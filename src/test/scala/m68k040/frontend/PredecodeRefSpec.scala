@@ -29,4 +29,14 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x0240) == cp(false,0))  // ANDI.W
     assert(classify(0x41D0) == cp(false,0))  // LEA (A0),A0
   }
+  test("MUL/DIV (class 8/C opmode 3/7) -> complex") {
+    assert(classify(0x80C1) == cp(false,0))  // DIVU.W D1,D0
+    assert(classify(0x81C1) == cp(false,0))  // DIVS.W D1,D0
+    assert(classify(0xC0C1) == cp(false,0))  // MULU.W D1,D0
+    assert(classify(0xC1C1) == cp(false,0))  // MULS.W D1,D0
+  }
+  test("ADDA/SUBA (class 9/D opmode 3/7) stay simple len1") {
+    assert(classify(0xD1C9) == cp(true,1))   // ADDA.L A1,A0
+    assert(classify(0x90C9) == cp(true,1))   // SUBA.W A1,A0
+  }
 }

@@ -54,9 +54,11 @@ object PredecodeRef {
       case 0x8 | 0x9 | 0xC | 0xD =>
         val opmode  = (op >> 6) & 7
         val srcMode = (op >> 3) & 7; val srcReg = op & 7
-        if (opmode == 4 || opmode == 5 || opmode == 6) COMPLEX
+        // classes 0x8(OR-group)/0xC(AND-group) opmode 3/7 = DIVU/DIVS/MULU/MULS -> complex
+        val isMulDiv = (cls == 0x8 || cls == 0xC) && (opmode == 3 || opmode == 7)
+        if (opmode == 4 || opmode == 5 || opmode == 6 || isMulDiv) COMPLEX
         else {
-          val sizeL = opmode == 2 || opmode == 7
+          val sizeL = opmode == 2 || opmode == 7   // opmode 7 here can only be ADDA.L/SUBA.L (cls 9/D)
           eaExt(srcMode, srcReg, sizeL, allowImm = false) match {
             case Some(e) => CP(simple = true, lenWords = 1 + e)
             case None    => COMPLEX

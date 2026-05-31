@@ -114,7 +114,10 @@ object PredecodeWord {
         val opmode  = op(8 downto 6).asUInt
         val srcMode = op(5 downto 3).asUInt
         val srcReg  = op(2 downto 0).asUInt
-        when(opmode =/= U(4, 3 bits) && opmode =/= U(5, 3 bits) && opmode =/= U(6, 3 bits)) {
+        // classes 8(OR-group)/C(AND-group) opmode 3/7 = DIVU/DIVS/MULU/MULS -> complex
+        val isMulDiv = (cls === U(8, 4 bits) || cls === U(0xC, 4 bits)) &&
+                       (opmode === U(3, 3 bits) || opmode === U(7, 3 bits))
+        when(opmode =/= U(4, 3 bits) && opmode =/= U(5, 3 bits) && opmode =/= U(6, 3 bits) && !isMulDiv) {
           val sizeL = (opmode === U(2, 3 bits)) || (opmode === U(7, 3 bits))
           val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = false)
           when(ok) {
