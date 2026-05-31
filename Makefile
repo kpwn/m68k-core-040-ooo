@@ -1,6 +1,6 @@
 SBT ?= sbt
 
-.PHONY: compile test-fast test verilog clean
+.PHONY: compile test-fast test verilog clean musashi test-verilator
 
 compile:
 	$(SBT) compile
@@ -17,3 +17,9 @@ verilog:
 clean:
 	$(SBT) clean
 	rm -rf simWorkspace generated
+
+musashi:
+	$(MAKE) -C tools/musashi
+
+test-verilator:
+	$(SBT) "testOnly * -- -n m68k040.VerilatorTest"

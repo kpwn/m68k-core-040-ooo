@@ -1,0 +1,7 @@
+# Build artefacts — produced by `make -C tools/musashi`.
+*.o
+*.a
+musashi_run
+musashi/m68kmake
+musashi/m68kops.c
+musashi/m68kops.h
