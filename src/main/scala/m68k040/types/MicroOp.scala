@@ -9,9 +9,7 @@ import spinal.core._
 case class MicroOp(p: M68kParams) extends Bundle {
   val robId        = UInt(p.robIdWidth bits)
   val uopIdx       = UInt(2 bits)            // up to 4 µops/instruction
-  // Bool subclass: auto-assigns DontCare when used as an output port so that
-  // `out(uop.lastUop)` on an in(MicroOp) bundle elaborates without a no-driver error.
-  val lastUop      = new Bool { override def asOutput(): this.type = { super.asOutput(); this.assignDontCare(); this } }
+  val lastUop      = Bool()
   val cluster      = Cluster()
   val opClass      = Bits(8 bits)            // decoded op selector (refined per cluster later)
   val staticLatency= UInt(4 bits)            // ready_cycle = issue_cycle + staticLatency
