@@ -1,0 +1,16 @@
+target/
+project/target/
+project/project/
+.bsp/
+.coursier/
+simWorkspace/
+generated/
+*.fst
+*.vcd
+hs_err_pid*.log
+.idea/
+.metals/
+.bloop/
+# stray root-level Verilog from elaboration tests that don't set a target dir
+/*.v
+unnamed.v
