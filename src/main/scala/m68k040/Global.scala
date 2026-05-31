@@ -6,6 +6,9 @@ import spinal.lib.misc.database.Database
   * producer plugin (documented in the comment). `blocking` keys make readers
   * await the producer; `value` keys are plain. */
 object Global {
+  // Keys are added here as the consuming plugins are written; see M68kParams
+  // for the full parameter set. The framework does NOT throw on double-set —
+  // invariant #3 (one producer per key) is a convention, not runtime-enforced.
   // Producer: ParamPlugin (setup phase)
   val ROB_DEPTH       = Database.blocking[Int]()
   val PHYS_INT_REGS   = Database.blocking[Int]()

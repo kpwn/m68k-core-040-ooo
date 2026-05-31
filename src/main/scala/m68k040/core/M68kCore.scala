@@ -8,8 +8,8 @@ import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
   * behavior lives in the hosted plugins (spec invariant #3). */
 class M68kCore(val plugins: Seq[FiberPlugin]) extends Component {
   setDefinitionName("M68kCore")
-  val database = new Database
-  val host = database on (new PluginHost)
+  private val database = new Database
+  private val host = database on (new PluginHost)
   database.on {
     host.asHostOf(plugins)
   }
