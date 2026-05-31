@@ -14,7 +14,7 @@
 
 HERE         := $(dir $(lastword $(MAKEFILE_LIST)))
 MUSASHI_DIR  := $(HERE)musashi
-CACHE_DIR    := $(HOME)/.cache/m68k-core-030-inorder
+CACHE_DIR    := $(HOME)/.cache/m68k-core-040-ooo
 CACHE_BIN    := $(CACHE_DIR)/musashi_run
 
 CC      ?= gcc
@@ -29,7 +29,7 @@ INCS    := -I$(MUSASHI_DIR) -I$(MUSASHI_DIR)/softfloat -I$(HERE)
 
 all: musashi_run install
 
-# ── install — copy musashi_run into ~/.cache/m68k-core-030-inorder so worktrees ─
+# ── install — copy musashi_run into ~/.cache/m68k-core-040-ooo so worktrees ─────
 # share one binary instead of each rebuilding it (Musashi.scala looks
 # in the shared cache before falling back to the in-tree copy).
 install: $(HERE)musashi_run

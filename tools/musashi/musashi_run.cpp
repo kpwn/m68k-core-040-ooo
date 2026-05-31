@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
     }
 
     MusashiRef ref;
-    ref.set_cpu_type(MusashiRef::CPU_68030);
+    ref.set_cpu_type(MusashiRef::CPU_68040);
     ref.set_interrupt_ack_response(ack_response);
 
     int64_t loaded = ref.load_binary(bin_path, load_addr);

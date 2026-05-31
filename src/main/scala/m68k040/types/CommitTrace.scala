@@ -7,7 +7,7 @@ import spinal.core._
   * state against the reference model at the ROB retire boundary. */
 case class CommitTrace() extends Bundle {
   val fire         = Bool()          // a single instruction retired this cycle
-  val pc           = UInt(32 bits)
+  val pc           = UInt(32 bits)   // POST-instruction PC (next-instruction addr); must match Musashi --trace for lock-step
   val opword       = Bits(16 bits)
   val archRegId    = UInt(4 bits)
   val archRegWrite = Bits(32 bits)

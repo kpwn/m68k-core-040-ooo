@@ -7,7 +7,19 @@ final case class LockStepResult(ok: Boolean, firstDivergence: Option[Divergence]
 
 /** Pure-Scala instruction-level lock-step comparator. Aligns the DUT's retired
   * commits with Musashi's per-instruction steps positionally and reports the
-  * first divergence. Granularity = one retired instruction (spec invariant #5). */
+  * first divergence. Granularity = one retired instruction (spec invariant #5).
+  *
+  * Conventions the DUT's CommitTrace MUST honor for alignment:
+  *  - PC is the POST-instruction PC (address of the NEXT instruction), matching
+  *    the Musashi --trace records. The real commit stage must use the same
+  *    convention or positional comparison is off by one.
+  *  - `ccr` is always compared (ccrValid is not consulted here): the DUT must
+  *    drive the post-instruction CCR every retired instruction, as the oracle does.
+  *  - Register check is gated on `archRegValid`: a DUT that under-reports validity
+  *    can hide a wrong register. This is the trust model, not full coverage.
+  *  - Memory writes (memAddr/memData/memWrite) are captured but NOT yet compared
+  *    (deferred; see the plan's downstream section).
+  */
 object LockStep {
   def compare(dut: Seq[CommitObservation], oracle: Seq[OracleStep]): LockStepResult = {
     val n = math.min(dut.size, oracle.size)
