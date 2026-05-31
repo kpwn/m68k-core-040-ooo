@@ -122,6 +122,68 @@ class IcacheSpec extends AnyFunSuite {
     }
   }
 
+  // -------- Test 4: round-robin eviction (way 0 first) --------
+  test("filling all 4 ways then a 5th tag evicts round-robin (way 0 first)", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+      dut.icache.logic.cmdPort.valid #= false
+      dut.icache.logic.cmdPort.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      pulseInvalidateAll(dut, cd)
+
+      var arCount = 0
+      fork { while (true) { cd.waitSampling()
+        if (dut.icache.logic.axi.ar.valid.toBoolean && dut.icache.logic.axi.ar.ready.toBoolean) arCount += 1 } }
+
+      // 5 addresses, SAME set index (bits[11:6]=0), DIFFERENT tags (bits[31:12]) via 0x1000 stride.
+      val addrs = (0 until 5).map(i => i.toLong * 0x1000L)
+      addrs.take(4).foreach(a => fetch(dut, cd, a))   // fill ways 0..3 (4 refills)
+      val cBeforeFifth = arCount
+      fetch(dut, cd, addrs(4))                          // 5th distinct tag -> evicts victim (way 0)
+      assert(arCount == cBeforeFifth + 1, s"5th distinct tag must refill once: $cBeforeFifth -> $arCount")
+      val cBeforeReFetch = arCount
+      val got = fetch(dut, cd, addrs(0))                // addr0 was in way0 -> evicted -> miss again
+      assert(got == IcacheSim.window64(addrs(0)),
+        s"evicted line refetch data mismatch: got 0x${got.toString(16)} expected 0x${IcacheSim.window64(addrs(0)).toString(16)}")
+      assert(arCount == cBeforeReFetch + 1, s"evicted line (way 0) must miss again: $cBeforeReFetch -> $arCount")
+      cd.waitSampling(4)
+    }
+  }
+
+  // -------- Test 5: invalidateAll forces a re-miss --------
+  test("invalidateAll forces a re-miss", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+      dut.icache.logic.cmdPort.valid #= false
+      dut.icache.logic.cmdPort.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      pulseInvalidateAll(dut, cd)
+
+      var arCount = 0
+      fork { while (true) { cd.waitSampling()
+        if (dut.icache.logic.axi.ar.valid.toBoolean && dut.icache.logic.axi.ar.ready.toBoolean) arCount += 1 } }
+
+      val pc = 0x4080L
+      fetch(dut, cd, pc)                 // cold miss -> refill
+      val cAfterFirst = arCount
+      fetch(dut, cd, pc)                 // hit -> no new AR
+      assert(arCount == cAfterFirst, s"second fetch should hit (no AR): $cAfterFirst -> $arCount")
+      pulseInvalidateAll(dut, cd)        // wipe
+      val cBeforeReMiss = arCount
+      val got = fetch(dut, cd, pc)       // must miss again
+      assert(got == IcacheSim.window64(pc),
+        s"post-invalidate data mismatch: got 0x${got.toString(16)} expected 0x${IcacheSim.window64(pc).toString(16)}")
+      assert(arCount == cBeforeReMiss + 1, s"invalidateAll must force a refill: $cBeforeReMiss -> $arCount")
+      cd.waitSampling(4)
+    }
+  }
+
   // -------- Test 3: crossing 64B boundary triggers a new refill --------
   test("crossing the 64B line boundary triggers a new refill", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
