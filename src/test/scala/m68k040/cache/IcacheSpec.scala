@@ -184,6 +184,33 @@ class IcacheSpec extends AnyFunSuite {
     }
   }
 
+  // -------- Test 6: predecode on miss -- fetched window carries PredecodeRef-matching chunks --------
+  test("fetched window carries predecode matching PredecodeRef", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      val base = 0x5000L
+      val words = Seq(0x7005, 0x5240, 0x3200, 0x6000) // MOVEQ(simple1), ADDQ(complex), MOVE.W D0,D1(simple1), BRA.w(simple2)
+      IcacheSim.attachMemoryWithWords(dut.icache.logic.axi, cd, base, words)
+      dut.icache.logic.cmdPort.valid #= false
+      dut.icache.logic.cmdPort.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2); pulseInvalidateAll(dut, cd)
+      dut.icache.logic.cmdPort.valid #= true
+      dut.icache.logic.cmdPort.payload.pc #= base
+      cd.waitSamplingWhere(dut.icache.logic.cmdPort.ready.toBoolean)
+      dut.icache.logic.cmdPort.valid #= false
+      cd.waitSamplingWhere(dut.icache.logic.rspPort.valid.toBoolean)
+      for (i <- 0 until 4) {
+        val ref = m68k040.frontend.PredecodeRef.classify(words(i))
+        assert(dut.icache.logic.rspPort.payload.pred(i).simple.toBoolean == ref.simple, s"chunk $i simple: ref=${ref.simple}")
+        if (ref.simple)
+          assert(dut.icache.logic.rspPort.payload.pred(i).lenWords.toInt == ref.lenWords, s"chunk $i len: ref=${ref.lenWords}")
+      }
+      cd.waitSampling(4)
+    }
+  }
+
   // -------- Test 3: crossing 64B boundary triggers a new refill --------
   test("crossing the 64B line boundary triggers a new refill", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>

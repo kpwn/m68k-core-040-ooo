@@ -1,6 +1,7 @@
 package m68k040.cache
 
 import m68k040.services.{FetchService, TranslationService}
+import m68k040.frontend.PredecodeWord
 import spinal.core._
 import spinal.lib._
 import spinal.lib.bus.amba4.axi.{Axi4Config, Axi4ReadOnly, Axi4}
@@ -51,6 +52,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val tagMem = Seq.fill(ways)(Mem(UInt(tagBits bits), sets))
     // Data: 2 beats × 64 sets = 128 entries per way; async-read
     val dataMem = Seq.fill(ways)(Mem(Bits(256 bits), sets * beatsPerLine))
+    // Predecode: 32 chunks × 4 bits = 128 bits per line per set, per way
+    val predMem = Seq.fill(ways)(Mem(Bits(128 bits), sets))
     // Valid bits: register array, cleared by invalidateAll
     val valids  = Vec.fill(ways)(Vec.fill(sets)(RegInit(False)))
     // Round-robin victim pointer per set
@@ -77,12 +80,26 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val rspPcReg    = Reg(UInt(32 bits))
     val rspDataReg  = Reg(Bits(64 bits))
     val rspFaultReg = Reg(Bool())
+    val rspPredReg  = Reg(Vec(ChunkPredecode(), 4))
+
+    // Line capture register: accumulates 2×256-bit AXI beats into 512-bit line
+    val lineReg = Reg(Bits(512 bits))
 
     // ---- read-data mux helpers (Scala-level; hardware MuxOH at elaboration) ----
     // Read all ways and select with OHToUInt / hardware MUX.
     def readDataMem(readAddr: UInt, selWay: UInt): Bits = {
       val perWay = Vec(dataMem.map(_.readAsync(readAddr)))
       perWay(selWay)
+    }
+
+    // ---- window predecode helper: extract 4-chunk pred for the 8-byte window at pc ----
+    // entry: 128-bit predMem row (32 chunks packed, chunk k at bits [4k+3:4k])
+    // pc(5 downto 3) selects which 8-word window (0..7), giving a 16-bit sub-entry
+    // Each 4-bit nibble within that 16-bit sub-entry is one ChunkPredecode
+    def windowPred(entry: Bits, pc: UInt): Vec[ChunkPredecode] = {
+      val win  = entry.subdivideIn(16 bits)(pc(5 downto 3))   // 16 bits = 4 chunks × 4 bits
+      val nibs = win.subdivideIn(4 bits)                      // Vec(4) of 4-bit nibbles
+      Vec(nibs.map(b => b.as(ChunkPredecode())))
     }
 
     // ---- default output assignments ----
@@ -92,6 +109,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     rspPort.payload.pc    := rspPcReg
     rspPort.payload.data  := rspDataReg
     rspPort.payload.fault := rspFaultReg
+    rspPort.payload.pred  := rspPredReg
     axi.ar.valid   := False
     axi.ar.payload.assignDontCare()
     axi.r.ready    := False
@@ -120,9 +138,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
     // ---- FSM ----
     val fsm = new StateMachine {
-      val IDLE   = new State with EntryPoint
-      val REFILL = new State
-      val REPLAY = new State
+      val IDLE      = new State with EntryPoint
+      val REFILL    = new State
+      val PREDECODE = new State
+      val REPLAY    = new State
 
       // ------------------------------------------------------------------
       // IDLE: accept fetch commands; hit → respond immediately, miss → latch
@@ -137,6 +156,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
             rspPcReg    := idlePc
             rspDataReg  := idleWindow
             rspFaultReg := xlate.rsp.fault
+            val predEntry = Vec(predMem.map(_.readAsync(idleSet)))
+            rspPredReg  := windowPred(predEntry(hitWayIdx), idlePc)
             // remain in IDLE
           } otherwise {
             // Miss: latch all miss state and go refill
@@ -182,19 +203,37 @@ class IcachePlugin extends FiberPlugin with FetchService {
               dataMem(w).write(writeAddr, axi.r.payload.data)
             }
           }
+          // Capture beat into lineReg: beat0 → low 256 bits, beat1 → high 256 bits
+          when(beatCnt === U(0, 1 bits)) {
+            lineReg(255 downto 0)   := axi.r.payload.data
+          } otherwise {
+            lineReg(511 downto 256) := axi.r.payload.data
+          }
           beatCnt := beatCnt + 1
 
           when(axi.r.payload.last) {
-            for (w <- 0 until ways) {
-              when(victimWay === U(w, wayBits bits)) {
-                tagMem(w).write(missSet, missTag)
-                valids(w)(missSet) := True
-              }
-            }
-            victim(missSet) := victim(missSet) + 1
-            goto(REPLAY)
+            goto(PREDECODE)
           }
         }
+      }
+
+      // ------------------------------------------------------------------
+      // PREDECODE: run predecode on completed line, write predMem + tag/valid
+      // ------------------------------------------------------------------
+      PREDECODE.whenIsActive {
+        activePc := missPC
+        val words  = lineReg.subdivideIn(16 bits)                  // Vec(32) of 16-bit words
+        val chunks = Vec(words.map(w => PredecodeWord.classify(w))) // Vec(32) ChunkPredecode
+        val packed = chunks.asBits                                  // 128 bits
+        for (w <- 0 until ways) {
+          when(victimWay === U(w, wayBits bits)) {
+            predMem(w).write(missSet, packed)
+            tagMem(w).write(missSet, missTag)
+            valids(w)(missSet) := True
+          }
+        }
+        victim(missSet) := victim(missSet) + 1
+        goto(REPLAY)
       }
 
       // ------------------------------------------------------------------
@@ -213,6 +252,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
         rspPcReg    := missPC
         rspDataReg  := replayWindow
         rspFaultReg := xlate.rsp.fault
+        val replayPredEntry = Vec(predMem.map(_.readAsync(missSet)))
+        rspPredReg  := windowPred(replayPredEntry(victimWay), missPC)
 
         goto(IDLE)
       }

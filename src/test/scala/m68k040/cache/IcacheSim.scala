@@ -42,4 +42,15 @@ object IcacheSim {
         mem.read(address.toLong)
     }
   }
+
+  def attachMemoryWithWords(axi: Axi4ReadOnly, cd: ClockDomain, base: Long, words: Seq[Int]): Axi4ReadOnlySlaveAgent = {
+    val mem = SparseMemory()
+    words.zipWithIndex.foreach { case (w, i) =>
+      mem.write(base + 2*i,     (w & 0xff).toByte)
+      mem.write(base + 2*i + 1, ((w >> 8) & 0xff).toByte)
+    }
+    new Axi4ReadOnlySlaveAgent(axi, cd) {
+      override def readByte(address: BigInt, id: Int): Byte = mem.read(address.toLong)
+    }
+  }
 }
