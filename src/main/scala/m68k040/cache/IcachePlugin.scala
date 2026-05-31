@@ -17,13 +17,15 @@ import spinal.lib.misc.plugin.FiberPlugin
   */
 class IcachePlugin extends FiberPlugin with FetchService {
 
-  // ---- geometry constants (Scala-time) ----
-  private val ways         = 4
-  private val sets         = 64
-  private val tagBits      = 20
-  private val beatsPerLine = 2     // 64-byte line / 32 bytes per beat
-  private val setBits      = log2Up(sets)  // 6
-  private val wayBits      = log2Up(ways)  // 2
+  // ---- geometry (single source of truth) ----
+  private val geo          = CacheGeometry.l1i040
+  geo.requireViptSafe(4096, "L1I")         // alias-safety guard (4 KiB pages)
+  private val ways         = geo.ways
+  private val sets         = geo.sets
+  private val tagBits      = geo.tagBits
+  private val beatsPerLine = geo.lineBytes / 32   // 256-bit (32 B) beats
+  private val setBits      = geo.indexBits
+  private val wayBits      = log2Up(ways)
 
   val axiCfg = Axi4Config(addressWidth = 32, dataWidth = 256, idWidth = 2)
 
