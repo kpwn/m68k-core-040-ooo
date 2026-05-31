@@ -16,6 +16,8 @@ case class M68kParams(
     loadQDepth:   Int = 8,
     storeQDepth:  Int = 8,
     l1iKb:        Int = 16,
+    l1iWays:      Int = 4,
+    l1iLineBytes: Int = 64,
     l1dKb:        Int = 16,
     l2Kb:         Int = 1024,
     btbEntries:   Int = 256,

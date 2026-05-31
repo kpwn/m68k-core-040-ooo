@@ -13,5 +13,8 @@ class ParamPlugin(p: M68kParams) extends FiberPlugin {
     Global.PHYS_X_REGS.set(p.physX)
     Global.DECODE_WIDTH.set(p.decodeWidth)
     Global.RETIRE_WIDTH.set(p.retireWidth)
+    Global.L1I_KB.set(p.l1iKb)
+    Global.L1I_WAYS.set(p.l1iWays)
+    Global.L1I_LINE_BYTES.set(p.l1iLineBytes)
   }
 }
