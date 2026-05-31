@@ -124,6 +124,10 @@ public:
                                                       const std::vector<std::pair<uint32_t, unsigned int>>& irq_events,
                                                       int max_cycles);
     int      step_one();
+    // Initialise sentinel tracking for use with step_one() loops.
+    // Must be called before the first step_one() when not using
+    // run_until_sentinel*; mirrors the init that run_until_sentinel_or_pc_with_irq_events does.
+    void     begin_trace(uint32_t sentinel_addr);
     bool     hit_sentinel() const { return hit_sentinel_; }
     bool     hit_stop_pc() const { return hit_stop_pc_; }
     uint32_t last_sentinel_value() const { return last_sentinel_value_; }

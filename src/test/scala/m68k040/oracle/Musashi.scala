@@ -62,6 +62,60 @@ object Musashi {
     }
   }
 
+  def assembleAndTrace(
+      source: String,
+      loadAddress: Long = ProgramAssembler.DefaultLoadAddress,
+      initialSp: Long = 0x00100000L,
+      stopPc: Option[Long] = None,
+      maxCycles: Int = 50000): Either[OracleError, Vector[OracleStep]] = {
+    if (!Files.exists(runnerPath)) {
+      return Left(OracleError(s"musashi_run not found at $runnerPath; build it with `make musashi`"))
+    }
+
+    ProgramAssembler.assemble(source, loadAddress).flatMap { image =>
+      val bin   = Files.createTempFile("m68k040-musashi-", ".bin")
+      val trace = sibling(bin, ".trace")
+      try {
+        Files.write(bin, image.bytes.map(_.toByte).toArray)
+        val cmd =
+          Seq(
+            runnerPath.toString,
+            "--bin", bin.toString,
+            "--trace", trace.toString,
+            "--load-addr", f"0x${loadAddress & 0xffffffffL}%08x",
+            "--initial-sp", f"0x${initialSp & 0xffffffffL}%08x",
+            "--sentinel", f"0x${Sentinel & 0xffffffffL}%08x",
+            "--max-cycles", maxCycles.toString) ++
+            stopPc.toSeq.flatMap(pc => Seq("--stop-pc", f"0x${pc & 0xffffffffL}%08x"))
+        runTraceCmd(cmd, trace)
+      } finally {
+        deleteIfExists(trace)
+        deleteIfExists(bin)
+      }
+    }
+  }
+
+  private def runTraceCmd(cmd: Seq[String], trace: Path): Either[OracleError, Vector[OracleStep]] = {
+    try {
+      val pb = new ProcessBuilder(cmd: _*)
+      pb.redirectOutput(ProcessBuilder.Redirect.DISCARD)
+      val p = pb.start()
+      val stderrSrc = Source.fromInputStream(p.getErrorStream)
+      val stderr =
+        try stderrSrc.mkString
+        finally stderrSrc.close()
+      val exit = p.waitFor()
+      // exit codes 0 and 1 are both acceptable (0 = pass, 1 = sentinel not magic value)
+      if (exit > 1 && !Files.exists(trace)) {
+        Left(OracleError(s"musashi_run failed before producing trace: ${if (stderr.nonEmpty) stderr.trim else s"exit code $exit"}"))
+      } else {
+        OracleStep.parseTrace(trace)
+      }
+    } catch {
+      case e: java.io.IOException => Left(OracleError(s"musashi_run failed: ${e.getMessage}"))
+    }
+  }
+
   private def runCmd(cmd: Seq[String], out: Path): Either[OracleError, OracleState] = {
     try {
       val pb = new ProcessBuilder(cmd: _*)

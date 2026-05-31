@@ -276,6 +276,14 @@ int MusashiRef::step_one() {
     return m68k_execute(1);
 }
 
+void MusashiRef::begin_trace(uint32_t sentinel_addr) {
+    hit_sentinel_        = false;
+    hit_stop_pc_         = false;
+    sentinel_addr_       = sentinel_addr;
+    last_sentinel_value_ = 0;
+    last_sentinel_size_  = 0;
+}
+
 std::vector<MusashiRef::MemByte> MusashiRef::final_mem_writes() const {
     std::vector<MemByte> out;
     out.reserve(writes_.size());

@@ -23,7 +23,7 @@ static const char* USAGE =
   "musashi_run --bin <path> [--load-addr <hex>] [--initial-sp <hex>] "
   "[--sentinel <hex>] [--stop-pc <hex>] [--irq-level <0-7>] "
   "[--irq-at-pc <hex>] [--irq-event <pc>:<0-7>] [--ack-vector <2-255>|--ack-spurious] "
-  "[--max-cycles <n>] --out <path>\n";
+  "[--max-cycles <n>] --out <path> [--trace <path>]\n";
 
 static uint32_t parse_u32(const char* s) {
     if (!s) return 0;
@@ -35,6 +35,7 @@ static uint32_t parse_u32(const char* s) {
 int main(int argc, char** argv) {
     std::string bin_path;
     std::string out_path;
+    std::string trace_path;
     uint32_t load_addr  = 0x40800000u;
     uint32_t initial_sp = 0x00800000u;
     uint32_t sentinel   = 0xFFFF0000u;
@@ -78,6 +79,7 @@ int main(int argc, char** argv) {
         else if (a == "--ack-spurious") ack_response = -2;
         else if (a == "--max-cycles" && i + 1 < argc) max_cycles = (int)parse_u32(argv[++i]);
         else if (a == "--out"        && i + 1 < argc) out_path   = argv[++i];
+        else if (a == "--trace"      && i + 1 < argc) trace_path = argv[++i];
         else if (a == "--help" || a == "-h") { std::fputs(USAGE, stdout); return 0; }
         else {
             std::fprintf(stderr, "unknown arg: %s\n%s", a.c_str(), USAGE);
@@ -85,7 +87,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (bin_path.empty() || out_path.empty()) {
+    if (bin_path.empty() || (out_path.empty() && trace_path.empty())) {
         std::fputs(USAGE, stderr);
         return 2;
     }
@@ -107,19 +109,82 @@ int main(int argc, char** argv) {
     ref.add_readonly_range(sentinel, sentinel + 0x10);
     ref.add_readonly_range(0, 8);   // reset vector we wrote manually
 
-    ref.reset(load_addr, initial_sp);
     if (use_irq_at_pc) {
         irq_events.push_back({irq_at_pc, irq_level});
     }
-    if (irq_events.empty()) {
-        ref.set_irq(irq_level);
-    }
 
-    int cycles = ref.run_until_sentinel_or_pc_with_irq_events(
-        sentinel, use_stop_pc, stop_pc, irq_events, max_cycles);
+    int cycles = 0;
+
+    if (!trace_path.empty()) {
+        // ── Per-instruction trace mode ────────────────────────────────
+        // Drive the CPU one instruction at a time and emit a post-instruction
+        // state record after each step.
+        //
+        // Use reset_direct so the Musashi reset-processing bookkeeping
+        // cycle is drained internally before we start stepping user code.
+        // This ensures the first step_one() executes the first user instruction,
+        // not the reset exception handler.
+        ref.reset_direct(load_addr, initial_sp);
+        if (irq_events.empty()) {
+            ref.set_irq(irq_level);
+        }
+
+        FILE* tf = std::fopen(trace_path.c_str(), "w");
+        if (!tf) {
+            std::fprintf(stderr, "musashi_run: cannot open trace file %s\n", trace_path.c_str());
+            return 2;
+        }
+
+        ref.begin_trace(sentinel);
+        int cycles_left = max_cycles;
+
+        while (cycles_left > 0 && !ref.hit_sentinel()) {
+            if (use_stop_pc && ref.get_reg(MusashiRef::REG_PC) == stop_pc) break;
+
+            int n = ref.step_one();
+            if (n <= 0) n = 1;
+            cycles      += n;
+            cycles_left -= n;
+
+            // Emit post-instruction state
+            uint32_t pc = ref.get_reg(MusashiRef::REG_PC);
+            uint32_t sr = ref.get_reg(MusashiRef::REG_SR) & 0xFFFFu;
+            std::fprintf(tf,
+                "step pc=0x%08x sr=0x%04x"
+                " d0=0x%08x d1=0x%08x d2=0x%08x d3=0x%08x"
+                " d4=0x%08x d5=0x%08x d6=0x%08x d7=0x%08x"
+                " a0=0x%08x a1=0x%08x a2=0x%08x a3=0x%08x"
+                " a4=0x%08x a5=0x%08x a6=0x%08x a7=0x%08x\n",
+                pc, sr,
+                ref.get_reg(MusashiRef::REG_D0), ref.get_reg(MusashiRef::REG_D1),
+                ref.get_reg(MusashiRef::REG_D2), ref.get_reg(MusashiRef::REG_D3),
+                ref.get_reg(MusashiRef::REG_D4), ref.get_reg(MusashiRef::REG_D5),
+                ref.get_reg(MusashiRef::REG_D6), ref.get_reg(MusashiRef::REG_D7),
+                ref.get_reg(MusashiRef::REG_A0), ref.get_reg(MusashiRef::REG_A1),
+                ref.get_reg(MusashiRef::REG_A2), ref.get_reg(MusashiRef::REG_A3),
+                ref.get_reg(MusashiRef::REG_A4), ref.get_reg(MusashiRef::REG_A5),
+                ref.get_reg(MusashiRef::REG_A6), ref.get_reg(MusashiRef::REG_A7));
+        }
+        std::fclose(tf);
+    } else {
+        // ── Final-state mode (original behaviour) ─────────────────────
+        ref.reset(load_addr, initial_sp);
+        if (irq_events.empty()) {
+            ref.set_irq(irq_level);
+        }
+        cycles = ref.run_until_sentinel_or_pc_with_irq_events(
+            sentinel, use_stop_pc, stop_pc, irq_events, max_cycles);
+    }
 
     // Emit the state in the same format tb_top.cpp's dump_final_state()
     // produces, so fuzz.py can diff them line-for-line.
+    if (out_path.empty()) {
+        bool pass = use_stop_pc
+                    ? ref.hit_stop_pc()
+                    : (ref.hit_sentinel() && ref.last_sentinel_size() == 4
+                       && ref.last_sentinel_value() == 0xC0FFEE00u);
+        return pass ? 0 : 1;
+    }
     FILE* f = std::fopen(out_path.c_str(), "w");
     if (!f) {
         std::fprintf(stderr, "musashi_run: cannot open %s\n", out_path.c_str());
