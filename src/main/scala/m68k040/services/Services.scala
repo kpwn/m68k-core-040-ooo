@@ -2,6 +2,7 @@ package m68k040.services
 
 import m68k040.types.CommitTrace
 import m68k040.cache.{FetchCmd, FetchRsp, TranslationReq, TranslationRsp}
+import m68k040.frontend.DecodePacket
 import spinal.core._
 import spinal.lib.{Stream, Flow}
 
@@ -31,4 +32,11 @@ trait FetchService {
 trait TranslationService {
   def req: TranslationReq
   def rsp: TranslationRsp
+}
+
+/** Produced by the fetch/align stage; consumed by the (future) decode stage.
+  * Two packets/cycle; slot 0 valid when the stream fires, slot 1 on 2-wide cycles. */
+trait DecodeFeedService {
+  def feed: Stream[Vec[DecodePacket]]   // Vec length 2
+  def slot1Valid: Bool
 }
