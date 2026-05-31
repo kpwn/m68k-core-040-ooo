@@ -55,11 +55,33 @@ ChunkPredecode {
 
 Input: one 16-bit opword. Output: `ChunkPredecode`.
 
-Decode using opword fields: class `op[15:12]`, plus per-class size and EA `mode[5:3]`/`reg[2:0]`.
-Produce `simple=1` + exact `lenWords` for the fast-path opcode classes with a **non-indexed simple EA
-mode**; otherwise `simple=0`.
+### 4.0 What `simple` means — and the LUT budget
 
-**Fast-path opcode classes (simple when EA is simple):** `MOVE`/`MOVEA`, `ADD`/`ADDA`/`ADDQ`,
+`simple = 1` iff the fast 2-wide decoder can fully crack the instruction:
+1. it decodes to **≤ 2 µops**, **and**
+2. its length is **deterministic and trivial to compute** from the opword, **and**
+3. detecting (1)+(2) is **cheap in LUTs**.
+
+Everything else is `complex`: microcoded/large instructions, anything > 2 µops, and **anything that
+would add meaningful logic to the predecoder**.
+
+**Hard design constraint:** 32 `PredecodeWord` instances run **in parallel** per line, so the metric
+that matters is **LUT count per instance** (it is multiplied by 32). Predecode is off the FMax hot path
+(it runs in the dedicated PREDECODE refill cycle), so *depth* is not the concern — *area* is. **Bias
+toward `complex`:** when a case is ambiguous or would cost extra logic to classify, mark it `complex`.
+Coverage of the common easy cases beats coverage of rare hard ones.
+
+This ties predecode's `simple` to the decoder's fast path: `simple = fast-opcode ∧ simple-EA ∧ (≤2 µops)`.
+µop-count matters, not just length — e.g. a memory-destination RMW (`ADD Dn,(An)` → AGU+load+ALU+store)
+and mem→mem `MOVE` are `complex` despite trivial length, because they exceed 2 µops.
+
+### 4.1 Classification
+
+Decode using opword fields: class `op[15:12]`, plus per-class size, direction, and EA
+`mode[5:3]`/`reg[2:0]`. Produce `simple=1` + exact `lenWords` only when all three criteria above hold;
+otherwise `simple=0`.
+
+**Fast-path opcode classes (simple when EA is simple AND the form is ≤2 µops):** `MOVE`/`MOVEA`, `ADD`/`ADDA`/`ADDQ`,
 `SUB`/`SUBA`/`SUBQ`, `AND`, `OR`, `EOR`, `CMP`/`CMPA`, `MOVEQ`, `LEA`, `PEA`, `Bcc`/`BSR`/`BRA`,
 `DBcc`, `Scc`, simple shifts/rotates (`ASL/ASR/LSL/LSR/ROL/ROR/ROXL/ROXR` register/memory forms),
 `TST`, `CLR`, `NOT`, `NEG`, `SWAP`, `EXT`, `NOP`.
@@ -77,9 +99,18 @@ mode**; otherwise `simple=0`.
 `lenWords = 1 (opword) + Σ extwords` over the instruction's operand(s). For two-EA `MOVE`, sum source
 and destination extwords (e.g. `MOVE.L #imm32, abs.L` = 1+2+2 = 5 words = 10 bytes).
 
-**Complex (`simple=0`):** indexed modes `110 (d8,An,Xn)` and `111/011`/`111/100`-PC-indexed (brief or
-full), memory-indirect, `MOVEM`, `MOVEP`, `CAS`/`CAS2`, bitfield ops, `MOVES`, `CHK2`/`CMP2`, F-line,
-MMU/`PFLUSH`/`PTEST`, `TAS`, privileged/`STOP`/`RESET`/`RTE`, and any opword not in the fast set.
+**µop-count gate (a cheap opcode+EA+direction test, not a full decode):**
+- ≤2 µops (simple): register/register or register/immediate ALU (1 µop); a single memory *source*
+  feeding a register dest, or a register source to a single memory dest (2 µops: 1 mem access + op);
+  `MOVEQ`/`LEA`/`PEA`/`Bcc`/`DBcc`/`Scc`/`TST`/`CLR` in their ≤2-µop forms.
+- >2 µops (complex): memory-destination **read-modify-write** (`ADD Dn,(An)`, etc. → AGU+load+op+store),
+  mem→mem `MOVE`, and any form needing more than one memory access plus its op.
+
+**Complex (`simple=0`):** the >2-µop forms above; indexed modes `110 (d8,An,Xn)` and
+`111/011`/`111/100`-PC-indexed (brief or full); memory-indirect; `MOVEM`, `MOVEP`, `CAS`/`CAS2`,
+bitfield ops, `MOVES`, `CHK2`/`CMP2`, F-line, MMU/`PFLUSH`/`PTEST`, `TAS`, privileged/`STOP`/`RESET`/
+`RTE`; and any opword not in the fast set — plus, by the bias rule, anything whose simple-classification
+would cost extra LUTs.
 
 The classifier is a flat combinational function (LUT-like); spec correctness is defined by the Scala
 reference in the tests (§7), which is the single source of truth for the opword→`ChunkPredecode` map.
@@ -111,8 +142,10 @@ existing FSM; data capture and the registered response are unchanged in spirit.
 - Miss latency: +1 cycle (the PREDECODE stage) versus the current I-cache. Acceptable — it is amortized
   over all subsequent hits to the line, and miss latency is dominated by AXI refill anyway.
 - The 32-way parallel classifier in `PREDECODE` is one cycle of combinational logic at refill rate
-  (not fetch rate). If it proves too deep for one cycle, it pipelines into two PREDECODE cycles with no
-  hot-path impact — but one cycle is expected to suffice given opword-only depth.
+  (not fetch rate). Depth is not the concern; **area is** — 32 copies of `PredecodeWord`. The
+  bias-toward-`complex` rule (§4.0) is the LUT-budget control: each copy stays a small opcode/EA pattern
+  match. If 32 parallel copies prove too costly, the fallback is to classify fewer words per cycle over
+  2 PREDECODE cycles (e.g. 16×2) — still off the hot path — but a single LUT-frugal pass is the target.
 
 ## 7. Verification
 
