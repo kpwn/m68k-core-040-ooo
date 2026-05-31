@@ -1,7 +1,9 @@
 package m68k040.services
 
 import m68k040.types.CommitTrace
+import m68k040.cache.{FetchCmd, FetchRsp, TranslationReq, TranslationRsp}
 import spinal.core._
+import spinal.lib.{Stream, Flow}
 
 /** Catalog of cross-plugin service interfaces (spec invariant #3 / Appendix B).
   * A plugin implements a trait and registers via addService(this); consumers
@@ -16,4 +18,17 @@ trait CommitTraceService {
 trait FlushService {
   def doFlush: Bool
   def flushPc: UInt
+}
+
+/** Produced by the I-cache; consumed by the fetch/align stage (later). */
+trait FetchService {
+  def cmd: Stream[FetchCmd]
+  def rsp: Flow[FetchRsp]
+}
+
+/** Produced by the MMU/ITLB (identity stub this slice); consumed by the I-cache.
+  * Combinational: drive `rsp` from `req` within the same cycle. */
+trait TranslationService {
+  def req: TranslationReq
+  def rsp: TranslationRsp
 }
