@@ -26,9 +26,12 @@ case class M68kParams(
     decodeWidth:  Int = 2,
     retireWidth:  Int = 2
 ) {
-  val robIdWidth:     Int = log2Up(robDepth)
-  val physIntIdWidth: Int = log2Up(physInt)
-  val physNzvcIdWidth:Int = log2Up(physNzvc)
-  val physXIdWidth:   Int = log2Up(physX)
-  val sqPtrWidth:     Int = log2Up(storeQDepth)
+  // Derived pointer/index widths are ceil-log2; non-power-of-two depths
+  // (e.g. physInt=48 -> 6 bits) are valid and intentional.
+  val robIdWidth:      Int = log2Up(robDepth)
+  val physIntIdWidth:  Int = log2Up(physInt)
+  val physNzvcIdWidth: Int = log2Up(physNzvc)
+  val physXIdWidth:    Int = log2Up(physX)
+  val sqPtrWidth:      Int = log2Up(storeQDepth)
+  val lqPtrWidth:      Int = log2Up(loadQDepth)
 }
