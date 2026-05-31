@@ -2,6 +2,13 @@ package m68k040.cache
 
 import spinal.core._
 
+/** Per-16-bit-word predecode result (one per chunk; 32 per 64-byte line).
+  * `lenWords` (1..5 = 2/4/6/8/10 bytes) is meaningful only when `simple`. 4 bits. */
+case class ChunkPredecode() extends Bundle {
+  val simple   = Bool()
+  val lenWords = UInt(3 bits)
+}
+
 object CacheMode extends SpinalEnum {
   val CACHEABLE, INHIBITED = newElement()
 }
@@ -17,6 +24,7 @@ case class FetchRsp() extends Bundle {
   val data  = Bits(64 bits)   // little-endian window: data[7:0] = byte at pc+0 ... data[63:56] = byte at pc+7
                               // (architectural big-endian byte-order is the fetch/align stage's concern, deferred)
   val fault = Bool()
+  val pred  = Vec(ChunkPredecode(), 4)   // predecode for the 4 words of the returned window
 }
 
 /** Translation request (virtual page number). */
