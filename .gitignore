@@ -1,0 +1,13 @@
+target/
+project/target/
+project/project/
+.bsp/
+.coursier/
+simWorkspace/
+generated/
+*.fst
+*.vcd
+hs_err_pid*.log
+.idea/
+.metals/
+.bloop/
