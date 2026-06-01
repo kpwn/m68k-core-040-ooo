@@ -3,6 +3,7 @@ package m68k040.services
 import m68k040.types.CommitTrace
 import m68k040.cache.{FetchCmd, FetchRsp, TranslationReq, TranslationRsp}
 import m68k040.frontend.DecodePacket
+import m68k040.decode.DecodedUop
 import spinal.core._
 import spinal.lib.{Stream, Flow}
 
@@ -39,4 +40,11 @@ trait TranslationService {
 trait DecodeFeedService {
   def feed: Stream[Vec[DecodePacket]]   // Vec length 2
   def slot1Valid: Bool
+}
+
+/** Produced by the decode stage; consumed by the (future) rename stage.
+  * Two µops/cycle. Plain Stream (directionless) per the service convention. */
+trait DecodeUopService {
+  def uops: Stream[Vec[DecodedUop]]   // Vec length 2
+  def uop1Valid: Bool
 }

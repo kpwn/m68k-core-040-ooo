@@ -31,7 +31,10 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val ibuf = new InstructionBuffer()
 
     // ---- Public ports (accessible from testbench via dut.fa.logic.*) ----
-    val feed          = master(Stream(Vec(DecodePacket(), 2)))
+    // feed is a plain directionless Stream (service convention: plain wires so a
+    // sibling plugin in the same Component can drive feed.ready without hierarchy
+    // violation; matches IcachePlugin.cmdPort convention).
+    val feed          = Stream(Vec(DecodePacket(), 2))   // producer drives valid/payload; consumer drives ready
     val slot1ValidOut = out(Bool())
     val slot1Valid    = slot1ValidOut   // alias for testbench access via logic.slot1Valid
     val redirect      = slave(Flow(UInt(32 bits)))
