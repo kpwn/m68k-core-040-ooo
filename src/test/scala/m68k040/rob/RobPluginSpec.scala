@@ -1,6 +1,6 @@
 package m68k040.rob
 
-import m68k040.{M68kParams, VerilatorTest}
+import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
 import m68k040.mmu.IdentityTranslationPlugin
 import m68k040.cache.{IcachePlugin, IcacheSim}
@@ -68,7 +68,7 @@ class RobPluginSpec extends AnyFunSuite {
 
   // ─────────────────────────────────────────────────────────────────────────────
   test("alloc + 2-wide retire") {
-    SimConfig.compile(new SimpleDut).doSim { dut =>
+    M68kSim().compile(new SimpleDut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       initSimple(dut, cd)
 
@@ -112,7 +112,7 @@ class RobPluginSpec extends AnyFunSuite {
 
   // ─────────────────────────────────────────────────────────────────────────────
   test("in-order: complete robId 1 but not 0 -> no retire until 0 completes") {
-    SimConfig.compile(new SimpleDut).doSim { dut =>
+    M68kSim().compile(new SimpleDut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       initSimple(dut, cd)
 
@@ -152,7 +152,7 @@ class RobPluginSpec extends AnyFunSuite {
 
   // ─────────────────────────────────────────────────────────────────────────────
   test("retireAlone: branch retires 1-wide even if head+1 complete") {
-    SimConfig.compile(new SimpleDut).doSim { dut =>
+    M68kSim().compile(new SimpleDut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       initSimple(dut, cd)
 
@@ -191,7 +191,7 @@ class RobPluginSpec extends AnyFunSuite {
 
   // ─────────────────────────────────────────────────────────────────────────────
   test("flush squashes in-flight entries") {
-    SimConfig.compile(new SimpleDut).doSim { dut =>
+    M68kSim().compile(new SimpleDut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       initSimple(dut, cd)
 
@@ -242,7 +242,7 @@ class RobPluginSpec extends AnyFunSuite {
   }
 
   test("sustained free-loop: real rename->rob keeps flowing past 48 allocations", VerilatorTest) {
-    SimConfig.withVerilator.compile(new E2EDut).doSim { dut =>
+    M68kSim().withVerilator.compile(new E2EDut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       dut.dsrc.logic.src.valid #= false
       dut.dsrc.logic.s1v #= false

@@ -1,6 +1,6 @@
 package m68k040.rename
 
-import m68k040.VerilatorTest
+import m68k040.{M68kSim, VerilatorTest}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -9,7 +9,7 @@ import org.scalatest.funsuite.AnyFunSuite
 class FreelistSpec extends AnyFunSuite {
   def mk = Freelist(physCount = 48, archCount = 16, popPorts = 2, pushPorts = 2)
   test("pops return distinct free ids (>= archCount)", VerilatorTest) {
-    SimConfig.withVerilator.compile(mk).doSim { dut =>
+    M68kSim().withVerilator.compile(mk).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
       dut.io.flush #= false; dut.io.pop.foreach(_.take #= false); dut.io.push.foreach(_.valid #= false)
       dut.clockDomain.waitSamplingWhere(dut.io.popReady.toBoolean)   // wait for init to finish
@@ -23,7 +23,7 @@ class FreelistSpec extends AnyFunSuite {
     }
   }
   test("non-prefix take (only pop(1)) consumes exactly one distinct id", VerilatorTest) {
-    SimConfig.withVerilator.compile(mk).doSim { dut =>
+    M68kSim().withVerilator.compile(mk).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
       dut.io.flush #= false; dut.io.pop.foreach(_.take #= false); dut.io.push.foreach(_.valid #= false)
       dut.clockDomain.waitSamplingWhere(dut.io.popReady.toBoolean)
@@ -37,7 +37,7 @@ class FreelistSpec extends AnyFunSuite {
     }
   }
   test("push returns an id to the pool", VerilatorTest) {
-    SimConfig.withVerilator.compile(mk).doSim { dut =>
+    M68kSim().withVerilator.compile(mk).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
       dut.io.flush #= false; dut.io.pop.foreach(_.take #= false); dut.io.push.foreach(_.valid #= false)
       dut.clockDomain.waitSamplingWhere(dut.io.popReady.toBoolean)

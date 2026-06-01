@@ -1,6 +1,6 @@
 package m68k040.top
 
-import m68k040.M68kParams
+import m68k040.{M68kParams, M68kSpinalConfig}
 import m68k040.core.{M68kCore, ParamPlugin, HelloPlugin}
 import m68k040.cache.IcachePlugin
 import m68k040.mmu.IdentityTranslationPlugin
@@ -17,7 +17,7 @@ object GenVerilog {
 
   def main(args: Array[String]): Unit = {
     val p = M68kParams()
-    SpinalConfig(targetDirectory = "generated")
+    M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog(new M68kCore(plugins(p)))
     println("Generated generated/M68kCore.v")
   }
@@ -41,7 +41,7 @@ object GenSynthVerilog {
 
   def main(args: Array[String]): Unit = {
     val p = M68kParams()
-    SpinalConfig(targetDirectory = "generated")
+    M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog(new M68kCore(plugins(p)).setDefinitionName("M68kCoreSynth"))
     println("Generated generated/M68kCoreSynth.v")
   }
@@ -62,7 +62,7 @@ object GenBackendSynthVerilog {
 
   def main(args: Array[String]): Unit = {
     val p = M68kParams()
-    SpinalConfig(targetDirectory = "generated")
+    M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog(new M68kCore(plugins(p)).setDefinitionName("M68kBackendSynth"))
     println("Generated generated/M68kBackendSynth.v")
   }
