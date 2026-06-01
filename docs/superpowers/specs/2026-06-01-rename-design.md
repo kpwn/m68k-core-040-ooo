@@ -93,6 +93,11 @@ RenamedUop {  // rename -> dispatch/ROB contract
 
 ## 7. Known divergences / deferrals (logged)
 - Commit/flush test-driven (real driver = ROB/commit slice).
+- **REQUIRED follow-up (commit/ROB slice): wire freelist push-on-commit.** This slice leaves `Freelist.io.push`
+  idle (`setIdle()`) — commit updates the committed RAT but does NOT return `pdstOld` back to the freelist.
+  Correct now (no test drains 48/16/16 regs), but under sustained operation the freelist monotonically drains
+  and rename stalls forever. `RenamedUop` already carries `pdstOld/pNzvcOld/pXOld` for this; the commit loop
+  MUST push them back. Non-negotiable before the core runs real programs.
 - Coarse freelist reset on flush (precise speculative-reclaim deferred; correct because spec RAT also resets to committed).
 - FP rename deferred (PRF not built; rename namespace reserved).
 - Memory/complex µops not produced by decode yet (sub-slices 2/3) — rename handles whatever DecodeUopService emits; `unimplemented` µops are carried through (rename maps their declared operands or none).
