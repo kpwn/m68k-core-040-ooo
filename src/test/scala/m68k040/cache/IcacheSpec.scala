@@ -288,4 +288,28 @@ class IcacheSpec extends AnyFunSuite {
       cd.waitSampling(4)
     }
   }
+
+  // -------- Streaming: 3 consecutive windows in a warm line all return correct data --------
+  test("three consecutive same-line hits return correct windows at the new latency", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      pulseInvalidateAll(dut, cd)
+
+      val base = 0x7000L
+      fetch(dut, cd, base)   // cold miss warms the whole 64B line
+      // Three windows within the same line (offsets 8, 16, 24): all hits.
+      for (off <- Seq(8L, 16L, 24L)) {
+        val got = fetch(dut, cd, base + off)
+        assert(got == IcacheSim.window64(base + off),
+          s"streaming hit at +$off mismatch: got 0x${got.toString(16)} expected 0x${IcacheSim.window64(base + off).toString(16)}")
+      }
+      cd.waitSampling(4)
+    }
+  }
 }
