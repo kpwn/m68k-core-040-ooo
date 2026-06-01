@@ -14,3 +14,12 @@ hs_err_pid*.log
 # stray root-level Verilog from elaboration tests that don't set a target dir
 /*.v
 unnamed.v
+# Vivado / synthesis artifacts (keep scripts in synth/, ignore outputs)
+synth/*.rpt
+synth/*.log
+synth/*.jou
+synth/*.dcp
+clockInfo.txt
+.Xil/
+vivado*.log
+vivado*.jou

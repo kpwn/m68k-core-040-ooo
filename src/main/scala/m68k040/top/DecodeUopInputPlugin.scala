@@ -1,0 +1,36 @@
+package m68k040.top
+
+import m68k040.decode.DecodedUop
+import m68k040.services.DecodeUopService
+import spinal.core._
+import spinal.lib._
+import spinal.lib.misc.plugin.FiberPlugin
+
+/** Synthesis-only boundary: provides DecodeUopService from registered top-level
+  * IO so the OoO backend (rename → ROB) can be synthesized out-of-context. The
+  * inputs are registered (RegNext) so measured paths are internal reg→reg, not
+  * unconstrained IO. */
+class DecodeUopInputPlugin extends FiberPlugin with DecodeUopService {
+  var uopsPort: Stream[Vec[DecodedUop]] = null
+  var uop1ValidReg: Bool = null
+
+  override def uops: Stream[Vec[DecodedUop]] = uopsPort
+  override def uop1Valid: Bool = uop1ValidReg
+
+  during setup {
+    uopsPort = Stream(Vec(DecodedUop(), 2))
+    uop1ValidReg = Bool()
+  }
+
+  val logic = during build new Area {
+    val uopsInPayload = in(Vec(DecodedUop(), 2))
+    val uopsInValid   = in Bool ()
+    val uop1ValidIn   = in Bool ()
+    val uopsOutReady  = out Bool ()
+
+    uopsPort.valid   := RegNext(uopsInValid)   init False
+    uopsPort.payload := RegNext(uopsInPayload)
+    uop1ValidReg     := RegNext(uop1ValidIn)   init False
+    uopsOutReady     := RegNext(uopsPort.ready) init False
+  }
+}

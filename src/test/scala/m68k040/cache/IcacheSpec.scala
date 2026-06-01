@@ -213,6 +213,42 @@ class IcacheSpec extends AnyFunSuite {
     }
   }
 
+  // -------- Latency: a warm hit responds exactly 2 cycles after accept (BRAM read) --------
+  test("warm hit responds exactly two cycles after cmd accept", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      pulseInvalidateAll(dut, cd)
+
+      val base = 0x6000L
+      fetch(dut, cd, base)            // cold miss warms the line
+      cd.waitSampling(4)              // let the pipeline drain to idle
+
+      // Present a hit and measure latency precisely.
+      dut.probe.logic.cmdIn.valid #= true
+      dut.probe.logic.cmdIn.payload.pc #= base
+      cd.waitSamplingWhere(
+        dut.probe.logic.cmdIn.ready.toBoolean && dut.probe.logic.cmdIn.valid.toBoolean)
+      dut.probe.logic.cmdIn.valid #= false
+      // +1 cycle: BRAM read still in flight, no response yet
+      cd.waitSampling()
+      assert(!dut.probe.logic.rspOut.valid.toBoolean,
+        "rsp must NOT be valid 1 cycle after accept (BRAM read in flight)")
+      // +2 cycles: response arrives
+      cd.waitSampling()
+      assert(dut.probe.logic.rspOut.valid.toBoolean,
+        "rsp must be valid exactly 2 cycles after accept")
+      assert(dut.probe.logic.rspOut.payload.data.toBigInt == IcacheSim.window64(base),
+        "2-cycle hit data mismatch")
+      cd.waitSampling(4)
+    }
+  }
+
   // -------- Test 3: crossing 64B boundary triggers a new refill --------
   test("crossing the 64B line boundary triggers a new refill", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
@@ -249,6 +285,30 @@ class IcacheSpec extends AnyFunSuite {
         s"new-line: data mismatch at 0x${(base+64).toHexString}: got 0x${result.toString(16)} expected 0x${expected.toString(16)}")
       assert(arBeatCounter == arAfterFirst + 1,
         s"crossing 64B boundary must issue exactly one new AXI burst: ar before=$arAfterFirst after=$arBeatCounter")
+      cd.waitSampling(4)
+    }
+  }
+
+  // -------- Streaming: 3 consecutive windows in a warm line all return correct data --------
+  test("three consecutive same-line hits return correct windows at the new latency", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      pulseInvalidateAll(dut, cd)
+
+      val base = 0x7000L
+      fetch(dut, cd, base)   // cold miss warms the whole 64B line
+      // Three windows within the same line (offsets 8, 16, 24): all hits.
+      for (off <- Seq(8L, 16L, 24L)) {
+        val got = fetch(dut, cd, base + off)
+        assert(got == IcacheSim.window64(base + off),
+          s"streaming hit at +$off mismatch: got 0x${got.toString(16)} expected 0x${IcacheSim.window64(base + off).toString(16)}")
+      }
       cd.waitSampling(4)
     }
   }
