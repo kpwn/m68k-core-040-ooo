@@ -1,6 +1,7 @@
 package m68k040.rename
 
-import m68k040.services.{DecodeUopService, RenameUopService}
+import m68k040.services.{DecodeUopService, RenameUopService, RenameCommitService}
+import m68k040.rob.CommitSlot
 import spinal.core._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
@@ -18,7 +19,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   * - flush: rollback all RATs + flush all freelists.
   * - commit: minimal int-RAT commit port (updates committed mapping).
   */
-class RenameStage extends FiberPlugin with RenameUopService {
+class RenameStage extends FiberPlugin with RenameUopService with RenameCommitService {
 
   val logic = during build new Area {
     val du = host[DecodeUopService]
@@ -34,12 +35,11 @@ class RenameStage extends FiberPlugin with RenameUopService {
     val xFree    = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = 2)
 
     // ── flush / commit ports ──────────────────────────────────────────────────
-    val flush = in Bool ()
-    val commit = Vec.fill(2)(slave(Flow(new Bundle {
-      val intArch  = UInt(4 bits)
-      val intNew   = UInt(6 bits)
-      val intWrite = Bool()
-    })))
+    // Plain directionless service wires (RenameCommitService): ROB (a sibling
+    // plugin) drives these; this stage consumes them. Standalone rename tests
+    // poke them in sim (simPublic).
+    val flush = Bool()
+    val commitPorts = Vec.fill(2)(Flow(CommitSlot()))
 
     // ── Committed-identity init ────────────────────────────────────────────────
     // Counter 0..15 drives intRat.commits(0) with (addr=i, data=i); the flag RATs
@@ -62,11 +62,14 @@ class RenameStage extends FiberPlugin with RenameUopService {
       xRat.io.commits(w).valid    := False
       xRat.io.commits(w).payload.assignDontCare()
     }
-    // Freelist push ports unused this slice (no commit-time free).
+    // Close the freelist loop: free old pdsts of retired instructions.
     for (k <- 0 until 2) {
-      intFree.io.push(k).setIdle()
-      nzvcFree.io.push(k).setIdle()
-      xFree.io.push(k).setIdle()
+      intFree.io.push(k).valid   := commitPorts(k).valid && commitPorts(k).intWrite
+      intFree.io.push(k).payload := commitPorts(k).intOld
+      nzvcFree.io.push(k).valid   := commitPorts(k).valid && commitPorts(k).nzvcWrite
+      nzvcFree.io.push(k).payload := commitPorts(k).nzvcOld
+      xFree.io.push(k).valid   := commitPorts(k).valid && commitPorts(k).xWrite
+      xFree.io.push(k).payload := commitPorts(k).xOld
     }
 
     // ── Rollback / flush wiring ────────────────────────────────────────────────
@@ -116,6 +119,9 @@ class RenameStage extends FiberPlugin with RenameUopService {
       r.cond         := dec.cond
       r.branchDisp   := dec.branchDisp
       r.unimplemented:= dec.unimplemented
+
+      // architectural int dst reg (threaded for commit RAT update + CommitTrace)
+      r.dstArch    := dec.dstReg
 
       // int operands
       r.psrcA      := intRat.io.reads(2 * s).data
@@ -191,16 +197,35 @@ class RenameStage extends FiberPlugin with RenameUopService {
         xRat.io.commits(0).data     := 0
       }
     } otherwise {
-      // normal: commits(0)/(1) driven by the commit ports (int RAT only)
-      intRat.io.commits(0).valid := commit(0).valid && commit(0).intWrite
-      intRat.io.commits(0).addr  := commit(0).intArch
-      intRat.io.commits(0).data  := commit(0).intNew
-      intRat.io.commits(1).valid := commit(1).valid && commit(1).intWrite
-      intRat.io.commits(1).addr  := commit(1).intArch
-      intRat.io.commits(1).data  := commit(1).intNew
+      // normal: commits(0) driven by the commit ports (int RAT only on slot 0
+      // because commits(0) is the init-muxed port; nzvc/x committed on both slots).
+      intRat.io.commits(0).valid := commitPorts(0).valid && commitPorts(0).intWrite
+      intRat.io.commits(0).addr  := commitPorts(0).intArch
+      intRat.io.commits(0).data  := commitPorts(0).intNew
+    }
+    // commits(1) for int and both slots for the flag RATs are not init-muxed.
+    when(initDone) {
+      intRat.io.commits(1).valid := commitPorts(1).valid && commitPorts(1).intWrite
+      intRat.io.commits(1).addr  := commitPorts(1).intArch
+      intRat.io.commits(1).data  := commitPorts(1).intNew
+    }
+    for (k <- 0 until 2) {
+      // commits(0) is init-muxed (only drivable once init is done); commits(1) is free.
+      val gate = if (k == 0) initDone else True
+      when(gate) {
+        nzvcRat.io.commits(k).valid := commitPorts(k).valid && commitPorts(k).nzvcWrite
+        nzvcRat.io.commits(k).addr  := 0
+        nzvcRat.io.commits(k).data  := commitPorts(k).nzvcNew
+        xRat.io.commits(k).valid := commitPorts(k).valid && commitPorts(k).xWrite
+        xRat.io.commits(k).addr  := 0
+        xRat.io.commits(k).data  := commitPorts(k).xNew
+      }
     }
   }
 
   override def uops: Stream[Vec[RenamedUop]] = logic.uopsPort
   override def uop1Valid: Bool               = logic.uop1Sig
+
+  override def commitPorts: Vec[Flow[CommitSlot]] = logic.commitPorts
+  override def flushPort:   Bool                  = logic.flush
 }

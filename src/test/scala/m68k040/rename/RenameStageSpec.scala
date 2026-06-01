@@ -16,7 +16,8 @@ class RenameStageSpec extends AnyFunSuite {
     val dsrc = new DecodeUopSourcePlugin
     val ren  = new RenameStage
     val sink = new RenameUopSinkPlugin
-    db.on { host.asHostOf(Seq[FiberPlugin](dsrc, ren, sink)) }
+    val cdrv = new RenameCommitDriverPlugin
+    db.on { host.asHostOf(Seq[FiberPlugin](dsrc, ren, sink, cdrv)) }
   }
 
   /** Poke all fields of a DecodedUop slot; unused default to 0/false. */
@@ -64,8 +65,8 @@ class RenameStageSpec extends AnyFunSuite {
       val cd = dut.clockDomain; cd.forkStimulus(10)
       dut.sink.logic.out.ready #= true
       dut.dsrc.logic.src.valid #= false
-      dut.ren.logic.flush #= false
-      dut.ren.logic.commit.foreach(_.valid #= false)
+      dut.cdrv.logic.flushIn #= false
+      dut.cdrv.logic.cmd.foreach(_.valid #= false)
       cd.waitSampling()
       waitInit(dut, cd)
 
@@ -89,8 +90,8 @@ class RenameStageSpec extends AnyFunSuite {
       val cd = dut.clockDomain; cd.forkStimulus(10)
       dut.sink.logic.out.ready #= true
       dut.dsrc.logic.src.valid #= false
-      dut.ren.logic.flush #= false
-      dut.ren.logic.commit.foreach(_.valid #= false)
+      dut.cdrv.logic.flushIn #= false
+      dut.cdrv.logic.cmd.foreach(_.valid #= false)
       cd.waitSampling()
       waitInit(dut, cd)
 
@@ -111,8 +112,8 @@ class RenameStageSpec extends AnyFunSuite {
       val cd = dut.clockDomain; cd.forkStimulus(10)
       dut.sink.logic.out.ready #= true
       dut.dsrc.logic.src.valid #= false
-      dut.ren.logic.flush #= false
-      dut.ren.logic.commit.foreach(_.valid #= false)
+      dut.cdrv.logic.flushIn #= false
+      dut.cdrv.logic.cmd.foreach(_.valid #= false)
       cd.waitSampling()
       waitInit(dut, cd)
 
@@ -135,8 +136,8 @@ class RenameStageSpec extends AnyFunSuite {
       val cd = dut.clockDomain; cd.forkStimulus(10)
       dut.sink.logic.out.ready #= true
       dut.dsrc.logic.src.valid #= false
-      dut.ren.logic.flush #= false
-      dut.ren.logic.commit.foreach(_.valid #= false)
+      dut.cdrv.logic.flushIn #= false
+      dut.cdrv.logic.cmd.foreach(_.valid #= false)
       cd.waitSampling()
       waitInit(dut, cd)
 
@@ -151,18 +152,21 @@ class RenameStageSpec extends AnyFunSuite {
       cd.waitSampling()
 
       // (b) commit D0 -> P0 to the committed RAT for one cycle
-      dut.ren.logic.commit(0).valid #= true
-      dut.ren.logic.commit(0).payload.intArch  #= 0
-      dut.ren.logic.commit(0).payload.intNew   #= p0
-      dut.ren.logic.commit(0).payload.intWrite #= true
+      dut.cdrv.logic.cmd(0).valid #= true
+      dut.cdrv.logic.cmd(0).payload.intArch   #= 0
+      dut.cdrv.logic.cmd(0).payload.intNew    #= p0
+      dut.cdrv.logic.cmd(0).payload.intOld    #= p0
+      dut.cdrv.logic.cmd(0).payload.intWrite  #= true
+      dut.cdrv.logic.cmd(0).payload.nzvcWrite #= false
+      dut.cdrv.logic.cmd(0).payload.xWrite    #= false
       cd.waitSampling()
-      dut.ren.logic.commit(0).valid #= false
+      dut.cdrv.logic.cmd(0).valid #= false
       cd.waitSampling()
 
       // (c) flush high one cycle (rollback)
-      dut.ren.logic.flush #= true
+      dut.cdrv.logic.flushIn #= true
       cd.waitSampling()
-      dut.ren.logic.flush #= false
+      dut.cdrv.logic.flushIn #= false
       cd.waitSampling()
 
       // wait for freelist re-init after flush

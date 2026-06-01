@@ -5,6 +5,7 @@ import m68k040.cache.{FetchCmd, FetchRsp, TranslationReq, TranslationRsp}
 import m68k040.frontend.DecodePacket
 import m68k040.decode.DecodedUop
 import m68k040.rename.RenamedUop
+import m68k040.rob.CommitSlot
 import spinal.core._
 import spinal.lib.{Stream, Flow}
 
@@ -12,9 +13,16 @@ import spinal.lib.{Stream, Flow}
   * A plugin implements a trait and registers via addService(this); consumers
   * resolve it with host[ServiceName]. Grown as real plugins are added. */
 
-/** Produced by the commit plugin; consumed by the verification harness. */
+/** Rename exposes; ROB drives. commitPorts = 2-wide retire commit+free; flushPort = rollback. */
+trait RenameCommitService {
+  def commitPorts: Vec[Flow[CommitSlot]]   // length 2
+  def flushPort:   Bool
+}
+
+/** ROB exposes; lock-step harness / sinks consume. Up to 2 retired instr/cycle. */
 trait CommitTraceService {
-  def trace: CommitTrace
+  def trace:     Vec[CommitTrace]   // length 2
+  def traceFire: Vec[Bool]          // length 2
 }
 
 /** Produced by the redirect/flush owner (commit/branch); consumed by frontend. */
