@@ -65,7 +65,7 @@ class RenameStageSpec extends AnyFunSuite {
       dut.sink.logic.out.ready #= true
       dut.dsrc.logic.src.valid #= false
       dut.ren.logic.flush #= false
-      dut.ren.logic.commit.foreach(_.valid #= false)
+      dut.ren.logic.commitPorts.foreach(_.valid #= false)
       cd.waitSampling()
       waitInit(dut, cd)
 
@@ -90,7 +90,7 @@ class RenameStageSpec extends AnyFunSuite {
       dut.sink.logic.out.ready #= true
       dut.dsrc.logic.src.valid #= false
       dut.ren.logic.flush #= false
-      dut.ren.logic.commit.foreach(_.valid #= false)
+      dut.ren.logic.commitPorts.foreach(_.valid #= false)
       cd.waitSampling()
       waitInit(dut, cd)
 
@@ -112,7 +112,7 @@ class RenameStageSpec extends AnyFunSuite {
       dut.sink.logic.out.ready #= true
       dut.dsrc.logic.src.valid #= false
       dut.ren.logic.flush #= false
-      dut.ren.logic.commit.foreach(_.valid #= false)
+      dut.ren.logic.commitPorts.foreach(_.valid #= false)
       cd.waitSampling()
       waitInit(dut, cd)
 
@@ -136,7 +136,7 @@ class RenameStageSpec extends AnyFunSuite {
       dut.sink.logic.out.ready #= true
       dut.dsrc.logic.src.valid #= false
       dut.ren.logic.flush #= false
-      dut.ren.logic.commit.foreach(_.valid #= false)
+      dut.ren.logic.commitPorts.foreach(_.valid #= false)
       cd.waitSampling()
       waitInit(dut, cd)
 
@@ -151,12 +151,15 @@ class RenameStageSpec extends AnyFunSuite {
       cd.waitSampling()
 
       // (b) commit D0 -> P0 to the committed RAT for one cycle
-      dut.ren.logic.commit(0).valid #= true
-      dut.ren.logic.commit(0).payload.intArch  #= 0
-      dut.ren.logic.commit(0).payload.intNew   #= p0
-      dut.ren.logic.commit(0).payload.intWrite #= true
+      dut.ren.logic.commitPorts(0).valid #= true
+      dut.ren.logic.commitPorts(0).payload.intArch   #= 0
+      dut.ren.logic.commitPorts(0).payload.intNew    #= p0
+      dut.ren.logic.commitPorts(0).payload.intOld    #= p0
+      dut.ren.logic.commitPorts(0).payload.intWrite  #= true
+      dut.ren.logic.commitPorts(0).payload.nzvcWrite #= false
+      dut.ren.logic.commitPorts(0).payload.xWrite    #= false
       cd.waitSampling()
-      dut.ren.logic.commit(0).valid #= false
+      dut.ren.logic.commitPorts(0).valid #= false
       cd.waitSampling()
 
       // (c) flush high one cycle (rollback)
