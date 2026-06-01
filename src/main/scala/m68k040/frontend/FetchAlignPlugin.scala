@@ -44,7 +44,9 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val started       = Reg(Bool()) init False       // don't fetch until first redirect
     val fetchInFlight = Reg(Bool()) init False       // single-outstanding guard
 
-    // EXPERIMENT: complexPending removed; emit-once relies on the stalled latch.
+    // Complex emit-once is enforced by the `stalled` latch (no separate delay reg):
+    // a complex packet has shiftWords=0, so on its fire only `stalled` advances,
+    // gating feed.valid until `resume` clears it.
 
     // Track whether the next rsp should drop leading words (set on redirect/resume)
     val dropPending = Reg(Bool()) init False
