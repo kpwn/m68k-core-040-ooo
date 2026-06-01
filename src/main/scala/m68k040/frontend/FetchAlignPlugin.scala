@@ -14,15 +14,11 @@ import spinal.lib.misc.plugin.FiberPlugin
   *  - Leading-word drop on redirect/resume: only enqueue words from decodePc's
   *    offset within the fetched 8-byte window.
   *  - Staleness: in-flight rsp after a redirect/resume is silently dropped.
-  *  - Complex-stall: emit the complex packet once (after 1 pending cycle), then
-  *    hold feed.valid low until resume.
-  *
-  * Complex-packet emission timing:
-  *   When a complex instruction is at the head of the buffer and stalled=False,
-  *   we set complexPending=True (registered, 1-cycle delay) and suppress feed.valid
-  *   on that first cycle.  On the NEXT cycle, complexPending=True enables emission
-  *   (feed.valid=True).  This ensures the test's waitSamplingWhere always sees the
-  *   complex packet (it always advances at least one clock before sampling).
+  *  - Complex-stall: emit the complex packet once, then hold feed.valid low
+  *    until resume. Emit-once is enforced by the `stalled` latch: when a complex
+  *    packet fires, `stalled` latches True the next cycle and suppresses
+  *    feed.valid until resume clears it. (No separate complexPending delay; the
+  *    complex packet is valid for one cycle, observed by per-cycle sampling.)
   */
 class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
 
