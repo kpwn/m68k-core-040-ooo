@@ -213,6 +213,42 @@ class IcacheSpec extends AnyFunSuite {
     }
   }
 
+  // -------- Latency: a warm hit responds exactly 2 cycles after accept (BRAM read) --------
+  test("warm hit responds exactly two cycles after cmd accept", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      pulseInvalidateAll(dut, cd)
+
+      val base = 0x6000L
+      fetch(dut, cd, base)            // cold miss warms the line
+      cd.waitSampling(4)              // let the pipeline drain to idle
+
+      // Present a hit and measure latency precisely.
+      dut.probe.logic.cmdIn.valid #= true
+      dut.probe.logic.cmdIn.payload.pc #= base
+      cd.waitSamplingWhere(
+        dut.probe.logic.cmdIn.ready.toBoolean && dut.probe.logic.cmdIn.valid.toBoolean)
+      dut.probe.logic.cmdIn.valid #= false
+      // +1 cycle: BRAM read still in flight, no response yet
+      cd.waitSampling()
+      assert(!dut.probe.logic.rspOut.valid.toBoolean,
+        "rsp must NOT be valid 1 cycle after accept (BRAM read in flight)")
+      // +2 cycles: response arrives
+      cd.waitSampling()
+      assert(dut.probe.logic.rspOut.valid.toBoolean,
+        "rsp must be valid exactly 2 cycles after accept")
+      assert(dut.probe.logic.rspOut.payload.data.toBigInt == IcacheSim.window64(base),
+        "2-cycle hit data mismatch")
+      cd.waitSampling(4)
+    }
+  }
+
   // -------- Test 3: crossing 64B boundary triggers a new refill --------
   test("crossing the 64B line boundary triggers a new refill", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
