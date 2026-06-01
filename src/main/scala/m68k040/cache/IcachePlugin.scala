@@ -34,8 +34,13 @@ class IcachePlugin extends FiberPlugin with FetchService {
   val logic = during build new Area {
 
     // ---- ports exposed to testbench / parent component ----
-    val cmdPort       = slave(Stream(FetchCmd()))
-    val rspPort       = master(Flow(FetchRsp()))
+    // EXPERIMENT (Approach 1): plain Stream/Flow (no slave/master). The I-cache
+    // is the cmd CONSUMER (drives ready, reads valid/payload) and the rsp
+    // PRODUCER (drives valid/payload). As plain directionless wires, a sibling
+    // plugin in the same Component can drive cmd.valid/payload without
+    // setAsDirectionLess. Standalone, a probe plugin provides the top-level IO.
+    val cmdPort       = Stream(FetchCmd())
+    val rspPort       = Flow(FetchRsp())
     val axi           = master(Axi4ReadOnly(axiCfg))
     val invalidateAll = in Bool()
 

@@ -11,7 +11,8 @@ class IcacheElaborateSpec extends AnyFunSuite {
   test("I-cache + identity translation elaborate inside a plugin host") {
     val report = SpinalConfig(targetDirectory = "simWorkspace/gen").generateVerilog {
       IcacheTop(Seq[FiberPlugin](
-        new ParamPlugin(M68kParams()), new IdentityTranslationPlugin, new IcachePlugin))
+        new ParamPlugin(M68kParams()), new IdentityTranslationPlugin, new IcachePlugin,
+        new FetchProbePlugin))   // provides a cmd producer for the plain service Stream
     }
     assert(report.toplevelName.nonEmpty)
   }

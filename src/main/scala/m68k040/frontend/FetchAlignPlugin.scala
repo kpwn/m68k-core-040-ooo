@@ -41,14 +41,6 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val redirect      = slave(Flow(UInt(32 bits)))
     val resume        = slave(Flow(UInt(32 bits)))
 
-    // ---- Make ic.cmd signals directionless so we can drive them from within ----
-    // ic.cmd is declared as slave(Stream(...)) in IcachePlugin, which makes the
-    // valid/payload signals appear as "in" ports of the Dut component.  By
-    // stripping the direction we make them plain wires that the hierarchy checker
-    // allows to be assigned from within the same component.
-    ic.cmd.valid.setAsDirectionLess()
-    ic.cmd.payload.pc.setAsDirectionLess()
-
     // ---- State registers ----
     val decodePc      = Reg(UInt(32 bits)) init 0
     val fetchPc       = Reg(UInt(32 bits)) init 0   // 8-aligned
