@@ -96,13 +96,18 @@ case class Freelist(
   io.popReady := initDone && (count >= U(popPorts, countW bits))
 
   // ── Async reads (pop outputs) ─────────────────────────────────────────────
+  // Compact the take mask: pop(k) reads from head + (number of takes among ports 0..k-1).
+  // This ensures each asserted take consumes a distinct id regardless of which ports fire.
+  // Non-asserted ports' id outputs are don't-care (the consumer ignores them when take=false).
   for (k <- 0 until popPorts) {
-    io.pop(k).id := ram.readAsync((head + U(k, ptrW bits)).resized)
+    val lowerTakes =
+      if (k == 0) U(0, log2Up(popPorts + 1) bits)
+      else (0 until k).map(j => io.pop(j).take.asUInt.resize(log2Up(popPorts + 1))).reduce(_ +^ _)
+    io.pop(k).id := ram.readAsync((head + lowerTakes.resized).resized)
   }
 
   // ── Pop / push updates (only when init done and not flushing) ─────────────
   when(initDone && !io.flush) {
-    // Count takes (prefix assumption: takes are 0..n-1)
     val takeCount = io.pop.map(p => p.take.asUInt.resize(log2Up(popPorts + 1))).reduceLeft(_ + _)
 
     // Count and apply pushes
