@@ -1,0 +1,206 @@
+package m68k040.rename
+
+import m68k040.services.{DecodeUopService, RenameUopService}
+import spinal.core._
+import spinal.lib._
+import spinal.lib.misc.plugin.FiberPlugin
+
+/** RenameStage: 2-wide register rename (int + split CCR: NZVC and X).
+  *
+  * - Three RATs (int, nzvc, x) provide arch->phys mappings with O(1) rollback.
+  * - Three freelists allocate physical destinations.
+  * - Intra-group hazards: slot1 RAW from slot0's int/flag writes; slot1 pdstOld
+  *   bypass when slot0 wrote the same int reg; WAW handled by two distinct
+  *   freelist pops (RatTable multi-write-bypass makes slot1 final in the RAT).
+  * - Committed-identity init: seeds the int RAT committed RAM with identity
+  *   (arch i -> phys i) and the flag RATs (arch 0 -> phys 0) so flush restores
+  *   sane mappings. Normal operation gated until init done.
+  * - flush: rollback all RATs + flush all freelists.
+  * - commit: minimal int-RAT commit port (updates committed mapping).
+  */
+class RenameStage extends FiberPlugin with RenameUopService {
+
+  val logic = during build new Area {
+    val du = host[DecodeUopService]
+
+    // ── RATs (int RAT: 4 src reads + 2 dst-old reads = 6 read ports) ─────────
+    val intRat  = RatTable(physIdWidth = 6, archDepth = 16, writePorts = 2, commitPorts = 2, readPorts = 6)
+    val nzvcRat = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = 2, readPorts = 2)
+    val xRat    = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = 2, readPorts = 2)
+
+    // ── Freelists ────────────────────────────────────────────────────────────
+    val intFree  = Freelist(physCount = 48, archCount = 16, popPorts = 2, pushPorts = 2)
+    val nzvcFree = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = 2)
+    val xFree    = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = 2)
+
+    // ── flush / commit ports ──────────────────────────────────────────────────
+    val flush = in Bool ()
+    val commit = Vec.fill(2)(slave(Flow(new Bundle {
+      val intArch  = UInt(4 bits)
+      val intNew   = UInt(6 bits)
+      val intWrite = Bool()
+    })))
+
+    // ── Committed-identity init ────────────────────────────────────────────────
+    // Counter 0..15 drives intRat.commits(0) with (addr=i, data=i); the flag RATs
+    // commit (addr 0, data 0) on the first cycle. Gate normal operation until done.
+    val initDone    = Reg(Bool()) init False
+    val initCounter = Reg(UInt(5 bits)) init 0   // 0..16
+    when(!initDone) {
+      when(initCounter === U(15)) {
+        initDone := True
+      }
+      initCounter := initCounter + 1
+    }
+
+    // ── Default flow valids for commit ports (driven by the init/commit mux) ───
+    for (w <- 0 until 2) {
+      intRat.io.commits(w).valid  := False
+      intRat.io.commits(w).payload.assignDontCare()
+      nzvcRat.io.commits(w).valid := False
+      nzvcRat.io.commits(w).payload.assignDontCare()
+      xRat.io.commits(w).valid    := False
+      xRat.io.commits(w).payload.assignDontCare()
+    }
+    // Freelist push ports unused this slice (no commit-time free).
+    for (k <- 0 until 2) {
+      intFree.io.push(k).setIdle()
+      nzvcFree.io.push(k).setIdle()
+      xFree.io.push(k).setIdle()
+    }
+
+    // ── Rollback / flush wiring ────────────────────────────────────────────────
+    intRat.io.rollback  := flush
+    nzvcRat.io.rollback := flush
+    xRat.io.rollback    := flush
+    intFree.io.flush  := flush
+    nzvcFree.io.flush := flush
+    xFree.io.flush    := flush
+
+    // ── Output stream ──────────────────────────────────────────────────────────
+    val uopsPort = Stream(Vec(RenamedUop(), 2))
+
+    // Stream handshake / init gating
+    val freeReady = intFree.io.popReady && nzvcFree.io.popReady && xFree.io.popReady
+    uopsPort.valid := du.uops.valid && initDone
+    du.uops.ready  := initDone && uopsPort.ready && freeReady
+    val fire = du.uops.fire
+    val uop1Sig = du.uops.valid && du.uop1Valid
+
+    // ── Per-slot rename ────────────────────────────────────────────────────────
+    // Build raw (pre-bypass) renamed uops, then apply intra-group bypass for slot1.
+    val raw = Vec(RenamedUop(), 2)
+
+    for (s <- 0 until 2) {
+      val dec = du.uops.payload(s)
+      val r   = raw(s)
+
+      // int src reads
+      intRat.io.reads(2 * s).addr     := dec.srcAReg
+      intRat.io.reads(2 * s + 1).addr := dec.srcBReg
+      // int dst-old read
+      intRat.io.reads(4 + s).addr     := dec.dstReg
+      // flag src reads (single arch entry, addr 0)
+      nzvcRat.io.reads(s).addr := 0
+      xRat.io.reads(s).addr    := 0
+
+      // copy decoded fields
+      r.valid        := dec.valid
+      r.pc           := dec.pc
+      r.op           := dec.op
+      r.cluster      := dec.cluster
+      r.size         := dec.size
+      r.useImm       := dec.useImm
+      r.imm          := dec.imm
+      r.isBranch     := dec.isBranch
+      r.cond         := dec.cond
+      r.branchDisp   := dec.branchDisp
+      r.unimplemented:= dec.unimplemented
+
+      // int operands
+      r.psrcA      := intRat.io.reads(2 * s).data
+      r.psrcAValid := dec.srcAValid
+      r.psrcB      := intRat.io.reads(2 * s + 1).data
+      r.psrcBValid := dec.srcBValid
+
+      // int dst allocation
+      intFree.io.pop(s).take := fire && dec.dstValid
+      r.pdst       := intFree.io.pop(s).id
+      r.pdstValid  := dec.dstValid
+      r.pdstOld    := intRat.io.reads(4 + s).data
+      intRat.io.writes(s).valid := fire && dec.dstValid
+      intRat.io.writes(s).addr  := dec.dstReg
+      intRat.io.writes(s).data  := intFree.io.pop(s).id
+
+      // NZVC src + dst
+      r.pNzvcSrc  := nzvcRat.io.reads(s).data
+      r.readsNzvc := dec.readsNzvc
+      nzvcFree.io.pop(s).take := fire && dec.writesNzvc
+      r.pNzvcDst  := nzvcFree.io.pop(s).id
+      r.writesNzvc:= dec.writesNzvc
+      r.pNzvcOld  := nzvcRat.io.reads(s).data
+      nzvcRat.io.writes(s).valid := fire && dec.writesNzvc
+      nzvcRat.io.writes(s).addr  := 0
+      nzvcRat.io.writes(s).data  := nzvcFree.io.pop(s).id
+
+      // X src + dst
+      r.pXSrc  := xRat.io.reads(s).data
+      r.readsX := dec.readsX
+      xFree.io.pop(s).take := fire && dec.writesX
+      r.pXDst  := xFree.io.pop(s).id
+      r.writesX:= dec.writesX
+      r.pXOld  := xRat.io.reads(s).data
+      xRat.io.writes(s).valid := fire && dec.writesX
+      xRat.io.writes(s).addr  := 0
+      xRat.io.writes(s).data  := xFree.io.pop(s).id
+    }
+
+    // ── Intra-group hazards (slot1 reads slot0's writes) ───────────────────────
+    val dec0 = du.uops.payload(0)
+    val dec1 = du.uops.payload(1)
+    val slot0 = raw(0)
+    val slot1 = raw(1)
+
+    // int RAW
+    when(dec0.dstValid && dec0.dstReg === dec1.srcAReg) { slot1.psrcA := slot0.pdst }
+    when(dec0.dstValid && dec0.dstReg === dec1.srcBReg) { slot1.psrcB := slot0.pdst }
+    // int dst-old: slot1 overwrites a reg slot0 also wrote -> old is slot0's pdst
+    when(dec0.dstValid && dec0.dstReg === dec1.dstReg)  { slot1.pdstOld := slot0.pdst }
+    // flag RAW (single arch entry)
+    when(dec0.writesNzvc) { slot1.pNzvcSrc := slot0.pNzvcDst; slot1.pNzvcOld := slot0.pNzvcDst }
+    when(dec0.writesX)    { slot1.pXSrc := slot0.pXDst;       slot1.pXOld := slot0.pXDst }
+
+    uopsPort.payload(0) := slot0
+    uopsPort.payload(1) := slot1
+    uopsPort.payload(0).valid.allowOverride; uopsPort.payload(0).valid := du.uops.valid
+    uopsPort.payload(1).valid.allowOverride; uopsPort.payload(1).valid := uop1Sig
+
+    // ── Commit + init mux on intRat.commits(0) ─────────────────────────────────
+    when(!initDone) {
+      // init drives commits(0) with identity (addr=i, data=i)
+      intRat.io.commits(0).valid := True
+      intRat.io.commits(0).addr  := initCounter.resized
+      intRat.io.commits(0).data  := initCounter.resized
+      // flag RATs: seed arch 0 -> phys 0 on the first init cycle
+      when(initCounter === U(0)) {
+        nzvcRat.io.commits(0).valid := True
+        nzvcRat.io.commits(0).addr  := 0
+        nzvcRat.io.commits(0).data  := 0
+        xRat.io.commits(0).valid    := True
+        xRat.io.commits(0).addr     := 0
+        xRat.io.commits(0).data     := 0
+      }
+    } otherwise {
+      // normal: commits(0)/(1) driven by the commit ports (int RAT only)
+      intRat.io.commits(0).valid := commit(0).valid && commit(0).intWrite
+      intRat.io.commits(0).addr  := commit(0).intArch
+      intRat.io.commits(0).data  := commit(0).intNew
+      intRat.io.commits(1).valid := commit(1).valid && commit(1).intWrite
+      intRat.io.commits(1).addr  := commit(1).intArch
+      intRat.io.commits(1).data  := commit(1).intNew
+    }
+  }
+
+  override def uops: Stream[Vec[RenamedUop]] = logic.uopsPort
+  override def uop1Valid: Bool               = logic.uop1Sig
+}
