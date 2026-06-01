@@ -4,6 +4,7 @@ import spinal.core._
 
 /** One m68k instruction handed to the (future) decode stage. */
 case class DecodePacket() extends Bundle {
+  val valid     = Bool()
   val pc        = UInt(32 bits)
   val words     = Vec(Bits(16 bits), 5)   // opword + up to 4 following words (10 bytes max simple)
   val wordCount = UInt(3 bits)            // valid words in `words` (1..5)
