@@ -1,6 +1,6 @@
 package m68k040.rename
 
-import m68k040.VerilatorTest
+import m68k040.{M68kSim, VerilatorTest}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -9,7 +9,7 @@ import org.scalatest.funsuite.AnyFunSuite
 class RatTableSpec extends AnyFunSuite {
   def mk = RatTable(physIdWidth = 6, archDepth = 16, writePorts = 2, commitPorts = 2, readPorts = 2)
   test("write then read returns speculative mapping", VerilatorTest) {
-    SimConfig.withVerilator.compile(mk).doSim { dut =>
+    M68kSim().withVerilator.compile(mk).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
       dut.io.rollback #= false
       dut.io.writes.foreach(_.valid #= false); dut.io.commits.foreach(_.valid #= false)
@@ -21,7 +21,7 @@ class RatTableSpec extends AnyFunSuite {
     }
   }
   test("commit + rollback restores committed mapping (O(1))", VerilatorTest) {
-    SimConfig.withVerilator.compile(mk).doSim { dut =>
+    M68kSim().withVerilator.compile(mk).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
       dut.io.rollback #= false; dut.io.writes.foreach(_.valid #= false); dut.io.commits.foreach(_.valid #= false)
       dut.clockDomain.waitSampling()
@@ -37,7 +37,7 @@ class RatTableSpec extends AnyFunSuite {
     }
   }
   test("two write ports same addr -> later port wins", VerilatorTest) {
-    SimConfig.withVerilator.compile(mk).doSim { dut =>
+    M68kSim().withVerilator.compile(mk).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
       dut.io.rollback #= false; dut.io.writes.foreach(_.valid #= false); dut.io.commits.foreach(_.valid #= false)
       dut.clockDomain.waitSampling()
@@ -46,6 +46,26 @@ class RatTableSpec extends AnyFunSuite {
       dut.clockDomain.waitSampling(); dut.io.writes.foreach(_.valid #= false); dut.clockDomain.waitSampling()
       dut.io.reads(0).addr #= 7; sleep(1)
       assert(dut.io.reads(0).data.toInt == 21, "later write port wins WAW")
+    }
+  }
+  test("multi-port writes reconstruct via lowered banks (XOR)", VerilatorTest) {
+    M68kSim().withVerilator.compile(mk).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      dut.io.rollback #= false
+      dut.io.writes.foreach { w => w.valid #= false }
+      dut.io.commits.foreach { c => c.valid #= false }
+      cd.waitSampling(2)
+      dut.io.writes(0).valid #= true; dut.io.writes(0).addr #= 3; dut.io.writes(0).data #= 17
+      dut.io.writes(1).valid #= true; dut.io.writes(1).addr #= 9; dut.io.writes(1).data #= 42
+      cd.waitSampling()
+      dut.io.writes.foreach { w => w.valid #= false }
+      cd.waitSampling()
+      dut.io.reads(0).addr #= 3
+      dut.io.reads(1).addr #= 9
+      sleep(1)
+      assert(dut.io.reads(0).data.toBigInt == 17, s"reg3 got ${dut.io.reads(0).data.toBigInt}")
+      assert(dut.io.reads(1).data.toBigInt == 42, s"reg9 got ${dut.io.reads(1).data.toBigInt}")
     }
   }
 }

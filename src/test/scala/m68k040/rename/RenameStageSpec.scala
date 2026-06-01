@@ -1,5 +1,6 @@
 package m68k040.rename
 
+import m68k040.M68kSim
 import m68k040.decode.{DecodedUop, DecOp}
 import m68k040.isa.{Cluster, Size}
 import spinal.core._
@@ -61,7 +62,7 @@ class RenameStageSpec extends AnyFunSuite {
   }
 
   test("intra-group RAW: slot1 src reads slot0 dst") {
-    SimConfig.compile(new Dut).doSim { dut =>
+    M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       dut.sink.logic.out.ready #= true
       dut.dsrc.logic.src.valid #= false
@@ -86,7 +87,7 @@ class RenameStageSpec extends AnyFunSuite {
   }
 
   test("WAW: both write same int reg get distinct phys allocations") {
-    SimConfig.compile(new Dut).doSim { dut =>
+    M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       dut.sink.logic.out.ready #= true
       dut.dsrc.logic.src.valid #= false
@@ -108,7 +109,7 @@ class RenameStageSpec extends AnyFunSuite {
   }
 
   test("flag rename RAW: slot1 NZVC src reads slot0 NZVC dst") {
-    SimConfig.compile(new Dut).doSim { dut =>
+    M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       dut.sink.logic.out.ready #= true
       dut.dsrc.logic.src.valid #= false
@@ -132,7 +133,7 @@ class RenameStageSpec extends AnyFunSuite {
   }
 
   test("commit + flush restores committed int mapping") {
-    SimConfig.compile(new Dut).doSim { dut =>
+    M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       dut.sink.logic.out.ready #= true
       dut.dsrc.logic.src.valid #= false
