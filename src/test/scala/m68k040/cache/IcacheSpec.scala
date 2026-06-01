@@ -22,10 +22,12 @@ class IcacheSpec extends AnyFunSuite {
     val param  = new ParamPlugin(M68kParams())
     val xlate  = new IdentityTranslationPlugin
     val icache = new IcachePlugin
+    val probe  = new FetchProbePlugin   // exposes cmdIn/rspOut top-level IO
 
-    db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, icache)) }
-    // No manual wiring needed: slave(Stream(FetchCmd())) etc. created inside
-    // icache.logic (during build) automatically become top-level IO of this Component.
+    db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, icache, probe)) }
+    // The I-cache's cmd/rsp are plain (directionless) service Streams. The probe
+    // plugin's during-build wires them to its own slave/master IO, which become
+    // top-level IO of this Component for the sim to drive/observe.
   }
 
   // ---- sim helpers (all port access through dut.icache.logic.* post-elaboration) ----
@@ -42,14 +44,14 @@ class IcacheSpec extends AnyFunSuite {
     * Returns the 64-bit response data. */
   def fetch(dut: Dut, cd: ClockDomain, pc: Long): BigInt = {
     // present the command
-    dut.icache.logic.cmdPort.valid #= true
-    dut.icache.logic.cmdPort.payload.pc #= pc
+    dut.probe.logic.cmdIn.valid #= true
+    dut.probe.logic.cmdIn.payload.pc #= pc
     // wait until cmd fires (ready && valid)
-    cd.waitSamplingWhere(dut.icache.logic.cmdPort.ready.toBoolean && dut.icache.logic.cmdPort.valid.toBoolean)
-    dut.icache.logic.cmdPort.valid #= false
+    cd.waitSamplingWhere(dut.probe.logic.cmdIn.ready.toBoolean && dut.probe.logic.cmdIn.valid.toBoolean)
+    dut.probe.logic.cmdIn.valid #= false
     // wait for response
-    cd.waitSamplingWhere(dut.icache.logic.rspPort.valid.toBoolean)
-    dut.icache.logic.rspPort.payload.data.toBigInt
+    cd.waitSamplingWhere(dut.probe.logic.rspOut.valid.toBoolean)
+    dut.probe.logic.rspOut.payload.data.toBigInt
   }
 
   // ---- test harness factory ----
@@ -64,8 +66,8 @@ class IcacheSpec extends AnyFunSuite {
       // attach behavioral AXI memory (cover a big range)
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
 
-      dut.icache.logic.cmdPort.valid    #= false
-      dut.icache.logic.cmdPort.payload.pc #= 0
+      dut.probe.logic.cmdIn.valid    #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
       dut.icache.logic.invalidateAll    #= false
 
       cd.waitSampling(2)
@@ -89,8 +91,8 @@ class IcacheSpec extends AnyFunSuite {
 
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
 
-      dut.icache.logic.cmdPort.valid    #= false
-      dut.icache.logic.cmdPort.payload.pc #= 0
+      dut.probe.logic.cmdIn.valid    #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
       dut.icache.logic.invalidateAll    #= false
 
       cd.waitSampling(2)
@@ -128,8 +130,8 @@ class IcacheSpec extends AnyFunSuite {
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
-      dut.icache.logic.cmdPort.valid #= false
-      dut.icache.logic.cmdPort.payload.pc #= 0
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
       dut.icache.logic.invalidateAll #= false
       cd.waitSampling(2)
       pulseInvalidateAll(dut, cd)
@@ -159,8 +161,8 @@ class IcacheSpec extends AnyFunSuite {
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
-      dut.icache.logic.cmdPort.valid #= false
-      dut.icache.logic.cmdPort.payload.pc #= 0
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
       dut.icache.logic.invalidateAll #= false
       cd.waitSampling(2)
       pulseInvalidateAll(dut, cd)
@@ -192,20 +194,20 @@ class IcacheSpec extends AnyFunSuite {
       val base = 0x5000L
       val words = Seq(0x7005, 0x5240, 0x3200, 0x6000) // MOVEQ(simple1), ADDQ(complex), MOVE.W D0,D1(simple1), BRA.w(simple2)
       IcacheSim.attachMemoryWithWords(dut.icache.logic.axi, cd, base, words)
-      dut.icache.logic.cmdPort.valid #= false
-      dut.icache.logic.cmdPort.payload.pc #= 0
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
       dut.icache.logic.invalidateAll #= false
       cd.waitSampling(2); pulseInvalidateAll(dut, cd)
-      dut.icache.logic.cmdPort.valid #= true
-      dut.icache.logic.cmdPort.payload.pc #= base
-      cd.waitSamplingWhere(dut.icache.logic.cmdPort.ready.toBoolean)
-      dut.icache.logic.cmdPort.valid #= false
-      cd.waitSamplingWhere(dut.icache.logic.rspPort.valid.toBoolean)
+      dut.probe.logic.cmdIn.valid #= true
+      dut.probe.logic.cmdIn.payload.pc #= base
+      cd.waitSamplingWhere(dut.probe.logic.cmdIn.ready.toBoolean)
+      dut.probe.logic.cmdIn.valid #= false
+      cd.waitSamplingWhere(dut.probe.logic.rspOut.valid.toBoolean)
       for (i <- 0 until 4) {
         val ref = m68k040.frontend.PredecodeRef.classify(words(i))
-        assert(dut.icache.logic.rspPort.payload.pred(i).simple.toBoolean == ref.simple, s"chunk $i simple: ref=${ref.simple}")
+        assert(dut.probe.logic.rspOut.payload.pred(i).simple.toBoolean == ref.simple, s"chunk $i simple: ref=${ref.simple}")
         if (ref.simple)
-          assert(dut.icache.logic.rspPort.payload.pred(i).lenWords.toInt == ref.lenWords, s"chunk $i len: ref=${ref.lenWords}")
+          assert(dut.probe.logic.rspOut.payload.pred(i).lenWords.toInt == ref.lenWords, s"chunk $i len: ref=${ref.lenWords}")
       }
       cd.waitSampling(4)
     }
@@ -219,8 +221,8 @@ class IcacheSpec extends AnyFunSuite {
 
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
 
-      dut.icache.logic.cmdPort.valid    #= false
-      dut.icache.logic.cmdPort.payload.pc #= 0
+      dut.probe.logic.cmdIn.valid    #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
       dut.icache.logic.invalidateAll    #= false
 
       cd.waitSampling(2)

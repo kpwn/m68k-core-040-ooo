@@ -14,15 +14,11 @@ import spinal.lib.misc.plugin.FiberPlugin
   *  - Leading-word drop on redirect/resume: only enqueue words from decodePc's
   *    offset within the fetched 8-byte window.
   *  - Staleness: in-flight rsp after a redirect/resume is silently dropped.
-  *  - Complex-stall: emit the complex packet once (after 1 pending cycle), then
-  *    hold feed.valid low until resume.
-  *
-  * Complex-packet emission timing:
-  *   When a complex instruction is at the head of the buffer and stalled=False,
-  *   we set complexPending=True (registered, 1-cycle delay) and suppress feed.valid
-  *   on that first cycle.  On the NEXT cycle, complexPending=True enables emission
-  *   (feed.valid=True).  This ensures the test's waitSamplingWhere always sees the
-  *   complex packet (it always advances at least one clock before sampling).
+  *  - Complex-stall: emit the complex packet once, then hold feed.valid low
+  *    until resume. Emit-once is enforced by the `stalled` latch: when a complex
+  *    packet fires, `stalled` latches True the next cycle and suppresses
+  *    feed.valid until resume clears it. (No separate complexPending delay; the
+  *    complex packet is valid for one cycle, observed by per-cycle sampling.)
   */
 class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
 
@@ -41,14 +37,6 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val redirect      = slave(Flow(UInt(32 bits)))
     val resume        = slave(Flow(UInt(32 bits)))
 
-    // ---- Make ic.cmd signals directionless so we can drive them from within ----
-    // ic.cmd is declared as slave(Stream(...)) in IcachePlugin, which makes the
-    // valid/payload signals appear as "in" ports of the Dut component.  By
-    // stripping the direction we make them plain wires that the hierarchy checker
-    // allows to be assigned from within the same component.
-    ic.cmd.valid.setAsDirectionLess()
-    ic.cmd.payload.pc.setAsDirectionLess()
-
     // ---- State registers ----
     val decodePc      = Reg(UInt(32 bits)) init 0
     val fetchPc       = Reg(UInt(32 bits)) init 0   // 8-aligned
@@ -56,9 +44,9 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val started       = Reg(Bool()) init False       // don't fetch until first redirect
     val fetchInFlight = Reg(Bool()) init False       // single-outstanding guard
 
-    // complexPending: set when a complex is at head but not yet emitted (1-cycle delay
-    // before emission so waitSamplingWhere-style tests can observe the packet).
-    val complexPending = Reg(Bool()) init False
+    // Complex emit-once is enforced by the `stalled` latch (no separate delay reg):
+    // a complex packet has shiftWords=0, so on its fire only `stalled` advances,
+    // gating feed.valid until `resume` clears it.
 
     // Track whether the next rsp should drop leading words (set on redirect/resume)
     val dropPending = Reg(Bool()) init False
@@ -126,24 +114,13 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // ---- Aligner: combinational decode of buffer head ----
     val res = Aligner.align(decodePc, ibuf.io.head, ibuf.io.headPred, ibuf.io.avail)
 
-    // ---- Complex-pending logic ----
-    // When complex at head, not stalled, not yet pending: mark as pending (1-cycle delay).
-    when(!stalled && res.slot0Valid && res.complex && !complexPending) {
-      complexPending := True
-    }
-    // Clear pending when complex fires or on redirect/resume
-    when((feed.fire && res.complex) || redirect.valid || (resume.valid && stalled)) {
-      complexPending := False
-    }
-
     // ---- Feed valid logic ----
-    // Simple packets: emit immediately when at head and not stalled.
-    // Complex packets: emit only after 1 cycle of being at head (complexPending=True).
-    val complexEmit = complexPending && res.slot0Valid && res.complex && !stalled
+    // Emit when a packet is at head and not stalled. Complex packets emit once:
+    // the cycle after they fire, the stalled latch suppresses re-emission.
     feed.payload(0) := res.slot0
     feed.payload(1) := res.slot1
     slot1ValidOut   := res.slot1Valid
-    feed.valid      := (res.slot0Valid && !res.complex && !stalled) || complexEmit
+    feed.valid      := res.slot0Valid && !stalled
 
     // When feed fires: consume words from buffer and advance decodePc
     when(feed.fire) {
@@ -164,7 +141,6 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       ibuf.io.flush  := True
       stalled        := False
       started        := True
-      complexPending := False
       // Drop leading words on the next rsp: startWord = newPc[2:1] (word index within 8-byte window)
       dropPending    := True
       dropCount      := newPc(2 downto 1)
@@ -182,7 +158,6 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       fetchPc     := newPc(31 downto 3) @@ U(0, 3 bits)
       ibuf.io.flush  := True
       stalled        := False
-      complexPending := False
       dropPending    := True
       dropCount      := newPc(2 downto 1)
       when(fetchInFlight) {
