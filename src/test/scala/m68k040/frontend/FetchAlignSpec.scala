@@ -52,11 +52,11 @@ class FetchAlignSpec extends AnyFunSuite {
       dut.fa.logic.feed.ready #= true
       var sawComplex = false; var guard = 0
       while (!sawComplex && guard < 80) {
-        cd.waitSamplingWhere(dut.fa.logic.feed.valid.toBoolean || {guard += 1; guard >= 80})
+        cd.waitSampling(); guard += 1
         if (dut.fa.logic.feed.valid.toBoolean && dut.fa.logic.feed.payload(0).complex.toBoolean) {
           assert(dut.fa.logic.feed.payload(0).pc.toLong == base + 2, s"complex pc=${dut.fa.logic.feed.payload(0).pc.toLong.toHexString}")
           sawComplex = true
-        } else cd.waitSampling()
+        }
       }
       assert(sawComplex, "expected a complex packet at base+2")
       cd.waitSampling(3)
