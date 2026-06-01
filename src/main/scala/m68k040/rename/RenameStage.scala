@@ -35,8 +35,11 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     val xFree    = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = 2)
 
     // ── flush / commit ports ──────────────────────────────────────────────────
-    val flush = in Bool ()
-    val commitPorts = Vec.fill(2)(slave(Flow(CommitSlot())))
+    // Plain directionless service wires (RenameCommitService): ROB (a sibling
+    // plugin) drives these; this stage consumes them. Standalone rename tests
+    // poke them in sim (simPublic).
+    val flush = Bool()
+    val commitPorts = Vec.fill(2)(Flow(CommitSlot()))
 
     // ── Committed-identity init ────────────────────────────────────────────────
     // Counter 0..15 drives intRat.commits(0) with (addr=i, data=i); the flag RATs
@@ -116,6 +119,9 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.cond         := dec.cond
       r.branchDisp   := dec.branchDisp
       r.unimplemented:= dec.unimplemented
+
+      // architectural int dst reg (threaded for commit RAT update + CommitTrace)
+      r.dstArch    := dec.dstReg
 
       // int operands
       r.psrcA      := intRat.io.reads(2 * s).data
