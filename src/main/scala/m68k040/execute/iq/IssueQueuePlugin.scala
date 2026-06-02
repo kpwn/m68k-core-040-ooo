@@ -130,11 +130,18 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val oh1 = OHMasking.first(aluReady & ~oh0)
     val ohB = OHMasking.first(brReady)
 
-    issuePorts(0).valid   := oh0.orR
+    // Suppress ALL issue on a flush cycle. flushSignal (= the ROB's registered
+    // doFlush pulse, or a test flush) clears every slot's `sel` for NEXT cycle, but
+    // the select above reads the CURRENT (combinational) sel — so without this gate
+    // a wrong-path slot still issues on the flush cycle, its completion/writeback
+    // arrives 1-2 cycles later carrying a now-reused robId, and corrupts the
+    // commit/whitebox join. Gating issue on !flushSignal is the correct squash
+    // behavior (a single AND on the registered pulse, not a broadcast).
+    issuePorts(0).valid   := oh0.orR && !flushSignal
     issuePorts(0).payload := MuxOH(oh0, contexts)
-    issuePorts(1).valid   := oh1.orR
+    issuePorts(1).valid   := oh1.orR && !flushSignal
     issuePorts(1).payload := MuxOH(oh1, contexts)
-    issuePorts(2).valid   := ohB.orR
+    issuePorts(2).valid   := ohB.orR && !flushSignal
     issuePorts(2).payload := MuxOH(ohB, contexts)
 
     // Free chosen slots when their issue port fires.

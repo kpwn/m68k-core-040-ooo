@@ -41,9 +41,13 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // slot1Valid signal exposed via the service
     val uop1Sig = df.feed.valid && df.slot1Valid
 
-    // Flush-able pipeline register (decode -> rename boundary). flush tied False
-    // until 3d wires the mispredict-flush (frontend pipeline squash).
-    val pipeFlush = Bool(); pipeFlush := False
+    // Flush-able pipeline register (decode -> rename boundary). Squashed by the
+    // ROB's commit-time mispredict redirect. Default-driven False (allowOverride)
+    // so a sibling wiring plugin can OVERRIDE it from RedirectService.doFlush
+    // (full core). Driving it here from host[RedirectService] directly would create
+    // a Fiber build-order cycle (consumer build forces ROB build, ROB depends back
+    // through rename->decode->fetch), so the wire is left for the wiring plugin.
+    val pipeFlush = Bool(); pipeFlush.allowOverride; pipeFlush := False
     val uopsStaged = m68k040.frontend.PipeStage(uopsPort, pipeFlush)
   }
 
