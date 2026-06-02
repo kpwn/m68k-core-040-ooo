@@ -45,7 +45,9 @@ class SimpleDecodeUnitSpec extends AnyFunSuite {
   test("ADD.L D1,D0", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       drivePkt(dut, 0xD081); sleep(1)
-      assert(dut.uop.op.toEnum == DecOp.ADD && dut.uop.srcAReg.toInt == 1 && dut.uop.srcBReg.toInt == 0)
+      // ALU convention: srcA = destination operand (Dn), srcB = source (EA), so the
+      // datapath computes src1(=Dn) op src2(=EA) — required for SUB/CMP ordering.
+      assert(dut.uop.op.toEnum == DecOp.ADD && dut.uop.srcAReg.toInt == 0 && dut.uop.srcBReg.toInt == 1)
       assert(dut.uop.dstReg.toInt == 0 && dut.uop.dstValid.toBoolean)
       assert(dut.uop.writesNzvc.toBoolean && dut.uop.writesX.toBoolean)
     }
@@ -54,7 +56,8 @@ class SimpleDecodeUnitSpec extends AnyFunSuite {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       drivePkt(dut, 0xB642); sleep(1)
       assert(dut.uop.op.toEnum == DecOp.CMP && !dut.uop.dstValid.toBoolean && dut.uop.writesNzvc.toBoolean)
-      assert(dut.uop.srcAReg.toInt == 2 && dut.uop.srcBReg.toInt == 3)
+      // srcA = destination operand (Dn=D3), srcB = source (EA=D2): CMP computes D3 - D2.
+      assert(dut.uop.srcAReg.toInt == 3 && dut.uop.srcBReg.toInt == 2)
     }
   }
   test("BRA.w", VerilatorTest) {

@@ -85,7 +85,14 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
 
     // Stream handshake / init gating
     val freeReady = intFree.io.popReady && nzvcFree.io.popReady && xFree.io.popReady
-    uopsPort.valid := du.uops.valid && initDone
+    // freeReady must gate the OUTPUT valid as well as the input ready. Otherwise a
+    // downstream consumer (DispatchPlugin) that does not itself observe freeReady
+    // could fire on uopsPort while du.uops does NOT fire (freeReady low) — the
+    // frontend would then NOT advance (feed.fire is gated by du.uops.ready which
+    // includes freeReady) and re-present the SAME packet next cycle, dispatching it
+    // twice (the duplicate-instruction bug). Tying valid to freeReady keeps the
+    // upstream feed.fire and the downstream dispatch.fire in lock-step.
+    uopsPort.valid := du.uops.valid && initDone && freeReady
     du.uops.ready  := initDone && uopsPort.ready && freeReady
     val fire = du.uops.fire
     val uop1Sig = du.uops.valid && du.uop1Valid

@@ -29,6 +29,7 @@ class InstructionBuffer extends Component {
   // Registers
   val entries = Vec(Reg(IbEntry()), BUF_WORDS)
   val count   = Reg(UInt(log2Up(BUF_WORDS + 1) bits)) init 0
+  spinal.core.sim.SimPublic(count)
 
   // Push ready: accept when there's room for a full window
   io.push.ready := (count + 4 <= BUF_WORDS)

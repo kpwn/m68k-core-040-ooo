@@ -177,9 +177,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
 
     // ── Sim-only commit observation (lock-step harness consumes this) ───────────
     case class CommitObs() extends Bundle { val fire = Bool(); val robId = UInt(robIdW bits); val pc = UInt(32 bits) }
+    // Registered (sim-only) so the lock-step harness reading them in onSamplings
+    // gets stable one-cycle pulses (reading combinational retire signals there races).
     val commitObs = Vec(CommitObs(), 2); commitObs.simPublic()
-    commitObs(0).fire := retire0; commitObs(0).robId := h0; commitObs(0).pc := p0.predNextPc
-    commitObs(1).fire := retire1; commitObs(1).robId := h1; commitObs(1).pc := p1.predNextPc
+    commitObs(0).fire := RegNext(retire0) init False; commitObs(0).robId := RegNext(h0); commitObs(0).pc := RegNext(p0.predNextPc)
+    commitObs(1).fire := RegNext(retire1) init False; commitObs(1).robId := RegNext(h1); commitObs(1).pc := RegNext(p1.predNextPc)
   }
 
   override def trace     = logic.traceVec

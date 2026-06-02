@@ -21,24 +21,31 @@ object WhiteboxCapture {
     * Read `result` after the program drains. */
   final class Handle {
     private val wbMap   = mutable.HashMap[Int, Wb]()
-    private val commits = mutable.ArrayBuffer[CommitObservation]()
-    private var ccr     = 0 // running architectural CCR (X N Z V C), bit4..bit0
+    private val commits = mutable.ArrayBuffer[(Int, Long)]() // (robId, pc) in retire order
 
-    /** Record an EU writeback (keyed by robId). */
+    /** Record an EU writeback (keyed by robId). Overwrite is fine — within a
+      * run no robId is reused before it retires (ring depth >> program length). */
     def onWb(robId: Int, wb: Wb): Unit = { wbMap(robId) = wb }
 
-    /** Fold the CCR for the retiring instruction and append its CommitObservation. */
-    def onCommit(robId: Int, pc: Long): Unit = {
-      val wb = wbMap.getOrElse(robId,
-        sys.error(s"commit robId=$robId with no writeback observed"))
-      if (wb.nzvcWrite) ccr = (ccr & 0x10) | (wb.nzvc & 0xf)     // N,Z,V,C bits
-      if (wb.xWrite)    ccr = (ccr & 0x0f) | ((wb.x & 1) << 4)   // X bit
-      commits += CommitObservation(
-        pc = pc, archRegId = wb.dstArch,
-        archRegWrite = wb.result, archRegValid = wb.intWrite,
-        ccr = ccr, memAddr = 0, memData = 0, memWrite = false)
-    }
+    /** Record a retired commit (robId + post-instruction pc) in retire order. */
+    def onCommit(robId: Int, pc: Long): Unit = { commits += ((robId, pc)) }
 
-    def result: Seq[CommitObservation] = commits.toSeq
+    /** Reconstruct the CommitObservation stream AFTER the run: join each commit
+      * to its writeback by robId (the wbMap is fully populated by now, so there's
+      * no in-sim wb-vs-commit sampling race) and fold the architectural CCR in
+      * retire order. */
+    def result: Seq[CommitObservation] = {
+      var ccr = 0 // running architectural CCR (X N Z V C), bit4..bit0
+      commits.toSeq.map { case (robId, pc) =>
+        val wb = wbMap.getOrElse(robId,
+          sys.error(s"commit robId=$robId with no writeback observed"))
+        if (wb.nzvcWrite) ccr = (ccr & 0x10) | (wb.nzvc & 0xf)     // N,Z,V,C bits
+        if (wb.xWrite)    ccr = (ccr & 0x0f) | ((wb.x & 1) << 4)   // X bit
+        CommitObservation(
+          pc = pc, archRegId = wb.dstArch,
+          archRegWrite = wb.result, archRegValid = wb.intWrite,
+          ccr = ccr, memAddr = 0, memData = 0, memWrite = false)
+      }
+    }
   }
 }

@@ -95,16 +95,18 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // Per-instruction value+flags+masks keyed by robId; the lock-step harness
     // joins this with the ROB commit-obs (retire order + pc) to reconstruct the
     // architectural CommitObservation stream. No synthesizable cost (sim-only).
+    // Registered (sim-only) so the lock-step harness reading wbObs in onSamplings
+    // gets stable one-cycle pulses (reading combinational result there races).
     val wbObs = WbObs()
-    wbObs.valid     := s1Valid
-    wbObs.robId     := s1Ctx.robId
-    wbObs.dstArch   := u1.dstArch
-    wbObs.result    := rsp.result
-    wbObs.intWrite  := u1.pdstValid
-    wbObs.nzvc      := rsp.nzvc
-    wbObs.nzvcWrite := u1.writesNzvc
-    wbObs.x         := rsp.xOut
-    wbObs.xWrite    := u1.writesX
+    wbObs.valid     := RegNext(s1Valid) init False
+    wbObs.robId     := RegNext(s1Ctx.robId)
+    wbObs.dstArch   := RegNext(u1.dstArch)
+    wbObs.result    := RegNext(rsp.result)
+    wbObs.intWrite  := RegNext(u1.pdstValid)
+    wbObs.nzvc      := RegNext(rsp.nzvc)
+    wbObs.nzvcWrite := RegNext(u1.writesNzvc)
+    wbObs.x         := RegNext(rsp.xOut)
+    wbObs.xWrite    := RegNext(u1.writesX)
     wbObs.simPublic()
   }
 }

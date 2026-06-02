@@ -183,11 +183,15 @@ object SimpleDecodeUnit {
               is(0xD) { uop.op := DecOp.ADD }
             }
 
-            // opmode 0,1,2 → EA→Dn
+            // opmode 0,1,2 → EA→Dn. The ALU datapath computes src1 - src2 (src1 =
+            // destination operand) and MOVE-style result = src2, so srcA must be
+            // the DESTINATION (Dn) and srcB the source (EA): SUB/CMP need Dn - EA,
+            // not EA - Dn. (ADD/AND/OR are commutative so order is irrelevant for
+            // them, which previously masked this in 2-byte ADD-only checks.)
             when(opmode === 0 || opmode === 1 || opmode === 2) {
-              uop.srcAReg   := eaRegFull
+              uop.srcAReg   := dn.resized
               uop.srcAValid := True
-              uop.srcBReg   := dn.resized
+              uop.srcBReg   := eaRegFull
               uop.srcBValid := True
               uop.dstReg    := dn.resized
 
