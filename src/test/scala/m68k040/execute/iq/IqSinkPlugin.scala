@@ -13,6 +13,10 @@ class IqSinkPlugin extends FiberPlugin {
     val ready1 = in Bool ()
     iq.issue(0).ready := ready0
     iq.issue(1).ready := ready1
+    // Port 2 (branch) is unused in these ALU-only tests; keep it ready so its
+    // (always-idle, since the source pushes only non-branch uops) stream is
+    // fully driven and never structurally back-pressures.
+    iq.issue(2).ready := True
 
     val v0 = out Bool (); val rob0 = out UInt (6 bits)
     val v1 = out Bool (); val rob1 = out UInt (6 bits)
