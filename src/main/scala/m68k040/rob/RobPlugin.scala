@@ -47,7 +47,19 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     head.simPublic(); tail.simPublic(); count.simPublic()
 
     // ── External ports ────────────────────────────────────────────────────────
-    val completion = Vec.fill(2)(slave(Flow(UInt(robIdW bits))))
+    // Plain directionless service wires: a sibling plugin (the EU wiring) DRIVES
+    // completion(k).valid/payload; this ROB consumes them. Standalone tests poke
+    // them in sim (simPublic). Mirrors the RenameCommitService.commitPorts wiring
+    // convention (sibling-driven, directionless).
+    val completion = Vec.fill(2)(Flow(UInt(robIdW bits)))
+    // Default-drive (idle) so the ROB elaborates standalone; a sibling EU-wiring
+    // plugin OVERRIDES these via allowOverride, and standalone tests poke them in
+    // sim (simPublic).
+    completion.foreach { c =>
+      c.valid.allowOverride;   c.valid   := False
+      c.payload.allowOverride; c.payload := U(0, robIdW bits)
+      c.simPublic()
+    }
     val flush      = slave(Flow(NoData()))
 
     // ── Build a RobPayload from a RenamedUop ───────────────────────────────────
