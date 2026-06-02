@@ -21,24 +21,31 @@ object WhiteboxCapture {
     * Read `result` after the program drains. */
   final class Handle {
     private val wbMap   = mutable.HashMap[Int, Wb]()
-    private val commits = mutable.ArrayBuffer[(Int, Long)]() // (robId, pc) in retire order
+    // (pc, wb-snapshot) in retire order. The wb is SNAPSHOTTED at commit time, not
+    // joined lazily at the end: under branch mispredict recovery a robId is REUSED
+    // (a squashed wrong-path uop and a later correct uop share an index), so a
+    // global last-writer map is ambiguous. At the cycle a commit fires, wbMap holds
+    // the COMMITTING instruction's wb (it wrote before retiring; any earlier
+    // squashed reuse was overwritten by the real producer; any FUTURE reuse of the
+    // index has not happened yet). Snapshotting here is robId-reuse-correct.
+    private val commits = mutable.ArrayBuffer[(Long, Wb)]()
 
-    /** Record an EU writeback (keyed by robId). Overwrite is fine — within a
-      * run no robId is reused before it retires (ring depth >> program length). */
+    /** Record an EU writeback (keyed by robId). */
     def onWb(robId: Int, wb: Wb): Unit = { wbMap(robId) = wb }
 
-    /** Record a retired commit (robId + post-instruction pc) in retire order. */
-    def onCommit(robId: Int, pc: Long): Unit = { commits += ((robId, pc)) }
+    /** Record a retired commit (robId + post-instruction pc) in retire order,
+      * snapshotting the committing instruction's writeback now (see above). */
+    def onCommit(robId: Int, pc: Long): Unit = {
+      val wb = wbMap.getOrElse(robId,
+        sys.error(s"commit robId=$robId with no writeback observed"))
+      commits += ((pc, wb))
+    }
 
-    /** Reconstruct the CommitObservation stream AFTER the run: join each commit
-      * to its writeback by robId (the wbMap is fully populated by now, so there's
-      * no in-sim wb-vs-commit sampling race) and fold the architectural CCR in
-      * retire order. */
+    /** Reconstruct the CommitObservation stream AFTER the run, folding the
+      * architectural CCR in retire order over the per-commit wb snapshots. */
     def result: Seq[CommitObservation] = {
       var ccr = 0 // running architectural CCR (X N Z V C), bit4..bit0
-      commits.toSeq.map { case (robId, pc) =>
-        val wb = wbMap.getOrElse(robId,
-          sys.error(s"commit robId=$robId with no writeback observed"))
+      commits.toSeq.map { case (pc, wb) =>
         if (wb.nzvcWrite) ccr = (ccr & 0x10) | (wb.nzvc & 0xf)     // N,Z,V,C bits
         if (wb.xWrite)    ccr = (ccr & 0x0f) | ((wb.x & 1) << 4)   // X bit
         CommitObservation(

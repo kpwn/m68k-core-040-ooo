@@ -1,6 +1,6 @@
 package m68k040.rob
 
-import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService}
+import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService}
 import m68k040.rename.RenamedUop
 import m68k040.types.CommitTrace
 import spinal.core._
@@ -19,7 +19,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   *
   * retireAlone entries (branches, for now) retire 1-wide.
   */
-class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService {
+class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService {
 
   /** One ROB entry's commit/free + trace payload. */
   case class RobPayload() extends Bundle {
@@ -39,7 +39,6 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
 
     // ── Ring storage ────────────────────────────────────────────────────────
     val payload   = Mem(RobPayload(), depth)
-    val valids    = Vec.fill(depth)(RegInit(False))
     val completes = Vec.fill(depth)(RegInit(False))
     val head  = Reg(UInt(robIdW bits)) init 0
     val tail  = Reg(UInt(robIdW bits)) init 0
@@ -62,6 +61,29 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     }
     val flush      = slave(Flow(NoData()))
 
+    // Branch completion: the branch EU marks a robId complete and records its
+    // {mispredict, nextPc} for commit-time recovery. Directionless service wire,
+    // same convention as `completion`: default-driven idle (allowOverride) so the
+    // ROB elaborates standalone; a sibling branch EU OVERRIDES it, and standalone
+    // tests poke it in sim (simPublic).
+    val branchCompletion = Flow(m68k040.execute.BranchCompletion())
+    branchCompletion.valid.allowOverride; branchCompletion.valid := False
+    // Concrete (not assignDontCare) idle defaults — mirrors `completion`'s `:= U(0)`.
+    // assignDontCare drives the payload to don't-care; a sim poke updates the public
+    // mirror but the CONSUMER reads the don't-care net, so `completes(robId)` indexes
+    // garbage instead of the poked robId. Concrete zero defaults make the poke visible.
+    branchCompletion.payload.robId.allowOverride;      branchCompletion.payload.robId := U(0, robIdW bits)
+    branchCompletion.payload.mispredict.allowOverride; branchCompletion.payload.mispredict := False
+    branchCompletion.payload.nextPc.allowOverride;     branchCompletion.payload.nextPc := U(0, 32 bits)
+    branchCompletion.simPublic()
+    // mispredictStore MUST default False: a freshly-allocated branch entry is "not
+    // yet known mispredicted" until its EU completion (branchCompletion) says so.
+    // Without this, `doFlushReg := ... && mispredictStore(h0)` reads a stale/uninit
+    // bit and can spuriously flush (a branch that completes via the normal port).
+    // Reset per-alloc below (mirrors `completes`), with alloc-priority on a reused index.
+    val mispredictStore = Vec.fill(depth)(RegInit(False))
+    val nextPcStore     = Vec.fill(depth)(Reg(UInt(32 bits)))
+
     // ── Build a RobPayload from a RenamedUop ───────────────────────────────────
     def payloadFrom(u: RenamedUop): RobPayload = {
       val p = RobPayload()
@@ -79,8 +101,15 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val h1 = head + 1
     val p0 = payload.readAsync(h0)
     val p1 = payload.readAsync(h1)
-    val retire0 = valids(h0) && completes(h0) && !flush.valid
-    val retire1 = retire0 && valids(h1) && completes(h1) && !p0.retireAlone && !p1.retireAlone
+    // Commit-time mispredict redirect is a REGISTERED pulse (declared here so the
+    // retire guards can gate on it). `flushing` = test flush OR the registered
+    // redirect pulse; it drives ONLY pointer/reg resets (no combinational fanout).
+    val doFlushReg = RegInit(False); doFlushReg.simPublic()
+    val flushPcReg = Reg(UInt(32 bits)); flushPcReg.simPublic()
+    val flushing   = flush.valid || doFlushReg
+
+    val retire0 = (count > 0) && completes(h0) && !flushing
+    val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone
 
     val traceVec     = Vec(CommitTrace(), 2)
     val traceFireVec = Vec(Bool(), 2)
@@ -93,7 +122,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       traceVec(k).assignDontCare()
     }
 
-    def driveCommit(k: Int, p: RobPayload): Unit = {
+    def driveCommit(k: Int, p: RobPayload, commitPc: UInt): Unit = {
       rc.commitPorts(k).valid     := True
       rc.commitPorts(k).intArch   := p.archRegId
       rc.commitPorts(k).intNew    := p.intNew
@@ -108,7 +137,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
 
       traceFireVec(k)          := True
       traceVec(k).fire         := True
-      traceVec(k).pc           := p.predNextPc
+      traceVec(k).pc           := commitPc
       traceVec(k).opword       := 0
       traceVec(k).archRegId    := p.archRegId
       traceVec(k).archRegWrite := 0
@@ -122,8 +151,13 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       traceVec(k).excVector    := 0
     }
 
-    when(retire0) { driveCommit(0, p0) }
-    when(retire1) { driveCommit(1, p1) }
+    // Branch trace nextPc: a branch's commit pc is its RESOLVED nextPc (not the
+    // predicted predNextPc). Branches are retireAlone, so retire1 can never be a
+    // branch -> the slot-1 Mux is harmless.
+    val commitPc0 = Mux(p0.retireAlone, nextPcStore(h0), p0.predNextPc)
+    val commitPc1 = Mux(p1.retireAlone, nextPcStore(h1), p1.predNextPc)
+    when(retire0) { driveCommit(0, p0, commitPc0) }
+    when(retire1) { driveCommit(1, p1, commitPc1) }
 
     val retiredThisCycle = (retire1 ? U(2) | (retire0 ? U(1) | U(0))).resize(count.getWidth)
 
@@ -142,46 +176,62 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val alloc1 = allocFireSig && allocSlot1Sig
     val allocThisCycle = (alloc1 ? U(2) | (alloc0 ? U(1) | U(0))).resize(count.getWidth)
 
+    // ── Completion mark (alloc-reset has priority on a reused index) ────────────
+    // MUST come BEFORE the alloc-reset writes below so that on a re-allocated index
+    // a stale wrong-path completion (set here) is OVERRIDDEN by the alloc's
+    // completes:=False (later `when` wins in SpinalHDL).
+    for (c <- completion) when(c.valid) { completes(c.payload) := True }
+    // Branch completion also marks complete + records {mispredict, nextPc}. Placed
+    // with the other completion sets (BEFORE the alloc-reset) so alloc wins on a
+    // re-used index (Task 1 alloc-priority).
+    when(branchCompletion.valid) {
+      completes(branchCompletion.payload.robId)       := True
+      mispredictStore(branchCompletion.payload.robId) := branchCompletion.payload.mispredict
+      nextPcStore(branchCompletion.payload.robId)     := branchCompletion.payload.nextPc
+    }
+
     when(alloc0) {
       payload.write(tail, payloadFrom(allocUopVec(0)))
-      valids(tail)    := True
-      completes(tail) := False
+      completes(tail)       := False
+      mispredictStore(tail) := False
     }
     when(alloc1) {
       payload.write(tail + 1, payloadFrom(allocUopVec(1)))
-      valids(tail + 1)    := True
-      completes(tail + 1) := False
+      completes(tail + 1)       := False
+      mispredictStore(tail + 1) := False
     }
     when(allocFireSig) {
       tail := tail + Mux(allocSlot1Sig, U(2, robIdW bits), U(1, robIdW bits))
     }
 
-    // ── Completion mark (retire-clear has priority on same index) ───────────────
-    for (c <- completion) when(c.valid) { completes(c.payload) := True }
-
-    // ── Retire-side state updates (head advance + valid clear) ──────────────────
-    when(retire0) { valids(h0) := False }
-    when(retire1) { valids(h1) := False }
+    // ── Retire-side state update (head advance; validity is count-derived) ──────
     head := head + Mux(retire1, U(2, robIdW bits), Mux(retire0, U(1, robIdW bits), U(0, robIdW bits)))
 
     // ── count update (alloc + retire) ──────────────────────────────────────────
     count := count + allocThisCycle - retiredThisCycle
 
-    // ── Flush (squash all in-flight) ────────────────────────────────────────────
-    when(flush.valid) {
+    // ── Commit-time mispredict redirect (REGISTERED pulse) ──────────────────────
+    // When the retiring head is a mispredicting branch (retireAlone), register the
+    // flush for next cycle. doFlushReg is the ONLY flush signal that fans out, and
+    // it drives only pointer/reg resets (FMax: no combinational execute->flush path).
+    doFlushReg := retire0 && p0.retireAlone && mispredictStore(h0)
+    when(retire0 && p0.retireAlone && mispredictStore(h0)) { flushPcReg := nextPcStore(h0) }
+
+    // ── Flush (squash all in-flight) — pointer-only, driven by the registered ─────
+    // redirect pulse OR the test flush port.
+    when(flushing) {
       tail  := head
       count := 0
-      valids.foreach(_ := False)
     }
-    rc.flushPort := flush.valid
+    rc.flushPort := flushing
 
     // ── Sim-only commit observation (lock-step harness consumes this) ───────────
     case class CommitObs() extends Bundle { val fire = Bool(); val robId = UInt(robIdW bits); val pc = UInt(32 bits) }
     // Registered (sim-only) so the lock-step harness reading them in onSamplings
     // gets stable one-cycle pulses (reading combinational retire signals there races).
     val commitObs = Vec(CommitObs(), 2); commitObs.simPublic()
-    commitObs(0).fire := RegNext(retire0) init False; commitObs(0).robId := RegNext(h0); commitObs(0).pc := RegNext(p0.predNextPc)
-    commitObs(1).fire := RegNext(retire1) init False; commitObs(1).robId := RegNext(h1); commitObs(1).pc := RegNext(p1.predNextPc)
+    commitObs(0).fire := RegNext(retire0) init False; commitObs(0).robId := RegNext(h0); commitObs(0).pc := RegNext(commitPc0)
+    commitObs(1).fire := RegNext(retire1) init False; commitObs(1).robId := RegNext(h1); commitObs(1).pc := RegNext(commitPc1)
   }
 
   override def trace     = logic.traceVec
@@ -193,4 +243,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   override def allocFire  = logic.allocFireSig
   override def allocUop   = logic.allocUopVec
   override def allocSlot1 = logic.allocSlot1Sig
+
+  override def doFlush = logic.doFlushReg
+  override def flushPc = logic.flushPcReg
 }

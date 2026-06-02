@@ -229,9 +229,13 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       }
     }
 
-    // Flush-able pipeline register (rename -> dispatch boundary). flush tied False
-    // until 3d wires the mispredict-flush (frontend pipeline squash).
-    val pipeFlush = Bool(); pipeFlush := False
+    // Flush-able pipeline register (rename -> dispatch boundary). Squashed by the
+    // ROB's commit-time mispredict redirect. Default-driven False (allowOverride)
+    // so a sibling wiring plugin can OVERRIDE it from RedirectService.doFlush
+    // (full core). Driving it here from host[RedirectService] directly would create
+    // a Fiber build-order cycle (ROB depends back through rename), so the wire is
+    // left for the wiring plugin to drive.
+    val pipeFlush = Bool(); pipeFlush.allowOverride; pipeFlush := False
     val uopsStaged = m68k040.frontend.PipeStage(uopsPort, pipeFlush)
   }
 

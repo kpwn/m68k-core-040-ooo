@@ -35,7 +35,8 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
   during setup {
     pushPort      = Stream(Vec(IqContext(), wayCount))
     pushSlot1Port = Bool()
-    issuePorts    = Vec.fill(wayCount)(Stream(IqContext()))
+    // 3 issue ports: 0,1 = ALU (class-filtered to non-branch), 2 = branch.
+    issuePorts    = Vec.fill(3)(Stream(IqContext()))
     flushSignal   = Bool()
   }
 
@@ -117,21 +118,37 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     when(pushPort.fire) { pushed := Mux(pushSlot1Port, U(2), U(1)) }
     val issued = CountOne(issuePorts.map(_.fire))
 
-    // ---- Select: two age-ordered ports (lowest-index-first one-hot) ----
-    val validReady = B(slots.map(_.ready))            // bit i == slot i ready
-    val contexts   = Vec(slots.map(_.context))
+    // ---- Select: age-ordered, CLASS-filtered (lowest-index-first one-hot) ----
+    // ALU ports (0,1) select non-branch ready slots; branch port (2) selects
+    // branch-class ready slots (class = context.uop.isBranch). The classes are
+    // disjoint, so a slot is selected by at most one port.
+    val aluReady = B(slots.map(s => s.ready && !s.context.uop.isBranch))
+    val brReady  = B(slots.map(s => s.ready &&  s.context.uop.isBranch))
+    val contexts = Vec(slots.map(_.context))
 
-    val oh0 = OHMasking.first(validReady)
-    val oh1 = OHMasking.first(validReady & ~oh0)
+    val oh0 = OHMasking.first(aluReady)
+    val oh1 = OHMasking.first(aluReady & ~oh0)
+    val ohB = OHMasking.first(brReady)
 
-    issuePorts(0).valid   := oh0.orR
+    // Suppress ALL issue on a flush cycle. flushSignal (= the ROB's registered
+    // doFlush pulse, or a test flush) clears every slot's `sel` for NEXT cycle, but
+    // the select above reads the CURRENT (combinational) sel — so without this gate
+    // a wrong-path slot still issues on the flush cycle, its completion/writeback
+    // arrives 1-2 cycles later carrying a now-reused robId, and corrupts the
+    // commit/whitebox join. Gating issue on !flushSignal is the correct squash
+    // behavior (a single AND on the registered pulse, not a broadcast).
+    issuePorts(0).valid   := oh0.orR && !flushSignal
     issuePorts(0).payload := MuxOH(oh0, contexts)
-    issuePorts(1).valid   := oh1.orR
+    issuePorts(1).valid   := oh1.orR && !flushSignal
     issuePorts(1).payload := MuxOH(oh1, contexts)
+    issuePorts(2).valid   := ohB.orR && !flushSignal
+    issuePorts(2).payload := MuxOH(ohB, contexts)
 
     // Free chosen slots when their issue port fires.
     for ((slot, i) <- slots.zipWithIndex) {
-      slot.fire := (issuePorts(0).fire && oh0(i)) || (issuePorts(1).fire && oh1(i))
+      slot.fire := (issuePorts(0).fire && oh0(i)) ||
+                   (issuePorts(1).fire && oh1(i)) ||
+                   (issuePorts(2).fire && ohB(i))
     }
 
     // ---- Static-latency-1 wakeup events ----

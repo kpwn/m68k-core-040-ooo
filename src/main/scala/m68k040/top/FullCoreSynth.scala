@@ -10,10 +10,10 @@ import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
 import m68k040.dispatch.DispatchPlugin
 import m68k040.rob.RobPlugin
-import m68k040.execute.AluEuPlugin
+import m68k040.execute.{AluEuPlugin, BranchEuPlugin}
 import m68k040.execute.iq.{IssueQueuePlugin, IssueQueueService}
 import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
-import m68k040.services.CommitTraceService
+import m68k040.services.{CommitTraceService, RedirectService}
 import spinal.core._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
@@ -23,13 +23,30 @@ import spinal.lib.misc.plugin.FiberPlugin
   * anchors the pipeline to top IO so nothing is pruned: the EU int-write results
   * (anchors the ALU+PRF datapath, since a PRF read value is then observed) and
   * the CommitTrace (anchors the ROB retire/control path). */
-class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin) extends FiberPlugin {
+class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin) extends FiberPlugin {
   val logic = during build new Area {
     val iq  = host[IssueQueueService]
     val rob = host[RobPlugin]
-    iq.flushPort := RegNext(in Bool ()) init False   // plain wire; drive from top IO
+    // Commit-time mispredict redirect fan-out (registered doFlush pulse). doFlush
+    // fans only to pointer/bitmap/skid-valid resets + the registered redirect PC
+    // (FMax: no combinational execute->flush path).
+    val doFlush = host[RedirectService].doFlush
+    val flushPc = host[RedirectService].flushPc
+    iq.flushPort := doFlush                                   // IQ clear
+    host[DecodeStage].logic.pipeFlush := doFlush              // FE skid (decode->rename)
+    host[RenameStage].logic.pipeFlush := doFlush              // FE skid (rename->dispatch)
+    // RAT-rollback (rename.flushPort) already driven by the ROB (rc.flushPort).
+    val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
+    faRedir.valid   := doFlush
+    faRedir.payload := flushPc
     eu0.issue << iq.issue(0)
     eu1.issue << iq.issue(1)
+    // Branch EU: issue port 2 (branch-class) -> branch EU; its completion records
+    // {mispredict, nextPc} into the ROB for commit-time recovery (sibling-driven,
+    // exactly like the ALU completion ports above).
+    branchEu.issue << iq.issue(2)
+    rob.logic.branchCompletion.valid   := branchEu.completion.valid
+    rob.logic.branchCompletion.payload := branchEu.completion.payload
     rob.logic.completion(0).valid   := eu0.completion.valid
     rob.logic.completion(0).payload := eu0.completion.payload
     rob.logic.completion(1).valid   := eu1.completion.valid
@@ -59,6 +76,7 @@ object GenFullCoreSynthVerilog {
       .generateVerilog {
         val eu0 = new AluEuPlugin
         val eu1 = new AluEuPlugin
+        val branchEu = new BranchEuPlugin
         new M68kCore(Seq[FiberPlugin](
           new ParamPlugin(p),
           new IdentityTranslationPlugin(),
@@ -69,11 +87,11 @@ object GenFullCoreSynthVerilog {
           new DispatchPlugin(),
           new RobPlugin(),
           new IssueQueuePlugin(),
-          eu0, eu1,
+          eu0, eu1, branchEu,
           new RegFilePluginInt(),
           new RegFilePluginNzvc(),
           new RegFilePluginX(),
-          new BackendWiringPlugin(eu0, eu1)
+          new BackendWiringPlugin(eu0, eu1, branchEu)
         )).setDefinitionName("M68kFullCoreSynth")
       }
     println("Generated generated/M68kFullCoreSynth.v")

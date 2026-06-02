@@ -8,9 +8,10 @@ import m68k040.frontend.FetchAlignPlugin
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
 import m68k040.rob.RobPlugin
-import m68k040.execute.AluEuPlugin
+import m68k040.execute.{AluEuPlugin, BranchEuPlugin}
 import m68k040.execute.iq.{IssueQueuePlugin, IssueQueueService}
 import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
+import m68k040.services.RedirectService
 import m68k040.oracle.{Musashi, OracleStep, ProgramAssembler}
 import spinal.core._
 import spinal.core.sim._
@@ -36,23 +37,37 @@ import org.scalatest.funsuite.AnyFunSuite
   */
 class ExecuteLockStepSpec extends AnyFunSuite {
 
-  /** Ties off the IQ flush port (no flush exercised in straight-line runs). */
-  class IqFlushTiePlugin extends FiberPlugin {
-    val logic = during build new Area { host[IssueQueueService].flushPort := False }
-  }
-
-  /** Wires IQ issue ports to the two EUs and the EU completions to the ROB.
-    * Lifted verbatim from BackendWhiteboxSpec (proven in Task 2). */
-  class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin) extends FiberPlugin {
+  /** Wires IQ issue ports to the two ALU EUs + the branch EU, the EU completions
+    * to the ROB, and the ROB's commit-time mispredict redirect (RedirectService)
+    * to the IQ flush. (Frontend pipeFlush / RAT-rollback flush / fetch redirect are
+    * driven inside the consuming plugins from host.get[RedirectService].) */
+  class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin) extends FiberPlugin {
     val logic = during build new Area {
       val iq  = host[IssueQueueService]
       val rob = host[RobPlugin]
       eu0.issue << iq.issue(0)
       eu1.issue << iq.issue(1)
+      // Branch EU: issue port 2 (branch-class) -> branch EU; completion -> ROB
+      // branchCompletion (records {mispredict, nextPc} for commit-time recovery).
+      branchEu.issue << iq.issue(2)
+      rob.logic.branchCompletion.valid   := branchEu.completion.valid
+      rob.logic.branchCompletion.payload := branchEu.completion.payload
       rob.logic.completion(0).valid   := eu0.completion.valid
       rob.logic.completion(0).payload := eu0.completion.payload
       rob.logic.completion(1).valid   := eu1.completion.valid
       rob.logic.completion(1).payload := eu1.completion.payload
+
+      // ── Commit-time mispredict redirect fan-out (registered doFlush pulse) ──
+      val doFlush = host[RedirectService].doFlush
+      val flushPc = host[RedirectService].flushPc
+      iq.flushPort := doFlush                                  // IQ clear
+      host[DecodeStage].logic.pipeFlush := doFlush             // FE skid (decode->rename)
+      host[RenameStage].logic.pipeFlush := doFlush             // FE skid (rename->dispatch)
+      // RAT-rollback flush (rename.flushPort) is already driven by the ROB
+      // (rc.flushPort := flushing). Fetch redirect to the resolved target:
+      val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
+      faRedir.valid   := doFlush
+      faRedir.payload := flushPc
     }
   }
 
@@ -70,16 +85,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val iq     = new IssueQueuePlugin
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
+    val branchEu = new BranchEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
     val rfX    = new RegFilePluginX
-    val wire   = new BackendWiringPlugin(eu0, eu1)
-    val ftie   = new IqFlushTiePlugin
+    val wire   = new BackendWiringPlugin(eu0, eu1, branchEu)
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
       new IdentityTranslationPlugin,
-      icache, fa, dec, ren, disp, rob, iq, eu0, eu1,
-      rfInt, rfNzvc, rfX, wire, ftie)) }
+      icache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu,
+      rfInt, rfNzvc, rfX, wire)) }
   }
 
   /** Attach a behavioral AXI read-only memory backed by the assembled program.
@@ -108,8 +123,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
   }
 
-  /** Run one straight-line program through the full core and lock-step it. */
-  def runLockStep(name: String, src: String): Unit = {
+  /** Run one program through the full core and lock-step it.
+    *
+    * `nInstr` is the number of RETIRED (executed) instructions to compare. For
+    * straight-line code that equals the source line count (the default, computed
+    * below when `nInstr < 0`). For programs with taken branches it must be given
+    * explicitly: a taken branch skips/loops, so the executed count differs from the
+    * source line count. The oracle (Musashi traces actual execution) and the DUT
+    * commit stream are both bounded to the first `nInstr` records. */
+  def runLockStep(name: String, src: String, nInstr: Int = -1): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
 
     // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel.
@@ -123,8 +145,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Left(err) => fail(s"[$name] ProgramAssembler.assemble failed: ${err.reason}")
     }
 
-    // N = number of real instructions in the source (one per non-blank line).
-    val n = src.split(';').map(_.trim).count(_.nonEmpty)
+    // N = number of RETIRED instructions to compare. Default (straight-line) = the
+    // source line count; branch programs pass it explicitly (executed count).
+    val n = if (nInstr >= 0) nInstr else src.split(';').map(_.trim).count(_.nonEmpty)
     assert(oracleSteps.size >= n,
       s"[$name] oracle produced ${oracleSteps.size} steps, expected >= $n (program ran past its end?)")
     val oracle = oracleSteps.take(n)
@@ -150,6 +173,25 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                 nzvcWrite = w.nzvcWrite.toBoolean,
                 x         = if (w.x.toBoolean) 1 else 0,
                 xWrite    = w.xWrite.toBoolean))
+          }
+        }
+        // Branch EU writeback-obs: a branch writes NO int/flag reg and leaves CCR
+        // unchanged. Map it to a no-write Wb (the commit pc comes from the ROB
+        // commitObs = resolved nextPc). dstArch=0 is harmless since intWrite=false.
+        {
+          val bw = dut.branchEu.logic.wbObs
+          if (bw.valid.toBoolean) {
+            wbCount += 1
+            handle.onWb(
+              bw.robId.toInt,
+              WhiteboxCapture.Wb(
+                dstArch   = 0,
+                result    = 0L,
+                intWrite  = false,
+                nzvc      = 0,
+                nzvcWrite = false,
+                x         = 0,
+                xWrite    = false))
           }
         }
         for (k <- 0 until 2) {
@@ -243,5 +285,48 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "and.l %d1,%d0", "or.l %d2,%d1", "add.l %d3,%d2", "cmp.l %d4,%d3",
       "sub.l %d5,%d4", "and.l %d6,%d5", "or.l %d7,%d6", "add.l %d0,%d7"
     ).mkString(" ; "))
+  }
+
+  // ── Branch lock-step (2-byte short branches) ──────────────────────────────
+  // No predictor: a TAKEN branch is a mispredict -> the ROB registers a
+  // commit-time redirect pulse that squashes the speculative fall-through and
+  // refetches at the resolved target. The branch's commit pc = resolved nextPc
+  // (= Musashi's post-instruction pc). Each program passes an EXPLICIT executed
+  // instruction count (a taken branch skips/loops -> count != source lines).
+
+  test("lock-step: beq.s taken (skips a moveq)", VerilatorTest) {
+    // D0=1; cmp d0,d0 -> Z=1; beq taken -> skip `moveq #9,%d1`; land on moveq#7.
+    // Executed: moveq#1, cmp, beq(taken->target), moveq#7 = 4.
+    runLockStep("beq-taken",
+      "moveq #1,%d0 ; cmp.l %d0,%d0 ; beq.s .L ; moveq #9,%d1 ; .L: moveq #7,%d2",
+      nInstr = 4)
+  }
+
+  test("lock-step: bne.s not-taken (falls through)", VerilatorTest) {
+    // D0=1; cmp d0,d0 -> Z=1; bne NOT taken -> fall through (D1=9), then moveq#7.
+    // Executed: moveq#1, cmp, bne(not-taken->pc+2), moveq#9, moveq#7 = 5.
+    runLockStep("bne-nottaken",
+      "moveq #1,%d0 ; cmp.l %d0,%d0 ; bne.s .L ; moveq #9,%d1 ; .L: moveq #7,%d2",
+      nInstr = 5)
+  }
+
+  test("lock-step: bra.s unconditional", VerilatorTest) {
+    // Unconditional taken -> skip `moveq #9,%d0`; land on moveq#7.
+    // Executed: bra(taken->target), moveq#7 = 2.
+    runLockStep("bra",
+      "bra.s .L ; moveq #9,%d0 ; .L: moveq #7,%d1",
+      nInstr = 2)
+  }
+
+  test("lock-step: backward bne.s loop (one backward taken)", VerilatorTest) {
+    // D0=2 (counter), D1=1 (decrement). Loop body sub.l d1,d0 ; bne.s .L:
+    //   iter1: 2-1=1 (Z=0) -> bne TAKEN  (backward commit-time redirect to .L)
+    //   iter2: 1-1=0 (Z=1) -> bne NOT taken -> fall through to moveq#7
+    // Exactly one backward-taken mispredict, exercising backward branch
+    // displacement + commit-time redirect + recovery. Executed: moveq#2, moveq#1,
+    // sub, bne(taken), sub, bne(not-taken), moveq#7 = 7.
+    runLockStep("loop",
+      "moveq #2,%d0 ; moveq #1,%d1 ; .L: sub.l %d1,%d0 ; bne.s .L ; moveq #7,%d2",
+      nInstr = 7)
   }
 }

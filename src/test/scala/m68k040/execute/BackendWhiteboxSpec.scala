@@ -37,6 +37,10 @@ class BackendWhiteboxSpec extends AnyFunSuite {
       // IQ issue (producer) → EU issue (plain-wire, EU drives ready).
       eu0.issue << iq.issue(0)
       eu1.issue << iq.issue(1)
+      // Branch issue port (BR2): no branch EU in this no-branch DUT (BR4 adds it) —
+      // tie its ready off so the IQ's issue(2) Stream is driven. The straight-line
+      // ALU corpus has no branches, so this port never carries a valid uop.
+      iq.issue(2).ready := False
       // EU completion (Flow) → ROB completion ports (both directionless plain
       // wires; drive the ROB's completion from the EU's completion).
       rob.logic.completion(0).valid   := eu0.completion.valid

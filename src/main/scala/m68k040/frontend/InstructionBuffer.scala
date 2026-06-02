@@ -26,13 +26,28 @@ class InstructionBuffer extends Component {
     val flush    = in  Bool()
   }
 
-  // Registers
-  val entries = Vec(Reg(IbEntry()), BUF_WORDS)
+  // Registers. `entries` are RegInit'd to a benign zero/non-simple value: SpinalSim
+  // randomizes uninit Regs per-seed, and a `head(i)` read of a slot that count
+  // claims valid (e.g. a transient during refill) would otherwise return seed-random
+  // garbage -> flaky lock-step. Deterministic reset makes the buffer seed-stable.
+  val entries = Vec.fill(BUF_WORDS) {
+    val e = Reg(IbEntry())
+    e.word init 0
+    e.pred.simple init False
+    e.pred.lenWords init 0
+    e
+  }
   val count   = Reg(UInt(log2Up(BUF_WORDS + 1) bits)) init 0
   spinal.core.sim.SimPublic(count)
 
-  // Push ready: accept when there's room for a full window
-  io.push.ready := (count + 4 <= BUF_WORDS)
+  // Push ready: accept when there's room for a full window.
+  // NB: use a width-extending add (+^) — `count` is only wide enough to hold
+  // BUF_WORDS (4 bits, max 15), so a plain `count + 4` OVERFLOWS at count=12
+  // (12+4=16 wraps to 0) and spuriously reports ready while the buffer is FULL,
+  // which then fires a push that wraps `count` back down (corrupting the head).
+  // This only surfaces when the buffer fills to BUF_WORDS under sustained
+  // back-pressure (e.g. the post-mispredict rename freelist re-init stall).
+  io.push.ready := (count +^ 4 <= BUF_WORDS)
 
   // Compute next state combinationally
   val afterShift = count - io.shift   // shift <= count by construction

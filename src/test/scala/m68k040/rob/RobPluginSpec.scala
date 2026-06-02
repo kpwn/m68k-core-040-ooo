@@ -77,6 +77,15 @@ class RobPluginSpec extends AnyFunSuite {
     dut.rob.logic.completion(0).valid #= false
   }
 
+  /** Poll a combinational signal CHECK-FIRST. `waitSamplingWhere` waits one edge
+    * BEFORE checking, which consumes a self-clearing one-cycle combinational pulse
+    * (e.g. `fireOut`/retire, high only until the next edge advances head/count).
+    * Check-first catches the pulse in the cycle it is asserted. */
+  def waitUntil(cd: ClockDomain, cond: => Boolean, max: Int = 200): Unit = {
+    var n = 0
+    while (!cond) { assert(n < max, "waitUntil timed out"); n += 1; cd.waitSampling() }
+  }
+
   // ─────────────────────────────────────────────────────────────────────────────
   test("alloc + 2-wide retire") {
     M68kSim().compile(new SimpleDut).doSim { dut =>
@@ -233,6 +242,141 @@ class RobPluginSpec extends AnyFunSuite {
       dut.rsrc.logic.src.valid #= false
       cd.waitSampling()
       assert(dut.rob.logic.count.toInt == 1, "one new entry after flush")
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  test("stale completion after flush does NOT retire a freshly re-allocated entry") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      // Dispatch 2 uncompleted uops -> robId 0,1 occupy the ring.
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x100, dstArch = 1, pdst = 20, pdstValid = true, pdstOld = 1)
+      pokeRu(dut.rsrc.logic.src.payload(1), pc = 0x200, dstArch = 2, pdst = 21, pdstValid = true, pdstOld = 2)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= true
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      dut.rsrc.logic.u1v #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 2, "2 in flight before flush")
+
+      // Flush: pointer reset (tail:=head, count:=0). Entries 0,1 are now squashed.
+      dut.rob.logic.flush.valid #= true
+      cd.waitSampling()
+      dut.rob.logic.flush.valid #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 0, "ROB empty after flush")
+      val reuseId = dut.rob.logic.tail.toInt // next alloc lands here (a now-squashed id)
+
+      // A wrong-path completion arrives LATE for the squashed robId -> sets a stale
+      // completes(reuseId):=True. (Fire it on the same cycle we re-allocate that id,
+      // so alloc-priority ordering is what must win.)
+      // Re-allocate ONE new uop (single-wide) at reuseId and do NOT complete it.
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x300, dstArch = 7, pdst = 30, pdstValid = true, pdstOld = 7)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= false
+      markComplete(dut, reuseId) // stale completion on the index being re-allocated
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      clearComplete(dut)
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 1, s"one new entry after re-alloc, count=${dut.rob.logic.count.toInt}")
+
+      // The freshly re-allocated entry is NOT complete (alloc-reset beat the stale
+      // completion). It must NOT retire over the next several cycles.
+      for (_ <- 0 until 6) {
+        assert(!dut.tsink.logic.fireOut(0).toBoolean,
+          "stale completion must NOT retire the re-allocated entry (alloc-reset must win)")
+        cd.waitSampling()
+      }
+      assert(dut.rob.logic.count.toInt == 1, "entry still in flight (never retired)")
+
+      // Now legitimately complete it -> it retires (proves it was a normal live entry).
+      markComplete(dut, reuseId)
+      cd.waitSampling()
+      clearComplete(dut)
+      cd.waitSamplingWhere(dut.tsink.logic.fireOut(0).toBoolean)
+      assert(dut.tsink.logic.traceOut(0).archRegId.toInt == 7, "retired entry is the re-allocated uop")
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 0, "ROB drained after legit completion")
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  test("mispredicting branch retire fires a REGISTERED doFlush pulse + flushPc + self-squash") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+      dut.rob.logic.branchCompletion.valid #= false
+
+      // Allocate a single branch (retireAlone) at robId 0.
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x1000, dstArch = 0, pdstValid = false, isBranch = true)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= false
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 1, "one branch in flight")
+
+      // Branch EU completion: robId 0 mispredicted, resolved nextPc = 0xBEEF.
+      dut.rob.logic.branchCompletion.valid #= true
+      dut.rob.logic.branchCompletion.payload.robId #= 0
+      dut.rob.logic.branchCompletion.payload.mispredict #= true
+      dut.rob.logic.branchCompletion.payload.nextPc #= 0xBEEF
+      cd.waitSampling()
+      dut.rob.logic.branchCompletion.valid #= false
+
+      // The branch retires (1-wide). doFlush is REGISTERED -> it pulses the cycle
+      // AFTER retire0 asserts. Wait for the retire, then check next-cycle pulse.
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
+      // commit trace pc must be the RESOLVED nextPc, not predNextPc(=pc+2=0x1002).
+      assert(dut.tsink.logic.traceOut(0).pc.toLong == 0xBEEF,
+        s"branch trace pc must be resolved nextPc, got 0x${dut.tsink.logic.traceOut(0).pc.toLong.toHexString}")
+      // doFlush is registered: not asserted in the retire cycle yet.
+      assert(!dut.rob.logic.doFlushReg.toBoolean, "doFlush must be registered (not combinational with retire)")
+      cd.waitSampling()
+      // Now the registered pulse fires with the resolved PC.
+      assert(dut.rob.logic.doFlushReg.toBoolean, "doFlush pulses the cycle after the mispredicting branch retires")
+      assert(dut.rob.logic.flushPcReg.toLong == 0xBEEF, s"flushPc = 0x${dut.rob.logic.flushPcReg.toLong.toHexString}")
+      // ROB self-squashes (pointer-only): count -> 0, tail == head.
+      cd.waitSampling()
+      assert(dut.rob.logic.doFlushReg.toBoolean == false, "doFlush is a one-cycle pulse")
+      assert(dut.rob.logic.count.toInt == 0, s"ROB self-squashed, count=${dut.rob.logic.count.toInt}")
+      assert(dut.rob.logic.tail.toInt == dut.rob.logic.head.toInt, "tail==head after self-squash")
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  test("correctly-predicted branch retire does NOT fire doFlush") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+      dut.rob.logic.branchCompletion.valid #= false
+
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x2000, dstArch = 0, pdstValid = false, isBranch = true)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= false
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      cd.waitSampling()
+
+      // Not mispredicted.
+      dut.rob.logic.branchCompletion.valid #= true
+      dut.rob.logic.branchCompletion.payload.robId #= 0
+      dut.rob.logic.branchCompletion.payload.mispredict #= false
+      dut.rob.logic.branchCompletion.payload.nextPc #= 0x2002
+      cd.waitSampling()
+      dut.rob.logic.branchCompletion.valid #= false
+
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
+      // No mispredict -> no doFlush over the next few cycles.
+      for (_ <- 0 until 4) {
+        assert(!dut.rob.logic.doFlushReg.toBoolean, "no doFlush for a correctly-predicted branch")
+        cd.waitSampling()
+      }
+      assert(dut.rob.logic.count.toInt == 0, "branch retired normally, ROB drained")
     }
   }
 

@@ -31,6 +31,13 @@ trait FlushService {
   def flushPc: UInt
 }
 
+/** Owned by the ROB (commit-time mispredict). Consumed by rename/IQ/frontend.
+  * doFlush is a REGISTERED pulse (FMax: drives only pointer/bitmap resets). */
+trait RedirectService {
+  def doFlush: Bool
+  def flushPc: UInt
+}
+
 /** Produced by the I-cache; consumed by the fetch/align stage (later). */
 trait FetchService {
   def cmd: Stream[FetchCmd]

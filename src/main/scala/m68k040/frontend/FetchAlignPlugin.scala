@@ -40,6 +40,14 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val slot1Valid    = slot1ValidOut   // alias for testbench access via logic.slot1Valid
     val redirect      = slave(Flow(UInt(32 bits)))
     val resume        = slave(Flow(UInt(32 bits)))
+    // Commit-time mispredict redirect (full core): a sibling wiring plugin drives
+    // this from the ROB's RedirectService. Directionless, idle-defaulted with
+    // CONCRETE zeros (allowOverride) — NOT assignDontCare (which would hide the
+    // sibling's drive / a sim poke from the consumer). Highest fetch-redirect
+    // priority (applied last, below).
+    val mispredictRedirect = Flow(UInt(32 bits))
+    mispredictRedirect.valid.allowOverride;   mispredictRedirect.valid   := False
+    mispredictRedirect.payload.allowOverride; mispredictRedirect.payload := U(0, 32 bits)
 
     // ---- State registers ----
     val decodePc      = Reg(UInt(32 bits)) init 0
@@ -163,6 +171,30 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       fetchPc     := newPc(31 downto 3) @@ U(0, 3 bits)
       ibuf.io.flush  := True
       stalled        := False
+      dropPending    := True
+      dropCount      := newPc(2 downto 1)
+      when(fetchInFlight) {
+        rspStale      := True
+        fetchInFlight := False
+      }
+    }
+
+    // ---- commit-time mispredict redirect (HIGHEST priority) ----
+    // `mispredictRedirect` is an internal directionless Flow, default-driven idle
+    // (allowOverride) so FetchAlign elaborates standalone. In the full core a
+    // sibling wiring plugin OVERRIDES it from the ROB's RedirectService (doFlush /
+    // flushPc) — a REGISTERED one-cycle pulse. We drive it from the wiring plugin
+    // (not by reading host[RedirectService] here) to avoid a Fiber build-order
+    // cycle (FetchAlign build -> ROB build -> ... -> FetchAlign.feed). On the pulse
+    // we restart fetch at the resolved flushPc, exactly like an external redirect.
+    // Placed LAST so it wins (later when in SpinalHDL overrides the external one).
+    when(mispredictRedirect.valid) {
+      val newPc   = mispredictRedirect.payload
+      decodePc    := newPc
+      fetchPc     := newPc(31 downto 3) @@ U(0, 3 bits)
+      ibuf.io.flush  := True
+      stalled        := False
+      started        := True
       dropPending    := True
       dropCount      := newPc(2 downto 1)
       when(fetchInFlight) {
