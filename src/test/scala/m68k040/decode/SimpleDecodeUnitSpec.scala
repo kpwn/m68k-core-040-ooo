@@ -31,15 +31,18 @@ class SimpleDecodeUnitSpec extends AnyFunSuite {
   test("MOVE.W D0,D1", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       drivePkt(dut, 0x3200); sleep(1)
-      assert(dut.uop.op.toEnum == DecOp.MOVE && dut.uop.srcAReg.toInt == 0 && dut.uop.srcAValid.toBoolean)
+      // ALU MOVE computes result = src2 (= srcB), so the register source must be in srcB.
+      assert(dut.uop.op.toEnum == DecOp.MOVE && dut.uop.srcBReg.toInt == 0 && dut.uop.srcBValid.toBoolean)
+      assert(!dut.uop.srcAValid.toBoolean)
       assert(dut.uop.dstReg.toInt == 1 && dut.uop.dstValid.toBoolean && dut.uop.writesNzvc.toBoolean)
     }
   }
   test("MOVEA.L A0,A1 (no flags)", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       drivePkt(dut, 0x2248); sleep(1)
-      assert(dut.uop.op.toEnum == DecOp.MOVE && dut.uop.srcAReg.toInt == 8 && dut.uop.dstReg.toInt == 9)
-      assert(dut.uop.dstValid.toBoolean && !dut.uop.writesNzvc.toBoolean)
+      // MOVEA source (A0) goes to srcB (ALU MOVE result = src2); dest A1; no flags.
+      assert(dut.uop.op.toEnum == DecOp.MOVE && dut.uop.srcBReg.toInt == 8 && dut.uop.srcBValid.toBoolean)
+      assert(dut.uop.dstReg.toInt == 9 && dut.uop.dstValid.toBoolean && !dut.uop.writesNzvc.toBoolean)
     }
   }
   test("ADD.L D1,D0", VerilatorTest) {

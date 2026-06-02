@@ -223,6 +223,17 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #5,%d0 ; moveq #5,%d1 ; cmp.l %d1,%d0 ; moveq #7,%d2")
   }
 
+  test("lock-step: register move chain", VerilatorTest) {
+    // Register-to-register MOVE: the ALU computes result = src2 (= srcB), so the
+    // decoder must place the MOVE source register in srcB. Before the fix the
+    // source went to srcA and srcB defaulted to reg0 (D0), so the move read D0's
+    // value instead of the named source. We seed D0 with a DIFFERENT value (99)
+    // than the source register (D1=42) so the buggy reg0-read is detectable:
+    // pre-fix `move.l %d1,%d2` would yield D2=99 (D0), diverging from Musashi's 42.
+    runLockStep("regmove",
+      "moveq #99,%d0 ; moveq #42,%d1 ; move.l %d1,%d2 ; move.l %d2,%d3")
+  }
+
   test("lock-step: mixed straight-line (~24 instrs)", VerilatorTest) {
     runLockStep("mixed", Seq(
       "moveq #1,%d0", "moveq #2,%d1", "moveq #3,%d2", "moveq #4,%d3",

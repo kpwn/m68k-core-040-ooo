@@ -80,15 +80,16 @@ object SimpleDecodeUnit {
           uop.size := Size.LONG
         }
 
-        // source
+        // source — the ALU MOVE path computes result = src2 (= srcB), so a
+        // register-source MOVE must put the source operand in srcB (NOT srcA).
         when(srcMode === 0) {
           // Dn
-          uop.srcAReg   := srcReg.asUInt.resized
-          uop.srcAValid := True
+          uop.srcBReg   := srcReg.asUInt.resized
+          uop.srcBValid := True
         } .elsewhen(srcMode === 1) {
           // An
-          uop.srcAReg   := (8 + srcReg.asUInt).resized
-          uop.srcAValid := True
+          uop.srcBReg   := (8 + srcReg.asUInt).resized
+          uop.srcBValid := True
         } .elsewhen(srcMode === 7 && srcReg === 4) {
           // #imm
           uop.useImm := True
