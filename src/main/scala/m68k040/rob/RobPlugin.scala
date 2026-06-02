@@ -1,6 +1,6 @@
 package m68k040.rob
 
-import m68k040.services.{RenameUopService, RenameCommitService, CommitTraceService}
+import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService}
 import m68k040.rename.RenamedUop
 import m68k040.types.CommitTrace
 import spinal.core._
@@ -10,15 +10,16 @@ import spinal.lib.misc.plugin.FiberPlugin
 
 /** RobPlugin: instruction-level reorder buffer ring with 2-wide in-order retire.
   *
-  * - Dispatch: consumes RenameUopService.uops (2-wide), allocates ring slots.
-  * - Completion: external markComplete.Flow(robId) marks an entry done.
+  * - Alloc: PASSIVE RobAllocService — DispatchPlugin takes robIds and drives the
+  *   alloc-fire/uop/slot1 wires; the ROB writes the ring slots.
+  * - Completion: two external completion.Flow(robId) ports mark entries done.
   * - Retire: in-order, up to 2/cycle, drives RenameCommitService.commitPorts
-  *   (commit committed-RAT + free old pdsts) and exposes CommitTrace.
+  *   (commit committed-RAT + free old pdsts) and exposes CommitTrace + commitObs.
   * - Flush: squash all in-flight entries (tail := head, count := 0).
   *
   * retireAlone entries (branches, for now) retire 1-wide.
   */
-class RobPlugin extends FiberPlugin with CommitTraceService {
+class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService {
 
   /** One ROB entry's commit/free + trace payload. */
   case class RobPayload() extends Bundle {
@@ -31,7 +32,6 @@ class RobPlugin extends FiberPlugin with CommitTraceService {
   }
 
   val logic = during build new Area {
-    val ru = host[RenameUopService]
     val rc = host[RenameCommitService]
 
     val depth  = 64
@@ -47,8 +47,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService {
     head.simPublic(); tail.simPublic(); count.simPublic()
 
     // ── External ports ────────────────────────────────────────────────────────
-    val markComplete = slave(Flow(UInt(robIdW bits)))
-    val flush        = slave(Flow(NoData()))
+    val completion = Vec.fill(2)(slave(Flow(UInt(robIdW bits))))
+    val flush      = slave(Flow(NoData()))
 
     // ── Build a RobPayload from a RenamedUop ───────────────────────────────────
     def payloadFrom(u: RenamedUop): RobPayload = {
@@ -115,30 +115,37 @@ class RobPlugin extends FiberPlugin with CommitTraceService {
 
     val retiredThisCycle = (retire1 ? U(2) | (retire0 ? U(1) | U(0))).resize(count.getWidth)
 
-    // ── Dispatch / alloc ────────────────────────────────────────────────────────
-    ru.uops.ready := count <= (depth - 2)
-    val alloc0 = ru.uops.fire
-    val alloc1 = ru.uops.fire && ru.uop1Valid
+    // ── Passive alloc interface (driven by DispatchPlugin) ──────────────────────
+    // Plain-wire service convention: the ROB EXPOSES these via RobAllocService;
+    // the sibling DispatchPlugin DRIVES allocFireSig/allocUopVec/allocSlot1Sig
+    // (do NOT default-drive them here — that would double-drive). allocReadySig /
+    // robId1Sig are driven here (ROB produces them).
+    val allocReadySig = Bool(); allocReadySig := count <= (depth - 2)
+    val allocFireSig  = Bool()                 // DRIVEN by DispatchPlugin
+    val allocUopVec   = Vec(RenamedUop(), 2)   // DRIVEN by DispatchPlugin
+    val allocSlot1Sig = Bool()                 // DRIVEN by DispatchPlugin
+    val robId1Sig     = UInt(robIdW bits); robId1Sig := tail + 1
+
+    val alloc0 = allocFireSig
+    val alloc1 = allocFireSig && allocSlot1Sig
     val allocThisCycle = (alloc1 ? U(2) | (alloc0 ? U(1) | U(0))).resize(count.getWidth)
 
     when(alloc0) {
-      payload.write(tail, payloadFrom(ru.uops.payload(0)))
+      payload.write(tail, payloadFrom(allocUopVec(0)))
       valids(tail)    := True
       completes(tail) := False
     }
     when(alloc1) {
-      payload.write(tail + 1, payloadFrom(ru.uops.payload(1)))
+      payload.write(tail + 1, payloadFrom(allocUopVec(1)))
       valids(tail + 1)    := True
       completes(tail + 1) := False
     }
-    when(ru.uops.fire) {
-      tail := tail + Mux(ru.uop1Valid, U(2, robIdW bits), U(1, robIdW bits))
+    when(allocFireSig) {
+      tail := tail + Mux(allocSlot1Sig, U(2, robIdW bits), U(1, robIdW bits))
     }
 
     // ── Completion mark (retire-clear has priority on same index) ───────────────
-    when(markComplete.valid) {
-      completes(markComplete.payload) := True
-    }
+    for (c <- completion) when(c.valid) { completes(c.payload) := True }
 
     // ── Retire-side state updates (head advance + valid clear) ──────────────────
     when(retire0) { valids(h0) := False }
@@ -155,8 +162,21 @@ class RobPlugin extends FiberPlugin with CommitTraceService {
       valids.foreach(_ := False)
     }
     rc.flushPort := flush.valid
+
+    // ── Sim-only commit observation (lock-step harness consumes this) ───────────
+    case class CommitObs() extends Bundle { val fire = Bool(); val robId = UInt(robIdW bits); val pc = UInt(32 bits) }
+    val commitObs = Vec(CommitObs(), 2); commitObs.simPublic()
+    commitObs(0).fire := retire0; commitObs(0).robId := h0; commitObs(0).pc := p0.predNextPc
+    commitObs(1).fire := retire1; commitObs(1).robId := h1; commitObs(1).pc := p1.predNextPc
   }
 
   override def trace     = logic.traceVec
   override def traceFire = logic.traceFireVec
+
+  override def allocReady = logic.allocReadySig
+  override def robId0     = logic.tail
+  override def robId1     = logic.robId1Sig
+  override def allocFire  = logic.allocFireSig
+  override def allocUop   = logic.allocUopVec
+  override def allocSlot1 = logic.allocSlot1Sig
 }

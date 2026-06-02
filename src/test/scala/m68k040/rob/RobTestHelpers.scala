@@ -1,6 +1,6 @@
 package m68k040.rob
 
-import m68k040.services.{RenameUopService, RenameCommitService}
+import m68k040.services.{RenameUopService, RenameCommitService, RobAllocService}
 import m68k040.rename.RenamedUop
 import spinal.core._
 import spinal.core.sim._
@@ -8,7 +8,7 @@ import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
 
 /** Test-only: PRODUCES RenameUopService from top-level-driven signals.
-  * Test drives src.valid + src.payload + u1v; RobPlugin drives src.ready. */
+  * Test drives src.valid + src.payload + u1v; consumer drives src.ready. */
 class RenameUopSourcePlugin extends FiberPlugin with RenameUopService {
   val logic = during build new Area {
     val src = Stream(Vec(RenamedUop(), 2))
@@ -19,6 +19,23 @@ class RenameUopSourcePlugin extends FiberPlugin with RenameUopService {
   }
   override def uops: Stream[Vec[RenamedUop]] = logic.src
   override def uop1Valid: Bool               = logic.u1v
+}
+
+/** Test-only mini-dispatch: drives the ROB's passive RobAllocService directly
+  * from a RenameUopService (no IQ). Mirrors DispatchPlugin's ROB-alloc side so
+  * RobPluginSpec can exercise the ring/retire path without an IssueQueue.
+  * Back-pressure is ROB-only: ren.uops.ready := rob.allocReady. */
+class RobAllocDriverPlugin extends FiberPlugin {
+  val logic = during build new Area {
+    val ren = host[RenameUopService]
+    val rob = host[RobAllocService]
+    val fire = ren.uops.valid && rob.allocReady
+    ren.uops.ready := rob.allocReady
+    rob.allocFire   := fire
+    rob.allocUop(0) := ren.uops.payload(0)
+    rob.allocUop(1) := ren.uops.payload(1)
+    rob.allocSlot1  := ren.uop1Valid
+  }
 }
 
 /** Test-only: CONSUMES RenameCommitService from RobPlugin, exposing commit ports
