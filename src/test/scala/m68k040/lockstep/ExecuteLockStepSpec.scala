@@ -49,6 +49,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val rob = host[RobPlugin]
       eu0.issue << iq.issue(0)
       eu1.issue << iq.issue(1)
+      // Branch issue port (BR2): no branch EU in this DUT yet (BR4 adds it). Tie
+      // its ready off so issue(2) is driven; the straight-line corpus has no branches.
+      iq.issue(2).ready := False
       rob.logic.completion(0).valid   := eu0.completion.valid
       rob.logic.completion(0).payload := eu0.completion.payload
       rob.logic.completion(1).valid   := eu1.completion.valid
