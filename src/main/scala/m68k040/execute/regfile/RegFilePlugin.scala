@@ -26,15 +26,25 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
 
   val logic = during build new Area {
     assert(writeReq.nonEmpty, s"RegFile ${spec.name}: at least one write port required (for init)")
+    // PRECONDITION (silent-corruption class): the multi-write Mem lowers to XOR/LVT
+    // banks (m68k040.hw.MultiPortWritesSymplifier), which require that NO TWO PHYSICAL
+    // write ports write the SAME address in the SAME cycle. Same-`sharingKey` requests
+    // merge into ONE physical port here (safe). DIFFERENT-key requests become DIFFERENT
+    // physical ports — callers MUST guarantee they never target the same physical
+    // register in one cycle (held by rename's unique-pdst allocation: each in-flight
+    // writer owns a distinct phys reg). Violating this corrupts silently.
+    //
     // Merge write requests sharing a key into one physical write port; within a
-    // group the highest-priority valid request wins (one-hot).
+    // group the highest-priority valid request wins.
     val phys = writeReq.groupBy(_.key).values.toSeq.map { grp =>
+      // sort descending by priority so element 0 is the highest priority
       val sorted = grp.sortBy(-_.priority)
       val bus    = RegFileWritePort(spec.addressWidth, spec.dataWidth)
       val valids = sorted.map(_.port.valid)
-      // first (highest-priority) valid, as a one-hot over `sorted`
       val anyValid = valids.reduce(_ || _)
-      // priority-select address/data: fold from lowest to highest priority so highest wins
+      // foldRight over the descending-priority list: the accumulator starts at the
+      // lowest-priority end and each higher-priority valid request overrides it, so the
+      // highest-priority valid request wins the address/data selection.
       bus.valid   := anyValid
       bus.address := sorted.foldRight(U(0, spec.addressWidth bits)) { case (r, acc) => Mux(r.port.valid, r.port.address, acc) }
       bus.data    := sorted.foldRight(B(0, spec.dataWidth bits))    { case (r, acc) => Mux(r.port.valid, r.port.data, acc) }

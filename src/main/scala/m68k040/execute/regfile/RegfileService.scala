@@ -26,6 +26,16 @@ case class RegFileBypassPort(addressWidth: Int, dataWidth: Int) extends Bundle {
   val data    = Bits(dataWidth bits)
 }
 
+/** Register-file allocation service.
+  *
+  * Consumers MUST call `newRead`/`newWrite`/`newBypass` during their own `during setup`
+  * phase (the file wires the allocated ports in `during build`, after all setups run).
+  *
+  * Writers that do NOT share a `sharingKey` become DISTINCT physical write ports and
+  * MUST target distinct physical registers in any given cycle — two physical write
+  * ports writing the same address in the same cycle corrupt silently. See the
+  * precondition note in RegFilePlugin (the XOR/LVT multi-write lowering requirement).
+  */
 trait RegfileService {
   def spec: RegfileSpec
   def newRead(forceNoBypass: Boolean = false): RegFileReadPort

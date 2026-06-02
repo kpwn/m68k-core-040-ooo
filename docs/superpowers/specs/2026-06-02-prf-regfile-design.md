@@ -49,6 +49,7 @@ Marker subtraits `IntRegFileService`/`NzvcRegFileService`/`XRegFileService exten
 - `during build`:
   - **Write merge** (NaxRiscv `writeMerges`): group writes by `sharingKey`; each group → one physical write bus via `OHMasking.first` over the group's `valid`s ordered by `priority` (higher first); a group containing a `latency==0` member also drives a `newBypass`. Physical write-port count = number of groups.
   - Instantiate `RegFileAsync(dataWidth, depth, readPorts=reads.size, writePorts=groups.size, bypassPorts=bypasses.size)`; connect merged write buses, read ports, and bypass ports.
+  - **Precondition (silent-corruption class):** the multi-write Mem lowers to XOR/LVT banks (`MultiPortWritesSymplifier`) which require that no two physical write ports write the same address in the same cycle. Same-`sharingKey` requests merge into one physical port (safe); **different-key requests become different physical write ports, and callers MUST guarantee they never target the same physical register in one cycle** (held by rename's unique-pdst allocation — each in-flight writer owns a distinct phys reg). Violating this corrupts silently.
 - Three instances constructed in the top: `new RegFilePlugin(Int)`, `(Nzvc)`, `(X)`, each mixing in its marker service trait (or one class parameterized by spec that registers the right marker).
 
 ## 4. Data flow
