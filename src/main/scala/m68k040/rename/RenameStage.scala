@@ -228,10 +228,15 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
         xRat.io.commits(k).data  := commitPorts(k).xNew
       }
     }
+
+    // Flush-able pipeline register (rename -> dispatch boundary). flush tied False
+    // until 3d wires the mispredict-flush (frontend pipeline squash).
+    val pipeFlush = Bool(); pipeFlush := False
+    val uopsStaged = m68k040.frontend.PipeStage(uopsPort, pipeFlush)
   }
 
-  override def uops: Stream[Vec[RenamedUop]] = logic.uopsPort
-  override def uop1Valid: Bool               = logic.uop1Sig
+  override def uops: Stream[Vec[RenamedUop]] = logic.uopsStaged
+  override def uop1Valid: Bool               = logic.uopsStaged.payload(1).valid
 
   override def commitPorts: Vec[Flow[CommitSlot]] = logic.commitPorts
   override def flushPort:   Bool                  = logic.flush

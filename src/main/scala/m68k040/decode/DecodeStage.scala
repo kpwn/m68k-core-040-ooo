@@ -40,8 +40,13 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
 
     // slot1Valid signal exposed via the service
     val uop1Sig = df.feed.valid && df.slot1Valid
+
+    // Flush-able pipeline register (decode -> rename boundary). flush tied False
+    // until 3d wires the mispredict-flush (frontend pipeline squash).
+    val pipeFlush = Bool(); pipeFlush := False
+    val uopsStaged = m68k040.frontend.PipeStage(uopsPort, pipeFlush)
   }
 
-  override def uops: Stream[Vec[DecodedUop]] = logic.uopsPort
-  override def uop1Valid: Bool               = logic.uop1Sig
+  override def uops: Stream[Vec[DecodedUop]] = logic.uopsStaged
+  override def uop1Valid: Bool               = logic.uopsStaged.payload(1).valid
 }
