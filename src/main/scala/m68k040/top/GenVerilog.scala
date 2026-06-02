@@ -35,7 +35,9 @@ object GenSynthVerilog {
     new FetchAlignPlugin(),
     new DecodeStage(),
     new RenameStage(),
+    new m68k040.dispatch.DispatchPlugin(),
     new RobPlugin(),
+    new m68k040.execute.iq.IssueQueuePlugin(),
     new SynthProbePlugin()
   )
 
@@ -56,7 +58,9 @@ object GenBackendSynthVerilog {
     new ParamPlugin(p),
     new DecodeUopInputPlugin(),
     new RenameStage(),
+    new m68k040.dispatch.DispatchPlugin(),
     new RobPlugin(),
+    new m68k040.execute.iq.IssueQueuePlugin(),
     new SynthProbePlugin()
   )
 

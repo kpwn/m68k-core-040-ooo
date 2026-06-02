@@ -22,11 +22,12 @@ class RobPluginSpec extends AnyFunSuite {
     val db   = new Database
     val host = db on (new PluginHost)
     val rsrc = new RenameUopSourcePlugin
+    val drv  = new RobAllocDriverPlugin
     val rob  = new RobPlugin
     val csink = new RenameCommitSinkPlugin
     val tsink = new CommitTraceSinkPlugin
     db.on { host.asHostOf(Seq[FiberPlugin](
-      new ParamPlugin(M68kParams()), rsrc, rob, csink, tsink)) }
+      new ParamPlugin(M68kParams()), rsrc, drv, rob, csink, tsink)) }
   }
 
   /** Poke a RenamedUop slot with sane defaults. */
@@ -61,9 +62,19 @@ class RobPluginSpec extends AnyFunSuite {
   def initSimple(dut: SimpleDut, cd: ClockDomain): Unit = {
     dut.rsrc.logic.src.valid #= false
     dut.rsrc.logic.u1v #= false
-    dut.rob.logic.markComplete.valid #= false
+    dut.rob.logic.completion(0).valid #= false
+    dut.rob.logic.completion(1).valid #= false
     dut.rob.logic.flush.valid #= false
     cd.waitSampling()
+  }
+
+  /** Mark a single robId complete this cycle on completion port 0. */
+  def markComplete(dut: SimpleDut, robId: Int): Unit = {
+    dut.rob.logic.completion(0).valid #= true
+    dut.rob.logic.completion(0).payload #= robId
+  }
+  def clearComplete(dut: SimpleDut): Unit = {
+    dut.rob.logic.completion(0).valid #= false
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -84,12 +95,11 @@ class RobPluginSpec extends AnyFunSuite {
 
       // Mark robId complete. Flow is single-port; mark 1 FIRST (head=0 won't retire
       // since head incomplete), then 0 so both land complete -> 2-wide retire.
-      dut.rob.logic.markComplete.valid #= true
-      dut.rob.logic.markComplete.payload #= 1
+      markComplete(dut, 1)
       cd.waitSampling()
-      dut.rob.logic.markComplete.payload #= 0
+      dut.rob.logic.completion(0).payload #= 0
       cd.waitSampling()
-      dut.rob.logic.markComplete.valid #= false
+      clearComplete(dut)
 
       // Now head=0, both complete: expect 2-wide retire in the same cycle.
       cd.waitSamplingWhere(dut.tsink.logic.fireOut(0).toBoolean)
@@ -126,10 +136,9 @@ class RobPluginSpec extends AnyFunSuite {
       cd.waitSampling()
 
       // Complete ONLY robId 1.
-      dut.rob.logic.markComplete.valid #= true
-      dut.rob.logic.markComplete.payload #= 1
+      markComplete(dut, 1)
       cd.waitSampling()
-      dut.rob.logic.markComplete.valid #= false
+      clearComplete(dut)
 
       // For several cycles, no retire (head=0 not complete).
       for (_ <- 0 until 5) {
@@ -139,10 +148,9 @@ class RobPluginSpec extends AnyFunSuite {
       assert(dut.rob.logic.count.toInt == 2, s"count still 2, got ${dut.rob.logic.count.toInt}")
 
       // Now complete robId 0 -> 2-wide retire fires.
-      dut.rob.logic.markComplete.valid #= true
-      dut.rob.logic.markComplete.payload #= 0
+      markComplete(dut, 0)
       cd.waitSampling()
-      dut.rob.logic.markComplete.valid #= false
+      clearComplete(dut)
       cd.waitSamplingWhere(dut.tsink.logic.fireOut(0).toBoolean)
       assert(dut.tsink.logic.fireOut(0).toBoolean && dut.tsink.logic.fireOut(1).toBoolean, "both retire once head completes")
       cd.waitSampling()
@@ -167,12 +175,11 @@ class RobPluginSpec extends AnyFunSuite {
       cd.waitSampling()
 
       // Complete slot1 FIRST (won't retire, head=branch incomplete), then slot0.
-      dut.rob.logic.markComplete.valid #= true
-      dut.rob.logic.markComplete.payload #= 1
+      markComplete(dut, 1)
       cd.waitSampling()
-      dut.rob.logic.markComplete.payload #= 0
+      dut.rob.logic.completion(0).payload #= 0
       cd.waitSampling()
-      dut.rob.logic.markComplete.valid #= false
+      clearComplete(dut)
 
       // head=0 is a branch -> retire 1-wide only this cycle (slot1 held back).
       cd.waitSamplingWhere(dut.tsink.logic.fireOut(0).toBoolean)
@@ -235,10 +242,11 @@ class RobPluginSpec extends AnyFunSuite {
     val host = db on (new PluginHost)
     val dsrc = new m68k040.rename.DecodeUopSourcePlugin
     val ren  = new RenameStage
+    val drv  = new RobAllocDriverPlugin
     val rob  = new RobPlugin
     val tsink = new CommitTraceSinkPlugin
     db.on { host.asHostOf(Seq[FiberPlugin](
-      new ParamPlugin(M68kParams()), dsrc, ren, rob, tsink)) }
+      new ParamPlugin(M68kParams()), dsrc, ren, drv, rob, tsink)) }
   }
 
   test("sustained free-loop: real rename->rob keeps flowing past 48 allocations", VerilatorTest) {
@@ -246,7 +254,8 @@ class RobPluginSpec extends AnyFunSuite {
       val cd = dut.clockDomain; cd.forkStimulus(10)
       dut.dsrc.logic.src.valid #= false
       dut.dsrc.logic.s1v #= false
-      dut.rob.logic.markComplete.valid #= false
+      dut.rob.logic.completion(0).valid #= false
+      dut.rob.logic.completion(1).valid #= false
       dut.rob.logic.flush.valid #= false
       cd.waitSampling()
       // wait for rename init.
@@ -303,13 +312,13 @@ class RobPluginSpec extends AnyFunSuite {
       val completeLag = 4
 
       while (allocs < totalUops && cyc < 4000) {
-        // Set up completion for any due entries (single markComplete port -> at most 1/cycle).
+        // Set up completion for any due entries (use completion port 0 -> at most 1/cycle).
         // Default no complete.
-        dut.rob.logic.markComplete.valid #= false
+        dut.rob.logic.completion(0).valid #= false
         if (pending.nonEmpty && pending.front._2 <= cyc) {
           val (rid, _) = pending.dequeue()
-          dut.rob.logic.markComplete.valid #= true
-          dut.rob.logic.markComplete.payload #= rid
+          dut.rob.logic.completion(0).valid #= true
+          dut.rob.logic.completion(0).payload #= rid
         }
 
         // Drive a uop on slot0 only.
@@ -332,16 +341,16 @@ class RobPluginSpec extends AnyFunSuite {
       // Drain: keep completing remaining pending entries.
       var drain = 0
       while (pending.nonEmpty && drain < 2000) {
-        dut.rob.logic.markComplete.valid #= false
+        dut.rob.logic.completion(0).valid #= false
         if (pending.front._2 <= cyc) {
           val (rid, _) = pending.dequeue()
-          dut.rob.logic.markComplete.valid #= true
-          dut.rob.logic.markComplete.payload #= rid
+          dut.rob.logic.completion(0).valid #= true
+          dut.rob.logic.completion(0).payload #= rid
         }
         cd.waitSampling()
         cyc += 1; drain += 1
       }
-      dut.rob.logic.markComplete.valid #= false
+      dut.rob.logic.completion(0).valid #= false
       // let final retires drain
       for (_ <- 0 until 20) cd.waitSampling()
 

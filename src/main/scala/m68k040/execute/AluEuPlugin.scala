@@ -4,6 +4,7 @@ import m68k040.execute.iq.IqContext
 import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, XRegFileService,
   RegFileReadPort, RegFileWritePort, RegFileBypassPort}
 import spinal.core._
+import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
 
@@ -11,6 +12,19 @@ import spinal.lib.misc.plugin.FiberPlugin
 trait AluEuService {
   def issue: Stream[IqContext]
   def completion: Flow[UInt]   // robId
+}
+
+/** Sim-only per-instruction writeback observation (NaxRiscv-style whitebox). */
+case class WbObs() extends Bundle {
+  val valid     = Bool()
+  val robId     = UInt(6 bits)
+  val dstArch   = UInt(4 bits)
+  val result    = Bits(32 bits)
+  val intWrite  = Bool()
+  val nzvc      = Bits(4 bits)
+  val nzvcWrite = Bool()
+  val x         = Bool()
+  val xWrite    = Bool()
 }
 
 /** Fixed-latency-1 integer ALU EU. S0 read | M2S | S1 execute+writeback+bypass+completion. */
@@ -76,5 +90,23 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // ---- S1: completion ----
     completionPort.valid   := s1Valid
     completionPort.payload := s1Ctx.robId
+
+    // ---- S1: sim-only whitebox writeback observation (NaxRiscv-style) ----
+    // Per-instruction value+flags+masks keyed by robId; the lock-step harness
+    // joins this with the ROB commit-obs (retire order + pc) to reconstruct the
+    // architectural CommitObservation stream. No synthesizable cost (sim-only).
+    // Registered (sim-only) so the lock-step harness reading wbObs in onSamplings
+    // gets stable one-cycle pulses (reading combinational result there races).
+    val wbObs = WbObs()
+    wbObs.valid     := RegNext(s1Valid) init False
+    wbObs.robId     := RegNext(s1Ctx.robId)
+    wbObs.dstArch   := RegNext(u1.dstArch)
+    wbObs.result    := RegNext(rsp.result)
+    wbObs.intWrite  := RegNext(u1.pdstValid)
+    wbObs.nzvc      := RegNext(rsp.nzvc)
+    wbObs.nzvcWrite := RegNext(u1.writesNzvc)
+    wbObs.x         := RegNext(rsp.xOut)
+    wbObs.xWrite    := RegNext(u1.writesX)
+    wbObs.simPublic()
   }
 }

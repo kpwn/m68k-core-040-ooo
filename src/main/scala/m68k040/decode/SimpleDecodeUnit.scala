@@ -80,15 +80,16 @@ object SimpleDecodeUnit {
           uop.size := Size.LONG
         }
 
-        // source
+        // source — the ALU MOVE path computes result = src2 (= srcB), so a
+        // register-source MOVE must put the source operand in srcB (NOT srcA).
         when(srcMode === 0) {
           // Dn
-          uop.srcAReg   := srcReg.asUInt.resized
-          uop.srcAValid := True
+          uop.srcBReg   := srcReg.asUInt.resized
+          uop.srcBValid := True
         } .elsewhen(srcMode === 1) {
           // An
-          uop.srcAReg   := (8 + srcReg.asUInt).resized
-          uop.srcAValid := True
+          uop.srcBReg   := (8 + srcReg.asUInt).resized
+          uop.srcBValid := True
         } .elsewhen(srcMode === 7 && srcReg === 4) {
           // #imm
           uop.useImm := True
@@ -183,11 +184,15 @@ object SimpleDecodeUnit {
               is(0xD) { uop.op := DecOp.ADD }
             }
 
-            // opmode 0,1,2 → EA→Dn
+            // opmode 0,1,2 → EA→Dn. The ALU datapath computes src1 - src2 (src1 =
+            // destination operand) and MOVE-style result = src2, so srcA must be
+            // the DESTINATION (Dn) and srcB the source (EA): SUB/CMP need Dn - EA,
+            // not EA - Dn. (ADD/AND/OR are commutative so order is irrelevant for
+            // them, which previously masked this in 2-byte ADD-only checks.)
             when(opmode === 0 || opmode === 1 || opmode === 2) {
-              uop.srcAReg   := eaRegFull
+              uop.srcAReg   := dn.resized
               uop.srcAValid := True
-              uop.srcBReg   := dn.resized
+              uop.srcBReg   := eaRegFull
               uop.srcBValid := True
               uop.dstReg    := dn.resized
 

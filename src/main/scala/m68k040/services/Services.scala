@@ -63,3 +63,14 @@ trait RenameUopService {
   def uops: Stream[Vec[RenamedUop]]   // Vec length 2
   def uop1Valid: Bool
 }
+
+/** ROB exposes a passive allocation interface; DispatchPlugin drives it.
+  * robId0/robId1 are the ring indices the next 0th/1st µop will occupy. */
+trait RobAllocService {
+  def allocReady: Bool                 // room for 2 (ROB drives)
+  def robId0: UInt                     // = tail
+  def robId1: UInt                     // = tail+1
+  def allocFire: Bool                  // dispatch drives: commit the allocation this cycle
+  def allocUop: Vec[RenamedUop]        // dispatch drives: the 2 µops (length 2)
+  def allocSlot1: Bool                 // dispatch drives: 2nd µop valid
+}

@@ -86,7 +86,13 @@ class MultiPortWritesSymplifier extends PhaseMemBlackboxing {
   override def doBlackboxing(pc: PhaseContext, typo: MemTopology): Unit = {
     if (typo.writes.size <= 1) return
 
-    if (typo.readsSync.size == 0 && typo.readsAsync.size != 0) {
+    // Handle async-read multi-write Mems (XOR/LVT banks). readsAsync may be 0
+    // (a write-only Mem, e.g. an NZVC/X PRF whose readers are all bypass-only in
+    // a given build): the bank construction is valid with zero external read
+    // ports — the XOR banks still need their internal cross-reads, which are not
+    // part of `readsAsync`. The hard requirement is only that there are no SYNC
+    // reads (those need the NaxRiscv sync branch, not used in this core).
+    if (typo.readsSync.size == 0) {
       typo.writes.foreach(w => assert(w.mask == null, "MultiPortWritesSymplifier: masked writes unsupported"))
       typo.writes.foreach(w => assert(w.clockDomain == typo.writes.head.clockDomain))
       val cd = typo.writes.head.clockDomain

@@ -35,6 +35,7 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // sibling plugin in the same Component can drive feed.ready without hierarchy
     // violation; matches IcachePlugin.cmdPort convention).
     val feed          = Stream(Vec(DecodePacket(), 2))   // producer drives valid/payload; consumer drives ready
+    spinal.core.sim.SimPublic(feed.valid, feed.ready, feed.payload(0).pc)
     val slot1ValidOut = out(Bool())
     val slot1Valid    = slot1ValidOut   // alias for testbench access via logic.slot1Valid
     val redirect      = slave(Flow(UInt(32 bits)))
@@ -43,6 +44,7 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // ---- State registers ----
     val decodePc      = Reg(UInt(32 bits)) init 0
     val fetchPc       = Reg(UInt(32 bits)) init 0   // 8-aligned
+    spinal.core.sim.SimPublic(decodePc, fetchPc)
     val stalled       = Reg(Bool()) init False       // complex-instruction stall
     val started       = Reg(Bool()) init False       // don't fetch until first redirect
     val fetchInFlight = Reg(Bool()) init False       // single-outstanding guard
