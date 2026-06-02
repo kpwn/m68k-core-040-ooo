@@ -72,4 +72,36 @@ class AluDatapathSpec extends AnyFunSuite {
       check(dut, OPS.find(_.mnem == "add").get, SIZES.head, 0x0000007FL, 0x00000001L)
     }
   }
+
+  test("directed corner cases across all op x size", VerilatorTest) {
+    SimConfig.withVerilator.compile(new AluDut).doSim { dut =>
+      val vectors = Seq(
+        (0x00000000L, 0x00000000L),
+        (0x7FFFFFFFL, 0x00000001L),
+        (0x80000000L, 0x00000001L),
+        (0x000000FFL, 0x00000001L),
+        (0x0000FFFFL, 0x00000001L),
+        (0xFFFFFFFFL, 0x00000001L),
+        (0x12345678L, 0x12345678L),
+        (0x80808080L, 0x7F7F7F7FL),
+        (0xA5A5A5A5L, 0x5A5A5A5AL),
+        (0x00000080L, 0x00000080L)
+      )
+      for (oc <- OPS; sz <- SIZES; (s1, s2) <- vectors) check(dut, oc, sz, s1, s2)
+    }
+  }
+
+  test("randomized sweep vs Musashi (all op x size)", VerilatorTest, SlowTest) {
+    val rng = new scala.util.Random(0x68040)
+    val PER = 24
+    SimConfig.withVerilator.compile(new AluDut).doSim { dut =>
+      for (oc <- OPS; sz <- SIZES) {
+        for (_ <- 0 until PER) {
+          val s1 = rng.nextInt() & 0xffffffffL
+          val s2 = rng.nextInt() & 0xffffffffL
+          check(dut, oc, sz, s1, s2)
+        }
+      }
+    }
+  }
 }
