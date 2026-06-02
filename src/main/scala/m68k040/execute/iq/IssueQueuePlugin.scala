@@ -1,5 +1,6 @@
 package m68k040.execute.iq
 
+import m68k040.rename.RenamedUop
 import spinal.core._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
@@ -57,6 +58,20 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     }
     val slots = lines.flatMap(_.ways) // index == priority
 
+    val slotIdxW = log2Up(slotCount) // 4 bits
+
+    // ---- Scoreboards (one per reg class). Scheme (b): store the producer's
+    // CURRENT slot index per physreg; shift stored indices by wayCount on every
+    // compaction (slots march toward 0). busy[p] => physreg p has an in-flight
+    // producer occupying slot physToSlot[p]. ----
+    class Scoreboard(depth: Int) extends Area {
+      val busy       = Reg(Bits(depth bits)) init 0
+      val physToSlot = Reg(Vec(UInt(slotIdxW bits), depth))
+    }
+    val sbInt  = new Scoreboard(48) // int physregs (width 6)
+    val sbNzvc = new Scoreboard(16) // NZVC flag physregs (width 4)
+    val sbX    = new Scoreboard(16) // X flag physregs (width 4)
+
     // ---- Occupancy / back-pressure ----
     val count = Reg(UInt(log2Up(slotCount + 1) bits)) init 0
     pushPort.ready := count <= (slotCount - wayCount)
@@ -83,6 +98,58 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       slot.fire := (issuePorts(0).fire && oh0(i)) || (issuePorts(1).fire && oh1(i))
     }
 
+    // ---- Static-latency-1 wakeup events ----
+    // events(j) == slot j issued (fired) this cycle. A slot j that fires is a
+    // producer whose result becomes available next cycle; dependents carry a
+    // trigger bit at index j which we clear (combinationally into the trigger
+    // reg's next value) so they become ready next cycle (back-to-back, lat 1).
+    val events = oh0.andMask(issuePorts(0).fire) | oh1.andMask(issuePorts(1).fire)
+
+    // ---- Depend-on-READ trigger init for the two newly-pushed slots ----
+    // Slot0 lands at priority `slot0Prio` (lines.last.ways(0)), slot1 at
+    // `slot1Prio` (== slot0Prio+1). A producer dependency is ALWAYS on an older
+    // (lower-index) slot, so it fits in the dependent's trigger width.
+    //
+    // A push always coincides with a compaction shift (slots march down by
+    // wayCount). The scoreboard holds the producer's CURRENT (pre-shift) slot;
+    // next cycle (when our freshly-written triggers take effect) the producer
+    // sits at slot-wayCount, so a dependency on an existing producer references
+    // bit (producerSlot - wayCount). Intra-push (slot1 reads slot0's dst)
+    // references slot0's final position (slot0Prio) directly, no shift offset.
+    val slot0Prio = (lineCount - 1) * wayCount     // 14
+    val slot1Prio = slot0Prio + 1                  // 15
+
+    // Build the trigger Bits for a pushed slot of the given priority width.
+    def trigInit(uop: RenamedUop, width: Int): Bits = {
+      val t = B(0, width bits)
+      def dep(busy: Bits, physToSlot: Vec[UInt], physreg: UInt, reads: Bool): Unit = {
+        val producerSlot = (physToSlot(physreg) - wayCount).resize(slotIdxW)
+        when(reads && busy(physreg)) {
+          // bit index < this slot's priority (older), so in range.
+          t(producerSlot) := True
+        }
+      }
+      dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcA, uop.psrcAValid)
+      dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcB, uop.psrcBValid && !uop.useImm)
+      dep(sbNzvc.busy, sbNzvc.physToSlot, uop.pNzvcSrc, uop.readsNzvc)
+      dep(sbX.busy,    sbX.physToSlot,    uop.pXSrc, uop.readsX)
+      t
+    }
+
+    val pushUop0 = pushPort.payload(0).uop
+    val pushUop1 = pushPort.payload(1).uop
+    val trig0 = trigInit(pushUop0, slot0Prio + 1)
+    val trig1 = trigInit(pushUop1, slot1Prio + 1)
+    // Intra-push: slot1 reads a physreg that slot0 (pushed same cycle) writes.
+    // slot0 ends at slot0Prio; set slot1's trigger bit there.
+    val s0WritesInt  = pushUop0.pdstValid
+    val s0WritesNzvc = pushUop0.writesNzvc
+    val s0WritesX    = pushUop0.writesX
+    when(s0WritesInt  && pushUop1.psrcAValid && pushUop1.psrcA === pushUop0.pdst)              { trig1(slot0Prio) := True }
+    when(s0WritesInt  && pushUop1.psrcBValid && !pushUop1.useImm && pushUop1.psrcB === pushUop0.pdst) { trig1(slot0Prio) := True }
+    when(s0WritesNzvc && pushUop1.readsNzvc && pushUop1.pNzvcSrc === pushUop0.pNzvcDst)        { trig1(slot0Prio) := True }
+    when(s0WritesX    && pushUop1.readsX    && pushUop1.pXSrc === pushUop0.pXDst)              { trig1(slot0Prio) := True }
+
     // ---- Compaction on push.fire (shift toward index 0, insert at last line) ----
     when(pushPort.fire) {
       for (lineId <- 0 to lineCount - 2) {
@@ -100,11 +167,56 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       val wDst0 = lines.last.ways(0)
       val wDst1 = lines.last.ways(1)
       wDst0.context  := wSrc0
-      wDst0.triggers := 0
+      wDst0.triggers := trig0
       wDst0.sel      := True
       wDst1.context  := wSrc1
-      wDst1.triggers := 0
+      wDst1.triggers := trig1
       wDst1.sel      := pushSlot1Port
+    }
+
+    // ---- Apply wakeup events (clears trigger bits). MUST come after the
+    // compaction block so it overrides the shifted trigger value. On a
+    // compaction cycle every slot (and its triggers) shifts down by wayCount,
+    // so an event at producer-slot j must be applied at j-wayCount: NaxRiscv's
+    // moved = !moveIt ? events | (events >> wayCount). ----
+    val eventsMoved = Mux(pushPort.fire, events |>> wayCount, events)
+    for (j <- 0 until slotCount) {
+      when(eventsMoved(j)) {
+        slots.filter(_.priority >= j).foreach(s => s.triggers(j) := False)
+      }
+    }
+
+    // ---- Scoreboard maintenance ----
+    // Compaction shifts every still-busy producer's stored slot down by wayCount.
+    when(pushPort.fire) {
+      def shift(sb: Scoreboard): Unit = {
+        for (p <- 0 until sb.physToSlot.length) {
+          sb.physToSlot(p) := (sb.physToSlot(p) - wayCount).resize(slotIdxW)
+        }
+      }
+      shift(sbInt); shift(sbNzvc); shift(sbX)
+    }
+    // On push, record each newly-pushed producer's dst -> its landing slot + busy.
+    // (Written after the shift above so the fresh slot wins for that physreg.)
+    when(pushPort.fire) {
+      when(pushUop0.pdstValid)  { sbInt.busy(pushUop0.pdst)   := True; sbInt.physToSlot(pushUop0.pdst)   := slot0Prio }
+      when(pushUop0.writesNzvc) { sbNzvc.busy(pushUop0.pNzvcDst) := True; sbNzvc.physToSlot(pushUop0.pNzvcDst) := slot0Prio }
+      when(pushUop0.writesX)    { sbX.busy(pushUop0.pXDst)     := True; sbX.physToSlot(pushUop0.pXDst)     := slot0Prio }
+      when(pushSlot1Port) {
+        when(pushUop1.pdstValid)  { sbInt.busy(pushUop1.pdst)   := True; sbInt.physToSlot(pushUop1.pdst)   := slot1Prio }
+        when(pushUop1.writesNzvc) { sbNzvc.busy(pushUop1.pNzvcDst) := True; sbNzvc.physToSlot(pushUop1.pNzvcDst) := slot1Prio }
+        when(pushUop1.writesX)    { sbX.busy(pushUop1.pXDst)     := True; sbX.physToSlot(pushUop1.pXDst)     := slot1Prio }
+      }
+    }
+    // On issue, clear busy for the issued producer's dst(s) so later pushes do
+    // not depend on an already-issued (latency-1, result-available) producer.
+    for (k <- 0 until wayCount) {
+      val ctx = issuePorts(k).payload
+      when(issuePorts(k).fire) {
+        when(ctx.uop.pdstValid)  { sbInt.busy(ctx.uop.pdst)     := False }
+        when(ctx.uop.writesNzvc) { sbNzvc.busy(ctx.uop.pNzvcDst) := False }
+        when(ctx.uop.writesX)    { sbX.busy(ctx.uop.pXDst)       := False }
+      }
     }
 
     count := count + pushed - issued
@@ -116,6 +228,9 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
         w.triggers := 0
       })
       count := 0
+      sbInt.busy  := 0
+      sbNzvc.busy := 0
+      sbX.busy    := 0
     }
   }
 }
