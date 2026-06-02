@@ -67,3 +67,31 @@ object GenBackendSynthVerilog {
     println("Generated generated/M68kBackendSynth.v")
   }
 }
+
+/** OOC synth gate for the IssueQueue (slice 3b) — registered IO boundary so the
+  * measured paths are the internal compaction / wakeup / age-select reg→reg. */
+object GenIqSynthVerilog {
+  def main(args: Array[String]): Unit = {
+    M68kSpinalConfig(targetDirectory = "generated")
+      .generateVerilog(new M68kCore(Seq[FiberPlugin](
+        new m68k040.execute.iq.IssueQueuePlugin(),
+        new IqSynthProbePlugin()
+      )).setDefinitionName("M68kIqSynth"))
+    println("Generated generated/M68kIqSynth.v")
+  }
+}
+
+/** OOC synth gate for the three PRFs (slice 2) — registered IO boundary so the
+  * measured paths are the RF read/bypass/LVT-mux + write-merge reg→reg. */
+object GenPrfSynthVerilog {
+  def main(args: Array[String]): Unit = {
+    M68kSpinalConfig(targetDirectory = "generated")
+      .generateVerilog(new M68kCore(Seq[FiberPlugin](
+        new m68k040.execute.regfile.RegFilePluginInt(),
+        new m68k040.execute.regfile.RegFilePluginNzvc(),
+        new m68k040.execute.regfile.RegFilePluginX(),
+        new PrfSynthProbePlugin()
+      )).setDefinitionName("M68kPrfSynth"))
+    println("Generated generated/M68kPrfSynth.v")
+  }
+}
