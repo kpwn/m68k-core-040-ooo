@@ -236,6 +236,65 @@ class RobPluginSpec extends AnyFunSuite {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  test("stale completion after flush does NOT retire a freshly re-allocated entry") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      // Dispatch 2 uncompleted uops -> robId 0,1 occupy the ring.
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x100, dstArch = 1, pdst = 20, pdstValid = true, pdstOld = 1)
+      pokeRu(dut.rsrc.logic.src.payload(1), pc = 0x200, dstArch = 2, pdst = 21, pdstValid = true, pdstOld = 2)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= true
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      dut.rsrc.logic.u1v #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 2, "2 in flight before flush")
+
+      // Flush: pointer reset (tail:=head, count:=0). Entries 0,1 are now squashed.
+      dut.rob.logic.flush.valid #= true
+      cd.waitSampling()
+      dut.rob.logic.flush.valid #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 0, "ROB empty after flush")
+      val reuseId = dut.rob.logic.tail.toInt // next alloc lands here (a now-squashed id)
+
+      // A wrong-path completion arrives LATE for the squashed robId -> sets a stale
+      // completes(reuseId):=True. (Fire it on the same cycle we re-allocate that id,
+      // so alloc-priority ordering is what must win.)
+      // Re-allocate ONE new uop (single-wide) at reuseId and do NOT complete it.
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x300, dstArch = 7, pdst = 30, pdstValid = true, pdstOld = 7)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= false
+      markComplete(dut, reuseId) // stale completion on the index being re-allocated
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      clearComplete(dut)
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 1, s"one new entry after re-alloc, count=${dut.rob.logic.count.toInt}")
+
+      // The freshly re-allocated entry is NOT complete (alloc-reset beat the stale
+      // completion). It must NOT retire over the next several cycles.
+      for (_ <- 0 until 6) {
+        assert(!dut.tsink.logic.fireOut(0).toBoolean,
+          "stale completion must NOT retire the re-allocated entry (alloc-reset must win)")
+        cd.waitSampling()
+      }
+      assert(dut.rob.logic.count.toInt == 1, "entry still in flight (never retired)")
+
+      // Now legitimately complete it -> it retires (proves it was a normal live entry).
+      markComplete(dut, reuseId)
+      cd.waitSampling()
+      clearComplete(dut)
+      cd.waitSamplingWhere(dut.tsink.logic.fireOut(0).toBoolean)
+      assert(dut.tsink.logic.traceOut(0).archRegId.toInt == 7, "retired entry is the re-allocated uop")
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 0, "ROB drained after legit completion")
+    }
+  }
+
   // ── End-to-end sustained free-loop DUT ────────────────────────────────────────
   class E2EDut extends Component {
     val db   = new Database

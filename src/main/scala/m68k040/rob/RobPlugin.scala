@@ -39,7 +39,6 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
 
     // ── Ring storage ────────────────────────────────────────────────────────
     val payload   = Mem(RobPayload(), depth)
-    val valids    = Vec.fill(depth)(RegInit(False))
     val completes = Vec.fill(depth)(RegInit(False))
     val head  = Reg(UInt(robIdW bits)) init 0
     val tail  = Reg(UInt(robIdW bits)) init 0
@@ -79,8 +78,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val h1 = head + 1
     val p0 = payload.readAsync(h0)
     val p1 = payload.readAsync(h1)
-    val retire0 = valids(h0) && completes(h0) && !flush.valid
-    val retire1 = retire0 && valids(h1) && completes(h1) && !p0.retireAlone && !p1.retireAlone
+    val retire0 = (count > 0) && completes(h0) && !flush.valid
+    val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone
 
     val traceVec     = Vec(CommitTrace(), 2)
     val traceFireVec = Vec(Bool(), 2)
@@ -142,26 +141,25 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val alloc1 = allocFireSig && allocSlot1Sig
     val allocThisCycle = (alloc1 ? U(2) | (alloc0 ? U(1) | U(0))).resize(count.getWidth)
 
+    // ── Completion mark (alloc-reset has priority on a reused index) ────────────
+    // MUST come BEFORE the alloc-reset writes below so that on a re-allocated index
+    // a stale wrong-path completion (set here) is OVERRIDDEN by the alloc's
+    // completes:=False (later `when` wins in SpinalHDL).
+    for (c <- completion) when(c.valid) { completes(c.payload) := True }
+
     when(alloc0) {
       payload.write(tail, payloadFrom(allocUopVec(0)))
-      valids(tail)    := True
       completes(tail) := False
     }
     when(alloc1) {
       payload.write(tail + 1, payloadFrom(allocUopVec(1)))
-      valids(tail + 1)    := True
       completes(tail + 1) := False
     }
     when(allocFireSig) {
       tail := tail + Mux(allocSlot1Sig, U(2, robIdW bits), U(1, robIdW bits))
     }
 
-    // ── Completion mark (retire-clear has priority on same index) ───────────────
-    for (c <- completion) when(c.valid) { completes(c.payload) := True }
-
-    // ── Retire-side state updates (head advance + valid clear) ──────────────────
-    when(retire0) { valids(h0) := False }
-    when(retire1) { valids(h1) := False }
+    // ── Retire-side state update (head advance; validity is count-derived) ──────
     head := head + Mux(retire1, U(2, robIdW bits), Mux(retire0, U(1, robIdW bits), U(0, robIdW bits)))
 
     // ── count update (alloc + retire) ──────────────────────────────────────────
@@ -171,7 +169,6 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     when(flush.valid) {
       tail  := head
       count := 0
-      valids.foreach(_ := False)
     }
     rc.flushPort := flush.valid
 
