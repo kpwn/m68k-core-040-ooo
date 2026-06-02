@@ -387,4 +387,168 @@ class IssueQueueSpec extends AnyFunSuite {
         s"all four issue, dependents after producers; got ${flat.mkString(",")}")
     }
   }
+
+  // -------------------------------------------------------------------------
+  // A. CRITICAL regression: the oldest uop must survive while a hole opens
+  //    above it. Reproduces the silent-oldest-drop bug that the COUNT-proxy
+  //    push.ready had: with the oldest stalled in line 0 and younger ready
+  //    uops draining `count` below slotCount-wayCount, the old gate would
+  //    re-assert push.ready and the next compaction would DISCARD line 0.
+  //
+  //    Construction: the OLDEST uop sits in line 0 but its issue port (port 0,
+  //    which OHMasking.first always assigns to the lowest-index ready slot) is
+  //    held NOT-ready, so it can never fire. Younger independent uops are ready
+  //    and drain one-per-cycle via port 1. This empties the upper lines (count
+  //    falls toward the old threshold) while line 0 stays occupied. We then
+  //    attempt to push more uops.
+  //
+  //    Hard invariants:
+  //      * while the oldest occupies line 0, pushReady MUST be deasserted (the
+  //        queue refuses to compact past the occupied oldest line). With the old
+  //        count gate pushReady would re-assert and the push would drop rob 0.
+  //      * NO pushed robId is ever lost: every robId we push eventually issues.
+  //        Once we release port 0, the oldest must still issue.
+  // -------------------------------------------------------------------------
+  test("CRITICAL: oldest survives a hole; pushReady stays low while line0 occupied", VerilatorTest) {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      idle(dut)
+      cd.waitSampling(2)
+
+      val pushedRobs = scala.collection.mutable.Set[Int]()
+      val issuedRobs = scala.collection.mutable.Set[Int]()
+
+      def collectIssue(): Unit = {
+        val s = dut.sink.logic
+        if (s.v0.toBoolean && dut.sink.logic.ready0.toBoolean) issuedRobs += s.rob0.toInt
+        if (s.v1.toBoolean && dut.sink.logic.ready1.toBoolean) issuedRobs += s.rob1.toInt
+      }
+
+      // Push the OLDEST uop (rob 0, independent/ready) first, then 7 pairs of
+      // younger independents back-to-back with NO gaps and sinks OFF. Each push.fire
+      // compacts the table down by one line; after 7 follow-up push.fires rob 0
+      // (which landed at priority 14) marches to priority 0 = LINE 0. The queue
+      // then holds 15 uops with rob 0 parked in line 0.
+      dut.sink.logic.ready0 #= false
+      dut.sink.logic.ready1 #= false
+      pushUops(dut, Some(UopSpec(rob = 0, pdstValid = true, pdst = 0)), None)
+      pushedRobs += 0
+      cd.waitSampling()
+
+      var nextRob = 1
+      for (_ <- 0 until 7) {
+        val a = nextRob; val b = nextRob + 1
+        assert(dut.source.logic.pushReady.toBoolean,
+          s"load: pushReady should be high pushing rob $a,$b")
+        pushUops(dut, Some(UopSpec(rob = a, pdstValid = true, pdst = 20 + a)),
+                      Some(UopSpec(rob = b, pdstValid = true, pdst = 20 + b)))
+        pushedRobs += a; pushedRobs += b
+        nextRob += 2
+        cd.waitSampling()
+      }
+      pushUops(dut, None, None)
+      cd.waitSampling()
+
+      // Now release port 1 only: the oldest (rob 0) is the lowest-index ready slot
+      // so OHMasking.first puts it on port 0, which stays NOT-ready -> rob 0 can
+      // never fire. Younger ready slots issue one-per-cycle on port 1, draining
+      // the upper lines while rob 0 stays parked in line 0.
+      dut.sink.logic.ready0 #= false
+      dut.sink.logic.ready1 #= true
+      for (_ <- 0 until 16) {
+        cd.waitSampling()
+        collectIssue()
+        // KEY ASSERTION: rob 0 occupies line 0 (it is ready but cannot fire on
+        // the disabled port 0), so the queue must refuse to compact -> pushReady
+        // must be deasserted. The old count gate would re-assert here and the
+        // next push would silently discard rob 0.
+        assert(!dut.source.logic.pushReady.toBoolean,
+          "pushReady must stay LOW while the oldest occupies line 0 (no silent drop)")
+        // Confirm rob 0 has NOT issued (it cannot, port 0 disabled).
+        assert(!issuedRobs.contains(0), "oldest rob 0 must not have issued yet")
+      }
+
+      // While line 0 is occupied, try to force a push; it must NOT be accepted
+      // (pushReady low). Attempt a push of a brand-new robId and verify it is
+      // refused (push.fire == valid && ready, ready is low).
+      pushUops(dut, Some(UopSpec(rob = 30, pdstValid = true, pdst = 40)), None)
+      cd.waitSampling()
+      assert(!dut.source.logic.pushReady.toBoolean,
+        "push of rob 30 must be refused while line 0 occupied")
+      pushUops(dut, None, None)
+      cd.waitSampling()
+
+      // Release port 0: the oldest must now finally issue -> proving it was never
+      // dropped.
+      dut.sink.logic.ready0 #= true
+      dut.sink.logic.ready1 #= true
+      for (_ <- 0 until 20) {
+        collectIssue()
+        cd.waitSampling()
+      }
+      collectIssue()
+
+      // Hard no-drop invariant: every pushed robId issued; none vanished. rob 30
+      // was never accepted (pushReady was low), so it is not in pushedRobs.
+      assert(issuedRobs.contains(0), "CRITICAL: oldest rob 0 was DROPPED (never issued)")
+      assert(pushedRobs.subsetOf(issuedRobs),
+        s"some pushed robId vanished. pushed=${pushedRobs.toSeq.sorted}, issued=${issuedRobs.toSeq.sorted}")
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // B. Push-while-issuing in the SAME cycle exercises the eventsMoved (events
+  //    >> wayCount) wakeup-alignment branch: when a push.fire compacts the same
+  //    cycle a producer issues, the wakeup event for that producer must be
+  //    shifted down by wayCount to land on the (now-shifted) dependent.
+  // -------------------------------------------------------------------------
+  test("push-while-issuing aligns wakeup (events>>wayCount) and does not drop the new uop", VerilatorTest) {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      idle(dut)
+      cd.waitSampling(2)
+
+      // Producer P (rob 0, pdst=5) and dependent C (rob 1, psrcA=5). Load with
+      // sinks off so both are resident; C carries a trigger on P.
+      dut.sink.logic.ready0 #= false
+      dut.sink.logic.ready1 #= false
+      val p = UopSpec(rob = 0, pdstValid = true, pdst = 5)
+      val c = UopSpec(rob = 1, pdstValid = true, pdst = 6, psrcAValid = true, psrcA = 5)
+      pushUops(dut, Some(p), Some(c)); cd.waitSampling()
+      pushUops(dut, None, None); cd.waitSampling()
+
+      // Enable sinks. On the cycle P issues, simultaneously PUSH a new independent
+      // uop D (rob 2) -> push.fire and an issue happen the same cycle, exercising
+      // the eventsMoved (>> wayCount) wakeup-shift path.
+      dut.sink.logic.ready0 #= true
+      dut.sink.logic.ready1 #= true
+
+      val perCycle = ArrayBuffer[Seq[Int]]()
+      var pushedD = false
+      // Push D exactly on the first cycle (P should be ready to issue then). The
+      // push fires only if pushReady is high; line0 holds P which issues this
+      // cycle, so selComb of line0 frees and pushReady was set last cycle.
+      pushUops(dut, Some(UopSpec(rob = 2, pdstValid = true, pdst = 7)), None)
+      for (i <- 0 until 12) {
+        val accepted = dut.source.logic.pushReady.toBoolean && !pushedD
+        cd.waitSampling()
+        if (accepted) { pushedD = true; pushUops(dut, None, None) }
+        perCycle += issuedThisCycle(dut)
+      }
+
+      val flat = perCycle.flatten.toSeq
+      // P must issue, then C exactly one cycle later (latency-1 wakeup survived the
+      // same-cycle compaction), and D must also issue (not dropped).
+      assert(flat.contains(0) && flat.contains(1) && flat.contains(2),
+        s"all of P(0), C(1), D(2) must issue; got ${flat.mkString(",")}")
+      assert(pushedD, "D was never accepted (push-while-issue path not exercised)")
+      val pIdx = perCycle.indexWhere(_.contains(0))
+      val cIdx = perCycle.indexWhere(_.contains(1))
+      assert(pIdx >= 0 && cIdx >= 0, "P and C must both issue")
+      assert(cIdx == pIdx + 1,
+        s"C must issue exactly 1 cycle after P (latency-1 wakeup); P@$pIdx C@$cIdx, per-cycle ${perCycle.map(_.mkString("+")).mkString("|")}")
+    }
+  }
 }

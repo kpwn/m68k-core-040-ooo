@@ -60,7 +60,16 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
 
     val slotIdxW = log2Up(slotCount) // 4 bits
 
-    // ---- Scoreboards (one per reg class). Scheme (b): store the producer's
+    // ---- Scoreboards (one per reg class).
+    // RELIED-UPON INVARIANT: at most ONE in-flight producer per physical register
+    // pre-commit. Rename allocates a unique pdst for every writer and does not
+    // reuse a physreg until the prior mapping commits, so a physreg has at most
+    // one un-issued producer in the queue at a time. Both `physToSlot` (a single
+    // producer slot per physreg) and the push-before-issue-clear ordering within
+    // a cycle (push sets busy[p] then issue may clear busy of an OLDER mapping)
+    // are correct ONLY under this invariant. If a physreg could have two in-flight
+    // producers, physToSlot would alias and a dependent could track the wrong one.
+    // Scheme (b): store the producer's
     // CURRENT slot index per physreg; shift stored indices by wayCount on every
     // compaction (slots march toward 0). busy[p] => physreg p has an in-flight
     // producer occupying slot physToSlot[p]. ----
@@ -73,8 +82,35 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val sbX    = new Scoreboard(16) // X flag physregs (width 4)
 
     // ---- Occupancy / back-pressure ----
-    val count = Reg(UInt(log2Up(slotCount + 1) bits)) init 0
-    pushPort.ready := count <= (slotCount - wayCount)
+    // Back-pressure is gated on LINE 0 BEING EMPTY, not on a count proxy.
+    //
+    // Compaction (the `when(push.fire)` block below) is an UNCONDITIONAL uniform
+    // shift: every line copies from the line above and line 0 (slots 0,1) is
+    // DISCARDED. That is only safe if line 0 is empty when a push fires. A count
+    // proxy (count <= slotCount-wayCount) is NOT sufficient: in OoO operation an
+    // older slot can be STALLED (waiting on a trigger) in line 0 while younger
+    // ready slots issue from higher lines, leaving a hole. count could then drain
+    // below the threshold with line 0 still occupied by the oldest uop, and the
+    // next push would silently discard it (ROB desync). We therefore gate on the
+    // actual emptiness of line 0.
+    //
+    // Following NaxRiscv IssueQueue (frontend/IssueQueue.scala:133-138), push.ready
+    // is a REGISTERED next-cycle predicate: if we compact this cycle (push.fire),
+    // then next cycle line 1 becomes line 0, so use line1Ready; otherwise line0Ready.
+    // This design does NOT use a trigger keepalive bit (a stalled slot still has
+    // sel===True, only ready===False), so "empty" is simply !sel.
+    //
+    // No combinational loop: push.fire = push.valid && push.ready, and push.ready
+    // is driven purely by the registered readyReg, so push.ready does not depend
+    // combinationally on push.fire.
+    val count = Reg(UInt(log2Up(slotCount + 1) bits)) init 0 // instrumentation only
+    // selComb = sel after this cycle's issue, i.e. the slot's NEXT-cycle occupancy
+    // (absent compaction). Sampling selComb (not sel) lets a line that empties via
+    // issue THIS cycle re-open push.ready next cycle.
+    val line0Ready = lines(0).ways.map(w => !w.selComb).reduce(_ && _)
+    val line1Ready = lines(1).ways.map(w => !w.selComb).reduce(_ && _)
+    val readyReg   = RegInit(False)
+    pushPort.ready := readyReg
 
     val pushed = UInt(log2Up(wayCount + 1) bits)
     pushed := 0
@@ -221,6 +257,11 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
 
     count := count + pushed - issued
 
+    // Next-cycle push.ready: if compacting this cycle, line 1 becomes line 0 next
+    // cycle (use line1Ready); else line0Ready. line0/line1 emptiness is sampled
+    // combinationally from sel BEFORE this cycle's compaction writes take effect.
+    readyReg := Mux(pushPort.fire, line1Ready, line0Ready)
+
     // ---- Flush ----
     when(flushSignal) {
       lines.foreach(_.ways.foreach { w =>
@@ -231,6 +272,8 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       sbInt.busy  := 0
       sbNzvc.busy := 0
       sbX.busy    := 0
+      // After flush line 0 is empty next cycle, so push.ready may re-assert.
+      readyReg := True
     }
   }
 }
