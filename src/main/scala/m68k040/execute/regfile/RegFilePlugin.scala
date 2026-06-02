@@ -26,7 +26,20 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
 
   val logic = during build new Area {
     assert(writeReq.nonEmpty, s"RegFile ${spec.name}: at least one write port required (for init)")
-    val phys = writeReq.map(_.port).toSeq
+    // Merge write requests sharing a key into one physical write port; within a
+    // group the highest-priority valid request wins (one-hot).
+    val phys = writeReq.groupBy(_.key).values.toSeq.map { grp =>
+      val sorted = grp.sortBy(-_.priority)
+      val bus    = RegFileWritePort(spec.addressWidth, spec.dataWidth)
+      val valids = sorted.map(_.port.valid)
+      // first (highest-priority) valid, as a one-hot over `sorted`
+      val anyValid = valids.reduce(_ || _)
+      // priority-select address/data: fold from lowest to highest priority so highest wins
+      bus.valid   := anyValid
+      bus.address := sorted.foldRight(U(0, spec.addressWidth bits)) { case (r, acc) => Mux(r.port.valid, r.port.address, acc) }
+      bus.data    := sorted.foldRight(B(0, spec.dataWidth bits))    { case (r, acc) => Mux(r.port.valid, r.port.data, acc) }
+      bus
+    }
 
     val ram = Mem(Bits(spec.dataWidth bits), spec.depth)
 

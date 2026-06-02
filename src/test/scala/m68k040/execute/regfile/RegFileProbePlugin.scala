@@ -15,8 +15,9 @@ class RegFileProbePlugin extends FiberPlugin {
     val rf = host[RegFilePlugin]
     rd0  = rf.newRead()
     rd1  = rf.newRead()
-    wr0  = rf.newWrite(latency = 1)
-    wr1  = rf.newWrite(latency = 1)
+    val grpKey = new Object
+    wr0 = rf.newWrite(latency = 1, sharingKey = grpKey, priority = 1)  // higher
+    wr1 = rf.newWrite(latency = 1, sharingKey = grpKey, priority = 0)
     byp0 = rf.newBypass()
   }
 
