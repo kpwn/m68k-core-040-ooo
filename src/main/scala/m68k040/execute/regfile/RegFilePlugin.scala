@@ -27,8 +27,38 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
   val logic = during build new Area {
     assert(writeReq.nonEmpty, s"RegFile ${spec.name}: at least one write port required (for init)")
     val phys = writeReq.map(_.port).toSeq
+
     val ram = Mem(Bits(spec.dataWidth bits), spec.depth)
-    for (w <- phys) ram.write(w.address, w.data, enable = w.valid)
-    for ((r, _) <- reads) r.data := ram.readAsync(r.addr)
+
+    // init-zero boot sweep: write 0 to every address through physical write 0
+    // before normal operation (no fetch happens until the first redirect).
+    // Counter counts 0..depth (inclusive); init writes addresses 0..depth-1
+    // only (gated by initDone) so no out-of-range write occurs.
+    val initCounter = Reg(UInt(log2Up(spec.depth + 1) bits)) init 0
+    val initDone    = initCounter === U(spec.depth)
+    when(!initDone) { initCounter := initCounter + 1 }
+
+    for ((w, i) <- phys.zipWithIndex) {
+      if (i == 0) {
+        ram.write(
+          address = Mux(initDone, w.address, initCounter.resized),
+          data    = Mux(initDone, w.data, B(0, spec.dataWidth bits)),
+          enable  = !initDone || w.valid)
+      } else {
+        ram.write(w.address, w.data, enable = w.valid && initDone)
+      }
+    }
+
+    for ((r, noByp) <- reads) {
+      val rfData = ram.readAsync(r.addr)
+      if (noByp || bypasses.isEmpty) {
+        r.data := rfData
+      } else {
+        // a bypass hit on the read address overrides RF data
+        r.data := bypasses.foldLeft(rfData) { case (acc, b) =>
+          Mux(b.valid && b.address === r.addr, b.data, acc)
+        }
+      }
+    }
   }
 }
