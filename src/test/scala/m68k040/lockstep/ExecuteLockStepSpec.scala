@@ -329,4 +329,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #2,%d0 ; moveq #1,%d1 ; .L: sub.l %d1,%d0 ; bne.s .L ; moveq #7,%d2",
       nInstr = 7)
   }
+
+  test("lock-step: backward bne.s loop (multiple consecutive taken)", VerilatorTest) {
+    // D0=4: iter1..3 taken (3,2,1 -> Z=0), iter4 1-1=0 (Z=1) not-taken. THREE
+    // back-to-back taken mispredicts -> exercises freelist/RAT recovery across
+    // CONSECUTIVE flushes (the case that exposed the freelist flush re-init bug:
+    // a flush must roll the freelist back to its COMMITTED state, not the identity
+    // pool). Executed: moveq#4, moveq#1, [sub,bne]x4, moveq#7 = 11.
+    runLockStep("loop-multi",
+      "moveq #4,%d0 ; moveq #1,%d1 ; .L: sub.l %d1,%d0 ; bne.s .L ; moveq #7,%d2",
+      nInstr = 11)
+  }
 }

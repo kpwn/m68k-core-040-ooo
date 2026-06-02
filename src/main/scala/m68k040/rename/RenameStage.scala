@@ -104,6 +104,12 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     for (s <- 0 until 2) {
       val dec = du.uops.payload(s)
       val r   = raw(s)
+      // Resource allocation (freelist pops + RAT writes) for slot 1 must ALSO be
+      // gated on uop1Valid — otherwise an empty/invalid second slot whose decoded
+      // dstValid/writesNzvc/writesX happen to be set would spuriously pop a pdst
+      // (never freed, since it never commits) and drain the freelist. Slot 0 always
+      // allocates when the group fires.
+      val slotEn = if (s == 0) fire else (fire && uop1Sig)
 
       // int src reads
       intRat.io.reads(2 * s).addr     := dec.srcAReg
@@ -137,33 +143,33 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.psrcBValid := dec.srcBValid
 
       // int dst allocation
-      intFree.io.pop(s).take := fire && dec.dstValid
+      intFree.io.pop(s).take := slotEn && dec.dstValid
       r.pdst       := intFree.io.pop(s).id
       r.pdstValid  := dec.dstValid
       r.pdstOld    := intRat.io.reads(4 + s).data
-      intRat.io.writes(s).valid := fire && dec.dstValid
+      intRat.io.writes(s).valid := slotEn && dec.dstValid
       intRat.io.writes(s).addr  := dec.dstReg
       intRat.io.writes(s).data  := intFree.io.pop(s).id
 
       // NZVC src + dst
       r.pNzvcSrc  := nzvcRat.io.reads(s).data
       r.readsNzvc := dec.readsNzvc
-      nzvcFree.io.pop(s).take := fire && dec.writesNzvc
+      nzvcFree.io.pop(s).take := slotEn && dec.writesNzvc
       r.pNzvcDst  := nzvcFree.io.pop(s).id
       r.writesNzvc:= dec.writesNzvc
       r.pNzvcOld  := nzvcRat.io.reads(s).data
-      nzvcRat.io.writes(s).valid := fire && dec.writesNzvc
+      nzvcRat.io.writes(s).valid := slotEn && dec.writesNzvc
       nzvcRat.io.writes(s).addr  := 0
       nzvcRat.io.writes(s).data  := nzvcFree.io.pop(s).id
 
       // X src + dst
       r.pXSrc  := xRat.io.reads(s).data
       r.readsX := dec.readsX
-      xFree.io.pop(s).take := fire && dec.writesX
+      xFree.io.pop(s).take := slotEn && dec.writesX
       r.pXDst  := xFree.io.pop(s).id
       r.writesX:= dec.writesX
       r.pXOld  := xRat.io.reads(s).data
-      xRat.io.writes(s).valid := fire && dec.writesX
+      xRat.io.writes(s).valid := slotEn && dec.writesX
       xRat.io.writes(s).addr  := 0
       xRat.io.writes(s).data  := xFree.io.pop(s).id
     }

@@ -44,7 +44,11 @@ case class Freelist(
   }
 
   // ── Circular RAM ──────────────────────────────────────────────────────────
-  val ram = Mem(UInt(idW bits), physCount)
+  // Depth = 2^ptrW (NOT physCount): the ptrW-bit head/tail/commHead pointers wrap
+  // at 2^ptrW, so the RAM must be that deep or pointers past physCount address out
+  // of range. The ring only ever holds <= freeN free ids, so the extra capacity is
+  // unused — it just keeps the binary pointer wrap consistent with the RAM depth.
+  val ram = Mem(UInt(idW bits), 1 << ptrW)
 
   // ── Pointers ──────────────────────────────────────────────────────────────
   val head  = Reg(UInt(ptrW   bits)) init 0
@@ -62,20 +66,26 @@ case class Freelist(
   val initTailVal  = U(freeN, ptrW bits)
   val initCountVal = U(freeN, countW bits)
 
-  // Re-init trigger: asserted on reset (via !initDone) and on flush.
-  // When re-init is active, initDone is cleared and the counter restarts.
-  val reInit = !initDone || io.flush
+  // ── Committed-pop pointer (mispredict-recovery rollback) ───────────────────
+  // `head` advances on SPECULATIVE rename pops; `commHead` mirrors it but advances
+  // only as popped dsts RETIRE (their uops commit) — the same count as the commit
+  // pushes, since every committed int/flag writer both frees its old pdst (push)
+  // AND makes its newly-popped pdst permanent. On a mispredict flush we roll the
+  // freelist back to its COMMITTED state by returning every in-flight speculative
+  // pop (head - commHead) to the pool: head := commHead; count += head - commHead.
+  //
+  // This is pointer-ONLY (no RAM rewrite, no multi-cycle re-init stall) and makes
+  // NO identity assumption about the committed mapping. The previous flush reset to
+  // the INITIAL pool (free = archCount..physCount-1), which is only correct while
+  // the committed mapping is identity — after real commits the committed RAT owns
+  // non-identity physregs, so resetting wrongly freed live committed regs and a
+  // later pop handed one out (clobbering an operand). That broke ANY recovery whose
+  // committed mapping had drifted from identity (e.g. a loop past its 1st mispredict).
+  val commHead = Reg(UInt(ptrW bits)) init 0
 
-  when(io.flush) {
-    initDone    := False
-    initCounter := 0
-    head        := initHeadVal
-    tail        := initTailVal
-    count       := initCountVal
-  }
-
-  when(!initDone && !io.flush) {
-    // Write one id per cycle into the RAM
+  // Power-on RAM fill ONLY (driven by reset's !initDone, NOT by flush): write one id
+  // per cycle into ram[0..freeN-1]. Flush no longer clears initDone.
+  when(!initDone) {
     ram.write(
       address = initCounter.resized,
       data    = (U(archCount, idW bits) + initCounter).resized,
@@ -87,9 +97,21 @@ case class Freelist(
       head        := initHeadVal
       tail        := initTailVal
       count       := initCountVal
+      commHead    := initHeadVal
     } otherwise {
       initCounter := initCounter + 1
     }
+  }
+
+  // Mispredict flush: pointer-only rollback to committed state (init has priority).
+  // tail, commHead, the RAM and initDone are UNCHANGED — committed allocations persist.
+  when(initDone && io.flush) {
+    // Squash undoes all SPECULATIVE pops: return to the committed head. Post-squash
+    // free count is ALWAYS freeN (exactly archCount regs stay committed-allocated),
+    // and the invariant tail - commHead == freeN holds (both advance by pushCount),
+    // so head := commHead leaves tail - head == freeN, consistent with count := freeN.
+    head  := commHead
+    count := initCountVal
   }
 
   // ── popReady ──────────────────────────────────────────────────────────────
@@ -108,22 +130,34 @@ case class Freelist(
 
   // ── Pop / push updates (only when init done and not flushing) ─────────────
   when(initDone && !io.flush) {
+    val pcW = log2Up(pushPorts + 1)
     val takeCount = io.pop.map(p => p.take.asUInt.resize(log2Up(popPorts + 1))).reduceLeft(_ + _)
 
-    // Count and apply pushes
-    var pushCount = U(0, log2Up(pushPorts + 1) bits)
+    // pushCount MUST be a HARDWARE sum of the valid push ports. A Scala
+    // `when(valid){ pushCount = pushCount + 1 }` does NOT gate the increment —
+    // `pushCount` is a Scala var, so it builds `U(0)+1+1` UNCONDITIONALLY, making
+    // pushCount == pushPorts every cycle. That advanced tail/count/commHead even
+    // when nothing was pushed (idle drift); it was masked for straight-line code
+    // (head stays in the valid RAM region) and by the old full re-init-on-flush.
+    // Writes are COMPACTED: the v-th valid push lands at tail + v (mirrors the pop
+    // side), so a sparse push (only port 1 valid) still packs at tail.
+    val pushCount = io.push.map(_.valid.asUInt.resize(pcW)).reduce(_ +^ _).resize(pcW)
     for (j <- 0 until pushPorts) {
-      val isValid = io.push(j).valid
+      val lowerValids =
+        if (j == 0) U(0, pcW bits)
+        else (0 until j).map(i => io.push(i).valid.asUInt.resize(pcW)).reduce(_ +^ _).resize(pcW)
       ram.write(
-        address = (tail + U(j, ptrW bits)).resized,
+        address = (tail + lowerValids.resized).resized,
         data    = io.push(j).payload,
-        enable  = isValid
+        enable  = io.push(j).valid
       )
-      when(isValid) { pushCount = pushCount + 1 }
     }
 
-    head  := (head  + takeCount.resized).resized
-    tail  := (tail  + pushCount.resized).resized
-    count := (count - takeCount.resized + pushCount.resized).resized
+    head     := (head  + takeCount.resized).resized
+    tail     := (tail  + pushCount.resized).resized
+    // commHead tracks committed pops: pushes happen on commit, and each committed
+    // writer's pop becomes permanent at the same time (1:1 with pushes).
+    commHead := (commHead + pushCount.resized).resized
+    count    := (count - takeCount.resized + pushCount.resized).resized
   }
 }
