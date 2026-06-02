@@ -11,9 +11,11 @@ class RegFileSpec extends AnyFunSuite {
   class Dut extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
-    val rf    = new RegFilePlugin(RegfileSpec.Int)
-    val probe = new RegFileProbePlugin
-    db.on { host.asHostOf(Seq[FiberPlugin](rf, probe)) }
+    val rfInt  = new RegFilePluginInt
+    val rfNzvc = new RegFilePluginNzvc
+    val rfX    = new RegFilePluginX
+    val probe  = new RegFileProbePlugin
+    db.on { host.asHostOf(Seq[FiberPlugin](rfInt, rfNzvc, rfX, probe)) }
   }
 
   test("write then read returns the written value") {
@@ -24,6 +26,7 @@ class RegFileSpec extends AnyFunSuite {
       dut.probe.logic.rd0Addr #= 0; dut.probe.logic.rd1Addr #= 0
       dut.probe.logic.w0a #= 0; dut.probe.logic.w0d #= 0; dut.probe.logic.w1a #= 0; dut.probe.logic.w1d #= 0
       dut.probe.logic.b0a #= 0; dut.probe.logic.b0d #= 0
+      dut.probe.logic.nzWv #= false; dut.probe.logic.nzBv #= false; dut.probe.logic.nzWa #= 0; dut.probe.logic.nzWd #= 0; dut.probe.logic.nzBa #= 0; dut.probe.logic.nzBd #= 0; dut.probe.logic.nzRdAddr #= 0
       cd.waitSampling(80)   // wait out the init sweep (depth 48 + margin)
       dut.probe.logic.w0v #= true; dut.probe.logic.w0a #= 5; dut.probe.logic.w0d #= BigInt("DEADBEEF", 16)
       cd.waitSampling()
@@ -43,6 +46,7 @@ class RegFileSpec extends AnyFunSuite {
       dut.probe.logic.w0v #= false; dut.probe.logic.w1v #= false; dut.probe.logic.b0v #= false
       dut.probe.logic.w0a #= 0; dut.probe.logic.w0d #= 0; dut.probe.logic.w1a #= 0; dut.probe.logic.w1d #= 0
       dut.probe.logic.b0a #= 0; dut.probe.logic.b0d #= 0; dut.probe.logic.rd1Addr #= 0
+      dut.probe.logic.nzWv #= false; dut.probe.logic.nzBv #= false; dut.probe.logic.nzWa #= 0; dut.probe.logic.nzWd #= 0; dut.probe.logic.nzBa #= 0; dut.probe.logic.nzBd #= 0; dut.probe.logic.nzRdAddr #= 0
       cd.waitSampling(80)   // wait out the init sweep (depth 48 + margin)
       dut.probe.logic.rd0Addr #= 7
       sleep(1)
@@ -57,6 +61,7 @@ class RegFileSpec extends AnyFunSuite {
       dut.probe.logic.w0v #= false; dut.probe.logic.w1v #= false; dut.probe.logic.b0v #= false
       dut.probe.logic.w0a #= 0; dut.probe.logic.w0d #= 0; dut.probe.logic.w1a #= 0; dut.probe.logic.w1d #= 0
       dut.probe.logic.b0a #= 0; dut.probe.logic.b0d #= 0; dut.probe.logic.rd0Addr #= 0; dut.probe.logic.rd1Addr #= 0
+      dut.probe.logic.nzWv #= false; dut.probe.logic.nzBv #= false; dut.probe.logic.nzWa #= 0; dut.probe.logic.nzWd #= 0; dut.probe.logic.nzBa #= 0; dut.probe.logic.nzBd #= 0; dut.probe.logic.nzRdAddr #= 0
       cd.waitSampling(80)
       dut.probe.logic.w0v #= true; dut.probe.logic.w0a #= 9; dut.probe.logic.w0d #= BigInt("11111111", 16)
       cd.waitSampling(); dut.probe.logic.w0v #= false; cd.waitSampling()
@@ -77,6 +82,7 @@ class RegFileSpec extends AnyFunSuite {
       dut.probe.logic.w0v #= false; dut.probe.logic.w1v #= false; dut.probe.logic.b0v #= false
       dut.probe.logic.w0a #= 0; dut.probe.logic.w0d #= 0; dut.probe.logic.w1a #= 0; dut.probe.logic.w1d #= 0
       dut.probe.logic.b0a #= 0; dut.probe.logic.b0d #= 0; dut.probe.logic.rd0Addr #= 0; dut.probe.logic.rd1Addr #= 0
+      dut.probe.logic.nzWv #= false; dut.probe.logic.nzBv #= false; dut.probe.logic.nzWa #= 0; dut.probe.logic.nzWd #= 0; dut.probe.logic.nzBa #= 0; dut.probe.logic.nzBd #= 0; dut.probe.logic.nzRdAddr #= 0
       cd.waitSampling(80)
       // only wr1 (low prio) valid -> its value lands
       dut.probe.logic.w1v #= true; dut.probe.logic.w1a #= 3; dut.probe.logic.w1d #= BigInt("0000AAAA", 16)
@@ -89,6 +95,22 @@ class RegFileSpec extends AnyFunSuite {
       cd.waitSampling(); dut.probe.logic.w0v #= false; dut.probe.logic.w1v #= false; cd.waitSampling()
       dut.probe.logic.rd0Addr #= 4; sleep(1)
       assert(dut.probe.logic.rd0Data.toBigInt == BigInt("0000BBBB", 16), "high-prio write should win")
+    }
+  }
+
+  test("NZVC file (XOR path): write then read") {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      dut.probe.logic.w0v #= false; dut.probe.logic.w1v #= false; dut.probe.logic.b0v #= false
+      dut.probe.logic.w0a #= 0; dut.probe.logic.w0d #= 0; dut.probe.logic.w1a #= 0; dut.probe.logic.w1d #= 0
+      dut.probe.logic.b0a #= 0; dut.probe.logic.b0d #= 0; dut.probe.logic.rd0Addr #= 0; dut.probe.logic.rd1Addr #= 0
+      dut.probe.logic.nzWv #= false; dut.probe.logic.nzBv #= false; dut.probe.logic.nzWa #= 0; dut.probe.logic.nzWd #= 0; dut.probe.logic.nzBa #= 0; dut.probe.logic.nzBd #= 0; dut.probe.logic.nzRdAddr #= 0
+      cd.waitSampling(80)
+      dut.probe.logic.nzWv #= true; dut.probe.logic.nzWa #= 2; dut.probe.logic.nzWd #= 0xD
+      cd.waitSampling(); dut.probe.logic.nzWv #= false; cd.waitSampling()
+      dut.probe.logic.nzRdAddr #= 2; sleep(1)
+      assert((dut.probe.logic.nzRdData.toBigInt & 0xF) == 0xD, s"NZVC got ${dut.probe.logic.nzRdData.toBigInt.toString(16)}")
     }
   }
 }

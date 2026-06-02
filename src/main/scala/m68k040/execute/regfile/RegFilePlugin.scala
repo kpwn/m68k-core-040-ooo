@@ -75,3 +75,7 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
     }
   }
 }
+
+class RegFilePluginInt  extends RegFilePlugin(RegfileSpec.Int)  with IntRegFileService
+class RegFilePluginNzvc extends RegFilePlugin(RegfileSpec.Nzvc) with NzvcRegFileService
+class RegFilePluginX    extends RegFilePlugin(RegfileSpec.X)    with XRegFileService

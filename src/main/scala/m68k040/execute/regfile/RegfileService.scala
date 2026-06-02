@@ -32,3 +32,7 @@ trait RegfileService {
   def newWrite(latency: Int = 1, sharingKey: Any = null, priority: Int = 0): RegFileWritePort
   def newBypass(): RegFileBypassPort
 }
+
+trait IntRegFileService  extends RegfileService
+trait NzvcRegFileService extends RegfileService
+trait XRegFileService    extends RegfileService
