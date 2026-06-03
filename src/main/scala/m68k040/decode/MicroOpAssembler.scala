@@ -1,7 +1,7 @@
 package m68k040.decode
 
 import m68k040.frontend.DecodePacket
-import m68k040.isa.{Cluster, Size}
+import m68k040.isa.{Cluster, Size, MemOp}
 import spinal.core._
 import spinal.lib._
 
@@ -26,6 +26,7 @@ object MicroOpAssembler {
     uop.op            := spec.op
     uop.cluster       := spec.cluster
     uop.size          := spec.size
+    uop.memOp         := MemOp.NONE
     uop.srcAReg       := 0; uop.srcAValid := False
     uop.srcBReg       := 0; uop.srcBValid := False
     uop.dstReg        := 0; uop.dstValid  := False

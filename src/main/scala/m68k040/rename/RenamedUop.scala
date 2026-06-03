@@ -1,6 +1,6 @@
 package m68k040.rename
 
-import m68k040.isa.{Cluster, Size}
+import m68k040.isa.{Cluster, Size, MemOp}
 import m68k040.decode.DecOp
 import spinal.core._
 
@@ -14,6 +14,7 @@ case class RenamedUop() extends Bundle {
   val op           = DecOp()
   val cluster      = Cluster()
   val size         = Size()
+  val memOp        = MemOp()
   val useImm       = Bool();  val imm = Bits(32 bits)
   val isBranch     = Bool();  val cond = Bits(4 bits); val branchDisp = Bits(32 bits)
   val unimplemented= Bool()
