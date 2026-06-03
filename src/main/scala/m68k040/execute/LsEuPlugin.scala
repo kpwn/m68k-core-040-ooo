@@ -90,11 +90,40 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val va0   = (base0.asSInt + disp0).asUInt
     val data0 = rdData.data
 
+    // ---- AGU cross-line / cross-page detection (S0, combinational) ----
+    // sizeBytes from the access size (1/2/4). A single m68k access spans at most
+    // two 16-byte lines / two 4 KB pages, so a single "second access" suffices.
+    def sizeBytes(s: m68k040.isa.Size.C): UInt = {
+      val n = UInt(3 bits); n := 1
+      switch(s) {
+        is(m68k040.isa.Size.BYTE) { n := 1 }
+        is(m68k040.isa.Size.WORD) { n := 2 }
+        is(m68k040.isa.Size.LONG) { n := 4 }
+      }
+      n
+    }
+    val nBytes0    = sizeBytes(u0.size)
+    val lineOff0   = va0(3 downto 0)
+    val pageOff0   = va0(11 downto 0)
+    val crossLine0 = (lineOff0 +^ nBytes0) > U(16)
+    val crossPage0 = (pageOff0 +^ nBytes0) > U(4096)
+    val twoAccess0 = crossLine0 || crossPage0
+    // addrB = next line base = (va & ~15) + 16. When crossPage this equals the
+    // next page base (the line that crosses the page boundary is the page-aligned
+    // first line of the next page).
+    val addrB0     = (va0 & ~U(15, 32 bits)) + 16
+
     // ---- S0 -> S1 register (M2S) ----
     val s1Valid = RegInit(False)
     val s1Ctx   = Reg(IqContext())
     val s1Va    = Reg(UInt(32 bits))
     val s1Data  = Reg(Bits(32 bits))
+    // Registered cross-detection (alongside s1Va). simPublic for directed probing.
+    val s1CrossLine = RegInit(False)
+    val s1CrossPage = RegInit(False)
+    val s1TwoAccess = RegInit(False)
+    val s1AddrB     = Reg(UInt(32 bits))
+    s1CrossLine.simPublic(); s1CrossPage.simPublic(); s1TwoAccess.simPublic(); s1AddrB.simPublic()
     val u1 = s1Ctx.uop
 
     // Translation is driven by the D-cache from loadCmd.payload.vaddr (which we
@@ -206,6 +235,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       s1Ctx   := issuePort.payload
       s1Va    := va0
       s1Data  := data0
+      s1CrossLine := crossLine0
+      s1CrossPage := crossPage0
+      s1TwoAccess := twoAccess0
+      s1AddrB     := addrB0
     } otherwise {
       when(!busy) { s1Valid := False }
     }
