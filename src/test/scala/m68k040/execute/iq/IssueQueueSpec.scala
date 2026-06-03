@@ -47,6 +47,7 @@ class IssueQueueSpec extends AnyFunSuite {
     Seq(s0, s1).zip(slots).foreach { case (specOpt, slot) =>
       specOpt.foreach { u =>
         slot.robId #= u.rob
+        slot.cluster #= m68k040.isa.Cluster.INT; slot.memOp #= m68k040.isa.MemOp.NONE
         slot.pdst #= u.pdst; slot.pdstValid #= u.pdstValid
         slot.psrcA #= u.psrcA; slot.psrcAValid #= u.psrcAValid
         slot.psrcB #= u.psrcB; slot.psrcBValid #= u.psrcBValid
@@ -66,6 +67,7 @@ class IssueQueueSpec extends AnyFunSuite {
     s.pushValid #= false; s.slot1Valid #= false; s.flush #= false
     for (slot <- Seq(s.s0, s.s1)) {
       slot.robId #= 0
+      slot.cluster #= m68k040.isa.Cluster.INT; slot.memOp #= m68k040.isa.MemOp.NONE
       slot.pdst #= 0; slot.pdstValid #= false
       slot.psrcA #= 0; slot.psrcAValid #= false
       slot.psrcB #= 0; slot.psrcBValid #= false

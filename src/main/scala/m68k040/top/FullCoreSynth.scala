@@ -3,14 +3,14 @@ package m68k040.top
 import m68k040.M68kParams
 import m68k040.M68kSpinalConfig
 import m68k040.core.{M68kCore, ParamPlugin}
-import m68k040.cache.IcachePlugin
-import m68k040.mmu.IdentityTranslationPlugin
+import m68k040.cache.{IcachePlugin, DcachePlugin}
+import m68k040.mmu.{IdentityTranslationPlugin, DIdentityTranslationPlugin}
 import m68k040.frontend.FetchAlignPlugin
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
 import m68k040.dispatch.DispatchPlugin
 import m68k040.rob.RobPlugin
-import m68k040.execute.{AluEuPlugin, BranchEuPlugin}
+import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin}
 import m68k040.execute.iq.{IssueQueuePlugin, IssueQueueService}
 import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
 import m68k040.services.{CommitTraceService, RedirectService}
@@ -23,7 +23,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   * anchors the pipeline to top IO so nothing is pruned: the EU int-write results
   * (anchors the ALU+PRF datapath, since a PRF read value is then observed) and
   * the CommitTrace (anchors the ROB retire/control path). */
-class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin) extends FiberPlugin {
+class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin) extends FiberPlugin {
   val logic = during build new Area {
     val iq  = host[IssueQueueService]
     val rob = host[RobPlugin]
@@ -52,6 +52,25 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     rob.logic.completion(1).valid   := eu1.completion.valid
     rob.logic.completion(1).payload := eu1.completion.payload
 
+    // ---- LS cluster wiring ----
+    // LS issue port (3) -> LS EU. Its completion is BOTH a ROB completion (3rd
+    // port) AND the IQ dynamic-wakeup broadcast (variant A: dependents of a load
+    // wake when the load's data is actually ready).
+    lsEu.issue << iq.issue(3)
+    rob.logic.completion(2).valid   := lsEu.completion.valid
+    rob.logic.completion(2).payload := lsEu.completion.payload
+    iq.lsWakeup.valid   := lsEu.completion.valid
+    // The IQ dynamic wakeup is keyed by the producer pdst. A completed load's pdst
+    // is the issued LS uop's dst; the LS EU completion carries robId, so re-derive
+    // the pdst from the issued context held at the LS EU's S1.
+    iq.lsWakeup.payload := lsEu.logic.s1Ctx.uop.pdst
+    // ROB retire (slot 0) -> SQ commit; doFlush -> SQ flush (squash speculative).
+    lsEu.sqCommit.valid   := rob.logic.retire0
+    lsEu.sqCommit.payload := rob.logic.h0
+    lsEu.sqFlush          := doFlush
+    // The D-cache's `axi` is declared master() inside its plugin and surfaces as a
+    // top-level IO automatically (like the I-cache's), so no extra wiring needed.
+
     // Synth anchors (registered top outputs) so synthesis can't trim the core.
     val eu0Res = out(RegNext(eu0.intW.data))   // EU0 int result -> anchors datapath+PRF
     val eu1Res = out(RegNext(eu1.intW.data))
@@ -77,21 +96,24 @@ object GenFullCoreSynthVerilog {
         val eu0 = new AluEuPlugin
         val eu1 = new AluEuPlugin
         val branchEu = new BranchEuPlugin
+        val lsEu = new LsEuPlugin
         new M68kCore(Seq[FiberPlugin](
           new ParamPlugin(p),
           new IdentityTranslationPlugin(),
+          new DIdentityTranslationPlugin(),
           new IcachePlugin(),
+          new DcachePlugin(),
           new FetchAlignPlugin(),
           new DecodeStage(),
           new RenameStage(),
           new DispatchPlugin(),
           new RobPlugin(),
           new IssueQueuePlugin(),
-          eu0, eu1, branchEu,
+          eu0, eu1, branchEu, lsEu,
           new RegFilePluginInt(),
           new RegFilePluginNzvc(),
           new RegFilePluginX(),
-          new BackendWiringPlugin(eu0, eu1, branchEu)
+          new BackendWiringPlugin(eu0, eu1, branchEu, lsEu)
         )).setDefinitionName("M68kFullCoreSynth")
       }
     println("Generated generated/M68kFullCoreSynth.v")

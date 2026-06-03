@@ -17,6 +17,8 @@ class IqSinkPlugin extends FiberPlugin {
     // (always-idle, since the source pushes only non-branch uops) stream is
     // fully driven and never structurally back-pressures.
     iq.issue(2).ready := True
+    // Port 3 (LS): driven-ready input; expose its valid/robId/pdst for the LS test.
+    val ready3 = in Bool (); iq.issue(3).ready := ready3
 
     val v0 = out Bool (); val rob0 = out UInt (6 bits)
     val v1 = out Bool (); val rob1 = out UInt (6 bits)
@@ -24,5 +26,10 @@ class IqSinkPlugin extends FiberPlugin {
     rob0 := iq.issue(0).payload.robId
     v1   := iq.issue(1).valid
     rob1 := iq.issue(1).payload.robId
+
+    val v3 = out Bool (); val rob3 = out UInt (6 bits); val pdst3 = out UInt (6 bits)
+    v3    := iq.issue(3).valid
+    rob3  := iq.issue(3).payload.robId
+    pdst3 := iq.issue(3).payload.uop.pdst
   }
 }

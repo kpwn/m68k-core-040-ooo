@@ -51,6 +51,14 @@ trait TranslationService {
   def rsp: TranslationRsp
 }
 
+/** D-side translation (DTLB; identity stub this slice). A SEPARATE service from
+  * the I-side TranslationService so the I-cache and D-cache each own a distinct
+  * request port (one TranslationService can have only one driver). */
+trait DTranslationService {
+  def req: TranslationReq
+  def rsp: TranslationRsp
+}
+
 /** Produced by the fetch/align stage; consumed by the (future) decode stage.
   * Two packets/cycle; slot 0 valid when the stream fires, slot 1 on 2-wide cycles. */
 trait DecodeFeedService {

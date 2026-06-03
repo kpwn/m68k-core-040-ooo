@@ -1,6 +1,6 @@
 package m68k040.decode
 
-import m68k040.isa.{Cluster, Size}
+import m68k040.isa.{Cluster, Size, MemOp}
 import spinal.core._
 
 object DecOp extends SpinalEnum {
@@ -15,6 +15,7 @@ case class DecodedUop() extends Bundle {
   val op           = DecOp()
   val cluster      = Cluster()
   val size         = Size()
+  val memOp        = MemOp()
   val srcAReg      = UInt(4 bits); val srcAValid = Bool()
   val srcBReg      = UInt(4 bits); val srcBValid = Bool()
   val dstReg       = UInt(4 bits); val dstValid  = Bool()
