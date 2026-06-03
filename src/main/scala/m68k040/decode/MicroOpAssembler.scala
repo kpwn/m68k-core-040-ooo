@@ -49,8 +49,8 @@ object MicroOpAssembler {
     // --- srcA slot ---
     switch(spec.srcA.kind) {
       is(OperandKind.REGFIELD) {
-        when(spec.srcA.isAddr) { uop.srcAReg := (U(8, 4 bits) + op(11 downto 9).asUInt).resized }
-          .otherwise { uop.srcAReg := op(11 downto 9).asUInt.resize(4) }
+        when(spec.srcA.isAddr) { uop.srcAReg := (U(8, 5 bits) + op(11 downto 9).asUInt).resized }
+          .otherwise { uop.srcAReg := op(11 downto 9).asUInt.resize(5) }
         uop.srcAValid := True
       }
       is(OperandKind.EASRC) {
@@ -65,8 +65,8 @@ object MicroOpAssembler {
     // --- srcB slot ---
     switch(spec.srcB.kind) {
       is(OperandKind.REGFIELD) {
-        when(spec.srcB.isAddr) { uop.srcBReg := (U(8, 4 bits) + op(11 downto 9).asUInt).resized }
-          .otherwise { uop.srcBReg := op(11 downto 9).asUInt.resize(4) }
+        when(spec.srcB.isAddr) { uop.srcBReg := (U(8, 5 bits) + op(11 downto 9).asUInt).resized }
+          .otherwise { uop.srcBReg := op(11 downto 9).asUInt.resize(5) }
         uop.srcBValid := True
       }
       is(OperandKind.EASRC) {
@@ -81,8 +81,8 @@ object MicroOpAssembler {
     // --- dst slot ---
     switch(spec.dst.kind) {
       is(OperandKind.REGFIELD) {
-        when(spec.dst.isAddr) { uop.dstReg := (U(8, 4 bits) + op(11 downto 9).asUInt).resized }
-          .otherwise { uop.dstReg := op(11 downto 9).asUInt.resize(4) }
+        when(spec.dst.isAddr) { uop.dstReg := (U(8, 5 bits) + op(11 downto 9).asUInt).resized }
+          .otherwise { uop.dstReg := op(11 downto 9).asUInt.resize(5) }
         uop.dstValid := True
       }
       is(OperandKind.EASRC) {

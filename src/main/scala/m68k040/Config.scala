@@ -6,7 +6,7 @@ import spinal.core._
   * parameters so IPC/area/FMax can be swept without rearchitecting. */
 case class M68kParams(
     robDepth:     Int = 64,
-    physInt:      Int = 48,
+    physInt:      Int = 50,
     physNzvc:     Int = 16,
     physX:        Int = 16,
     intRsDepth:   Int = 8,

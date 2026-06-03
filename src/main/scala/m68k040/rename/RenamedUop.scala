@@ -18,7 +18,7 @@ case class RenamedUop() extends Bundle {
   val useImm       = Bool();  val imm = Bits(32 bits)
   val isBranch     = Bool();  val cond = Bits(4 bits); val branchDisp = Bits(32 bits)
   val unimplemented= Bool()
-  val dstArch = UInt(4 bits)   // architectural int dst reg (for commit RAT update + CommitTrace)
+  val dstArch = UInt(5 bits)   // architectural int dst reg 0..17 (incl T0/T1); for commit RAT + CommitTrace
   val psrcA = UInt(intW bits); val psrcAValid = Bool()
   val psrcB = UInt(intW bits); val psrcBValid = Bool()
   val pdst  = UInt(intW bits); val pdstValid  = Bool(); val pdstOld = UInt(intW bits)

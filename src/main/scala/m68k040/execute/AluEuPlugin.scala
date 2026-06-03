@@ -18,7 +18,7 @@ trait AluEuService {
 case class WbObs() extends Bundle {
   val valid     = Bool()
   val robId     = UInt(6 bits)
-  val dstArch   = UInt(4 bits)
+  val dstArch   = UInt(5 bits)
   val result    = Bits(32 bits)
   val intWrite  = Bool()
   val nzvc      = Bits(4 bits)

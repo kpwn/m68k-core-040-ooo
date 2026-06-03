@@ -25,7 +25,7 @@ object EaClass extends SpinalEnum {
 
 case class EaSpec() extends Bundle {
   val klass = EaClass()
-  val reg   = UInt(4 bits)    // full reg id: Dn=0..7, An=8..15 (valid for DATAREG/ADDRREG)
+  val reg   = UInt(5 bits)    // full reg id: Dn=0..7, An=8..15, temps 16/17 (valid for DATAREG/ADDRREG)
   val imm   = Bits(32 bits)   // valid for IMM
 }
 object EaSpec {

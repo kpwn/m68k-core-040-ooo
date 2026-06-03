@@ -21,7 +21,7 @@ object EaDecoder {
 
     switch(mode) {
       is(0) { e.klass := EaClass.DATAREG; e.reg := reg.asUInt.resized }              // Dn
-      is(1) { e.klass := EaClass.ADDRREG; e.reg := (U(8, 4 bits) + reg.asUInt).resized } // An
+      is(1) { e.klass := EaClass.ADDRREG; e.reg := (U(8, 5 bits) + reg.asUInt).resized } // An
       is(2, 3, 4, 5, 6) { e.klass := EaClass.MEMSIMPLE }                              // (An)/(An)+/-(An)/(d16,An)/(d8,An,Xn)
       is(7) {
         switch(reg) {
