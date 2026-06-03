@@ -29,6 +29,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val nzvcNew    = UInt(4 bits); val nzvcOld = UInt(4 bits); val nzvcWrite = Bool()
     val xNew       = UInt(4 bits); val xOld = UInt(4 bits); val xWrite = Bool()
     val retireAlone = Bool()
+    // Precise-fault capture (exception slice 1): set at alloc from the uop.
+    val faulted     = Bool()
+    val faultVector = UInt(8 bits)
+    val faultPc     = UInt(32 bits)   // the FAULTING instruction's own PC (for the frame)
+    val isRte       = Bool()          // return-from-exception (serializing)
   }
 
   val logic = during build new Area {
@@ -93,7 +98,13 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       p.intNew     := u.pdst;     p.intOld := u.pdstOld;   p.intWrite  := u.pdstValid
       p.nzvcNew    := u.pNzvcDst; p.nzvcOld := u.pNzvcOld;  p.nzvcWrite := u.writesNzvc
       p.xNew       := u.pXDst;    p.xOld := u.pXOld;        p.xWrite    := u.writesX
-      p.retireAlone := u.isBranch
+      // A faulted µop AND an RTE retire ALONE (precise / serializing): they must be
+      // the head and the only retirer this cycle.
+      p.retireAlone := u.isBranch || u.faulted || u.isRte
+      p.faulted     := u.faulted
+      p.faultVector := u.faultVector
+      p.faultPc     := u.pc
+      p.isRte       := u.isRte
       p
     }
 
@@ -109,7 +120,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val flushPcReg = Reg(UInt(32 bits)); flushPcReg.simPublic()
     val flushing   = flush.valid || doFlushReg
 
-    val retire0 = (count > 0) && completes(h0) && !flushing
+    // The head is a faulted µop ready to retire -> take the exception INSTEAD of a
+    // normal commit (precise: the faulting instruction does not commit its result).
+    val headReady   = (count > 0) && completes(h0) && !flushing
+    val faultRetire = headReady && p0.faulted
+    val retire0 = headReady && !p0.faulted
     val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone
 
     val traceVec     = Vec(CommitTrace(), 2)
@@ -217,6 +232,16 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // it drives only pointer/reg resets (FMax: no combinational execute->flush path).
     doFlushReg := retire0 && p0.retireAlone && mispredictStore(h0)
     when(retire0 && p0.retireAlone && mispredictStore(h0)) { flushPcReg := nextPcStore(h0) }
+
+    // ── Precise-fault exception-pending (combinational at faulted retire) ───────
+    // When the head is a faulted µop ready to retire, signal an exception with its
+    // vector + the FAULTING instruction's PC. The commit-side exception FSM (Task 3)
+    // consumes this (squashes via flush, stacks the frame, vectors). Until then it
+    // remains asserted (head held). The faulted entry does NOT commit (retire0 is
+    // gated `!p0.faulted`).
+    val exceptionPending = Bool();    exceptionPending := faultRetire;       exceptionPending.simPublic()
+    val exceptionVector  = UInt(8 bits);  exceptionVector := p0.faultVector; exceptionVector.simPublic()
+    val exceptionPc      = UInt(32 bits); exceptionPc     := p0.faultPc;     exceptionPc.simPublic()
 
     // ── Flush (squash all in-flight) — pointer-only, driven by the registered ─────
     // redirect pulse OR the test flush port.

@@ -78,6 +78,9 @@ object MicroOpAssembler {
     opUop.isBranch      := spec.isBranch; opUop.cond := spec.cond
     opUop.branchDisp    := 0
     opUop.unimplemented := False
+    opUop.faulted       := False
+    opUop.faultVector   := 0
+    opUop.isRte         := False
 
     // --- srcA slot ---
     switch(spec.srcA.kind) {
@@ -165,6 +168,7 @@ object MicroOpAssembler {
     ldUop.isBranch      := False; ldUop.cond := 0
     ldUop.branchDisp    := 0
     ldUop.unimplemented := False
+    ldUop.faulted       := False; ldUop.faultVector := 0; ldUop.isRte := False
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
     // Address = dst base An (psrcA) + dst disp(imm); data = the MOVE source register
@@ -192,6 +196,7 @@ object MicroOpAssembler {
     stUop.isBranch      := False; stUop.cond := 0
     stUop.branchDisp    := 0
     stUop.unimplemented := False
+    stUop.faulted       := False; stUop.faultVector := 0; stUop.isRte := False
 
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
     // Defer: non-simple, illegal op, a USED src EA that is neither reg/imm nor a
@@ -199,7 +204,23 @@ object MicroOpAssembler {
     // crackable MOVE store (mem-to-mem MOVE and RMW-to-mem stay unimplemented).
     // `bad` also disables cracking.
     val dstOk = dstEaOk || crackStore
-    val bad = !pkt.simple || spec.illegal || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk)
+    // ── RTE (0x4E73) — a serializing return-from-exception µop (privileged). ────
+    // Decoded here (line 0x4 is otherwise unimplemented) so it is NOT treated as an
+    // illegal instruction. It commits like a no-op op µop but carries isRte; the
+    // commit-side exception FSM acts on it at retire (pops the frame, redirects).
+    val isRteOp = (op === B"16'h4E73")
+    val bad = !isRteOp && (!pkt.simple || spec.illegal || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
+    when(isRteOp) {
+      // a single architectural op µop carrying isRte; writes nothing, has a real PC.
+      opUop.op            := DecOp.ILLEGAL  // no ALU action; the FSM handles it
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
+      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
+      opUop.unimplemented := False
+      opUop.faulted := False; opUop.faultVector := 0
+      opUop.isRte   := True
+    }
     when(bad) {
       opUop.op            := DecOp.ILLEGAL
       opUop.cluster       := Cluster.INT
@@ -207,6 +228,10 @@ object MicroOpAssembler {
       opUop.unimplemented := True
       opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
       opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
+      // Illegal instruction -> precise fault, vector 4. The op µop retires as the
+      // faulting head; the exception FSM stacks the frame + vectors.
+      opUop.faulted     := True
+      opUop.faultVector := 4
     }
 
     // ── Sequence selection (each slot driven exactly once) ─────────────────────

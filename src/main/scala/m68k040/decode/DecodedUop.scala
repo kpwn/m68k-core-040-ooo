@@ -28,4 +28,11 @@ case class DecodedUop() extends Bundle {
   val cond         = Bits(4 bits)
   val branchDisp   = Bits(32 bits)
   val unimplemented= Bool()
+  // Precise-fault capture (exception slice 1): `faulted` marks this µop as raising
+  // a synchronous fault at retire; `faultVector` is the m68k exception vector
+  // NUMBER (4 = illegal instruction, 8 = privilege violation). Default: no fault.
+  val faulted      = Bool()
+  val faultVector  = UInt(8 bits)
+  // RTE (return-from-exception): a serializing exception-return µop. Default False.
+  val isRte        = Bool()
 }

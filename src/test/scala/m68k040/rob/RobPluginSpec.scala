@@ -58,6 +58,7 @@ class RobPluginSpec extends AnyFunSuite {
     u.pNzvcDst #= pNzvcDst; u.writesNzvc #= writesNzvc; u.pNzvcOld #= pNzvcOld
     u.pXSrc #= 0; u.readsX #= false
     u.pXDst #= pXDst; u.writesX #= writesX; u.pXOld #= pXOld
+    u.faulted #= false; u.faultVector #= 0; u.isRte #= false
   }
 
   def initSimple(dut: SimpleDut, cd: ClockDomain): Unit = {
@@ -432,6 +433,7 @@ class RobPluginSpec extends AnyFunSuite {
         u.writesNzvc #= false; u.writesX #= false
         u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0
         u.unimplemented #= false
+        u.faulted #= false; u.faultVector #= 0; u.isRte #= false
       }
 
       // Completion chaser fork: keep a queue of dispatched robIds and complete the
