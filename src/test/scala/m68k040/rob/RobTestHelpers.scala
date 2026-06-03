@@ -47,7 +47,7 @@ class RenameCommitSinkPlugin extends FiberPlugin with RenameCommitService {
     val flushP  = Bool()
     // Mirror to top-level outputs for observation.
     val commitValidOut = out(Vec(Bool(), 2))
-    val commitArchOut  = out(Vec(UInt(4 bits), 2))
+    val commitArchOut  = out(Vec(UInt(5 bits), 2))
     val commitOldOut   = out(Vec(UInt(6 bits), 2))
     for (k <- 0 until 2) {
       commitValidOut(k) := commits(k).valid

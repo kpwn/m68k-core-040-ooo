@@ -1,7 +1,8 @@
 package m68k040.execute.iq
 
-import m68k040.M68kSim
+import m68k040.{M68kParams, M68kSim}
 import m68k040.VerilatorTest
+import m68k040.core.ParamPlugin
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
@@ -17,7 +18,8 @@ class IssueQueueSpec extends AnyFunSuite {
     val iq     = new IssueQueuePlugin
     val source = new IqSourcePlugin
     val sink   = new IqSinkPlugin
-    db.on { host.asHostOf(Seq[FiberPlugin](iq, source, sink)) }
+    // ParamPlugin publishes PHYS_INT_REGS (the IQ sizes its int scoreboards from it).
+    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), iq, source, sink)) }
   }
 
   /** Drive both push slots independent/ready with the given robIds. */

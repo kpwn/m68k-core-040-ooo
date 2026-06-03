@@ -59,11 +59,12 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     lsEu.issue << iq.issue(3)
     rob.logic.completion(2).valid   := lsEu.completion.valid
     rob.logic.completion(2).payload := lsEu.completion.payload
-    iq.lsWakeup.valid   := lsEu.completion.valid
-    // The IQ dynamic wakeup is keyed by the producer pdst. A completed load's pdst
-    // is the issued LS uop's dst; the LS EU completion carries robId, so re-derive
-    // the pdst from the issued context held at the LS EU's S1.
-    iq.lsWakeup.payload := lsEu.logic.s1Ctx.uop.pdst
+    // The IQ dynamic wakeup is keyed by the producer pdst. The LS EU drives a
+    // dedicated `wakeup` Flow from its REGISTERED completion stage (valid only for a
+    // completing LOAD that produces a physreg — a store completes too but writes no
+    // register), so consumers don't reach into the (now-pipelined) internal context.
+    iq.lsWakeup.valid   := lsEu.wakeup.valid
+    iq.lsWakeup.payload := lsEu.wakeup.payload
     // ROB retire (slot 0) -> SQ commit; doFlush -> SQ flush (squash speculative).
     lsEu.sqCommit.valid   := rob.logic.retire0
     lsEu.sqCommit.payload := rob.logic.h0

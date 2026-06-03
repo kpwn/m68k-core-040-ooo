@@ -25,13 +25,19 @@ object EaClass extends SpinalEnum {
 
 case class EaSpec() extends Bundle {
   val klass = EaClass()
-  val reg   = UInt(4 bits)    // full reg id: Dn=0..7, An=8..15 (valid for DATAREG/ADDRREG)
+  val reg   = UInt(5 bits)    // full reg id: Dn=0..7, An=8..15, temps 16/17 (valid for DATAREG/ADDRREG)
   val imm   = Bits(32 bits)   // valid for IMM
+  // memSimple base/disp (valid for MEMSIMPLE; produced by the memory-cracking slice).
+  val baseValid = Bool()      // a base An register read is needed (false for abs / PC-rel)
+  val base      = UInt(5 bits)// base An reg id (when baseValid)
+  val disp      = Bits(32 bits)// displacement / absolute address (final disp once pcRel folded)
+  val pcRel     = Bool()      // (d16,PC): the assembler folds pc into `disp` (base=0)
 }
 object EaSpec {
   def illegalDefault(): EaSpec = {
     val e = EaSpec()
     e.klass := EaClass.ILLEGAL; e.reg := 0; e.imm := 0
+    e.baseValid := False; e.base := 0; e.disp := 0; e.pcRel := False
     e
   }
 }

@@ -25,12 +25,12 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     val du = host[DecodeUopService]
 
     // ── RATs (int RAT: 4 src reads + 2 dst-old reads = 6 read ports) ─────────
-    val intRat  = RatTable(physIdWidth = 6, archDepth = 16, writePorts = 2, commitPorts = 2, readPorts = 6)
+    val intRat  = RatTable(physIdWidth = 6, archDepth = 18, writePorts = 2, commitPorts = 2, readPorts = 6)
     val nzvcRat = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = 2, readPorts = 2)
     val xRat    = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = 2, readPorts = 2)
 
     // ── Freelists ────────────────────────────────────────────────────────────
-    val intFree  = Freelist(physCount = 48, archCount = 16, popPorts = 2, pushPorts = 2)
+    val intFree  = Freelist(physCount = 50, archCount = 18, popPorts = 2, pushPorts = 2)
     val nzvcFree = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = 2)
     val xFree    = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = 2)
 
@@ -42,12 +42,13 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     val commitPorts = Vec.fill(2)(Flow(CommitSlot()))
 
     // ── Committed-identity init ────────────────────────────────────────────────
-    // Counter 0..15 drives intRat.commits(0) with (addr=i, data=i); the flag RATs
-    // commit (addr 0, data 0) on the first cycle. Gate normal operation until done.
+    // Counter 0..17 drives intRat.commits(0) with (addr=i, data=i) — identity for
+    // D0-7/A0-7 AND the two temp arch regs T0/T1 (16,17); the flag RATs commit
+    // (addr 0, data 0) on the first cycle. Gate normal operation until done.
     val initDone    = Reg(Bool()) init False
-    val initCounter = Reg(UInt(5 bits)) init 0   // 0..16
+    val initCounter = Reg(UInt(5 bits)) init 0   // 0..17
     when(!initDone) {
-      when(initCounter === U(15)) {
+      when(initCounter === U(17)) {
         initDone := True
       }
       initCounter := initCounter + 1
@@ -123,6 +124,7 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       // copy decoded fields
       r.valid        := dec.valid
       r.pc           := dec.pc
+      r.nextPc       := dec.nextPc
       r.op           := dec.op
       r.cluster      := dec.cluster
       r.size         := dec.size

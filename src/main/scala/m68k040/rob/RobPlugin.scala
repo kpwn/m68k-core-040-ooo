@@ -24,7 +24,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   /** One ROB entry's commit/free + trace payload. */
   case class RobPayload() extends Bundle {
     val predNextPc = UInt(32 bits)
-    val archRegId  = UInt(4 bits)
+    val archRegId  = UInt(5 bits)
     val intNew     = UInt(6 bits); val intOld = UInt(6 bits); val intWrite = Bool()
     val nzvcNew    = UInt(4 bits); val nzvcOld = UInt(4 bits); val nzvcWrite = Bool()
     val xNew       = UInt(4 bits); val xOld = UInt(4 bits); val xWrite = Bool()
@@ -88,7 +88,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // ── Build a RobPayload from a RenamedUop ───────────────────────────────────
     def payloadFrom(u: RenamedUop): RobPayload = {
       val p = RobPayload()
-      p.predNextPc := u.pc + 2
+      p.predNextPc := u.nextPc
       p.archRegId  := u.dstArch
       p.intNew     := u.pdst;     p.intOld := u.pdstOld;   p.intWrite  := u.pdstValid
       p.nzvcNew    := u.pNzvcDst; p.nzvcOld := u.pNzvcOld;  p.nzvcWrite := u.writesNzvc

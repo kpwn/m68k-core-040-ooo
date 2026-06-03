@@ -41,6 +41,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val loadRspPort = Flow(DLoadRsp())
     val loadBusyReg = Bool()
     val storePort   = Flow(DStoreCmd())
+    val storeAckReg = Bool()
     val axi         = master(Axi4(axiCfg))
 
     // ---- translation (load path only; D-side TLB) ----
@@ -180,6 +181,12 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       when(axi.w.ready) { stWDone := True }
     }
 
+    // ---- store write-through ACK ----
+    // The write has landed in memory once the AXI B response handshakes (b.ready is
+    // always True). The SQ holds the drained entry resident — still forwarding — until
+    // this pulse, closing the stale-refill window for a younger load that misses L1D.
+    storeAckReg := axi.b.valid && axi.b.ready
+
     // ---- LOAD FSM ----
     val fsm = new StateMachine {
       val IDLE   = new State with EntryPoint
@@ -259,4 +266,5 @@ class DcachePlugin extends FiberPlugin with DcacheService {
   override def loadRsp  = logic.loadRspPort
   override def loadBusy = logic.loadBusyReg
   override def store    = logic.storePort
+  override def storeAck = logic.storeAckReg
 }

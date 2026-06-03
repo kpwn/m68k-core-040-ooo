@@ -152,6 +152,34 @@ class LsEuSpec extends AnyFunSuite {
     }
   }
 
+  test("younger load that misses L1D forwards a committed store through the drain window", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      // base is a line NEVER loaded into L1D -> a load here MISSES. The store also
+      // misses (write-through, no-allocate) so it does NOT update the L1D line.
+      val base = 0x6000L
+      for (i <- 0 until 16) mem.pokeByte(base + i, memByte(base + i))  // STALE memory
+      seed(dut, cd, preg = 10, value = base)
+      seed(dut, cd, preg = 11, value = 0x0BADF00DL)
+      // store (robId 3) then COMMIT it -> it begins draining to memory.
+      issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11, Size.LONG, robId = 3)
+      assert(waitCompletion(dut, cd, robId = 3), "store alloc")
+      dut.src.logic.iSqCommitValid #= true; dut.src.logic.iSqCommitRob #= 3
+      cd.waitSampling()
+      dut.src.logic.iSqCommitValid #= false
+      // Immediately issue a YOUNGER load (robId 5) to the same addr. Even though the
+      // line misses L1D and the store may already be mid-drain, the SQ entry stays
+      // resident until its memory write is ACKed -> the load must FORWARD the store
+      // data, not refill stale memory.
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 23, robId = 5)
+      assert(waitCompletion(dut, cd, robId = 5), "younger load completes")
+      cd.waitSampling(4)
+      dut.src.logic.obsIntAddr #= 23; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == BigInt(0x0BADF00DL),
+        s"load must forward store data, got ${dut.src.logic.obsIntData.toBigInt.toString(16)} (stale = ${expectedLong(base).toString(16)})")
+    }
+  }
+
   test("flush squashes an uncommitted store (never drains)", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
       val (cd, mem) = initDut(dut)

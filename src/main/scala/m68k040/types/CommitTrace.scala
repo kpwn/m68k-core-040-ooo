@@ -9,7 +9,7 @@ case class CommitTrace() extends Bundle {
   val fire         = Bool()          // a single instruction retired this cycle
   val pc           = UInt(32 bits)   // POST-instruction PC (next-instruction addr); must match Musashi --trace for lock-step
   val opword       = Bits(16 bits)
-  val archRegId    = UInt(4 bits)
+  val archRegId    = UInt(5 bits)
   val archRegWrite = Bits(32 bits)
   val archRegValid = Bool()
   val ccr          = Bits(5 bits)    // X,N,Z,V,C after this instruction

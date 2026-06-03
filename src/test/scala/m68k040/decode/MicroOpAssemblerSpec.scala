@@ -2,7 +2,7 @@ package m68k040.decode
 
 import m68k040.VerilatorTest
 import m68k040.frontend.DecodePacket
-import m68k040.isa.Size
+import m68k040.isa.{Size, MemOp}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -12,7 +12,7 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
   class Dut extends Component {
     val pkt = in(DecodePacket())
     val uop = out(DecodedUop())
-    uop := MicroOpAssembler.assemble(pkt)
+    uop := MicroOpAssembler.assemble(pkt).uops(0)
   }
   def drive(dut: Dut, op: Int, w1: Int = 0, w2: Int = 0, len: Int = 1): Unit = {
     dut.pkt.valid #= true; dut.pkt.pc #= 0x1000; dut.pkt.simple #= true; dut.pkt.complex #= false
@@ -50,9 +50,10 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
   test("Bcc word disp", VerilatorTest) { run { dut => drive(dut, 0x6700, 0x0010, len = 2); sleep(1)
     assert(dut.uop.isBranch.toBoolean && dut.uop.cond.toInt == 7 && dut.uop.branchDisp.toLong == 0x10)
   }}
-  test("memory-EA operand -> unimplemented (reg/imm slice)", VerilatorTest) { run { dut => drive(dut, 0xD090); sleep(1)
-    // ADD.L (A0),D0 — EA is memory -> not handled this slice
-    assert(dut.uop.unimplemented.toBoolean)
+  test("memSimple-EA source -> cracked load uop (slot0), not unimplemented", VerilatorTest) { run { dut => drive(dut, 0xD090); sleep(1)
+    // ADD.L (A0),D0 — EA (A0) is memSimple -> slot0 is now the LOAD µop (cracking
+    // slice 2), no longer unimplemented. (Full sequence covered by CrackLoadSpec.)
+    assert(!dut.uop.unimplemented.toBoolean && dut.uop.memOp.toEnum == MemOp.LOAD)
   }}
   test("non-simple packet -> unimplemented", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>

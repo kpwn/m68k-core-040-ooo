@@ -43,6 +43,7 @@ class RobPluginSpec extends AnyFunSuite {
   ): Unit = {
     u.valid #= valid
     u.pc #= pc
+    u.nextPc #= pc + 2   // 2-byte instruction model: commit pc = nextPc = pc + 2
     u.op #= DecOp.MOVE
     u.cluster #= Cluster.INT
     u.size #= Size.LONG
@@ -419,6 +420,7 @@ class RobPluginSpec extends AnyFunSuite {
         val u = dut.dsrc.logic.src.payload(s)
         u.valid #= true
         u.pc #= 0
+        u.nextPc #= 2
         u.op #= DecOp.MOVE
         u.cluster #= Cluster.INT
         u.size #= Size.LONG

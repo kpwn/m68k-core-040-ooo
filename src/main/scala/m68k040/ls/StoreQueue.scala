@@ -44,11 +44,18 @@ class StoreQueue(depth: Int = 8) extends Component {
   val ptrW = log2Up(depth)
 
   val io = new Bundle {
-    val alloc  = slave(Flow(SqAlloc()))
-    val fwd    = new Bundle { val query = in(SqFwdQuery()); val rsp = out(SqFwdRsp()) }
-    val commit = slave(Flow(UInt(6 bits)))
-    val flush  = in(Bool())
-    val drain  = master(Flow(DStoreCmd()))
+    val alloc    = slave(Flow(SqAlloc()))
+    val fwd      = new Bundle { val query = in(SqFwdQuery()); val rsp = out(SqFwdRsp()) }
+    val commit   = slave(Flow(UInt(6 bits)))
+    val flush    = in(Bool())
+    val drain    = master(Flow(DStoreCmd()))
+    // Memory-write acknowledge for the in-flight drain. The oldest committed entry
+    // is PRESENTED on `drain` for exactly one cycle (latched by the D-cache), then
+    // HELD resident (still forwarding) until `drainAck` confirms the write-through
+    // landed in memory. Popping on drain-issue (not ack) would leave a window where
+    // the store left the SQ but its memory write was not yet visible — a younger
+    // load that MISSED L1D could refill stale memory. Holding until ack closes it.
+    val drainAck = in(Bool())
   }
 
   // ---- ring storage (all RegInit) ----
@@ -77,9 +84,15 @@ class StoreQueue(depth: Int = 8) extends Component {
     (diff =/= 0) && (diff < U(32, 6 bits))
   }
 
-  // ---- drain: oldest entry, valid & committed -> write-through, then pop ----
-  val drainFire = valids(head) && committed(head) && !io.flush
-  io.drain.valid          := drainFire
+  // ---- drain: oldest entry, valid & committed -> write-through, HOLD until ack ----
+  // `drainBusy` is set the cycle we present the store on `io.drain` (the D-cache
+  // latches it that cycle) and cleared on `io.drainAck`. While busy we do NOT
+  // re-present the store (a single write-through per entry) and we do NOT pop —
+  // the entry stays resident so SQ-forwarding covers the entire drain window.
+  val drainBusy = RegInit(False)
+  val headReady = valids(head) && committed(head) && !io.flush
+  val drainIssue = headReady && !drainBusy   // one-cycle present to the D-cache
+  io.drain.valid          := drainIssue
   io.drain.payload.paddr  := paddrs(head)
   io.drain.payload.data   := datas(head)
   io.drain.payload.size   := sizes(head)
@@ -140,8 +153,10 @@ class StoreQueue(depth: Int = 8) extends Component {
     tail := tail + 1
   }
 
-  // ---- drain pop: clear head entry, advance head ----
-  when(drainFire) {
+  // ---- drain handshake: present -> busy; ack -> pop + advance ----
+  when(drainIssue) { drainBusy := True }
+  when(io.drainAck && drainBusy) {
+    drainBusy    := False
     valids(head) := False
     head := head + 1
   }

@@ -1,6 +1,7 @@
 package m68k040.execute.iq
 
-import m68k040.{M68kSim, VerilatorTest}
+import m68k040.{M68kParams, M68kSim, VerilatorTest}
+import m68k040.core.ParamPlugin
 import m68k040.isa.{Cluster, MemOp}
 import spinal.core._
 import spinal.core.sim._
@@ -15,7 +16,8 @@ class IqLsSpec extends AnyFunSuite {
     val iq     = new IssueQueuePlugin
     val source = new IqSourcePlugin
     val sink   = new IqSinkPlugin
-    db.on { host.asHostOf(Seq[FiberPlugin](iq, source, sink)) }
+    // ParamPlugin publishes PHYS_INT_REGS (the IQ sizes its int scoreboards from it).
+    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), iq, source, sink)) }
   }
 
   def idle(dut: Dut): Unit = {
@@ -95,7 +97,11 @@ class IqLsSpec extends AnyFunSuite {
       val cd = dut.clockDomain; cd.forkStimulus(10)
       idle(dut); cd.waitSampling(3)
 
-      // hold port3 not-ready so we can observe both reach it
+      // Hold port3 not-ready while we load both LS uops into the queue. With the
+      // REGISTERED issue stage (m2sPipe, collapsBubble=false) the issue port only
+      // PRESENTS a uop once it has been accepted into the issue register, which
+      // requires ready3 — so we pulse ready3 to advance each in turn and observe
+      // them oldest-first, one at a time (the invariant under test).
       dut.sink.logic.ready3 #= false
 
       pushOne(dut, robId = 10, Cluster.LS, MemOp.LOAD, pdst = 1, pdstValid = true, psrcA = 0, psrcAValid = false)
@@ -105,15 +111,22 @@ class IqLsSpec extends AnyFunSuite {
       dut.source.logic.pushValid #= false
       cd.waitSampling(2)
 
-      // port3 sees the oldest LS (robId 10) presented
-      assert(dut.sink.logic.v3.toBoolean && dut.sink.logic.rob3.toInt == 10, s"oldest LS on port3, saw v=${dut.sink.logic.v3.toBoolean} rob=${dut.sink.logic.rob3.toInt}")
-      // accept it
+      // Pulse ready3: the oldest LS (robId 10) latches into the issue register and
+      // appears at the port the NEXT cycle (one-cycle registered-issue latency).
       dut.sink.logic.ready3 #= true
       cd.waitSampling()
       dut.sink.logic.ready3 #= false
-      cd.waitSampling(2)
-      // now the younger LS (robId 11) is presented
-      assert(dut.sink.logic.v3.toBoolean && dut.sink.logic.rob3.toInt == 11, s"younger LS on port3, saw v=${dut.sink.logic.v3.toBoolean} rob=${dut.sink.logic.rob3.toInt}")
+      cd.waitSampling()
+      assert(dut.sink.logic.v3.toBoolean && dut.sink.logic.rob3.toInt == 10,
+        s"oldest LS on port3, saw v=${dut.sink.logic.v3.toBoolean} rob=${dut.sink.logic.rob3.toInt}")
+      // Accept robId 10, then pulse ready3 again so the younger LS (robId 11)
+      // advances into the issue register and is presented one at a time.
+      dut.sink.logic.ready3 #= true
+      cd.waitSampling()
+      dut.sink.logic.ready3 #= false
+      cd.waitSampling()
+      assert(dut.sink.logic.v3.toBoolean && dut.sink.logic.rob3.toInt == 11,
+        s"younger LS on port3, saw v=${dut.sink.logic.v3.toBoolean} rob=${dut.sink.logic.rob3.toInt}")
       cd.waitSampling(2)
     }
   }

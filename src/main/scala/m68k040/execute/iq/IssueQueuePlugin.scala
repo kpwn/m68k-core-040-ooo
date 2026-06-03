@@ -98,7 +98,11 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       val busy       = Reg(Bits(depth bits)) init 0
       val physToSlot = Reg(Vec(UInt(slotIdxW bits), depth))
     }
-    val sbInt  = new Scoreboard(48) // int physregs (width 6)
+    // Int scoreboard width = the physical int register count (parametric; was a
+    // hardcoded 48 — became 50 when the 2 temp arch regs T0/T1 widened the int
+    // pool, so a temp's pdst could index past 48 and alias/over-run the bitmaps).
+    val physIntN = m68k040.Global.PHYS_INT_REGS.get
+    val sbInt  = new Scoreboard(physIntN) // int physregs
     val sbNzvc = new Scoreboard(16) // NZVC flag physregs (width 4)
     val sbX    = new Scoreboard(16) // X flag physregs (width 4)
 
@@ -108,10 +112,17 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // LS EU broadcasts lsWakeup(p). This is SEPARATE from the static slot-trigger
     // mechanism (which assumes latency-1): LS producers are tracked ONLY here, not
     // in sbInt, so trigInit never sets a static (auto-clearing) trigger for them.
-    val lsBusy = Reg(Bits(48 bits)) init 0
+    val lsBusy = Reg(Bits(physIntN bits)) init 0
 
     // LS class predicate: cluster == LS and a real memory op.
     def isLs(u: RenamedUop): Bool = (u.cluster === m68k040.isa.Cluster.LS) && (u.memOp =/= m68k040.isa.MemOp.NONE)
+
+    // Is srcB a REAL register operand (vs an immediate)? For ALU µops `useImm`
+    // means srcB carries an immediate (no register read). For LS µops `imm` is the
+    // ADDRESS DISPLACEMENT and srcB is the STORE DATA register — both are live, so
+    // useImm must NOT suppress the srcB (data) dependency. Conflating the two would
+    // let a store issue before its data producer retired (reading a stale PRF).
+    def srcBIsReg(u: RenamedUop): Bool = u.psrcBValid && (!u.useImm || isLs(u))
 
     // ---- Occupancy / back-pressure ----
     // Back-pressure is gated on LINE 0 BEING EMPTY, not on a count proxy.
@@ -135,6 +146,10 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // No combinational loop: push.fire = push.valid && push.ready, and push.ready
     // is driven purely by the registered readyReg, so push.ready does not depend
     // combinationally on push.fire.
+    // Internal combinational select streams (the registered issue stage feeds the
+    // external `issuePorts` from these; see the select section below). Declared here
+    // so `issued` (count instrumentation) can reference selPorts.fire.
+    val selPorts = Vec.fill(4)(Stream(IqContext()))
     val count = Reg(UInt(log2Up(slotCount + 1) bits)) init 0 // instrumentation only
     // selComb = sel after this cycle's issue, i.e. the slot's NEXT-cycle occupancy
     // (absent compaction). Sampling selComb (not sel) lets a line that empties via
@@ -147,7 +162,9 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val pushed = UInt(log2Up(wayCount + 1) bits)
     pushed := 0
     when(pushPort.fire) { pushed := Mux(pushSlot1Port, U(2), U(1)) }
-    val issued = CountOne(issuePorts.map(_.fire))
+    // `issued` (count instrumentation) must key off the SELECT ports, since a slot
+    // is freed (count decremented) when it moves into the registered issue stage.
+    val issued = CountOne(selPorts.map(_.fire))
 
     // ---- Select: age-ordered, CLASS-filtered (lowest-index-first one-hot) ----
     // ALU ports (0,1) select non-branch ready slots; branch port (2) selects
@@ -164,6 +181,29 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val ohB = OHMasking.first(brReady)
     val ohL = OHMasking.first(lsReady)
 
+    // ---- FMax: REGISTERED issue->operand-read boundary ----
+    // The combinational select (above) + MuxOH(contexts) feeding each EU's S0
+    // RegFile read-address was the FMax-critical arc (select->OHMasking->MuxOH->
+    // uop.psrcA->PRF read-addr->read->S0). We cut it with a registered stage on
+    // every issue port: `selPorts` are the INTERNAL combinational select streams
+    // (all IQ bookkeeping — fire/events/scoreboard/wakeup — keys off THESE, at
+    // select time); the EXTERNAL `issuePorts` are `selPorts` piped through a
+    // registered M2S stage (m2sPipe). The EU therefore reads the PRF off a
+    // REGISTERED address, not the select cone — splitting the arc into
+    //   select -> MuxOH -> selPort payload reg   (short)
+    //   reg -> PRF read-addr -> read -> S0        (short)
+    // at the cost of ONE extra issue->execute cycle.
+    //
+    // WAKEUP RETIMING (correctness): the static-latency-1 wakeup is derived from
+    // `events` at SELECT time (below), and the EU pipeline shifts uniformly by +1
+    // (every EU gained the same stage), so a producer selected at cycle C still
+    // executes/bypasses exactly when a dependent — woken at C, selected at C+1,
+    // reading at C+2 — performs its read. The relative producer/consumer timing is
+    // PRESERVED, so no change to the events/scoreboard bookkeeping is needed; it is
+    // all expressed relative to select time. The LS dynamic-completion wakeup is
+    // late-bound (driven by actual completion) and self-consistent at any depth.
+    // (`selPorts` itself is declared earlier so `issued` can reference it.)
+
     // Suppress ALL issue on a flush cycle. flushSignal (= the ROB's registered
     // doFlush pulse, or a test flush) clears every slot's `sel` for NEXT cycle, but
     // the select above reads the CURRENT (combinational) sel — so without this gate
@@ -171,21 +211,43 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // arrives 1-2 cycles later carrying a now-reused robId, and corrupts the
     // commit/whitebox join. Gating issue on !flushSignal is the correct squash
     // behavior (a single AND on the registered pulse, not a broadcast).
-    issuePorts(0).valid   := oh0.orR && !flushSignal
-    issuePorts(0).payload := MuxOH(oh0, contexts)
-    issuePorts(1).valid   := oh1.orR && !flushSignal
-    issuePorts(1).payload := MuxOH(oh1, contexts)
-    issuePorts(2).valid   := ohB.orR && !flushSignal
-    issuePorts(2).payload := MuxOH(ohB, contexts)
-    issuePorts(3).valid   := ohL.orR && !flushSignal
-    issuePorts(3).payload := MuxOH(ohL, contexts)
+    selPorts(0).valid   := oh0.orR && !flushSignal
+    selPorts(0).payload := MuxOH(oh0, contexts)
+    selPorts(1).valid   := oh1.orR && !flushSignal
+    selPorts(1).payload := MuxOH(oh1, contexts)
+    selPorts(2).valid   := ohB.orR && !flushSignal
+    selPorts(2).payload := MuxOH(ohB, contexts)
+    selPorts(3).valid   := ohL.orR && !flushSignal
+    selPorts(3).payload := MuxOH(ohL, contexts)
 
-    // Free chosen slots when their issue port fires.
+    // Registered issue stage: drop the in-flight registered uop on a flush (it is
+    // wrong-path), exactly as the slots are squashed. `flush` clears the pipe's
+    // valid reg so a squashed selection never reaches the EU.
+    //
+    // collapsBubble = FALSE is REQUIRED for correctness, not just FMax: with
+    // collapsBubble=true the pipe presents `self.ready` whenever its register is
+    // empty (a 1-deep skid), which would free an IQ slot BEFORE the EU actually
+    // accepts the uop — growing effective queue depth past slotCount and letting a
+    // not-ready EU (e.g. a held port, or LS busy) drain a slot it should hold. With
+    // collapsBubble=false, `self.ready := m2sPipe.ready` is driven purely by the
+    // downstream EU, so a slot is freed EXACTLY when the EU would have accepted it
+    // (original backpressure/capacity semantics), with one cycle of register
+    // latency added on the forward (payload) path — which is exactly the arc we are
+    // cutting. For the always-ready ALU/branch EUs this drains every cycle (no
+    // bubble); for the LS EU it back-pressures into the IQ as before.
+    for (k <- 0 until 4) {
+      issuePorts(k) << selPorts(k).m2sPipe(collapsBubble = false, flush = flushSignal)
+    }
+
+    // Free chosen slots when their SELECT port fires (i.e. when the uop moves into
+    // the registered issue stage). For ALU/branch the EU is always ready so the
+    // pipe always accepts (fire == valid); for LS the pipe back-pressures when the
+    // EU is busy, holding the slot — so no issued uop is ever lost.
     for ((slot, i) <- slots.zipWithIndex) {
-      slot.fire := (issuePorts(0).fire && oh0(i)) ||
-                   (issuePorts(1).fire && oh1(i)) ||
-                   (issuePorts(2).fire && ohB(i)) ||
-                   (issuePorts(3).fire && ohL(i))
+      slot.fire := (selPorts(0).fire && oh0(i)) ||
+                   (selPorts(1).fire && oh1(i)) ||
+                   (selPorts(2).fire && ohB(i)) ||
+                   (selPorts(3).fire && ohL(i))
     }
 
     // ---- Static-latency-1 wakeup events ----
@@ -193,7 +255,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // producer whose result becomes available next cycle; dependents carry a
     // trigger bit at index j which we clear (combinationally into the trigger
     // reg's next value) so they become ready next cycle (back-to-back, lat 1).
-    val events = oh0.andMask(issuePorts(0).fire) | oh1.andMask(issuePorts(1).fire)
+    val events = oh0.andMask(selPorts(0).fire) | oh1.andMask(selPorts(1).fire)
 
     // ---- Depend-on-READ trigger init for the two newly-pushed slots ----
     // Slot0 lands at priority `slot0Prio` (lines.last.ways(0)), slot1 at
@@ -220,7 +282,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
         }
       }
       dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcA, uop.psrcAValid)
-      dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcB, uop.psrcBValid && !uop.useImm)
+      dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcB, srcBIsReg(uop))
       dep(sbNzvc.busy, sbNzvc.physToSlot, uop.pNzvcSrc, uop.readsNzvc)
       dep(sbX.busy,    sbX.physToSlot,    uop.pXSrc, uop.readsX)
       t
@@ -234,22 +296,39 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // Push-time LS dependency: does this uop read a physreg produced by an
     // in-flight (not-yet-completed) LS load? (Intra-push slot1<-slot0 LS handled
     // below.) Reads lsBusy at push (off the issue/PRF-read critical path).
+    //
+    // SAME-CYCLE WAKEUP: a physreg `p` is only still-in-flight if it is lsBusy AND
+    // the load is NOT completing THIS cycle. Without the `!wokeThisCycle` guard a
+    // consumer dispatched the exact cycle its producing load broadcasts lsWakeup
+    // would latch lsWait=True (reading the not-yet-cleared lsBusy) yet never see
+    // the wakeup pulse (already past) -> a lost wakeup that hangs the consumer.
+    // This is the back-to-back case the decode-matrix cracker creates (LOAD->temp
+    // then the op reading the temp, dispatched within 1-2 cycles).
+    def stillBusy(p: UInt): Bool =
+      lsBusy(p) && !(lsWakeupPort.valid && lsWakeupPort.payload === p)
     def lsDepInit(uop: RenamedUop): Bool =
-      (uop.psrcAValid && lsBusy(uop.psrcA)) || (uop.psrcBValid && !uop.useImm && lsBusy(uop.psrcB))
+      (uop.psrcAValid && stillBusy(uop.psrcA)) || (srcBIsReg(uop) && stillBusy(uop.psrcB))
     val lsDep0 = lsDepInit(pushUop0)
     val lsDep1Base = lsDepInit(pushUop1)
     // Intra-push: slot1 reads slot0's dst and slot0 is an LS load -> slot1 waits.
     val s0IsLsLoad = isLs(pushUop0) && (pushUop0.memOp === m68k040.isa.MemOp.LOAD) && pushUop0.pdstValid
     val lsDep1 = lsDep1Base ||
       (s0IsLsLoad && pushUop1.psrcAValid && (pushUop1.psrcA === pushUop0.pdst)) ||
-      (s0IsLsLoad && pushUop1.psrcBValid && !pushUop1.useImm && (pushUop1.psrcB === pushUop0.pdst))
+      (s0IsLsLoad && srcBIsReg(pushUop1) && (pushUop1.psrcB === pushUop0.pdst))
     // Intra-push: slot1 reads a physreg that slot0 (pushed same cycle) writes.
     // slot0 ends at slot0Prio; set slot1's trigger bit there.
-    val s0WritesInt  = pushUop0.pdstValid
+    //
+    // The STATIC (latency-1) int trigger must be SUPPRESSED when slot0 is an LS
+    // load: an LS load is variable-latency and produces NO static issue-event
+    // (`events` covers only the ALU ports), so a static trigger bit on it would
+    // never clear and hang the consumer. That dependency is instead carried by
+    // `lsDep1` (the dynamic lsWait, cleared by lsWakeup). This is exactly the
+    // cracked LOAD->temp + op-reading-temp pair when both land in one push group.
+    val s0WritesInt  = pushUop0.pdstValid && !s0IsLsLoad
     val s0WritesNzvc = pushUop0.writesNzvc
     val s0WritesX    = pushUop0.writesX
     when(s0WritesInt  && pushUop1.psrcAValid && pushUop1.psrcA === pushUop0.pdst)              { trig1(slot0Prio) := True }
-    when(s0WritesInt  && pushUop1.psrcBValid && !pushUop1.useImm && pushUop1.psrcB === pushUop0.pdst) { trig1(slot0Prio) := True }
+    when(s0WritesInt  && srcBIsReg(pushUop1) && pushUop1.psrcB === pushUop0.pdst) { trig1(slot0Prio) := True }
     when(s0WritesNzvc && pushUop1.readsNzvc && pushUop1.pNzvcSrc === pushUop0.pNzvcDst)        { trig1(slot0Prio) := True }
     when(s0WritesX    && pushUop1.readsX    && pushUop1.pXSrc === pushUop0.pXDst)              { trig1(slot0Prio) := True }
 
@@ -300,7 +379,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       val u = s.context.uop
       lsWakeupPort.valid && s.sel &&
         ((u.psrcAValid && (u.psrcA === lsWakeupPort.payload)) ||
-         (u.psrcBValid && !u.useImm && (u.psrcB === lsWakeupPort.payload)))
+         (srcBIsReg(u) && (u.psrcB === lsWakeupPort.payload)))
     })
     for (i <- 0 until slotCount) {
       when(lsWakeMatch(i)) {
@@ -345,8 +424,8 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // On issue, clear busy for the issued producer's dst(s) so later pushes do
     // not depend on an already-issued (latency-1, result-available) producer.
     for (k <- 0 until wayCount) {
-      val ctx = issuePorts(k).payload
-      when(issuePorts(k).fire) {
+      val ctx = selPorts(k).payload
+      when(selPorts(k).fire) {
         when(ctx.uop.pdstValid)  { sbInt.busy(ctx.uop.pdst)     := False }
         when(ctx.uop.writesNzvc) { sbNzvc.busy(ctx.uop.pNzvcDst) := False }
         when(ctx.uop.writesX)    { sbX.busy(ctx.uop.pXDst)       := False }
