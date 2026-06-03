@@ -20,8 +20,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val uopsPort = Stream(Vec(DecodedUop(), 2))
 
     // Combinational decode of both slots
-    val d0 = MicroOpAssembler.assemble(df.feed.payload(0))
-    val d1 = MicroOpAssembler.assemble(df.feed.payload(1))
+    // NOTE: single-µop passthrough (slot0 only) until Task 5 wires the expansion
+    // queue. Cracked memory loads (count==2) are not yet drained here.
+    val d0 = MicroOpAssembler.assemble(df.feed.payload(0)).uops(0)
+    val d1 = MicroOpAssembler.assemble(df.feed.payload(1)).uops(0)
 
     // Assign decoded content, then override validity from the feed handshake.
     // Use allowOverride on the .valid fields to resolve the overlap between the

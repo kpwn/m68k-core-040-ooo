@@ -5,13 +5,29 @@ import m68k040.isa.{Cluster, Size, MemOp}
 import spinal.core._
 import spinal.lib._
 
-/** Combines the EA-agnostic OperationDecoder with the opcode-agnostic EaDecoder
-  * into one DecodedUop. This slice: register/immediate operands only, exactly one
-  * µop per instruction (no temps, no memory). Any operand that resolves to a
-  * memory/illegal EA -> `unimplemented` (memory cracking is a later slice). */
+/** Cracking assembler: combines the EA-agnostic OperationDecoder with the
+  * opcode-agnostic EaDecoder into a 1–2 µop SEQUENCE.
+  *
+  * - Register/immediate operands: 1 op µop (decode-matrix slice 1).
+  * - memSimple EA SOURCE (the EASRC role): cracked into a LOAD µop → temp T0,
+  *   then the op µop with the EASRC operand reading T0 (slice 2).
+  *
+  * Deferred (→ `unimplemented`): `(An)+`/`-(An)` side-effects, `(d8,An,Xn)` /
+  * `(d8,PC,Xn)` indexed (memComplex), RMW-to-memory, and (until Task 4) memSimple
+  * EA DESTINATION (the EADST store). */
 object MicroOpAssembler {
-  def assemble(pkt: DecodePacket): DecodedUop = {
-    val uop = DecodedUop()
+
+  /** Internal int temp arch regs targeted by EA cracking. */
+  val T0 = 16
+  val T1 = 17
+
+  case class AssembledUops() extends Bundle {
+    val uops  = Vec(DecodedUop(), 2)
+    val count = UInt(2 bits)         // 1 or 2 µops valid (uops(0) always, uops(1) iff count===2)
+  }
+
+  def assemble(pkt: DecodePacket): AssembledUops = {
+    val out = AssembledUops()
     val op  = pkt.words(0)
     val spec = OperationDecoder.decode(op)
 
@@ -20,99 +36,148 @@ object MicroOpAssembler {
     val dstEaField = op(8 downto 6) ## op(11 downto 9)
     val dstEa = EaDecoder.decode(dstEaField, spec.size, pkt.words)
 
-    // ---- defaults ----
-    uop.valid         := pkt.valid
-    uop.pc            := pkt.pc
-    uop.op            := spec.op
-    uop.cluster       := spec.cluster
-    uop.size          := spec.size
-    uop.memOp         := MemOp.NONE
-    uop.srcAReg       := 0; uop.srcAValid := False
-    uop.srcBReg       := 0; uop.srcBValid := False
-    uop.dstReg        := 0; uop.dstValid  := False
-    uop.useImm        := False; uop.imm    := 0
-    uop.readsNzvc     := spec.readsNzvc; uop.readsX := spec.readsX
-    uop.writesNzvc    := spec.writesNzvc; uop.writesX := spec.writesX
-    uop.isBranch      := spec.isBranch; uop.cond := spec.cond
-    uop.branchDisp    := 0
-    uop.unimplemented := False
-
-    // A µop is reg/imm-decodable only if every active EA-sourced operand is a
-    // register or immediate. Memory/illegal EAs (or illegal op, or !simple) ->
-    // unimplemented (cleared fields above keep the bundle well-formed).
-    val srcEaOk = (srcEa.klass === EaClass.DATAREG) || (srcEa.klass === EaClass.ADDRREG) || (srcEa.klass === EaClass.IMM)
-    val dstEaOk = (dstEa.klass === EaClass.DATAREG) || (dstEa.klass === EaClass.ADDRREG)
+    // ── Operand classification ───────────────────────────────────────────────
+    val srcIsReg = (srcEa.klass === EaClass.DATAREG) || (srcEa.klass === EaClass.ADDRREG)
+    val srcIsMem = (srcEa.klass === EaClass.MEMSIMPLE)
+    val srcEaOk  = srcIsReg || (srcEa.klass === EaClass.IMM) || srcIsMem
+    val dstEaOk  = (dstEa.klass === EaClass.DATAREG) || (dstEa.klass === EaClass.ADDRREG)
     val usesSrcEa = (spec.srcA.kind === OperandKind.EASRC) || (spec.srcB.kind === OperandKind.EASRC)
     val usesDstEa = (spec.dst.kind === OperandKind.EADST)
 
-    // ---- place each operand slot (inlined per-slot; identical logic) ----
+    // The op consumes a memSimple SOURCE EA -> crack a leading load µop into T0,
+    // and the op reads T0 in the EASRC slot.
+    val crackLoad = usesSrcEa && srcIsMem
+
+    // ── opUop = the operation (EASRC operand routed to T0 when cracked) ────────
+    val opUop = DecodedUop()
+    opUop.valid         := pkt.valid
+    opUop.pc            := pkt.pc
+    opUop.op            := spec.op
+    opUop.cluster       := spec.cluster
+    opUop.size          := spec.size
+    opUop.memOp         := MemOp.NONE
+    opUop.srcAReg       := 0; opUop.srcAValid := False
+    opUop.srcBReg       := 0; opUop.srcBValid := False
+    opUop.dstReg        := 0; opUop.dstValid  := False
+    opUop.useImm        := False; opUop.imm    := 0
+    opUop.readsNzvc     := spec.readsNzvc; opUop.readsX := spec.readsX
+    opUop.writesNzvc    := spec.writesNzvc; opUop.writesX := spec.writesX
+    opUop.isBranch      := spec.isBranch; opUop.cond := spec.cond
+    opUop.branchDisp    := 0
+    opUop.unimplemented := False
+
     // --- srcA slot ---
     switch(spec.srcA.kind) {
       is(OperandKind.REGFIELD) {
-        when(spec.srcA.isAddr) { uop.srcAReg := (U(8, 5 bits) + op(11 downto 9).asUInt).resized }
-          .otherwise { uop.srcAReg := op(11 downto 9).asUInt.resize(5) }
-        uop.srcAValid := True
+        when(spec.srcA.isAddr) { opUop.srcAReg := (U(8, 5 bits) + op(11 downto 9).asUInt).resized }
+          .otherwise { opUop.srcAReg := op(11 downto 9).asUInt.resize(5) }
+        opUop.srcAValid := True
       }
       is(OperandKind.EASRC) {
-        when(srcEa.klass === EaClass.IMM) { uop.useImm := True; uop.imm := srcEa.imm }
-          .otherwise { uop.srcAReg := srcEa.reg; uop.srcAValid := True }
+        when(srcEa.klass === EaClass.IMM) { opUop.useImm := True; opUop.imm := srcEa.imm }
+          .elsewhen(srcIsMem) { opUop.srcAReg := U(T0, 5 bits); opUop.srcAValid := True }
+          .otherwise { opUop.srcAReg := srcEa.reg; opUop.srcAValid := True }
       }
-      is(OperandKind.EADST) { uop.srcAReg := dstEa.reg; uop.srcAValid := True }
-      is(OperandKind.IMMQ)  { uop.useImm := True; uop.imm := op(7 downto 0).asSInt.resize(32).asBits }
+      is(OperandKind.EADST) { opUop.srcAReg := dstEa.reg; opUop.srcAValid := True }
+      is(OperandKind.IMMQ)  { opUop.useImm := True; opUop.imm := op(7 downto 0).asSInt.resize(32).asBits }
       default {}
     }
 
     // --- srcB slot ---
     switch(spec.srcB.kind) {
       is(OperandKind.REGFIELD) {
-        when(spec.srcB.isAddr) { uop.srcBReg := (U(8, 5 bits) + op(11 downto 9).asUInt).resized }
-          .otherwise { uop.srcBReg := op(11 downto 9).asUInt.resize(5) }
-        uop.srcBValid := True
+        when(spec.srcB.isAddr) { opUop.srcBReg := (U(8, 5 bits) + op(11 downto 9).asUInt).resized }
+          .otherwise { opUop.srcBReg := op(11 downto 9).asUInt.resize(5) }
+        opUop.srcBValid := True
       }
       is(OperandKind.EASRC) {
-        when(srcEa.klass === EaClass.IMM) { uop.useImm := True; uop.imm := srcEa.imm }
-          .otherwise { uop.srcBReg := srcEa.reg; uop.srcBValid := True }
+        when(srcEa.klass === EaClass.IMM) { opUop.useImm := True; opUop.imm := srcEa.imm }
+          .elsewhen(srcIsMem) { opUop.srcBReg := U(T0, 5 bits); opUop.srcBValid := True }
+          .otherwise { opUop.srcBReg := srcEa.reg; opUop.srcBValid := True }
       }
-      is(OperandKind.EADST) { uop.srcBReg := dstEa.reg; uop.srcBValid := True }
-      is(OperandKind.IMMQ)  { uop.useImm := True; uop.imm := op(7 downto 0).asSInt.resize(32).asBits }
+      is(OperandKind.EADST) { opUop.srcBReg := dstEa.reg; opUop.srcBValid := True }
+      is(OperandKind.IMMQ)  { opUop.useImm := True; opUop.imm := op(7 downto 0).asSInt.resize(32).asBits }
       default {}
     }
 
     // --- dst slot ---
     switch(spec.dst.kind) {
       is(OperandKind.REGFIELD) {
-        when(spec.dst.isAddr) { uop.dstReg := (U(8, 5 bits) + op(11 downto 9).asUInt).resized }
-          .otherwise { uop.dstReg := op(11 downto 9).asUInt.resize(5) }
-        uop.dstValid := True
+        when(spec.dst.isAddr) { opUop.dstReg := (U(8, 5 bits) + op(11 downto 9).asUInt).resized }
+          .otherwise { opUop.dstReg := op(11 downto 9).asUInt.resize(5) }
+        opUop.dstValid := True
       }
       is(OperandKind.EASRC) {
-        when(srcEa.klass =/= EaClass.IMM) { uop.dstReg := srcEa.reg; uop.dstValid := True }
+        when(srcEa.klass =/= EaClass.IMM) {
+          when(srcIsMem) { opUop.dstReg := U(T0, 5 bits) } .otherwise { opUop.dstReg := srcEa.reg }
+          opUop.dstValid := True
+        }
       }
-      is(OperandKind.EADST) { uop.dstReg := dstEa.reg; uop.dstValid := True }
+      is(OperandKind.EADST) { opUop.dstReg := dstEa.reg; opUop.dstValid := True }
       default {}
     }
-    when(spec.dst.kind =/= OperandKind.NONE && spec.dstWrites) { uop.dstValid := True }
-    when(spec.dst.kind =/= OperandKind.NONE && !spec.dstWrites) { uop.dstValid := False } // CMP/CMPA
+    when(spec.dst.kind =/= OperandKind.NONE && spec.dstWrites) { opUop.dstValid := True }
+    when(spec.dst.kind =/= OperandKind.NONE && !spec.dstWrites) { opUop.dstValid := False } // CMP/CMPA
 
     // MOVE: NZVC only if the destination EA is a data register.
-    when(spec.writesNzvcIfDataDst) { uop.writesNzvc := (dstEa.klass === EaClass.DATAREG) }
+    when(spec.writesNzvcIfDataDst) { opUop.writesNzvc := (dstEa.klass === EaClass.DATAREG) }
 
     // Branch displacement (byte / word / long), reproducing the simple-decode rule.
     when(spec.isBranch) {
       val disp8 = op(7 downto 0)
-      when(disp8 === 0x00) { uop.branchDisp := pkt.words(1).asSInt.resize(32).asBits }
-        .elsewhen(disp8 === M"11111111") { uop.branchDisp := pkt.words(1) ## pkt.words(2) }
-        .otherwise { uop.branchDisp := disp8.asSInt.resize(32).asBits }
+      when(disp8 === 0x00) { opUop.branchDisp := pkt.words(1).asSInt.resize(32).asBits }
+        .elsewhen(disp8 === M"11111111") { opUop.branchDisp := pkt.words(1) ## pkt.words(2) }
+        .otherwise { opUop.branchDisp := disp8.asSInt.resize(32).asBits }
     }
 
-    // ---- unimplemented gating ----
-    when(!pkt.simple || spec.illegal ||
-         (usesSrcEa && !srcEaOk) || (usesDstEa && !dstEaOk)) {
-      uop.op            := DecOp.ILLEGAL
-      uop.unimplemented := True
-      uop.dstValid := False; uop.srcAValid := False; uop.srcBValid := False
-      uop.writesNzvc := False; uop.writesX := False; uop.isBranch := False
+    // ── ldUop = the LOAD (used only when crackLoad) ────────────────────────────
+    // Address = base An (psrcA) + disp(imm); for (d16,PC) the PC is folded into the
+    // absolute disp (base=0). dst = T0.
+    val ldUop = DecodedUop()
+    ldUop.valid         := pkt.valid
+    ldUop.pc            := pkt.pc
+    ldUop.op            := DecOp.MOVE
+    ldUop.cluster       := Cluster.LS
+    ldUop.size          := spec.size
+    ldUop.memOp         := MemOp.LOAD
+    ldUop.srcAReg       := srcEa.base; ldUop.srcAValid := srcEa.baseValid
+    ldUop.srcBReg       := 0;          ldUop.srcBValid := False
+    ldUop.dstReg        := U(T0, 5 bits); ldUop.dstValid := True
+    ldUop.useImm        := True
+    val pcRelAddr = (pkt.pc + U(2, 32 bits) + srcEa.disp.asUInt).asBits
+    ldUop.imm           := Mux(srcEa.pcRel, pcRelAddr, srcEa.disp)
+    ldUop.readsNzvc     := False; ldUop.readsX := False
+    ldUop.writesNzvc    := False; ldUop.writesX := False
+    ldUop.isBranch      := False; ldUop.cond := 0
+    ldUop.branchDisp    := 0
+    ldUop.unimplemented := False
+
+    // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
+    // Defer: non-simple, illegal op, a USED src EA that is neither reg/imm nor a
+    // crackable memSimple, or a USED dst EA that is not a register (memSimple store
+    // is Task 4; until then it stays unimplemented). `bad` also disables cracking.
+    val bad = !pkt.simple || spec.illegal || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstEaOk)
+    when(bad) {
+      opUop.op            := DecOp.ILLEGAL
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.unimplemented := True
+      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
+      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
     }
-    uop
+
+    // ── Sequence selection (each slot driven exactly once) ─────────────────────
+    // crackLoad & !bad -> [load, op] (count 2); else -> [op] (count 1, op carries
+    // the illegal override when bad).
+    when(crackLoad && !bad) {
+      out.count   := 2
+      out.uops(0) := ldUop
+      out.uops(1) := opUop
+    } otherwise {
+      out.count   := 1
+      out.uops(0) := opUop
+      out.uops(1) := opUop
+    }
+    out
   }
 }
