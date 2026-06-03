@@ -2,7 +2,7 @@ package m68k040.lockstep
 
 import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
-import m68k040.mmu.{IdentityTranslationPlugin, DIdentityTranslationPlugin}
+import m68k040.mmu.{IdentityTranslationPlugin, DtlbPlugin}
 import m68k040.cache.{IcachePlugin, DcachePlugin}
 import m68k040.frontend.FetchAlignPlugin
 import m68k040.decode.DecodeStage
@@ -76,6 +76,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       lsEu.sqCommit.payload := rob.logic.h0
       lsEu.sqFlush          := host[RedirectService].doFlush
 
+      // ── DTLB U/M deferred-write queue wiring (mirrors top/FullCoreSynth) ──
+      val dtlb = host[m68k040.mmu.DtlbPlugin]
+      dtlb.umAccessRobId := lsEu.xlateRobId
+      dtlb.umCommitValid := rob.logic.retire0
+      dtlb.umCommitId    := rob.logic.h0
+      dtlb.umFlush       := host[RedirectService].doFlush
+
       // ── Commit-time mispredict redirect fan-out (registered doFlush pulse) ──
       val doFlush = host[RedirectService].doFlush
       val flushPc = host[RedirectService].flushPc
@@ -95,6 +102,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   class FullCoreDut extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
+    val dtlb   = new DtlbPlugin
     val icache = new IcachePlugin
     val dcache = new DcachePlugin
     val fa     = new FetchAlignPlugin
@@ -114,7 +122,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
       new IdentityTranslationPlugin,
-      new DIdentityTranslationPlugin,
+      dtlb,
       icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu,
       rfInt, rfNzvc, rfX, wire)) }
   }
@@ -153,8 +161,28 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     * explicitly: a taken branch skips/loops, so the executed count differs from the
     * source line count. The oracle (Musashi traces actual execution) and the DUT
     * commit stream are both bounded to the first `nInstr` records. */
+  // --- MMU (directed non-identity) lock-step config ---
+  // Musashi exposes no 040-MMU config, so for the MMU-enabled lock-step we run the
+  // SAME program (register stream still lock-steps vs Musashi — data round-trips
+  // store->load regardless of the physical address) and additionally assert the
+  // store landed at the DIRECTLY-COMPUTED translated PA (directed, documented). The
+  // map is (dataPageVA -> PPN): VA[31:12]==(dataPageVA>>12) maps to PPN.
+  val MMU_ROOT = 0x00080000L
+  val MMU_PTRT = 0x00081000L
+  val MMU_PAGT = 0x00082000L
+  def buildMmuTable(mem: m68k040.ls.BehavioralMemAgent, dataPageVA: Long, ppn: Long): Unit = {
+    def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) mem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+    val rootIdx = ((dataPageVA >> 25) & 0x7f).toInt
+    val ptrIdx  = ((dataPageVA >> 18) & 0x7f).toInt
+    val pageIdx = ((dataPageVA >> 12) & 0x3f).toInt
+    pokeWordLE(MMU_ROOT + rootIdx * 4, (MMU_PTRT & 0xfffffff0L) | 0x3L)
+    pokeWordLE(MMU_PTRT + ptrIdx * 4,  (MMU_PAGT & 0xfffffff0L) | 0x3L)
+    // page descriptor: PDT resident, no WP/super; PPN = non-identity
+    pokeWordLE(MMU_PAGT + pageIdx * 4, ((ppn << 12) & 0xfffff000L) | 0x1L)
+  }
+
   def runLockStep(name: String, src: String, nInstr: Int = -1, checkMem: Seq[Long] = Seq.empty,
-                  checkSpan: Int = 4): Unit = {
+                  checkSpan: Int = 4, mmuMap: Option[(Long, Long)] = None): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
 
     // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel.
@@ -253,6 +281,19 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Attach a behavioral read/write memory to the D-cache AXI (separate image,
       // zeroed; the programs store before they load, so no data preload needed).
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      // Attach a behavioral memory to the DTLB walker AXI (the page table lives here
+      // when the MMU is enabled; idle for MMU-disabled programs). MMU disabled by
+      // default -> identity passthrough, so existing programs are unchanged.
+      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      mmuMap match {
+        case Some((dataPageVA, ppn)) =>
+          buildMmuTable(ptmem, dataPageVA, ppn)
+          dut.dtlb.logic.mmuEnable #= true
+          dut.dtlb.logic.rootPtr   #= MMU_ROOT
+        case None =>
+          dut.dtlb.logic.mmuEnable #= false
+          dut.dtlb.logic.rootPtr   #= 0
+      }
 
       // Idle the frontend; consumer-driven ready ports default high downstream.
       dut.fa.logic.redirect.valid #= false
@@ -299,11 +340,18 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // then compare the program's DATA bytes against the DUT's D-cache memory.
       if (checkMem.nonEmpty) {
         cd.waitSampling(200)
+        // Under an enabled MMU the store lands at the TRANSLATED PA. Translate each
+        // checked VA byte = (PPN << 12) | (VA & 0xfff) (directed; the page maps the
+        // whole data page). MMU-disabled -> identity (PA == VA), unchanged.
+        def pa(va: Long): Long = mmuMap match {
+          case Some((_, ppn)) => (ppn << 12) | (va & 0xfffL)
+          case None           => va
+        }
         for (addr <- checkAddrs) {
           val expected = oracleMem.getOrElse(addr, 0) & 0xff
-          val got = dmem.peekByte(addr)
+          val got = dmem.peekByte(pa(addr))
           assert(got == expected,
-            f"[$name] memory mismatch at 0x$addr%08x: dut=0x$got%02x oracle=0x$expected%02x")
+            f"[$name] memory mismatch at VA 0x$addr%08x (PA 0x${pa(addr)}%08x): dut=0x$got%02x oracle=0x$expected%02x")
         }
       }
     }
@@ -479,5 +527,78 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l #0x11223344,%d0 ; move.l %d0,0x2010 ; " +
       "move.l #0x12345678,%d2 ; move.l %d2,0x200E ; move.l 0x2010,%d1",
       checkMem = Seq(0x200EL, 0x2010L))
+  }
+
+  // ── MMU-enabled (translated, non-identity PA) lock-step ────────────────────
+  // The MMU is enabled with a page table mapping the data page (VA 0x2000 ->
+  // PPN 0x42, i.e. PA 0x42000). The register commit stream still lock-steps vs
+  // Musashi (store->load round-trips the value regardless of PA), and the store is
+  // additionally asserted to land at the DIRECTLY-COMPUTED translated PA (Musashi
+  // exposes no 040-MMU config, so this is directed-non-identity). The first data
+  // access TLB-misses -> the hardware walker fills -> subsequent accesses hit.
+
+  test("lock-step MMU: store then load-back at translated PA", VerilatorTest) {
+    // moveq #42,%d0 ; store D0->VA 0x2000 ; load VA 0x2000 -> D1 (== 42).
+    // VA 0x2000 -> PA 0x42000; the store must land at PA 0x42000.
+    runLockStep("mmu-st-ld",
+      "moveq #42,%d0 ; move.l %d0,0x2000 ; move.l 0x2000,%d1",
+      checkMem = Seq(0x2000L), mmuMap = Some((0x2000L, 0x42L)))
+  }
+
+  test("lock-step MMU: load -> ALU -> store at translated PA (M bit set at commit)", VerilatorTest) {
+    // moveq #5,%d0 ; store 5->VA0x2000 ; load VA0x2000->D1 ; add D1,D1 -> 10 ;
+    // store D1->VA0x2004. Both stores translate to PA 0x42000/0x42004; the write
+    // access also queues an M-bit descriptor write drained at commit.
+    runLockStep("mmu-ld-alu-st",
+      "moveq #5,%d0 ; move.l %d0,0x2000 ; move.l 0x2000,%d1 ; add.l %d1,%d1 ; move.l %d1,0x2004",
+      checkMem = Seq(0x2000L, 0x2004L), mmuMap = Some((0x2000L, 0x42L)))
+  }
+
+  // ── MMU fault-flag test (non-resident page -> rsp.fault FLAGGED, not delivered) ─
+  test("MMU fault: load to a non-resident page flags rsp.fault (no delivery)", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    // A program that stores then loads VA 0x2000. The page is left NON-RESIDENT in
+    // the table, so the data access faults -> the DTLB flags rsp.fault. We assert
+    // the flag (delivery is a later slice), not the register stream.
+    val src = "moveq #42,%d0 ; move.l %d0,0x2000 ; move.l 0x2000,%d1"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"assemble failed: ${err.reason}")
+    }
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      // Build a table whose root/pointer are resident but the PAGE descriptor is
+      // NON-RESIDENT (PDT=00) for the data page VA 0x2000.
+      def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) ptmem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+      val va = 0x2000L
+      val rootIdx = ((va >> 25) & 0x7f).toInt; val ptrIdx = ((va >> 18) & 0x7f).toInt; val pageIdx = ((va >> 12) & 0x3f).toInt
+      pokeWordLE(MMU_ROOT + rootIdx * 4, (MMU_PTRT & 0xfffffff0L) | 0x3L)
+      pokeWordLE(MMU_PTRT + ptrIdx * 4,  (MMU_PAGT & 0xfffffff0L) | 0x3L)
+      pokeWordLE(MMU_PAGT + pageIdx * 4, (0x42L << 12) & 0xfffff000L)   // PDT=00 -> non-resident
+      dut.dtlb.logic.mmuEnable #= true
+      dut.dtlb.logic.rootPtr   #= MMU_ROOT
+
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.fa.logic.redirect.valid   #= true
+      dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= false
+
+      // run a while; the data store/load to the non-resident page must flag a fault
+      var guard = 0
+      while (!dut.dtlb.logic.faultSeen.toBoolean && guard < 2000) { cd.waitSampling(); guard += 1 }
+      assert(dut.dtlb.logic.faultSeen.toBoolean,
+        "a data access to a non-resident page must flag DTLB rsp.fault (flagged, not delivered)")
+    }
   }
 }

@@ -42,8 +42,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // ---- resolve TranslationService ----
     val xlate = host[TranslationService]
     val activePc = UInt(32 bits)
+    xlate.req.valid      := True
     xlate.req.vpn        := activePc(31 downto 12)
     xlate.req.supervisor := False
+    xlate.req.write      := False
 
     // ---- storage arrays ----
     // Tags + pred: async-read LUTRAM (single write port -> distributed RAM). Kept

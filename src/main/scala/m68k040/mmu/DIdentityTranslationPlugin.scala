@@ -16,6 +16,7 @@ class DIdentityTranslationPlugin extends FiberPlugin with DTranslationService {
   override def rsp: TranslationRsp = _rsp
 
   val logic = during build new Area {
+    _rsp.ready     := True
     _rsp.ppn       := _req.vpn
     _rsp.cacheMode := CacheMode.CACHEABLE
     _rsp.fault     := False

@@ -44,12 +44,15 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val storeAckReg = Bool()
     val axi         = master(Axi4(axiCfg))
 
-    // ---- translation (load path only; D-side TLB) ----
+    // ---- translation (D-side TLB) ----
+    // The LS EU is the translate-at-execute requester: it DRIVES `xlate.req` (the
+    // access VPN, write?, supervisor?) — for both loads (presented on loadCmd) and
+    // stores (SQ-alloc paddr). The cache only READS `xlate.rsp`: it forms the load
+    // hit-tag from `rsp.ppn` (consistent because the LS EU drives req.vpn from the
+    // same vaddr it puts on loadCmd) and gates load acceptance on `rsp.ready` (a
+    // DTLB miss holds it low while the walker runs -> the load is not accepted and
+    // the LS EU stalls on its existing single-outstanding back-pressure path).
     val xlate = host[DTranslationService]
-    val xlateVpn = UInt(20 bits)
-    xlate.req.vpn        := xlateVpn
-    xlate.req.supervisor := False
-    xlateVpn := loadCmdPort.payload.vaddr(31 downto 12)
 
     // ---- storage ----
     val dataMem = Seq.fill(ways)(Mem(Bits(128 bits), sets))
@@ -204,7 +207,11 @@ class DcachePlugin extends FiberPlugin with DcacheService {
 
       IDLE.whenIsActive {
         busy := False
-        loadCmdPort.ready := !inFlight
+        // Accept a load only when translation is RESOLVED this cycle (TLB hit or
+        // identity). On a DTLB miss `rsp.ready` is False while the walker runs, so
+        // the load is not accepted and the LS EU stays on its existing single-
+        // outstanding back-pressure path (re-driving loadCmd.valid) until it hits.
+        loadCmdPort.ready := !inFlight && xlate.rsp.ready
         when(loadCmdPort.fire) {
           when(isHit) {
             rdSet   := cmdSet
@@ -230,7 +237,6 @@ class DcachePlugin extends FiberPlugin with DcacheService {
 
       REFILL.whenIsActive {
         busy := True
-        xlateVpn := missVaddr(31 downto 12)
         val lineBase = (missVaddr(31 downto offBits) ## U(0, offBits bits)).asUInt
         when(!arSent) {
           axi.ar.valid         := True

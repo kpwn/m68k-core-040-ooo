@@ -23,6 +23,9 @@ trait LsEuService {
   // completes and its data is in the PRF. Registered alongside the completion stage
   // so consumers do not have to reach into the (now-pipelined) internal s1 context.
   def wakeup: Flow[UInt]       // pdst of a completing load (valid only when it writes a reg)
+  // robId of the access currently being translated (tags a DTLB walk's deferred U/M
+  // descriptor write so it drains at THAT instruction's commit).
+  def xlateRobId: UInt
 }
 
 /** AGU + Load/Store EU (LS-1 slice): conservative single-outstanding pipe.
@@ -52,6 +55,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   override def sqCommit: Flow[UInt]     = sqCommitPort
   override def sqFlush: Bool            = sqFlushSig
   override def wakeup: Flow[UInt]       = wakeupPort
+  var xlateRobIdSig: UInt = null
+  override def xlateRobId: UInt         = xlateRobIdSig
 
   during setup {
     issuePort      = Stream(IqContext())
@@ -59,6 +64,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sqCommitPort   = Flow(UInt(6 bits))
     sqFlushSig     = Bool()
     wakeupPort     = Flow(UInt(6 bits))
+    xlateRobIdSig  = UInt(6 bits)
     val irf = host[IntRegFileService]
     rdBase = irf.newRead()
     rdData = irf.newRead()
@@ -126,11 +132,17 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     s1CrossLine.simPublic(); s1CrossPage.simPublic(); s1TwoAccess.simPublic(); s1AddrB.simPublic()
     val u1 = s1Ctx.uop
 
-    // Translation is driven by the D-cache from loadCmd.payload.vaddr (which we
-    // set to s1Va unconditionally below), so we just consume xlate.rsp here for
-    // the physical address used by the SQ query/alloc. (Single TranslationService:
-    // the cache owns the request port; we read the response.)
+    // ---- translate-at-execute: the LS EU DRIVES the D-side translation port ----
+    // It presents the access VPN (loadVaddr, which the FSM sets to s1Va for slot A
+    // or s1AddrB for slot B), the access class (write?=store, supervisor?), and
+    // `valid` (a real demand). The D-cache READS the response (rsp.ppn for its load
+    // hit-tag, rsp.ready to gate load acceptance). On a DTLB miss `rsp.ready` is
+    // False while the walker runs; the LS EU stalls (does NOT alloc a store / does
+    // NOT accept the load) on its existing single-outstanding path until ready.
+    // (req drivers are set after loadVaddr is declared, below.)
     val s1Paddr = (xlate.rsp.ppn ## s1Va(11 downto 0)).asUInt
+    val xlateReady = xlate.rsp.ready    // False on an enabled-MMU TLB miss (walking)
+    val xlateFault = xlate.rsp.fault
 
     // ---- dcache load cmd defaults ----
     // The FSM selects the access address: slot A = s1Va, slot B = s1AddrB (the
@@ -182,6 +194,18 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
 
     val isLoad  = u1.memOp === MemOp.LOAD
     val isStore = u1.memOp === MemOp.STORE
+
+    // ---- drive the D-side translation request (translate-at-execute) ----
+    // VPN = the access address the EU is currently presenting (loadVaddr tracks
+    // s1Va for slot A / s1AddrB for slot B). `valid` asserts whenever a memory µop
+    // is resident in S1 (a real translation demand -> the DTLB may walk on a miss).
+    // `write` selects the store M-bit / write-protect check. supervisor=False (user
+    // accesses this slice; MOVEC/SR-source deferred).
+    xlate.req.valid      := s1Valid && (isLoad || isStore)
+    xlate.req.vpn        := loadVaddr(31 downto 12)
+    xlate.req.supervisor := False
+    xlate.req.write      := isStore
+    xlateRobIdSig        := s1Ctx.robId
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax: registered COMPLETION + WRITEBACK stage.
@@ -299,19 +323,38 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
         busy := False
         when(s1Valid) {
           when(isStore) {
-            // allocate into the SQ; "executes" immediately (no int dst). Store
-            // completion drives a CONSTANT compData (off the SQ-compare arc), so it
-            // captures here directly without the extra resolve cycle.
-            sq.io.alloc.valid := True
-            captureCompletion(B(0, 32 bits))
+            // Translate-at-execute: a store's paddr (s1Paddr) comes from the DTLB.
+            // Only alloc once translation is RESOLVED (TLB hit / identity); on a
+            // DTLB miss `xlateReady` is False while the walker runs -> hold S1
+            // (busy) and retry next cycle (the existing single-outstanding stall).
+            when(xlateReady) {
+              // allocate into the SQ; "executes" immediately (no int dst). Store
+              // completion drives a CONSTANT compData (off the SQ-compare arc), so it
+              // captures here directly without the extra resolve cycle.
+              sq.io.alloc.valid := True
+              captureCompletion(B(0, 32 bits))
+            } otherwise {
+              // DTLB walking: hold THIS store in S1 and retry. `busy` alone is not
+              // enough (the S0->S1 advance reads the pre-update busy and would clear
+              // s1Valid this cycle), so re-assert s1Valid explicitly (later write wins).
+              busy := True
+              s1Valid := True
+            }
           } elsewhen(isLoad) {
-            // Capture the SQ-forward compare result into registers; resolve next
-            // cycle. Hold s1 (busy) so the SQ query stays stable into RESOLVE.
-            fwdHit   := sq.io.fwd.rsp.hit
-            fwdStall := sq.io.fwd.rsp.stall
-            fwdData  := sq.io.fwd.rsp.data
-            busy := True
-            goto(RESOLVE)
+            // Only proceed once translation is resolved (s1Paddr feeds the SQ fwd
+            // query). On a DTLB miss hold S1 (busy) and retry; otherwise capture the
+            // SQ-forward compare result and resolve next cycle.
+            when(xlateReady) {
+              fwdHit   := sq.io.fwd.rsp.hit
+              fwdStall := sq.io.fwd.rsp.stall
+              fwdData  := sq.io.fwd.rsp.data
+              goto(RESOLVE)
+            } otherwise {
+              // DTLB walking: hold THIS load in S1 (s1Valid would otherwise be
+              // cleared by the pre-update-busy S0->S1 advance) and retry.
+              s1Valid := True
+            }
+            busy := True   // hold s1 (busy) so the SQ query stays stable into RESOLVE
           } otherwise {
             captureCompletion(B(0, 32 bits))   // non-memory (defensive)
           }

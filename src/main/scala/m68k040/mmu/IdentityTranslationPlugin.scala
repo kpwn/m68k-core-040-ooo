@@ -17,7 +17,9 @@ class IdentityTranslationPlugin extends FiberPlugin with TranslationService {
   override def rsp: TranslationRsp = _rsp
 
   val logic = during build new Area {
-    // Identity: physical page == virtual page, always cacheable, never fault.
+    // Identity: physical page == virtual page, always cacheable, never fault,
+    // always resolved this cycle (no walk).
+    _rsp.ready     := True
     _rsp.ppn       := _req.vpn
     _rsp.cacheMode := CacheMode.CACHEABLE
     _rsp.fault     := False

@@ -27,14 +27,24 @@ case class FetchRsp() extends Bundle {
   val pred  = Vec(ChunkPredecode(), 4)   // predecode for the 4 words of the returned window
 }
 
-/** Translation request (virtual page number). */
+/** Translation request (virtual page number).
+  *  - `valid` : a real translation demand this cycle (a DTLB may start a table
+  *    walk only when valid; the identity stub ignores it). Default-driven for
+  *    back-compat: an undriven consumer leaves it False (no walk).
+  *  - `write` : the access is a store (selects the M-bit / write-protect check). */
 case class TranslationReq() extends Bundle {
+  val valid      = Bool()
   val vpn        = UInt(20 bits)   // addr[31:12]
   val supervisor = Bool()
+  val write      = Bool()
 }
 
-/** Translation response (physical page number + cache mode). */
+/** Translation response (physical page number + cache mode).
+  *  - `ready` : the translation is resolved THIS cycle (a TLB hit, or identity).
+  *    On a DTLB miss it is False while the walker runs, so the consumer (D-cache)
+  *    must NOT accept the access — it stalls on its existing back-pressure path. */
 case class TranslationRsp() extends Bundle {
+  val ready     = Bool()
   val ppn       = UInt(20 bits)
   val cacheMode = CacheMode()
   val fault     = Bool()
