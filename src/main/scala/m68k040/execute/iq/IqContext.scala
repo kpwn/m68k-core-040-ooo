@@ -12,6 +12,9 @@ case class IqContext() extends Bundle {
 trait IssueQueueService {
   def push: Stream[Vec[IqContext]]   // length 2
   def pushSlot1Valid: Bool
-  def issue: Vec[Stream[IqContext]]  // length 2 (two ALU ports)
+  def issue: Vec[Stream[IqContext]]  // length 4 (ALU0, ALU1, branch, LS)
   def flushPort: Bool
+  /** Dynamic-completion wakeup (variant A): the LS EU broadcasts the pdst of a
+    * just-completed load; slots reading that physreg become ready. */
+  def lsWakeup: Flow[UInt]
 }

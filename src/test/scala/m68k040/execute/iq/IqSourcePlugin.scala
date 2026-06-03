@@ -19,6 +19,8 @@ class IqSourcePlugin extends FiberPlugin {
     // Per-slot driving signals (k = 0, 1).
     case class SlotIo() {
       val robId      = in UInt (6 bits)
+      val cluster    = in(m68k040.isa.Cluster())
+      val memOp      = in(m68k040.isa.MemOp())
       val pdst       = in UInt (6 bits); val pdstValid  = in Bool ()
       val psrcA      = in UInt (6 bits); val psrcAValid = in Bool ()
       val psrcB      = in UInt (6 bits); val psrcBValid = in Bool ()
@@ -39,7 +41,8 @@ class IqSourcePlugin extends FiberPlugin {
       u.valid        := True
       u.pc           := 0
       u.op      := m68k040.decode.DecOp.MOVE
-      u.cluster := m68k040.isa.Cluster.INT
+      u.cluster := io.cluster
+      u.memOp   := io.memOp
       u.size    := m68k040.isa.Size.LONG
       u.imm          := 0
       u.isBranch     := False
@@ -68,5 +71,10 @@ class IqSourcePlugin extends FiberPlugin {
     iq.push.payload(0)  := mkSlot(s0)
     iq.push.payload(1)  := mkSlot(s1)
     pushReady           := iq.push.ready
+
+    // Dynamic LS wakeup (sim-driven; overrides the IQ's idle default).
+    val lsWakeupValid = in Bool (); val lsWakeupPdst = in UInt (6 bits)
+    iq.lsWakeup.valid   := lsWakeupValid
+    iq.lsWakeup.payload := lsWakeupPdst
   }
 }

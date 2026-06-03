@@ -2,6 +2,7 @@ package m68k040.execute.iq
 
 import m68k040.rename.RenamedUop
 import spinal.core._
+import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
 
@@ -26,21 +27,31 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
   var pushSlot1Port : Bool                   = null
   var issuePorts    : Vec[Stream[IqContext]] = null
   var flushSignal   : Bool                   = null
+  var lsWakeupPort  : Flow[UInt]             = null
 
   override def push: Stream[Vec[IqContext]]  = pushPort
   override def pushSlot1Valid: Bool          = pushSlot1Port
   override def issue: Vec[Stream[IqContext]] = issuePorts
   override def flushPort: Bool               = flushSignal
+  override def lsWakeup: Flow[UInt]          = lsWakeupPort
 
   during setup {
     pushPort      = Stream(Vec(IqContext(), wayCount))
     pushSlot1Port = Bool()
-    // 3 issue ports: 0,1 = ALU (class-filtered to non-branch), 2 = branch.
-    issuePorts    = Vec.fill(3)(Stream(IqContext()))
+    // 4 issue ports: 0,1 = ALU (non-branch, non-LS), 2 = branch, 3 = LS.
+    issuePorts    = Vec.fill(4)(Stream(IqContext()))
     flushSignal   = Bool()
+    lsWakeupPort  = Flow(UInt(6 bits))   // carries a completed-load pdst
   }
 
   val logic = during build new Area {
+    // Dynamic-wakeup input: default-driven idle (allowOverride) so the IQ
+    // elaborates standalone; the LS-EU wiring OVERRIDES it. Concrete zero payload
+    // (not assignDontCare) so a sim poke reaches the consumer.
+    lsWakeupPort.valid.allowOverride;   lsWakeupPort.valid   := False
+    lsWakeupPort.payload.allowOverride; lsWakeupPort.payload := U(0, 6 bits)
+    lsWakeupPort.simPublic()
+
     // ---- Slot array (priority = line*wayCount + way; 0 = oldest) ----
     val lines = for (line <- 0 until lineCount) yield new Area {
       val ways = for (way <- 0 until wayCount) yield new Area {
@@ -50,8 +61,12 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
         val selComb  = CombInit(sel)                   // sel after issue this cycle
         val triggers = Reg(Bits((priority + 1) bits)) init 0
         val context  = Reg(IqContext())
-        // Task 1: triggers always 0 -> ready == occupied.
-        val ready    = sel && (if (priority == 0) True else triggers(priority - 1 downto 0) === 0)
+        // Dynamic LS dependency: a source physreg produced by an in-flight LS load
+        // (lsBusy) holds the slot NOT-ready until lsWakeup clears it. Computed below
+        // (lsDep wire) after lsBusy is in scope; default False here.
+        val lsDep    = Bool()
+        // triggers==0 (static latency-1) AND no pending LS source -> ready.
+        val ready    = sel && (if (priority == 0) True else triggers(priority - 1 downto 0) === 0) && !lsDep
 
         when(fire) { selComb := False }
         sel := selComb
@@ -81,6 +96,24 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val sbInt  = new Scoreboard(48) // int physregs (width 6)
     val sbNzvc = new Scoreboard(16) // NZVC flag physregs (width 4)
     val sbX    = new Scoreboard(16) // X flag physregs (width 4)
+
+    // ---- Dynamic-completion (variant A) LS scoreboard ----
+    // lsBusy[p] => int physreg p is produced by an in-flight LS LOAD that has NOT
+    // yet completed. A consumer reading such a physreg is held NOT-ready until the
+    // LS EU broadcasts lsWakeup(p). This is SEPARATE from the static slot-trigger
+    // mechanism (which assumes latency-1): LS producers are tracked ONLY here, not
+    // in sbInt, so trigInit never sets a static (auto-clearing) trigger for them.
+    val lsBusy = Reg(Bits(48 bits)) init 0
+
+    // Drive each slot's lsDep from lsBusy + its source physregs.
+    for (slot <- slots) {
+      val u = slot.context.uop
+      slot.lsDep := (u.psrcAValid && lsBusy(u.psrcA)) ||
+                    (u.psrcBValid && !u.useImm && lsBusy(u.psrcB))
+    }
+
+    // LS class predicate: cluster == LS and a real memory op.
+    def isLs(u: RenamedUop): Bool = (u.cluster === m68k040.isa.Cluster.LS) && (u.memOp =/= m68k040.isa.MemOp.NONE)
 
     // ---- Occupancy / back-pressure ----
     // Back-pressure is gated on LINE 0 BEING EMPTY, not on a count proxy.
@@ -122,13 +155,16 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // ALU ports (0,1) select non-branch ready slots; branch port (2) selects
     // branch-class ready slots (class = context.uop.isBranch). The classes are
     // disjoint, so a slot is selected by at most one port.
-    val aluReady = B(slots.map(s => s.ready && !s.context.uop.isBranch))
+    // Classes are disjoint: ALU = non-branch & non-LS; branch = isBranch; LS = isLs.
+    val aluReady = B(slots.map(s => s.ready && !s.context.uop.isBranch && !isLs(s.context.uop)))
     val brReady  = B(slots.map(s => s.ready &&  s.context.uop.isBranch))
+    val lsReady  = B(slots.map(s => s.ready &&  isLs(s.context.uop)))
     val contexts = Vec(slots.map(_.context))
 
     val oh0 = OHMasking.first(aluReady)
     val oh1 = OHMasking.first(aluReady & ~oh0)
     val ohB = OHMasking.first(brReady)
+    val ohL = OHMasking.first(lsReady)
 
     // Suppress ALL issue on a flush cycle. flushSignal (= the ROB's registered
     // doFlush pulse, or a test flush) clears every slot's `sel` for NEXT cycle, but
@@ -143,12 +179,15 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     issuePorts(1).payload := MuxOH(oh1, contexts)
     issuePorts(2).valid   := ohB.orR && !flushSignal
     issuePorts(2).payload := MuxOH(ohB, contexts)
+    issuePorts(3).valid   := ohL.orR && !flushSignal
+    issuePorts(3).payload := MuxOH(ohL, contexts)
 
     // Free chosen slots when their issue port fires.
     for ((slot, i) <- slots.zipWithIndex) {
       slot.fire := (issuePorts(0).fire && oh0(i)) ||
                    (issuePorts(1).fire && oh1(i)) ||
-                   (issuePorts(2).fire && ohB(i))
+                   (issuePorts(2).fire && ohB(i)) ||
+                   (issuePorts(3).fire && ohL(i))
     }
 
     // ---- Static-latency-1 wakeup events ----
@@ -251,12 +290,22 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     }
     // On push, record each newly-pushed producer's dst -> its landing slot + busy.
     // (Written after the shift above so the fresh slot wins for that physreg.)
+    // An LS LOAD producer is tracked in lsBusy (dynamic wakeup), NOT sbInt (static
+    // latency-1). All other int producers go in sbInt as before.
+    val push0IsLs = isLs(pushUop0)
+    val push1IsLs = isLs(pushUop1)
     when(pushPort.fire) {
-      when(pushUop0.pdstValid)  { sbInt.busy(pushUop0.pdst)   := True; sbInt.physToSlot(pushUop0.pdst)   := slot0Prio }
+      when(pushUop0.pdstValid) {
+        when(push0IsLs) { lsBusy(pushUop0.pdst) := True }
+          .otherwise    { sbInt.busy(pushUop0.pdst) := True; sbInt.physToSlot(pushUop0.pdst) := slot0Prio }
+      }
       when(pushUop0.writesNzvc) { sbNzvc.busy(pushUop0.pNzvcDst) := True; sbNzvc.physToSlot(pushUop0.pNzvcDst) := slot0Prio }
       when(pushUop0.writesX)    { sbX.busy(pushUop0.pXDst)     := True; sbX.physToSlot(pushUop0.pXDst)     := slot0Prio }
       when(pushSlot1Port) {
-        when(pushUop1.pdstValid)  { sbInt.busy(pushUop1.pdst)   := True; sbInt.physToSlot(pushUop1.pdst)   := slot1Prio }
+        when(pushUop1.pdstValid) {
+          when(push1IsLs) { lsBusy(pushUop1.pdst) := True }
+            .otherwise    { sbInt.busy(pushUop1.pdst) := True; sbInt.physToSlot(pushUop1.pdst) := slot1Prio }
+        }
         when(pushUop1.writesNzvc) { sbNzvc.busy(pushUop1.pNzvcDst) := True; sbNzvc.physToSlot(pushUop1.pNzvcDst) := slot1Prio }
         when(pushUop1.writesX)    { sbX.busy(pushUop1.pXDst)     := True; sbX.physToSlot(pushUop1.pXDst)     := slot1Prio }
       }
@@ -270,6 +319,15 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
         when(ctx.uop.writesNzvc) { sbNzvc.busy(ctx.uop.pNzvcDst) := False }
         when(ctx.uop.writesX)    { sbX.busy(ctx.uop.pXDst)       := False }
       }
+    }
+
+    // ---- Dynamic LS wakeup: clear lsBusy for the completed load's pdst ----
+    // Placed AFTER the push-recording so a same-cycle re-allocation of that physreg
+    // (a new LS load pushed onto the just-freed pdst) wins (stays busy).
+    when(lsWakeupPort.valid) { lsBusy(lsWakeupPort.payload) := False }
+    when(pushPort.fire) {
+      when(pushUop0.pdstValid && push0IsLs) { lsBusy(pushUop0.pdst) := True }
+      when(pushSlot1Port && pushUop1.pdstValid && push1IsLs) { lsBusy(pushUop1.pdst) := True }
     }
 
     count := count + pushed - issued
@@ -289,6 +347,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       sbInt.busy  := 0
       sbNzvc.busy := 0
       sbX.busy    := 0
+      lsBusy      := 0
       // After flush line 0 is empty next cycle, so push.ready may re-assert.
       readyReg := True
     }
