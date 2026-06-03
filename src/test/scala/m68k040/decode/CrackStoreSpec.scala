@@ -35,7 +35,8 @@ class CrackStoreSpec extends AnyFunSuite {
       assert(dut.uop0.imm.toLong == 0, "store disp = 0 for (An)")
       assert(dut.uop0.srcBReg.toInt == 1 && dut.uop0.srcBValid.toBoolean, "store data = D1 (srcB)")
       assert(!dut.uop0.dstValid.toBoolean, "a store writes no int reg")
-      assert(!dut.uop0.writesNzvc.toBoolean, "MOVE to memory writes no NZVC")
+      assert(dut.uop0.writesNzvc.toBoolean, "MOVE to memory SETS NZVC (N/Z of the moved value)")
+      assert(!dut.uop0.writesX.toBoolean, "MOVE never writes X")
       assert(dut.uop0.size.toEnum == Size.LONG && !dut.uop0.unimplemented.toBoolean)
     }
   }

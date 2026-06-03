@@ -168,7 +168,11 @@ object MicroOpAssembler {
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
     // Address = dst base An (psrcA) + dst disp(imm); data = the MOVE source register
-    // (srcB). No int dst, no flags (MOVE to memory writes no NZVC).
+    // (srcB). No int dst. MOVE to memory DOES set NZVC from the moved value (N=sign,
+    // Z=value==0, V=0, C=0) — implementation (a): the STORE µop carries writesNzvc +
+    // a renamed NZVC dest; the LS EU computes N/Z of the store data at the access size
+    // and writes the NZVC PRF (+ bypass) at completion. (MOVEA — to an address reg —
+    // never reaches here: an address-reg dst is not memSimple.)
     val stUop = DecodedUop()
     stUop.valid         := pkt.valid
     stUop.pc            := pkt.pc
@@ -184,7 +188,7 @@ object MicroOpAssembler {
     val stPcRelAddr = (pkt.pc + U(2, 32 bits) + dstEa.disp.asUInt).asBits
     stUop.imm           := Mux(dstEa.pcRel, stPcRelAddr, dstEa.disp)
     stUop.readsNzvc     := False; stUop.readsX := False
-    stUop.writesNzvc    := False; stUop.writesX := False
+    stUop.writesNzvc    := True;  stUop.writesX := False   // MOVE to memory sets NZVC
     stUop.isBranch      := False; stUop.cond := 0
     stUop.branchDisp    := 0
     stUop.unimplemented := False
