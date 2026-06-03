@@ -40,18 +40,29 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // a cross-scope assignment when a consumer touches rsp before this plugin builds).
     _req = TranslationReq()
     _rsp = TranslationRsp()
+    // U/M queue hooks (sibling-driven; default-idle in logic via allowOverride so a
+    // standalone DUT that doesn't wire them still elaborates).
+    umAccessRobId = UInt(6 bits)
+    umCommitValid = Bool()
+    umCommitId    = UInt(6 bits)
+    umFlush       = Bool()
   }
 
   // control registers (test-poked; simPublic). RegInit so MMU-disabled is the
   // power-on default -> existing tests unchanged.
   var mmuEnableReg: Bool = null
   var rootPtrReg: UInt   = null
-  // exposed walk deferred-descriptor-write (consumed by the U/M queue in Task 4)
-  var umWriteValid: Bool = null
-  var umWriteAddr:  UInt = null
-  var umWriteByte:  Bits = null
-  // AXI port for the walker (full Axi4; write channels tied off). Surfaces as top
-  // IO so the testbench / synth top attaches the page-table memory.
+  // U/M deferred-write queue hooks (driven by the LS-cluster wiring):
+  //  - umAccessRobId : robId of the access currently being translated (tags a walk's
+  //    U/M write so it drains at THAT instruction's commit)
+  //  - umCommit      : ROB retired this robId (mark the queued U/M write committable)
+  //  - umFlush       : mispredict squash (discard speculative U/M writes)
+  var umAccessRobId: UInt = null
+  var umCommitValid: Bool = null
+  var umCommitId:    UInt = null
+  var umFlush:       Bool = null
+  // AXI port for the walker + U/M descriptor write drain (full Axi4). Surfaces as
+  // top IO so the testbench / synth top attaches the page-table memory.
   var walkerAxi: Axi4 = null
   def axiCfg: Axi4Config = Axi4Config(addressWidth = 32, dataWidth = 128, idWidth = 4)
 
@@ -61,9 +72,17 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     walkerAxi = master(Axi4(axiCfg)).setName("dtlbAxi")
     walkerAxi.ar << walker.io.axi.ar
     walkerAxi.r  >> walker.io.axi.r
+    // aw/w are driven by the U/M descriptor-write drain below (default idle).
     walkerAxi.aw.valid := False; walkerAxi.aw.payload.assignDontCare()
     walkerAxi.w.valid  := False; walkerAxi.w.payload.assignDontCare()
     walkerAxi.b.ready  := True
+
+    // U/M queue hooks: default-idle (allowOverride) so a standalone DUT elaborates;
+    // the LS-cluster wiring OVERRIDES them.
+    umAccessRobId.allowOverride; umAccessRobId := U(0, 6 bits)
+    umCommitValid.allowOverride; umCommitValid := False
+    umCommitId.allowOverride;    umCommitId    := U(0, 6 bits)
+    umFlush.allowOverride;       umFlush       := False
 
     val mmuEnable = RegInit(False); mmuEnable.simPublic()
     val rootPtr   = Reg(UInt(32 bits)) init 0; rootPtr.simPublic()
@@ -103,9 +122,11 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // VPN a walk is servicing: latched at walk-start so the fill/latch target the
     // right VPN even if _req.vpn changes while walking.
     val walkVpn = Reg(UInt(20 bits))
+    val walkRobId = Reg(UInt(6 bits))   // robId of the access that triggered the walk
     when(needWalk) {
       walker.io.start := True
-      walkVpn := _req.vpn
+      walkVpn   := _req.vpn
+      walkRobId := umAccessRobId
     }
 
     // On walk completion: latch the result and (if no fault) fill the TLB.
@@ -131,16 +152,65 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       }
     }
 
-    // ---- deferred U/M descriptor write (exposed; queued at Task 4) ----
-    val umVal = out Bool ()
-    val umAdr = out UInt (32 bits)
-    val umByt = out Bits (8 bits)
-    umVal := walker.io.done && walker.io.rsp.umWrite.valid
-    umAdr := walker.io.rsp.umWrite.addr
-    umByt := walker.io.rsp.umWrite.newByte
-    umWriteValid = umVal
-    umWriteAddr  = umAdr
-    umWriteByte  = umByt
+    // ---- deferred U/M descriptor-write queue (speculative; drained at commit) ----
+    // A non-faulting walk that needs to set U (and M on a write) pushes {robId, addr,
+    // newByte}; the entry drains at the triggering instruction's commit (RMW the
+    // descriptor byte over this same AXI bus) and is discarded on a flush. NOT
+    // performed speculatively.
+    val umq = new UmWriteQueue(4)
+    umq.io.alloc.valid          := walker.io.done && walker.io.rsp.umWrite.valid && !walker.io.rsp.fault
+    umq.io.alloc.payload.robId  := walkRobId
+    umq.io.alloc.payload.addr   := walker.io.rsp.umWrite.addr
+    umq.io.alloc.payload.newByte:= walker.io.rsp.umWrite.newByte
+    umq.io.commit.valid   := umCommitValid
+    umq.io.commit.payload := umCommitId
+    umq.io.flush          := umFlush
+
+    // ---- U/M drain: single-byte RMW over the DTLB AXI write channel ----
+    // The descriptor lives at a physical byte address; write just that byte (16-byte
+    // beat with a one-hot strobe at addr[3:0]). Single-outstanding: present aw+w,
+    // hold until both handshake, ack on b. The queue holds the entry until `drainAck`.
+    val drainAwDone = RegInit(True)
+    val drainWDone  = RegInit(True)
+    val drainByteOff = umq.io.drain.payload.addr(3 downto 0)
+    val drainBeat = Bits(128 bits)
+    val drainStrb = Bits(16 bits)
+    drainBeat := B(0, 128 bits)
+    drainStrb := B(0, 16 bits)
+    for (i <- 0 until 16) {
+      when(drainByteOff === U(i, 4 bits)) {
+        drainBeat(8 * i + 7 downto 8 * i) := umq.io.drain.payload.newByte
+        drainStrb(i) := True
+      }
+    }
+    val drainAddrReg = Reg(UInt(32 bits))
+    val drainBeatReg = Reg(Bits(128 bits))
+    val drainStrbReg = Reg(Bits(16 bits))
+    when(umq.io.drain.valid && drainAwDone && drainWDone) {
+      drainAddrReg := (umq.io.drain.payload.addr(31 downto 4) ## U(0, 4 bits)).asUInt
+      drainBeatReg := drainBeat
+      drainStrbReg := drainStrb
+      drainAwDone  := False
+      drainWDone   := False
+    }
+    when(!drainAwDone) {
+      walkerAxi.aw.valid        := True
+      walkerAxi.aw.payload.addr := drainAddrReg
+      walkerAxi.aw.payload.id   := U(3, 4 bits)
+      walkerAxi.aw.payload.len  := U(0, 8 bits)
+      walkerAxi.aw.payload.size := U(4, 3 bits)
+      walkerAxi.aw.payload.burst := spinal.lib.bus.amba4.axi.Axi4.burst.INCR
+      when(walkerAxi.aw.ready) { drainAwDone := True }
+    }
+    when(!drainWDone) {
+      walkerAxi.w.valid        := True
+      walkerAxi.w.payload.data := drainBeatReg
+      walkerAxi.w.payload.strb := drainStrbReg
+      walkerAxi.w.payload.last := True
+      when(walkerAxi.w.ready) { drainWDone := True }
+    }
+    // ack the queue once the write lands (b handshake). drainAck pops the entry.
+    umq.io.drainAck := walkerAxi.b.valid && walkerAxi.b.ready
 
     // ---- response mux ----
     // hit-class perm fault: a write to a write-protected page, or a user access to

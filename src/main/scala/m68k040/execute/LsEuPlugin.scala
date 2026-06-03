@@ -23,6 +23,9 @@ trait LsEuService {
   // completes and its data is in the PRF. Registered alongside the completion stage
   // so consumers do not have to reach into the (now-pipelined) internal s1 context.
   def wakeup: Flow[UInt]       // pdst of a completing load (valid only when it writes a reg)
+  // robId of the access currently being translated (tags a DTLB walk's deferred U/M
+  // descriptor write so it drains at THAT instruction's commit).
+  def xlateRobId: UInt
 }
 
 /** AGU + Load/Store EU (LS-1 slice): conservative single-outstanding pipe.
@@ -52,6 +55,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   override def sqCommit: Flow[UInt]     = sqCommitPort
   override def sqFlush: Bool            = sqFlushSig
   override def wakeup: Flow[UInt]       = wakeupPort
+  var xlateRobIdSig: UInt = null
+  override def xlateRobId: UInt         = xlateRobIdSig
 
   during setup {
     issuePort      = Stream(IqContext())
@@ -59,6 +64,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sqCommitPort   = Flow(UInt(6 bits))
     sqFlushSig     = Bool()
     wakeupPort     = Flow(UInt(6 bits))
+    xlateRobIdSig  = UInt(6 bits)
     val irf = host[IntRegFileService]
     rdBase = irf.newRead()
     rdData = irf.newRead()
@@ -199,6 +205,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     xlate.req.vpn        := loadVaddr(31 downto 12)
     xlate.req.supervisor := False
     xlate.req.write      := isStore
+    xlateRobIdSig        := s1Ctx.robId
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax: registered COMPLETION + WRITEBACK stage.

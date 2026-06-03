@@ -76,6 +76,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       lsEu.sqCommit.payload := rob.logic.h0
       lsEu.sqFlush          := host[RedirectService].doFlush
 
+      // ── DTLB U/M deferred-write queue wiring (mirrors top/FullCoreSynth) ──
+      val dtlb = host[m68k040.mmu.DtlbPlugin]
+      dtlb.umAccessRobId := lsEu.xlateRobId
+      dtlb.umCommitValid := rob.logic.retire0
+      dtlb.umCommitId    := rob.logic.h0
+      dtlb.umFlush       := host[RedirectService].doFlush
+
       // ── Commit-time mispredict redirect fan-out (registered doFlush pulse) ──
       val doFlush = host[RedirectService].doFlush
       val flushPc = host[RedirectService].flushPc
