@@ -142,6 +142,32 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val compIsLoad    = RegInit(False)   // load (writes a reg + wakes) vs store
     val compDstArch   = Reg(UInt(5 bits))
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // FMax #2: PIPELINE the SQ-forward query result -> completion decision.
+    //
+    // The 8-entry SQ overlap-compare + youngest-full-overlap `best` reduce off
+    // `s1Paddr` (== s1Va_reg -> xlate -> paddr) feeding compData/compValid in the
+    // SAME cycle was the 17-level, 70%-route critical path (s1Va_reg ->
+    // SQ-compare -> compData_reg/CE). We REGISTER the SQ forward response
+    // (hit/data/stall) for a load in the decision cycle, and DRIVE the completion
+    // capture from those registers the NEXT cycle (a RESOLVE state). This splits
+    //   s1Va_reg -> s1Paddr -> SQ-fwd-compare -> fwd* reg          (short)
+    //   fwd* reg -> captureCompletion -> compData_reg              (short, 1 mux)
+    // at the cost of ONE extra load-latency cycle (lock-step is latency-agnostic).
+    //
+    // SAFE under single-outstanding (issue.ready := !busy && !s1Valid &&
+    // !compValid): at most one LS µop is ever in the forward/resolve stages, and
+    // the s1 context (hence the SQ query) is held stable across the registered
+    // query and its RESOLVE use (busy holds s1Valid; no concurrent store-alloc in
+    // this pipe; a draining entry is held-resident-until-ack so it keeps
+    // forwarding). A wrong-path load still completes but the ROB filters its
+    // completion by robId, exactly as before this retime (the LS EU did not gate
+    // the in-flight load on flush previously either). All RegInit / Reg (no uninit
+    // fanout).
+    val fwdHit   = RegInit(False)
+    val fwdStall = RegInit(False)
+    val fwdData  = Reg(Bits(32 bits))
+
     // captured-decision -> register (called in the decision cycle)
     def captureCompletion(result: Bits): Unit = {
       compValid     := True
@@ -188,36 +214,58 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     compValid := False
 
     val fsm = new StateMachine {
-      val IDLE = new State with EntryPoint
-      val WAIT = new State    // cache load cmd accepted, awaiting loadRsp
+      val IDLE    = new State with EntryPoint
+      val RESOLVE = new State  // registered SQ-fwd result -> completion / cache launch
+      val WAIT    = new State   // cache load cmd accepted, awaiting loadRsp
 
       IDLE.whenIsActive {
         busy := False
         when(s1Valid) {
           when(isStore) {
-            // allocate into the SQ; "executes" immediately (no int dst).
+            // allocate into the SQ; "executes" immediately (no int dst). Store
+            // completion drives a CONSTANT compData (off the SQ-compare arc), so it
+            // captures here directly without the extra resolve cycle.
             sq.io.alloc.valid := True
             captureCompletion(B(0, 32 bits))
           } elsewhen(isLoad) {
-            when(sq.io.fwd.rsp.hit) {
-              // full-overlap forward: skip the cache.
-              captureCompletion(sq.io.fwd.rsp.data)
-            } elsewhen(sq.io.fwd.rsp.stall) {
-              // partial/ambiguous overlap: hold S1 and retry next cycle.
-              busy := True
-            } otherwise {
-              // drive the cache load; back-pressure on dcache.loadBusy.
-              dcache.loadCmd.valid := True
-              when(dcache.loadCmd.fire) {
-                busy := True
-                goto(WAIT)
-              } otherwise {
-                busy := True   // cache occupied; retry next cycle
-              }
-            }
+            // Capture the SQ-forward compare result into registers; resolve next
+            // cycle. Hold s1 (busy) so the SQ query stays stable into RESOLVE.
+            fwdHit   := sq.io.fwd.rsp.hit
+            fwdStall := sq.io.fwd.rsp.stall
+            fwdData  := sq.io.fwd.rsp.data
+            busy := True
+            goto(RESOLVE)
           } otherwise {
             captureCompletion(B(0, 32 bits))   // non-memory (defensive)
           }
+        }
+      }
+
+      // Decision-resolve from the REGISTERED SQ-forward result (off the long
+      // s1Paddr -> SQ-compare arc). s1 is still held (busy), so a re-query for the
+      // stall-retry path reads stable SQ content.
+      RESOLVE.whenIsActive {
+        busy := True
+        when(fwdHit) {
+          // full-overlap forward: skip the cache.
+          captureCompletion(fwdData)
+          busy    := False
+          s1Valid := False
+          goto(IDLE)
+        } elsewhen(fwdStall) {
+          // partial/ambiguous overlap: re-sample the SQ this cycle and retry. The
+          // overlapping older store will drain/forward; once it resolves to a full
+          // forward (or no overlap) we proceed. Stays in a (busy) hold.
+          fwdHit   := sq.io.fwd.rsp.hit
+          fwdStall := sq.io.fwd.rsp.stall
+          fwdData  := sq.io.fwd.rsp.data
+        } otherwise {
+          // no forward: drive the cache load; back-pressure on dcache.loadBusy.
+          dcache.loadCmd.valid := True
+          when(dcache.loadCmd.fire) {
+            goto(WAIT)
+          }
+          // else cache occupied; stay in RESOLVE (busy) and retry next cycle.
         }
       }
 
