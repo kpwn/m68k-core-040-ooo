@@ -124,6 +124,7 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       // copy decoded fields
       r.valid        := dec.valid
       r.pc           := dec.pc
+      r.nextPc       := dec.nextPc
       r.op           := dec.op
       r.cluster      := dec.cluster
       r.size         := dec.size

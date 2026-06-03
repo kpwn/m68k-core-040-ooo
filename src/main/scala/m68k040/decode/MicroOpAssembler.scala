@@ -55,10 +55,16 @@ object MicroOpAssembler {
     val dstIsMem  = (dstEa.klass === EaClass.MEMSIMPLE)
     val crackStore = (spec.op === DecOp.MOVE) && usesDstEa && dstIsMem && srcIsReg
 
+    // POST-instruction PC = pc + length(bytes). All µops of one instruction share
+    // it so the (single, architectural) op-µop commit pc matches the reference's
+    // next-instruction PC even for multi-word memory instructions.
+    val nextPc = (pkt.pc + (pkt.lenWords << 1)).resize(32)
+
     // ── opUop = the operation (EASRC operand routed to T0 when cracked) ────────
     val opUop = DecodedUop()
     opUop.valid         := pkt.valid
     opUop.pc            := pkt.pc
+    opUop.nextPc        := nextPc
     opUop.op            := spec.op
     opUop.cluster       := spec.cluster
     opUop.size          := spec.size
@@ -143,6 +149,7 @@ object MicroOpAssembler {
     val ldUop = DecodedUop()
     ldUop.valid         := pkt.valid
     ldUop.pc            := pkt.pc
+    ldUop.nextPc        := nextPc
     ldUop.op            := DecOp.MOVE
     ldUop.cluster       := Cluster.LS
     ldUop.size          := spec.size
@@ -165,6 +172,7 @@ object MicroOpAssembler {
     val stUop = DecodedUop()
     stUop.valid         := pkt.valid
     stUop.pc            := pkt.pc
+    stUop.nextPc        := nextPc
     stUop.op            := DecOp.MOVE
     stUop.cluster       := Cluster.LS
     stUop.size          := spec.size

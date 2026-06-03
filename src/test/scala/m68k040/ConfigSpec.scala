@@ -6,7 +6,7 @@ class ConfigSpec extends AnyFunSuite {
   test("default params expose the Appendix A baselines") {
     val p = M68kParams()
     assert(p.robDepth == 64)
-    assert(p.physInt == 48)
+    assert(p.physInt == 50)   // 48 + headroom for the 2 EA-cracking temp arch regs
     assert(p.physNzvc == 16)
     assert(p.physX == 16)
     assert(p.decodeWidth == 2)

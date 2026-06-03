@@ -13,6 +13,7 @@ object DecOp extends SpinalEnum {
 case class DecodedUop() extends Bundle {
   val valid        = Bool()
   val pc           = UInt(32 bits)
+  val nextPc       = UInt(32 bits)   // POST-instruction PC = pc + length (all µops of an instr share it)
   val op           = DecOp()
   val cluster      = Cluster()
   val size         = Size()

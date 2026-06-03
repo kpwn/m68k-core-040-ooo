@@ -34,11 +34,21 @@ object WhiteboxCapture {
     def onWb(robId: Int, wb: Wb): Unit = { wbMap(robId) = wb }
 
     /** Record a retired commit (robId + post-instruction pc) in retire order,
-      * snapshotting the committing instruction's writeback now (see above). */
+      * snapshotting the committing instruction's writeback now (see above).
+      *
+      * A cracked memory instruction (e.g. `ADD.L (A0),D1`) retires as TWO ROB
+      * entries: a LOAD µop writing an internal temp (arch ≥ 16 = T0/T1) and the
+      * op µop writing the architectural reg. Temps NEVER commit architecturally
+      * (decode-matrix spec §4.5: the instruction is the architectural unit), and a
+      * load µop writes no flags — so a temp-writing commit carries no architectural
+      * state and is DROPPED here, leaving the architectural commit stream 1:1 with
+      * Musashi's per-instruction trace (the temp µop and its op share the same
+      * post-instruction pc). */
     def onCommit(robId: Int, pc: Long): Unit = {
       val wb = wbMap.getOrElse(robId,
         sys.error(s"commit robId=$robId with no writeback observed"))
-      commits += ((pc, wb))
+      val isTempOnly = wb.intWrite && wb.dstArch >= 16 && !wb.nzvcWrite && !wb.xWrite
+      if (!isTempOnly) commits += ((pc, wb))
     }
 
     /** Reconstruct the CommitObservation stream AFTER the run, folding the

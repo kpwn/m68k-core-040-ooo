@@ -1,6 +1,7 @@
 package m68k040.execute.iq
 
-import m68k040.{M68kSim, VerilatorTest}
+import m68k040.{M68kParams, M68kSim, VerilatorTest}
+import m68k040.core.ParamPlugin
 import m68k040.isa.{Cluster, MemOp}
 import spinal.core._
 import spinal.core.sim._
@@ -15,7 +16,8 @@ class IqLsSpec extends AnyFunSuite {
     val iq     = new IssueQueuePlugin
     val source = new IqSourcePlugin
     val sink   = new IqSinkPlugin
-    db.on { host.asHostOf(Seq[FiberPlugin](iq, source, sink)) }
+    // ParamPlugin publishes PHYS_INT_REGS (the IQ sizes its int scoreboards from it).
+    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), iq, source, sink)) }
   }
 
   def idle(dut: Dut): Unit = {

@@ -88,7 +88,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // ── Build a RobPayload from a RenamedUop ───────────────────────────────────
     def payloadFrom(u: RenamedUop): RobPayload = {
       val p = RobPayload()
-      p.predNextPc := u.pc + 2
+      p.predNextPc := u.nextPc
       p.archRegId  := u.dstArch
       p.intNew     := u.pdst;     p.intOld := u.pdstOld;   p.intWrite  := u.pdstValid
       p.nzvcNew    := u.pNzvcDst; p.nzvcOld := u.pNzvcOld;  p.nzvcWrite := u.writesNzvc

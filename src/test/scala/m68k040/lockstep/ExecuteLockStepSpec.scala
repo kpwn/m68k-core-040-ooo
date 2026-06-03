@@ -2,13 +2,13 @@ package m68k040.lockstep
 
 import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
-import m68k040.mmu.IdentityTranslationPlugin
-import m68k040.cache.IcachePlugin
+import m68k040.mmu.{IdentityTranslationPlugin, DIdentityTranslationPlugin}
+import m68k040.cache.{IcachePlugin, DcachePlugin}
 import m68k040.frontend.FetchAlignPlugin
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
 import m68k040.rob.RobPlugin
-import m68k040.execute.{AluEuPlugin, BranchEuPlugin}
+import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin}
 import m68k040.execute.iq.{IssueQueuePlugin, IssueQueueService}
 import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
 import m68k040.services.RedirectService
@@ -41,7 +41,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     * to the ROB, and the ROB's commit-time mispredict redirect (RedirectService)
     * to the IQ flush. (Frontend pipeFlush / RAT-rollback flush / fetch redirect are
     * driven inside the consuming plugins from host.get[RedirectService].) */
-  class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin) extends FiberPlugin {
+  class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin) extends FiberPlugin {
     val logic = during build new Area {
       val iq  = host[IssueQueueService]
       val rob = host[RobPlugin]
@@ -50,15 +50,31 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Branch EU: issue port 2 (branch-class) -> branch EU; completion -> ROB
       // branchCompletion (records {mispredict, nextPc} for commit-time recovery).
       branchEu.issue << iq.issue(2)
-      // LS issue port (LS3): no LS EU in this DUT — tie its ready off so the IQ's
-      // issue(3) Stream is fully driven.
-      iq.issue(3).ready := False
       rob.logic.branchCompletion.valid   := branchEu.completion.valid
       rob.logic.branchCompletion.payload := branchEu.completion.payload
       rob.logic.completion(0).valid   := eu0.completion.valid
       rob.logic.completion(0).payload := eu0.completion.payload
       rob.logic.completion(1).valid   := eu1.completion.valid
       rob.logic.completion(1).payload := eu1.completion.payload
+
+      // ── LS cluster wiring (mirrors top/FullCoreSynth.BackendWiringPlugin) ──
+      // LS issue port (3) -> LS EU. Its completion is BOTH a ROB completion (port
+      // 2) AND the IQ dynamic-wakeup broadcast (variant A: a load's dependents wake
+      // when the load's data is actually ready).
+      lsEu.issue << iq.issue(3)
+      rob.logic.completion(2).valid   := lsEu.completion.valid
+      rob.logic.completion(2).payload := lsEu.completion.payload
+      // The dynamic wakeup must fire ONLY for a completing LOAD (it produces a
+      // physreg). A STORE also completes (to retire) but writes NO register; its
+      // s1Ctx.uop.pdst is stale/garbage and could spuriously match a consumer's
+      // source physreg, clearing its lsWait early -> the consumer reads the PRF
+      // before its real producing load lands. Gate on pdstValid.
+      iq.lsWakeup.valid   := lsEu.completion.valid && lsEu.logic.s1Ctx.uop.pdstValid
+      iq.lsWakeup.payload := lsEu.logic.s1Ctx.uop.pdst
+      // ROB retire (slot 0) -> SQ commit; doFlush -> SQ flush (squash speculative).
+      lsEu.sqCommit.valid   := rob.logic.retire0
+      lsEu.sqCommit.payload := rob.logic.h0
+      lsEu.sqFlush          := host[RedirectService].doFlush
 
       // ── Commit-time mispredict redirect fan-out (registered doFlush pulse) ──
       val doFlush = host[RedirectService].doFlush
@@ -80,6 +96,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val db    = new Database
     val host  = db on (new PluginHost)
     val icache = new IcachePlugin
+    val dcache = new DcachePlugin
     val fa     = new FetchAlignPlugin
     val dec    = new DecodeStage
     val ren    = new RenameStage
@@ -89,14 +106,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
+    val lsEu   = new LsEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
     val rfX    = new RegFilePluginX
-    val wire   = new BackendWiringPlugin(eu0, eu1, branchEu)
+    val wire   = new BackendWiringPlugin(eu0, eu1, branchEu, lsEu)
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
       new IdentityTranslationPlugin,
-      icache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu,
+      new DIdentityTranslationPlugin,
+      icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu,
       rfInt, rfNzvc, rfX, wire)) }
   }
 
@@ -134,7 +153,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     * explicitly: a taken branch skips/loops, so the executed count differs from the
     * source line count. The oracle (Musashi traces actual execution) and the DUT
     * commit stream are both bounded to the first `nInstr` records. */
-  def runLockStep(name: String, src: String, nInstr: Int = -1): Unit = {
+  def runLockStep(name: String, src: String, nInstr: Int = -1, checkMem: Seq[Long] = Seq.empty): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
 
     // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel.
@@ -142,6 +161,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Right(v)  => v
       case Left(err) => fail(s"[$name] Musashi.assembleAndTrace failed: ${err.reason}")
     }
+    // Oracle FINAL memory image (for store programs): assembleAndRun returns the
+    // per-byte memoryWrites the program performed. Only the program's explicit DATA
+    // addresses (`checkMem`, each a 4-byte long) are compared — Musashi's harness
+    // also writes the stack/sentinel region which the bare DUT does not exercise.
+    val oracleMem: Map[Long, Int] =
+      if (checkMem.nonEmpty) Musashi.assembleAndRun(src) match {
+        case Right(st) => st.memoryWrites
+        case Left(err) => fail(s"[$name] Musashi.assembleAndRun failed: ${err.reason}")
+      } else Map.empty
+    val checkAddrs: Seq[Long] = checkMem.flatMap(a => (0L until 4L).map(a + _))
     // Program bytes for the I-cache.
     val image = ProgramAssembler.assemble(src, loadAddr) match {
       case Right(i)  => i
@@ -160,24 +189,31 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val handle = new WhiteboxCapture.Handle
       var wbCount = 0; var commitCount = 0
 
+      // Capture one EU's writeback-obs into the whitebox (shared by ALU0/ALU1/LS).
+      def captureWb(w: m68k040.execute.WbObs): Unit = {
+        if (w.valid.toBoolean) {
+          wbCount += 1
+          handle.onWb(
+            w.robId.toInt,
+            WhiteboxCapture.Wb(
+              dstArch   = w.dstArch.toInt,
+              result    = w.result.toLong & 0xffffffffL,
+              intWrite  = w.intWrite.toBoolean,
+              nzvc      = w.nzvc.toInt,
+              nzvcWrite = w.nzvcWrite.toBoolean,
+              x         = if (w.x.toBoolean) 1 else 0,
+              xWrite    = w.xWrite.toBoolean))
+        }
+      }
+
       // Per-cycle sampler: EU writeback-obs (join key) + ROB commit-obs (order/pc).
       cd.onSamplings {
-        for (eu <- Seq(dut.eu0, dut.eu1)) {
-          val w = eu.logic.wbObs
-          if (w.valid.toBoolean) {
-            wbCount += 1
-            handle.onWb(
-              w.robId.toInt,
-              WhiteboxCapture.Wb(
-                dstArch   = w.dstArch.toInt,
-                result    = w.result.toLong & 0xffffffffL,
-                intWrite  = w.intWrite.toBoolean,
-                nzvc      = w.nzvc.toInt,
-                nzvcWrite = w.nzvcWrite.toBoolean,
-                x         = if (w.x.toBoolean) 1 else 0,
-                xWrite    = w.xWrite.toBoolean))
-          }
-        }
+        captureWb(dut.eu0.logic.wbObs)
+        captureWb(dut.eu1.logic.wbObs)
+        // LS EU writeback-obs (loads write an int reg incl. the T0/T1 temp; stores
+        // write none). Same join key (robId) as the ALU EUs. Temp-only commits are
+        // dropped in WhiteboxCapture.onCommit (decode-matrix §4.5).
+        captureWb(dut.lsEu.logic.wbObs);
         // Branch EU writeback-obs: a branch writes NO int/flag reg and leaves CCR
         // unchanged. Map it to a no-write Wb (the commit pc comes from the ROB
         // commitObs = resolved nextPc). dstArch=0 is harmless since intWrite=false.
@@ -209,6 +245,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
       // Attach the program to the I-cache AXI.
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+
+      // Attach a behavioral read/write memory to the D-cache AXI (separate image,
+      // zeroed; the programs store before they load, so no data preload needed).
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
 
       // Idle the frontend; consumer-driven ready ports default high downstream.
       dut.fa.logic.redirect.valid #= false
@@ -250,6 +290,18 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       assert(res.ok,
         s"[$name] lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")} " +
           s"(matched ${res.matched}, dut commits ${handle.result.size}, oracle steps $n)")
+
+      // Final memory check (store programs): let committed stores drain to memory,
+      // then compare the program's DATA bytes against the DUT's D-cache memory.
+      if (checkMem.nonEmpty) {
+        cd.waitSampling(200)
+        for (addr <- checkAddrs) {
+          val expected = oracleMem.getOrElse(addr, 0) & 0xff
+          val got = dmem.peekByte(addr)
+          assert(got == expected,
+            f"[$name] memory mismatch at 0x$addr%08x: dut=0x$got%02x oracle=0x$expected%02x")
+        }
+      }
     }
   }
 
@@ -342,5 +394,39 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     runLockStep("loop-multi",
       "moveq #4,%d0 ; moveq #1,%d1 ; .L: sub.l %d1,%d0 ; bne.s .L ; moveq #7,%d2",
       nInstr = 11)
+  }
+
+  // ── Load/store lock-step (THE memory milestone) ────────────────────────────
+  // All addresses use absolute modes (no An setup needed) and store BEFORE they
+  // load, so the D-cache behavioral memory needs no preload. The store µop drains
+  // at commit (write-through); store-then-load-back resolves via SQ forwarding.
+
+  test("lock-step: store then load-back (D1 == stored value)", VerilatorTest) {
+    // moveq #42,%d0 ; move.l %d0,0x2000 (store) ; move.l 0x2000,%d1 (load-back)
+    // D1 must read back 42 (SQ forward / write-through). Final mem[0x2000]==42.
+    runLockStep("st-ld",
+      "moveq #42,%d0 ; move.l %d0,0x2000 ; move.l 0x2000,%d1",
+      checkMem = Seq(0x2000L))
+  }
+
+  test("lock-step: two loads + add", VerilatorTest) {
+    // Two cracked loads feeding an add: D2 = mem[0x2000] + mem[0x2004] = 10 + 20 = 30.
+    // Each load immediately follows its producing store so it resolves via the
+    // store-queue forward path (the load reads the in-flight store's data). Both
+    // `move.l (mem),%d2` and `add.l (mem),%d2` crack LOAD->T0 then the op reading T0.
+    runLockStep("two-ld-add",
+      "moveq #10,%d0 ; move.l %d0,0x2000 ; move.l 0x2000,%d2 ; " +
+      "moveq #20,%d3 ; move.l %d3,0x2004 ; add.l 0x2004,%d2",
+      checkMem = Seq(0x2000L, 0x2004L))
+  }
+
+  test("lock-step: load -> ALU -> store (temp dataflow through LS wakeup)", VerilatorTest) {
+    // moveq #5,%d0 ; store 5 -> 0x2000 ; load 0x2000 -> D1 (cracks LOAD->T0 then
+    // MOVE T0->D1, the temp consumed via the LS dynamic-completion wakeup) ;
+    // add.l %d1,%d1 -> D1 = 10 ; store D1 -> 0x2004. A loaded value flows through
+    // an ALU op into a store. Final mem[0x2000]==5, mem[0x2004]==10.
+    runLockStep("ld-alu-st",
+      "moveq #5,%d0 ; move.l %d0,0x2000 ; move.l 0x2000,%d1 ; add.l %d1,%d1 ; move.l %d1,0x2004",
+      checkMem = Seq(0x2000L, 0x2004L))
   }
 }

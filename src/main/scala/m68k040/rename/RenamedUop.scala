@@ -11,6 +11,7 @@ case class RenamedUop() extends Bundle {
   val flagW = 4   // log2Up(PHYS_NZVC_REGS=16) = log2Up(PHYS_X_REGS=16)
   val valid        = Bool()
   val pc           = UInt(32 bits)
+  val nextPc       = UInt(32 bits)   // POST-instruction PC (pc + length); used for commit pc
   val op           = DecOp()
   val cluster      = Cluster()
   val size         = Size()

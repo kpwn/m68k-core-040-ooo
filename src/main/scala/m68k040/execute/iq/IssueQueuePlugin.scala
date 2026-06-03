@@ -98,7 +98,11 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       val busy       = Reg(Bits(depth bits)) init 0
       val physToSlot = Reg(Vec(UInt(slotIdxW bits), depth))
     }
-    val sbInt  = new Scoreboard(48) // int physregs (width 6)
+    // Int scoreboard width = the physical int register count (parametric; was a
+    // hardcoded 48 — became 50 when the 2 temp arch regs T0/T1 widened the int
+    // pool, so a temp's pdst could index past 48 and alias/over-run the bitmaps).
+    val physIntN = m68k040.Global.PHYS_INT_REGS.get
+    val sbInt  = new Scoreboard(physIntN) // int physregs
     val sbNzvc = new Scoreboard(16) // NZVC flag physregs (width 4)
     val sbX    = new Scoreboard(16) // X flag physregs (width 4)
 
@@ -108,10 +112,17 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // LS EU broadcasts lsWakeup(p). This is SEPARATE from the static slot-trigger
     // mechanism (which assumes latency-1): LS producers are tracked ONLY here, not
     // in sbInt, so trigInit never sets a static (auto-clearing) trigger for them.
-    val lsBusy = Reg(Bits(48 bits)) init 0
+    val lsBusy = Reg(Bits(physIntN bits)) init 0
 
     // LS class predicate: cluster == LS and a real memory op.
     def isLs(u: RenamedUop): Bool = (u.cluster === m68k040.isa.Cluster.LS) && (u.memOp =/= m68k040.isa.MemOp.NONE)
+
+    // Is srcB a REAL register operand (vs an immediate)? For ALU µops `useImm`
+    // means srcB carries an immediate (no register read). For LS µops `imm` is the
+    // ADDRESS DISPLACEMENT and srcB is the STORE DATA register — both are live, so
+    // useImm must NOT suppress the srcB (data) dependency. Conflating the two would
+    // let a store issue before its data producer retired (reading a stale PRF).
+    def srcBIsReg(u: RenamedUop): Bool = u.psrcBValid && (!u.useImm || isLs(u))
 
     // ---- Occupancy / back-pressure ----
     // Back-pressure is gated on LINE 0 BEING EMPTY, not on a count proxy.
@@ -220,7 +231,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
         }
       }
       dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcA, uop.psrcAValid)
-      dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcB, uop.psrcBValid && !uop.useImm)
+      dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcB, srcBIsReg(uop))
       dep(sbNzvc.busy, sbNzvc.physToSlot, uop.pNzvcSrc, uop.readsNzvc)
       dep(sbX.busy,    sbX.physToSlot,    uop.pXSrc, uop.readsX)
       t
@@ -234,22 +245,39 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // Push-time LS dependency: does this uop read a physreg produced by an
     // in-flight (not-yet-completed) LS load? (Intra-push slot1<-slot0 LS handled
     // below.) Reads lsBusy at push (off the issue/PRF-read critical path).
+    //
+    // SAME-CYCLE WAKEUP: a physreg `p` is only still-in-flight if it is lsBusy AND
+    // the load is NOT completing THIS cycle. Without the `!wokeThisCycle` guard a
+    // consumer dispatched the exact cycle its producing load broadcasts lsWakeup
+    // would latch lsWait=True (reading the not-yet-cleared lsBusy) yet never see
+    // the wakeup pulse (already past) -> a lost wakeup that hangs the consumer.
+    // This is the back-to-back case the decode-matrix cracker creates (LOAD->temp
+    // then the op reading the temp, dispatched within 1-2 cycles).
+    def stillBusy(p: UInt): Bool =
+      lsBusy(p) && !(lsWakeupPort.valid && lsWakeupPort.payload === p)
     def lsDepInit(uop: RenamedUop): Bool =
-      (uop.psrcAValid && lsBusy(uop.psrcA)) || (uop.psrcBValid && !uop.useImm && lsBusy(uop.psrcB))
+      (uop.psrcAValid && stillBusy(uop.psrcA)) || (srcBIsReg(uop) && stillBusy(uop.psrcB))
     val lsDep0 = lsDepInit(pushUop0)
     val lsDep1Base = lsDepInit(pushUop1)
     // Intra-push: slot1 reads slot0's dst and slot0 is an LS load -> slot1 waits.
     val s0IsLsLoad = isLs(pushUop0) && (pushUop0.memOp === m68k040.isa.MemOp.LOAD) && pushUop0.pdstValid
     val lsDep1 = lsDep1Base ||
       (s0IsLsLoad && pushUop1.psrcAValid && (pushUop1.psrcA === pushUop0.pdst)) ||
-      (s0IsLsLoad && pushUop1.psrcBValid && !pushUop1.useImm && (pushUop1.psrcB === pushUop0.pdst))
+      (s0IsLsLoad && srcBIsReg(pushUop1) && (pushUop1.psrcB === pushUop0.pdst))
     // Intra-push: slot1 reads a physreg that slot0 (pushed same cycle) writes.
     // slot0 ends at slot0Prio; set slot1's trigger bit there.
-    val s0WritesInt  = pushUop0.pdstValid
+    //
+    // The STATIC (latency-1) int trigger must be SUPPRESSED when slot0 is an LS
+    // load: an LS load is variable-latency and produces NO static issue-event
+    // (`events` covers only the ALU ports), so a static trigger bit on it would
+    // never clear and hang the consumer. That dependency is instead carried by
+    // `lsDep1` (the dynamic lsWait, cleared by lsWakeup). This is exactly the
+    // cracked LOAD->temp + op-reading-temp pair when both land in one push group.
+    val s0WritesInt  = pushUop0.pdstValid && !s0IsLsLoad
     val s0WritesNzvc = pushUop0.writesNzvc
     val s0WritesX    = pushUop0.writesX
     when(s0WritesInt  && pushUop1.psrcAValid && pushUop1.psrcA === pushUop0.pdst)              { trig1(slot0Prio) := True }
-    when(s0WritesInt  && pushUop1.psrcBValid && !pushUop1.useImm && pushUop1.psrcB === pushUop0.pdst) { trig1(slot0Prio) := True }
+    when(s0WritesInt  && srcBIsReg(pushUop1) && pushUop1.psrcB === pushUop0.pdst) { trig1(slot0Prio) := True }
     when(s0WritesNzvc && pushUop1.readsNzvc && pushUop1.pNzvcSrc === pushUop0.pNzvcDst)        { trig1(slot0Prio) := True }
     when(s0WritesX    && pushUop1.readsX    && pushUop1.pXSrc === pushUop0.pXDst)              { trig1(slot0Prio) := True }
 
@@ -300,7 +328,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       val u = s.context.uop
       lsWakeupPort.valid && s.sel &&
         ((u.psrcAValid && (u.psrcA === lsWakeupPort.payload)) ||
-         (u.psrcBValid && !u.useImm && (u.psrcB === lsWakeupPort.payload)))
+         (srcBIsReg(u) && (u.psrcB === lsWakeupPort.payload)))
     })
     for (i <- 0 until slotCount) {
       when(lsWakeMatch(i)) {

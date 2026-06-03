@@ -73,7 +73,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val u0 = issuePort.payload.uop
     rdBase.addr := u0.psrcA
     rdData.addr := u0.psrcB
-    val base0 = rdBase.data.asUInt
+    // Address = base + disp. Absolute / PC-relative EAs carry NO base register
+    // (psrcAValid=false; the assembler folded the absolute/PC value into imm), so
+    // the base contribution must be ZERO there — otherwise the stale psrcA (which
+    // defaults to physreg 0) would corrupt the computed address.
+    val base0 = Mux(u0.psrcAValid, rdBase.data.asUInt, U(0, 32 bits))
     val disp0 = u0.imm.asSInt
     val va0   = (base0.asSInt + disp0).asUInt
     val data0 = rdData.data

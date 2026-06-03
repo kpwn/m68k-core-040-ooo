@@ -86,7 +86,7 @@ class LsBackendInjectSpec extends AnyFunSuite {
       psrcB: Int = 0, psrcBValid: Boolean = false,
       pdst: Int = 0, pdstValid: Boolean = true, pdstOld: Int = 0,
       writesNzvc: Boolean = false, pNzvcDst: Int = 0): Unit = {
-    u.valid #= valid; u.pc #= pc; u.op #= op; u.cluster #= cluster; u.memOp #= memOp
+    u.valid #= valid; u.pc #= pc; u.nextPc #= pc + 2; u.op #= op; u.cluster #= cluster; u.memOp #= memOp
     u.size #= size; u.useImm #= useImm; u.imm #= BigInt(imm & 0xffffffffL)
     u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0; u.unimplemented #= false
     u.dstArch #= dstArch
