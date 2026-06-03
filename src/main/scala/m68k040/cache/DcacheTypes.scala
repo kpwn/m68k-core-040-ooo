@@ -21,11 +21,20 @@ case class DLoadRsp() extends Bundle {
 }
 
 /** Store command from the SQ drain: a PHYSICAL address (already translated),
-  * the store data in the low bytes per size, and the access size. Write-through. */
+  * the store data in the low bytes per size, and the access size. Write-through.
+  *
+  * `useStrb` selects an explicit line-relative byte strobe + 128-bit line-aligned
+  * data (`strb`/`lineData`) instead of deriving the merge from {data,size,paddr-
+  * offset} via the byte-lane. The SQ uses the explicit form to drain a SPLIT
+  * (cross-line/page) store slot whose byte count need not be a clean 1/2/4 Size
+  * (e.g. a 3-byte slot). Aligned stores leave `useStrb=false` (unchanged path). */
 case class DStoreCmd() extends Bundle {
-  val paddr = UInt(32 bits)
-  val data  = Bits(32 bits)
-  val size  = Size()
+  val paddr    = UInt(32 bits)
+  val data     = Bits(32 bits)
+  val size     = Size()
+  val useStrb  = Bool()
+  val strb     = Bits(16 bits)
+  val lineData = Bits(128 bits)
 }
 
 /** D-cache service contract (spec 4.2). */

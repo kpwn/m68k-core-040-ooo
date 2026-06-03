@@ -15,6 +15,16 @@ class StoreQueueSpec extends AnyFunSuite {
     dut.io.alloc.payload.paddr #= paddr
     dut.io.alloc.payload.data #= data
     dut.io.alloc.payload.size #= size
+    // aligned (single-slot) store: covered byte count from the size, no slot B.
+    dut.io.alloc.payload.nbytesA #= (size match { case Size.BYTE => 1; case Size.WORD => 2; case _ => 4 })
+    dut.io.alloc.payload.useStrbA #= false
+    dut.io.alloc.payload.strbA #= 0
+    dut.io.alloc.payload.lineDataA #= 0
+    dut.io.alloc.payload.validB #= false
+    dut.io.alloc.payload.paddrB #= 0
+    dut.io.alloc.payload.nbytesB #= 0
+    dut.io.alloc.payload.strbB #= 0
+    dut.io.alloc.payload.lineDataB #= 0
     cd.waitSampling()
     dut.io.alloc.valid #= false
   }

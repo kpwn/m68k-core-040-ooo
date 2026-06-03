@@ -145,12 +145,37 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     dcache.loadCmd.payload.vaddr := loadVaddr
     dcache.loadCmd.payload.size  := u1.size
 
+    // ---- store split (byte-lane) for the SQ entry ----
+    // Under identity translation paddr == vaddr, so slot B's physical address is
+    // s1AddrB directly (the real-DTLB slice will translate addrB's VPN separately).
+    // sizeBytes of the store; bytes in slot A = (16 - lineOffSt), spill -> slot B.
+    val stOff      = s1Va(3 downto 0)
+    val stBytes    = sizeBytes(u1.size)                 // 1/2/4
+    val bytesInA   = (U(16) - stOff.resize(5 bits))     // 1..16
+    val nbytesA_st = Mux(s1TwoAccess, bytesInA.resize(3 bits), stBytes)
+    val nbytesB_st = Mux(s1TwoAccess, (stBytes - bytesInA).resize(3 bits), U(0, 3 bits))
+    val splitDataA = m68k040.cache.DcacheByteLane.storeDataA(stOff, u1.size, s1Data)
+    val splitStrbA = m68k040.cache.DcacheByteLane.storeStrbA(stOff, u1.size)
+    val splitDataB = m68k040.cache.DcacheByteLane.storeDataB(stOff, u1.size, s1Data)
+    val splitStrbB = m68k040.cache.DcacheByteLane.storeStrbB(stOff, u1.size)
+    val s1PaddrB   = s1AddrB   // identity translation
+
     // ---- SQ alloc + fwd defaults ----
     sq.io.alloc.valid          := False
     sq.io.alloc.payload.robId  := s1Ctx.robId
     sq.io.alloc.payload.paddr  := s1Paddr
     sq.io.alloc.payload.data   := s1Data
     sq.io.alloc.payload.size   := u1.size
+    sq.io.alloc.payload.nbytesA   := nbytesA_st
+    // Aligned store: drain via {data,size} (fast path). Split store: explicit strobe.
+    sq.io.alloc.payload.useStrbA  := s1TwoAccess
+    sq.io.alloc.payload.strbA     := splitStrbA
+    sq.io.alloc.payload.lineDataA := splitDataA
+    sq.io.alloc.payload.validB    := s1TwoAccess
+    sq.io.alloc.payload.paddrB    := s1PaddrB
+    sq.io.alloc.payload.nbytesB   := nbytesB_st
+    sq.io.alloc.payload.strbB     := splitStrbB
+    sq.io.alloc.payload.lineDataB := splitDataB
     sq.io.fwd.query.robId := s1Ctx.robId
     sq.io.fwd.query.paddr := s1Paddr
     sq.io.fwd.query.size  := u1.size

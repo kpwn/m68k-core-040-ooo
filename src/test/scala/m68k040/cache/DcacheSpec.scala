@@ -51,6 +51,7 @@ class DcacheSpec extends AnyFunSuite {
     dut.probe.logic.storeIn.payload.paddr #= paddr
     dut.probe.logic.storeIn.payload.data #= data
     dut.probe.logic.storeIn.payload.size #= size
+    dut.probe.logic.storeIn.payload.useStrb #= false
     cd.waitSampling()
     dut.probe.logic.storeIn.valid #= false
     cd.waitSampling(12)
