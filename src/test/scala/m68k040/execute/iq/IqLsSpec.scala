@@ -97,7 +97,11 @@ class IqLsSpec extends AnyFunSuite {
       val cd = dut.clockDomain; cd.forkStimulus(10)
       idle(dut); cd.waitSampling(3)
 
-      // hold port3 not-ready so we can observe both reach it
+      // Hold port3 not-ready while we load both LS uops into the queue. With the
+      // REGISTERED issue stage (m2sPipe, collapsBubble=false) the issue port only
+      // PRESENTS a uop once it has been accepted into the issue register, which
+      // requires ready3 — so we pulse ready3 to advance each in turn and observe
+      // them oldest-first, one at a time (the invariant under test).
       dut.sink.logic.ready3 #= false
 
       pushOne(dut, robId = 10, Cluster.LS, MemOp.LOAD, pdst = 1, pdstValid = true, psrcA = 0, psrcAValid = false)
@@ -107,15 +111,22 @@ class IqLsSpec extends AnyFunSuite {
       dut.source.logic.pushValid #= false
       cd.waitSampling(2)
 
-      // port3 sees the oldest LS (robId 10) presented
-      assert(dut.sink.logic.v3.toBoolean && dut.sink.logic.rob3.toInt == 10, s"oldest LS on port3, saw v=${dut.sink.logic.v3.toBoolean} rob=${dut.sink.logic.rob3.toInt}")
-      // accept it
+      // Pulse ready3: the oldest LS (robId 10) latches into the issue register and
+      // appears at the port the NEXT cycle (one-cycle registered-issue latency).
       dut.sink.logic.ready3 #= true
       cd.waitSampling()
       dut.sink.logic.ready3 #= false
-      cd.waitSampling(2)
-      // now the younger LS (robId 11) is presented
-      assert(dut.sink.logic.v3.toBoolean && dut.sink.logic.rob3.toInt == 11, s"younger LS on port3, saw v=${dut.sink.logic.v3.toBoolean} rob=${dut.sink.logic.rob3.toInt}")
+      cd.waitSampling()
+      assert(dut.sink.logic.v3.toBoolean && dut.sink.logic.rob3.toInt == 10,
+        s"oldest LS on port3, saw v=${dut.sink.logic.v3.toBoolean} rob=${dut.sink.logic.rob3.toInt}")
+      // Accept robId 10, then pulse ready3 again so the younger LS (robId 11)
+      // advances into the issue register and is presented one at a time.
+      dut.sink.logic.ready3 #= true
+      cd.waitSampling()
+      dut.sink.logic.ready3 #= false
+      cd.waitSampling()
+      assert(dut.sink.logic.v3.toBoolean && dut.sink.logic.rob3.toInt == 11,
+        s"younger LS on port3, saw v=${dut.sink.logic.v3.toBoolean} rob=${dut.sink.logic.rob3.toInt}")
       cd.waitSampling(2)
     }
   }

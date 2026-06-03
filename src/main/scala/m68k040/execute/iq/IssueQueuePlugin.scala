@@ -146,6 +146,10 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // No combinational loop: push.fire = push.valid && push.ready, and push.ready
     // is driven purely by the registered readyReg, so push.ready does not depend
     // combinationally on push.fire.
+    // Internal combinational select streams (the registered issue stage feeds the
+    // external `issuePorts` from these; see the select section below). Declared here
+    // so `issued` (count instrumentation) can reference selPorts.fire.
+    val selPorts = Vec.fill(4)(Stream(IqContext()))
     val count = Reg(UInt(log2Up(slotCount + 1) bits)) init 0 // instrumentation only
     // selComb = sel after this cycle's issue, i.e. the slot's NEXT-cycle occupancy
     // (absent compaction). Sampling selComb (not sel) lets a line that empties via
@@ -158,7 +162,9 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val pushed = UInt(log2Up(wayCount + 1) bits)
     pushed := 0
     when(pushPort.fire) { pushed := Mux(pushSlot1Port, U(2), U(1)) }
-    val issued = CountOne(issuePorts.map(_.fire))
+    // `issued` (count instrumentation) must key off the SELECT ports, since a slot
+    // is freed (count decremented) when it moves into the registered issue stage.
+    val issued = CountOne(selPorts.map(_.fire))
 
     // ---- Select: age-ordered, CLASS-filtered (lowest-index-first one-hot) ----
     // ALU ports (0,1) select non-branch ready slots; branch port (2) selects
@@ -175,6 +181,29 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val ohB = OHMasking.first(brReady)
     val ohL = OHMasking.first(lsReady)
 
+    // ---- FMax: REGISTERED issue->operand-read boundary ----
+    // The combinational select (above) + MuxOH(contexts) feeding each EU's S0
+    // RegFile read-address was the FMax-critical arc (select->OHMasking->MuxOH->
+    // uop.psrcA->PRF read-addr->read->S0). We cut it with a registered stage on
+    // every issue port: `selPorts` are the INTERNAL combinational select streams
+    // (all IQ bookkeeping — fire/events/scoreboard/wakeup — keys off THESE, at
+    // select time); the EXTERNAL `issuePorts` are `selPorts` piped through a
+    // registered M2S stage (m2sPipe). The EU therefore reads the PRF off a
+    // REGISTERED address, not the select cone — splitting the arc into
+    //   select -> MuxOH -> selPort payload reg   (short)
+    //   reg -> PRF read-addr -> read -> S0        (short)
+    // at the cost of ONE extra issue->execute cycle.
+    //
+    // WAKEUP RETIMING (correctness): the static-latency-1 wakeup is derived from
+    // `events` at SELECT time (below), and the EU pipeline shifts uniformly by +1
+    // (every EU gained the same stage), so a producer selected at cycle C still
+    // executes/bypasses exactly when a dependent — woken at C, selected at C+1,
+    // reading at C+2 — performs its read. The relative producer/consumer timing is
+    // PRESERVED, so no change to the events/scoreboard bookkeeping is needed; it is
+    // all expressed relative to select time. The LS dynamic-completion wakeup is
+    // late-bound (driven by actual completion) and self-consistent at any depth.
+    // (`selPorts` itself is declared earlier so `issued` can reference it.)
+
     // Suppress ALL issue on a flush cycle. flushSignal (= the ROB's registered
     // doFlush pulse, or a test flush) clears every slot's `sel` for NEXT cycle, but
     // the select above reads the CURRENT (combinational) sel — so without this gate
@@ -182,21 +211,43 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // arrives 1-2 cycles later carrying a now-reused robId, and corrupts the
     // commit/whitebox join. Gating issue on !flushSignal is the correct squash
     // behavior (a single AND on the registered pulse, not a broadcast).
-    issuePorts(0).valid   := oh0.orR && !flushSignal
-    issuePorts(0).payload := MuxOH(oh0, contexts)
-    issuePorts(1).valid   := oh1.orR && !flushSignal
-    issuePorts(1).payload := MuxOH(oh1, contexts)
-    issuePorts(2).valid   := ohB.orR && !flushSignal
-    issuePorts(2).payload := MuxOH(ohB, contexts)
-    issuePorts(3).valid   := ohL.orR && !flushSignal
-    issuePorts(3).payload := MuxOH(ohL, contexts)
+    selPorts(0).valid   := oh0.orR && !flushSignal
+    selPorts(0).payload := MuxOH(oh0, contexts)
+    selPorts(1).valid   := oh1.orR && !flushSignal
+    selPorts(1).payload := MuxOH(oh1, contexts)
+    selPorts(2).valid   := ohB.orR && !flushSignal
+    selPorts(2).payload := MuxOH(ohB, contexts)
+    selPorts(3).valid   := ohL.orR && !flushSignal
+    selPorts(3).payload := MuxOH(ohL, contexts)
 
-    // Free chosen slots when their issue port fires.
+    // Registered issue stage: drop the in-flight registered uop on a flush (it is
+    // wrong-path), exactly as the slots are squashed. `flush` clears the pipe's
+    // valid reg so a squashed selection never reaches the EU.
+    //
+    // collapsBubble = FALSE is REQUIRED for correctness, not just FMax: with
+    // collapsBubble=true the pipe presents `self.ready` whenever its register is
+    // empty (a 1-deep skid), which would free an IQ slot BEFORE the EU actually
+    // accepts the uop — growing effective queue depth past slotCount and letting a
+    // not-ready EU (e.g. a held port, or LS busy) drain a slot it should hold. With
+    // collapsBubble=false, `self.ready := m2sPipe.ready` is driven purely by the
+    // downstream EU, so a slot is freed EXACTLY when the EU would have accepted it
+    // (original backpressure/capacity semantics), with one cycle of register
+    // latency added on the forward (payload) path — which is exactly the arc we are
+    // cutting. For the always-ready ALU/branch EUs this drains every cycle (no
+    // bubble); for the LS EU it back-pressures into the IQ as before.
+    for (k <- 0 until 4) {
+      issuePorts(k) << selPorts(k).m2sPipe(collapsBubble = false, flush = flushSignal)
+    }
+
+    // Free chosen slots when their SELECT port fires (i.e. when the uop moves into
+    // the registered issue stage). For ALU/branch the EU is always ready so the
+    // pipe always accepts (fire == valid); for LS the pipe back-pressures when the
+    // EU is busy, holding the slot — so no issued uop is ever lost.
     for ((slot, i) <- slots.zipWithIndex) {
-      slot.fire := (issuePorts(0).fire && oh0(i)) ||
-                   (issuePorts(1).fire && oh1(i)) ||
-                   (issuePorts(2).fire && ohB(i)) ||
-                   (issuePorts(3).fire && ohL(i))
+      slot.fire := (selPorts(0).fire && oh0(i)) ||
+                   (selPorts(1).fire && oh1(i)) ||
+                   (selPorts(2).fire && ohB(i)) ||
+                   (selPorts(3).fire && ohL(i))
     }
 
     // ---- Static-latency-1 wakeup events ----
@@ -204,7 +255,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // producer whose result becomes available next cycle; dependents carry a
     // trigger bit at index j which we clear (combinationally into the trigger
     // reg's next value) so they become ready next cycle (back-to-back, lat 1).
-    val events = oh0.andMask(issuePorts(0).fire) | oh1.andMask(issuePorts(1).fire)
+    val events = oh0.andMask(selPorts(0).fire) | oh1.andMask(selPorts(1).fire)
 
     // ---- Depend-on-READ trigger init for the two newly-pushed slots ----
     // Slot0 lands at priority `slot0Prio` (lines.last.ways(0)), slot1 at
@@ -373,8 +424,8 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // On issue, clear busy for the issued producer's dst(s) so later pushes do
     // not depend on an already-issued (latency-1, result-available) producer.
     for (k <- 0 until wayCount) {
-      val ctx = issuePorts(k).payload
-      when(issuePorts(k).fire) {
+      val ctx = selPorts(k).payload
+      when(selPorts(k).fire) {
         when(ctx.uop.pdstValid)  { sbInt.busy(ctx.uop.pdst)     := False }
         when(ctx.uop.writesNzvc) { sbNzvc.busy(ctx.uop.pNzvcDst) := False }
         when(ctx.uop.writesX)    { sbX.busy(ctx.uop.pXDst)       := False }
