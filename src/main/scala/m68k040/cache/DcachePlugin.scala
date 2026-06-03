@@ -120,6 +120,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val s1Ext  = DcacheByteLane.extract(s1Line, s1Off, s1Size)
     loadRspPort.valid       := s1Valid
     loadRspPort.payload.data  := s1Ext
+    loadRspPort.payload.line  := s1Line
     loadRspPort.payload.fault := s1Fault
 
     // ---- STORE write-through ----
@@ -140,8 +141,14 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val stHit = Vec(Bool(), ways)
     for (w <- 0 until ways)
       stHit(w) := valids(w)(stSet) && (tagMem(w).readAsync(stSet) === stTag)
-    val mergeData = DcacheByteLane.storeData(stOff, storePort.payload.size, storePort.payload.data)
-    val mergeStrb = DcacheByteLane.storeStrb(stOff, storePort.payload.size)
+    // Aligned/probe path derives the merge from {data,size,offset}; a SPLIT store
+    // slot supplies an explicit line-relative strobe + 128-bit line-aligned data.
+    val mergeData = Mux(storePort.payload.useStrb,
+      storePort.payload.lineData,
+      DcacheByteLane.storeData(stOff, storePort.payload.size, storePort.payload.data))
+    val mergeStrb = Mux(storePort.payload.useStrb,
+      storePort.payload.strb,
+      DcacheByteLane.storeStrb(stOff, storePort.payload.size))
     val mrgBytes  = mergeData.subdivideIn(8 bits)
 
     when(storePort.valid) {

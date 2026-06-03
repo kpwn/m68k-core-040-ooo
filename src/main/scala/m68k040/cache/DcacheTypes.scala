@@ -10,18 +10,31 @@ case class DLoadCmd() extends Bundle {
   val size  = Size()
 }
 
-/** Load response: size-extracted (byte-lane, big-endian) data + fault. */
+/** Load response: size-extracted (byte-lane, big-endian) data + fault. `line` is
+  * the raw 128-bit cache line the access hit (byte i = line[i*8 +: 8]); the LS EU
+  * uses it for the cross-boundary merge of a misaligned access spanning two lines.
+  * The aligned fast path uses `data` exactly as before. */
 case class DLoadRsp() extends Bundle {
   val data  = Bits(32 bits)
+  val line  = Bits(128 bits)
   val fault = Bool()
 }
 
 /** Store command from the SQ drain: a PHYSICAL address (already translated),
-  * the store data in the low bytes per size, and the access size. Write-through. */
+  * the store data in the low bytes per size, and the access size. Write-through.
+  *
+  * `useStrb` selects an explicit line-relative byte strobe + 128-bit line-aligned
+  * data (`strb`/`lineData`) instead of deriving the merge from {data,size,paddr-
+  * offset} via the byte-lane. The SQ uses the explicit form to drain a SPLIT
+  * (cross-line/page) store slot whose byte count need not be a clean 1/2/4 Size
+  * (e.g. a 3-byte slot). Aligned stores leave `useStrb=false` (unchanged path). */
 case class DStoreCmd() extends Bundle {
-  val paddr = UInt(32 bits)
-  val data  = Bits(32 bits)
-  val size  = Size()
+  val paddr    = UInt(32 bits)
+  val data     = Bits(32 bits)
+  val size     = Size()
+  val useStrb  = Bool()
+  val strb     = Bits(16 bits)
+  val lineData = Bits(128 bits)
 }
 
 /** D-cache service contract (spec 4.2). */
@@ -96,5 +109,115 @@ object DcacheByteLane {
     for (i <- 0 until 16) bits(i) := (U(i) >= off) && (U(i) < (off + nbytes))
     strb := bits.asBits
     strb
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Cross-boundary (split) helpers (misaligned access spanning two 16-byte lines).
+  //
+  // Big-endian byte k of the access (k=0 is the MSB, living at byte offset `off`)
+  // occupies ABSOLUTE byte position `off + k`. If `off + k <= 15` it lives in line
+  // A at index `off+k`; otherwise in line B at index `off+k-16`. A single m68k
+  // access is at most 4 bytes, so it spans at most two adjacent lines.
+  // ───────────────────────────────────────────────────────────────────────────
+
+  private def nBytesOf(size: Size.C): UInt = {
+    val n = UInt(3 bits); n := 1
+    switch(size) {
+      is(Size.BYTE) { n := 1 }
+      is(Size.WORD) { n := 2 }
+      is(Size.LONG) { n := 4 }
+    }
+    n
+  }
+
+  /** Load merge: gather `size` big-endian bytes spanning the A/B line boundary at
+    * byte offset `off`. Byte k of the value (k=0 = MSB at `off`) is taken from
+    * line A at `off+k` (if `off+k<16`) else line B at `off+k-16`. Right-justified
+    * in 32 bits. Aligned (no cross) reduces to `extract(lineA, ...)`. */
+  def extractCross(lineA: Bits, lineB: Bits, off: UInt, size: Size.C): Bits = {
+    val aBytes = lineA.subdivideIn(8 bits)   // aBytes(i) = lineA[i*8 +: 8]
+    val bBytes = lineB.subdivideIn(8 bits)
+    // selByte(k) = the absolute-position byte at (off + k).
+    def selByte(k: Int): Bits = {
+      val pos = off +^ U(k, 5 bits)          // 0..18 (off<=15, k<=3)
+      Mux(pos < U(16), aBytes(pos.resize(4 bits)), bBytes((pos - U(16)).resize(4 bits)))
+    }
+    val b0 = selByte(0); val b1 = selByte(1); val b2 = selByte(2); val b3 = selByte(3)
+    val result = Bits(32 bits)
+    result := B(0, 32 bits)
+    switch(size) {
+      is(Size.BYTE) { result := B(0, 24 bits) ## b0 }
+      is(Size.WORD) { result := B(0, 16 bits) ## b0 ## b1 }
+      is(Size.LONG) { result := b0 ## b1 ## b2 ## b3 }
+    }
+    result
+  }
+
+  // Per-byte value of the access at big-endian byte index k (k=0 = MSB).
+  private def valueByte(size: Size.C, data: Bits, k: Int): Bits = {
+    val out = Bits(8 bits); out := B(0, 8 bits)
+    switch(size) {
+      is(Size.BYTE) { if (k == 0) out := data(7 downto 0) }
+      is(Size.WORD) {
+        if (k == 0) out := data(15 downto 8)
+        if (k == 1) out := data(7 downto 0)
+      }
+      is(Size.LONG) {
+        if (k == 0) out := data(31 downto 24)
+        if (k == 1) out := data(23 downto 16)
+        if (k == 2) out := data(15 downto 8)
+        if (k == 3) out := data(7 downto 0)
+      }
+    }
+    out
+  }
+
+  // True iff big-endian access byte k is in-range for this size (k < nBytes).
+  private def kActive(size: Size.C, k: Int): Bool = (U(k) < nBytesOf(size))
+
+  /** Store split — slot A (low line): the 128-bit merge data for bytes whose
+    * absolute position `off+k` stays within line A (< 16). */
+  def storeDataA(off: UInt, size: Size.C, data: Bits): Bits = {
+    val out = Vec(Bits(8 bits), 16)
+    for (i <- 0 until 16) out(i) := B(0, 8 bits)
+    for (k <- 0 until 4) {
+      val pos = off +^ U(k, 5 bits)
+      when(kActive(size, k) && (pos < U(16))) { out(pos.resize(4 bits)) := valueByte(size, data, k) }
+    }
+    out.asBits
+  }
+
+  /** Store split — slot A byte strobe. */
+  def storeStrbA(off: UInt, size: Size.C): Bits = {
+    val bits = Vec(Bool(), 16)
+    for (i <- 0 until 16) bits(i) := False
+    for (k <- 0 until 4) {
+      val pos = off +^ U(k, 5 bits)
+      when(kActive(size, k) && (pos < U(16))) { bits(pos.resize(4 bits)) := True }
+    }
+    bits.asBits
+  }
+
+  /** Store split — slot B (high line): bytes whose absolute position `off+k`
+    * spilled past line A (>= 16), placed at `off+k-16` in line B. */
+  def storeDataB(off: UInt, size: Size.C, data: Bits): Bits = {
+    val out = Vec(Bits(8 bits), 16)
+    for (i <- 0 until 16) out(i) := B(0, 8 bits)
+    for (k <- 0 until 4) {
+      val pos = off +^ U(k, 5 bits)
+      when(kActive(size, k) && (pos >= U(16))) { out((pos - U(16)).resize(4 bits)) := valueByte(size, data, k) }
+    }
+    out.asBits
+  }
+
+  /** Store split — slot B byte strobe. Zero when the access does not cross. */
+  def storeStrbB(off: UInt, size: Size.C): Bits = {
+    val bits = Vec(Bool(), 16)
+    for (i <- 0 until 16) bits(i) := False
+    for (k <- 0 until 4) {
+      val pos = off +^ U(k, 5 bits)
+      when(kActive(size, k) && (pos >= U(16))) { bits((pos - U(16)).resize(4 bits)) := True }
+    }
+    bits.asBits
   }
 }
