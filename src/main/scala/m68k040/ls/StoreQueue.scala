@@ -162,18 +162,26 @@ class StoreQueue(depth: Int = 8) extends Component {
     val full     = overlapA && !validBs(i) && (aLo === qLo) && (nbytesAs(i) === qBytes)
     val partial  = overlap && !full
   }
-  // youngest older overlapping entry: among matches, the one closest (in ROB age)
-  // to the query. Build a priority by age distance (q.robId - robId), smallest wins.
-  val anyOverlap = perEntry.map(_.overlap).orR
+  // youngest older overlapping entry: among ALL overlapping matches (full OR
+  // partial), the one closest (in ROB age) to the query. ONE reduce tree carrying
+  // whether that youngest-overlapping entry is a FULL overlap. A clean forward is
+  // possible iff the YOUNGEST overlapping store fully covers the query: a younger
+  // partial store (e.g. a split store's slot B overwriting some query bytes) would
+  // itself be the youngest-overlapping entry and is NOT full -> stall. This is a
+  // single tree (same depth as the prior youngest-full select), avoiding a serial
+  // dependency on a separately-reduced `best.dist` (which regressed FMax).
   val anyPartial = perEntry.map(_.partial).orR
-  // pick the youngest full-overlap entry (smallest (q.robId - robId))
-  val fullVec    = Vec(perEntry.map(_.full))
   val ageDist    = Vec((0 until depth).map(i => (q.robId - robIds(i))(5 downto 0)))
-  // Select the youngest full-overlap entry (smallest ROB age distance). Build a
-  // pure Mux-tree reduction over the Scala collection (no self-referential reg).
-  case class Cand() extends Bundle { val valid = Bool(); val dist = UInt(6 bits); val data = Bits(32 bits) }
+  case class Cand() extends Bundle {
+    val valid = Bool(); val full = Bool(); val dist = UInt(6 bits); val data = Bits(32 bits)
+  }
   val cands = (0 until depth).map { i =>
-    val c = Cand(); c.valid := fullVec(i); c.dist := ageDist(i); c.data := datas(i); c
+    val c = Cand()
+    c.valid := perEntry(i).overlap
+    c.full  := perEntry(i).full
+    c.dist  := ageDist(i)
+    c.data  := datas(i)
+    c
   }
   val best = cands.reduceBalancedTree { (a, b) =>
     val o = Cand()
@@ -181,9 +189,10 @@ class StoreQueue(depth: Int = 8) extends Component {
     when(a.valid && (!b.valid || (a.dist <= b.dist))) { o := a } otherwise { o := b }
     o
   }
-  io.fwd.rsp.hit   := best.valid
+  val fullValid = best.valid && best.full
+  io.fwd.rsp.hit   := fullValid
   io.fwd.rsp.data  := best.data
-  io.fwd.rsp.stall := anyPartial && !best.valid   // a full forward resolves the load
+  io.fwd.rsp.stall := anyPartial && !fullValid   // a clean full forward resolves the load
 
   // ---- commit: mark the matching valid entry committed ----
   when(io.commit.valid) {

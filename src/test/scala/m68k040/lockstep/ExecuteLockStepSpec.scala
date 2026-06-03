@@ -153,7 +153,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     * explicitly: a taken branch skips/loops, so the executed count differs from the
     * source line count. The oracle (Musashi traces actual execution) and the DUT
     * commit stream are both bounded to the first `nInstr` records. */
-  def runLockStep(name: String, src: String, nInstr: Int = -1, checkMem: Seq[Long] = Seq.empty): Unit = {
+  def runLockStep(name: String, src: String, nInstr: Int = -1, checkMem: Seq[Long] = Seq.empty,
+                  checkSpan: Int = 4): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
 
     // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel.
@@ -170,7 +171,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         case Right(st) => st.memoryWrites
         case Left(err) => fail(s"[$name] Musashi.assembleAndRun failed: ${err.reason}")
       } else Map.empty
-    val checkAddrs: Seq[Long] = checkMem.flatMap(a => (0L until 4L).map(a + _))
+    // Each checked base spans `checkSpan` bytes (4 for a long, 2 for a word). Only
+    // program-written bytes are compared (the DUT's SparseMemory defaults unwritten
+    // bytes to a non-zero pattern, so checking only the written span is required).
+    val checkAddrs: Seq[Long] = checkMem.flatMap(a => (0L until checkSpan.toLong).map(a + _))
     // Program bytes for the I-cache.
     val image = ProgramAssembler.assemble(src, loadAddr) match {
       case Right(i)  => i
@@ -428,5 +432,52 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     runLockStep("ld-alu-st",
       "moveq #5,%d0 ; move.l %d0,0x2000 ; move.l 0x2000,%d1 ; add.l %d1,%d1 ; move.l %d1,0x2004",
       checkMem = Seq(0x2000L, 0x2004L))
+  }
+
+  // ── Misaligned / line- & page-crossing lock-step (the two-access-slot milestone) ─
+  // Musashi models 68040 misaligned semantics (a misaligned access reads/writes
+  // the same byte sequence as two aligned halves) — it is the oracle. Each program
+  // stores BEFORE it loads, so the split store drains atomically (both halves) and
+  // the cross load reads back the merged value. Addresses are chosen to cross a
+  // 16-byte L1D line and/or a 4 KB page.
+
+  test("lock-step: line-crossing long store then load-back (offset 14)", VerilatorTest) {
+    // move.l %d0,0x200E : a LONG at line offset 14 spans 0x200E..0x2011 -> crosses
+    // the 16-byte line boundary (lines 0x2000 / 0x2010). Load it back into D1.
+    // Final mem[0x200E..0x2011] == 0x12345678 (split store drained both halves).
+    runLockStep("cross-line-st-ld",
+      "move.l #0x12345678,%d0 ; move.l %d0,0x200E ; move.l 0x200E,%d1",
+      checkMem = Seq(0x200EL))
+  }
+
+  test("lock-step: word-misaligned store then load-back", VerilatorTest) {
+    // move.w %d0,0x2003 : a WORD at odd offset 3 within line 0x2000 (misaligned,
+    // single line) store + word load-back. Data is positive (bit15=0) so the MOVE
+    // CCR is 0 in both DUT and oracle (stores/loads do not compute CCR in this
+    // slice; matching today's aligned store lock-step convention).
+    runLockStep("misaligned-word",
+      "move.l #0x00001234,%d0 ; move.w %d0,0x2003 ; moveq #0,%d1 ; move.w 0x2003,%d1",
+      checkMem = Seq(0x2003L), checkSpan = 2)
+  }
+
+  test("lock-step: page-crossing word store then load-back", VerilatorTest) {
+    // move.w %d0,0x2FFF : a WORD at page offset 0xFFF spans 0x2FFF..0x3000 -> crosses
+    // the 4 KB page boundary (identity translation: two translations, both succeed).
+    // Load it back. Final mem[0x2FFF..0x3000] holds the stored word.
+    runLockStep("cross-page-st-ld",
+      "move.l #0x00004321,%d0 ; move.w %d0,0x2FFF ; moveq #0,%d1 ; move.w 0x2FFF,%d1",
+      checkMem = Seq(0x2FFFL), checkSpan = 2)
+  }
+
+  test("lock-step: line-crossing long store then overlapping long load", VerilatorTest) {
+    // Pre-initialize the next line (0x2010), then store a long at the line-crossing
+    // 0x200E (split: bytes 0x200E..0x2011), then load a long at 0x2010 overlapping
+    // the high half of the split store. All loaded bytes are program-defined.
+    // Loaded value = 56 78 33 44 = 0x56783344 (positive -> CCR 0). Exercises the
+    // dual-slot forward / drain-then-read across the boundary.
+    runLockStep("cross-line-overlap",
+      "move.l #0x11223344,%d0 ; move.l %d0,0x2010 ; " +
+      "move.l #0x12345678,%d2 ; move.l %d2,0x200E ; move.l 0x2010,%d1",
+      checkMem = Seq(0x200EL, 0x2010L))
   }
 }
