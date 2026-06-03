@@ -5,7 +5,7 @@ import m68k040.execute.iq.IqContext
 import m68k040.execute.regfile.{IntRegFileService, RegFileReadPort, RegFileWritePort, RegFileBypassPort}
 import m68k040.isa.MemOp
 import m68k040.ls.{StoreQueue, SqAlloc, SqFwdQuery}
-import m68k040.services.TranslationService
+import m68k040.services.DTranslationService
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -61,7 +61,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
 
   val logic = during build new Area {
     val dcache = host[DcacheService]
-    val xlate  = host[TranslationService]
+    val xlate  = host[DTranslationService]
 
     // ---- store queue instance ----
     val sq = new StoreQueue(8)

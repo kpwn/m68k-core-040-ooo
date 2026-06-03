@@ -1,7 +1,7 @@
 package m68k040.cache
 
 import m68k040.isa.Size
-import m68k040.services.TranslationService
+import m68k040.services.DTranslationService
 import spinal.core._
 import spinal.lib._
 import spinal.lib.bus.amba4.axi.{Axi4, Axi4Config}
@@ -43,8 +43,8 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val storePort   = Flow(DStoreCmd())
     val axi         = master(Axi4(axiCfg))
 
-    // ---- translation (load path only) ----
-    val xlate = host[TranslationService]
+    // ---- translation (load path only; D-side TLB) ----
+    val xlate = host[DTranslationService]
     val xlateVpn = UInt(20 bits)
     xlate.req.vpn        := xlateVpn
     xlate.req.supervisor := False

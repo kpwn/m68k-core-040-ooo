@@ -50,6 +50,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Branch EU: issue port 2 (branch-class) -> branch EU; completion -> ROB
       // branchCompletion (records {mispredict, nextPc} for commit-time recovery).
       branchEu.issue << iq.issue(2)
+      // LS issue port (LS3): no LS EU in this DUT — tie its ready off so the IQ's
+      // issue(3) Stream is fully driven.
+      iq.issue(3).ready := False
       rob.logic.branchCompletion.valid   := branchEu.completion.valid
       rob.logic.branchCompletion.payload := branchEu.completion.payload
       rob.logic.completion(0).valid   := eu0.completion.valid

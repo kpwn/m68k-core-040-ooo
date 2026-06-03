@@ -4,7 +4,7 @@ import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
 import m68k040.isa.Size
 import m68k040.ls.BehavioralMemAgent
-import m68k040.mmu.IdentityTranslationPlugin
+import m68k040.mmu.DIdentityTranslationPlugin
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -18,7 +18,7 @@ class DcacheSpec extends AnyFunSuite {
     val db   = new Database
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
-    val xlate  = new IdentityTranslationPlugin
+    val xlate  = new DIdentityTranslationPlugin
     val dcache = new DcachePlugin
     val probe  = new DcacheProbePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, dcache, probe)) }

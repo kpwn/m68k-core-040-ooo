@@ -6,7 +6,7 @@ import m68k040.cache.DcachePlugin
 import m68k040.execute.LsEuPlugin
 import m68k040.execute.regfile.RegFilePluginInt
 import m68k040.isa.{MemOp, Size}
-import m68k040.mmu.IdentityTranslationPlugin
+import m68k040.mmu.DIdentityTranslationPlugin
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
@@ -19,7 +19,7 @@ class LsEuSpec extends AnyFunSuite {
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
     val rfInt  = new RegFilePluginInt
-    val xlate  = new IdentityTranslationPlugin
+    val xlate  = new DIdentityTranslationPlugin
     val dcache = new DcachePlugin
     val eu     = new LsEuPlugin
     val src    = new LsEuSourcePlugin

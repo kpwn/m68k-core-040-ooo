@@ -61,12 +61,17 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
         val selComb  = CombInit(sel)                   // sel after issue this cycle
         val triggers = Reg(Bits((priority + 1) bits)) init 0
         val context  = Reg(IqContext())
-        // Dynamic LS dependency: a source physreg produced by an in-flight LS load
-        // (lsBusy) holds the slot NOT-ready until lsWakeup clears it. Computed below
-        // (lsDep wire) after lsBusy is in scope; default False here.
-        val lsDep    = Bool()
+        // Dynamic LS dependency: a REGISTERED per-slot bit (like `triggers`), set at
+        // push if a source physreg is produced by an in-flight LS load, cleared on
+        // the matching lsWakeup. Keeping it a single registered bit (vs reading the
+        // 48-wide lsBusy in the ready cone) keeps the lsBusy->ready->select->PRF-read
+        // path off the FMax-critical S0 arc (variant-A FMax fix). `lsDepNext` (a wire)
+        // holds the combinational next value; the compaction/maintenance below writes
+        // the reg from it (default keep).
+        val lsWait     = Reg(Bool()) init False
+        // default: hold (overridden by compaction-shift and lsWakeup-clear below).
         // triggers==0 (static latency-1) AND no pending LS source -> ready.
-        val ready    = sel && (if (priority == 0) True else triggers(priority - 1 downto 0) === 0) && !lsDep
+        val ready    = sel && (if (priority == 0) True else triggers(priority - 1 downto 0) === 0) && !lsWait
 
         when(fire) { selComb := False }
         sel := selComb
@@ -104,13 +109,6 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // mechanism (which assumes latency-1): LS producers are tracked ONLY here, not
     // in sbInt, so trigInit never sets a static (auto-clearing) trigger for them.
     val lsBusy = Reg(Bits(48 bits)) init 0
-
-    // Drive each slot's lsDep from lsBusy + its source physregs.
-    for (slot <- slots) {
-      val u = slot.context.uop
-      slot.lsDep := (u.psrcAValid && lsBusy(u.psrcA)) ||
-                    (u.psrcBValid && !u.useImm && lsBusy(u.psrcB))
-    }
 
     // LS class predicate: cluster == LS and a real memory op.
     def isLs(u: RenamedUop): Bool = (u.cluster === m68k040.isa.Cluster.LS) && (u.memOp =/= m68k040.isa.MemOp.NONE)
@@ -232,6 +230,19 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val pushUop1 = pushPort.payload(1).uop
     val trig0 = trigInit(pushUop0, slot0Prio + 1)
     val trig1 = trigInit(pushUop1, slot1Prio + 1)
+
+    // Push-time LS dependency: does this uop read a physreg produced by an
+    // in-flight (not-yet-completed) LS load? (Intra-push slot1<-slot0 LS handled
+    // below.) Reads lsBusy at push (off the issue/PRF-read critical path).
+    def lsDepInit(uop: RenamedUop): Bool =
+      (uop.psrcAValid && lsBusy(uop.psrcA)) || (uop.psrcBValid && !uop.useImm && lsBusy(uop.psrcB))
+    val lsDep0 = lsDepInit(pushUop0)
+    val lsDep1Base = lsDepInit(pushUop1)
+    // Intra-push: slot1 reads slot0's dst and slot0 is an LS load -> slot1 waits.
+    val s0IsLsLoad = isLs(pushUop0) && (pushUop0.memOp === m68k040.isa.MemOp.LOAD) && pushUop0.pdstValid
+    val lsDep1 = lsDep1Base ||
+      (s0IsLsLoad && pushUop1.psrcAValid && (pushUop1.psrcA === pushUop0.pdst)) ||
+      (s0IsLsLoad && pushUop1.psrcBValid && !pushUop1.useImm && (pushUop1.psrcB === pushUop0.pdst))
     // Intra-push: slot1 reads a physreg that slot0 (pushed same cycle) writes.
     // slot0 ends at slot0Prio; set slot1's trigger bit there.
     val s0WritesInt  = pushUop0.pdstValid
@@ -251,6 +262,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
           wDst.context  := wSrc.context
           wDst.triggers := (wSrc.triggers >> wayCount).resized
           wDst.sel      := wSrc.selComb
+          wDst.lsWait   := wSrc.lsWait     // LS dependency shifts with the slot
         }
       }
       // New uops into the last line.
@@ -261,9 +273,11 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       wDst0.context  := wSrc0
       wDst0.triggers := trig0
       wDst0.sel      := True
+      wDst0.lsWait   := lsDep0
       wDst1.context  := wSrc1
       wDst1.triggers := trig1
       wDst1.sel      := pushSlot1Port
+      wDst1.lsWait   := lsDep1
     }
 
     // ---- Apply wakeup events (clears trigger bits). MUST come after the
@@ -275,6 +289,24 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     for (j <- 0 until slotCount) {
       when(eventsMoved(j)) {
         slots.filter(_.priority >= j).foreach(s => s.triggers(j) := False)
+      }
+    }
+
+    // ---- LS dynamic wakeup: clear lsWait for slots reading the woken pdst. ----
+    // Mirrors the trigger/eventsMoved shift discipline: on a compaction cycle the
+    // matched slot moves down by wayCount, so the clear is applied to slot i-wayCount.
+    // Placed AFTER the compaction block so it overrides the shifted lsWait value.
+    val lsWakeMatch = Vec(slots.map { s =>
+      val u = s.context.uop
+      lsWakeupPort.valid && s.sel &&
+        ((u.psrcAValid && (u.psrcA === lsWakeupPort.payload)) ||
+         (u.psrcBValid && !u.useImm && (u.psrcB === lsWakeupPort.payload)))
+    })
+    for (i <- 0 until slotCount) {
+      when(lsWakeMatch(i)) {
+        // on a non-compaction cycle, clear slot i; on compaction, clear slot i-wayCount.
+        when(pushPort.fire) { if (i >= wayCount) slots(i - wayCount).lsWait := False }
+          .otherwise        { slots(i).lsWait := False }
       }
     }
 
