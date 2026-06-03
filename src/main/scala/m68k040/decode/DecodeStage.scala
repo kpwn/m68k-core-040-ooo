@@ -7,7 +7,7 @@ import spinal.lib.misc.plugin.FiberPlugin
 
 /** DecodeStage: 2-wide decode plugin.
   *
-  * Hosts two SimpleDecodeUnit instances (one per slot), drives uop validity
+  * Hosts two MicroOpAssembler decodes (one per slot), drives uop validity
   * from the feed handshake (not from DecodePacket.valid, which is don't-care
   * from the Aligner), and provides a 1:1 combinational passthrough.
   */
@@ -20,8 +20,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val uopsPort = Stream(Vec(DecodedUop(), 2))
 
     // Combinational decode of both slots
-    val d0 = SimpleDecodeUnit.decode(df.feed.payload(0))
-    val d1 = SimpleDecodeUnit.decode(df.feed.payload(1))
+    val d0 = MicroOpAssembler.assemble(df.feed.payload(0))
+    val d1 = MicroOpAssembler.assemble(df.feed.payload(1))
 
     // Assign decoded content, then override validity from the feed handshake.
     // Use allowOverride on the .valid fields to resolve the overlap between the
