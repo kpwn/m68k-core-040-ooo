@@ -2,7 +2,7 @@ package m68k040.execute
 
 import m68k040.cache.{DcacheService, DLoadCmd, DStoreCmd}
 import m68k040.execute.iq.IqContext
-import m68k040.execute.regfile.{IntRegFileService, RegFileReadPort, RegFileWritePort, RegFileBypassPort}
+import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, RegFileReadPort, RegFileWritePort, RegFileBypassPort}
 import m68k040.isa.MemOp
 import m68k040.ls.{StoreQueue, SqAlloc, SqFwdQuery}
 import m68k040.services.DTranslationService
@@ -49,6 +49,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   var rdBase, rdData: RegFileReadPort = null
   var intW: RegFileWritePort = null
   var intByp: RegFileBypassPort = null
+  var nzvcW: RegFileWritePort = null
+  var nzvcByp: RegFileBypassPort = null
 
   override def issue: Stream[IqContext] = issuePort
   override def completion: Flow[UInt]   = completionPort
@@ -70,6 +72,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     rdData = irf.newRead()
     intW   = irf.newWrite(latency = 1)
     intByp = irf.newBypass()
+    // MOVE-to-memory sets NZVC (impl (a)): the LS EU writes the NZVC PRF + bypass at
+    // store completion. rename allocates the store µop a unique pNzvcDst, so this
+    // distinct physical write port never collides with the ALU EUs' NZVC writers.
+    val nz = host[NzvcRegFileService]
+    nzvcW   = nz.newWrite(latency = 1)
+    nzvcByp = nz.newBypass()
   }
 
   val logic = during build new Area {
@@ -227,6 +235,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val compPdstValid = RegInit(False)
     val compIsLoad    = RegInit(False)   // load (writes a reg + wakes) vs store
     val compDstArch   = Reg(UInt(5 bits))
+    // NZVC writeback for a MOVE-to-memory store (N/Z of the moved value, V=C=0).
+    val compNzvc      = Reg(Bits(4 bits))
+    val compNzvcWrite = RegInit(False)
+    val compNzvcDst   = Reg(UInt(nzvcW.address.getWidth bits))
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax #2: PIPELINE the SQ-forward query result -> completion decision.
@@ -263,6 +275,21 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val aDone    = RegInit(False)
     val lineOff  = s1Va(3 downto 0)
 
+    // ---- MOVE-to-memory NZVC (computed from the store data at the access size) ----
+    // m68k MOVE sets N = sign bit of the moved value at the size, Z = (value==0 over
+    // the size's bytes), V = 0, C = 0. The store data (s1Data) holds the source
+    // register; only the low `size` bytes are written / observed. Computed off the
+    // already-registered s1Data (no new long arc).
+    val stN = u1.size.mux(
+      m68k040.isa.Size.BYTE -> s1Data(7),
+      m68k040.isa.Size.WORD -> s1Data(15),
+      m68k040.isa.Size.LONG -> s1Data(31))
+    val stZ = u1.size.mux(
+      m68k040.isa.Size.BYTE -> (s1Data(7 downto 0)  === 0),
+      m68k040.isa.Size.WORD -> (s1Data(15 downto 0) === 0),
+      m68k040.isa.Size.LONG -> (s1Data === 0))
+    val storeNzvc = stN ## stZ ## False ## False   // N Z V(0) C(0)
+
     // captured-decision -> register (called in the decision cycle)
     def captureCompletion(result: Bits): Unit = {
       compValid     := True
@@ -272,6 +299,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compPdstValid := u1.pdstValid
       compIsLoad    := isLoad
       compDstArch   := u1.dstArch
+      // A MOVE store carries writesNzvc -> compute + write the renamed NZVC PRF.
+      // (Loads do not write NZVC: u1.writesNzvc is False for the load µop.)
+      compNzvc      := storeNzvc
+      compNzvcWrite := u1.writesNzvc
+      compNzvcDst   := u1.pNzvcDst
     }
 
     // ---- drive completion / writeback / wakeup from the registered stage ----
@@ -283,6 +315,15 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     intByp.valid   := compValid && compPdstValid
     intByp.address := compPdst
     intByp.data    := compData
+    // NZVC writeback + bypass for a MOVE-to-memory store (mirrors the int path; the
+    // bypass forwards to a dependent flag-reader issuing the same cycle, exactly as
+    // the ALU EU's NZVC bypass).
+    nzvcW.valid     := compValid && compNzvcWrite
+    nzvcW.address   := compNzvcDst
+    nzvcW.data      := compNzvc
+    nzvcByp.valid   := nzvcW.valid
+    nzvcByp.address := nzvcW.address
+    nzvcByp.data    := nzvcW.data
     // Dynamic load-wakeup: only a completing LOAD that produces a physreg broadcasts
     // (a store completes too but writes no register — its pdst is stale).
     wakeupPort.valid   := compValid && compIsLoad && compPdstValid
@@ -310,7 +351,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     }
 
     // compValid is a single-cycle pulse: default-clear, re-set only by a capture.
+    // compNzvcWrite likewise (so a stale store's NZVC write does not linger).
     compValid := False
+    compNzvcWrite := False
 
     val fsm = new StateMachine {
       val IDLE    = new State with EntryPoint
@@ -448,8 +491,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     wbObs.dstArch   := compDstArch
     wbObs.result    := compData
     wbObs.intWrite  := compPdstValid
-    wbObs.nzvc      := B(0, 4 bits)
-    wbObs.nzvcWrite := False
+    wbObs.nzvc      := compNzvc          // MOVE-to-memory store flags (else don't-care)
+    wbObs.nzvcWrite := compNzvcWrite     // True only for a MOVE-to-memory store
     wbObs.x         := False
     wbObs.xWrite    := False
     wbObs.simPublic()

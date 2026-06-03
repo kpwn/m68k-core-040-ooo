@@ -461,6 +461,51 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       checkMem = Seq(0x2000L))
   }
 
+  // ── MOVE-to/from-memory CCR (the bug fix) ──────────────────────────────────
+  // MOVE (all sizes) sets N/Z from the moved value and clears V/C — INCLUDING
+  // MOVE to memory. These programs move NEGATIVE and ZERO values to/from memory
+  // and lock-step the committed CCR against Musashi (which sets MOVE flags). The
+  // store µop now carries writesNzvc (impl (a)); the load-back's op µop sets NZVC
+  // from the loaded value. Each ends with a `move.l Dn,Dm` so a divergent CCR (if
+  // the store/load failed to set flags) is visible at commit, not just in memory.
+
+  test("lock-step: MOVE negative value TO memory sets N (CCR)", VerilatorTest) {
+    // D0 = -1 (0xFFFFFFFF). store D0 -> 0x2000 sets N=1,Z=0,V=0,C=0. The store's
+    // committed CCR must show N set (pre-fix it stayed 0). Load it back into D1
+    // (the load-back's MOVE also sets N). mem[0x2000] == 0xFFFFFFFF.
+    runLockStep("move-neg-to-mem",
+      "moveq #-1,%d0 ; move.l %d0,0x2000 ; move.l 0x2000,%d1",
+      checkMem = Seq(0x2000L))
+  }
+
+  test("lock-step: MOVE zero value TO memory sets Z (CCR)", VerilatorTest) {
+    // First dirty CCR with a negative move (N=1), then store ZERO -> the store must
+    // set Z=1,N=0 (CCR changes from N to Z). Pre-fix the store left CCR=N, diverging.
+    runLockStep("move-zero-to-mem",
+      "moveq #-5,%d0 ; move.l %d0,0x2004 ; moveq #0,%d1 ; move.l %d1,0x2000 ; move.l 0x2000,%d2",
+      checkMem = Seq(0x2000L, 0x2004L))
+  }
+
+  test("lock-step: MOVE.W negative word TO memory sets N at word size", VerilatorTest) {
+    // D0 low word = 0x8000 (negative at WORD size, but POSITIVE at long). move.w
+    // D0,0x2000 must compute N from bit15 (=1), Z=0. Exercises size-correct N. The
+    // long value 0x00008000 would give N=0 at long size, so this distinguishes the
+    // size handling. Load the word back into D1 (zero-extended).
+    runLockStep("move-negw-to-mem",
+      "move.l #0x00008000,%d0 ; move.w %d0,0x2000 ; moveq #0,%d1 ; move.w 0x2000,%d1",
+      checkMem = Seq(0x2000L), checkSpan = 2)
+  }
+
+  test("lock-step: MOVE negative/zero FROM memory sets CCR (mem->Dn)", VerilatorTest) {
+    // Store a NEGATIVE long, load it back -> the load-back MOVE sets N. Then store
+    // ZERO, load it back -> the load-back MOVE sets Z. Verifies MOVE mem->Dn flags
+    // from the LOADED value for both negative and zero.
+    runLockStep("move-from-mem-flags",
+      "moveq #-1,%d0 ; move.l %d0,0x2000 ; move.l 0x2000,%d1 ; " +
+      "moveq #0,%d2 ; move.l %d2,0x2004 ; move.l 0x2004,%d3",
+      checkMem = Seq(0x2000L, 0x2004L))
+  }
+
   test("lock-step: two loads + add", VerilatorTest) {
     // Two cracked loads feeding an add: D2 = mem[0x2000] + mem[0x2004] = 10 + 20 = 30.
     // Each load immediately follows its producing store so it resolves via the
@@ -501,8 +546,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   test("lock-step: word-misaligned store then load-back", VerilatorTest) {
     // move.w %d0,0x2003 : a WORD at odd offset 3 within line 0x2000 (misaligned,
     // single line) store + word load-back. Data is positive (bit15=0) so the MOVE
-    // CCR is 0 in both DUT and oracle (stores/loads do not compute CCR in this
-    // slice; matching today's aligned store lock-step convention).
+    // CCR is 0 (N=0,Z=0,V=0,C=0) in both DUT and oracle. (MOVE-to/from-memory NOW
+    // computes CCR — see the move-neg/zero-to-mem programs for the N/Z coverage.)
     runLockStep("misaligned-word",
       "move.l #0x00001234,%d0 ; move.w %d0,0x2003 ; moveq #0,%d1 ; move.w 0x2003,%d1",
       checkMem = Seq(0x2003L), checkSpan = 2)
