@@ -4,7 +4,7 @@ import m68k040.M68kParams
 import m68k040.M68kSpinalConfig
 import m68k040.core.{M68kCore, ParamPlugin}
 import m68k040.cache.{IcachePlugin, DcachePlugin}
-import m68k040.mmu.{IdentityTranslationPlugin, DIdentityTranslationPlugin}
+import m68k040.mmu.{IdentityTranslationPlugin, DtlbPlugin}
 import m68k040.frontend.FetchAlignPlugin
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
@@ -101,7 +101,7 @@ object GenFullCoreSynthVerilog {
         new M68kCore(Seq[FiberPlugin](
           new ParamPlugin(p),
           new IdentityTranslationPlugin(),
-          new DIdentityTranslationPlugin(),
+          new DtlbPlugin(),
           new IcachePlugin(),
           new DcachePlugin(),
           new FetchAlignPlugin(),

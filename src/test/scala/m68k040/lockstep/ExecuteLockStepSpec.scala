@@ -2,7 +2,7 @@ package m68k040.lockstep
 
 import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
-import m68k040.mmu.{IdentityTranslationPlugin, DIdentityTranslationPlugin}
+import m68k040.mmu.{IdentityTranslationPlugin, DtlbPlugin}
 import m68k040.cache.{IcachePlugin, DcachePlugin}
 import m68k040.frontend.FetchAlignPlugin
 import m68k040.decode.DecodeStage
@@ -95,6 +95,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   class FullCoreDut extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
+    val dtlb   = new DtlbPlugin
     val icache = new IcachePlugin
     val dcache = new DcachePlugin
     val fa     = new FetchAlignPlugin
@@ -114,7 +115,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
       new IdentityTranslationPlugin,
-      new DIdentityTranslationPlugin,
+      dtlb,
       icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu,
       rfInt, rfNzvc, rfX, wire)) }
   }
@@ -253,6 +254,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Attach a behavioral read/write memory to the D-cache AXI (separate image,
       // zeroed; the programs store before they load, so no data preload needed).
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      // Attach a behavioral memory to the DTLB walker AXI (the page table lives here
+      // when the MMU is enabled; idle for MMU-disabled programs). MMU disabled by
+      // default -> identity passthrough, so existing programs are unchanged.
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      dut.dtlb.logic.mmuEnable #= false
+      dut.dtlb.logic.rootPtr   #= 0
 
       // Idle the frontend; consumer-driven ready ports default high downstream.
       dut.fa.logic.redirect.valid #= false
