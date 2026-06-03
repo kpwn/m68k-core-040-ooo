@@ -48,6 +48,13 @@ object MicroOpAssembler {
     // and the op reads T0 in the EASRC slot.
     val crackLoad = usesSrcEa && srcIsMem
 
+    // MOVE reg -> memSimple destination -> a single STORE µop (data = the register
+    // source). Mem-to-mem (source also memSimple) is deferred. RMW (ALU op with a
+    // memory dst) is deferred (only MOVE stores). The store data is the MOVE source
+    // register (which OperationDecoder placed in the srcB EASRC slot).
+    val dstIsMem  = (dstEa.klass === EaClass.MEMSIMPLE)
+    val crackStore = (spec.op === DecOp.MOVE) && usesDstEa && dstIsMem && srcIsReg
+
     // ── opUop = the operation (EASRC operand routed to T0 when cracked) ────────
     val opUop = DecodedUop()
     opUop.valid         := pkt.valid
@@ -152,11 +159,35 @@ object MicroOpAssembler {
     ldUop.branchDisp    := 0
     ldUop.unimplemented := False
 
+    // ── stUop = the STORE (used only when crackStore) ──────────────────────────
+    // Address = dst base An (psrcA) + dst disp(imm); data = the MOVE source register
+    // (srcB). No int dst, no flags (MOVE to memory writes no NZVC).
+    val stUop = DecodedUop()
+    stUop.valid         := pkt.valid
+    stUop.pc            := pkt.pc
+    stUop.op            := DecOp.MOVE
+    stUop.cluster       := Cluster.LS
+    stUop.size          := spec.size
+    stUop.memOp         := MemOp.STORE
+    stUop.srcAReg       := dstEa.base; stUop.srcAValid := dstEa.baseValid
+    stUop.srcBReg       := srcEa.reg;  stUop.srcBValid := True            // store data
+    stUop.dstReg        := 0;          stUop.dstValid  := False
+    stUop.useImm        := True
+    val stPcRelAddr = (pkt.pc + U(2, 32 bits) + dstEa.disp.asUInt).asBits
+    stUop.imm           := Mux(dstEa.pcRel, stPcRelAddr, dstEa.disp)
+    stUop.readsNzvc     := False; stUop.readsX := False
+    stUop.writesNzvc    := False; stUop.writesX := False
+    stUop.isBranch      := False; stUop.cond := 0
+    stUop.branchDisp    := 0
+    stUop.unimplemented := False
+
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
     // Defer: non-simple, illegal op, a USED src EA that is neither reg/imm nor a
-    // crackable memSimple, or a USED dst EA that is not a register (memSimple store
-    // is Task 4; until then it stays unimplemented). `bad` also disables cracking.
-    val bad = !pkt.simple || spec.illegal || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstEaOk)
+    // crackable memSimple, or a USED dst EA that is not a register AND not a
+    // crackable MOVE store (mem-to-mem MOVE and RMW-to-mem stay unimplemented).
+    // `bad` also disables cracking.
+    val dstOk = dstEaOk || crackStore
+    val bad = !pkt.simple || spec.illegal || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk)
     when(bad) {
       opUop.op            := DecOp.ILLEGAL
       opUop.cluster       := Cluster.INT
@@ -167,9 +198,19 @@ object MicroOpAssembler {
     }
 
     // ── Sequence selection (each slot driven exactly once) ─────────────────────
-    // crackLoad & !bad -> [load, op] (count 2); else -> [op] (count 1, op carries
-    // the illegal override when bad).
-    when(crackLoad && !bad) {
+    // bad        -> [op] (count 1, op carries the illegal override)
+    // crackStore -> [store] (count 1)
+    // crackLoad  -> [load, op] (count 2)
+    // else       -> [op] (count 1)
+    when(bad) {
+      out.count   := 1
+      out.uops(0) := opUop
+      out.uops(1) := opUop
+    } elsewhen(crackStore) {
+      out.count   := 1
+      out.uops(0) := stUop
+      out.uops(1) := stUop
+    } elsewhen(crackLoad) {
       out.count   := 2
       out.uops(0) := ldUop
       out.uops(1) := opUop
