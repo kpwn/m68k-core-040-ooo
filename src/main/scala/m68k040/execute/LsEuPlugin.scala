@@ -334,7 +334,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
               sq.io.alloc.valid := True
               captureCompletion(B(0, 32 bits))
             } otherwise {
-              busy := True   // walking: hold s1Valid, retry
+              // DTLB walking: hold THIS store in S1 and retry. `busy` alone is not
+              // enough (the S0->S1 advance reads the pre-update busy and would clear
+              // s1Valid this cycle), so re-assert s1Valid explicitly (later write wins).
+              busy := True
+              s1Valid := True
             }
           } elsewhen(isLoad) {
             // Only proceed once translation is resolved (s1Paddr feeds the SQ fwd
@@ -345,6 +349,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
               fwdStall := sq.io.fwd.rsp.stall
               fwdData  := sq.io.fwd.rsp.data
               goto(RESOLVE)
+            } otherwise {
+              // DTLB walking: hold THIS load in S1 (s1Valid would otherwise be
+              // cleared by the pre-update-busy S0->S1 advance) and retry.
+              s1Valid := True
             }
             busy := True   // hold s1 (busy) so the SQ query stays stable into RESOLVE
           } otherwise {

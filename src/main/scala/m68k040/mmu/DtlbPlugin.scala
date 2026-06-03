@@ -242,5 +242,11 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       _rsp.cacheMode := CacheMode.CACHEABLE
       _rsp.fault     := False
     }
+
+    // Sim-only sticky fault observation: set whenever a translation resolves with a
+    // fault flagged (FLAGGED only — no exception delivery this slice). The lock-step
+    // harness asserts it for the non-resident-page fault test.
+    val faultSeen = RegInit(False); faultSeen.simPublic()
+    when(_rsp.ready && _rsp.fault) { faultSeen := True }
   }
 }

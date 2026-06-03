@@ -8,7 +8,6 @@ import m68k040.ls.BehavioralMemAgent
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
-import spinal.lib.bus.amba4.axi.Axi4
 import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
 import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
