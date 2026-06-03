@@ -38,9 +38,22 @@ class StoreQueueSpec extends AnyFunSuite {
     dut.io.alloc.valid #= false
     dut.io.commit.valid #= false
     dut.io.flush #= false
+    dut.io.drainAck #= false
     setQuery(dut, 0, 0, Size.LONG)
     cd.waitSampling(3)
     cd
+  }
+
+  /** Model the D-cache's write-through ack: a drained store is presented for one
+    * cycle (io.drain.valid) then HELD resident until ack. This fork acks the cycle
+    * after each drain-issue (a 1-cycle write-through), mirroring DcachePlugin.storeAck. */
+  def forkDrainAck(dut: StoreQueue, cd: ClockDomain): Unit = fork {
+    while (true) {
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+    }
   }
 
   test("alloc then a younger load forwards full-overlap data", VerilatorTest) {
@@ -70,6 +83,7 @@ class StoreQueueSpec extends AnyFunSuite {
   test("committed oldest entry drains; flush squashes uncommitted younger entry", VerilatorTest) {
     M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
       val cd = initDut(dut)
+      forkDrainAck(dut, cd)
       // A (older, robId 4) committed; B (younger, robId 8) uncommitted
       alloc(dut, cd, robId = 4, paddr = 0x100, data = 0x11111111L, Size.LONG)
       alloc(dut, cd, robId = 8, paddr = 0x200, data = 0x22222222L, Size.LONG)
@@ -97,6 +111,35 @@ class StoreQueueSpec extends AnyFunSuite {
       // after A drains the queue is empty
       sleep(1)
       assert(!dut.io.drain.valid.toBoolean, "empty after A drains")
+      cd.waitSampling(2)
+    }
+  }
+
+  test("drained-but-unacked entry still forwards (drain-window hazard)", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      // store committed -> it will be presented on io.drain. Hold ack OFF so the
+      // entry stays in the drain window (memory write not yet acknowledged).
+      alloc(dut, cd, robId = 4, paddr = 0x100, data = 0xCAFEBABEL, Size.LONG)
+      commit(dut, cd, robId = 4)
+      // wait for the drain to be presented (io.drain.valid pulses), keep ack low
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
+      // NEXT cycles: entry is "drained" (presented) but UNACKED -> must still be
+      // resident and forward to a younger load that would otherwise miss L1D.
+      cd.waitSampling()
+      setQuery(dut, robId = 6, paddr = 0x100, Size.LONG)
+      sleep(1)
+      assert(dut.io.drain.valid.toBoolean == false, "must not re-present an in-flight drain")
+      assert(dut.io.fwd.rsp.hit.toBoolean, "drained-but-unacked store must still forward")
+      assert(dut.io.fwd.rsp.data.toLong == 0xCAFEBABEL, s"fwd data ${dut.io.fwd.rsp.data.toLong.toHexString}")
+      // now ack -> entry pops, forwarding stops
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      cd.waitSampling()
+      setQuery(dut, robId = 6, paddr = 0x100, Size.LONG)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean, "after ack+pop the entry no longer forwards")
       cd.waitSampling(2)
     }
   }

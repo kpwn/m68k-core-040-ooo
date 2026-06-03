@@ -30,6 +30,7 @@ trait DcacheService {
   def loadRsp:  spinal.lib.Flow[DLoadRsp]     // fixed offset for a hit; valid late on a miss-refill
   def loadBusy: Bool                          // high while a refill is in flight (back-pressures loads)
   def store:    spinal.lib.Flow[DStoreCmd]    // write-through: update line if hit + write memory
+  def storeAck: Bool                          // 1-cycle pulse when a write-through landed in memory (AXI B)
 }
 
 /** Big-endian byte-lane helpers shared by load extraction and store merge.
