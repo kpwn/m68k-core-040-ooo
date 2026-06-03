@@ -120,6 +120,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val s1Ext  = DcacheByteLane.extract(s1Line, s1Off, s1Size)
     loadRspPort.valid       := s1Valid
     loadRspPort.payload.data  := s1Ext
+    loadRspPort.payload.line  := s1Line
     loadRspPort.payload.fault := s1Fault
 
     // ---- STORE write-through ----

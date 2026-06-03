@@ -133,8 +133,16 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val s1Paddr = (xlate.rsp.ppn ## s1Va(11 downto 0)).asUInt
 
     // ---- dcache load cmd defaults ----
+    // The FSM selects the access address: slot A = s1Va, slot B = s1AddrB (the
+    // next-line / next-page base). The cache translates whatever vaddr we present
+    // (its xlateVpn := loadCmd.vaddr[31:12]), so driving s1AddrB here naturally
+    // issues slot B's translation (the next page's VPN on a page-cross, the same
+    // page on a line-cross). We always issue size=LONG on a cross access so the
+    // cache reads/extracts the whole line slice; the merge selects the bytes.
+    val loadVaddr = UInt(32 bits)
+    loadVaddr := s1Va
     dcache.loadCmd.valid        := False
-    dcache.loadCmd.payload.vaddr := s1Va
+    dcache.loadCmd.payload.vaddr := loadVaddr
     dcache.loadCmd.payload.size  := u1.size
 
     // ---- SQ alloc + fwd defaults ----
@@ -197,6 +205,15 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val fwdStall = RegInit(False)
     val fwdData  = Reg(Bits(32 bits))
 
+    // ---- two-access (cross-line / cross-page) capture ----
+    // The captured 128-bit line from slot A; slot B's line arrives in WAIT_B and
+    // is merged with it. `lineOff` is the byte offset of the access within line A.
+    // `aDone` records that slot A's line was captured (loadRsp is a 1-cycle pulse,
+    // so we latch it and then keep driving slot B's cmd until the cache accepts it).
+    val lineA    = Reg(Bits(128 bits))
+    val aDone    = RegInit(False)
+    val lineOff  = s1Va(3 downto 0)
+
     // captured-decision -> register (called in the decision cycle)
     def captureCompletion(result: Bits): Unit = {
       compValid     := True
@@ -249,7 +266,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val fsm = new StateMachine {
       val IDLE    = new State with EntryPoint
       val RESOLVE = new State  // registered SQ-fwd result -> completion / cache launch
-      val WAIT    = new State   // cache load cmd accepted, awaiting loadRsp
+      val WAIT    = new State   // aligned: cache load cmd accepted, awaiting loadRsp
+      val WAIT_A  = new State    // cross: slot A accepted, awaiting line A
+      val WAIT_B  = new State    // cross: slot B accepted, awaiting line B -> merge
 
       IDLE.whenIsActive {
         busy := False
@@ -277,26 +296,31 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       // Decision-resolve from the REGISTERED SQ-forward result (off the long
       // s1Paddr -> SQ-compare arc). s1 is still held (busy), so a re-query for the
       // stall-retry path reads stable SQ content.
+      //
+      // A CROSS load (s1TwoAccess) never takes the single-slot full-forward fast
+      // path: the SQ holds a split store as two slots and a same-addr/size forward
+      // can't span the boundary, so a cross load with ANY overlap STALLS until the
+      // older store drains to memory, then reads the merged value from the cache.
       RESOLVE.whenIsActive {
         busy := True
-        when(fwdHit) {
-          // full-overlap forward: skip the cache.
+        when(fwdHit && !s1TwoAccess) {
+          // full-overlap forward: skip the cache (aligned only).
           captureCompletion(fwdData)
           busy    := False
           s1Valid := False
           goto(IDLE)
-        } elsewhen(fwdStall) {
-          // partial/ambiguous overlap: re-sample the SQ this cycle and retry. The
-          // overlapping older store will drain/forward; once it resolves to a full
-          // forward (or no overlap) we proceed. Stays in a (busy) hold.
+        } elsewhen(fwdStall || (fwdHit && s1TwoAccess)) {
+          // overlap with an older store: re-sample the SQ and retry. For a cross
+          // load any overlap (hit or partial) holds until the store drains.
           fwdHit   := sq.io.fwd.rsp.hit
           fwdStall := sq.io.fwd.rsp.stall
           fwdData  := sq.io.fwd.rsp.data
         } otherwise {
           // no forward: drive the cache load; back-pressure on dcache.loadBusy.
+          loadVaddr := s1Va                  // slot A (also the aligned access)
           dcache.loadCmd.valid := True
           when(dcache.loadCmd.fire) {
-            goto(WAIT)
+            when(s1TwoAccess) { aDone := False; goto(WAIT_A) } otherwise { goto(WAIT) }
           }
           // else cache occupied; stay in RESOLVE (busy) and retry next cycle.
         }
@@ -309,6 +333,37 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
         busy := True
         when(dcache.loadRsp.valid) {
           captureCompletion(dcache.loadRsp.payload.data)
+          busy    := False
+          s1Valid := False
+          goto(IDLE)
+        }
+      }
+
+      // CROSS slot A: capture line A (latched via aDone since loadRsp is a 1-cycle
+      // pulse), then launch slot B at s1AddrB (the cache re-translates addrB's VPN:
+      // same page for a line-cross, next page for a page-cross). Each slot can
+      // independently hit / miss-refill the L1D.
+      WAIT_A.whenIsActive {
+        busy := True
+        when(dcache.loadRsp.valid && !aDone) {
+          lineA := dcache.loadRsp.payload.line
+          aDone := True
+        }
+        when(dcache.loadRsp.valid || aDone) {
+          // slot A done -> drive slot B's cmd until the cache accepts it.
+          loadVaddr := s1AddrB
+          dcache.loadCmd.valid := True
+          when(dcache.loadCmd.fire) { goto(WAIT_B) }
+        }
+      }
+
+      // CROSS slot B: capture line B, merge sizeBytes spanning the boundary, done.
+      WAIT_B.whenIsActive {
+        busy := True
+        when(dcache.loadRsp.valid) {
+          val merged = m68k040.cache.DcacheByteLane.extractCross(
+            lineA, dcache.loadRsp.payload.line, lineOff, u1.size)
+          captureCompletion(merged)
           busy    := False
           s1Valid := False
           goto(IDLE)

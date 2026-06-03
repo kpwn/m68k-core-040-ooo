@@ -10,9 +10,13 @@ case class DLoadCmd() extends Bundle {
   val size  = Size()
 }
 
-/** Load response: size-extracted (byte-lane, big-endian) data + fault. */
+/** Load response: size-extracted (byte-lane, big-endian) data + fault. `line` is
+  * the raw 128-bit cache line the access hit (byte i = line[i*8 +: 8]); the LS EU
+  * uses it for the cross-boundary merge of a misaligned access spanning two lines.
+  * The aligned fast path uses `data` exactly as before. */
 case class DLoadRsp() extends Bundle {
   val data  = Bits(32 bits)
+  val line  = Bits(128 bits)
   val fault = Bool()
 }
 
