@@ -69,8 +69,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // s1Ctx.uop.pdst is stale/garbage and could spuriously match a consumer's
       // source physreg, clearing its lsWait early -> the consumer reads the PRF
       // before its real producing load lands. Gate on pdstValid.
-      iq.lsWakeup.valid   := lsEu.completion.valid && lsEu.logic.s1Ctx.uop.pdstValid
-      iq.lsWakeup.payload := lsEu.logic.s1Ctx.uop.pdst
+      iq.lsWakeup.valid   := lsEu.wakeup.valid
+      iq.lsWakeup.payload := lsEu.wakeup.payload
       // ROB retire (slot 0) -> SQ commit; doFlush -> SQ flush (squash speculative).
       lsEu.sqCommit.valid   := rob.logic.retire0
       lsEu.sqCommit.payload := rob.logic.h0

@@ -19,6 +19,10 @@ trait LsEuService {
   def completion: Flow[UInt]   // robId (dynamic-completion wakeup source)
   def sqCommit: Flow[UInt]     // ROB retired this store robId
   def sqFlush: Bool            // mispredict squash
+  // Dynamic load-wakeup broadcast: valid (with the produced pdst) the cycle a LOAD
+  // completes and its data is in the PRF. Registered alongside the completion stage
+  // so consumers do not have to reach into the (now-pipelined) internal s1 context.
+  def wakeup: Flow[UInt]       // pdst of a completing load (valid only when it writes a reg)
 }
 
 /** AGU + Load/Store EU (LS-1 slice): conservative single-outstanding pipe.
@@ -38,6 +42,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   var completionPort: Flow[UInt]   = null
   var sqCommitPort: Flow[UInt]     = null
   var sqFlushSig: Bool             = null
+  var wakeupPort: Flow[UInt]       = null
   var rdBase, rdData: RegFileReadPort = null
   var intW: RegFileWritePort = null
   var intByp: RegFileBypassPort = null
@@ -46,12 +51,14 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   override def completion: Flow[UInt]   = completionPort
   override def sqCommit: Flow[UInt]     = sqCommitPort
   override def sqFlush: Bool            = sqFlushSig
+  override def wakeup: Flow[UInt]       = wakeupPort
 
   during setup {
     issuePort      = Stream(IqContext())
     completionPort = Flow(UInt(6 bits))
     sqCommitPort   = Flow(UInt(6 bits))
     sqFlushSig     = Bool()
+    wakeupPort     = Flow(UInt(6 bits))
     val irf = host[IntRegFileService]
     rdBase = irf.newRead()
     rdData = irf.newRead()
@@ -68,6 +75,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sq.io.commit << sqCommitPort
     sq.io.flush  := sqFlushSig
     dcache.store << sq.io.drain
+    sq.io.drainAck := dcache.storeAck   // pop a drained entry only once memory is written
 
     // ---- S0: read operands ----
     val u0 = issuePort.payload.uop
@@ -95,16 +103,6 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // the cache owns the request port; we read the response.)
     val s1Paddr = (xlate.rsp.ppn ## s1Va(11 downto 0)).asUInt
 
-    // ---- completion / writeback defaults ----
-    completionPort.valid   := False
-    completionPort.payload := s1Ctx.robId
-    intW.valid   := False
-    intW.address := u1.pdst
-    intW.data    := B(0, 32 bits)
-    intByp.valid := False
-    intByp.address := u1.pdst
-    intByp.data    := B(0, 32 bits)
-
     // ---- dcache load cmd defaults ----
     dcache.loadCmd.valid        := False
     dcache.loadCmd.payload.vaddr := s1Va
@@ -120,18 +118,61 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sq.io.fwd.query.paddr := s1Paddr
     sq.io.fwd.query.size  := u1.size
 
-    // ---- wbObs (sim) ----
-    val wbResult  = Bits(32 bits); wbResult := B(0, 32 bits)
-    val wbFire    = Bool(); wbFire := False
-
-    val busy = RegInit(False)
-    issuePort.ready := !busy && !s1Valid   // single-outstanding
-
-    // captured-load registers (for the wait state)
-    val ldData = Reg(Bits(32 bits))
-
     val isLoad  = u1.memOp === MemOp.LOAD
     val isStore = u1.memOp === MemOp.STORE
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // FMax: registered COMPLETION + WRITEBACK stage.
+    //
+    // The decision (SQ-forward compare / store-alloc / cache hit-detect) is a long
+    // combinational arc off s1Paddr. Previously it fed completionPort/intW/wbObs and
+    // hence ROB.completes in the SAME cycle (the 21-level, 72%-route critical path).
+    // We now CAPTURE the decision result into registers in the decision cycle and
+    // DRIVE completion/writeback/wakeup from those registers the NEXT cycle (one
+    // mux level: reg -> port). This splits the arc into
+    //   s1Paddr -> SQ-fwd/cache-hit -> comp* reg   (short)
+    //   comp* reg -> completion -> ROB.completes    (short)
+    // at the cost of ONE extra completion-latency cycle (lock-step is latency-
+    // agnostic). All comp* are RegInit/Reg (no uninit fanout).
+    val compValid     = RegInit(False)
+    val compRobId     = Reg(UInt(6 bits))
+    val compData      = Reg(Bits(32 bits))
+    val compPdst      = Reg(UInt(6 bits))
+    val compPdstValid = RegInit(False)
+    val compIsLoad    = RegInit(False)   // load (writes a reg + wakes) vs store
+    val compDstArch   = Reg(UInt(5 bits))
+
+    // captured-decision -> register (called in the decision cycle)
+    def captureCompletion(result: Bits): Unit = {
+      compValid     := True
+      compRobId     := s1Ctx.robId
+      compData      := result
+      compPdst      := u1.pdst
+      compPdstValid := u1.pdstValid
+      compIsLoad    := isLoad
+      compDstArch   := u1.dstArch
+    }
+
+    // ---- drive completion / writeback / wakeup from the registered stage ----
+    completionPort.valid   := compValid
+    completionPort.payload := compRobId
+    intW.valid     := compValid && compPdstValid
+    intW.address   := compPdst
+    intW.data      := compData
+    intByp.valid   := compValid && compPdstValid
+    intByp.address := compPdst
+    intByp.data    := compData
+    // Dynamic load-wakeup: only a completing LOAD that produces a physreg broadcasts
+    // (a store completes too but writes no register — its pdst is stale).
+    wakeupPort.valid   := compValid && compIsLoad && compPdstValid
+    wakeupPort.payload := compPdst
+
+    val busy = RegInit(False)
+    // Single-outstanding: do not accept a new µop while a decision is pending
+    // (s1Valid), a load is in flight (busy), or a registered completion is occupying
+    // the writeback stage this cycle (compValid). compValid is a 1-cycle pulse, so
+    // this only stalls issue for that one extra cycle.
+    issuePort.ready := !busy && !s1Valid && !compValid
 
     // S0 -> S1 advance (only when not busy in a wait state)
     when(issuePort.fire) {
@@ -143,18 +184,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       when(!busy) { s1Valid := False }
     }
 
-    def doWriteback(result: Bits): Unit = {
-      intW.valid     := u1.pdstValid
-      intW.address   := u1.pdst
-      intW.data      := result
-      intByp.valid   := u1.pdstValid
-      intByp.address := u1.pdst
-      intByp.data    := result
-      completionPort.valid   := True
-      completionPort.payload := s1Ctx.robId
-      wbResult := result
-      wbFire   := True
-    }
+    // compValid is a single-cycle pulse: default-clear, re-set only by a capture.
+    compValid := False
 
     val fsm = new StateMachine {
       val IDLE = new State with EntryPoint
@@ -166,11 +197,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           when(isStore) {
             // allocate into the SQ; "executes" immediately (no int dst).
             sq.io.alloc.valid := True
-            doWriteback(B(0, 32 bits))
+            captureCompletion(B(0, 32 bits))
           } elsewhen(isLoad) {
             when(sq.io.fwd.rsp.hit) {
               // full-overlap forward: skip the cache.
-              doWriteback(sq.io.fwd.rsp.data)
+              captureCompletion(sq.io.fwd.rsp.data)
             } elsewhen(sq.io.fwd.rsp.stall) {
               // partial/ambiguous overlap: hold S1 and retry next cycle.
               busy := True
@@ -185,17 +216,18 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
               }
             }
           } otherwise {
-            doWriteback(B(0, 32 bits))   // non-memory (defensive)
+            captureCompletion(B(0, 32 bits))   // non-memory (defensive)
           }
         }
       }
 
       // cmd accepted; the dcache delivers exactly one loadRsp (fixed for a hit,
-      // late after a refill). Do NOT re-drive loadCmd here.
+      // late after a refill). Do NOT re-drive loadCmd here. Route the refilled
+      // load through the SAME registered completion stage for uniformity.
       WAIT.whenIsActive {
         busy := True
         when(dcache.loadRsp.valid) {
-          doWriteback(dcache.loadRsp.payload.data)
+          captureCompletion(dcache.loadRsp.payload.data)
           busy    := False
           s1Valid := False
           goto(IDLE)
@@ -204,16 +236,18 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     }
 
     // ---- wbObs (sim-only whitebox) ----
+    // Driven straight from the registered completion stage (already a register), so
+    // the observed writeback aligns exactly with the completion/wakeup the ROB sees.
     val wbObs = WbObs()
-    wbObs.valid     := RegNext(wbFire) init False
-    wbObs.robId     := RegNext(s1Ctx.robId)
-    wbObs.dstArch   := RegNext(u1.dstArch)
-    wbObs.result    := RegNext(wbResult)
-    wbObs.intWrite  := RegNext(u1.pdstValid)
-    wbObs.nzvc      := RegNext(B(0, 4 bits))
-    wbObs.nzvcWrite := RegNext(False)
-    wbObs.x         := RegNext(False)
-    wbObs.xWrite    := RegNext(False)
+    wbObs.valid     := compValid
+    wbObs.robId     := compRobId
+    wbObs.dstArch   := compDstArch
+    wbObs.result    := compData
+    wbObs.intWrite  := compPdstValid
+    wbObs.nzvc      := B(0, 4 bits)
+    wbObs.nzvcWrite := False
+    wbObs.x         := False
+    wbObs.xWrite    := False
     wbObs.simPublic()
   }
 }
