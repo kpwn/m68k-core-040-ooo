@@ -97,7 +97,8 @@ class ExceptionUnit(
   // 7 = format-$7 access-fault). Chooses the pop size (8 vs 60 bytes). For $7 RTE
   // restores SR/PC and RESUMES at the stacked PC (= faulting instr -> re-executes),
   // discarding the rest of the frame — matching MAME's RTE case 7.
-  val popIs7 = RegInit(False)
+  val popIs7 = RegInit(False); popIs7.simPublic()
+  val popFmtWord = Reg(UInt(16 bits)); popFmtWord.simPublic()
 
   // ── redirect outputs (the ROB ORs these into its registered redirect) ────────
   val redirectValid = Bool(); redirectValid := False
@@ -181,6 +182,16 @@ class ExceptionUnit(
     stoSize  := sz
     stoData  := data.resize(32)
   }
+  // Identity supervisor PHYSICAL store WITHOUT a translation request. The exception
+  // frame/vector accesses are physical (paddr == va); the D-cache store port uses the
+  // paddr directly. Driving the DTLB here would (with the MMU live) start a walk whose
+  // multi-cycle not-ready stalls the store state -> re-pulsed stores. So we don't.
+  def driveStoreNoXlate(va: UInt, sz: Size.C, data: Bits): Unit = {
+    stoVld   := True
+    stoPaddr := va
+    stoSize  := sz
+    stoData  := data.resize(32)
+  }
 
   // ENTRY frame-store step. The D-cache store path is single-outstanding, so each
   // word is issued THEN we wait for the write-through ACK (AXI B) before the next —
@@ -244,7 +255,13 @@ class ExceptionUnit(
         curFault  := entryFaultAddr
         // SSW = (in_mmu 0x400) | fc | (rw<<8); fc = data space (bit0=1) + supervisor
         // (bit2) if a supervisor access; rw = read?1:write?0 (MAME m68ki_aerr).
-        val fc  = Mux(entryFaultSup, U(0x5, 3 bits), U(0x1, 3 bits))
+        // The faulting access's privilege = the PRE-exception S bit (SR bit13 =
+        // srSys bit5), read here BEFORE the FSM sets S. (The LS EU's translate-time
+        // supervisor flag is a slice-1 user-only simplification, so the SSW's super
+        // bit comes from the architectural SR, matching the MAME oracle which reads
+        // the SR S bit.) entryFaultSup is retained for a future MOVES/SFC-driven mode.
+        val faultSuper = ss.srSys(5) || entryFaultSup
+        val fc  = Mux(faultSuper, U(0x5, 3 bits), U(0x1, 3 bits))
         val rwB = Mux(entryFaultWr, U(0, 1 bits), U(1, 1 bits))   // write->0, read->1
         curSsw    := (U(0x400, 16 bits) | fc.resize(16) | (rwB ## U(0, 8 bits)).asUInt.resize(16))
         oldSr     := (ss.srSys ## committedCcr.resize(8 bits)).asUInt
@@ -265,13 +282,19 @@ class ExceptionUnit(
     // Wait for older committed stores to fully drain before we use the store port.
     E_DRAIN.whenIsActive { when(sqDrained) { goto(E_STORE) } }
 
-    // ── ENTRY: stack the format-$0 frame (4 words, one at a time) ───────────────
+    // ── ENTRY: stack the frame (one word at a time) ─────────────────────────────
     E_STORE.whenIsActive {
-      // present the translation + the store this cycle; advance to wait-ack only
-      // once translation resolved (identity = same cycle). The store Flow pulse is
-      // latched by the cache this cycle.
-      driveStore(frameWordAddr(stStep), Size.WORD, frameWordData(stStep))
-      when(dtRsp.ready) { goto(E_STWAIT) }
+      // Issue the store EXACTLY ONCE (one cycle), then unconditionally wait its ACK.
+      // The exception sequencer is a supervisor PHYSICAL access: the store paddr is
+      // identity, and the D-cache store port is a backpressure-less Flow using that
+      // paddr directly — it needs NO translation. We must NOT gate on `dtRsp.ready`
+      // (with the MMU live, the frame VPN walks and dtRsp.ready drops for several
+      // cycles, during which the combinational `driveStore` would re-pulse the
+      // REGISTERED store every cycle -> the SAME word stored many times, a
+      // nondeterministic count that races the cache store machine and corrupts the
+      // frame). One cycle here -> exactly one registered store pulse.
+      driveStoreNoXlate(frameWordAddr(stStep), Size.WORD, frameWordData(stStep))
+      goto(E_STWAIT)
     }
     E_STWAIT.whenIsActive {
       // hold nothing on the store port (one-cycle pulse already issued); wait for
@@ -352,6 +375,7 @@ class ExceptionUnit(
       dtoVld := True; dtoVpn := (frameBase + 6)(31 downto 12)
       when(dcLoadRsp.valid) {
         // top nibble 7 => format-$7 access-fault frame.
+        popFmtWord := dcLoadRsp.payload.data(15 downto 0).asUInt
         popIs7 := dcLoadRsp.payload.data(15 downto 12).asUInt === U(7, 4 bits)
         goto(R_REDIR)
       }

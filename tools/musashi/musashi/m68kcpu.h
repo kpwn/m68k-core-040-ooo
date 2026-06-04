@@ -1030,6 +1030,7 @@ extern const uint8    m68ki_ea_idx_cycle_table[];
 extern uint           m68ki_aerr_address;
 extern uint           m68ki_aerr_write_mode;
 extern uint           m68ki_aerr_fc;
+extern int            m68ki_bus_error_step_break;
 
 /* Forward declarations to keep some of the macros happy */
 static inline uint m68ki_read_16_fc (uint address, uint fc);
@@ -2016,6 +2017,11 @@ static inline void m68ki_exception_bus_error(void)
 		 * runner pulses the bus error with these set). in_mmu=1 (MMU-originated). */
 		m68ki_stack_frame_0111(sr, EXCEPTION_BUS_ERROR, REG_PPC,
 			m68ki_aerr_address, m68ki_aerr_write_mode ? 1 : 0, m68ki_aerr_fc, 1);
+		/* Make the access fault a DISCRETE trace step (PC = handler entry); the
+		 * execute loop breaks after the longjmp re-entry instead of folding the
+		 * handler's first instruction into this step. Mirrors our RTL's commit-time
+		 * exception-entry observation. */
+		m68ki_bus_error_step_break = 1;
 	}
 	else
 	{

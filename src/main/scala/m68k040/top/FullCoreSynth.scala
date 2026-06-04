@@ -75,6 +75,10 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     lsEu.issue << iq.issue(3)
     rob.logic.completion(2).valid   := lsEu.completion.valid
     rob.logic.completion(2).payload := lsEu.completion.payload
+    // MMU access-fault completion -> ROB (flags the entry vector 2 + faultAddr/SSW
+    // for precise format-$7 delivery at retire).
+    rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
+    rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
     // The IQ dynamic wakeup is keyed by the producer pdst. The LS EU drives a
     // dedicated `wakeup` Flow from its REGISTERED completion stage (valid only for a
     // completing LOAD that produces a physreg — a store completes too but writes no

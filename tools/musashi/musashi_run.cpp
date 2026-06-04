@@ -51,6 +51,10 @@ int main(int argc, char** argv) {
     uint32_t mmu_root = 0;
     uint32_t mmu_data_lo = 0;
     uint32_t mmu_data_hi = 0;
+    // Page-table preload: little-endian longwords {addr, word} written before run
+    // (the descriptor format is read LE). Lets the harness seed the resident
+    // root/pointer descriptors the data-page walk needs (the handler writes the leaf).
+    std::vector<std::pair<uint32_t, uint32_t>> pt_preload;
 
     for (int i = 1; i < argc; i++) {
         std::string a(argv[i]);
@@ -85,6 +89,13 @@ int main(int argc, char** argv) {
         else if (a == "--mmu-root"    && i + 1 < argc) { mmu_root = parse_u32(argv[++i]); use_mmu = true; }
         else if (a == "--mmu-data-lo" && i + 1 < argc) mmu_data_lo = parse_u32(argv[++i]);
         else if (a == "--mmu-data-hi" && i + 1 < argc) mmu_data_hi = parse_u32(argv[++i]);
+        else if (a == "--mmu-pt" && i + 1 < argc) {
+            const char* spec = argv[++i];
+            const char* sep = std::strchr(spec, ':');
+            if (!sep) { std::fprintf(stderr, "bad --mmu-pt, expected <addr>:<word>: %s\n", spec); return 2; }
+            std::string addr(spec, sep - spec);
+            pt_preload.push_back({parse_u32(addr.c_str()), parse_u32(sep + 1)});
+        }
         else if (a == "--out"        && i + 1 < argc) out_path   = argv[++i];
         else if (a == "--trace"      && i + 1 < argc) trace_path = argv[++i];
         else if (a == "--help" || a == "-h") { std::fputs(USAGE, stdout); return 0; }
@@ -115,6 +126,15 @@ int main(int argc, char** argv) {
     // in normal programs but shouldn't cause false fails if they do.
     ref.add_readonly_range(sentinel, sentinel + 0x10);
     ref.add_readonly_range(0, 8);   // reset vector we wrote manually
+
+    // Page-table preload (little-endian longwords).
+    for (const auto& e : pt_preload) {
+        uint32_t a = e.first, w = e.second;
+        ref.write8(a + 0, (uint8_t)(w & 0xff));
+        ref.write8(a + 1, (uint8_t)((w >> 8) & 0xff));
+        ref.write8(a + 2, (uint8_t)((w >> 16) & 0xff));
+        ref.write8(a + 3, (uint8_t)((w >> 24) & 0xff));
+    }
 
     if (use_irq_at_pc) {
         irq_events.push_back({irq_at_pc, irq_level});

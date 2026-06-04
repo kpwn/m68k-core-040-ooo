@@ -30,16 +30,21 @@ class MmuFaultOracleSpec extends AnyFunSuite {
   // Handler copies the 60-byte ($3C) format-$7 frame from (A7) to scratch @ 0x5000
   // (identity, outside the data window) so the test can inspect the stacked bytes,
   // then maps the page (page[2] resident, PPN 0x42) and RTEs.
+  // Descriptors are stored byte-SWAPPED: a normal m68k `move.l` stores big-endian,
+  // but the page-table descriptor format is read LITTLE-ENDIAN (RTL TableWalker +
+  // the oracle MMU), so the immediate is byteswap(descriptor).
+  //   root[0]=0x00081002 -> 0x02100800 ; ptr[0]=0x00082002 -> 0x02200800
+  //   page[2] resident (PPN 0x42, PDT=01) = 0x00042001 -> 0x01200400
   val program =
-    "move.l #0x00081002,%d1 ; move.l %d1,0x80000 ; " +   // root[0] -> Ptr resident
-    "move.l #0x00082002,%d1 ; move.l %d1,0x81000 ; " +   // ptr[0]  -> Page resident
+    "move.l #0x02100800,%d1 ; move.l %d1,0x80000 ; " +   // root[0] -> Ptr resident
+    "move.l #0x02200800,%d1 ; move.l %d1,0x81000 ; " +   // ptr[0]  -> Page resident
     "move.l #0x00000000,%d1 ; move.l %d1,0x82008 ; " +   // page[2] -> non-resident (pageIdx=2 -> +8)
     "move.l #handler,%d1 ; move.l %d1,0x8 ; " +          // vector 2 (access fault) @ 0x8
     "moveq #42,%d0 ; move.l %d0,0x2000 ; " +             // FAULTS (page non-resident), then re-runs
     "loop: bra loop ; " +
     "handler: move.l %a7,%a0 ; move.l #0x5000,%a1 ; moveq #14,%d2 ; " +
     "cpy: move.l (%a0)+,(%a1)+ ; dbra %d2,cpy ; " +      // copy 15 longs (60 bytes)
-    "move.l #0x00042001,%d1 ; move.l %d1,0x82008 ; rte"
+    "move.l #0x01200400,%d1 ; move.l %d1,0x82008 ; rte"
 
   test("oracle: non-resident page -> format-$7 -> handler maps -> RTE -> resume") {
     val steps = Musashi.assembleAndTrace(program, mmu = mmu, maxCycles = 20000) match {
@@ -84,5 +89,30 @@ class MmuFaultOracleSpec extends AnyFunSuite {
     assert(faultAddr == 0x2000L, f"fault address must be the faulting VA 0x2000 (got 0x$faultAddr%08x)")
     assert(ssw == 0x0405, f"SSW must be 0x0405 (in_mmu|super-data|write) (got 0x$ssw%04x)")
     assert((sr & 0x2000) != 0, f"stacked SR must have S set (got 0x$sr%04x)")
+  }
+
+  // Mirrors the full-core lock-step program (preloaded root[0]/ptr[0]; handler maps
+  // pageA[2]) so the oracle side is validated fast before the slow Verilator run.
+  test("oracle (lock-step program): preloaded table + handler maps pageA[2]") {
+    val PTRT = 0x00081000L; val PAGA = 0x00082000L
+    val src =
+      "move.l #handler,%d1 ; move.l %d1,0x8 ; " +
+      "moveq #42,%d0 ; move.l %d0,0x2000 ; " +
+      "loop: bra loop ; " +
+      "handler: move.l #0x01200400,%d1 ; move.l %d1,0x82008 ; rte"
+    val oraclePt = Seq(
+      0x80000L -> ((PTRT & 0xfffffff0L) | 0x2L),
+      PTRT     -> ((PAGA & 0xfffffff0L) | 0x2L))
+    val cfg = Some(Musashi.MmuConfig(0x80000L, 0x2000L, 0x3000L, oraclePt))
+    val steps = Musashi.assembleAndTrace(src, mmu = cfg, maxCycles = 20000) match {
+      case Right(v) => v; case Left(e) => fail(e.reason) }
+    val pcs = steps.take(12).map(_.pc)
+    info(s"PCs: ${pcs.map(p => f"0x$p%08x").mkString(" ")}")
+    info(s"SRs: ${steps.take(12).map(s => f"0x${s.sr}%04x").mkString(" ")}")
+    val st = Musashi.assembleAndRun(src, mmu = cfg, maxCycles = 20000) match {
+      case Right(s) => s; case Left(e) => fail(e.reason) }
+    val pa = 0x42000L
+    assert(st.finalRam.getOrElse(pa + 3, -1) == 0x2a,
+      f"re-executed store landed 0x${st.finalRam.getOrElse(pa + 3, -1)}%02x at PA 0x${pa+3}%08x")
   }
 }

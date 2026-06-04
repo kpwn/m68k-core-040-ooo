@@ -164,6 +164,18 @@ uint32_t MusashiRef::mmu_translate(uint32_t va, bool rw) {
     // and when the MMU is off.
     if (!mmu_enabled_ || va < mmu_lo_ || va >= mmu_hi_) return va;
 
+    // Page-table descriptors are read LITTLE-ENDIAN — matching the RTL TableWalker
+    // (byte at the lowest address is bits[7:0]). A descriptor written by a normal
+    // m68k `move.l` (big-endian) is therefore byte-swapped from the walker's view;
+    // the handler writes the byte-swapped value in BOTH oracle and RTL, keeping the
+    // program identical. read8 is untranslated (descriptors live at physical PT addrs).
+    auto rd32le = [&](uint32_t a) -> uint32_t {
+        return  (uint32_t)read8(a)
+              | ((uint32_t)read8(a + 1) << 8)
+              | ((uint32_t)read8(a + 2) << 16)
+              | ((uint32_t)read8(a + 3) << 24);
+    };
+
     const bool supervisor = (get_reg(REG_SR) & 0x2000u) != 0;
 
     auto fault = [&](void) -> uint32_t {
@@ -180,19 +192,19 @@ uint32_t MusashiRef::mmu_translate(uint32_t va, bool rw) {
 
     // Root level: descriptor at root_ptr + rootIdx*4, rootIdx = VA[31:25].
     uint32_t rootIdx = (va >> 25) & 0x7f;
-    uint32_t rootDesc = read32((mmu_root_ & 0xfffffffcu) + rootIdx * 4);
+    uint32_t rootDesc = rd32le((mmu_root_ & 0xfffffffcu) + rootIdx * 4);
     if (!(rootDesc & 0x2u)) return fault();   // UDT high bit (bit1) == resident
     uint32_t ptrBase = rootDesc & 0xfffffff0u;
 
     // Pointer level: descriptor at ptrBase + ptrIdx*4, ptrIdx = VA[24:18].
     uint32_t ptrIdx = (va >> 18) & 0x7f;
-    uint32_t ptrDesc = read32(ptrBase + ptrIdx * 4);
+    uint32_t ptrDesc = rd32le(ptrBase + ptrIdx * 4);
     if (!(ptrDesc & 0x2u)) return fault();
     uint32_t pageBase = ptrDesc & 0xfffffff0u;
 
     // Page (leaf) level: descriptor at pageBase + pageIdx*4, pageIdx = VA[17:12].
     uint32_t pageIdx = (va >> 12) & 0x3f;
-    uint32_t pgDesc = read32(pageBase + pageIdx * 4);
+    uint32_t pgDesc = rd32le(pageBase + pageIdx * 4);
     uint32_t pdt = pgDesc & 0x3u;
     bool resident = (pdt == 0x1u) || (pdt == 0x3u);
     bool indirect = (pdt == 0x2u);
