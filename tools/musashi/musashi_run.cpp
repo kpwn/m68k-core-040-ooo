@@ -47,6 +47,10 @@ int main(int argc, char** argv) {
     std::vector<std::pair<uint32_t, unsigned int>> irq_events;
     int      ack_response = -1;
     int      max_cycles = 200000;
+    bool     use_mmu = false;
+    uint32_t mmu_root = 0;
+    uint32_t mmu_data_lo = 0;
+    uint32_t mmu_data_hi = 0;
 
     for (int i = 1; i < argc; i++) {
         std::string a(argv[i]);
@@ -78,6 +82,9 @@ int main(int argc, char** argv) {
         }
         else if (a == "--ack-spurious") ack_response = -2;
         else if (a == "--max-cycles" && i + 1 < argc) max_cycles = (int)parse_u32(argv[++i]);
+        else if (a == "--mmu-root"    && i + 1 < argc) { mmu_root = parse_u32(argv[++i]); use_mmu = true; }
+        else if (a == "--mmu-data-lo" && i + 1 < argc) mmu_data_lo = parse_u32(argv[++i]);
+        else if (a == "--mmu-data-hi" && i + 1 < argc) mmu_data_hi = parse_u32(argv[++i]);
         else if (a == "--out"        && i + 1 < argc) out_path   = argv[++i];
         else if (a == "--trace"      && i + 1 < argc) trace_path = argv[++i];
         else if (a == "--help" || a == "-h") { std::fputs(USAGE, stdout); return 0; }
@@ -128,6 +135,7 @@ int main(int argc, char** argv) {
         if (irq_events.empty()) {
             ref.set_irq(irq_level);
         }
+        if (use_mmu) ref.enable_mmu(mmu_root, mmu_data_lo, mmu_data_hi);
 
         FILE* tf = std::fopen(trace_path.c_str(), "w");
         if (!tf) {
@@ -172,6 +180,7 @@ int main(int argc, char** argv) {
         if (irq_events.empty()) {
             ref.set_irq(irq_level);
         }
+        if (use_mmu) ref.enable_mmu(mmu_root, mmu_data_lo, mmu_data_hi);
         cycles = ref.run_until_sentinel_or_pc_with_irq_events(
             sentinel, use_stop_pc, stop_pc, irq_events, max_cycles);
     }

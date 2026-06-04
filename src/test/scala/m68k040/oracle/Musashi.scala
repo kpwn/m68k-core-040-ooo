@@ -25,6 +25,7 @@ object Musashi {
       irqEvents: Seq[(Long, Int)] = Seq.empty,
       interruptAckVector: Option[Int] = None,
       interruptAckSpurious: Boolean = false,
+      mmu: Option[MmuConfig] = None,
       maxCycles: Int = 50000): Either[OracleError, OracleState] = {
     require(irqLevel >= 0 && irqLevel <= 7, "IRQ level must be 0 through 7")
     require(irqEvents.forall { case (_, level) => level >= 0 && level <= 7 }, "IRQ event levels must be 0 through 7")
@@ -53,7 +54,8 @@ object Musashi {
             irqAtPc.toSeq.flatMap(pc => Seq("--irq-at-pc", f"0x${pc & 0xffffffffL}%08x")) ++
             irqEvents.flatMap { case (pc, level) => Seq("--irq-event", f"0x${pc & 0xffffffffL}%08x:$level") } ++
             interruptAckVector.toSeq.flatMap(vector => Seq("--ack-vector", vector.toString)) ++
-            (if (interruptAckSpurious) Seq("--ack-spurious") else Seq.empty)
+            (if (interruptAckSpurious) Seq("--ack-spurious") else Seq.empty) ++
+            mmuArgs(mmu)
         runCmd(cmd, out)
       } finally {
         deleteIfExists(out)
@@ -62,11 +64,24 @@ object Musashi {
     }
   }
 
+  /** MMU config for the 68040 software MMU oracle: (rootPtr, dataLo, dataHi).
+    * Only DATA accesses in [dataLo, dataHi) are translated through the page table
+    * rooted at rootPtr; a fault raises a format-$7 access-fault exception. None ->
+    * MMU off (identity), every existing program byte-for-byte unchanged. */
+  case class MmuConfig(rootPtr: Long, dataLo: Long, dataHi: Long)
+
+  private def mmuArgs(mmu: Option[MmuConfig]): Seq[String] = mmu.toSeq.flatMap { m =>
+    Seq("--mmu-root",    f"0x${m.rootPtr & 0xffffffffL}%08x",
+        "--mmu-data-lo", f"0x${m.dataLo  & 0xffffffffL}%08x",
+        "--mmu-data-hi", f"0x${m.dataHi  & 0xffffffffL}%08x")
+  }
+
   def assembleAndTrace(
       source: String,
       loadAddress: Long = ProgramAssembler.DefaultLoadAddress,
       initialSp: Long = 0x00100000L,
       stopPc: Option[Long] = None,
+      mmu: Option[MmuConfig] = None,
       maxCycles: Int = 50000): Either[OracleError, Vector[OracleStep]] = {
     if (!Files.exists(runnerPath)) {
       return Left(OracleError(s"musashi_run not found at $runnerPath; build it with `make musashi`"))
@@ -86,7 +101,8 @@ object Musashi {
             "--initial-sp", f"0x${initialSp & 0xffffffffL}%08x",
             "--sentinel", f"0x${Sentinel & 0xffffffffL}%08x",
             "--max-cycles", maxCycles.toString) ++
-            stopPc.toSeq.flatMap(pc => Seq("--stop-pc", f"0x${pc & 0xffffffffL}%08x"))
+            stopPc.toSeq.flatMap(pc => Seq("--stop-pc", f"0x${pc & 0xffffffffL}%08x")) ++
+            mmuArgs(mmu)
         runTraceCmd(cmd, trace)
       } finally {
         deleteIfExists(trace)

@@ -143,6 +143,69 @@ void MusashiRef::set_interrupt_ack_response(int vector) {
     int_ack_response_ = vector;
 }
 
+// ── 68040 software MMU ──────────────────────────────────────────────
+// Mirrors our RTL TableWalker + the MAME 68040 access-fault model.
+
+extern "C" {
+extern unsigned int m68ki_aerr_address;
+extern unsigned int m68ki_aerr_write_mode;
+extern unsigned int m68ki_aerr_fc;
+}
+
+void MusashiRef::enable_mmu(uint32_t root_ptr, uint32_t data_lo, uint32_t data_hi) {
+    mmu_enabled_ = true;
+    mmu_root_    = root_ptr;
+    mmu_lo_      = data_lo;
+    mmu_hi_      = data_hi;
+}
+
+uint32_t MusashiRef::mmu_translate(uint32_t va, bool rw) {
+    // Identity for everything outside the data window (code/vectors/stack/PT),
+    // and when the MMU is off.
+    if (!mmu_enabled_ || va < mmu_lo_ || va >= mmu_hi_) return va;
+
+    const bool supervisor = (get_reg(REG_SR) & 0x2000u) != 0;
+
+    auto fault = [&](void) -> uint32_t {
+        // 68040 access-fault inputs for the format-$7 SSW + frame:
+        //  - aerr_address  : the faulting logical (effective) address (the VA)
+        //  - aerr_write_mode: SSW R/W bit, 1=read 0=write (MAME orig_rw)
+        //  - aerr_fc       : 3-bit function code (supervisor=bit2; data=1)
+        m68ki_aerr_address    = va;
+        m68ki_aerr_write_mode = rw ? 0u : 1u;            // write -> 0, read -> 1
+        m68ki_aerr_fc         = (supervisor ? 0x4u : 0x0u) | 0x1u;  // data space
+        m68k_pulse_bus_error();   // stacks the format-$7 frame + longjmps out
+        return va;                // not reached
+    };
+
+    // Root level: descriptor at root_ptr + rootIdx*4, rootIdx = VA[31:25].
+    uint32_t rootIdx = (va >> 25) & 0x7f;
+    uint32_t rootDesc = read32((mmu_root_ & 0xfffffffcu) + rootIdx * 4);
+    if (!(rootDesc & 0x2u)) return fault();   // UDT high bit (bit1) == resident
+    uint32_t ptrBase = rootDesc & 0xfffffff0u;
+
+    // Pointer level: descriptor at ptrBase + ptrIdx*4, ptrIdx = VA[24:18].
+    uint32_t ptrIdx = (va >> 18) & 0x7f;
+    uint32_t ptrDesc = read32(ptrBase + ptrIdx * 4);
+    if (!(ptrDesc & 0x2u)) return fault();
+    uint32_t pageBase = ptrDesc & 0xfffffff0u;
+
+    // Page (leaf) level: descriptor at pageBase + pageIdx*4, pageIdx = VA[17:12].
+    uint32_t pageIdx = (va >> 12) & 0x3f;
+    uint32_t pgDesc = read32(pageBase + pageIdx * 4);
+    uint32_t pdt = pgDesc & 0x3u;
+    bool resident = (pdt == 0x1u) || (pdt == 0x3u);
+    bool indirect = (pdt == 0x2u);
+    bool wp  = (pgDesc & 0x4u) != 0;     // bit2 write-protect
+    bool sup = (pgDesc & 0x80u) != 0;    // bit7 supervisor-only
+    if (!resident || indirect) return fault();   // non-resident / unsupported indirect
+    if (rw && wp) return fault();                // write to write-protected page
+    if (sup && !supervisor) return fault();      // user access to supervisor page
+
+    uint32_t ppn = (pgDesc >> 12) & 0xfffffu;
+    return (ppn << 12) | (va & 0xfffu);
+}
+
 uint32_t MusashiRef::get_reg(Reg r) const {
     m68k_register_t mr;
     switch (r) {
@@ -336,6 +399,7 @@ static inline bool straddles(uint32_t a, int size, uint32_t tgt) {
 // ── Musashi C-level callbacks ───────────────────────────────────────
 
 uint32_t MusashiRef::cb_read8(uint32_t a) {
+    a = mmu_translate(a, /*rw=*/false);
     if (bus_) return bus_->read8(a) & 0xFFu;
     auto it = mem_.find(a);
     return (it == mem_.end()) ? 0xFF : it->second;
@@ -350,6 +414,7 @@ uint32_t MusashiRef::cb_read32(uint32_t a) {
 }
 
 void MusashiRef::cb_write8(uint32_t a, uint32_t v) {
+    a = mmu_translate(a, /*rw=*/true);
     uint8_t b = (uint8_t)v;
     if (bus_) {
         bus_->write8(a, b);
