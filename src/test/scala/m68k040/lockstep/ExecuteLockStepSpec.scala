@@ -3,7 +3,7 @@ package m68k040.lockstep
 import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
 import m68k040.mmu.{IdentityTranslationPlugin, DtlbPlugin}
-import m68k040.cache.{IcachePlugin, DcachePlugin}
+import m68k040.cache.{IcachePlugin, DcachePlugin, DcacheService}
 import m68k040.frontend.FetchAlignPlugin
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
@@ -11,7 +11,7 @@ import m68k040.rob.RobPlugin
 import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin}
 import m68k040.execute.iq.{IssueQueuePlugin, IssueQueueService}
 import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
-import m68k040.services.RedirectService
+import m68k040.services.{RedirectService, DTranslationService}
 import m68k040.oracle.{Musashi, OracleStep, ProgramAssembler}
 import spinal.core._
 import spinal.core.sim._
@@ -42,6 +42,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     * to the IQ flush. (Frontend pipeFlush / RAT-rollback flush / fetch redirect are
     * driven inside the consuming plugins from host.get[RedirectService].) */
   class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin) extends FiberPlugin {
+    // Int PRF write port for the exception unit's A7 (reg 15) write-back. Allocated
+    // in setup (RegfileService requires it). latency=0 so the handler can read the
+    // updated A7 the cycle after the exception commits (it is serializing).
+    var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
+    during setup { a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7") }
     val logic = during build new Area {
       val iq  = host[IssueQueueService]
       val rob = host[RobPlugin]
@@ -56,6 +61,17 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       rob.logic.completion(0).payload := eu0.completion.payload
       rob.logic.completion(1).valid   := eu1.completion.valid
       rob.logic.completion(1).payload := eu1.completion.payload
+      // Committed-CCR VALUE completion (per EU): record the {N,Z,V,C,X} the EU wrote
+      // for this robId so the exception FSM can stack the SR low byte byte-for-byte.
+      def wireCcr(idx: Int, w: m68k040.execute.WbObs): Unit = {
+        rob.logic.ccrCompletion(idx).valid            := w.valid
+        rob.logic.ccrCompletion(idx).payload.robId    := w.robId
+        rob.logic.ccrCompletion(idx).payload.nzvc     := w.nzvc.asUInt
+        rob.logic.ccrCompletion(idx).payload.nzvcWrite:= w.nzvcWrite
+        rob.logic.ccrCompletion(idx).payload.x        := w.x
+        rob.logic.ccrCompletion(idx).payload.xWrite   := w.xWrite
+      }
+      wireCcr(0, eu0.logic.wbObs); wireCcr(1, eu1.logic.wbObs); wireCcr(2, lsEu.logic.wbObs)
 
       // ── LS cluster wiring (mirrors top/FullCoreSynth.BackendWiringPlugin) ──
       // LS issue port (3) -> LS EU. Its completion is BOTH a ROB completion (port
@@ -86,14 +102,52 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // ── Commit-time mispredict redirect fan-out (registered doFlush pulse) ──
       val doFlush = host[RedirectService].doFlush
       val flushPc = host[RedirectService].flushPc
-      iq.flushPort := doFlush                                  // IQ clear
-      host[DecodeStage].logic.pipeFlush := doFlush             // FE skid (decode->rename)
-      host[RenameStage].logic.pipeFlush := doFlush             // FE skid (rename->dispatch)
+      val excActive = rob.logic.excActive
+      // IQ/skid flush held high while the exception FSM runs (serializing) so
+      // wrong-path uops fetched during the multi-cycle sequence are squashed.
+      iq.flushPort := doFlush || excActive                     // IQ clear
+      host[DecodeStage].logic.pipeFlush := doFlush || excActive
+      host[RenameStage].logic.pipeFlush := doFlush || excActive
       // RAT-rollback flush (rename.flushPort) is already driven by the ROB
       // (rc.flushPort := flushing). Fetch redirect to the resolved target:
       val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
       faRedir.valid   := doFlush
       faRedir.payload := flushPc
+
+      // ── Exception D-cache MUX (the LS EU arbitrates: it owns the cache ports, so
+      // the exception unit's requests are routed THROUGH the LS EU's mux — see
+      // LsEuPlugin.excActive/excLoad*/excStore*/excXlate*). The exc reads the cache
+      // responses directly here. The exception sequencer is serializing (the LS pipe
+      // is squashed), so the cache port is free while excActive. ──
+      val dc    = host[DcacheService]
+      val xlate = host[DTranslationService]
+      val exc   = rob.logic.exc
+      exc.dcLoadRsp.valid   := dc.loadRsp.valid
+      exc.dcLoadRsp.payload := dc.loadRsp.payload
+      exc.dcLoadBusy        := dc.loadBusy
+      exc.dcStoreAck        := dc.storeAck
+      exc.dtRsp.ready       := xlate.rsp.ready
+      exc.dtRsp.ppn         := xlate.rsp.ppn
+      exc.dtRsp.cacheMode   := xlate.rsp.cacheMode
+      exc.dtRsp.fault       := xlate.rsp.fault
+      // route the exc's cache requests through the LS EU's arbiter
+      lsEu.excActive            := excActive
+      lsEu.excLoadCmdValid      := exc.dcLoadCmd.valid
+      lsEu.excLoadCmdVaddr      := exc.dcLoadCmd.payload.vaddr
+      lsEu.excLoadCmdSize       := exc.dcLoadCmd.payload.size
+      exc.dcLoadCmd.ready       := lsEu.excLoadCmdReady
+      lsEu.excStoreValid        := exc.dcStore.valid
+      lsEu.excStorePayload      := exc.dcStore.payload
+      lsEu.excXlateValid        := exc.dtReq.valid
+      lsEu.excXlateVpn          := exc.dtReq.vpn
+      lsEu.excXlateWrite        := exc.dtReq.write
+      lsEu.excXlateSupervisor   := exc.dtReq.supervisor
+      exc.sqDrained             := lsEu.sqEmptySig
+      // A7 (int reg 15) write-back on an exception/RTE A7 change. Committed arch-15
+      // maps to phys-15 (identity, unrenamed in these programs).
+      a7Wr.valid   := exc.a7WriteValid
+      a7Wr.address := U(15, a7Wr.address.getWidth bits)
+      a7Wr.data    := exc.a7WriteData.asBits
     }
   }
 
@@ -269,8 +323,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           val c = dut.rob.logic.commitObs(k)
           if (c.fire.toBoolean) {
             commitCount += 1
-            println(s"[$name] COMMIT robId=${c.robId.toInt} pc=0x${(c.pc.toLong & 0xffffffffL).toHexString} (wbSeen=$wbCount)")
-            handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL)
+            handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
+              sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL)
+          }
+        }
+        // Exception / RTE commit channel (handler-entry / restored PC + sysByte/A7).
+        {
+          val c = dut.rob.logic.commitObs(2)
+          if (c.fire.toBoolean) {
+            commitCount += 1
+            handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL)
           }
         }
       }
@@ -307,6 +369,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
 
+      // Boot the committed supervisor SP to Musashi's initial SSP (0x00100000) AFTER
+      // the init sweep (it resets committed state) so the surfaced A7 (== SSP, S=1)
+      // matches OracleStep.a(7) for every program.
+      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      cd.waitSampling()
       // Pulse redirect to the program load PC to start fetch.
       dut.fa.logic.redirect.valid   #= true
       dut.fa.logic.redirect.payload #= loadAddr
@@ -645,5 +712,23 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       assert(dut.dtlb.logic.faultSeen.toBoolean,
         "a data access to a non-resident page must flag DTLB rsp.fault (flagged, not delivered)")
     }
+  }
+
+  // ── PRECISE EXCEPTION lock-step: illegal-instruction -> handler -> RTE ───────
+  // A program that installs the illegal-instruction vector (4) at VBR+0x10 (a
+  // runtime store, so both the DUT D-cache and Musashi see it), executes an
+  // `illegal` (0x4AFC) which the core delivers PRECISELY (stack a format-$0 frame
+  // to SSP-8, fetch the handler vector, switch to supervisor — already supervisor
+  // here, vector to the handler), runs a handler that bumps the stacked PC past the
+  // illegal + sets D1/D2, and RTEs back to the fall-through `moveq #7,%d3`. The
+  // commit stream (PC / full SR / A7 / regs) is lock-stepped vs Musashi step-for-
+  // step across entry -> handler -> RTE. The final `bra .` halts over-fetch.
+  test("lock-step: illegal-instruction -> handler -> RTE (precise exception)", VerilatorTest) {
+    runLockStep("exc-illegal",
+      "move.l #handler,%d0 ; move.l %d0,0x10 ; illegal ; moveq #7,%d3 ; " +
+      "loop: bra loop ; " +
+      "handler: moveq #2,%d1 ; move.l 2(%a7),%d0 ; add.l %d1,%d0 ; move.l %d0,2(%a7) ; " +
+      "moveq #1,%d2 ; rte",
+      nInstr = 10)
   }
 }

@@ -24,6 +24,9 @@ import spinal.lib.misc.plugin.FiberPlugin
   * (anchors the ALU+PRF datapath, since a PRF read value is then observed) and
   * the CommitTrace (anchors the ROB retire/control path). */
 class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin) extends FiberPlugin {
+  // Int PRF write port for the exception unit's A7 (reg 15) write-back.
+  var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
+  during setup { a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7") }
   val logic = during build new Area {
     val iq  = host[IssueQueueService]
     val rob = host[RobPlugin]
@@ -32,9 +35,12 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // (FMax: no combinational execute->flush path).
     val doFlush = host[RedirectService].doFlush
     val flushPc = host[RedirectService].flushPc
-    iq.flushPort := doFlush                                   // IQ clear
-    host[DecodeStage].logic.pipeFlush := doFlush              // FE skid (decode->rename)
-    host[RenameStage].logic.pipeFlush := doFlush              // FE skid (rename->dispatch)
+    val excActive = rob.logic.excActive
+    // IQ/skid flush held high while the commit-side exception sequencer runs
+    // (serializing) so wrong-path uops fetched during the sequence are squashed.
+    iq.flushPort := doFlush || excActive                      // IQ clear
+    host[DecodeStage].logic.pipeFlush := doFlush || excActive // FE skid (decode->rename)
+    host[RenameStage].logic.pipeFlush := doFlush || excActive // FE skid (rename->dispatch)
     // RAT-rollback (rename.flushPort) already driven by the ROB (rc.flushPort).
     val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
     faRedir.valid   := doFlush
@@ -51,6 +57,16 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     rob.logic.completion(0).payload := eu0.completion.payload
     rob.logic.completion(1).valid   := eu1.completion.valid
     rob.logic.completion(1).payload := eu1.completion.payload
+    // Committed-CCR VALUE completion (per EU) for the exception FSM's stacked SR.
+    def wireCcr(idx: Int, w: m68k040.execute.WbObs): Unit = {
+      rob.logic.ccrCompletion(idx).valid            := w.valid
+      rob.logic.ccrCompletion(idx).payload.robId    := w.robId
+      rob.logic.ccrCompletion(idx).payload.nzvc     := w.nzvc.asUInt
+      rob.logic.ccrCompletion(idx).payload.nzvcWrite:= w.nzvcWrite
+      rob.logic.ccrCompletion(idx).payload.x        := w.x
+      rob.logic.ccrCompletion(idx).payload.xWrite   := w.xWrite
+    }
+    wireCcr(0, eu0.logic.wbObs); wireCcr(1, eu1.logic.wbObs); wireCcr(2, lsEu.logic.wbObs)
 
     // ---- LS cluster wiring ----
     // LS issue port (3) -> LS EU. Its completion is BOTH a ROB completion (3rd
@@ -81,6 +97,38 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     dtlb.umFlush       := doFlush
     // The D-cache's `axi` is declared master() inside its plugin and surfaces as a
     // top-level IO automatically (like the I-cache's), so no extra wiring needed.
+
+    // ── Exception-unit cache arbitration (routed through the LS EU's mux) + the
+    // exc reads the cache/TLB responses. While excActive the commit-side FSM owns
+    // the D-cache ports (the LS pipe is squashed — serializing). ──
+    val dc    = host[m68k040.cache.DcacheService]
+    val xlate = host[m68k040.services.DTranslationService]
+    val exc   = rob.logic.exc
+    exc.dcLoadRsp.valid   := dc.loadRsp.valid
+    exc.dcLoadRsp.payload := dc.loadRsp.payload
+    exc.dcLoadBusy        := dc.loadBusy
+    exc.dcStoreAck        := dc.storeAck
+    exc.dtRsp.ready       := xlate.rsp.ready
+    exc.dtRsp.ppn         := xlate.rsp.ppn
+    exc.dtRsp.cacheMode   := xlate.rsp.cacheMode
+    exc.dtRsp.fault       := xlate.rsp.fault
+    lsEu.excActive          := excActive
+    lsEu.excLoadCmdValid    := exc.dcLoadCmd.valid
+    lsEu.excLoadCmdVaddr    := exc.dcLoadCmd.payload.vaddr
+    lsEu.excLoadCmdSize     := exc.dcLoadCmd.payload.size
+    exc.dcLoadCmd.ready     := lsEu.excLoadCmdReady
+    lsEu.excStoreValid      := exc.dcStore.valid
+    lsEu.excStorePayload    := exc.dcStore.payload
+    lsEu.excXlateValid      := exc.dtReq.valid
+    lsEu.excXlateVpn        := exc.dtReq.vpn
+    lsEu.excXlateWrite      := exc.dtReq.write
+    lsEu.excXlateSupervisor := exc.dtReq.supervisor
+    exc.sqDrained           := lsEu.sqEmptySig
+    // A7 (int reg 15) write-back on an exception/RTE A7 change (committed arch-15 ==
+    // phys-15, unrenamed).
+    a7Wr.valid   := exc.a7WriteValid
+    a7Wr.address := U(15, a7Wr.address.getWidth bits)
+    a7Wr.data    := exc.a7WriteData.asBits
 
     // Synth anchors (registered top outputs) so synthesis can't trim the core.
     val eu0Res = out(RegNext(eu0.intW.data))   // EU0 int result -> anchors datapath+PRF

@@ -19,49 +19,52 @@ object WhiteboxCapture {
   /** Stateful reconstruction handle. Drive `onWb` for every cycle an EU's wbObs
     * is valid, and `onCommit` for every fired ROB commit-obs (in retire order).
     * Read `result` after the program drains. */
+  /** A normal commit (Wb-backed) or an exception/RTE commit (SR/A7 directly). */
+  private sealed trait Rec
+  private final case class NormRec(pc: Long, sysByte: Int, a7: Long, wb: Wb) extends Rec
+  private final case class ExcRec(pc: Long, sysByte: Int, a7: Long) extends Rec
+
   final class Handle {
     private val wbMap   = mutable.HashMap[Int, Wb]()
-    // (pc, wb-snapshot) in retire order. The wb is SNAPSHOTTED at commit time, not
-    // joined lazily at the end: under branch mispredict recovery a robId is REUSED
-    // (a squashed wrong-path uop and a later correct uop share an index), so a
-    // global last-writer map is ambiguous. At the cycle a commit fires, wbMap holds
-    // the COMMITTING instruction's wb (it wrote before retiring; any earlier
-    // squashed reuse was overwritten by the real producer; any FUTURE reuse of the
-    // index has not happened yet). Snapshotting here is robId-reuse-correct.
-    private val commits = mutable.ArrayBuffer[(Long, Wb)]()
+    private val commits = mutable.ArrayBuffer[Rec]()
 
     /** Record an EU writeback (keyed by robId). */
     def onWb(robId: Int, wb: Wb): Unit = { wbMap(robId) = wb }
 
-    /** Record a retired commit (robId + post-instruction pc) in retire order,
-      * snapshotting the committing instruction's writeback now (see above).
-      *
-      * A cracked memory instruction (e.g. `ADD.L (A0),D1`) retires as TWO ROB
-      * entries: a LOAD µop writing an internal temp (arch ≥ 16 = T0/T1) and the
-      * op µop writing the architectural reg. Temps NEVER commit architecturally
-      * (decode-matrix spec §4.5: the instruction is the architectural unit), and a
-      * load µop writes no flags — so a temp-writing commit carries no architectural
-      * state and is DROPPED here, leaving the architectural commit stream 1:1 with
-      * Musashi's per-instruction trace (the temp µop and its op share the same
-      * post-instruction pc). */
-    def onCommit(robId: Int, pc: Long): Unit = {
+    /** Record a retired NORMAL commit (robId + post-instruction pc + the committed
+      * SR system byte + A7), snapshotting the committing instruction's writeback. A
+      * cracked-load temp µop (arch ≥ 16, no flags) is DROPPED (decode §4.5). */
+    def onCommit(robId: Int, pc: Long, sysByte: Int = 0x27, a7: Long = -1L): Unit = {
       val wb = wbMap.getOrElse(robId,
         sys.error(s"commit robId=$robId with no writeback observed"))
       val isTempOnly = wb.intWrite && wb.dstArch >= 16 && !wb.nzvcWrite && !wb.xWrite
-      if (!isTempOnly) commits += ((pc, wb))
+      if (!isTempOnly) commits += NormRec(pc, sysByte, a7, wb)
     }
 
-    /** Reconstruct the CommitObservation stream AFTER the run, folding the
-      * architectural CCR in retire order over the per-commit wb snapshots. */
+    /** Record an exception / RTE "instruction" commit: the handler-entry / restored
+      * PC + the post-event SR system byte + A7. CCR is unchanged (carried over). */
+    def onExcCommit(pc: Long, sysByte: Int, a7: Long): Unit =
+      commits += ExcRec(pc, sysByte, a7)
+
+    /** Reconstruct the CommitObservation stream AFTER the run: fold the CCR over Wb
+      * snapshots and combine with the per-commit SR system byte + A7 into the full
+      * 16-bit SR. */
     def result: Seq[CommitObservation] = {
       var ccr = 0 // running architectural CCR (X N Z V C), bit4..bit0
-      commits.toSeq.map { case (pc, wb) =>
-        if (wb.nzvcWrite) ccr = (ccr & 0x10) | (wb.nzvc & 0xf)     // N,Z,V,C bits
-        if (wb.xWrite)    ccr = (ccr & 0x0f) | ((wb.x & 1) << 4)   // X bit
-        CommitObservation(
-          pc = pc, archRegId = wb.dstArch,
-          archRegWrite = wb.result, archRegValid = wb.intWrite,
-          ccr = ccr, memAddr = 0, memData = 0, memWrite = false)
+      commits.toSeq.map {
+        case NormRec(pc, sysByte, a7, wb) =>
+          if (wb.nzvcWrite) ccr = (ccr & 0x10) | (wb.nzvc & 0xf)
+          if (wb.xWrite)    ccr = (ccr & 0x0f) | ((wb.x & 1) << 4)
+          CommitObservation(
+            pc = pc, archRegId = wb.dstArch,
+            archRegWrite = wb.result, archRegValid = wb.intWrite,
+            ccr = ccr, memAddr = 0, memData = 0, memWrite = false,
+            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7)
+        case ExcRec(pc, sysByte, a7) =>
+          CommitObservation(
+            pc = pc, archRegId = 0, archRegWrite = 0, archRegValid = false,
+            ccr = ccr, memAddr = 0, memData = 0, memWrite = false,
+            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7)
       }
     }
   }

@@ -106,7 +106,13 @@ object DcacheByteLane {
       is(Size.LONG) { nbytes := 4 }
     }
     val bits = Vec(Bool(), 16)
-    for (i <- 0 until 16) bits(i) := (U(i) >= off) && (U(i) < (off + nbytes))
+    // `off +^ nbytes` (WIDENING add): a WORD/LONG at a high offset (e.g. off=14,
+    // nbytes=2 -> 16) would overflow a 4-bit `off + nbytes` to 0, zeroing the strobe
+    // (NO bytes stored). A non-crossing access ending exactly at the line boundary
+    // (off+nbytes==16) is valid -> compare with the widened sum.
+    val end  = off +^ nbytes        // 5-bit (no overflow at off=14, WORD -> 16)
+    val offW = off.resize(5 bits)
+    for (i <- 0 until 16) bits(i) := (U(i, 5 bits) >= offW) && (U(i, 5 bits) < end)
     strb := bits.asBits
     strb
   }

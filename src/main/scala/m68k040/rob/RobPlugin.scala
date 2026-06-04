@@ -84,6 +84,34 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // Reset per-alloc below (mirrors `completes`), with alloc-priority on a reused index.
     val mispredictStore = Vec.fill(depth)(RegInit(False))
     val nextPcStore     = Vec.fill(depth)(Reg(UInt(32 bits)))
+    // Precise-fault per-entry capture — RegInit Vecs reset per-alloc (mirrors
+    // mispredictStore). RegInit(False) guarantees a never-allocated / re-allocated
+    // entry reads "not faulted / not RTE" deterministically (no uninit-Mem flake).
+    val faultedStore  = Vec.fill(depth)(RegInit(False))
+    val isRteStore    = Vec.fill(depth)(RegInit(False))
+    val faultVecStore = Vec.fill(depth)(Reg(UInt(8 bits)))
+    val faultPcStore  = Vec.fill(depth)(Reg(UInt(32 bits)))
+    // Per-entry committed-CCR VALUE capture (set at completion from the EU writeback
+    // values via ccrCompletion). Folded into committedCcr at retire (for the stacked
+    // exception frame). RegInit False so an unwired entry contributes nothing.
+    val nzvcValStore = Vec.fill(depth)(Reg(UInt(4 bits)))
+    val nzvcWrStore  = Vec.fill(depth)(RegInit(False))
+    val xValStore    = Vec.fill(depth)(RegInit(False))
+    val xWrStore     = Vec.fill(depth)(RegInit(False))
+    // CCR-value completion: the EU-wiring drives {robId, nzvc, nzvcWrite, x, xWrite}
+    // for a completing CCR-writer (one port per EU). Default-idle (allowOverride) so
+    // a DUT that doesn't wire it elaborates; the full-core wiring OVERRIDES it from
+    // the EUs' wbObs.
+    val ccrCompletion = Vec.fill(3)(Flow(m68k040.rob.CcrCompletion()))
+    ccrCompletion.foreach { c =>
+      c.valid.allowOverride;            c.valid := False
+      c.payload.robId.allowOverride;    c.payload.robId := U(0, robIdW bits)
+      c.payload.nzvc.allowOverride;     c.payload.nzvc := U(0, 4 bits)
+      c.payload.nzvcWrite.allowOverride;c.payload.nzvcWrite := False
+      c.payload.x.allowOverride;        c.payload.x := False
+      c.payload.xWrite.allowOverride;   c.payload.xWrite := False
+      c.simPublic()
+    }
 
     // ── Build a RobPayload from a RenamedUop ───────────────────────────────────
     def payloadFrom(u: RenamedUop): RobPayload = {
@@ -93,6 +121,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       p.intNew     := u.pdst;     p.intOld := u.pdstOld;   p.intWrite  := u.pdstValid
       p.nzvcNew    := u.pNzvcDst; p.nzvcOld := u.pNzvcOld;  p.nzvcWrite := u.writesNzvc
       p.xNew       := u.pXDst;    p.xOld := u.pXOld;        p.xWrite    := u.writesX
+      // A faulted µop AND an RTE retire ALONE (precise / serializing): they must be
+      // the head and the only retirer this cycle. (faulted/isRte themselves live in
+      // RegInit per-entry Vecs — see faultedStore/isRteStore — reset per-alloc like
+      // mispredictStore, so an uninit Mem field can never spuriously trigger.)
       p.retireAlone := u.isBranch
       p
     }
@@ -107,10 +139,26 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // redirect pulse; it drives ONLY pointer/reg resets (no combinational fanout).
     val doFlushReg = RegInit(False); doFlushReg.simPublic()
     val flushPcReg = Reg(UInt(32 bits)); flushPcReg.simPublic()
-    val flushing   = flush.valid || doFlushReg
+    // Exception squash: high on the entry/RTE trigger cycle AND while the FSM runs
+    // (serializing — keep younger work squashed + block alloc/retire). Driven after
+    // the exc unit is built; forward-declared so `flushing` can gate on it.
+    val excSquash = Bool()
+    val flushing   = flush.valid || doFlushReg || excSquash
 
-    val retire0 = (count > 0) && completes(h0) && !flushing
-    val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone
+    // The head is a faulted µop ready to retire -> take the exception INSTEAD of a
+    // normal commit (precise: the faulting instruction does not commit its result).
+    // An RTE head is serializing too: it triggers the exception-return FSM and does
+    // NOT drive a normal int/flag commit. The exception FSM (exc) gates these so a
+    // trigger fires once per event (excIdle).
+    val excIdle = Bool()   // driven below from exc.active
+    val headReady   = (count > 0) && completes(h0) && !flushing
+    val faultRetire = headReady && faultedStore(h0) && excIdle; faultRetire.simPublic()
+    val rteRetire   = headReady && isRteStore(h0)   && excIdle; rteRetire.simPublic()
+    val retire0 = headReady && !faultedStore(h0) && !isRteStore(h0)
+    // A faulted/RTE entry at h1 must NOT commit in slot1 (it is serializing — it
+    // retires alone when it reaches the head).
+    val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone &&
+                  !faultedStore(h1) && !isRteStore(h1)
 
     val traceVec     = Vec(CommitTrace(), 2)
     val traceFireVec = Vec(Bool(), 2)
@@ -190,16 +238,34 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       mispredictStore(branchCompletion.payload.robId) := branchCompletion.payload.mispredict
       nextPcStore(branchCompletion.payload.robId)     := branchCompletion.payload.nextPc
     }
+    // CCR-value completion: record each completing instruction's NZVC/X VALUES per
+    // entry (BEFORE the alloc-reset so a re-used index's alloc wins). One port/EU.
+    for (c <- ccrCompletion) when(c.valid) {
+      nzvcValStore(c.payload.robId) := c.payload.nzvc
+      nzvcWrStore(c.payload.robId)  := c.payload.nzvcWrite
+      xValStore(c.payload.robId)    := c.payload.x
+      xWrStore(c.payload.robId)     := c.payload.xWrite
+    }
 
     when(alloc0) {
       payload.write(tail, payloadFrom(allocUopVec(0)))
       completes(tail)       := False
       mispredictStore(tail) := False
+      faultedStore(tail)  := allocUopVec(0).faulted
+      isRteStore(tail)    := allocUopVec(0).isRte
+      faultVecStore(tail) := allocUopVec(0).faultVector
+      faultPcStore(tail)  := allocUopVec(0).pc
+      nzvcWrStore(tail) := False; xWrStore(tail) := False
     }
     when(alloc1) {
       payload.write(tail + 1, payloadFrom(allocUopVec(1)))
       completes(tail + 1)       := False
       mispredictStore(tail + 1) := False
+      faultedStore(tail + 1)  := allocUopVec(1).faulted
+      isRteStore(tail + 1)    := allocUopVec(1).isRte
+      faultVecStore(tail + 1) := allocUopVec(1).faultVector
+      faultPcStore(tail + 1)  := allocUopVec(1).pc
+      nzvcWrStore(tail + 1) := False; xWrStore(tail + 1) := False
     }
     when(allocFireSig) {
       tail := tail + Mux(allocSlot1Sig, U(2, robIdW bits), U(1, robIdW bits))
@@ -215,8 +281,57 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // When the retiring head is a mispredicting branch (retireAlone), register the
     // flush for next cycle. doFlushReg is the ONLY flush signal that fans out, and
     // it drives only pointer/reg resets (FMax: no combinational execute->flush path).
-    doFlushReg := retire0 && p0.retireAlone && mispredictStore(h0)
-    when(retire0 && p0.retireAlone && mispredictStore(h0)) { flushPcReg := nextPcStore(h0) }
+    // The exception FSM's final redirect (vector target / RTE restored PC) is ORed
+    // into it below (after the exc unit is built).
+    val branchRedirect = retire0 && p0.retireAlone && mispredictStore(h0)
+
+    // ── Precise-fault exception-pending (combinational at faulted retire) ───────
+    // When the head is a faulted µop ready to retire, signal an exception with its
+    // vector + the FAULTING instruction's PC. The commit-side exception FSM consumes
+    // this (squashes, stacks the frame, vectors). The faulted entry does NOT commit
+    // (retire0 is gated `!p0.faulted`).
+    val exceptionPending = Bool();    exceptionPending := faultRetire;       exceptionPending.simPublic()
+    val exceptionVector  = UInt(8 bits);  exceptionVector := faultVecStore(h0); exceptionVector.simPublic()
+    val exceptionPc      = UInt(32 bits); exceptionPc     := faultPcStore(h0);  exceptionPc.simPublic()
+
+    // ── Committed CCR (X N Z V C, bits 4..0) — VALUE, folded at retire ───────────
+    // The ROB has no CCR value on its payload (only phys IDs), so the EU writeback
+    // VALUES are recorded per-entry at completion (ccrCompletion, like the branch
+    // completion's {mispredict,nextPc}) and folded into a committed-CCR register at
+    // retire. Used ONLY by the (rare, serializing) exception FSM for the stacked
+    // frame's SR low byte (byte-for-byte vs Musashi). Default 0 if unwired (the
+    // standalone ROB/exception unit tests don't drive ccrCompletion and don't check
+    // the stacked CCR; the full-core wiring drives it from the EUs).
+    val committedCcr = RegInit(U(0, 5 bits)); committedCcr.simPublic()
+    val ccrAfter0 = UInt(5 bits); ccrAfter0 := committedCcr
+    when(retire0 && nzvcWrStore(h0)) { ccrAfter0(3 downto 0) := nzvcValStore(h0) }
+    when(retire0 && xWrStore(h0))    { ccrAfter0(4)          := xValStore(h0) }
+    val ccrAfter1 = UInt(5 bits); ccrAfter1 := ccrAfter0
+    when(retire1 && nzvcWrStore(h1)) { ccrAfter1(3 downto 0) := nzvcValStore(h1) }
+    when(retire1 && xWrStore(h1))    { ccrAfter1(4)          := xValStore(h1) }
+    committedCcr := ccrAfter1
+
+    // ── Commit-side exception sequencer (entry FSM + RTE) ───────────────────────
+    val exc = new m68k040.exception.ExceptionUnit(
+      ss = new m68k040.exception.SystemState,
+      entryTrigger = exceptionPending, entryVector = faultVecStore(h0), entryPc = faultPcStore(h0),
+      rteTrigger   = rteRetire,        rtePc        = p0.predNextPc,
+      committedCcr = committedCcr)
+    excIdle := !exc.active
+    val excActive = exc.active; excActive.simPublic()
+    // Squash + serialize while the FSM runs (NOT on the trigger cycle, when the FSM
+    // is still IDLE and the fault/RTE head must retire-trigger). On the trigger cycle
+    // excActive is False, so faultRetire/rteRetire fire and the exc captures; next
+    // cycle the FSM is active -> count:=0 squashes the faulted/RTE entry + younger.
+    excSquash := excActive
+
+    // ── Final registered redirect: branch mispredict OR exception vector/RTE PC ──
+    // The exc unit pulses redirectValid (one cycle) at the end of an entry/RTE
+    // sequence with the target (vector / restored PC). doFlushReg is the registered
+    // fan-out pulse; it drives the IQ/skid/fetch redirect for both cases.
+    doFlushReg := branchRedirect || exc.redirectValid
+    when(branchRedirect)    { flushPcReg := nextPcStore(h0) }
+    when(exc.redirectValid) { flushPcReg := exc.redirectPc }
 
     // ── Flush (squash all in-flight) — pointer-only, driven by the registered ─────
     // redirect pulse OR the test flush port.
@@ -227,12 +342,27 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     rc.flushPort := flushing
 
     // ── Sim-only commit observation (lock-step harness consumes this) ───────────
-    case class CommitObs() extends Bundle { val fire = Bool(); val robId = UInt(robIdW bits); val pc = UInt(32 bits) }
-    // Registered (sim-only) so the lock-step harness reading them in onSamplings
-    // gets stable one-cycle pulses (reading combinational retire signals there races).
-    val commitObs = Vec(CommitObs(), 2); commitObs.simPublic()
+    // Carries the POST-instruction SR (full 16-bit) + A7 so the lock-step can
+    // compare them against Musashi's OracleStep.sr / a(7) through an exception.
+    // Channel 2 is the exception/RTE "instruction" commit (handler-entry / restored
+    // PC + the post-event SR/A7), produced by the ExceptionUnit's obs.
+    // Carries the post-instruction SR SYSTEM BYTE (S/I/T) + A7. The lock-step
+    // whitebox combines sysByte with its OWN reconstructed CCR (the ROB has no CCR
+    // VALUE on the hot path) to form the full 16-bit SR. Channel 2 is the
+    // exception/RTE "instruction" commit (handler-entry / restored PC + the
+    // post-event sysByte/A7), produced by the ExceptionUnit's obs.
+    case class CommitObs() extends Bundle {
+      val fire = Bool(); val robId = UInt(robIdW bits); val pc = UInt(32 bits)
+      val sysByte = UInt(8 bits); val a7 = UInt(32 bits)
+    }
+    val commitObs = Vec(CommitObs(), 3); commitObs.simPublic()
     commitObs(0).fire := RegNext(retire0) init False; commitObs(0).robId := RegNext(h0); commitObs(0).pc := RegNext(commitPc0)
+    commitObs(0).sysByte := RegNext(exc.ss.srSys); commitObs(0).a7 := RegNext(exc.ss.a7)
     commitObs(1).fire := RegNext(retire1) init False; commitObs(1).robId := RegNext(h1); commitObs(1).pc := RegNext(commitPc1)
+    commitObs(1).sysByte := RegNext(exc.ss.srSys); commitObs(1).a7 := RegNext(exc.ss.a7)
+    // Exception / RTE commit (handler-entry or restored PC + post-event sysByte/A7).
+    commitObs(2).fire := RegNext(exc.obsFire) init False; commitObs(2).robId := RegNext(h0)
+    commitObs(2).pc := RegNext(exc.obsPc); commitObs(2).sysByte := RegNext(exc.obsSysByte); commitObs(2).a7 := RegNext(exc.obsA7)
   }
 
   override def trace     = logic.traceVec

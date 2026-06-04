@@ -97,6 +97,7 @@ class BackendWhiteboxSpec extends AnyFunSuite {
     u.useImm #= useImm; u.imm #= BigInt(imm & 0xffffffffL)
     u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0
     u.unimplemented #= false
+    u.faulted #= false; u.faultVector #= 0; u.isRte #= false
     u.dstArch #= dstArch
     u.psrcA #= psrcA; u.psrcAValid #= psrcAValid
     u.psrcB #= psrcB; u.psrcBValid #= psrcBValid

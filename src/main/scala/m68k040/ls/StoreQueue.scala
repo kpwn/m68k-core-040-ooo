@@ -67,6 +67,7 @@ class StoreQueue(depth: Int = 8) extends Component {
     // the store left the SQ but its memory write was not yet visible — a younger
     // load that MISSED L1D could refill stale memory. Holding until ack closes it.
     val drainAck = in(Bool())
+    val empty    = out(Bool())   // no valid entry AND no drain in flight
   }
 
   // ---- ring storage (all RegInit) ----
@@ -252,4 +253,7 @@ class StoreQueue(depth: Int = 8) extends Component {
 
   // ---- count = hardware sum of valids (no Scala-var counters) ----
   count := CountOne(valids).resized
+
+  // ---- empty: no resident entry AND no drain in flight ----
+  io.empty := !valids.reduce(_ || _) && !drainBusy
 }
