@@ -38,10 +38,12 @@ class SystemState extends Area {
   srSys.simPublic(); vbr.simPublic(); usp.simPublic(); ssp.simPublic()
 
   /** Committed S (supervisor) bit. */
-  val s = srSys(S_BIT)
+  val s = srSys(S_BIT); s.simPublic()
 
-  /** Architectural A7, banked by committed S. */
-  val a7 = Mux(s, ssp, usp)
+  /** Architectural A7, banked by committed S. simPublic so the lock-step / unit
+    * tests can observe the banked SP (and so USP is never pruned when its only
+    * consumer is this mux). */
+  val a7 = Mux(s, ssp, usp); a7.simPublic()
 
   // ── write ports (driven by the exception FSM / RTE / privileged moves) ──────
   val setSrSys = Flow(UInt(8 bits))
