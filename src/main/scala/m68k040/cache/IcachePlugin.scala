@@ -157,12 +157,26 @@ class IcachePlugin extends FiberPlugin with FetchService {
       val REPLAY    = new State
 
       // ----- IDLE: accept; hit -> arm S1 read, miss -> latch + refill -----
+      // The fetch can be accepted only when the ITLB has RESOLVED the translation
+      // (xlate.rsp.ready). MMU-off identity is always ready, so MMU-disabled fetch is
+      // unchanged. On an ITLB MISS rsp.ready is LOW (the walker is running): we do not
+      // accept (stall) until it resolves. A resolved translation that FAULTS
+      // (non-resident / supervisor I-page) is accepted as a fault placeholder
+      // (s1Fault) WITHOUT a refill — the rsp carries fault -> DecodePacket.fault.
       IDLE.whenIsActive {
         activePc      := cmdPort.payload.pc
-        cmdPort.ready := !inFlight
+        cmdPort.ready := !inFlight && xlate.rsp.ready
 
         when(cmdPort.fire) {
-          when(isHit) {
+          when(xlate.rsp.fault) {
+            // Translation fault: emit a fault response (no data, no refill).
+            s1Valid := True
+            s1Way   := U(0, wayBits bits)
+            s1Pc    := idlePc
+            s1Fault := True
+            s1Lane  := idleLaneIdx
+            s1Pred  := Vec.fill(4)(ChunkPredecode().getZero)
+          } elsewhen(isHit) {
             // Arm S1: launch the data BRAM read; latch control for next-cycle mux.
             dataReadAddr := idleReadAddr
             dataReadEn   := True

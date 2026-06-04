@@ -4,7 +4,7 @@ import m68k040.M68kParams
 import m68k040.M68kSpinalConfig
 import m68k040.core.{M68kCore, ParamPlugin}
 import m68k040.cache.{IcachePlugin, DcachePlugin}
-import m68k040.mmu.{IdentityTranslationPlugin, DtlbPlugin, MmuControlPlugin}
+import m68k040.mmu.{ItlbPlugin, DtlbPlugin, MmuControlPlugin}
 import m68k040.frontend.FetchAlignPlugin
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
@@ -109,6 +109,14 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     dtlb.umCommitValid := rob.logic.retire0
     dtlb.umCommitId    := rob.logic.h0
     dtlb.umFlush       := doFlush
+    // ── ITLB U deferred-write queue wiring (U-only; instruction fetch sets U not M) ──
+    // The fetch walk's U-descriptor write drains at retire (tagged robId 0; the U bit
+    // is idempotent / not architecturally compared) and discards on flush.
+    val itlb = host[m68k040.mmu.ItlbPlugin]
+    itlb.umAccessRobId := U(0, 6 bits)
+    itlb.umCommitValid := rob.logic.retire0
+    itlb.umCommitId    := rob.logic.h0
+    itlb.umFlush       := doFlush
     // The D-cache's `axi` is declared master() inside its plugin and surfaces as a
     // top-level IO automatically (like the I-cache's), so no extra wiring needed.
 
@@ -173,7 +181,7 @@ object GenFullCoreSynthVerilog {
         new M68kCore(Seq[FiberPlugin](
           new ParamPlugin(p),
           new MmuControlPlugin(),
-          new IdentityTranslationPlugin(),
+          new ItlbPlugin(),
           new DtlbPlugin(),
           new IcachePlugin(),
           new DcachePlugin(),

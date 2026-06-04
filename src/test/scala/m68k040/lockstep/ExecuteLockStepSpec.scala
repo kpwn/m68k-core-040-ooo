@@ -2,7 +2,7 @@ package m68k040.lockstep
 
 import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
-import m68k040.mmu.{IdentityTranslationPlugin, DtlbPlugin, MmuControlPlugin}
+import m68k040.mmu.{ItlbPlugin, DtlbPlugin, MmuControlPlugin}
 import m68k040.cache.{IcachePlugin, DcachePlugin, DcacheService}
 import m68k040.frontend.FetchAlignPlugin
 import m68k040.decode.DecodeStage
@@ -102,6 +102,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dtlb.umCommitValid := rob.logic.retire0
       dtlb.umCommitId    := rob.logic.h0
       dtlb.umFlush       := host[RedirectService].doFlush
+      // ── ITLB U deferred-write queue wiring (U-only; mirrors top/FullCoreSynth) ──
+      val itlb = host[m68k040.mmu.ItlbPlugin]
+      itlb.umAccessRobId := U(0, 6 bits)
+      itlb.umCommitValid := rob.logic.retire0
+      itlb.umCommitId    := rob.logic.h0
+      itlb.umFlush       := host[RedirectService].doFlush
 
       // ── Commit-time mispredict redirect fan-out (registered doFlush pulse) ──
       val doFlush = host[RedirectService].doFlush
@@ -161,6 +167,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
+    val itlb   = new ItlbPlugin
     val dtlb   = new DtlbPlugin
     val icache = new IcachePlugin
     val dcache = new DcachePlugin
@@ -181,7 +188,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
       ctrl,
-      new IdentityTranslationPlugin,
+      itlb,
       dtlb,
       icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu,
       rfInt, rfNzvc, rfX, wire)) }
@@ -230,15 +237,30 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   val MMU_ROOT = 0x00080000L
   val MMU_PTRT = 0x00081000L
   val MMU_PAGT = 0x00082000L
-  def buildMmuTable(mem: m68k040.ls.BehavioralMemAgent, dataPageVA: Long, ppn: Long): Unit = {
+  // Per-(rootIdx,ptrIdx) leaf page table: the 64-entry leaf table for the data VA
+  // lives at MMU_PAGT; the code VA (a different root/ptr index) gets its own leaf
+  // table at MMU_PAGT2 so both can coexist under the shared root/ptr tables.
+  val MMU_PAGT2 = 0x00083000L
+  def mapPage(mem: m68k040.ls.BehavioralMemAgent, va: Long, ppn: Long, leafBase: Long): Unit = {
     def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) mem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
-    val rootIdx = ((dataPageVA >> 25) & 0x7f).toInt
-    val ptrIdx  = ((dataPageVA >> 18) & 0x7f).toInt
-    val pageIdx = ((dataPageVA >> 12) & 0x3f).toInt
+    val rootIdx = ((va >> 25) & 0x7f).toInt
+    val ptrIdx  = ((va >> 18) & 0x7f).toInt
+    val pageIdx = ((va >> 12) & 0x3f).toInt
     pokeWordLE(MMU_ROOT + rootIdx * 4, (MMU_PTRT & 0xfffffff0L) | 0x3L)
-    pokeWordLE(MMU_PTRT + ptrIdx * 4,  (MMU_PAGT & 0xfffffff0L) | 0x3L)
-    // page descriptor: PDT resident, no WP/super; PPN = non-identity
-    pokeWordLE(MMU_PAGT + pageIdx * 4, ((ppn << 12) & 0xfffff000L) | 0x1L)
+    pokeWordLE(MMU_PTRT + ptrIdx * 4,  (leafBase & 0xfffffff0L) | 0x3L)
+    pokeWordLE(leafBase + pageIdx * 4, ((ppn << 12) & 0xfffff000L) | 0x1L)
+  }
+  // The 68040 has ONE MMU: when enabled, BOTH I-fetch and D-access translate. The
+  // oracle treats instruction fetch as IDENTITY (untranslated), so to keep the RTL
+  // ITLB byte-for-byte the same we IDENTITY-map the code region (8 pages from the
+  // load address — covers the program + handler). Data gets the non-identity PPN.
+  def buildMmuTable(mem: m68k040.ls.BehavioralMemAgent, dataPageVA: Long, ppn: Long): Unit = {
+    mapPage(mem, dataPageVA, ppn, MMU_PAGT)
+    val codeBase = ProgramAssembler.DefaultLoadAddress
+    for (i <- 0 until 8) {
+      val cva = codeBase + i * 0x1000L
+      mapPage(mem, cva, (cva >> 12) & 0xfffffL, MMU_PAGT2)  // identity
+    }
   }
 
   def runLockStep(name: String, src: String, nInstr: Int = -1, checkMem: Seq[Long] = Seq.empty,
@@ -353,9 +375,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // when the MMU is enabled; idle for MMU-disabled programs). MMU disabled by
       // default -> identity passthrough, so existing programs are unchanged.
       val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      // The ITLB has its OWN dedicated walker AXI port: attach a second behavioral
+      // memory holding the SAME page table (one shared page table, two read ports).
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
       mmuMap match {
         case Some((dataPageVA, ppn)) =>
           buildMmuTable(ptmem, dataPageVA, ppn)
+          buildMmuTable(itlbPtmem, dataPageVA, ppn)
           dut.ctrl.logic.mmuEnable #= true
           dut.ctrl.logic.rootPtr   #= MMU_ROOT
         case None =>
@@ -688,14 +714,21 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
       val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
       // Build a table whose root/pointer are resident but the PAGE descriptor is
-      // NON-RESIDENT (PDT=00) for the data page VA 0x2000.
-      def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) ptmem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
-      val va = 0x2000L
-      val rootIdx = ((va >> 25) & 0x7f).toInt; val ptrIdx = ((va >> 18) & 0x7f).toInt; val pageIdx = ((va >> 12) & 0x3f).toInt
-      pokeWordLE(MMU_ROOT + rootIdx * 4, (MMU_PTRT & 0xfffffff0L) | 0x3L)
-      pokeWordLE(MMU_PTRT + ptrIdx * 4,  (MMU_PAGT & 0xfffffff0L) | 0x3L)
-      pokeWordLE(MMU_PAGT + pageIdx * 4, (0x42L << 12) & 0xfffff000L)   // PDT=00 -> non-resident
+      // NON-RESIDENT (PDT=00) for the data page VA 0x2000. Code is IDENTITY-mapped
+      // (resident) in BOTH walker memories so instruction fetch through the ITLB does
+      // not fault — only the DATA access to VA 0x2000 faults.
+      def buildFaultTable(mem: m68k040.ls.BehavioralMemAgent): Unit = {
+        def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) mem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+        val va = 0x2000L
+        val rootIdx = ((va >> 25) & 0x7f).toInt; val ptrIdx = ((va >> 18) & 0x7f).toInt; val pageIdx = ((va >> 12) & 0x3f).toInt
+        pokeWordLE(MMU_ROOT + rootIdx * 4, (MMU_PTRT & 0xfffffff0L) | 0x3L)
+        pokeWordLE(MMU_PTRT + ptrIdx * 4,  (MMU_PAGT & 0xfffffff0L) | 0x3L)
+        pokeWordLE(MMU_PAGT + pageIdx * 4, (0x42L << 12) & 0xfffff000L)   // PDT=00 -> non-resident
+        for (i <- 0 until 8) { val cva = loadAddr + i * 0x1000L; mapPage(mem, cva, (cva >> 12) & 0xfffffL, MMU_PAGT2) }
+      }
+      buildFaultTable(ptmem); buildFaultTable(itlbPtmem)
       dut.ctrl.logic.mmuEnable #= true
       dut.ctrl.logic.rootPtr   #= MMU_ROOT
 
@@ -827,6 +860,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // handler writes via a D-cache store must be visible to the walker on re-walk.
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
       val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // The ITLB walker shares the SAME backing memory (one physical page table), so a
+      // handler PT write is visible to the I-side re-walk too.
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
       // Build the nested page table (little-endian) in the shared memory.
       def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
       pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)   // root[0] -> ptr resident
@@ -836,6 +872,17 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       pokeLE(PAGA + 2 * 4,    0x0L)                          // pageA[2] = NON-RESIDENT (the fault)
       pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)          // pageA[0x3f] = identity VPN 0xFF (supervisor stack)
       pokeLE(PAGC + 2 * 4,    (0x82L << 12) | 0x1L)          // pageC[2] = identity VPN 0x82 (PT write)
+      // The 68040 has ONE MMU: the I-fetch path also translates. IDENTITY-map the code
+      // region (8 pages from loadAddr; the oracle treats I-fetch as identity) so the
+      // ITLB resolves code fetches without faulting. A SEPARATE leaf table (PAGD) at a
+      // free address keeps it out of pageA/pageC.
+      val PAGD = 0x00084000L
+      pokeLE(PTRT + (((loadAddr >> 18) & 0x7f).toInt) * 4, (PAGD & 0xfffffff0L) | 0x2L)
+      pokeLE(MMU_ROOT + (((loadAddr >> 25) & 0x7f).toInt) * 4, (PTRT & 0xfffffff0L) | 0x2L)
+      for (i <- 0 until 8) {
+        val cva = loadAddr + i * 0x1000L
+        pokeLE(PAGD + (((cva >> 12) & 0x3f).toInt) * 4, (((cva >> 12) & 0xfffffL) << 12) | 0x1L)
+      }
       dut.ctrl.logic.mmuEnable #= true
       dut.ctrl.logic.rootPtr   #= 0x80000L
 
