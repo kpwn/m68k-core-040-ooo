@@ -26,6 +26,23 @@ trait LsEuService {
   // robId of the access currently being translated (tags a DTLB walk's deferred U/M
   // descriptor write so it drains at THAT instruction's commit).
   def xlateRobId: UInt
+  // MMU access-fault completion: the cycle an LS access takes a DTLB rsp.fault, mark
+  // its ROB entry FAULTED (vector 2, access fault) with the faulting VA + the SSW
+  // access attributes {write, sizeBits, supervisor}. The ROB consumes this like
+  // branchCompletion (records per-entry, raises the precise exception at retire).
+  def faultCompletion: Flow[LsFault]
+}
+
+/** LS access-fault completion payload: which ROB entry faulted (vector 2 implied),
+  * the faulting VA, and the SSW access attributes. `write` = store (R/W=write),
+  * `sizeBits` = encoded access size (00=byte,01=word,10=long), `supervisor` = the
+  * access function-code supervisor bit. */
+case class LsFault() extends Bundle {
+  val robId      = UInt(6 bits)
+  val faultAddr  = UInt(32 bits)
+  val write      = Bool()
+  val sizeBits   = UInt(2 bits)
+  val supervisor = Bool()
 }
 
 /** AGU + Load/Store EU (LS-1 slice): conservative single-outstanding pipe.
@@ -46,6 +63,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   var sqCommitPort: Flow[UInt]     = null
   var sqFlushSig: Bool             = null
   var wakeupPort: Flow[UInt]       = null
+  var faultCompletionPort: Flow[LsFault] = null
   var rdBase, rdData: RegFileReadPort = null
   var intW: RegFileWritePort = null
   var intByp: RegFileBypassPort = null
@@ -57,6 +75,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   override def sqCommit: Flow[UInt]     = sqCommitPort
   override def sqFlush: Bool            = sqFlushSig
   override def wakeup: Flow[UInt]       = wakeupPort
+  override def faultCompletion: Flow[LsFault] = faultCompletionPort
   var xlateRobIdSig: UInt = null
   override def xlateRobId: UInt         = xlateRobIdSig
 
@@ -86,6 +105,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sqCommitPort   = Flow(UInt(6 bits))
     sqFlushSig     = Bool()
     wakeupPort     = Flow(UInt(6 bits))
+    faultCompletionPort = Flow(LsFault()); faultCompletionPort.simPublic()
     xlateRobIdSig  = UInt(6 bits)
     val irf = host[IntRegFileService]
     rdBase = irf.newRead()
@@ -298,6 +318,17 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val compNzvc      = Reg(Bits(4 bits))
     val compNzvcWrite = RegInit(False)
     val compNzvcDst   = Reg(UInt(nzvcW.address.getWidth bits))
+    // MMU access-FAULT completion: when an access takes a DTLB rsp.fault, it still
+    // COMPLETES (compValid -> the ROB marks the entry done so it can retire), but as
+    // a FAULT: it writes NO register / allocs NO store / wakes nothing, and drives
+    // faultCompletion {robId, faultAddr, write, sizeBits, supervisor} so the ROB
+    // flags the entry (vector 2) for precise delivery at retire. RegInit(False) so an
+    // unfaulted access never spuriously flags. Captured alongside the comp* stage.
+    val compIsFault   = RegInit(False)
+    val compFaultAddr = Reg(UInt(32 bits))
+    val compFaultWr   = RegInit(False)
+    val compFaultSize = Reg(UInt(2 bits))
+    val compFaultSup  = RegInit(False)
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax #2: PIPELINE the SQ-forward query result -> completion decision.
@@ -363,21 +394,45 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compNzvc      := storeNzvc
       compNzvcWrite := u1.writesNzvc
       compNzvcDst   := u1.pNzvcDst
+      compIsFault   := False
+    }
+
+    // captured-FAULT -> register (called in the decision cycle when an access takes a
+    // DTLB rsp.fault). Completes (compValid) so the ROB marks done, but flagged as a
+    // fault (no reg write / no store alloc / no wakeup); drives faultCompletion. The
+    // SSW attrs: write = store, sizeBits = encoded access size, supervisor = the
+    // access function-code supervisor bit (xlate.req.supervisor for this access).
+    def captureFault(): Unit = {
+      compValid     := True
+      compRobId     := s1Ctx.robId
+      compPdstValid := False
+      compNzvcWrite := False
+      compIsLoad    := False
+      compIsFault   := True
+      compFaultAddr := s1Va
+      compFaultWr   := isStore
+      compFaultSize := u1.size.mux(
+        m68k040.isa.Size.BYTE -> U(0, 2 bits),
+        m68k040.isa.Size.WORD -> U(1, 2 bits),
+        m68k040.isa.Size.LONG -> U(2, 2 bits))
+      compFaultSup  := xlate.req.supervisor
     }
 
     // ---- drive completion / writeback / wakeup from the registered stage ----
+    // A FAULTED access still completes (marks the ROB entry done) but writes NO
+    // register / wakes nothing — its result is replaced by the precise exception.
     completionPort.valid   := compValid
     completionPort.payload := compRobId
-    intW.valid     := compValid && compPdstValid
+    intW.valid     := compValid && compPdstValid && !compIsFault
     intW.address   := compPdst
     intW.data      := compData
-    intByp.valid   := compValid && compPdstValid
+    intByp.valid   := compValid && compPdstValid && !compIsFault
     intByp.address := compPdst
     intByp.data    := compData
     // NZVC writeback + bypass for a MOVE-to-memory store (mirrors the int path; the
     // bypass forwards to a dependent flag-reader issuing the same cycle, exactly as
     // the ALU EU's NZVC bypass).
-    nzvcW.valid     := compValid && compNzvcWrite
+    nzvcW.valid     := compValid && compNzvcWrite && !compIsFault
     nzvcW.address   := compNzvcDst
     nzvcW.data      := compNzvc
     nzvcByp.valid   := nzvcW.valid
@@ -385,8 +440,15 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     nzvcByp.data    := nzvcW.data
     // Dynamic load-wakeup: only a completing LOAD that produces a physreg broadcasts
     // (a store completes too but writes no register — its pdst is stale).
-    wakeupPort.valid   := compValid && compIsLoad && compPdstValid
+    wakeupPort.valid   := compValid && compIsLoad && compPdstValid && !compIsFault
     wakeupPort.payload := compPdst
+    // MMU access-fault completion (registered, alongside the comp* stage).
+    faultCompletionPort.valid           := compValid && compIsFault
+    faultCompletionPort.payload.robId   := compRobId
+    faultCompletionPort.payload.faultAddr  := compFaultAddr
+    faultCompletionPort.payload.write      := compFaultWr
+    faultCompletionPort.payload.sizeBits   := compFaultSize
+    faultCompletionPort.payload.supervisor := compFaultSup
 
     val busy = RegInit(False)
     // Single-outstanding: do not accept a new µop while a decision is pending
@@ -411,8 +473,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
 
     // compValid is a single-cycle pulse: default-clear, re-set only by a capture.
     // compNzvcWrite likewise (so a stale store's NZVC write does not linger).
+    // compIsFault likewise (so a non-faulting access never lingers a stale fault).
     compValid := False
     compNzvcWrite := False
+    compIsFault := False
 
     val fsm = new StateMachine {
       val IDLE    = new State with EntryPoint
@@ -437,10 +501,21 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
             // re-assert s1Valid explicitly (later write wins).
             busy := True
             when(xlateReady) {
-              s2Paddr  := s1Paddr
-              s2PaddrB := s1PaddrB
-              s2Fault  := xlateFault
-              goto(XLATE)
+              when(xlateFault) {
+                // MMU access fault: the translation RESOLVED with a fault (non-
+                // resident / write-protect / supervisor). The access does NOT
+                // proceed (no SQ alloc / no cache launch); it completes as a FAULT
+                // (vector 2) so the ROB flags the entry for precise delivery.
+                captureFault()
+                busy    := False
+                s1Valid := False
+                goto(IDLE)
+              } otherwise {
+                s2Paddr  := s1Paddr
+                s2PaddrB := s1PaddrB
+                s2Fault  := xlateFault
+                goto(XLATE)
+              }
             } otherwise {
               s1Valid := True
             }

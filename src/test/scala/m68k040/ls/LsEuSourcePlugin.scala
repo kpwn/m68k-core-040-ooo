@@ -66,6 +66,14 @@ class LsEuSourcePlugin extends FiberPlugin {
     cValid := eu.completion.valid
     cRob   := eu.completion.payload
 
+    // MMU access-fault completion observation (Task 1).
+    val fValid = out Bool ();        fValid := eu.faultCompletion.valid
+    val fRob   = out UInt (6 bits);  fRob   := eu.faultCompletion.payload.robId
+    val fAddr  = out UInt (32 bits); fAddr  := eu.faultCompletion.payload.faultAddr
+    val fWrite = out Bool ();        fWrite := eu.faultCompletion.payload.write
+    val fSize  = out UInt (2 bits);  fSize  := eu.faultCompletion.payload.sizeBits
+    val fSuper = out Bool ();        fSuper := eu.faultCompletion.payload.supervisor
+
     // ROB-side SQ commit / flush (sim-driven)
     val iSqCommitValid = in Bool (); val iSqCommitRob = in UInt (6 bits)
     val iSqFlush       = in Bool ()

@@ -91,6 +91,26 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val isRteStore    = Vec.fill(depth)(RegInit(False))
     val faultVecStore = Vec.fill(depth)(Reg(UInt(8 bits)))
     val faultPcStore  = Vec.fill(depth)(Reg(UInt(32 bits)))
+    // MMU access-fault per-entry capture (set at COMPLETION from the LS EU's
+    // faultCompletion, NOT at alloc — an MMU fault is discovered at execute). On a
+    // faulting LS access the LS EU marks the entry faulted vector 2 + the faulting VA
+    // + the SSW access attrs {write, sizeBits, supervisor}; the exception FSM stacks
+    // the format-$7 frame from these. RegInit Vecs, reset per-alloc (mirrors
+    // faultedStore) so a re-used index never carries a stale MMU fault.
+    val faultAddrStore = Vec.fill(depth)(Reg(UInt(32 bits)))
+    val faultWrStore   = Vec.fill(depth)(RegInit(False))
+    val faultSizeStore = Vec.fill(depth)(Reg(UInt(2 bits)))
+    val faultSupStore  = Vec.fill(depth)(RegInit(False))
+    // LS access-fault completion (driven by the LS-cluster wiring, like
+    // branchCompletion). Default-idle (allowOverride) so a standalone DUT elaborates.
+    val lsFaultCompletion = Flow(m68k040.execute.LsFault())
+    lsFaultCompletion.valid.allowOverride;            lsFaultCompletion.valid := False
+    lsFaultCompletion.payload.robId.allowOverride;    lsFaultCompletion.payload.robId := U(0, robIdW bits)
+    lsFaultCompletion.payload.faultAddr.allowOverride;lsFaultCompletion.payload.faultAddr := U(0, 32 bits)
+    lsFaultCompletion.payload.write.allowOverride;    lsFaultCompletion.payload.write := False
+    lsFaultCompletion.payload.sizeBits.allowOverride; lsFaultCompletion.payload.sizeBits := U(0, 2 bits)
+    lsFaultCompletion.payload.supervisor.allowOverride; lsFaultCompletion.payload.supervisor := False
+    lsFaultCompletion.simPublic()
     // Per-entry committed-CCR VALUE capture (set at completion from the EU writeback
     // values via ccrCompletion). Folded into committedCcr at retire (for the stacked
     // exception frame). RegInit False so an unwired entry contributes nothing.
@@ -246,6 +266,20 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       xValStore(c.payload.robId)    := c.payload.x
       xWrStore(c.payload.robId)     := c.payload.xWrite
     }
+    // LS MMU access-fault completion: mark the entry FAULTED (vector 2) + record the
+    // faulting VA + SSW attrs. The faulting instruction's PC is already captured per
+    // entry at alloc (faultPcStore), so the $7 frame's PC field is available. Placed
+    // with the other completion marks (BEFORE the alloc-reset) so alloc wins on a
+    // re-used index. completes is set by the LS EU's normal completion port too (the
+    // faulted access still completes so the entry can retire + trigger the exception).
+    when(lsFaultCompletion.valid) {
+      faultedStore(lsFaultCompletion.payload.robId)   := True
+      faultVecStore(lsFaultCompletion.payload.robId)  := U(2, 8 bits)  // access fault
+      faultAddrStore(lsFaultCompletion.payload.robId) := lsFaultCompletion.payload.faultAddr
+      faultWrStore(lsFaultCompletion.payload.robId)   := lsFaultCompletion.payload.write
+      faultSizeStore(lsFaultCompletion.payload.robId) := lsFaultCompletion.payload.sizeBits
+      faultSupStore(lsFaultCompletion.payload.robId)  := lsFaultCompletion.payload.supervisor
+    }
 
     when(alloc0) {
       payload.write(tail, payloadFrom(allocUopVec(0)))
@@ -255,6 +289,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       isRteStore(tail)    := allocUopVec(0).isRte
       faultVecStore(tail) := allocUopVec(0).faultVector
       faultPcStore(tail)  := allocUopVec(0).pc
+      faultWrStore(tail)  := False; faultSupStore(tail) := False
       nzvcWrStore(tail) := False; xWrStore(tail) := False
     }
     when(alloc1) {
@@ -265,6 +300,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       isRteStore(tail + 1)    := allocUopVec(1).isRte
       faultVecStore(tail + 1) := allocUopVec(1).faultVector
       faultPcStore(tail + 1)  := allocUopVec(1).pc
+      faultWrStore(tail + 1)  := False; faultSupStore(tail + 1) := False
       nzvcWrStore(tail + 1) := False; xWrStore(tail + 1) := False
     }
     when(allocFireSig) {
@@ -293,6 +329,13 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val exceptionPending = Bool();    exceptionPending := faultRetire;       exceptionPending.simPublic()
     val exceptionVector  = UInt(8 bits);  exceptionVector := faultVecStore(h0); exceptionVector.simPublic()
     val exceptionPc      = UInt(32 bits); exceptionPc     := faultPcStore(h0);  exceptionPc.simPublic()
+    // Access-fault (vector 2) extras for the format-$7 frame: the faulting VA + the
+    // SSW access attrs {write, sizeBits, supervisor}. Meaningful only when the head's
+    // vector is 2; the exception FSM selects the $7 path on the vector.
+    val exceptionFaultAddr = UInt(32 bits); exceptionFaultAddr := faultAddrStore(h0); exceptionFaultAddr.simPublic()
+    val exceptionFaultWr   = Bool();        exceptionFaultWr   := faultWrStore(h0);   exceptionFaultWr.simPublic()
+    val exceptionFaultSize = UInt(2 bits);  exceptionFaultSize := faultSizeStore(h0); exceptionFaultSize.simPublic()
+    val exceptionFaultSup  = Bool();        exceptionFaultSup  := faultSupStore(h0);  exceptionFaultSup.simPublic()
 
     // ── Committed CCR (X N Z V C, bits 4..0) — VALUE, folded at retire ───────────
     // The ROB has no CCR value on its payload (only phys IDs), so the EU writeback
