@@ -51,6 +51,8 @@ int main(int argc, char** argv) {
     uint32_t mmu_root = 0;
     uint32_t mmu_data_lo = 0;
     uint32_t mmu_data_hi = 0;
+    uint32_t mmu_instr_lo = 0;
+    uint32_t mmu_instr_hi = 0;
     // Page-table preload: little-endian longwords {addr, word} written before run
     // (the descriptor format is read LE). Lets the harness seed the resident
     // root/pointer descriptors the data-page walk needs (the handler writes the leaf).
@@ -89,6 +91,8 @@ int main(int argc, char** argv) {
         else if (a == "--mmu-root"    && i + 1 < argc) { mmu_root = parse_u32(argv[++i]); use_mmu = true; }
         else if (a == "--mmu-data-lo" && i + 1 < argc) mmu_data_lo = parse_u32(argv[++i]);
         else if (a == "--mmu-data-hi" && i + 1 < argc) mmu_data_hi = parse_u32(argv[++i]);
+        else if (a == "--mmu-instr-lo" && i + 1 < argc) mmu_instr_lo = parse_u32(argv[++i]);
+        else if (a == "--mmu-instr-hi" && i + 1 < argc) mmu_instr_hi = parse_u32(argv[++i]);
         else if (a == "--mmu-pt" && i + 1 < argc) {
             const char* spec = argv[++i];
             const char* sep = std::strchr(spec, ':');
@@ -156,6 +160,7 @@ int main(int argc, char** argv) {
             ref.set_irq(irq_level);
         }
         if (use_mmu) ref.enable_mmu(mmu_root, mmu_data_lo, mmu_data_hi);
+        if (use_mmu) ref.set_instr_window(mmu_instr_lo, mmu_instr_hi);
 
         FILE* tf = std::fopen(trace_path.c_str(), "w");
         if (!tf) {
@@ -201,6 +206,7 @@ int main(int argc, char** argv) {
             ref.set_irq(irq_level);
         }
         if (use_mmu) ref.enable_mmu(mmu_root, mmu_data_lo, mmu_data_hi);
+        if (use_mmu) ref.set_instr_window(mmu_instr_lo, mmu_instr_hi);
         cycles = ref.run_until_sentinel_or_pc_with_irq_events(
             sentinel, use_stop_pc, stop_pc, irq_events, max_cycles);
     }
