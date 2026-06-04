@@ -98,6 +98,26 @@ public:
     void     set_irq(unsigned int level);
     void     set_interrupt_ack_response(int vector);
 
+    // ── 68040 software MMU (oracle for our RTL's format-$7 page-fault delivery) ──
+    // When enabled, DATA accesses (cb_read*/cb_write* with a data function code)
+    // are translated through a 68040 long-format 3-level page table rooted at
+    // `root_ptr` (URP/SRP). A non-resident / write-protect / supervisor-violation
+    // page raises a 68040 access fault (vector 2, format-$7 frame) via Musashi's
+    // m68k_pulse_bus_error(), exactly mirroring MAME's m68040 model. The table
+    // descriptor format matches our RTL's TableWalker (rootIdx=VA[31:25],
+    // ptrIdx=VA[24:18], pageIdx=VA[17:12]; descriptors little-endian; PDT/UDT in
+    // low 2 bits, WP=bit2, super=bit7, PPN=bits[31:12]). Disabled by default ->
+    // every existing program is byte-for-byte unchanged.
+    //
+    // Only DATA accesses whose (untranslated) address falls in the half-open
+    // window [data_lo, data_hi) are translated; everything else (instruction
+    // fetch from the code region, vector table, supervisor stack, the page
+    // table itself, the sentinel) passes through identity. This matches the
+    // RTL, where only D-side data accesses go through the DTLB (instruction
+    // fetch uses a separate, untranslated I-cache). The window is the data
+    // page region the program touches.
+    void     enable_mmu(uint32_t root_ptr, uint32_t data_lo, uint32_t data_hi);
+
     uint32_t get_reg(Reg r) const;
     void     set_reg(Reg r, uint32_t v);
 
@@ -156,6 +176,17 @@ public:
     int      cb_int_ack(int int_level);
 
 private:
+    // 68040 software MMU: translate `va` (a data access; rw: false=read,
+    // true=write). Returns the physical address. On a non-resident /
+    // write-protect / supervisor fault, sets the m68ki_aerr_* globals and
+    // calls m68k_pulse_bus_error() (which longjmps out — does not return here).
+    // Untranslated / disabled -> identity.
+    uint32_t mmu_translate(uint32_t va, bool rw);
+    bool      mmu_enabled_ = false;
+    uint32_t  mmu_root_    = 0;
+    uint32_t  mmu_lo_      = 0;
+    uint32_t  mmu_hi_      = 0;
+
     // Flat byte store — hash map to keep memory small for sparse
     // programs.  Address → byte value.  Missing addresses read 0xFF,
     // matching the Verilator MemModel default so co-sim results stay

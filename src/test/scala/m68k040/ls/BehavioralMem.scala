@@ -43,8 +43,11 @@ object BehavioralMem {
 /** Attaches read + write slave agents to a full Axi4 bus, both backed by the same
   * SparseMemory. Exposes pokeByte/peekByte helpers for the testbench (mirrors the
   * I-cache sim's preloaded-image accessors). */
-class BehavioralMemAgent(axi: Axi4, cd: ClockDomain) {
-  val mem = SparseMemory()
+class BehavioralMemAgent(axi: Axi4, cd: ClockDomain, sharedMem: SparseMemory = null) {
+  // Optionally SHARE a backing SparseMemory with another agent (e.g. the D-cache and
+  // the MMU walker both view the same physical memory — the page table the handler
+  // writes via the D-cache must be visible to the walker). Default: own memory.
+  val mem = if (sharedMem != null) sharedMem else SparseMemory()
 
   // ---- read path: serve bytes from the shared image ----
   val readAgent = new Axi4ReadOnlySlaveAgent(axi.ar, axi.r, cd) {

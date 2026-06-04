@@ -1030,6 +1030,7 @@ extern const uint8    m68ki_ea_idx_cycle_table[];
 extern uint           m68ki_aerr_address;
 extern uint           m68ki_aerr_write_mode;
 extern uint           m68ki_aerr_fc;
+extern int            m68ki_bus_error_step_break;
 
 /* Forward declarations to keep some of the macros happy */
 static inline uint m68ki_read_16_fc (uint address, uint fc);
@@ -1934,6 +1935,55 @@ extern jmp_buf m68ki_bus_error_jmp_buf;
 #define m68ki_check_bus_error_trap() setjmp(m68ki_bus_error_jmp_buf)
 
 /* Exception for bus error */
+/* Format 7 stack frame (68040 access error).
+ *
+ * Ported BYTE-FOR-BYTE from MAME's legacy m68k core
+ * (src/devices/cpu/m68000/m68kcpu.h: m68ki_stack_frame_0111) so this Musashi
+ * runner is the byte-for-byte oracle for our RTL's format-$7 delivery. Pushed
+ * LAST->FIRST (predecrement), so in memory ASCENDING from the final SSP the 30
+ * words (0x3C bytes) are:
+ *   [SSP+0x00] SR ; [+0x02] PC ; [+0x06] 0x7000|(vec<<2) ;
+ *   [+0x08] effective address ; [+0x0C] SSW = (in_mmu?0x400:0)|fc|(rw<<8) ;
+ *   [+0x0E] internal (long+word, zero) ; [+0x14] fault address ;
+ *   [+0x18] internal (9 longs, zero).
+ * rw: 1 = read, 0 = write (matches m68ki_aerr_write_mode). fc: 3-bit FC.
+ */
+static inline void m68ki_stack_frame_0111(uint sr, uint vector, uint pc, uint fault_address, uint rw, uint fc, uint in_mmu)
+{
+	/* INTERNAL REGISTERS (18 words) */
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+	m68ki_push_32(0);
+
+	/* FAULT ADDRESS (2 words) */
+	m68ki_push_32(fault_address);
+
+	/* INTERNAL REGISTERS (3 words) */
+	m68ki_push_32(0);
+	m68ki_push_16(0);
+
+	/* SPECIAL STATUS REGISTER (1 word) */
+	m68ki_push_16((in_mmu ? 0x400 : 0) | (fc & 7) | ((rw & 1) << 8));
+
+	/* EFFECTIVE ADDRESS (2 words) */
+	m68ki_push_32(fault_address);
+
+	/* 0111, VECTOR OFFSET (1 word) */
+	m68ki_push_16(0x7000 | (vector<<2));
+
+	/* PROGRAM COUNTER (2 words) */
+	m68ki_push_32(pc);
+
+	/* STATUS REGISTER (1 word) */
+	m68ki_push_16(sr);
+}
+
 static inline void m68ki_exception_bus_error(void)
 {
 	int i;
@@ -1959,8 +2009,25 @@ static inline void m68ki_exception_bus_error(void)
 
 	uint sr = m68ki_init_exception();
 
-	/* Note: This is implemented for 68010 only! */
-	m68ki_stack_frame_1000(REG_PPC, sr, EXCEPTION_BUS_ERROR);
+	if(CPU_TYPE_IS_040_PLUS(CPU_TYPE))
+	{
+		/* 68040: format-$7 access-error frame (MAME-matched). The faulting
+		 * instruction PC is REG_PPC; the access address / rw / fc come from the
+		 * m68ki_aerr_* globals set when the access faulted (the MMU walk in the
+		 * runner pulses the bus error with these set). in_mmu=1 (MMU-originated). */
+		m68ki_stack_frame_0111(sr, EXCEPTION_BUS_ERROR, REG_PPC,
+			m68ki_aerr_address, m68ki_aerr_write_mode ? 1 : 0, m68ki_aerr_fc, 1);
+		/* Make the access fault a DISCRETE trace step (PC = handler entry); the
+		 * execute loop breaks after the longjmp re-entry instead of folding the
+		 * handler's first instruction into this step. Mirrors our RTL's commit-time
+		 * exception-entry observation. */
+		m68ki_bus_error_step_break = 1;
+	}
+	else
+	{
+		/* Note: This is implemented for 68010 only! */
+		m68ki_stack_frame_1000(REG_PPC, sr, EXCEPTION_BUS_ERROR);
+	}
 
 	m68ki_jump_vector(EXCEPTION_BUS_ERROR);
 

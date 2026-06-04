@@ -38,7 +38,13 @@ class ExceptionUnit(
     val ss: SystemState,
     entryTrigger: Bool, entryVector: UInt, entryPc: UInt,
     rteTrigger: Bool, rtePc: UInt,
-    committedCcr: UInt) extends Area {
+    committedCcr: UInt,
+    // Access-fault (vector 2) extras for the format-$7 frame. Default-driven idle
+    // (a DUT that does not supply them — e.g. the slice-1 format-$0 unit tests —
+    // passes the defaults; the $7 path is selected only when entryVector === 2).
+    entryFaultAddr: UInt = U(0, 32 bits),
+    entryFaultWr:   Bool = False,
+    entryFaultSup:  Bool = False) extends Area {
 
   // ── exposed D-cache request ports (wiring MUXes them onto the real cache) ────
   val dcLoadCmd  = Stream(DLoadCmd())
@@ -76,12 +82,23 @@ class ExceptionUnit(
   val curVec   = Reg(UInt(8 bits))
   val curPc    = Reg(UInt(32 bits))   // ENTRY: faulting PC to stack; RTE: restored PC
   val oldSr    = Reg(UInt(16 bits))   // ENTRY: SR to stack
-  val frameBase= Reg(UInt(32 bits))   // ENTRY: new SSP = SSP-8 ; RTE: old SSP (read base)
+  val frameBase= Reg(UInt(32 bits))   // ENTRY: new SSP = SSP-8 (or -60 for $7); RTE: old SSP
   val vecTarget= Reg(UInt(32 bits))   // redirect target
+  // ENTRY: is this an access fault (vector 2)? -> stack a format-$7 frame (30 words)
+  // instead of format-$0 (4 words). Captured at trigger.
+  val curIs7   = RegInit(False)
+  val curFault = Reg(UInt(32 bits))   // faulting VA (EA + fault-address fields of $7)
+  val curSsw   = Reg(UInt(16 bits))   // $7 special status word
 
   // RTE pop accumulators
   val popSr = Reg(UInt(16 bits))
   val popPc = Reg(UInt(32 bits))
+  // RTE format select: the stacked format word @base+6 top nibble (0 = format-$0,
+  // 7 = format-$7 access-fault). Chooses the pop size (8 vs 60 bytes). For $7 RTE
+  // restores SR/PC and RESUMES at the stacked PC (= faulting instr -> re-executes),
+  // discarding the rest of the frame — matching MAME's RTE case 7.
+  val popIs7 = RegInit(False); popIs7.simPublic()
+  val popFmtWord = Reg(UInt(16 bits)); popFmtWord.simPublic()
 
   // ── redirect outputs (the ROB ORs these into its registered redirect) ────────
   val redirectValid = Bool(); redirectValid := False
@@ -165,18 +182,51 @@ class ExceptionUnit(
     stoSize  := sz
     stoData  := data.resize(32)
   }
+  // Identity supervisor PHYSICAL store WITHOUT a translation request. The exception
+  // frame/vector accesses are physical (paddr == va); the D-cache store port uses the
+  // paddr directly. Driving the DTLB here would (with the MMU live) start a walk whose
+  // multi-cycle not-ready stalls the store state -> re-pulsed stores. So we don't.
+  def driveStoreNoXlate(va: UInt, sz: Size.C, data: Bits): Unit = {
+    stoVld   := True
+    stoPaddr := va
+    stoSize  := sz
+    stoData  := data.resize(32)
+  }
 
-  // ENTRY frame-store step (0..3): SR, PC hi, PC lo, format/vector word. The
-  // D-cache store path is single-outstanding, so each word is issued THEN we wait
-  // for the write-through ACK (AXI B) before the next — otherwise a back-to-back
-  // store overwrites the previous write-through beat before it drains (lost word).
-  val stStep = Reg(UInt(2 bits)) init 0; stStep.simPublic()
+  // ENTRY frame-store step. The D-cache store path is single-outstanding, so each
+  // word is issued THEN we wait for the write-through ACK (AXI B) before the next —
+  // otherwise a back-to-back store overwrites the previous write-through beat before
+  // it drains (lost word). Word index is from frameBase (LOW address), ascending.
+  //   format-$0 (illegal/privilege): 4 words [SR, PC hi, PC lo, vec<<2].
+  //   format-$7 (access fault):     30 words ($3C) — MAME m68ki_stack_frame_0111:
+  //     [+0x00]=SR [+0x02]=PChi [+0x04]=PClo [+0x06]=0x7000|(vec<<2)
+  //     [+0x08]=EAhi [+0x0a]=EAlo [+0x0c]=SSW [+0x0e..0x12]=0 (3 words)
+  //     [+0x14]=faultAddr hi [+0x16]=faultAddr lo [+0x18..0x3a]=0 (18 words).
+  //   stStep counts WORDS (5 bits, 0..29). lastStep = 3 ($0) or 29 ($7).
+  val stStep = Reg(UInt(5 bits)) init 0; stStep.simPublic()
+  val lastStep = Mux(curIs7, U(29, 5 bits), U(3, 5 bits))
   def frameWordAddr(step: UInt): UInt = (frameBase + (step << 1)).resized
-  def frameWordData(step: UInt): Bits = step.mux(
-    U(0, 2 bits) -> oldSr.asBits,
-    U(1, 2 bits) -> curPc(31 downto 16).asBits,
-    U(2, 2 bits) -> curPc(15 downto 0).asBits,
-    U(3, 2 bits) -> (curVec << 2).resize(16).asBits)
+  // Common low-4-word prefix: SR, PC hi, PC lo, format/vector word. The format/vector
+  // word is curVec<<2 for $0 and 0x7000|(curVec<<2) for $7.
+  val fmtVecWord = Mux(curIs7, (U(0x7000, 16 bits) | (curVec << 2).resize(16)), (curVec << 2).resize(16))
+  def frameWordData(step: UInt): Bits = {
+    val out = Bits(16 bits)
+    out := B(0, 16 bits)
+    switch(step) {
+      is(U(0, 5 bits)) { out := oldSr.asBits }
+      is(U(1, 5 bits)) { out := curPc(31 downto 16).asBits }
+      is(U(2, 5 bits)) { out := curPc(15 downto 0).asBits }
+      is(U(3, 5 bits)) { out := fmtVecWord.asBits }
+      // $7-only words (steps 4..29). For $0 these steps never execute.
+      is(U(4, 5 bits))  { out := curFault(31 downto 16).asBits }   // EA hi
+      is(U(5, 5 bits))  { out := curFault(15 downto 0).asBits }    // EA lo
+      is(U(6, 5 bits))  { out := curSsw.asBits }                   // SSW
+      is(U(10, 5 bits)) { out := curFault(31 downto 16).asBits }   // fault addr hi
+      is(U(11, 5 bits)) { out := curFault(15 downto 0).asBits }    // fault addr lo
+      // all other steps (7,8,9,12..29) stack 0 (internal registers).
+    }
+    out
+  }
 
   val fsm = new StateMachine {
     val IDLE      = new State with EntryPoint
@@ -192,15 +242,31 @@ class ExceptionUnit(
     val R_SRWAIT  = new State
     val R_PCREQ   = new State    // load PC long @ base+2
     val R_PCWAIT  = new State
+    val R_FMTREQ  = new State    // load format word @ base+6 (select $0 vs $7 pop)
+    val R_FMTWAIT = new State
     val R_REDIR   = new State
 
     IDLE.whenIsActive {
       when(entryTrigger) {
+        val is7 = entryVector === 2   // access fault -> format-$7
         curVec    := entryVector
         curPc     := entryPc
+        curIs7    := is7
+        curFault  := entryFaultAddr
+        // SSW = (in_mmu 0x400) | fc | (rw<<8); fc = data space (bit0=1) + supervisor
+        // (bit2) if a supervisor access; rw = read?1:write?0 (MAME m68ki_aerr).
+        // The faulting access's privilege = the PRE-exception S bit (SR bit13 =
+        // srSys bit5), read here BEFORE the FSM sets S. (The LS EU's translate-time
+        // supervisor flag is a slice-1 user-only simplification, so the SSW's super
+        // bit comes from the architectural SR, matching the MAME oracle which reads
+        // the SR S bit.) entryFaultSup is retained for a future MOVES/SFC-driven mode.
+        val faultSuper = ss.srSys(5) || entryFaultSup
+        val fc  = Mux(faultSuper, U(0x5, 3 bits), U(0x1, 3 bits))
+        val rwB = Mux(entryFaultWr, U(0, 1 bits), U(1, 1 bits))   // write->0, read->1
+        curSsw    := (U(0x400, 16 bits) | fc.resize(16) | (rwB ## U(0, 8 bits)).asUInt.resize(16))
         oldSr     := (ss.srSys ## committedCcr.resize(8 bits)).asUInt
-        // new SSP = current A7 (SSP, since committed S) - 8
-        val nb = (ss.ssp - 8)
+        // new SSP = current A7 (SSP, since committed S) - frame size (8 for $0, 60 for $7)
+        val nb = Mux(is7, ss.ssp - 60, ss.ssp - 8)
         frameBase := nb
         // compute vector fetch base = VBR + vec*4
         vecTarget := (ss.vbr + (entryVector << 2)).resized
@@ -216,13 +282,19 @@ class ExceptionUnit(
     // Wait for older committed stores to fully drain before we use the store port.
     E_DRAIN.whenIsActive { when(sqDrained) { goto(E_STORE) } }
 
-    // ── ENTRY: stack the format-$0 frame (4 words, one at a time) ───────────────
+    // ── ENTRY: stack the frame (one word at a time) ─────────────────────────────
     E_STORE.whenIsActive {
-      // present the translation + the store this cycle; advance to wait-ack only
-      // once translation resolved (identity = same cycle). The store Flow pulse is
-      // latched by the cache this cycle.
-      driveStore(frameWordAddr(stStep), Size.WORD, frameWordData(stStep))
-      when(dtRsp.ready) { goto(E_STWAIT) }
+      // Issue the store EXACTLY ONCE (one cycle), then unconditionally wait its ACK.
+      // The exception sequencer is a supervisor PHYSICAL access: the store paddr is
+      // identity, and the D-cache store port is a backpressure-less Flow using that
+      // paddr directly — it needs NO translation. We must NOT gate on `dtRsp.ready`
+      // (with the MMU live, the frame VPN walks and dtRsp.ready drops for several
+      // cycles, during which the combinational `driveStore` would re-pulse the
+      // REGISTERED store every cycle -> the SAME word stored many times, a
+      // nondeterministic count that races the cache store machine and corrupts the
+      // frame). One cycle here -> exactly one registered store pulse.
+      driveStoreNoXlate(frameWordAddr(stStep), Size.WORD, frameWordData(stStep))
+      goto(E_STWAIT)
     }
     E_STWAIT.whenIsActive {
       // hold nothing on the store port (one-cycle pulse already issued); wait for
@@ -233,7 +305,7 @@ class ExceptionUnit(
       // stAwDone/stWDone) could drop a beat. One idle cycle guarantees the machine
       // is idle before the next store.
       when(dcStoreAck) {
-        when(stStep === 3) { goto(E_VECREQ) } otherwise { stStep := stStep + 1; goto(E_STORE) }
+        when(stStep === lastStep) { goto(E_VECREQ) } otherwise { stStep := stStep + 1; goto(E_STORE) }
       }
     }
     // ── ENTRY: fetch the handler vector ─────────────────────────────────────────
@@ -290,15 +362,32 @@ class ExceptionUnit(
       dtoVld := True; dtoVpn := (frameBase + 2)(31 downto 12)
       when(dcLoadRsp.valid) {
         popPc := dcLoadRsp.payload.data.asUInt
+        goto(R_FMTREQ)
+      }
+    }
+    // Read the format word @base+6 to select the pop size ($0 = 8 bytes, $7 = 60).
+    R_FMTREQ.whenIsActive {
+      dtoVld := True; dtoVpn := (frameBase + 6)(31 downto 12)
+      ldoVld := True; ldoVaddr := frameBase + 6; ldoSize := Size.WORD
+      when(dcLoadCmd.fire) { goto(R_FMTWAIT) }
+    }
+    R_FMTWAIT.whenIsActive {
+      dtoVld := True; dtoVpn := (frameBase + 6)(31 downto 12)
+      when(dcLoadRsp.valid) {
+        // top nibble 7 => format-$7 access-fault frame.
+        popFmtWord := dcLoadRsp.payload.data(15 downto 0).asUInt
+        popIs7 := dcLoadRsp.payload.data(15 downto 12).asUInt === U(7, 4 bits)
         goto(R_REDIR)
       }
     }
     R_REDIR.whenIsActive {
       // restore the full SR (system byte). A7 banks automatically by the new S.
       ss.setSrSys.valid := True; ss.setSrSys.payload := popSr(15 downto 8)
-      // SSP += 8 (pop the frame). The CURRENT A7 is SSP (we were supervisor); after
-      // restoring SR the bank may switch to USP, so write SSP explicitly.
-      val newSsp = frameBase + 8
+      // SSP += frame size (8 for $0, 60 for $7). The CURRENT A7 is SSP (we were
+      // supervisor); after restoring SR the bank may switch to USP, so write SSP
+      // explicitly. For $7 the popPc is the faulting instruction's PC -> RTE resumes
+      // by RE-EXECUTING it (the handler has fixed the mapping), matching MAME.
+      val newSsp = frameBase + Mux(popIs7, U(60, 32 bits), U(8, 32 bits))
       ss.setSsp.valid   := True; ss.setSsp.payload := newSsp
       redirectValid := True
       redirectPc    := popPc

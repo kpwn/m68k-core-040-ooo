@@ -80,6 +80,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       lsEu.issue << iq.issue(3)
       rob.logic.completion(2).valid   := lsEu.completion.valid
       rob.logic.completion(2).payload := lsEu.completion.payload
+      // MMU access-fault completion -> ROB (flags the entry vector 2 + faultAddr/SSW
+      // for precise format-$7 delivery at retire).
+      rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
+      rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
       // The dynamic wakeup must fire ONLY for a completing LOAD (it produces a
       // physreg). A STORE also completes (to retire) but writes NO register; its
       // s1Ctx.uop.pdst is stale/garbage and could spuriously match a consumer's
@@ -730,5 +734,155 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "handler: moveq #2,%d1 ; move.l 2(%a7),%d0 ; add.l %d1,%d0 ; move.l %d0,2(%a7) ; " +
       "moveq #1,%d2 ; rte",
       nInstr = 10)
+  }
+
+  // ── MMU page-fault delivery lock-step (format-$7 -> handler -> RTE) ──────────
+  // THE Task-4 gate: a data store to a NON-RESIDENT page raises a 68040 access
+  // fault (vector 2, format-$7), vectors to a handler that writes a resident page
+  // descriptor, RTEs (re-executing the faulting store, which now succeeds), and
+  // continues. The committed PC/SR/A7 stream + the stacked $7 frame match the MAME
+  // 040 oracle step-for-step.
+  //
+  // MMU-on translates EVERY D-side access in the RTL, so the page table must map all
+  // pages the data side touches. The exception FSM's frame/vector accesses use
+  // IDENTITY paddr (they bypass translation), and RTE's frame reads are FSM-driven
+  // (identity), so the supervisor stack needs no mapping. The LS data accesses that
+  // DO translate are: the vector store (VA 0x8, VPN 0), the faulting store (VA
+  // 0x2000, VPN 2), and the handler's PT write (VA 0x82008, VPN 0x82). Table:
+  //   root[0] -> ptr ; ptr[0] -> pageA (covers 0x0..0x3FFFF) ; ptr[2] -> pageC
+  //   pageA[0] = identity VPN 0 resident (vector page) ; pageA[2] = NON-RESIDENT
+  //   pageC[2] = identity VPN 0x82 resident (the PT write page).
+  // The handler writes pageA[2] = PPN 0x42 resident. Descriptors are LITTLE-ENDIAN
+  // (RTL walker + oracle MMU), so a `move.l #imm` (big-endian store) writes
+  // byteswap(descriptor): pageA[2] resident PPN 0x42 = 0x00042001 -> imm 0x01200400.
+  test("lock-step: page fault (non-resident) -> handler maps -> RTE -> resume", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val PTRT = 0x00081000L
+    val PAGA = 0x00082000L
+    val PAGC = 0x00083000L
+    val dataPPN = 0x42L
+
+    // The program (identical for RTL + oracle). Handler writes pageA[2] (byteswapped
+    // resident PPN-0x42 descriptor) then RTE -> the faulting store re-executes.
+    val src =
+      "move.l #handler,%d1 ; move.l %d1,0x8 ; " +        // vector 2 (access fault) @ 0x8
+      "moveq #42,%d0 ; move.l %d0,0x2000 ; " +           // FAULTS, then re-runs after RTE
+      "loop: bra loop ; " +
+      "handler: move.l #0x01200400,%d1 ; move.l %d1,0x82008 ; rte"
+    val nInstr = 8  // vec-imm, vec-store, store(fault->reexec after handler), handler-imm, handler-store, rte, store(reexec), bra
+
+    // Oracle: window = the data page only; preload the resident root[0] + ptr[0]
+    // descriptors the VA-0x2000 walk needs (handler writes the leaf pageA[2]).
+    def le(v: Long): Long = v & 0xffffffffL
+    val oraclePt = Seq(
+      0x80000L -> ((PTRT & 0xfffffff0L) | 0x2L),   // root[0] -> ptr resident
+      PTRT     -> ((PAGA & 0xfffffff0L) | 0x2L))   // ptr[0]  -> pageA resident
+    val mmu = Some(Musashi.MmuConfig(rootPtr = 0x80000L, dataLo = 0x2000L, dataHi = 0x3000L, ptPreload = oraclePt))
+
+    val oracleSteps = Musashi.assembleAndTrace(src, mmu = mmu, maxCycles = 20000) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[pagefault] oracle trace failed: ${err.reason}")
+    }
+    assert(oracleSteps.size >= nInstr, s"[pagefault] oracle produced ${oracleSteps.size} steps, expected >= $nInstr")
+    val oracle = oracleSteps.take(nInstr)
+
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[pagefault] assemble failed: ${err.reason}")
+    }
+
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      val handle = new WhiteboxCapture.Handle
+
+      def captureWb(w: m68k040.execute.WbObs): Unit = if (w.valid.toBoolean) {
+        handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
+          dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
+          intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
+          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean))
+      }
+      def captureBranch(): Unit = {
+        val bw = dut.branchEu.logic.wbObs
+        if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+      }
+      def captureExc(): Unit = {
+        val c = dut.rob.logic.commitObs(2)
+        if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL)
+      }
+      cd.onSamplings {
+        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs)
+        captureBranch()
+        for (k <- 0 until 2) {
+          val c = dut.rob.logic.commitObs(k)
+          if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
+            sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL)
+        }
+        captureExc()
+      }
+
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      // The D-cache and the MMU walker SHARE one physical memory: the page table the
+      // handler writes via a D-cache store must be visible to the walker on re-walk.
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // Build the nested page table (little-endian) in the shared memory.
+      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+      pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)   // root[0] -> ptr resident
+      pokeLE(PTRT + 0 * 4,    (PAGA & 0xfffffff0L) | 0x2L)   // ptr[0]  -> pageA resident
+      pokeLE(PTRT + 2 * 4,    (PAGC & 0xfffffff0L) | 0x2L)   // ptr[2]  -> pageC resident
+      pokeLE(PAGA + 0 * 4,    (0x0L << 12) | 0x1L)           // pageA[0] = identity VPN 0 (vectors)
+      pokeLE(PAGA + 2 * 4,    0x0L)                          // pageA[2] = NON-RESIDENT (the fault)
+      pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)          // pageA[0x3f] = identity VPN 0xFF (supervisor stack)
+      pokeLE(PAGC + 2 * 4,    (0x82L << 12) | 0x1L)          // pageC[2] = identity VPN 0x82 (PT write)
+      dut.dtlb.logic.mmuEnable #= true
+      dut.dtlb.logic.rootPtr   #= 0x80000L
+
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= true
+      dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= false
+
+      var guard = 0; val cap = 6000
+      var sawFault = false
+      while (handle.result.size < nInstr && guard < cap) {
+        if (dut.dtlb.logic.faultSeen.toBoolean) sawFault = true
+        cd.waitSampling(); guard += 1
+      }
+      assert(sawFault, "[pagefault] the data access to the non-resident page must flag a DTLB fault")
+      assert(handle.result.size >= nInstr,
+        s"[pagefault] only ${handle.result.size}/$nInstr committed within $cap cycles")
+      // The stacked format-$7 frame (read back from the supervisor stack, big-endian)
+      // must match the MAME-040 oracle byte-for-byte.
+      val fb = 0x100000L - 60
+      def pk16(a: Long): Int = ((dmem.peekByte(a) << 8) | dmem.peekByte(a + 1)) & 0xffff
+      def pk32(a: Long): Long = ((pk16(a).toLong << 16) | pk16(a + 2)) & 0xffffffffL
+      assert((pk16(fb) & 0xff00) == 0x2700, f"[pagefault] frame SR=0x${pk16(fb)}%04x expected 0x27xx")
+      assert(pk32(fb + 2) == 0x4080000cL, f"[pagefault] frame PC=0x${pk32(fb + 2)}%08x expected the faulting-instr PC 0x4080000c")
+      assert(pk16(fb + 6) == 0x7008, f"[pagefault] frame fmt/vec=0x${pk16(fb + 6)}%04x expected 0x7008")
+      assert(pk32(fb + 8) == 0x2000L, f"[pagefault] frame EA=0x${pk32(fb + 8)}%08x expected 0x2000")
+      assert(pk16(fb + 0xc) == 0x0405, f"[pagefault] frame SSW=0x${pk16(fb + 0xc)}%04x expected 0x0405")
+      assert(pk32(fb + 0x14) == 0x2000L, f"[pagefault] frame faultAddr=0x${pk32(fb + 0x14)}%08x expected 0x2000")
+
+      val res = LockStep.compare(handle.result.take(nInstr), oracle)
+      assert(res.ok,
+        s"[pagefault] lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")} " +
+          s"(matched ${res.matched}, dut commits ${handle.result.size}, oracle steps $nInstr)")
+
+      // The re-executed store landed at the mapped PA 0x42000 (value 42 = 0x2a).
+      cd.waitSampling(200)
+      val pa = (dataPPN << 12) | (0x2000L & 0xfffL)
+      assert(dmem.peekByte(pa + 3) == 0x2a,
+        f"[pagefault] re-executed store must land 0x2a at PA 0x${pa + 3}%08x (got 0x${dmem.peekByte(pa + 3)}%02x)")
+    }
   }
 }

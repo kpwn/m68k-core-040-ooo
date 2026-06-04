@@ -9290,6 +9290,34 @@ rte_loop:
 				CPU_INSTR_MODE = INSTRUCTION_YES;
 				CPU_RUN_MODE = RUN_MODE_NORMAL;
 				return;
+			case 7: /* 68040 access error (format-$7, 30-word frame) */
+				/* Ported from MAME's m68k RTE: restore SR + PC, then discard the
+				 * remaining 28 words of the format-$7 frame. PC is the faulting
+				 * instruction's PC, so execution RE-EXECUTES it (the handler has
+				 * fixed the mapping). No hardware re-run / continuation. */
+				new_sr = m68ki_pull_16();
+				new_pc = m68ki_pull_32();
+				m68ki_fake_pull_16();	/* $06: format word */
+				m68ki_fake_pull_32();	/* $08: effective address */
+				m68ki_fake_pull_16();	/* $0c: special status word */
+				m68ki_fake_pull_16();	/* $0e: wb3s */
+				m68ki_fake_pull_16();	/* $10: wb2s */
+				m68ki_fake_pull_16();	/* $12: wb1s */
+				m68ki_fake_pull_32();	/* $14: data fault address */
+				m68ki_fake_pull_32();	/* $18: wb3a */
+				m68ki_fake_pull_32();	/* $1c: wb3d */
+				m68ki_fake_pull_32();	/* $20: wb2a */
+				m68ki_fake_pull_32();	/* $24: wb2d */
+				m68ki_fake_pull_32();	/* $28: wb1a */
+				m68ki_fake_pull_32();	/* $2c: wb1d/pd0 */
+				m68ki_fake_pull_32();	/* $30: pd1 */
+				m68ki_fake_pull_32();	/* $34: pd2 */
+				m68ki_fake_pull_32();	/* $38: pd3 */
+				m68ki_jump(new_pc);
+				m68ki_set_sr(new_sr);
+				CPU_INSTR_MODE = INSTRUCTION_YES;
+				CPU_RUN_MODE = RUN_MODE_NORMAL;
+				return;
 		}
 		/* Not handling long or short bus fault */
 		CPU_INSTR_MODE = INSTRUCTION_YES;

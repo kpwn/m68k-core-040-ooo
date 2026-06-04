@@ -151,6 +151,18 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
         tlb.io.fillValid := True
       }
     }
+    // A faulting walk caches its FAULT in the result latch (the TLB is NOT filled on
+    // a fault). On a flush (umFlush == the commit-time doFlush squash — which fires
+    // when an access fault is DELIVERED) invalidate the latch so a re-executed access
+    // after the handler maps the page RE-WALKS (and now sees the resident descriptor)
+    // rather than re-reading the stale non-resident fault. A real 68040 handler
+    // PFLUSHes the ATC before RTE; clearing the 1-entry latch here is the equivalent
+    // for our result cache (and is harmless on a branch-mispredict flush — it just
+    // forces one re-walk). The filled TLB is left intact (it only holds resident
+    // translations, which remain valid across a flush).
+    when(umFlush) {
+      latchValid := False
+    }
 
     // ---- deferred U/M descriptor-write queue (speculative; drained at commit) ----
     // A non-faulting walk that needs to set U (and M on a write) pushes {robId, addr,

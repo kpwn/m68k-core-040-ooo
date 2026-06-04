@@ -94,6 +94,14 @@ uint    m68ki_aerr_fc;
 
 jmp_buf m68ki_bus_error_jmp_buf;
 
+/* Set by m68ki_exception_bus_error (68040 access fault) so the execute loop ENDS
+ * the current m68k_execute call right after delivery, with PC = the handler entry.
+ * This makes a bus-error access fault a DISCRETE trace step (matching our RTL's
+ * commit-time exception entry), rather than folding the handler's first instruction
+ * into the faulting step. Only the 040 access-fault path sets it; programs that
+ * never fault are byte-for-byte unchanged. */
+int m68ki_bus_error_step_break = 0;
+
 /* Used by shift & rotate instructions */
 const uint8 m68ki_shift_8_table[65] =
 {
@@ -985,6 +993,11 @@ int m68k_execute(int num_cycles)
 		do
 		{
 			int i;
+			/* A 68040 access fault (bus error) just delivered via longjmp -> end
+			 * this execute call now, with PC = the handler entry, so the fault is a
+			 * DISCRETE trace step (do NOT run the handler's first instruction in the
+			 * same step). Cleared here. */
+			if (m68ki_bus_error_step_break) { m68ki_bus_error_step_break = 0; break; }
 			/* Set tracing accodring to T1. (T0 is done inside instruction) */
 			m68ki_trace_t1(); /* auto-disable (see m68kcpu.h) */
 
