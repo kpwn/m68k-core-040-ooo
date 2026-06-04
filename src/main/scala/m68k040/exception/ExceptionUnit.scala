@@ -93,6 +93,11 @@ class ExceptionUnit(
   // RTE pop accumulators
   val popSr = Reg(UInt(16 bits))
   val popPc = Reg(UInt(32 bits))
+  // RTE format select: the stacked format word @base+6 top nibble (0 = format-$0,
+  // 7 = format-$7 access-fault). Chooses the pop size (8 vs 60 bytes). For $7 RTE
+  // restores SR/PC and RESUMES at the stacked PC (= faulting instr -> re-executes),
+  // discarding the rest of the frame — matching MAME's RTE case 7.
+  val popIs7 = RegInit(False)
 
   // ── redirect outputs (the ROB ORs these into its registered redirect) ────────
   val redirectValid = Bool(); redirectValid := False
@@ -226,6 +231,8 @@ class ExceptionUnit(
     val R_SRWAIT  = new State
     val R_PCREQ   = new State    // load PC long @ base+2
     val R_PCWAIT  = new State
+    val R_FMTREQ  = new State    // load format word @ base+6 (select $0 vs $7 pop)
+    val R_FMTWAIT = new State
     val R_REDIR   = new State
 
     IDLE.whenIsActive {
@@ -332,15 +339,31 @@ class ExceptionUnit(
       dtoVld := True; dtoVpn := (frameBase + 2)(31 downto 12)
       when(dcLoadRsp.valid) {
         popPc := dcLoadRsp.payload.data.asUInt
+        goto(R_FMTREQ)
+      }
+    }
+    // Read the format word @base+6 to select the pop size ($0 = 8 bytes, $7 = 60).
+    R_FMTREQ.whenIsActive {
+      dtoVld := True; dtoVpn := (frameBase + 6)(31 downto 12)
+      ldoVld := True; ldoVaddr := frameBase + 6; ldoSize := Size.WORD
+      when(dcLoadCmd.fire) { goto(R_FMTWAIT) }
+    }
+    R_FMTWAIT.whenIsActive {
+      dtoVld := True; dtoVpn := (frameBase + 6)(31 downto 12)
+      when(dcLoadRsp.valid) {
+        // top nibble 7 => format-$7 access-fault frame.
+        popIs7 := dcLoadRsp.payload.data(15 downto 12).asUInt === U(7, 4 bits)
         goto(R_REDIR)
       }
     }
     R_REDIR.whenIsActive {
       // restore the full SR (system byte). A7 banks automatically by the new S.
       ss.setSrSys.valid := True; ss.setSrSys.payload := popSr(15 downto 8)
-      // SSP += 8 (pop the frame). The CURRENT A7 is SSP (we were supervisor); after
-      // restoring SR the bank may switch to USP, so write SSP explicitly.
-      val newSsp = frameBase + 8
+      // SSP += frame size (8 for $0, 60 for $7). The CURRENT A7 is SSP (we were
+      // supervisor); after restoring SR the bank may switch to USP, so write SSP
+      // explicitly. For $7 the popPc is the faulting instruction's PC -> RTE resumes
+      // by RE-EXECUTING it (the handler has fixed the mapping), matching MAME.
+      val newSsp = frameBase + Mux(popIs7, U(60, 32 bits), U(8, 32 bits))
       ss.setSsp.valid   := True; ss.setSsp.payload := newSsp
       redirectValid := True
       redirectPc    := popPc
