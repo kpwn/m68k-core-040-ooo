@@ -188,6 +188,26 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val xlateReady = xlate.rsp.ready    // False on an enabled-MMU TLB miss (walking)
     val xlateFault = xlate.rsp.fault
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // FMax #3: PIPELINE the DTLB lookup -> SQ-forward / store-alloc.
+    //
+    // With mmuEnable LIVE the DTLB hit-path lookup (s1Va -> banked way-mux -> ppn)
+    // sits IN FRONT of the s1Paddr that feeds the 8-entry SQ overlap-compare reduce
+    // (-> fwdData). That fused arc (s1Va_reg -> DTLB -> s1Paddr -> SQ-compare ->
+    // fwdData_reg) was the 25-level / 6.349ns critical path (157MHz). We REGISTER
+    // the translated physical address (+perm fault) in a dedicated translate stage
+    // (XLATE), so the SQ-forward query / store-alloc consume the REGISTERED paddr
+    // the NEXT cycle. This splits the arc into
+    //   s1Va_reg -> DTLB lookup -> s2Paddr_reg                 (translate stage)
+    //   s2Paddr_reg -> SQ-compare -> fwd*_reg / alloc          (forward stage)
+    // at the cost of ONE extra translate-latency cycle (lock-step is latency-
+    // agnostic; the EU is single-outstanding and already stalls the walker on a
+    // DTLB miss). Identity (MMU-disabled) flows through the SAME register so both
+    // modes are pipelined uniformly. All RegInit / Reg (no uninit fanout).
+    val s2Paddr  = Reg(UInt(32 bits))
+    val s2PaddrB = Reg(UInt(32 bits))
+    val s2Fault  = RegInit(False)
+
     // ---- dcache load cmd defaults ----
     // The FSM selects the access address: slot A = s1Va, slot B = s1AddrB (the
     // next-line / next-page base). The cache translates whatever vaddr we present
@@ -196,9 +216,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // page on a line-cross). We always issue size=LONG on a cross access so the
     // cache reads/extracts the whole line slice; the merge selects the bytes.
     val loadVaddr = UInt(32 bits)
+    val loadPaddr = UInt(32 bits)
     loadVaddr := s1Va
+    loadPaddr := s2Paddr          // REGISTERED physical address (slot A); slot B uses s2PaddrB
     dcache.loadCmd.valid        := False
     dcache.loadCmd.payload.vaddr := loadVaddr
+    dcache.loadCmd.payload.paddr := loadPaddr
     dcache.loadCmd.payload.size  := u1.size
 
     // ---- store split (byte-lane) for the SQ entry ----
@@ -219,7 +242,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // ---- SQ alloc + fwd defaults ----
     sq.io.alloc.valid          := False
     sq.io.alloc.payload.robId  := s1Ctx.robId
-    sq.io.alloc.payload.paddr  := s1Paddr
+    sq.io.alloc.payload.paddr  := s2Paddr
     sq.io.alloc.payload.data   := s1Data
     sq.io.alloc.payload.size   := u1.size
     sq.io.alloc.payload.nbytesA   := nbytesA_st
@@ -228,12 +251,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sq.io.alloc.payload.strbA     := splitStrbA
     sq.io.alloc.payload.lineDataA := splitDataA
     sq.io.alloc.payload.validB    := s1TwoAccess
-    sq.io.alloc.payload.paddrB    := s1PaddrB
+    sq.io.alloc.payload.paddrB    := s2PaddrB
     sq.io.alloc.payload.nbytesB   := nbytesB_st
     sq.io.alloc.payload.strbB     := splitStrbB
     sq.io.alloc.payload.lineDataB := splitDataB
     sq.io.fwd.query.robId := s1Ctx.robId
-    sq.io.fwd.query.paddr := s1Paddr
+    sq.io.fwd.query.paddr := s2Paddr
     sq.io.fwd.query.size  := u1.size
 
     val isLoad  = u1.memOp === MemOp.LOAD
@@ -393,6 +416,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
 
     val fsm = new StateMachine {
       val IDLE    = new State with EntryPoint
+      val XLATE   = new State  // registered translated paddr -> SQ-fwd query / store alloc
       val RESOLVE = new State  // registered SQ-fwd result -> completion / cache launch
       val WAIT    = new State   // aligned: cache load cmd accepted, awaiting loadRsp
       val WAIT_A  = new State    // cross: slot A accepted, awaiting line A
@@ -401,42 +425,52 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       IDLE.whenIsActive {
         busy := False
         when(s1Valid) {
-          when(isStore) {
-            // Translate-at-execute: a store's paddr (s1Paddr) comes from the DTLB.
-            // Only alloc once translation is RESOLVED (TLB hit / identity); on a
-            // DTLB miss `xlateReady` is False while the walker runs -> hold S1
-            // (busy) and retry next cycle (the existing single-outstanding stall).
+          when(isLoad || isStore) {
+            // Translate-at-execute: REGISTER the translated paddr (+perm fault) in
+            // this stage so the SQ overlap-compare / store-alloc consume a REGISTERED
+            // s2Paddr next cycle (the DTLB lookup is no longer in series with the
+            // SQ-compare). Only advance once translation is RESOLVED (TLB hit /
+            // identity); on a DTLB miss `xlateReady` is False while the walker runs ->
+            // hold S1 (busy) and retry next cycle (the existing single-outstanding
+            // stall). `busy` alone is not enough on the stall path (the S0->S1 advance
+            // reads the pre-update busy and would clear s1Valid this cycle), so
+            // re-assert s1Valid explicitly (later write wins).
+            busy := True
             when(xlateReady) {
-              // allocate into the SQ; "executes" immediately (no int dst). Store
-              // completion drives a CONSTANT compData (off the SQ-compare arc), so it
-              // captures here directly without the extra resolve cycle.
-              sq.io.alloc.valid := True
-              captureCompletion(B(0, 32 bits))
+              s2Paddr  := s1Paddr
+              s2PaddrB := s1PaddrB
+              s2Fault  := xlateFault
+              goto(XLATE)
             } otherwise {
-              // DTLB walking: hold THIS store in S1 and retry. `busy` alone is not
-              // enough (the S0->S1 advance reads the pre-update busy and would clear
-              // s1Valid this cycle), so re-assert s1Valid explicitly (later write wins).
-              busy := True
               s1Valid := True
             }
-          } elsewhen(isLoad) {
-            // Only proceed once translation is resolved (s1Paddr feeds the SQ fwd
-            // query). On a DTLB miss hold S1 (busy) and retry; otherwise capture the
-            // SQ-forward compare result and resolve next cycle.
-            when(xlateReady) {
-              fwdHit   := sq.io.fwd.rsp.hit
-              fwdStall := sq.io.fwd.rsp.stall
-              fwdData  := sq.io.fwd.rsp.data
-              goto(RESOLVE)
-            } otherwise {
-              // DTLB walking: hold THIS load in S1 (s1Valid would otherwise be
-              // cleared by the pre-update-busy S0->S1 advance) and retry.
-              s1Valid := True
-            }
-            busy := True   // hold s1 (busy) so the SQ query stays stable into RESOLVE
           } otherwise {
             captureCompletion(B(0, 32 bits))   // non-memory (defensive)
           }
+        }
+      }
+
+      // Translated-paddr resolve: s2Paddr is now REGISTERED, so the SQ overlap-compare
+      // / store-alloc fed from it start fresh this cycle (off the long DTLB-lookup arc).
+      // s1 is still held (busy) so the SQ query / store-split inputs are stable.
+      XLATE.whenIsActive {
+        busy := True
+        when(isStore) {
+          // allocate into the SQ; "executes" immediately (no int dst). Store
+          // completion drives a CONSTANT compData (off the SQ-compare arc), so it
+          // captures here directly without the extra resolve cycle.
+          sq.io.alloc.valid := True
+          captureCompletion(B(0, 32 bits))
+          busy    := False
+          s1Valid := False
+          goto(IDLE)
+        } otherwise {
+          // load: capture the SQ-forward compare result (off the registered s2Paddr)
+          // and resolve next cycle.
+          fwdHit   := sq.io.fwd.rsp.hit
+          fwdStall := sq.io.fwd.rsp.stall
+          fwdData  := sq.io.fwd.rsp.data
+          goto(RESOLVE)
         }
       }
 
@@ -499,6 +533,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
         when(dcache.loadRsp.valid || aDone) {
           // slot A done -> drive slot B's cmd until the cache accepts it.
           loadVaddr := s1AddrB
+          loadPaddr := s2PaddrB     // REGISTERED slot-B physical address
           dcache.loadCmd.valid := True
           when(dcache.loadCmd.fire) { goto(WAIT_B) }
         }
@@ -543,6 +578,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     when(excActive && excLoadCmdValid) {
       dcache.loadCmd.valid         := True
       dcache.loadCmd.payload.vaddr := excLoadCmdVaddr
+      // exception sequencer runs MMU-off (identity, slice-1): paddr == vaddr.
+      dcache.loadCmd.payload.paddr := excLoadCmdVaddr
       dcache.loadCmd.payload.size  := excLoadCmdSize
     }
     when(excActive && excStoreValid) {

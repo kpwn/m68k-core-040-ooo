@@ -91,6 +91,15 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // robId; the queue drains at that robId's commit (same retire port as the SQ)
     // and discards on flush.
     val dtlb = host[m68k040.mmu.DtlbPlugin]
+    // Drive the MMU control regs from registered synth-top inputs: (a) so they are
+    // not UNASSIGNED (clean elaboration — sim-poked / future-MOVEC-driven, no RTL
+    // driver otherwise), and (b) so OOC synth cannot const-fold mmuEnable to its init
+    // (False) and prune the DTLB/walker — the gate must measure the MMU translate
+    // path in the netlist.
+    val mmuEnableIn = in Bool ()
+    val rootPtrIn   = in UInt (32 bits)
+    dtlb.logic.mmuEnable := RegNext(mmuEnableIn) init False
+    dtlb.logic.rootPtr   := RegNext(rootPtrIn) init 0
     dtlb.umAccessRobId := lsEu.xlateRobId
     dtlb.umCommitValid := rob.logic.retire0
     dtlb.umCommitId    := rob.logic.h0

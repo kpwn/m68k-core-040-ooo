@@ -3,10 +3,16 @@ package m68k040.cache
 import m68k040.isa.Size
 import spinal.core._
 
-/** Load request: a virtual address + access size. The cache translates (VIPT)
-  * and reads. */
+/** Load request: a virtual address + access size + the PRE-TRANSLATED physical
+  * address. VIPT: the cache indexes with `vaddr[set]` (page-invariant low bits)
+  * and tags with the physical page number carried in `paddr`. The requester (LS
+  * EU) supplies `paddr` from a REGISTERED translate stage so the DTLB lookup is
+  * NOT in series with the cache tag-compare (FMax). Under identity translation
+  * paddr == vaddr; for the exception serializing path paddr is the identity vaddr.
+  * `paddr[11:0]` must equal `vaddr[11:0]` (same page offset) by construction. */
 case class DLoadCmd() extends Bundle {
   val vaddr = UInt(32 bits)
+  val paddr = UInt(32 bits)
   val size  = Size()
 }
 

@@ -142,6 +142,8 @@ class ExceptionUnit(
   val ldoSize  = Size();        ldoSize := Size.LONG
   dcLoadCmd.valid         := RegNext(ldoVld) init False
   dcLoadCmd.payload.vaddr := RegNext(ldoVaddr)
+  // exception sequencer runs MMU-off (identity, slice-1): paddr == vaddr.
+  dcLoadCmd.payload.paddr := RegNext(ldoVaddr)
   dcLoadCmd.payload.size  := RegNext(ldoSize)
 
   val dtoVld = Bool();        dtoVld := False
