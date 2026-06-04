@@ -359,7 +359,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       ss = new m68k040.exception.SystemState,
       entryTrigger = exceptionPending, entryVector = faultVecStore(h0), entryPc = faultPcStore(h0),
       rteTrigger   = rteRetire,        rtePc        = p0.predNextPc,
-      committedCcr = committedCcr)
+      committedCcr = committedCcr,
+      // Access-fault (vector 2) extras for the format-$7 frame.
+      entryFaultAddr = faultAddrStore(h0),
+      entryFaultWr   = faultWrStore(h0),
+      entryFaultSup  = faultSupStore(h0))
     excIdle := !exc.active
     val excActive = exc.active; excActive.simPublic()
     // Squash + serialize while the FSM runs (NOT on the trigger cycle, when the FSM

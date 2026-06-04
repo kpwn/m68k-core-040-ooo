@@ -38,7 +38,13 @@ class ExceptionUnit(
     val ss: SystemState,
     entryTrigger: Bool, entryVector: UInt, entryPc: UInt,
     rteTrigger: Bool, rtePc: UInt,
-    committedCcr: UInt) extends Area {
+    committedCcr: UInt,
+    // Access-fault (vector 2) extras for the format-$7 frame. Default-driven idle
+    // (a DUT that does not supply them — e.g. the slice-1 format-$0 unit tests —
+    // passes the defaults; the $7 path is selected only when entryVector === 2).
+    entryFaultAddr: UInt = U(0, 32 bits),
+    entryFaultWr:   Bool = False,
+    entryFaultSup:  Bool = False) extends Area {
 
   // ── exposed D-cache request ports (wiring MUXes them onto the real cache) ────
   val dcLoadCmd  = Stream(DLoadCmd())
@@ -76,8 +82,13 @@ class ExceptionUnit(
   val curVec   = Reg(UInt(8 bits))
   val curPc    = Reg(UInt(32 bits))   // ENTRY: faulting PC to stack; RTE: restored PC
   val oldSr    = Reg(UInt(16 bits))   // ENTRY: SR to stack
-  val frameBase= Reg(UInt(32 bits))   // ENTRY: new SSP = SSP-8 ; RTE: old SSP (read base)
+  val frameBase= Reg(UInt(32 bits))   // ENTRY: new SSP = SSP-8 (or -60 for $7); RTE: old SSP
   val vecTarget= Reg(UInt(32 bits))   // redirect target
+  // ENTRY: is this an access fault (vector 2)? -> stack a format-$7 frame (30 words)
+  // instead of format-$0 (4 words). Captured at trigger.
+  val curIs7   = RegInit(False)
+  val curFault = Reg(UInt(32 bits))   // faulting VA (EA + fault-address fields of $7)
+  val curSsw   = Reg(UInt(16 bits))   // $7 special status word
 
   // RTE pop accumulators
   val popSr = Reg(UInt(16 bits))
@@ -166,17 +177,40 @@ class ExceptionUnit(
     stoData  := data.resize(32)
   }
 
-  // ENTRY frame-store step (0..3): SR, PC hi, PC lo, format/vector word. The
-  // D-cache store path is single-outstanding, so each word is issued THEN we wait
-  // for the write-through ACK (AXI B) before the next — otherwise a back-to-back
-  // store overwrites the previous write-through beat before it drains (lost word).
-  val stStep = Reg(UInt(2 bits)) init 0; stStep.simPublic()
+  // ENTRY frame-store step. The D-cache store path is single-outstanding, so each
+  // word is issued THEN we wait for the write-through ACK (AXI B) before the next —
+  // otherwise a back-to-back store overwrites the previous write-through beat before
+  // it drains (lost word). Word index is from frameBase (LOW address), ascending.
+  //   format-$0 (illegal/privilege): 4 words [SR, PC hi, PC lo, vec<<2].
+  //   format-$7 (access fault):     30 words ($3C) — MAME m68ki_stack_frame_0111:
+  //     [+0x00]=SR [+0x02]=PChi [+0x04]=PClo [+0x06]=0x7000|(vec<<2)
+  //     [+0x08]=EAhi [+0x0a]=EAlo [+0x0c]=SSW [+0x0e..0x12]=0 (3 words)
+  //     [+0x14]=faultAddr hi [+0x16]=faultAddr lo [+0x18..0x3a]=0 (18 words).
+  //   stStep counts WORDS (5 bits, 0..29). lastStep = 3 ($0) or 29 ($7).
+  val stStep = Reg(UInt(5 bits)) init 0; stStep.simPublic()
+  val lastStep = Mux(curIs7, U(29, 5 bits), U(3, 5 bits))
   def frameWordAddr(step: UInt): UInt = (frameBase + (step << 1)).resized
-  def frameWordData(step: UInt): Bits = step.mux(
-    U(0, 2 bits) -> oldSr.asBits,
-    U(1, 2 bits) -> curPc(31 downto 16).asBits,
-    U(2, 2 bits) -> curPc(15 downto 0).asBits,
-    U(3, 2 bits) -> (curVec << 2).resize(16).asBits)
+  // Common low-4-word prefix: SR, PC hi, PC lo, format/vector word. The format/vector
+  // word is curVec<<2 for $0 and 0x7000|(curVec<<2) for $7.
+  val fmtVecWord = Mux(curIs7, (U(0x7000, 16 bits) | (curVec << 2).resize(16)), (curVec << 2).resize(16))
+  def frameWordData(step: UInt): Bits = {
+    val out = Bits(16 bits)
+    out := B(0, 16 bits)
+    switch(step) {
+      is(U(0, 5 bits)) { out := oldSr.asBits }
+      is(U(1, 5 bits)) { out := curPc(31 downto 16).asBits }
+      is(U(2, 5 bits)) { out := curPc(15 downto 0).asBits }
+      is(U(3, 5 bits)) { out := fmtVecWord.asBits }
+      // $7-only words (steps 4..29). For $0 these steps never execute.
+      is(U(4, 5 bits))  { out := curFault(31 downto 16).asBits }   // EA hi
+      is(U(5, 5 bits))  { out := curFault(15 downto 0).asBits }    // EA lo
+      is(U(6, 5 bits))  { out := curSsw.asBits }                   // SSW
+      is(U(10, 5 bits)) { out := curFault(31 downto 16).asBits }   // fault addr hi
+      is(U(11, 5 bits)) { out := curFault(15 downto 0).asBits }    // fault addr lo
+      // all other steps (7,8,9,12..29) stack 0 (internal registers).
+    }
+    out
+  }
 
   val fsm = new StateMachine {
     val IDLE      = new State with EntryPoint
@@ -196,11 +230,19 @@ class ExceptionUnit(
 
     IDLE.whenIsActive {
       when(entryTrigger) {
+        val is7 = entryVector === 2   // access fault -> format-$7
         curVec    := entryVector
         curPc     := entryPc
+        curIs7    := is7
+        curFault  := entryFaultAddr
+        // SSW = (in_mmu 0x400) | fc | (rw<<8); fc = data space (bit0=1) + supervisor
+        // (bit2) if a supervisor access; rw = read?1:write?0 (MAME m68ki_aerr).
+        val fc  = Mux(entryFaultSup, U(0x5, 3 bits), U(0x1, 3 bits))
+        val rwB = Mux(entryFaultWr, U(0, 1 bits), U(1, 1 bits))   // write->0, read->1
+        curSsw    := (U(0x400, 16 bits) | fc.resize(16) | (rwB ## U(0, 8 bits)).asUInt.resize(16))
         oldSr     := (ss.srSys ## committedCcr.resize(8 bits)).asUInt
-        // new SSP = current A7 (SSP, since committed S) - 8
-        val nb = (ss.ssp - 8)
+        // new SSP = current A7 (SSP, since committed S) - frame size (8 for $0, 60 for $7)
+        val nb = Mux(is7, ss.ssp - 60, ss.ssp - 8)
         frameBase := nb
         // compute vector fetch base = VBR + vec*4
         vecTarget := (ss.vbr + (entryVector << 2)).resized
@@ -233,7 +275,7 @@ class ExceptionUnit(
       // stAwDone/stWDone) could drop a beat. One idle cycle guarantees the machine
       // is idle before the next store.
       when(dcStoreAck) {
-        when(stStep === 3) { goto(E_VECREQ) } otherwise { stStep := stStep + 1; goto(E_STORE) }
+        when(stStep === lastStep) { goto(E_VECREQ) } otherwise { stStep := stStep + 1; goto(E_STORE) }
       }
     }
     // ── ENTRY: fetch the handler vector ─────────────────────────────────────────
