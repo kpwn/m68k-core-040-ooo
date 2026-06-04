@@ -29,11 +29,6 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val nzvcNew    = UInt(4 bits); val nzvcOld = UInt(4 bits); val nzvcWrite = Bool()
     val xNew       = UInt(4 bits); val xOld = UInt(4 bits); val xWrite = Bool()
     val retireAlone = Bool()
-    // Precise-fault capture (exception slice 1): set at alloc from the uop.
-    val faulted     = Bool()
-    val faultVector = UInt(8 bits)
-    val faultPc     = UInt(32 bits)   // the FAULTING instruction's own PC (for the frame)
-    val isRte       = Bool()          // return-from-exception (serializing)
   }
 
   val logic = during build new Area {
@@ -89,6 +84,13 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // Reset per-alloc below (mirrors `completes`), with alloc-priority on a reused index.
     val mispredictStore = Vec.fill(depth)(RegInit(False))
     val nextPcStore     = Vec.fill(depth)(Reg(UInt(32 bits)))
+    // Precise-fault per-entry capture — RegInit Vecs reset per-alloc (mirrors
+    // mispredictStore). RegInit(False) guarantees a never-allocated / re-allocated
+    // entry reads "not faulted / not RTE" deterministically (no uninit-Mem flake).
+    val faultedStore  = Vec.fill(depth)(RegInit(False))
+    val isRteStore    = Vec.fill(depth)(RegInit(False))
+    val faultVecStore = Vec.fill(depth)(Reg(UInt(8 bits)))
+    val faultPcStore  = Vec.fill(depth)(Reg(UInt(32 bits)))
 
     // ── Build a RobPayload from a RenamedUop ───────────────────────────────────
     def payloadFrom(u: RenamedUop): RobPayload = {
@@ -99,12 +101,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       p.nzvcNew    := u.pNzvcDst; p.nzvcOld := u.pNzvcOld;  p.nzvcWrite := u.writesNzvc
       p.xNew       := u.pXDst;    p.xOld := u.pXOld;        p.xWrite    := u.writesX
       // A faulted µop AND an RTE retire ALONE (precise / serializing): they must be
-      // the head and the only retirer this cycle.
-      p.retireAlone := u.isBranch || u.faulted || u.isRte
-      p.faulted     := u.faulted
-      p.faultVector := u.faultVector
-      p.faultPc     := u.pc
-      p.isRte       := u.isRte
+      // the head and the only retirer this cycle. (faulted/isRte themselves live in
+      // RegInit per-entry Vecs — see faultedStore/isRteStore — reset per-alloc like
+      // mispredictStore, so an uninit Mem field can never spuriously trigger.)
+      p.retireAlone := u.isBranch
       p
     }
 
@@ -118,14 +118,26 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // redirect pulse; it drives ONLY pointer/reg resets (no combinational fanout).
     val doFlushReg = RegInit(False); doFlushReg.simPublic()
     val flushPcReg = Reg(UInt(32 bits)); flushPcReg.simPublic()
-    val flushing   = flush.valid || doFlushReg
+    // Exception squash: high on the entry/RTE trigger cycle AND while the FSM runs
+    // (serializing — keep younger work squashed + block alloc/retire). Driven after
+    // the exc unit is built; forward-declared so `flushing` can gate on it.
+    val excSquash = Bool()
+    val flushing   = flush.valid || doFlushReg || excSquash
 
     // The head is a faulted µop ready to retire -> take the exception INSTEAD of a
     // normal commit (precise: the faulting instruction does not commit its result).
+    // An RTE head is serializing too: it triggers the exception-return FSM and does
+    // NOT drive a normal int/flag commit. The exception FSM (exc) gates these so a
+    // trigger fires once per event (excIdle).
+    val excIdle = Bool()   // driven below from exc.active
     val headReady   = (count > 0) && completes(h0) && !flushing
-    val faultRetire = headReady && p0.faulted
-    val retire0 = headReady && !p0.faulted
-    val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone
+    val faultRetire = headReady && faultedStore(h0) && excIdle; faultRetire.simPublic()
+    val rteRetire   = headReady && isRteStore(h0)   && excIdle; rteRetire.simPublic()
+    val retire0 = headReady && !faultedStore(h0) && !isRteStore(h0)
+    // A faulted/RTE entry at h1 must NOT commit in slot1 (it is serializing — it
+    // retires alone when it reaches the head).
+    val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone &&
+                  !faultedStore(h1) && !isRteStore(h1)
 
     val traceVec     = Vec(CommitTrace(), 2)
     val traceFireVec = Vec(Bool(), 2)
@@ -210,11 +222,19 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       payload.write(tail, payloadFrom(allocUopVec(0)))
       completes(tail)       := False
       mispredictStore(tail) := False
+      faultedStore(tail)  := allocUopVec(0).faulted
+      isRteStore(tail)    := allocUopVec(0).isRte
+      faultVecStore(tail) := allocUopVec(0).faultVector
+      faultPcStore(tail)  := allocUopVec(0).pc
     }
     when(alloc1) {
       payload.write(tail + 1, payloadFrom(allocUopVec(1)))
       completes(tail + 1)       := False
       mispredictStore(tail + 1) := False
+      faultedStore(tail + 1)  := allocUopVec(1).faulted
+      isRteStore(tail + 1)    := allocUopVec(1).isRte
+      faultVecStore(tail + 1) := allocUopVec(1).faultVector
+      faultPcStore(tail + 1)  := allocUopVec(1).pc
     }
     when(allocFireSig) {
       tail := tail + Mux(allocSlot1Sig, U(2, robIdW bits), U(1, robIdW bits))
@@ -230,18 +250,54 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // When the retiring head is a mispredicting branch (retireAlone), register the
     // flush for next cycle. doFlushReg is the ONLY flush signal that fans out, and
     // it drives only pointer/reg resets (FMax: no combinational execute->flush path).
-    doFlushReg := retire0 && p0.retireAlone && mispredictStore(h0)
-    when(retire0 && p0.retireAlone && mispredictStore(h0)) { flushPcReg := nextPcStore(h0) }
+    // The exception FSM's final redirect (vector target / RTE restored PC) is ORed
+    // into it below (after the exc unit is built).
+    val branchRedirect = retire0 && p0.retireAlone && mispredictStore(h0)
 
     // ── Precise-fault exception-pending (combinational at faulted retire) ───────
     // When the head is a faulted µop ready to retire, signal an exception with its
-    // vector + the FAULTING instruction's PC. The commit-side exception FSM (Task 3)
-    // consumes this (squashes via flush, stacks the frame, vectors). Until then it
-    // remains asserted (head held). The faulted entry does NOT commit (retire0 is
-    // gated `!p0.faulted`).
+    // vector + the FAULTING instruction's PC. The commit-side exception FSM consumes
+    // this (squashes, stacks the frame, vectors). The faulted entry does NOT commit
+    // (retire0 is gated `!p0.faulted`).
     val exceptionPending = Bool();    exceptionPending := faultRetire;       exceptionPending.simPublic()
-    val exceptionVector  = UInt(8 bits);  exceptionVector := p0.faultVector; exceptionVector.simPublic()
-    val exceptionPc      = UInt(32 bits); exceptionPc     := p0.faultPc;     exceptionPc.simPublic()
+    val exceptionVector  = UInt(8 bits);  exceptionVector := faultVecStore(h0); exceptionVector.simPublic()
+    val exceptionPc      = UInt(32 bits); exceptionPc     := faultPcStore(h0);  exceptionPc.simPublic()
+
+    // ── Committed CCR (X N Z V C, bits 4..0) — folded at retire, like the whitebox ─
+    // Needed by the exception FSM to build the stacked SR low byte byte-for-byte.
+    val committedCcr = RegInit(U(0, 5 bits)); committedCcr.simPublic()
+    // slot0 then slot1 fold (slot1 is younger -> applied after slot0).
+    val ccrAfter0 = UInt(5 bits)
+    ccrAfter0 := committedCcr
+    when(retire0 && p0.nzvcWrite) { ccrAfter0(3 downto 0) := p0.nzvcNew }
+    when(retire0 && p0.xWrite)    { ccrAfter0(4)          := p0.xNew(0) }
+    val ccrAfter1 = UInt(5 bits)
+    ccrAfter1 := ccrAfter0
+    when(retire1 && p1.nzvcWrite) { ccrAfter1(3 downto 0) := p1.nzvcNew }
+    when(retire1 && p1.xWrite)    { ccrAfter1(4)          := p1.xNew(0) }
+    committedCcr := ccrAfter1
+
+    // ── Commit-side exception sequencer (entry FSM + RTE) ───────────────────────
+    val exc = new m68k040.exception.ExceptionUnit(
+      ss = new m68k040.exception.SystemState,
+      entryTrigger = exceptionPending, entryVector = faultVecStore(h0), entryPc = faultPcStore(h0),
+      rteTrigger   = rteRetire,        rtePc        = p0.predNextPc,
+      committedCcr = committedCcr)
+    excIdle := !exc.active
+    val excActive = exc.active; excActive.simPublic()
+    // Squash + serialize while the FSM runs (NOT on the trigger cycle, when the FSM
+    // is still IDLE and the fault/RTE head must retire-trigger). On the trigger cycle
+    // excActive is False, so faultRetire/rteRetire fire and the exc captures; next
+    // cycle the FSM is active -> count:=0 squashes the faulted/RTE entry + younger.
+    excSquash := excActive
+
+    // ── Final registered redirect: branch mispredict OR exception vector/RTE PC ──
+    // The exc unit pulses redirectValid (one cycle) at the end of an entry/RTE
+    // sequence with the target (vector / restored PC). doFlushReg is the registered
+    // fan-out pulse; it drives the IQ/skid/fetch redirect for both cases.
+    doFlushReg := branchRedirect || exc.redirectValid
+    when(branchRedirect)    { flushPcReg := nextPcStore(h0) }
+    when(exc.redirectValid) { flushPcReg := exc.redirectPc }
 
     // ── Flush (squash all in-flight) — pointer-only, driven by the registered ─────
     // redirect pulse OR the test flush port.

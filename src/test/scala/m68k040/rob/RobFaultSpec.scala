@@ -62,6 +62,7 @@ class RobFaultSpec extends AnyFunSuite {
     u.pXDst #= 0; u.writesX #= false; u.pXOld #= 0
     u.faulted #= faulted
     u.faultVector #= faultVector
+    u.isRte #= false
   }
 
   def initSimple(dut: SimpleDut, cd: ClockDomain): Unit = {
