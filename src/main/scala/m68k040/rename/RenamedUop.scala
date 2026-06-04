@@ -22,6 +22,9 @@ case class RenamedUop() extends Bundle {
   // Precise-fault capture (exception slice 1): `faulted` + `faultVector` (4=illegal,
   // 8=privilege) threaded from decode; `isRte` marks a return-from-exception µop.
   val faulted      = Bool();  val faultVector = UInt(8 bits); val isRte = Bool()
+  // Instruction-fetch access-fault extras (format-$7): faultAddr = fetch PC stacked
+  // as the EA; sswInstr = 1 => program-space SSW (vs data). Threaded from decode.
+  val faultAddr    = UInt(32 bits); val sswInstr = Bool()
   val dstArch = UInt(5 bits)   // architectural int dst reg 0..17 (incl T0/T1); for commit RAT + CommitTrace
   val psrcA = UInt(intW bits); val psrcAValid = Bool()
   val psrcB = UInt(intW bits); val psrcBValid = Bool()

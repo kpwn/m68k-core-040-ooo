@@ -33,6 +33,13 @@ case class DecodedUop() extends Bundle {
   // NUMBER (4 = illegal instruction, 8 = privilege violation). Default: no fault.
   val faulted      = Bool()
   val faultVector  = UInt(8 bits)
+  // Access-fault (vector 2) extras for the format-$7 frame, used for an
+  // INSTRUCTION-FETCH fault (the I-cache raised DecodePacket.fault). `faultAddr` is
+  // the faulting fetch PC (the EA stacked in the $7 frame); `sswInstr` set => the
+  // fault was an instruction fetch (the exception FSM stacks a program-space SSW
+  // instead of data-space). Both default to 0/False (data faults / no fault).
+  val faultAddr    = UInt(32 bits)
+  val sswInstr     = Bool()
   // RTE (return-from-exception): a serializing exception-return µop. Default False.
   val isRte        = Bool()
 }

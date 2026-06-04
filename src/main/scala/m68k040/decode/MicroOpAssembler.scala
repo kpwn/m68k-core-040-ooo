@@ -80,6 +80,8 @@ object MicroOpAssembler {
     opUop.unimplemented := False
     opUop.faulted       := False
     opUop.faultVector   := 0
+    opUop.faultAddr     := pkt.pc
+    opUop.sswInstr      := False
     opUop.isRte         := False
 
     // --- srcA slot ---
@@ -169,6 +171,7 @@ object MicroOpAssembler {
     ldUop.branchDisp    := 0
     ldUop.unimplemented := False
     ldUop.faulted       := False; ldUop.faultVector := 0; ldUop.isRte := False
+    ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
     // Address = dst base An (psrcA) + dst disp(imm); data = the MOVE source register
@@ -197,6 +200,7 @@ object MicroOpAssembler {
     stUop.branchDisp    := 0
     stUop.unimplemented := False
     stUop.faulted       := False; stUop.faultVector := 0; stUop.isRte := False
+    stUop.faultAddr     := pkt.pc; stUop.sswInstr := False
 
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
     // Defer: non-simple, illegal op, a USED src EA that is neither reg/imm nor a
@@ -234,12 +238,37 @@ object MicroOpAssembler {
       opUop.faultVector := 4
     }
 
+    // ── INSTRUCTION-FETCH fault (the I-cache raised DecodePacket.fault) ─────────
+    // The ITLB faulted translating this fetch (non-resident / supervisor I-page), so
+    // the instruction bytes are don't-care: emit a single faulted op µop that DELIVERS
+    // the format-$7 access fault (vector 2) at retire. faultAddr = the fetch PC (the
+    // EA stacked in the $7 frame); sswInstr = 1 so the exception FSM stacks a
+    // program-space SSW. Last-wins over `bad`/RTE so a faulting fetch always delivers.
+    when(pkt.fault) {
+      opUop.op            := DecOp.ILLEGAL   // no ALU action; the FSM delivers it
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.unimplemented := False
+      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
+      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
+      opUop.isRte         := False
+      opUop.faulted       := True
+      opUop.faultVector   := 2               // access fault -> format-$7
+      opUop.faultAddr     := pkt.pc          // faulting instruction PC
+      opUop.sswInstr      := True            // instruction fetch (program-space SSW)
+    }
+
     // ── Sequence selection (each slot driven exactly once) ─────────────────────
     // bad        -> [op] (count 1, op carries the illegal override)
     // crackStore -> [store] (count 1)
     // crackLoad  -> [load, op] (count 2)
     // else       -> [op] (count 1)
-    when(bad) {
+    when(pkt.fault) {
+      // Fetch fault dominates: a single faulted (vector-2) delivery µop.
+      out.count   := 1
+      out.uops(0) := opUop
+      out.uops(1) := opUop
+    } elsewhen(bad) {
       out.count   := 1
       out.uops(0) := opUop
       out.uops(1) := opUop

@@ -101,6 +101,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val faultWrStore   = Vec.fill(depth)(RegInit(False))
     val faultSizeStore = Vec.fill(depth)(Reg(UInt(2 bits)))
     val faultSupStore  = Vec.fill(depth)(RegInit(False))
+    // Instruction-fetch access-fault: set at ALLOC for a faulted (vector-2) µop whose
+    // fault came from the I-cache (sswInstr). Selects a program-space SSW in the $7
+    // frame. RegInit(False), reset per-alloc (mirrors faultedStore).
+    val faultInstrStore = Vec.fill(depth)(RegInit(False))
     // LS access-fault completion (driven by the LS-cluster wiring, like
     // branchCompletion). Default-idle (allowOverride) so a standalone DUT elaborates.
     val lsFaultCompletion = Flow(m68k040.execute.LsFault())
@@ -290,6 +294,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultVecStore(tail) := allocUopVec(0).faultVector
       faultPcStore(tail)  := allocUopVec(0).pc
       faultWrStore(tail)  := False; faultSupStore(tail) := False
+      // Instruction-fetch fault: capture the fetch PC as the EA + the SSW-instr bit.
+      faultAddrStore(tail)  := allocUopVec(0).faultAddr
+      faultInstrStore(tail) := allocUopVec(0).sswInstr
       nzvcWrStore(tail) := False; xWrStore(tail) := False
     }
     when(alloc1) {
@@ -301,6 +308,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultVecStore(tail + 1) := allocUopVec(1).faultVector
       faultPcStore(tail + 1)  := allocUopVec(1).pc
       faultWrStore(tail + 1)  := False; faultSupStore(tail + 1) := False
+      faultAddrStore(tail + 1)  := allocUopVec(1).faultAddr
+      faultInstrStore(tail + 1) := allocUopVec(1).sswInstr
       nzvcWrStore(tail + 1) := False; xWrStore(tail + 1) := False
     }
     when(allocFireSig) {
@@ -336,6 +345,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val exceptionFaultWr   = Bool();        exceptionFaultWr   := faultWrStore(h0);   exceptionFaultWr.simPublic()
     val exceptionFaultSize = UInt(2 bits);  exceptionFaultSize := faultSizeStore(h0); exceptionFaultSize.simPublic()
     val exceptionFaultSup  = Bool();        exceptionFaultSup  := faultSupStore(h0);  exceptionFaultSup.simPublic()
+    val exceptionFaultInstr= Bool();        exceptionFaultInstr:= faultInstrStore(h0);exceptionFaultInstr.simPublic()
 
     // ── Committed CCR (X N Z V C, bits 4..0) — VALUE, folded at retire ───────────
     // The ROB has no CCR value on its payload (only phys IDs), so the EU writeback
@@ -363,7 +373,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // Access-fault (vector 2) extras for the format-$7 frame.
       entryFaultAddr = faultAddrStore(h0),
       entryFaultWr   = faultWrStore(h0),
-      entryFaultSup  = faultSupStore(h0))
+      entryFaultSup  = faultSupStore(h0),
+      entryFaultInstr= faultInstrStore(h0))
     excIdle := !exc.active
     val excActive = exc.active; excActive.simPublic()
     // Squash + serialize while the FSM runs (NOT on the trigger cycle, when the FSM
