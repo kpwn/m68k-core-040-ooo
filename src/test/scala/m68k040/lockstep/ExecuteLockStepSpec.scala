@@ -2,7 +2,7 @@ package m68k040.lockstep
 
 import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
-import m68k040.mmu.{IdentityTranslationPlugin, DtlbPlugin}
+import m68k040.mmu.{IdentityTranslationPlugin, DtlbPlugin, MmuControlPlugin}
 import m68k040.cache.{IcachePlugin, DcachePlugin, DcacheService}
 import m68k040.frontend.FetchAlignPlugin
 import m68k040.decode.DecodeStage
@@ -160,6 +160,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   class FullCoreDut extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
+    val ctrl   = new MmuControlPlugin
     val dtlb   = new DtlbPlugin
     val icache = new IcachePlugin
     val dcache = new DcachePlugin
@@ -179,6 +180,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val wire   = new BackendWiringPlugin(eu0, eu1, branchEu, lsEu)
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
+      ctrl,
       new IdentityTranslationPlugin,
       dtlb,
       icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu,
@@ -354,11 +356,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       mmuMap match {
         case Some((dataPageVA, ppn)) =>
           buildMmuTable(ptmem, dataPageVA, ppn)
-          dut.dtlb.logic.mmuEnable #= true
-          dut.dtlb.logic.rootPtr   #= MMU_ROOT
+          dut.ctrl.logic.mmuEnable #= true
+          dut.ctrl.logic.rootPtr   #= MMU_ROOT
         case None =>
-          dut.dtlb.logic.mmuEnable #= false
-          dut.dtlb.logic.rootPtr   #= 0
+          dut.ctrl.logic.mmuEnable #= false
+          dut.ctrl.logic.rootPtr   #= 0
       }
 
       // Idle the frontend; consumer-driven ready ports default high downstream.
@@ -694,8 +696,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       pokeWordLE(MMU_ROOT + rootIdx * 4, (MMU_PTRT & 0xfffffff0L) | 0x3L)
       pokeWordLE(MMU_PTRT + ptrIdx * 4,  (MMU_PAGT & 0xfffffff0L) | 0x3L)
       pokeWordLE(MMU_PAGT + pageIdx * 4, (0x42L << 12) & 0xfffff000L)   // PDT=00 -> non-resident
-      dut.dtlb.logic.mmuEnable #= true
-      dut.dtlb.logic.rootPtr   #= MMU_ROOT
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.rootPtr   #= MMU_ROOT
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
@@ -834,8 +836,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       pokeLE(PAGA + 2 * 4,    0x0L)                          // pageA[2] = NON-RESIDENT (the fault)
       pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)          // pageA[0x3f] = identity VPN 0xFF (supervisor stack)
       pokeLE(PAGC + 2 * 4,    (0x82L << 12) | 0x1L)          // pageC[2] = identity VPN 0x82 (PT write)
-      dut.dtlb.logic.mmuEnable #= true
-      dut.dtlb.logic.rootPtr   #= 0x80000L
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.rootPtr   #= 0x80000L
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false

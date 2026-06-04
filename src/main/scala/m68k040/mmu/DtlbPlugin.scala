@@ -1,7 +1,7 @@
 package m68k040.mmu
 
 import m68k040.cache.{CacheMode, TranslationReq, TranslationRsp}
-import m68k040.services.DTranslationService
+import m68k040.services.{DTranslationService, MmuControlService}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -48,10 +48,6 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     umFlush       = Bool()
   }
 
-  // control registers (test-poked; simPublic). RegInit so MMU-disabled is the
-  // power-on default -> existing tests unchanged.
-  var mmuEnableReg: Bool = null
-  var rootPtrReg: UInt   = null
   // U/M deferred-write queue hooks (driven by the LS-cluster wiring):
   //  - umAccessRobId : robId of the access currently being translated (tags a walk's
   //    U/M write so it drains at THAT instruction's commit)
@@ -84,10 +80,11 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     umCommitId.allowOverride;    umCommitId    := U(0, 6 bits)
     umFlush.allowOverride;       umFlush       := False
 
-    val mmuEnable = RegInit(False); mmuEnable.simPublic()
-    val rootPtr   = Reg(UInt(32 bits)) init 0; rootPtr.simPublic()
-    mmuEnableReg = mmuEnable
-    rootPtrReg   = rootPtr
+    // The ONE 68040 MMU control is owned by MmuControlPlugin and shared with the
+    // ITLB; the DTLB only READS it (no longer owns its own enable/root regs).
+    val ctrl = host[MmuControlService]
+    val mmuEnable = ctrl.mmuEnable
+    val rootPtr   = ctrl.rootPtr
 
     // ---- TLB lookup (combinational) ----
     tlb.io.lookupVpn := _req.vpn

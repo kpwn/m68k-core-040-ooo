@@ -4,7 +4,7 @@ import m68k040.M68kParams
 import m68k040.M68kSpinalConfig
 import m68k040.core.{M68kCore, ParamPlugin}
 import m68k040.cache.{IcachePlugin, DcachePlugin}
-import m68k040.mmu.{IdentityTranslationPlugin, DtlbPlugin}
+import m68k040.mmu.{IdentityTranslationPlugin, DtlbPlugin, MmuControlPlugin}
 import m68k040.frontend.FetchAlignPlugin
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
@@ -95,15 +95,16 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // robId; the queue drains at that robId's commit (same retire port as the SQ)
     // and discards on flush.
     val dtlb = host[m68k040.mmu.DtlbPlugin]
-    // Drive the MMU control regs from registered synth-top inputs: (a) so they are
-    // not UNASSIGNED (clean elaboration — sim-poked / future-MOVEC-driven, no RTL
+    // Drive the ONE shared MMU control from registered synth-top inputs: (a) so they
+    // are not UNASSIGNED (clean elaboration — sim-poked / future-MOVEC-driven, no RTL
     // driver otherwise), and (b) so OOC synth cannot const-fold mmuEnable to its init
-    // (False) and prune the DTLB/walker — the gate must measure the MMU translate
-    // path in the netlist.
+    // (False) and prune the DTLB/ITLB/walkers — the gate must measure the MMU
+    // translate path (BOTH TLBs + both walkers) in the netlist.
+    val mmuCtrl = host[m68k040.services.MmuControlService]
     val mmuEnableIn = in Bool ()
     val rootPtrIn   = in UInt (32 bits)
-    dtlb.logic.mmuEnable := RegNext(mmuEnableIn) init False
-    dtlb.logic.rootPtr   := RegNext(rootPtrIn) init 0
+    mmuCtrl.mmuEnable := RegNext(mmuEnableIn) init False
+    mmuCtrl.rootPtr   := RegNext(rootPtrIn) init 0
     dtlb.umAccessRobId := lsEu.xlateRobId
     dtlb.umCommitValid := rob.logic.retire0
     dtlb.umCommitId    := rob.logic.h0
@@ -171,6 +172,7 @@ object GenFullCoreSynthVerilog {
         val lsEu = new LsEuPlugin
         new M68kCore(Seq[FiberPlugin](
           new ParamPlugin(p),
+          new MmuControlPlugin(),
           new IdentityTranslationPlugin(),
           new DtlbPlugin(),
           new IcachePlugin(),

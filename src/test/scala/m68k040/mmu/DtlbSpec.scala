@@ -39,9 +39,10 @@ class DtlbSpec extends AnyFunSuite {
   class Dut extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
+    val ctrl = new MmuControlPlugin()
     val dtlb = new DtlbPlugin()
     val probe = new DtlbProbePlugin()
-    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), dtlb, probe)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ctrl, dtlb, probe)) }
     def walkerAxi = dtlb.walkerAxi   // full Axi4 master exposed by the plugin
   }
 
@@ -111,8 +112,8 @@ class DtlbSpec extends AnyFunSuite {
       // enable MMU + set root pointer + build a table mapping VA 0x00802000 -> PPN 0xABCDE
       val va = 0x00802000L
       buildTable(mem, va, ppn = 0xABCDEL)
-      dut.dtlb.logic.mmuEnable #= true
-      dut.dtlb.logic.rootPtr   #= ROOT
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.rootPtr   #= ROOT
       cd.waitSampling(2)
 
       // count walker AR bursts to prove the second lookup is a TLB hit (no walk)
