@@ -60,7 +60,27 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   var xlateRobIdSig: UInt = null
   override def xlateRobId: UInt         = xlateRobIdSig
 
+  // ── Exception-unit cache arbitration (full-core wiring drives these) ─────────
+  // While `excActive`, the commit-side ExceptionUnit owns the D-cache + D-TLB
+  // request ports (the LS pipe is squashed/idle — serializing). The LS EU MUXes
+  // these exc requests onto the cache it already owns. Default-idle (allowOverride)
+  // so standalone LS tests / a DUT that doesn't wire them are unchanged.
+  var excActive: Bool = null
+  var excLoadCmdValid: Bool = null; var excLoadCmdVaddr: UInt = null; var excLoadCmdSize: m68k040.isa.Size.C = null
+  var excLoadCmdReady: Bool = null
+  var excStoreValid: Bool = null;   var excStorePayload: DStoreCmd = null
+  var excXlateValid: Bool = null;   var excXlateVpn: UInt = null
+  var excXlateWrite: Bool = null;   var excXlateSupervisor: Bool = null
+  var sqEmptySig: Bool = null   // store queue drained (no committed store in flight)
+
   during setup {
+    excActive       = Bool()
+    excLoadCmdValid = Bool(); excLoadCmdVaddr = UInt(32 bits); excLoadCmdSize = m68k040.isa.Size()
+    excLoadCmdReady = Bool()
+    excStoreValid   = Bool(); excStorePayload = DStoreCmd()
+    excXlateValid   = Bool(); excXlateVpn = UInt(20 bits)
+    excXlateWrite   = Bool(); excXlateSupervisor = Bool()
+    sqEmptySig      = Bool()
     issuePort      = Stream(IqContext())
     completionPort = Flow(UInt(6 bits))
     sqCommitPort   = Flow(UInt(6 bits))
@@ -84,12 +104,28 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val dcache = host[DcacheService]
     val xlate  = host[DTranslationService]
 
+    // exc-arbitration inputs default-idle (allowOverride): a DUT that doesn't wire
+    // the exception unit (standalone LS tests) sees excActive=False -> the LS EU
+    // owns the cache exactly as before.
+    excActive.allowOverride;            excActive := False
+    excLoadCmdValid.allowOverride;      excLoadCmdValid := False
+    excLoadCmdVaddr.allowOverride;      excLoadCmdVaddr := U(0, 32 bits)
+    excLoadCmdSize.allowOverride;       excLoadCmdSize := m68k040.isa.Size.LONG
+    excStoreValid.allowOverride;        excStoreValid := False
+    excStorePayload.allowOverride;      excStorePayload.assignDontCare()
+    excXlateValid.allowOverride;        excXlateValid := False
+    excXlateVpn.allowOverride;          excXlateVpn := U(0, 20 bits)
+    excXlateWrite.allowOverride;        excXlateWrite := False
+    excXlateSupervisor.allowOverride;   excXlateSupervisor := True
+    excLoadCmdReady.allowOverride;      excLoadCmdReady := False
+
     // ---- store queue instance ----
     val sq = new StoreQueue(8)
     sq.io.commit << sqCommitPort
     sq.io.flush  := sqFlushSig
     dcache.store << sq.io.drain
     sq.io.drainAck := dcache.storeAck   // pop a drained entry only once memory is written
+    sqEmptySig := sq.io.empty           // surfaced for the exception FSM's drain wait
 
     // ---- S0: read operands ----
     val u0 = issuePort.payload.uop
@@ -496,5 +532,29 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     wbObs.x         := False
     wbObs.xWrite    := False
     wbObs.simPublic()
+
+    // ── Exception-unit cache arbitration MUX (LAST drivers — override the LS EU's
+    // cache/TLB requests while the commit-side exception sequencer is ACTIVELY
+    // accessing the cache). Placed at the end of `logic` (same scope) so the LS
+    // EU's drives are the base and these override them. Gated on the exc's PER-PORT
+    // request valids (NOT excActive) so the SQ drain / a quiescing LS access keeps
+    // the port on cycles the exc isn't using it (the exception is serializing, so
+    // any older LS store has already committed/drained by the time the exc stores).
+    when(excActive && excLoadCmdValid) {
+      dcache.loadCmd.valid         := True
+      dcache.loadCmd.payload.vaddr := excLoadCmdVaddr
+      dcache.loadCmd.payload.size  := excLoadCmdSize
+    }
+    when(excActive && excStoreValid) {
+      dcache.store.valid          := True
+      dcache.store.payload        := excStorePayload
+    }
+    when(excActive && excXlateValid) {
+      xlate.req.valid      := True
+      xlate.req.vpn        := excXlateVpn
+      xlate.req.write      := excXlateWrite
+      xlate.req.supervisor := excXlateSupervisor
+    }
+    excLoadCmdReady := dcache.loadCmd.ready
   }
 }

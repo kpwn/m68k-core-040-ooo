@@ -32,6 +32,13 @@ object LockStep {
           Some(f"pc: dut=0x${c.pc}%08x oracle=0x${s.pc}%08x")
         else if (c.ccr != s.ccr)
           Some(f"ccr: dut=0x${c.ccr}%02x oracle=0x${s.ccr}%02x")
+        // Full 16-bit SR (system byte + CCR): compared through exceptions/RTE so the
+        // committed S/I/T track Musashi's. (ccr above already covers the low byte.)
+        else if ((c.sr & 0xffff) != (s.sr & 0xffff))
+          Some(f"sr: dut=0x${c.sr & 0xffff}%04x oracle=0x${s.sr & 0xffff}%04x")
+        // A7 (banked SP), when surfaced (a7 >= 0): tracks USP/SSP across exceptions.
+        else if (c.a7 >= 0 && (c.a7 & 0xffffffffL) != (s.a(7) & 0xffffffffL))
+          Some(f"a7: dut=0x${c.a7 & 0xffffffffL}%08x oracle=0x${s.a(7) & 0xffffffffL}%08x")
         else if (c.archRegValid && {
                    val id = c.archRegId
                    val expected = if (id < 8) s.d(id) else s.a(id - 8)

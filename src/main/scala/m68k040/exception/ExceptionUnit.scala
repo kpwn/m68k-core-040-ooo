@@ -66,6 +66,12 @@ class ExceptionUnit(
   // `active` is high whenever the FSM is mid-sequence; the wiring gates the MUX on it.
   val active = Bool()
 
+  // The store queue is drained (no committed store still heading to memory). The
+  // entry FSM waits for this before stacking its frame so it never steals the
+  // D-cache store port from an older committed store's in-flight write-through
+  // (which would silently drop that store). Default True (unit DUTs w/o an LS EU).
+  val sqDrained = Bool(); sqDrained.allowOverride; sqDrained := True
+
   // ── captured per-event state ────────────────────────────────────────────────
   val curVec   = Reg(UInt(8 bits))
   val curPc    = Reg(UInt(32 bits))   // ENTRY: faulting PC to stack; RTE: restored PC
@@ -81,6 +87,25 @@ class ExceptionUnit(
   val redirectValid = Bool(); redirectValid := False
   val redirectPc    = UInt(32 bits); redirectPc := vecTarget
 
+  // ── commit observation for the exception/RTE "instruction" (lock-step). At the
+  // redirect cycle the event delivers its POST-state: the handler-entry PC (entry)
+  // / restored PC (RTE), the resulting SR (16b) and A7. Mirrors Musashi's trace
+  // step for the faulting / RTE instruction. ───────────────────────────────────
+  val obsFire    = Bool();        obsFire := False
+  val obsPc      = UInt(32 bits); obsPc := U(0, 32 bits)
+  val obsSysByte = UInt(8 bits);  obsSysByte := U(0, 8 bits)   // post-event SR system byte
+  val obsA7      = UInt(32 bits); obsA7 := U(0, 32 bits)
+
+  // ── Architectural A7 (int reg 15) write-back. The committed A7 lives in BOTH the
+  // SystemState bank (ss.ssp/usp) AND the int register file (arch reg 15) the
+  // datapath reads. When the exception changes A7 (entry: SSP-=8; RTE: restore +
+  // maybe re-bank to USP), it must update reg 15 so the handler's (A7)/disp(A7)
+  // stack accesses see the new SP. The full-core wiring connects this to an int PRF
+  // write port (phys = committed arch-15 mapping; identity phys-15 while A7 is
+  // unrenamed). obsFire qualifies it (same cycle as the event's commit obs). ─────
+  val a7WriteValid = Bool();        a7WriteValid := obsFire
+  val a7WriteData  = UInt(32 bits); a7WriteData := obsA7
+
   // ── SystemState write defaults (the FSM pulses them) ────────────────────────
   ss.setSrSys.valid := False; ss.setSrSys.payload := U(0, 8 bits)
   ss.setSsp.valid   := False; ss.setSsp.payload   := U(0, 32 bits)
@@ -88,36 +113,55 @@ class ExceptionUnit(
   ss.setUsp.valid   := False; ss.setUsp.payload   := U(0, 32 bits)
   ss.writeA7.valid  := False; ss.writeA7.payload  := U(0, 32 bits)
 
-  // ── D-cache port defaults ───────────────────────────────────────────────────
-  dcLoadCmd.valid         := False
-  dcLoadCmd.payload.vaddr := U(0, 32 bits)
-  dcLoadCmd.payload.size  := Size.LONG
-  dcStore.valid           := False
-  dcStore.payload.paddr   := U(0, 32 bits)
-  dcStore.payload.data    := B(0, 32 bits)
-  dcStore.payload.size    := Size.LONG
+  // ── D-cache STORE: REGISTERED output (FMax). The frame-word store payload is a
+  // combinational mux off the FSM step `stStep`; driving it straight onto the
+  // D-cache store port put `stStep -> store-merge -> SQ-overlap-compare` on the
+  // LS EU's critical SQ-forward arc. We compute the store into combinational
+  // `sto*` and REGISTER it onto `dcStore` (the exception FSM is serializing /
+  // multi-cycle + ack-gated, so the extra cycle is free). This cuts the arc. ────
+  val stoVld   = Bool();        stoVld := False
+  val stoPaddr = UInt(32 bits); stoPaddr := U(0, 32 bits)
+  val stoData  = Bits(32 bits); stoData := B(0, 32 bits)
+  val stoSize  = Size();        stoSize := Size.LONG
+  dcStore.valid           := RegNext(stoVld) init False
+  dcStore.payload.paddr   := RegNext(stoPaddr)
+  dcStore.payload.data    := RegNext(stoData)
+  dcStore.payload.size    := RegNext(stoSize)
   dcStore.payload.useStrb := False
   dcStore.payload.strb    := B(0, 16 bits)
   dcStore.payload.lineData:= B(0, 128 bits)
 
-  dtReq.valid      := False
-  dtReq.vpn        := U(0, 20 bits)
+  // ── D-cache LOAD + D-TLB req: REGISTERED outputs (FMax). The frame/vector load
+  // vaddr (off `frameBase`/`vecTarget`) drives the D-cache hit/miss-tag + the LS
+  // EU's SQ-overlap compare; combinationally that put `frameBase -> miss-tag ->
+  // SQ-compare -> fwdData` on the critical arc. We register the load cmd + the
+  // matching D-TLB request. The load states hold the request until the registered
+  // `dcLoadCmd.fire`, so the extra cycle is free + the cmd/vpn stay consistent. ──
+  val ldoVld   = Bool();        ldoVld := False
+  val ldoVaddr = UInt(32 bits); ldoVaddr := U(0, 32 bits)
+  val ldoSize  = Size();        ldoSize := Size.LONG
+  dcLoadCmd.valid         := RegNext(ldoVld) init False
+  dcLoadCmd.payload.vaddr := RegNext(ldoVaddr)
+  dcLoadCmd.payload.size  := RegNext(ldoSize)
+
+  val dtoVld = Bool();        dtoVld := False
+  val dtoVpn = UInt(20 bits); dtoVpn := U(0, 20 bits)
+  val dtoWr  = Bool();        dtoWr := False
+  dtReq.valid      := RegNext(dtoVld) init False
+  dtReq.vpn        := RegNext(dtoVpn)
   dtReq.supervisor := True
-  dtReq.write      := False
+  dtReq.write      := RegNext(dtoWr) init False
 
-  // identity-or-DTLB physical address for the address currently presented.
-  def paddrOf(va: UInt): UInt = (dtRsp.ppn ## va(11 downto 0)).asUInt
-
-  // helper: issue one aligned store of `sz` at `va` with right-justified `data`.
+  // helper: present one aligned store of `sz` at `va`. The store paddr is the
+  // identity-translated va (MMU off in slice-1 exception tests; a real-DTLB frame
+  // translation is a fast-follow). Both sto* (the store) and dto* (the matching
+  // D-TLB request, for the cache's coherence) are REGISTERED onto dcStore/dtReq.
   def driveStore(va: UInt, sz: Size.C, data: Bits): Unit = {
-    dtReq.valid      := True
-    dtReq.vpn        := va(31 downto 12)
-    dtReq.write      := True
-    dtReq.supervisor := True
-    dcStore.valid         := True
-    dcStore.payload.paddr := paddrOf(va)
-    dcStore.payload.size  := sz
-    dcStore.payload.data  := data.resize(32)
+    dtoVld := True; dtoVpn := va(31 downto 12); dtoWr := True
+    stoVld   := True
+    stoPaddr := va
+    stoSize  := sz
+    stoData  := data.resize(32)
   }
 
   // ENTRY frame-store step (0..3): SR, PC hi, PC lo, format/vector word. The
@@ -135,6 +179,7 @@ class ExceptionUnit(
   val fsm = new StateMachine {
     val IDLE      = new State with EntryPoint
     // ENTRY path
+    val E_DRAIN   = new State    // wait for the SQ to drain before grabbing the port
     val E_STORE   = new State    // issue one frame word store
     val E_STWAIT  = new State    // await its write-through ACK; advance step
     val E_VECREQ  = new State    // issue vector load @ VBR+vec*4
@@ -158,13 +203,16 @@ class ExceptionUnit(
         // compute vector fetch base = VBR + vec*4
         vecTarget := (ss.vbr + (entryVector << 2)).resized
         stStep    := 0
-        goto(E_STORE)
+        goto(E_DRAIN)
       } elsewhen(rteTrigger) {
         // RTE reads the frame at the CURRENT A7 (SSP). frameBase := SSP.
         frameBase := ss.ssp
         goto(R_SRREQ)
       }
     }
+
+    // Wait for older committed stores to fully drain before we use the store port.
+    E_DRAIN.whenIsActive { when(sqDrained) { goto(E_STORE) } }
 
     // ── ENTRY: stack the format-$0 frame (4 words, one at a time) ───────────────
     E_STORE.whenIsActive {
@@ -188,20 +236,13 @@ class ExceptionUnit(
     }
     // ── ENTRY: fetch the handler vector ─────────────────────────────────────────
     E_VECREQ.whenIsActive {
-      dtReq.valid      := True
-      dtReq.vpn        := vecTarget(31 downto 12)
-      dtReq.write      := False
-      dtReq.supervisor := True
-      dcLoadCmd.valid         := True
-      dcLoadCmd.payload.vaddr := vecTarget
-      dcLoadCmd.payload.size  := Size.LONG
+      dtoVld := True; dtoVpn := vecTarget(31 downto 12); dtoWr := False
+      ldoVld := True; ldoVaddr := vecTarget; ldoSize := Size.LONG
       when(dcLoadCmd.fire) { goto(E_VECWAIT) }
     }
     E_VECWAIT.whenIsActive {
       // keep the translation valid while the load is in flight
-      dtReq.valid      := True
-      dtReq.vpn        := vecTarget(31 downto 12)
-      dtReq.supervisor := True
+      dtoVld := True; dtoVpn := vecTarget(31 downto 12)
       when(dcLoadRsp.valid) {
         vecTarget := dcLoadRsp.payload.data.asUInt
         goto(E_REDIR)
@@ -215,33 +256,36 @@ class ExceptionUnit(
       ss.setSrSys.valid := True; ss.setSrSys.payload := newSys
       redirectValid := True
       redirectPc    := vecTarget
+      // commit observation: the faulting instruction's trace step == handler entry
+      // with the post-exception SR system byte (S set, T cleared) + A7 = new SSP.
+      // (CCR is unchanged by the exception -> the whitebox carries it.)
+      obsFire    := True
+      obsPc      := vecTarget
+      obsSysByte := newSys
+      obsA7      := frameBase
       goto(IDLE)
     }
 
     // ── RTE: pop the frame, restore SR + PC, SSP += 8, redirect ─────────────────
     R_SRREQ.whenIsActive {
-      dtReq.valid := True; dtReq.vpn := (frameBase + 0)(31 downto 12); dtReq.supervisor := True
-      dcLoadCmd.valid := True
-      dcLoadCmd.payload.vaddr := frameBase + 0
-      dcLoadCmd.payload.size  := Size.WORD
+      dtoVld := True; dtoVpn := (frameBase + 0)(31 downto 12)
+      ldoVld := True; ldoVaddr := frameBase + 0; ldoSize := Size.WORD
       when(dcLoadCmd.fire) { goto(R_SRWAIT) }
     }
     R_SRWAIT.whenIsActive {
-      dtReq.valid := True; dtReq.vpn := (frameBase + 0)(31 downto 12); dtReq.supervisor := True
+      dtoVld := True; dtoVpn := (frameBase + 0)(31 downto 12)
       when(dcLoadRsp.valid) {
         popSr := dcLoadRsp.payload.data(15 downto 0).asUInt
         goto(R_PCREQ)
       }
     }
     R_PCREQ.whenIsActive {
-      dtReq.valid := True; dtReq.vpn := (frameBase + 2)(31 downto 12); dtReq.supervisor := True
-      dcLoadCmd.valid := True
-      dcLoadCmd.payload.vaddr := frameBase + 2
-      dcLoadCmd.payload.size  := Size.LONG
+      dtoVld := True; dtoVpn := (frameBase + 2)(31 downto 12)
+      ldoVld := True; ldoVaddr := frameBase + 2; ldoSize := Size.LONG
       when(dcLoadCmd.fire) { goto(R_PCWAIT) }
     }
     R_PCWAIT.whenIsActive {
-      dtReq.valid := True; dtReq.vpn := (frameBase + 2)(31 downto 12); dtReq.supervisor := True
+      dtoVld := True; dtoVpn := (frameBase + 2)(31 downto 12)
       when(dcLoadRsp.valid) {
         popPc := dcLoadRsp.payload.data.asUInt
         goto(R_REDIR)
@@ -252,9 +296,18 @@ class ExceptionUnit(
       ss.setSrSys.valid := True; ss.setSrSys.payload := popSr(15 downto 8)
       // SSP += 8 (pop the frame). The CURRENT A7 is SSP (we were supervisor); after
       // restoring SR the bank may switch to USP, so write SSP explicitly.
-      ss.setSsp.valid   := True; ss.setSsp.payload := frameBase + 8
+      val newSsp = frameBase + 8
+      ss.setSsp.valid   := True; ss.setSsp.payload := newSsp
       redirectValid := True
       redirectPc    := popPc
+      // commit observation: RTE's trace step == restored PC + restored SR sysByte
+      // + A7. A7 after RTE = popped-SSP if S restored supervisor, else USP. The CCR
+      // is restored from the frame too, but the whitebox carries it (RTE restores
+      // the same CCR the matching exception entry saved -> reconstructed CCR holds).
+      obsFire    := True
+      obsPc      := popPc
+      obsSysByte := popSr(15 downto 8)
+      obsA7      := Mux(popSr(13), newSsp, ss.usp)   // SR bit13 = S
       goto(IDLE)
     }
   }
