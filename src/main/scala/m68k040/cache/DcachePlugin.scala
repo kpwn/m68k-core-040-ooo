@@ -74,7 +74,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val rdData = Vec(dataMem.map(_.readSync(rdSet, rdEn)))
 
     // ---- miss-state latches ----
-    val missVaddr = Reg(UInt(32 bits))
+    val missPaddr = Reg(UInt(32 bits))   // physical addr of the missing line (AXI refill base)
     val missSet   = Reg(UInt(setBits bits))
     val missTag   = Reg(UInt(tagBits bits))
     val missOff   = Reg(UInt(offBits bits))
@@ -104,14 +104,18 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val busy = Reg(Bool()) init False
     loadBusyReg := busy
 
-    // ---- load hit detection (combinational from cmd vaddr + translation) ----
+    // ---- load hit detection (combinational from cmd vaddr + PRE-TRANSLATED paddr) ----
+    // FMax: the physical tag comes from the requester's REGISTERED `loadCmd.paddr`
+    // (translate-at-execute already resolved it into a register), NOT from the live
+    // DTLB lookup `xlate.rsp.ppn`. This removes the DTLB way-mux/ppn select from the
+    // cache tag-compare -> hit -> dataMem-read arc (the post-MMU critical path).
+    // VIPT: index on the page-invariant vaddr set bits; tag on the physical bits.
     val cmdVaddr = loadCmdPort.payload.vaddr
+    val cmdPaddr = loadCmdPort.payload.paddr
     val cmdSet   = cmdVaddr(offBits + setBits - 1 downto offBits)
     val cmdOff   = cmdVaddr(offBits - 1 downto 0)
-    val cmdPaddrTag = xlate.rsp.ppn ## cmdVaddr(11 downto offBits + setBits)  // high tag bits
-    // physical tag = paddr[31:offBits+setBits]; paddr = ppn(20) ## vaddr[11:0].
-    // tagBits=21, of which the top (32-12)=20 are ppn and the low (12-offBits-setBits)=1 are vaddr.
-    val cmdTag = (xlate.rsp.ppn ## cmdVaddr(11 downto offBits + setBits)).asUInt
+    // physical tag = paddr[31:offBits+setBits].
+    val cmdTag = cmdPaddr(31 downto offBits + setBits)
     val hitVec = Vec(Bool(), ways)
     for (w <- 0 until ways)
       hitVec(w) := valids(w)(cmdSet) && (tagMem(w).readAsync(cmdSet) === cmdTag)
@@ -222,7 +226,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
             s1Size  := loadCmdPort.payload.size
             s1Fault := xlate.rsp.fault
           } otherwise {
-            missVaddr := cmdVaddr
+            missPaddr := cmdPaddr
             missSet   := cmdSet
             missTag   := cmdTag
             missOff   := cmdOff
@@ -237,7 +241,9 @@ class DcachePlugin extends FiberPlugin with DcacheService {
 
       REFILL.whenIsActive {
         busy := True
-        val lineBase = (missVaddr(31 downto offBits) ## U(0, offBits bits)).asUInt
+        // Refill from the PHYSICAL line base (the access was already translated;
+        // missPaddr holds the resolved physical address). Under identity == vaddr.
+        val lineBase = (missPaddr(31 downto offBits) ## U(0, offBits bits)).asUInt
         when(!arSent) {
           axi.ar.valid         := True
           axi.ar.payload.addr  := lineBase

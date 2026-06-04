@@ -39,6 +39,7 @@ class DcacheSpec extends AnyFunSuite {
   def load(dut: Dut, cd: ClockDomain, vaddr: Long, size: SpinalEnumElement[Size.type]): BigInt = {
     dut.probe.logic.loadCmdIn.valid #= true
     dut.probe.logic.loadCmdIn.payload.vaddr #= vaddr
+    dut.probe.logic.loadCmdIn.payload.paddr #= vaddr   // identity translation in this spec
     dut.probe.logic.loadCmdIn.payload.size #= size
     cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.ready.toBoolean && dut.probe.logic.loadCmdIn.valid.toBoolean)
     dut.probe.logic.loadCmdIn.valid #= false
