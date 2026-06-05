@@ -213,8 +213,12 @@ class IcacheSpec extends AnyFunSuite {
     }
   }
 
-  // -------- Latency: a warm hit responds exactly 2 cycles after accept (BRAM read) --------
-  test("warm hit responds exactly two cycles after cmd accept", VerilatorTest) {
+  // -------- Latency: a warm hit responds exactly 3 cycles after accept --------
+  // The accept now lands in the registered ITLB-translate (T) stage; the hit-detect
+  // + BRAM read run off the REGISTERED physical paddr the NEXT cycle (FMax: the live
+  // ITLB way-mux is out of the hit cone). So a warm hit is: accept -> (+1) T-consume
+  // arms the BRAM read -> (+2) S1 muxes the beat -> (+3) rsp register drives the Flow.
+  test("warm hit responds exactly three cycles after cmd accept", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
@@ -235,16 +239,21 @@ class IcacheSpec extends AnyFunSuite {
       cd.waitSamplingWhere(
         dut.probe.logic.cmdIn.ready.toBoolean && dut.probe.logic.cmdIn.valid.toBoolean)
       dut.probe.logic.cmdIn.valid #= false
-      // +1 cycle: BRAM read still in flight, no response yet
+      // +1 cycle: T-stage just registered the translation; hit-detect/BRAM read not
+      // yet launched — no response.
       cd.waitSampling()
       assert(!dut.probe.logic.rspOut.valid.toBoolean,
-        "rsp must NOT be valid 1 cycle after accept (BRAM read in flight)")
-      // +2 cycles: response arrives
+        "rsp must NOT be valid 1 cycle after accept (translation just registered)")
+      // +2 cycles: BRAM read in flight (armed off the registered paddr), no response yet
+      cd.waitSampling()
+      assert(!dut.probe.logic.rspOut.valid.toBoolean,
+        "rsp must NOT be valid 2 cycles after accept (BRAM read in flight)")
+      // +3 cycles: response arrives
       cd.waitSampling()
       assert(dut.probe.logic.rspOut.valid.toBoolean,
-        "rsp must be valid exactly 2 cycles after accept")
+        "rsp must be valid exactly 3 cycles after accept")
       assert(dut.probe.logic.rspOut.payload.data.toBigInt == IcacheSim.window64(base),
-        "2-cycle hit data mismatch")
+        "3-cycle hit data mismatch")
       cd.waitSampling(4)
     }
   }
