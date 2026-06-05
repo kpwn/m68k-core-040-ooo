@@ -149,61 +149,59 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val stAwDone   = Reg(Bool()) init True   // True == no store in flight
     val stWDone    = Reg(Bool()) init True
 
-    val stSet = storePort.payload.paddr(offBits + setBits - 1 downto offBits)
-    val stOff = storePort.payload.paddr(offBits - 1 downto 0)
-    val stTag = storePort.payload.paddr(31 downto offBits + setBits)
-    val stHit = Vec(Bool(), ways)
-    for (w <- 0 until ways)
-      stHit(w) := valids(w)(stSet) && (tagMem(w).readAsync(stSet) === stTag)
-    // Aligned/probe path derives the merge from {data,size,offset}; a SPLIT store
-    // slot supplies an explicit line-relative strobe + 128-bit line-aligned data.
-    val mergeData = Mux(storePort.payload.useStrb,
-      storePort.payload.lineData,
-      DcacheByteLane.storeData(stOff, storePort.payload.size, storePort.payload.data))
-    val mergeStrb = Mux(storePort.payload.useStrb,
-      storePort.payload.strb,
-      DcacheByteLane.storeStrb(stOff, storePort.payload.size))
-
-    // ---- store-S0 registers (the cache-boundary flops) ----
-    val s0Valid    = RegInit(False)
-    val s0Set      = Reg(UInt(setBits bits))
-    val s0MergeReg = Reg(Bits(128 bits))   // store bytes (line-aligned)
-    val s0StrbReg  = Reg(Bits(16 bits))    // per-byte strobe
-    val s0HitReg   = Reg(Vec(Bool(), ways))
-    val s0OldLine  = Reg(Vec(Bits(128 bits), ways))  // old line per HIT way (readAsync captured)
-
+    // ---- store-S0: PURE payload latch (the cache-boundary flop) ----
+    // FMax: the store paddr arrives on `storePort` off a LONG cone (the LS-EU FSM
+    // -> DTLB walker/hit -> store-port mux, route-dominated). Doing hit-detect +
+    // old-line readAsync + 16-lane merge + dataMem.write off that LIVE paddr was the
+    // binding path. So S0 does NOTHING but flop the raw store payload (a short
+    // route ending at a register physically at the cache). EVERYTHING else (set
+    // decode, hit-detect via tagMem.readAsync, old-line readAsync, merge, write)
+    // happens in store-S1 from the REGISTERED payload, fully decoupled from the
+    // DTLB cone. Single-outstanding => valids/tagMem cannot change between S0 and
+    // S1 (no concurrent refill), so S1 hit-detect is correct.
+    val s0Valid   = RegInit(False)
+    val s0Payload = Reg(DStoreCmd())
     s0Valid := False  // default; armed on a store-accept below
     when(storePort.valid) {
-      s0Valid    := True
-      s0Set      := stSet
-      s0MergeReg := mergeData
-      s0StrbReg  := mergeStrb
-      s0HitReg   := stHit
-      // capture the (dist-RAM async) old line per way into the boundary flop; the
-      // merge in S1 then starts from this register rather than a long route.
-      for (w <- 0 until ways) s0OldLine(w) := dataMem(w).readAsync(stSet)
-      // latch the write-through beat payload (AXI aw/w fire next cycle, in lock with S1)
-      stMergeReg := mergeData
-      stStrbReg  := mergeStrb
-      stAddrReg  := (storePort.payload.paddr(31 downto offBits) ## U(0, offBits bits)).asUInt
-      stAwDone   := False
-      stWDone    := False
+      s0Valid   := True
+      s0Payload := storePort.payload
     }
 
-    // ---- store-S1: merge the registered old line + store bytes, write dataMem ----
+    // ---- store-S1: decode set/off/tag + hit-detect + old-line read + merge + write ----
     // Placed BEFORE the LOAD FSM so a same-cycle refill write (in REFILL) overrides
     // this store write (refill has priority). Single-outstanding guarantees they
     // never actually collide; this preserves the original last-assignment ordering.
-    val s1MrgBytes = s0MergeReg.subdivideIn(8 bits)
+    val stS1Set = s0Payload.paddr(offBits + setBits - 1 downto offBits)
+    val stS1Off = s0Payload.paddr(offBits - 1 downto 0)
+    val stS1Tag = s0Payload.paddr(31 downto offBits + setBits)
+    val stS1Hit = Vec(Bool(), ways)
+    for (w <- 0 until ways)
+      stS1Hit(w) := valids(w)(stS1Set) && (tagMem(w).readAsync(stS1Set) === stS1Tag)
+    // Aligned/probe path derives the merge from {data,size,offset}; a SPLIT store
+    // slot supplies an explicit line-relative strobe + 128-bit line-aligned data.
+    val mergeData = Mux(s0Payload.useStrb,
+      s0Payload.lineData,
+      DcacheByteLane.storeData(stS1Off, s0Payload.size, s0Payload.data))
+    val mergeStrb = Mux(s0Payload.useStrb,
+      s0Payload.strb,
+      DcacheByteLane.storeStrb(stS1Off, s0Payload.size))
+    val stS1MrgBytes = mergeData.subdivideIn(8 bits)
     when(s0Valid) {
-      for (w <- 0 until ways) when(s0HitReg(w)) {
-        val curBytes = s0OldLine(w).subdivideIn(8 bits)
+      for (w <- 0 until ways) when(stS1Hit(w)) {
+        val curBytes = dataMem(w).readAsync(stS1Set).subdivideIn(8 bits)
         val newBytes = Vec(Bits(8 bits), 16)
-        for (i <- 0 until 16) newBytes(i) := Mux(s0StrbReg(i), s1MrgBytes(i), curBytes(i))
+        for (i <- 0 until 16) newBytes(i) := Mux(mergeStrb(i), stS1MrgBytes(i), curBytes(i))
         wrEn(w)   := True
-        wrSet(w)  := s0Set
+        wrSet(w)  := stS1Set
         wrData(w) := newBytes.asBits
       }
+      // latch the write-through beat payload (AXI aw/w fire after S1, unchanged
+      // relative ordering: still one cycle after the store is presented + merged).
+      stMergeReg := mergeData
+      stStrbReg  := mergeStrb
+      stAddrReg  := (s0Payload.paddr(31 downto offBits) ## U(0, offBits bits)).asUInt  // line-aligned
+      stAwDone   := False
+      stWDone    := False
     }
 
     // AXI write-through driver (single 128-bit beat).
