@@ -89,17 +89,17 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // entry reads "not faulted / not RTE" deterministically (no uninit-Mem flake).
     val faultedStore  = Vec.fill(depth)(RegInit(False))
     val isRteStore    = Vec.fill(depth)(RegInit(False))
-    val faultVecStore = Vec.fill(depth)(Reg(UInt(8 bits)))
-    val faultPcStore  = Vec.fill(depth)(Reg(UInt(32 bits)))
+    val faultVecStore = Vec.fill(depth)(RegInit(U(0, 8 bits)))
+    val faultPcStore  = Vec.fill(depth)(RegInit(U(0, 32 bits)))
     // MMU access-fault per-entry capture (set at COMPLETION from the LS EU's
     // faultCompletion, NOT at alloc — an MMU fault is discovered at execute). On a
     // faulting LS access the LS EU marks the entry faulted vector 2 + the faulting VA
     // + the SSW access attrs {write, sizeBits, supervisor}; the exception FSM stacks
     // the format-$7 frame from these. RegInit Vecs, reset per-alloc (mirrors
     // faultedStore) so a re-used index never carries a stale MMU fault.
-    val faultAddrStore = Vec.fill(depth)(Reg(UInt(32 bits)))
+    val faultAddrStore = Vec.fill(depth)(RegInit(U(0, 32 bits)))
     val faultWrStore   = Vec.fill(depth)(RegInit(False))
-    val faultSizeStore = Vec.fill(depth)(Reg(UInt(2 bits)))
+    val faultSizeStore = Vec.fill(depth)(RegInit(U(0, 2 bits)))
     val faultSupStore  = Vec.fill(depth)(RegInit(False))
     // Instruction-fetch access-fault: set at ALLOC for a faulted (vector-2) µop whose
     // fault came from the I-cache (sswInstr). Selects a program-space SSW in the $7
@@ -283,6 +283,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultWrStore(lsFaultCompletion.payload.robId)   := lsFaultCompletion.payload.write
       faultSizeStore(lsFaultCompletion.payload.robId) := lsFaultCompletion.payload.sizeBits
       faultSupStore(lsFaultCompletion.payload.robId)  := lsFaultCompletion.payload.supervisor
+      // A DATA (LS) access fault is data-space, NEVER an instruction fetch — clear the
+      // SSW-instr bit explicitly so it does not inherit the alloc'd µop's sswInstr
+      // (which is only meaningful for I-fetch-fault µops). Without this the SSW
+      // data/program bit was seed-flaky (the µop's unset sswInstr randomized).
+      faultInstrStore(lsFaultCompletion.payload.robId) := False
     }
 
     when(alloc0) {
