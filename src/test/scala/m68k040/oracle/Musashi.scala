@@ -69,12 +69,15 @@ object Musashi {
     * rooted at rootPtr; a fault raises a format-$7 access-fault exception. None ->
     * MMU off (identity), every existing program byte-for-byte unchanged. */
   case class MmuConfig(rootPtr: Long, dataLo: Long, dataHi: Long,
-                       ptPreload: Seq[(Long, Long)] = Seq.empty)
+                       ptPreload: Seq[(Long, Long)] = Seq.empty,
+                       instrLo: Long = 0L, instrHi: Long = 0L)
 
   private def mmuArgs(mmu: Option[MmuConfig]): Seq[String] = mmu.toSeq.flatMap { m =>
     Seq("--mmu-root",    f"0x${m.rootPtr & 0xffffffffL}%08x",
         "--mmu-data-lo", f"0x${m.dataLo  & 0xffffffffL}%08x",
-        "--mmu-data-hi", f"0x${m.dataHi  & 0xffffffffL}%08x") ++
+        "--mmu-data-hi", f"0x${m.dataHi  & 0xffffffffL}%08x",
+        "--mmu-instr-lo",f"0x${m.instrLo & 0xffffffffL}%08x",
+        "--mmu-instr-hi",f"0x${m.instrHi & 0xffffffffL}%08x") ++
       m.ptPreload.flatMap { case (a, w) =>
         Seq("--mmu-pt", f"0x${a & 0xffffffffL}%08x:0x${w & 0xffffffffL}%08x")
       }

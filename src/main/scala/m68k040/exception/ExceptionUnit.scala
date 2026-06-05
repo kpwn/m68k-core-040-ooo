@@ -44,7 +44,10 @@ class ExceptionUnit(
     // passes the defaults; the $7 path is selected only when entryVector === 2).
     entryFaultAddr: UInt = U(0, 32 bits),
     entryFaultWr:   Bool = False,
-    entryFaultSup:  Bool = False) extends Area {
+    entryFaultSup:  Bool = False,
+    // Instruction-fetch access fault: build a PROGRAM-space SSW (vs data) and force
+    // the R/W bit to read. Default False => data fault (unchanged for LS faults).
+    entryFaultInstr: Bool = False) extends Area {
 
   // ── exposed D-cache request ports (wiring MUXes them onto the real cache) ────
   val dcLoadCmd  = Stream(DLoadCmd())
@@ -261,8 +264,13 @@ class ExceptionUnit(
         // bit comes from the architectural SR, matching the MAME oracle which reads
         // the SR S bit.) entryFaultSup is retained for a future MOVES/SFC-driven mode.
         val faultSuper = ss.srSys(5) || entryFaultSup
-        val fc  = Mux(faultSuper, U(0x5, 3 bits), U(0x1, 3 bits))
-        val rwB = Mux(entryFaultWr, U(0, 1 bits), U(1, 1 bits))   // write->0, read->1
+        // FC space (bit2=supervisor): DATA access => bit0 set (01/101); INSTRUCTION
+        // fetch => program space, bit1 set (10/110). Mirrors MAME's m68040 SSW TM/FC
+        // (data=...001/101, program=...010/110). An instruction fetch is always a
+        // READ (rw bit = 1).
+        val spaceBits = Mux(entryFaultInstr, U(0x2, 3 bits), U(0x1, 3 bits))
+        val fc  = Mux(faultSuper, U(0x4, 3 bits), U(0x0, 3 bits)) | spaceBits
+        val rwB = Mux(entryFaultInstr, U(1, 1 bits), Mux(entryFaultWr, U(0, 1 bits), U(1, 1 bits)))
         curSsw    := (U(0x400, 16 bits) | fc.resize(16) | (rwB ## U(0, 8 bits)).asUInt.resize(16))
         oldSr     := (ss.srSys ## committedCcr.resize(8 bits)).asUInt
         // new SSP = current A7 (SSP, since committed S) - frame size (8 for $0, 60 for $7)

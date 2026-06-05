@@ -48,9 +48,10 @@ class UmWriteSpec extends AnyFunSuite {
   class Dut extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
+    val ctrl = new MmuControlPlugin()
     val dtlb = new DtlbPlugin()
     val probe = new UmProbePlugin()
-    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), dtlb, probe)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ctrl, dtlb, probe)) }
     def walkerAxi = dtlb.walkerAxi
   }
 
@@ -97,8 +98,8 @@ class UmWriteSpec extends AnyFunSuite {
     dut.probe.logic.commitValid #= false; dut.probe.logic.commitId #= 0
     dut.probe.logic.flush #= false
     cd.waitSampling(4)
-    dut.dtlb.logic.mmuEnable #= true
-    dut.dtlb.logic.rootPtr   #= ROOT
+    dut.ctrl.logic.mmuEnable #= true
+    dut.ctrl.logic.rootPtr   #= ROOT
     cd.waitSampling(2)
     (cd, mem)
   }

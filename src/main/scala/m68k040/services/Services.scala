@@ -44,6 +44,14 @@ trait FetchService {
   def rsp: Flow[FetchRsp]
 }
 
+/** The ONE 68040 MMU control (TC enable + URP/SRP root pointer), shared by BOTH
+  * the I-side ITLB and the D-side DTLB. One owner drives the regs (synth top input /
+  * sim poke / future MOVEC); both TLBs read it. `mmuEnable` LOW => identity. */
+trait MmuControlService {
+  def mmuEnable: Bool
+  def rootPtr:   UInt   // 32 bits
+}
+
 /** Produced by the MMU/ITLB (identity stub this slice); consumed by the I-cache.
   * Combinational: drive `rsp` from `req` within the same cycle. */
 trait TranslationService {

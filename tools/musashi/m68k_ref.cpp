@@ -150,6 +150,9 @@ extern "C" {
 extern unsigned int m68ki_aerr_address;
 extern unsigned int m68ki_aerr_write_mode;
 extern unsigned int m68ki_aerr_fc;
+// Set by Musashi's opcode-prefetch path (m68ki_read_imm_*) so the oracle MMU knows a
+// bus read is an INSTRUCTION fetch (program space) vs a data access. 0 = data.
+volatile unsigned int g_mmu_instr_fetch = 0;
 }
 
 void MusashiRef::enable_mmu(uint32_t root_ptr, uint32_t data_lo, uint32_t data_hi) {
@@ -159,10 +162,26 @@ void MusashiRef::enable_mmu(uint32_t root_ptr, uint32_t data_lo, uint32_t data_h
     mmu_hi_      = data_hi;
 }
 
+void MusashiRef::set_instr_window(uint32_t instr_lo, uint32_t instr_hi) {
+    mmu_instr_lo_ = instr_lo;
+    mmu_instr_hi_ = instr_hi;
+}
+
 uint32_t MusashiRef::mmu_translate(uint32_t va, bool rw) {
-    // Identity for everything outside the data window (code/vectors/stack/PT),
-    // and when the MMU is off.
-    if (!mmu_enabled_ || va < mmu_lo_ || va >= mmu_hi_) return va;
+    // Dispatch on the current access class: an opcode prefetch is an INSTRUCTION
+    // fetch (program space); everything else is data. (g_mmu_instr_fetch is set by
+    // m68ki_read_imm_* around the prefetch read.)
+    return mmu_translate_ex(va, rw, g_mmu_instr_fetch != 0);
+}
+
+uint32_t MusashiRef::mmu_translate_ex(uint32_t va, bool rw, bool instr) {
+    // Window selection: data accesses use [mmu_lo_, mmu_hi_); instruction fetches use
+    // [mmu_instr_lo_, mmu_instr_hi_). Outside the relevant window (or MMU off) ->
+    // identity (code/vectors/stack/PT pass through, matching the RTL where only the
+    // mapped pages translate).
+    if (!mmu_enabled_) return va;
+    if (instr) { if (va < mmu_instr_lo_ || va >= mmu_instr_hi_) return va; }
+    else       { if (va < mmu_lo_       || va >= mmu_hi_)       return va; }
 
     // Page-table descriptors are read LITTLE-ENDIAN — matching the RTL TableWalker
     // (byte at the lowest address is bits[7:0]). A descriptor written by a normal
@@ -182,10 +201,16 @@ uint32_t MusashiRef::mmu_translate(uint32_t va, bool rw) {
         // 68040 access-fault inputs for the format-$7 SSW + frame:
         //  - aerr_address  : the faulting logical (effective) address (the VA)
         //  - aerr_write_mode: SSW R/W bit, 1=read 0=write (MAME orig_rw)
-        //  - aerr_fc       : 3-bit function code (supervisor=bit2; data=1)
+        //  - aerr_fc       : 3-bit function code (supervisor=bit2; space: data=1,
+        //                    program/instruction=2). An instruction fetch is a READ.
+        const uint32_t space = instr ? 0x2u : 0x1u;
         m68ki_aerr_address    = va;
-        m68ki_aerr_write_mode = rw ? 0u : 1u;            // write -> 0, read -> 1
-        m68ki_aerr_fc         = (supervisor ? 0x4u : 0x0u) | 0x1u;  // data space
+        m68ki_aerr_write_mode = instr ? 1u : (rw ? 0u : 1u);   // fetch=read; else write->0/read->1
+        m68ki_aerr_fc         = (supervisor ? 0x4u : 0x0u) | space;
+        // The bus error longjmps out of the in-flight prefetch, SKIPPING the
+        // g_mmu_instr_fetch=0 reset in m68ki_read_imm_*. Clear it here so the frame
+        // stacking + vector fetch run as DATA (identity), not instruction fetches.
+        g_mmu_instr_fetch = 0;
         m68k_pulse_bus_error();   // stacks the format-$7 frame + longjmps out
         return va;                // not reached
     };

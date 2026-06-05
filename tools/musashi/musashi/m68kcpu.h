@@ -1031,6 +1031,9 @@ extern uint           m68ki_aerr_address;
 extern uint           m68ki_aerr_write_mode;
 extern uint           m68ki_aerr_fc;
 extern int            m68ki_bus_error_step_break;
+/* Set by the opcode-prefetch path to mark an INSTRUCTION fetch for the grafted
+ * oracle MMU (program space). Defined in m68k_ref.cpp. */
+extern volatile unsigned int g_mmu_instr_fetch;
 
 /* Forward declarations to keep some of the macros happy */
 static inline uint m68ki_read_16_fc (uint address, uint fc);
@@ -1069,6 +1072,9 @@ static inline uint m68ki_read_imm_16(void)
 #if M68K_EMULATE_PREFETCH
 {
 	uint result;
+	/* INSTRUCTION-FETCH window: tell the grafted oracle MMU these reads are program
+	 * space (so the I-side of the one MMU translates + faults with a program SSW). */
+	g_mmu_instr_fetch = 1;
 	if(REG_PC != CPU_PREF_ADDR)
 	{
 		CPU_PREF_ADDR = REG_PC;
@@ -1078,11 +1084,18 @@ static inline uint m68ki_read_imm_16(void)
 	REG_PC += 2;
 	CPU_PREF_ADDR = REG_PC;
 	CPU_PREF_DATA = m68k_read_immediate_16(ADDRESS_68K(CPU_PREF_ADDR));
+	g_mmu_instr_fetch = 0;
 	return result;
 }
 #else
 	REG_PC += 2;
-	return m68k_read_immediate_16(ADDRESS_68K(REG_PC-2));
+	{
+		uint r;
+		g_mmu_instr_fetch = 1;
+		r = m68k_read_immediate_16(ADDRESS_68K(REG_PC-2));
+		g_mmu_instr_fetch = 0;
+		return r;
+	}
 #endif /* M68K_EMULATE_PREFETCH */
 }
 
@@ -1107,6 +1120,7 @@ static inline uint m68ki_read_imm_32(void)
 	m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_PROGRAM); /* auto-disable (see m68kcpu.h) */
 	m68ki_check_address_error(REG_PC, MODE_READ, FLAG_S | FUNCTION_CODE_USER_PROGRAM); /* auto-disable (see m68kcpu.h) */
 
+	g_mmu_instr_fetch = 1;
 	if(REG_PC != CPU_PREF_ADDR)
 	{
 		CPU_PREF_ADDR = REG_PC;
@@ -1121,13 +1135,20 @@ static inline uint m68ki_read_imm_32(void)
 	REG_PC += 2;
 	CPU_PREF_ADDR = REG_PC;
 	CPU_PREF_DATA = m68k_read_immediate_16(ADDRESS_68K(CPU_PREF_ADDR));
+	g_mmu_instr_fetch = 0;
 
 	return temp_val;
 #else
 	m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_PROGRAM); /* auto-disable (see m68kcpu.h) */
 	m68ki_check_address_error(REG_PC, MODE_READ, FLAG_S | FUNCTION_CODE_USER_PROGRAM); /* auto-disable (see m68kcpu.h) */
 	REG_PC += 4;
-	return m68k_read_immediate_32(ADDRESS_68K(REG_PC-4));
+	{
+		uint r;
+		g_mmu_instr_fetch = 1;
+		r = m68k_read_immediate_32(ADDRESS_68K(REG_PC-4));
+		g_mmu_instr_fetch = 0;
+		return r;
+	}
 #endif /* M68K_EMULATE_PREFETCH */
 }
 

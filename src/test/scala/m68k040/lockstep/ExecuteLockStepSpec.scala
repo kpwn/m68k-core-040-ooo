@@ -2,7 +2,7 @@ package m68k040.lockstep
 
 import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
-import m68k040.mmu.{IdentityTranslationPlugin, DtlbPlugin}
+import m68k040.mmu.{ItlbPlugin, DtlbPlugin, MmuControlPlugin}
 import m68k040.cache.{IcachePlugin, DcachePlugin, DcacheService}
 import m68k040.frontend.FetchAlignPlugin
 import m68k040.decode.DecodeStage
@@ -102,6 +102,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dtlb.umCommitValid := rob.logic.retire0
       dtlb.umCommitId    := rob.logic.h0
       dtlb.umFlush       := host[RedirectService].doFlush
+      // ── ITLB U deferred-write queue wiring (U-only; mirrors top/FullCoreSynth) ──
+      val itlb = host[m68k040.mmu.ItlbPlugin]
+      itlb.umAccessRobId := U(0, 6 bits)
+      itlb.umCommitValid := rob.logic.retire0
+      itlb.umCommitId    := rob.logic.h0
+      itlb.umFlush       := host[RedirectService].doFlush
 
       // ── Commit-time mispredict redirect fan-out (registered doFlush pulse) ──
       val doFlush = host[RedirectService].doFlush
@@ -160,6 +166,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   class FullCoreDut extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
+    val ctrl   = new MmuControlPlugin
+    val itlb   = new ItlbPlugin
     val dtlb   = new DtlbPlugin
     val icache = new IcachePlugin
     val dcache = new DcachePlugin
@@ -179,7 +187,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val wire   = new BackendWiringPlugin(eu0, eu1, branchEu, lsEu)
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
-      new IdentityTranslationPlugin,
+      ctrl,
+      itlb,
       dtlb,
       icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu,
       rfInt, rfNzvc, rfX, wire)) }
@@ -228,15 +237,30 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   val MMU_ROOT = 0x00080000L
   val MMU_PTRT = 0x00081000L
   val MMU_PAGT = 0x00082000L
-  def buildMmuTable(mem: m68k040.ls.BehavioralMemAgent, dataPageVA: Long, ppn: Long): Unit = {
+  // Per-(rootIdx,ptrIdx) leaf page table: the 64-entry leaf table for the data VA
+  // lives at MMU_PAGT; the code VA (a different root/ptr index) gets its own leaf
+  // table at MMU_PAGT2 so both can coexist under the shared root/ptr tables.
+  val MMU_PAGT2 = 0x00083000L
+  def mapPage(mem: m68k040.ls.BehavioralMemAgent, va: Long, ppn: Long, leafBase: Long): Unit = {
     def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) mem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
-    val rootIdx = ((dataPageVA >> 25) & 0x7f).toInt
-    val ptrIdx  = ((dataPageVA >> 18) & 0x7f).toInt
-    val pageIdx = ((dataPageVA >> 12) & 0x3f).toInt
+    val rootIdx = ((va >> 25) & 0x7f).toInt
+    val ptrIdx  = ((va >> 18) & 0x7f).toInt
+    val pageIdx = ((va >> 12) & 0x3f).toInt
     pokeWordLE(MMU_ROOT + rootIdx * 4, (MMU_PTRT & 0xfffffff0L) | 0x3L)
-    pokeWordLE(MMU_PTRT + ptrIdx * 4,  (MMU_PAGT & 0xfffffff0L) | 0x3L)
-    // page descriptor: PDT resident, no WP/super; PPN = non-identity
-    pokeWordLE(MMU_PAGT + pageIdx * 4, ((ppn << 12) & 0xfffff000L) | 0x1L)
+    pokeWordLE(MMU_PTRT + ptrIdx * 4,  (leafBase & 0xfffffff0L) | 0x3L)
+    pokeWordLE(leafBase + pageIdx * 4, ((ppn << 12) & 0xfffff000L) | 0x1L)
+  }
+  // The 68040 has ONE MMU: when enabled, BOTH I-fetch and D-access translate. The
+  // oracle treats instruction fetch as IDENTITY (untranslated), so to keep the RTL
+  // ITLB byte-for-byte the same we IDENTITY-map the code region (8 pages from the
+  // load address — covers the program + handler). Data gets the non-identity PPN.
+  def buildMmuTable(mem: m68k040.ls.BehavioralMemAgent, dataPageVA: Long, ppn: Long): Unit = {
+    mapPage(mem, dataPageVA, ppn, MMU_PAGT)
+    val codeBase = ProgramAssembler.DefaultLoadAddress
+    for (i <- 0 until 8) {
+      val cva = codeBase + i * 0x1000L
+      mapPage(mem, cva, (cva >> 12) & 0xfffffL, MMU_PAGT2)  // identity
+    }
   }
 
   def runLockStep(name: String, src: String, nInstr: Int = -1, checkMem: Seq[Long] = Seq.empty,
@@ -351,14 +375,18 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // when the MMU is enabled; idle for MMU-disabled programs). MMU disabled by
       // default -> identity passthrough, so existing programs are unchanged.
       val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      // The ITLB has its OWN dedicated walker AXI port: attach a second behavioral
+      // memory holding the SAME page table (one shared page table, two read ports).
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
       mmuMap match {
         case Some((dataPageVA, ppn)) =>
           buildMmuTable(ptmem, dataPageVA, ppn)
-          dut.dtlb.logic.mmuEnable #= true
-          dut.dtlb.logic.rootPtr   #= MMU_ROOT
+          buildMmuTable(itlbPtmem, dataPageVA, ppn)
+          dut.ctrl.logic.mmuEnable #= true
+          dut.ctrl.logic.rootPtr   #= MMU_ROOT
         case None =>
-          dut.dtlb.logic.mmuEnable #= false
-          dut.dtlb.logic.rootPtr   #= 0
+          dut.ctrl.logic.mmuEnable #= false
+          dut.ctrl.logic.rootPtr   #= 0
       }
 
       // Idle the frontend; consumer-driven ready ports default high downstream.
@@ -686,16 +714,23 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
       val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
       // Build a table whose root/pointer are resident but the PAGE descriptor is
-      // NON-RESIDENT (PDT=00) for the data page VA 0x2000.
-      def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) ptmem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
-      val va = 0x2000L
-      val rootIdx = ((va >> 25) & 0x7f).toInt; val ptrIdx = ((va >> 18) & 0x7f).toInt; val pageIdx = ((va >> 12) & 0x3f).toInt
-      pokeWordLE(MMU_ROOT + rootIdx * 4, (MMU_PTRT & 0xfffffff0L) | 0x3L)
-      pokeWordLE(MMU_PTRT + ptrIdx * 4,  (MMU_PAGT & 0xfffffff0L) | 0x3L)
-      pokeWordLE(MMU_PAGT + pageIdx * 4, (0x42L << 12) & 0xfffff000L)   // PDT=00 -> non-resident
-      dut.dtlb.logic.mmuEnable #= true
-      dut.dtlb.logic.rootPtr   #= MMU_ROOT
+      // NON-RESIDENT (PDT=00) for the data page VA 0x2000. Code is IDENTITY-mapped
+      // (resident) in BOTH walker memories so instruction fetch through the ITLB does
+      // not fault — only the DATA access to VA 0x2000 faults.
+      def buildFaultTable(mem: m68k040.ls.BehavioralMemAgent): Unit = {
+        def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) mem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+        val va = 0x2000L
+        val rootIdx = ((va >> 25) & 0x7f).toInt; val ptrIdx = ((va >> 18) & 0x7f).toInt; val pageIdx = ((va >> 12) & 0x3f).toInt
+        pokeWordLE(MMU_ROOT + rootIdx * 4, (MMU_PTRT & 0xfffffff0L) | 0x3L)
+        pokeWordLE(MMU_PTRT + ptrIdx * 4,  (MMU_PAGT & 0xfffffff0L) | 0x3L)
+        pokeWordLE(MMU_PAGT + pageIdx * 4, (0x42L << 12) & 0xfffff000L)   // PDT=00 -> non-resident
+        for (i <- 0 until 8) { val cva = loadAddr + i * 0x1000L; mapPage(mem, cva, (cva >> 12) & 0xfffffL, MMU_PAGT2) }
+      }
+      buildFaultTable(ptmem); buildFaultTable(itlbPtmem)
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.rootPtr   #= MMU_ROOT
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
@@ -825,6 +860,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // handler writes via a D-cache store must be visible to the walker on re-walk.
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
       val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // The ITLB walker shares the SAME backing memory (one physical page table), so a
+      // handler PT write is visible to the I-side re-walk too.
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
       // Build the nested page table (little-endian) in the shared memory.
       def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
       pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)   // root[0] -> ptr resident
@@ -834,8 +872,19 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       pokeLE(PAGA + 2 * 4,    0x0L)                          // pageA[2] = NON-RESIDENT (the fault)
       pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)          // pageA[0x3f] = identity VPN 0xFF (supervisor stack)
       pokeLE(PAGC + 2 * 4,    (0x82L << 12) | 0x1L)          // pageC[2] = identity VPN 0x82 (PT write)
-      dut.dtlb.logic.mmuEnable #= true
-      dut.dtlb.logic.rootPtr   #= 0x80000L
+      // The 68040 has ONE MMU: the I-fetch path also translates. IDENTITY-map the code
+      // region (8 pages from loadAddr; the oracle treats I-fetch as identity) so the
+      // ITLB resolves code fetches without faulting. A SEPARATE leaf table (PAGD) at a
+      // free address keeps it out of pageA/pageC.
+      val PAGD = 0x00084000L
+      pokeLE(PTRT + (((loadAddr >> 18) & 0x7f).toInt) * 4, (PAGD & 0xfffffff0L) | 0x2L)
+      pokeLE(MMU_ROOT + (((loadAddr >> 25) & 0x7f).toInt) * 4, (PTRT & 0xfffffff0L) | 0x2L)
+      for (i <- 0 until 8) {
+        val cva = loadAddr + i * 0x1000L
+        pokeLE(PAGD + (((cva >> 12) & 0x3f).toInt) * 4, (((cva >> 12) & 0xfffffL) << 12) | 0x1L)
+      }
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.rootPtr   #= 0x80000L
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
@@ -883,6 +932,236 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val pa = (dataPPN << 12) | (0x2000L & 0xfffL)
       assert(dmem.peekByte(pa + 3) == 0x2a,
         f"[pagefault] re-executed store must land 0x2a at PA 0x${pa + 3}%08x (got 0x${dmem.peekByte(pa + 3)}%02x)")
+    }
+  }
+
+  // ── ITLB lock-step helpers ──────────────────────────────────────────────────
+  /** Place a code image at an ARBITRARY base in an I-cache SparseMemory (low-byte
+    * first, matching the I-cache window convention — same swap as attachProgram). */
+  private def writeCodeAt(mem: SparseMemory, base: Long, bytes: Vector[Int]): Unit = {
+    val nWords = bytes.length / 2
+    for (i <- 0 until nWords) {
+      val w = ((bytes(2 * i) & 0xff) << 8) | (bytes(2 * i + 1) & 0xff)
+      mem.write(base + 2 * i,     (w & 0xff).toByte)
+      mem.write(base + 2 * i + 1, ((w >> 8) & 0xff).toByte)
+    }
+  }
+  /** Wire the full whitebox commit capture (incl. the exception commit channel) used
+    * by the ITLB lock-step tests. */
+  private def wireWhitebox(dut: FullCoreDut, handle: WhiteboxCapture.Handle): Unit = {
+    def captureWb(w: m68k040.execute.WbObs): Unit = if (w.valid.toBoolean) {
+      handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
+        dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
+        intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
+        x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean))
+    }
+    dut.clockDomain.onSamplings {
+      captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs)
+      val bw = dut.branchEu.logic.wbObs
+      if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+      for (k <- 0 until 2) {
+        val c = dut.rob.logic.commitObs(k)
+        if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
+          sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL)
+      }
+      val ce = dut.rob.logic.commitObs(2)
+      if (ce.fire.toBoolean) handle.onExcCommit(ce.pc.toLong & 0xffffffffL, ce.sysByte.toInt & 0xff, ce.a7.toLong & 0xffffffffL)
+    }
+  }
+
+  // ── ITLB lock-step (a): code at a NON-IDENTITY instruction mapping ──────────
+  // The program is linked at VA loadAddr but the ITLB maps that code page to a
+  // DIFFERENT physical page (PPN 0x50000): the I-cache fetches from the PA while the
+  // architectural PC stream is the VA. The oracle runs instruction fetch as identity
+  // (PC = VA), so the committed PC/SR/A7/register stream lock-steps step-for-step —
+  // proving the ITLB miss->walk->fill + translate is transparent.
+  test("lock-step ITLB: code at a non-identity instruction mapping", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress           // VA 0x40800000
+    val codePPN  = 0x50000L                                      // PA page 0x50000000
+    val codePA   = codePPN << 12
+    // A register-only straight-line program (no data accesses -> only the I-side
+    // translates). 6 instructions, then halt.
+    val src = "moveq #1,%d0 ; moveq #2,%d1 ; add.l %d0,%d1 ; moveq #7,%d2 ; " +
+              "sub.l %d0,%d2 ; and.l %d1,%d2 ; loop: bra loop"
+    val nInstr = 6
+    val oracleSteps = Musashi.assembleAndTrace(src, maxCycles = 20000) match {
+      case Right(v)  => v.take(nInstr); case Left(e) => fail(s"[itlb-a] oracle: ${e.reason}") }
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i; case Left(e) => fail(s"[itlb-a] assemble: ${e.reason}") }
+
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      val handle = new WhiteboxCapture.Handle
+      wireWhitebox(dut, handle)
+
+      // I-cache memory: code lives at the PA (0x50000000), NOT the VA.
+      val icmem = SparseMemory()
+      writeCodeAt(icmem, codePA, image.bytes)
+      new Axi4ReadOnlySlaveAgent(dut.icache.logic.axi, cd) {
+        override def readByte(address: BigInt, id: Int): Byte = icmem.read(address.toLong)
+      }
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      // Page table (in both walker memories): map VA loadAddr -> PPN 0x50000 (resident).
+      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      def build(mem: m68k040.ls.BehavioralMemAgent): Unit = {
+        for (i <- 0 until 8) mapPage(mem, loadAddr + i * 0x1000L, codePPN + i, MMU_PAGT2)
+      }
+      build(ptmem); build(itlbPtmem)
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.rootPtr   #= MMU_ROOT
+
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+
+      var guard = 0; val cap = 5000
+      while (handle.result.size < nInstr && guard < cap) { cd.waitSampling(); guard += 1 }
+      assert(handle.result.size >= nInstr,
+        s"[itlb-a] only ${handle.result.size}/$nInstr committed within $cap cycles")
+      val res = LockStep.compare(handle.result.take(nInstr), oracleSteps)
+      assert(res.ok, s"[itlb-a] lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")} " +
+        s"(matched ${res.matched}, dut ${handle.result.size}, oracle $nInstr)")
+    }
+  }
+
+  // ── ITLB lock-step (b): branch to a NON-RESIDENT I-page -> format-$7 -> RTE ──
+  // The program (at loadAddr) installs the vector-2 handler, then branches FORWARD
+  // (bra.w, reachable) to VA loadAddr+0x2000 — an instruction page left NON-RESIDENT.
+  // The I-fetch there faults -> the core delivers a format-$7 access fault (SSW
+  // program-space, EA = the faulting page VA) -> the handler writes a resident
+  // descriptor for that page -> RTE re-fetches it, which now runs (writes D3 then
+  // halts). The committed PC/SR/A7 stream + the stacked $7 frame match the MAME-040
+  // oracle (extended for I-fetch) step-for-step / byte-for-byte. (The 040 decoder has
+  // no absolute JMP, so the non-resident page is within bra.w reach of the code.)
+  test("lock-step ITLB: non-resident I-page -> format-$7 -> handler maps -> RTE -> resume", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress       // 0x40800000
+    val farVA    = loadAddr + 0x2000L                        // 0x40802000 (non-resident I-page)
+    // Code leaf table PAGD placed at 0x3F000 so the far-page descriptor (PAGD+2*4 =
+    // 0x3F008) is itself in pageA's identity range (ptr[0], pageIdx 0x3f) -> the
+    // handler's DATA write to VA 0x3F008 translates to PA 0x3F008.
+    val PTRT = 0x00081000L; val PAGA = 0x00082000L; val PAGD = 0x0003F000L
+    val descVA = PAGD + 2*4                                  // 0x3F008 (the far-page descriptor)
+    // Far page resident IDENTITY (PPN farVA>>12). LE descriptor; big-endian move.l imm
+    // = byteswap(that).
+    val farPpn   = (farVA >> 12) & 0xfffffL                  // 0x40802
+    val farDescLE = ((farPpn << 12) | 0x1L) & 0xffffffffL    // 0x40802001
+    val farDescBE = java.lang.Long.reverseBytes(farDescLE) >>> 32  // byteswap to a move.l imm
+    // Program: install handler @ 0x8, bra.w to far. far page (.org 0x2000) writes D3
+    // then halts. handler maps PAGD[2] resident then RTE.
+    // The fall-through after `bra.w far` (the mispredicted not-taken path) is fetched
+    // speculatively before the redirect; keep it STORE-FREE (filler moveqs) so no
+    // wrong-path store is ever allocated into the SQ. The handler (with its store)
+    // sits AFTER the filler.
+    val filler = (0 until 24).map(_ => "moveq #0,%d7").mkString(" ; ")
+    val src =
+      "move.l #handler,%d1 ; move.l %d1,0x8 ; " +
+      "moveq #1,%d4 ; moveq #2,%d5 ; moveq #3,%d6 ; " +   // let the vec-store drain
+      "bra.w far ; " +
+      filler + " ; " +                                   // store-free wrong-path window
+      f"handler: move.l #0x$farDescBE%08x,%%d1 ; move.l %%d1,0x3F008 ; rte ; " +
+      ".org 0x2000 ; far: moveq #99,%d3 ; floop: bra floop"
+    val nInstr = 10  // vec-imm, vec-store, 3x moveq, [fault@far], handler-imm, handler-store, rte, moveq@far
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i; case Left(e) => fail(s"[itlb-b] assemble: ${e.reason}") }
+
+    // Oracle: instr window covers ONLY the far page [farVA, farVA+0x1000); preloaded
+    // resident root[4]/ptr[0x20] (the code's root/ptr) + PAGD[2] NON-RESIDENT (=0).
+    // The oracle fetches the far-page code from its own memory (the image already
+    // contains it at offset 0x2000). The handler maps PAGD[2] resident, RTEs.
+    val rIdx = ((loadAddr >> 25) & 0x7f).toInt
+    val pIdx = ((loadAddr >> 18) & 0x7f).toInt
+    val oraclePt = Seq(
+      (0x80000L + rIdx*4) -> ((PTRT & 0xfffffff0L) | 0x2L),   // root[code] -> ptr
+      (PTRT + pIdx*4)     -> ((PAGD & 0xfffffff0L) | 0x2L),   // ptr[code]  -> PAGD
+      (PAGD + 2*4)        -> 0x0L) ++                          // PAGD[2] = NON-RESIDENT (the I-fault)
+      // the OTHER code pages identity-resident so the rest of the program fetches.
+      (0 until 8).filter(_ != 2).map(i => (PAGD + i*4) -> ((((loadAddr>>12)&0xfffffL)+i) << 12 | 0x1L))
+    val mmu = Some(Musashi.MmuConfig(rootPtr = 0x80000L, dataLo = 0L, dataHi = 0L,
+      ptPreload = oraclePt, instrLo = farVA, instrHi = farVA + 0x1000L))
+    val oracleSteps = Musashi.assembleAndTrace(src, mmu = mmu, maxCycles = 20000) match {
+      case Right(v)  => v; case Left(e) => fail(s"[itlb-b] oracle: ${e.reason}") }
+    assert(oracleSteps.size >= nInstr, s"[itlb-b] oracle produced ${oracleSteps.size} steps (< $nInstr)")
+    val oracle = oracleSteps.take(nInstr)
+
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      val handle = new WhiteboxCapture.Handle
+      wireWhitebox(dut, handle)
+
+      // I-cache memory: the whole image at loadAddr (identity PA == VA for resident
+      // pages; the far page is at PA loadAddr+0x2000 once mapped identity).
+      val icmem = SparseMemory()
+      writeCodeAt(icmem, loadAddr, image.bytes)
+      new Axi4ReadOnlySlaveAgent(dut.icache.logic.axi, cd) {
+        override def readByte(address: BigInt, id: Int): Byte = icmem.read(address.toLong)
+      }
+      // D-cache + walker memories share one backing store (the handler's PT write must
+      // be visible to the ITLB re-walk).
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+      // Page table. Data accesses that translate: the vector store (VA 0x8) and the
+      // handler PT write (VA 0x3F008). Both via root[0]->ptr[0]->pageA, identity.
+      pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)   // root[0] -> ptr
+      pokeLE(PTRT + 0*4,      (PAGA & 0xfffffff0L) | 0x2L)   // ptr[0]  -> pageA (0x0..0x3FFFF)
+      pokeLE(PAGA + 0*4,      (0x0L << 12) | 0x1L)           // pageA[0] = identity (vector store VA 0x8)
+      pokeLE(PAGA + 0x3f*4,   (0x3fL << 12) | 0x1L)          // pageA[0x3f] = identity VPN 0x3F (PT write VA 0x3F008)
+      // Code region: root[code]->ptr, ptr[code]->PAGD; PAGD[2] NON-RESIDENT, the rest
+      // identity-resident.
+      pokeLE(0x80000L + rIdx*4, (PTRT & 0xfffffff0L) | 0x2L)
+      pokeLE(PTRT + pIdx*4,     (PAGD & 0xfffffff0L) | 0x2L)
+      for (i <- 0 until 8) {
+        val v = if (i == 2) 0x0L else ((((loadAddr>>12)&0xfffffL)+i) << 12 | 0x1L)
+        pokeLE(PAGD + i*4, v)
+      }
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.rootPtr   #= 0x80000L
+
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+
+      var guard = 0; val cap = 12000; var sawFault = false
+      while (handle.result.size < nInstr && guard < cap) {
+        if (dut.itlb.logic.faultSeen.toBoolean) sawFault = true
+        cd.waitSampling(); guard += 1
+      }
+      assert(sawFault, "[itlb-b] the I-fetch to the non-resident page must flag an ITLB fault")
+      assert(handle.result.size >= nInstr,
+        s"[itlb-b] only ${handle.result.size}/$nInstr committed within $cap cycles")
+      // Stacked format-$7 frame (supervisor stack, big-endian): SSW = program-space.
+      val fb = 0x100000L - 60
+      def pk16(a: Long): Int = ((dmem.peekByte(a) << 8) | dmem.peekByte(a + 1)) & 0xffff
+      def pk32(a: Long): Long = ((pk16(a).toLong << 16) | pk16(a + 2)) & 0xffffffffL
+      assert((pk16(fb) & 0xff00) == 0x2700, f"[itlb-b] frame SR=0x${pk16(fb)}%04x expected 0x27xx")
+      assert(pk16(fb + 6) == 0x7008, f"[itlb-b] frame fmt/vec=0x${pk16(fb + 6)}%04x expected 0x7008")
+      assert(pk32(fb + 8) == farVA, f"[itlb-b] frame EA=0x${pk32(fb + 8)}%08x expected 0x$farVA%08x")
+      assert(pk16(fb + 0xc) == 0x0506, f"[itlb-b] frame SSW=0x${pk16(fb + 0xc)}%04x expected 0x0506 (in_mmu|super-program|read)")
+      assert(pk32(fb + 0x14) == farVA, f"[itlb-b] frame faultAddr=0x${pk32(fb + 0x14)}%08x expected 0x$farVA%08x")
+
+      val res = LockStep.compare(handle.result.take(nInstr), oracle)
+      assert(res.ok, s"[itlb-b] lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")} " +
+        s"(matched ${res.matched}, dut ${handle.result.size}, oracle $nInstr)")
     }
   }
 }

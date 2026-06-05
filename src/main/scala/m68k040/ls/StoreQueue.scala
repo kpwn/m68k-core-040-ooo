@@ -241,14 +241,22 @@ class StoreQueue(depth: Int = 8) extends Component {
   // ---- flush: squash speculative (uncommitted) entries. Roll tail back to just
   // past the youngest COMMITTED entry. Walk from head over committed entries. ----
   when(io.flush) {
-    // count of committed entries still live, scanning head..tail
+    // A drainAck this same cycle pops the head entry (single-slot, or slot B of a
+    // split). That popped entry must NOT be counted as kept — otherwise the flush's
+    // keepCount over-counts by one and tail lands one past the real youngest entry,
+    // leaving a PHANTOM entry that never drains (empty stays false forever -> the
+    // commit-side exception FSM hangs at E_DRAIN). Exclude the popped head here.
+    val popsHead = io.drainAck && drainBusy && !(!drainPhaseB && validBs(head))
     val keep = Vec(Bool(), depth)
-    for (i <- 0 until depth) keep(i) := valids(i) && committed(i)
+    for (i <- 0 until depth)
+      keep(i) := valids(i) && committed(i) && !(popsHead && (U(i, log2Up(depth) bits) === head))
     for (i <- 0 until depth) when(!keep(i)) { valids(i) := False }
-    // new tail = head + (number of committed-live entries). Committed entries are
-    // always the oldest contiguous run (commit is in-order), so this is exact.
+    // new tail = head' + (number of committed-live entries), where head' accounts for
+    // the coincident pop (head advances by 1 if popsHead). Committed entries are the
+    // oldest contiguous run (commit is in-order), so this is exact.
     val keepCount = CountOne(keep)
-    tail := (head + keepCount).resized
+    val headAfter = Mux(popsHead, head + 1, head)
+    tail := (headAfter + keepCount).resized
   }
 
   // ---- count = hardware sum of valids (no Scala-var counters) ----

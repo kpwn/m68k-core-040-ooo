@@ -117,6 +117,10 @@ public:
     // fetch uses a separate, untranslated I-cache). The window is the data
     // page region the program touches.
     void     enable_mmu(uint32_t root_ptr, uint32_t data_lo, uint32_t data_hi);
+    // Set the instruction-translate window (the I-side of the one MMU). An
+    // instruction fetch in [instr_lo, instr_hi) translates + can fault (program-space
+    // SSW). Default window is empty -> instruction fetch is identity (unchanged).
+    void     set_instr_window(uint32_t instr_lo, uint32_t instr_hi);
 
     uint32_t get_reg(Reg r) const;
     void     set_reg(Reg r, uint32_t v);
@@ -182,10 +186,19 @@ private:
     // calls m68k_pulse_bus_error() (which longjmps out — does not return here).
     // Untranslated / disabled -> identity.
     uint32_t mmu_translate(uint32_t va, bool rw);
+    // Instruction-fetch translate (the 68040 has ONE MMU: I and D both translate).
+    // `instr` selects program space for the fault SSW (FC bit1) + the instruction
+    // translate window. Mirrors the RTL ITLB.
+    uint32_t mmu_translate_ex(uint32_t va, bool rw, bool instr);
     bool      mmu_enabled_ = false;
     uint32_t  mmu_root_    = 0;
     uint32_t  mmu_lo_      = 0;
     uint32_t  mmu_hi_      = 0;
+    // Instruction-translate window [instr_lo_, instr_hi_): an instruction FETCH whose
+    // (untranslated) VA falls here is translated through the SAME page table; a
+    // non-resident I-page raises a vector-2 access fault with a PROGRAM-space SSW.
+    uint32_t  mmu_instr_lo_ = 0;
+    uint32_t  mmu_instr_hi_ = 0;
 
     // Flat byte store — hash map to keep memory small for sparse
     // programs.  Address → byte value.  Missing addresses read 0xFF,

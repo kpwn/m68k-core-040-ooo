@@ -65,8 +65,25 @@ class IcachePlugin extends FiberPlugin with FetchService {
       for (w <- 0 until ways; s <- 0 until sets) valids(w)(s) := False
     }
 
+    // ---- T-stage: REGISTERED ITLB translation (FMax pipeline split) ----
+    // The cmd is accepted into this stage once the ITLB has RESOLVED the translation
+    // (xlate.rsp.ready). We REGISTER the translated physical address ({ppn, pc[11:0]})
+    // + fault here, so the I-cache hit-detect below tags on the REGISTERED physical
+    // paddr (tPaddr) instead of the LIVE `xlate.rsp.ppn`. This removes the ITLB `Tlb`
+    // way-mux / walk-latch mux from the VIPT hit cone (tag-compare -> hit ->
+    // dataMem ENARDEN / s1Pred), which was the post-ITLB route-dominated limiter.
+    // VIPT: index on the page-invariant pc[11:6] set bits; tag on the registered
+    // physical bits. MMU-off (identity, ppn==pc[31:12]) flows through the SAME
+    // register so both modes are pipelined uniformly. Costs ONE translate-latency
+    // cycle on a fetch (the frontend is single-outstanding + latency-agnostic).
+    val tValid = RegInit(False)
+    val tPc    = Reg(UInt(32 bits))
+    val tPaddr = Reg(UInt(32 bits))   // {ppn, pc[11:0]} captured at translate time
+    val tFault = RegInit(False)
+
     // ---- miss-state latches ----
     val missPC    = Reg(UInt(32 bits))
+    val missPA    = Reg(UInt(32 bits))   // translated physical line address (refill AXI)
     val missSet   = Reg(UInt(setBits bits))
     val missTag   = Reg(UInt(tagBits bits))
     val victimWay = Reg(UInt(wayBits bits))
@@ -91,7 +108,14 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val s1Pc    = Reg(UInt(32 bits))
     val s1Fault = Reg(Bool())
     val s1Lane  = Reg(UInt(2 bits))
-    val s1Pred  = Reg(Vec(ChunkPredecode(), 4))
+    // FMax: register the RAW per-way predMem entries (the readAsync results, indexed
+    // by the page-invariant set bits — NOT a hit-way select), and defer the way-mux +
+    // window-decode to the S1->rsp stage keyed off the REGISTERED s1Way. This mirrors
+    // the data path (s1Beat = dataBeat(s1Way)) and keeps the hitWayIdx/predMem way-mux
+    // + windowPred OUT of the IDLE consume cone (which was the route-dominated arc into
+    // s1Pred). A fault placeholder registers all-zero entries (windowPred of zero = a
+    // zeroed predecode, matching the old getZero placeholder).
+    val s1PredEntries = Reg(Vec(Bits(128 bits), ways))
     s1Valid := False   // default each cycle; armed in IDLE-hit / REPLAY below
 
     // ---- rsp output register stage ----
@@ -109,13 +133,17 @@ class IcachePlugin extends FiberPlugin with FetchService {
     }
 
     // ---- S1 -> rsp output register (runs every cycle; meaningful when s1Valid) ----
+    // Way-mux the registered raw beats/pred by s1Way, then window-decode — all off
+    // REGISTERED state (s1Way/s1Lane/s1Pc), so neither the data nor the pred select
+    // is in the IDLE hit cone.
     val s1Beat   = dataBeat(s1Way)
     val s1Window = s1Beat.subdivideIn(64 bits)(s1Lane)
+    val s1PredW  = windowPred(s1PredEntries(s1Way), s1Pc)
     rspValidReg := s1Valid
     rspPcReg    := s1Pc
     rspDataReg  := s1Window
     rspFaultReg := s1Fault
-    rspPredReg  := s1Pred
+    rspPredReg  := s1PredW
 
     // ---- rsp outputs (combinational from the registered stage) ----
     rspPort.valid         := rspValidReg
@@ -131,10 +159,14 @@ class IcachePlugin extends FiberPlugin with FetchService {
     axi.r.ready   := False
     activePc      := cmdPort.payload.pc
 
-    // ---- hit detection (combinational, from cmdPort.pc + translation) ----
-    val idlePc    = cmdPort.payload.pc
+    // ---- hit detection (combinational, from the REGISTERED T-stage paddr) ----
+    // VIPT: index with the page-invariant pc[11:6] set bits (from the registered tPc);
+    // tag with the REGISTERED physical page number tPaddr[31:12]. The live ITLB
+    // way-mux is NOT in this cone (it was already resolved into tPaddr the prior
+    // cycle), so the tag-compare -> hit -> dataMem ENARDEN arc is route-clean.
+    val idlePc    = tPc
     val idleSet   = idlePc(11 downto 6)
-    val idleTag   = xlate.rsp.ppn
+    val idleTag   = tPaddr(31 downto 12)
     val hitVec = Vec(Bool(), ways)
     for (w <- 0 until ways)
       hitVec(w) := valids(w)(idleSet) && (tagMem(w).readAsync(idleSet) === idleTag)
@@ -145,9 +177,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val idleReadAddr  = (idleSet ## idleBeatSel).asUInt
     val idlePredEntry = Vec(predMem.map(_.readAsync(idleSet)))
 
-    // Single-in-flight: do not accept a new cmd while a hit response is draining
-    // (S1 or the rsp register). Costs nothing — the consumer is single-outstanding.
-    val inFlight = s1Valid || rspValidReg
+    // Single-in-flight: do not accept a new cmd into the T-stage while a translated
+    // fetch is being consumed (T-stage occupied), or a hit response is draining (S1 /
+    // rsp register). Costs nothing — the consumer is single-outstanding.
+    val inFlight = tValid || s1Valid || rspValidReg
 
     // ---- FSM ----
     val fsm = new StateMachine {
@@ -156,26 +189,70 @@ class IcachePlugin extends FiberPlugin with FetchService {
       val PREDECODE = new State
       val REPLAY    = new State
 
-      // ----- IDLE: accept; hit -> arm S1 read, miss -> latch + refill -----
+      // ----- IDLE: T-accept (translate) + consume the REGISTERED T-stage -----
+      // Two decoupled actions, both single-outstanding (inFlight gates each):
+      //
+      // (1) T-ACCEPT: present `cmdPort.pc` to the ITLB; once it has RESOLVED the
+      //     translation (xlate.rsp.ready), REGISTER {ppn,pc[11:0]} + fault into the
+      //     T-stage. MMU-off identity is always ready, so MMU-disabled fetch is
+      //     unchanged. On an ITLB MISS rsp.ready is LOW (the walker is running): we do
+      //     not accept (stall) until it resolves.
+      // (2) CONSUME: when a translated fetch is registered (tValid), tag-compare off
+      //     the REGISTERED tPaddr (the live ITLB way-mux is OUT of this cone) and
+      //     either emit a fault placeholder, arm the S1 hit read, or start a refill
+      //     from the registered physical line base. A resolved translation that FAULTS
+      //     (non-resident / supervisor I-page) is consumed as a fault placeholder
+      //     (s1Fault) WITHOUT a refill — the rsp carries fault -> DecodePacket.fault.
       IDLE.whenIsActive {
         activePc      := cmdPort.payload.pc
-        cmdPort.ready := !inFlight
+        cmdPort.ready := !inFlight && xlate.rsp.ready
 
+        // (1) T-accept: register the resolved translation. tValid persists until the
+        // consume below clears it (next IDLE cycle), keeping single-outstanding.
         when(cmdPort.fire) {
-          when(isHit) {
-            // Arm S1: launch the data BRAM read; latch control for next-cycle mux.
-            dataReadAddr := idleReadAddr
-            dataReadEn   := True
+          tValid := True
+          tPc    := cmdPort.payload.pc
+          tPaddr := (xlate.rsp.ppn ## cmdPort.payload.pc(11 downto 0)).asUInt
+          tFault := xlate.rsp.fault
+        }
+
+        // (2) Consume the registered translation.
+        when(tValid) {
+          // FMax: arm the data-BRAM read whenever a translated fetch is present —
+          // INDEPENDENT of the hit/fault decision. The result is only CONSUMED when
+          // s1Valid is set (a real hit below), so a redundant read on a miss/fault
+          // cycle is harmless (power only). Off the registered tPaddr, so the tag-
+          // compare is no longer in the data-BRAM `ENARDEN` critical path.
+          dataReadAddr := idleReadAddr
+          dataReadEn   := True
+          tValid := False   // consumed this cycle (later writes below may re-arm S1)
+
+          // Register the RAW per-way predMem entries (way-mux + window-decode deferred
+          // to S1 keyed off s1Way). On a fault placeholder the entries are zeroed
+          // (windowPred(0) == the old getZero placeholder).
+          when(tFault) {
+            // Translation fault: emit a fault response (no data, no refill).
+            s1Valid := True
+            s1Way   := U(0, wayBits bits)
+            s1Pc    := idlePc
+            s1Fault := True
+            s1Lane  := idleLaneIdx
+            s1PredEntries := Vec.fill(ways)(B(0, 128 bits))
+          } elsewhen(isHit) {
+            // Hit: the data BRAM read is already armed above; latch the S1 control.
             s1Valid := True
             s1Way   := hitWayIdx
             s1Pc    := idlePc
-            s1Fault := xlate.rsp.fault
+            s1Fault := False
             s1Lane  := idleLaneIdx
-            s1Pred  := windowPred(idlePredEntry(hitWayIdx), idlePc)
+            s1PredEntries := idlePredEntry
           } otherwise {
             missPC    := idlePc
             missSet   := idleSet
             missTag   := idleTag
+            // PHYSICAL line base for the refill: the registered translated PA =
+            // {ppn, pc[11:0]} (MMU-off identity: ppn == pc[31:12], == the VA).
+            missPA    := tPaddr
             victimWay := victim(idleSet)
             beatCnt   := U(0, 1 bits)
             arSent    := False
@@ -187,7 +264,9 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // ----- REFILL: issue AXI AR; collect 2 R beats into dataMem -----
       REFILL.whenIsActive {
         activePc := missPC
-        val lineBase = missPC & ~U(63, 32 bits)
+        // Refill from the PHYSICAL line base (missPA, the translated PA); identity
+        // when the MMU is off (missPA == missPC).
+        val lineBase = missPA & ~U(63, 32 bits)
 
         when(!arSent) {
           axi.ar.valid         := True
@@ -246,9 +325,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
         s1Valid := True
         s1Way   := victimWay
         s1Pc    := missPC
-        s1Fault := xlate.rsp.fault
+        // A refill only happens for a NON-faulting translation (the T-stage fault
+        // path emits a placeholder without refilling), so the replayed line is fault-
+        // free by construction — off the live ITLB rsp entirely.
+        s1Fault := False
         s1Lane  := missPC(4 downto 3)
-        s1Pred  := windowPred(replayPredEntry(victimWay), missPC)
+        s1PredEntries := replayPredEntry
 
         goto(IDLE)
       }

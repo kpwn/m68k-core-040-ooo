@@ -56,6 +56,14 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val stalled       = Reg(Bool()) init False       // complex-instruction stall
     val started       = Reg(Bool()) init False       // don't fetch until first redirect
     val fetchInFlight = Reg(Bool()) init False       // single-outstanding guard
+    // I-fetch fault hold: a translation fault (ITLB non-resident / protect) on a
+    // fetch response. We emit ONE faulted DecodePacket (slot0.fault, pc = the faulting
+    // fetch PC) and STOP fetching until a redirect (the exception delivers + vectors).
+    // Without this hold the front-end would keep fetching the bad page (a flood of
+    // faulted uops that starves the commit-side exception sequencer).
+    val faultHold     = Reg(Bool()) init False
+    val faultEmitted  = Reg(Bool()) init False   // the faulted packet was already emitted
+    val faultPc       = Reg(UInt(32 bits)) init 0
 
     // Complex emit-once is enforced by the `stalled` latch (no separate delay reg):
     // a complex packet has shiftWords=0, so on its fire only `stalled` advances,
@@ -77,7 +85,8 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     ibuf.io.flush        := False
 
     // ---- FetchControl: issue fetches (single-outstanding) ----
-    ic.cmd.valid      := started && !fetchInFlight && ibuf.io.push.ready && !stalled
+    // Suppress fetching while holding an I-fetch fault (wait for the redirect).
+    ic.cmd.valid      := started && !fetchInFlight && ibuf.io.push.ready && !stalled && !faultHold
     ic.cmd.payload.pc := fetchPc
 
     when(ic.cmd.fire) {
@@ -89,11 +98,22 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val rspWords = ic.rsp.payload.data.subdivideIn(16 bits)
     val rspPreds = ic.rsp.payload.pred
 
+    // A fault response (not stale): latch the fault + the faulting fetch PC and stop
+    // fetching. The faulted packet is emitted on the feed below; do NOT enqueue words.
+    // Capture the FIRST fault only (gate on !faultHold): a fault response one cycle
+    // before the hold engages can be followed by a second in-flight fault response for
+    // the next window; the EA must be the FIRST faulting address, not the later one.
+    val rspFault = ic.rsp.valid && ic.rsp.payload.fault && !rspStale && !faultHold
+    when(rspFault) {
+      faultHold := True
+      faultPc   := ic.rsp.payload.pc
+    }
+
     when(ic.rsp.valid) {
       fetchInFlight := False
       fetchPc       := fetchPc + 8
 
-      when(!rspStale) {
+      when(!rspStale && !ic.rsp.payload.fault) {
         // Determine starting word index within this window
         val startWord = UInt(2 bits)
         when(dropPending) {
@@ -118,8 +138,9 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
         }
         ibuf.io.push.payload.n := nWords
         ibuf.io.push.valid     := True
-      } otherwise {
-        // Stale: discard response, clear stale flag
+      } elsewhen(rspStale) {
+        // Stale: discard response, clear stale flag (a fault response is handled
+        // above via faultHold; it pushes nothing either).
         rspStale := False
       }
     }
@@ -134,9 +155,33 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     feed.payload(1) := res.slot1
     slot1ValidOut   := res.slot1Valid
     feed.valid      := res.slot0Valid && !stalled
+    // I-fetch fault: override the feed with a single faulted DecodePacket (slot0
+    // only), emitted EXACTLY ONCE (faultEmitted suppresses re-emission). Its bytes are
+    // don't-care; decode turns it into a faulted vector-2 µop that delivers at retire.
+    when(faultHold) {
+      feed.valid             := !faultEmitted
+      slot1ValidOut          := False
+      feed.payload(0).valid     := True
+      feed.payload(0).fault     := True
+      // EA / faulting-instruction PC = the architectural fetch PC (decodePc, = the
+      // branch/redirect target), NOT the 8-byte I-cache fetch window (which can be one
+      // window ahead of the faulting instruction).
+      feed.payload(0).pc        := decodePc
+      feed.payload(0).simple    := True
+      feed.payload(0).complex   := False
+      feed.payload(0).wordCount := 1
+      feed.payload(0).lenWords  := 1
+      feed.payload(0).words.foreach(_ := 0)
+      feed.payload(1).valid     := False
+      feed.payload(1).fault     := False
+    }
+    // Emit-once: latch faultEmitted when the faulted packet fires.
+    when(faultHold && feed.fire) { faultEmitted := True }
 
-    // When feed fires: consume words from buffer and advance decodePc
-    when(feed.fire) {
+    // When feed fires (normal, NOT the faulted-packet override): consume words from
+    // the buffer and advance decodePc. A faulted feed shifts nothing (its bytes came
+    // from faultPc, not the IBuf).
+    when(feed.fire && !faultHold) {
       ibuf.io.shift := res.shiftWords
       decodePc      := decodePc + (res.shiftWords.resize(32) |<< 1)
       when(res.complex) {
@@ -153,6 +198,9 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       fetchPc     := newPc(31 downto 3) @@ U(0, 3 bits)
       ibuf.io.flush  := True
       stalled        := False
+      // Clear the I-fetch-fault hold: the exception delivered + vectored, resume fetch.
+      faultHold      := False
+      faultEmitted   := False
       started        := True
       // Drop leading words on the next rsp: startWord = newPc[2:1] (word index within 8-byte window)
       dropPending    := True
@@ -195,6 +243,10 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       ibuf.io.flush  := True
       stalled        := False
       started        := True
+      // Clear the I-fetch-fault hold: the commit-side exception delivered the fault
+      // and vectored here -> resume fetching at the redirected (handler) PC.
+      faultHold      := False
+      faultEmitted   := False
       dropPending    := True
       dropCount      := newPc(2 downto 1)
       when(fetchInFlight) {
