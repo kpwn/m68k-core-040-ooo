@@ -563,6 +563,31 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       checkMem = Seq(0x2000L))
   }
 
+  // ── Store-pipeline (S0/S1) store->load + SQ-forward coverage ────────────────
+  // The store cache-write now lands one cycle later (S0 read / S1 merge+write).
+  // These programs pin that the +1-cycle write is invisible: the in-flight store
+  // is covered by SQ forwarding + the drain-resident-until-ACK window. Each step
+  // lock-steps PC/SR/regs vs Musashi.
+
+  test("lock-step: store then immediate load same line (SQ forward)", VerilatorTest) {
+    // Two stores into the SAME 16-byte line (0x2000), each immediately loaded back.
+    // The load fires while the store is still draining (cache write delayed to S1),
+    // so it MUST resolve via SQ forwarding. Final mem[0x2000], mem[0x2004].
+    runLockStep("st-ld-sameline",
+      "moveq #0x11,%d0 ; move.l %d0,0x2000 ; move.l 0x2000,%d1 ; " +
+      "moveq #0x22,%d2 ; move.l %d2,0x2004 ; move.l 0x2004,%d3",
+      checkMem = Seq(0x2000L, 0x2004L))
+  }
+
+  test("lock-step: store long then load overlapping sub-word (SQ forward)", VerilatorTest) {
+    // Store a LONG at 0x2000, then load the WORD at 0x2002 overlapping its low half.
+    // The overlapping sub-word load must forward from the in-flight store (the cache
+    // line is still being merged in S1). 0x12345678 -> word @0x2002 == 0x5678.
+    runLockStep("st-ld-subword",
+      "move.l #0x12345678,%d0 ; move.l %d0,0x2000 ; moveq #0,%d1 ; move.w 0x2002,%d1",
+      checkMem = Seq(0x2000L), checkSpan = 4)
+  }
+
   // ── MOVE-to/from-memory CCR (the bug fix) ──────────────────────────────────
   // MOVE (all sizes) sets N/Z from the moved value and clears V/C — INCLUDING
   // MOVE to memory. These programs move NEGATIVE and ZERO values to/from memory

@@ -127,6 +127,51 @@ class DcacheSpec extends AnyFunSuite {
     }
   }
 
+  // (c2) directed S0/S1 pipeline: a partial sub-word store hit MERGES into the line
+  // (surrounding bytes preserved) and reads back correctly. Pins the read-modify-write
+  // across the (now pipelined) +1-cycle store write.
+  test("store-RMW merges a sub-word into a hit line preserving neighbors", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x5000L
+      preload(mem, base, 16)         // known image
+      load(dut, cd, base, Size.LONG) // warm the whole line
+
+      // store a WORD 0xCAFE at base+2 (big-endian: byte+2=0xCA, byte+3=0xFE)
+      doStore(dut, cd, base + 2, BigInt("CAFE", 16), Size.WORD)
+
+      // memory: only the two stored bytes change
+      assert(mem.peekByte(base + 0) == memByte(base + 0), "mem byte 0 preserved")
+      assert(mem.peekByte(base + 1) == memByte(base + 1), "mem byte 1 preserved")
+      assert(mem.peekByte(base + 2) == 0xCA, "mem byte 2 = CA")
+      assert(mem.peekByte(base + 3) == 0xFE, "mem byte 3 = FE")
+      assert(mem.peekByte(base + 4) == memByte(base + 4), "mem byte 4 preserved")
+
+      // cached line: the WORD reads back merged, neighbors intact
+      assert(load(dut, cd, base + 2, Size.WORD) == BigInt("CAFE", 16), "merged word")
+      assert(load(dut, cd, base + 0, Size.WORD) == expected(base + 0, 2), "neighbor lo word")
+      assert(load(dut, cd, base + 4, Size.LONG) == expected(base + 4, 4), "neighbor hi long")
+      cd.waitSampling(4)
+    }
+  }
+
+  // (c3) two back-to-back stores to the same hit line both land (S0/S1 sequencing).
+  test("two sequential stores to the same line both land", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x6000L
+      preload(mem, base, 16)
+      load(dut, cd, base, Size.LONG)
+
+      doStore(dut, cd, base + 0, BigInt("AABBCCDD", 16), Size.LONG)
+      doStore(dut, cd, base + 8, BigInt("11223344", 16), Size.LONG)
+
+      assert(load(dut, cd, base + 0, Size.LONG) == BigInt("AABBCCDD", 16), "store 1 landed")
+      assert(load(dut, cd, base + 8, Size.LONG) == BigInt("11223344", 16), "store 2 landed")
+      cd.waitSampling(4)
+    }
+  }
+
   // (d) store to a missing line -> memory written, no allocate (re-load misses then refills new value)
   test("store to a missing line is write-through with no allocate", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
