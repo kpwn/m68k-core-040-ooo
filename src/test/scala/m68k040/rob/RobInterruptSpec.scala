@@ -105,24 +105,48 @@ class RobInterruptSpec extends AnyFunSuite {
     cd.waitSampling()
   }
 
+  /** Poll up to `n` cycles for interruptPending to pulse; return its sampled
+    * {level, vec, pc} on the firing cycle. interruptPending is a 1-cycle pulse (the
+    * exc-FSM goes active next cycle and re-suppresses it), so a fixed-cycle check is
+    * backend/seed-timing-flaky -- poll instead. Also asserts the head did not commit
+    * on the firing cycle. */
+  def awaitPending(dut: Dut, cd: ClockDomain, n: Int = 8): Option[(Int, Int, Long)] = {
+    var k = 0
+    while (k < n) {
+      if (dut.rob.logic.interruptPending.toBoolean) {
+        assert(!dut.csink.logic.commitValidOut(0).toBoolean, "head must NOT commit on interrupt")
+        return Some((dut.rob.logic.interruptLevel.toInt, dut.rob.logic.interruptVec.toInt,
+                     dut.rob.logic.interruptPc.toLong & 0xffffffffL))
+      }
+      cd.waitSampling(); k += 1
+    }
+    None
+  }
+
+  /** Assert interruptPending NEVER pulses across `n` cycles (masked / not-first / faulted). */
+  def assertNeverPending(dut: Dut, cd: ClockDomain, n: Int = 8): Unit = {
+    var k = 0
+    while (k < n) {
+      assert(!dut.rob.logic.interruptPending.toBoolean, "interruptPending must NOT fire")
+      cd.waitSampling(); k += 1
+    }
+  }
+
   test("ipl>mask at a first-uop head -> interruptPending, head not committed, captures") {
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       init(dut, cd)
       setMask(dut, cd, 2)
       allocOne(dut, cd, pc = 0x400)
-
       // Raise IPL=3 > mask=2, autovector.
       dut.intCtrl.logic.iplIn #= 3
       dut.intCtrl.logic.iackAvec #= true
-      cd.waitSampling(2)
-
-      assert(dut.rob.logic.interruptPending.toBoolean, "interruptPending must be high (ipl>mask)")
-      assert(dut.rob.logic.interruptLevel.toInt == 3, s"level=${dut.rob.logic.interruptLevel.toInt}")
-      assert(dut.rob.logic.interruptVec.toInt == 24 + 3, s"avec vec=${dut.rob.logic.interruptVec.toInt}")
-      assert(dut.rob.logic.interruptPc.toLong == 0x400L, f"intPc=0x${dut.rob.logic.interruptPc.toLong}%x")
-      // The head must NOT commit while interruptPending.
-      assert(!dut.csink.logic.commitValidOut(0).toBoolean, "head must NOT commit on interrupt")
+      val p = awaitPending(dut, cd)
+      assert(p.isDefined, "interruptPending must fire (ipl>mask)")
+      val (level, vec, pc) = p.get
+      assert(level == 3, s"level=$level")
+      assert(vec == 24 + 3, s"avec vec=$vec")
+      assert(pc == 0x400L, f"intPc=0x$pc%x")
     }
   }
 
@@ -134,8 +158,7 @@ class RobInterruptSpec extends AnyFunSuite {
       allocOne(dut, cd, pc = 0x400)
       dut.intCtrl.logic.iplIn #= 2  // equal -> masked
       dut.intCtrl.logic.iackAvec #= true
-      cd.waitSampling(2)
-      assert(!dut.rob.logic.interruptPending.toBoolean, "ipl==mask must be masked (NOT pending)")
+      assertNeverPending(dut, cd)
     }
   }
 
@@ -147,10 +170,11 @@ class RobInterruptSpec extends AnyFunSuite {
       allocOne(dut, cd, pc = 0x500)
       dut.intCtrl.logic.iplIn #= 7  // NMI: 7>7 is false, but NMI always recognized
       dut.intCtrl.logic.iackAvec #= true
-      cd.waitSampling(2)
-      assert(dut.rob.logic.interruptPending.toBoolean, "NMI must be recognized through mask=7")
-      assert(dut.rob.logic.interruptLevel.toInt == 7, "NMI level 7")
-      assert(dut.rob.logic.interruptVec.toInt == 24 + 7, "NMI autovector 31")
+      val p = awaitPending(dut, cd)
+      assert(p.isDefined, "NMI must be recognized through mask=7")
+      val (level, vec, _) = p.get
+      assert(level == 7, "NMI level 7")
+      assert(vec == 24 + 7, "NMI autovector 31")
     }
   }
 
@@ -163,9 +187,9 @@ class RobInterruptSpec extends AnyFunSuite {
       dut.intCtrl.logic.iplIn #= 4
       dut.intCtrl.logic.iackAvec #= false
       dut.intCtrl.logic.iackVector #= 0x45
-      cd.waitSampling(2)
-      assert(dut.rob.logic.interruptPending.toBoolean, "ipl>mask must be pending")
-      assert(dut.rob.logic.interruptVec.toInt == 0x45, s"vectored vec=${dut.rob.logic.interruptVec.toInt}")
+      val p = awaitPending(dut, cd)
+      assert(p.isDefined, "ipl>mask must be pending")
+      assert(p.get._2 == 0x45, s"vectored vec=${p.get._2}")
     }
   }
 
@@ -177,9 +201,7 @@ class RobInterruptSpec extends AnyFunSuite {
       allocOne(dut, cd, pc = 0x700, firstOfInstr = false)
       dut.intCtrl.logic.iplIn #= 5  // > mask
       dut.intCtrl.logic.iackAvec #= true
-      cd.waitSampling(2)
-      assert(!dut.rob.logic.interruptPending.toBoolean,
-        "must NOT interrupt mid-cracked-instruction (head is not a first µop)")
+      assertNeverPending(dut, cd)
     }
   }
 
@@ -191,9 +213,7 @@ class RobInterruptSpec extends AnyFunSuite {
       allocOne(dut, cd, pc = 0x800, faulted = true, faultVector = 4)
       dut.intCtrl.logic.iplIn #= 5
       dut.intCtrl.logic.iackAvec #= true
-      cd.waitSampling(2)
-      assert(!dut.rob.logic.interruptPending.toBoolean,
-        "a faulted head takes priority over an interrupt")
+      assertNeverPending(dut, cd)
     }
   }
 }
