@@ -46,6 +46,7 @@ class RobFaultSpec extends AnyFunSuite {
     u.valid #= valid
     u.pc #= pc
     u.nextPc #= pc + 2
+    u.faultUsesNextPc #= false
     u.op #= DecOp.MOVE
     u.cluster #= Cluster.INT
     u.size #= Size.LONG

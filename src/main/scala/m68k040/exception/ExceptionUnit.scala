@@ -90,6 +90,11 @@ class ExceptionUnit(
   // ENTRY: is this an access fault (vector 2)? -> stack a format-$7 frame (30 words)
   // instead of format-$0 (4 words). Captured at trigger.
   val curIs7   = RegInit(False)
+  // ENTRY: is this a format-$2 trap (TRAPV / CHK / DIV0 on the 68040)? -> stack a
+  // 6-word format-$2 frame {SR, PC, 0x2000|vec<<2, PPC} (Musashi m68ki_stack_frame_0010
+  // for CPU_TYPE 68040). Captured at trigger. PPC = the trap instr's own PC.
+  val curIs2   = RegInit(False)
+  val curPpc   = Reg(UInt(32 bits))   // format-$2 PPC (the trap instruction's PC)
   val curFault = Reg(UInt(32 bits))   // faulting VA (EA + fault-address fields of $7)
   val curSsw   = Reg(UInt(16 bits))   // $7 special status word
 
@@ -101,6 +106,10 @@ class ExceptionUnit(
   // restores SR/PC and RESUMES at the stacked PC (= faulting instr -> re-executes),
   // discarding the rest of the frame — matching MAME's RTE case 7.
   val popIs7 = RegInit(False); popIs7.simPublic()
+  // format-$2 (top nibble 2): the 6-word trap frame (TRAPV/CHK/DIV0). RTE pops 12
+  // bytes and resumes at the stacked PC (= the next instruction; TRAPV is not
+  // restarted), discarding the format word + PPC. Matches Musashi RTE case 2.
+  val popIs2 = RegInit(False); popIs2.simPublic()
   val popFmtWord = Reg(UInt(16 bits)); popFmtWord.simPublic()
 
   // ── redirect outputs (the ROB ORs these into its registered redirect) ────────
@@ -207,11 +216,13 @@ class ExceptionUnit(
   //     [+0x14]=faultAddr hi [+0x16]=faultAddr lo [+0x18..0x3a]=0 (18 words).
   //   stStep counts WORDS (5 bits, 0..29). lastStep = 3 ($0) or 29 ($7).
   val stStep = Reg(UInt(5 bits)) init 0; stStep.simPublic()
-  val lastStep = Mux(curIs7, U(29, 5 bits), U(3, 5 bits))
+  val lastStep = Mux(curIs7, U(29, 5 bits), Mux(curIs2, U(5, 5 bits), U(3, 5 bits)))
   def frameWordAddr(step: UInt): UInt = (frameBase + (step << 1)).resized
   // Common low-4-word prefix: SR, PC hi, PC lo, format/vector word. The format/vector
-  // word is curVec<<2 for $0 and 0x7000|(curVec<<2) for $7.
-  val fmtVecWord = Mux(curIs7, (U(0x7000, 16 bits) | (curVec << 2).resize(16)), (curVec << 2).resize(16))
+  // word is curVec<<2 for $0, 0x2000|(curVec<<2) for $2, 0x7000|(curVec<<2) for $7.
+  val fmtVecWord = Mux(curIs7, (U(0x7000, 16 bits) | (curVec << 2).resize(16)),
+                   Mux(curIs2, (U(0x2000, 16 bits) | (curVec << 2).resize(16)),
+                               (curVec << 2).resize(16)))
   def frameWordData(step: UInt): Bits = {
     val out = Bits(16 bits)
     out := B(0, 16 bits)
@@ -220,9 +231,11 @@ class ExceptionUnit(
       is(U(1, 5 bits)) { out := curPc(31 downto 16).asBits }
       is(U(2, 5 bits)) { out := curPc(15 downto 0).asBits }
       is(U(3, 5 bits)) { out := fmtVecWord.asBits }
-      // $7-only words (steps 4..29). For $0 these steps never execute.
-      is(U(4, 5 bits))  { out := curFault(31 downto 16).asBits }   // EA hi
-      is(U(5, 5 bits))  { out := curFault(15 downto 0).asBits }    // EA lo
+      // format-$2 words (steps 4..5): PPC (the trap instruction's own PC). For $7
+      // these same step indices carry the EA (overridden just below).
+      is(U(4, 5 bits))  { out := Mux(curIs2, curPpc(31 downto 16), curFault(31 downto 16)).asBits }
+      is(U(5, 5 bits))  { out := Mux(curIs2, curPpc(15 downto 0),  curFault(15 downto 0)).asBits }
+      // $7-only words (steps 6..29). For $0/$2 these steps never execute.
       is(U(6, 5 bits))  { out := curSsw.asBits }                   // SSW
       is(U(10, 5 bits)) { out := curFault(31 downto 16).asBits }   // fault addr hi
       is(U(11, 5 bits)) { out := curFault(15 downto 0).asBits }    // fault addr lo
@@ -252,9 +265,16 @@ class ExceptionUnit(
     IDLE.whenIsActive {
       when(entryTrigger) {
         val is7 = entryVector === 2   // access fault -> format-$7
+        // TRAPV (vector 7) is a group-2 trap -> format-$2 on the 68040 (Musashi
+        // m68ki_stack_frame_0010). The 6-word frame stacks {SR, PC(=nextPc),
+        // 0x2000|vec<<2, PPC}. PPC = the trap instruction's own PC = entryPc-2
+        // (TRAPV is a single 2-byte opword, and entryPc = nextPc = pc+2).
+        val is2 = entryVector === 7
         curVec    := entryVector
         curPc     := entryPc
         curIs7    := is7
+        curIs2    := is2
+        curPpc    := (entryPc - 2).resized
         curFault  := entryFaultAddr
         // SSW = (in_mmu 0x400) | fc | (rw<<8); fc = data space (bit0=1) + supervisor
         // (bit2) if a supervisor access; rw = read?1:write?0 (MAME m68ki_aerr).
@@ -273,8 +293,9 @@ class ExceptionUnit(
         val rwB = Mux(entryFaultInstr, U(1, 1 bits), Mux(entryFaultWr, U(0, 1 bits), U(1, 1 bits)))
         curSsw    := (U(0x400, 16 bits) | fc.resize(16) | (rwB ## U(0, 8 bits)).asUInt.resize(16))
         oldSr     := (ss.srSys ## committedCcr.resize(8 bits)).asUInt
-        // new SSP = current A7 (SSP, since committed S) - frame size (8 for $0, 60 for $7)
-        val nb = Mux(is7, ss.ssp - 60, ss.ssp - 8)
+        // new SSP = current A7 (SSP, since committed S) - frame size
+        //   format-$0 = 8 bytes, format-$2 = 12 bytes, format-$7 = 60 bytes.
+        val nb = Mux(is7, ss.ssp - 60, Mux(is2, ss.ssp - 12, ss.ssp - 8))
         frameBase := nb
         // compute vector fetch base = VBR + vec*4
         vecTarget := (ss.vbr + (entryVector << 2)).resized
@@ -382,9 +403,11 @@ class ExceptionUnit(
     R_FMTWAIT.whenIsActive {
       dtoVld := True; dtoVpn := (frameBase + 6)(31 downto 12)
       when(dcLoadRsp.valid) {
-        // top nibble 7 => format-$7 access-fault frame.
+        // top nibble selects the pop size: 7 => format-$7 (60 bytes), 2 => format-$2
+        // (12 bytes), else format-$0 (8 bytes).
         popFmtWord := dcLoadRsp.payload.data(15 downto 0).asUInt
         popIs7 := dcLoadRsp.payload.data(15 downto 12).asUInt === U(7, 4 bits)
+        popIs2 := dcLoadRsp.payload.data(15 downto 12).asUInt === U(2, 4 bits)
         goto(R_REDIR)
       }
     }
@@ -395,7 +418,7 @@ class ExceptionUnit(
       // supervisor); after restoring SR the bank may switch to USP, so write SSP
       // explicitly. For $7 the popPc is the faulting instruction's PC -> RTE resumes
       // by RE-EXECUTING it (the handler has fixed the mapping), matching MAME.
-      val newSsp = frameBase + Mux(popIs7, U(60, 32 bits), U(8, 32 bits))
+      val newSsp = frameBase + Mux(popIs7, U(60, 32 bits), Mux(popIs2, U(12, 32 bits), U(8, 32 bits)))
       ss.setSsp.valid   := True; ss.setSsp.payload := newSsp
       redirectValid := True
       redirectPc    := popPc

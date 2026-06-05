@@ -14,6 +14,15 @@ case class BranchCompletion() extends Bundle {
   val nextPc     = UInt(32 bits)
 }
 
+/** TRAPV fault completion: the branch EU drives this (vector 7 implied) when a
+  * TRAPV trap-check µop sees V=1 at execute. The ROB marks the entry faulted +
+  * vector 7. The stacked PC (= nextPc) is already captured per-entry at alloc
+  * (faultPcStore), so only the robId is needed here (cf. lsFaultCompletion, which
+  * must also carry the execute-computed EA). */
+case class TrapvFault() extends Bundle {
+  val robId   = UInt(6 bits)
+}
+
 /** Sim-only whitebox observation (branch writes no reg; CCR unchanged). */
 case class BrWbObs() extends Bundle {
   val valid  = Bool()
@@ -25,6 +34,9 @@ case class BrWbObs() extends Bundle {
 trait BranchEuService {
   def issue: Stream[IqContext]
   def completion: Flow[BranchCompletion]
+  /** TRAPV execute-time conditional fault (vector 7): fires when a TRAPV trap-check
+    * µop sees V=1. The ROB consumes it like lsFaultCompletion. */
+  def trapvFault: Flow[TrapvFault]
 }
 
 /** Latency-1 branch EU. S0 reads NZVC; S1 evaluates the 68k condition, computes
@@ -32,13 +44,16 @@ trait BranchEuService {
 class BranchEuPlugin extends FiberPlugin with BranchEuService {
   var issuePort: Stream[IqContext] = null
   var completionPort: Flow[BranchCompletion] = null
+  var trapvFaultPort: Flow[TrapvFault] = null
   var nzRd: RegFileReadPort = null
   override def issue = issuePort
   override def completion = completionPort
+  override def trapvFault = trapvFaultPort
 
   during setup {
     issuePort = Stream(IqContext())
     completionPort = Flow(BranchCompletion())
+    trapvFaultPort = Flow(TrapvFault())
     nzRd = host[NzvcRegFileService].newRead(forceNoBypass = false)
   }
 
@@ -76,11 +91,19 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     val target = (u1.pc + 2 + u1.branchDisp.asUInt)
     val nextPc = Mux(taken, target, u1.pc + 2)
 
-    // ---- S1: completion ----
+    // ---- S1: completion (entry completes either way so it can retire) ----
+    // TRAPV is decoded with cond=F (taken=False), so it naturally yields mispredict=
+    // False and nextPc = pc+2 (= its own nextPc) with NO isTrapv term on these
+    // outputs — keeping the completion->ROB->IQ-select arc off the critical path. A
+    // V=1 TRAPV instead raises trapvFault (below); a V=0 TRAPV retires as a no-op.
     completionPort.valid              := s1Valid
     completionPort.payload.robId      := s1Ctx.robId
-    completionPort.payload.mispredict := s1Valid && taken   // no predictor: taken => mispredict
+    completionPort.payload.mispredict := s1Valid && taken   // TRAPV: taken=False -> no redirect
     completionPort.payload.nextPc     := nextPc
+
+    // ---- S1: TRAPV execute-time conditional fault (vector 7 if V=1) ----
+    trapvFaultPort.valid         := s1Valid && u1.isTrapv && v
+    trapvFaultPort.payload.robId := s1Ctx.robId
 
     // ---- S1: sim-only whitebox (branch: no reg write, CCR unchanged) ----
     val wbObs = BrWbObs()

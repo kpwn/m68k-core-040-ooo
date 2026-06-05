@@ -33,6 +33,12 @@ case class DecodedUop() extends Bundle {
   // NUMBER (4 = illegal instruction, 8 = privilege violation). Default: no fault.
   val faulted      = Bool()
   val faultVector  = UInt(8 bits)
+  // Which PC the exception frame stacks for this fault. Most faults (illegal,
+  // privilege, I-fetch) stack the FAULTING instruction's PC (= `pc`, the default).
+  // TRAP/TRAPV stack the PC of the NEXT instruction (not restartable): the assembler
+  // sets this flag and the ROB stacks `nextPc` instead of `pc` (a 1-bit select keeps
+  // the rename/dispatch pipeline narrow — no extra 32-bit field).
+  val faultUsesNextPc = Bool()
   // Access-fault (vector 2) extras for the format-$7 frame, used for an
   // INSTRUCTION-FETCH fault (the I-cache raised DecodePacket.fault). `faultAddr` is
   // the faulting fetch PC (the EA stacked in the $7 frame); `sswInstr` set => the
@@ -42,4 +48,8 @@ case class DecodedUop() extends Bundle {
   val sswInstr     = Bool()
   // RTE (return-from-exception): a serializing exception-return µop. Default False.
   val isRte        = Bool()
+  // TRAPV (0x4E76): an execute-time CONDITIONAL trap. A branch-class trap-check µop
+  // (isBranch + readsNzvc) marked isTrapv; the branch EU reads NZVC and, if V=1,
+  // drives a trapvFault (vector 7, faultPc = nextPc). If V=0 it retires as a no-op.
+  val isTrapv      = Bool()
 }
