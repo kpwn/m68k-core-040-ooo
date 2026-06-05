@@ -130,12 +130,19 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     loadRspPort.payload.line  := s1Line
     loadRspPort.payload.fault := s1Fault
 
-    // ---- STORE write-through ----
-    // On store-accept (a Flow pulse): RMW the hit line (combinational BRAM write
-    // this cycle) and latch the merged 128-bit beat + strobe + paddr into regs.
-    // A small store FSM then drives the AXI write (aw + w, single beat) holding
-    // valid until both handshake. Single-outstanding in this slice; the LS pipe
-    // does not present a second store while one is draining.
+    // ---- STORE write-through (PIPELINED RMW: store-S0 read / store-S1 merge+write) ----
+    // FMax: the binding full-core path was exc-FSM -> (DTLB cone) -> dataMem store
+    // write-data, because the RMW (readAsync old line + 16-lane byte-merge + write)
+    // was a single combinational cycle fronted by the far-placed exc-FSM/DTLB cone
+    // (route 71.7%). Split it:
+    //   store-S0 (on storePort.valid): latch {mergeData, mergeStrb, set, per-way hit,
+    //     per-way old-line readAsync, axi line addr} into regs PHYSICALLY at the cache.
+    //   store-S1 (next cycle): byte-merge the registered old line with the registered
+    //     store bytes and drive the dataMem write port; the merge+write now starts
+    //     from flops at the dataMem (a local cone), and the long exc-FSM/DTLB route
+    //     ends at the S0 latch. Latency-agnostic lock-step makes the +1 cycle free.
+    // Single-outstanding: the producer never presents a 2nd store before this one's
+    // AXI B (storeAck) lands, so S0/S1 never overlap a second store.
     val stMergeReg = Reg(Bits(128 bits))
     val stStrbReg  = Reg(Bits(16 bits))
     val stAddrReg  = Reg(UInt(32 bits))
@@ -156,25 +163,47 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val mergeStrb = Mux(storePort.payload.useStrb,
       storePort.payload.strb,
       DcacheByteLane.storeStrb(stOff, storePort.payload.size))
-    val mrgBytes  = mergeData.subdivideIn(8 bits)
 
+    // ---- store-S0 registers (the cache-boundary flops) ----
+    val s0Valid    = RegInit(False)
+    val s0Set      = Reg(UInt(setBits bits))
+    val s0MergeReg = Reg(Bits(128 bits))   // store bytes (line-aligned)
+    val s0StrbReg  = Reg(Bits(16 bits))    // per-byte strobe
+    val s0HitReg   = Reg(Vec(Bool(), ways))
+    val s0OldLine  = Reg(Vec(Bits(128 bits), ways))  // old line per HIT way (readAsync captured)
+
+    s0Valid := False  // default; armed on a store-accept below
     when(storePort.valid) {
-      // RMW the hit way's line (only the strobed bytes). Per-way (Scala-indexed).
-      for (w <- 0 until ways) when(stHit(w)) {
-        val cur      = dataMem(w).readAsync(stSet)
-        val curBytes = cur.subdivideIn(8 bits)
-        val newBytes = Vec(Bits(8 bits), 16)
-        for (i <- 0 until 16) newBytes(i) := Mux(mergeStrb(i), mrgBytes(i), curBytes(i))
-        wrEn(w)   := True
-        wrSet(w)  := stSet
-        wrData(w) := newBytes.asBits
-      }
-      // latch for the write-through beat
+      s0Valid    := True
+      s0Set      := stSet
+      s0MergeReg := mergeData
+      s0StrbReg  := mergeStrb
+      s0HitReg   := stHit
+      // capture the (dist-RAM async) old line per way into the boundary flop; the
+      // merge in S1 then starts from this register rather than a long route.
+      for (w <- 0 until ways) s0OldLine(w) := dataMem(w).readAsync(stSet)
+      // latch the write-through beat payload (AXI aw/w fire next cycle, in lock with S1)
       stMergeReg := mergeData
       stStrbReg  := mergeStrb
       stAddrReg  := (storePort.payload.paddr(31 downto offBits) ## U(0, offBits bits)).asUInt
       stAwDone   := False
       stWDone    := False
+    }
+
+    // ---- store-S1: merge the registered old line + store bytes, write dataMem ----
+    // Placed BEFORE the LOAD FSM so a same-cycle refill write (in REFILL) overrides
+    // this store write (refill has priority). Single-outstanding guarantees they
+    // never actually collide; this preserves the original last-assignment ordering.
+    val s1MrgBytes = s0MergeReg.subdivideIn(8 bits)
+    when(s0Valid) {
+      for (w <- 0 until ways) when(s0HitReg(w)) {
+        val curBytes = s0OldLine(w).subdivideIn(8 bits)
+        val newBytes = Vec(Bits(8 bits), 16)
+        for (i <- 0 until 16) newBytes(i) := Mux(s0StrbReg(i), s1MrgBytes(i), curBytes(i))
+        wrEn(w)   := True
+        wrSet(w)  := s0Set
+        wrData(w) := newBytes.asBits
+      }
     }
 
     // AXI write-through driver (single 128-bit beat).
