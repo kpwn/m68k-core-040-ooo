@@ -25,6 +25,7 @@ object Musashi {
       irqEvents: Seq[(Long, Int)] = Seq.empty,
       interruptAckVector: Option[Int] = None,
       interruptAckSpurious: Boolean = false,
+      initialSr: Option[Int] = None,
       mmu: Option[MmuConfig] = None,
       maxCycles: Int = 50000): Either[OracleError, OracleState] = {
     require(irqLevel >= 0 && irqLevel <= 7, "IRQ level must be 0 through 7")
@@ -55,6 +56,7 @@ object Musashi {
             irqEvents.flatMap { case (pc, level) => Seq("--irq-event", f"0x${pc & 0xffffffffL}%08x:$level") } ++
             interruptAckVector.toSeq.flatMap(vector => Seq("--ack-vector", vector.toString)) ++
             (if (interruptAckSpurious) Seq("--ack-spurious") else Seq.empty) ++
+            initialSr.toSeq.flatMap(sr => Seq("--initial-sr", f"0x${sr & 0xffff}%04x")) ++
             mmuArgs(mmu)
         runCmd(cmd, out)
       } finally {
@@ -88,8 +90,13 @@ object Musashi {
       loadAddress: Long = ProgramAssembler.DefaultLoadAddress,
       initialSp: Long = 0x00100000L,
       stopPc: Option[Long] = None,
+      irqEvents: Seq[(Long, Int)] = Seq.empty,
+      interruptAckVector: Option[Int] = None,
+      initialSr: Option[Int] = None,
       mmu: Option[MmuConfig] = None,
       maxCycles: Int = 50000): Either[OracleError, Vector[OracleStep]] = {
+    require(irqEvents.forall { case (_, level) => level >= 0 && level <= 7 }, "IRQ event levels must be 0 through 7")
+    require(interruptAckVector.forall(vector => vector >= 2 && vector <= 255), "Interrupt acknowledge vector must be 2 through 255")
     if (!Files.exists(runnerPath)) {
       return Left(OracleError(s"musashi_run not found at $runnerPath; build it with `make musashi`"))
     }
@@ -109,6 +116,9 @@ object Musashi {
             "--sentinel", f"0x${Sentinel & 0xffffffffL}%08x",
             "--max-cycles", maxCycles.toString) ++
             stopPc.toSeq.flatMap(pc => Seq("--stop-pc", f"0x${pc & 0xffffffffL}%08x")) ++
+            irqEvents.flatMap { case (pc, level) => Seq("--irq-event", f"0x${pc & 0xffffffffL}%08x:$level") } ++
+            interruptAckVector.toSeq.flatMap(vector => Seq("--ack-vector", vector.toString)) ++
+            initialSr.toSeq.flatMap(sr => Seq("--initial-sr", f"0x${sr & 0xffff}%04x")) ++
             mmuArgs(mmu)
         runTraceCmd(cmd, trace)
       } finally {

@@ -134,6 +134,14 @@ class ExceptionUnit(
   val obsPc      = UInt(32 bits); obsPc := U(0, 32 bits)
   val obsSysByte = UInt(8 bits);  obsSysByte := U(0, 8 bits)   // post-event SR system byte
   val obsA7      = UInt(32 bits); obsA7 := U(0, 32 bits)
+  // True when this obs is an INTERRUPT entry (vs a fault/trap entry or RTE). The
+  // lock-step harness drops the separate interrupt-entry record because Musashi's
+  // trace BUNDLES the interrupt entry with the first handler instruction in one
+  // step (an async interrupt consumes no user instruction); a synchronous
+  // fault/trap entry is its own oracle step (the faulting instruction consumed it),
+  // so its obs is kept. The post-entry state is still verified by the first handler
+  // instruction's commit (it carries the mask-raised SR + decremented A7).
+  val obsIsInterrupt = Bool();    obsIsInterrupt := False
 
   // ── Architectural A7 (int reg 15) write-back. The committed A7 lives in BOTH the
   // SystemState bank (ss.ssp/usp) AND the int register file (arch reg 15) the
@@ -388,6 +396,7 @@ class ExceptionUnit(
       obsPc      := vecTarget
       obsSysByte := newSys
       obsA7      := frameBase
+      obsIsInterrupt := curIsInt
       goto(IDLE)
     }
 

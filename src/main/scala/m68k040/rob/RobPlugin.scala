@@ -508,15 +508,19 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     case class CommitObs() extends Bundle {
       val fire = Bool(); val robId = UInt(robIdW bits); val pc = UInt(32 bits)
       val sysByte = UInt(8 bits); val a7 = UInt(32 bits)
+      // True for an INTERRUPT-entry obs (channel 2 only). The lock-step harness drops
+      // it (Musashi bundles the interrupt entry with the first handler instruction).
+      val isInterrupt = Bool()
     }
     val commitObs = Vec(CommitObs(), 3); commitObs.simPublic()
     commitObs(0).fire := RegNext(retire0) init False; commitObs(0).robId := RegNext(h0); commitObs(0).pc := RegNext(commitPc0)
-    commitObs(0).sysByte := RegNext(exc.ss.srSys); commitObs(0).a7 := RegNext(exc.ss.a7)
+    commitObs(0).sysByte := RegNext(exc.ss.srSys); commitObs(0).a7 := RegNext(exc.ss.a7); commitObs(0).isInterrupt := False
     commitObs(1).fire := RegNext(retire1) init False; commitObs(1).robId := RegNext(h1); commitObs(1).pc := RegNext(commitPc1)
-    commitObs(1).sysByte := RegNext(exc.ss.srSys); commitObs(1).a7 := RegNext(exc.ss.a7)
+    commitObs(1).sysByte := RegNext(exc.ss.srSys); commitObs(1).a7 := RegNext(exc.ss.a7); commitObs(1).isInterrupt := False
     // Exception / RTE commit (handler-entry or restored PC + post-event sysByte/A7).
     commitObs(2).fire := RegNext(exc.obsFire) init False; commitObs(2).robId := RegNext(h0)
     commitObs(2).pc := RegNext(exc.obsPc); commitObs(2).sysByte := RegNext(exc.obsSysByte); commitObs(2).a7 := RegNext(exc.obsA7)
+    commitObs(2).isInterrupt := RegNext(exc.obsIsInterrupt) init False
   }
 
   override def trace     = logic.traceVec

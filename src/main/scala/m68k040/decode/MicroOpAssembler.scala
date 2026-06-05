@@ -85,7 +85,10 @@ object MicroOpAssembler {
     opUop.sswInstr      := False
     opUop.isRte         := False
     opUop.isTrapv       := False
-    opUop.firstOfInstr  := True   // overridden False for the trailing op of a 2-µop crack
+    // The op µop is the FIRST µop of its instruction EXCEPT when it is the trailing
+    // op of a 2-µop memSimple-source crack ([load, op]) — i.e. when crackLoad. (For
+    // every other path opUop is uops(0), the macro-instruction boundary.)
+    opUop.firstOfInstr  := !crackLoad
 
     // --- srcA slot ---
     switch(spec.srcA.kind) {
@@ -337,7 +340,6 @@ object MicroOpAssembler {
       out.count   := 2
       out.uops(0) := ldUop
       out.uops(1) := opUop
-      out.uops(1).firstOfInstr := False   // the trailing op is NOT a macro-instr boundary
     } otherwise {
       out.count   := 1
       out.uops(0) := opUop

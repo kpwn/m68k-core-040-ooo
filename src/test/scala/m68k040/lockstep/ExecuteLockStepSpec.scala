@@ -461,6 +461,229 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
   }
 
+  /** Lock-step an interrupt program vs Musashi (simple protocol).
+    *
+    * `irqEvents` = (eventPc, level): the IRQ is recognized at the instruction
+    * boundary AT eventPc (that instruction is preempted and re-executes after RTE),
+    * EXACTLY as the oracle's trace loop applies it. The DUT raises `iplIn`=level
+    * once it has committed the predecessor of eventPc (commitObs.pc == eventPc),
+    * matching the oracle's set_irq at PC==eventPc; it drops iplIn on the exception
+    * entry commit (one-shot edge), so a level-triggered re-fire after RTE does not
+    * loop. `avec`=true => autovector (vec = 24+level), else vectored (`vectorIn`).
+    * `initialSr` overrides the boot SR (lower the I-mask so a non-NMI level is taken;
+    * both DUT committed srSys and the oracle reset SR are set to it). */
+  def runIrqLockStep(name: String, src: String, nInstr: Int,
+                     irqEvents: Seq[(Long, Int)], avec: Boolean = true,
+                     vectorIn: Int = 0, initialSr: Int = 0x2700): Unit = {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val ackVector = if (avec) None else Some(vectorIn)
+
+    val oracleSteps: Vector[OracleStep] =
+      Musashi.assembleAndTrace(src, irqEvents = irqEvents, interruptAckVector = ackVector,
+                               initialSr = Some(initialSr)) match {
+        case Right(v)  => v
+        case Left(err) => fail(s"[$name] Musashi.assembleAndTrace failed: ${err.reason}")
+      }
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[$name] ProgramAssembler.assemble failed: ${err.reason}")
+    }
+    assert(oracleSteps.size >= nInstr,
+      s"[$name] oracle produced ${oracleSteps.size} steps, expected >= $nInstr")
+    val oracle = oracleSteps.take(nInstr)
+    val eventPcs = irqEvents.map(_._1 & 0xffffffffL).toSet
+    val levelByPc = irqEvents.map { case (pc, l) => (pc & 0xffffffffL) -> l }.toMap
+
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      val handle = new WhiteboxCapture.Handle
+      var wbCount = 0; var commitCount = 0
+      // Pending IRQ to assert + a one-shot guard so we drive a single edge per event.
+      val firedEvents = scala.collection.mutable.Set[Long]()
+
+      def captureWb(w: m68k040.execute.WbObs): Unit = {
+        if (w.valid.toBoolean) {
+          wbCount += 1
+          handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
+            dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
+            intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt,
+            nzvcWrite = w.nzvcWrite.toBoolean, x = if (w.x.toBoolean) 1 else 0,
+            xWrite = w.xWrite.toBoolean))
+        }
+      }
+
+      cd.onSamplings {
+        captureWb(dut.eu0.logic.wbObs)
+        captureWb(dut.eu1.logic.wbObs)
+        captureWb(dut.lsEu.logic.wbObs);
+        {
+          val bw = dut.branchEu.logic.wbObs
+          if (bw.valid.toBoolean) {
+            wbCount += 1
+            handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+          }
+        }
+        for (k <- 0 until 2) {
+          val c = dut.rob.logic.commitObs(k)
+          if (c.fire.toBoolean) {
+            commitCount += 1
+            val pc = c.pc.toLong & 0xffffffffL
+            handle.onCommit(c.robId.toInt, pc, sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL)
+            // The just-committed instruction's successor is `pc`. If an IRQ event is
+            // scheduled at `pc` and not yet fired, raise iplIn so the next head
+            // (the eventPc instruction) recognizes the interrupt before committing.
+            if (eventPcs.contains(pc) && !firedEvents.contains(pc)) {
+              firedEvents += pc
+              dut.intCtrl.logic.iplIn      #= levelByPc(pc)
+              dut.intCtrl.logic.iackAvec   #= avec
+              dut.intCtrl.logic.iackVector #= vectorIn
+            }
+          }
+        }
+        {
+          val c = dut.rob.logic.commitObs(2)
+          if (c.fire.toBoolean) {
+            val isInt = c.isInterrupt.toBoolean
+            // Drop the interrupt-ENTRY record: Musashi's trace bundles the entry with
+            // the first handler instruction (an async interrupt consumes no user
+            // instruction), so the entry is verified by that first handler commit's
+            // mask-raised SR + decremented A7. A fault/trap entry and the RTE record
+            // ARE their own oracle steps -> keep them.
+            if (!isInt) {
+              commitCount += 1
+              handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL)
+            } else {
+              // Drop the IRQ line on the entry commit (one-shot edge): the interrupt
+              // is taken, the mask is raised; a re-fire after RTE must not loop.
+              dut.intCtrl.logic.iplIn #= 0
+            }
+          }
+        }
+      }
+
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      dut.ctrl.logic.mmuEnable #= false
+      dut.ctrl.logic.rootPtr   #= 0
+      dut.intCtrl.logic.iplIn #= 0
+      dut.intCtrl.logic.iackAvec #= false
+      dut.intCtrl.logic.iackVector #= 0
+
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      // Boot the committed SR to initialSr's system byte (lower the I-mask so a
+      // non-NMI level is taken; matches the oracle's --initial-sr).
+      dut.rob.logic.exc.ss.srSys #= (initialSr >> 8) & 0xff
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= true
+      dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= false
+
+      var guard = 0; val cap = 6000
+      while (handle.result.size < nInstr && guard < cap) { cd.waitSampling(); guard += 1 }
+      assert(handle.result.size >= nInstr,
+        s"[$name] only ${handle.result.size}/$nInstr instructions committed within $cap cycles")
+
+      val res = LockStep.compare(handle.result.take(nInstr), oracle)
+      assert(res.ok,
+        s"[$name] lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")} " +
+          s"(matched ${res.matched}, dut commits ${handle.result.size}, oracle steps $nInstr)")
+    }
+  }
+
+  // ── INTERRUPT lock-step (simple protocol) ────────────────────────────────────
+  // Autovector level 5 -> vector 24+5 = 29 -> table @ 0x74. The boot SR mask is
+  // lowered to 0 (initialSr 0x2000) so the level-5 IRQ is taken. The IRQ is
+  // recognized at the boundary before `moveq #1,%d1` (the preempted instruction
+  // re-executes after RTE). The handler bumps D3 and RTEs. PC/SR(incl. mask)/A7 +
+  // regs are lock-stepped vs Musashi across entry -> handler -> RTE -> resume.
+  test("lock-step IRQ: autovector -> handler -> RTE -> resume", VerilatorTest) {
+    // The IRQ-boundary instruction is a LOAD (`move.l 0x90,%d1`) of a value the
+    // program just stored (0x11223344). A load is multi-cycle, so the DUT holds it
+    // at the head long enough for the asynchronously-raised iplIn (driven the cycle
+    // its predecessor commits) to be sampled and preempt it -- and it re-executes
+    // (re-loading the same value) after RTE, matching the oracle's re-step.
+    val src =
+      "move.l #0x11223344,%d0 ; move.l %d0,0x90 ; " + // seed [0x90] = 0x11223344
+      "move.l #handler,%d0 ; move.l %d0,0x74 ; " +    // install vector 29 @ 0x74
+      "move.l 0x90,%d1 ; moveq #2,%d2 ; " +           // load @ boundary
+      "loop: bra loop ; " +
+      "handler: moveq #9,%d3 ; rte"
+    // event @ load PC = 6+4+6+4 = 0x14 in -> 0x40800014.
+    runIrqLockStep("irq-avec", src, nInstr = 10,
+      irqEvents = Seq((0x40800014L, 5)), avec = true, initialSr = 0x2000)
+  }
+
+  // Vectored: the SoC presents a vectored vector (0x46 = 70) instead of autovector;
+  // the frame's format/vector word + handler fetch use 0x46. Vector 70 table @ 0x118.
+  test("lock-step IRQ: vectored -> handler -> RTE -> resume", VerilatorTest) {
+    val src =
+      "move.l #0x11223344,%d0 ; move.l %d0,0x90 ; " +
+      "move.l #handler,%d0 ; move.l %d0,0x118 ; " +   // install vector 0x46 @ 0x118
+      "move.l 0x90,%d1 ; moveq #2,%d2 ; " +
+      "loop: bra loop ; " +
+      "handler: moveq #9,%d3 ; rte"
+    runIrqLockStep("irq-vectored", src, nInstr = 10,
+      irqEvents = Seq((0x40800014L, 5)), avec = false, vectorIn = 0x46, initialSr = 0x2000)
+  }
+
+  // Masked: ipl (3) <= the SR I-mask (boot 7) -> NOT taken. The DUT raises iplIn=3
+  // but the recognition never fires; both DUT and oracle run straight-line. (initialSr
+  // 0x2700 = mask 7; the oracle's level-3 event is likewise masked.)
+  test("lock-step IRQ: masked (ipl <= mask) NOT taken", VerilatorTest) {
+    val src =
+      "moveq #1,%d1 ; moveq #2,%d2 ; moveq #3,%d3 ; moveq #4,%d4 ; " +
+      "loop: bra loop"
+    // event @ moveq #3 PC = 0x40800004; level 3 <= mask 7 -> ignored.
+    runIrqLockStep("irq-masked", src, nInstr = 5,
+      irqEvents = Seq((0x40800004L, 3)), avec = true, initialSr = 0x2700)
+  }
+
+  // NMI: level 7 is ALWAYS taken regardless of the mask (boot 7). Vector 31 @ 0x7C.
+  test("lock-step IRQ: NMI (level 7) through mask 7", VerilatorTest) {
+    val src =
+      "move.l #0x11223344,%d0 ; move.l %d0,0x90 ; " +
+      "move.l #handler,%d0 ; move.l %d0,0x7c ; " +    // install vector 31 @ 0x7C
+      "move.l 0x90,%d1 ; moveq #2,%d2 ; " +
+      "loop: bra loop ; " +
+      "handler: moveq #9,%d3 ; rte"
+    runIrqLockStep("irq-nmi", src, nInstr = 10,
+      irqEvents = Seq((0x40800014L, 7)), avec = true, initialSr = 0x2700)
+  }
+
+  // Nested: a level-3 IRQ enters handlerA (mask raised to 3); inside handlerA a
+  // level-5 IRQ (5 > 3) preempts it -> handlerB -> RTE -> back into handlerA -> RTE
+  // -> resume. Two events: at the main load boundary (level 3) and inside handlerA
+  // (level 5). Both vectors autovector (29 @ 0x74, 24+3; and 24+5... wait levels:
+  // level 3 -> vec 27 @ 0x6C; level 5 -> vec 29 @ 0x74). Both handlers installed.
+  test("lock-step IRQ: nested (higher level preempts a running handler)", VerilatorTest) {
+    val src =
+      "move.l #0x11223344,%d0 ; move.l %d0,0x90 ; " +   // seed [0x90] (main load)
+      "move.l #0x55667788,%d0 ; move.l %d0,0x94 ; " +   // seed [0x94] (handlerA's load)
+      "move.l #handlerA,%d0 ; move.l %d0,0x6c ; " +     // vec 27 (level 3) @ 0x6C
+      "move.l #handlerB,%d0 ; move.l %d0,0x74 ; " +     // vec 29 (level 5) @ 0x74
+      "move.l 0x90,%d1 ; moveq #2,%d2 ; " +             // main boundary (level 3 IRQ) @ 0x28
+      "loop: bra loop ; " +
+      "handlerA: moveq #4,%d4 ; move.l 0x94,%d5 ; rte ; " + // load boundary @ 0x34 (level 5)
+      "handlerB: moveq #9,%d3 ; rte"
+    // main load @ 0x40800028; handlerA's `move.l 0x94,%d5` (2nd handler instr) @ 0x34
+    // -- NOT the first handler instruction (which the oracle bundles with the entry,
+    // so a PC-scheduled event there would never be observed). The level-5 IRQ at 0x34
+    // preempts handlerA (5 > the raised mask 3) -> handlerB -> RTE -> handlerA -> RTE.
+    runIrqLockStep("irq-nested", src, nInstr = 15,
+      irqEvents = Seq((0x40800028L, 3), (0x40800034L, 5)), avec = true, initialSr = 0x2000)
+  }
+
   test("lock-step: moveq sequence", VerilatorTest) {
     runLockStep("moveq",
       "moveq #1,%d0 ; moveq #2,%d1 ; moveq #-1,%d2 ; moveq #0,%d3")
