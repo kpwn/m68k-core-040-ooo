@@ -209,7 +209,31 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val headReady   = (count > 0) && completes(h0) && !flushing
     val faultRetire = headReady && faultedStore(h0) && excIdle; faultRetire.simPublic()
     val rteRetire   = headReady && isRteStore(h0)   && excIdle; rteRetire.simPublic()
-    val retire0 = headReady && !faultedStore(h0) && !isRteStore(h0)
+
+    // ── Interrupt recognition (precise, at a macro-instruction boundary) ─────────
+    // Take an interrupt BETWEEN instructions when ALL hold:
+    //   (a) iplIn > srSys[2:0] (the SR I-mask) OR iplIn == 7 (NMI always);
+    //   (b) the ROB head is the FIRST µop of an instruction (firstStore(h0)) — never
+    //       mid-cracked-instruction;
+    //   (c) the head is NOT faulted / NOT RTE (its own exception/return has priority);
+    //   (d) excIdle (the exc-FSM is not already running);
+    //   (e) a head is present (count>0) and we are not flushing.
+    // We do NOT require completes(h0): the interrupt PREEMPTS the head (it does not
+    // commit — it re-executes after RTE). The stacked PC is the head INSTRUCTION's
+    // PC (pcStore(h0)); the vector is the simple-protocol curVec computed below.
+    // `interruptPending` is FORWARD-DECLARED here (retire0 gates on it) and DRIVEN
+    // after the exc unit is built (it reads the SR I-mask from exc.ss.srSys).
+    val interruptPending = Bool(); interruptPending.simPublic()
+    val interruptLevel = UInt(3 bits); interruptLevel := iplIn; interruptLevel.simPublic()
+    // Simple-protocol vector: autovector (24+level) or the vectored input.
+    val interruptVec = UInt(8 bits)
+    interruptVec := Mux(iackAvec, (U(24, 8 bits) + iplIn).resized, iackVector)
+    interruptVec.simPublic()
+    val interruptPc = UInt(32 bits); interruptPc := pcStore(h0); interruptPc.simPublic()
+
+    // A normal retire is also blocked while an interrupt is pending (the head does
+    // not commit — like the faulted-head case).
+    val retire0 = headReady && !faultedStore(h0) && !isRteStore(h0) && !interruptPending
     // A faulted/RTE entry at h1 must NOT commit in slot1 (it is serializing — it
     // retires alone when it reaches the head).
     val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone &&
@@ -428,6 +452,16 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       entryFaultInstr= faultInstrStore(h0))
     excIdle := !exc.active
     val excActive = exc.active; excActive.simPublic()
+
+    // ── Drive interrupt recognition (needs the SR I-mask from exc.ss, built above) ─
+    // iplIn > srSys[2:0] (mask) OR iplIn==7 (NMI), at a first-µop non-faulted/non-RTE
+    // head, excIdle, head present, not flushing. (Forward-declared above so retire0
+    // can gate on it.)
+    val maskI = exc.ss.srSys(2 downto 0)
+    val iplActive = (iplIn > maskI) || (iplIn === U(7, 3 bits))
+    interruptPending := (count > 0) && !flushing && excIdle &&
+                        firstStore(h0) && !faultedStore(h0) && !isRteStore(h0) &&
+                        iplActive
     // Squash + serialize while the FSM runs (NOT on the trigger cycle, when the FSM
     // is still IDLE and the fault/RTE head must retire-trigger). On the trigger cycle
     // excActive is False, so faultRetire/rteRetire fire and the exc captures; next
