@@ -44,6 +44,8 @@ int main(int argc, char** argv) {
     unsigned int irq_level = 0;
     uint32_t irq_at_pc = 0;
     bool     use_irq_at_pc = false;
+    uint32_t initial_sr = 0;
+    bool     use_initial_sr = false;   // override the post-reset SR (e.g. lower the I-mask)
     std::vector<std::pair<uint32_t, unsigned int>> irq_events;
     int      ack_response = -1;
     int      max_cycles = 200000;
@@ -69,6 +71,7 @@ int main(int argc, char** argv) {
             use_stop_pc = true;
         }
         else if (a == "--irq-level"  && i + 1 < argc) irq_level = parse_u32(argv[++i]) & 7u;
+        else if (a == "--initial-sr" && i + 1 < argc) { initial_sr = parse_u32(argv[++i]) & 0xffffu; use_initial_sr = true; }
         else if (a == "--irq-at-pc"  && i + 1 < argc) {
             irq_at_pc = parse_u32(argv[++i]);
             use_irq_at_pc = true;
@@ -156,6 +159,7 @@ int main(int argc, char** argv) {
         // This ensures the first step_one() executes the first user instruction,
         // not the reset exception handler.
         ref.reset_direct(load_addr, initial_sp);
+        if (use_initial_sr) ref.set_reg(MusashiRef::REG_SR, initial_sr);
         if (irq_events.empty()) {
             ref.set_irq(irq_level);
         }
@@ -170,9 +174,29 @@ int main(int argc, char** argv) {
 
         ref.begin_trace(sentinel);
         int cycles_left = max_cycles;
+        size_t trace_irq_index = 0;
+        bool   irq_asserted = false;   // one-shot edge bookkeeping
 
         while (cycles_left > 0 && !ref.hit_sentinel()) {
             if (use_stop_pc && ref.get_reg(MusashiRef::REG_PC) == stop_pc) break;
+
+            // Apply PC-scheduled IRQ events (one-shot edge): when PC reaches an
+            // event's PC, raise the line to that level for the NEXT step (which
+            // takes the interrupt at this macro-instruction boundary), then drop it
+            // so a level-triggered re-fire after RTE does not loop. This models a
+            // SoC that asserts IPL for one boundary and de-asserts after IACK.
+            if (irq_asserted) {
+                // Drop the line once PC has left the event PC (the IRQ was taken /
+                // the instruction advanced) so it is a single edge.
+                ref.set_irq(0);
+                irq_asserted = false;
+            }
+            while (trace_irq_index < irq_events.size() &&
+                   ref.get_reg(MusashiRef::REG_PC) == irq_events[trace_irq_index].first) {
+                ref.set_irq(irq_events[trace_irq_index].second);
+                irq_asserted = true;
+                trace_irq_index++;
+            }
 
             int n = ref.step_one();
             if (n <= 0) n = 1;
@@ -202,6 +226,7 @@ int main(int argc, char** argv) {
     } else {
         // ── Final-state mode (original behaviour) ─────────────────────
         ref.reset(load_addr, initial_sp);
+        if (use_initial_sr) ref.set_reg(MusashiRef::REG_SR, initial_sr);
         if (irq_events.empty()) {
             ref.set_irq(irq_level);
         }

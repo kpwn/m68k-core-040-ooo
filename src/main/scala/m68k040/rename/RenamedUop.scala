@@ -31,6 +31,9 @@ case class RenamedUop() extends Bundle {
   // Instruction-fetch access-fault extras (format-$7): faultAddr = fetch PC stacked
   // as the EA; sswInstr = 1 => program-space SSW (vs data). Threaded from decode.
   val faultAddr    = UInt(32 bits); val sswInstr = Bool()
+  // Macro-instruction boundary marker (interrupts): True for the FIRST µop of an
+  // instruction (the only multi-µop case is a memSimple-source crack [load, op]).
+  val firstOfInstr = Bool()
   val dstArch = UInt(5 bits)   // architectural int dst reg 0..17 (incl T0/T1); for commit RAT + CommitTrace
   val psrcA = UInt(intW bits); val psrcAValid = Bool()
   val psrcB = UInt(intW bits); val psrcBValid = Bool()

@@ -108,6 +108,18 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     val rootPtrIn   = in UInt (32 bits)
     mmuCtrl.mmuEnable := RegNext(mmuEnableIn) init False
     mmuCtrl.rootPtr   := RegNext(rootPtrIn) init 0
+    // ── Interrupt inputs (simple protocol) from REGISTERED OOC inputs ──
+    // Mirror the mmuEnable/rootPtr pattern: drive the InterruptControlPlugin's regs
+    // from RegNext(in...) init 0 so the IPL-compare + vector-select cone is LIVE in
+    // the netlist (OOC synth can't const-fold iplIn=0 and prune the recognition
+    // logic). Idle (ipl=0) by default -> no interrupt unless the SoC raises iplIn.
+    val intCtrlPlug = host[m68k040.exception.InterruptControlPlugin]
+    val iplInPort      = in UInt (3 bits)
+    val iackAvecIn     = in Bool ()
+    val iackVectorIn   = in UInt (8 bits)
+    intCtrlPlug.logic.iplIn      := RegNext(iplInPort) init 0
+    intCtrlPlug.logic.iackAvec   := RegNext(iackAvecIn) init False
+    intCtrlPlug.logic.iackVector := RegNext(iackVectorIn) init 0
     dtlb.umAccessRobId := lsEu.xlateRobId
     dtlb.umCommitValid := rob.logic.retire0
     dtlb.umCommitId    := rob.logic.h0
@@ -184,6 +196,7 @@ object GenFullCoreSynthVerilog {
         new M68kCore(Seq[FiberPlugin](
           new ParamPlugin(p),
           new MmuControlPlugin(),
+          new m68k040.exception.InterruptControlPlugin(),
           new ItlbPlugin(),
           new DtlbPlugin(),
           new IcachePlugin(),
