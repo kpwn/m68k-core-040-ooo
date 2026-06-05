@@ -440,16 +440,27 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     committedCcr := ccrAfter1
 
     // ── Commit-side exception sequencer (entry FSM + RTE) ───────────────────────
+    // entryTrigger has TWO sources: a faulted/trap head (exceptionPending) OR an
+    // interrupt at a macro-instruction boundary (interruptPending). They are
+    // mutually exclusive (exceptionPending requires faulted(h0); interruptPending
+    // requires !faulted(h0)). For an interrupt entry the vector = the simple-protocol
+    // curVec (interruptVec), the stacked PC = the head INSTRUCTION's PC (interruptPc),
+    // entryIsInterrupt selects the SR I-mask:=level update + format-$0 (not $7/$2).
+    val excEntryTrigger = exceptionPending || interruptPending
+    val excEntryVector  = Mux(interruptPending, interruptVec, faultVecStore(h0))
+    val excEntryPc      = Mux(interruptPending, interruptPc,  faultPcStore(h0))
     val exc = new m68k040.exception.ExceptionUnit(
       ss = new m68k040.exception.SystemState,
-      entryTrigger = exceptionPending, entryVector = faultVecStore(h0), entryPc = faultPcStore(h0),
+      entryTrigger = excEntryTrigger, entryVector = excEntryVector, entryPc = excEntryPc,
       rteTrigger   = rteRetire,        rtePc        = p0.predNextPc,
       committedCcr = committedCcr,
       // Access-fault (vector 2) extras for the format-$7 frame.
       entryFaultAddr = faultAddrStore(h0),
       entryFaultWr   = faultWrStore(h0),
       entryFaultSup  = faultSupStore(h0),
-      entryFaultInstr= faultInstrStore(h0))
+      entryFaultInstr= faultInstrStore(h0),
+      entryIsInterrupt = interruptPending,
+      entryIplLevel    = interruptLevel)
     excIdle := !exc.active
     val excActive = exc.active; excActive.simPublic()
 

@@ -47,7 +47,13 @@ class ExceptionUnit(
     entryFaultSup:  Bool = False,
     // Instruction-fetch access fault: build a PROGRAM-space SSW (vs data) and force
     // the R/W bit to read. Default False => data fault (unchanged for LS faults).
-    entryFaultInstr: Bool = False) extends Area {
+    entryFaultInstr: Bool = False,
+    // INTERRUPT entry (vs fault/trap). When True the entry SR-write additionally
+    // raises the SR I-mask to `entryIplLevel` (so equal/lower interrupts are held
+    // until RTE; NMI sets 7). Fault/trap entries leave the mask unchanged (S=1 /
+    // T=0 only). Default False => the existing fault/trap behavior is unchanged.
+    entryIsInterrupt: Bool = False,
+    entryIplLevel:    UInt = U(0, 3 bits)) extends Area {
 
   // ── exposed D-cache request ports (wiring MUXes them onto the real cache) ────
   val dcLoadCmd  = Stream(DLoadCmd())
@@ -95,6 +101,10 @@ class ExceptionUnit(
   // for CPU_TYPE 68040). Captured at trigger. PPC = the trap instr's own PC.
   val curIs2   = RegInit(False)
   val curPpc   = Reg(UInt(32 bits))   // format-$2 PPC (the trap instruction's PC)
+  // ENTRY: is this an INTERRUPT entry? -> raise the SR I-mask to curLevel in the
+  // entry SR-write (fault/trap entries leave the mask unchanged). Captured at trigger.
+  val curIsInt = RegInit(False)
+  val curLevel = Reg(UInt(3 bits))    // interrupt level for the I-mask raise
   val curFault = Reg(UInt(32 bits))   // faulting VA (EA + fault-address fields of $7)
   val curSsw   = Reg(UInt(16 bits))   // $7 special status word
 
@@ -264,16 +274,21 @@ class ExceptionUnit(
 
     IDLE.whenIsActive {
       when(entryTrigger) {
-        val is7 = entryVector === 2   // access fault -> format-$7
+        // An INTERRUPT entry is always a format-$0 frame (never $7/$2), regardless
+        // of its vector value (autovector 24+level or a vectored 0..255). Fault/trap
+        // entries select $7 (access fault, vector 2) / $2 (TRAPV, vector 7) by vector.
+        val is7 = !entryIsInterrupt && (entryVector === 2)   // access fault -> format-$7
         // TRAPV (vector 7) is a group-2 trap -> format-$2 on the 68040 (Musashi
         // m68ki_stack_frame_0010). The 6-word frame stacks {SR, PC(=nextPc),
         // 0x2000|vec<<2, PPC}. PPC = the trap instruction's own PC = entryPc-2
         // (TRAPV is a single 2-byte opword, and entryPc = nextPc = pc+2).
-        val is2 = entryVector === 7
+        val is2 = !entryIsInterrupt && (entryVector === 7)
         curVec    := entryVector
         curPc     := entryPc
         curIs7    := is7
         curIs2    := is2
+        curIsInt  := entryIsInterrupt
+        curLevel  := entryIplLevel
         curPpc    := (entryPc - 2).resized
         curFault  := entryFaultAddr
         // SSW = (in_mmu 0x400) | fc | (rw<<8); fc = data space (bit0=1) + supervisor
@@ -355,7 +370,14 @@ class ExceptionUnit(
       // commit the architectural side-effects + redirect
       ss.setSsp.valid   := True; ss.setSsp.payload := frameBase
       // enter supervisor, clear trace: set S (bit5), clear T1/T0 (bits 7,6).
-      val newSys = (ss.srSys | U(0x20, 8 bits)) & U(0x3f, 8 bits)
+      // For an INTERRUPT entry ALSO raise the SR I-mask (bits 2:0) to the interrupt
+      // level so equal/lower interrupts are held until RTE (NMI sets 7); fault/trap
+      // entries leave the mask unchanged. (newSysBase clears S/T only; the mask bits
+      // 2:0 are preserved for faults, overwritten with curLevel for interrupts.)
+      val newSysBase = (ss.srSys | U(0x20, 8 bits)) & U(0x3f, 8 bits)
+      val newSys = Mux(curIsInt,
+                       (newSysBase & U(0xf8, 8 bits)) | curLevel.resize(8),
+                       newSysBase)
       ss.setSrSys.valid := True; ss.setSrSys.payload := newSys
       redirectValid := True
       redirectPc    := vecTarget
