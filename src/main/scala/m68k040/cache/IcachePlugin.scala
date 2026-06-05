@@ -168,6 +168,17 @@ class IcachePlugin extends FiberPlugin with FetchService {
         activePc      := cmdPort.payload.pc
         cmdPort.ready := !inFlight && xlate.rsp.ready
 
+        // FMax: arm the data-BRAM read whenever a fetch is PRESENT and the pipe is
+        // free — INDEPENDENT of the (deep, ITLB-`ppn`-derived) hit/fault decision. The
+        // read result is only CONSUMED when s1Valid is set (a real hit below), so a
+        // redundant read on a miss/stall/fault cycle is harmless (power only). This
+        // keeps the ITLB combinational tag-compare OUT of the data-BRAM `ENARDEN`
+        // critical path (the VIPT hit cone no longer gates the BRAM enable).
+        when(cmdPort.valid && !inFlight) {
+          dataReadAddr := idleReadAddr
+          dataReadEn   := True
+        }
+
         when(cmdPort.fire) {
           when(xlate.rsp.fault) {
             // Translation fault: emit a fault response (no data, no refill).
@@ -178,9 +189,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
             s1Lane  := idleLaneIdx
             s1Pred  := Vec.fill(4)(ChunkPredecode().getZero)
           } elsewhen(isHit) {
-            // Arm S1: launch the data BRAM read; latch control for next-cycle mux.
-            dataReadAddr := idleReadAddr
-            dataReadEn   := True
+            // Hit: the data BRAM read is already armed above; latch the S1 control.
             s1Valid := True
             s1Way   := hitWayIdx
             s1Pc    := idlePc
