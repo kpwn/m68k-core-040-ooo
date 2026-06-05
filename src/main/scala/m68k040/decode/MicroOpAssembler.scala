@@ -80,6 +80,7 @@ object MicroOpAssembler {
     opUop.unimplemented := False
     opUop.faulted       := False
     opUop.faultVector   := 0
+    opUop.faultPc       := pkt.pc   // default: faulting instr PC (TRAP/TRAPV override -> nextPc)
     opUop.faultAddr     := pkt.pc
     opUop.sswInstr      := False
     opUop.isRte         := False
@@ -171,6 +172,7 @@ object MicroOpAssembler {
     ldUop.branchDisp    := 0
     ldUop.unimplemented := False
     ldUop.faulted       := False; ldUop.faultVector := 0; ldUop.isRte := False
+    ldUop.faultPc       := pkt.pc
     ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
@@ -200,6 +202,7 @@ object MicroOpAssembler {
     stUop.branchDisp    := 0
     stUop.unimplemented := False
     stUop.faulted       := False; stUop.faultVector := 0; stUop.isRte := False
+    stUop.faultPc       := pkt.pc
     stUop.faultAddr     := pkt.pc; stUop.sswInstr := False
 
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
@@ -213,7 +216,14 @@ object MicroOpAssembler {
     // illegal instruction. It commits like a no-op op µop but carries isRte; the
     // commit-side exception FSM acts on it at retire (pops the frame, redirects).
     val isRteOp = (op === B"16'h4E73")
-    val bad = !isRteOp && (!pkt.simple || spec.illegal || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
+    // ── TRAP #n (0x4E4n) — a decode-time UNCONDITIONAL software trap. ───────────
+    // bits 15:4 == 0x4E4; n = op[3:0]. A faulted op µop (vector 32+n) delivering at
+    // retire via the format-$0 FSM. TRAP is NOT restartable: it stacks the PC of the
+    // NEXT instruction -> faultPc = nextPc. Decoded here (line 0x4 is otherwise
+    // unimplemented) so it is NOT treated illegal.
+    val isTrapOp = (op(15 downto 4) === B"12'h4E4")
+    val bad = !isRteOp && !isTrapOp &&
+              (!pkt.simple || spec.illegal || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     when(isRteOp) {
       // a single architectural op µop carrying isRte; writes nothing, has a real PC.
       opUop.op            := DecOp.ILLEGAL  // no ALU action; the FSM handles it
@@ -236,6 +246,21 @@ object MicroOpAssembler {
       // faulting head; the exception FSM stacks the frame + vectors.
       opUop.faulted     := True
       opUop.faultVector := 4
+    }
+    when(isTrapOp) {
+      // Unconditional faulted µop: vector 32+n, delivered at retire (format-$0).
+      // The op carries no ALU action / operands and writes nothing.
+      opUop.op            := DecOp.ILLEGAL   // no ALU action; the FSM delivers it
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
+      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
+      opUop.unimplemented := False
+      opUop.isRte         := False
+      opUop.faulted       := True
+      opUop.faultVector   := (U(32, 8 bits) + op(3 downto 0).asUInt).resized
+      // TRAP stacks the NEXT instruction's PC (= pc+2; nextPc), not its own.
+      opUop.faultPc       := nextPc
     }
 
     // ── INSTRUCTION-FETCH fault (the I-cache raised DecodePacket.fault) ─────────

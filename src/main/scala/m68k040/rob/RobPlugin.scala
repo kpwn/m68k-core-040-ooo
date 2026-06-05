@@ -297,7 +297,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultedStore(tail)  := allocUopVec(0).faulted
       isRteStore(tail)    := allocUopVec(0).isRte
       faultVecStore(tail) := allocUopVec(0).faultVector
-      faultPcStore(tail)  := allocUopVec(0).pc
+      faultPcStore(tail)  := allocUopVec(0).faultPc
       faultWrStore(tail)  := False; faultSupStore(tail) := False
       // Instruction-fetch fault: capture the fetch PC as the EA + the SSW-instr bit.
       faultAddrStore(tail)  := allocUopVec(0).faultAddr
@@ -311,7 +311,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultedStore(tail + 1)  := allocUopVec(1).faulted
       isRteStore(tail + 1)    := allocUopVec(1).isRte
       faultVecStore(tail + 1) := allocUopVec(1).faultVector
-      faultPcStore(tail + 1)  := allocUopVec(1).pc
+      faultPcStore(tail + 1)  := allocUopVec(1).faultPc
       faultWrStore(tail + 1)  := False; faultSupStore(tail + 1) := False
       faultAddrStore(tail + 1)  := allocUopVec(1).faultAddr
       faultInstrStore(tail + 1) := allocUopVec(1).sswInstr
