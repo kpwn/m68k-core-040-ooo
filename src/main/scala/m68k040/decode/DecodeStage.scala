@@ -1,5 +1,6 @@
 package m68k040.decode
 
+import m68k040.frontend.{DecodePacket, PipeStage}
 import m68k040.services.{DecodeFeedService, DecodeUopService}
 import spinal.core._
 import spinal.lib._
@@ -13,22 +14,63 @@ import spinal.lib.misc.plugin.FiberPlugin
   * (DecodeUopService.uops). The queue absorbs the variable-rate expansion and is
   * flushed on a mispredict (pipeFlush). The decode→rename skid that the previous
   * 1:1 passthrough provided is now the queue itself.
+  *
+  * FRONTEND-FMAX SKID: the FetchAlign→DecodeStage boundary is registered by a
+  * 1-deep `PipeStage`. This SPLITS the standing route-dominated critical arc
+  * `ibuf.count → Aligner predicated-length/branchDisp select → MicroOpQueue ring
+  * write-enable` into two shorter halves: (1) `ibuf.count → Aligner → fedStage
+  * register`, and (2) `fedStage register → MicroOpAssembler → queue ring`. The
+  * decode is LATENCY-AGNOSTIC (whitebox lock-step joins by robId, the MicroOpQueue
+  * already buffers), so the extra frontend cycle changes no architectural result.
+  * The skid is flushed by the same `pipeFlush` as the queue so a wrong-path group
+  * held in the register is squashed on a mispredict/exception redirect.
   */
 class DecodeStage extends FiberPlugin with DecodeUopService {
+
+  // Combined skid payload: the 2 DecodePackets plus the slot1-valid flag, carried
+  // together through the registered FetchAlign→DecodeStage boundary so the second
+  // slot's validity stays aligned with its packet across the pipeline register.
+  case class FedPacket() extends Bundle {
+    val packets    = Vec(DecodePacket(), 2)
+    val slot1Valid = Bool()
+  }
 
   val logic = during build new Area {
     val df = host[DecodeFeedService]
 
-    // Crack both slots into µop sequences.
-    val a0 = MicroOpAssembler.assemble(df.feed.payload(0))
-    val a1 = MicroOpAssembler.assemble(df.feed.payload(1))
-
-    val slot1Valid = df.feed.valid && df.slot1Valid
-    val n0 = a0.count                                  // 1 or 2 (slot0 always present when feed.valid)
-    val n1 = Mux(slot1Valid, a1.count, U(0, 2 bits))   // slot1's µops (0 if slot1 invalid)
-
     // ── µop expansion queue ──────────────────────────────────────────────────
     val queue = new MicroOpQueue(depth = 16)
+
+    // Flush: default-driven False (allowOverride) so a sibling wiring plugin can
+    // OVERRIDE it from RedirectService.doFlush (full core). Driving it from
+    // host[RedirectService] here would create a Fiber build-order cycle. The SAME
+    // flush squashes both the MicroOpQueue and the FetchAlign→decode skid below.
+    val pipeFlush = Bool(); pipeFlush.allowOverride; pipeFlush := False
+    queue.io.flush := pipeFlush
+
+    // ── Registered FetchAlign→DecodeStage boundary (timing skid) ────────────────
+    // Pack the feed payload + slot1Valid into one stream, register it (PipeStage),
+    // then decode the REGISTERED packets. This splits the standing route-dominated
+    // arc (ibuf.count → Aligner → MicroOpQueue ring) at this boundary. pipeFlush
+    // squashes a held wrong-path group (same broadcast that flushes the queue).
+    val fedIn = Stream(FedPacket())
+    fedIn.valid              := df.feed.valid
+    fedIn.payload.packets(0) := df.feed.payload(0)
+    fedIn.payload.packets(1) := df.feed.payload(1)
+    fedIn.payload.slot1Valid := df.slot1Valid
+    df.feed.ready := fedIn.ready
+
+    val fed = PipeStage(fedIn, pipeFlush)
+    // The queue drains the registered group; ready propagates back to the skid.
+    fed.ready := queue.io.push.ready
+
+    // Crack both slots into µop sequences (from the REGISTERED packets).
+    val a0 = MicroOpAssembler.assemble(fed.payload.packets(0))
+    val a1 = MicroOpAssembler.assemble(fed.payload.packets(1))
+
+    val slot1Valid = fed.valid && fed.payload.slot1Valid
+    val n0 = a0.count                                  // 1 or 2 (slot0 always present when fed.valid)
+    val n1 = Mux(slot1Valid, a1.count, U(0, 2 bits))   // slot1's µops (0 if slot1 invalid)
 
     // Pack slot0's then slot1's µops at compacted positions (n0 ∈ {1,2}):
     //   push(0) = a0[0]
@@ -42,16 +84,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
 
     val totalCount = (n0 +^ n1).resize(3)              // 1..4
     queue.io.push.count := totalCount
-    queue.io.push.valid := df.feed.valid
-
-    // Feed handshake: accept the burst when the queue has room.
-    df.feed.ready := queue.io.push.ready
-
-    // Flush: default-driven False (allowOverride) so a sibling wiring plugin can
-    // OVERRIDE it from RedirectService.doFlush (full core). Driving it from
-    // host[RedirectService] here would create a Fiber build-order cycle.
-    val pipeFlush = Bool(); pipeFlush.allowOverride; pipeFlush := False
-    queue.io.flush := pipeFlush
+    // Push the REGISTERED group into the queue when it has room.
+    queue.io.push.valid := fed.valid
 
     // ── Rename-facing output ───────────────────────────────────────────────────
     val uopsOut = queue.io.pop
