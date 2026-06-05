@@ -774,6 +774,50 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 10)
   }
 
+  // ── TRAP #n lock-step: decode-time unconditional trap -> handler -> RTE ──────
+  // `trap #5` raises vector 37 (32+5) via the format-$0 path. TRAP is not
+  // restartable: it stacks the PC of the NEXT instruction, so RTE resumes at the
+  // fall-through `moveq #7,%d3` WITHOUT the handler bumping the stacked PC. The
+  // handler vector lives at VBR(0)+37*4 = 0x94 (a runtime store the DUT D-cache +
+  // Musashi both see). Commit PC/SR/A7 lock-stepped vs Musashi across entry ->
+  // handler -> RTE -> resume.
+  test("lock-step: TRAP #5 -> handler -> RTE (format-$0 delivery)", VerilatorTest) {
+    runLockStep("exc-trap",
+      "move.l #handler,%d0 ; move.l %d0,0x94 ; trap #5 ; moveq #7,%d3 ; " +
+      "loop: bra loop ; " +
+      "handler: moveq #2,%d1 ; moveq #1,%d2 ; rte",
+      nInstr = 7)
+  }
+
+  // ── TRAPV lock-step: execute-time conditional trap (vector 7, format-$2) ─────
+  // V-set case: an add.l overflow sets V=1, so `trapv` traps -> vector 7 (format-$2
+  // on the 68040), vectors to the handler, which RTEs back to the fall-through. The
+  // stacked PC is the NEXT instruction's PC (TRAPV is not restartable). Commit
+  // PC/SR/A7 lock-stepped vs Musashi across the overflow, the trap, the handler,
+  // and the RTE resume.
+  test("lock-step: TRAPV with V set -> handler -> RTE (format-$2 delivery)", VerilatorTest) {
+    // The handler's last flag-writer reproduces the entry flags (N=1,V=1 from the
+    // add.l overflow) so the sim whitebox's reconstructed CCR matches Musashi's
+    // RTE-restored CCR at the RTE step. (The architectural CCR restore on RTE is a
+    // separate pre-existing concern outside the trap machinery; this mirrors the
+    // illegal-instruction test, where entry and handler-exit CCR coincide.)
+    runLockStep("exc-trapv-set",
+      "move.l #handler,%d0 ; move.l %d0,0x1c ; " +       // vector 7 @ 0x1C
+      "move.l #0x7fffffff,%d4 ; add.l %d4,%d4 ; " +      // signed overflow -> N=1,V=1
+      "trapv ; moveq #7,%d3 ; " +
+      "loop: bra loop ; " +
+      "handler: move.l #0x7fffffff,%d1 ; add.l %d1,%d1 ; rte",  // reproduce N=1,V=1
+      nInstr = 9)
+  }
+
+  // V-clear case: a moveq clears V, so `trapv` is a no-op and falls through to the
+  // next instruction. No exception is taken; the commit stream is straight-line.
+  test("lock-step: TRAPV with V clear -> falls through (no trap)", VerilatorTest) {
+    runLockStep("exc-trapv-clear",
+      "moveq #5,%d4 ; trapv ; moveq #7,%d3 ; loop: bra loop",
+      nInstr = 4)
+  }
+
   // ── MMU page-fault delivery lock-step (format-$7 -> handler -> RTE) ──────────
   // THE Task-4 gate: a data store to a NON-RESIDENT page raises a 68040 access
   // fault (vector 2, format-$7), vectors to a handler that writes a resident page

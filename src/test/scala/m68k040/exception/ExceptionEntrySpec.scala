@@ -77,7 +77,7 @@ class ExceptionEntrySpec extends AnyFunSuite {
   def pokeRu(u: RenamedUop, valid: Boolean = true, pc: Long = 0,
              faulted: Boolean = false, faultVector: Int = 0, isRte: Boolean = false): Unit = {
     u.valid #= valid
-    u.pc #= pc; u.nextPc #= pc + 2
+    u.pc #= pc; u.nextPc #= pc + 2; u.faultUsesNextPc #= false
     u.op #= DecOp.MOVE; u.cluster #= Cluster.INT; u.size #= Size.LONG
     u.useImm #= false; u.imm #= 0
     u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0

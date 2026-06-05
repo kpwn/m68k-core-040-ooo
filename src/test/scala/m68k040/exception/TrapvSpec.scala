@@ -41,9 +41,11 @@ class TrapvSpec extends AnyFunSuite {
       uop.faulted := False; uop.faultVector := 0; uop.isRte := False
       uop.faultAddr := 0; uop.sswInstr := False
       // TRAPV trap-check µop: a branch-class uop reading NZVC, marked isTrapv.
-      uop.isBranch := True; uop.cond := 0; uop.branchDisp := 0
+      // cond = F (1): matches the decoder so the branch EU yields taken=False
+      // (mispredict stays False) — TRAPV is a fault, not a redirect.
+      uop.isBranch := True; uop.cond := 1; uop.branchDisp := 0
       uop.isTrapv := True
-      uop.pc := 0x2000; uop.nextPc := iNextPc; uop.faultPc := iNextPc
+      uop.pc := 0x2000; uop.nextPc := iNextPc; uop.faultUsesNextPc := True
       uop.pNzvcSrc := iPNzvcSrc; uop.readsNzvc := True
       ctx.robId := iRobId
       eu.issue.valid := iValid; eu.issue.payload := ctx
@@ -59,7 +61,6 @@ class TrapvSpec extends AnyFunSuite {
       val cNextPc  = out UInt (32 bits); cNextPc  := eu.completion.payload.nextPc
       val tvValid  = out Bool ();        tvValid  := eu.trapvFault.valid
       val tvRob    = out UInt (6 bits);  tvRob    := eu.trapvFault.payload.robId
-      val tvPc     = out UInt (32 bits); tvPc     := eu.trapvFault.payload.faultPc
     }
   }
   class Dut extends Component {
@@ -70,8 +71,8 @@ class TrapvSpec extends AnyFunSuite {
     db.on { host.asHostOf(Seq[FiberPlugin](rfNzvc, eu, src)) }
   }
 
-  def runOne(vSet: Boolean): (Boolean, Boolean, BigInt, Boolean) = {
-    var sawComplete = false; var sawTrapv = false; var tvPc = BigInt(0); var mis = false
+  def runOne(vSet: Boolean): (Boolean, Boolean, Boolean) = {
+    var sawComplete = false; var sawTrapv = false; var mis = false
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10); val s = dut.src.logic
       s.iValid #= false; s.wValid #= false; s.wAddr #= 0; s.wData #= 0
@@ -87,23 +88,22 @@ class TrapvSpec extends AnyFunSuite {
           sawComplete = true; mis = dut.src.logic.cMis.toBoolean
         }
         if (dut.src.logic.tvValid.toBoolean && dut.src.logic.tvRob.toInt == 5) {
-          sawTrapv = true; tvPc = dut.src.logic.tvPc.toBigInt
+          sawTrapv = true
         }
         cd.waitSampling()
       }
     }
-    (sawComplete, sawTrapv, tvPc, mis)
+    (sawComplete, sawTrapv, mis)
   }
 
-  test("TRAPV with V=1 -> trapvFault fires (faultPc=nextPc), entry completes, not a mispredict", VerilatorTest) {
-    val (complete, trapv, pc, mis) = runOne(vSet = true)
+  test("TRAPV with V=1 -> trapvFault fires, entry completes, not a mispredict", VerilatorTest) {
+    val (complete, trapv, mis) = runOne(vSet = true)
     assert(complete, "TRAPV entry must complete so it can retire")
     assert(trapv, "TRAPV with V=1 must drive a trapvFault completion")
-    assert(pc == 0x3000, s"trapv faultPc must be nextPc (0x3000), got 0x${pc.toString(16)}")
     assert(!mis, "TRAPV is not a branch redirect (mispredict must be false)")
   }
   test("TRAPV with V=0 -> no trapvFault, entry completes (retires as no-op)", VerilatorTest) {
-    val (complete, trapv, _, mis) = runOne(vSet = false)
+    val (complete, trapv, mis) = runOne(vSet = false)
     assert(complete, "TRAPV entry must complete")
     assert(!trapv, "TRAPV with V=0 must NOT fault")
     assert(!mis, "TRAPV is not a branch redirect")

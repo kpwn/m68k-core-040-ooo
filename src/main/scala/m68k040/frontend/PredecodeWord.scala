@@ -88,6 +88,20 @@ object PredecodeWord {
         }
       }
 
+      // TRAP #n (0x4E4x) / TRAPV (0x4E76): single-word instructions. Predecode them
+      // as SIMPLE length-1 so the decoder computes the correct nextPc (= pc+2), which
+      // TRAP/TRAPV stack as the (not-restartable) return PC. Other line-4 opcodes
+      // (RTE/illegal/etc.) stay complex (their stacked PC is the FAULTING PC = pc, so
+      // their nextPc is unused, and RTE's commit PC comes from the popped frame).
+      is(U(4, 4 bits)) {
+        val isTrap  = op(15 downto 4) === B"12'h4E4"   // 0x4E4x
+        val isTrapv = op === B"16'h4E76"
+        when(isTrap || isTrapv) {
+          r.simple   := True
+          r.lenWords := U(1, 3 bits)
+        }
+      }
+
       // MOVEQ
       is(U(7, 4 bits)) {
         when(op(8) === False) {

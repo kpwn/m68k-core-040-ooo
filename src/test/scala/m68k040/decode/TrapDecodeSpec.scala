@@ -30,7 +30,8 @@ class TrapDecodeSpec extends AnyFunSuite {
       assert(!dut.uop.unimplemented.toBoolean, "TRAP is implemented (not illegal)")
       assert(!dut.uop.dstValid.toBoolean && !dut.uop.srcAValid.toBoolean && !dut.uop.srcBValid.toBoolean)
       assert(!dut.uop.writesNzvc.toBoolean && !dut.uop.writesX.toBoolean && !dut.uop.isRte.toBoolean)
-      assert(dut.uop.faultPc.toLong == 0x1002L, s"TRAP stacks NEXT PC (pc+2), got 0x${dut.uop.faultPc.toLong.toHexString}")
+      assert(dut.uop.faultUsesNextPc.toBoolean, "TRAP stacks the NEXT PC (faultUsesNextPc) — the ROB selects nextPc(=pc+2)")
+      assert(dut.uop.nextPc.toLong == 0x1002L, s"nextPc must be pc+2=0x1002, got 0x${dut.uop.nextPc.toLong.toHexString}")
     }
   }
   test("TRAP #0 (0x4E40) -> vector 32", VerilatorTest) {

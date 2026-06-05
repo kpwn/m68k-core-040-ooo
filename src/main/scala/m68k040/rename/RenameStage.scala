@@ -137,7 +137,7 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.unimplemented:= dec.unimplemented
       r.faulted      := dec.faulted
       r.faultVector  := dec.faultVector
-      r.faultPc      := dec.faultPc
+      r.faultUsesNextPc := dec.faultUsesNextPc
       r.faultAddr    := dec.faultAddr
       r.sswInstr     := dec.sswInstr
       r.isRte        := dec.isRte

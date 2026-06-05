@@ -56,7 +56,7 @@ class BranchEuSourcePlugin extends FiberPlugin {
     uop.pNzvcSrc     := iPNzvcSrc
     uop.readsNzvc    := True
     uop.isTrapv      := False
-    uop.faultPc      := iPc
+    uop.faultUsesNextPc := False
     uop.nextPc       := iPc + 2
     ctx.robId        := iRobId
 

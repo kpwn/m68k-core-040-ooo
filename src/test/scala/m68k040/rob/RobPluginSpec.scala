@@ -44,7 +44,7 @@ class RobPluginSpec extends AnyFunSuite {
     u.valid #= valid
     u.pc #= pc
     u.nextPc #= pc + 2   // 2-byte instruction model: commit pc = nextPc = pc + 2
-    u.faultPc #= pc
+    u.faultUsesNextPc #= false
     u.op #= DecOp.MOVE
     u.cluster #= Cluster.INT
     u.size #= Size.LONG
@@ -423,7 +423,7 @@ class RobPluginSpec extends AnyFunSuite {
         u.valid #= true
         u.pc #= 0
         u.nextPc #= 2
-        u.faultPc #= 0
+        u.faultUsesNextPc #= false
         u.op #= DecOp.MOVE
         u.cluster #= Cluster.INT
         u.size #= Size.LONG

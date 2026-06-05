@@ -16,10 +16,11 @@ case class BranchCompletion() extends Bundle {
 
 /** TRAPV fault completion: the branch EU drives this (vector 7 implied) when a
   * TRAPV trap-check µop sees V=1 at execute. The ROB marks the entry faulted +
-  * vector 7 + faultPc (mirrors lsFaultCompletion). */
+  * vector 7. The stacked PC (= nextPc) is already captured per-entry at alloc
+  * (faultPcStore), so only the robId is needed here (cf. lsFaultCompletion, which
+  * must also carry the execute-computed EA). */
 case class TrapvFault() extends Bundle {
   val robId   = UInt(6 bits)
-  val faultPc = UInt(32 bits)
 }
 
 /** Sim-only whitebox observation (branch writes no reg; CCR unchanged). */
@@ -88,23 +89,21 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
       15 -> (z || (n =/= v))       // LE
     )
     val target = (u1.pc + 2 + u1.branchDisp.asUInt)
-    val branchNextPc = Mux(taken, target, u1.pc + 2)
-    // TRAPV is NOT a branch: it never redirects, and its commit nextPc is the µop's
-    // own nextPc (= pc+2). A V=1 TRAPV faults via trapvFault (the ROB redirects to
-    // the vector); a V=0 TRAPV retires straight through.
-    val isTrapv = u1.isTrapv
-    val nextPc  = Mux(isTrapv, u1.nextPc, branchNextPc)
+    val nextPc = Mux(taken, target, u1.pc + 2)
 
     // ---- S1: completion (entry completes either way so it can retire) ----
+    // TRAPV is decoded with cond=F (taken=False), so it naturally yields mispredict=
+    // False and nextPc = pc+2 (= its own nextPc) with NO isTrapv term on these
+    // outputs — keeping the completion->ROB->IQ-select arc off the critical path. A
+    // V=1 TRAPV instead raises trapvFault (below); a V=0 TRAPV retires as a no-op.
     completionPort.valid              := s1Valid
     completionPort.payload.robId      := s1Ctx.robId
-    completionPort.payload.mispredict := s1Valid && taken && !isTrapv  // TRAPV never redirects
+    completionPort.payload.mispredict := s1Valid && taken   // TRAPV: taken=False -> no redirect
     completionPort.payload.nextPc     := nextPc
 
     // ---- S1: TRAPV execute-time conditional fault (vector 7 if V=1) ----
-    trapvFaultPort.valid         := s1Valid && isTrapv && v
+    trapvFaultPort.valid         := s1Valid && u1.isTrapv && v
     trapvFaultPort.payload.robId := s1Ctx.robId
-    trapvFaultPort.payload.faultPc := u1.faultPc
 
     // ---- S1: sim-only whitebox (branch: no reg write, CCR unchanged) ----
     val wbObs = BrWbObs()

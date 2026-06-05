@@ -22,9 +22,9 @@ case class RenamedUop() extends Bundle {
   // Precise-fault capture (exception slice 1): `faulted` + `faultVector` (4=illegal,
   // 8=privilege) threaded from decode; `isRte` marks a return-from-exception µop.
   val faulted      = Bool();  val faultVector = UInt(8 bits); val isRte = Bool()
-  // The PC stacked in the exception frame (= pc for illegal/privilege/I-fetch;
-  // = nextPc for TRAP/TRAPV which are not restartable). Threaded from decode.
-  val faultPc      = UInt(32 bits)
+  // Stack `nextPc` (not `pc`) in the exception frame — set for TRAP/TRAPV (not
+  // restartable). 1-bit; the ROB selects pc vs nextPc at alloc. Threaded from decode.
+  val faultUsesNextPc = Bool()
   // TRAPV: an execute-time conditional trap-check µop (branch-class). The branch EU
   // drives a trapvFault (vector 7) only if V=1 at execute. Threaded from decode.
   val isTrapv      = Bool()

@@ -90,7 +90,7 @@ class BackendWhiteboxSpec extends AnyFunSuite {
       pXDst: Int = 0, writesX: Boolean = false, pXOld: Int = 0
   ): Unit = {
     u.valid #= valid
-    u.pc #= pc; u.nextPc #= pc + 2; u.faultPc #= pc
+    u.pc #= pc; u.nextPc #= pc + 2; u.faultUsesNextPc #= false
     u.op #= op
     u.cluster #= Cluster.INT
     u.size #= Size.LONG

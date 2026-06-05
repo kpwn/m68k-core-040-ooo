@@ -45,6 +45,13 @@ object PredecodeRef {
           if (srcMem && dstMem) COMPLEX
           else CP(simple = true, lenWords = 1 + se.get + de.get)
         }
+      case 0x4 =>
+        // TRAP #n (0x4E4x) / TRAPV (0x4E76): single-word, predecoded simple len-1 so
+        // the decoder computes the correct nextPc (= pc+2, the trap's stacked PC).
+        // Other line-4 opcodes stay complex.
+        val isTrap  = (op & 0xfff0) == 0x4e40
+        val isTrapv = op == 0x4e76
+        if (isTrap || isTrapv) CP(simple = true, lenWords = 1) else COMPLEX
       case 0x7 =>
         if (((op >> 8) & 1) == 0) CP(simple = true, lenWords = 1) else COMPLEX
       case 0x6 =>

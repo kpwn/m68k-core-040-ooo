@@ -80,7 +80,7 @@ object MicroOpAssembler {
     opUop.unimplemented := False
     opUop.faulted       := False
     opUop.faultVector   := 0
-    opUop.faultPc       := pkt.pc   // default: faulting instr PC (TRAP/TRAPV override -> nextPc)
+    opUop.faultUsesNextPc := False  // default: stack the faulting instr PC (pc); TRAP/TRAPV -> nextPc
     opUop.faultAddr     := pkt.pc
     opUop.sswInstr      := False
     opUop.isRte         := False
@@ -173,7 +173,7 @@ object MicroOpAssembler {
     ldUop.branchDisp    := 0
     ldUop.unimplemented := False
     ldUop.faulted       := False; ldUop.faultVector := 0; ldUop.isRte := False
-    ldUop.faultPc       := pkt.pc
+    ldUop.faultUsesNextPc := False
     ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False; ldUop.isTrapv := False
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
@@ -203,7 +203,7 @@ object MicroOpAssembler {
     stUop.branchDisp    := 0
     stUop.unimplemented := False
     stUop.faulted       := False; stUop.faultVector := 0; stUop.isRte := False
-    stUop.faultPc       := pkt.pc
+    stUop.faultUsesNextPc := False
     stUop.faultAddr     := pkt.pc; stUop.sswInstr := False; stUop.isTrapv := False
 
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
@@ -265,7 +265,7 @@ object MicroOpAssembler {
       opUop.faulted       := True
       opUop.faultVector   := (U(32, 8 bits) + op(3 downto 0).asUInt).resized
       // TRAP stacks the NEXT instruction's PC (= pc+2; nextPc), not its own.
-      opUop.faultPc       := nextPc
+      opUop.faultUsesNextPc := True
     }
     when(isTrapvOp) {
       // Branch-class trap-check µop: issues to the branch EU, reads NZVC(V). The EU
@@ -282,11 +282,14 @@ object MicroOpAssembler {
       opUop.faulted       := False            // conditional: set at execute, not decode
       opUop.faultVector   := 0
       opUop.isBranch      := True             // route to the branch EU (NZVC read)
-      opUop.cond          := 0
+      // cond = F (1): branchEU `taken`=False -> mispredict stays False and the branch
+      // nextPc = pc+2 (= TRAPV's nextPc) WITHOUT any isTrapv special-case on the
+      // mispredict/nextPc outputs (keeps those off the critical completion->ROB arc).
+      opUop.cond          := 1
       opUop.branchDisp    := 0
       opUop.readsNzvc     := True
       opUop.isTrapv       := True
-      opUop.faultPc       := nextPc
+      opUop.faultUsesNextPc := True
     }
 
     // ── INSTRUCTION-FETCH fault (the I-cache raised DecodePacket.fault) ─────────

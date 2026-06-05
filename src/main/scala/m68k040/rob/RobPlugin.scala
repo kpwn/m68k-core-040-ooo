@@ -123,7 +123,6 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val trapvFaultCompletion = Flow(m68k040.execute.TrapvFault())
     trapvFaultCompletion.valid.allowOverride;         trapvFaultCompletion.valid := False
     trapvFaultCompletion.payload.robId.allowOverride; trapvFaultCompletion.payload.robId := U(0, robIdW bits)
-    trapvFaultCompletion.payload.faultPc.allowOverride; trapvFaultCompletion.payload.faultPc := U(0, 32 bits)
     trapvFaultCompletion.simPublic()
     // Per-entry committed-CCR VALUE capture (set at completion from the EU writeback
     // values via ccrCompletion). Folded into committedCcr at retire (for the stacked
@@ -307,8 +306,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     when(trapvFaultCompletion.valid) {
       faultedStore(trapvFaultCompletion.payload.robId)    := True
       faultVecStore(trapvFaultCompletion.payload.robId)   := U(7, 8 bits)   // TRAPV vector
-      faultPcStore(trapvFaultCompletion.payload.robId)    := trapvFaultCompletion.payload.faultPc
       faultInstrStore(trapvFaultCompletion.payload.robId) := False
+      // faultPcStore is already the TRAPV µop's nextPc (captured at alloc) — no write.
     }
 
     when(alloc0) {
@@ -318,7 +317,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultedStore(tail)  := allocUopVec(0).faulted
       isRteStore(tail)    := allocUopVec(0).isRte
       faultVecStore(tail) := allocUopVec(0).faultVector
-      faultPcStore(tail)  := allocUopVec(0).faultPc
+      faultPcStore(tail)  := Mux(allocUopVec(0).faultUsesNextPc, allocUopVec(0).nextPc, allocUopVec(0).pc)
       faultWrStore(tail)  := False; faultSupStore(tail) := False
       // Instruction-fetch fault: capture the fetch PC as the EA + the SSW-instr bit.
       faultAddrStore(tail)  := allocUopVec(0).faultAddr
@@ -332,7 +331,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultedStore(tail + 1)  := allocUopVec(1).faulted
       isRteStore(tail + 1)    := allocUopVec(1).isRte
       faultVecStore(tail + 1) := allocUopVec(1).faultVector
-      faultPcStore(tail + 1)  := allocUopVec(1).faultPc
+      faultPcStore(tail + 1)  := Mux(allocUopVec(1).faultUsesNextPc, allocUopVec(1).nextPc, allocUopVec(1).pc)
       faultWrStore(tail + 1)  := False; faultSupStore(tail + 1) := False
       faultAddrStore(tail + 1)  := allocUopVec(1).faultAddr
       faultInstrStore(tail + 1) := allocUopVec(1).sswInstr

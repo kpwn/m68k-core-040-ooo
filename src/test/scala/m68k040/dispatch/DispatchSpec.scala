@@ -48,7 +48,7 @@ class DispatchSpec extends AnyFunSuite {
       pdst: Int = 0, pdstValid: Boolean = true, pdstOld: Int = 0
   ): Unit = {
     u.valid #= valid
-    u.pc #= pc; u.nextPc #= pc + 2; u.faultPc #= pc
+    u.pc #= pc; u.nextPc #= pc + 2; u.faultUsesNextPc #= false
     u.op #= DecOp.MOVE
     u.cluster #= Cluster.INT
     u.size #= Size.LONG
