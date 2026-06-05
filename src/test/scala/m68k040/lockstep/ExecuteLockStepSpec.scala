@@ -170,6 +170,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
+    val intCtrl = new m68k040.exception.InterruptControlPlugin
     val itlb   = new ItlbPlugin
     val dtlb   = new DtlbPlugin
     val icache = new IcachePlugin
@@ -191,6 +192,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
       ctrl,
+      intCtrl,
       itlb,
       dtlb,
       icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu,

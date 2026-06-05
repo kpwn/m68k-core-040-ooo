@@ -85,6 +85,7 @@ object MicroOpAssembler {
     opUop.sswInstr      := False
     opUop.isRte         := False
     opUop.isTrapv       := False
+    opUop.firstOfInstr  := True   // overridden False for the trailing op of a 2-µop crack
 
     // --- srcA slot ---
     switch(spec.srcA.kind) {
@@ -175,6 +176,7 @@ object MicroOpAssembler {
     ldUop.faulted       := False; ldUop.faultVector := 0; ldUop.isRte := False
     ldUop.faultUsesNextPc := False
     ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False; ldUop.isTrapv := False
+    ldUop.firstOfInstr  := True    // the LOAD is the FIRST µop of a cracked instruction
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
     // Address = dst base An (psrcA) + dst disp(imm); data = the MOVE source register
@@ -205,6 +207,7 @@ object MicroOpAssembler {
     stUop.faulted       := False; stUop.faultVector := 0; stUop.isRte := False
     stUop.faultUsesNextPc := False
     stUop.faultAddr     := pkt.pc; stUop.sswInstr := False; stUop.isTrapv := False
+    stUop.firstOfInstr  := True    // a single STORE µop is its own first µop
 
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
     // Defer: non-simple, illegal op, a USED src EA that is neither reg/imm nor a
@@ -334,6 +337,7 @@ object MicroOpAssembler {
       out.count   := 2
       out.uops(0) := ldUop
       out.uops(1) := opUop
+      out.uops(1).firstOfInstr := False   // the trailing op is NOT a macro-instr boundary
     } otherwise {
       out.count   := 1
       out.uops(0) := opUop

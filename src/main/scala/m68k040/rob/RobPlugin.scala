@@ -33,6 +33,20 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
 
   val logic = during build new Area {
     val rc = host[RenameCommitService]
+    // External interrupt inputs (simple protocol). The recognition logic (Task 3)
+    // compares iplIn vs the SR I-mask and selects the vector; here (Task 2) we
+    // mirror them simPublic so a directed test sees the inputs reach the ROB. The
+    // service owner (InterruptControlPlugin) defaults idle (ipl=0) so existing
+    // tests are unchanged. A standalone ROB DUT with no InterruptControlPlugin
+    // gets idle defaults via the fallback below.
+    val intCtrl = host.get[m68k040.services.InterruptControlService]
+    val iplIn      = UInt(3 bits); iplIn.simPublic()
+    val iackAvec   = Bool();       iackAvec.simPublic()
+    val iackVector = UInt(8 bits); iackVector.simPublic()
+    intCtrl match {
+      case Some(c) => iplIn := c.iplIn; iackAvec := c.iackAvec; iackVector := c.iackVector
+      case None    => iplIn := 0;       iackAvec := False;      iackVector := 0
+    }
 
     val depth  = 64
     val robIdW = log2Up(depth) // = 6, wraps naturally
@@ -105,6 +119,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // fault came from the I-cache (sswInstr). Selects a program-space SSW in the $7
     // frame. RegInit(False), reset per-alloc (mirrors faultedStore).
     val faultInstrStore = Vec.fill(depth)(RegInit(False))
+    // Interrupt-recognition per-entry capture (RegInit, reset per-alloc like the
+    // fault Vecs). `firstStore` = the µop is the FIRST of a macro-instruction (an
+    // interrupt may be taken only at such a head). `pcStore` = the head
+    // INSTRUCTION's PC = the stacked PC for an interrupt (the not-yet-committed
+    // instruction, re-executed after RTE). RegInit so a never/re-allocated index
+    // reads deterministically.
+    val firstStore = Vec.fill(depth)(RegInit(False))
+    val pcStore    = Vec.fill(depth)(RegInit(U(0, 32 bits)))
     // LS access-fault completion (driven by the LS-cluster wiring, like
     // branchCompletion). Default-idle (allowOverride) so a standalone DUT elaborates.
     val lsFaultCompletion = Flow(m68k040.execute.LsFault())
@@ -322,6 +344,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // Instruction-fetch fault: capture the fetch PC as the EA + the SSW-instr bit.
       faultAddrStore(tail)  := allocUopVec(0).faultAddr
       faultInstrStore(tail) := allocUopVec(0).sswInstr
+      firstStore(tail) := allocUopVec(0).firstOfInstr
+      pcStore(tail)    := allocUopVec(0).pc
       nzvcWrStore(tail) := False; xWrStore(tail) := False
     }
     when(alloc1) {
@@ -335,6 +359,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultWrStore(tail + 1)  := False; faultSupStore(tail + 1) := False
       faultAddrStore(tail + 1)  := allocUopVec(1).faultAddr
       faultInstrStore(tail + 1) := allocUopVec(1).sswInstr
+      firstStore(tail + 1) := allocUopVec(1).firstOfInstr
+      pcStore(tail + 1)    := allocUopVec(1).pc
       nzvcWrStore(tail + 1) := False; xWrStore(tail + 1) := False
     }
     when(allocFireSig) {

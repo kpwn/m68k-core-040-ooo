@@ -52,6 +52,23 @@ trait MmuControlService {
   def rootPtr:   UInt   // 32 bits
 }
 
+/** The external interrupt inputs (simple protocol): a 3-bit IPL plus the SoC's
+  * per-level autovector/vectored selection. One owner drives the regs (synth top
+  * input / sim poke / future SoC); the ROB recognition logic reads them.
+  *
+  *  - `iplIn`      : interrupt priority level (0 = none, 1..7 = level, 7 = NMI).
+  *  - `iackAvec`   : True => autovector (vector = 24 + level) for the active level.
+  *  - `iackVector` : the vectored vector (8b) used when `!iackAvec`.
+  *
+  * The vector is computed COMBINATIONALLY at interrupt entry:
+  *   curVec = iackAvec ? (24 + iplIn) : iackVector
+  * (no faithful IACK bus handshake — postponed). */
+trait InterruptControlService {
+  def iplIn:      UInt   // 3 bits
+  def iackAvec:   Bool
+  def iackVector: UInt   // 8 bits
+}
+
 /** Produced by the MMU/ITLB (identity stub this slice); consumed by the I-cache.
   * Combinational: drive `rsp` from `req` within the same cycle. */
 trait TranslationService {

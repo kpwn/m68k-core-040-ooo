@@ -52,4 +52,10 @@ case class DecodedUop() extends Bundle {
   // (isBranch + readsNzvc) marked isTrapv; the branch EU reads NZVC and, if V=1,
   // drives a trapvFault (vector 7, faultPc = nextPc). If V=0 it retires as a no-op.
   val isTrapv      = Bool()
+  // Macro-instruction boundary marker: True for the FIRST µop of an instruction.
+  // The cracker emits 1 or 2 µops/instruction; the only 2-µop case is a memSimple
+  // source crack -> [load, op] where the LOAD is first. An interrupt may be taken
+  // only when the ROB head is a first µop (never mid-cracked-instruction). Default
+  // True (every single-µop instruction is its own first µop).
+  val firstOfInstr = Bool()
 }
