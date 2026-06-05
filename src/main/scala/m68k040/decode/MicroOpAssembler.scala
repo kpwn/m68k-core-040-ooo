@@ -84,6 +84,7 @@ object MicroOpAssembler {
     opUop.faultAddr     := pkt.pc
     opUop.sswInstr      := False
     opUop.isRte         := False
+    opUop.isTrapv       := False
 
     // --- srcA slot ---
     switch(spec.srcA.kind) {
@@ -173,7 +174,7 @@ object MicroOpAssembler {
     ldUop.unimplemented := False
     ldUop.faulted       := False; ldUop.faultVector := 0; ldUop.isRte := False
     ldUop.faultPc       := pkt.pc
-    ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False
+    ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False; ldUop.isTrapv := False
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
     // Address = dst base An (psrcA) + dst disp(imm); data = the MOVE source register
@@ -203,7 +204,7 @@ object MicroOpAssembler {
     stUop.unimplemented := False
     stUop.faulted       := False; stUop.faultVector := 0; stUop.isRte := False
     stUop.faultPc       := pkt.pc
-    stUop.faultAddr     := pkt.pc; stUop.sswInstr := False
+    stUop.faultAddr     := pkt.pc; stUop.sswInstr := False; stUop.isTrapv := False
 
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
     // Defer: non-simple, illegal op, a USED src EA that is neither reg/imm nor a
@@ -222,7 +223,11 @@ object MicroOpAssembler {
     // NEXT instruction -> faultPc = nextPc. Decoded here (line 0x4 is otherwise
     // unimplemented) so it is NOT treated illegal.
     val isTrapOp = (op(15 downto 4) === B"12'h4E4")
-    val bad = !isRteOp && !isTrapOp &&
+    // ── TRAPV (0x4E76) — an EXECUTE-time CONDITIONAL trap (vector 7 if V). ──────
+    // Decoded as a branch-class trap-check µop (isBranch so it issues to the branch
+    // EU, readsNzvc so it reads V). The branch EU drives a trapvFault when V=1.
+    val isTrapvOp = (op === B"16'h4E76")
+    val bad = !isRteOp && !isTrapOp && !isTrapvOp &&
               (!pkt.simple || spec.illegal || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     when(isRteOp) {
       // a single architectural op µop carrying isRte; writes nothing, has a real PC.
@@ -260,6 +265,27 @@ object MicroOpAssembler {
       opUop.faulted       := True
       opUop.faultVector   := (U(32, 8 bits) + op(3 downto 0).asUInt).resized
       // TRAP stacks the NEXT instruction's PC (= pc+2; nextPc), not its own.
+      opUop.faultPc       := nextPc
+    }
+    when(isTrapvOp) {
+      // Branch-class trap-check µop: issues to the branch EU, reads NZVC(V). The EU
+      // drives a trapvFault (vector 7) iff V=1; otherwise it retires as a no-op. It
+      // writes no register and (like a branch) leaves CCR unchanged. TRAPV is not
+      // restartable -> faultPc = nextPc (the stacked PC when it traps).
+      opUop.op            := DecOp.ILLEGAL    // no ALU action
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
+      opUop.writesNzvc := False; opUop.writesX := False
+      opUop.unimplemented := False
+      opUop.isRte         := False
+      opUop.faulted       := False            // conditional: set at execute, not decode
+      opUop.faultVector   := 0
+      opUop.isBranch      := True             // route to the branch EU (NZVC read)
+      opUop.cond          := 0
+      opUop.branchDisp    := 0
+      opUop.readsNzvc     := True
+      opUop.isTrapv       := True
       opUop.faultPc       := nextPc
     }
 

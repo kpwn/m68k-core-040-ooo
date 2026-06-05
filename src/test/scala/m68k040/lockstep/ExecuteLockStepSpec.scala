@@ -57,6 +57,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       branchEu.issue << iq.issue(2)
       rob.logic.branchCompletion.valid   := branchEu.completion.valid
       rob.logic.branchCompletion.payload := branchEu.completion.payload
+      // TRAPV execute-time conditional fault (vector 7 if V) -> ROB.
+      rob.logic.trapvFaultCompletion.valid   := branchEu.trapvFault.valid
+      rob.logic.trapvFaultCompletion.payload := branchEu.trapvFault.payload
       rob.logic.completion(0).valid   := eu0.completion.valid
       rob.logic.completion(0).payload := eu0.completion.payload
       rob.logic.completion(1).valid   := eu1.completion.valid

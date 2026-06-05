@@ -47,4 +47,8 @@ case class DecodedUop() extends Bundle {
   val sswInstr     = Bool()
   // RTE (return-from-exception): a serializing exception-return µop. Default False.
   val isRte        = Bool()
+  // TRAPV (0x4E76): an execute-time CONDITIONAL trap. A branch-class trap-check µop
+  // (isBranch + readsNzvc) marked isTrapv; the branch EU reads NZVC and, if V=1,
+  // drives a trapvFault (vector 7, faultPc = nextPc). If V=0 it retires as a no-op.
+  val isTrapv      = Bool()
 }

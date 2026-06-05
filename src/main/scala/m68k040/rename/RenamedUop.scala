@@ -25,6 +25,9 @@ case class RenamedUop() extends Bundle {
   // The PC stacked in the exception frame (= pc for illegal/privilege/I-fetch;
   // = nextPc for TRAP/TRAPV which are not restartable). Threaded from decode.
   val faultPc      = UInt(32 bits)
+  // TRAPV: an execute-time conditional trap-check µop (branch-class). The branch EU
+  // drives a trapvFault (vector 7) only if V=1 at execute. Threaded from decode.
+  val isTrapv      = Bool()
   // Instruction-fetch access-fault extras (format-$7): faultAddr = fetch PC stacked
   // as the EA; sswInstr = 1 => program-space SSW (vs data). Threaded from decode.
   val faultAddr    = UInt(32 bits); val sswInstr = Bool()

@@ -115,6 +115,16 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     lsFaultCompletion.payload.sizeBits.allowOverride; lsFaultCompletion.payload.sizeBits := U(0, 2 bits)
     lsFaultCompletion.payload.supervisor.allowOverride; lsFaultCompletion.payload.supervisor := False
     lsFaultCompletion.simPublic()
+    // TRAPV execute-time conditional fault completion (driven by the branch EU). When
+    // a TRAPV trap-check µop sees V=1 the branch EU drives this; the ROB marks the
+    // entry FAULTED (vector 7). faultPc is already captured per-entry at alloc (the
+    // TRAPV µop's faultPc = nextPc), so this only flips faulted+vector. Default-idle
+    // (allowOverride) so a standalone DUT elaborates; the EU-wiring OVERRIDES it.
+    val trapvFaultCompletion = Flow(m68k040.execute.TrapvFault())
+    trapvFaultCompletion.valid.allowOverride;         trapvFaultCompletion.valid := False
+    trapvFaultCompletion.payload.robId.allowOverride; trapvFaultCompletion.payload.robId := U(0, robIdW bits)
+    trapvFaultCompletion.payload.faultPc.allowOverride; trapvFaultCompletion.payload.faultPc := U(0, 32 bits)
+    trapvFaultCompletion.simPublic()
     // Per-entry committed-CCR VALUE capture (set at completion from the EU writeback
     // values via ccrCompletion). Folded into committedCcr at retire (for the stacked
     // exception frame). RegInit False so an unwired entry contributes nothing.
@@ -288,6 +298,17 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // (which is only meaningful for I-fetch-fault µops). Without this the SSW
       // data/program bit was seed-flaky (the µop's unset sswInstr randomized).
       faultInstrStore(lsFaultCompletion.payload.robId) := False
+    }
+    // TRAPV conditional fault: flip the entry FAULTED + vector 7. faultPc is already
+    // the TRAPV µop's nextPc (captured at alloc into faultPcStore), so the format-$2
+    // frame stacks the right PC. The entry also completes via branchCompletion (so it
+    // can retire + trigger the exception). Placed BEFORE alloc-reset (alloc wins on a
+    // re-used index). NOT an instruction-fetch fault -> clear the SSW-instr bit.
+    when(trapvFaultCompletion.valid) {
+      faultedStore(trapvFaultCompletion.payload.robId)    := True
+      faultVecStore(trapvFaultCompletion.payload.robId)   := U(7, 8 bits)   // TRAPV vector
+      faultPcStore(trapvFaultCompletion.payload.robId)    := trapvFaultCompletion.payload.faultPc
+      faultInstrStore(trapvFaultCompletion.payload.robId) := False
     }
 
     when(alloc0) {
