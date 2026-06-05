@@ -67,6 +67,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
     // ---- miss-state latches ----
     val missPC    = Reg(UInt(32 bits))
+    val missPA    = Reg(UInt(32 bits))   // translated physical line address (refill AXI)
     val missSet   = Reg(UInt(setBits bits))
     val missTag   = Reg(UInt(tagBits bits))
     val victimWay = Reg(UInt(wayBits bits))
@@ -190,6 +191,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
             missPC    := idlePc
             missSet   := idleSet
             missTag   := idleTag
+            // PHYSICAL line base for the refill: under an enabled MMU the AXI address
+            // is the TRANSLATED PA = {ppn, VA[11:0]}, not the VA. (MMU-off identity:
+            // ppn == VA[31:12], so this equals the VA — unchanged.)
+            missPA    := (idleTag ## idlePc(11 downto 0)).asUInt
             victimWay := victim(idleSet)
             beatCnt   := U(0, 1 bits)
             arSent    := False
@@ -201,7 +206,9 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // ----- REFILL: issue AXI AR; collect 2 R beats into dataMem -----
       REFILL.whenIsActive {
         activePc := missPC
-        val lineBase = missPC & ~U(63, 32 bits)
+        // Refill from the PHYSICAL line base (missPA, the translated PA); identity
+        // when the MMU is off (missPA == missPC).
+        val lineBase = missPA & ~U(63, 32 bits)
 
         when(!arSent) {
           axi.ar.valid         := True
