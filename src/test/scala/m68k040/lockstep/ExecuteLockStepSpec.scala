@@ -1427,6 +1427,25 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #5,%d4 ; loop: bra loop", nInstr = 6)
   }
 
+  // ── MULU.L / MULS.L 32x32 -> 32 lock-step (Dl = product[31:0]; +overflow V) ──
+  // 0x4C00|ea form, ext bit10=0: Dl = (ea * Dl)[31:0]. V set iff the full 64-bit
+  // product doesn't fit 32 bits (signed: high32 != sign-ext of bit31; unsigned:
+  // high32 != 0). N=Dl[31], Z=(Dl==0), C=0.
+  test("lock-step: MULU.L/MULS.L 32x32->32 normal", VerilatorTest) {
+    runLockStep("mul-l32-normal",
+      "move.l #100000,%d0 ; moveq #7,%d1 ; mulu.l %d1,%d0 ; " +    // 700000 fits 32 (no V)
+      "move.l #-100000,%d2 ; moveq #7,%d3 ; muls.l %d3,%d2 ; " +   // -700000 signed (no V)
+      "moveq #1,%d4 ; loop: bra loop", nInstr = 7)
+  }
+
+  // .L32 overflow: a product that exceeds 32 bits -> V=1, the low 32 still written.
+  test("lock-step: MULU.L/MULS.L 32x32->32 overflow (V=1)", VerilatorTest) {
+    runLockStep("mul-l32-ovf",
+      "move.l #0x100000,%d0 ; move.l #0x100000,%d1 ; mulu.l %d1,%d0 ; " + // 2^20*2^20=2^40 -> V
+      "move.l #0x40000000,%d2 ; moveq #4,%d3 ; muls.l %d3,%d2 ; " +       // 2^30*4=2^32 signed -> V
+      "moveq #5,%d4 ; loop: bra loop", nInstr = 7)
+  }
+
   // ── MMU page-fault delivery lock-step (format-$7 -> handler -> RTE) ──────────
   // THE Task-4 gate: a data store to a NON-RESIDENT page raises a 68040 access
   // fault (vector 2, format-$7), vectors to a handler that writes a resident page

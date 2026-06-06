@@ -281,10 +281,17 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val mulLo = mulCore.io.prodLo
     val mulHi = mulCore.io.prodHi
     val mulHiLatch = Reg(Bits(32 bits))
-    // N/Z for the .W/.L32 forms come from the low 32-bit product (V handled in T4).
+    // N/Z for the .W/.L32 forms come from the low 32-bit product.
     val mulLoN = mulLo(31)
     val mulLoZ = mulLo === 0
-    val mulNzvcW = (mulLoN ## mulLoZ ## False ## False).asBits   // .W: N Z V(0) C(0)
+    // .L32 overflow: the full 64-bit product is not representable in 32 bits. Signed:
+    // high32 != the sign-extension of bit31 (i.e. != all-ones when lo<0, != 0 when
+    // lo>=0). Unsigned: high32 != 0. (.W can't overflow; .L64 V=0.)
+    val mulSext = Mux(mulLoN, B(0xFFFFFFFFL, 32 bits), B(0, 32 bits))
+    val mulOverflow = Mux(mulSigned, mulHi =/= mulSext, mulHi =/= B(0, 32 bits))
+    val mulV = (u1.size =/= Size.WORD) && !u1.div64 && mulOverflow   // .L32 only
+    // .W/.L32 writeback flags: N Z V C(0). (.L64 N/Z from the full 64-bit -> T5.)
+    val mulNzvcW = (mulLoN ## mulLoZ ## mulV ## False).asBits
 
     // ---- FSM ----
     val fsm = new StateMachine {

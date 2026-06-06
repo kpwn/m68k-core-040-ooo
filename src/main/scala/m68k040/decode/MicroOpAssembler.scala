@@ -255,6 +255,9 @@ object MicroOpAssembler {
     // DIVU.L/DIVS.L: opword 0100 1100 01 mmmrrr (op[15:6]==0x131). Decoded here (line 4
     // is otherwise illegal) from the extension word — NOT `bad`.
     val isDivLOp = (op(15 downto 6) === B"10'b0100110001")
+    // MULU.L/MULS.L: opword 0100 1100 00 mmmrrr (op[15:6]==0x130). Decoded here (line 4
+    // is otherwise illegal) from the extension word — NOT `bad`.
+    val isMulLOp = (op(15 downto 6) === B"10'b0100110000")
     // ── JMP (0x4EC0 | ea) — a computed-target branch to the EA *address* (no push). ─
     // op[15:6] == 0100111011 (0x13B). Target = EA address: psrcA = base An (or none for
     // abs/PC), imm = displacement / folded absolute / folded PC. Control EA modes only:
@@ -271,7 +274,7 @@ object MicroOpAssembler {
     // RTS (0x4E75) / RTR (0x4E77) are line-4 returns cracked below (NOT illegal).
     val isRtsBad = (op === B"16'h4E75")
     val isRtrBad = (op === B"16'h4E77")
-    val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isJmpOp && !isJsrOp &&
+    val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad &&
               (!pkt.simple || spec.illegal || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     // A JMP/JSR with a non-control EA is illegal (vector 4).
@@ -468,6 +471,98 @@ object MicroOpAssembler {
       opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
     }
 
+    // ── MULU.L / MULS.L (32x32->32 and 32x32->64) — line-4 extension-word forms ──
+    // Opword 0100 1100 00 mmmrrr (op[15:6]==0x130); EA (op[5:0]) is the 32-bit
+    // multiplier. The EXTENSION WORD words(1) carries: Dl=ext[14:12] (the low-product
+    // dst AND the multiplicand source), signed=ext[11] (MULS), size64=ext[10] (1 =>
+    // 64-bit Dh:Dl result), Dh=ext[2:0] (the high-product dst, .L64 only).
+    //   - 32x32->32 (bit10=0): product[31:0] -> Dl + V(overflow). single MUL µop.
+    //   - 32x32->64 (bit10=1): product -> Dh:Dl. crack [MUL -> Dl] + [MULHI -> Dh].
+    // MUL reads Dl (psrcA) + the multiplier EA (psrcB) — only 2 sources (no psrcC).
+    val mullDl     = ext(14 downto 12).asUInt.resize(5)
+    val mullDh     = ext(2 downto 0).asUInt.resize(5)
+    val mullSigned = ext(11)
+    val mull64     = ext(10)
+    // The MUL.L multiplier is 32-bit -> re-decode the source EA at LONG size (reuses
+    // the same EaDecoder call shape as DIV.L; the ext word is words(1), the EA's own
+    // extension words follow at words(2..)).
+    val mullSrcEa = EaDecoder.decode(op(5 downto 0), Size.LONG, Vec(pkt.words(0), pkt.words(2), pkt.words(3)))
+    val mullMulIsImm = mullSrcEa.klass === EaClass.IMM
+    val mullMulIsReg = (mullSrcEa.klass === EaClass.DATAREG) || (mullSrcEa.klass === EaClass.ADDRREG)
+    val mullMulIsMem = mullSrcEa.klass === EaClass.MEMSIMPLE
+
+    // MUL (low-product) µop. Writes Dl. Sets N/Z (+ V for the .L32 form).
+    val mullUop = DecodedUop()
+    mullUop.valid         := pkt.valid
+    mullUop.pc            := pkt.pc
+    mullUop.nextPc        := nextPc
+    mullUop.op            := DecOp.MUL
+    mullUop.cluster       := Cluster.CPLX
+    mullUop.size          := Size.LONG
+    mullUop.memOp         := MemOp.NONE
+    mullUop.srcAReg       := mullDl; mullUop.srcAValid := True              // multiplicand (Dl)
+    when(mullMulIsImm) {
+      mullUop.srcBReg := 0; mullUop.srcBValid := False
+      mullUop.useImm  := True; mullUop.imm := mullSrcEa.imm
+    } elsewhen(mullMulIsMem) {
+      mullUop.srcBReg := U(T0, 5 bits); mullUop.srcBValid := True
+      mullUop.useImm  := False; mullUop.imm := 0
+    } otherwise {
+      mullUop.srcBReg := mullSrcEa.reg; mullUop.srcBValid := True
+      mullUop.useImm  := False; mullUop.imm := 0
+    }
+    mullUop.srcCReg       := 0; mullUop.srcCValid := False                  // 2 sources only
+    mullUop.dstReg        := mullDl; mullUop.dstValid := True               // low product -> Dl
+    mullUop.readsNzvc     := False; mullUop.readsX := False
+    mullUop.writesNzvc    := True;  mullUop.writesX := False                // MUL sets N/Z (+V .L32)
+    mullUop.isBranch      := False; mullUop.ibranch := False; mullUop.stkPush := False; mullUop.anInc := 0; mullUop.ccrRestore := False; mullUop.cond := 0; mullUop.branchDisp := 0
+    mullUop.unimplemented := False
+    mullUop.faulted       := False; mullUop.faultVector := 0; mullUop.isRte := False
+    mullUop.faultUsesNextPc := False
+    mullUop.faultAddr     := pkt.pc; mullUop.sswInstr := False; mullUop.isTrapv := False
+    mullUop.divSigned     := mullSigned; mullUop.div64 := mull64; mullUop.divIsRem := False
+    mullUop.firstOfInstr  := True
+
+    // MULHI (high-product move) µop (.L64 only): CPLX, writes the EU's LATCHED high
+    // product to Dh. No real register source (the high product is an internal latch)
+    // -> implicit dependency on the immediately-preceding MUL, enforced by age-ordered
+    // single-outstanding CPLX issue. Writes Dh; sets no flags (the MUL set N/Z; V=0).
+    val mulhiUop = DecodedUop()
+    mulhiUop.valid         := pkt.valid
+    mulhiUop.pc            := pkt.pc
+    mulhiUop.nextPc        := nextPc
+    mulhiUop.op            := DecOp.MULHI
+    mulhiUop.cluster       := Cluster.CPLX
+    mulhiUop.size          := Size.LONG
+    mulhiUop.memOp         := MemOp.NONE
+    mulhiUop.srcAReg       := 0; mulhiUop.srcAValid := False
+    mulhiUop.srcBReg       := 0; mulhiUop.srcBValid := False
+    mulhiUop.srcCReg       := 0; mulhiUop.srcCValid := False
+    mulhiUop.useImm        := False; mulhiUop.imm := 0
+    mulhiUop.dstReg        := mullDh; mulhiUop.dstValid := True             // high product -> Dh
+    mulhiUop.readsNzvc     := False; mulhiUop.readsX := False
+    mulhiUop.writesNzvc    := False; mulhiUop.writesX := False
+    mulhiUop.isBranch      := False; mulhiUop.ibranch := False; mulhiUop.stkPush := False; mulhiUop.anInc := 0; mulhiUop.ccrRestore := False; mulhiUop.cond := 0; mulhiUop.branchDisp := 0
+    mulhiUop.unimplemented := False
+    mulhiUop.faulted       := False; mulhiUop.faultVector := 0; mulhiUop.isRte := False
+    mulhiUop.faultUsesNextPc := False
+    mulhiUop.faultAddr     := pkt.pc; mulhiUop.sswInstr := False; mulhiUop.isTrapv := False
+    mulhiUop.divSigned     := mullSigned; mulhiUop.div64 := mull64; mulhiUop.divIsRem := False
+    mulhiUop.firstOfInstr  := False           // trailing crack µop
+
+    // MUL.L is valid only when its multiplier EA is reg/imm (a memSimple multiplier
+    // would need a leading load crack -> defer; reg/imm cover lock-step + common cases).
+    val mulLOk = mullMulIsReg || mullMulIsImm
+    when(isMulLOp && !mulLOk) {
+      opUop.op            := DecOp.ILLEGAL
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.unimplemented := True
+      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
+      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
+      opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
+    }
+
     // ── ibrUop = an INDIRECT branch to a computed EA address (JMP / JSR target). ──
     // target = base An (psrcA) + imm; imm = displacement (or folded absolute / folded
     // PC). The EA is op[5:0] (`srcEa`, control modes). For (d16,PC) the assembler folds
@@ -651,6 +746,20 @@ object MicroOpAssembler {
         out.count   := 1
         out.uops(0) := divlUop      // quotient-only (Dr==Dq)
         out.uops(1) := divlUop
+      }
+    } elsewhen(isMulLOp) {
+      when(!mulLOk) {
+        out.count   := 1
+        out.uops(0) := opUop        // forced illegal (vector 4) above
+        out.uops(1) := opUop
+      } elsewhen(mull64) {
+        out.count   := 2
+        out.uops(0) := mullUop      // low product -> Dl
+        out.uops(1) := mulhiUop     // high product -> Dh
+      } otherwise {
+        out.count   := 1
+        out.uops(0) := mullUop      // 32x32->32 (single dest Dl)
+        out.uops(1) := mullUop
       }
     } elsewhen(isJmpOp) {
       // JMP -> a single indirect branch to the EA address (bad EA forced illegal above).
