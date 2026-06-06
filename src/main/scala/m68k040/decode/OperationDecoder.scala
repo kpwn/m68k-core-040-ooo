@@ -55,6 +55,7 @@ object OperationDecoder {
           o.srcA := dnField            // Dn (checked value)
           o.srcB := easrc              // bound (EA)
           o.dst.setNone(); o.dstWrites := False
+          o.writesNzvc := True         // CHK sets N (1 if Dn<0, 0 if Dn>=0); Z=V=C=0
         }
       }
       // ---- Bcc / BSR / BRA (0110 cccc dddddddd) ----
@@ -69,8 +70,24 @@ object OperationDecoder {
       is(0x8, 0x9, 0xB, 0xC, 0xD) {
         val opmode = opword(8 downto 6)
         val isRmw  = (opmode === 4 || opmode === 5 || opmode === 6)
+        // DIVU.W (line 0x8 opmode 3) / DIVS.W (line 0x8 opmode 7): 32-bit dividend Dn
+        // (bits 11:9) / 16-bit divisor EA -> Dn = {rem[31:16], q[15:0]}. BOTH DIVs are
+        // line 8 (the OR group); BOTH MULs are line C (the AND group) -> MULU/MULS
+        // (line 0xC opmode 3/7) stay illegal (separate slice).
+        val isDivuW = (line === 0x8) && (opmode === 3)
+        val isDivsW = (line === 0x8) && (opmode === 7)
         val isMulDiv = ((line === 0x8 || line === 0xC) && (opmode === 3 || opmode === 7))
-        when(!isRmw && !isMulDiv) {
+        when(isDivuW || isDivsW) {
+          o.illegal := False
+          o.op := DecOp.DIV
+          o.cluster := Cluster.CPLX
+          o.size := Size.WORD
+          o.srcA := dnField               // 32-bit dividend Dn
+          o.srcB := easrc                 // 16-bit divisor EA
+          o.dst := dnField; o.dstWrites := True   // result -> Dn
+          o.writesNzvc := True            // DIV sets N/Z/V (C=0)
+          o.divSigned := isDivsW
+        } .elsewhen(!isRmw && !isMulDiv) {
           o.illegal := False
           switch(line) {
             is(0x8) { o.op := DecOp.OR }

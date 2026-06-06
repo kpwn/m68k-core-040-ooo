@@ -58,6 +58,10 @@ case class OpSpec() extends Bundle {
   val writesNzvcIfDataDst = Bool()
   val isBranch = Bool();   val cond = Bits(4 bits)
   val illegal  = Bool()
+  // CPLX (DivEu) control: DIVS vs DIVU, and the 64-bit-dividend form. CHK/DIVU leave
+  // these False. (div64 / the Dr:Dq pair are set by the line-4 DIV.L decode in T6/T7.)
+  val divSigned = Bool()
+  val div64     = Bool()
 }
 object OpSpec {
   def illegalDefault(): OpSpec = {
@@ -70,6 +74,7 @@ object OpSpec {
     o.writesNzvcIfDataDst := False
     o.isBranch := False;  o.cond := 0
     o.illegal := True
+    o.divSigned := False; o.div64 := False
     o
   }
 }

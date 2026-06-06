@@ -379,7 +379,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           val c = dut.rob.logic.commitObs(2)
           if (c.fire.toBoolean) {
             commitCount += 1
-            handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL)
+            handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL, if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1)
           }
         }
       }
@@ -565,7 +565,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             // ARE their own oracle steps -> keep them.
             if (!isInt) {
               commitCount += 1
-              handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL)
+              handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL, if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1)
             } else {
               // Drop the IRQ line on the entry commit (one-shot edge): the interrupt
               // is taken, the mask is raised; a re-fire after RTE must not loop.
@@ -1118,6 +1118,68 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 4)
   }
 
+  // ── DIVU.W / DIVS.W lock-step (32/16 -> Dn = {rem16, q16}, N/Z/V) ────────────
+  // Register-divisor forms are 2-byte opwords (nextPc = pc+2), straight-line.
+  test("lock-step: DIVU.W normal + DIVS.W normal", VerilatorTest) {
+    runLockStep("div-w-normal",
+      "moveq #100,%d0 ; moveq #7,%d1 ; divu.w %d1,%d0 ; " +   // 100/7 -> q14 r2 in d0
+      "moveq #-100,%d2 ; moveq #7,%d3 ; divs.w %d3,%d2 ; " +  // -100/7 -> q-14 r-2
+      "moveq #1,%d4 ; loop: bra loop", nInstr = 7)
+  }
+
+  // DIVU.W overflow: a large dividend / small divisor yields a quotient > 16 bits ->
+  // V=1, NO result write (Dn unchanged). The committed flags + (unchanged) Dn match.
+  test("lock-step: DIVU.W overflow (V=1, no write)", VerilatorTest) {
+    runLockStep("div-w-ovf",
+      "move.l #0x10000,%d0 ; moveq #1,%d1 ; divu.w %d1,%d0 ; " + // 0x10000/1 = 0x10000 > 16b -> V
+      "moveq #5,%d2 ; loop: bra loop", nInstr = 5)
+  }
+
+  // DIVU.W divide-by-zero -> vector 5 (format-$2) -> handler -> RTE -> resume.
+  // The handler's last flag-writer reproduces the entry CCR (Z=1 from `moveq #0,%d2`)
+  // so the sim whitebox's reconstructed CCR matches the oracle's RTE-restored CCR at
+  // the RTE step (same convention as the TRAPV lock-step; the architectural CCR
+  // restore on RTE is a separate pre-existing concern outside the trap machinery).
+  test("lock-step: DIVU.W DIV0 -> handler -> RTE", VerilatorTest) {
+    runLockStep("div-w-div0",
+      "move.l #handler,%d0 ; move.l %d0,0x14 ; " +   // vector 5 (DIV0) @ 0x14
+      "moveq #100,%d1 ; moveq #0,%d2 ; divu.w %d2,%d1 ; " + // /0 -> trap; entry CCR Z=1
+      "moveq #7,%d3 ; loop: bra loop ; " +
+      "handler: moveq #0,%d4 ; rte", nInstr = 8)  // moveq #0 -> Z=1 matches entry CCR
+  }
+
+  // ── CHK lock-step (vector 6, format-$2): in-bounds no-op + both out-of-bounds ──
+  // In-bounds: CHK is a no-op, straight-line. (CHK leaves CCR per the 68k undefined-
+  // except-N rule; Musashi's CHK does modify N/Z, but the lock-step compares the
+  // committed register stream + PC/SR/A7 — for the no-trap path the registers/PC match
+  // and the next flag-writer overwrites CCR before any compare point.)
+  test("lock-step: CHK in-bounds (no trap)", VerilatorTest) {
+    runLockStep("chk-inbounds",
+      "moveq #5,%d0 ; moveq #10,%d1 ; chk.w %d1,%d0 ; " +  // 0<=5<=10 -> no trap
+      "moveq #3,%d2 ; loop: bra loop", nInstr = 5)
+  }
+
+  // Dn<0 (N=1) -> trap vector 6 -> handler -> RTE. The handler reproduces the entry
+  // CCR (the chk's predecessor `moveq #-5,%d0` sets N=1) so the RTE-restored CCR
+  // matches (same convention as the DIV0/TRAPV tests).
+  test("lock-step: CHK Dn<0 -> handler -> RTE", VerilatorTest) {
+    runLockStep("chk-neg",
+      "move.l #handler,%d0 ; move.l %d0,0x18 ; " +   // vector 6 (CHK) @ 0x18
+      "moveq #-5,%d1 ; moveq #10,%d2 ; chk.w %d2,%d1 ; " + // -5<0 -> trap (entry N=1)
+      "moveq #7,%d3 ; loop: bra loop ; " +
+      "handler: moveq #-1,%d4 ; rte", nInstr = 8)   // moveq #-1 -> N=1 matches entry
+  }
+
+  // Dn>bound (N=0) -> trap vector 6 -> handler -> RTE. Entry CCR: `moveq #20,%d1`
+  // sets N=0,Z=0 (positive nonzero); the handler reproduces it.
+  test("lock-step: CHK Dn>bound -> handler -> RTE", VerilatorTest) {
+    runLockStep("chk-over",
+      "move.l #handler,%d0 ; move.l %d0,0x18 ; " +   // vector 6 (CHK) @ 0x18
+      "moveq #20,%d1 ; moveq #10,%d2 ; chk.w %d2,%d1 ; " + // 20>10 -> trap (entry N=0)
+      "moveq #7,%d3 ; loop: bra loop ; " +
+      "handler: moveq #1,%d4 ; rte", nInstr = 8)    // moveq #1 -> N=0,Z=0 matches entry
+  }
+
   // ── MMU page-fault delivery lock-step (format-$7 -> handler -> RTE) ──────────
   // THE Task-4 gate: a data store to a NON-RESIDENT page raises a 68040 access
   // fault (vector 2, format-$7), vectors to a handler that writes a resident page
@@ -1189,7 +1251,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
       def captureExc(): Unit = {
         val c = dut.rob.logic.commitObs(2)
-        if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL)
+        if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL, if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1)
       }
       cd.onSamplings {
         captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
@@ -1312,7 +1374,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL)
       }
       val ce = dut.rob.logic.commitObs(2)
-      if (ce.fire.toBoolean) handle.onExcCommit(ce.pc.toLong & 0xffffffffL, ce.sysByte.toInt & 0xff, ce.a7.toLong & 0xffffffffL)
+      if (ce.fire.toBoolean) handle.onExcCommit(ce.pc.toLong & 0xffffffffL, ce.sysByte.toInt & 0xff, ce.a7.toLong & 0xffffffffL, if (ce.ccrFoldValid.toBoolean) ce.ccrFold.toInt & 0xf else -1)
     }
   }
 

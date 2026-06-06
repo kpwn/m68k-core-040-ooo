@@ -85,9 +85,16 @@ object MicroOpAssembler {
     opUop.sswInstr      := False
     opUop.isRte         := False
     opUop.isTrapv       := False
-    opUop.divSigned     := False
-    opUop.div64         := False
+    opUop.divSigned     := spec.divSigned
+    opUop.div64         := spec.div64
     opUop.divIsRem      := False
+    // CHK / DIV are group-2 traps (CHK vec6, DIV0 vec5) delivered execute-time via
+    // euFault -> format-$2: they stack the NEXT instruction's PC (the 040 group-2
+    // frame's PC = pc+len). The fault is conditional (set at execute), but faultPc is
+    // captured at ALLOC, so faultUsesNextPc must be set NOW for the CPLX ops.
+    when(spec.op === DecOp.CHK || spec.op === DecOp.DIV) {
+      opUop.faultUsesNextPc := True
+    }
     // The op µop is the FIRST µop of its instruction EXCEPT when it is the trailing
     // op of a 2-µop memSimple-source crack ([load, op]) — i.e. when crackLoad. (For
     // every other path opUop is uops(0), the macro-instruction boundary.)

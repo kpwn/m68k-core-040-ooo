@@ -147,6 +147,9 @@ class ExceptionUnit(
   // so its obs is kept. The post-entry state is still verified by the first handler
   // instruction's commit (it carries the mask-raised SR + decremented A7).
   val obsIsInterrupt = Bool();    obsIsInterrupt := False
+  // True when this obs is an exception/trap ENTRY (vs an RTE). The ROB uses it to
+  // apply a faulting-instruction CCR fold (CHK) only to the entry step, not RTE.
+  val obsIsEntry = Bool();        obsIsEntry := False
 
   // ── Architectural A7 (int reg 15) write-back. The committed A7 lives in BOTH the
   // SystemState bank (ss.ssp/usp) AND the int register file (arch reg 15) the
@@ -402,6 +405,7 @@ class ExceptionUnit(
       // with the post-exception SR system byte (S set, T cleared) + A7 = new SSP.
       // (CCR is unchanged by the exception -> the whitebox carries it.)
       obsFire    := True
+      obsIsEntry := True
       obsPc      := vecTarget
       obsSysByte := newSys
       obsA7      := frameBase

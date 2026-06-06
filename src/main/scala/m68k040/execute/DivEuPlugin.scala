@@ -141,55 +141,141 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val chkNeg   = chkDn < 0
     val chkOver  = chkDn > chkBound
     val chkTrap  = chkNeg || chkOver
-    // N flag per the rule (set even though we don't commit NZVC; surfaced for the
-    // sim whitebox so a directed test can observe it).
+    // N flag per the rule: N=1 if Dn<0, N=0 otherwise (incl. Dn>bound and in-bounds).
+    // Z/V/C = 0 (matches Musashi's CHK CCR for both trap and no-trap paths). CHK
+    // ALWAYS commits this NZVC (even on the trap path, so the stacked CCR's N matches).
     val chkN     = chkNeg
+    val chkNzvc  = (chkN ## False ## False ## False).asBits   // N Z(0) V(0) C(0)
 
-    // captured-completion helpers
-    def captureComplete(result: Bits, nzvc: Bits, writesNzvc: Bool): Unit = {
+    // captured-completion helpers. `writeInt` lets the caller suppress the register
+    // write (e.g. DIV overflow: V=1 but Dn unchanged) without a second overlapping
+    // assignment to compPdstValid.
+    def captureComplete(result: Bits, nzvc: Bits, writesNzvc: Bool, writeInt: Bool): Unit = {
       compValid     := True
       compRobId     := s1Ctx.robId
       compData      := result
       compPdst      := u1.pdst
-      compPdstValid := u1.pdstValid
+      compPdstValid := u1.pdstValid && writeInt
       compDstArch   := u1.dstArch
       compNzvc      := nzvc
       compNzvcWrite := writesNzvc
       compNzvcDst   := u1.pNzvcDst
       compFault     := False
     }
-    def captureFault(vec: UInt): Unit = {
+    def captureFault(vec: UInt, nzvc: Bits, writesNzvc: Bool): Unit = {
       compValid     := True
       compRobId     := s1Ctx.robId
       compData      := B(0, 32 bits)
       compPdst      := u1.pdst
       compPdstValid := False
       compDstArch   := u1.dstArch
-      compNzvc      := B(0, 4 bits)
-      compNzvcWrite := False
+      compNzvc      := nzvc
+      compNzvcWrite := writesNzvc      // CHK still sets N even when it traps (Musashi)
       compNzvcDst   := u1.pNzvcDst
       compFault     := True
       compFaultVec  := vec
     }
 
-    // ---- FSM (CHK single-cycle now; DIV iterative core added in later tasks) ----
+    // ─────────────────────────────────────────────────────────────────────────
+    // DIV integration (DIVU/DIVS): the iterative DivUnit (sign-normalize +
+    // magnitudes + fix-up + overflow). Operands are EXTENDED to the core's 64/32
+    // width here per the form/sign:
+    //   .W   : dividend = Dn (32b) s/z-ext to 64 ; divisor = EA[15:0] s/z-ext to 32.
+    //   .L32 : dividend = Dq (32b) s/z-ext to 64 ; divisor = EA (32b).
+    //   .L64 : dividend = Dr:Dq (64b)            ; divisor = EA (32b).  (T7)
+    val isDiv = u1.op === DecOp.DIV
+    val divForm = DivForm()
+    when(u1.size === Size.WORD) { divForm := DivForm.W }
+      .otherwise { divForm := Mux(u1.div64, DivForm.L64, DivForm.L32) }
+    // dividend low 32 = s1A (Dn/Dq). high 32 = s1H (Dr, only for .L64). For non-.L64
+    // the high half is the sign/zero extension of s1A.
+    val divSigned = u1.divSigned
+    // dividend: for .W the 32-bit Dn is the value; sign/zero-extend to 64.
+    val dividend64 = UInt(64 bits)
+    when(u1.div64) {
+      dividend64 := (s1H ## s1A).asUInt
+    } elsewhen(u1.size === Size.WORD) {
+      // .W: the WHOLE 32-bit Dn is the dividend (32/16). s/z-ext 32->64.
+      dividend64 := Mux(divSigned && s1A(31), (B(0xFFFFFFFFL, 32 bits) ## s1A).asUInt, (B(0, 32 bits) ## s1A).asUInt)
+    } otherwise {
+      // .L32: 32-bit dividend s/z-ext 32->64.
+      dividend64 := Mux(divSigned && s1A(31), (B(0xFFFFFFFFL, 32 bits) ## s1A).asUInt, (B(0, 32 bits) ## s1A).asUInt)
+    }
+    val divisor32 = UInt(32 bits)
+    when(u1.size === Size.WORD) {
+      // 16-bit divisor in s1B[15:0]; s/z-ext to 32.
+      divisor32 := Mux(divSigned && s1B(15), (B(0xFFFF, 16 bits) ## s1B(15 downto 0)).asUInt, (B(0, 16 bits) ## s1B(15 downto 0)).asUInt)
+    } otherwise {
+      divisor32 := s1B.asUInt
+    }
+
+    val divUnit = new DivUnit
+    divUnit.io.start    := False
+    divUnit.io.dividend := dividend64
+    divUnit.io.divisor  := divisor32
+    divUnit.io.signed   := divSigned
+    divUnit.io.form     := divForm
+
+    // ---- pack the DIV result into Dn per form ----
+    // .W   : Dn = {remainder[15:0], quotient[15:0]}.
+    // .L32/.L64 quotient-only path (this task handles .W; .L in T6/T7) -> quotient.
+    val resQ = divUnit.io.quotient
+    val resR = divUnit.io.remainder
+    val divResultW = (resR(15 downto 0) ## resQ(15 downto 0)).asBits  // .W packed
+    val divResult  = Mux(u1.size === Size.WORD, divResultW, resQ.asBits)
+    // NZVC: N/Z from the quotient (at the dest width); V = overflow; C = 0.
+    val qN = Mux(u1.size === Size.WORD, resQ(15), resQ(31))
+    val qZ = Mux(u1.size === Size.WORD, resQ(15 downto 0) === 0, resQ === 0)
+    val divNzvcNormal = (qN ## qZ ## False ## False).asBits          // N Z V(0) C(0)
+    val divNzvcOver   = (False ## False ## True ## False).asBits     // overflow: V=1
+    // On overflow: V=1, NO result write (Dn unchanged). On DIV0: euFault vec5, no write.
+
+    // ---- FSM ----
     val fsm = new StateMachine {
-      val IDLE = new State with EntryPoint
+      val IDLE  = new State with EntryPoint
+      val DIVING = new State    // DivUnit iterating
 
       IDLE.whenIsActive {
         busy := False
         when(s1Valid) {
           when(isChk) {
-            // single-cycle bound check
-            when(chkTrap) { captureFault(U(6, 8 bits)) }
-              .otherwise   { captureComplete(B(0, 32 bits), B(0, 4 bits), False) }  // in-bounds no-op
+            // single-cycle bound check; CHK writes NZVC (N per rule, Z/V/C=0) on BOTH
+            // paths so the committed/stacked CCR's N matches Musashi.
+            when(chkTrap) { captureFault(U(6, 8 bits), chkNzvc, True) }
+              .otherwise   { captureComplete(B(0, 32 bits), chkNzvc, True, False) }  // in-bounds: N=0, no reg write
             s1Valid := False
+          } elsewhen(isDiv) {
+            when(divisor32 === 0) {
+              // DIV0 -> euFault vector 5, no write, no flag change (Musashi leaves CCR).
+              captureFault(U(5, 8 bits), B(0, 4 bits), False)
+              s1Valid := False
+            } otherwise {
+              divUnit.io.start := True
+              busy := True
+              goto(DIVING)
+            }
           } otherwise {
-            // DIV path: implemented in Tasks 5-7. Defensive complete for now so an
-            // unexpected non-CHK CPLX µop cannot hang the pipe.
-            captureComplete(B(0, 32 bits), B(0, 4 bits), False)
+            // defensive complete (unexpected CPLX µop) so the pipe can't hang.
+            captureComplete(B(0, 32 bits), B(0, 4 bits), False, False)
             s1Valid := False
           }
+        }
+      }
+
+      DIVING.whenIsActive {
+        busy := True
+        when(divUnit.io.done) {
+          // Overflow -> V=1, NO register write (compPdstValid forced false). Normal ->
+          // write the packed result + N/Z (V=0).
+          when(divUnit.io.overflow) {
+            // overflow: V=1, NO result write (Dn unchanged).
+            captureComplete(B(0, 32 bits), divNzvcOver, True, False)
+          } otherwise {
+            captureComplete(divResult, divNzvcNormal, u1.writesNzvc, True)
+          }
+          busy    := False
+          s1Valid := False
+          goto(IDLE)
         }
       }
     }
@@ -225,7 +311,12 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     wbObs.result    := compData
     wbObs.intWrite  := compPdstValid && !compFault
     wbObs.nzvc      := compNzvc
-    wbObs.nzvcWrite := compNzvcWrite && !compFault
+    // CHK sets N even as it traps -> its NZVC must reach the ROB's committed-CCR fold
+    // (ccrCompletion) so the stacked frame's CCR matches Musashi. compNzvcWrite is
+    // True for a CHK fault (and False for DIV0/normal-no-flag), so the wbObs flag is
+    // compNzvcWrite directly (NOT masked by !compFault — unlike the PRF write, which
+    // is masked since the faulting µop's rename rolls back).
+    wbObs.nzvcWrite := compNzvcWrite
     wbObs.x         := False
     wbObs.xWrite    := False
     wbObs.simPublic()
