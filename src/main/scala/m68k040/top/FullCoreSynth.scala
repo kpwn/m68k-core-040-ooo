@@ -10,7 +10,7 @@ import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
 import m68k040.dispatch.DispatchPlugin
 import m68k040.rob.RobPlugin
-import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin}
+import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin, DivEuPlugin}
 import m68k040.execute.iq.{IssueQueuePlugin, IssueQueueService}
 import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
 import m68k040.services.{CommitTraceService, RedirectService}
@@ -23,7 +23,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   * anchors the pipeline to top IO so nothing is pruned: the EU int-write results
   * (anchors the ALU+PRF datapath, since a PRF read value is then observed) and
   * the CommitTrace (anchors the ROB retire/control path). */
-class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin) extends FiberPlugin {
+class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin, divEu: DivEuPlugin) extends FiberPlugin {
   // Int PRF write port for the exception unit's A7 (reg 15) write-back.
   var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
   during setup { a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7") }
@@ -53,9 +53,9 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     branchEu.issue << iq.issue(2)
     rob.logic.branchCompletion.valid   := branchEu.completion.valid
     rob.logic.branchCompletion.payload := branchEu.completion.payload
-    // TRAPV execute-time conditional fault (vector 7 if V) -> ROB.
-    rob.logic.trapvFaultCompletion.valid   := branchEu.trapvFault.valid
-    rob.logic.trapvFaultCompletion.payload := branchEu.trapvFault.payload
+    // Execute-time conditional fault (TRAPV vector 7) -> ROB euFault (generalized).
+    rob.logic.euFaultCompletion.valid   := branchEu.trapvFault.valid
+    rob.logic.euFaultCompletion.payload := branchEu.trapvFault.payload
     rob.logic.completion(0).valid   := eu0.completion.valid
     rob.logic.completion(0).payload := eu0.completion.payload
     rob.logic.completion(1).valid   := eu1.completion.valid
@@ -82,6 +82,24 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // for precise format-$7 delivery at retire).
     rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
     rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
+
+    // ---- CPLX (DivEu) wiring: issue port 4 -> DivEu; completion (port 3) + dynamic
+    // wakeup + euFault (CHK vec6 / DIV0 vec5). ----
+    divEu.issue << iq.issue(4)
+    rob.logic.completion(3).valid   := divEu.completion.valid
+    rob.logic.completion(3).payload := divEu.completion.payload
+    iq.cplxWakeup.valid   := divEu.wakeup.valid
+    iq.cplxWakeup.payload := divEu.wakeup.payload
+    // DivEu euFault shares the generalized ROB euFaultCompletion with the branch EU's
+    // TRAPV. They are mutually exclusive in practice (different EUs, single-outstanding),
+    // but to be safe the branch EU's fault takes priority via last-driver: drive the
+    // DivEu fault FIRST, then the branch EU below would override — instead OR them with
+    // an explicit mux (the branch EU's drive above already set it; OR the DivEu in).
+    when(divEu.euFault.valid) {
+      rob.logic.euFaultCompletion.valid   := True
+      rob.logic.euFaultCompletion.payload := divEu.euFault.payload
+    }
+    wireCcr(3, divEu.logic.wbObs)
     // The IQ dynamic wakeup is keyed by the producer pdst. The LS EU drives a
     // dedicated `wakeup` Flow from its REGISTERED completion stage (valid only for a
     // completing LOAD that produces a physreg — a store completes too but writes no
@@ -193,6 +211,7 @@ object GenFullCoreSynthVerilog {
         val eu1 = new AluEuPlugin
         val branchEu = new BranchEuPlugin
         val lsEu = new LsEuPlugin
+        val divEu = new DivEuPlugin
         new M68kCore(Seq[FiberPlugin](
           new ParamPlugin(p),
           new MmuControlPlugin(),
@@ -207,11 +226,11 @@ object GenFullCoreSynthVerilog {
           new DispatchPlugin(),
           new RobPlugin(),
           new IssueQueuePlugin(),
-          eu0, eu1, branchEu, lsEu,
+          eu0, eu1, branchEu, lsEu, divEu,
           new RegFilePluginInt(),
           new RegFilePluginNzvc(),
           new RegFilePluginX(),
-          new BackendWiringPlugin(eu0, eu1, branchEu, lsEu)
+          new BackendWiringPlugin(eu0, eu1, branchEu, lsEu, divEu)
         )).setDefinitionName("M68kFullCoreSynth")
       }
     println("Generated generated/M68kFullCoreSynth.v")

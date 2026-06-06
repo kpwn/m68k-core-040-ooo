@@ -37,6 +37,11 @@ import spinal.lib.fsm._
 class ExceptionUnit(
     val ss: SystemState,
     entryTrigger: Bool, entryVector: UInt, entryPc: UInt,
+    // Format-$2 group-2 trap PPC = the trapping INSTRUCTION's PC (TRAPV/CHK/DIV0). For
+    // TRAPV this equals entryPc-2 (a 2-byte op), but CHK/DIV0 are variable-length, so
+    // the PPC is supplied explicitly. Default entryPc-2 keeps the old TRAPV-only unit
+    // tests (which don't pass entryPpc) byte-for-byte.
+    entryPpc: UInt = null,
     rteTrigger: Bool, rtePc: UInt,
     committedCcr: UInt,
     // Access-fault (vector 2) extras for the format-$7 frame. Default-driven idle
@@ -286,18 +291,22 @@ class ExceptionUnit(
         // of its vector value (autovector 24+level or a vectored 0..255). Fault/trap
         // entries select $7 (access fault, vector 2) / $2 (TRAPV, vector 7) by vector.
         val is7 = !entryIsInterrupt && (entryVector === 2)   // access fault -> format-$7
-        // TRAPV (vector 7) is a group-2 trap -> format-$2 on the 68040 (Musashi
-        // m68ki_stack_frame_0010). The 6-word frame stacks {SR, PC(=nextPc),
-        // 0x2000|vec<<2, PPC}. PPC = the trap instruction's own PC = entryPc-2
-        // (TRAPV is a single 2-byte opword, and entryPc = nextPc = pc+2).
-        val is2 = !entryIsInterrupt && (entryVector === 7)
+        // The 68040 group-2 traps stack a 6-word format-$2 frame {SR, PC(=nextPc),
+        // 0x2000|vec<<2, PPC} (Musashi m68ki_stack_frame_0010): TRAPV (vector 7), CHK
+        // (vector 6), and DIV0/integer-divide-by-zero (vector 5). PC = the next
+        // instruction (faultUsesNextPc); PPC = the trapping instruction's own PC.
+        val is2 = !entryIsInterrupt &&
+                  ((entryVector === 7) || (entryVector === 6) || (entryVector === 5))
+        // PPC: supplied explicitly (variable-length CHK/DIV0); fall back to entryPc-2
+        // for callers that don't pass it (the TRAPV-only unit tests, 2-byte op).
+        val ppc = if (entryPpc != null) entryPpc else (entryPc - 2).resized
         curVec    := entryVector
         curPc     := entryPc
         curIs7    := is7
         curIs2    := is2
         curIsInt  := entryIsInterrupt
         curLevel  := entryIplLevel
-        curPpc    := (entryPc - 2).resized
+        curPpc    := ppc.resized
         curFault  := entryFaultAddr
         // SSW = (in_mmu 0x400) | fc | (rw<<8); fc = data space (bit0=1) + supervisor
         // (bit2) if a supervisor access; rw = read?1:write?0 (MAME m68ki_aerr).

@@ -31,6 +31,11 @@ case class RenamedUop() extends Bundle {
   // Instruction-fetch access-fault extras (format-$7): faultAddr = fetch PC stacked
   // as the EA; sswInstr = 1 => program-space SSW (vs data). Threaded from decode.
   val faultAddr    = UInt(32 bits); val sswInstr = Bool()
+  // CPLX-cluster (DivEu) control: CHK / DIV. divSigned=DIVS; div64=64-bit dividend
+  // (Dr:Dq); divIsRem=the trailing remainder-move (DIVREM) µop. Threaded from decode.
+  val divSigned    = Bool()
+  val div64        = Bool()
+  val divIsRem     = Bool()
   // Macro-instruction boundary marker (interrupts): True for the FIRST µop of an
   // instruction (the only multi-µop case is a memSimple-source crack [load, op]).
   val firstOfInstr = Bool()

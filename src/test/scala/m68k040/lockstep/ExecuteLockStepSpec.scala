@@ -8,7 +8,7 @@ import m68k040.frontend.FetchAlignPlugin
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
 import m68k040.rob.RobPlugin
-import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin}
+import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin, DivEuPlugin}
 import m68k040.execute.iq.{IssueQueuePlugin, IssueQueueService}
 import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
 import m68k040.services.{RedirectService, DTranslationService}
@@ -41,7 +41,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     * to the ROB, and the ROB's commit-time mispredict redirect (RedirectService)
     * to the IQ flush. (Frontend pipeFlush / RAT-rollback flush / fetch redirect are
     * driven inside the consuming plugins from host.get[RedirectService].) */
-  class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin) extends FiberPlugin {
+  class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin, divEu: DivEuPlugin) extends FiberPlugin {
     // Int PRF write port for the exception unit's A7 (reg 15) write-back. Allocated
     // in setup (RegfileService requires it). latency=0 so the handler can read the
     // updated A7 the cycle after the exception commits (it is serializing).
@@ -57,9 +57,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       branchEu.issue << iq.issue(2)
       rob.logic.branchCompletion.valid   := branchEu.completion.valid
       rob.logic.branchCompletion.payload := branchEu.completion.payload
-      // TRAPV execute-time conditional fault (vector 7 if V) -> ROB.
-      rob.logic.trapvFaultCompletion.valid   := branchEu.trapvFault.valid
-      rob.logic.trapvFaultCompletion.payload := branchEu.trapvFault.payload
+      // Execute-time conditional fault (TRAPV vector 7) -> ROB euFault (generalized).
+      rob.logic.euFaultCompletion.valid   := branchEu.trapvFault.valid
+      rob.logic.euFaultCompletion.payload := branchEu.trapvFault.payload
       rob.logic.completion(0).valid   := eu0.completion.valid
       rob.logic.completion(0).payload := eu0.completion.payload
       rob.logic.completion(1).valid   := eu1.completion.valid
@@ -75,6 +75,19 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         rob.logic.ccrCompletion(idx).payload.xWrite   := w.xWrite
       }
       wireCcr(0, eu0.logic.wbObs); wireCcr(1, eu1.logic.wbObs); wireCcr(2, lsEu.logic.wbObs)
+      wireCcr(3, divEu.logic.wbObs)
+
+      // ── CPLX (DivEu) wiring (mirrors top/FullCoreSynth) ──
+      // Issue port 4 -> DivEu; completion (port 3) + dynamic wakeup + euFault.
+      divEu.issue << iq.issue(4)
+      rob.logic.completion(3).valid   := divEu.completion.valid
+      rob.logic.completion(3).payload := divEu.completion.payload
+      iq.cplxWakeup.valid   := divEu.wakeup.valid
+      iq.cplxWakeup.payload := divEu.wakeup.payload
+      when(divEu.euFault.valid) {
+        rob.logic.euFaultCompletion.valid   := True
+        rob.logic.euFaultCompletion.payload := divEu.euFault.payload
+      }
 
       // ── LS cluster wiring (mirrors top/FullCoreSynth.BackendWiringPlugin) ──
       // LS issue port (3) -> LS EU. Its completion is BOTH a ROB completion (port
@@ -185,17 +198,18 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
     val lsEu   = new LsEuPlugin
+    val divEu  = new DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
     val rfX    = new RegFilePluginX
-    val wire   = new BackendWiringPlugin(eu0, eu1, branchEu, lsEu)
+    val wire   = new BackendWiringPlugin(eu0, eu1, branchEu, lsEu, divEu)
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
       ctrl,
       intCtrl,
       itlb,
       dtlb,
-      icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu,
+      icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
       rfInt, rfNzvc, rfX, wire)) }
   }
 
@@ -332,7 +346,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         // LS EU writeback-obs (loads write an int reg incl. the T0/T1 temp; stores
         // write none). Same join key (robId) as the ALU EUs. Temp-only commits are
         // dropped in WhiteboxCapture.onCommit (decode-matrix §4.5).
-        captureWb(dut.lsEu.logic.wbObs);
+        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs);
         // Branch EU writeback-obs: a branch writes NO int/flag reg and leaves CCR
         // unchanged. Map it to a no-write Wb (the commit pc comes from the ROB
         // commitObs = resolved nextPc). dstArch=0 is harmless since intWrite=false.
@@ -515,7 +529,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.onSamplings {
         captureWb(dut.eu0.logic.wbObs)
         captureWb(dut.eu1.logic.wbObs)
-        captureWb(dut.lsEu.logic.wbObs);
+        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs);
         {
           val bw = dut.branchEu.logic.wbObs
           if (bw.valid.toBoolean) {
@@ -1178,7 +1192,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL)
       }
       cd.onSamplings {
-        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs)
+        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
         captureBranch()
         for (k <- 0 until 2) {
           val c = dut.rob.logic.commitObs(k)
@@ -1289,7 +1303,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean))
     }
     dut.clockDomain.onSamplings {
-      captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs)
+      captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
       val bw = dut.branchEu.logic.wbObs
       if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
       for (k <- 0 until 2) {

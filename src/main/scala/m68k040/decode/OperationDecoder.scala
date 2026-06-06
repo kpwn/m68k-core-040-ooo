@@ -2,6 +2,7 @@ package m68k040.decode
 
 import m68k040.isa.{Cluster, Size}
 import spinal.core._
+import spinal.lib._
 
 /** EA-agnostic operation decoder: opword -> OpSpec. Masked-pattern table grouped
   * by line nibble. Reproduces today's op set over reg/imm modes; memory/complex
@@ -39,6 +40,22 @@ object OperationDecoder {
         o.srcB := easrc                       // source EA -> srcB (ALU MOVE result = src2)
         o.dst  := eadst; o.dstWrites := True   // dest EA
         o.writesNzvcIfDataDst := True          // NZVC only if dst is a data reg (assembler resolves)
+      }
+      // ---- CHK.W/CHK.L (0100 ddd 1 ss mmmrrr) ----
+      // bit8=1 marks CHK in line 4; bit7 selects size (.W=1 / .L=0), bit6=0. The
+      // checked register Dn is bits 11:9 (read as srcA); the bound is the EA (srcB).
+      // CHK writes NO register and leaves CCR per the 68k rule (only N is meaningful,
+      // set by the EU at execute; matched in lock-step). Routed to the CPLX (DivEu).
+      is(0x4) {
+        when(opword(8) && !opword(6)) {
+          o.illegal := False
+          o.op := DecOp.CHK
+          o.cluster := Cluster.CPLX
+          o.size := Mux(opword(7), Size.WORD, Size.LONG)
+          o.srcA := dnField            // Dn (checked value)
+          o.srcB := easrc              // bound (EA)
+          o.dst.setNone(); o.dstWrites := False
+        }
       }
       // ---- Bcc / BSR / BRA (0110 cccc dddddddd) ----
       is(0x6) {
