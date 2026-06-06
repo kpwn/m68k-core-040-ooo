@@ -76,7 +76,7 @@ object MicroOpAssembler {
     opUop.useImm        := False; opUop.imm    := 0
     opUop.readsNzvc     := spec.readsNzvc; opUop.readsX := spec.readsX
     opUop.writesNzvc    := spec.writesNzvc; opUop.writesX := spec.writesX
-    opUop.isBranch      := spec.isBranch; opUop.cond := spec.cond
+    opUop.isBranch      := spec.isBranch; opUop.ibranch := False; opUop.cond := spec.cond
     opUop.branchDisp    := 0
     opUop.unimplemented := False
     opUop.faulted       := False
@@ -185,7 +185,7 @@ object MicroOpAssembler {
     ldUop.imm           := Mux(srcEa.pcRel, pcRelAddr, srcEa.disp)
     ldUop.readsNzvc     := False; ldUop.readsX := False
     ldUop.writesNzvc    := False; ldUop.writesX := False
-    ldUop.isBranch      := False; ldUop.cond := 0
+    ldUop.isBranch      := False; ldUop.ibranch := False; ldUop.cond := 0
     ldUop.branchDisp    := 0
     ldUop.unimplemented := False
     ldUop.faulted       := False; ldUop.faultVector := 0; ldUop.isRte := False
@@ -218,7 +218,7 @@ object MicroOpAssembler {
     stUop.imm           := Mux(dstEa.pcRel, stPcRelAddr, dstEa.disp)
     stUop.readsNzvc     := False; stUop.readsX := False
     stUop.writesNzvc    := True;  stUop.writesX := False   // MOVE to memory sets NZVC
-    stUop.isBranch      := False; stUop.cond := 0
+    stUop.isBranch      := False; stUop.ibranch := False; stUop.cond := 0
     stUop.branchDisp    := 0
     stUop.unimplemented := False
     stUop.faulted       := False; stUop.faultVector := 0; stUop.isRte := False
@@ -251,8 +251,20 @@ object MicroOpAssembler {
     // DIVU.L/DIVS.L: opword 0100 1100 01 mmmrrr (op[15:6]==0x131). Decoded here (line 4
     // is otherwise illegal) from the extension word — NOT `bad`.
     val isDivLOp = (op(15 downto 6) === B"10'b0100110001")
-    val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp &&
+    // ── JMP (0x4EC0 | ea) — a computed-target branch to the EA *address* (no push). ─
+    // op[15:6] == 0100111011 (0x13B). Target = EA address: psrcA = base An (or none for
+    // abs/PC), imm = displacement / folded absolute / folded PC. Control EA modes only:
+    // (An), (d16,An), (xxx).W/.L, (d16,PC). Reg-direct / imm / (An)+ / -(An) / indexed
+    // are illegal for JMP (-> `bad`). Decoded here (line 4 is otherwise illegal).
+    val isJmpOp = (op(15 downto 6) === B"10'b0100111011")
+    // A JMP/JSR control EA is the in-scope MEMSIMPLE set (the EaDecoder already
+    // classifies (An)/(d16,An)/(xxx)/(d16,PC) as MEMSIMPLE; indexed/predec/postinc are
+    // MEMCOMPLEX, reg-direct DATAREG/ADDRREG, imm IMM). So a valid control EA == srcIsMem.
+    val ctrlEaOk = srcIsMem
+    val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isJmpOp &&
               (!pkt.simple || spec.illegal || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
+    // A JMP with a non-control EA is illegal (vector 4).
+    val jmpBad = isJmpOp && !ctrlEaOk
     when(isRteOp) {
       // a single architectural op µop carrying isRte; writes nothing, has a real PC.
       opUop.op            := DecOp.ILLEGAL  // no ALU action; the FSM handles it
@@ -388,7 +400,7 @@ object MicroOpAssembler {
     divlUop.dstReg        := divlDq; divlUop.dstValid := True              // quotient -> Dq
     divlUop.readsNzvc     := False; divlUop.readsX := False
     divlUop.writesNzvc    := True;  divlUop.writesX := False               // DIV sets N/Z/V
-    divlUop.isBranch      := False; divlUop.cond := 0; divlUop.branchDisp := 0
+    divlUop.isBranch      := False; divlUop.ibranch := False; divlUop.cond := 0; divlUop.branchDisp := 0
     divlUop.unimplemented := False
     divlUop.faulted       := False; divlUop.faultVector := 0; divlUop.isRte := False
     divlUop.faultUsesNextPc := True            // DIV0 stacks nextPc (group-2 format-$2)
@@ -418,7 +430,7 @@ object MicroOpAssembler {
     divremUop.dstReg        := divlDr; divremUop.dstValid := True          // remainder -> Dr
     divremUop.readsNzvc     := False; divremUop.readsX := False
     divremUop.writesNzvc    := False; divremUop.writesX := False
-    divremUop.isBranch      := False; divremUop.cond := 0; divremUop.branchDisp := 0
+    divremUop.isBranch      := False; divremUop.ibranch := False; divremUop.cond := 0; divremUop.branchDisp := 0
     divremUop.unimplemented := False
     divremUop.faulted       := False; divremUop.faultVector := 0; divremUop.isRte := False
     divremUop.faultUsesNextPc := False
@@ -435,6 +447,47 @@ object MicroOpAssembler {
     // exactly like the `bad` path. opUop is already illegal for the 4C4x opword
     // (OperationDecoder's line-4 default), so we just force the faulted illegal fields.
     when(isDivLOp && !divLOk) {
+      opUop.op            := DecOp.ILLEGAL
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.unimplemented := True
+      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
+      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
+      opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
+    }
+
+    // ── ibrUop = an INDIRECT branch to a computed EA address (JMP / JSR target). ──
+    // target = base An (psrcA) + imm; imm = displacement (or folded absolute / folded
+    // PC). The EA is op[5:0] (`srcEa`, control modes). For (d16,PC) the assembler folds
+    // pc into the imm (base=0), exactly like the load crack's pcRelAddr.
+    val ctrlPcRelAddr = (pkt.pc + U(2, 32 bits) + srcEa.disp.asUInt).asBits
+    val ibrUop = DecodedUop()
+    ibrUop.valid         := pkt.valid
+    ibrUop.pc            := pkt.pc
+    ibrUop.nextPc        := nextPc
+    ibrUop.op            := DecOp.BRANCH
+    ibrUop.cluster       := Cluster.INT
+    ibrUop.size          := Size.LONG
+    ibrUop.memOp         := MemOp.NONE
+    ibrUop.srcAReg       := srcEa.base; ibrUop.srcAValid := srcEa.baseValid   // EA base An
+    ibrUop.srcBReg       := 0;          ibrUop.srcBValid := False
+    ibrUop.srcCReg       := 0;          ibrUop.srcCValid := False
+    ibrUop.dstReg        := 0;          ibrUop.dstValid  := False
+    ibrUop.useImm        := True
+    ibrUop.imm           := Mux(srcEa.pcRel, ctrlPcRelAddr, srcEa.disp)
+    ibrUop.readsNzvc     := False; ibrUop.readsX := False
+    ibrUop.writesNzvc    := False; ibrUop.writesX := False
+    ibrUop.isBranch      := True;  ibrUop.ibranch := True
+    ibrUop.cond          := 0;     ibrUop.branchDisp := 0
+    ibrUop.unimplemented := False
+    ibrUop.faulted       := False; ibrUop.faultVector := 0; ibrUop.isRte := False
+    ibrUop.faultUsesNextPc := False
+    ibrUop.faultAddr     := pkt.pc; ibrUop.sswInstr := False; ibrUop.isTrapv := False
+    ibrUop.divSigned     := False; ibrUop.div64 := False; ibrUop.divIsRem := False
+    ibrUop.firstOfInstr  := True   // JMP is a single µop (its own first); JSR overrides
+
+    // A JMP with a non-control EA -> illegal (vector 4), like the `bad` path.
+    when(jmpBad) {
       opUop.op            := DecOp.ILLEGAL
       opUop.cluster       := Cluster.INT
       opUop.memOp         := MemOp.NONE
@@ -475,6 +528,11 @@ object MicroOpAssembler {
         out.uops(0) := divlUop      // quotient-only (Dr==Dq)
         out.uops(1) := divlUop
       }
+    } elsewhen(isJmpOp) {
+      // JMP -> a single indirect branch to the EA address (bad EA forced illegal above).
+      out.count   := 1
+      out.uops(0) := Mux(jmpBad, opUop, ibrUop)
+      out.uops(1) := Mux(jmpBad, opUop, ibrUop)
     } elsewhen(crackStore) {
       out.count   := 1
       out.uops(0) := stUop

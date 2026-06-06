@@ -32,6 +32,13 @@ case class DecodedUop() extends Bundle {
   val readsNzvc    = Bool();       val readsX    = Bool()
   val writesNzvc   = Bool();       val writesX   = Bool()
   val isBranch     = Bool()
+  // Indirect / computed-target branch (JSR/JMP/RTS/RTR): when set, the branch EU
+  // forms its target from a SOURCE OPERAND (`psrcA + imm`) instead of `pc+2+disp`,
+  // and ALWAYS redirects (unconditional). For JSR/JMP psrcA is the EA base An (imm =
+  // displacement / folded absolute / folded PC) — a tiny AGU in the branch EU; for
+  // RTS/RTR psrcA is the popped target value (imm = 0). Default False (a plain Bcc/
+  // BRA/BSR forms pc+2+disp as before).
+  val ibranch      = Bool()
   val cond         = Bits(4 bits)
   val branchDisp   = Bits(32 bits)
   val unimplemented= Bool()

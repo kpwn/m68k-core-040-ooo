@@ -126,6 +126,28 @@ object PredecodeWord {
             r.lenWords := (U(2, 3 bits) + e).resized   // opword + DIV.L ext word + EA ext
           }
         }
+        // JMP (0100111011 mmmrrr) / JSR (0100111010 mmmrrr): a computed-target branch
+        // to the EA *address*. 1 opword + the control-EA extension words. Control modes
+        // only — (An)/(d16,An)/(xxx).W/.L/(d16,PC); reg-direct / imm / (An)+ / -(An) /
+        // indexed are NOT control modes (eaExt returns ok=False or an EA that the
+        // assembler rejects -> illegal). allowImm=false so #imm is NOT a valid mode.
+        val isJmp = op(15 downto 6) === B"10'b0100111011"
+        val isJsr = op(15 downto 6) === B"10'b0100111010"
+        when(isJmp || isJsr) {
+          val srcMode = op(5 downto 3).asUInt
+          val srcReg  = op(2 downto 0).asUInt
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL = False, allowImm = false)
+          // Reg-direct (modes 0,1) and (An)+/-(An) (modes 3,4) are NOT control modes;
+          // eaExt accepts them (ext 0) but they are illegal for JMP/JSR. Restrict to
+          // the in-scope control modes so predecode frames the right length AND a
+          // non-control EA stays complex (-> the assembler's illegal path).
+          val ctrlMode = (srcMode === U(2, 3 bits)) || (srcMode === U(5, 3 bits)) ||
+                         (srcMode === U(7, 3 bits))
+          when(ok && ctrlMode) {
+            r.simple   := True
+            r.lenWords := (U(1, 3 bits) + e).resized   // opword + EA ext
+          }
+        }
       }
 
       // MOVEQ

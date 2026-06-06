@@ -766,6 +766,39 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 2)
   }
 
+  // ── JMP (computed-target branch, no push) ──────────────────────────────────
+  test("lock-step: jmp (An) computed target", VerilatorTest) {
+    // Load .L's absolute address into A0, jmp (A0): skips moveq#9, lands on moveq#7.
+    // Executed: move.l#.L,a0, jmp(a0), moveq#7 = 3.
+    runLockStep("jmp-an",
+      "move.l #.L,%a0 ; jmp (%a0) ; moveq #9,%d0 ; .L: moveq #7,%d1",
+      nInstr = 3)
+  }
+
+  test("lock-step: jmp (xxx).L absolute target", VerilatorTest) {
+    // jmp .L (absolute long): skips moveq#9, lands on moveq#7.
+    // Executed: jmp(abs), moveq#7 = 2.
+    runLockStep("jmp-abs",
+      "jmp (.L).l ; moveq #9,%d0 ; .L: moveq #7,%d1",
+      nInstr = 2)
+  }
+
+  test("lock-step: jmp (d16,PC) pc-relative target", VerilatorTest) {
+    // jmp .L(pc) (PC-relative): skips moveq#9, lands on moveq#7.
+    // Executed: jmp(pc-rel), moveq#7 = 2.
+    runLockStep("jmp-pcrel",
+      "jmp .L(%pc) ; moveq #9,%d0 ; .L: moveq #7,%d1",
+      nInstr = 2)
+  }
+
+  test("lock-step: jmp (d16,An) displaced target", VerilatorTest) {
+    // A0 = .L - 4; jmp 4(A0) -> .L. Skips moveq#9, lands on moveq#7.
+    // Executed: move.l#.L-4,a0, jmp 4(a0), moveq#7 = 3.
+    runLockStep("jmp-d16an",
+      "move.l #.L-4,%a0 ; jmp 4(%a0) ; moveq #9,%d0 ; .L: moveq #7,%d1",
+      nInstr = 3)
+  }
+
   test("lock-step: backward bne.s loop (one backward taken)", VerilatorTest) {
     // D0=2 (counter), D1=1 (decrement). Loop body sub.l d1,d0 ; bne.s .L:
     //   iter1: 2-1=1 (Z=0) -> bne TAKEN  (backward commit-time redirect to .L)

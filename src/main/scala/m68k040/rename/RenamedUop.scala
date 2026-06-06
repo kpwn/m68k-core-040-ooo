@@ -18,6 +18,9 @@ case class RenamedUop() extends Bundle {
   val memOp        = MemOp()
   val useImm       = Bool();  val imm = Bits(32 bits)
   val isBranch     = Bool();  val cond = Bits(4 bits); val branchDisp = Bits(32 bits)
+  // Indirect / computed-target branch (JSR/JMP/RTS/RTR): target = psrcA + imm,
+  // unconditional redirect. Threaded from decode.
+  val ibranch      = Bool()
   val unimplemented= Bool()
   // Precise-fault capture (exception slice 1): `faulted` + `faultVector` (4=illegal,
   // 8=privilege) threaded from decode; `isRte` marks a return-from-exception µop.

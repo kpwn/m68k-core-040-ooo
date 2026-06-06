@@ -1,7 +1,7 @@
 package m68k040.execute
 
 import m68k040.execute.iq.IqContext
-import m68k040.execute.regfile.{NzvcRegFileService, RegFileReadPort}
+import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, RegFileReadPort}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -51,6 +51,9 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
   var completionPort: Flow[BranchCompletion] = null
   var trapvFaultPort: Flow[EuFault] = null
   var nzRd: RegFileReadPort = null
+  // Int read port for an INDIRECT branch (ibranch): reads the target base operand
+  // (psrcA) — the EA base An for JSR/JMP, or the popped target value for RTS/RTR.
+  var tgtRd: RegFileReadPort = null
   override def issue = issuePort
   override def completion = completionPort
   override def trapvFault = trapvFaultPort
@@ -60,17 +63,23 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     completionPort = Flow(BranchCompletion())
     trapvFaultPort = Flow(EuFault())
     nzRd = host[NzvcRegFileService].newRead(forceNoBypass = false)
+    tgtRd = host[IntRegFileService].newRead(forceNoBypass = false)
   }
 
   val logic = during build new Area {
-    // ---- S0: read NZVC source ----
+    // ---- S0: read NZVC source + (ibranch) the int target base ----
     issuePort.ready := True              // fixed-latency EU never structurally stalls
-    nzRd.addr := issuePort.payload.uop.pNzvcSrc
+    nzRd.addr  := issuePort.payload.uop.pNzvcSrc
+    tgtRd.addr := issuePort.payload.uop.psrcA
 
     // ---- S0 -> S1 register (M2S) ----
     val s1Valid = RegNext(issuePort.valid) init False
     val s1Ctx   = RegNext(issuePort.payload)
     val s1Nzvc  = RegNext(nzRd.data)              // {N(3),Z(2),V(1),C(0)}
+    // Registered int target base (psrcA). For an absolute / PC-folded ibranch the
+    // assembler leaves psrcAValid=False (base contribution must be ZERO; the folded
+    // value rides in imm), exactly as the LS EU's base-mux for absolute/PC EAs.
+    val s1TgtBase = RegNext(Mux(issuePort.payload.uop.psrcAValid, tgtRd.data.asUInt, U(0, 32 bits)))
     val u1 = s1Ctx.uop
 
     // ---- S1: condition eval (cond[3:0]) ----
@@ -93,8 +102,15 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
       14 -> (!z && (n === v)),     // GT
       15 -> (z || (n =/= v))       // LE
     )
-    val target = (u1.pc + 2 + u1.branchDisp.asUInt)
-    val nextPc = Mux(taken, target, u1.pc + 2)
+    // PC-relative target (Bcc/BRA/BSR). INDIRECT (ibranch) target = base + imm (a
+    // tiny AGU: base = psrcA for (An)/(d16,An)/RTS-RTR-T0, 0 for absolute/PC-folded;
+    // imm = displacement / folded absolute / folded PC / 0).
+    val relTarget = (u1.pc + 2 + u1.branchDisp.asUInt)
+    val indTarget = (s1TgtBase + u1.imm.asUInt)
+    val target    = Mux(u1.ibranch, indTarget, relTarget)
+    // An ibranch ALWAYS redirects (unconditional); a Bcc/BRA redirects iff `taken`.
+    val redirect  = Mux(u1.ibranch, True, taken)
+    val nextPc    = Mux(redirect, target, u1.pc + 2)
 
     // ---- S1: completion (entry completes either way so it can retire) ----
     // TRAPV is decoded with cond=F (taken=False), so it naturally yields mispredict=
@@ -103,7 +119,7 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     // V=1 TRAPV instead raises trapvFault (below); a V=0 TRAPV retires as a no-op.
     completionPort.valid              := s1Valid
     completionPort.payload.robId      := s1Ctx.robId
-    completionPort.payload.mispredict := s1Valid && taken   // TRAPV: taken=False -> no redirect
+    completionPort.payload.mispredict := s1Valid && redirect  // TRAPV: redirect=False -> no redirect
     completionPort.payload.nextPc     := nextPc
 
     // ---- S1: TRAPV execute-time conditional fault (vector 7 if V=1) ----
