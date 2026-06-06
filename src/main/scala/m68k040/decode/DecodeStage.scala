@@ -61,31 +61,67 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     df.feed.ready := fedIn.ready
 
     val fed = PipeStage(fedIn, pipeFlush)
-    // The queue drains the registered group; ready propagates back to the skid.
-    fed.ready := queue.io.push.ready
 
-    // Crack both slots into µop sequences (from the REGISTERED packets).
+    // ── 3-µop-instruction handling (RTR = pop.w CCR + pop.l PC + ibranch) ───────
+    // A single instruction can crack to 3 µops; the 4-wide MicroOpQueue push then
+    // cannot always hold slot0+slot1 (e.g. a 2-µop slot0 + a 3-µop slot1 = 5). We
+    // serialize: decode ONE instruction per cycle whenever the group contains a 3-µop
+    // crack. A 3-µop slot0 (RTR) emits its 3 µops + suppresses slot1 (slot1 is the
+    // sequential-after-RTR instruction — wrong-path, since RTR always redirects — so
+    // dropping it is correct; the redirect re-fetches). A 3-µop slot1 (RTR after a
+    // non-control slot0) is NOT wrong-path, so it must NOT be dropped: this cycle emit
+    // slot0 only + STASH slot1's packet; next cycle emit the stashed RTR solo.
     val a0 = MicroOpAssembler.assemble(fed.payload.packets(0))
-    val a1 = MicroOpAssembler.assemble(fed.payload.packets(1))
+    val a1raw = MicroOpAssembler.assemble(fed.payload.packets(1))
 
-    val slot1Valid = fed.valid && fed.payload.slot1Valid
-    val n0 = a0.count                                  // 1 or 2 (slot0 always present when fed.valid)
-    val n1 = Mux(slot1Valid, a1.count, U(0, 2 bits))   // slot1's µops (0 if slot1 invalid)
+    // Stash for a deferred 3-µop slot1 (RTR-in-slot1). Holds slot1's packet; when
+    // valid, the NEXT cycle decodes IT solo (and we do not consume a new fed group).
+    val stashValid  = RegInit(False)
+    val stashPacket = Reg(DecodePacket())
+    when(pipeFlush) { stashValid := False }
 
-    // Pack slot0's then slot1's µops at compacted positions (n0 ∈ {1,2}):
-    //   push(0) = a0[0]
-    //   push(1) = (n0==2) ? a0[1] : a1[0]
-    //   push(2) = (n0==2) ? a1[0] : a1[1]
-    //   push(3) = a1[1]
-    queue.io.push.uops(0) := a0.uops(0)
-    queue.io.push.uops(1) := Mux(n0 === U(2), a0.uops(1), a1.uops(0))
-    queue.io.push.uops(2) := Mux(n0 === U(2), a1.uops(0), a1.uops(1))
-    queue.io.push.uops(3) := a1.uops(1)
+    // The instruction being decoded this cycle: the stashed RTR (if pending) else
+    // slot0 of the current fed group.
+    val curPacket = Mux(stashValid, stashPacket, fed.payload.packets(0))
+    val aCur = Mux(stashValid, MicroOpAssembler.assemble(stashPacket), a0)
 
-    val totalCount = (n0 +^ n1).resize(3)              // 1..4
+    val curIs3   = aCur.count === U(3, 2 bits)
+    val slot1Is3 = a1raw.count === U(3, 2 bits)
+    val slot0Is3 = a0.count === U(3, 2 bits)
+
+    // slot1 is emitted alongside slot0 only when: not decoding a stash, slot1 present,
+    // slot0 is NOT 3-µop, and slot1 itself is NOT 3-µop (a 3-µop slot1 is deferred).
+    val slot1Emit = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Is3 && !slot1Is3
+    // Defer slot1 to the stash when it is a 3-µop crack paired after a ≤2-µop slot0.
+    val deferSlot1 = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Is3 && slot1Is3
+
+    val nCur = aCur.count                                  // 1..3 (the head instruction)
+    val n1   = Mux(slot1Emit, a1raw.count, U(0, 2 bits))   // slot1 µops (0 if not emitted)
+
+    // Pack: positions 0..2 = head instruction's µops; the slot1 µops follow at nCur..
+    // (only when slot1Emit, where nCur<=2 and n1<=2, so max position 3).
+    queue.io.push.uops(0) := aCur.uops(0)
+    queue.io.push.uops(1) := Mux(nCur >= U(2), aCur.uops(1), a1raw.uops(0))
+    queue.io.push.uops(2) := Mux(curIs3, aCur.uops(2), Mux(nCur === U(2), a1raw.uops(0), a1raw.uops(1)))
+    queue.io.push.uops(3) := a1raw.uops(1)
+
+    val totalCount = (nCur +^ n1).resize(3)            // 1..4
     queue.io.push.count := totalCount
-    // Push the REGISTERED group into the queue when it has room.
-    queue.io.push.valid := fed.valid
+    // Push when there is a head instruction: either a stashed RTR or a valid fed group.
+    queue.io.push.valid := stashValid || fed.valid
+
+    // Consume the fed group only when NOT replaying a stash AND the queue accepted.
+    // When deferring slot1, we still consume the group THIS cycle (slot0 emitted) and
+    // set the stash; the stash replays slot1 next cycle without consuming a new group.
+    fed.ready := !stashValid && queue.io.push.ready
+    when(queue.io.push.ready) {
+      when(stashValid) {
+        stashValid := False                  // the stashed RTR was emitted this cycle
+      } elsewhen(deferSlot1 && fed.valid) {
+        stashValid  := True                  // defer slot1 (RTR) to next cycle
+        stashPacket := fed.payload.packets(1)
+      }
+    }
 
     // ── Rename-facing output ───────────────────────────────────────────────────
     val uopsOut = queue.io.pop

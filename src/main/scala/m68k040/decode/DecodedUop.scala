@@ -87,6 +87,12 @@ case class DecodedUop() extends Bundle {
   // has no data dst, so this lone int write is the A7 side-effect. Reuses one int
   // dst + the imm field (no 2nd write port / no 2nd 32-bit field). Default False.
   val stkPush      = Bool()
+  // ── RTR CCR-restore load (pop the saved CCR word) ──────────────────────────
+  // A LOAD µop that, instead of writing an int reg, RESTORES the CCR from the loaded
+  // word's low byte: NZVC := data[3:0], X := data[4]. RTR restores ONLY the CCR (SR
+  // low byte), never the system byte. The LS EU writes the renamed NZVC + X PRFs.
+  // Default False. (writesNzvc/writesX on this µop select the flag dests.)
+  val ccrRestore   = Bool()
   // Macro-instruction boundary marker: True for the FIRST µop of an instruction.
   // The cracker emits 1 or 2 µops/instruction; the only 2-µop case is a memSimple
   // source crack -> [load, op] where the LOAD is first. An interrupt may be taken

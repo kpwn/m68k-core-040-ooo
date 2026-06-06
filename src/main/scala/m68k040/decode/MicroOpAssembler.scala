@@ -22,8 +22,12 @@ object MicroOpAssembler {
   val T1 = 17
 
   case class AssembledUops() extends Bundle {
-    val uops  = Vec(DecodedUop(), 2)
-    val count = UInt(2 bits)         // 1 or 2 µops valid (uops(0) always, uops(1) iff count===2)
+    // Up to 3 µops per instruction (RTR = pop.w CCR + pop.l PC + ibranch). uops(0)
+    // always valid; uops(1) iff count>=2; uops(2) iff count==3. The 3-µop case
+    // (RTR) is decoded ONE-instruction-per-cycle (DecodeStage gates slot1 off) so the
+    // 4-wide MicroOpQueue push never overflows (3 <= 4).
+    val uops  = Vec(DecodedUop(), 3)
+    val count = UInt(2 bits)         // 1, 2, or 3 µops valid
   }
 
   def assemble(pkt: DecodePacket): AssembledUops = {
@@ -76,7 +80,7 @@ object MicroOpAssembler {
     opUop.useImm        := False; opUop.imm    := 0
     opUop.readsNzvc     := spec.readsNzvc; opUop.readsX := spec.readsX
     opUop.writesNzvc    := spec.writesNzvc; opUop.writesX := spec.writesX
-    opUop.isBranch      := spec.isBranch; opUop.ibranch := False; opUop.stkPush := False; opUop.anInc := 0; opUop.cond := spec.cond
+    opUop.isBranch      := spec.isBranch; opUop.ibranch := False; opUop.stkPush := False; opUop.anInc := 0; opUop.ccrRestore := False; opUop.cond := spec.cond
     opUop.branchDisp    := 0
     opUop.unimplemented := False
     opUop.faulted       := False
@@ -185,7 +189,7 @@ object MicroOpAssembler {
     ldUop.imm           := Mux(srcEa.pcRel, pcRelAddr, srcEa.disp)
     ldUop.readsNzvc     := False; ldUop.readsX := False
     ldUop.writesNzvc    := False; ldUop.writesX := False
-    ldUop.isBranch      := False; ldUop.ibranch := False; ldUop.stkPush := False; ldUop.anInc := 0; ldUop.cond := 0
+    ldUop.isBranch      := False; ldUop.ibranch := False; ldUop.stkPush := False; ldUop.anInc := 0; ldUop.ccrRestore := False; ldUop.cond := 0
     ldUop.branchDisp    := 0
     ldUop.unimplemented := False
     ldUop.faulted       := False; ldUop.faultVector := 0; ldUop.isRte := False
@@ -218,7 +222,7 @@ object MicroOpAssembler {
     stUop.imm           := Mux(dstEa.pcRel, stPcRelAddr, dstEa.disp)
     stUop.readsNzvc     := False; stUop.readsX := False
     stUop.writesNzvc    := True;  stUop.writesX := False   // MOVE to memory sets NZVC
-    stUop.isBranch      := False; stUop.ibranch := False; stUop.stkPush := False; stUop.anInc := 0; stUop.cond := 0
+    stUop.isBranch      := False; stUop.ibranch := False; stUop.stkPush := False; stUop.anInc := 0; stUop.ccrRestore := False; stUop.cond := 0
     stUop.branchDisp    := 0
     stUop.unimplemented := False
     stUop.faulted       := False; stUop.faultVector := 0; stUop.isRte := False
@@ -257,6 +261,9 @@ object MicroOpAssembler {
     // (An), (d16,An), (xxx).W/.L, (d16,PC). Reg-direct / imm / (An)+ / -(An) / indexed
     // are illegal for JMP (-> `bad`). Decoded here (line 4 is otherwise illegal).
     val isJmpOp = (op(15 downto 6) === B"10'b0100111011")
+    // JSR (0x4E80 | ea) — call: push retPC + ibranch to the EA address. Same control
+    // EA modes as JMP. op[15:6] == 0100111010 (0x13A).
+    val isJsrOp = (op(15 downto 6) === B"10'b0100111010")
     // A JMP/JSR control EA is the in-scope MEMSIMPLE set (the EaDecoder already
     // classifies (An)/(d16,An)/(xxx)/(d16,PC) as MEMSIMPLE; indexed/predec/postinc are
     // MEMCOMPLEX, reg-direct DATAREG/ADDRREG, imm IMM). So a valid control EA == srcIsMem.
@@ -264,11 +271,12 @@ object MicroOpAssembler {
     // RTS (0x4E75) / RTR (0x4E77) are line-4 returns cracked below (NOT illegal).
     val isRtsBad = (op === B"16'h4E75")
     val isRtrBad = (op === B"16'h4E77")
-    val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isJmpOp &&
+    val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad &&
               (!pkt.simple || spec.illegal || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
-    // A JMP with a non-control EA is illegal (vector 4).
+    // A JMP/JSR with a non-control EA is illegal (vector 4).
     val jmpBad = isJmpOp && !ctrlEaOk
+    val jsrBad = isJsrOp && !ctrlEaOk
     when(isRteOp) {
       // a single architectural op µop carrying isRte; writes nothing, has a real PC.
       opUop.op            := DecOp.ILLEGAL  // no ALU action; the FSM handles it
@@ -404,7 +412,7 @@ object MicroOpAssembler {
     divlUop.dstReg        := divlDq; divlUop.dstValid := True              // quotient -> Dq
     divlUop.readsNzvc     := False; divlUop.readsX := False
     divlUop.writesNzvc    := True;  divlUop.writesX := False               // DIV sets N/Z/V
-    divlUop.isBranch      := False; divlUop.ibranch := False; divlUop.stkPush := False; divlUop.anInc := 0; divlUop.cond := 0; divlUop.branchDisp := 0
+    divlUop.isBranch      := False; divlUop.ibranch := False; divlUop.stkPush := False; divlUop.anInc := 0; divlUop.ccrRestore := False; divlUop.cond := 0; divlUop.branchDisp := 0
     divlUop.unimplemented := False
     divlUop.faulted       := False; divlUop.faultVector := 0; divlUop.isRte := False
     divlUop.faultUsesNextPc := True            // DIV0 stacks nextPc (group-2 format-$2)
@@ -434,7 +442,7 @@ object MicroOpAssembler {
     divremUop.dstReg        := divlDr; divremUop.dstValid := True          // remainder -> Dr
     divremUop.readsNzvc     := False; divremUop.readsX := False
     divremUop.writesNzvc    := False; divremUop.writesX := False
-    divremUop.isBranch      := False; divremUop.ibranch := False; divremUop.stkPush := False; divremUop.anInc := 0; divremUop.cond := 0; divremUop.branchDisp := 0
+    divremUop.isBranch      := False; divremUop.ibranch := False; divremUop.stkPush := False; divremUop.anInc := 0; divremUop.ccrRestore := False; divremUop.cond := 0; divremUop.branchDisp := 0
     divremUop.unimplemented := False
     divremUop.faulted       := False; divremUop.faultVector := 0; divremUop.isRte := False
     divremUop.faultUsesNextPc := False
@@ -482,17 +490,19 @@ object MicroOpAssembler {
     ibrUop.readsNzvc     := False; ibrUop.readsX := False
     ibrUop.writesNzvc    := False; ibrUop.writesX := False
     ibrUop.isBranch      := True;  ibrUop.ibranch := True
-    ibrUop.stkPush       := False; ibrUop.anInc := 0    // JMP: no An postinc (JSR/RTS override)
+    ibrUop.stkPush       := False; ibrUop.anInc := 0; ibrUop.ccrRestore := False    // JMP: no An postinc (JSR/RTS override)
     ibrUop.cond          := 0;     ibrUop.branchDisp := 0
     ibrUop.unimplemented := False
     ibrUop.faulted       := False; ibrUop.faultVector := 0; ibrUop.isRte := False
     ibrUop.faultUsesNextPc := False
     ibrUop.faultAddr     := pkt.pc; ibrUop.sswInstr := False; ibrUop.isTrapv := False
     ibrUop.divSigned     := False; ibrUop.div64 := False; ibrUop.divIsRem := False
-    ibrUop.firstOfInstr  := True   // JMP is a single µop (its own first); JSR overrides
+    // JMP is a single µop (its own first); JSR's ibranch is the TRAILING µop (the push
+    // is first), so firstOfInstr is False for JSR.
+    ibrUop.firstOfInstr  := !isJsrOp
 
-    // A JMP with a non-control EA -> illegal (vector 4), like the `bad` path.
-    when(jmpBad) {
+    // A JMP/JSR with a non-control EA -> illegal (vector 4), like the `bad` path.
+    when(jmpBad || jsrBad) {
       opUop.op            := DecOp.ILLEGAL
       opUop.cluster       := Cluster.INT
       opUop.memOp         := MemOp.NONE
@@ -513,17 +523,20 @@ object MicroOpAssembler {
               useImm: Bool = False, imm: Bits = B(0, 32 bits),
               isBranch: Bool = False, ibranch: Bool = False, stkPush: Bool = False,
               anInc: UInt = U(0, 3 bits), cond: Bits = B(0, 4 bits),
-              branchDisp: Bits = B(0, 32 bits), first: Bool = True): DecodedUop = {
+              branchDisp: Bits = B(0, 32 bits), first: Bool = True,
+              size: Size.C = Size.LONG, ccrRestore: Bool = False,
+              writesNzvc: Bool = False, writesX: Bool = False): DecodedUop = {
       val u = DecodedUop()
       u.valid := pkt.valid; u.pc := pkt.pc; u.nextPc := nextPc
-      u.op := DecOp.MOVE; u.cluster := cluster; u.size := Size.LONG; u.memOp := memOp
+      u.op := DecOp.MOVE; u.cluster := cluster; u.size := size; u.memOp := memOp
       u.srcAReg := srcAReg; u.srcAValid := srcAValid
       u.srcBReg := srcBReg; u.srcBValid := srcBValid
       u.srcCReg := 0; u.srcCValid := False
       u.dstReg := dstReg;  u.dstValid := dstValid
       u.useImm := useImm; u.imm := imm
-      u.readsNzvc := False; u.readsX := False; u.writesNzvc := False; u.writesX := False
+      u.readsNzvc := False; u.readsX := False; u.writesNzvc := writesNzvc; u.writesX := writesX
       u.isBranch := isBranch; u.ibranch := ibranch; u.stkPush := stkPush; u.anInc := anInc
+      u.ccrRestore := ccrRestore
       u.cond := cond; u.branchDisp := branchDisp
       u.unimplemented := False
       u.faulted := False; u.faultVector := 0; u.faultUsesNextPc := False
@@ -584,6 +597,26 @@ object MicroOpAssembler {
     val rtsLoad   = popUop(A7, disp = 0, dst = T0, first = True)
     val rtsBranch = retBranchUop(tgt = T0, an = A7, inc = 4)
 
+    // ── JSR (0x4E80|ea) — crack into [push.l retPC -> -(A7)] + [ibranch -> EA addr]. ─
+    // The push store is FIRST; the ibranch (ibrUop, firstOfInstr=False for JSR) jumps
+    // to the EA effective ADDRESS (psrcA = base An + imm = disp/folded), exactly like
+    // JMP's target. (No An postinc — JSR does not pop.)
+    val jsrPush = pushUop(A7, nextPc.asBits, first = True)
+
+    // ── RTR (0x4E77) — pop CCR (word) then PC (long); restore CCR; A7 += 6. ─────────
+    // Crack: [load.w (A7) -> CCR restore (NZVC:=d[3:0], X:=d[4])] + [load.l (A7+2) -> T0]
+    // + [ibranch -> T0 ; A7 += 6]. RTR restores ONLY the CCR (SR low byte), never the
+    // system byte. 3 µops (the widened AssembledUops budget). The CCR-restore load
+    // writes the renamed NZVC + X PRFs from the loaded byte; the PC load -> T0; the
+    // trailing ibranch redirects to T0 and folds A7 += 6 (2 for the CCR word + 4 PC).
+    val isRtrOp   = (op === B"16'h4E77")
+    val rtrCcr    = mkUop(cluster = Cluster.LS, memOp = MemOp.LOAD, size = Size.WORD,
+                          srcAReg = U(A7, 5 bits), srcAValid = True,
+                          useImm = True, imm = B(0, 32 bits),
+                          ccrRestore = True, writesNzvc = True, writesX = True, first = True)
+    val rtrPc     = popUop(A7, disp = 2, dst = T0, first = False)   // PC at (A7+2)
+    val rtrBranch = retBranchUop(tgt = T0, an = A7, inc = 6)
+
     // ── Sequence selection (each slot driven exactly once) ─────────────────────
     // pkt.fault  -> [op] (fetch fault delivery)
     // bad        -> [op] (count 1, op carries the illegal override)
@@ -591,7 +624,11 @@ object MicroOpAssembler {
     //               -> [illegal]
     // crackStore -> [store] (count 1)
     // crackLoad  -> [load, op] (count 2)
+    // JSR        -> [push, ibranch] (count 2)
+    // RTR        -> [pop.w ccr, pop.l pc, ibranch] (count 3)
     // else       -> [op] (count 1)
+    // Default the 3rd µop slot (only RTR uses it) so every path drives uops(2) once.
+    out.uops(2) := opUop
     when(pkt.fault) {
       // Fetch fault dominates: a single faulted (vector-2) delivery µop.
       out.count   := 1
@@ -620,6 +657,11 @@ object MicroOpAssembler {
       out.count   := 1
       out.uops(0) := Mux(jmpBad, opUop, ibrUop)
       out.uops(1) := Mux(jmpBad, opUop, ibrUop)
+    } elsewhen(isJsrOp) {
+      // JSR -> [push.l retPC -> -(A7)] + [ibranch -> EA addr]. Bad EA -> illegal.
+      out.count   := Mux(jsrBad, U(1, 2 bits), U(2, 2 bits))
+      out.uops(0) := Mux(jsrBad, opUop, jsrPush)
+      out.uops(1) := Mux(jsrBad, opUop, ibrUop)
     } elsewhen(isBsr) {
       // BSR -> [push.l retPC -> -(A7)] + [bra pc+2+disp].
       out.count   := 2
@@ -630,6 +672,12 @@ object MicroOpAssembler {
       out.count   := 2
       out.uops(0) := rtsLoad
       out.uops(1) := rtsBranch
+    } elsewhen(isRtrOp) {
+      // RTR -> [pop.w (A7) -> CCR] + [pop.l (A7+2) -> T0] + [ibranch -> T0 ; A7 += 6].
+      out.count   := 3
+      out.uops(0) := rtrCcr
+      out.uops(1) := rtrPc
+      out.uops(2) := rtrBranch
     } elsewhen(crackStore) {
       out.count   := 1
       out.uops(0) := stUop

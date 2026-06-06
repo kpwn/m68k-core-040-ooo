@@ -2,7 +2,7 @@ package m68k040.execute
 
 import m68k040.cache.{DcacheService, DLoadCmd, DStoreCmd}
 import m68k040.execute.iq.IqContext
-import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, RegFileReadPort, RegFileWritePort, RegFileBypassPort}
+import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, XRegFileService, RegFileReadPort, RegFileWritePort, RegFileBypassPort}
 import m68k040.isa.MemOp
 import m68k040.ls.{StoreQueue, SqAlloc, SqFwdQuery}
 import m68k040.services.DTranslationService
@@ -69,6 +69,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   var intByp: RegFileBypassPort = null
   var nzvcW: RegFileWritePort = null
   var nzvcByp: RegFileBypassPort = null
+  // X-flag write/bypass for the RTR CCR-restore load (X := loaded[4]).
+  var xW: RegFileWritePort = null
+  var xByp: RegFileBypassPort = null
 
   override def issue: Stream[IqContext] = issuePort
   override def completion: Flow[UInt]   = completionPort
@@ -118,6 +121,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val nz = host[NzvcRegFileService]
     nzvcW   = nz.newWrite(latency = 1)
     nzvcByp = nz.newBypass()
+    // X write/bypass for the RTR CCR-restore load (X := loaded[4]). rename gives the
+    // ccr-restore load a unique pXDst, so this is a distinct physical X write port.
+    val xrf = host[XRegFileService]
+    xW   = xrf.newWrite(latency = 1)
+    xByp = xrf.newBypass()
   }
 
   val logic = during build new Area {
@@ -334,11 +342,19 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // architectural commit is the trailing branch). The lock-step whitebox DROPS its
     // commit record (like DIVREM) but STILL folds its A7 write into the running A7.
     val compStkPush   = RegInit(False)
+    // RTR CCR-restore load: also a CRACK µop (the RTR macro instruction's single commit
+    // is the trailing ibranch) -> DROP its commit record (like stkPush) but still fold
+    // its CCR (NZVC/X) into the running architectural CCR.
+    val compCcrRestore = RegInit(False)
     val compDstArch   = Reg(UInt(5 bits))
     // NZVC writeback for a MOVE-to-memory store (N/Z of the moved value, V=C=0).
     val compNzvc      = Reg(Bits(4 bits))
     val compNzvcWrite = RegInit(False)
     val compNzvcDst   = Reg(UInt(nzvcW.address.getWidth bits))
+    // RTR CCR-restore (X := loaded[4]); NZVC := loaded[3:0] reuses compNzvc.
+    val compX         = RegInit(False)
+    val compXWrite    = RegInit(False)
+    val compXDst      = Reg(UInt(xW.address.getWidth bits))
     // MMU access-FAULT completion: when an access takes a DTLB rsp.fault, it still
     // COMPLETES (compValid -> the ROB marks the entry done so it can retire), but as
     // a FAULT: it writes NO register / allocs NO store / wakes nothing, and drives
@@ -408,17 +424,26 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compValid     := True
       compRobId     := s1Ctx.robId
       compData      := Mux(u1.stkPush, s1Va.asBits, result)
+      // A CCR-restore load writes NO int reg (it restores flags); a stack-push store's
+      // int dst is A7 (handled via compData above); a plain load writes its int dst.
       compPdst      := u1.pdst
-      compPdstValid := u1.pdstValid
+      compPdstValid := u1.pdstValid && !u1.ccrRestore
       compIsLoad    := isLoad
-      compWakes     := isLoad || u1.stkPush     // both produce an int reg -> wake
+      // Wake an int-producing load / stkPush store. A CCR-restore load produces no int
+      // reg, so it must NOT broadcast a (stale-pdst) wakeup.
+      compWakes     := (isLoad && !u1.ccrRestore) || u1.stkPush
       compStkPush   := u1.stkPush
+      compCcrRestore := u1.ccrRestore
       compDstArch   := u1.dstArch
-      // A MOVE store carries writesNzvc -> compute + write the renamed NZVC PRF.
-      // (Loads do not write NZVC: u1.writesNzvc is False for the load µop.)
-      compNzvc      := storeNzvc
+      // CCR-restore (RTR): NZVC := loaded[3:0], X := loaded[4] (CCR bit layout
+      // X=4,N=3,Z=2,V=1,C=0). Otherwise a MOVE-to-mem store's NZVC = N/Z of the stored
+      // value (V=C=0). A plain load writes neither (u1.writesNzvc/X are False).
+      compNzvc      := Mux(u1.ccrRestore, result(3 downto 0), storeNzvc)
       compNzvcWrite := u1.writesNzvc
       compNzvcDst   := u1.pNzvcDst
+      compX         := result(4)
+      compXWrite    := u1.writesX
+      compXDst      := u1.pXDst
       compIsFault   := False
     }
 
@@ -432,9 +457,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compRobId     := s1Ctx.robId
       compPdstValid := False
       compNzvcWrite := False
+      compXWrite    := False
       compIsLoad    := False
       compWakes     := False
       compStkPush   := False
+      compCcrRestore := False
       compIsFault   := True
       compFaultAddr := s1Va
       compFaultWr   := isStore
@@ -465,6 +492,13 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     nzvcByp.valid   := nzvcW.valid
     nzvcByp.address := nzvcW.address
     nzvcByp.data    := nzvcW.data
+    // X writeback + bypass for the RTR CCR-restore load (X := loaded[4]).
+    xW.valid     := compValid && compXWrite && !compIsFault
+    xW.address   := compXDst
+    xW.data      := B(compX)
+    xByp.valid   := xW.valid
+    xByp.address := xW.address
+    xByp.data    := xW.data
     // Dynamic load-wakeup: a completing LOAD or a STACK-PUSH store (both produce an
     // int physreg) broadcasts; a plain store completes too but writes no register.
     wakeupPort.valid   := compValid && compWakes && compPdstValid && !compIsFault
@@ -503,6 +537,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // compIsFault likewise (so a non-faulting access never lingers a stale fault).
     compValid := False
     compNzvcWrite := False
+    compXWrite := False
     compIsFault := False
 
     val fsm = new StateMachine {
@@ -664,14 +699,14 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     wbObs.dstArch   := compDstArch
     wbObs.result    := compData
     wbObs.intWrite  := compPdstValid
-    wbObs.nzvc      := compNzvc          // MOVE-to-memory store flags (else don't-care)
-    wbObs.nzvcWrite := compNzvcWrite     // True only for a MOVE-to-memory store
-    wbObs.x         := False
-    wbObs.xWrite    := False
+    wbObs.nzvc      := compNzvc          // MOVE-to-mem store flags OR RTR CCR-restore NZVC
+    wbObs.nzvcWrite := compNzvcWrite     // store NZVC or RTR CCR-restore
+    wbObs.x         := compX             // RTR CCR-restore X (loaded[4])
+    wbObs.xWrite    := compXWrite
     // Reuse `divRem` as the generic "crack µop — DROP this commit record" marker: a
     // stack-push store is the leading crack µop of BSR/JSR (the trailing branch is the
     // macro instruction's single commit). Its A7 write is still folded into running A7.
-    wbObs.divRem    := compStkPush
+    wbObs.divRem    := compStkPush || compCcrRestore
     wbObs.simPublic()
 
     // ── Exception-unit cache arbitration MUX (LAST drivers — override the LS EU's

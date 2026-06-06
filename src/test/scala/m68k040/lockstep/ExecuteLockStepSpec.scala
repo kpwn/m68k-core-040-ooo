@@ -859,6 +859,74 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 8)
   }
 
+  // ── JSR (call via the EA address) ──────────────────────────────────────────
+  test("lock-step: jsr (An) ... rts", VerilatorTest) {
+    // A0 = sub; jsr (A0) pushes retPC + jumps to sub; sub does moveq#3 + rts.
+    // Executed to sentinel: moveq#1, move.l#sub a0, jsr(a0), moveq#3, rts, moveq#7 = 6.
+    runLockStep("jsr-an",
+      "moveq #1,%d0 ; move.l #sub,%a0 ; jsr (%a0) ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "sub: moveq #3,%d1 ; rts",
+      nInstr = 6)
+  }
+
+  test("lock-step: jsr (xxx).L ... rts", VerilatorTest) {
+    // jsr sub (absolute long). Executed: moveq#1, jsr(abs), moveq#3, rts, moveq#7 = 5.
+    runLockStep("jsr-abs",
+      "moveq #1,%d0 ; jsr (sub).l ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "sub: moveq #3,%d1 ; rts",
+      nInstr = 5)
+  }
+
+  test("lock-step: jsr (d16,PC) ... rts", VerilatorTest) {
+    // jsr sub(pc) (PC-relative). Executed: moveq#1, jsr(pcrel), moveq#3, rts, moveq#7 = 5.
+    runLockStep("jsr-pcrel",
+      "moveq #1,%d0 ; jsr sub(%pc) ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "sub: moveq #3,%d1 ; rts",
+      nInstr = 5)
+  }
+
+  test("lock-step: jsr (d16,An) ... rts", VerilatorTest) {
+    // A0 = sub - 8 ; jsr 8(A0) -> sub. Executed: moveq#1, move.l#sub-8 a0, jsr 8(a0),
+    // moveq#3, rts, moveq#7 = 6.
+    runLockStep("jsr-d16an",
+      "moveq #1,%d0 ; move.l #sub-8,%a0 ; jsr 8(%a0) ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "sub: moveq #3,%d1 ; rts",
+      nInstr = 6)
+  }
+
+  test("lock-step: store.l then load.l same addr (drain race probe)", VerilatorTest) {
+    // Isolation probe for the RTR flake: store a long to 0x2002 (a never-resident line),
+    // space it, then load.l 0x2002 -> d7. If this flakes, the store->miss-load drain is
+    // a general harness/core issue (not RTR-specific).
+    runLockStep("st-ld-drain",
+      "move.l #0x12345678,%d1 ; move.l %d1,0x2002 ; moveq #1,%d4 ; moveq #1,%d5 ; " +
+      "moveq #1,%d6 ; move.l 0x2002,%d7 ; .stop: bra .stop",
+      nInstr = 6, checkMem = Seq(0x2002L))
+  }
+
+  // ── RTR (restore CCR + PC) ─────────────────────────────────────────────────
+  test("lock-step: rtr (restore CCR + PC) via a hand-built frame", VerilatorTest) {
+    // The 040 RTR pops a CCR word @(A7) then a PC long @(A7+2), A7 += 6, restoring ONLY
+    // the CCR (SR low byte) and jumping to the popped PC. Predecrement/move-from-SR are
+    // not in scope yet, so we hand-build the frame in a data page via MOVE-to-abs stores
+    // then point A7 at it: mem[0x2000] = 0x0004 (CCR word, Z=1), mem[0x2002] = target.
+    //   moveq#4,d0 ; move.w d0,(0x2000).w  (CCR word)
+    //   move.l #target,d1 ; move.l d1,(0x2002).l  (PC long)
+    //   move.l #0x2000,a7 ; rtr   (pop CCR+PC, A7 -> 0x2006, jump to target)
+    //   target: moveq#7,d2 ; .stop: bra .stop
+    // rtr restores CCR=0x04 (Z set) + redirects to target. Executed: moveq#4,
+    // move.w-store, move.l#target, move.l-store, move.l#0x2000-to-a7, rtr, moveq#7 = 7.
+    // A real RTR frame is stacked by the (long-committed) caller — resident in memory
+    // before RTR. Our test stacks it inline, so we (a) space the stores out and (b) read
+    // the frame line back into d4/d5 first, which refills the (no-allocate-store) line
+    // into L1D with the drained store data; RTR's two pops then HIT the resident line.
+    runLockStep("rtr-frame",
+      "moveq #4,%d0 ; move.w %d0,0x2000 ; move.l #target,%d1 ; move.l %d1,0x2002 ; " +
+      "move.l 0x2000,%d4 ; move.l 0x2002,%d5 ; " +
+      "move.l #0x2000,%a7 ; rtr ; target: moveq #7,%d2 ; .stop: bra .stop",
+      nInstr = 9, checkMem = Seq(0x2000L))
+  }
+
   test("lock-step: backward bne.s loop (one backward taken)", VerilatorTest) {
     // D0=2 (counter), D1=1 (decrement). Loop body sub.l d1,d0 ; bne.s .L:
     //   iter1: 2-1=1 (Z=0) -> bne TAKEN  (backward commit-time redirect to .L)

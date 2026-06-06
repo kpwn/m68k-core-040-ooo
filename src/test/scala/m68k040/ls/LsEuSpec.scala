@@ -4,7 +4,7 @@ import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
 import m68k040.cache.DcachePlugin
 import m68k040.execute.LsEuPlugin
-import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc}
+import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
 import m68k040.isa.{MemOp, Size}
 import m68k040.mmu.DIdentityTranslationPlugin
 import spinal.core._
@@ -20,11 +20,12 @@ class LsEuSpec extends AnyFunSuite {
     val param  = new ParamPlugin(M68kParams())
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc   // LS EU now writes NZVC for MOVE-to-memory
+    val rfX    = new RegFilePluginX     // LS EU now writes X for RTR CCR-restore
     val xlate  = new DIdentityTranslationPlugin
     val dcache = new DcachePlugin
     val eu     = new LsEuPlugin
     val src    = new LsEuSourcePlugin
-    db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, xlate, dcache, eu, src)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, xlate, dcache, eu, src)) }
   }
 
   def simConfig = M68kSim().withVerilator
