@@ -18,8 +18,44 @@ object OperationDecoder {
     val easrc   = OperandSrc(); easrc.kind := OperandKind.EASRC;  easrc.isAddr := False
     val eadst   = OperandSrc(); eadst.kind := OperandKind.EADST;  eadst.isAddr := False
     val immq    = OperandSrc(); immq.kind  := OperandKind.IMMQ;   immq.isAddr := False
+    val immext  = OperandSrc(); immext.kind := OperandKind.IMMEXT; immext.isAddr := False
 
     switch(line) {
+      // ---- Line-0 immediates: ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea> ----
+      // 0000 ooo0 ss mmmrrr + imm. opmode ooo (bits 11:9): 0=ORI,1=ANDI,2=SUBI,
+      // 3=ADDI,5=EORI,6=CMPI (4=bit/BTST-imm, 7=MOVES -> out of scope). bit8=0; size
+      // ss (bits 7:6): 00=.B,01=.W,10=.L (11 illegal). The IMMEDIATE is srcB (the
+      // trailing ext word(s), sized by the op); the EA (op[5:0]) is the DESTINATION
+      // operand (srcA, read) AND the writeback dst (dst=EASRC). CMPI writes no reg.
+      // Register/data-reg destination only this slice (memory-dest RMW deferred -> the
+      // assembler gates a non-data-reg EA to illegal). EA-agnostic: the assembler
+      // maps EASRC to the EA register / cracks; this decoder just names the operands.
+      is(0x0) {
+        val opmode = opword(11 downto 9)
+        val ss     = opword(7 downto 6)
+        val isImm  = !opword(8) && (opmode === 0 || opmode === 1 || opmode === 2 ||
+                                    opmode === 3 || opmode === 5 || opmode === 6)
+        when(isImm && ss =/= 3) {
+          o.illegal := False
+          switch(opmode) {
+            is(0) { o.op := DecOp.OR }
+            is(1) { o.op := DecOp.AND }
+            is(2) { o.op := DecOp.SUB }
+            is(3) { o.op := DecOp.ADD }
+            is(5) { o.op := DecOp.EOR }
+            is(6) { o.op := DecOp.CMP }
+          }
+          o.srcA := easrc                      // EA = the destination operand (read)
+          o.srcB := immext                     // the trailing immediate word(s)
+          o.dst  := easrc                       // writeback to the same EA register
+          when(opmode =/= 6) { o.dstWrites := True }   // CMPI writes no reg
+          when(ss === 0) { o.size := Size.BYTE }
+            .elsewhen(ss === 1) { o.size := Size.WORD }
+            .otherwise { o.size := Size.LONG }
+          when(opmode === 2 || opmode === 3) { o.writesNzvc := True; o.writesX := True }   // ADDI/SUBI
+            .otherwise { o.writesNzvc := True }                                            // AND/OR/EOR/CMP
+        }
+      }
       // ---- MOVEQ (0111 rrr0 dddddddd) ----
       is(0x7) {
         when(opword(8) === False) {

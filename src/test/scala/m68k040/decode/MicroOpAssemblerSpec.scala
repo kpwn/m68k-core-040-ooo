@@ -69,6 +69,40 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
   test("EOR.B D2,(A0) (mem dest) -> unimplemented (RMW deferred)", VerilatorTest) { run { dut => drive(dut, 0xB510); sleep(1)
     assert(dut.uop.unimplemented.toBoolean && dut.uop.memOp.toEnum == MemOp.NONE)
   }}
+  // Line-0 immediates: srcA = EA reg (Dn dst operand), srcB = the trailing imm
+  // word(s) via useImm, dst = EA reg. ADDI.L #imm,D0 (0x0680) + imm32 = words(1..2).
+  test("ADDI.L #0x12345678,D0 (reg dest): srcA=D0, useImm imm32, dst=D0, NZVCX", VerilatorTest) {
+    run { dut => drive(dut, 0x0680, 0x1234, 0x5678, len = 3); sleep(1)
+      assert(dut.uop.op.toEnum == DecOp.ADD && !dut.uop.unimplemented.toBoolean)
+      assert(dut.uop.srcAReg.toInt == 0 && dut.uop.srcAValid.toBoolean)
+      assert(dut.uop.useImm.toBoolean && dut.uop.imm.toLong == 0x12345678L && !dut.uop.srcBValid.toBoolean)
+      assert(dut.uop.dstReg.toInt == 0 && dut.uop.dstValid.toBoolean)
+      assert(dut.uop.writesNzvc.toBoolean && dut.uop.writesX.toBoolean && dut.uop.size.toEnum == Size.LONG)
+    }
+  }
+  // ANDI.W #0xABCD,D3 (0x0243) + imm word = words(1). .W -> 1 imm word.
+  test("ANDI.W #0xABCD,D3 (reg dest): useImm low word, dst=D3, NZ no X", VerilatorTest) {
+    run { dut => drive(dut, 0x0243, 0xABCD, len = 2); sleep(1)
+      assert(dut.uop.op.toEnum == DecOp.AND && !dut.uop.unimplemented.toBoolean)
+      assert(dut.uop.srcAReg.toInt == 3 && dut.uop.dstReg.toInt == 3 && dut.uop.dstValid.toBoolean)
+      assert(dut.uop.useImm.toBoolean && (dut.uop.imm.toLong & 0xffff) == 0xABCD)
+      assert(dut.uop.writesNzvc.toBoolean && !dut.uop.writesX.toBoolean && dut.uop.size.toEnum == Size.WORD)
+    }
+  }
+  // CMPI.L #imm,D1 (0x0C81): writes NO register.
+  test("CMPI.L #imm,D1 (reg dest): no dst write, NZVC", VerilatorTest) {
+    run { dut => drive(dut, 0x0C81, 0x0000, 0x0001, len = 3); sleep(1)
+      assert(dut.uop.op.toEnum == DecOp.CMP && !dut.uop.dstValid.toBoolean && dut.uop.writesNzvc.toBoolean)
+      assert(dut.uop.srcAReg.toInt == 1 && dut.uop.useImm.toBoolean && dut.uop.imm.toLong == 1)
+    }
+  }
+  // ADDI.B #imm,(A0) (0x0610): memory destination = deferred RMW -> illegal. Must NOT
+  // crack a leading load.
+  test("ADDI.B #imm,(A0) (mem dest) -> unimplemented (RMW deferred)", VerilatorTest) {
+    run { dut => drive(dut, 0x0610, 0x0042, len = 2); sleep(1)
+      assert(dut.uop.unimplemented.toBoolean && dut.uop.memOp.toEnum == MemOp.NONE)
+    }
+  }
   test("non-simple packet -> unimplemented", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       drive(dut, 0x7605); dut.pkt.simple #= false; dut.pkt.complex #= true; sleep(1)

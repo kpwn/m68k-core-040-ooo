@@ -40,6 +40,15 @@ object MicroOpAssembler {
     val dstEaField = op(8 downto 6) ## op(11 downto 9)
     val dstEa = EaDecoder.decode(dstEaField, spec.size, pkt.words)
 
+    // Line-0 immediate (IMMEXT): the trailing extension word(s), sized by the op.
+    // .L = words(1)##words(2) (the full 32-bit value); .B/.W = words(1) (sign-extended,
+    // matching the EaDecoder #imm path — only the low `size` bits are consumed by the
+    // ALU / flag logic, so the upper extension is don't-care). The imm precedes any EA
+    // ext, and a line-0 immediate's EA is mode0 (Dn, no ext) -> words(1..2) are the imm.
+    val immExt = Mux(spec.size === Size.LONG,
+                     pkt.words(1) ## pkt.words(2),
+                     pkt.words(1).asSInt.resize(32).asBits)
+
     // ── Operand classification ───────────────────────────────────────────────
     val srcIsReg = (srcEa.klass === EaClass.DATAREG) || (srcEa.klass === EaClass.ADDRREG)
     val srcIsMem = (srcEa.klass === EaClass.MEMSIMPLE)
@@ -136,6 +145,7 @@ object MicroOpAssembler {
       }
       is(OperandKind.EADST) { opUop.srcBReg := dstEa.reg; opUop.srcBValid := True }
       is(OperandKind.IMMQ)  { opUop.useImm := True; opUop.imm := op(7 downto 0).asSInt.resize(32).asBits }
+      is(OperandKind.IMMEXT) { opUop.useImm := True; opUop.imm := immExt }   // line-0 trailing imm word(s)
       default {}
     }
 
@@ -242,6 +252,12 @@ object MicroOpAssembler {
     // the deferred RMW (load-op-store) form -> illegal. `eorMemBad` forces the illegal
     // path (it must NOT crack a leading load, which the generic srcEaOk would do).
     val eorMemBad = (spec.op === DecOp.EOR) && (srcEa.klass =/= EaClass.DATAREG)
+    // Line-0 immediate (srcB = IMMEXT): the EA (op[5:0]) is the DESTINATION. This slice
+    // supports a DATA-REGISTER destination only; a memory / An-direct / #imm EA is the
+    // deferred RMW (or illegal) form -> illegal. (The non-privileged to-CCR forms are a
+    // SEPARATE encoding handled below; they are NOT gated here.)
+    val isLineImm  = spec.srcB.kind === OperandKind.IMMEXT
+    val lineImmBad = isLineImm && (srcEa.klass =/= EaClass.DATAREG)
     // ── RTE (0x4E73) — a serializing return-from-exception µop (privileged). ────
     // Decoded here (line 0x4 is otherwise unimplemented) so it is NOT treated as an
     // illegal instruction. It commits like a no-op op µop but carries isRte; the
@@ -281,7 +297,7 @@ object MicroOpAssembler {
     val isRtrBad = (op === B"16'h4E77")
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad &&
-              (!pkt.simple || spec.illegal || eorMemBad || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
+              (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     // A JMP/JSR with a non-control EA is illegal (vector 4).
     val jmpBad = isJmpOp && !ctrlEaOk
     val jsrBad = isJsrOp && !ctrlEaOk
