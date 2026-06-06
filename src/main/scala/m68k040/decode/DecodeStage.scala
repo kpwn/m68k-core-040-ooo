@@ -74,35 +74,34 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val a0 = MicroOpAssembler.assemble(fed.payload.packets(0))
     val a1raw = MicroOpAssembler.assemble(fed.payload.packets(1))
 
-    // Stash for a deferred 3-µop slot1 (RTR-in-slot1). Holds slot1's packet; when
-    // valid, the NEXT cycle decodes IT solo (and we do not consume a new fed group).
-    val stashValid  = RegInit(False)
-    val stashPacket = Reg(DecodePacket())
+    // Stash for a deferred 3-µop slot1 (RTR-in-slot1). FMax: stash the ALREADY-DECODED
+    // slot1 µops (computed from a1raw, no second MicroOpAssembler instance) — the
+    // replay cycle reads these REGISTERS instead of re-assembling, keeping the decode-
+    // crack cone off the queue-push critical arc. Rare path (RTR after a non-control
+    // slot0): a1raw is the 3-µop RTR crack.
+    val stashValid = RegInit(False)
+    val stashUops  = Reg(Vec(DecodedUop(), 3))
     when(pipeFlush) { stashValid := False }
 
-    // The instruction being decoded this cycle: the stashed RTR (if pending) else
-    // slot0 of the current fed group.
-    val curPacket = Mux(stashValid, stashPacket, fed.payload.packets(0))
-    val aCur = Mux(stashValid, MicroOpAssembler.assemble(stashPacket), a0)
-
-    val curIs3   = aCur.count === U(3, 2 bits)
     val slot1Is3 = a1raw.count === U(3, 2 bits)
     val slot0Is3 = a0.count === U(3, 2 bits)
 
-    // slot1 is emitted alongside slot0 only when: not decoding a stash, slot1 present,
+    // slot1 is emitted alongside slot0 only when: not replaying a stash, slot1 present,
     // slot0 is NOT 3-µop, and slot1 itself is NOT 3-µop (a 3-µop slot1 is deferred).
     val slot1Emit = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Is3 && !slot1Is3
     // Defer slot1 to the stash when it is a 3-µop crack paired after a ≤2-µop slot0.
     val deferSlot1 = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Is3 && slot1Is3
 
-    val nCur = aCur.count                                  // 1..3 (the head instruction)
+    // Head instruction this cycle: the stashed RTR (registered uops) else slot0 (a0).
+    val nCur = Mux(stashValid, U(3, 2 bits), a0.count)     // 1..3
     val n1   = Mux(slot1Emit, a1raw.count, U(0, 2 bits))   // slot1 µops (0 if not emitted)
 
     // Pack: positions 0..2 = head instruction's µops; the slot1 µops follow at nCur..
     // (only when slot1Emit, where nCur<=2 and n1<=2, so max position 3).
-    queue.io.push.uops(0) := aCur.uops(0)
-    queue.io.push.uops(1) := Mux(nCur >= U(2), aCur.uops(1), a1raw.uops(0))
-    queue.io.push.uops(2) := Mux(curIs3, aCur.uops(2), Mux(nCur === U(2), a1raw.uops(0), a1raw.uops(1)))
+    def headUop(i: Int): DecodedUop = Mux(stashValid, stashUops(i), a0.uops(i))
+    queue.io.push.uops(0) := headUop(0)
+    queue.io.push.uops(1) := Mux(nCur >= U(2), headUop(1), a1raw.uops(0))
+    queue.io.push.uops(2) := Mux(nCur === U(3), headUop(2), Mux(nCur === U(2), a1raw.uops(0), a1raw.uops(1)))
     queue.io.push.uops(3) := a1raw.uops(1)
 
     val totalCount = (nCur +^ n1).resize(3)            // 1..4
@@ -112,14 +111,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
 
     // Consume the fed group only when NOT replaying a stash AND the queue accepted.
     // When deferring slot1, we still consume the group THIS cycle (slot0 emitted) and
-    // set the stash; the stash replays slot1 next cycle without consuming a new group.
+    // register the decoded slot1 µops; the stash replays them next cycle.
     fed.ready := !stashValid && queue.io.push.ready
     when(queue.io.push.ready) {
       when(stashValid) {
         stashValid := False                  // the stashed RTR was emitted this cycle
       } elsewhen(deferSlot1 && fed.valid) {
         stashValid  := True                  // defer slot1 (RTR) to next cycle
-        stashPacket := fed.payload.packets(1)
+        for (i <- 0 until 3) { stashUops(i) := a1raw.uops(i) }
       }
     }
 
