@@ -24,8 +24,9 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
   val logic = during build new Area {
     val du = host[DecodeUopService]
 
-    // ── RATs (int RAT: 4 src reads + 2 dst-old reads = 6 read ports) ─────────
-    val intRat  = RatTable(physIdWidth = 6, archDepth = 18, writePorts = 2, commitPorts = 2, readPorts = 6)
+    // ── RATs (int RAT: 4 srcA/B reads + 2 srcC reads + 2 dst-old reads = 8 ports) ──
+    // srcC is the DIVU.L/DIVS.L 64/32 dividend-high (Dr) source (per slot).
+    val intRat  = RatTable(physIdWidth = 6, archDepth = 18, writePorts = 2, commitPorts = 2, readPorts = 8)
     val nzvcRat = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = 2, readPorts = 2)
     val xRat    = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = 2, readPorts = 2)
 
@@ -117,6 +118,8 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       intRat.io.reads(2 * s + 1).addr := dec.srcBReg
       // int dst-old read
       intRat.io.reads(4 + s).addr     := dec.dstReg
+      // int srcC read (DIV.L 64/32 dividend-high Dr; ports 6,7)
+      intRat.io.reads(6 + s).addr     := dec.srcCReg
       // flag src reads (single arch entry, addr 0)
       nzvcRat.io.reads(s).addr := 0
       xRat.io.reads(s).addr    := 0
@@ -155,6 +158,8 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.psrcAValid := dec.srcAValid
       r.psrcB      := intRat.io.reads(2 * s + 1).data
       r.psrcBValid := dec.srcBValid
+      r.psrcC      := intRat.io.reads(6 + s).data
+      r.psrcCValid := dec.srcCValid
 
       // int dst allocation
       intFree.io.pop(s).take := slotEn && dec.dstValid
@@ -197,6 +202,7 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     // int RAW
     when(dec0.dstValid && dec0.dstReg === dec1.srcAReg) { slot1.psrcA := slot0.pdst }
     when(dec0.dstValid && dec0.dstReg === dec1.srcBReg) { slot1.psrcB := slot0.pdst }
+    when(dec0.dstValid && dec0.dstReg === dec1.srcCReg) { slot1.psrcC := slot0.pdst }
     // int dst-old: slot1 overwrites a reg slot0 also wrote -> old is slot0's pdst
     when(dec0.dstValid && dec0.dstReg === dec1.dstReg)  { slot1.pdstOld := slot0.pdst }
     // flag RAW (single arch entry)

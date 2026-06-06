@@ -309,6 +309,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       }
       dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcA, uop.psrcAValid)
       dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcB, srcBIsReg(uop))
+      dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcC, uop.psrcCValid)
       dep(sbNzvc.busy, sbNzvc.physToSlot, uop.pNzvcSrc, uop.readsNzvc)
       dep(sbX.busy,    sbX.physToSlot,    uop.pXSrc, uop.readsX)
       t
@@ -333,28 +334,32 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     def stillBusy(p: UInt): Bool =
       lsBusy(p) && !(lsWakeupPort.valid && lsWakeupPort.payload === p)
     def lsDepInit(uop: RenamedUop): Bool =
-      (uop.psrcAValid && stillBusy(uop.psrcA)) || (srcBIsReg(uop) && stillBusy(uop.psrcB))
+      (uop.psrcAValid && stillBusy(uop.psrcA)) || (srcBIsReg(uop) && stillBusy(uop.psrcB)) ||
+      (uop.psrcCValid && stillBusy(uop.psrcC))
     val lsDep0 = lsDepInit(pushUop0)
     val lsDep1Base = lsDepInit(pushUop1)
     // Intra-push: slot1 reads slot0's dst and slot0 is an LS load -> slot1 waits.
     val s0IsLsLoad = isLs(pushUop0) && (pushUop0.memOp === m68k040.isa.MemOp.LOAD) && pushUop0.pdstValid
     val lsDep1 = lsDep1Base ||
       (s0IsLsLoad && pushUop1.psrcAValid && (pushUop1.psrcA === pushUop0.pdst)) ||
-      (s0IsLsLoad && srcBIsReg(pushUop1) && (pushUop1.psrcB === pushUop0.pdst))
+      (s0IsLsLoad && srcBIsReg(pushUop1) && (pushUop1.psrcB === pushUop0.pdst)) ||
+      (s0IsLsLoad && pushUop1.psrcCValid && (pushUop1.psrcC === pushUop0.pdst))
 
     // Push-time CPLX (DivEu) dependency: same mechanism as LS but on cplxBusy /
     // cplxWakeup. A consumer of an in-flight DIV result latches cplxWait.
     def stillCplxBusy(p: UInt): Bool =
       cplxBusy(p) && !(cplxWakeupPort.valid && cplxWakeupPort.payload === p)
     def cplxDepInit(uop: RenamedUop): Bool =
-      (uop.psrcAValid && stillCplxBusy(uop.psrcA)) || (srcBIsReg(uop) && stillCplxBusy(uop.psrcB))
+      (uop.psrcAValid && stillCplxBusy(uop.psrcA)) || (srcBIsReg(uop) && stillCplxBusy(uop.psrcB)) ||
+      (uop.psrcCValid && stillCplxBusy(uop.psrcC))
     val cplxDep0 = cplxDepInit(pushUop0)
     val cplxDep1Base = cplxDepInit(pushUop1)
     // Intra-push: slot1 reads slot0's dst and slot0 is a DIV producer -> slot1 waits.
     val s0IsCplxProd = isCplxProducer(pushUop0)
     val cplxDep1 = cplxDep1Base ||
       (s0IsCplxProd && pushUop1.psrcAValid && (pushUop1.psrcA === pushUop0.pdst)) ||
-      (s0IsCplxProd && srcBIsReg(pushUop1) && (pushUop1.psrcB === pushUop0.pdst))
+      (s0IsCplxProd && srcBIsReg(pushUop1) && (pushUop1.psrcB === pushUop0.pdst)) ||
+      (s0IsCplxProd && pushUop1.psrcCValid && (pushUop1.psrcC === pushUop0.pdst))
     // Intra-push: slot1 reads a physreg that slot0 (pushed same cycle) writes.
     // slot0 ends at slot0Prio; set slot1's trigger bit there.
     //
@@ -371,6 +376,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val s0WritesX    = pushUop0.writesX
     when(s0WritesInt  && pushUop1.psrcAValid && pushUop1.psrcA === pushUop0.pdst)              { trig1(slot0Prio) := True }
     when(s0WritesInt  && srcBIsReg(pushUop1) && pushUop1.psrcB === pushUop0.pdst) { trig1(slot0Prio) := True }
+    when(s0WritesInt  && pushUop1.psrcCValid && pushUop1.psrcC === pushUop0.pdst) { trig1(slot0Prio) := True }
     when(s0WritesNzvc && pushUop1.readsNzvc && pushUop1.pNzvcSrc === pushUop0.pNzvcDst)        { trig1(slot0Prio) := True }
     when(s0WritesX    && pushUop1.readsX    && pushUop1.pXSrc === pushUop0.pXDst)              { trig1(slot0Prio) := True }
 
@@ -424,7 +430,8 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       val u = s.context.uop
       lsWakeupPort.valid && s.sel &&
         ((u.psrcAValid && (u.psrcA === lsWakeupPort.payload)) ||
-         (srcBIsReg(u) && (u.psrcB === lsWakeupPort.payload)))
+         (srcBIsReg(u) && (u.psrcB === lsWakeupPort.payload)) ||
+         (u.psrcCValid && (u.psrcC === lsWakeupPort.payload)))
     })
     for (i <- 0 until slotCount) {
       when(lsWakeMatch(i)) {
@@ -440,7 +447,8 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       val u = s.context.uop
       cplxWakeupPort.valid && s.sel &&
         ((u.psrcAValid && (u.psrcA === cplxWakeupPort.payload)) ||
-         (srcBIsReg(u) && (u.psrcB === cplxWakeupPort.payload)))
+         (srcBIsReg(u) && (u.psrcB === cplxWakeupPort.payload)) ||
+         (u.psrcCValid && (u.psrcC === cplxWakeupPort.payload)))
     })
     for (i <- 0 until slotCount) {
       when(cplxWakeMatch(i)) {

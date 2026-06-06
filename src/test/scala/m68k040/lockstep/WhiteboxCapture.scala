@@ -12,9 +12,13 @@ import scala.collection.mutable
   */
 object WhiteboxCapture {
 
-  /** One EU writeback observation (the value + flags + write masks for a robId). */
+  /** One EU writeback observation (the value + flags + write masks for a robId).
+    * `divRem` marks the trailing DIVREM crack µop -> its commit is DROPPED (the 2-µop
+    * DIVU.L/DIVS.L maps to ONE oracle instruction step; the Dr write still lands in the
+    * PRF and is verified by a later instruction that reads Dr). */
   final case class Wb(dstArch: Int, result: Long, intWrite: Boolean,
-                      nzvc: Int, nzvcWrite: Boolean, x: Int, xWrite: Boolean)
+                      nzvc: Int, nzvcWrite: Boolean, x: Int, xWrite: Boolean,
+                      divRem: Boolean = false)
 
   /** Stateful reconstruction handle. Drive `onWb` for every cycle an EU's wbObs
     * is valid, and `onCommit` for every fired ROB commit-obs (in retire order).
@@ -44,7 +48,10 @@ object WhiteboxCapture {
       val wb = wbMap.getOrElse(robId,
         sys.error(s"commit robId=$robId with no writeback observed"))
       val isTempOnly = wb.intWrite && wb.dstArch >= 16 && !wb.nzvcWrite && !wb.xWrite
-      if (!isTempOnly) commits += NormRec(pc, sysByte, a7, wb)
+      // The DIVREM crack µop is part of the SAME architectural instruction as its DIV
+      // -> drop its commit record (one oracle step per instruction). Its Dr write is in
+      // the PRF and checked by a later reader.
+      if (!isTempOnly && !wb.divRem) commits += NormRec(pc, sysByte, a7, wb)
     }
 
     /** Record an exception / RTE "instruction" commit: the handler-entry / restored

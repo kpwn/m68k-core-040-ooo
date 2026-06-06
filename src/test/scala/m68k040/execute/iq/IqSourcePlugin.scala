@@ -62,6 +62,15 @@ class IqSourcePlugin extends FiberPlugin {
       u.pNzvcSrc     := io.pNzvcSrc;   u.pNzvcDst   := io.pNzvcDst
       u.readsX       := io.readsX;     u.writesX    := io.writesX
       u.pXSrc        := io.pXSrc;      u.pXDst      := io.pXDst
+      // Third source (DIV.L 64/32) + CPLX/div control + precise-fault fields: safe
+      // defaults (these IQ tests don't exercise DIV/CHK/faults).
+      u.psrcC        := 0; u.psrcCValid := False
+      u.divSigned    := False; u.div64 := False; u.divIsRem := False
+      u.nextPc       := 0
+      u.faulted      := False; u.faultVector := 0; u.faultUsesNextPc := False
+      u.isRte        := False; u.isTrapv := False
+      u.faultAddr    := 0; u.sswInstr := False
+      u.firstOfInstr := True
       c
     }
 

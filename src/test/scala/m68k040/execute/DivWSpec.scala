@@ -39,6 +39,7 @@ class DivWSpec extends AnyFunSuite {
       uop.dstArch := 0
       uop.psrcA := 3; uop.psrcAValid := True       // dividend Dn (phys 3)
       uop.psrcB := 4; uop.psrcBValid := True       // 16-bit divisor (phys 4)
+      uop.psrcC := 0; uop.psrcCValid := False
       uop.pdst := iPdst; uop.pdstValid := True; uop.pdstOld := 0
       uop.pNzvcSrc := 0; uop.readsNzvc := False
       uop.pNzvcDst := 1; uop.writesNzvc := True; uop.pNzvcOld := 0

@@ -54,12 +54,21 @@ object PredecodeRef {
         // CHK.W/CHK.L (0100 ddd 1 s 0 mmmrrr): bit8=1, bit6=0; bound is an EA source
         // (sizeL = .L when bit7=0). 1 opword + the EA extension words.
         val isChk = ((op >> 8) & 1) == 1 && ((op >> 6) & 1) == 0
+        // DIVU.L/DIVS.L (0100 1100 01 mmmrrr): opword + DIV.L ext word + 32-bit-divisor
+        // EA ext. MUL.L (...00...) stays complex.
+        val isDivL = ((op >> 6) & 0x3ff) == 0x131
         if (isTrap || isTrapv) CP(simple = true, lenWords = 1)
         else if (isChk) {
           val sizeL   = ((op >> 7) & 1) == 0
           val srcMode = (op >> 3) & 7; val srcReg = op & 7
           eaExt(srcMode, srcReg, sizeL, allowImm = true) match {
             case Some(e) => CP(simple = true, lenWords = 1 + e)
+            case None    => COMPLEX
+          }
+        } else if (isDivL) {
+          val srcMode = (op >> 3) & 7; val srcReg = op & 7
+          eaExt(srcMode, srcReg, sizeL = true, allowImm = true) match {
+            case Some(e) => CP(simple = true, lenWords = 2 + e)
             case None    => COMPLEX
           }
         } else COMPLEX

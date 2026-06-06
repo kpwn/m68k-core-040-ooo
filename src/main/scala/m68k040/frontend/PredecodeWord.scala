@@ -113,6 +113,19 @@ object PredecodeWord {
             r.lenWords := (U(1, 3 bits) + e).resized
           }
         }
+        // DIVU.L/DIVS.L (0100 1100 01 mmmrrr): opword + 1 extension word (the Dq/Dr/
+        // signed/size word) + the 32-bit-divisor EA extension. MUL.L (...00...) stays
+        // complex (separate slice).
+        val isDivL = op(15 downto 6) === B"10'b0100110001"
+        when(isDivL) {
+          val srcMode = op(5 downto 3).asUInt
+          val srcReg  = op(2 downto 0).asUInt
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL = True, allowImm = true)  // 32-bit divisor
+          when(ok) {
+            r.simple   := True
+            r.lenWords := (U(2, 3 bits) + e).resized   // opword + DIV.L ext word + EA ext
+          }
+        }
       }
 
       // MOVEQ

@@ -72,17 +72,19 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val u0 = issuePort.payload.uop
     rdA.addr := u0.psrcA
     rdB.addr := u0.psrcB
-    rdH.addr := u0.psrcB     // (DIV64 high word; decode points psrcB pair — refined in T7)
+    rdH.addr := u0.psrcC     // DIV.L 64/32 dividend HIGH word (Dr) via the 3rd source
     val s0A = rdA.data
     val s0B = Mux(u0.useImm, u0.imm, rdB.data)
     val s0H = rdH.data
 
-    // single-outstanding busy
+    // single-outstanding busy. A µop occupying s1 (not yet consumed) ALSO blocks a new
+    // issue — otherwise a 2nd µop (e.g. the cracked DIVREM following its DIV) would
+    // fire the cycle after the first while `busy` is still being set, overwriting s1.
     val busy = RegInit(False)
-    issuePort.ready := !busy
+    val s1Valid = RegInit(False)
+    issuePort.ready := !busy && !s1Valid
 
     // ---- S0 -> S1 register (M2S), captured on issue.fire ----
-    val s1Valid = RegInit(False)
     val s1Ctx   = Reg(IqContext())
     val s1A     = Reg(Bits(32 bits))
     val s1B     = Reg(Bits(32 bits))
@@ -117,6 +119,9 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // euFault capture (CHK out-of-bounds vec6 / DIV0 vec5).
     val compFault     = RegInit(False)
     val compFaultVec  = Reg(UInt(8 bits))
+    // True when the captured completion is the trailing DIVREM crack µop (whitebox
+    // drops its commit; the PRF write still lands). Captured in the capture helpers.
+    val compDivRem    = RegInit(False)
 
     compValid     := False
     compNzvcWrite := False
@@ -161,6 +166,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       compNzvcWrite := writesNzvc
       compNzvcDst   := u1.pNzvcDst
       compFault     := False
+      compDivRem    := u1.divIsRem
     }
     def captureFault(vec: UInt, nzvc: Bits, writesNzvc: Bool): Unit = {
       compValid     := True
@@ -174,6 +180,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       compNzvcDst   := u1.pNzvcDst
       compFault     := True
       compFaultVec  := vec
+      compDivRem    := False
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -230,6 +237,14 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val divNzvcOver   = (False ## False ## True ## False).asBits     // overflow: V=1
     // On overflow: V=1, NO result write (Dn unchanged). On DIV0: euFault vec5, no write.
 
+    // ---- DIVREM (remainder-move) support: latch the just-finished DIV's REMAINDER
+    // (and whether it overflowed) so the trailing DIVREM µop writes Dr. The DIVREM is
+    // the next CPLX µop in age order (single-outstanding), so the latch is valid. On a
+    // DIV overflow NEITHER dest is written -> the DIVREM must also skip its write.
+    val isDivRem = u1.divIsRem
+    val remLatch = Reg(Bits(32 bits))
+    val ovLatch  = RegInit(False)
+
     // ---- FSM ----
     val fsm = new StateMachine {
       val IDLE  = new State with EntryPoint
@@ -244,6 +259,12 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
             when(chkTrap) { captureFault(U(6, 8 bits), chkNzvc, True) }
               .otherwise   { captureComplete(B(0, 32 bits), chkNzvc, True, False) }  // in-bounds: N=0, no reg write
             s1Valid := False
+          } elsewhen(isDivRem) {
+            // Trailing remainder-move: write the latched remainder to Dr. If the
+            // preceding DIV overflowed, NO dest was written -> skip this write too
+            // (writeInt=!ovLatch). Sets no flags (the DIV µop already set NZVC).
+            captureComplete(remLatch, B(0, 4 bits), False, !ovLatch)
+            s1Valid := False
           } elsewhen(isDiv) {
             when(divisor32 === 0) {
               // DIV0 -> euFault vector 5, no write, no flag change (Musashi leaves CCR).
@@ -252,6 +273,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
             } otherwise {
               divUnit.io.start := True
               busy := True
+              s1Valid := False        // consumed into DIVING (its operands are latched)
               goto(DIVING)
             }
           } otherwise {
@@ -265,10 +287,13 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       DIVING.whenIsActive {
         busy := True
         when(divUnit.io.done) {
-          // Overflow -> V=1, NO register write (compPdstValid forced false). Normal ->
-          // write the packed result + N/Z (V=0).
+          // Latch the remainder (signed) + overflow for the trailing DIVREM µop. For
+          // the .W form the remainder is packed into the quotient result (no DIVREM);
+          // for the .L forms the DIVREM writes Dr from this latch.
+          remLatch := resR.asBits
+          ovLatch  := divUnit.io.overflow
+          // Overflow -> V=1, NO register write. Normal -> write quotient + N/Z (V=0).
           when(divUnit.io.overflow) {
-            // overflow: V=1, NO result write (Dn unchanged).
             captureComplete(B(0, 32 bits), divNzvcOver, True, False)
           } otherwise {
             captureComplete(divResult, divNzvcNormal, u1.writesNzvc, True)
@@ -319,6 +344,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     wbObs.nzvcWrite := compNzvcWrite
     wbObs.x         := False
     wbObs.xWrite    := False
+    wbObs.divRem    := compDivRem
     wbObs.simPublic()
     // CHK N flag observation (sim-only) for directed tests.
     val chkNObs = Bool(); chkNObs := chkN && isChk && s1Valid; chkNObs.simPublic()

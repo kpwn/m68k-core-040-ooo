@@ -41,6 +41,11 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x4101) == cp(true,1))   // CHK.L D1,D0
     assert(classify(0x41BC) == cp(true,2))   // CHK.W #imm,D0 (imm -> +1 word)
   }
+  test("DIVU.L/DIVS.L (0100110001 mmmrrr) -> simple len 2 (reg/imm divisor); MUL.L complex") {
+    assert(classify(0x4C41) == cp(true,2))   // DIVU.L D1,D0 (opword + ext word)
+    assert(classify(0x4C7C) == cp(true,4))   // DIVU.L #imm,D0 (opword + ext + 2 imm words)
+    assert(classify(0x4C01) == cp(false,0))  // MUL.L (separate slice)
+  }
   test("ADDA/SUBA (class 9/D opmode 3/7) stay simple len1") {
     assert(classify(0xD1C9) == cp(true,1))   // ADDA.L A1,A0
     assert(classify(0x90C9) == cp(true,1))   // SUBA.W A1,A0

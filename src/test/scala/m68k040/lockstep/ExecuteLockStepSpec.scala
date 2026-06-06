@@ -335,7 +335,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
               nzvc      = w.nzvc.toInt,
               nzvcWrite = w.nzvcWrite.toBoolean,
               x         = if (w.x.toBoolean) 1 else 0,
-              xWrite    = w.xWrite.toBoolean))
+              xWrite    = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
         }
       }
 
@@ -522,7 +522,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
             intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt,
             nzvcWrite = w.nzvcWrite.toBoolean, x = if (w.x.toBoolean) 1 else 0,
-            xWrite = w.xWrite.toBoolean))
+            xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
         }
       }
 
@@ -1148,6 +1148,35 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "handler: moveq #0,%d4 ; rte", nInstr = 8)  // moveq #0 -> Z=1 matches entry CCR
   }
 
+  // ── DIVU.L/DIVS.L 32/32 lock-step (quotient -> Dq; quotient+remainder Dr:Dq) ──
+  test("lock-step: DIVU.L/DIVS.L 32/32 quotient-only", VerilatorTest) {
+    runLockStep("div-l32-q",
+      "move.l #1000000,%d0 ; moveq #7,%d1 ; divu.l %d1,%d0 ; " +   // 1000000/7 -> Dq
+      "move.l #-1000000,%d2 ; moveq #7,%d3 ; divs.l %d3,%d2 ; " + // signed
+      "moveq #1,%d4 ; loop: bra loop", nInstr = 7)
+  }
+
+  // Remainder:quotient 32/32 form (Dr!=Dq, cracked DIV+DIVREM). GNU `divull Dn,Dr,Dq`
+  // = the 32-bit form (ext bit10=0) writing Dq=quotient + Dr=remainder. The trailing
+  // `move.l %d2/%d5,...` READ the remainders (Dr) so the DIVREM PRF write is verified
+  // by a normal commit (its own commit record is coalesced into the DIV's step).
+  test("lock-step: DIVU.L/DIVS.L 32/32 remainder:quotient (Dr,Dq)", VerilatorTest) {
+    runLockStep("div-l32-rq",
+      "move.l #1000003,%d0 ; moveq #7,%d1 ; divull %d1,%d2,%d0 ; " + // d0=q, d2=rem
+      "move.l #-1000003,%d3 ; moveq #7,%d4 ; divsll %d4,%d5,%d3 ; " + // signed
+      "move.l %d2,%d6 ; move.l %d5,%d7 ; " +                          // verify both remainders
+      "loop: bra loop", nInstr = 8)
+  }
+
+  // DIVU.L 32/32 DIV0 -> vector 5 -> handler -> RTE.
+  test("lock-step: DIVU.L 32/32 DIV0 -> handler -> RTE", VerilatorTest) {
+    runLockStep("div-l32-div0",
+      "move.l #handler,%d0 ; move.l %d0,0x14 ; " +     // vector 5 @ 0x14
+      "move.l #1000,%d1 ; moveq #0,%d2 ; divu.l %d2,%d1 ; " + // /0 -> trap (entry Z=1)
+      "moveq #7,%d3 ; loop: bra loop ; " +
+      "handler: moveq #0,%d4 ; rte", nInstr = 8)       // moveq #0 -> Z=1 matches entry
+  }
+
   // ── CHK lock-step (vector 6, format-$2): in-bounds no-op + both out-of-bounds ──
   // In-bounds: CHK is a no-op, straight-line. (CHK leaves CCR per the 68k undefined-
   // except-N rule; Musashi's CHK does modify N/Z, but the lock-step compares the
@@ -1243,7 +1272,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
           dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
           intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
-          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean))
+          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
       }
       def captureBranch(): Unit = {
         val bw = dut.branchEu.logic.wbObs
@@ -1362,7 +1391,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
         dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
         intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
-        x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean))
+        x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
     }
     dut.clockDomain.onSamplings {
       captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)

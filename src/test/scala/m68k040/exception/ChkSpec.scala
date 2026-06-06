@@ -40,6 +40,7 @@ class ChkSpec extends AnyFunSuite {
       uop.dstArch := 0
       uop.psrcA := iPsrcA; uop.psrcAValid := True
       uop.psrcB := iPsrcB; uop.psrcBValid := True
+      uop.psrcC := 0; uop.psrcCValid := False
       uop.pdst := 0; uop.pdstValid := False; uop.pdstOld := 0
       uop.pNzvcSrc := 0; uop.readsNzvc := False
       uop.pNzvcDst := 0; uop.writesNzvc := False; uop.pNzvcOld := 0

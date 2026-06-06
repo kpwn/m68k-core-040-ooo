@@ -24,6 +24,9 @@ case class DecodedUop() extends Bundle {
   val memOp        = MemOp()
   val srcAReg      = UInt(5 bits); val srcAValid = Bool()
   val srcBReg      = UInt(5 bits); val srcBValid = Bool()
+  // Third source: ONLY the DIVU.L/DIVS.L 64/32 form (the dividend HIGH word Dr); all
+  // other µops leave srcCValid=False. Threaded through rename to a 3rd physical source.
+  val srcCReg      = UInt(5 bits); val srcCValid = Bool()
   val dstReg       = UInt(5 bits); val dstValid  = Bool()
   val useImm       = Bool();       val imm       = Bits(32 bits)
   val readsNzvc    = Bool();       val readsX    = Bool()

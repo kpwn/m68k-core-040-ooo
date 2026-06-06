@@ -641,6 +641,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     wbObs.nzvcWrite := compNzvcWrite     // True only for a MOVE-to-memory store
     wbObs.x         := False
     wbObs.xWrite    := False
+    wbObs.divRem    := False
     wbObs.simPublic()
 
     // ── Exception-unit cache arbitration MUX (LAST drivers — override the LS EU's

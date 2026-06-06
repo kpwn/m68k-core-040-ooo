@@ -58,6 +58,7 @@ class AluEuSourcePlugin extends FiberPlugin {
     uop.imm       := iImm
     uop.psrcA     := iPsrcA; uop.psrcAValid := iPsrcAValid
     uop.psrcB     := iPsrcB; uop.psrcBValid := iPsrcBValid
+    uop.psrcC := 0; uop.psrcCValid := False
     uop.pdst      := iPdst;  uop.pdstValid  := iPdstValid
     uop.writesNzvc := iWritesNz; uop.pNzvcDst := iPNzvcDst
     uop.writesX    := iWritesX;  uop.pXDst    := iPXDst
