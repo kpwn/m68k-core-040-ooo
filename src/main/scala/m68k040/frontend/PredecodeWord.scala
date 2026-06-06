@@ -100,6 +100,32 @@ object PredecodeWord {
           r.simple   := True
           r.lenWords := U(1, 3 bits)
         }
+        // CHK.W/CHK.L (0100 ddd 1 s 0 mmmrrr): bit8=1, bit6=0. The bound is an EA
+        // source (sizeL = .L when bit7=0). 1 opword + the EA extension words.
+        val isChk = op(8) && !op(6)
+        when(isChk) {
+          val sizeL   = !op(7)                       // CHK.L when bit7=0
+          val srcMode = op(5 downto 3).asUInt
+          val srcReg  = op(2 downto 0).asUInt
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = true)
+          when(ok) {
+            r.simple   := True
+            r.lenWords := (U(1, 3 bits) + e).resized
+          }
+        }
+        // DIVU.L/DIVS.L (0100 1100 01 mmmrrr): opword + 1 extension word (the Dq/Dr/
+        // signed/size word) + the 32-bit-divisor EA extension. MUL.L (...00...) stays
+        // complex (separate slice).
+        val isDivL = op(15 downto 6) === B"10'b0100110001"
+        when(isDivL) {
+          val srcMode = op(5 downto 3).asUInt
+          val srcReg  = op(2 downto 0).asUInt
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL = True, allowImm = true)  // 32-bit divisor
+          when(ok) {
+            r.simple   := True
+            r.lenWords := (U(2, 3 bits) + e).resized   // opword + DIV.L ext word + EA ext
+          }
+        }
       }
 
       // MOVEQ
@@ -128,10 +154,22 @@ object PredecodeWord {
         val opmode  = op(8 downto 6).asUInt
         val srcMode = op(5 downto 3).asUInt
         val srcReg  = op(2 downto 0).asUInt
-        // classes 8(OR-group)/C(AND-group) opmode 3/7 = DIVU/DIVS/MULU/MULS -> complex
+        // classes 8(OR-group)/C(AND-group) opmode 3/7 = DIVU/DIVS/MULU/MULS.
+        //   BOTH DIVs are line 8: DIVU.W = opmode 3, DIVS.W = opmode 7. They ARE
+        //   handled now (1 opword + the 16-bit-divisor EA extension). BOTH MULs are
+        //   line C (opmode 3/7) -> stay complex (separate slice).
+        val isDivuW = (cls === U(8, 4 bits)) && (opmode === U(3, 3 bits))
+        val isDivsW = (cls === U(8, 4 bits)) && (opmode === U(7, 3 bits))
         val isMulDiv = (cls === U(8, 4 bits) || cls === U(0xC, 4 bits)) &&
                        (opmode === U(3, 3 bits) || opmode === U(7, 3 bits))
-        when(opmode =/= U(4, 3 bits) && opmode =/= U(5, 3 bits) && opmode =/= U(6, 3 bits) && !isMulDiv) {
+        when(isDivuW || isDivsW) {
+          // 16-bit divisor EA (sizeL = false: word operand size for #imm extension).
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL = False, allowImm = true)
+          when(ok) {
+            r.simple   := True
+            r.lenWords := (U(1, 3 bits) + e).resized
+          }
+        } elsewhen(opmode =/= U(4, 3 bits) && opmode =/= U(5, 3 bits) && opmode =/= U(6, 3 bits) && !isMulDiv) {
           val sizeL = (opmode === U(2, 3 bits)) || (opmode === U(7, 3 bits))
           val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = false)
           when(ok) {

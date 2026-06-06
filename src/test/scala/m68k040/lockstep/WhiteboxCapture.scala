@@ -12,9 +12,13 @@ import scala.collection.mutable
   */
 object WhiteboxCapture {
 
-  /** One EU writeback observation (the value + flags + write masks for a robId). */
+  /** One EU writeback observation (the value + flags + write masks for a robId).
+    * `divRem` marks the trailing DIVREM crack µop -> its commit is DROPPED (the 2-µop
+    * DIVU.L/DIVS.L maps to ONE oracle instruction step; the Dr write still lands in the
+    * PRF and is verified by a later instruction that reads Dr). */
   final case class Wb(dstArch: Int, result: Long, intWrite: Boolean,
-                      nzvc: Int, nzvcWrite: Boolean, x: Int, xWrite: Boolean)
+                      nzvc: Int, nzvcWrite: Boolean, x: Int, xWrite: Boolean,
+                      divRem: Boolean = false)
 
   /** Stateful reconstruction handle. Drive `onWb` for every cycle an EU's wbObs
     * is valid, and `onCommit` for every fired ROB commit-obs (in retire order).
@@ -22,7 +26,13 @@ object WhiteboxCapture {
   /** A normal commit (Wb-backed) or an exception/RTE commit (SR/A7 directly). */
   private sealed trait Rec
   private final case class NormRec(pc: Long, sysByte: Int, a7: Long, wb: Wb) extends Rec
-  private final case class ExcRec(pc: Long, sysByte: Int, a7: Long) extends Rec
+  // ExcRec: an exception/trap ENTRY or RTE step. `foldNzvc` (>=0) folds the FAULTING
+  // instruction's own NZVC write onto the running CCR before this step — needed for
+  // CHK, which sets N as it traps but never retires normally (so its Wb is never
+  // folded by a NormRec). -1 => no fold (TRAPV/DIV0/access-fault/interrupt/RTE leave
+  // the running CCR as-is; RTE restores the same CCR the entry saved, which the
+  // running fold already reflects).
+  private final case class ExcRec(pc: Long, sysByte: Int, a7: Long, foldNzvc: Int) extends Rec
 
   final class Handle {
     private val wbMap   = mutable.HashMap[Int, Wb]()
@@ -38,13 +48,16 @@ object WhiteboxCapture {
       val wb = wbMap.getOrElse(robId,
         sys.error(s"commit robId=$robId with no writeback observed"))
       val isTempOnly = wb.intWrite && wb.dstArch >= 16 && !wb.nzvcWrite && !wb.xWrite
-      if (!isTempOnly) commits += NormRec(pc, sysByte, a7, wb)
+      // The DIVREM crack µop is part of the SAME architectural instruction as its DIV
+      // -> drop its commit record (one oracle step per instruction). Its Dr write is in
+      // the PRF and checked by a later reader.
+      if (!isTempOnly && !wb.divRem) commits += NormRec(pc, sysByte, a7, wb)
     }
 
     /** Record an exception / RTE "instruction" commit: the handler-entry / restored
       * PC + the post-event SR system byte + A7. CCR is unchanged (carried over). */
-    def onExcCommit(pc: Long, sysByte: Int, a7: Long): Unit =
-      commits += ExcRec(pc, sysByte, a7)
+    def onExcCommit(pc: Long, sysByte: Int, a7: Long, foldNzvc: Int = -1): Unit =
+      commits += ExcRec(pc, sysByte, a7, foldNzvc)
 
     /** Reconstruct the CommitObservation stream AFTER the run: fold the CCR over Wb
       * snapshots and combine with the per-commit SR system byte + A7 into the full
@@ -60,7 +73,11 @@ object WhiteboxCapture {
             archRegWrite = wb.result, archRegValid = wb.intWrite,
             ccr = ccr, memAddr = 0, memData = 0, memWrite = false,
             sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7)
-        case ExcRec(pc, sysByte, a7) =>
+        case ExcRec(pc, sysByte, a7, foldNzvc) =>
+          // Fold the faulting instruction's own NZVC (CHK) onto the running CCR before
+          // the entry step; -1 => no fold (the running CCR already reflects the
+          // architectural state for TRAPV/DIV0/access-fault/interrupt/RTE).
+          if (foldNzvc >= 0) ccr = (ccr & 0x10) | (foldNzvc & 0xf)
           CommitObservation(
             pc = pc, archRegId = 0, archRegWrite = 0, archRegValid = false,
             ccr = ccr, memAddr = 0, memData = 0, memWrite = false,

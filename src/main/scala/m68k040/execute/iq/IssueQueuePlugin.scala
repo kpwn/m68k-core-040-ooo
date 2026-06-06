@@ -28,20 +28,24 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
   var issuePorts    : Vec[Stream[IqContext]] = null
   var flushSignal   : Bool                   = null
   var lsWakeupPort  : Flow[UInt]             = null
+  var cplxWakeupPort: Flow[UInt]             = null
 
   override def push: Stream[Vec[IqContext]]  = pushPort
   override def pushSlot1Valid: Bool          = pushSlot1Port
   override def issue: Vec[Stream[IqContext]] = issuePorts
   override def flushPort: Bool               = flushSignal
   override def lsWakeup: Flow[UInt]          = lsWakeupPort
+  override def cplxWakeup: Flow[UInt]        = cplxWakeupPort
 
   during setup {
     pushPort      = Stream(Vec(IqContext(), wayCount))
     pushSlot1Port = Bool()
-    // 4 issue ports: 0,1 = ALU (non-branch, non-LS), 2 = branch, 3 = LS.
-    issuePorts    = Vec.fill(4)(Stream(IqContext()))
+    // 5 issue ports: 0,1 = ALU (non-branch, non-LS, non-CPLX), 2 = branch, 3 = LS,
+    // 4 = CPLX (DivEu: CHK + DIV).
+    issuePorts    = Vec.fill(5)(Stream(IqContext()))
     flushSignal   = Bool()
     lsWakeupPort  = Flow(UInt(6 bits))   // carries a completed-load pdst
+    cplxWakeupPort= Flow(UInt(6 bits))   // carries a completed-DIV pdst
   }
 
   val logic = during build new Area {
@@ -51,6 +55,9 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     lsWakeupPort.valid.allowOverride;   lsWakeupPort.valid   := False
     lsWakeupPort.payload.allowOverride; lsWakeupPort.payload := U(0, 6 bits)
     lsWakeupPort.simPublic()
+    cplxWakeupPort.valid.allowOverride;   cplxWakeupPort.valid   := False
+    cplxWakeupPort.payload.allowOverride; cplxWakeupPort.payload := U(0, 6 bits)
+    cplxWakeupPort.simPublic()
 
     // ---- Slot array (priority = line*wayCount + way; 0 = oldest) ----
     val lines = for (line <- 0 until lineCount) yield new Area {
@@ -69,9 +76,13 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
         // holds the combinational next value; the compaction/maintenance below writes
         // the reg from it (default keep).
         val lsWait     = Reg(Bool()) init False
-        // default: hold (overridden by compaction-shift and lsWakeup-clear below).
-        // triggers==0 (static latency-1) AND no pending LS source -> ready.
-        val ready    = sel && (if (priority == 0) True else triggers(priority - 1 downto 0) === 0) && !lsWait
+        // CPLX (DivEu) dynamic dependency: identical mechanism to lsWait, but cleared
+        // by cplxWakeup (a completing multi-cycle DIV). A consumer of a DIV result
+        // waits here (DIV is variable-latency; no static issue-event).
+        val cplxWait   = Reg(Bool()) init False
+        // default: hold (overridden by compaction-shift and wakeup-clear below).
+        // triggers==0 (static latency-1) AND no pending LS / CPLX source -> ready.
+        val ready    = sel && (if (priority == 0) True else triggers(priority - 1 downto 0) === 0) && !lsWait && !cplxWait
 
         when(fire) { selComb := False }
         sel := selComb
@@ -113,9 +124,18 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // mechanism (which assumes latency-1): LS producers are tracked ONLY here, not
     // in sbInt, so trigInit never sets a static (auto-clearing) trigger for them.
     val lsBusy = Reg(Bits(physIntN bits)) init 0
+    // cplxBusy[p] => int physreg p is produced by an in-flight (not-yet-completed)
+    // multi-cycle DIV. A consumer reading it is held NOT-ready until cplxWakeup(p).
+    // Same dynamic-completion mechanism as lsBusy, separate bitmap + wakeup port.
+    val cplxBusy = Reg(Bits(physIntN bits)) init 0
 
     // LS class predicate: cluster == LS and a real memory op.
     def isLs(u: RenamedUop): Bool = (u.cluster === m68k040.isa.Cluster.LS) && (u.memOp =/= m68k040.isa.MemOp.NONE)
+    // CPLX (DivEu) class predicate: cluster == CPLX (CHK + DIV).
+    def isCplx(u: RenamedUop): Bool = u.cluster === m68k040.isa.Cluster.CPLX
+    // A CPLX *producer* with dynamic latency = a DIV that writes a physreg. CHK writes
+    // nothing (no producer). Only such producers populate cplxBusy / drive cplxWakeup.
+    def isCplxProducer(u: RenamedUop): Bool = isCplx(u) && u.pdstValid
 
     // Is srcB a REAL register operand (vs an immediate)? For ALU µops `useImm`
     // means srcB carries an immediate (no register read). For LS µops `imm` is the
@@ -149,7 +169,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // Internal combinational select streams (the registered issue stage feeds the
     // external `issuePorts` from these; see the select section below). Declared here
     // so `issued` (count instrumentation) can reference selPorts.fire.
-    val selPorts = Vec.fill(4)(Stream(IqContext()))
+    val selPorts = Vec.fill(5)(Stream(IqContext()))
     val count = Reg(UInt(log2Up(slotCount + 1) bits)) init 0 // instrumentation only
     // selComb = sel after this cycle's issue, i.e. the slot's NEXT-cycle occupancy
     // (absent compaction). Sampling selComb (not sel) lets a line that empties via
@@ -170,16 +190,19 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // ALU ports (0,1) select non-branch ready slots; branch port (2) selects
     // branch-class ready slots (class = context.uop.isBranch). The classes are
     // disjoint, so a slot is selected by at most one port.
-    // Classes are disjoint: ALU = non-branch & non-LS; branch = isBranch; LS = isLs.
-    val aluReady = B(slots.map(s => s.ready && !s.context.uop.isBranch && !isLs(s.context.uop)))
+    // Classes are disjoint: ALU = non-branch & non-LS & non-CPLX; branch = isBranch;
+    // LS = isLs; CPLX = isCplx (CHK + DIV -> DivEu).
+    val aluReady = B(slots.map(s => s.ready && !s.context.uop.isBranch && !isLs(s.context.uop) && !isCplx(s.context.uop)))
     val brReady  = B(slots.map(s => s.ready &&  s.context.uop.isBranch))
     val lsReady  = B(slots.map(s => s.ready &&  isLs(s.context.uop)))
+    val cplxReady= B(slots.map(s => s.ready &&  isCplx(s.context.uop)))
     val contexts = Vec(slots.map(_.context))
 
     val oh0 = OHMasking.first(aluReady)
     val oh1 = OHMasking.first(aluReady & ~oh0)
     val ohB = OHMasking.first(brReady)
     val ohL = OHMasking.first(lsReady)
+    val ohC = OHMasking.first(cplxReady)
 
     // ---- FMax: REGISTERED issue->operand-read boundary ----
     // The combinational select (above) + MuxOH(contexts) feeding each EU's S0
@@ -219,6 +242,8 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     selPorts(2).payload := MuxOH(ohB, contexts)
     selPorts(3).valid   := ohL.orR && !flushSignal
     selPorts(3).payload := MuxOH(ohL, contexts)
+    selPorts(4).valid   := ohC.orR && !flushSignal
+    selPorts(4).payload := MuxOH(ohC, contexts)
 
     // Registered issue stage: drop the in-flight registered uop on a flush (it is
     // wrong-path), exactly as the slots are squashed. `flush` clears the pipe's
@@ -235,7 +260,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // latency added on the forward (payload) path — which is exactly the arc we are
     // cutting. For the always-ready ALU/branch EUs this drains every cycle (no
     // bubble); for the LS EU it back-pressures into the IQ as before.
-    for (k <- 0 until 4) {
+    for (k <- 0 until 5) {
       issuePorts(k) << selPorts(k).m2sPipe(collapsBubble = false, flush = flushSignal)
     }
 
@@ -247,7 +272,8 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       slot.fire := (selPorts(0).fire && oh0(i)) ||
                    (selPorts(1).fire && oh1(i)) ||
                    (selPorts(2).fire && ohB(i)) ||
-                   (selPorts(3).fire && ohL(i))
+                   (selPorts(3).fire && ohL(i)) ||
+                   (selPorts(4).fire && ohC(i))
     }
 
     // ---- Static-latency-1 wakeup events ----
@@ -283,6 +309,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       }
       dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcA, uop.psrcAValid)
       dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcB, srcBIsReg(uop))
+      dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcC, uop.psrcCValid)
       dep(sbNzvc.busy, sbNzvc.physToSlot, uop.pNzvcSrc, uop.readsNzvc)
       dep(sbX.busy,    sbX.physToSlot,    uop.pXSrc, uop.readsX)
       t
@@ -307,14 +334,32 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     def stillBusy(p: UInt): Bool =
       lsBusy(p) && !(lsWakeupPort.valid && lsWakeupPort.payload === p)
     def lsDepInit(uop: RenamedUop): Bool =
-      (uop.psrcAValid && stillBusy(uop.psrcA)) || (srcBIsReg(uop) && stillBusy(uop.psrcB))
+      (uop.psrcAValid && stillBusy(uop.psrcA)) || (srcBIsReg(uop) && stillBusy(uop.psrcB)) ||
+      (uop.psrcCValid && stillBusy(uop.psrcC))
     val lsDep0 = lsDepInit(pushUop0)
     val lsDep1Base = lsDepInit(pushUop1)
     // Intra-push: slot1 reads slot0's dst and slot0 is an LS load -> slot1 waits.
     val s0IsLsLoad = isLs(pushUop0) && (pushUop0.memOp === m68k040.isa.MemOp.LOAD) && pushUop0.pdstValid
     val lsDep1 = lsDep1Base ||
       (s0IsLsLoad && pushUop1.psrcAValid && (pushUop1.psrcA === pushUop0.pdst)) ||
-      (s0IsLsLoad && srcBIsReg(pushUop1) && (pushUop1.psrcB === pushUop0.pdst))
+      (s0IsLsLoad && srcBIsReg(pushUop1) && (pushUop1.psrcB === pushUop0.pdst)) ||
+      (s0IsLsLoad && pushUop1.psrcCValid && (pushUop1.psrcC === pushUop0.pdst))
+
+    // Push-time CPLX (DivEu) dependency: same mechanism as LS but on cplxBusy /
+    // cplxWakeup. A consumer of an in-flight DIV result latches cplxWait.
+    def stillCplxBusy(p: UInt): Bool =
+      cplxBusy(p) && !(cplxWakeupPort.valid && cplxWakeupPort.payload === p)
+    def cplxDepInit(uop: RenamedUop): Bool =
+      (uop.psrcAValid && stillCplxBusy(uop.psrcA)) || (srcBIsReg(uop) && stillCplxBusy(uop.psrcB)) ||
+      (uop.psrcCValid && stillCplxBusy(uop.psrcC))
+    val cplxDep0 = cplxDepInit(pushUop0)
+    val cplxDep1Base = cplxDepInit(pushUop1)
+    // Intra-push: slot1 reads slot0's dst and slot0 is a DIV producer -> slot1 waits.
+    val s0IsCplxProd = isCplxProducer(pushUop0)
+    val cplxDep1 = cplxDep1Base ||
+      (s0IsCplxProd && pushUop1.psrcAValid && (pushUop1.psrcA === pushUop0.pdst)) ||
+      (s0IsCplxProd && srcBIsReg(pushUop1) && (pushUop1.psrcB === pushUop0.pdst)) ||
+      (s0IsCplxProd && pushUop1.psrcCValid && (pushUop1.psrcC === pushUop0.pdst))
     // Intra-push: slot1 reads a physreg that slot0 (pushed same cycle) writes.
     // slot0 ends at slot0Prio; set slot1's trigger bit there.
     //
@@ -324,11 +369,14 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // never clear and hang the consumer. That dependency is instead carried by
     // `lsDep1` (the dynamic lsWait, cleared by lsWakeup). This is exactly the
     // cracked LOAD->temp + op-reading-temp pair when both land in one push group.
-    val s0WritesInt  = pushUop0.pdstValid && !s0IsLsLoad
+    // Suppress the static int trigger for an LS load OR a DIV producer (both are
+    // variable-latency, tracked dynamically via lsWait/cplxWait, not static triggers).
+    val s0WritesInt  = pushUop0.pdstValid && !s0IsLsLoad && !s0IsCplxProd
     val s0WritesNzvc = pushUop0.writesNzvc
     val s0WritesX    = pushUop0.writesX
     when(s0WritesInt  && pushUop1.psrcAValid && pushUop1.psrcA === pushUop0.pdst)              { trig1(slot0Prio) := True }
     when(s0WritesInt  && srcBIsReg(pushUop1) && pushUop1.psrcB === pushUop0.pdst) { trig1(slot0Prio) := True }
+    when(s0WritesInt  && pushUop1.psrcCValid && pushUop1.psrcC === pushUop0.pdst) { trig1(slot0Prio) := True }
     when(s0WritesNzvc && pushUop1.readsNzvc && pushUop1.pNzvcSrc === pushUop0.pNzvcDst)        { trig1(slot0Prio) := True }
     when(s0WritesX    && pushUop1.readsX    && pushUop1.pXSrc === pushUop0.pXDst)              { trig1(slot0Prio) := True }
 
@@ -342,6 +390,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
           wDst.triggers := (wSrc.triggers >> wayCount).resized
           wDst.sel      := wSrc.selComb
           wDst.lsWait   := wSrc.lsWait     // LS dependency shifts with the slot
+          wDst.cplxWait := wSrc.cplxWait   // CPLX (DIV) dependency shifts with the slot
         }
       }
       // New uops into the last line.
@@ -353,10 +402,12 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       wDst0.triggers := trig0
       wDst0.sel      := True
       wDst0.lsWait   := lsDep0
+      wDst0.cplxWait := cplxDep0
       wDst1.context  := wSrc1
       wDst1.triggers := trig1
       wDst1.sel      := pushSlot1Port
       wDst1.lsWait   := lsDep1
+      wDst1.cplxWait := cplxDep1
     }
 
     // ---- Apply wakeup events (clears trigger bits). MUST come after the
@@ -379,13 +430,30 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       val u = s.context.uop
       lsWakeupPort.valid && s.sel &&
         ((u.psrcAValid && (u.psrcA === lsWakeupPort.payload)) ||
-         (srcBIsReg(u) && (u.psrcB === lsWakeupPort.payload)))
+         (srcBIsReg(u) && (u.psrcB === lsWakeupPort.payload)) ||
+         (u.psrcCValid && (u.psrcC === lsWakeupPort.payload)))
     })
     for (i <- 0 until slotCount) {
       when(lsWakeMatch(i)) {
         // on a non-compaction cycle, clear slot i; on compaction, clear slot i-wayCount.
         when(pushPort.fire) { if (i >= wayCount) slots(i - wayCount).lsWait := False }
           .otherwise        { slots(i).lsWait := False }
+      }
+    }
+
+    // ---- CPLX (DivEu) dynamic wakeup: clear cplxWait for slots reading the woken
+    // pdst (identical discipline to lsWakeMatch). ----
+    val cplxWakeMatch = Vec(slots.map { s =>
+      val u = s.context.uop
+      cplxWakeupPort.valid && s.sel &&
+        ((u.psrcAValid && (u.psrcA === cplxWakeupPort.payload)) ||
+         (srcBIsReg(u) && (u.psrcB === cplxWakeupPort.payload)) ||
+         (u.psrcCValid && (u.psrcC === cplxWakeupPort.payload)))
+    })
+    for (i <- 0 until slotCount) {
+      when(cplxWakeMatch(i)) {
+        when(pushPort.fire) { if (i >= wayCount) slots(i - wayCount).cplxWait := False }
+          .otherwise        { slots(i).cplxWait := False }
       }
     }
 
@@ -405,16 +473,20 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // latency-1). All other int producers go in sbInt as before.
     val push0IsLs = isLs(pushUop0)
     val push1IsLs = isLs(pushUop1)
+    val push0IsCplxProd = isCplxProducer(pushUop0)
+    val push1IsCplxProd = isCplxProducer(pushUop1)
     when(pushPort.fire) {
       when(pushUop0.pdstValid) {
-        when(push0IsLs) { lsBusy(pushUop0.pdst) := True }
+        when(push0IsLs)       { lsBusy(pushUop0.pdst) := True }
+          .elsewhen(push0IsCplxProd) { cplxBusy(pushUop0.pdst) := True }
           .otherwise    { sbInt.busy(pushUop0.pdst) := True; sbInt.physToSlot(pushUop0.pdst) := slot0Prio }
       }
       when(pushUop0.writesNzvc) { sbNzvc.busy(pushUop0.pNzvcDst) := True; sbNzvc.physToSlot(pushUop0.pNzvcDst) := slot0Prio }
       when(pushUop0.writesX)    { sbX.busy(pushUop0.pXDst)     := True; sbX.physToSlot(pushUop0.pXDst)     := slot0Prio }
       when(pushSlot1Port) {
         when(pushUop1.pdstValid) {
-          when(push1IsLs) { lsBusy(pushUop1.pdst) := True }
+          when(push1IsLs)       { lsBusy(pushUop1.pdst) := True }
+            .elsewhen(push1IsCplxProd) { cplxBusy(pushUop1.pdst) := True }
             .otherwise    { sbInt.busy(pushUop1.pdst) := True; sbInt.physToSlot(pushUop1.pdst) := slot1Prio }
         }
         when(pushUop1.writesNzvc) { sbNzvc.busy(pushUop1.pNzvcDst) := True; sbNzvc.physToSlot(pushUop1.pNzvcDst) := slot1Prio }
@@ -440,6 +512,13 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       when(pushUop0.pdstValid && push0IsLs) { lsBusy(pushUop0.pdst) := True }
       when(pushSlot1Port && pushUop1.pdstValid && push1IsLs) { lsBusy(pushUop1.pdst) := True }
     }
+    // ---- Dynamic CPLX (DivEu) wakeup: clear cplxBusy for the completed DIV's pdst ----
+    // Same priority discipline as lsBusy (a same-cycle re-allocation wins).
+    when(cplxWakeupPort.valid) { cplxBusy(cplxWakeupPort.payload) := False }
+    when(pushPort.fire) {
+      when(pushUop0.pdstValid && push0IsCplxProd) { cplxBusy(pushUop0.pdst) := True }
+      when(pushSlot1Port && pushUop1.pdstValid && push1IsCplxProd) { cplxBusy(pushUop1.pdst) := True }
+    }
 
     count := count + pushed - issued
 
@@ -459,6 +538,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       sbNzvc.busy := 0
       sbX.busy    := 0
       lsBusy      := 0
+      cplxBusy    := 0
       // After flush line 0 is empty next cycle, so push.ready may re-assert.
       readyReg := True
     }

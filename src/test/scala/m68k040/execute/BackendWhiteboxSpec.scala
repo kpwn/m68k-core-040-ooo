@@ -44,6 +44,9 @@ class BackendWhiteboxSpec extends AnyFunSuite {
       // LS issue port (LS3): no LS EU in this DUT — tie its ready off so the IQ's
       // issue(3) Stream is fully driven. (No LS uops in this corpus.)
       iq.issue(3).ready := False
+      // CPLX issue port (4): no DivEu in this DUT — tie its ready off so the IQ's
+      // issue(4) Stream is fully driven. (No CHK/DIV uops in this corpus.)
+      iq.issue(4).ready := False
       // EU completion (Flow) → ROB completion ports (both directionless plain
       // wires; drive the ROB's completion from the EU's completion).
       rob.logic.completion(0).valid   := eu0.completion.valid

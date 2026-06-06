@@ -25,6 +25,12 @@ case class WbObs() extends Bundle {
   val nzvcWrite = Bool()
   val x         = Bool()
   val xWrite    = Bool()
+  // True for the trailing DIVREM crack µop (the 2nd µop of a DIVU.L/DIVS.L that
+  // writes the remainder to Dr). The lock-step whitebox DROPS its commit record so a
+  // 2-µop divide maps to ONE oracle instruction step (positional alignment); the
+  // remainder register write still lands in the PRF and is verified by a later
+  // instruction that reads Dr. Default False (all other EUs leave it False).
+  val divRem    = Bool()
 }
 
 /** Fixed-latency-1 integer ALU EU. S0 read | M2S | S1 execute+writeback+bypass+completion. */
@@ -107,6 +113,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     wbObs.nzvcWrite := RegNext(u1.writesNzvc)
     wbObs.x         := RegNext(rsp.xOut)
     wbObs.xWrite    := RegNext(u1.writesX)
+    wbObs.divRem    := False
     wbObs.simPublic()
   }
 }

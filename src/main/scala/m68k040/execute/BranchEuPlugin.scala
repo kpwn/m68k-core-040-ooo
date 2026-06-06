@@ -14,13 +14,17 @@ case class BranchCompletion() extends Bundle {
   val nextPc     = UInt(32 bits)
 }
 
-/** TRAPV fault completion: the branch EU drives this (vector 7 implied) when a
-  * TRAPV trap-check µop sees V=1 at execute. The ROB marks the entry faulted +
-  * vector 7. The stacked PC (= nextPc) is already captured per-entry at alloc
-  * (faultPcStore), so only the robId is needed here (cf. lsFaultCompletion, which
-  * must also carry the execute-computed EA). */
-case class TrapvFault() extends Bundle {
-  val robId   = UInt(6 bits)
+/** Execute-time conditional fault completion (generalized from the original TRAPV-
+  * only fault). An EU drives this when an execute-time check raises a synchronous
+  * fault that carries an exception VECTOR: TRAPV (vector 7, branch EU), CHK (vector
+  * 6, div EU), DIV0 (vector 5, div EU). The ROB marks the entry faulted + the
+  * carried vector. The stacked PC (= nextPc for these group-2 traps) and the PPC
+  * (= the instruction PC) are already captured per-entry at alloc (faultPcStore /
+  * pcStore), so only {robId, vector} are needed here (cf. lsFaultCompletion, which
+  * must also carry the execute-computed EA). All three are format-$2 group-2 traps. */
+case class EuFault() extends Bundle {
+  val robId  = UInt(6 bits)
+  val vector = UInt(8 bits)
 }
 
 /** Sim-only whitebox observation (branch writes no reg; CCR unchanged). */
@@ -35,8 +39,9 @@ trait BranchEuService {
   def issue: Stream[IqContext]
   def completion: Flow[BranchCompletion]
   /** TRAPV execute-time conditional fault (vector 7): fires when a TRAPV trap-check
-    * µop sees V=1. The ROB consumes it like lsFaultCompletion. */
-  def trapvFault: Flow[TrapvFault]
+    * µop sees V=1. The ROB consumes it like lsFaultCompletion. Generalized to carry
+    * the vector so the ROB's euFault handling is shared with CHK/DIV0. */
+  def trapvFault: Flow[EuFault]
 }
 
 /** Latency-1 branch EU. S0 reads NZVC; S1 evaluates the 68k condition, computes
@@ -44,7 +49,7 @@ trait BranchEuService {
 class BranchEuPlugin extends FiberPlugin with BranchEuService {
   var issuePort: Stream[IqContext] = null
   var completionPort: Flow[BranchCompletion] = null
-  var trapvFaultPort: Flow[TrapvFault] = null
+  var trapvFaultPort: Flow[EuFault] = null
   var nzRd: RegFileReadPort = null
   override def issue = issuePort
   override def completion = completionPort
@@ -53,7 +58,7 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
   during setup {
     issuePort = Stream(IqContext())
     completionPort = Flow(BranchCompletion())
-    trapvFaultPort = Flow(TrapvFault())
+    trapvFaultPort = Flow(EuFault())
     nzRd = host[NzvcRegFileService].newRead(forceNoBypass = false)
   }
 
@@ -102,8 +107,9 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     completionPort.payload.nextPc     := nextPc
 
     // ---- S1: TRAPV execute-time conditional fault (vector 7 if V=1) ----
-    trapvFaultPort.valid         := s1Valid && u1.isTrapv && v
-    trapvFaultPort.payload.robId := s1Ctx.robId
+    trapvFaultPort.valid          := s1Valid && u1.isTrapv && v
+    trapvFaultPort.payload.robId  := s1Ctx.robId
+    trapvFaultPort.payload.vector := U(7, 8 bits)   // TRAPV -> vector 7
 
     // ---- S1: sim-only whitebox (branch: no reg write, CCR unchanged) ----
     val wbObs = BrWbObs()

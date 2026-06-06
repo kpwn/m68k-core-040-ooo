@@ -4,7 +4,11 @@ import m68k040.isa.{Cluster, Size, MemOp}
 import spinal.core._
 
 object DecOp extends SpinalEnum {
-  val MOVE, ADD, SUB, AND, OR, CMP, BRANCH, ILLEGAL = newElement()
+  val MOVE, ADD, SUB, AND, OR, CMP, BRANCH, ILLEGAL,
+      // CPLX-cluster (DivEu) ops: bound-check trap + integer divide. DIV carries
+      // {signed, the .W/.L/64-form, quotient-only-vs-remainder} via size + the
+      // divForm/divSigned/div64 µop fields below.
+      CHK, DIV, DIVREM = newElement()
 }
 
 /** Pre-rename µop: the decode→rename contract. Architectural operands
@@ -20,6 +24,9 @@ case class DecodedUop() extends Bundle {
   val memOp        = MemOp()
   val srcAReg      = UInt(5 bits); val srcAValid = Bool()
   val srcBReg      = UInt(5 bits); val srcBValid = Bool()
+  // Third source: ONLY the DIVU.L/DIVS.L 64/32 form (the dividend HIGH word Dr); all
+  // other µops leave srcCValid=False. Threaded through rename to a 3rd physical source.
+  val srcCReg      = UInt(5 bits); val srcCValid = Bool()
   val dstReg       = UInt(5 bits); val dstValid  = Bool()
   val useImm       = Bool();       val imm       = Bits(32 bits)
   val readsNzvc    = Bool();       val readsX    = Bool()
@@ -52,6 +59,15 @@ case class DecodedUop() extends Bundle {
   // (isBranch + readsNzvc) marked isTrapv; the branch EU reads NZVC and, if V=1,
   // drives a trapvFault (vector 7, faultPc = nextPc). If V=0 it retires as a no-op.
   val isTrapv      = Bool()
+  // ── CPLX-cluster (DivEu) control (CHK / DIV) ────────────────────────────────
+  // `divSigned` = DIVS (vs DIVU) / CHK is always signed-compare. `div64` = the
+  // 64-bit-dividend form (Dr:Dq); `divForm` selects the writeback/iteration width.
+  // For the 64/32 + 32/32-with-remainder forms the decode CRACKS into a DIV µop
+  // (quotient -> Dq) + a DIVREM µop (the latched remainder -> Dr); `divIsRem` marks
+  // the trailing remainder-move µop. These default to harmless values for non-CPLX.
+  val divSigned    = Bool()
+  val div64        = Bool()     // 64-bit dividend (Dr:Dq) form
+  val divIsRem     = Bool()     // this µop is the trailing remainder-move (DIVREM)
   // Macro-instruction boundary marker: True for the FIRST µop of an instruction.
   // The cracker emits 1 or 2 µops/instruction; the only 2-µop case is a memSimple
   // source crack -> [load, op] where the LOAD is first. An interrupt may be taken

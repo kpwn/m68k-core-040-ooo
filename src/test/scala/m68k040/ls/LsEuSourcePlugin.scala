@@ -51,6 +51,7 @@ class LsEuSourcePlugin extends FiberPlugin {
     uop.imm          := iImm
     uop.psrcA        := iPsrcA; uop.psrcAValid := iPsrcAValid
     uop.psrcB        := iPsrcB; uop.psrcBValid := iPsrcBValid
+    uop.psrcC := 0; uop.psrcCValid := False
     uop.pdst         := iPdst;  uop.pdstValid  := iPdstValid
     uop.writesNzvc   := False;  uop.pNzvcDst := U(0)
     uop.writesX      := False;  uop.pXDst    := U(0)

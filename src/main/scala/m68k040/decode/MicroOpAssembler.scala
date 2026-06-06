@@ -71,6 +71,7 @@ object MicroOpAssembler {
     opUop.memOp         := MemOp.NONE
     opUop.srcAReg       := 0; opUop.srcAValid := False
     opUop.srcBReg       := 0; opUop.srcBValid := False
+    opUop.srcCReg       := 0; opUop.srcCValid := False
     opUop.dstReg        := 0; opUop.dstValid  := False
     opUop.useImm        := False; opUop.imm    := 0
     opUop.readsNzvc     := spec.readsNzvc; opUop.readsX := spec.readsX
@@ -85,6 +86,16 @@ object MicroOpAssembler {
     opUop.sswInstr      := False
     opUop.isRte         := False
     opUop.isTrapv       := False
+    opUop.divSigned     := spec.divSigned
+    opUop.div64         := spec.div64
+    opUop.divIsRem      := False
+    // CHK / DIV are group-2 traps (CHK vec6, DIV0 vec5) delivered execute-time via
+    // euFault -> format-$2: they stack the NEXT instruction's PC (the 040 group-2
+    // frame's PC = pc+len). The fault is conditional (set at execute), but faultPc is
+    // captured at ALLOC, so faultUsesNextPc must be set NOW for the CPLX ops.
+    when(spec.op === DecOp.CHK || spec.op === DecOp.DIV) {
+      opUop.faultUsesNextPc := True
+    }
     // The op µop is the FIRST µop of its instruction EXCEPT when it is the trailing
     // op of a 2-µop memSimple-source crack ([load, op]) — i.e. when crackLoad. (For
     // every other path opUop is uops(0), the macro-instruction boundary.)
@@ -167,6 +178,7 @@ object MicroOpAssembler {
     ldUop.memOp         := MemOp.LOAD
     ldUop.srcAReg       := srcEa.base; ldUop.srcAValid := srcEa.baseValid
     ldUop.srcBReg       := 0;          ldUop.srcBValid := False
+    ldUop.srcCReg       := 0;          ldUop.srcCValid := False
     ldUop.dstReg        := U(T0, 5 bits); ldUop.dstValid := True
     ldUop.useImm        := True
     val pcRelAddr = (pkt.pc + U(2, 32 bits) + srcEa.disp.asUInt).asBits
@@ -179,6 +191,7 @@ object MicroOpAssembler {
     ldUop.faulted       := False; ldUop.faultVector := 0; ldUop.isRte := False
     ldUop.faultUsesNextPc := False
     ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False; ldUop.isTrapv := False
+    ldUop.divSigned     := False; ldUop.div64 := False; ldUop.divIsRem := False
     ldUop.firstOfInstr  := True    // the LOAD is the FIRST µop of a cracked instruction
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
@@ -198,6 +211,7 @@ object MicroOpAssembler {
     stUop.memOp         := MemOp.STORE
     stUop.srcAReg       := dstEa.base; stUop.srcAValid := dstEa.baseValid
     stUop.srcBReg       := srcEa.reg;  stUop.srcBValid := True            // store data
+    stUop.srcCReg       := 0;          stUop.srcCValid := False
     stUop.dstReg        := 0;          stUop.dstValid  := False
     stUop.useImm        := True
     val stPcRelAddr = (pkt.pc + U(2, 32 bits) + dstEa.disp.asUInt).asBits
@@ -210,6 +224,7 @@ object MicroOpAssembler {
     stUop.faulted       := False; stUop.faultVector := 0; stUop.isRte := False
     stUop.faultUsesNextPc := False
     stUop.faultAddr     := pkt.pc; stUop.sswInstr := False; stUop.isTrapv := False
+    stUop.divSigned     := False; stUop.div64 := False; stUop.divIsRem := False
     stUop.firstOfInstr  := True    // a single STORE µop is its own first µop
 
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
@@ -233,7 +248,10 @@ object MicroOpAssembler {
     // Decoded as a branch-class trap-check µop (isBranch so it issues to the branch
     // EU, readsNzvc so it reads V). The branch EU drives a trapvFault when V=1.
     val isTrapvOp = (op === B"16'h4E76")
-    val bad = !isRteOp && !isTrapOp && !isTrapvOp &&
+    // DIVU.L/DIVS.L: opword 0100 1100 01 mmmrrr (op[15:6]==0x131). Decoded here (line 4
+    // is otherwise illegal) from the extension word — NOT `bad`.
+    val isDivLOp = (op(15 downto 6) === B"10'b0100110001")
+    val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp &&
               (!pkt.simple || spec.illegal || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     when(isRteOp) {
       // a single architectural op µop carrying isRte; writes nothing, has a real PC.
@@ -318,8 +336,119 @@ object MicroOpAssembler {
       opUop.sswInstr      := True            // instruction fetch (program-space SSW)
     }
 
+    // ── DIVU.L / DIVS.L (32/32 and 64/32) — line-4 extension-word forms ─────────
+    // Opword 0100 1100 01 mmmrrr (op[15:6]==0x131); the EA (op[5:0]) is the 32-bit
+    // divisor. The EXTENSION WORD words(1) carries: Dq=ext[14:12] (quotient dst +
+    // 32-bit dividend / 64-bit-dividend low), signed=ext[11], size64=ext[10] (1 =>
+    // 64-bit dividend Dr:Dq), Dr=ext[2:0] (remainder dst + 64-bit-dividend high).
+    //   - 32-bit form, Dr==Dq -> quotient ONLY (single DIV µop -> Dq).
+    //   - 32-bit form, Dr!=Dq -> quotient -> Dq + remainder -> Dr (crack DIV+DIVREM).
+    //   - 64-bit form          -> quotient -> Dq + remainder -> Dr (crack DIV+DIVREM).
+    // The DIV µop reads Dq (psrcA) + the divisor EA (psrcB) [+ Dr via psrcC for 64b];
+    // the trailing DIVREM µop writes the DivEu's latched remainder to Dr. Both are
+    // CPLX (DivEu), single-outstanding -> issue in age order so the rem latch is valid.
+    val ext = pkt.words(1)
+    val divlDq     = ext(14 downto 12).asUInt.resize(5)
+    val divlDr     = ext(2 downto 0).asUInt.resize(5)
+    val divlSigned = ext(11)
+    val divl64     = ext(10)
+    // The DIV.L divisor is 32-bit -> re-decode the source EA at LONG size (so an
+    // immediate divisor consumes 2 extension words / is the full 32-bit value). The
+    // ext word is words(1); the EA's own extension words follow at words(2..).
+    val divlSrcEa = EaDecoder.decode(op(5 downto 0), Size.LONG, Vec(pkt.words(0), pkt.words(2), pkt.words(3)))
+    // Divisor EA reuses divlSrcEa (op[5:0]); reg/imm/memSimple.
+    val divlDivisorIsImm = divlSrcEa.klass === EaClass.IMM
+    val divlDivisorIsReg = (divlSrcEa.klass === EaClass.DATAREG) || (divlSrcEa.klass === EaClass.ADDRREG)
+    val divlDivisorIsMem = divlSrcEa.klass === EaClass.MEMSIMPLE
+    // remainder is produced (a 2nd dest) for the 64-bit form OR a 32-bit form whose
+    // Dr field differs from Dq.
+    val divlHasRem = divl64 || (divlDr =/= divlDq)
+
+    // DIV (quotient) µop.
+    val divlUop = DecodedUop()
+    divlUop.valid         := pkt.valid
+    divlUop.pc            := pkt.pc
+    divlUop.nextPc        := nextPc
+    divlUop.op            := DecOp.DIV
+    divlUop.cluster       := Cluster.CPLX
+    divlUop.size          := Size.LONG
+    divlUop.memOp         := MemOp.NONE
+    divlUop.srcAReg       := divlDq; divlUop.srcAValid := True             // dividend (Dq / lo)
+    // divisor: reg -> srcB; imm -> useImm; mem -> T0 (cracked load).
+    when(divlDivisorIsImm) {
+      divlUop.srcBReg := 0; divlUop.srcBValid := False
+      divlUop.useImm  := True; divlUop.imm := divlSrcEa.imm
+    } elsewhen(divlDivisorIsMem) {
+      divlUop.srcBReg := U(T0, 5 bits); divlUop.srcBValid := True
+      divlUop.useImm  := False; divlUop.imm := 0
+    } otherwise {
+      divlUop.srcBReg := divlSrcEa.reg; divlUop.srcBValid := True
+      divlUop.useImm  := False; divlUop.imm := 0
+    }
+    divlUop.dstReg        := divlDq; divlUop.dstValid := True              // quotient -> Dq
+    divlUop.readsNzvc     := False; divlUop.readsX := False
+    divlUop.writesNzvc    := True;  divlUop.writesX := False               // DIV sets N/Z/V
+    divlUop.isBranch      := False; divlUop.cond := 0; divlUop.branchDisp := 0
+    divlUop.unimplemented := False
+    divlUop.faulted       := False; divlUop.faultVector := 0; divlUop.isRte := False
+    divlUop.faultUsesNextPc := True            // DIV0 stacks nextPc (group-2 format-$2)
+    divlUop.faultAddr     := pkt.pc; divlUop.sswInstr := False; divlUop.isTrapv := False
+    divlUop.divSigned     := divlSigned; divlUop.div64 := divl64; divlUop.divIsRem := False
+    divlUop.firstOfInstr  := True
+    // 64-bit dividend high word Dr: carried in srcC (psrcC after rename). For the
+    // 32-bit form psrcC is unused.
+    divlUop.srcCReg       := divlDr; divlUop.srcCValid := divl64
+
+    // DIVREM (remainder-move) µop: CPLX, writes the DivEu's latched remainder to Dr.
+    // No real register source (the remainder is the DivEu's internal latch) -> it has
+    // an implicit dependency on the immediately-preceding DIV, enforced by age-ordered
+    // single-outstanding CPLX issue. It writes Dr; sets no flags.
+    val divremUop = DecodedUop()
+    divremUop.valid         := pkt.valid
+    divremUop.pc            := pkt.pc
+    divremUop.nextPc        := nextPc
+    divremUop.op            := DecOp.DIVREM
+    divremUop.cluster       := Cluster.CPLX
+    divremUop.size          := Size.LONG
+    divremUop.memOp         := MemOp.NONE
+    divremUop.srcAReg       := 0; divremUop.srcAValid := False
+    divremUop.srcBReg       := 0; divremUop.srcBValid := False
+    divremUop.srcCReg       := 0; divremUop.srcCValid := False
+    divremUop.useImm        := False; divremUop.imm := 0
+    divremUop.dstReg        := divlDr; divremUop.dstValid := True          // remainder -> Dr
+    divremUop.readsNzvc     := False; divremUop.readsX := False
+    divremUop.writesNzvc    := False; divremUop.writesX := False
+    divremUop.isBranch      := False; divremUop.cond := 0; divremUop.branchDisp := 0
+    divremUop.unimplemented := False
+    divremUop.faulted       := False; divremUop.faultVector := 0; divremUop.isRte := False
+    divremUop.faultUsesNextPc := False
+    divremUop.faultAddr     := pkt.pc; divremUop.sswInstr := False; divremUop.isTrapv := False
+    divremUop.divSigned     := divlSigned; divremUop.div64 := divl64; divremUop.divIsRem := True
+    divremUop.firstOfInstr  := False           // trailing crack µop
+
+    // DIV.L is valid only when its divisor EA is reg/imm. A memSimple divisor would
+    // need a leading load crack too (3-µop) -> defer for now; reg/imm cover the
+    // lock-step + common cases.
+    val divLOk = divlDivisorIsReg || divlDivisorIsImm
+
+    // An unsupported DIV.L (memSimple divisor) -> mark the op µop illegal (vector 4),
+    // exactly like the `bad` path. opUop is already illegal for the 4C4x opword
+    // (OperationDecoder's line-4 default), so we just force the faulted illegal fields.
+    when(isDivLOp && !divLOk) {
+      opUop.op            := DecOp.ILLEGAL
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.unimplemented := True
+      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
+      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
+      opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
+    }
+
     // ── Sequence selection (each slot driven exactly once) ─────────────────────
+    // pkt.fault  -> [op] (fetch fault delivery)
     // bad        -> [op] (count 1, op carries the illegal override)
+    // DIV.L      -> [div] (quotient-only) or [div, divrem] (count 1 or 2); bad divisor
+    //               -> [illegal]
     // crackStore -> [store] (count 1)
     // crackLoad  -> [load, op] (count 2)
     // else       -> [op] (count 1)
@@ -332,6 +461,20 @@ object MicroOpAssembler {
       out.count   := 1
       out.uops(0) := opUop
       out.uops(1) := opUop
+    } elsewhen(isDivLOp) {
+      when(!divLOk) {
+        out.count   := 1
+        out.uops(0) := opUop      // forced illegal (vector 4) above
+        out.uops(1) := opUop
+      } elsewhen(divlHasRem) {
+        out.count   := 2
+        out.uops(0) := divlUop      // quotient -> Dq
+        out.uops(1) := divremUop    // remainder -> Dr
+      } otherwise {
+        out.count   := 1
+        out.uops(0) := divlUop      // quotient-only (Dr==Dq)
+        out.uops(1) := divlUop
+      }
     } elsewhen(crackStore) {
       out.count   := 1
       out.uops(0) := stUop

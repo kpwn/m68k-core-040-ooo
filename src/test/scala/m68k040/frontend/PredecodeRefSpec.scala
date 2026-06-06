@@ -29,11 +29,22 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x0240) == cp(false,0))  // ANDI.W
     assert(classify(0x41D0) == cp(false,0))  // LEA (A0),A0
   }
-  test("MUL/DIV (class 8/C opmode 3/7) -> complex") {
-    assert(classify(0x80C1) == cp(false,0))  // DIVU.W D1,D0
-    assert(classify(0x81C1) == cp(false,0))  // DIVS.W D1,D0
-    assert(classify(0xC0C1) == cp(false,0))  // MULU.W D1,D0
+  test("DIVU.W/DIVS.W (class 8 opmode 3/7) -> simple; MULU/MULS (class C) -> complex") {
+    assert(classify(0x80C1) == cp(true,1))   // DIVU.W D1,D0 (reg divisor, 1 word)
+    assert(classify(0x81C1) == cp(true,1))   // DIVS.W D1,D0
+    assert(classify(0x80FC) == cp(true,2))   // DIVU.W #imm,D0 (imm divisor -> +1 ext word)
+    assert(classify(0xC0C1) == cp(false,0))  // MULU.W D1,D0 (separate slice)
     assert(classify(0xC1C1) == cp(false,0))  // MULS.W D1,D0
+  }
+  test("CHK.W/CHK.L (class 4 bit8=1 bit6=0) -> simple") {
+    assert(classify(0x4181) == cp(true,1))   // CHK.W D1,D0 (reg bound)
+    assert(classify(0x4101) == cp(true,1))   // CHK.L D1,D0
+    assert(classify(0x41BC) == cp(true,2))   // CHK.W #imm,D0 (imm -> +1 word)
+  }
+  test("DIVU.L/DIVS.L (0100110001 mmmrrr) -> simple len 2 (reg/imm divisor); MUL.L complex") {
+    assert(classify(0x4C41) == cp(true,2))   // DIVU.L D1,D0 (opword + ext word)
+    assert(classify(0x4C7C) == cp(true,4))   // DIVU.L #imm,D0 (opword + ext + 2 imm words)
+    assert(classify(0x4C01) == cp(false,0))  // MUL.L (separate slice)
   }
   test("ADDA/SUBA (class 9/D opmode 3/7) stay simple len1") {
     assert(classify(0xD1C9) == cp(true,1))   // ADDA.L A1,A0

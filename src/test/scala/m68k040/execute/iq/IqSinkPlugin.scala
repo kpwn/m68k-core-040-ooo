@@ -19,6 +19,8 @@ class IqSinkPlugin extends FiberPlugin {
     iq.issue(2).ready := True
     // Port 3 (LS): driven-ready input; expose its valid/robId/pdst for the LS test.
     val ready3 = in Bool (); iq.issue(3).ready := ready3
+    // Port 4 (CPLX/DivEu): unused in these tests; keep ready so it is fully driven.
+    iq.issue(4).ready := True
 
     val v0 = out Bool (); val rob0 = out UInt (6 bits)
     val v1 = out Bool (); val rob1 = out UInt (6 bits)

@@ -31,12 +31,20 @@ case class RenamedUop() extends Bundle {
   // Instruction-fetch access-fault extras (format-$7): faultAddr = fetch PC stacked
   // as the EA; sswInstr = 1 => program-space SSW (vs data). Threaded from decode.
   val faultAddr    = UInt(32 bits); val sswInstr = Bool()
+  // CPLX-cluster (DivEu) control: CHK / DIV. divSigned=DIVS; div64=64-bit dividend
+  // (Dr:Dq); divIsRem=the trailing remainder-move (DIVREM) µop. Threaded from decode.
+  val divSigned    = Bool()
+  val div64        = Bool()
+  val divIsRem     = Bool()
   // Macro-instruction boundary marker (interrupts): True for the FIRST µop of an
   // instruction (the only multi-µop case is a memSimple-source crack [load, op]).
   val firstOfInstr = Bool()
   val dstArch = UInt(5 bits)   // architectural int dst reg 0..17 (incl T0/T1); for commit RAT + CommitTrace
   val psrcA = UInt(intW bits); val psrcAValid = Bool()
   val psrcB = UInt(intW bits); val psrcBValid = Bool()
+  // Third physical source: ONLY the DIVU.L/DIVS.L 64/32 form (dividend high word Dr).
+  // All other µops leave psrcCValid=False.
+  val psrcC = UInt(intW bits); val psrcCValid = Bool()
   val pdst  = UInt(intW bits); val pdstValid  = Bool(); val pdstOld = UInt(intW bits)
   val pNzvcSrc = UInt(flagW bits); val readsNzvc  = Bool()
   val pNzvcDst = UInt(flagW bits); val writesNzvc = Bool(); val pNzvcOld = UInt(flagW bits)

@@ -36,6 +36,7 @@ class LsBackendInjectSpec extends AnyFunSuite {
       eu1.issue << iq.issue(1)
       iq.issue(2).ready := False           // no branch uops injected here
       lsEu.issue << iq.issue(3)
+      iq.issue(4).ready := False           // no CHK/DIV uops injected here
       rob.logic.completion(0).valid   := eu0.completion.valid
       rob.logic.completion(0).payload := eu0.completion.payload
       rob.logic.completion(1).valid   := eu1.completion.valid

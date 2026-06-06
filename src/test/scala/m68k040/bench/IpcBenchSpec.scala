@@ -54,7 +54,7 @@ class IpcBenchSpec extends AnyFunSuite {
   // Copied (not shared) because the lock-step DUT is a private inner class. The
   // wiring is the SAME proven full-core chain.
 
-  class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin) extends FiberPlugin {
+  class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin, divEu: m68k040.execute.DivEuPlugin) extends FiberPlugin {
     var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
     during setup { a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7") }
     val logic = during build new Area {
@@ -65,8 +65,8 @@ class IpcBenchSpec extends AnyFunSuite {
       branchEu.issue << iq.issue(2)
       rob.logic.branchCompletion.valid   := branchEu.completion.valid
       rob.logic.branchCompletion.payload := branchEu.completion.payload
-      rob.logic.trapvFaultCompletion.valid   := branchEu.trapvFault.valid
-      rob.logic.trapvFaultCompletion.payload := branchEu.trapvFault.payload
+      rob.logic.euFaultCompletion.valid   := branchEu.trapvFault.valid
+      rob.logic.euFaultCompletion.payload := branchEu.trapvFault.payload
       rob.logic.completion(0).valid   := eu0.completion.valid
       rob.logic.completion(0).payload := eu0.completion.payload
       rob.logic.completion(1).valid   := eu1.completion.valid
@@ -80,12 +80,24 @@ class IpcBenchSpec extends AnyFunSuite {
         rob.logic.ccrCompletion(idx).payload.xWrite   := w.xWrite
       }
       wireCcr(0, eu0.logic.wbObs); wireCcr(1, eu1.logic.wbObs); wireCcr(2, lsEu.logic.wbObs)
+      wireCcr(3, divEu.logic.wbObs)
 
       lsEu.issue << iq.issue(3)
       rob.logic.completion(2).valid   := lsEu.completion.valid
       rob.logic.completion(2).payload := lsEu.completion.payload
       rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
       rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
+
+      // CPLX (DivEu) wiring (mirrors top/FullCoreSynth).
+      divEu.issue << iq.issue(4)
+      rob.logic.completion(3).valid   := divEu.completion.valid
+      rob.logic.completion(3).payload := divEu.completion.payload
+      iq.cplxWakeup.valid   := divEu.wakeup.valid
+      iq.cplxWakeup.payload := divEu.wakeup.payload
+      when(divEu.euFault.valid) {
+        rob.logic.euFaultCompletion.valid   := True
+        rob.logic.euFaultCompletion.payload := divEu.euFault.payload
+      }
       iq.lsWakeup.valid   := lsEu.wakeup.valid
       iq.lsWakeup.payload := lsEu.wakeup.payload
       lsEu.sqCommit.valid   := rob.logic.retire0
@@ -161,17 +173,18 @@ class IpcBenchSpec extends AnyFunSuite {
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
     val lsEu   = new LsEuPlugin
+    val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
     val rfX    = new RegFilePluginX
-    val wire   = new BackendWiringPlugin(eu0, eu1, branchEu, lsEu)
+    val wire   = new BackendWiringPlugin(eu0, eu1, branchEu, lsEu, divEu)
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
       ctrl,
       intCtrl,
       itlb,
       dtlb,
-      icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu,
+      icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
       rfInt, rfNzvc, rfX, wire)) }
   }
 

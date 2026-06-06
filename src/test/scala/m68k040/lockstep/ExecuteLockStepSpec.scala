@@ -8,7 +8,7 @@ import m68k040.frontend.FetchAlignPlugin
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
 import m68k040.rob.RobPlugin
-import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin}
+import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin, DivEuPlugin}
 import m68k040.execute.iq.{IssueQueuePlugin, IssueQueueService}
 import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
 import m68k040.services.{RedirectService, DTranslationService}
@@ -41,7 +41,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     * to the ROB, and the ROB's commit-time mispredict redirect (RedirectService)
     * to the IQ flush. (Frontend pipeFlush / RAT-rollback flush / fetch redirect are
     * driven inside the consuming plugins from host.get[RedirectService].) */
-  class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin) extends FiberPlugin {
+  class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin, divEu: DivEuPlugin) extends FiberPlugin {
     // Int PRF write port for the exception unit's A7 (reg 15) write-back. Allocated
     // in setup (RegfileService requires it). latency=0 so the handler can read the
     // updated A7 the cycle after the exception commits (it is serializing).
@@ -57,9 +57,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       branchEu.issue << iq.issue(2)
       rob.logic.branchCompletion.valid   := branchEu.completion.valid
       rob.logic.branchCompletion.payload := branchEu.completion.payload
-      // TRAPV execute-time conditional fault (vector 7 if V) -> ROB.
-      rob.logic.trapvFaultCompletion.valid   := branchEu.trapvFault.valid
-      rob.logic.trapvFaultCompletion.payload := branchEu.trapvFault.payload
+      // Execute-time conditional fault (TRAPV vector 7) -> ROB euFault (generalized).
+      rob.logic.euFaultCompletion.valid   := branchEu.trapvFault.valid
+      rob.logic.euFaultCompletion.payload := branchEu.trapvFault.payload
       rob.logic.completion(0).valid   := eu0.completion.valid
       rob.logic.completion(0).payload := eu0.completion.payload
       rob.logic.completion(1).valid   := eu1.completion.valid
@@ -75,6 +75,19 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         rob.logic.ccrCompletion(idx).payload.xWrite   := w.xWrite
       }
       wireCcr(0, eu0.logic.wbObs); wireCcr(1, eu1.logic.wbObs); wireCcr(2, lsEu.logic.wbObs)
+      wireCcr(3, divEu.logic.wbObs)
+
+      // ── CPLX (DivEu) wiring (mirrors top/FullCoreSynth) ──
+      // Issue port 4 -> DivEu; completion (port 3) + dynamic wakeup + euFault.
+      divEu.issue << iq.issue(4)
+      rob.logic.completion(3).valid   := divEu.completion.valid
+      rob.logic.completion(3).payload := divEu.completion.payload
+      iq.cplxWakeup.valid   := divEu.wakeup.valid
+      iq.cplxWakeup.payload := divEu.wakeup.payload
+      when(divEu.euFault.valid) {
+        rob.logic.euFaultCompletion.valid   := True
+        rob.logic.euFaultCompletion.payload := divEu.euFault.payload
+      }
 
       // ── LS cluster wiring (mirrors top/FullCoreSynth.BackendWiringPlugin) ──
       // LS issue port (3) -> LS EU. Its completion is BOTH a ROB completion (port
@@ -185,17 +198,18 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
     val lsEu   = new LsEuPlugin
+    val divEu  = new DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
     val rfX    = new RegFilePluginX
-    val wire   = new BackendWiringPlugin(eu0, eu1, branchEu, lsEu)
+    val wire   = new BackendWiringPlugin(eu0, eu1, branchEu, lsEu, divEu)
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
       ctrl,
       intCtrl,
       itlb,
       dtlb,
-      icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu,
+      icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
       rfInt, rfNzvc, rfX, wire)) }
   }
 
@@ -321,7 +335,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
               nzvc      = w.nzvc.toInt,
               nzvcWrite = w.nzvcWrite.toBoolean,
               x         = if (w.x.toBoolean) 1 else 0,
-              xWrite    = w.xWrite.toBoolean))
+              xWrite    = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
         }
       }
 
@@ -332,7 +346,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         // LS EU writeback-obs (loads write an int reg incl. the T0/T1 temp; stores
         // write none). Same join key (robId) as the ALU EUs. Temp-only commits are
         // dropped in WhiteboxCapture.onCommit (decode-matrix §4.5).
-        captureWb(dut.lsEu.logic.wbObs);
+        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs);
         // Branch EU writeback-obs: a branch writes NO int/flag reg and leaves CCR
         // unchanged. Map it to a no-write Wb (the commit pc comes from the ROB
         // commitObs = resolved nextPc). dstArch=0 is harmless since intWrite=false.
@@ -365,7 +379,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           val c = dut.rob.logic.commitObs(2)
           if (c.fire.toBoolean) {
             commitCount += 1
-            handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL)
+            handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL, if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1)
           }
         }
       }
@@ -508,14 +522,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
             intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt,
             nzvcWrite = w.nzvcWrite.toBoolean, x = if (w.x.toBoolean) 1 else 0,
-            xWrite = w.xWrite.toBoolean))
+            xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
         }
       }
 
       cd.onSamplings {
         captureWb(dut.eu0.logic.wbObs)
         captureWb(dut.eu1.logic.wbObs)
-        captureWb(dut.lsEu.logic.wbObs);
+        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs);
         {
           val bw = dut.branchEu.logic.wbObs
           if (bw.valid.toBoolean) {
@@ -551,7 +565,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             // ARE their own oracle steps -> keep them.
             if (!isInt) {
               commitCount += 1
-              handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL)
+              handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL, if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1)
             } else {
               // Drop the IRQ line on the entry commit (one-shot edge): the interrupt
               // is taken, the mask is raised; a re-fire after RTE must not loop.
@@ -1104,6 +1118,135 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 4)
   }
 
+  // ── DIVU.W / DIVS.W lock-step (32/16 -> Dn = {rem16, q16}, N/Z/V) ────────────
+  // Register-divisor forms are 2-byte opwords (nextPc = pc+2), straight-line.
+  test("lock-step: DIVU.W normal + DIVS.W normal", VerilatorTest) {
+    runLockStep("div-w-normal",
+      "moveq #100,%d0 ; moveq #7,%d1 ; divu.w %d1,%d0 ; " +   // 100/7 -> q14 r2 in d0
+      "moveq #-100,%d2 ; moveq #7,%d3 ; divs.w %d3,%d2 ; " +  // -100/7 -> q-14 r-2
+      "moveq #1,%d4 ; loop: bra loop", nInstr = 7)
+  }
+
+  // DIVU.W overflow: a large dividend / small divisor yields a quotient > 16 bits ->
+  // V=1, NO result write (Dn unchanged). The committed flags + (unchanged) Dn match.
+  test("lock-step: DIVU.W overflow (V=1, no write)", VerilatorTest) {
+    runLockStep("div-w-ovf",
+      "move.l #0x10000,%d0 ; moveq #1,%d1 ; divu.w %d1,%d0 ; " + // 0x10000/1 = 0x10000 > 16b -> V
+      "moveq #5,%d2 ; loop: bra loop", nInstr = 5)
+  }
+
+  // DIVU.W divide-by-zero -> vector 5 (format-$2) -> handler -> RTE -> resume.
+  // The handler's last flag-writer reproduces the entry CCR (Z=1 from `moveq #0,%d2`)
+  // so the sim whitebox's reconstructed CCR matches the oracle's RTE-restored CCR at
+  // the RTE step (same convention as the TRAPV lock-step; the architectural CCR
+  // restore on RTE is a separate pre-existing concern outside the trap machinery).
+  test("lock-step: DIVU.W DIV0 -> handler -> RTE", VerilatorTest) {
+    runLockStep("div-w-div0",
+      "move.l #handler,%d0 ; move.l %d0,0x14 ; " +   // vector 5 (DIV0) @ 0x14
+      "moveq #100,%d1 ; moveq #0,%d2 ; divu.w %d2,%d1 ; " + // /0 -> trap; entry CCR Z=1
+      "moveq #7,%d3 ; loop: bra loop ; " +
+      "handler: moveq #0,%d4 ; rte", nInstr = 8)  // moveq #0 -> Z=1 matches entry CCR
+  }
+
+  // ── DIVU.L/DIVS.L 32/32 lock-step (quotient -> Dq; quotient+remainder Dr:Dq) ──
+  test("lock-step: DIVU.L/DIVS.L 32/32 quotient-only", VerilatorTest) {
+    runLockStep("div-l32-q",
+      "move.l #1000000,%d0 ; moveq #7,%d1 ; divu.l %d1,%d0 ; " +   // 1000000/7 -> Dq
+      "move.l #-1000000,%d2 ; moveq #7,%d3 ; divs.l %d3,%d2 ; " + // signed
+      "moveq #1,%d4 ; loop: bra loop", nInstr = 7)
+  }
+
+  // Remainder:quotient 32/32 form (Dr!=Dq, cracked DIV+DIVREM). GNU `divull Dn,Dr,Dq`
+  // = the 32-bit form (ext bit10=0) writing Dq=quotient + Dr=remainder. The trailing
+  // `move.l %d2/%d5,...` READ the remainders (Dr) so the DIVREM PRF write is verified
+  // by a normal commit (its own commit record is coalesced into the DIV's step).
+  test("lock-step: DIVU.L/DIVS.L 32/32 remainder:quotient (Dr,Dq)", VerilatorTest) {
+    runLockStep("div-l32-rq",
+      "move.l #1000003,%d0 ; moveq #7,%d1 ; divull %d1,%d2,%d0 ; " + // d0=q, d2=rem
+      "move.l #-1000003,%d3 ; moveq #7,%d4 ; divsll %d4,%d5,%d3 ; " + // signed
+      "move.l %d2,%d6 ; move.l %d5,%d7 ; " +                          // verify both remainders
+      "loop: bra loop", nInstr = 8)
+  }
+
+  // DIVU.L 32/32 DIV0 -> vector 5 -> handler -> RTE.
+  test("lock-step: DIVU.L 32/32 DIV0 -> handler -> RTE", VerilatorTest) {
+    runLockStep("div-l32-div0",
+      "move.l #handler,%d0 ; move.l %d0,0x14 ; " +     // vector 5 @ 0x14
+      "move.l #1000,%d1 ; moveq #0,%d2 ; divu.l %d2,%d1 ; " + // /0 -> trap (entry Z=1)
+      "moveq #7,%d3 ; loop: bra loop ; " +
+      "handler: moveq #0,%d4 ; rte", nInstr = 8)       // moveq #0 -> Z=1 matches entry
+  }
+
+  // ── DIVU.L/DIVS.L 64/32 lock-step (Dr:Dq 64-bit dividend -> Dq=q, Dr=rem) ─────
+  // GNU `divu.l %dn,%dr:%dq` (the `:` syntax) = the 64-bit form (ext bit10=1): the
+  // 64-bit dividend is Dr:Dq (Dr high, Dq low). Cracked DIV(+psrcC=Dr)+DIVREM. The
+  // trailing moves verify the remainder (Dr).
+  test("lock-step: DIVU.L 64/32 (Dr:Dq) normal", VerilatorTest) {
+    runLockStep("div-l64-u",
+      "move.l #0x12,%d2 ; move.l #0x34567890,%d0 ; moveq #100,%d1 ; " + // Dr:Dq = 0x12_34567890
+      "divu.l %d1,%d2:%d0 ; " +                                          // d0=q, d2=rem
+      "move.l %d2,%d6 ; loop: bra loop", nInstr = 6)
+  }
+
+  // DIVS.L 64/32 signed, negative dividend.
+  test("lock-step: DIVS.L 64/32 (Dr:Dq) signed negative", VerilatorTest) {
+    runLockStep("div-l64-s",
+      "move.l #0xffffffff,%d2 ; move.l #0xfff0bdc0,%d0 ; moveq #7,%d1 ; " + // Dr:Dq = -1000000 (sign-ext)
+      "divs.l %d1,%d2:%d0 ; " +
+      "move.l %d2,%d6 ; loop: bra loop", nInstr = 6)
+  }
+
+  // DIVU.L 64/32 overflow: a 64-bit dividend whose quotient exceeds 32 bits -> V=1,
+  // NO write (Dq, Dr unchanged). Verified by reading both back.
+  test("lock-step: DIVU.L 64/32 overflow (V=1, no write)", VerilatorTest) {
+    runLockStep("div-l64-ovf",
+      "move.l #0x10,%d2 ; move.l #0,%d0 ; moveq #1,%d1 ; " + // 0x10_00000000 / 1 -> q > 32b
+      "divu.l %d1,%d2:%d0 ; " +
+      "moveq #5,%d6 ; loop: bra loop", nInstr = 6)
+  }
+
+  // DIVU.L 64/32 DIV0 -> vector 5 -> handler -> RTE.
+  test("lock-step: DIVU.L 64/32 DIV0 -> handler -> RTE", VerilatorTest) {
+    runLockStep("div-l64-div0",
+      "move.l #handler,%d6 ; move.l %d6,0x14 ; " +     // vector 5 @ 0x14
+      "move.l #0x12,%d2 ; move.l #0x3456,%d0 ; moveq #0,%d1 ; " + // /0
+      "divu.l %d1,%d2:%d0 ; " +
+      "moveq #7,%d3 ; loop: bra loop ; " +
+      "handler: moveq #0,%d4 ; rte", nInstr = 9)       // entry CCR Z=1 (moveq #0,%d1)
+  }
+
+  // ── CHK lock-step (vector 6, format-$2): in-bounds no-op + both out-of-bounds ──
+  // In-bounds: CHK is a no-op, straight-line. (CHK leaves CCR per the 68k undefined-
+  // except-N rule; Musashi's CHK does modify N/Z, but the lock-step compares the
+  // committed register stream + PC/SR/A7 — for the no-trap path the registers/PC match
+  // and the next flag-writer overwrites CCR before any compare point.)
+  test("lock-step: CHK in-bounds (no trap)", VerilatorTest) {
+    runLockStep("chk-inbounds",
+      "moveq #5,%d0 ; moveq #10,%d1 ; chk.w %d1,%d0 ; " +  // 0<=5<=10 -> no trap
+      "moveq #3,%d2 ; loop: bra loop", nInstr = 5)
+  }
+
+  // Dn<0 (N=1) -> trap vector 6 -> handler -> RTE. The handler reproduces the entry
+  // CCR (the chk's predecessor `moveq #-5,%d0` sets N=1) so the RTE-restored CCR
+  // matches (same convention as the DIV0/TRAPV tests).
+  test("lock-step: CHK Dn<0 -> handler -> RTE", VerilatorTest) {
+    runLockStep("chk-neg",
+      "move.l #handler,%d0 ; move.l %d0,0x18 ; " +   // vector 6 (CHK) @ 0x18
+      "moveq #-5,%d1 ; moveq #10,%d2 ; chk.w %d2,%d1 ; " + // -5<0 -> trap (entry N=1)
+      "moveq #7,%d3 ; loop: bra loop ; " +
+      "handler: moveq #-1,%d4 ; rte", nInstr = 8)   // moveq #-1 -> N=1 matches entry
+  }
+
+  // Dn>bound (N=0) -> trap vector 6 -> handler -> RTE. Entry CCR: `moveq #20,%d1`
+  // sets N=0,Z=0 (positive nonzero); the handler reproduces it.
+  test("lock-step: CHK Dn>bound -> handler -> RTE", VerilatorTest) {
+    runLockStep("chk-over",
+      "move.l #handler,%d0 ; move.l %d0,0x18 ; " +   // vector 6 (CHK) @ 0x18
+      "moveq #20,%d1 ; moveq #10,%d2 ; chk.w %d2,%d1 ; " + // 20>10 -> trap (entry N=0)
+      "moveq #7,%d3 ; loop: bra loop ; " +
+      "handler: moveq #1,%d4 ; rte", nInstr = 8)    // moveq #1 -> N=0,Z=0 matches entry
+  }
+
   // ── MMU page-fault delivery lock-step (format-$7 -> handler -> RTE) ──────────
   // THE Task-4 gate: a data store to a NON-RESIDENT page raises a 68040 access
   // fault (vector 2, format-$7), vectors to a handler that writes a resident page
@@ -1167,7 +1310,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
           dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
           intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
-          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean))
+          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
       }
       def captureBranch(): Unit = {
         val bw = dut.branchEu.logic.wbObs
@@ -1175,10 +1318,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
       def captureExc(): Unit = {
         val c = dut.rob.logic.commitObs(2)
-        if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL)
+        if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL, if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1)
       }
       cd.onSamplings {
-        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs)
+        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
         captureBranch()
         for (k <- 0 until 2) {
           val c = dut.rob.logic.commitObs(k)
@@ -1286,10 +1429,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
         dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
         intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
-        x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean))
+        x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
     }
     dut.clockDomain.onSamplings {
-      captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs)
+      captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
       val bw = dut.branchEu.logic.wbObs
       if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
       for (k <- 0 until 2) {
@@ -1298,7 +1441,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL)
       }
       val ce = dut.rob.logic.commitObs(2)
-      if (ce.fire.toBoolean) handle.onExcCommit(ce.pc.toLong & 0xffffffffL, ce.sysByte.toInt & 0xff, ce.a7.toLong & 0xffffffffL)
+      if (ce.fire.toBoolean) handle.onExcCommit(ce.pc.toLong & 0xffffffffL, ce.sysByte.toInt & 0xff, ce.a7.toLong & 0xffffffffL, if (ce.ccrFoldValid.toBoolean) ce.ccrFold.toInt & 0xf else -1)
     }
   }
 

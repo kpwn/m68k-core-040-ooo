@@ -64,8 +64,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // completion(k).valid/payload; this ROB consumes them. Standalone tests poke
     // them in sim (simPublic). Mirrors the RenameCommitService.commitPorts wiring
     // convention (sibling-driven, directionless).
-    // 3 completion ports: ALU0, ALU1, LS EU (sibling-driven, directionless).
-    val completion = Vec.fill(3)(Flow(UInt(robIdW bits)))
+    // 4 completion ports: ALU0, ALU1, LS EU, CPLX EU (DivEu) (sibling-driven).
+    val completion = Vec.fill(4)(Flow(UInt(robIdW bits)))
     // Default-drive (idle) so the ROB elaborates standalone; a sibling EU-wiring
     // plugin OVERRIDES these via allowOverride, and standalone tests poke them in
     // sim (simPublic).
@@ -137,15 +137,18 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     lsFaultCompletion.payload.sizeBits.allowOverride; lsFaultCompletion.payload.sizeBits := U(0, 2 bits)
     lsFaultCompletion.payload.supervisor.allowOverride; lsFaultCompletion.payload.supervisor := False
     lsFaultCompletion.simPublic()
-    // TRAPV execute-time conditional fault completion (driven by the branch EU). When
-    // a TRAPV trap-check µop sees V=1 the branch EU drives this; the ROB marks the
-    // entry FAULTED (vector 7). faultPc is already captured per-entry at alloc (the
-    // TRAPV µop's faultPc = nextPc), so this only flips faulted+vector. Default-idle
-    // (allowOverride) so a standalone DUT elaborates; the EU-wiring OVERRIDES it.
-    val trapvFaultCompletion = Flow(m68k040.execute.TrapvFault())
-    trapvFaultCompletion.valid.allowOverride;         trapvFaultCompletion.valid := False
-    trapvFaultCompletion.payload.robId.allowOverride; trapvFaultCompletion.payload.robId := U(0, robIdW bits)
-    trapvFaultCompletion.simPublic()
+    // Execute-time conditional fault completion (generalized; driven by the branch EU
+    // for TRAPV and the div EU for CHK/DIV0). When an execute-time check raises a
+    // synchronous group-2 trap the EU drives this with {robId, vector}; the ROB marks
+    // the entry FAULTED + the carried vector. faultPc (= nextPc) and the PPC (=
+    // instruction pc, pcStore) are already captured per-entry at alloc, so this only
+    // flips faulted+vector. Default-idle (allowOverride) so a standalone DUT
+    // elaborates; the EU-wiring OVERRIDES it. (Field name kept as `euFaultCompletion`.)
+    val euFaultCompletion = Flow(m68k040.execute.EuFault())
+    euFaultCompletion.valid.allowOverride;          euFaultCompletion.valid := False
+    euFaultCompletion.payload.robId.allowOverride;  euFaultCompletion.payload.robId := U(0, robIdW bits)
+    euFaultCompletion.payload.vector.allowOverride; euFaultCompletion.payload.vector := U(0, 8 bits)
+    euFaultCompletion.simPublic()
     // Per-entry committed-CCR VALUE capture (set at completion from the EU writeback
     // values via ccrCompletion). Folded into committedCcr at retire (for the stacked
     // exception frame). RegInit False so an unwired entry contributes nothing.
@@ -157,7 +160,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // for a completing CCR-writer (one port per EU). Default-idle (allowOverride) so
     // a DUT that doesn't wire it elaborates; the full-core wiring OVERRIDES it from
     // the EUs' wbObs.
-    val ccrCompletion = Vec.fill(3)(Flow(m68k040.rob.CcrCompletion()))
+    val ccrCompletion = Vec.fill(4)(Flow(m68k040.rob.CcrCompletion()))
     ccrCompletion.foreach { c =>
       c.valid.allowOverride;            c.valid := False
       c.payload.robId.allowOverride;    c.payload.robId := U(0, robIdW bits)
@@ -344,16 +347,17 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // data/program bit was seed-flaky (the µop's unset sswInstr randomized).
       faultInstrStore(lsFaultCompletion.payload.robId) := False
     }
-    // TRAPV conditional fault: flip the entry FAULTED + vector 7. faultPc is already
-    // the TRAPV µop's nextPc (captured at alloc into faultPcStore), so the format-$2
-    // frame stacks the right PC. The entry also completes via branchCompletion (so it
-    // can retire + trigger the exception). Placed BEFORE alloc-reset (alloc wins on a
-    // re-used index). NOT an instruction-fetch fault -> clear the SSW-instr bit.
-    when(trapvFaultCompletion.valid) {
-      faultedStore(trapvFaultCompletion.payload.robId)    := True
-      faultVecStore(trapvFaultCompletion.payload.robId)   := U(7, 8 bits)   // TRAPV vector
-      faultInstrStore(trapvFaultCompletion.payload.robId) := False
-      // faultPcStore is already the TRAPV µop's nextPc (captured at alloc) — no write.
+    // Execute-time conditional fault (TRAPV / CHK / DIV0): flip the entry FAULTED +
+    // the CARRIED vector. faultPc is already the µop's nextPc (captured at alloc into
+    // faultPcStore via faultUsesNextPc), so the format-$2 frame stacks the right PC;
+    // the PPC is pcStore. The entry also completes via its normal completion port (so
+    // it can retire + trigger the exception). Placed BEFORE alloc-reset (alloc wins on
+    // a re-used index). NOT an instruction-fetch fault -> clear the SSW-instr bit.
+    when(euFaultCompletion.valid) {
+      faultedStore(euFaultCompletion.payload.robId)    := True
+      faultVecStore(euFaultCompletion.payload.robId)   := euFaultCompletion.payload.vector
+      faultInstrStore(euFaultCompletion.payload.robId) := False
+      // faultPcStore is already the µop's nextPc (captured at alloc) — no write.
     }
 
     when(alloc0) {
@@ -439,6 +443,26 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     when(retire1 && xWrStore(h1))    { ccrAfter1(4)          := xValStore(h1) }
     committedCcr := ccrAfter1
 
+    // CCR the exception stacks: committedCcr PLUS the FAULTING head's own flag effects
+    // when it writes flags (CHK sets N even as it traps -> the stacked CCR's N must
+    // reflect it, matching Musashi). Applied ONLY to a FAULT/trap entry (faultRetire):
+    // an INTERRUPT preempts the head BEFORE its effects (it re-executes after RTE), so
+    // an interrupt stacks the plain committedCcr. For faults that don't modify CCR
+    // (illegal/TRAPV/DIV0/access-fault) nzvcWrStore(h0) is False -> == committedCcr.
+    val ccrForException = UInt(5 bits); ccrForException := committedCcr
+    when(faultRetire && nzvcWrStore(h0)) { ccrForException(3 downto 0) := nzvcValStore(h0) }
+    when(faultRetire && xWrStore(h0))    { ccrForException(4)          := xValStore(h0) }
+    // CAPTURE the faulting instruction's own NZVC fold at the trigger cycle and HOLD
+    // it until the (much-later) exception-entry obs fires (the lock-step whitebox
+    // folds it onto the running CCR for the entry step). Only a CHK fault writes flags
+    // as it traps; other faults leave nzvcWrStore(h0)=False -> held invalid.
+    val heldCcrFold      = Reg(UInt(4 bits))
+    val heldCcrFoldValid = RegInit(False)
+    when(faultRetire) {
+      heldCcrFold      := nzvcValStore(h0)
+      heldCcrFoldValid := nzvcWrStore(h0)
+    }
+
     // ── Commit-side exception sequencer (entry FSM + RTE) ───────────────────────
     // entryTrigger has TWO sources: a faulted/trap head (exceptionPending) OR an
     // interrupt at a macro-instruction boundary (interruptPending). They are
@@ -452,8 +476,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val exc = new m68k040.exception.ExceptionUnit(
       ss = new m68k040.exception.SystemState,
       entryTrigger = excEntryTrigger, entryVector = excEntryVector, entryPc = excEntryPc,
+      // PPC for a format-$2 group-2 trap (TRAPV/CHK/DIV0) = the trapping INSTRUCTION's
+      // PC. pcStore(h0) holds the instruction PC (variable-length safe; entryPc-2 only
+      // worked for the 2-byte TRAPV). Interrupts ignore entryPpc (format-$0).
+      entryPpc     = pcStore(h0),
       rteTrigger   = rteRetire,        rtePc        = p0.predNextPc,
-      committedCcr = committedCcr,
+      committedCcr = ccrForException,
       // Access-fault (vector 2) extras for the format-$7 frame.
       entryFaultAddr = faultAddrStore(h0),
       entryFaultWr   = faultWrStore(h0),
@@ -508,6 +536,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     case class CommitObs() extends Bundle {
       val fire = Bool(); val robId = UInt(robIdW bits); val pc = UInt(32 bits)
       val sysByte = UInt(8 bits); val a7 = UInt(32 bits)
+      // Faulting instruction's own NZVC fold for the lock-step whitebox (channel 2,
+      // entry only): when a faulting head WROTE flags (CHK sets N as it traps), the
+      // whitebox folds these 4 bits onto the running CCR before the entry step (its
+      // own Wb never retires normally). `ccrFoldValid` qualifies it; for entries that
+      // don't modify CCR (TRAPV/DIV0/access-fault) / interrupts / RTE it is False
+      // (the whitebox's running CCR already reflects the architectural state).
+      val ccrFold      = UInt(4 bits)
+      val ccrFoldValid = Bool()
       // True for an INTERRUPT-entry obs (channel 2 only). The lock-step harness drops
       // it (Musashi bundles the interrupt entry with the first handler instruction).
       val isInterrupt = Bool()
@@ -515,11 +551,21 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val commitObs = Vec(CommitObs(), 3); commitObs.simPublic()
     commitObs(0).fire := RegNext(retire0) init False; commitObs(0).robId := RegNext(h0); commitObs(0).pc := RegNext(commitPc0)
     commitObs(0).sysByte := RegNext(exc.ss.srSys); commitObs(0).a7 := RegNext(exc.ss.a7); commitObs(0).isInterrupt := False
+    commitObs(0).ccrFold := 0; commitObs(0).ccrFoldValid := False
     commitObs(1).fire := RegNext(retire1) init False; commitObs(1).robId := RegNext(h1); commitObs(1).pc := RegNext(commitPc1)
     commitObs(1).sysByte := RegNext(exc.ss.srSys); commitObs(1).a7 := RegNext(exc.ss.a7); commitObs(1).isInterrupt := False
+    commitObs(1).ccrFold := 0; commitObs(1).ccrFoldValid := False
     // Exception / RTE commit (handler-entry or restored PC + post-event sysByte/A7).
+    // For a FAULT entry where the faulting head wrote flags (CHK), carry its NZVC fold
+    // so the whitebox folds it (the faulting µop's Wb never retires normally).
     commitObs(2).fire := RegNext(exc.obsFire) init False; commitObs(2).robId := RegNext(h0)
     commitObs(2).pc := RegNext(exc.obsPc); commitObs(2).sysByte := RegNext(exc.obsSysByte); commitObs(2).a7 := RegNext(exc.obsA7)
+    // Fold value held since the trigger (aligned with the late obsFire entry pulse).
+    // Applied ONLY to a fault/trap ENTRY obs (obsIsEntry) that is not an interrupt and
+    // whose faulting instruction wrote flags (CHK). RTE obs / interrupt entries carry
+    // no fold (their running-CCR reconstruction is already correct).
+    commitObs(2).ccrFold      := RegNext(heldCcrFold)
+    commitObs(2).ccrFoldValid := RegNext(exc.obsFire && exc.obsIsEntry && !exc.obsIsInterrupt && heldCcrFoldValid) init False
     commitObs(2).isInterrupt := RegNext(exc.obsIsInterrupt) init False
   }
 
