@@ -26,6 +26,7 @@ class AluDatapathSpec extends AnyFunSuite {
     OpCase("sub",  DecOp.SUB,  writesX = true,  writesDst = true),
     OpCase("and",  DecOp.AND,  writesX = false, writesDst = true),
     OpCase("or",   DecOp.OR,   writesX = false, writesDst = true),
+    OpCase("eor",  DecOp.EOR,  writesX = false, writesDst = true),
     OpCase("cmp",  DecOp.CMP,  writesX = false, writesDst = false)
   )
   case class SzCase(sfx: String, enum: SpinalEnumElement[Size.type], w: Int) { def mask: Long = if (w == 32) 0xFFFFFFFFL else (1L << w) - 1 }

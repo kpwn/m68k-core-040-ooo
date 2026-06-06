@@ -70,6 +70,12 @@ object OperationDecoder {
       is(0x8, 0x9, 0xB, 0xC, 0xD) {
         val opmode = opword(8 downto 6)
         val isRmw  = (opmode === 4 || opmode === 5 || opmode === 6)
+        // EOR (line B, opmode 4/5/6 = .B/.W/.L): `Dn ^ <ea> -> <ea>`. The EA is the
+        // DESTINATION operand (read AND written), Dn (bits 11:9) the source. Register
+        // destination only this slice (memory-dest RMW deferred -> the assembler gates
+        // a non-reg EA to illegal). An-direct (mode 1) is CMPM, NOT EOR -> excluded.
+        // Flags: NZ, V=C=0 (no X). srcA=EA (dst operand), srcB=Dn, dst=EA.
+        val isEor = (line === 0xB) && isRmw && (opword(5 downto 3) =/= 1)
         // DIVU.W (line 0x8 opmode 3) / DIVS.W (line 0x8 opmode 7): 32-bit dividend Dn
         // (bits 11:9) / 16-bit divisor EA -> Dn = {rem[31:16], q[15:0]}. BOTH DIVs are
         // line 8 (the OR group). MULU.W (line 0xC opmode 3) / MULS.W (line 0xC opmode
@@ -102,6 +108,15 @@ object OperationDecoder {
           o.dst := dnField; o.dstWrites := True   // product -> Dn[31:0]
           o.writesNzvc := True            // MUL sets N/Z (V=0, C=0)
           o.divSigned := isMulsW          // reuse divSigned as the MULS marker
+        } .elsewhen(isEor) {
+          // EOR Dn,<ea>: srcA = EA (dst operand), srcB = Dn, dst = EA (same field).
+          o.illegal := False
+          o.op := DecOp.EOR
+          o.srcA := easrc; o.srcB := dnField; o.dst := easrc; o.dstWrites := True
+          when(opmode === 4) { o.size := Size.BYTE }
+            .elsewhen(opmode === 5) { o.size := Size.WORD }
+            .otherwise { o.size := Size.LONG }
+          o.writesNzvc := True            // EOR sets N/Z (V=0, C=0); no X
         } .elsewhen(!isRmw && !isMulDiv) {
           o.illegal := False
           switch(line) {

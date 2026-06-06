@@ -4,7 +4,7 @@ import m68k040.isa.{Cluster, Size, MemOp}
 import spinal.core._
 
 object DecOp extends SpinalEnum {
-  val MOVE, ADD, SUB, AND, OR, CMP, BRANCH, ILLEGAL,
+  val MOVE, ADD, SUB, AND, OR, EOR, CMP, BRANCH, ILLEGAL,
       // CPLX-cluster (DivEu) ops: bound-check trap + integer divide. DIV carries
       // {signed, the .W/.L/64-form, quotient-only-vs-remainder} via size + the
       // divForm/divSigned/div64 µop fields below.

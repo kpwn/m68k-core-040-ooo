@@ -55,6 +55,20 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
     // slice 2), no longer unimplemented. (Full sequence covered by CrackLoadSpec.)
     assert(!dut.uop.unimplemented.toBoolean && dut.uop.memOp.toEnum == MemOp.LOAD)
   }}
+  // EOR.L D1,D2 (0xB382): reg dest. srcA = EA reg (D2 = dst operand), srcB = Dn (D1),
+  // dst = EA reg (D2). Writes the reg + NZVC, no X.
+  test("EOR.L D1,D2 (reg dest): srcA=D2, srcB=D1, dst=D2, NZVC no X", VerilatorTest) { run { dut => drive(dut, 0xB382); sleep(1)
+    assert(dut.uop.op.toEnum == DecOp.EOR && !dut.uop.unimplemented.toBoolean)
+    assert(dut.uop.srcAReg.toInt == 2 && dut.uop.srcAValid.toBoolean)
+    assert(dut.uop.srcBReg.toInt == 1 && dut.uop.srcBValid.toBoolean)
+    assert(dut.uop.dstReg.toInt == 2 && dut.uop.dstValid.toBoolean)
+    assert(dut.uop.writesNzvc.toBoolean && !dut.uop.writesX.toBoolean && !dut.uop.useImm.toBoolean)
+  }}
+  // EOR.B D2,(A0) (0xB510): memory destination = the deferred RMW form -> illegal
+  // (unimplemented). Must NOT crack a leading load.
+  test("EOR.B D2,(A0) (mem dest) -> unimplemented (RMW deferred)", VerilatorTest) { run { dut => drive(dut, 0xB510); sleep(1)
+    assert(dut.uop.unimplemented.toBoolean && dut.uop.memOp.toEnum == MemOp.NONE)
+  }}
   test("non-simple packet -> unimplemented", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       drive(dut, 0x7605); dut.pkt.simple #= false; dut.pkt.complex #= true; sleep(1)

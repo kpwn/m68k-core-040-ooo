@@ -26,25 +26,47 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x5240) == cp(false,0))  // ADDQ.W #1,D0
     assert(classify(0x51C8) == cp(false,0))  // DBRA D0
     assert(classify(0xE148) == cp(false,0))  // LSL.W #8,D0
-    assert(classify(0x0240) == cp(false,0))  // ANDI.W
     assert(classify(0x41D0) == cp(false,0))  // LEA (A0),A0
   }
-  test("DIVU.W/DIVS.W (class 8 opmode 3/7) -> simple; MULU/MULS (class C) -> complex") {
+  test("line-0 immediates ADDI/SUBI/ANDI/ORI/EORI/CMPI -> Dn (in scope)") {
+    assert(classify(0x0000) == cp(true,2))   // ORI.B  #imm,D0 (.B = opword + 1 imm word)
+    assert(classify(0x0240) == cp(true,2))   // ANDI.W #imm,D0 (.W = opword + 1 imm word)
+    assert(classify(0x0480) == cp(true,3))   // SUBI.L #imm,D0 (.L = opword + 2 imm words)
+    assert(classify(0x0680) == cp(true,3))   // ADDI.L #imm,D0
+    assert(classify(0x0A40) == cp(true,2))   // EORI.W #imm,D0
+    assert(classify(0x0C80) == cp(true,3))   // CMPI.L #imm,D0
+  }
+  test("line-0 ANDI/ORI/EORI #imm,CCR (...00 111100 byte) -> simple len2; SR/CMPI-to-ccr complex") {
+    assert(classify(0x023C) == cp(true,2))   // ANDI #imm,CCR
+    assert(classify(0x003C) == cp(true,2))   // ORI  #imm,CCR
+    assert(classify(0x0A3C) == cp(true,2))   // EORI #imm,CCR
+    assert(classify(0x027C) == cp(false,0))  // ANDI #imm,SR (word, privileged) -> deferred
+    assert(classify(0x0C3C) == cp(false,0))  // CMPI #imm,<#imm> (no CMPI-to-CCR) -> illegal
+  }
+  test("line-0 memory-dest immediate (deferred RMW) + illegal size -> complex") {
+    assert(classify(0x0010) == cp(false,0))  // ORI.B #imm,(A0) — RMW deferred
+    assert(classify(0x00C0) == cp(false,0))  // ss=11 illegal size
+    assert(classify(0x0840) == cp(false,0))  // opmode 4 (BTST-imm / bit ops) — out of scope
+  }
+  test("DIVU.W/DIVS.W (class 8 opmode 3/7) + MULU.W/MULS.W (class C) -> simple; An-direct MUL EA complex") {
     assert(classify(0x80C1) == cp(true,1))   // DIVU.W D1,D0 (reg divisor, 1 word)
     assert(classify(0x81C1) == cp(true,1))   // DIVS.W D1,D0
     assert(classify(0x80FC) == cp(true,2))   // DIVU.W #imm,D0 (imm divisor -> +1 ext word)
-    assert(classify(0xC0C1) == cp(false,0))  // MULU.W D1,D0 (separate slice)
-    assert(classify(0xC1C1) == cp(false,0))  // MULS.W D1,D0
+    assert(classify(0xC0C1) == cp(true,1))   // MULU.W D1,D0 (reg multiplier, 1 word)
+    assert(classify(0xC1C1) == cp(true,1))   // MULS.W D1,D0
+    assert(classify(0xC0FC) == cp(true,2))   // MULU.W #imm,D0 (imm -> +1 ext word)
+    assert(classify(0xC0C9) == cp(false,0))  // MULU.W A1,D0 — An-direct is NOT a legal MUL EA
   }
   test("CHK.W/CHK.L (class 4 bit8=1 bit6=0) -> simple") {
     assert(classify(0x4181) == cp(true,1))   // CHK.W D1,D0 (reg bound)
     assert(classify(0x4101) == cp(true,1))   // CHK.L D1,D0
     assert(classify(0x41BC) == cp(true,2))   // CHK.W #imm,D0 (imm -> +1 word)
   }
-  test("DIVU.L/DIVS.L (0100110001 mmmrrr) -> simple len 2 (reg/imm divisor); MUL.L complex") {
+  test("DIVU.L/DIVS.L (0100110001 mmmrrr) / MULU.L/MULS.L (0100110000) -> simple len 2 (reg/imm)") {
     assert(classify(0x4C41) == cp(true,2))   // DIVU.L D1,D0 (opword + ext word)
     assert(classify(0x4C7C) == cp(true,4))   // DIVU.L #imm,D0 (opword + ext + 2 imm words)
-    assert(classify(0x4C01) == cp(false,0))  // MUL.L (separate slice)
+    assert(classify(0x4C01) == cp(true,2))   // MULU.L D1,D0 (opword + ext word; RTL frames it)
+    assert(classify(0x4C3C) == cp(true,4))   // MULU.L #imm,D0 (opword + ext + 2 imm words)
   }
   test("ADDA/SUBA (class 9/D opmode 3/7) stay simple len1") {
     assert(classify(0xD1C9) == cp(true,1))   // ADDA.L A1,A0

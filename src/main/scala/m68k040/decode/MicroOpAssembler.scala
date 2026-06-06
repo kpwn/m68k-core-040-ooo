@@ -237,6 +237,11 @@ object MicroOpAssembler {
     // crackable MOVE store (mem-to-mem MOVE and RMW-to-mem stay unimplemented).
     // `bad` also disables cracking.
     val dstOk = dstEaOk || crackStore
+    // EOR (line B, register dest): the EA (op[5:0]) is the DESTINATION, read AND
+    // written. This slice supports a DATA-REGISTER destination only; a memory EA is
+    // the deferred RMW (load-op-store) form -> illegal. `eorMemBad` forces the illegal
+    // path (it must NOT crack a leading load, which the generic srcEaOk would do).
+    val eorMemBad = (spec.op === DecOp.EOR) && (srcEa.klass =/= EaClass.DATAREG)
     // ── RTE (0x4E73) — a serializing return-from-exception µop (privileged). ────
     // Decoded here (line 0x4 is otherwise unimplemented) so it is NOT treated as an
     // illegal instruction. It commits like a no-op op µop but carries isRte; the
@@ -276,7 +281,7 @@ object MicroOpAssembler {
     val isRtrBad = (op === B"16'h4E77")
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad &&
-              (!pkt.simple || spec.illegal || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
+              (!pkt.simple || spec.illegal || eorMemBad || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     // A JMP/JSR with a non-control EA is illegal (vector 4).
     val jmpBad = isJmpOp && !ctrlEaOk
     val jsrBad = isJsrOp && !ctrlEaOk
