@@ -92,6 +92,50 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val tlbHit   = tlb.io.hit
     val tlbEntry = tlb.io.hitEntry
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // FMax: REGISTER the TLB hit-path result (decouple the deep `hitVec` cone).
+    //
+    // The combinational hit lookup is `lookupVpn -> banked way-mux tag-compare
+    // (hitVec, CARRY8) -> tlb.io.hit / hitEntry -> permFault/ppn -> rsp.ready/.fault`.
+    // That arc was the SHARED root of the route-dominated full-core limiters: it fans
+    // (a) into the LS-EU FSM s1Valid next-state, (b) into the D-cache load-accept +
+    // dataMem read/store-write, and (c) into the D-cache s1Fault — every consumer
+    // starts a fresh long cone off the LIVE lookup.
+    //
+    // Capture the hit's {vpn, ppn, writeProt, supervisor, cacheMode} into a 1-entry
+    // result register (`hr*`). The hit-class response is served from this REGISTER
+    // when it holds the live req.vpn (`hrMatch`), so the deep hitVec cone now ENDS at
+    // a flop instead of fanning combinationally into all consumers. permFault is
+    // recomputed against the LIVE req.write/supervisor (a 2-LUT cone, not the deep
+    // hitVec) so the access-class semantics are unchanged.
+    //
+    // Cost: the FIRST cycle a new vpn is presented, hrMatch is False (the register
+    // doesn't yet hold this vpn) so rsp.ready is low for that one cycle — the consumer
+    // stalls exactly as it already does on a DTLB miss (single-outstanding back-
+    // pressure holds req.vpn stable), then hrMatch asserts next cycle. Lock-step is
+    // latency-agnostic, so the +1 translate cycle on a TLB hit is free. The register
+    // is updated EVERY cycle a hit is observed, so it tracks the held vpn within one
+    // cycle and self-heals after a fill (a just-filled entry hits next cycle -> hr
+    // captures it). The `latchMatch` fast-path (walk-completion / fault) is unchanged
+    // and still serves combinationally so a walk result is delivered without an extra
+    // cycle (it already cost the multi-cycle walk).
+    val hrValid = RegInit(False)
+    val hrVpn   = Reg(UInt(20 bits))
+    val hrPpn   = Reg(UInt(20 bits))
+    val hrWp    = Reg(Bool())
+    val hrSup   = Reg(Bool())
+    val hrCmode = Reg(CacheMode())
+    hrValid := False
+    when(mmuEnable && _req.valid && tlbHit) {
+      hrValid := True
+      hrVpn   := _req.vpn
+      hrPpn   := tlbEntry.ppn
+      hrWp    := tlbEntry.writeProt
+      hrSup   := tlbEntry.supervisor
+      hrCmode := tlbEntry.cacheMode
+    }
+    val hrMatch = hrValid && (hrVpn === _req.vpn)
+
     // ---- result latch (serves the cycle(s) around a walk completion + faults) ----
     val latchValid  = RegInit(False)
     val latchVpn    = Reg(UInt(20 bits))
@@ -233,11 +277,14 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       _rsp.ppn       := _req.vpn
       _rsp.cacheMode := CacheMode.CACHEABLE
       _rsp.fault     := False
-    } elsewhen(tlbHit) {
+    } elsewhen(hrMatch) {
+      // hit served from the REGISTERED result (the deep hitVec cone ended at hr*).
+      // permFault is recomputed against the live req.write/supervisor (short cone);
+      // the held entry perms (hrWp/hrSup) and ppn/cacheMode come from flops.
       _rsp.ready     := True
-      _rsp.ppn       := tlbEntry.ppn
-      _rsp.cacheMode := tlbEntry.cacheMode
-      _rsp.fault     := permFault(tlbEntry.writeProt, tlbEntry.supervisor)
+      _rsp.ppn       := hrPpn
+      _rsp.cacheMode := hrCmode
+      _rsp.fault     := permFault(hrWp, hrSup)
     } elsewhen(latchMatch) {
       // walk just resolved this VPN (fault, or the 1-cycle gap before the fill).
       _rsp.ready     := True
