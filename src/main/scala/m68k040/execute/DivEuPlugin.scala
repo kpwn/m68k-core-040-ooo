@@ -166,7 +166,9 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       compNzvcWrite := writesNzvc
       compNzvcDst   := u1.pNzvcDst
       compFault     := False
-      compDivRem    := u1.divIsRem
+      // The trailing crack µop (DIVREM or MULHI) is coalesced into the preceding
+      // op's oracle step (its own commit is dropped, the PRF write still lands).
+      compDivRem    := u1.divIsRem || (u1.op === DecOp.MULHI)
     }
     def captureFault(vec: UInt, nzvc: Bits, writesNzvc: Bool): Unit = {
       compValid     := True
@@ -245,10 +247,50 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val remLatch = Reg(Bits(32 bits))
     val ovLatch  = RegInit(False)
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // MUL integration (MULU/MULS): the registered DSP-mappable MulCore. MUL is the
+    // SAME CPLX EU (folded in, not a separate plugin) — it reuses this FSM, the
+    // busy-gated single-outstanding issue, the completion/wakeup ports, and the
+    // crack-latch mechanism (MULHI mirrors DIVREM). 2 source operands only (no psrcC).
+    //   .W   : 16x16 -> Dn[31:0]. Operands = s1A[15:0] / s1B[15:0], s/z-ext to 32.
+    //   .L32 : 32x32 -> Dl[31:0] + V(overflow). Operands = s1A / s1B (full 32).  (T4)
+    //   .L64 : 32x32 -> Dh:Dl. MUL writes Dl (low), MULHI writes Dh (latched high). (T5)
+    val isMul    = u1.op === DecOp.MUL
+    val isMulHi  = u1.op === DecOp.MULHI
+    val mulSigned = u1.divSigned          // reused as the MULS marker
+    // Operand A/B for MulCore: .W extends the low 16 bits; .L uses the full 32.
+    val mulA = Bits(32 bits)
+    val mulB = Bits(32 bits)
+    when(u1.size === Size.WORD) {
+      mulA := Mux(mulSigned && s1A(15), B(0xFFFF, 16 bits), B(0, 16 bits)) ## s1A(15 downto 0)
+      mulB := Mux(mulSigned && s1B(15), B(0xFFFF, 16 bits), B(0, 16 bits)) ## s1B(15 downto 0)
+    } otherwise {
+      mulA := s1A
+      mulB := s1B
+    }
+
+    val mulCore = new MulCore
+    mulCore.io.start  := False
+    mulCore.io.a      := mulA
+    mulCore.io.b      := mulB
+    mulCore.io.signed := mulSigned
+
+    // The full 64-bit product is split lo/hi by MulCore. For .W/.L32 the dest is the
+    // low 32; .L64 writes lo -> Dl + (latched) hi -> Dh. The high product is LATCHED
+    // at done for the trailing MULHI crack (no re-multiply), mirroring remLatch.
+    val mulLo = mulCore.io.prodLo
+    val mulHi = mulCore.io.prodHi
+    val mulHiLatch = Reg(Bits(32 bits))
+    // N/Z for the .W/.L32 forms come from the low 32-bit product (V handled in T4).
+    val mulLoN = mulLo(31)
+    val mulLoZ = mulLo === 0
+    val mulNzvcW = (mulLoN ## mulLoZ ## False ## False).asBits   // .W: N Z V(0) C(0)
+
     // ---- FSM ----
     val fsm = new StateMachine {
       val IDLE  = new State with EntryPoint
       val DIVING = new State    // DivUnit iterating
+      val MULING = new State    // MulCore registering the product
 
       IDLE.whenIsActive {
         busy := False
@@ -276,6 +318,17 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
               s1Valid := False        // consumed into DIVING (its operands are latched)
               goto(DIVING)
             }
+          } elsewhen(isMulHi) {
+            // Trailing high-product move (.L64): write the latched high product to Dh.
+            // MUL can't overflow into a no-write (.L64 V=0), so always write. No flags.
+            captureComplete(mulHiLatch, B(0, 4 bits), False, True)
+            s1Valid := False
+          } elsewhen(isMul) {
+            // launch the registered DSP multiply (1-cycle); hold busy until done.
+            mulCore.io.start := True
+            busy := True
+            s1Valid := False          // consumed into MULING (operands latched in MulCore)
+            goto(MULING)
           } otherwise {
             // defensive complete (unexpected CPLX µop) so the pipe can't hang.
             captureComplete(B(0, 32 bits), B(0, 4 bits), False, False)
@@ -298,6 +351,19 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
           } otherwise {
             captureComplete(divResult, divNzvcNormal, u1.writesNzvc, True)
           }
+          busy    := False
+          s1Valid := False
+          goto(IDLE)
+        }
+      }
+
+      MULING.whenIsActive {
+        busy := True
+        when(mulCore.io.done) {
+          // Latch the high product for a trailing MULHI (.L64). The .W form writes the
+          // low 32-bit product with N/Z from it (V=0, C=0). (.L32 V + .L64 N/Z = T4/T5.)
+          mulHiLatch := mulHi
+          captureComplete(mulLo, mulNzvcW, u1.writesNzvc, True)
           busy    := False
           s1Valid := False
           goto(IDLE)

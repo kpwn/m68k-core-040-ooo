@@ -1408,6 +1408,25 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "handler: moveq #1,%d4 ; rte", nInstr = 8)    // moveq #1 -> N=0,Z=0 matches entry
   }
 
+  // ── MULU.W / MULS.W lock-step (16x16 -> Dn[31:0], N/Z; V=0, C=0) ─────────────
+  // Register-source forms are 2-byte opwords (nextPc = pc+2), straight-line. The
+  // full 32-bit product lands in Dn; N=bit31, Z=(product==0), V=0.
+  test("lock-step: MULU.W normal + MULS.W normal/sign", VerilatorTest) {
+    runLockStep("mul-w-normal",
+      "moveq #100,%d0 ; moveq #7,%d1 ; mulu.w %d1,%d0 ; " +    // 100*7 = 700 in d0
+      "moveq #-100,%d2 ; moveq #7,%d3 ; muls.w %d3,%d2 ; " +   // -100*7 = -700 (signed)
+      "move.l #0x8000,%d4 ; move.l #0x8000,%d5 ; muls.w %d5,%d4 ; " + // -32768*-32768 = +2^30
+      "moveq #1,%d6 ; loop: bra loop", nInstr = 9)
+  }
+
+  // MULU.W large product (N=1: bit31 set) + a zero product (Z=1).
+  test("lock-step: MULU.W large product (N=1) + zero (Z=1)", VerilatorTest) {
+    runLockStep("mul-w-flags",
+      "move.l #0xffff,%d0 ; move.l #0xffff,%d1 ; mulu.w %d1,%d0 ; " + // 65535*65535 = 0xFFFE0001 (N=1)
+      "moveq #0,%d2 ; moveq #123,%d3 ; mulu.w %d3,%d2 ; " +           // 0*123 = 0 (Z=1)
+      "moveq #5,%d4 ; loop: bra loop", nInstr = 6)
+  }
+
   // ── MMU page-fault delivery lock-step (format-$7 -> handler -> RTE) ──────────
   // THE Task-4 gate: a data store to a NON-RESIDENT page raises a 68040 access
   // fault (vector 2, format-$7), vectors to a handler that writes a resident page

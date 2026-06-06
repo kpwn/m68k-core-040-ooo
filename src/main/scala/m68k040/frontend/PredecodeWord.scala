@@ -183,15 +183,17 @@ object PredecodeWord {
         val srcMode = op(5 downto 3).asUInt
         val srcReg  = op(2 downto 0).asUInt
         // classes 8(OR-group)/C(AND-group) opmode 3/7 = DIVU/DIVS/MULU/MULS.
-        //   BOTH DIVs are line 8: DIVU.W = opmode 3, DIVS.W = opmode 7. They ARE
-        //   handled now (1 opword + the 16-bit-divisor EA extension). BOTH MULs are
-        //   line C (opmode 3/7) -> stay complex (separate slice).
+        //   BOTH DIVs are line 8: DIVU.W = opmode 3, DIVS.W = opmode 7.
+        //   BOTH MULs are line C: MULU.W = opmode 3, MULS.W = opmode 7.
+        //   All four are 1 opword + the 16-bit EA extension (the multiplier/divisor).
         val isDivuW = (cls === U(8, 4 bits)) && (opmode === U(3, 3 bits))
         val isDivsW = (cls === U(8, 4 bits)) && (opmode === U(7, 3 bits))
+        val isMuluW = (cls === U(0xC, 4 bits)) && (opmode === U(3, 3 bits))
+        val isMulsW = (cls === U(0xC, 4 bits)) && (opmode === U(7, 3 bits))
         val isMulDiv = (cls === U(8, 4 bits) || cls === U(0xC, 4 bits)) &&
                        (opmode === U(3, 3 bits) || opmode === U(7, 3 bits))
-        when(isDivuW || isDivsW) {
-          // 16-bit divisor EA (sizeL = false: word operand size for #imm extension).
+        when(isDivuW || isDivsW || isMuluW || isMulsW) {
+          // 16-bit multiplier/divisor EA (sizeL = false: word operand size for #imm).
           val (ok, e) = eaExt(srcMode, srcReg, sizeL = False, allowImm = true)
           when(ok) {
             r.simple   := True
