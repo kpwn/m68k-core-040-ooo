@@ -290,8 +290,11 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val mulSext = Mux(mulLoN, B(0xFFFFFFFFL, 32 bits), B(0, 32 bits))
     val mulOverflow = Mux(mulSigned, mulHi =/= mulSext, mulHi =/= B(0, 32 bits))
     val mulV = (u1.size =/= Size.WORD) && !u1.div64 && mulOverflow   // .L32 only
-    // .W/.L32 writeback flags: N Z V C(0). (.L64 N/Z from the full 64-bit -> T5.)
-    val mulNzvcW = (mulLoN ## mulLoZ ## mulV ## False).asBits
+    // .L64: N/Z come from the FULL 64-bit product (N=hi[31], Z=(hi|lo==0)); V=0.
+    // .W/.L32: N/Z from the low 32-bit product; V=overflow (.L32 only).
+    val mulN = Mux(u1.div64, mulHi(31), mulLoN)
+    val mulZ = Mux(u1.div64, (mulHi | mulLo) === 0, mulLoZ)
+    val mulNzvcW = (mulN ## mulZ ## mulV ## False).asBits   // N Z V C(0)
 
     // ---- FSM ----
     val fsm = new StateMachine {

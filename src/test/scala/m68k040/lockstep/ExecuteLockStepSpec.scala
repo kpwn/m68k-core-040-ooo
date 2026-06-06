@@ -1446,6 +1446,23 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #5,%d4 ; loop: bra loop", nInstr = 7)
   }
 
+  // ── MULU.L/MULS.L 32x32 -> 64 lock-step (Dh:Dl 2-dest crack) ─────────────────
+  // 0x4C00|ea form, ext bit10=1: Dh:Dl = ea * Dl (full 64-bit product). Cracked
+  // [MUL -> Dl] + [MULHI -> Dh from the EU's latched high product]. V=0; N=Dh[31],
+  // Z=(Dh|Dl==0). The trailing moves read Dh so the MULHI PRF write is verified.
+  test("lock-step: MULU.L 32x32->64 (Dh:Dl) normal", VerilatorTest) {
+    runLockStep("mul-l64-u",
+      "move.l #0x100000,%d0 ; move.l #0x100000,%d1 ; mulu.l %d1,%d2:%d0 ; " + // 2^20*2^20=2^40
+      "move.l %d2,%d6 ; loop: bra loop", nInstr = 5)
+  }
+
+  // MULS.L 64-bit signed (negative product spans Dh:Dl).
+  test("lock-step: MULS.L 32x32->64 (Dh:Dl) signed negative", VerilatorTest) {
+    runLockStep("mul-l64-s",
+      "move.l #-100000,%d0 ; move.l #100000,%d1 ; muls.l %d1,%d2:%d0 ; " + // -(10^10) signed
+      "move.l %d2,%d6 ; loop: bra loop", nInstr = 5)
+  }
+
   // ── MMU page-fault delivery lock-step (format-$7 -> handler -> RTE) ──────────
   // THE Task-4 gate: a data store to a NON-RESIDENT page raises a 68040 access
   // fault (vector 2, format-$7), vectors to a handler that writes a resident page
