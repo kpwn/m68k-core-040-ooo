@@ -44,6 +44,7 @@ class IbranchSourcePlugin extends FiberPlugin {
     uop.useImm       := True
     uop.imm          := iImm
     uop.unimplemented:= False
+    uop.anInc := 0; uop.stkPush := False; uop.ccrRestore := False
     uop.dstArch      := 0
     uop.psrcA        := iPsrcA; uop.psrcAValid := iPsrcAValid
     uop.psrcB        := 0; uop.psrcBValid := False

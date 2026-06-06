@@ -46,6 +46,7 @@ class BranchEuSourcePlugin extends FiberPlugin {
     uop.useImm       := False
     uop.imm          := 0
     uop.unimplemented:= False
+    uop.anInc := 0; uop.stkPush := False; uop.ccrRestore := False
     uop.dstArch      := 0
     uop.psrcA        := 0; uop.psrcAValid := False
     uop.psrcB        := 0; uop.psrcBValid := False

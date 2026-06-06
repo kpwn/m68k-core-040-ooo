@@ -281,7 +281,16 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // producer whose result becomes available next cycle; dependents carry a
     // trigger bit at index j which we clear (combinationally into the trigger
     // reg's next value) so they become ready next cycle (back-to-back, lat 1).
-    val events = oh0.andMask(selPorts(0).fire) | oh1.andMask(selPorts(1).fire)
+    //
+    // The BRANCH port (port 2) is ALSO a static-latency-1 producer NOW: an RTS/RTR
+    // ibranch writes A7 (the postincremented SP) via the branch EU's int write port
+    // (same pipeline depth as the ALU EUs). A consumer of that A7 (e.g. `rts` followed
+    // by an A7-relative access) carries a static trigger on the branch slot; without
+    // including ohB here that trigger would never clear (the branch fires on port 2,
+    // not 0/1) and the consumer would hang. A plain branch (no int pdst) generates a
+    // harmless no-consumer event. The branch EU's An bypass covers the same-cycle read.
+    val events = oh0.andMask(selPorts(0).fire) | oh1.andMask(selPorts(1).fire) |
+                 ohB.andMask(selPorts(2).fire)
 
     // ---- Depend-on-READ trigger init for the two newly-pushed slots ----
     // Slot0 lands at priority `slot0Prio` (lines.last.ways(0)), slot1 at
@@ -502,6 +511,13 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
         when(ctx.uop.writesNzvc) { sbNzvc.busy(ctx.uop.pNzvcDst) := False }
         when(ctx.uop.writesX)    { sbX.busy(ctx.uop.pXDst)       := False }
       }
+    }
+    // The BRANCH port (port 2) also clears its int pdst busy: an RTS/RTR ibranch is a
+    // latency-1 int producer (A7) in sbInt, so a later push must not record a static
+    // trigger on its already-issued (result-available) slot. (A branch writes no flags.)
+    {
+      val bctx = selPorts(2).payload
+      when(selPorts(2).fire && bctx.uop.pdstValid) { sbInt.busy(bctx.uop.pdst) := False }
     }
 
     // ---- Dynamic LS wakeup: clear lsBusy for the completed load's pdst ----

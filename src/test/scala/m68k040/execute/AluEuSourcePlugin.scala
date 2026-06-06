@@ -46,6 +46,7 @@ class AluEuSourcePlugin extends FiberPlugin {
     uop.cond         := B(0)
     uop.branchDisp   := B(0)
     uop.unimplemented:= False
+    uop.ibranch := False; uop.anInc := 0; uop.stkPush := False; uop.ccrRestore := False
     uop.dstArch      := U(0)
     uop.pdstOld      := U(0)
     uop.pNzvcSrc     := U(0); uop.readsNzvc := False
