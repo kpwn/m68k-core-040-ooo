@@ -98,6 +98,14 @@ case class DecodedUop() extends Bundle {
   // low byte), never the system byte. The LS EU writes the renamed NZVC + X PRFs.
   // Default False. (writesNzvc/writesX on this µop select the flag dests.)
   val ccrRestore   = Bool()
+  // ── ANDI/ORI/EORI #imm,CCR (the non-privileged to-CCR forms) ────────────────
+  // An ALU-cluster µop that READS the current CCR {X,N,Z,V,C} and WRITES it back:
+  // ccr5' = ccr5 <op> imm[4:0], op = AND/OR/EOR (in `op`), imm[4:0] in `imm`. It
+  // reads NZVC (pNzvcSrc) + X (pXSrc) and writes NZVC (pNzvcDst) + X (pXDst); no int
+  // dst. The ALU EU assembles ccr5, applies the logical op, and splits the result
+  // back into NZVC/X. Default False (every other op leaves it clear). CCR only — the
+  // privileged system-byte (to SR) forms are deferred.
+  val toCcr        = Bool()
   // Macro-instruction boundary marker: True for the FIRST µop of an instruction.
   // The cracker emits 1 or 2 µops/instruction; the only 2-µop case is a memSimple
   // source crack -> [load, op] where the LOAD is first. An interrupt may be taken

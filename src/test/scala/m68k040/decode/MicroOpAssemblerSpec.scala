@@ -103,6 +103,35 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
       assert(dut.uop.unimplemented.toBoolean && dut.uop.memOp.toEnum == MemOp.NONE)
     }
   }
+  // ANDI #imm,CCR (0x023C) + imm.B = words(1). toCcr µop: reads+writes NZVC+X, no int
+  // operands/dst, op = AND, useImm = the imm byte. NOT unimplemented (CCR is non-priv).
+  test("ANDI #0x1f,CCR (0x023C): toCcr, AND, reads+writes NZVC+X, no int dst", VerilatorTest) {
+    run { dut => drive(dut, 0x023C, 0x001F, len = 2); sleep(1)
+      assert(dut.uop.op.toEnum == DecOp.AND && !dut.uop.unimplemented.toBoolean)
+      assert(dut.uop.toCcr.toBoolean)
+      assert(dut.uop.readsNzvc.toBoolean && dut.uop.readsX.toBoolean)
+      assert(dut.uop.writesNzvc.toBoolean && dut.uop.writesX.toBoolean)
+      assert(!dut.uop.srcAValid.toBoolean && !dut.uop.srcBValid.toBoolean && !dut.uop.dstValid.toBoolean)
+      assert(dut.uop.useImm.toBoolean && (dut.uop.imm.toLong & 0x1f) == 0x1f)
+    }
+  }
+  test("ORI #imm,CCR (0x003C): toCcr, OR", VerilatorTest) {
+    run { dut => drive(dut, 0x003C, 0x0003, len = 2); sleep(1)
+      assert(dut.uop.op.toEnum == DecOp.OR && dut.uop.toCcr.toBoolean && !dut.uop.unimplemented.toBoolean)
+    }
+  }
+  test("EORI #imm,CCR (0x0A3C): toCcr, EOR", VerilatorTest) {
+    run { dut => drive(dut, 0x0A3C, 0x0010, len = 2); sleep(1)
+      assert(dut.uop.op.toEnum == DecOp.EOR && dut.uop.toCcr.toBoolean && !dut.uop.unimplemented.toBoolean)
+    }
+  }
+  // ANDI #imm,SR (0x027C, word) is privileged -> deferred (illegal). CMPI #imm,CCR is
+  // not a valid form -> illegal. Neither is a toCcr op.
+  test("ANDI #imm,SR (word, 0x027C) -> unimplemented (privileged, deferred)", VerilatorTest) {
+    run { dut => drive(dut, 0x027C, 0x0000, len = 2); sleep(1)
+      assert(dut.uop.unimplemented.toBoolean && !dut.uop.toCcr.toBoolean)
+    }
+  }
   test("non-simple packet -> unimplemented", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       drive(dut, 0x7605); dut.pkt.simple #= false; dut.pkt.complex #= true; sleep(1)

@@ -89,7 +89,7 @@ object MicroOpAssembler {
     opUop.useImm        := False; opUop.imm    := 0
     opUop.readsNzvc     := spec.readsNzvc; opUop.readsX := spec.readsX
     opUop.writesNzvc    := spec.writesNzvc; opUop.writesX := spec.writesX
-    opUop.isBranch      := spec.isBranch; opUop.ibranch := False; opUop.stkPush := False; opUop.anInc := 0; opUop.ccrRestore := False; opUop.cond := spec.cond
+    opUop.isBranch      := spec.isBranch; opUop.ibranch := False; opUop.stkPush := False; opUop.anInc := 0; opUop.ccrRestore := False; opUop.toCcr := False; opUop.cond := spec.cond
     opUop.branchDisp    := 0
     opUop.unimplemented := False
     opUop.faulted       := False
@@ -199,7 +199,7 @@ object MicroOpAssembler {
     ldUop.imm           := Mux(srcEa.pcRel, pcRelAddr, srcEa.disp)
     ldUop.readsNzvc     := False; ldUop.readsX := False
     ldUop.writesNzvc    := False; ldUop.writesX := False
-    ldUop.isBranch      := False; ldUop.ibranch := False; ldUop.stkPush := False; ldUop.anInc := 0; ldUop.ccrRestore := False; ldUop.cond := 0
+    ldUop.isBranch      := False; ldUop.ibranch := False; ldUop.stkPush := False; ldUop.anInc := 0; ldUop.ccrRestore := False; ldUop.toCcr := False; ldUop.cond := 0
     ldUop.branchDisp    := 0
     ldUop.unimplemented := False
     ldUop.faulted       := False; ldUop.faultVector := 0; ldUop.isRte := False
@@ -232,7 +232,7 @@ object MicroOpAssembler {
     stUop.imm           := Mux(dstEa.pcRel, stPcRelAddr, dstEa.disp)
     stUop.readsNzvc     := False; stUop.readsX := False
     stUop.writesNzvc    := True;  stUop.writesX := False   // MOVE to memory sets NZVC
-    stUop.isBranch      := False; stUop.ibranch := False; stUop.stkPush := False; stUop.anInc := 0; stUop.ccrRestore := False; stUop.cond := 0
+    stUop.isBranch      := False; stUop.ibranch := False; stUop.stkPush := False; stUop.anInc := 0; stUop.ccrRestore := False; stUop.toCcr := False; stUop.cond := 0
     stUop.branchDisp    := 0
     stUop.unimplemented := False
     stUop.faulted       := False; stUop.faultVector := 0; stUop.isRte := False
@@ -251,13 +251,25 @@ object MicroOpAssembler {
     // written. This slice supports a DATA-REGISTER destination only; a memory EA is
     // the deferred RMW (load-op-store) form -> illegal. `eorMemBad` forces the illegal
     // path (it must NOT crack a leading load, which the generic srcEaOk would do).
-    val eorMemBad = (spec.op === DecOp.EOR) && (srcEa.klass =/= EaClass.DATAREG)
+    // ── ANDI/ORI/EORI #imm,CCR (the non-privileged to-CCR forms) ────────────────
+    // Encoding 0000 ooo0 00 111100 + imm.B: line0, opmode ooo in {0=ORI,1=ANDI,5=EORI}
+    // (bit8=0), size byte (ss=00), EA = mode7/reg4 (op[5:0]==0x3C). The op µop READS
+    // the current CCR {X,N,Z,V,C} and WRITES it back: ccr5' = ccr5 op imm[4:0]. The
+    // ALU EU does the read-modify-write. CCR ONLY — the privileged to-SR (word, ss=01)
+    // forms are deferred (they stay illegal: ss=01 -> spec.op illegal at OperationDecoder).
+    val isLineImm  = spec.srcB.kind === OperandKind.IMMEXT
+    val isToCcr    = isLineImm && (op(5 downto 0) === B"6'b111100") && (spec.size === Size.BYTE) &&
+                     (spec.op === DecOp.AND || spec.op === DecOp.OR || spec.op === DecOp.EOR)
+    // EOR (line B, register dest): the EA (op[5:0]) is the DESTINATION, read AND
+    // written. This slice supports a DATA-REGISTER destination only; a memory EA is
+    // the deferred RMW (load-op-store) form -> illegal. `eorMemBad` forces the illegal
+    // path (it must NOT crack a leading load, which the generic srcEaOk would do). The
+    // EORI #imm,CCR form (also spec.op==EOR, klass==IMM) is NOT gated here (-> !isToCcr).
+    val eorMemBad = (spec.op === DecOp.EOR) && (srcEa.klass =/= EaClass.DATAREG) && !isToCcr
     // Line-0 immediate (srcB = IMMEXT): the EA (op[5:0]) is the DESTINATION. This slice
     // supports a DATA-REGISTER destination only; a memory / An-direct / #imm EA is the
-    // deferred RMW (or illegal) form -> illegal. (The non-privileged to-CCR forms are a
-    // SEPARATE encoding handled below; they are NOT gated here.)
-    val isLineImm  = spec.srcB.kind === OperandKind.IMMEXT
-    val lineImmBad = isLineImm && (srcEa.klass =/= EaClass.DATAREG)
+    // deferred RMW (or illegal) form -> illegal. The to-CCR form is the one exception.
+    val lineImmBad = isLineImm && (srcEa.klass =/= EaClass.DATAREG) && !isToCcr
     // ── RTE (0x4E73) — a serializing return-from-exception µop (privileged). ────
     // Decoded here (line 0x4 is otherwise unimplemented) so it is NOT treated as an
     // illegal instruction. It commits like a no-op op µop but carries isRte; the
@@ -323,6 +335,21 @@ object MicroOpAssembler {
       // faulting head; the exception FSM stacks the frame + vectors.
       opUop.faulted     := True
       opUop.faultVector := 4
+    }
+    // ── ANDI/ORI/EORI #imm,CCR: a CCR read-modify-write op µop (ALU cluster) ─────
+    // The base opUop already carries op = AND/OR/EOR + useImm/imm = the imm byte (via
+    // the IMMEXT srcB). Override the operand/flag masks: NO int operands / dst; READS
+    // NZVC + X (the current CCR) and WRITES NZVC + X (the result); toCcr tells the ALU
+    // EU to assemble {X,N,Z,V,C}, apply the logical op against imm[4:0], and split the
+    // result back into NZVC/X. (Last-wins after `bad`; isToCcr is never in `bad`.)
+    when(isToCcr) {
+      opUop.cluster   := Cluster.INT
+      opUop.toCcr     := True
+      opUop.srcAValid := False; opUop.srcBValid := False
+      opUop.dstValid  := False
+      opUop.readsNzvc := True;  opUop.readsX  := True
+      opUop.writesNzvc := True; opUop.writesX := True
+      opUop.unimplemented := False
     }
     when(isTrapOp) {
       // Unconditional faulted µop: vector 32+n, delivered at retire (format-$0).
@@ -436,7 +463,7 @@ object MicroOpAssembler {
     divlUop.dstReg        := divlDq; divlUop.dstValid := True              // quotient -> Dq
     divlUop.readsNzvc     := False; divlUop.readsX := False
     divlUop.writesNzvc    := True;  divlUop.writesX := False               // DIV sets N/Z/V
-    divlUop.isBranch      := False; divlUop.ibranch := False; divlUop.stkPush := False; divlUop.anInc := 0; divlUop.ccrRestore := False; divlUop.cond := 0; divlUop.branchDisp := 0
+    divlUop.isBranch      := False; divlUop.ibranch := False; divlUop.stkPush := False; divlUop.anInc := 0; divlUop.ccrRestore := False; divlUop.toCcr := False; divlUop.cond := 0; divlUop.branchDisp := 0
     divlUop.unimplemented := False
     divlUop.faulted       := False; divlUop.faultVector := 0; divlUop.isRte := False
     divlUop.faultUsesNextPc := True            // DIV0 stacks nextPc (group-2 format-$2)
@@ -466,7 +493,7 @@ object MicroOpAssembler {
     divremUop.dstReg        := divlDr; divremUop.dstValid := True          // remainder -> Dr
     divremUop.readsNzvc     := False; divremUop.readsX := False
     divremUop.writesNzvc    := False; divremUop.writesX := False
-    divremUop.isBranch      := False; divremUop.ibranch := False; divremUop.stkPush := False; divremUop.anInc := 0; divremUop.ccrRestore := False; divremUop.cond := 0; divremUop.branchDisp := 0
+    divremUop.isBranch      := False; divremUop.ibranch := False; divremUop.stkPush := False; divremUop.anInc := 0; divremUop.ccrRestore := False; divremUop.toCcr := False; divremUop.cond := 0; divremUop.branchDisp := 0
     divremUop.unimplemented := False
     divremUop.faulted       := False; divremUop.faultVector := 0; divremUop.isRte := False
     divremUop.faultUsesNextPc := False
@@ -536,7 +563,7 @@ object MicroOpAssembler {
     mullUop.dstReg        := mullDl; mullUop.dstValid := True               // low product -> Dl
     mullUop.readsNzvc     := False; mullUop.readsX := False
     mullUop.writesNzvc    := True;  mullUop.writesX := False                // MUL sets N/Z (+V .L32)
-    mullUop.isBranch      := False; mullUop.ibranch := False; mullUop.stkPush := False; mullUop.anInc := 0; mullUop.ccrRestore := False; mullUop.cond := 0; mullUop.branchDisp := 0
+    mullUop.isBranch      := False; mullUop.ibranch := False; mullUop.stkPush := False; mullUop.anInc := 0; mullUop.ccrRestore := False; mullUop.toCcr := False; mullUop.cond := 0; mullUop.branchDisp := 0
     mullUop.unimplemented := False
     mullUop.faulted       := False; mullUop.faultVector := 0; mullUop.isRte := False
     mullUop.faultUsesNextPc := False
@@ -563,7 +590,7 @@ object MicroOpAssembler {
     mulhiUop.dstReg        := mullDh; mulhiUop.dstValid := True             // high product -> Dh
     mulhiUop.readsNzvc     := False; mulhiUop.readsX := False
     mulhiUop.writesNzvc    := False; mulhiUop.writesX := False
-    mulhiUop.isBranch      := False; mulhiUop.ibranch := False; mulhiUop.stkPush := False; mulhiUop.anInc := 0; mulhiUop.ccrRestore := False; mulhiUop.cond := 0; mulhiUop.branchDisp := 0
+    mulhiUop.isBranch      := False; mulhiUop.ibranch := False; mulhiUop.stkPush := False; mulhiUop.anInc := 0; mulhiUop.ccrRestore := False; mulhiUop.toCcr := False; mulhiUop.cond := 0; mulhiUop.branchDisp := 0
     mulhiUop.unimplemented := False
     mulhiUop.faulted       := False; mulhiUop.faultVector := 0; mulhiUop.isRte := False
     mulhiUop.faultUsesNextPc := False
@@ -606,7 +633,7 @@ object MicroOpAssembler {
     ibrUop.readsNzvc     := False; ibrUop.readsX := False
     ibrUop.writesNzvc    := False; ibrUop.writesX := False
     ibrUop.isBranch      := True;  ibrUop.ibranch := True
-    ibrUop.stkPush       := False; ibrUop.anInc := 0; ibrUop.ccrRestore := False    // JMP: no An postinc (JSR/RTS override)
+    ibrUop.stkPush       := False; ibrUop.anInc := 0; ibrUop.ccrRestore := False; ibrUop.toCcr := False    // JMP: no An postinc (JSR/RTS override)
     ibrUop.cond          := 0;     ibrUop.branchDisp := 0
     ibrUop.unimplemented := False
     ibrUop.faulted       := False; ibrUop.faultVector := 0; ibrUop.isRte := False
@@ -652,7 +679,7 @@ object MicroOpAssembler {
       u.useImm := useImm; u.imm := imm
       u.readsNzvc := False; u.readsX := False; u.writesNzvc := writesNzvc; u.writesX := writesX
       u.isBranch := isBranch; u.ibranch := ibranch; u.stkPush := stkPush; u.anInc := anInc
-      u.ccrRestore := ccrRestore
+      u.ccrRestore := ccrRestore; u.toCcr := False
       u.cond := cond; u.branchDisp := branchDisp
       u.unimplemented := False
       u.faulted := False; u.faultVector := 0; u.faultUsesNextPc := False

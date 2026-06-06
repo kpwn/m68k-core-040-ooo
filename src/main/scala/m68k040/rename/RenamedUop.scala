@@ -29,6 +29,9 @@ case class RenamedUop() extends Bundle {
   val stkPush      = Bool()
   // RTR CCR-restore load: NZVC := loaded[3:0], X := loaded[4] (no int dst). Threaded.
   val ccrRestore   = Bool()
+  // ANDI/ORI/EORI #imm,CCR: ALU-cluster CCR read-modify-write (ccr5' = ccr5 op
+  // imm[4:0]); reads+writes NZVC+X, no int dst. Threaded from decode.
+  val toCcr        = Bool()
   val unimplemented= Bool()
   // Precise-fault capture (exception slice 1): `faulted` + `faultVector` (4=illegal,
   // 8=privilege) threaded from decode; `isRte` marks a return-from-exception µop.
