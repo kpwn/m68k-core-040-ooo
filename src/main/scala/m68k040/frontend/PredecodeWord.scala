@@ -251,6 +251,10 @@ object PredecodeWord {
         val isCmp   = (opmode === U(0, 3 bits)) || (opmode === U(1, 3 bits)) ||
                       (opmode === U(2, 3 bits)) || (opmode === U(3, 3 bits)) ||
                       (opmode === U(7, 3 bits))
+        // EOR (opmode 4/5/6): EA is the DESTINATION (read+written). Register (data-reg,
+        // mode0) dest -> simple len1; An-direct (CMPM) and memory-dest (RMW) -> COMPLEX.
+        val isEor   = (opmode === U(4, 3 bits)) || (opmode === U(5, 3 bits)) ||
+                      (opmode === U(6, 3 bits))
         when(isCmp) {
           val sizeL = (opmode === U(2, 3 bits)) || (opmode === U(7, 3 bits))
           val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = false)
@@ -258,6 +262,9 @@ object PredecodeWord {
             r.simple   := True
             r.lenWords := (U(1, 3 bits) + e).resized
           }
+        } elsewhen(isEor && (srcMode === U(0, 3 bits))) {
+          r.simple   := True
+          r.lenWords := U(1, 3 bits)                  // EOR Dn,Dm (register dest)
         }
       }
 

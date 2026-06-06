@@ -151,14 +151,20 @@ object PredecodeRef {
         }
       case 0xB =>
         val opmode  = (op >> 6) & 7
+        val srcMode = (op >> 3) & 7; val srcReg = op & 7
+        // CMP (opmode 0/1/2 = .B/.W/.L, EA source) and CMPA (3/7). EOR (opmode 4/5/6)
+        // is a SEPARATE family: EA is the DESTINATION (read AND written). This slice
+        // frames the register (data-reg, mode0) EOR dest as simple len1; An-direct
+        // (mode1 = CMPM) and memory-dest EOR (RMW) are deferred -> COMPLEX.
+        val isEor = opmode == 4 || opmode == 5 || opmode == 6
         if (opmode == 0 || opmode == 1 || opmode == 2 || opmode == 3 || opmode == 7) {
-          val srcMode = (op >> 3) & 7; val srcReg = op & 7
           val sizeL = opmode == 2 || opmode == 7
           eaExt(srcMode, srcReg, sizeL, allowImm = false) match {
             case Some(e) => CP(simple = true, lenWords = 1 + e)
             case None    => COMPLEX
           }
-        } else COMPLEX
+        } else if (isEor && srcMode == 0) CP(simple = true, lenWords = 1)  // EOR Dn,Dm
+        else COMPLEX
       case _ => COMPLEX
     }
   }

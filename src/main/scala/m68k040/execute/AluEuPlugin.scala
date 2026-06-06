@@ -1,5 +1,7 @@
 package m68k040.execute
 
+import m68k040.decode.DecOp
+import m68k040.isa.Size
 import m68k040.execute.iq.IqContext
 import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, XRegFileService,
   RegFileReadPort, RegFileWritePort, RegFileBypassPort}
@@ -83,8 +85,21 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     cmd.xIn  := False                    // no flag-read ops yet
     val rsp = AluDatapath(cmd)
 
+    // ---- S1: size-merge of the int writeback (68k partial-register semantics) ----
+    // A .B / .W ALU op updates ONLY the low byte / word of the destination register;
+    // the upper bits are PRESERVED. For ADD/SUB/AND/OR/EOR the destination operand is
+    // srcA (src1), so the old register value is s1Src1 -> merge its upper bits with the
+    // datapath's low `size` result. (MOVE's dst is NOT src1 — MOVE keeps the full
+    // datapath result, preserving the existing MOVE.L path; MOVE.B/.W reg-dest is a
+    // separate concern outside this slice and is not regressed here.) .L = full result.
+    val isMove = u1.op === DecOp.MOVE
+    val mergedResult = Mux(isMove, rsp.result, u1.size.mux(
+      Size.BYTE -> (s1Src1(31 downto 8)  ## rsp.result(7 downto 0)),
+      Size.WORD -> (s1Src1(31 downto 16) ## rsp.result(15 downto 0)),
+      Size.LONG -> rsp.result))
+
     // ---- S1: writeback (gated by masks) ----
-    intW.valid   := s1Valid && u1.pdstValid;  intW.address   := u1.pdst;     intW.data   := rsp.result
+    intW.valid   := s1Valid && u1.pdstValid;  intW.address   := u1.pdst;     intW.data   := mergedResult
     nzvcW.valid  := s1Valid && u1.writesNzvc; nzvcW.address  := u1.pNzvcDst;  nzvcW.data  := rsp.nzvc
     xW.valid     := s1Valid && u1.writesX;    xW.address     := u1.pXDst;     xW.data     := B(rsp.xOut)
 
@@ -107,7 +122,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     wbObs.valid     := RegNext(s1Valid) init False
     wbObs.robId     := RegNext(s1Ctx.robId)
     wbObs.dstArch   := RegNext(u1.dstArch)
-    wbObs.result    := RegNext(rsp.result)
+    wbObs.result    := RegNext(mergedResult)
     wbObs.intWrite  := RegNext(u1.pdstValid)
     wbObs.nzvc      := RegNext(rsp.nzvc)
     wbObs.nzvcWrite := RegNext(u1.writesNzvc)

@@ -761,6 +761,75 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  // ── Line-0 immediates (ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,Dn) lock-step ──────
+  // Value + NZVCX step-for-step vs Musashi, with flag-affecting operands (carry,
+  // overflow, zero, negative) across .B/.W/.L.
+  test("lock-step: ADDI/SUBI .B/.W/.L flag boundaries", VerilatorTest) {
+    runLockStep("addi-subi", Seq(
+      "moveq #0,%d0", "addi.b #0x7f,%d0", "addi.b #1,%d0",       // .B overflow 0x7f+1
+      "moveq #0,%d1", "addi.b #0xff,%d1", "addi.b #1,%d1",       // .B carry/zero 0xff+1
+      "moveq #0,%d2", "addi.w #0x7fff,%d2", "addi.w #1,%d2",     // .W overflow
+      "moveq #0,%d3", "addi.l #0x7fffffff,%d3", "addi.l #1,%d3", // .L overflow
+      "moveq #1,%d4", "subi.b #2,%d4",                          // .B borrow -> negative
+      "moveq #5,%d5", "subi.w #5,%d5",                          // .W zero
+      "moveq #0,%d6", "subi.l #1,%d6"                           // .L borrow -> 0xffffffff
+    ).mkString(" ; "))
+  }
+  test("lock-step: ANDI/ORI/EORI .B/.W/.L (NZ, V=C=0)", VerilatorTest) {
+    runLockStep("andi-ori-eori", Seq(
+      "move.l #0x12345678,%d0", "andi.l #0xff00ff00,%d0",       // .L AND
+      "move.l #0x00000000,%d1", "ori.l #0x80000000,%d1",        // .L OR -> negative
+      "move.l #0xaaaaaaaa,%d2", "eori.l #0xffffffff,%d2",       // .L EOR -> 0x55555555
+      "move.l #0x000000ff,%d3", "andi.b #0x0f,%d3",             // .B AND
+      "move.l #0x00000000,%d4", "ori.w #0x8000,%d4",            // .W OR -> negative word
+      "move.l #0x0000ffff,%d5", "eori.w #0xffff,%d5",           // .W EOR -> zero word
+      "move.l #0x000000a5,%d6", "eori.b #0xa5,%d6"              // .B EOR -> zero byte
+    ).mkString(" ; "))
+  }
+  test("lock-step: CMPI .B/.W/.L (NZVC, no write)", VerilatorTest) {
+    runLockStep("cmpi", Seq(
+      "moveq #5,%d0", "cmpi.l #5,%d0",                          // equal -> Z
+      "moveq #5,%d1", "cmpi.l #6,%d1",                          // 5-6 -> negative/borrow
+      "moveq #-1,%d2", "cmpi.b #0x7f,%d2",                      // .B signed boundary
+      "move.l #0x00008000,%d3", "cmpi.w #1,%d3"                 // .W overflow boundary
+    ).mkString(" ; "))
+  }
+
+  // ── EOR Dn,Dm (register destination) lock-step ──────────────────────────────
+  test("lock-step: EOR Dn,Dm .B/.W/.L (NZ, V=C=0)", VerilatorTest) {
+    runLockStep("eor-reg", Seq(
+      "move.l #0xaaaaaaaa,%d0", "move.l #0x55555555,%d1", "eor.l %d0,%d1",  // -> 0xffffffff neg
+      "move.l #0x12345678,%d2", "move.l #0x12345678,%d3", "eor.l %d2,%d3",  // -> 0 zero
+      "move.l #0x000000f0,%d4", "move.l #0x0000000f,%d5", "eor.b %d4,%d5",  // .B -> 0xff neg byte
+      "move.l #0x0000abcd,%d6", "move.l #0x0000abcd,%d7", "eor.w %d6,%d7"   // .W -> 0 zero word
+    ).mkString(" ; "))
+  }
+
+  // ── ANDI/ORI/EORI #imm,CCR (NOT privileged — CCR only) lock-step ────────────
+  // Set up the CCR via an arithmetic op (subi -> known NZVCX), then AND/OR/EOR the
+  // immediate byte into the CCR (X=4,N=3,Z=2,V=1,C=0), verified step-for-step incl X.
+  test("lock-step: ANDI #imm,CCR clears flags", VerilatorTest) {
+    runLockStep("andi-ccr", Seq(
+      "moveq #0,%d0", "subi.b #1,%d0",        // sets N + C + X (0 - 1 = 0xff)
+      "andi #0x00,%ccr",                      // clear all CCR bits
+      "moveq #1,%d1"                          // observe cleared CCR carried forward
+    ).mkString(" ; "))
+  }
+  test("lock-step: ORI #imm,CCR sets flags", VerilatorTest) {
+    runLockStep("ori-ccr", Seq(
+      "moveq #5,%d0", "cmpi.l #5,%d0",        // Z=1, others mostly 0
+      "ori #0x1f,%ccr",                       // set X,N,Z,V,C
+      "moveq #2,%d1"
+    ).mkString(" ; "))
+  }
+  test("lock-step: EORI #imm,CCR toggles flags", VerilatorTest) {
+    runLockStep("eori-ccr", Seq(
+      "moveq #0,%d0", "subi.b #1,%d0",        // N=1,C=1,X=1 (0xff), Z=0,V=0
+      "eori #0x1f,%ccr",                      // toggle all 5 -> N=0,C=0,X=0,Z=1,V=1
+      "moveq #3,%d1"
+    ).mkString(" ; "))
+  }
+
   // ── Branch lock-step (2-byte short branches) ──────────────────────────────
   // No predictor: a TAKEN branch is a mispredict -> the ROB registers a
   // commit-time redirect pulse that squashes the speculative fall-through and

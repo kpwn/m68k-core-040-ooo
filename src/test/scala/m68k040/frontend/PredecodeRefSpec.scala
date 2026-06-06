@@ -20,7 +20,13 @@ class PredecodeRefSpec extends AnyFunSuite {
   test("ADD.L D0,(A0) RMW -> complex") { assert(classify(0xD190) == cp(false,0)) }
   test("ADDA.L A1,A0 opmode111 -> simple len1") { assert(classify(0xD1C9) == cp(true,1)) }
   test("CMP.W (d16,A0),D0 -> simple len2") { assert(classify(0xB068) == cp(true,2)) }
-  test("EOR.W D0,(A0) class B opmode101 -> complex") { assert(classify(0xB150) == cp(false,0)) }
+  test("EOR.W D0,(A0) mem-dest (opmode5) -> complex (RMW deferred)") { assert(classify(0xB150) == cp(false,0)) }
+  test("EOR Dn,Dm register dest (opmode 4/5/6, mode0) -> simple len1") {
+    assert(classify(0xB382) == cp(true,1))   // EOR.L D1,D2
+    assert(classify(0xB302) == cp(true,1))   // EOR.B D1,D2
+    assert(classify(0xB342) == cp(true,1))   // EOR.W D1,D2
+    assert(classify(0xB389) == cp(false,0))  // EOR.L D1,A1 (An-direct = CMPM) -> complex
+  }
   test("indexed (d8,A0,Xn) source -> complex") { assert(classify(0xD0B0) == cp(false,0)) }
   test("deferred ops -> complex") {
     assert(classify(0x5240) == cp(false,0))  // ADDQ.W #1,D0
