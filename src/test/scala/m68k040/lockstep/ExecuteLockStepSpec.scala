@@ -1177,6 +1177,44 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "handler: moveq #0,%d4 ; rte", nInstr = 8)       // moveq #0 -> Z=1 matches entry
   }
 
+  // ── DIVU.L/DIVS.L 64/32 lock-step (Dr:Dq 64-bit dividend -> Dq=q, Dr=rem) ─────
+  // GNU `divu.l %dn,%dr:%dq` (the `:` syntax) = the 64-bit form (ext bit10=1): the
+  // 64-bit dividend is Dr:Dq (Dr high, Dq low). Cracked DIV(+psrcC=Dr)+DIVREM. The
+  // trailing moves verify the remainder (Dr).
+  test("lock-step: DIVU.L 64/32 (Dr:Dq) normal", VerilatorTest) {
+    runLockStep("div-l64-u",
+      "move.l #0x12,%d2 ; move.l #0x34567890,%d0 ; moveq #100,%d1 ; " + // Dr:Dq = 0x12_34567890
+      "divu.l %d1,%d2:%d0 ; " +                                          // d0=q, d2=rem
+      "move.l %d2,%d6 ; loop: bra loop", nInstr = 6)
+  }
+
+  // DIVS.L 64/32 signed, negative dividend.
+  test("lock-step: DIVS.L 64/32 (Dr:Dq) signed negative", VerilatorTest) {
+    runLockStep("div-l64-s",
+      "move.l #0xffffffff,%d2 ; move.l #0xfff0bdc0,%d0 ; moveq #7,%d1 ; " + // Dr:Dq = -1000000 (sign-ext)
+      "divs.l %d1,%d2:%d0 ; " +
+      "move.l %d2,%d6 ; loop: bra loop", nInstr = 6)
+  }
+
+  // DIVU.L 64/32 overflow: a 64-bit dividend whose quotient exceeds 32 bits -> V=1,
+  // NO write (Dq, Dr unchanged). Verified by reading both back.
+  test("lock-step: DIVU.L 64/32 overflow (V=1, no write)", VerilatorTest) {
+    runLockStep("div-l64-ovf",
+      "move.l #0x10,%d2 ; move.l #0,%d0 ; moveq #1,%d1 ; " + // 0x10_00000000 / 1 -> q > 32b
+      "divu.l %d1,%d2:%d0 ; " +
+      "moveq #5,%d6 ; loop: bra loop", nInstr = 6)
+  }
+
+  // DIVU.L 64/32 DIV0 -> vector 5 -> handler -> RTE.
+  test("lock-step: DIVU.L 64/32 DIV0 -> handler -> RTE", VerilatorTest) {
+    runLockStep("div-l64-div0",
+      "move.l #handler,%d6 ; move.l %d6,0x14 ; " +     // vector 5 @ 0x14
+      "move.l #0x12,%d2 ; move.l #0x3456,%d0 ; moveq #0,%d1 ; " + // /0
+      "divu.l %d1,%d2:%d0 ; " +
+      "moveq #7,%d3 ; loop: bra loop ; " +
+      "handler: moveq #0,%d4 ; rte", nInstr = 9)       // entry CCR Z=1 (moveq #0,%d1)
+  }
+
   // ── CHK lock-step (vector 6, format-$2): in-bounds no-op + both out-of-bounds ──
   // In-bounds: CHK is a no-op, straight-line. (CHK leaves CCR per the 68k undefined-
   // except-N rule; Musashi's CHK does modify N/Z, but the lock-step compares the
