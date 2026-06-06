@@ -119,17 +119,18 @@ object PredecodeWord {
             r.lenWords := (U(1, 3 bits) + e).resized
           }
         }
-        // DIVU.L/DIVS.L (0100 1100 01 mmmrrr): opword + 1 extension word (the Dq/Dr/
-        // signed/size word) + the 32-bit-divisor EA extension. MUL.L (...00...) stays
-        // complex (separate slice).
+        // DIVU.L/DIVS.L (0100 1100 01 mmmrrr) / MULU.L/MULS.L (0100 1100 00 mmmrrr):
+        // opword + 1 extension word (the Dl/Dh/signed/size word) + the 32-bit EA
+        // extension. Same framing for both (the ext word + a 32-bit source EA).
         val isDivL = op(15 downto 6) === B"10'b0100110001"
-        when(isDivL) {
+        val isMulL = op(15 downto 6) === B"10'b0100110000"
+        when(isDivL || isMulL) {
           val srcMode = op(5 downto 3).asUInt
           val srcReg  = op(2 downto 0).asUInt
-          val (ok, e) = eaExt(srcMode, srcReg, sizeL = True, allowImm = true)  // 32-bit divisor
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL = True, allowImm = true)  // 32-bit source
           when(ok) {
             r.simple   := True
-            r.lenWords := (U(2, 3 bits) + e).resized   // opword + DIV.L ext word + EA ext
+            r.lenWords := (U(2, 3 bits) + e).resized   // opword + ext word + EA ext
           }
         }
         // JMP (0100111011 mmmrrr) / JSR (0100111010 mmmrrr): a computed-target branch
@@ -183,15 +184,22 @@ object PredecodeWord {
         val srcMode = op(5 downto 3).asUInt
         val srcReg  = op(2 downto 0).asUInt
         // classes 8(OR-group)/C(AND-group) opmode 3/7 = DIVU/DIVS/MULU/MULS.
-        //   BOTH DIVs are line 8: DIVU.W = opmode 3, DIVS.W = opmode 7. They ARE
-        //   handled now (1 opword + the 16-bit-divisor EA extension). BOTH MULs are
-        //   line C (opmode 3/7) -> stay complex (separate slice).
+        //   BOTH DIVs are line 8: DIVU.W = opmode 3, DIVS.W = opmode 7.
+        //   BOTH MULs are line C: MULU.W = opmode 3, MULS.W = opmode 7.
+        //   All four are 1 opword + the 16-bit EA extension (the multiplier/divisor).
         val isDivuW = (cls === U(8, 4 bits)) && (opmode === U(3, 3 bits))
         val isDivsW = (cls === U(8, 4 bits)) && (opmode === U(7, 3 bits))
+        // MUL.W's multiplier is a DATA addressing mode — An-direct (srcMode 1) is NOT
+        // legal (matches decode + the 040 ISA), so it stays COMPLEX (-> illegal), never
+        // framed as a simple 1-word MUL. (This also keeps free-running garbage with an
+        // An-direct EA from framing as a live multi-cycle MUL.)
+        val mulEaOk = srcMode =/= U(1, 3 bits)
+        val isMuluW = (cls === U(0xC, 4 bits)) && (opmode === U(3, 3 bits)) && mulEaOk
+        val isMulsW = (cls === U(0xC, 4 bits)) && (opmode === U(7, 3 bits)) && mulEaOk
         val isMulDiv = (cls === U(8, 4 bits) || cls === U(0xC, 4 bits)) &&
                        (opmode === U(3, 3 bits) || opmode === U(7, 3 bits))
-        when(isDivuW || isDivsW) {
-          // 16-bit divisor EA (sizeL = false: word operand size for #imm extension).
+        when(isDivuW || isDivsW || isMuluW || isMulsW) {
+          // 16-bit multiplier/divisor EA (sizeL = false: word operand size for #imm).
           val (ok, e) = eaExt(srcMode, srcReg, sizeL = False, allowImm = true)
           when(ok) {
             r.simple   := True

@@ -90,6 +90,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // ── CPLX (DivEu) wiring (mirrors top/FullCoreSynth) ──
       // Issue port 4 -> DivEu; completion (port 3) + dynamic wakeup + euFault.
       divEu.issue << iq.issue(4)
+      // Squash a multi-cycle DIV/MUL flushed in flight (same flush the IQ uses).
+      divEu.cplxFlush := host[RedirectService].doFlush || rob.logic.excActive
       rob.logic.completion(3).valid   := divEu.completion.valid
       rob.logic.completion(3).payload := divEu.completion.payload
       iq.cplxWakeup.valid   := divEu.wakeup.valid
@@ -1406,6 +1408,61 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #20,%d1 ; moveq #10,%d2 ; chk.w %d2,%d1 ; " + // 20>10 -> trap (entry N=0)
       "moveq #7,%d3 ; loop: bra loop ; " +
       "handler: moveq #1,%d4 ; rte", nInstr = 8)    // moveq #1 -> N=0,Z=0 matches entry
+  }
+
+  // ── MULU.W / MULS.W lock-step (16x16 -> Dn[31:0], N/Z; V=0, C=0) ─────────────
+  // Register-source forms are 2-byte opwords (nextPc = pc+2), straight-line. The
+  // full 32-bit product lands in Dn; N=bit31, Z=(product==0), V=0.
+  test("lock-step: MULU.W normal + MULS.W normal/sign", VerilatorTest) {
+    runLockStep("mul-w-normal",
+      "moveq #100,%d0 ; moveq #7,%d1 ; mulu.w %d1,%d0 ; " +    // 100*7 = 700 in d0
+      "moveq #-100,%d2 ; moveq #7,%d3 ; muls.w %d3,%d2 ; " +   // -100*7 = -700 (signed)
+      "move.l #0x8000,%d4 ; move.l #0x8000,%d5 ; muls.w %d5,%d4 ; " + // -32768*-32768 = +2^30
+      "moveq #1,%d6 ; loop: bra loop", nInstr = 9)
+  }
+
+  // MULU.W large product (N=1: bit31 set) + a zero product (Z=1).
+  test("lock-step: MULU.W large product (N=1) + zero (Z=1)", VerilatorTest) {
+    runLockStep("mul-w-flags",
+      "move.l #0xffff,%d0 ; move.l #0xffff,%d1 ; mulu.w %d1,%d0 ; " + // 65535*65535 = 0xFFFE0001 (N=1)
+      "moveq #0,%d2 ; moveq #123,%d3 ; mulu.w %d3,%d2 ; " +           // 0*123 = 0 (Z=1)
+      "moveq #5,%d4 ; loop: bra loop", nInstr = 6)
+  }
+
+  // ── MULU.L / MULS.L 32x32 -> 32 lock-step (Dl = product[31:0]; +overflow V) ──
+  // 0x4C00|ea form, ext bit10=0: Dl = (ea * Dl)[31:0]. V set iff the full 64-bit
+  // product doesn't fit 32 bits (signed: high32 != sign-ext of bit31; unsigned:
+  // high32 != 0). N=Dl[31], Z=(Dl==0), C=0.
+  test("lock-step: MULU.L/MULS.L 32x32->32 normal", VerilatorTest) {
+    runLockStep("mul-l32-normal",
+      "move.l #100000,%d0 ; moveq #7,%d1 ; mulu.l %d1,%d0 ; " +    // 700000 fits 32 (no V)
+      "move.l #-100000,%d2 ; moveq #7,%d3 ; muls.l %d3,%d2 ; " +   // -700000 signed (no V)
+      "moveq #1,%d4 ; loop: bra loop", nInstr = 7)
+  }
+
+  // .L32 overflow: a product that exceeds 32 bits -> V=1, the low 32 still written.
+  test("lock-step: MULU.L/MULS.L 32x32->32 overflow (V=1)", VerilatorTest) {
+    runLockStep("mul-l32-ovf",
+      "move.l #0x100000,%d0 ; move.l #0x100000,%d1 ; mulu.l %d1,%d0 ; " + // 2^20*2^20=2^40 -> V
+      "move.l #0x40000000,%d2 ; moveq #4,%d3 ; muls.l %d3,%d2 ; " +       // 2^30*4=2^32 signed -> V
+      "moveq #5,%d4 ; loop: bra loop", nInstr = 7)
+  }
+
+  // ── MULU.L/MULS.L 32x32 -> 64 lock-step (Dh:Dl 2-dest crack) ─────────────────
+  // 0x4C00|ea form, ext bit10=1: Dh:Dl = ea * Dl (full 64-bit product). Cracked
+  // [MUL -> Dl] + [MULHI -> Dh from the EU's latched high product]. V=0; N=Dh[31],
+  // Z=(Dh|Dl==0). The trailing moves read Dh so the MULHI PRF write is verified.
+  test("lock-step: MULU.L 32x32->64 (Dh:Dl) normal", VerilatorTest) {
+    runLockStep("mul-l64-u",
+      "move.l #0x100000,%d0 ; move.l #0x100000,%d1 ; mulu.l %d1,%d2:%d0 ; " + // 2^20*2^20=2^40
+      "move.l %d2,%d6 ; loop: bra loop", nInstr = 5)
+  }
+
+  // MULS.L 64-bit signed (negative product spans Dh:Dl).
+  test("lock-step: MULS.L 32x32->64 (Dh:Dl) signed negative", VerilatorTest) {
+    runLockStep("mul-l64-s",
+      "move.l #-100000,%d0 ; move.l #100000,%d1 ; muls.l %d1,%d2:%d0 ; " + // -(10^10) signed
+      "move.l %d2,%d6 ; loop: bra loop", nInstr = 5)
   }
 
   // ── MMU page-fault delivery lock-step (format-$7 -> handler -> RTE) ──────────

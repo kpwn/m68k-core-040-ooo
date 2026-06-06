@@ -8,7 +8,12 @@ object DecOp extends SpinalEnum {
       // CPLX-cluster (DivEu) ops: bound-check trap + integer divide. DIV carries
       // {signed, the .W/.L/64-form, quotient-only-vs-remainder} via size + the
       // divForm/divSigned/div64 µop fields below.
-      CHK, DIV, DIVREM = newElement()
+      CHK, DIV, DIVREM,
+      // CPLX-cluster integer multiply (MULU/MULS). MUL writes the product low word
+      // (Dn[31:0] for .W/.L32, Dl[31:0] for .L64); MULHI is the trailing crack µop
+      // for the .L64 form (writes the LATCHED high product Dh from MulCore). Sign +
+      // form carried via size + divSigned (reused for MULS) + div64 (.L64 marker).
+      MUL, MULHI = newElement()
 }
 
 /** Pre-rename µop: the decode→rename contract. Architectural operands

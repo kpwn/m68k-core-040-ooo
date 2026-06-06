@@ -72,10 +72,12 @@ object OperationDecoder {
         val isRmw  = (opmode === 4 || opmode === 5 || opmode === 6)
         // DIVU.W (line 0x8 opmode 3) / DIVS.W (line 0x8 opmode 7): 32-bit dividend Dn
         // (bits 11:9) / 16-bit divisor EA -> Dn = {rem[31:16], q[15:0]}. BOTH DIVs are
-        // line 8 (the OR group); BOTH MULs are line C (the AND group) -> MULU/MULS
-        // (line 0xC opmode 3/7) stay illegal (separate slice).
+        // line 8 (the OR group). MULU.W (line 0xC opmode 3) / MULS.W (line 0xC opmode
+        // 7): 16x16 -> Dn[31:0], the full 32-bit product; N/Z from the product, V=0.
         val isDivuW = (line === 0x8) && (opmode === 3)
         val isDivsW = (line === 0x8) && (opmode === 7)
+        val isMuluW = (line === 0xC) && (opmode === 3)
+        val isMulsW = (line === 0xC) && (opmode === 7)
         val isMulDiv = ((line === 0x8 || line === 0xC) && (opmode === 3 || opmode === 7))
         when(isDivuW || isDivsW) {
           o.illegal := False
@@ -87,6 +89,19 @@ object OperationDecoder {
           o.dst := dnField; o.dstWrites := True   // result -> Dn
           o.writesNzvc := True            // DIV sets N/Z/V (C=0)
           o.divSigned := isDivsW
+        } .elsewhen((isMuluW || isMulsW) && (opword(5 downto 3) =/= 1)) {
+          // MULU.W/MULS.W: 16x16 -> Dn[31:0]. The multiplier EA is a DATA addressing
+          // mode; An-direct (mode 1) is NOT a legal MUL EA (matches the 040 ISA +
+          // Musashi's "A+-DXWLdxI" mode set, which excludes An-direct) -> stays illegal.
+          o.illegal := False
+          o.op := DecOp.MUL
+          o.cluster := Cluster.CPLX
+          o.size := Size.WORD
+          o.srcA := dnField               // Dn[15:0] multiplicand
+          o.srcB := easrc                 // 16-bit multiplier EA
+          o.dst := dnField; o.dstWrites := True   // product -> Dn[31:0]
+          o.writesNzvc := True            // MUL sets N/Z (V=0, C=0)
+          o.divSigned := isMulsW          // reuse divSigned as the MULS marker
         } .elsewhen(!isRmw && !isMulDiv) {
           o.illegal := False
           switch(line) {
