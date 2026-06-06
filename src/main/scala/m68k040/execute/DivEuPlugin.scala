@@ -20,6 +20,13 @@ trait DivEuService {
   /** Execute-time conditional fault (CHK -> vector 6, DIV0 -> vector 5). The ROB
     * consumes it like the branch EU's trapvFault (generalized euFault). */
   def euFault: Flow[EuFault]
+  /** Mispredict/exception squash (the RedirectService doFlush pulse). A MULTI-CYCLE
+    * op (DIV/MUL) in flight when a flush hits is WRONG-PATH: its late completion
+    * would land after the ROB reuses its robId. We abort the FSM + suppress the
+    * stale completion/writeback so it cannot pollute the reused entry. (The ROB also
+    * filters wrong-path completions by robId; this additionally protects against the
+    * multi-cycle straddle where completion lands after reuse.) */
+  def cplxFlush: Bool
 }
 
 /** CPLX execution unit: CHK (bound-check trap, single-cycle) + multi-cycle DIVU/DIVS.
@@ -47,17 +54,23 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
   var rdA, rdB, rdH: RegFileReadPort = null
   var intW: RegFileWritePort = null;  var intByp: RegFileBypassPort = null
   var nzvcW: RegFileWritePort = null; var nzvcByp: RegFileBypassPort = null
+  var flushSig: Bool = null
 
   override def issue: Stream[IqContext] = issuePort
   override def completion: Flow[UInt]   = completionPort
   override def wakeup: Flow[UInt]       = wakeupPort
   override def euFault: Flow[EuFault]   = euFaultPort
+  override def cplxFlush: Bool          = flushSig
 
   during setup {
     issuePort      = Stream(IqContext())
     completionPort = Flow(UInt(6 bits))
     wakeupPort     = Flow(UInt(6 bits))
     euFaultPort    = Flow(EuFault()); euFaultPort.simPublic()
+    flushSig       = Bool()
+    // default-driven idle (allowOverride) so a standalone test that does not wire a
+    // flush still elaborates; the BackendWiring drives it from doFlush.
+    flushSig.allowOverride; flushSig := False
     val irf = host[IntRegFileService]
     rdA = irf.newRead()   // CHK: Dn ; DIV: dividend low (Dq)
     rdB = irf.newRead()   // CHK: bound ; DIV: divisor (when register)
@@ -102,6 +115,16 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       when(!busy) { s1Valid := False }
     }
 
+    // Mispredict/exception squash: a 1-cycle doFlush pulse. Latch it so the eventual
+    // completion of a multi-cycle op (DIV/MUL) that was IN FLIGHT at the flush is
+    // suppressed — its robId may be reused by a correct-path op before the (late)
+    // completion lands. `flushed` is set on any flush while busy/s1Valid (an in-flight
+    // op); it is captured into compFlushed at the op's completion and cleared then.
+    val flushed = RegInit(False)
+    when(flushSig && (busy || s1Valid)) { flushed := True }
+    // A flush also drops a not-yet-launched s1 op (it never enters DIVING/MULING).
+    when(flushSig) { s1Valid := False }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Registered COMPLETION / WRITEBACK stage (mirrors LsEu): the decision (CHK
     // compare / DIV result) is captured into comp* registers and DRIVES the
@@ -122,6 +145,9 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // True when the captured completion is the trailing DIVREM crack µop (whitebox
     // drops its commit; the PRF write still lands). Captured in the capture helpers.
     val compDivRem    = RegInit(False)
+    // True when the completing op was WRONG-PATH (a flush hit it in flight). Its
+    // completion/writeback/wakeup/euFault are suppressed (see the port drives below).
+    val compFlushed   = RegInit(False)
 
     compValid     := False
     compNzvcWrite := False
@@ -169,6 +195,10 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       // The trailing crack µop (DIVREM or MULHI) is coalesced into the preceding
       // op's oracle step (its own commit is dropped, the PRF write still lands).
       compDivRem    := u1.divIsRem || (u1.op === DecOp.MULHI)
+      // Was this op (or its in-flight predecessor) flushed? If so the completion is
+      // wrong-path and must not drive any port (its robId may have been reused).
+      compFlushed   := flushed || flushSig
+      flushed       := False                 // captured -> consume the latch
     }
     def captureFault(vec: UInt, nzvc: Bits, writesNzvc: Bool): Unit = {
       compValid     := True
@@ -183,6 +213,8 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       compFault     := True
       compFaultVec  := vec
       compDivRem    := False
+      compFlushed   := flushed || flushSig
+      flushed       := False
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -382,31 +414,35 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     }
 
     // ---- drive ports from the registered completion stage ----
-    completionPort.valid   := compValid
+    // compFlushed suppresses a WRONG-PATH completion (a multi-cycle op flushed in
+    // flight): no completion / PRF write / wakeup / euFault — its robId may already
+    // be reused by a correct-path op.
+    val compLive = compValid && !compFlushed
+    completionPort.valid   := compLive
     completionPort.payload := compRobId
-    intW.valid     := compValid && compPdstValid && !compFault
+    intW.valid     := compLive && compPdstValid && !compFault
     intW.address   := compPdst
     intW.data      := compData
     intByp.valid   := intW.valid
     intByp.address := compPdst
     intByp.data    := compData
-    nzvcW.valid     := compValid && compNzvcWrite && !compFault
+    nzvcW.valid     := compLive && compNzvcWrite && !compFault
     nzvcW.address   := compNzvcDst
     nzvcW.data      := compNzvc
     nzvcByp.valid   := nzvcW.valid
     nzvcByp.address := nzvcW.address
     nzvcByp.data    := nzvcW.data
     // Dynamic-completion wakeup: a completing DIV that produced a physreg.
-    wakeupPort.valid   := compValid && compPdstValid && !compFault
+    wakeupPort.valid   := compLive && compPdstValid && !compFault
     wakeupPort.payload := compPdst
     // Generalized euFault (CHK vec6 / DIV0 vec5).
-    euFaultPort.valid         := compValid && compFault
+    euFaultPort.valid         := compLive && compFault
     euFaultPort.payload.robId := compRobId
     euFaultPort.payload.vector:= compFaultVec
 
     // ---- sim-only whitebox ----
     val wbObs = WbObs()
-    wbObs.valid     := compValid
+    wbObs.valid     := compLive
     wbObs.robId     := compRobId
     wbObs.dstArch   := compDstArch
     wbObs.result    := compData

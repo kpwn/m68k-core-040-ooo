@@ -90,6 +90,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // ── CPLX (DivEu) wiring (mirrors top/FullCoreSynth) ──
       // Issue port 4 -> DivEu; completion (port 3) + dynamic wakeup + euFault.
       divEu.issue << iq.issue(4)
+      // Squash a multi-cycle DIV/MUL flushed in flight (same flush the IQ uses).
+      divEu.cplxFlush := host[RedirectService].doFlush || rob.logic.excActive
       rob.logic.completion(3).valid   := divEu.completion.valid
       rob.logic.completion(3).payload := divEu.completion.payload
       iq.cplxWakeup.valid   := divEu.wakeup.valid

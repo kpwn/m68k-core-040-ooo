@@ -189,8 +189,13 @@ object PredecodeWord {
         //   All four are 1 opword + the 16-bit EA extension (the multiplier/divisor).
         val isDivuW = (cls === U(8, 4 bits)) && (opmode === U(3, 3 bits))
         val isDivsW = (cls === U(8, 4 bits)) && (opmode === U(7, 3 bits))
-        val isMuluW = (cls === U(0xC, 4 bits)) && (opmode === U(3, 3 bits))
-        val isMulsW = (cls === U(0xC, 4 bits)) && (opmode === U(7, 3 bits))
+        // MUL.W's multiplier is a DATA addressing mode — An-direct (srcMode 1) is NOT
+        // legal (matches decode + the 040 ISA), so it stays COMPLEX (-> illegal), never
+        // framed as a simple 1-word MUL. (This also keeps free-running garbage with an
+        // An-direct EA from framing as a live multi-cycle MUL.)
+        val mulEaOk = srcMode =/= U(1, 3 bits)
+        val isMuluW = (cls === U(0xC, 4 bits)) && (opmode === U(3, 3 bits)) && mulEaOk
+        val isMulsW = (cls === U(0xC, 4 bits)) && (opmode === U(7, 3 bits)) && mulEaOk
         val isMulDiv = (cls === U(8, 4 bits) || cls === U(0xC, 4 bits)) &&
                        (opmode === U(3, 3 bits) || opmode === U(7, 3 bits))
         when(isDivuW || isDivsW || isMuluW || isMulsW) {

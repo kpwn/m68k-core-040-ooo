@@ -89,7 +89,10 @@ object OperationDecoder {
           o.dst := dnField; o.dstWrites := True   // result -> Dn
           o.writesNzvc := True            // DIV sets N/Z/V (C=0)
           o.divSigned := isDivsW
-        } .elsewhen(isMuluW || isMulsW) {
+        } .elsewhen((isMuluW || isMulsW) && (opword(5 downto 3) =/= 1)) {
+          // MULU.W/MULS.W: 16x16 -> Dn[31:0]. The multiplier EA is a DATA addressing
+          // mode; An-direct (mode 1) is NOT a legal MUL EA (matches the 040 ISA +
+          // Musashi's "A+-DXWLdxI" mode set, which excludes An-direct) -> stays illegal.
           o.illegal := False
           o.op := DecOp.MUL
           o.cluster := Cluster.CPLX

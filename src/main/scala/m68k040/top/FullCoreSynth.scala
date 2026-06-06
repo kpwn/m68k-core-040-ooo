@@ -86,6 +86,9 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // ---- CPLX (DivEu) wiring: issue port 4 -> DivEu; completion (port 3) + dynamic
     // wakeup + euFault (CHK vec6 / DIV0 vec5). ----
     divEu.issue << iq.issue(4)
+    // Squash a multi-cycle DIV/MUL flushed in flight (same flush the IQ uses) so its
+    // late wrong-path completion can't land on a reused robId.
+    divEu.cplxFlush := doFlush || excActive
     rob.logic.completion(3).valid   := divEu.completion.valid
     rob.logic.completion(3).payload := divEu.completion.payload
     iq.cplxWakeup.valid   := divEu.wakeup.valid
