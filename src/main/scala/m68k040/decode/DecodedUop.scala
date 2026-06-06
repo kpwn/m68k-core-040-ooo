@@ -75,6 +75,13 @@ case class DecodedUop() extends Bundle {
   val divSigned    = Bool()
   val div64        = Bool()     // 64-bit dividend (Dr:Dq) form
   val divIsRem     = Bool()     // this µop is the trailing remainder-move (DIVREM)
+  // ── Stack-push store (BSR/JSR call: push return-PC to -(A7)) ────────────────
+  // A predecrement-store µop: address = base An (psrcA) - sizeBytes; the STORE DATA
+  // is the immediate (`imm` carries retPC = nextPc, NOT a displacement); and the
+  // µop's single int dst = the SAME predecremented address (the new A7) — a store
+  // has no data dst, so this lone int write is the A7 side-effect. Reuses one int
+  // dst + the imm field (no 2nd write port / no 2nd 32-bit field). Default False.
+  val stkPush      = Bool()
   // Macro-instruction boundary marker: True for the FIRST µop of an instruction.
   // The cracker emits 1 or 2 µops/instruction; the only 2-µop case is a memSimple
   // source crack -> [load, op] where the LOAD is first. An interrupt may be taken

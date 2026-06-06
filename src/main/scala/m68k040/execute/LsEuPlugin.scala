@@ -156,9 +156,21 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // the base contribution must be ZERO there — otherwise the stale psrcA (which
     // defaults to physreg 0) would corrupt the computed address.
     val base0 = Mux(u0.psrcAValid, rdBase.data.asUInt, U(0, 32 bits))
-    val disp0 = u0.imm.asSInt
+    // STACK-PUSH (BSR/JSR): predecrement store. addr = base(A7) - sizeBytes, and the
+    // STORE DATA is `imm` (retPC), not a register. The displacement is therefore the
+    // negative access size (NOT u0.imm). sizeBytes computed below (sizeBytes(u0.size)).
+    def szBytes0(s: m68k040.isa.Size.C): SInt = {
+      val n = SInt(32 bits); n := 1
+      switch(s) {
+        is(m68k040.isa.Size.BYTE) { n := 1 }
+        is(m68k040.isa.Size.WORD) { n := 2 }
+        is(m68k040.isa.Size.LONG) { n := 4 }
+      }
+      n
+    }
+    val disp0 = Mux(u0.stkPush, -szBytes0(u0.size), u0.imm.asSInt)
     val va0   = (base0.asSInt + disp0).asUInt
-    val data0 = rdData.data
+    val data0 = Mux(u0.stkPush, u0.imm, rdData.data)   // push: data = retPC (imm)
 
     // ---- AGU cross-line / cross-page detection (S0, combinational) ----
     // sizeBytes from the access size (1/2/4). A single m68k access spans at most
@@ -313,6 +325,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val compPdst      = Reg(UInt(6 bits))
     val compPdstValid = RegInit(False)
     val compIsLoad    = RegInit(False)   // load (writes a reg + wakes) vs store
+    // A STACK-PUSH store produces an int reg (the predecremented A7) — unlike a plain
+    // store. It must write the int PRF AND broadcast a wakeup (a consumer of the new
+    // A7 — e.g. a following push/pop — waits on it). `compWakes` gates the wakeup for
+    // BOTH a load and a stkPush store; `compStkPush` selects the int write (= s1Va).
+    val compWakes     = RegInit(False)
     val compDstArch   = Reg(UInt(5 bits))
     // NZVC writeback for a MOVE-to-memory store (N/Z of the moved value, V=C=0).
     val compNzvc      = Reg(Bits(4 bits))
@@ -380,14 +397,17 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       m68k040.isa.Size.LONG -> (s1Data === 0))
     val storeNzvc = stN ## stZ ## False ## False   // N Z V(0) C(0)
 
-    // captured-decision -> register (called in the decision cycle)
+    // captured-decision -> register (called in the decision cycle). A STACK-PUSH store
+    // writes its int dst (A7) with the PREDECREMENTED address (s1Va) — not the load
+    // `result` — and wakes consumers of A7.
     def captureCompletion(result: Bits): Unit = {
       compValid     := True
       compRobId     := s1Ctx.robId
-      compData      := result
+      compData      := Mux(u1.stkPush, s1Va.asBits, result)
       compPdst      := u1.pdst
       compPdstValid := u1.pdstValid
       compIsLoad    := isLoad
+      compWakes     := isLoad || u1.stkPush     // both produce an int reg -> wake
       compDstArch   := u1.dstArch
       // A MOVE store carries writesNzvc -> compute + write the renamed NZVC PRF.
       // (Loads do not write NZVC: u1.writesNzvc is False for the load µop.)
@@ -408,6 +428,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compPdstValid := False
       compNzvcWrite := False
       compIsLoad    := False
+      compWakes     := False
       compIsFault   := True
       compFaultAddr := s1Va
       compFaultWr   := isStore
@@ -438,9 +459,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     nzvcByp.valid   := nzvcW.valid
     nzvcByp.address := nzvcW.address
     nzvcByp.data    := nzvcW.data
-    // Dynamic load-wakeup: only a completing LOAD that produces a physreg broadcasts
-    // (a store completes too but writes no register — its pdst is stale).
-    wakeupPort.valid   := compValid && compIsLoad && compPdstValid && !compIsFault
+    // Dynamic load-wakeup: a completing LOAD or a STACK-PUSH store (both produce an
+    // int physreg) broadcasts; a plain store completes too but writes no register.
+    wakeupPort.valid   := compValid && compWakes && compPdstValid && !compIsFault
     wakeupPort.payload := compPdst
     // MMU access-fault completion (registered, alongside the comp* stage).
     faultCompletionPort.valid           := compValid && compIsFault

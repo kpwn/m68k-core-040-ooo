@@ -44,6 +44,7 @@ class LsEuSpec extends AnyFunSuite {
     val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
+    s.iStkPush #= false
     s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false
     cd.waitSampling(80) // PRF init sweep
     (cd, mem)

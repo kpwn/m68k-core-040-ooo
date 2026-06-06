@@ -21,6 +21,9 @@ case class RenamedUop() extends Bundle {
   // Indirect / computed-target branch (JSR/JMP/RTS/RTR): target = psrcA + imm,
   // unconditional redirect. Threaded from decode.
   val ibranch      = Bool()
+  // Stack-push store (BSR/JSR): addr = psrcA - sizeBytes; data = imm; int dst (A7)
+  // := the predecremented address. Threaded from decode.
+  val stkPush      = Bool()
   val unimplemented= Bool()
   // Precise-fault capture (exception slice 1): `faulted` + `faultVector` (4=illegal,
   // 8=privilege) threaded from decode; `isRte` marks a return-from-exception µop.
