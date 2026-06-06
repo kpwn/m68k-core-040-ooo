@@ -49,6 +49,7 @@ class IqSourcePlugin extends FiberPlugin {
       u.cond         := 0
       u.branchDisp   := 0
       u.unimplemented := False
+      u.ibranch := False; u.anInc := 0; u.stkPush := False; u.ccrRestore := False
       u.dstArch      := 0
       u.pdstOld      := 0
       u.pNzvcOld     := 0

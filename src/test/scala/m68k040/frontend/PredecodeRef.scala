@@ -51,13 +51,21 @@ object PredecodeRef {
         // Other line-4 opcodes stay complex.
         val isTrap  = (op & 0xfff0) == 0x4e40
         val isTrapv = op == 0x4e76
+        // RTS (0x4E75) / RTR (0x4E77): single-word return instructions (simple len-1).
+        val isRts   = op == 0x4e75
+        val isRtr   = op == 0x4e77
         // CHK.W/CHK.L (0100 ddd 1 s 0 mmmrrr): bit8=1, bit6=0; bound is an EA source
         // (sizeL = .L when bit7=0). 1 opword + the EA extension words.
         val isChk = ((op >> 8) & 1) == 1 && ((op >> 6) & 1) == 0
         // DIVU.L/DIVS.L (0100 1100 01 mmmrrr): opword + DIV.L ext word + 32-bit-divisor
         // EA ext. MUL.L (...00...) stays complex.
         val isDivL = ((op >> 6) & 0x3ff) == 0x131
-        if (isTrap || isTrapv) CP(simple = true, lenWords = 1)
+        // JMP (0100111011 mmmrrr) / JSR (0100111010 mmmrrr): computed-target branch to
+        // the EA address. 1 opword + control-EA ext. Control modes only:
+        // (An)=2, (d16,An)=5, (xxx).W/.L/(d16,PC)=mode7 reg0/1/2.
+        val isJmp = ((op >> 6) & 0x3ff) == 0x13b
+        val isJsr = ((op >> 6) & 0x3ff) == 0x13a
+        if (isTrap || isTrapv || isRts || isRtr) CP(simple = true, lenWords = 1)
         else if (isChk) {
           val sizeL   = ((op >> 7) & 1) == 0
           val srcMode = (op >> 3) & 7; val srcReg = op & 7
@@ -70,6 +78,13 @@ object PredecodeRef {
           eaExt(srcMode, srcReg, sizeL = true, allowImm = true) match {
             case Some(e) => CP(simple = true, lenWords = 2 + e)
             case None    => COMPLEX
+          }
+        } else if (isJmp || isJsr) {
+          val srcMode = (op >> 3) & 7; val srcReg = op & 7
+          val ctrlMode = srcMode == 2 || srcMode == 5 || srcMode == 7
+          eaExt(srcMode, srcReg, sizeL = false, allowImm = false) match {
+            case Some(e) if ctrlMode => CP(simple = true, lenWords = 1 + e)
+            case _                   => COMPLEX
           }
         } else COMPLEX
       case 0x7 =>

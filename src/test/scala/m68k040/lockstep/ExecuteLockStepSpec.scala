@@ -46,8 +46,18 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // in setup (RegfileService requires it). latency=0 so the handler can read the
     // updated A7 the cycle after the exception commits (it is serializing).
     var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
-    during setup { a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7") }
+    // Sim-only boot seed of the int PRF (A7 = boot SSP). Shares the "excA7" physical
+    // write port (the exc unit is idle at boot, so no same-cycle collision). Driven by
+    // the harness for a couple of cycles after the init sweep, before the first fetch.
+    var seedWr: m68k040.execute.regfile.RegFileWritePort = null
+    during setup {
+      a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
+      seedWr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7", priority = 1)
+    }
     val logic = during build new Area {
+      val seedValid = in Bool (); val seedAddr = in UInt (6 bits); val seedData = in Bits (32 bits)
+      seedValid.simPublic(); seedAddr.simPublic(); seedData.simPublic()
+      seedWr.valid := seedValid; seedWr.address := seedAddr; seedWr.data := seedData
       val iq  = host[IssueQueueService]
       val rob = host[RobPlugin]
       eu0.issue << iq.issue(0)
@@ -354,12 +364,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           val bw = dut.branchEu.logic.wbObs
           if (bw.valid.toBoolean) {
             wbCount += 1
+            // A plain branch writes no reg; an RTS/RTR ibranch writes A7 (postinc SP).
+            val anWr = bw.anWrite.toBoolean
             handle.onWb(
               bw.robId.toInt,
               WhiteboxCapture.Wb(
-                dstArch   = 0,
-                result    = 0L,
-                intWrite  = false,
+                dstArch   = if (anWr) bw.anArch.toInt else 0,
+                result    = if (anWr) bw.anData.toLong & 0xffffffffL else 0L,
+                intWrite  = anWr,
                 nzvc      = 0,
                 nzvcWrite = false,
                 x         = 0,
@@ -370,6 +382,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           val c = dut.rob.logic.commitObs(k)
           if (c.fire.toBoolean) {
             commitCount += 1
+            if (sys.env.contains("CR_RAW")) {
+              val w = handle.peekWb(c.robId.toInt)
+              println(f"[$name] RAWCOMMIT rob=${c.robId.toInt} pc=0x${c.pc.toLong & 0xffffffffL}%08x dstArch=${w.map(_.dstArch).getOrElse(-1)} intW=${w.map(_.intWrite).getOrElse(false)} res=0x${w.map(_.result & 0xffffffffL).getOrElse(0L)}%08x divRem=${w.map(_.divRem).getOrElse(false)}")
+            }
             handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
               sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL)
           }
@@ -413,6 +429,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.fa.logic.resume.valid   #= false
       dut.rob.logic.flush.valid   #= false
       dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid    #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
 
       // Let the PRF init sweep + rename committed-RAT identity init finish.
       cd.waitSampling(2)
@@ -424,6 +441,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // the init sweep (it resets committed state) so the surfaced A7 (== SSP, S=1)
       // matches OracleStep.a(7) for every program.
       dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      // Seed the int PRF arch-15 (A7, identity phys-15) to the boot SSP too: the OoO
+      // datapath reads A7 from the int PRF (call/return push/pop), so it must mirror
+      // the committed SSP at boot (reset loads SSP into A7). The exc unit keeps ss.ssp
+      // in sync on exceptions; the PRF arch-15 follows OoO writes thereafter.
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
       cd.waitSampling()
       // Pulse redirect to the program load PC to start fetch.
       dut.fa.logic.redirect.valid   #= true
@@ -435,21 +461,19 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       var guard = 0
       val cap   = 4000
       while (handle.result.size < n && guard < cap) {
-        if (name == "mixed" && guard < 80) {
-          val dpc = dut.fa.logic.decodePc.toLong & 0xffffffffL
-          val fpc = dut.fa.logic.fetchPc.toLong & 0xffffffffL
-          val ic  = dut.fa.logic.ibuf.count.toInt
-          val fv  = dut.fa.logic.feed.valid.toBoolean
-          val fr  = dut.fa.logic.feed.ready.toBoolean
-          val p0  = dut.fa.logic.feed.payload(0).pc.toLong & 0xffffffffL
-          println(f"[$name] c$guard%3d dpc=0x$dpc%x fpc=0x$fpc%x ibuf=$ic feed(v=$fv r=$fr p0=0x$p0%x)")
-        }
         cd.waitSampling(); guard += 1
       }
       assert(handle.result.size >= n,
         s"[$name] only ${handle.result.size}/$n instructions committed within $cap cycles")
 
       val res = LockStep.compare(handle.result.take(n), oracle)
+      if (!res.ok && sys.env.contains("CR_DEBUG")) {
+        val rr = handle.result.take(n)
+        for (i <- 0 until n) {
+          val c = rr(i); val s = oracle(i)
+          println(f"[$name] idx$i%2d dut pc=0x${c.pc}%08x a7=0x${c.a7 & 0xffffffffL}%08x reg${c.archRegId}=0x${c.archRegWrite & 0xffffffffL}%08x(v=${c.archRegValid}) | orc pc=0x${s.pc}%08x a7=0x${s.a(7) & 0xffffffffL}%08x")
+        }
+      }
       assert(res.ok,
         s"[$name] lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")} " +
           s"(matched ${res.matched}, dut commits ${handle.result.size}, oracle steps $n)")
@@ -764,6 +788,143 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     runLockStep("bra",
       "bra.s .L ; moveq #9,%d0 ; .L: moveq #7,%d1",
       nInstr = 2)
+  }
+
+  // ── JMP (computed-target branch, no push) ──────────────────────────────────
+  test("lock-step: jmp (An) computed target", VerilatorTest) {
+    // Load .L's absolute address into A0, jmp (A0): skips moveq#9, lands on moveq#7.
+    // Executed: move.l#.L,a0, jmp(a0), moveq#7 = 3.
+    runLockStep("jmp-an",
+      "move.l #.L,%a0 ; jmp (%a0) ; moveq #9,%d0 ; .L: moveq #7,%d1",
+      nInstr = 3)
+  }
+
+  test("lock-step: jmp (xxx).L absolute target", VerilatorTest) {
+    // jmp .L (absolute long): skips moveq#9, lands on moveq#7.
+    // Executed: jmp(abs), moveq#7 = 2.
+    runLockStep("jmp-abs",
+      "jmp (.L).l ; moveq #9,%d0 ; .L: moveq #7,%d1",
+      nInstr = 2)
+  }
+
+  test("lock-step: jmp (d16,PC) pc-relative target", VerilatorTest) {
+    // jmp .L(pc) (PC-relative): skips moveq#9, lands on moveq#7.
+    // Executed: jmp(pc-rel), moveq#7 = 2.
+    runLockStep("jmp-pcrel",
+      "jmp .L(%pc) ; moveq #9,%d0 ; .L: moveq #7,%d1",
+      nInstr = 2)
+  }
+
+  test("lock-step: jmp (d16,An) displaced target", VerilatorTest) {
+    // A0 = .L - 4; jmp 4(A0) -> .L. Skips moveq#9, lands on moveq#7.
+    // Executed: move.l#.L-4,a0, jmp 4(a0), moveq#7 = 3.
+    runLockStep("jmp-d16an",
+      "move.l #.L-4,%a0 ; jmp 4(%a0) ; moveq #9,%d0 ; .L: moveq #7,%d1",
+      nInstr = 3)
+  }
+
+  test("lock-step: bsr push (no rts) isolation", VerilatorTest) {
+    // moveq#1 ; bsr sub ; .stop: bra .stop ; sub: moveq#3 ; bra .stop2 ; .stop2: bra .stop2
+    // No RTS at all -> isolates the BSR push+branch crack from the RTS pop+ibranch.
+    // Executed to sentinel: moveq#1, bsr, moveq#3, bra = 4.
+    runLockStep("bsr-push-iso",
+      "moveq #1,%d0 ; bsr sub ; .stop: bra .stop ; sub: moveq #3,%d1 ; bra .stop2 ; .stop2: bra .stop2",
+      nInstr = 4)
+  }
+
+  // ── BSR / RTS (the core call/return round trip) ────────────────────────────
+  test("lock-step: bsr ... rts round trip", VerilatorTest) {
+    // moveq#1,d0 ; bsr sub ; moveq#7,d2 ; stop-fence(bra .) ; sub: moveq#3,d1 ; rts
+    // Flow: moveq#1, bsr(push retPC + branch to sub), moveq#3, rts(pop + branch back),
+    // moveq#7, then bra-to-self sentinel. Executed (to the sentinel): moveq#1, bsr,
+    // moveq#3, rts, moveq#7 = 5. Verifies retPC round-trip + A7 restored (push then
+    // pop -> net 0) + final regs/PC.
+    runLockStep("bsr-rts",
+      "moveq #1,%d0 ; bsr sub ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "sub: moveq #3,%d1 ; rts",
+      nInstr = 5)
+  }
+
+  test("lock-step: nested bsr (call within a callee)", VerilatorTest) {
+    // outer calls inner; inner returns; outer returns. Two pushes, two pops, A7 net 0.
+    // moveq#1,d0 ; bsr a ; .stop: bra .stop ;
+    // a: moveq#2,d1 ; bsr b ; moveq#4,d3 ; rts ;
+    // b: moveq#3,d2 ; rts
+    // Executed to sentinel: moveq#1, bsr a, moveq#2, bsr b, moveq#3, rts(b->a),
+    // moveq#4, rts(a->main) = 8.
+    runLockStep("bsr-nested",
+      "moveq #1,%d0 ; bsr a ; .stop: bra .stop ; " +
+      "a: moveq #2,%d1 ; bsr b ; moveq #4,%d3 ; rts ; " +
+      "b: moveq #3,%d2 ; rts",
+      nInstr = 8)
+  }
+
+  // ── JSR (call via the EA address) ──────────────────────────────────────────
+  test("lock-step: jsr (An) ... rts", VerilatorTest) {
+    // A0 = sub; jsr (A0) pushes retPC + jumps to sub; sub does moveq#3 + rts.
+    // Executed to sentinel: moveq#1, move.l#sub a0, jsr(a0), moveq#3, rts, moveq#7 = 6.
+    runLockStep("jsr-an",
+      "moveq #1,%d0 ; move.l #sub,%a0 ; jsr (%a0) ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "sub: moveq #3,%d1 ; rts",
+      nInstr = 6)
+  }
+
+  test("lock-step: jsr (xxx).L ... rts", VerilatorTest) {
+    // jsr sub (absolute long). Executed: moveq#1, jsr(abs), moveq#3, rts, moveq#7 = 5.
+    runLockStep("jsr-abs",
+      "moveq #1,%d0 ; jsr (sub).l ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "sub: moveq #3,%d1 ; rts",
+      nInstr = 5)
+  }
+
+  test("lock-step: jsr (d16,PC) ... rts", VerilatorTest) {
+    // jsr sub(pc) (PC-relative). Executed: moveq#1, jsr(pcrel), moveq#3, rts, moveq#7 = 5.
+    runLockStep("jsr-pcrel",
+      "moveq #1,%d0 ; jsr sub(%pc) ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "sub: moveq #3,%d1 ; rts",
+      nInstr = 5)
+  }
+
+  test("lock-step: jsr (d16,An) ... rts", VerilatorTest) {
+    // A0 = sub - 8 ; jsr 8(A0) -> sub. Executed: moveq#1, move.l#sub-8 a0, jsr 8(a0),
+    // moveq#3, rts, moveq#7 = 6.
+    runLockStep("jsr-d16an",
+      "moveq #1,%d0 ; move.l #sub-8,%a0 ; jsr 8(%a0) ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "sub: moveq #3,%d1 ; rts",
+      nInstr = 6)
+  }
+
+  test("lock-step: store.l then load.l same addr (drain race probe)", VerilatorTest) {
+    // Isolation probe for the RTR flake: store a long to 0x2002 (a never-resident line),
+    // space it, then load.l 0x2002 -> d7. If this flakes, the store->miss-load drain is
+    // a general harness/core issue (not RTR-specific).
+    runLockStep("st-ld-drain",
+      "move.l #0x12345678,%d1 ; move.l %d1,0x2002 ; moveq #1,%d4 ; moveq #1,%d5 ; " +
+      "moveq #1,%d6 ; move.l 0x2002,%d7 ; .stop: bra .stop",
+      nInstr = 6, checkMem = Seq(0x2002L))
+  }
+
+  // ── RTR (restore CCR + PC) ─────────────────────────────────────────────────
+  test("lock-step: rtr (restore CCR + PC) via a hand-built frame", VerilatorTest) {
+    // The 040 RTR pops a CCR word @(A7) then a PC long @(A7+2), A7 += 6, restoring ONLY
+    // the CCR (SR low byte) and jumping to the popped PC. Predecrement/move-from-SR are
+    // not in scope yet, so we hand-build the frame in a data page via MOVE-to-abs stores
+    // then point A7 at it: mem[0x2000] = 0x0004 (CCR word, Z=1), mem[0x2002] = target.
+    //   moveq#4,d0 ; move.w d0,(0x2000).w  (CCR word)
+    //   move.l #target,d1 ; move.l d1,(0x2002).l  (PC long)
+    //   move.l #0x2000,a7 ; rtr   (pop CCR+PC, A7 -> 0x2006, jump to target)
+    //   target: moveq#7,d2 ; .stop: bra .stop
+    // rtr restores CCR=0x04 (Z set) + redirects to target. Executed: moveq#4,
+    // move.w-store, move.l#target, move.l-store, move.l#0x2000-to-a7, rtr, moveq#7 = 7.
+    // A real RTR frame is stacked by the (long-committed) caller — resident in memory
+    // before RTR. Our test stacks it inline, so we (a) space the stores out and (b) read
+    // the frame line back into d4/d5 first, which refills the (no-allocate-store) line
+    // into L1D with the drained store data; RTR's two pops then HIT the resident line.
+    runLockStep("rtr-frame",
+      "moveq #4,%d0 ; move.w %d0,0x2000 ; move.l #target,%d1 ; move.l %d1,0x2002 ; " +
+      "move.l 0x2000,%d4 ; move.l 0x2002,%d5 ; " +
+      "move.l #0x2000,%a7 ; rtr ; target: moveq #7,%d2 ; .stop: bra .stop",
+      nInstr = 9, checkMem = Seq(0x2000L))
   }
 
   test("lock-step: backward bne.s loop (one backward taken)", VerilatorTest) {

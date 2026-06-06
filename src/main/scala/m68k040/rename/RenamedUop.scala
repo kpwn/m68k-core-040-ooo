@@ -18,6 +18,17 @@ case class RenamedUop() extends Bundle {
   val memOp        = MemOp()
   val useImm       = Bool();  val imm = Bits(32 bits)
   val isBranch     = Bool();  val cond = Bits(4 bits); val branchDisp = Bits(32 bits)
+  // Indirect / computed-target branch (JSR/JMP/RTS/RTR): target = psrcA + imm,
+  // unconditional redirect. Threaded from decode.
+  val ibranch      = Bool()
+  // Stack-pop postincrement folded into the trailing ibranch (RTS=4/RTR=6): when the
+  // ibranch has an int dst, the branch EU writes dst := psrcB + anInc. Threaded.
+  val anInc        = UInt(3 bits)
+  // Stack-push store (BSR/JSR): addr = psrcA - sizeBytes; data = imm; int dst (A7)
+  // := the predecremented address. Threaded from decode.
+  val stkPush      = Bool()
+  // RTR CCR-restore load: NZVC := loaded[3:0], X := loaded[4] (no int dst). Threaded.
+  val ccrRestore   = Bool()
   val unimplemented= Bool()
   // Precise-fault capture (exception slice 1): `faulted` + `faultVector` (4=illegal,
   // 8=privilege) threaded from decode; `isRte` marks a return-from-exception µop.

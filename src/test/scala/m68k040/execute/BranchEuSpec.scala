@@ -2,7 +2,7 @@ package m68k040.execute
 
 import m68k040.{M68kSim, VerilatorTest}
 import m68k040.execute.iq.IqContext
-import m68k040.execute.regfile.{NzvcRegFileService, RegFilePluginNzvc, RegFileReadPort, RegFileWritePort}
+import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, RegFilePluginInt, RegFilePluginNzvc, RegFileReadPort, RegFileWritePort}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -15,13 +15,18 @@ import org.scalatest.funsuite.AnyFunSuite
   */
 class BranchEuSourcePlugin extends FiberPlugin {
   var nzW: RegFileWritePort = null
+  // The branch EU now reads the int PRF (ibranch target base), so the int regfile
+  // is in the DUT and needs ≥1 write port for its init sweep. Own one (idle here).
+  var intW: RegFileWritePort = null
 
   during setup {
     nzW = host[NzvcRegFileService].newWrite(latency = 1)
+    intW = host[IntRegFileService].newWrite(latency = 1)
   }
 
   val logic = during build new Area {
     val eu = host[BranchEuService]
+    intW.valid := False; intW.address := 0; intW.data := 0
 
     // ---- issue inputs (sim-driven) ----
     val iValid    = in Bool ()
@@ -41,6 +46,7 @@ class BranchEuSourcePlugin extends FiberPlugin {
     uop.useImm       := False
     uop.imm          := 0
     uop.unimplemented:= False
+    uop.anInc := 0; uop.stkPush := False; uop.ccrRestore := False
     uop.dstArch      := 0
     uop.psrcA        := 0; uop.psrcAValid := False
     uop.psrcB        := 0; uop.psrcBValid := False
@@ -51,6 +57,7 @@ class BranchEuSourcePlugin extends FiberPlugin {
     uop.pXDst        := 0; uop.writesX := False; uop.pXOld := 0
     // branch fields
     uop.isBranch     := True
+    uop.ibranch      := False
     uop.cond         := iCond
     uop.pc           := iPc
     uop.branchDisp   := iDisp
@@ -84,10 +91,11 @@ class BranchEuSpec extends AnyFunSuite {
   class Dut extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
+    val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
     val eu     = new BranchEuPlugin
     val src    = new BranchEuSourcePlugin
-    db.on { host.asHostOf(Seq[FiberPlugin](rfNzvc, eu, src)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](rfInt, rfNzvc, eu, src)) }
   }
 
   // Reference condition table (matches the 68k Bcc encoding / Musashi ground truth).

@@ -25,7 +25,13 @@ object WhiteboxCapture {
     * Read `result` after the program drains. */
   /** A normal commit (Wb-backed) or an exception/RTE commit (SR/A7 directly). */
   private sealed trait Rec
-  private final case class NormRec(pc: Long, sysByte: Int, a7: Long, wb: Wb) extends Rec
+  // `emit` = produce a CommitObservation for this record. A DROPPED crack µop
+  // (temp-only load / DIVREM / stack-push store) sets emit=false: it does NOT add an
+  // oracle-aligned step, but its arch-reg write (e.g. a stack-push store's A7 = A7-4)
+  // STILL folds into the running architectural state (A7 + CCR) so the NEXT kept
+  // record carries it. `a7Static` is the ROB-surfaced ss.a7 (used only for exception
+  // steps / when no OoO A7 write has been seen).
+  private final case class NormRec(pc: Long, sysByte: Int, a7Static: Long, wb: Wb, emit: Boolean) extends Rec
   // ExcRec: an exception/trap ENTRY or RTE step. `foldNzvc` (>=0) folds the FAULTING
   // instruction's own NZVC write onto the running CCR before this step — needed for
   // CHK, which sets N as it traps but never retires normally (so its Wb is never
@@ -41,6 +47,9 @@ object WhiteboxCapture {
     /** Record an EU writeback (keyed by robId). */
     def onWb(robId: Int, wb: Wb): Unit = { wbMap(robId) = wb }
 
+    /** Debug-only: peek the last-observed wb for a robId (None if never observed). */
+    def peekWb(robId: Int): Option[Wb] = wbMap.get(robId)
+
     /** Record a retired NORMAL commit (robId + post-instruction pc + the committed
       * SR system byte + A7), snapshotting the committing instruction's writeback. A
       * cracked-load temp µop (arch ≥ 16, no flags) is DROPPED (decode §4.5). */
@@ -48,10 +57,12 @@ object WhiteboxCapture {
       val wb = wbMap.getOrElse(robId,
         sys.error(s"commit robId=$robId with no writeback observed"))
       val isTempOnly = wb.intWrite && wb.dstArch >= 16 && !wb.nzvcWrite && !wb.xWrite
-      // The DIVREM crack µop is part of the SAME architectural instruction as its DIV
-      // -> drop its commit record (one oracle step per instruction). Its Dr write is in
-      // the PRF and checked by a later reader.
-      if (!isTempOnly && !wb.divRem) commits += NormRec(pc, sysByte, a7, wb)
+      // DROP (emit=false) the crack µops that are NOT their own oracle step: a temp-only
+      // load (cracked load -> T0), the trailing DIVREM, and a stack-push store (the
+      // BSR/JSR leading push; its A7 write still folds). Their reg writes still fold
+      // into the running architectural A7/CCR (handled in `result`).
+      val emit = !isTempOnly && !wb.divRem
+      commits += NormRec(pc, sysByte, a7, wb, emit)
     }
 
     /** Record an exception / RTE "instruction" commit: the handler-entry / restored
@@ -64,24 +75,46 @@ object WhiteboxCapture {
       * 16-bit SR. */
     def result: Seq[CommitObservation] = {
       var ccr = 0 // running architectural CCR (X N Z V C), bit4..bit0
-      commits.toSeq.map {
-        case NormRec(pc, sysByte, a7, wb) =>
+      // Running architectural A7 (arch reg 15). Seeded lazily to the first surfaced
+      // ss.a7 (the boot SSP); thereafter it FOLLOWS OoO arch-15 writes (call/return,
+      // MOVE-to-A7) — the synthesizable ss.a7 only tracks EXCEPTION A7 changes, so the
+      // OoO A7 must be reconstructed from the whitebox writes here.
+      var a7Run: Long = -1L
+      // The committed ss.a7 (a7Static) tracks ONLY exception/RTE/boot A7 changes (the
+      // exc unit writes it + PRF arch-15). OoO arch-15 writes (call/return, MOVE-to-A7)
+      // are NOT in ss.a7; they are reconstructed from the whitebox arch-15 wb. So:
+      // resync a7Run to a7Static whenever a7Static CHANGES (exc/boot moved A7), and
+      // otherwise fold OoO arch-15 wb writes. (An OoO write leaves ss.a7 unchanged, so
+      // it never triggers a spurious resync.)
+      var lastA7Static: Long = -2L
+      commits.toSeq.flatMap {
+        case NormRec(pc, sysByte, a7Static, wb, emit) =>
+          if (a7Static >= 0 && a7Static != lastA7Static) { a7Run = a7Static & 0xffffffffL; lastA7Static = a7Static }
+          if (a7Run < 0 && a7Static >= 0) a7Run = a7Static & 0xffffffffL
           if (wb.nzvcWrite) ccr = (ccr & 0x10) | (wb.nzvc & 0xf)
           if (wb.xWrite)    ccr = (ccr & 0x0f) | ((wb.x & 1) << 4)
-          CommitObservation(
+          // Fold an arch-15 (A7) int write into the running A7 (even for a dropped
+          // crack µop like the stack-push store).
+          if (wb.intWrite && wb.dstArch == 15) a7Run = wb.result & 0xffffffffL
+          if (!emit) Nil
+          else Seq(CommitObservation(
             pc = pc, archRegId = wb.dstArch,
             archRegWrite = wb.result, archRegValid = wb.intWrite,
             ccr = ccr, memAddr = 0, memData = 0, memWrite = false,
-            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7)
+            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7Run))
         case ExcRec(pc, sysByte, a7, foldNzvc) =>
+          // An exception/RTE step uses the ROB-surfaced ss.a7 (the exc unit's banked
+          // A7); resync the running A7 to it (+ lastA7Static so the next NormRec, which
+          // carries the SAME ss.a7, does not re-resync over a subsequent OoO write).
+          if (a7 >= 0) { a7Run = a7 & 0xffffffffL; lastA7Static = a7 }
           // Fold the faulting instruction's own NZVC (CHK) onto the running CCR before
           // the entry step; -1 => no fold (the running CCR already reflects the
           // architectural state for TRAPV/DIV0/access-fault/interrupt/RTE).
           if (foldNzvc >= 0) ccr = (ccr & 0x10) | (foldNzvc & 0xf)
-          CommitObservation(
+          Seq(CommitObservation(
             pc = pc, archRegId = 0, archRegWrite = 0, archRegValid = false,
             ccr = ccr, memAddr = 0, memData = 0, memWrite = false,
-            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7)
+            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7))
       }
     }
   }

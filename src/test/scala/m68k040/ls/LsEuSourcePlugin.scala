@@ -31,6 +31,7 @@ class LsEuSourcePlugin extends FiberPlugin {
     val iImm     = in Bits (32 bits)                               // displacement
     val iPdst    = in UInt (6 bits); val iPdstValid  = in Bool ()  // load dst
     val iRobId   = in UInt (6 bits)
+    val iStkPush = in Bool ()                                      // stack-push store
     val iReady   = out Bool ()
 
     val ctx = IqContext()
@@ -41,6 +42,8 @@ class LsEuSourcePlugin extends FiberPlugin {
     uop.memOp        := iMemOp
     uop.op           := m68k040.decode.DecOp.MOVE
     uop.isBranch     := False
+    uop.ibranch      := False
+    uop.stkPush      := iStkPush
     uop.cond         := B(0)
     uop.branchDisp   := B(0)
     uop.unimplemented:= False

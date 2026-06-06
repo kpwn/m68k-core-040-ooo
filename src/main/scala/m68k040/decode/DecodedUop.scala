@@ -32,6 +32,18 @@ case class DecodedUop() extends Bundle {
   val readsNzvc    = Bool();       val readsX    = Bool()
   val writesNzvc   = Bool();       val writesX   = Bool()
   val isBranch     = Bool()
+  // Indirect / computed-target branch (JSR/JMP/RTS/RTR): when set, the branch EU
+  // forms its target from a SOURCE OPERAND (`psrcA + imm`) instead of `pc+2+disp`,
+  // and ALWAYS redirects (unconditional). For JSR/JMP psrcA is the EA base An (imm =
+  // displacement / folded absolute / folded PC) — a tiny AGU in the branch EU; for
+  // RTS/RTR psrcA is the popped target value (imm = 0). Default False (a plain Bcc/
+  // BRA/BSR forms pc+2+disp as before).
+  val ibranch      = Bool()
+  // Stack-pop postincrement folded into the trailing ibranch (RTS/RTR): when the
+  // ibranch has an int dst (dstReg = A7), the branch EU writes A7 := psrcB + anInc
+  // (psrcB = the pre-pop A7). anInc = 4 (RTS) / 6 (RTR: word CCR + long PC). 0 = no
+  // postinc (JSR/JMP — no An write). 3 bits hold 0/4/6. Default 0.
+  val anInc        = UInt(3 bits)
   val cond         = Bits(4 bits)
   val branchDisp   = Bits(32 bits)
   val unimplemented= Bool()
@@ -68,6 +80,19 @@ case class DecodedUop() extends Bundle {
   val divSigned    = Bool()
   val div64        = Bool()     // 64-bit dividend (Dr:Dq) form
   val divIsRem     = Bool()     // this µop is the trailing remainder-move (DIVREM)
+  // ── Stack-push store (BSR/JSR call: push return-PC to -(A7)) ────────────────
+  // A predecrement-store µop: address = base An (psrcA) - sizeBytes; the STORE DATA
+  // is the immediate (`imm` carries retPC = nextPc, NOT a displacement); and the
+  // µop's single int dst = the SAME predecremented address (the new A7) — a store
+  // has no data dst, so this lone int write is the A7 side-effect. Reuses one int
+  // dst + the imm field (no 2nd write port / no 2nd 32-bit field). Default False.
+  val stkPush      = Bool()
+  // ── RTR CCR-restore load (pop the saved CCR word) ──────────────────────────
+  // A LOAD µop that, instead of writing an int reg, RESTORES the CCR from the loaded
+  // word's low byte: NZVC := data[3:0], X := data[4]. RTR restores ONLY the CCR (SR
+  // low byte), never the system byte. The LS EU writes the renamed NZVC + X PRFs.
+  // Default False. (writesNzvc/writesX on this µop select the flag dests.)
+  val ccrRestore   = Bool()
   // Macro-instruction boundary marker: True for the FIRST µop of an instruction.
   // The cracker emits 1 or 2 µops/instruction; the only 2-µop case is a memSimple
   // source crack -> [load, op] where the LOAD is first. An interrupt may be taken

@@ -5,7 +5,7 @@ import m68k040.core.ParamPlugin
 import m68k040.cache.DcachePlugin
 import m68k040.decode.DecOp
 import m68k040.execute.LsEuPlugin
-import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc}
+import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
 import m68k040.isa.{Cluster, MemOp, Size}
 import m68k040.ls.{DFaultingTranslationPlugin, LsEuSourcePlugin, BehavioralMemAgent}
 import m68k040.rename.RenamedUop
@@ -34,11 +34,12 @@ class AccessFaultCaptureSpec extends AnyFunSuite {
     val param  = new ParamPlugin(M68kParams())
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
+    val rfX    = new RegFilePluginX     // LS EU now writes X for RTR CCR-restore
     val xlate  = new DFaultingTranslationPlugin
     val dcache = new DcachePlugin
     val eu     = new LsEuPlugin
     val src    = new LsEuSourcePlugin
-    db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, xlate, dcache, eu, src)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, xlate, dcache, eu, src)) }
   }
 
   test("LS EU: a faulting store emits faultCompletion (VA, write, size, super); no reg write", VerilatorTest) {
