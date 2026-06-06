@@ -775,6 +775,42 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 11)
   }
 
+  // ── Loop-with-load (the deadlock-fix milestone) ────────────────────────────
+  // A backward-branch loop whose BODY contains a memory op. The body load cracks
+  // into [load->T0, move T0->Dn]; the move ALSO writes NZVC. The cracked move
+  // pairs with the load in one rename group, so the loop's `sub` (the youngest
+  // NZVC writer before the loop-back branch) renames ALONE in slot 0 the next
+  // cycle. Pre-fix the RAT's multi-write spec Mem silently DROPPED slot-0-only
+  // writes (only the highest write port updated a 1-entry flag RAT), so the `sub`
+  // never updated the NZVC RAT and the loop-back `bne` read the STALE move-NZVC
+  // (Z=0) instead of the sub's (Z=1) -> the final not-taken bne mis-resolved as
+  // taken (extra wrong iteration / divergence). Lock-steps step-for-step + final
+  // mem so the regression is caught at the architectural level.
+  test("lock-step: backward loop with a LOAD in the body", VerilatorTest) {
+    // d2=42 stored to 0x2000 (so the body load reads a known value). d0=3 counter,
+    // d1=1 decrement. Body: load 0x2000->d3 ; sub d1,d0 ; bne .L.
+    //   iter1: 3-1=2 (Z=0) bne TAKEN, iter2: 2-1=1 bne TAKEN, iter3: 1-1=0 not taken.
+    // Two backward-taken mispredicts, each followed by a body load whose cracked
+    // flag-setting move splits the sub into a lone slot-0 rename.
+    // Executed: moveq#42, move.l(store), moveq#3, moveq#1, [load,sub,bne]x3 = 13.
+    runLockStep("loop-load",
+      "moveq #42,%d2 ; move.l %d2,0x2000 ; moveq #3,%d0 ; moveq #1,%d1 ; " +
+      ".L: move.l 0x2000,%d3 ; sub.l %d1,%d0 ; bne.s .L",
+      nInstr = 13, checkMem = Seq(0x2000L))
+  }
+
+  // A second loop-with-memory shape: a STORE in the body (the store also sets NZVC
+  // as MOVE-to-memory) followed by a flag-dependent loop-back branch. Exercises the
+  // same lone-slot-0 NZVC-RAT-write path with a store rather than a load.
+  test("lock-step: backward loop with a STORE in the body", VerilatorTest) {
+    // d0=3 counter, d1=1 dec, d2=7 value. Body: store d2->0x2010 ; sub d1,d0 ; bne.
+    // Executed: moveq#3, moveq#1, moveq#7, [store,sub,bne]x3 = 12.
+    runLockStep("loop-store",
+      "moveq #3,%d0 ; moveq #1,%d1 ; moveq #7,%d2 ; " +
+      ".L: move.l %d2,0x2010 ; sub.l %d1,%d0 ; bne.s .L",
+      nInstr = 12, checkMem = Seq(0x2010L))
+  }
+
   // ── Load/store lock-step (THE memory milestone) ────────────────────────────
   // All addresses use absolute modes (no An setup needed) and store BEFORE they
   // load, so the D-cache behavioral memory needs no preload. The store µop drains

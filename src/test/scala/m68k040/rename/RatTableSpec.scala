@@ -48,6 +48,34 @@ class RatTableSpec extends AnyFunSuite {
       assert(dut.io.reads(0).data.toInt == 21, "later write port wins WAW")
     }
   }
+  // ── Regression: the flag-RAT (archDepth=1) lone-slot-0 write bug ──────────────
+  // The NZVC/X RATs are 1-entry, 2-write-port tables where BOTH write ports always
+  // address arch 0. The old multi-write async-read Mem dropped write port 0: a lone
+  // slot-0 write never persisted (only the highest write port ever updated the
+  // cell). A later branch then read a STALE youngest-flag mapping -> the loop-with-
+  // load divergence. This pins that a write through port 0 ALONE is visible to a
+  // later read in the exact flag-RAT configuration.
+  def mk1 = RatTable(physIdWidth = 4, archDepth = 1, writePorts = 2, commitPorts = 2, readPorts = 2)
+  test("1-entry RAT: lone write port 0 persists to a later read", VerilatorTest) {
+    M68kSim().withVerilator.compile(mk1).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.rollback #= false; dut.io.writes.foreach(_.valid #= false); dut.io.commits.foreach(_.valid #= false)
+      dut.io.writes.foreach(_.addr #= 0); dut.io.commits.foreach(_.addr #= 0); dut.io.reads.foreach(_.addr #= 0)
+      dut.clockDomain.waitSampling()
+      // Cycle A: write port 1 alone -> p9 (mirrors the cracked move taking slot 1).
+      dut.io.writes(1).valid #= true; dut.io.writes(1).data #= 9
+      dut.clockDomain.waitSampling(); dut.io.writes(1).valid #= false
+      // Cycle B: write port 0 ALONE -> p10 (mirrors the sub renaming alone in slot 0).
+      dut.io.writes(0).valid #= true; dut.io.writes(0).data #= 10
+      dut.clockDomain.waitSampling(); dut.io.writes(0).valid #= false
+      // Idle a couple cycles (the bne reads several cycles later), then read.
+      dut.clockDomain.waitSampling(2)
+      dut.io.reads(0).addr #= 0; sleep(1)
+      assert(dut.io.reads(0).data.toInt == 10,
+        s"lone slot-0 write must win the youngest mapping, got p${dut.io.reads(0).data.toInt} (pre-fix: stale p9)")
+    }
+  }
+
   test("multi-port writes reconstruct via lowered banks (XOR)", VerilatorTest) {
     M68kSim().withVerilator.compile(mk).doSim { dut =>
       val cd = dut.clockDomain
