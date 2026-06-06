@@ -21,6 +21,9 @@ case class RenamedUop() extends Bundle {
   // Indirect / computed-target branch (JSR/JMP/RTS/RTR): target = psrcA + imm,
   // unconditional redirect. Threaded from decode.
   val ibranch      = Bool()
+  // Stack-pop postincrement folded into the trailing ibranch (RTS=4/RTR=6): when the
+  // ibranch has an int dst, the branch EU writes dst := psrcB + anInc. Threaded.
+  val anInc        = UInt(3 bits)
   // Stack-push store (BSR/JSR): addr = psrcA - sizeBytes; data = imm; int dst (A7)
   // := the predecremented address. Threaded from decode.
   val stkPush      = Bool()

@@ -96,7 +96,13 @@ object PredecodeWord {
       is(U(4, 4 bits)) {
         val isTrap  = op(15 downto 4) === B"12'h4E4"   // 0x4E4x
         val isTrapv = op === B"16'h4E76"
-        when(isTrap || isTrapv) {
+        // RTS (0x4E75) / RTR (0x4E77): single-word RETURN instructions cracked into a
+        // pop + an indirect branch. Predecode SIMPLE length-1 so the aligner frames the
+        // next instruction correctly (the RTS/RTR commit PC is the redirect target, so
+        // nextPc itself is unused — but the length must be right for fetch framing).
+        val isRts   = op === B"16'h4E75"
+        val isRtr   = op === B"16'h4E77"
+        when(isTrap || isTrapv || isRts || isRtr) {
           r.simple   := True
           r.lenWords := U(1, 3 bits)
         }

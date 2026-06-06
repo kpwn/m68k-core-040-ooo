@@ -76,7 +76,7 @@ object MicroOpAssembler {
     opUop.useImm        := False; opUop.imm    := 0
     opUop.readsNzvc     := spec.readsNzvc; opUop.readsX := spec.readsX
     opUop.writesNzvc    := spec.writesNzvc; opUop.writesX := spec.writesX
-    opUop.isBranch      := spec.isBranch; opUop.ibranch := False; opUop.stkPush := False; opUop.cond := spec.cond
+    opUop.isBranch      := spec.isBranch; opUop.ibranch := False; opUop.stkPush := False; opUop.anInc := 0; opUop.cond := spec.cond
     opUop.branchDisp    := 0
     opUop.unimplemented := False
     opUop.faulted       := False
@@ -185,7 +185,7 @@ object MicroOpAssembler {
     ldUop.imm           := Mux(srcEa.pcRel, pcRelAddr, srcEa.disp)
     ldUop.readsNzvc     := False; ldUop.readsX := False
     ldUop.writesNzvc    := False; ldUop.writesX := False
-    ldUop.isBranch      := False; ldUop.ibranch := False; ldUop.stkPush := False; ldUop.cond := 0
+    ldUop.isBranch      := False; ldUop.ibranch := False; ldUop.stkPush := False; ldUop.anInc := 0; ldUop.cond := 0
     ldUop.branchDisp    := 0
     ldUop.unimplemented := False
     ldUop.faulted       := False; ldUop.faultVector := 0; ldUop.isRte := False
@@ -218,7 +218,7 @@ object MicroOpAssembler {
     stUop.imm           := Mux(dstEa.pcRel, stPcRelAddr, dstEa.disp)
     stUop.readsNzvc     := False; stUop.readsX := False
     stUop.writesNzvc    := True;  stUop.writesX := False   // MOVE to memory sets NZVC
-    stUop.isBranch      := False; stUop.ibranch := False; stUop.stkPush := False; stUop.cond := 0
+    stUop.isBranch      := False; stUop.ibranch := False; stUop.stkPush := False; stUop.anInc := 0; stUop.cond := 0
     stUop.branchDisp    := 0
     stUop.unimplemented := False
     stUop.faulted       := False; stUop.faultVector := 0; stUop.isRte := False
@@ -261,7 +261,11 @@ object MicroOpAssembler {
     // classifies (An)/(d16,An)/(xxx)/(d16,PC) as MEMSIMPLE; indexed/predec/postinc are
     // MEMCOMPLEX, reg-direct DATAREG/ADDRREG, imm IMM). So a valid control EA == srcIsMem.
     val ctrlEaOk = srcIsMem
+    // RTS (0x4E75) / RTR (0x4E77) are line-4 returns cracked below (NOT illegal).
+    val isRtsBad = (op === B"16'h4E75")
+    val isRtrBad = (op === B"16'h4E77")
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isJmpOp &&
+              !isRtsBad && !isRtrBad &&
               (!pkt.simple || spec.illegal || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     // A JMP with a non-control EA is illegal (vector 4).
     val jmpBad = isJmpOp && !ctrlEaOk
@@ -400,7 +404,7 @@ object MicroOpAssembler {
     divlUop.dstReg        := divlDq; divlUop.dstValid := True              // quotient -> Dq
     divlUop.readsNzvc     := False; divlUop.readsX := False
     divlUop.writesNzvc    := True;  divlUop.writesX := False               // DIV sets N/Z/V
-    divlUop.isBranch      := False; divlUop.ibranch := False; divlUop.stkPush := False; divlUop.cond := 0; divlUop.branchDisp := 0
+    divlUop.isBranch      := False; divlUop.ibranch := False; divlUop.stkPush := False; divlUop.anInc := 0; divlUop.cond := 0; divlUop.branchDisp := 0
     divlUop.unimplemented := False
     divlUop.faulted       := False; divlUop.faultVector := 0; divlUop.isRte := False
     divlUop.faultUsesNextPc := True            // DIV0 stacks nextPc (group-2 format-$2)
@@ -430,7 +434,7 @@ object MicroOpAssembler {
     divremUop.dstReg        := divlDr; divremUop.dstValid := True          // remainder -> Dr
     divremUop.readsNzvc     := False; divremUop.readsX := False
     divremUop.writesNzvc    := False; divremUop.writesX := False
-    divremUop.isBranch      := False; divremUop.ibranch := False; divremUop.stkPush := False; divremUop.cond := 0; divremUop.branchDisp := 0
+    divremUop.isBranch      := False; divremUop.ibranch := False; divremUop.stkPush := False; divremUop.anInc := 0; divremUop.cond := 0; divremUop.branchDisp := 0
     divremUop.unimplemented := False
     divremUop.faulted       := False; divremUop.faultVector := 0; divremUop.isRte := False
     divremUop.faultUsesNextPc := False
@@ -478,6 +482,7 @@ object MicroOpAssembler {
     ibrUop.readsNzvc     := False; ibrUop.readsX := False
     ibrUop.writesNzvc    := False; ibrUop.writesX := False
     ibrUop.isBranch      := True;  ibrUop.ibranch := True
+    ibrUop.stkPush       := False; ibrUop.anInc := 0    // JMP: no An postinc (JSR/RTS override)
     ibrUop.cond          := 0;     ibrUop.branchDisp := 0
     ibrUop.unimplemented := False
     ibrUop.faulted       := False; ibrUop.faultVector := 0; ibrUop.isRte := False
@@ -496,6 +501,88 @@ object MicroOpAssembler {
       opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
       opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
     }
+
+    // ── Call/return µop builder: every field assigned EXACTLY ONCE (SpinalHDL flags an
+    // unconditional reassignment as an ASSIGNMENT OVERLAP), so the varying fields are
+    // parameters with safe defaults. Used by the BSR/JSR/RTS/RTR cracks.
+    val A7 = 15
+    def mkUop(cluster: Cluster.C = Cluster.INT, memOp: MemOp.C = MemOp.NONE,
+              srcAReg: UInt = U(0, 5 bits), srcAValid: Bool = False,
+              srcBReg: UInt = U(0, 5 bits), srcBValid: Bool = False,
+              dstReg: UInt = U(0, 5 bits),  dstValid: Bool = False,
+              useImm: Bool = False, imm: Bits = B(0, 32 bits),
+              isBranch: Bool = False, ibranch: Bool = False, stkPush: Bool = False,
+              anInc: UInt = U(0, 3 bits), cond: Bits = B(0, 4 bits),
+              branchDisp: Bits = B(0, 32 bits), first: Bool = True): DecodedUop = {
+      val u = DecodedUop()
+      u.valid := pkt.valid; u.pc := pkt.pc; u.nextPc := nextPc
+      u.op := DecOp.MOVE; u.cluster := cluster; u.size := Size.LONG; u.memOp := memOp
+      u.srcAReg := srcAReg; u.srcAValid := srcAValid
+      u.srcBReg := srcBReg; u.srcBValid := srcBValid
+      u.srcCReg := 0; u.srcCValid := False
+      u.dstReg := dstReg;  u.dstValid := dstValid
+      u.useImm := useImm; u.imm := imm
+      u.readsNzvc := False; u.readsX := False; u.writesNzvc := False; u.writesX := False
+      u.isBranch := isBranch; u.ibranch := ibranch; u.stkPush := stkPush; u.anInc := anInc
+      u.cond := cond; u.branchDisp := branchDisp
+      u.unimplemented := False
+      u.faulted := False; u.faultVector := 0; u.faultUsesNextPc := False
+      u.faultAddr := pkt.pc; u.sswInstr := False; u.isRte := False; u.isTrapv := False
+      u.divSigned := False; u.div64 := False; u.divIsRem := False
+      u.firstOfInstr := first
+      u
+    }
+
+    // ── BSR (0x61xx) — crack into [push.l retPC -> -(A7)] + [bra pc+2+disp]. ──────
+    // The push store (stkPush) writes A7 := A7-4 + stores retPC; the branch is an
+    // UNCONDITIONAL PC-relative branch (cond=T) to pc+2+disp. (Line-6 BSR's opword
+    // cond field is 1=F, so the plain branch path would never take it — we crack here
+    // BEFORE the branch path and force cond=T.) The branch carries the architectural
+    // commit PC; the push store is the FIRST µop, the branch the macro boundary's
+    // single architectural op.
+    // PUSH-store µop: stkPush store, addr = An - sizeBytes, data = retPc, int dst (An)
+    // = the predecremented address. Used by BSR (here) + JSR (Task 5).
+    def pushUop(an: Int, retPc: Bits, first: Bool): DecodedUop =
+      mkUop(cluster = Cluster.LS, memOp = MemOp.STORE, stkPush = True,
+            srcAReg = U(an, 5 bits), srcAValid = True,    // base An (A7)
+            dstReg  = U(an, 5 bits), dstValid  = True,    // new A7 = A7-4
+            useImm  = True, imm = retPc, first = first)   // store data = retPC
+    // POP-load µop: load.l (An + disp) -> a temp dst.
+    def popUop(an: Int, disp: Int, dst: Int, first: Bool): DecodedUop =
+      mkUop(cluster = Cluster.LS, memOp = MemOp.LOAD,
+            srcAReg = U(an, 5 bits), srcAValid = True,
+            useImm  = True, imm = S(disp, 32 bits).asBits,
+            dstReg  = U(dst, 5 bits), dstValid = True, first = first)
+    // RETURN ibranch: ibranch -> tgt (psrcA + 0), folding An += inc (psrcB=An, dst=An,
+    // anInc=inc). Used by RTS/RTR.
+    def retBranchUop(tgt: Int, an: Int, inc: Int): DecodedUop =
+      mkUop(isBranch = True, ibranch = True,
+            srcAReg = U(tgt, 5 bits), srcAValid = True,   // target = tgt + 0
+            useImm  = True, imm = B(0, 32 bits),
+            srcBReg = U(an, 5 bits),  srcBValid = True,    // postinc base = An
+            dstReg  = U(an, 5 bits),  dstValid = True,     // new A7 = A7 + inc
+            anInc = U(inc, 3 bits), first = False)
+
+    val isBsr = (op(15 downto 8) === B"8'h61")
+    val bsrDisp = {
+      val disp8 = op(7 downto 0)
+      val d = Bits(32 bits)
+      when(disp8 === 0x00) { d := pkt.words(1).asSInt.resize(32).asBits }
+        .elsewhen(disp8 === M"11111111") { d := pkt.words(1) ## pkt.words(2) }
+        .otherwise { d := disp8.asSInt.resize(32).asBits }
+      d
+    }
+    val bsrPush   = pushUop(A7, nextPc.asBits, first = True)
+    val bsrBranch = mkUop(isBranch = True, cond = B(0, 4 bits),    // unconditional BRA
+                          branchDisp = bsrDisp, first = False)
+
+    // ── RTS (0x4E75) — crack into [load.l (A7) -> T0] + [ibranch -> T0 ; A7 += 4]. ─
+    // The pop load reads (A7) into T0 (a temp); the trailing ibranch redirects to T0
+    // and folds the A7 += 4 postincrement. The ibranch depends on the load's T0
+    // (dynamic LS wakeup; the IQ tracks the load's pdst via lsBusy/lsWakeup).
+    val isRtsOp   = (op === B"16'h4E75")
+    val rtsLoad   = popUop(A7, disp = 0, dst = T0, first = True)
+    val rtsBranch = retBranchUop(tgt = T0, an = A7, inc = 4)
 
     // ── Sequence selection (each slot driven exactly once) ─────────────────────
     // pkt.fault  -> [op] (fetch fault delivery)
@@ -533,6 +620,16 @@ object MicroOpAssembler {
       out.count   := 1
       out.uops(0) := Mux(jmpBad, opUop, ibrUop)
       out.uops(1) := Mux(jmpBad, opUop, ibrUop)
+    } elsewhen(isBsr) {
+      // BSR -> [push.l retPC -> -(A7)] + [bra pc+2+disp].
+      out.count   := 2
+      out.uops(0) := bsrPush
+      out.uops(1) := bsrBranch
+    } elsewhen(isRtsOp) {
+      // RTS -> [load.l (A7) -> T0] + [ibranch -> T0 ; A7 += 4].
+      out.count   := 2
+      out.uops(0) := rtsLoad
+      out.uops(1) := rtsBranch
     } elsewhen(crackStore) {
       out.count   := 1
       out.uops(0) := stUop

@@ -36,6 +36,7 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // violation; matches IcachePlugin.cmdPort convention).
     val feed          = Stream(Vec(DecodePacket(), 2))   // producer drives valid/payload; consumer drives ready
     spinal.core.sim.SimPublic(feed.valid, feed.ready, feed.payload(0).pc)
+    spinal.core.sim.SimPublic(feed.payload(0).simple, feed.payload(0).lenWords)
     val slot1ValidOut = out(Bool())
     val slot1Valid    = slot1ValidOut   // alias for testbench access via logic.slot1Valid
     val redirect      = slave(Flow(UInt(32 bits)))
@@ -72,9 +73,11 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // Track whether the next rsp should drop leading words (set on redirect/resume)
     val dropPending = Reg(Bool()) init False
     val dropCount   = Reg(UInt(2 bits)) init 0      // words to drop (0..3)
+    spinal.core.sim.SimPublic(dropCount, dropPending)
 
     // Track whether the in-flight fetch is stale (redirect/resume happened after cmd fired)
     val rspStale = Reg(Bool()) init False
+    spinal.core.sim.SimPublic(rspStale, fetchInFlight)
 
     // ---- Default-drive IBuf inputs ----
     ibuf.io.push.valid   := False
@@ -147,6 +150,7 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
 
     // ---- Aligner: combinational decode of buffer head ----
     val res = Aligner.align(decodePc, ibuf.io.head, ibuf.io.headPred, ibuf.io.avail)
+    spinal.core.sim.SimPublic(ibuf.io.headPred(0).simple, ibuf.io.head(0))
 
     // ---- Feed valid logic ----
     // Emit when a packet is at head and not stalled. Complex packets emit once:
@@ -205,10 +209,23 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       // Drop leading words on the next rsp: startWord = newPc[2:1] (word index within 8-byte window)
       dropPending    := True
       dropCount      := newPc(2 downto 1)
-      // Mark any in-flight rsp as stale
-      when(fetchInFlight) {
+      // Mark any in-flight rsp as stale. CRITICAL: do NOT clear fetchInFlight here —
+      // the stale fetch is still PHYSICALLY in flight (its response is coming). Clearing
+      // it would let a NEW fetch issue immediately, creating TWO outstanding fetches
+      // that the single fetchInFlight/rspStale/dropPending bits cannot track — the
+      // dropCount then leaks onto the WRONG window (a misaligned head on a redirect to
+      // a mid-window address, e.g. a subroutine entry right after a .w branch's disp
+      // word). Keep fetchInFlight=True; the stale response (handled below) clears it,
+      // and only THEN does the post-redirect fetch issue + consume dropPending.
+      //
+      // CRITICAL guard `!ic.rsp.valid`: if the in-flight fetch's response ARRIVES THIS
+      // cycle (fif transitions true->false at line 113, and ibuf.flush discards its
+      // enqueue), there is no longer a stale fetch to track — setting rspStale here
+      // would WRONGLY mark the NEXT (post-redirect) fetch stale, discarding it and
+      // leaking dropPending onto the fetch AFTER that (the misaligned-head bug). Only
+      // mark stale a fetch whose response has NOT yet arrived.
+      when(fetchInFlight && !ic.rsp.valid) {
         rspStale      := True
-        fetchInFlight := False
       }
     }
 
@@ -221,9 +238,8 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       stalled        := False
       dropPending    := True
       dropCount      := newPc(2 downto 1)
-      when(fetchInFlight) {
-        rspStale      := True
-        fetchInFlight := False
+      when(fetchInFlight && !ic.rsp.valid) {
+        rspStale      := True   // keep fetchInFlight (see redirect block) — single-outstanding
       }
     }
 
@@ -249,9 +265,8 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       faultEmitted   := False
       dropPending    := True
       dropCount      := newPc(2 downto 1)
-      when(fetchInFlight) {
-        rspStale      := True
-        fetchInFlight := False
+      when(fetchInFlight && !ic.rsp.valid) {
+        rspStale      := True   // keep fetchInFlight (see redirect block) — single-outstanding
       }
     }
   }

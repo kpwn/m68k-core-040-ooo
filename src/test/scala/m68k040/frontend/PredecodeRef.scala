@@ -51,6 +51,9 @@ object PredecodeRef {
         // Other line-4 opcodes stay complex.
         val isTrap  = (op & 0xfff0) == 0x4e40
         val isTrapv = op == 0x4e76
+        // RTS (0x4E75) / RTR (0x4E77): single-word return instructions (simple len-1).
+        val isRts   = op == 0x4e75
+        val isRtr   = op == 0x4e77
         // CHK.W/CHK.L (0100 ddd 1 s 0 mmmrrr): bit8=1, bit6=0; bound is an EA source
         // (sizeL = .L when bit7=0). 1 opword + the EA extension words.
         val isChk = ((op >> 8) & 1) == 1 && ((op >> 6) & 1) == 0
@@ -62,7 +65,7 @@ object PredecodeRef {
         // (An)=2, (d16,An)=5, (xxx).W/.L/(d16,PC)=mode7 reg0/1/2.
         val isJmp = ((op >> 6) & 0x3ff) == 0x13b
         val isJsr = ((op >> 6) & 0x3ff) == 0x13a
-        if (isTrap || isTrapv) CP(simple = true, lenWords = 1)
+        if (isTrap || isTrapv || isRts || isRtr) CP(simple = true, lenWords = 1)
         else if (isChk) {
           val sizeL   = ((op >> 7) & 1) == 0
           val srcMode = (op >> 3) & 7; val srcReg = op & 7

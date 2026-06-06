@@ -330,6 +330,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // A7 — e.g. a following push/pop — waits on it). `compWakes` gates the wakeup for
     // BOTH a load and a stkPush store; `compStkPush` selects the int write (= s1Va).
     val compWakes     = RegInit(False)
+    // A STACK-PUSH store is a CRACK µop of BSR/JSR (the macro instruction's single
+    // architectural commit is the trailing branch). The lock-step whitebox DROPS its
+    // commit record (like DIVREM) but STILL folds its A7 write into the running A7.
+    val compStkPush   = RegInit(False)
     val compDstArch   = Reg(UInt(5 bits))
     // NZVC writeback for a MOVE-to-memory store (N/Z of the moved value, V=C=0).
     val compNzvc      = Reg(Bits(4 bits))
@@ -408,6 +412,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compPdstValid := u1.pdstValid
       compIsLoad    := isLoad
       compWakes     := isLoad || u1.stkPush     // both produce an int reg -> wake
+      compStkPush   := u1.stkPush
       compDstArch   := u1.dstArch
       // A MOVE store carries writesNzvc -> compute + write the renamed NZVC PRF.
       // (Loads do not write NZVC: u1.writesNzvc is False for the load µop.)
@@ -429,6 +434,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compNzvcWrite := False
       compIsLoad    := False
       compWakes     := False
+      compStkPush   := False
       compIsFault   := True
       compFaultAddr := s1Va
       compFaultWr   := isStore
@@ -471,7 +477,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     faultCompletionPort.payload.sizeBits   := compFaultSize
     faultCompletionPort.payload.supervisor := compFaultSup
 
-    val busy = RegInit(False)
+    val busy = RegInit(False); busy.simPublic(); s1Valid.simPublic()
     // Single-outstanding: do not accept a new µop while a decision is pending
     // (s1Valid), a load is in flight (busy), or a registered completion is occupying
     // the writeback stage this cycle (compValid). compValid is a 1-cycle pulse, so
@@ -662,7 +668,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     wbObs.nzvcWrite := compNzvcWrite     // True only for a MOVE-to-memory store
     wbObs.x         := False
     wbObs.xWrite    := False
-    wbObs.divRem    := False
+    // Reuse `divRem` as the generic "crack µop — DROP this commit record" marker: a
+    // stack-push store is the leading crack µop of BSR/JSR (the trailing branch is the
+    // macro instruction's single commit). Its A7 write is still folded into running A7.
+    wbObs.divRem    := compStkPush
     wbObs.simPublic()
 
     // ── Exception-unit cache arbitration MUX (LAST drivers — override the LS EU's
