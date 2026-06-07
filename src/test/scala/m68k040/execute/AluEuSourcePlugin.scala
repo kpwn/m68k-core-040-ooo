@@ -1,22 +1,24 @@
 package m68k040.execute
 
 import m68k040.execute.iq.IqContext
-import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService}
+import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, XRegFileService}
 import m68k040.decode.DecOp
 import m68k040.isa.Size
 import spinal.core._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
 
-/** Drives AluEu.issue from IO; provides int+NZVC PRF read ports to observe results. */
+/** Drives AluEu.issue from IO; provides int+NZVC+X PRF read ports to observe results. */
 class AluEuSourcePlugin extends FiberPlugin {
   import m68k040.execute.regfile.{RegFileReadPort}
   var obsInt: RegFileReadPort = null
   var obsNzvc: RegFileReadPort = null
+  var obsX: RegFileReadPort = null
 
   during setup {
     obsInt  = host[IntRegFileService].newRead(forceNoBypass = true)
     obsNzvc = host[NzvcRegFileService].newRead(forceNoBypass = true)
+    obsX    = host[XRegFileService].newRead(forceNoBypass = true)
   }
 
   val logic = during build new Area {
@@ -35,6 +37,11 @@ class AluEuSourcePlugin extends FiberPlugin {
     val iWritesX  = in Bool ();       val iPXDst      = in UInt (4 bits)
     val iRobId    = in UInt (6 bits)
     val iReady    = out Bool ()
+    // shift / CCR-RMW / flag-source controls (slow path)
+    val iShiftOp  = in Bits (2 bits); val iShiftDir = in Bool ()
+    val iToCcr    = in Bool ()
+    val iReadsNz  = in Bool ();        val iPNzvcSrc  = in UInt (4 bits)
+    val iReadsX   = in Bool ();        val iPXSrc     = in UInt (4 bits)
 
     val ctx = IqContext()
     val uop = ctx.uop
@@ -49,9 +56,9 @@ class AluEuSourcePlugin extends FiberPlugin {
     uop.ibranch := False; uop.anInc := 0; uop.stkPush := False; uop.ccrRestore := False
     uop.dstArch      := U(0)
     uop.pdstOld      := U(0)
-    uop.pNzvcSrc     := U(0); uop.readsNzvc := False
+    uop.pNzvcSrc     := iPNzvcSrc; uop.readsNzvc := iReadsNz
     uop.pNzvcOld     := U(0)
-    uop.pXSrc        := U(0); uop.readsX     := False
+    uop.pXSrc        := iPXSrc; uop.readsX     := iReadsX
     uop.pXOld        := U(0)
     uop.op        := iOp
     uop.size      := iSize
@@ -63,6 +70,20 @@ class AluEuSourcePlugin extends FiberPlugin {
     uop.pdst      := iPdst;  uop.pdstValid  := iPdstValid
     uop.writesNzvc := iWritesNz; uop.pNzvcDst := iPNzvcDst
     uop.writesX    := iWritesX;  uop.pXDst    := iPXDst
+    uop.shiftOp    := iShiftOp;  uop.shiftDir := iShiftDir
+    uop.toCcr      := iToCcr
+    // remaining RenamedUop fields (defaults; not exercised by the ALU EU directly).
+    uop.nextPc       := U(0)
+    uop.memOp        := m68k040.isa.MemOp.NONE
+    uop.faulted      := False; uop.faultVector := U(0); uop.isRte := False
+    uop.faultUsesNextPc := False
+    uop.isTrapv      := False
+    uop.faultAddr    := U(0); uop.sswInstr := False
+    uop.divSigned    := False; uop.div64 := False; uop.divIsRem := False
+    uop.extByte      := False
+    uop.isMovea      := False
+    uop.isScc        := False; uop.isDbcc := False
+    uop.firstOfInstr := False
     ctx.robId := iRobId
     eu.issue.valid   := iValid
     eu.issue.payload := ctx
@@ -78,5 +99,7 @@ class AluEuSourcePlugin extends FiberPlugin {
     val obsIntData  = out Bits (32 bits); obsIntData := obsInt.data
     val obsNzvcAddr = in UInt (4 bits); obsNzvc.addr := obsNzvcAddr
     val obsNzvcData = out Bits (4 bits); obsNzvcData := obsNzvc.data
+    val obsXAddr    = in UInt (4 bits); obsX.addr := obsXAddr
+    val obsXData    = out Bits (1 bits); obsXData := obsX.data
   }
 }
