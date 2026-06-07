@@ -96,10 +96,16 @@ object WhiteboxCapture {
           // Fold an arch-15 (A7) int write into the running A7 (even for a dropped
           // crack µop like the stack-push store).
           if (wb.intWrite && wb.dstArch == 15) a7Run = wb.result & 0xffffffffL
+          // A TEMP destination (arch >= 16, e.g. the mem-dest RMW op µop -> T1) is NOT
+          // architectural: emit the step (it carries the instruction PC + the folded
+          // CCR — the RMW's flags), but force archRegValid=False so the comparator does
+          // NOT index a non-existent oracle register (D/A are 0..15). The memory effect
+          // is checked separately via checkMem.
+          val isTemp = wb.intWrite && wb.dstArch >= 16
           if (!emit) Nil
           else Seq(CommitObservation(
-            pc = pc, archRegId = wb.dstArch,
-            archRegWrite = wb.result, archRegValid = wb.intWrite,
+            pc = pc, archRegId = if (isTemp) 0 else wb.dstArch,
+            archRegWrite = if (isTemp) 0L else wb.result, archRegValid = wb.intWrite && !isTemp,
             ccr = ccr, memAddr = 0, memData = 0, memWrite = false,
             sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7Run))
         case ExcRec(pc, sysByte, a7, foldNzvc) =>

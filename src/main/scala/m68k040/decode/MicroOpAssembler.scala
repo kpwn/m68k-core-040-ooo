@@ -49,6 +49,24 @@ object MicroOpAssembler {
                      pkt.words(1) ## pkt.words(2),
                      pkt.words(1).asSInt.resize(32).asBits)
 
+    // Line-0 immediate mem-dest RMW (ADDI/.../EORI/CMPI #imm,<ea>): the EA's OWN
+    // extension words follow the immediate (1 word for .B/.W, 2 for .L), NOT at
+    // words(1). Re-decode the EA from a SHIFTED words vector so its disp/abs come from
+    // the right offset (same shape as the DIV.L/MUL.L re-decode). `immEa` is used ONLY
+    // for the RMW load/store ADDRESS when the op is a line-0 immediate; the plain
+    // `srcEa` (words(1)-based) still drives the operand CLASS (mode/reg are offset-
+    // independent) and every non-immediate path.
+    val immIsLong = spec.size === Size.LONG
+    val immEa = EaDecoder.decode(
+      op(5 downto 0), spec.size,
+      Mux(immIsLong, Vec(pkt.words(0), pkt.words(3), pkt.words(4)),    // .L: imm = words(1..2)
+                     Vec(pkt.words(0), pkt.words(2), pkt.words(3))))   // .B/.W: imm = words(1)
+    // The EA descriptor for the RMW load/store ADDRESS: immEa for a line-0 immediate
+    // (its ext follows the imm), srcEa otherwise. (klass/base/baseValid/pcRel are
+    // offset-independent and identical; only `disp` differs.)
+    val opIsLineImm = spec.srcB.kind === OperandKind.IMMEXT
+    val rmwEaDisp = Mux(opIsLineImm, immEa.disp, srcEa.disp)
+
     // ── Operand classification ───────────────────────────────────────────────
     val srcIsReg = (srcEa.klass === EaClass.DATAREG) || (srcEa.klass === EaClass.ADDRREG)
     val srcIsMem = (srcEa.klass === EaClass.MEMSIMPLE)
@@ -68,7 +86,26 @@ object MicroOpAssembler {
     val isLine4Unary = spec.op === DecOp.CLR || spec.op === DecOp.NEG || spec.op === DecOp.NEGX ||
                        spec.op === DecOp.NOT || spec.op === DecOp.TST || spec.op === DecOp.SWAP ||
                        spec.op === DecOp.EXT || spec.op === DecOp.TAS
-    val crackLoad = usesSrcEa && srcIsMem && !isAddqSubq && !isLine4Unary
+
+    // ── Memory-destination RMW (MEMSIMPLE EAs) ─────────────────────────────────
+    // For ADD/SUB/AND/OR/EOR Dn,<ea> + ADDI/.../EORI #imm,<ea> + ADDQ/SUBQ #n,<ea> +
+    // CLR/NEG/NEGX/NOT/TST <ea>, OperationDecoder names the EA as BOTH srcA (read) AND
+    // dst (written back) via the EASRC role (spec.dst.kind == EASRC). When that EA is
+    // MEMSIMPLE we crack a memory RMW:
+    //   crackRmw      : [load.sz <ea> -> T0] [op (T0 + Dn/#imm) -> T1 + flags] [store.sz T1 -> <ea>]
+    //   crackLoadOnly : [load.sz <ea> -> T0] [op (flags only)]                 (TST / CMPI / CMP-mem; NO store)
+    //   crackClr      : [CLR -> T1 (=0) + Z/N flags]                            [store.sz T1 -> <ea>] (NO load)
+    // The EA is op[5:0] = `srcEa` (the SAME descriptor for load and store: MEMSIMPLE has
+    // no side effect, so both recompute base+disp identically). SWAP/EXT/TAS are Dn-only
+    // (TAS-mem deferred) -> a memory EA there stays illegal (line4UnaryMemBad below).
+    val eaIsDst       = (spec.dst.kind === OperandKind.EASRC)
+    val rmwOpInScope  = !(spec.op === DecOp.SWAP || spec.op === DecOp.EXT || spec.op === DecOp.TAS)
+    val memDest       = srcIsMem && eaIsDst && rmwOpInScope
+    val crackClr      = memDest && (spec.op === DecOp.CLR)
+    val crackLoadOnly = memDest && !spec.dstWrites                       // TST / CMPI / CMP-mem (no store)
+    val crackRmw      = memDest && spec.dstWrites && !crackClr           // load-op-store
+    // The generic memSimple-SOURCE load crack: a TRUE source EA (NOT a mem destination).
+    val crackLoad = usesSrcEa && srcIsMem && !isAddqSubq && !isLine4Unary && !memDest
 
     // MOVE reg -> memSimple destination -> a single STORE µop (data = the register
     // source). Mem-to-mem (source also memSimple) is deferred. RMW (ALU op with a
@@ -123,10 +160,12 @@ object MicroOpAssembler {
     when(spec.op === DecOp.CHK || spec.op === DecOp.DIV) {
       opUop.faultUsesNextPc := True
     }
-    // The op µop is the FIRST µop of its instruction EXCEPT when it is the trailing
-    // op of a 2-µop memSimple-source crack ([load, op]) — i.e. when crackLoad. (For
-    // every other path opUop is uops(0), the macro-instruction boundary.)
-    opUop.firstOfInstr  := !crackLoad
+    // The op µop is the FIRST µop of its instruction EXCEPT when a LOAD precedes it:
+    // a memSimple-source crack ([load, op]) OR a mem-dest RMW / load-only crack
+    // ([load, op, (store)]). For crackClr the op IS first (no leading load). (For every
+    // other path opUop is uops(0), the macro-instruction boundary.)
+    val opHasLeadingLoad = crackLoad || crackRmw || crackLoadOnly
+    opUop.firstOfInstr  := !opHasLeadingLoad
 
     // --- srcA slot ---
     switch(spec.srcA.kind) {
@@ -179,7 +218,10 @@ object MicroOpAssembler {
       }
       is(OperandKind.EASRC) {
         when(srcEa.klass =/= EaClass.IMM) {
-          when(srcIsMem) { opUop.dstReg := U(T0, 5 bits) } .otherwise { opUop.dstReg := srcEa.reg }
+          // memDest (RMW/CLR): the op result -> T1 (the trailing store reads T1, then
+          // recomputes the EA). Otherwise (a data-reg EA destination) -> the EA register.
+          when(memDest) { opUop.dstReg := U(T1, 5 bits) }
+            .elsewhen(srcIsMem) { opUop.dstReg := U(T0, 5 bits) } .otherwise { opUop.dstReg := srcEa.reg }
           opUop.dstValid := True
         }
       }
@@ -188,6 +230,13 @@ object MicroOpAssembler {
     }
     when(spec.dst.kind =/= OperandKind.NONE && spec.dstWrites) { opUop.dstValid := True }
     when(spec.dst.kind =/= OperandKind.NONE && !spec.dstWrites) { opUop.dstValid := False } // CMP/CMPA
+
+    // CLR mem-dest crack: the op writes 0 (no load precedes it), so it must NOT read T0
+    // (there is no producing load). Drop the srcA/srcB reads — CLR ignores its input.
+    when(crackClr) {
+      opUop.srcAValid := False
+      opUop.srcBValid := False
+    }
 
     // ── Line-E shift/rotate operand routing (DecOp.SHIFT) ──────────────────────
     // Fixed-field operands: srcA = dst = Dr (op[2:0], the shifted data reg). Count:
@@ -279,8 +328,10 @@ object MicroOpAssembler {
     ldUop.srcCReg       := 0;          ldUop.srcCValid := False
     ldUop.dstReg        := U(T0, 5 bits); ldUop.dstValid := True
     ldUop.useImm        := True
+    // disp = rmwEaDisp (immEa for a line-0 immediate mem-dest, else srcEa). A (d16,PC)
+    // source folds pc into the absolute disp (never a line-0 immediate -> srcEa.disp).
     val pcRelAddr = (pkt.pc + U(2, 32 bits) + srcEa.disp.asUInt).asBits
-    ldUop.imm           := Mux(srcEa.pcRel, pcRelAddr, srcEa.disp)
+    ldUop.imm           := Mux(srcEa.pcRel, pcRelAddr, rmwEaDisp)
     ldUop.readsNzvc     := False; ldUop.readsX := False
     ldUop.writesNzvc    := False; ldUop.writesX := False
     ldUop.isBranch      := False; ldUop.ibranch := False; ldUop.stkPush := False; ldUop.anInc := 0; ldUop.ccrRestore := False; ldUop.toCcr := False; ldUop.cond := 0
@@ -327,6 +378,38 @@ object MicroOpAssembler {
     stUop.shiftOp := 0; stUop.shiftDir := False; stUop.isMovea := False; stUop.isScc := False; stUop.isDbcc := False; stUop.extByte := False
     stUop.firstOfInstr  := True    // a single STORE µop is its own first µop
 
+    // ── rmwStUop = the STORE of a memory-destination RMW (crackRmw / crackClr) ──
+    // The EA is op[5:0] = `srcEa` (the SAME descriptor the load used — MEMSIMPLE has no
+    // side effect, so base+disp recompute identically). data = T1 (the op result). NO
+    // int dst, NO flags (the op µop owns NZVCX). firstOfInstr=False (a trailing µop).
+    val rmwStUop = DecodedUop()
+    rmwStUop.valid         := pkt.valid
+    rmwStUop.pc            := pkt.pc
+    rmwStUop.nextPc        := nextPc
+    rmwStUop.op            := DecOp.MOVE
+    rmwStUop.cluster       := Cluster.LS
+    rmwStUop.size          := spec.size
+    rmwStUop.memOp         := MemOp.STORE
+    rmwStUop.srcAReg       := srcEa.base; rmwStUop.srcAValid := srcEa.baseValid
+    rmwStUop.srcBReg       := U(T1, 5 bits); rmwStUop.srcBValid := True       // store data = T1
+    rmwStUop.srcCReg       := 0;          rmwStUop.srcCValid := False
+    rmwStUop.dstReg        := 0;          rmwStUop.dstValid  := False
+    rmwStUop.useImm        := True
+    // Same EA as the load (MEMSIMPLE recompute): rmwEaDisp (immEa for a line-0 immediate).
+    val rmwStPcRelAddr = (pkt.pc + U(2, 32 bits) + srcEa.disp.asUInt).asBits
+    rmwStUop.imm           := Mux(srcEa.pcRel, rmwStPcRelAddr, rmwEaDisp)
+    rmwStUop.readsNzvc     := False; rmwStUop.readsX := False
+    rmwStUop.writesNzvc    := False; rmwStUop.writesX := False   // the op µop owns the flags
+    rmwStUop.isBranch      := False; rmwStUop.ibranch := False; rmwStUop.stkPush := False; rmwStUop.anInc := 0; rmwStUop.ccrRestore := False; rmwStUop.toCcr := False; rmwStUop.cond := 0
+    rmwStUop.branchDisp    := 0
+    rmwStUop.unimplemented := False
+    rmwStUop.faulted       := False; rmwStUop.faultVector := 0; rmwStUop.isRte := False
+    rmwStUop.faultUsesNextPc := False
+    rmwStUop.faultAddr     := pkt.pc; rmwStUop.sswInstr := False; rmwStUop.isTrapv := False
+    rmwStUop.divSigned     := False; rmwStUop.div64 := False; rmwStUop.divIsRem := False
+    rmwStUop.shiftOp := 0; rmwStUop.shiftDir := False; rmwStUop.isMovea := False; rmwStUop.isScc := False; rmwStUop.isDbcc := False; rmwStUop.extByte := False
+    rmwStUop.firstOfInstr  := False    // the trailing store of a cracked RMW
+
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
     // Defer: non-simple, illegal op, a USED src EA that is neither reg/imm nor a
     // crackable memSimple, or a USED dst EA that is not a register AND not a
@@ -351,21 +434,35 @@ object MicroOpAssembler {
     // the deferred RMW (load-op-store) form -> illegal. `eorMemBad` forces the illegal
     // path (it must NOT crack a leading load, which the generic srcEaOk would do). The
     // EORI #imm,CCR form (also spec.op==EOR, klass==IMM) is NOT gated here (-> !isToCcr).
-    val eorMemBad = (spec.op === DecOp.EOR) && (srcEa.klass =/= EaClass.DATAREG) && !isToCcr
+    // A MEMSIMPLE EA is now a valid RMW destination (load-op-store crack); only An /
+    // #imm / MEMCOMPLEX stay illegal -> reject "not DATAREG and not MEMSIMPLE".
+    val eorMemBad = (spec.op === DecOp.EOR) && (srcEa.klass =/= EaClass.DATAREG) &&
+                    (srcEa.klass =/= EaClass.MEMSIMPLE) && !isToCcr
+    // ALU Dn,<ea> RMW (line 8/9/C/D opmode 4/5/6): the EA MUST be a memory-alterable mode
+    // (MEMSIMPLE in scope). EA=Dn/An (the encoding overlaps no valid op) or MEMCOMPLEX ->
+    // illegal. OperationDecoder named these (op != illegal); gate the bad EAs here.
+    val line   = op(15 downto 12)
+    val opmode = op(8 downto 6)
+    val isAluRmwOp = (line === B"4'h8" || line === B"4'h9" || line === B"4'hC" || line === B"4'hD") &&
+                     (opmode === 4 || opmode === 5 || opmode === 6)
+    val aluRmwMemBad = isAluRmwOp && (srcEa.klass =/= EaClass.MEMSIMPLE)
     // ADDQ/SUBQ (srcB = IMMQ3): the EA (op[5:0]) is the DESTINATION (read AND written).
     // This slice supports a DATA-register OR ADDRESS-register destination only; a memory
     // EA is the deferred RMW form -> illegal. `addqMemBad` forces the illegal path (it
     // must NOT crack a leading load, which the generic srcEaOk/crackLoad would do).
     val addqMemBad = (spec.srcB.kind === OperandKind.IMMQ3) &&
-                     (srcEa.klass =/= EaClass.DATAREG) && (srcEa.klass =/= EaClass.ADDRREG)
-    // Line-4 unary (CLR/NEG/NEGX/NOT/TST/SWAP/EXT/TAS): DATA-register dest only this
-    // slice; a non-data-reg EA (memory / An-direct / #imm) is the deferred memory form
-    // (or illegal) -> force the illegal path (no leading-load crack).
-    val line4UnaryMemBad = isLine4Unary && (srcEa.klass =/= EaClass.DATAREG)
-    // Line-0 immediate (srcB = IMMEXT): the EA (op[5:0]) is the DESTINATION. This slice
-    // supports a DATA-REGISTER destination only; a memory / An-direct / #imm EA is the
-    // deferred RMW (or illegal) form -> illegal. The to-CCR form is the one exception.
-    val lineImmBad = isLineImm && (srcEa.klass =/= EaClass.DATAREG) && !isToCcr
+                     (srcEa.klass =/= EaClass.DATAREG) && (srcEa.klass =/= EaClass.ADDRREG) &&
+                     (srcEa.klass =/= EaClass.MEMSIMPLE)
+    // Line-4 unary (CLR/NEG/NEGX/NOT/TST/SWAP/EXT/TAS): DATA-register OR (CLR/NEG/NEGX/
+    // NOT/TST) a MEMSIMPLE EA (the RMW crack). SWAP/EXT/TAS are Dn-only (TAS-mem deferred)
+    // -> a non-data-reg EA there stays illegal. An / #imm / MEMCOMPLEX always illegal.
+    val line4UnaryMemBad = isLine4Unary && (srcEa.klass =/= EaClass.DATAREG) &&
+                           !(rmwOpInScope && (srcEa.klass === EaClass.MEMSIMPLE))
+    // Line-0 immediate (srcB = IMMEXT): the EA (op[5:0]) is the DESTINATION. DATA-register
+    // OR a MEMSIMPLE EA (the RMW crack); An / #imm / MEMCOMPLEX stay illegal. The to-CCR
+    // form is the one exception.
+    val lineImmBad = isLineImm && (srcEa.klass =/= EaClass.DATAREG) &&
+                     (srcEa.klass =/= EaClass.MEMSIMPLE) && !isToCcr
     // ── Line-5 Scc / DBcc (0101 cccc 11 mmmrrr) ─────────────────────────────────
     // ss == 11 (op[7:6]). mode = op[5:3]. DBcc = mode 001 (+ disp16 word). Scc = any
     // other mode (a byte set on cond); in-scope = mode 000 (Dn). Memory Scc (mode>=2)
@@ -421,7 +518,7 @@ object MicroOpAssembler {
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp &&
               (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
-               line4UnaryMemBad ||
+               line4UnaryMemBad || aluRmwMemBad ||
                (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     // A JMP/JSR with a non-control EA is illegal (vector 4).
     val jmpBad = isJmpOp && !ctrlEaOk
@@ -1005,6 +1102,22 @@ object MicroOpAssembler {
       out.count   := 1
       out.uops(0) := stUop
       out.uops(1) := stUop
+    } elsewhen(crackRmw) {
+      // mem-dest RMW -> [load.sz <ea> -> T0] [op (T0+Dn/#imm) -> T1 + flags] [store.sz T1 -> <ea>]
+      out.count   := 3
+      out.uops(0) := ldUop
+      out.uops(1) := opUop
+      out.uops(2) := rmwStUop
+    } elsewhen(crackClr) {
+      // CLR mem -> [CLR -> T1 (=0) + Z/N flags] [store.sz T1 -> <ea>] (NO load)
+      out.count   := 2
+      out.uops(0) := opUop
+      out.uops(1) := rmwStUop
+    } elsewhen(crackLoadOnly) {
+      // TST / CMPI / CMP-mem -> [load.sz <ea> -> T0] [op (flags only)] (NO store)
+      out.count   := 2
+      out.uops(0) := ldUop
+      out.uops(1) := opUop
     } elsewhen(crackLoad) {
       out.count   := 2
       out.uops(0) := ldUop

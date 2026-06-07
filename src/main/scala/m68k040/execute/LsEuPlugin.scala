@@ -346,6 +346,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // is the trailing ibranch) -> DROP its commit record (like stkPush) but still fold
     // its CCR (NZVC/X) into the running architectural CCR.
     val compCcrRestore = RegInit(False)
+    // A mem-dest RMW / CLR TRAILING store (the macro instruction's single architectural
+    // commit is the op µop, which carries the PC + flags). A trailing RMW store writes
+    // NEITHER an int reg NOR flags (the op µop owns NZVCX) — unlike a MOVE-to-mem store
+    // (writes NZVC) or a stack-push store (writes A7). DROP its commit record (it has no
+    // architectural register/flag effect; the memory effect is checked via checkMem).
+    val compRmwStore  = RegInit(False)
     val compDstArch   = Reg(UInt(5 bits))
     // NZVC writeback for a MOVE-to-memory store (N/Z of the moved value, V=C=0).
     val compNzvc      = Reg(Bits(4 bits))
@@ -434,6 +440,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compWakes     := (isLoad && !u1.ccrRestore) || u1.stkPush
       compStkPush   := u1.stkPush
       compCcrRestore := u1.ccrRestore
+      // Trailing RMW/CLR store: a STORE writing neither an int reg nor flags.
+      compRmwStore  := isStore && !u1.pdstValid && !u1.writesNzvc && !u1.stkPush
       compDstArch   := u1.dstArch
       // CCR-restore (RTR): NZVC := loaded[3:0], X := loaded[4] (CCR bit layout
       // X=4,N=3,Z=2,V=1,C=0). Otherwise a MOVE-to-mem store's NZVC = N/Z of the stored
@@ -706,7 +714,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // Reuse `divRem` as the generic "crack µop — DROP this commit record" marker: a
     // stack-push store is the leading crack µop of BSR/JSR (the trailing branch is the
     // macro instruction's single commit). Its A7 write is still folded into running A7.
-    wbObs.divRem    := compStkPush || compCcrRestore
+    wbObs.divRem    := compStkPush || compCcrRestore || compRmwStore
     wbObs.simPublic()
 
     // ── Exception-unit cache arbitration MUX (LAST drivers — override the LS EU's

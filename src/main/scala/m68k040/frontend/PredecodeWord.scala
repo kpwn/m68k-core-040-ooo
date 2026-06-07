@@ -11,6 +11,28 @@ object PredecodeWord {
 
     val cls = op(15 downto 12).asUInt
 
+    // In-scope MEMSIMPLE RMW-DESTINATION EA: (An)=mode2 (0 ext), (d16,An)=mode5 (1 ext),
+    // (xxx).W=mode7/reg0 (1 ext), (xxx).L=mode7/reg1 (2 ext). Returns (ok, ext). The
+    // side-effect modes (An)+/-(An)/indexed (modes 3/4/6) + (d16,PC) (read-only, not
+    // alterable) + #imm are NOT in scope -> ok=False -> COMPLEX (the assembler's illegal
+    // path). Used to frame the mem-dest RMW lengths (so nextPc is correct).
+    def memDestExt(mode: UInt, reg: UInt): (Bool, UInt) = {
+      val ok  = Bool(); val ext = UInt(3 bits)
+      ok := False; ext := U(0, 3 bits)
+      switch(mode) {
+        is(U(2, 3 bits)) { ok := True; ext := U(0, 3 bits) }   // (An)
+        is(U(5, 3 bits)) { ok := True; ext := U(1, 3 bits) }   // (d16,An)
+        is(U(7, 3 bits)) {
+          switch(reg) {
+            is(U(0, 3 bits)) { ok := True; ext := U(1, 3 bits) }   // (xxx).W
+            is(U(1, 3 bits)) { ok := True; ext := U(2, 3 bits) }   // (xxx).L
+            default { ok := False }
+          }
+        }
+      }
+      (ok, ext)
+    }
+
     // EA extension words; returns (ok, ext). ok=False => complex.
     def eaExt(mode: UInt, reg: UInt, sizeL: Bool, allowImm: Boolean): (Bool, UInt) = {
       val ok  = Bool()
@@ -71,8 +93,15 @@ object PredecodeWord {
             when(ccrOk) { r.simple := True; r.lenWords := U(2, 3 bits) }   // opword + imm byte word
           } elsewhen(mode === 0) {
             r.simple := True; r.lenWords := (U(1, 3 bits) + immWords).resized   // data-reg dest
+          } otherwise {
+            // mem-dest RMW (ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea>): opword + imm words +
+            // the EA extension (imm precedes the EA ext). In-scope MEMSIMPLE dest only.
+            val (mok, mext) = memDestExt(mode, reg)
+            when(mok) {
+              r.simple := True; r.lenWords := (U(1, 3 bits) + immWords + mext).resized
+            }
           }
-          // else (mem dest / SR) -> COMPLEX (deferred)
+          // SR dest (mode7/reg4 .W) / out-of-scope EAs -> COMPLEX (deferred)
         }
       }
 
@@ -187,6 +216,19 @@ object PredecodeWord {
           r.simple   := True
           r.lenWords := U(1, 3 bits)
         }
+        // CLR/NEG/NEGX/NOT/TST <ea> mem-dest (the RMW crack): mode != 000, ss != 11,
+        // oooo in {0,2,4,6,A}, bit8=0. In-scope MEMSIMPLE dest -> opword + EA ext.
+        // SWAP/EXT/TAS are Dn-only (mode 000, matched above); TAS-mem deferred.
+        val isUnaryMem = !op(8) && (u4ss =/= U(3, 2 bits)) && (u4mode =/= U(0, 3 bits)) &&
+                         (u4o === U(0, 4 bits) || u4o === U(2, 4 bits) || u4o === U(4, 4 bits) ||
+                          u4o === U(6, 4 bits) || u4o === U(0xA, 4 bits))
+        when(isUnaryMem) {
+          val (mok, mext) = memDestExt(u4mode, op(2 downto 0).asUInt)
+          when(mok) {
+            r.simple   := True
+            r.lenWords := (U(1, 3 bits) + mext).resized
+          }
+        }
         val isJmp = op(15 downto 6) === B"10'b0100111011"
         val isJsr = op(15 downto 6) === B"10'b0100111010"
         when(isJmp || isJsr) {
@@ -217,6 +259,9 @@ object PredecodeWord {
         when(ss =/= U(3, 2 bits)) {
           when(mode === U(0, 3 bits) || mode === U(1, 3 bits)) {   // ADDQ/SUBQ Dn / An
             r.simple := True; r.lenWords := U(1, 3 bits)
+          } otherwise {                                            // ADDQ/SUBQ #n,<ea> mem-dest (RMW)
+            val (mok, mext) = memDestExt(mode, op(2 downto 0).asUInt)
+            when(mok) { r.simple := True; r.lenWords := (U(1, 3 bits) + mext).resized }
           }
         } otherwise {                                              // ss == 11
           when(mode === U(1, 3 bits)) {                            // DBcc + disp16
@@ -282,6 +327,15 @@ object PredecodeWord {
             r.simple   := True
             r.lenWords := (U(1, 3 bits) + e).resized
           }
+        } elsewhen(opmode === U(4, 3 bits) || opmode === U(5, 3 bits) || opmode === U(6, 3 bits)) {
+          // ALU Dn,<ea> RMW (opmode 4/5/6 = .B/.W/.L mem-dest): opword + EA ext. The EA
+          // MUST be a MEMSIMPLE alterable-memory mode (the assembler illegalises Dn/An/
+          // MEMCOMPLEX). (DIVU/MULU are opmode 3/7, excluded.)
+          val (mok, mext) = memDestExt(srcMode, srcReg)
+          when(mok) {
+            r.simple   := True
+            r.lenWords := (U(1, 3 bits) + mext).resized
+          }
         }
       }
 
@@ -307,6 +361,14 @@ object PredecodeWord {
         } elsewhen(isEor && (srcMode === U(0, 3 bits))) {
           r.simple   := True
           r.lenWords := U(1, 3 bits)                  // EOR Dn,Dm (register dest)
+        } elsewhen(isEor) {
+          // EOR Dn,<ea> mem-dest (RMW): opword + EA ext. In-scope MEMSIMPLE dest only;
+          // An-direct (CMPM) / MEMCOMPLEX -> COMPLEX (the assembler's illegal path).
+          val (mok, mext) = memDestExt(srcMode, srcReg)
+          when(mok) {
+            r.simple   := True
+            r.lenWords := (U(1, 3 bits) + mext).resized
+          }
         }
       }
 

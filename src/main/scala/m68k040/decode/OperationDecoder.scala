@@ -291,6 +291,25 @@ object OperationDecoder {
             .elsewhen(opmode === 5) { o.size := Size.WORD }
             .otherwise { o.size := Size.LONG }
           o.writesNzvc := True            // EOR sets N/Z (V=0, C=0); no X
+        } .elsewhen(isRmw && (line === 0x8 || line === 0x9 || line === 0xC || line === 0xD)) {
+          // ALU Dn,<ea> RMW (the memory-destination forms): opmode 4/5/6 = .B/.W/.L.
+          // The EA (op[5:0]) is the DESTINATION operand (read AND written back); Dn
+          // (bits 11:9) is the source. srcA = EA (dst operand / `a`), srcB = Dn, dst =
+          // EA. The assembler gates a non-MEMSIMPLE EA (An / #imm / MEMCOMPLEX) to
+          // illegal and cracks a MEMSIMPLE EA into [load -> T0][op -> T1][store T1].
+          o.illegal := False
+          switch(line) {
+            is(0x8) { o.op := DecOp.OR }
+            is(0x9) { o.op := DecOp.SUB }
+            is(0xC) { o.op := DecOp.AND }
+            is(0xD) { o.op := DecOp.ADD }
+          }
+          o.srcA := easrc; o.srcB := dnField; o.dst := easrc; o.dstWrites := True
+          when(opmode === 4) { o.size := Size.BYTE }
+            .elsewhen(opmode === 5) { o.size := Size.WORD }
+            .otherwise { o.size := Size.LONG }
+          when(line === 0x8 || line === 0xC) { o.writesNzvc := True }                 // OR/AND: NZ
+            .otherwise { o.writesNzvc := True; o.writesX := True }                     // ADD/SUB: NZVCX
         } .elsewhen(!isRmw && !isMulDiv) {
           o.illegal := False
           switch(line) {

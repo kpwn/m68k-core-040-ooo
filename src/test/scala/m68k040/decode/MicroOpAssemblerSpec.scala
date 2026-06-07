@@ -71,10 +71,15 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
     assert(dut.uop.dstReg.toInt == 2 && dut.uop.dstValid.toBoolean)
     assert(dut.uop.writesNzvc.toBoolean && !dut.uop.writesX.toBoolean && !dut.uop.useImm.toBoolean)
   }}
-  // EOR.B D2,(A0) (0xB510): memory destination = the deferred RMW form -> illegal
-  // (unimplemented). Must NOT crack a leading load.
-  test("EOR.B D2,(A0) (mem dest) -> unimplemented (RMW deferred)", VerilatorTest) { run { dut => drive(dut, 0xB510); sleep(1)
-    assert(dut.uop.unimplemented.toBoolean && dut.uop.memOp.toEnum == MemOp.NONE)
+  // EOR.B D2,(A0) (0xB510): memory destination = the RMW form -> cracks into a leading
+  // LOAD ([load -> T0][EOR -> T1][store T1]). uops(0) is the load (full triple in
+  // MemRmwDecodeSpec). An-direct / MEMCOMPLEX dest still illegal.
+  test("EOR.B D2,(A0) (mem dest) -> leading LOAD (RMW crack)", VerilatorTest) { run { dut => drive(dut, 0xB510); sleep(1)
+    assert(!dut.uop.unimplemented.toBoolean && dut.uop.memOp.toEnum == MemOp.LOAD)
+  }}
+  // EOR.B D2,A0 (0xB508, An-direct): not a valid EOR EA (CMPM region) -> illegal.
+  test("EOR.B D2,A0 (An-direct) -> unimplemented", VerilatorTest) { run { dut => drive(dut, 0xB508); sleep(1)
+    assert(dut.uop.unimplemented.toBoolean)
   }}
   // Line-0 immediates: srcA = EA reg (Dn dst operand), srcB = the trailing imm
   // word(s) via useImm, dst = EA reg. ADDI.L #imm,D0 (0x0680) + imm32 = words(1..2).
@@ -103,11 +108,11 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
       assert(dut.uop.srcAReg.toInt == 1 && dut.uop.useImm.toBoolean && dut.uop.imm.toLong == 1)
     }
   }
-  // ADDI.B #imm,(A0) (0x0610): memory destination = deferred RMW -> illegal. Must NOT
-  // crack a leading load.
-  test("ADDI.B #imm,(A0) (mem dest) -> unimplemented (RMW deferred)", VerilatorTest) {
+  // ADDI.B #imm,(A0) (0x0610): memory destination = the RMW form -> cracks into a
+  // leading LOAD ([load -> T0][ADD #imm -> T1][store T1]). uops(0) is the load.
+  test("ADDI.B #imm,(A0) (mem dest) -> leading LOAD (RMW crack)", VerilatorTest) {
     run { dut => drive(dut, 0x0610, 0x0042, len = 2); sleep(1)
-      assert(dut.uop.unimplemented.toBoolean && dut.uop.memOp.toEnum == MemOp.NONE)
+      assert(!dut.uop.unimplemented.toBoolean && dut.uop.memOp.toEnum == MemOp.LOAD)
     }
   }
   // ANDI #imm,CCR (0x023C) + imm.B = words(1). toCcr µop: reads+writes NZVC+X, no int

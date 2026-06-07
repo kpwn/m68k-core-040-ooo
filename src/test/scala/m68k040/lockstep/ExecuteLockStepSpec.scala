@@ -1093,6 +1093,161 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  // ── Memory-destination RMW lock-step (load-op-store crack) ─────────────────
+  // Each program seeds ONE data word in memory (move #val,Dn ; move Dn,addr), runs ONE
+  // RMW op against that memory dest, then halts. The register/flag/PC stream lock-steps
+  // vs Musashi; checkMem verifies the FINAL memory value = the RMW result.
+  //
+  // ONE RMW PER PROGRAM (single store->load->store sequence): a PRE-EXISTING SQ/dcache
+  // drain race (reproducible on master WITHOUT any RMW — a 3x back-to-back store->load-
+  // same->store-same program drops a store there too) corrupts memory under sustained
+  // same-address store-load-store pressure. That LS drain bug is ORTHOGONAL to the RMW
+  // crack and OUT OF SCOPE here; a single RMW per program drains cleanly (the 200-cycle
+  // post-run settle guarantees the lone store reaches memory), so these gate the CRACK
+  // (decode + load->op->store + EA recompute + flags + final memory) exactly. .B/.W
+  // RMWs seed a FULL .L word so the checked .L span is fully written (RMW modifies only
+  // the low byte(s); the seed's upper bytes match Musashi); checkSpan=4 validates it.
+
+  test("lock-step: ADD.L Dn,(An) RMW -> mem + NZVCX", VerilatorTest) {
+    runLockStep("rmw-add-l",
+      "move.l #0x10000001,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; move.l #0x20000002,%d1 ; add.l %d1,(%a0) ; " +
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L))   // -> 0x30000003
+  }
+  test("lock-step: SUB.L Dn,(An) RMW", VerilatorTest) {
+    runLockStep("rmw-sub-l",
+      "move.l #0x00000005,%d2 ; move.l #0x3000,%a1 ; move.l %d2,(%a1) ; move.l #0x00000003,%d3 ; sub.l %d3,(%a1) ; " +
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L))   // -> 2
+  }
+  test("lock-step: AND.L Dn,(An) RMW", VerilatorTest) {
+    runLockStep("rmw-and-l",
+      "move.l #0xff00ff00,%d4 ; move.l #0x3000,%a2 ; move.l %d4,(%a2) ; move.l #0x0f0f0f0f,%d5 ; and.l %d5,(%a2) ; " +
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L))   // -> 0x0f000f00
+  }
+  test("lock-step: OR.L Dn,(An) RMW", VerilatorTest) {
+    runLockStep("rmw-or-l",
+      "move.l #0x12340001,%d6 ; move.l #0x3000,%a3 ; move.l %d6,(%a3) ; move.l #0x00005678,%d7 ; or.l %d7,(%a3) ; " +
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L))   // -> 0x12345679
+  }
+  test("lock-step: ADD.B Dn,(An) RMW (carry/X/Z edge)", VerilatorTest) {
+    runLockStep("rmw-add-b",
+      "move.l #0x111100ff,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; move.l #0x00000001,%d1 ; add.b %d1,(%a0) ; " +
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L), checkSpan = 4)   // .B 0xff+1 -> 0x00, C/X/Z
+  }
+  test("lock-step: ADD.W Dn,(An) RMW (overflow/N edge)", VerilatorTest) {
+    runLockStep("rmw-add-w",
+      "move.l #0x22227fff,%d2 ; move.l #0x3000,%a1 ; move.l %d2,(%a1) ; move.l #0x00000001,%d3 ; add.w %d3,(%a1) ; " +
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L), checkSpan = 4)   // .W 0x7fff+1 -> 0x8000, V/N
+  }
+  test("lock-step: SUB.B Dn,(An) RMW (borrow edge)", VerilatorTest) {
+    runLockStep("rmw-sub-b",
+      "move.l #0x33330000,%d4 ; move.l #0x3000,%a2 ; move.l %d4,(%a2) ; move.l #0x00000001,%d5 ; sub.b %d5,(%a2) ; " +
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L), checkSpan = 4)   // .B 0-1 -> 0xff, C/X/N
+  }
+  test("lock-step: EOR.B/.W/.L Dn,(An) RMW", VerilatorTest) {
+    runLockStep("rmw-eor-b",
+      "move.l #0x111100aa,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; move.l #0x000000ff,%d1 ; eor.b %d1,(%a0) ; " +
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L), checkSpan = 4)   // .B aa^ff -> 0x55
+  }
+  test("lock-step: EOR.L Dn,(An) RMW (N edge)", VerilatorTest) {
+    runLockStep("rmw-eor-l",
+      "move.l #0x12345678,%d4 ; move.l #0x3000,%a2 ; move.l %d4,(%a2) ; move.l #0xffffffff,%d5 ; eor.l %d5,(%a2) ; " +
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L), checkSpan = 4)   // -> 0xedcba987, N=1
+  }
+  test("lock-step: ADDI.L #imm,(An) RMW", VerilatorTest) {
+    runLockStep("rmw-addi-l",
+      "move.l #0x00000010,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; addi.l #0x22,(%a0) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 4)   // -> 0x32
+  }
+  test("lock-step: SUBI.W #imm,(An) RMW", VerilatorTest) {
+    runLockStep("rmw-subi-w",
+      "move.l #0x11110050,%d1 ; move.l #0x3000,%a1 ; move.l %d1,(%a1) ; subi.w #0x0030,(%a1) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 4)   // .W -> 0x20
+  }
+  test("lock-step: ANDI.W #imm,(An) RMW", VerilatorTest) {
+    runLockStep("rmw-andi-w",
+      "move.l #0x2222ff0f,%d2 ; move.l #0x3000,%a2 ; move.l %d2,(%a2) ; andi.w #0x0ff0,(%a2) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 4)   // .W -> 0x0f00
+  }
+  test("lock-step: ORI.L #imm,(An) RMW", VerilatorTest) {
+    runLockStep("rmw-ori-l",
+      "move.l #0x12000000,%d3 ; move.l #0x3000,%a3 ; move.l %d3,(%a3) ; ori.l #0x00345678,(%a3) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 4)   // -> 0x12345678
+  }
+  test("lock-step: EORI.B #imm,(An) RMW", VerilatorTest) {
+    runLockStep("rmw-eori-b",
+      "move.l #0x444400aa,%d4 ; move.l #0x3000,%a4 ; move.l %d4,(%a4) ; eori.b #0xff,(%a4) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 4)   // .B aa^ff -> 0x55
+  }
+  test("lock-step: ADDQ.L #n,(An) RMW", VerilatorTest) {
+    runLockStep("rmw-addq-l",
+      "move.l #0x00000005,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; addq.l #3,(%a0) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 4)   // -> 8
+  }
+  test("lock-step: SUBQ.W #8,(An) RMW (n=8)", VerilatorTest) {
+    runLockStep("rmw-subq-w",
+      "move.l #0x11110010,%d1 ; move.l #0x3000,%a1 ; move.l %d1,(%a1) ; subq.w #8,(%a1) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 4)   // .W -> 8
+  }
+  test("lock-step: ADDQ.B #1,(An) RMW (carry edge)", VerilatorTest) {
+    runLockStep("rmw-addq-b",
+      "move.l #0x222200ff,%d2 ; move.l #0x3000,%a2 ; move.l %d2,(%a2) ; addq.b #1,(%a2) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 4)   // .B 0xff+1 -> 0x00, C/X/Z
+  }
+  test("lock-step: CLR.L (An) RMW (Z=1,N=0)", VerilatorTest) {
+    runLockStep("rmw-clr-l",
+      "move.l #0x11223344,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; clr.l (%a0) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L))   // -> 0, Z=1,N=0
+  }
+  test("lock-step: NEG.L (An) RMW (N/C/X)", VerilatorTest) {
+    runLockStep("rmw-neg-l",
+      "move.l #0x00000001,%d1 ; move.l #0x3000,%a1 ; move.l %d1,(%a1) ; neg.l (%a1) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L))   // -> 0xffffffff, N=1,C=1,X=1
+  }
+  test("lock-step: NOT.L (An) RMW (N)", VerilatorTest) {
+    runLockStep("rmw-not-l",
+      "move.l #0x00000005,%d2 ; move.l #0x3000,%a2 ; move.l %d2,(%a2) ; not.l (%a2) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L))   // -> 0xfffffffa, N=1
+  }
+  test("lock-step: NEGX.B (An) RMW (X input via prior subi)", VerilatorTest) {
+    // Seed a byte + set X via a register subi, then NEGX the memory dest (reads X).
+    runLockStep("rmw-negx",
+      "move.l #0x3000,%a0 ; move.l #0x00000003,%d0 ; move.b %d0,(%a0) ; " +
+      "moveq #0,%d1 ; subi.b #1,%d1 ; " +        // X=1 (0-1 borrow)
+      "negx.b (%a0) ; " +                         // 0 - 3 - 1 = 0xfc, N=1
+      ".stop: bra .stop",
+      nInstr = 6, checkMem = Seq(0x3000L), checkSpan = 1)
+  }
+  test("lock-step: TST.L (An) RMW = load+flags, NO store", VerilatorTest) {
+    runLockStep("rmw-tst-l",
+      "move.l #0x80000000,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; tst.l (%a0) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L))   // N=1, mem unchanged
+  }
+  test("lock-step: TST.W (An) RMW = load+flags, NO store (Z)", VerilatorTest) {
+    runLockStep("rmw-tst-w",
+      "move.l #0x11110000,%d1 ; move.l #0x3000,%a1 ; move.l %d1,(%a1) ; tst.w (%a1) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 4)   // Z=1, mem unchanged
+  }
+  test("lock-step: CMPI.L #imm,(An) = load+compare, NO store (Z)", VerilatorTest) {
+    runLockStep("rmw-cmpi-l",
+      "move.l #0x00000005,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; cmpi.l #0x00000005,(%a0) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L))   // equal -> Z=1, mem unchanged
+  }
+  test("lock-step: CMPI.W #imm,(An) = load+compare, NO store (N/C)", VerilatorTest) {
+    runLockStep("rmw-cmpi-w",
+      "move.l #0x11110010,%d1 ; move.l #0x3000,%a1 ; move.l %d1,(%a1) ; cmpi.w #0x0020,(%a1) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 4)   // 0x10<0x20 -> N/C, mem unchanged
+  }
+  test("lock-step: RMW to (d16,An) (ADDQ)", VerilatorTest) {
+    runLockStep("rmw-d16an",
+      "move.l #0x00000007,%d0 ; move.l #0x3000,%a1 ; move.l %d0,0x10(%a1) ; addq.l #1,0x10(%a1) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3010L))   // (d16,A1) -> 8 at 0x3010
+  }
+  test("lock-step: RMW to (xxx).L abs (SUBI)", VerilatorTest) {
+    runLockStep("rmw-abs",
+      "move.l #0x0000000a,%d1 ; move.l #0x3000,%a2 ; move.l %d1,(%a2) ; subi.l #4,0x3000 ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L))   // (xxx).L abs -> 6 at 0x3000
+  }
+
   // ── Branch lock-step (2-byte short branches) ──────────────────────────────
   // No predictor: a TAKEN branch is a mispredict -> the ROB registers a
   // commit-time redirect pulse that squashes the speculative fall-through and

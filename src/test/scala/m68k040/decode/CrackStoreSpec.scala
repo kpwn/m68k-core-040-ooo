@@ -66,10 +66,12 @@ class CrackStoreSpec extends AnyFunSuite {
     }
   }
 
-  test("ADD.L D1,(A0) RMW-to-mem stays unimplemented", VerilatorTest) {
-    // ADD.L D1,(A0): line D, opmode=110 (.L Dn,EA = RMW). opword = 1101 001 110 010 000 = 0xD390
+  test("ADD.L D1,(A0) RMW-to-mem now cracks to a leading LOAD (see MemRmwDecodeSpec)", VerilatorTest) {
+    // ADD.L D1,(A0): line D, opmode=110 (.L Dn,EA = RMW). opword = 1101 001 110 010 000 = 0xD390.
+    // Now implemented: cracks into [load -> T0][op -> T1][store T1] (full triple in MemRmwDecodeSpec).
     run { dut => drive(dut, 0xD390); sleep(1)
-      assert(dut.uop0.unimplemented.toBoolean, "ALU op with memory dst (RMW) must stay unimplemented")
+      assert(!dut.uop0.unimplemented.toBoolean && dut.uop0.memOp.toEnum == MemOp.LOAD,
+        "ALU mem-dest RMW now cracks to a leading load")
     }
   }
 

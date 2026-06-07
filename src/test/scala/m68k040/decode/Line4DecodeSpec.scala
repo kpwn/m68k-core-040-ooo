@@ -75,9 +75,17 @@ class Line4DecodeSpec extends AnyFunSuite {
       assert(dut.uop.op.toEnum == DecOp.CHK, "bit8=1 -> CHK, not CLR/NEG/etc")
     }
   }
-  // Memory-dest CLR.L (An) = 0x4290 (mode 010) -> deferred -> illegal.
-  test("CLR.L (A0) memory dest -> illegal (deferred)", VerilatorTest) {
+  // Memory-dest CLR.L (An) = 0x4290 (mode 010): now the RMW crack [CLR -> T1][store T1].
+  // uops(0) is the CLR op (no load); full sequence in MemRmwDecodeSpec.
+  test("CLR.L (A0) memory dest -> CLR op (no longer illegal)", VerilatorTest) {
     run { dut => drive(dut, 0x4290); sleep(1)
+      assert(!dut.uop.unimplemented.toBoolean && dut.uop.op.toEnum == DecOp.CLR && dut.uop.dstReg.toInt == 17,
+        "CLR mem-dest now cracks to [CLR -> T1][store]")
+    }
+  }
+  // Memory-COMPLEX CLR.L (A0)+ = 0x4298 (mode 011): still deferred -> illegal.
+  test("CLR.L (A0)+ memory-complex dest -> illegal (deferred)", VerilatorTest) {
+    run { dut => drive(dut, 0x4298); sleep(1)
       assert(dut.uop.unimplemented.toBoolean && dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 4)
     }
   }
