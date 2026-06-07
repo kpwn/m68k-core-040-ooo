@@ -1009,6 +1009,90 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  // ── Line-4 single-operand family (CLR/NEG/NEGX/NOT/TST/SWAP/EXT/TAS) ─────────
+  // Data-register forms. Value + NZVCX step-for-step vs Musashi (the gate). All
+  // sizes + flag edges (zero/negative/overflow/carry), NEGX with X set + the
+  // Z-clear-only (Z-preserve) rule, SWAP, EXT.W/.L, EXTB.L, TAS.
+
+  test("lock-step: CLR.B/.W/.L (Z=1, N=V=C=0, upper preserved)", VerilatorTest) {
+    runLockStep("clr", Seq(
+      "move.l #0x11223344,%d0", "clr.b %d0",                  // -> 0x11223300, Z=1
+      "move.l #0x11223344,%d1", "clr.w %d1",                  // -> 0x11220000, Z=1
+      "move.l #0x11223344,%d2", "clr.l %d2",                  // -> 0, Z=1
+      "moveq #-1,%d3", "subi.b #1,%d3", "clr.b %d3"           // set C/X then CLR (C cleared)
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: NEG.B/.W/.L (NZVCX, X=C, V overflow, C unless zero)", VerilatorTest) {
+    runLockStep("neg", Seq(
+      "moveq #1,%d0", "neg.b %d0",                            // 0-1 -> 0xff, N=1,C=1,X=1
+      "moveq #0,%d1", "neg.l %d1",                            // 0-0 -> 0, Z=1,C=0,X=0,V=0
+      "move.l #0x00000080,%d2", "neg.b %d2",                  // .B 0x80 -> overflow V=1, C=1
+      "move.l #0x00008000,%d3", "neg.w %d3",                  // .W 0x8000 -> V=1, C=1
+      "move.l #0x80000000,%d4", "neg.l %d4",                  // .L 0x80000000 -> V=1, C=1
+      "move.l #0xaabbccdd,%d5", "neg.b %d5"                   // partial: upper preserved
+    ).mkString(" ; "))
+  }
+
+  // NEGX = 0 - Dn - X; Z is CLEAR-ONLY (Z := Z_old && result==0). Exercises X=1 and
+  // X=0 inputs and BOTH Z-preserve directions (result 0 with Z_old 0 -> Z stays 0;
+  // result 0 with Z_old 1 -> Z stays 1). subi.b sets X + Z to feed the next negx.
+  test("lock-step: NEGX.B/.W/.L (X input, Z clear-only / Z-preserve)", VerilatorTest) {
+    runLockStep("negx", Seq(
+      "moveq #5,%d0", "subi.b #2,%d0", "negx.b %d0",          // X=0 (5-2 no borrow), negx 0-3-0
+      "moveq #0,%d1", "subi.b #1,%d1", "negx.b %d1",          // X=1 (0-1 borrow), negx 0-0xff-1=0; Z_old=0 -> Z STAYS 0
+      "moveq #1,%d2", "subi.b #1,%d2", "negx.b %d2",          // X=0,Z=1 (1-1=0), negx 0-0-0=0; Z_old=1 -> Z STAYS 1
+      "move.l #0x00008000,%d3", "subi.b #1,%d3", "negx.w %d3",// .W with X=0
+      "move.l #0x80000001,%d4", "subi.b #1,%d4", "negx.l %d4" // .L with X=0
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: NOT.B/.W/.L (NZ, V=C=0, upper preserved)", VerilatorTest) {
+    runLockStep("not", Seq(
+      "move.l #0x0000000f,%d0", "not.b %d0",                  // .B ~0x0f=0xf0, N=1
+      "move.l #0xffffffff,%d1", "not.w %d1",                  // .W ~0xffff=0 word, Z=1
+      "move.l #0x12345678,%d2", "not.l %d2",                  // .L ~ -> 0xedcba987, N=1
+      "move.l #0xaabbccdd,%d3", "not.b %d3"                   // partial: upper preserved
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: TST.B/.W/.L (NZ, V=C=0, no write)", VerilatorTest) {
+    runLockStep("tst", Seq(
+      "move.l #0x00000080,%d0", "tst.b %d0",                  // .B negative byte -> N=1
+      "move.l #0x00000000,%d1", "tst.w %d1",                  // .W zero -> Z=1
+      "move.l #0x80000000,%d2", "tst.l %d2",                  // .L negative -> N=1
+      "move.l #0x0000007f,%d3", "tst.b %d3"                   // .B positive -> N=0,Z=0
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: SWAP (halves swapped, NZ from 32-bit, V=C=0)", VerilatorTest) {
+    runLockStep("swap", Seq(
+      "move.l #0x12345678,%d0", "swap %d0",                   // -> 0x56781234
+      "move.l #0x00000000,%d1", "swap %d1",                   // -> 0, Z=1
+      "move.l #0x8000ffff,%d2", "swap %d2",                   // -> 0xffff8000, N=1 (bit31=1)
+      "move.l #0x0000abcd,%d3", "swap %d3"                    // -> 0xabcd0000, N=1
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: EXT.W / EXT.L / EXTB.L (sign-extend, NZ, V=C=0)", VerilatorTest) {
+    runLockStep("ext", Seq(
+      "move.l #0x11223380,%d0", "ext.w %d0",                  // byte 0x80 -> word 0xff80 (.W upper preserved), N=1
+      "move.l #0x1122337f,%d1", "ext.w %d1",                  // byte 0x7f -> word 0x007f, N=0
+      "move.l #0x0000ffff,%d2", "ext.l %d2",                  // word 0xffff -> long 0xffffffff, N=1
+      "move.l #0x00007fff,%d3", "ext.l %d3",                  // word 0x7fff -> long 0x00007fff
+      "move.l #0x11223380,%d4", "extb.l %d4",                 // byte 0x80 -> long 0xffffff80, N=1
+      "move.l #0x11223300,%d5", "extb.l %d5"                  // byte 0x00 -> long 0, Z=1
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: TAS (N/Z from Dn[7:0], set bit7, V=C=0)", VerilatorTest) {
+    runLockStep("tas", Seq(
+      "move.l #0x11223300,%d0", "tas %d0",                    // byte 0x00 -> N=0,Z=1; then 0x80 -> 0x11223380
+      "move.l #0x1122337f,%d1", "tas %d1",                    // byte 0x7f -> N=0,Z=0; then 0xff -> 0x112233ff
+      "move.l #0x112233ff,%d2", "tas %d2"                     // byte 0xff -> N=1,Z=0; stays 0xff
+    ).mkString(" ; "))
+  }
+
   // ── Branch lock-step (2-byte short branches) ──────────────────────────────
   // No predictor: a TAKEN branch is a mispredict -> the ROB registers a
   // commit-time redirect pulse that squashes the speculative fall-through and
