@@ -822,6 +822,26 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  // ── Line-5 Scc (set byte on condition) lock-step ────────────────────────────
+  // Scc Dn := cond ? 0xFF : 0x00 (byte partial write, preserve Dn[31:8], NO flags).
+  // Seed flags via a CMP, then several Scc conditions both true and false; the upper
+  // 24 bits of each Dn (pre-seeded) must be preserved. Value step-for-step vs Musashi.
+  test("lock-step: Scc set byte on condition (>=3 conds, true/false, upper preserved)", VerilatorTest) {
+    runLockStep("scc", Seq(
+      "move.l #0xaaaaaa00,%d0", "move.l #0xbbbbbb00,%d1",
+      "move.l #0xcccccc00,%d2", "move.l #0xdddddd00,%d3",
+      "move.l #0xeeeeee00,%d4", "move.l #0xffffff00,%d5",
+      "moveq #5,%d6", "moveq #5,%d7",
+      "cmp.l %d7,%d6",          // 5-5 -> Z=1 (EQ true, NE false, GE/LE true, GT/LT false)
+      "seq %d0",                // EQ true  -> D0[7:0]=0xFF -> 0xaaaaaaff
+      "sne %d1",                // NE false -> D1[7:0]=0x00 -> 0xbbbbbb00
+      "smi %d2",                // MI false (N=0) -> 0xcccccc00
+      "spl %d3",                // PL true  (N=0) -> 0xddddddff
+      "st  %d4",                // always true -> 0xeeeeeeff
+      "sf  %d5"                 // always false -> 0xffffff00
+    ).mkString(" ; "))
+  }
+
   test("lock-step: ANDI/ORI/EORI .B/.W/.L (NZ, V=C=0)", VerilatorTest) {
     runLockStep("andi-ori-eori", Seq(
       "move.l #0x12345678,%d0", "andi.l #0xff00ff00,%d0",       // .L AND
