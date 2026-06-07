@@ -24,6 +24,16 @@ object PredecodeRef {
   }
   def isMem(mode: Int): Boolean = mode > 1   // not Dn(0)/An(1)
 
+  /** In-scope MEMSIMPLE RMW-DESTINATION EA ext: (An)=2 (0), (d16,An)=5 (1),
+    * (xxx).W=mode7/reg0 (1), (xxx).L=mode7/reg1 (2). Side-effect modes 3/4/6,
+    * (d16,PC) (read-only), and #imm are NOT in scope -> None (COMPLEX). */
+  def memDestExt(mode: Int, reg: Int): Option[Int] = mode match {
+    case 2 => Some(0)
+    case 5 => Some(1)
+    case 7 => reg match { case 0 => Some(1); case 1 => Some(2); case _ => None }
+    case _ => None
+  }
+
   def classify(op0: Int): CP = {
     val op  = op0 & 0xffff
     val cls = (op >> 12) & 0xf
@@ -51,7 +61,10 @@ object PredecodeRef {
         if (!isImmOp || immWords < 0) COMPLEX
         else if (isToCcr) { if (ccrOk) CP(simple = true, lenWords = 1 + 1) else COMPLEX }
         else if (mode == 0) CP(simple = true, lenWords = 1 + immWords)  // data-reg dest
-        else COMPLEX                                              // mem dest / SR -> deferred
+        else memDestExt(mode, reg) match {                        // mem-dest RMW (imm + EA ext)
+          case Some(e) => CP(simple = true, lenWords = 1 + immWords + e)
+          case None    => COMPLEX                                 // SR / out-of-scope -> deferred
+        }
       case 0x1 | 0x2 | 0x3 =>
         val sizeL   = cls == 0x2
         val srcMode = (op >> 3) & 7; val srcReg = op & 7
@@ -109,8 +122,17 @@ object PredecodeRef {
         val isExtbL = is13 == 0x0938    // 0x49C0-C7
         val isTas   = is13 == 0x0958    // 0x4AC0-C7
         val isUnary = isUnaryArith || isSwap || isExtW || isExtL || isExtbL || isTas
+        // CLR/NEG/NEGX/NOT/TST <ea> mem-dest (RMW): mode != 000, ss != 11, oooo in
+        // {0,2,4,6,A}, bit8=0. In-scope MEMSIMPLE dest -> opword + EA ext. SWAP/EXT/TAS
+        // are Dn-only (mode 000); TAS-mem deferred.
+        val isUnaryMem = ((op >> 8) & 1) == 0 && u4ss != 3 && u4mode != 0 &&
+                         (u4o == 0 || u4o == 2 || u4o == 4 || u4o == 6 || u4o == 0xA)
         if (isTrap || isTrapv || isRts || isRtr) CP(simple = true, lenWords = 1)
         else if (isUnary) CP(simple = true, lenWords = 1)
+        else if (isUnaryMem) memDestExt(u4mode, op & 7) match {
+          case Some(e) => CP(simple = true, lenWords = 1 + e)
+          case None    => COMPLEX
+        }
         else if (isChk) {
           val sizeL   = ((op >> 7) & 1) == 0
           val srcMode = (op >> 3) & 7; val srcReg = op & 7
@@ -138,7 +160,10 @@ object PredecodeRef {
         val mode = (op >> 3) & 7
         if (ss != 3) {
           if (mode == 0 || mode == 1) CP(simple = true, lenWords = 1)  // ADDQ/SUBQ Dn/An
-          else COMPLEX                                                 // mem dest deferred
+          else memDestExt(mode, op & 7) match {                        // ADDQ/SUBQ #n,<ea> mem-dest
+            case Some(e) => CP(simple = true, lenWords = 1 + e)
+            case None    => COMPLEX
+          }
         } else {
           if (mode == 1) CP(simple = true, lenWords = 2)               // DBcc + disp16
           else if (mode == 0) CP(simple = true, lenWords = 1)          // Scc Dn
@@ -172,7 +197,12 @@ object PredecodeRef {
             case None    => COMPLEX
           }
         }
-        else if (opmode == 4 || opmode == 5 || opmode == 6 || isMulDiv) COMPLEX
+        else if (isMulDiv) COMPLEX
+        else if (opmode == 4 || opmode == 5 || opmode == 6)        // ALU Dn,<ea> RMW mem-dest
+          memDestExt(srcMode, srcReg) match {
+            case Some(e) => CP(simple = true, lenWords = 1 + e)
+            case None    => COMPLEX
+          }
         else {
           val sizeL = opmode == 2 || opmode == 7   // opmode 7 here can only be ADDA.L/SUBA.L (cls 9/D)
           eaExt(srcMode, srcReg, sizeL, allowImm = false) match {
@@ -195,6 +225,10 @@ object PredecodeRef {
             case None    => COMPLEX
           }
         } else if (isEor && srcMode == 0) CP(simple = true, lenWords = 1)  // EOR Dn,Dm
+        else if (isEor) memDestExt(srcMode, srcReg) match {                // EOR Dn,<ea> mem-dest
+          case Some(e) => CP(simple = true, lenWords = 1 + e)
+          case None    => COMPLEX                                          // An-direct (CMPM) / MEMCOMPLEX
+        }
         else COMPLEX
       // Line-E register-form shifts/rotates (1110 ccc d ss i tt rrr): single-word.
       // ss=11 is the memory single-bit form (deferred RMW) -> COMPLEX.

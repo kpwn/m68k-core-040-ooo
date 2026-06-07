@@ -56,8 +56,17 @@ class OperationDecoderSpec extends AnyFunSuite {
   test("Bcc: isBranch, cond, readsNzvc for cond>=2", VerilatorTest) {
     run(0x6700) { dut => assert(dut.o.isBranch.toBoolean && dut.o.cond.toInt == 0x7 && dut.o.readsNzvc.toBoolean) }
   }
-  test("RMW form (ADD Dn->EA, opmode4) -> illegal in this slice", VerilatorTest) {
-    run(0xD181) { dut => assert(dut.o.illegal.toBoolean) }
+  // ALU Dn,<ea> RMW (opmode 4/5/6): OperationDecoder NAMES the operands EA-agnostically
+  // (srcA=EASRC dst operand, srcB=Dn, dst=EASRC, ADD writes NZVCX). The assembler gates
+  // the EA — a memory EA cracks into load-op-store; a Dn/An/MEMCOMPLEX EA is illegalised
+  // there (aluRmwMemBad). So OperationDecoder is NOT illegal for these opwords.
+  test("RMW form (ADD Dn->EA, opmode6) -> ADD named (EA gated in the assembler)", VerilatorTest) {
+    run(0xD181) { dut =>
+      assert(dut.o.op.toEnum == DecOp.ADD && !dut.o.illegal.toBoolean)
+      assert(dut.o.srcA.kind.toEnum == OperandKind.EASRC && dut.o.dst.kind.toEnum == OperandKind.EASRC)
+      assert(dut.o.srcB.kind.toEnum == OperandKind.REGFIELD)
+      assert(dut.o.writesNzvc.toBoolean && dut.o.writesX.toBoolean)
+    }
   }
   // EOR.L D1,D2 = 0xB382 (1011 001 1 10 000 010): opmode6 (.L), src Dn=bits11:9=D1,
   // dst = the EA (op[5:0] = D2). Dm := Dm ^ Dn. EOR's dst is the SAME EA it reads

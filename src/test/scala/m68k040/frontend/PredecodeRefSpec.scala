@@ -17,10 +17,15 @@ class PredecodeRefSpec extends AnyFunSuite {
   test("BRA.w disp==0 -> simple len2") { assert(classify(0x6000) == cp(true,2)) }
   test("BRA.l disp==0xFF -> simple len3") { assert(classify(0x60FF) == cp(true,3)) }
   test("ADD.L (A0),D0 EA->Dn -> simple len1") { assert(classify(0xD090) == cp(true,1)) }
-  test("ADD.L D0,(A0) RMW -> complex") { assert(classify(0xD190) == cp(false,0)) }
+  test("ADD.L D0,(A0) RMW mem-dest -> simple len1 (An)") { assert(classify(0xD190) == cp(true,1)) }
+  test("ADD.W D0,(d16,A0) RMW -> simple len2; (xxx).L -> len3; (A0)+ -> complex") {
+    assert(classify(0xD168) == cp(true,2))   // ADD.W D0,(d16,A0) -> opword + disp16
+    assert(classify(0xD1B9) == cp(true,3))   // ADD.L D0,(xxx).L -> opword + abs32
+    assert(classify(0xD198) == cp(false,0))  // ADD.L D0,(A0)+ -> MEMCOMPLEX deferred
+  }
   test("ADDA.L A1,A0 opmode111 -> simple len1") { assert(classify(0xD1C9) == cp(true,1)) }
   test("CMP.W (d16,A0),D0 -> simple len2") { assert(classify(0xB068) == cp(true,2)) }
-  test("EOR.W D0,(A0) mem-dest (opmode5) -> complex (RMW deferred)") { assert(classify(0xB150) == cp(false,0)) }
+  test("EOR.W D0,(A0) mem-dest (opmode5) -> simple len1 (RMW)") { assert(classify(0xB150) == cp(true,1)) }
   test("EOR Dn,Dm register dest (opmode 4/5/6, mode0) -> simple len1") {
     assert(classify(0xB382) == cp(true,1))   // EOR.L D1,D2
     assert(classify(0xB302) == cp(true,1))   // EOR.B D1,D2
@@ -28,8 +33,12 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0xB389) == cp(false,0))  // EOR.L D1,A1 (An-direct = CMPM) -> complex
   }
   test("indexed (d8,A0,Xn) source -> complex") { assert(classify(0xD0B0) == cp(false,0)) }
+  test("ADDQ #n,(An) mem-dest -> simple (RMW now in scope)") {
+    assert(classify(0x5290) == cp(true,1))   // ADDQ.L #1,(A0) -> (An) mem-dest RMW
+    assert(classify(0x5268) == cp(true,2))   // ADDQ.W #1,(d16,A0) -> opword + disp16
+    assert(classify(0x5298) == cp(false,0))  // ADDQ.L #1,(A0)+ -> MEMCOMPLEX deferred
+  }
   test("deferred ops -> complex") {
-    assert(classify(0x5290) == cp(false,0))  // ADDQ.L #1,(A0) -> memory dest (deferred RMW)
     assert(classify(0x50FA) == cp(false,0))  // TRAPcc/ST (d16,PC)? mode7 reg2 ss=11 -> deferred
     assert(classify(0xE0D0) == cp(false,0))  // ASR.W (A0) (line-E memory single-bit, ss=11) -> deferred
     assert(classify(0x41D0) == cp(false,0))  // LEA (A0),A0
@@ -65,8 +74,12 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x027C) == cp(false,0))  // ANDI #imm,SR (word, privileged) -> deferred
     assert(classify(0x0C3C) == cp(false,0))  // CMPI #imm,<#imm> (no CMPI-to-CCR) -> illegal
   }
-  test("line-0 memory-dest immediate (deferred RMW) + illegal size -> complex") {
-    assert(classify(0x0010) == cp(false,0))  // ORI.B #imm,(A0) — RMW deferred
+  test("line-0 memory-dest immediate (RMW) + illegal size + out-of-scope") {
+    assert(classify(0x0010) == cp(true,2))   // ORI.B #imm,(A0) — opword + imm word + (An) ext0
+    assert(classify(0x0610) == cp(true,2))   // ADDI.B #imm,(A0)
+    assert(classify(0x0668) == cp(true,3))   // ADDI.W #imm,(d16,A0) — opword + imm + disp16
+    assert(classify(0x04B9) == cp(true,5))   // SUBI.L #imm,(xxx).L — opword + 2 imm + abs32
+    assert(classify(0x0618) == cp(false,0))  // ADDI.B #imm,(A0)+ -> MEMCOMPLEX deferred
     assert(classify(0x00C0) == cp(false,0))  // ss=11 illegal size
     assert(classify(0x0840) == cp(false,0))  // opmode 4 (BTST-imm / bit ops) — out of scope
   }
