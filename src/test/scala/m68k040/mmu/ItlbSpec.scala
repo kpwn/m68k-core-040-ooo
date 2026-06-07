@@ -91,6 +91,49 @@ class ItlbSpec extends AnyFunSuite {
     }
   }
 
+  test("ITLB registered miss->walker trigger: single-outstanding while req held (exactly one walk)", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new BehavioralMemAgent(dut.walkerAxi, cd)
+      dut.probe.logic.reqIn.valid #= false
+      dut.probe.logic.reqIn.vpn #= 0; dut.probe.logic.reqIn.write #= false; dut.probe.logic.reqIn.supervisor #= false
+      cd.waitSampling(4)
+
+      val va = 0x00402000L
+      buildTable(mem, va, ppn = 0x12345L)
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.rootPtr   #= ROOT
+      cd.waitSampling(2)
+
+      // Count every walker AR burst. With the registered trigger, holding the
+      // fetch request valid across the multi-cycle walk (as the I-cache does on a
+      // miss) must launch EXACTLY ONE walk -> EXACTLY 3 reads (root/ptr/page), no
+      // double-walk and no dropped miss.
+      var arCount = 0
+      fork { while (true) { cd.waitSampling()
+        if (dut.walkerAxi.ar.valid.toBoolean && dut.walkerAxi.ar.ready.toBoolean) arCount += 1 } }
+
+      // present the miss and HOLD it valid throughout (the registered trigger must
+      // still pulse start exactly once even with the live req held high).
+      dut.probe.logic.reqIn.valid #= true
+      dut.probe.logic.reqIn.vpn   #= vpnOf(va)
+      dut.probe.logic.reqIn.write #= false
+      dut.probe.logic.reqIn.supervisor #= false
+      var guard = 0
+      while (!dut.probe.logic.rspOut.ready.toBoolean && guard < 300) { cd.waitSampling(); guard += 1 }
+      sleep(1)
+      assert(dut.probe.logic.rspOut.ready.toBoolean, "held miss resolves (ready) after the walk")
+      assert(!dut.probe.logic.rspOut.fault.toBoolean, "resident page: no fault")
+      assert(dut.probe.logic.rspOut.ppn.toLong == 0x12345L, f"walked ppn: got 0x${dut.probe.logic.rspOut.ppn.toLong}%x")
+      assert(arCount == 3, s"single-outstanding: exactly one 3-level walk while req held; got $arCount ARs")
+
+      // keep holding the (now-resolved) request a few cycles: no spurious re-walk.
+      cd.waitSampling(8)
+      assert(arCount == 3, s"no re-walk while the resolved req stays valid; got $arCount ARs")
+    }
+  }
+
   test("ITLB: miss -> walk -> fill -> hit; non-resident -> fault", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
