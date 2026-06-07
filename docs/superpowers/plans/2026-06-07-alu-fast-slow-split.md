@@ -16,7 +16,38 @@
 
 ### Task 1: Diagnose the 24-level cone + the slow-op set + the slow-wakeup plan
 **Files:** read-only `AluEuPlugin.scala`, `IssueQueuePlugin.scala`, the OOC timing report (gen+synth current master, read `synth/M68kFullCoreSynth_timing.rpt` for the s1Src2->NZVC path's logic). Identify EXACTLY which ops/sub-paths make the 24 levels (shifter? CCR-RMW? mergedResult? SWAP/EXT?). Pick the MINIMUM slow-op set that clears the cone (keep the fast path broad). Plan the slow-path S1->S2 stage + the IQ dynamic-wakeup bitmap (mirror cplxBusy).
-- [ ] Capture decisions in the Task-1 commit (empty ok).
+- [x] Capture decisions in the Task-1 commit (empty ok).
+
+**DIAGNOSIS (baseline gen+OOC synth, WNS -2.398, FMAX 156.3):** all 8 worst setup paths are the SAME cone:
+`AluEuPlugin.s1Src2[*] -> ... -> finalNzvc_regNext[*] -> RegFilePluginNzvc ram (NZVC writeback)`,
+24 logic levels (LUT6=16), 6.319ns data-path delay. The path threads through `s1Src2`
+(the shift COUNT / CCR imm operand) and `s1Ctx_uop_useImm` (which gates both the shifter
+count form and the CCR imm), folding into `finalNzvc`.
+`finalNzvc = Mux(isShift, shiftNzvc, Mux(toCcr, ccrNzvc, aluNzvc))`.
+The deep contributor is the BARREL SHIFTER (`Shifter.scala`): multiple 66-bit variable
+funnel shifts (`shl`/`shr`, the rotate funnels), the per-size `shTable` generation, and the
+ROX `rmod` 7-deep subtract-reduce chain — all as a function of the variable count `s1Src2`.
+The `aluNzvc` (plain ADD/SUB) path is a 32-bit adder + simple flag fold — much shallower.
+
+**SLOW-OP SET (minimum that clears the cone):** `isSlow = isShift || toCcr`.
+- isShift (DecOp.SHIFT): the dominant deep funnel cone — MUST move to S2.
+- toCcr (ANDI/ORI/EORI #imm,CCR): also on the `finalNzvc` mux + reads/writes NZVC+X;
+  3 rare instructions => ~zero IPC cost; moving it removes another `finalNzvc` contributor.
+**FAST path (UNCHANGED, lat1):** ADD/SUB/AND/OR/EOR/CMP/MOVE/MOVEA/imm/CLR/NEGX/EXT/SWAP —
+the `aluNzvc`/`mergedResult` cone (the dependent-chain IPC path) + bypass + static lat1 wake.
+
+**SLOW PATH (lat2):** S1 registers {op,size,operands,flags,useImm,shiftOp/Dir,extByte,ctx,masks}
+into S2 regs; S2 computes shifter + CCR-RMW + final NZVCX; S2 drives intW/nzvcW/xW (lat1 write
+ports off the S2 stage => arch lat2) + completion + a new `aluSlowWakeup` Flow (pdst). The S2
+PRF writes use the SAME lat1 write ports (one extra pipe cycle = arch latency 2). NO bypass of a
+slow producer's S1 partial (dynamic wakeup gates the dependent until S2).
+
+**IQ DYNAMIC WAKEUP:** mirror cplxBusy — a new `aluSlowBusy` bitmap + `aluSlowWakeupPort` Flow.
+A slow-ALU producer's pdst is recorded in aluSlowBusy (NOT sbInt => no static lat1 trigger);
+a consumer latches `aluSlowWait` (like cplxWait) and wakes on the aluSlowWakeup broadcast (lat2).
+Both ALU EUs (eu0/eu1, issue ports 0/1) can issue a slow op => the two EUs' wakeup Flows are
+ORed into the single IQ port (mutually-exclusive pdsts; at most one valid per EU per cycle).
+The static `events` set must EXCLUDE a slow-producer's issue (so no lat1 trigger fires for it).
 
 ### Task 2: Slow path (S1->S2 for shift/CCR-RMW) + lat-2 writeback/completion
 **Files:** `execute/AluEuPlugin.scala`; Test `execute/AluFastSlowSpec.scala`.
