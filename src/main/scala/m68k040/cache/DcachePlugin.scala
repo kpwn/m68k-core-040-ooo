@@ -219,7 +219,23 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       stS1Payload := s0Payload
     }
 
-    // ---- LOAD FSM (drives the shared read port with PRIORITY over the store) ----
+    // ---- shared read-port arbitration (FMax: keep the live load-accept/DTLB cone OUT
+    // of the high-fanout BRAM read-address net) ----
+    // The store drives the read address as the BASE (off the REGISTERED stS1Payload —
+    // a clean flop->BRAM-address arc). The LOAD FSM below OVERRIDES rdSet/rdEn LAST
+    // (last-assignment wins) on a load-accept / REPLAY, so the load keeps priority.
+    // Crucially the load-vs-store select on the rdSet net is ONLY `loadCmdPort.fire /
+    // REPLAY` (the same cone baseline already had on the dataMem read address) — the
+    // store base adds NO arbiter cone to that fo=high net. The "did the store actually
+    // get the port?" question (loadUsesPort) feeds ONLY the low-fanout stS2Valid
+    // control register, NOT the BRAM address — breaking the post-route critical path
+    // (DTLB-walker -> loadCmdPort.ready -> arbiter -> tag/dataMem read-address).
+    when(stS1Valid) {
+      rdSet := stS1Set
+      rdEn  := True
+    }
+
+    // ---- LOAD FSM (OVERRIDES the shared read port with PRIORITY over the store) ----
     val fsm = new StateMachine {
       val IDLE   = new State with EntryPoint
       val REFILL = new State
@@ -320,17 +336,19 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       }
     }
 
-    // ---- store read-port arbiter: load>store; defer the store-S1 read on conflict ----
-    // The store launches its shared read ONLY when the load FSM isn't using the port
-    // this cycle. On a conflict the store holds in S1 (re-armed below) and retries.
+    // ---- store read-port arbiter CONTROL (no BRAM-address logic here) ----
+    // The store's read ADDRESS was already driven (as the base) before the FSM; the
+    // FSM overrode rdSet/rdEn if a load used the port this cycle. So here we ONLY
+    // resolve whether the store actually GOT the port: if the load took it
+    // (loadUsesPort), the store's read was overridden -> hold in S1 and retry; else
+    // its read launched -> advance to S2. This `loadUsesPort` consumer is a small
+    // control register (stS2Valid/stS1Valid), NOT the high-fanout BRAM read-address.
     when(stS1Valid) {
       when(!fsm.loadUsesPort) {
-        rdSet       := stS1Set
-        rdEn        := True
         stS2Valid   := True
         stS2Payload := stS1Payload
       } otherwise {
-        // Port busy: hold in S1, retry next cycle.
+        // Port taken by the load: hold in S1, retry next cycle.
         stS1Valid   := True
       }
     }

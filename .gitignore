@@ -23,3 +23,5 @@ clockInfo.txt
 .Xil/
 vivado*.log
 vivado*.jou
+cong/
+synth/vivado_*.log
