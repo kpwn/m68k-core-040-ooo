@@ -91,7 +91,26 @@ object PredecodeRef {
         // (An)=2, (d16,An)=5, (xxx).W/.L/(d16,PC)=mode7 reg0/1/2.
         val isJmp = ((op >> 6) & 0x3ff) == 0x13b
         val isJsr = ((op >> 6) & 0x3ff) == 0x13a
+        // Line-4 single-operand DATA-register family (the unary group): single-word ->
+        // SIMPLE len1. CLR/NEG/NEGX/NOT/TST (0100 oooo ss 000rrr, oooo in {0,2,4,6,A},
+        // ss != 11, mode 000=Dn) + SWAP (0x4840-47) / EXT.W (0x4880-87) / EXT.L
+        // (0x48C0-C7) / EXTB.L (0x49C0-C7) / TAS (0x4AC0-C7). Memory-dest forms (mode !=
+        // 000) are the deferred RMW slice -> COMPLEX. bit8=0 except EXTB.L (checked
+        // BEFORE isChk, which it would otherwise alias: 0x49C0 has bit8=1 & bit6=0).
+        val u4o    = (op >> 8) & 0xf
+        val u4ss   = (op >> 6) & 3
+        val u4mode = (op >> 3) & 7
+        val isUnaryArith = ((op >> 8) & 1) == 0 && u4ss != 3 && u4mode == 0 &&
+                           (u4o == 0 || u4o == 2 || u4o == 4 || u4o == 6 || u4o == 0xA)
+        val is13 = (op >> 3) & 0x1fff   // op[15:3]
+        val isSwap  = is13 == 0x0908    // 0x4840-47
+        val isExtW  = is13 == 0x0910    // 0x4880-87
+        val isExtL  = is13 == 0x0918    // 0x48C0-C7
+        val isExtbL = is13 == 0x0938    // 0x49C0-C7
+        val isTas   = is13 == 0x0958    // 0x4AC0-C7
+        val isUnary = isUnaryArith || isSwap || isExtW || isExtL || isExtbL || isTas
         if (isTrap || isTrapv || isRts || isRtr) CP(simple = true, lenWords = 1)
+        else if (isUnary) CP(simple = true, lenWords = 1)
         else if (isChk) {
           val sizeL   = ((op >> 7) & 1) == 0
           val srcMode = (op >> 3) & 7; val srcReg = op & 7

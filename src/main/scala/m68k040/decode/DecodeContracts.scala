@@ -74,6 +74,9 @@ case class OpSpec() extends Bundle {
   val shiftOp   = Bits(2 bits)
   val shiftDir  = Bool()
   val shiftImm  = Bool()
+  // Line-4 EXT/EXTB byte-source marker (DecOp.EXT): the sign-extend source is a BYTE
+  // (EXT.W / EXTB.L) rather than a word (EXT.L). Non-EXT ops leave it False.
+  val extByte   = Bool()
 }
 object OpSpec {
   def illegalDefault(): OpSpec = {
@@ -88,6 +91,7 @@ object OpSpec {
     o.illegal := True
     o.divSigned := False; o.div64 := False
     o.shiftOp := 0; o.shiftDir := False; o.shiftImm := False
+    o.extByte := False
     o
   }
 }

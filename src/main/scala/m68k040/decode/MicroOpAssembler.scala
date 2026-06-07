@@ -62,7 +62,13 @@ object MicroOpAssembler {
     // EASRC is the DESTINATION (a deferred memory RMW), NOT a load source -> a memory
     // EA there is illegal (addqMemBad), never a leading-load crack.
     val isAddqSubq = spec.srcB.kind === OperandKind.IMMQ3
-    val crackLoad = usesSrcEa && srcIsMem && !isAddqSubq
+    // Line-4 single-operand family (CLR/NEG/NEGX/NOT/TST/SWAP/EXT/TAS): the EASRC slot
+    // is the DESTINATION operand (data-register only this slice), NOT a load source ->
+    // a memory EA is the deferred RMW/store form (illegal), never a leading-load crack.
+    val isLine4Unary = spec.op === DecOp.CLR || spec.op === DecOp.NEG || spec.op === DecOp.NEGX ||
+                       spec.op === DecOp.NOT || spec.op === DecOp.TST || spec.op === DecOp.SWAP ||
+                       spec.op === DecOp.EXT || spec.op === DecOp.TAS
+    val crackLoad = usesSrcEa && srcIsMem && !isAddqSubq && !isLine4Unary
 
     // MOVE reg -> memSimple destination -> a single STORE µop (data = the register
     // source). Mem-to-mem (source also memSimple) is deferred. RMW (ALU op with a
@@ -107,6 +113,7 @@ object MicroOpAssembler {
     opUop.divIsRem      := False
     opUop.shiftOp       := spec.shiftOp
     opUop.shiftDir      := spec.shiftDir
+    opUop.extByte       := spec.extByte
     opUop.isMovea       := False
     opUop.isScc         := False; opUop.isDbcc := False
     // CHK / DIV are group-2 traps (CHK vec6, DIV0 vec5) delivered execute-time via
@@ -283,7 +290,7 @@ object MicroOpAssembler {
     ldUop.faultUsesNextPc := False
     ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False; ldUop.isTrapv := False
     ldUop.divSigned     := False; ldUop.div64 := False; ldUop.divIsRem := False
-    ldUop.shiftOp := 0; ldUop.shiftDir := False; ldUop.isMovea := False; ldUop.isScc := False; ldUop.isDbcc := False
+    ldUop.shiftOp := 0; ldUop.shiftDir := False; ldUop.isMovea := False; ldUop.isScc := False; ldUop.isDbcc := False; ldUop.extByte := False
     ldUop.firstOfInstr  := True    // the LOAD is the FIRST µop of a cracked instruction
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
@@ -317,7 +324,7 @@ object MicroOpAssembler {
     stUop.faultUsesNextPc := False
     stUop.faultAddr     := pkt.pc; stUop.sswInstr := False; stUop.isTrapv := False
     stUop.divSigned     := False; stUop.div64 := False; stUop.divIsRem := False
-    stUop.shiftOp := 0; stUop.shiftDir := False; stUop.isMovea := False; stUop.isScc := False; stUop.isDbcc := False
+    stUop.shiftOp := 0; stUop.shiftDir := False; stUop.isMovea := False; stUop.isScc := False; stUop.isDbcc := False; stUop.extByte := False
     stUop.firstOfInstr  := True    // a single STORE µop is its own first µop
 
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
@@ -351,6 +358,10 @@ object MicroOpAssembler {
     // must NOT crack a leading load, which the generic srcEaOk/crackLoad would do).
     val addqMemBad = (spec.srcB.kind === OperandKind.IMMQ3) &&
                      (srcEa.klass =/= EaClass.DATAREG) && (srcEa.klass =/= EaClass.ADDRREG)
+    // Line-4 unary (CLR/NEG/NEGX/NOT/TST/SWAP/EXT/TAS): DATA-register dest only this
+    // slice; a non-data-reg EA (memory / An-direct / #imm) is the deferred memory form
+    // (or illegal) -> force the illegal path (no leading-load crack).
+    val line4UnaryMemBad = isLine4Unary && (srcEa.klass =/= EaClass.DATAREG)
     // Line-0 immediate (srcB = IMMEXT): the EA (op[5:0]) is the DESTINATION. This slice
     // supports a DATA-REGISTER destination only; a memory / An-direct / #imm EA is the
     // deferred RMW (or illegal) form -> illegal. The to-CCR form is the one exception.
@@ -410,6 +421,7 @@ object MicroOpAssembler {
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp &&
               (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
+               line4UnaryMemBad ||
                (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     // A JMP/JSR with a non-control EA is illegal (vector 4).
     val jmpBad = isJmpOp && !ctrlEaOk
@@ -617,7 +629,7 @@ object MicroOpAssembler {
     divlUop.faultUsesNextPc := True            // DIV0 stacks nextPc (group-2 format-$2)
     divlUop.faultAddr     := pkt.pc; divlUop.sswInstr := False; divlUop.isTrapv := False
     divlUop.divSigned     := divlSigned; divlUop.div64 := divl64; divlUop.divIsRem := False
-    divlUop.shiftOp := 0; divlUop.shiftDir := False; divlUop.isMovea := False; divlUop.isScc := False; divlUop.isDbcc := False
+    divlUop.shiftOp := 0; divlUop.shiftDir := False; divlUop.isMovea := False; divlUop.isScc := False; divlUop.isDbcc := False; divlUop.extByte := False
     divlUop.firstOfInstr  := True
     // 64-bit dividend high word Dr: carried in srcC (psrcC after rename). For the
     // 32-bit form psrcC is unused.
@@ -648,7 +660,7 @@ object MicroOpAssembler {
     divremUop.faultUsesNextPc := False
     divremUop.faultAddr     := pkt.pc; divremUop.sswInstr := False; divremUop.isTrapv := False
     divremUop.divSigned     := divlSigned; divremUop.div64 := divl64; divremUop.divIsRem := True
-    divremUop.shiftOp := 0; divremUop.shiftDir := False; divremUop.isMovea := False; divremUop.isScc := False; divremUop.isDbcc := False
+    divremUop.shiftOp := 0; divremUop.shiftDir := False; divremUop.isMovea := False; divremUop.isScc := False; divremUop.isDbcc := False; divremUop.extByte := False
     divremUop.firstOfInstr  := False           // trailing crack µop
 
     // DIV.L is valid only when its divisor EA is reg/imm. A memSimple divisor would
@@ -719,7 +731,7 @@ object MicroOpAssembler {
     mullUop.faultUsesNextPc := False
     mullUop.faultAddr     := pkt.pc; mullUop.sswInstr := False; mullUop.isTrapv := False
     mullUop.divSigned     := mullSigned; mullUop.div64 := mull64; mullUop.divIsRem := False
-    mullUop.shiftOp := 0; mullUop.shiftDir := False; mullUop.isMovea := False; mullUop.isScc := False; mullUop.isDbcc := False
+    mullUop.shiftOp := 0; mullUop.shiftDir := False; mullUop.isMovea := False; mullUop.isScc := False; mullUop.isDbcc := False; mullUop.extByte := False
     mullUop.firstOfInstr  := True
 
     // MULHI (high-product move) µop (.L64 only): CPLX, writes the EU's LATCHED high
@@ -747,7 +759,7 @@ object MicroOpAssembler {
     mulhiUop.faultUsesNextPc := False
     mulhiUop.faultAddr     := pkt.pc; mulhiUop.sswInstr := False; mulhiUop.isTrapv := False
     mulhiUop.divSigned     := mullSigned; mulhiUop.div64 := mull64; mulhiUop.divIsRem := False
-    mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False; mulhiUop.isMovea := False; mulhiUop.isScc := False; mulhiUop.isDbcc := False
+    mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False; mulhiUop.isMovea := False; mulhiUop.isScc := False; mulhiUop.isDbcc := False; mulhiUop.extByte := False
     mulhiUop.firstOfInstr  := False           // trailing crack µop
 
     // MUL.L is valid only when its multiplier EA is reg/imm (a memSimple multiplier
@@ -792,7 +804,7 @@ object MicroOpAssembler {
     ibrUop.faultUsesNextPc := False
     ibrUop.faultAddr     := pkt.pc; ibrUop.sswInstr := False; ibrUop.isTrapv := False
     ibrUop.divSigned     := False; ibrUop.div64 := False; ibrUop.divIsRem := False
-    ibrUop.shiftOp := 0; ibrUop.shiftDir := False; ibrUop.isMovea := False; ibrUop.isScc := False; ibrUop.isDbcc := False
+    ibrUop.shiftOp := 0; ibrUop.shiftDir := False; ibrUop.isMovea := False; ibrUop.isScc := False; ibrUop.isDbcc := False; ibrUop.extByte := False
     // JMP is a single µop (its own first); JSR's ibranch is the TRAILING µop (the push
     // is first), so firstOfInstr is False for JSR.
     ibrUop.firstOfInstr  := !isJsrOp
@@ -838,7 +850,7 @@ object MicroOpAssembler {
       u.faulted := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.faultAddr := pkt.pc; u.sswInstr := False; u.isRte := False; u.isTrapv := False
       u.divSigned := False; u.div64 := False; u.divIsRem := False
-      u.shiftOp := 0; u.shiftDir := False; u.isMovea := False; u.isScc := False; u.isDbcc := False
+      u.shiftOp := 0; u.shiftDir := False; u.isMovea := False; u.isScc := False; u.isDbcc := False; u.extByte := False
       u.firstOfInstr := first
       u
     }

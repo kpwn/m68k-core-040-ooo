@@ -18,7 +18,20 @@ object DecOp extends SpinalEnum {
       // op carries `shiftOp` (tt: 0=AS,1=LS,2=ROX,3=RO) + `shiftDir` (1=left) + size;
       // the count is the immediate (useImm/imm, the `i=0` form) or the 2nd data-reg
       // source Dc (srcB, the `i=1` form). Routed to the ALU EU's barrel shifter.
-      SHIFT = newElement()
+      SHIFT,
+      // Line-4 single-operand data-register ops (the unary family). All read the dst
+      // Dn as srcA (the .B/.W partial-merge / operand source) and write Dn (except TST).
+      //   CLR  : Dn(size):=0 (N=0,Z=1,V=0,C=0).
+      //   NEG  : Dn := 0-Dn (NZVCX; X=C; V overflow).
+      //   NEGX : Dn := 0-Dn-X (NZVCX; reads X + old Z; Z is CLEAR-ONLY).
+      //   NOT  : Dn := ~Dn (NZ; V=0,C=0).
+      //   TST  : flags only (NZ; V=0,C=0); no write.
+      //   SWAP : Dn := {Dn[15:0],Dn[31:16]} (full-32; NZ from the 32-bit result).
+      //   EXT  : sign-extend the low byte/word -> .W/.L (NZ); `extByte` selects the
+      //          byte-source form (EXT.W byte->word .W; EXTB.L byte->long; EXT.L
+      //          word->long when extByte=0).
+      //   TAS  : N/Z from Dn[7:0] (V=0,C=0); then Dn[7]:=1 (byte partial merge).
+      CLR, NEG, NEGX, NOT, TST, SWAP, EXT, TAS = newElement()
 }
 
 /** Pre-rename µop: the decode→rename contract. Architectural operands
@@ -117,6 +130,12 @@ case class DecodedUop() extends Bundle {
   // Default 0/False (non-shift µops). Threaded through rename to the ALU EU.
   val shiftOp      = Bits(2 bits)
   val shiftDir     = Bool()
+  // ── Line-4 EXT/EXTB source-width marker (DecOp.EXT) ──────────────────────────
+  // EXT sign-extends the low byte/word of Dn. `extByte` = the source is a BYTE
+  // (Dn[7:0]) rather than a word (Dn[15:0]): EXT.W (byte->word, size WORD, extByte)
+  // + EXTB.L (byte->long, size LONG, extByte). EXT.L (word->long, size LONG) leaves
+  // extByte=False. Default False (every non-EXT op). The destination width is `size`.
+  val extByte      = Bool()
   // MOVEA (MOVE / MOVEQ-class with an ADDRESS-register destination): An is ALWAYS
   // written full-32 and sets NO flags; the .W form SIGN-EXTENDS the 16-bit source to
   // 32 bits. The ALU EU keys off this to bypass the .B/.W partial-register merge

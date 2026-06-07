@@ -89,12 +89,23 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
 
     // ---- S1: execute ----
     val cmd = AluCmd()
-    cmd.op   := u1.op
-    cmd.size := u1.size
-    cmd.src1 := s1Src1
-    cmd.src2 := s1Src2
-    cmd.xIn  := False                    // no flag-read ops yet (ALU arith)
+    cmd.op      := u1.op
+    cmd.size    := u1.size
+    cmd.src1    := s1Src1
+    cmd.src2    := s1Src2
+    cmd.xIn     := s1X                    // current X (NEGX: 0 - Dn - X)
+    cmd.extByte := u1.extByte             // EXT/EXTB byte-source marker
     val rsp = AluDatapath(cmd)
+
+    // ── NEGX: the 68k extended-arith Z is CLEAR-ONLY ────────────────────────────
+    // Z := Z_old && (result == 0). NEGX reads NZVC (-> s1Nzvc holds the old CCR), so the
+    // old Z is s1Nzvc(2). The datapath produced the raw Z (rsp.nzvc(2)); AND it with the
+    // old Z so a zero result PRESERVES a prior Z=0 (only clears, never sets, Z). The
+    // other NZVC bits (N/V/C) and X are unchanged from the datapath.
+    val isNegx   = u1.op === DecOp.NEGX
+    val negxZ    = rsp.nzvc(2) && s1Nzvc(2)
+    val negxNzvc = rsp.nzvc(3) ## negxZ ## rsp.nzvc(1 downto 0)
+    val aluNzvc  = Mux(isNegx, negxNzvc, rsp.nzvc)
 
     // ── S1: line-E barrel shifter (DecOp.SHIFT) ────────────────────────────────
     // The shift INPUT (Dr) is src1; the count is the immediate (u1.useImm -> imm[5:0])
@@ -154,7 +165,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // The int writeback is suppressed for a toCcr op (it has no int dst -> pdstValid
     // False already). NZVC/X take the CCR-rmw result for toCcr, else the datapath flags.
     // Final NZVC/X: shifter for SHIFT, CCR-rmw for toCcr, else the ALU datapath.
-    val finalNzvc = Mux(isShift, shiftNzvc, Mux(u1.toCcr, ccrNzvc, rsp.nzvc))
+    val finalNzvc = Mux(isShift, shiftNzvc, Mux(u1.toCcr, ccrNzvc, aluNzvc))
     val finalX    = Mux(isShift, shiftRsp.xOut, Mux(u1.toCcr, ccrX, rsp.xOut))
     intW.valid   := s1Valid && u1.pdstValid;  intW.address   := u1.pdst;     intW.data   := mergedResult
     nzvcW.valid  := s1Valid && u1.writesNzvc; nzvcW.address  := u1.pNzvcDst;  nzvcW.data  := finalNzvc

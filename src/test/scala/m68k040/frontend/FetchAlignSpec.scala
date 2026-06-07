@@ -46,7 +46,7 @@ class FetchAlignSpec extends AnyFunSuite {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val base = 0x7000L
-      IcacheSim.attachMemoryWithWords(dut.ic.logic.axi, cd, base, Seq(0x7000,0x4880,0x7001,0x7002,0x7003,0x7004)) // MOVEQ, EXT.W(complex - not yet implemented), ... (was 0xC0C1 MULU, now simple after the MUL slice)
+      IcacheSim.attachMemoryWithWords(dut.ic.logic.axi, cd, base, Seq(0x7000,0x48E7,0x7001,0x7002,0x7003,0x7004)) // MOVEQ, MOVEM(complex - not yet implemented; was 0x4880 EXT.W, now simple after the line-4 unary slice)
       dut.probe.logic.feedOut.ready #= false; dut.fa.logic.resume.valid #= false; dut.fa.logic.redirect.valid #= false
       cd.waitSampling(2)
       redirect(dut, cd, base)
