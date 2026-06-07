@@ -201,7 +201,28 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val oh0 = OHMasking.first(aluReady)
     val oh1 = OHMasking.first(aluReady & ~oh0)
     val ohB = OHMasking.first(brReady)
-    val ohL = OHMasking.first(lsReady)
+    // ---- LS issue is IN PROGRAM ORDER (no MOB / no load-store disambiguation) ----
+    // The L1D is write-no-allocate and stores are visible only at commit (SQ drain),
+    // so a load disambiguates against older stores ONLY via the SQ-forward — which can
+    // see a store ONLY once that store has executed and ALLOCATED its address into the
+    // SQ. If a YOUNGER load were allowed to issue ahead of an OLDER store to the same
+    // address (because the load's address is ready while the store still waits on its
+    // data producer, e.g. the ALU result of a load-op-store RMW), the load would query
+    // the SQ before that store allocated, MISS the forward, and read STALE memory (the
+    // older store's value never reaches it) — silently corrupting a dependent store's
+    // data (the RMW write-back). The architectural regs still match (the load feeds an
+    // unchecked T0/T1 temp), so only final memory is wrong: the "dropped store" race.
+    //
+    // Fix: select the OLDEST LS slot, and only when it is ready. A younger LS µop is
+    // NOT issued while an older LS µop is still unready — guaranteeing every older
+    // store has allocated into the SQ before any younger load (or store) to the same
+    // address disambiguates. Single LS EU + single SQ-drain port make in-order LS
+    // issue the natural (and previously assumed) discipline; this just enforces it.
+    // OCCUPIED LS slots only (an empty slot's context is garbage and must NOT be
+    // mistaken for the oldest LS — that would block real LS issue forever -> deadlock).
+    val lsPresent = B(slots.map(s => s.sel && isLs(s.context.uop)))
+    val ohLoldest = OHMasking.first(lsPresent)         // oldest occupied LS slot (ready or not)
+    val ohL = ohLoldest & lsReady                      // issue it ONLY if it is ready
     val ohC = OHMasking.first(cplxReady)
 
     // ---- FMax: REGISTERED issue->operand-read boundary ----
