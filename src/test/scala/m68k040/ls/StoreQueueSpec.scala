@@ -154,6 +154,56 @@ class StoreQueueSpec extends AnyFunSuite {
     }
   }
 
+  test("youngest of two overlapping stores forwards (pre-registered bounds, value identical)", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      // two aligned LONG stores to the SAME addr; the YOUNGER (robId 6) must win.
+      alloc(dut, cd, robId = 4, paddr = 0x100, data = 0x11111111L, Size.LONG)
+      alloc(dut, cd, robId = 6, paddr = 0x100, data = 0x22222222L, Size.LONG)
+      // load younger than both -> youngest matching store (robId 6) forwards.
+      setQuery(dut, robId = 9, paddr = 0x100, Size.LONG)
+      cd.waitSampling()
+      sleep(1)
+      assert(dut.io.fwd.rsp.hit.toBoolean, "youngest full-overlap should hit")
+      assert(dut.io.fwd.rsp.data.toLong == 0x22222222L,
+        s"youngest store wins: ${dut.io.fwd.rsp.data.toLong.toHexString}")
+      assert(!dut.io.fwd.rsp.stall.toBoolean, "clean full forward -> no stall")
+      // a load BETWEEN the two stores (older than robId 6, younger than robId 4) -> only
+      // the older store (robId 4) is in age range -> forwards the OLD value.
+      setQuery(dut, robId = 5, paddr = 0x100, Size.LONG)
+      sleep(1)
+      assert(dut.io.fwd.rsp.hit.toBoolean, "older-only overlap still full-hits")
+      assert(dut.io.fwd.rsp.data.toLong == 0x11111111L,
+        s"between-load sees the older store: ${dut.io.fwd.rsp.data.toLong.toHexString}")
+      cd.waitSampling(2)
+    }
+  }
+
+  test("forward partial-overlap boundary cases (pre-registered range bounds)", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      // WORD store at 0x102..0x103.
+      alloc(dut, cd, robId = 4, paddr = 0x102, data = 0xBEEFL, Size.WORD)
+      // load BYTE at 0x101 -> just below the store range (paddrLo=0x102) -> NO overlap.
+      setQuery(dut, robId = 6, paddr = 0x101, Size.BYTE)
+      cd.waitSampling()
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean && !dut.io.fwd.rsp.stall.toBoolean,
+        "byte just below the store range must not overlap")
+      // load BYTE at 0x103 -> inside the store range -> partial overlap -> stall.
+      setQuery(dut, robId = 6, paddr = 0x103, Size.BYTE)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean, "sub-range byte is not a full forward")
+      assert(dut.io.fwd.rsp.stall.toBoolean, "byte inside the store range -> stall")
+      // load BYTE at 0x104 -> just above the store range (paddrHi=0x104) -> NO overlap.
+      setQuery(dut, robId = 6, paddr = 0x104, Size.BYTE)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean && !dut.io.fwd.rsp.stall.toBoolean,
+        "byte just above the store range (== paddrHi) must not overlap")
+      cd.waitSampling(2)
+    }
+  }
+
   test("partial overlap with an older store stalls the load", VerilatorTest) {
     M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
       val cd = initDut(dut)

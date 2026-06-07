@@ -82,12 +82,24 @@ class StoreQueue(depth: Int = 8) extends Component {
   val useStrbAs = Vec.fill(depth)(RegInit(False))
   val strbAs    = Vec.fill(depth)(RegInit(B(0, 16 bits)))
   val lineDataAs= Vec.fill(depth)(RegInit(B(0, 128 bits)))
+  // FMax (P1): PRE-REGISTERED slot-A upper byte-range bound, computed at ALLOC as
+  // paddr + nbytesA. The forward overlap test then compares the load range against
+  // this stored bound (a COMPARE) instead of recomputing paddr+nbytes in the
+  // forward cone (which placed a per-entry CARRY8 adder in the binding
+  // s2Paddr->fwdData post-route path). Stored at 32 bits — EXACTLY the width of the
+  // old combinational `paddrs(i) + nbytesAs(i)` (SpinalHDL `+` yields a 32-bit
+  // result, carry-out dropped), so the (qLo < aHi) compare is bit-identical to
+  // before. paddrLo is just paddrs(i) (no adder needed).
+  val paddrHiAs = Vec.fill(depth)(RegInit(U(0, 32 bits)))
   // optional slot B (second half of a split store)
   val validBs   = Vec.fill(depth)(RegInit(False))
   val paddrBs   = Vec.fill(depth)(RegInit(U(0, 32 bits)))
   val nbytesBs  = Vec.fill(depth)(RegInit(U(0, 3 bits)))
   val strbBs    = Vec.fill(depth)(RegInit(B(0, 16 bits)))
   val lineDataBs= Vec.fill(depth)(RegInit(B(0, 128 bits)))
+  // PRE-REGISTERED slot-B upper byte-range bound (= paddrB + nbytesB), same rationale
+  // and same 32-bit width (bit-identical to the old `paddrBs(i) + nbytesBs(i)`).
+  val paddrHiBs = Vec.fill(depth)(RegInit(U(0, 32 bits)))
   // drain phase of the head entry: false = slot A, true = slot B (split only)
   val drainPhaseB = RegInit(False)
 
@@ -150,13 +162,14 @@ class StoreQueue(depth: Int = 8) extends Component {
     val ent      = valids(i) && olderThan(robIds(i), q.robId)
     val qLo      = q.paddr
     val qHi      = q.paddr + qBytes
-    // slot A range
+    // slot A range. paddrHi is PRE-REGISTERED at alloc (= paddr + nbytesA), so the
+    // overlap test is a pure COMPARE here — no per-entry adder in the forward cone.
     val aLo      = paddrs(i)
-    val aHi      = paddrs(i) + nbytesAs(i)
+    val aHi      = paddrHiAs(i)
     val overlapA = ent && (qLo < aHi) && (aLo < qHi)
-    // slot B range (only when this entry is a split store)
+    // slot B range (only when this entry is a split store); bHi pre-registered too.
     val bLo      = paddrBs(i)
-    val bHi      = paddrBs(i) + nbytesBs(i)
+    val bHi      = paddrHiBs(i)
     val overlapB = ent && validBs(i) && (qLo < bHi) && (bLo < qHi)
     val overlap  = overlapA || overlapB
     // full overlap = exact addr+size against slot A of a NON-split store.
@@ -210,12 +223,19 @@ class StoreQueue(depth: Int = 8) extends Component {
     datas(tail)     := io.alloc.payload.data
     sizes(tail)     := io.alloc.payload.size
     nbytesAs(tail)  := io.alloc.payload.nbytesA
+    // PRE-REGISTER the slot-A upper byte-range bound (= paddr + nbytesA). This `+`
+    // yields a 32-bit result (carry-out dropped), bit-identical to the old forward-
+    // path `paddrs(i) + nbytesAs(i)` — the adder now lives at alloc (once/cycle, off
+    // the forward cone) instead of per-entry in the binding s2Paddr->fwdData path.
+    paddrHiAs(tail) := io.alloc.payload.paddr + io.alloc.payload.nbytesA
     useStrbAs(tail) := io.alloc.payload.useStrbA
     strbAs(tail)    := io.alloc.payload.strbA
     lineDataAs(tail):= io.alloc.payload.lineDataA
     validBs(tail)   := io.alloc.payload.validB
     paddrBs(tail)   := io.alloc.payload.paddrB
     nbytesBs(tail)  := io.alloc.payload.nbytesB
+    // PRE-REGISTER the slot-B upper byte-range bound (= paddrB + nbytesB), same as A.
+    paddrHiBs(tail) := io.alloc.payload.paddrB + io.alloc.payload.nbytesB
     strbBs(tail)    := io.alloc.payload.strbB
     lineDataBs(tail):= io.alloc.payload.lineDataB
     tail := tail + 1
