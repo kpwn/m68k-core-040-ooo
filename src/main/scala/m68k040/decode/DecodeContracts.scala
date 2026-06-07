@@ -66,6 +66,12 @@ case class OpSpec() extends Bundle {
   // these False. (div64 / the Dr:Dq pair are set by the line-4 DIV.L decode in T6/T7.)
   val divSigned = Bool()
   val div64     = Bool()
+  // Line-E shift/rotate control: shiftOp = tt (0=AS,1=LS,2=ROX,3=RO), shiftDir = d
+  // (1=left), shiftImm = the `i=0` immediate-count form (count = ccc, 0->8 in the
+  // assembler). Non-shift ops leave these at 0/False.
+  val shiftOp   = Bits(2 bits)
+  val shiftDir  = Bool()
+  val shiftImm  = Bool()
 }
 object OpSpec {
   def illegalDefault(): OpSpec = {
@@ -79,6 +85,7 @@ object OpSpec {
     o.isBranch := False;  o.cond := 0
     o.illegal := True
     o.divSigned := False; o.div64 := False
+    o.shiftOp := 0; o.shiftDir := False; o.shiftImm := False
     o
   }
 }

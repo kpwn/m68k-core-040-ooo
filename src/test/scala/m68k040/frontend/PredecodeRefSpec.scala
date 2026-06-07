@@ -31,8 +31,15 @@ class PredecodeRefSpec extends AnyFunSuite {
   test("deferred ops -> complex") {
     assert(classify(0x5240) == cp(false,0))  // ADDQ.W #1,D0
     assert(classify(0x51C8) == cp(false,0))  // DBRA D0
-    assert(classify(0xE148) == cp(false,0))  // LSL.W #8,D0
+    assert(classify(0xE0D0) == cp(false,0))  // ASR.W (A0) (line-E memory single-bit, ss=11) -> deferred
     assert(classify(0x41D0) == cp(false,0))  // LEA (A0),A0
+  }
+  test("line-E register-form shifts/rotates -> simple len1 (in scope)") {
+    assert(classify(0xE148) == cp(true,1))   // LSL.W #8,D0
+    assert(classify(0xE380) == cp(true,1))   // ASL.L #1,D0
+    assert(classify(0xE32A) == cp(true,1))   // LSL.B Dc,D2 (register count)
+    assert(classify(0xE493) == cp(true,1))   // ROXR.L #2,D3
+    assert(classify(0xE0D8) == cp(false,0))  // ss=11 memory form -> complex
   }
   test("line-0 immediates ADDI/SUBI/ANDI/ORI/EORI/CMPI -> Dn (in scope)") {
     assert(classify(0x0000) == cp(true,2))   // ORI.B  #imm,D0 (.B = opword + 1 imm word)

@@ -805,6 +805,77 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  // ── Line-E register-form shifts/rotates (immediate count) lock-step ─────────
+  // Each of the 8 ops, .B/.W/.L, with operands exercising C/X/V/N/Z edges:
+  // shift-out-1, ASL sign-change (V), and ROX-through-X. Result + NZVCX step-for-step.
+  test("lock-step: ASL/ASR .B/.W/.L immediate count (NZVCX, ASL-V)", VerilatorTest) {
+    runLockStep("shift-as-imm", Seq(
+      "move.l #0x40000000,%d0", "asl.l #1,%d0",            // .L sign-change -> V, C=0
+      "move.l #0xc0000000,%d1", "asl.l #1,%d1",            // .L MSB stable (both top bits 1) -> V=0, C=1
+      "move.l #0x00000040,%d2", "asl.b #2,%d2",            // .B 0x40<<2 -> 0x00 C=1 from bit6
+      "move.l #0xffffffff,%d3", "asr.l #4,%d3",            // .L sign-extend, C=1
+      "move.l #0x00008000,%d4", "asr.w #1,%d4",            // .W arithmetic -> 0x0000c000 N=1 C=0
+      "move.l #0x00000081,%d5", "asr.b #1,%d5",            // .B -> 0x000000c0 C=1
+      "move.l #0x00000001,%d6", "asl.l #8,%d6"             // .L generic
+    ).mkString(" ; "))
+  }
+  test("lock-step: LSL/LSR .B/.W/.L immediate count (NZ, C=X, V=0)", VerilatorTest) {
+    runLockStep("shift-ls-imm", Seq(
+      "move.l #0x80000000,%d0", "lsl.l #1,%d0",            // .L -> 0 C=1 X=1 Z=1
+      "move.l #0x00000001,%d1", "lsr.l #1,%d1",            // .L -> 0 C=1 X=1 Z=1
+      "move.l #0x00008000,%d2", "lsl.w #1,%d2",            // .W -> 0 C=1
+      "move.l #0x00000001,%d3", "lsr.b #1,%d3",            // .B -> 0 C=1
+      "move.l #0x12345678,%d4", "lsr.l #4,%d4",            // .L generic C=0
+      "move.l #0x000000ff,%d5", "lsl.b #8,%d5"             // .B shift==size
+    ).mkString(" ; "))
+  }
+  test("lock-step: ROXL/ROXR .B/.W/.L immediate count (rotate-through-X)", VerilatorTest) {
+    runLockStep("shift-rox-imm", Seq(
+      // seed X via an add that carries, then ROX feeds X in and out.
+      "ori #0x10,%ccr",                                    // X=1 (CCR bit4)
+      "move.l #0x00000000,%d1", "roxl.l #1,%d1",           // X(1) rotates into bit0 -> d1=1, X=0
+      "move.l #0x80000000,%d2", "roxl.l #1,%d2",           // bit31 -> X/C, X-in(0) -> bit0
+      "move.l #0x00000001,%d3", "roxr.l #1,%d3",           // bit0 -> X/C
+      "move.l #0x00000001,%d4", "roxr.w #1,%d4",           // .W ROX
+      "move.l #0x00000080,%d5", "roxl.b #1,%d5"            // .B ROX
+    ).mkString(" ; "))
+  }
+  test("lock-step: ROL/ROR .B/.W/.L immediate count (C, X UNAFFECTED)", VerilatorTest) {
+    runLockStep("shift-ro-imm", Seq(
+      // pre-set X=1 via carry; ROL/ROR must leave X untouched.
+      "ori #0x10,%ccr",                                    // X=1 (CCR bit4)
+      "move.l #0x80000001,%d0", "rol.l #1,%d0",            // -> 0x00000003, C=1, X stays 1
+      "move.l #0x00000001,%d1", "ror.l #1,%d1",            // -> 0x80000000, C=1, X stays 1
+      "move.l #0x00008000,%d2", "rol.w #1,%d2",            // .W -> 0x0001 C=1
+      "move.l #0x00000001,%d3", "ror.b #1,%d3",            // .B -> 0x80 C=1
+      "move.l #0x12345678,%d4", "rol.l #4,%d4"             // .L generic
+    ).mkString(" ; "))
+  }
+
+  // ── Line-E register-form shifts/rotates (register count Dc mod 64) lock-step ─
+  // count = Dc & 0x3f. Exercise count 0 (flag specials), count >= size, mod-64
+  // wrap, and the generic case across the 8 ops + .B/.W/.L.
+  test("lock-step: AS/LS register count (count 0, >=size, mod-64)", VerilatorTest) {
+    runLockStep("shift-asls-reg", Seq(
+      "move.l #0xdeadbeef,%d0", "moveq #0,%d1", "asl.l %d1,%d0",   // count 0: C=0, X untouched, NZ of src
+      "move.l #0x00000001,%d2", "moveq #32,%d3", "asl.l %d3,%d2",  // count==size: result 0, C=X=src&1
+      "move.l #0x00008000,%d4", "moveq #40,%d5", "lsl.w %d5,%d4",  // .W count 40>16: result 0
+      "move.l #0xffffffff,%d6", "moveq #4,%d7", "asr.l %d7,%d6",   // .L generic arithmetic, C=1
+      "move.l #0x12345678,%d0", "move.l #64,%d1", "lsl.l %d1,%d0", // Dc=64 -> mod64=0 -> count 0
+      "move.l #0x80000000,%d2", "moveq #1,%d3", "lsr.l %d3,%d2"    // .L LSR generic
+    ).mkString(" ; "))
+  }
+  test("lock-step: ROX/RO register count (count 0=ROX-C-from-X, mod-64)", VerilatorTest) {
+    runLockStep("shift-roxro-reg", Seq(
+      "ori #0x10,%ccr",                                            // X=1
+      "move.l #0x00000000,%d0", "moveq #0,%d1", "roxl.l %d1,%d0",  // ROX count0: C=X (1), result=src
+      "move.l #0x00000001,%d2", "moveq #1,%d3", "roxr.l %d3,%d2",  // ROXR bit0 -> X/C
+      "move.l #0x80000001,%d4", "moveq #0,%d5", "rol.l %d5,%d4",   // ROL count0: C=0, X untouched, NZ src
+      "move.l #0x00000001,%d6", "moveq #36,%d7", "ror.l %d7,%d6",  // ROR Dc=36 mod32=4
+      "move.l #0x00000003,%d0", "move.l #33,%d1", "roxl.l %d1,%d0" // ROXL Dc=33 mod33=0 -> count0 path
+    ).mkString(" ; "))
+  }
+
   // ── ANDI/ORI/EORI #imm,CCR (NOT privileged — CCR only) lock-step ────────────
   // Set up the CCR via an arithmetic op (subi -> known NZVCX), then AND/OR/EOR the
   // immediate byte into the CCR (X=4,N=3,Z=2,V=1,C=0), verified step-for-step incl X.

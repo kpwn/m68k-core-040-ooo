@@ -127,4 +127,41 @@ class OperationDecoderSpec extends AnyFunSuite {
   test("line-0 opmode4 (bit/BTST-imm) -> illegal (out of scope)", VerilatorTest) {
     run(0x0840) { dut => assert(dut.o.illegal.toBoolean) }
   }
+
+  // ── Line-E register-form shifts/rotates (1110 ccc d ss i tt rrr) ─────────────
+  test("ASL.L #1,D0 (0xE380): SHIFT tt=00 dir=left .L, imm, NZVC+X", VerilatorTest) {
+    run(0xE380) { dut =>
+      assert(dut.o.op.toEnum == DecOp.SHIFT && dut.o.size.toEnum == Size.LONG && !dut.o.illegal.toBoolean)
+      assert(dut.o.shiftOp.toInt == 0 && dut.o.shiftDir.toBoolean && dut.o.shiftImm.toBoolean)
+      assert(dut.o.writesNzvc.toBoolean && dut.o.writesX.toBoolean && dut.o.dstWrites.toBoolean)
+    }
+  }
+  test("ASR.W #3,D1 (0xE641): SHIFT tt=00 dir=right .W, imm, writesX", VerilatorTest) {
+    run(0xE641) { dut =>
+      assert(dut.o.op.toEnum == DecOp.SHIFT && dut.o.size.toEnum == Size.WORD)
+      assert(dut.o.shiftOp.toInt == 0 && !dut.o.shiftDir.toBoolean && dut.o.shiftImm.toBoolean && dut.o.writesX.toBoolean)
+    }
+  }
+  test("LSL.B Dc,D2 (0xE32A): SHIFT tt=01 dir=left .B, register count (i=1)", VerilatorTest) {
+    run(0xE32A) { dut =>
+      assert(dut.o.op.toEnum == DecOp.SHIFT && dut.o.size.toEnum == Size.BYTE)
+      assert(dut.o.shiftOp.toInt == 1 && dut.o.shiftDir.toBoolean && !dut.o.shiftImm.toBoolean && dut.o.writesX.toBoolean)
+    }
+  }
+  test("ROXR.L #2,D3 (0xE493): SHIFT tt=10 dir=right .L, imm, writesX", VerilatorTest) {
+    run(0xE493) { dut =>
+      assert(dut.o.op.toEnum == DecOp.SHIFT && dut.o.size.toEnum == Size.LONG)
+      assert(dut.o.shiftOp.toInt == 2 && !dut.o.shiftDir.toBoolean && dut.o.writesX.toBoolean)
+    }
+  }
+  test("ROR.W #1,D4 (0xE25C): SHIFT tt=11 dir=right .W, ROL/ROR do NOT write X", VerilatorTest) {
+    run(0xE25C) { dut =>
+      assert(dut.o.op.toEnum == DecOp.SHIFT && dut.o.size.toEnum == Size.WORD)
+      assert(dut.o.shiftOp.toInt == 3 && !dut.o.shiftDir.toBoolean)
+      assert(dut.o.writesNzvc.toBoolean && !dut.o.writesX.toBoolean)
+    }
+  }
+  test("line-E ss=11 (memory single-bit form) -> illegal (deferred)", VerilatorTest) {
+    run(0xE0D0) { dut => assert(dut.o.illegal.toBoolean) }   // 1110 000 0 11 010000
+  }
 }

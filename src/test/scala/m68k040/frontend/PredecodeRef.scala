@@ -165,6 +165,11 @@ object PredecodeRef {
           }
         } else if (isEor && srcMode == 0) CP(simple = true, lenWords = 1)  // EOR Dn,Dm
         else COMPLEX
+      // Line-E register-form shifts/rotates (1110 ccc d ss i tt rrr): single-word.
+      // ss=11 is the memory single-bit form (deferred RMW) -> COMPLEX.
+      case 0xE =>
+        val ss = (op >> 6) & 3
+        if (ss != 3) CP(simple = true, lenWords = 1) else COMPLEX
       case _ => COMPLEX
     }
   }
