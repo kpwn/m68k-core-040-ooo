@@ -163,26 +163,28 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // (psrcAValid=false; the assembler folded the absolute/PC value into imm), so
     // the base contribution must be ZERO there — otherwise the stale psrcA (which
     // defaults to physreg 0) would corrupt the computed address.
+    // FMax: the AGU BASE operand crosses the ALU->LS boundary COMBINATIONALLY — the
+    // ALU EU's S1 result bypasses (intByp) into rdBase.data the same cycle a dependent
+    // LS µop reads it. Computing `va0 = base + disp` here in S0 therefore chained the
+    // ALU datapath adder + the AGU adder across the boundary into the `s1Va` flop (the
+    // 26-level, 3x CARRY8, -2.375ns OOC worst path: AluEu.s1Src2 -> ALU result ->
+    // bypass -> base0 -> va0 -> s1Va). FIX (standing rule: registered module
+    // boundaries): REGISTER the bypassed base operand at the LS boundary (`s1Base`),
+    // and compute the effective address `s1Va` in S1 off that flop + the shallow
+    // (uop-derived, no-bypass) displacement. The ALU->base cone now ENDS at `s1Base`;
+    // the AGU adder is a SEPARATE shallow stage (s1Base_reg + disp -> s1Va), not
+    // chained onto the ALU's result. (Latency-agnostic: lock-step is instruction-level
+    // and the EU is single-outstanding.)
     val base0 = Mux(u0.psrcAValid, rdBase.data.asUInt, U(0, 32 bits))
-    // STACK-PUSH (BSR/JSR): predecrement store. addr = base(A7) - sizeBytes, and the
-    // STORE DATA is `imm` (retPC), not a register. The displacement is therefore the
-    // negative access size (NOT u0.imm). sizeBytes computed below (sizeBytes(u0.size)).
-    def szBytes0(s: m68k040.isa.Size.C): SInt = {
-      val n = SInt(32 bits); n := 1
-      switch(s) {
-        is(m68k040.isa.Size.BYTE) { n := 1 }
-        is(m68k040.isa.Size.WORD) { n := 2 }
-        is(m68k040.isa.Size.LONG) { n := 4 }
-      }
-      n
-    }
-    val disp0 = Mux(u0.stkPush, -szBytes0(u0.size), u0.imm.asSInt)
-    val va0   = (base0.asSInt + disp0).asUInt
+    // STORE DATA: `imm` (retPC) for a stack-push (BSR/JSR predecrement), else the
+    // (possibly bypassed) source register. Captured into `s1Data` at the boundary; it
+    // is NOT on the AGU cone (feeds only the SQ entry), so it stays a registered value.
     val data0 = Mux(u0.stkPush, u0.imm, rdData.data)   // push: data = retPC (imm)
 
-    // ---- AGU cross-line / cross-page detection (S0, combinational) ----
-    // sizeBytes from the access size (1/2/4). A single m68k access spans at most
-    // two 16-byte lines / two 4 KB pages, so a single "second access" suffices.
+    // ---- access size in bytes (1/2/4) ----
+    // A single m68k access spans at most two 16-byte lines / two 4 KB pages, so a
+    // single "second access" suffices. Used by the S1 cross-detection (below) and
+    // the store byte-lane split.
     def sizeBytes(s: m68k040.isa.Size.C): UInt = {
       val n = UInt(3 bits); n := 1
       switch(s) {
@@ -192,29 +194,60 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       }
       n
     }
-    val nBytes0    = sizeBytes(u0.size)
-    val lineOff0   = va0(3 downto 0)
-    val pageOff0   = va0(11 downto 0)
-    val crossLine0 = (lineOff0 +^ nBytes0) > U(16)
-    val crossPage0 = (pageOff0 +^ nBytes0) > U(4096)
-    val twoAccess0 = crossLine0 || crossPage0
-    // addrB = next line base = (va & ~15) + 16. When crossPage this equals the
-    // next page base (the line that crosses the page boundary is the page-aligned
-    // first line of the next page).
-    val addrB0     = (va0 & ~U(15, 32 bits)) + 16
 
     // ---- S0 -> S1 register (M2S) ----
+    // `s1Base` is the REGISTERED (post-bypass) AGU base operand; the deep ALU->base
+    // cone ends here. `s1Data` is the registered store data (off the AGU cone).
     val s1Valid = RegInit(False)
     val s1Ctx   = Reg(IqContext())
-    val s1Va    = Reg(UInt(32 bits))
+    val s1Base  = Reg(UInt(32 bits))
     val s1Data  = Reg(Bits(32 bits))
-    // Registered cross-detection (alongside s1Va). simPublic for directed probing.
-    val s1CrossLine = RegInit(False)
-    val s1CrossPage = RegInit(False)
-    val s1TwoAccess = RegInit(False)
-    val s1AddrB     = Reg(UInt(32 bits))
-    s1CrossLine.simPublic(); s1CrossPage.simPublic(); s1TwoAccess.simPublic(); s1AddrB.simPublic()
     val u1 = s1Ctx.uop
+
+    // ---- S1: AGU effective address (off the REGISTERED base) ----
+    // addr = base + disp. STACK-PUSH (BSR/JSR) predecrements: disp = -sizeBytes (the
+    // store data is `imm`=retPC, handled via data0 -> s1Data). Otherwise disp = imm.
+    // Both come from the registered uop (`u1`) — no bypass — so `s1Va` is a SINGLE
+    // shallow adder off the `s1Base` flop, not chained onto the ALU result. `s1Va` is
+    // combinational off held flops (s1Base/s1Ctx are held stable while busy), so every
+    // FSM consumer (IDLE+ cycles) reads a consistent address; the translated paddr is
+    // registered downstream in s2Paddr/s2PaddrB.
+    def szBytes1(s: m68k040.isa.Size.C): SInt = {
+      val n = SInt(32 bits); n := 1
+      switch(s) {
+        is(m68k040.isa.Size.BYTE) { n := 1 }
+        is(m68k040.isa.Size.WORD) { n := 2 }
+        is(m68k040.isa.Size.LONG) { n := 4 }
+      }
+      n
+    }
+    val s1Disp = Mux(u1.stkPush, -szBytes1(u1.size), u1.imm.asSInt)
+    val s1Va   = (s1Base.asSInt + s1Disp).asUInt
+
+    // ---- AGU cross-line / cross-page detection (S1, off s1Va) ----
+    // The cross-detection / next-line base USED to be computed in S0 off the
+    // combinational `va0` (= base+disp) and latched into s1* the same cycle, which —
+    // because `base0` bypasses combinationally from the ALU — fused the +16 / cross
+    // compares onto the ALU->va chain (2 of the original 4 chained CARRY8 adders). They
+    // are now derived off `s1Va` (itself a shallow adder off the `s1Base` flop), so the
+    // next-line base / cross compares are a SEPARATE shallow stage downstream of the
+    // registered base — NOT chained onto the ALU result. `s1Va` is stable across the
+    // FSM (s1Base is held while busy; issue.ready gates a new latch), so every FSM
+    // consumer (IDLE+ cycles) reads consistent values; the slot-B paddr is registered
+    // downstream in `s2PaddrB` (IDLE). simPublic for directed probing (AguCrossSpec
+    // samples one cycle after the S1 latch, where s1Base/s1Va are valid+stable, so the
+    // comb values match the old registered ones exactly).
+    val nBytes1    = sizeBytes(u1.size)
+    val lineOff1   = s1Va(3 downto 0)
+    val pageOff1   = s1Va(11 downto 0)
+    val s1CrossLine = (lineOff1 +^ nBytes1) > U(16)
+    val s1CrossPage = (pageOff1 +^ nBytes1) > U(4096)
+    val s1TwoAccess = s1CrossLine || s1CrossPage
+    // addrB = next line base = (s1Va & ~15) + 16. When crossPage this equals the next
+    // page base (the line that crosses the page boundary is the page-aligned first
+    // line of the next page).
+    val s1AddrB     = (s1Va & ~U(15, 32 bits)) + 16
+    s1CrossLine.simPublic(); s1CrossPage.simPublic(); s1TwoAccess.simPublic(); s1AddrB.simPublic()
 
     // ---- translate-at-execute: the LS EU DRIVES the D-side translation port ----
     // It presents the access VPN (loadVaddr, which the FSM sets to s1Va for slot A
@@ -526,16 +559,18 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // this only stalls issue for that one extra cycle.
     issuePort.ready := !busy && !s1Valid && !compValid
 
-    // S0 -> S1 advance (only when not busy in a wait state)
+    // S0 -> S1 advance (only when not busy in a wait state). The bypassed BASE operand
+    // (`base0`) is latched here — NOT the computed effective address — so the deep
+    // ALU->base cone ends at the `s1Base` flop. The effective address `s1Va`, the
+    // cross-detection, and the next-line base (`s1AddrB`/`s1CrossLine`/`s1CrossPage`/
+    // `s1TwoAccess`) are all derived COMBINATIONALLY off `s1Base`/`s1Va` above (shallow
+    // stages off the flop), so neither the AGU adder nor the +16/cross compares are
+    // chained onto the ALU result.
     when(issuePort.fire) {
       s1Valid := True
       s1Ctx   := issuePort.payload
-      s1Va    := va0
+      s1Base  := base0
       s1Data  := data0
-      s1CrossLine := crossLine0
-      s1CrossPage := crossPage0
-      s1TwoAccess := twoAccess0
-      s1AddrB     := addrB0
     } otherwise {
       when(!busy) { s1Valid := False }
     }
