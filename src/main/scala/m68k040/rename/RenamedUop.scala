@@ -54,6 +54,9 @@ case class RenamedUop() extends Bundle {
   // shiftDir = d (1=left). Count = useImm/imm (i=0) or psrcB=Dc (i=1). Threaded.
   val shiftOp      = Bits(2 bits)
   val shiftDir     = Bool()
+  // MOVEA (MOVE with an ADDRESS-register dst): full-32 write, .W sign-extends the
+  // source, no flags. The ALU EU keys off it to bypass the .B/.W partial merge.
+  val isMovea      = Bool()
   // Macro-instruction boundary marker (interrupts): True for the FIRST µop of an
   // instruction (the only multi-µop case is a memSimple-source crack [load, op]).
   val firstOfInstr = Bool()

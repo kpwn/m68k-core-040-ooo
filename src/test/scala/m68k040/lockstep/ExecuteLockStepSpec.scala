@@ -750,6 +750,32 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #99,%d0 ; moveq #42,%d1 ; move.l %d1,%d2 ; move.l %d2,%d3")
   }
 
+  // ── MOVE.B/.W to Dn: partial-register write (preserve Dn upper bytes) ───────
+  // 68k semantics: MOVE.B writes Dn[7:0] / preserves Dn[31:8]; MOVE.W writes
+  // Dn[15:0] / preserves Dn[31:16]; MOVE.L writes all 32. MOVE sets N/Z from the
+  // moved value (per size), V=C=0, X untouched. Seed Dn = 0x11223344 (a long-imm
+  // MOVE.L) then a .B / .W MOVE: the value AND flags are compared step-for-step.
+  test("lock-step: MOVE.B/.W to Dn preserves upper bytes", VerilatorTest) {
+    runLockStep("move-partial", Seq(
+      "move.l #0x11223344,%d0", "move.b #0xaa,%d0",            // -> 0x112233aa, N=1
+      "move.l #0x11223344,%d1", "move.w #0x55aa,%d1",          // -> 0x112255aa
+      "move.l #0xffffffff,%d2", "move.b #0x00,%d2",            // -> 0xffffff00, Z=1
+      "move.l #0x80000000,%d3", "move.w #0x0001,%d3",          // -> 0x80000001
+      "move.l #0x12345678,%d4", "move.b %d0,%d4",              // reg src .B -> 0x123456aa
+      "move.l #0x0000abcd,%d5", "move.w %d1,%d5"               // reg src .W -> 0x000055aa
+    ).mkString(" ; "))
+  }
+
+  // MOVE.L to Dn (full write, no merge) + MOVEA.W/.L (An full-32, .W sign-extend,
+  // NO flags) must stay correct — guards against the partial fix touching them.
+  test("lock-step: MOVE.L full + MOVEA.W/.L (no merge / no flags)", VerilatorTest) {
+    runLockStep("move-l-movea", Seq(
+      "move.l #0x11223344,%d0", "move.l #0xaabbccdd,%d0",      // .L full overwrite
+      "move.l #0x0000ffff,%d1", "movea.w %d1,%a2",             // .W sign-extend -> 0xffffffff
+      "move.l #0x12345678,%d3", "movea.l %d3,%a4"              // .L full to An
+    ).mkString(" ; "))
+  }
+
   test("lock-step: mixed straight-line (~24 instrs)", VerilatorTest) {
     runLockStep("mixed", Seq(
       "moveq #1,%d0", "moveq #2,%d1", "moveq #3,%d2", "moveq #4,%d3",

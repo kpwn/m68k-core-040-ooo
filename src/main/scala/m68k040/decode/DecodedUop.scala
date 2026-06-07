@@ -117,6 +117,12 @@ case class DecodedUop() extends Bundle {
   // Default 0/False (non-shift µops). Threaded through rename to the ALU EU.
   val shiftOp      = Bits(2 bits)
   val shiftDir     = Bool()
+  // MOVEA (MOVE / MOVEQ-class with an ADDRESS-register destination): An is ALWAYS
+  // written full-32 and sets NO flags; the .W form SIGN-EXTENDS the 16-bit source to
+  // 32 bits. The ALU EU keys off this to bypass the .B/.W partial-register merge
+  // (which is for DATA-reg destinations only) and to sign-extend a .W MOVEA source.
+  // Default False (every other op, incl. MOVE-to-Dn, leaves it clear).
+  val isMovea      = Bool()
   // Macro-instruction boundary marker: True for the FIRST µop of an instruction.
   // The cracker emits 1 or 2 µops/instruction; the only 2-µop case is a memSimple
   // source crack -> [load, op] where the LOAD is first. An interrupt may be taken

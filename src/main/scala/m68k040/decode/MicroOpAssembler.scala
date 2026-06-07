@@ -104,6 +104,7 @@ object MicroOpAssembler {
     opUop.divIsRem      := False
     opUop.shiftOp       := spec.shiftOp
     opUop.shiftDir      := spec.shiftDir
+    opUop.isMovea       := False
     // CHK / DIV are group-2 traps (CHK vec6, DIV0 vec5) delivered execute-time via
     // euFault -> format-$2: they stack the NEXT instruction's PC (the 040 group-2
     // frame's PC = pc+len). The fault is conditional (set at execute), but faultPc is
@@ -195,6 +196,34 @@ object MicroOpAssembler {
     // MOVE: NZVC only if the destination EA is a data register.
     when(spec.writesNzvcIfDataDst) { opUop.writesNzvc := (dstEa.klass === EaClass.DATAREG) }
 
+    // ── MOVE.B/.W to a DATA register: partial-register write (preserve Dn upper) ─
+    // 68k semantics: MOVE.B writes Dn[7:0] / preserves Dn[31:8]; MOVE.W writes
+    // Dn[15:0] / preserves Dn[31:16]. The ALU EU does the .B/.W size-merge using
+    // s1Src1 (= srcA) as the OLD-value source — but a plain MOVE has no srcA, so the
+    // EU would drop the upper bytes. Make the .B/.W reg-dest MOVE READ the old Dn as
+    // srcA (the merge source); the EU's normal size-merge then preserves the upper
+    // bytes. This adds a partial-register DEPENDENCY (the MOVE now reads its own
+    // destination); rename allocates psrcA from the dest's current mapping and the IQ
+    // wakeup (uop.psrcAValid) tracks it. UNCHANGED: MOVE.L (full 32 write, no merge
+    // needed -> no srcA read), MOVE to memory (crackStore -> stUop, opUop unused),
+    // MOVEA / MOVE to An (dstEa is ADDRREG, not DATAREG -> excluded; An is full-32).
+    val moveDataDst = (spec.op === DecOp.MOVE) && (dstEa.klass === EaClass.DATAREG)
+    val movePartial = moveDataDst && (spec.size === Size.BYTE || spec.size === Size.WORD)
+    when(movePartial) {
+      opUop.srcAReg   := dstEa.reg     // the destination Dn = the merge (old-value) source
+      opUop.srcAValid := True
+    }
+
+    // ── MOVEA (MOVE with an ADDRESS-register destination) ──────────────────────
+    // An is ALWAYS written full-32 (no partial merge) and sets NO flags; the .W form
+    // sign-extends the 16-bit source. Mark the op so the ALU EU bypasses the .B/.W
+    // merge and sign-extends a .W source. (A reg-direct An source is DATAREG/ADDRREG,
+    // so no leading load is cracked; MOVEA's source EA is the usual srcB EASRC.)
+    val moveAddrDst = (spec.op === DecOp.MOVE) && (dstEa.klass === EaClass.ADDRREG)
+    when(moveAddrDst) {
+      opUop.isMovea := True
+    }
+
     // Branch displacement (byte / word / long), reproducing the simple-decode rule.
     when(spec.isBranch) {
       val disp8 = op(7 downto 0)
@@ -230,7 +259,7 @@ object MicroOpAssembler {
     ldUop.faultUsesNextPc := False
     ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False; ldUop.isTrapv := False
     ldUop.divSigned     := False; ldUop.div64 := False; ldUop.divIsRem := False
-    ldUop.shiftOp := 0; ldUop.shiftDir := False
+    ldUop.shiftOp := 0; ldUop.shiftDir := False; ldUop.isMovea := False
     ldUop.firstOfInstr  := True    // the LOAD is the FIRST µop of a cracked instruction
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
@@ -264,7 +293,7 @@ object MicroOpAssembler {
     stUop.faultUsesNextPc := False
     stUop.faultAddr     := pkt.pc; stUop.sswInstr := False; stUop.isTrapv := False
     stUop.divSigned     := False; stUop.div64 := False; stUop.divIsRem := False
-    stUop.shiftOp := 0; stUop.shiftDir := False
+    stUop.shiftOp := 0; stUop.shiftDir := False; stUop.isMovea := False
     stUop.firstOfInstr  := True    // a single STORE µop is its own first µop
 
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
@@ -495,7 +524,7 @@ object MicroOpAssembler {
     divlUop.faultUsesNextPc := True            // DIV0 stacks nextPc (group-2 format-$2)
     divlUop.faultAddr     := pkt.pc; divlUop.sswInstr := False; divlUop.isTrapv := False
     divlUop.divSigned     := divlSigned; divlUop.div64 := divl64; divlUop.divIsRem := False
-    divlUop.shiftOp := 0; divlUop.shiftDir := False
+    divlUop.shiftOp := 0; divlUop.shiftDir := False; divlUop.isMovea := False
     divlUop.firstOfInstr  := True
     // 64-bit dividend high word Dr: carried in srcC (psrcC after rename). For the
     // 32-bit form psrcC is unused.
@@ -526,7 +555,7 @@ object MicroOpAssembler {
     divremUop.faultUsesNextPc := False
     divremUop.faultAddr     := pkt.pc; divremUop.sswInstr := False; divremUop.isTrapv := False
     divremUop.divSigned     := divlSigned; divremUop.div64 := divl64; divremUop.divIsRem := True
-    divremUop.shiftOp := 0; divremUop.shiftDir := False
+    divremUop.shiftOp := 0; divremUop.shiftDir := False; divremUop.isMovea := False
     divremUop.firstOfInstr  := False           // trailing crack µop
 
     // DIV.L is valid only when its divisor EA is reg/imm. A memSimple divisor would
@@ -597,7 +626,7 @@ object MicroOpAssembler {
     mullUop.faultUsesNextPc := False
     mullUop.faultAddr     := pkt.pc; mullUop.sswInstr := False; mullUop.isTrapv := False
     mullUop.divSigned     := mullSigned; mullUop.div64 := mull64; mullUop.divIsRem := False
-    mullUop.shiftOp := 0; mullUop.shiftDir := False
+    mullUop.shiftOp := 0; mullUop.shiftDir := False; mullUop.isMovea := False
     mullUop.firstOfInstr  := True
 
     // MULHI (high-product move) µop (.L64 only): CPLX, writes the EU's LATCHED high
@@ -625,7 +654,7 @@ object MicroOpAssembler {
     mulhiUop.faultUsesNextPc := False
     mulhiUop.faultAddr     := pkt.pc; mulhiUop.sswInstr := False; mulhiUop.isTrapv := False
     mulhiUop.divSigned     := mullSigned; mulhiUop.div64 := mull64; mulhiUop.divIsRem := False
-    mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False
+    mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False; mulhiUop.isMovea := False
     mulhiUop.firstOfInstr  := False           // trailing crack µop
 
     // MUL.L is valid only when its multiplier EA is reg/imm (a memSimple multiplier
@@ -670,7 +699,7 @@ object MicroOpAssembler {
     ibrUop.faultUsesNextPc := False
     ibrUop.faultAddr     := pkt.pc; ibrUop.sswInstr := False; ibrUop.isTrapv := False
     ibrUop.divSigned     := False; ibrUop.div64 := False; ibrUop.divIsRem := False
-    ibrUop.shiftOp := 0; ibrUop.shiftDir := False
+    ibrUop.shiftOp := 0; ibrUop.shiftDir := False; ibrUop.isMovea := False
     // JMP is a single µop (its own first); JSR's ibranch is the TRAILING µop (the push
     // is first), so firstOfInstr is False for JSR.
     ibrUop.firstOfInstr  := !isJsrOp
@@ -716,7 +745,7 @@ object MicroOpAssembler {
       u.faulted := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.faultAddr := pkt.pc; u.sswInstr := False; u.isRte := False; u.isTrapv := False
       u.divSigned := False; u.div64 := False; u.divIsRem := False
-      u.shiftOp := 0; u.shiftDir := False
+      u.shiftOp := 0; u.shiftDir := False; u.isMovea := False
       u.firstOfInstr := first
       u
     }

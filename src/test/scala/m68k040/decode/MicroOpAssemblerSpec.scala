@@ -27,14 +27,21 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
     assert(dut.uop.useImm.toBoolean && dut.uop.imm.toLong == 5 && dut.uop.size.toEnum == Size.LONG)
     assert(dut.uop.writesNzvc.toBoolean && !dut.uop.writesX.toBoolean && !dut.uop.unimplemented.toBoolean)
   }}
-  test("MOVE.W D0,D1 (src in srcB, writesNzvc)", VerilatorTest) { run { dut => drive(dut, 0x3200); sleep(1)
+  test("MOVE.W D0,D1 (src in srcB; srcA=dst Dn for partial merge, writesNzvc)", VerilatorTest) { run { dut => drive(dut, 0x3200); sleep(1)
+    // MOVE.W to a DATA register is a PARTIAL-register write (preserve D1[31:16]). The
+    // assembler makes it READ its destination Dn (D1) as srcA so the ALU EU's .B/.W
+    // size-merge has the old value as the merge source.
     assert(dut.uop.op.toEnum == DecOp.MOVE && dut.uop.srcBReg.toInt == 0 && dut.uop.srcBValid.toBoolean)
-    assert(!dut.uop.srcAValid.toBoolean && dut.uop.dstReg.toInt == 1 && dut.uop.dstValid.toBoolean)
+    assert(dut.uop.srcAValid.toBoolean && dut.uop.srcAReg.toInt == 1)   // srcA = dst D1 (merge source)
+    assert(!dut.uop.isMovea.toBoolean && dut.uop.dstReg.toInt == 1 && dut.uop.dstValid.toBoolean)
     assert(dut.uop.writesNzvc.toBoolean)
   }}
-  test("MOVEA.L A0,A1 (src in srcB, no flags)", VerilatorTest) { run { dut => drive(dut, 0x2248); sleep(1)
+  test("MOVEA.L A0,A1 (src in srcB, no flags, isMovea)", VerilatorTest) { run { dut => drive(dut, 0x2248); sleep(1)
     assert(dut.uop.srcBReg.toInt == 8 && dut.uop.srcBValid.toBoolean)
     assert(dut.uop.dstReg.toInt == 9 && dut.uop.dstValid.toBoolean && !dut.uop.writesNzvc.toBoolean)
+    // An-dst MOVE -> isMovea (full-32 write, no partial merge; .W sign-extends). No
+    // srcA dst-read merge source (An is never partially written).
+    assert(dut.uop.isMovea.toBoolean && !dut.uop.srcAValid.toBoolean)
   }}
   test("MOVE.L #imm,D0", VerilatorTest) { run { dut => drive(dut, 0x203C, 0x1234, 0x5678, len = 3); sleep(1)
     assert(dut.uop.useImm.toBoolean && dut.uop.imm.toLong == 0x12345678L && dut.uop.dstReg.toInt == 0)
