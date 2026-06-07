@@ -12,7 +12,9 @@ object OperandKind extends SpinalEnum {
   // immediates ADDI/SUBI/ANDI/ORI/EORI/CMPI). Sized by the op size: .B/.W = 1 word
   // (low byte / word), .L = 2 words. Distinct from IMMQ (the MOVEQ 8-bit signed
   // opword immediate) and from the EA #imm (mode7/reg4, resolved by the EaDecoder).
-  val NONE, REGFIELD, EASRC, EADST, IMMQ, IMMEXT = newElement()
+  // IMMQ3 = the ADDQ/SUBQ 3-bit "quick" immediate (opword bits 11:9, value 1-8 with
+  // ddd==0 meaning 8). Distinct from IMMQ (the MOVEQ 8-bit signed opword immediate).
+  val NONE, REGFIELD, EASRC, EADST, IMMQ, IMMEXT, IMMQ3 = newElement()
 }
 
 case class OperandSrc() extends Bundle {

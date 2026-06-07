@@ -19,6 +19,7 @@ object OperationDecoder {
     val eadst   = OperandSrc(); eadst.kind := OperandKind.EADST;  eadst.isAddr := False
     val immq    = OperandSrc(); immq.kind  := OperandKind.IMMQ;   immq.isAddr := False
     val immext  = OperandSrc(); immext.kind := OperandKind.IMMEXT; immext.isAddr := False
+    val immq3   = OperandSrc(); immq3.kind := OperandKind.IMMQ3;  immq3.isAddr := False
 
     switch(line) {
       // ---- Line-0 immediates: ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea> ----
@@ -64,6 +65,31 @@ object OperationDecoder {
           o.srcB := immq
           o.dst := dnField; o.dstWrites := True
           o.writesNzvc := True
+        }
+      }
+      // ---- Line-5: ADDQ/SUBQ #n,<ea> (0101 ddd q ss mmmrrr, ss != 11) ----
+      // q = bit8 (0 = ADDQ, 1 = SUBQ); ddd = bits 11:9 (the quick immediate 1-8, with
+      // ddd==0 meaning 8 — resolved in the assembler from the IMMQ3 operand). ss (7:6)
+      // = .B/.W/.L (11 is the Scc/DBcc/TRAPcc family, handled in the assembler). The EA
+      // (op[5:0]) is the DESTINATION operand: read as srcA (the ALU `a`/merge source),
+      // written back as dst (same EA). Dn dest -> ADD/SUB + NZVCX (size-merged for .B/.W);
+      // An dest -> full-32 ADD/SUB, NO flags (the assembler forces size LONG + clears the
+      // flag masks when the EA resolves to an address register, like ADDA/SUBA). Scc/DBcc
+      // (ss==11) are produced by the assembler (branch-EU condition path), so OpSpec here
+      // leaves them illegal; the assembler overrides. Memory-dest ADDQ/SUBQ is deferred.
+      is(0x5) {
+        val ss = opword(7 downto 6)
+        when(ss =/= 3) {                       // ss==11 -> Scc/DBcc (assembler-built)
+          o.illegal := False
+          o.op := Mux(opword(8), DecOp.SUB, DecOp.ADD)
+          o.srcA := easrc                       // EA = the destination operand (read)
+          o.srcB := immq3                       // the quick immediate (1-8, 0->8)
+          o.dst  := easrc                        // writeback to the same EA register
+          o.dstWrites := True
+          when(ss === 0) { o.size := Size.BYTE }
+            .elsewhen(ss === 1) { o.size := Size.WORD }
+            .otherwise { o.size := Size.LONG }
+          o.writesNzvc := True; o.writesX := True   // Dn dest; assembler clears for An dest
         }
       }
       // ---- MOVE.B/.W/.L (00 ss ...) src EA = bits 5-0, dst EA = bits 11-6 ----

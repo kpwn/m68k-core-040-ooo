@@ -801,6 +801,27 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #0,%d6", "subi.l #1,%d6"                           // .L borrow -> 0xffffffff
     ).mkString(" ; "))
   }
+  // ── Line-5 ADDQ/SUBQ (Dn flags + An full-32 no-flags) lock-step ─────────────
+  // Dn dest: ADD/SUB #1-8 with NZVCX (size-merged for .B/.W), flag-edge operands
+  // (carry/overflow/zero/negative). An dest: full-32 add/sub, NO flags, .W operates
+  // on the full 32 (#imm zero-extended). Value + NZVCX step-for-step vs Musashi.
+  test("lock-step: ADDQ/SUBQ .B/.W/.L Dn flags + An full-32 no-flags", VerilatorTest) {
+    runLockStep("addq-subq", Seq(
+      "moveq #0,%d0", "addq.b #1,%d0", "addq.b #8,%d0",          // .B 0->1->9
+      "move.l #0x0000007f,%d1", "addq.b #1,%d1",                // .B overflow 0x7f+1 -> V,N
+      "move.l #0x000000ff,%d2", "addq.b #1,%d2",                // .B carry/zero 0xff+1 -> C,Z,X
+      "move.l #0x00007fff,%d3", "addq.w #1,%d3",                // .W overflow
+      "move.l #0x7fffffff,%d4", "addq.l #1,%d4",                // .L overflow
+      "moveq #5,%d5", "subq.b #5,%d5",                          // .B zero
+      "moveq #1,%d6", "subq.w #2,%d6",                          // .W borrow -> 0xffff word, N,C,X
+      "move.l #0x11223344,%d7", "subq.l #8,%d7",                // .L generic
+      // An dest: full-32 add/sub, NO flags. .W operates on the full 32 bits.
+      "movea.l #0x00010000,%a0", "addq.w #1,%a0",               // -> 0x00010001 full-32
+      "movea.l #0x00000001,%a1", "subq.l #2,%a1",               // -> 0xffffffff full-32
+      "movea.l #0x0000ffff,%a2", "addq.w #8,%a2"                // -> 0x00010007 full-32 (no word-wrap)
+    ).mkString(" ; "))
+  }
+
   test("lock-step: ANDI/ORI/EORI .B/.W/.L (NZ, V=C=0)", VerilatorTest) {
     runLockStep("andi-ori-eori", Seq(
       "move.l #0x12345678,%d0", "andi.l #0xff00ff00,%d0",       // .L AND

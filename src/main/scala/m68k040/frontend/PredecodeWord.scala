@@ -185,6 +185,27 @@ object PredecodeWord {
         }
       }
 
+      // Line-5: ADDQ/SUBQ (0101 ddd q ss mmmrrr, ss != 11) + Scc/DBcc (ss == 11).
+      //   ss != 11 (ADDQ/SUBQ): dest EA mode 0/1 (Dn/An) -> SIMPLE len1; memory dest is
+      //     the deferred RMW -> COMPLEX (the assembler's illegal path).
+      //   ss == 11: mode 001 -> DBcc (opword + disp16) -> SIMPLE len2; mode 000 -> Scc Dn
+      //     -> SIMPLE len1; other modes (memory Scc / TRAPcc) deferred -> COMPLEX.
+      is(U(5, 4 bits)) {
+        val ss   = op(7 downto 6).asUInt
+        val mode = op(5 downto 3).asUInt
+        when(ss =/= U(3, 2 bits)) {
+          when(mode === U(0, 3 bits) || mode === U(1, 3 bits)) {   // ADDQ/SUBQ Dn / An
+            r.simple := True; r.lenWords := U(1, 3 bits)
+          }
+        } otherwise {                                              // ss == 11
+          when(mode === U(1, 3 bits)) {                            // DBcc + disp16
+            r.simple := True; r.lenWords := U(2, 3 bits)
+          } elsewhen(mode === U(0, 3 bits)) {                      // Scc Dn
+            r.simple := True; r.lenWords := U(1, 3 bits)
+          }
+        }
+      }
+
       // MOVEQ
       is(U(7, 4 bits)) {
         when(op(8) === False) {

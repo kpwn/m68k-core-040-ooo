@@ -58,8 +58,11 @@ object MicroOpAssembler {
     val usesDstEa = (spec.dst.kind === OperandKind.EADST)
 
     // The op consumes a memSimple SOURCE EA -> crack a leading load µop into T0,
-    // and the op reads T0 in the EASRC slot.
-    val crackLoad = usesSrcEa && srcIsMem
+    // and the op reads T0 in the EASRC slot. EXCEPT ADDQ/SUBQ (srcB = IMMQ3): its
+    // EASRC is the DESTINATION (a deferred memory RMW), NOT a load source -> a memory
+    // EA there is illegal (addqMemBad), never a leading-load crack.
+    val isAddqSubq = spec.srcB.kind === OperandKind.IMMQ3
+    val crackLoad = usesSrcEa && srcIsMem && !isAddqSubq
 
     // MOVE reg -> memSimple destination -> a single STORE µop (data = the register
     // source). Mem-to-mem (source also memSimple) is deferred. RMW (ALU op with a
@@ -149,6 +152,13 @@ object MicroOpAssembler {
       is(OperandKind.EADST) { opUop.srcBReg := dstEa.reg; opUop.srcBValid := True }
       is(OperandKind.IMMQ)  { opUop.useImm := True; opUop.imm := op(7 downto 0).asSInt.resize(32).asBits }
       is(OperandKind.IMMEXT) { opUop.useImm := True; opUop.imm := immExt }   // line-0 trailing imm word(s)
+      is(OperandKind.IMMQ3) {
+        // ADDQ/SUBQ quick immediate: ddd = op[11:9], 1-8 with ddd==0 -> 8. Always
+        // POSITIVE (1-8), zero-extended (the An full-32 path adds/subtracts it whole).
+        val ddd = op(11 downto 9).asUInt
+        opUop.useImm := True
+        opUop.imm    := Mux(ddd === 0, U(8, 4 bits), ddd.resize(4)).resize(32).asBits
+      }
       default {}
     }
 
@@ -222,6 +232,19 @@ object MicroOpAssembler {
     val moveAddrDst = (spec.op === DecOp.MOVE) && (dstEa.klass === EaClass.ADDRREG)
     when(moveAddrDst) {
       opUop.isMovea := True
+    }
+
+    // ── ADDQ/SUBQ #n,An — full-32, NO flags (like ADDA/SUBA) ───────────────────
+    // ADDQ/SUBQ (srcB = IMMQ3) whose DESTINATION EA (op[5:0] = srcEa, since dst=EASRC)
+    // resolves to an ADDRESS register: the operation is full-32 regardless of the .B/.W
+    // size field and writes NO condition codes (the 68k An rule). Force size LONG (the
+    // ALU does a full-32 ADD/SUB; the .B/.W partial merge is bypassed) and clear the
+    // flag write masks. The Dn-dest case (srcEa = DATAREG) keeps size/NZVCX from decode.
+    val addqAddrDst = (spec.srcB.kind === OperandKind.IMMQ3) && (srcEa.klass === EaClass.ADDRREG)
+    when(addqAddrDst) {
+      opUop.size       := Size.LONG
+      opUop.writesNzvc := False
+      opUop.writesX    := False
     }
 
     // Branch displacement (byte / word / long), reproducing the simple-decode rule.
@@ -321,6 +344,12 @@ object MicroOpAssembler {
     // path (it must NOT crack a leading load, which the generic srcEaOk would do). The
     // EORI #imm,CCR form (also spec.op==EOR, klass==IMM) is NOT gated here (-> !isToCcr).
     val eorMemBad = (spec.op === DecOp.EOR) && (srcEa.klass =/= EaClass.DATAREG) && !isToCcr
+    // ADDQ/SUBQ (srcB = IMMQ3): the EA (op[5:0]) is the DESTINATION (read AND written).
+    // This slice supports a DATA-register OR ADDRESS-register destination only; a memory
+    // EA is the deferred RMW form -> illegal. `addqMemBad` forces the illegal path (it
+    // must NOT crack a leading load, which the generic srcEaOk/crackLoad would do).
+    val addqMemBad = (spec.srcB.kind === OperandKind.IMMQ3) &&
+                     (srcEa.klass =/= EaClass.DATAREG) && (srcEa.klass =/= EaClass.ADDRREG)
     // Line-0 immediate (srcB = IMMEXT): the EA (op[5:0]) is the DESTINATION. This slice
     // supports a DATA-REGISTER destination only; a memory / An-direct / #imm EA is the
     // deferred RMW (or illegal) form -> illegal. The to-CCR form is the one exception.
@@ -364,7 +393,7 @@ object MicroOpAssembler {
     val isRtrBad = (op === B"16'h4E77")
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad &&
-              (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
+              (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     // A JMP/JSR with a non-control EA is illegal (vector 4).
     val jmpBad = isJmpOp && !ctrlEaOk
     val jsrBad = isJsrOp && !ctrlEaOk
