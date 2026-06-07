@@ -54,6 +54,9 @@ case class RenamedUop() extends Bundle {
   // shiftDir = d (1=left). Count = useImm/imm (i=0) or psrcB=Dc (i=1). Threaded.
   val shiftOp      = Bits(2 bits)
   val shiftDir     = Bool()
+  // Line-4 EXT/EXTB byte-source marker (DecOp.EXT): the sign-extend source is a BYTE
+  // (EXT.W / EXTB.L) rather than a word (EXT.L). Threaded from decode to the ALU EU.
+  val extByte      = Bool()
   // MOVEA (MOVE with an ADDRESS-register dst): full-32 write, .W sign-extends the
   // source, no flags. The ALU EU keys off it to bypass the .B/.W partial merge.
   val isMovea      = Bool()

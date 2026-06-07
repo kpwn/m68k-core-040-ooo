@@ -166,6 +166,27 @@ object PredecodeWord {
         // only — (An)/(d16,An)/(xxx).W/.L/(d16,PC); reg-direct / imm / (An)+ / -(An) /
         // indexed are NOT control modes (eaExt returns ok=False or an EA that the
         // assembler rejects -> illegal). allowImm=false so #imm is NOT a valid mode.
+        // Line-4 single-operand DATA-register family (the unary group), all single-word
+        // -> SIMPLE len1. CLR/NEG/NEGX/NOT/TST (0100 oooo ss 000rrr, oooo in {0,2,4,6,A},
+        // ss != 11, mode 000=Dn) + SWAP (0x4840-47) / EXT.W (0x4880-87) / EXT.L
+        // (0x48C0-C7) / EXTB.L (0x49C0-C7) / TAS (0x4AC0-C7). Memory-dest forms (mode !=
+        // 000) are the deferred RMW slice -> COMPLEX (the assembler's illegal path).
+        // bit8=0 for all EXCEPT EXTB.L (matched by its own pattern).
+        val u4o    = op(11 downto 8).asUInt
+        val u4ss   = op(7 downto 6).asUInt
+        val u4mode = op(5 downto 3).asUInt
+        val isUnaryArith = !op(8) && (u4ss =/= U(3, 2 bits)) && (u4mode === U(0, 3 bits)) &&
+                           (u4o === U(0, 4 bits) || u4o === U(2, 4 bits) || u4o === U(4, 4 bits) ||
+                            u4o === U(6, 4 bits) || u4o === U(0xA, 4 bits))
+        val isSwap  = op(15 downto 3) === B"13'b0100100001000"   // 0x4840-47
+        val isExtW  = op(15 downto 3) === B"13'b0100100010000"   // 0x4880-87
+        val isExtL  = op(15 downto 3) === B"13'b0100100011000"   // 0x48C0-C7
+        val isExtbL = op(15 downto 3) === B"13'b0100100111000"   // 0x49C0-C7
+        val isTas   = op(15 downto 3) === B"13'b0100101011000"   // 0x4AC0-C7
+        when(isUnaryArith || isSwap || isExtW || isExtL || isExtbL || isTas) {
+          r.simple   := True
+          r.lenWords := U(1, 3 bits)
+        }
         val isJmp = op(15 downto 6) === B"10'b0100111011"
         val isJsr = op(15 downto 6) === B"10'b0100111010"
         when(isJmp || isJsr) {

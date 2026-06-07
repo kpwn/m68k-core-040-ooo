@@ -109,7 +109,11 @@ object OperationDecoder {
       // CHK writes NO register and leaves CCR per the 68k rule (only N is meaningful,
       // set by the EU at execute; matched in lock-step). Routed to the CPLX (DivEu).
       is(0x4) {
-        when(opword(8) && !opword(6)) {
+        // EXTB.L (0100 1001 11 000 rrr, op[15:6]==0x127) has bit8=1 & bit6=0 and would
+        // otherwise alias the CHK pattern; decode it as the unary EXT (byte->long) below
+        // and exclude it from CHK. (The remaining bit8=1/bit6=0 line-4 opwords are CHK.)
+        val isExtbL = opword(15 downto 6) === B"10'b0100100111"
+        when(opword(8) && !opword(6) && !isExtbL) {
           o.illegal := False
           o.op := DecOp.CHK
           o.cluster := Cluster.CPLX
@@ -118,6 +122,86 @@ object OperationDecoder {
           o.srcB := easrc              // bound (EA)
           o.dst.setNone(); o.dstWrites := False
           o.writesNzvc := True         // CHK sets N (1 if Dn<0, 0 if Dn>=0); Z=V=C=0
+        }
+        // ── Line-4 single-operand DATA-register family (the unary group) ──────────
+        // CLR/NEG/NEGX/NOT/TST (`0100 oooo ss 000rrr`, oooo selects the op, ss the size
+        // .B/.W/.L, mode 000 = Dn) + SWAP/EXT/EXTB/TAS (the `0100 1000`/`1001`/`1010`
+        // sub-group). The EA (op[5:0]) is the DESTINATION operand: srcA = the read
+        // (merge / operand) source, dst = the same EA register (written back, except
+        // TST). EASRC routes to the EA register in the assembler; the assembler gates a
+        // non-Dn EA (mode != 000) to the deferred memory form (illegal). bit8=0 here
+        // EXCEPT EXTB.L (handled by its explicit pattern, which dominates).
+        val o4   = opword(11 downto 8)   // op selector for NEGX/CLR/NEG/NOT/TST
+        val ss4  = opword(7 downto 6)
+        def setSize(): Unit = {
+          when(ss4 === 0) { o.size := Size.BYTE }
+            .elsewhen(ss4 === 1) { o.size := Size.WORD }
+            .otherwise { o.size := Size.LONG }
+        }
+        when(!opword(8) && ss4 =/= 3 && (o4 === 0x0 || o4 === 0x2 || o4 === 0x4 ||
+                                         o4 === 0x6 || o4 === 0xA)) {
+          o.illegal := False
+          o.srcA := easrc                       // dst operand read (merge / source)
+          o.dst  := easrc                        // writeback to the same EA register
+          setSize()
+          switch(o4) {
+            is(0x0) {   // NEGX: 0-Dn-X, NZVCX, reads X + old Z (Z clear-only)
+              o.op := DecOp.NEGX; o.dstWrites := True
+              o.writesNzvc := True; o.writesX := True
+              o.readsX := True; o.readsNzvc := True
+            }
+            is(0x2) {   // CLR: Dn:=0, N=0/Z=1/V=0/C=0 (no X)
+              o.op := DecOp.CLR; o.dstWrites := True
+              o.writesNzvc := True
+            }
+            is(0x4) {   // NEG: 0-Dn, NZVCX (X=C)
+              o.op := DecOp.NEG; o.dstWrites := True
+              o.writesNzvc := True; o.writesX := True
+            }
+            is(0x6) {   // NOT: ~Dn, NZ (V=0,C=0)
+              o.op := DecOp.NOT; o.dstWrites := True
+              o.writesNzvc := True
+            }
+            is(0xA) {   // TST: flags only (NZ); NO write
+              o.op := DecOp.TST; o.dstWrites := False
+              o.writesNzvc := True
+            }
+          }
+        }
+        // SWAP Dn (0100 1000 0100 0rrr, op[15:3]==0x0908): full-32 halves swap, NZ.
+        when(opword(15 downto 3) === B"13'b0100100001000") {
+          o.illegal := False
+          o.op := DecOp.SWAP; o.size := Size.LONG
+          o.srcA := easrc; o.dst := easrc; o.dstWrites := True
+          o.writesNzvc := True
+        }
+        // EXT.W Dn (0100 1000 1000 0rrr, op[15:3]==0x0910): byte->word (.W, NZ, extByte).
+        when(opword(15 downto 3) === B"13'b0100100010000") {
+          o.illegal := False
+          o.op := DecOp.EXT; o.size := Size.WORD; o.extByte := True
+          o.srcA := easrc; o.dst := easrc; o.dstWrites := True
+          o.writesNzvc := True
+        }
+        // EXT.L Dn (0100 1000 1100 0rrr, op[15:3]==0x0918): word->long (full-32, NZ).
+        when(opword(15 downto 3) === B"13'b0100100011000") {
+          o.illegal := False
+          o.op := DecOp.EXT; o.size := Size.LONG
+          o.srcA := easrc; o.dst := easrc; o.dstWrites := True
+          o.writesNzvc := True
+        }
+        // EXTB.L Dn (0100 1001 1100 0rrr, op[15:3]==0x0938): byte->long (full-32, NZ, extByte).
+        when(opword(15 downto 3) === B"13'b0100100111000") {
+          o.illegal := False
+          o.op := DecOp.EXT; o.size := Size.LONG; o.extByte := True
+          o.srcA := easrc; o.dst := easrc; o.dstWrites := True
+          o.writesNzvc := True
+        }
+        // TAS Dn (0100 1010 11 000 rrr, op[15:3]==0x0958): N/Z from Dn[7:0]; Dn[7]:=1.
+        when(opword(15 downto 3) === B"13'b0100101011000") {
+          o.illegal := False
+          o.op := DecOp.TAS; o.size := Size.BYTE
+          o.srcA := easrc; o.dst := easrc; o.dstWrites := True
+          o.writesNzvc := True
         }
       }
       // ---- Bcc / BSR / BRA (0110 cccc dddddddd) ----
