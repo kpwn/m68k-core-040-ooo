@@ -1128,6 +1128,19 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l #0x12340001,%d6 ; move.l #0x3000,%a3 ; move.l %d6,(%a3) ; move.l #0x00005678,%d7 ; or.l %d7,(%a3) ; " +
       ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L))   // -> 0x12345679
   }
+  // Regression guard for the IN-ORDER-LS-ISSUE fix (IssueQueuePlugin ohL). A multi-RMW
+  // chain to ONE address: pre-fix, a younger RMW load (addr ready) issued AHEAD of an
+  // older RMW store still waiting on its ALU data -> the load queried SQ-forward before
+  // that store ALLOCATED -> forward miss -> write-no-allocate stale refill -> dropped
+  // store -> wrong final memory (regs still matched Musashi; only memory diverged). The
+  // fix issues the OLDEST occupied LS slot (when ready), so no load bypasses an older
+  // store. (This is why the single-RMW-per-program note above existed; now multi-RMW works.)
+  test("lock-step: multi-RMW chain to one addr (in-order LS issue) -> mem", VerilatorTest) {
+    runLockStep("rmw-chain",
+      "move.l #0x3000,%a0 ; move.l #0x100,%d0 ; move.l %d0,(%a0) ; addq.l #1,(%a0) ; addq.l #2,(%a0) ; " +
+      "addq.l #3,(%a0) ; addq.l #4,(%a0) ; addq.l #5,(%a0) ; " +
+      ".stop: bra .stop", nInstr = 8, checkMem = Seq(0x3000L))   // -> 0x100+1+2+3+4+5 = 0x10F
+  }
   test("lock-step: ADD.B Dn,(An) RMW (carry/X/Z edge)", VerilatorTest) {
     runLockStep("rmw-add-b",
       "move.l #0x111100ff,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; move.l #0x00000001,%d1 ; add.b %d1,(%a0) ; " +
