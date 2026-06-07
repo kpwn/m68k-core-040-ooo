@@ -45,7 +45,7 @@ class TrapvSpec extends AnyFunSuite {
       // cond = F (1): matches the decoder so the branch EU yields taken=False
       // (mispredict stays False) — TRAPV is a fault, not a redirect.
       uop.isBranch := True; uop.cond := 1; uop.branchDisp := 0
-      uop.isTrapv := True
+      uop.isTrapv := True; uop.isScc := False; uop.isDbcc := False
       uop.pc := 0x2000; uop.nextPc := iNextPc; uop.faultUsesNextPc := True
       uop.pNzvcSrc := iPNzvcSrc; uop.readsNzvc := True
       ctx.robId := iRobId

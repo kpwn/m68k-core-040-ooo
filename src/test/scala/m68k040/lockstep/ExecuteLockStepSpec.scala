@@ -842,6 +842,47 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  // ── Line-5 DBcc / DBRA (decrement-and-branch counted loops) lock-step ───────
+  // DBRA (cc=F) is the common counted loop: it ALWAYS decrements Dn.W and branches
+  // until Dn.W reaches -1 (0xFFFF), then falls through. The counter is Dn[15:0]
+  // (partial — Dn[31:16] preserved). Value + PC/Dn step-for-step vs Musashi.
+  test("lock-step: DBRA counted loop (runs N times, exits at -1, Dn.W partial)", VerilatorTest) {
+    // D0 = 3 (counter, upper-16 = 0). Body addq.l #1,d1. DBRA decrements D0.W each
+    // iteration and branches while D0.W != -1:
+    //   iter1 D0:3->2 branch ; iter2 2->1 branch ; iter3 1->0 branch ; iter4 0->-1 fall.
+    // Body runs 4 times -> D1 = 4 ; D0 ends 0x0000ffff (low16 = -1, upper16 preserved).
+    // Executed: moveq#3(1) + 4*(addq+dbra)(8) + moveq#9(1) = 10.
+    runLockStep("dbra",
+      "moveq #3,%d0 ; moveq #0,%d1 ; .L: addq.l #1,%d1 ; dbra %d0,.L ; moveq #9,%d2",
+      nInstr = 10)
+  }
+
+  // DBcc with a REAL condition (DBEQ): branches+decrements only when cond is FALSE
+  // (Z=0, not-equal); falls through (NO decrement) when cond is TRUE (Z=1, equal) OR
+  // on counter expiry. Exercises the taken (dec+branch), not-taken (cond-true early
+  // exit, no decrement) and the counter all together.
+  test("lock-step: DBEQ real-condition loop (taken / cond-true fall-through)", VerilatorTest) {
+    // D0=4 (counter), D1=0. Body addq.l #1,d1 ; cmp.l #2,d1 (sets Z when d1==2).
+    //   iter1: d1=1, 1!=2 -> Z=0 (EQ false) -> dec D0 4->3, branch.
+    //   iter2: d1=2, 2==2 -> Z=1 (EQ true)  -> fall through (NO dec): D0 stays 3.
+    // Exit: D1=2, D0=3. Executed: moveq#4,moveq#0(2) + iter1(addq,cmp,dbeq=3) +
+    //   iter2(addq,cmp,dbeq=3) + moveq#9(1) = 9.
+    runLockStep("dbeq",
+      "moveq #4,%d0 ; moveq #0,%d1 ; .L: addq.l #1,%d1 ; cmp.l #2,%d1 ; dbeq %d0,.L ; moveq #9,%d2",
+      nInstr = 9)
+  }
+
+  // DBRA with a non-zero upper-16 in the counter: the decrement-and-test uses ONLY
+  // Dn[15:0]; Dn[31:16] must be preserved across the whole loop and the -1 expiry.
+  test("lock-step: DBRA preserves Dn[31:16] across the loop", VerilatorTest) {
+    // D0 = 0xABCD0002 (counter low16 = 2, upper16 = 0xABCD). DBRA runs the body 3
+    // times (2->1->0->-1); D0 ends 0xABCDffff (upper16 preserved). Executed:
+    // move.l(1) + moveq#0(1) + 3*(addq+dbra=2)=6 + moveq#9(1) = 9.
+    runLockStep("dbra-upper",
+      "move.l #0xabcd0002,%d0 ; moveq #0,%d1 ; .L: addq.l #1,%d1 ; dbra %d0,.L ; moveq #9,%d2",
+      nInstr = 9)
+  }
+
   test("lock-step: ANDI/ORI/EORI .B/.W/.L (NZ, V=C=0)", VerilatorTest) {
     runLockStep("andi-ori-eori", Seq(
       "move.l #0x12345678,%d0", "andi.l #0xff00ff00,%d0",       // .L AND

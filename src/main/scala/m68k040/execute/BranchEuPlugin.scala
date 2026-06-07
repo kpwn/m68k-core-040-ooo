@@ -146,7 +146,10 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     val redirect  = Mux(u1.isScc, False,
                     Mux(u1.isDbcc, dbBranch,
                     Mux(u1.ibranch, True, taken)))
-    val nextPc    = Mux(redirect, target, u1.pc + 2)
+    // Fall-through PC = the instruction's POST-PC (pc + length). DBcc is a 2-word
+    // instruction (opword + disp16) so its not-taken/expiry PC is pc+4, NOT pc+2 —
+    // use the assembler-computed u1.nextPc (also correct for a not-taken Bcc.w).
+    val nextPc    = Mux(redirect, target, u1.nextPc)
 
     // ---- S1: completion (entry completes either way so it can retire) ----
     // TRAPV is decoded with cond=F (taken=False), so it naturally yields mispredict=
