@@ -1,5 +1,7 @@
 package m68k040.execute
 
+import m68k040.decode.DecOp
+import m68k040.isa.Size
 import m68k040.execute.iq.IqContext
 import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, XRegFileService,
   RegFileReadPort, RegFileWritePort, RegFileBypassPort}
@@ -42,6 +44,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
   var intW: RegFileWritePort = null;  var intByp: RegFileBypassPort = null
   var nzvcW: RegFileWritePort = null; var nzvcByp: RegFileBypassPort = null
   var xW: RegFileWritePort = null;    var xByp: RegFileBypassPort = null
+  // Flag SOURCE read ports — used ONLY by the ANDI/ORI/EORI #imm,CCR read-modify-write
+  // (toCcr): the op reads the current NZVC + X to fold the immediate into the CCR.
+  var nzvcRd: RegFileReadPort = null
+  var xRd: RegFileReadPort = null
 
   override def issue: Stream[IqContext] = issuePort
   override def completion: Flow[UInt]   = completionPort
@@ -54,8 +60,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     intW = irf.newWrite(latency = 1); intByp = irf.newBypass()
     val nz = host[NzvcRegFileService]
     nzvcW = nz.newWrite(latency = 1); nzvcByp = nz.newBypass()
+    nzvcRd = nz.newRead(forceNoBypass = false)
     val xrf = host[XRegFileService]
     xW = xrf.newWrite(latency = 1); xByp = xrf.newBypass()
+    xRd = xrf.newRead(forceNoBypass = false)
   }
 
   val logic = during build new Area {
@@ -66,12 +74,17 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     rdB.addr := u0.psrcB
     val src1 = rdA.data
     val src2 = Mux(u0.useImm, u0.imm, rdB.data)
+    // Flag sources (only the toCcr read-modify-write uses them).
+    nzvcRd.addr := u0.pNzvcSrc
+    xRd.addr    := u0.pXSrc
 
     // ---- S0 -> S1 register (M2S) ----
     val s1Valid = RegNext(issuePort.valid) init False
     val s1Ctx   = RegNext(issuePort.payload)   // IqContext (uop + robId)
     val s1Src1  = RegNext(src1)
     val s1Src2  = RegNext(src2)
+    val s1Nzvc  = RegNext(nzvcRd.data)         // {N(3),Z(2),V(1),C(0)} (toCcr)
+    val s1X     = RegNext(xRd.data(0))         // X (toCcr)
     val u1 = s1Ctx.uop
 
     // ---- S1: execute ----
@@ -83,10 +96,39 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     cmd.xIn  := False                    // no flag-read ops yet
     val rsp = AluDatapath(cmd)
 
+    // ---- S1: size-merge of the int writeback (68k partial-register semantics) ----
+    // A .B / .W ALU op updates ONLY the low byte / word of the destination register;
+    // the upper bits are PRESERVED. For ADD/SUB/AND/OR/EOR the destination operand is
+    // srcA (src1), so the old register value is s1Src1 -> merge its upper bits with the
+    // datapath's low `size` result. (MOVE's dst is NOT src1 — MOVE keeps the full
+    // datapath result, preserving the existing MOVE.L path; MOVE.B/.W reg-dest is a
+    // separate concern outside this slice and is not regressed here.) .L = full result.
+    val isMove = u1.op === DecOp.MOVE
+    val mergedResult = Mux(isMove, rsp.result, u1.size.mux(
+      Size.BYTE -> (s1Src1(31 downto 8)  ## rsp.result(7 downto 0)),
+      Size.WORD -> (s1Src1(31 downto 16) ## rsp.result(15 downto 0)),
+      Size.LONG -> rsp.result))
+
+    // ---- S1: ANDI/ORI/EORI #imm,CCR (toCcr) — CCR read-modify-write ----
+    // Assemble the current 5-bit CCR {X,N,Z,V,C} from the flag PRFs, apply the logical
+    // op against imm[4:0] (s1Src2, the imm byte), split the result back: new NZVC =
+    // ccr5'[3:0], new X = ccr5'[4]. The CCR bit layout is X=4,N=3,Z=2,V=1,C=0, so the
+    // flag halves line up directly (NZVC = bits[3:0], X = bit[4]) with no reshuffling.
+    val ccrOld = s1X ## s1Nzvc(3 downto 0)         // {X,N,Z,V,C}
+    val ccrImm = s1Src2(4 downto 0)
+    val ccrNew = u1.op.mux(
+      DecOp.AND -> (ccrOld & ccrImm),
+      DecOp.OR  -> (ccrOld | ccrImm),
+      default   -> (ccrOld ^ ccrImm))              // EOR (toCcr only AND/OR/EOR reach here)
+    val ccrNzvc = ccrNew(3 downto 0)
+    val ccrX    = ccrNew(4)
+
     // ---- S1: writeback (gated by masks) ----
-    intW.valid   := s1Valid && u1.pdstValid;  intW.address   := u1.pdst;     intW.data   := rsp.result
-    nzvcW.valid  := s1Valid && u1.writesNzvc; nzvcW.address  := u1.pNzvcDst;  nzvcW.data  := rsp.nzvc
-    xW.valid     := s1Valid && u1.writesX;    xW.address     := u1.pXDst;     xW.data     := B(rsp.xOut)
+    // The int writeback is suppressed for a toCcr op (it has no int dst -> pdstValid
+    // False already). NZVC/X take the CCR-rmw result for toCcr, else the datapath flags.
+    intW.valid   := s1Valid && u1.pdstValid;  intW.address   := u1.pdst;     intW.data   := mergedResult
+    nzvcW.valid  := s1Valid && u1.writesNzvc; nzvcW.address  := u1.pNzvcDst;  nzvcW.data  := Mux(u1.toCcr, ccrNzvc, rsp.nzvc)
+    xW.valid     := s1Valid && u1.writesX;    xW.address     := u1.pXDst;     xW.data     := Mux(u1.toCcr, B(ccrX), B(rsp.xOut))
 
     // ---- S1: bypass (mirror the writes; forwards to a dependent reading this cycle) ----
     intByp.valid  := intW.valid;  intByp.address  := intW.address;  intByp.data  := intW.data
@@ -107,11 +149,11 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     wbObs.valid     := RegNext(s1Valid) init False
     wbObs.robId     := RegNext(s1Ctx.robId)
     wbObs.dstArch   := RegNext(u1.dstArch)
-    wbObs.result    := RegNext(rsp.result)
+    wbObs.result    := RegNext(mergedResult)
     wbObs.intWrite  := RegNext(u1.pdstValid)
-    wbObs.nzvc      := RegNext(rsp.nzvc)
+    wbObs.nzvc      := RegNext(Mux(u1.toCcr, ccrNzvc, rsp.nzvc))
     wbObs.nzvcWrite := RegNext(u1.writesNzvc)
-    wbObs.x         := RegNext(rsp.xOut)
+    wbObs.x         := RegNext(Mux(u1.toCcr, ccrX, rsp.xOut))
     wbObs.xWrite    := RegNext(u1.writesX)
     wbObs.divRem    := False
     wbObs.simPublic()

@@ -35,6 +35,7 @@ object AluDatapath {
       DecOp.MOVE -> cmd.src2.asUInt,
       DecOp.AND  -> (a & b),
       DecOp.OR   -> (a | b),
+      DecOp.EOR  -> (a ^ b),
       default    -> sum32
     )
 

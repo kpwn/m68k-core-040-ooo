@@ -48,6 +48,34 @@ object PredecodeWord {
     }
 
     switch(cls) {
+      // Line-0 immediates: ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea> + the to-CCR forms.
+      // 0000 ooo0 ss mmmrrr + imm. opmode ooo (11:9) in {0=ORI,1=ANDI,2=SUBI,3=ADDI,
+      // 5=EORI,6=CMPI}; bit8=0; size ss (7:6) in {00=.B,01=.W,10=.L}; imm words = 1
+      // for .B/.W, 2 for .L (the imm precedes any EA ext). Data-reg dest (mode0) =>
+      // 1+immWords; to-CCR (...00 111100, byte, ANDI/ORI/EORI only) => 1+1. SR / mem
+      // destinations are deferred (privileged / RMW) => COMPLEX. (Mirrors PredecodeRef.)
+      is(U(0, 4 bits)) {
+        val opmode = op(11 downto 9).asUInt
+        val bit8   = op(8)
+        val ss     = op(7 downto 6).asUInt
+        val mode   = op(5 downto 3).asUInt
+        val reg    = op(2 downto 0).asUInt
+        val isImmOp = !bit8 && (opmode === 0 || opmode === 1 || opmode === 2 ||
+                                opmode === 3 || opmode === 5 || opmode === 6)
+        val sizeOk   = ss =/= 3
+        val immWords = Mux(ss === 2, U(2, 3 bits), U(1, 3 bits))   // .L=2, .B/.W=1
+        val isToCcr  = (mode === 7) && (reg === 4) && (ss === 0)
+        val ccrOk    = opmode === 0 || opmode === 1 || opmode === 5   // ANDI/ORI/EORI only
+        when(isImmOp && sizeOk) {
+          when(isToCcr) {
+            when(ccrOk) { r.simple := True; r.lenWords := U(2, 3 bits) }   // opword + imm byte word
+          } elsewhen(mode === 0) {
+            r.simple := True; r.lenWords := (U(1, 3 bits) + immWords).resized   // data-reg dest
+          }
+          // else (mem dest / SR) -> COMPLEX (deferred)
+        }
+      }
+
       // MOVE.B / MOVE.L / MOVE.W
       is(U(1, 4 bits), U(2, 4 bits), U(3, 4 bits)) {
         val sizeL   = cls === U(2, 4 bits)
@@ -223,6 +251,10 @@ object PredecodeWord {
         val isCmp   = (opmode === U(0, 3 bits)) || (opmode === U(1, 3 bits)) ||
                       (opmode === U(2, 3 bits)) || (opmode === U(3, 3 bits)) ||
                       (opmode === U(7, 3 bits))
+        // EOR (opmode 4/5/6): EA is the DESTINATION (read+written). Register (data-reg,
+        // mode0) dest -> simple len1; An-direct (CMPM) and memory-dest (RMW) -> COMPLEX.
+        val isEor   = (opmode === U(4, 3 bits)) || (opmode === U(5, 3 bits)) ||
+                      (opmode === U(6, 3 bits))
         when(isCmp) {
           val sizeL = (opmode === U(2, 3 bits)) || (opmode === U(7, 3 bits))
           val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = false)
@@ -230,6 +262,9 @@ object PredecodeWord {
             r.simple   := True
             r.lenWords := (U(1, 3 bits) + e).resized
           }
+        } elsewhen(isEor && (srcMode === U(0, 3 bits))) {
+          r.simple   := True
+          r.lenWords := U(1, 3 bits)                  // EOR Dn,Dm (register dest)
         }
       }
 
