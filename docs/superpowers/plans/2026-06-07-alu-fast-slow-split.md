@@ -52,7 +52,7 @@ The static `events` set must EXCLUDE a slow-producer's issue (so no lat1 trigger
 ### Task 2: Slow path (S1->S2 for shift/CCR-RMW) + lat-2 writeback/completion
 **Files:** `execute/AluEuPlugin.scala`; Test `execute/AluFastSlowSpec.scala`.
 For isSlow ops: register the operands/op into S2; compute shift/CCR-RMW + NZVCX in S2; writeback (intW/nzvcW/xW) + completion at lat2. Fast ops UNCHANGED (S1 lat1). Keep the fast bypass; do NOT bypass a slow producer's S1 partial.
-- [ ] failing test (a shift result is correct + available lat2; a fast add still lat1 + bypasses) → FAIL → implement → PASS ×2 → commit `alu: slow path (S1->S2) for shift + CCR-RMW (lat2)`.
+- [x] failing test (a shift result is correct + available lat2; a fast add still lat1 + bypasses) → FAIL → implement → PASS ×2 → commit `alu: slow path (S1->S2) for shift + CCR-RMW (lat2)`.
 
 ### Task 3: IQ dynamic wakeup for slow-ALU producers
 **Files:** `execute/iq/IssueQueuePlugin.scala`; Test `execute/iq/` directed.

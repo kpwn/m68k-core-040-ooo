@@ -33,6 +33,7 @@ class IqLsSpec extends AnyFunSuite {
       slot.pNzvcSrc #= 0; slot.pNzvcDst #= 0
       slot.readsX #= false; slot.writesX #= false
       slot.pXSrc #= 0; slot.pXDst #= 0
+      slot.isShift #= false
     }
     dut.sink.logic.ready0 #= true
     dut.sink.logic.ready1 #= true
@@ -43,12 +44,13 @@ class IqLsSpec extends AnyFunSuite {
 
   // push a single uop into slot0 (slot1 invalid)
   def pushOne(dut: Dut, robId: Int, cluster: SpinalEnumElement[Cluster.type], memOp: SpinalEnumElement[MemOp.type],
-              pdst: Int, pdstValid: Boolean, psrcA: Int, psrcAValid: Boolean): Unit = {
+              pdst: Int, pdstValid: Boolean, psrcA: Int, psrcAValid: Boolean, isShift: Boolean = false): Unit = {
     val s = dut.source.logic
     s.s0.robId #= robId; s.s0.cluster #= cluster; s.s0.memOp #= memOp
     s.s0.pdst #= pdst; s.s0.pdstValid #= pdstValid
     s.s0.psrcA #= psrcA; s.s0.psrcAValid #= psrcAValid
     s.s0.psrcB #= 0; s.s0.psrcBValid #= false; s.s0.useImm #= false
+    s.s0.isShift #= isShift
     s.pushValid #= true; s.slot1Valid #= false
   }
 

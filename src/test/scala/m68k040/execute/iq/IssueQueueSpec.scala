@@ -58,6 +58,7 @@ class IssueQueueSpec extends AnyFunSuite {
         slot.pNzvcSrc #= u.pNzvcSrc; slot.pNzvcDst #= u.pNzvcDst
         slot.readsX #= u.readsX; slot.writesX #= u.writesX
         slot.pXSrc #= u.pXSrc; slot.pXDst #= u.pXDst
+        slot.isShift #= false
       }
     }
     src.pushValid #= s0.isDefined
@@ -78,6 +79,7 @@ class IssueQueueSpec extends AnyFunSuite {
       slot.pNzvcSrc #= 0; slot.pNzvcDst #= 0
       slot.readsX #= false; slot.writesX #= false
       slot.pXSrc #= 0; slot.pXDst #= 0
+      slot.isShift #= false
     }
     dut.sink.logic.ready0 #= false
     dut.sink.logic.ready1 #= false

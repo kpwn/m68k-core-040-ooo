@@ -47,6 +47,12 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     faRedir.payload := flushPc
     eu0.issue << iq.issue(0)
     eu1.issue << iq.issue(1)
+    // SLOW-ALU (shift, latency-2) dynamic wakeup: ONE IQ port per ALU EU (both EUs can
+    // complete a distinct shift the same cycle, so no shared/OR'd port).
+    iq.aluSlowWakeup(0).valid   := eu0.slowWakeup.valid
+    iq.aluSlowWakeup(0).payload := eu0.slowWakeup.payload
+    iq.aluSlowWakeup(1).valid   := eu1.slowWakeup.valid
+    iq.aluSlowWakeup(1).payload := eu1.slowWakeup.payload
     // Branch EU: issue port 2 (branch-class) -> branch EU; its completion records
     // {mispredict, nextPc} into the ROB for commit-time recovery (sibling-driven,
     // exactly like the ALU completion ports above).

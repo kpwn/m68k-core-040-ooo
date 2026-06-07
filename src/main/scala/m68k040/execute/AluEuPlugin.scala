@@ -2,7 +2,7 @@ package m68k040.execute
 
 import m68k040.decode.DecOp
 import m68k040.isa.Size
-import m68k040.execute.iq.IqContext
+import m68k040.execute.iq.{IqContext, AluSlowWakeup}
 import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, XRegFileService,
   RegFileReadPort, RegFileWritePort, RegFileBypassPort}
 import spinal.core._
@@ -14,12 +14,10 @@ import spinal.lib.misc.plugin.FiberPlugin
 trait AluEuService {
   def issue: Stream[IqContext]
   def completion: Flow[UInt]   // robId
-  /** Dynamic-completion wakeup (variant A, mirroring DivEu): the SLOW ALU path
-    * (shift / CCR-RMW, latency-2) broadcasts the pdst of its just-completed result
-    * the cycle it lands in the PRF (S2). The IQ holds a dependent of a slow producer
-    * (aluSlowWait) until this fires. Fast (latency-1) ALU ops use the static
-    * latency-1 wakeup and DO NOT drive this port. */
-  def slowWakeup: Flow[UInt]   // pdst of a completing slow-ALU op (lat2)
+  /** Dynamic-completion wakeup (mirroring DivEu/LsEu): the SLOW path (shift, lat2)
+    * broadcasts its int+NZVC+X dsts the cycle the result lands (S2). The IQ holds a
+    * dependent of a slow producer until this fires. Fast (lat1) ops do NOT drive it. */
+  def slowWakeup: Flow[AluSlowWakeup]
 }
 
 /** Sim-only per-instruction writeback observation (NaxRiscv-style whitebox). */
@@ -52,7 +50,7 @@ case class WbObs() extends Bundle {
 class AluEuPlugin extends FiberPlugin with AluEuService {
   var issuePort: Stream[IqContext] = null
   var completionPort: Flow[UInt]   = null
-  var slowWakeupPort: Flow[UInt]   = null
+  var slowWakeupPort: Flow[AluSlowWakeup] = null
   // PRF ports (allocated in setup)
   var rdA, rdB: RegFileReadPort = null
   var intW: RegFileWritePort = null;  var intByp: RegFileBypassPort = null
@@ -72,12 +70,12 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
 
   override def issue: Stream[IqContext] = issuePort
   override def completion: Flow[UInt]   = completionPort
-  override def slowWakeup: Flow[UInt]   = slowWakeupPort
+  override def slowWakeup: Flow[AluSlowWakeup] = slowWakeupPort
 
   during setup {
     issuePort      = Stream(IqContext())
     completionPort = Flow(UInt(6 bits))
-    slowWakeupPort = Flow(UInt(6 bits))
+    slowWakeupPort = Flow(AluSlowWakeup())
     val irf = host[IntRegFileService]
     rdA = irf.newRead(); rdB = irf.newRead()
     intW = irf.newWrite(latency = 1); intByp = irf.newBypass()
@@ -112,11 +110,16 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val s1X     = RegNext(xRd.data(0))         // X (toCcr)
     val u1 = s1Ctx.uop
 
-    // ── slow-op classification: the barrel shifter (DecOp.SHIFT) and the CCR-RMW
-    // (ANDI/ORI/EORI #imm,CCR, toCcr) are the 24-level `s1Src2 -> NZVC` cone; they go
-    // to the 2-cycle (S1->S2) path. Everything else is the fast latency-1 path. ──
+    // ── slow-op classification: the barrel shifter (DecOp.SHIFT) — the 64-wide
+    // funnel + shTable + the ROX rmod subtract chain — is the deep part of the
+    // 24-level `s1Src2 -> NZVC` cone, so it goes to the 2-cycle (S1->S2) path.
+    // The CCR-RMW (toCcr) STAYS on the fast path: it is a shallow 5-bit logic fold
+    // (NOT the deep cone), and keeping it fast avoids a flag-class dynamic wakeup —
+    // toCcr writes only NZVC+X (flag physregs), which are tracked by the STATIC
+    // latency-1 flag scoreboards (sbNzvc/sbX); a lat2 flag write would desync them.
+    // (Re-confirmed by synth: moving the shifter alone clears the cone.) ──
     val isShift = u1.op === DecOp.SHIFT
-    val isSlow  = isShift || u1.toCcr
+    val isSlow  = isShift
 
     // Single-outstanding slow stall: when a slow op occupies S1 (heading to S2 next
     // cycle), DON'T accept a new op at S0 — otherwise that op's S1 completion next
@@ -166,9 +169,24 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
       s1Src2(15 downto 0).asSInt.resize(32).asBits, s1Src2)
     val mergedResult = Mux(u1.isMovea, moveaResult, sizeMerged)
 
-    // Fast final flags = the ALU datapath (no shifter, no CCR-RMW on this cone).
-    val finalNzvc = aluNzvc
-    val finalX    = rsp.xOut
+    // ---- S1: ANDI/ORI/EORI #imm,CCR (toCcr) — CCR read-modify-write (FAST path) ----
+    // Assemble the current 5-bit CCR {X,N,Z,V,C} from the flag PRFs, apply the logical
+    // op against imm[4:0] (s1Src2, the imm byte), split the result back: NZVC =
+    // ccr5'[3:0], X = ccr5'[4]. CCR layout X=4,N=3,Z=2,V=1,C=0 lines the flag halves up
+    // directly (no reshuffling). This is a shallow 5-bit fold (NOT the deep cone), so
+    // it stays latency-1 — toCcr's NZVC+X writes remain statically tracked (sbNzvc/sbX).
+    val ccrOld = s1X ## s1Nzvc(3 downto 0)         // {X,N,Z,V,C}
+    val ccrImm = s1Src2(4 downto 0)
+    val ccrNew = u1.op.mux(
+      DecOp.AND -> (ccrOld & ccrImm),
+      DecOp.OR  -> (ccrOld | ccrImm),
+      default   -> (ccrOld ^ ccrImm))              // EOR (toCcr only AND/OR/EOR reach here)
+    val ccrNzvc = ccrNew(3 downto 0)
+    val ccrX    = ccrNew(4)
+
+    // Fast final flags: CCR-rmw for toCcr, else the ALU datapath (NO shifter).
+    val finalNzvc = Mux(u1.toCcr, ccrNzvc, aluNzvc)
+    val finalX    = Mux(u1.toCcr, ccrX, rsp.xOut)
 
     // ---- S1: FAST writeback (gated by masks; suppressed for a slow op) ----
     val fastFire = s1Valid && !isSlow
@@ -182,15 +200,13 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     xByp.valid    := xW.valid;    xByp.address    := xW.address;    xByp.data    := xW.data
 
     // ============================ SLOW PATH (S1 -> S2) ============================
-    // Register the slow op's operands + control into S2; compute the barrel shifter +
-    // the CCR-RMW THERE (off the S1 writeback cone), completing at latency-2.
+    // Register the shift op's operands + control into S2; compute the barrel shifter
+    // THERE (off the S1 writeback cone), completing at latency-2.
     val s2Valid = RegNext(s1Valid && isSlow) init False
     val s2Ctx   = RegNext(s1Ctx)
     val s2Src1  = RegNext(s1Src1)
     val s2Src2  = RegNext(s1Src2)
-    val s2Nzvc  = RegNext(s1Nzvc)
     val s2X     = RegNext(s1X)
-    val s2IsShift = RegNext(isShift)
     val u2 = s2Ctx.uop
 
     // ── S2: line-E barrel shifter (DecOp.SHIFT) ────────────────────────────────
@@ -211,28 +227,12 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
 
     // ── S2: SHIFT int writeback — the shift dst is Dr = src1, so the .B/.W upper-
     // preserve merge applies exactly as for a fast op (merge against s2Src1). ──
-    val s2SizeMerged = u2.size.mux(
+    val slowResult = u2.size.mux(
       Size.BYTE -> (s2Src1(31 downto 8)  ## shiftRsp.result(7 downto 0)),
       Size.WORD -> (s2Src1(31 downto 16) ## shiftRsp.result(15 downto 0)),
       Size.LONG -> shiftRsp.result)
-
-    // ── S2: ANDI/ORI/EORI #imm,CCR (toCcr) — CCR read-modify-write ────────────────
-    // Assemble the current 5-bit CCR {X,N,Z,V,C}, apply the logical op against imm[4:0]
-    // (s2Src2, the imm byte), split back: NZVC = ccr5'[3:0], X = ccr5'[4]. CCR layout
-    // X=4,N=3,Z=2,V=1,C=0 lines the flag halves up directly (no reshuffling).
-    val ccrOld = s2X ## s2Nzvc(3 downto 0)         // {X,N,Z,V,C}
-    val ccrImm = s2Src2(4 downto 0)
-    val ccrNew = u2.op.mux(
-      DecOp.AND -> (ccrOld & ccrImm),
-      DecOp.OR  -> (ccrOld | ccrImm),
-      default   -> (ccrOld ^ ccrImm))              // EOR (toCcr only AND/OR/EOR reach here)
-    val ccrNzvc = ccrNew(3 downto 0)
-    val ccrX    = ccrNew(4)
-
-    // ── S2: final slow result/flags: shifter for SHIFT, CCR-rmw for toCcr ──
-    val slowResult = s2SizeMerged                   // toCcr has no int dst (pdstValid False)
-    val slowNzvc   = Mux(s2IsShift, shiftNzvc, ccrNzvc)
-    val slowX      = Mux(s2IsShift, shiftRsp.xOut, ccrX)
+    val slowNzvc   = shiftNzvc
+    val slowX      = shiftRsp.xOut
 
     // ---- S2: SLOW writeback (separate ports; latency-2) ----
     intWs.valid   := s2Valid && u2.pdstValid;  intWs.address  := u2.pdst;     intWs.data  := slowResult
@@ -243,11 +243,16 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     nzvcByps.valid := nzvcWs.valid; nzvcByps.address := nzvcWs.address; nzvcByps.data := nzvcWs.data
     xByps.valid    := xWs.valid;    xByps.address    := xWs.address;    xByps.data    := xWs.data
 
-    // ---- SLOW dynamic-completion wakeup (mirror DivEu): broadcast the producing pdst
-    // the cycle the slow result lands in the PRF (S2). The IQ holds a dependent of a
-    // slow producer until this fires (aluSlowWait). ----
-    slowWakeupPort.valid   := s2Valid && u2.pdstValid
-    slowWakeupPort.payload := u2.pdst
+    // ---- SLOW dynamic-completion wakeup (mirror LsEu/DivEu): broadcast the shift's
+    // int + NZVC + X dsts the cycle the result lands in the PRF (S2). The IQ holds a
+    // dependent of the shift (int OR flag source) until this fires (aluSlowWait). ----
+    slowWakeupPort.valid            := s2Valid
+    slowWakeupPort.payload.pdst     := u2.pdst
+    slowWakeupPort.payload.pdstValid:= u2.pdstValid
+    slowWakeupPort.payload.pNzvcDst := u2.pNzvcDst
+    slowWakeupPort.payload.nzvcValid:= u2.writesNzvc
+    slowWakeupPort.payload.pXDst    := u2.pXDst
+    slowWakeupPort.payload.xValid   := u2.writesX
 
     // ---- completion: fast (S1) OR slow (S2) — single port, never both same cycle
     // (the single-outstanding S1 stall guarantees S1-fast and S2-slow never coincide). ----
