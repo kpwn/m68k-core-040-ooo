@@ -57,7 +57,9 @@ For isSlow ops: register the operands/op into S2; compute shift/CCR-RMW + NZVCX 
 ### Task 3: IQ dynamic wakeup for slow-ALU producers
 **Files:** `execute/iq/IssueQueuePlugin.scala`; Test `execute/iq/` directed.
 Track slow-ALU producers in a new dynamic bitmap (mirror cplxBusy): a dependent of a slow-ALU producer is NOT statically woken at lat1; it wakes when the slow-ALU `wakeup` broadcasts (lat2). Fast ALU stays static-lat1.
-- [ ] failing test (a dependent of a shift waits 1 extra cycle then issues with the correct operand; a dependent of an add issues back-to-back) → FAIL → implement → PASS ×2 → commit `iq: dynamic wakeup for slow-ALU producers (lat2)`.
+- [x] failing test (a dependent of a shift waits 1 extra cycle then issues with the correct operand; a dependent of an add issues back-to-back) → FAIL → implement → PASS ×2 → commit `iq: dynamic wakeup for slow-ALU producers (lat2)`.
+  - REVISED slow-op set: `isSlow = isShift` ONLY (toCcr STAYS fast — shallow 5-bit fold + statically-tracked flag writes; moving it to lat2 would desync the flag scoreboards). Shifter = the deep cone.
+  - DYNAMIC mechanism (aluSlow* busy bitmaps + aluSlowWait + per-EU aluSlowWakeup Flow carrying the shift's int+NZVC+X dsts), mirroring cplxBusy across all 3 reg classes a shift writes. (A delayed-static-events variant was tried first + dropped: it mishandled a producer issuing before its dependent was pushed.)
 
 ### Task 4: Lock-step + IPC + OOC FMax
 **Files:** `lockstep/ExecuteLockStepSpec.scala`, run suites.

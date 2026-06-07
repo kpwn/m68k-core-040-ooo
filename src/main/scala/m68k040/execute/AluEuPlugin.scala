@@ -200,39 +200,46 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     xByp.valid    := xW.valid;    xByp.address    := xW.address;    xByp.data    := xW.data
 
     // ============================ SLOW PATH (S1 -> S2) ============================
-    // Register the shift op's operands + control into S2; compute the barrel shifter
-    // THERE (off the S1 writeback cone), completing at latency-2.
-    val s2Valid = RegNext(s1Valid && isSlow) init False
-    val s2Ctx   = RegNext(s1Ctx)
-    val s2Src1  = RegNext(s1Src1)
-    val s2Src2  = RegNext(s1Src2)
-    val s2X     = RegNext(s1X)
-    val u2 = s2Ctx.uop
-
-    // ── S2: line-E barrel shifter (DecOp.SHIFT) ────────────────────────────────
+    // Pipeline the barrel shifter ACROSS the S1->S2 boundary: COMPUTE the shifter in S1
+    // (from the s1 operands, in parallel with the fast ALU but NOT on the fast S1
+    // writeback cone — its outputs go to S2 registers, not the fast write ports), then
+    // S2 does only the shallow size-merge + writeback. This keeps the deep shifter cone
+    // OFF both the fast S1 writeback path AND the S2->NZVC-RAM write path: the shifter's
+    // long cone now ends at the local s2Shift* FFs (a register endpoint, off the central
+    // flag-RAM routing), and S2's write cone is a shallow mux + RAM write.
+    //
+    // ── S1: line-E barrel shifter (DecOp.SHIFT) ────────────────────────────────
     // The shift INPUT (Dr) is src1; the count is the immediate (useImm -> imm[5:0]) or
     // the 2nd data-reg source Dc (src2[5:0] = Dc & 0x3f). X-in is the current X. The
     // barrel shifter produces result + NZVCX; ROL/ROR leave X (writesX=False), and the
     // count-0 / count>=size specials are inside it.
     val shiftCmd = ShiftCmd()
-    shiftCmd.shiftOp := u2.shiftOp.asUInt
-    shiftCmd.dirLeft := u2.shiftDir
-    shiftCmd.size    := u2.size
-    shiftCmd.data    := s2Src1
-    shiftCmd.count   := s2Src2(5 downto 0).asUInt
-    shiftCmd.isImm   := u2.useImm
-    shiftCmd.xIn     := s2X
+    shiftCmd.shiftOp := u1.shiftOp.asUInt
+    shiftCmd.dirLeft := u1.shiftDir
+    shiftCmd.size    := u1.size
+    shiftCmd.data    := s1Src1
+    shiftCmd.count   := s1Src2(5 downto 0).asUInt
+    shiftCmd.isImm   := u1.useImm
+    shiftCmd.xIn     := s1X
     val shiftRsp = Shifter(shiftCmd)
-    val shiftNzvc = shiftRsp.n ## shiftRsp.z ## shiftRsp.v ## shiftRsp.c
+
+    // ── S1 -> S2 registers (the shifter RESULT/flags + the merge source) ──
+    val s2Valid     = RegNext(s1Valid && isSlow) init False
+    val s2Ctx       = RegNext(s1Ctx)
+    val s2Src1      = RegNext(s1Src1)            // merge source (Dr upper bits preserved)
+    val s2ShiftRes  = RegNext(shiftRsp.result)
+    val s2ShiftNzvc = RegNext(shiftRsp.n ## shiftRsp.z ## shiftRsp.v ## shiftRsp.c)
+    val s2ShiftX    = RegNext(shiftRsp.xOut)
+    val u2 = s2Ctx.uop
 
     // ── S2: SHIFT int writeback — the shift dst is Dr = src1, so the .B/.W upper-
     // preserve merge applies exactly as for a fast op (merge against s2Src1). ──
     val slowResult = u2.size.mux(
-      Size.BYTE -> (s2Src1(31 downto 8)  ## shiftRsp.result(7 downto 0)),
-      Size.WORD -> (s2Src1(31 downto 16) ## shiftRsp.result(15 downto 0)),
-      Size.LONG -> shiftRsp.result)
-    val slowNzvc   = shiftNzvc
-    val slowX      = shiftRsp.xOut
+      Size.BYTE -> (s2Src1(31 downto 8)  ## s2ShiftRes(7 downto 0)),
+      Size.WORD -> (s2Src1(31 downto 16) ## s2ShiftRes(15 downto 0)),
+      Size.LONG -> s2ShiftRes)
+    val slowNzvc   = s2ShiftNzvc
+    val slowX      = s2ShiftX
 
     // ---- S2: SLOW writeback (separate ports; latency-2) ----
     intWs.valid   := s2Valid && u2.pdstValid;  intWs.address  := u2.pdst;     intWs.data  := slowResult
