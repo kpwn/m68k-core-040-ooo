@@ -50,6 +50,10 @@ case class RenamedUop() extends Bundle {
   val divSigned    = Bool()
   val div64        = Bool()
   val divIsRem     = Bool()
+  // Line-E shift/rotate control (DecOp.SHIFT): shiftOp = tt (0=AS,1=LS,2=ROX,3=RO),
+  // shiftDir = d (1=left). Count = useImm/imm (i=0) or psrcB=Dc (i=1). Threaded.
+  val shiftOp      = Bits(2 bits)
+  val shiftDir     = Bool()
   // Macro-instruction boundary marker (interrupts): True for the FIRST µop of an
   // instruction (the only multi-µop case is a memSimple-source crack [load, op]).
   val firstOfInstr = Bool()

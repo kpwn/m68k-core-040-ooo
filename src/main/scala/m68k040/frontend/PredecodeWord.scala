@@ -268,6 +268,17 @@ object PredecodeWord {
         }
       }
 
+      // Line-E register-form shifts/rotates (1110 ccc d ss i tt rrr): single-word,
+      // no extension -> SIMPLE len 1. ss=11 is the MEMORY single-bit form (1110 ccc d
+      // 11 mmmrrr, shift <ea> by 1) which is the deferred RMW slice -> COMPLEX.
+      is(U(0xE, 4 bits)) {
+        val ss = op(7 downto 6).asUInt
+        when(ss =/= U(3, 2 bits)) {
+          r.simple   := True
+          r.lenWords := U(1, 3 bits)
+        }
+      }
+
       default { /* complex: r stays simple=False, lenWords=0 */ }
     }
     r

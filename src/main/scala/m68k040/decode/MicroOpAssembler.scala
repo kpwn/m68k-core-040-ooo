@@ -102,6 +102,8 @@ object MicroOpAssembler {
     opUop.divSigned     := spec.divSigned
     opUop.div64         := spec.div64
     opUop.divIsRem      := False
+    opUop.shiftOp       := spec.shiftOp
+    opUop.shiftDir      := spec.shiftDir
     // CHK / DIV are group-2 traps (CHK vec6, DIV0 vec5) delivered execute-time via
     // euFault -> format-$2: they stack the NEXT instruction's PC (the 040 group-2
     // frame's PC = pc+len). The fault is conditional (set at execute), but faultPc is
@@ -168,6 +170,28 @@ object MicroOpAssembler {
     when(spec.dst.kind =/= OperandKind.NONE && spec.dstWrites) { opUop.dstValid := True }
     when(spec.dst.kind =/= OperandKind.NONE && !spec.dstWrites) { opUop.dstValid := False } // CMP/CMPA
 
+    // ── Line-E shift/rotate operand routing (DecOp.SHIFT) ──────────────────────
+    // Fixed-field operands: srcA = dst = Dr (op[2:0], the shifted data reg). Count:
+    //  i=0 (shiftImm) -> immediate ccc = op[11:9]; ccc==0 means 8 (useImm/imm).
+    //  i=1            -> 2nd data-reg source Dc = op[11:9] (srcB).
+    when(spec.op === DecOp.SHIFT) {
+      val dr = op(2 downto 0).asUInt.resize(5)
+      val ccc = op(11 downto 9).asUInt
+      opUop.srcAReg := dr; opUop.srcAValid := True       // Dr (shift input)
+      opUop.dstReg  := dr; opUop.dstValid  := True       // Dr (shift result)
+      when(spec.shiftImm) {
+        // immediate count: ccc 1..8, with ccc==0 -> 8.
+        val cnt = Mux(ccc === 0, U(8, 6 bits), ccc.resize(6))
+        opUop.useImm := True
+        opUop.imm    := cnt.resize(32).asBits
+        opUop.srcBValid := False
+      } otherwise {
+        // register count: srcB = Dc (op[11:9]); the EU masks to 6 bits.
+        opUop.srcBReg := ccc.resize(5); opUop.srcBValid := True
+        opUop.useImm  := False
+      }
+    }
+
     // MOVE: NZVC only if the destination EA is a data register.
     when(spec.writesNzvcIfDataDst) { opUop.writesNzvc := (dstEa.klass === EaClass.DATAREG) }
 
@@ -206,6 +230,7 @@ object MicroOpAssembler {
     ldUop.faultUsesNextPc := False
     ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False; ldUop.isTrapv := False
     ldUop.divSigned     := False; ldUop.div64 := False; ldUop.divIsRem := False
+    ldUop.shiftOp := 0; ldUop.shiftDir := False
     ldUop.firstOfInstr  := True    // the LOAD is the FIRST µop of a cracked instruction
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
@@ -239,6 +264,7 @@ object MicroOpAssembler {
     stUop.faultUsesNextPc := False
     stUop.faultAddr     := pkt.pc; stUop.sswInstr := False; stUop.isTrapv := False
     stUop.divSigned     := False; stUop.div64 := False; stUop.divIsRem := False
+    stUop.shiftOp := 0; stUop.shiftDir := False
     stUop.firstOfInstr  := True    // a single STORE µop is its own first µop
 
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
@@ -469,6 +495,7 @@ object MicroOpAssembler {
     divlUop.faultUsesNextPc := True            // DIV0 stacks nextPc (group-2 format-$2)
     divlUop.faultAddr     := pkt.pc; divlUop.sswInstr := False; divlUop.isTrapv := False
     divlUop.divSigned     := divlSigned; divlUop.div64 := divl64; divlUop.divIsRem := False
+    divlUop.shiftOp := 0; divlUop.shiftDir := False
     divlUop.firstOfInstr  := True
     // 64-bit dividend high word Dr: carried in srcC (psrcC after rename). For the
     // 32-bit form psrcC is unused.
@@ -499,6 +526,7 @@ object MicroOpAssembler {
     divremUop.faultUsesNextPc := False
     divremUop.faultAddr     := pkt.pc; divremUop.sswInstr := False; divremUop.isTrapv := False
     divremUop.divSigned     := divlSigned; divremUop.div64 := divl64; divremUop.divIsRem := True
+    divremUop.shiftOp := 0; divremUop.shiftDir := False
     divremUop.firstOfInstr  := False           // trailing crack µop
 
     // DIV.L is valid only when its divisor EA is reg/imm. A memSimple divisor would
@@ -569,6 +597,7 @@ object MicroOpAssembler {
     mullUop.faultUsesNextPc := False
     mullUop.faultAddr     := pkt.pc; mullUop.sswInstr := False; mullUop.isTrapv := False
     mullUop.divSigned     := mullSigned; mullUop.div64 := mull64; mullUop.divIsRem := False
+    mullUop.shiftOp := 0; mullUop.shiftDir := False
     mullUop.firstOfInstr  := True
 
     // MULHI (high-product move) µop (.L64 only): CPLX, writes the EU's LATCHED high
@@ -596,6 +625,7 @@ object MicroOpAssembler {
     mulhiUop.faultUsesNextPc := False
     mulhiUop.faultAddr     := pkt.pc; mulhiUop.sswInstr := False; mulhiUop.isTrapv := False
     mulhiUop.divSigned     := mullSigned; mulhiUop.div64 := mull64; mulhiUop.divIsRem := False
+    mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False
     mulhiUop.firstOfInstr  := False           // trailing crack µop
 
     // MUL.L is valid only when its multiplier EA is reg/imm (a memSimple multiplier
@@ -640,6 +670,7 @@ object MicroOpAssembler {
     ibrUop.faultUsesNextPc := False
     ibrUop.faultAddr     := pkt.pc; ibrUop.sswInstr := False; ibrUop.isTrapv := False
     ibrUop.divSigned     := False; ibrUop.div64 := False; ibrUop.divIsRem := False
+    ibrUop.shiftOp := 0; ibrUop.shiftDir := False
     // JMP is a single µop (its own first); JSR's ibranch is the TRAILING µop (the push
     // is first), so firstOfInstr is False for JSR.
     ibrUop.firstOfInstr  := !isJsrOp
@@ -685,6 +716,7 @@ object MicroOpAssembler {
       u.faulted := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.faultAddr := pkt.pc; u.sswInstr := False; u.isRte := False; u.isTrapv := False
       u.divSigned := False; u.div64 := False; u.divIsRem := False
+      u.shiftOp := 0; u.shiftDir := False
       u.firstOfInstr := first
       u
     }

@@ -93,8 +93,25 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     cmd.size := u1.size
     cmd.src1 := s1Src1
     cmd.src2 := s1Src2
-    cmd.xIn  := False                    // no flag-read ops yet
+    cmd.xIn  := False                    // no flag-read ops yet (ALU arith)
     val rsp = AluDatapath(cmd)
+
+    // ── S1: line-E barrel shifter (DecOp.SHIFT) ────────────────────────────────
+    // The shift INPUT (Dr) is src1; the count is the immediate (u1.useImm -> imm[5:0])
+    // or the 2nd data-reg source Dc (src2[5:0], masked to 6 bits = Dc & 0x3f). X-in is
+    // the current X (s1X). The barrel shifter produces result + NZVCX; ROL/ROR leave X
+    // (writesX=False from decode), and count-0 / count>=size specials are inside it.
+    val isShift = u1.op === DecOp.SHIFT
+    val shiftCmd = ShiftCmd()
+    shiftCmd.shiftOp := u1.shiftOp.asUInt
+    shiftCmd.dirLeft := u1.shiftDir
+    shiftCmd.size    := u1.size
+    shiftCmd.data    := s1Src1
+    shiftCmd.count   := s1Src2(5 downto 0).asUInt  // imm count (useImm) or Dc both land in src2[5:0]
+    shiftCmd.isImm   := u1.useImm
+    shiftCmd.xIn     := s1X
+    val shiftRsp = Shifter(shiftCmd)
+    val shiftNzvc = shiftRsp.n ## shiftRsp.z ## shiftRsp.v ## shiftRsp.c
 
     // ---- S1: size-merge of the int writeback (68k partial-register semantics) ----
     // A .B / .W ALU op updates ONLY the low byte / word of the destination register;
@@ -104,10 +121,13 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // datapath result, preserving the existing MOVE.L path; MOVE.B/.W reg-dest is a
     // separate concern outside this slice and is not regressed here.) .L = full result.
     val isMove = u1.op === DecOp.MOVE
+    // The op datapath result: shifter for SHIFT, else the ALU datapath. The shift dst
+    // operand is Dr = src1, so the .B/.W upper-preserve merge below applies unchanged.
+    val opResult = Mux(isShift, shiftRsp.result, rsp.result)
     val mergedResult = Mux(isMove, rsp.result, u1.size.mux(
-      Size.BYTE -> (s1Src1(31 downto 8)  ## rsp.result(7 downto 0)),
-      Size.WORD -> (s1Src1(31 downto 16) ## rsp.result(15 downto 0)),
-      Size.LONG -> rsp.result))
+      Size.BYTE -> (s1Src1(31 downto 8)  ## opResult(7 downto 0)),
+      Size.WORD -> (s1Src1(31 downto 16) ## opResult(15 downto 0)),
+      Size.LONG -> opResult))
 
     // ---- S1: ANDI/ORI/EORI #imm,CCR (toCcr) — CCR read-modify-write ----
     // Assemble the current 5-bit CCR {X,N,Z,V,C} from the flag PRFs, apply the logical
@@ -126,9 +146,12 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // ---- S1: writeback (gated by masks) ----
     // The int writeback is suppressed for a toCcr op (it has no int dst -> pdstValid
     // False already). NZVC/X take the CCR-rmw result for toCcr, else the datapath flags.
+    // Final NZVC/X: shifter for SHIFT, CCR-rmw for toCcr, else the ALU datapath.
+    val finalNzvc = Mux(isShift, shiftNzvc, Mux(u1.toCcr, ccrNzvc, rsp.nzvc))
+    val finalX    = Mux(isShift, shiftRsp.xOut, Mux(u1.toCcr, ccrX, rsp.xOut))
     intW.valid   := s1Valid && u1.pdstValid;  intW.address   := u1.pdst;     intW.data   := mergedResult
-    nzvcW.valid  := s1Valid && u1.writesNzvc; nzvcW.address  := u1.pNzvcDst;  nzvcW.data  := Mux(u1.toCcr, ccrNzvc, rsp.nzvc)
-    xW.valid     := s1Valid && u1.writesX;    xW.address     := u1.pXDst;     xW.data     := Mux(u1.toCcr, B(ccrX), B(rsp.xOut))
+    nzvcW.valid  := s1Valid && u1.writesNzvc; nzvcW.address  := u1.pNzvcDst;  nzvcW.data  := finalNzvc
+    xW.valid     := s1Valid && u1.writesX;    xW.address     := u1.pXDst;     xW.data     := B(finalX)
 
     // ---- S1: bypass (mirror the writes; forwards to a dependent reading this cycle) ----
     intByp.valid  := intW.valid;  intByp.address  := intW.address;  intByp.data  := intW.data
@@ -151,9 +174,9 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     wbObs.dstArch   := RegNext(u1.dstArch)
     wbObs.result    := RegNext(mergedResult)
     wbObs.intWrite  := RegNext(u1.pdstValid)
-    wbObs.nzvc      := RegNext(Mux(u1.toCcr, ccrNzvc, rsp.nzvc))
+    wbObs.nzvc      := RegNext(finalNzvc)
     wbObs.nzvcWrite := RegNext(u1.writesNzvc)
-    wbObs.x         := RegNext(Mux(u1.toCcr, ccrX, rsp.xOut))
+    wbObs.x         := RegNext(finalX)
     wbObs.xWrite    := RegNext(u1.writesX)
     wbObs.divRem    := False
     wbObs.simPublic()

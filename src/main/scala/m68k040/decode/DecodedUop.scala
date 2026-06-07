@@ -13,7 +13,12 @@ object DecOp extends SpinalEnum {
       // (Dn[31:0] for .W/.L32, Dl[31:0] for .L64); MULHI is the trailing crack µop
       // for the .L64 form (writes the LATCHED high product Dh from MulCore). Sign +
       // form carried via size + divSigned (reused for MULS) + div64 (.L64 marker).
-      MUL, MULHI = newElement()
+      MUL, MULHI,
+      // Line-E register-form shift/rotate (ASL/ASR/LSL/LSR/ROXL/ROXR/ROL/ROR). The
+      // op carries `shiftOp` (tt: 0=AS,1=LS,2=ROX,3=RO) + `shiftDir` (1=left) + size;
+      // the count is the immediate (useImm/imm, the `i=0` form) or the 2nd data-reg
+      // source Dc (srcB, the `i=1` form). Routed to the ALU EU's barrel shifter.
+      SHIFT = newElement()
 }
 
 /** Pre-rename µop: the decode→rename contract. Architectural operands
@@ -106,6 +111,12 @@ case class DecodedUop() extends Bundle {
   // back into NZVC/X. Default False (every other op leaves it clear). CCR only — the
   // privileged system-byte (to SR) forms are deferred.
   val toCcr        = Bool()
+  // ── Line-E shift/rotate control (DecOp.SHIFT) ───────────────────────────────
+  // shiftOp = tt (0=ASL/ASR, 1=LSL/LSR, 2=ROXL/ROXR, 3=ROL/ROR); shiftDir = d
+  // (1=left). The count is useImm/imm (i=0, ccc 1-8 with 0->8) or srcB=Dc (i=1).
+  // Default 0/False (non-shift µops). Threaded through rename to the ALU EU.
+  val shiftOp      = Bits(2 bits)
+  val shiftDir     = Bool()
   // Macro-instruction boundary marker: True for the FIRST µop of an instruction.
   // The cracker emits 1 or 2 µops/instruction; the only 2-µop case is a memSimple
   // source crack -> [load, op] where the LOAD is first. An interrupt may be taken

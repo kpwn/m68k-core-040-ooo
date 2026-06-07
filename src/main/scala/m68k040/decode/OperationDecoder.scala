@@ -102,6 +102,34 @@ object OperationDecoder {
         o.cluster := Cluster.INT
         o.readsNzvc := (opword(11 downto 8).asUInt >= 2)
       }
+      // ---- Line-E register-form shifts/rotates (1110 ccc d ss i tt rrr) ----
+      // ss (bits 7:6) = .B/.W/.L (11 = the memory single-bit form -> deferred/illegal).
+      // d (bit8) = direction (1=left). i (bit5) = count source (0 immediate ccc, 1 reg
+      // Dc). tt (bits 4:3) = family: 00 ASL/ASR, 01 LSL/LSR, 10 ROXL/ROXR, 11 ROL/ROR.
+      // rrr (bits 2:0) = Dr (the shifted data reg). The assembler fills the fixed-field
+      // operands (srcA=Dr, dst=Dr, srcB=Dc for the reg form) + the immediate count.
+      // Flags: N/Z always; V only for ASL (set in the EU); writesX for AS/LS/ROX, NOT
+      // for RO; readsX for AS/LS/ROX (count-0 preserves X) + ROX (rotate-through-X).
+      is(0xE) {
+        val ss = opword(7 downto 6)
+        val tt = opword(4 downto 3)
+        when(ss =/= 3) {                    // ss=11 is the memory single-bit form (deferred)
+          o.illegal := False
+          o.op := DecOp.SHIFT
+          o.cluster := Cluster.INT
+          when(ss === 0) { o.size := Size.BYTE }
+            .elsewhen(ss === 1) { o.size := Size.WORD }
+            .otherwise { o.size := Size.LONG }
+          o.shiftOp  := tt
+          o.shiftDir := opword(8)
+          o.shiftImm := !opword(5)          // i=0 -> immediate count
+          o.dstWrites := True
+          o.writesNzvc := True
+          val isRo = (tt === 3)             // ROL/ROR do NOT touch X
+          o.writesX := !isRo
+          o.readsX  := !isRo                // AS/LS/ROX read X (count-0 preserve + ROX-through-X)
+        }
+      }
       // ---- OR/SUB/CMP/AND/ADD (1ooo ... ) ----
       is(0x8, 0x9, 0xB, 0xC, 0xD) {
         val opmode = opword(8 downto 6)
