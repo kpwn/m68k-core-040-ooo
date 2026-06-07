@@ -49,6 +49,24 @@ object MicroOpAssembler {
                      pkt.words(1) ## pkt.words(2),
                      pkt.words(1).asSInt.resize(32).asBits)
 
+    // Line-0 immediate mem-dest RMW (ADDI/.../EORI/CMPI #imm,<ea>): the EA's OWN
+    // extension words follow the immediate (1 word for .B/.W, 2 for .L), NOT at
+    // words(1). Re-decode the EA from a SHIFTED words vector so its disp/abs come from
+    // the right offset (same shape as the DIV.L/MUL.L re-decode). `immEa` is used ONLY
+    // for the RMW load/store ADDRESS when the op is a line-0 immediate; the plain
+    // `srcEa` (words(1)-based) still drives the operand CLASS (mode/reg are offset-
+    // independent) and every non-immediate path.
+    val immIsLong = spec.size === Size.LONG
+    val immEa = EaDecoder.decode(
+      op(5 downto 0), spec.size,
+      Mux(immIsLong, Vec(pkt.words(0), pkt.words(3), pkt.words(4)),    // .L: imm = words(1..2)
+                     Vec(pkt.words(0), pkt.words(2), pkt.words(3))))   // .B/.W: imm = words(1)
+    // The EA descriptor for the RMW load/store ADDRESS: immEa for a line-0 immediate
+    // (its ext follows the imm), srcEa otherwise. (klass/base/baseValid/pcRel are
+    // offset-independent and identical; only `disp` differs.)
+    val opIsLineImm = spec.srcB.kind === OperandKind.IMMEXT
+    val rmwEaDisp = Mux(opIsLineImm, immEa.disp, srcEa.disp)
+
     // ── Operand classification ───────────────────────────────────────────────
     val srcIsReg = (srcEa.klass === EaClass.DATAREG) || (srcEa.klass === EaClass.ADDRREG)
     val srcIsMem = (srcEa.klass === EaClass.MEMSIMPLE)
@@ -310,8 +328,10 @@ object MicroOpAssembler {
     ldUop.srcCReg       := 0;          ldUop.srcCValid := False
     ldUop.dstReg        := U(T0, 5 bits); ldUop.dstValid := True
     ldUop.useImm        := True
+    // disp = rmwEaDisp (immEa for a line-0 immediate mem-dest, else srcEa). A (d16,PC)
+    // source folds pc into the absolute disp (never a line-0 immediate -> srcEa.disp).
     val pcRelAddr = (pkt.pc + U(2, 32 bits) + srcEa.disp.asUInt).asBits
-    ldUop.imm           := Mux(srcEa.pcRel, pcRelAddr, srcEa.disp)
+    ldUop.imm           := Mux(srcEa.pcRel, pcRelAddr, rmwEaDisp)
     ldUop.readsNzvc     := False; ldUop.readsX := False
     ldUop.writesNzvc    := False; ldUop.writesX := False
     ldUop.isBranch      := False; ldUop.ibranch := False; ldUop.stkPush := False; ldUop.anInc := 0; ldUop.ccrRestore := False; ldUop.toCcr := False; ldUop.cond := 0
@@ -375,8 +395,9 @@ object MicroOpAssembler {
     rmwStUop.srcCReg       := 0;          rmwStUop.srcCValid := False
     rmwStUop.dstReg        := 0;          rmwStUop.dstValid  := False
     rmwStUop.useImm        := True
+    // Same EA as the load (MEMSIMPLE recompute): rmwEaDisp (immEa for a line-0 immediate).
     val rmwStPcRelAddr = (pkt.pc + U(2, 32 bits) + srcEa.disp.asUInt).asBits
-    rmwStUop.imm           := Mux(srcEa.pcRel, rmwStPcRelAddr, srcEa.disp)
+    rmwStUop.imm           := Mux(srcEa.pcRel, rmwStPcRelAddr, rmwEaDisp)
     rmwStUop.readsNzvc     := False; rmwStUop.readsX := False
     rmwStUop.writesNzvc    := False; rmwStUop.writesX := False   // the op µop owns the flags
     rmwStUop.isBranch      := False; rmwStUop.ibranch := False; rmwStUop.stkPush := False; rmwStUop.anInc := 0; rmwStUop.ccrRestore := False; rmwStUop.toCcr := False; rmwStUop.cond := 0

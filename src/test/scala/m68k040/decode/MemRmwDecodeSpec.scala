@@ -30,6 +30,14 @@ class MemRmwDecodeSpec extends AnyFunSuite {
     dut.pkt.words(0) #= op; dut.pkt.words(1) #= w1; dut.pkt.words(2) #= w2
     dut.pkt.words(3) #= 0; dut.pkt.words(4) #= 0
   }
+  // drive with explicit extension words (words(1..4)), for ops where the EA ext follows
+  // the immediate (so we can place a disp at words(3)/(4)).
+  def drive2(dut: Dut, op: Int, ext: Seq[Int], len: Int): Unit = {
+    dut.pkt.valid #= true; dut.pkt.pc #= 0x2000; dut.pkt.simple #= true; dut.pkt.complex #= false
+    dut.pkt.lenWords #= len; dut.pkt.wordCount #= len; dut.pkt.fault #= false
+    dut.pkt.words(0) #= op
+    for (i <- 1 to 4) dut.pkt.words(i) #= (if (i - 1 < ext.length) ext(i - 1) else 0)
+  }
   def run(check: Dut => Unit): Unit = SimConfig.withVerilator.compile(new Dut).doSim(check)
 
   // helper: assert a [load -> T0][op -> T1][store T1 -> ea] triple
@@ -155,6 +163,82 @@ class MemRmwDecodeSpec extends AnyFunSuite {
       assert(dut.uop1.srcAReg.toInt == 8 && dut.uop1.srcAValid.toBoolean, "store base = A0")
       assert(!dut.uop1.writesNzvc.toBoolean, "store sets no flags")
       assert(!dut.uop1.unimplemented.toBoolean)
+    }
+  }
+
+  // ── line-0 immediates #imm,<ea> (the imm precedes the EA ext) ──────────────
+  test("ADDI.W #0x1234,(A0) -> load->T0, ADD(T0,#imm)->T1, store T1->(A0)", VerilatorTest) {
+    // ADDI.W #imm,(A0): 0000 011 0 01 010 000 = 0x0650, imm word = words(1)
+    run { dut => drive(dut, 0x0650, 0x1234, len = 2); sleep(1)
+      assertRmwTriple(dut, base = 8, baseValid = true, disp = 0, sz = Size.WORD, expOp = DecOp.ADD, opSrcReg = -1)
+      assert(dut.uop1.useImm.toBoolean && (dut.uop1.imm.toLong & 0xffff) == 0x1234, "ADD uses #imm")
+      assert(dut.uop1.writesX.toBoolean, "ADDI writes X")
+    }
+  }
+
+  test("ANDI.L #imm,(d16,A1) -> RMW triple; EA disp16 follows the imm32 (right offset)", VerilatorTest) {
+    // ANDI.L #imm,(d16,A1): 0000 001 0 10 101 001 = 0x02A9, imm32 = words(1..2), disp16 = words(3)
+    run { dut => drive2(dut, 0x02A9, Seq(0x1111, 0x2222, 0x0030), len = 4); sleep(1)
+      assert(dut.count.toInt == 3)
+      assert(dut.uop0.memOp.toEnum == MemOp.LOAD && dut.uop0.srcAReg.toInt == 9)
+      assert((dut.uop0.imm.toLong & 0xffffffffL) == 0x30L, "load disp16 = 0x30 (the word AFTER imm32)")
+      assert(dut.uop1.op.toEnum == DecOp.AND && dut.uop1.dstReg.toInt == T1)
+      assert((dut.uop1.imm.toLong & 0xffffffffL) == 0x11112222L, "AND uses imm32 (words 1..2)")
+      assert(dut.uop2.memOp.toEnum == MemOp.STORE && dut.uop2.srcBReg.toInt == T1)
+      assert((dut.uop2.imm.toLong & 0xffffffffL) == 0x30L, "store disp = load disp (same EA)")
+    }
+  }
+
+  test("EORI.B #imm,(xxx).W -> RMW triple, base=0", VerilatorTest) {
+    // EORI.B #imm,(xxx).W: 0000 101 0 00 111 000 = 0x0A38, imm.B = words(1), abs16 = words(2)
+    run { dut => drive(dut, 0x0A38, 0x0055, 0x3000, len = 3); sleep(1)
+      assert(dut.count.toInt == 3)
+      assert(!dut.uop0.srcAValid.toBoolean, "(xxx).W needs no base")
+      assert((dut.uop0.imm.toLong & 0xffffffffL) == 0x3000L, "load abs = 0x3000")
+      assert(dut.uop1.op.toEnum == DecOp.EOR && (dut.uop1.imm.toLong & 0xff) == 0x55)
+      assert((dut.uop2.imm.toLong & 0xffffffffL) == 0x3000L, "store abs = load abs (same EA)")
+    }
+  }
+
+  // ── ADDQ/SUBQ #n,<ea> ──────────────────────────────────────────────────────
+  test("ADDQ.L #3,(A0) -> load->T0, ADD(T0,#3)->T1, store T1->(A0)", VerilatorTest) {
+    // ADDQ.L #3,(A0): 0101 011 0 10 010 000 = 0x5690 (ddd=3, q=0=ADDQ, ss=.L)
+    run { dut => drive(dut, 0x5690); sleep(1)
+      assertRmwTriple(dut, base = 8, baseValid = true, disp = 0, sz = Size.LONG, expOp = DecOp.ADD, opSrcReg = -1)
+      assert(dut.uop1.useImm.toBoolean && dut.uop1.imm.toLong == 3, "ADDQ #3")
+    }
+  }
+
+  test("SUBQ.W #8,(d16,A1) -> RMW triple, ddd=0 -> 8", VerilatorTest) {
+    // SUBQ.W #8,(d16,A1): 0101 000 1 01 101 001 = 0x5169 (ddd=0->8, q=1=SUBQ, ss=.W)
+    run { dut => drive(dut, 0x5169, 0x000A, len = 2); sleep(1)
+      assertRmwTriple(dut, base = 9, baseValid = true, disp = 0xA, sz = Size.WORD, expOp = DecOp.SUB, opSrcReg = -1)
+      assert(dut.uop1.imm.toLong == 8, "SUBQ ddd=0 -> 8")
+    }
+  }
+
+  // ── CMPI #imm,<ea> = load + compare, NO store ──────────────────────────────
+  test("CMPI.L #imm,(A0) -> load->T0 + compare (NO store, no write)", VerilatorTest) {
+    // CMPI.L #imm,(A0): 0000 110 0 10 010 000 = 0x0C90, imm32 = words(1..2)
+    run { dut => drive(dut, 0x0C90, 0x0000, 0x0001, len = 3); sleep(1)
+      assert(dut.count.toInt == 2, s"CMPI mem = load + compare (no store), got ${dut.count.toInt}")
+      assert(dut.uop0.memOp.toEnum == MemOp.LOAD && dut.uop0.dstReg.toInt == T0)
+      assert(dut.uop1.op.toEnum == DecOp.CMP && dut.uop1.writesNzvc.toBoolean)
+      assert(!dut.uop1.dstValid.toBoolean, "CMPI writes no register")
+      assert(dut.uop1.memOp.toEnum == MemOp.NONE, "no store µop for CMPI")
+      assert(dut.uop1.useImm.toBoolean && (dut.uop1.imm.toLong & 0xffffffffL) == 1L)
+      assert(!dut.uop1.unimplemented.toBoolean)
+    }
+  }
+
+  // ── CMP <ea>,Dn (mem SOURCE) = load + compare, no store (already supported) ──
+  test("CMP.L (A0),D1 (mem source) -> load->T0 + compare, no store", VerilatorTest) {
+    // CMP.L (A0),D1: line B, opmode 2 (.L EA->Dn). 1011 001 010 010 000 = 0xB290
+    run { dut => drive(dut, 0xB290); sleep(1)
+      assert(dut.count.toInt == 2, "CMP mem-source = load + compare")
+      assert(dut.uop0.memOp.toEnum == MemOp.LOAD)
+      assert(dut.uop1.op.toEnum == DecOp.CMP && !dut.uop1.dstValid.toBoolean && dut.uop1.writesNzvc.toBoolean)
+      assert(dut.uop1.memOp.toEnum == MemOp.NONE)
     }
   }
 
