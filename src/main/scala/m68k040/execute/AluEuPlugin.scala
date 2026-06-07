@@ -114,20 +114,27 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val shiftNzvc = shiftRsp.n ## shiftRsp.z ## shiftRsp.v ## shiftRsp.c
 
     // ---- S1: size-merge of the int writeback (68k partial-register semantics) ----
-    // A .B / .W ALU op updates ONLY the low byte / word of the destination register;
-    // the upper bits are PRESERVED. For ADD/SUB/AND/OR/EOR the destination operand is
-    // srcA (src1), so the old register value is s1Src1 -> merge its upper bits with the
-    // datapath's low `size` result. (MOVE's dst is NOT src1 — MOVE keeps the full
-    // datapath result, preserving the existing MOVE.L path; MOVE.B/.W reg-dest is a
-    // separate concern outside this slice and is not regressed here.) .L = full result.
-    val isMove = u1.op === DecOp.MOVE
+    // A .B / .W op updates ONLY the low byte / word of the destination register; the
+    // upper bits are PRESERVED. For ADD/SUB/AND/OR/EOR the destination operand is srcA
+    // (src1), so the old register value is s1Src1 -> merge its upper bits with the
+    // datapath's low `size` result. MOVE.B/.W to a DATA register also reaches this
+    // merge: the decoder makes such a MOVE READ its destination Dn as srcA (the merge
+    // source), so s1Src1 holds the old Dn and the upper bytes are preserved. MOVE.L
+    // (and any .L op) takes the full result; MOVE.L to Dn writes s1Src1=don't-care but
+    // selects LONG -> full opResult, so it is unaffected.
     // The op datapath result: shifter for SHIFT, else the ALU datapath. The shift dst
     // operand is Dr = src1, so the .B/.W upper-preserve merge below applies unchanged.
     val opResult = Mux(isShift, shiftRsp.result, rsp.result)
-    val mergedResult = Mux(isMove, rsp.result, u1.size.mux(
+    val sizeMerged = u1.size.mux(
       Size.BYTE -> (s1Src1(31 downto 8)  ## opResult(7 downto 0)),
       Size.WORD -> (s1Src1(31 downto 16) ## opResult(15 downto 0)),
-      Size.LONG -> opResult))
+      Size.LONG -> opResult)
+    // MOVEA (MOVE to An): An is ALWAYS written full-32 — NO partial merge. The .W form
+    // SIGN-EXTENDS the 16-bit source (the MOVE source is src2); .L writes it whole.
+    // (MOVEA never reaches a .B form — byte MOVEA is illegal in the ISA.)
+    val moveaResult = Mux(u1.size === Size.WORD,
+      s1Src2(15 downto 0).asSInt.resize(32).asBits, s1Src2)
+    val mergedResult = Mux(u1.isMovea, moveaResult, sizeMerged)
 
     // ---- S1: ANDI/ORI/EORI #imm,CCR (toCcr) — CCR read-modify-write ----
     // Assemble the current 5-bit CCR {X,N,Z,V,C} from the flag PRFs, apply the logical
