@@ -3,7 +3,7 @@ package m68k040.exception
 import m68k040.{M68kSim, VerilatorTest}
 import m68k040.execute.{BranchEuPlugin, BranchEuService}
 import m68k040.execute.iq.IqContext
-import m68k040.execute.regfile.{NzvcRegFileService, RegFilePluginNzvc, RegFileWritePort}
+import m68k040.execute.regfile.{NzvcRegFileService, RegFilePluginNzvc, RegFilePluginInt, RegFileWritePort}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -30,6 +30,10 @@ class TrapvSpec extends AnyFunSuite {
       val iNextPc   = in UInt (32 bits)
 
       val ctx = IqContext(); val uop = ctx.uop
+      // Default-drive every uop field (the bundle has grown many fields — ibranch/anInc/
+      // stkPush/ccrRestore/div*/shift*/isMovea/toCcr/... — since this stub was written);
+      // the TRAPV path reads only the branch/NZVC fields, explicitly set below.
+      uop.assignDontCare()
       uop.valid := False; uop.cluster := m68k040.isa.Cluster.INT
       uop.op := m68k040.decode.DecOp.ILLEGAL; uop.size := m68k040.isa.Size.WORD
       uop.useImm := False; uop.imm := 0; uop.unimplemented := False
@@ -46,6 +50,8 @@ class TrapvSpec extends AnyFunSuite {
       // (mispredict stays False) — TRAPV is a fault, not a redirect.
       uop.isBranch := True; uop.cond := 1; uop.branchDisp := 0
       uop.isTrapv := True; uop.isScc := False; uop.isDbcc := False
+      // branch-EU control fields the TRAPV path must NOT trigger (call/return + line-5):
+      uop.ibranch := False; uop.anInc := 0; uop.stkPush := False; uop.ccrRestore := False
       uop.pc := 0x2000; uop.nextPc := iNextPc; uop.faultUsesNextPc := True
       uop.pNzvcSrc := iPNzvcSrc; uop.readsNzvc := True
       ctx.robId := iRobId
@@ -66,10 +72,11 @@ class TrapvSpec extends AnyFunSuite {
   }
   class Dut extends Component {
     val db = new Database; val host = db on (new PluginHost)
+    val rfInt  = new RegFilePluginInt   // branch-EU ibranch (call/return) reads IntRegFileService
     val rfNzvc = new RegFilePluginNzvc
     val eu  = new BranchEuPlugin
     val src = new Src
-    db.on { host.asHostOf(Seq[FiberPlugin](rfNzvc, eu, src)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](rfInt, rfNzvc, eu, src)) }
   }
 
   def runOne(vSet: Boolean): (Boolean, Boolean, Boolean) = {
