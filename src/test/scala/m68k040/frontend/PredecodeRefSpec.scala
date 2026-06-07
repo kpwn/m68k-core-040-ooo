@@ -29,10 +29,19 @@ class PredecodeRefSpec extends AnyFunSuite {
   }
   test("indexed (d8,A0,Xn) source -> complex") { assert(classify(0xD0B0) == cp(false,0)) }
   test("deferred ops -> complex") {
-    assert(classify(0x5240) == cp(false,0))  // ADDQ.W #1,D0
-    assert(classify(0x51C8) == cp(false,0))  // DBRA D0
+    assert(classify(0x5290) == cp(false,0))  // ADDQ.L #1,(A0) -> memory dest (deferred RMW)
+    assert(classify(0x50FA) == cp(false,0))  // TRAPcc/ST (d16,PC)? mode7 reg2 ss=11 -> deferred
     assert(classify(0xE0D0) == cp(false,0))  // ASR.W (A0) (line-E memory single-bit, ss=11) -> deferred
     assert(classify(0x41D0) == cp(false,0))  // LEA (A0),A0
+  }
+  // Line-5 ADDQ/SUBQ (Dn/An dest) + Scc (Dn) + DBcc (now in scope).
+  test("line-5 ADDQ/SUBQ + Scc + DBcc -> simple (in scope)") {
+    assert(classify(0x5240) == cp(true,1))   // ADDQ.W #1,D0
+    assert(classify(0x5248) == cp(true,1))   // ADDQ.W #1,A0 (An dest)
+    assert(classify(0x5701) == cp(true,1))   // SUBQ.B #3,D1
+    assert(classify(0x57C2) == cp(true,1))   // SEQ D2 (Scc Dn)
+    assert(classify(0x51C8) == cp(true,2))   // DBRA D0 + disp16 -> len2
+    assert(classify(0x57CE) == cp(true,2))   // DBEQ D6 + disp16 -> len2
   }
   test("line-E register-form shifts/rotates -> simple len1 (in scope)") {
     assert(classify(0xE148) == cp(true,1))   // LSL.W #8,D0

@@ -58,8 +58,11 @@ object MicroOpAssembler {
     val usesDstEa = (spec.dst.kind === OperandKind.EADST)
 
     // The op consumes a memSimple SOURCE EA -> crack a leading load µop into T0,
-    // and the op reads T0 in the EASRC slot.
-    val crackLoad = usesSrcEa && srcIsMem
+    // and the op reads T0 in the EASRC slot. EXCEPT ADDQ/SUBQ (srcB = IMMQ3): its
+    // EASRC is the DESTINATION (a deferred memory RMW), NOT a load source -> a memory
+    // EA there is illegal (addqMemBad), never a leading-load crack.
+    val isAddqSubq = spec.srcB.kind === OperandKind.IMMQ3
+    val crackLoad = usesSrcEa && srcIsMem && !isAddqSubq
 
     // MOVE reg -> memSimple destination -> a single STORE µop (data = the register
     // source). Mem-to-mem (source also memSimple) is deferred. RMW (ALU op with a
@@ -105,6 +108,7 @@ object MicroOpAssembler {
     opUop.shiftOp       := spec.shiftOp
     opUop.shiftDir      := spec.shiftDir
     opUop.isMovea       := False
+    opUop.isScc         := False; opUop.isDbcc := False
     // CHK / DIV are group-2 traps (CHK vec6, DIV0 vec5) delivered execute-time via
     // euFault -> format-$2: they stack the NEXT instruction's PC (the 040 group-2
     // frame's PC = pc+len). The fault is conditional (set at execute), but faultPc is
@@ -149,6 +153,13 @@ object MicroOpAssembler {
       is(OperandKind.EADST) { opUop.srcBReg := dstEa.reg; opUop.srcBValid := True }
       is(OperandKind.IMMQ)  { opUop.useImm := True; opUop.imm := op(7 downto 0).asSInt.resize(32).asBits }
       is(OperandKind.IMMEXT) { opUop.useImm := True; opUop.imm := immExt }   // line-0 trailing imm word(s)
+      is(OperandKind.IMMQ3) {
+        // ADDQ/SUBQ quick immediate: ddd = op[11:9], 1-8 with ddd==0 -> 8. Always
+        // POSITIVE (1-8), zero-extended (the An full-32 path adds/subtracts it whole).
+        val ddd = op(11 downto 9).asUInt
+        opUop.useImm := True
+        opUop.imm    := Mux(ddd === 0, U(8, 4 bits), ddd.resize(4)).resize(32).asBits
+      }
       default {}
     }
 
@@ -224,6 +235,19 @@ object MicroOpAssembler {
       opUop.isMovea := True
     }
 
+    // ── ADDQ/SUBQ #n,An — full-32, NO flags (like ADDA/SUBA) ───────────────────
+    // ADDQ/SUBQ (srcB = IMMQ3) whose DESTINATION EA (op[5:0] = srcEa, since dst=EASRC)
+    // resolves to an ADDRESS register: the operation is full-32 regardless of the .B/.W
+    // size field and writes NO condition codes (the 68k An rule). Force size LONG (the
+    // ALU does a full-32 ADD/SUB; the .B/.W partial merge is bypassed) and clear the
+    // flag write masks. The Dn-dest case (srcEa = DATAREG) keeps size/NZVCX from decode.
+    val addqAddrDst = (spec.srcB.kind === OperandKind.IMMQ3) && (srcEa.klass === EaClass.ADDRREG)
+    when(addqAddrDst) {
+      opUop.size       := Size.LONG
+      opUop.writesNzvc := False
+      opUop.writesX    := False
+    }
+
     // Branch displacement (byte / word / long), reproducing the simple-decode rule.
     when(spec.isBranch) {
       val disp8 = op(7 downto 0)
@@ -259,7 +283,7 @@ object MicroOpAssembler {
     ldUop.faultUsesNextPc := False
     ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False; ldUop.isTrapv := False
     ldUop.divSigned     := False; ldUop.div64 := False; ldUop.divIsRem := False
-    ldUop.shiftOp := 0; ldUop.shiftDir := False; ldUop.isMovea := False
+    ldUop.shiftOp := 0; ldUop.shiftDir := False; ldUop.isMovea := False; ldUop.isScc := False; ldUop.isDbcc := False
     ldUop.firstOfInstr  := True    // the LOAD is the FIRST µop of a cracked instruction
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
@@ -293,7 +317,7 @@ object MicroOpAssembler {
     stUop.faultUsesNextPc := False
     stUop.faultAddr     := pkt.pc; stUop.sswInstr := False; stUop.isTrapv := False
     stUop.divSigned     := False; stUop.div64 := False; stUop.divIsRem := False
-    stUop.shiftOp := 0; stUop.shiftDir := False; stUop.isMovea := False
+    stUop.shiftOp := 0; stUop.shiftDir := False; stUop.isMovea := False; stUop.isScc := False; stUop.isDbcc := False
     stUop.firstOfInstr  := True    // a single STORE µop is its own first µop
 
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
@@ -321,10 +345,31 @@ object MicroOpAssembler {
     // path (it must NOT crack a leading load, which the generic srcEaOk would do). The
     // EORI #imm,CCR form (also spec.op==EOR, klass==IMM) is NOT gated here (-> !isToCcr).
     val eorMemBad = (spec.op === DecOp.EOR) && (srcEa.klass =/= EaClass.DATAREG) && !isToCcr
+    // ADDQ/SUBQ (srcB = IMMQ3): the EA (op[5:0]) is the DESTINATION (read AND written).
+    // This slice supports a DATA-register OR ADDRESS-register destination only; a memory
+    // EA is the deferred RMW form -> illegal. `addqMemBad` forces the illegal path (it
+    // must NOT crack a leading load, which the generic srcEaOk/crackLoad would do).
+    val addqMemBad = (spec.srcB.kind === OperandKind.IMMQ3) &&
+                     (srcEa.klass =/= EaClass.DATAREG) && (srcEa.klass =/= EaClass.ADDRREG)
     // Line-0 immediate (srcB = IMMEXT): the EA (op[5:0]) is the DESTINATION. This slice
     // supports a DATA-REGISTER destination only; a memory / An-direct / #imm EA is the
     // deferred RMW (or illegal) form -> illegal. The to-CCR form is the one exception.
     val lineImmBad = isLineImm && (srcEa.klass =/= EaClass.DATAREG) && !isToCcr
+    // ── Line-5 Scc / DBcc (0101 cccc 11 mmmrrr) ─────────────────────────────────
+    // ss == 11 (op[7:6]). mode = op[5:3]. DBcc = mode 001 (+ disp16 word). Scc = any
+    // other mode (a byte set on cond); in-scope = mode 000 (Dn). Memory Scc (mode>=2)
+    // + TRAPcc (mode 7, reg 2/3/4) are deferred -> illegal. cccc = op[11:8] (the branch
+    // EU's 16-condition field). rrr = op[2:0] (Dn for Scc / the DBcc counter Dn).
+    val isLine5    = (op(15 downto 12) === B"4'h5")
+    val ss5        = op(7 downto 6)
+    val mode5      = op(5 downto 3)
+    val cccc5      = op(11 downto 8)
+    val rrr5       = op(2 downto 0).asUInt.resize(5)
+    val isDbccOp   = isLine5 && (ss5 === 3) && (mode5 === 1)
+    val isSccOp    = isLine5 && (ss5 === 3) && (mode5 === 0)          // Scc Dn (in scope)
+    // A memory/TRAPcc line-5 ss==11 form (not DBcc mode 001, not Scc-Dn mode 000) is
+    // deferred -> illegal (`sccMemBad`).
+    val sccMemBad  = isLine5 && (ss5 === 3) && (mode5 =/= 0) && (mode5 =/= 1)
     // ── RTE (0x4E73) — a serializing return-from-exception µop (privileged). ────
     // Decoded here (line 0x4 is otherwise unimplemented) so it is NOT treated as an
     // illegal instruction. It commits like a no-op op µop but carries isRte; the
@@ -363,8 +408,9 @@ object MicroOpAssembler {
     val isRtsBad = (op === B"16'h4E75")
     val isRtrBad = (op === B"16'h4E77")
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
-              !isRtsBad && !isRtrBad &&
-              (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
+              !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp &&
+              (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
+               (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     // A JMP/JSR with a non-control EA is illegal (vector 4).
     val jmpBad = isJmpOp && !ctrlEaOk
     val jsrBad = isJsrOp && !ctrlEaOk
@@ -445,6 +491,53 @@ object MicroOpAssembler {
       opUop.isTrapv       := True
       opUop.faultUsesNextPc := True
     }
+    // ── Scc Dn (0101 cccc 11 000rrr) — set Dn[7:0] := cond ? 0xFF : 0x00 ────────
+    // A branch-class µop (routes to the branch EU's condition mux). It READS its dst Dn
+    // (srcA = the merge upper-24 source) and WRITES Dn (dst = the byte-merged result);
+    // it never redirects (the branch EU's Scc path forces taken/mispredict off and the
+    // int write through anW). NO flags, NO ALU action. cond = cccc; the byte value is
+    // computed in the EU from `taken`.
+    when(isSccOp) {
+      opUop.op            := DecOp.ILLEGAL    // no ALU action; the branch EU drives the write
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.isBranch      := True             // branch EU (condition mux)
+      opUop.isScc         := True
+      opUop.cond          := cccc5
+      opUop.readsNzvc     := True             // read NZVC for the condition
+      opUop.srcAReg       := rrr5; opUop.srcAValid := True   // old Dn (merge upper-24 source)
+      opUop.srcBValid     := False
+      opUop.dstReg        := rrr5; opUop.dstValid := True    // Dn (byte-merged result)
+      opUop.useImm        := False
+      opUop.writesNzvc    := False; opUop.writesX := False
+      opUop.branchDisp    := 0
+      opUop.unimplemented := False
+      opUop.faulted       := False; opUop.faultVector := 0
+      opUop.isRte         := False; opUop.isTrapv := False; opUop.ibranch := False
+    }
+    // ── DBcc Dn,disp (0101 cccc 11 001rrr + disp16) — decrement-and-branch ──────
+    // A branch-class µop. READS Dn (srcA = the counter / merge source) + WRITES Dn (dst
+    // = Mux(cond, Dn, {Dn[31:16], Dn[15:0]-1})); redirect = `!cond && (decW != -1)` to
+    // pc+2+disp (the branch EU's relTarget). cond = cccc (DBRA/DBF = cccc=F=1). NO flags.
+    when(isDbccOp) {
+      opUop.op            := DecOp.ILLEGAL    // no ALU action; the branch EU drives it
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.isBranch      := True             // branch EU (condition mux + PC-rel target)
+      opUop.isDbcc        := True
+      opUop.cond          := cccc5
+      opUop.readsNzvc     := True             // read NZVC for the condition
+      opUop.srcAReg       := rrr5; opUop.srcAValid := True   // old Dn (counter / merge source)
+      opUop.srcBValid     := False
+      opUop.dstReg        := rrr5; opUop.dstValid := True    // Dn (decremented or unchanged)
+      opUop.useImm        := False
+      opUop.writesNzvc    := False; opUop.writesX := False
+      // disp16 (the trailing extension word) — the PC-relative branch displacement.
+      opUop.branchDisp    := pkt.words(1).asSInt.resize(32).asBits
+      opUop.unimplemented := False
+      opUop.faulted       := False; opUop.faultVector := 0
+      opUop.isRte         := False; opUop.isTrapv := False; opUop.ibranch := False
+    }
 
     // ── INSTRUCTION-FETCH fault (the I-cache raised DecodePacket.fault) ─────────
     // The ITLB faulted translating this fetch (non-resident / supervisor I-page), so
@@ -524,7 +617,7 @@ object MicroOpAssembler {
     divlUop.faultUsesNextPc := True            // DIV0 stacks nextPc (group-2 format-$2)
     divlUop.faultAddr     := pkt.pc; divlUop.sswInstr := False; divlUop.isTrapv := False
     divlUop.divSigned     := divlSigned; divlUop.div64 := divl64; divlUop.divIsRem := False
-    divlUop.shiftOp := 0; divlUop.shiftDir := False; divlUop.isMovea := False
+    divlUop.shiftOp := 0; divlUop.shiftDir := False; divlUop.isMovea := False; divlUop.isScc := False; divlUop.isDbcc := False
     divlUop.firstOfInstr  := True
     // 64-bit dividend high word Dr: carried in srcC (psrcC after rename). For the
     // 32-bit form psrcC is unused.
@@ -555,7 +648,7 @@ object MicroOpAssembler {
     divremUop.faultUsesNextPc := False
     divremUop.faultAddr     := pkt.pc; divremUop.sswInstr := False; divremUop.isTrapv := False
     divremUop.divSigned     := divlSigned; divremUop.div64 := divl64; divremUop.divIsRem := True
-    divremUop.shiftOp := 0; divremUop.shiftDir := False; divremUop.isMovea := False
+    divremUop.shiftOp := 0; divremUop.shiftDir := False; divremUop.isMovea := False; divremUop.isScc := False; divremUop.isDbcc := False
     divremUop.firstOfInstr  := False           // trailing crack µop
 
     // DIV.L is valid only when its divisor EA is reg/imm. A memSimple divisor would
@@ -626,7 +719,7 @@ object MicroOpAssembler {
     mullUop.faultUsesNextPc := False
     mullUop.faultAddr     := pkt.pc; mullUop.sswInstr := False; mullUop.isTrapv := False
     mullUop.divSigned     := mullSigned; mullUop.div64 := mull64; mullUop.divIsRem := False
-    mullUop.shiftOp := 0; mullUop.shiftDir := False; mullUop.isMovea := False
+    mullUop.shiftOp := 0; mullUop.shiftDir := False; mullUop.isMovea := False; mullUop.isScc := False; mullUop.isDbcc := False
     mullUop.firstOfInstr  := True
 
     // MULHI (high-product move) µop (.L64 only): CPLX, writes the EU's LATCHED high
@@ -654,7 +747,7 @@ object MicroOpAssembler {
     mulhiUop.faultUsesNextPc := False
     mulhiUop.faultAddr     := pkt.pc; mulhiUop.sswInstr := False; mulhiUop.isTrapv := False
     mulhiUop.divSigned     := mullSigned; mulhiUop.div64 := mull64; mulhiUop.divIsRem := False
-    mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False; mulhiUop.isMovea := False
+    mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False; mulhiUop.isMovea := False; mulhiUop.isScc := False; mulhiUop.isDbcc := False
     mulhiUop.firstOfInstr  := False           // trailing crack µop
 
     // MUL.L is valid only when its multiplier EA is reg/imm (a memSimple multiplier
@@ -699,7 +792,7 @@ object MicroOpAssembler {
     ibrUop.faultUsesNextPc := False
     ibrUop.faultAddr     := pkt.pc; ibrUop.sswInstr := False; ibrUop.isTrapv := False
     ibrUop.divSigned     := False; ibrUop.div64 := False; ibrUop.divIsRem := False
-    ibrUop.shiftOp := 0; ibrUop.shiftDir := False; ibrUop.isMovea := False
+    ibrUop.shiftOp := 0; ibrUop.shiftDir := False; ibrUop.isMovea := False; ibrUop.isScc := False; ibrUop.isDbcc := False
     // JMP is a single µop (its own first); JSR's ibranch is the TRAILING µop (the push
     // is first), so firstOfInstr is False for JSR.
     ibrUop.firstOfInstr  := !isJsrOp
@@ -745,7 +838,7 @@ object MicroOpAssembler {
       u.faulted := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.faultAddr := pkt.pc; u.sswInstr := False; u.isRte := False; u.isTrapv := False
       u.divSigned := False; u.div64 := False; u.divIsRem := False
-      u.shiftOp := 0; u.shiftDir := False; u.isMovea := False
+      u.shiftOp := 0; u.shiftDir := False; u.isMovea := False; u.isScc := False; u.isDbcc := False
       u.firstOfInstr := first
       u
     }

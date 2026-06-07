@@ -123,6 +123,18 @@ case class DecodedUop() extends Bundle {
   // (which is for DATA-reg destinations only) and to sign-extend a .W MOVEA source.
   // Default False (every other op, incl. MOVE-to-Dn, leaves it clear).
   val isMovea      = Bool()
+  // ── Line-5 Scc / DBcc (branch-EU condition-path µops) ───────────────────────
+  // Scc (`0101 cccc 11 000rrr`): set Dn[7:0] := cond(cccc) ? 0xFF : 0x00, preserve the
+  // upper 24 bits, NO flags. A branch-class µop (isBranch, readsNzvc, cond=cccc) that
+  // reads its destination Dn (psrcA, the merge source) and writes it (pdst); it NEVER
+  // redirects (not a control transfer). Default False.
+  val isScc        = Bool()
+  // DBcc (`0101 cccc 11001rrr` + disp16): decrement-and-branch. If cond FALSE -> Dn.W
+  // -= 1 (partial, preserve Dn[31:16]); branch to pc+2+disp if Dn.W (after dec) != -1.
+  // If cond TRUE -> Dn unchanged, fall through. A branch-class µop (isBranch, readsNzvc,
+  // cond=cccc) reading Dn (psrcA) + writing Dn (pdst, the merged decrement-or-unchanged)
+  // + a PC-relative redirect gated on `!cond && (decW != -1)`. Default False.
+  val isDbcc       = Bool()
   // Macro-instruction boundary marker: True for the FIRST µop of an instruction.
   // The cracker emits 1 or 2 µops/instruction; the only 2-µop case is a memSimple
   // source crack -> [load, op] where the LOAD is first. An interrupt may be taken

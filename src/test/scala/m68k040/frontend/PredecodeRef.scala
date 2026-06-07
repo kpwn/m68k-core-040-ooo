@@ -113,6 +113,18 @@ object PredecodeRef {
             case _                   => COMPLEX
           }
         } else COMPLEX
+      // Line-5: ADDQ/SUBQ (ss != 11) + Scc/DBcc (ss == 11). See PredecodeWord.
+      case 0x5 =>
+        val ss   = (op >> 6) & 3
+        val mode = (op >> 3) & 7
+        if (ss != 3) {
+          if (mode == 0 || mode == 1) CP(simple = true, lenWords = 1)  // ADDQ/SUBQ Dn/An
+          else COMPLEX                                                 // mem dest deferred
+        } else {
+          if (mode == 1) CP(simple = true, lenWords = 2)               // DBcc + disp16
+          else if (mode == 0) CP(simple = true, lenWords = 1)          // Scc Dn
+          else COMPLEX                                                 // mem Scc / TRAPcc
+        }
       case 0x7 =>
         if (((op >> 8) & 1) == 0) CP(simple = true, lenWords = 1) else COMPLEX
       case 0x6 =>

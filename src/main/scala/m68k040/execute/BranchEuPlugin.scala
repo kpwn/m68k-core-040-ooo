@@ -123,9 +123,33 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     val relTarget = (u1.pc + 2 + u1.branchDisp.asUInt)
     val indTarget = (s1TgtBase + u1.imm.asUInt)
     val target    = Mux(u1.ibranch, indTarget, relTarget)
-    // An ibranch ALWAYS redirects (unconditional); a Bcc/BRA redirects iff `taken`.
-    val redirect  = Mux(u1.ibranch, True, taken)
-    val nextPc    = Mux(redirect, target, u1.pc + 2)
+
+    // ── Line-5 Scc / DBcc — the condition-path int writes + DBcc branch ─────────
+    // Scc/DBcc read their destination Dn via psrcA (s1TgtBase = the old Dn). `taken`
+    // is the evaluated condition cccc.
+    val oldDn = s1TgtBase.asBits                               // old Dn (the merge source)
+    // Scc: Dn[7:0] := taken ? 0xFF : 0x00 (preserve Dn[31:8]); never redirects.
+    val sccByte   = Mux(taken, B"8'hFF", B"8'h00")
+    val sccResult = (oldDn(31 downto 8) ## sccByte)
+    // DBcc: if cond FALSE -> Dn.W -= 1 (preserve Dn[31:16]); branch if decW != -1.
+    // If cond TRUE -> Dn unchanged, fall through. `taken` is the cond; DBcc decrements
+    // when !taken. The Dn write is ALWAYS performed (rename allocated a new pdst), with
+    // the value = unchanged Dn (cond true) or the 16-bit-decremented Dn (cond false).
+    val dbDecW    = (oldDn(15 downto 0).asUInt - 1).resize(16)
+    val dbDecFull = (oldDn(31 downto 16) ## dbDecW.asBits)
+    val dbExpired = dbDecW === U(0xFFFF, 16 bits)              // reached -1 -> fall through
+    val dbResult  = Mux(taken, oldDn, dbDecFull)              // cond true -> unchanged
+    val dbBranch  = u1.isDbcc && !taken && !dbExpired         // decrement non-expired -> branch
+
+    // An ibranch ALWAYS redirects (unconditional); a Bcc/BRA redirects iff `taken`;
+    // DBcc redirects iff dbBranch; Scc never redirects.
+    val redirect  = Mux(u1.isScc, False,
+                    Mux(u1.isDbcc, dbBranch,
+                    Mux(u1.ibranch, True, taken)))
+    // Fall-through PC = the instruction's POST-PC (pc + length). DBcc is a 2-word
+    // instruction (opword + disp16) so its not-taken/expiry PC is pc+4, NOT pc+2 —
+    // use the assembler-computed u1.nextPc (also correct for a not-taken Bcc.w).
+    val nextPc    = Mux(redirect, target, u1.nextPc)
 
     // ---- S1: completion (entry completes either way so it can retire) ----
     // TRAPV is decoded with cond=F (taken=False), so it naturally yields mispredict=
@@ -137,14 +161,19 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     completionPort.payload.mispredict := s1Valid && redirect  // TRAPV: redirect=False -> no redirect
     completionPort.payload.nextPc     := nextPc
 
-    // ---- S1: An POSTINCREMENT write (RTS/RTR fold A7 += anInc into the ibranch) ----
-    // The new A7 = pre-pop A7 (psrcB, s1AnBase) + anInc (4=RTS, 6=RTR). Written to the
-    // ibranch's renamed int dst (pdst). A plain Bcc/BRA/BSR/JMP/JSR has pdstValid=False
-    // (the JSR/JMP ibranch carries NO An write) so this never fires for them.
-    val anWrite = s1Valid && u1.ibranch && u1.pdstValid
-    val newAn   = (s1AnBase + u1.anInc).resize(32)
-    anW.valid     := anWrite;  anW.address := u1.pdst;  anW.data := newAn.asBits
-    anByp.valid   := anWrite;  anByp.address := u1.pdst; anByp.data := newAn.asBits
+    // ---- S1: branch-EU int write (RTS/RTR postinc A7, OR Scc/DBcc Dn write) ----
+    // Three mutually-exclusive int-write sources, all to the renamed pdst:
+    //  - RTS/RTR ibranch: A7 := pre-pop A7 (s1AnBase) + anInc (4=RTS, 6=RTR).
+    //  - Scc:  Dn := {Dn[31:8], cond?0xFF:0x00}.
+    //  - DBcc: Dn := cond ? Dn : {Dn[31:16], Dn.W-1}.
+    // A plain Bcc/BRA/BSR/JMP/JSR has pdstValid=False -> no int write.
+    val newAn      = (s1AnBase + u1.anInc).resize(32)
+    val condIntVal = Mux(u1.isScc, sccResult, dbResult)              // Scc vs DBcc
+    val condIntWr  = (u1.isScc || u1.isDbcc) && u1.pdstValid
+    val anWrite    = s1Valid && ((u1.ibranch && u1.pdstValid) || condIntWr)
+    val intData    = Mux(condIntWr, condIntVal, newAn.asBits)
+    anW.valid     := anWrite;  anW.address := u1.pdst;  anW.data := intData
+    anByp.valid   := anWrite;  anByp.address := u1.pdst; anByp.data := intData
 
     // ---- S1: TRAPV execute-time conditional fault (vector 7 if V=1) ----
     trapvFaultPort.valid          := s1Valid && u1.isTrapv && v
@@ -152,14 +181,15 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     trapvFaultPort.payload.vector := U(7, 8 bits)   // TRAPV -> vector 7
 
     // ---- S1: sim-only whitebox. A plain branch writes NO reg; an RTS/RTR ibranch
-    // writes A7 (the postincremented SP). Report that int write so the lock-step
-    // whitebox reconstructs the A7 update (dstArch = A7 = 15). ----
+    // writes A7 (the postincremented SP); Scc/DBcc write Dn. Report that int write +
+    // value (`intData`) so the lock-step whitebox reconstructs the register update
+    // (dstArch = A7 for ibranch, Dn for Scc/DBcc). ----
     val wbObs = BrWbObs()
     wbObs.valid   := RegNext(s1Valid) init False
     wbObs.robId   := RegNext(s1Ctx.robId)
     wbObs.nextPc  := RegNext(nextPc)
     wbObs.anWrite := RegNext(anWrite) init False
-    wbObs.anData  := RegNext(newAn.asBits)
+    wbObs.anData  := RegNext(intData)
     wbObs.anArch  := RegNext(u1.dstArch)
     wbObs.simPublic()
   }

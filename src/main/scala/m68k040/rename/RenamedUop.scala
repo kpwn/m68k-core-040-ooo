@@ -57,6 +57,11 @@ case class RenamedUop() extends Bundle {
   // MOVEA (MOVE with an ADDRESS-register dst): full-32 write, .W sign-extends the
   // source, no flags. The ALU EU keys off it to bypass the .B/.W partial merge.
   val isMovea      = Bool()
+  // Line-5 Scc / DBcc (branch-EU condition-path µops). Scc: Dn[7:0] := cond?0xFF:0x00
+  // (no branch, no flags). DBcc: conditional Dn.W decrement + PC-relative branch on
+  // `!cond && (decW != -1)`. Both read NZVC (cond) + Dn (psrcA) + write Dn (pdst).
+  val isScc        = Bool()
+  val isDbcc       = Bool()
   // Macro-instruction boundary marker (interrupts): True for the FIRST µop of an
   // instruction (the only multi-µop case is a memSimple-source crack [load, op]).
   val firstOfInstr = Bool()
