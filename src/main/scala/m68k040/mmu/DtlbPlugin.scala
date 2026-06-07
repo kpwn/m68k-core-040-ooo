@@ -146,12 +146,6 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val latchFault  = Reg(Bool())
 
     // ---- walker control ----
-    walker.io.req.vpn     := _req.vpn
-    walker.io.req.rootPtr := rootPtr
-    walker.io.req.isWrite := _req.write
-    walker.io.req.isSuper := _req.supervisor
-    walker.io.start := False
-
     // A walk is needed when enabled + a live demand + TLB miss + the latch doesn't
     // already hold this VPN's result + the walker is idle.
     val latchMatch = latchValid && (latchVpn === _req.vpn)
@@ -160,14 +154,59 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // restart the walker for the just-resolved VPN.
     val needWalk   = mmuEnable && _req.valid && !tlbHit && !latchMatch &&
                      !walker.io.busy && !walker.io.done
-    // VPN a walk is servicing: latched at walk-start so the fill/latch target the
-    // right VPN even if _req.vpn changes while walking.
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // FMax: REGISTER the miss→walker TRIGGER (sever the Dcache valids → walker cone).
+    //
+    // Driving `walker.io.req.vpn := _req.vpn` and `walker.io.start := needWalk`
+    // LIVE put the cross-module cone `Dcache valids → LsEu → _req.vpn → tlb hitVec
+    // → walker fsm CE` (WNS −1.206, the gate-failer) directly on the walker FSM's
+    // clock-enable. The walker has its OWN AXI port — there is NO data coupling,
+    // only this trigger chain. Capture the miss request {vpn,write,super,robId}
+    // into `missReqReg` flops on the cycle `needWalk` fires, then drive
+    // walker.io.req/.start from those FLOPS one cycle later. The deep hitVec/valids
+    // cone now ENDS at missReqReg; the walker is driven from registers.
+    //
+    // Single-outstanding: `missReqReg.valid` is a 1-cycle pulse. `needWalk` already
+    // gates on walker-idle (!busy) + the anti-respin (!done, !latchMatch), and we
+    // additionally suppress capture while a launch is already pending
+    // (`!missReqReg.valid`) so EXACTLY ONE start pulse is emitted per miss:
+    //   N   : needWalk -> missReqReg.valid<=1 (capture)         [walker idle]
+    //   N+1 : walker.io.start = missReqReg.valid = 1 (launch)   [walker still idle;
+    //         capture suppressed by !missReqReg.valid; walker latches reqReg]
+    //   N+2 : walker busy -> needWalk false (no re-launch); walk runs to fill/latch.
+    // The LS-EU holds the request valid + stalls (rsp.ready=False) until the walk
+    // fills the TLB; the +1 cycle to LAUNCH is latency-agnostic (lock-step is
+    // instruction-level). rootPtr is already an MmuControl flop -> driven live.
+    val missReqReg = new Area {
+      val valid = RegInit(False)
+      val vpn   = Reg(UInt(20 bits))
+      val write = Reg(Bool())
+      val sup   = Reg(Bool())
+      val robId = Reg(UInt(6 bits))
+    }
+    missReqReg.valid := False
+    when(needWalk && !missReqReg.valid) {
+      missReqReg.valid := True
+      missReqReg.vpn   := _req.vpn
+      missReqReg.write := _req.write
+      missReqReg.sup   := _req.supervisor
+      missReqReg.robId := umAccessRobId
+    }
+
+    walker.io.req.vpn     := missReqReg.vpn
+    walker.io.req.rootPtr := rootPtr
+    walker.io.req.isWrite := missReqReg.write
+    walker.io.req.isSuper := missReqReg.sup
+    walker.io.start       := missReqReg.valid
+
+    // VPN a walk is servicing: latched at walk-LAUNCH (the registered-trigger cycle)
+    // so the fill/latch target the right VPN even if _req.vpn changes while walking.
     val walkVpn = Reg(UInt(20 bits))
     val walkRobId = Reg(UInt(6 bits))   // robId of the access that triggered the walk
-    when(needWalk) {
-      walker.io.start := True
-      walkVpn   := _req.vpn
-      walkRobId := umAccessRobId
+    when(missReqReg.valid) {
+      walkVpn   := missReqReg.vpn
+      walkRobId := missReqReg.robId
     }
 
     // On walk completion: latch the result and (if no fault) fill the TLB.
