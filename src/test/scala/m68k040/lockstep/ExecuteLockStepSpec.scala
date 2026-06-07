@@ -852,6 +852,30 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  // ── Line-E register-form shifts/rotates (register count Dc mod 64) lock-step ─
+  // count = Dc & 0x3f. Exercise count 0 (flag specials), count >= size, mod-64
+  // wrap, and the generic case across the 8 ops + .B/.W/.L.
+  test("lock-step: AS/LS register count (count 0, >=size, mod-64)", VerilatorTest) {
+    runLockStep("shift-asls-reg", Seq(
+      "move.l #0xdeadbeef,%d0", "moveq #0,%d1", "asl.l %d1,%d0",   // count 0: C=0, X untouched, NZ of src
+      "move.l #0x00000001,%d2", "moveq #32,%d3", "asl.l %d3,%d2",  // count==size: result 0, C=X=src&1
+      "move.l #0x00008000,%d4", "moveq #40,%d5", "lsl.w %d5,%d4",  // .W count 40>16: result 0
+      "move.l #0xffffffff,%d6", "moveq #4,%d7", "asr.l %d7,%d6",   // .L generic arithmetic, C=1
+      "move.l #0x12345678,%d0", "move.l #64,%d1", "lsl.l %d1,%d0", // Dc=64 -> mod64=0 -> count 0
+      "move.l #0x80000000,%d2", "moveq #1,%d3", "lsr.l %d3,%d2"    // .L LSR generic
+    ).mkString(" ; "))
+  }
+  test("lock-step: ROX/RO register count (count 0=ROX-C-from-X, mod-64)", VerilatorTest) {
+    runLockStep("shift-roxro-reg", Seq(
+      "ori #0x10,%ccr",                                            // X=1
+      "move.l #0x00000000,%d0", "moveq #0,%d1", "roxl.l %d1,%d0",  // ROX count0: C=X (1), result=src
+      "move.l #0x00000001,%d2", "moveq #1,%d3", "roxr.l %d3,%d2",  // ROXR bit0 -> X/C
+      "move.l #0x80000001,%d4", "moveq #0,%d5", "rol.l %d5,%d4",   // ROL count0: C=0, X untouched, NZ src
+      "move.l #0x00000001,%d6", "moveq #36,%d7", "ror.l %d7,%d6",  // ROR Dc=36 mod32=4
+      "move.l #0x00000003,%d0", "move.l #33,%d1", "roxl.l %d1,%d0" // ROXL Dc=33 mod33=0 -> count0 path
+    ).mkString(" ; "))
+  }
+
   // ── ANDI/ORI/EORI #imm,CCR (NOT privileged — CCR only) lock-step ────────────
   // Set up the CCR via an arithmetic op (subi -> known NZVCX), then AND/OR/EOR the
   // immediate byte into the CCR (X=4,N=3,Z=2,V=1,C=0), verified step-for-step incl X.
