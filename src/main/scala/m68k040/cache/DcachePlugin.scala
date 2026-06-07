@@ -150,7 +150,13 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val ldS1Hit     = ldS1HitVec.orR
     val ldS1HitWay  = OHToUInt(ldS1HitVec)
     val ldS1Line    = rdData(ldS1HitWay)
-    val ldS1Resp    = ldS1Valid && (ldS1Hit || ldS1Fault)
+    // Respond ONLY on a HIT (the fault flag rides along with the hit response,
+    // matching baseline: `s1Fault := xlate.rsp.fault` was set ONLY in the hit branch).
+    // A MISS — fault or not — falls through to REFILL below, exactly as baseline
+    // (baseline's miss branch goes to REFILL regardless of xlate.rsp.fault; the
+    // genuine non-resident-page fault is handled by the LS EU's own fault path, not
+    // by short-circuiting a garbage cache response here).
+    val ldS1Resp    = ldS1Valid && ldS1Hit
 
     loadRspPort.valid         := ldS1Resp
     loadRspPort.payload.data  := DcacheByteLane.extract(ldS1Line, ldS1Off, ldS1Size)
@@ -248,9 +254,11 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           ldS1Fault    := xlate.rsp.fault
           ldS1Paddr    := cmdPaddr
         }
-        // S1 resolution of a launched load read. A hit/fault drives the response
-        // combinationally (ldS1Resp above). A miss starts the refill.
-        when(ldS1Valid && !ldS1Hit && !ldS1Fault) {
+        // S1 resolution of a launched load read. A HIT drives the response
+        // combinationally (ldS1Resp above, fault riding along). A MISS — fault or
+        // not — starts the refill, EXACTLY as baseline (whose miss branch went to
+        // REFILL unconditionally; only the hit branch carried xlate.rsp.fault).
+        when(ldS1Valid && !ldS1Hit) {
           // Miss: latch miss-state and start the refill (the +1-cycle deferral
           // relative to the old async hit-detect is latency-agnostic).
           missPaddr := ldS1Paddr
