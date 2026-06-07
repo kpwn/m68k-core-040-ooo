@@ -1,0 +1,3 @@
+# Register the ITLB-miss->walker trigger (xmodule cone fast-follow)
+
+Mirror of the merged DTLB fix (commit 10ce410, `feat/dtlb-walker-trigger-reg`): ItlbPlugin has the IDENTICAL live-combinational walk trigger (`walker.io.req.vpn := _req.vpn; walker.io.start := needWalk` off live `tlbHit`/`_req`), forming a cross-module cone into the ITLB walker FSM. Register it the same way: `missReqReg` flops capture the miss, drive `walker.io.req/.start` from the flops. Single-outstanding preserved (1-cycle pulse, gated walker-idle+anti-respin). +1 walk-launch cycle latency-agnostic (I-fetch stalls on the ITLB miss). Gate: lock-step ITLB/I-fetch UNCHANGED x2 + the I-side walker cone gone from the worst-path list. Reference the DTLB DtlbPlugin.scala change as the template.
