@@ -58,6 +58,20 @@ class DcacheSpec extends AnyFunSuite {
     cd.waitSampling(12)
   }
 
+  /** Mimic the exception-FSM frame push: pulse one WORD store, then wait for the
+    * write-through ACK (AXI B) before the next — single-outstanding, ack-gated. */
+  def doStoreAckGated(dut: Dut, cd: ClockDomain, paddr: Long, data: BigInt): Unit = {
+    dut.probe.logic.storeIn.valid #= true
+    dut.probe.logic.storeIn.payload.paddr #= paddr
+    dut.probe.logic.storeIn.payload.data #= data
+    dut.probe.logic.storeIn.payload.size #= Size.WORD
+    dut.probe.logic.storeIn.payload.useStrb #= false
+    cd.waitSampling()
+    dut.probe.logic.storeIn.valid #= false
+    // storeAck == AXI B handshake (b.ready is held True by the cache).
+    cd.waitSamplingWhere(dut.dcache.logic.axi.b.valid.toBoolean && dut.dcache.logic.axi.b.ready.toBoolean)
+  }
+
   def initDut(dut: Dut): (ClockDomain, BehavioralMemAgent) = {
     val cd = dut.clockDomain
     cd.forkStimulus(period = 10)
@@ -191,6 +205,25 @@ class DcacheSpec extends AnyFunSuite {
       assert(arCount == 1, s"missing-line store must not allocate: refill count $arCount")
       assert(got == BigInt("11223344", 16), s"refill sees stored value: ${got.toString(16)}")
       cd.waitSampling(4)
+    }
+  }
+
+  // (f) ack-gated back-to-back WORD stores to an UNCACHED line each land in memory.
+  // Reproduces the exception-FSM frame push (issue store -> wait storeAck -> next):
+  // every write-through beat must reach memory; none may be dropped by the pipeline.
+  test("ack-gated back-to-back word stores to a missing line all land", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x7f00L                  // uncached line (no prior load)
+      // Eight ascending WORD stores within one 16-byte line, ack-gated each.
+      val words = Seq(0x1111, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666, 0x7777, 0x8888)
+      for ((w, i) <- words.zipWithIndex) doStoreAckGated(dut, cd, base + i * 2, BigInt(w))
+      cd.waitSampling(8)
+      for ((w, i) <- words.zipWithIndex) {
+        val hi = (w >> 8) & 0xff; val lo = w & 0xff
+        assert(mem.peekByte(base + i * 2)     == hi, f"word $i%d hi byte @+${i*2}%x")
+        assert(mem.peekByte(base + i * 2 + 1) == lo, f"word $i%d lo byte @+${i*2+1}%x")
+      }
     }
   }
 }
