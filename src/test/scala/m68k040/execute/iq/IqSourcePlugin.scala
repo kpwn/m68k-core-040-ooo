@@ -29,6 +29,8 @@ class IqSourcePlugin extends FiberPlugin {
       val pNzvcSrc   = in UInt (4 bits); val pNzvcDst = in UInt (4 bits)
       val readsX     = in Bool (); val writesX = in Bool ()
       val pXSrc      = in UInt (4 bits); val pXDst = in UInt (4 bits)
+      // True => this uop is a line-E SHIFT (the slow-ALU latency-2 producer); else MOVE.
+      val isShift    = in Bool ()
     }
     val s0 = SlotIo()
     val s1 = SlotIo()
@@ -40,7 +42,7 @@ class IqSourcePlugin extends FiberPlugin {
       // Safe defaults for unused fields so the bundle is fully driven.
       u.valid        := True
       u.pc           := 0
-      u.op      := m68k040.decode.DecOp.MOVE
+      u.op      := Mux(io.isShift, m68k040.decode.DecOp.SHIFT, m68k040.decode.DecOp.MOVE)
       u.cluster := io.cluster
       u.memOp   := io.memOp
       u.size    := m68k040.isa.Size.LONG
@@ -86,5 +88,19 @@ class IqSourcePlugin extends FiberPlugin {
     val lsWakeupValid = in Bool (); val lsWakeupPdst = in UInt (6 bits)
     iq.lsWakeup.valid   := lsWakeupValid
     iq.lsWakeup.payload := lsWakeupPdst
+
+    // Dynamic SLOW-ALU (shift) wakeup (sim-driven; emulates the ALU EU's S2 broadcast).
+    val aluSlowWakeupValid = in Bool ()
+    val aluSlowWakeupPdst  = in UInt (6 bits); val aluSlowWakeupPdstV = in Bool ()
+    val aluSlowWakeupNzvc  = in UInt (4 bits); val aluSlowWakeupNzvcV = in Bool ()
+    val aluSlowWakeupX     = in UInt (4 bits); val aluSlowWakeupXV    = in Bool ()
+    // Drive port 0 (emulating eu0); port 1 keeps the IQ idle default (False).
+    iq.aluSlowWakeup(0).valid            := aluSlowWakeupValid
+    iq.aluSlowWakeup(0).payload.pdst     := aluSlowWakeupPdst
+    iq.aluSlowWakeup(0).payload.pdstValid:= aluSlowWakeupPdstV
+    iq.aluSlowWakeup(0).payload.pNzvcDst := aluSlowWakeupNzvc
+    iq.aluSlowWakeup(0).payload.nzvcValid:= aluSlowWakeupNzvcV
+    iq.aluSlowWakeup(0).payload.pXDst    := aluSlowWakeupX
+    iq.aluSlowWakeup(0).payload.xValid   := aluSlowWakeupXV
   }
 }

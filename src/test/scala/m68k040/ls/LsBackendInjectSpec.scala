@@ -34,7 +34,19 @@ class LsBackendInjectSpec extends AnyFunSuite {
       val rob = host[RobPlugin]
       eu0.issue << iq.issue(0)
       eu1.issue << iq.issue(1)
+      // SLOW-ALU (shift, lat2) dynamic wakeup (mirrors top/FullCoreSynth). No shifts in
+      // this LS-injection corpus, so inert, but wired for consistency/latent-deadlock safety.
+      iq.aluSlowWakeup(0).valid   := eu0.slowWakeup.valid
+      iq.aluSlowWakeup(0).payload := eu0.slowWakeup.payload
+      iq.aluSlowWakeup(1).valid   := eu1.slowWakeup.valid
+      iq.aluSlowWakeup(1).payload := eu1.slowWakeup.payload
       iq.issue(2).ready := False           // no branch uops injected here
+      // branchEu is instantiated but no branch uops are injected; drive its issue input
+      // INERT so it elaborates (an undriven Stream[RenamedUop] payload = NO DRIVER). This
+      // was a latent gap: the branch-EU slice added branchEu to the DUT but only tied the
+      // IQ port (issue(2).ready), leaving branchEu's OWN issue.payload undriven.
+      branchEu.issue.valid := False
+      branchEu.issue.payload.assignDontCare()
       lsEu.issue << iq.issue(3)
       iq.issue(4).ready := False           // no CHK/DIV uops injected here
       rob.logic.completion(0).valid   := eu0.completion.valid
@@ -98,6 +110,19 @@ class LsBackendInjectSpec extends AnyFunSuite {
     u.pNzvcSrc #= 0; u.readsNzvc #= false
     u.pNzvcDst #= pNzvcDst; u.writesNzvc #= writesNzvc; u.pNzvcOld #= 0
     u.pXSrc #= 0; u.readsX #= false; u.pXDst #= 0; u.writesX #= false; u.pXOld #= 0
+    // Drive EVERY remaining RenamedUop field — the EU/IQ read several (isMovea muxes the
+    // writeback to src2; toCcr muxes flags; isShift routes the slow path), so leaving any
+    // undriven gives a nondeterministic per-netlist value and a flaky sim. This corpus is
+    // store/load/ALU only: all the op-flavour flags are false. Fields added by later ISA
+    // slices (MOVEA, toCcr, shifts, line-4/5) must default here.
+    u.psrcC #= 0; u.psrcCValid #= false
+    u.ibranch #= false; u.anInc #= 0; u.stkPush #= false; u.ccrRestore #= false
+    u.toCcr #= false; u.isTrapv #= false
+    u.faultAddr #= 0; u.sswInstr #= false
+    u.divSigned #= false; u.divIsRem #= false
+    u.shiftOp #= 0; u.shiftDir #= false; u.extByte #= false
+    u.isMovea #= false; u.isScc #= false; u.isDbcc #= false
+    u.firstOfInstr #= true
   }
 
   def memByte(addr: Long): Int = ((addr * 5 + 0x23) & 0xff).toInt

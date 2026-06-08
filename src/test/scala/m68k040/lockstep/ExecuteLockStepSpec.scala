@@ -62,6 +62,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val rob = host[RobPlugin]
       eu0.issue << iq.issue(0)
       eu1.issue << iq.issue(1)
+      // SLOW-ALU (shift, latency-2) dynamic wakeup: ONE IQ port per ALU EU (mirrors
+      // top/FullCoreSynth.BackendWiringPlugin). Without this the IQ's aluSlowWakeup
+      // ports keep their setup default (valid:=False), so a shift's dependents (and
+      // its own aluSlow* busy bitmaps) never wake -> deadlock.
+      iq.aluSlowWakeup(0).valid   := eu0.slowWakeup.valid
+      iq.aluSlowWakeup(0).payload := eu0.slowWakeup.payload
+      iq.aluSlowWakeup(1).valid   := eu1.slowWakeup.valid
+      iq.aluSlowWakeup(1).payload := eu1.slowWakeup.payload
       // Branch EU: issue port 2 (branch-class) -> branch EU; completion -> ROB
       // branchCompletion (records {mispredict, nextPc} for commit-time recovery).
       branchEu.issue << iq.issue(2)
@@ -1006,6 +1014,39 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #0,%d0", "subi.b #1,%d0",        // N=1,C=1,X=1 (0xff), Z=0,V=0
       "eori #0x1f,%ccr",                      // toggle all 5 -> N=0,C=0,X=0,Z=1,V=1
       "moveq #3,%d1"
+    ).mkString(" ; "))
+  }
+
+  // ── Slow-ALU (shift, latency-2) DEPENDENT CHAINS ────────────────────────────
+  // Exercises the IQ aluSlow dynamic-wakeup (lat2): an op that consumes a SHIFT's
+  // INT result, NZVC result, and X result must wait one extra cycle and then read
+  // the correct value. Pre-fix (the aluSlowWakeup port was unwired in the test
+  // BackendWiringPlugin) these DEADLOCKED — the consumer's aluSlowWait never cleared.
+  test("lock-step: dependent chain through a SHIFT int result (lat2 wakeup)", VerilatorTest) {
+    runLockStep("shift-dep-int", Seq(
+      "move.l #0x00000003,%d0", "lsl.l #4,%d0",    // d0 = 0x30 (slow producer)
+      "add.l %d0,%d1",                              // CONSUMES d0 (shift int result) -> waits lat2
+      "move.l #0x0000000f,%d2", "lsl.l #2,%d2",    // d2 = 0x3c (slow)
+      "move.l %d2,%d3",                             // CONSUMES d2 (shift result)
+      "sub.l %d0,%d2"                               // CONSUMES d0 AND d2 (two shift results)
+    ).mkString(" ; "))
+  }
+  test("lock-step: dependent chain through a SHIFT NZVC result (lat2 wakeup)", VerilatorTest) {
+    runLockStep("shift-dep-nzvc", Seq(
+      "move.l #0x80000000,%d0", "asl.l #1,%d0",     // shift sets N/Z/V/C (slow producer)
+      "bne .skip",                                  // CONSUMES the shift's NZVC (cc read) -> lat2
+      "moveq #1,%d1",
+      ".skip: moveq #2,%d2"
+    ).mkString(" ; "), nInstr = 4)
+  }
+  test("lock-step: back-to-back SHIFT chain (X + int + NZVC all lat2)", VerilatorTest) {
+    runLockStep("shift-chain-bb", Seq(
+      "ori #0x10,%ccr",                             // X=1
+      "move.l #0x00000001,%d0",
+      "roxl.l #1,%d0",                              // ROX reads X, writes X (slow)
+      "roxl.l #1,%d0",                              // reads PRIOR shift's X + int result (slow->slow lat2)
+      "roxl.l #1,%d0",                              // chained again
+      "add.l %d0,%d1"                               // consumes the final shift int result
     ).mkString(" ; "))
   }
 

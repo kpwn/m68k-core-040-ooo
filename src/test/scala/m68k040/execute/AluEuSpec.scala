@@ -22,6 +22,12 @@ class AluEuSpec extends AnyFunSuite {
     db.on { host.asHostOf(Seq[FiberPlugin](rfInt, rfNzvc, rfX, eu, src)) }
   }
 
+  // helper: safe defaults for the slow-path/flag-source ports (call once after stimulus)
+  def initPorts(d: Dut): Unit = {
+    val s = d.src.logic
+    s.iShiftOp #= 0; s.iShiftDir #= false; s.iToCcr #= false
+    s.iReadsNz #= false; s.iPNzvcSrc #= 0; s.iReadsX #= false; s.iPXSrc #= 0
+  }
   // helper: drive one issue for a cycle (call inside doSim)
   def idle(d: Dut): Unit = { d.src.logic.iValid #= false }
   def issueMoveq(d: Dut, imm: Long, pdst: Int, robId: Int): Unit = {
@@ -47,6 +53,7 @@ class AluEuSpec extends AnyFunSuite {
   test("single immediate op writes int PRF + fires completion", VerilatorTest) {
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
+      initPorts(dut)
       idle(dut); dut.src.logic.obsIntAddr #= 0; dut.src.logic.obsNzvcAddr #= 0
       cd.waitSampling(80) // PRF init sweep
       issueMoveq(dut, 0x12345678L, pdst = 7, robId = 3)
@@ -68,6 +75,7 @@ class AluEuSpec extends AnyFunSuite {
   test("reg-reg ADD reads operands from PRF", VerilatorTest) {
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
+      initPorts(dut)
       idle(dut); dut.src.logic.obsIntAddr #= 0; dut.src.logic.obsNzvcAddr #= 0
       cd.waitSampling(80)
       // preload R0=100, R1=23 via two MOVEQ
@@ -85,6 +93,7 @@ class AluEuSpec extends AnyFunSuite {
   test("back-to-back: dependent reads producer result via bypass", VerilatorTest) {
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
+      initPorts(dut)
       idle(dut); dut.src.logic.obsIntAddr #= 0; dut.src.logic.obsNzvcAddr #= 0
       cd.waitSampling(80)
       // preload R0=10, R1=5
@@ -107,6 +116,7 @@ class AluEuSpec extends AnyFunSuite {
   test("CMP writes flags but not the int dst", VerilatorTest) {
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
+      initPorts(dut)
       idle(dut); dut.src.logic.obsIntAddr #= 0; dut.src.logic.obsNzvcAddr #= 0
       cd.waitSampling(80)
       // preload R5 = 0xAA so we can see it is NOT overwritten
