@@ -56,7 +56,6 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     spinal.core.sim.SimPublic(decodePc, fetchPc)
     val stalled       = Reg(Bool()) init False       // complex-instruction stall
     val started       = Reg(Bool()) init False       // don't fetch until first redirect
-    val fetchInFlight = Reg(Bool()) init False       // single-outstanding guard
     // I-fetch fault hold: a translation fault (ITLB non-resident / protect) on a
     // fetch response. We emit ONE faulted DecodePacket (slot0.fault, pc = the faulting
     // fetch PC) and STOP fetching until a redirect (the exception delivers + vectors).
@@ -70,14 +69,18 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // a complex packet has shiftWords=0, so on its fire only `stalled` advances,
     // gating feed.valid until `resume` clears it.
 
-    // Track whether the next rsp should drop leading words (set on redirect/resume)
-    val dropPending = Reg(Bool()) init False
-    val dropCount   = Reg(UInt(2 bits)) init 0      // words to drop (0..3)
-    spinal.core.sim.SimPublic(dropCount, dropPending)
-
-    // Track whether the in-flight fetch is stale (redirect/resume happened after cmd fired)
-    val rspStale = Reg(Bool()) init False
-    spinal.core.sim.SimPublic(rspStale, fetchInFlight)
+    // Per-fetch outstanding-record tracking (Slice 1: ONE record = single-outstanding;
+    // Slice 2 generalizes {recValid,recStale,recDrop} to a depth-N ring once the I-cache
+    // is pipelined). The in-flight fetch carries its OWN stale + leading-drop, captured at
+    // ISSUE — immune to later redirects overwriting global state (the bug that wedged
+    // nested-bsr-during-miss: a stale window mis-attributed to a redirect target).
+    val recValid = Reg(Bool()) init False   // a fetch is outstanding (replaces fetchInFlight)
+    val recStale = Reg(Bool()) init False   // a redirect happened after it issued -> discard its rsp
+    val recDrop  = Reg(UInt(2 bits)) init 0 // leading words to drop on its rsp (target[2:1])
+    // Leading-word drop intent for the NEXT fetch to issue (set by a redirect to
+    // target[2:1]; latched into recDrop at issue, then cleared).
+    val pendingDrop = Reg(UInt(2 bits)) init 0
+    spinal.core.sim.SimPublic(recValid, recStale, recDrop, pendingDrop)
 
     // ---- Default-drive IBuf inputs ----
     ibuf.io.push.valid   := False
@@ -87,13 +90,23 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     ibuf.io.shift        := 0
     ibuf.io.flush        := False
 
+    // Any fetch-redirect this cycle (external redirect, complex-resume, or commit
+    // mispredict). A fetch issued THIS cycle used the pre-redirect fetchPc -> born stale.
+    // (mispredictRedirect/redirect/resume are all declared above; resume only when stalled.)
+    val redirectThisCycle = redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid
+
     // ---- FetchControl: issue fetches (single-outstanding) ----
     // Suppress fetching while holding an I-fetch fault (wait for the redirect).
-    ic.cmd.valid      := started && !fetchInFlight && ibuf.io.push.ready && !stalled && !faultHold
+    ic.cmd.valid      := started && !recValid && ibuf.io.push.ready && !stalled && !faultHold
     ic.cmd.payload.pc := fetchPc
 
     when(ic.cmd.fire) {
-      fetchInFlight := True
+      // Capture this fetch's record. Born stale iff a redirect fires THIS cycle (this
+      // fetch used the old, now-wrong fetchPc). Latch the drop intent; consume it.
+      recValid := True
+      recStale := redirectThisCycle
+      recDrop  := pendingDrop
+      pendingDrop := 0
     }
 
     // ---- Enqueue: handle I-cache responses ----
@@ -106,46 +119,41 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // Capture the FIRST fault only (gate on !faultHold): a fault response one cycle
     // before the hold engages can be followed by a second in-flight fault response for
     // the next window; the EA must be the FIRST faulting address, not the later one.
-    val rspFault = ic.rsp.valid && ic.rsp.payload.fault && !rspStale && !faultHold
+    val rspFault = ic.rsp.valid && ic.rsp.payload.fault && !recStale && !faultHold
     when(rspFault) {
       faultHold := True
       faultPc   := ic.rsp.payload.pc
     }
 
     when(ic.rsp.valid) {
-      fetchInFlight := False
-      fetchPc       := fetchPc + 8
+      recValid := False          // the outstanding fetch's response arrived (record consumed)
+      // Advance the sequential fetch pointer ONLY for a live (non-stale) response. A
+      // STALE response belongs to a fetch issued before a redirect; the redirect already
+      // reset fetchPc to the new target window, so the next fetch must use THAT target —
+      // advancing here would walk fetchPc off the target (B+8 instead of B), enqueuing a
+      // window that the aligner cannot match against decodePc (lenWords=0 self-redirect).
+      // (Old global tracking advanced unconditionally; it relied on the redirect-cycle
+      // override and broke once the stale rsp arrived a cycle after the redirect.)
+      when(!recStale) {
+        fetchPc := fetchPc + 8
+      }
 
-      when(!rspStale && !ic.rsp.payload.fault) {
-        // Determine starting word index within this window
-        val startWord = UInt(2 bits)
-        when(dropPending) {
-          startWord   := dropCount
-          dropPending := False
-        } otherwise {
-          startWord := U(0, 2 bits)
-        }
-
-        // n = 4 - startWord words to enqueue
-        val nWords = U(4, 3 bits) - startWord.resize(3)
-
-        // Build push payload: map incoming window[startWord..3] -> push[0..n-1]
+      when(!recStale && !ic.rsp.payload.fault) {
+        // Leading-word drop carried by THIS fetch's record.
+        val startWord = recDrop
+        val nWords    = U(4, 3 bits) - startWord.resize(3)
         for (j <- 0 until 4) {
           when(U(j) < nWords) {
-            // srcIdx = startWord + j, always in 0..3; resize(2) is safe since guard ensures range
             val srcIdx = (startWord + U(j, 2 bits)).resize(2)
-            ibuf.io.push.payload.words(j) := rspWords(srcIdx)
+            ibuf.io.push.payload.words(j)          := rspWords(srcIdx)
             ibuf.io.push.payload.preds(j).simple   := rspPreds(srcIdx).simple
             ibuf.io.push.payload.preds(j).lenWords := rspPreds(srcIdx).lenWords
           }
         }
         ibuf.io.push.payload.n := nWords
         ibuf.io.push.valid     := True
-      } elsewhen(rspStale) {
-        // Stale: discard response, clear stale flag (a fault response is handled
-        // above via faultHold; it pushes nothing either).
-        rspStale := False
       }
+      // stale OR fault: enqueue nothing (discard), as before.
     }
 
     // ---- Aligner: combinational decode of buffer head ----
@@ -206,27 +214,14 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       faultHold      := False
       faultEmitted   := False
       started        := True
-      // Drop leading words on the next rsp: startWord = newPc[2:1] (word index within 8-byte window)
-      dropPending    := True
-      dropCount      := newPc(2 downto 1)
-      // Mark any in-flight rsp as stale. CRITICAL: do NOT clear fetchInFlight here —
-      // the stale fetch is still PHYSICALLY in flight (its response is coming). Clearing
-      // it would let a NEW fetch issue immediately, creating TWO outstanding fetches
-      // that the single fetchInFlight/rspStale/dropPending bits cannot track — the
-      // dropCount then leaks onto the WRONG window (a misaligned head on a redirect to
-      // a mid-window address, e.g. a subroutine entry right after a .w branch's disp
-      // word). Keep fetchInFlight=True; the stale response (handled below) clears it,
-      // and only THEN does the post-redirect fetch issue + consume dropPending.
-      //
-      // CRITICAL guard `!ic.rsp.valid`: if the in-flight fetch's response ARRIVES THIS
-      // cycle (fif transitions true->false at line 113, and ibuf.flush discards its
-      // enqueue), there is no longer a stale fetch to track — setting rspStale here
-      // would WRONGLY mark the NEXT (post-redirect) fetch stale, discarding it and
-      // leaking dropPending onto the fetch AFTER that (the misaligned-head bug). Only
-      // mark stale a fetch whose response has NOT yet arrived.
-      when(fetchInFlight && !ic.rsp.valid) {
-        rspStale      := True
-      }
+      pendingDrop    := newPc(2 downto 1)
+      // Per-fetch stale tracking (recValid/recStale/recDrop) replaces the single-bit rspStale/dropPending.
+      // Mark the in-flight fetch (if any) stale: a redirect invalidates it.
+      // (No !ic.rsp.valid guard — the per-fetch recStale bit is robust; a stale rsp is
+      // consumed + discarded in the rsp block. recValid is NOT cleared: the fetch is still
+      // physically coming; its stale response clears recValid normally, preserving the
+      // single-outstanding invariant — a new fetch issues only after that frees occupancy.)
+      when(recValid) { recStale := True }
     }
 
     // ---- resume (lower priority than redirect, active when stalled) ----
@@ -236,11 +231,9 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       fetchPc     := newPc(31 downto 3) @@ U(0, 3 bits)
       ibuf.io.flush  := True
       stalled        := False
-      dropPending    := True
-      dropCount      := newPc(2 downto 1)
-      when(fetchInFlight && !ic.rsp.valid) {
-        rspStale      := True   // keep fetchInFlight (see redirect block) — single-outstanding
-      }
+      pendingDrop    := newPc(2 downto 1)
+      // Per-fetch stale tracking (recValid/recStale/recDrop) replaces the single-bit rspStale/dropPending.
+      when(recValid) { recStale := True }
     }
 
     // ---- commit-time mispredict redirect (HIGHEST priority) ----
@@ -263,11 +256,9 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       // and vectored here -> resume fetching at the redirected (handler) PC.
       faultHold      := False
       faultEmitted   := False
-      dropPending    := True
-      dropCount      := newPc(2 downto 1)
-      when(fetchInFlight && !ic.rsp.valid) {
-        rspStale      := True   // keep fetchInFlight (see redirect block) — single-outstanding
-      }
+      pendingDrop    := newPc(2 downto 1)
+      // Per-fetch stale tracking (recValid/recStale/recDrop) replaces the single-bit rspStale/dropPending.
+      when(recValid) { recStale := True }
     }
   }
 

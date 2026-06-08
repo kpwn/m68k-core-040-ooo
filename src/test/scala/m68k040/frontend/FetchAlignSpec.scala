@@ -68,4 +68,30 @@ class FetchAlignSpec extends AnyFunSuite {
       assert(dut.probe.logic.feedOut.payload(0).pc.toLong == base + 4, s"after resume pc=${dut.probe.logic.feedOut.payload(0).pc.toLong.toHexString}")
     }
   }
+
+  test("redirect during an in-flight fetch discards the stale window, fetches the new target", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      // Two distinct windows in ONE memory image (a single AXI slave agent; two agents
+      // on the same bus would both respond and wedge the handshake). A = MOVEQ #1 x8,
+      // B = MOVEQ #2 x8, B placed in the SAME image right after A (different 8-byte windows).
+      val a = 0x8000L; val b = 0x8010L
+      IcacheSim.attachMemoryWithWords(dut.ic.logic.axi, cd, a,
+        Seq.fill(8)(0x7201) ++ Seq.fill(8)(0x7402)) // A: MOVEQ #1,%d1 ; B: MOVEQ #2,%d2
+      dut.probe.logic.feedOut.ready #= false
+      dut.fa.logic.resume.valid #= false; dut.fa.logic.redirect.valid #= false
+      cd.waitSampling(2)
+      // Redirect to A (cold -> miss/refill in flight), then quickly redirect to B before
+      // A's window can be consumed — B must win, with a correct (lenWords>0) packet at B.
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= a
+      cd.waitSampling(); dut.fa.logic.redirect.payload #= b
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      dut.probe.logic.feedOut.ready #= true
+      cd.waitSamplingWhere(dut.probe.logic.feedOut.valid.toBoolean)
+      assert(dut.probe.logic.feedOut.payload(0).pc.toLong == b,
+        s"expected target B=0x${b.toHexString}, got 0x${dut.probe.logic.feedOut.payload(0).pc.toLong.toHexString}")
+      assert(dut.probe.logic.feedOut.payload(0).lenWords.toInt > 0,
+        s"stale-window leak: lenWords=${dut.probe.logic.feedOut.payload(0).lenWords.toInt} (would self-redirect)")
+    }
+  }
 }
