@@ -106,6 +106,15 @@ class ShifterSpec extends AnyFunSuite {
     io.rsp := Shifter(io.cmd)
   }
 
+  // ── Layer 2b: STAGED RTL Shifter (stage2 ∘ stage1) vs ShiftRef ───────────────
+  class ShifterStagedDut extends Component {
+    val io = new Bundle {
+      val cmd = in(ShiftCmd())
+      val rsp = out(ShiftRsp())
+    }
+    io.rsp := Shifter.stage2(Shifter.stage1(io.cmd))
+  }
+
   private def szEnum(size: Int): SpinalEnumElement[Size.type] =
     size match { case 8 => Size.BYTE; case 16 => Size.WORD; case 32 => Size.LONG }
 
@@ -116,6 +125,43 @@ class ShifterSpec extends AnyFunSuite {
                      0x12345678L, 0xdeadbeefL, 0xcafebabeL)
       for ((tt, _, _) <- OPS; (size, _) <- SIZES; dir <- Seq(false, true)) {
         // imm counts 1..8; reg counts 0..63 (full sweep — cheap in RTL).
+        val cases =
+          (1 to 8).map(c => (c, true)) ++ (0 to 63).map(c => (c, false))
+        for (src <- srcs; xIn <- Seq(0, 1); (count, isImm) <- cases) {
+          dut.io.cmd.shiftOp #= tt
+          dut.io.cmd.dirLeft #= dir
+          dut.io.cmd.size    #= szEnum(size)
+          dut.io.cmd.data    #= BigInt(src & 0xffffffffL)
+          dut.io.cmd.count   #= count
+          dut.io.cmd.isImm   #= isImm
+          dut.io.cmd.xIn     #= (xIn != 0)
+          sleep(1)
+          val effCount = if (isImm) count else (count & 0x3f)
+          val r = ShiftRef.eval(tt, dir, size, src, effCount, isImm, xIn)
+          val gRes = dut.io.rsp.result.toLong & sizeMask(size)
+          val gN = if (dut.io.rsp.n.toBoolean) 1 else 0
+          val gZ = if (dut.io.rsp.z.toBoolean) 1 else 0
+          val gV = if (dut.io.rsp.v.toBoolean) 1 else 0
+          val gC = if (dut.io.rsp.c.toBoolean) 1 else 0
+          val gX = if (dut.io.rsp.xOut.toBoolean) 1 else 0
+          val ctx = f"tt=$tt dir=$dir size=$size src=0x$src%08x xIn=$xIn count=$count imm=$isImm: ref res=0x${r.res}%x N=${r.n}Z=${r.z}V=${r.v}C=${r.c}X=${r.x} got res=0x$gRes%x N=${gN}Z=${gZ}V=${gV}C=${gC}X=${gX}"
+          assert(gRes == (r.res & sizeMask(size)), s"result — $ctx")
+          assert(gN == r.n, s"N — $ctx")
+          assert(gZ == r.z, s"Z — $ctx")
+          assert(gV == r.v, s"V — $ctx")
+          assert(gC == r.c, s"C — $ctx")
+          assert(gX == r.x, s"X — $ctx")
+        }
+      }
+    }
+  }
+
+  test("RTL Shifter STAGED (stage2∘stage1) matches ShiftRef (all op x dir x size, imm + reg count, X-in)", VerilatorTest) {
+    SimConfig.withVerilator.compile(new ShifterStagedDut).doSim { dut =>
+      val srcs = Seq(0x00000000L, 0x00000001L, 0x7fffffffL, 0x80000000L, 0xffffffffL,
+                     0xa5a5a5a5L, 0x5a5a5a5aL, 0x80000001L, 0x0000ff00L, 0x00008001L,
+                     0x12345678L, 0xdeadbeefL, 0xcafebabeL)
+      for ((tt, _, _) <- OPS; (size, _) <- SIZES; dir <- Seq(false, true)) {
         val cases =
           (1 to 8).map(c => (c, true)) ++ (0 to 63).map(c => (c, false))
         for (src <- srcs; xIn <- Seq(0, 1); (count, isImm) <- cases) {

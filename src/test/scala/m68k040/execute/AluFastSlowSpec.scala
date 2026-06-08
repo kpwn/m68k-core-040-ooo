@@ -11,8 +11,9 @@ import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
 
 /** Fast/slow ALU split: fast ops (ADD) complete at latency-1 (S1) with bypass;
-  * slow ops (SHIFT, ANDI-to-CCR) complete at latency-2 (S2). Latency-agnostic
-  * correctness: the slow result is correct, just one cycle later. */
+  * the SHIFT slow op completes at latency-3 (S3) after the deep-pipeline split
+  * (stage1@S1, stage2@S2, writeback@S3). Latency-agnostic correctness: the slow
+  * result is correct, just two cycles later than a fast op. */
 class AluFastSlowSpec extends AnyFunSuite {
   class Dut extends Component {
     val db   = new Database
@@ -109,7 +110,7 @@ class AluFastSlowSpec extends AnyFunSuite {
     }
   }
 
-  test("slow SHIFT (LSL #1) result correct, completes at latency-2 (S2)", VerilatorTest) {
+  test("slow SHIFT (LSL #1) result correct, completes at latency-3 (S3)", VerilatorTest) {
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       initPorts(dut); idle(dut)
@@ -118,7 +119,7 @@ class AluFastSlowSpec extends AnyFunSuite {
       issueMoveq(dut, 0x21, pdst = 3, robId = 0); cd.waitSampling()  // R3 = 0x21
       idle(dut); cd.waitSampling(6)
       val lat = latencyOf(dut, 9, window = 6) { issueLslImm(dut, pa = 3, count = 1, pdst = 4, robId = 9) }
-      assert(lat == 3, s"slow SHIFT completion latency=$lat (expected 3 = arch lat2, exactly ONE cycle after the fast ADD's 2)")
+      assert(lat == 4, s"slow SHIFT completion latency=$lat (expected 4 = arch lat3 + harness pre-capture edge, ONE cycle deeper than the lat2 shifter)")
       cd.waitSampling(4)
       dut.src.logic.obsIntAddr #= 4; sleep(1)
       assert(dut.src.logic.obsIntData.toBigInt == 0x42,
@@ -126,10 +127,10 @@ class AluFastSlowSpec extends AnyFunSuite {
     }
   }
 
-  test("slow SHIFT writeback lands at S2 (PRF holds old dst until then)", VerilatorTest) {
-    // The slow producer must NOT write the PRF / bypass its S1 partial. Reading the
+  test("slow SHIFT writeback lands at S3 (PRF holds old dst until then)", VerilatorTest) {
+    // The slow producer must NOT write the PRF / bypass its S1/S2 partial. Reading the
     // dst forceNoBypass while the shift is in S1 still observes the OLD value; only the
-    // S2 (lat2) write updates it. Verifies the result + the no-early-write property.
+    // S3 (lat3) write updates it. Verifies the result + the no-early-write property.
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       initPorts(dut); idle(dut)
@@ -146,10 +147,10 @@ class AluFastSlowSpec extends AnyFunSuite {
       dut.src.logic.obsIntAddr #= 6; sleep(1)
       assert(dut.src.logic.obsIntData.toBigInt == 0xDD,
         s"R6 at S1 of the shift must still be the OLD 0xDD (no early write), got 0x${dut.src.logic.obsIntData.toBigInt.toString(16)}")
-      cd.waitSampling(5)
+      cd.waitSampling(6)
       dut.src.logic.obsIntAddr #= 6; sleep(1)
       assert(dut.src.logic.obsIntData.toBigInt == 0x44,
-        s"R6 (LSL.L #2 of 0x11) got 0x${dut.src.logic.obsIntData.toBigInt.toString(16)} (expected 0x44 at lat2)")
+        s"R6 (LSL.L #2 of 0x11) got 0x${dut.src.logic.obsIntData.toBigInt.toString(16)} (expected 0x44 at lat3)")
     }
   }
 }
