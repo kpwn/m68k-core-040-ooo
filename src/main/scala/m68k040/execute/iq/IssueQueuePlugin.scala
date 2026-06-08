@@ -555,9 +555,19 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
                                   (u.psrcCValid && (u.psrcC === aw.payload.pdst)))) ||
         (aw.payload.nzvcValid && u.readsNzvc && (u.pNzvcSrc === aw.payload.pNzvcDst)) ||
         (aw.payload.xValid    && u.readsX    && (u.pXSrc === aw.payload.pXDst)))
+    // A slot may read MORE THAN ONE in-flight slow (shift) producer (e.g. `sub d0,d2`
+    // where both d0 and d2 are still-in-flight shifts). With a deeper slow pipe the two
+    // producers' wakeups can be several cycles apart, so clearing the single aluSlowWait
+    // bit on the FIRST matching wakeup would issue the consumer before its OTHER slow
+    // operand has landed. Only clear aluSlowWait once NO slow operand remains in flight
+    // AFTER this cycle's wakeups (stillAluSlow* already excludes a same-cycle wake). ──
+    def aluSlowRemaining(u: RenamedUop): Bool =
+      (u.psrcAValid && stillAluSlowInt(u.psrcA)) || (srcBIsReg(u) && stillAluSlowInt(u.psrcB)) ||
+      (u.psrcCValid && stillAluSlowInt(u.psrcC)) ||
+      (u.readsNzvc && stillAluSlowNzvc(u.pNzvcSrc)) || (u.readsX && stillAluSlowX(u.pXSrc))
     val aluSlowWakeMatch = Vec(slots.map { s =>
       val u = s.context.uop
-      s.sel && aluSlowWakeupPorts.map(aw => slowMatchOne(u, aw)).orR
+      s.sel && aluSlowWakeupPorts.map(aw => slowMatchOne(u, aw)).orR && !aluSlowRemaining(u)
     })
     for (i <- 0 until slotCount) {
       when(aluSlowWakeMatch(i)) {
