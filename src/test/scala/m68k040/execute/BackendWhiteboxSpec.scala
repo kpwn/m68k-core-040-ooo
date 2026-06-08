@@ -5,7 +5,7 @@ import m68k040.core.ParamPlugin
 import m68k040.rob.{RobPlugin, RenameUopSourcePlugin, RenameCommitSinkPlugin}
 import m68k040.rename.RenamedUop
 import m68k040.decode.DecOp
-import m68k040.isa.{Cluster, Size}
+import m68k040.isa.{Cluster, Size, MemOp}
 import m68k040.execute.iq.{IssueQueuePlugin, IssueQueueService}
 import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
 import m68k040.lockstep.WhiteboxCapture
@@ -115,6 +115,20 @@ class BackendWhiteboxSpec extends AnyFunSuite {
     u.pNzvcDst #= pNzvcDst; u.writesNzvc #= writesNzvc; u.pNzvcOld #= pNzvcOld
     u.pXSrc #= pXSrc; u.readsX #= readsX
     u.pXDst #= pXDst; u.writesX #= writesX; u.pXOld #= pXOld
+    // Drive EVERY RenamedUop field — the EU/IQ fast path reads several of these (isMovea
+    // muxes the writeback to src2; toCcr muxes the flags; isShift routes the slow path),
+    // so leaving any undriven gives it a nondeterministic per-netlist value and a flaky
+    // result (this corpus is plain MOVE/ADD: all the op-flavour flags are false). Fields
+    // added by later ISA slices (MOVEA, toCcr, shifts, mem-RMW, line-4/5) must default here.
+    u.memOp #= MemOp.NONE
+    u.psrcC #= 0; u.psrcCValid #= false
+    u.ibranch #= false; u.anInc #= 0; u.stkPush #= false; u.ccrRestore #= false
+    u.toCcr #= false; u.isTrapv #= false
+    u.faultAddr #= 0; u.sswInstr #= false
+    u.divSigned #= false; u.divIsRem #= false
+    u.shiftOp #= 0; u.shiftDir #= false; u.extByte #= false
+    u.isMovea #= false; u.isScc #= false; u.isDbcc #= false
+    u.firstOfInstr #= true
   }
 
   test("backend whitebox reconstructs CommitObservations for MOVEQ/MOVEQ/ADD", VerilatorTest) {
