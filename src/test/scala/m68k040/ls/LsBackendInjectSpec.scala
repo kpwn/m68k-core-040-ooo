@@ -34,6 +34,12 @@ class LsBackendInjectSpec extends AnyFunSuite {
       val rob = host[RobPlugin]
       eu0.issue << iq.issue(0)
       eu1.issue << iq.issue(1)
+      // SLOW-ALU (shift, lat2) dynamic wakeup (mirrors top/FullCoreSynth). No shifts in
+      // this LS-injection corpus, so inert, but wired for consistency/latent-deadlock safety.
+      iq.aluSlowWakeup(0).valid   := eu0.slowWakeup.valid
+      iq.aluSlowWakeup(0).payload := eu0.slowWakeup.payload
+      iq.aluSlowWakeup(1).valid   := eu1.slowWakeup.valid
+      iq.aluSlowWakeup(1).payload := eu1.slowWakeup.payload
       iq.issue(2).ready := False           // no branch uops injected here
       lsEu.issue << iq.issue(3)
       iq.issue(4).ready := False           // no CHK/DIV uops injected here

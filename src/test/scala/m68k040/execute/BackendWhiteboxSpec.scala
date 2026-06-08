@@ -37,6 +37,12 @@ class BackendWhiteboxSpec extends AnyFunSuite {
       // IQ issue (producer) → EU issue (plain-wire, EU drives ready).
       eu0.issue << iq.issue(0)
       eu1.issue << iq.issue(1)
+      // SLOW-ALU (shift, lat2) dynamic wakeup (mirrors top/FullCoreSynth). This corpus
+      // has no shifts, so it is inert, but wired for consistency / latent-deadlock safety.
+      iq.aluSlowWakeup(0).valid   := eu0.slowWakeup.valid
+      iq.aluSlowWakeup(0).payload := eu0.slowWakeup.payload
+      iq.aluSlowWakeup(1).valid   := eu1.slowWakeup.valid
+      iq.aluSlowWakeup(1).payload := eu1.slowWakeup.payload
       // Branch issue port (BR2): no branch EU in this no-branch DUT (BR4 adds it) —
       // tie its ready off so the IQ's issue(2) Stream is driven. The straight-line
       // ALU corpus has no branches, so this port never carries a valid uop.

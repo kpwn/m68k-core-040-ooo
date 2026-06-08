@@ -62,6 +62,13 @@ class IpcBenchSpec extends AnyFunSuite {
       val rob = host[RobPlugin]
       eu0.issue << iq.issue(0)
       eu1.issue << iq.issue(1)
+      // SLOW-ALU (shift, lat2) dynamic wakeup — one IQ port per ALU EU (mirrors
+      // top/FullCoreSynth). Inert for the shift-free IPC kernels, but required so a
+      // shift's dependents could wake (consistency with the production wiring).
+      iq.aluSlowWakeup(0).valid   := eu0.slowWakeup.valid
+      iq.aluSlowWakeup(0).payload := eu0.slowWakeup.payload
+      iq.aluSlowWakeup(1).valid   := eu1.slowWakeup.valid
+      iq.aluSlowWakeup(1).payload := eu1.slowWakeup.payload
       branchEu.issue << iq.issue(2)
       rob.logic.branchCompletion.valid   := branchEu.completion.valid
       rob.logic.branchCompletion.payload := branchEu.completion.payload
