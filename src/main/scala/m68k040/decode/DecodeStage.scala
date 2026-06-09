@@ -35,6 +35,15 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val slot1Valid = Bool()
   }
 
+  // Push payload registered between the decode/pack output and the MicroOpQueue write
+  // (P1 timing skid): the 4 packed µops + their count. Carried through a 1-deep PipeStage
+  // so the deep MicroOpAssembler decode cone ends at a register and the ring write
+  // consumes only registered signals (kills the decode-cone half of the push critical arc).
+  case class PushPayload() extends Bundle {
+    val uops  = Vec(DecodedUop(), 4)
+    val count = UInt(3 bits)
+  }
+
   val logic = during build new Area {
     val df = host[DecodeFeedService]
 
@@ -102,23 +111,37 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // Pack: positions 0..2 = head instruction's µops; the slot1 µops follow at nCur..
     // (only when slot1Emit, where nCur<=2 and n1<=2, so max position 3).
     def headUop(i: Int): DecodedUop = Mux(stashValid, stashUops(i), a0.uops(i))
-    queue.io.push.uops(0) := headUop(0)
-    queue.io.push.uops(1) := Mux(nCur >= U(2), headUop(1), a1raw.uops(0))
-    queue.io.push.uops(2) := Mux(nCur === U(3), headUop(2), Mux(nCur === U(2), a1raw.uops(0), a1raw.uops(1)))
-    queue.io.push.uops(3) := a1raw.uops(1)
 
     val totalCount = (nCur +^ n1).resize(3)            // 1..4
-    queue.io.push.count := totalCount
-    // Push when there is a head instruction: either a stashed RTR or a valid fed group.
-    queue.io.push.valid := stashValid || fed.valid
 
-    // Consume the fed group only when NOT replaying a stash AND the queue accepted.
-    // When deferring slot1, we still consume the group THIS cycle (slot0 emitted) and
-    // register the decoded slot1 µops; the stash replays them next cycle.
-    fed.ready := !stashValid && queue.io.push.ready
-    when(queue.io.push.ready) {
+    // Produce the push as a Stream (the deep assemble/pack cone drives this).
+    val pushProduced = Stream(PushPayload())
+    // Push when there is a head instruction: either a stashed RTR or a valid fed group.
+    pushProduced.valid           := stashValid || fed.valid
+    pushProduced.payload.uops(0) := headUop(0)
+    pushProduced.payload.uops(1) := Mux(nCur >= U(2), headUop(1), a1raw.uops(0))
+    pushProduced.payload.uops(2) := Mux(nCur === U(3), headUop(2), Mux(nCur === U(2), a1raw.uops(0), a1raw.uops(1)))
+    pushProduced.payload.uops(3) := a1raw.uops(1)
+    pushProduced.payload.count   := totalCount
+
+    // P1: register the produced push. The deep `assemble` cone ends at pushReg's input;
+    // the ring write in N+1 is a shallow, register-driven broadcast. Flushed by the SAME
+    // pipeFlush that squashes `fed` and the queue, so a held wrong-path group is discarded.
+    val pushReg = PipeStage(pushProduced, pipeFlush)
+    queue.io.push.valid := pushReg.valid
+    queue.io.push.count := pushReg.payload.count
+    queue.io.push.uops  := pushReg.payload.uops
+    pushReg.ready       := queue.io.push.ready
+
+    // Consume the fed group / advance the stash when the PRODUCED group enters pushReg.
+    // The "group accepted" signal is now the register's input-ready (pushProduced.ready),
+    // not queue.io.push.ready directly. When deferring slot1, we still consume the group
+    // THIS cycle (slot0 emitted into pushReg) and register the decoded slot1 µops; the
+    // stash replays them next cycle.
+    fed.ready := !stashValid && pushProduced.ready
+    when(pushProduced.ready) {
       when(stashValid) {
-        stashValid := False                  // the stashed RTR was emitted this cycle
+        stashValid := False                  // the stashed slot1/RTR was emitted (into pushReg) this cycle
       } elsewhen(deferSlot1 && fed.valid) {
         stashValid  := True                  // defer slot1 to next cycle (3-µop slot0 or slot1)
         stashCount  := a1raw.count
