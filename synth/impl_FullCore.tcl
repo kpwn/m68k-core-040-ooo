@@ -2,6 +2,9 @@ read_verilog generated/M68kFullCoreSynth.v
 read_xdc synth/clk.xdc
 synth_design -top M68kFullCoreSynth -part xcku5p-ffvb676-2-e -mode out_of_context
 opt_design
+# Front-end floorplan: co-locate DecodeStage so the decode->ring nets stay local (read after
+# opt so the cell filter sees elaborated leaves). Part of the front-end FMax stack (195->~218).
+read_xdc synth/floorplan_decode.xdc
 place_design
 phys_opt_design
 route_design
