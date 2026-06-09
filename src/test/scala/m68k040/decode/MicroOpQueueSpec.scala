@@ -102,4 +102,44 @@ class MicroOpQueueSpec extends AnyFunSuite {
       assert(!dut.io.pop.valid.toBoolean, "queue must be empty after flush")
     }
   }
+
+  test("banking: randomized push/pop/flush preserves FIFO order vs reference model", VerilatorTest) {
+    M68kSim().withVerilator.compile(mk).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      val rnd = new scala.util.Random(0x6809)
+      dut.io.flush #= false; idle(dut); dut.io.pop.ready #= false
+      cd.waitSampling()
+      val model = scala.collection.mutable.Queue[Int]()   // reference FIFO of dstReg tags
+      var tag = 0
+      var cycles = 0
+      while (cycles < 400) {
+        // Decide a tentative push burst, pop-ready, and flush for THIS cycle, then drive them.
+        val nPushReq = if (rnd.nextInt(3) != 0) rnd.nextInt(5) else 0  // 0..4 requested
+        if (nPushReq > 0) pushBurst(dut, tag, nPushReq) else idle(dut)
+        val popReady = rnd.nextInt(3) != 0
+        dut.io.pop.ready #= popReady
+        val doFlush = rnd.nextInt(40) == 0
+        dut.io.flush #= doFlush
+        sleep(1)  // let combinational outputs (push.ready / pop.valid / payloads) settle
+        // Sample what ACTUALLY fires this cycle from the settled handshake signals.
+        val pushFired = dut.io.push.valid.toBoolean && dut.io.push.ready.toBoolean
+        val popped = scala.collection.mutable.ArrayBuffer[Int]()
+        if (!doFlush && dut.io.pop.valid.toBoolean && popReady) {
+          popped += dut.io.pop.payload(0).dstReg.toInt
+          if (dut.io.pop1Valid.toBoolean) popped += dut.io.pop.payload(1).dstReg.toInt
+        }
+        cd.waitSampling()
+        // Mirror the SAME effects on the reference model. Flush takes precedence (pointer
+        // reset wipes the queue), matching the RTL where flush overrides push/pop this cycle.
+        for (p <- popped) {
+          assert(model.nonEmpty, s"DUT popped $p with empty model @cycle $cycles")
+          val exp = model.dequeue()
+          assert(p == exp, s"FIFO order: DUT popped $p, model expected $exp @cycle $cycles")
+        }
+        if (pushFired) { for (i <- 0 until nPushReq) model.enqueue((tag + i) & 0x1f); tag += nPushReq }
+        if (doFlush) model.clear()
+        cycles += 1
+      }
+    }
+  }
 }
