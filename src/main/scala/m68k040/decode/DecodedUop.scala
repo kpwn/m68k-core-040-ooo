@@ -31,7 +31,13 @@ object DecOp extends SpinalEnum {
       //          byte-source form (EXT.W byte->word .W; EXTB.L byte->long; EXT.L
       //          word->long when extByte=0).
       //   TAS  : N/Z from Dn[7:0] (V=0,C=0); then Dn[7]:=1 (byte partial merge).
-      CLR, NEG, NEGX, NOT, TST, SWAP, EXT, TAS = newElement()
+      CLR, NEG, NEGX, NOT, TST, SWAP, EXT, TAS,
+      // Bit op (BTST/BCHG/BCLR/BSET): tests bit n -> Z = complement of that bit; all
+      // but BTST then set/clear/toggle it. The op carries `bitOp` (tt: 00 BTST, 01
+      // BCHG, 10 BCLR, 11 BSET). Bit number = the immediate (static, useImm) or srcB=Dn
+      // (dynamic). Dest width: LONG (Dn, bit mod 32) or BYTE (memory, bit mod 8) — set
+      // by the assembler from the EA. Z-only flag write (preserve N/V/C; X untouched).
+      BITOP = newElement()
 }
 
 /** Pre-rename µop: the decode→rename contract. Architectural operands
@@ -130,6 +136,11 @@ case class DecodedUop() extends Bundle {
   // Default 0/False (non-shift µops). Threaded through rename to the ALU EU.
   val shiftOp      = Bits(2 bits)
   val shiftDir     = Bool()
+  // ── Bit op (BTST/BCHG/BCLR/BSET): tt = 00 BTST, 01 BCHG, 10 BCLR, 11 BSET. ──────
+  // The bit number is the immediate (static form, useImm) or srcB=Dn (dynamic). Dest
+  // width: LONG (Dn, bit mod 32) or BYTE (memory, bit mod 8) — set by the assembler
+  // from the EA. The ALU EU runs the bit-op datapath + a Z-only flag write. Default 0.
+  val bitOp        = Bits(2 bits)
   // ── Line-4 EXT/EXTB source-width marker (DecOp.EXT) ──────────────────────────
   // EXT sign-extends the low byte/word of Dn. `extByte` = the source is a BYTE
   // (Dn[7:0]) rather than a word (Dn[15:0]): EXT.W (byte->word, size WORD, extByte)
