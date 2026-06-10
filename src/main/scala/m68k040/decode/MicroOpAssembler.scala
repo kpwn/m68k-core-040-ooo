@@ -30,6 +30,99 @@ object MicroOpAssembler {
     val count = UInt(2 bits)         // 1, 2, or 3 µops valid
   }
 
+  /** Fully-defaulted plain LOAD/STORE µop builder for the MOVEM micro-sequencer
+    * (DecodeStage FSM). Every DecodedUop field assigned exactly once. The MOVEM move
+    * µops are plain LS-cluster LOAD/STORE (NO flags, NO new EU): the FSM walks the
+    * addresses via a constant base An (`base`/`baseValid`) + a per-element displacement
+    * (`disp`), so it does NOT use the eaAuto fold (the single final An update is a
+    * separate ADD µop, `movemAnUpdUop`).
+    *
+    *  - LOAD : [base+disp] -> reg (dstReg=reg). `.W` (sizeLong=False) SIGN-EXTENDS the
+    *           loaded word to the full 32-bit register — reuse `isMovea` as the LS-EU
+    *           "sign-extend .W load result" marker (the field already means "sign-extend
+    *           a .W value"; the ALU EU is the only other consumer and never sees an
+    *           LS-cluster µop). A `.L` load leaves isMovea False (full 32-bit load).
+    *  - STORE: reg -> [base+disp] (srcBReg=reg = the stored data, no int dst, NO flags).
+    */
+  def movemMoveUop(reg: UInt, base: UInt, baseValid: Bool, disp: Bits, sizeLong: Bool,
+                   isLoad: Bool, first: Bool, drop: Bool, valid: Bool, pc: UInt, nextPc: UInt): DecodedUop = {
+    val u = DecodedUop()
+    u.valid       := valid
+    u.pc          := pc
+    u.nextPc      := nextPc
+    u.op          := DecOp.MOVE
+    u.cluster     := Cluster.LS
+    u.size        := Mux(sizeLong, Size.LONG, Size.WORD)
+    u.memOp       := Mux(isLoad, MemOp.LOAD, MemOp.STORE)
+    // base An (the address register); the FSM keeps it constant + walks `disp`.
+    u.srcAReg     := base; u.srcAValid := baseValid
+    // STORE data = the moved register (srcB); LOAD reads no srcB.
+    u.srcBReg     := Mux(isLoad, U(0, 5 bits), reg); u.srcBValid := !isLoad
+    u.srcCReg     := 0;   u.srcCValid := False
+    // LOAD writes the register; STORE writes no int reg (no eaAuto fold here).
+    u.dstReg      := reg; u.dstValid := isLoad
+    u.useImm      := True; u.imm := disp
+    u.readsNzvc   := False; u.readsX := False
+    u.writesNzvc  := False; u.writesX := False     // MOVEM affects NO condition codes
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
+    u.cond        := 0; u.branchDisp := 0
+    u.unimplemented := False
+    u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+    u.faultAddr   := pc; u.sswInstr := False; u.isRte := False; u.isTrapv := False
+    u.divSigned   := False; u.div64 := False
+    // `divRem` = the generic crack-DROP marker (like DIVREM / the source-EA An-update): a
+    // dropped MOVEM move does NOT map to its own oracle step (the macro is ONE step — the
+    // final An-update / last move is the kept commit), but its reg write still lands in the
+    // PRF + is verified by a later reader (lock-step) / checkMem (stores).
+    u.divIsRem    := drop
+    u.eaAuto      := EaAuto.NONE; u.eaDelta := 0     // NO auto-fold: addresses via disp
+    u.ccrRestore  := False; u.toCcr := False
+    u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.extByte := False
+    // Reuse isMovea as the ".W load -> sign-extend the full 32-bit reg" marker (LOAD only).
+    u.isMovea     := isLoad && !sizeLong
+    u.isScc       := False; u.isDbcc := False
+    // Only the VERY FIRST emitted move of the whole MOVEM is the macro boundary
+    // (firstOfInstr); every later move + the final An update is non-first, so an
+    // interrupt is only taken at the MOVEM boundary (never mid-emission — the partly-
+    // emitted moves would otherwise be re-run after RTE since they share the MOVEM pc).
+    u.firstOfInstr := first
+    u
+  }
+
+  /** The single final An update for `(An)+`/`-(An)` MOVEM: `An := An ± count*size`
+    * (ONE ADD, not a per-move fold). It is the macro instruction's last µop (NOT first).
+    * `signedDelta` is the full signed byte delta (+count*size for postinc, -count*size
+    * for predec). It carries the nextPc so the ROB advances PC correctly at commit. */
+  def movemAnUpdUop(an: UInt, signedDelta: SInt, valid: Bool, pc: UInt, nextPc: UInt): DecodedUop = {
+    val u = DecodedUop()
+    u.valid       := valid
+    u.pc          := pc
+    u.nextPc      := nextPc
+    u.op          := DecOp.ADD
+    u.cluster     := Cluster.INT
+    u.size        := Size.LONG
+    u.memOp       := MemOp.NONE
+    u.srcAReg     := an; u.srcAValid := True
+    u.srcBReg     := 0;  u.srcBValid := False
+    u.srcCReg     := 0;  u.srcCValid := False
+    u.dstReg      := an; u.dstValid := True
+    u.useImm      := True; u.imm := signedDelta.resize(32).asBits
+    u.readsNzvc   := False; u.readsX := False
+    u.writesNzvc  := False; u.writesX := False     // An update sets NO flags
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
+    u.cond        := 0; u.branchDisp := 0
+    u.unimplemented := False
+    u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+    u.faultAddr   := pc; u.sswInstr := False; u.isRte := False; u.isTrapv := False
+    u.divSigned   := False; u.div64 := False; u.divIsRem := False
+    u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
+    u.ccrRestore  := False; u.toCcr := False
+    u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.extByte := False
+    u.isMovea     := False; u.isScc := False; u.isDbcc := False
+    u.firstOfInstr := False    // trailing µop of the MOVEM macro
+    u
+  }
+
   def assemble(pkt: DecodePacket): AssembledUops = {
     val out = AssembledUops()
     val op  = pkt.words(0)

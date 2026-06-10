@@ -99,6 +99,16 @@ case class OpSpec() extends Bundle {
   // Line-4 EXT/EXTB byte-source marker (DecOp.EXT): the sign-extend source is a BYTE
   // (EXT.W / EXTB.L) rather than a word (EXT.L). Non-EXT ops leave it False.
   val extByte   = Bool()
+  // MOVEM (`0100 1 d 001 s mmmrrr` + 16-bit register mask): the core's first variable-
+  // length, multi-cycle-emitted instruction. OperationDecoder only CLASSIFIES it (keeps
+  // it non-illegal, a benign placeholder like EXG); the DecodeStage micro-sequencer FSM
+  // reads `movem`/`movemDir`/`movemSizeLong` + the EA (via the EaDecoder on op[5:0]) and
+  // the mask (words(1)) to emit the per-register load/store µops over multiple cycles.
+  //   movemDir       : 0 = registers->memory (STORE), 1 = memory->registers (LOAD)
+  //   movemSizeLong  : 0 = .W (load sign-extends), 1 = .L
+  val movem         = Bool()
+  val movemDir      = Bool()
+  val movemSizeLong = Bool()
 }
 object OpSpec {
   def illegalDefault(): OpSpec = {
@@ -116,6 +126,7 @@ object OpSpec {
     o.bcdSub := False
     o.bitOp := 0
     o.extByte := False
+    o.movem := False; o.movemDir := False; o.movemSizeLong := False
     o
   }
 }
