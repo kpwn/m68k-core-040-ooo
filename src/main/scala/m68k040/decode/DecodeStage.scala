@@ -370,7 +370,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       } otherwise {
         when(pushProduced.ready) {
           movemMask    := movemMask2                                  // drop the 1-2 emitted bits
-          movemOff     := movemOff + movemStep * movemNumThisCycle.asSInt.resize(32)
+          movemOff     := (movemOff + movemStep * movemNumThisCycle.asSInt.resize(32)).resize(32)
           movemEmitted := movemEmitted + movemNumThisCycle.resize(5)
           // Mask drained after this cycle's extraction? (2 emitted -> movemMask2 / movemMask1
           // both 0 if <=2 bits; 1 emitted (odd tail) -> movemMask1 is the post-clear mask.)
