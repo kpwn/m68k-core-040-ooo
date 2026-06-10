@@ -13,6 +13,10 @@ case class AluCmd() extends Bundle {
   val src2    = Bits(32 bits)  // src operand
   val xIn     = Bool()         // current X — used by NEGX (0 - Dn - X)
   val extByte = Bool()         // EXT/EXTB: sign-extend a BYTE source (else a word)
+  // Bit op (DecOp.BITOP) sub-kind: 00 BTST, 01 BCHG, 10 BCLR, 11 BSET. The bit number
+  // is src2 (the EU muxes useImm/imm vs Dn); the tested data is src1. The modulo is
+  // size-driven: LONG (Dn) -> mod 32, BYTE (mem byte) -> mod 8.
+  val bitOp   = Bits(2 bits)
 }
 
 /** ALU result + computed condition codes. nzvc = N(bit3) Z(bit2) V(bit1) C(bit0).
@@ -56,6 +60,20 @@ object AluDatapath {
     val tasRes  = (a(31 downto 8) ## (a(7 downto 0) | U(0x80, 8 bits)))  // set Dn[7]
     val notRes  = ~a
 
+    // ── Bit op (BTST/BCHG/BCLR/BSET) ────────────────────────────────────────────
+    // bn = bitNumber mod (LONG?32:8); mask = 1<<bn; Z = (data & mask)==0; result =
+    // BTST:data / BCHG:^ / BCLR:&~ / BSET:|. data = src1 (the Dn long, or the loaded
+    // byte for a mem RMW); the bit number = src2 (the EU already muxed useImm vs Dn).
+    val bnRaw   = cmd.src2.asUInt
+    val bn      = Mux(cmd.size === Size.LONG, bnRaw(4 downto 0), bnRaw(2 downto 0).resize(5))
+    val bmask   = ((U(1, 32 bits) << bn).resize(32)).asBits   // 1<<bn, kept 32-wide
+    val bTestZ  = (cmd.src1 & bmask) === 0
+    val bitRes  = cmd.bitOp.mux(
+      B"00" -> cmd.src1,             // BTST: no change
+      B"01" -> (cmd.src1 ^ bmask),   // BCHG
+      B"10" -> (cmd.src1 & ~bmask),  // BCLR
+      B"11" -> (cmd.src1 | bmask))   // BSET
+
     val result = cmd.op.mux(
       DecOp.MOVE -> cmd.src2.asUInt,
       DecOp.AND  -> (a & b),
@@ -67,6 +85,7 @@ object AluDatapath {
       DecOp.SWAP -> swapRes.asUInt,
       DecOp.EXT  -> extRes,
       DecOp.TAS  -> tasRes.asUInt,
+      DecOp.BITOP-> bitRes.asUInt,       // BTST/BCHG/BCLR/BSET (gated by dstWrites in the EU)
       default    -> sum32               // ADD/SUB/CMP/NEG/NEGX
     )
 
@@ -88,9 +107,12 @@ object AluDatapath {
 
     // TAS sets N/Z from the ORIGINAL Dn[7:0] (BEFORE bit7 is set), not from the result
     // (whose bit7 is always 1). N = a[7], Z = (a[7:0]==0).
-    val isTas = cmd.op === DecOp.TAS
+    val isTas   = cmd.op === DecOp.TAS
+    val isBitOp = cmd.op === DecOp.BITOP
+    // BITOP Z = the tested bit's complement (data & mask)==0; N comes from the EU's
+    // old-NZVC merge (bit-ops preserve N/V/C), so the datapath N is don't-care here.
     val n     = Mux(isTas, a(7), nGen)
-    val z     = Mux(isTas, a(7 downto 0) === 0, zGen)
+    val z     = Mux(isTas, a(7 downto 0) === 0, Mux(isBitOp, bTestZ, zGen))
 
     // C: ADD = cout, SUB/NEG/NEGX = borrow = ~cout. Logical/bit ops (incl. CLR/TAS) = 0.
     val cFlag = Mux(isArith, Mux(isSub || isNeg || isNegx, ~cout, cout), False)
