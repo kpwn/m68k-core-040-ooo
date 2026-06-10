@@ -71,6 +71,7 @@ class AluEuSourcePlugin extends FiberPlugin {
     uop.writesNzvc := iWritesNz; uop.pNzvcDst := iPNzvcDst
     uop.writesX    := iWritesX;  uop.pXDst    := iPXDst
     uop.shiftOp    := iShiftOp;  uop.shiftDir := iShiftDir
+    uop.bcdSub     := False
     uop.toCcr      := iToCcr
     // remaining RenamedUop fields (defaults; not exercised by the ALU EU directly).
     uop.nextPc       := U(0)
