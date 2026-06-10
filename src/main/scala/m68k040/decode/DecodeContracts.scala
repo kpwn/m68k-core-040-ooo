@@ -74,6 +74,9 @@ case class OpSpec() extends Bundle {
   val shiftOp   = Bits(2 bits)
   val shiftDir  = Bool()
   val shiftImm  = Bool()
+  // Packed-BCD sub-kind (DecOp.BCD): False = ABCD (add), True = SBCD (subtract). Non-BCD
+  // ops leave it False.
+  val bcdSub    = Bool()
   // Bit op (DecOp.BITOP) sub-kind: tt = 00 BTST, 01 BCHG, 10 BCLR, 11 BSET. Non-bit
   // ops leave it 0. The bit-number source is the immediate (static) or srcB (dynamic);
   // the dest width (LONG Dn / BYTE mem) is resolved by the assembler from the EA.
@@ -95,6 +98,7 @@ object OpSpec {
     o.illegal := True
     o.divSigned := False; o.div64 := False
     o.shiftOp := 0; o.shiftDir := False; o.shiftImm := False
+    o.bcdSub := False
     o.bitOp := 0
     o.extByte := False
     o

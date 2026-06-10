@@ -303,7 +303,29 @@ object OperationDecoder {
                     (opword(7 downto 3) === B"5'b01000" ||
                      opword(7 downto 3) === B"5'b01001" ||
                      opword(7 downto 3) === B"5'b10001")
-        when(isAddxSubx) {
+        // ABCD (line C) / SBCD (line 8), REGISTER form: 1xx0 xxx 1 0000 0 yyy.
+        //   bit8=1 + bits7:6=00 = opmode 4 (the AND/OR-RMW band); bits 5:4=00 + bit3=0
+        //   ("00000") select the DATA-register form. xxx(11:9)=Dx (dst + a source),
+        //   yyy(2:0)=Dy (a source). The memory form (bit3=1 -> -(Ay),-(Ax)) fails the
+        //   "00000" test and stays illegal/deferred. Checked FIRST so the AND/OR-RMW
+        //   branch (which would reject this Dn-direct EA as illegal) never sees it.
+        //   srcB = easrc: the EA field 000yyy -> EaDecoder DATAREG Dy (the ADDX/SUBX
+        //   precedent — a fixed data-reg read of bits 2:0 without new operand plumbing).
+        val isBcdReg = (line === 0x8 || line === 0xC) && opword(8) &&
+                       (opword(7 downto 3) === B"5'b00000")
+        when(isBcdReg) {
+          o.illegal := False
+          o.op     := DecOp.BCD
+          o.bcdSub := (line === 0x8)            // line 8 = SBCD (subtract), line C = ABCD (add)
+          o.size   := Size.BYTE                 // BCD is byte-only
+          o.srcA   := dnField                   // Dx (bits 11:9): dst operand + .B merge source
+          o.srcB   := easrc                     // EA 000yyy -> DATAREG Dy (the source byte)
+          o.dst    := dnField; o.dstWrites := True
+          o.readsNzvc  := True                  // EU needs old Z (clear-only) + computes N/V
+          o.writesNzvc := True
+          o.readsX     := True                  // X-in (the carry/borrow into the add/sub)
+          o.writesX    := True                  // X-out := decimal carry/borrow
+        } .elsewhen(isAddxSubx) {
           o.illegal := False
           o.op   := Mux(line === 0xD, DecOp.ADDX, DecOp.SUBX)
           o.srcA := dnField      // Dx (bits 11:9), the dst operand `a` (read + written)

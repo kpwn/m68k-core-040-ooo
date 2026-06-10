@@ -39,6 +39,13 @@ object DecOp extends SpinalEnum {
       //   ADDX : Dx := Dx + Dy + X (NZVCX; reads X + old Z; Z CLEAR-ONLY, like NEGX).
       //   SUBX : Dx := Dx - Dy - X (NZVCX; reads X + old Z; Z CLEAR-ONLY, like NEGX).
       ADDX, SUBX,
+      // Packed-BCD add/subtract (ABCD/SBCD, register form, BYTE). One op with a 1-bit
+      // `bcdSub` sub-kind (mirrors SHIFT/shiftDir): False=ABCD (Dx+Dy+X with decimal
+      // adjust), True=SBCD (Dx-Dy-X). srcA=Dx (dst + .B-merge source), srcB=Dy, dst=Dx.
+      // C/X = decimal carry/borrow (res>0x99); Z is CLEAR-ONLY (Z &= res==0, like NEGX);
+      // N=res[7] and V=bit7(~rawLoSum & res) are computed to MATCH Musashi (officially
+      // "undefined" but the full-CCR lock-step compares them). Routed to the ALU EU.
+      BCD,
       // Bit op (BTST/BCHG/BCLR/BSET): tests bit n -> Z = complement of that bit; all
       // but BTST then set/clear/toggle it. The op carries `bitOp` (tt: 00 BTST, 01
       // BCHG, 10 BCLR, 11 BSET). Bit number = the immediate (static, useImm) or srcB=Dn
@@ -143,6 +150,11 @@ case class DecodedUop() extends Bundle {
   // Default 0/False (non-shift µops). Threaded through rename to the ALU EU.
   val shiftOp      = Bits(2 bits)
   val shiftDir     = Bool()
+  // ── Packed-BCD add/subtract sub-kind (DecOp.BCD) ─────────────────────────────
+  // bcdSub: False = ABCD (Dx := BCD(Dx + Dy + X)); True = SBCD (Dx := BCD(Dx - Dy - X)).
+  // BYTE only. The ALU EU runs the decimal-adjust datapath + the BCD flag merge (C/X =
+  // decimal carry/borrow, clear-only Z, Musashi-exact N/V). Default False.
+  val bcdSub       = Bool()
   // ── Bit op (BTST/BCHG/BCLR/BSET): tt = 00 BTST, 01 BCHG, 10 BCLR, 11 BSET. ──────
   // The bit number is the immediate (static form, useImm) or srcB=Dn (dynamic). Dest
   // width: LONG (Dn, bit mod 32) or BYTE (memory, bit mod 8) — set by the assembler
