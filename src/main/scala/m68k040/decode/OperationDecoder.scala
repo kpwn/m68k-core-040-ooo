@@ -283,7 +283,29 @@ object OperationDecoder {
         val isMuluW = (line === 0xC) && (opmode === 3)
         val isMulsW = (line === 0xC) && (opmode === 7)
         val isMulDiv = ((line === 0x8 || line === 0xC) && (opmode === 3 || opmode === 7))
-        when(isDivuW || isDivsW) {
+        // ADDX/SUBX register form (Dy,Dx): line D/9, RMW opmode (bit8=1, ss in .B/.W/.L),
+        // EA mode field (bits 5:3) == 000 = Dn-direct. That slot is NOT a valid ADD/SUB
+        // encoding (a Dn-direct RMW destination is illegal), so it IS ADDX (line D) /
+        // SUBX (line 9): Dx := Dx +/- Dy +/- X. srcA = Dx (bits 11:9, read+written), srcB
+        // = the EA 000yyy -> EaDecoder DATAREG Dy (the source). Reuses NEGX's X-in
+        // (readsX/cmd.xIn) + old-Z (readsNzvc) for the clear-only-Z merge. The memory
+        // form `-(Ay),-(Ax)` (bit3=1 -> EA mode 001) is NOT caught here and stays on the
+        // RMW path where the assembler rejects An-direct -> illegal (deferred w/ MOVEM).
+        val eaMode     = opword(5 downto 3)
+        val isAddxSubx = isRmw && (line === 0x9 || line === 0xD) && (eaMode === B"000")
+        when(isAddxSubx) {
+          o.illegal := False
+          o.op   := Mux(line === 0xD, DecOp.ADDX, DecOp.SUBX)
+          o.srcA := dnField      // Dx (bits 11:9), the dst operand `a` (read + written)
+          o.srcB := easrc        // EA 000yyy -> EaDecoder DATAREG Dy = source `b`
+          o.dst  := dnField; o.dstWrites := True
+          when(opmode === 4) { o.size := Size.BYTE }
+            .elsewhen(opmode === 5) { o.size := Size.WORD }
+            .otherwise { o.size := Size.LONG }
+          o.writesNzvc := True; o.writesX := True   // NZVC + X (X = carry/borrow out)
+          o.readsX     := True                      // X carry/borrow IN (like NEGX)
+          o.readsNzvc  := True                      // old Z for the clear-only-Z merge
+        } .elsewhen(isDivuW || isDivsW) {
           o.illegal := False
           o.op := DecOp.DIV
           o.cluster := Cluster.CPLX

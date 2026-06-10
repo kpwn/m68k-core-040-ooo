@@ -462,7 +462,11 @@ object MicroOpAssembler {
     val opmode = op(8 downto 6)
     val isAluRmwOp = (line === B"4'h8" || line === B"4'h9" || line === B"4'hC" || line === B"4'hD") &&
                      (opmode === 4 || opmode === 5 || opmode === 6)
-    val aluRmwMemBad = isAluRmwOp && (srcEa.klass =/= EaClass.MEMSIMPLE)
+    // EA mode 000 in the line-9/D RMW slot is ADDX/SUBX (a DATAREG operand, single ALU
+    // µop), NOT a mem-RMW -> exclude it from the "RMW EA must be MEMSIMPLE" gate.
+    val isAddxSubxReg = (line === B"4'h9" || line === B"4'hD") &&
+                        (opmode === 4 || opmode === 5 || opmode === 6) && (op(5 downto 3) === 0)
+    val aluRmwMemBad = isAluRmwOp && !isAddxSubxReg && (srcEa.klass =/= EaClass.MEMSIMPLE)
     // ADDQ/SUBQ (srcB = IMMQ3): the EA (op[5:0]) is the DESTINATION (read AND written).
     // This slice supports a DATA-register OR ADDRESS-register destination only; a memory
     // EA is the deferred RMW form -> illegal. `addqMemBad` forces the illegal path (it

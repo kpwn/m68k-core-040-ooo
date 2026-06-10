@@ -32,6 +32,13 @@ object DecOp extends SpinalEnum {
       //          word->long when extByte=0).
       //   TAS  : N/Z from Dn[7:0] (V=0,C=0); then Dn[7]:=1 (byte partial merge).
       CLR, NEG, NEGX, NOT, TST, SWAP, EXT, TAS,
+      // Extended add/subtract (register form, Dy,Dx). Like ADD/SUB but with the X
+      // (extend) bit folded into the carry/borrow-in, and the 68k CLEAR-ONLY Z
+      // (Z := Z_old && result==0) — exactly the NEGX rule. srcA=Dx (read+written),
+      // srcB=Dy. Reuse NEGX's X-in (cmd.xIn) + old-Z (readsNzvc) machinery; no new field.
+      //   ADDX : Dx := Dx + Dy + X (NZVCX; reads X + old Z; Z CLEAR-ONLY, like NEGX).
+      //   SUBX : Dx := Dx - Dy - X (NZVCX; reads X + old Z; Z CLEAR-ONLY, like NEGX).
+      ADDX, SUBX,
       // Bit op (BTST/BCHG/BCLR/BSET): tests bit n -> Z = complement of that bit; all
       // but BTST then set/clear/toggle it. The op carries `bitOp` (tt: 00 BTST, 01
       // BCHG, 10 BCLR, 11 BSET). Bit number = the immediate (static, useImm) or srcB=Dn
