@@ -371,7 +371,14 @@ object PredecodeWord {
           // (mode 001) is NOT framed here (stays the assembler's illegal/deferred path).
           val isAddxSubxReg = (cls === U(9, 4 bits) || cls === U(0xD, 4 bits)) &&
                               (srcMode === U(0, 3 bits))
-          when(isAddxSubxReg) {
+          // ABCD (line C) / SBCD (line 8) register form: opmode 4, EA mode field 000
+          // (Dn-direct). A single 1-word op (Dx := BCD(Dx +/- Dy +/- X)). Like ADDX/SUBX
+          // the mode-000 slot is not a valid mem-dst, so frame it as simple len1 (else
+          // memDestExt rejects Dn -> unframed -> nextPc=pc -> the front-end stalls). The
+          // memory form -(Ay),-(Ax) (mode 001) is NOT framed (stays illegal/deferred).
+          val isBcdReg = (cls === U(8, 4 bits) || cls === U(0xC, 4 bits)) &&
+                         (opmode === U(4, 3 bits)) && (srcMode === U(0, 3 bits))
+          when(isAddxSubxReg || isBcdReg) {
             r.simple   := True
             r.lenWords := U(1, 3 bits)
           } otherwise {
