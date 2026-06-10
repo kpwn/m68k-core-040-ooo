@@ -160,6 +160,54 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val bitNzvc  = s1Nzvc(3) ## rsp.nzvc(2) ## s1Nzvc(1) ## s1Nzvc(0)   // {N_old, Z, V_old, C_old}
     val aluNzvc  = Mux(isBitOp, bitNzvc, Mux(isExtended, extNzvc, rsp.nzvc))
 
+    // ── BCD decimal-adjust datapath (ABCD/SBCD, byte) — Musashi-bit-matched ──────
+    // Transcribed verbatim from tools/musashi/musashi/m68k_in.c m68k_op_abcd_8_rr /
+    // m68k_op_sbcd_8_rr. `res` is a C `uint` (32-bit unsigned): the low-nibble sum/diff
+    // can wrap negative (SBCD) into a huge value, which makes the `>9` / `>0x99` tests
+    // and the corrections behave decimally. We mirror that with 32-bit UInt lanes (no
+    // pre-masking — the un-masked intermediate is what the C compares). Widths are kept
+    // at Musashi's 32 bits deliberately (the lock-step is the arbiter; not hand-narrowed).
+    //   dx = s1Src1[7:0] (the dst byte), dy = s1Src2[7:0] (the source byte), xin = old X.
+    val isBcd = u1.op === DecOp.BCD
+    val dx    = s1Src1(7 downto 0).asUInt
+    val dy    = s1Src2(7 downto 0).asUInt
+    val xin   = s1X.asUInt                                   // 0/1
+    val dxLo  = dx(3 downto 0).resize(32)                    // LOW_NIBBLE(dst)
+    val dyLo  = dy(3 downto 0).resize(32)                    // LOW_NIBBLE(src)
+    val dxHi  = (dx & U"8'h_f0").resize(32)                  // HIGH_NIBBLE(dst)
+    val dyHi  = (dy & U"8'h_f0").resize(32)                  // HIGH_NIBBLE(src)
+    // ── ABCD (add): res = lo(src)+lo(dst)+X; Vraw=~res; if(res>9) res+=6;
+    //    res += hi(src)+hi(dst); C=X=(res>0x99); if(C) res-=0xA0; V=bit7(Vraw&res);
+    //    N=bit7(res); res8=res&0xff. ──
+    val aLoSum = (dxLo + dyLo + xin.resize(32))              // 0..0x13
+    val aVraw  = ~aLoSum                                      // FLAG_V = ~res (part I)
+    val aAdj   = Mux(aLoSum > 9, aLoSum + 6, aLoSum)
+    val aFull  = aAdj + dxHi + dyHi
+    val aCarry = aFull > 0x99
+    val aRes   = Mux(aCarry, aFull - 0xA0, aFull)            // pre-mask res (V/N read this)
+    val aV     = (aVraw & aRes)(7)                           // FLAG_V &= res; CCR V = bit7
+    val aN     = aRes(7)                                     // FLAG_N = NFLAG_8(res)
+    val aRes8  = aRes(7 downto 0)
+    // ── SBCD (subtract): res = lo(dst)-lo(src)-X (unsigned wrap); Vraw=~res;
+    //    if(res>9) res-=6; res += hi(dst)-hi(src); C=X=(res>0x99); if(C) res+=0xA0;
+    //    res8=res&0xff (BEFORE V/N here); V=bit7(Vraw&res8); N=bit7(res8). ──
+    val sLoSub = (dxLo - dyLo - xin.resize(32))             // wraps in 32-bit unsigned
+    val sVraw  = ~sLoSub                                     // FLAG_V = ~res (part I)
+    val sAdj   = Mux(sLoSub > 9, sLoSub - 6, sLoSub)
+    val sFull  = sAdj + dxHi - dyHi
+    val sBorrow= sFull > 0x99
+    val sFix   = Mux(sBorrow, sFull + 0xA0, sFull)
+    val sRes8  = sFix(7 downto 0)                            // res = MASK_OUT_ABOVE_8(res)
+    val sV     = (sVraw(7) & sRes8(7))                       // FLAG_V &= res8; CCR V = bit7
+    val sN     = sRes8(7)                                    // FLAG_N = NFLAG_8(res)
+    // ── select by bcdSub; C=X=decimal carry/borrow; Z is CLEAR-ONLY (FLAG_Z |= res). ──
+    val bcdRes8  = Mux(u1.bcdSub, sRes8, aRes8)
+    val bcdCarry = Mux(u1.bcdSub, sBorrow, aCarry)
+    val bcdN     = Mux(u1.bcdSub, sN, aN)
+    val bcdV     = Mux(u1.bcdSub, sV, aV)
+    val bcdZ     = s1Nzvc(2) && (bcdRes8 === 0)              // Z := Z_old && res8==0
+    val bcdNzvc  = bcdN ## bcdZ ## bcdV ## bcdCarry          // {N,Z,V,C}
+
     // ---- S1: size-merge of the FAST int writeback (68k partial-register semantics) ----
     // A .B / .W op updates ONLY the low byte / word of the destination register; the
     // upper bits are PRESERVED. For ADD/SUB/AND/OR/EOR the destination operand is srcA
@@ -169,7 +217,8 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // source), so s1Src1 holds the old Dn and the upper bytes are preserved. MOVE.L
     // (and any .L op) takes the full result. The fast path no longer muxes the shifter
     // result (a SHIFT is slow), so opResult is the ALU datapath result directly.
-    val opResult = rsp.result
+    // BCD overrides the datapath result low byte (BYTE size -> the merge preserves Dx[31:8]).
+    val opResult = Mux(isBcd, B(0, 24 bits) ## bcdRes8, rsp.result)
     val sizeMerged = u1.size.mux(
       Size.BYTE -> (s1Src1(31 downto 8)  ## opResult(7 downto 0)),
       Size.WORD -> (s1Src1(31 downto 16) ## opResult(15 downto 0)),
@@ -196,9 +245,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val ccrNzvc = ccrNew(3 downto 0)
     val ccrX    = ccrNew(4)
 
-    // Fast final flags: CCR-rmw for toCcr, else the ALU datapath (NO shifter).
-    val finalNzvc = Mux(u1.toCcr, ccrNzvc, aluNzvc)
-    val finalX    = Mux(u1.toCcr, ccrX, rsp.xOut)
+    // Fast final flags: CCR-rmw for toCcr, BCD decimal carry/quirky-N/V for BCD, else
+    // the ALU datapath (NO shifter). X = the BCD decimal carry/borrow for a BCD op.
+    val finalNzvc = Mux(u1.toCcr, ccrNzvc, Mux(isBcd, bcdNzvc, aluNzvc))
+    val finalX    = Mux(u1.toCcr, ccrX, Mux(isBcd, bcdCarry, rsp.xOut))
 
     // ---- S1: FAST writeback (gated by masks; suppressed for a slow op) ----
     val fastFire = s1Valid && !isSlow

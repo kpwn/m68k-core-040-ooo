@@ -1194,6 +1194,161 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  // ── Packed-BCD add (ABCD Dy,Dx) — decimal-adjust + the full-CCR (incl the
+  // "undefined"-but-compared N/V) match vs Musashi. X is seeded by a preceding flag
+  // setter (addi.b that carries -> X=1; one that does NOT carry -> X=0). Each `abcd`
+  // reads the LOW byte; the upper 24 bits are preserved (the reg compare covers them).
+  // Tests are kept short (the harness exposes an unrelated uninit-PRF flake on very long
+  // straight-line programs); each name contains "ABCD" so `-z "ABCD"` selects them. ────
+  test("lock-step: ABCD no/half-carry, X=0 (full CCR incl N/V)", VerilatorTest) {
+    runLockStep("abcd-lo", Seq(
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x11223300,%d0", "move.l #0x44556600,%d1", "abcd %d1,%d0", // 00+00=00, upper preserved
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x00000001,%d2", "move.l #0x00000001,%d3", "abcd %d3,%d2", // 01+01=02
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x00000005,%d4", "move.l #0x00000006,%d5", "abcd %d5,%d4", // 05+06=11 (low half-carry +6)
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x00000009,%d0", "move.l #0x00000001,%d1", "abcd %d1,%d0"  // 09+01=10 (half-carry)
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: ABCD high/full carry, X=0 (C/X=1, N canary)", VerilatorTest) {
+    runLockStep("abcd-hi", Seq(
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x00000050,%d2", "move.l #0x00000050,%d3", "abcd %d3,%d2", // 50+50=100 (carry,X=1)
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x00000090,%d4", "move.l #0x00000010,%d5", "abcd %d5,%d4", // 90+10=100 (carry)
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x00000099,%d0", "move.l #0x00000099,%d1", "abcd %d1,%d0"  // 99+99=198 -> 0x98 (N=1 canary)
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: ABCD with X=1 in (carry via the X ripple)", VerilatorTest) {
+    runLockStep("abcd-xin", Seq(
+      "move.l #0x000000ff,%d6", "addi.b #1,%d6",            // X=1 seed
+      "move.l #0x00000045,%d2", "move.l #0x00000054,%d3", "abcd %d3,%d2", // 45+54+1=100 (carry via X)
+      "move.l #0x000000ff,%d6", "addi.b #1,%d6",            // X=1
+      "move.l #0x00000009,%d0", "move.l #0x00000000,%d1", "abcd %d1,%d0", // 09+00+1=10 (half-carry via X)
+      "move.l #0x000000ff,%d6", "addi.b #1,%d6",            // X=1
+      "move.l #0x00000099,%d4", "move.l #0x00000000,%d5", "abcd %d5,%d4"  // 99+00+1=100 (carry)
+    ).mkString(" ; "))
+  }
+
+  // ABCD invalid-BCD inputs (low nibble > 9 / byte 0xFF): Musashi's un-masked >9 / >0x99
+  // handling. The full-CCR compare nails the quirky N/V here.
+  test("lock-step: ABCD invalid-BCD inputs (0xFF, 0x0F, X=0/1)", VerilatorTest) {
+    runLockStep("abcd-invalid", Seq(
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x000000ff,%d0", "move.l #0x000000ff,%d1", "abcd %d1,%d0", // 0xff+0xff
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x0000000f,%d2", "move.l #0x0000000f,%d3", "abcd %d3,%d2", // 0x0f+0x0f
+      "move.l #0x000000ff,%d6", "addi.b #1,%d6",            // X=1
+      "move.l #0x000000ff,%d4", "move.l #0x0000000a,%d5", "abcd %d5,%d4"  // 0xff+0x0a+1
+    ).mkString(" ; "))
+  }
+
+  // ABCD clear-only Z + upper-byte preservation: Z=1 then a non-zero result clears Z; a
+  // zero result with Z_old=1 keeps Z=1. Mirrors the NEGX/ADDX clear-only-Z test.
+  test("lock-step: ABCD clear-only Z + upper-byte preserve", VerilatorTest) {
+    runLockStep("abcd-z", Seq(
+      // Z_old=1 (subi.b 1-1=0 sets Z=1, X=0), abcd 00+00+0=00 -> Z STAYS 1
+      "move.l #0x00000001,%d6", "subi.b #1,%d6",             // Z=1, X=0
+      "move.l #0x11223300,%d0", "move.l #0x44556600,%d1", "abcd %d1,%d0", // 00+00=00; Z stays 1; upper 0x112233 preserved
+      // Z_old=1, abcd non-zero result -> Z clears to 0
+      "move.l #0x00000001,%d6", "subi.b #1,%d6",             // Z=1, X=0
+      "move.l #0x00000012,%d2", "move.l #0x00000034,%d3", "abcd %d3,%d2", // 12+34=46; Z clears
+      // Z_old=1, abcd with X=1 producing 0x00 (99+00+1=100 -> 00, carry) -> Z stays 1
+      "move.l #0x000000ff,%d6", "addi.b #1,%d6",             // X=1, Z=1 (0xff+1=0 carry)
+      "move.l #0x11990099,%d4", "move.l #0x00000000,%d5", "abcd %d5,%d4"  // 99+00+1=00 carry; Z stays 1; upper 0x119900 preserved
+    ).mkString(" ; "))
+  }
+
+  // Multi-byte packed-BCD add (the canonical ABCD use): ripple X between bytes.
+  test("lock-step: ABCD 4-digit multi-byte chain (X ripple)", VerilatorTest) {
+    runLockStep("abcd-chain", Seq(
+      // (D1 high, D0 low) 0x99 0x99 + (D3 D2) 0x00 0x01 -> low 99+01=00 carry, high 99+00+1=00 carry
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0 for the low byte
+      "move.l #0x00000099,%d0", "move.l #0x00000099,%d1",    // A: low=0x99 high=0x99
+      "move.l #0x00000001,%d2", "move.l #0x00000000,%d3",    // B: low=0x01 high=0x00
+      "abcd %d2,%d0",                                        // low: 99+01+0=00 carry -> X=1
+      "abcd %d3,%d1",                                        // high: 99+00+1=00 carry
+      // non-overflowing chain: 12 34 + 45 23 = 57 57
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x00000034,%d4", "move.l #0x00000012,%d5",    // A: low=0x34 high=0x12
+      "move.l #0x00000023,%d6", "move.l #0x00000045,%d7",    // B: low=0x23 high=0x45
+      "abcd %d6,%d4",                                        // low 34+23=57, no carry -> X=0
+      "abcd %d7,%d5"                                         // high 12+45=57
+    ).mkString(" ; "))
+  }
+
+  // ── Packed-BCD subtract (SBCD Dy,Dx) — borrow / unsigned-wrap decimal adjust + full
+  // CCR (incl N/V) vs Musashi. SBCD's V masks res AFTER the 8-bit mask (vs ABCD before).
+  // Names contain "SBCD" so `-z "SBCD"` selects them. ────────────────────────────────
+  test("lock-step: SBCD no/low-borrow, X=0 (full CCR incl N/V)", VerilatorTest) {
+    runLockStep("sbcd-lo", Seq(
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x11223399,%d0", "move.l #0x44556611,%d1", "sbcd %d1,%d0", // 99-11=88
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x00000010,%d4", "move.l #0x00000001,%d5", "sbcd %d5,%d4", // 10-01=09 (low borrow -6)
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x00000055,%d2", "move.l #0x00000055,%d3", "sbcd %d3,%d2"  // 55-55=00
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: SBCD high-borrow, X=0 (+0xA0 wrap, N canary)", VerilatorTest) {
+    runLockStep("sbcd-hi", Seq(
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x00000000,%d2", "move.l #0x00000001,%d3", "sbcd %d3,%d2", // 00-01=99 borrow (X=1, N=1 canary)
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x00000050,%d0", "move.l #0x00000099,%d1", "sbcd %d1,%d0", // 50-99=51 borrow (high borrow +0xA0)
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x00000000,%d4", "move.l #0x00000099,%d5", "sbcd %d5,%d4"  // 00-99=01 borrow
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: SBCD with X=1 in (borrow via the X ripple)", VerilatorTest) {
+    runLockStep("sbcd-xin", Seq(
+      "move.l #0x00000000,%d6", "subi.b #1,%d6",            // X=1 seed (0-1 borrow)
+      "move.l #0x00000010,%d4", "move.l #0x00000001,%d5", "sbcd %d5,%d4", // 10-01-1=08
+      "move.l #0x00000000,%d6", "subi.b #1,%d6",            // X=1
+      "move.l #0x00000000,%d0", "move.l #0x00000099,%d1", "sbcd %d1,%d0", // 00-99-1=00 borrow
+      "move.l #0x00000000,%d6", "subi.b #1,%d6",            // X=1
+      "move.l #0x00000000,%d2", "move.l #0x00000000,%d3", "sbcd %d3,%d2"  // 00-00-1=99 borrow
+    ).mkString(" ; "))
+  }
+
+  // SBCD invalid-BCD inputs (low nibble 0xF / 0xFF) + clear-only Z.
+  test("lock-step: SBCD invalid-BCD inputs + clear-only Z", VerilatorTest) {
+    runLockStep("sbcd-invalid-z", Seq(
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x000000ff,%d0", "move.l #0x0000000f,%d1", "sbcd %d1,%d0", // 0xff-0x0f
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x0000000f,%d2", "move.l #0x000000ff,%d3", "sbcd %d3,%d2", // 0x0f-0xff borrow
+      // Z clear-only: pre-set Z=1, sbcd 55-55=00 with Z_old=1 -> Z stays 1; upper preserved
+      "move.l #0x00000001,%d6", "subi.b #1,%d6",            // Z=1, X=0
+      "move.l #0x11223355,%d4", "move.l #0x44556655,%d5", "sbcd %d5,%d4"  // 55-55=00; Z stays 1; upper preserved
+    ).mkString(" ; "))
+  }
+
+  // Multi-byte packed-BCD subtract (X ripples the borrow between bytes).
+  test("lock-step: SBCD 4-digit multi-byte chain (borrow ripple)", VerilatorTest) {
+    runLockStep("sbcd-chain", Seq(
+      // (D1 D0) 0x00 0x00 - (D3 D2) 0x00 0x01: low 00-01=99 borrow, high 00-00-1=99 borrow
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0 for the low byte
+      "move.l #0x00000000,%d0", "move.l #0x00000000,%d1",    // A: low=0x00 high=0x00
+      "move.l #0x00000001,%d2", "move.l #0x00000000,%d3",    // B: low=0x01 high=0x00
+      "sbcd %d2,%d0",                                        // low 00-01=99 borrow -> X=1
+      "sbcd %d3,%d1",                                        // high 00-00-1=99 borrow
+      // non-borrowing chain: 87 65 - 12 34 = 75 31
+      "moveq #1,%d6", "addi.b #1,%d6",                       // X=0
+      "move.l #0x00000065,%d4", "move.l #0x00000087,%d5",    // A: low=0x65 high=0x87
+      "move.l #0x00000034,%d6", "move.l #0x00000012,%d7",    // B: low=0x34 high=0x12
+      "sbcd %d6,%d4",                                        // low 65-34=31, no borrow -> X=0
+      "sbcd %d7,%d5"                                         // high 87-12=75
+    ).mkString(" ; "))
+  }
+
   test("lock-step: NOT.B/.W/.L (NZ, V=C=0, upper preserved)", VerilatorTest) {
     runLockStep("not", Seq(
       "move.l #0x0000000f,%d0", "not.b %d0",                  // .B ~0x0f=0xf0, N=1

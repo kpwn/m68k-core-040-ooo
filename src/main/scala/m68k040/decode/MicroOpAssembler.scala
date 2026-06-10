@@ -159,6 +159,7 @@ object MicroOpAssembler {
     opUop.divIsRem      := False
     opUop.shiftOp       := spec.shiftOp
     opUop.shiftDir      := spec.shiftDir
+    opUop.bcdSub        := spec.bcdSub
     opUop.bitOp         := spec.bitOp
     opUop.extByte       := spec.extByte
     opUop.isMovea       := False
@@ -358,7 +359,7 @@ object MicroOpAssembler {
     ldUop.faultUsesNextPc := False
     ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False; ldUop.isTrapv := False
     ldUop.divSigned     := False; ldUop.div64 := False; ldUop.divIsRem := False
-    ldUop.shiftOp := 0; ldUop.shiftDir := False; ldUop.isMovea := False; ldUop.isScc := False; ldUop.isDbcc := False; ldUop.extByte := False; ldUop.bitOp := 0
+    ldUop.shiftOp := 0; ldUop.shiftDir := False; ldUop.isMovea := False; ldUop.isScc := False; ldUop.isDbcc := False; ldUop.extByte := False; ldUop.bitOp := 0; ldUop.bcdSub := False
     ldUop.firstOfInstr  := True    // the LOAD is the FIRST µop of a cracked instruction
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
@@ -392,7 +393,7 @@ object MicroOpAssembler {
     stUop.faultUsesNextPc := False
     stUop.faultAddr     := pkt.pc; stUop.sswInstr := False; stUop.isTrapv := False
     stUop.divSigned     := False; stUop.div64 := False; stUop.divIsRem := False
-    stUop.shiftOp := 0; stUop.shiftDir := False; stUop.isMovea := False; stUop.isScc := False; stUop.isDbcc := False; stUop.extByte := False; stUop.bitOp := 0
+    stUop.shiftOp := 0; stUop.shiftDir := False; stUop.isMovea := False; stUop.isScc := False; stUop.isDbcc := False; stUop.extByte := False; stUop.bitOp := 0; stUop.bcdSub := False
     stUop.firstOfInstr  := True    // a single STORE µop is its own first µop
 
     // ── rmwStUop = the STORE of a memory-destination RMW (crackRmw / crackClr) ──
@@ -424,7 +425,7 @@ object MicroOpAssembler {
     rmwStUop.faultUsesNextPc := False
     rmwStUop.faultAddr     := pkt.pc; rmwStUop.sswInstr := False; rmwStUop.isTrapv := False
     rmwStUop.divSigned     := False; rmwStUop.div64 := False; rmwStUop.divIsRem := False
-    rmwStUop.shiftOp := 0; rmwStUop.shiftDir := False; rmwStUop.isMovea := False; rmwStUop.isScc := False; rmwStUop.isDbcc := False; rmwStUop.extByte := False; rmwStUop.bitOp := 0
+    rmwStUop.shiftOp := 0; rmwStUop.shiftDir := False; rmwStUop.isMovea := False; rmwStUop.isScc := False; rmwStUop.isDbcc := False; rmwStUop.extByte := False; rmwStUop.bitOp := 0; rmwStUop.bcdSub := False
     rmwStUop.firstOfInstr  := False    // the trailing store of a cracked RMW
 
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
@@ -466,7 +467,11 @@ object MicroOpAssembler {
     // µop), NOT a mem-RMW -> exclude it from the "RMW EA must be MEMSIMPLE" gate.
     val isAddxSubxReg = (line === B"4'h9" || line === B"4'hD") &&
                         (opmode === 4 || opmode === 5 || opmode === 6) && (op(5 downto 3) === 0)
-    val aluRmwMemBad = isAluRmwOp && !isAddxSubxReg && (srcEa.klass =/= EaClass.MEMSIMPLE)
+    // ABCD (line C) / SBCD (line 8) register form: opmode 4, EA mode 000 (Dn-direct).
+    // OperationDecoder already named it DecOp.BCD (a single register-direct ALU µop);
+    // exclude it from the "RMW EA must be MEMSIMPLE" gate (its Dn-direct EA is intended).
+    val isBcdReg = (spec.op === DecOp.BCD)
+    val aluRmwMemBad = isAluRmwOp && !isAddxSubxReg && !isBcdReg && (srcEa.klass =/= EaClass.MEMSIMPLE)
     // ADDQ/SUBQ (srcB = IMMQ3): the EA (op[5:0]) is the DESTINATION (read AND written).
     // This slice supports a DATA-register OR ADDRESS-register destination only; a memory
     // EA is the deferred RMW form -> illegal. `addqMemBad` forces the illegal path (it
@@ -765,7 +770,7 @@ object MicroOpAssembler {
     divlUop.faultUsesNextPc := True            // DIV0 stacks nextPc (group-2 format-$2)
     divlUop.faultAddr     := pkt.pc; divlUop.sswInstr := False; divlUop.isTrapv := False
     divlUop.divSigned     := divlSigned; divlUop.div64 := divl64; divlUop.divIsRem := False
-    divlUop.shiftOp := 0; divlUop.shiftDir := False; divlUop.isMovea := False; divlUop.isScc := False; divlUop.isDbcc := False; divlUop.extByte := False; divlUop.bitOp := 0
+    divlUop.shiftOp := 0; divlUop.shiftDir := False; divlUop.isMovea := False; divlUop.isScc := False; divlUop.isDbcc := False; divlUop.extByte := False; divlUop.bitOp := 0; divlUop.bcdSub := False
     divlUop.firstOfInstr  := True
     // 64-bit dividend high word Dr: carried in srcC (psrcC after rename). For the
     // 32-bit form psrcC is unused.
@@ -796,7 +801,7 @@ object MicroOpAssembler {
     divremUop.faultUsesNextPc := False
     divremUop.faultAddr     := pkt.pc; divremUop.sswInstr := False; divremUop.isTrapv := False
     divremUop.divSigned     := divlSigned; divremUop.div64 := divl64; divremUop.divIsRem := True
-    divremUop.shiftOp := 0; divremUop.shiftDir := False; divremUop.isMovea := False; divremUop.isScc := False; divremUop.isDbcc := False; divremUop.extByte := False; divremUop.bitOp := 0
+    divremUop.shiftOp := 0; divremUop.shiftDir := False; divremUop.isMovea := False; divremUop.isScc := False; divremUop.isDbcc := False; divremUop.extByte := False; divremUop.bitOp := 0; divremUop.bcdSub := False
     divremUop.firstOfInstr  := False           // trailing crack µop
 
     // DIV.L is valid only when its divisor EA is reg/imm. A memSimple divisor would
@@ -867,7 +872,7 @@ object MicroOpAssembler {
     mullUop.faultUsesNextPc := False
     mullUop.faultAddr     := pkt.pc; mullUop.sswInstr := False; mullUop.isTrapv := False
     mullUop.divSigned     := mullSigned; mullUop.div64 := mull64; mullUop.divIsRem := False
-    mullUop.shiftOp := 0; mullUop.shiftDir := False; mullUop.isMovea := False; mullUop.isScc := False; mullUop.isDbcc := False; mullUop.extByte := False; mullUop.bitOp := 0
+    mullUop.shiftOp := 0; mullUop.shiftDir := False; mullUop.isMovea := False; mullUop.isScc := False; mullUop.isDbcc := False; mullUop.extByte := False; mullUop.bitOp := 0; mullUop.bcdSub := False
     mullUop.firstOfInstr  := True
 
     // MULHI (high-product move) µop (.L64 only): CPLX, writes the EU's LATCHED high
@@ -895,7 +900,7 @@ object MicroOpAssembler {
     mulhiUop.faultUsesNextPc := False
     mulhiUop.faultAddr     := pkt.pc; mulhiUop.sswInstr := False; mulhiUop.isTrapv := False
     mulhiUop.divSigned     := mullSigned; mulhiUop.div64 := mull64; mulhiUop.divIsRem := False
-    mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False; mulhiUop.isMovea := False; mulhiUop.isScc := False; mulhiUop.isDbcc := False; mulhiUop.extByte := False; mulhiUop.bitOp := 0
+    mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False; mulhiUop.isMovea := False; mulhiUop.isScc := False; mulhiUop.isDbcc := False; mulhiUop.extByte := False; mulhiUop.bitOp := 0; mulhiUop.bcdSub := False
     mulhiUop.firstOfInstr  := False           // trailing crack µop
 
     // MUL.L is valid only when its multiplier EA is reg/imm (a memSimple multiplier
@@ -940,7 +945,7 @@ object MicroOpAssembler {
     ibrUop.faultUsesNextPc := False
     ibrUop.faultAddr     := pkt.pc; ibrUop.sswInstr := False; ibrUop.isTrapv := False
     ibrUop.divSigned     := False; ibrUop.div64 := False; ibrUop.divIsRem := False
-    ibrUop.shiftOp := 0; ibrUop.shiftDir := False; ibrUop.isMovea := False; ibrUop.isScc := False; ibrUop.isDbcc := False; ibrUop.extByte := False; ibrUop.bitOp := 0
+    ibrUop.shiftOp := 0; ibrUop.shiftDir := False; ibrUop.isMovea := False; ibrUop.isScc := False; ibrUop.isDbcc := False; ibrUop.extByte := False; ibrUop.bitOp := 0; ibrUop.bcdSub := False
     // JMP is a single µop (its own first); JSR's ibranch is the TRAILING µop (the push
     // is first), so firstOfInstr is False for JSR.
     ibrUop.firstOfInstr  := !isJsrOp
@@ -987,7 +992,7 @@ object MicroOpAssembler {
       u.faulted := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.faultAddr := pkt.pc; u.sswInstr := False; u.isRte := False; u.isTrapv := False
       u.divSigned := False; u.div64 := False; u.divIsRem := divIsRem
-      u.shiftOp := 0; u.shiftDir := False; u.isMovea := False; u.isScc := False; u.isDbcc := False; u.extByte := False; u.bitOp := 0
+      u.shiftOp := 0; u.shiftDir := False; u.isMovea := False; u.isScc := False; u.isDbcc := False; u.extByte := False; u.bitOp := 0; u.bcdSub := False
       u.firstOfInstr := first
       u
     }

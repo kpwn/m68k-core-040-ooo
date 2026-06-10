@@ -54,6 +54,9 @@ case class RenamedUop() extends Bundle {
   // shiftDir = d (1=left). Count = useImm/imm (i=0) or psrcB=Dc (i=1). Threaded.
   val shiftOp      = Bits(2 bits)
   val shiftDir     = Bool()
+  // Packed-BCD sub-kind (DecOp.BCD): False = ABCD (add), True = SBCD (subtract). The
+  // ALU EU's decimal-adjust datapath keys off it. Threaded from decode to the ALU EU.
+  val bcdSub       = Bool()
   // Bit op (DecOp.BITOP): tt = 00 BTST, 01 BCHG, 10 BCLR, 11 BSET. Bit number = the
   // immediate (static) or psrcB=Dn (dynamic); the tested data = psrcA. Z-only flag
   // write (the ALU EU preserves N/V/C). Threaded from decode to the ALU EU.
