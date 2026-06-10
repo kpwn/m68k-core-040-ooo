@@ -138,6 +138,8 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.ibranch      := dec.ibranch
       r.anInc        := dec.anInc
       r.stkPush      := dec.stkPush
+      r.eaAuto       := dec.eaAuto
+      r.eaDelta      := dec.eaDelta
       r.ccrRestore   := dec.ccrRestore
       r.toCcr        := dec.toCcr
       r.cond         := dec.cond

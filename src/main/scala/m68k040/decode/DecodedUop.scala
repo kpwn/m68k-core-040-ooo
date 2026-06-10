@@ -130,6 +130,18 @@ case class DecodedUop() extends Bundle {
   // has no data dst, so this lone int write is the A7 side-effect. Reuses one int
   // dst + the imm field (no 2nd write port / no 2nd 32-bit field). Default False.
   val stkPush      = Bool()
+  // ── EA auto-update (general -(An)/(An)+, modes 4/3) ─────────────────────────
+  // A mem µop whose base An gets `An := An ± eaDelta` folded in (generalizing stkPush
+  // to ANY An and size). POSTINC: access addr = An (psrcA), An := An + eaDelta.
+  // PREDEC: access addr = An - eaDelta (the same addr stkPush computes for A7, now any
+  // delta), An := An - eaDelta. The An write rides the µop's int dst (dstReg=An) when
+  // the µop produces the An value (a STORE / RMW-store with no data dst, or a dedicated
+  // An-update mem µop); a LOAD that ALSO produces a value writes the value to its dst
+  // and the An update is a SEPARATE crack µop (the load can write only one int reg).
+  // eaAuto is carried on BOTH the load AND the store of a predec RMW so they compute the
+  // SAME decremented address; only the An-writer carries the int dst. NONE/0 = no update.
+  val eaAuto       = EaAuto()
+  val eaDelta      = UInt(3 bits)
   // ── RTR CCR-restore load (pop the saved CCR word) ──────────────────────────
   // A LOAD µop that, instead of writing an int reg, RESTORES the CCR from the loaded
   // word's low byte: NZVC := data[3:0], X := data[4]. RTR restores ONLY the CCR (SR

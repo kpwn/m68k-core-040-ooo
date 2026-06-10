@@ -11,17 +11,18 @@ class PredecodeRefSpec extends AnyFunSuite {
   test("MOVE.W D0,D1 reg->reg -> simple len1") { assert(classify(0x3200) == cp(true,1)) }
   test("MOVE.L #imm32,D0 -> simple len3") { assert(classify(0x203C) == cp(true,3)) }
   test("MOVE.L (d16,A0),D1 -> simple len2") { assert(classify(0x2228) == cp(true,2)) }
-  test("MOVE.L (A0),(A1) mem->mem -> complex") { assert(classify(0x2290) == cp(false,0)) }
-  test("MOVE.L abs.L,abs.L mem->mem -> complex") { assert(classify(0x23F9) == cp(false,0)) }
+  // mem-to-mem MOVE is now in scope (cracked into [load][store] + folded An auto-updates).
+  test("MOVE.L (A0),(A1) mem->mem -> simple len1") { assert(classify(0x2290) == cp(true,1)) }
+  test("MOVE.L abs.L,abs.L mem->mem -> simple len5 (2+2 ext)") { assert(classify(0x23F9) == cp(true,5)) }
   test("BRA.s -> simple len1") { assert(classify(0x6002) == cp(true,1)) }
   test("BRA.w disp==0 -> simple len2") { assert(classify(0x6000) == cp(true,2)) }
   test("BRA.l disp==0xFF -> simple len3") { assert(classify(0x60FF) == cp(true,3)) }
   test("ADD.L (A0),D0 EA->Dn -> simple len1") { assert(classify(0xD090) == cp(true,1)) }
   test("ADD.L D0,(A0) RMW mem-dest -> simple len1 (An)") { assert(classify(0xD190) == cp(true,1)) }
-  test("ADD.W D0,(d16,A0) RMW -> simple len2; (xxx).L -> len3; (A0)+ -> complex") {
+  test("ADD.W D0,(d16,A0) RMW -> simple len2; (xxx).L -> len3; (A0)+ -> simple len1") {
     assert(classify(0xD168) == cp(true,2))   // ADD.W D0,(d16,A0) -> opword + disp16
     assert(classify(0xD1B9) == cp(true,3))   // ADD.L D0,(xxx).L -> opword + abs32
-    assert(classify(0xD198) == cp(false,0))  // ADD.L D0,(A0)+ -> MEMCOMPLEX deferred
+    assert(classify(0xD198) == cp(true,1))   // ADD.L D0,(A0)+ -> RMW postinc (0 ext, An folded)
   }
   test("ADDA.L A1,A0 opmode111 -> simple len1") { assert(classify(0xD1C9) == cp(true,1)) }
   test("CMP.W (d16,A0),D0 -> simple len2") { assert(classify(0xB068) == cp(true,2)) }
@@ -36,7 +37,7 @@ class PredecodeRefSpec extends AnyFunSuite {
   test("ADDQ #n,(An) mem-dest -> simple (RMW now in scope)") {
     assert(classify(0x5290) == cp(true,1))   // ADDQ.L #1,(A0) -> (An) mem-dest RMW
     assert(classify(0x5268) == cp(true,2))   // ADDQ.W #1,(d16,A0) -> opword + disp16
-    assert(classify(0x5298) == cp(false,0))  // ADDQ.L #1,(A0)+ -> MEMCOMPLEX deferred
+    assert(classify(0x5298) == cp(true,1))   // ADDQ.L #1,(A0)+ -> RMW postinc (0 ext, An folded)
   }
   test("deferred ops -> complex") {
     assert(classify(0x50FA) == cp(false,0))  // TRAPcc/ST (d16,PC)? mode7 reg2 ss=11 -> deferred
@@ -79,7 +80,7 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x0610) == cp(true,2))   // ADDI.B #imm,(A0)
     assert(classify(0x0668) == cp(true,3))   // ADDI.W #imm,(d16,A0) — opword + imm + disp16
     assert(classify(0x04B9) == cp(true,5))   // SUBI.L #imm,(xxx).L — opword + 2 imm + abs32
-    assert(classify(0x0618) == cp(false,0))  // ADDI.B #imm,(A0)+ -> MEMCOMPLEX deferred
+    assert(classify(0x0618) == cp(true,2))   // ADDI.B #imm,(A0)+ -> RMW postinc (opword + imm, 0 ea ext)
     assert(classify(0x00C0) == cp(false,0))  // ss=11 illegal size
     assert(classify(0x0840) == cp(true,2))   // BCHG #n,D0 (static bit-op, opmode 4) — opword + bit word
   }

@@ -2873,4 +2873,104 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         s"(matched ${res.matched}, dut ${handle.result.size}, oracle $nInstr)")
     }
   }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // -(An) / (An)+ predecrement / postincrement addressing modes.
+  //
+  // The An := An ± delta write-back is folded into the load/store/RMW crack
+  // (generalizing the call/return A7 stkPush). Programs STORE before they LOAD
+  // (the DUT memory is zeroed), then read the post-update An into a Dn so the RAW
+  // on the An update + the An value are validated against Musashi. checkMem
+  // validates the stored bytes. ADDX/SBCD memory predec forms stay deferred (they
+  // need >3 µops — beyond the AssembledUops budget — and OperationDecoder leaves
+  // them illegal; documented in the slice report).
+
+  // ── MOVE (An)+,Dn loads (.L/.W/.B) + RAW on the postinc An ────────────────────
+  test("lock-step: MOVE.L (A0)+,D0 postinc load + An RAW", VerilatorTest) {
+    runLockStep("pp-move-l-postinc-load",
+      "move.l #0xdeadbeef,%d7 ; move.l #0x3000,%a0 ; move.l %d7,(%a0) ; " +
+      "move.l #0x3000,%a0 ; move.l (%a0)+,%d0 ; move.l %a0,%d1 ; " +
+      ".stop: bra .stop", nInstr = 6)   // D0=0xdeadbeef, A0=D1=0x3004
+  }
+  test("lock-step: MOVE.W (A0)+,D0 postinc load (delta 2)", VerilatorTest) {
+    runLockStep("pp-move-w-postinc-load",
+      "move.l #0x1122aabb,%d7 ; move.l #0x3000,%a0 ; move.l %d7,(%a0) ; " +
+      "move.l #0x3000,%a0 ; move.l #0xffffffff,%d0 ; move.w (%a0)+,%d0 ; move.l %a0,%d1 ; " +
+      ".stop: bra .stop", nInstr = 7)   // D0=0xffff1122, A0=D1=0x3002
+  }
+  test("lock-step: MOVE.B (A0)+,D0 postinc load (delta 1)", VerilatorTest) {
+    runLockStep("pp-move-b-postinc-load",
+      "move.l #0x7e112233,%d7 ; move.l #0x3000,%a0 ; move.l %d7,(%a0) ; " +
+      "move.l #0x00000000,%d0 ; move.l #0x3000,%a0 ; move.b (%a0)+,%d0 ; move.l %a0,%d1 ; " +
+      ".stop: bra .stop", nInstr = 7)   // D0=0x0000007e, A0=D1=0x3001
+  }
+
+  // ── MOVE Dn,-(An) stores (.L/.W/.B) + the predec An ──────────────────────────
+  test("lock-step: MOVE.L D0,-(A0) predec store + mem + An", VerilatorTest) {
+    runLockStep("pp-move-l-predec-store",
+      "move.l #0x12345678,%d0 ; move.l #0x3004,%a0 ; move.l %d0,-(%a0) ; move.l %a0,%d1 ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L))   // mem[0x3000]=val, A0=D1=0x3000
+  }
+  test("lock-step: MOVE.W D0,-(A0) predec store (delta 2)", VerilatorTest) {
+    runLockStep("pp-move-w-predec-store",
+      "move.l #0x0000beef,%d0 ; move.l #0x3002,%a0 ; move.w %d0,-(%a0) ; move.l %a0,%d1 ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 2)   // mem[0x3000].w=0xbeef, A0=0x3000
+  }
+
+  // ── A7 byte even-keeping: -(A7).B / (A7)+.B adjust by 2 ───────────────────────
+  test("lock-step: MOVE.B D0,-(A7) then (A7)+ — A7 stays even (delta 2)", VerilatorTest) {
+    runLockStep("pp-a7-byte-even",
+      "move.l #0x000000a5,%d0 ; move.l %sp,%d2 ; move.b %d0,-(%sp) ; move.l %sp,%d1 ; " +
+      "move.b (%sp)+,%d3 ; move.l %sp,%d4 ; " +
+      ".stop: bra .stop", nInstr = 6)   // D1=SP-2 (byte->2), D3=0xa5, D4=SP (restored)
+  }
+
+  // ── MOVE.L (A1)+,(A0)+ block-copy step (mem-to-mem, double auto) ──────────────
+  test("lock-step: MOVE.L (A1)+,(A0)+ block-copy (double postinc)", VerilatorTest) {
+    runLockStep("pp-move-l-mem2mem-postinc",
+      "move.l #0xcafef00d,%d7 ; move.l #0x3100,%a1 ; move.l %d7,(%a1) ; " +
+      "move.l #0x3100,%a1 ; move.l #0x3200,%a0 ; move.l (%a1)+,(%a0)+ ; " +
+      "move.l %a1,%d1 ; move.l %a0,%d2 ; " +
+      ".stop: bra .stop", nInstr = 8, checkMem = Seq(0x3200L))  // mem[0x3200]=val, A1=D1=0x3104, A0=D2=0x3204
+  }
+
+  // ── ALU load (An)+: ADD.L (A0)+,D0 ───────────────────────────────────────────
+  test("lock-step: ADD.L (A0)+,D0 postinc ALU load + An", VerilatorTest) {
+    runLockStep("pp-add-l-postinc-load",
+      "move.l #0x10000002,%d7 ; move.l #0x3000,%a0 ; move.l %d7,(%a0) ; " +
+      "move.l #0x20000003,%d0 ; move.l #0x3000,%a0 ; add.l (%a0)+,%d0 ; move.l %a0,%d1 ; " +
+      ".stop: bra .stop", nInstr = 7)   // D0=0x30000005, A0=D1=0x3004
+  }
+
+  // ── CLR (An)+ (store, no load) ───────────────────────────────────────────────
+  test("lock-step: CLR.L (A0)+ postinc store + mem + An", VerilatorTest) {
+    runLockStep("pp-clr-l-postinc",
+      "move.l #0xffffffff,%d7 ; move.l #0x3000,%a0 ; move.l %d7,(%a0) ; " +
+      "move.l #0x3000,%a0 ; clr.l (%a0)+ ; move.l %a0,%d1 ; " +
+      ".stop: bra .stop", nInstr = 6, checkMem = Seq(0x3000L))   // mem=0, A0=D1=0x3004
+  }
+
+  // ── NEG -(An) (RMW predec: load An-delta, op, store An-delta, one An update) ──
+  test("lock-step: NEG.L -(A0) predec RMW + mem + An", VerilatorTest) {
+    runLockStep("pp-neg-l-predec",
+      "move.l #0x00000005,%d7 ; move.l #0x3000,%a0 ; move.l %d7,(%a0) ; " +
+      "move.l #0x3004,%a0 ; neg.l -(%a0) ; move.l %a0,%d1 ; " +
+      ".stop: bra .stop", nInstr = 6, checkMem = Seq(0x3000L))   // mem[0x3000]=-5=0xfffffffb, A0=D1=0x3000
+  }
+
+  // ── RMW (An)+: ADD.L Dn,(An)+ (postinc, store carries An) ─────────────────────
+  test("lock-step: ADD.L D1,(A0)+ postinc RMW + mem + An", VerilatorTest) {
+    runLockStep("pp-add-l-postinc-rmw",
+      "move.l #0x00000010,%d7 ; move.l #0x3000,%a0 ; move.l %d7,(%a0) ; " +
+      "move.l #0x00000022,%d1 ; move.l #0x3000,%a0 ; add.l %d1,(%a0)+ ; move.l %a0,%d2 ; " +
+      ".stop: bra .stop", nInstr = 7, checkMem = Seq(0x3000L))   // mem[0x3000]=0x32, A0=D2=0x3004
+  }
+
+  // ── Edge: predec source then immediate An use (RAW on the predec An update) ───
+  test("lock-step: MOVE.L (A0)+,D0 then add.l #4,%a0 (RAW on postinc An)", VerilatorTest) {
+    runLockStep("pp-postinc-then-an-use",
+      "move.l #0x01020304,%d7 ; move.l #0x3000,%a0 ; move.l %d7,(%a0) ; " +
+      "move.l #0x3000,%a0 ; move.l (%a0)+,%d0 ; addq.l #4,%a0 ; move.l %a0,%d1 ; " +
+      ".stop: bra .stop", nInstr = 7)   // D0=val, A0=D1=0x3008 (0x3000+4 postinc +4 addq)
+  }
 }

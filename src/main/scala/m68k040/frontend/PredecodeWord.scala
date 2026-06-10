@@ -11,16 +11,19 @@ object PredecodeWord {
 
     val cls = op(15 downto 12).asUInt
 
-    // In-scope MEMSIMPLE RMW-DESTINATION EA: (An)=mode2 (0 ext), (d16,An)=mode5 (1 ext),
-    // (xxx).W=mode7/reg0 (1 ext), (xxx).L=mode7/reg1 (2 ext). Returns (ok, ext). The
-    // side-effect modes (An)+/-(An)/indexed (modes 3/4/6) + (d16,PC) (read-only, not
-    // alterable) + #imm are NOT in scope -> ok=False -> COMPLEX (the assembler's illegal
-    // path). Used to frame the mem-dest RMW lengths (so nextPc is correct).
+    // In-scope MEMSIMPLE RMW-DESTINATION EA: (An)=mode2 (0 ext), (An)+=mode3 (0 ext),
+    // -(An)=mode4 (0 ext), (d16,An)=mode5 (1 ext), (xxx).W=mode7/reg0 (1 ext),
+    // (xxx).L=mode7/reg1 (2 ext). Returns (ok, ext). The predec/postinc auto modes carry
+    // no extension word (the An side-effect is folded by the assembler crack). The indexed
+    // (mode 6 / 7-3) + (d16,PC) (read-only, not alterable) + #imm modes are NOT in scope
+    // -> ok=False -> COMPLEX. Used to frame the mem-dest RMW lengths (so nextPc is right).
     def memDestExt(mode: UInt, reg: UInt): (Bool, UInt) = {
       val ok  = Bool(); val ext = UInt(3 bits)
       ok := False; ext := U(0, 3 bits)
       switch(mode) {
         is(U(2, 3 bits)) { ok := True; ext := U(0, 3 bits) }   // (An)
+        is(U(3, 3 bits)) { ok := True; ext := U(0, 3 bits) }   // (An)+ postincrement (no ext)
+        is(U(4, 3 bits)) { ok := True; ext := U(0, 3 bits) }   // -(An) predecrement (no ext)
         is(U(5, 3 bits)) { ok := True; ext := U(1, 3 bits) }   // (d16,An)
         is(U(7, 3 bits)) {
           switch(reg) {
@@ -152,11 +155,10 @@ object PredecodeWord {
           dExt := e
         }
 
-        // mem-to-mem check: srcMem = mode > 1; dstMem = mode != 1 && mode > 1
-        val srcMem = srcMode > U(1, 3 bits)
-        val dstMem = (dstMode =/= U(1, 3 bits)) && (dstMode > U(1, 3 bits))
-
-        when(sOk && dOk && !(srcMem && dstMem)) {
+        // MOVE (incl. mem-to-mem): both EAs in-scope MEMSIMPLE/reg/imm -> SIMPLE. The
+        // assembler cracks mem-to-mem into [load src -> T0][store T0 -> dst] (+ folded
+        // An auto-updates). lenWords = opword + src ext + dst ext (predec/postinc add 0).
+        when(sOk && dOk) {
           r.simple   := True
           r.lenWords := (U(1, 3 bits) + sExt + dExt).resized
         }

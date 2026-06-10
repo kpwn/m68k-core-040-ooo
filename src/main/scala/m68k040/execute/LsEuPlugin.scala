@@ -233,8 +233,22 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       }
       n
     }
-    val s1Disp = Mux(u1.stkPush, -szBytes1(u1.size), u1.imm.asSInt)
+    // EA auto-update (-(An)/(An)+) access offset:
+    //   PREDEC  -> base - eaDelta (the decremented An IS the access address + new An)
+    //   POSTINC -> base           (access at An; the An update is base + eaDelta, below)
+    // generalizing the stkPush A7 predecrement (-sizeBytes on A7) to any An/delta. A
+    // non-auto / non-push µop uses the displacement (`imm`) exactly as before.
+    val eaDelta1 = u1.eaDelta.resize(32).asSInt
+    val s1Disp = Mux(u1.stkPush, -szBytes1(u1.size),
+                 Mux(u1.eaAuto === m68k040.decode.EaAuto.PREDEC,  -eaDelta1,
+                 Mux(u1.eaAuto === m68k040.decode.EaAuto.POSTINC,  S(0, 32 bits),
+                     u1.imm.asSInt)))
     val s1Va   = (s1Base.asSInt + s1Disp).asUInt
+    // The An write-back value for an auto-update µop (when it carries an int dst):
+    //   PREDEC  -> s1Va (= base - eaDelta, the decremented An)
+    //   POSTINC -> base + eaDelta
+    val s1AnPost = (s1Base + u1.eaDelta).asBits
+    val s1AnWb   = Mux(u1.eaAuto === m68k040.decode.EaAuto.POSTINC, s1AnPost, s1Va.asBits)
 
     // ---- AGU cross-line / cross-page detection (S1, off s1Va) ----
     // The cross-detection / next-line base USED to be computed in S0 off the
@@ -391,6 +405,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // is the trailing ibranch) -> DROP its commit record (like stkPush) but still fold
     // its CCR (NZVC/X) into the running architectural CCR.
     val compCcrRestore = RegInit(False)
+    // An EA auto-update (-(An)/(An)+) STORE that is NOT the macro commit (a mem-dest RMW
+    // store, a CLR store, or a mem-to-mem store) writes An (its int dst) but is a CRACK
+    // µop -> DROP its commit record (like stkPush) while its An write still lands in the
+    // PRF (verified by a later An reader) and folds the running A7 when An==A7. A SINGLE
+    // reg-to-mem store (MOVE Dn,-(An), firstOfInstr) IS the macro commit -> kept.
+    val compEaAutoDrop = RegInit(False)
     // A mem-dest RMW / CLR TRAILING store (the macro instruction's single architectural
     // commit is the op µop, which carries the PC + flags). A trailing RMW store writes
     // NEITHER an int reg NOR flags (the op µop owns NZVCX) — unlike a MOVE-to-mem store
@@ -471,21 +491,33 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // captured-decision -> register (called in the decision cycle). A STACK-PUSH store
     // writes its int dst (A7) with the PREDECREMENTED address (s1Va) — not the load
     // `result` — and wakes consumers of A7.
+    // An EA auto-update STORE (-(An)/(An)+) writes its base An (its int dst) with the
+    // s1AnWb value — generalizing the stkPush A7 side-effect to any An. A LOAD with an
+    // auto EA writes its LOADED value to its int dst (the An update rides a separate ADD
+    // crack µop); so the An write is selected ONLY for an eaAuto STORE.
+    val isAutoStoreAn = isStore && (u1.eaAuto =/= m68k040.decode.EaAuto.NONE)
     def captureCompletion(result: Bits): Unit = {
       compValid     := True
       compRobId     := s1Ctx.robId
-      compData      := Mux(u1.stkPush, s1Va.asBits, result)
+      compData      := Mux(u1.stkPush, s1Va.asBits,
+                       Mux(isAutoStoreAn, s1AnWb, result))
       // A CCR-restore load writes NO int reg (it restores flags); a stack-push store's
       // int dst is A7 (handled via compData above); a plain load writes its int dst.
       compPdst      := u1.pdst
       compPdstValid := u1.pdstValid && !u1.ccrRestore
       compIsLoad    := isLoad
-      // Wake an int-producing load / stkPush store. A CCR-restore load produces no int
-      // reg, so it must NOT broadcast a (stale-pdst) wakeup.
-      compWakes     := (isLoad && !u1.ccrRestore) || u1.stkPush
+      // Wake an int-producing load / stkPush store / EA-auto store (the predec/postinc
+      // An side-effect). A CCR-restore load produces no int reg -> no (stale-pdst) wakeup.
+      compWakes     := (isLoad && !u1.ccrRestore) || u1.stkPush || (isAutoStoreAn && u1.pdstValid)
       compStkPush   := u1.stkPush
       compCcrRestore := u1.ccrRestore
-      // Trailing RMW/CLR store: a STORE writing neither an int reg nor flags.
+      // Drop the commit record of an EA-auto store that is an RMW/CLR AUXILIARY store:
+      // it writes An but NOT NZVC (the op µop owns the flags + is the macro commit). A
+      // MOVE store (reg-to-mem OR mem-to-mem) writes NZVC and IS the macro commit (it
+      // carries the PC) -> KEPT. So drop iff it writes An but no flags.
+      compEaAutoDrop := isAutoStoreAn && !u1.writesNzvc
+      // Trailing RMW/CLR store: a STORE writing neither an int reg nor flags. An EA-auto
+      // store writes An (pdstValid) -> NOT a dropped RMW store (its An commit is kept).
       compRmwStore  := isStore && !u1.pdstValid && !u1.writesNzvc && !u1.stkPush
       compDstArch   := u1.dstArch
       // CCR-restore (RTR): NZVC := loaded[3:0], X := loaded[4] (CCR bit layout
@@ -515,6 +547,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compWakes     := False
       compStkPush   := False
       compCcrRestore := False
+      compEaAutoDrop := False
       compIsFault   := True
       compFaultAddr := s1Va
       compFaultWr   := isStore
@@ -767,7 +800,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // Reuse `divRem` as the generic "crack µop — DROP this commit record" marker: a
     // stack-push store is the leading crack µop of BSR/JSR (the trailing branch is the
     // macro instruction's single commit). Its A7 write is still folded into running A7.
-    wbObs.divRem    := compStkPush || compCcrRestore || compRmwStore
+    wbObs.divRem    := compStkPush || compCcrRestore || compRmwStore || compEaAutoDrop
     wbObs.simPublic()
 
     // ── Exception-unit cache arbitration MUX (LAST drivers — override the LS EU's

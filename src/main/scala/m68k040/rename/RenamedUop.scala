@@ -27,6 +27,11 @@ case class RenamedUop() extends Bundle {
   // Stack-push store (BSR/JSR): addr = psrcA - sizeBytes; data = imm; int dst (A7)
   // := the predecremented address. Threaded from decode.
   val stkPush      = Bool()
+  // EA auto-update (-(An)/(An)+): the LS EU computes the access addr (PREDEC: An-delta,
+  // POSTINC: An) and (for an auto STORE) writes An := An ± eaDelta on its int dst —
+  // generalizing stkPush to any An/size. Threaded from decode.
+  val eaAuto       = m68k040.decode.EaAuto()
+  val eaDelta      = UInt(3 bits)
   // RTR CCR-restore load: NZVC := loaded[3:0], X := loaded[4] (no int dst). Threaded.
   val ccrRestore   = Bool()
   // ANDI/ORI/EORI #imm,CCR: ALU-cluster CCR read-modify-write (ccr5' = ccr5 op

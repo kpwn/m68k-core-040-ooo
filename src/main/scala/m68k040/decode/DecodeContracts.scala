@@ -29,6 +29,15 @@ object EaClass extends SpinalEnum {
   val DATAREG, ADDRREG, IMM, MEMSIMPLE, MEMCOMPLEX, ILLEGAL = newElement()
 }
 
+/** EA auto-update side-effect (predec/postinc): NONE for every non-auto EA;
+  * POSTINC for `(An)+` (EA = An, then An += delta); PREDEC for `-(An)` (An -= delta
+  * first, EA = the decremented An). The assembler folds the `An := An ± delta`
+  * write-back into the load/store/RMW crack; the LS EU computes the access address
+  * (An / An-delta) + the An write. Generalizes the call/return A7 stkPush. */
+object EaAuto extends SpinalEnum {
+  val NONE, POSTINC, PREDEC = newElement()
+}
+
 case class EaSpec() extends Bundle {
   val klass = EaClass()
   val reg   = UInt(5 bits)    // full reg id: Dn=0..7, An=8..15, temps 16/17 (valid for DATAREG/ADDRREG)
@@ -38,12 +47,18 @@ case class EaSpec() extends Bundle {
   val base      = UInt(5 bits)// base An reg id (when baseValid)
   val disp      = Bits(32 bits)// displacement / absolute address (final disp once pcRel folded)
   val pcRel     = Bool()      // (d16,PC): the assembler folds pc into `disp` (base=0)
+  // EA auto-update (predec/postinc, modes 4/3). NONE for every other EA. autoDelta is
+  // the An adjust in bytes (1/2/4, or 2 for a BYTE access on A7 to keep SP even); valid
+  // only when autoMode != NONE. The base An reg id is `base` (= 8+reg) with baseValid.
+  val autoMode  = EaAuto()
+  val autoDelta = UInt(3 bits)
 }
 object EaSpec {
   def illegalDefault(): EaSpec = {
     val e = EaSpec()
     e.klass := EaClass.ILLEGAL; e.reg := 0; e.imm := 0
     e.baseValid := False; e.base := 0; e.disp := 0; e.pcRel := False
+    e.autoMode := EaAuto.NONE; e.autoDelta := 0
     e
   }
 }
