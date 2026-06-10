@@ -283,7 +283,24 @@ object OperationDecoder {
         val isMuluW = (line === 0xC) && (opmode === 3)
         val isMulsW = (line === 0xC) && (opmode === 7)
         val isMulDiv = ((line === 0x8 || line === 0xC) && (opmode === 3 || opmode === 7))
-        when(isDivuW || isDivsW) {
+        // EXG (line C, bit8=1, opmode 5/6, reg-direct EA): 1100 xxx 1 ooooo yyy with
+        // ooooo in {01000 (Dx,Dy), 01001 (Ax,Ay), 10001 (Dx,Ay)}. EXG is fully cracked in
+        // the MicroOpAssembler (impl A, like RTS/RTR), so OperationDecoder only needs to
+        // keep these opwords NON-illegal (a benign MOVE placeholder the assembler overrides)
+        // so the assembler's `bad` does not fire. Without this guard they would fall into
+        // the AND-RMW branch (opmode 5/6) -> named AND -> illegalised by aluRmwMemBad
+        // (reg-direct EA != MEMSIMPLE). The assembler's isExgOp arm emits the real 3-µop
+        // crack and excludes EXG from `bad`.
+        val isExg = (line === 0xC) && opword(8) &&
+                    (opword(7 downto 3) === B"5'b01000" ||
+                     opword(7 downto 3) === B"5'b01001" ||
+                     opword(7 downto 3) === B"5'b10001")
+        when(isExg) {
+          // Benign placeholder: not illegal, no register effects here; the assembler
+          // builds the 3 MOVE µops (regA->T0 ; regB->regA ; T0->regB) from the opword.
+          o.illegal := False
+          o.op := DecOp.MOVE
+        } .elsewhen(isDivuW || isDivsW) {
           o.illegal := False
           o.op := DecOp.DIV
           o.cluster := Cluster.CPLX

@@ -337,7 +337,19 @@ object PredecodeWord {
         val isMulsW = (cls === U(0xC, 4 bits)) && (opmode === U(7, 3 bits)) && mulEaOk
         val isMulDiv = (cls === U(8, 4 bits) || cls === U(0xC, 4 bits)) &&
                        (opmode === U(3, 3 bits) || opmode === U(7, 3 bits))
-        when(isDivuW || isDivsW || isMuluW || isMulsW) {
+        // EXG (line C, bit8=1): 1100 xxx 1 ooooo yyy with ooooo in {01000,01001,10001}
+        // (EXG Dx,Dy / Ax,Ay / Dx,Ay). A single-word reg-reg swap (no extension) -> simple,
+        // len=1. EXG's opmode(8:6) is 5 (01000/01001) or 6 (10001), so it would otherwise
+        // hit the AND-RMW memDestExt path below with a reg-direct EA -> NOT MEMSIMPLE ->
+        // complex -> wrong length. Frame it BEFORE that band (it dominates the chain here).
+        val isExg = (cls === U(0xC, 4 bits)) && op(8) &&
+                    (op(7 downto 3) === B"5'b01000" ||   // EXG Dx,Dy
+                     op(7 downto 3) === B"5'b01001" ||   // EXG Ax,Ay
+                     op(7 downto 3) === B"5'b10001")      // EXG Dx,Ay
+        when(isExg) {
+          r.simple   := True
+          r.lenWords := U(1, 3 bits)
+        } elsewhen(isDivuW || isDivsW || isMuluW || isMulsW) {
           // 16-bit multiplier/divisor EA (sizeL = false: word operand size for #imm).
           val (ok, e) = eaExt(srcMode, srcReg, sizeL = False, allowImm = true)
           when(ok) {
