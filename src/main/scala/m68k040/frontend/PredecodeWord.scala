@@ -103,6 +103,23 @@ object PredecodeWord {
           }
           // SR dest (mode7/reg4 .W) / out-of-scope EAs -> COMPLEX (deferred)
         }
+        // ── Bit ops (BTST/BCHG/BCLR/BSET) ──────────────────────────────────────
+        // dynamic 0000 rrr 1 tt mmmrrr (bit8=1, NOT mode 001=MOVEP); static 0000 1000
+        // tt mmmrrr (bits 11:8 == 1000) + bit-number ext word. Dn dest (mode 0) -> 1
+        // (dynamic) / 2 (static, opword + bit word). Memory dest -> +EA ext (the bit
+        // word precedes the EA ext for the static form). An/#imm/MEMCOMPLEX -> COMPLEX
+        // (the assembler's illegal path). MOVEP (dynamic mode 001) stays COMPLEX.
+        val isDynBit  = bit8 && (mode =/= U(1, 3 bits))         // exclude MOVEP
+        val isStatBit = op(11 downto 8) === B"1000"            // opmode 4
+        val bitBase   = Mux(isStatBit, U(2, 3 bits), U(1, 3 bits))   // +1 for the static bit word
+        when(isDynBit || isStatBit) {
+          when(mode === U(0, 3 bits)) {                         // Dn dest (LONG)
+            r.simple := True; r.lenWords := bitBase
+          } otherwise {                                         // memory dest (BYTE) -> +EA ext
+            val (mok, mext) = memDestExt(mode, reg)
+            when(mok) { r.simple := True; r.lenWords := (bitBase + mext).resized }
+          }
+        }
       }
 
       // MOVE.B / MOVE.L / MOVE.W

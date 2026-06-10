@@ -115,6 +115,10 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // register), so consumers don't reach into the (now-pipelined) internal context.
     iq.lsWakeup.valid   := lsEu.wakeup.valid
     iq.lsWakeup.payload := lsEu.wakeup.payload
+    // Dynamic NZVC wakeup: a completing NZVC-writing LS store (MOVE-to-mem) wakes a
+    // flag-reader of its NZVC (e.g. a bit-op RMW µop). Mirrors the int load wakeup.
+    iq.lsNzvcWakeup.valid   := lsEu.wakeupNzvc.valid
+    iq.lsNzvcWakeup.payload := lsEu.wakeupNzvc.payload
     // ROB retire (slot 0) -> SQ commit; doFlush -> SQ flush (squash speculative).
     lsEu.sqCommit.valid   := rob.logic.retire0
     lsEu.sqCommit.payload := rob.logic.h0

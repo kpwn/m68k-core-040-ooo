@@ -81,7 +81,7 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x04B9) == cp(true,5))   // SUBI.L #imm,(xxx).L — opword + 2 imm + abs32
     assert(classify(0x0618) == cp(false,0))  // ADDI.B #imm,(A0)+ -> MEMCOMPLEX deferred
     assert(classify(0x00C0) == cp(false,0))  // ss=11 illegal size
-    assert(classify(0x0840) == cp(false,0))  // opmode 4 (BTST-imm / bit ops) — out of scope
+    assert(classify(0x0840) == cp(true,2))   // BCHG #n,D0 (static bit-op, opmode 4) — opword + bit word
   }
   test("DIVU.W/DIVS.W (class 8 opmode 3/7) + MULU.W/MULS.W (class C) -> simple; An-direct MUL EA complex") {
     assert(classify(0x80C1) == cp(true,1))   // DIVU.W D1,D0 (reg divisor, 1 word)

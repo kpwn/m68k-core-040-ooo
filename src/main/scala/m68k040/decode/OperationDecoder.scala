@@ -56,6 +56,30 @@ object OperationDecoder {
           when(opmode === 2 || opmode === 3) { o.writesNzvc := True; o.writesX := True }   // ADDI/SUBI
             .otherwise { o.writesNzvc := True }                                            // AND/OR/EOR/CMP
         }
+        // ── Bit ops (BTST/BCHG/BCLR/BSET) ──────────────────────────────────────
+        // dynamic 0000 rrr 1 tt mmmrrr (bit8=1, NOT mode 001=MOVEP); static 0000 1000
+        // tt mmmrrr (bits 11:8 == 1000). tt (bits 7:6): 00 BTST, 01 BCHG, 10 BCLR, 11
+        // BSET. The EA (op[5:0]) is the DESTINATION (tested + written, except BTST). The
+        // bit number is Dn (dynamic, bits 11:9) or the trailing ext word (static). The
+        // size/modulo is dest-dependent (Dn=LONG mod32, mem=BYTE mod8) -> the assembler
+        // resolves it. This does NOT match the immediates above (isImm needs !bit8 +
+        // opmode in {0,1,2,3,5,6}; static bit-op is opmode 4, dynamic is bit8=1).
+        val mode     = opword(5 downto 3)
+        val tt       = opword(7 downto 6)
+        val isDynBit = opword(8) && (mode =/= B"001")            // exclude MOVEP (mode 001)
+        val isStatBit= opword(11 downto 8) === B"1000"           // opmode 4 (bit8=0)
+        when(isDynBit || isStatBit) {
+          o.illegal := False
+          o.op    := DecOp.BITOP
+          o.bitOp := tt
+          o.srcA  := easrc                          // the destination operand (tested + written)
+          o.srcB  := Mux(isDynBit, dnField, immext) // bit number: Dn (dyn) or ext word (stat)
+          o.dst   := easrc
+          o.dstWrites := (tt =/= B"00")             // BTST writes nothing
+          o.readsNzvc  := True                      // the EU needs old N/V/C to preserve them
+          o.writesNzvc := True                      // Z computed; the EU preserves N/V/C (Z-only)
+          // size is dest-dependent (Dn=LONG, mem=BYTE) -> resolved in the assembler.
+        }
       }
       // ---- MOVEQ (0111 rrr0 dddddddd) ----
       is(0x7) {

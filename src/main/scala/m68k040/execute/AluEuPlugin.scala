@@ -139,6 +139,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     cmd.src2    := s1Src2
     cmd.xIn     := s1X                    // current X (NEGX: 0 - Dn - X)
     cmd.extByte := u1.extByte             // EXT/EXTB byte-source marker
+    cmd.bitOp   := u1.bitOp               // BTST/BCHG/BCLR/BSET sub-kind
     val rsp = AluDatapath(cmd)
 
     // ── NEGX: the 68k extended-arith Z is CLEAR-ONLY ────────────────────────────
@@ -149,7 +150,14 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val isNegx   = u1.op === DecOp.NEGX
     val negxZ    = rsp.nzvc(2) && s1Nzvc(2)
     val negxNzvc = rsp.nzvc(3) ## negxZ ## rsp.nzvc(1 downto 0)
-    val aluNzvc  = Mux(isNegx, negxNzvc, rsp.nzvc)
+
+    // ── BITOP: Z-only flag write (preserve N/V/C; X untouched) ──────────────────
+    // Bit-ops set ONLY Z (= the tested bit's complement, in rsp.nzvc(2)); N/V/C come
+    // from the OLD CCR (s1Nzvc — BITOP readsNzvc, so it holds the old flags). X is not
+    // written (writesX=False). Same shallow merge mechanism as NEGX's partial Z.
+    val isBitOp  = u1.op === DecOp.BITOP
+    val bitNzvc  = s1Nzvc(3) ## rsp.nzvc(2) ## s1Nzvc(1) ## s1Nzvc(0)   // {N_old, Z, V_old, C_old}
+    val aluNzvc  = Mux(isBitOp, bitNzvc, Mux(isNegx, negxNzvc, rsp.nzvc))
 
     // ---- S1: size-merge of the FAST int writeback (68k partial-register semantics) ----
     // A .B / .W op updates ONLY the low byte / word of the destination register; the

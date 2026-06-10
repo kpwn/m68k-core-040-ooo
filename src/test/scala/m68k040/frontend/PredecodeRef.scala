@@ -58,13 +58,26 @@ object PredecodeRef {
         val immWords = ss match { case 0 | 1 => 1; case 2 => 2; case _ => -1 }  // -1 = illegal size
         val isToCcr = mode == 7 && reg == 4 && ss == 0           // ANDI/ORI/EORI #imm,CCR (byte)
         val ccrOk   = opmode == 0 || opmode == 1 || opmode == 5  // ANDI/ORI/EORI only (to CCR)
-        if (!isImmOp || immWords < 0) COMPLEX
-        else if (isToCcr) { if (ccrOk) CP(simple = true, lenWords = 1 + 1) else COMPLEX }
-        else if (mode == 0) CP(simple = true, lenWords = 1 + immWords)  // data-reg dest
-        else memDestExt(mode, reg) match {                        // mem-dest RMW (imm + EA ext)
-          case Some(e) => CP(simple = true, lenWords = 1 + immWords + e)
-          case None    => COMPLEX                                 // SR / out-of-scope -> deferred
-        }
+        // Bit ops: dynamic 0000 rrr 1 tt mmmrrr (bit8=1, NOT mode 001=MOVEP); static
+        // 0000 1000 tt mmmrrr (bits 11:8 == 1000) + bit-number word. Dn dest -> 1
+        // (dynamic) / 2 (static); memory -> +EA ext. An/#imm/MEMCOMPLEX -> COMPLEX.
+        val isDynBit  = bit8 == 1 && mode != 1                   // exclude MOVEP (mode 001)
+        val isStatBit = ((op >> 8) & 0xf) == 0x8                 // opmode 4
+        val bitBase   = if (isStatBit) 2 else 1                  // +1 for the static bit word
+        if (isImmOp && immWords >= 0) {
+          if (isToCcr) { if (ccrOk) CP(simple = true, lenWords = 1 + 1) else COMPLEX }
+          else if (mode == 0) CP(simple = true, lenWords = 1 + immWords)  // data-reg dest
+          else memDestExt(mode, reg) match {                      // mem-dest RMW (imm + EA ext)
+            case Some(e) => CP(simple = true, lenWords = 1 + immWords + e)
+            case None    => COMPLEX                               // SR / out-of-scope -> deferred
+          }
+        } else if (isDynBit || isStatBit) {
+          if (mode == 0) CP(simple = true, lenWords = bitBase)    // Dn dest (LONG)
+          else memDestExt(mode, reg) match {                      // memory dest (BYTE) -> +EA ext
+            case Some(e) => CP(simple = true, lenWords = bitBase + e)
+            case None    => COMPLEX                               // An/#imm/MEMCOMPLEX -> deferred
+          }
+        } else COMPLEX
       case 0x1 | 0x2 | 0x3 =>
         val sizeL   = cls == 0x2
         val srcMode = (op >> 3) & 7; val srcReg = op & 7

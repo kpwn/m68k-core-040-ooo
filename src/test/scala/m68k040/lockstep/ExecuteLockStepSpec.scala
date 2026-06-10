@@ -127,6 +127,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // before its real producing load lands. Gate on pdstValid.
       iq.lsWakeup.valid   := lsEu.wakeup.valid
       iq.lsWakeup.payload := lsEu.wakeup.payload
+      iq.lsNzvcWakeup.valid   := lsEu.wakeupNzvc.valid
+      iq.lsNzvcWakeup.payload := lsEu.wakeupNzvc.payload
       // ROB retire (slot 0) -> SQ commit; doFlush -> SQ flush (squash speculative).
       lsEu.sqCommit.valid   := rob.logic.retire0
       lsEu.sqCommit.payload := rob.logic.h0
@@ -1300,6 +1302,119 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     runLockStep("rmw-abs",
       "move.l #0x0000000a,%d1 ; move.l #0x3000,%a2 ; move.l %d1,(%a2) ; subi.l #4,0x3000 ; " +
       ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L))   // (xxx).L abs -> 6 at 0x3000
+  }
+
+  // ── Bit ops (BTST/BSET/BCLR/BCHG) lock-step ────────────────────────────────
+  // {BTST,BSET,BCLR,BCHG} × {static #n, dynamic Dn} × {Dn-dest LONG, memory-dest BYTE},
+  // with bit-number edges (0,7,31,32->mod32; 33,63->mod32; 8->mod8 byte). Each tests bit
+  // n -> Z = ~bit; all but BTST then set/clear/toggle it. Dn = full LONG (mod 32); memory
+  // = BYTE (mod 8): BTST load-only (NO store), BSET/BCLR/BCHG mem-RMW. Flags = Z ONLY;
+  // N/V/C/X preserved. checkMem verifies the byte RMW (and BTST's NO-store).
+
+  // ── static #n, Dn dest (LONG, mod 32) — bit edges ──────────────────────────
+  test("lock-step: BSET/BCLR/BCHG/BTST #n,Dn (static, bit 0)", VerilatorTest) {
+    runLockStep("bit-static-dn-0",
+      "move.l #0x00000000,%d0 ; bset #0,%d0 ; "  +  // -> bit0 set, Z=1 (was 0)
+      "move.l #0xffffffff,%d1 ; bclr #0,%d1 ; "  +  // -> bit0 clear, Z=0
+      "move.l #0x00000001,%d2 ; bchg #0,%d2 ; "  +  // -> bit0 toggled, Z=0
+      "move.l #0x00000000,%d3 ; btst #0,%d3 ; "  +  // -> Z=1, no write
+      ".stop: bra .stop", nInstr = 9)
+  }
+  test("lock-step: BSET/BCLR/BCHG/BTST #7,Dn (static, bit 7)", VerilatorTest) {
+    runLockStep("bit-static-dn-7",
+      "move.l #0x11223344,%d0 ; bset #7,%d0 ; "  +
+      "move.l #0x11223388,%d1 ; bclr #7,%d1 ; "  +
+      "move.l #0x11223344,%d2 ; bchg #7,%d2 ; "  +
+      "move.l #0x11223380,%d3 ; btst #7,%d3 ; "  +
+      ".stop: bra .stop", nInstr = 9)
+  }
+  test("lock-step: BSET/BCLR/BCHG/BTST #31,Dn (static, top bit)", VerilatorTest) {
+    runLockStep("bit-static-dn-31",
+      "move.l #0x00000000,%d0 ; bset #31,%d0 ; " +  // -> 0x80000000
+      "move.l #0xffffffff,%d1 ; bclr #31,%d1 ; " +  // -> 0x7fffffff
+      "move.l #0x00000000,%d2 ; bchg #31,%d2 ; " +  // -> 0x80000000
+      "move.l #0x80000000,%d3 ; btst #31,%d3 ; " +  // -> Z=0
+      ".stop: bra .stop", nInstr = 9)
+  }
+  test("lock-step: BSET/BTST #32,Dn (static, mod 32 -> bit 0)", VerilatorTest) {
+    runLockStep("bit-static-dn-32",
+      "move.l #0x00000000,%d0 ; bset #32,%d0 ; " +  // 32 mod 32 = 0 -> bit0 set
+      "move.l #0x00000001,%d1 ; btst #32,%d1 ; " +  // bit0=1 -> Z=0
+      ".stop: bra .stop", nInstr = 5)
+  }
+
+  // ── dynamic Dn, Dn dest (LONG, mod 32) — bit edges incl. >31 ───────────────
+  test("lock-step: BSET/BCLR/BCHG/BTST Dc,Dn (dynamic, c=3)", VerilatorTest) {
+    runLockStep("bit-dyn-dn-3",
+      "moveq #3,%d7 ; "                          +
+      "move.l #0x00000000,%d0 ; bset %d7,%d0 ; " +  // bit3 set
+      "move.l #0xffffffff,%d1 ; bclr %d7,%d1 ; " +  // bit3 clear
+      "move.l #0x00000008,%d2 ; bchg %d7,%d2 ; " +  // bit3 toggle -> 0
+      "move.l #0x00000000,%d3 ; btst %d7,%d3 ; " +  // Z=1
+      ".stop: bra .stop", nInstr = 10)
+  }
+  test("lock-step: BSET/BTST Dc,Dn (dynamic, c=31)", VerilatorTest) {
+    runLockStep("bit-dyn-dn-31",
+      "moveq #31,%d7 ; "                         +
+      "move.l #0x00000000,%d0 ; bset %d7,%d0 ; " +  // -> 0x80000000
+      "move.l #0x80000000,%d1 ; btst %d7,%d1 ; " +  // Z=0
+      ".stop: bra .stop", nInstr = 5)
+  }
+  test("lock-step: BSET/BTST Dc,Dn (dynamic, c=33 -> mod32 bit 1)", VerilatorTest) {
+    runLockStep("bit-dyn-dn-33",
+      "moveq #33,%d7 ; "                         +
+      "move.l #0x00000000,%d0 ; bset %d7,%d0 ; " +  // 33 mod 32 = 1 -> bit1 set (0x2)
+      "move.l #0x00000002,%d1 ; btst %d7,%d1 ; " +  // bit1=1 -> Z=0
+      ".stop: bra .stop", nInstr = 5)
+  }
+  test("lock-step: BCHG Dc,Dn (dynamic, c=63 -> mod32 bit 31)", VerilatorTest) {
+    runLockStep("bit-dyn-dn-63",
+      "move.l #63,%d7 ; "                        +  // 63 mod 32 = 31
+      "move.l #0x00000000,%d0 ; bchg %d7,%d0 ; " +  // -> 0x80000000
+      ".stop: bra .stop", nInstr = 3)
+  }
+
+  // ── memory dest (BYTE, mod 8): BSET/BCLR/BCHG = RMW; BTST = load-only NO store ──
+  test("lock-step: BSET.B #n,(An) (mem RMW byte)", VerilatorTest) {
+    runLockStep("bit-mem-bset",
+      "move.l #0x11223300,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; bset #0,(%a0) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 4)  // byte 0x00 -> 0x01, Z was 1
+  }
+  test("lock-step: BCLR.B #7,(An) (mem RMW byte)", VerilatorTest) {
+    runLockStep("bit-mem-bclr",
+      "move.l #0x112233ff,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; bclr #7,(%a0) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 4)  // byte 0xff bit7 clear -> 0x7f
+  }
+  test("lock-step: BCHG.B #n,(An) (mem RMW byte)", VerilatorTest) {
+    runLockStep("bit-mem-bchg",
+      "move.l #0x11223355,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; bchg #1,(%a0) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 4)  // byte 0x55 bit1 toggle -> 0x57
+  }
+  test("lock-step: BTST #n,(An) (mem load-only, NO store)", VerilatorTest) {
+    runLockStep("bit-mem-btst",
+      "move.l #0x11223380,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; btst #7,(%a0) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 4)  // byte 0x80 bit7=1 -> Z=0, mem unchanged
+  }
+  test("lock-step: BSET.B #8,(An) (mem, 8 mod 8 -> bit 0)", VerilatorTest) {
+    runLockStep("bit-mem-bset-8",
+      "move.l #0x11223300,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; bset #8,(%a0) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L), checkSpan = 4)  // 8 mod 8 = 0 -> byte 0x00->0x01
+  }
+  test("lock-step: BSET %d1,(An) (dynamic mem RMW byte)", VerilatorTest) {
+    runLockStep("bit-mem-dyn-bset",
+      "moveq #3,%d1 ; move.l #0x11223300,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; bset %d1,(%a0) ; " +
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L), checkSpan = 4)  // byte 0x00 bit3 set -> 0x08
+  }
+
+  // ── flag preservation: a bit-op changes Z ONLY; N/V/C/X preserved ──────────
+  // Pre-set N/V/C/X via a prior addq overflow + carry, then a bit-op: Z flips, the
+  // other CCR bits hold. (subi.b #1 on 0 sets C/X/N; the following bset only sets Z.)
+  test("lock-step: bit-op preserves N/V/C/X (only Z changes)", VerilatorTest) {
+    runLockStep("bit-flags-preserve",
+      "moveq #0,%d1 ; subi.b #1,%d1 ; "          +  // 0-1 -> 0xff, sets N=1,C=1,X=1,V=0,Z=0
+      "move.l #0x00000000,%d0 ; bset #5,%d0 ; "  +  // bit5 was 0 -> Z=1; N/V/C/X unchanged
+      "move.l #0x00000020,%d2 ; btst #5,%d2 ; "  +  // bit5=1 -> Z=0; N/V/C/X still unchanged
+      ".stop: bra .stop", nInstr = 6)
   }
 
   // ── Branch lock-step (2-byte short branches) ──────────────────────────────

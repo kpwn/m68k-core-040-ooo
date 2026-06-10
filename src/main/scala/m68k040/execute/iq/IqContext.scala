@@ -28,6 +28,13 @@ trait IssueQueueService {
   /** Dynamic-completion wakeup (variant A): the LS EU broadcasts the pdst of a
     * just-completed load; slots reading that physreg become ready. */
   def lsWakeup: Flow[UInt]
+  /** Dynamic-completion NZVC wakeup: the LS EU broadcasts the pNzvcDst of a
+    * just-completed NZVC-writing store (a MOVE-to-memory store) or RTR CCR-restore;
+    * a flag-reader of that NZVC becomes ready. Separate from lsWakeup (int pdst): an LS
+    * op can write BOTH an int reg AND NZVC, and a reader may depend on one or the other
+    * or both. The static IQ scoreboard cannot clear an LS-produced NZVC (an LS op issues
+    * on the LS port, generating no static latency-1 ALU/branch wakeup event). */
+  def lsNzvcWakeup: Flow[UInt]
   /** Dynamic-completion wakeup for the CPLX cluster (DivEu): a multi-cycle DIV
     * broadcasts the pdst of its just-completed quotient/remainder; slots reading
     * that physreg become ready. Separate Flow from lsWakeup so a same-cycle LS load
