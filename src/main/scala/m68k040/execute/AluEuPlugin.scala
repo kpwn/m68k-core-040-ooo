@@ -142,14 +142,15 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     cmd.bitOp   := u1.bitOp               // BTST/BCHG/BCLR/BSET sub-kind
     val rsp = AluDatapath(cmd)
 
-    // ── NEGX: the 68k extended-arith Z is CLEAR-ONLY ────────────────────────────
-    // Z := Z_old && (result == 0). NEGX reads NZVC (-> s1Nzvc holds the old CCR), so the
-    // old Z is s1Nzvc(2). The datapath produced the raw Z (rsp.nzvc(2)); AND it with the
-    // old Z so a zero result PRESERVES a prior Z=0 (only clears, never sets, Z). The
-    // other NZVC bits (N/V/C) and X are unchanged from the datapath.
-    val isNegx   = u1.op === DecOp.NEGX
-    val negxZ    = rsp.nzvc(2) && s1Nzvc(2)
-    val negxNzvc = rsp.nzvc(3) ## negxZ ## rsp.nzvc(1 downto 0)
+    // ── Extended-arith family (NEGX/ADDX/SUBX): the 68k Z is CLEAR-ONLY ─────────
+    // Z := Z_old && (result == 0). These ops read NZVC (-> s1Nzvc holds the old CCR), so
+    // the old Z is s1Nzvc(2). The datapath produced the raw Z (rsp.nzvc(2)); AND it with
+    // the old Z so a zero result PRESERVES a prior Z=0 (only clears, never sets, Z) — the
+    // multi-precision rule. N/V/C and X are unchanged from the datapath (X = carry/borrow
+    // out). ADDX/SUBX reuse NEGX's merge verbatim (all three set readsNzvc).
+    val isExtended = (u1.op === DecOp.NEGX) || (u1.op === DecOp.ADDX) || (u1.op === DecOp.SUBX)
+    val extZ       = rsp.nzvc(2) && s1Nzvc(2)
+    val extNzvc    = rsp.nzvc(3) ## extZ ## rsp.nzvc(1 downto 0)
 
     // ── BITOP: Z-only flag write (preserve N/V/C; X untouched) ──────────────────
     // Bit-ops set ONLY Z (= the tested bit's complement, in rsp.nzvc(2)); N/V/C come
@@ -157,7 +158,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // written (writesX=False). Same shallow merge mechanism as NEGX's partial Z.
     val isBitOp  = u1.op === DecOp.BITOP
     val bitNzvc  = s1Nzvc(3) ## rsp.nzvc(2) ## s1Nzvc(1) ## s1Nzvc(0)   // {N_old, Z, V_old, C_old}
-    val aluNzvc  = Mux(isBitOp, bitNzvc, Mux(isNegx, negxNzvc, rsp.nzvc))
+    val aluNzvc  = Mux(isBitOp, bitNzvc, Mux(isExtended, extNzvc, rsp.nzvc))
 
     // ---- S1: size-merge of the FAST int writeback (68k partial-register semantics) ----
     // A .B / .W op updates ONLY the low byte / word of the destination register; the
