@@ -547,8 +547,15 @@ object MicroOpAssembler {
     // stack-frame ops cracked below (NOT illegal). op[15:4]==0x4E5, op[3] selects.
     val isLinkOp = (op(15 downto 4) === B"12'h4E5") && !op(3)
     val isUnlkOp = (op(15 downto 4) === B"12'h4E5") &&  op(3)
+    // EXG (line C, bit8=1, opmode in {01000,01001,10001}): a reg-reg swap cracked below
+    // into 3 MOVE µops. Its opmode lands in the AND-RMW band (5/6) with a reg-direct EA,
+    // which aluRmwMemBad would illegalise -> exclude from `bad` (mirror !isRtrBad).
+    val isExgDD = (op(15 downto 12) === B"4'hC") && op(8) && (op(7 downto 3) === B"5'b01000") // EXG Dx,Dy
+    val isExgAA = (op(15 downto 12) === B"4'hC") && op(8) && (op(7 downto 3) === B"5'b01001") // EXG Ax,Ay
+    val isExgDA = (op(15 downto 12) === B"4'hC") && op(8) && (op(7 downto 3) === B"5'b10001") // EXG Dx,Ay
+    val isExgOp = isExgDD || isExgAA || isExgDA
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
-              !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isUnlkOp &&
+              !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isUnlkOp && !isExgOp &&
               (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
                line4UnaryMemBad || aluRmwMemBad || bitOpMemBad ||
                (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
@@ -1099,6 +1106,30 @@ object MicroOpAssembler {
     val unlkAn   = mkUop(srcBReg = U(T0, 5 bits), srcBValid = True,        // MOVE T0 -> An
                          dstReg = linkAn, dstValid = True, first = False)
 
+    // ── EXG (line C) — exchange two full-32 registers, NO flags. Cracked into 3 MOVE
+    // µops through int temp T0: [T0 := regA] [regA := regB] [regB := T0]. Each is a
+    // plain full-32 LONG MOVE (mkUop defaults: op=MOVE, INT, size=LONG, writesNzvc=False,
+    // writesX=False, isMovea=False) — the ALU MOVE result = srcB (the MOVE source is the
+    // srcB slot; srcA is the .B/.W partial-merge old-value source, unused for LONG). A
+    // MOVE.L to an An writes it full-32 with no flags (cf. unlkAn above) so the D/A reg-id
+    // mapping is the only subtlety. regA = bits-11:9 reg, regB = bits-2:0 reg:
+    //   EXG Dx,Dy: regA=D(op11:9),    regB=D(op2:0)
+    //   EXG Ax,Ay: regA=A(8+op11:9),  regB=A(8+op2:0)
+    //   EXG Dx,Ay: regA=D(op11:9),    regB=A(8+op2:0)
+    val exgRx   = op(11 downto 9).asUInt
+    val exgRy   = op(2 downto 0).asUInt
+    val exgRegA = Mux(isExgAA, (U(8, 5 bits) + exgRx).resized, exgRx.resize(5))            // A only for Ax,Ay
+    val exgRegB = Mux(isExgAA || isExgDA, (U(8, 5 bits) + exgRy).resized, exgRy.resize(5)) // A for Ax,Ay & Dx,Ay
+    // µ0 writes T0 (arch >= 16) -> the whitebox DROPS it as a temp-only write.
+    // µ1 writes regA (an arch reg 0..15) -> a SECOND architectural write for one oracle
+    // step. Mark it `divIsRem` (the generic ALU crack-DROP marker, like LINK's A7-fold):
+    // its commit OBSERVATION is dropped, but the regA write still lands in the PRF and is
+    // verified by a later instruction that reads regA (the DIVREM/Dr pattern). µ2 (regB)
+    // is the single KEPT architectural commit, carrying the EXG instruction's oracle step.
+    val exgU0 = mkUop(srcBReg = exgRegA, srcBValid = True, dstReg = U(T0, 5 bits), dstValid = True, first = True)
+    val exgU1 = mkUop(srcBReg = exgRegB, srcBValid = True, dstReg = exgRegA,       dstValid = True, first = False, divIsRem = True)
+    val exgU2 = mkUop(srcBReg = U(T0, 5 bits), srcBValid = True, dstReg = exgRegB, dstValid = True, first = False)
+
     // ── Sequence selection (each slot driven exactly once) ─────────────────────
     // pkt.fault  -> [op] (fetch fault delivery)
     // bad        -> [op] (count 1, op carries the illegal override)
@@ -1186,6 +1217,12 @@ object MicroOpAssembler {
       out.uops(0) := unlkLoad
       out.uops(1) := unlkA7
       out.uops(2) := unlkAn
+    } elsewhen(isExgOp) {
+      // EXG -> [MOVE.L regA -> T0] + [MOVE.L regB -> regA] + [MOVE.L T0 -> regB] (NO flags).
+      out.count   := 3
+      out.uops(0) := exgU0
+      out.uops(1) := exgU1
+      out.uops(2) := exgU2
     } elsewhen(crackStore) {
       out.count   := 1
       out.uops(0) := stUop

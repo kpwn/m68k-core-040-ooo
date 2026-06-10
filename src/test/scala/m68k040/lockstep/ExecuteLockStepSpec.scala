@@ -1701,6 +1701,61 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 10)
   }
 
+  // ── EXG (exchange two full-32 registers, NO flags) — 3-µop crack through T0 ──────
+  // EXG swaps the full 32 bits of two registers and sets NO condition codes. The
+  // lock-step compares ALL regs + CCR against Musashi every retired step, so a swapped
+  // reg-id (D-vs-A +8) diverges on the regs and a stray writesNzvc diverges on CCR.
+  test("lock-step: EXG Dx,Dy (data/data swap, distinct values)", VerilatorTest) {
+    // D0=0x11111111, D1=0x22222222 -> after EXG: D0=0x22222222, D1=0x11111111.
+    runLockStep("exg-dd",
+      "move.l #0x11111111,%d0 ; move.l #0x22222222,%d1 ; exg %d0,%d1 ; " +
+      "move.l %d0,%d2 ; move.l %d1,%d3 ; .stop: bra .stop",
+      nInstr = 5)
+  }
+
+  test("lock-step: EXG Ax,Ay (addr/addr full-32 swap)", VerilatorTest) {
+    // A0=0xDEAD0000, A1=0xBEEF1111 -> swapped. A2 := A0 confirms the full-32 An write.
+    runLockStep("exg-aa",
+      "move.l #0xDEAD0000,%a0 ; move.l #0xBEEF1111,%a1 ; exg %a0,%a1 ; " +
+      "move.l %a0,%d0 ; move.l %a1,%d1 ; .stop: bra .stop",
+      nInstr = 5)
+  }
+
+  test("lock-step: EXG Dx,Ay (mixed data/addr file mapping)", VerilatorTest) {
+    // D0=0x0A0A0A0A, A1=0xF0F0F0F0 -> after EXG: D0=0xF0F0F0F0, A1=0x0A0A0A0A.
+    runLockStep("exg-da",
+      "move.l #0x0A0A0A0A,%d0 ; move.l #0xF0F0F0F0,%a1 ; exg %d0,%a1 ; " +
+      "move.l %d0,%d2 ; move.l %a1,%d3 ; .stop: bra .stop",
+      nInstr = 5)
+  }
+
+  test("lock-step: EXG D3,D3 (same reg -> net unchanged)", VerilatorTest) {
+    // The historical same-arch-reg dual-write RAT hazard: D3 must be preserved.
+    runLockStep("exg-same",
+      "move.l #0x5A5A5A5A,%d3 ; exg %d3,%d3 ; move.l %d3,%d4 ; .stop: bra .stop",
+      nInstr = 3)
+  }
+
+  test("lock-step: EXG A7,A0 (stack pointer involved, SP still usable)", VerilatorTest) {
+    // A7 (SP) := 0x3010 (D-cache-backed), A0 := 0x1234 -> EXG swaps them (A7=0x1234,
+    // A0=0x3010). Then EXG back so A7 is a valid SP again, and a benign moveq confirms
+    // the core continues. The lock-step checks A7 + A0 each step.
+    runLockStep("exg-a7",
+      "move.l #0x3010,%a7 ; move.l #0x1234,%a0 ; exg %a7,%a0 ; " +
+      "exg %a7,%a0 ; moveq #7,%d0 ; .stop: bra .stop",
+      nInstr = 5)
+  }
+
+  test("lock-step: EXG preserves NZVC + X (flags set before the swap)", VerilatorTest) {
+    // Pre-set N/V/C/X via .B overflow (0x7f+1 -> N=1,V=1) and a carry (0xff+1 ->
+    // C=1,X=1,Z=1), then EXG. CCR (compared every step) must be UNCHANGED across EXG.
+    runLockStep("exg-flags",
+      "move.l #0x000000ff,%d0 ; addq.b #1,%d0 ; " +   // C,X,Z set
+      "move.l #0x44444444,%d1 ; move.l #0x55555555,%d2 ; " +
+      "exg %d1,%d2 ; move.l %d1,%d3 ; .stop: bra .stop",
+      nInstr = 6)
+  }
+
   test("lock-step: store.l then load.l same addr (drain race probe)", VerilatorTest) {
     // Isolation probe for the RTR flake: store a long to 0x2002 (a never-resident line),
     // space it, then load.l 0x2002 -> d7. If this flakes, the store->miss-load drain is

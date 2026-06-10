@@ -293,6 +293,16 @@ object OperationDecoder {
         // RMW path where the assembler rejects An-direct -> illegal (deferred w/ MOVEM).
         val eaMode     = opword(5 downto 3)
         val isAddxSubx = isRmw && (line === 0x9 || line === 0xD) && (eaMode === B"000")
+        // EXG (line C, bit8=1, reg-direct): 1100 xxx 1 ooooo yyy with ooooo in
+        // {01000 (Dx,Dy), 01001 (Ax,Ay), 10001 (Dx,Ay)}. Fully cracked in the
+        // MicroOpAssembler (impl A, like RTS/RTR); OperationDecoder only keeps these
+        // opwords NON-illegal (a benign MOVE placeholder the assembler's isExgOp arm
+        // overrides) so the assembler's `bad` does not fire. Checked BEFORE isMulDiv so an
+        // EXG whose Dx field happens to be opmode 3/7 is not mis-named MULU/MULS.
+        val isExg = (line === 0xC) && opword(8) &&
+                    (opword(7 downto 3) === B"5'b01000" ||
+                     opword(7 downto 3) === B"5'b01001" ||
+                     opword(7 downto 3) === B"5'b10001")
         when(isAddxSubx) {
           o.illegal := False
           o.op   := Mux(line === 0xD, DecOp.ADDX, DecOp.SUBX)
@@ -305,6 +315,11 @@ object OperationDecoder {
           o.writesNzvc := True; o.writesX := True   // NZVC + X (X = carry/borrow out)
           o.readsX     := True                      // X carry/borrow IN (like NEGX)
           o.readsNzvc  := True                      // old Z for the clear-only-Z merge
+        } .elsewhen(isExg) {
+          // Benign placeholder: not illegal, no register effects here; the assembler
+          // builds the 3 MOVE µops (regA->T0 ; regB->regA ; T0->regB) from the opword.
+          o.illegal := False
+          o.op := DecOp.MOVE
         } .elsewhen(isDivuW || isDivsW) {
           o.illegal := False
           o.op := DecOp.DIV
