@@ -1552,6 +1552,51 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 6)
   }
 
+  // ── LINK / UNLK (frame setup / teardown; reuse the call/return crack machinery) ──
+  // LINK An,#d: push old An to -(A7); An := A7 (new frame ptr); A7 += d.
+  // UNLK An:    A7 := An; An := mem[A7]; A7 += 4.
+  test("lock-step: link/unlk round trip (frame setup + teardown, checkMem pushed An)", VerilatorTest) {
+    // A6 := 0x2222 (a known frame-pointer value = the pushed word); A7 := 0x3010 (a
+    // D-cache-backed SP). LINK A6,#-8 pushes A6 to 0x300C, A6 := 0x300C, A7 := 0x3004.
+    // move A6->d0 validates LINK's An (= 0x300C). UNLK A6 restores A6 := mem[0x300C] =
+    // 0x2222 and A7 := 0x3010. move A6->d1 validates the restored An. checkMem 0x300C =
+    // the pushed old A6 (0x2222). Executed: move,move,link,move,unlk,move = 6.
+    runLockStep("link-unlk-rt",
+      "move.l #0x2222,%a6 ; move.l #0x3010,%a7 ; link %a6,#-8 ; move.l %a6,%d0 ; " +
+      "unlk %a6 ; move.l %a6,%d1 ; .stop: bra .stop",
+      nInstr = 6, checkMem = Seq(0x300CL))   // pushed old A6 = 0x00002222
+  }
+
+  test("lock-step: link positive disp (A7 grows up) + unlk", VerilatorTest) {
+    // LINK A5,#+16: push A5 to 0x300C, A5 := 0x300C, A7 := 0x3010+16 = 0x3020. UNLK A5
+    // restores A5 := mem[0x300C], A7 := 0x3010. d0/d1 read A5 after link / after unlk.
+    runLockStep("link-pos-disp",
+      "move.l #0xCAFE,%a5 ; move.l #0x3010,%a7 ; link %a5,#16 ; move.l %a5,%d0 ; " +
+      "unlk %a5 ; move.l %a5,%d1 ; .stop: bra .stop",
+      nInstr = 6, checkMem = Seq(0x300CL))   // pushed old A5 = 0x0000CAFE
+  }
+
+  test("lock-step: nested link/unlk (two frames, LIFO teardown)", VerilatorTest) {
+    // Two nested frames sharing A6 (the classic compiler prologue/epilogue). The OUTER
+    // A6 (0x1111) is pushed first; the INNER push saves the outer frame ptr. UNLK
+    // unwinds in LIFO order. Validates A6 + A7 across nested setup/teardown.
+    //   A6:=0x1111 ; A7:=0x3020 ;
+    //   link A6,#-4  (push 0x1111 @0x301C ; A6=0x301C ; A7=0x3018) ;
+    //   move A6->d0  (=0x301C) ;
+    //   link A6,#-4  (push 0x301C @0x3014 ; A6=0x3014 ; A7=0x3010) ;
+    //   move A6->d1  (=0x3014) ;
+    //   unlk A6      (A6:=mem[0x3014]=0x301C ; A7:=0x3018) ;
+    //   move A6->d2  (=0x301C) ;
+    //   unlk A6      (A6:=mem[0x301C]=0x1111 ; A7:=0x3020) ;
+    //   move A6->d3  (=0x1111).
+    // Executed: move,move,link,move,link,move,unlk,move,unlk,move = 10.
+    runLockStep("link-unlk-nested",
+      "move.l #0x1111,%a6 ; move.l #0x3020,%a7 ; " +
+      "link %a6,#-4 ; move.l %a6,%d0 ; link %a6,#-4 ; move.l %a6,%d1 ; " +
+      "unlk %a6 ; move.l %a6,%d2 ; unlk %a6 ; move.l %a6,%d3 ; .stop: bra .stop",
+      nInstr = 10)
+  }
+
   test("lock-step: store.l then load.l same addr (drain race probe)", VerilatorTest) {
     // Isolation probe for the RTR flake: store a long to 0x2002 (a never-resident line),
     // space it, then load.l 0x2002 -> d7. If this flakes, the store->miss-load drain is

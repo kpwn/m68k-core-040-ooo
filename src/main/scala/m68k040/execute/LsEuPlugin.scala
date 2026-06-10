@@ -185,10 +185,13 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // chained onto the ALU's result. (Latency-agnostic: lock-step is instruction-level
     // and the EU is single-outstanding.)
     val base0 = Mux(u0.psrcAValid, rdBase.data.asUInt, U(0, 32 bits))
-    // STORE DATA: `imm` (retPC) for a stack-push (BSR/JSR predecrement), else the
-    // (possibly bypassed) source register. Captured into `s1Data` at the boundary; it
-    // is NOT on the AGU cone (feeds only the SQ entry), so it stays a registered value.
-    val data0 = Mux(u0.stkPush, u0.imm, rdData.data)   // push: data = retPC (imm)
+    // STORE DATA: `imm` (retPC) for a BSR/JSR stack-push (predecrement, srcB invalid),
+    // else the (possibly bypassed) source register. A LINK push is ALSO a stkPush but
+    // carries the pushed register (the old An) in srcB (srcBValid), so it reads rdData
+    // — the `!u0.srcBValid` guard keeps the imm path for BSR/JSR while letting LINK push
+    // a register. Captured into `s1Data` at the boundary; it is NOT on the AGU cone
+    // (feeds only the SQ entry), so it stays a registered value.
+    val data0 = Mux(u0.stkPush && !u0.psrcBValid, u0.imm, rdData.data)   // push: retPC (imm) / LINK: old An (srcB)
 
     // ---- access size in bytes (1/2/4) ----
     // A single m68k access spans at most two 16-byte lines / two 4 KB pages, so a

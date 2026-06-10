@@ -140,7 +140,13 @@ object PredecodeRef {
         // are Dn-only (mode 000); TAS-mem deferred.
         val isUnaryMem = ((op >> 8) & 1) == 0 && u4ss != 3 && u4mode != 0 &&
                          (u4o == 0 || u4o == 2 || u4o == 4 || u4o == 6 || u4o == 0xA)
-        if (isTrap || isTrapv || isRts || isRtr) CP(simple = true, lenWords = 1)
+        // LINK An,#disp16 (op[15:4]==0x4E5, op[3]=0): opword + disp16 -> simple len 2.
+        // UNLK An (op[3]=1): single word -> simple len 1. (bit6=1 here -> not isChk.)
+        val isLink = (op & 0xfff8) == 0x4e50
+        val isUnlk = (op & 0xfff8) == 0x4e58
+        if (isLink) CP(simple = true, lenWords = 2)
+        else if (isUnlk) CP(simple = true, lenWords = 1)
+        else if (isTrap || isTrapv || isRts || isRtr) CP(simple = true, lenWords = 1)
         else if (isUnary) CP(simple = true, lenWords = 1)
         else if (isUnaryMem) memDestExt(u4mode, op & 7) match {
           case Some(e) => CP(simple = true, lenWords = 1 + e)

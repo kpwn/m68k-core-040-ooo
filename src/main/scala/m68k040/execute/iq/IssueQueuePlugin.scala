@@ -418,12 +418,16 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       (uop.psrcCValid && stillBusy(uop.psrcC))
     val lsDep0 = lsDepInit(pushUop0)
     val lsDep1Base = lsDepInit(pushUop1)
-    // Intra-push: slot1 reads slot0's dst and slot0 is an LS load -> slot1 waits.
-    val s0IsLsLoad = isLs(pushUop0) && (pushUop0.memOp === m68k040.isa.MemOp.LOAD) && pushUop0.pdstValid
+    // Intra-push: slot1 reads slot0's dst and slot0 is an LS INT producer -> slot1 waits
+    // (dynamic lsWait). An LS int producer = a LOAD (-> a reg) OR a stkPush STORE (whose
+    // int dst is the predecremented A7, e.g. LINK's push). BOTH complete via the LS port
+    // + broadcast lsWakeup (compWakes covers load AND stkPush), so BOTH are lsBusy-tracked
+    // (push0IsLs = isLs, store-inclusive) and BOTH must suppress the static int trigger.
+    val s0IsLsIntProd = isLs(pushUop0) && pushUop0.pdstValid
     val lsDep1 = lsDep1Base ||
-      (s0IsLsLoad && pushUop1.psrcAValid && (pushUop1.psrcA === pushUop0.pdst)) ||
-      (s0IsLsLoad && srcBIsReg(pushUop1) && (pushUop1.psrcB === pushUop0.pdst)) ||
-      (s0IsLsLoad && pushUop1.psrcCValid && (pushUop1.psrcC === pushUop0.pdst))
+      (s0IsLsIntProd && pushUop1.psrcAValid && (pushUop1.psrcA === pushUop0.pdst)) ||
+      (s0IsLsIntProd && srcBIsReg(pushUop1) && (pushUop1.psrcB === pushUop0.pdst)) ||
+      (s0IsLsIntProd && pushUop1.psrcCValid && (pushUop1.psrcC === pushUop0.pdst))
 
     // Push-time LS-NZVC dependency: does this uop READ an NZVC physreg produced by an
     // in-flight LS NZVC writer (a MOVE-to-memory store)? Same same-cycle-wakeup guard as
@@ -492,9 +496,13 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // producer (all latency>1, tracked dynamically via lsWait/cplxWait/aluSlowWait, not
     // static latency-1 triggers). For a shift this covers ALL THREE classes (int + NZVC
     // + X), since the shift writes all of them at lat2 (the aluSlowDep1 carries them).
-    val s0WritesInt  = pushUop0.pdstValid && !s0IsLsLoad && !s0IsCplxProd && !s0IsAluSlowProd
-    // Also suppress the static NZVC trigger for an LS NZVC producer (a MOVE-to-mem store):
-    // it issues on the LS port (no static event) -> its NZVC dep is carried by lsNzvcDep1.
+    // LS-int producer (a LOAD or a stkPush STORE's predecremented-A7 side-effect) issues on
+    // the LS port (no static int event) -> its int dep is carried dynamically (lsWait), not
+    // the static scoreboard [feat/link-unlk: broadened from LOAD-only s0IsLsLoad].
+    val s0WritesInt  = pushUop0.pdstValid && !s0IsLsIntProd && !s0IsCplxProd && !s0IsAluSlowProd
+    // Likewise suppress the static NZVC trigger for an LS NZVC producer (a MOVE-to-mem
+    // store): it issues on the LS port (no static event) -> its NZVC dep is carried by
+    // lsNzvcDep1 [feat/bit-ops: the latent LS-NZVC deadlock fix].
     val s0WritesNzvc = pushUop0.writesNzvc && !s0IsAluSlowProd && !s0IsLsNzvc
     val s0WritesX    = pushUop0.writesX    && !s0IsAluSlowProd
     when(s0WritesInt  && pushUop1.psrcAValid && pushUop1.psrcA === pushUop0.pdst)              { trig1(slot0Prio) := True }
