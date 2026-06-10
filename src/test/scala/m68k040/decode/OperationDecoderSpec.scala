@@ -133,8 +133,13 @@ class OperationDecoderSpec extends AnyFunSuite {
       assert(dut.o.writesNzvc.toBoolean && !dut.o.writesX.toBoolean && !dut.o.dstWrites.toBoolean)
     }
   }
-  test("line-0 opmode4 (bit/BTST-imm) -> illegal (out of scope)", VerilatorTest) {
-    run(0x0840) { dut => assert(dut.o.illegal.toBoolean) }
+  test("line-0 opmode4 static bit-op (0x0840 BCHG #imm,D0): BITOP, bitOp=01, not illegal", VerilatorTest) {
+    // opmode 4 (bits 11:8 == 1000) is the STATIC bit-op space (was illegal/out-of-scope
+    // before the bit-ops slice). tt = bits 7:6 = 01 -> BCHG.
+    run(0x0840) { dut =>
+      assert(dut.o.op.toEnum == DecOp.BITOP && !dut.o.illegal.toBoolean)
+      assert(dut.o.bitOp.toInt == 1)
+    }
   }
 
   // ── Line-E register-form shifts/rotates (1110 ccc d ss i tt rrr) ─────────────
