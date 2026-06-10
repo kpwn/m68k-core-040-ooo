@@ -38,4 +38,53 @@ class EaDecoderSpec extends AnyFunSuite {
     dut.eaField #= 0x10 /*mode2 (An)*/; dut.size #= Size.LONG; sleep(1)
     assert(dut.out0.klass.toEnum == EaClass.MEMSIMPLE)
   }}
+  // ── (An)+ postincrement (mode 3) ──────────────────────────────────────────────
+  test("(A2)+ .L -> MEMSIMPLE POSTINC base=A2 delta=4", VerilatorTest) { run { dut =>
+    dut.eaField #= 0x1A /*mode3 reg2*/; dut.size #= Size.LONG; sleep(1)
+    assert(dut.out0.klass.toEnum == EaClass.MEMSIMPLE)
+    assert(dut.out0.baseValid.toBoolean && dut.out0.base.toInt == 10)
+    assert(dut.out0.autoMode.toEnum == EaAuto.POSTINC && dut.out0.autoDelta.toInt == 4)
+  }}
+  test("(A2)+ .W -> POSTINC delta=2", VerilatorTest) { run { dut =>
+    dut.eaField #= 0x1A; dut.size #= Size.WORD; sleep(1)
+    assert(dut.out0.autoMode.toEnum == EaAuto.POSTINC && dut.out0.autoDelta.toInt == 2)
+  }}
+  test("(A2)+ .B -> POSTINC delta=1", VerilatorTest) { run { dut =>
+    dut.eaField #= 0x1A; dut.size #= Size.BYTE; sleep(1)
+    assert(dut.out0.autoMode.toEnum == EaAuto.POSTINC && dut.out0.autoDelta.toInt == 1)
+  }}
+  // ── -(An) predecrement (mode 4) ───────────────────────────────────────────────
+  test("-(A2) .L -> MEMSIMPLE PREDEC base=A2 delta=4", VerilatorTest) { run { dut =>
+    dut.eaField #= 0x22 /*mode4 reg2*/; dut.size #= Size.LONG; sleep(1)
+    assert(dut.out0.klass.toEnum == EaClass.MEMSIMPLE)
+    assert(dut.out0.baseValid.toBoolean && dut.out0.base.toInt == 10)
+    assert(dut.out0.autoMode.toEnum == EaAuto.PREDEC && dut.out0.autoDelta.toInt == 4)
+  }}
+  test("-(A2) .W -> PREDEC delta=2", VerilatorTest) { run { dut =>
+    dut.eaField #= 0x22; dut.size #= Size.WORD; sleep(1)
+    assert(dut.out0.autoMode.toEnum == EaAuto.PREDEC && dut.out0.autoDelta.toInt == 2)
+  }}
+  // ── A7 byte even-keeping rule (reg==7) ────────────────────────────────────────
+  test("-(A7) .B -> PREDEC delta=2 (keep SP even)", VerilatorTest) { run { dut =>
+    dut.eaField #= 0x27 /*mode4 reg7=A7*/; dut.size #= Size.BYTE; sleep(1)
+    assert(dut.out0.base.toInt == 15)
+    assert(dut.out0.autoMode.toEnum == EaAuto.PREDEC && dut.out0.autoDelta.toInt == 2)
+  }}
+  test("(A7)+ .B -> POSTINC delta=2 (keep SP even)", VerilatorTest) { run { dut =>
+    dut.eaField #= 0x1F /*mode3 reg7=A7*/; dut.size #= Size.BYTE; sleep(1)
+    assert(dut.out0.autoMode.toEnum == EaAuto.POSTINC && dut.out0.autoDelta.toInt == 2)
+  }}
+  test("(A7)+ .W -> POSTINC delta=2 (normal sizeBytes on A7)", VerilatorTest) { run { dut =>
+    dut.eaField #= 0x1F; dut.size #= Size.WORD; sleep(1)
+    assert(dut.out0.autoMode.toEnum == EaAuto.POSTINC && dut.out0.autoDelta.toInt == 2)
+  }}
+  test("-(A7) .L -> PREDEC delta=4 (normal sizeBytes on A7)", VerilatorTest) { run { dut =>
+    dut.eaField #= 0x27; dut.size #= Size.LONG; sleep(1)
+    assert(dut.out0.autoMode.toEnum == EaAuto.PREDEC && dut.out0.autoDelta.toInt == 4)
+  }}
+  // ── non-auto EAs leave autoMode NONE ──────────────────────────────────────────
+  test("(An) leaves autoMode NONE", VerilatorTest) { run { dut =>
+    dut.eaField #= 0x10; dut.size #= Size.LONG; sleep(1)
+    assert(dut.out0.autoMode.toEnum == EaAuto.NONE)
+  }}
 }
