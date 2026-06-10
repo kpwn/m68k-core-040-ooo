@@ -24,11 +24,14 @@ object PredecodeRef {
   }
   def isMem(mode: Int): Boolean = mode > 1   // not Dn(0)/An(1)
 
-  /** In-scope MEMSIMPLE RMW-DESTINATION EA ext: (An)=2 (0), (d16,An)=5 (1),
-    * (xxx).W=mode7/reg0 (1), (xxx).L=mode7/reg1 (2). Side-effect modes 3/4/6,
-    * (d16,PC) (read-only), and #imm are NOT in scope -> None (COMPLEX). */
+  /** In-scope MEMSIMPLE RMW-DESTINATION EA ext: (An)=2 (0), (An)+=3 (0), -(An)=4 (0),
+    * (d16,An)=5 (1), (xxx).W=mode7/reg0 (1), (xxx).L=mode7/reg1 (2). The predec/postinc
+    * auto modes carry no extension word (the An side-effect is folded by the crack).
+    * Indexed (mode 6 / 7-3), (d16,PC) (read-only), and #imm are NOT in scope -> None. */
   def memDestExt(mode: Int, reg: Int): Option[Int] = mode match {
     case 2 => Some(0)
+    case 3 => Some(0)
+    case 4 => Some(0)
     case 5 => Some(1)
     case 7 => reg match { case 0 => Some(1); case 1 => Some(2); case _ => None }
     case _ => None
@@ -90,10 +93,9 @@ object PredecodeRef {
         }
         if (se.isEmpty || de.isEmpty) COMPLEX
         else {
-          val srcMem = isMem(srcMode)
-          val dstMem = dstMode != 1 && isMem(dstMode)
-          if (srcMem && dstMem) COMPLEX
-          else CP(simple = true, lenWords = 1 + se.get + de.get)
+          // MOVE incl. mem-to-mem: the assembler cracks mem-to-mem into [load][store]
+          // (+ folded An auto-updates). len = opword + src ext + dst ext.
+          CP(simple = true, lenWords = 1 + se.get + de.get)
         }
       case 0x4 =>
         // TRAP #n (0x4E4x) / TRAPV (0x4E76): single-word, predecoded simple len-1 so
