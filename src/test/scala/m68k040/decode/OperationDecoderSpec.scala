@@ -60,8 +60,10 @@ class OperationDecoderSpec extends AnyFunSuite {
   // (srcA=EASRC dst operand, srcB=Dn, dst=EASRC, ADD writes NZVCX). The assembler gates
   // the EA — a memory EA cracks into load-op-store; a Dn/An/MEMCOMPLEX EA is illegalised
   // there (aluRmwMemBad). So OperationDecoder is NOT illegal for these opwords.
-  test("RMW form (ADD Dn->EA, opmode6) -> ADD named (EA gated in the assembler)", VerilatorTest) {
-    run(0xD181) { dut =>
+  // NOTE: use a MEMORY EA (0xD190 = ADD.L D0,(A0), mode 010) — the Dn-direct opmode-6 form
+  // (e.g. 0xD181) is now ADDX (the ADDX/SUBX slice claims line-9/D RMW + EA-mode-000).
+  test("RMW form (ADD.L D0,(A0), opmode6) -> ADD named (EA gated in the assembler)", VerilatorTest) {
+    run(0xD190) { dut =>
       assert(dut.o.op.toEnum == DecOp.ADD && !dut.o.illegal.toBoolean)
       assert(dut.o.srcA.kind.toEnum == OperandKind.EASRC && dut.o.dst.kind.toEnum == OperandKind.EASRC)
       assert(dut.o.srcB.kind.toEnum == OperandKind.REGFIELD)
