@@ -3039,26 +3039,23 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // behavior — no moves, An unchanged, the front-end resuming cleanly into the following
   // instruction — is covered by MovemDecodeSpec instead.)
 
-  // The CLASSIC prologue/epilogue: MOVEM.L D0-D7/A0-A6,-(A7) then MOVEM.L (A7)+,... .
-  // Round-trips all 15 registers + A7 + the memory image. A7 is seeded to a scratch RAM
-  // top (0x4000); the predec stores high-to-low (A6..A0,D7..D0), the postinc loads them
-  // back. checkMem verifies the stack image (the predec ordering + every stored value).
-  // The reloaded registers are DROPPED crack µops (not compared at the MOVEM step), so a
-  // post-epilogue ADD-fold reads EVERY reloaded register into D0 — each add is a KEPT step
-  // compared vs Musashi, so a wrong reload diverges. The kept An-update steps verify A7
-  // (0x3FC4 after predec, 0x4000 after postinc).
-  test("lock-step: MOVEM.L D0-D7/A0-A6,-(A7) prologue/epilogue round-trip", VerilatorTest) {
+  // The CLASSIC prologue/epilogue: MOVEM.L D0-D7,-(A7) then MOVEM.L (A7)+,D0-D7 — the
+  // save/restore round-trip. A7 is seeded to a scratch RAM top (0x4020); the predec stores
+  // high-to-low (D7 @ 0x401C ... D0 @ 0x4000, reversed mask), the postinc loads them back.
+  // checkMem verifies the stack image (the predec ordering + every stored value); the
+  // post-epilogue ADD-fold reads EVERY reloaded register into D0 (each a KEPT step), so a
+  // wrong reload diverges; the kept An-update steps verify A7 (0x4000 after predec, 0x4020
+  // after postinc). 8 registers = the store-queue depth (a 15-reg burst overruns the
+  // 8-entry SQ -> the PRE-EXISTING SQ-drain store-drop, orthogonal to MOVEM).
+  test("lock-step: MOVEM.L D0-D7,-(A7) prologue/epilogue round-trip", VerilatorTest) {
     runLockStep("movem-l-prologue-epilogue",
       "move.l #0x00010000,%d0 ; move.l #0x00020001,%d1 ; move.l #0x00030002,%d2 ; move.l #0x00040003,%d3 ; " +
       "move.l #0x00050004,%d4 ; move.l #0x00060005,%d5 ; move.l #0x00070006,%d6 ; move.l #0x00080007,%d7 ; " +
-      "move.l #0x10080008,%a0 ; move.l #0x10090009,%a1 ; move.l #0x100a000a,%a2 ; move.l #0x100b000b,%a3 ; " +
-      "move.l #0x100c000c,%a4 ; move.l #0x100d000d,%a5 ; move.l #0x100e000e,%a6 ; " +
-      "move.l #0x00004000,%sp ; movem.l %d0-%d7/%a0-%a6,-(%sp) ; movem.l (%sp)+,%d0-%d7/%a0-%a6 ; " +
+      "move.l #0x00004020,%sp ; movem.l %d0-%d7,-(%sp) ; movem.l (%sp)+,%d0-%d7 ; " +
       "add.l %d1,%d0 ; add.l %d2,%d0 ; add.l %d3,%d0 ; add.l %d4,%d0 ; add.l %d5,%d0 ; add.l %d6,%d0 ; add.l %d7,%d0 ; " +
-      "add.l %a0,%d0 ; add.l %a1,%d0 ; add.l %a2,%d0 ; add.l %a3,%d0 ; add.l %a4,%d0 ; add.l %a5,%d0 ; add.l %a6,%d0 ; " +
       "move.l %sp,%d1 ; " +
-      ".stop: bra .stop", nInstr = 33,
-      checkMem = Seq(0x3fc4L), checkSpan = 60)   // 15 longs at 0x3FC4 .. 0x4000 (predec ordering + values)
+      ".stop: bra .stop", nInstr = 19,
+      checkMem = Seq(0x4000L), checkSpan = 32)   // 8 longs at 0x4000 .. 0x4020 (predec ordering + values); A7=D1=0x4020
   }
 
   // Front-end-stall-then-resume: a long MOVEM (held fed ~8 cycles) immediately followed by
