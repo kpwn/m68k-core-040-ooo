@@ -1066,7 +1066,9 @@ object MicroOpAssembler {
                          useImm = True, imm = B(0, 32 bits),
                          dstReg = U(T0, 5 bits), dstValid = True, first = True)
     val unlkA7   = addUop(linkAn, B(4, 32 bits), U(A7, 5 bits), first = False, drop = True)
-    val unlkAn   = mkUop(srcAReg = U(T0, 5 bits), srcAValid = True,        // MOVE T0 -> An
+    // MOVE T0 -> An: the ALU MOVE takes its moved value from src2 (= srcB), NOT srcA
+    // (srcA is the .B/.W partial-merge OLD-value source). LONG move -> no merge, srcB only.
+    val unlkAn   = mkUop(srcBReg = U(T0, 5 bits), srcBValid = True,        // MOVE T0 -> An
                          dstReg = linkAn, dstValid = True, first = False)
 
     // ── Sequence selection (each slot driven exactly once) ─────────────────────

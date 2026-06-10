@@ -82,7 +82,7 @@ class LinkUnlkDecodeSpec extends AnyFunSuite {
       assert((dut.uop1.imm.toLong & 0xffffffffL) == 4L && dut.uop1.divIsRem.toBoolean)
       assert(!dut.uop1.writesNzvc.toBoolean && !dut.uop1.firstOfInstr.toBoolean)
       // µop2: A6 := T0. KEPT (MOVE).
-      assert(dut.uop2.op.toEnum == DecOp.MOVE && dut.uop2.srcAReg.toInt == T0 && dut.uop2.dstReg.toInt == 14)
+      assert(dut.uop2.op.toEnum == DecOp.MOVE && dut.uop2.srcBReg.toInt == T0 && dut.uop2.srcBValid.toBoolean && dut.uop2.dstReg.toInt == 14)
       assert(dut.uop2.dstValid.toBoolean && !dut.uop2.divIsRem.toBoolean && !dut.uop2.firstOfInstr.toBoolean)
     }
   }
