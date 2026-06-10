@@ -23,6 +23,12 @@ trait LsEuService {
   // completes and its data is in the PRF. Registered alongside the completion stage
   // so consumers do not have to reach into the (now-pipelined) internal s1 context.
   def wakeup: Flow[UInt]       // pdst of a completing load (valid only when it writes a reg)
+  // Dynamic NZVC-wakeup broadcast: valid (with the produced pNzvcDst) the cycle a STORE
+  // that writes NZVC (a MOVE-to-memory store) — or an RTR CCR-restore — completes and
+  // its NZVC is in the PRF. A flag-reader (e.g. a bit-op's RMW µop) of such an in-flight
+  // LS-produced NZVC waits on this (the static IQ scoreboard cannot clear it: an LS op
+  // issues on the LS port, generating no static latency-1 ALU/branch wakeup event).
+  def wakeupNzvc: Flow[UInt]   // pNzvcDst of a completing NZVC-writing LS op
   // robId of the access currently being translated (tags a DTLB walk's deferred U/M
   // descriptor write so it drains at THAT instruction's commit).
   def xlateRobId: UInt
@@ -63,6 +69,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   var sqCommitPort: Flow[UInt]     = null
   var sqFlushSig: Bool             = null
   var wakeupPort: Flow[UInt]       = null
+  var wakeupNzvcPort: Flow[UInt]   = null
   var faultCompletionPort: Flow[LsFault] = null
   var rdBase, rdData: RegFileReadPort = null
   var intW: RegFileWritePort = null
@@ -78,6 +85,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   override def sqCommit: Flow[UInt]     = sqCommitPort
   override def sqFlush: Bool            = sqFlushSig
   override def wakeup: Flow[UInt]       = wakeupPort
+  override def wakeupNzvc: Flow[UInt]   = wakeupNzvcPort
   override def faultCompletion: Flow[LsFault] = faultCompletionPort
   var xlateRobIdSig: UInt = null
   override def xlateRobId: UInt         = xlateRobIdSig
@@ -108,6 +116,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sqCommitPort   = Flow(UInt(6 bits))
     sqFlushSig     = Bool()
     wakeupPort     = Flow(UInt(6 bits))
+    wakeupNzvcPort = Flow(UInt(4 bits))   // pNzvcDst of a completing NZVC-writing LS op
     faultCompletionPort = Flow(LsFault()); faultCompletionPort.simPublic()
     xlateRobIdSig  = UInt(6 bits)
     val irf = host[IntRegFileService]
@@ -544,6 +553,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // int physreg) broadcasts; a plain store completes too but writes no register.
     wakeupPort.valid   := compValid && compWakes && compPdstValid && !compIsFault
     wakeupPort.payload := compPdst
+    // Dynamic NZVC-wakeup: a completing NZVC-writing LS op (a MOVE-to-memory store or an
+    // RTR CCR-restore) broadcasts its pNzvcDst the cycle its NZVC lands in the PRF. The IQ
+    // holds a flag-reader of that NZVC until this fires (the static scoreboard cannot —
+    // an LS op generates no static ALU/branch wakeup event).
+    wakeupNzvcPort.valid   := compValid && compNzvcWrite && !compIsFault
+    wakeupNzvcPort.payload := compNzvcDst
     // MMU access-fault completion (registered, alongside the comp* stage).
     faultCompletionPort.valid           := compValid && compIsFault
     faultCompletionPort.payload.robId   := compRobId

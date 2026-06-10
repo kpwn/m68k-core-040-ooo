@@ -107,6 +107,8 @@ class IpcBenchSpec extends AnyFunSuite {
       }
       iq.lsWakeup.valid   := lsEu.wakeup.valid
       iq.lsWakeup.payload := lsEu.wakeup.payload
+      iq.lsNzvcWakeup.valid   := lsEu.wakeupNzvc.valid
+      iq.lsNzvcWakeup.payload := lsEu.wakeupNzvc.payload
       lsEu.sqCommit.valid   := rob.logic.retire0
       lsEu.sqCommit.payload := rob.logic.h0
       lsEu.sqFlush          := host[RedirectService].doFlush
