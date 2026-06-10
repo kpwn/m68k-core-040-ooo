@@ -515,8 +515,12 @@ object MicroOpAssembler {
     // RTS (0x4E75) / RTR (0x4E77) are line-4 returns cracked below (NOT illegal).
     val isRtsBad = (op === B"16'h4E75")
     val isRtrBad = (op === B"16'h4E77")
+    // LINK An,#disp16 (0100 1110 0101 0aaa) / UNLK An (0100 1110 0101 1aaa): line-4
+    // stack-frame ops cracked below (NOT illegal). op[15:4]==0x4E5, op[3] selects.
+    val isLinkOp = (op(15 downto 4) === B"12'h4E5") && !op(3)
+    val isUnlkOp = (op(15 downto 4) === B"12'h4E5") &&  op(3)
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
-              !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp &&
+              !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isUnlkOp &&
               (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
                line4UnaryMemBad || aluRmwMemBad ||
                (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
@@ -930,10 +934,11 @@ object MicroOpAssembler {
               anInc: UInt = U(0, 3 bits), cond: Bits = B(0, 4 bits),
               branchDisp: Bits = B(0, 32 bits), first: Bool = True,
               size: Size.C = Size.LONG, ccrRestore: Bool = False,
-              writesNzvc: Bool = False, writesX: Bool = False): DecodedUop = {
+              writesNzvc: Bool = False, writesX: Bool = False,
+              op: DecOp.C = DecOp.MOVE, divIsRem: Bool = False): DecodedUop = {
       val u = DecodedUop()
       u.valid := pkt.valid; u.pc := pkt.pc; u.nextPc := nextPc
-      u.op := DecOp.MOVE; u.cluster := cluster; u.size := size; u.memOp := memOp
+      u.op := op; u.cluster := cluster; u.size := size; u.memOp := memOp
       u.srcAReg := srcAReg; u.srcAValid := srcAValid
       u.srcBReg := srcBReg; u.srcBValid := srcBValid
       u.srcCReg := 0; u.srcCValid := False
@@ -946,7 +951,7 @@ object MicroOpAssembler {
       u.unimplemented := False
       u.faulted := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.faultAddr := pkt.pc; u.sswInstr := False; u.isRte := False; u.isTrapv := False
-      u.divSigned := False; u.div64 := False; u.divIsRem := False
+      u.divSigned := False; u.div64 := False; u.divIsRem := divIsRem
       u.shiftOp := 0; u.shiftDir := False; u.isMovea := False; u.isScc := False; u.isDbcc := False; u.extByte := False
       u.firstOfInstr := first
       u
@@ -1023,6 +1028,47 @@ object MicroOpAssembler {
     val rtrPc     = popUop(A7, disp = 2, dst = T0, first = False)   // PC at (A7+2)
     val rtrBranch = retBranchUop(tgt = T0, an = A7, inc = 6)
 
+    // ── LINK / UNLK (line-4 stack-frame ops; reuse the call/return crack machinery) ──
+    // An (the frame-pointer register) = arch 8 + op[2:0]. disp16 (LINK) = sign-extended
+    // words(1). The kept (architectural-commit) µop of each crack is the LAST one (so the
+    // whitebox A7-fold `a7Run` is final at its step) and it writes An (the OTHER arch reg)
+    // so BOTH An (the checked archReg) and A7 (a7Run) are validated at one oracle step.
+    // The intermediate A7-fold ALU µop sets `divIsRem` — reused as the generic ALU
+    // crack-DROP marker (its A7 write still folds; the ALU EU surfaces it as wbObs.divRem).
+    val linkAn  = (U(8, 5 bits) + op(2 downto 0).asUInt).resized
+    val linkDisp = pkt.words(1).asSInt.resize(32)                    // sext(disp16)
+    val negDisp  = (-linkDisp).asBits                                // -disp (for An:=A7-disp)
+
+    // ADD-class crack µop (LONG, no flags): dst := srcA + imm. `drop` marks it a dropped
+    // (folded) crack µop via divIsRem. Built on mkUop then op/divIsRem overridden.
+    def addUop(srcA: UInt, imm: Bits, dst: UInt, first: Bool, drop: Bool): DecodedUop =
+      mkUop(srcAReg = srcA, srcAValid = True, useImm = True, imm = imm,
+            dstReg = dst, dstValid = True, first = first,
+            op = DecOp.ADD, divIsRem = drop)
+
+    // LINK An,#disp16 — [stkPush store dst=An, push old An] + [A7 := A7+disp (drop)]
+    //                   + [An := A7-disp (kept)].
+    // µop0: a stkPush whose base/dst is A7 (predecrement A7 := A7-4) but whose store DATA
+    // is the OLD An (srcB) — the LsEu data0 mux selects the register when srcBValid.
+    val linkPush = mkUop(cluster = Cluster.LS, memOp = MemOp.STORE, stkPush = True,
+                         srcAReg = U(A7, 5 bits), srcAValid = True,   // base A7 (addr = A7-4)
+                         srcBReg = linkAn,        srcBValid = True,    // store data = old An
+                         dstReg  = U(A7, 5 bits), dstValid  = True,    // A7 := A7-4
+                         first = True)
+    val linkA7  = addUop(U(A7, 5 bits), linkDisp.asBits, U(A7, 5 bits), first = False, drop = True)
+    val linkAnU = addUop(U(A7, 5 bits), negDisp,         linkAn,        first = False, drop = False)
+
+    // UNLK An — [load.l (An) -> T0] + [A7 := An+4 (drop)] + [An := T0 (kept MOVE)].
+    // load.l (An + 0) -> T0 (the saved frame value). An is a hardware UInt (not a Scala
+    // Int), so build the load directly via mkUop rather than the Int-keyed popUop.
+    val unlkLoad = mkUop(cluster = Cluster.LS, memOp = MemOp.LOAD,
+                         srcAReg = linkAn, srcAValid = True,
+                         useImm = True, imm = B(0, 32 bits),
+                         dstReg = U(T0, 5 bits), dstValid = True, first = True)
+    val unlkA7   = addUop(linkAn, B(4, 32 bits), U(A7, 5 bits), first = False, drop = True)
+    val unlkAn   = mkUop(srcAReg = U(T0, 5 bits), srcAValid = True,        // MOVE T0 -> An
+                         dstReg = linkAn, dstValid = True, first = False)
+
     // ── Sequence selection (each slot driven exactly once) ─────────────────────
     // pkt.fault  -> [op] (fetch fault delivery)
     // bad        -> [op] (count 1, op carries the illegal override)
@@ -1098,6 +1144,18 @@ object MicroOpAssembler {
       out.uops(0) := rtrCcr
       out.uops(1) := rtrPc
       out.uops(2) := rtrBranch
+    } elsewhen(isLinkOp) {
+      // LINK -> [stkPush store dst=An, push old An] + [A7 := A7+disp (drop)] + [An := A7-disp (kept)].
+      out.count   := 3
+      out.uops(0) := linkPush
+      out.uops(1) := linkA7
+      out.uops(2) := linkAnU
+    } elsewhen(isUnlkOp) {
+      // UNLK -> [load.l (An) -> T0] + [A7 := An+4 (drop)] + [An := T0 (kept)].
+      out.count   := 3
+      out.uops(0) := unlkLoad
+      out.uops(1) := unlkA7
+      out.uops(2) := unlkAn
     } elsewhen(crackStore) {
       out.count   := 1
       out.uops(0) := stUop

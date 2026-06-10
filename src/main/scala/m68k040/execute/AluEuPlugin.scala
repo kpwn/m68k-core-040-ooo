@@ -306,7 +306,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     wbObs.nzvcWrite := RegNext(obsNzvcW)
     wbObs.x         := RegNext(obsX)
     wbObs.xWrite    := RegNext(obsXW)
-    wbObs.divRem    := False
+    // Generic ALU crack-drop marker: divIsRem is set ONLY on the CPLX DIVREM µop
+    // (never a real ALU op), so the LINK/UNLK A7-fold ALU µops reuse it to DROP their
+    // commit record (their A7 write still folds into the running architectural A7).
+    wbObs.divRem    := RegNext(Mux(s3Valid, u3.divIsRem, u1.divIsRem)) init False
     wbObs.simPublic()
   }
 }

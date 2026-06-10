@@ -163,6 +163,13 @@ object PredecodeWord {
           r.simple   := True
           r.lenWords := U(1, 3 bits)
         }
+        // LINK An,#disp16 (0100 1110 0101 0aaa, op[15:4]==0x4E5, op[3]=0): opword + a
+        // disp16 extension word -> SIMPLE len 2. UNLK An (op[3]=1): single word -> len 1.
+        // (The cracker decodes both in the assembler, like RTS/JSR; predecode only frames.)
+        val isLink = (op(15 downto 4) === B"12'h4E5") && !op(3)
+        val isUnlk = (op(15 downto 4) === B"12'h4E5") &&  op(3)
+        when(isLink) { r.simple := True; r.lenWords := U(2, 3 bits) }
+        when(isUnlk) { r.simple := True; r.lenWords := U(1, 3 bits) }
         // CHK.W/CHK.L (0100 ddd 1 s 0 mmmrrr): bit8=1, bit6=0. The bound is an EA
         // source (sizeL = .L when bit7=0). 1 opword + the EA extension words.
         val isChk = op(8) && !op(6)
