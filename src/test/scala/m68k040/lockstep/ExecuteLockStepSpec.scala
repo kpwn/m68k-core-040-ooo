@@ -1090,6 +1090,110 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  // ── ADDX/SUBX register form (Dy,Dx): Dx := Dx +/- Dy +/- X ──────────────────
+  // Extended arith with X folded into the carry/borrow-in + the NEGX clear-only Z
+  // (Z := Z_old && result==0). X is seeded by a preceding flag-setter (addi/subi
+  // that carries/borrows). Value + NZVCX step-for-step vs Musashi. addx/subx do NOT
+  // touch X when... (they always write X = carry/borrow out).
+  test("lock-step: ADDX.B/.W/.L x X=0/1 (NZVCX, X in/out)", VerilatorTest) {
+    runLockStep("addx-basic", Seq(
+      // .B X=0: 0x10 + 0x20 + 0 = 0x30, no carry -> X=0,C=0
+      "moveq #5,%d0", "addi.b #1,%d0",                    // 5+1 no carry -> X=0
+      "move.l #0x11223310,%d1", "move.l #0x44556620,%d2", "addx.b %d2,%d1",  // 0x10+0x20+0 -> 0x..30
+      // .B X=1: seed X via carry; 0x01 + 0x01 + 1 = 0x03
+      "move.l #0x000000ff,%d3", "addi.b #1,%d3",          // 0xff+1 -> carry -> X=1,Z=1
+      "move.l #0xaaaa0001,%d4", "move.l #0xbbbb0001,%d5", "addx.b %d5,%d4",  // 1+1+1=3, upper preserved
+      // .W X=1: 0x0001 + 0x0001 + 1 = 0x0003
+      "move.l #0x0000ffff,%d6", "addi.b #1,%d6",          // X=1 again
+      "move.l #0x12340001,%d7", "move.l #0x00010001,%d0", "addx.w %d0,%d7",  // .W upper preserved
+      // .L X=0 overflow: 0x7fffffff + 0 + 0 = 0x7fffffff (V=0); then +1 via X
+      "moveq #5,%d1", "addi.b #1,%d1",                    // X=0
+      "move.l #0x7fffffff,%d2", "move.l #0x00000000,%d3", "addx.l %d3,%d2", // 0x7fffffff+0+0
+      // .L X=1 overflow edge: 0x7fffffff + 0 + 1 = 0x80000000 (V=1,N=1)
+      "move.l #0x000000ff,%d4", "addi.b #1,%d4",          // X=1
+      "move.l #0x7fffffff,%d5", "move.l #0x00000000,%d6", "addx.l %d6,%d5"  // V from the X increment
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: SUBX.B/.W/.L x X=0/1 (NZVCX, borrow in/out)", VerilatorTest) {
+    runLockStep("subx-basic", Seq(
+      // .B X=0: 0x30 - 0x10 - 0 = 0x20, no borrow
+      "moveq #5,%d0", "addi.b #1,%d0",                    // X=0
+      "move.l #0x11223330,%d1", "move.l #0x44556610,%d2", "subx.b %d2,%d1", // 0x30-0x10-0
+      // .B X=1 borrow: 0x10 - 0x10 - 1 = 0xff (borrow out, N=1,C=1,X=1)
+      "move.l #0x00000000,%d3", "subi.b #1,%d3",          // 0-1 borrow -> X=1
+      "move.l #0xaaaa0010,%d4", "move.l #0xbbbb0010,%d5", "subx.b %d5,%d4", // 0x10-0x10-1=0xff
+      // .B borrow at 0x80 boundary (signed underflow): 0x80 - 0x01 - 0 ... use X=0 here
+      "moveq #5,%d6", "addi.b #1,%d6",                    // X=0
+      "move.l #0x12340080,%d7", "move.l #0x00000001,%d0", "subx.b %d0,%d7", // 0x80-1-0=0x7f, V=1
+      // .W X=1: 0x0000 - 0x0000 - 1 = 0xffff (borrow out)
+      "move.l #0x00000000,%d1", "subi.b #1,%d1",          // X=1
+      "move.l #0x43210000,%d2", "move.l #0x00000000,%d3", "subx.w %d3,%d2", // 0-0-1=0xffff .W
+      // .L X=1: 0x00000000 - 0x00000000 - 1 = 0xffffffff
+      "move.l #0x00000000,%d4", "subi.b #1,%d4",          // X=1
+      "move.l #0x00000000,%d5", "move.l #0x00000000,%d6", "subx.l %d6,%d5"  // 0-0-1 -> 0xffffffff
+    ).mkString(" ; "))
+  }
+
+  // ── Multi-precision: two ADDX limbs forming a 64-bit add (low sets X, high uses it)
+  // and the SUBX twin. Low-limb overflow (X=1 into the high limb) AND no-overflow (X=0).
+  test("lock-step: ADDX 64-bit multi-precision chain (low limb carry -> high)", VerilatorTest) {
+    runLockStep("addx-chain", Seq(
+      // (D1:D0) = 0x00000001_ffffffff + (D3:D2) = 0x00000002_00000001
+      //   low:  add.l   D2,D0  -> 0xffffffff + 0x00000001 = 0x00000000, C=1 -> X=1
+      //   high: addx.l  D3,D1  -> 0x00000001 + 0x00000002 + 1 = 0x00000004
+      "move.l #0xffffffff,%d0", "move.l #0x00000001,%d1",       // (D1:D0) high:low
+      "move.l #0x00000001,%d2", "move.l #0x00000002,%d3",       // (D3:D2)
+      "add.l %d2,%d0",                                          // low limb, sets X=1
+      "addx.l %d3,%d1",                                         // high limb consumes X
+      // no-carry case: low limb does NOT overflow -> X=0 into high
+      "move.l #0x00000001,%d4", "move.l #0x00000010,%d5",       // (D5:D4)
+      "move.l #0x00000002,%d6", "move.l #0x00000020,%d7",       // (D7:D6)
+      "add.l %d6,%d4",                                          // 1+2=3, no carry -> X=0
+      "addx.l %d7,%d5"                                          // 0x10+0x20+0 = 0x30
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: SUBX 64-bit multi-precision chain (low limb borrow -> high)", VerilatorTest) {
+    runLockStep("subx-chain", Seq(
+      // (D1:D0) = 0x00000003_00000000 - (D3:D2) = 0x00000001_00000001
+      //   low:  sub.l   D2,D0  -> 0x00000000 - 0x00000001 = 0xffffffff, borrow -> X=1
+      //   high: subx.l  D3,D1  -> 0x00000003 - 0x00000001 - 1 = 0x00000001
+      "move.l #0x00000000,%d0", "move.l #0x00000003,%d1",       // (D1:D0)
+      "move.l #0x00000001,%d2", "move.l #0x00000001,%d3",       // (D3:D2)
+      "sub.l %d2,%d0",                                          // low limb borrow -> X=1
+      "subx.l %d3,%d1",                                         // high limb consumes borrow
+      // no-borrow case: low limb does NOT borrow -> X=0 into high
+      "move.l #0x00000030,%d4", "move.l #0x00000005,%d5",       // (D5:D4)
+      "move.l #0x00000010,%d6", "move.l #0x00000002,%d7",       // (D7:D6)
+      "sub.l %d6,%d4",                                          // 0x30-0x10=0x20, no borrow -> X=0
+      "subx.l %d7,%d5"                                          // 5-2-0 = 3
+    ).mkString(" ; "))
+  }
+
+  // ── Clear-only Z (NEGX rule applied to ADDX/SUBX): a zero result only KEEPS a
+  // prior Z, never sets it. Three directions: Z_old=0 + zero result -> Z stays 0;
+  // Z_old=1 + zero result -> Z stays 1; non-zero result -> Z clears to 0. ─────────
+  test("lock-step: ADDX/SUBX clear-only Z (Z preceding 0/1, zero + non-zero results)", VerilatorTest) {
+    runLockStep("addx-subx-z", Seq(
+      // Z_old=0, ADDX result 0: addi.b #1 to 0x7f -> 0x80 (N=1,Z=0) sets X=0,Z=0,
+      // then addx.b 0+0+0 = 0 -> Z must STAY 0 (clear-only).
+      "move.l #0x0000007f,%d0", "addi.b #1,%d0",          // -> 0x80: Z=0, X=0
+      "move.l #0xaaaa0000,%d1", "move.l #0xbbbb0000,%d2", "addx.b %d2,%d1", // 0+0+0=0; Z stays 0
+      // Z_old=1, SUBX result 0: subi.b #1 from 1 -> 0 (Z=1, no borrow X=0),
+      // then subx.b 0-0-0 = 0 -> Z must STAY 1.
+      "move.l #0x00000001,%d3", "subi.b #1,%d3",          // -> 0: Z=1, X=0
+      "move.l #0xcccc0000,%d4", "move.l #0xdddd0000,%d5", "subx.b %d5,%d4", // 0-0-0=0; Z stays 1
+      // Z_old=1, ADDX non-zero result: clears Z to 0.
+      "move.l #0x00000001,%d6", "subi.b #1,%d6",          // -> 0: Z=1, X=0
+      "move.l #0x00000005,%d7", "move.l #0x00000003,%d0", "addx.b %d0,%d7", // 5+3+0=8; Z clears to 0
+      // Z_old=1, ADDX with X=1 producing a zero byte: 0xff + 0x00 + 1 = 0x00 (carry),
+      // Z_old=1 -> Z stays 1. Seed X=1,Z=1 via addi.b #1 to 0xff (-> 0, carry).
+      "move.l #0x000000ff,%d1", "addi.b #1,%d1",          // 0xff+1 -> 0: Z=1, X=1 (carry)
+      "move.l #0x111100ff,%d2", "move.l #0x22220000,%d3", "addx.b %d3,%d2" // 0xff+0+1=0x00; Z stays 1
+    ).mkString(" ; "))
+  }
+
   test("lock-step: NOT.B/.W/.L (NZ, V=C=0, upper preserved)", VerilatorTest) {
     runLockStep("not", Seq(
       "move.l #0x0000000f,%d0", "not.b %d0",                  // .B ~0x0f=0xf0, N=1

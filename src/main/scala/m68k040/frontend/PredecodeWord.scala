@@ -352,13 +352,25 @@ object PredecodeWord {
             r.lenWords := (U(1, 3 bits) + e).resized
           }
         } elsewhen(opmode === U(4, 3 bits) || opmode === U(5, 3 bits) || opmode === U(6, 3 bits)) {
-          // ALU Dn,<ea> RMW (opmode 4/5/6 = .B/.W/.L mem-dest): opword + EA ext. The EA
-          // MUST be a MEMSIMPLE alterable-memory mode (the assembler illegalises Dn/An/
-          // MEMCOMPLEX). (DIVU/MULU are opmode 3/7, excluded.)
-          val (mok, mext) = memDestExt(srcMode, srcReg)
-          when(mok) {
+          // ADDX/SUBX register form (line 9/D, opmode 4/5/6, EA mode field 000 = Dn-direct):
+          // a single 1-word op (Dx := Dx +/- Dy +/- X). The mode-000 slot is NOT a valid
+          // ADD/SUB-to-mem dst, so frame it as simple len1 (else memDestExt rejects Dn ->
+          // unframed -> nextPc=pc -> the front-end stalls). The memory form `-(Ay),-(Ax)`
+          // (mode 001) is NOT framed here (stays the assembler's illegal/deferred path).
+          val isAddxSubxReg = (cls === U(9, 4 bits) || cls === U(0xD, 4 bits)) &&
+                              (srcMode === U(0, 3 bits))
+          when(isAddxSubxReg) {
             r.simple   := True
-            r.lenWords := (U(1, 3 bits) + mext).resized
+            r.lenWords := U(1, 3 bits)
+          } otherwise {
+            // ALU Dn,<ea> RMW (opmode 4/5/6 = .B/.W/.L mem-dest): opword + EA ext. The EA
+            // MUST be a MEMSIMPLE alterable-memory mode (the assembler illegalises Dn/An/
+            // MEMCOMPLEX). (DIVU/MULU are opmode 3/7, excluded.)
+            val (mok, mext) = memDestExt(srcMode, srcReg)
+            when(mok) {
+              r.simple   := True
+              r.lenWords := (U(1, 3 bits) + mext).resized
+            }
           }
         }
       }

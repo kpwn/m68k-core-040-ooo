@@ -43,11 +43,18 @@ object AluDatapath {
     val isSub   = cmd.op === DecOp.SUB || cmd.op === DecOp.CMP
     val isNeg   = cmd.op === DecOp.NEG
     val isNegx  = cmd.op === DecOp.NEGX
-    val isArith = cmd.op === DecOp.ADD || isSub || isNeg || isNegx
-    // The operand to negate (NEG/NEGX) is src1 (a); ordinary ADD/SUB negate src2 (b).
+    // ADDX/SUBX: ordinary two-operand ADD/SUB (a=src1=Dx, b=src2=Dy) with X folded into
+    // the carry/borrow-in. ADDX = a + b + X  (cin := X); SUBX = a - b - X = a + ~b + !X
+    // (cin := !X, the NEGX borrow form). Only NEG/NEGX force aEff=0; ADDX/SUBX use `a`.
+    val isAddx  = cmd.op === DecOp.ADDX
+    val isSubx  = cmd.op === DecOp.SUBX
+    val isArith = cmd.op === DecOp.ADD || isSub || isNeg || isNegx || isAddx || isSubx
+    // The operand to negate (NEG/NEGX) is src1 (a); ordinary ADD/SUB(X) negate src2 (b).
     val aEff = Mux(isNeg || isNegx, U(0, 32 bits), a)
-    val bEff = Mux(isNeg || isNegx, ~a, Mux(isSub, ~b, b))
-    val cin  = Mux(isNegx, !cmd.xIn, Mux(isSub || isNeg, True, False))
+    val bEff = Mux(isNeg || isNegx, ~a, Mux(isSub || isSubx, ~b, b))   // SUBX subtracts (~b)
+    val cin  = Mux(isNegx || isSubx, !cmd.xIn,                         // SUBX borrow = !X
+                 Mux(isSub || isNeg, True,                             // SUB/NEG cin = 1
+                   Mux(isAddx, cmd.xIn, False)))                       // ADDX carry = X; ADD = 0
     val sum32 = aEff + bEff + cin.asUInt.resize(32)
 
     // ── SWAP / EXT / TAS / NOT / CLR bit-manipulation results ────────────────────
@@ -114,8 +121,8 @@ object AluDatapath {
     val n     = Mux(isTas, a(7), nGen)
     val z     = Mux(isTas, a(7 downto 0) === 0, Mux(isBitOp, bTestZ, zGen))
 
-    // C: ADD = cout, SUB/NEG/NEGX = borrow = ~cout. Logical/bit ops (incl. CLR/TAS) = 0.
-    val cFlag = Mux(isArith, Mux(isSub || isNeg || isNegx, ~cout, cout), False)
+    // C: ADD/ADDX = cout, SUB/NEG/NEGX/SUBX = borrow = ~cout. Logical/bit (CLR/TAS) = 0.
+    val cFlag = Mux(isArith, Mux(isSub || isNeg || isNegx || isSubx, ~cout, cout), False)
     val vFlag = Mux(isArith, vArith, False)
 
     // CLR forces Z=1/N=0 (the result is 0 at every size). The generic n/z above already
