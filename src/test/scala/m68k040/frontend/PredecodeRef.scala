@@ -217,6 +217,11 @@ object PredecodeRef {
           }
         }
         else if (isMulDiv) COMPLEX
+        // ADDX/SUBX register form (line 9/D, opmode 4/5/6, EA mode 000 = Dn-direct):
+        // a single 1-word op (Dx := Dx +/- Dy +/- X). Mode 000 is NOT a valid
+        // ADD/SUB-to-mem dst, so frame it simple len1. Memory form (mode 001) -> COMPLEX.
+        else if ((cls == 0x9 || cls == 0xD) && (opmode == 4 || opmode == 5 || opmode == 6) && srcMode == 0)
+          CP(simple = true, lenWords = 1)
         else if (opmode == 4 || opmode == 5 || opmode == 6)        // ALU Dn,<ea> RMW mem-dest
           memDestExt(srcMode, srcReg) match {
             case Some(e) => CP(simple = true, lenWords = 1 + e)
