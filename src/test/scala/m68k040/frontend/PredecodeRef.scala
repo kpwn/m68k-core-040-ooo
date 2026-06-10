@@ -222,6 +222,17 @@ object PredecodeRef {
         // ADD/SUB-to-mem dst, so frame it simple len1. Memory form (mode 001) -> COMPLEX.
         else if ((cls == 0x9 || cls == 0xD) && (opmode == 4 || opmode == 5 || opmode == 6) && srcMode == 0)
           CP(simple = true, lenWords = 1)
+        // EXG (line C, bit8=1): 1100 xxx 1 ooooo yyy with ooooo (bits 7:3) in {01000,01001,
+        // 10001} (EXG Dx,Dy / Ax,Ay / Dx,Ay). A single-word reg-reg swap -> simple len1
+        // (mirrors the RTL PredecodeWord, which frames it before the AND-RMW band).
+        else if (cls == 0xC && ((op >> 8) & 1) == 1 &&
+                 (((op >> 3) & 0x1f) == 0x08 || ((op >> 3) & 0x1f) == 0x09 || ((op >> 3) & 0x1f) == 0x11))
+          CP(simple = true, lenWords = 1)
+        // ABCD (line C) / SBCD (line 8) register form: opmode 4, EA mode 000 (Dn-direct).
+        // A single 1-word op (Dx := BCD(Dx +/- Dy +/- X)). Mode 000 is NOT a valid mem-dst,
+        // so frame it simple len1 (mirrors the RTL). Memory form (mode 001) -> COMPLEX.
+        else if ((cls == 0x8 || cls == 0xC) && opmode == 4 && srcMode == 0)
+          CP(simple = true, lenWords = 1)
         else if (opmode == 4 || opmode == 5 || opmode == 6)        // ALU Dn,<ea> RMW mem-dest
           memDestExt(srcMode, srcReg) match {
             case Some(e) => CP(simple = true, lenWords = 1 + e)
