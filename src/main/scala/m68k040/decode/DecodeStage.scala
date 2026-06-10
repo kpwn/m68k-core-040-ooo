@@ -96,9 +96,19 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val slot1Is3 = a1raw.count === U(3, 2 bits)
     val slot0Is3 = a0.count === U(3, 2 bits)
 
+    // A slot1 MOVEM cannot be emitted as a normal crack — its real µops come from the
+    // micro-sequencer FSM (entered next cycle from the stashed packet). It MUST be
+    // excluded from the normal slot1 push, otherwise the assembler's benign MOVE
+    // PLACEHOLDER crack of the MOVEM opword (OperationDecoder marks MOVEM as DecOp.MOVE)
+    // is pushed as a SPURIOUS extra kept µop alongside slot0 — the phantom commit.
+    // (`slot1IsMovem` below reuses this; the OperationDecoder cone is shared via CSE.)
+    val slot1IsMovemEarly = fed.valid && fed.payload.slot1Valid &&
+                            OperationDecoder.decode(fed.payload.packets(1).words(0)).movem
+
     // slot1 is emitted alongside slot0 only when: not replaying a stash, slot1 present,
-    // slot0 is NOT 3-µop, and slot1 itself is NOT 3-µop (a 3-µop slot1 is deferred).
-    val slot1Emit = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Is3 && !slot1Is3
+    // slot0 is NOT 3-µop, slot1 itself is NOT 3-µop (a 3-µop slot1 is deferred), and
+    // slot1 is NOT a MOVEM (the FSM owns it — see slot1IsMovemEarly).
+    val slot1Emit = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Is3 && !slot1Is3 && !slot1IsMovemEarly
     // Defer slot1 to the stash when EITHER slot0 is a 3-µop crack (slot1 cannot fit
     // alongside 3 µops) OR slot1 itself is a 3-µop crack (cannot fit after a <=2-µop
     // slot0). In both cases emit slot0 this cycle + stash slot1's µops; replay next.
@@ -203,9 +213,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // cycle and the slot1 PACKET (opword+mask+pc+lenWords) is stashed; the FSM enters from
     // it next cycle (mirrors the 3-µop slot1 defer, but carries the raw packet).
     val spec0  = OperationDecoder.decode(fed.payload.packets(0).words(0))
-    val spec1  = OperationDecoder.decode(fed.payload.packets(1).words(0))
     val slot0IsMovem = fed.valid && spec0.movem
-    val slot1IsMovem = fed.valid && fed.payload.slot1Valid && spec1.movem
+    val slot1IsMovem = slot1IsMovemEarly   // slot1's MOVEM marker (decoded above, shared via CSE)
     val movemPendValid = RegInit(False)
     val movemPendPkt   = Reg(DecodePacket())
     when(pipeFlush) { movemPendValid := False }
