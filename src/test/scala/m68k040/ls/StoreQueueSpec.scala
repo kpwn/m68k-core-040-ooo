@@ -204,6 +204,45 @@ class StoreQueueSpec extends AnyFunSuite {
     }
   }
 
+  test("io.full asserts at depth; a drain frees a slot so a further alloc succeeds", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      // Fill the ring to depth WITHOUT draining: alloc 8 distinct aligned stores, all
+      // committed (so the head is drainable) but hold drainAck LOW so nothing pops.
+      // io.full must NOT assert before the 8th, and MUST assert after it.
+      for (i <- 0 until 8) {
+        sleep(1)
+        assert(!dut.io.full.toBoolean, s"must not be full with $i entries")
+        alloc(dut, cd, robId = 10 + i, paddr = 0x100 + i * 0x10, data = 0x1000L + i, Size.LONG)
+      }
+      sleep(1)
+      assert(dut.io.full.toBoolean, "ring must be full after 8 allocs")
+
+      // Commit the oldest (robId 10) so it becomes drainable. Hold drainAck off until
+      // the drain is presented, then ack exactly once -> the head pops -> a slot frees.
+      commit(dut, cd, robId = 10)
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
+      assert(dut.io.drain.payload.paddr.toLong == 0x100, "oldest (0x100) drains first")
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      sleep(1)
+      assert(!dut.io.full.toBoolean, "io.full must deassert after one entry drains/pops")
+
+      // A 9th alloc now succeeds (does not overrun) and is forwardable to a younger load.
+      alloc(dut, cd, robId = 20, paddr = 0x300, data = 0xABCD1234L, Size.LONG)
+      sleep(1)
+      assert(dut.io.full.toBoolean, "back to full after the 9th alloc refills the freed slot")
+      setQuery(dut, robId = 30, paddr = 0x300, Size.LONG)
+      cd.waitSampling()
+      sleep(1)
+      assert(dut.io.fwd.rsp.hit.toBoolean, "the newly-allocated entry must forward")
+      assert(dut.io.fwd.rsp.data.toLong == 0xABCD1234L,
+        s"forward data ${dut.io.fwd.rsp.data.toLong.toHexString}")
+      cd.waitSampling(2)
+    }
+  }
+
   test("partial overlap with an older store stalls the load", VerilatorTest) {
     M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
       val cd = initDut(dut)

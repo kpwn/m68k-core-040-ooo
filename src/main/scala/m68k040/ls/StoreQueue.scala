@@ -68,6 +68,12 @@ class StoreQueue(depth: Int = 8) extends Component {
     // load that MISSED L1D could refill stale memory. Holding until ack closes it.
     val drainAck = in(Bool())
     val empty    = out(Bool())   // no valid entry AND no drain in flight
+    // Back-pressure to the LS-EU: high when the ring is FULL (all `depth` entries
+    // resident). The LS-EU reads this ONLY in its execute/alloc FSM (a `WAIT_SQ`
+    // stall, off the IQ issue-select cone) and holds a store's alloc until an entry
+    // drains. The alloc Flow has no `ready`, so the EU is responsible for never
+    // allocating while full; the sim assert below enforces that contract.
+    val full     = out(Bool())
   }
 
   // ---- ring storage (all RegInit) ----
@@ -281,6 +287,24 @@ class StoreQueue(depth: Int = 8) extends Component {
 
   // ---- count = hardware sum of valids (no Scala-var counters) ----
   count := CountOne(valids).resized
+
+  // ---- full: all `depth` entries resident. Driven from the LIVE valids popcount
+  // (not the registered `count`, which trails valids by a cycle) so back-pressure is
+  // precise: there is no one-cycle window where a stale count would let a (depth+1)th
+  // alloc slip in and overrun the ring. This compare feeds ONLY the LS-EU alloc FSM
+  // (a `WAIT_SQ` stall, off the IQ select cone) — same push-only discipline as the
+  // `lsBusy` read — so it is not on the sensitive issue->operand critical path. ----
+  val liveCount = CountOne(valids)
+  io.full := liveCount === U(depth, liveCount.getWidth bits)
+
+  // Sim-only contract guard: the LS-EU must never present an alloc while full (the
+  // alloc Flow has no ready, so a missing WAIT_SQ back-pressure would silently
+  // overrun the ring and corrupt `count`/`head`/`tail`). A flush this cycle squashes
+  // speculative entries, so allow alloc+flush coincidence.
+  GenerationFlags.simulation {
+    assert(!(io.alloc.valid && io.full && !io.flush),
+      "StoreQueue: alloc fired while full — missing LS-EU back-pressure (WAIT_SQ)")
+  }
 
   // ---- empty: no resident entry AND no drain in flight ----
   io.empty := !valids.reduce(_ || _) && !drainBusy
