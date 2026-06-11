@@ -3062,6 +3062,36 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       checkMem = Seq(0x3fc4L), checkSpan = 60)   // 15 longs at 0x3FC4 .. 0x4000 (predec ordering + values)
   }
 
+  // REGRESSION: a >8-physical-register reload burst exposed a PRF backing-Mem undersize.
+  // Load 15 registers from memory with INDIVIDUAL `move.l (d16,A7),Dn` loads (each a real
+  // kept oracle step — NOT a dropped MOVEM µop), then 14 dependent `add.l %dN/%aN,%d0`
+  // folds reading every loaded reg. Each memory-source MOVE cracks into [load -> T0] +
+  // [op T0 -> Dn], so 15 in-flight T0 versions + 15 arch dests drive the physical-int pool
+  // past 32 live renames — handing out the high physreg ids (48/49). RegfileSpec.Int.depth
+  // was left at 48 (stale; the freelist + IQ scoreboards moved to 50 when T0/T1 widened the
+  // pool), so ids 48/49 addressed PAST the PRF Mem: the producing load's write never landed
+  // and the dependent op read an uninitialized (per-seed-random) value. Mirrors the MOVEM
+  // epilogue's pressure WITHOUT the MOVEM FSM, so it pins the bug to rename/PRF sizing.
+  test("lock-step: 15 individual loads + dependent adds (>8 reload pressure)", VerilatorTest) {
+    runLockStep("loads15-probe",
+      "move.l #0x00010000,%d0 ; move.l #0x00020001,%d1 ; move.l #0x00030002,%d2 ; move.l #0x00040003,%d3 ; " +
+      "move.l #0x00050004,%d4 ; move.l #0x00060005,%d5 ; move.l #0x00070006,%d6 ; move.l #0x00080007,%d7 ; " +
+      "move.l #0x10080008,%a0 ; move.l #0x10090009,%a1 ; move.l #0x100a000a,%a2 ; move.l #0x100b000b,%a3 ; " +
+      "move.l #0x100c000c,%a4 ; move.l #0x100d000d,%a5 ; move.l #0x100e000e,%a6 ; " +
+      "move.l #0x00004000,%sp ; movem.l %d0-%d7/%a0-%a6,-(%sp) ; " +
+      // reload each from the predec image (A7 now at 0x3FC4; the 15 longs run 0x3FC4..0x3FFF
+      // in predec order D0..D7,A0..A6 low->high address).
+      "move.l (0,%sp),%d0 ; move.l (4,%sp),%d1 ; move.l (8,%sp),%d2 ; move.l (12,%sp),%d3 ; " +
+      "move.l (16,%sp),%d4 ; move.l (20,%sp),%d5 ; move.l (24,%sp),%d6 ; move.l (28,%sp),%d7 ; " +
+      "move.l (32,%sp),%a0 ; move.l (36,%sp),%a1 ; move.l (40,%sp),%a2 ; move.l (44,%sp),%a3 ; " +
+      "move.l (48,%sp),%a4 ; move.l (52,%sp),%a5 ; move.l (56,%sp),%a6 ; " +
+      "add.l %d1,%d0 ; add.l %d2,%d0 ; add.l %d3,%d0 ; add.l %d4,%d0 ; add.l %d5,%d0 ; add.l %d6,%d0 ; add.l %d7,%d0 ; " +
+      "add.l %a0,%d0 ; add.l %a1,%d0 ; add.l %a2,%d0 ; add.l %a3,%d0 ; add.l %a4,%d0 ; add.l %a5,%d0 ; add.l %a6,%d0 ; " +
+      "move.l %sp,%d1 ; " +
+      ".stop: bra .stop", nInstr = 47,
+      checkMem = Seq(0x3fc4L), checkSpan = 60)
+  }
+
   // Front-end-stall-then-resume: a long MOVEM (held fed ~8 cycles) immediately followed by
   // an ALU chain + a branch — the FSM must release `fed` cleanly and the trailing
   // instructions must execute (no deadlock, correct next-instruction stream).

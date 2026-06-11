@@ -6,7 +6,15 @@ case class RegfileSpec(name: String, dataWidth: Int, depth: Int) {
   def addressWidth: Int = log2Up(depth)
 }
 object RegfileSpec {
-  val Int  = RegfileSpec("int",  32, 48)
+  // depth MUST cover the full physical-int pool the rename freelist allocates
+  // (Freelist physCount = 50; the IQ scoreboards use Global.PHYS_INT_REGS = 50). It was
+  // left at 48 when the 2 EA-cracking temp arch regs (T0/T1) widened the pool to 50, so
+  // the PRF backing Mem under-ran: ids 48/49 — handed out only under heavy register
+  // pressure (a >8-destination load burst exhausts the lower ids first) — addressed PAST
+  // the 48-entry Mem, so the producing write never landed and the dependent read returned
+  // an uninitialized (per-seed-random) value. addressWidth is log2Up(50)=6 = log2Up(48),
+  // so all port widths are unchanged; only the Mem entry count grows (48 -> 50).
+  val Int  = RegfileSpec("int",  32, 50)
   val Nzvc = RegfileSpec("nzvc", 4,  16)
   val X    = RegfileSpec("x",    1,  16)
 }
