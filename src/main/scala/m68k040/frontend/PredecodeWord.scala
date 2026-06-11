@@ -255,6 +255,42 @@ object PredecodeWord {
             r.lenWords := (U(1, 3 bits) + mext).resized
           }
         }
+        // MOVEM (0100 1 d 001 s mmmrrr) + 16-bit register-mask ext word: a 2+-word
+        // instruction = opword + mask + the EA's OWN extension words (the mask precedes the
+        // EA ext). In-scope modes: (An)/(An)+/-(An) add 0, (d16,An)/(xxx).W/(d16,PC) add 1,
+        // (xxx).L adds 2 -> lenWords = 1 (opword) + 1 (mask) + EA ext. Direction (bit10)
+        // chooses store (control-alterable + -(An)) vs load (control + (An)+ + (d16,PC)/
+        // (xxx)); for FRAMING the length only depends on the EA's ext-word count, so a single
+        // memDestExt-style table covers store modes and the load adds (An)+ / (d16,PC).
+        // Indexed (mode 6 / 7-3), reg-direct, #imm -> NOT in scope -> COMPLEX (never enter
+        // the FSM). bit8=0, bits9:7=001, bit11=1 (does not alias CHK / the unary group).
+        val isMovem = op(11) && (op(9 downto 7) === B"001")
+        when(isMovem) {
+          val mmMode = op(5 downto 3).asUInt
+          val mmReg  = op(2 downto 0).asUInt
+          val mmDir  = op(10)                         // 0 store / 1 load
+          val mmOk   = Bool(); val mmExt = UInt(3 bits)
+          mmOk := False; mmExt := U(0, 3 bits)
+          switch(mmMode) {
+            is(U(2, 3 bits)) { mmOk := True; mmExt := U(0, 3 bits) }                    // (An) (store+load)
+            is(U(3, 3 bits)) { mmOk := mmDir;  mmExt := U(0, 3 bits) }                   // (An)+ LOAD only
+            is(U(4, 3 bits)) { mmOk := !mmDir; mmExt := U(0, 3 bits) }                   // -(An) STORE only
+            is(U(5, 3 bits)) { mmOk := True; mmExt := U(1, 3 bits) }                     // (d16,An)
+            is(U(7, 3 bits)) {
+              switch(mmReg) {
+                is(U(0, 3 bits)) { mmOk := True; mmExt := U(1, 3 bits) }                 // (xxx).W
+                is(U(1, 3 bits)) { mmOk := True; mmExt := U(2, 3 bits) }                 // (xxx).L
+                is(U(2, 3 bits)) { mmOk := mmDir; mmExt := U(1, 3 bits) }                // (d16,PC) LOAD only
+                default          { mmOk := False }
+              }
+            }
+            default { mmOk := False }
+          }
+          when(mmOk) {
+            r.simple   := True
+            r.lenWords := (U(2, 3 bits) + mmExt).resized   // opword + mask + EA ext
+          }
+        }
         val isJmp = op(15 downto 6) === B"10'b0100111011"
         val isJsr = op(15 downto 6) === B"10'b0100111010"
         when(isJmp || isJsr) {

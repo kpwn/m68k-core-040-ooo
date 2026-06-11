@@ -570,8 +570,17 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
          (srcBIsReg(u) && (u.psrcB === lsWakeupPort.payload)) ||
          (u.psrcCValid && (u.psrcC === lsWakeupPort.payload)))
     })
+    // MULTI-LS-SOURCE GUARD: a slot may read TWO (or three) registers that are EACH an
+    // in-flight LS LOAD result (the first consumer of a multi-register MOVEM load — e.g.
+    // `ADD Dn,Dm` where both Dn and Dm were just MOVEM-loaded). `lsWait` is a single bit,
+    // so a naive clear on the FIRST matching wakeup would let the slot issue while the
+    // OTHER LS source is still in flight -> it reads a stale (pre-load) value. Only clear
+    // `lsWait` once NO other LS source of the slot is still busy: re-evaluate the slot's
+    // remaining LS dependency against `stillBusy` (which already excludes the pdst woken
+    // THIS cycle), and keep waiting while another source remains busy.
+    val lsStillDep = Vec(slots.map { s => lsDepInit(s.context.uop) })
     for (i <- 0 until slotCount) {
-      when(lsWakeMatch(i)) {
+      when(lsWakeMatch(i) && !lsStillDep(i)) {
         // on a non-compaction cycle, clear slot i; on compaction, clear slot i-wayCount.
         when(pushPort.fire) { if (i >= wayCount) slots(i - wayCount).lsWait := False }
           .otherwise        { slots(i).lsWait := False }

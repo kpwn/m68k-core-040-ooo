@@ -417,6 +417,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // (writes NZVC) or a stack-push store (writes A7). DROP its commit record (it has no
     // architectural register/flag effect; the memory effect is checked via checkMem).
     val compRmwStore  = RegInit(False)
+    // Generic crack-DROP marker carried on the µop (`divIsRem`): a MOVEM LOAD writes an
+    // arch reg (so it is NOT a compRmwStore) yet must be DROPPED from the oracle-step stream
+    // (the MOVEM macro is ONE step — the final An-update is the kept commit). The loaded
+    // value still lands in the PRF + is verified by a later reader. (compRmwStore already
+    // drops MOVEM STORES — a store with no reg/flag write — so this covers the loads.)
+    val compCrackDrop = RegInit(False)
     val compDstArch   = Reg(UInt(5 bits))
     // NZVC writeback for a MOVE-to-memory store (N/Z of the moved value, V=C=0).
     val compNzvc      = Reg(Bits(4 bits))
@@ -499,8 +505,15 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     def captureCompletion(result: Bits): Unit = {
       compValid     := True
       compRobId     := s1Ctx.robId
+      // MOVEM.W LOAD sign-extends the loaded word to the full 32-bit register (Musashi
+      // MAKE_INT_16). The DcacheByteLane.extract path ZERO-extends a WORD; the MOVEM-load
+      // µop carries `isMovea` (reused as the ".W load -> sign-extend" marker; the ALU EU
+      // is the only other isMovea consumer and never sees an LS-cluster µop). A .L MOVEM
+      // load + every non-MOVEM load leave isMovea False (full / zero-extended result).
+      val ldResult = Mux(u1.isMovea && isLoad && (u1.size === m68k040.isa.Size.WORD),
+                         result(15 downto 0).asSInt.resize(32).asBits, result)
       compData      := Mux(u1.stkPush, s1Va.asBits,
-                       Mux(isAutoStoreAn, s1AnWb, result))
+                       Mux(isAutoStoreAn, s1AnWb, ldResult))
       // A CCR-restore load writes NO int reg (it restores flags); a stack-push store's
       // int dst is A7 (handled via compData above); a plain load writes its int dst.
       compPdst      := u1.pdst
@@ -519,6 +532,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       // Trailing RMW/CLR store: a STORE writing neither an int reg nor flags. An EA-auto
       // store writes An (pdstValid) -> NOT a dropped RMW store (its An commit is kept).
       compRmwStore  := isStore && !u1.pdstValid && !u1.writesNzvc && !u1.stkPush
+      compCrackDrop := u1.divIsRem    // MOVEM move (load/store) crack-drop marker
       compDstArch   := u1.dstArch
       // CCR-restore (RTR): NZVC := loaded[3:0], X := loaded[4] (CCR bit layout
       // X=4,N=3,Z=2,V=1,C=0). Otherwise a MOVE-to-mem store's NZVC = N/Z of the stored
@@ -548,6 +562,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compStkPush   := False
       compCcrRestore := False
       compEaAutoDrop := False
+      compCrackDrop := False
       compIsFault   := True
       compFaultAddr := s1Va
       compFaultWr   := isStore
@@ -800,7 +815,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // Reuse `divRem` as the generic "crack µop — DROP this commit record" marker: a
     // stack-push store is the leading crack µop of BSR/JSR (the trailing branch is the
     // macro instruction's single commit). Its A7 write is still folded into running A7.
-    wbObs.divRem    := compStkPush || compCcrRestore || compRmwStore || compEaAutoDrop
+    wbObs.divRem    := compStkPush || compCcrRestore || compRmwStore || compEaAutoDrop || compCrackDrop
     wbObs.simPublic()
 
     // ── Exception-unit cache arbitration MUX (LAST drivers — override the LS EU's

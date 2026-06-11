@@ -2973,4 +2973,100 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l #0x3000,%a0 ; move.l (%a0)+,%d0 ; addq.l #4,%a0 ; move.l %a0,%d1 ; " +
       ".stop: bra .stop", nInstr = 7)   // D0=val, A0=D1=0x3008 (0x3000+4 postinc +4 addq)
   }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // MOVEM (multi-register load/store) — the DecodeStage micro-sequencer FSM.
+  // The classic prologue/epilogue round-trip, .W sign-extend on load, control/sparse
+  // masks, edge masks (empty/single/odd), and the front-end-stall-then-resume.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  // MOVEM.L D0/D2/A1,(d16,A0) — control mode, SPARSE non-contiguous mask (priority-encode
+  // order D0,D2,A1 ascending). checkMem verifies the 3 stored words landed at the right
+  // ascending addresses (0x3000/4/8). The final kept An-update (A0+=0) commits the macro.
+  test("lock-step: MOVEM.L control-mode sparse store (d16,An) -> mem", VerilatorTest) {
+    runLockStep("movem-l-control-sparse",
+      "move.l #0x11111111,%d0 ; move.l #0x22222222,%d2 ; move.l #0xa1a1a1a1,%a1 ; " +
+      "move.l #0x3000,%a0 ; movem.l %d0/%d2/%a1,(0,%a0) ; " +
+      ".stop: bra .stop", nInstr = 5,
+      checkMem = Seq(0x3000L, 0x3004L, 0x3008L))   // D0,D2,A1 stored ascending
+  }
+
+  // MOVEM.L (An)+,<list> load + final An update (A0 += 12). The loaded D3/D4/D5 are dropped
+  // crack µops -> surface them via adds (each a kept step) so the loaded values are
+  // compared vs Musashi. A0 (=0x300C after postinc) is the kept An-update step. Stores via
+  // -(A0) (predec, which the LS forwards into the (A0)+ reload the same way the prologue's
+  // -(A7)/(A7)+ round-trip drains), so the multi-reg reload is the resident-line path.
+  test("lock-step: MOVEM.L (An)+ load -> regs + An postinc", VerilatorTest) {
+    runLockStep("movem-l-postinc-load",
+      "move.l #0x0a0a0a0a,%d0 ; move.l #0x0b0b0b0b,%d1 ; move.l #0x0c0c0c0c,%d2 ; " +
+      "move.l #0x300c,%a0 ; movem.l %d0/%d1/%d2,-(%a0) ; movem.l (%a0)+,%d3/%d4/%d5 ; move.l %a0,%d6 ; " +
+      "add.l %d4,%d3 ; add.l %d5,%d3 ; " +
+      ".stop: bra .stop", nInstr = 9, checkMem = Seq(0x3000L, 0x3004L, 0x3008L))   // A0=D6=0x300C
+  }
+
+  // MOVEM.W load SIGN-EXTENDS the loaded word to the full 32-bit register (Musashi
+  // MAKE_INT_16). Two single-register loads (no multi-store burst, so the orthogonal
+  // store->load-same-line LS drain race does not interfere): store a NEGATIVE word (0x8001)
+  // and a POSITIVE word (0x7fff) to one line, drain + refill the line, then MOVEM.W-load
+  // each back and surface it — the loaded values must be the SIGN-EXTENDED 0xFFFF8001 /
+  // 0x00007FFF (not zero-extended), pinning both sign directions.
+  test("lock-step: MOVEM.W store/load — .W load sign-extends", VerilatorTest) {
+    runLockStep("movem-w-signext",
+      "move.l #0x12348001,%d0 ; move.l #0x56787fff,%d2 ; move.l #0x3000,%a0 ; move.w %d0,(%a0) ; move.w %d2,2(%a0) ; " +
+      "moveq #1,%d1 ; moveq #2,%d1 ; moveq #3,%d1 ; move.l 0x3000,%d1 ; " +    // drain + refill the line
+      "movem.w (%a0),%d4 ; movem.w (2,%a0),%d5 ; move.l %d4,%d6 ; move.l %d5,%d7 ; " +
+      ".stop: bra .stop", nInstr = 13,
+      checkMem = Seq(0x3000L), checkSpan = 4)   // 0x8001 @ 0x3000 (->0xFFFF8001), 0x7fff @ 0x3002 (->0x00007FFF)
+  }
+
+  // ((d16,PC) MOVEM load reads the CODE image as data, but the lock-step D-cache memory is
+  // a SEPARATE backing store from the I-cache program image (data must be runtime-STORED to
+  // be visible to both the DUT D-cache and Musashi). The (d16,PC) ADDRESS computation
+  // (EA_PCDI = pc+4+d16) is exercised at the decode level in MovemDecodeSpec/EaDecoder
+  // instead; a memory-backed lock-step for it would need a writable PC-reachable data page.)
+
+  // Single register (the odd-tail of size 1): store D3, load it back into D4, surface D4
+  // (a kept MOVE.L step) so the loaded value is compared. checkMem verifies the store.
+  test("lock-step: MOVEM.L single register store+load", VerilatorTest) {
+    runLockStep("movem-l-single",
+      "move.l #0xdeadbeef,%d3 ; move.l #0x3000,%a0 ; movem.l %d3,(%a0) ; " +
+      "movem.l (%a0),%d4 ; move.l %d4,%d5 ; " +
+      ".stop: bra .stop", nInstr = 6, checkMem = Seq(0x3000L))
+  }
+
+  // (Empty-mask MOVEM emits ZERO architectural µops -> it produces no commit, so it cannot
+  // appear in a robId-joined lock-step program (the oracle would over-count). Its FSM
+  // behavior — no moves, An unchanged, the front-end resuming cleanly into the following
+  // instruction — is covered by MovemDecodeSpec instead.)
+
+  // The CLASSIC prologue/epilogue: MOVEM.L D0-D7,-(A7) then MOVEM.L (A7)+,D0-D7 — the
+  // save/restore round-trip. A7 is seeded to a scratch RAM top (0x4020); the predec stores
+  // high-to-low (D7 @ 0x401C ... D0 @ 0x4000, reversed mask), the postinc loads them back.
+  // checkMem verifies the stack image (the predec ordering + every stored value); the
+  // post-epilogue ADD-fold reads EVERY reloaded register into D0 (each a KEPT step), so a
+  // wrong reload diverges; the kept An-update steps verify A7 (0x4000 after predec, 0x4020
+  // after postinc). 8 registers = the store-queue depth (a 15-reg burst overruns the
+  // 8-entry SQ -> the PRE-EXISTING SQ-drain store-drop, orthogonal to MOVEM).
+  test("lock-step: MOVEM.L D0-D7,-(A7) prologue/epilogue round-trip", VerilatorTest) {
+    runLockStep("movem-l-prologue-epilogue",
+      "move.l #0x00010000,%d0 ; move.l #0x00020001,%d1 ; move.l #0x00030002,%d2 ; move.l #0x00040003,%d3 ; " +
+      "move.l #0x00050004,%d4 ; move.l #0x00060005,%d5 ; move.l #0x00070006,%d6 ; move.l #0x00080007,%d7 ; " +
+      "move.l #0x00004020,%sp ; movem.l %d0-%d7,-(%sp) ; movem.l (%sp)+,%d0-%d7 ; " +
+      "add.l %d1,%d0 ; add.l %d2,%d0 ; add.l %d3,%d0 ; add.l %d4,%d0 ; add.l %d5,%d0 ; add.l %d6,%d0 ; add.l %d7,%d0 ; " +
+      "move.l %sp,%d1 ; " +
+      ".stop: bra .stop", nInstr = 19,
+      checkMem = Seq(0x4000L), checkSpan = 32)   // 8 longs at 0x4000 .. 0x4020 (predec ordering + values); A7=D1=0x4020
+  }
+
+  // Front-end-stall-then-resume: a long MOVEM (held fed ~8 cycles) immediately followed by
+  // an ALU chain + a branch — the FSM must release `fed` cleanly and the trailing
+  // instructions must execute (no deadlock, correct next-instruction stream).
+  test("lock-step: MOVEM front-end stall then ALU/branch resume", VerilatorTest) {
+    runLockStep("movem-stall-resume",
+      "move.l #0x01010101,%d0 ; move.l #0x02020202,%d1 ; move.l #0x03030303,%d2 ; move.l #0x04040404,%d3 ; " +
+      "move.l #0x05050505,%d4 ; move.l #0x06060606,%d5 ; move.l #0x07070707,%d6 ; move.l #0x08080808,%d7 ; " +
+      "move.l #0x3000,%a0 ; movem.l %d0-%d7,(%a0) ; " +
+      "addq.l #1,%d0 ; add.l %d1,%d2 ; and.l %d3,%d4 ; bra .next ; nop ; .next: move.l #0x99,%d5 ; " +
+      ".stop: bra .stop", nInstr = 15, checkMem = Seq(0x3000L), checkSpan = 32)
+  }
 }

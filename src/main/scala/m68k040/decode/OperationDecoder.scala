@@ -227,6 +227,23 @@ object OperationDecoder {
           o.srcA := easrc; o.dst := easrc; o.dstWrites := True
           o.writesNzvc := True
         }
+        // MOVEM (0100 1 d 001 s mmmrrr) + 16-bit register-mask ext word: bit11=1, bit10=d
+        // (0 store / 1 load), bits 9:7=001, bit6=s (0 .W / 1 .L). The DecodeStage micro-
+        // sequencer FSM owns the µop emission (reads movem/movemDir/movemSizeLong + the EA
+        // + the mask); OperationDecoder only marks it NON-illegal (a benign MOVE placeholder
+        // like EXG so the assembler's `bad` never fires — the FSM gates the normal crack off
+        // when active). The EA mode field DISAMBIGUATES from EXT.W (0x4880, mode 000) /
+        // EXT.L (0x48C0, mode 000), which share bit11=1 & bits9:7=001 but use Dn-direct
+        // (mode 0): a real MOVEM EA is a MEMORY mode (>=2), so EXCLUDE reg-direct modes 0/1.
+        // (Indexed mode 6 / 7-3 stay framed COMPLEX by predecode -> never enter the FSM.)
+        val mmMode4 = opword(5 downto 3)
+        when(opword(11) && (opword(9 downto 7) === B"001") && (mmMode4.asUInt >= 2)) {
+          o.illegal := False
+          o.op := DecOp.MOVE                     // benign placeholder; the FSM produces the real µops
+          o.movem := True
+          o.movemDir := opword(10)
+          o.movemSizeLong := opword(6)
+        }
       }
       // ---- Bcc / BSR / BRA (0110 cccc dddddddd) ----
       is(0x6) {

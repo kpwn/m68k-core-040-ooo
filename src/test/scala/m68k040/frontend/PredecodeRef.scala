@@ -174,6 +174,32 @@ object PredecodeRef {
             case Some(e) if ctrlMode => CP(simple = true, lenWords = 1 + e)
             case _                   => COMPLEX
           }
+        } else if (op.&(0x0800) != 0 && ((op >> 7) & 7) == 1) {
+          // MOVEM (0100 1 d 001 s mmmrrr) + 16-bit mask: opword + mask + EA ext. In-scope:
+          // (An)/(An)+/-(An) +0, (d16,An)/(xxx).W/(d16,PC) +1, (xxx).L +2. Direction (bit10)
+          // restricts (An)+ to LOAD, -(An) to STORE, (d16,PC) to LOAD. Out-of-scope modes
+          // (indexed/reg-direct/#imm) -> COMPLEX. (No alias: bit8=0 so not CHK; u4o = 8/C
+          // so not the unary group.)
+          val mmDir  = ((op >> 10) & 1) == 1   // 0 store / 1 load
+          val mmMode = (op >> 3) & 7
+          val mmReg  = op & 7
+          val mmExt: Option[Int] = mmMode match {
+            case 2 => Some(0)                               // (An)
+            case 3 => if (mmDir) Some(0) else None          // (An)+ LOAD only
+            case 4 => if (!mmDir) Some(0) else None         // -(An) STORE only
+            case 5 => Some(1)                               // (d16,An)
+            case 7 => mmReg match {
+              case 0 => Some(1)                             // (xxx).W
+              case 1 => Some(2)                             // (xxx).L
+              case 2 => if (mmDir) Some(1) else None        // (d16,PC) LOAD only
+              case _ => None
+            }
+            case _ => None
+          }
+          mmExt match {
+            case Some(e) => CP(simple = true, lenWords = 2 + e)
+            case None    => COMPLEX
+          }
         } else COMPLEX
       // Line-5: ADDQ/SUBQ (ss != 11) + Scc/DBcc (ss == 11). See PredecodeWord.
       case 0x5 =>
