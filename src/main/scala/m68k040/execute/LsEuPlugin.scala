@@ -656,6 +656,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       val WAIT    = new State   // aligned: cache load cmd accepted, awaiting loadRsp
       val WAIT_A  = new State    // cross: slot A accepted, awaiting line A
       val WAIT_B  = new State    // cross: slot B accepted, awaiting line B -> merge
+      val WAIT_SQ = new State    // store: SQ full, hold the alloc until an entry drains
 
       IDLE.whenIsActive {
         busy := False
@@ -705,11 +706,26 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           // allocate into the SQ; "executes" immediately (no int dst). Store
           // completion drives a CONSTANT compData (off the SQ-compare arc), so it
           // captures here directly without the extra resolve cycle.
-          sq.io.alloc.valid := True
-          captureCompletion(B(0, 32 bits))
-          busy    := False
-          s1Valid := False
-          goto(IDLE)
+          //
+          // BACK-PRESSURE: the SQ alloc Flow has no `ready`, so allocating while the
+          // ring is FULL would overrun it (silent store-drop / count corruption — the
+          // bug a >8-store MOVEM burst exposed). If full, DO NOT alloc; HOLD the µop
+          // (busy, s1 held) in WAIT_SQ until an older committed store drains and frees
+          // an entry. A split store consumes exactly ONE ring entry (slot B is a second
+          // slot WITHIN the entry), so the single `io.full` check covers it. Deadlock-
+          // free: the stalled store is strictly YOUNGER than the resident ones, which
+          // commit incrementally in ROB order and drain (hold-until-ack), freeing a slot.
+          // `sq.io.full` is read ONLY here in the execute FSM (off the IQ select cone),
+          // mirroring the push-only `lsBusy` discipline — no IQ-critical-path impact.
+          when(!sq.io.full) {
+            sq.io.alloc.valid := True
+            captureCompletion(B(0, 32 bits))
+            busy    := False
+            s1Valid := False
+            goto(IDLE)
+          } otherwise {
+            goto(WAIT_SQ)
+          }
         } otherwise {
           // load: capture the SQ-forward compare result (off the registered s2Paddr)
           // and resolve next cycle.
@@ -792,6 +808,23 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           val merged = m68k040.cache.DcacheByteLane.extractCross(
             lineA, dcache.loadRsp.payload.line, lineOff, u1.size)
           captureCompletion(merged)
+          busy    := False
+          s1Valid := False
+          goto(IDLE)
+        }
+      }
+
+      // STORE back-pressure stall: the SQ was full when this store reached its alloc
+      // point. Hold the µop (busy => issue.ready low => no younger µop enters; s1 is
+      // held so the store-split inputs / s2Paddr stay stable) and do NOT alloc until
+      // an older committed store drains (`io.full` deasserts). Then alloc + complete,
+      // exactly as the non-full XLATE store path. Deadlock-free (the draining stores
+      // are strictly older — incremental ROB-order commit guarantees forward progress).
+      WAIT_SQ.whenIsActive {
+        busy := True
+        when(!sq.io.full) {
+          sq.io.alloc.valid := True
+          captureCompletion(B(0, 32 bits))
           busy    := False
           s1Valid := False
           goto(IDLE)

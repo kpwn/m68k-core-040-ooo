@@ -60,6 +60,14 @@ class LsEuSourcePlugin extends FiberPlugin {
     uop.writesX      := False;  uop.pXDst    := U(0)
     uop.pNzvcSrc     := U(0);   uop.readsNzvc := False;  uop.pNzvcOld := U(0)
     uop.pXSrc        := U(0);   uop.readsX    := False;  uop.pXOld    := U(0)
+    // Fields added by later slices (auto-EA / RTR CCR-restore / MOVEM crack markers).
+    // This directed LS source exercises plain aligned load/store (no -(An)/(An)+,
+    // no CCR-restore, no MOVEM crack), so default them inert.
+    uop.eaAuto       := m68k040.decode.EaAuto.NONE
+    uop.eaDelta      := U(0)
+    uop.ccrRestore   := False
+    uop.isMovea      := False
+    uop.divIsRem     := False
     ctx.robId := iRobId
     eu.issue.valid   := iValid
     eu.issue.payload := ctx
