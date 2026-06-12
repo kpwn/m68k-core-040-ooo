@@ -1349,6 +1349,91 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // BCD/ADDX/SUBX -(Ay),-(Ax) MEMORY forms — the MICROCODE ENGINE's first customers.
+  //
+  // (Ax) := <op>( (Ax) <+/-> (Ay) <+/-> X ), both operands PREDECREMENT memory. The
+  // DecodeStage µcode SEQUENCER emits the 6-µop sequence ([load(Ay)->T0][Ay-=d][load(Ax)
+  // ->T1][Ax-=d][op T1,T0->T2 +flags][store T2->(Ax)]). Each program: seed Ay/Ax above
+  // the operand bytes, STORE the operands, set X, run the op, then read Ay/Ax into a Dn
+  // (RAW on the predec An updates) — lock-stepped vs Musashi with the FULL CCR byte
+  // (incl the BCD N/V Musashi computes) + checkMem on the result byte. Names contain
+  // ABCD-mem/SBCD-mem/ADDX-mem/SUBX-mem so `-z` selects each.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  test("lock-step: ABCD-mem -(A1),-(A0) (full CCR + mem + An RAW)", VerilatorTest) {
+    runLockStep("ABCD-mem", Seq(
+      // mem[0x3000]=0x55 (the (Ax) dst byte), mem[0x4000]=0x27 (the (Ay) src byte).
+      "move.l #0x3001,%a0", "move.l #0x00000055,%d0", "move.b %d0,-(%a0)",   // mem[0x3000]=0x55, A0=0x3000
+      "move.l #0x4001,%a1", "move.l #0x00000027,%d1", "move.b %d1,-(%a1)",   // mem[0x4000]=0x27, A1=0x4000
+      "move.l #0x3001,%a0", "move.l #0x4001,%a1",                             // reset An above the bytes
+      "moveq #1,%d6", "addi.b #1,%d6",                                        // X=0
+      "abcd -(%a1),-(%a0)",                                                    // mem[0x3000]:=55+27=82; A0=0x3000,A1=0x4000
+      "move.l %a0,%d3", "move.l %a1,%d4"                                       // RAW on the predec An updates
+    ).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 1)
+  }
+
+  test("lock-step: ABCD-mem carry (X out=1, C=1) + half-carry", VerilatorTest) {
+    runLockStep("ABCD-mem-carry", Seq(
+      "move.l #0x3001,%a0", "move.l #0x00000099,%d0", "move.b %d0,-(%a0)",   // mem[0x3000]=0x99
+      "move.l #0x4001,%a1", "move.l #0x00000099,%d1", "move.b %d1,-(%a1)",   // mem[0x4000]=0x99
+      "move.l #0x3001,%a0", "move.l #0x4001,%a1",
+      "moveq #-1,%d6", "addi.b #1,%d6",                                       // X=1 (0xff+1 carries)
+      "abcd -(%a1),-(%a0)",                                                    // 99+99+1=199 -> 0x99, carry (C=X=1)
+      "move.l %a0,%d3", "move.l %a1,%d4"
+    ).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 1)
+  }
+
+  test("lock-step: SBCD-mem -(A1),-(A0) borrow + full CCR", VerilatorTest) {
+    runLockStep("SBCD-mem", Seq(
+      "move.l #0x3001,%a0", "move.l #0x00000050,%d0", "move.b %d0,-(%a0)",   // mem[0x3000]=0x50 (dst)
+      "move.l #0x4001,%a1", "move.l #0x00000099,%d1", "move.b %d1,-(%a1)",   // mem[0x4000]=0x99 (src)
+      "move.l #0x3001,%a0", "move.l #0x4001,%a1",
+      "moveq #1,%d6", "addi.b #1,%d6",                                        // X=0
+      "sbcd -(%a1),-(%a0)",                                                    // 50-99=51 borrow (C=X=1)
+      "move.l %a0,%d3", "move.l %a1,%d4"
+    ).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 1)
+  }
+
+  test("lock-step: ADDX-mem.L -(A1),-(A0) (4-byte limb + An RAW)", VerilatorTest) {
+    runLockStep("ADDX-mem", Seq(
+      // mem[0x3000]=0x10000001 (dst), mem[0x4000]=0x20000002 (src). .L predec by 4.
+      "move.l #0x3004,%a0", "move.l #0x10000001,%d0", "move.l %d0,-(%a0)",   // mem[0x3000]=0x10000001, A0=0x3000
+      "move.l #0x4004,%a1", "move.l #0x20000002,%d1", "move.l %d1,-(%a1)",   // mem[0x4000]=0x20000002, A1=0x4000
+      "move.l #0x3004,%a0", "move.l #0x4004,%a1",
+      "moveq #1,%d6", "addi.b #1,%d6",                                        // X=0
+      "addx.l -(%a1),-(%a0)",                                                  // 0x10000001+0x20000002 = 0x30000003
+      "move.l %a0,%d3", "move.l %a1,%d4"                                       // A0=0x3000, A1=0x4000
+    ).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+
+  test("lock-step: SUBX-mem.W -(A1),-(A0) (word limb, borrow)", VerilatorTest) {
+    runLockStep("SUBX-mem", Seq(
+      // mem[0x3000]=0x0003 (dst word), mem[0x4000]=0x0005 (src word). .W predec by 2.
+      "move.l #0x3002,%a0", "move.l #0x00000003,%d0", "move.w %d0,-(%a0)",   // mem[0x3000]=0x0003, A0=0x3000
+      "move.l #0x4002,%a1", "move.l #0x00000005,%d1", "move.w %d1,-(%a1)",   // mem[0x4000]=0x0005, A1=0x4000
+      "move.l #0x3002,%a0", "move.l #0x4002,%a1",
+      "moveq #1,%d6", "addi.b #1,%d6",                                        // X=0
+      "subx.w -(%a1),-(%a0)",                                                  // 0x0003-0x0005 = 0xfffe borrow (C=X=1)
+      "move.l %a0,%d3", "move.l %a1,%d4"                                       // A0=0x3000, A1=0x4000
+    ).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 2)
+  }
+
+
+  test("lock-step: ABCD-mem alternate slot alignment", VerilatorTest) {
+    // An extra 1-word op before the X-mem op shifts its fetch-group slot parity
+    // (exercises a different slot0/slot1 pairing than the other tests).
+    runLockStep("ABCD-mem-slot0", Seq(
+      "move.l #0x3001,%a0", "move.l #0x00000012,%d0", "move.b %d0,-(%a0)",
+      "move.l #0x4001,%a1", "move.l #0x00000034,%d1", "move.b %d1,-(%a1)",
+      "move.l #0x3001,%a0", "move.l #0x4001,%a1",
+      "moveq #1,%d6", "addi.b #1,%d6",
+      "moveq #7,%d2",                                          // 1-word op to shift slot parity
+      "abcd -(%a1),-(%a0)",                                    // 12+34 = 46
+      "move.l %a0,%d3", "move.l %a1,%d4"
+    ).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 1)
+  }
+
   test("lock-step: NOT.B/.W/.L (NZ, V=C=0, upper preserved)", VerilatorTest) {
     runLockStep("not", Seq(
       "move.l #0x0000000f,%d0", "not.b %d0",                  // .B ~0x0f=0xf0, N=1
@@ -2885,9 +2970,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // (generalizing the call/return A7 stkPush). Programs STORE before they LOAD
   // (the DUT memory is zeroed), then read the post-update An into a Dn so the RAW
   // on the An update + the An value are validated against Musashi. checkMem
-  // validates the stored bytes. ADDX/SBCD memory predec forms stay deferred (they
-  // need >3 µops — beyond the AssembledUops budget — and OperationDecoder leaves
-  // them illegal; documented in the slice report).
+  // validates the stored bytes. (The ABCD/SBCD/ADDX/SUBX -(Ay),-(Ax) MEMORY predec
+  // forms — which need >3 µops, beyond the AssembledUops budget — are now implemented
+  // via the µcode ENGINE (decode/Microcode.scala + the DecodeStage sequencer); their
+  // own lock-step tests are above (search "*-mem").)
 
   // ── MOVE (An)+,Dn loads (.L/.W/.B) + RAW on the postinc An ────────────────────
   test("lock-step: MOVE.L (A0)+,D0 postinc load + An RAW", VerilatorTest) {
