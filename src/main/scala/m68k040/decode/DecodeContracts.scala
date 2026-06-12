@@ -109,6 +109,16 @@ case class OpSpec() extends Bundle {
   val movem         = Bool()
   val movemDir      = Bool()
   val movemSizeLong = Bool()
+  // ── Microcode engine routing (v1: straight-line cold opcodes) ───────────────
+  // A cold/complex opcode whose µop stream EXCEEDS the ≤3-µop fast-crack budget is
+  // emitted by the DecodeStage µcode SEQUENCER instead of the MicroOpAssembler crack.
+  // OperationDecoder sets `microcoded := True` + `ucEntry` (the entry µPC into the
+  // Microcode ROM); the sequencer walks the ROM from `ucEntry`. Like `movem`, the op
+  // is kept NON-illegal (a benign placeholder so the assembler's `bad` never fires —
+  // the sequencer owns emission). First customers: the ABCD/SBCD/ADDX/SUBX
+  // -(Ay),-(Ax) MEMORY forms (6 µops). Default: not microcoded.
+  val microcoded    = Bool()
+  val ucEntry       = UInt(4 bits)   // entry µPC (ROM is small; 4 bits is ample for v1)
 }
 object OpSpec {
   def illegalDefault(): OpSpec = {
@@ -127,6 +137,7 @@ object OpSpec {
     o.bitOp := 0
     o.extByte := False
     o.movem := False; o.movemDir := False; o.movemSizeLong := False
+    o.microcoded := False; o.ucEntry := 0
     o
   }
 }
