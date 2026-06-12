@@ -252,7 +252,11 @@ object PredecodeRef {
         // ADDX/SUBX register form (line 9/D, opmode 4/5/6, EA mode 000 = Dn-direct):
         // a single 1-word op (Dx := Dx +/- Dy +/- X). Mode 000 is NOT a valid
         // ADD/SUB-to-mem dst, so frame it simple len1. Memory form (mode 001) -> COMPLEX.
-        else if ((cls == 0x9 || cls == 0xD) && (opmode == 4 || opmode == 5 || opmode == 6) && srcMode == 0)
+        // ADDX/SUBX register form (mode 000) AND -(Ay),-(Ax) MEMORY form (mode 001,
+        // microcoded): both are single 1-word ops (the mem form's 6 µops come from the
+        // DecodeStage µcode sequencer; predecode only needs LEN=1). Mode 001 is An-direct
+        // (never a valid ADD/SUB mem dst) so it is unambiguously the X-mem form.
+        else if ((cls == 0x9 || cls == 0xD) && (opmode == 4 || opmode == 5 || opmode == 6) && (srcMode == 0 || srcMode == 1))
           CP(simple = true, lenWords = 1)
         // EXG (line C, bit8=1): 1100 xxx 1 ooooo yyy with ooooo (bits 7:3) in {01000,01001,
         // 10001} (EXG Dx,Dy / Ax,Ay / Dx,Ay). A single-word reg-reg swap -> simple len1
@@ -263,7 +267,10 @@ object PredecodeRef {
         // ABCD (line C) / SBCD (line 8) register form: opmode 4, EA mode 000 (Dn-direct).
         // A single 1-word op (Dx := BCD(Dx +/- Dy +/- X)). Mode 000 is NOT a valid mem-dst,
         // so frame it simple len1 (mirrors the RTL). Memory form (mode 001) -> COMPLEX.
-        else if ((cls == 0x8 || cls == 0xC) && opmode == 4 && srcMode == 0)
+        // ABCD/SBCD register form (mode 000) AND -(Ay),-(Ax) MEMORY form (mode 001,
+        // microcoded): both single 1-word ops (opmode 4 only; the mem 6 µops come from
+        // the µcode sequencer). Mode 001 is An-direct (not a valid mem dst) -> X-mem form.
+        else if ((cls == 0x8 || cls == 0xC) && opmode == 4 && (srcMode == 0 || srcMode == 1))
           CP(simple = true, lenWords = 1)
         else if (opmode == 4 || opmode == 5 || opmode == 6)        // ALU Dn,<ea> RMW mem-dest
           memDestExt(srcMode, srcReg) match {

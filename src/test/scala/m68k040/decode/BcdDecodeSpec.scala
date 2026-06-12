@@ -123,23 +123,27 @@ class BcdDecodeSpec extends AnyFunSuite {
     }
   }
 
-  test("ABCD memory form -(A1),-(A0) (0xC109, bit3=1): NOT BCD, illegal/deferred", VerilatorTest) {
-    // bits 5:3 = 001 (bit3=1) fails the "00000" register-form test -> stays on the
-    // AND-RMW path; the assembler rejects the Dn-direct/An EA -> illegal.
+  // ── ABCD/SBCD MEMORY form -(Ay),-(Ax) (bit3=1, EA mode 001): MICROCODED ───────
+  // bits 5:3 = 001 (bit3=1) is the -(Ay),-(Ax) memory form: a >3-µop sequence the
+  // DecodeStage µcode sequencer emits (NOT the fast crack). OperationDecoder marks it
+  // microcoded + NON-illegal (op=BCD + bcdSub + size carry the kind), with the real µop
+  // stream produced by the engine (validated in MicrocodeSpec + ExecuteLockStepSpec).
+  test("ABCD memory form -(A1),-(A0) (0xC109, bit3=1): microcoded (NOT illegal)", VerilatorTest) {
     runDec(0xC109) { dut =>
-      assert(dut.o.op.toEnum != DecOp.BCD, "memory-form ABCD is not the register BCD")
-    }
-    runAsm { dut => drive(dut, 0xC109); sleep(1)
-      assert(dut.uop0.unimplemented.toBoolean, "memory-form ABCD (-(Ay),-(Ax)) stays illegal/deferred")
+      assert(!dut.o.illegal.toBoolean, "memory-form ABCD is NOT illegal (microcoded)")
+      assert(dut.o.microcoded.toBoolean, "memory-form ABCD is microcoded")
+      assert(dut.o.op.toEnum == DecOp.BCD, "op = BCD (the latched op for the engine)")
+      assert(!dut.o.bcdSub.toBoolean, "ABCD: bcdSub = False")
+      assert(dut.o.size.toEnum == Size.BYTE, "BCD mem is byte-only")
     }
   }
 
-  test("SBCD memory form -(A1),-(A0) (0x8109, bit3=1): NOT BCD, illegal/deferred", VerilatorTest) {
+  test("SBCD memory form -(A1),-(A0) (0x8109, bit3=1): microcoded (NOT illegal)", VerilatorTest) {
     runDec(0x8109) { dut =>
-      assert(dut.o.op.toEnum != DecOp.BCD, "memory-form SBCD is not the register BCD")
-    }
-    runAsm { dut => drive(dut, 0x8109); sleep(1)
-      assert(dut.uop0.unimplemented.toBoolean, "memory-form SBCD stays illegal/deferred")
+      assert(!dut.o.illegal.toBoolean, "memory-form SBCD is NOT illegal (microcoded)")
+      assert(dut.o.microcoded.toBoolean, "memory-form SBCD is microcoded")
+      assert(dut.o.op.toEnum == DecOp.BCD, "op = BCD")
+      assert(dut.o.bcdSub.toBoolean, "SBCD: bcdSub = True")
     }
   }
 }

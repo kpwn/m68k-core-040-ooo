@@ -39,11 +39,21 @@ class PredecodeWordSpec extends AnyFunSuite {
       chk(0x2430, 2, "MOVE.L (d8,An,Xn) src")
       // move.l (6,%pc,%d1.w*2),%d2 = 0x243B (src mode7 reg3)
       chk(0x243B, 2, "MOVE.L (d8,PC,Xn) src")
-      // move.l %d2,(4,%a0,%d1.w*2) = 0x2580 ... actually dst mode6: opword 0x2... dst field.
       // add.l %d1,(4,%a0,%d2.w) = 0xD3B0 (line D, Dn=D1 src, opmode6 .L, dst mode6 reg0)
       chk(0xD3B0, 2, "ADD.L Dn,(d8,An,Xn) RMW dest")
       // add.l (4,%a0,%d1.w),%d2 = 0xD4B0 (line D, dst D2, opmode2 .L src, src mode6 reg0)
       chk(0xD4B0, 2, "ADD.L (d8,An,Xn),Dn src")
+    }
+  }
+
+  test("BCD/ADDX/SUBX -(Ay),-(Ax) memory forms frame simple len=1", VerilatorTest) {
+    // ABCD -(A1),-(A0) 0xC109 ; SBCD 0x8109 ; ADDX.L -(A2),-(A3) 0xD78A ; SUBX.B -(A1),-(A0) 0x9109
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      for (op <- Seq(0xC109, 0x8109, 0xD78A, 0x9109)) {
+        dut.op #= op; sleep(1)
+        assert(dut.res.simple.toBoolean, f"opword 0x$op%04x must frame simple")
+        assert(dut.res.lenWords.toInt == 1, f"opword 0x$op%04x must frame lenWords=1, got ${dut.res.lenWords.toInt}")
+      }
     }
   }
 }
