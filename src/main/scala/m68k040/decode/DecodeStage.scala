@@ -103,14 +103,13 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // PLACEHOLDER crack of the MOVEM opword (OperationDecoder marks MOVEM as DecOp.MOVE)
     // is pushed as a SPURIOUS extra kept µop alongside slot0 — the phantom commit.
     // (`slot1IsMovem` below reuses this; the OperationDecoder cone is shared via CSE.)
-    val slot1IsMovemEarly = fed.valid && fed.payload.slot1Valid &&
-                            OperationDecoder.decode(fed.payload.packets(1).words(0)).movem
-    // A slot1 MICROCODED op (like a slot1 MOVEM) cannot be emitted as a normal crack —
-    // its real µops come from the µcode SEQUENCER (entered from the stashed packet). It
-    // MUST be excluded from the normal slot1 push (else the benign placeholder is pushed
-    // as a phantom commit). Mirrors slot1IsMovemEarly. (Shared OperationDecoder cone.)
-    val slot1IsUcodeEarly = fed.valid && fed.payload.slot1Valid &&
-                            OperationDecoder.decode(fed.payload.packets(1).words(0)).microcoded
+    // ONE shared OperationDecoder cone on the slot1 opword (FMax: a single decode feeds
+    // both the MOVEM and the microcoded slot1 markers — they cannot be emitted as a normal
+    // crack; their real µops come from the FSM / µcode sequencer entered from the stashed
+    // packet, so both MUST be excluded from the normal slot1 push to avoid a phantom commit).
+    val slot1Spec0        = OperationDecoder.decode(fed.payload.packets(1).words(0))
+    val slot1IsMovemEarly = fed.valid && fed.payload.slot1Valid && slot1Spec0.movem
+    val slot1IsUcodeEarly = fed.valid && fed.payload.slot1Valid && slot1Spec0.microcoded
 
     // slot1 is emitted alongside slot0 only when: not replaying a stash, slot1 present,
     // slot0 is NOT 3-µop, slot1 itself is NOT 3-µop (a 3-µop slot1 is deferred), and
@@ -310,7 +309,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
 
     // The source packet the engine enters from: the stashed slot1 microcoded op, else slot0.
     val ucEntryPkt = Mux(ucPendValid, ucPendPkt, fed.payload.packets(0))
-    val ucEntrySpec = OperationDecoder.decode(ucEntryPkt.words(0))
+    // ucEntrySpec: reuse spec0 (the slot0 decode) for a slot0 entry; only the PENDING-slot1
+    // entry needs its own decode (its opword differs from slot0). One extra cone, not two.
+    val ucPendSpec  = OperationDecoder.decode(ucPendPkt.words(0))
+    val ucEntrySpec = Mux(ucPendValid, ucPendSpec, spec0)
 
     // Begin a µcode op: a pending slot1 microcoded op, OR a microcoded slot0 (not blocked
     // by a stash), while the engine + the MOVEM FSM are idle.
