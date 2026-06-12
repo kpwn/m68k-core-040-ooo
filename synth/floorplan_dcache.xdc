@@ -12,14 +12,21 @@
 # took decode->ring off the critical path, 195->~218).
 #
 # Read AFTER opt_design (see impl_FullCore.tcl) so the cell filter sees elaborated leaves.
-# Region: same X span as pb_decode (X36..X75) but STACKED ABOVE it (Y110..Y214, ~2 clock-
-# region rows) so it does NOT collide with pb_decode's SLICE_X36Y0:SLICE_X75Y104. Loose
-# (~40 cols x ~104 rows), not snug -- the precedent showed a too-tight box over-constrains
-# the router and REGRESSES.
+# Region (the measured sweet spot): same X span as pb_decode (X36..X75) but STACKED ABOVE it
+# (Y110..Y214, ~2 clock-region rows) so it does NOT collide with pb_decode's
+# SLICE_X36Y0:SLICE_X75Y104. Loose (~40 cols x ~105 rows), not snug -- the precedent showed a
+# too-tight box over-constrains the router and REGRESSES.
+#
+# ITERATIONS (full-core post-route, OOC 4 ns; master baseline -0.514 / 221.5 MHz):
+#   v1  X36Y110:X75Y214 (this box)   WNS -0.317 / 231.6 MHz   <-- BEST (+10.1 MHz)
+#   v2  X28Y110:X83Y214 (wider)      WNS -0.439 / 225.3 MHz   (looser -> less co-location)
+#   v3  X36Y70:X75Y174  (shift down) WNS -0.477 / 223.4 MHz   (collides w/ datapath/decode)
+# v1's X36..X75 width (same as decode) is the sweet spot; wider AND shifted-down both regress.
 #
 # NOTE (capture): `*Plugin_logic*` UNDER-captures post-flatten (Vivado merges leaf names);
-# verify the printed PBLOCK_DCACHE_CELLS count is non-trivial (hundreds+). The three
-# plugins contribute ~944 (Dcache) + 81 (Dtlb) + 352 (LsEu) unique signal names pre-synth.
+# verify the printed pb_dcache cell count is non-trivial -- here the OR-filter over all three
+# plugins captures 7313 cells (robust, vs the decode pblock's 1284). The three plugins
+# contribute ~944 (Dcache) + 81 (Dtlb) + 352 (LsEu) unique signal names pre-synth.
 create_pblock pb_dcache
 resize_pblock pb_dcache -add {SLICE_X36Y110:SLICE_X75Y214}
 add_cells_to_pblock pb_dcache [get_cells -hier -filter {NAME =~ *DcachePlugin_logic* || NAME =~ *DtlbPlugin_logic* || NAME =~ *LsEuPlugin_logic*}]
