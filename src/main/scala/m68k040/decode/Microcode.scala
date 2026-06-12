@@ -208,6 +208,9 @@ object Microcode {
     u.bcdSub := ctx.bcdSub
     u.bitOp := 0; u.extByte := False; u.isMovea := False
     u.isScc := False; u.isDbcc := False
+    // Indexed-EA descriptor fields (added by the indexed-modes slice): µcode µops never
+    // use an index — default inert (mirrors MicroOpAssembler's non-indexed cracks).
+    u.indexLong := False; u.indexScale := 0
     u.firstOfInstr := Bool(d.isFirst)
     u
   }
