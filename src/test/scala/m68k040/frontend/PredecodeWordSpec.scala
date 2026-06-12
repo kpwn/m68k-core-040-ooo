@@ -26,4 +26,15 @@ class PredecodeWordSpec extends AnyFunSuite {
       }
     }
   }
+
+  test("BCD/ADDX/SUBX -(Ay),-(Ax) memory forms frame simple len=1", VerilatorTest) {
+    // ABCD -(A1),-(A0) 0xC109 ; SBCD 0x8109 ; ADDX.L -(A2),-(A3) 0xD78A ; SUBX.B -(A1),-(A0) 0x9109
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      for (op <- Seq(0xC109, 0x8109, 0xD78A, 0x9109)) {
+        dut.op #= op; sleep(1)
+        assert(dut.res.simple.toBoolean, f"opword 0x$op%04x must frame simple")
+        assert(dut.res.lenWords.toInt == 1, f"opword 0x$op%04x must frame lenWords=1, got ${dut.res.lenWords.toInt}")
+      }
+    }
+  }
 }

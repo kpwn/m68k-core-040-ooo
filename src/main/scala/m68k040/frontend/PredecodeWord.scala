@@ -402,20 +402,19 @@ object PredecodeWord {
             r.lenWords := (U(1, 3 bits) + e).resized
           }
         } elsewhen(opmode === U(4, 3 bits) || opmode === U(5, 3 bits) || opmode === U(6, 3 bits)) {
-          // ADDX/SUBX register form (line 9/D, opmode 4/5/6, EA mode field 000 = Dn-direct):
-          // a single 1-word op (Dx := Dx +/- Dy +/- X). The mode-000 slot is NOT a valid
-          // ADD/SUB-to-mem dst, so frame it as simple len1 (else memDestExt rejects Dn ->
-          // unframed -> nextPc=pc -> the front-end stalls). The memory form `-(Ay),-(Ax)`
-          // (mode 001) is NOT framed here (stays the assembler's illegal/deferred path).
+          // ADDX/SUBX register form (mode 000) AND -(Ay),-(Ax) MEMORY form (mode 001,
+          // MICROCODED): both are single 1-word ops. The reg form is Dx := Dx +/- Dy +/- X
+          // (1 µop); the mem form's 6 µops come from the DecodeStage µcode SEQUENCER, so
+          // predecode only needs LEN=1. Mode 001 is An-direct (never a valid ADD/SUB-to-mem
+          // dst) so it is unambiguously the X-mem form. Frame both (else memDestExt rejects
+          // mode 000/001 -> unframed -> nextPc=pc -> the front-end stalls).
           val isAddxSubxReg = (cls === U(9, 4 bits) || cls === U(0xD, 4 bits)) &&
-                              (srcMode === U(0, 3 bits))
-          // ABCD (line C) / SBCD (line 8) register form: opmode 4, EA mode field 000
-          // (Dn-direct). A single 1-word op (Dx := BCD(Dx +/- Dy +/- X)). Like ADDX/SUBX
-          // the mode-000 slot is not a valid mem-dst, so frame it as simple len1 (else
-          // memDestExt rejects Dn -> unframed -> nextPc=pc -> the front-end stalls). The
-          // memory form -(Ay),-(Ax) (mode 001) is NOT framed (stays illegal/deferred).
+                              (srcMode === U(0, 3 bits) || srcMode === U(1, 3 bits))
+          // ABCD (line C) / SBCD (line 8): opmode 4. Register form (mode 000) + -(Ay),-(Ax)
+          // MEMORY form (mode 001, microcoded). Both single 1-word ops (the mem 6 µops come
+          // from the µcode sequencer). Mode 001 An-direct = the X-mem form; frame both.
           val isBcdReg = (cls === U(8, 4 bits) || cls === U(0xC, 4 bits)) &&
-                         (opmode === U(4, 3 bits)) && (srcMode === U(0, 3 bits))
+                         (opmode === U(4, 3 bits)) && (srcMode === U(0, 3 bits) || srcMode === U(1, 3 bits))
           when(isAddxSubxReg || isBcdReg) {
             r.simple   := True
             r.lenWords := U(1, 3 bits)
