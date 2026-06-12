@@ -257,10 +257,17 @@ class MemRmwDecodeSpec extends AnyFunSuite {
     }
   }
 
-  test("NEG.L (d8,A0,D0) indexed dest -> illegal (MEMCOMPLEX deferred)", VerilatorTest) {
-    // NEG.L (d8,A0,Xn): 0100 0100 10 110 000 = 0x44B0, ext = index word
+  test("NEG.L (d8,A0,D0) indexed dest -> load->T0, NEG->T1, store T1 (index on srcC)", VerilatorTest) {
+    // NEG.L (d8,A0,Xn): 0100 0100 10 110 000 = 0x44B0; ext 0x0000 = Xn=D0, .W, *1, d8=0.
+    // Indexed is now in scope -> the SAME load-op-store RMW crack, with the index reg on
+    // srcC of BOTH the load and the store (so they recompute the SAME indexed address).
     run { dut => drive(dut, 0x44B0, 0x0000, len = 2); sleep(1)
-      assert(dut.uop0.unimplemented.toBoolean, "indexed mem-dest stays illegal")
+      assertRmwTriple(dut, base = 8, baseValid = true, disp = 0, sz = Size.LONG, expOp = DecOp.NEG, opSrcReg = -1)
+      // index reg D0 (srcC) on both the load and the store; .W / scale *1.
+      assert(dut.uop0.srcCReg.toInt == 0 && dut.uop0.srcCValid.toBoolean, "load index = D0 (srcC)")
+      assert(dut.uop2.srcCReg.toInt == 0 && dut.uop2.srcCValid.toBoolean, "store index = D0 (srcC)")
+      assert(!dut.uop0.indexLong.toBoolean && dut.uop0.indexScale.toInt == 0, "load .W / scale *1")
+      assert(!dut.uop2.indexLong.toBoolean && dut.uop2.indexScale.toInt == 0, "store .W / scale *1")
     }
   }
 }

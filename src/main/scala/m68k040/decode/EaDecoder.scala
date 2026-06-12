@@ -37,6 +37,22 @@ object EaDecoder {
     e.pcRel     := False
     e.autoMode  := EaAuto.NONE
     e.autoDelta := 0
+    e.indexValid := False
+    e.indexReg   := 0
+    e.indexLong  := False
+    e.indexScale := 0
+
+    // Brief-format extension word (modes 6 / 7-3): D/A(15) | Xn(14:12) | W/L(11) |
+    // scale(10:9) | brief=0(8) | d8(7:0). bit8=1 => FULL format (memory-indirect /
+    // base-outer-disp) — OUT OF SCOPE (Track B µcode) -> the caller keeps MEMCOMPLEX.
+    val extW        = words(1)
+    val briefIsFull = extW(8)                              // bit8=1 => full ext format
+    val idxDA       = extW(15)                             // 1 => An, 0 => Dn
+    val idxXn       = extW(14 downto 12).asUInt
+    val idxReg      = Mux(idxDA, (U(8, 5 bits) + idxXn).resized, idxXn.resize(5))
+    val idxLong     = extW(11)                             // 1 => .L, 0 => .W
+    val idxScale    = extW(10 downto 9).asUInt
+    val idxD8       = extW(7 downto 0).asSInt.resize(32).asBits   // sext(d8)
 
     switch(mode) {
       is(0) { e.klass := EaClass.DATAREG; e.reg := reg.asUInt.resized }                  // Dn
@@ -56,7 +72,15 @@ object EaDecoder {
         e.klass := EaClass.MEMSIMPLE; e.baseValid := True
         e.disp  := words(1).asSInt.resize(32).asBits
       }
-      is(6) { e.klass := EaClass.MEMCOMPLEX }      // (d8,An,Xn): indexed deferred
+      is(6) {                                      // (d8,An,Xn*scale) brief indexed
+        when(briefIsFull) { e.klass := EaClass.MEMCOMPLEX }   // full format -> Track B
+        .otherwise {
+          e.klass := EaClass.MEMSIMPLE; e.baseValid := True
+          e.disp  := idxD8
+          e.indexValid := True; e.indexReg := idxReg
+          e.indexLong  := idxLong; e.indexScale := idxScale
+        }
+      }
       is(7) {
         switch(reg) {
           is(0) {                                  // (xxx).W
@@ -71,7 +95,15 @@ object EaDecoder {
             e.klass := EaClass.MEMSIMPLE; e.baseValid := False; e.pcRel := True
             e.disp  := words(1).asSInt.resize(32).asBits
           }
-          is(3) { e.klass := EaClass.MEMCOMPLEX }  // (d8,PC,Xn): indexed deferred
+          is(3) {                                  // (d8,PC,Xn*scale) brief indexed
+            when(briefIsFull) { e.klass := EaClass.MEMCOMPLEX }
+            .otherwise {
+              e.klass := EaClass.MEMSIMPLE; e.baseValid := False; e.pcRel := True
+              e.disp  := idxD8
+              e.indexValid := True; e.indexReg := idxReg
+              e.indexLong  := idxLong; e.indexScale := idxScale
+            }
+          }
           is(4) {                                  // #imm
             e.klass := EaClass.IMM
             when(size === Size.LONG) {

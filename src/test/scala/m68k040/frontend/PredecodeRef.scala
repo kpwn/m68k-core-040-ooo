@@ -11,12 +11,12 @@ object PredecodeRef {
   def eaExt(mode: Int, reg: Int, sizeL: Boolean, allowImm: Boolean): Option[Int] = mode match {
     case 0 | 1 | 2 | 3 | 4 => Some(0)        // Dn, An, (An), (An)+, -(An)
     case 5                 => Some(1)        // (d16,An)
-    case 6                 => None           // (d8,An,Xn) indexed -> complex
+    case 6                 => Some(1)        // (d8,An,Xn) brief indexed -> 1 ext word
     case 7 => reg match {
       case 0 => Some(1)                      // abs.W
       case 1 => Some(2)                      // abs.L
       case 2 => Some(1)                      // (d16,PC)
-      case 3 => None                         // (d8,PC,Xn)
+      case 3 => Some(1)                      // (d8,PC,Xn) brief indexed -> 1 ext word
       case 4 => if (allowImm) Some(if (sizeL) 2 else 1) else None  // #imm
       case _ => None
     }
@@ -33,6 +33,8 @@ object PredecodeRef {
     case 3 => Some(0)
     case 4 => Some(0)
     case 5 => Some(1)
+    case 6 => Some(1)        // (d8,An,Xn) brief indexed (alterable mem-dest)
+    // (d8,PC,Xn) (mode 7/3) is PC-relative => NOT alterable => NOT a mem-dest -> None.
     case 7 => reg match { case 0 => Some(1); case 1 => Some(2); case _ => None }
     case _ => None
   }
@@ -88,6 +90,8 @@ object PredecodeRef {
         val se = eaExt(srcMode, srcReg, sizeL, allowImm = true)
         val de = dstMode match {
           case 0 | 1 | 2 | 3 | 4 | 5 => eaExt(dstMode, dstReg, sizeL, allowImm = false)
+          case 6 => Some(1)   // (d8,An,Xn) brief indexed destination: 1 ext word
+          // mode 7 reg 2/3 ((d16,PC)/(d8,PC,Xn)) are PC-relative => NOT a MOVE dest -> None.
           case 7 => dstReg match { case 0 => Some(1); case 1 => Some(2); case _ => None }
           case _ => None
         }

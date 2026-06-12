@@ -25,10 +25,13 @@ object PredecodeWord {
         is(U(3, 3 bits)) { ok := True; ext := U(0, 3 bits) }   // (An)+ postincrement (no ext)
         is(U(4, 3 bits)) { ok := True; ext := U(0, 3 bits) }   // -(An) predecrement (no ext)
         is(U(5, 3 bits)) { ok := True; ext := U(1, 3 bits) }   // (d16,An)
+        is(U(6, 3 bits)) { ok := True; ext := U(1, 3 bits) }   // (d8,An,Xn) brief indexed (alterable)
         is(U(7, 3 bits)) {
           switch(reg) {
             is(U(0, 3 bits)) { ok := True; ext := U(1, 3 bits) }   // (xxx).W
             is(U(1, 3 bits)) { ok := True; ext := U(2, 3 bits) }   // (xxx).L
+            // NOTE: (d8,PC,Xn) (reg 3) is PC-relative => NOT alterable => NOT a mem-dest
+            // (read-only). Left rejected (complex -> assembler illegal). Source-only.
             default { ok := False }
           }
         }
@@ -50,14 +53,19 @@ object PredecodeWord {
           ext := U(1, 3 bits)
         }
         is(U(6, 3 bits)) {
-          ok := False
+          // Brief-format indexed (d8,An,Xn): 1 ext word. Predecode cannot see bit8 (full
+          // vs brief) — frame as brief len 1. A FULL-format EA (bit8=1) is illegalised by
+          // the assembler (MEMCOMPLEX -> vector-4 fault), where a mis-framed length is
+          // harmless (the illegal op flushes the pipeline at the faulting pc). Track B
+          // handles the full extension format precisely.
+          ext := U(1, 3 bits)
         }
         is(U(7, 3 bits)) {
           switch(reg) {
             is(U(0, 3 bits)) { ext := U(1, 3 bits) }
             is(U(1, 3 bits)) { ext := U(2, 3 bits) }
             is(U(2, 3 bits)) { ext := U(1, 3 bits) }
-            is(U(3, 3 bits)) { ok := False }
+            is(U(3, 3 bits)) { ext := U(1, 3 bits) }   // (d8,PC,Xn) brief indexed: 1 ext word
             is(U(4, 3 bits)) {
               if (allowImm) {
                 ext := Mux(sizeL, U(2, 3 bits), U(1, 3 bits))
@@ -135,7 +143,11 @@ object PredecodeWord {
 
         val (sOk, sExt) = eaExt(srcMode, srcReg, sizeL, allowImm = true)
 
-        // dst: modes 0-5 via eaExt(allowImm=false), mode 7 only reg0/reg1, else complex
+        // dst: modes 0-5 via eaExt(allowImm=false), mode 6 = brief indexed (1 ext word),
+        // mode 7 only reg0/reg1, else complex. mode 7-3 ((d8,PC,Xn)) + 7-2 ((d16,PC)) are
+        // PC-relative => NOT alterable => NOT a MOVE destination -> complex (assembler
+        // illegal). The MOVE dst inline path (NOT eaExt) owns this since eaExt is the
+        // source variant (which DOES accept (d16,PC)/(d8,PC,Xn) as read-only sources).
         val dOk  = Bool()
         val dExt = UInt(3 bits)
         dOk  := True
@@ -148,7 +160,7 @@ object PredecodeWord {
             default          { dOk  := False }
           }
         } elsewhen(dstMode === U(6, 3 bits)) {
-          dOk := False
+          dExt := U(1, 3 bits)   // (d8,An,Xn) brief indexed destination: 1 ext word
         } otherwise {
           val (o, e) = eaExt(dstMode, dstReg, sizeL, allowImm = false)
           dOk  := o

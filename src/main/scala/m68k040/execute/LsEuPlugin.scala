@@ -72,6 +72,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   var wakeupNzvcPort: Flow[UInt]   = null
   var faultCompletionPort: Flow[LsFault] = null
   var rdBase, rdData: RegFileReadPort = null
+  var rdIndex: RegFileReadPort = null   // brief-format indexed EA: the index register Xn (psrcC)
   var intW: RegFileWritePort = null
   var intByp: RegFileBypassPort = null
   var nzvcW: RegFileWritePort = null
@@ -122,6 +123,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val irf = host[IntRegFileService]
     rdBase = irf.newRead()
     rdData = irf.newRead()
+    rdIndex = irf.newRead()   // brief-format indexed EA: the index register Xn (psrcC)
     intW   = irf.newWrite(latency = 1)
     intByp = irf.newBypass()
     // MOVE-to-memory sets NZVC (impl (a)): the LS EU writes the NZVC PRF + bypass at
@@ -193,6 +195,22 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // (feeds only the SQ entry), so it stays a registered value.
     val data0 = Mux(u0.stkPush && !u0.psrcBValid, u0.imm, rdData.data)   // push: retPC (imm) / LINK: old An (srcB)
 
+    // Brief-format indexed EA: the index register Xn rides psrcC. .W sign-extends the
+    // low 16 bits, .L uses the full 32; then shift-left by the scale exponent (0..3 =>
+    // *1/2/4/8). Zero when no index (psrcCValid false) so a non-indexed access adds
+    // nothing. Read in S0 (off the regfile, possibly bypassed); the scaled term is
+    // REGISTERED into s1Index at the S0->S1 boundary so the AGU adder stays a shallow
+    // stage off flops (mirrors s1Base) — Xn is an architectural reg read, not on the
+    // deep ALU->base bypass cone.
+    rdIndex.addr := u0.psrcC
+    val idxRaw0  = Mux(u0.indexLong, rdIndex.data.asUInt,
+                       rdIndex.data(15 downto 0).asSInt.resize(32).asUInt)
+    // Scale shift: 32-bit MODULAR (m68k address arithmetic wraps mod 2^32, matching
+    // Musashi). `<<` by the 2-bit exponent keeps 32 bits (overflow bits discarded) —
+    // explicit resize so the result width is unambiguously 32 (the s1Index reg width).
+    val idxScaled = ((idxRaw0 << u0.indexScale).resize(32))
+    val idxTerm0 = Mux(u0.psrcCValid, idxScaled, U(0, 32 bits))
+
     // ---- access size in bytes (1/2/4) ----
     // A single m68k access spans at most two 16-byte lines / two 4 KB pages, so a
     // single "second access" suffices. Used by the S1 cross-detection (below) and
@@ -214,6 +232,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val s1Ctx   = Reg(IqContext())
     val s1Base  = Reg(UInt(32 bits))
     val s1Data  = Reg(Bits(32 bits))
+    // Registered scaled index term (brief-format indexed EA): 0 for a non-indexed access.
+    val s1Index = Reg(UInt(32 bits))
     val u1 = s1Ctx.uop
 
     // ---- S1: AGU effective address (off the REGISTERED base) ----
@@ -243,7 +263,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
                  Mux(u1.eaAuto === m68k040.decode.EaAuto.PREDEC,  -eaDelta1,
                  Mux(u1.eaAuto === m68k040.decode.EaAuto.POSTINC,  S(0, 32 bits),
                      u1.imm.asSInt)))
-    val s1Va   = (s1Base.asSInt + s1Disp).asUInt
+    // Effective address = base + disp + scaled index. The index term is 0 for non-indexed
+    // accesses (s1Index latched from idxTerm0, gated by psrcCValid). Indexed modes never
+    // carry eaAuto/stkPush (mutually exclusive EA modes), so s1Disp = plain imm (d8 or
+    // pc+2+d8) for an indexed µop and s1Index adds the scaled Xn. All three are flops/
+    // uop-derived (no ALU-result bypass) -> a single shallow adder, not on the ALU cone.
+    val s1Va   = (s1Base.asSInt + s1Disp + s1Index.asSInt).asUInt
     // The An write-back value for an auto-update µop (when it carries an int dst):
     //   PREDEC  -> s1Va (= base - eaDelta, the decremented An)
     //   POSTINC -> base + eaDelta
@@ -637,6 +662,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       s1Ctx   := issuePort.payload
       s1Base  := base0
       s1Data  := data0
+      s1Index := idxTerm0
     } otherwise {
       when(!busy) { s1Valid := False }
     }

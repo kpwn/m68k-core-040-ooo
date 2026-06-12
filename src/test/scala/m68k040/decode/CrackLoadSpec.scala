@@ -94,10 +94,23 @@ class CrackLoadSpec extends AnyFunSuite {
     }
   }
 
-  test("memComplex EA source still unimplemented", VerilatorTest) {
-    // ADD.L (d8,A0,D0.w),D1 : mode 6 = (d8,An,Xn) -> memComplex -> unimplemented
+  test("indexed (d8,A0,Xn) EA source -> LOAD(base=A0,index=Xn) + ADD reading T0", VerilatorTest) {
+    // ADD.L (d8,A0,D0.w),D1 : mode 6 = brief indexed -> now cracks a leading load.
+    // opword 0xD2B0; ext word 0x0000 = Xn=D0, .W (bit11=0), scale*1 (bits10:9=0), d8=0.
     run { dut => drive(dut, 0xD2B0, 0x0000, len = 2); sleep(1)
-      assert(dut.uop0.unimplemented.toBoolean, "memComplex EA must stay unimplemented")
+      assert(dut.count.toInt == 2, s"expected 2 µops, got ${dut.count.toInt}")
+      assert(!dut.uop0.unimplemented.toBoolean, "indexed EA is now in scope")
+      // µop0 = load: base = A0 (8), index = D0 (srcC), disp = d8 = 0.
+      assert(dut.uop0.cluster.toEnum == Cluster.LS && dut.uop0.memOp.toEnum == MemOp.LOAD)
+      assert(dut.uop0.srcAReg.toInt == 8 && dut.uop0.srcAValid.toBoolean, "load base = A0")
+      assert(dut.uop0.srcCReg.toInt == 0 && dut.uop0.srcCValid.toBoolean, "load index = D0 (srcC)")
+      assert(!dut.uop0.indexLong.toBoolean && dut.uop0.indexScale.toInt == 0, ".W, scale *1")
+      assert(dut.uop0.imm.toLong == 0, "load disp = d8 = 0")
+      assert(dut.uop0.dstReg.toInt == 16, "load dst = T0")
+      // µop1 = ADD reading T0 in srcB.
+      assert(dut.uop1.op.toEnum == DecOp.ADD)
+      assert(dut.uop1.srcBReg.toInt == 16 && dut.uop1.srcBValid.toBoolean, "ADD srcB = T0")
+      assert(!dut.uop1.unimplemented.toBoolean)
     }
   }
 

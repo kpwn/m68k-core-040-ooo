@@ -80,6 +80,10 @@ case class RenamedUop() extends Bundle {
   // Macro-instruction boundary marker (interrupts): True for the FIRST µop of an
   // instruction (the only multi-µop case is a memSimple-source crack [load, op]).
   val firstOfInstr = Bool()
+  // Brief-format indexed EA: the index reg rides psrcC/psrcCValid; these size+scale it
+  // in the LS-EU AGU (indexLong => full 32 vs .W sign-extend; indexScale = *1/2/4/8).
+  val indexLong  = Bool()
+  val indexScale = UInt(2 bits)
   val dstArch = UInt(5 bits)   // architectural int dst reg 0..17 (incl T0/T1); for commit RAT + CommitTrace
   val psrcA = UInt(intW bits); val psrcAValid = Bool()
   val psrcB = UInt(intW bits); val psrcBValid = Bool()
