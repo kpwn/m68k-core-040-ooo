@@ -600,7 +600,7 @@ object MicroOpAssembler {
     // OperationDecoder already named it DecOp.BCD (a single register-direct ALU µop);
     // exclude it from the "RMW EA must be MEMSIMPLE" gate (its Dn-direct EA is intended).
     val isBcdReg = (spec.op === DecOp.BCD)
-    val aluRmwMemBad = isAluRmwOp && !isAddxSubxReg && !isBcdReg && (srcEa.klass =/= EaClass.MEMSIMPLE)
+    val aluRmwMemBad = isAluRmwOp && !isAddxSubxReg && !isBcdReg && !spec.microcoded && (srcEa.klass =/= EaClass.MEMSIMPLE)
     // ADDQ/SUBQ (srcB = IMMQ3): the EA (op[5:0]) is the DESTINATION (read AND written).
     // This slice supports a DATA-register OR ADDRESS-register destination only; a memory
     // EA is the deferred RMW form -> illegal. `addqMemBad` forces the illegal path (it
@@ -1295,7 +1295,15 @@ object MicroOpAssembler {
     // else       -> [op] (count 1)
     // Default the 3rd µop slot (only RTR uses it) so every path drives uops(2) once.
     out.uops(2) := opUop
-    when(pkt.fault) {
+    when(spec.microcoded) {
+      // The DecodeStage µcode SEQUENCER owns emission (like MOVEM): emit a benign single
+      // placeholder µop here so the assembler's `bad`/crack never fires. The sequencer
+      // gates this off (it does not push the placeholder). opUop is already non-`bad`
+      // (spec.illegal False + no USED src/dst EA), so unimplemented stays False.
+      out.count   := 1
+      out.uops(0) := opUop
+      out.uops(1) := opUop
+    } elsewhen(pkt.fault) {
       // Fetch fault dominates: a single faulted (vector-2) delivery µop.
       out.count   := 1
       out.uops(0) := opUop

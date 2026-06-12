@@ -2,6 +2,7 @@ package m68k040.decode
 
 import m68k040.frontend.{DecodePacket, PipeStage}
 import m68k040.services.{DecodeFeedService, DecodeUopService}
+import m68k040.isa.Size
 import spinal.core._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
@@ -214,6 +215,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // it next cycle (mirrors the 3-µop slot1 defer, but carries the raw packet).
     val spec0  = OperationDecoder.decode(fed.payload.packets(0).words(0))
     val slot0IsMovem = fed.valid && spec0.movem
+    // The head packet's microcode marker (shared CSE with spec0): a `microcoded` opword
+    // is owned by the µcode SEQUENCER (below), mutually exclusive with the fast head AND
+    // the MOVEM FSM (exactly as a MOVEM slot0 is owned by the MOVEM FSM).
+    val slot0IsMicrocoded = fed.valid && spec0.microcoded
     val slot1IsMovem = slot1IsMovemEarly   // slot1's MOVEM marker (decoded above, shared via CSE)
     val movemPendValid = RegInit(False)
     val movemPendPkt   = Reg(DecodePacket())
@@ -269,11 +274,48 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // regardless of what slot0 in the HELD next group is — even a MOVEM that waits), OR a
     // fresh slot0 that is NOT a MOVEM and no slot1 MOVEM is pending. A slot0 MOVEM (when not
     // replaying a stash) is owned by the FSM -> the normal head does not push it.
-    val normalHeadValid = stashValid || (fed.valid && !slot0IsMovem && !movemPendValid)
+    val normalHeadValid = stashValid || (fed.valid && !slot0IsMovem && !slot0IsMicrocoded && !movemPendValid)
 
     // Produce the push as a Stream. When the MOVEM FSM is active it OVERRIDES the source
     // (its 2 moves / the final An update); otherwise the normal crack drives it.
-    val pushProduced = Stream(PushPayload())
+    // ── µcode SEQUENCER (the ROM-driven generalization of the MOVEM FSM) ─────────
+    // On a `microcoded` opword the engine takes over (mutually exclusive with the fast
+    // head AND the MOVEM FSM): latch the instruction CONTEXT (Microcode.Ctx), walk
+    // Microcode.rom from `ucEntry` emitting ONE resolved µop/cycle (v1 straight-line),
+    // hold `fed` until the `isLast` descriptor, `pipeFlush` aborts. Same contract as
+    // MOVEM, parameterized by the ROM instead of MOVEM's bespoke mask loop. v1 LIMIT: a
+    // microcoded op immediately FOLLOWED by another microcoded/MOVEM op in the SAME fetch
+    // group is the untested edge — the slot1 stash carries a NORMAL slot1 (the tested
+    // programs put a normal instr / NOP after each X-mem op).
+    val ucActive = RegInit(False)
+    val ucPc     = Reg(UInt(4 bits))
+    val ucCtx    = Reg(Microcode.Ctx())
+    when(pipeFlush) { ucActive := False }
+
+    // Begin a µcode op: a microcoded slot0 (not blocked by a stash) while the engine + the
+    // MOVEM FSM are idle. (A pending MOVEM / active MOVEM holds priority — they cannot
+    // co-occur with a microcoded slot0 in the same group given the v1 limit above.)
+    val ucBegin = !ucActive && !movemActive && !movemPendValid && slot0IsMicrocoded && !stashValid
+    // The entry context, latched on ucBegin from the head packet.
+    val ucEntryCtx = Microcode.Ctx()
+    ucEntryCtx.opword       := fed.payload.packets(0).words(0)
+    ucEntryCtx.pc           := fed.payload.packets(0).pc
+    ucEntryCtx.nextPc       := (fed.payload.packets(0).pc + (fed.payload.packets(0).lenWords << 1)).resize(32)
+    ucEntryCtx.op           := spec0.op
+    ucEntryCtx.bcdSub       := spec0.bcdSub
+    ucEntryCtx.size         := spec0.size
+    ucEntryCtx.sizeBytesLog := spec0.size.mux(
+      Size.BYTE -> U(0, 2 bits), Size.WORD -> U(1, 2 bits), default -> U(2, 2 bits))
+
+    // Resolve every ROM row against the LATCHED ctx, then index by ucPc -> this cycle's
+    // µop (the ROM is a compile-time Scala Vector; resolve each row to hardware + mux).
+    val ucResolved = Vec(Microcode.rom.map(d => Microcode.resolve(d, ucCtx, True)))
+    val ucLastVec  = Vec(Microcode.rom.map(d => Bool(d.isLast)))
+    val ucIdx      = ucPc.resize(log2Up(Microcode.romSize))
+    val ucCurUop   = ucResolved(ucIdx)
+    val ucCurLast  = ucLastVec(ucIdx)
+
+        val pushProduced = Stream(PushPayload())
     when(movemActive) {
       pushProduced.valid           := True
       when(movemAnUpdPhase) {
@@ -287,6 +329,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       }
       pushProduced.payload.uops(2) := movemAnUop      // unused (count <= 2)
       pushProduced.payload.uops(3) := movemAnUop
+    } elsewhen(ucActive) {
+      // µcode SEQUENCER drive: emit the resolved ROM µop at ucPc (1/cycle in v1).
+      pushProduced.valid           := True
+      pushProduced.payload.uops(0) := ucCurUop
+      pushProduced.payload.uops(1) := ucCurUop
+      pushProduced.payload.uops(2) := ucCurUop
+      pushProduced.payload.uops(3) := ucCurUop
+      pushProduced.payload.count   := U(1, 3 bits)
     } otherwise {
       pushProduced.valid           := normalHeadValid
       pushProduced.payload.uops(0) := normUop(0)
@@ -315,8 +365,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // FOLLOWING group, NOT consumed until the FSM finishes (movemHoldsFed).
     val movemEnterSlot0 = movemBegin && !movemPendValid                  // entering a slot0 MOVEM (not a pending one)
     val movemHoldsFed   = movemActive || movemPendValid                 // FSM busy -> hold the next group in `fed`
-    fed.ready := (!stashValid && !movemHoldsFed && !slot0IsMovem && pushProduced.ready) || movemEnterSlot0
-    when(!movemActive && !movemBegin && pushProduced.ready) {
+    // µcode: hold `fed` while the engine is busy or about to begin; release exactly when
+    // the LAST µop is accepted into pushReg (ucReleaseFed). A microcoded slot0 is owned by
+    // the engine (like a MOVEM slot0), so the NORMAL fed.ready arm must NOT consume it.
+    val ucHoldsFed    = ucActive || slot0IsMicrocoded
+    val ucReleaseFed  = ucActive && ucCurLast && pushProduced.ready
+    fed.ready := (!stashValid && !movemHoldsFed && !slot0IsMovem && !ucHoldsFed && pushProduced.ready) ||
+                 movemEnterSlot0 || ucReleaseFed
+    when(!movemActive && !movemBegin && !ucBegin && !ucActive && pushProduced.ready) {
       when(stashValid) {
         stashValid := False                  // the stashed slot1/RTR was emitted (into pushReg) this cycle
       } elsewhen(slot1IsMovem) {
@@ -399,6 +455,31 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       movemAnUpdPhase := False
       movemPendValid  := False
     }
+
+    // ── µcode SEQUENCER transitions (mirror the MOVEM FSM begin/advance/abort) ────
+    when(ucBegin) {
+      // Latch the entry context; start emitting next cycle from ucEntry.
+      ucActive := True
+      ucPc     := spec0.ucEntry
+      ucCtx    := ucEntryCtx
+      // STASH a present slot1 (a normal instruction) so it is not lost when `fed` is held/
+      // consumed (mirrors the MOVEM movemEnterSlot0 stash + the 3-µop slot1 defer). Replayed
+      // after the engine finishes. (v1: slot1 is assumed normal — see the limit note above.)
+      when(fed.payload.slot1Valid) {
+        stashValid := True
+        stashCount := a1raw.count
+        for (i <- 0 until 3) { stashUops(i) := a1raw.uops(i) }
+      }
+    } elsewhen(ucActive) {
+      when(pushProduced.ready) {
+        when(ucCurLast) { ucActive := False }       // last µop accepted -> release fed (ucReleaseFed)
+          .otherwise    { ucPc := ucPc + 1 }        // advance the µPC (straight-line)
+      }
+    }
+    // pipeFlush ABORTS the engine (LAST word, so a flush coinciding with ucBegin still
+    // resets it): the partially-emitted µops are squashed by the queue flush; the op
+    // re-decodes from scratch on re-fetch.
+    when(pipeFlush) { ucActive := False }
 
     // ── Rename-facing output ───────────────────────────────────────────────────
     val uopsOut = queue.io.pop
