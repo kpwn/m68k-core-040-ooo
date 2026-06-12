@@ -33,7 +33,18 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0xB342) == cp(true,1))   // EOR.W D1,D2
     assert(classify(0xB389) == cp(false,0))  // EOR.L D1,A1 (An-direct = CMPM) -> complex
   }
-  test("indexed (d8,A0,Xn) source -> complex") { assert(classify(0xD0B0) == cp(false,0)) }
+  // Brief-format indexed (d8,An,Xn)/(d8,PC,Xn) are now IN SCOPE -> simple, +1 ext word
+  // (was deferred/complex). Predecode frames the brief case (1 ext word); the assembler
+  // illegalises a full-format (bit8=1) EA, where a mis-framed length is harmless.
+  test("indexed (d8,A0,Xn) source -> simple len2 (brief ext word)") {
+    assert(classify(0xD0B0) == cp(true,2))   // ADD.B (d8,A0,Xn),D0  src mode 6
+    assert(classify(0x2430) == cp(true,2))   // MOVE.L (d8,A0,Xn),D2 src mode 6
+    assert(classify(0x243B) == cp(true,2))   // MOVE.L (d8,PC,Xn),D2 src mode 7-3
+  }
+  test("indexed (d8,An,Xn) destination -> simple len2 (MOVE + RMW)") {
+    assert(classify(0x2183) == cp(true,2))   // MOVE.L D3,(d8,A0,Xn) dst mode 6
+    assert(classify(0xD3B0) == cp(true,2))   // ADD.L D1,(d8,A0,Xn)  RMW dst mode 6
+  }
   test("ADDQ #n,(An) mem-dest -> simple (RMW now in scope)") {
     assert(classify(0x5290) == cp(true,1))   // ADDQ.L #1,(A0) -> (An) mem-dest RMW
     assert(classify(0x5268) == cp(true,2))   // ADDQ.W #1,(d16,A0) -> opword + disp16
