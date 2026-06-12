@@ -90,6 +90,8 @@ object PredecodeRef {
         val se = eaExt(srcMode, srcReg, sizeL, allowImm = true)
         val de = dstMode match {
           case 0 | 1 | 2 | 3 | 4 | 5 => eaExt(dstMode, dstReg, sizeL, allowImm = false)
+          case 6 => Some(1)   // (d8,An,Xn) brief indexed destination: 1 ext word
+          // mode 7 reg 2/3 ((d16,PC)/(d8,PC,Xn)) are PC-relative => NOT a MOVE dest -> None.
           case 7 => dstReg match { case 0 => Some(1); case 1 => Some(2); case _ => None }
           case _ => None
         }

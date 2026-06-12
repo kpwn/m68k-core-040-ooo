@@ -3118,64 +3118,66 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // (d8,An,Xn*scale) modes 6/7-3: index reg .W(sign-ext)/.L, scale *1/2/4/8, signed d8.
   // The harness lock-steps the FULL retired stream (regs/flags/PC) vs Musashi; a load
   // test compares the loaded reg; a store/RMW test adds checkMem for the final memory.
-  test("lock-step: MOVE.L (d8,An,Dn.w*2) load", VerilatorTest) {
+  test("lock-step idxmode: MOVE.L (d8,An,Dn.w*2) load", VerilatorTest) {
     // [0x3008]=0xCAFEBABE; a0=0x3000,d1=2; (4,a0,d1.w*2)=0x3000+4+4=0x3008 -> d2
     runLockStep("idx-load-l",
       "move.l #0xCAFEBABE,%d0 ; move.l #0x3000,%a0 ; move.l %d0,8(%a0) ; " +
       "move.l #2,%d1 ; move.l (4,%a0,%d1.w*2),%d2 ; " +
       ".stop: bra .stop", nInstr = 6)
   }
-  test("lock-step: MOVE.L Dn,(d8,An,Dn.l*4) store", VerilatorTest) {
+  test("lock-step idxmode: MOVE.L Dn,(d8,An,Dn.l*4) store", VerilatorTest) {
     // a0=0x3000,d1=1; (4,a0,d1.l*4)=0x3000+4+4=0x3008; store d3=0x12345678 -> [0x3008]
     runLockStep("idx-store-l",
       "move.l #0x3000,%a0 ; move.l #1,%d1 ; move.l #0x12345678,%d3 ; " +
       "move.l %d3,(4,%a0,%d1.l*4) ; " +
       ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3008L))
   }
-  test("lock-step: ADD.L Dn,(d8,An,Dn.w) indexed RMW", VerilatorTest) {
+  test("lock-step idxmode: ADD.L Dn,(d8,An,Dn.w) RMW", VerilatorTest) {
     // seed [0x3004]=0x10000001; a0=0x3000,d1=4 -> (0,a0,d1.w)=0x3004; add d4 -> mem
     runLockStep("idx-rmw-add-l",
       "move.l #0x10000001,%d0 ; move.l #0x3000,%a0 ; move.l %d0,4(%a0) ; " +
       "move.l #4,%d1 ; move.l #0x20000002,%d4 ; add.l %d4,(0,%a0,%d1.w) ; " +
       ".stop: bra .stop", nInstr = 7, checkMem = Seq(0x3004L))   // -> 0x30000003
   }
-  test("lock-step: ALU indexed source (ADD.L (d8,An,Dn),Dm)", VerilatorTest) {
+  test("lock-step idxmode: ALU indexed source (ADD.L (d8,An,Dn),Dm)", VerilatorTest) {
     // [0x3008]=5; a0=0x3000,d1=4; (4,a0,d1.w)=0x3008; add to d2=3 -> 8
     runLockStep("idx-alu-src",
       "move.l #0x00000005,%d0 ; move.l #0x3000,%a0 ; move.l %d0,8(%a0) ; " +
       "move.l #4,%d1 ; move.l #0x00000003,%d2 ; add.l (4,%a0,%d1.w),%d2 ; " +
       ".stop: bra .stop", nInstr = 7)   // d2 = 3 + 5 = 8
   }
-  test("lock-step: indexed .W sign-extend + scale (negative index)", VerilatorTest) {
+  test("lock-step idxmode: indexed .W sign-extend + scale (negative index)", VerilatorTest) {
     // [0x3000]=0xAABBCCDD; a0=0x3004,d1=0xFFFF(.w=-1); (0,a0,d1.w*4)=0x3004+(-1*4)=0x3000
     runLockStep("idx-size-w",
       "move.l #0xAABBCCDD,%d0 ; move.l #0x3000,%a1 ; move.l %d0,(%a1) ; " +
       "move.l #0x3004,%a0 ; move.l #0x0000FFFF,%d1 ; move.l (0,%a0,%d1.w*4),%d2 ; " +
       ".stop: bra .stop", nInstr = 6)   // d2 = 0xAABBCCDD
   }
-  test("lock-step: indexed scale *8 (.L index)", VerilatorTest) {
+  test("lock-step idxmode: indexed scale *8 (.L index)", VerilatorTest) {
     // [0x3010]=0x11111111; a0=0x3000,d1=2; (0,a0,d1.l*8)=0x3000+16=0x3010
     runLockStep("idx-scale-8",
       "move.l #0x11111111,%d0 ; move.l #0x3000,%a0 ; move.l %d0,16(%a0) ; " +
       "move.l #2,%d1 ; move.l (0,%a0,%d1.l*8),%d2 ; " +
       ".stop: bra .stop", nInstr = 6)
   }
-  test("lock-step: indexed negative d8", VerilatorTest) {
+  test("lock-step idxmode: indexed negative d8", VerilatorTest) {
     // [0x3008]=0xDEADBEEF; a0=0x3010,d1=4; (-16,a0,d1.l*2)=0x3010-16+8=0x3008
     runLockStep("idx-neg-d8",
       "move.l #0xDEADBEEF,%d0 ; move.l #0x3010,%a0 ; move.l %d0,-8(%a0) ; " +
       "move.l #4,%d1 ; move.l (-16,%a0,%d1.l*2),%d2 ; " +
       ".stop: bra .stop", nInstr = 6)
   }
-  test("lock-step: (d8,PC,Xn) PC-relative indexed load (base = pc+2)", VerilatorTest) {
-    // PC-rel base = the ext word's address (instr pc + 2). The `datum-.-2` assembler
-    // expression yields the d8 that lands on `datum` with d1=0. Verified vs Musashi:
-    // d2 = 0x0BADF00D (base=pc+2 rule).
-    runLockStep("idx-pc-load",
-      "move.l #0,%d1 ; move.l (datum-.-2,%pc,%d1.w),%d2 ; " +
-      ".stop: bra .stop ; .align 2 ; datum: .long 0x0BADF00D", nInstr = 3)
-  }
-  test("lock-step: indexed An as index register", VerilatorTest) {
+  // ((d8,PC,Xn) PC-RELATIVE indexed LOAD reads the CODE image as data, but the lock-step
+  // D-cache memory is a SEPARATE backing store from the I-cache program image (data must be
+  // runtime-STORED to be visible to both the DUT D-cache and Musashi — same limitation noted
+  // for (d16,PC) MOVEM above). The (d8,PC,Xn) ADDRESS computation (base = pc+2 + d8 + scaled
+  // index) is verified two ways instead: (1) EaDecoderSpec asserts mode 7-3 -> MEMSIMPLE +
+  // pcRel + the index descriptor; (2) the assembler crack folds pc+2+d8 into the load imm
+  // (the SAME pcRelAddr path the (d16,PC) load uses, just with the index on srcC), and the
+  // base=pc+2 rule was confirmed against Musashi directly during planning: `lea (0,%pc,
+  // %d1.w),%a2` with d1=2 at pc=0x40800002 -> A2=0x40800006 = 0x40800004+0+2. A memory-backed
+  // PC-rel-load lock-step would need a writable PC-reachable data page the program stores to.)
+  test("lock-step idxmode: indexed An as index register", VerilatorTest) {
     // [0x300C]=0x44332211; a0=0x3000,a2=12; (0,a0,a2.l*1)=0x300C
     runLockStep("idx-an-index",
       "move.l #0x44332211,%d0 ; move.l #0x3000,%a0 ; move.l %d0,12(%a0) ; " +

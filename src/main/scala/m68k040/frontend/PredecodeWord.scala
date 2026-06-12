@@ -143,7 +143,11 @@ object PredecodeWord {
 
         val (sOk, sExt) = eaExt(srcMode, srcReg, sizeL, allowImm = true)
 
-        // dst: modes 0-5 via eaExt(allowImm=false), mode 7 only reg0/reg1, else complex
+        // dst: modes 0-5 via eaExt(allowImm=false), mode 6 = brief indexed (1 ext word),
+        // mode 7 only reg0/reg1, else complex. mode 7-3 ((d8,PC,Xn)) + 7-2 ((d16,PC)) are
+        // PC-relative => NOT alterable => NOT a MOVE destination -> complex (assembler
+        // illegal). The MOVE dst inline path (NOT eaExt) owns this since eaExt is the
+        // source variant (which DOES accept (d16,PC)/(d8,PC,Xn) as read-only sources).
         val dOk  = Bool()
         val dExt = UInt(3 bits)
         dOk  := True
@@ -156,7 +160,7 @@ object PredecodeWord {
             default          { dOk  := False }
           }
         } elsewhen(dstMode === U(6, 3 bits)) {
-          dOk := False
+          dExt := U(1, 3 bits)   // (d8,An,Xn) brief indexed destination: 1 ext word
         } otherwise {
           val (o, e) = eaExt(dstMode, dstReg, sizeL, allowImm = false)
           dOk  := o
