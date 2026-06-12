@@ -205,7 +205,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     rdIndex.addr := u0.psrcC
     val idxRaw0  = Mux(u0.indexLong, rdIndex.data.asUInt,
                        rdIndex.data(15 downto 0).asSInt.resize(32).asUInt)
-    val idxTerm0 = Mux(u0.psrcCValid, (idxRaw0 |<< u0.indexScale), U(0, 32 bits))
+    // Scale shift: 32-bit MODULAR (m68k address arithmetic wraps mod 2^32, matching
+    // Musashi). `<<` by the 2-bit exponent keeps 32 bits (overflow bits discarded) —
+    // explicit resize so the result width is unambiguously 32 (the s1Index reg width).
+    val idxScaled = ((idxRaw0 << u0.indexScale).resize(32))
+    val idxTerm0 = Mux(u0.psrcCValid, idxScaled, U(0, 32 bits))
 
     // ---- access size in bytes (1/2/4) ----
     // A single m68k access spans at most two 16-byte lines / two 4 KB pages, so a
