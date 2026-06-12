@@ -81,6 +81,7 @@ object MicroOpAssembler {
     // Reuse isMovea as the ".W load -> sign-extend the full 32-bit reg" marker (LOAD only).
     u.isMovea     := isLoad && !sizeLong
     u.isScc       := False; u.isDbcc := False
+    u.indexLong   := False; u.indexScale := 0
     // Only the VERY FIRST emitted move of the whole MOVEM is the macro boundary
     // (firstOfInstr); every later move + the final An update is non-first, so an
     // interrupt is only taken at the MOVEM boundary (never mid-emission — the partly-
@@ -119,6 +120,7 @@ object MicroOpAssembler {
     u.ccrRestore  := False; u.toCcr := False
     u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.extByte := False
     u.isMovea     := False; u.isScc := False; u.isDbcc := False
+    u.indexLong   := False; u.indexScale := 0
     u.firstOfInstr := False    // trailing µop of the MOVEM macro
     u
   }
@@ -202,7 +204,11 @@ object MicroOpAssembler {
 
     val eaIsDst       = (spec.dst.kind === OperandKind.EASRC)
     val rmwOpInScope  = !(spec.op === DecOp.SWAP || spec.op === DecOp.EXT || spec.op === DecOp.TAS)
-    val memDest       = srcIsMem && eaIsDst && rmwOpInScope
+    // PC-relative EAs (d16,PC)/(d8,PC,Xn) are NOT alterable -> never a mem-dest RMW/store
+    // destination (the 68k forbids writes to PC-space). They are SOURCE-only. Excluding
+    // pcRel here keeps an indexed/displaced PC-rel RMW-dest on the illegal path (the
+    // mem-dest gates only checked `=/= MEMSIMPLE`, which a pcRel MEMSIMPLE would pass).
+    val memDest       = srcIsMem && eaIsDst && rmwOpInScope && !srcEa.pcRel
     val crackClr      = memDest && (spec.op === DecOp.CLR)
     val crackLoadOnly = memDest && !spec.dstWrites                       // TST / CMPI / CMP-mem (no store)
     val crackRmw      = memDest && spec.dstWrites && !crackClr           // load-op-store
@@ -274,6 +280,7 @@ object MicroOpAssembler {
     opUop.extByte       := spec.extByte
     opUop.isMovea       := False
     opUop.isScc         := False; opUop.isDbcc := False
+    opUop.indexLong     := False; opUop.indexScale := 0
     // CHK / DIV are group-2 traps (CHK vec6, DIV0 vec5) delivered execute-time via
     // euFault -> format-$2: they stack the NEXT instruction's PC (the 040 group-2
     // frame's PC = pc+len). The fault is conditional (set at execute), but faultPc is
@@ -453,7 +460,12 @@ object MicroOpAssembler {
     ldUop.memOp         := MemOp.LOAD
     ldUop.srcAReg       := srcEa.base; ldUop.srcAValid := srcEa.baseValid
     ldUop.srcBReg       := 0;          ldUop.srcBValid := False
-    ldUop.srcCReg       := 0;          ldUop.srcCValid := False
+    // Indexed EA: the index register rides srcC; the AGU sizes+scales it. For a line-0
+    // immediate mem-dest the index descriptor lives on immEa (its ext = the brief word,
+    // following the imm); otherwise srcEa. base+disp already account for pcRel/disp.
+    val ldIdxEa = Mux(opIsLineImm, immEa, srcEa)
+    ldUop.srcCReg       := ldIdxEa.indexReg;   ldUop.srcCValid := ldIdxEa.indexValid
+    ldUop.indexLong     := ldIdxEa.indexLong;  ldUop.indexScale := ldIdxEa.indexScale
     ldUop.dstReg        := U(T0, 5 bits); ldUop.dstValid := True
     ldUop.useImm        := True
     // disp = rmwEaDisp (immEa for a line-0 immediate mem-dest, else srcEa). A (d16,PC)
@@ -497,7 +509,10 @@ object MicroOpAssembler {
     // mem-to-mem MOVE (the leading load wrote T0). The same store µop folds the dest-EA
     // An update + the MOVE-to-mem NZVC for both forms.
     stUop.srcBReg       := Mux(crackMemMem, U(T0, 5 bits), srcEa.reg); stUop.srcBValid := True
-    stUop.srcCReg       := 0;          stUop.srcCValid := False
+    // Indexed MOVE destination: the dest-EA index reg rides srcC (store DATA is srcB). A
+    // mem-to-mem MOVE composes: srcA=dst base, srcB=T0 (loaded data), srcC=dst index.
+    stUop.srcCReg       := dstEa.indexReg;  stUop.srcCValid := dstEa.indexValid
+    stUop.indexLong     := dstEa.indexLong; stUop.indexScale := dstEa.indexScale
     // Auto-update DEST EA (-(An)/(An)+): the store's (otherwise unused) int dst carries
     // the An write (An := An ± delta) — generalizing stkPush to any An. PREDEC: addr =
     // An-delta = the written An; POSTINC: addr = An, written An = An+delta. The LS EU
@@ -534,7 +549,11 @@ object MicroOpAssembler {
     rmwStUop.memOp         := MemOp.STORE
     rmwStUop.srcAReg       := srcEa.base; rmwStUop.srcAValid := srcEa.baseValid
     rmwStUop.srcBReg       := U(T1, 5 bits); rmwStUop.srcBValid := True       // store data = T1
-    rmwStUop.srcCReg       := 0;          rmwStUop.srcCValid := False
+    // Indexed RMW: load + store share ONE EA; the index reg rides srcC on BOTH so they
+    // compute the SAME indexed address (mirrors how eaAuto is on both).
+    val rmwIdxEa = Mux(opIsLineImm, immEa, srcEa)
+    rmwStUop.srcCReg       := rmwIdxEa.indexReg;  rmwStUop.srcCValid := rmwIdxEa.indexValid
+    rmwStUop.indexLong     := rmwIdxEa.indexLong; rmwStUop.indexScale := rmwIdxEa.indexScale
     // Auto-update RMW EA (-(An)/(An)+): the load + this store share ONE EA and ONE An
     // update — the store carries the An write (An := An ± delta) on its int dst (the
     // load carries the SAME eaAuto for its address but writes only T0). The An write
@@ -625,6 +644,12 @@ object MicroOpAssembler {
     // bit-op has srcB=IMMEXT, so `isLineImm` is also true for it — `lineImmBad` excludes
     // bit-ops via `!isBitOp` so this gate is the single bit-op EA check, static+dynamic.)
     val bitOpMemBad = isBitOp && (srcEa.klass =/= EaClass.DATAREG) && (srcEa.klass =/= EaClass.MEMSIMPLE)
+    // PC-relative EA used as a DESTINATION (op[5:0] = the written EA, i.e. spec.dst.kind
+    // == EASRC): ISA-illegal (PC-space is not alterable). The mem-dest gates above only
+    // reject `=/= MEMSIMPLE`; a pcRel MEMSIMPLE (d16,PC)/(d8,PC,Xn) would otherwise slip
+    // through (memDest is now false for pcRel, so no RMW crack fires -> would mis-crack a
+    // leading load). Force the illegal path. Source pcRel (read) stays valid.
+    val eaDstPcRelBad = eaIsDst && srcIsMem && srcEa.pcRel
     // ── Line-5 Scc / DBcc (0101 cccc 11 mmmrrr) ─────────────────────────────────
     // ss == 11 (op[7:6]). mode = op[5:3]. DBcc = mode 001 (+ disp16 word). Scc = any
     // other mode (a byte set on cond); in-scope = mode 000 (Dn). Memory Scc (mode>=2)
@@ -670,10 +695,12 @@ object MicroOpAssembler {
     // JSR (0x4E80 | ea) — call: push retPC + ibranch to the EA address. Same control
     // EA modes as JMP. op[15:6] == 0100111010 (0x13A).
     val isJsrOp = (op(15 downto 6) === B"10'b0100111010")
-    // A JMP/JSR control EA is the in-scope MEMSIMPLE set (the EaDecoder already
-    // classifies (An)/(d16,An)/(xxx)/(d16,PC) as MEMSIMPLE; indexed/predec/postinc are
-    // MEMCOMPLEX, reg-direct DATAREG/ADDRREG, imm IMM). So a valid control EA == srcIsMem.
-    val ctrlEaOk = srcIsMem
+    // A JMP/JSR control EA is the in-scope MEMSIMPLE set (the EaDecoder classifies
+    // (An)/(d16,An)/(xxx)/(d16,PC) as MEMSIMPLE; predec/postinc are MEMCOMPLEX, reg-direct
+    // DATAREG/ADDRREG, imm IMM). Indexed (d8,An,Xn)/(d8,PC,Xn) is now MEMSIMPLE too, but an
+    // INDEXED JMP/JSR target is DEFERRED here (the branch-EU AGU reads no index register —
+    // it would silently drop the index). Reject an indexed control EA rather than mis-jump.
+    val ctrlEaOk = srcIsMem && !srcEa.indexValid
     // RTS (0x4E75) / RTR (0x4E77) are line-4 returns cracked below (NOT illegal).
     val isRtsBad = (op === B"16'h4E75")
     val isRtrBad = (op === B"16'h4E77")
@@ -691,7 +718,7 @@ object MicroOpAssembler {
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isUnlkOp && !isExgOp &&
               (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
-               line4UnaryMemBad || aluRmwMemBad || bitOpMemBad ||
+               line4UnaryMemBad || aluRmwMemBad || bitOpMemBad || eaDstPcRelBad ||
                (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     // A JMP/JSR with a non-control EA is illegal (vector 4).
     val jmpBad = isJmpOp && !ctrlEaOk
@@ -901,6 +928,7 @@ object MicroOpAssembler {
     divlUop.faultAddr     := pkt.pc; divlUop.sswInstr := False; divlUop.isTrapv := False
     divlUop.divSigned     := divlSigned; divlUop.div64 := divl64; divlUop.divIsRem := False
     divlUop.shiftOp := 0; divlUop.shiftDir := False; divlUop.isMovea := False; divlUop.isScc := False; divlUop.isDbcc := False; divlUop.extByte := False; divlUop.bitOp := 0; divlUop.bcdSub := False
+    divlUop.indexLong := False; divlUop.indexScale := 0
     divlUop.firstOfInstr  := True
     // 64-bit dividend high word Dr: carried in srcC (psrcC after rename). For the
     // 32-bit form psrcC is unused.
@@ -933,6 +961,7 @@ object MicroOpAssembler {
     divremUop.faultAddr     := pkt.pc; divremUop.sswInstr := False; divremUop.isTrapv := False
     divremUop.divSigned     := divlSigned; divremUop.div64 := divl64; divremUop.divIsRem := True
     divremUop.shiftOp := 0; divremUop.shiftDir := False; divremUop.isMovea := False; divremUop.isScc := False; divremUop.isDbcc := False; divremUop.extByte := False; divremUop.bitOp := 0; divremUop.bcdSub := False
+    divremUop.indexLong := False; divremUop.indexScale := 0
     divremUop.firstOfInstr  := False           // trailing crack µop
 
     // DIV.L is valid only when its divisor EA is reg/imm. A memSimple divisor would
@@ -1005,6 +1034,7 @@ object MicroOpAssembler {
     mullUop.faultAddr     := pkt.pc; mullUop.sswInstr := False; mullUop.isTrapv := False
     mullUop.divSigned     := mullSigned; mullUop.div64 := mull64; mullUop.divIsRem := False
     mullUop.shiftOp := 0; mullUop.shiftDir := False; mullUop.isMovea := False; mullUop.isScc := False; mullUop.isDbcc := False; mullUop.extByte := False; mullUop.bitOp := 0; mullUop.bcdSub := False
+    mullUop.indexLong := False; mullUop.indexScale := 0
     mullUop.firstOfInstr  := True
 
     // MULHI (high-product move) µop (.L64 only): CPLX, writes the EU's LATCHED high
@@ -1034,6 +1064,7 @@ object MicroOpAssembler {
     mulhiUop.faultAddr     := pkt.pc; mulhiUop.sswInstr := False; mulhiUop.isTrapv := False
     mulhiUop.divSigned     := mullSigned; mulhiUop.div64 := mull64; mulhiUop.divIsRem := False
     mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False; mulhiUop.isMovea := False; mulhiUop.isScc := False; mulhiUop.isDbcc := False; mulhiUop.extByte := False; mulhiUop.bitOp := 0; mulhiUop.bcdSub := False
+    mulhiUop.indexLong := False; mulhiUop.indexScale := 0
     mulhiUop.firstOfInstr  := False           // trailing crack µop
 
     // MUL.L is valid only when its multiplier EA is reg/imm (a memSimple multiplier
@@ -1080,6 +1111,7 @@ object MicroOpAssembler {
     ibrUop.faultAddr     := pkt.pc; ibrUop.sswInstr := False; ibrUop.isTrapv := False
     ibrUop.divSigned     := False; ibrUop.div64 := False; ibrUop.divIsRem := False
     ibrUop.shiftOp := 0; ibrUop.shiftDir := False; ibrUop.isMovea := False; ibrUop.isScc := False; ibrUop.isDbcc := False; ibrUop.extByte := False; ibrUop.bitOp := 0; ibrUop.bcdSub := False
+    ibrUop.indexLong := False; ibrUop.indexScale := 0
     // JMP is a single µop (its own first); JSR's ibranch is the TRAILING µop (the push
     // is first), so firstOfInstr is False for JSR.
     ibrUop.firstOfInstr  := !isJsrOp
@@ -1129,6 +1161,7 @@ object MicroOpAssembler {
       u.faultAddr := pkt.pc; u.sswInstr := False; u.isRte := False; u.isTrapv := False
       u.divSigned := False; u.div64 := False; u.divIsRem := divIsRem
       u.shiftOp := 0; u.shiftDir := False; u.isMovea := False; u.isScc := False; u.isDbcc := False; u.extByte := False; u.bitOp := 0; u.bcdSub := False
+      u.indexLong := False; u.indexScale := 0
       u.firstOfInstr := first
       u
     }

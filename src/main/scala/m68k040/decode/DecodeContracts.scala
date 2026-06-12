@@ -52,6 +52,16 @@ case class EaSpec() extends Bundle {
   // only when autoMode != NONE. The base An reg id is `base` (= 8+reg) with baseValid.
   val autoMode  = EaAuto()
   val autoDelta = UInt(3 bits)
+  // Brief-format INDEXED EA (modes 6 / 7-3): EA = base + sext(d8) + (Xn sized) << scale.
+  // indexValid => an index register read is needed (Xn). indexReg = the full reg id
+  // (Dn=0..7 / An=8..15). indexLong => .L index (full 32); False => .W (sign-extend low
+  // 16). indexScale = the 2-bit scale exponent (0=*1,1=*2,2=*4,3=*8). The d8 displacement
+  // rides `disp` (base+disp fold as usual); PC-rel (mode 7-3) folds pc+2+d8 (base=0).
+  // NONE for every non-indexed EA. Carried on MEMSIMPLE alongside base/disp/autoMode.
+  val indexValid = Bool()
+  val indexReg   = UInt(5 bits)
+  val indexLong  = Bool()
+  val indexScale = UInt(2 bits)
 }
 object EaSpec {
   def illegalDefault(): EaSpec = {
@@ -59,6 +69,7 @@ object EaSpec {
     e.klass := EaClass.ILLEGAL; e.reg := 0; e.imm := 0
     e.baseValid := False; e.base := 0; e.disp := 0; e.pcRel := False
     e.autoMode := EaAuto.NONE; e.autoDelta := 0
+    e.indexValid := False; e.indexReg := 0; e.indexLong := False; e.indexScale := 0
     e
   }
 }

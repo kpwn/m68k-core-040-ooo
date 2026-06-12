@@ -202,4 +202,12 @@ case class DecodedUop() extends Bundle {
   // only when the ROB head is a first µop (never mid-cracked-instruction). Default
   // True (every single-µop instruction is its own first µop).
   val firstOfInstr = Bool()
+  // ── Brief-format indexed EA (the AGU index term) ────────────────────────────
+  // For a mem µop whose address is an indexed EA, the index register rides srcCReg/
+  // srcCValid (psrcC after rename), and these two fields tell the LS-EU AGU how to
+  // size+scale it: indexLong => use the full 32-bit Xn (else sign-extend Xn[15:0]);
+  // indexScale = the 2-bit scale exponent (0=*1,1=*2,2=*4,3=*8). EA = base + disp +
+  // (Xn sized) << indexScale. NONE/0 for every non-indexed µop (srcCValid gates it).
+  val indexLong  = Bool()
+  val indexScale = UInt(2 bits)
 }
