@@ -119,14 +119,24 @@ class AddxSubxDecodeSpec extends AnyFunSuite {
     }
   }
 
-  test("ADDX.L -(A2),-(A3) (0xD78A, bit3=1 -> EA mode 001): NOT ADDX, illegal/deferred", VerilatorTest) {
-    // Memory form: EA mode field = 001 (An-direct in the RMW slot). The carve-out keys
-    // strictly on mode 000, so this stays on the RMW path -> assembler rejects (illegal).
+  test("ADDX.L -(A2),-(A3) (0xD78A, bit3=1 -> EA mode 001): MICROCODED (NOT illegal)", VerilatorTest) {
+    // Memory form: EA mode field = 001 (An-direct in the RMW slot) = the -(Ay),-(Ax) form.
+    // A >3-µop sequence the DecodeStage µcode SEQUENCER emits; OperationDecoder marks it
+    // microcoded + NON-illegal (op=ADDX + size carry the kind). Validated end-to-end in
+    // MicrocodeSpec + ExecuteLockStepSpec.
     runDec(0xD78A) { dut =>
-      assert(dut.o.op.toEnum != DecOp.ADDX, "memory-form ADDX is not the register ADDX")
+      assert(!dut.o.illegal.toBoolean, "memory-form ADDX is NOT illegal (microcoded)")
+      assert(dut.o.microcoded.toBoolean, "memory-form ADDX is microcoded")
+      assert(dut.o.op.toEnum == DecOp.ADDX, "op = ADDX (the latched op for the engine)")
+      assert(dut.o.size.toEnum == Size.LONG, "ADDX.L mem -> size LONG")
     }
-    runAsm { dut => drive(dut, 0xD78A); sleep(1)
-      assert(dut.uop0.unimplemented.toBoolean, "memory-form ADDX (-(Ay),-(Ax)) stays illegal/deferred")
+  }
+
+  test("SUBX.B -(A1),-(A0) (0x9109, mode 001): MICROCODED", VerilatorTest) {
+    runDec(0x9109) { dut =>   // 1001 000 1 00 001 001 (line9 Ax=A0 opmode4 .B eaMode001 Ay=A1)
+      assert(dut.o.microcoded.toBoolean, "memory-form SUBX is microcoded")
+      assert(dut.o.op.toEnum == DecOp.SUBX, "op = SUBX")
+      assert(dut.o.size.toEnum == Size.BYTE, "SUBX.B mem -> size BYTE")
     }
   }
 

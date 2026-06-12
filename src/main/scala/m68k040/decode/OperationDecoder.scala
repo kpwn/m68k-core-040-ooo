@@ -330,7 +330,35 @@ object OperationDecoder {
         //   precedent — a fixed data-reg read of bits 2:0 without new operand plumbing).
         val isBcdReg = (line === 0x8 || line === 0xC) && opword(8) &&
                        (opword(7 downto 3) === B"5'b00000")
-        when(isBcdReg) {
+        // ── BCD MEMORY form -(Ay),-(Ax): line 8/C, opmode 4, EA mode field 001 ──────
+        // 1xx0 xxx 1 0000 1 yyy (bit3=1). A >3-µop sequence the DecodeStage µcode
+        // SEQUENCER emits ([load(Ay)->T0][Ay-=d][load(Ax)->T1][Ax-=d][BCD T1,T0->T2]
+        // [store T2->(Ax)]). Marked microcoded + NON-illegal (a benign placeholder like
+        // MOVEM so the assembler's `bad` never fires — the sequencer owns emission).
+        // op=BCD + bcdSub + size carry the kind to Microcode.Ctx. Checked BEFORE isBcdReg.
+        val isBcdMem = (line === 0x8 || line === 0xC) && opword(8) &&
+                       (opword(7 downto 3) === B"5'b00001")
+        // ── ADDX/SUBX MEMORY form -(Ay),-(Ax): line 9/D, opmode 4/5/6, EA mode 001 ──
+        // Same µcode sequence; op=ADDX/SUBX + size (.B/.W/.L) carry the kind.
+        val isAddxSubxMem = isRmw && (line === 0x9 || line === 0xD) && (eaMode === B"001")
+        when(isBcdMem) {
+          o.illegal := False
+          o.microcoded := True
+          o.ucEntry := U(Microcode.BCD_MEM_ENTRY, 4 bits)
+          o.op     := DecOp.BCD
+          o.bcdSub := (line === 0x8)              // line 8 = SBCD (subtract), line C = ABCD (add)
+          o.size   := Size.BYTE                    // BCD is byte-only
+          o.readsNzvc := True; o.writesNzvc := True; o.readsX := True; o.writesX := True
+        } .elsewhen(isAddxSubxMem) {
+          o.illegal := False
+          o.microcoded := True
+          o.ucEntry := U(Microcode.BCD_MEM_ENTRY, 4 bits)
+          o.op   := Mux(line === 0xD, DecOp.ADDX, DecOp.SUBX)
+          when(opmode === 4) { o.size := Size.BYTE }
+            .elsewhen(opmode === 5) { o.size := Size.WORD }
+            .otherwise { o.size := Size.LONG }
+          o.readsNzvc := True; o.writesNzvc := True; o.readsX := True; o.writesX := True
+        } .elsewhen(isBcdReg) {
           o.illegal := False
           o.op     := DecOp.BCD
           o.bcdSub := (line === 0x8)            // line 8 = SBCD (subtract), line C = ABCD (add)
