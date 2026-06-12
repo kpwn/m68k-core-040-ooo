@@ -88,12 +88,12 @@ class MicrocodeSpec extends AnyFunSuite {
     // µPC3: ADD A0 += -1 (dropped)
     assert(us(3).op == "ADD" && us(3).dst == 8 && us(3).srcA == 8 && us(3).drop,
       s"µPC3 A0 -= 1 dropped: ${us(3)}")
-    // µPC4: BCD T1,T0 -> T2(18), writes NZVC+X, bcdSub False (ABCD)
-    assert(us(4).op == "BCD" && us(4).dst == 18 && us(4).srcA == 17 && us(4).srcB == 16 &&
+    // µPC4: BCD T1,T0 -> T1(17) (result reuses T1), writes NZVC+X, bcdSub False (ABCD)
+    assert(us(4).op == "BCD" && us(4).dst == 17 && us(4).srcA == 17 && us(4).srcB == 16 &&
            us(4).wNz && us(4).wX && !us(4).bcdSub,
       s"µPC4 BCD T1,T0->T2: ${us(4)}")
-    // µPC5: STORE T2(18) -> (A0=8), no auto, NOT first
-    assert(us(5).mem == "STORE" && us(5).srcA == 8 && us(5).srcB == 18 && us(5).srcBV &&
+    // µPC5: STORE T1(17) -> (A0=8), no auto, NOT first
+    assert(us(5).mem == "STORE" && us(5).srcA == 8 && us(5).srcB == 17 && us(5).srcBV &&
            us(5).eaAuto == "NONE" && !us(5).first,
       s"µPC5 store T2->(A0): ${us(5)}")
   }
@@ -113,9 +113,9 @@ class MicrocodeSpec extends AnyFunSuite {
     assert(us(0).mem == "LOAD" && us(0).srcA == 10 && us(0).eaAuto == "PREDEC" && us(0).eaDelta == 4 && us(0).sizeL,
       s"µPC0 load(A2).L predec delta4: ${us(0)}")
     assert(us(2).mem == "LOAD" && us(2).srcA == 11 && us(2).eaDelta == 4, s"µPC2 load(A3): ${us(2)}")
-    assert(us(4).op == "ADDX" && us(4).dst == 18 && us(4).srcA == 17 && us(4).srcB == 16 && us(4).sizeL,
+    assert(us(4).op == "ADDX" && us(4).dst == 17 && us(4).srcA == 17 && us(4).srcB == 16 && us(4).sizeL,
       s"µPC4 ADDX.L T1,T0->T2: ${us(4)}")
-    assert(us(5).mem == "STORE" && us(5).srcA == 11 && us(5).srcB == 18 && us(5).sizeL,
+    assert(us(5).mem == "STORE" && us(5).srcA == 11 && us(5).srcB == 17 && us(5).sizeL,
       s"µPC5 store.L T2->(A3): ${us(5)}")
   }
 

@@ -31,7 +31,8 @@ object Microcode {
   // 18 fits the temp pool.
   val T0 = MicroOpAssembler.T0   // 16
   val T1 = MicroOpAssembler.T1   // 17
-  val T2 = 18
+  // (No 3rd temp: the op result reuses T1 — see the ROM µPC4 comment. The int RAT
+  // depth stays 18, so no rename/PRF widening + zero synth impact.)
 
   /** Operand-selector vocabulary (the ROM's small mux set), resolved by the engine from
     * the latched opword fields + size. */
@@ -41,7 +42,6 @@ object Microcode {
   case object SAx         extends Sel   // 8 + op[11:9]  (dest   An / Ax)
   case object ST0         extends Sel
   case object ST1         extends Sel
-  case object ST2         extends Sel
   case object SNegDeltaAy extends Sel   // -deltaAy (Ay predec write-back imm, LONG)
   case object SNegDeltaAx extends Sel   // -deltaAx (Ax predec write-back imm, LONG)
 
@@ -92,11 +92,14 @@ object Microcode {
     Desc(UMove, mem = MLoad, auto = APredecAx, srcA = SAx, dst = ST1),
     // µPC3: ADD.L Ax - deltaAx -> Ax   (the Ax predec write-back; dropped crack µop)
     Desc(UAddDrop, srcA = SAx, dst = SAx, useImm = true, imm = SNegDeltaAx),
-    // µPC4: <BCD|ADDX|SUBX>.sz srcA=T1 (dst byte = dx), srcB=T0 (src byte = dy) -> T2,
+    // µPC4: <BCD|ADDX|SUBX>.sz srcA=T1 (dst byte = dx), srcB=T0 (src byte = dy) -> T1,
     //        + NZVCX/X (reads X + old-Z, the clear-only-Z rule like the register form).
-    Desc(UOpFromCtx, srcA = ST1, srcB = ST0, dst = ST2, writesFlags = true),
-    // µPC5: STORE.sz T2 -> (Ax)  (Ax was ALREADY decremented at µPC3 -> NO auto; isLast).
-    Desc(UMove, mem = MStore, auto = ANoAuto, srcA = SAx, srcB = ST2, isLast = true)
+    //        The RESULT reuses T1 (the dst-byte temp, dead after this read) — no 3rd temp
+    //        is needed, so the rename int-RAT depth (18 = D0-7/A0-7/T0/T1) is unchanged. The
+    //        same-µop T1 read(srcA)+write(dst) is a normal RAW the renamer resolves.
+    Desc(UOpFromCtx, srcA = ST1, srcB = ST0, dst = ST1, writesFlags = true),
+    // µPC5: STORE.sz T1 -> (Ax)  (Ax was ALREADY decremented at µPC3 -> NO auto; isLast).
+    Desc(UMove, mem = MStore, auto = ANoAuto, srcA = SAx, srcB = ST1, isLast = true)
   )
   def romSize: Int = rom.size
 
@@ -120,7 +123,6 @@ object Microcode {
     case SAx => (axReg(ctx), True)
     case ST0 => (U(T0, 5 bits), True)
     case ST1 => (U(T1, 5 bits), True)
-    case ST2 => (U(T2, 5 bits), True)
     case _   => (U(0, 5 bits), False)
   }
 
