@@ -194,6 +194,12 @@ object PredecodeRef {
         } else if (op == 0x4e74) {
           // RTD (0x4E74) + disp16: opword + 1 disp word.
           CP(simple = true, lenWords = 2)
+        } else if (op == 0x4e70) {
+          // RESET (0x4E70): single-word privileged sysOp.
+          CP(simple = true, lenWords = 1)
+        } else if (op == 0x4e72) {
+          // STOP (0x4E72) + imm16: opword + 1 imm word.
+          CP(simple = true, lenWords = 2)
         } else if (op.&(0x0800) != 0 && ((op >> 7) & 7) == 1) {
           // MOVEM (0100 1 d 001 s mmmrrr) + 16-bit mask: opword + mask + EA ext. In-scope:
           // (An)/(An)+/-(An) +0, (d16,An)/(xxx).W/(d16,PC) +1, (xxx).L +2. Direction (bit10)

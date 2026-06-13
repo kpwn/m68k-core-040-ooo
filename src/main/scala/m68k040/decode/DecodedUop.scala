@@ -60,7 +60,14 @@ object SysKind extends SpinalEnum {
   val NONE,
       MOVE_TO_SR,   // <ea>.W -> SR (system byte + CCR); re-banks A7 on an S flip.
       MOVE_USP,     // An <-> USP (direction in sysReadDir).
-      MOVEC         // Rn <-> Rc {VBR/USP/CACR/...} (direction in sysReadDir, Rc in imm).
+      MOVEC,        // Rn <-> Rc {VBR/USP/CACR/...} (direction in sysReadDir, Rc in imm).
+      // RESET (0x4E70): privileged; asserts the external reset line. Architecturally a NOP
+      // (no state change); the FSM consumes it + advances PC (serializing). S=0 -> vector 8.
+      RESET,
+      // STOP (0x4E72) + imm16: privileged; SR := imm16 (reuses the MOVE-to-SR SR-write +
+      // banking) then HALT until an interrupt with level > the new I-mask. SR write is the
+      // S_APPLY path; the halt is the ROB `stopped` state. S=0 -> vector 8.
+      STOP          // (RESET=4, STOP=5 — needs the 3-bit FSM ctx widened in T0.)
       = newElement()
 }
 

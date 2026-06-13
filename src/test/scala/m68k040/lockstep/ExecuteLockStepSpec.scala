@@ -2112,6 +2112,140 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 5)   // after move-to-SR: S=0, A7=USP=0x00200000 (a1 surfaces A7)
   }
 
+  // ── RESET (0x4E70): privileged no-op in supervisor ──────────────────────────
+  // Architecturally a NOP (the external reset line is not modeled for lock-step); the
+  // commit-time sysOp FSM consumes it + advances PC. Lock-step: RESET falls through, the
+  // surrounding moveqs are unaffected (PC/SR/A7/regs step-for-step vs Musashi).
+  test("lock-step: RESET (supervisor) falls through (no state change)", VerilatorTest) {
+    runLockStep("reset-fallthrough",
+      "moveq #1,%d0 ; reset ; moveq #2,%d1 ; " +
+      ".stop: bra .stop",
+      nInstr = 3)
+  }
+
+  // RESET at S=0 (user) -> vector-8 privilege violation (format-$0, restartable: stacks its
+  // OWN PC). Same shape as the MOVE-USP privilege test: install the vector-8 handler @0x20,
+  // drop to user, then `reset` traps. The handler bumps the stacked PC past the 2-byte op +
+  // RTEs. PC/SR/A7 lock-stepped across user-switch, trap entry, handler, RTE.
+  test("lock-step: RESET at S=0 -> vector-8 privilege violation -> handler -> RTE", VerilatorTest) {
+    runLockStep("reset-priv",
+      "move.l #handler,%d0 ; move.l %d0,0x20 ; move.w #0x0000,%d1 ; move %d1,%sr ; " + // -> user (S=0)
+      "reset ; moveq #7,%d3 ; " +                                                      // privileged -> trap; resume here
+      "loop: bra loop ; " +
+      "handler: move.l 2(%a7),%d0 ; addq.l #2,%d0 ; move.l %d0,2(%a7) ; " +
+      "moveq #1,%d2 ; rte",
+      nInstr = 11, usp = 0)
+  }
+
+  // ── STOP (0x4E72) + imm16: SR-load + halt + resume-on-IRQ ───────────────────
+  // STOP loads SR := imm16 (S=1, I-mask=0 here) then HALTS. A level-5 autovector IRQ
+  // (vec 29 @ 0x74) wakes it: the IRQ entry takes the handler, which RTEs back to the
+  // STOP successor. Lock-step the FULL state (SR incl. mask / A7 / PC) across STOP -> halt
+  // -> IRQ entry -> handler -> RTE -> resume, vs Musashi. The IRQ is injected once the DUT
+  // reaches the `stopped` state (the STOP commit itself, via commitObs(2), does not drive
+  // the commit-PC-triggered injection the normal IRQ harness uses, and STOP halts so no
+  // further user commit fires) — so this is a bespoke STOP-aware harness.
+  test("lock-step: STOP #imm -> halt -> IRQ -> handler -> RTE -> resume", VerilatorTest) {
+    val name = "stop-irq"
+    val initialSr = 0x2700
+    val src =
+      "move.l #handler,%d0 ; move.l %d0,0x74 ; " +   // install vector 29 (autovec lvl 5) @ 0x74
+      "stop #0x2000 ; moveq #2,%d2 ; " +             // SR := 0x2000 (S=1, mask=0) then HALT; resume here
+      "loop: bra loop ; " +
+      "handler: moveq #9,%d3 ; rte"
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    // STOP commits at its nextPc; the IRQ is recognized while halted (vec 24+5 = 29).
+    val nInstr = 6   // move1, move2, STOP, handler-moveq#9, rte, moveq#2 (entry obs dropped)
+    val oracleSteps = Musashi.assembleAndTrace(src, irqEvents = Seq((0x4080000eL, 5)),
+                                               interruptAckVector = None,
+                                               initialSr = Some(initialSr)) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[$name] Musashi.assembleAndTrace failed: ${err.reason}")
+    }
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[$name] ProgramAssembler.assemble failed: ${err.reason}")
+    }
+    assert(oracleSteps.size >= nInstr, s"[$name] oracle produced ${oracleSteps.size}, expected >= $nInstr")
+    val oracle = oracleSteps.take(nInstr)
+
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      val handle = new WhiteboxCapture.Handle
+      var irqRaised = false
+
+      def captureWb(w: m68k040.execute.WbObs): Unit = {
+        if (w.valid.toBoolean) handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
+          dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
+          intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
+          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean,
+          keepCommit = w.keepCommit.toBoolean))
+      }
+
+      cd.onSamplings {
+        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs)
+        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
+        val bw = dut.branchEu.logic.wbObs
+        if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+        for (k <- 0 until 2) {
+          val c = dut.rob.logic.commitObs(k)
+          if (c.fire.toBoolean)
+            handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL)
+        }
+        val ce = dut.rob.logic.commitObs(2)
+        if (ce.fire.toBoolean) {
+          if (!ce.isInterrupt.toBoolean)
+            handle.onExcCommit(ce.pc.toLong & 0xffffffffL, ce.sysByte.toInt & 0xff, ce.a7.toLong & 0xffffffffL,
+              if (ce.ccrFoldValid.toBoolean) ce.ccrFold.toInt & 0xf else -1,
+              if (ce.setCcr5Valid.toBoolean) ce.setCcr5.toInt & 0x1f else -1)
+          else dut.intCtrl.logic.iplIn #= 0   // one-shot edge: drop on the entry
+        }
+        // STOP-aware IRQ injection: raise iplIn once the core is halted (stopped). The new
+        // SR mask is 0, so a level-5 IRQ is recognized; it wakes the core.
+        if (dut.rob.logic.stopped.toBoolean && !irqRaised) {
+          irqRaised = true
+          dut.intCtrl.logic.iplIn #= 5
+          dut.intCtrl.logic.iackAvec #= true
+          dut.intCtrl.logic.iackVector #= 0
+        }
+      }
+
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      dut.ctrl.logic.mmuEnable #= false
+      dut.ctrl.logic.rootPtr   #= 0
+      dut.intCtrl.logic.iplIn #= 0
+      dut.intCtrl.logic.iackAvec #= false
+      dut.intCtrl.logic.iackVector #= 0
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.srSys #= (initialSr >> 8) & 0xff
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= true
+      dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= false
+
+      var guard = 0; val cap = 6000
+      while (handle.result.size < nInstr && guard < cap) { cd.waitSampling(); guard += 1 }
+      assert(handle.result.size >= nInstr,
+        s"[$name] only ${handle.result.size}/$nInstr instructions committed within $cap cycles")
+      val res = LockStep.compare(handle.result.take(nInstr), oracle)
+      assert(res.ok,
+        s"[$name] lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")} " +
+          s"(matched ${res.matched}, dut commits ${handle.result.size}, oracle steps $nInstr)")
+    }
+  }
+
   // ── MOVEC (Track D): VBR / USP / CACR control registers ─────────────────────
   // MOVEC USP round-trip: write USP from D0 (movec %d0,%usp), read it back into D1
   // (movec %usp,%d1). D1 == D0 proves the USP bank via MOVEC. (Supervisor; A7 unchanged.)

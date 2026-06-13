@@ -130,6 +130,17 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // statically faulted head, but conditional on the runtime committed S. RegInit(False),
     // reset per-alloc (mirrors faultedStore).
     val needsSupStore = Vec.fill(depth)(RegInit(False))
+    // ── STOP (0x4E72) halt state ────────────────────────────────────────────────
+    // Set when a SysKind.STOP sysOp serializes its retire in SUPERVISOR (S=1; the S=0
+    // case is a vector-8 fault, not a halt). While `stopped` the core quiesces: no
+    // instruction retires (the ROB is empty post-redirect anyway) AND fetch is held
+    // (the `quiesce` output gates the front-end). An interrupt recognized at the right
+    // level CLEARS it (the IRQ entry resumes execution at the handler).
+    val stopped = RegInit(False); stopped.simPublic()
+    // The PC to RESUME at when an IRQ wakes the halted core (= STOP's nextPc, latched at the
+    // STOP retire). While stopped the ROB is empty (count==0), so pcStore(h0) is stale — the
+    // interrupt entry must stack THIS PC as the return address (else RTE resumes at garbage).
+    val stoppedPc = Reg(UInt(32 bits)) init 0; stoppedPc.simPublic()
     // MMU access-fault per-entry capture (set at COMPLETION from the LS EU's
     // faultCompletion, NOT at alloc — an MMU fault is discovered at execute). On a
     // faulting LS access the LS EU marks the entry faulted vector 2 + the faulting VA
@@ -280,7 +291,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val interruptVec = UInt(8 bits)
     interruptVec := Mux(iackAvec, (U(24, 8 bits) + iplIn).resized, iackVector)
     interruptVec.simPublic()
-    val interruptPc = UInt(32 bits); interruptPc := pcStore(h0); interruptPc.simPublic()
+    // While stopped (ROB empty), stack the latched STOP-successor PC (the resume point);
+    // otherwise the preempted head instruction's PC. (`stopped`/`stoppedPc` are Regs above.)
+    val interruptPc = UInt(32 bits); interruptPc := Mux(stopped, stoppedPc, pcStore(h0)); interruptPc.simPublic()
 
     // A normal retire is also blocked while an interrupt is pending (the head does
     // not commit — like the faulted-head case).
@@ -288,7 +301,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // OR a privilege-violation head (Track C MOVE-from-SR in user mode). retire1 likewise
     // excludes a needsSupervisor (C) or sysOp (D) head from slot-1 (both serializing).
     val retire0 = headReady && !faultedStore(h0) && !isRteStore(h0) && !sysOpStore(h0) &&
-                  !interruptPending && !privViolation
+                  !interruptPending && !privViolation && !stopped
     val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone &&
                   !faultedStore(h1) && !isRteStore(h1) && !needsSupStore(h1) && !sysOpStore(h1)
 
@@ -585,7 +598,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // available only after exc is built) and driven below. The captured context comes
       // straight from the head's per-entry sysOp stores + the captured value.
       sysTrigger = sysTriggerSig,
-      sysKind    = sysKindStore(h0).asBits.asUInt.resize(2),
+      sysKind    = sysKindStore(h0).asBits.asUInt.resize(3),
       sysReadDir = sysReadDirStore(h0),
       sysVal     = sysValStore(h0),
       sysRc      = sysRcStore(h0),
@@ -630,10 +643,20 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // (the head's own exception delivers first), so exclude it.
     val maskI = exc.ss.srSys(2 downto 0)
     val iplActive = (iplIn > maskI) || (iplIn === U(7, 3 bits))
-    interruptPending := (count > 0) && !flushing && excIdle &&
-                        firstStore(h0) && !faultedStore(h0) && !isRteStore(h0) &&
-                        !privViolation && !sysOpStore(h0) &&
-                        iplActive
+    // Normal recognition: a first-µop non-faulted/non-RTE/non-sysOp head is present. When
+    // STOPPED the ROB is empty (count==0, no head) and the IRQ must wake the halted core
+    // with no head present, so OR in `stopped` as a recognition gate.
+    val normalIrqGate = (count > 0) && firstStore(h0) && !faultedStore(h0) &&
+                        !isRteStore(h0) && !privViolation && !sysOpStore(h0)
+    interruptPending := (normalIrqGate || stopped) && !flushing && excIdle && iplActive
+    // STOP halts the core after its serializing retire (supervisor only; S=0 -> vector-8
+    // via sysPrivFault). The interrupt entry RESUMES it: clear `stopped` when an interrupt
+    // is recognized. (sysTriggerSig / interruptPending are both built above.)
+    when(sysTriggerSig && (sysKindStore(h0) === m68k040.decode.SysKind.STOP)) {
+      stopped   := True
+      stoppedPc := p0.predNextPc      // STOP's nextPc = the resume point (IRQ stacks this)
+    }
+    when(interruptPending) { stopped := False }
     // Squash + serialize while the FSM runs (NOT on the trigger cycle, when the FSM
     // is still IDLE and the fault/RTE head must retire-trigger). On the trigger cycle
     // excActive is False, so faultRetire/rteRetire fire and the exc captures; next

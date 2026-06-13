@@ -337,6 +337,32 @@ object OperationDecoder {
           o.sysReadDir := !opword(0)             // 0x4E7A (bit0=0) = Rc->Rn (read); 0x4E7B = Rn->Rc (write)
           // operands resolved by the assembler from the ext word (A/D + reg# + Rc).
         }
+        // ── RESET (0x4E70): privileged; asserts the external reset line for 512 clks.
+        // Architecturally a NOP (no state change). A COMMIT-TIME SYSTEM op so it serializes
+        // + advances PC like the other sysOps; S=0 -> vector-8. The FSM does nothing but
+        // consume it + redirect to nextPc.
+        when(opword === B"16'h4E70") {
+          o.illegal := False
+          o.op := DecOp.MOVE
+          o.size := Size.LONG
+          o.sysOp := True
+          o.sysKind := SysKind.RESET
+          o.sysReadDir := False
+          o.dst.setNone(); o.dstWrites := False
+        }
+        // ── STOP (0x4E72) + imm16: privileged; SR := imm16 then HALT until IRQ > new mask.
+        // A COMMIT-TIME SYSTEM op: the SR write reuses the MOVE-to-SR S_APPLY path (the
+        // value = imm16, carried by the assembler as a MOVE-imm op-µop -> sysValStore). The
+        // halt is the ROB `stopped` state. S=0 -> vector-8.
+        when(opword === B"16'h4E72") {
+          o.illegal := False
+          o.op := DecOp.MOVE                     // result = imm16 (the new SR), captured for the FSM
+          o.size := Size.WORD
+          o.sysOp := True
+          o.sysKind := SysKind.STOP
+          o.sysReadDir := False
+          o.dst.setNone(); o.dstWrites := False
+        }
       }
       // ---- Bcc / BSR / BRA (0110 cccc dddddddd) ----
       is(0x6) {

@@ -50,6 +50,15 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     mispredictRedirect.valid.allowOverride;   mispredictRedirect.valid   := False
     mispredictRedirect.payload.allowOverride; mispredictRedirect.payload := U(0, 32 bits)
 
+    // ── STOP-halt quiesce (full core): the ROB drives this high while the core is in the
+    // STOP `stopped` state. It suppresses fetch + feed (the front-end holds at the STOP
+    // successor PC the post-STOP redirect set) until the wake redirect (the IRQ-entry
+    // vector) clears it — exactly like faultHold, but it emits NO packet. Directionless,
+    // idle-defaulted with a concrete zero (allowOverride) so a DUT that does NOT wire it
+    // still elaborates (the wiring layer overrides it). ──────────────────────────────
+    val quiesce = Bool()
+    quiesce.allowOverride; quiesce := False
+
     // ---- State registers ----
     val decodePc      = Reg(UInt(32 bits)) init 0
     val fetchPc       = Reg(UInt(32 bits)) init 0   // 8-aligned
@@ -96,8 +105,9 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val redirectThisCycle = redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid
 
     // ---- FetchControl: issue fetches (single-outstanding) ----
-    // Suppress fetching while holding an I-fetch fault (wait for the redirect).
-    ic.cmd.valid      := started && !recValid && ibuf.io.push.ready && !stalled && !faultHold
+    // Suppress fetching while holding an I-fetch fault OR while STOP-quiesced (wait for the
+    // redirect / IRQ-entry vector to clear it).
+    ic.cmd.valid      := started && !recValid && ibuf.io.push.ready && !stalled && !faultHold && !quiesce
     ic.cmd.payload.pc := fetchPc
 
     when(ic.cmd.fire) {
@@ -166,7 +176,9 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     feed.payload(0) := res.slot0
     feed.payload(1) := res.slot1
     slot1ValidOut   := res.slot1Valid
-    feed.valid      := res.slot0Valid && !stalled
+    // Gate feed low while STOP-quiesced so no buffered successor word is dispatched /
+    // allocated into the ROB while halted (the quiesce only ends on the wake redirect).
+    feed.valid      := res.slot0Valid && !stalled && !quiesce
     // I-fetch fault: override the feed with a single faulted DecodePacket (slot0
     // only), emitted EXACTLY ONCE (faultEmitted suppresses re-emission). Its bytes are
     // don't-care; decode turns it into a faulted vector-2 µop that delivers at retire.
