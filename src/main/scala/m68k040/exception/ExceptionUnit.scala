@@ -72,7 +72,7 @@ class ExceptionUnit(
     //   sysPc       : the sysOp instruction's PC (the obs commit PC).
     //   sysNextPc   : the next instruction's PC (the redirect target after serialize).
     sysTrigger:   Bool = False,
-    sysKind:      UInt = U(0, 2 bits),
+    sysKind:      UInt = U(0, 3 bits),
     sysReadDir:   Bool = False,
     sysVal:       Bits = B(0, 32 bits),
     sysRc:        UInt = U(0, 12 bits),
@@ -137,7 +137,7 @@ class ExceptionUnit(
   val curSsw   = Reg(UInt(16 bits))   // $7 special status word
 
   // ── Commit-time SYSTEM op captured state (latched at sysTrigger) ─────────────
-  val sysCapKind    = Reg(UInt(2 bits))
+  val sysCapKind    = Reg(UInt(3 bits))
   val sysCapReadDir = Reg(Bool())
   val sysCapVal     = Reg(Bits(32 bits))
   val sysCapRc      = Reg(UInt(12 bits))
@@ -545,7 +545,7 @@ class ExceptionUnit(
     // is sysCapVal; the read direction writes the int PRF arch-reg (sysRegWrite*).
     S_APPLY.whenIsActive {
       switch(sysCapKind) {
-        is(U(1, 2 bits)) {                          // MOVE to SR : sysVal.W -> SR
+        is(U(1, 3 bits)) {                          // MOVE to SR : sysVal.W -> SR
           // System byte = sysVal[15:8], CCR = sysVal[4:0]. Writing srSys may flip S ->
           // A7 re-banks. The committed CCR is tracked in the ROB; we surface the new SR
           // (sysByte) in the obs, and the ROB folds sysVal[4:0] into committedCcr (so the
@@ -553,7 +553,7 @@ class ExceptionUnit(
           // the NEW-S bank's value (computed from the post-write S in S_REDIR via ss.a7).
           ss.setSrSys.valid := True; ss.setSrSys.payload := sysCapVal(15 downto 8).asUInt
         }
-        is(U(2, 2 bits)) {                          // MOVE USP : An<->USP
+        is(U(2, 3 bits)) {                          // MOVE USP : An<->USP
           when(sysCapReadDir) {                     // USP -> An : write the int PRF[pdst]
             sysRegWriteValid := True
             sysRegWritePhys  := sysCapDstPhys
@@ -562,7 +562,7 @@ class ExceptionUnit(
             ss.setUsp.valid := True; ss.setUsp.payload := sysCapVal.asUInt
           }
         }
-        is(U(3, 2 bits)) {                          // MOVEC : Rc<->Rn
+        is(U(3, 3 bits)) {                          // MOVEC : Rc<->Rn
           when(sysCapReadDir) {                     // Rc -> Rn : read the committed reg
             sysRegWriteValid := True
             sysRegWritePhys  := sysCapDstPhys
@@ -598,7 +598,7 @@ class ExceptionUnit(
       obsA7      := ss.a7                   // re-banked A7 (Mux on post-write S)
       // MOVE-to-SR (sysCapKind==1) writes the full CCR (sysVal[4:0]) -> surface it so the
       // whitebox resyncs its running CCR to this absolute value. Other sysOps leave CCR.
-      when(sysCapKind === U(1, 2 bits)) {
+      when(sysCapKind === U(1, 3 bits)) {
         obsSetCcr5Valid := True
         obsSetCcr5      := sysCapVal(4 downto 0).asUInt
       }

@@ -585,7 +585,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // available only after exc is built) and driven below. The captured context comes
       // straight from the head's per-entry sysOp stores + the captured value.
       sysTrigger = sysTriggerSig,
-      sysKind    = sysKindStore(h0).asBits.asUInt.resize(2),
+      sysKind    = sysKindStore(h0).asBits.asUInt.resize(3),
       sysReadDir = sysReadDirStore(h0),
       sysVal     = sysValStore(h0),
       sysRc      = sysRcStore(h0),
