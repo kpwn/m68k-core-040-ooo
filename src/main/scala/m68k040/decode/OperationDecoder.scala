@@ -244,6 +244,44 @@ object OperationDecoder {
           o.movemDir := opword(10)
           o.movemSizeLong := opword(6)
         }
+        // ── LEA An,<ea> (0100 An 1 11 mmmrrr): bit8=1, bits7:6=11. Compute the control-
+        // EA ADDRESS -> An (full-32, no flags). A benign MOVE placeholder; the assembler
+        // builds the leaAddr crack (LS address-generate). The An dst rides op[11:9]. The
+        // EA must be a MEMORY/control mode (mode >= 2): reg-direct (Dn/An) LEA is illegal
+        // AND mode 000 + bits7:6=11 is EXTB.L (0x49C0, op[15:6]==0100100111) — excluding
+        // mode 000/001 keeps EXTB.L on the EXT path and rejects the illegal reg-direct LEA.
+        // (CHK is bit6=0 -> disjoint; MOVEM is bit8=0 -> disjoint.)
+        val leaMode = opword(5 downto 3)
+        when(opword(8) && (opword(7 downto 6) === B"11") && (leaMode.asUInt >= 2)) {
+          o.illegal := False
+          o.op := DecOp.MOVE; o.size := Size.LONG
+          // operands left to the assembler's leaAddr crack (the EA is an ADDRESS the AGU
+          // computes, not a loaded value — no EASRC operand here).
+        }
+        // ── PEA <ea> (0100 1000 01 mmmrrr): op[15:6]==0x121. Push the control-EA address.
+        when(opword(15 downto 6) === B"10'b0100100001") {
+          o.illegal := False
+          o.op := DecOp.MOVE; o.size := Size.LONG
+        }
+        // ── MOVE from SR (0100 0000 11 mmmrrr): op[15:6]==0x103. SR(16) -> EA (.W).
+        // PRIVILEGED (040): the assembler sets needsSupervisor (ROB vector-8 if S==0).
+        when(opword(15 downto 6) === B"10'b0100000011") {
+          o.illegal := False
+          o.op := DecOp.MOVE; o.size := Size.WORD
+        }
+        // ── MOVE from CCR (0100 0010 11 mmmrrr): op[15:6]==0x10B. CCR(byte,ZX) -> EA (.W).
+        when(opword(15 downto 6) === B"10'b0100001011") {
+          o.illegal := False
+          o.op := DecOp.MOVE; o.size := Size.WORD
+        }
+        // ── MOVE to CCR (0100 0100 11 mmmrrr): op[15:6]==0x113. EA(.W low byte) -> CCR.
+        // srcB = the EA source (so a memSimple EA gets the generic leading-load crack);
+        // the assembler marks the op µop toCcr (direct CCR := src[4:0]).
+        when(opword(15 downto 6) === B"10'b0100010011") {
+          o.illegal := False
+          o.op := DecOp.MOVE; o.size := Size.WORD
+          o.srcB := easrc
+        }
       }
       // ---- Bcc / BSR / BRA (0110 cccc dddddddd) ----
       is(0x6) {
