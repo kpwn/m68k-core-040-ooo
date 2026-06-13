@@ -206,6 +206,17 @@ object MicroOpAssembler {
     val bitOpIsMem  = isBitOp && srcIsMem
     val bitOpSize   = Mux(bitOpIsMem, Size.BYTE, Size.LONG)
 
+    // Memory bit-ops are BYTE-sized, but the bit-op opword has NO size field (the size
+    // bits encode the bit-op TYPE), so OperationDecoder left spec.size at the WORD
+    // default -> EaDecoder computed autoDelta=2 for an (An)+/-(An) bit-op EA. A BYTE
+    // (An)+/-(An) must adjust An by 1 (A7-byte -> 2 to keep the stack pointer even).
+    // Recompute the source-EA auto-delta at BYTE for a memory bit-op; non-bit-ops keep
+    // srcEa.autoDelta (their spec.size is correct). stUop uses dstEa.autoDelta (MOVE-only,
+    // never a bit-op) so it is unaffected.
+    val srcIsA7        = srcEa.base === U(15, 5 bits)          // A7 = base 8+7
+    val bitOpByteDelta = Mux(srcIsA7, U(2, 3 bits), U(1, 3 bits))
+    val srcEaDelta     = Mux(bitOpIsMem, bitOpByteDelta, srcEa.autoDelta)
+
     val eaIsDst       = (spec.dst.kind === OperandKind.EASRC)
     val rmwOpInScope  = !(spec.op === DecOp.SWAP || spec.op === DecOp.EXT || spec.op === DecOp.TAS)
     // PC-relative EAs (d16,PC)/(d8,PC,Xn) are NOT alterable -> never a mem-dest RMW/store
@@ -487,7 +498,7 @@ object MicroOpAssembler {
     // POSTINC: An). The load does NOT write An (its int dst is the loaded value T0); the
     // An update rides a separate ADD µop (anUpdUop). For crackRmw the SAME eaAuto is on
     // BOTH the load (here) and the store so they access the same predec address.
-    ldUop.eaAuto        := srcEa.autoMode; ldUop.eaDelta := srcEa.autoDelta
+    ldUop.eaAuto        := srcEa.autoMode; ldUop.eaDelta := srcEaDelta
     ldUop.branchDisp    := 0
     ldUop.unimplemented := False
     ldUop.faulted       := False; ldUop.faultVector := 0; ldUop.isRte := False
@@ -578,7 +589,7 @@ object MicroOpAssembler {
     rmwStUop.readsNzvc     := False; rmwStUop.readsX := False
     rmwStUop.writesNzvc    := False; rmwStUop.writesX := False   // the op µop owns the flags
     rmwStUop.isBranch      := False; rmwStUop.ibranch := False; rmwStUop.stkPush := False; rmwStUop.anInc := 0; rmwStUop.ccrRestore := False; rmwStUop.toCcr := False; rmwStUop.cond := 0
-    rmwStUop.eaAuto        := srcEa.autoMode; rmwStUop.eaDelta := srcEa.autoDelta
+    rmwStUop.eaAuto        := srcEa.autoMode; rmwStUop.eaDelta := srcEaDelta
     rmwStUop.branchDisp    := 0
     rmwStUop.unimplemented := False
     rmwStUop.faulted       := False; rmwStUop.faultVector := 0; rmwStUop.isRte := False
@@ -1558,7 +1569,7 @@ object MicroOpAssembler {
     // marker, like LINK's A7-fold) while its An write still lands in the PRF and is
     // verified by a later reader. ALU ADD (LONG, no flags): dst := srcA + imm.
     val srcAnReg   = srcEa.base
-    val srcDelta32 = srcEa.autoDelta.resize(32).asSInt
+    val srcDelta32 = srcEaDelta.resize(32).asSInt
     val srcAnImm   = Mux(srcEa.autoMode === EaAuto.PREDEC, (-srcDelta32).asBits, srcDelta32.asBits)
     val anUpdUop   = addUop(srcAnReg, srcAnImm, srcAnReg, first = False, drop = True)
 
