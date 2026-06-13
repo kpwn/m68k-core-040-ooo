@@ -259,7 +259,11 @@ object OperationDecoder {
           // computes, not a loaded value — no EASRC operand here).
         }
         // ── PEA <ea> (0100 1000 01 mmmrrr): op[15:6]==0x121. Push the control-EA address.
-        when(opword(15 downto 6) === B"10'b0100100001") {
+        // The EA must be a CONTROL addressing mode (mode field >= 2): reg-direct (mode 000
+        // = Dn) is NOT PEA — 0x48400|rrr is SWAP Dn (op[15:3]==0x0908, mode 000), which
+        // shares op[15:6]==0x121 and would otherwise be clobbered here. Excluding mode
+        // 000/001 keeps SWAP on its own pattern (and rejects the illegal reg-direct PEA).
+        when((opword(15 downto 6) === B"10'b0100100001") && (opword(5 downto 3).asUInt >= 2)) {
           o.illegal := False
           o.op := DecOp.MOVE; o.size := Size.LONG
         }

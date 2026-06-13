@@ -242,18 +242,56 @@ class MemRmwDecodeSpec extends AnyFunSuite {
     }
   }
 
-  // ── still-deferred dest modes stay illegal ─────────────────────────────────
-  test("ADD.L D1,(A0)+ (post-inc dest) -> illegal (MEMCOMPLEX deferred)", VerilatorTest) {
+  // ── auto-update (-(An)/(An)+) mem-dest RMW (now in scope) ───────────────────
+  // Like a plain mem-dest RMW [load -> T0][op (T0,Dn) -> T1][store T1 -> ea] but the
+  // load + store both carry the SAME eaAuto (so they hit the SAME address) and the STORE
+  // (the lone int-writer of the triple) folds the An update on its int dst (dst = An).
+  def assertAutoRmwTriple(dut: Dut, an: Int, auto: EaAuto.E, delta: Int,
+                          sz: Size.E, expOp: DecOp.E): Unit = {
+    assert(dut.count.toInt == 3, s"auto-RMW = 3 µops, got ${dut.count.toInt}")
+    // load <ea> -> T0, with the auto-update marker (the load itself writes no int reg).
+    assert(dut.uop0.cluster.toEnum == Cluster.LS && dut.uop0.memOp.toEnum == MemOp.LOAD, "uop0 = LOAD")
+    assert(dut.uop0.srcAReg.toInt == an && dut.uop0.srcAValid.toBoolean, s"load base = A$an")
+    assert(dut.uop0.eaAuto.toEnum == auto && dut.uop0.eaDelta.toInt == delta, "load carries the auto-update")
+    assert(dut.uop0.dstReg.toInt == T0 && dut.uop0.dstValid.toBoolean, "load dst = T0")
+    assert(dut.uop0.size.toEnum == sz, "load size")
+    assert(dut.uop0.firstOfInstr.toBoolean, "load is firstOfInstr")
+    assert(!dut.uop0.unimplemented.toBoolean, "auto-update mem-dest is now in scope")
+    // op (T0 with Dn) -> T1 + flags.
+    assert(dut.uop1.op.toEnum == expOp, s"uop1 op = $expOp")
+    assert(dut.uop1.dstReg.toInt == T1 && dut.uop1.dstValid.toBoolean, "op dst = T1")
+    assert(dut.uop1.writesNzvc.toBoolean, "op writes flags")
+    assert(!dut.uop1.unimplemented.toBoolean)
+    // store T1 -> <ea>, SAME eaAuto, and the An update rides this store's int dst.
+    assert(dut.uop2.cluster.toEnum == Cluster.LS && dut.uop2.memOp.toEnum == MemOp.STORE, "uop2 = STORE")
+    assert(dut.uop2.srcAReg.toInt == an && dut.uop2.srcAValid.toBoolean, s"store base = A$an")
+    assert(dut.uop2.srcBReg.toInt == T1 && dut.uop2.srcBValid.toBoolean, "store data = T1")
+    assert(dut.uop2.eaAuto.toEnum == auto && dut.uop2.eaDelta.toInt == delta, "store carries the SAME auto-update")
+    assert(dut.uop2.dstReg.toInt == an && dut.uop2.dstValid.toBoolean, "store folds the An update on its int dst")
+    assert(!dut.uop2.writesNzvc.toBoolean, "store sets no flags (op owns them)")
+    assert(!dut.uop2.unimplemented.toBoolean)
+  }
+
+  test("ADD.L D1,(A0)+ (post-inc dest) -> load(A0)+ -> T0, ADD -> T1, store T1 -> (A0)+ (A0+=4)", VerilatorTest) {
     // ADD.L D1,(A0)+: line D opmode 6, EA mode 3 reg 0. 1101 001 110 011 000 = 0xD398
     run { dut => drive(dut, 0xD398); sleep(1)
-      assert(dut.uop0.unimplemented.toBoolean, "post-inc mem-dest stays illegal")
+      assertAutoRmwTriple(dut, an = 8, auto = EaAuto.POSTINC, delta = 4, sz = Size.LONG, expOp = DecOp.ADD)
+      // ADD reads D1 (the register operand) + T0 (loaded mem); writes X.
+      val reads1  = dut.uop1.srcAReg.toInt == 1 || dut.uop1.srcBReg.toInt == 1
+      val readsT0 = dut.uop1.srcAReg.toInt == T0 || dut.uop1.srcBReg.toInt == T0
+      assert(reads1 && readsT0, "ADD reads D1 and T0")
+      assert(dut.uop1.writesX.toBoolean, "ADD writes X")
     }
   }
 
-  test("ADD.L D1,-(A0) (pre-dec dest) -> illegal (MEMCOMPLEX deferred)", VerilatorTest) {
+  test("ADD.L D1,-(A0) (pre-dec dest) -> load-(A0) -> T0, ADD -> T1, store T1 -> -(A0) (A0-=4)", VerilatorTest) {
     // ADD.L D1,-(A0): line D opmode 6, EA mode 4 reg 0. 1101 001 110 100 000 = 0xD3A0
     run { dut => drive(dut, 0xD3A0); sleep(1)
-      assert(dut.uop0.unimplemented.toBoolean, "pre-dec mem-dest stays illegal")
+      assertAutoRmwTriple(dut, an = 8, auto = EaAuto.PREDEC, delta = 4, sz = Size.LONG, expOp = DecOp.ADD)
+      val reads1  = dut.uop1.srcAReg.toInt == 1 || dut.uop1.srcBReg.toInt == 1
+      val readsT0 = dut.uop1.srcAReg.toInt == T0 || dut.uop1.srcBReg.toInt == T0
+      assert(reads1 && readsT0, "ADD reads D1 and T0")
+      assert(dut.uop1.writesX.toBoolean, "ADD writes X")
     }
   }
 

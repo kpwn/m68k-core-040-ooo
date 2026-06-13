@@ -16,6 +16,7 @@ class CrackLoadSpec extends AnyFunSuite {
     val count = out(UInt(2 bits)); count := a.count
     val uop0  = out(DecodedUop()); uop0 := a.uops(0)
     val uop1  = out(DecodedUop()); uop1 := a.uops(1)
+    val uop2  = out(DecodedUop()); uop2 := a.uops(2)
   }
 
   def drive(dut: Dut, op: Int, w1: Int = 0, w2: Int = 0, len: Int = 1): Unit = {
@@ -114,10 +115,32 @@ class CrackLoadSpec extends AnyFunSuite {
     }
   }
 
-  test("(An)+ post-increment still unimplemented", VerilatorTest) {
-    // ADD.L (A0)+,D1 : mode 3 = (An)+ -> deferred -> unimplemented
+  test("(An)+ post-increment EA source -> LOAD(A0)+ + An-update + ADD reading T0", VerilatorTest) {
+    // ADD.L (A0)+,D1 : mode 3 = (An)+ -> now cracks [load (A0)+ -> T0][A0 += 4][ADD D1,T0].
+    // POSTINC: access addr = A0 (psrcA), A0 := A0 + 4. The load can write only one int reg
+    // (T0), so the An update rides a SEPARATE ADD µop; the op (ADD) reads T0 last.
     run { dut => drive(dut, 0xD298); sleep(1)
-      assert(dut.uop0.unimplemented.toBoolean, "(An)+ side-effect EA must stay unimplemented")
+      assert(dut.count.toInt == 3, s"expected 3 µops, got ${dut.count.toInt}")
+      // µop0 = load (A0)+ -> T0, POSTINC delta 4 (the load itself does NOT write A0).
+      assert(!dut.uop0.unimplemented.toBoolean, "(An)+ side-effect EA is now in scope")
+      assert(dut.uop0.cluster.toEnum == Cluster.LS && dut.uop0.memOp.toEnum == MemOp.LOAD)
+      assert(dut.uop0.srcAReg.toInt == 8 && dut.uop0.srcAValid.toBoolean, "load base = A0 (8)")
+      assert(dut.uop0.eaAuto.toEnum == EaAuto.POSTINC && dut.uop0.eaDelta.toInt == 4, "(A0)+ POSTINC, delta 4")
+      assert(dut.uop0.dstReg.toInt == 16 && dut.uop0.dstValid.toBoolean, "load dst = T0 (16)")
+      assert(dut.uop0.size.toEnum == Size.LONG)
+      assert(dut.uop0.firstOfInstr.toBoolean, "load is the first µop")
+      // µop1 = the An postincrement: A0 := A0 + 4 (a plain ADD reading A0 + #4 -> A0).
+      assert(dut.uop1.op.toEnum == DecOp.ADD, "An-update is an ADD")
+      assert(dut.uop1.srcAReg.toInt == 8 && dut.uop1.srcAValid.toBoolean, "An-update reads A0")
+      assert(dut.uop1.useImm.toBoolean && dut.uop1.imm.toLong == 4, "An-update adds the +4 delta")
+      assert(dut.uop1.dstReg.toInt == 8 && dut.uop1.dstValid.toBoolean, "An-update writes A0")
+      assert(!dut.uop1.writesNzvc.toBoolean, "An-update sets no flags (address arithmetic)")
+      // µop2 = ADD reading T0 in srcB, D1 in srcA -> D1, NZVCX.
+      assert(dut.uop2.op.toEnum == DecOp.ADD && dut.uop2.cluster.toEnum == Cluster.INT)
+      assert(dut.uop2.srcBReg.toInt == 16 && dut.uop2.srcBValid.toBoolean, "ADD srcB = T0 (16)")
+      assert(dut.uop2.srcAReg.toInt == 1 && dut.uop2.srcAValid.toBoolean, "ADD srcA = D1")
+      assert(dut.uop2.dstReg.toInt == 1 && dut.uop2.dstValid.toBoolean && dut.uop2.writesNzvc.toBoolean)
+      assert(!dut.uop2.unimplemented.toBoolean)
     }
   }
 }

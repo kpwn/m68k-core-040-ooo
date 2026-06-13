@@ -2,7 +2,7 @@ package m68k040.decode
 
 import m68k040.VerilatorTest
 import m68k040.frontend.DecodePacket
-import m68k040.isa.Size
+import m68k040.isa.{MemOp, Size}
 import spinal.core._
 import spinal.core.sim._
 import org.scalatest.funsuite.AnyFunSuite
@@ -13,8 +13,11 @@ import org.scalatest.funsuite.AnyFunSuite
 class Line4DecodeSpec extends AnyFunSuite {
   class Dut extends Component {
     val pkt = in(DecodePacket())
+    val a   = MicroOpAssembler.assemble(pkt)
+    val count = out(UInt(2 bits)); count := a.count
     val uop = out(DecodedUop())
-    uop := MicroOpAssembler.assemble(pkt).uops(0)
+    uop := a.uops(0)
+    val uop1 = out(DecodedUop()); uop1 := a.uops(1)
   }
   def drive(dut: Dut, op: Int, w1: Int = 0, len: Int = 1): Unit = {
     dut.pkt.valid #= true; dut.pkt.pc #= 0x1000; dut.pkt.simple #= true; dut.pkt.complex #= false
@@ -83,10 +86,24 @@ class Line4DecodeSpec extends AnyFunSuite {
         "CLR mem-dest now cracks to [CLR -> T1][store]")
     }
   }
-  // Memory-COMPLEX CLR.L (A0)+ = 0x4298 (mode 011): still deferred -> illegal.
-  test("CLR.L (A0)+ memory-complex dest -> illegal (deferred)", VerilatorTest) {
+  // CLR.L (A0)+ = 0x4298 (mode 011): the CLR mem-RMW store with an (A0)+ POSTINC An-update.
+  // Now cracks [CLR -> T1=0][store T1 -> (A0)+, A0 += 4] (no load — CLR overwrites). uops(0)
+  // is the CLR op; uops(1) is the auto-update store (the lone int-writer folds A0 := A0+4).
+  test("CLR.L (A0)+ -> CLR -> T1 + auto-store T1 -> (A0)+ (A0 += 4)", VerilatorTest) {
     run { dut => drive(dut, 0x4298); sleep(1)
-      assert(dut.uop.unimplemented.toBoolean && dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 4)
+      assert(dut.count.toInt == 2, s"CLR (A0)+ = op(0) + auto-store, got ${dut.count.toInt}")
+      // uop0 = CLR op -> T1 (not illegal: predec/postinc mem-dest is now in scope).
+      assert(!dut.uop.unimplemented.toBoolean && !dut.uop.faulted.toBoolean, "(A0)+ CLR is no longer illegal")
+      assert(dut.uop.op.toEnum == DecOp.CLR && dut.uop.size.toEnum == Size.LONG)
+      assert(dut.uop.dstReg.toInt == 17 && dut.uop.dstValid.toBoolean, "CLR dst = T1 (17)")
+      assert(dut.uop.writesNzvc.toBoolean, "CLR sets flags (Z=1,N=0)")
+      assert(dut.uop.firstOfInstr.toBoolean, "CLR op is firstOfInstr (no load)")
+      // uop1 = the auto-update store: data = T1, base = A0, POSTINC delta 4, folds A0 := A0+4.
+      assert(dut.uop1.memOp.toEnum == MemOp.STORE && dut.uop1.srcBReg.toInt == 17, "store data = T1")
+      assert(dut.uop1.srcAReg.toInt == 8 && dut.uop1.srcAValid.toBoolean, "store base = A0")
+      assert(dut.uop1.eaAuto.toEnum == EaAuto.POSTINC && dut.uop1.eaDelta.toInt == 4, "(A0)+ POSTINC, delta 4")
+      assert(dut.uop1.dstReg.toInt == 8 && dut.uop1.dstValid.toBoolean, "store folds A0 := A0+4 on its int dst")
+      assert(!dut.uop1.writesNzvc.toBoolean && !dut.uop1.unimplemented.toBoolean)
     }
   }
 
