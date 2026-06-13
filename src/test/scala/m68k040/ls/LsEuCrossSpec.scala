@@ -54,6 +54,8 @@ class LsEuCrossSpec extends AnyFunSuite {
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
     s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false
+    s.iStkPush #= false   // MUST default: an undriven stkPush makes a load PREDECREMENT,
+                          // writing (base - size) to the dst instead of the loaded data.
     cd.waitSampling(80)
     (cd, mem)
   }
