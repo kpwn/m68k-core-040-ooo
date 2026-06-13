@@ -38,6 +38,7 @@ class LsEuSourcePlugin extends FiberPlugin {
     val uop = ctx.uop
     uop.valid        := False
     uop.pc           := U(0)
+    uop.nextPc       := U(0)
     uop.cluster      := Cluster.LS
     uop.memOp        := iMemOp
     uop.op           := m68k040.decode.DecOp.MOVE
@@ -68,6 +69,23 @@ class LsEuSourcePlugin extends FiberPlugin {
     uop.ccrRestore   := False
     uop.isMovea      := False
     uop.divIsRem     := False
+    // Fields added by later slices that this directed LS source does not exercise —
+    // default them inert so the RenamedUop is fully driven (no no-driver/latch). Track A
+    // added indexLong/indexScale (indexed-EA); Track D added sysOp/sysKind/sysReadDir
+    // (commit-time system ops). The remaining flag/branch/fault/shift/bcd fields are
+    // likewise inert for a plain aligned load/store.
+    uop.indexLong    := False; uop.indexScale := U(0)
+    uop.sysOp        := False; uop.sysKind := m68k040.decode.SysKind.NONE; uop.sysReadDir := False
+    uop.toCcr        := False
+    uop.anInc        := U(0)
+    uop.divSigned    := False; uop.div64 := False
+    uop.shiftOp      := B(0); uop.shiftDir := False
+    uop.bcdSub       := False; uop.bitOp := B(0); uop.extByte := False
+    uop.isScc        := False; uop.isDbcc := False
+    uop.firstOfInstr := True
+    uop.faulted      := False; uop.faultVector := U(0); uop.faultUsesNextPc := False
+    uop.faultAddr    := U(0); uop.sswInstr := False
+    uop.isRte        := False; uop.isTrapv := False
     ctx.robId := iRobId
     eu.issue.valid   := iValid
     eu.issue.payload := ctx
