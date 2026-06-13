@@ -84,6 +84,13 @@ case class RenamedUop() extends Bundle {
   // in the LS-EU AGU (indexLong => full 32 vs .W sign-extend; indexScale = *1/2/4/8).
   val indexLong  = Bool()
   val indexScale = UInt(2 bits)
+  // LEA address-generate (LS): write s1Va to the int dst, no mem access. Threaded.
+  val leaAddr  = Bool()
+  // MOVE from/to CCR/SR (ALU). fromCcr/fromSr select the CCR/SR int result; needs-
+  // Supervisor = privileged (ROB vector-8 check on the committed S bit). Threaded.
+  val fromCcr  = Bool()
+  val fromSr   = Bool()
+  val needsSupervisor = Bool()
   val dstArch = UInt(5 bits)   // architectural int dst reg 0..17 (incl T0/T1); for commit RAT + CommitTrace
   val psrcA = UInt(intW bits); val psrcAValid = Bool()
   val psrcB = UInt(intW bits); val psrcBValid = Bool()
