@@ -2640,7 +2640,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "loop: bra loop ; " +
       "handler: move.l 2(%a7),%d0 ; addq.l #2,%d0 ; move.l %d0,2(%a7) ; " +            // bump stacked PC past the 2-byte op
       "moveq #1,%d2 ; rte",
-      nInstr = 11)
+      nInstr = 11, usp = 0)   // the program never sets USP; pin dut USP=0 to match Musashi's default (the
+                              // harness seeds the dut USP but the Musashi binding has no USP seed). MOVE-to-SR
+                              // banking is still exercised (A7: SSP 0x100000 -> USP 0 on S->0, back on the trap).
   }
 
   test("lock-step: TRAP #5 -> handler -> RTE (format-$0 delivery)", VerilatorTest) {
