@@ -599,18 +599,53 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 ---
 
-## Results (fill in during execution)
+## Results
 
-- Plan SHA: (this commit)
-- RESET: implemented / deferred — reason:
-- STOP: implemented / deferred — quiesce design chosen (explicit fetch-gate vs self-redirect):
-- MOVES: implemented / deferred — reason:
-- New struct/Ctx fields (for the controller to cross-check builders+pokers): `SysKind.RESET`, `SysKind.STOP`; ExceptionUnit `sysKind`/`sysCapKind` widened 2→3 bits; RobPlugin `stopped`/`quiesce`.
-- Lock-step results (diverged count):
-- Decode/parity/fastTest:
-- ≥200 OOC gate FMax + worst path:
-- Final SHA:
-- Blockers / traces:
+- Plan SHA: `eb780c5`
+- **RESET (0x4E70): IMPLEMENTED.** No-op `SysKind.RESET` on the commit-time sysOp path; the
+  S_APPLY FSM does nothing, S_REDIR advances PC. The value-less op-µop's `sysValRdy` is set
+  by the normal no-write completion (no alloc-ready fallback needed — verified by the passing
+  lock-step). Lock-step: supervisor fall-through + S=0 vector-8 trap, **0 diverged**.
+- **STOP (0x4E72): IMPLEMENTED.** `SysKind.STOP`; the op-µop is a MOVE-imm16 so imm16 (the new
+  SR) flows into `sysValStore`; S_APPLY writes SR like MOVE-to-SR (+CCR fold +A7 re-bank).
+  **Quiesce design = explicit fetch-gate** (NOT self-redirect): a ROB `stopped` reg drives a
+  FetchAlign `quiesce` input (faultHold-style fetch+feed suppress); `interruptPending` fires
+  while stopped (count==0, no head) to wake; the IRQ-entry vector redirect resumes fetch. A
+  `stoppedPc` reg latches STOP's nextPc so the IRQ entry stacks the correct resume PC (else
+  the empty-ROB `pcStore(h0)` is stale → RTE resumes at garbage; this was the one real bug
+  caught + fixed via the lock-step). Lock-step: SR-load + halt + level-5 autovector wake +
+  handler + RTE + resume, full SR/A7/PC/regs, **0 diverged**.
+- **MOVES (0x0E00): DEFERRED — reason:** This core has no function-code-qualified bus and
+  SFC/DFC are RAZ-WI (MOVEC SFC=0x000/DFC=0x001 are write-ignored, read-zero). A real MOVES
+  selects an ALTERNATE address space via SFC/DFC. Decisive finding: in this Musashi build
+  `m68ki_read_N_fc`/`m68ki_write_N_fc` do `(void)fc;` — the FC is IGNORED for the actual
+  access (it only sets the fault-frame FC register + feeds the PMMU, which is OFF in lock-step).
+  So a degenerate flat-space MOVES *would* trace-match Musashi — but that is precisely why it
+  would be a FAKE: neither the core (RAZ-WI SFC/DFC, flat bus) nor the MMU-off Musashi exercises
+  the FC distinction, so a MOVES test would be byte-for-byte indistinguishable from a plain MOVE
+  and prove NOTHING MOVES-specific, while still requiring µcode-engine decode/crack work. Per
+  the no-fake-pass rule, deferred. Implementing MOVES faithfully needs an FC-qualified D-cache
+  port + real SFC/DFC made readable (its own slice, gated behind the MMU's FC plumbing).
+- New struct/Ctx fields (for the controller to cross-check builders+pokers):
+  - `SysKind.RESET` (=4), `SysKind.STOP` (=5) appended to the enum (DecodedUop.scala).
+  - ExceptionUnit `sysKind` ctx param + `sysCapKind` reg widened 2→3 bits (+ the S_APPLY/S_REDIR
+    literals); RobPlugin `sysKind = ...resize(3)` wiring.
+  - RobPlugin `stopped` (RegInit False) + `stoppedPc` (Reg UInt32) — both simPublic.
+  - FetchAlignPlugin `quiesce` (Bool, allowOverride idle) — wired from `rob.logic.stopped` in
+    FullCoreSynth.
+  - No new field on DecodedUop/RenamedUop/Microcode.Ctx (RESET/STOP reuse the existing
+    sysOp/sysKind/imm fields), so the µop builders + ROB/IRQ test pokers needed NO new
+    assignments — confirmed by T4 grep + the green fastTest/lock-step.
+- Lock-step results: **0 diverged** on every test (RESET ×2, STOP ×1, + all pre-existing sysOp/
+  IRQ/exception tests in the full ExecuteLockStepSpec run).
+- Decode/parity/fastTest: green — OperationDecoderSpec (44, +RESET/+STOP), PredecodeWordSpec
+  (65536-opword parity, RESET=len1/STOP=len2), MicroOpAssemblerSpec, DecodedUopSpec,
+  RobInterruptSpec, InterruptEntrySpec, MicrocodeSpec.
+- ≥200 OOC gate FMax + worst path: (see T6 — run after the controller's Vivado P&R clears)
+- Final SHA: (T6 final commit)
+- Blockers / traces: none. The only real bug (stoppedPc) was caught by the STOP lock-step and
+  fixed; trace evidence in /home/qwertyoruiop/tmp/t3-lockstep.log (diverged step 4) →
+  t3-lockstep2.log (0 diverged after the fix).
 
 ---
 
