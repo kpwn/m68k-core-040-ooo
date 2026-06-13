@@ -201,6 +201,26 @@ object PredecodeWord {
         val isUnlk = (op(15 downto 4) === B"12'h4E5") &&  op(3)
         when(isLink) { r.simple := True; r.lenWords := U(2, 3 bits) }
         when(isUnlk) { r.simple := True; r.lenWords := U(1, 3 bits) }
+        // ── Privileged commit-time SYSTEM ops (frame the length so nextPc is right) ─
+        // MOVE to SR (0100 0110 11 mmmrrr): opword + the source EA's ext words (the
+        // EA is a .W source). MOVE USP (0100 1110 0110 d rrr = 0x4E6x): single word.
+        // MOVEC (0x4E7A/0x4E7B): opword + 1 ext word {A/D|reg#|Rc}. These commit-time
+        // sysOps re-fetch younger work after the serializing retire, so a precise nextPc
+        // matters (the redirect target = nextPc).
+        val isMoveToSr = op(15 downto 6) === B"10'b0100011011"
+        when(isMoveToSr) {
+          val srcMode = op(5 downto 3).asUInt
+          val srcReg  = op(2 downto 0).asUInt
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL = False, allowImm = true)  // .W source EA
+          when(ok) { r.simple := True; r.lenWords := (U(1, 3 bits) + e).resized }
+        }
+        val isMoveUsp = op(15 downto 4) === B"12'h4E6"
+        when(isMoveUsp) { r.simple := True; r.lenWords := U(1, 3 bits) }
+        val isMovec = op(15 downto 1) === B"15'b010011100111101"   // 0x4E7A / 0x4E7B
+        when(isMovec) { r.simple := True; r.lenWords := U(2, 3 bits) }   // opword + ext word
+        // RTD (0x4E74) + disp16: opword + 1 disp word -> SIMPLE len 2 (RTS-with-dealloc).
+        val isRtd = op === B"16'h4E74"
+        when(isRtd) { r.simple := True; r.lenWords := U(2, 3 bits) }
         // CHK.W/CHK.L (0100 ddd 1 s 0 mmmrrr): bit8=1, bit6=0. The bound is an EA
         // source (sizeL = .L when bit7=0). 1 opword + the EA extension words.
         val isChk = op(8) && !op(6)

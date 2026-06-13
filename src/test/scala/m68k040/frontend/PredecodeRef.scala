@@ -178,6 +178,22 @@ object PredecodeRef {
             case Some(e) if ctrlMode => CP(simple = true, lenWords = 1 + e)
             case _                   => COMPLEX
           }
+        } else if (((op >> 6) & 0x3ff) == 0x11b) {
+          // MOVE to SR (0100 0110 11 mmmrrr): opword + the .W source EA ext words.
+          val srcMode = (op >> 3) & 7; val srcReg = op & 7
+          eaExt(srcMode, srcReg, sizeL = false, allowImm = true) match {
+            case Some(e) => CP(simple = true, lenWords = 1 + e)
+            case None    => COMPLEX
+          }
+        } else if ((op & 0xfff0) == 0x4e60) {
+          // MOVE USP (0100 1110 0110 d rrr = 0x4E6x): single word.
+          CP(simple = true, lenWords = 1)
+        } else if ((op & 0xfffe) == 0x4e7a) {
+          // MOVEC (0x4E7A Rc->Rn / 0x4E7B Rn->Rc): opword + 1 ext word {A/D|reg#|Rc}.
+          CP(simple = true, lenWords = 2)
+        } else if (op == 0x4e74) {
+          // RTD (0x4E74) + disp16: opword + 1 disp word.
+          CP(simple = true, lenWords = 2)
         } else if (op.&(0x0800) != 0 && ((op >> 7) & 7) == 1) {
           // MOVEM (0100 1 d 001 s mmmrrr) + 16-bit mask: opword + mask + EA ext. In-scope:
           // (An)/(An)+/-(An) +0, (d16,An)/(xxx).W/(d16,PC) +1, (xxx).L +2. Direction (bit10)

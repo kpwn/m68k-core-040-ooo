@@ -212,6 +212,9 @@ object Microcode {
     // use an index — default inert (mirrors MicroOpAssembler's non-indexed cracks).
     u.indexLong := False; u.indexScale := 0
     u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+    // µcode µops are never commit-time system ops (the system ops ride the fast
+    // op-µop builder + the ROB serializing path, not the ROM). Default inert.
+    u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
     u.firstOfInstr := Bool(d.isFirst)
     u
   }

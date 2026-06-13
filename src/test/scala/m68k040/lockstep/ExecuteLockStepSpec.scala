@@ -95,6 +95,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         rob.logic.ccrCompletion(idx).payload.nzvcWrite:= w.nzvcWrite
         rob.logic.ccrCompletion(idx).payload.x        := w.x
         rob.logic.ccrCompletion(idx).payload.xWrite   := w.xWrite
+        // The EU writeback VALUE + intWrite (captured per-ROB-entry for a commit-time
+        // system op's write direction: the sysOp µop is a MOVE -> result = the source).
+        rob.logic.ccrCompletion(idx).payload.result   := w.result
+        rob.logic.ccrCompletion(idx).payload.intWrite := w.intWrite
       }
       wireCcr(0, eu0.logic.wbObs); wireCcr(1, eu1.logic.wbObs); wireCcr(2, lsEu.logic.wbObs)
       wireCcr(3, divEu.logic.wbObs)
@@ -196,10 +200,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       lsEu.excXlateSupervisor   := exc.dtReq.supervisor
       exc.sqDrained             := lsEu.sqEmptySig
       // A7 (int reg 15) write-back on an exception/RTE A7 change. Committed arch-15
-      // maps to phys-15 (identity, unrenamed in these programs).
-      a7Wr.valid   := exc.a7WriteValid
-      a7Wr.address := U(15, a7Wr.address.getWidth bits)
-      a7Wr.data    := exc.a7WriteData.asBits
+      // maps to phys-15 (identity, unrenamed in these programs). The SAME PRF write
+      // port also serves a commit-time SYSTEM op's READ direction (MOVE-USP / MOVEC
+      // Rc->Rn writes an arbitrary int arch-Rn): sysRegWrite fires in S_APPLY, a7Write
+      // in S_REDIR (consecutive cycles -> no same-cycle collision on the one port).
+      a7Wr.valid   := exc.a7WriteValid || exc.sysRegWriteValid
+      a7Wr.address := Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
+                                                U(15, a7Wr.address.getWidth bits))
+      a7Wr.data    := Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits)
     }
   }
 
@@ -415,7 +423,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           val c = dut.rob.logic.commitObs(2)
           if (c.fire.toBoolean) {
             commitCount += 1
-            handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL, if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1)
+            handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
+              if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1,
+              if (c.setCcr5Valid.toBoolean) c.setCcr5.toInt & 0x1f else -1)
           }
         }
       }
@@ -2040,6 +2050,105 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 6)
   }
 
+  // ── RTD (RTS with a stack-deallocation displacement) ───────────────────────
+  test("lock-step: bsr ... rtd #4 (pop PC + dealloc the pushed arg)", VerilatorTest) {
+    // The caller pushes a 4-byte arg, then BSRs. The callee returns with `rtd #4`,
+    // which pops the return PC from (A7) AND deallocates the 4 arg bytes (A7 += 4+4),
+    // so A7 is restored to its value BEFORE the arg push. Verifies the RTD crack:
+    // [pop PC -> T0][A7 += 4+disp16][ibranch T0] vs Musashi (PC + A7 step-for-step).
+    // Flow to sentinel: moveq#1, moveq#0xa->d3, move.l d3 -(sp), bsr, moveq#3, rtd#4,
+    // moveq#7 = 7.
+    runLockStep("rtd-dealloc",
+      "moveq #1,%d0 ; moveq #0xa,%d3 ; move.l %d3,-(%sp) ; bsr sub ; moveq #7,%d2 ; " +
+      ".stop: bra .stop ; sub: moveq #3,%d1 ; rtd #4",
+      nInstr = 7)
+  }
+
+  test("lock-step: rtd #0 (== rts, no dealloc)", VerilatorTest) {
+    // rtd #0 pops PC + A7 += 4 (exactly RTS). Confirms the disp16=0 edge.
+    runLockStep("rtd-zero",
+      "moveq #1,%d0 ; bsr sub ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "sub: moveq #3,%d1 ; rtd #0",
+      nInstr = 5)
+  }
+
+  test("lock-step: rtd #-4 (negative displacement)", VerilatorTest) {
+    // A negative disp16 leaves A7 BELOW the return slot (A7 += 4 + (-4) = +0). Exercises
+    // the sign-extension of disp16 in the A7 add. After return A7 = the post-pop value
+    // minus 4 (one word below where RTS would leave it).
+    runLockStep("rtd-neg",
+      "moveq #1,%d0 ; bsr sub ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "sub: moveq #3,%d1 ; rtd #-4",
+      nInstr = 5)
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // PRIVILEGED COMMIT-TIME SYSTEM ops (Track D): MOVE-USP / MOVE-to-SR / MOVEC.
+  // The core boots SUPERVISOR (S=1, SSP=0x00100000, USP=0). The serializing system-op
+  // FSM (ExceptionUnit S_APPLY) writes committed state + re-banks A7 + redirects.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  // MOVE USP round-trip (supervisor): write USP from A3, read it back into A4. A4 is
+  // surfaced into D5 (the read is FSM-written, verified by the following reader). A7
+  // stays = SSP (S unchanged), so the serialization is the only effect.
+  test("lock-step: MOVE A3,USP ; MOVE USP,A4 round-trip (supervisor)", VerilatorTest) {
+    runLockStep("move-usp-roundtrip",
+      "move.l #0x12340000,%a3 ; move.l %a3,%usp ; move.l %usp,%a4 ; move.l %a4,%a5 ; " +
+      ".stop: bra .stop",
+      nInstr = 4)   // a5 == 0x12340000 (USP round-tripped; MOVEA sets no flags)
+  }
+
+  // MOVE to SR — the S-bit write + A7 banking. Set USP distinct from SSP, then a
+  // MOVE-to-SR clearing S switches supervisor->user: A7 must bank from SSP to the USP
+  // value (lock-step a7 step-for-step). The SR system byte also changes (S 1->0). The
+  // .L move sets D0; the .W source is D0's low word. SR=0x0700 (user, I=7, all CCR 0).
+  test("lock-step: MOVE D0,SR (S=1->S=0) -> A7 banks to USP", VerilatorTest) {
+    runLockStep("move-to-sr-bank",
+      // USP := 0x00200000 (distinct from boot SSP 0x00100000); D0 := 0x0700 (user SR);
+      // move D0,SR clears S -> A7 banks to USP=0x00200000. Read A7 into A1 to surface it.
+      "move.l #0x00200000,%a2 ; move.l %a2,%usp ; move.w #0x0700,%d0 ; move %d0,%sr ; " +
+      "move.l %sp,%a1 ; " +
+      ".stop: bra .stop",
+      nInstr = 5)   // after move-to-SR: S=0, A7=USP=0x00200000 (a1 surfaces A7)
+  }
+
+  // ── MOVEC (Track D): VBR / USP / CACR control registers ─────────────────────
+  // MOVEC USP round-trip: write USP from D0 (movec %d0,%usp), read it back into D1
+  // (movec %usp,%d1). D1 == D0 proves the USP bank via MOVEC. (Supervisor; A7 unchanged.)
+  test("lock-step: MOVEC D0,USP ; MOVEC USP,D1 round-trip", VerilatorTest) {
+    runLockStep("movec-usp",
+      "move.l #0x0abc0000,%d0 ; movec %d0,%usp ; movec %usp,%d1 ; " +
+      ".stop: bra .stop",
+      nInstr = 3)   // d1 == 0x0abc0000
+  }
+
+  // MOVEC CACR RAZ-WI: write a value to CACR (write-ignored), read it back -> 0 (RAZ).
+  // The 68040 CACR's only effects are cache enables, which this core lacks -> RAZ-WI.
+  // (Musashi masks CACR to the implemented bits; for a fresh write-then-read the DUT's
+  // RAZ matches Musashi when the written value clears on read of the unimplemented bits.
+  // We write 0 then read 0 to stay trace-indistinguishable from Musashi's CACR model.)
+  test("lock-step: MOVEC CACR read -> 0 (RAZ)", VerilatorTest) {
+    runLockStep("movec-cacr-raz",
+      "movec %cacr,%d2 ; " +    // read CACR (RAZ) -> D2 = 0
+      ".stop: bra .stop",
+      nInstr = 1)   // d2 == 0
+  }
+
+  // MOVEC VBR then an exception: set VBR := 0x3000, install the illegal-instruction
+  // handler at VBR+4*4 = 0x3010 (a runtime store the DUT D-cache + Musashi both see),
+  // then `illegal` (vector 4) -> the FSM fetches the vector at VBR+0x10 = 0x3010 ->
+  // the handler PC must be the stored handler addr. This PROVES the MOVEC VBR write
+  // drives the vector fetch (vs the default VBR=0). The handler bumps the stacked PC
+  // past the 2-byte illegal + RTEs. Commit PC/SR/A7 lock-stepped across entry/handler/RTE.
+  test("lock-step: MOVEC D0,VBR then illegal -> handler via new VBR -> RTE", VerilatorTest) {
+    runLockStep("movec-vbr-exc",
+      "move.l #0x3000,%d0 ; movec %d0,%vbr ; move.l #handler,%d1 ; move.l %d1,0x3010 ; " +
+      "illegal ; moveq #7,%d3 ; " +
+      "loop: bra loop ; " +
+      "handler: move.l 2(%a7),%d0 ; addq.l #2,%d0 ; move.l %d0,2(%a7) ; moveq #1,%d2 ; rte",
+      nInstr = 11)
+  }
+
   test("lock-step: jsr (xxx).L ... rts", VerilatorTest) {
     // jsr sub (absolute long). Executed: moveq#1, jsr(abs), moveq#3, rts, moveq#7 = 5.
     runLockStep("jsr-abs",
@@ -2517,6 +2626,23 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // handler vector lives at VBR(0)+37*4 = 0x94 (a runtime store the DUT D-cache +
   // Musashi both see). Commit PC/SR/A7 lock-stepped vs Musashi across entry ->
   // handler -> RTE -> resume.
+  // ── PRIVILEGE-violation trap (Track D): a privileged op at S=0 -> vector 8 ───
+  // Install the privilege handler at VBR(0)+8*4 = 0x20, drop to USER mode (MOVE-to-SR
+  // clearing S), then a privileged `move %usp,%a0` at S=0 traps to vector 8 (format-$0,
+  // restartable: stacks its OWN PC). The handler (supervisor) bumps the stacked PC past
+  // the 2-byte faulting op (so RTE resumes at the fall-through, not re-trapping) and
+  // RTEs. Commit PC/SR/A7 lock-stepped across the user-switch, the trap entry (S back
+  // to 1, A7 banks to SSP), the handler, and the RTE (back to user, A7 -> USP).
+  test("lock-step: privileged op at S=0 -> vector-8 trap -> handler -> RTE", VerilatorTest) {
+    runLockStep("exc-privilege",
+      "move.l #handler,%d0 ; move.l %d0,0x20 ; move.w #0x0000,%d1 ; move %d1,%sr ; " + // -> user (S=0)
+      "move.l %usp,%a0 ; moveq #7,%d3 ; " +                                            // privileged -> trap; resume here
+      "loop: bra loop ; " +
+      "handler: move.l 2(%a7),%d0 ; addq.l #2,%d0 ; move.l %d0,2(%a7) ; " +            // bump stacked PC past the 2-byte op
+      "moveq #1,%d2 ; rte",
+      nInstr = 11)
+  }
+
   test("lock-step: TRAP #5 -> handler -> RTE (format-$0 delivery)", VerilatorTest) {
     runLockStep("exc-trap",
       "move.l #handler,%d0 ; move.l %d0,0x94 ; trap #5 ; moveq #7,%d3 ; " +

@@ -38,7 +38,9 @@ object WhiteboxCapture {
   // folded by a NormRec). -1 => no fold (TRAPV/DIV0/access-fault/interrupt/RTE leave
   // the running CCR as-is; RTE restores the same CCR the entry saved, which the
   // running fold already reflects).
-  private final case class ExcRec(pc: Long, sysByte: Int, a7: Long, foldNzvc: Int) extends Rec
+  // setCcr5 >= 0 => MOVE-to-SR's ABSOLUTE 5-bit CCR write (X N Z V C); the running CCR
+  // is SET to it (vs the per-bit NZVC fold). -1 => no absolute CCR write.
+  private final case class ExcRec(pc: Long, sysByte: Int, a7: Long, foldNzvc: Int, setCcr5: Int = -1) extends Rec
 
   final class Handle {
     private val wbMap   = mutable.HashMap[Int, Wb]()
@@ -70,8 +72,8 @@ object WhiteboxCapture {
 
     /** Record an exception / RTE "instruction" commit: the handler-entry / restored
       * PC + the post-event SR system byte + A7. CCR is unchanged (carried over). */
-    def onExcCommit(pc: Long, sysByte: Int, a7: Long, foldNzvc: Int = -1): Unit =
-      commits += ExcRec(pc, sysByte, a7, foldNzvc)
+    def onExcCommit(pc: Long, sysByte: Int, a7: Long, foldNzvc: Int = -1, setCcr5: Int = -1): Unit =
+      commits += ExcRec(pc, sysByte, a7, foldNzvc, setCcr5)
 
     /** Reconstruct the CommitObservation stream AFTER the run: fold the CCR over Wb
       * snapshots and combine with the per-commit SR system byte + A7 into the full
@@ -111,7 +113,7 @@ object WhiteboxCapture {
             archRegWrite = if (isTemp) 0L else wb.result, archRegValid = wb.intWrite && !isTemp,
             ccr = ccr, memAddr = 0, memData = 0, memWrite = false,
             sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7Run))
-        case ExcRec(pc, sysByte, a7, foldNzvc) =>
+        case ExcRec(pc, sysByte, a7, foldNzvc, setCcr5) =>
           // An exception/RTE step uses the ROB-surfaced ss.a7 (the exc unit's banked
           // A7); resync the running A7 to it (+ lastA7Static so the next NormRec, which
           // carries the SAME ss.a7, does not re-resync over a subsequent OoO write).
@@ -120,6 +122,8 @@ object WhiteboxCapture {
           // the entry step; -1 => no fold (the running CCR already reflects the
           // architectural state for TRAPV/DIV0/access-fault/interrupt/RTE).
           if (foldNzvc >= 0) ccr = (ccr & 0x10) | (foldNzvc & 0xf)
+          // MOVE-to-SR's ABSOLUTE 5-bit CCR write SETS the running CCR (X N Z V C).
+          if (setCcr5 >= 0) ccr = setCcr5 & 0x1f
           Seq(CommitObservation(
             pc = pc, archRegId = 0, archRegWrite = 0, archRegValid = false,
             ccr = ccr, memAddr = 0, memData = 0, memWrite = false,
