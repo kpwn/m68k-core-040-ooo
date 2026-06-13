@@ -1929,6 +1929,49 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L), checkSpan = 4)  // byte 0x00 bit3 set -> 0x08
   }
 
+  // ── memory bit-op with (An)+/-(An): BYTE access -> An adjusts by 1 (the eaDelta fix) ──
+  // The bit-op RESULT in memory AND the An post-update lock-step vs Musashi (full reg
+  // stream + checkMem). A BYTE (An)+ must increment An by 1; pre-fix it over-incremented
+  // by 2. `move.l %a0,%d7` lands A0's resolved value in the compared register stream.
+  test("lock-step: BSET #n,(A0)+ post-inc -> mem RMW + A0 += 1 (BYTE)", VerilatorTest) {
+    runLockStep("bit-mem-bset-postinc",
+      "move.l #0x11223300,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; " +
+      "bset #0,(%a0)+ ; move.l %a0,%d7 ; " +                  // mem[0x3000] bit0 set; A0 -> 0x3001
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+  test("lock-step: BCLR #7,(A0)+ post-inc -> mem RMW + A0 += 1 (BYTE)", VerilatorTest) {
+    runLockStep("bit-mem-bclr-postinc",
+      "move.l #0x112233ff,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; " +
+      "bclr #7,(%a0)+ ; move.l %a0,%d7 ; " +                  // byte 0xff bit7 clear -> 0x7f; A0 -> 0x3001
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+  test("lock-step: BCHG #1,(A0)+ post-inc -> mem RMW + A0 += 1 (BYTE)", VerilatorTest) {
+    runLockStep("bit-mem-bchg-postinc",
+      "move.l #0x11223355,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; " +
+      "bchg #1,(%a0)+ ; move.l %a0,%d7 ; " +                  // byte 0x55 bit1 toggle -> 0x57; A0 -> 0x3001
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+  test("lock-step: BSET #n,-(A0) pre-dec -> mem RMW + A0 -= 1 (BYTE)", VerilatorTest) {
+    runLockStep("bit-mem-bset-predec",
+      "move.l #0x11223300,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; " +
+      "move.l #0x3001,%a0 ; bset #0,-(%a0) ; move.l %a0,%d7 ; " +  // -(A0): A0 0x3001 -> 0x3000, byte bit0 set
+      ".stop: bra .stop", nInstr = 6, checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+  test("lock-step: BSET %d1,(A0)+ dynamic post-inc -> mem RMW + A0 += 1 (BYTE)", VerilatorTest) {
+    runLockStep("bit-mem-dyn-bset-postinc",
+      "moveq #3,%d1 ; move.l #0x11223300,%d0 ; move.l #0x3000,%a0 ; move.l %d0,(%a0) ; " +
+      "bset %d1,(%a0)+ ; move.l %a0,%d7 ; " +                 // byte bit3 set -> 0x08; A0 -> 0x3001
+      ".stop: bra .stop", nInstr = 6, checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+  // A7-byte special case: a BYTE (A7)+ adjusts A7 by 2 (keep SP even). The DECODE side of
+  // this rule (eaDelta=2 for a memory bit-op on A7) is proven directly in BitOpDecodeSpec
+  // ("BSET #n,(A7)+ -> A7-byte eaDelta=2"). It is NOT lock-stepped here: a store-folded A7
+  // post-update from a non-first crack µop is not surfaced through the whitebox A7
+  // reconstruction (ss.a7 tracks the exception SP, not an OoO RMW-store A7 fold) -> A7 reads
+  // back unchanged for BOTH the pre-fix and post-fix delta, so the divergence is the
+  // ORTHOGONAL A7-banking/whitebox limitation, not the eaDelta fix. The non-A7 cases above
+  // (A0 += 1 / -= 1, dynamic) are the lock-step correctness proof for the delta.
+
   // ── flag preservation: a bit-op changes Z ONLY; N/V/C/X preserved ──────────
   // Pre-set N/V/C/X via a prior addq overflow + carry, then a bit-op: Z flips, the
   // other CCR bits hold. (subi.b #1 on 0 sets C/X/N; the following bset only sets Z.)

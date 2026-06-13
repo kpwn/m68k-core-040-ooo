@@ -145,11 +145,40 @@ class BitOpDecodeSpec extends AnyFunSuite {
     }
   }
 
-  // ── BSET #n,(A0)+ post-inc -> deferred (MEMCOMPLEX), illegal ───────────────────
+  // ── BSET #n,(A0)+ post-inc -> mem-RMW crack, BYTE eaDelta=1 (NOT illegal) ───────
   // static BSET = 0000 1000 11 mmmrrr; (A0)+ = mode3 reg0 -> 0000 1000 11 011 000 = 0x08D8.
-  test("BSET #n,(A0)+ (post-inc) -> illegal (MEMCOMPLEX deferred)", VerilatorTest) {
+  // Memory bit-ops are BYTE-sized, so the (A0)+ post-increment adjusts A0 by 1 (eaDelta=1),
+  // NOT 2. The load + RMW store both carry POSTINC/eaDelta=1; the store folds the A0 write.
+  test("BSET #n,(A0)+ (post-inc) -> RMW crack, BYTE eaDelta=1 on (A0)+", VerilatorTest) {
     run { dut => drive(dut, 0x08D8, 0x0001, len = 2); sleep(1)
-      assert(dut.uop0.unimplemented.toBoolean, "post-inc bit-op mem-dest stays illegal")
+      assert(!dut.uop0.unimplemented.toBoolean, "post-inc mem bit-op now cracks")
+      assert(dut.count.toInt == 3, "load + BITOP + store")
+      assert(dut.uop0.memOp.toEnum == MemOp.LOAD && dut.uop0.size.toEnum == Size.BYTE, "load.B")
+      assert(dut.uop0.srcAReg.toInt == 8, "base = A0")
+      assert(dut.uop0.eaAuto.toEnum == EaAuto.POSTINC, "load carries POSTINC")
+      assert(dut.uop0.eaDelta.toInt == 1, "BYTE (A0)+ -> eaDelta = 1, NOT 2")
+      assert(dut.uop1.op.toEnum == DecOp.BITOP && dut.uop1.bitOp.toInt == 3 && dut.uop1.size.toEnum == Size.BYTE, "BITOP BSET byte")
+      assert(dut.uop2.memOp.toEnum == MemOp.STORE && dut.uop2.size.toEnum == Size.BYTE, "store.B")
+      assert(dut.uop2.eaAuto.toEnum == EaAuto.POSTINC && dut.uop2.eaDelta.toInt == 1, "store carries POSTINC eaDelta=1")
+      assert(dut.uop2.dstReg.toInt == 8 && dut.uop2.dstValid.toBoolean, "store folds the A0 post-update write")
     }
   }
+
+  // ── BSET #n,(A7)+ -> BYTE access on A7 -> eaDelta=2 (keep the stack pointer even) ──
+  // static BSET = 0000 1000 11 mmmrrr; (A7)+ = mode3 reg7 -> 0000 1000 11 011 111 = 0x08DF.
+  // A BYTE (An)+ adjusts An by 1, EXCEPT A7 -> 2 (the 68k even-SP rule). The bit-op crack
+  // must therefore carry eaDelta=2 (not 1, and not the old WORD 2) for (A7)+.
+  test("BSET #n,(A7)+ -> RMW crack, A7-byte eaDelta=2 (even-SP rule)", VerilatorTest) {
+    run { dut => drive(dut, 0x08DF, 0x0001, len = 2); sleep(1)
+      assert(!dut.uop0.unimplemented.toBoolean, "post-inc mem bit-op on A7 cracks")
+      assert(dut.count.toInt == 3, "load + BITOP + store")
+      assert(dut.uop0.memOp.toEnum == MemOp.LOAD && dut.uop0.size.toEnum == Size.BYTE, "load.B")
+      assert(dut.uop0.srcAReg.toInt == 15, "base = A7")
+      assert(dut.uop0.eaAuto.toEnum == EaAuto.POSTINC && dut.uop0.eaDelta.toInt == 2, "A7-byte (A7)+ -> eaDelta = 2")
+      assert(dut.uop2.memOp.toEnum == MemOp.STORE && dut.uop2.size.toEnum == Size.BYTE, "store.B")
+      assert(dut.uop2.eaAuto.toEnum == EaAuto.POSTINC && dut.uop2.eaDelta.toInt == 2, "store carries A7-byte eaDelta=2")
+      assert(dut.uop2.dstReg.toInt == 15 && dut.uop2.dstValid.toBoolean, "store folds the A7 post-update write")
+    }
+  }
+
 }

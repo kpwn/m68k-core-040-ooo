@@ -15,6 +15,7 @@ class CrackStoreSpec extends AnyFunSuite {
     val a   = MicroOpAssembler.assemble(pkt)
     val count = out(UInt(2 bits)); count := a.count
     val uop0  = out(DecodedUop()); uop0 := a.uops(0)
+    val uop1  = out(DecodedUop()); uop1 := a.uops(1)
   }
 
   def drive(dut: Dut, op: Int, w1: Int = 0, w2: Int = 0, len: Int = 1): Unit = {
@@ -75,11 +76,19 @@ class CrackStoreSpec extends AnyFunSuite {
     }
   }
 
-  test("MOVE.L (A1),(A0) mem-to-mem stays unimplemented", VerilatorTest) {
+  test("MOVE.L (A1),(A0) mem-to-mem cracks to load(A1)->T0 + store T0->(A0)", VerilatorTest) {
     // MOVE.L (A1),(A0): src EA = (A1) memSimple, dst EA = (A0) memSimple.
     // dstMode=010 dstReg=000, src=(A1) = 010 001. opword = 0010 000 010 010 001 = 0x2091
+    // Now implemented (crackMemMem): [load.L (A1) -> T0][store.L T0 -> (A0)], count 2.
     run { dut => drive(dut, 0x2091); sleep(1)
-      assert(dut.uop0.unimplemented.toBoolean, "two-memory MOVE must stay unimplemented")
+      assert(!dut.uop0.unimplemented.toBoolean, "mem-to-mem MOVE now cracks")
+      assert(dut.count.toInt == 2, "load + store")
+      assert(dut.uop0.memOp.toEnum == MemOp.LOAD && dut.uop0.size.toEnum == Size.LONG, "uop0 = load.L")
+      assert(dut.uop0.srcAReg.toInt == 9 && dut.uop0.srcAValid.toBoolean, "load base = A1 (reg 9)")
+      assert(dut.uop0.dstReg.toInt == MicroOpAssembler.T0, "load -> T0")
+      assert(dut.uop1.memOp.toEnum == MemOp.STORE && dut.uop1.size.toEnum == Size.LONG, "uop1 = store.L")
+      assert(dut.uop1.srcAReg.toInt == 8 && dut.uop1.srcAValid.toBoolean, "store base = A0 (reg 8)")
+      assert(dut.uop1.srcBReg.toInt == MicroOpAssembler.T0 && dut.uop1.srcBValid.toBoolean, "store data = T0")
     }
   }
 }
