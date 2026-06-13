@@ -125,6 +125,10 @@ class LsBackendInjectSpec extends AnyFunSuite {
     u.divSigned #= false; u.divIsRem #= false
     u.shiftOp #= 0; u.shiftDir #= false; u.extByte #= false
     u.isMovea #= false; u.isScc #= false; u.isDbcc #= false
+    u.div64 #= false; u.bcdSub #= false; u.bitOp #= 0
+    u.indexLong #= false; u.indexScale #= 0
+    u.leaAddr #= false; u.fromCcr #= false; u.fromSr #= false
+    u.needsSupervisor #= false; u.keepCommit #= false
     u.firstOfInstr #= true
   }
 
