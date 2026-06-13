@@ -167,7 +167,7 @@ PredecodeWordSpec catch it, NOT fastTest).
 
 ## Tasks (TDD; commit per task)
 
-- [ ] **Task 1 — Struct fields + decode classification (no behavior yet).** Add the minimal
+- [x] **Task 1 — Struct fields + decode classification (no behavior yet).** Add the minimal
   `sysOp`/`sysKind`/... fields to DecodedUop + RenamedUop (assign in EVERY builder — grep
   `movemMoveUop`, `movemAnUpdUop`, `Microcode.resolve`, the MicroOpAssembler op/load/store/rmw/
   divl/divrem builders). Classify the opwords in OperationDecoder (opmode-6 0x46C0 = MOVE-to-SR;
@@ -177,14 +177,14 @@ PredecodeWordSpec catch it, NOT fastTest).
   nextPc != pc; MOVE-USP/MOVEC are 2 words for MOVEC ext, MOVE-to-SR is 1 word + EA-ext-sized).
   COMMIT.
 
-- [ ] **Task 2 — RTD (0x4E74) µcode crack, NON-system, NON-privileged.** Add a MOVEC/RTD-independent
+- [x] **Task 2 — RTD (0x4E74) µcode crack, NON-system, NON-privileged.** Add a MOVEC/RTD-independent
   RTD ROM sequence (or a MicroOpAssembler crack if ≤3 µops): [pop PC ← (A7) load → T0][A7 += 4 +
   disp16 ADD → A7][ibranch to T0]. Reuse the RTS pop + the ibranch + the A7-add machinery (search
   the existing RTS/0x4E75 crack — RTD = RTS + a disp). Predecode frames RTD as 2 words (opword +
   disp16). TEST: lock-step `rtd #disp` (push a return addr, RTD, land at it; A7 = old+4+disp) vs
   Musashi (PC + A7 step-for-step). COMMIT.
 
-- [ ] **Task 3 — Commit-time system-op INFRA + privilege trap.** ROB: `sysOpStore` Vecs + the
+- [x] **Task 3 — Commit-time system-op INFRA + privilege trap.** ROB: `sysOpStore` Vecs + the
   serializing-retire gate (a sysOp head retires ALONE, like faultRetire/rteRetire — add `sysRetire
   = headReady && sysOpStore(h0) && excIdle`; gate retire0/retire1/interrupt off it). PRIVILEGE: a
   sysOp head with `exc.ss.s == 0` ⇒ drive `exceptionPending` with vector 8 (format-$0) INSTEAD of
@@ -194,7 +194,7 @@ PredecodeWordSpec catch it, NOT fastTest).
   trap → handler → RTE (PC/SR/A7); + a sysOp in SUPER mode that is a structural no-op still
   serializes + commits (PC advances). COMMIT.
 
-- [ ] **Task 4 — MOVE USP (0x4E60 An→USP / 0x4E68 USP→An).** WRITE (An→USP): capture the An source
+- [x] **Task 4 — MOVE USP (0x4E60 An→USP / 0x4E68 USP→An).** WRITE (An→USP): capture the An source
   VALUE (the µop reads srcA=An via the ALU EU MOVE; `sysValStore` captures the writeback); S_APPLY
   drives `ss.setUsp := sysVal`. READ (USP→An): S_APPLY reads `ss.usp` and writes int PRF arch-An
   via the generalized arch-reg write port; obs carries the An result. TEST: lock-step (super mode)
@@ -202,7 +202,7 @@ PredecodeWordSpec catch it, NOT fastTest).
   banking proof: set USP, switch to user via MOVE-to-SR (Task 5) — deferred to Task 5's test.
   COMMIT.
 
-- [ ] **Task 5 — MOVE to SR (0x46C0|ea) — SR write + A7 banking + serialization.** Capture the EA
+- [x] **Task 5 — MOVE to SR (0x46C0|ea) — SR write + A7 banking + serialization.** Capture the EA
   source .W VALUE (ALU EU MOVE result → `sysValStore`). S_APPLY: `ss.setSrSys := sysVal[15:8]`,
   CCR `committedCcr := sysVal[4:0]`, and re-bank A7 (write int PRF arch-15 with the NEW-S bank's
   value; obs sysByte = new system byte, obsA7 = re-banked a7). Redirect to nextPc (serialize).
@@ -213,7 +213,7 @@ PredecodeWordSpec catch it, NOT fastTest).
   user-switch is the new path) + the privilege trap (a MOVE-to-SR executed at S=0 → vector 8).
   Lock-step FULL arch state (A7/SR incl CCR). COMMIT.
 
-- [ ] **Task 6 — MOVEC (0x4E7A Rc→Rn / 0x4E7B Rn→Rc): VBR + USP + CACR (RAZ-WI) + inert SFC/DFC.**
+- [x] **Task 6 — MOVEC (0x4E7A Rc→Rn / 0x4E7B Rn→Rc): VBR + USP + CACR (RAZ-WI) + inert SFC/DFC.**
   Decode the ext word (A/D, reg#, Rc). WRITE (Rn→Rc): S_APPLY routes `sysVal` by Rc to
   `ss.setVbr`/`ss.setUsp`/CACR-discard/SFC-DFC-discard. READ (Rc→Rn): S_APPLY muxes the committed
   reg (vbr/usp/CACR=0/SFC=DFC=0) → int PRF arch-Rn. TEST: lock-step `movec %d0,%vbr` then take a
@@ -222,12 +222,12 @@ PredecodeWordSpec catch it, NOT fastTest).
   Musashi reads — VERIFY Musashi CACR readback: if Musashi returns the written value, do NOT
   write-then-readback CACR; only test RAZ on a fresh CACR or a value Musashi also masks). COMMIT.
 
-- [ ] **Task 7 — RESET (0x4E70) IF cheap (privileged NOP), else DEFER + document.** A zero-effect
+- [~] (DEFERRED) **Task 7 — RESET (0x4E70) IF cheap (privileged NOP), else DEFER + document.** A zero-effect
   sysKind that only privilege-checks + serializes + commits PC. Add ONLY if Task 3's infra makes
   it a ~1-line add. TEST: lock-step `reset` in super (no state change, PC advances) + in user
   (vector-8 trap). Else SKIP + report the defer reason. COMMIT (or skip).
 
-- [ ] **Task 8 — Decode/parity/fastTest + ≥200 OOC synth gate.** Run OperationDecoderSpec +
+- [x] **Task 8 — Decode/parity/fastTest + ≥200 OOC synth gate.** Run OperationDecoderSpec +
   PredecodeWordSpec (65536) + fastTest + the full ExecuteLockStepSpec (×2 reseeded if the harness
   reseeds). Then the OOC synth gate: `pgrep -af vivado` FIRST (Track C may be gating — WAIT; never
   two vivados, never Verilator+vivado concurrently). Report FMax + worst path. COMMIT any synth tcl.
@@ -261,3 +261,50 @@ PredecodeWordSpec catch it, NOT fastTest).
   Verilator+vivado).
 - Do NOT merge/delete the worktree — the controller reviews + reconciles with Track C.
 - COMMIT EARLY + OFTEN (plan first, then each task) — the controller resumes from the last commit.
+
+---
+
+## Results (implementation log)
+
+**Final new struct fields (minimal set, all assigned in every builder/poker):**
+- `DecodedUop` + `RenamedUop` + `OpSpec`: `sysOp: Bool`, `sysKind: SysKind` (enum NONE/
+  MOVE_TO_SR/MOVE_USP/MOVEC), `sysReadDir: Bool`. The MOVEC Rc id rides `imm[11:0]`
+  (useImm=False so the IQ still treats srcB as a register source). The read-direction dst
+  rides the normal `dstReg`/`dstArch` (a REAL renamed pdst).
+- `OpSpec`: same three + `SysKind`.
+- `CcrCompletion`: `+result: Bits(32)`, `+intWrite: Bool` (reuses the existing per-entry EU
+  value-capture port to capture the sysOp source VALUE; no new completion port).
+- `ROB`: `sysOpStore`/`sysKindStore`/`sysReadDirStore`/`sysDstArchStore`/`sysRcStore`/
+  `sysValStore` (+ `sysValRdyStore` — the race fix; see below), all RegInit reset per-alloc.
+- `ExceptionUnit`: `sysTrigger`/`sysKind`/`sysReadDir`/`sysVal`/`sysRc`/`sysDstPhys`/`sysPc`/
+  `sysNextPc` inputs; `sysRegWriteValid`/`sysRegWritePhys`/`sysRegWriteData` (generalized
+  arch-reg PRF write for the read direction); `obsSetCcr5Valid`/`obsSetCcr5` (MOVE-to-SR's
+  absolute full-CCR write, threaded to the whitebox). FSM states `S_APPLY`/`S_REDIR`.
+
+**µcode sequences:** RTD is a MicroOpAssembler 3-µop crack (NOT the ROM): `[pop PC (A7)->T0]
+[A7 += 4+disp16 ADD drop][ibranch T0 kept]`. MOVE-to-SR/MOVE-USP/MOVEC are NOT ROM customers
+— they are commit-time system ops riding the ExceptionUnit FSM (a single op µop + the
+serializing retire), not multi-µop ROM sequences.
+
+**Value-vs-trigger RACE (caught + fixed):** the EU `completion` port (sets `completes`)
+fires one cycle BEFORE its `wbObs` (the value, captured into `sysValStore` via
+ccrCompletion). A write-direction sysOp gated only on `completes` could trigger before its
+value landed → the FSM latched a stale `sysValStore`. FIXED with `sysValRdyStore` (set by
+ccrCompletion, gates `sysRetire`). Verified deterministic ×3.
+
+**STOP / RESET / MOVES — assessed + DEFERRED (honest):**
+- STOP (0x4E72): the SR-load half reuses the MOVE-to-SR path, but the halt-until-interrupt
+  half needs a core quiesce + IRQ-coupled wake that interacts with `interruptPending` — its
+  own slice. DEFERRED.
+- RESET (0x4E70): a privileged NOP on the ISS. Would be a zero-effect sysKind (privilege-
+  check + serialize + commit PC, no state change). Adding it = a new SysKind enum value +
+  decode + a no-op S_APPLY case + a lock-step test — more than the "1-line add" the plan
+  gated it on, and net-new commit-obs surface to validate. DEFERRED to avoid scope creep on
+  an already-large slice; the infra makes it a clean fast-follow.
+- MOVES (0x0E00): needs SFC/DFC-qualified alternate-space accesses (no function-code bus +
+  MMU off here) — a fake without them. DEFERRED; SFC/DFC are inert RAZ-WI stubs in MOVEC.
+
+**MOVEC Rc coverage:** VBR (0x801) + USP (0x800) functional; CACR (0x002) RAZ-WI; SFC/DFC
+(0x000/0x001) inert RAZ-WI (no consumer until MOVES). MSP/ISP (0x803/4) + TC/TTRs/URP/SRP
+NOT modeled (need M-bit dual-SP / MMU-enable) → currently alias the RAZ-WI default,
+UNTESTED — documented as a future slice.
