@@ -731,8 +731,11 @@ object MicroOpAssembler {
     // LEA (0100 An 1 11 mmmrrr): bit8=1, bits7:6=11, mode>=2. Control EA -> An (no flags).
     val isLeaOp = (op(15 downto 12) === B"4'h4") && op(8) && (op(7 downto 6) === B"11") &&
                   (op(5 downto 3).asUInt >= 2)
-    // PEA (0100 1000 01 mmmrrr): op[15:6]==0x121. Compute control EA -> push to -(A7).
-    val isPeaOp = (op(15 downto 6) === B"10'b0100100001")
+    // PEA (0100 1000 01 mmmrrr): op[15:6]==0x121, mode>=2 (CONTROL EA). Compute control
+    // EA -> push to -(A7). Reg-direct (mode 000) is SWAP Dn (0x4840|rrr), which shares
+    // op[15:6]==0x121 — require mode>=2 so SWAP keeps its own unary decode (and the
+    // illegal reg-direct PEA is rejected), mirroring isLeaOp's mode>=2 guard.
+    val isPeaOp = (op(15 downto 6) === B"10'b0100100001") && (op(5 downto 3).asUInt >= 2)
     // MOVE from SR (0x40C0) / from CCR (0x42C0): SR/CCR -> EA (.W). from-SR is PRIVILEGED.
     val isMoveFromSrOp  = (op(15 downto 6) === B"10'b0100000011")
     val isMoveFromCcrOp = (op(15 downto 6) === B"10'b0100001011")
