@@ -332,21 +332,44 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val s2PaddrB = Reg(UInt(32 bits))
     val s2Fault  = RegInit(False)
 
-    // ---- dcache load cmd defaults ----
-    // The FSM selects the access address: slot A = s1Va, slot B = s1AddrB (the
-    // next-line / next-page base). The cache translates whatever vaddr we present
-    // (its xlateVpn := loadCmd.vaddr[31:12]), so driving s1AddrB here naturally
-    // issues slot B's translation (the next page's VPN on a page-cross, the same
-    // page on a line-cross). We always issue size=LONG on a cross access so the
-    // cache reads/extracts the whole line slice; the merge selects the bytes.
+    // ─────────────────────────────────────────────────────────────────────────
+    // FMax #1: REGISTER the AGU effective address at the D-cache boundary.
+    //
+    // `loadCmd.vaddr` was driven LIVE from `s1Va` (= s1Base + s1Disp(eaDelta/eaAuto/
+    // stkPush) + s1Index). That AGU sum fanned combinationally across the LS-EU ->
+    // D-cache module boundary into the cache's BRAM tag/data read-address (cmdSet/
+    // cmdTag -> rdSet) — the route-dominated worst path (s1Ctx_uop_{eaDelta,eaAuto,
+    // stkPush}/C -> DcachePlugin tagMem/D). CAPTURE the resolved access {vaddr,paddr,
+    // addrB,paddrB,size,twoAccess} into `llReg` flops the cycle the FSM decides to go
+    // to the cache (the new LAUNCH state), and drive `loadCmd` from THOSE flops the
+    // next cycle. The cache now tags on a REGISTERED address (flop -> loadCmd ->
+    // cmdSet); the AGU adder ends at the llReg flop. +1 cache-launch cycle is latency-
+    // agnostic (the EU is single-outstanding; s1* are held stable while busy). All
+    // RegInit / Reg (no uninit fanout).
+    val llReg = new Area {
+      val valid     = RegInit(False)
+      val vaddr     = Reg(UInt(32 bits))
+      val paddr     = Reg(UInt(32 bits))
+      val addrB     = Reg(UInt(32 bits))
+      val paddrB    = Reg(UInt(32 bits))
+      val size      = Reg(m68k040.isa.Size())
+      val twoAccess = RegInit(False)
+      val bDone     = RegInit(False)   // slot A launched; now presenting slot B (cross)
+    }
+
+    // ---- dcache load cmd: driven from the REGISTERED launch stage (llReg) ----
+    // slot A = llReg.vaddr/paddr; slot B (cross) = llReg.addrB/paddrB (selected once
+    // slot A is captured -> bDone). The cache tags on this REGISTERED address (the AGU
+    // sum that produced it ended at the llReg flop). `loadVaddr`/`loadPaddr` are kept
+    // as locals so the same nets feed the exc-arbitration MUX path unchanged.
     val loadVaddr = UInt(32 bits)
     val loadPaddr = UInt(32 bits)
-    loadVaddr := s1Va
-    loadPaddr := s2Paddr          // REGISTERED physical address (slot A); slot B uses s2PaddrB
-    dcache.loadCmd.valid        := False
+    loadVaddr := Mux(llReg.bDone, llReg.addrB,  llReg.vaddr)
+    loadPaddr := Mux(llReg.bDone, llReg.paddrB, llReg.paddr)
+    dcache.loadCmd.valid        := llReg.valid
     dcache.loadCmd.payload.vaddr := loadVaddr
     dcache.loadCmd.payload.paddr := loadPaddr
-    dcache.loadCmd.payload.size  := u1.size
+    dcache.loadCmd.payload.size  := llReg.size
 
     // ---- store split (byte-lane) for the SQ entry ----
     // Under identity translation paddr == vaddr, so slot B's physical address is
@@ -387,16 +410,69 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val isStore = u1.memOp === MemOp.STORE
 
     // ---- drive the D-side translation request (translate-at-execute) ----
-    // VPN = the access address the EU is currently presenting (loadVaddr tracks
-    // s1Va for slot A / s1AddrB for slot B). `valid` asserts whenever a memory µop
-    // is resident in S1 (a real translation demand -> the DTLB may walk on a miss).
-    // `write` selects the store M-bit / write-protect check. supervisor=False (user
-    // accesses this slice; MOVEC/SR-source deferred).
-    xlate.req.valid      := s1Valid && (isLoad || isStore)
-    xlate.req.vpn        := loadVaddr(31 downto 12)
-    xlate.req.supervisor := False
-    xlate.req.write      := isStore
-    xlateRobIdSig        := s1Ctx.robId
+    // VPN = the access address the EU is currently presenting. With FMax #1 the cache
+    // `loadCmd` is now driven off the REGISTERED `llReg`; the DTLB request must instead
+    // track the LIVE access being translated (translation runs in IDLE, BEFORE the
+    // registered cache launch — it feeds s2Paddr, which llReg later captures). So drive
+    // the VPN from `xlateVaddr` (s1Va for slot A / s1AddrB for slot B, selected by the
+    // same `llReg.bDone` the cache cmd uses). s1AddrB is the registered-base-derived
+    // next-line base (a shallow stage off s1Va), NOT on the eaDelta->tag arc the cache
+    // cmd registered away. `valid` asserts whenever a memory µop is resident in S1 (a
+    // real translation demand -> the DTLB may walk on a miss). `write` selects the store
+    // M-bit / write-protect check. supervisor=False (user accesses this slice).
+    val xlateVaddr = Mux(llReg.bDone, s1AddrB, s1Va)
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // FMax #2: REGISTER the LS-EU -> DTLB translation-request INTERFACE.
+    //
+    // After FMax #1 the cache `loadCmd` tags on a registered address, but the DTLB
+    // request below is still combinational off the LIVE access (s1Valid/xlateVaddr
+    // via eaDelta) — under MMU-on it fed the DTLB `tlb.io.lookupVpn := _req.vpn` cone
+    // LIVE, so the route-dominated arc `Dcache valids/ldS1Set -> LsEu -> _req.vpn/
+    // _req.valid -> DTLB hitVec -> hr*/missReqReg/CE -> s2Paddr -> tagMem` STILL landed
+    // the AGU/eaDelta source on the cache tag access (the post-FMax#1 worst path:
+    // s1Ctx_uop_eaDelta -> tagMem via the DTLB cone). REGISTER the request {valid,vpn,
+    // write,super,robId} into `reqReg` flops here and drive the DTLB `req` from THOSE
+    // flops, so the DTLB hitVec/hr*/missReqReg cone STARTS at a register inside the
+    // DTLB pblock instead of fanning combinationally out of the LS-EU.
+    //
+    // Latency: the request is held STABLE while the EU is busy (s1* held; xlateVaddr
+    // tracks the held s1Va / s1AddrB in the cross slot-B state), so the registered req
+    // settles to the live access within one cycle and stays put until completion. The
+    // FSM only consumes a translation result once the registered req MATCHES the access
+    // it is resolving (`reqMatch`), exactly mirroring the single-outstanding DTLB-miss
+    // stall (rsp.ready low -> hold S1, retry). +1 translate cycle is latency-agnostic.
+    //
+    // `reqDrv*` are combinational nets written by the base drive (here) and, last-wins,
+    // by the exception-unit arbitration override at the END of `logic`. The single
+    // register stage (`reqReg`) + the final `xlate.req`/`xlateRobIdSig` drive are
+    // emitted AFTER both writers so the registered interface reflects the resolved req.
+    val reqDrvValid = Bool()
+    val reqDrvVpn   = UInt(20 bits)
+    val reqDrvSup   = Bool()
+    val reqDrvWrite = Bool()
+    val reqDrvRobId = UInt(6 bits)
+    reqDrvValid := s1Valid && (isLoad || isStore)
+    reqDrvVpn   := xlateVaddr(31 downto 12)   // FMax #1's live access VPN (NOT the llReg cmd)
+    reqDrvSup   := False
+    reqDrvWrite := isStore
+    reqDrvRobId := s1Ctx.robId
+
+    val reqReg = new Area {
+      val valid = RegInit(False)
+      val vpn   = Reg(UInt(20 bits))
+      val sup   = Reg(Bool())
+      val write = Reg(Bool())
+      val robId = Reg(UInt(6 bits))
+    }
+    // `reqMatch`: the REGISTERED req corresponds to the access the FSM is currently
+    // presenting (held s1 access via xlateVaddr / isStore). Gates the IDLE consume so a
+    // STALE rsp (the registered req still holding a previous access's vpn for one cycle
+    // after S1 advances) is never mistaken for THIS access's translation. Under identity
+    // (MMU-off) rsp.ready is always True, but reqMatch still requires the flop to have
+    // captured this vpn -> identical +1-cycle alignment in both MMU modes.
+    val reqMatch = reqReg.valid && (reqReg.vpn === xlateVaddr(31 downto 12)) &&
+                   (reqReg.write === isStore)
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax: registered COMPLETION + WRITEBACK stage.
@@ -686,6 +762,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       val IDLE    = new State with EntryPoint
       val XLATE   = new State  // registered translated paddr -> SQ-fwd query / store alloc
       val RESOLVE = new State  // registered SQ-fwd result -> completion / cache launch
+      val LAUNCH  = new State  // registered cache launch: drive loadCmd off llReg (FMax #1)
       val WAIT    = new State   // aligned: cache load cmd accepted, awaiting loadRsp
       val WAIT_A  = new State    // cross: slot A accepted, awaiting line A
       val WAIT_B  = new State    // cross: slot B accepted, awaiting line B -> merge
@@ -712,7 +789,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
             // reads the pre-update busy and would clear s1Valid this cycle), so
             // re-assert s1Valid explicitly (later write wins).
             busy := True
-            when(xlateReady) {
+            // Only consume the translation once the REGISTERED req matches THIS access
+            // (`reqMatch`, FMax #2): on the first IDLE cycle for a new access the
+            // registered req still holds the previous vpn, so its rsp is stale. reqMatch
+            // asserts the next cycle (the req settled to this held access); until then
+            // hold S1 (the explicit re-assert below), exactly like the DTLB-miss stall.
+            when(xlateReady && reqMatch) {
               when(xlateFault) {
                 // MMU access fault: the translation RESOLVED with a fault (non-
                 // resident / write-protect / supervisor). The access does NOT
@@ -799,13 +881,35 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           fwdStall := sq.io.fwd.rsp.stall
           fwdData  := sq.io.fwd.rsp.data
         } otherwise {
-          // no forward: drive the cache load; back-pressure on dcache.loadBusy.
-          loadVaddr := s1Va                  // slot A (also the aligned access)
-          dcache.loadCmd.valid := True
-          when(dcache.loadCmd.fire) {
-            when(s1TwoAccess) { aDone := False; goto(WAIT_A) } otherwise { goto(WAIT) }
-          }
-          // else cache occupied; stay in RESOLVE (busy) and retry next cycle.
+          // no forward: CAPTURE the resolved access into the launch register (llReg)
+          // and launch the cache off the flop next cycle (FMax #1 — severs the live
+          // s1Va -> loadCmd.vaddr -> cmdTag/cmdSet AGU->tag arc). All inputs are flops/
+          // shallow-stages off s1Base (s1Va/s1AddrB) or already-registered (s2Paddr/B).
+          llReg.valid     := True
+          llReg.vaddr     := s1Va
+          llReg.paddr     := s2Paddr
+          llReg.addrB     := s1AddrB
+          llReg.paddrB    := s2PaddrB
+          llReg.size      := u1.size
+          llReg.twoAccess := s1TwoAccess
+          llReg.bDone     := False
+          goto(LAUNCH)
+        }
+      }
+
+      // Registered cache launch (FMax #1): `loadCmd` is driven from `llReg` (the flop)
+      // by the cmd drive above — the cache tags on a REGISTERED address. Hold here
+      // (llReg.valid asserted) until the cache accepts (loadCmd.fire), then go to WAIT
+      // (aligned) / WAIT_A (cross). The +1 cache-launch cycle is latency-agnostic.
+      LAUNCH.whenIsActive {
+        busy := True
+        when(dcache.loadCmd.fire) {
+          // Slot A accepted -> drop loadCmd.valid (do NOT re-issue slot A while WAIT/
+          // WAIT_A awaits its response). For a cross access WAIT_A re-asserts the launch
+          // for slot B (bDone) once slot A's line lands.
+          llReg.valid := False
+          when(llReg.twoAccess) { aDone := False; goto(WAIT_A) }
+          .otherwise { goto(WAIT) }
         }
       }
 
@@ -829,15 +933,19 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       WAIT_A.whenIsActive {
         busy := True
         when(dcache.loadRsp.valid && !aDone) {
-          lineA := dcache.loadRsp.payload.line
-          aDone := True
+          // Slot A's line landed: latch it and ARM slot B's launch (set bDone so the
+          // cmd drive selects llReg.addrB/paddrB) — but DO NOT assert valid yet; bDone
+          // registers next cycle, so present slot B's cmd from the following cycle when
+          // the addrB select is live (avoids a spurious slot-A re-issue this cycle).
+          lineA       := dcache.loadRsp.payload.line
+          aDone       := True
+          llReg.bDone := True
         }
-        when(dcache.loadRsp.valid || aDone) {
-          // slot A done -> drive slot B's cmd until the cache accepts it.
-          loadVaddr := s1AddrB
-          loadPaddr := s2PaddrB     // REGISTERED slot-B physical address
-          dcache.loadCmd.valid := True
-          when(dcache.loadCmd.fire) { goto(WAIT_B) }
+        when(aDone) {
+          // bDone is now registered -> the cmd presents slot B (addrB/paddrB). Re-assert
+          // the launch valid and hold until the cache accepts slot B, then drop it.
+          llReg.valid := True
+          when(dcache.loadCmd.fire) { llReg.valid := False; goto(WAIT_B) }
         }
       }
 
@@ -913,12 +1021,37 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       dcache.store.valid          := True
       dcache.store.payload        := excStorePayload
     }
+    // Exc override of the (combinational) translation-request DRIVE — last-wins over
+    // the base drive above. This feeds the SAME `reqDrv*` nets that get registered into
+    // `reqReg` and drive `xlate.req` below, so the exc request is registered on the
+    // identical 1-cycle boundary (FMax #2). The exc sequencer is a supervisor PHYSICAL
+    // access and does NOT gate on dtRsp.ready (see ExceptionUnit), so the +1 register
+    // latency only delays the (suppress-spurious-walk) request presentation — no
+    // behavior change. Its own dtReq is already a RegNext upstream.
     when(excActive && excXlateValid) {
-      xlate.req.valid      := True
-      xlate.req.vpn        := excXlateVpn
-      xlate.req.write      := excXlateWrite
-      xlate.req.supervisor := excXlateSupervisor
+      reqDrvValid := True
+      reqDrvVpn   := excXlateVpn
+      reqDrvWrite := excXlateWrite
+      reqDrvSup   := excXlateSupervisor
+      // robId is meaningless for the exc (no speculative U/M tagging on the
+      // serializing commit-side access); keep the base value.
     }
+
+    // ── Single registered stage for the DTLB request interface (sever the cross-module
+    // hitVec/hr*/missReqReg cone — see the reqReg rationale above). Driven from the
+    // resolved `reqDrv*` (base or exc override). Emitted as the LAST drivers of
+    // `xlate.req` so it is the sole writer.
+    reqReg.valid := reqDrvValid
+    reqReg.vpn   := reqDrvVpn
+    reqReg.sup   := reqDrvSup
+    reqReg.write := reqDrvWrite
+    reqReg.robId := reqDrvRobId
+    xlate.req.valid      := reqReg.valid
+    xlate.req.vpn        := reqReg.vpn
+    xlate.req.supervisor := reqReg.sup
+    xlate.req.write      := reqReg.write
+    xlateRobIdSig        := reqReg.robId
+
     excLoadCmdReady := dcache.loadCmd.ready
   }
 }
