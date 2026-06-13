@@ -56,4 +56,27 @@ class PredecodeWordSpec extends AnyFunSuite {
       }
     }
   }
+
+  // ── Track C: LEA / PEA / MOVE from-SR / from-CCR / to-CCR framing ────────────
+  test("LEA/PEA/MOVE-SR/CCR frame opword + EA ext", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      def chk(op: Int, len: Int, name: String): Unit = {
+        dut.op #= op; sleep(1)
+        assert(dut.res.simple.toBoolean, f"$name op=0x$op%04x expected simple")
+        assert(dut.res.lenWords.toInt == len, f"$name op=0x$op%04x len rtl=${dut.res.lenWords.toInt} exp=$len")
+      }
+      chk(0x41D0, 1, "LEA (A0),A0")            // mode 2, 0 ext
+      chk(0x41E8, 2, "LEA (d16,A0),A0")        // mode 5, 1 ext
+      chk(0x41F0, 2, "LEA (d8,A0,Xn),A0")      // mode 6, 1 ext (brief)
+      chk(0x41FA, 2, "LEA (d16,PC),A0")        // mode 7-2, 1 ext
+      chk(0x41F9, 3, "LEA (xxx).L,A0")         // mode 7-1, 2 ext
+      chk(0x4850, 1, "PEA (A0)")               // mode 2
+      chk(0x4868, 2, "PEA (d16,A0)")           // mode 5
+      chk(0x40D0, 1, "MOVE SR,(A0)")           // from SR, mode 2
+      chk(0x40E8, 2, "MOVE SR,(d16,A0)")       // from SR, mode 5
+      chk(0x42D0, 1, "MOVE CCR,(A0)")          // from CCR, mode 2
+      chk(0x44D0, 1, "MOVE (A0),CCR")          // to CCR, mode 2
+      chk(0x44FC, 2, "MOVE #imm,CCR")          // to CCR, mode 7-4 #imm (1 ext)
+    }
+  }
 }

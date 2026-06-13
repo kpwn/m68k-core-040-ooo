@@ -320,6 +320,33 @@ object PredecodeWord {
             r.lenWords := (U(1, 3 bits) + e).resized   // opword + EA ext
           }
         }
+        // ── LEA An,<ea> (0100 An 1 11 mmmrrr): bit8=1, bits7:6=11, mode>=2. Control EA,
+        // opword + EA ext. (isUnary's EXTB.L is mode 000 -> excluded by mode>=2.) An
+        // out-of-scope EA still frames its len via eaExt; the assembler faults the EA.
+        val isLea = op(8) && (op(7 downto 6) === B"11") && (op(5 downto 3).asUInt >= 2)
+        when(isLea) {
+          val (ok, e) = eaExt(op(5 downto 3).asUInt, op(2 downto 0).asUInt, sizeL = False, allowImm = false)
+          when(ok) { r.simple := True; r.lenWords := (U(1, 3 bits) + e).resized }
+        }
+        // ── PEA <ea> (0100 1000 01 mmmrrr): control EA, opword + EA ext.
+        val isPea = op(15 downto 6) === B"10'b0100100001"
+        when(isPea) {
+          val (ok, e) = eaExt(op(5 downto 3).asUInt, op(2 downto 0).asUInt, sizeL = False, allowImm = false)
+          when(ok) { r.simple := True; r.lenWords := (U(1, 3 bits) + e).resized }
+        }
+        // ── MOVE from SR (0x40C0) / from CCR (0x42C0): SR/CCR -> EA (.W), data EA.
+        val isMoveFromSr  = op(15 downto 6) === B"10'b0100000011"
+        val isMoveFromCcr = op(15 downto 6) === B"10'b0100001011"
+        when(isMoveFromSr || isMoveFromCcr) {
+          val (ok, e) = eaExt(op(5 downto 3).asUInt, op(2 downto 0).asUInt, sizeL = False, allowImm = false)
+          when(ok) { r.simple := True; r.lenWords := (U(1, 3 bits) + e).resized }
+        }
+        // ── MOVE to CCR (0x44C0): EA(.W) -> CCR, data EA incl #imm.
+        val isMoveToCcr = op(15 downto 6) === B"10'b0100010011"
+        when(isMoveToCcr) {
+          val (ok, e) = eaExt(op(5 downto 3).asUInt, op(2 downto 0).asUInt, sizeL = False, allowImm = true)
+          when(ok) { r.simple := True; r.lenWords := (U(1, 3 bits) + e).resized }
+        }
       }
 
       // Line-5: ADDQ/SUBQ (0101 ddd q ss mmmrrr, ss != 11) + Scc/DBcc (ss == 11).

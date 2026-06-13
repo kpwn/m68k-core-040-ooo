@@ -204,6 +204,38 @@ object PredecodeRef {
             case Some(e) => CP(simple = true, lenWords = 2 + e)
             case None    => COMPLEX
           }
+        } else if (((op >> 8) & 1) == 1 && ((op >> 6) & 3) == 3 && (((op >> 3) & 7) >= 2)) {
+          // LEA An,<ea> (0100 An 1 11 mmmrrr): bit8=1, bits7:6=11, mode>=2 (control EA;
+          // reg-direct mode0/1 + EXTB.L mode0 excluded). opword + EA ext. (isUnary above
+          // already consumed EXTB.L.) eaExt accepts the in-scope modes; an out-of-scope
+          // control EA frames len via eaExt anyway (the assembler faults the illegal EA).
+          val srcMode = (op >> 3) & 7; val srcReg = op & 7
+          eaExt(srcMode, srcReg, sizeL = false, allowImm = false) match {
+            case Some(e) => CP(simple = true, lenWords = 1 + e)
+            case None    => COMPLEX
+          }
+        } else if (((op >> 6) & 0x3ff) == 0x121) {
+          // PEA <ea> (0100 1000 01 mmmrrr): control EA, opword + EA ext.
+          val srcMode = (op >> 3) & 7; val srcReg = op & 7
+          eaExt(srcMode, srcReg, sizeL = false, allowImm = false) match {
+            case Some(e) => CP(simple = true, lenWords = 1 + e)
+            case None    => COMPLEX
+          }
+        } else if (((op >> 6) & 0x3ff) == 0x103 || ((op >> 6) & 0x3ff) == 0x10b) {
+          // MOVE from SR (0x40C0) / from CCR (0x42C0): SR/CCR -> EA (.W), data EA. opword
+          // + EA ext (no #imm dest).
+          val srcMode = (op >> 3) & 7; val srcReg = op & 7
+          eaExt(srcMode, srcReg, sizeL = false, allowImm = false) match {
+            case Some(e) => CP(simple = true, lenWords = 1 + e)
+            case None    => COMPLEX
+          }
+        } else if (((op >> 6) & 0x3ff) == 0x113) {
+          // MOVE to CCR (0x44C0): EA(.W) -> CCR, data EA incl #imm. opword + EA ext.
+          val srcMode = (op >> 3) & 7; val srcReg = op & 7
+          eaExt(srcMode, srcReg, sizeL = false, allowImm = true) match {
+            case Some(e) => CP(simple = true, lenWords = 1 + e)
+            case None    => COMPLEX
+          }
         } else COMPLEX
       // Line-5: ADDQ/SUBQ (ss != 11) + Scc/DBcc (ss == 11). See PredecodeWord.
       case 0x5 =>
