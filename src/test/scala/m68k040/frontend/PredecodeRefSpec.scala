@@ -53,7 +53,10 @@ class PredecodeRefSpec extends AnyFunSuite {
   test("deferred ops -> complex") {
     assert(classify(0x50FA) == cp(false,0))  // TRAPcc/ST (d16,PC)? mode7 reg2 ss=11 -> deferred
     assert(classify(0xE0D0) == cp(false,0))  // ASR.W (A0) (line-E memory single-bit, ss=11) -> deferred
-    assert(classify(0x41D0) == cp(false,0))  // LEA (A0),A0
+  }
+  // LEA (A0),A0 (0x41D0) is now IN SCOPE (Track C) -> simple, len 1 (mode 2, no ext word).
+  test("LEA -> simple (Track C, in scope)") {
+    assert(classify(0x41D0) == cp(true,1))   // LEA (A0),A0
   }
   // Line-5 ADDQ/SUBQ (Dn/An dest) + Scc (Dn) + DBcc (now in scope).
   test("line-5 ADDQ/SUBQ + Scc + DBcc -> simple (in scope)") {

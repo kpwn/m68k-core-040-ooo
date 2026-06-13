@@ -61,6 +61,7 @@ class RobPluginSpec extends AnyFunSuite {
     u.pXDst #= pXDst; u.writesX #= writesX; u.pXOld #= pXOld
     u.faulted #= false; u.faultVector #= 0; u.isRte #= false
     u.sysOp #= false; u.sysKind #= m68k040.decode.SysKind.NONE; u.sysReadDir #= false
+    u.needsSupervisor #= false   // Track C field (privViolation): inert, else garbage spuriously blocks retire
   }
 
   def initSimple(dut: SimpleDut, cd: ClockDomain): Unit = {

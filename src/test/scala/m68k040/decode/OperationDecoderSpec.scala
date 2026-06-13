@@ -222,8 +222,8 @@ class OperationDecoderSpec extends AnyFunSuite {
       assert(dut.o.srcB.kind.toEnum == OperandKind.EASRC)
     }
   }
-  test("MOVE to SR (A0) (0x46D0): UNTOUCHED (Track D) -> still illegal", VerilatorTest) {
-    run(0x46D0) { dut => assert(dut.o.illegal.toBoolean) }
+  test("MOVE to SR (A0) (0x46D0): now implemented (Track D) -> legal sysOp", VerilatorTest) {
+    run(0x46D0) { dut => assert(!dut.o.illegal.toBoolean && dut.o.sysOp.toBoolean) }
   }
   // ── Privileged commit-time SYSTEM ops (Track D) ─────────────────────────────
   test("MOVE to SR (0x46C0|Dn): sysOp MOVE_TO_SR write, srcB EASRC, non-illegal", VerilatorTest) {
