@@ -62,6 +62,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val rob = host[RobPlugin]
       eu0.issue << iq.issue(0)
       eu1.issue << iq.issue(1)
+      // MOVE-from-SR int result: wire the committed SR system byte to both ALU EUs
+      // (mirrors top/FullCoreSynth.BackendWiringPlugin).
+      eu0.srSysIn := rob.logic.exc.ss.srSys
+      eu1.srSysIn := rob.logic.exc.ss.srSys
       // SLOW-ALU (shift, latency-2) dynamic wakeup: ONE IQ port per ALU EU (mirrors
       // top/FullCoreSynth.BackendWiringPlugin). Without this the IQ's aluSlowWakeup
       // ports keep their setup default (valid:=False), so a shift's dependents (and
@@ -305,11 +309,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   }
 
   def runLockStep(name: String, src: String, nInstr: Int = -1, checkMem: Seq[Long] = Seq.empty,
-                  checkSpan: Int = 4, mmuMap: Option[(Long, Long)] = None): Unit = {
+                  checkSpan: Int = 4, mmuMap: Option[(Long, Long)] = None,
+                  initialSr: Option[Int] = None, usp: Long = 0x00200000L): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
 
-    // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel.
-    val oracleSteps: Vector[OracleStep] = Musashi.assembleAndTrace(src) match {
+    // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel. `initialSr` (when set)
+    // boots both Musashi AND the DUT in a non-default mode (e.g. USER mode S=0 for the
+    // privilege-violation test).
+    val oracleSteps: Vector[OracleStep] = Musashi.assembleAndTrace(src, initialSr = initialSr) match {
       case Right(v)  => v
       case Left(err) => fail(s"[$name] Musashi.assembleAndTrace failed: ${err.reason}")
     }
@@ -357,7 +364,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
               nzvc      = w.nzvc.toInt,
               nzvcWrite = w.nzvcWrite.toBoolean,
               x         = if (w.x.toBoolean) 1 else 0,
-              xWrite    = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
+              xWrite    = w.xWrite.toBoolean, divRem = w.divRem.toBoolean,
+              keepCommit = w.keepCommit.toBoolean))
         }
       }
 
@@ -453,13 +461,21 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // the init sweep (it resets committed state) so the surfaced A7 (== SSP, S=1)
       // matches OracleStep.a(7) for every program.
       dut.rob.logic.exc.ss.ssp #= 0x00100000L
-      // Seed the int PRF arch-15 (A7, identity phys-15) to the boot SSP too: the OoO
+      // Boot mode: default supervisor (SR boot 0x2700, S=1). When `initialSr` overrides it
+      // (e.g. user mode S=0 for the privilege-violation test), seed the committed SR system
+      // byte AND the USP bank; in user mode the surfaced A7 == USP, so the int PRF arch-15
+      // must mirror USP (not SSP).
+      val userMode = initialSr.exists(sr => ((sr >> 13) & 1) == 0)
+      initialSr.foreach(sr => dut.rob.logic.exc.ss.srSys #= (sr >> 8) & 0xff)
+      dut.rob.logic.exc.ss.usp #= BigInt(usp & 0xffffffffL)
+      val bootA7 = if (userMode) (usp & 0xffffffffL) else 0x00100000L
+      // Seed the int PRF arch-15 (A7, identity phys-15) to the boot SP: the OoO
       // datapath reads A7 from the int PRF (call/return push/pop), so it must mirror
-      // the committed SSP at boot (reset loads SSP into A7). The exc unit keeps ss.ssp
+      // the committed SP at boot (reset loads SP into A7). The exc unit keeps ss.ssp
       // in sync on exceptions; the PRF arch-15 follows OoO writes thereafter.
       dut.wire.logic.seedValid #= true
       dut.wire.logic.seedAddr  #= 15
-      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      dut.wire.logic.seedData  #= BigInt(bootA7)
       cd.waitSampling(2)
       dut.wire.logic.seedValid #= false
       cd.waitSampling()
@@ -558,7 +574,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
             intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt,
             nzvcWrite = w.nzvcWrite.toBoolean, x = if (w.x.toBoolean) 1 else 0,
-            xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
+            xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean,
+            keepCommit = w.keepCommit.toBoolean))
         }
       }
 
@@ -1017,6 +1034,158 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "eori #0x1f,%ccr",                      // toggle all 5 -> N=0,C=0,X=0,Z=1,V=1
       "moveq #3,%d1"
     ).mkString(" ; "))
+  }
+
+  // ── Track C: MOVE-to-CCR / MOVE-from-CCR (NOT privileged) ───────────────────
+  // MOVE-to-CCR: CCR {X,N,Z,V,C} := src[4:0] (DIRECT, any data source). Seed an
+  // arithmetic CCR, then a full MOVE replaces it from a register / immediate, verified
+  // step-for-step incl X (CCR layout X=4,N=3,Z=2,V=1,C=0).
+  test("lock-step: MOVE Dn,CCR (direct CCR assign)", VerilatorTest) {
+    runLockStep("move-to-ccr-reg", Seq(
+      "moveq #0,%d0", "subi.b #1,%d0",        // set N+C+X
+      "moveq #0x1f,%d1", "move.w %d1,%ccr",   // CCR := 0x1f (all 5 set)
+      "moveq #5,%d2", "move.w %d2,%ccr",      // CCR := 0x05 (V,C) only
+      "moveq #7,%d3"                          // observe carried CCR
+    ).mkString(" ; "))
+  }
+  test("lock-step: MOVE #imm,CCR", VerilatorTest) {
+    runLockStep("move-to-ccr-imm", Seq(
+      "moveq #0,%d0", "subi.b #1,%d0",        // dirty CCR
+      "move.w #0x00,%ccr",                    // CCR := 0
+      "move.w #0x1b,%ccr",                    // CCR := X,N,V,C (0x1b)
+      "moveq #1,%d1"
+    ).mkString(" ; "))
+  }
+  // MOVE-from-CCR: EA(.W) := zero-extend(CCR byte). Reg dest (.W partial merge) + mem
+  // dest (store .W). Seed Dn upper bytes to verify the partial merge.
+  test("lock-step: MOVE CCR,Dn (zero-extended CCR byte, .W merge)", VerilatorTest) {
+    runLockStep("move-from-ccr-reg", Seq(
+      "move.l #0x11223344,%d2",               // seed upper bytes
+      "moveq #0,%d0", "subi.b #1,%d0",        // CCR := N+C+X (0x19)
+      "move.w %ccr,%d2",                      // d2 = 0x1122_0019 (.W merge)
+      "moveq #1,%d1"
+    ).mkString(" ; "))
+  }
+  test("lock-step: MOVE CCR,(An) store", VerilatorTest) {
+    runLockStep("move-from-ccr-mem", Seq(
+      "move.l #0x3000,%a0",                   // dst address
+      "moveq #5,%d0", "cmpi.l #5,%d0",        // Z=1 (CCR=0x04)
+      "move.w %ccr,(%a0)",                    // mem[0x3000] = 0x0004 (word)
+      "moveq #2,%d1"
+    ).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 2)
+  }
+
+  // ── Track C: LEA / PEA ──────────────────────────────────────────────────────
+  // LEA computes a control EA ADDRESS -> An (no memory access). Various EA modes.
+  test("lock-step: LEA control EAs -> An", VerilatorTest) {
+    runLockStep("lea", Seq(
+      "move.l #0x00010000,%a0",
+      "lea (%a0),%a1",                        // A1 = 0x00010000
+      "lea (8,%a0),%a2",                      // A2 = 0x00010008
+      "move.l #2,%d1",
+      "lea (4,%a0,%d1.w*2),%a3",              // A3 = 0x00010000 + 4 + 2*2 = 0x0001000C
+      "lea (0x1234).w,%a4",                   // A4 = 0x00001234
+      "lea (0x00020000).l,%a5"                // A5 = 0x00020000
+    ).mkString(" ; "))
+  }
+  // PEA computes a control EA and pushes it to -(A7); verify the pushed value + A7.
+  test("lock-step: PEA pushes the computed EA", VerilatorTest) {
+    runLockStep("pea", Seq(
+      "move.l #0x9000,%a7",                   // SP
+      "move.l #0x00010000,%a0",
+      "pea (8,%a0)",                          // push 0x00010008 -> mem[0x8FFC], A7=0x8FFC
+      "pea (0x00005678).l",                   // push 0x00005678 -> mem[0x8FF8], A7=0x8FF8
+      "moveq #1,%d0"
+    ).mkString(" ; "), checkMem = Seq(0x8FF8L), checkSpan = 8)
+  }
+
+  // ── Track C: MOVE-from-SR (SUPERVISOR — boot S=1) ───────────────────────────
+  // SR = {system byte, CCR}. Boot SR = 0x2700 (S=1, I=7, T=0). Set the CCR via an
+  // arithmetic op, then MOVE SR,Dn reads the full 16-bit SR (system byte | CCR),
+  // verified vs Musashi step-for-step.
+  test("lock-step: MOVE SR,Dn (supervisor) reads the full SR", VerilatorTest) {
+    runLockStep("move-from-sr-sup", Seq(
+      "move.l #0x11223344,%d2",               // seed upper bytes
+      "moveq #0,%d0", "subi.b #1,%d0",        // CCR := N+C+X (0x19) -> SR = 0x2719
+      "move.w %sr,%d2",                       // d2 = 0x1122_2719 (.W merge, supervisor)
+      "moveq #1,%d1"
+    ).mkString(" ; "))
+  }
+  test("lock-step: MOVE SR,(An) store (supervisor)", VerilatorTest) {
+    runLockStep("move-from-sr-mem", Seq(
+      "move.l #0x3000,%a0",
+      "moveq #5,%d0", "cmpi.l #5,%d0",        // Z=1 -> SR = 0x2704
+      "move.w %sr,(%a0)",                     // mem[0x3000] = 0x2704
+      "moveq #2,%d1"
+    ).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 2)
+  }
+
+  // ── Track C: MOVE-from-SR PRIVILEGE VIOLATION (user mode S=0 -> vector 8) ────
+  // Directed (not full Musashi handler parity): boot USER mode (S=0), run MOVE SR,Dn,
+  // and confirm the DUT raises a PRECISE vector-8 (privilege violation) exception entry
+  // at the offending instruction's PC. A supervisor MOVE SR,Dn (control) takes NO trap.
+  // This validates the ROB's needsSupervisor -> committed-S check (the exception SUBSYSTEM
+  // delivery of vector 8 reuses the existing format-$0 path, already lock-stepped for
+  // vector 4 / interrupts).
+  private def runMoveFromSrPriv(userMode: Boolean): (Boolean, Int) = {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    // A vector-8 handler that just spins (we only observe the ENTRY pulse). Place it after
+    // the MOVE so the program image covers it; install the vector at mem[VBR(0)+8*4=0x20].
+    val src = "move.w %sr,%d0 ; handler: bra.s handler"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i
+      case Left(e)  => fail(s"assemble failed: ${e.reason}")
+    }
+    var sawPriv = false
+    var vec = -1
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.rootPtr #= 0
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      // Install the vector-8 handler address @ VBR(0)+0x20 in data memory (so the entry
+      // FSM's vector fetch resolves; we don't need handler parity).
+      val handlerPc = loadAddr + 2   // the `handler:` label (after the 1-word MOVE)
+      for (i <- 0 until 4) dmem.pokeByte(0x20 + i, ((handlerPc >> (8 * i)) & 0xff).toInt)
+      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.usp #= 0x00200000L
+      // Boot mode: user (S=0, SR 0x0000) or supervisor (S=1, 0x27 default).
+      if (userMode) dut.rob.logic.exc.ss.srSys #= 0x00 else dut.rob.logic.exc.ss.srSys #= 0x27
+      val bootA7 = if (userMode) 0x00200000L else 0x00100000L
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(bootA7)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      var guard = 0
+      while (!sawPriv && guard < 600) {
+        if (dut.rob.logic.exceptionPending.toBoolean) {
+          sawPriv = true
+          vec = dut.rob.logic.exceptionVector.toInt
+        }
+        cd.waitSampling(); guard += 1
+      }
+    }
+    (sawPriv, vec)
+  }
+
+  test("MOVE SR,Dn in USER mode raises a vector-8 privilege violation", VerilatorTest) {
+    val (saw, vec) = runMoveFromSrPriv(userMode = true)
+    assert(saw, "user-mode MOVE-from-SR must raise a precise exception")
+    assert(vec == 8, s"privilege violation must be vector 8, got $vec")
+  }
+  test("MOVE SR,Dn in SUPERVISOR mode raises NO exception", VerilatorTest) {
+    val (saw, _) = runMoveFromSrPriv(userMode = false)
+    assert(!saw, "supervisor MOVE-from-SR must NOT raise a privilege violation")
   }
 
   // ── Slow-ALU (shift, latency-2) DEPENDENT CHAINS ────────────────────────────

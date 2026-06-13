@@ -37,6 +37,15 @@ case class WbObs() extends Bundle {
   // remainder register write still lands in the PRF and is verified by a later
   // instruction that reads Dr. Default False (all other EUs leave it False).
   val divRem    = Bool()
+  // KEEP this commit as its own oracle step even though it writes only a TEMP (T1) and
+  // no flags: a mem-dest MOVE-from-CCR/SR's op µop produces the CCR/SR byte into T1 (the
+  // trailing store -> memory), but the macro instruction HAS an architectural effect (the
+  // memory write) and so needs exactly one kept commit observation (its PC). Without this
+  // the temp-only op µop would be dropped AND the store is an rmwStore drop -> the whole
+  // instruction would vanish from the commit stream (PC misalign). Default False; only the
+  // ALU sets it (fromCcr/fromSr to a temp dst). The reg-dest forms write a real Dn and are
+  // kept normally (keepCommit stays False there, harmlessly).
+  val keepCommit = Bool()
 }
 
 /** Fast/slow integer ALU EU. S0 read | M2S | S1 execute.
@@ -67,6 +76,12 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
   // (toCcr): the op reads the current NZVC + X to fold the immediate into the CCR.
   var nzvcRd: RegFileReadPort = null
   var xRd: RegFileReadPort = null
+  // Committed SR system byte (for MOVE-from-SR's int result = {srSysIn, CCR}). Wired
+  // from the ROB's exc.ss.srSys in BackendWiringPlugin; defaults to 0 if unwired (the
+  // standalone AluEu DUTs never exercise fromSr). Safe to read combinationally: the only
+  // writer of srSys (exception entry / RTE) fully flushes, so no in-flight fromSr µop
+  // ever observes a stale srSys.
+  var srSysIn: UInt = null
 
   override def issue: Stream[IqContext] = issuePort
   override def completion: Flow[UInt]   = completionPort
@@ -88,6 +103,9 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     xW = xrf.newWrite(latency = 1); xByp = xrf.newBypass()
     xWs = xrf.newWrite(latency = 1); xByps = xrf.newBypass()
     xRd = xrf.newRead(forceNoBypass = false)
+    // Committed SR system byte input (for MOVE-from-SR). Created in setup (stable ref for
+    // the wiring plugin); default-idle in build, the wiring overrides with exc.ss.srSys.
+    srSysIn = UInt(8 bits)
   }
 
   val logic = during build new Area {
@@ -228,7 +246,24 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // (MOVEA never reaches a .B form — byte MOVEA is illegal in the ISA.)
     val moveaResult = Mux(u1.size === Size.WORD,
       s1Src2(15 downto 0).asSInt.resize(32).asBits, s1Src2)
-    val mergedResult = Mux(u1.isMovea, moveaResult, sizeMerged)
+    // ── MOVE from CCR / from SR int result (fromCcr / fromSr) ───────────────────
+    // fromCcr: zero-extended CCR byte {0..0, X,N,Z,V,C} (CCR layout X=4,N=3,Z=2,V=1,C=0).
+    // fromSr : zero-extended 16-bit SR = {srSys(8), 0,0,0, X,N,Z,V,C}. The op is .W so the
+    // WORD size-merge writes the low 16 (the SR/CCR word) into a Dn (preserving Dn[31:16])
+    // or stores the low 16. s1SrSys is the committed system byte registered to S1.
+    val s1SrSys   = RegNext(srSysIn)
+    val ccrByte5  = (s1X ## s1Nzvc(3 downto 0))                    // {X,N,Z,V,C}
+    val fromCcrRes = (U(0, 27 bits) ## ccrByte5).asBits            // 32-bit, low 5 = CCR
+    val fromSrRes  = (U(0, 16 bits) ## s1SrSys ## U(0, 3 bits) ## ccrByte5).asBits  // low 16 = SR
+    // The MOVE source for the size-merge: fromSr/fromCcr override src2 with the SR/CCR
+    // value (so the existing WORD size-merge applies uniformly).
+    val srcForMove = Mux(u1.fromSr, fromSrRes, Mux(u1.fromCcr, fromCcrRes, s1Src2))
+    val sizeMergedMove = u1.size.mux(
+      Size.BYTE -> (s1Src1(31 downto 8)  ## srcForMove(7 downto 0)),
+      Size.WORD -> (s1Src1(31 downto 16) ## srcForMove(15 downto 0)),
+      Size.LONG -> srcForMove)
+    val isFromCcrSr = u1.fromCcr || u1.fromSr
+    val mergedResult = Mux(u1.isMovea, moveaResult, Mux(isFromCcrSr, sizeMergedMove, sizeMerged))
 
     // ---- S1: ANDI/ORI/EORI #imm,CCR (toCcr) — CCR read-modify-write (FAST path) ----
     // Assemble the current 5-bit CCR {X,N,Z,V,C} from the flag PRFs, apply the logical
@@ -239,9 +274,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val ccrOld = s1X ## s1Nzvc(3 downto 0)         // {X,N,Z,V,C}
     val ccrImm = s1Src2(4 downto 0)
     val ccrNew = u1.op.mux(
-      DecOp.AND -> (ccrOld & ccrImm),
-      DecOp.OR  -> (ccrOld | ccrImm),
-      default   -> (ccrOld ^ ccrImm))              // EOR (toCcr only AND/OR/EOR reach here)
+      DecOp.AND  -> (ccrOld & ccrImm),
+      DecOp.OR   -> (ccrOld | ccrImm),
+      DecOp.MOVE -> ccrImm,                         // MOVE-to-CCR: CCR := src[4:0] (direct)
+      default    -> (ccrOld ^ ccrImm))              // EOR (toCcr AND/OR/EOR/MOVE reach here)
     val ccrNzvc = ccrNew(3 downto 0)
     val ccrX    = ccrNew(4)
 
@@ -369,6 +405,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // (never a real ALU op), so the LINK/UNLK A7-fold ALU µops reuse it to DROP their
     // commit record (their A7 write still folds into the running architectural A7).
     wbObs.divRem    := RegNext(Mux(s3Valid, u3.divIsRem, u1.divIsRem)) init False
+    // Keep the macro-commit marker through (the mem-dest MOVE-from-CCR/SR op µop -> T1
+    // sets keepCommit so the whitebox keeps it as the instruction's single oracle step;
+    // its trailing store is an rmwStore drop). fromCcr/fromSr are fast-path only.
+    wbObs.keepCommit := RegNext(Mux(s3Valid, u3.keepCommit, u1.keepCommit)) init False
     wbObs.simPublic()
   }
 }

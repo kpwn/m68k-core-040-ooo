@@ -169,8 +169,11 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val aluSlowNzvcBusy = Reg(Bits(16 bits)) init 0
     val aluSlowXBusy    = Reg(Bits(16 bits)) init 0
 
-    // LS class predicate: cluster == LS and a real memory op.
-    def isLs(u: RenamedUop): Bool = (u.cluster === m68k040.isa.Cluster.LS) && (u.memOp =/= m68k040.isa.MemOp.NONE)
+    // LS class predicate: cluster == LS and a real memory op OR a LEA address-generate
+    // (leaAddr, memOp NONE — it rides the LS-EU AGU to compute the EA address with no
+    // memory access).
+    def isLs(u: RenamedUop): Bool =
+      (u.cluster === m68k040.isa.Cluster.LS) && ((u.memOp =/= m68k040.isa.MemOp.NONE) || u.leaAddr)
     // CPLX (DivEu) class predicate: cluster == CPLX (CHK + DIV).
     def isCplx(u: RenamedUop): Bool = u.cluster === m68k040.isa.Cluster.CPLX
     // A CPLX *producer* with dynamic latency = a DIV that writes a physreg. CHK writes

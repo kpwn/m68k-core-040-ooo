@@ -37,6 +37,7 @@ class BackendWhiteboxSpec extends AnyFunSuite {
       // IQ issue (producer) → EU issue (plain-wire, EU drives ready).
       eu0.issue << iq.issue(0)
       eu1.issue << iq.issue(1)
+      eu0.srSysIn := U(0, 8 bits); eu1.srSysIn := U(0, 8 bits)  // MOVE-from-SR srSys input (unused here)
       // SLOW-ALU (shift, lat2) dynamic wakeup (mirrors top/FullCoreSynth). This corpus
       // has no shifts, so it is inert, but wired for consistency / latent-deadlock safety.
       iq.aluSlowWakeup(0).valid   := eu0.slowWakeup.valid
@@ -128,6 +129,11 @@ class BackendWhiteboxSpec extends AnyFunSuite {
     u.divSigned #= false; u.divIsRem #= false
     u.shiftOp #= 0; u.shiftDir #= false; u.extByte #= false
     u.isMovea #= false; u.isScc #= false; u.isDbcc #= false
+    u.div64 #= false; u.bcdSub #= false; u.bitOp #= 0
+    u.eaAuto #= m68k040.decode.EaAuto.NONE; u.eaDelta #= 0
+    u.indexLong #= false; u.indexScale #= 0
+    u.leaAddr #= false; u.fromCcr #= false; u.fromSr #= false
+    u.needsSupervisor #= false; u.keepCommit #= false
     u.firstOfInstr #= true
   }
 

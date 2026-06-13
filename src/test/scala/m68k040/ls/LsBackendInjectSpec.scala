@@ -34,6 +34,7 @@ class LsBackendInjectSpec extends AnyFunSuite {
       val rob = host[RobPlugin]
       eu0.issue << iq.issue(0)
       eu1.issue << iq.issue(1)
+      eu0.srSysIn := U(0, 8 bits); eu1.srSysIn := U(0, 8 bits)  // MOVE-from-SR srSys input (unused here)
       // SLOW-ALU (shift, lat2) dynamic wakeup (mirrors top/FullCoreSynth). No shifts in
       // this LS-injection corpus, so inert, but wired for consistency/latent-deadlock safety.
       iq.aluSlowWakeup(0).valid   := eu0.slowWakeup.valid
@@ -124,6 +125,10 @@ class LsBackendInjectSpec extends AnyFunSuite {
     u.divSigned #= false; u.divIsRem #= false
     u.shiftOp #= 0; u.shiftDir #= false; u.extByte #= false
     u.isMovea #= false; u.isScc #= false; u.isDbcc #= false
+    u.div64 #= false; u.bcdSub #= false; u.bitOp #= 0
+    u.indexLong #= false; u.indexScale #= 0
+    u.leaAddr #= false; u.fromCcr #= false; u.fromSr #= false
+    u.needsSupervisor #= false; u.keepCommit #= false
     u.firstOfInstr #= true
   }
 

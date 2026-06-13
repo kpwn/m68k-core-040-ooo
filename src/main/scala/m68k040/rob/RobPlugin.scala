@@ -105,6 +105,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val isRteStore    = Vec.fill(depth)(RegInit(False))
     val faultVecStore = Vec.fill(depth)(RegInit(U(0, 8 bits)))
     val faultPcStore  = Vec.fill(depth)(RegInit(U(0, 32 bits)))
+    // needsSupervisor per-entry (set at alloc from the µop): a PRIVILEGED op (MOVE-from-
+    // SR). When such a head retires while the committed S bit is 0, the ROB converts it
+    // to a faulted vector-8 (privilege violation, format-$0) entry — precise, like a
+    // statically faulted head, but conditional on the runtime committed S. RegInit(False),
+    // reset per-alloc (mirrors faultedStore).
+    val needsSupStore = Vec.fill(depth)(RegInit(False))
     // MMU access-fault per-entry capture (set at COMPLETION from the LS EU's
     // faultCompletion, NOT at alloc — an MMU fault is discovered at execute). On a
     // faulting LS access the LS EU marks the entry faulted vector 2 + the faulting VA
@@ -209,8 +215,18 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // NOT drive a normal int/flag commit. The exception FSM (exc) gates these so a
     // trigger fires once per event (excIdle).
     val excIdle = Bool()   // driven below from exc.active
+    // Committed S (supervisor) bit — FORWARD-DECLARED (the privilege check below gates on
+    // it); DRIVEN from exc.ss.s after the exc unit is built.
+    val committedS = Bool(); committedS.simPublic()
     val headReady   = (count > 0) && completes(h0) && !flushing
-    val faultRetire = headReady && faultedStore(h0) && excIdle; faultRetire.simPublic()
+    // Privilege violation: a needsSupervisor head retiring in USER mode (committed S==0)
+    // takes a vector-8 (format-$0) exception. Treated like a faulted head — the op does
+    // NOT commit its result (precise). Only meaningful when the head is otherwise ready.
+    val privViolation = headReady && needsSupStore(h0) && !committedS && excIdle; privViolation.simPublic()
+    // The head triggers an exception when it is a STATICALLY faulted head OR a privilege
+    // violation. Both route through the same entry FSM (faultPcStore / faultVecStore are
+    // overridden below for the privilege case).
+    val faultRetire = headReady && (faultedStore(h0) || privViolation) && excIdle; faultRetire.simPublic()
     val rteRetire   = headReady && isRteStore(h0)   && excIdle; rteRetire.simPublic()
 
     // ── Interrupt recognition (precise, at a macro-instruction boundary) ─────────
@@ -236,11 +252,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
 
     // A normal retire is also blocked while an interrupt is pending (the head does
     // not commit — like the faulted-head case).
-    val retire0 = headReady && !faultedStore(h0) && !isRteStore(h0) && !interruptPending
+    val retire0 = headReady && !faultedStore(h0) && !isRteStore(h0) && !interruptPending && !privViolation
     // A faulted/RTE entry at h1 must NOT commit in slot1 (it is serializing — it
     // retires alone when it reaches the head).
     val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone &&
-                  !faultedStore(h1) && !isRteStore(h1)
+                  !faultedStore(h1) && !isRteStore(h1) && !needsSupStore(h1)
 
     val traceVec     = Vec(CommitTrace(), 2)
     val traceFireVec = Vec(Bool(), 2)
@@ -373,6 +389,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultAddrStore(tail)  := allocUopVec(0).faultAddr
       faultInstrStore(tail) := allocUopVec(0).sswInstr
       firstStore(tail) := allocUopVec(0).firstOfInstr
+      needsSupStore(tail) := allocUopVec(0).needsSupervisor
       pcStore(tail)    := allocUopVec(0).pc
       nzvcWrStore(tail) := False; xWrStore(tail) := False
     }
@@ -388,6 +405,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultAddrStore(tail + 1)  := allocUopVec(1).faultAddr
       faultInstrStore(tail + 1) := allocUopVec(1).sswInstr
       firstStore(tail + 1) := allocUopVec(1).firstOfInstr
+      needsSupStore(tail + 1) := allocUopVec(1).needsSupervisor
       pcStore(tail + 1)    := allocUopVec(1).pc
       nzvcWrStore(tail + 1) := False; xWrStore(tail + 1) := False
     }
@@ -415,8 +433,13 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // this (squashes, stacks the frame, vectors). The faulted entry does NOT commit
     // (retire0 is gated `!p0.faulted`).
     val exceptionPending = Bool();    exceptionPending := faultRetire;       exceptionPending.simPublic()
-    val exceptionVector  = UInt(8 bits);  exceptionVector := faultVecStore(h0); exceptionVector.simPublic()
-    val exceptionPc      = UInt(32 bits); exceptionPc     := faultPcStore(h0);  exceptionPc.simPublic()
+    // A privilege violation (needsSupervisor head in user mode) that is NOT itself a
+    // statically faulted head delivers vector 8 (format-$0) with the FAULTING instruction's
+    // PC (pcStore(h0)) — privilege violation is restartable, stacks the offending PC. A
+    // head that is BOTH faulted AND needsSupervisor keeps its static fault (fault wins).
+    val privOnly = privViolation && !faultedStore(h0)
+    val exceptionVector  = UInt(8 bits);  exceptionVector := Mux(privOnly, U(8, 8 bits),  faultVecStore(h0)); exceptionVector.simPublic()
+    val exceptionPc      = UInt(32 bits); exceptionPc     := Mux(privOnly, pcStore(h0),    faultPcStore(h0));  exceptionPc.simPublic()
     // Access-fault (vector 2) extras for the format-$7 frame: the faulting VA + the
     // SSW access attrs {write, sizeBits, supervisor}. Meaningful only when the head's
     // vector is 2; the exception FSM selects the $7 path on the vector.
@@ -471,8 +494,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // curVec (interruptVec), the stacked PC = the head INSTRUCTION's PC (interruptPc),
     // entryIsInterrupt selects the SR I-mask:=level update + format-$0 (not $7/$2).
     val excEntryTrigger = exceptionPending || interruptPending
-    val excEntryVector  = Mux(interruptPending, interruptVec, faultVecStore(h0))
-    val excEntryPc      = Mux(interruptPending, interruptPc,  faultPcStore(h0))
+    val excEntryVector  = Mux(interruptPending, interruptVec, exceptionVector)
+    val excEntryPc      = Mux(interruptPending, interruptPc,  exceptionPc)
     val exc = new m68k040.exception.ExceptionUnit(
       ss = new m68k040.exception.SystemState,
       entryTrigger = excEntryTrigger, entryVector = excEntryVector, entryPc = excEntryPc,
@@ -491,15 +514,18 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       entryIplLevel    = interruptLevel)
     excIdle := !exc.active
     val excActive = exc.active; excActive.simPublic()
+    // Drive the forward-declared committed-S (the privilege check gates on it).
+    committedS := exc.ss.s
 
     // ── Drive interrupt recognition (needs the SR I-mask from exc.ss, built above) ─
     // iplIn > srSys[2:0] (mask) OR iplIn==7 (NMI), at a first-µop non-faulted/non-RTE
     // head, excIdle, head present, not flushing. (Forward-declared above so retire0
-    // can gate on it.)
+    // can gate on it.) A pending PRIVILEGE VIOLATION takes priority over an interrupt
+    // (the head's own exception delivers first), so exclude it.
     val maskI = exc.ss.srSys(2 downto 0)
     val iplActive = (iplIn > maskI) || (iplIn === U(7, 3 bits))
     interruptPending := (count > 0) && !flushing && excIdle &&
-                        firstStore(h0) && !faultedStore(h0) && !isRteStore(h0) &&
+                        firstStore(h0) && !faultedStore(h0) && !isRteStore(h0) && !privViolation &&
                         iplActive
     // Squash + serialize while the FSM runs (NOT on the trigger cycle, when the FSM
     // is still IDLE and the fault/RTE head must retire-trigger). On the trigger cycle

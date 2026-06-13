@@ -180,4 +180,49 @@ class OperationDecoderSpec extends AnyFunSuite {
   test("line-E ss=11 (memory single-bit form) -> illegal (deferred)", VerilatorTest) {
     run(0xE0D0) { dut => assert(dut.o.illegal.toBoolean) }   // 1110 000 0 11 010000
   }
+
+  // ── Track C: LEA / PEA / MOVE from-SR / from-CCR / to-CCR (line-4) ───────────
+  test("LEA (A0),A0 (0x41D0): non-illegal, MOVE/LONG", VerilatorTest) {
+    run(0x41D0) { dut =>
+      assert(!dut.o.illegal.toBoolean)
+      assert(dut.o.op.toEnum == DecOp.MOVE && dut.o.size.toEnum == Size.LONG)
+    }
+  }
+  test("LEA (d16,A0),A1 (0x43E8): non-illegal (control EA)", VerilatorTest) {
+    run(0x43E8) { dut => assert(!dut.o.illegal.toBoolean) }
+  }
+  test("EXTB.L D0 (0x49C0): stays EXT (NOT mis-decoded as LEA)", VerilatorTest) {
+    run(0x49C0) { dut =>
+      assert(!dut.o.illegal.toBoolean)
+      assert(dut.o.op.toEnum == DecOp.EXT && dut.o.size.toEnum == Size.LONG && dut.o.extByte.toBoolean)
+    }
+  }
+  test("PEA (A0) (0x4850): non-illegal, MOVE/LONG", VerilatorTest) {
+    run(0x4850) { dut =>
+      assert(!dut.o.illegal.toBoolean)
+      assert(dut.o.op.toEnum == DecOp.MOVE && dut.o.size.toEnum == Size.LONG)
+    }
+  }
+  test("MOVE from SR (A0) (0x40D0): non-illegal, MOVE/WORD", VerilatorTest) {
+    run(0x40D0) { dut =>
+      assert(!dut.o.illegal.toBoolean)
+      assert(dut.o.op.toEnum == DecOp.MOVE && dut.o.size.toEnum == Size.WORD)
+    }
+  }
+  test("MOVE from CCR (A0) (0x42D0): non-illegal, MOVE/WORD", VerilatorTest) {
+    run(0x42D0) { dut =>
+      assert(!dut.o.illegal.toBoolean)
+      assert(dut.o.op.toEnum == DecOp.MOVE && dut.o.size.toEnum == Size.WORD)
+    }
+  }
+  test("MOVE to CCR (A0) (0x44D0): non-illegal, MOVE/WORD, srcB EASRC", VerilatorTest) {
+    run(0x44D0) { dut =>
+      assert(!dut.o.illegal.toBoolean)
+      assert(dut.o.op.toEnum == DecOp.MOVE && dut.o.size.toEnum == Size.WORD)
+      assert(dut.o.srcB.kind.toEnum == OperandKind.EASRC)
+    }
+  }
+  test("MOVE to SR (A0) (0x46D0): UNTOUCHED (Track D) -> still illegal", VerilatorTest) {
+    run(0x46D0) { dut => assert(dut.o.illegal.toBoolean) }
+  }
 }

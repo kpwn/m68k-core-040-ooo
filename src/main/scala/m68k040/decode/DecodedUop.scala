@@ -210,4 +210,27 @@ case class DecodedUop() extends Bundle {
   // (Xn sized) << indexScale. NONE/0 for every non-indexed µop (srcCValid gates it).
   val indexLong  = Bool()
   val indexScale = UInt(2 bits)
+  // ── LEA address-generate (DecOp.MOVE, LS cluster) ───────────────────────────
+  // Compute the control-EA ADDRESS (base + disp + Xn*scale, via the LS-EU AGU) and
+  // write it to the int dst — NO memory access, NO translate (so it never faults).
+  // The LS EU completes it in IDLE with s1Va as the result (reusing the stkPush
+  // address-writeback precedent). Default False.
+  val leaAddr  = Bool()
+  // ── MOVE from/to SR/CCR (ALU cluster) ───────────────────────────────────────
+  // fromCcr: the int result = the CCR byte {X,N,Z,V,C} zero-extended (.W). fromSr:
+  // the int result = the 16-bit SR = {srSysIn, CCR byte} zero-extended (.W). Both
+  // READ NZVC+X (the toCcr read ports). needsSupervisor: a privileged op (MOVE-from-
+  // SR) — the ROB converts the head to a faulted vector-8 entry at retire if the
+  // committed S bit is 0. Default False (every other op).
+  val fromCcr  = Bool()
+  val fromSr   = Bool()
+  val needsSupervisor = Bool()
+  // ── Lock-step macro-commit marker (sim whitebox only; no hardware effect) ────
+  // Forces the lock-step whitebox to KEEP this µop's commit as the macro instruction's
+  // single oracle step, even though it writes only a TEMP / is an otherwise-dropped crack
+  // µop (stkPush / rmwStore). Used by ops whose every µop would otherwise be dropped so
+  // the instruction vanishes from the commit stream: PEA (push T0 -> -(A7), the kept A7-
+  // updating commit) and the mem-dest MOVE-from-CCR/SR op µop (-> T1, the kept step; its
+  // trailing store is dropped). The EUs OR it into wbObs.keepCommit. Default False.
+  val keepCommit = Bool()
 }

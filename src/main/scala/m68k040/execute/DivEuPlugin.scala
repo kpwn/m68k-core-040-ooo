@@ -457,6 +457,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     wbObs.x         := False
     wbObs.xWrite    := False
     wbObs.divRem    := compDivRem
+    wbObs.keepCommit := False
     wbObs.simPublic()
     // CHK N flag observation (sim-only) for directed tests.
     val chkNObs = Bool(); chkNObs := chkN && isChk && s1Valid; chkNObs.simPublic()

@@ -18,7 +18,7 @@ object WhiteboxCapture {
     * PRF and is verified by a later instruction that reads Dr). */
   final case class Wb(dstArch: Int, result: Long, intWrite: Boolean,
                       nzvc: Int, nzvcWrite: Boolean, x: Int, xWrite: Boolean,
-                      divRem: Boolean = false)
+                      divRem: Boolean = false, keepCommit: Boolean = false)
 
   /** Stateful reconstruction handle. Drive `onWb` for every cycle an EU's wbObs
     * is valid, and `onCommit` for every fired ROB commit-obs (in retire order).
@@ -61,7 +61,10 @@ object WhiteboxCapture {
       // load (cracked load -> T0), the trailing DIVREM, and a stack-push store (the
       // BSR/JSR leading push; its A7 write still folds). Their reg writes still fold
       // into the running architectural A7/CCR (handled in `result`).
-      val emit = !isTempOnly && !wb.divRem
+      // EXCEPTION: a `keepCommit` op (the mem-dest MOVE-from-CCR/SR op µop -> T1) IS the
+      // macro instruction's single kept oracle step (its trailing store is an rmwStore
+      // drop), so keep it even though it writes only a temp.
+      val emit = (!isTempOnly && !wb.divRem) || wb.keepCommit
       commits += NormRec(pc, sysByte, a7, wb, emit)
     }
 
