@@ -91,6 +91,9 @@ case class RenamedUop() extends Bundle {
   val fromCcr  = Bool()
   val fromSr   = Bool()
   val needsSupervisor = Bool()
+  // Lock-step macro-commit marker (sim whitebox only): KEEP this µop's commit as the
+  // instruction's single oracle step (PEA push / mem-dest MOVE-from-CCR/SR op µop).
+  val keepCommit = Bool()
   val dstArch = UInt(5 bits)   // architectural int dst reg 0..17 (incl T0/T1); for commit RAT + CommitTrace
   val psrcA = UInt(intW bits); val psrcAValid = Bool()
   val psrcB = UInt(intW bits); val psrcBValid = Bool()

@@ -448,6 +448,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // value still lands in the PRF + is verified by a later reader. (compRmwStore already
     // drops MOVEM STORES — a store with no reg/flag write — so this covers the loads.)
     val compCrackDrop = RegInit(False)
+    // Macro-commit KEEP marker (PEA's push): force the whitebox to keep this commit.
+    val compKeepCommit = RegInit(False)
     val compDstArch   = Reg(UInt(5 bits))
     // NZVC writeback for a MOVE-to-memory store (N/Z of the moved value, V=C=0).
     val compNzvc      = Reg(Bits(4 bits))
@@ -537,8 +539,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       // load + every non-MOVEM load leave isMovea False (full / zero-extended result).
       val ldResult = Mux(u1.isMovea && isLoad && (u1.size === m68k040.isa.Size.WORD),
                          result(15 downto 0).asSInt.resize(32).asBits, result)
-      compData      := Mux(u1.stkPush, s1Va.asBits,
-                       Mux(isAutoStoreAn, s1AnWb, ldResult))
+      // LEA address-generate: the int result IS the computed effective address (s1Va),
+      // exactly like a stkPush writes its predecremented address. No memory was accessed.
+      compData      := Mux(u1.leaAddr, s1Va.asBits,
+                       Mux(u1.stkPush, s1Va.asBits,
+                       Mux(isAutoStoreAn, s1AnWb, ldResult)))
       // A CCR-restore load writes NO int reg (it restores flags); a stack-push store's
       // int dst is A7 (handled via compData above); a plain load writes its int dst.
       compPdst      := u1.pdst
@@ -546,7 +551,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compIsLoad    := isLoad
       // Wake an int-producing load / stkPush store / EA-auto store (the predec/postinc
       // An side-effect). A CCR-restore load produces no int reg -> no (stale-pdst) wakeup.
-      compWakes     := (isLoad && !u1.ccrRestore) || u1.stkPush || (isAutoStoreAn && u1.pdstValid)
+      compWakes     := (isLoad && !u1.ccrRestore) || u1.stkPush || u1.leaAddr || (isAutoStoreAn && u1.pdstValid)
       compStkPush   := u1.stkPush
       compCcrRestore := u1.ccrRestore
       // Drop the commit record of an EA-auto store that is an RMW/CLR AUXILIARY store:
@@ -558,6 +563,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       // store writes An (pdstValid) -> NOT a dropped RMW store (its An commit is kept).
       compRmwStore  := isStore && !u1.pdstValid && !u1.writesNzvc && !u1.stkPush
       compCrackDrop := u1.divIsRem    // MOVEM move (load/store) crack-drop marker
+      compKeepCommit := u1.keepCommit // PEA push: force-keep the macro commit
       compDstArch   := u1.dstArch
       // CCR-restore (RTR): NZVC := loaded[3:0], X := loaded[4] (CCR bit layout
       // X=4,N=3,Z=2,V=1,C=0). Otherwise a MOVE-to-mem store's NZVC = N/Z of the stored
@@ -588,6 +594,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compCcrRestore := False
       compEaAutoDrop := False
       compCrackDrop := False
+      compKeepCommit := False
       compIsFault   := True
       compFaultAddr := s1Va
       compFaultWr   := isStore
@@ -687,7 +694,14 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       IDLE.whenIsActive {
         busy := False
         when(s1Valid) {
-          when(isLoad || isStore) {
+          when(u1.leaAddr) {
+            // LEA address-generate: complete immediately with the computed EA address
+            // (s1Va) as the int result. NO translate, NO cache access -> never page-faults.
+            // The int dst (An / T0) write + wakeup ride captureCompletion's leaAddr path.
+            captureCompletion(s1Va.asBits)
+            busy    := False
+            s1Valid := False
+          } elsewhen(isLoad || isStore) {
             // Translate-at-execute: REGISTER the translated paddr (+perm fault) in
             // this stage so the SQ overlap-compare / store-alloc consume a REGISTERED
             // s2Paddr next cycle (the DTLB lookup is no longer in series with the
@@ -875,6 +889,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // stack-push store is the leading crack µop of BSR/JSR (the trailing branch is the
     // macro instruction's single commit). Its A7 write is still folded into running A7.
     wbObs.divRem    := compStkPush || compCcrRestore || compRmwStore || compEaAutoDrop || compCrackDrop
+    // PEA's push (stkPush store) is the macro instruction's single KEPT commit (it folds
+    // A7 -= 4 and is the last µop — there is no trailing branch like BSR/JSR). keepCommit
+    // overrides the stkPush divRem-drop in the whitebox.
+    wbObs.keepCommit := compKeepCommit
     wbObs.simPublic()
 
     // ── Exception-unit cache arbitration MUX (LAST drivers — override the LS EU's

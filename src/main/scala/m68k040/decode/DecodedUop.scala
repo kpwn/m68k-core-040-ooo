@@ -225,4 +225,12 @@ case class DecodedUop() extends Bundle {
   val fromCcr  = Bool()
   val fromSr   = Bool()
   val needsSupervisor = Bool()
+  // ── Lock-step macro-commit marker (sim whitebox only; no hardware effect) ────
+  // Forces the lock-step whitebox to KEEP this µop's commit as the macro instruction's
+  // single oracle step, even though it writes only a TEMP / is an otherwise-dropped crack
+  // µop (stkPush / rmwStore). Used by ops whose every µop would otherwise be dropped so
+  // the instruction vanishes from the commit stream: PEA (push T0 -> -(A7), the kept A7-
+  // updating commit) and the mem-dest MOVE-from-CCR/SR op µop (-> T1, the kept step; its
+  // trailing store is dropped). The EUs OR it into wbObs.keepCommit. Default False.
+  val keepCommit = Bool()
 }

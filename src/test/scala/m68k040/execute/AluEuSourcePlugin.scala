@@ -23,6 +23,9 @@ class AluEuSourcePlugin extends FiberPlugin {
 
   val logic = during build new Area {
     val eu = host[AluEuService]
+    // Default the committed-SR-system-byte input (the standalone ALU DUTs never run a
+    // MOVE-from-SR op, so 0 is harmless). The full-core DUT wires it from exc.ss.srSys.
+    host[m68k040.execute.AluEuPlugin].srSysIn := U(0, 8 bits)
 
     // issue inputs (sim-driven)
     val iValid    = in Bool ()

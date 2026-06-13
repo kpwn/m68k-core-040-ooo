@@ -211,7 +211,7 @@ object Microcode {
     // Indexed-EA descriptor fields (added by the indexed-modes slice): µcode µops never
     // use an index — default inert (mirrors MicroOpAssembler's non-indexed cracks).
     u.indexLong := False; u.indexScale := 0
-    u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False
+    u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
     u.firstOfInstr := Bool(d.isFirst)
     u
   }

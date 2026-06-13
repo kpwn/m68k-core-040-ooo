@@ -62,6 +62,7 @@ class IpcBenchSpec extends AnyFunSuite {
       val rob = host[RobPlugin]
       eu0.issue << iq.issue(0)
       eu1.issue << iq.issue(1)
+      eu0.srSysIn := U(0, 8 bits); eu1.srSysIn := U(0, 8 bits)  // MOVE-from-SR srSys input (unused here)
       // SLOW-ALU (shift, lat2) dynamic wakeup — one IQ port per ALU EU (mirrors
       // top/FullCoreSynth). Inert for the shift-free IPC kernels, but required so a
       // shift's dependents could wake (consistency with the production wiring).
