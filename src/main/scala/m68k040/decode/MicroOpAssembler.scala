@@ -809,8 +809,12 @@ object MicroOpAssembler {
         val regN  = ext(14 downto 12).asUInt
         val rnId  = Mux(isAn, (U(8, 5 bits) + regN.resize(5)).resize(5), regN.resize(5))
         val rc    = ext(11 downto 0)
-        opUop.imm := rc.resize(32)              // Rc id in imm[11:0]
-        opUop.useImm := True
+        // Rc id rides imm[11:0], but useImm=FALSE: the EU ignores imm (a MOVEC write is
+        // a MOVE whose result = srcB = Rn), while the ROB reads imm[11:0] for the Rc
+        // directly. Keeping useImm=False is REQUIRED so the IQ treats srcB as a REGISTER
+        // source (srcBIsReg gates on !useImm) -> the Rn dependency is woken correctly.
+        opUop.imm := rc.resize(32)              // Rc id in imm[11:0] (NOT useImm)
+        opUop.useImm := False
         opUop.srcAValid := False; opUop.srcBValid := False
         when(spec.sysReadDir) {                 // 0x4E7A Rc -> Rn: dst = Rn
           // The read dst is a REAL renamed register (dstValid=True): rename allocates a

@@ -1943,6 +1943,43 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 5)   // after move-to-SR: S=0, A7=USP=0x00200000 (a1 surfaces A7)
   }
 
+  // ── MOVEC (Track D): VBR / USP / CACR control registers ─────────────────────
+  // MOVEC USP round-trip: write USP from D0 (movec %d0,%usp), read it back into D1
+  // (movec %usp,%d1). D1 == D0 proves the USP bank via MOVEC. (Supervisor; A7 unchanged.)
+  test("lock-step: MOVEC D0,USP ; MOVEC USP,D1 round-trip", VerilatorTest) {
+    runLockStep("movec-usp",
+      "move.l #0x0abc0000,%d0 ; movec %d0,%usp ; movec %usp,%d1 ; " +
+      ".stop: bra .stop",
+      nInstr = 3)   // d1 == 0x0abc0000
+  }
+
+  // MOVEC CACR RAZ-WI: write a value to CACR (write-ignored), read it back -> 0 (RAZ).
+  // The 68040 CACR's only effects are cache enables, which this core lacks -> RAZ-WI.
+  // (Musashi masks CACR to the implemented bits; for a fresh write-then-read the DUT's
+  // RAZ matches Musashi when the written value clears on read of the unimplemented bits.
+  // We write 0 then read 0 to stay trace-indistinguishable from Musashi's CACR model.)
+  test("lock-step: MOVEC CACR read -> 0 (RAZ)", VerilatorTest) {
+    runLockStep("movec-cacr-raz",
+      "movec %cacr,%d2 ; " +    // read CACR (RAZ) -> D2 = 0
+      ".stop: bra .stop",
+      nInstr = 1)   // d2 == 0
+  }
+
+  // MOVEC VBR then an exception: set VBR := 0x3000, install the illegal-instruction
+  // handler at VBR+4*4 = 0x3010 (a runtime store the DUT D-cache + Musashi both see),
+  // then `illegal` (vector 4) -> the FSM fetches the vector at VBR+0x10 = 0x3010 ->
+  // the handler PC must be the stored handler addr. This PROVES the MOVEC VBR write
+  // drives the vector fetch (vs the default VBR=0). The handler bumps the stacked PC
+  // past the 2-byte illegal + RTEs. Commit PC/SR/A7 lock-stepped across entry/handler/RTE.
+  test("lock-step: MOVEC D0,VBR then illegal -> handler via new VBR -> RTE", VerilatorTest) {
+    runLockStep("movec-vbr-exc",
+      "move.l #0x3000,%d0 ; movec %d0,%vbr ; move.l #handler,%d1 ; move.l %d1,0x3010 ; " +
+      "illegal ; moveq #7,%d3 ; " +
+      "loop: bra loop ; " +
+      "handler: move.l 2(%a7),%d0 ; addq.l #2,%d0 ; move.l %d0,2(%a7) ; moveq #1,%d2 ; rte",
+      nInstr = 11)
+  }
+
   test("lock-step: jsr (xxx).L ... rts", VerilatorTest) {
     // jsr sub (absolute long). Executed: moveq#1, jsr(abs), moveq#3, rts, moveq#7 = 5.
     runLockStep("jsr-abs",
