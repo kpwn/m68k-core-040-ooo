@@ -150,4 +150,48 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
       assert(dut.uop.unimplemented.toBoolean)
     }
   }
+
+  // ── Track C: LEA / PEA / MOVE-from-CCR/SR / MOVE-to-CCR cracks ───────────────
+  test("LEA (A0),A1 (0x43D0): leaAddr LS uop, dst=A1, base=A0, no mem", VerilatorTest) {
+    run { dut => drive(dut, 0x43D0); sleep(1)
+      assert(dut.uop.leaAddr.toBoolean && dut.uop.op.toEnum == DecOp.MOVE)
+      assert(dut.uop.cluster.toEnum == m68k040.isa.Cluster.LS)
+      assert(dut.uop.memOp.toEnum == m68k040.isa.MemOp.NONE)
+      assert(dut.uop.dstReg.toInt == 9 && dut.uop.dstValid.toBoolean)   // A1 = arch 9
+      assert(dut.uop.srcAReg.toInt == 8 && dut.uop.srcAValid.toBoolean) // A0 = arch 8
+      assert(!dut.uop.unimplemented.toBoolean)
+    }
+  }
+  test("PEA (A0) (0x4850): uops(0) = leaAddr -> T0 (first)", VerilatorTest) {
+    run { dut => drive(dut, 0x4850); sleep(1)
+      assert(dut.uop.leaAddr.toBoolean && dut.uop.dstReg.toInt == 16)   // T0
+      assert(dut.uop.firstOfInstr.toBoolean)
+    }
+  }
+  test("MOVE from CCR,(A0) (0x42D0): fromCcr op, T1 dst, keepCommit (mem)", VerilatorTest) {
+    run { dut => drive(dut, 0x42D0); sleep(1)
+      assert(dut.uop.fromCcr.toBoolean && dut.uop.op.toEnum == DecOp.MOVE)
+      assert(dut.uop.readsNzvc.toBoolean && dut.uop.readsX.toBoolean)
+      assert(dut.uop.dstReg.toInt == 17 && dut.uop.keepCommit.toBoolean) // T1 + keep
+    }
+  }
+  test("MOVE from CCR,D0 (0x42C0): fromCcr op, Dn dst (.W merge)", VerilatorTest) {
+    run { dut => drive(dut, 0x42C0); sleep(1)
+      assert(dut.uop.fromCcr.toBoolean && dut.uop.dstReg.toInt == 0 && dut.uop.dstValid.toBoolean)
+      assert(dut.uop.size.toEnum == m68k040.isa.Size.WORD && dut.uop.srcAValid.toBoolean) // merge src
+    }
+  }
+  test("MOVE from SR,D0 (0x40C0): fromSr op + needsSupervisor (privileged)", VerilatorTest) {
+    run { dut => drive(dut, 0x40C0); sleep(1)
+      assert(dut.uop.fromSr.toBoolean && dut.uop.needsSupervisor.toBoolean)
+      assert(dut.uop.readsNzvc.toBoolean && dut.uop.dstReg.toInt == 0)
+    }
+  }
+  test("MOVE D0,CCR (0x44C0): toCcr op (MOVE), writes NZVC+X, no old-CCR read", VerilatorTest) {
+    run { dut => drive(dut, 0x44C0); sleep(1)
+      assert(dut.uop.toCcr.toBoolean && dut.uop.op.toEnum == DecOp.MOVE)
+      assert(dut.uop.writesNzvc.toBoolean && dut.uop.writesX.toBoolean)
+      assert(!dut.uop.readsNzvc.toBoolean)   // a full MOVE-to-CCR does NOT read old CCR
+    }
+  }
 }
