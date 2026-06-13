@@ -1871,6 +1871,38 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 6)
   }
 
+  // ── RTD (RTS with a stack-deallocation displacement) ───────────────────────
+  test("lock-step: bsr ... rtd #4 (pop PC + dealloc the pushed arg)", VerilatorTest) {
+    // The caller pushes a 4-byte arg, then BSRs. The callee returns with `rtd #4`,
+    // which pops the return PC from (A7) AND deallocates the 4 arg bytes (A7 += 4+4),
+    // so A7 is restored to its value BEFORE the arg push. Verifies the RTD crack:
+    // [pop PC -> T0][A7 += 4+disp16][ibranch T0] vs Musashi (PC + A7 step-for-step).
+    // Flow to sentinel: moveq#1, moveq#0xa->d3, move.l d3 -(sp), bsr, moveq#3, rtd#4,
+    // moveq#7 = 7.
+    runLockStep("rtd-dealloc",
+      "moveq #1,%d0 ; moveq #0xa,%d3 ; move.l %d3,-(%sp) ; bsr sub ; moveq #7,%d2 ; " +
+      ".stop: bra .stop ; sub: moveq #3,%d1 ; rtd #4",
+      nInstr = 7)
+  }
+
+  test("lock-step: rtd #0 (== rts, no dealloc)", VerilatorTest) {
+    // rtd #0 pops PC + A7 += 4 (exactly RTS). Confirms the disp16=0 edge.
+    runLockStep("rtd-zero",
+      "moveq #1,%d0 ; bsr sub ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "sub: moveq #3,%d1 ; rtd #0",
+      nInstr = 5)
+  }
+
+  test("lock-step: rtd #-4 (negative displacement)", VerilatorTest) {
+    // A negative disp16 leaves A7 BELOW the return slot (A7 += 4 + (-4) = +0). Exercises
+    // the sign-extension of disp16 in the A7 add. After return A7 = the post-pop value
+    // minus 4 (one word below where RTS would leave it).
+    runLockStep("rtd-neg",
+      "moveq #1,%d0 ; bsr sub ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      "sub: moveq #3,%d1 ; rtd #-4",
+      nInstr = 5)
+  }
+
   test("lock-step: jsr (xxx).L ... rts", VerilatorTest) {
     // jsr sub (absolute long). Executed: moveq#1, jsr(abs), moveq#3, rts, moveq#7 = 5.
     runLockStep("jsr-abs",

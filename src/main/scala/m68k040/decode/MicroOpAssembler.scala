@@ -727,9 +727,11 @@ object MicroOpAssembler {
     // write / MOVEC-write) so the EU writeback VALUE is captured for the commit FSM.
     // The privilege check (S=0 -> vector 8) is at the serializing retire, NOT decode.
     val isSysOp = spec.sysOp
+    // RTD (0x4E74): a line-4 return cracked below (NOT illegal).
+    val isRtdBad = (op === B"16'h4E74")
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isUnlkOp && !isExgOp &&
-              !isSysOp &&
+              !isSysOp && !isRtdBad &&
               (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
                line4UnaryMemBad || aluRmwMemBad || bitOpMemBad || eaDstPcRelBad ||
                (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
@@ -1287,6 +1289,8 @@ object MicroOpAssembler {
     val rtsLoad   = popUop(A7, disp = 0, dst = T0, first = True)
     val rtsBranch = retBranchUop(tgt = T0, an = A7, inc = 4)
 
+    val isRtdOp   = (op === B"16'h4E74")
+
     // ── JSR (0x4E80|ea) — crack into [push.l retPC -> -(A7)] + [ibranch -> EA addr]. ─
     // The push store is FIRST; the ibranch (ibrUop, firstOfInstr=False for JSR) jumps
     // to the EA effective ADDRESS (psrcA = base An + imm = disp/folded), exactly like
@@ -1324,6 +1328,23 @@ object MicroOpAssembler {
       mkUop(srcAReg = srcA, srcAValid = True, useImm = True, imm = imm,
             dstReg = dst, dstValid = True, first = first,
             op = DecOp.ADD, divIsRem = drop)
+
+    // ── RTD (0x4E74) + disp16 — RTS with a stack-deallocation displacement. ───────
+    // Pop PC from (A7), then A7 := A7 + 4 + disp16 (the 16-bit sign-extended frame
+    // dealloc), then jump. NOT privileged (a user-mode return on the 68040). The anInc
+    // field is only 3 bits (can't hold 4+disp16), so the A7 add is a SEPARATE dropped
+    // ALU µop (like UNLK's A7-fold), and the ibranch carries NO anInc:
+    //   [load.l (A7) -> T0 (first)] [A7 := A7 + (4+disp16) (ADD, drop)] [ibranch -> T0 (kept)].
+    // The ibranch is the kept architectural commit (the redirect PC); the A7 add is a
+    // dropped crack µop whose A7 write still lands in the PRF (verified by a later A7
+    // reader, like LINK/UNLK). disp16 = sign-extended words(1).
+    val rtdDisp   = pkt.words(1).asSInt.resize(32)
+    val rtdDealloc= (S(4, 32 bits) + rtdDisp).asBits          // 4 + disp16
+    val rtdLoad   = popUop(A7, disp = 0, dst = T0, first = True)
+    val rtdA7     = addUop(U(A7, 5 bits), rtdDealloc, U(A7, 5 bits), first = False, drop = True)
+    val rtdBranch = mkUop(isBranch = True, ibranch = True,
+                          srcAReg = U(T0, 5 bits), srcAValid = True,   // target = T0 + 0
+                          useImm  = True, imm = B(0, 32 bits), first = False)
 
     // LINK An,#disp16 — [stkPush store dst=An, push old An] + [A7 := A7+disp (drop)]
     //                   + [An := A7-disp (kept)].
@@ -1463,6 +1484,12 @@ object MicroOpAssembler {
       out.count   := 2
       out.uops(0) := rtsLoad
       out.uops(1) := rtsBranch
+    } elsewhen(isRtdOp) {
+      // RTD -> [load.l (A7) -> T0] + [A7 := A7 + (4+disp16) (drop)] + [ibranch -> T0].
+      out.count   := 3
+      out.uops(0) := rtdLoad
+      out.uops(1) := rtdA7
+      out.uops(2) := rtdBranch
     } elsewhen(isRtrOp) {
       // RTR -> [pop.w (A7) -> CCR] + [pop.l (A7+2) -> T0] + [ibranch -> T0 ; A7 += 6].
       out.count   := 3

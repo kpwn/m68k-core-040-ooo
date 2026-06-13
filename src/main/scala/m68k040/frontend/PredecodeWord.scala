@@ -218,6 +218,9 @@ object PredecodeWord {
         when(isMoveUsp) { r.simple := True; r.lenWords := U(1, 3 bits) }
         val isMovec = op(15 downto 1) === B"15'b010011100111101"   // 0x4E7A / 0x4E7B
         when(isMovec) { r.simple := True; r.lenWords := U(2, 3 bits) }   // opword + ext word
+        // RTD (0x4E74) + disp16: opword + 1 disp word -> SIMPLE len 2 (RTS-with-dealloc).
+        val isRtd = op === B"16'h4E74"
+        when(isRtd) { r.simple := True; r.lenWords := U(2, 3 bits) }
         // CHK.W/CHK.L (0100 ddd 1 s 0 mmmrrr): bit8=1, bit6=0. The bound is an EA
         // source (sizeL = .L when bit7=0). 1 opword + the EA extension words.
         val isChk = op(8) && !op(6)
