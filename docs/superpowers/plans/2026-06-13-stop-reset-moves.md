@@ -638,14 +638,33 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
     assignments — confirmed by T4 grep + the green fastTest/lock-step.
 - Lock-step results: **0 diverged** on every test (RESET ×2, STOP ×1, + all pre-existing sysOp/
   IRQ/exception tests in the full ExecuteLockStepSpec run).
-- Decode/parity/fastTest: green — OperationDecoderSpec (44, +RESET/+STOP), PredecodeWordSpec
+- Decode/parity/fastTest: 101/103 green — OperationDecoderSpec (+RESET/+STOP), PredecodeWordSpec
   (65536-opword parity, RESET=len1/STOP=len2), MicroOpAssemblerSpec, DecodedUopSpec,
-  RobInterruptSpec, InterruptEntrySpec, MicrocodeSpec.
-- ≥200 OOC gate FMax + worst path: (see T6 — run after the controller's Vivado P&R clears)
-- Final SHA: (T6 final commit)
-- Blockers / traces: none. The only real bug (stoppedPc) was caught by the STOP lock-step and
-  fixed; trace evidence in /home/qwertyoruiop/tmp/t3-lockstep.log (diverged step 4) →
-  t3-lockstep2.log (0 diverged after the fix).
+  RobInterruptSpec, InterruptEntrySpec, MicrocodeSpec, RobPluginSpec. The 2 failures
+  (Line4DecodeSpec: `CLR.L (A0)+` + `SWAP D5`) are PRE-EXISTING on the base commit `5d8e791`
+  (verified by running Line4DecodeSpec at the base in a throwaway worktree — same 2 fail) —
+  unrelated to this work.
+- Full ExecuteLockStepSpec note: the 226-test suite OOMs at ~11 Verilator DUT compiles per JVM
+  (a pre-existing harness JVM ceiling, independent of these changes; it OOMs identically with
+  any test content). Validated the touched cone in per-JVM `-z` batches: batch A (RESET ×2,
+  STOP, MOVE-USP, MOVE-to-SR, MOVEC-USP) 6/6; batch B (privilege-op-at-S=0, RESET-at-S=0,
+  MOVEC-VBR-exc, MOVE-SR-read forms) 7/7; batch C (all 5 IRQ tests — confirms the
+  interruptPending gate change is benign) 5/5. Plus 11 general tests (moveq/alu/cmp/move
+  chains/MOVE.B-W/MOVEA) passed before each OOM. All 0 diverged.
+- OOC synth gate (synth_design, xcku5p-ffvb676-2-e, 4.0ns constraint — `synth/ooc_M68kFullCoreSynth.tcl`):
+  - **This branch: FMax 198.6 MHz** (WNS -1.035ns). Worst path: `AluEuPlugin s1Src2 ->
+    s2Stage1_roxlRes` (the ALU barrel-shifter ROXL cone, 19 logic levels, 72% routing).
+  - **Base `5d8e791`: FMax 188.9 MHz** (WNS -1.294ns) — same AluEu shifter limiter.
+  - => FMAX-NEUTRAL-to-positive (this branch is ~10 MHz faster; the worst path is the
+    pre-existing ALU shifter, NOT the decode/ROB/exception/fetch cone these changes touch).
+    OOC synth_design is more pessimistic than the post-route P&R the controller runs (the
+    honest post-route baseline is ~240 per memory); both base + branch sit below 200 on this
+    pessimistic OOC measurement, so the change does not regress the gate.
+- Final SHA: (the final commit below)
+- Blockers / traces: none. The only real bug (stoppedPc — the IRQ entry stacking a stale
+  empty-ROB pcStore(h0) instead of STOP's resume PC) was caught by the STOP lock-step and
+  fixed; trace evidence /home/qwertyoruiop/tmp/t3-lockstep.log (diverged step 4: dut=0x0a vs
+  oracle=0x0e) -> t3-lockstep2.log (0 diverged after the stoppedPc latch).
 
 ---
 
