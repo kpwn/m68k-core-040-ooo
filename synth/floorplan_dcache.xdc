@@ -34,7 +34,7 @@ create_pblock pb_dcache
 # X28-83) lost co-location. So widen ONLY right to X81 (46 cols), restoring ~v1 density
 # (8467/(46*105) ~ 7313/(40*105)) without spreading. Y span unchanged (avoids guessing the
 # device's top SLICE row).
-resize_pblock pb_dcache -add {SLICE_X36Y110:SLICE_X81Y214}
+resize_pblock pb_dcache -add {SLICE_X36Y110:SLICE_X87Y214}
 add_cells_to_pblock pb_dcache [get_cells -hier -filter {NAME =~ *DcachePlugin_logic* || NAME =~ *DtlbPlugin_logic* || NAME =~ *LsEuPlugin_logic*}]
 # (cell-count diagnostic is printed from impl_FullCore.tcl in TCL context — `puts` is not
 #  supported inside an xdc read via read_xdc and throws a CRITICAL WARNING.)
