@@ -264,4 +264,18 @@ class OperationDecoderSpec extends AnyFunSuite {
       assert(!dut.o.sysReadDir.toBoolean)          // Rn -> Rc (write)
     }
   }
+  test("RESET (0x4E70): sysOp RESET, non-illegal, write dir", VerilatorTest) {
+    run(0x4E70) { dut =>
+      assert(!dut.o.illegal.toBoolean, "RESET must not be illegal")
+      assert(dut.o.sysOp.toBoolean && dut.o.sysKind.toEnum == SysKind.RESET)
+      assert(!dut.o.sysReadDir.toBoolean)
+    }
+  }
+  test("STOP (0x4E72): sysOp STOP, non-illegal, write dir", VerilatorTest) {
+    run(0x4E72) { dut =>
+      assert(!dut.o.illegal.toBoolean, "STOP must not be illegal")
+      assert(dut.o.sysOp.toBoolean && dut.o.sysKind.toEnum == SysKind.STOP)
+      assert(!dut.o.sysReadDir.toBoolean)
+    }
+  }
 }

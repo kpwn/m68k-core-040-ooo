@@ -580,6 +580,16 @@ class ExceptionUnit(
             }
           }
         }
+        is(U(4, 3 bits)) {                          // RESET : no architectural state change
+          // The external reset line is not modeled for lock-step; RESET is an internal NOP.
+          // S_REDIR just advances PC (the obs carries the UNCHANGED sysByte + A7).
+        }
+        is(U(5, 3 bits)) {                          // STOP : SR := sysVal[15:0]
+          // Identical SR write to MOVE-to-SR: system byte = sysVal[15:8] (S/T/I incl. the
+          // new I-mask), CCR = sysVal[4:0]. A7 re-banks on an S flip (S_REDIR via ss.a7).
+          // The HALT itself is the ROB `stopped` state (set on the STOP sysRetire).
+          ss.setSrSys.valid := True; ss.setSrSys.payload := sysCapVal(15 downto 8).asUInt
+        }
       }
       goto(S_REDIR)
     }
@@ -596,9 +606,10 @@ class ExceptionUnit(
       obsPc      := sysCapNextPc            // the sysOp's commit step == its nextPc
       obsSysByte := ss.srSys                // post-write system byte (S/T/I)
       obsA7      := ss.a7                   // re-banked A7 (Mux on post-write S)
-      // MOVE-to-SR (sysCapKind==1) writes the full CCR (sysVal[4:0]) -> surface it so the
-      // whitebox resyncs its running CCR to this absolute value. Other sysOps leave CCR.
-      when(sysCapKind === U(1, 3 bits)) {
+      // MOVE-to-SR (sysCapKind==1) AND STOP (sysCapKind==5) write the full CCR (sysVal[4:0])
+      // -> surface it so the whitebox resyncs its running CCR to this absolute value. Other
+      // sysOps (MOVE-USP/MOVEC/RESET) leave CCR untouched.
+      when(sysCapKind === U(1, 3 bits) || sysCapKind === U(5, 3 bits)) {
         obsSetCcr5Valid := True
         obsSetCcr5      := sysCapVal(4 downto 0).asUInt
       }

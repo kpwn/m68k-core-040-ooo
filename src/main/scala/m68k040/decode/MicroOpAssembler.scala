@@ -956,6 +956,21 @@ object MicroOpAssembler {
           opUop.dstValid := False
         }
       }
+      // RESET: no source, no dst, no value needed (the FSM is a no-op). Clear all operands
+      // so nothing is read/written; the op-µop is purely the serializing macro boundary.
+      when(spec.sysKind === SysKind.RESET) {
+        opUop.srcAValid := False; opUop.srcBValid := False; opUop.dstValid := False
+        opUop.useImm := False
+      }
+      // STOP: SR := imm16. The op-µop is a MOVE whose result = imm16 (zero-extended), so the
+      // EU writeback VALUE (captured into sysValStore) carries the new SR to the FSM exactly
+      // like MOVE-to-SR's register source. No int operands / dst.
+      when(spec.sysKind === SysKind.STOP) {
+        opUop.op := DecOp.MOVE
+        opUop.srcAValid := False; opUop.srcBValid := False; opUop.dstValid := False
+        opUop.useImm := True
+        opUop.imm := pkt.words(1).asUInt.resize(32).asBits   // imm16 -> new SR (zero-ext)
+      }
     }
     when(isTrapOp) {
       // Unconditional faulted µop: vector 32+n, delivered at retire (format-$0).

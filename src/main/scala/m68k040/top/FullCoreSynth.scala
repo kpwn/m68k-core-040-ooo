@@ -45,6 +45,9 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
     faRedir.valid   := doFlush
     faRedir.payload := flushPc
+    // STOP-halt: while the ROB is in the `stopped` state, quiesce the front-end (hold
+    // fetch + feed at the STOP successor PC). The IRQ-entry vector redirect clears it.
+    host[FetchAlignPlugin].logic.quiesce := rob.logic.stopped
     eu0.issue << iq.issue(0)
     eu1.issue << iq.issue(1)
     // MOVE-from-SR int result needs the committed SR system byte: wire the ROB's

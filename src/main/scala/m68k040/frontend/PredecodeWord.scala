@@ -221,6 +221,13 @@ object PredecodeWord {
         // RTD (0x4E74) + disp16: opword + 1 disp word -> SIMPLE len 2 (RTS-with-dealloc).
         val isRtd = op === B"16'h4E74"
         when(isRtd) { r.simple := True; r.lenWords := U(2, 3 bits) }
+        // RESET (0x4E70): single-word privileged sysOp -> SIMPLE len 1 (nextPc = pc+2, the
+        // redirect target after the serializing retire).
+        val isReset = op === B"16'h4E70"
+        when(isReset) { r.simple := True; r.lenWords := U(1, 3 bits) }
+        // STOP (0x4E72) + imm16: opword + 1 imm word -> SIMPLE len 2 (nextPc = pc+4).
+        val isStop = op === B"16'h4E72"
+        when(isStop) { r.simple := True; r.lenWords := U(2, 3 bits) }
         // CHK.W/CHK.L (0100 ddd 1 s 0 mmmrrr): bit8=1, bit6=0. The bound is an EA
         // source (sizeL = .L when bit7=0). 1 opword + the EA extension words.
         val isChk = op(8) && !op(6)
