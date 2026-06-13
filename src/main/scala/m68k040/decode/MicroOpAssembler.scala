@@ -82,6 +82,7 @@ object MicroOpAssembler {
     u.isMovea     := isLoad && !sizeLong
     u.isScc       := False; u.isDbcc := False
     u.indexLong   := False; u.indexScale := 0
+    u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
     // Only the VERY FIRST emitted move of the whole MOVEM is the macro boundary
     // (firstOfInstr); every later move + the final An update is non-first, so an
     // interrupt is only taken at the MOVEM boundary (never mid-emission — the partly-
@@ -121,6 +122,7 @@ object MicroOpAssembler {
     u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.extByte := False
     u.isMovea     := False; u.isScc := False; u.isDbcc := False
     u.indexLong   := False; u.indexScale := 0
+    u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
     u.firstOfInstr := False    // trailing µop of the MOVEM macro
     u
   }
@@ -281,6 +283,7 @@ object MicroOpAssembler {
     opUop.isMovea       := False
     opUop.isScc         := False; opUop.isDbcc := False
     opUop.indexLong     := False; opUop.indexScale := 0
+    opUop.sysOp := False; opUop.sysKind := SysKind.NONE; opUop.sysReadDir := False
     // CHK / DIV are group-2 traps (CHK vec6, DIV0 vec5) delivered execute-time via
     // euFault -> format-$2: they stack the NEXT instruction's PC (the 040 group-2
     // frame's PC = pc+len). The fault is conditional (set at execute), but faultPc is
@@ -466,6 +469,7 @@ object MicroOpAssembler {
     val ldIdxEa = Mux(opIsLineImm, immEa, srcEa)
     ldUop.srcCReg       := ldIdxEa.indexReg;   ldUop.srcCValid := ldIdxEa.indexValid
     ldUop.indexLong     := ldIdxEa.indexLong;  ldUop.indexScale := ldIdxEa.indexScale
+    ldUop.sysOp := False; ldUop.sysKind := SysKind.NONE; ldUop.sysReadDir := False
     ldUop.dstReg        := U(T0, 5 bits); ldUop.dstValid := True
     ldUop.useImm        := True
     // disp = rmwEaDisp (immEa for a line-0 immediate mem-dest, else srcEa). A (d16,PC)
@@ -513,6 +517,7 @@ object MicroOpAssembler {
     // mem-to-mem MOVE composes: srcA=dst base, srcB=T0 (loaded data), srcC=dst index.
     stUop.srcCReg       := dstEa.indexReg;  stUop.srcCValid := dstEa.indexValid
     stUop.indexLong     := dstEa.indexLong; stUop.indexScale := dstEa.indexScale
+    stUop.sysOp := False; stUop.sysKind := SysKind.NONE; stUop.sysReadDir := False
     // Auto-update DEST EA (-(An)/(An)+): the store's (otherwise unused) int dst carries
     // the An write (An := An ± delta) — generalizing stkPush to any An. PREDEC: addr =
     // An-delta = the written An; POSTINC: addr = An, written An = An+delta. The LS EU
@@ -554,6 +559,7 @@ object MicroOpAssembler {
     val rmwIdxEa = Mux(opIsLineImm, immEa, srcEa)
     rmwStUop.srcCReg       := rmwIdxEa.indexReg;  rmwStUop.srcCValid := rmwIdxEa.indexValid
     rmwStUop.indexLong     := rmwIdxEa.indexLong; rmwStUop.indexScale := rmwIdxEa.indexScale
+    rmwStUop.sysOp := False; rmwStUop.sysKind := SysKind.NONE; rmwStUop.sysReadDir := False
     // Auto-update RMW EA (-(An)/(An)+): the load + this store share ONE EA and ONE An
     // update — the store carries the An write (An := An ± delta) on its int dst (the
     // load carries the SAME eaAuto for its address but writes only T0). The An write
@@ -715,8 +721,15 @@ object MicroOpAssembler {
     val isExgAA = (op(15 downto 12) === B"4'hC") && op(8) && (op(7 downto 3) === B"5'b01001") // EXG Ax,Ay
     val isExgDA = (op(15 downto 12) === B"4'hC") && op(8) && (op(7 downto 3) === B"5'b10001") // EXG Dx,Ay
     val isExgOp = isExgDD || isExgAA || isExgDA
+    // ── Privileged commit-time SYSTEM ops (MOVE-to-SR / MOVE-USP / MOVEC) ────────
+    // Classified by OperationDecoder (spec.sysOp). They are NOT illegal; the op µop
+    // carries the sysOp markers + reads its source register (MOVE-to-SR / MOVE-USP-
+    // write / MOVEC-write) so the EU writeback VALUE is captured for the commit FSM.
+    // The privilege check (S=0 -> vector 8) is at the serializing retire, NOT decode.
+    val isSysOp = spec.sysOp
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isUnlkOp && !isExgOp &&
+              !isSysOp &&
               (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
                line4UnaryMemBad || aluRmwMemBad || bitOpMemBad || eaDstPcRelBad ||
                (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
@@ -760,6 +773,57 @@ object MicroOpAssembler {
       opUop.readsNzvc := True;  opUop.readsX  := True
       opUop.writesNzvc := True; opUop.writesX := True
       opUop.unimplemented := False
+    }
+    // ── Privileged commit-time SYSTEM ops: MOVE-to-SR / MOVE-USP / MOVEC ─────────
+    // The op µop is the macro boundary (single µop; reg-source/reg-dest forms only —
+    // a MEMORY-source MOVE-to-SR (load <ea> -> SR) is a fast-follow crack). It carries
+    // the sysOp markers; the ROB retires it ALONE (serializing) and the ExceptionUnit
+    // applies the effect at retire. WRITE direction: the source register is read so its
+    // EU writeback VALUE is captured per-ROB-entry (-> the SystemState write). READ
+    // direction: NO datapath dst — the FSM writes the int PRF arch-reg directly (the
+    // dst arch reg rides dstReg, but dstValid=False so rename does NOT allocate a PRF
+    // for it; the FSM uses the committed arch->phys mapping like the a7Write port). The
+    // MOVEC Rc id (12-bit) + the A/D|reg# of the ext word are carried in `imm`.
+    when(isSysOp) {
+      opUop.op            := DecOp.MOVE     // result = the source value (for a WRITE)
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.unimplemented := False
+      opUop.isBranch      := False
+      opUop.writesNzvc := False; opUop.writesX := False
+      opUop.readsNzvc  := False; opUop.readsX  := False
+      opUop.faulted := False; opUop.faultVector := 0
+      opUop.sysOp      := True
+      opUop.sysKind    := spec.sysKind
+      opUop.sysReadDir := spec.sysReadDir
+      opUop.firstOfInstr := True
+      // ── MOVEC ext word: bit15 = A/D (1=An), bits14:12 = reg#, bits11:0 = Rc. ──
+      // The ext word is pkt.words(1). For a WRITE (Rn->Rc) the source Rn rides srcA;
+      // for a READ (Rc->Rn) the dst Rn rides dstReg (dstValid=False). The Rc id rides
+      // `imm[11:0]`. (MOVE-to-SR/MOVE-USP set their operands via the spec srcB/dst.)
+      when(spec.sysKind === SysKind.MOVEC) {
+        val ext   = pkt.words(1)
+        val isAn  = ext(15)
+        val regN  = ext(14 downto 12).asUInt
+        val rnId  = Mux(isAn, (U(8, 5 bits) + regN.resize(5)).resize(5), regN.resize(5))
+        val rc    = ext(11 downto 0)
+        opUop.imm := rc.resize(32)              // Rc id in imm[11:0]
+        opUop.useImm := True
+        opUop.srcAValid := False; opUop.srcBValid := False
+        when(spec.sysReadDir) {                 // 0x4E7A Rc -> Rn: dst = Rn (FSM writes PRF)
+          opUop.dstReg := rnId; opUop.dstValid := False
+        } otherwise {                           // 0x4E7B Rn -> Rc: src = Rn (value captured)
+          opUop.srcAReg := rnId; opUop.srcAValid := True
+          opUop.dstValid := False
+        }
+      }
+      // MOVE-USP read (USP -> An): the base resolved dst := anField (dstWrites False);
+      // make the dst arch reg explicit (FSM writes PRF), no datapath src.
+      when(spec.sysKind === SysKind.MOVE_USP && spec.sysReadDir) {
+        opUop.dstReg := (U(8, 5 bits) + op(2 downto 0).asUInt).resize(5)
+        opUop.dstValid := False
+        opUop.srcAValid := False; opUop.srcBValid := False
+      }
     }
     when(isTrapOp) {
       // Unconditional faulted µop: vector 32+n, delivered at retire (format-$0).
@@ -929,6 +993,7 @@ object MicroOpAssembler {
     divlUop.divSigned     := divlSigned; divlUop.div64 := divl64; divlUop.divIsRem := False
     divlUop.shiftOp := 0; divlUop.shiftDir := False; divlUop.isMovea := False; divlUop.isScc := False; divlUop.isDbcc := False; divlUop.extByte := False; divlUop.bitOp := 0; divlUop.bcdSub := False
     divlUop.indexLong := False; divlUop.indexScale := 0
+    divlUop.sysOp := False; divlUop.sysKind := SysKind.NONE; divlUop.sysReadDir := False
     divlUop.firstOfInstr  := True
     // 64-bit dividend high word Dr: carried in srcC (psrcC after rename). For the
     // 32-bit form psrcC is unused.
@@ -962,6 +1027,7 @@ object MicroOpAssembler {
     divremUop.divSigned     := divlSigned; divremUop.div64 := divl64; divremUop.divIsRem := True
     divremUop.shiftOp := 0; divremUop.shiftDir := False; divremUop.isMovea := False; divremUop.isScc := False; divremUop.isDbcc := False; divremUop.extByte := False; divremUop.bitOp := 0; divremUop.bcdSub := False
     divremUop.indexLong := False; divremUop.indexScale := 0
+    divremUop.sysOp := False; divremUop.sysKind := SysKind.NONE; divremUop.sysReadDir := False
     divremUop.firstOfInstr  := False           // trailing crack µop
 
     // DIV.L is valid only when its divisor EA is reg/imm. A memSimple divisor would
@@ -1035,6 +1101,7 @@ object MicroOpAssembler {
     mullUop.divSigned     := mullSigned; mullUop.div64 := mull64; mullUop.divIsRem := False
     mullUop.shiftOp := 0; mullUop.shiftDir := False; mullUop.isMovea := False; mullUop.isScc := False; mullUop.isDbcc := False; mullUop.extByte := False; mullUop.bitOp := 0; mullUop.bcdSub := False
     mullUop.indexLong := False; mullUop.indexScale := 0
+    mullUop.sysOp := False; mullUop.sysKind := SysKind.NONE; mullUop.sysReadDir := False
     mullUop.firstOfInstr  := True
 
     // MULHI (high-product move) µop (.L64 only): CPLX, writes the EU's LATCHED high
@@ -1065,6 +1132,7 @@ object MicroOpAssembler {
     mulhiUop.divSigned     := mullSigned; mulhiUop.div64 := mull64; mulhiUop.divIsRem := False
     mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False; mulhiUop.isMovea := False; mulhiUop.isScc := False; mulhiUop.isDbcc := False; mulhiUop.extByte := False; mulhiUop.bitOp := 0; mulhiUop.bcdSub := False
     mulhiUop.indexLong := False; mulhiUop.indexScale := 0
+    mulhiUop.sysOp := False; mulhiUop.sysKind := SysKind.NONE; mulhiUop.sysReadDir := False
     mulhiUop.firstOfInstr  := False           // trailing crack µop
 
     // MUL.L is valid only when its multiplier EA is reg/imm (a memSimple multiplier
@@ -1112,6 +1180,7 @@ object MicroOpAssembler {
     ibrUop.divSigned     := False; ibrUop.div64 := False; ibrUop.divIsRem := False
     ibrUop.shiftOp := 0; ibrUop.shiftDir := False; ibrUop.isMovea := False; ibrUop.isScc := False; ibrUop.isDbcc := False; ibrUop.extByte := False; ibrUop.bitOp := 0; ibrUop.bcdSub := False
     ibrUop.indexLong := False; ibrUop.indexScale := 0
+    ibrUop.sysOp := False; ibrUop.sysKind := SysKind.NONE; ibrUop.sysReadDir := False
     // JMP is a single µop (its own first); JSR's ibranch is the TRAILING µop (the push
     // is first), so firstOfInstr is False for JSR.
     ibrUop.firstOfInstr  := !isJsrOp
@@ -1162,6 +1231,7 @@ object MicroOpAssembler {
       u.divSigned := False; u.div64 := False; u.divIsRem := divIsRem
       u.shiftOp := 0; u.shiftDir := False; u.isMovea := False; u.isScc := False; u.isDbcc := False; u.extByte := False; u.bitOp := 0; u.bcdSub := False
       u.indexLong := False; u.indexScale := 0
+      u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
       u.firstOfInstr := first
       u
     }

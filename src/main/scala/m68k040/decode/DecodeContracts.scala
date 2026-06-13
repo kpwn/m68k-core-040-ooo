@@ -130,6 +130,13 @@ case class OpSpec() extends Bundle {
   // -(Ay),-(Ax) MEMORY forms (6 µops). Default: not microcoded.
   val microcoded    = Bool()
   val ucEntry       = UInt(4 bits)   // entry µPC (ROM is small; 4 bits is ample for v1)
+  // ── Commit-time PRIVILEGED SYSTEM ops (MOVE-to-SR / MOVE-USP / MOVEC) ─────────
+  // Classification only (the assembler builds the op µop carrying these): `sysOp`
+  // marks a serializing commit-time system op, `sysKind` selects which, `sysReadDir`
+  // the direction (read SYSTEM->Rn vs write Rn->SYSTEM). Default: not a sysOp.
+  val sysOp         = Bool()
+  val sysKind       = SysKind()
+  val sysReadDir    = Bool()
 }
 object OpSpec {
   def illegalDefault(): OpSpec = {
@@ -149,6 +156,7 @@ object OpSpec {
     o.extByte := False
     o.movem := False; o.movemDir := False; o.movemSizeLong := False
     o.microcoded := False; o.ucEntry := 0
+    o.sysOp := False; o.sysKind := SysKind.NONE; o.sysReadDir := False
     o
   }
 }

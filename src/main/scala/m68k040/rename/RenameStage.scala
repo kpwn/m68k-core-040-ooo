@@ -166,6 +166,9 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.firstOfInstr := dec.firstOfInstr
       r.indexLong    := dec.indexLong
       r.indexScale   := dec.indexScale
+      r.sysOp        := dec.sysOp
+      r.sysKind      := dec.sysKind
+      r.sysReadDir   := dec.sysReadDir
 
       // architectural int dst reg (threaded for commit RAT update + CommitTrace)
       r.dstArch    := dec.dstReg

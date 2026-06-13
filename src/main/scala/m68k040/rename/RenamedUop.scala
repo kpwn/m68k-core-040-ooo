@@ -84,6 +84,14 @@ case class RenamedUop() extends Bundle {
   // in the LS-EU AGU (indexLong => full 32 vs .W sign-extend; indexScale = *1/2/4/8).
   val indexLong  = Bool()
   val indexScale = UInt(2 bits)
+  // Commit-time privileged system op (MOVE-to-SR / MOVE-USP / MOVEC): serializing
+  // retire, applied by the ExceptionUnit (re-banks A7 + redirects), S=0 -> vector-8.
+  // sysReadDir = read SYSTEM->Rn (the FSM writes int PRF arch-dstArch with the
+  // committed value) vs write Rn->SYSTEM (the source rides psrcA, its writeback VALUE
+  // captured per-ROB-entry). The MOVEC Rc id rides `imm`. Default: not a sysOp.
+  val sysOp        = Bool()
+  val sysKind      = m68k040.decode.SysKind()
+  val sysReadDir   = Bool()
   val dstArch = UInt(5 bits)   // architectural int dst reg 0..17 (incl T0/T1); for commit RAT + CommitTrace
   val psrcA = UInt(intW bits); val psrcAValid = Bool()
   val psrcB = UInt(intW bits); val psrcBValid = Bool()

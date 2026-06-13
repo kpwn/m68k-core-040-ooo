@@ -180,4 +180,44 @@ class OperationDecoderSpec extends AnyFunSuite {
   test("line-E ss=11 (memory single-bit form) -> illegal (deferred)", VerilatorTest) {
     run(0xE0D0) { dut => assert(dut.o.illegal.toBoolean) }   // 1110 000 0 11 010000
   }
+
+  // ── Privileged commit-time SYSTEM ops (Track D) ─────────────────────────────
+  test("MOVE to SR (0x46C0|Dn): sysOp MOVE_TO_SR write, srcB EASRC, non-illegal", VerilatorTest) {
+    run(0x46C0) { dut =>     // move %d0,%sr
+      assert(!dut.o.illegal.toBoolean)
+      assert(dut.o.sysOp.toBoolean && dut.o.sysKind.toEnum == SysKind.MOVE_TO_SR)
+      assert(!dut.o.sysReadDir.toBoolean)          // write <ea> -> SR
+      assert(dut.o.srcB.kind.toEnum == OperandKind.EASRC && dut.o.size.toEnum == Size.WORD)
+      assert(!dut.o.dstWrites.toBoolean)
+    }
+  }
+  test("MOVE USP write (0x4E60|An): sysOp MOVE_USP, write dir, srcB An", VerilatorTest) {
+    run(0x4E63) { dut =>     // move %a3,%usp
+      assert(!dut.o.illegal.toBoolean)
+      assert(dut.o.sysOp.toBoolean && dut.o.sysKind.toEnum == SysKind.MOVE_USP)
+      assert(!dut.o.sysReadDir.toBoolean)
+      assert(dut.o.srcB.kind.toEnum == OperandKind.REGFIELD && dut.o.srcB.isAddr.toBoolean)
+    }
+  }
+  test("MOVE USP read (0x4E68|An): sysOp MOVE_USP, read dir", VerilatorTest) {
+    run(0x4E6C) { dut =>     // move %usp,%a4
+      assert(!dut.o.illegal.toBoolean)
+      assert(dut.o.sysOp.toBoolean && dut.o.sysKind.toEnum == SysKind.MOVE_USP)
+      assert(dut.o.sysReadDir.toBoolean)           // USP -> An (read)
+    }
+  }
+  test("MOVEC Rc->Rn (0x4E7A): sysOp MOVEC, read dir, non-illegal", VerilatorTest) {
+    run(0x4E7A) { dut =>
+      assert(!dut.o.illegal.toBoolean)
+      assert(dut.o.sysOp.toBoolean && dut.o.sysKind.toEnum == SysKind.MOVEC)
+      assert(dut.o.sysReadDir.toBoolean)           // Rc -> Rn (read)
+    }
+  }
+  test("MOVEC Rn->Rc (0x4E7B): sysOp MOVEC, write dir", VerilatorTest) {
+    run(0x4E7B) { dut =>
+      assert(!dut.o.illegal.toBoolean)
+      assert(dut.o.sysOp.toBoolean && dut.o.sysKind.toEnum == SysKind.MOVEC)
+      assert(!dut.o.sysReadDir.toBoolean)          // Rn -> Rc (write)
+    }
+  }
 }

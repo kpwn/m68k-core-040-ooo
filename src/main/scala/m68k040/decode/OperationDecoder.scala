@@ -244,6 +244,61 @@ object OperationDecoder {
           o.movemDir := opword(10)
           o.movemSizeLong := opword(6)
         }
+        // ── MOVE to SR (0100 0110 11 mmmrrr) + ea : src.W -> SR (PRIVILEGED) ──────
+        // The opmode-6 case of the 0x4xC0 family (Track C owns opmodes 0/2/4 =
+        // MOVE-from-SR/from-CCR/to-CCR; keep this carve to opmode 6 ONLY so the
+        // controller reconciles). A COMMIT-TIME SYSTEM op: it writes the FULL SR
+        // (system byte incl S/T/I + CCR), re-banks A7 on an S flip, serializes, and
+        // a committed S=0 traps (vector 8 — checked at retire). The EA src is read
+        // as srcB (the move source, .W); no dst reg write (the SR is committed state,
+        // applied by the ExceptionUnit). NOT illegal; the assembler builds the sysOp
+        // µop reading the EA source. EA mode field op[5:3] disambiguated from the
+        // unary/MOVEM patterns (distinct bits 15:6).
+        when(opword(15 downto 6) === B"10'b0100011011") {
+          o.illegal := False
+          o.op := DecOp.MOVE                     // result = srcB (the EA source word)
+          o.size := Size.WORD
+          o.srcB := easrc                        // the EA source (.W) -> SR
+          o.dst.setNone(); o.dstWrites := False  // no reg write; SR is committed state
+          o.sysOp := True
+          o.sysKind := SysKind.MOVE_TO_SR
+          o.sysReadDir := False                  // write <ea> -> SR
+        }
+        // ── MOVE USP (0100 1110 0110 d rrr): An <-> USP (PRIVILEGED) ──────────────
+        // 0x4E60|reg = An -> USP (d=0, sysReadDir=False); 0x4E68|reg = USP -> An
+        // (d=1, sysReadDir=True). opword(15 downto 4) == 0x4E6. The An is op[2:0].
+        // A COMMIT-TIME SYSTEM op (the USP bank lives in SystemState). Direction d =
+        // bit3. WRITE: src An rides srcB (read in the datapath, value captured). READ:
+        // dst An rides dst (the FSM writes int PRF arch-An). S=0 -> vector 8.
+        when(opword(15 downto 4) === B"12'h4E6") {
+          o.illegal := False
+          o.op := DecOp.MOVE
+          o.size := Size.LONG
+          o.sysOp := True
+          o.sysKind := SysKind.MOVE_USP
+          o.sysReadDir := opword(3)              // 1 = USP -> An (read), 0 = An -> USP (write)
+          when(opword(3)) {                      // USP -> An : dst = An (op[2:0]+8)
+            o.dst := anField; o.dstWrites := False  // the FSM writes the int PRF (not a normal rename dst)
+          } otherwise {                          // An -> USP : src An -> srcB
+            o.srcB := anField
+            o.dst.setNone(); o.dstWrites := False
+          }
+        }
+        // ── MOVEC (0100 1110 0111 101 d): Rc <-> Rn (PRIVILEGED) + ext word ───────
+        // 0x4E7A = Rc -> Rn (d=0, sysReadDir=True); 0x4E7B = Rn -> Rc (d=1,
+        // sysReadDir=False). opword(15 downto 1) == B"...0100111001111101" i.e.
+        // opword(15 downto 1) === 0x4E7A>>1. The ext word {A/D, reg#, 12-bit Rc} is
+        // parsed by the assembler (the operands need the ext word). A COMMIT-TIME
+        // SYSTEM op. S=0 -> vector 8.
+        when(opword(15 downto 1) === B"15'b010011100111101") {
+          o.illegal := False
+          o.op := DecOp.MOVE
+          o.size := Size.LONG
+          o.sysOp := True
+          o.sysKind := SysKind.MOVEC
+          o.sysReadDir := !opword(0)             // 0x4E7A (bit0=0) = Rc->Rn (read); 0x4E7B = Rn->Rc (write)
+          // operands resolved by the assembler from the ext word (A/D + reg# + Rc).
+        }
       }
       // ---- Bcc / BSR / BRA (0110 cccc dddddddd) ----
       is(0x6) {

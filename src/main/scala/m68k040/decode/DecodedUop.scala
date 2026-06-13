@@ -54,6 +54,16 @@ object DecOp extends SpinalEnum {
       BITOP = newElement()
 }
 
+/** Commit-time privileged-system-op kind (DecodedUop.sysOp / .sysKind). Selects how
+  * the ExceptionUnit applies the op at the serializing retire. NONE for non-sysOps. */
+object SysKind extends SpinalEnum {
+  val NONE,
+      MOVE_TO_SR,   // <ea>.W -> SR (system byte + CCR); re-banks A7 on an S flip.
+      MOVE_USP,     // An <-> USP (direction in sysReadDir).
+      MOVEC         // Rn <-> Rc {VBR/USP/CACR/...} (direction in sysReadDir, Rc in imm).
+      = newElement()
+}
+
 /** Pre-rename µop: the decode→rename contract. Architectural operands
   * (D0-7 = 0..7, A0-7 = 8..15, T0/T1 temps = 16/17). Reg ids are 5 bits so the
   * cracker's temp targets fit. Rename maps these to physical MicroOp fields. */
@@ -210,4 +220,22 @@ case class DecodedUop() extends Bundle {
   // (Xn sized) << indexScale. NONE/0 for every non-indexed µop (srcCValid gates it).
   val indexLong  = Bool()
   val indexScale = UInt(2 bits)
+  // ── Commit-time PRIVILEGED SYSTEM ops (MOVE-to-SR / MOVE-USP / MOVEC) ─────────
+  // These ops write/read COMMITTED architectural system state (srSys/usp/ssp/vbr/
+  // cacr) owned by the commit-side ExceptionUnit/SystemState — they CANNOT execute
+  // out-of-order. `sysOp` marks such a µop: the ROB retires it ALONE (serializing,
+  // like RTE), the ExceptionUnit applies the effect at retire (re-banking A7 +
+  // redirecting younger work), and a committed S=0 converts it into a vector-8
+  // privilege-violation trap (the check is at COMMIT because S is committed state).
+  //   sysKind  : which system op (SysKind enum below).
+  //   sysReadDir: read SYSTEM-reg -> Rn (True) vs write Rn -> SYSTEM-reg (False).
+  // For a WRITE the source register rides the normal srcA (read in the OoO datapath,
+  // its writeback VALUE captured per-ROB-entry like nzvcValStore -> fed to the FSM).
+  // For a READ the destination Rn rides the normal dstReg/dstValid (the FSM writes
+  // the int PRF arch-Rn with the committed system value). The MOVEC control-reg id
+  // (12-bit Rc) rides `imm` (no value source competes for it on a MOVEC). Default:
+  // not a sysOp. (Reuses srcA/dstReg/imm to keep the rename/dispatch width minimal.)
+  val sysOp        = Bool()
+  val sysKind      = SysKind()
+  val sysReadDir   = Bool()
 }
