@@ -143,11 +143,13 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // (it now completes at S3). Prevents (a) two slow ops contending for the single slow
     // write/completion ports and (b) a fast op's completion coinciding with the slow op's
     // S3 completion. Slow ops are rare; the sibling ALU EU + 2-wide IQ absorb the bubble.
-    // (s2Valid/s3Valid are the RegNext chain of `s1Valid && isSlow`, declared in the SLOW
-    // PATH section below; forward-declared here as plain Bools and wired there.)
-    val s2Valid = Bool()
-    val s3Valid = Bool()
-    issuePort.ready := !((s1Valid && isSlow) || s2Valid || s3Valid)
+    // (s1aValid/s2Valid/s3Valid are the RegNext chain of `s1Valid && isSlow`, declared in
+    // the SLOW PATH section below; forward-declared here as plain Bools and wired there.)
+    // FMax #3 added the S1a stage (split stage1), so the slow pipe is now S1/S1a/S2/S3.
+    val s1aValid = Bool()
+    val s2Valid  = Bool()
+    val s3Valid  = Bool()
+    issuePort.ready := !((s1Valid && isSlow) || s1aValid || s2Valid || s3Valid)
 
     // ---- S1: FAST execute (ALU datapath; NO shifter, NO CCR-RMW on this cone) ----
     val cmd = AluCmd()
@@ -320,13 +322,29 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     shiftCmd.isImm   := u1.useImm
     shiftCmd.xIn     := s1X
 
-    // SLOW path stage 1 (S1): the deep variable-shift networks only. Register the
-    // ShiftStage1 midpoint into S2 (the cut that halves the cone).
-    val s1Stage1 = Shifter.stage1(shiftCmd)
-    s2Valid     := RegNext(s1Valid && isSlow) init False
+    // FMax #3: SPLIT stage 1 across an extra register. The single-cycle stage1 cone
+    // `s1Src2(count) -> rmod -> variable barrel shift -> s2Stage1` was the post-fmax#1/#2
+    // limiter (s1Src2 -> s2Stage1_roxlRes, 19 levels, WNS -0.805). stage1a computes the
+    // (cheap) count-derived SHIFT AMOUNTS + masked source; we REGISTER that midpoint
+    // (s1aStage1a) and stage1b performs the (wide) variable barrel shifts off the
+    // registered amounts. The deep funnel cone is now halved across the S1->S1a boundary.
+    // This makes the shift the lat-4 (S1,S1a,S2,S3) SLOW path; the dynamic slowWakeup
+    // (broadcast at S3) makes the extra cycle latency-agnostic (no static scoreboard
+    // constant — the IQ waits on the wakeup). RegNext (chained s*Valid) gates issue.
+    //
+    // S1: stage1a (amounts) -> register into S1a.
+    val s1Stage1a = Shifter.stage1a(shiftCmd)
+    s1aValid     := RegNext(s1Valid && isSlow) init False
+    val s1aStage1a = RegNext(s1Stage1a)
+    val s1aCtx     = RegNext(s1Ctx)
+    val s1aSrc1    = RegNext(s1Src1)
+    // S1a: stage1b (the deep variable shifts) off the registered amounts -> register
+    // the ShiftStage1 midpoint into S2 (the original cut).
+    val s1Stage1 = Shifter.stage1b(s1aStage1a)
+    s2Valid     := RegNext(s1aValid) init False
     val s2Stage1 = RegNext(s1Stage1)
-    val s2Ctx    = RegNext(s1Ctx)
-    val s2Src1   = RegNext(s1Src1)        // merge source preserved to S3
+    val s2Ctx    = RegNext(s1aCtx)
+    val s2Src1   = RegNext(s1aSrc1)        // merge source preserved to S3
 
     // SLOW path stage 2 (S2): bit-extract + mux on the registered midpoint. Register
     // the finished result/flags into S3 (arch latency-3).
