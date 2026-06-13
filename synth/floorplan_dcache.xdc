@@ -28,7 +28,13 @@
 # plugins captures 7313 cells (robust, vs the decode pblock's 1284). The three plugins
 # contribute ~944 (Dcache) + 81 (Dtlb) + 352 (LsEu) unique signal names pre-synth.
 create_pblock pb_dcache
-resize_pblock pb_dcache -add {SLICE_X36Y110:SLICE_X75Y214}
+# LOOSENED (2026-06-13) for the line-4 cell growth: LEA grew LsEuPlugin -> the pblock now
+# holds ~8467 cells (was 7313), congesting v1's 40-col box (post-route 231.6 -> 208.8). The
+# v1/v2 lesson: keep the LEFT edge co-located with pb_decode (X36) — widening BOTH sides (v2
+# X28-83) lost co-location. So widen ONLY right to X81 (46 cols), restoring ~v1 density
+# (8467/(46*105) ~ 7313/(40*105)) without spreading. Y span unchanged (avoids guessing the
+# device's top SLICE row).
+resize_pblock pb_dcache -add {SLICE_X36Y110:SLICE_X81Y214}
 add_cells_to_pblock pb_dcache [get_cells -hier -filter {NAME =~ *DcachePlugin_logic* || NAME =~ *DtlbPlugin_logic* || NAME =~ *LsEuPlugin_logic*}]
 # (cell-count diagnostic is printed from impl_FullCore.tcl in TCL context — `puts` is not
 #  supported inside an xdc read via read_xdc and throws a CRITICAL WARNING.)
