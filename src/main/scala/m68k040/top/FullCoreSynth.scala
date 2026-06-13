@@ -74,6 +74,8 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
       rob.logic.ccrCompletion(idx).payload.nzvcWrite:= w.nzvcWrite
       rob.logic.ccrCompletion(idx).payload.x        := w.x
       rob.logic.ccrCompletion(idx).payload.xWrite   := w.xWrite
+      rob.logic.ccrCompletion(idx).payload.result   := w.result
+      rob.logic.ccrCompletion(idx).payload.intWrite := w.intWrite
     }
     wireCcr(0, eu0.logic.wbObs); wireCcr(1, eu1.logic.wbObs); wireCcr(2, lsEu.logic.wbObs)
 
@@ -194,9 +196,13 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     exc.sqDrained           := lsEu.sqEmptySig
     // A7 (int reg 15) write-back on an exception/RTE A7 change (committed arch-15 ==
     // phys-15, unrenamed).
-    a7Wr.valid   := exc.a7WriteValid
-    a7Wr.address := U(15, a7Wr.address.getWidth bits)
-    a7Wr.data    := exc.a7WriteData.asBits
+    // A7 (arch-15) write on exc/RTE A7 change; the SAME port also serves a commit-time
+    // SYSTEM op's READ direction (MOVE-USP/MOVEC Rc->Rn writes an arbitrary arch-Rn).
+    // sysRegWrite fires in S_APPLY, a7Write in S_REDIR (consecutive -> no port collision).
+    a7Wr.valid   := exc.a7WriteValid || exc.sysRegWriteValid
+    a7Wr.address := Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
+                                              U(15, a7Wr.address.getWidth bits))
+    a7Wr.data    := Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits)
 
     // Synth anchors (registered top outputs) so synthesis can't trim the core.
     val eu0Res = out(RegNext(eu0.intW.data))   // EU0 int result -> anchors datapath+PRF

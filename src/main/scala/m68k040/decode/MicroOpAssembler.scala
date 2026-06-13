@@ -812,19 +812,34 @@ object MicroOpAssembler {
         opUop.imm := rc.resize(32)              // Rc id in imm[11:0]
         opUop.useImm := True
         opUop.srcAValid := False; opUop.srcBValid := False
-        when(spec.sysReadDir) {                 // 0x4E7A Rc -> Rn: dst = Rn (FSM writes PRF)
-          opUop.dstReg := rnId; opUop.dstValid := False
-        } otherwise {                           // 0x4E7B Rn -> Rc: src = Rn (value captured)
-          opUop.srcAReg := rnId; opUop.srcAValid := True
+        when(spec.sysReadDir) {                 // 0x4E7A Rc -> Rn: dst = Rn
+          // The read dst is a REAL renamed register (dstValid=True): rename allocates a
+          // pdst, the ROB commits the arch->pdst mapping at the serializing retire, and
+          // the FSM writes the system VALUE into PRF[pdst]. A normal later reader of Rn
+          // then sees the value (the committed mapping). (Unlike A7, an arbitrary Rn is
+          // renamed, so the FSM must target pdst — the committed identity won't hold.)
+          opUop.dstReg := rnId; opUop.dstValid := True
+        } otherwise {                           // 0x4E7B Rn -> Rc: src = Rn -> srcB
+          // The op is MOVE (result = srcB), so the ALU EU's wbObs.result = Rn's value;
+          // the ROB captures it (sysValStore) for the commit-time SystemState write.
+          opUop.srcBReg := rnId; opUop.srcBValid := True
           opUop.dstValid := False
         }
       }
-      // MOVE-USP read (USP -> An): the base resolved dst := anField (dstWrites False);
-      // make the dst arch reg explicit (FSM writes PRF), no datapath src.
-      when(spec.sysKind === SysKind.MOVE_USP && spec.sysReadDir) {
-        opUop.dstReg := (U(8, 5 bits) + op(2 downto 0).asUInt).resize(5)
-        opUop.dstValid := False
-        opUop.srcAValid := False; opUop.srcBValid := False
+      // MOVE-USP: the An is op[2:0] (NOT the op[11:9] the base anField uses). Override
+      // the operand explicitly. READ (USP->An): dst = An (the FSM writes the PRF; no
+      // datapath src). WRITE (An->USP): the source An -> srcB so the MOVE result = An
+      // (captured into sysValStore for the SystemState write).
+      when(spec.sysKind === SysKind.MOVE_USP) {
+        val uspAn = (U(8, 5 bits) + op(2 downto 0).asUInt).resize(5)
+        when(spec.sysReadDir) {                 // USP -> An (real renamed dst; FSM writes PRF[pdst])
+          opUop.dstReg := uspAn; opUop.dstValid := True
+          opUop.srcAValid := False; opUop.srcBValid := False
+        } otherwise {                           // An -> USP
+          opUop.srcBReg := uspAn; opUop.srcBValid := True
+          opUop.srcAValid := False
+          opUop.dstValid := False
+        }
       }
     }
     when(isTrapOp) {

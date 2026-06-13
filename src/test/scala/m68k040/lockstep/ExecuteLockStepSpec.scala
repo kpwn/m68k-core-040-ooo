@@ -91,6 +91,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         rob.logic.ccrCompletion(idx).payload.nzvcWrite:= w.nzvcWrite
         rob.logic.ccrCompletion(idx).payload.x        := w.x
         rob.logic.ccrCompletion(idx).payload.xWrite   := w.xWrite
+        // The EU writeback VALUE + intWrite (captured per-ROB-entry for a commit-time
+        // system op's write direction: the sysOp µop is a MOVE -> result = the source).
+        rob.logic.ccrCompletion(idx).payload.result   := w.result
+        rob.logic.ccrCompletion(idx).payload.intWrite := w.intWrite
       }
       wireCcr(0, eu0.logic.wbObs); wireCcr(1, eu1.logic.wbObs); wireCcr(2, lsEu.logic.wbObs)
       wireCcr(3, divEu.logic.wbObs)
@@ -192,10 +196,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       lsEu.excXlateSupervisor   := exc.dtReq.supervisor
       exc.sqDrained             := lsEu.sqEmptySig
       // A7 (int reg 15) write-back on an exception/RTE A7 change. Committed arch-15
-      // maps to phys-15 (identity, unrenamed in these programs).
-      a7Wr.valid   := exc.a7WriteValid
-      a7Wr.address := U(15, a7Wr.address.getWidth bits)
-      a7Wr.data    := exc.a7WriteData.asBits
+      // maps to phys-15 (identity, unrenamed in these programs). The SAME PRF write
+      // port also serves a commit-time SYSTEM op's READ direction (MOVE-USP / MOVEC
+      // Rc->Rn writes an arbitrary int arch-Rn): sysRegWrite fires in S_APPLY, a7Write
+      // in S_REDIR (consecutive cycles -> no same-cycle collision on the one port).
+      a7Wr.valid   := exc.a7WriteValid || exc.sysRegWriteValid
+      a7Wr.address := Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
+                                                U(15, a7Wr.address.getWidth bits))
+      a7Wr.data    := Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits)
     }
   }
 
@@ -407,7 +415,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           val c = dut.rob.logic.commitObs(2)
           if (c.fire.toBoolean) {
             commitCount += 1
-            handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL, if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1)
+            handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
+              if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1,
+              if (c.setCcr5Valid.toBoolean) c.setCcr5.toInt & 0x1f else -1)
           }
         }
       }
@@ -1901,6 +1911,22 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #1,%d0 ; bsr sub ; moveq #7,%d2 ; .stop: bra .stop ; " +
       "sub: moveq #3,%d1 ; rtd #-4",
       nInstr = 5)
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // PRIVILEGED COMMIT-TIME SYSTEM ops (Track D): MOVE-USP / MOVE-to-SR / MOVEC.
+  // The core boots SUPERVISOR (S=1, SSP=0x00100000, USP=0). The serializing system-op
+  // FSM (ExceptionUnit S_APPLY) writes committed state + re-banks A7 + redirects.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  // MOVE USP round-trip (supervisor): write USP from A3, read it back into A4. A4 is
+  // surfaced into D5 (the read is FSM-written, verified by the following reader). A7
+  // stays = SSP (S unchanged), so the serialization is the only effect.
+  test("lock-step: MOVE A3,USP ; MOVE USP,A4 round-trip (supervisor)", VerilatorTest) {
+    runLockStep("move-usp-roundtrip",
+      "move.l #0x12340000,%a3 ; move.l %a3,%usp ; move.l %usp,%a4 ; move.l %a4,%a5 ; " +
+      ".stop: bra .stop",
+      nInstr = 4)   // a5 == 0x12340000 (USP round-tripped; MOVEA sets no flags)
   }
 
   test("lock-step: jsr (xxx).L ... rts", VerilatorTest) {

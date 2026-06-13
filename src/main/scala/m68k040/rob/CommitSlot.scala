@@ -17,4 +17,11 @@ case class CcrCompletion() extends Bundle {
   val robId     = UInt(6 bits)
   val nzvc      = UInt(4 bits); val nzvcWrite = Bool()
   val x         = Bool();       val xWrite    = Bool()
+  // The EU writeback VALUE (wbObs.result) + intWrite, captured per-ROB-entry. Used by
+  // the commit-time PRIVILEGED SYSTEM ops (MOVE-to-SR / MOVE-USP-write / MOVEC-write):
+  // their op µop is a MOVE (result = the source register), so wbObs.result IS the
+  // value the ExceptionUnit writes into the committed system state (srSys/usp/vbr/...).
+  // For non-sysOps the ROB ignores it. Default 0/False if unwired.
+  val result    = Bits(32 bits)
+  val intWrite  = Bool()
 }

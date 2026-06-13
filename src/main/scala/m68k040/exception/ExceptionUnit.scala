@@ -58,7 +58,30 @@ class ExceptionUnit(
     // until RTE; NMI sets 7). Fault/trap entries leave the mask unchanged (S=1 /
     // T=0 only). Default False => the existing fault/trap behavior is unchanged.
     entryIsInterrupt: Bool = False,
-    entryIplLevel:    UInt = U(0, 3 bits)) extends Area {
+    entryIplLevel:    UInt = U(0, 3 bits),
+    // ── Commit-time PRIVILEGED SYSTEM op (MOVE-to-SR / MOVE-USP / MOVEC) ─────────
+    // A serializing system op at the head (S=1 supervisor — the user-mode case is a
+    // vector-8 fault delivered via entryTrigger instead). The FSM applies the effect
+    // (write committed SR/USP/VBR + re-bank A7, or read system->Rn), pulses the obs
+    // (post-state sysByte + re-banked A7), and redirects to sysNextPc (serialize).
+    //   sysKind     : 1=MOVE-to-SR, 2=MOVE-USP, 3=MOVEC (mirrors decode.SysKind enum).
+    //   sysReadDir  : read SYSTEM->Rn (True) vs write Rn->SYSTEM (False).
+    //   sysVal      : the captured source VALUE (for a write).
+    //   sysRc       : the 12-bit MOVEC control-reg id.
+    //   sysDstArch  : the Rn arch reg for a READ (the FSM writes the int PRF).
+    //   sysPc       : the sysOp instruction's PC (the obs commit PC).
+    //   sysNextPc   : the next instruction's PC (the redirect target after serialize).
+    sysTrigger:   Bool = False,
+    sysKind:      UInt = U(0, 2 bits),
+    sysReadDir:   Bool = False,
+    sysVal:       Bits = B(0, 32 bits),
+    sysRc:        UInt = U(0, 12 bits),
+    // The PHYSICAL dst reg for a READ (the rename-allocated pdst of the read µop). The
+    // ROB commits the arch->pdst mapping at the serializing retire; the FSM writes the
+    // system VALUE into PRF[pdst]. (An arbitrary Rn is renamed, unlike the identity A7.)
+    sysDstPhys:   UInt = U(0, 6 bits),
+    sysPc:        UInt = U(0, 32 bits),
+    sysNextPc:    UInt = U(0, 32 bits)) extends Area {
 
   // ── exposed D-cache request ports (wiring MUXes them onto the real cache) ────
   val dcLoadCmd  = Stream(DLoadCmd())
@@ -113,6 +136,15 @@ class ExceptionUnit(
   val curFault = Reg(UInt(32 bits))   // faulting VA (EA + fault-address fields of $7)
   val curSsw   = Reg(UInt(16 bits))   // $7 special status word
 
+  // ── Commit-time SYSTEM op captured state (latched at sysTrigger) ─────────────
+  val sysCapKind    = Reg(UInt(2 bits))
+  val sysCapReadDir = Reg(Bool())
+  val sysCapVal     = Reg(Bits(32 bits))
+  val sysCapRc      = Reg(UInt(12 bits))
+  val sysCapDstPhys = Reg(UInt(6 bits))
+  val sysCapPc      = Reg(UInt(32 bits))
+  val sysCapNextPc  = Reg(UInt(32 bits))
+
   // RTE pop accumulators
   val popSr = Reg(UInt(16 bits))
   val popPc = Reg(UInt(32 bits))
@@ -139,6 +171,12 @@ class ExceptionUnit(
   val obsPc      = UInt(32 bits); obsPc := U(0, 32 bits)
   val obsSysByte = UInt(8 bits);  obsSysByte := U(0, 8 bits)   // post-event SR system byte
   val obsA7      = UInt(32 bits); obsA7 := U(0, 32 bits)
+  // MOVE-to-SR writes the FULL CCR (X N Z V C = sysVal[4:0]) as an ABSOLUTE value (vs
+  // the per-bit fold of NZVC the CHK entry uses). When `obsSetCcr5Valid`, the lock-step
+  // whitebox SETS the running CCR to `obsSetCcr5` for this obs step (the only commit
+  // path that writes the full CCR outside a normal Wb). Default invalid.
+  val obsSetCcr5Valid = Bool();       obsSetCcr5Valid := False
+  val obsSetCcr5      = UInt(5 bits); obsSetCcr5      := U(0, 5 bits)
   // True when this obs is an INTERRUPT entry (vs a fault/trap entry or RTE). The
   // lock-step harness drops the separate interrupt-entry record because Musashi's
   // trace BUNDLES the interrupt entry with the first handler instruction in one
@@ -160,6 +198,15 @@ class ExceptionUnit(
   // unrenamed). obsFire qualifies it (same cycle as the event's commit obs). ─────
   val a7WriteValid = Bool();        a7WriteValid := obsFire
   val a7WriteData  = UInt(32 bits); a7WriteData := obsA7
+
+  // ── Generalized arch-reg PRF write (commit-time system op READ direction) ─────
+  // MOVE-USP / MOVEC READ (system reg -> Rn) writes an ARBITRARY int arch reg (the Rn),
+  // not just A7. The full-core wiring connects this to an int PRF write port at the
+  // committed arch->phys mapping (identity while unrenamed in the tested programs). The
+  // S_APPLY FSM state pulses it. Default idle.
+  val sysRegWriteValid = Bool();        sysRegWriteValid := False;        sysRegWriteValid.simPublic()
+  val sysRegWritePhys  = UInt(6 bits);  sysRegWritePhys  := U(0, 6 bits);  sysRegWritePhys.simPublic()
+  val sysRegWriteData  = UInt(32 bits); sysRegWriteData  := U(0, 32 bits); sysRegWriteData.simPublic()
 
   // ── SystemState write defaults (the FSM pulses them) ────────────────────────
   ss.setSrSys.valid := False; ss.setSrSys.payload := U(0, 8 bits)
@@ -287,6 +334,11 @@ class ExceptionUnit(
     val R_FMTREQ  = new State    // load format word @ base+6 (select $0 vs $7 pop)
     val R_FMTWAIT = new State
     val R_REDIR   = new State
+    // Commit-time SYSTEM-op path (MOVE-to-SR / MOVE-USP / MOVEC). S_APPLY writes the
+    // committed system state + the int PRF (read dir) in one cycle; S_REDIR pulses the
+    // obs (post-state) + redirects (so the re-banked A7 / new S settle before the obs).
+    val S_APPLY   = new State
+    val S_REDIR   = new State
 
     IDLE.whenIsActive {
       when(entryTrigger) {
@@ -340,6 +392,17 @@ class ExceptionUnit(
         // RTE reads the frame at the CURRENT A7 (SSP). frameBase := SSP.
         frameBase := ss.ssp
         goto(R_SRREQ)
+      } elsewhen(sysTrigger) {
+        // Commit-time SYSTEM op (supervisor; the user-mode case is a vector-8 fault via
+        // entryTrigger). Latch the captured context; apply next cycle.
+        sysCapKind    := sysKind
+        sysCapReadDir := sysReadDir
+        sysCapVal     := sysVal
+        sysCapRc      := sysRc
+        sysCapDstPhys := sysDstPhys
+        sysCapPc      := sysPc
+        sysCapNextPc  := sysNextPc
+        goto(S_APPLY)
       }
     }
 
@@ -474,6 +537,73 @@ class ExceptionUnit(
       obsPc      := popPc
       obsSysByte := popSr(15 downto 8)
       obsA7      := Mux(popSr(13), newSsp, ss.usp)   // SR bit13 = S
+      goto(IDLE)
+    }
+
+    // ── Commit-time SYSTEM op: APPLY the effect to committed state (1 cycle) ──────
+    // sysCapKind: 1=MOVE-to-SR, 2=MOVE-USP, 3=MOVEC. The write direction's source value
+    // is sysCapVal; the read direction writes the int PRF arch-reg (sysRegWrite*).
+    S_APPLY.whenIsActive {
+      switch(sysCapKind) {
+        is(U(1, 2 bits)) {                          // MOVE to SR : sysVal.W -> SR
+          // System byte = sysVal[15:8], CCR = sysVal[4:0]. Writing srSys may flip S ->
+          // A7 re-banks. The committed CCR is tracked in the ROB; we surface the new SR
+          // (sysByte) in the obs, and the ROB folds sysVal[4:0] into committedCcr (so the
+          // whitebox's running CCR resyncs). Re-bank A7: write the int PRF arch-15 with
+          // the NEW-S bank's value (computed from the post-write S in S_REDIR via ss.a7).
+          ss.setSrSys.valid := True; ss.setSrSys.payload := sysCapVal(15 downto 8).asUInt
+        }
+        is(U(2, 2 bits)) {                          // MOVE USP : An<->USP
+          when(sysCapReadDir) {                     // USP -> An : write the int PRF[pdst]
+            sysRegWriteValid := True
+            sysRegWritePhys  := sysCapDstPhys
+            sysRegWriteData  := ss.usp
+          } otherwise {                             // An -> USP : write the USP bank
+            ss.setUsp.valid := True; ss.setUsp.payload := sysCapVal.asUInt
+          }
+        }
+        is(U(3, 2 bits)) {                          // MOVEC : Rc<->Rn
+          when(sysCapReadDir) {                     // Rc -> Rn : read the committed reg
+            sysRegWriteValid := True
+            sysRegWritePhys  := sysCapDstPhys
+            // Rc id: VBR=0x801, USP=0x800, CACR=0x002 (RAZ), SFC=0x000/DFC=0x001 (RAZ).
+            sysRegWriteData  := sysCapRc.mux(
+              U(0x801, 12 bits) -> ss.vbr,
+              U(0x800, 12 bits) -> ss.usp,
+              default           -> U(0, 32 bits))   // CACR/SFC/DFC/other -> RAZ (read 0)
+          } otherwise {                             // Rn -> Rc : write the committed reg
+            switch(sysCapRc) {
+              is(U(0x801, 12 bits)) { ss.setVbr.valid := True; ss.setVbr.payload := sysCapVal.asUInt }
+              is(U(0x800, 12 bits)) { ss.setUsp.valid := True; ss.setUsp.payload := sysCapVal.asUInt }
+              // CACR (0x002) / SFC (0x000) / DFC (0x001) / other: WI (write-ignored,
+              // RAZ-WI — this core has no cache-enable / alt-space access path).
+            }
+          }
+        }
+      }
+      goto(S_REDIR)
+    }
+    // S_REDIR: the system-state writes from S_APPLY have now COMMITTED (a cycle later),
+    // so ss.a7 / ss.srSys reflect the new state. Pulse the obs (post-state sysByte +
+    // re-banked A7) + write the int PRF arch-15 with the re-banked A7 (a MOVE-to-SR S
+    // flip switches the active bank), and redirect to the next instruction (serialize).
+    S_REDIR.whenIsActive {
+      // Re-bank A7 in the int PRF: ss.a7 = Mux(S, ssp, usp) with the POST-write S. The
+      // a7Write port is qualified by obsFire (below). For MOVE-to-SR this carries the
+      // user/supervisor SP switch into the datapath's arch-15. For MOVE-USP/MOVEC that
+      // wrote USP while in supervisor, ss.a7 (=ssp) is unchanged -> a harmless re-write.
+      obsFire    := True
+      obsPc      := sysCapNextPc            // the sysOp's commit step == its nextPc
+      obsSysByte := ss.srSys                // post-write system byte (S/T/I)
+      obsA7      := ss.a7                   // re-banked A7 (Mux on post-write S)
+      // MOVE-to-SR (sysCapKind==1) writes the full CCR (sysVal[4:0]) -> surface it so the
+      // whitebox resyncs its running CCR to this absolute value. Other sysOps leave CCR.
+      when(sysCapKind === U(1, 2 bits)) {
+        obsSetCcr5Valid := True
+        obsSetCcr5      := sysCapVal(4 downto 0).asUInt
+      }
+      redirectValid := True
+      redirectPc    := sysCapNextPc
       goto(IDLE)
     }
   }

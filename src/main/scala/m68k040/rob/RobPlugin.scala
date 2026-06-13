@@ -104,6 +104,25 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val faultedStore  = Vec.fill(depth)(RegInit(False))
     val isRteStore    = Vec.fill(depth)(RegInit(False))
     val faultVecStore = Vec.fill(depth)(RegInit(U(0, 8 bits)))
+    // Commit-time PRIVILEGED SYSTEM ops (MOVE-to-SR / MOVE-USP / MOVEC): captured at
+    // alloc (RegInit, reset per-alloc like faultedStore). `sysOpStore` = this entry is
+    // a serializing system op; `sysKindStore` selects which; `sysReadDirStore` = read
+    // SYSTEM->Rn vs write Rn->SYSTEM; `sysDstArchStore` = the Rn for a read (the FSM
+    // writes the int PRF); `sysRcStore` = the 12-bit MOVEC control-reg id (from imm).
+    // `sysValStore` = the captured source VALUE (wbObs.result) for a write direction.
+    val sysOpStore      = Vec.fill(depth)(RegInit(False))
+    val sysKindStore    = Vec.fill(depth)(RegInit(m68k040.decode.SysKind.NONE()))
+    val sysReadDirStore = Vec.fill(depth)(RegInit(False))
+    val sysDstArchStore = Vec.fill(depth)(RegInit(U(0, 5 bits)))
+    val sysRcStore      = Vec.fill(depth)(RegInit(U(0, 12 bits)))
+    val sysValStore     = Vec.fill(depth)(Reg(Bits(32 bits)))
+    // The EU's `completion` port (marks `completes`) fires ONE cycle BEFORE its `wbObs`
+    // (the value, captured into sysValStore via ccrCompletion). So a write-direction
+    // sysOp head could `sysRetire` (gated on completes) before its VALUE lands -> the FSM
+    // would latch a STALE sysValStore. `sysValRdyStore` is set BY the ccrCompletion (same
+    // cycle the value lands); sysRetire gates on it so the write triggers only AFTER the
+    // value is captured. RegInit(False), reset per-alloc (mirrors faultedStore).
+    val sysValRdyStore  = Vec.fill(depth)(RegInit(False))
     val faultPcStore  = Vec.fill(depth)(RegInit(U(0, 32 bits)))
     // MMU access-fault per-entry capture (set at COMPLETION from the LS EU's
     // faultCompletion, NOT at alloc — an MMU fault is discovered at execute). On a
@@ -168,6 +187,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       c.payload.nzvcWrite.allowOverride;c.payload.nzvcWrite := False
       c.payload.x.allowOverride;        c.payload.x := False
       c.payload.xWrite.allowOverride;   c.payload.xWrite := False
+      c.payload.result.allowOverride;   c.payload.result := B(0, 32 bits)
+      c.payload.intWrite.allowOverride; c.payload.intWrite := False
       c.simPublic()
     }
 
@@ -212,6 +233,17 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val headReady   = (count > 0) && completes(h0) && !flushing
     val faultRetire = headReady && faultedStore(h0) && excIdle; faultRetire.simPublic()
     val rteRetire   = headReady && isRteStore(h0)   && excIdle; rteRetire.simPublic()
+    // A commit-time PRIVILEGED SYSTEM op (MOVE-to-SR / MOVE-USP / MOVEC) at the head:
+    // serializing (retires ALONE, like fault/RTE). It triggers either the system-op
+    // FSM (S=1 supervisor) OR a vector-8 privilege fault (S=0 user) — resolved below
+    // after the exc unit exposes ss.s. A faulted/RTE head takes priority over a sysOp
+    // (a head can't be both: sysOps are never faulted/RTE at alloc).
+    // Gated on sysValRdyStore so a WRITE-direction sysOp triggers only AFTER its source
+    // VALUE has been captured (the EU's `completion` precedes its `wbObs` by one cycle).
+    // The READ direction also waits one harmless extra cycle (its wbObs sets the flag too).
+    val sysRetire   = headReady && sysOpStore(h0) && sysValRdyStore(h0) &&
+                      !faultedStore(h0) && !isRteStore(h0) &&
+                      excIdle; sysRetire.simPublic()
 
     // ── Interrupt recognition (precise, at a macro-instruction boundary) ─────────
     // Take an interrupt BETWEEN instructions when ALL hold:
@@ -236,11 +268,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
 
     // A normal retire is also blocked while an interrupt is pending (the head does
     // not commit — like the faulted-head case).
-    val retire0 = headReady && !faultedStore(h0) && !isRteStore(h0) && !interruptPending
-    // A faulted/RTE entry at h1 must NOT commit in slot1 (it is serializing — it
+    val retire0 = headReady && !faultedStore(h0) && !isRteStore(h0) && !sysOpStore(h0) && !interruptPending
+    // A faulted/RTE/sysOp entry at h1 must NOT commit in slot1 (it is serializing — it
     // retires alone when it reaches the head).
     val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone &&
-                  !faultedStore(h1) && !isRteStore(h1)
+                  !faultedStore(h1) && !isRteStore(h1) && !sysOpStore(h1)
 
     val traceVec     = Vec(CommitTrace(), 2)
     val traceFireVec = Vec(Bool(), 2)
@@ -289,6 +321,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val commitPc1 = Mux(p1.retireAlone, nextPcStore(h1), p1.predNextPc)
     when(retire0) { driveCommit(0, p0, commitPc0) }
     when(retire1) { driveCommit(1, p1, commitPc1) }
+    // (A commit-time SYSTEM op READ commits its dst arch->pdst mapping at the trigger —
+    // driven AFTER the exc unit is built, see `sysReadCommit` below, since the S=1
+    // decision needs exc.ss.s.)
 
     val retiredThisCycle = (retire1 ? U(2) | (retire0 ? U(1) | U(0))).resize(count.getWidth)
 
@@ -327,6 +362,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       nzvcWrStore(c.payload.robId)  := c.payload.nzvcWrite
       xValStore(c.payload.robId)    := c.payload.x
       xWrStore(c.payload.robId)     := c.payload.xWrite
+      // Capture the EU writeback VALUE for a commit-time system op's write direction
+      // (the op µop is a MOVE -> result = the source register). The ROB ignores it for
+      // non-sysOps. (Placed BEFORE alloc-reset so a re-used index's alloc wins.)
+      sysValStore(c.payload.robId)  := c.payload.result
+      // The value has landed -> a write-direction sysOp may now trigger (this fires the
+      // cycle AFTER the EU's `completion` set `completes`, closing the value-vs-trigger
+      // race). An intWrite-only capture qualifies (a sysOp µop always writes via its EU).
+      sysValRdyStore(c.payload.robId) := True
     }
     // LS MMU access-fault completion: mark the entry FAULTED (vector 2) + record the
     // faulting VA + SSW attrs. The faulting instruction's PC is already captured per
@@ -375,6 +418,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       firstStore(tail) := allocUopVec(0).firstOfInstr
       pcStore(tail)    := allocUopVec(0).pc
       nzvcWrStore(tail) := False; xWrStore(tail) := False
+      sysOpStore(tail)      := allocUopVec(0).sysOp
+      sysKindStore(tail)    := allocUopVec(0).sysKind
+      sysReadDirStore(tail) := allocUopVec(0).sysReadDir
+      sysDstArchStore(tail) := allocUopVec(0).dstArch
+      sysRcStore(tail)      := allocUopVec(0).imm(11 downto 0).asUInt
+      sysValRdyStore(tail)  := False
     }
     when(alloc1) {
       payload.write(tail + 1, payloadFrom(allocUopVec(1)))
@@ -390,6 +439,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       firstStore(tail + 1) := allocUopVec(1).firstOfInstr
       pcStore(tail + 1)    := allocUopVec(1).pc
       nzvcWrStore(tail + 1) := False; xWrStore(tail + 1) := False
+      sysOpStore(tail + 1)      := allocUopVec(1).sysOp
+      sysKindStore(tail + 1)    := allocUopVec(1).sysKind
+      sysReadDirStore(tail + 1) := allocUopVec(1).sysReadDir
+      sysDstArchStore(tail + 1) := allocUopVec(1).dstArch
+      sysRcStore(tail + 1)      := allocUopVec(1).imm(11 downto 0).asUInt
+      sysValRdyStore(tail + 1)  := False
     }
     when(allocFireSig) {
       tail := tail + Mux(allocSlot1Sig, U(2, robIdW bits), U(1, robIdW bits))
@@ -414,9 +469,20 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // vector + the FAULTING instruction's PC. The commit-side exception FSM consumes
     // this (squashes, stacks the frame, vectors). The faulted entry does NOT commit
     // (retire0 is gated `!p0.faulted`).
-    val exceptionPending = Bool();    exceptionPending := faultRetire;       exceptionPending.simPublic()
-    val exceptionVector  = UInt(8 bits);  exceptionVector := faultVecStore(h0); exceptionVector.simPublic()
-    val exceptionPc      = UInt(32 bits); exceptionPc     := faultPcStore(h0);  exceptionPc.simPublic()
+    // A commit-time PRIVILEGED SYSTEM op executed at S=0 (user) is a PRIVILEGE-VIOLATION
+    // fault (vector 8, format-$0). The S-bit is committed state, so the check is HERE at
+    // the serializing retire (not decode). `sysPrivFault` is forward-declared (the priv
+    // decision needs exc.ss.s, available after the exc unit is built below) and ORed into
+    // exceptionPending; the supervisor (S=1) case instead drives the system-op FSM.
+    // Forward-declared (default idle, OVERRIDDEN after exc.ss.s is available below).
+    val sysPrivFault = Bool(); sysPrivFault.allowOverride; sysPrivFault := False; sysPrivFault.simPublic()
+    val sysTriggerSig = Bool(); sysTriggerSig.allowOverride; sysTriggerSig := False; sysTriggerSig.simPublic()
+    val exceptionPending = Bool();    exceptionPending := faultRetire || sysPrivFault; exceptionPending.simPublic()
+    // Vector/PC: a privilege fault stacks vector 8 + the sysOp instruction's own PC
+    // (pcStore(h0), restartable — RTE re-runs the faulting op in supervisor... actually
+    // the handler decides; the 040 stacks the faulting instr PC for a privilege fault).
+    val exceptionVector  = UInt(8 bits);  exceptionVector := Mux(sysPrivFault, U(8, 8 bits), faultVecStore(h0)); exceptionVector.simPublic()
+    val exceptionPc      = UInt(32 bits); exceptionPc     := Mux(sysPrivFault, pcStore(h0), faultPcStore(h0));   exceptionPc.simPublic()
     // Access-fault (vector 2) extras for the format-$7 frame: the faulting VA + the
     // SSW access attrs {write, sizeBits, supervisor}. Meaningful only when the head's
     // vector is 2; the exception FSM selects the $7 path on the vector.
@@ -442,6 +508,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     when(retire1 && nzvcWrStore(h1)) { ccrAfter1(3 downto 0) := nzvcValStore(h1) }
     when(retire1 && xWrStore(h1))    { ccrAfter1(4)          := xValStore(h1) }
     committedCcr := ccrAfter1
+    // (MOVE-to-SR's absolute full-CCR write to committedCcr is applied AFTER the exc
+    // unit is built — see `exc.obsSetCcr5Valid` override below.)
 
     // CCR the exception stacks: committedCcr PLUS the FAULTING head's own flag effects
     // when it writes flags (CHK sets N even as it traps -> the stacked CCR's N must
@@ -471,8 +539,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // curVec (interruptVec), the stacked PC = the head INSTRUCTION's PC (interruptPc),
     // entryIsInterrupt selects the SR I-mask:=level update + format-$0 (not $7/$2).
     val excEntryTrigger = exceptionPending || interruptPending
-    val excEntryVector  = Mux(interruptPending, interruptVec, faultVecStore(h0))
-    val excEntryPc      = Mux(interruptPending, interruptPc,  faultPcStore(h0))
+    // exceptionVector/exceptionPc already fold in the sysPrivFault (vector 8 + the sysOp
+    // PC); a fault/trap uses them, an interrupt overrides with its own vector/PC.
+    val excEntryVector  = Mux(interruptPending, interruptVec, exceptionVector)
+    val excEntryPc      = Mux(interruptPending, interruptPc,  exceptionPc)
     val exc = new m68k040.exception.ExceptionUnit(
       ss = new m68k040.exception.SystemState,
       entryTrigger = excEntryTrigger, entryVector = excEntryVector, entryPc = excEntryPc,
@@ -488,9 +558,47 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       entryFaultSup  = faultSupStore(h0),
       entryFaultInstr= faultInstrStore(h0),
       entryIsInterrupt = interruptPending,
-      entryIplLevel    = interruptLevel)
+      entryIplLevel    = interruptLevel,
+      // ── Commit-time SYSTEM op (supervisor): drive the S_APPLY FSM ──────────────
+      // sysTriggerSig is forward-declared (the S=1 vs S=0 decision needs exc.ss.s,
+      // available only after exc is built) and driven below. The captured context comes
+      // straight from the head's per-entry sysOp stores + the captured value.
+      sysTrigger = sysTriggerSig,
+      sysKind    = sysKindStore(h0).asBits.asUInt.resize(2),
+      sysReadDir = sysReadDirStore(h0),
+      sysVal     = sysValStore(h0),
+      sysRc      = sysRcStore(h0),
+      sysDstPhys = p0.intNew,        // the read µop's rename-allocated pdst (FSM writes it)
+      sysPc      = pcStore(h0),
+      sysNextPc  = p0.predNextPc)
     excIdle := !exc.active
     val excActive = exc.active; excActive.simPublic()
+    // The commit-time system op's S=1 vs S=0 split (needs exc.ss.s): S=1 supervisor ->
+    // drive the S_APPLY FSM (sysTrigger); S=0 user -> a vector-8 privilege fault.
+    sysTriggerSig := sysRetire && exc.ss.s
+    sysPrivFault  := sysRetire && !exc.ss.s
+    // MOVE-to-SR writes the FULL CCR (sysVal[4:0]) as an absolute value: override the
+    // committed CCR when the system-op FSM applies it (so a LATER exception's stacked SR
+    // low byte is correct). The FSM surfaces obsSetCcr5 on S_REDIR; apply it last-wins
+    // (after the retire0/retire1 folds above — SpinalHDL last-`when` wins).
+    when(exc.obsSetCcr5Valid) { committedCcr := exc.obsSetCcr5 }
+
+    // ── Commit-time SYSTEM op READ: commit the dst arch->pdst mapping at the trigger ──
+    // A MOVE-USP/MOVEC Rc->Rn (read) does NOT go through retire0 (it is serializing),
+    // but its renamed dst MUST commit (arch->pdst into the committed RAT + free the old
+    // pdst) so a normal later reader of Rn sees the FSM-written value (PRF[pdst]). Driven
+    // at the trigger cycle (sysTriggerSig = sysRetire && S=1) for a read-direction head.
+    // Only the int-RAT/freelist commit (intWrite); no trace (the obs is the ExcRec).
+    // Last-wins over the default/retire0 (retire0 is gated off the sysOp head).
+    when(sysTriggerSig && sysReadDirStore(h0)) {
+      rc.commitPorts(0).valid     := True
+      rc.commitPorts(0).intArch   := p0.archRegId
+      rc.commitPorts(0).intNew    := p0.intNew
+      rc.commitPorts(0).intOld    := p0.intOld
+      rc.commitPorts(0).intWrite  := p0.intWrite
+      rc.commitPorts(0).nzvcWrite := False
+      rc.commitPorts(0).xWrite    := False
+    }
 
     // ── Drive interrupt recognition (needs the SR I-mask from exc.ss, built above) ─
     // iplIn > srSys[2:0] (mask) OR iplIn==7 (NMI), at a first-µop non-faulted/non-RTE
@@ -500,6 +608,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val iplActive = (iplIn > maskI) || (iplIn === U(7, 3 bits))
     interruptPending := (count > 0) && !flushing && excIdle &&
                         firstStore(h0) && !faultedStore(h0) && !isRteStore(h0) &&
+                        !sysOpStore(h0) &&
                         iplActive
     // Squash + serialize while the FSM runs (NOT on the trigger cycle, when the FSM
     // is still IDLE and the fault/RTE head must retire-trigger). On the trigger cycle
@@ -547,14 +656,21 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // True for an INTERRUPT-entry obs (channel 2 only). The lock-step harness drops
       // it (Musashi bundles the interrupt entry with the first handler instruction).
       val isInterrupt = Bool()
+      // MOVE-to-SR (commit-time system op): an ABSOLUTE 5-bit CCR write (X N Z V C). The
+      // whitebox SETS its running CCR to this value (vs the per-bit NZVC fold). Default
+      // invalid (every fault/RTE/interrupt obs leaves the running CCR via the fold path).
+      val setCcr5      = UInt(5 bits)
+      val setCcr5Valid = Bool()
     }
     val commitObs = Vec(CommitObs(), 3); commitObs.simPublic()
     commitObs(0).fire := RegNext(retire0) init False; commitObs(0).robId := RegNext(h0); commitObs(0).pc := RegNext(commitPc0)
     commitObs(0).sysByte := RegNext(exc.ss.srSys); commitObs(0).a7 := RegNext(exc.ss.a7); commitObs(0).isInterrupt := False
     commitObs(0).ccrFold := 0; commitObs(0).ccrFoldValid := False
+    commitObs(0).setCcr5 := 0; commitObs(0).setCcr5Valid := False
     commitObs(1).fire := RegNext(retire1) init False; commitObs(1).robId := RegNext(h1); commitObs(1).pc := RegNext(commitPc1)
     commitObs(1).sysByte := RegNext(exc.ss.srSys); commitObs(1).a7 := RegNext(exc.ss.a7); commitObs(1).isInterrupt := False
     commitObs(1).ccrFold := 0; commitObs(1).ccrFoldValid := False
+    commitObs(1).setCcr5 := 0; commitObs(1).setCcr5Valid := False
     // Exception / RTE commit (handler-entry or restored PC + post-event sysByte/A7).
     // For a FAULT entry where the faulting head wrote flags (CHK), carry its NZVC fold
     // so the whitebox folds it (the faulting µop's Wb never retires normally).
@@ -567,6 +683,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     commitObs(2).ccrFold      := RegNext(heldCcrFold)
     commitObs(2).ccrFoldValid := RegNext(exc.obsFire && exc.obsIsEntry && !exc.obsIsInterrupt && heldCcrFoldValid) init False
     commitObs(2).isInterrupt := RegNext(exc.obsIsInterrupt) init False
+    // MOVE-to-SR's absolute CCR write (registered alongside the obs pulse).
+    commitObs(2).setCcr5      := RegNext(exc.obsSetCcr5)
+    commitObs(2).setCcr5Valid := RegNext(exc.obsFire && exc.obsSetCcr5Valid) init False
   }
 
   override def trace     = logic.traceVec
