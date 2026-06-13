@@ -421,11 +421,58 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // real translation demand -> the DTLB may walk on a miss). `write` selects the store
     // M-bit / write-protect check. supervisor=False (user accesses this slice).
     val xlateVaddr = Mux(llReg.bDone, s1AddrB, s1Va)
-    xlate.req.valid      := s1Valid && (isLoad || isStore)
-    xlate.req.vpn        := xlateVaddr(31 downto 12)
-    xlate.req.supervisor := False
-    xlate.req.write      := isStore
-    xlateRobIdSig        := s1Ctx.robId
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // FMax #2: REGISTER the LS-EU -> DTLB translation-request INTERFACE.
+    //
+    // After FMax #1 the cache `loadCmd` tags on a registered address, but the DTLB
+    // request below is still combinational off the LIVE access (s1Valid/xlateVaddr
+    // via eaDelta) — under MMU-on it fed the DTLB `tlb.io.lookupVpn := _req.vpn` cone
+    // LIVE, so the route-dominated arc `Dcache valids/ldS1Set -> LsEu -> _req.vpn/
+    // _req.valid -> DTLB hitVec -> hr*/missReqReg/CE -> s2Paddr -> tagMem` STILL landed
+    // the AGU/eaDelta source on the cache tag access (the post-FMax#1 worst path:
+    // s1Ctx_uop_eaDelta -> tagMem via the DTLB cone). REGISTER the request {valid,vpn,
+    // write,super,robId} into `reqReg` flops here and drive the DTLB `req` from THOSE
+    // flops, so the DTLB hitVec/hr*/missReqReg cone STARTS at a register inside the
+    // DTLB pblock instead of fanning combinationally out of the LS-EU.
+    //
+    // Latency: the request is held STABLE while the EU is busy (s1* held; xlateVaddr
+    // tracks the held s1Va / s1AddrB in the cross slot-B state), so the registered req
+    // settles to the live access within one cycle and stays put until completion. The
+    // FSM only consumes a translation result once the registered req MATCHES the access
+    // it is resolving (`reqMatch`), exactly mirroring the single-outstanding DTLB-miss
+    // stall (rsp.ready low -> hold S1, retry). +1 translate cycle is latency-agnostic.
+    //
+    // `reqDrv*` are combinational nets written by the base drive (here) and, last-wins,
+    // by the exception-unit arbitration override at the END of `logic`. The single
+    // register stage (`reqReg`) + the final `xlate.req`/`xlateRobIdSig` drive are
+    // emitted AFTER both writers so the registered interface reflects the resolved req.
+    val reqDrvValid = Bool()
+    val reqDrvVpn   = UInt(20 bits)
+    val reqDrvSup   = Bool()
+    val reqDrvWrite = Bool()
+    val reqDrvRobId = UInt(6 bits)
+    reqDrvValid := s1Valid && (isLoad || isStore)
+    reqDrvVpn   := xlateVaddr(31 downto 12)   // FMax #1's live access VPN (NOT the llReg cmd)
+    reqDrvSup   := False
+    reqDrvWrite := isStore
+    reqDrvRobId := s1Ctx.robId
+
+    val reqReg = new Area {
+      val valid = RegInit(False)
+      val vpn   = Reg(UInt(20 bits))
+      val sup   = Reg(Bool())
+      val write = Reg(Bool())
+      val robId = Reg(UInt(6 bits))
+    }
+    // `reqMatch`: the REGISTERED req corresponds to the access the FSM is currently
+    // presenting (held s1 access via xlateVaddr / isStore). Gates the IDLE consume so a
+    // STALE rsp (the registered req still holding a previous access's vpn for one cycle
+    // after S1 advances) is never mistaken for THIS access's translation. Under identity
+    // (MMU-off) rsp.ready is always True, but reqMatch still requires the flop to have
+    // captured this vpn -> identical +1-cycle alignment in both MMU modes.
+    val reqMatch = reqReg.valid && (reqReg.vpn === xlateVaddr(31 downto 12)) &&
+                   (reqReg.write === isStore)
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax: registered COMPLETION + WRITEBACK stage.
@@ -742,7 +789,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
             // reads the pre-update busy and would clear s1Valid this cycle), so
             // re-assert s1Valid explicitly (later write wins).
             busy := True
-            when(xlateReady) {
+            // Only consume the translation once the REGISTERED req matches THIS access
+            // (`reqMatch`, FMax #2): on the first IDLE cycle for a new access the
+            // registered req still holds the previous vpn, so its rsp is stale. reqMatch
+            // asserts the next cycle (the req settled to this held access); until then
+            // hold S1 (the explicit re-assert below), exactly like the DTLB-miss stall.
+            when(xlateReady && reqMatch) {
               when(xlateFault) {
                 // MMU access fault: the translation RESOLVED with a fault (non-
                 // resident / write-protect / supervisor). The access does NOT
@@ -969,12 +1021,37 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       dcache.store.valid          := True
       dcache.store.payload        := excStorePayload
     }
+    // Exc override of the (combinational) translation-request DRIVE — last-wins over
+    // the base drive above. This feeds the SAME `reqDrv*` nets that get registered into
+    // `reqReg` and drive `xlate.req` below, so the exc request is registered on the
+    // identical 1-cycle boundary (FMax #2). The exc sequencer is a supervisor PHYSICAL
+    // access and does NOT gate on dtRsp.ready (see ExceptionUnit), so the +1 register
+    // latency only delays the (suppress-spurious-walk) request presentation — no
+    // behavior change. Its own dtReq is already a RegNext upstream.
     when(excActive && excXlateValid) {
-      xlate.req.valid      := True
-      xlate.req.vpn        := excXlateVpn
-      xlate.req.write      := excXlateWrite
-      xlate.req.supervisor := excXlateSupervisor
+      reqDrvValid := True
+      reqDrvVpn   := excXlateVpn
+      reqDrvWrite := excXlateWrite
+      reqDrvSup   := excXlateSupervisor
+      // robId is meaningless for the exc (no speculative U/M tagging on the
+      // serializing commit-side access); keep the base value.
     }
+
+    // ── Single registered stage for the DTLB request interface (sever the cross-module
+    // hitVec/hr*/missReqReg cone — see the reqReg rationale above). Driven from the
+    // resolved `reqDrv*` (base or exc override). Emitted as the LAST drivers of
+    // `xlate.req` so it is the sole writer.
+    reqReg.valid := reqDrvValid
+    reqReg.vpn   := reqDrvVpn
+    reqReg.sup   := reqDrvSup
+    reqReg.write := reqDrvWrite
+    reqReg.robId := reqDrvRobId
+    xlate.req.valid      := reqReg.valid
+    xlate.req.vpn        := reqReg.vpn
+    xlate.req.supervisor := reqReg.sup
+    xlate.req.write      := reqReg.write
+    xlateRobIdSig        := reqReg.robId
+
     excLoadCmdReady := dcache.loadCmd.ready
   }
 }
