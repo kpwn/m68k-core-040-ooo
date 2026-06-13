@@ -137,6 +137,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // (the `quiesce` output gates the front-end). An interrupt recognized at the right
     // level CLEARS it (the IRQ entry resumes execution at the handler).
     val stopped = RegInit(False); stopped.simPublic()
+    // The PC to RESUME at when an IRQ wakes the halted core (= STOP's nextPc, latched at the
+    // STOP retire). While stopped the ROB is empty (count==0), so pcStore(h0) is stale — the
+    // interrupt entry must stack THIS PC as the return address (else RTE resumes at garbage).
+    val stoppedPc = Reg(UInt(32 bits)) init 0; stoppedPc.simPublic()
     // MMU access-fault per-entry capture (set at COMPLETION from the LS EU's
     // faultCompletion, NOT at alloc — an MMU fault is discovered at execute). On a
     // faulting LS access the LS EU marks the entry faulted vector 2 + the faulting VA
@@ -287,7 +291,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val interruptVec = UInt(8 bits)
     interruptVec := Mux(iackAvec, (U(24, 8 bits) + iplIn).resized, iackVector)
     interruptVec.simPublic()
-    val interruptPc = UInt(32 bits); interruptPc := pcStore(h0); interruptPc.simPublic()
+    // While stopped (ROB empty), stack the latched STOP-successor PC (the resume point);
+    // otherwise the preempted head instruction's PC. (`stopped`/`stoppedPc` are Regs above.)
+    val interruptPc = UInt(32 bits); interruptPc := Mux(stopped, stoppedPc, pcStore(h0)); interruptPc.simPublic()
 
     // A normal retire is also blocked while an interrupt is pending (the head does
     // not commit — like the faulted-head case).
@@ -646,7 +652,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // STOP halts the core after its serializing retire (supervisor only; S=0 -> vector-8
     // via sysPrivFault). The interrupt entry RESUMES it: clear `stopped` when an interrupt
     // is recognized. (sysTriggerSig / interruptPending are both built above.)
-    when(sysTriggerSig && (sysKindStore(h0) === m68k040.decode.SysKind.STOP)) { stopped := True }
+    when(sysTriggerSig && (sysKindStore(h0) === m68k040.decode.SysKind.STOP)) {
+      stopped   := True
+      stoppedPc := p0.predNextPc      // STOP's nextPc = the resume point (IRQ stacks this)
+    }
     when(interruptPending) { stopped := False }
     // Squash + serialize while the FSM runs (NOT on the trigger cycle, when the FSM
     // is still IDLE and the fault/RTE head must retire-trigger). On the trigger cycle
