@@ -1,6 +1,6 @@
 # 68040 MSP/ISP three-stack banking + live M-bit (Slice A) — Design
 
-**Status:** Draft — user-approved shape (split: banking slice first; airtight lock-step via extended OracleStep).
+**Status:** Draft — user-approved shape (split: banking slice first; airtight lock-step via extended OracleStep; **live-coherent banks** chosen for MOVE-to-SR bank preservation — see §4.1, decided during planning).
 **Date:** 2026-06-14
 **Parent:** the exception subsystem ([[exception-subsystem]]). One of the "Other fast-follows (deferred)" — MSP/ISP split.
 **Scope note:** This is **Slice A** of the M-bit feature. **Slice B** (the interrupt-with-M=1 throwaway frame, format $1, + the RTE-from-$1 re-RTE loop) is explicitly OUT and deferred to its own brainstorm→spec→plan.
@@ -33,6 +33,7 @@ The implication: the RTL change is **localized** — extend every S-only bank se
 **In (Slice A):**
 - A third committed stack-pointer bank (MSP) in `SystemState`; the existing `ssp` is **renamed `isp`** (it is the ISP — the M=0 supervisor bank used at reset).
 - A live M-bit: A7 banks by (S,M); M settable by MOVE-to-SR (privileged), restored by RTE, preserved across fault/trap entry.
+- **Live-coherent banks (§4.1):** a commit-time path that makes `ss.usp/isp/msp` continuously mirror the live committed A7 of the active bank, so a MOVE-to-SR (S,M) switch always loads a correctly-preserved bank and the exception FSM reads a live SP. (This also retires the pre-existing snapshot-staleness simplification.)
 - Fault/trap exception entry stacks the frame on the **current** supervisor bank `Mux(m, msp, isp)`; RTE pops it and re-banks A7 by the **restored** (S,M).
 - Interrupt entry **only for the M=0 case** — frame on ISP, no throwaway (this is the existing behavior, now expressed through the (S,M) bank selection; verified unchanged).
 - Airtight lock-step: extend the oracle trace + `OracleStep` + the DUT whitebox to carry MSP and ISP, compared **every step** (both active and inactive banks).
@@ -56,7 +57,21 @@ val a7      = Mux(s, supBank, usp)        // full three-way bank
 
 and a **single write-routing rule** for the FSM's SP-set and for `writeA7`: route the value to `usp` / `isp` / `msp` by committed `(s, m)`. This keeps the change DRY and makes "which bank" decided in exactly one place.
 
-The committed banks stay coherent with the renamed int-reg-15 by the *existing* mechanism (the FSM writes the re-banked A7 into arch-15 on every serializing change; normal A7-modifying instructions sync the committed bank via `writeA7`). Slice A only widens the bank index of that mechanism from S to (S,M) — it does not invent new coherence machinery.
+### 4.1 Live-coherent banks (the chosen MOVE-to-SR preservation model)
+
+**Discovered during planning:** the committed `ss.*` banks are NOT live mirrors of the architectural A7. The architectural A7 truth lives in the renamed int PRF (arch-reg-15); `ss.usp/ssp` are *snapshots* the exception FSM refreshes only at entry/RTE (`RobPlugin.scala:714` feeds `commitObs.a7 := RegNext(exc.ss.a7)`, and the lock-step whitebox only resyncs to it on change, otherwise trusting live renamed writeback). `writeA7` exists as a port but is **never pulsed** — it idles (`ExceptionUnit.scala:216`). So a MOVE-to-SR that switches (S,M) and loads the target bank would load a STALE snapshot for a bank that was modified-while-active-then-deselected.
+
+**Chosen fix — make `ss.*` live-coherent:** drive `ss.writeA7` **every cycle** with the live committed A7 value, routed to the bank selected by committed (S,M). Mechanism (mapped from rename/regfile/top):
+1. A new **committed-RAT read** of arch-15 exposes `commReg(15)` (the committed phys mapping for A7) — `rename/RatTable.scala` (currently `commReg` is internal; add a committed-only read or hardwire a read port to addr 15 and select the committed side).
+2. A new **int-PRF read port** (`execute/regfile`, `IntRegFileService.newRead`) reads `PRF[commReg(15)]` = the committed A7 value.
+3. The top wiring (`top/FullCoreSynth.scala` `BackendWiringPlugin`, near the existing `excA7` write port at `:205-213`) feeds that value into a new ExceptionUnit input `committedA7In`.
+4. `SystemState`/`ExceptionUnit` drive `ss.writeA7.valid := True; ss.writeA7.payload := committedA7In` every cycle; the routing `when(s){when(m){msp}else{isp}}else{usp}` keeps the ACTIVE bank == live committed A7 and leaves the inactive banks preserved. The FSM's `setIsp`/`setMsp`/`setUsp` (entry/RTE/MOVE-USP) are listed AFTER `writeA7` in `SystemState`, so they win on their serializing cycle (later-`when`-wins).
+
+**Consequences:**
+- A (S,M) switch loads a correctly-preserved bank (the deselected bank kept its last live value); MOVE-to-SR M-toggling is fully correct.
+- The exception FSM reads a LIVE `ss.supBank` at entry — fixing the latent staleness.
+- **Timing:** the readback has PRF read latency; the FSM must compute `frameBase` from a SETTLED `ss.supBank` (the committed A7 is final once the faulting head retires and younger ops are squashed; the FSM's `E_DRAIN` SQ-wait gives settle time, but `frameBase` capture must occur AFTER the readback settles — capture it on the `E_DRAIN`→`E_STORE` edge rather than the `IDLE`→entry edge, or add a one-cycle settle). The implementer verifies via the exception lock-step regression (no frame-address divergence).
+- Because the banks are now live, the airtight lock-step samples the committed `ss.msp/isp` regs DIRECTLY (no whitebox reconstruction needed — see §5.3 revised).
 
 ## 5. Component changes
 
@@ -73,6 +88,14 @@ The committed banks stay coherent with the renamed int-reg-15 by the *existing* 
 - **RTE SP restore + A7 re-bank** (`:529,539`): write the popped `newSsp` back to the bank that was active during the exception (`ss.m` is unchanged for fault/trap, so route by current `ss.m`); change the A7 re-bank to `obsA7 := Mux(popSr(13), Mux(popSr(12), ss.msp, ss.isp), ss.usp)` (restored S=bit13, restored M=bit12). Note the popped `newSsp` must reach `obsA7` for the active case — preserve the existing data path, just widen the bank mux.
 - **MOVE-to-SR / STOP / S_REDIR** (`:554,591,608`): no new code — `ss.a7` is now (S,M)-aware, so the existing `obsA7 := ss.a7` re-bank in S_REDIR handles an M-flip automatically.
 - **Interrupt entry**: the frame base + SP write now read the current supervisor bank, which is ISP when M=0 — identical to today's single-supervisor behavior. **Guard:** Slice A does not implement the M=1 interrupt path; no code asserts M=1+interrupt, and existing interrupt tests run M=0.
+
+### 5.4 Live-coherent commit-sync (§4.1) — `rename` / `execute/regfile` / `top` / `ExceptionUnit`
+- `rename/RatTable.scala`: expose the committed mapping of arch-15 (`commReg(15)`) — either add a committed-only read accessor or hardwire a read port to addr 15 and take the committed side.
+- `execute/regfile` (`IntRegFileService`): allocate ONE new read port (`newRead`) addressed by `commReg(15)`.
+- `top/FullCoreSynth.scala` (`BackendWiringPlugin`, near `:205-213`): wire the PRF read data into a new `ExceptionUnit` input `committedA7In : UInt(32 bits)`.
+- `ExceptionUnit.scala`: drive `ss.writeA7.valid := True; ss.writeA7.payload := committedA7In` every cycle (replacing the idle default at `:216`); compute entry `frameBase` from a settled `ss.supBank` (capture on the `E_DRAIN`→`E_STORE` edge, not `IDLE`→entry — see §4.1 timing).
+- `SystemState.scala`: `writeA7` routes by (S,M) (already in §5.1); FSM `setIsp`/`setMsp`/`setUsp` retain priority (later-`when`-wins).
+- **Standalone-DUT note:** the new `committedA7In` input must have an idle default / be drivable so the existing `SystemState`/exception unit tests (which instantiate pieces standalone) keep compiling.
 
 ### 5.3 Lock-step harness (airtight inactive-bank compare)
 - **`tools/musashi/musashi_run.cpp`** (per-step trace `:209-223`): append `msp=0x%08x isp=0x%08x` to the format string, supplying `ref.get_reg(MusashiRef::REG_MSP)` and `REG_ISP`. (REG enums already exist; confirm `REG_MSP` is mapped in `m68k_ref.cpp` alongside `REG_ISP` at `:269` — add the `case REG_MSP: mr = M68K_REG_MSP; break;` if absent.) Rebuild the oracle binary.
@@ -106,7 +129,7 @@ A new directed program (and additions to `ExecuteLockStepSpec`) that:
 - Pre-existing ITLB-flake caveat: repro on baseline before attributing any flake to this slice.
 
 ### 7.3 Synth gate
-- Honest post-route (`synth/impl_FullCore.tcl`), ≥200 MHz gate (per [[frontend-fmax-250-campaign]] the gate is ≥200; baseline ~247). Expect **neutral**: this adds one 32-bit register (MSP) and widens an S-mux to a 3:1 (S,M) mux on the **serializing** commit-side path (not a hot datapath). Report WNS/FMax vs the master baseline.
+- Honest post-route (`synth/impl_FullCore.tcl`), ≥200 MHz gate (per [[frontend-fmax-250-campaign]] the gate is ≥200; baseline ~247). **Not neutral** (revised): the live-coherent path (§4.1) adds one int-PRF read port + one committed-RAT read of arch-15 + the MSP register + a (S,M) write-mux — the new PRF/RAT read ports touch the hot rename/regfile cone and may perturb the ~247 placement equilibrium. The gate is ≥200 (ample margin), but report WNS/FMax vs the master baseline honestly; if it regresses below ~230, note the limiter (likely the added int-PRF read port) — do NOT merge below 200, and do NOT const-fold/relax anything to recover.
 
 ## 8. Open items / Slice B handoff
 - **Slice B (deferred):** interrupt-with-M=1 throwaway frame (format $1) + RTE-from-$1 re-RTE loop. The (S,M) banking + the OracleStep MSP/ISP compare built here are its prerequisites. Reference: `m68kcpu.h:2228-2236` (entry double-frame), and Musashi's RTE format-$1 handling (to be located in Slice B).
