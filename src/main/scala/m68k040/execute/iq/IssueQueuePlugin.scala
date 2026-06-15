@@ -195,7 +195,11 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // ADDRESS DISPLACEMENT and srcB is the STORE DATA register — both are live, so
     // useImm must NOT suppress the srcB (data) dependency. Conflating the two would
     // let a store issue before its data producer retired (reading a stale PRF).
-    def srcBIsReg(u: RenamedUop): Bool = u.psrcBValid && (!u.useImm || isLs(u))
+    // PACK/UNPK are a second exception: they set useImm=True (adj16 as imm) but ALSO
+    // have psrcB = Dy (a real register read). The EU reads rdB.data (s1RdB) directly,
+    // bypassing the useImm mux, so psrcB IS a live data dependency.
+    def isPackUnpk(u: RenamedUop): Bool = (u.op === m68k040.decode.DecOp.PACK) || (u.op === m68k040.decode.DecOp.UNPK)
+    def srcBIsReg(u: RenamedUop): Bool = u.psrcBValid && (!u.useImm || isLs(u) || isPackUnpk(u))
 
     // ---- Occupancy / back-pressure ----
     // Back-pressure is gated on LINE 0 BEING EMPTY, not on a count proxy.

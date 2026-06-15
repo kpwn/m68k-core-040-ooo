@@ -3981,4 +3981,106 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #1,%d5 ; trapeq ; moveq #7,%d3 ; loop: bra loop",
       nInstr = 4)
   }
+
+  // ── PACK Dy,Dx,#adj (register form, no CCR effect) ──────────────────────────
+  // PACK: src=(Dy+adj)&0xffff; Dx[7:0] := (src[11:8] ## src[3:0]) = ((src>>4)&0xF0)|(src&0x0F);
+  // Dx[31:8] preserved; NO CCR change. Musashi transcription (m68k_op_pack_16_rr).
+  //
+  // KEY correctness check: the INITIAL CCR is set by a preceding ADDQ before the PACK;
+  // the CCR after PACK must MATCH the pre-PACK CCR exactly (no spurious flag write).
+  // The initial Dx value has sentinel upper bytes to catch any clobber of Dx[31:8].
+  // ─────────────────────────────────────────────────────────────────────────────
+  test("lock-step: PACK adj=0 (nibble extraction, zero adj)", VerilatorTest) {
+    runLockStep("pack-adj0", Seq(
+      // PACK packs src bits [11:8]##[3:0] into a byte (the two unpacked-BCD digit nibbles).
+      // Dy=D1=0x0000_0034 -> src=0x0034 -> result byte = src[11:8]##src[3:0] = 0x0##0x4 = 0x04; adj=0
+      // Set Dx=D0 upper bytes to 0xDEAD_DEAD to verify preservation.
+      "move.l #0xdeaddead,%d0", "move.l #0x00000034,%d1", "pack %d1,%d0,#0",
+      // Dy=D3=0x0000_0012 -> src=0x0012 -> result = 0x0##0x2 = 0x02; adj=0
+      "move.l #0xbeefcafe,%d2", "move.l #0x00000012,%d3", "pack %d3,%d2,#0",
+      // Dy=D5=0x0000_0089 -> src=0x0089 -> result = 0x0##0x9 = 0x09; adj=0 (only [11:8],[3:0] survive)
+      "move.l #0x12345678,%d4", "move.l #0x00000089,%d5", "pack %d5,%d4,#0"
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: PACK adj!=0 (non-zero adjustment + nibble extract)", VerilatorTest) {
+    runLockStep("pack-adj", Seq(
+      // Dy=0x0031, adj=0x0001 -> src=0x0032 -> result = src[11:8]##src[3:0] = 0x0##0x2 = 0x02
+      "move.l #0xdeaddead,%d0", "move.l #0x00000031,%d1", "pack %d1,%d0,#1",
+      // Dy=0x0000, adj=0x0039 -> src=0x0039 -> result = 0x0##0x9 = 0x09
+      "move.l #0xaabbccdd,%d6", "move.l #0x00000000,%d7", "pack %d7,%d6,#0x39",
+      // Dy=0x00AB, adj=0x0055 -> src=0x0100 -> result = (0x10>>4)&0xF0 | 0x10&0x0F
+      //   = (0x01<<4) | 0x00 = 0x10
+      "move.l #0x11223344,%d2", "move.l #0x000000ab,%d3", "pack %d3,%d2,#0x55"
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: PACK Dx upper 24 bits preserved (.B merge check)", VerilatorTest) {
+    runLockStep("pack-upper", Seq(
+      // Sentinel upper bytes in ALL 3 variants; result byte must go to low 8 only.
+      "move.l #0xcafebabe,%d0", "move.l #0x000000ff,%d1", "pack %d1,%d0,#0",
+      // 0xff + adj 0 -> src=0x00ff -> result = (0x0f<<4)|(0x0f) = 0xff; Dx[31:8]=0xcafeba preserved
+      "move.l #0x12345678,%d4", "move.l #0xffffffff,%d5", "pack %d5,%d4,#0",
+      // Dy high word stripped: only Dy+adj is used; src & 0xffff matters
+      "move.l #0xaabbccdd,%d2", "move.l #0x00000000,%d3", "pack %d3,%d2,#0"
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: PACK CCR unchanged after PACK", VerilatorTest) {
+    runLockStep("pack-ccr", Seq(
+      // Set a known CCR: N=1,Z=0,V=1,C=0 via overflow; then PACK must not change it.
+      "move.l #0x7fffffff,%d6", "add.l %d6,%d6",            // signed overflow -> N=1,V=1
+      "move.l #0xdeaddead,%d0", "move.l #0x00000012,%d1", "pack %d1,%d0,#0",
+      // CCR should still be N=1,V=1 from the add after the pack
+      "move.l #0x7fffffff,%d6", "add.l %d6,%d6",            // re-seed CCR: N=1,V=1
+      "move.l #0xbeefbeef,%d2", "move.l #0x00000034,%d3", "pack %d3,%d2,#1"
+    ).mkString(" ; "))
+  }
+
+  // ── UNPK Dy,Dx,#adj (register form, no CCR effect) ───────────────────────────
+  // UNPK: src=Dy&0xffff; Dx[15:0] := ((src[7:4]##0000##src[3:0]) + adj) & 0xffff;
+  // Dx[31:16] preserved; NO CCR change. Musashi transcription (m68k_op_unpk_16_rr).
+  // ─────────────────────────────────────────────────────────────────────────────
+  test("lock-step: UNPK adj=0 (nibble expand, zero adj)", VerilatorTest) {
+    runLockStep("unpk-adj0", Seq(
+      // Dy=0x00000034 -> src=0x0034 -> expand = (3<<8)|(4) = 0x0304; adj=0 -> result=0x0304
+      "move.l #0xdead0000,%d0", "move.l #0x00000034,%d1", "unpk %d1,%d0,#0",
+      // Dy=0x00000012 -> expand = 0x0102; adj=0
+      "move.l #0xbeef0000,%d2", "move.l #0x00000012,%d3", "unpk %d3,%d2,#0",
+      // Dy=0x00000099 -> expand = (9<<8)|9 = 0x0909; adj=0
+      "move.l #0x12340000,%d4", "move.l #0x00000099,%d5", "unpk %d5,%d4,#0"
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: UNPK adj!=0 (non-zero adjustment)", VerilatorTest) {
+    runLockStep("unpk-adj", Seq(
+      // Dy=0x12 -> expand=0x0102; adj=0x30 -> result = 0x0132 (ASCII '1','2' from BCD)
+      "move.l #0xdead0000,%d0", "move.l #0x00000012,%d1", "unpk %d1,%d0,#0x30",
+      // Dy=0x89 -> expand=0x0809; adj=0x3030 -> result=(0x0809+0x3030)&0xffff=0x3839 ('8','9')
+      "move.l #0xbeef0000,%d6", "move.l #0x00000089,%d7", "unpk %d7,%d6,#0x3030",
+      // Dy=0x00 -> expand=0; adj=0x3030 -> result=0x3030 ('0','0')
+      "move.l #0x56780000,%d2", "move.l #0x00000000,%d3", "unpk %d3,%d2,#0x3030"
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: UNPK Dx upper 16 bits preserved (.W merge check)", VerilatorTest) {
+    runLockStep("unpk-upper", Seq(
+      // Sentinel upper 16 in Dx; only Dx[15:0] changes. Dx[31:16] = 0xDEAD preserved.
+      "move.l #0xdead1234,%d0", "move.l #0x00000012,%d1", "unpk %d1,%d0,#0",
+      // Dx[31:16] = 0xBEEF must survive
+      "move.l #0xbeef5678,%d4", "move.l #0x00000099,%d5", "unpk %d5,%d4,#0",
+      // Large Dx upper and zero Dy
+      "move.l #0xcafe9abc,%d2", "move.l #0x00000000,%d3", "unpk %d3,%d2,#0"
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: UNPK CCR unchanged after UNPK", VerilatorTest) {
+    runLockStep("unpk-ccr", Seq(
+      // Set CCR via overflow; UNPK must not modify it.
+      "move.l #0x7fffffff,%d6", "add.l %d6,%d6",            // N=1,V=1
+      "move.l #0xdead0000,%d0", "move.l #0x00000034,%d1", "unpk %d1,%d0,#0",
+      "move.l #0x7fffffff,%d6", "add.l %d6,%d6",            // re-seed
+      "move.l #0xbeef0000,%d2", "move.l #0x00000012,%d3", "unpk %d3,%d2,#0x30"
+    ).mkString(" ; "))
+  }
 }

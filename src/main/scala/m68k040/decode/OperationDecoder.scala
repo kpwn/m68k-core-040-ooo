@@ -443,6 +443,14 @@ object OperationDecoder {
                     (opword(7 downto 3) === B"5'b01000" ||
                      opword(7 downto 3) === B"5'b01001" ||
                      opword(7 downto 3) === B"5'b10001")
+        // ── PACK/UNPK register forms (line 8 ONLY): 1000 xxx 1 0100/1000 0 yyy + adj16 ──
+        // PACK Dy,Dx,#adj: opmode 5 (bits7:5=`101`), UNPK Dy,Dx,#adj: opmode 6 (bits7:5=`110`).
+        // op[5:3]=`000` selects the register form (R=op[3]=0); the memory form (op[5:3]=`001`)
+        // is DEFERRED (stays illegal). Line 8 only — opmode 5/6 on line C is OR.W/OR.L.
+        // Dx = op[11:9] (dst, .B merge source for PACK / .W for UNPK), Dy = op[2:0] (src).
+        // adj16 is pkt.words(1), carried in `imm` (useImm=True). NO CCR effect.
+        val isPackReg = (line === 0x8) && (opmode === 5) && (opword(5 downto 3) === B"3'b000")
+        val isUnpkReg = (line === 0x8) && (opmode === 6) && (opword(5 downto 3) === B"3'b000")
         // ABCD (line C) / SBCD (line 8), REGISTER form: 1xx0 xxx 1 0000 0 yyy.
         //   bit8=1 + bits7:6=00 = opmode 4 (the AND/OR-RMW band); bits 5:4=00 + bit3=0
         //   ("00000") select the DATA-register form. xxx(11:9)=Dx (dst + a source),
@@ -464,7 +472,23 @@ object OperationDecoder {
         // ── ADDX/SUBX MEMORY form -(Ay),-(Ax): line 9/D, opmode 4/5/6, EA mode 001 ──
         // Same µcode sequence; op=ADDX/SUBX + size (.B/.W/.L) carry the kind.
         val isAddxSubxMem = isRmw && (line === 0x9 || line === 0xD) && (eaMode === B"001")
-        when(isBcdMem) {
+        when(isPackReg) {
+          o.illegal := False
+          o.op      := DecOp.PACK
+          o.size    := Size.BYTE          // .B merge: only Dx[7:0] written; Dx[31:8] preserved
+          o.srcA    := dnField            // Dx (bits 11:9): .B merge source (the old Dx value)
+          o.srcB    := easrc              // EA 000yyy -> DATAREG Dy (the source)
+          o.dst     := dnField; o.dstWrites := True
+          // adj16 in imm (pkt.words(1)) routed at assemble time; no CCR reads or writes
+        } .elsewhen(isUnpkReg) {
+          o.illegal := False
+          o.op      := DecOp.UNPK
+          o.size    := Size.WORD          // .W merge: only Dx[15:0] written; Dx[31:16] preserved
+          o.srcA    := dnField            // Dx (bits 11:9): .W merge source (the old Dx value)
+          o.srcB    := easrc              // EA 000yyy -> DATAREG Dy (the source)
+          o.dst     := dnField; o.dstWrites := True
+          // adj16 in imm (pkt.words(1)) routed at assemble time; no CCR reads or writes
+        } .elsewhen(isBcdMem) {
           o.illegal := False
           o.microcoded := True
           o.ucEntry := U(Microcode.BCD_MEM_ENTRY, 4 bits)

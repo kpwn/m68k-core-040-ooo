@@ -124,6 +124,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val s1Ctx   = RegNext(issuePort.payload)   // IqContext (uop + robId)
     val s1Src1  = RegNext(src1)
     val s1Src2  = RegNext(src2)
+    // Raw rdB.data (bypassing the useImm mux): used by PACK/UNPK so they can have both
+    // srcA=Dx (old, merge source) AND srcB=Dy (source data) in s1RdB, while imm=adj16
+    // rides s1Src2. All other ops that set useImm=False read s1Src2 == rdB.data anyway.
+    val s1RdB   = RegNext(rdB.data)
     val s1Nzvc  = RegNext(nzvcRd.data)         // {N(3),Z(2),V(1),C(0)} (toCcr)
     val s1X     = RegNext(xRd.data(0))         // X (toCcr)
     val u1 = s1Ctx.uop
@@ -228,6 +232,37 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val bcdZ     = s1Nzvc(2) && (bcdRes8 === 0)              // Z := Z_old && res8==0
     val bcdNzvc  = bcdN ## bcdZ ## bcdV ## bcdCarry          // {N,Z,V,C}
 
+    // ── PACK/UNPK datapath (register forms, no CCR effect) ──────────────────────
+    // s1Src1 = Dx (old value, used as merge source for upper-bit preservation via sizeMerged).
+    // s1RdB  = Dy (raw rdB.data, the source register — bypasses the useImm mux).
+    // s1Src2 = adj16 (the 16-bit adjustment, sign-extended, from imm since useImm=True).
+    //
+    // PACK Dy,Dx,#adj: src=(Dy+adj)&0xffff; Dx[7:0] := ((src>>4)&0xF0) | (src&0x0F);
+    //   Dx[31:8] preserved (.B merge uses s1Src1=Dx).
+    // UNPK Dy,Dx,#adj: src=Dy&0xffff; Dx[15:0] := (((src<<4)&0x0F00)|(src&0x000F)+adj)&0xffff;
+    //   Dx[31:16] preserved (.W merge uses s1Src1=Dx).
+    // Both transcribed verbatim from Musashi m68k_op_pack_16_rr / m68k_op_unpk_16_rr.
+    val isPack = u1.op === DecOp.PACK
+    val isUnpk = u1.op === DecOp.UNPK
+    // PACK: src = (Dy + adj) & 0xffff (Dy from s1RdB, adj from s1Src2)
+    val packDy      = s1RdB.asUInt                                          // Dy (32-bit)
+    val packAdj     = s1Src2.asUInt                                         // adj16 (sign-extended 32-bit)
+    val packSrc32   = (packDy + packAdj) & U(0xFFFF, 32 bits)              // (Dy+adj) & 0xffff
+    val packNibHi   = (packSrc32 >> 4)(7 downto 0) & U(0xF0, 8 bits)      // (src>>4) & 0xF0, 8-bit masked
+    val packNibLo   = packSrc32(3 downto 0).resize(8) & U(0x0F, 8 bits)   // src & 0x0F, 4->8
+    val packByte    = (packNibHi | packNibLo).resize(8).asBits             // 8-bit result
+    val packRes8    = B(0, 24 bits) ## packByte                            // 32-bit, result in [7:0]
+    // UNPK: src = Dy & 0xffff; expand = (src<<4)&0x0F00 | src&0x000F; result = (expand+adj)&0xffff
+    val unpkDy      = s1RdB.asUInt                                          // Dy (32-bit)
+    val unpkAdj     = s1Src2.asUInt                                         // adj16 (32-bit)
+    val unpkSrc16   = unpkDy & U(0xFFFF, 32 bits)                          // Dy & 0xffff
+    val unpkShifted = ((unpkSrc16 << 4) & U(0x0F00, 36 bits)).resize(32)  // (src<<4)&0x0F00, back to 32
+    val unpkHi      = unpkShifted & U(0x0F00, 32 bits)                    // high nibble -> upper byte
+    val unpkLo      = unpkSrc16 & U(0x000F, 32 bits)                      // low nibble
+    val unpkExpand  = unpkHi | unpkLo                                       // expanded BCD
+    val unpkRes16   = (unpkExpand + unpkAdj) & U(0xFFFF, 32 bits)         // + adj, mask 16-bit
+    val unpkRes32   = unpkRes16.resize(32).asBits                          // 32-bit, result in [15:0]
+
     // ---- S1: size-merge of the FAST int writeback (68k partial-register semantics) ----
     // A .B / .W op updates ONLY the low byte / word of the destination register; the
     // upper bits are PRESERVED. For ADD/SUB/AND/OR/EOR the destination operand is srcA
@@ -238,7 +273,13 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // (and any .L op) takes the full result. The fast path no longer muxes the shifter
     // result (a SHIFT is slow), so opResult is the ALU datapath result directly.
     // BCD overrides the datapath result low byte (BYTE size -> the merge preserves Dx[31:8]).
-    val opResult = Mux(isBcd, B(0, 24 bits) ## bcdRes8, rsp.result)
+    // PACK overrides result byte (BYTE size -> .B merge preserves Dx[31:8]).
+    // UNPK overrides result low word (WORD size -> .W merge preserves Dx[31:16]).
+    // For PACK: opResult must present the result in low 8 bits (upper 24 don't-care for .B merge).
+    // For UNPK: opResult must present the result in low 16 bits (upper 16 don't-care for .W merge).
+    val opResult = Mux(isPack, packRes8,
+                   Mux(isUnpk, unpkRes32,
+                   Mux(isBcd,  B(0, 24 bits) ## bcdRes8, rsp.result)))
     val sizeMerged = u1.size.mux(
       Size.BYTE -> (s1Src1(31 downto 8)  ## opResult(7 downto 0)),
       Size.WORD -> (s1Src1(31 downto 16) ## opResult(15 downto 0)),
