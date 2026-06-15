@@ -114,7 +114,7 @@ class ExceptionEntrySpec extends AnyFunSuite {
       val ssp0 = 0x00100000L
       val vbr  = 0L
       val handler = 0x40009000L
-      dut.rob.logic.exc.ss.ssp #= ssp0
+      dut.rob.logic.exc.ss.isp #= ssp0
       dut.rob.logic.exc.ss.vbr #= vbr
       // srSys at reset = 0x27 (S=1). committed CCR seeded 0.
       // preload vector table: mem[VBR + 4*4] = handler. The 68k vector table is
@@ -160,7 +160,7 @@ class ExceptionEntrySpec extends AnyFunSuite {
       assert(fmt == (4 << 2), f"format/vector word=0x$fmt%04x expected 0x${4 << 2}%04x")
 
       // SSP decremented by 8; S still set (srSys bit5).
-      assert((dut.rob.logic.exc.ss.ssp.toLong & 0xffffffffL) == base, f"ssp=0x${dut.rob.logic.exc.ss.ssp.toLong}%x expected 0x$base%x")
+      assert((dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL) == base, f"ssp=0x${dut.rob.logic.exc.ss.isp.toLong}%x expected 0x$base%x")
       assert(((dut.rob.logic.exc.ss.srSys.toInt >> 5) & 1) == 1, "S must be set after entry")
     }
   }

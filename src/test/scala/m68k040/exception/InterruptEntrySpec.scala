@@ -124,7 +124,7 @@ class InterruptEntrySpec extends AnyFunSuite {
       val ssp0 = 0x00100000L
       val vbr  = 0L
       val handler = 0x40000000L + (expVec.toLong * 0x100L)
-      dut.rob.logic.exc.ss.ssp #= ssp0
+      dut.rob.logic.exc.ss.isp #= ssp0
       dut.rob.logic.exc.ss.vbr #= vbr
       // srSys: S=1 (bit5), mask=`mask`, T=0.
       dut.rob.logic.exc.ss.srSys #= (0x20 | (mask & 0x7))
@@ -179,7 +179,7 @@ class InterruptEntrySpec extends AnyFunSuite {
       assert(((sys >> 5) & 1) == 1, s"[$name] S must be set after entry")
       assert(((sys >> 6) & 3) == 0, s"[$name] T must be cleared after entry")
       // SSP decremented by 8 (format-$0 = 8 bytes).
-      assert((dut.rob.logic.exc.ss.ssp.toLong & 0xffffffffL) == base, s"[$name] SSP must be SSP-8")
+      assert((dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL) == base, s"[$name] SSP must be SSP-8")
     }
   }
 

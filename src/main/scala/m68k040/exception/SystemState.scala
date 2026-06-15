@@ -64,14 +64,6 @@ class SystemState extends Area {
   setMsp.valid.allowOverride;   setMsp.valid := False;   setMsp.payload.allowOverride;   setMsp.payload := U(0, 32 bits)
   writeA7.valid.allowOverride;  writeA7.valid := False;  writeA7.payload.allowOverride;  writeA7.payload := U(0, 32 bits)
 
-  // ── backward-compat shims (Task 2 will replace with proper (S,M) routing) ─
-  // ExceptionUnit uses `ss.ssp` / `ss.setSsp`: treat ssp as an alias for isp
-  // (the M=0 supervisor bank, which is what the boot SR 0x27 selects). Task 2
-  // rewires these to Mux(m, msp, isp) and routes setSsp by committed (S,M).
-  // (see docs/superpowers/plans/2026-06-14-msp-isp-mbit-banking.md, Task 2)
-  def ssp: UInt         = isp
-  def setSsp: Flow[UInt] = setIsp
-
   // ── commit-time updates ──────────────────────────────────────────────────
   when(setSrSys.valid) { srSys := setSrSys.payload }
   when(setVbr.valid)   { vbr   := setVbr.payload }

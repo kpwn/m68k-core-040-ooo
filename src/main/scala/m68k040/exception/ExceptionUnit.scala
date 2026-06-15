@@ -190,7 +190,7 @@ class ExceptionUnit(
   val obsIsEntry = Bool();        obsIsEntry := False
 
   // ── Architectural A7 (int reg 15) write-back. The committed A7 lives in BOTH the
-  // SystemState bank (ss.ssp/usp) AND the int register file (arch reg 15) the
+  // SystemState bank (ss.isp/ss.msp/ss.usp) AND the int register file (arch reg 15) the
   // datapath reads. When the exception changes A7 (entry: SSP-=8; RTE: restore +
   // maybe re-bank to USP), it must update reg 15 so the handler's (A7)/disp(A7)
   // stack accesses see the new SP. The full-core wiring connects this to an int PRF
@@ -210,7 +210,8 @@ class ExceptionUnit(
 
   // ── SystemState write defaults (the FSM pulses them) ────────────────────────
   ss.setSrSys.valid := False; ss.setSrSys.payload := U(0, 8 bits)
-  ss.setSsp.valid   := False; ss.setSsp.payload   := U(0, 32 bits)
+  ss.setIsp.valid   := False; ss.setIsp.payload   := U(0, 32 bits)
+  ss.setMsp.valid   := False; ss.setMsp.payload   := U(0, 32 bits)
   ss.setVbr.valid   := False; ss.setVbr.payload   := U(0, 32 bits)
   ss.setUsp.valid   := False; ss.setUsp.payload   := U(0, 32 bits)
   ss.writeA7.valid  := False; ss.writeA7.payload  := U(0, 32 bits)
@@ -382,7 +383,11 @@ class ExceptionUnit(
         oldSr     := (ss.srSys ## committedCcr.resize(8 bits)).asUInt
         // new SSP = current A7 (SSP, since committed S) - frame size
         //   format-$0 = 8 bytes, format-$2 = 12 bytes, format-$7 = 60 bytes.
-        val nb = Mux(is7, ss.ssp - 60, Mux(is2, ss.ssp - 12, ss.ssp - 8))
+        // new SP = current supervisor stack (M ? MSP : ISP) - frame size. M is PRESERVED
+        // across fault/trap entry (the &0x3f mask in E_REDIR keeps bit4), so the
+        // post-stack SP is written back to this SAME bank.
+        val supSp = Mux(ss.m, ss.msp, ss.isp)
+        val nb = Mux(is7, supSp - 60, Mux(is2, supSp - 12, supSp - 8))
         frameBase := nb
         // compute vector fetch base = VBR + vec*4
         vecTarget := (ss.vbr + (entryVector << 2)).resized
@@ -390,7 +395,7 @@ class ExceptionUnit(
         goto(E_DRAIN)
       } elsewhen(rteTrigger) {
         // RTE reads the frame at the CURRENT A7 (SSP). frameBase := SSP.
-        frameBase := ss.ssp
+        frameBase := Mux(ss.m, ss.msp, ss.isp)   // RTE reads the current supervisor stack
         goto(R_SRREQ)
       } elsewhen(sysTrigger) {
         // Commit-time SYSTEM op (supervisor; the user-mode case is a vector-8 fault via
@@ -451,7 +456,8 @@ class ExceptionUnit(
     }
     E_REDIR.whenIsActive {
       // commit the architectural side-effects + redirect
-      ss.setSsp.valid   := True; ss.setSsp.payload := frameBase
+      when(ss.m) { ss.setMsp.valid := True; ss.setMsp.payload := frameBase }
+      .otherwise { ss.setIsp.valid := True; ss.setIsp.payload := frameBase }
       // enter supervisor, clear trace: set S (bit5), clear T1/T0 (bits 7,6).
       // For an INTERRUPT entry ALSO raise the SR I-mask (bits 2:0) to the interrupt
       // level so equal/lower interrupts are held until RTE (NMI sets 7); fault/trap
@@ -526,7 +532,8 @@ class ExceptionUnit(
       // explicitly. For $7 the popPc is the faulting instruction's PC -> RTE resumes
       // by RE-EXECUTING it (the handler has fixed the mapping), matching MAME.
       val newSsp = frameBase + Mux(popIs7, U(60, 32 bits), Mux(popIs2, U(12, 32 bits), U(8, 32 bits)))
-      ss.setSsp.valid   := True; ss.setSsp.payload := newSsp
+      when(ss.m) { ss.setMsp.valid := True; ss.setMsp.payload := newSsp }
+      .otherwise { ss.setIsp.valid := True; ss.setIsp.payload := newSsp }
       redirectValid := True
       redirectPc    := popPc
       // commit observation: RTE's trace step == restored PC + restored SR sysByte
@@ -536,7 +543,12 @@ class ExceptionUnit(
       obsFire    := True
       obsPc      := popPc
       obsSysByte := popSr(15 downto 8)
-      obsA7      := Mux(popSr(13), newSsp, ss.usp)   // SR bit13 = S
+      // A7 after RTE = restored-(S,M) bank. popSr(13)=S, popSr(12)=M. For Slice A
+      // (fault/trap), M is unchanged so the popped bank == the restored supervisor bank
+      // and obsA7 resolves to Mux(S, newSsp, usp) — identical to the old behavior.
+      val poppedSameBank = (popSr(12) === ss.m)
+      val rsupBank = Mux(popSr(12), ss.msp, ss.isp)
+      obsA7 := Mux(popSr(13), Mux(poppedSameBank, newSsp, rsupBank), ss.usp)
       goto(IDLE)
     }
 

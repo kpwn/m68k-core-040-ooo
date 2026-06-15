@@ -470,7 +470,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Boot the committed supervisor SP to Musashi's initial SSP (0x00100000) AFTER
       // the init sweep (it resets committed state) so the surfaced A7 (== SSP, S=1)
       // matches OracleStep.a(7) for every program.
-      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
       // Boot mode: default supervisor (SR boot 0x2700, S=1). When `initialSr` overrides it
       // (e.g. user mode S=0 for the privilege-violation test), seed the committed SR system
       // byte AND the USP bank; in user mode the surfaced A7 == USP, so the int PRF arch-15
@@ -481,7 +481,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val bootA7 = if (userMode) (usp & 0xffffffffL) else 0x00100000L
       // Seed the int PRF arch-15 (A7, identity phys-15) to the boot SP: the OoO
       // datapath reads A7 from the int PRF (call/return push/pop), so it must mirror
-      // the committed SP at boot (reset loads SP into A7). The exc unit keeps ss.ssp
+      // the committed SP at boot (reset loads SP into A7). The exc unit keeps ss.isp
       // in sync on exceptions; the PRF arch-15 follows OoO writes thereafter.
       dut.wire.logic.seedValid #= true
       dut.wire.logic.seedAddr  #= 15
@@ -656,7 +656,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
-      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
       // Boot the committed SR to initialSr's system byte (lower the I-mask so a
       // non-NMI level is taken; matches the oracle's --initial-sr).
       dut.rob.logic.exc.ss.srSys #= (initialSr >> 8) & 0xff
@@ -1167,7 +1167,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // FSM's vector fetch resolves; we don't need handler parity).
       val handlerPc = loadAddr + 2   // the `handler:` label (after the 1-word MOVE)
       for (i <- 0 until 4) dmem.pokeByte(0x20 + i, ((handlerPc >> (8 * i)) & 0xff).toInt)
-      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
       dut.rob.logic.exc.ss.usp #= 0x00200000L
       // Boot mode: user (S=0, SR 0x0000) or supervisor (S=1, 0x27 default).
       if (userMode) dut.rob.logic.exc.ss.srSys #= 0x00 else dut.rob.logic.exc.ss.srSys #= 0x27
@@ -2270,7 +2270,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
-      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
       dut.rob.logic.exc.ss.srSys #= (initialSr >> 8) & 0xff
       cd.waitSampling()
       dut.fa.logic.redirect.valid   #= true
@@ -3166,7 +3166,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
-      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
       cd.waitSampling()
       dut.fa.logic.redirect.valid   #= true
       dut.fa.logic.redirect.payload #= loadAddr
@@ -3291,7 +3291,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
-      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
       cd.waitSampling()
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling(); dut.fa.logic.redirect.valid #= false
@@ -3408,7 +3408,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
-      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
       cd.waitSampling()
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling(); dut.fa.logic.redirect.valid #= false

@@ -118,7 +118,7 @@ class RteSpec extends AnyFunSuite {
       val usp0    = 0x0000BEEFL
       val retSr   = 0x0004            // S=0, I=0, T=0, CCR=Z(bit2). user mode.
       val retPc   = 0x40001234L
-      dut.rob.logic.exc.ss.ssp #= ssp0
+      dut.rob.logic.exc.ss.isp #= ssp0
       dut.rob.logic.exc.ss.usp #= usp0
       // build the frame at SSP (big-endian words): [0]=SR, [2]=PChi, [4]=PClo, [6]=fmt.
       def pokeBE16(a: Long, w: Int): Unit = { dmem.pokeByte(a, (w >> 8) & 0xff); dmem.pokeByte(a + 1, w & 0xff) }
@@ -152,8 +152,8 @@ class RteSpec extends AnyFunSuite {
       // SR restored (system byte = retSr>>8 = 0x00, S=0); SSP += 8; A7 now USP.
       assert((dut.rob.logic.exc.ss.srSys.toInt & 0xff) == ((retSr >> 8) & 0xff),
         f"srSys=0x${dut.rob.logic.exc.ss.srSys.toInt}%02x expected 0x${(retSr >> 8) & 0xff}%02x")
-      assert((dut.rob.logic.exc.ss.ssp.toLong & 0xffffffffL) == ssp0 + 8,
-        f"ssp=0x${dut.rob.logic.exc.ss.ssp.toLong}%x expected 0x${ssp0 + 8}%x")
+      assert((dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL) == ssp0 + 8,
+        f"ssp=0x${dut.rob.logic.exc.ss.isp.toLong}%x expected 0x${ssp0 + 8}%x")
       // S=0 -> A7 reads USP
       assert(((dut.rob.logic.exc.ss.srSys.toInt >> 5) & 1) == 0, "S must be cleared (returned to user)")
       assert((dut.rob.logic.exc.ss.usp.toLong & 0xffffffffL) == usp0, "USP unchanged")

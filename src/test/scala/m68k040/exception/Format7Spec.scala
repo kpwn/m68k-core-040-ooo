@@ -105,7 +105,7 @@ class Format7Spec extends AnyFunSuite {
       val vbr  = 0L
       val handler = 0x40009000L
       val faultVA = 0x2000L
-      dut.rob.logic.exc.ss.ssp #= ssp0
+      dut.rob.logic.exc.ss.isp #= ssp0
       dut.rob.logic.exc.ss.vbr #= vbr
       def pokeBE32(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
       pokeBE32(vbr + 2 * 4, handler)   // vector 2 (access fault) @ VBR+8
@@ -160,7 +160,7 @@ class Format7Spec extends AnyFunSuite {
         assert(peekBE16(base + off) == 0, f"internal word @+0x$off%02x must be 0 (got 0x${peekBE16(base + off)}%04x)")
       }
       // SSP decremented by 60; S still set.
-      assert((dut.rob.logic.exc.ss.ssp.toLong & 0xffffffffL) == base, f"ssp=0x${dut.rob.logic.exc.ss.ssp.toLong}%x expected 0x$base%x")
+      assert((dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL) == base, f"ssp=0x${dut.rob.logic.exc.ss.isp.toLong}%x expected 0x$base%x")
       assert(((dut.rob.logic.exc.ss.srSys.toInt >> 5) & 1) == 1, "S must be set after entry")
     }
   }
