@@ -47,7 +47,7 @@ class DivWSpec extends AnyFunSuite {
       uop.faulted := False; uop.faultVector := 0; uop.isRte := False
       uop.faultAddr := 0; uop.sswInstr := False
       uop.isBranch := False; uop.cond := 0; uop.branchDisp := 0
-      uop.isTrapv := False; uop.faultUsesNextPc := True; uop.isScc := False; uop.isDbcc := False
+      uop.isCondTrap := False; uop.faultUsesNextPc := True; uop.isScc := False; uop.isDbcc := False
       uop.divSigned := iSigned; uop.div64 := False; uop.divIsRem := False
       uop.firstOfInstr := True
       uop.pc := 0x2000; uop.nextPc := 0x2002

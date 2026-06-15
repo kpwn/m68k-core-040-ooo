@@ -71,7 +71,7 @@ class IqSourcePlugin extends FiberPlugin {
       u.divSigned    := False; u.div64 := False; u.divIsRem := False
       u.nextPc       := 0
       u.faulted      := False; u.faultVector := 0; u.faultUsesNextPc := False
-      u.isRte        := False; u.isTrapv := False; u.isScc := False; u.isDbcc := False
+      u.isRte        := False; u.isCondTrap := False; u.isScc := False; u.isDbcc := False
       u.faultAddr    := 0; u.sswInstr := False
       u.firstOfInstr := True
       c

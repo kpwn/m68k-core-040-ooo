@@ -68,7 +68,7 @@ object MicroOpAssembler {
     u.cond        := 0; u.branchDisp := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
-    u.faultAddr   := pc; u.sswInstr := False; u.isRte := False; u.isTrapv := False
+    u.faultAddr   := pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
     u.divSigned   := False; u.div64 := False
     // `divRem` = the generic crack-DROP marker (like DIVREM / the source-EA An-update): a
     // dropped MOVEM move does NOT map to its own oracle step (the macro is ONE step — the
@@ -116,7 +116,7 @@ object MicroOpAssembler {
     u.cond        := 0; u.branchDisp := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
-    u.faultAddr   := pc; u.sswInstr := False; u.isRte := False; u.isTrapv := False
+    u.faultAddr   := pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
     u.divSigned   := False; u.div64 := False; u.divIsRem := False
     u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
     u.ccrRestore  := False; u.toCcr := False
@@ -284,7 +284,7 @@ object MicroOpAssembler {
     opUop.faultAddr     := pkt.pc
     opUop.sswInstr      := False
     opUop.isRte         := False
-    opUop.isTrapv       := False
+    opUop.isCondTrap    := False
     opUop.divSigned     := spec.divSigned
     opUop.div64         := spec.div64
     opUop.divIsRem      := False
@@ -503,7 +503,7 @@ object MicroOpAssembler {
     ldUop.unimplemented := False
     ldUop.faulted       := False; ldUop.faultVector := 0; ldUop.isRte := False
     ldUop.faultUsesNextPc := False
-    ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False; ldUop.isTrapv := False
+    ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False; ldUop.isCondTrap := False
     ldUop.divSigned     := False; ldUop.div64 := False; ldUop.divIsRem := False
     ldUop.shiftOp := 0; ldUop.shiftDir := False; ldUop.isMovea := False; ldUop.isScc := False; ldUop.isDbcc := False; ldUop.extByte := False; ldUop.bitOp := 0; ldUop.bcdSub := False
     ldUop.firstOfInstr  := True    // the LOAD is the FIRST µop of a cracked instruction
@@ -550,7 +550,7 @@ object MicroOpAssembler {
     stUop.unimplemented := False
     stUop.faulted       := False; stUop.faultVector := 0; stUop.isRte := False
     stUop.faultUsesNextPc := False
-    stUop.faultAddr     := pkt.pc; stUop.sswInstr := False; stUop.isTrapv := False
+    stUop.faultAddr     := pkt.pc; stUop.sswInstr := False; stUop.isCondTrap := False
     stUop.divSigned     := False; stUop.div64 := False; stUop.divIsRem := False
     stUop.shiftOp := 0; stUop.shiftDir := False; stUop.isMovea := False; stUop.isScc := False; stUop.isDbcc := False; stUop.extByte := False; stUop.bitOp := 0; stUop.bcdSub := False
     // A single reg-to-mem STORE is its own first µop; a mem-to-mem store TRAILS the load.
@@ -594,7 +594,7 @@ object MicroOpAssembler {
     rmwStUop.unimplemented := False
     rmwStUop.faulted       := False; rmwStUop.faultVector := 0; rmwStUop.isRte := False
     rmwStUop.faultUsesNextPc := False
-    rmwStUop.faultAddr     := pkt.pc; rmwStUop.sswInstr := False; rmwStUop.isTrapv := False
+    rmwStUop.faultAddr     := pkt.pc; rmwStUop.sswInstr := False; rmwStUop.isCondTrap := False
     rmwStUop.divSigned     := False; rmwStUop.div64 := False; rmwStUop.divIsRem := False
     rmwStUop.shiftOp := 0; rmwStUop.shiftDir := False; rmwStUop.isMovea := False; rmwStUop.isScc := False; rmwStUop.isDbcc := False; rmwStUop.extByte := False; rmwStUop.bitOp := 0; rmwStUop.bcdSub := False
     rmwStUop.firstOfInstr  := False    // the trailing store of a cracked RMW
@@ -673,21 +673,26 @@ object MicroOpAssembler {
     // through (memDest is now false for pcRel, so no RMW crack fires -> would mis-crack a
     // leading load). Force the illegal path. Source pcRel (read) stays valid.
     val eaDstPcRelBad = eaIsDst && srcIsMem && srcEa.pcRel
-    // ── Line-5 Scc / DBcc (0101 cccc 11 mmmrrr) ─────────────────────────────────
+    // ── Line-5 Scc / DBcc / TRAPcc (0101 cccc 11 mmmrrr) ────────────────────────
     // ss == 11 (op[7:6]). mode = op[5:3]. DBcc = mode 001 (+ disp16 word). Scc = any
-    // other mode (a byte set on cond); in-scope = mode 000 (Dn). Memory Scc (mode>=2)
-    // + TRAPcc (mode 7, reg 2/3/4) are deferred -> illegal. cccc = op[11:8] (the branch
-    // EU's 16-condition field). rrr = op[2:0] (Dn for Scc / the DBcc counter Dn).
+    // other mode (a byte set on cond); in-scope = mode 000 (Dn). TRAPcc = mode 111 with
+    // reg ∈ {2,3,4} (no-operand/word/long). cccc = op[11:8]. rrr = op[2:0].
     val isLine5    = (op(15 downto 12) === B"4'h5")
     val ss5        = op(7 downto 6)
     val mode5      = op(5 downto 3)
     val cccc5      = op(11 downto 8)
     val rrr5       = op(2 downto 0).asUInt.resize(5)
+    val rrr5raw    = op(2 downto 0).asUInt
     val isDbccOp   = isLine5 && (ss5 === 3) && (mode5 === 1)
     val isSccOp    = isLine5 && (ss5 === 3) && (mode5 === 0)          // Scc Dn (in scope)
-    // A memory/TRAPcc line-5 ss==11 form (not DBcc mode 001, not Scc-Dn mode 000) is
-    // deferred -> illegal (`sccMemBad`).
-    val sccMemBad  = isLine5 && (ss5 === 3) && (mode5 =/= 0) && (mode5 =/= 1)
+    // TRAPcc: line-5 ss==11, mode==7 (reg field is the ttt operand form), ttt ∈ {2,3,4}.
+    //   ttt=4 (reg=4): no operand (1 word). ttt=2 (reg=2): #data16 (2 words).
+    //   ttt=3 (reg=3): #data32 (3 words). Other ttt -> illegal (stays sccMemBad).
+    val isTrapccOp = isLine5 && (ss5 === 3) && (mode5 === 7) &&
+                     ((rrr5raw === 2) || (rrr5raw === 3) || (rrr5raw === 4))
+    // A memory Scc / other mode-7 TRAPcc line-5 ss==11 form is deferred -> illegal.
+    // Exclude TRAPcc (mode7,reg{2,3,4}) from the sccMemBad bucket.
+    val sccMemBad  = isLine5 && (ss5 === 3) && (mode5 =/= 0) && (mode5 =/= 1) && !isTrapccOp
     // ── RTE (0x4E73) — a serializing return-from-exception µop (privileged). ────
     // Decoded here (line 0x4 is otherwise unimplemented) so it is NOT treated as an
     // illegal instruction. It commits like a no-op op µop but carries isRte; the
@@ -780,7 +785,7 @@ object MicroOpAssembler {
     // RTD (0x4E74): a line-4 return cracked below (NOT illegal).
     val isRtdBad = (op === B"16'h4E74")
     // Merged illegal-detection exclusion list (Track C ops + Track D ops).
-    val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
+    val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isTrapccOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isUnlkOp && !isExgOp &&
               !isLeaOp && !isPeaOp && !isMoveFromSrOp && !isMoveFromCcrOp && !isMoveToCcrOp &&
               !isSysOp && !isRtdBad &&
@@ -1002,10 +1007,11 @@ object MicroOpAssembler {
       opUop.faultUsesNextPc := True
     }
     when(isTrapvOp) {
-      // Branch-class trap-check µop: issues to the branch EU, reads NZVC(V). The EU
-      // drives a trapvFault (vector 7) iff V=1; otherwise it retires as a no-op. It
-      // writes no register and (like a branch) leaves CCR unchanged. TRAPV is not
-      // restartable -> faultPc = nextPc (the stacked PC when it traps).
+      // Branch-class cond-trap µop: issues to the branch EU, reads NZVC. The EU
+      // evaluates cond=9 (VS, V-set) via `taken`; if taken drives a trapvFault (vector 7,
+      // faultPc = nextPc). Not taken -> retires as a no-op. TRAPV is not restartable ->
+      // faultUsesNextPc. The redirect is suppressed by the `isCondTrap` gate in the EU
+      // regardless of `taken`, so completion/mispredict stay off the critical path.
       opUop.op            := DecOp.ILLEGAL    // no ALU action
       opUop.cluster       := Cluster.INT
       opUop.memOp         := MemOp.NONE
@@ -1016,14 +1022,38 @@ object MicroOpAssembler {
       opUop.faulted       := False            // conditional: set at execute, not decode
       opUop.faultVector   := 0
       opUop.isBranch      := True             // route to the branch EU (NZVC read)
-      // cond = F (1): branchEU `taken`=False -> mispredict stays False and the branch
-      // nextPc = pc+2 (= TRAPV's nextPc) WITHOUT any isTrapv special-case on the
-      // mispredict/nextPc outputs (keeps those off the critical completion->ROB arc).
-      opUop.cond          := 1
+      // cond = 9 (VS): taken iff V=1, matching TRAPV semantics. The EU suppresses
+      // redirect via the `isCondTrap` gate (no mispredict regardless of `taken`).
+      opUop.cond          := 9
       opUop.branchDisp    := 0
       opUop.readsNzvc     := True
-      opUop.isTrapv       := True
+      opUop.isCondTrap    := True
       opUop.faultUsesNextPc := True
+    }
+    // ── TRAPcc (0101 cccc 11 111 ttt): conditional trap, vector 7, format-$2 ──────
+    // ttt=4 (1 word), ttt=2 (+word), ttt=3 (+long). The operand words are handler-only
+    // data; the CPU ignores them (affects only length, handled by predecode). The µop
+    // is a branch-class cond-trap (isCondTrap, cond=cccc); the branch EU evaluates the
+    // condition via `taken` and, if taken, drives a trapvFault (vector 7). Stacked PC
+    // = nextPc (not restartable) -> faultUsesNextPc=True. No register/CCR change.
+    when(isTrapccOp) {
+      opUop.op            := DecOp.ILLEGAL    // no ALU action
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
+      opUop.writesNzvc := False; opUop.writesX := False
+      opUop.unimplemented := False
+      opUop.isRte         := False
+      opUop.faulted       := False            // conditional: fault set at execute, not decode
+      opUop.faultVector   := 0
+      opUop.isBranch      := True             // route to the branch EU (NZVC read)
+      opUop.cond          := cccc5            // the 4-bit condition code from op[11:8]
+      opUop.branchDisp    := 0
+      opUop.readsNzvc     := True
+      opUop.isCondTrap    := True
+      opUop.faultUsesNextPc := True
+      // nextPc is the pc + length (1/2/3 words by ttt); predecode computes the correct
+      // lenWords and the DecodePacket carries nextPc = pc + lenWords*2. No override needed.
     }
     // ── Scc Dn (0101 cccc 11 000rrr) — set Dn[7:0] := cond ? 0xFF : 0x00 ────────
     // A branch-class µop (routes to the branch EU's condition mux). It READS its dst Dn
@@ -1047,7 +1077,7 @@ object MicroOpAssembler {
       opUop.branchDisp    := 0
       opUop.unimplemented := False
       opUop.faulted       := False; opUop.faultVector := 0
-      opUop.isRte         := False; opUop.isTrapv := False; opUop.ibranch := False
+      opUop.isRte         := False; opUop.isCondTrap := False; opUop.ibranch := False
     }
     // ── DBcc Dn,disp (0101 cccc 11 001rrr + disp16) — decrement-and-branch ──────
     // A branch-class µop. READS Dn (srcA = the counter / merge source) + WRITES Dn (dst
@@ -1070,7 +1100,7 @@ object MicroOpAssembler {
       opUop.branchDisp    := pkt.words(1).asSInt.resize(32).asBits
       opUop.unimplemented := False
       opUop.faulted       := False; opUop.faultVector := 0
-      opUop.isRte         := False; opUop.isTrapv := False; opUop.ibranch := False
+      opUop.isRte         := False; opUop.isCondTrap := False; opUop.ibranch := False
     }
 
     // ── INSTRUCTION-FETCH fault (the I-cache raised DecodePacket.fault) ─────────
@@ -1150,7 +1180,7 @@ object MicroOpAssembler {
     divlUop.unimplemented := False
     divlUop.faulted       := False; divlUop.faultVector := 0; divlUop.isRte := False
     divlUop.faultUsesNextPc := True            // DIV0 stacks nextPc (group-2 format-$2)
-    divlUop.faultAddr     := pkt.pc; divlUop.sswInstr := False; divlUop.isTrapv := False
+    divlUop.faultAddr     := pkt.pc; divlUop.sswInstr := False; divlUop.isCondTrap := False
     divlUop.divSigned     := divlSigned; divlUop.div64 := divl64; divlUop.divIsRem := False
     divlUop.shiftOp := 0; divlUop.shiftDir := False; divlUop.isMovea := False; divlUop.isScc := False; divlUop.isDbcc := False; divlUop.extByte := False; divlUop.bitOp := 0; divlUop.bcdSub := False
     divlUop.indexLong := False; divlUop.indexScale := 0
@@ -1185,7 +1215,7 @@ object MicroOpAssembler {
     divremUop.unimplemented := False
     divremUop.faulted       := False; divremUop.faultVector := 0; divremUop.isRte := False
     divremUop.faultUsesNextPc := False
-    divremUop.faultAddr     := pkt.pc; divremUop.sswInstr := False; divremUop.isTrapv := False
+    divremUop.faultAddr     := pkt.pc; divremUop.sswInstr := False; divremUop.isCondTrap := False
     divremUop.divSigned     := divlSigned; divremUop.div64 := divl64; divremUop.divIsRem := True
     divremUop.shiftOp := 0; divremUop.shiftDir := False; divremUop.isMovea := False; divremUop.isScc := False; divremUop.isDbcc := False; divremUop.extByte := False; divremUop.bitOp := 0; divremUop.bcdSub := False
     divremUop.indexLong := False; divremUop.indexScale := 0
@@ -1260,7 +1290,7 @@ object MicroOpAssembler {
     mullUop.unimplemented := False
     mullUop.faulted       := False; mullUop.faultVector := 0; mullUop.isRte := False
     mullUop.faultUsesNextPc := False
-    mullUop.faultAddr     := pkt.pc; mullUop.sswInstr := False; mullUop.isTrapv := False
+    mullUop.faultAddr     := pkt.pc; mullUop.sswInstr := False; mullUop.isCondTrap := False
     mullUop.divSigned     := mullSigned; mullUop.div64 := mull64; mullUop.divIsRem := False
     mullUop.shiftOp := 0; mullUop.shiftDir := False; mullUop.isMovea := False; mullUop.isScc := False; mullUop.isDbcc := False; mullUop.extByte := False; mullUop.bitOp := 0; mullUop.bcdSub := False
     mullUop.indexLong := False; mullUop.indexScale := 0
@@ -1292,7 +1322,7 @@ object MicroOpAssembler {
     mulhiUop.unimplemented := False
     mulhiUop.faulted       := False; mulhiUop.faultVector := 0; mulhiUop.isRte := False
     mulhiUop.faultUsesNextPc := False
-    mulhiUop.faultAddr     := pkt.pc; mulhiUop.sswInstr := False; mulhiUop.isTrapv := False
+    mulhiUop.faultAddr     := pkt.pc; mulhiUop.sswInstr := False; mulhiUop.isCondTrap := False
     mulhiUop.divSigned     := mullSigned; mulhiUop.div64 := mull64; mulhiUop.divIsRem := False
     mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False; mulhiUop.isMovea := False; mulhiUop.isScc := False; mulhiUop.isDbcc := False; mulhiUop.extByte := False; mulhiUop.bitOp := 0; mulhiUop.bcdSub := False
     mulhiUop.indexLong := False; mulhiUop.indexScale := 0
@@ -1341,7 +1371,7 @@ object MicroOpAssembler {
     ibrUop.unimplemented := False
     ibrUop.faulted       := False; ibrUop.faultVector := 0; ibrUop.isRte := False
     ibrUop.faultUsesNextPc := False
-    ibrUop.faultAddr     := pkt.pc; ibrUop.sswInstr := False; ibrUop.isTrapv := False
+    ibrUop.faultAddr     := pkt.pc; ibrUop.sswInstr := False; ibrUop.isCondTrap := False
     ibrUop.divSigned     := False; ibrUop.div64 := False; ibrUop.divIsRem := False
     ibrUop.shiftOp := 0; ibrUop.shiftDir := False; ibrUop.isMovea := False; ibrUop.isScc := False; ibrUop.isDbcc := False; ibrUop.extByte := False; ibrUop.bitOp := 0; ibrUop.bcdSub := False
     ibrUop.indexLong := False; ibrUop.indexScale := 0
@@ -1394,7 +1424,7 @@ object MicroOpAssembler {
       u.cond := cond; u.branchDisp := branchDisp
       u.unimplemented := False
       u.faulted := False; u.faultVector := 0; u.faultUsesNextPc := False
-      u.faultAddr := pkt.pc; u.sswInstr := False; u.isRte := False; u.isTrapv := False
+      u.faultAddr := pkt.pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
       u.divSigned := False; u.div64 := False; u.divIsRem := divIsRem
       u.shiftOp := 0; u.shiftDir := False; u.isMovea := False; u.isScc := False; u.isDbcc := False; u.extByte := False; u.bitOp := 0; u.bcdSub := False
       u.indexLong := False; u.indexScale := 0
@@ -1611,7 +1641,7 @@ object MicroOpAssembler {
       u.cond        := 0; u.branchDisp := 0
       u.unimplemented := False
       u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
-      u.faultAddr   := pkt.pc; u.sswInstr := False; u.isRte := False; u.isTrapv := False
+      u.faultAddr   := pkt.pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
       u.divSigned   := False; u.div64 := False; u.divIsRem := False
       u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
       u.ccrRestore  := False; u.toCcr := False

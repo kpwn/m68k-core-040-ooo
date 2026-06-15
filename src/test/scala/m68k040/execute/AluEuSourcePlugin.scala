@@ -81,7 +81,7 @@ class AluEuSourcePlugin extends FiberPlugin {
     uop.memOp        := m68k040.isa.MemOp.NONE
     uop.faulted      := False; uop.faultVector := U(0); uop.isRte := False
     uop.faultUsesNextPc := False
-    uop.isTrapv      := False
+    uop.isCondTrap   := False
     uop.faultAddr    := U(0); uop.sswInstr := False
     uop.divSigned    := False; uop.div64 := False; uop.divIsRem := False
     uop.extByte      := False

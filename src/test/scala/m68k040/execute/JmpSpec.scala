@@ -60,7 +60,7 @@ class IbranchSourcePlugin extends FiberPlugin {
     uop.branchDisp   := 0
     uop.pNzvcSrc     := 0
     uop.readsNzvc    := False
-    uop.isTrapv      := False; uop.isScc := False; uop.isDbcc := False
+    uop.isCondTrap   := False; uop.isScc := False; uop.isDbcc := False
     uop.faulted      := False; uop.faultVector := 0; uop.faultUsesNextPc := False
     uop.faultAddr    := 0; uop.sswInstr := False; uop.isRte := False
     uop.divSigned := False; uop.div64 := False; uop.divIsRem := False

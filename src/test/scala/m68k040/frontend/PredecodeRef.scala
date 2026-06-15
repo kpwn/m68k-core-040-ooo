@@ -272,7 +272,15 @@ object PredecodeRef {
         } else {
           if (mode == 1) CP(simple = true, lenWords = 2)               // DBcc + disp16
           else if (mode == 0) CP(simple = true, lenWords = 1)          // Scc Dn
-          else COMPLEX                                                 // mem Scc / TRAPcc
+          else if (mode == 7) {                                        // TRAPcc (mode 7)
+            val ttt = op & 7
+            ttt match {
+              case 4 => CP(simple = true, lenWords = 1)               // TRAPcc (no operand)
+              case 2 => CP(simple = true, lenWords = 2)               // TRAPcc.W (#data16)
+              case 3 => CP(simple = true, lenWords = 3)               // TRAPcc.L (#data32)
+              case _ => COMPLEX                                        // other ttt -> illegal
+            }
+          } else COMPLEX                                               // mem Scc -> deferred
         }
       case 0x7 =>
         if (((op >> 8) & 1) == 0) CP(simple = true, lenWords = 1) else COMPLEX

@@ -51,8 +51,17 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x5298) == cp(true,1))   // ADDQ.L #1,(A0)+ -> RMW postinc (0 ext, An folded)
   }
   test("deferred ops -> complex") {
-    assert(classify(0x50FA) == cp(false,0))  // TRAPcc/ST (d16,PC)? mode7 reg2 ss=11 -> deferred
+    // TRAPcc is now IN SCOPE: 0x50FA = TRAPT.W (cond=T, ttt=2, #data16) -> simple len2
+    assert(classify(0x50FA) == cp(true,2))   // TRAPcc.W (cond=T, ttt=2): simple len2
     assert(classify(0xE0D0) == cp(false,0))  // ASR.W (A0) (line-E memory single-bit, ss=11) -> deferred
+  }
+  test("TRAPcc forms: ttt=4 (1w) / ttt=2 (+w16) / ttt=3 (+l32) / ttt=0 (illegal)") {
+    assert(classify(0x51FC) == cp(true,1))   // TRAPF  (cc=F, ttt=4): no-operand, 1 word
+    assert(classify(0x50FC) == cp(true,1))   // TRAPT  (cc=T, ttt=4): no-operand, 1 word
+    assert(classify(0x57FA) == cp(true,2))   // TRAPEQ (cc=EQ, ttt=2): #data16, 2 words
+    assert(classify(0x59FB) == cp(true,3))   // TRAPVS (cc=VS, ttt=3): #data32, 3 words
+    assert(classify(0x50F8) == cp(false,0))  // TRAPcc ttt=0 (invalid) -> COMPLEX (illegal)
+    assert(classify(0x50F9) == cp(false,0))  // TRAPcc ttt=1 (invalid) -> COMPLEX (illegal)
   }
   // LEA (A0),A0 (0x41D0) is now IN SCOPE (Track C) -> simple, len 1 (mode 2, no ext word).
   test("LEA -> simple (Track C, in scope)") {

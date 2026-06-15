@@ -45,11 +45,11 @@ class TrapvSpec extends AnyFunSuite {
       uop.readsX := False; uop.pXSrc := 0; uop.pXDst := 0; uop.writesX := False; uop.pXOld := 0
       uop.faulted := False; uop.faultVector := 0; uop.isRte := False
       uop.faultAddr := 0; uop.sswInstr := False
-      // TRAPV trap-check µop: a branch-class uop reading NZVC, marked isTrapv.
-      // cond = F (1): matches the decoder so the branch EU yields taken=False
-      // (mispredict stays False) — TRAPV is a fault, not a redirect.
-      uop.isBranch := True; uop.cond := 1; uop.branchDisp := 0
-      uop.isTrapv := True; uop.isScc := False; uop.isDbcc := False
+      // TRAPV cond-trap µop: a branch-class uop reading NZVC, marked isCondTrap.
+      // cond = 9 (VS): the EU evaluates taken=v -> trapvFault if V=1. Redirect is
+      // suppressed by the `isCondTrap` gate regardless of `taken`.
+      uop.isBranch := True; uop.cond := 9; uop.branchDisp := 0
+      uop.isCondTrap := True; uop.isScc := False; uop.isDbcc := False
       // branch-EU control fields the TRAPV path must NOT trigger (call/return + line-5):
       uop.ibranch := False; uop.anInc := 0; uop.stkPush := False; uop.ccrRestore := False
       uop.pc := 0x2000; uop.nextPc := iNextPc; uop.faultUsesNextPc := True

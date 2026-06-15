@@ -3907,4 +3907,64 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l #12,%a2 ; move.l (0,%a0,%a2.l*1),%d2 ; " +
       ".stop: bra .stop", nInstr = 6)
   }
+
+  // ── TRAPcc lock-step: 020+ conditional trap (vector 7, format-$2) ────────────
+  // TRAPcc is the generalisation of TRAPV: evaluates a 16-condition code `cccc`; if
+  // TRUE raises vector 7 (same format-$2 as TRAPV). The stacked PC is the NEXT
+  // instruction's PC (past any operand words). All forms lock-stepped vs Musashi.
+
+  // cond-TRUE case (TRAPT, no-operand): TRAPT always traps -> vector 7 (format-$2).
+  // Uses the VS-entry CCR re-construction trick: the handler's last flag-writer
+  // reproduces the entry flags (N=1,V=1 from the add.l overflow just before TRAPT)
+  // so the whitebox-reconstructed CCR matches Musashi's RTE-restored CCR at the RTE step.
+  // TRAPT is the 1-word no-operand form (ttt=4), so stacked PC = trappc + 2.
+  test("lock-step: TRAPT (cond=T, no-operand) -> handler -> RTE (format-$2)", VerilatorTest) {
+    runLockStep("exc-trapt",
+      "move.l #handler,%d0 ; move.l %d0,0x1c ; " +         // vector 7 @ 0x1C
+      "move.l #0x7fffffff,%d4 ; add.l %d4,%d4 ; " +        // signed overflow -> N=1,V=1
+      "trapt ; moveq #7,%d3 ; " +                           // TRAPT: always traps (ttt=4, no operand)
+      "loop: bra loop ; " +
+      "handler: move.l #0x7fffffff,%d1 ; add.l %d1,%d1 ; rte",   // reproduce N=1,V=1 for RTE
+      nInstr = 9)
+  }
+
+  // TRAPEQ (cond=EQ, no-operand, ttt=4): Z=1 -> trap; Z=0 -> fall through.
+  // MOVEQ #0 clears all CCR except Z=1 (N=0, V=0, C=0, Z=1). TRAPEQ fires.
+  // The handler reproduces entry CCR (Z=1 from moveq #0).
+  test("lock-step: TRAPEQ (cond=EQ, no-operand, Z=1) -> handler -> RTE", VerilatorTest) {
+    runLockStep("exc-trapeq-taken",
+      "move.l #handler,%d0 ; move.l %d0,0x1c ; " +         // vector 7 @ 0x1C
+      "moveq #0,%d5 ; " +                                   // Z=1, N=0, V=0, C=0
+      "trapeq ; moveq #7,%d3 ; " +                          // TRAPEQ: Z=1 -> traps (ttt=4)
+      "loop: bra loop ; " +
+      "handler: moveq #0,%d6 ; rte",                        // reproduce Z=1 for RTE CCR match
+      nInstr = 7)
+  }
+
+  // TRAPVS (#data16 form, ttt=2): VS (V=1) -> trap. Uses V=1 from add.l overflow.
+  // stacked PC = trapvspc + 4 (opword + #data16 word). Handler reproduces N=1,V=1.
+  test("lock-step: TRAPVS.W (cond=VS, #data16 form, V=1) -> handler -> RTE", VerilatorTest) {
+    runLockStep("exc-trapvs-w",
+      "move.l #handler,%d0 ; move.l %d0,0x1c ; " +         // vector 7 @ 0x1C
+      "move.l #0x7fffffff,%d4 ; add.l %d4,%d4 ; " +        // N=1,V=1
+      "trapvsw #0xBEEF ; moveq #7,%d3 ; " +                 // TRAPVS.W (+#data16, 2 words): V=1 -> traps
+      "loop: bra loop ; " +
+      "handler: move.l #0x7fffffff,%d1 ; add.l %d1,%d1 ; rte",   // reproduce N=1,V=1
+      nInstr = 9)
+  }
+
+  // cond-FALSE case (TRAPF, no-operand): TRAPF never traps -> fall through.
+  test("lock-step: TRAPF (cond=F, no-operand) -> falls through (no trap)", VerilatorTest) {
+    runLockStep("exc-trapf-notaken",
+      "moveq #5,%d4 ; trapf ; moveq #7,%d3 ; loop: bra loop",
+      nInstr = 4)
+  }
+
+  // cond-FALSE case (TRAPEQ with Z=0): Z=0 -> fall through.
+  // MOVEQ #1 clears Z (Z=0, V=0, N=0, C=0). TRAPEQ does NOT fire.
+  test("lock-step: TRAPEQ (cond=EQ, no-operand, Z=0) -> falls through (no trap)", VerilatorTest) {
+    runLockStep("exc-trapeq-notaken",
+      "moveq #1,%d5 ; trapeq ; moveq #7,%d3 ; loop: bra loop",
+      nInstr = 4)
+  }
 }

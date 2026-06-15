@@ -187,7 +187,7 @@ object Microcode {
     u.cond := 0; u.branchDisp := 0
     u.unimplemented := False
     u.faulted := False; u.faultVector := 0; u.faultUsesNextPc := False
-    u.faultAddr := ctx.pc; u.sswInstr := False; u.isRte := False; u.isTrapv := False
+    u.faultAddr := ctx.pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
     u.divSigned := False; u.div64 := False
     // The two An write-back ADDs are DROPPED crack µops (divIsRem): the commit
     // observation is dropped, but the An write lands in the PRF + is verified by a later
