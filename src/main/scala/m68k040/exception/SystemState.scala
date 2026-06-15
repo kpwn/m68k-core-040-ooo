@@ -45,7 +45,7 @@ class SystemState extends Area {
   val m = srSys(M_BIT); m.simPublic()
 
   /** Active supervisor stack: M ? MSP : ISP. */
-  val supBank = Mux(m, msp, isp)
+  val supBank = Mux(m, msp, isp); supBank.simPublic()
   /** Architectural A7, banked by committed (S, M). */
   val a7 = Mux(s, supBank, usp); a7.simPublic()
 
@@ -56,6 +56,7 @@ class SystemState extends Area {
   val setIsp   = Flow(UInt(32 bits))
   val setMsp   = Flow(UInt(32 bits))
   val writeA7  = Flow(UInt(32 bits))   // writes the bank selected by committed (S, M)
+  // Default idle; allowOverride so a standalone/test DUT (and ExceptionUnit) can drive them.
   setSrSys.valid.allowOverride; setSrSys.valid := False; setSrSys.payload.allowOverride; setSrSys.payload := U(0, 8 bits)
   setVbr.valid.allowOverride;   setVbr.valid := False;   setVbr.payload.allowOverride;   setVbr.payload := U(0, 32 bits)
   setUsp.valid.allowOverride;   setUsp.valid := False;   setUsp.payload.allowOverride;   setUsp.payload := U(0, 32 bits)
@@ -67,6 +68,7 @@ class SystemState extends Area {
   // ExceptionUnit uses `ss.ssp` / `ss.setSsp`: treat ssp as an alias for isp
   // (the M=0 supervisor bank, which is what the boot SR 0x27 selects). Task 2
   // rewires these to Mux(m, msp, isp) and routes setSsp by committed (S,M).
+  // (see docs/superpowers/plans/2026-06-14-msp-isp-mbit-banking.md, Task 2)
   def ssp: UInt         = isp
   def setSsp: Flow[UInt] = setIsp
 

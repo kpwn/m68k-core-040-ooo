@@ -54,6 +54,24 @@ class SystemStateBankSpec extends AnyFunSuite {
       assert((dut.io.msp.toLong & 0xffffffffL) == 0x12340000L) // M=1 -> MSP
       assert((dut.io.isp.toLong & 0xffffffffL) == 0L)
       assert((dut.io.usp.toLong & 0xffffffffL) == 0L)
+
+      // S=1, M=0 -> ISP (set srSys first so the committed (S,M) is latched before the write)
+      dut.io.srSys #= 0x20; dut.clockDomain.waitSampling()
+      dut.io.data #= 0x56780000L; dut.io.wr #= true
+      dut.clockDomain.waitSampling(); dut.io.wr #= false
+      dut.clockDomain.waitSampling()
+      assert((dut.io.isp.toLong & 0xffffffffL) == 0x56780000L)
+      assert((dut.io.msp.toLong & 0xffffffffL) == 0x12340000L) // still from the prior MSP write
+      assert((dut.io.usp.toLong & 0xffffffffL) == 0L)
+
+      // S=0 -> USP (set srSys first so the committed (S,M) is latched before the write)
+      dut.io.srSys #= 0x00; dut.clockDomain.waitSampling()
+      dut.io.data #= 0x9ABC0000L; dut.io.wr #= true
+      dut.clockDomain.waitSampling(); dut.io.wr #= false
+      dut.clockDomain.waitSampling()
+      assert((dut.io.usp.toLong & 0xffffffffL) == 0x9ABC0000L)
+      assert((dut.io.isp.toLong & 0xffffffffL) == 0x56780000L) // unchanged
+      assert((dut.io.msp.toLong & 0xffffffffL) == 0x12340000L) // unchanged
     }
   }
 }
