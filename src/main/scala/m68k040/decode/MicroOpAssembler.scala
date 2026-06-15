@@ -1407,7 +1407,10 @@ object MicroOpAssembler {
     // LS-EU AGU reads the index, like LEA). pcRel folds pc.
     val c2SrcEa = EaDecoder.decode(op(5 downto 0), c2Size, Vec(pkt.words(0), pkt.words(2), pkt.words(3)))
     val c2EaOk  = (c2SrcEa.klass === EaClass.MEMSIMPLE) && (c2SrcEa.autoMode === EaAuto.NONE)
-    val c2PcRelAddr = (pkt.pc + U(2, 32 bits) + c2SrcEa.disp.asUInt).asBits
+    // CMP2/CHK2 has 2 ext words: [opword][cmp2_ext][ea_ext]. The EA ext word lives at
+    // pc+4, so (d16,PC)/(d8,PC,Xn) PC-relative accesses must use pc+4 as the base
+    // (= address of the EA extension word), NOT pc+2 (which would be the cmp2_ext word).
+    val c2PcRelAddr = (pkt.pc + U(4, 32 bits) + c2SrcEa.disp.asUInt).asBits
     // Load1 address = base An + disp (+ index); load2 = SAME + size.
     val c2Disp1 = Mux(c2SrcEa.pcRel, c2PcRelAddr, c2SrcEa.disp)
     val c2Disp2 = Mux(c2SrcEa.pcRel, (c2PcRelAddr.asSInt + c2SizeBytes).asBits,

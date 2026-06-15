@@ -3171,14 +3171,18 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l #0x3000,%a0 ; " +
       // .B bounds: lower=-5 (0xFB), upper=+5 (0x05) @ 0x3000, 0x3001.
       "move.b #-5,%d0 ; move.b %d0,(%a0) ; move.b #5,%d0 ; move.b %d0,1(%a0) ; " +
-      "moveq #0,%d1 ; cmp2.b (%a0),%d1 ; " +    // -5<=0<=5 -> Z=0,C=0
-      "move.l #-9,%d1 ; cmp2.b (%a0),%d1 ; " +  // -9 < -5 -> C=1 (signed)
+      // N/V sentinel before .B tests: addq.b #1,d7 with d7=0x7F -> 0x80, N=1,V=1.
+      // The bounds stores above set no flags; the sentinel writer is the last flag-setter
+      // before each cmp2.b, confirming N/V are preserved by CMP2.
+      "moveq #127,%d7 ; addq.b #1,%d7 ; moveq #0,%d1 ; cmp2.b (%a0),%d1 ; " +    // -5<=0<=5 -> Z=0,C=0; N/V=1 preserved
+      "moveq #127,%d7 ; addq.b #1,%d7 ; move.l #-9,%d1 ; cmp2.b (%a0),%d1 ; " +  // -9 < -5 -> C=1 (signed); N/V=1 preserved
       // .L bounds: lower=0x1000, upper=0x10000000 @ 0x3008.
       "move.l #0x3008,%a1 ; move.l #0x1000,%d2 ; move.l %d2,(%a1) ; " +
       "move.l #0x10000000,%d2 ; move.l %d2,4(%a1) ; " +
-      "move.l #0x5000,%d3 ; cmp2.l (%a1),%d3 ; " +  // in-bounds -> Z=0,C=0
-      "move.l #0x20000000,%d3 ; cmp2.l (%a1),%d3 ; " + // > upper -> C=1
-      "loop: bra loop", nInstr = 16)
+      // N/V sentinel before .L tests.
+      "moveq #127,%d7 ; addq.b #1,%d7 ; move.l #0x5000,%d3 ; cmp2.l (%a1),%d3 ; " +  // in-bounds -> Z=0,C=0; N/V=1 preserved
+      "moveq #127,%d7 ; addq.b #1,%d7 ; move.l #0x20000000,%d3 ; cmp2.l (%a1),%d3 ; " + // > upper -> C=1; N/V=1 preserved
+      "loop: bra loop", nInstr = 28)
   }
 
   // CMP2.W with an ADDRESS-register Rn (.W stays MASKED, not sign-extended) — the

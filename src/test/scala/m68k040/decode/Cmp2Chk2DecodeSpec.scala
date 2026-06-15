@@ -155,4 +155,37 @@ class Cmp2Chk2DecodeSpec extends AnyFunSuite {
       assert(dut.uop0.unimplemented.toBoolean && dut.uop0.faultVector.toInt == 4, "#imm -> illegal vec4")
     }
   }
+
+  // ── PC-relative EA: base is pc+4, NOT pc+2 ─────────────────────────────────
+  // CMP2/CHK2 is a 2-ext-word instruction: [opword@pc][cmp2_ext@pc+2][ea_ext@pc+4].
+  // For a (d16,PC) EA (mode 7 reg 2), the m68k spec says PC-base = address of the EA
+  // extension word = pc+4.  The crack must therefore use pc+4+disp (not pc+2+disp).
+  //
+  // Encoding: opword 0x02FA = 0000 0010 1111 1010 (ss=01 .W, mode 7 = bits[5:3]=111,
+  // reg 2 = bits[2:0]=010 → (d16,PC)).  ext word = cmp2 ext (A/D=0,Rn=1,R/M=0).
+  // ea_ext (words(2)) = d16 = 4.  pkt.pc = 0x2000.
+  // Expected lower-bound address = 0x2000 + 4 + 4 = 0x2008.
+  // Expected upper-bound address = 0x2008 + 2 (size=.W) = 0x200A.
+  test("assembler: CMP2.W (d16,PC) lower=pc+4+disp, upper=pc+4+disp+size (not pc+2)", VerilatorTest) {
+    // 0x02FA = mode 7, reg 2 = (d16,PC)
+    runAsm { dut => drive(dut, 0x02FA, ext(ad = 0, rn = 1, rm = 0), w2 = 4, len = 3); sleep(1)
+      assert(dut.count.toInt == 3, "3-µop crack")
+      // µop0: lower bound load — imm must be the folded absolute address pc+4+disp.
+      // srcAValid = false because PC-rel folds the base into the immediate.
+      assert(!dut.uop0.srcAValid.toBoolean, "PC-rel: no base register (folded into imm)")
+      // pkt.pc = 0x2000, ea_ext at pc+4, d16 = 4 -> target = 0x2008
+      val lowerAddr = dut.uop0.imm.toLong & 0xffffffffL
+      assert(lowerAddr == 0x2008L,
+        s"lower-bound: expected pc+4+disp=0x2008, got 0x${lowerAddr.toHexString} " +
+        s"(bug would give 0x${(0x2002L + 4L).toHexString} for pc+2+disp)")
+      // µop1: upper bound load = lower + size(2) = 0x200A
+      val upperAddr = dut.uop1.imm.toLong & 0xffffffffL
+      assert(upperAddr == 0x200AL,
+        s"upper-bound: expected pc+4+disp+size=0x200A, got 0x${upperAddr.toHexString}")
+      // sanity: the rest of the crack is well-formed
+      assert(dut.uop0.dstReg.toInt == T0 && dut.uop1.dstReg.toInt == T1, "T0 / T1")
+      assert(dut.uop2.op.toEnum == DecOp.CMP2CHK2, "u2 = compare")
+      assert(dut.uop2.srcCReg.toInt == 1, "Rn = D1")
+    }
+  }
 }
