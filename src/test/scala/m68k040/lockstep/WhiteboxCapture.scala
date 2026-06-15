@@ -107,12 +107,20 @@ object WhiteboxCapture {
           // NOT index a non-existent oracle register (D/A are 0..15). The memory effect
           // is checked separately via checkMem.
           val isTemp = wb.intWrite && wb.dstArch >= 16
+          // The committed ss.* banks are registered readback shadows that lag the per-step
+          // commit boundary for a normal A7 write. The ACTIVE (S,M)-selected bank's timely
+          // value is a7Run (== the validated live A7). Inactive banks are stable -> sample
+          // them directly. Guard: only override when a7Run is valid (>= 0).
+          val sBitN  = (sysByte >> 5) & 1
+          val mBitN  = (sysByte >> 4) & 1
+          val mspOut = if (a7Run >= 0 && sBitN == 1 && mBitN == 1) a7Run else msp
+          val ispOut = if (a7Run >= 0 && sBitN == 1 && mBitN == 0) a7Run else isp
           if (!emit) Nil
           else Seq(CommitObservation(
             pc = pc, archRegId = if (isTemp) 0 else wb.dstArch,
             archRegWrite = if (isTemp) 0L else wb.result, archRegValid = wb.intWrite && !isTemp,
             ccr = ccr, memAddr = 0, memData = 0, memWrite = false,
-            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7Run, msp = msp, isp = isp))
+            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7Run, msp = mspOut, isp = ispOut))
         case ExcRec(pc, sysByte, a7, foldNzvc, setCcr5, msp, isp) =>
           // An exception/RTE step uses the ROB-surfaced ss.a7 (the exc unit's banked
           // A7); resync the running A7 to it (+ lastA7Static so the next NormRec, which
@@ -124,10 +132,17 @@ object WhiteboxCapture {
           if (foldNzvc >= 0) ccr = (ccr & 0x10) | (foldNzvc & 0xf)
           // MOVE-to-SR's ABSOLUTE 5-bit CCR write SETS the running CCR (X N Z V C).
           if (setCcr5 >= 0) ccr = setCcr5 & 0x1f
+          // Same active-bank shadow-lag fix for ExcRec: the exc FSM drains before consuming
+          // the shadow, but surface the active bank from a7 (timely for exc commits) and
+          // the inactive banks from the stable shadow. Guard: only override when a7 >= 0.
+          val sBitE  = (sysByte >> 5) & 1
+          val mBitE  = (sysByte >> 4) & 1
+          val mspOutE = if (a7 >= 0 && sBitE == 1 && mBitE == 1) a7 & 0xffffffffL else msp
+          val ispOutE = if (a7 >= 0 && sBitE == 1 && mBitE == 0) a7 & 0xffffffffL else isp
           Seq(CommitObservation(
             pc = pc, archRegId = 0, archRegWrite = 0, archRegValid = false,
             ccr = ccr, memAddr = 0, memData = 0, memWrite = false,
-            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7, msp = msp, isp = isp))
+            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7, msp = mspOutE, isp = ispOutE))
       }
     }
   }
