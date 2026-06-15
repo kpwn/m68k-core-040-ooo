@@ -127,10 +127,12 @@ case class DecodedUop() extends Bundle {
   val sswInstr     = Bool()
   // RTE (return-from-exception): a serializing exception-return µop. Default False.
   val isRte        = Bool()
-  // TRAPV (0x4E76): an execute-time CONDITIONAL trap. A branch-class trap-check µop
-  // (isBranch + readsNzvc) marked isTrapv; the branch EU reads NZVC and, if V=1,
-  // drives a trapvFault (vector 7, faultPc = nextPc). If V=0 it retires as a no-op.
-  val isTrapv      = Bool()
+  // isCondTrap: a branch-class execute-time CONDITIONAL trap µop (isBranch + readsNzvc).
+  // The branch EU evaluates the 16-condition `cond` field (via `taken`); if taken it
+  // drives a trapvFault (vector 7, faultPc = nextPc). If not taken it retires as a no-op.
+  // TRAPV (0x4E76) uses isCondTrap with cond=9 (VS, V=1). TRAPcc uses cond=cccc.
+  // The µop NEVER causes a branch redirect regardless of `taken` (the EU suppresses it).
+  val isCondTrap   = Bool()
   // ── CPLX-cluster (DivEu) control (CHK / DIV) ────────────────────────────────
   // `divSigned` = DIVS (vs DIVU) / CHK is always signed-compare. `div64` = the
   // 64-bit-dividend form (Dr:Dq); `divForm` selects the writeback/iteration width.

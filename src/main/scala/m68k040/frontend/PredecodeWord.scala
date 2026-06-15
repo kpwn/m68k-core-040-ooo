@@ -396,6 +396,16 @@ object PredecodeWord {
             r.simple := True; r.lenWords := U(2, 3 bits)
           } elsewhen(mode === U(0, 3 bits)) {                      // Scc Dn
             r.simple := True; r.lenWords := U(1, 3 bits)
+          } elsewhen(mode === U(7, 3 bits)) {                      // TRAPcc (mode 7)
+            val ttt = op(2 downto 0).asUInt
+            when(ttt === U(4, 3 bits)) {                           // TRAPcc (no operand, 1 word)
+              r.simple := True; r.lenWords := U(1, 3 bits)
+            } elsewhen(ttt === U(2, 3 bits)) {                     // TRAPcc.W (#data16, 2 words)
+              r.simple := True; r.lenWords := U(2, 3 bits)
+            } elsewhen(ttt === U(3, 3 bits)) {                     // TRAPcc.L (#data32, 3 words)
+              r.simple := True; r.lenWords := U(3, 3 bits)
+            }
+            // other ttt -> COMPLEX (stays ILLEGAL)
           }
         }
       }

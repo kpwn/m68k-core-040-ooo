@@ -43,9 +43,9 @@ case class BrWbObs() extends Bundle {
 trait BranchEuService {
   def issue: Stream[IqContext]
   def completion: Flow[BranchCompletion]
-  /** TRAPV execute-time conditional fault (vector 7): fires when a TRAPV trap-check
-    * µop sees V=1. The ROB consumes it like lsFaultCompletion. Generalized to carry
-    * the vector so the ROB's euFault handling is shared with CHK/DIV0. */
+  /** isCondTrap execute-time conditional fault (vector 7): fires when a cond-trap µop
+    * (TRAPV/TRAPcc) evaluates its `cond` as taken. The ROB consumes it like
+    * lsFaultCompletion. Carries the vector so ROB euFault handling is shared with CHK/DIV0. */
   def trapvFault: Flow[EuFault]
 }
 
@@ -143,7 +143,10 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
 
     // An ibranch ALWAYS redirects (unconditional); a Bcc/BRA redirects iff `taken`;
     // DBcc redirects iff dbBranch; Scc never redirects.
-    val redirect  = Mux(u1.isScc, False,
+    // isCondTrap (TRAPV/TRAPcc): NEVER redirects regardless of `taken` — it is a
+    // fault, not a control transfer. Gate explicitly (cond carries the real condition,
+    // not the fixed F=cond1 of the old TRAPV, so the `taken` path must be suppressed).
+    val redirect  = Mux(u1.isScc || u1.isCondTrap, False,
                     Mux(u1.isDbcc, dbBranch,
                     Mux(u1.ibranch, True, taken)))
     // Fall-through PC = the instruction's POST-PC (pc + length). DBcc is a 2-word
@@ -152,13 +155,12 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     val nextPc    = Mux(redirect, target, u1.nextPc)
 
     // ---- S1: completion (entry completes either way so it can retire) ----
-    // TRAPV is decoded with cond=F (taken=False), so it naturally yields mispredict=
-    // False and nextPc = pc+2 (= its own nextPc) with NO isTrapv term on these
-    // outputs — keeping the completion->ROB->IQ-select arc off the critical path. A
-    // V=1 TRAPV instead raises trapvFault (below); a V=0 TRAPV retires as a no-op.
+    // isCondTrap (TRAPV/TRAPcc): redirect is suppressed by the `|| u1.isCondTrap` gate
+    // above, so mispredict stays False and nextPc = the instruction's nextPc regardless
+    // of `taken`. A taken cond-trap raises trapvFault (below); not-taken retires as no-op.
     completionPort.valid              := s1Valid
     completionPort.payload.robId      := s1Ctx.robId
-    completionPort.payload.mispredict := s1Valid && redirect  // TRAPV: redirect=False -> no redirect
+    completionPort.payload.mispredict := s1Valid && redirect
     completionPort.payload.nextPc     := nextPc
 
     // ---- S1: branch-EU int write (RTS/RTR postinc A7, OR Scc/DBcc Dn write) ----
@@ -175,10 +177,12 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     anW.valid     := anWrite;  anW.address := u1.pdst;  anW.data := intData
     anByp.valid   := anWrite;  anByp.address := u1.pdst; anByp.data := intData
 
-    // ---- S1: TRAPV execute-time conditional fault (vector 7 if V=1) ----
-    trapvFaultPort.valid          := s1Valid && u1.isTrapv && v
+    // ---- S1: isCondTrap execute-time conditional fault (vector 7 if cond taken) ----
+    // Covers TRAPV (cond=9=VS, taken iff V) and TRAPcc (cond=cccc). Both deliver
+    // vector 7 (format-$2 group-2 trap); the redirect is suppressed above.
+    trapvFaultPort.valid          := s1Valid && u1.isCondTrap && taken
     trapvFaultPort.payload.robId  := s1Ctx.robId
-    trapvFaultPort.payload.vector := U(7, 8 bits)   // TRAPV -> vector 7
+    trapvFaultPort.payload.vector := U(7, 8 bits)   // vector 7 (TRAPV / TRAPcc)
 
     // ---- S1: sim-only whitebox. A plain branch writes NO reg; an RTS/RTR ibranch
     // writes A7 (the postincremented SP); Scc/DBcc write Dn. Report that int write +

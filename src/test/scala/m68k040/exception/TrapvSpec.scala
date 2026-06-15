@@ -12,9 +12,9 @@ import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
 
 /** TRAPV (0x4E76): execute-time CONDITIONAL trap. The decoder emits a branch-class
-  * trap-check µop (isTrapv, readsNzvc). At execute the branch EU reads NZVC; if V=1
-  * it drives a trapvFault completion (vector 7 implied, faultPc = nextPc) so the ROB
-  * marks the entry faulted; if V=0 the µop completes as a no-op and retires.
+  * cond-trap µop (isCondTrap, cond=9=VS, readsNzvc). At execute the branch EU reads
+  * NZVC; if V=1 it drives a trapvFault completion (vector 7 implied, faultPc = nextPc)
+  * so the ROB marks the entry faulted; if V=0 the µop completes as a no-op and retires.
   *
   * This unit test drives the branch EU directly (the model for the V read) and
   * observes the trapvFault completion. */
@@ -45,11 +45,11 @@ class TrapvSpec extends AnyFunSuite {
       uop.readsX := False; uop.pXSrc := 0; uop.pXDst := 0; uop.writesX := False; uop.pXOld := 0
       uop.faulted := False; uop.faultVector := 0; uop.isRte := False
       uop.faultAddr := 0; uop.sswInstr := False
-      // TRAPV trap-check µop: a branch-class uop reading NZVC, marked isTrapv.
-      // cond = F (1): matches the decoder so the branch EU yields taken=False
-      // (mispredict stays False) — TRAPV is a fault, not a redirect.
-      uop.isBranch := True; uop.cond := 1; uop.branchDisp := 0
-      uop.isTrapv := True; uop.isScc := False; uop.isDbcc := False
+      // TRAPV cond-trap µop: a branch-class uop reading NZVC, marked isCondTrap.
+      // cond = 9 (VS): the EU evaluates taken=v -> trapvFault if V=1. Redirect is
+      // suppressed by the `isCondTrap` gate regardless of `taken`.
+      uop.isBranch := True; uop.cond := 9; uop.branchDisp := 0
+      uop.isCondTrap := True; uop.isScc := False; uop.isDbcc := False
       // branch-EU control fields the TRAPV path must NOT trigger (call/return + line-5):
       uop.ibranch := False; uop.anInc := 0; uop.stkPush := False; uop.ccrRestore := False
       uop.pc := 0x2000; uop.nextPc := iNextPc; uop.faultUsesNextPc := True

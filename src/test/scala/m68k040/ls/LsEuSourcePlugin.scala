@@ -90,7 +90,7 @@ class LsEuSourcePlugin extends FiberPlugin {
     uop.firstOfInstr := True
     uop.faulted      := False; uop.faultVector := U(0); uop.faultUsesNextPc := False
     uop.faultAddr    := U(0); uop.sswInstr := False
-    uop.isRte        := False; uop.isTrapv := False
+    uop.isRte        := False; uop.isCondTrap := False
     ctx.robId := iRobId
     eu.issue.valid   := iValid
     eu.issue.payload := ctx
