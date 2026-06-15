@@ -31,7 +31,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
   var a7Rd: m68k040.execute.regfile.RegFileReadPort = null
   during setup {
     a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
-    a7Rd = host[m68k040.execute.regfile.IntRegFileService].newRead()
+    a7Rd = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
   }
   val logic = during build new Area {
     val iq  = host[IssueQueueService]

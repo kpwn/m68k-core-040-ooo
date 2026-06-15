@@ -483,6 +483,8 @@ class ExceptionUnit(
     }
     E_REDIR.whenIsActive {
       // commit the architectural side-effects + redirect
+      // NB: ss.writeA7 (live readback) also fires every cycle, but setIsp/setMsp here
+      // WIN by SystemState's later-when ordering — this serializing SP write is authoritative.
       when(ss.m) { ss.setMsp.valid := True; ss.setMsp.payload := frameBase }
       .otherwise { ss.setIsp.valid := True; ss.setIsp.payload := frameBase }
       // enter supervisor, clear trace: set S (bit5), clear T1/T0 (bits 7,6).

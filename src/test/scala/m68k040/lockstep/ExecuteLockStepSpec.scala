@@ -56,7 +56,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     during setup {
       a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
       seedWr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7", priority = 1)
-      a7Rd   = host[m68k040.execute.regfile.IntRegFileService].newRead()
+      a7Rd   = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
     }
     val logic = during build new Area {
       val seedValid = in Bool (); val seedAddr = in UInt (6 bits); val seedData = in Bits (32 bits)
