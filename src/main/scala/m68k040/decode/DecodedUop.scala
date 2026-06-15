@@ -251,7 +251,7 @@ case class DecodedUop() extends Bundle {
   // trailing store is dropped). The EUs OR it into wbObs.keepCommit. Default False.
   val keepCommit = Bool()
   // ── Commit-time PRIVILEGED SYSTEM ops (MOVE-to-SR / MOVE-USP / MOVEC) ─────────
-  // These ops write/read COMMITTED architectural system state (srSys/usp/ssp/vbr/
+  // These ops write/read COMMITTED architectural system state (srSys/usp/isp/msp/vbr/
   // cacr) owned by the commit-side ExceptionUnit/SystemState — they CANNOT execute
   // out-of-order. `sysOp` marks such a µop: the ROB retires it ALONE (serializing,
   // like RTE), the ExceptionUnit applies the effect at retire (re-banking A7 +

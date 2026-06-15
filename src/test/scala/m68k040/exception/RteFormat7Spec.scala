@@ -104,7 +104,7 @@ class RteFormat7Spec extends AnyFunSuite {
       val retSr = 0x2700            // S=1, I=7. supervisor.
       val retPc = 0x40000010L       // the faulting instruction PC (re-executed)
       val faultVA = 0x2000L
-      dut.rob.logic.exc.ss.ssp #= ssp0
+      dut.rob.logic.exc.ss.isp #= ssp0
       def pokeBE16(a: Long, w: Int): Unit = { dmem.pokeByte(a, (w >> 8) & 0xff); dmem.pokeByte(a + 1, w & 0xff) }
       def pokeBE32(a: Long, w: Long): Unit = { pokeBE16(a, ((w >> 16) & 0xffff).toInt); pokeBE16(a + 2, (w & 0xffff).toInt) }
       // Stack the full $7 frame (MAME layout) so the format word @+6 selects $7.
@@ -136,8 +136,8 @@ class RteFormat7Spec extends AnyFunSuite {
 
       assert((dut.rob.logic.exc.ss.srSys.toInt & 0xff) == ((retSr >> 8) & 0xff),
         f"srSys=0x${dut.rob.logic.exc.ss.srSys.toInt}%02x expected 0x${(retSr >> 8) & 0xff}%02x")
-      assert((dut.rob.logic.exc.ss.ssp.toLong & 0xffffffffL) == ssp0 + 60,
-        f"ssp=0x${dut.rob.logic.exc.ss.ssp.toLong}%x expected 0x${ssp0 + 60}%x (popped 60-byte format-7 frame)")
+      assert((dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL) == ssp0 + 60,
+        f"ssp=0x${dut.rob.logic.exc.ss.isp.toLong}%x expected 0x${ssp0 + 60}%x (popped 60-byte format-7 frame)")
       assert(((dut.rob.logic.exc.ss.srSys.toInt >> 5) & 1) == 1, "S still set (returned to supervisor)")
     }
   }

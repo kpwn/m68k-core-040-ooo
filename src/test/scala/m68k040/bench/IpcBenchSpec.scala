@@ -338,7 +338,7 @@ class IpcBenchSpec extends AnyFunSuite {
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
 
-      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
       cd.waitSampling()
       dut.fa.logic.redirect.valid   #= true
       dut.fa.logic.redirect.payload #= loadAddr

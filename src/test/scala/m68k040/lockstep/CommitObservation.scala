@@ -13,5 +13,7 @@ final case class CommitObservation(
     memData:      Long,
     memWrite:     Boolean,
     sr:           Int  = 0x2700,   // full 16-bit SR (system byte + CCR)
-    a7:           Long = -1L       // committed A7 (-1 = "not surfaced/don't compare")
+    a7:           Long = -1L,      // committed A7 (-1 = "not surfaced/don't compare")
+    msp:          Long = -1L,      // committed MSP (-1 = not surfaced)
+    isp:          Long = -1L       // committed ISP (-1 = not surfaced)
 )

@@ -93,6 +93,7 @@ object Musashi {
       irqEvents: Seq[(Long, Int)] = Seq.empty,
       interruptAckVector: Option[Int] = None,
       initialSr: Option[Int] = None,
+      initialMsp: Option[Long] = None,
       mmu: Option[MmuConfig] = None,
       maxCycles: Int = 50000): Either[OracleError, Vector[OracleStep]] = {
     require(irqEvents.forall { case (_, level) => level >= 0 && level <= 7 }, "IRQ event levels must be 0 through 7")
@@ -119,6 +120,7 @@ object Musashi {
             irqEvents.flatMap { case (pc, level) => Seq("--irq-event", f"0x${pc & 0xffffffffL}%08x:$level") } ++
             interruptAckVector.toSeq.flatMap(vector => Seq("--ack-vector", vector.toString)) ++
             initialSr.toSeq.flatMap(sr => Seq("--initial-sr", f"0x${sr & 0xffff}%04x")) ++
+            initialMsp.toSeq.flatMap(msp => Seq("--initial-msp", f"0x${msp & 0xffffffffL}%08x")) ++
             mmuArgs(mmu)
         runTraceCmd(cmd, trace)
       } finally {

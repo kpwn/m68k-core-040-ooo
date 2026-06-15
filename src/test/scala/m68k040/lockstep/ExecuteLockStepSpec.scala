@@ -50,9 +50,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // write port (the exc unit is idle at boot, so no same-cycle collision). Driven by
     // the harness for a couple of cycles after the init sweep, before the first fetch.
     var seedWr: m68k040.execute.regfile.RegFileWritePort = null
+    // Int PRF READ port for the LIVE committed A7 readback (arch-15 committed phys). Feeds
+    // exc.committedA7In so ss.usp/isp/msp continuously mirror the architectural A7.
+    var a7Rd: m68k040.execute.regfile.RegFileReadPort = null
     during setup {
       a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
       seedWr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7", priority = 1)
+      a7Rd   = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
     }
     val logic = during build new Area {
       val seedValid = in Bool (); val seedAddr = in UInt (6 bits); val seedData = in Bits (32 bits)
@@ -199,15 +203,22 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       lsEu.excXlateWrite        := exc.dtReq.write
       lsEu.excXlateSupervisor   := exc.dtReq.supervisor
       exc.sqDrained             := lsEu.sqEmptySig
-      // A7 (int reg 15) write-back on an exception/RTE A7 change. Committed arch-15
-      // maps to phys-15 (identity, unrenamed in these programs). The SAME PRF write
-      // port also serves a commit-time SYSTEM op's READ direction (MOVE-USP / MOVEC
-      // Rc->Rn writes an arbitrary int arch-Rn): sysRegWrite fires in S_APPLY, a7Write
-      // in S_REDIR (consecutive cycles -> no same-cycle collision on the one port).
+      // A7 (arch-15) write on exc/RTE A7 change. The SAME PRF write port also serves
+      // a commit-time SYSTEM op's READ direction (MOVE-USP / MOVEC Rc->Rn writes an
+      // arbitrary int arch-Rn): sysRegWrite fires in S_APPLY, a7Write in S_REDIR
+      // (consecutive cycles -> no same-cycle collision on the one port).
+      // The a7Write address uses committedPhysA7 (commReg(15)) so the write is correct
+      // even when arch-15 has been renamed by an OoO A7 write (move ...,%sp / push /
+      // bsr). When A7 is unrenamed, committedPhysA7 == 15, identical to old U(15).
       a7Wr.valid   := exc.a7WriteValid || exc.sysRegWriteValid
       a7Wr.address := Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
-                                                U(15, a7Wr.address.getWidth bits))
+                                                host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth))
       a7Wr.data    := Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits)
+      // LIVE committed-A7 readback: read the int PRF at the committed arch-15 phys mapping
+      // and feed it to the exception unit, which drives ss.writeA7 every cycle (routed by
+      // committed S,M) so ss.usp/isp/msp track the architectural A7 of the active bank.
+      a7Rd.addr := host[RenameStage].committedPhysA7.resize(a7Rd.addr.getWidth)
+      exc.committedA7In := a7Rd.data.asUInt
     }
   }
 
@@ -318,13 +329,17 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
   def runLockStep(name: String, src: String, nInstr: Int = -1, checkMem: Seq[Long] = Seq.empty,
                   checkSpan: Int = 4, mmuMap: Option[(Long, Long)] = None,
-                  initialSr: Option[Int] = None, usp: Long = 0x00200000L): Unit = {
+                  initialSr: Option[Int] = None, usp: Long = 0x00200000L,
+                  initialMsp: Option[Long] = None): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
 
     // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel. `initialSr` (when set)
     // boots both Musashi AND the DUT in a non-default mode (e.g. USER mode S=0 for the
-    // privilege-violation test).
-    val oracleSteps: Vector[OracleStep] = Musashi.assembleAndTrace(src, initialSr = initialSr) match {
+    // privilege-violation test). `initialMsp` (when set) seeds the inactive MSP bank so
+    // the program can switch to M=1 without first writing %sp (avoiding the phys-15
+    // rename that would break the exc FSM's hardcoded arch-15 write path).
+    val oracleSteps: Vector[OracleStep] = Musashi.assembleAndTrace(src, initialSr = initialSr,
+                                                                   initialMsp = initialMsp) match {
       case Right(v)  => v
       case Left(err) => fail(s"[$name] Musashi.assembleAndTrace failed: ${err.reason}")
     }
@@ -415,7 +430,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
               println(f"[$name] RAWCOMMIT rob=${c.robId.toInt} pc=0x${c.pc.toLong & 0xffffffffL}%08x dstArch=${w.map(_.dstArch).getOrElse(-1)} intW=${w.map(_.intWrite).getOrElse(false)} res=0x${w.map(_.result & 0xffffffffL).getOrElse(0L)}%08x divRem=${w.map(_.divRem).getOrElse(false)}")
             }
             handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
-              sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL)
+              sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
+              msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
           }
         }
         // Exception / RTE commit channel (handler-entry / restored PC + sysByte/A7).
@@ -425,7 +442,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             commitCount += 1
             handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
               if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1,
-              if (c.setCcr5Valid.toBoolean) c.setCcr5.toInt & 0x1f else -1)
+              if (c.setCcr5Valid.toBoolean) c.setCcr5.toInt & 0x1f else -1,
+              msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
           }
         }
       }
@@ -470,18 +489,29 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Boot the committed supervisor SP to Musashi's initial SSP (0x00100000) AFTER
       // the init sweep (it resets committed state) so the surfaced A7 (== SSP, S=1)
       // matches OracleStep.a(7) for every program.
-      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
       // Boot mode: default supervisor (SR boot 0x2700, S=1). When `initialSr` overrides it
       // (e.g. user mode S=0 for the privilege-violation test), seed the committed SR system
       // byte AND the USP bank; in user mode the surfaced A7 == USP, so the int PRF arch-15
       // must mirror USP (not SSP).
       val userMode = initialSr.exists(sr => ((sr >> 13) & 1) == 0)
+      // M=1 mode: when `initialSr` has M=1, the active bank at boot is MSP. Seed ss.msp
+      // to `initialMsp` so that (a) the live-coherent writeA7 feedback reads the correct
+      // PRF value and (b) the oracle (seeded via --initial-msp) matches the DUT from the
+      // first step. The ISP remains at 0x00100000 (the inactive bank for M=1).
+      val modeM1 = initialSr.exists(sr => ((sr >> 12) & 1) == 1)
       initialSr.foreach(sr => dut.rob.logic.exc.ss.srSys #= (sr >> 8) & 0xff)
+      initialMsp.foreach(msp => dut.rob.logic.exc.ss.msp #= BigInt(msp & 0xffffffffL))
       dut.rob.logic.exc.ss.usp #= BigInt(usp & 0xffffffffL)
-      val bootA7 = if (userMode) (usp & 0xffffffffL) else 0x00100000L
+      // bootA7: the PRF arch-15 must mirror the ACTIVE bank's value so the OoO datapath
+      // sees the correct A7 from the first instruction. Active bank selection:
+      //   user mode (S=0) -> USP; M=1 supervisor -> MSP; M=0 supervisor -> ISP.
+      val bootA7 = if (userMode) (usp & 0xffffffffL)
+                   else if (modeM1) initialMsp.getOrElse(0L) & 0xffffffffL
+                   else 0x00100000L
       // Seed the int PRF arch-15 (A7, identity phys-15) to the boot SP: the OoO
       // datapath reads A7 from the int PRF (call/return push/pop), so it must mirror
-      // the committed SP at boot (reset loads SP into A7). The exc unit keeps ss.ssp
+      // the committed SP at boot (reset loads SP into A7). The exc unit keeps ss.isp
       // in sync on exceptions; the PRF arch-15 follows OoO writes thereafter.
       dut.wire.logic.seedValid #= true
       dut.wire.logic.seedAddr  #= 15
@@ -605,7 +635,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           if (c.fire.toBoolean) {
             commitCount += 1
             val pc = c.pc.toLong & 0xffffffffL
-            handle.onCommit(c.robId.toInt, pc, sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL)
+            handle.onCommit(c.robId.toInt, pc, sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
+              msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
             // The just-committed instruction's successor is `pc`. If an IRQ event is
             // scheduled at `pc` and not yet fired, raise iplIn so the next head
             // (the eventPc instruction) recognizes the interrupt before committing.
@@ -628,7 +660,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             // ARE their own oracle steps -> keep them.
             if (!isInt) {
               commitCount += 1
-              handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL, if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1)
+              handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
+                if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1,
+                msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+                isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
             } else {
               // Drop the IRQ line on the entry commit (one-shot edge): the interrupt
               // is taken, the mask is raised; a re-fire after RTE must not loop.
@@ -656,10 +691,20 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
-      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
       // Boot the committed SR to initialSr's system byte (lower the I-mask so a
       // non-NMI level is taken; matches the oracle's --initial-sr).
       dut.rob.logic.exc.ss.srSys #= (initialSr >> 8) & 0xff
+      // Seed the int PRF arch-15 (A7, identity phys-15) to the boot SSP. The committed
+      // A7 banks (ss.usp/isp/msp) are now LIVE-COHERENT with the architectural A7 read
+      // back from the PRF every cycle (the exc unit drives ss.writeA7), so the PRF
+      // arch-15 — not the poked ss.isp — is the boot SP source of truth. All IRQ tests
+      // boot supervisor (initialSr S=1), so the active bank is ISP = 0x00100000.
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
       cd.waitSampling()
       dut.fa.logic.redirect.valid   #= true
       dut.fa.logic.redirect.payload #= loadAddr
@@ -1167,7 +1212,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // FSM's vector fetch resolves; we don't need handler parity).
       val handlerPc = loadAddr + 2   // the `handler:` label (after the 1-word MOVE)
       for (i <- 0 until 4) dmem.pokeByte(0x20 + i, ((handlerPc >> (8 * i)) & 0xff).toInt)
-      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
       dut.rob.logic.exc.ss.usp #= 0x00200000L
       // Boot mode: user (S=0, SR 0x0000) or supervisor (S=1, 0x27 default).
       if (userMode) dut.rob.logic.exc.ss.srSys #= 0x00 else dut.rob.logic.exc.ss.srSys #= 0x27
@@ -2233,14 +2278,18 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         for (k <- 0 until 2) {
           val c = dut.rob.logic.commitObs(k)
           if (c.fire.toBoolean)
-            handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL)
+            handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
+              msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
         }
         val ce = dut.rob.logic.commitObs(2)
         if (ce.fire.toBoolean) {
           if (!ce.isInterrupt.toBoolean)
             handle.onExcCommit(ce.pc.toLong & 0xffffffffL, ce.sysByte.toInt & 0xff, ce.a7.toLong & 0xffffffffL,
               if (ce.ccrFoldValid.toBoolean) ce.ccrFold.toInt & 0xf else -1,
-              if (ce.setCcr5Valid.toBoolean) ce.setCcr5.toInt & 0x1f else -1)
+              if (ce.setCcr5Valid.toBoolean) ce.setCcr5.toInt & 0x1f else -1,
+              msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
           else dut.intCtrl.logic.iplIn #= 0   // one-shot edge: drop on the entry
         }
         // STOP-aware IRQ injection: raise iplIn once the core is halted (stopped). The new
@@ -2270,7 +2319,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
-      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
       dut.rob.logic.exc.ss.srSys #= (initialSr >> 8) & 0xff
       cd.waitSampling()
       dut.fa.logic.redirect.valid   #= true
@@ -2830,6 +2879,110 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 7)
   }
 
+  // ── M-bit MSP/ISP banking lock-step tests ────────────────────────────────────
+  // The 68040 has three SP banks: USP (user), ISP (supervisor interrupt stack,
+  // S=1 M=0), and MSP (master stack, S=1 M=1).  Bit 12 (M) of SR selects ISP vs
+  // MSP while in supervisor mode.  These tests exercise the live-coherent banking
+  // logic (ss.msp / ss.isp updated at commit time, surfaced every step, compared
+  // vs Musashi's REG_MSP / REG_ISP every step).
+  //
+  // CONSTRAINT: M=1 may only pair with a TRAP/illegal/privileged exception — NOT
+  // an interrupt.  The interrupt-with-M=1 throwaway frame (format $1) is a later
+  // slice and is NOT implemented.  A TRAP while M=1 stacks a normal format-$0
+  // frame on the master stack (no throwaway frame); Musashi matches this exactly.
+
+  // Test 1: seed MSP=0x000A0000 (via initialMsp), then MOVE-to-SR to switch to M=1
+  // (arch-15 is still at phys-15 identity alias when the exc FSM fires, so the
+  // re-bank is coherent).  After the switch, take TRAP #1 on the master stack
+  // (format-$0), handler RTEs, M stays 1.  Inactive ISP (0x00100000) is preserved
+  // and compared every step.
+  //
+  // Instruction sequence (nInstr = 7):
+  //  1  move.w #0x3700,%sr    S=1,M=1,I=7 (exc FSM; arch-15 = phys-15 identity)
+  //  2  move.l #handler,%d0   load handler address (no arch-15 rename)
+  //  3  move.l %d0,0x84       install vec 33 (TRAP #1 = 32+1, 33*4=0x84)
+  //  4  trap #1               format-$0 frame on MSP; exc commit; MSP -> 0x0009FFF8
+  //  5  moveq #9,%d4          handler body
+  //  6  rte                   restore SR/PC; M stays 1; MSP restored to 0x000A0000
+  //  7  moveq #7,%d3          resume after RTE
+  //
+  // WHY initialMsp IS NEEDED: the exc FSM writes the re-banked A7 to PRF arch-15 at
+  // a hardcoded physical address (phys-15 = identity alias at boot).  After any OoO
+  // A7 write (e.g., move.l #addr,%sp) the committed RAT's phys for arch-15 diverges
+  // from phys-15; then the writeA7 feedback loop restores the old value, reverting
+  // the exc FSM's SP decrement.  Seeding MSP via initialMsp and doing MOVE-to-SR
+  // BEFORE any %sp write keeps phys-15 as the committed alias throughout, so all
+  // exc FSM A7 writes land on the correct physical register.
+  //
+  // NOTE (Musashi seeding): --initial-msp is applied while M=0 so Musashi stores
+  // 0x000A0000 into the INACTIVE MSP shadow (sp[6]) via set_reg(MSP) with M=0.
+  // When the program's move.w #0x3700,%sr executes, Musashi's real ISA m-bit
+  // transition loads sp[6] into dar[15] and saves the old A7 (ISP) into sp[4] —
+  // exactly matching the DUT's behaviour.  ISP (sp[4]=0x00100000) is stable and
+  // compared every step thereafter.
+  test("lock-step: M-bit MSP/ISP banking (set M, write MSP, trap on MSP, RTE)", VerilatorTest) {
+    runLockStep("mbit-msp",
+      "move.w #0x3700,%sr ; " +    // (1) S=1,M=1,I=7 via exc FSM (MOVE-to-SR)
+      "move.l #handler,%d0 ; " +   // (2) load handler address (no arch-15 rename)
+      "move.l %d0,0x84 ; " +       // (3) install vec 33 (TRAP #1 = 32+1, 33*4=0x84)
+      "trap #1 ; " +               // (4) format-$0 frame on MSP; exception commit
+      "moveq #7,%d3 ; " +          // (7) resume point after RTE
+      ".stop: bra .stop ; " +
+      "handler: moveq #9,%d4 ; rte",  // (5)(6) handler body + RTE
+      nInstr = 7,
+      initialMsp = Some(0x000A0000L)) // seed inactive MSP = 0x000A0000 (DUT + oracle)
+  }
+
+  // Test 2: symmetric ISP-only trap (M stays 0) — proves the M=0 path is
+  // unchanged by the M-bit banking work.  This mirrors the TRAP #5 test but is
+  // explicitly named to tie it to the M-bit work.  TRAP #3 (vector 35, @ 0x8C)
+  // stacks a format-$0 frame on ISP (M=0), handler RTEs.
+  //
+  // Instruction sequence (nInstr = 7):
+  //  1  move.l #handler,%d0       load handler address
+  //  2  move.l %d0,0x8c           install vec 35 (TRAP #3 = 32+3 = 35*4=0x8C)
+  //  3  trap #3                   format-$0 frame on ISP; exception commit
+  //  4  moveq #3,%d1              handler body step 1
+  //  5  moveq #5,%d2              handler body step 2
+  //  6  rte                       restore SR/PC; M stays 0; ISP unwound
+  //  7  moveq #7,%d3              resume after RTE
+  test("lock-step: M-bit ISP-only trap (M stays 0)", VerilatorTest) {
+    runLockStep("mbit-isp-only",
+      "move.l #handler,%d0 ; move.l %d0,0x8c ; trap #3 ; moveq #7,%d3 ; " +
+      ".stop: bra .stop ; " +
+      "handler: moveq #3,%d1 ; moveq #5,%d2 ; rte",
+      nInstr = 7)
+  }
+
+  // ── Rename-aware A7 writeback: exception after OoO A7 write ─────────────────
+  // Validates that the exc FSM writes the re-banked A7 to committedPhysA7 (not to
+  // a hardcoded phys-15). After `move.l #0x000F0000,%sp` the committed RAT maps
+  // arch-15 to a NEW physical register (no longer phys-15 identity); the subsequent
+  // TRAP #4 must stack the format-$0 frame on that renamed A7, and RTE must restore
+  // it, step-for-step with Musashi. With the old U(15) the exc FSM would write to
+  // stale phys-15 and the handler/RTE would see the WRONG A7.
+  //
+  // Instruction sequence (nInstr = 8):
+  //  1  move.l #0x000F0000,%sp  OoO write to arch-15 (renames it off phys-15)
+  //  2  move.l #handler,%d0     load handler addr
+  //  3  move.l %d0,0x90         install vec 36 (TRAP #4 = 32+4 = 36, 36*4=0x90)
+  //  4  trap #4                 format-$0 frame on renamed A7; exc commits + writes
+  //                             committedPhysA7 with the decremented SP
+  //  5  moveq #7,%d3            resume point after RTE
+  //  6  (loop bra)              halt
+  //  7  moveq #9,%d4            handler body
+  //  8  rte                     restores SR/PC; committedPhysA7 updated to original A7
+  test("lock-step: exception after OoO A7 write (move.l #imm,%sp then trap) - rename-aware frame", VerilatorTest) {
+    runLockStep("exc-after-a7-rename",
+      "move.l #0x000F0000,%sp ; " +                   // (1) OoO rename of arch-15
+      "move.l #handler,%d0 ; move.l %d0,0x90 ; " +    // (2)(3) install vec 36 (TRAP #4)
+      "trap #4 ; " +                                  // (4) format-$0 frame on renamed A7
+      "moveq #7,%d3 ; " +                             // (5) resume after RTE
+      ".stop: bra .stop ; " +
+      "handler: moveq #9,%d4 ; rte",                  // (7)(8)
+      nInstr = 8)
+  }
+
   // ── TRAPV lock-step: execute-time conditional trap (vector 7, format-$2) ─────
   // V-set case: an add.l overflow sets V=1, so `trapv` traps -> vector 7 (format-$2
   // on the 68040), vectors to the handler, which RTEs back to the fall-through. The
@@ -3114,7 +3267,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
       def captureExc(): Unit = {
         val c = dut.rob.logic.commitObs(2)
-        if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL, if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1)
+        if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
+          if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1,
+          msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+          isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
       }
       cd.onSamplings {
         captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
@@ -3122,7 +3278,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         for (k <- 0 until 2) {
           val c = dut.rob.logic.commitObs(k)
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
-            sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL)
+            sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
+            msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
         }
         captureExc()
       }
@@ -3166,7 +3324,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
-      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
       cd.waitSampling()
       dut.fa.logic.redirect.valid   #= true
       dut.fa.logic.redirect.payload #= loadAddr
@@ -3234,10 +3392,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       for (k <- 0 until 2) {
         val c = dut.rob.logic.commitObs(k)
         if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
-          sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL)
+          sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
+          msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+          isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
       }
       val ce = dut.rob.logic.commitObs(2)
-      if (ce.fire.toBoolean) handle.onExcCommit(ce.pc.toLong & 0xffffffffL, ce.sysByte.toInt & 0xff, ce.a7.toLong & 0xffffffffL, if (ce.ccrFoldValid.toBoolean) ce.ccrFold.toInt & 0xf else -1)
+      if (ce.fire.toBoolean) handle.onExcCommit(ce.pc.toLong & 0xffffffffL, ce.sysByte.toInt & 0xff, ce.a7.toLong & 0xffffffffL,
+        if (ce.ccrFoldValid.toBoolean) ce.ccrFold.toInt & 0xf else -1,
+        msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+        isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
     }
   }
 
@@ -3291,7 +3454,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
-      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
       cd.waitSampling()
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling(); dut.fa.logic.redirect.valid #= false
@@ -3408,7 +3571,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
-      dut.rob.logic.exc.ss.ssp #= 0x00100000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
       cd.waitSampling()
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling(); dut.fa.logic.redirect.valid #= false

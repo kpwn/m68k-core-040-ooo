@@ -31,7 +31,7 @@ object WhiteboxCapture {
   // STILL folds into the running architectural state (A7 + CCR) so the NEXT kept
   // record carries it. `a7Static` is the ROB-surfaced ss.a7 (used only for exception
   // steps / when no OoO A7 write has been seen).
-  private final case class NormRec(pc: Long, sysByte: Int, a7Static: Long, wb: Wb, emit: Boolean) extends Rec
+  private final case class NormRec(pc: Long, sysByte: Int, a7Static: Long, wb: Wb, emit: Boolean, msp: Long = -1L, isp: Long = -1L) extends Rec
   // ExcRec: an exception/trap ENTRY or RTE step. `foldNzvc` (>=0) folds the FAULTING
   // instruction's own NZVC write onto the running CCR before this step — needed for
   // CHK, which sets N as it traps but never retires normally (so its Wb is never
@@ -40,7 +40,7 @@ object WhiteboxCapture {
   // running fold already reflects).
   // setCcr5 >= 0 => MOVE-to-SR's ABSOLUTE 5-bit CCR write (X N Z V C); the running CCR
   // is SET to it (vs the per-bit NZVC fold). -1 => no absolute CCR write.
-  private final case class ExcRec(pc: Long, sysByte: Int, a7: Long, foldNzvc: Int, setCcr5: Int = -1) extends Rec
+  private final case class ExcRec(pc: Long, sysByte: Int, a7: Long, foldNzvc: Int, setCcr5: Int = -1, msp: Long = -1L, isp: Long = -1L) extends Rec
 
   final class Handle {
     private val wbMap   = mutable.HashMap[Int, Wb]()
@@ -55,7 +55,7 @@ object WhiteboxCapture {
     /** Record a retired NORMAL commit (robId + post-instruction pc + the committed
       * SR system byte + A7), snapshotting the committing instruction's writeback. A
       * cracked-load temp µop (arch ≥ 16, no flags) is DROPPED (decode §4.5). */
-    def onCommit(robId: Int, pc: Long, sysByte: Int = 0x27, a7: Long = -1L): Unit = {
+    def onCommit(robId: Int, pc: Long, sysByte: Int = 0x27, a7: Long = -1L, msp: Long = -1L, isp: Long = -1L): Unit = {
       val wb = wbMap.getOrElse(robId,
         sys.error(s"commit robId=$robId with no writeback observed"))
       val isTempOnly = wb.intWrite && wb.dstArch >= 16 && !wb.nzvcWrite && !wb.xWrite
@@ -67,13 +67,13 @@ object WhiteboxCapture {
       // macro instruction's single kept oracle step (its trailing store is an rmwStore
       // drop), so keep it even though it writes only a temp.
       val emit = (!isTempOnly && !wb.divRem) || wb.keepCommit
-      commits += NormRec(pc, sysByte, a7, wb, emit)
+      commits += NormRec(pc, sysByte, a7, wb, emit, msp, isp)
     }
 
     /** Record an exception / RTE "instruction" commit: the handler-entry / restored
       * PC + the post-event SR system byte + A7. CCR is unchanged (carried over). */
-    def onExcCommit(pc: Long, sysByte: Int, a7: Long, foldNzvc: Int = -1, setCcr5: Int = -1): Unit =
-      commits += ExcRec(pc, sysByte, a7, foldNzvc, setCcr5)
+    def onExcCommit(pc: Long, sysByte: Int, a7: Long, foldNzvc: Int = -1, setCcr5: Int = -1, msp: Long = -1L, isp: Long = -1L): Unit =
+      commits += ExcRec(pc, sysByte, a7, foldNzvc, setCcr5, msp, isp)
 
     /** Reconstruct the CommitObservation stream AFTER the run: fold the CCR over Wb
       * snapshots and combine with the per-commit SR system byte + A7 into the full
@@ -93,7 +93,7 @@ object WhiteboxCapture {
       // it never triggers a spurious resync.)
       var lastA7Static: Long = -2L
       commits.toSeq.flatMap {
-        case NormRec(pc, sysByte, a7Static, wb, emit) =>
+        case NormRec(pc, sysByte, a7Static, wb, emit, msp, isp) =>
           if (a7Static >= 0 && a7Static != lastA7Static) { a7Run = a7Static & 0xffffffffL; lastA7Static = a7Static }
           if (a7Run < 0 && a7Static >= 0) a7Run = a7Static & 0xffffffffL
           if (wb.nzvcWrite) ccr = (ccr & 0x10) | (wb.nzvc & 0xf)
@@ -107,13 +107,21 @@ object WhiteboxCapture {
           // NOT index a non-existent oracle register (D/A are 0..15). The memory effect
           // is checked separately via checkMem.
           val isTemp = wb.intWrite && wb.dstArch >= 16
+          // The committed ss.* banks are registered readback shadows that lag the per-step
+          // commit boundary for a normal A7 write. The ACTIVE (S,M)-selected bank's timely
+          // value is a7Run (== the validated live A7). Inactive banks are stable -> sample
+          // them directly. Guard: only override when a7Run is valid (>= 0).
+          val sBitN  = (sysByte >> 5) & 1
+          val mBitN  = (sysByte >> 4) & 1
+          val mspOut = if (a7Run >= 0 && sBitN == 1 && mBitN == 1) a7Run else msp
+          val ispOut = if (a7Run >= 0 && sBitN == 1 && mBitN == 0) a7Run else isp
           if (!emit) Nil
           else Seq(CommitObservation(
             pc = pc, archRegId = if (isTemp) 0 else wb.dstArch,
             archRegWrite = if (isTemp) 0L else wb.result, archRegValid = wb.intWrite && !isTemp,
             ccr = ccr, memAddr = 0, memData = 0, memWrite = false,
-            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7Run))
-        case ExcRec(pc, sysByte, a7, foldNzvc, setCcr5) =>
+            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7Run, msp = mspOut, isp = ispOut))
+        case ExcRec(pc, sysByte, a7, foldNzvc, setCcr5, msp, isp) =>
           // An exception/RTE step uses the ROB-surfaced ss.a7 (the exc unit's banked
           // A7); resync the running A7 to it (+ lastA7Static so the next NormRec, which
           // carries the SAME ss.a7, does not re-resync over a subsequent OoO write).
@@ -124,10 +132,17 @@ object WhiteboxCapture {
           if (foldNzvc >= 0) ccr = (ccr & 0x10) | (foldNzvc & 0xf)
           // MOVE-to-SR's ABSOLUTE 5-bit CCR write SETS the running CCR (X N Z V C).
           if (setCcr5 >= 0) ccr = setCcr5 & 0x1f
+          // Same active-bank shadow-lag fix for ExcRec: the exc FSM drains before consuming
+          // the shadow, but surface the active bank from a7 (timely for exc commits) and
+          // the inactive banks from the stable shadow. Guard: only override when a7 >= 0.
+          val sBitE  = (sysByte >> 5) & 1
+          val mBitE  = (sysByte >> 4) & 1
+          val mspOutE = if (a7 >= 0 && sBitE == 1 && mBitE == 1) a7 & 0xffffffffL else msp
+          val ispOutE = if (a7 >= 0 && sBitE == 1 && mBitE == 0) a7 & 0xffffffffL else isp
           Seq(CommitObservation(
             pc = pc, archRegId = 0, archRegWrite = 0, archRegValid = false,
             ccr = ccr, memAddr = 0, memData = 0, memWrite = false,
-            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7))
+            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7, msp = mspOutE, isp = ispOutE))
       }
     }
   }
