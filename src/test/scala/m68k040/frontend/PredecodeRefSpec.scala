@@ -62,6 +62,7 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x59FB) == cp(true,3))   // TRAPVS (cc=VS, ttt=3): #data32, 3 words
     assert(classify(0x50F8) == cp(false,0))  // TRAPcc ttt=0 (invalid) -> COMPLEX (illegal)
     assert(classify(0x50F9) == cp(false,0))  // TRAPcc ttt=1 (invalid) -> COMPLEX (illegal)
+    assert(classify(0x50FD) == cp(false,0))  // TRAPcc ttt=5 (invalid) -> COMPLEX (illegal)
   }
   // LEA (A0),A0 (0x41D0) is now IN SCOPE (Track C) -> simple, len 1 (mode 2, no ext word).
   test("LEA -> simple (Track C, in scope)") {

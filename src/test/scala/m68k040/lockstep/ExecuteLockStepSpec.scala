@@ -3953,6 +3953,20 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 9)
   }
 
+  // TRAPVS.L (#data32 form, ttt=3): VS (V=1) -> trap. The 3-word form has the longest
+  // stacked-PC chain (pc + 6); predecode-length bugs are the #1 bug class so this
+  // end-to-end lock-step is the critical coverage gap. stacked PC = trapvspc + 6
+  // (opword + #data32 = 3 words). Handler reproduces N=1,V=1 for the CCR fold match.
+  test("lock-step: TRAPVS.L (#data32 form, V=1) -> handler -> RTE", VerilatorTest) {
+    runLockStep("exc-trapvs-l",
+      "move.l #handler,%d0 ; move.l %d0,0x1c ; " +         // vector 7 @ 0x1C
+      "move.l #0x7fffffff,%d4 ; add.l %d4,%d4 ; " +        // signed overflow -> N=1,V=1
+      "trapvs.l #0xDEADBEEF ; moveq #7,%d3 ; " +           // TRAPVS.L (+#data32, 3 words): V=1 -> traps
+      "loop: bra loop ; " +
+      "handler: move.l #0x7fffffff,%d1 ; add.l %d1,%d1 ; rte",   // reproduce N=1,V=1
+      nInstr = 9)
+  }
+
   // cond-FALSE case (TRAPF, no-operand): TRAPF never traps -> fall through.
   test("lock-step: TRAPF (cond=F, no-operand) -> falls through (no trap)", VerilatorTest) {
     runLockStep("exc-trapf-notaken",

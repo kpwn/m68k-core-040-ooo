@@ -12,9 +12,9 @@ import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
 
 /** TRAPV (0x4E76): execute-time CONDITIONAL trap. The decoder emits a branch-class
-  * trap-check µop (isTrapv, readsNzvc). At execute the branch EU reads NZVC; if V=1
-  * it drives a trapvFault completion (vector 7 implied, faultPc = nextPc) so the ROB
-  * marks the entry faulted; if V=0 the µop completes as a no-op and retires.
+  * cond-trap µop (isCondTrap, cond=9=VS, readsNzvc). At execute the branch EU reads
+  * NZVC; if V=1 it drives a trapvFault completion (vector 7 implied, faultPc = nextPc)
+  * so the ROB marks the entry faulted; if V=0 the µop completes as a no-op and retires.
   *
   * This unit test drives the branch EU directly (the model for the V read) and
   * observes the trapvFault completion. */
