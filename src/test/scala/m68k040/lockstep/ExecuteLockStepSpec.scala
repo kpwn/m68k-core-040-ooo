@@ -203,14 +203,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       lsEu.excXlateWrite        := exc.dtReq.write
       lsEu.excXlateSupervisor   := exc.dtReq.supervisor
       exc.sqDrained             := lsEu.sqEmptySig
-      // A7 (int reg 15) write-back on an exception/RTE A7 change. Committed arch-15
-      // maps to phys-15 (identity, unrenamed in these programs). The SAME PRF write
-      // port also serves a commit-time SYSTEM op's READ direction (MOVE-USP / MOVEC
-      // Rc->Rn writes an arbitrary int arch-Rn): sysRegWrite fires in S_APPLY, a7Write
-      // in S_REDIR (consecutive cycles -> no same-cycle collision on the one port).
+      // A7 (arch-15) write on exc/RTE A7 change. The SAME PRF write port also serves
+      // a commit-time SYSTEM op's READ direction (MOVE-USP / MOVEC Rc->Rn writes an
+      // arbitrary int arch-Rn): sysRegWrite fires in S_APPLY, a7Write in S_REDIR
+      // (consecutive cycles -> no same-cycle collision on the one port).
+      // The a7Write address uses committedPhysA7 (commReg(15)) so the write is correct
+      // even when arch-15 has been renamed by an OoO A7 write (move ...,%sp / push /
+      // bsr). When A7 is unrenamed, committedPhysA7 == 15, identical to old U(15).
       a7Wr.valid   := exc.a7WriteValid || exc.sysRegWriteValid
       a7Wr.address := Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
-                                                U(15, a7Wr.address.getWidth bits))
+                                                host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth))
       a7Wr.data    := Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits)
       // LIVE committed-A7 readback: read the int PRF at the committed arch-15 phys mapping
       // and feed it to the exception unit, which drives ss.writeA7 every cycle (routed by
@@ -2950,6 +2952,35 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       ".stop: bra .stop ; " +
       "handler: moveq #3,%d1 ; moveq #5,%d2 ; rte",
       nInstr = 7)
+  }
+
+  // ── Rename-aware A7 writeback: exception after OoO A7 write ─────────────────
+  // Validates that the exc FSM writes the re-banked A7 to committedPhysA7 (not to
+  // a hardcoded phys-15). After `move.l #0x000F0000,%sp` the committed RAT maps
+  // arch-15 to a NEW physical register (no longer phys-15 identity); the subsequent
+  // TRAP #4 must stack the format-$0 frame on that renamed A7, and RTE must restore
+  // it, step-for-step with Musashi. With the old U(15) the exc FSM would write to
+  // stale phys-15 and the handler/RTE would see the WRONG A7.
+  //
+  // Instruction sequence (nInstr = 8):
+  //  1  move.l #0x000F0000,%sp  OoO write to arch-15 (renames it off phys-15)
+  //  2  move.l #handler,%d0     load handler addr
+  //  3  move.l %d0,0x90         install vec 36 (TRAP #4 = 32+4 = 36, 36*4=0x90)
+  //  4  trap #4                 format-$0 frame on renamed A7; exc commits + writes
+  //                             committedPhysA7 with the decremented SP
+  //  5  moveq #7,%d3            resume point after RTE
+  //  6  (loop bra)              halt
+  //  7  moveq #9,%d4            handler body
+  //  8  rte                     restores SR/PC; committedPhysA7 updated to original A7
+  test("lock-step: exception after OoO A7 write (move.l #imm,%sp then trap) - rename-aware frame", VerilatorTest) {
+    runLockStep("exc-after-a7-rename",
+      "move.l #0x000F0000,%sp ; " +                   // (1) OoO rename of arch-15
+      "move.l #handler,%d0 ; move.l %d0,0x90 ; " +    // (2)(3) install vec 36 (TRAP #4)
+      "trap #4 ; " +                                  // (4) format-$0 frame on renamed A7
+      "moveq #7,%d3 ; " +                             // (5) resume after RTE
+      ".stop: bra .stop ; " +
+      "handler: moveq #9,%d4 ; rte",                  // (7)(8)
+      nInstr = 8)
   }
 
   // ── TRAPV lock-step: execute-time conditional trap (vector 7, format-$2) ─────

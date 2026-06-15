@@ -208,14 +208,15 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     lsEu.excXlateWrite      := exc.dtReq.write
     lsEu.excXlateSupervisor := exc.dtReq.supervisor
     exc.sqDrained           := lsEu.sqEmptySig
-    // A7 (int reg 15) write-back on an exception/RTE A7 change (committed arch-15 ==
-    // phys-15, unrenamed).
     // A7 (arch-15) write on exc/RTE A7 change; the SAME port also serves a commit-time
     // SYSTEM op's READ direction (MOVE-USP/MOVEC Rc->Rn writes an arbitrary arch-Rn).
     // sysRegWrite fires in S_APPLY, a7Write in S_REDIR (consecutive -> no port collision).
+    // The a7Write address uses committedPhysA7 (commReg(15)) so the write is correct
+    // even when arch-15 has been renamed by an OoO A7 write (move ...,%sp / push / bsr).
+    // When A7 is unrenamed, committedPhysA7 == 15, so this is identical to the old U(15).
     a7Wr.valid   := exc.a7WriteValid || exc.sysRegWriteValid
     a7Wr.address := Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
-                                              U(15, a7Wr.address.getWidth bits))
+                                              host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth))
     a7Wr.data    := Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits)
     // LIVE committed-A7 readback: read the int PRF at the committed arch-15 phys mapping
     // and feed it to the exception unit, which drives ss.writeA7 every cycle (routed by
