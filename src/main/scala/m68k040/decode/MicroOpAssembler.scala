@@ -807,13 +807,13 @@ object MicroOpAssembler {
     // RTD (0x4E74): a line-4 return cracked below (NOT illegal).
     val isRtdBad = (op === B"16'h4E74")
     // Merged illegal-detection exclusion list (Track C ops + Track D ops).
-    val isCmp2Chk2Bad = !op(11) && !op(8) && (op(7 downto 6) === B"11") &&
+    val isCmp2Chk2Enc = !op(11) && !op(8) && (op(7 downto 6) === B"11") &&
                         (op(10 downto 9) =/= B"11") && (op(5 downto 3).asUInt >= 2) &&
                         (op(15 downto 12) === B"4'h0")     // line-0 CMP2/CHK2 (assembler-decoded)
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isTrapccOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isUnlkOp && !isExgOp &&
               !isLeaOp && !isPeaOp && !isMoveFromSrOp && !isMoveFromCcrOp && !isMoveToCcrOp &&
-              !isSysOp && !isRtdBad && !isCmp2Chk2Bad &&
+              !isSysOp && !isRtdBad && !isCmp2Chk2Enc &&
               (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
                line4UnaryMemBad || aluRmwMemBad || bitOpMemBad || eaDstPcRelBad ||
                (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
@@ -1384,16 +1384,14 @@ object MicroOpAssembler {
     // BOTH srcA + srcB — the MOVEM multi-LS-source wakeup, class-agnostic, already
     // tracks psrcA/psrcB/psrcC). isChk2 + divSigned(reused as adReg=A/D) carry the
     // sub-kind/sign-ext rule; size from op[10:9].
-    val isCmp2Chk2Op = (op(15 downto 12) === B"4'h0") && !op(11) && !op(8) &&
-                       (op(7 downto 6) === B"11") && (op(10 downto 9) =/= B"11") &&
-                       (op(5 downto 3).asUInt >= 2)
+    val isCmp2Chk2Op = isCmp2Chk2Enc
     val c2ssReal = op(10 downto 9)
     val c2Size   = Size()
     when(c2ssReal === 0) { c2Size := Size.BYTE }
       .elsewhen(c2ssReal === 1) { c2Size := Size.WORD }
       .otherwise { c2Size := Size.LONG }
     val c2SizeBytes = c2ssReal.mux(
-      B"00" -> S(1, 32 bits), B"01" -> S(2, 32 bits), default -> S(4, 32 bits))
+      B"00" -> U(1, 32 bits), B"01" -> U(2, 32 bits), default -> U(4, 32 bits))
     val c2Ext   = pkt.words(1)
     val c2Ad    = c2Ext(15)                                  // A/D: 1 = address reg
     val c2Rn    = Mux(c2Ad, (U(8, 5 bits) + c2Ext(14 downto 12).asUInt).resize(5),
@@ -1413,8 +1411,8 @@ object MicroOpAssembler {
     val c2PcRelAddr = (pkt.pc + U(4, 32 bits) + c2SrcEa.disp.asUInt).asBits
     // Load1 address = base An + disp (+ index); load2 = SAME + size.
     val c2Disp1 = Mux(c2SrcEa.pcRel, c2PcRelAddr, c2SrcEa.disp)
-    val c2Disp2 = Mux(c2SrcEa.pcRel, (c2PcRelAddr.asSInt + c2SizeBytes).asBits,
-                                     (c2SrcEa.disp.asSInt + c2SizeBytes).asBits)
+    val c2Disp2 = Mux(c2SrcEa.pcRel, (c2PcRelAddr.asSInt + c2SizeBytes.asSInt).asBits,
+                                     (c2SrcEa.disp.asSInt + c2SizeBytes.asSInt).asBits)
     // Common load builder (every field once): addr = base + disp + index, -> dst.
     def c2LoadUop(disp: Bits, dst: Int, first: Bool): DecodedUop = {
       val u = DecodedUop()
@@ -1498,6 +1496,7 @@ object MicroOpAssembler {
       opUop.memOp         := MemOp.NONE
       opUop.unimplemented := True
       opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
+      opUop.srcCValid := False
       opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
       opUop.readsNzvc := False; opUop.readsX := False
       opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
