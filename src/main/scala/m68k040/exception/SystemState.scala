@@ -11,62 +11,75 @@ import spinal.lib._
   * events, so no PRF/RAT machinery is needed (spec §3.1).
   *
   *  - `srSys` : the SR SYSTEM byte = SR[15:8]. Bit layout (within the 8-bit
-  *      system byte): T1=7, T0=6, S=5, (M=4 unused this slice), I2=2, I1=1, I0=0.
-  *      So the S (supervisor) bit is system-byte bit 5 (== SR bit 13). Reset =
+  *      system byte): T1=7, T0=6, S=5, M=4, I2=2, I1=1, I0=0.
+  *      S (supervisor) = system-byte bit 5 (SR bit 13). Reset =
   *      0x27 (S=1, I=7, T=0) to MATCH Musashi's boot SR (0x2700) so existing
   *      non-faulting lock-step programs surface the same SR.
   *  - `vbr`  : vector base register (reset 0).
-  *  - `usp`/`ssp` : the two A7 banks. A7 (architectural addr reg 7) selects the
-  *      bank by the COMMITTED S bit. S changes only on a serializing event, so
-  *      banking is a committed-S mux — safe (no in-flight A7 with a stale S).
+  *  - `usp`  : user stack pointer (S=0 bank).
+  *  - `isp`  : interrupt stack pointer (S=1, M=0 bank).
+  *  - `msp`  : master stack pointer (S=1, M=1 bank).
   *
-  * `a7` is the architectural A7 value (S ? ssp : usp). `writeA7` writes the
-  * bank currently selected by committed S.
+  * `a7` is the architectural A7 value: Mux(S, Mux(M, msp, isp), usp).
+  * `writeA7` writes the bank currently selected by committed (S, M).
   *
   * All write ports are `Flow` (valid+payload). Multiple ports may target
-  * different registers in the same cycle; `writeA7` and `setSsp`/`setUsp` should
-  * not be driven concurrently for the same bank (the FSM serializes them).
+  * different registers in the same cycle; `writeA7` and `setIsp`/`setMsp`/`setUsp`
+  * should not be driven concurrently for the same bank (the FSM serializes them).
   */
 class SystemState extends Area {
   /** Supervisor bit position within the 8-bit SR system byte (SR bit 13). */
   val S_BIT = 5
+  /** Master bit position within the 8-bit SR system byte (SR bit 12). */
+  val M_BIT = 4
 
-  val srSys = RegInit(U(0x27, 8 bits))   // S=1, I=7, T=0 (matches Musashi boot SR)
+  val srSys = RegInit(U(0x27, 8 bits))   // S=1, M=0, I=7, T=0 (matches Musashi boot SR)
   val vbr   = RegInit(U(0, 32 bits))
   val usp   = RegInit(U(0, 32 bits))
-  val ssp   = RegInit(U(0, 32 bits))
-  srSys.simPublic(); vbr.simPublic(); usp.simPublic(); ssp.simPublic()
+  val isp   = RegInit(U(0, 32 bits))     // M=0 supervisor bank (Interrupt Stack Pointer)
+  val msp   = RegInit(U(0, 32 bits))     // M=1 supervisor bank (Master Stack Pointer)
+  srSys.simPublic(); vbr.simPublic(); usp.simPublic(); isp.simPublic(); msp.simPublic()
 
-  /** Committed S (supervisor) bit. */
+  /** Committed S (supervisor) and M (master) bits. */
   val s = srSys(S_BIT); s.simPublic()
+  val m = srSys(M_BIT); m.simPublic()
 
-  /** Architectural A7, banked by committed S. simPublic so the lock-step / unit
-    * tests can observe the banked SP (and so USP is never pruned when its only
-    * consumer is this mux). */
-  val a7 = Mux(s, ssp, usp); a7.simPublic()
+  /** Active supervisor stack: M ? MSP : ISP. */
+  val supBank = Mux(m, msp, isp)
+  /** Architectural A7, banked by committed (S, M). */
+  val a7 = Mux(s, supBank, usp); a7.simPublic()
 
-  // ── write ports (driven by the exception FSM / RTE / privileged moves) ──────
+  // ── write ports ────────────────────────────────────────────────────────────
   val setSrSys = Flow(UInt(8 bits))
   val setVbr   = Flow(UInt(32 bits))
   val setUsp   = Flow(UInt(32 bits))
-  val setSsp   = Flow(UInt(32 bits))
-  val writeA7  = Flow(UInt(32 bits))   // writes the bank selected by committed S
-  // default idle (allowOverride so a standalone/test DUT can drive them)
+  val setIsp   = Flow(UInt(32 bits))
+  val setMsp   = Flow(UInt(32 bits))
+  val writeA7  = Flow(UInt(32 bits))   // writes the bank selected by committed (S, M)
   setSrSys.valid.allowOverride; setSrSys.valid := False; setSrSys.payload.allowOverride; setSrSys.payload := U(0, 8 bits)
   setVbr.valid.allowOverride;   setVbr.valid := False;   setVbr.payload.allowOverride;   setVbr.payload := U(0, 32 bits)
   setUsp.valid.allowOverride;   setUsp.valid := False;   setUsp.payload.allowOverride;   setUsp.payload := U(0, 32 bits)
-  setSsp.valid.allowOverride;   setSsp.valid := False;   setSsp.payload.allowOverride;   setSsp.payload := U(0, 32 bits)
+  setIsp.valid.allowOverride;   setIsp.valid := False;   setIsp.payload.allowOverride;   setIsp.payload := U(0, 32 bits)
+  setMsp.valid.allowOverride;   setMsp.valid := False;   setMsp.payload.allowOverride;   setMsp.payload := U(0, 32 bits)
   writeA7.valid.allowOverride;  writeA7.valid := False;  writeA7.payload.allowOverride;  writeA7.payload := U(0, 32 bits)
+
+  // ── backward-compat shims (Task 2 will replace with proper (S,M) routing) ─
+  // ExceptionUnit uses `ss.ssp` / `ss.setSsp`: treat ssp as an alias for isp
+  // (the M=0 supervisor bank, which is what the boot SR 0x27 selects). Task 2
+  // rewires these to Mux(m, msp, isp) and routes setSsp by committed (S,M).
+  def ssp: UInt         = isp
+  def setSsp: Flow[UInt] = setIsp
 
   // ── commit-time updates ──────────────────────────────────────────────────
   when(setSrSys.valid) { srSys := setSrSys.payload }
   when(setVbr.valid)   { vbr   := setVbr.payload }
-  // writeA7 routes to the bank selected by the COMMITTED S (current srSys, before
-  // any same-cycle setSrSys). Listed FIRST so an explicit setSsp/setUsp in the
-  // same cycle takes priority (later-`when` wins in SpinalHDL).
+  // writeA7 routes by COMMITTED (S, M). Listed FIRST so an explicit setIsp/setMsp/setUsp
+  // in the same cycle wins (later-`when` wins in SpinalHDL).
   when(writeA7.valid) {
-    when(s) { ssp := writeA7.payload } otherwise { usp := writeA7.payload }
+    when(s) { when(m) { msp := writeA7.payload } otherwise { isp := writeA7.payload } }
+    .otherwise { usp := writeA7.payload }
   }
-  when(setUsp.valid)   { usp   := setUsp.payload }
-  when(setSsp.valid)   { ssp   := setSsp.payload }
+  when(setUsp.valid)   { usp := setUsp.payload }
+  when(setIsp.valid)   { isp := setIsp.payload }
+  when(setMsp.valid)   { msp := setMsp.payload }
 }
