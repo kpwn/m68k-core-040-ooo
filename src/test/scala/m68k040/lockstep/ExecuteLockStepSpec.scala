@@ -327,13 +327,17 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
   def runLockStep(name: String, src: String, nInstr: Int = -1, checkMem: Seq[Long] = Seq.empty,
                   checkSpan: Int = 4, mmuMap: Option[(Long, Long)] = None,
-                  initialSr: Option[Int] = None, usp: Long = 0x00200000L): Unit = {
+                  initialSr: Option[Int] = None, usp: Long = 0x00200000L,
+                  initialMsp: Option[Long] = None): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
 
     // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel. `initialSr` (when set)
     // boots both Musashi AND the DUT in a non-default mode (e.g. USER mode S=0 for the
-    // privilege-violation test).
-    val oracleSteps: Vector[OracleStep] = Musashi.assembleAndTrace(src, initialSr = initialSr) match {
+    // privilege-violation test). `initialMsp` (when set) seeds the inactive MSP bank so
+    // the program can switch to M=1 without first writing %sp (avoiding the phys-15
+    // rename that would break the exc FSM's hardcoded arch-15 write path).
+    val oracleSteps: Vector[OracleStep] = Musashi.assembleAndTrace(src, initialSr = initialSr,
+                                                                   initialMsp = initialMsp) match {
       case Right(v)  => v
       case Left(err) => fail(s"[$name] Musashi.assembleAndTrace failed: ${err.reason}")
     }
@@ -489,9 +493,20 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // byte AND the USP bank; in user mode the surfaced A7 == USP, so the int PRF arch-15
       // must mirror USP (not SSP).
       val userMode = initialSr.exists(sr => ((sr >> 13) & 1) == 0)
+      // M=1 mode: when `initialSr` has M=1, the active bank at boot is MSP. Seed ss.msp
+      // to `initialMsp` so that (a) the live-coherent writeA7 feedback reads the correct
+      // PRF value and (b) the oracle (seeded via --initial-msp) matches the DUT from the
+      // first step. The ISP remains at 0x00100000 (the inactive bank for M=1).
+      val modeM1 = initialSr.exists(sr => ((sr >> 12) & 1) == 1)
       initialSr.foreach(sr => dut.rob.logic.exc.ss.srSys #= (sr >> 8) & 0xff)
+      initialMsp.foreach(msp => dut.rob.logic.exc.ss.msp #= BigInt(msp & 0xffffffffL))
       dut.rob.logic.exc.ss.usp #= BigInt(usp & 0xffffffffL)
-      val bootA7 = if (userMode) (usp & 0xffffffffL) else 0x00100000L
+      // bootA7: the PRF arch-15 must mirror the ACTIVE bank's value so the OoO datapath
+      // sees the correct A7 from the first instruction. Active bank selection:
+      //   user mode (S=0) -> USP; M=1 supervisor -> MSP; M=0 supervisor -> ISP.
+      val bootA7 = if (userMode) (usp & 0xffffffffL)
+                   else if (modeM1) initialMsp.getOrElse(0L) & 0xffffffffL
+                   else 0x00100000L
       // Seed the int PRF arch-15 (A7, identity phys-15) to the boot SP: the OoO
       // datapath reads A7 from the int PRF (call/return push/pop), so it must mirror
       // the committed SP at boot (reset loads SP into A7). The exc unit keeps ss.isp
@@ -2859,6 +2874,81 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l #handler,%d0 ; move.l %d0,0x94 ; trap #5 ; moveq #7,%d3 ; " +
       "loop: bra loop ; " +
       "handler: moveq #2,%d1 ; moveq #1,%d2 ; rte",
+      nInstr = 7)
+  }
+
+  // ── M-bit MSP/ISP banking lock-step tests ────────────────────────────────────
+  // The 68040 has three SP banks: USP (user), ISP (supervisor interrupt stack,
+  // S=1 M=0), and MSP (master stack, S=1 M=1).  Bit 12 (M) of SR selects ISP vs
+  // MSP while in supervisor mode.  These tests exercise the live-coherent banking
+  // logic (ss.msp / ss.isp updated at commit time, surfaced every step, compared
+  // vs Musashi's REG_MSP / REG_ISP every step).
+  //
+  // CONSTRAINT: M=1 may only pair with a TRAP/illegal/privileged exception — NOT
+  // an interrupt.  The interrupt-with-M=1 throwaway frame (format $1) is a later
+  // slice and is NOT implemented.  A TRAP while M=1 stacks a normal format-$0
+  // frame on the master stack (no throwaway frame); Musashi matches this exactly.
+
+  // Test 1: seed MSP=0x000A0000 (via initialMsp), then MOVE-to-SR to switch to M=1
+  // (arch-15 is still at phys-15 identity alias when the exc FSM fires, so the
+  // re-bank is coherent).  After the switch, take TRAP #1 on the master stack
+  // (format-$0), handler RTEs, M stays 1.  Inactive ISP (0x00100000) is preserved
+  // and compared every step.
+  //
+  // Instruction sequence (nInstr = 7):
+  //  1  move.w #0x3700,%sr    S=1,M=1,I=7 (exc FSM; arch-15 = phys-15 identity)
+  //  2  move.l #handler,%d0   load handler address (no arch-15 rename)
+  //  3  move.l %d0,0x84       install vec 33 (TRAP #1 = 32+1, 33*4=0x84)
+  //  4  trap #1               format-$0 frame on MSP; exc commit; MSP -> 0x0009FFF8
+  //  5  moveq #9,%d4          handler body
+  //  6  rte                   restore SR/PC; M stays 1; MSP restored to 0x000A0000
+  //  7  moveq #7,%d3          resume after RTE
+  //
+  // WHY initialMsp IS NEEDED: the exc FSM writes the re-banked A7 to PRF arch-15 at
+  // a hardcoded physical address (phys-15 = identity alias at boot).  After any OoO
+  // A7 write (e.g., move.l #addr,%sp) the committed RAT's phys for arch-15 diverges
+  // from phys-15; then the writeA7 feedback loop restores the old value, reverting
+  // the exc FSM's SP decrement.  Seeding MSP via initialMsp and doing MOVE-to-SR
+  // BEFORE any %sp write keeps phys-15 as the committed alias throughout, so all
+  // exc FSM A7 writes land on the correct physical register.
+  //
+  // NOTE (Musashi seeding): --initial-msp is applied while M=0 so Musashi stores
+  // 0x000A0000 into the INACTIVE MSP shadow (sp[6]) via set_reg(MSP) with M=0.
+  // When the program's move.w #0x3700,%sr executes, Musashi's real ISA m-bit
+  // transition loads sp[6] into dar[15] and saves the old A7 (ISP) into sp[4] —
+  // exactly matching the DUT's behaviour.  ISP (sp[4]=0x00100000) is stable and
+  // compared every step thereafter.
+  test("lock-step: M-bit MSP/ISP banking (set M, write MSP, trap on MSP, RTE)", VerilatorTest) {
+    runLockStep("mbit-msp",
+      "move.w #0x3700,%sr ; " +    // (1) S=1,M=1,I=7 via exc FSM (MOVE-to-SR)
+      "move.l #handler,%d0 ; " +   // (2) load handler address (no arch-15 rename)
+      "move.l %d0,0x84 ; " +       // (3) install vec 33 (TRAP #1 = 32+1, 33*4=0x84)
+      "trap #1 ; " +               // (4) format-$0 frame on MSP; exception commit
+      "moveq #7,%d3 ; " +          // (7) resume point after RTE
+      ".stop: bra .stop ; " +
+      "handler: moveq #9,%d4 ; rte",  // (5)(6) handler body + RTE
+      nInstr = 7,
+      initialMsp = Some(0x000A0000L)) // seed inactive MSP = 0x000A0000 (DUT + oracle)
+  }
+
+  // Test 2: symmetric ISP-only trap (M stays 0) — proves the M=0 path is
+  // unchanged by the M-bit banking work.  This mirrors the TRAP #5 test but is
+  // explicitly named to tie it to the M-bit work.  TRAP #3 (vector 35, @ 0x8C)
+  // stacks a format-$0 frame on ISP (M=0), handler RTEs.
+  //
+  // Instruction sequence (nInstr = 7):
+  //  1  move.l #handler,%d0       load handler address
+  //  2  move.l %d0,0x8c           install vec 35 (TRAP #3 = 32+3 = 35*4=0x8C)
+  //  3  trap #3                   format-$0 frame on ISP; exception commit
+  //  4  moveq #3,%d1              handler body step 1
+  //  5  moveq #5,%d2              handler body step 2
+  //  6  rte                       restore SR/PC; M stays 0; ISP unwound
+  //  7  moveq #7,%d3              resume after RTE
+  test("lock-step: M-bit ISP-only trap (M stays 0)", VerilatorTest) {
+    runLockStep("mbit-isp-only",
+      "move.l #handler,%d0 ; move.l %d0,0x8c ; trap #3 ; moveq #7,%d3 ; " +
+      ".stop: bra .stop ; " +
+      "handler: moveq #3,%d1 ; moveq #5,%d2 ; rte",
       nInstr = 7)
   }
 

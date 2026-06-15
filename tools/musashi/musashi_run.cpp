@@ -21,6 +21,7 @@
 
 static const char* USAGE =
   "musashi_run --bin <path> [--load-addr <hex>] [--initial-sp <hex>] "
+  "[--initial-sr <hex>] [--initial-msp <hex>] "
   "[--sentinel <hex>] [--stop-pc <hex>] [--irq-level <0-7>] "
   "[--irq-at-pc <hex>] [--irq-event <pc>:<0-7>] [--ack-vector <2-255>|--ack-spurious] "
   "[--max-cycles <n>] --out <path> [--trace <path>]\n";
@@ -46,6 +47,8 @@ int main(int argc, char** argv) {
     bool     use_irq_at_pc = false;
     uint32_t initial_sr = 0;
     bool     use_initial_sr = false;   // override the post-reset SR (e.g. lower the I-mask)
+    uint32_t initial_msp = 0;
+    bool     use_initial_msp = false;  // override the post-reset MSP (needed for M=1 tests)
     std::vector<std::pair<uint32_t, unsigned int>> irq_events;
     int      ack_response = -1;
     int      max_cycles = 200000;
@@ -71,7 +74,8 @@ int main(int argc, char** argv) {
             use_stop_pc = true;
         }
         else if (a == "--irq-level"  && i + 1 < argc) irq_level = parse_u32(argv[++i]) & 7u;
-        else if (a == "--initial-sr" && i + 1 < argc) { initial_sr = parse_u32(argv[++i]) & 0xffffu; use_initial_sr = true; }
+        else if (a == "--initial-sr"  && i + 1 < argc) { initial_sr  = parse_u32(argv[++i]) & 0xffffu; use_initial_sr  = true; }
+        else if (a == "--initial-msp" && i + 1 < argc) { initial_msp = parse_u32(argv[++i]);           use_initial_msp = true; }
         else if (a == "--irq-at-pc"  && i + 1 < argc) {
             irq_at_pc = parse_u32(argv[++i]);
             use_irq_at_pc = true;
@@ -159,7 +163,8 @@ int main(int argc, char** argv) {
         // This ensures the first step_one() executes the first user instruction,
         // not the reset exception handler.
         ref.reset_direct(load_addr, initial_sp);
-        if (use_initial_sr) ref.set_reg(MusashiRef::REG_SR, initial_sr);
+        if (use_initial_sr)  ref.set_reg(MusashiRef::REG_SR,  initial_sr);
+        if (use_initial_msp) ref.set_reg(MusashiRef::REG_MSP, initial_msp);
         if (irq_events.empty()) {
             ref.set_irq(irq_level);
         }
