@@ -114,9 +114,11 @@ class ExceptionUnit(
   // read at the committed arch-15 phys mapping). It feeds ss.writeA7 so the committed
   // bank (usp/isp/msp selected by committed S,M) continuously mirrors the architectural
   // A7 — making a MOVE-to-SR (S,M) switch load a correctly-preserved bank and the
-  // exception FSM read a live supervisor SP. Idle default (U0) so standalone unit-test
-  // DUTs that don't wire it still elaborate; allowOverride lets the wiring drive it.
-  val committedA7In = UInt(32 bits); committedA7In.allowOverride; committedA7In := U(0, 32 bits)
+  // exception FSM read a live supervisor SP. Default = ss.a7 (a self-hold echo: writeA7
+  // writes the active bank back to itself = no-op) so standalone unit-test DUTs that
+  // don't wire the PRF readback are NOT stomped to 0; allowOverride lets the full-core
+  // wiring override it with the real committed-A7 readback.
+  val committedA7In = UInt(32 bits); committedA7In.allowOverride; committedA7In := ss.a7
 
   // The store queue is drained (no committed store still heading to memory). The
   // entry FSM waits for this before stacking its frame so it never steals the
