@@ -424,7 +424,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
               println(f"[$name] RAWCOMMIT rob=${c.robId.toInt} pc=0x${c.pc.toLong & 0xffffffffL}%08x dstArch=${w.map(_.dstArch).getOrElse(-1)} intW=${w.map(_.intWrite).getOrElse(false)} res=0x${w.map(_.result & 0xffffffffL).getOrElse(0L)}%08x divRem=${w.map(_.divRem).getOrElse(false)}")
             }
             handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
-              sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL)
+              sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
+              msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
           }
         }
         // Exception / RTE commit channel (handler-entry / restored PC + sysByte/A7).
@@ -434,7 +436,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             commitCount += 1
             handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
               if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1,
-              if (c.setCcr5Valid.toBoolean) c.setCcr5.toInt & 0x1f else -1)
+              if (c.setCcr5Valid.toBoolean) c.setCcr5.toInt & 0x1f else -1,
+              msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
           }
         }
       }
@@ -614,7 +618,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           if (c.fire.toBoolean) {
             commitCount += 1
             val pc = c.pc.toLong & 0xffffffffL
-            handle.onCommit(c.robId.toInt, pc, sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL)
+            handle.onCommit(c.robId.toInt, pc, sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
+              msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
             // The just-committed instruction's successor is `pc`. If an IRQ event is
             // scheduled at `pc` and not yet fired, raise iplIn so the next head
             // (the eventPc instruction) recognizes the interrupt before committing.
@@ -637,7 +643,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             // ARE their own oracle steps -> keep them.
             if (!isInt) {
               commitCount += 1
-              handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL, if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1)
+              handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
+                if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1,
+                msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+                isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
             } else {
               // Drop the IRQ line on the entry commit (one-shot edge): the interrupt
               // is taken, the mask is raised; a re-fire after RTE must not loop.
@@ -2252,14 +2261,18 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         for (k <- 0 until 2) {
           val c = dut.rob.logic.commitObs(k)
           if (c.fire.toBoolean)
-            handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL)
+            handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
+              msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
         }
         val ce = dut.rob.logic.commitObs(2)
         if (ce.fire.toBoolean) {
           if (!ce.isInterrupt.toBoolean)
             handle.onExcCommit(ce.pc.toLong & 0xffffffffL, ce.sysByte.toInt & 0xff, ce.a7.toLong & 0xffffffffL,
               if (ce.ccrFoldValid.toBoolean) ce.ccrFold.toInt & 0xf else -1,
-              if (ce.setCcr5Valid.toBoolean) ce.setCcr5.toInt & 0x1f else -1)
+              if (ce.setCcr5Valid.toBoolean) ce.setCcr5.toInt & 0x1f else -1,
+              msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
           else dut.intCtrl.logic.iplIn #= 0   // one-shot edge: drop on the entry
         }
         // STOP-aware IRQ injection: raise iplIn once the core is halted (stopped). The new
@@ -3133,7 +3146,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
       def captureExc(): Unit = {
         val c = dut.rob.logic.commitObs(2)
-        if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL, if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1)
+        if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
+          if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1,
+          msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+          isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
       }
       cd.onSamplings {
         captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
@@ -3141,7 +3157,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         for (k <- 0 until 2) {
           val c = dut.rob.logic.commitObs(k)
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
-            sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL)
+            sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
+            msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
         }
         captureExc()
       }
@@ -3253,10 +3271,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       for (k <- 0 until 2) {
         val c = dut.rob.logic.commitObs(k)
         if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
-          sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL)
+          sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
+          msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+          isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
       }
       val ce = dut.rob.logic.commitObs(2)
-      if (ce.fire.toBoolean) handle.onExcCommit(ce.pc.toLong & 0xffffffffL, ce.sysByte.toInt & 0xff, ce.a7.toLong & 0xffffffffL, if (ce.ccrFoldValid.toBoolean) ce.ccrFold.toInt & 0xf else -1)
+      if (ce.fire.toBoolean) handle.onExcCommit(ce.pc.toLong & 0xffffffffL, ce.sysByte.toInt & 0xff, ce.a7.toLong & 0xffffffffL,
+        if (ce.ccrFoldValid.toBoolean) ce.ccrFold.toInt & 0xf else -1,
+        msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+        isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
     }
   }
 
