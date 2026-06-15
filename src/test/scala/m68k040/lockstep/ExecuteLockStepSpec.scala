@@ -3992,21 +3992,22 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // ─────────────────────────────────────────────────────────────────────────────
   test("lock-step: PACK adj=0 (nibble extraction, zero adj)", VerilatorTest) {
     runLockStep("pack-adj0", Seq(
-      // Dy=D1=0x0000_0034 -> src=0x0034 -> result byte = (3<<4)|4 = 0x34; adj=0
+      // PACK packs src bits [11:8]##[3:0] into a byte (the two unpacked-BCD digit nibbles).
+      // Dy=D1=0x0000_0034 -> src=0x0034 -> result byte = src[11:8]##src[3:0] = 0x0##0x4 = 0x04; adj=0
       // Set Dx=D0 upper bytes to 0xDEAD_DEAD to verify preservation.
       "move.l #0xdeaddead,%d0", "move.l #0x00000034,%d1", "pack %d1,%d0,#0",
-      // Dy=D3=0x0000_0012 -> src=0x0012 -> result = 0x12; adj=0
+      // Dy=D3=0x0000_0012 -> src=0x0012 -> result = 0x0##0x2 = 0x02; adj=0
       "move.l #0xbeefcafe,%d2", "move.l #0x00000012,%d3", "pack %d3,%d2,#0",
-      // Dy=D5=0x0000_0089 -> src=0x0089 -> result = (8<<4)|9 = 0x89; adj=0 (BCD digit check)
+      // Dy=D5=0x0000_0089 -> src=0x0089 -> result = 0x0##0x9 = 0x09; adj=0 (only [11:8],[3:0] survive)
       "move.l #0x12345678,%d4", "move.l #0x00000089,%d5", "pack %d5,%d4,#0"
     ).mkString(" ; "))
   }
 
   test("lock-step: PACK adj!=0 (non-zero adjustment + nibble extract)", VerilatorTest) {
     runLockStep("pack-adj", Seq(
-      // Dy=0x0031, adj=0x0001 -> src=0x0032 -> result = (3<<4)|2 = 0x32
+      // Dy=0x0031, adj=0x0001 -> src=0x0032 -> result = src[11:8]##src[3:0] = 0x0##0x2 = 0x02
       "move.l #0xdeaddead,%d0", "move.l #0x00000031,%d1", "pack %d1,%d0,#1",
-      // Dy=0x0000, adj=0x0039 -> src=0x0039 -> result = (3<<4)|9 = 0x39 (a common adj for ASCII '0' BCD)
+      // Dy=0x0000, adj=0x0039 -> src=0x0039 -> result = 0x0##0x9 = 0x09
       "move.l #0xaabbccdd,%d6", "move.l #0x00000000,%d7", "pack %d7,%d6,#0x39",
       // Dy=0x00AB, adj=0x0055 -> src=0x0100 -> result = (0x10>>4)&0xF0 | 0x10&0x0F
       //   = (0x01<<4) | 0x00 = 0x10

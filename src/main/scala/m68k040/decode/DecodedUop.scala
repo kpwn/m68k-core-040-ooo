@@ -56,7 +56,8 @@ object DecOp extends SpinalEnum {
       // PACK Dy,Dx,#adj : src16=(Dy+adj)&0xffff; Dx[7:0]:=(src16[11:8]##src16[3:0]); Dx[31:8] preserved.
       // UNPK Dy,Dx,#adj : src16=Dy&0xffff; Dx[15:0]:=((src16[7:4]##4'b0##src16[3:0])+adj)&0xffff; Dx[31:16] preserved.
       // Size: BYTE (PACK, .B merge writes Dx[7:0]) / WORD (UNPK, .W merge writes Dx[15:0]).
-      // adj16 rides `imm` (useImm=True); srcA=Dy, dst=Dx. NO CCR effect.
+      // adj16 rides `imm` (useImm=True); srcA=Dx (old-value .B/.W merge source),
+      // srcB=Dy (the data source), dst=Dx. NO CCR effect.
       PACK, UNPK = newElement()
 }
 
