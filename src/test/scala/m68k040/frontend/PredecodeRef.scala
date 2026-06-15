@@ -82,6 +82,16 @@ object PredecodeRef {
             case Some(e) => CP(simple = true, lenWords = bitBase + e)
             case None    => COMPLEX                               // An/#imm/MEMCOMPLEX -> deferred
           }
+        } else if (((op >> 11) & 1) == 0 && bit8 == 0 && ((op >> 6) & 3) == 3 &&
+                   ((op >> 9) & 3) != 3 && mode >= 2) {
+          // CMP2/CHK2 (0000 0ss0 11 mmm rrr) + ext word: bit11==0, ss=op[10:9]
+          // (.B/.W/.L, =/=3), bit8==0, bits[7:6]==11, EA a CONTROL mode (mode>=2,
+          // reject postinc/predec). len = opword + ext word + EA ext.
+          val ctrlMode = mode == 2 || mode == 5 || mode == 6 || mode == 7
+          eaExt(mode, reg, sizeL = false, allowImm = false) match {
+            case Some(e) if ctrlMode => CP(simple = true, lenWords = 2 + e)
+            case _                   => COMPLEX
+          }
         } else COMPLEX
       case 0x1 | 0x2 | 0x3 =>
         val sizeL   = cls == 0x2

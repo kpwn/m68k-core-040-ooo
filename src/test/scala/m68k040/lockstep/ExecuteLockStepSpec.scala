@@ -3141,6 +3141,100 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "handler: moveq #1,%d4 ; rte", nInstr = 8)    // moveq #1 -> N=0,Z=0 matches entry
   }
 
+  // ── CMP2 / CHK2 lock-step (020+ bounds-check against a memory pair) ──────────
+  // The bounds pair is seeded into memory (lower @0x3000, upper @0x3000+size); A0
+  // points to the pair. CMP2: Z := Rn==lower||Rn==upper; C := signed(Rn<lower||
+  // Rn>upper); N/V UNCHANGED. A `addq.b #1,%d7` (127->-128) sets a SENTINEL N=1,V=1
+  // right before each CMP2 (the bounds loads + MOVEA set no flags), so the lock-step
+  // (which compares the FULL CCR at the cmp2 commit step) confirms N/V are preserved.
+  // CHK2: out-of-bounds -> vector 6 (format-$2) -> handler -> RTE -> resume.
+
+  // CMP2.W in-bounds + ==lower + ==upper + OOB-low + OOB-high, all .W, N/V sentinel.
+  // The N/V sentinel (127+1=-128 -> N=1,V=1) is set RIGHT BEFORE each cmp2 (after Rn
+  // is loaded — `move.w #imm,%d1` would otherwise clobber the flags), so the cmp2's
+  // committed CCR = {N=1, Z, V=1, C} confirms N/V are PRESERVED (vs Musashi's full CCR).
+  test("lock-step: CMP2.W (An) bounds {in,==lo,==hi,oob-lo,oob-hi}, N/V preserved", VerilatorTest) {
+    runLockStep("cmp2-w",
+      "move.l #0x3000,%a0 ; " +
+      "move.w #10,%d0 ; move.w %d0,(%a0) ; move.w #100,%d0 ; move.w %d0,2(%a0) ; " + // [0x3000]=10,[0x3002]=100
+      "move.w #50,%d1 ; moveq #127,%d7 ; addq.b #1,%d7 ; cmp2.w (%a0),%d1 ; " +  // in -> Z=0,C=0; N/V=1
+      "move.w #10,%d1 ; moveq #127,%d7 ; addq.b #1,%d7 ; cmp2.w (%a0),%d1 ; " +  // ==lo -> Z=1,C=0
+      "move.w #100,%d1 ; moveq #127,%d7 ; addq.b #1,%d7 ; cmp2.w (%a0),%d1 ; " + // ==hi -> Z=1,C=0
+      "move.w #5,%d1 ; moveq #127,%d7 ; addq.b #1,%d7 ; cmp2.w (%a0),%d1 ; " +   // <lo -> C=1
+      "move.w #200,%d1 ; moveq #127,%d7 ; addq.b #1,%d7 ; cmp2.w (%a0),%d1 ; " + // >hi -> C=1
+      "loop: bra loop", nInstr = 28)
+  }
+
+  // CMP2.B (signed bounds) + CMP2.L (full 32, no mask) — exercise the per-size paths.
+  test("lock-step: CMP2.B/.L bounds compare (signed bounds, per-size flags)", VerilatorTest) {
+    runLockStep("cmp2-bl",
+      "move.l #0x3000,%a0 ; " +
+      // .B bounds: lower=-5 (0xFB), upper=+5 (0x05) @ 0x3000, 0x3001.
+      "move.b #-5,%d0 ; move.b %d0,(%a0) ; move.b #5,%d0 ; move.b %d0,1(%a0) ; " +
+      "moveq #0,%d1 ; cmp2.b (%a0),%d1 ; " +    // -5<=0<=5 -> Z=0,C=0
+      "move.l #-9,%d1 ; cmp2.b (%a0),%d1 ; " +  // -9 < -5 -> C=1 (signed)
+      // .L bounds: lower=0x1000, upper=0x10000000 @ 0x3008.
+      "move.l #0x3008,%a1 ; move.l #0x1000,%d2 ; move.l %d2,(%a1) ; " +
+      "move.l #0x10000000,%d2 ; move.l %d2,4(%a1) ; " +
+      "move.l #0x5000,%d3 ; cmp2.l (%a1),%d3 ; " +  // in-bounds -> Z=0,C=0
+      "move.l #0x20000000,%d3 ; cmp2.l (%a1),%d3 ; " + // > upper -> C=1
+      "loop: bra loop", nInstr = 16)
+  }
+
+  // CMP2.W with an ADDRESS-register Rn (.W stays MASKED, not sign-extended) — the
+  // 040 quirk. A2 low word = 0xFFF0 (-16 as signed, but masked to 0xFFF0 = 65520).
+  // bounds lower=0, upper=0x7FFF: masked compare 65520 > 0x7FFF -> C=1.
+  test("lock-step: CMP2.W with An (Rn masked, not sign-extended)", VerilatorTest) {
+    runLockStep("cmp2-an",
+      "move.l #0x3000,%a0 ; " +
+      "move.w #0,%d0 ; move.w %d0,(%a0) ; move.w #0x7fff,%d0 ; move.w %d0,2(%a0) ; " +
+      "move.l #0x1234fff0,%a2 ; cmp2.w (%a0),%a2 ; " + // A2.W=0xFFF0 masked=65520 > 0x7FFF -> C=1
+      "loop: bra loop", nInstr = 8)
+  }
+
+  // CMP2.W via (d16,An) addressing — bounds at 8(A0); the 2nd load adds +size to disp.
+  test("lock-step: CMP2.W (d16,An) bounds pointer", VerilatorTest) {
+    runLockStep("cmp2-d16an",
+      "move.l #0x2ff8,%a0 ; " +                       // A0 + 8 = 0x3000
+      "move.w #20,%d0 ; move.w %d0,8(%a0) ; move.w #40,%d0 ; move.w %d0,10(%a0) ; " +
+      "move.w #30,%d1 ; cmp2.w (8,%a0),%d1 ; " +      // 20<=30<=40 -> Z=0,C=0
+      "loop: bra loop", nInstr = 7)
+  }
+
+  // CMP2.W via (d8,An,Xn) indexed — the index reg rides srcC on both loads.
+  test("lock-step: CMP2.W (d8,An,Xn) indexed bounds pointer", VerilatorTest) {
+    runLockStep("cmp2-idx",
+      "move.l #0x3000,%a0 ; move.l #4,%d2 ; " +       // base+index+disp: 0x3000+4+(-4)=0x3000
+      "move.w #1,%d0 ; move.w %d0,(%a0) ; move.w #9,%d0 ; move.w %d0,2(%a0) ; " +
+      "move.w #5,%d1 ; cmp2.w (-4,%a0,%d2.l),%d1 ; " + // in-bounds
+      "loop: bra loop", nInstr = 8)
+  }
+
+  // CHK2.W in-bounds -> no trap (straight-line).
+  test("lock-step: CHK2.W in-bounds (no trap)", VerilatorTest) {
+    runLockStep("chk2-inbounds",
+      "move.l #0x3000,%a0 ; " +
+      "move.w #0,%d0 ; move.w %d0,(%a0) ; move.w #100,%d0 ; move.w %d0,2(%a0) ; " +
+      "move.w #50,%d1 ; chk2.w (%a0),%d1 ; " +        // 0<=50<=100 -> no trap
+      "moveq #3,%d2 ; loop: bra loop", nInstr = 8)
+  }
+
+  // CHK2.W out-of-bounds -> trap vector 6 -> handler -> RTE -> resume. The entry CCR =
+  // {oldN, Z, oldV, C=1}: the pre-chk2 flag-writer (the `move.w` store of 20) leaves
+  // N=0,Z=0,V=0,C=0, so the chk2 out-of-bounds (99>20) entry CCR = N=0,Z=0,V=0,C=1.
+  // The handler's last flag-writer reproduces it (a compare yielding C=1,N=0,Z=0,V=0:
+  // 0 - 0x80000001 borrows but the result MSB is 0) so the RTE-restored CCR matches
+  // (same convention as the CHK / DIV0 lock-step tests).
+  test("lock-step: CHK2.W out-of-bounds -> handler -> RTE", VerilatorTest) {
+    runLockStep("chk2-oob",
+      "move.l #handler,%d0 ; move.l %d0,0x18 ; " +    // vector 6 (CHK) @ 0x18
+      "move.l #0x3000,%a0 ; " +
+      "move.w #10,%d3 ; move.w %d3,(%a0) ; move.w #20,%d3 ; move.w %d3,2(%a0) ; " +
+      "move.w #99,%d1 ; chk2.w (%a0),%d1 ; " +        // 99 > 20 -> C=1 -> trap (entry CCR=0x01)
+      "moveq #7,%d4 ; loop: bra loop ; " +
+      "handler: moveq #0,%d6 ; cmp.l #0x80000001,%d6 ; rte", nInstr = 10) // N=0,Z=0,V=0,C=1
+  }
+
   // ── MULU.W / MULS.W lock-step (16x16 -> Dn[31:0], N/Z; V=0, C=0) ─────────────
   // Register-source forms are 2-byte opwords (nextPc = pc+2), straight-line. The
   // full 32-bit product lands in Dn; N=bit31, Z=(product==0), V=0.

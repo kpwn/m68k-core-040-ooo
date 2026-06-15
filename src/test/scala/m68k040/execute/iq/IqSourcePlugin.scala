@@ -69,6 +69,7 @@ class IqSourcePlugin extends FiberPlugin {
       // defaults (these IQ tests don't exercise DIV/CHK/faults).
       u.psrcC        := 0; u.psrcCValid := False
       u.divSigned    := False; u.div64 := False; u.divIsRem := False
+      u.isChk2 := False
       u.nextPc       := 0
       u.faulted      := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.isRte        := False; u.isCondTrap := False; u.isScc := False; u.isDbcc := False

@@ -75,6 +75,7 @@ object MicroOpAssembler {
     // final An-update / last move is the kept commit), but its reg write still lands in the
     // PRF + is verified by a later reader (lock-step) / checkMem (stores).
     u.divIsRem    := drop
+    u.isChk2      := False
     u.eaAuto      := EaAuto.NONE; u.eaDelta := 0     // NO auto-fold: addresses via disp
     u.ccrRestore  := False; u.toCcr := False
     u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.extByte := False
@@ -118,6 +119,7 @@ object MicroOpAssembler {
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
     u.faultAddr   := pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
     u.divSigned   := False; u.div64 := False; u.divIsRem := False
+    u.isChk2      := False
     u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
     u.ccrRestore  := False; u.toCcr := False
     u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.extByte := False
@@ -250,8 +252,10 @@ object MicroOpAssembler {
     // (the load occupies its int dst with the loaded value). Both EAs are MEMSIMPLE.
     val crackMemMem = (spec.op === DecOp.MOVE) && usesDstEa && dstIsMem && srcIsMem
     // The generic memSimple-SOURCE load crack: a TRUE source EA (NOT a mem destination)
-    // and NOT a mem-to-mem MOVE (which has its own crack below).
-    val crackLoad = usesSrcEa && srcIsMem && !isAddqSubq && !isLine4Unary && !memDest && !crackMemMem
+    // and NOT a mem-to-mem MOVE (which has its own crack below). CMP2/CHK2 also names
+    // its EA srcA (EASRC) but owns a bespoke 2-load+compare crack (below) -> excluded.
+    val isCmp2Chk2Spec = spec.op === DecOp.CMP2CHK2
+    val crackLoad = usesSrcEa && srcIsMem && !isAddqSubq && !isLine4Unary && !memDest && !crackMemMem && !isCmp2Chk2Spec
 
     // POST-instruction PC = pc + length(bytes). All µops of one instruction share
     // it so the (single, architectural) op-µop commit pc matches the reference's
@@ -288,6 +292,7 @@ object MicroOpAssembler {
     opUop.divSigned     := spec.divSigned
     opUop.div64         := spec.div64
     opUop.divIsRem      := False
+    opUop.isChk2        := False
     opUop.shiftOp       := spec.shiftOp
     opUop.shiftDir      := spec.shiftDir
     opUop.bcdSub        := spec.bcdSub
@@ -517,6 +522,7 @@ object MicroOpAssembler {
     ldUop.faultUsesNextPc := False
     ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False; ldUop.isCondTrap := False
     ldUop.divSigned     := False; ldUop.div64 := False; ldUop.divIsRem := False
+    ldUop.isChk2        := False
     ldUop.shiftOp := 0; ldUop.shiftDir := False; ldUop.isMovea := False; ldUop.isScc := False; ldUop.isDbcc := False; ldUop.extByte := False; ldUop.bitOp := 0; ldUop.bcdSub := False
     ldUop.firstOfInstr  := True    // the LOAD is the FIRST µop of a cracked instruction
 
@@ -564,6 +570,7 @@ object MicroOpAssembler {
     stUop.faultUsesNextPc := False
     stUop.faultAddr     := pkt.pc; stUop.sswInstr := False; stUop.isCondTrap := False
     stUop.divSigned     := False; stUop.div64 := False; stUop.divIsRem := False
+    stUop.isChk2        := False
     stUop.shiftOp := 0; stUop.shiftDir := False; stUop.isMovea := False; stUop.isScc := False; stUop.isDbcc := False; stUop.extByte := False; stUop.bitOp := 0; stUop.bcdSub := False
     // A single reg-to-mem STORE is its own first µop; a mem-to-mem store TRAILS the load.
     stUop.firstOfInstr  := !crackMemMem
@@ -608,6 +615,7 @@ object MicroOpAssembler {
     rmwStUop.faultUsesNextPc := False
     rmwStUop.faultAddr     := pkt.pc; rmwStUop.sswInstr := False; rmwStUop.isCondTrap := False
     rmwStUop.divSigned     := False; rmwStUop.div64 := False; rmwStUop.divIsRem := False
+    rmwStUop.isChk2        := False
     rmwStUop.shiftOp := 0; rmwStUop.shiftDir := False; rmwStUop.isMovea := False; rmwStUop.isScc := False; rmwStUop.isDbcc := False; rmwStUop.extByte := False; rmwStUop.bitOp := 0; rmwStUop.bcdSub := False
     rmwStUop.firstOfInstr  := False    // the trailing store of a cracked RMW
 
@@ -799,10 +807,13 @@ object MicroOpAssembler {
     // RTD (0x4E74): a line-4 return cracked below (NOT illegal).
     val isRtdBad = (op === B"16'h4E74")
     // Merged illegal-detection exclusion list (Track C ops + Track D ops).
+    val isCmp2Chk2Bad = !op(11) && !op(8) && (op(7 downto 6) === B"11") &&
+                        (op(10 downto 9) =/= B"11") && (op(5 downto 3).asUInt >= 2) &&
+                        (op(15 downto 12) === B"4'h0")     // line-0 CMP2/CHK2 (assembler-decoded)
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isTrapccOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isUnlkOp && !isExgOp &&
               !isLeaOp && !isPeaOp && !isMoveFromSrOp && !isMoveFromCcrOp && !isMoveToCcrOp &&
-              !isSysOp && !isRtdBad &&
+              !isSysOp && !isRtdBad && !isCmp2Chk2Bad &&
               (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
                line4UnaryMemBad || aluRmwMemBad || bitOpMemBad || eaDstPcRelBad ||
                (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
@@ -1196,6 +1207,7 @@ object MicroOpAssembler {
     divlUop.faultUsesNextPc := True            // DIV0 stacks nextPc (group-2 format-$2)
     divlUop.faultAddr     := pkt.pc; divlUop.sswInstr := False; divlUop.isCondTrap := False
     divlUop.divSigned     := divlSigned; divlUop.div64 := divl64; divlUop.divIsRem := False
+    divlUop.isChk2        := False
     divlUop.shiftOp := 0; divlUop.shiftDir := False; divlUop.isMovea := False; divlUop.isScc := False; divlUop.isDbcc := False; divlUop.extByte := False; divlUop.bitOp := 0; divlUop.bcdSub := False
     divlUop.indexLong := False; divlUop.indexScale := 0
     divlUop.leaAddr := False; divlUop.fromCcr := False; divlUop.fromSr := False; divlUop.needsSupervisor := False; divlUop.keepCommit := False
@@ -1231,6 +1243,7 @@ object MicroOpAssembler {
     divremUop.faultUsesNextPc := False
     divremUop.faultAddr     := pkt.pc; divremUop.sswInstr := False; divremUop.isCondTrap := False
     divremUop.divSigned     := divlSigned; divremUop.div64 := divl64; divremUop.divIsRem := True
+    divremUop.isChk2        := False
     divremUop.shiftOp := 0; divremUop.shiftDir := False; divremUop.isMovea := False; divremUop.isScc := False; divremUop.isDbcc := False; divremUop.extByte := False; divremUop.bitOp := 0; divremUop.bcdSub := False
     divremUop.indexLong := False; divremUop.indexScale := 0
     divremUop.leaAddr := False; divremUop.fromCcr := False; divremUop.fromSr := False; divremUop.needsSupervisor := False; divremUop.keepCommit := False
@@ -1306,6 +1319,7 @@ object MicroOpAssembler {
     mullUop.faultUsesNextPc := False
     mullUop.faultAddr     := pkt.pc; mullUop.sswInstr := False; mullUop.isCondTrap := False
     mullUop.divSigned     := mullSigned; mullUop.div64 := mull64; mullUop.divIsRem := False
+    mullUop.isChk2        := False
     mullUop.shiftOp := 0; mullUop.shiftDir := False; mullUop.isMovea := False; mullUop.isScc := False; mullUop.isDbcc := False; mullUop.extByte := False; mullUop.bitOp := 0; mullUop.bcdSub := False
     mullUop.indexLong := False; mullUop.indexScale := 0
     mullUop.leaAddr := False; mullUop.fromCcr := False; mullUop.fromSr := False; mullUop.needsSupervisor := False; mullUop.keepCommit := False
@@ -1338,6 +1352,7 @@ object MicroOpAssembler {
     mulhiUop.faultUsesNextPc := False
     mulhiUop.faultAddr     := pkt.pc; mulhiUop.sswInstr := False; mulhiUop.isCondTrap := False
     mulhiUop.divSigned     := mullSigned; mulhiUop.div64 := mull64; mulhiUop.divIsRem := False
+    mulhiUop.isChk2        := False
     mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False; mulhiUop.isMovea := False; mulhiUop.isScc := False; mulhiUop.isDbcc := False; mulhiUop.extByte := False; mulhiUop.bitOp := 0; mulhiUop.bcdSub := False
     mulhiUop.indexLong := False; mulhiUop.indexScale := 0
     mulhiUop.leaAddr := False; mulhiUop.fromCcr := False; mulhiUop.fromSr := False; mulhiUop.needsSupervisor := False; mulhiUop.keepCommit := False
@@ -1354,6 +1369,134 @@ object MicroOpAssembler {
       opUop.unimplemented := True
       opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
       opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
+      opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
+    }
+
+    // ── CMP2 / CHK2 (0000 0ss0 11 mmm rrr) + ext word — the 2-load+compare crack ──
+    // The EA (op[5:0] = srcEa, a CONTROL mode) points to the LOWER bound; the UPPER
+    // bound is at EA+size. Crack:
+    //   µop0 LOAD.size @[EA]      -> T0 (lower)   (first; reuses ldUop's address path)
+    //   µop1 LOAD.size @[EA+size] -> T1 (upper)   (SAME base/index, disp += size)
+    //   µop2 CMP2CHK2  srcA=T0 srcB=T1 srcC=Rn -> CCR {oldN,Z,oldV,C}; CHK2 EuFault{vec6}
+    // The extension word (words(1)) carries: A/D=bit15, Rn=bits[14:12], R/M=bit11
+    // (1=CHK2). Rn = D0-7 (A/D=0) or A0-7 (A/D=1). The compare's psrcC = Rn rides a
+    // normal reg (statically tracked); T0/T1 are LS-produced (the IQ lsWait covers
+    // BOTH srcA + srcB — the MOVEM multi-LS-source wakeup, class-agnostic, already
+    // tracks psrcA/psrcB/psrcC). isChk2 + divSigned(reused as adReg=A/D) carry the
+    // sub-kind/sign-ext rule; size from op[10:9].
+    val isCmp2Chk2Op = (op(15 downto 12) === B"4'h0") && !op(11) && !op(8) &&
+                       (op(7 downto 6) === B"11") && (op(10 downto 9) =/= B"11") &&
+                       (op(5 downto 3).asUInt >= 2)
+    val c2ssReal = op(10 downto 9)
+    val c2Size   = Size()
+    when(c2ssReal === 0) { c2Size := Size.BYTE }
+      .elsewhen(c2ssReal === 1) { c2Size := Size.WORD }
+      .otherwise { c2Size := Size.LONG }
+    val c2SizeBytes = c2ssReal.mux(
+      B"00" -> S(1, 32 bits), B"01" -> S(2, 32 bits), default -> S(4, 32 bits))
+    val c2Ext   = pkt.words(1)
+    val c2Ad    = c2Ext(15)                                  // A/D: 1 = address reg
+    val c2Rn    = Mux(c2Ad, (U(8, 5 bits) + c2Ext(14 downto 12).asUInt).resize(5),
+                            c2Ext(14 downto 12).asUInt.resize(5))
+    val c2IsChk2= c2Ext(11)                                  // R/M: 1 = CHK2
+    // The CMP2/CHK2 extension word is words(1); the EA's OWN extension words FOLLOW it
+    // (at words(2..)). Re-decode the EA from a SHIFTED words vector so its disp/abs come
+    // from the right offset (the same shape as the DIV.L/MUL.L re-decode). The bounds EA
+    // is a CONTROL mode -> EaDecoder classifies (An)/(d16,An)/(xxx)/(d16,PC) (+ indexed)
+    // as MEMSIMPLE; reg-direct/imm/(An)+/-(An) are NOT control. Indexed IS allowed (the
+    // LS-EU AGU reads the index, like LEA). pcRel folds pc.
+    val c2SrcEa = EaDecoder.decode(op(5 downto 0), c2Size, Vec(pkt.words(0), pkt.words(2), pkt.words(3)))
+    val c2EaOk  = (c2SrcEa.klass === EaClass.MEMSIMPLE) && (c2SrcEa.autoMode === EaAuto.NONE)
+    val c2PcRelAddr = (pkt.pc + U(2, 32 bits) + c2SrcEa.disp.asUInt).asBits
+    // Load1 address = base An + disp (+ index); load2 = SAME + size.
+    val c2Disp1 = Mux(c2SrcEa.pcRel, c2PcRelAddr, c2SrcEa.disp)
+    val c2Disp2 = Mux(c2SrcEa.pcRel, (c2PcRelAddr.asSInt + c2SizeBytes).asBits,
+                                     (c2SrcEa.disp.asSInt + c2SizeBytes).asBits)
+    // Common load builder (every field once): addr = base + disp + index, -> dst.
+    def c2LoadUop(disp: Bits, dst: Int, first: Bool): DecodedUop = {
+      val u = DecodedUop()
+      u.valid       := pkt.valid
+      u.pc          := pkt.pc
+      u.nextPc      := nextPc
+      u.op          := DecOp.MOVE
+      u.cluster     := Cluster.LS
+      u.size        := c2Size
+      u.memOp       := MemOp.LOAD
+      u.srcAReg     := c2SrcEa.base; u.srcAValid := c2SrcEa.baseValid
+      u.srcBReg     := 0;          u.srcBValid := False
+      u.srcCReg     := c2SrcEa.indexReg; u.srcCValid := c2SrcEa.indexValid   // index (AGU)
+      u.dstReg      := U(dst, 5 bits); u.dstValid := True
+      u.useImm      := True; u.imm := disp
+      u.readsNzvc   := False; u.readsX := False
+      u.writesNzvc  := False; u.writesX := False
+      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
+      u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
+      u.ccrRestore  := False; u.toCcr := False
+      u.cond        := 0; u.branchDisp := 0
+      u.unimplemented := False
+      u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+      u.faultAddr   := pkt.pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
+      u.divSigned   := False; u.div64 := False; u.divIsRem := False; u.isChk2 := False
+      u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.extByte := False
+      u.isMovea     := False; u.isScc := False; u.isDbcc := False
+      u.indexLong   := c2SrcEa.indexLong; u.indexScale := c2SrcEa.indexScale
+      u.leaAddr     := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+      u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+      u.firstOfInstr := first
+      u
+    }
+    val c2Load0 = c2LoadUop(c2Disp1, T0, first = True)       // lower @ [EA]
+    val c2Load1 = c2LoadUop(c2Disp2, T1, first = False)      // upper @ [EA+size]
+    // Compare µop (CPLX/DivEu): srcA=T0(lower), srcB=T1(upper), srcC=Rn (psrcC). The EU
+    // computes Z/C per Musashi + the {oldN,Z,oldV,C} CCR RMW; CHK2 raises EuFault{vec6}
+    // on out-of-bounds C. reads+writes NZVC (preserve N/V); no int dst.
+    val c2Cmp = {
+      val u = DecodedUop()
+      u.valid       := pkt.valid
+      u.pc          := pkt.pc
+      u.nextPc      := nextPc
+      u.op          := DecOp.CMP2CHK2
+      u.cluster     := Cluster.CPLX
+      u.size        := c2Size
+      u.memOp       := MemOp.NONE
+      u.srcAReg     := U(T0, 5 bits); u.srcAValid := True       // lower (LS-produced)
+      u.srcBReg     := U(T1, 5 bits); u.srcBValid := True       // upper (LS-produced)
+      u.srcCReg     := c2Rn;          u.srcCValid := True        // Rn (normal reg, psrcC)
+      u.dstReg      := 0; u.dstValid := False
+      u.useImm      := False; u.imm := 0
+      u.readsNzvc   := True; u.readsX := False                   // RMW: read old N/V
+      u.writesNzvc  := True; u.writesX := False                  // write {oldN,Z,oldV,C}
+      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
+      u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
+      u.ccrRestore  := False; u.toCcr := False
+      u.cond        := 0; u.branchDisp := 0
+      u.unimplemented := False
+      u.faulted     := False; u.faultVector := 0
+      // CHK2 vec-6 is a group-2 (format-$2) trap delivered execute-time via euFault:
+      // it stacks the NEXT instruction's PC. faultPc is captured at ALLOC, so set
+      // faultUsesNextPc NOW (mirrors CHK / the DIV0 path).
+      u.faultUsesNextPc := True
+      u.faultAddr   := pkt.pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
+      u.divSigned   := c2Ad; u.div64 := False; u.divIsRem := False   // divSigned reused = adReg
+      u.isChk2      := c2IsChk2
+      u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.extByte := False
+      u.isMovea     := False; u.isScc := False; u.isDbcc := False
+      u.indexLong   := False; u.indexScale := 0
+      u.leaAddr     := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+      u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+      u.firstOfInstr := False                                   // trailing (loads are first)
+      u
+    }
+    // A CMP2/CHK2 with a non-control EA -> illegal (vector 4).
+    val c2Bad = isCmp2Chk2Op && !c2EaOk
+    when(c2Bad) {
+      opUop.op            := DecOp.ILLEGAL
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.unimplemented := True
+      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
+      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
+      opUop.readsNzvc := False; opUop.readsX := False
       opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
     }
 
@@ -1387,6 +1530,7 @@ object MicroOpAssembler {
     ibrUop.faultUsesNextPc := False
     ibrUop.faultAddr     := pkt.pc; ibrUop.sswInstr := False; ibrUop.isCondTrap := False
     ibrUop.divSigned     := False; ibrUop.div64 := False; ibrUop.divIsRem := False
+    ibrUop.isChk2        := False
     ibrUop.shiftOp := 0; ibrUop.shiftDir := False; ibrUop.isMovea := False; ibrUop.isScc := False; ibrUop.isDbcc := False; ibrUop.extByte := False; ibrUop.bitOp := 0; ibrUop.bcdSub := False
     ibrUop.indexLong := False; ibrUop.indexScale := 0
     ibrUop.leaAddr := False; ibrUop.fromCcr := False; ibrUop.fromSr := False; ibrUop.needsSupervisor := False; ibrUop.keepCommit := False
@@ -1440,6 +1584,7 @@ object MicroOpAssembler {
       u.faulted := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.faultAddr := pkt.pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
       u.divSigned := False; u.div64 := False; u.divIsRem := divIsRem
+      u.isChk2 := False
       u.shiftOp := 0; u.shiftDir := False; u.isMovea := False; u.isScc := False; u.isDbcc := False; u.extByte := False; u.bitOp := 0; u.bcdSub := False
       u.indexLong := False; u.indexScale := 0
       u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := keepCommit
@@ -1657,6 +1802,7 @@ object MicroOpAssembler {
       u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.faultAddr   := pkt.pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
       u.divSigned   := False; u.div64 := False; u.divIsRem := False
+      u.isChk2      := False
       u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
       u.ccrRestore  := False; u.toCcr := False
       u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.extByte := False
@@ -1697,6 +1843,19 @@ object MicroOpAssembler {
       out.count   := 1
       out.uops(0) := opUop
       out.uops(1) := opUop
+    } elsewhen(isCmp2Chk2Op) {
+      // CMP2/CHK2 -> [load.size [EA] -> T0] [load.size [EA+size] -> T1] [compare].
+      // Bad EA (non-control) forced illegal above (c2Bad sets opUop faulted vec4).
+      when(c2Bad) {
+        out.count   := 1
+        out.uops(0) := opUop
+        out.uops(1) := opUop
+      } otherwise {
+        out.count   := 3
+        out.uops(0) := c2Load0
+        out.uops(1) := c2Load1
+        out.uops(2) := c2Cmp
+      }
     } elsewhen(isLeaOp) {
       // LEA -> single address-generate µop (addr -> An). Bad EA forced illegal above.
       out.count   := 1
