@@ -405,6 +405,18 @@ object MicroOpAssembler {
       }
     }
 
+    // ── PACK/UNPK register form operand routing ─────────────────────────────────
+    // srcA = Dx (op[11:9], old value = merge source for .B/.W upper-bit preservation) —
+    // already routed via dnField REGFIELD above. srcB = Dy (op[2:0], source data) —
+    // routed via EASRC (mode 000 DATAREG). Additionally, adj16 = pkt.words(1) rides
+    // `imm` (useImm=True); the EU reads rdB.data (s1RdB) directly for Dy, bypassing
+    // the useImm mux. Dst = Dx (dnField, already routed above).
+    val packUnpkReg = (spec.op === DecOp.PACK) || (spec.op === DecOp.UNPK)
+    when(packUnpkReg) {
+      opUop.useImm := True
+      opUop.imm    := pkt.words(1).resize(16).asSInt.resize(32).asBits  // adj16, sign-extended
+    }
+
     // MOVE: NZVC only if the destination EA is a data register.
     when(spec.writesNzvcIfDataDst) { opUop.writesNzvc := (dstEa.klass === EaClass.DATAREG) }
 
@@ -642,7 +654,9 @@ object MicroOpAssembler {
     // OperationDecoder already named it DecOp.BCD (a single register-direct ALU µop);
     // exclude it from the "RMW EA must be MEMSIMPLE" gate (its Dn-direct EA is intended).
     val isBcdReg = (spec.op === DecOp.BCD)
-    val aluRmwMemBad = isAluRmwOp && !isAddxSubxReg && !isBcdReg && !spec.microcoded && (srcEa.klass =/= EaClass.MEMSIMPLE)
+    // PACK/UNPK register forms (line 8, opmode 5/6, EA mode 000 Dn-direct): single-µop
+    // register ops (Dy is srcB via mode-000 DATAREG). Excluded from the RMW-MEMSIMPLE gate.
+    val aluRmwMemBad = isAluRmwOp && !isAddxSubxReg && !isBcdReg && !packUnpkReg && !spec.microcoded && (srcEa.klass =/= EaClass.MEMSIMPLE)
     // ADDQ/SUBQ (srcB = IMMQ3): the EA (op[5:0]) is the DESTINATION (read AND written).
     // This slice supports a DATA-register OR ADDRESS-register destination only; a memory
     // EA is the deferred RMW form -> illegal. `addqMemBad` forces the illegal path (it

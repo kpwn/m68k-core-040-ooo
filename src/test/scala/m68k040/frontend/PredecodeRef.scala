@@ -334,6 +334,12 @@ object PredecodeRef {
         // the µcode sequencer). Mode 001 is An-direct (not a valid mem dst) -> X-mem form.
         else if ((cls == 0x8 || cls == 0xC) && opmode == 4 && (srcMode == 0 || srcMode == 1))
           CP(simple = true, lenWords = 1)
+        // PACK (line 8, opmode 5) / UNPK (line 8, opmode 6): opword + 16-bit adj word = len 2.
+        // Both the register form (srcMode 000) AND the deferred memory form (srcMode 001) are
+        // framed as len=2 so the front-end doesn't stall; the decode illegalises the mem form.
+        // Line C opmode 5/6 is OR.W/.L, NOT PACK/UNPK — excluded.
+        else if (cls == 0x8 && (opmode == 5 || opmode == 6) && (srcMode == 0 || srcMode == 1))
+          CP(simple = true, lenWords = 2)
         else if (opmode == 4 || opmode == 5 || opmode == 6)        // ALU Dn,<ea> RMW mem-dest
           memDestExt(srcMode, srcReg) match {
             case Some(e) => CP(simple = true, lenWords = 1 + e)

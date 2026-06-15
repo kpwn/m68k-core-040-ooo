@@ -51,7 +51,13 @@ object DecOp extends SpinalEnum {
       // BCHG, 10 BCLR, 11 BSET). Bit number = the immediate (static, useImm) or srcB=Dn
       // (dynamic). Dest width: LONG (Dn, bit mod 32) or BYTE (memory, bit mod 8) — set
       // by the assembler from the EA. Z-only flag write (preserve N/V/C; X untouched).
-      BITOP = newElement()
+      BITOP,
+      // PACK/UNPK register forms (68020+, no memory form this slice).
+      // PACK Dy,Dx,#adj : src16=(Dy+adj)&0xffff; Dx[7:0]:=(src16[11:8]##src16[3:0]); Dx[31:8] preserved.
+      // UNPK Dy,Dx,#adj : src16=Dy&0xffff; Dx[15:0]:=((src16[7:4]##4'b0##src16[3:0])+adj)&0xffff; Dx[31:16] preserved.
+      // Size: BYTE (PACK, .B merge writes Dx[7:0]) / WORD (UNPK, .W merge writes Dx[15:0]).
+      // adj16 rides `imm` (useImm=True); srcA=Dy, dst=Dx. NO CCR effect.
+      PACK, UNPK = newElement()
 }
 
 /** Commit-time privileged-system-op kind (DecodedUop.sysOp / .sysKind). Selects how

@@ -491,9 +491,19 @@ object PredecodeWord {
           // from the µcode sequencer). Mode 001 An-direct = the X-mem form; frame both.
           val isBcdReg = (cls === U(8, 4 bits) || cls === U(0xC, 4 bits)) &&
                          (opmode === U(4, 3 bits)) && (srcMode === U(0, 3 bits) || srcMode === U(1, 3 bits))
+          // PACK (line 8, opmode 5) / UNPK (line 8, opmode 6): opword + 16-bit adj extension.
+          // Frame BOTH the register form (srcMode 000) AND the deferred memory form (srcMode 001)
+          // as len=2 so the front-end doesn't stall on the memory form (decode illegalises it).
+          // Line C with opmode 5/6 is OR.W/.L, NOT PACK/UNPK -> exclude line C here.
+          val isPackUnpkFrame = (cls === U(8, 4 bits)) &&
+                                (opmode === U(5, 3 bits) || opmode === U(6, 3 bits)) &&
+                                (srcMode === U(0, 3 bits) || srcMode === U(1, 3 bits))
           when(isAddxSubxReg || isBcdReg) {
             r.simple   := True
             r.lenWords := U(1, 3 bits)
+          } elsewhen(isPackUnpkFrame) {
+            r.simple   := True
+            r.lenWords := U(2, 3 bits)   // opword + adj16 extension word
           } otherwise {
             // ALU Dn,<ea> RMW (opmode 4/5/6 = .B/.W/.L mem-dest): opword + EA ext. The EA
             // MUST be a MEMSIMPLE alterable-memory mode (the assembler illegalises Dn/An/
