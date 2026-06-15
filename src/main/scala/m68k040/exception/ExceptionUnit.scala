@@ -230,6 +230,13 @@ class ExceptionUnit(
   // the architectural A7 of the active bank. The FSM's setIsp/setMsp/setUsp pulses on
   // serializing cycles WIN over writeA7 (they are listed AFTER writeA7 in SystemState's
   // when-chain — later-when-wins), so a frame-store SP write is not clobbered.
+  // SETTLE CAVEAT (Slice A scope): committedA7In (the PRF readback) lags the architectural
+  // A7 by the Mem-write->async-read latency, so the ACTIVE bank tracks A7 with ~1-2 cycle
+  // lag. This is invisible to real consumers: the exc FSM reads the bank only after E_DRAIN
+  // (settled), and MOVE-to-SR (S,M) switches are serializing. A RAPID M re-toggle
+  // (M=0->1->0 within the settle window) is NOT validated here — it could leave a
+  // briefly-active bank's shadow stale when deselected. Add a directed test for that before
+  // Slice B (interrupt throwaway frame) relies on cross-toggle preservation.
   ss.writeA7.valid  := True; ss.writeA7.payload  := committedA7In
 
   // ── D-cache STORE: REGISTERED output (FMax). The frame-word store payload is a
@@ -577,6 +584,9 @@ class ExceptionUnit(
       // A7 after RTE = restored-(S,M) bank. popSr(13)=S, popSr(12)=M. For Slice A
       // (fault/trap), M is unchanged so the popped bank == the restored supervisor bank
       // and obsA7 resolves to Mux(S, newSsp, usp) — identical to the old behavior.
+      // The poppedSameBank==False branch (an RTE that CHANGES M, reading rsupBank) is
+      // defensive for a later slice and is UNVALIDATED in Slice A — no in-scope RTE flips
+      // M. It also reads the shadow banks (see the SETTLE CAVEAT above). Slice-B territory.
       val poppedSameBank = (popSr(12) === ss.m)
       val rsupBank = Mux(popSr(12), ss.msp, ss.isp)
       obsA7 := Mux(popSr(13), Mux(poppedSameBank, newSsp, rsupBank), ss.usp)
@@ -645,7 +655,7 @@ class ExceptionUnit(
       // POST-write (S,M). The
       // a7Write port is qualified by obsFire (below). For MOVE-to-SR this carries the
       // user/supervisor SP switch into the datapath's arch-15. For MOVE-USP/MOVEC that
-      // wrote USP while in supervisor, ss.a7 (=ssp) is unchanged -> a harmless re-write.
+      // wrote USP while in supervisor, ss.a7 (=isp/msp) is unchanged -> a harmless re-write.
       obsFire    := True
       obsPc      := sysCapNextPc            // the sysOp's commit step == its nextPc
       obsSysByte := ss.srSys                // post-write system byte (S/T/I)
