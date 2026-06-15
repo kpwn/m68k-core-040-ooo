@@ -109,6 +109,15 @@ class ExceptionUnit(
   // `active` is high whenever the FSM is mid-sequence; the wiring gates the MUX on it.
   val active = Bool()
 
+  // ── Live committed A7 (arch reg 15) read back from the int PRF ────────────────
+  // The full-core wiring drives this every cycle with the committed A7 value (PRF
+  // read at the committed arch-15 phys mapping). It feeds ss.writeA7 so the committed
+  // bank (usp/isp/msp selected by committed S,M) continuously mirrors the architectural
+  // A7 — making a MOVE-to-SR (S,M) switch load a correctly-preserved bank and the
+  // exception FSM read a live supervisor SP. Idle default (U0) so standalone unit-test
+  // DUTs that don't wire it still elaborate; allowOverride lets the wiring drive it.
+  val committedA7In = UInt(32 bits); committedA7In.allowOverride; committedA7In := U(0, 32 bits)
+
   // The store queue is drained (no committed store still heading to memory). The
   // entry FSM waits for this before stacking its frame so it never steals the
   // D-cache store port from an older committed store's in-flight write-through
@@ -119,7 +128,7 @@ class ExceptionUnit(
   val curVec   = Reg(UInt(8 bits))
   val curPc    = Reg(UInt(32 bits))   // ENTRY: faulting PC to stack; RTE: restored PC
   val oldSr    = Reg(UInt(16 bits))   // ENTRY: SR to stack
-  val frameBase= Reg(UInt(32 bits))   // ENTRY: new SSP = SSP-8 (or -60 for $7); RTE: old SSP
+  val frameBase= Reg(UInt(32 bits))   // ENTRY: new SP = supervisor bank (M?MSP:ISP) - frame size; RTE: old SP
   val vecTarget= Reg(UInt(32 bits))   // redirect target
   // ENTRY: is this an access fault (vector 2)? -> stack a format-$7 frame (30 words)
   // instead of format-$0 (4 words). Captured at trigger.
@@ -214,7 +223,12 @@ class ExceptionUnit(
   ss.setMsp.valid   := False; ss.setMsp.payload   := U(0, 32 bits)
   ss.setVbr.valid   := False; ss.setVbr.payload   := U(0, 32 bits)
   ss.setUsp.valid   := False; ss.setUsp.payload   := U(0, 32 bits)
-  ss.writeA7.valid  := False; ss.writeA7.payload  := U(0, 32 bits)
+  // LIVE-COHERENT committed A7: drive writeA7 EVERY cycle with the live committed A7
+  // (routed by committed S,M inside SystemState). This keeps ss.usp/isp/msp mirroring
+  // the architectural A7 of the active bank. The FSM's setIsp/setMsp/setUsp pulses on
+  // serializing cycles WIN over writeA7 (they are listed AFTER writeA7 in SystemState's
+  // when-chain — later-when-wins), so a frame-store SP write is not clobbered.
+  ss.writeA7.valid  := True; ss.writeA7.payload  := committedA7In
 
   // ── D-cache STORE: REGISTERED output (FMax). The frame-word store payload is a
   // combinational mux off the FSM step `stStep`; driving it straight onto the
@@ -381,8 +395,9 @@ class ExceptionUnit(
         val rwB = Mux(entryFaultInstr, U(1, 1 bits), Mux(entryFaultWr, U(0, 1 bits), U(1, 1 bits)))
         curSsw    := (U(0x400, 16 bits) | fc.resize(16) | (rwB ## U(0, 8 bits)).asUInt.resize(16))
         oldSr     := (ss.srSys ## committedCcr.resize(8 bits)).asUInt
-        // new SSP = current A7 (SSP, since committed S) - frame size
+        // new SP = supervisor bank (M?MSP:ISP) - frame size
         //   format-$0 = 8 bytes, format-$2 = 12 bytes, format-$7 = 60 bytes.
+        // (PRELIMINARY value; recomputed from the settled live bank on E_DRAIN->E_STORE.)
         // new SP = current supervisor stack (M ? MSP : ISP) - frame size. M is PRESERVED
         // across fault/trap entry (the &0x3f mask in E_REDIR keeps bit4), so the
         // post-stack SP is written back to this SAME bank.
@@ -412,7 +427,19 @@ class ExceptionUnit(
     }
 
     // Wait for older committed stores to fully drain before we use the store port.
-    E_DRAIN.whenIsActive { when(sqDrained) { goto(E_STORE) } }
+    E_DRAIN.whenIsActive {
+      when(sqDrained) {
+        // RECOMPUTE frameBase from the SETTLED live supervisor bank (M ? MSP : ISP).
+        // The IDLE entry-capture computed frameBase from ss.supBank on the IDLE->entry
+        // edge, but the live committed-A7 readback has a 1-cycle latency, so that early
+        // value can be stale. By E_DRAIN->E_STORE the readback has settled, so recompute
+        // from the current bank: new SP = supervisor bank (M?MSP:ISP) - frame size
+        // (format-$0 = 8, format-$2 = 12, format-$7 = 60 bytes).
+        val supSp = Mux(ss.m, ss.msp, ss.isp)
+        frameBase := Mux(curIs7, supSp - 60, Mux(curIs2, supSp - 12, supSp - 8))
+        goto(E_STORE)
+      }
+    }
 
     // ── ENTRY: stack the frame (one word at a time) ─────────────────────────────
     E_STORE.whenIsActive {
@@ -610,7 +637,8 @@ class ExceptionUnit(
     // re-banked A7) + write the int PRF arch-15 with the re-banked A7 (a MOVE-to-SR S
     // flip switches the active bank), and redirect to the next instruction (serialize).
     S_REDIR.whenIsActive {
-      // Re-bank A7 in the int PRF: ss.a7 = Mux(S, ssp, usp) with the POST-write S. The
+      // Re-bank A7 in the int PRF: ss.a7 = Mux(s, Mux(m, msp, isp), usp) with the
+      // POST-write (S,M). The
       // a7Write port is qualified by obsFire (below). For MOVE-to-SR this carries the
       // user/supervisor SP switch into the datapath's arch-15. For MOVE-USP/MOVEC that
       // wrote USP while in supervisor, ss.a7 (=ssp) is unchanged -> a harmless re-write.

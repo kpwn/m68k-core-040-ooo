@@ -46,6 +46,10 @@ case class RatTable(
       val addr = in UInt (log2Up(archDepth) bits)
       val data = out UInt (physIdWidth bits)
     })
+    // Committed phys mapping of EVERY arch register (commit RAM only, ignoring the
+    // speculative remap). Surfaced as an output so a parent (e.g. the exception unit's
+    // live committed-A7 readback) can read an architectural mapping across the hierarchy.
+    val committedPhys = out Vec (UInt(physIdWidth bits), archDepth)
   }
 
   // ── Speculative / committed storage (REGISTER Vecs, NOT Mem) ────────────────
@@ -101,4 +105,12 @@ case class RatTable(
     val committed = commReg(io.reads(r).addr)
     io.reads(r).data := Mux(location(io.reads(r).addr), written, committed)
   }
+
+  // Surface the committed phys mappings (commit RAM only) as output ports.
+  for (a <- 0 until archDepth) io.committedPhys(a) := commReg(a)
+
+  /** COMMITTED phys mapping of a given arch register (the commit RAM only, ignoring
+    * any speculative remap). Used to read the architectural (committed) value of a
+    * register from the PRF — e.g. the exception unit's live committed A7 (arch 15). */
+  def committedPhys(arch: Int): UInt = io.committedPhys(arch)
 }

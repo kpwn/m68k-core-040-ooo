@@ -50,9 +50,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // write port (the exc unit is idle at boot, so no same-cycle collision). Driven by
     // the harness for a couple of cycles after the init sweep, before the first fetch.
     var seedWr: m68k040.execute.regfile.RegFileWritePort = null
+    // Int PRF READ port for the LIVE committed A7 readback (arch-15 committed phys). Feeds
+    // exc.committedA7In so ss.usp/isp/msp continuously mirror the architectural A7.
+    var a7Rd: m68k040.execute.regfile.RegFileReadPort = null
     during setup {
       a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
       seedWr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7", priority = 1)
+      a7Rd   = host[m68k040.execute.regfile.IntRegFileService].newRead()
     }
     val logic = during build new Area {
       val seedValid = in Bool (); val seedAddr = in UInt (6 bits); val seedData = in Bits (32 bits)
@@ -208,6 +212,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       a7Wr.address := Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
                                                 U(15, a7Wr.address.getWidth bits))
       a7Wr.data    := Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits)
+      // LIVE committed-A7 readback: read the int PRF at the committed arch-15 phys mapping
+      // and feed it to the exception unit, which drives ss.writeA7 every cycle (routed by
+      // committed S,M) so ss.usp/isp/msp track the architectural A7 of the active bank.
+      a7Rd.addr := host[RenameStage].committedPhysA7.resize(a7Rd.addr.getWidth)
+      exc.committedA7In := a7Rd.data.asUInt
     }
   }
 
@@ -660,6 +669,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Boot the committed SR to initialSr's system byte (lower the I-mask so a
       // non-NMI level is taken; matches the oracle's --initial-sr).
       dut.rob.logic.exc.ss.srSys #= (initialSr >> 8) & 0xff
+      // Seed the int PRF arch-15 (A7, identity phys-15) to the boot SSP. The committed
+      // A7 banks (ss.usp/isp/msp) are now LIVE-COHERENT with the architectural A7 read
+      // back from the PRF every cycle (the exc unit drives ss.writeA7), so the PRF
+      // arch-15 — not the poked ss.isp — is the boot SP source of truth. All IRQ tests
+      // boot supervisor (initialSr S=1), so the active bank is ISP = 0x00100000.
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
       cd.waitSampling()
       dut.fa.logic.redirect.valid   #= true
       dut.fa.logic.redirect.payload #= loadAddr

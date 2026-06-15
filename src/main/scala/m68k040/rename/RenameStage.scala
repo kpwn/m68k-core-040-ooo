@@ -293,6 +293,11 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
   override def uops: Stream[Vec[RenamedUop]] = logic.uopsStaged
   override def uop1Valid: Bool               = logic.uopsStaged.payload(1).valid
 
+  /** COMMITTED phys mapping of arch reg 15 (A7). The exception unit reads the live
+    * committed A7 value from the int PRF at this phys to keep ss.usp/isp/msp coherent
+    * with the architectural A7 every cycle (driven by the backend wiring layer). */
+  def committedPhysA7: UInt = logic.intRat.committedPhys(15)
+
   override def commitPorts: Vec[Flow[CommitSlot]] = logic.commitPorts
   override def flushPort:   Bool                  = logic.flush
 }
