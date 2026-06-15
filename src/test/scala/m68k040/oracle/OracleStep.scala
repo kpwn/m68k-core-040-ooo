@@ -5,7 +5,7 @@ import java.nio.file.Path
 
 /** One retired-instruction record from the Musashi per-instruction trace.
   * Post-instruction architectural state (the lock-step compare granularity). */
-final case class OracleStep(pc: Long, sr: Int, d: Vector[Long], a: Vector[Long]) {
+final case class OracleStep(pc: Long, sr: Int, d: Vector[Long], a: Vector[Long], msp: Long = -1L, isp: Long = -1L) {
   def ccr: Int = sr & 0x1f
 }
 
@@ -34,7 +34,9 @@ object OracleStep {
       sr <- get("sr")
       d  <- sequence((0 until 8).map(i => get(s"d$i")).toVector)
       a  <- sequence((0 until 8).map(i => get(s"a$i")).toVector)
-    } yield OracleStep(pc, sr.toInt & 0xffff, d, a)
+    } yield OracleStep(pc, sr.toInt & 0xffff, d, a,
+                       msp = kv.get("msp").map(hex).getOrElse(-1L),
+                       isp = kv.get("isp").map(hex).getOrElse(-1L))
   }
 
   private def sequence[A](xs: Vector[Either[OracleError, A]]): Either[OracleError, Vector[A]] =

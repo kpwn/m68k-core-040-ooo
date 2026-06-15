@@ -211,7 +211,8 @@ int main(int argc, char** argv) {
                 " d0=0x%08x d1=0x%08x d2=0x%08x d3=0x%08x"
                 " d4=0x%08x d5=0x%08x d6=0x%08x d7=0x%08x"
                 " a0=0x%08x a1=0x%08x a2=0x%08x a3=0x%08x"
-                " a4=0x%08x a5=0x%08x a6=0x%08x a7=0x%08x\n",
+                " a4=0x%08x a5=0x%08x a6=0x%08x a7=0x%08x"
+                " msp=0x%08x isp=0x%08x\n",
                 pc, sr,
                 ref.get_reg(MusashiRef::REG_D0), ref.get_reg(MusashiRef::REG_D1),
                 ref.get_reg(MusashiRef::REG_D2), ref.get_reg(MusashiRef::REG_D3),
@@ -220,7 +221,8 @@ int main(int argc, char** argv) {
                 ref.get_reg(MusashiRef::REG_A0), ref.get_reg(MusashiRef::REG_A1),
                 ref.get_reg(MusashiRef::REG_A2), ref.get_reg(MusashiRef::REG_A3),
                 ref.get_reg(MusashiRef::REG_A4), ref.get_reg(MusashiRef::REG_A5),
-                ref.get_reg(MusashiRef::REG_A6), ref.get_reg(MusashiRef::REG_A7));
+                ref.get_reg(MusashiRef::REG_A6), ref.get_reg(MusashiRef::REG_A7),
+                ref.get_reg(MusashiRef::REG_MSP), ref.get_reg(MusashiRef::REG_ISP));
         }
         std::fclose(tf);
     } else {

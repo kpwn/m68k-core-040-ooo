@@ -39,6 +39,10 @@ object LockStep {
         // A7 (banked SP), when surfaced (a7 >= 0): tracks USP/SSP across exceptions.
         else if (c.a7 >= 0 && (c.a7 & 0xffffffffL) != (s.a(7) & 0xffffffffL))
           Some(f"a7: dut=0x${c.a7 & 0xffffffffL}%08x oracle=0x${s.a(7) & 0xffffffffL}%08x")
+        else if (c.msp >= 0 && s.msp >= 0 && (c.msp & 0xffffffffL) != (s.msp & 0xffffffffL))
+          Some(f"msp: dut=0x${c.msp & 0xffffffffL}%08x oracle=0x${s.msp & 0xffffffffL}%08x")
+        else if (c.isp >= 0 && s.isp >= 0 && (c.isp & 0xffffffffL) != (s.isp & 0xffffffffL))
+          Some(f"isp: dut=0x${c.isp & 0xffffffffL}%08x oracle=0x${s.isp & 0xffffffffL}%08x")
         else if (c.archRegValid && {
                    val id = c.archRegId
                    val expected = if (id < 8) s.d(id) else s.a(id - 8)
