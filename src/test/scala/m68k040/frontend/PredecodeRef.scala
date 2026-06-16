@@ -390,7 +390,13 @@ object PredecodeRef {
       // ss=11 is the memory single-bit form (deferred RMW) -> COMPLEX.
       case 0xE =>
         val ss = (op >> 6) & 3
-        if (ss != 3) CP(simple = true, lenWords = 1) else COMPLEX
+        // Bit-field register form: op[11]=1, ss==3, mode 000 -> SIMPLE len 2
+        // (opword + the bit-field ext word). ss=11 with op[11]=0 (memory single-bit
+        // shift) or mode!=0 (memory bit-field) -> COMPLEX (deferred RMW).
+        val isBitfieldReg = (((op >> 11) & 1) == 1) && (ss == 3) && (((op >> 3) & 7) == 0)
+        if (isBitfieldReg) CP(simple = true, lenWords = 2)
+        else if (ss != 3) CP(simple = true, lenWords = 1)
+        else COMPLEX
       case _ => COMPLEX
     }
   }

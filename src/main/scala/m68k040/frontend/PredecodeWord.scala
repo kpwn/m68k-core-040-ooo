@@ -586,6 +586,15 @@ object PredecodeWord {
           r.simple   := True
           r.lenWords := U(1, 3 bits)
         }
+        // Bit-field register form (BFxxx Dn{...}): op[11:8]>=8 (op[11]=1), op[7:6]==3,
+        // mode 000 (op[5:3]==0). opword + the bit-field extension word -> SIMPLE len 2.
+        // (ss=11 with op[11]=0 = the deferred memory single-bit shift, or mode!=0 = a
+        // memory bit-field, both stay COMPLEX -> the assembler's illegal path.)
+        val isBitfieldReg = op(11) && (ss === U(3, 2 bits)) && (op(5 downto 3).asUInt === U(0, 3 bits))
+        when(isBitfieldReg) {
+          r.simple   := True
+          r.lenWords := U(2, 3 bits)
+        }
       }
 
       default { /* complex: r stays simple=False, lenWords=0 */ }

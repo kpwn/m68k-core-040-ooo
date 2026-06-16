@@ -1066,6 +1066,67 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  // ── Bit-field register forms (BFxxx Dn{#off:#wd}, static) lock-step ─────────
+  // All 8 ops with a spread of static offset/width incl. edge cases: offset 0 (MSB),
+  // near-31, width 1, width 32 (the 0->32 encoding), non-byte-aligned fields. The FULL
+  // CCR (N/Z, V=C=0, X UNCHANGED via the ori-seeded X sentinel) + the written reg
+  // (Dy or Dn2) are compared step-for-step vs Musashi.
+  test("lock-step: BFTST/BFCHG/BFCLR/BFSET (NZ, V=C=0, X untouched)", VerilatorTest) {
+    runLockStep("bf-modify", Seq(
+      "ori #0x10,%ccr",                                    // X=1 sentinel (BFxxx must leave X)
+      "move.l #0x12345678,%d0", "bftst %d0{#4:#8}",        // N=bit31(d0<<4)=0, Z=field!=0
+      "move.l #0x0000ffff,%d1", "bftst %d1{#0:#16}",       // offset0 (MSB) field 0 -> Z=1
+      "move.l #0x80000000,%d2", "bftst %d2{#0:#1}",        // N=1 (MSB set), width 1
+      "move.l #0x12345678,%d0", "bfchg %d0{#8:#8}",        // toggle middle byte
+      "move.l #0xffffffff,%d3", "bfclr %d3{#4:#8}",        // clear non-byte-aligned field
+      "move.l #0x00000000,%d4", "bfset %d4{#0:#32}",       // set whole reg (width 32)
+      "move.l #0x00000001,%d5", "bfset %d5{#31:#1}"        // set LSB (offset 31, width 1)
+    ).mkString(" ; "))
+  }
+  test("lock-step: BFEXTU/BFEXTS (logical vs arithmetic extract, sign-extend)", VerilatorTest) {
+    runLockStep("bf-extract", Seq(
+      "ori #0x10,%ccr",                                    // X=1 sentinel
+      "move.l #0x12345678,%d0", "bfextu %d0{#0:#16},%d1",  // extract top 16 -> d1=0x1234
+      "move.l #0x12345678,%d0", "bfextu %d0{#8:#8},%d2",   // middle byte -> d2=0x34
+      "move.l #0xff000000,%d0", "bfexts %d0{#0:#8},%d3",   // field 0xff -> sign-extend -> 0xffffffff
+      "move.l #0x0f000000,%d0", "bfexts %d0{#0:#8},%d4",   // field 0x0f -> positive 0x0000000f
+      "move.l #0x00008000,%d0", "bfexts %d0{#16:#1},%d5",  // single-bit field=1 -> -1 (sign)
+      "move.l #0x80000000,%d0", "bfextu %d0{#0:#32},%d6",  // width 32 logical -> whole reg
+      "move.l #0x00000000,%d0", "bfextu %d0{#5:#7},%d7"    // zero field -> d7=0, Z=1
+    ).mkString(" ; "))
+  }
+  test("lock-step: BFFFO (first-set scan + all-zero -> offset+width)", VerilatorTest) {
+    runLockStep("bf-ffo", Seq(
+      "ori #0x10,%ccr",                                    // X=1 sentinel
+      "move.l #0x80000000,%d0", "bfffo %d0{#0:#32},%d1",   // MSB set -> d1=offset(0)
+      "move.l #0x08000000,%d0", "bfffo %d0{#0:#32},%d2",   // bit27 set -> 4 zeros -> d2=4
+      "move.l #0x00010000,%d0", "bfffo %d0{#0:#16},%d3",   // field top16=0x0001 -> 15 -> d3=15
+      "move.l #0x00000000,%d0", "bfffo %d0{#3:#8},%d4",    // all-zero field -> d4=offset+width=11
+      "move.l #0x00ff0000,%d0", "bfffo %d0{#8:#8},%d5",    // field=0xff -> first set at offset 8 -> d5=8
+      "move.l #0x00000001,%d0", "bfffo %d0{#0:#32},%d6"    // only LSB -> 31 zeros -> d6=31
+    ).mkString(" ; "))
+  }
+  test("lock-step: BFINS (insert into the middle, N/Z from inserted value)", VerilatorTest) {
+    runLockStep("bf-ins", Seq(
+      "ori #0x10,%ccr",                                    // X=1 sentinel
+      "move.l #0xffffffff,%d0", "move.l #0x000000a5,%d4", "bfins %d4,%d0{#8:#8}",  // insert 0xa5 at bit23..16
+      "move.l #0x00000000,%d0", "move.l #0x0000000f,%d4", "bfins %d4,%d0{#0:#4}",  // insert nibble at MSB -> N=1
+      "move.l #0x12345678,%d0", "move.l #0x00000000,%d4", "bfins %d4,%d0{#4:#8}",  // insert 0 -> Z=1, clears field
+      "move.l #0x00000000,%d0", "move.l #0xffffffff,%d4", "bfins %d4,%d0{#0:#32}", // insert full -> d0=0xffffffff
+      "move.l #0xaaaaaaaa,%d0", "move.l #0x00000001,%d4", "bfins %d4,%d0{#31:#1}"  // insert LSB
+    ).mkString(" ; "))
+  }
+  // A bit-field result feeding a dependent op (exercises the slow-producer wakeup: the
+  // consumer must wait for the lat-4 bit-field result, not read a stale PRF).
+  test("lock-step: BFEXTU result feeds a dependent ADD (slow-producer wakeup)", VerilatorTest) {
+    runLockStep("bf-dep", Seq(
+      "move.l #0x12345678,%d0", "bfextu %d0{#0:#16},%d1",  // d1 = 0x1234 (slow result)
+      "add.l %d1,%d2",                                      // consumes d1 -> must wait on the slow wakeup
+      "move.l #0xff000000,%d0", "bfffo %d0{#0:#8},%d3",     // d3 = 0 (MSB set)
+      "addq.l #1,%d3"                                       // consumes d3
+    ).mkString(" ; "))
+  }
+
   // ── ANDI/ORI/EORI #imm,CCR (NOT privileged — CCR only) lock-step ────────────
   // Set up the CCR via an arithmetic op (subi -> known NZVCX), then AND/OR/EOR the
   // immediate byte into the CCR (X=4,N=3,Z=2,V=1,C=0), verified step-for-step incl X.

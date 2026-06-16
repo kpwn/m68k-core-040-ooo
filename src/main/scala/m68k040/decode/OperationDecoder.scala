@@ -430,6 +430,7 @@ object OperationDecoder {
       is(0xE) {
         val ss = opword(7 downto 6)
         val tt = opword(4 downto 3)
+        val mode = opword(5 downto 3)
         when(ss =/= 3) {                    // ss=11 is the memory single-bit form (deferred)
           o.illegal := False
           o.op := DecOp.SHIFT
@@ -445,6 +446,26 @@ object OperationDecoder {
           val isRo = (tt === 3)             // ROL/ROR do NOT touch X
           o.writesX := !isRo
           o.readsX  := !isRo                // AS/LS/ROX read X (count-0 preserve + ROX-through-X)
+        }
+        // ── Bit-field register form (BFxxx Dn{#off:#wd}) — slice 1 ──────────────
+        // 1110 1ooo 11 000 rrr: ss=11 (op[7:6]==3), op[11]=1 (op[11:8]>=8), mode 000
+        // (Dn). bfOp = op[10:8] (0=BFTST,1=BFCHG,2=BFCLR,3=BFSET,4=BFEXTU,5=BFEXTS,
+        // 6=BFFFO,7=BFINS). One ALU/shifter slow µop; the assembler routes srcA=Dy
+        // (op[2:0]), BFINS srcB=Dn2 (ext[14:12]), the dst (Dn2/Dy/none), and packs the
+        // static offset/width from the ext word. Do=1/Dw=1 (dynamic) -> illegal (the
+        // assembler gates from the ext word); mode!=0 (memory bit-field) stays illegal.
+        // Flags: NZ only, V=C=0, X UNTOUCHED.
+        val isBitfieldReg = opword(11) && (mode.asUInt === 0)   // ss==3 implied by this arm
+        when(ss === 3 && isBitfieldReg) {
+          o.illegal := False
+          o.op := DecOp.BITFIELD
+          o.cluster := Cluster.INT
+          o.size := Size.LONG
+          o.bfOp := opword(10 downto 8)
+          // operands (srcA=Dy, srcB=Dn2 for BFINS, dst per bfOp) + the offset/width imm
+          // are routed by the MicroOpAssembler (it owns the ext word). Mark NZ writes
+          // (V=C=0 in the EU); readsX/writesX stay False (X untouched).
+          o.writesNzvc := True
         }
       }
       // ---- OR/SUB/CMP/AND/ADD (1ooo ... ) ----
