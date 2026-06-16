@@ -82,6 +82,10 @@ object PredecodeRef {
             case Some(e) => CP(simple = true, lenWords = bitBase + e)
             case None    => COMPLEX                               // An/#imm/MEMCOMPLEX -> deferred
           }
+        } else if (bit8 == 1 && mode == 1) {
+          // MOVEP (0000 rrr 1 oo 001 aaa) + disp16: all 4 variants -> SIMPLE len 2
+          // (opword + disp16). Carved out of the dyn-bit-op path (which excludes mode 001).
+          CP(simple = true, lenWords = 2)
         } else if (((op >> 11) & 1) == 0 && bit8 == 0 && ((op >> 6) & 3) == 3 &&
                    ((op >> 9) & 3) != 3 && mode >= 2) {
           // CMP2/CHK2 (0000 0ss0 11 mmm rrr) + ext word: bit11==0, ss=op[10:9]

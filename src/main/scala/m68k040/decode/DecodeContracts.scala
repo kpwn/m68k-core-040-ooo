@@ -120,6 +120,17 @@ case class OpSpec() extends Bundle {
   val movem         = Bool()
   val movemDir      = Bool()
   val movemSizeLong = Bool()
+  // ── MOVEP (move peripheral data, alternating even bytes) ────────────────────
+  // Line-0 `0000 rrr 1 oo 001 aaa` + disp16. Like MOVEM, OperationDecoder only
+  // CLASSIFIES it (keeps it non-illegal, a benign placeholder); the DecodeStage MOVEP
+  // micro-sequencer FSM reads `movep`/`movepDir`/`movepSizeLong` + Dx (op[11:9]) + Ay
+  // (op[2:0]) + disp16 (words(1)) to emit the byte loads/stores + the shift/and/or
+  // assembly µops over multiple cycles.
+  //   movepDir       : 0 = memory->register (LOAD+assemble), 1 = register->memory (STORE bytes)
+  //   movepSizeLong  : 0 = .W (2 bytes), 1 = .L (4 bytes)
+  val movep         = Bool()
+  val movepDir      = Bool()
+  val movepSizeLong = Bool()
   // ── Microcode engine routing (v1: straight-line cold opcodes) ───────────────
   // A cold/complex opcode whose µop stream EXCEEDS the ≤3-µop fast-crack budget is
   // emitted by the DecodeStage µcode SEQUENCER instead of the MicroOpAssembler crack.
@@ -155,6 +166,7 @@ object OpSpec {
     o.bitOp := 0
     o.extByte := False
     o.movem := False; o.movemDir := False; o.movemSizeLong := False
+    o.movep := False; o.movepDir := False; o.movepSizeLong := False
     o.microcoded := False; o.ucEntry := 0
     o.sysOp := False; o.sysKind := SysKind.NONE; o.sysReadDir := False
     o
