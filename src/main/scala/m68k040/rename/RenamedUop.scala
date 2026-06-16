@@ -71,6 +71,10 @@ case class RenamedUop() extends Bundle {
   // immediate (static) or psrcB=Dn (dynamic); the tested data = psrcA. Z-only flag
   // write (the ALU EU preserves N/V/C). Threaded from decode to the ALU EU.
   val bitOp        = Bits(2 bits)
+  // Bit-field op (DecOp.BITFIELD): bfOp = op[10:8] (0=BFTST..7=BFINS). The static
+  // offset/width ride `imm` (imm[4:0]=offset, imm[9:5]=raw width, 0->32). Threaded
+  // from decode to the ALU EU's bit-field (slow/shifter-path) datapath.
+  val bfOp         = Bits(3 bits)
   // Line-4 EXT/EXTB byte-source marker (DecOp.EXT): the sign-extend source is a BYTE
   // (EXT.W / EXTB.L) rather than a word (EXT.L). Threaded from decode to the ALU EU.
   val extByte      = Bool()

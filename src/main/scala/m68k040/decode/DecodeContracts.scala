@@ -107,6 +107,10 @@ case class OpSpec() extends Bundle {
   // ops leave it 0. The bit-number source is the immediate (static) or srcB (dynamic);
   // the dest width (LONG Dn / BYTE mem) is resolved by the assembler from the EA.
   val bitOp     = Bits(2 bits)
+  // Bit-field op sub-kind (DecOp.BITFIELD): bfOp = op[10:8] (0=BFTST..7=BFINS). Non
+  // bit-field ops leave it 0. The static offset/width are packed into `imm` by the
+  // assembler (offset = ext[10:6], raw width = ext[4:0], 0->32 normalized in the EU).
+  val bfOp      = Bits(3 bits)
   // Line-4 EXT/EXTB byte-source marker (DecOp.EXT): the sign-extend source is a BYTE
   // (EXT.W / EXTB.L) rather than a word (EXT.L). Non-EXT ops leave it False.
   val extByte   = Bool()
@@ -164,6 +168,7 @@ object OpSpec {
     o.shiftOp := 0; o.shiftDir := False; o.shiftImm := False
     o.bcdSub := False
     o.bitOp := 0
+    o.bfOp := 0
     o.extByte := False
     o.movem := False; o.movemDir := False; o.movemSizeLong := False
     o.movep := False; o.movepDir := False; o.movepSizeLong := False

@@ -141,7 +141,12 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // latency-1 flag scoreboards (sbNzvc/sbX); a lat2 flag write would desync them.
     // (Re-confirmed by synth: moving the shifter alone clears the cone.) ──
     val isShift = u1.op === DecOp.SHIFT
-    val isSlow  = isShift
+    // The bit-field datapath (DecOp.BITFIELD) reuses the slow path: it adds two 32-bit
+    // barrel rotates + a CLZ (BFFFO) — a comparable cone to the shifter — and writes
+    // NZ only (V=C=0, X untouched). Routed lat-matched (S1->S3) like SHIFT, with the
+    // same dynamic slowWakeup so a dependent waits on the result landing.
+    val isBitfield = u1.op === DecOp.BITFIELD
+    val isSlow  = isShift || isBitfield
 
     // Single-outstanding SLOW: hold new issue while a slow op occupies ANY of S1/S2/S3
     // (it now completes at S3). Prevents (a) two slow ops contending for the single slow
@@ -379,6 +384,25 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val s1aStage1a = RegNext(s1Stage1a)
     val s1aCtx     = RegNext(s1Ctx)
     val s1aSrc1    = RegNext(s1Src1)
+
+    // ── S1: bit-field datapath (DecOp.BITFIELD) ────────────────────────────────
+    // Dy = s1Src1 (field reg, srcA=op[2:0]); Dn2 = s1RdB (insert source for BFINS,
+    // srcB); offset/width = the packed imm (imm[4:0]=offset, imm[9:5]=raw width). The
+    // datapath is computed combinationally here (parallel to the shifter, NOT on the
+    // fast S1 writeback cone) and its finished result+flags are pipelined to S3 so the
+    // slow writeback/wakeup mechanism is shared with SHIFT (lat-matched).
+    val bfCmd = BitfieldCmd()
+    bfCmd.dy       := s1Src1
+    bfCmd.dn2      := s1RdB
+    bfCmd.offset   := s1Src2(4 downto 0).asUInt
+    bfCmd.rawWidth := s1Src2(9 downto 5).asUInt
+    bfCmd.bfOp     := u1.bfOp
+    val bfRsp = Bitfield(bfCmd)
+    // Pipeline the bit-field result/flags S1 -> S1a -> S2 -> S3 (matching the shifter
+    // depth) so a single S3 writeback path serves both slow ops.
+    val s1aBfRes  = RegNext(bfRsp.result)
+    val s1aBfN    = RegNext(bfRsp.n)
+    val s1aBfZ    = RegNext(bfRsp.z)
     // S1a: stage1b (the deep variable shifts) off the registered amounts -> register
     // the ShiftStage1 midpoint into S2 (the original cut).
     val s1Stage1 = Shifter.stage1b(s1aStage1a)
@@ -386,6 +410,9 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val s2Stage1 = RegNext(s1Stage1)
     val s2Ctx    = RegNext(s1aCtx)
     val s2Src1   = RegNext(s1aSrc1)        // merge source preserved to S3
+    val s2BfRes  = RegNext(s1aBfRes)
+    val s2BfN    = RegNext(s1aBfN)
+    val s2BfZ    = RegNext(s1aBfZ)
 
     // SLOW path stage 2 (S2): bit-extract + mux on the registered midpoint. Register
     // the finished result/flags into S3 (arch latency-3).
@@ -396,7 +423,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val s3ShiftRes  = RegNext(s2Rsp.result)
     val s3ShiftNzvc = RegNext(s2Rsp.n ## s2Rsp.z ## s2Rsp.v ## s2Rsp.c)
     val s3ShiftX    = RegNext(s2Rsp.xOut)
+    val s3BfRes     = RegNext(s2BfRes)
+    val s3BfNzvc    = RegNext(s2BfN ## s2BfZ ## False ## False)   // {N,Z,V=0,C=0}
     val u3 = s3Ctx.uop
+    val s3IsBitfield = u3.op === DecOp.BITFIELD
 
     // ── S3: SHIFT int writeback — the shift dst is Dr = src1, so the .B/.W upper-
     // preserve merge applies exactly as for a fast op (merge against s3Src1). ──
@@ -404,9 +434,12 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
       Size.BYTE -> (s3Src1(31 downto 8)  ## s3ShiftRes(7 downto 0)),
       Size.WORD -> (s3Src1(31 downto 16) ## s3ShiftRes(15 downto 0)),
       Size.LONG -> s3ShiftRes)
-    val slowResult = slowMerged
-    val slowNzvc   = s3ShiftNzvc
-    val slowX      = s3ShiftX
+    // BITFIELD writes the FULL 32-bit result (no .B/.W merge); the shifter takes the
+    // size-merge. The slow path completes ONE op per cycle (single-outstanding), so a
+    // simple op-class mux is correct.
+    val slowResult = Mux(s3IsBitfield, s3BfRes, slowMerged)
+    val slowNzvc   = Mux(s3IsBitfield, s3BfNzvc, s3ShiftNzvc)
+    val slowX      = s3ShiftX   // BITFIELD leaves X untouched (writesX=False)
 
     // ---- S3: SLOW writeback (separate ports; latency-3) ----
     intWs.valid   := s3Valid && u3.pdstValid;  intWs.address  := u3.pdst;     intWs.data  := slowResult

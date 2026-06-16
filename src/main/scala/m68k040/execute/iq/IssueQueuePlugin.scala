@@ -183,7 +183,10 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // SLOW-ALU producer: a line-E SHIFT (DecOp.SHIFT) — the latency-2 EU path. (toCcr
     // stays latency-1.) Tracked in the aluSlow* bitmaps (dynamic lat2 wakeup), NOT the
     // static scoreboards. A shift writes int + NZVC + (X for non-rotate).
-    def isAluSlowProducer(u: RenamedUop): Bool = u.op === m68k040.decode.DecOp.SHIFT
+    // BITFIELD shares the ALU slow path (lat-4, dynamic slowWakeup) with SHIFT, so a
+    // dependent of a bit-field op (its Dn2/Dy result) must wait on the slow wakeup too.
+    def isAluSlowProducer(u: RenamedUop): Bool =
+      (u.op === m68k040.decode.DecOp.SHIFT) || (u.op === m68k040.decode.DecOp.BITFIELD)
 
     // An LS op that writes NZVC = a dynamic (variable-latency) NZVC producer (a
     // MOVE-to-memory store / RTR CCR-restore). Tracked in lsNzvcBusy (dynamic), NOT
@@ -199,7 +202,11 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // have psrcB = Dy (a real register read). The EU reads rdB.data (s1RdB) directly,
     // bypassing the useImm mux, so psrcB IS a live data dependency.
     def isPackUnpk(u: RenamedUop): Bool = (u.op === m68k040.decode.DecOp.PACK) || (u.op === m68k040.decode.DecOp.UNPK)
-    def srcBIsReg(u: RenamedUop): Bool = u.psrcBValid && (!u.useImm || isLs(u) || isPackUnpk(u))
+    // BFINS is a third exception: useImm=True (offset/width packed in imm) but psrcB =
+    // Dn2 (the insert source) is a LIVE register read (the EU reads rdB.data / s1RdB
+    // directly, bypassing the useImm mux). So its srcB dependency must NOT be suppressed.
+    def isBitfield(u: RenamedUop): Bool = u.op === m68k040.decode.DecOp.BITFIELD
+    def srcBIsReg(u: RenamedUop): Bool = u.psrcBValid && (!u.useImm || isLs(u) || isPackUnpk(u) || isBitfield(u))
 
     // ---- Occupancy / back-pressure ----
     // Back-pressure is gated on LINE 0 BEING EMPTY, not on a count proxy.
