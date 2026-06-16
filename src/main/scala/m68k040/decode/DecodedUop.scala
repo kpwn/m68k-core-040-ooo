@@ -58,7 +58,16 @@ object DecOp extends SpinalEnum {
       // Size: BYTE (PACK, .B merge writes Dx[7:0]) / WORD (UNPK, .W merge writes Dx[15:0]).
       // adj16 rides `imm` (useImm=True); srcA=Dx (old-value .B/.W merge source),
       // srcB=Dy (the data source), dst=Dx. NO CCR effect.
-      PACK, UNPK = newElement()
+      PACK, UNPK,
+      // CMP2/CHK2 bounds-compare µop (020+, CPLX/DivEu). The 2-load+compare crack puts
+      // the LOWER bound in srcA (T0, LS-loaded) and the UPPER bound in srcB (T1, LS-
+      // loaded); the compared register Rn rides srcC (psrcC, a normal reg). The EU
+      // sign-extends lower/upper from the loaded size, masks/sign-extends Rn per
+      // size + the A/D bit (`divSigned` reused as adReg: True=An, no .B/.W sign-ext),
+      // and writes the CCR RMW {oldN, Z, oldV, C} (readsNzvc + writesNzvc, preserving
+      // N/V). For CHK2 (`isChk2`) an out-of-bounds C raises EuFault{vector 6}; CMP2
+      // never traps. Z := Rn==lower||Rn==upper; C := signed(Rn<lower||Rn>upper).
+      CMP2CHK2 = newElement()
 }
 
 /** Commit-time privileged-system-op kind (DecodedUop.sysOp / .sysKind). Selects how
@@ -149,6 +158,12 @@ case class DecodedUop() extends Bundle {
   val divSigned    = Bool()
   val div64        = Bool()     // 64-bit dividend (Dr:Dq) form
   val divIsRem     = Bool()     // this µop is the trailing remainder-move (DIVREM)
+  // ── CMP2/CHK2 bounds-compare sub-kind (DecOp.CMP2CHK2) ───────────────────────
+  // isChk2: True = CHK2 (out-of-bounds C raises EuFault{vec6}); False = CMP2 (flags
+  // only, never traps). The A/D bit (whether Rn is a data or address reg, for the
+  // .B/.W sign-extension rule) is carried in `divSigned` (reused: True = An, NOT
+  // sign-extended for .B/.W; False = Dn, sign-extended). Default False.
+  val isChk2       = Bool()
   // ── Stack-push store (BSR/JSR call: push return-PC to -(A7)) ────────────────
   // A predecrement-store µop: address = base An (psrcA) - sizeBytes; the STORE DATA
   // is the immediate (`imm` carries retPC = nextPc, NOT a displacement); and the

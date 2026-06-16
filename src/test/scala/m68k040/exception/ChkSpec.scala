@@ -50,6 +50,7 @@ class ChkSpec extends AnyFunSuite {
       uop.isBranch := False; uop.cond := 0; uop.branchDisp := 0
       uop.isCondTrap := False; uop.faultUsesNextPc := True; uop.isScc := False; uop.isDbcc := False
       uop.divSigned := False; uop.div64 := False; uop.divIsRem := False
+      uop.isChk2 := False
       uop.firstOfInstr := True
       uop.pc := 0x2000; uop.nextPc := 0x2002
       ctx.robId := iRobId

@@ -131,6 +131,27 @@ object PredecodeWord {
             when(mok) { r.simple := True; r.lenWords := (bitBase + mext).resized }
           }
         }
+        // ── CMP2/CHK2 (0000 0ss0 11 mmm rrr) + ext word ────────────────────────
+        // bit11==0, ss=op[10:9] (.B/.W/.L, ss=/=3), bit8==0, bits[7:6]==11, EA a
+        // CONTROL mode (mode>=2; reject postinc(3)/predec(4)). len = opword + ext
+        // word + the EA extension. (Does not alias the immediate path — that needs
+        // bits[7:6]=/=3 — nor the bit-ops — those need bit8/bit11 set.)
+        val isCmp2Chk2 = !op(11) && !bit8 && (op(7 downto 6).asUInt === U(3, 2 bits)) &&
+                         (op(10 downto 9).asUInt =/= U(3, 2 bits)) && (mode >= U(2, 3 bits))
+        when(isCmp2Chk2) {
+          // Control modes: (An)=2, (d16,An)=5, (d8,An,Xn)=6, (xxx).W/.L=7/0,1,
+          // (d16,PC)=7/2, (d8,PC,Xn)=7/3. Reject (An)+=3 / -(An)=4 (NOT control) and
+          // #imm. eaExt(allowImm=false) accepts 3/4 (ext 0) but those are non-control
+          // -> the assembler illegalises them (a mis-frame of a non-control EA is
+          // harmless: the illegal op flushes at the faulting pc).
+          val ctrlMode = (mode === U(2, 3 bits)) || (mode === U(5, 3 bits)) ||
+                         (mode === U(6, 3 bits)) || (mode === U(7, 3 bits))
+          val (ok, e) = eaExt(mode, reg, sizeL = False, allowImm = false)
+          when(ok && ctrlMode) {
+            r.simple   := True
+            r.lenWords := (U(2, 3 bits) + e).resized   // opword + ext word + EA ext
+          }
+        }
       }
 
       // MOVE.B / MOVE.L / MOVE.W

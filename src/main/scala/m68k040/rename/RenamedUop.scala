@@ -56,6 +56,10 @@ case class RenamedUop() extends Bundle {
   val divSigned    = Bool()
   val div64        = Bool()
   val divIsRem     = Bool()
+  // CMP2/CHK2 bounds-compare sub-kind (DecOp.CMP2CHK2): isChk2 selects the CHK2
+  // trap-on-out-of-bounds form (vs CMP2 flags-only). The A/D bit rides divSigned
+  // (True = An, no .B/.W sign-extend of Rn). Threaded from decode to the DivEu.
+  val isChk2       = Bool()
   // Line-E shift/rotate control (DecOp.SHIFT): shiftOp = tt (0=AS,1=LS,2=ROX,3=RO),
   // shiftDir = d (1=left). Count = useImm/imm (i=0) or psrcB=Dc (i=1). Threaded.
   val shiftOp      = Bits(2 bits)

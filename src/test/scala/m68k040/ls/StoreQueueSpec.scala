@@ -182,24 +182,34 @@ class StoreQueueSpec extends AnyFunSuite {
   test("forward partial-overlap boundary cases (pre-registered range bounds)", VerilatorTest) {
     M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
       val cd = initDut(dut)
-      // WORD store at 0x102..0x103.
+      // WORD store at 0x102..0x103 (cache line 0x100..0x10F, 16-byte lines).
       alloc(dut, cd, robId = 4, paddr = 0x102, data = 0xBEEFL, Size.WORD)
-      // load BYTE at 0x101 -> just below the store range (paddrLo=0x102) -> NO overlap.
+      // load BYTE at 0x101 -> just below the store BYTE range (paddrLo=0x102) -> NO byte
+      // overlap (so NOT a forward: hit=false), but SAME cache line as the in-flight store
+      // -> a refill of that line would cache a stale copy (the store's bytes not yet in
+      // memory + write-no-allocate) -> the load MUST stall until the store drains.
       setQuery(dut, robId = 6, paddr = 0x101, Size.BYTE)
       cd.waitSampling()
       sleep(1)
-      assert(!dut.io.fwd.rsp.hit.toBoolean && !dut.io.fwd.rsp.stall.toBoolean,
-        "byte just below the store range must not overlap")
+      assert(!dut.io.fwd.rsp.hit.toBoolean, "byte just below the store range is NOT a byte forward")
+      assert(dut.io.fwd.rsp.stall.toBoolean, "same-cache-line in-flight store -> stall (refill hazard)")
       // load BYTE at 0x103 -> inside the store range -> partial overlap -> stall.
       setQuery(dut, robId = 6, paddr = 0x103, Size.BYTE)
       sleep(1)
       assert(!dut.io.fwd.rsp.hit.toBoolean, "sub-range byte is not a full forward")
       assert(dut.io.fwd.rsp.stall.toBoolean, "byte inside the store range -> stall")
-      // load BYTE at 0x104 -> just above the store range (paddrHi=0x104) -> NO overlap.
+      // load BYTE at 0x104 -> just above the store BYTE range (paddrHi=0x104), STILL the
+      // same cache line (0x100) -> no byte forward, but the same-line refill hazard -> stall.
       setQuery(dut, robId = 6, paddr = 0x104, Size.BYTE)
       sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean, "byte just above the store range is NOT a byte forward")
+      assert(dut.io.fwd.rsp.stall.toBoolean, "same-cache-line in-flight store -> stall (refill hazard)")
+      // load BYTE at 0x110 -> a DIFFERENT cache line -> no byte overlap AND no same-line
+      // hazard -> the load proceeds (no forward, no stall).
+      setQuery(dut, robId = 6, paddr = 0x110, Size.BYTE)
+      sleep(1)
       assert(!dut.io.fwd.rsp.hit.toBoolean && !dut.io.fwd.rsp.stall.toBoolean,
-        "byte just above the store range (== paddrHi) must not overlap")
+        "a different cache line must not overlap and must not stall")
       cd.waitSampling(2)
     }
   }

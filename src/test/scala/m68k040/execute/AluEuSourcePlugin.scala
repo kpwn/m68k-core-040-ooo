@@ -84,6 +84,7 @@ class AluEuSourcePlugin extends FiberPlugin {
     uop.isCondTrap   := False
     uop.faultAddr    := U(0); uop.sswInstr := False
     uop.divSigned    := False; uop.div64 := False; uop.divIsRem := False
+    uop.isChk2 := False
     uop.extByte      := False
     uop.isMovea      := False
     uop.isScc        := False; uop.isDbcc := False

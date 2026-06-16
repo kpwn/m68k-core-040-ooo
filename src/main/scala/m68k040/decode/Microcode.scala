@@ -193,6 +193,7 @@ object Microcode {
     // observation is dropped, but the An write lands in the PRF + is verified by a later
     // reader (the program reads Ay/Ax into a Dn after the op). Mirrors anUpdUop / LINK.
     u.divIsRem := Bool(d.uop == UAddDrop)
+    u.isChk2   := False
     // Auto-update: the LOAD carries PREDEC so the LS-EU computes addr = An - eaDelta (the
     // load does NOT write An — the LS-EU writes An only on an eaAuto STORE). The store
     // accesses the already-decremented Ax with NO auto. eaDelta is the byte count.

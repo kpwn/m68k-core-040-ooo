@@ -181,6 +181,18 @@ class StoreQueue(depth: Int = 8) extends Component {
     // full overlap = exact addr+size against slot A of a NON-split store.
     val full     = overlapA && !validBs(i) && (aLo === qLo) && (nbytesAs(i) === qBytes)
     val partial  = overlap && !full
+    // SAME-CACHE-LINE hazard (16-byte line; offBits=4). A younger load that MISSES the
+    // L1D refills the WHOLE line from memory. If an OLDER store to the SAME line is still
+    // in the SQ (not yet written through to memory), that refill would cache a STALE line
+    // (the store's bytes not yet in memory, and the store — write-no-allocate — won't
+    // update the now-cached line). A subsequent load to OTHER bytes of that line then HITS
+    // the stale cached copy. So a load that line-overlaps an older in-flight store must
+    // STALL until the store drains, even with NO byte overlap. (A clean FULL forward is
+    // still safe — we already have the data — so it is excluded by the consumer below.)
+    val lineA    = paddrs(i)(31 downto 4)
+    val lineB    = paddrBs(i)(31 downto 4)
+    val qLine    = q.paddr(31 downto 4)
+    val sameLine = ent && ((lineA === qLine) || (validBs(i) && (lineB === qLine)))
   }
   // youngest older overlapping entry: among ALL overlapping matches (full OR
   // partial), the one closest (in ROB age) to the query. ONE reduce tree carrying
@@ -210,9 +222,14 @@ class StoreQueue(depth: Int = 8) extends Component {
     o
   }
   val fullValid = best.valid && best.full
+  // Same-line hazard: any older in-flight store to the load's cache line forces a stall
+  // (the refill-stale-line hole above), UNLESS we can cleanly FULL-forward the exact bytes
+  // (then we have the data and never touch the cache). A byte-partial overlap already
+  // stalls via anyPartial; sameLine extends that to line-overlap-only stores too.
+  val anySameLine = perEntry.map(_.sameLine).orR
   io.fwd.rsp.hit   := fullValid
   io.fwd.rsp.data  := best.data
-  io.fwd.rsp.stall := anyPartial && !fullValid   // a clean full forward resolves the load
+  io.fwd.rsp.stall := (anyPartial || anySameLine) && !fullValid   // a clean full forward resolves the load
 
   // ---- commit: mark the matching valid entry committed ----
   when(io.commit.valid) {

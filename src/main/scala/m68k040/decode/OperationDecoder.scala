@@ -66,6 +66,32 @@ object OperationDecoder {
         // opmode in {0,1,2,3,5,6}; static bit-op is opmode 4, dynamic is bit8=1).
         val mode     = opword(5 downto 3)
         val tt       = opword(7 downto 6)
+        // ── CMP2/CHK2 (020+ bounds-check against a memory pair) ─────────────────
+        // Encoding `0000 0ss0 11 mmm rrr` + ext word (Musashi `0000 0ss0 11......`):
+        // bit11==0, ss=op[10:9] (00=.B,01=.W,10=.L), bit8==0, bits[7:6]==11 (the
+        // family marker — also blocks the line-0 immediate path, which needs ss=/=3),
+        // EA = a CONTROL mode (mode>=2). The EA points to the LOWER bound; the UPPER
+        // bound is at EA+size. The compared register Rn + the CMP2-vs-CHK2 selector +
+        // the A/D bit live in the extension word — the MicroOpAssembler owns the
+        // 2-load+compare crack (reading word2). OperationDecoder only NAMES the op
+        // (CPLX/DivEu, size from ss, reads+writes NZVC for the {oldN,Z,oldV,C} RMW) +
+        // the EA as srcA so the predecode/EaDecoder frame it; the assembler overrides
+        // the operand routing. mode<2 (Dn/An/postinc) stays ILLEGAL here.
+        val ssCmp2 = opword(10 downto 9)
+        val isCmp2Chk2 = !opword(11) && !opword(8) && (opword(7 downto 6) === 3) &&
+                         (ssCmp2 =/= 3) && (opword(5 downto 3).asUInt >= 2)
+        when(isCmp2Chk2) {
+          o.illegal := False
+          o.op      := DecOp.CMP2CHK2
+          o.cluster := Cluster.CPLX
+          when(ssCmp2 === 0) { o.size := Size.BYTE }
+            .elsewhen(ssCmp2 === 1) { o.size := Size.WORD }
+            .otherwise { o.size := Size.LONG }
+          o.srcA := easrc                  // the EA bounds pointer (LOWER bound base)
+          o.dst.setNone(); o.dstWrites := False
+          o.readsNzvc  := True             // RMW: read old N/V to preserve them
+          o.writesNzvc := True             // write {oldN, Z, oldV, C}
+        }
         val isDynBit = opword(8) && (mode =/= B"001")            // exclude MOVEP (mode 001)
         val isStatBit= opword(11 downto 8) === B"1000"           // opmode 4 (bit8=0)
         when(isDynBit || isStatBit) {

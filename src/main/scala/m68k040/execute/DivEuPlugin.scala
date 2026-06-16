@@ -54,6 +54,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
   var rdA, rdB, rdH: RegFileReadPort = null
   var intW: RegFileWritePort = null;  var intByp: RegFileBypassPort = null
   var nzvcW: RegFileWritePort = null; var nzvcByp: RegFileBypassPort = null
+  var nzvcRd: RegFileReadPort = null  // CMP2/CHK2 old-NZVC read (preserve N/V in the RMW)
   var flushSig: Bool = null
 
   override def issue: Stream[IqContext] = issuePort
@@ -78,6 +79,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     intW = irf.newWrite(latency = 1); intByp = irf.newBypass()
     val nz = host[NzvcRegFileService]
     nzvcW = nz.newWrite(latency = 1); nzvcByp = nz.newBypass()
+    nzvcRd = nz.newRead(forceNoBypass = false)   // CMP2/CHK2 reads old N/V to preserve them
   }
 
   val logic = during build new Area {
@@ -86,9 +88,11 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     rdA.addr := u0.psrcA
     rdB.addr := u0.psrcB
     rdH.addr := u0.psrcC     // DIV.L 64/32 dividend HIGH word (Dr) via the 3rd source
+    nzvcRd.addr := u0.pNzvcSrc                  // CMP2/CHK2 old NZVC (preserve N/V)
     val s0A = rdA.data
     val s0B = Mux(u0.useImm, u0.imm, rdB.data)
     val s0H = rdH.data
+    val s0Nzvc = nzvcRd.data                    // {N(3),Z(2),V(1),C(0)}
 
     // single-outstanding busy. A µop occupying s1 (not yet consumed) ALSO blocks a new
     // issue — otherwise a 2nd µop (e.g. the cracked DIVREM following its DIV) would
@@ -102,6 +106,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val s1A     = Reg(Bits(32 bits))
     val s1B     = Reg(Bits(32 bits))
     val s1H     = Reg(Bits(32 bits))
+    val s1Nzvc  = Reg(Bits(4 bits))    // old {N,Z,V,C} for the CMP2/CHK2 RMW
     val u1 = s1Ctx.uop
 
     // default: clear s1Valid unless held by busy (set on capture below)
@@ -111,6 +116,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       s1A     := s0A
       s1B     := s0B
       s1H     := s0H
+      s1Nzvc  := s0Nzvc
     } otherwise {
       when(!busy) { s1Valid := False }
     }
@@ -177,6 +183,51 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // ALWAYS commits this NZVC (even on the trap path, so the stacked CCR's N matches).
     val chkN     = chkNeg
     val chkNzvc  = (chkN ## False ## False ## False).asBits   // N Z(0) V(0) C(0)
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // CMP2 / CHK2 bounds compare (single-cycle, transcribed VERBATIM from Musashi
+    // m68k_op_chk2cmp2_{8,16,32}). Operands: s1A = lower (T0, LS-loaded), s1B = upper
+    // (T1, LS-loaded), s1H = Rn (the compared reg, via psrcC). lower/upper are SIGN-
+    // extended from the loaded size; Rn is masked to the size then, for .B/.W, sign-
+    // extended ONLY for a DATA reg (u1.divSigned reused as adReg: True = An -> NO
+    // sign-extend, stays masked). .L uses the full 32 bits (no mask / no sign-ext).
+    //   FLAG_Z = !((upper==compare)||(lower==compare))  -> Z_bit = (==lower || ==upper)
+    //   FLAG_C = signed(compare<lower || compare>upper)  (both ternary branches equal)
+    // CCR RMW = {oldN, Z, oldV, C} (preserve N/V; readsNzvc/writesNzvc). CHK2 (isChk2)
+    // raises EuFault{vec6} on C (out-of-bounds); CMP2 never traps.
+    val isCmp2 = u1.op === DecOp.CMP2CHK2
+    val c2Lower = u1.size.mux(
+      Size.BYTE -> s1A( 7 downto 0).asSInt.resize(32),
+      Size.WORD -> s1A(15 downto 0).asSInt.resize(32),
+      default   -> s1A.asSInt)
+    val c2Upper = u1.size.mux(
+      Size.BYTE -> s1B( 7 downto 0).asSInt.resize(32),
+      Size.WORD -> s1B(15 downto 0).asSInt.resize(32),
+      default   -> s1B.asSInt)
+    // compare (Rn): mask to size; then for .B/.W, sign-extend ONLY when adReg==False
+    // (data reg). For an address reg (.B/.W) it stays masked (zero-extended -> positive).
+    // .L is the full 32 bits regardless of adReg.
+    val c2AdReg = u1.divSigned                  // reused: True = An (no .B/.W sign-ext)
+    val c2RnByte = s1H( 7 downto 0)
+    val c2RnWord = s1H(15 downto 0)
+    val c2Compare = SInt(32 bits)
+    switch(u1.size) {
+      is(Size.BYTE) {
+        c2Compare := Mux(c2AdReg, (B(0, 24 bits) ## c2RnByte).asSInt,    // An: zero-ext (masked)
+                                  c2RnByte.asSInt.resize(32))            // Dn: sign-ext
+      }
+      is(Size.WORD) {
+        c2Compare := Mux(c2AdReg, (B(0, 16 bits) ## c2RnWord).asSInt,
+                                  c2RnWord.asSInt.resize(32))
+      }
+      default { c2Compare := s1H.asSInt }                               // .L: full 32
+    }
+    val c2Zbit = (c2Compare === c2Lower) || (c2Compare === c2Upper)
+    val c2Cbit = (c2Compare < c2Lower) || (c2Compare > c2Upper)         // signed OOB
+    val c2OldN = s1Nzvc(3)
+    val c2OldV = s1Nzvc(1)
+    val c2Nzvc = (c2OldN ## c2Zbit ## c2OldV ## c2Cbit).asBits          // {oldN, Z, oldV, C}
+    val c2Trap = u1.isChk2 && c2Cbit                                    // CHK2 out-of-bounds
 
     // captured-completion helpers. `writeInt` lets the caller suppress the register
     // write (e.g. DIV overflow: V=1 but Dn unchanged) without a second overlapping
@@ -342,6 +393,13 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
             // paths so the committed/stacked CCR's N matches Musashi.
             when(chkTrap) { captureFault(U(6, 8 bits), chkNzvc, True) }
               .otherwise   { captureComplete(B(0, 32 bits), chkNzvc, True, False) }  // in-bounds: N=0, no reg write
+            s1Valid := False
+          } elsewhen(isCmp2) {
+            // CMP2/CHK2: single-cycle bounds compare. Write the CCR RMW {oldN,Z,oldV,C}
+            // (no int dst). CHK2 out-of-bounds (c2Trap) -> EuFault vec6 (still writing
+            // the CCR so the stacked frame's flags match Musashi); CMP2 always completes.
+            when(c2Trap) { captureFault(U(6, 8 bits), c2Nzvc, True) }
+              .otherwise { captureComplete(B(0, 32 bits), c2Nzvc, True, False) }
             s1Valid := False
           } elsewhen(isDivRem) {
             // Trailing remainder-move: write the latched remainder to Dr. If the
