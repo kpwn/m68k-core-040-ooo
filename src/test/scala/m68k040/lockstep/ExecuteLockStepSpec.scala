@@ -4000,6 +4000,27 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       ".stop: bra .stop", nInstr = 6, checkMem = Seq(0x3010L), checkSpan = 1)
   }
 
+  // Regression: MOVEP immediately followed by a µcoded mem-form op (SBCD -(An)) — exercises
+  // the mutual-exclusion guard that was MISSING on ucBegin/movemBegin. Without the fix,
+  // movepBegin latches the MOVEP state + sets ucPendValid for the slot1-stashed SBCD; then
+  // next cycle movepActive=True and ucBegin (lacking !movepActive/!movepPendValid) fires,
+  // starting the µcode engine mid-MOVEP. Both sequencers use T0/T1 scratch → RAT corruption
+  // → wrong MOVEP stores or wrong SBCD result. The lock-step must be 0-diverged vs Musashi.
+  // MOVEP.L D0,(16,A0): D0=0x11223344, A0=0x3000 → stores 0x11/0x22/0x33/0x44 at 0x3010/12/14/16.
+  // SBCD -(A2),-(A1): dst=[A1-1]=[0x4000]=0x25, src=[A2-1]=[0x5000]=0x12 → 0x25-0x12=0x13→[0x4000].
+  test("lock-step: MOVEP.L reg->mem immediately followed by SBCD-mem (no sequencer collision)", VerilatorTest) {
+    runLockStep("movep-then-ucode",
+      "move.l #0x11223344,%d0 ; move.l #0x3000,%a0 ; " +
+      "move.l #0x4001,%a1 ; move.l #0x00000025,%d1 ; move.b %d1,-(%a1) ; " +   // [0x4000]=0x25, A1=0x4000
+      "move.l #0x5001,%a2 ; move.l #0x00000012,%d2 ; move.b %d2,-(%a2) ; " +   // [0x5000]=0x12, A2=0x5000
+      "move.l #0x4001,%a1 ; move.l #0x5001,%a2 ; " +                           // reset An above the bytes
+      "moveq #1,%d3 ; addi.b #1,%d3 ; " +                                       // X=0
+      "movep.l %d0,(16,%a0) ; " +                                               // MOVEP -> 0x3010..0x3016
+      "sbcd -(%a2),-(%a1) ; " +                                                 // µcoded: 0x25-0x12=0x13->[0x4000]
+      ".stop: bra .stop", nInstr = 14,
+      checkMem = Seq(0x3010L, 0x3012L, 0x3014L, 0x3016L, 0x4000L), checkSpan = 1)
+  }
+
   // ── Brief-format indexed addressing lock-step (all programs Musashi-verified) ──
   // (d8,An,Xn*scale) modes 6/7-3: index reg .W(sign-ext)/.L, scale *1/2/4/8, signed d8.
   // The harness lock-steps the FULL retired stream (regs/flags/PC) vs Musashi; a load

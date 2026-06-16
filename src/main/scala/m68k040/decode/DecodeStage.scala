@@ -240,12 +240,16 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val movemPendValid = RegInit(False)
     val movemPendPkt   = Reg(DecodePacket())
     when(pipeFlush) { movemPendValid := False }
+    // Hoisted early (also used by movemBegin and ucBegin mutual-exclusion guards):
+    val movepActive    = RegInit(False)
+    val movepPendValid = RegInit(False)
 
     // The source packet the FSM enters from: the stashed slot1 MOVEM, else slot0.
     val movemEntryPkt = Mux(movemPendValid, movemPendPkt, fed.payload.packets(0))
     // Begin a MOVEM: there's a MOVEM to start (a pending slot1 one, or slot0 is MOVEM and
     // not blocked by a stash/replay) and the FSM is idle.
-    val movemBegin = !movemActive && (movemPendValid || (slot0IsMovem && !stashValid))
+    val movemBegin = !movemActive && !ucActive && !ucPendValid && !movepActive && !movepPendValid &&
+                     (movemPendValid || (slot0IsMovem && !stashValid))
 
     // Decode the entry packet's EA + mask. The mask is words(1); a (d16,An)/(xxx)/(d16,PC)
     // EA extension word sits at words(2) (after the mask). PC-rel: EA_PCDI = (pc+4) + d16
@@ -289,7 +293,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // the single KEPT macro commit is the final `MOVE T1->Dx` (mem->reg) or the LAST byte
     // store's keepCommit (reg->mem writes NO register). `pipeFlush` aborts (the queue flush
     // squashes the partial µops; MOVEP re-decodes from scratch on re-fetch).
-    val movepActive    = RegInit(False)
+    // movepActive and movepPendValid declared above (hoisted for movemBegin/ucBegin guards).
     val movepStep      = Reg(UInt(4 bits))    // 0..10 (the longest variant = mem->reg .L = 11 steps)
     val movepDirReg    = Reg(Bool())          // 1 = register->memory (store bytes), 0 = memory->register
     val movepSizeLong  = Reg(Bool())          // 1 = .L (4 bytes), 0 = .W (2 bytes)
@@ -301,7 +305,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     when(pipeFlush) { movepActive := False }
 
     // MOVEP entry: a pending slot1 MOVEP (movepPendValid), else slot0. Decode Dx/Ay/disp16.
-    val movepPendValid = RegInit(False)
+    // movepPendValid declared above (hoisted).
     val movepPendPkt   = Reg(DecodePacket())
     when(pipeFlush) { movepPendValid := False }
     val movepEntryPkt  = Mux(movepPendValid, movepPendPkt, fed.payload.packets(0))
@@ -432,7 +436,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
 
     // Begin a µcode op: a pending slot1 microcoded op, OR a microcoded slot0 (not blocked
     // by a stash), while the engine + the MOVEM FSM are idle.
-    val ucBegin = !ucActive && !movemActive && !movemPendValid &&
+    val ucBegin = !ucActive && !movemActive && !movemPendValid && !movepActive && !movepPendValid &&
                   (ucPendValid || (slot0IsMicrocoded && !stashValid))
     // Entering a slot0 microcoded op (not a pending one): its group is consumed on entry.
     val ucEnterSlot0 = ucBegin && !ucPendValid
