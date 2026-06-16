@@ -3935,6 +3935,92 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       ".stop: bra .stop", nInstr = 15, checkMem = Seq(0x3000L), checkSpan = 32)
   }
 
+  // ════════════════════════════════════════════════════════════════════════════
+  // MOVEP (move peripheral data, alternating EVEN bytes) — the DecodeStage MOVEP FSM.
+  // All 4 variants vs Musashi. reg->mem: checkMem the stored EVEN bytes at ea/ea+2/...
+  // (each span 1 — the odd bytes are NOT touched, so comparing a contiguous span would
+  // read the DUT's uninitialised pattern). mem->reg: seed the even bytes, drain+refill the
+  // line (dodging the PRE-EXISTING plain-store->same-line-load LS flake the MOVEM .W test
+  // documents), MOVEP-load + surface Dx. .W mem->reg uses a sentinel Dx[31:16] to verify it
+  // is PRESERVED. CCR is verified UNCHANGED across the full retired stream (the lock-step
+  // joins NZVCX every step; a MOVEP that wrote CCR would diverge on the FOLLOWING op's read).
+  // ════════════════════════════════════════════════════════════════════════════
+
+  // reg->mem .L: D0=0x11223344 -> [ea]=0x11,[ea+2]=0x22,[ea+4]=0x33,[ea+6]=0x44 at ea=0x3010.
+  test("lock-step: MOVEP.L D0,(d16,A0) reg->mem alternating bytes", VerilatorTest) {
+    runLockStep("movep-l-re",
+      "move.l #0x11223344,%d0 ; move.l #0x3000,%a0 ; movep.l %d0,(16,%a0) ; " +
+      ".stop: bra .stop", nInstr = 4,
+      checkMem = Seq(0x3010L, 0x3012L, 0x3014L, 0x3016L), checkSpan = 1)   // 0x11/0x22/0x33/0x44
+  }
+
+  // reg->mem .W: D2=0xAABBCCDD -> [ea]=0xCC (Dx[15:8]), [ea+2]=0xDD (Dx[7:0]) at ea=0x3020.
+  test("lock-step: MOVEP.W D2,(d16,A1) reg->mem alternating bytes", VerilatorTest) {
+    runLockStep("movep-w-re",
+      "move.l #0xAABBCCDD,%d2 ; move.l #0x3000,%a1 ; movep.w %d2,(32,%a1) ; " +
+      ".stop: bra .stop", nInstr = 4,
+      checkMem = Seq(0x3020L, 0x3022L), checkSpan = 1)   // 0xCC / 0xDD
+  }
+
+  // mem->reg .L: MOVEP.L reads bytes [ea],[ea+2],[ea+4],[ea+6]. Seed two ADJACENT longs at
+  // ea(=0x3030) and ea+4 so ALL 8 bytes are defined (the drain+refill long-read then matches
+  // Musashi — no unwritten-odd-byte mismatch). word1=0xDE00AD00 -> [ea]=0xDE,[ea+2]=0xAD;
+  // word2=0xBE00EF00 -> [ea+4]=0xBE,[ea+6]=0xEF. MOVEP.L assembles D3=0xDEADBEEF; surface
+  // via move.l %d3,%d4 (a kept step compared vs Musashi).
+  test("lock-step: MOVEP.L (d16,A2),D3 mem->reg assemble", VerilatorTest) {
+    runLockStep("movep-l-er",
+      "move.l #0x3000,%a2 ; move.l #0xDE00AD00,%d0 ; move.l %d0,48(%a2) ; " +
+      "move.l #0xBE00EF00,%d1 ; move.l %d1,52(%a2) ; " +
+      "moveq #1,%d2 ; moveq #2,%d2 ; moveq #3,%d2 ; move.l 48(%a2),%d2 ; " +   // drain + refill the line
+      "movep.l (48,%a2),%d3 ; move.l %d3,%d4 ; " +
+      ".stop: bra .stop", nInstr = 11)
+  }
+
+  // mem->reg .W: D5 pre-seeded with a sentinel upper word (0x1234); MOVEP.W reads [ea],[ea+2].
+  // Seed one long at ea(=0x3040)=0x7F00F000 so [ea]=0x7F,[ea+2]=0xF0 (all bytes defined ->
+  // the drain+refill long-read matches Musashi). MOVEP.W -> D5[15:0]=0x7FF0, D5[31:16]=0x1234
+  // PRESERVED. Surface D5 via move.l %d5,%d6 (a kept step compared vs Musashi).
+  test("lock-step: MOVEP.W (d16,A3),D5 mem->reg preserves Dx[31:16]", VerilatorTest) {
+    runLockStep("movep-w-er",
+      "move.l #0x12345678,%d5 ; move.l #0x3000,%a3 ; " +
+      "move.l #0x7F00F000,%d0 ; move.l %d0,64(%a3) ; " +
+      "moveq #1,%d1 ; moveq #2,%d1 ; moveq #3,%d1 ; move.l 64(%a3),%d1 ; " +   // drain + refill the line
+      "movep.w (64,%a3),%d5 ; move.l %d5,%d6 ; " +
+      ".stop: bra .stop", nInstr = 10)   // D5 -> 0x12347FF0 (upper word PRESERVED)
+  }
+
+  // CCR-unchanged: set a known CCR with a flag-setting op, then MOVEP (no CCR effect),
+  // then a conditional that reads CCR — the full-stream lock-step verifies NZVCX is
+  // identical to Musashi at every step (a MOVEP CCR write would diverge here).
+  test("lock-step: MOVEP does not affect CCR", VerilatorTest) {
+    runLockStep("movep-ccr",
+      "move.l #0x80000000,%d0 ; add.l %d0,%d0 ; " +   // sets C/V/Z/N/X (0x80000000+0x80000000)
+      "move.l #0x11223344,%d1 ; move.l #0x3000,%a0 ; movep.l %d1,(16,%a0) ; " +
+      "addx.l %d2,%d2 ; " +                            // reads X (would diverge if MOVEP touched X)
+      ".stop: bra .stop", nInstr = 6, checkMem = Seq(0x3010L), checkSpan = 1)
+  }
+
+  // Regression: MOVEP immediately followed by a µcoded mem-form op (SBCD -(An)) — exercises
+  // the mutual-exclusion guard that was MISSING on ucBegin/movemBegin. Without the fix,
+  // movepBegin latches the MOVEP state + sets ucPendValid for the slot1-stashed SBCD; then
+  // next cycle movepActive=True and ucBegin (lacking !movepActive/!movepPendValid) fires,
+  // starting the µcode engine mid-MOVEP. Both sequencers use T0/T1 scratch → RAT corruption
+  // → wrong MOVEP stores or wrong SBCD result. The lock-step must be 0-diverged vs Musashi.
+  // MOVEP.L D0,(16,A0): D0=0x11223344, A0=0x3000 → stores 0x11/0x22/0x33/0x44 at 0x3010/12/14/16.
+  // SBCD -(A2),-(A1): dst=[A1-1]=[0x4000]=0x25, src=[A2-1]=[0x5000]=0x12 → 0x25-0x12=0x13→[0x4000].
+  test("lock-step: MOVEP.L reg->mem immediately followed by SBCD-mem (no sequencer collision)", VerilatorTest) {
+    runLockStep("movep-then-ucode",
+      "move.l #0x11223344,%d0 ; move.l #0x3000,%a0 ; " +
+      "move.l #0x4001,%a1 ; move.l #0x00000025,%d1 ; move.b %d1,-(%a1) ; " +   // [0x4000]=0x25, A1=0x4000
+      "move.l #0x5001,%a2 ; move.l #0x00000012,%d2 ; move.b %d2,-(%a2) ; " +   // [0x5000]=0x12, A2=0x5000
+      "move.l #0x4001,%a1 ; move.l #0x5001,%a2 ; " +                           // reset An above the bytes
+      "moveq #1,%d3 ; addi.b #1,%d3 ; " +                                       // X=0
+      "movep.l %d0,(16,%a0) ; " +                                               // MOVEP -> 0x3010..0x3016
+      "sbcd -(%a2),-(%a1) ; " +                                                 // µcoded: 0x25-0x12=0x13->[0x4000]
+      ".stop: bra .stop", nInstr = 14,
+      checkMem = Seq(0x3010L, 0x3012L, 0x3014L, 0x3016L, 0x4000L), checkSpan = 1)
+  }
+
   // ── Brief-format indexed addressing lock-step (all programs Musashi-verified) ──
   // (d8,An,Xn*scale) modes 6/7-3: index reg .W(sign-ext)/.L, scale *1/2/4/8, signed d8.
   // The harness lock-steps the FULL retired stream (regs/flags/PC) vs Musashi; a load

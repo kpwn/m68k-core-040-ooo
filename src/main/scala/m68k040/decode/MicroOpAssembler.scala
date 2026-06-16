@@ -131,6 +131,150 @@ object MicroOpAssembler {
     u
   }
 
+  // ════════════════════════════════════════════════════════════════════════════
+  // MOVEP micro-sequencer µop builders (the DecodeStage MOVEP FSM). MOVEP moves a
+  // data register <-> alternating EVEN memory bytes; the FSM emits a byte-at-a-time
+  // load/store sequence + the shift/and/or assembly using EXISTING DecOps (MOVE+memOp,
+  // SHIFT, AND, OR). NO new EU datapath / DecOp. MOVEP has NO CCR effect (writesNzvc/
+  // writesX False on every µop). All intermediate temp writes are DROPPED (divIsRem);
+  // the single KEPT macro commit is the final `MOVE Tacc->Dx` (mem->reg) or the last
+  // byte store carrying `keepCommit` (reg->mem, which writes no register).
+  //
+  // Every DecodedUop field is assigned exactly once (mirrors movemMoveUop's shape).
+  // ════════════════════════════════════════════════════════════════════════════
+
+  /** Common defaults for a MOVEP µop: NO flags, NO branch/sys/fault/index/auto markers,
+    * pc/nextPc threaded for the macro commit. Mutated by the specific builders. */
+  private def movepBase(pc: UInt, nextPc: UInt): DecodedUop = {
+    val u = DecodedUop()
+    // The specific builders below override a few fields (op/size/srcs/dst/flags) after
+    // these defaults; allowOverride makes that last-wins (the defaults provide the inert
+    // value for every field NOT touched by the builder, so no field is left UNASSIGNED).
+    u.flattenForeach(_.allowOverride)
+    u.valid       := True
+    u.pc          := pc
+    u.nextPc      := nextPc
+    u.op          := DecOp.MOVE
+    u.cluster     := Cluster.INT
+    u.size        := Size.LONG
+    u.memOp       := MemOp.NONE
+    u.srcAReg     := 0; u.srcAValid := False
+    u.srcBReg     := 0; u.srcBValid := False
+    u.srcCReg     := 0; u.srcCValid := False
+    u.dstReg      := 0; u.dstValid  := False
+    u.useImm      := False; u.imm := 0
+    u.readsNzvc   := False; u.readsX := False
+    u.writesNzvc  := False; u.writesX := False     // MOVEP affects NO condition codes
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
+    u.cond        := 0; u.branchDisp := 0
+    u.unimplemented := False
+    u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+    u.faultAddr   := pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
+    u.divSigned   := False; u.div64 := False
+    u.divIsRem    := False
+    u.isChk2      := False
+    u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
+    u.ccrRestore  := False; u.toCcr := False
+    u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.extByte := False
+    u.isMovea     := False; u.isScc := False; u.isDbcc := False
+    u.indexLong   := False; u.indexScale := 0
+    u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+    u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+    u.firstOfInstr := False
+    u
+  }
+
+  /** SHIFT µop: `src (LSL/LSR by `count`) -> dst`, LONG (no .B/.W merge). dirLeft selects
+    * LSL (assemble) vs LSR (extract a byte for storing). shiftOp = 1 (LSL/LSR family).
+    * dst is a temp (dropped); reads `src` (srcA). Used both to extract a byte from Dx
+    * (reg->mem) and to position a loaded byte (mem->reg). */
+  def movepShiftUop(src: UInt, dst: UInt, count: Int, dirLeft: Boolean,
+                    first: Boolean, pc: UInt, nextPc: UInt): DecodedUop = {
+    val u = movepBase(pc, nextPc)
+    u.op       := DecOp.SHIFT
+    u.shiftOp  := B"01"                 // tt=01 = LSL/LSR
+    u.shiftDir := Bool(dirLeft)
+    u.srcAReg  := src;  u.srcAValid := True
+    u.dstReg   := dst;  u.dstValid  := True
+    u.useImm   := True; u.imm := U(count, 32 bits).asBits
+    u.divIsRem := True                  // intermediate temp write -> dropped
+    u.firstOfInstr := Bool(first)
+    u
+  }
+
+  /** AND µop: `src & imm -> dst` (LONG), no flags. Used by mem->reg .W to preserve
+    * Dx[31:16] (imm = 0xFFFF0000) before assembling the low word. dst is a temp. */
+  def movepAndMaskUop(src: UInt, dst: UInt, mask: Long, first: Boolean,
+                      pc: UInt, nextPc: UInt): DecodedUop = {
+    val u = movepBase(pc, nextPc)
+    u.op       := DecOp.AND
+    u.srcAReg  := src; u.srcAValid := True
+    u.useImm   := True; u.imm := B(mask, 32 bits)
+    u.dstReg   := dst; u.dstValid := True
+    u.divIsRem := True
+    u.firstOfInstr := Bool(first)
+    u
+  }
+
+  /** OR µop: `srcA | srcB -> dst` (LONG), no flags. The accumulator merge. dst is a temp. */
+  def movepOrUop(srcA: UInt, srcB: UInt, dst: UInt, pc: UInt, nextPc: UInt): DecodedUop = {
+    val u = movepBase(pc, nextPc)
+    u.op       := DecOp.OR
+    u.srcAReg  := srcA; u.srcAValid := True
+    u.srcBReg  := srcB; u.srcBValid := True
+    u.dstReg   := dst;  u.dstValid := True
+    u.divIsRem := True
+    u
+  }
+
+  /** Byte LOAD µop: `[base + disp] -> T0` (.B, ZERO-extended into T0[31:8]=0 by the LS-EU
+    * DcacheByteLane.extract). dst = T0 (temp, dropped). NO auto-update (MOVEP EA is
+    * (d16,Ay) — no predec/postinc). */
+  def movepLoadUop(base: UInt, disp: Bits, first: Boolean, pc: UInt, nextPc: UInt): DecodedUop = {
+    val u = movepBase(pc, nextPc)
+    u.op      := DecOp.MOVE
+    u.cluster := Cluster.LS
+    u.size    := Size.BYTE
+    u.memOp   := MemOp.LOAD
+    u.srcAReg := base; u.srcAValid := True
+    u.dstReg  := U(T0, 5 bits); u.dstValid := True
+    u.useImm  := True; u.imm := disp
+    u.divIsRem := True                  // loaded byte is a temp -> dropped
+    u.firstOfInstr := Bool(first)
+    u
+  }
+
+  /** Byte STORE µop: `srcData(.B low byte) -> [base + disp]`. NO int dst, NO flags. The
+    * stored byte is the low byte of the source register (Dx directly for the position-0
+    * byte, or a shifted temp). `keep` forces the macro commit (reg->mem writes no reg, so
+    * the LAST store carries keepCommit). NO auto-update. */
+  def movepStoreUop(base: UInt, disp: Bits, srcData: UInt, keep: Boolean, first: Boolean,
+                    pc: UInt, nextPc: UInt): DecodedUop = {
+    val u = movepBase(pc, nextPc)
+    u.op      := DecOp.MOVE
+    u.cluster := Cluster.LS
+    u.size    := Size.BYTE
+    u.memOp   := MemOp.STORE
+    u.srcAReg := base; u.srcAValid := True
+    u.srcBReg := srcData; u.srcBValid := True   // store DATA
+    u.useImm  := True; u.imm := disp
+    u.keepCommit := Bool(keep)          // the kept macro commit (reg->mem) — others drop as RMW stores
+    u.firstOfInstr := Bool(first)
+    u
+  }
+
+  /** Final reg MOVE µop (mem->reg): `acc -> Dx` (full .L write; the .W form's acc
+    * already carries the preserved Dx[31:16] from the AND mask). KEPT macro commit
+    * (writes a real reg, not a temp; not divIsRem). srcB = acc (MOVE reads src2). */
+  def movepFinalMoveUop(acc: UInt, dx: UInt, pc: UInt, nextPc: UInt): DecodedUop = {
+    val u = movepBase(pc, nextPc)
+    u.op      := DecOp.MOVE
+    u.size    := Size.LONG              // full 32-bit write
+    u.srcBReg := acc; u.srcBValid := True
+    u.dstReg  := dx;  u.dstValid := True
+    u
+  }
+
   def assemble(pkt: DecodePacket): AssembledUops = {
     val out = AssembledUops()
     val op  = pkt.words(0)

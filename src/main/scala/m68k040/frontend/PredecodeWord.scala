@@ -131,6 +131,12 @@ object PredecodeWord {
             when(mok) { r.simple := True; r.lenWords := (bitBase + mext).resized }
           }
         }
+        // ── MOVEP (0000 rrr 1 oo 001 aaa) + disp16 ──────────────────────────────
+        // bit8=1 && mode==001 (the (d16,Ay) form), all 4 variants (oo in {0,1,2,3}):
+        // opword + disp16 -> SIMPLE len 2. Carved out of the dyn-bit-op path (which
+        // excludes mode 001). The DecodeStage MOVEP FSM owns the µop emission.
+        val isMovep = bit8 && (mode === U(1, 3 bits))
+        when(isMovep) { r.simple := True; r.lenWords := U(2, 3 bits) }
         // ── CMP2/CHK2 (0000 0ss0 11 mmm rrr) + ext word ────────────────────────
         // bit11==0, ss=op[10:9] (.B/.W/.L, ss=/=3), bit8==0, bits[7:6]==11, EA a
         // CONTROL mode (mode>=2; reject postinc(3)/predec(4)). len = opword + ext

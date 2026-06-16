@@ -93,6 +93,23 @@ object OperationDecoder {
           o.writesNzvc := True             // write {oldN, Z, oldV, C}
         }
         val isDynBit = opword(8) && (mode =/= B"001")            // exclude MOVEP (mode 001)
+        // ── MOVEP (0000 rrr 1 oo 001 aaa) + disp16 ─────────────────────────────
+        // bit8=1, mode (op[5:3]) == 001, opmode (op[8:6]) >= 4 (i.e. bit7|bit6 set: oo in
+        // {00.W m->r already has opmode 4, ...}). Actually opmode = bit8 ## op[7:6]; with
+        // bit8=1 the opmode is 4(.W m->r)/5(.L m->r)/6(.W r->m)/7(.L r->m) — all >= 4.
+        // dir = op[7] (0 = mem->reg, 1 = reg->mem); size = op[6] (0 = .W, 1 = .L). The
+        // DecodeStage MOVEP FSM owns the µop emission; OperationDecoder only marks it
+        // NON-illegal (a benign MOVE placeholder so the assembler's `bad` never fires —
+        // the FSM gates the normal crack off when active). EA-agnostic: the FSM forms the
+        // addresses from Ay (op[2:0]) + disp16 directly (no EaDecoder routing here).
+        val isMovep = opword(8) && (mode === B"001")
+        when(isMovep) {
+          o.illegal := False
+          o.op := DecOp.MOVE                     // benign placeholder; the FSM produces the real µops
+          o.movep := True
+          o.movepDir := opword(7)
+          o.movepSizeLong := opword(6)
+        }
         val isStatBit= opword(11 downto 8) === B"1000"           // opmode 4 (bit8=0)
         when(isDynBit || isStatBit) {
           o.illegal := False

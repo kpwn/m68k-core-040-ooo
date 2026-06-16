@@ -110,11 +110,16 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val slot1Spec0        = OperationDecoder.decode(fed.payload.packets(1).words(0))
     val slot1IsMovemEarly = fed.valid && fed.payload.slot1Valid && slot1Spec0.movem
     val slot1IsUcodeEarly = fed.valid && fed.payload.slot1Valid && slot1Spec0.microcoded
+    // A slot1 MOVEP, like a slot1 MOVEM, cannot be emitted as a normal crack — its real
+    // µops come from the MOVEP FSM (entered next cycle from the stashed packet). Exclude
+    // it from the normal slot1 push (the assembler's benign MOVE placeholder would
+    // otherwise be a phantom commit).
+    val slot1IsMovepEarly = fed.valid && fed.payload.slot1Valid && slot1Spec0.movep
 
     // slot1 is emitted alongside slot0 only when: not replaying a stash, slot1 present,
     // slot0 is NOT 3-µop, slot1 itself is NOT 3-µop (a 3-µop slot1 is deferred), and
-    // slot1 is NOT a MOVEM (the FSM owns it — see slot1IsMovemEarly).
-    val slot1Emit = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Is3 && !slot1Is3 && !slot1IsMovemEarly && !slot1IsUcodeEarly
+    // slot1 is NOT a MOVEM/MOVEP (the FSM owns it — see slot1IsMovemEarly/slot1IsMovepEarly).
+    val slot1Emit = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Is3 && !slot1Is3 && !slot1IsMovemEarly && !slot1IsUcodeEarly && !slot1IsMovepEarly
     // Defer slot1 to the stash when EITHER slot0 is a 3-µop crack (slot1 cannot fit
     // alongside 3 µops) OR slot1 itself is a 3-µop crack (cannot fit after a <=2-µop
     // slot0). In both cases emit slot0 this cycle + stash slot1's µops; replay next.
@@ -220,6 +225,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // it next cycle (mirrors the 3-µop slot1 defer, but carries the raw packet).
     val spec0  = OperationDecoder.decode(fed.payload.packets(0).words(0))
     val slot0IsMovem = fed.valid && spec0.movem
+    // MOVEP slot0 marker (shared CSE with spec0): owned by the MOVEP FSM (below),
+    // mutually exclusive with the fast head AND the MOVEM/µcode sequencers.
+    val slot0IsMovep = fed.valid && spec0.movep
     // The head packet's microcode marker (shared CSE with spec0): a `microcoded` opword
     // is owned by the µcode SEQUENCER (below), mutually exclusive with the fast head AND
     // the MOVEM FSM (exactly as a MOVEM slot0 is owned by the MOVEM FSM).
@@ -232,12 +240,16 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val movemPendValid = RegInit(False)
     val movemPendPkt   = Reg(DecodePacket())
     when(pipeFlush) { movemPendValid := False }
+    // Hoisted early (also used by movemBegin and ucBegin mutual-exclusion guards):
+    val movepActive    = RegInit(False)
+    val movepPendValid = RegInit(False)
 
     // The source packet the FSM enters from: the stashed slot1 MOVEM, else slot0.
     val movemEntryPkt = Mux(movemPendValid, movemPendPkt, fed.payload.packets(0))
     // Begin a MOVEM: there's a MOVEM to start (a pending slot1 one, or slot0 is MOVEM and
     // not blocked by a stash/replay) and the FSM is idle.
-    val movemBegin = !movemActive && (movemPendValid || (slot0IsMovem && !stashValid))
+    val movemBegin = !movemActive && !ucActive && !ucPendValid && !movepActive && !movepPendValid &&
+                     (movemPendValid || (slot0IsMovem && !stashValid))
 
     // Decode the entry packet's EA + mask. The mask is words(1); a (d16,An)/(xxx)/(d16,PC)
     // EA extension word sits at words(2) (after the mask). PC-rel: EA_PCDI = (pc+4) + d16
@@ -272,6 +284,114 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val eSizeBytes = Mux(eopw(6), S(4, 32 bits), S(2, 32 bits))
     val eMaskEmpty = eMask === 0
 
+    // ── MOVEP micro-sequencer FSM (alternating-byte peripheral move) ──────────────
+    // MOVEP (`0000 rrr 1 oo 001 aaa` + disp16) moves a data register <-> alternating
+    // EVEN memory bytes. Like the MOVEM FSM it HOLDS `fed`, latches Dx/Ay/disp/dir/size,
+    // and emits a per-byte LOAD/STORE + SHIFT/AND/OR assembly sequence ONE µop/cycle (via
+    // pushProduced) using EXISTING DecOps — SIDESTEPPING the ≤3-µop crack budget. The
+    // intermediate temp writes (T0 load scratch + T1 accumulator) are DROPPED (divIsRem);
+    // the single KEPT macro commit is the final `MOVE T1->Dx` (mem->reg) or the LAST byte
+    // store's keepCommit (reg->mem writes NO register). `pipeFlush` aborts (the queue flush
+    // squashes the partial µops; MOVEP re-decodes from scratch on re-fetch).
+    // movepActive and movepPendValid declared above (hoisted for movemBegin/ucBegin guards).
+    val movepStep      = Reg(UInt(4 bits))    // 0..10 (the longest variant = mem->reg .L = 11 steps)
+    val movepDirReg    = Reg(Bool())          // 1 = register->memory (store bytes), 0 = memory->register
+    val movepSizeLong  = Reg(Bool())          // 1 = .L (4 bytes), 0 = .W (2 bytes)
+    val movepDx        = Reg(UInt(5 bits))     // the data register
+    val movepAy        = Reg(UInt(5 bits))     // the base address register (8 + op[2:0])
+    val movepDisp      = Reg(Bits(32 bits))    // sign-extended disp16 (EA = Ay + disp)
+    val movepPc        = Reg(UInt(32 bits))
+    val movepNextPc    = Reg(UInt(32 bits))
+    when(pipeFlush) { movepActive := False }
+
+    // MOVEP entry: a pending slot1 MOVEP (movepPendValid), else slot0. Decode Dx/Ay/disp16.
+    // movepPendValid declared above (hoisted).
+    val movepPendPkt   = Reg(DecodePacket())
+    when(pipeFlush) { movepPendValid := False }
+    val movepEntryPkt  = Mux(movepPendValid, movepPendPkt, fed.payload.packets(0))
+    val mpOpw    = movepEntryPkt.words(0)
+    val mpDx     = mpOpw(11 downto 9).asUInt.resize(5)
+    val mpAy     = (U(8, 5 bits) + mpOpw(2 downto 0).asUInt).resize(5)
+    val mpDisp   = movepEntryPkt.words(1).asSInt.resize(32).asBits   // disp16 sign-extended
+    val mpDir    = mpOpw(7)                                          // 1 = reg->mem
+    val mpSizeL  = mpOpw(6)                                          // 1 = .L
+    val mpPc     = movepEntryPkt.pc
+    val mpNextPc = (mpPc + (movepEntryPkt.lenWords << 1)).resize(32) // = pc + 4 (opword + disp16)
+
+    // Begin a MOVEP: a pending slot1 one, OR a slot0 MOVEP (not blocked by a stash/replay),
+    // while the MOVEP FSM AND the MOVEM/µcode sequencers are all idle.
+    val movepBegin = !movepActive && !movemActive && !movemPendValid && !ucActive && !ucPendValid &&
+                     (movepPendValid || (slot0IsMovep && !stashValid))
+
+    // The per-step µop. The address disp for the byte at position k is movepDisp + k
+    // (k ∈ {0,2,4,6}). The shift counts assemble/extract the big-endian alternating bytes:
+    //   reg->mem .L: [ea]:=Dx[31:24]; [ea+2]:=Dx[23:16]; [ea+4]:=Dx[15:8]; [ea+6]:=Dx[7:0]
+    //   reg->mem .W: [ea]:=Dx[15:8];  [ea+2]:=Dx[7:0]
+    //   mem->reg .L: Dx := ([ea]<<24)|([ea+2]<<16)|([ea+4]<<8)|[ea+6]
+    //   mem->reg .W: Dx[15:0] := ([ea]<<8)|[ea+2]; Dx[31:16] PRESERVED
+    // Default = a no-op final-move placeholder (overwritten by the switches below).
+    def mpDispK(k: Int): Bits = (movepDisp.asSInt + S(k, 32 bits)).asBits
+    val movepUop  = DecodedUop()
+    val movepLast = Bool(); movepLast := True
+    val T0 = MicroOpAssembler.T0; val T1 = MicroOpAssembler.T1
+    // Default (overwritten by the per-variant/step switches below): the final move
+    // placeholder (also the natural step for the mem->reg last step).
+    movepUop := MicroOpAssembler.movepFinalMoveUop(U(T1, 5 bits), movepDx, movepPc, movepNextPc)
+    when(movepDirReg) {
+      when(movepSizeLong) {
+        // reg->mem .L : 7 steps (3 shift+store pairs + the position-0 store of Dx).
+        switch(movepStep) {
+          is(0) { movepUop := MicroOpAssembler.movepShiftUop(movepDx, U(T1,5 bits), 24, dirLeft=false, first=true,  movepPc, movepNextPc); movepLast := False }
+          is(1) { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(0), U(T1,5 bits), keep=false, first=false, movepPc, movepNextPc); movepLast := False }
+          is(2) { movepUop := MicroOpAssembler.movepShiftUop(movepDx, U(T1,5 bits), 16, dirLeft=false, first=false, movepPc, movepNextPc); movepLast := False }
+          is(3) { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(2), U(T1,5 bits), keep=false, first=false, movepPc, movepNextPc); movepLast := False }
+          is(4) { movepUop := MicroOpAssembler.movepShiftUop(movepDx, U(T1,5 bits),  8, dirLeft=false, first=false, movepPc, movepNextPc); movepLast := False }
+          is(5) { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(4), U(T1,5 bits), keep=false, first=false, movepPc, movepNextPc); movepLast := False }
+          default { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(6), movepDx, keep=true, first=false, movepPc, movepNextPc); movepLast := True }   // step 6
+        }
+      } otherwise {
+        // reg->mem .W : 3 steps (LSR Dx>>8 -> T1 ; STORE T1 ; STORE Dx (keep)).
+        switch(movepStep) {
+          is(0) { movepUop := MicroOpAssembler.movepShiftUop(movepDx, U(T1,5 bits), 8, dirLeft=false, first=true,  movepPc, movepNextPc); movepLast := False }
+          is(1) { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(0), U(T1,5 bits), keep=false, first=false, movepPc, movepNextPc); movepLast := False }
+          default { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(2), movepDx, keep=true, first=false, movepPc, movepNextPc); movepLast := True }   // step 2
+        }
+      }
+    } otherwise {
+      when(movepSizeLong) {
+        // mem->reg .L : 11 steps. Assemble in T1 (acc); T0 = load scratch.
+        //  0 LOAD[ea]->T0 ; 1 LSL T0<<24->T1 ; 2 LOAD[ea+2]->T0 ; 3 LSL T0<<16->T0 ; 4 OR T1|T0->T1 ;
+        //  5 LOAD[ea+4]->T0 ; 6 LSL T0<<8->T0 ; 7 OR T1|T0->T1 ; 8 LOAD[ea+6]->T0 ; 9 OR T1|T0->T1 ;
+        // 10 MOVE T1->Dx (keep).
+        switch(movepStep) {
+          is(0)  { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(0), first=true,  movepPc, movepNextPc); movepLast := False }
+          is(1)  { movepUop := MicroOpAssembler.movepShiftUop(U(T0,5 bits), U(T1,5 bits), 24, dirLeft=true, first=false, movepPc, movepNextPc); movepLast := False }
+          is(2)  { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(2), first=false, movepPc, movepNextPc); movepLast := False }
+          is(3)  { movepUop := MicroOpAssembler.movepShiftUop(U(T0,5 bits), U(T0,5 bits), 16, dirLeft=true, first=false, movepPc, movepNextPc); movepLast := False }
+          is(4)  { movepUop := MicroOpAssembler.movepOrUop(U(T1,5 bits), U(T0,5 bits), U(T1,5 bits), movepPc, movepNextPc); movepLast := False }
+          is(5)  { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(4), first=false, movepPc, movepNextPc); movepLast := False }
+          is(6)  { movepUop := MicroOpAssembler.movepShiftUop(U(T0,5 bits), U(T0,5 bits),  8, dirLeft=true, first=false, movepPc, movepNextPc); movepLast := False }
+          is(7)  { movepUop := MicroOpAssembler.movepOrUop(U(T1,5 bits), U(T0,5 bits), U(T1,5 bits), movepPc, movepNextPc); movepLast := False }
+          is(8)  { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(6), first=false, movepPc, movepNextPc); movepLast := False }
+          is(9)  { movepUop := MicroOpAssembler.movepOrUop(U(T1,5 bits), U(T0,5 bits), U(T1,5 bits), movepPc, movepNextPc); movepLast := False }
+          default { movepUop := MicroOpAssembler.movepFinalMoveUop(U(T1,5 bits), movepDx, movepPc, movepNextPc); movepLast := True }   // step 10
+        }
+      } otherwise {
+        // mem->reg .W : 7 steps. Preserve Dx[31:16] via AND mask into T1, assemble low word.
+        //  0 AND Dx & 0xFFFF0000 -> T1 ; 1 LOAD[ea]->T0 ; 2 LSL T0<<8->T0 ; 3 OR T1|T0->T1 ;
+        //  4 LOAD[ea+2]->T0 ; 5 OR T1|T0->T1 ; 6 MOVE T1->Dx (keep, full write).
+        switch(movepStep) {
+          is(0) { movepUop := MicroOpAssembler.movepAndMaskUop(movepDx, U(T1,5 bits), 0xFFFF0000L, first=true, movepPc, movepNextPc); movepLast := False }
+          is(1) { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(0), first=false, movepPc, movepNextPc); movepLast := False }
+          is(2) { movepUop := MicroOpAssembler.movepShiftUop(U(T0,5 bits), U(T0,5 bits), 8, dirLeft=true, first=false, movepPc, movepNextPc); movepLast := False }
+          is(3) { movepUop := MicroOpAssembler.movepOrUop(U(T1,5 bits), U(T0,5 bits), U(T1,5 bits), movepPc, movepNextPc); movepLast := False }
+          is(4) { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(2), first=false, movepPc, movepNextPc); movepLast := False }
+          is(5) { movepUop := MicroOpAssembler.movepOrUop(U(T1,5 bits), U(T0,5 bits), U(T1,5 bits), movepPc, movepNextPc); movepLast := False }
+          default { movepUop := MicroOpAssembler.movepFinalMoveUop(U(T1,5 bits), movepDx, movepPc, movepNextPc); movepLast := True }   // step 6
+        }
+      }
+    }
+
     // ── Normal (non-MOVEM) push production ──────────────────────────────────────
     def normUop(i: Int): DecodedUop = i match {
       case 0 => headUop(0)
@@ -283,7 +403,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // regardless of what slot0 in the HELD next group is — even a MOVEM that waits), OR a
     // fresh slot0 that is NOT a MOVEM and no slot1 MOVEM is pending. A slot0 MOVEM (when not
     // replaying a stash) is owned by the FSM -> the normal head does not push it.
-    val normalHeadValid = stashValid || (fed.valid && !slot0IsMovem && !slot0IsMicrocoded && !movemPendValid && !ucPendValid && !ucActive)
+    val normalHeadValid = stashValid || (fed.valid && !slot0IsMovem && !slot0IsMicrocoded && !slot0IsMovep && !movemPendValid && !ucPendValid && !ucActive && !movepPendValid && !movepActive)
 
     // Produce the push as a Stream. When the MOVEM FSM is active it OVERRIDES the source
     // (its 2 moves / the final An update); otherwise the normal crack drives it.
@@ -316,7 +436,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
 
     // Begin a µcode op: a pending slot1 microcoded op, OR a microcoded slot0 (not blocked
     // by a stash), while the engine + the MOVEM FSM are idle.
-    val ucBegin = !ucActive && !movemActive && !movemPendValid &&
+    val ucBegin = !ucActive && !movemActive && !movemPendValid && !movepActive && !movepPendValid &&
                   (ucPendValid || (slot0IsMicrocoded && !stashValid))
     // Entering a slot0 microcoded op (not a pending one): its group is consumed on entry.
     val ucEnterSlot0 = ucBegin && !ucPendValid
@@ -361,6 +481,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       pushProduced.payload.uops(2) := ucCurUop
       pushProduced.payload.uops(3) := ucCurUop
       pushProduced.payload.count   := U(1, 3 bits)
+    } elsewhen(movepActive) {
+      // MOVEP FSM drive: emit the per-step byte LOAD/STORE + shift/and/or µop (1/cycle).
+      pushProduced.valid           := True
+      pushProduced.payload.uops(0) := movepUop
+      pushProduced.payload.uops(1) := movepUop
+      pushProduced.payload.uops(2) := movepUop
+      pushProduced.payload.uops(3) := movepUop
+      pushProduced.payload.count   := U(1, 3 bits)
     } otherwise {
       pushProduced.valid           := normalHeadValid
       pushProduced.payload.uops(0) := normUop(0)
@@ -393,19 +521,32 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // the LAST µop is accepted into pushReg (ucReleaseFed). A microcoded slot0 is owned by
     // the engine (like a MOVEM slot0), so the NORMAL fed.ready arm must NOT consume it.
     val ucHoldsFed    = ucActive || ucPendValid || slot0IsMicrocoded
+    // MOVEP: identical contract to MOVEM. A slot0 MOVEP is consumed on its ENTRY cycle
+    // (movepEnterSlot0) — its state is latched into regs that cycle; its slot1 is stashed
+    // and replayed after the FSM finishes. A slot1 MOVEP is entered from the stashed PACKET
+    // (`fed` already consumed when stashed); while the FSM runs `fed` holds the FOLLOWING
+    // group (movepHoldsFed), released by the normal head once movepActive clears.
+    val movepEnterSlot0 = movepBegin && !movepPendValid
+    val movepHoldsFed   = movepActive || movepPendValid
     // NOTE: the engine does NOT consume `fed` on its last µop — the held FOLLOWING group
     // is emitted by the normal head once ucActive clears (ucHoldsFed drops). Consuming it
     // here would DROP that group. The sbcd's OWN group was already consumed at entry
     // (ucEnterSlot0) or when its slot1 was stashed (ucPendValid set in the normal consume).
-    fed.ready := (!stashValid && !movemHoldsFed && !slot0IsMovem && !ucHoldsFed && pushProduced.ready) ||
-                 movemEnterSlot0 || ucEnterSlot0
-    when(!movemActive && !movemBegin && !ucBegin && !ucActive && pushProduced.ready) {
+    fed.ready := (!stashValid && !movemHoldsFed && !slot0IsMovem && !ucHoldsFed &&
+                  !movepHoldsFed && !slot0IsMovep && pushProduced.ready) ||
+                 movemEnterSlot0 || ucEnterSlot0 || movepEnterSlot0
+    when(!movemActive && !movemBegin && !ucBegin && !ucActive && !movepActive && !movepBegin && pushProduced.ready) {
       when(stashValid) {
         stashValid := False                  // the stashed slot1/RTR was emitted (into pushReg) this cycle
       } elsewhen(slot1IsMovem) {
         // slot0 (non-MOVEM) emitted this cycle; stash the slot1 MOVEM packet, consume fed.
         movemPendValid := True
         movemPendPkt   := fed.payload.packets(1)
+      } elsewhen(slot1IsMovepEarly) {
+        // slot0 (normal) emitted this cycle; stash the slot1 MOVEP packet, consume fed.
+        // The MOVEP FSM enters from it next cycle (mirrors the slot1 MOVEM pend).
+        movepPendValid := True
+        movepPendPkt   := fed.payload.packets(1)
       } elsewhen(slot1IsUcodeEarly) {
         // slot0 (normal) emitted this cycle; stash the slot1 MICROCODED packet, consume fed.
         // The engine enters from it next cycle (mirrors the slot1 MOVEM pend).
@@ -445,6 +586,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         when(slot1IsMovem) {
           movemPendValid := True
           movemPendPkt   := fed.payload.packets(1)
+        } elsewhen(slot1IsMovepEarly) {
+          movepPendValid := True
+          movepPendPkt   := fed.payload.packets(1)
         } otherwise {
           stashValid  := True
           stashCount  := a1raw.count
@@ -504,6 +648,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         when(slot1IsMovem) {
           movemPendValid := True
           movemPendPkt   := fed.payload.packets(1)
+        } elsewhen(slot1IsMovepEarly) {
+          movepPendValid := True
+          movepPendPkt   := fed.payload.packets(1)
         } elsewhen(slot1IsUcodeEarly) {
           ucPendValid := True
           ucPendPkt   := fed.payload.packets(1)
@@ -523,6 +670,50 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // resets it): the partially-emitted µops are squashed by the queue flush; the op
     // re-decodes from scratch on re-fetch.
     when(pipeFlush) { ucActive := False; ucPendValid := False }
+
+    // ── MOVEP FSM transitions (mirror the MOVEM/µcode FSM begin/advance/abort) ─────
+    when(movepBegin) {
+      // Latch all MOVEP state; start emitting next cycle from these registers.
+      movepActive   := True
+      movepStep     := 0
+      movepDirReg   := mpDir
+      movepSizeLong := mpSizeL
+      movepDx       := mpDx
+      movepAy       := mpAy
+      movepDisp     := mpDisp
+      movepPc       := mpPc
+      movepNextPc   := mpNextPc
+      // A pending slot1 MOVEP is now consumed by this entry.
+      when(movepPendValid) { movepPendValid := False }
+      // Entering a slot0 MOVEP: STASH its slot1 (if any) so it is not lost when `fed` is
+      // consumed this cycle. A slot1 MOVEM -> movemPend; a slot1 MOVEP -> movepPend; a slot1
+      // microcoded -> ucPend; a normal slot1 -> decoded-µop stash. Replayed after the FSM finishes.
+      when(movepEnterSlot0 && fed.payload.slot1Valid) {
+        when(slot1IsMovem) {
+          movemPendValid := True
+          movemPendPkt   := fed.payload.packets(1)
+        } elsewhen(slot1IsMovepEarly) {
+          movepPendValid := True
+          movepPendPkt   := fed.payload.packets(1)
+        } elsewhen(slot1IsUcodeEarly) {
+          ucPendValid := True
+          ucPendPkt   := fed.payload.packets(1)
+        } otherwise {
+          stashValid := True
+          stashCount := a1raw.count
+          for (i <- 0 until 3) { stashUops(i) := a1raw.uops(i) }
+        }
+      }
+    } elsewhen(movepActive) {
+      when(pushProduced.ready) {
+        when(movepLast) { movepActive := False }    // last µop accepted -> release fed
+          .otherwise    { movepStep := movepStep + 1 }
+      }
+    }
+    // pipeFlush ABORTS the MOVEP FSM (LAST word, so a flush coinciding with movepBegin still
+    // resets it): the partially-emitted µops are squashed by the queue flush; MOVEP
+    // re-decodes from scratch on re-fetch.
+    when(pipeFlush) { movepActive := False; movepPendValid := False }
 
     // ── Rename-facing output ───────────────────────────────────────────────────
     val uopsOut = queue.io.pop
