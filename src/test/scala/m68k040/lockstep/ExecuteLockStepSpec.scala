@@ -1127,6 +1127,63 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  // ── Bit-field DYNAMIC offset/width (BFxxx Dn{Dn:Dn} / {Dn:#w} / {#o:Dn}) ─────
+  // The Do/Dw forms read the offset and/or width from a data register (the BFRESOLVE
+  // crack packs them into T0; the BITFIELD µop reads srcC=T0). Edge values: dynamic
+  // offset 0, dynamic width 32 (Dn value 0 -> 32, and Dn value 32 -> 32), width 1.
+  // FULL CCR (N/Z, V=C=0, X UNCHANGED) + the written reg vs Musashi. ×2 seeds.
+  test("lock-step: BFTST/BFCHG/BFCLR/BFSET dynamic offset/width", VerilatorTest) {
+    runLockStep("bf-modify-dyn", Seq(
+      "ori #0x10,%ccr",                                              // X=1 sentinel
+      "move.l #0x12345678,%d0", "moveq #4,%d6", "bftst %d0{%d6:#8}",  // dyn offset 4, static wd 8
+      "move.l #0x0000ffff,%d1", "moveq #16,%d7", "bftst %d1{#0:%d7}", // dyn width 16, offset 0
+      "move.l #0x80000000,%d2", "moveq #0,%d6", "moveq #1,%d7", "bftst %d2{%d6:%d7}", // dyn off 0, wd 1
+      "move.l #0x12345678,%d0", "moveq #8,%d6", "bfchg %d0{%d6:%d6}", // dyn off=wd=8
+      "move.l #0xffffffff,%d3", "moveq #4,%d6", "moveq #8,%d7", "bfclr %d3{%d6:%d7}",
+      "move.l #0x00000000,%d4", "moveq #0,%d6", "moveq #0,%d7", "bfset %d4{%d6:%d7}", // dyn width Dn=0 -> 32
+      "move.l #0x00000001,%d5", "moveq #31,%d6", "moveq #1,%d7", "bfset %d5{%d6:%d7}" // off 31, wd 1
+    ).mkString(" ; "))
+  }
+  test("lock-step: BFEXTU/BFEXTS dynamic offset/width (logical/arith, sign)", VerilatorTest) {
+    runLockStep("bf-extract-dyn", Seq(
+      "ori #0x10,%ccr",
+      "move.l #0x12345678,%d0", "moveq #0,%d2", "moveq #16,%d3", "bfextu %d0{%d2:%d3},%d1", // top16 -> 0x1234
+      "move.l #0x12345678,%d0", "moveq #8,%d2", "bfextu %d0{%d2:#8},%d4",                   // mid byte 0x34
+      "move.l #0xff000000,%d0", "moveq #8,%d3", "bfexts %d0{#0:%d3},%d5",                   // sign-extend 0xff
+      "move.l #0x00008000,%d0", "moveq #16,%d2", "moveq #1,%d3", "bfexts %d0{%d2:%d3},%d6", // 1-bit field=1 -> -1
+      "move.l #0x80000000,%d0", "moveq #0,%d2", "moveq #32,%d3", "bfextu %d0{%d2:%d3},%d7"  // dyn width 32 (Dn=32)
+    ).mkString(" ; "))
+  }
+  test("lock-step: BFFFO dynamic offset/width", VerilatorTest) {
+    runLockStep("bf-ffo-dyn", Seq(
+      "ori #0x10,%ccr",
+      "move.l #0x08000000,%d0", "moveq #0,%d2", "moveq #32,%d3", "bfffo %d0{%d2:%d3},%d1", // bit27 -> 4
+      "move.l #0x00000000,%d0", "moveq #3,%d2", "moveq #8,%d3", "bfffo %d0{%d2:%d3},%d4",   // all-zero -> off+wd=11
+      "move.l #0x00ff0000,%d0", "moveq #8,%d2", "bfffo %d0{%d2:#8},%d5",                    // first set at off 8
+      "move.l #0x00000001,%d0", "moveq #0,%d2", "moveq #0,%d3", "bfffo %d0{%d2:%d3},%d6"    // dyn wd 32 -> LSB -> 31
+    ).mkString(" ; "))
+  }
+  test("lock-step: BFINS dynamic offset/width (3-source: Dy + Dn2 + T0)", VerilatorTest) {
+    runLockStep("bf-ins-dyn", Seq(
+      "ori #0x10,%ccr",
+      "move.l #0xffffffff,%d0", "move.l #0x000000a5,%d1", "moveq #8,%d2", "bfins %d1,%d0{%d2:#8}",
+      "move.l #0x00000000,%d0", "move.l #0x0000000f,%d1", "moveq #0,%d2", "moveq #4,%d3", "bfins %d1,%d0{%d2:%d3}",
+      "move.l #0x12345678,%d0", "move.l #0x00000000,%d1", "moveq #4,%d2", "moveq #8,%d3", "bfins %d1,%d0{%d2:%d3}",
+      "move.l #0x00000000,%d0", "move.l #0xffffffff,%d1", "moveq #0,%d2", "moveq #0,%d3", "bfins %d1,%d0{%d2:%d3}", // dyn wd 32
+      "move.l #0xaaaaaaaa,%d0", "move.l #0x00000001,%d1", "moveq #31,%d2", "moveq #1,%d3", "bfins %d1,%d0{%d2:%d3}"
+    ).mkString(" ; "))
+  }
+  // Dynamic bit-field result feeding a dependent op (the BFRESOLVE T0 RAW + the slow
+  // bit-field result wakeup both exercised in one chain).
+  test("lock-step: BFEXTU dynamic feeds a dependent ADD", VerilatorTest) {
+    runLockStep("bf-dyn-dep", Seq(
+      "move.l #0x12345678,%d0", "moveq #0,%d2", "moveq #16,%d3", "bfextu %d0{%d2:%d3},%d1",
+      "add.l %d1,%d4",
+      "move.l #0xff000000,%d0", "moveq #8,%d2", "bfffo %d0{#0:%d2},%d5",
+      "addq.l #1,%d5"
+    ).mkString(" ; "))
+  }
+
   // ── ANDI/ORI/EORI #imm,CCR (NOT privileged — CCR only) lock-step ────────────
   // Set up the CCR via an arithmetic op (subi -> known NZVCX), then AND/OR/EOR the
   // immediate byte into the CCR (X=4,N=3,Z=2,V=1,C=0), verified step-for-step incl X.

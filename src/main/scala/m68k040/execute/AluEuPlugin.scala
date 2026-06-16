@@ -61,7 +61,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
   var completionPort: Flow[UInt]   = null
   var slowWakeupPort: Flow[AluSlowWakeup] = null
   // PRF ports (allocated in setup)
-  var rdA, rdB: RegFileReadPort = null
+  var rdA, rdB, rdC: RegFileReadPort = null
   var intW: RegFileWritePort = null;  var intByp: RegFileBypassPort = null
   var nzvcW: RegFileWritePort = null; var nzvcByp: RegFileBypassPort = null
   var xW: RegFileWritePort = null;    var xByp: RegFileBypassPort = null
@@ -93,6 +93,9 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     slowWakeupPort = Flow(AluSlowWakeup())
     val irf = host[IntRegFileService]
     rdA = irf.newRead(); rdB = irf.newRead()
+    // 3rd int read port: the BITFIELD-dynamic µop's srcC = T0 (BFRESOLVE-packed
+    // offset/width). Only that op uses psrcC on the ALU EU (idle/psrcC=0 otherwise).
+    rdC = irf.newRead()
     intW = irf.newWrite(latency = 1); intByp = irf.newBypass()
     intWs = irf.newWrite(latency = 1); intByps = irf.newBypass()
     val nz = host[NzvcRegFileService]
@@ -113,6 +116,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val u0 = issuePort.payload.uop
     rdA.addr := u0.psrcA
     rdB.addr := u0.psrcB
+    rdC.addr := u0.psrcC                 // BITFIELD-dynamic srcC = T0 (packed offset/width)
     val src1 = rdA.data
     val src2 = Mux(u0.useImm, u0.imm, rdB.data)
     // Flag sources (only the toCcr read-modify-write uses them).
@@ -128,6 +132,8 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // srcA=Dx (old, merge source) AND srcB=Dy (source data) in s1RdB, while imm=adj16
     // rides s1Src2. All other ops that set useImm=False read s1Src2 == rdB.data anyway.
     val s1RdB   = RegNext(rdB.data)
+    // s1RdC = the BITFIELD-dynamic packed offset/width (srcC = T0 from BFRESOLVE).
+    val s1RdC   = RegNext(rdC.data)
     val s1Nzvc  = RegNext(nzvcRd.data)         // {N(3),Z(2),V(1),C(0)} (toCcr)
     val s1X     = RegNext(xRd.data(0))         // X (toCcr)
     val u1 = s1Ctx.uop
@@ -268,6 +274,18 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val unpkRes16   = (unpkExpand + unpkAdj) & U(0xFFFF, 32 bits)         // + adj, mask 16-bit
     val unpkRes32   = unpkRes16.resize(32).asBits                          // 32-bit, result in [15:0]
 
+    // ── BFRESOLVE datapath (bit-field dynamic offset/width resolve, FAST lat-1) ──
+    // s1Src1 = offset-Dn (read iff Do); s1RdB = width-Dn (read iff Dw); s1Src2 = imm
+    // (useImm=True): imm[4:0]=static offset, imm[9:5]=static raw-width, imm[10]=Do,
+    // imm[11]=Dw. Produce packed = (Do?offDn[4:0]:immOff) | ((Dw?wdDn[4:0]:immWd)<<5),
+    // the SAME layout the static imm uses. Result T0; size LONG (full-32 writeback).
+    val isBfResolve = u1.op === DecOp.BFRESOLVE
+    val bfrDo       = s1Src2(10)
+    val bfrDw       = s1Src2(11)
+    val bfrOff      = Mux(bfrDo, s1Src1(4 downto 0), s1Src2(4 downto 0))
+    val bfrWd       = Mux(bfrDw, s1RdB(4 downto 0),  s1Src2(9 downto 5))
+    val bfResolveRes = (B(0, 22 bits) ## bfrWd ## bfrOff).resize(32)
+
     // ---- S1: size-merge of the FAST int writeback (68k partial-register semantics) ----
     // A .B / .W op updates ONLY the low byte / word of the destination register; the
     // upper bits are PRESERVED. For ADD/SUB/AND/OR/EOR the destination operand is srcA
@@ -282,9 +300,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // UNPK overrides result low word (WORD size -> .W merge preserves Dx[31:16]).
     // For PACK: opResult must present the result in low 8 bits (upper 24 don't-care for .B merge).
     // For UNPK: opResult must present the result in low 16 bits (upper 16 don't-care for .W merge).
-    val opResult = Mux(isPack, packRes8,
+    val opResult = Mux(isBfResolve, bfResolveRes,
+                   Mux(isPack, packRes8,
                    Mux(isUnpk, unpkRes32,
-                   Mux(isBcd,  B(0, 24 bits) ## bcdRes8, rsp.result)))
+                   Mux(isBcd,  B(0, 24 bits) ## bcdRes8, rsp.result))))
     val sizeMerged = u1.size.mux(
       Size.BYTE -> (s1Src1(31 downto 8)  ## opResult(7 downto 0)),
       Size.WORD -> (s1Src1(31 downto 16) ## opResult(15 downto 0)),
@@ -391,11 +410,17 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // datapath is computed combinationally here (parallel to the shifter, NOT on the
     // fast S1 writeback cone) and its finished result+flags are pipelined to S3 so the
     // slow writeback/wakeup mechanism is shared with SHIFT (lat-matched).
+    // STATIC: offset/raw-width from the imm (s1Src2[9:0]). DYNAMIC (bfDynamic): from the
+    // BFRESOLVE-packed T0 read via srcC (s1RdC[9:0]) — SAME packed layout (offset[4:0],
+    // raw width[9:5]). The EU normalizes width = ((rawWidth-1)&31)+1 (5-bit field; the
+    // register-value low 5 bits are equivalent to Musashi's ((width-1)&31)+1 on the full
+    // value). Dy/Dn2 (BFINS) are unchanged.
+    val bfPacked = Mux(u1.bfDynamic, s1RdC, s1Src2)
     val bfCmd = BitfieldCmd()
     bfCmd.dy       := s1Src1
     bfCmd.dn2      := s1RdB
-    bfCmd.offset   := s1Src2(4 downto 0).asUInt
-    bfCmd.rawWidth := s1Src2(9 downto 5).asUInt
+    bfCmd.offset   := bfPacked(4 downto 0).asUInt
+    bfCmd.rawWidth := bfPacked(9 downto 5).asUInt
     bfCmd.bfOp     := u1.bfOp
     val bfRsp = Bitfield(bfCmd)
     // Pipeline the bit-field result/flags S1 -> S1a -> S2 -> S3 (matching the shifter

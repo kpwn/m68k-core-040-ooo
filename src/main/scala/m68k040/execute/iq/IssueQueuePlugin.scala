@@ -206,7 +206,11 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // Dn2 (the insert source) is a LIVE register read (the EU reads rdB.data / s1RdB
     // directly, bypassing the useImm mux). So its srcB dependency must NOT be suppressed.
     def isBitfield(u: RenamedUop): Bool = u.op === m68k040.decode.DecOp.BITFIELD
-    def srcBIsReg(u: RenamedUop): Bool = u.psrcBValid && (!u.useImm || isLs(u) || isPackUnpk(u) || isBitfield(u))
+    // BFRESOLVE (bit-field dynamic offset/width resolve) is a fourth exception: useImm=True
+    // (static offset/width + Do/Dw in imm) but psrcB = width-Dn (Dw form) is a LIVE register
+    // read (the EU reads s1RdB directly). srcAValid=Do already gates psrcA the normal way.
+    def isBfResolve(u: RenamedUop): Bool = u.op === m68k040.decode.DecOp.BFRESOLVE
+    def srcBIsReg(u: RenamedUop): Bool = u.psrcBValid && (!u.useImm || isLs(u) || isPackUnpk(u) || isBitfield(u) || isBfResolve(u))
 
     // ---- Occupancy / back-pressure ----
     // Back-pressure is gated on LINE 0 BEING EMPTY, not on a count proxy.

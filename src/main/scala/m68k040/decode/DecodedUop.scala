@@ -65,6 +65,15 @@ object DecOp extends SpinalEnum {
       // Dn2 (EXTU/EXTS/FFO) / Dy (CHG/CLR/SET/INS) / none (TST). The static offset(5)
       // + width(5, raw, 0->32) are packed into `imm`. Writes NZ (V=C=0, X untouched).
       BITFIELD,
+      // Bit-field DYNAMIC offset/width resolve µop (slice 2/3, FAST ALU, lat-1). The
+      // leading crack µop of a Do/Dw bit-field: computes the PACKED offset/width that
+      // the trailing BITFIELD µop (bfDynamic) reads via srcC=T0. srcA=offset-Dn (read
+      // iff Do), srcB=width-Dn (read iff Dw); `imm` carries the static offset(imm[4:0])
+      // + static raw-width(imm[9:5]) + Do(imm[10]) + Dw(imm[11]). Result T0 =
+      // (Do?srcA[4:0]:imm[4:0]) | ((Dw?srcB[4:0]:imm[9:5]) << 5) — the SAME packed
+      // layout the static imm uses (offset[4:0], raw width[9:5]). T0 is a temp dst
+      // (kept-for-RAW); the macro architectural commit is the trailing BITFIELD µop.
+      BFRESOLVE,
       // CMP2/CHK2 bounds-compare µop (020+, CPLX/DivEu). The 2-load+compare crack puts
       // the LOWER bound in srcA (T0, LS-loaded) and the UPPER bound in srcB (T1, LS-
       // loaded); the compared register Rn rides srcC (psrcC, a normal reg). The EU
@@ -224,6 +233,12 @@ case class DecodedUop() extends Bundle {
   // offset(5b) + raw width(5b, 0->32) are packed into `imm` (imm[4:0]=offset,
   // imm[9:5]=width). Default 0. The ALU EU's bit-field datapath keys off bfOp.
   val bfOp         = Bits(3 bits)
+  // ── Bit-field DYNAMIC marker (DecOp.BITFIELD, Do||Dw) ────────────────────────
+  // When set, the BITFIELD µop is the trailing half of a Do/Dw crack: the EU takes
+  // offset = srcC[4:0] and raw-width = srcC[9:5] (the BFRESOLVE-packed T0 read via
+  // psrcC) INSTEAD of the static imm. False = the slice-1 static form (offset/width
+  // from imm). Default False.
+  val bfDynamic    = Bool()
   // ── Line-4 EXT/EXTB source-width marker (DecOp.EXT) ──────────────────────────
   // EXT sign-extends the low byte/word of Dn. `extByte` = the source is a BYTE
   // (Dn[7:0]) rather than a word (Dn[15:0]): EXT.W (byte->word, size WORD, extByte)

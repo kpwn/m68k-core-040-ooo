@@ -75,6 +75,9 @@ case class RenamedUop() extends Bundle {
   // offset/width ride `imm` (imm[4:0]=offset, imm[9:5]=raw width, 0->32). Threaded
   // from decode to the ALU EU's bit-field (slow/shifter-path) datapath.
   val bfOp         = Bits(3 bits)
+  // Bit-field DYNAMIC marker (DecOp.BITFIELD, Do||Dw crack): the EU takes offset/raw-
+  // width from srcC[9:0] (the BFRESOLVE-packed T0) instead of `imm`. Threaded decode->EU.
+  val bfDynamic    = Bool()
   // Line-4 EXT/EXTB byte-source marker (DecOp.EXT): the sign-extend source is a BYTE
   // (EXT.W / EXTB.L) rather than a word (EXT.L). Threaded from decode to the ALU EU.
   val extByte      = Bool()
