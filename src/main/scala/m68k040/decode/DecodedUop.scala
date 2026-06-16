@@ -60,8 +60,8 @@ object DecOp extends SpinalEnum {
       // srcB=Dy (the data source), dst=Dx. NO CCR effect.
       PACK, UNPK,
       // Bit-field op (020+, REGISTER form, STATIC offset/width — slice 1). One ALU/
-      // shifter slow µop carrying `bfOp` (op[10:8]): 0=BFTST,1=BFCHG,2=BFCLR,3=BFSET,
-      // 4=BFEXTU,5=BFEXTS,6=BFFFO,7=BFINS. srcA=Dy (field reg); BFINS srcB=Dn2; dst=
+      // shifter slow µop carrying `bfOp` (op[10:8], real 020 encoding): 0=BFTST,1=BFEXTU,
+      // 2=BFCHG,3=BFEXTS,4=BFCLR,5=BFFFO,6=BFSET,7=BFINS. srcA=Dy (field reg); BFINS srcB=Dn2; dst=
       // Dn2 (EXTU/EXTS/FFO) / Dy (CHG/CLR/SET/INS) / none (TST). The static offset(5)
       // + width(5, raw, 0->32) are packed into `imm`. Writes NZ (V=C=0, X untouched).
       BITFIELD,
@@ -220,7 +220,7 @@ case class DecodedUop() extends Bundle {
   // from the EA. The ALU EU runs the bit-op datapath + a Z-only flag write. Default 0.
   val bitOp        = Bits(2 bits)
   // ── Bit-field op sub-kind (DecOp.BITFIELD): bfOp = op[10:8] ─────────────────
-  // 0=BFTST,1=BFCHG,2=BFCLR,3=BFSET,4=BFEXTU,5=BFEXTS,6=BFFFO,7=BFINS. The static
+  // 0=BFTST,1=BFEXTU,2=BFCHG,3=BFEXTS,4=BFCLR,5=BFFFO,6=BFSET,7=BFINS. The static
   // offset(5b) + raw width(5b, 0->32) are packed into `imm` (imm[4:0]=offset,
   // imm[9:5]=width). Default 0. The ALU EU's bit-field datapath keys off bfOp.
   val bfOp         = Bits(3 bits)

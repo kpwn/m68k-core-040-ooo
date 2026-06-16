@@ -68,7 +68,7 @@ class BitfieldDecodeSpec extends AnyFunSuite {
       assert(!dut.uop.unimplemented.toBoolean)
     }
   }
-  // ── BFSET D3{#31:#1} (bfOp 3): dst=Dy ────────────────────────────────────────
+  // ── BFSET D3{#31:#1} (bfOp 6): dst=Dy ────────────────────────────────────────
   test("BFSET -> BITFIELD bfOp=6, dst=Dy, width 1", VerilatorTest) {
     run { dut => drive(dut, opw(6, 3), ext(31, 1)); sleep(1)
       assert(dut.uop.op.toEnum == DecOp.BITFIELD && dut.uop.bfOp.toInt == 6)

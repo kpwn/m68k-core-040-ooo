@@ -449,8 +449,8 @@ object OperationDecoder {
         }
         // ── Bit-field register form (BFxxx Dn{#off:#wd}) — slice 1 ──────────────
         // 1110 1ooo 11 000 rrr: ss=11 (op[7:6]==3), op[11]=1 (op[11:8]>=8), mode 000
-        // (Dn). bfOp = op[10:8] (0=BFTST,1=BFCHG,2=BFCLR,3=BFSET,4=BFEXTU,5=BFEXTS,
-        // 6=BFFFO,7=BFINS). One ALU/shifter slow µop; the assembler routes srcA=Dy
+        // (Dn). bfOp = op[10:8], real 020 encoding (0=BFTST,1=BFEXTU,2=BFCHG,3=BFEXTS,
+        // 4=BFCLR,5=BFFFO,6=BFSET,7=BFINS). One ALU/shifter slow µop; the assembler routes srcA=Dy
         // (op[2:0]), BFINS srcB=Dn2 (ext[14:12]), the dst (Dn2/Dy/none), and packs the
         // static offset/width from the ext word. Do=1/Dw=1 (dynamic) -> illegal (the
         // assembler gates from the ext word); mode!=0 (memory bit-field) stays illegal.

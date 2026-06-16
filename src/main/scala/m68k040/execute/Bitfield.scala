@@ -132,8 +132,9 @@ object Bitfield {
     rsp.z := z
   }.rsp
 
-  /** Count leading zeros of a 32-bit value: 0..32 (32 if all zero). Small balanced
-    * tree (priority encode). */
+  /** Count leading zeros of a 32-bit value: 0..32 (32 if all zero). Linear priority
+    * encode (Vivado retimes); BFFFO-only path, off the existing critical cone. If a
+    * post-route gate ever shows clz32 limiting, replace with an explicit 5-level tree. */
   private def clz32(x: Bits): UInt = {
     val cnt = UInt(6 bits)
     when(x === 0) { cnt := 32 } otherwise {
