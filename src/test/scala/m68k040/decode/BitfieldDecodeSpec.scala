@@ -19,6 +19,7 @@ class BitfieldDecodeSpec extends AnyFunSuite {
     val a   = MicroOpAssembler.assemble(pkt)
     val count = out(UInt(2 bits)); count := a.count
     val uop = out(DecodedUop()); uop := a.uops(0)
+    val uop1 = out(DecodedUop()); uop1 := a.uops(1)
   }
   def drive(dut: Dut, op: Int, ext: Int): Unit = {
     dut.pkt.valid #= true; dut.pkt.pc #= 0x1000; dut.pkt.simple #= true; dut.pkt.complex #= false
@@ -115,16 +116,68 @@ class BitfieldDecodeSpec extends AnyFunSuite {
     }
   }
 
-  // ── Deferred: dynamic offset (Do=1) -> illegal ──────────────────────────────
-  test("BFTST dynamic offset (Do=1) -> illegal/unimplemented", VerilatorTest) {
-    run { dut => drive(dut, opw(0, 0), ext(4, 8, doBit = true)); sleep(1)
-      assert(dut.uop.unimplemented.toBoolean, "Do=1 dynamic form deferred")
+  // ── Dynamic offset (Do=1): 2-µop crack [BFRESOLVE -> T0] [BITFIELD bfDynamic] ─
+  // bftst %d0{%d1:#8} -> Do=1, offset-Dn = ext[8:6], static width 8.
+  test("BFTST dynamic offset (Do=1) -> BFRESOLVE + BITFIELD bfDynamic crack", VerilatorTest) {
+    run { dut => // offset-Dn field = 1 (ext[8:6]); width static 8
+      drive(dut, opw(0, 0), (0 << 12) | (1 << 11) | (1 << 6) | 8); sleep(1)
+      assert(dut.count.toInt == 2, "Do/Dw dynamic = 2-µop crack")
+      // µop0 = BFRESOLVE -> T0, reads offset-Dn (srcA = D1), Do flag in imm[10].
+      assert(dut.uop.op.toEnum == DecOp.BFRESOLVE, "first µop = bf-resolve")
+      assert(dut.uop.srcAReg.toInt == 1 && dut.uop.srcAValid.toBoolean, "resolve reads offset-Dn = D1")
+      assert(dut.uop.dstValid.toBoolean, "resolve writes T0 (temp dst)")
+      assert(dut.uop.useImm.toBoolean)
+      assert(((dut.uop.imm.toLong >> 10) & 1) == 1, "Do flag in imm[10]")
+      assert(((dut.uop.imm.toLong >> 11) & 1) == 0, "Dw clear")
+      assert(((dut.uop.imm.toLong >> 5) & 0x1f) == 8, "static width 8 in imm[9:5]")
+      assert(!dut.uop.unimplemented.toBoolean)
+      // µop1 = BITFIELD bfDynamic, srcA = Dy = D0, srcC = T0 (packed off/wd), no dst (TST).
+      assert(dut.uop1.op.toEnum == DecOp.BITFIELD && dut.uop1.bfOp.toInt == 0)
+      assert(dut.uop1.bfDynamic.toBoolean, "bit-field µop flagged dynamic")
+      assert(dut.uop1.srcAReg.toInt == 0 && dut.uop1.srcAValid.toBoolean, "srcA = Dy")
+      assert(dut.uop1.srcCValid.toBoolean, "srcC = T0 (packed offset/width)")
+      assert(dut.uop1.srcCReg.toInt == dut.uop.dstReg.toInt, "srcC = the resolve's T0")
+      assert(!dut.uop1.dstValid.toBoolean, "BFTST writes no reg")
     }
   }
-  // ── Deferred: dynamic width (Dw=1) -> illegal ───────────────────────────────
-  test("BFEXTU dynamic width (Dw=1) -> illegal/unimplemented", VerilatorTest) {
-    run { dut => drive(dut, opw(1, 0), ext(0, 4, dn2 = 1, dwBit = true)); sleep(1)
-      assert(dut.uop.unimplemented.toBoolean, "Dw=1 dynamic form deferred")
+  // ── Dynamic width (Dw=1): bfextu %d0{#0:%d2},%d1 ────────────────────────────
+  test("BFEXTU dynamic width (Dw=1) -> BFRESOLVE(reads width-Dn) + BITFIELD bfDynamic", VerilatorTest) {
+    run { dut => // static offset 0; width-Dn field = 2 (ext[2:0]); Dw=1; Dn2=1
+      drive(dut, opw(1, 0), (1 << 12) | (0 << 6) | (1 << 5) | 2); sleep(1)
+      assert(dut.count.toInt == 2)
+      assert(dut.uop.op.toEnum == DecOp.BFRESOLVE)
+      assert(dut.uop.srcBReg.toInt == 2 && dut.uop.srcBValid.toBoolean, "resolve reads width-Dn = D2 (srcB)")
+      assert(((dut.uop.imm.toLong >> 11) & 1) == 1, "Dw flag in imm[11]")
+      assert(((dut.uop.imm.toLong >> 10) & 1) == 0, "Do clear")
+      assert(!dut.uop.unimplemented.toBoolean)
+      assert(dut.uop1.op.toEnum == DecOp.BITFIELD && dut.uop1.bfOp.toInt == 1 && dut.uop1.bfDynamic.toBoolean)
+      assert(dut.uop1.srcAReg.toInt == 0, "srcA = Dy")
+      assert(dut.uop1.dstReg.toInt == 1 && dut.uop1.dstValid.toBoolean, "dst = Dn2")
+      assert(dut.uop1.srcCValid.toBoolean)
+    }
+  }
+  // ── BFINS dynamic both (Do=1 && Dw=1): the 3-source case (Dy + Dn2 + T0) ─────
+  // bfins %d4,%d0{%d1:%d2} -> Do=1 (offset-Dn=D1), Dw=1 (width-Dn=D2), Dn2=D4, Dy=D0.
+  test("BFINS dynamic both -> resolve reads off-Dn+wd-Dn; bf µop srcA=Dy,srcB=Dn2,srcC=T0", VerilatorTest) {
+    run { dut =>
+      drive(dut, opw(7, 0), (4 << 12) | (1 << 11) | (1 << 6) | (1 << 5) | 2); sleep(1)
+      assert(dut.count.toInt == 2)
+      assert(dut.uop.op.toEnum == DecOp.BFRESOLVE)
+      assert(dut.uop.srcAReg.toInt == 1 && dut.uop.srcAValid.toBoolean, "off-Dn = D1")
+      assert(dut.uop.srcBReg.toInt == 2 && dut.uop.srcBValid.toBoolean, "wd-Dn = D2")
+      assert(((dut.uop.imm.toLong >> 10) & 3) == 3, "Do+Dw set")
+      assert(dut.uop1.op.toEnum == DecOp.BITFIELD && dut.uop1.bfOp.toInt == 7 && dut.uop1.bfDynamic.toBoolean)
+      assert(dut.uop1.srcAReg.toInt == 0 && dut.uop1.srcAValid.toBoolean, "srcA = Dy")
+      assert(dut.uop1.srcBReg.toInt == 4 && dut.uop1.srcBValid.toBoolean, "srcB = Dn2 (insert)")
+      assert(dut.uop1.srcCValid.toBoolean, "srcC = T0 (packed)")
+      assert(dut.uop1.dstReg.toInt == 0 && dut.uop1.dstValid.toBoolean, "dst = Dy")
+    }
+  }
+  // ── Static form is NOT cracked (count 1, no bfDynamic) — regression ──────────
+  test("BFTST static stays a single non-dynamic µop", VerilatorTest) {
+    run { dut => drive(dut, opw(0, 0), ext(4, 8)); sleep(1)
+      assert(dut.count.toInt == 1)
+      assert(dut.uop.op.toEnum == DecOp.BITFIELD && !dut.uop.bfDynamic.toBoolean)
     }
   }
   // ── Deferred: memory form (mode != 0) -> illegal ────────────────────────────
