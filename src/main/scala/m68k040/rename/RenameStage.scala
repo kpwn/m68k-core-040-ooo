@@ -165,6 +165,7 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.bfOp         := dec.bfOp
       r.bfDynamic    := dec.bfDynamic
       r.bfMem        := dec.bfMem
+      r.bfStoreForm  := dec.bfStoreForm
       r.extByte      := dec.extByte
       r.isMovea      := dec.isMovea
       r.isScc        := dec.isScc

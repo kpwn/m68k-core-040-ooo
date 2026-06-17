@@ -595,15 +595,15 @@ object PredecodeWord {
           r.simple   := True
           r.lenWords := U(2, 3 bits)
         }
-        // Bit-field MEMORY load-only form (BFTST/BFEXTU/BFEXTS/BFFFO <ea>, slice 3a):
-        // op[11]=1, op[7:6]==3, mode>=2 (control EA), bfOp (op[10:8]) in {0,1,3,5}.
-        // len = opword + bf-ext word + the EA's OWN ext words (per mode). The bf-ext
-        // word precedes the EA ext (same shape as CMP2/CHK2 -> +2 base). RMW mem ops
-        // (bfOp 2/4/6/7) at a memory EA stay COMPLEX -> the assembler's illegal path.
+        // Bit-field MEMORY form (BFxxx <ea>): op[11]=1, op[7:6]==3, mode>=2 (memory EA).
+        // len = opword + bf-ext word + the EA's OWN ext words (per mode). The bf-ext word
+        // precedes the EA ext (same shape as CMP2/CHK2 -> +2 base). Slice 3a framed only
+        // the LOAD-only ops {0,1,3,5}; slice 3b adds the RMW ops {2,4,6,7} (microcoded) —
+        // predecode computes only LENGTH (identical for load-only and RMW), so frame ALL
+        // EIGHT bfOps. The LEGALITY split (PC-rel illegal for RMW, control-alterable only)
+        // is enforced in OperationDecoder, NOT here.
         val bfMemMode = op(5 downto 3).asUInt
-        val bfMemBfOp = op(10 downto 8).asUInt
-        val bfMemLoadOnly = (bfMemBfOp === 0) || (bfMemBfOp === 1) || (bfMemBfOp === 3) || (bfMemBfOp === 5)
-        val isBitfieldMem = op(11) && (ss === U(3, 2 bits)) && (bfMemMode >= 2) && bfMemLoadOnly
+        val isBitfieldMem = op(11) && (ss === U(3, 2 bits)) && (bfMemMode >= 2)
         when(isBitfieldMem) {
           val (ok, e) = eaExt(bfMemMode, op(2 downto 0).asUInt, sizeL = False, allowImm = false)
           when(ok) {
