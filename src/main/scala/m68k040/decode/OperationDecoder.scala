@@ -467,6 +467,26 @@ object OperationDecoder {
           // (V=C=0 in the EU); readsX/writesX stay False (X untouched).
           o.writesNzvc := True
         }
+        // ── Bit-field MEMORY load-only form (BFxxx <ea>, static) — slice 3a ──────
+        // 1110 1ooo 11 mmm rrr with ss=3, op[11]=1, mode>=2 (a memory/control EA),
+        // bfOp in {0=BFTST,1=BFEXTU,3=BFEXTS,5=BFFFO} (the LOAD-only ops). The RMW
+        // ops (BFCHG/BFCLR/BFSET/BFINS = 2/4/6/7) at a memory EA stay illegal (slice
+        // 3b). The MicroOpAssembler owns the EA crack ([load.L -> T0][opt load.B ->
+        // T1][BITFIELD bfMem]); OperationDecoder only NAMES the op (BITFIELD, NZ
+        // write) + marks the EA as srcA so predecode/EaDecoder frame it. The
+        // assembler rejects a non-control EA (postinc/predec/Dn/An/#imm) -> illegal.
+        val bfMemOp = opword(10 downto 8)
+        val bfMemLoadOnly = (bfMemOp === 0) || (bfMemOp === 1) || (bfMemOp === 3) || (bfMemOp === 5)
+        val isBitfieldMem = opword(11) && (mode.asUInt >= 2) && bfMemLoadOnly
+        when(ss === 3 && isBitfieldMem) {
+          o.illegal := False
+          o.op := DecOp.BITFIELD
+          o.cluster := Cluster.INT
+          o.size := Size.LONG
+          o.bfOp := bfMemOp
+          o.srcA := easrc                  // the memory EA base (so predecode/EaDecoder frame it)
+          o.writesNzvc := True             // NZ only (V=C=0, X untouched)
+        }
       }
       // ---- OR/SUB/CMP/AND/ADD (1ooo ... ) ----
       is(0x8, 0x9, 0xB, 0xC, 0xD) {

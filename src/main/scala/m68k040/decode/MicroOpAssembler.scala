@@ -78,7 +78,7 @@ object MicroOpAssembler {
     u.isChk2      := False
     u.eaAuto      := EaAuto.NONE; u.eaDelta := 0     // NO auto-fold: addresses via disp
     u.ccrRestore  := False; u.toCcr := False
-    u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.extByte := False
+    u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.extByte := False
     // Reuse isMovea as the ".W load -> sign-extend the full 32-bit reg" marker (LOAD only).
     u.isMovea     := isLoad && !sizeLong
     u.isScc       := False; u.isDbcc := False
@@ -122,7 +122,7 @@ object MicroOpAssembler {
     u.isChk2      := False
     u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
     u.ccrRestore  := False; u.toCcr := False
-    u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.extByte := False
+    u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.extByte := False
     u.isMovea     := False; u.isScc := False; u.isDbcc := False
     u.indexLong   := False; u.indexScale := 0
     u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
@@ -175,7 +175,7 @@ object MicroOpAssembler {
     u.isChk2      := False
     u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
     u.ccrRestore  := False; u.toCcr := False
-    u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.extByte := False
+    u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.extByte := False
     u.isMovea     := False; u.isScc := False; u.isDbcc := False
     u.indexLong   := False; u.indexScale := 0
     u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
@@ -399,7 +399,13 @@ object MicroOpAssembler {
     // and NOT a mem-to-mem MOVE (which has its own crack below). CMP2/CHK2 also names
     // its EA srcA (EASRC) but owns a bespoke 2-load+compare crack (below) -> excluded.
     val isCmp2Chk2Spec = spec.op === DecOp.CMP2CHK2
-    val crackLoad = usesSrcEa && srcIsMem && !isAddqSubq && !isLine4Unary && !memDest && !crackMemMem && !isCmp2Chk2Spec
+    // Bit-field MEMORY load-only form (slice 3a): a DecOp.BITFIELD whose EA is a memory
+    // mode (mode>=2 -> NOT the register form's DATAREG). It owns a bespoke crack
+    // ([load.L -> T0][opt load.B -> T1][BITFIELD bfMem]) — the EA must be RE-DECODED from
+    // a words vector that SKIPS the bf-ext word (words(1)), like CMP2/CHK2. So it is
+    // EXCLUDED from the generic crackLoad (whose srcEa mis-decodes disp/abs by one word).
+    val isBfMemSpec = (spec.op === DecOp.BITFIELD) && srcIsMem
+    val crackLoad = usesSrcEa && srcIsMem && !isAddqSubq && !isLine4Unary && !memDest && !crackMemMem && !isCmp2Chk2Spec && !isBfMemSpec
 
     // POST-instruction PC = pc + length(bytes). All µops of one instruction share
     // it so the (single, architectural) op-µop commit pc matches the reference's
@@ -443,6 +449,7 @@ object MicroOpAssembler {
     opUop.bitOp         := spec.bitOp
     opUop.bfOp          := spec.bfOp
     opUop.bfDynamic     := False
+    opUop.bfMem         := False
     opUop.extByte       := spec.extByte
     opUop.isMovea       := False
     opUop.isScc         := False; opUop.isDbcc := False
@@ -580,8 +587,8 @@ object MicroOpAssembler {
     val bfExt   = pkt.words(1)
     val bfDo    = bfExt(11)
     val bfDw    = bfExt(5)
-    val bfDyn   = isBitfield && (bfDo || bfDw)
-    when(isBitfield) {
+    val bfDyn   = isBitfield && (bfDo || bfDw) && !isBfMemSpec
+    when(isBitfield && !isBfMemSpec) {
       val ext   = pkt.words(1)
       val dy    = op(2 downto 0).asUInt.resize(5)         // field register
       val dn2   = ext(14 downto 12).asUInt.resize(5)      // Dn2 (dest for EXTU/EXTS/FFO; src for INS)
@@ -716,7 +723,7 @@ object MicroOpAssembler {
     ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False; ldUop.isCondTrap := False
     ldUop.divSigned     := False; ldUop.div64 := False; ldUop.divIsRem := False
     ldUop.isChk2        := False
-    ldUop.shiftOp := 0; ldUop.shiftDir := False; ldUop.isMovea := False; ldUop.isScc := False; ldUop.isDbcc := False; ldUop.extByte := False; ldUop.bitOp := 0; ldUop.bfOp := 0; ldUop.bfDynamic := False; ldUop.bcdSub := False
+    ldUop.shiftOp := 0; ldUop.shiftDir := False; ldUop.isMovea := False; ldUop.isScc := False; ldUop.isDbcc := False; ldUop.extByte := False; ldUop.bitOp := 0; ldUop.bfOp := 0; ldUop.bfDynamic := False; ldUop.bfMem := False; ldUop.bcdSub := False
     ldUop.firstOfInstr  := True    // the LOAD is the FIRST µop of a cracked instruction
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
@@ -764,7 +771,7 @@ object MicroOpAssembler {
     stUop.faultAddr     := pkt.pc; stUop.sswInstr := False; stUop.isCondTrap := False
     stUop.divSigned     := False; stUop.div64 := False; stUop.divIsRem := False
     stUop.isChk2        := False
-    stUop.shiftOp := 0; stUop.shiftDir := False; stUop.isMovea := False; stUop.isScc := False; stUop.isDbcc := False; stUop.extByte := False; stUop.bitOp := 0; stUop.bfOp := 0; stUop.bfDynamic := False; stUop.bcdSub := False
+    stUop.shiftOp := 0; stUop.shiftDir := False; stUop.isMovea := False; stUop.isScc := False; stUop.isDbcc := False; stUop.extByte := False; stUop.bitOp := 0; stUop.bfOp := 0; stUop.bfDynamic := False; stUop.bfMem := False; stUop.bcdSub := False
     // A single reg-to-mem STORE is its own first µop; a mem-to-mem store TRAILS the load.
     stUop.firstOfInstr  := !crackMemMem
 
@@ -809,7 +816,7 @@ object MicroOpAssembler {
     rmwStUop.faultAddr     := pkt.pc; rmwStUop.sswInstr := False; rmwStUop.isCondTrap := False
     rmwStUop.divSigned     := False; rmwStUop.div64 := False; rmwStUop.divIsRem := False
     rmwStUop.isChk2        := False
-    rmwStUop.shiftOp := 0; rmwStUop.shiftDir := False; rmwStUop.isMovea := False; rmwStUop.isScc := False; rmwStUop.isDbcc := False; rmwStUop.extByte := False; rmwStUop.bitOp := 0; rmwStUop.bfOp := 0; rmwStUop.bfDynamic := False; rmwStUop.bcdSub := False
+    rmwStUop.shiftOp := 0; rmwStUop.shiftDir := False; rmwStUop.isMovea := False; rmwStUop.isScc := False; rmwStUop.isDbcc := False; rmwStUop.extByte := False; rmwStUop.bitOp := 0; rmwStUop.bfOp := 0; rmwStUop.bfDynamic := False; rmwStUop.bfMem := False; rmwStUop.bcdSub := False
     rmwStUop.firstOfInstr  := False    // the trailing store of a cracked RMW
 
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
@@ -1010,7 +1017,7 @@ object MicroOpAssembler {
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isTrapccOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isUnlkOp && !isExgOp &&
               !isLeaOp && !isPeaOp && !isMoveFromSrOp && !isMoveFromCcrOp && !isMoveToCcrOp &&
-              !isSysOp && !isRtdBad && !isCmp2Chk2Enc &&
+              !isSysOp && !isRtdBad && !isCmp2Chk2Enc && !isBfMemSpec &&
               (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
                line4UnaryMemBad || aluRmwMemBad || bitOpMemBad || eaDstPcRelBad ||
                (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
@@ -1405,7 +1412,7 @@ object MicroOpAssembler {
     divlUop.faultAddr     := pkt.pc; divlUop.sswInstr := False; divlUop.isCondTrap := False
     divlUop.divSigned     := divlSigned; divlUop.div64 := divl64; divlUop.divIsRem := False
     divlUop.isChk2        := False
-    divlUop.shiftOp := 0; divlUop.shiftDir := False; divlUop.isMovea := False; divlUop.isScc := False; divlUop.isDbcc := False; divlUop.extByte := False; divlUop.bitOp := 0; divlUop.bfOp := 0; divlUop.bfDynamic := False; divlUop.bcdSub := False
+    divlUop.shiftOp := 0; divlUop.shiftDir := False; divlUop.isMovea := False; divlUop.isScc := False; divlUop.isDbcc := False; divlUop.extByte := False; divlUop.bitOp := 0; divlUop.bfOp := 0; divlUop.bfDynamic := False; divlUop.bfMem := False; divlUop.bcdSub := False
     divlUop.indexLong := False; divlUop.indexScale := 0
     divlUop.leaAddr := False; divlUop.fromCcr := False; divlUop.fromSr := False; divlUop.needsSupervisor := False; divlUop.keepCommit := False
     divlUop.sysOp := False; divlUop.sysKind := SysKind.NONE; divlUop.sysReadDir := False
@@ -1441,7 +1448,7 @@ object MicroOpAssembler {
     divremUop.faultAddr     := pkt.pc; divremUop.sswInstr := False; divremUop.isCondTrap := False
     divremUop.divSigned     := divlSigned; divremUop.div64 := divl64; divremUop.divIsRem := True
     divremUop.isChk2        := False
-    divremUop.shiftOp := 0; divremUop.shiftDir := False; divremUop.isMovea := False; divremUop.isScc := False; divremUop.isDbcc := False; divremUop.extByte := False; divremUop.bitOp := 0; divremUop.bfOp := 0; divremUop.bfDynamic := False; divremUop.bcdSub := False
+    divremUop.shiftOp := 0; divremUop.shiftDir := False; divremUop.isMovea := False; divremUop.isScc := False; divremUop.isDbcc := False; divremUop.extByte := False; divremUop.bitOp := 0; divremUop.bfOp := 0; divremUop.bfDynamic := False; divremUop.bfMem := False; divremUop.bcdSub := False
     divremUop.indexLong := False; divremUop.indexScale := 0
     divremUop.leaAddr := False; divremUop.fromCcr := False; divremUop.fromSr := False; divremUop.needsSupervisor := False; divremUop.keepCommit := False
     divremUop.sysOp := False; divremUop.sysKind := SysKind.NONE; divremUop.sysReadDir := False
@@ -1517,7 +1524,7 @@ object MicroOpAssembler {
     mullUop.faultAddr     := pkt.pc; mullUop.sswInstr := False; mullUop.isCondTrap := False
     mullUop.divSigned     := mullSigned; mullUop.div64 := mull64; mullUop.divIsRem := False
     mullUop.isChk2        := False
-    mullUop.shiftOp := 0; mullUop.shiftDir := False; mullUop.isMovea := False; mullUop.isScc := False; mullUop.isDbcc := False; mullUop.extByte := False; mullUop.bitOp := 0; mullUop.bfOp := 0; mullUop.bfDynamic := False; mullUop.bcdSub := False
+    mullUop.shiftOp := 0; mullUop.shiftDir := False; mullUop.isMovea := False; mullUop.isScc := False; mullUop.isDbcc := False; mullUop.extByte := False; mullUop.bitOp := 0; mullUop.bfOp := 0; mullUop.bfDynamic := False; mullUop.bfMem := False; mullUop.bcdSub := False
     mullUop.indexLong := False; mullUop.indexScale := 0
     mullUop.leaAddr := False; mullUop.fromCcr := False; mullUop.fromSr := False; mullUop.needsSupervisor := False; mullUop.keepCommit := False
     mullUop.sysOp := False; mullUop.sysKind := SysKind.NONE; mullUop.sysReadDir := False
@@ -1550,7 +1557,7 @@ object MicroOpAssembler {
     mulhiUop.faultAddr     := pkt.pc; mulhiUop.sswInstr := False; mulhiUop.isCondTrap := False
     mulhiUop.divSigned     := mullSigned; mulhiUop.div64 := mull64; mulhiUop.divIsRem := False
     mulhiUop.isChk2        := False
-    mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False; mulhiUop.isMovea := False; mulhiUop.isScc := False; mulhiUop.isDbcc := False; mulhiUop.extByte := False; mulhiUop.bitOp := 0; mulhiUop.bfOp := 0; mulhiUop.bfDynamic := False; mulhiUop.bcdSub := False
+    mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False; mulhiUop.isMovea := False; mulhiUop.isScc := False; mulhiUop.isDbcc := False; mulhiUop.extByte := False; mulhiUop.bitOp := 0; mulhiUop.bfOp := 0; mulhiUop.bfDynamic := False; mulhiUop.bfMem := False; mulhiUop.bcdSub := False
     mulhiUop.indexLong := False; mulhiUop.indexScale := 0
     mulhiUop.leaAddr := False; mulhiUop.fromCcr := False; mulhiUop.fromSr := False; mulhiUop.needsSupervisor := False; mulhiUop.keepCommit := False
     mulhiUop.sysOp := False; mulhiUop.sysKind := SysKind.NONE; mulhiUop.sysReadDir := False
@@ -1566,6 +1573,130 @@ object MicroOpAssembler {
       opUop.unimplemented := True
       opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
       opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
+      opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
+    }
+
+    // ── Bit-field MEMORY load-only crack (BFTST/BFEXTU/BFEXTS/BFFFO <ea>, static) ──
+    // slice 3a. The bf-ext word (words(1)) carries Do=bit11, offset=bits[10:6], Dw=bit5,
+    // width=bits[4:0] (0->32), Dn2=bits[14:12]. The EA's OWN ext words FOLLOW it (at
+    // words(2..)), so re-decode the EA from a SHIFTED vector (same shape as CMP2/CHK2).
+    //   byteAddr = EA + (offset>>3)        (offset>>3 in 0..3, FOLDED into the disp)
+    //   bitOff   = offset & 7;  needHi = (bitOff + width) > 32  (STATIC)
+    //   µop0 LOAD.L @[byteAddr]   -> T0  (the misaligned LONG `lo`; LS handles cross-line)
+    //   µop1 LOAD.B @[byteAddr+4] -> T1  (the spill byte `hi`; ONLY when needHi)
+    //   µopN BITFIELD bfMem  srcA=T0 srcB=T1(needHi) -> Dn2 (EXTU/EXTS/FFO) / none (TST)
+    // The funnel + datapath run on the ALU EU (the slow BITFIELD pipe). DYNAMIC offset/
+    // width on mem forms is deferred (the OperationDecoder mem arm gates Do/Dw out by only
+    // naming the op; here bfMem ignores Do/Dw — slice 3a is STATIC only).
+    val bfmEaDec = EaDecoder.decode(op(5 downto 0), Size.LONG, Vec(pkt.words(0), pkt.words(2), pkt.words(3)))
+    // CONTROL modes only (MEMSIMPLE, no auto-update). (An)+/-(An) (autoMode != NONE) and
+    // reg-direct/#imm are rejected -> illegal (vector 4).
+    val bfmEaOk  = (bfmEaDec.klass === EaClass.MEMSIMPLE) && (bfmEaDec.autoMode === EaAuto.NONE)
+    val bfmOffset5 = bfExt(10 downto 6).asUInt              // static offset 0..31
+    val bfmWidthRaw= bfExt(4 downto 0).asUInt               // raw width (0->32)
+    val bfmWidth   = (((bfmWidthRaw - 1) & U(31, 5 bits)) + 1)   // 1..32
+    val bfmDn2     = bfExt(14 downto 12).asUInt.resize(5)
+    val bfmBfOp    = op(10 downto 8)
+    val bfmByteOff = bfmOffset5 >> 3                        // 0..3 (FOLDED into disp)
+    val bfmBitOff  = (bfmOffset5 & U(7, 5 bits)).resize(3)  // 0..7
+    val bfmNeedHi  = (bfmBitOff.resize(6) + bfmWidth.resize(6)) > U(32, 6 bits)
+    // The bit-field has 2 leading words (opword + bf-ext); the EA ext word lives at pc+4,
+    // so (d16,PC)/(d8,PC,Xn) PC-relative accesses use pc+4 as the base (= addr of the EA
+    // ext word), NOT pc+2 (which is the bf-ext word) — mirrors CMP2/CHK2.
+    val bfmPcRelAddr = (pkt.pc + U(4, 32 bits) + bfmEaDec.disp.asUInt).asBits
+    // byteAddr disp = EA disp + (offset>>3). For pcRel, fold pc+4 into the absolute first.
+    val bfmDispLo = Mux(bfmEaDec.pcRel,
+                        (bfmPcRelAddr.asUInt + bfmByteOff).asBits,
+                        (bfmEaDec.disp.asUInt + bfmByteOff).asBits)
+    val bfmDispHi = (bfmDispLo.asUInt + U(4, 32 bits)).asBits   // byteAddr+4 (the spill byte)
+    // imm packing for the BITFIELD bfMem compute µop (same low layout as the static
+    // register form: imm[4:0]=rotate offset(=0), imm[9:5]=rawWidth; PLUS the mem extras):
+    //   imm[12:10]=bitOff, imm[13]=needHi, imm[18:14]=origOffset(0..31).
+    val bfmImm = (B(0, 13 bits) ## bfmOffset5.asBits.resize(5) ## bfmNeedHi ## bfmBitOff.asBits.resize(3) ##
+                  bfmWidthRaw.asBits.resize(5) ## B(0, 5 bits)).resize(32)
+    def bfmLoadUop(disp: Bits, dst: Int, size: Size.C, first: Bool): DecodedUop = {
+      val u = DecodedUop()
+      u.valid       := pkt.valid
+      u.pc          := pkt.pc
+      u.nextPc      := nextPc
+      u.op          := DecOp.MOVE
+      u.cluster     := Cluster.LS
+      u.size        := size
+      u.memOp       := MemOp.LOAD
+      u.srcAReg     := bfmEaDec.base; u.srcAValid := bfmEaDec.baseValid
+      u.srcBReg     := 0;          u.srcBValid := False
+      u.srcCReg     := bfmEaDec.indexReg; u.srcCValid := bfmEaDec.indexValid   // index (AGU)
+      u.dstReg      := U(dst, 5 bits); u.dstValid := True
+      u.useImm      := True; u.imm := disp
+      u.readsNzvc   := False; u.readsX := False
+      u.writesNzvc  := False; u.writesX := False
+      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
+      u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
+      u.ccrRestore  := False; u.toCcr := False
+      u.cond        := 0; u.branchDisp := 0
+      u.unimplemented := False
+      u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+      u.faultAddr   := pkt.pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
+      u.divSigned   := False; u.div64 := False; u.divIsRem := False; u.isChk2 := False
+      u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.extByte := False
+      u.isMovea     := False; u.isScc := False; u.isDbcc := False
+      u.indexLong   := bfmEaDec.indexLong; u.indexScale := bfmEaDec.indexScale
+      u.leaAddr     := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+      u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+      u.firstOfInstr := first
+      u
+    }
+    val bfmLoadLo = bfmLoadUop(bfmDispLo, T0, Size.LONG, first = True)   // misaligned LONG `lo`
+    val bfmLoadHi = bfmLoadUop(bfmDispHi, T1, Size.BYTE, first = False)  // spill byte `hi`
+    // The BITFIELD bfMem compute µop (the macro architectural commit): srcA=T0, srcB=T1
+    // (valid iff needHi), dst=Dn2 for EXTU/EXTS/FFO, none for BFTST.
+    val bfmIsExtFfo = (bfmBfOp === 1) || (bfmBfOp === 3) || (bfmBfOp === 5)
+    val bfmIsTst    = (bfmBfOp === 0)
+    val bfmCompute = {
+      val u = DecodedUop()
+      u.valid       := pkt.valid
+      u.pc          := pkt.pc
+      u.nextPc      := nextPc
+      u.op          := DecOp.BITFIELD
+      u.cluster     := Cluster.INT
+      u.size        := Size.LONG
+      u.memOp       := MemOp.NONE
+      u.srcAReg     := U(T0, 5 bits); u.srcAValid := True             // lo (LS-produced)
+      u.srcBReg     := U(T1, 5 bits); u.srcBValid := bfmNeedHi        // hi (LS-produced, iff needHi)
+      u.srcCReg     := 0;             u.srcCValid := False
+      when(bfmIsExtFfo) { u.dstReg := bfmDn2; u.dstValid := True }
+        .otherwise      { u.dstReg := 0;      u.dstValid := False }   // BFTST: no write
+      u.useImm      := True; u.imm := bfmImm
+      u.readsNzvc   := False; u.readsX := False
+      u.writesNzvc  := True;  u.writesX := False                       // NZ only (V=C=0, X untouched)
+      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
+      u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
+      u.ccrRestore  := False; u.toCcr := False
+      u.cond        := 0; u.branchDisp := 0
+      u.unimplemented := False
+      u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+      u.faultAddr   := pkt.pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
+      u.divSigned   := False; u.div64 := False; u.divIsRem := False; u.isChk2 := False
+      u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0
+      u.bfOp        := bfmBfOp; u.bfDynamic := False; u.bfMem := True; u.extByte := False
+      u.isMovea     := False; u.isScc := False; u.isDbcc := False
+      u.indexLong   := False; u.indexScale := 0
+      u.leaAddr     := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+      u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+      u.firstOfInstr := False
+      u
+    }
+    // A bit-field memory op with a non-control EA -> illegal (vector 4).
+    val bfmBad = isBfMemSpec && !bfmEaOk
+    when(bfmBad) {
+      opUop.op            := DecOp.ILLEGAL
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.unimplemented := True
+      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
+      opUop.srcCValid := False
+      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
+      opUop.readsNzvc := False; opUop.readsX := False
       opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
     }
 
@@ -1635,7 +1766,7 @@ object MicroOpAssembler {
       u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.faultAddr   := pkt.pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
       u.divSigned   := False; u.div64 := False; u.divIsRem := False; u.isChk2 := False
-      u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.extByte := False
+      u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.extByte := False
       u.isMovea     := False; u.isScc := False; u.isDbcc := False
       u.indexLong   := c2SrcEa.indexLong; u.indexScale := c2SrcEa.indexScale
       u.leaAddr     := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
@@ -1677,7 +1808,7 @@ object MicroOpAssembler {
       u.faultAddr   := pkt.pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
       u.divSigned   := c2Ad; u.div64 := False; u.divIsRem := False   // divSigned reused = adReg
       u.isChk2      := c2IsChk2
-      u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.extByte := False
+      u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.extByte := False
       u.isMovea     := False; u.isScc := False; u.isDbcc := False
       u.indexLong   := False; u.indexScale := 0
       u.leaAddr     := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
@@ -1730,7 +1861,7 @@ object MicroOpAssembler {
     ibrUop.faultAddr     := pkt.pc; ibrUop.sswInstr := False; ibrUop.isCondTrap := False
     ibrUop.divSigned     := False; ibrUop.div64 := False; ibrUop.divIsRem := False
     ibrUop.isChk2        := False
-    ibrUop.shiftOp := 0; ibrUop.shiftDir := False; ibrUop.isMovea := False; ibrUop.isScc := False; ibrUop.isDbcc := False; ibrUop.extByte := False; ibrUop.bitOp := 0; ibrUop.bfOp := 0; ibrUop.bfDynamic := False; ibrUop.bcdSub := False
+    ibrUop.shiftOp := 0; ibrUop.shiftDir := False; ibrUop.isMovea := False; ibrUop.isScc := False; ibrUop.isDbcc := False; ibrUop.extByte := False; ibrUop.bitOp := 0; ibrUop.bfOp := 0; ibrUop.bfDynamic := False; ibrUop.bfMem := False; ibrUop.bcdSub := False
     ibrUop.indexLong := False; ibrUop.indexScale := 0
     ibrUop.leaAddr := False; ibrUop.fromCcr := False; ibrUop.fromSr := False; ibrUop.needsSupervisor := False; ibrUop.keepCommit := False
     ibrUop.sysOp := False; ibrUop.sysKind := SysKind.NONE; ibrUop.sysReadDir := False
@@ -1784,7 +1915,7 @@ object MicroOpAssembler {
       u.faultAddr := pkt.pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
       u.divSigned := False; u.div64 := False; u.divIsRem := divIsRem
       u.isChk2 := False
-      u.shiftOp := 0; u.shiftDir := False; u.isMovea := False; u.isScc := False; u.isDbcc := False; u.extByte := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bcdSub := False
+      u.shiftOp := 0; u.shiftDir := False; u.isMovea := False; u.isScc := False; u.isDbcc := False; u.extByte := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bcdSub := False
       u.indexLong := False; u.indexScale := 0
       u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := keepCommit
       u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
@@ -2004,7 +2135,7 @@ object MicroOpAssembler {
       u.isChk2      := False
       u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
       u.ccrRestore  := False; u.toCcr := False
-      u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.extByte := False
+      u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.extByte := False
       u.isMovea     := False; u.isScc := False; u.isDbcc := False
       u.indexLong   := srcEa.indexLong; u.indexScale := srcEa.indexScale
       u.leaAddr     := True; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
@@ -2061,6 +2192,24 @@ object MicroOpAssembler {
       out.count   := 1
       out.uops(0) := opUop
       out.uops(1) := opUop
+    } elsewhen(isBfMemSpec) {
+      // Bit-field MEMORY load-only -> [load.L [byteAddr] -> T0] (opt [load.B [byteAddr+4]
+      // -> T1]) [BITFIELD bfMem compute]. needHi (bitOff+width>32) selects the 3-µop span;
+      // otherwise 2 µops. Bad EA (non-control) -> illegal (bfmBad forced opUop above).
+      when(bfmBad) {
+        out.count   := 1
+        out.uops(0) := opUop
+        out.uops(1) := opUop
+      } elsewhen(bfmNeedHi) {
+        out.count   := 3
+        out.uops(0) := bfmLoadLo
+        out.uops(1) := bfmLoadHi
+        out.uops(2) := bfmCompute
+      } otherwise {
+        out.count   := 2
+        out.uops(0) := bfmLoadLo
+        out.uops(1) := bfmCompute
+      }
     } elsewhen(isCmp2Chk2Op) {
       // CMP2/CHK2 -> [load.size [EA] -> T0] [load.size [EA+size] -> T1] [compare].
       // Bad EA (non-control) forced illegal above (c2Bad sets opUop faulted vec4).

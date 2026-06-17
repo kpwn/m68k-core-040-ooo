@@ -239,6 +239,17 @@ case class DecodedUop() extends Bundle {
   // psrcC) INSTEAD of the static imm. False = the slice-1 static form (offset/width
   // from imm). Default False.
   val bfDynamic    = Bool()
+  // ── Bit-field MEMORY load-only marker (DecOp.BITFIELD, mem EA, slice 3a) ─────
+  // When set, this BITFIELD µop is the trailing compute half of a memory bit-field
+  // load crack: srcA = T0 (the misaligned LONG `lo` loaded at byteAddr), srcB = T1
+  // (the spill BYTE `hi` at byteAddr+4, valid only when bitOff+width>32). The ALU EU
+  // funnels field32 = (lo<<bitOff) | (needHi ? hi>>(8-bitOff) : 0) and feeds the
+  // datapath with rotate offset=0, ffoBase=origOffset (for BFFFO). The static
+  // bitOff/needHi/origOffset are packed into imm: imm[12:10]=bitOff, imm[13]=needHi,
+  // imm[18:14]=origOffset (imm[4:0]=0 rotate offset, imm[9:5]=rawWidth — same layout
+  // as the register-form static imm). Default False (register form). Only the
+  // load-only ops (BFTST/BFEXTU/BFEXTS/BFFFO) use this; RMW mem forms are deferred.
+  val bfMem        = Bool()
   // ── Line-4 EXT/EXTB source-width marker (DecOp.EXT) ──────────────────────────
   // EXT sign-extends the low byte/word of Dn. `extByte` = the source is a BYTE
   // (Dn[7:0]) rather than a word (Dn[15:0]): EXT.W (byte->word, size WORD, extByte)
