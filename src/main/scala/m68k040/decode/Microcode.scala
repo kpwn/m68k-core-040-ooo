@@ -26,13 +26,12 @@ import spinal.core._
 object Microcode {
 
   // Engine temps. T0/T1 are the existing int temps the mem-RMW/predec cracks reuse
-  // (MicroOpAssembler.T0/T1 = 16/17); T2 is the NEW 3rd temp (the op result, kept
-  // distinct from the two loaded operands). The DecodedUop reg-id space is 5 bits, so
-  // 18 fits the temp pool.
+  // (MicroOpAssembler.T0/T1 = 16/17); T2 is the 3rd temp (the bit-field RMW `res`, kept
+  // distinct from the two loaded operands lo/hi). The DecodedUop reg-id space is 5 bits,
+  // so 18 fits the temp pool. The int RAT/Freelist depth is now ARCH_INT_REGS = 19.
   val T0 = MicroOpAssembler.T0   // 16
   val T1 = MicroOpAssembler.T1   // 17
-  // (No 3rd temp: the op result reuses T1 — see the ROM µPC4 comment. The int RAT
-  // depth stays 18, so no rename/PRF widening + zero synth impact.)
+  val T2 = MicroOpAssembler.T2   // 18 — the bit-field 5-byte-chain `res` temp
 
   /** Operand-selector vocabulary (the ROM's small mux set), resolved by the engine from
     * the latched opword fields + size. */

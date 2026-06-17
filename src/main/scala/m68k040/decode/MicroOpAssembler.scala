@@ -17,9 +17,12 @@ import spinal.lib._
   * EA DESTINATION (the EADST store). */
 object MicroOpAssembler {
 
-  /** Internal int temp arch regs targeted by EA cracking. */
+  /** Internal int temp arch regs targeted by EA cracking. T2 is the 3rd temp added for
+    * the microcode engine's 5-byte bit-field RMW chain (3 simultaneously-live temps
+    * {lo,hi,res}); arch count = Isa.ARCH_INT_REGS = 19. */
   val T0 = 16
   val T1 = 17
+  val T2 = 18
 
   case class AssembledUops() extends Bundle {
     // Up to 3 µops per instruction (RTR = pop.w CCR + pop.l PC + ibranch). uops(0)
