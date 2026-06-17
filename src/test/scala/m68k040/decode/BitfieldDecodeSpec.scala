@@ -189,6 +189,151 @@ class BitfieldDecodeSpec extends AnyFunSuite {
     }
   }
 
+  // ════════════════════════════════════════════════════════════════════════════
+  // MEMORY load-only forms (slice 3a): BFTST/BFEXTU/BFEXTS/BFFFO at a memory EA.
+  // Crack: [load.L byteAddr -> T0] (opt [load.B byteAddr+4 -> T1]) [BITFIELD bfMem].
+  // ════════════════════════════════════════════════════════════════════════════
+  val T0 = 16; val T1 = 17
+  // opword 1110 1ooo 11 mmm rrr (memory EA mode/reg).
+  def opwMem(bfOp: Int, mode: Int, reg: Int): Int =
+    0xE000 | (1 << 11) | (bfOp << 8) | (3 << 6) | (mode << 3) | reg
+  // drive with an explicit lenWords (mem forms can be 2-4 words).
+  def driveMem(dut: Dut, op: Int, ext: Int, w2: Int = 0, len: Int = 2): Unit = {
+    dut.pkt.valid #= true; dut.pkt.pc #= 0x2000; dut.pkt.simple #= true; dut.pkt.complex #= false
+    dut.pkt.lenWords #= len; dut.pkt.wordCount #= len; dut.pkt.fault #= false
+    dut.pkt.words(0) #= op; dut.pkt.words(1) #= ext; dut.pkt.words(2) #= w2
+    dut.pkt.words(3) #= 0; dut.pkt.words(4) #= 0
+  }
+
+  // ── BFTST (A0){#3:#8}: bfOp 0, (An) mode 2 -> [load.L T0][BITFIELD bfMem, no dst] ──
+  test("BFTST mem (An) {#3:#8} -> load.L + BITFIELD bfMem, no dst", VerilatorTest) {
+    run { dut => driveMem(dut, opwMem(0, 2, 0), ext(3, 8)); sleep(1)
+      assert(dut.count.toInt == 2, "bitOff=3,width=8 -> bitOff+width=11<=32 -> 2 µops")
+      // µop0 = LOAD.L (An=A0) -> T0
+      assert(dut.uop.op.toEnum == DecOp.MOVE && dut.uop.memOp.toEnum == m68k040.isa.MemOp.LOAD)
+      assert(dut.uop.size.toEnum == Size.LONG)
+      assert(dut.uop.srcAReg.toInt == 8 && dut.uop.srcAValid.toBoolean, "base A0")
+      assert(dut.uop.dstReg.toInt == T0 && dut.uop.dstValid.toBoolean)
+      assert((dut.uop.imm.toLong & 0xffffffffL) == 0, "offset 3 >> 3 = 0 byte fold, (An) disp 0")
+      // µop1 = BITFIELD bfMem, srcA=T0, no T1 (needHi false), no dst (BFTST)
+      assert(dut.uop1.op.toEnum == DecOp.BITFIELD && dut.uop1.bfOp.toInt == 0)
+      assert(dut.uop1.bfMem.toBoolean, "compute µop flagged bfMem")
+      assert(dut.uop1.srcAReg.toInt == T0 && dut.uop1.srcAValid.toBoolean, "srcA = T0 (lo)")
+      assert(!dut.uop1.srcBValid.toBoolean, "needHi false -> no T1")
+      assert(!dut.uop1.dstValid.toBoolean, "BFTST writes no reg")
+      assert(dut.uop1.writesNzvc.toBoolean && !dut.uop1.writesX.toBoolean)
+      // imm packing: rotate offset (imm[4:0]) = 0; rawWidth (imm[9:5]) = 8; bitOff
+      // (imm[12:10]) = 3; needHi (imm[13]) = 0; origOffset (imm[18:14]) = 3.
+      val imm = dut.uop1.imm.toLong
+      assert((imm & 0x1f) == 0, "rotate offset 0")
+      assert(((imm >> 5) & 0x1f) == 8, "rawWidth 8")
+      assert(((imm >> 10) & 0x7) == 3, "bitOff 3")
+      assert(((imm >> 13) & 0x1) == 0, "needHi 0")
+      assert(((imm >> 14) & 0x1f) == 3, "origOffset 3")
+      assert(!dut.uop1.unimplemented.toBoolean)
+    }
+  }
+  // ── BFEXTU (A1){#4:#12},D1: bfOp 1, dst = Dn2 = D1 ──────────────────────────
+  test("BFEXTU mem (An) {#4:#12},D1 -> dst Dn2", VerilatorTest) {
+    run { dut => driveMem(dut, opwMem(1, 2, 1), ext(4, 12, dn2 = 1)); sleep(1)
+      assert(dut.count.toInt == 2, "bitOff=4,width=12 -> 16<=32")
+      assert(dut.uop.srcAReg.toInt == 9, "base A1")
+      assert(dut.uop1.op.toEnum == DecOp.BITFIELD && dut.uop1.bfOp.toInt == 1 && dut.uop1.bfMem.toBoolean)
+      assert(dut.uop1.dstReg.toInt == 1 && dut.uop1.dstValid.toBoolean, "dst Dn2 = D1")
+      val imm = dut.uop1.imm.toLong
+      assert(((imm >> 5) & 0x1f) == 12 && ((imm >> 10) & 0x7) == 4 && ((imm >> 14) & 0x1f) == 4)
+    }
+  }
+  // ── BFEXTS 12(A1){#7:#20},D2: (d16,An) mode 5 -> byteAddr disp folds offset>>3 ──
+  test("BFEXTS mem (d16,An) {#7:#20},D2 -> disp + offset>>3, dst Dn2", VerilatorTest) {
+    run { dut => // mode 5 (d16,An), reg 1; disp16 = 12 in words(2); offset 7 width 20
+      driveMem(dut, opwMem(3, 5, 1), ext(7, 20, dn2 = 2), w2 = 12, len = 3); sleep(1)
+      // bitOff=7, width=20 -> 27<=32 -> needHi false -> 2 µops
+      assert(dut.count.toInt == 2)
+      assert(dut.uop.op.toEnum == DecOp.MOVE && dut.uop.size.toEnum == Size.LONG)
+      assert(dut.uop.srcAReg.toInt == 9, "base A1")
+      // byteAddr disp = 12 + (7>>3=0) = 12
+      assert((dut.uop.imm.toLong & 0xffffffffL) == 12, "disp 12 + offset>>3(0)")
+      assert(dut.uop1.op.toEnum == DecOp.BITFIELD && dut.uop1.bfOp.toInt == 3 && dut.uop1.bfMem.toBoolean)
+      assert(dut.uop1.dstReg.toInt == 2 && dut.uop1.dstValid.toBoolean)
+      val imm = dut.uop1.imm.toLong
+      assert(((imm >> 10) & 0x7) == 7 && ((imm >> 13) & 1) == 0, "bitOff 7, needHi 0")
+    }
+  }
+  // ── BFFFO (A2){#1:#9},D3: bfOp 5, dst Dn2 = D3 ──────────────────────────────
+  test("BFFFO mem (An) {#1:#9},D3 -> dst Dn2", VerilatorTest) {
+    run { dut => driveMem(dut, opwMem(5, 2, 2), ext(1, 9, dn2 = 3)); sleep(1)
+      assert(dut.count.toInt == 2)
+      assert(dut.uop.srcAReg.toInt == 10, "base A2")
+      assert(dut.uop1.op.toEnum == DecOp.BITFIELD && dut.uop1.bfOp.toInt == 5 && dut.uop1.bfMem.toBoolean)
+      assert(dut.uop1.dstReg.toInt == 3 && dut.uop1.dstValid.toBoolean)
+      assert(((dut.uop1.imm.toLong >> 14) & 0x1f) == 1, "origOffset 1 (the FFO base)")
+    }
+  }
+  // ── 5-BYTE SPAN: offset=7, width=28 -> bitOff=7, bitOff+width=35>32 -> needHi -> 3 µops ──
+  test("BFEXTU mem 5-byte span (offset 7, width 28) -> 3 µops (load.L + load.B + compute)", VerilatorTest) {
+    run { dut => driveMem(dut, opwMem(1, 2, 0), ext(7, 28, dn2 = 4)); sleep(1)
+      assert(dut.count.toInt == 3, "bitOff+width=35>32 -> spill byte load")
+      // µop0 = load.L T0 (disp = offset>>3 = 0)
+      assert(dut.uop.op.toEnum == DecOp.MOVE && dut.uop.size.toEnum == Size.LONG && dut.uop.dstReg.toInt == T0)
+      assert((dut.uop.imm.toLong & 0xffffffffL) == 0)
+      // µop1 = load.B T1 at byteAddr+4 (disp = 0+4 = 4)
+      assert(dut.uop1.op.toEnum == DecOp.MOVE && dut.uop1.memOp.toEnum == m68k040.isa.MemOp.LOAD)
+      assert(dut.uop1.size.toEnum == Size.BYTE && dut.uop1.dstReg.toInt == T1)
+      assert((dut.uop1.imm.toLong & 0xffffffffL) == 4, "byteAddr + 4")
+    }
+  }
+  // ── width 32 (encoded 0): bfextu (A0){#0:#0},D1 -> width 32 raw 0 carried ─────
+  test("BFEXTU mem width-32 (raw 0) {#0:#0} -> 2 µops, rawWidth 0 in imm", VerilatorTest) {
+    run { dut => driveMem(dut, opwMem(1, 2, 0), ext(0, 0, dn2 = 1)); sleep(1)
+      // offset 0 -> bitOff 0; width 32, bitOff+width=32 (NOT >32) -> needHi false -> 2 µops
+      assert(dut.count.toInt == 2)
+      assert(((dut.uop1.imm.toLong >> 5) & 0x1f) == 0, "rawWidth 0 (=32) carried")
+      assert(((dut.uop1.imm.toLong >> 13) & 1) == 0, "needHi false (bitOff 0)")
+    }
+  }
+  // ── (xxx).L abs (mode 7 reg 1): 2 ext words -> 4-word instruction ────────────
+  test("BFTST mem (xxx).L {#0:#16} -> abs.L base folded, 2 µops", VerilatorTest) {
+    run { dut => // mode 7 reg 1 (abs.L); abs in words(2)/words(3)
+      driveMem(dut, opwMem(0, 7, 1), ext(0, 16), w2 = 0x0001, len = 4); sleep(1)
+      assert(dut.count.toInt == 2)
+      assert(dut.uop.op.toEnum == DecOp.MOVE && dut.uop.size.toEnum == Size.LONG)
+      assert(!dut.uop.srcAValid.toBoolean, "abs.L: no base reg (folded into disp)")
+      assert(dut.uop1.bfMem.toBoolean && dut.uop1.bfOp.toInt == 0)
+    }
+  }
+  // ── (An)+ is NOT valid for bit-fields -> illegal ─────────────────────────────
+  test("BFTST mem (An)+ (mode 3) -> illegal (postinc invalid for bit-fields)", VerilatorTest) {
+    run { dut => driveMem(dut, opwMem(0, 3, 0), ext(0, 8)); sleep(1)
+      assert(dut.uop.unimplemented.toBoolean, "(An)+ not a control EA -> illegal")
+      assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 4)
+    }
+  }
+  // ── -(An) is NOT valid for bit-fields -> illegal ─────────────────────────────
+  test("BFEXTU mem -(An) (mode 4) -> illegal (predec invalid for bit-fields)", VerilatorTest) {
+    run { dut => driveMem(dut, opwMem(1, 4, 0), ext(0, 8, dn2 = 1)); sleep(1)
+      assert(dut.uop.unimplemented.toBoolean, "-(An) not a control EA -> illegal")
+    }
+  }
+  // ── RMW mem ops (BFCHG/BFCLR/BFSET/BFINS) at a memory EA stay deferred/illegal ─
+  test("BFCLR mem (An) still illegal (slice 3b deferred)", VerilatorTest) {
+    run { dut => driveMem(dut, opwMem(4, 2, 0), ext(0, 8)); sleep(1)
+      assert(dut.uop.unimplemented.toBoolean, "BFCLR mem deferred (RMW)")
+    }
+  }
+  test("BFINS mem (An) still illegal (slice 3b deferred)", VerilatorTest) {
+    run { dut => driveMem(dut, opwMem(7, 2, 0), ext(0, 8, dn2 = 1)); sleep(1)
+      assert(dut.uop.unimplemented.toBoolean, "BFINS mem deferred (RMW)")
+    }
+  }
+  // ── Register form (mode 0) still decodes to a single non-mem BITFIELD ────────
+  test("BFEXTU register form still single µop, bfMem false (regression)", VerilatorTest) {
+    run { dut => drive(dut, opw(1, 0), ext(0, 16, dn2 = 1)); sleep(1)
+      assert(dut.count.toInt == 1)
+      assert(dut.uop.op.toEnum == DecOp.BITFIELD && !dut.uop.bfMem.toBoolean)
+    }
+  }
+
   // ── Shifts still decode (ss != 3) ───────────────────────────────────────────
   test("ASL.L #1,D0 (ss!=3) still decodes to SHIFT", VerilatorTest) {
     run { dut => // 1110 0011 10 000 000 = 0xE380 (asl.l #1,d0)

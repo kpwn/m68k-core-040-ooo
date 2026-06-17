@@ -13,6 +13,13 @@ case class BitfieldCmd() extends Bundle {
   val offset   = UInt(5 bits)
   val rawWidth = UInt(5 bits)
   val bfOp     = Bits(3 bits)
+  // BFFFO additive base: Dn2 := ffoBase + (#leading zeros). The REGISTER form sets
+  // ffoBase = offset (the field's bit offset within Dy). The MEMORY form left-justifies
+  // the field into `dy` (rotate offset = 0) but the FFO base must be the ORIGINAL memory
+  // bit offset (0..31), NOT 0 — so it is carried separately. Default callers set it to
+  // `offset` to preserve register-form behavior. 6 bits (offset 0..31 fits, but the FFO
+  // result can be ffoBase+width <= 31+32 = 63, so the add widens internally).
+  val ffoBase  = UInt(6 bits)
 }
 
 /** Bit-field datapath result. `result` is the value written to the destination
@@ -80,7 +87,10 @@ object Bitfield {
     val fieldLJ = (extU.asUInt << shAmt)(31 downto 0).asBits   // width-bit field at the top
     val clzRaw  = clz32(fieldLJ)                               // 0..32 (32 if all-zero)
     val clzClamped = Mux(clzRaw > width6, width6, clzRaw)      // clamp to width
-    val ffoRes  = (offset.resize(7) + clzClamped.resize(7)).resize(32).asBits
+    // FFO result = ffoBase + clz. ffoBase = offset for the register form (set by the
+    // caller); the memory form left-justifies the field (rotate offset = 0) and sets
+    // ffoBase = the ORIGINAL memory bit offset so the result is original_offset + clz.
+    val ffoRes  = (cmd.ffoBase.resize(7) + clzClamped.resize(7)).resize(32).asBits
 
     // CHG/CLR/SET mask-modify.
     val chgRes = (cmd.dy.asUInt ^ mask.asUInt).asBits

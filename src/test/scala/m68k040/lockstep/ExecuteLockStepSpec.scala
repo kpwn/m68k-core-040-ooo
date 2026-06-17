@@ -1184,6 +1184,89 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  // ── Bit-field MEMORY load-only forms (BFTST/BFEXTU/BFEXTS/BFFFO <ea>) — slice 3a ──
+  // Pre-seed memory at 0x3000 with a known big-endian pattern via stores, then run the
+  // bit-field loads at varied offset/width (bitOff 0 / >0, span 1..5 bytes, width
+  // 1/8/16/32). Verified step-for-step vs Musashi (Dn2 + N/Z, X untouched). The memory
+  // byteAddr = base + offset>>3; the LS reads a (possibly misaligned) LONG + optional
+  // spill byte.
+  // Pattern stored at 0x3000: 0x12 0x34 0x56 0x78 0x9A 0xBC 0xDE 0xF0 (two longs).
+  val bfMemSeed = Seq(
+    "move.l #0x3000,%a0",
+    "move.l #0x12345678,%d0", "move.l %d0,(%a0)",       // mem[0x3000..3003] = 12 34 56 78
+    "move.l #0x9abcdef0,%d1", "move.l %d1,4(%a0)",      // mem[0x3004..3007] = 9A BC DE F0
+    "move.l #0x3000,%a0"                                 // A0 = base
+  )
+  test("lock-step: BFTST mem (An) varied offset/width (NZ, X untouched)", VerilatorTest) {
+    runLockStep("bfmem-tst", (bfMemSeed ++ Seq(
+      "ori #0x10,%ccr",                                  // X=1 sentinel
+      "bftst (%a0){#0:#8}",                              // byte 0x12 (top bit 0) -> N=0, field!=0
+      "bftst (%a0){#0:#1}",                              // MSB of 0x12 = 0 -> N=0,Z=1
+      "bftst (%a0){#3:#5}",                              // bitOff 3, width 5 (within byte) field!=0
+      "bftst (%a0){#8:#16}",                             // bytes 0x3456 -> N=0
+      "bftst (%a0){#0:#32}"                              // whole long 0x12345678
+    )).mkString(" ; "))
+  }
+  test("lock-step: BFEXTU mem (An) zero-extend, span 1..4 bytes", VerilatorTest) {
+    runLockStep("bfmem-extu", (bfMemSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "bfextu (%a0){#0:#16},%d2",                        // top 16 bits -> 0x1234
+      "bfextu (%a0){#8:#8},%d3",                         // middle byte 0x34
+      "bfextu (%a0){#0:#32},%d4",                        // whole long -> 0x12345678
+      "bfextu (%a0){#4:#12},%d5",                        // bitOff 4, 12 bits -> 0x234
+      "bfextu (%a0){#3:#5},%d6"                          // 5-bit field at bit 3 of 0x12 (00010)
+    )).mkString(" ; "))
+  }
+  test("lock-step: BFEXTS mem (An) sign-extend (+ (d16,An))", VerilatorTest) {
+    runLockStep("bfmem-exts", (bfMemSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "bfexts (%a0){#0:#8},%d2",                         // field 0x12 (top bit 0) -> +0x12
+      "bfexts 4(%a0){#0:#8},%d3",                        // field 0x9A (top bit 1) -> sign-ext 0xFFFFFF9A
+      "bfexts (%a0){#0:#1},%d4",                         // single bit 0 -> 0
+      "bfexts 4(%a0){#0:#4},%d5"                         // field 0x9 -> top bit 1 -> sign-ext 0xFFFFFFF9
+    )).mkString(" ; "))
+  }
+  test("lock-step: BFFFO mem (An) first-set + all-zero -> offset+width", VerilatorTest) {
+    runLockStep("bfmem-ffo", (bfMemSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "bfffo (%a0){#0:#8},%d2",                          // 0x12 = 0001_0010 -> 3 leading zeros -> 0+3
+      "bfffo (%a0){#8:#8},%d3",                           // 0x34 = 0011_0100 -> 2 lz -> 8+2=10
+      "bfffo (%a0){#0:#32},%d4",                          // 0x12345678 -> 3 lz -> 3
+      "move.l #0,%d0", "move.l %d0,8(%a0)",               // mem[0x3008..b]=0 (all-zero field)
+      "bfffo 8(%a0){#3:#8},%d5"                           // all-zero -> offset+width = 3+8 = 11
+    )).mkString(" ; "))
+  }
+  // bitOff>0 5-BYTE-SPAN (the spill-byte path): offset 7, width 28 -> bitOff 7,
+  // bitOff+width=35>32 -> reads byteAddr long + byteAddr+4 byte.
+  test("lock-step: BFEXTU mem 5-byte span (offset 7, width 28) — spill byte path", VerilatorTest) {
+    runLockStep("bfmem-span5", (bfMemSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "bfextu (%a0){#7:#28},%d2",                        // bitOff 7 spans into the 5th byte
+      "bfffo (%a0){#7:#28},%d3",                          // FFO over the same wide field
+      "bfexts (%a0){#1:#31},%d4"                          // bitOff 1, width 31 -> bitOff+width=32 (no spill)
+    )).mkString(" ; "))
+  }
+  // offset>=8 (byteAddr = base + offset>>3): exercises the disp byte-fold.
+  test("lock-step: BFEXTU mem offset>=8 (byte-address fold)", VerilatorTest) {
+    runLockStep("bfmem-bytefold", (bfMemSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "bfextu (%a0){#16:#16},%d2",                       // offset 16 -> byteAddr base+2, bitOff 0 -> 0x5678
+      "bfextu (%a0){#24:#8},%d3",                         // offset 24 -> byteAddr base+3 -> 0x78
+      "bfextu (%a0){#20:#12},%d4",                        // offset 20 -> byteAddr base+2, bitOff 4 -> 0x678
+      "bfextu (%a0){#17:#15},%d5"                         // offset 17 -> byteAddr base+2, bitOff 1
+    )).mkString(" ; "))
+  }
+  // BFEXTU mem result feeding a dependent op (the slow BITFIELD result through the LS T0
+  // load — exercises the load->compute->consumer wakeup chain).
+  test("lock-step: BFEXTU mem feeds a dependent ADD", VerilatorTest) {
+    runLockStep("bfmem-dep", (bfMemSeed ++ Seq(
+      "bfextu (%a0){#0:#16},%d2",                        // d2 = 0x1234
+      "add.l %d2,%d3",
+      "bfffo (%a0){#8:#8},%d4",                           // d4 = 10
+      "addq.l #1,%d4"
+    )).mkString(" ; "))
+  }
+
   // ── ANDI/ORI/EORI #imm,CCR (NOT privileged — CCR only) lock-step ────────────
   // Set up the CCR via an arithmetic op (subi -> known NZVCX), then AND/OR/EOR the
   // immediate byte into the CCR (X=4,N=3,Z=2,V=1,C=0), verified step-for-step incl X.

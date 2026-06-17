@@ -416,12 +416,37 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // register-value low 5 bits are equivalent to Musashi's ((width-1)&31)+1 on the full
     // value). Dy/Dn2 (BFINS) are unchanged.
     val bfPacked = Mux(u1.bfDynamic, s1RdC, s1Src2)
+    // ── MEMORY bit-field load-only form (bfMem): the field comes from a (possibly
+    // misaligned) memory LONG `lo` (= srcA = T0) plus an optional spill BYTE `hi`
+    // (= srcB = T1, valid only when bitOff+width>32). The funnel left-justifies the
+    // `width`-bit field into bits[31:32-width]:
+    //   field32 = (lo << bitOff) | (needHi ? (hi[7:0] >> (8-bitOff)) : 0)
+    // then feeds the SAME datapath with dy=field32, rotate offset=0, rawWidth=width,
+    // and ffoBase = the ORIGINAL memory bit offset (for BFFFO). All of bitOff/width/
+    // needHi/origOffset are STATIC, packed into imm by the assembler:
+    //   imm[4:0]=0 (rotate offset), imm[9:5]=rawWidth, imm[12:10]=bitOff,
+    //   imm[13]=needHi, imm[18:14]=origOffset.
+    val bfMem      = u1.bfMem
+    val bfMemImm   = s1Src2
+    val bfMemBitOff = bfMemImm(12 downto 10).asUInt          // 0..7
+    val bfMemNeedHi = bfMemImm(13)
+    val bfMemOrigOff= bfMemImm(18 downto 14).asUInt          // 0..31
+    val bfLo       = s1Src1                                   // T0 (the misaligned long)
+    val bfHi       = s1RdB                                    // T1 (the spill byte, low 8 bits)
+    val bfFieldLo  = (bfLo.asUInt << bfMemBitOff)(31 downto 0)
+    // hi >> (8 - bitOff): keep the top `bitOff` bits of the byte. (8-bitOff) in 1..8.
+    val bfHiShAmt  = (U(8, 4 bits) - bfMemBitOff.resize(4))   // 1..8
+    val bfFieldHi  = Mux(bfMemNeedHi, (bfHi(7 downto 0).asUInt.resize(32) >> bfHiShAmt)(31 downto 0), U(0, 32 bits))
+    val bfField32  = (bfFieldLo | bfFieldHi).asBits
     val bfCmd = BitfieldCmd()
-    bfCmd.dy       := s1Src1
+    bfCmd.dy       := Mux(bfMem, bfField32, s1Src1)
     bfCmd.dn2      := s1RdB
-    bfCmd.offset   := bfPacked(4 downto 0).asUInt
+    bfCmd.offset   := Mux(bfMem, U(0, 5 bits), bfPacked(4 downto 0).asUInt)
     bfCmd.rawWidth := bfPacked(9 downto 5).asUInt
     bfCmd.bfOp     := u1.bfOp
+    // FFO additive base: register form -> the field offset; memory form -> the ORIGINAL
+    // memory bit offset (the rotate offset is 0 for the memory form).
+    bfCmd.ffoBase  := Mux(bfMem, bfMemOrigOff.resize(6), bfPacked(4 downto 0).asUInt.resize(6))
     val bfRsp = Bitfield(bfCmd)
     // Pipeline the bit-field result/flags S1 -> S1a -> S2 -> S3 (matching the shifter
     // depth) so a single S3 writeback path serves both slow ops.
