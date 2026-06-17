@@ -100,7 +100,14 @@ bfCmd.dy=field32, bfCmd.offset=0, bfCmd.rawWidth=rawWidth, bfCmd.ffoBase=origina
 Funnel is on the existing slow BITFIELD pipe (lat-matched S1->S3), NOT the IQ
 scoreboard nor the fast S1 cone. The extra LOAD.B uop reuses the existing LS path.
 ffoBase is a 5-bit add input replacing the existing offset add input (no new depth).
-Expected FMax-neutral vs the ~206 baseline. POST-ROUTE gated >= 200.
+POST-ROUTE gated >= 200.
+
+RESULT (post-route, xcku5p-ffvb676-2 OOC @ 250MHz target): WNS = -0.678 ns ->
+FMax = 213.77 MHz. ABOVE the >= 200 gate. The worst path is now the new funnel:
+s1Src2[12] (= imm bitOff) -> s2BfRes[5] (the bit-field result pipe), i.e. the
+(lo << bitOff) funnel deepened the slow BITFIELD S1 cone. Still above gate with
+headroom; if a later slice needs >213 here, register the funnel into an extra
+slow-pipe stage (the funnel is latency-agnostic on the single-outstanding slow path).
 
 ## Files
 
