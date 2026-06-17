@@ -26,12 +26,12 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
 
     // ── RATs (int RAT: 4 srcA/B reads + 2 srcC reads + 2 dst-old reads = 8 ports) ──
     // srcC is the DIVU.L/DIVS.L 64/32 dividend-high (Dr) source (per slot).
-    val intRat  = RatTable(physIdWidth = 6, archDepth = 18, writePorts = 2, commitPorts = 2, readPorts = 8)
+    val intRat  = RatTable(physIdWidth = 6, archDepth = m68k040.isa.Isa.ARCH_INT_REGS, writePorts = 2, commitPorts = 2, readPorts = 8)
     val nzvcRat = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = 2, readPorts = 2)
     val xRat    = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = 2, readPorts = 2)
 
     // ── Freelists ────────────────────────────────────────────────────────────
-    val intFree  = Freelist(physCount = 50, archCount = 18, popPorts = 2, pushPorts = 2)
+    val intFree  = Freelist(physCount = 50, archCount = m68k040.isa.Isa.ARCH_INT_REGS, popPorts = 2, pushPorts = 2)
     val nzvcFree = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = 2)
     val xFree    = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = 2)
 
@@ -43,13 +43,15 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     val commitPorts = Vec.fill(2)(Flow(CommitSlot()))
 
     // ── Committed-identity init ────────────────────────────────────────────────
-    // Counter 0..17 drives intRat.commits(0) with (addr=i, data=i) — identity for
-    // D0-7/A0-7 AND the two temp arch regs T0/T1 (16,17); the flag RATs commit
-    // (addr 0, data 0) on the first cycle. Gate normal operation until done.
+    // Counter 0..(ARCH_INT_REGS-1) drives intRat.commits(0) with (addr=i, data=i) —
+    // identity for D0-7/A0-7 AND the three temp arch regs T0/T1/T2 (16,17,18); the
+    // flag RATs commit (addr 0, data 0) on the first cycle. Gate normal operation
+    // until done. The terminal compare is driven by the canonical arch count so a
+    // bump of Isa.ARCH_INT_REGS flows here automatically. Counter is 5 bits (0..18 fits).
     val initDone    = Reg(Bool()) init False
-    val initCounter = Reg(UInt(5 bits)) init 0   // 0..17
+    val initCounter = Reg(UInt(5 bits)) init 0   // 0..(ARCH_INT_REGS-1)
     when(!initDone) {
-      when(initCounter === U(17)) {
+      when(initCounter === U(m68k040.isa.Isa.ARCH_INT_REGS - 1)) {
         initDone := True
       }
       initCounter := initCounter + 1
@@ -163,6 +165,7 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.bfOp         := dec.bfOp
       r.bfDynamic    := dec.bfDynamic
       r.bfMem        := dec.bfMem
+      r.bfStoreForm  := dec.bfStoreForm
       r.extByte      := dec.extByte
       r.isMovea      := dec.isMovea
       r.isScc        := dec.isScc

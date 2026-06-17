@@ -26,13 +26,12 @@ import spinal.core._
 object Microcode {
 
   // Engine temps. T0/T1 are the existing int temps the mem-RMW/predec cracks reuse
-  // (MicroOpAssembler.T0/T1 = 16/17); T2 is the NEW 3rd temp (the op result, kept
-  // distinct from the two loaded operands). The DecodedUop reg-id space is 5 bits, so
-  // 18 fits the temp pool.
+  // (MicroOpAssembler.T0/T1 = 16/17); T2 is the 3rd temp (the bit-field RMW `res`, kept
+  // distinct from the two loaded operands lo/hi). The DecodedUop reg-id space is 5 bits,
+  // so 18 fits the temp pool. The int RAT/Freelist depth is now ARCH_INT_REGS = 19.
   val T0 = MicroOpAssembler.T0   // 16
   val T1 = MicroOpAssembler.T1   // 17
-  // (No 3rd temp: the op result reuses T1 — see the ROM µPC4 comment. The int RAT
-  // depth stays 18, so no rename/PRF widening + zero synth impact.)
+  val T2 = MicroOpAssembler.T2   // 18 — the bit-field 5-byte-chain `res` temp
 
   /** Operand-selector vocabulary (the ROM's small mux set), resolved by the engine from
     * the latched opword fields + size. */
@@ -42,14 +41,22 @@ object Microcode {
   case object SAx         extends Sel   // 8 + op[11:9]  (dest   An / Ax)
   case object ST0         extends Sel
   case object ST1         extends Sel
+  case object ST2         extends Sel   // the 3rd temp (bit-field RMW `res`)
   case object SNegDeltaAy extends Sel   // -deltaAy (Ay predec write-back imm, LONG)
   case object SNegDeltaAx extends Sel   // -deltaAx (Ax predec write-back imm, LONG)
+  // ── v2 bit-field RMW selectors ─────────────────────────────────────────────
+  case object SEaBase     extends Sel   // (eaBase, eaBaseValid) — the bit-field EA base An
+  case object SDn2        extends Sel   // (bfDn2, True) — the BFINS insert source register
+  case object SEaDispLo   extends Sel   // selImm: the byteAddr disp (EA disp + offset>>3)
+  case object SEaDispHi   extends Sel   // selImm: the byteAddr+4 disp (the spill byte)
+  case object SBfImm      extends Sel   // selImm: the packed bfMem imm (bitOff/needHi/width/origOff)
 
   /** The op kind of a descriptor's template. */
   sealed trait UOp
   case object UMove      extends UOp    // plain move / load / store data move (DecOp.MOVE)
   case object UAddDrop   extends UOp    // ADD.L dst:=srcA+imm, divIsRem (dropped An write-back)
   case object UOpFromCtx extends UOp    // the latched op (BCD/ADDX/SUBX), flags from ctx
+  case object UBfMem     extends UOp    // BITFIELD bfMem compute (RES/LO/HI funnel form); op=BITFIELD
 
   /** Memory role. */
   sealed trait Mem
@@ -63,6 +70,14 @@ object Microcode {
   case object APredecAy extends Auto
   case object APredecAx extends Auto
 
+  /** Explicit µop size for a row (overrides the ctx-size default). The bit-field chain
+    * rows are LONG (lo load/store, the compute) or BYTE (the hi spill-byte load/store);
+    * the BCD chain rows use the ctx-size default (SzCtx). */
+  sealed trait Sz
+  case object SzCtx  extends Sz   // = ctx.size (BCD chain)
+  case object SzLong extends Sz
+  case object SzByte extends Sz
+
   /** One ROM row: a µop template + operand selectors + sequencing. */
   case class Desc(
       uop:    UOp,
@@ -70,10 +85,15 @@ object Microcode {
       auto:   Auto    = ANoAuto,
       srcA:   Sel     = SNone,
       srcB:   Sel     = SNone,
+      srcC:   Sel     = SNone,    // 3rd operand: BFINS insert source (Dn2) for the RES/LO4 compute
       dst:    Sel     = SNone,
       useImm: Boolean = false,
       imm:    Sel     = SNone,    // when useImm, the imm comes from this selector
+      sz:     Sz      = SzCtx,    // explicit µop size (SzCtx = ctx.size, the BCD default)
       writesFlags: Boolean = false,  // reads X+old-Z, writes NZVCX (the op µop)
+      indexFromEa: Boolean = false,  // LS row: srcC + indexLong/indexScale come from Ctx EA
+      bfStoreForm: Int     = 0,      // UBfMem: 0=RES,1=LO4,2=LO5,3=HI5 (the funnel form)
+      bfWritesNz:  Boolean = false,  // UBfMem: this compute writes the NZ flags (RES / LO4)
       isFirst: Boolean = false,   // firstOfInstr (the macro boundary)
       isLast:  Boolean = false    // releases `fed`
   )
@@ -99,11 +119,61 @@ object Microcode {
     //        same-µop T1 read(srcA)+write(dst) is a normal RAW the renamer resolves.
     Desc(UOpFromCtx, srcA = ST1, srcB = ST0, dst = ST1, writesFlags = true),
     // µPC5: STORE.sz T1 -> (Ax)  (Ax was ALREADY decremented at µPC3 -> NO auto; isLast).
-    Desc(UMove, mem = MStore, auto = ANoAuto, srcA = SAx, srcB = ST1, isLast = true)
+    Desc(UMove, mem = MStore, auto = ANoAuto, srcA = SAx, srcB = ST1, isLast = true),
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Bit-field MEMORY RMW (BFCHG/BFCLR/BFSET/BFINS), slice 3b — ALL through engine.
+    // The EA + bit-field static params (bitOff/needHi/width/Dn2/disp) are carried in the
+    // v2 Ctx (populated at ucBegin via EaDecoder on the EA-ext words). needHi (static,
+    // bitOff+width>32) selects the ENTRY POINT (no runtime ROM branch). All rows are
+    // straight-line. The address = SEaBase + SEaDispLo|SEaDispHi (+ Ctx index).
+    //
+    // 4-byte chain (needHi=False — the common case), 3 rows @ BF_RMW_4B_ENTRY=6:
+    //   a0 LOAD.L  [byteAddr] -> T0 (lo)                                   (isFirst)
+    //   a1 BITFIELD bfMem LO4  srcA=T0(lo), srcC=Dn2(BFINS) -> T1 (lo')    (+NZ flags;
+    //        funnels field32 from lo only, computes res INTERNALLY, outputs lo')
+    //   a2 STORE.L T1(lo') -> [byteAddr]                                   (isLast)
+    Desc(UMove,  mem = MLoad,  srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, indexFromEa = true, isFirst = true),                     // µPC6 (a0)
+    Desc(UBfMem, srcA = ST0, srcC = SDn2, dst = ST1, useImm = true, imm = SBfImm,
+         sz = SzLong, bfStoreForm = 1, bfWritesNz = true),                     // µPC7 (a1)
+    Desc(UMove,  mem = MStore, srcA = SEaBase, srcB = ST1, useImm = true, imm = SEaDispLo,
+         sz = SzLong, indexFromEa = true, isLast = true),                      // µPC8 (a2)
+
+    // 5-byte chain (needHi=True — bitOff+width>32), 7 rows @ BF_RMW_5B_ENTRY=9:
+    //   b0 LOAD.L  [byteAddr]   -> T0 (lo)                                  (isFirst)
+    //   b1 LOAD.B  [byteAddr+4] -> T1 (hi, the spill byte)
+    //   b2 BITFIELD bfMem RES  srcA=T0(lo), srcB=T1(hi), srcC=Dn2 -> T2 (res; +NZ flags)
+    //   b3 BITFIELD bfMem LO5  srcA=T0(lo), srcB=T2(res)         -> T0 (lo'; no flags)
+    //   b4 BITFIELD bfMem HI5  srcA=T1(hi), srcB=T2(res)         -> T1 (hi'; no flags)
+    //   b5 STORE.L T0(lo') -> [byteAddr]
+    //   b6 STORE.B T1(hi') -> [byteAddr+4]                                  (isLast)
+    // 3 simultaneously-live temps {T0=lo,T1=hi,T2=res} across b2..b4 (the lo'/hi' stores
+    // overwrite their dead source temp AFTER its last read).
+    Desc(UMove,  mem = MLoad,  srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, indexFromEa = true, isFirst = true),                     // µPC9  (b0)
+    Desc(UMove,  mem = MLoad,  srcA = SEaBase, dst = ST1, useImm = true, imm = SEaDispHi,
+         sz = SzByte, indexFromEa = true),                                     // µPC10 (b1)
+    Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = SDn2, dst = ST2, useImm = true, imm = SBfImm,
+         sz = SzLong, bfStoreForm = 0, bfWritesNz = true),                     // µPC11 (b2)
+    Desc(UBfMem, srcA = ST0, srcB = ST2, dst = ST0, useImm = true, imm = SBfImm,
+         sz = SzLong, bfStoreForm = 2),                                        // µPC12 (b3)
+    Desc(UBfMem, srcA = ST1, srcB = ST2, dst = ST1, useImm = true, imm = SBfImm,
+         sz = SzLong, bfStoreForm = 3),                                        // µPC13 (b4)
+    Desc(UMove,  mem = MStore, srcA = SEaBase, srcB = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, indexFromEa = true),                                     // µPC14 (b5)
+    Desc(UMove,  mem = MStore, srcA = SEaBase, srcB = ST1, useImm = true, imm = SEaDispHi,
+         sz = SzByte, indexFromEa = true, isLast = true)                       // µPC15 (b6)
   )
+  val BF_RMW_4B_ENTRY = 6
+  val BF_RMW_5B_ENTRY = 9
   def romSize: Int = rom.size
 
-  /** Latched-instruction CONTEXT the engine resolves selectors against. */
+  /** Latched-instruction CONTEXT the engine resolves selectors against. v1 fields
+    * (opword..sizeBytesLog) are UNCHANGED so the BCD/ADDX/SUBX chain resolves identically;
+    * the v2 group (EA + bit-field static params) is populated at ucBegin from the EaDecoder
+    * on the EA-ext words + the bf-ext word, used ONLY by the bit-field RMW rows. The v2
+    * fields default inert for a BCD entry (the BCD rows never reference them). */
   case class Ctx() extends Bundle {
     val opword       = Bits(16 bits)
     val pc           = UInt(32 bits)
@@ -112,6 +182,21 @@ object Microcode {
     val bcdSub       = Bool()
     val size         = Size()
     val sizeBytesLog = UInt(2 bits)      // 0=.B(1), 1=.W(2), 2=.L(4) — for the An delta
+    // ── v2 bit-field RMW EA group (mirrors EaDecoder output; the 3a bfm load/store carry
+    //    the same fields) ──────────────────────────────────────────────────────────────
+    val eaBase       = UInt(5 bits)      // base An reg id (8..15); valid per eaBaseValid
+    val eaBaseValid  = Bool()            // (An)/(d16,An)/(d8,An,Xn) -> True; (xxx).W/.L -> False
+    val eaIndexReg   = UInt(5 bits)      // index reg (Dn/An) for m6-brief
+    val eaIndexValid = Bool()
+    val eaIndexLong  = Bool()
+    val eaIndexScale = UInt(2 bits)
+    val eaDispLo     = Bits(32 bits)     // resolved byteAddr disp = EA.disp + (offset>>3)
+    val eaDispHi     = Bits(32 bits)     // = eaDispLo + 4 (byteAddr+4, the spill byte)
+    // ── v2 bit-field static params ────────────────────────────────────────────────────
+    val bfOp         = Bits(3 bits)      // op[10:8] = 2 BFCHG / 4 BFCLR / 6 BFSET / 7 BFINS
+    val bfDn2        = UInt(5 bits)      // ext[14:12] (BFINS insert source register)
+    val bfImm        = Bits(32 bits)     // the packed bfMem imm (identical layout to 3a bfmImm)
+    val bfNeedHi     = Bool()            // (bitOff+width)>32 — picks the entry in DecodeStage
   }
 
   // ── selector → (regId, valid) ──────────────────────────────────────────────
@@ -119,11 +204,14 @@ object Microcode {
   private def axReg(ctx: Ctx): UInt = (U(8, 5 bits) + ctx.opword(11 downto 9).asUInt).resize(5)
 
   private def selReg(sel: Sel, ctx: Ctx): (UInt, Bool) = sel match {
-    case SAy => (ayReg(ctx), True)
-    case SAx => (axReg(ctx), True)
-    case ST0 => (U(T0, 5 bits), True)
-    case ST1 => (U(T1, 5 bits), True)
-    case _   => (U(0, 5 bits), False)
+    case SAy     => (ayReg(ctx), True)
+    case SAx     => (axReg(ctx), True)
+    case ST0     => (U(T0, 5 bits), True)
+    case ST1     => (U(T1, 5 bits), True)
+    case ST2     => (U(T2, 5 bits), True)
+    case SEaBase => (ctx.eaBase, ctx.eaBaseValid)   // abs modes -> baseValid False (disp-only)
+    case SDn2    => (ctx.bfDn2, True)
+    case _       => (U(0, 5 bits), False)
   }
 
   /** deltaAn (bytes) = (size==BYTE && An==A7) ? 2 : sizeBytes — the A7-byte even rule. */
@@ -140,6 +228,9 @@ object Microcode {
   private def selImm(sel: Sel, ctx: Ctx): Bits = sel match {
     case SNegDeltaAy => negDelta(ayReg(ctx), ctx)
     case SNegDeltaAx => negDelta(axReg(ctx), ctx)
+    case SEaDispLo   => ctx.eaDispLo
+    case SEaDispHi   => ctx.eaDispHi
+    case SBfImm      => ctx.bfImm
     case _           => B(0, 32 bits)
   }
 
@@ -151,6 +242,11 @@ object Microcode {
     val (srcAReg, srcAV) = selReg(d.srcA, ctx)
     val (srcBReg, srcBV) = selReg(d.srcB, ctx)
     val (dstReg,  dstV)  = selReg(d.dst,  ctx)
+    // srcC: an LS row whose `indexFromEa` is set carries the EA index reg; a UBfMem
+    // compute row carries the BFINS insert source (Dn2) via d.srcC; otherwise inert.
+    val (srcCRegSel, srcCVSel) = selReg(d.srcC, ctx)
+    val srcCReg = if (d.indexFromEa) ctx.eaIndexReg else srcCRegSel
+    val srcCV   = if (d.indexFromEa) ctx.eaIndexValid else srcCVSel
 
     u.valid  := valid
     u.pc     := ctx.pc
@@ -159,12 +255,21 @@ object Microcode {
       case UMove      => u.op := DecOp.MOVE
       case UAddDrop   => u.op := DecOp.ADD
       case UOpFromCtx => u.op := ctx.op
+      case UBfMem     => u.op := DecOp.BITFIELD
     }
-    u.cluster := (d.mem match { case MNone => Cluster.INT; case _ => Cluster.LS })
-    // The An write-back ADD is LONG; everything else (loads/store/op) is the op size.
+    u.cluster := (d.uop match {
+      case UBfMem => Cluster.INT          // the bit-field compute runs on the ALU/slow pipe
+      case _      => (d.mem match { case MNone => Cluster.INT; case _ => Cluster.LS })
+    })
+    // The An write-back ADD is LONG; the BCD chain uses ctx.size; the bit-field chain rows
+    // carry an explicit size (SzLong for lo/compute, SzByte for the hi spill byte).
     d.uop match {
       case UAddDrop => u.size := Size.LONG
-      case _        => u.size := ctx.size
+      case _        => d.sz match {
+        case SzLong => u.size := Size.LONG
+        case SzByte => u.size := Size.BYTE
+        case SzCtx  => u.size := ctx.size
+      }
     }
     u.memOp := (d.mem match {
       case MNone  => MemOp.NONE
@@ -173,15 +278,16 @@ object Microcode {
     })
     u.srcAReg := srcAReg; u.srcAValid := srcAV
     u.srcBReg := srcBReg; u.srcBValid := srcBV
-    u.srcCReg := 0;       u.srcCValid := False
+    u.srcCReg := srcCReg; u.srcCValid := srcCV
     u.dstReg  := dstReg;  u.dstValid  := dstV
     u.useImm  := Bool(d.useImm)
     u.imm     := (if (d.useImm) selImm(d.imm, ctx) else B(0, 32 bits))
-    // Flags: the op µop reads X + old-Z (clear-only Z, the ADDX/BCD rule) + writes NZVCX;
-    // the An-add + loads/store write none.
+    // Flags: the BCD/ADDX/SUBX op µop reads X + old-Z (clear-only Z) + writes NZVCX. The
+    // bit-field RES/LO4 compute writes NZ only (V=C=0, X UNTOUCHED) — like the 3a bfMem
+    // compute; the other bit-field rows + loads/stores/An-add write no flags.
     u.readsNzvc  := Bool(d.writesFlags)
     u.readsX     := Bool(d.writesFlags)
-    u.writesNzvc := Bool(d.writesFlags)
+    u.writesNzvc := Bool(d.writesFlags || d.bfWritesNz)
     u.writesX    := Bool(d.writesFlags)
     u.isBranch := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
     u.cond := 0; u.branchDisp := 0
@@ -207,7 +313,20 @@ object Microcode {
     u.ccrRestore := False; u.toCcr := False
     u.shiftOp := 0; u.shiftDir := False
     u.bcdSub := ctx.bcdSub
-    u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.extByte := False; u.isMovea := False
+    // Bit-field RMW compute (UBfMem): op=BITFIELD + bfMem (so the ALU EU funnel datapath
+    // runs) + bfOp (CHG/CLR/SET/INS) from the latched ctx.op + the store-form selector. The
+    // funnel reads bitOff/needHi/width/origOff from the packed bfImm (= u.imm, set above).
+    u.bitOp := 0; u.bfDynamic := False; u.extByte := False; u.isMovea := False
+    d.uop match {
+      case UBfMem =>
+        u.bfMem       := True
+        u.bfOp        := ctx.bfOp        // CHG=2/CLR=4/SET=6/INS=7 (latched at ucBegin)
+        u.bfStoreForm := U(d.bfStoreForm, 2 bits)
+      case _ =>
+        u.bfMem       := False
+        u.bfOp        := 0
+        u.bfStoreForm := 0
+    }
     u.isScc := False; u.isDbcc := False
     // Indexed-EA descriptor fields (added by the indexed-modes slice): µcode µops never
     // use an index — default inert (mirrors MicroOpAssembler's non-indexed cracks).

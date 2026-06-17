@@ -248,8 +248,26 @@ case class DecodedUop() extends Bundle {
   // bitOff/needHi/origOffset are packed into imm: imm[12:10]=bitOff, imm[13]=needHi,
   // imm[18:14]=origOffset (imm[4:0]=0 rotate offset, imm[9:5]=rawWidth — same layout
   // as the register-form static imm). Default False (register form). Only the
-  // load-only ops (BFTST/BFEXTU/BFEXTS/BFFFO) use this; RMW mem forms are deferred.
+  // load-only ops (BFTST/BFEXTU/BFEXTS/BFFFO) use this; the RMW mem forms (slice 3b)
+  // set it too AND additionally carry a bfStoreForm marker (below).
   val bfMem        = Bool()
+  // ── Bit-field RMW STORE-FORM marker (DecOp.BITFIELD bfMem, slice 3b) ─────────
+  // The memory RMW ops (BFCHG/BFCLR/BFSET/BFINS) route through the v2 microcode
+  // engine. Their compute µops are different outputs of the SAME inverse-funnel
+  // datapath, selected here (the funnel field32 = (lo<<bitOff)|(needHi?hi>>(8-bitOff):0),
+  // res = chg/clr/set/ins over field32, lomask = bitOff==0 ? 0 : 0xffffffff<<(32-bitOff),
+  // himask = 0xff>>bitOff):
+  //   0 = RES  : output = res (the modify result) + NZ flags from field32. The load-only
+  //              3a value AND the 5-byte chain's separate res compute (b2; srcC=Dn2 BFINS).
+  //   1 = LO4  : the 4-byte chain's COMBINED compute. Computes res INTERNALLY from the
+  //              funnel (lo = srcA = T0, needHi=False) + carries the NZ flags, and outputs
+  //              lo' = (lo & lomask) | (res >> bitOff). BFINS insert source Dn2 rides srcC.
+  //   2 = LO5  : the 5-byte chain's lo' = (lo & lomask) | (res >> bitOff), where lo = srcA
+  //              (T0) and res = srcB (T2, the b2 result). NO flags (the b2 RES µop wrote them).
+  //   3 = HI5  : the 5-byte chain's hi' = (hi & himask) | ((res << (8-bitOff)) & 0xff), where
+  //              hi = srcA (T1) and res = srcB (T2). NO flags. The stored spill BYTE.
+  // Default 0 (RES / load-only / non-bit-field).
+  val bfStoreForm  = UInt(2 bits)
   // ── Line-4 EXT/EXTB source-width marker (DecOp.EXT) ──────────────────────────
   // EXT sign-extends the low byte/word of Dn. `extByte` = the source is a BYTE
   // (Dn[7:0]) rather than a word (Dn[15:0]): EXT.W (byte->word, size WORD, extByte)

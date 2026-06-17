@@ -487,6 +487,35 @@ object OperationDecoder {
           o.srcA := easrc                  // the memory EA base (so predecode/EaDecoder frame it)
           o.writesNzvc := True             // NZ only (V=C=0, X untouched)
         }
+        // ── Bit-field MEMORY RMW form (BFCHG/BFCLR/BFSET/BFINS, static) — slice 3b ──
+        // 1110 1ooo 11 mmm rrr with ss=3, op[11]=1, bfOp in {2=BFCHG,4=BFCLR,6=BFSET,
+        // 7=BFINS} at a CONTROL-ALTERABLE EA. The whole load-op-store sequence (3 µops
+        // for a 4-byte span, 7 for a 5-byte span) EXCEEDS the 3-µop crack budget AND the
+        // 5-byte span needs 3 live temps, so ALL four RMW ops route through the v2
+        // microcode engine. OperationDecoder marks `microcoded` + a DEFAULT ucEntry (the
+        // 4-byte entry); DecodeStage's ucBegin computes the REAL entry from the latched
+        // bfNeedHi (the bf-ext word is not visible here — OperationDecoder is ext-free).
+        // CONTROL-ALTERABLE only: (An) m2, (d16,An) m5, (d8,An,Xn) m6, (xxx).W 7-0,
+        // (xxx).L 7-1. PC-rel (7-2/7-3) is NOT alterable (read-only) -> ILLEGAL for RMW;
+        // (An)+/-(An)/Dn/An/#imm -> ILLEGAL (as in 3a). The illegal split is HERE (mode
+        // test) since the assembler does not crack the microcoded RMW.
+        val bfMemRmwOp = (bfMemOp === 2) || (bfMemOp === 4) || (bfMemOp === 6) || (bfMemOp === 7)
+        val bfMemReg = opword(2 downto 0)
+        val ctrlAlterable = (mode.asUInt === 2) || (mode.asUInt === 5) || (mode.asUInt === 6) ||
+                            ((mode.asUInt === 7) && ((bfMemReg.asUInt === 0) || (bfMemReg.asUInt === 1)))
+        when(ss === 3 && opword(11) && bfMemRmwOp && ctrlAlterable) {
+          o.illegal := False
+          o.microcoded := True
+          o.ucEntry := U(Microcode.BF_RMW_4B_ENTRY, o.ucEntry.getWidth bits)  // overridden by ucBegin (needHi)
+          o.op := DecOp.BITFIELD
+          o.cluster := Cluster.INT
+          o.size := Size.LONG
+          o.bfOp := bfMemOp
+          o.writesNzvc := True             // NZ only (V=C=0, X untouched)
+        }
+        // A RMW bit-field at a NON-control-alterable EA (PC-rel/(An)+/-(An)/Dn/An/#imm)
+        // stays ILLEGAL (the default `o.illegal` from illegalDefault is True; the
+        // microcoded arm above did not fire, so no override — vector-4 illegal).
       }
       // ---- OR/SUB/CMP/AND/ADD (1ooo ... ) ----
       is(0x8, 0x9, 0xB, 0xC, 0xD) {
@@ -575,7 +604,7 @@ object OperationDecoder {
         } .elsewhen(isBcdMem) {
           o.illegal := False
           o.microcoded := True
-          o.ucEntry := U(Microcode.BCD_MEM_ENTRY, 4 bits)
+          o.ucEntry := U(Microcode.BCD_MEM_ENTRY, o.ucEntry.getWidth bits)
           o.op     := DecOp.BCD
           o.bcdSub := (line === 0x8)              // line 8 = SBCD (subtract), line C = ABCD (add)
           o.size   := Size.BYTE                    // BCD is byte-only
@@ -583,7 +612,7 @@ object OperationDecoder {
         } .elsewhen(isAddxSubxMem) {
           o.illegal := False
           o.microcoded := True
-          o.ucEntry := U(Microcode.BCD_MEM_ENTRY, 4 bits)
+          o.ucEntry := U(Microcode.BCD_MEM_ENTRY, o.ucEntry.getWidth bits)
           o.op   := Mux(line === 0xD, DecOp.ADDX, DecOp.SUBX)
           when(opmode === 4) { o.size := Size.BYTE }
             .elsewhen(opmode === 5) { o.size := Size.WORD }

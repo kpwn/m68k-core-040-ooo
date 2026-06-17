@@ -440,7 +440,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val bfField32  = (bfFieldLo | bfFieldHi).asBits
     val bfCmd = BitfieldCmd()
     bfCmd.dy       := Mux(bfMem, bfField32, s1Src1)
-    bfCmd.dn2      := s1RdB
+    // BFINS insert source Dn2: the register form / 3a load-only path carries it on srcB
+    // (s1RdB). The mem-RMW chains route Dn2 via srcC (s1RdC) because srcB carries the spill
+    // byte `hi` (5-byte RES form) — keyed on a valid srcC for a bfMem compute.
+    bfCmd.dn2      := Mux(bfMem && u1.psrcCValid, s1RdC, s1RdB)
     bfCmd.offset   := Mux(bfMem, U(0, 5 bits), bfPacked(4 downto 0).asUInt)
     bfCmd.rawWidth := bfPacked(9 downto 5).asUInt
     bfCmd.bfOp     := u1.bfOp
@@ -448,9 +451,50 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // memory bit offset (the rotate offset is 0 for the memory form).
     bfCmd.ffoBase  := Mux(bfMem, bfMemOrigOff.resize(6), bfPacked(4 downto 0).asUInt.resize(6))
     val bfRsp = Bitfield(bfCmd)
+    // ── MEMORY bit-field RMW INVERSE FUNNEL (store-back, slice 3b) ───────────────
+    // The RMW chains (BFCHG/BFCLR/BFSET/BFINS) route through the microcode engine; each
+    // compute µop carries a bfStoreForm (DecodedUop): 0=RES, 1=LO4 (4-byte combined),
+    // 2=LO5, 3=HI5. The RES/LO4 forms compute `res` via the SAME funnel+modify above
+    // (bfRsp.result over the funnelled field32) + the NZ flags from the loaded field.
+    // The LO5/HI5 forms read `res` directly from srcB (= T2, the b2 result) — NO funnel.
+    //   lomask = (bitOff==0) ? 0 : (0xffffffff << (32-bitOff))
+    //   lo' = (lo & lomask) | (res >> bitOff)                  [LO4/LO5 output]
+    //   himask = 0xff >> bitOff
+    //   hi' = (hi & himask) | ((res << (8-bitOff)) & 0xff)     [HI5 output]
+    // The inverse funnel is PIPELINED into the S1a stage (off a registered `res`/`lo`/`hi`/
+    // bitOff) so it does NOT stack in series with the forward funnel in one S1 cone (spec
+    // §6 FMax plan); for LO5/HI5 each is its OWN µop (one funnel-depth, naturally shallow).
+    val bfStoreForm = u1.bfStoreForm
+    // `res` driving the inverse funnel: LO4 (form 1) recomputes it inline from the funnel;
+    // LO5/HI5 (forms 2/3) read it from srcB (T2). The lo/hi source for the merge = srcA (T0
+    // for lo / T1 for hi) = s1Src1.
+    val bfInvResS1 = Mux(bfStoreForm === U(1, 2 bits), bfRsp.result, s1RdB)
+    val bfInvSrcS1 = s1Src1
+    // Register the inverse-funnel inputs into S1a (the pipeline cut that keeps the forward
+    // and inverse funnels in separate cycles).
+    val s1aInvRes    = RegNext(bfInvResS1)
+    val s1aInvSrc    = RegNext(bfInvSrcS1)
+    val s1aBitOff    = RegNext(bfMemBitOff)
+    val s1aStoreForm = RegNext(bfStoreForm)
+    // S1a: the inverse-funnel masks/shifts (off the registered inputs).
+    val s1aLomask = Mux(s1aBitOff === 0, B(0, 32 bits),
+                        (B(0xffffffffL, 32 bits).asUInt << (U(32, 6 bits) - s1aBitOff.resize(6)))(31 downto 0).asBits)
+    val s1aLoStore = ((s1aInvSrc.asUInt & s1aLomask.asUInt) | (s1aInvRes.asUInt >> s1aBitOff)).asBits
+    val s1aHiShL   = (U(8, 4 bits) - s1aBitOff.resize(4))     // 8-bitOff, 1..8
+    val s1aHimask  = (B(0xff, 8 bits).asUInt >> s1aBitOff)(7 downto 0).asBits
+    val s1aHiStore = ((s1aInvSrc(7 downto 0).asUInt & s1aHimask.asUInt) |
+                      (s1aInvRes.asUInt << s1aHiShL)(7 downto 0))(7 downto 0).asBits
     // Pipeline the bit-field result/flags S1 -> S1a -> S2 -> S3 (matching the shifter
-    // depth) so a single S3 writeback path serves both slow ops.
-    val s1aBfRes  = RegNext(bfRsp.result)
+    // depth) so a single S3 writeback path serves both slow ops. The RES/load-only/LO4
+    // form takes the funnel+modify result (registered from S1); LO5/HI5 take the inverse-
+    // funnel output computed THIS stage (S1a). HI5 writes only the low byte (the store µop
+    // is BYTE-sized, so the upper bits are don't-care).
+    val s1aBfFunnelRes = RegNext(bfRsp.result)
+    val s1aBfRes  = s1aStoreForm.mux(
+      U(1, 2 bits) -> s1aLoStore,                          // LO4
+      U(2, 2 bits) -> s1aLoStore,                          // LO5
+      U(3, 2 bits) -> s1aHiStore.resize(32),               // HI5 (low byte)
+      default      -> s1aBfFunnelRes)                      // 0 = RES / load-only
     val s1aBfN    = RegNext(bfRsp.n)
     val s1aBfZ    = RegNext(bfRsp.z)
     // S1a: stage1b (the deep variable shifts) off the registered amounts -> register

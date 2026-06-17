@@ -144,7 +144,10 @@ case class OpSpec() extends Bundle {
   // the sequencer owns emission). First customers: the ABCD/SBCD/ADDX/SUBX
   // -(Ay),-(Ax) MEMORY forms (6 µops). Default: not microcoded.
   val microcoded    = Bool()
-  val ucEntry       = UInt(4 bits)   // entry µPC (ROM is small; 4 bits is ample for v1)
+  // entry µPC into the Microcode ROM. Widened 4 -> 5 bits in slice 3b: romSize hits 16
+  // (BCD 6 + bit-field 4-byte 3 + 5-byte 7), so 4 bits (0..15) is exactly full; 5 bits
+  // leaves headroom for the next customer. FMax-neutral (a decode flop).
+  val ucEntry       = UInt(5 bits)
   // ── Commit-time PRIVILEGED SYSTEM ops (MOVE-to-SR / MOVE-USP / MOVEC) ─────────
   // Classification only (the assembler builds the op µop carrying these): `sysOp`
   // marks a serializing commit-time system op, `sysKind` selects which, `sysReadDir`

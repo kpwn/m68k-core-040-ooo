@@ -416,7 +416,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // microcoded op immediately FOLLOWED by another microcoded/MOVEM op in the SAME fetch
     // group is the untested edge — the slot1 stash carries a NORMAL slot1 (the tested
     // programs put a normal instr / NOP after each X-mem op).
-    val ucPc     = Reg(UInt(4 bits))
+    val ucPc     = Reg(UInt(5 bits))
     val ucCtx    = Reg(Microcode.Ctx())
     when(pipeFlush) { ucActive := False }
 
@@ -450,6 +450,50 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.size         := ucEntrySpec.size
     ucEntryCtx.sizeBytesLog := ucEntrySpec.size.mux(
       Size.BYTE -> U(0, 2 bits), Size.WORD -> U(1, 2 bits), default -> U(2, 2 bits))
+
+    // ── v2 bit-field RMW Ctx population (slice 3b) ────────────────────────────────
+    // The bit-field RMW ops route through the engine. OperationDecoder is ext-word-free,
+    // so the EA + static params are resolved HERE (ucBegin has the full packet words),
+    // mirroring the 3a MicroOpAssembler `bfm` block. The bf-ext word is words(1); the EA's
+    // OWN ext words FOLLOW it (words(2..)) -> re-decode the EA from a SHIFTED vector.
+    val ucBfExt    = ucEntryPkt.words(1)
+    val ucBfEaDec  = EaDecoder.decode(ucEntryPkt.words(0)(5 downto 0), Size.LONG,
+                                      Vec(ucEntryPkt.words(0), ucEntryPkt.words(2), ucEntryPkt.words(3)))
+    val ucBfOffset5 = ucBfExt(10 downto 6).asUInt              // static offset 0..31
+    val ucBfWidthRaw= ucBfExt(4 downto 0).asUInt               // raw width (0->32)
+    val ucBfWidth   = (((ucBfWidthRaw - 1) & U(31, 5 bits)) + 1)   // 1..32
+    val ucBfDn2     = ucBfExt(14 downto 12).asUInt.resize(5)
+    val ucBfByteOff = ucBfOffset5 >> 3                         // 0..3 (folded into disp)
+    val ucBfBitOff  = (ucBfOffset5 & U(7, 5 bits)).resize(3)   // 0..7
+    val ucBfNeedHi  = (ucBfBitOff.resize(6) + ucBfWidth.resize(6)) > U(32, 6 bits)
+    // byteAddr disp = EA disp + (offset>>3). PC-rel is ILLEGAL for RMW (never reaches the
+    // engine), so the base is always an An or absolute -> no pcRel fold needed.
+    val ucBfDispLo  = (ucBfEaDec.disp.asUInt + ucBfByteOff).asBits
+    val ucBfDispHi  = (ucBfDispLo.asUInt + U(4, 32 bits)).asBits   // byteAddr+4 (spill byte)
+    // imm packing identical to the 3a bfmImm (AluEu already decodes this layout):
+    //   imm[4:0]=0 (rotate offset), imm[9:5]=rawWidth, imm[12:10]=bitOff, imm[13]=needHi,
+    //   imm[18:14]=origOffset.
+    val ucBfImm = (B(0, 13 bits) ## ucBfOffset5.asBits.resize(5) ## ucBfNeedHi ##
+                   ucBfBitOff.asBits.resize(3) ## ucBfWidthRaw.asBits.resize(5) ## B(0, 5 bits)).resize(32)
+    ucEntryCtx.eaBase       := ucBfEaDec.base
+    ucEntryCtx.eaBaseValid  := ucBfEaDec.baseValid
+    ucEntryCtx.eaIndexReg   := ucBfEaDec.indexReg
+    ucEntryCtx.eaIndexValid := ucBfEaDec.indexValid
+    ucEntryCtx.eaIndexLong  := ucBfEaDec.indexLong
+    ucEntryCtx.eaIndexScale := ucBfEaDec.indexScale
+    ucEntryCtx.eaDispLo     := ucBfDispLo
+    ucEntryCtx.eaDispHi     := ucBfDispHi
+    ucEntryCtx.bfOp         := ucEntryPkt.words(0)(10 downto 8)
+    ucEntryCtx.bfDn2        := ucBfDn2
+    ucEntryCtx.bfImm        := ucBfImm
+    ucEntryCtx.bfNeedHi     := ucBfNeedHi
+    // The REAL entry: a bit-field RMW (microcoded BITFIELD) picks 5B vs 4B by needHi;
+    // every other microcoded op (BCD/ADDX/SUBX) keeps its OperationDecoder ucEntry.
+    val ucIsBfRmw  = ucEntrySpec.microcoded && (ucEntrySpec.op === DecOp.BITFIELD)
+    val ucRealEntry = Mux(ucIsBfRmw,
+      Mux(ucBfNeedHi, U(Microcode.BF_RMW_5B_ENTRY, ucEntrySpec.ucEntry.getWidth bits),
+                      U(Microcode.BF_RMW_4B_ENTRY, ucEntrySpec.ucEntry.getWidth bits)),
+      ucEntrySpec.ucEntry)
 
     // Resolve every ROM row against the LATCHED ctx, then index by ucPc -> this cycle's
     // µop (the ROM is a compile-time Scala Vector; resolve each row to hardware + mux).
@@ -634,9 +678,11 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
 
     // ── µcode SEQUENCER transitions (mirror the MOVEM FSM begin/advance/abort) ────
     when(ucBegin) {
-      // Latch the entry context; start emitting next cycle from ucEntry.
+      // Latch the entry context; start emitting next cycle from ucEntry. For a bit-field
+      // RMW the real entry is picked from the latched bfNeedHi (4-byte vs 5-byte chain),
+      // since OperationDecoder is ext-word-free and emitted only the 4-byte default.
       ucActive := True
-      ucPc     := ucEntrySpec.ucEntry
+      ucPc     := ucRealEntry
       ucCtx    := ucEntryCtx
       // A pending slot1 microcoded op is now consumed by this entry.
       when(ucPendValid) { ucPendValid := False }

@@ -29,6 +29,28 @@ class BitfieldDecodeSpec extends AnyFunSuite {
   }
   def run(check: Dut => Unit): Unit = SimConfig.withVerilator.compile(new Dut).doSim(check)
 
+  // OperationDecoder spec DUT (the microcoded routing + illegal split live HERE for the
+  // bit-field RMW, since the assembler only emits a benign placeholder for a microcoded op).
+  class SpecDut extends Component {
+    val opword     = in(Bits(16 bits))
+    val s          = OperationDecoder.decode(opword)
+    val microcoded = out(Bool());      microcoded := s.microcoded
+    val ucEntry    = out(UInt(5 bits)); ucEntry := s.ucEntry
+    val illegal    = out(Bool());      illegal := s.illegal
+    val bfOp       = out(Bits(3 bits)); bfOp := s.bfOp
+    val op         = out(DecOp());      op := s.op
+  }
+  def runSpec(check: SpecDut => Unit): Unit = SimConfig.withVerilator.compile(new SpecDut).doSim(check)
+
+  // PredecodeWord framing DUT (length only).
+  class PreDut extends Component {
+    val w0 = in(Bits(16 bits))
+    val r  = m68k040.frontend.PredecodeWord.classify(w0)
+    val simple   = out(Bool());        simple := r.simple
+    val lenWords = out(UInt(3 bits));  lenWords := r.lenWords
+  }
+  def runPre(check: PreDut => Unit): Unit = SimConfig.withVerilator.compile(new PreDut).doSim(check)
+
   // ext word: bit11=Do, [10:6]=offset, bit5=Dw, [4:0]=width, [14:12]=Dn2.
   def ext(off: Int, wd: Int, dn2: Int = 0, doBit: Boolean = false, dwBit: Boolean = false): Int =
     (dn2 << 12) | (if (doBit) (1 << 11) else 0) | ((off & 0x1f) << 6) |
@@ -180,12 +202,13 @@ class BitfieldDecodeSpec extends AnyFunSuite {
       assert(dut.uop.op.toEnum == DecOp.BITFIELD && !dut.uop.bfDynamic.toBoolean)
     }
   }
-  // ── Deferred: memory form (mode != 0) -> illegal ────────────────────────────
-  test("BFCLR memory form (mode=2 (An)) -> illegal/unimplemented", VerilatorTest) {
-    run { dut => // mode 010 (An indirect), reg 2: opword 1110 1010 11 010 010
-      val opMem = 0xE000 | (1 << 11) | (2 << 8) | (3 << 6) | (2 << 3) | 2
-      drive(dut, opMem, ext(0, 8)); sleep(1)
-      assert(dut.uop.unimplemented.toBoolean, "memory bit-field deferred")
+  // ── Slice 3b: memory RMW form (mode>=2 control-alterable) -> microcoded ──────
+  test("BFCLR memory form (mode=2 (An)) -> microcoded BITFIELD (slice 3b)", VerilatorTest) {
+    runSpec { dut => // mode 010 (An indirect), reg 2: opword 1110 1100 11 010 010 (bfOp=4)
+      dut.opword #= (0xE000 | (1 << 11) | (4 << 8) | (3 << 6) | (2 << 3) | 2); sleep(1)
+      assert(dut.microcoded.toBoolean, "BFCLR (An) is microcoded")
+      assert(!dut.illegal.toBoolean)
+      assert(dut.op.toEnum == DecOp.BITFIELD && dut.bfOp.toInt == 4)
     }
   }
 
@@ -315,15 +338,54 @@ class BitfieldDecodeSpec extends AnyFunSuite {
       assert(dut.uop.unimplemented.toBoolean, "-(An) not a control EA -> illegal")
     }
   }
-  // ── RMW mem ops (BFCHG/BFCLR/BFSET/BFINS) at a memory EA stay deferred/illegal ─
-  test("BFCLR mem (An) still illegal (slice 3b deferred)", VerilatorTest) {
-    run { dut => driveMem(dut, opwMem(4, 2, 0), ext(0, 8)); sleep(1)
-      assert(dut.uop.unimplemented.toBoolean, "BFCLR mem deferred (RMW)")
+  // ════════════════════════════════════════════════════════════════════════════
+  // Slice 3b: memory RMW (BFCHG/BFCLR/BFSET/BFINS) decode — microcoded via the engine.
+  // The microcoded routing + illegal split live in OperationDecoder (the assembler emits
+  // a benign placeholder for a microcoded op). The 4B-vs-5B entry is picked in DecodeStage
+  // ucBegin from needHi, NOT here (OperationDecoder is ext-word-free -> emits the 4B entry).
+  // ════════════════════════════════════════════════════════════════════════════
+  // All 4 RMW ops x each control-alterable mode -> microcoded + correct bfOp.
+  for ((bfOp, name) <- Seq(2 -> "BFCHG", 4 -> "BFCLR", 6 -> "BFSET", 7 -> "BFINS")) {
+    for ((mode, reg, ea) <- Seq((2, 0, "(An)"), (5, 0, "(d16,An)"), (6, 0, "(d8,An,Xn)"),
+                                (7, 0, "(xxx).W"), (7, 1, "(xxx).L"))) {
+      test(s"$bfOp $name $ea -> microcoded BITFIELD, default 4B entry", VerilatorTest) {
+        runSpec { dut =>
+          dut.opword #= (0xE000 | (1 << 11) | (bfOp << 8) | (3 << 6) | (mode << 3) | reg); sleep(1)
+          assert(dut.microcoded.toBoolean, s"$name $ea microcoded")
+          assert(!dut.illegal.toBoolean, s"$name $ea not illegal")
+          assert(dut.op.toEnum == DecOp.BITFIELD && dut.bfOp.toInt == bfOp)
+          assert(dut.ucEntry.toInt == Microcode.BF_RMW_4B_ENTRY, "default entry = 4B (ucBegin overrides)")
+        }
+      }
     }
   }
-  test("BFINS mem (An) still illegal (slice 3b deferred)", VerilatorTest) {
-    run { dut => driveMem(dut, opwMem(7, 2, 0), ext(0, 8, dn2 = 1)); sleep(1)
-      assert(dut.uop.unimplemented.toBoolean, "BFINS mem deferred (RMW)")
+  // ILLEGAL EAs for RMW: PC-rel (7-2/7-3), (An)+ (3), -(An) (4), An (1), #imm (7-4).
+  // (mode 0 is the REGISTER form BFCHG/BFINS — a different, legal instruction, NOT a
+  // memory RMW — so it is NOT in the illegal-RMW set here.)
+  for ((bfOp, name) <- Seq(2 -> "BFCHG", 7 -> "BFINS")) {
+    for ((mode, reg, ea) <- Seq((7, 2, "(d16,PC)"), (7, 3, "(d8,PC,Xn)"), (3, 0, "(An)+"),
+                                (4, 0, "-(An)"), (1, 0, "An"), (7, 4, "#imm"))) {
+      test(s"$bfOp $name $ea -> ILLEGAL (not control-alterable)", VerilatorTest) {
+        runSpec { dut =>
+          dut.opword #= (0xE000 | (1 << 11) | (bfOp << 8) | (3 << 6) | (mode << 3) | reg); sleep(1)
+          assert(dut.illegal.toBoolean, s"$name $ea illegal")
+          assert(!dut.microcoded.toBoolean, s"$name $ea not microcoded")
+        }
+      }
+    }
+  }
+  // Predecode framing: RMW ops now frame (slice 3a only framed load-only). Same length as
+  // the load-only op at the same EA.
+  test("predecode frames BFSET (d16,An) (RMW) — len = opword + bf-ext + 1 EA ext", VerilatorTest) {
+    runPre { dut => dut.w0 #= (0xE000 | (1 << 11) | (6 << 8) | (3 << 6) | (5 << 3) | 0); sleep(1)
+      assert(dut.simple.toBoolean, "BFSET (d16,An) framed")
+      assert(dut.lenWords.toInt == 3, "opword + bf-ext + 1 disp ext")
+    }
+  }
+  test("predecode frames BFINS (xxx).L (RMW) — len = opword + bf-ext + 2 EA ext", VerilatorTest) {
+    runPre { dut => dut.w0 #= (0xE000 | (1 << 11) | (7 << 8) | (3 << 6) | (7 << 3) | 1); sleep(1)
+      assert(dut.simple.toBoolean, "BFINS (xxx).L framed")
+      assert(dut.lenWords.toInt == 4, "opword + bf-ext + 2 abs ext")
     }
   }
   // ── Register form (mode 0) still decodes to a single non-mem BITFIELD ────────
