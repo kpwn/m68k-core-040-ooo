@@ -183,6 +183,46 @@ class LsEuSpec extends AnyFunSuite {
     }
   }
 
+  // DIRECTED REPRO of the cross-line store-after-load drain bug. A cross-line LONG
+  // store (slot A low line / slot B high line), AFTER a cross-line LOAD to the same
+  // address, must write BOTH slot A and slot B through to backing memory.
+  def commit(dut: Dut, cd: ClockDomain, robId: Int): Unit = {
+    dut.src.logic.iSqCommitValid #= true; dut.src.logic.iSqCommitRob #= robId
+    cd.waitSampling()
+    dut.src.logic.iSqCommitValid #= false
+  }
+  test("cross-line store after cross-line load drains BOTH slots", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val addr = 0x3FFEL              // long spans 0x3FFE..0x4001 (lines 0x3FF0 / 0x4000)
+      // seed both lines so the load refills clean lines
+      for (i <- 0 until 16) { mem.pokeByte(0x3FF0L + i, memByte(0x3FF0L + i)); mem.pokeByte(0x4000L + i, memByte(0x4000L + i)) }
+      seed(dut, cd, preg = 10, value = addr)
+      // initial cross-line store (the seed) of 0x12345678
+      seed(dut, cd, preg = 11, value = 0x12345678L)
+      issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11, Size.LONG, robId = 1)
+      assert(waitCompletion(dut, cd, robId = 1), "seed store alloc")
+      commit(dut, cd, robId = 1)
+      cd.waitSampling(20)
+      assert(mem.peekByte(0x3FFEL) == 0x12, s"seed slotA drained: ${mem.peekByte(0x3FFEL).toHexString}")
+      assert(mem.peekByte(0x4000L) == 0x56, s"seed slotB drained: ${mem.peekByte(0x4000L).toHexString}")
+      // cross-line LOAD to the same address
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 20, robId = 2)
+      assert(waitCompletion(dut, cd, robId = 2), "cross-line load")
+      cd.waitSampling(4)
+      // cross-line STORE of 0xCAFEBABE to the same address
+      seed(dut, cd, preg = 12, value = 0xCAFEBABEL)
+      issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 12, Size.LONG, robId = 3)
+      assert(waitCompletion(dut, cd, robId = 3), "cross-line store alloc")
+      commit(dut, cd, robId = 3)
+      cd.waitSampling(30)
+      assert(mem.peekByte(0x3FFEL) == 0xCA, s"slotA write-through dropped: dut=0x${mem.peekByte(0x3FFEL).toHexString} exp=0xca")
+      assert(mem.peekByte(0x3FFFL) == 0xFE, s"slotA byte1: dut=0x${mem.peekByte(0x3FFFL).toHexString} exp=0xfe")
+      assert(mem.peekByte(0x4000L) == 0xBA, s"slotB byte0: dut=0x${mem.peekByte(0x4000L).toHexString} exp=0xba")
+      assert(mem.peekByte(0x4001L) == 0xBE, s"slotB byte1: dut=0x${mem.peekByte(0x4001L).toHexString} exp=0xbe")
+    }
+  }
+
   test("flush squashes an uncommitted store (never drains)", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
       val (cd, mem) = initDut(dut)

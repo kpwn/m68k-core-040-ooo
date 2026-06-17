@@ -1377,13 +1377,24 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // cross-line; only the backing-memory write-through diverges). Quarantined here until the
   // LS-EU cross-line-store-after-load drain is fixed (out of slice-3b scope). DO NOT delete:
   // this documents the gap (the LsEuPlugin/DcachePlugin owner picks it up).
-  ignore("lock-step: BFSET mem misaligned LONG store crossing a cache line (PRE-EXISTING LS-EU cross-line-store bug)") {
+  test("lock-step: BFSET mem misaligned LONG store crossing a cache line (PRE-EXISTING LS-EU cross-line-store bug)", VerilatorTest) {
     runLockStep("bfrmw-crossline", (bfMemSeedLine ++ Seq(
       "ori #0x10,%ccr",
       "bfset (%a0){#4:#24}",                             // 24-bit field, bitOff 4, store crosses 0x4000
       "move.l (%a0),%d2",
       "bfextu (%a0){#4:#24},%d3"
     )).mkString(" ; "), checkMem = Seq(0x3FFEL, 0x4002L), checkSpan = 4)
+  }
+  // PLAIN MOVE.L regression (zero bit-field machinery): a misaligned LONG store CROSSING
+  // a cache line, AFTER a cross-line LOAD to the same address, must write slot A through
+  // to backing memory. This is the minimal repro of the LS-EU cross-line-store-after-load
+  // drain bug — no engine/RMW code.
+  test("lock-step: plain MOVE.L cross-line store after cross-line load", VerilatorTest) {
+    runLockStep("crossline-move-after-load", (bfMemSeedLine ++ Seq(
+      "move.l (%a0),%d1",                               // cross-line LOAD to 0x3FFE
+      "move.l #0xCAFEBABE,%d2",
+      "move.l %d2,(%a0)"                                // cross-line STORE to 0x3FFE
+    )).mkString(" ; "), checkMem = Seq(0x3FFEL), checkSpan = 4)
   }
 
   // ── ANDI/ORI/EORI #imm,CCR (NOT privileged — CCR only) lock-step ────────────
