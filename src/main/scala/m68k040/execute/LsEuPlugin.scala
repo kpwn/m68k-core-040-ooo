@@ -770,6 +770,15 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
 
       IDLE.whenIsActive {
         busy := False
+        // Clear the cross slot-B select left set by a PRIOR cross-line LOAD (WAIT_A sets
+        // llReg.bDone := True and the load completes WITHOUT clearing it). bDone gates
+        // `xlateVaddr` (s1AddrB when set), and a STORE translates in IDLE/XLATE WITHOUT
+        // ever passing through RESOLVE (where a load re-clears bDone), so a stale bDone
+        // would make the store translate the NEXT-line base (s1AddrB) instead of s1Va —
+        // corrupting slot A's paddr to the wrong line and DROPPING its write-through
+        // (PRE-EXISTING cross-line-store-after-load bug). Cleared here every IDLE cycle;
+        // re-armed only by WAIT_A for an in-flight cross load.
+        llReg.bDone := False
         when(s1Valid) {
           when(u1.leaAddr) {
             // LEA address-generate: complete immediately with the computed EA address
