@@ -174,6 +174,20 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       faRedir.valid   := doFlush
       faRedir.payload := flushPc
 
+      // Fetch-time BTB wiring (slice 1): read off the fetch PC, invalidate off the
+      // I-cache, feed the registered prediction into FetchAlign's predict input.
+      val faBtb = host[FetchAlignPlugin]
+      val btb   = host[m68k040.frontend.BtbPlugin]
+      btb.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+      btb.logic.queryPc     := faBtb.logic.btbQueryPc0
+      btb.logic.queryValid  := faBtb.logic.btbQueryValid0
+      btb.logic.query2Pc    := faBtb.logic.btbQueryPc1
+      btb.logic.query2Valid := faBtb.logic.btbQueryValid1
+      faBtb.logic.btbPredTaken0  := btb.logic.predTakenComb
+      faBtb.logic.btbPredTarget0 := btb.logic.predTargetComb
+      faBtb.logic.btbPredTaken1  := btb.logic.predTaken2Comb
+      faBtb.logic.btbPredTarget1 := btb.logic.predTarget2Comb
+
       // ── Exception D-cache MUX (the LS EU arbitrates: it owns the cache ports, so
       // the exception unit's requests are routed THROUGH the LS EU's mux — see
       // LsEuPlugin.excActive/excLoad*/excStore*/excXlate*). The exc reads the cache
@@ -233,6 +247,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val dtlb   = new DtlbPlugin
     val icache = new IcachePlugin
     val dcache = new DcachePlugin
+    val btb    = new m68k040.frontend.BtbPlugin
     val fa     = new FetchAlignPlugin
     val dec    = new DecodeStage
     val ren    = new RenameStage
@@ -254,7 +269,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       intCtrl,
       itlb,
       dtlb,
-      icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
+      icache, dcache, btb, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
       rfInt, rfNzvc, rfX, wire)) }
   }
 
@@ -2866,6 +2881,24 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l 0x2000,%d4 ; move.l 0x2002,%d5 ; " +
       "move.l #0x2000,%a7 ; rtr ; target: moveq #7,%d2 ; .stop: bra .stop",
       nInstr = 9, checkMem = Seq(0x2000L))
+  }
+
+  // ── BTB staleness stress (fetch-time predictor, slice 1) ──────────────────────
+  // A loop with a MISPREDICTING inner branch: the inner beq alternates taken/not-taken
+  // across iterations, so the BTB learns one direction then MISPREDICTS when it flips —
+  // a commit-time recovery redirect — WHILE the outer loop back-edge (bne) is a
+  // predicted-taken fetch redirect. The two redirect classes (predict + commit) land in
+  // overlapping windows, hammering the recStale/recDrop staleness machinery (the prior
+  // dropCount-leak bug class). The architectural result MUST match Musashi byte-for-byte
+  // (a dropped/duplicated/mis-attributed fetch would diverge). d6 toggles 1,0,1,0 via
+  // add+and; the inner beq is taken on the d6==0 iterations (alternating mispredict);
+  // the outer bne is the hot back-edge (predicted once warm).
+  test("lock-step: BTB staleness — loop with a mispredicting inner branch", VerilatorTest) {
+    runLockStep("btb-staleness",
+      "moveq #12,%d7 ; moveq #1,%d1 ; moveq #0,%d6 ; moveq #1,%d4 ; moveq #0,%d0 ; " +
+      ".Lbr: add.l %d1,%d6 ; and.l %d4,%d6 ; beq.s .Lskip ; add.l %d1,%d0 ; " +
+      ".Lskip: sub.l %d1,%d7 ; bne.s .Lbr ; moveq #9,%d2",
+      nInstr = -1)
   }
 
   test("lock-step: backward bne.s loop (one backward taken)", VerilatorTest) {

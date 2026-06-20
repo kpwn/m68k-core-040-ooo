@@ -12,4 +12,12 @@ case class DecodePacket() extends Bundle {
   val lenWords  = UInt(3 bits)            // predecode length in words (meaningful iff simple)
   val complex   = Bool()                  // !simple
   val fault     = Bool()
+  // ── Fetch-time branch prediction (BTB + bimodal, slice 1) ───────────────────
+  // predTaken : this instruction's fetch window hit the BTB with predict-taken (the
+  //   front-end was redirected to predTarget on its behalf). predTarget : the target
+  //   fetch was redirected to (meaningful iff predTaken). Both ride fetch->decode->
+  //   rename->IQ/ROB->branch EU so the branch EU can verify predicted-vs-actual.
+  //   Non-branch / not-predicted packets carry predTaken=False, predTarget=0.
+  val predTaken  = Bool()
+  val predTarget = UInt(32 bits)
 }

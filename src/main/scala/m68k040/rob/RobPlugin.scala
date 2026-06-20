@@ -1,6 +1,6 @@
 package m68k040.rob
 
-import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService}
+import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate}
 import m68k040.rename.RenamedUop
 import m68k040.types.CommitTrace
 import spinal.core._
@@ -19,7 +19,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   *
   * retireAlone entries (branches, for now) retire 1-wide.
   */
-class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService {
+class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService {
 
   /** One ROB entry's commit/free + trace payload. */
   case class RobPayload() extends Bundle {
@@ -90,7 +90,24 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     branchCompletion.payload.robId.allowOverride;      branchCompletion.payload.robId := U(0, robIdW bits)
     branchCompletion.payload.mispredict.allowOverride; branchCompletion.payload.mispredict := False
     branchCompletion.payload.nextPc.allowOverride;     branchCompletion.payload.nextPc := U(0, 32 bits)
+    branchCompletion.payload.isBranch.allowOverride;   branchCompletion.payload.isBranch := False
+    branchCompletion.payload.btbPc.allowOverride;      branchCompletion.payload.btbPc := U(0, 32 bits)
+    branchCompletion.payload.btbTaken.allowOverride;   branchCompletion.payload.btbTaken := False
+    branchCompletion.payload.btbTarget.allowOverride;  branchCompletion.payload.btbTarget := U(0, 32 bits)
+    branchCompletion.payload.brType.allowOverride;     branchCompletion.payload.brType := U(0, 2 bits)
     branchCompletion.simPublic()
+
+    // ── Retire-time BTB update output (BtbUpdateService) ────────────────────────
+    // Pulses the cycle a BTB-eligible branch retires (driven below near branchRedirect,
+    // where retire0/h0 are in scope). Concrete idle defaults so a standalone DUT (no
+    // BtbPlugin consumer) elaborates; the BtbPlugin reads it in the full core.
+    val btbUpdateFlow = Flow(BtbUpdate())
+    btbUpdateFlow.valid := False
+    btbUpdateFlow.payload.pc     := U(0, 32 bits)
+    btbUpdateFlow.payload.taken  := False
+    btbUpdateFlow.payload.target := U(0, 32 bits)
+    btbUpdateFlow.payload.brType := U(0, 2 bits)
+    btbUpdateFlow.simPublic()
     // mispredictStore MUST default False: a freshly-allocated branch entry is "not
     // yet known mispredicted" until its EU completion (branchCompletion) says so.
     // Without this, `doFlushReg := ... && mispredictStore(h0)` reads a stale/uninit
@@ -98,6 +115,16 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // Reset per-alloc below (mirrors `completes`), with alloc-priority on a reused index.
     val mispredictStore = Vec.fill(depth)(RegInit(False))
     val nextPcStore     = Vec.fill(depth)(Reg(UInt(32 bits)))
+    // ── BTB-update per-entry capture (fetch-time predictor, slice 1) ────────────
+    // Recorded from branchCompletion (the branch EU) and read at retire to drive the
+    // BTB write port (the BtbUpdate service below). btbIsBranchStore RegInit(False)
+    // so a never-allocated / re-used-but-not-yet-completed entry never spuriously
+    // updates the BTB (mirrors mispredictStore's alloc-priority discipline).
+    val btbIsBranchStore = Vec.fill(depth)(RegInit(False))
+    val btbPcStore       = Vec.fill(depth)(Reg(UInt(32 bits)))
+    val btbTakenStore    = Vec.fill(depth)(RegInit(False))
+    val btbTargetStore   = Vec.fill(depth)(Reg(UInt(32 bits)))
+    val btbTypeStore     = Vec.fill(depth)(Reg(UInt(2 bits)))
     // Precise-fault per-entry capture — RegInit Vecs reset per-alloc (mirrors
     // mispredictStore). RegInit(False) guarantees a never-allocated / re-allocated
     // entry reads "not faulted / not RTE" deterministically (no uninit-Mem flake).
@@ -385,6 +412,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       completes(branchCompletion.payload.robId)       := True
       mispredictStore(branchCompletion.payload.robId) := branchCompletion.payload.mispredict
       nextPcStore(branchCompletion.payload.robId)     := branchCompletion.payload.nextPc
+      // BTB-update capture (read at retire to drive the BTB write port).
+      btbIsBranchStore(branchCompletion.payload.robId) := branchCompletion.payload.isBranch
+      btbPcStore(branchCompletion.payload.robId)       := branchCompletion.payload.btbPc
+      btbTakenStore(branchCompletion.payload.robId)    := branchCompletion.payload.btbTaken
+      btbTargetStore(branchCompletion.payload.robId)   := branchCompletion.payload.btbTarget
+      btbTypeStore(branchCompletion.payload.robId)     := branchCompletion.payload.brType
     }
     // CCR-value completion: record each completing instruction's NZVC/X VALUES per
     // entry (BEFORE the alloc-reset so a re-used index's alloc wins). One port/EU.
@@ -438,6 +471,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       payload.write(tail, payloadFrom(allocUopVec(0)))
       completes(tail)       := False
       mispredictStore(tail) := False
+      btbIsBranchStore(tail) := False
       faultedStore(tail)  := allocUopVec(0).faulted
       isRteStore(tail)    := allocUopVec(0).isRte
       faultVecStore(tail) := allocUopVec(0).faultVector
@@ -461,6 +495,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       payload.write(tail + 1, payloadFrom(allocUopVec(1)))
       completes(tail + 1)       := False
       mispredictStore(tail + 1) := False
+      btbIsBranchStore(tail + 1) := False
       faultedStore(tail + 1)  := allocUopVec(1).faulted
       isRteStore(tail + 1)    := allocUopVec(1).isRte
       faultVecStore(tail + 1) := allocUopVec(1).faultVector
@@ -496,6 +531,19 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // The exception FSM's final redirect (vector target / RTE restored PC) is ORed
     // into it below (after the exc unit is built).
     val branchRedirect = retire0 && p0.retireAlone && mispredictStore(h0)
+
+    // ── Retire-time BTB update (fetch-time predictor, slice 1) ──────────────────
+    // When a BTB-eligible branch retires at the head (retire0 — branches are
+    // retireAlone, so they always retire in slot 0), drive the BtbPlugin write port
+    // with its captured PC/target/brType + resolved direction. ONLY at retire => no
+    // wrong-path pollution (a squashed wrong-path branch never reaches retire).
+    when(retire0 && btbIsBranchStore(h0)) {
+      btbUpdateFlow.valid         := True
+      btbUpdateFlow.payload.pc     := btbPcStore(h0)
+      btbUpdateFlow.payload.taken  := btbTakenStore(h0)
+      btbUpdateFlow.payload.target := btbTargetStore(h0)
+      btbUpdateFlow.payload.brType := btbTypeStore(h0)
+    }
 
     // ── Precise-fault exception-pending (combinational at faulted retire) ───────
     // When the head is a faulted µop ready to retire, signal an exception with its
@@ -747,4 +795,6 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
 
   override def doFlush = logic.doFlushReg
   override def flushPc = logic.flushPcReg
+
+  override def btbUpdate = logic.btbUpdateFlow
 }

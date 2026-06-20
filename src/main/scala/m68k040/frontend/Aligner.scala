@@ -23,6 +23,11 @@ object Aligner {
     // Default-assign all packet fields to don't-care first
     r.slot0.assignDontCare()
     r.slot1.assignDontCare()
+    // Prediction defaults: NOT predicted. FetchAlign OVERRIDES predTaken/predTarget on
+    // the predicted-taken branch's slot after the aligner runs (so this stays a concrete
+    // default, not a don't-care a sim poke / FetchAlign drive can't see).
+    r.slot0.predTaken := False; r.slot0.predTarget := U(0, 32 bits)
+    r.slot1.predTaken := False; r.slot1.predTarget := U(0, 32 bits)
 
     // Default control signals
     r.slot0Valid  := False

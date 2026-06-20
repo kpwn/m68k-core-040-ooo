@@ -66,6 +66,7 @@ class IbranchSourcePlugin extends FiberPlugin {
     uop.divSigned := False; uop.div64 := False; uop.divIsRem := False
     uop.isChk2 := False
     uop.firstOfInstr := True
+    uop.predTaken    := False; uop.predTarget := 0
     uop.nextPc       := iPc + 2
     ctx.robId        := iRobId
 
