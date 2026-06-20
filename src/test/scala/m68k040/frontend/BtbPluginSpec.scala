@@ -41,9 +41,10 @@ class BtbPluginSpec extends AnyFunSuite {
       btb.logic.queryPc       := qPc
       btb.logic.queryValid    := qValid
       btb.logic.invalidateAll := inval
-      val oPredValid  = out(Bool());        oPredValid  := btb.logic.predValid
-      val oPredTarget = out(UInt(32 bits)); oPredTarget := btb.logic.predTarget
-      val oPredPc     = out(UInt(32 bits)); oPredPc     := btb.logic.predBranchPc
+      // Combinational lookup outputs (port 0): predict-taken + target this cycle.
+      val oPredValid  = out(Bool());        oPredValid  := btb.logic.predTakenComb
+      val oPredTarget = out(UInt(32 bits)); oPredTarget := btb.logic.predTargetComb
+      val oPredPc     = out(UInt(32 bits)); oPredPc     := qPc
     }
   }
 
@@ -58,13 +59,14 @@ class BtbPluginSpec extends AnyFunSuite {
 
   /** Issue a lookup for `pc` and return the REGISTERED prediction one cycle later. */
   def lookup(dut: BtbDut, cd: ClockDomain, pc: Long): (Boolean, Long, Long) = {
+    // Combinational lookup: drive qPc/qValid, let the async-read + tag-decode settle,
+    // sample the prediction THIS cycle (no register delay).
     dut.wire.logic.qPc #= pc; dut.wire.logic.qValid #= true
-    cd.waitSampling()                  // edge: registers the lookup result
-    cd.waitSampling()                  // hold qValid one more edge, then sample the reg
-    dut.wire.logic.qValid #= false
+    sleep(1); cd.waitSampling()        // settle the combinational read
     val pv = dut.wire.logic.oPredValid.toBoolean
     val pt = dut.wire.logic.oPredTarget.toLong
     val pp = dut.wire.logic.oPredPc.toLong
+    dut.wire.logic.qValid #= false
     (pv, pt, pp)
   }
 

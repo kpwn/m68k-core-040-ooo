@@ -59,18 +59,23 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val quiesce = Bool()
     quiesce.allowOverride; quiesce := False
 
-    // ── Fetch-time BTB prediction input (slice 1) ────────────────────────────────
-    // The BtbPlugin drives this REGISTERED prediction (a fetch-window hit predicted
-    // taken): `target` = the predicted target, `branchPc` = the predicted branch's PC
-    // (so the aligner can attribute the prediction to the right word + suppress the
-    // post-branch words). Directionless, idle-defaulted with concrete zeros so a
-    // standalone DUT elaborates; the wiring layer / BtbPlugin overrides it. The
-    // predict->fetch redirect (predictRedirect, below) is wired in Step 3; in Step 2
-    // this is declared + absorbed (predictor not yet driving fetch).
-    val predict = Flow(PredictRedirect())
-    predict.valid.allowOverride;            predict.valid := False
-    predict.payload.target.allowOverride;   predict.payload.target := U(0, 32 bits)
-    predict.payload.branchPc.allowOverride; predict.payload.branchPc := U(0, 32 bits)
+    // ── Fetch-time BTB prediction interface (slice 1) ────────────────────────────
+    // FetchAlign DRIVES the two per-instruction query PCs (slot0/slot1 of the aligner
+    // head) + valids; the BtbPlugin returns the COMBINATIONAL prediction this cycle.
+    // Directionless plain wires (the IcachePlugin convention): the wiring layer
+    // connects the query OUTPUTS to the BTB and the prediction INPUTS back. Concrete
+    // idle defaults so FetchAlign elaborates standalone (predictor inert).
+    //   btbQueryPc0/1, btbQueryValid0/1 : DRIVEN here (the aligner slot PCs).
+    //   btbPredTaken0/1, btbPredTarget0/1 : INPUT (the BTB's combinational predict).
+    val btbQueryPc0    = UInt(32 bits); val btbQueryValid0 = Bool()
+    val btbQueryPc1    = UInt(32 bits); val btbQueryValid1 = Bool()
+    val btbPredTaken0  = Bool(); val btbPredTarget0 = UInt(32 bits)
+    val btbPredTaken1  = Bool(); val btbPredTarget1 = UInt(32 bits)
+    // Inputs: idle-defaulted (allowOverride) so a standalone DUT (no BTB) reads not-taken.
+    btbPredTaken0.allowOverride;  btbPredTaken0  := False
+    btbPredTarget0.allowOverride; btbPredTarget0 := U(0, 32 bits)
+    btbPredTaken1.allowOverride;  btbPredTaken1  := False
+    btbPredTarget1.allowOverride; btbPredTarget1 := U(0, 32 bits)
 
     // ---- State registers ----
     val decodePc      = Reg(UInt(32 bits)) init 0
@@ -112,10 +117,20 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     ibuf.io.shift        := 0
     ibuf.io.flush        := False
 
-    // Any fetch-redirect this cycle (external redirect, complex-resume, or commit
-    // mispredict). A fetch issued THIS cycle used the pre-redirect fetchPc -> born stale.
-    // (mispredictRedirect/redirect/resume are all declared above; resume only when stalled.)
-    val redirectThisCycle = redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid
+    // A predicted-taken BTB redirect fires this cycle (forward-declared; driven below
+    // after the aligner + BTB lookup). Like the architectural redirects, a fetch issued
+    // the SAME cycle used the pre-redirect fetchPc and MUST be born stale — otherwise it
+    // fetches the (now wrong-path) sequential window and enqueues garbage that is NEVER
+    // squashed (a correctly-predicted branch does NOT flush the downstream). This was the
+    // staleness bug: predictFire was missing from redirectThisCycle.
+    val predictFire = Bool()
+    predictFire.allowOverride
+    predictFire := False   // default; overridden below (driven after the aligner/BTB lookup)
+
+    // Any fetch-redirect this cycle (external redirect, complex-resume, commit mispredict,
+    // OR a fetch-time prediction). A fetch issued THIS cycle used the pre-redirect fetchPc
+    // -> born stale. (mispredictRedirect/redirect/resume declared above; resume only when stalled.)
+    val redirectThisCycle = redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid || predictFire
 
     // ---- FetchControl: issue fetches (single-outstanding) ----
     // Suppress fetching while holding an I-fetch fault OR while STOP-quiesced (wait for the
@@ -183,12 +198,49 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val res = Aligner.align(decodePc, ibuf.io.head, ibuf.io.headPred, ibuf.io.avail)
     spinal.core.sim.SimPublic(ibuf.io.headPred(0).simple, ibuf.io.head(0))
 
+    // ── Fetch-time prediction (BTB + bimodal, slice 1) ───────────────────────────
+    // Query the BTB combinationally with the aligner's slot0/slot1 instruction PCs;
+    // the BTB returns predict-taken + target THIS cycle. An emitted slot that predicts
+    // taken IS the predicted-taken branch. We:
+    //   (a) stamp predTaken/predTarget on that slot's DecodePacket (rides to the EU),
+    //   (b) SUPPRESS everything after it in the window (slot1 after a predicted slot0 is
+    //       wrong-path),
+    //   (c) on feed.fire redirect fetch to predTarget (predictFire, below) — reusing the
+    //       redirect machinery, at priority BELOW commit/external/resume.
+    // Architectural correctness does NOT depend on the prediction being right: the
+    // branch EU verifies predicted-vs-actual + the commit-time redirect recovers a
+    // mispredict. A correct prediction simply avoids the squash.
+    val predEnable = !faultHold && !quiesce && !stalled
+    btbQueryPc0    := res.slot0.pc
+    btbQueryValid0 := predEnable && res.slot0Valid
+    btbQueryPc1    := res.slot1.pc
+    btbQueryValid1 := predEnable && res.slot1Valid
+    // slot0 predicted-taken: stamp slot0 + suppress slot1 + redirect (the proven path).
+    val slot0IsPred = btbPredTaken0 && res.slot0Valid
+    // slot1 predicted-taken (and slot0 is NOT): SUPPRESS slot1 this cycle so ONLY slot0
+    // emits; decodePc advances to the branch, which becomes slot0 NEXT cycle and takes
+    // the (correct, single-slot) slot0 prediction path. Costs one dual-issue slot on the
+    // predicted branch but reuses the proven slot0 redirect and keeps recovery simple.
+    val slot1WouldPred = btbPredTaken1 && res.slot1Valid && res.slot0Valid && !slot0IsPred
+    val predictedThisEmit = slot0IsPred
+    val predTargetSel = btbPredTarget0
+
     // ---- Feed valid logic ----
     // Emit when a packet is at head and not stalled. Complex packets emit once:
     // the cycle after they fire, the stalled latch suppresses re-emission.
     feed.payload(0) := res.slot0
     feed.payload(1) := res.slot1
     slot1ValidOut   := res.slot1Valid
+    // Suppress slot1 when slot0 is the predicted-taken branch (slot1 is wrong-path) OR
+    // when slot1 WOULD be a predicted branch (defer it to slot0 next cycle).
+    when(slot0IsPred || slot1WouldPred) {
+      slot1ValidOut := False
+    }
+    // Stamp the prediction onto slot0 (rides to the EU).
+    when(slot0IsPred) {
+      feed.payload(0).predTaken  := True
+      feed.payload(0).predTarget := btbPredTarget0
+    }
     // Gate feed low while STOP-quiesced so no buffered successor word is dispatched /
     // allocated into the ROB while halted (the quiesce only ends on the wake redirect).
     feed.valid      := res.slot0Valid && !stalled && !quiesce
@@ -222,13 +274,41 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // When feed fires (normal, NOT the faulted-packet override): consume words from
     // the buffer and advance decodePc. A faulted feed shifts nothing (its bytes came
     // from faultPc, not the IBuf).
+    // Effective shift: when slot1 is SUPPRESSED (a predicted slot0 branch, or a slot1
+    // branch deferred to next cycle), consume only slot0's words (lenWords); else the
+    // aligner's full shift. Without this, suppressing slot1 would still CONSUME its
+    // words from the IBuf — losing the deferred branch / the wrong-path successor.
+    val suppressSlot1 = slot0IsPred || slot1WouldPred
+    val effShift = Mux(suppressSlot1, res.slot0.lenWords.resize(res.shiftWords.getWidth), res.shiftWords)
     when(feed.fire && !faultHold) {
-      ibuf.io.shift := res.shiftWords
-      decodePc      := decodePc + (res.shiftWords.resize(32) |<< 1)
+      ibuf.io.shift := effShift
+      decodePc      := decodePc + (effShift.resize(32) |<< 1)
       when(res.complex) {
         // Complex instruction: stall after emitting — wait for resume
         stalled := True
       }
+    }
+
+    // ── predict redirect (BTB hit, slice 1) — BELOW commit/external/resume ────────
+    // When a predicted-taken branch was emitted this cycle (feed.fire), redirect fetch
+    // to the predicted target — exactly like an external redirect (decodePc/fetchPc/
+    // pendingDrop/recStale). Placed AFTER the normal decodePc advance (so it overrides
+    // it) but BEFORE the external/resume/mispredict redirects (so an architectural
+    // redirect coincident with a prediction always wins). When slot0 is the predicted
+    // branch, slot1 was suppressed above (slot1Valid:=False); when slot1 is the
+    // predicted branch, both slots emitted and we redirect after slot1.
+    predictFire := feed.fire && !faultHold && predictedThisEmit
+    when(predictFire) {
+      val newPc   = predTargetSel
+      decodePc    := newPc
+      fetchPc     := newPc(31 downto 3) @@ U(0, 3 bits)
+      ibuf.io.flush  := True
+      stalled        := False
+      started        := True
+      pendingDrop    := newPc(2 downto 1)
+      // Mark the in-flight fetch (if any) stale — the speculative target window
+      // supersedes it (the same recStale discipline the architectural redirects use).
+      when(recValid) { recStale := True }
     }
 
     // ---- redirect (highest priority) ----

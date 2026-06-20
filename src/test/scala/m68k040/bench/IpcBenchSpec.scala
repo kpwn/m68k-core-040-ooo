@@ -139,12 +139,15 @@ class IpcBenchSpec extends AnyFunSuite {
       // I-cache, feed the registered prediction into FetchAlign's predict input.
       val fa  = host[FetchAlignPlugin]
       val btb = host[m68k040.frontend.BtbPlugin]
-      btb.logic.queryPc       := fa.logic.fetchPc
-      btb.logic.queryValid    := host[m68k040.services.FetchService].cmd.fire
       btb.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
-      fa.logic.predict.valid            := btb.logic.predValid
-      fa.logic.predict.payload.target   := btb.logic.predTarget
-      fa.logic.predict.payload.branchPc := btb.logic.predBranchPc
+      btb.logic.queryPc     := fa.logic.btbQueryPc0
+      btb.logic.queryValid  := fa.logic.btbQueryValid0
+      btb.logic.query2Pc    := fa.logic.btbQueryPc1
+      btb.logic.query2Valid := fa.logic.btbQueryValid1
+      fa.logic.btbPredTaken0  := btb.logic.predTakenComb
+      fa.logic.btbPredTarget0 := btb.logic.predTargetComb
+      fa.logic.btbPredTaken1  := btb.logic.predTaken2Comb
+      fa.logic.btbPredTarget1 := btb.logic.predTarget2Comb
 
       val dc    = host[DcacheService]
       val xlate = host[DTranslationService]
@@ -488,6 +491,23 @@ class IpcBenchSpec extends AnyFunSuite {
     Kernel("branchy", src, setup.size + 220)
   }
 
+  // 4b. hot-loop: a TIGHT backward `bne.s` loop with a tiny independent-ALU body. The
+  //     back-edge is taken on EVERY iteration but the loop-top BTB entry warms after the
+  //     first 1-2 iterations -> the back-edge is predicted-taken -> NO squash. Without
+  //     prediction every back-edge is a ~5-6cyc commit-time mispredict; with it the loop
+  //     approaches the backend's dual-retire ceiling. This is the kernel the predictor
+  //     most directly targets (a hot back-edge).
+  def kHotLoop: Kernel = {
+    // d7 = trip count (down from 100); d1 = 1; d0/d2 = independent accumulators (ILP).
+    // Body per iter: add.l %d1,%d0 ; add.l %d1,%d2 ; sub.l %d1,%d7 ; bne.s .Lhot
+    //   -> 4 macros/iter, the bne taken 99x (back-edge) + 1 not-taken exit.
+    val iters = 100
+    val setup = Seq("moveq #100,%d7", "moveq #1,%d1", "moveq #0,%d0", "moveq #0,%d2")
+    val body  = ".Lhot: add.l %d1,%d0 ; add.l %d1,%d2 ; sub.l %d1,%d7 ; bne.s .Lhot"
+    val src = setup.mkString(" ; ") + " ; " + body
+    Kernel("hot-loop", src, setup.size + iters * 4)
+  }
+
   // 5. mixed: a STRAIGHT-LINE realistic blend of ALU + memory + branch. The branch
   //    in each group is a NOT-TAKEN forward beq (a value compared against a
   //    different value -> Z=0 -> falls through). A not-taken branch exercises the
@@ -527,7 +547,7 @@ class IpcBenchSpec extends AnyFunSuite {
   }
 
   test("IPC microbenchmark suite", VerilatorTest) {
-    val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kBranchy, kMixed)
+    val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kBranchy, kHotLoop, kMixed)
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))

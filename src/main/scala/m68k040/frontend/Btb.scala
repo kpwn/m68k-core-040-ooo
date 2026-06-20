@@ -21,15 +21,6 @@ case class BtbEntry(tagBits: Int) extends Bundle {
   val counter = UInt(2 bits)
 }
 
-/** The registered BTB prediction handed to FetchAlign: a fetch window predicted-taken.
-  *  - target   : the predicted-taken target (the next fetch PC).
-  *  - branchPc : the predicted branch instruction's PC (so the aligner attributes the
-  *               prediction to the right word + suppresses post-branch words). */
-case class PredictRedirect() extends Bundle {
-  val target   = UInt(32 bits)
-  val branchPc = UInt(32 bits)
-}
-
 /** Tagged direct-mapped BTB + 2-bit bimodal predictor (spec slice 1).
   *
   * Read  : a combinational async-read off the fetch PC (LUTRAM, like the I-cache
@@ -78,32 +69,36 @@ class BtbPlugin extends FiberPlugin {
     queryPc.allowOverride; queryPc := U(0, 32 bits)
     val queryValid = Bool()
     queryValid.allowOverride; queryValid := False
+    // Second combinational lookup port (the aligner's slot1 PC). Two per-instruction
+    // BTB reads per cycle so a 2-wide emit predicts a branch in EITHER slot.
+    val query2Pc = UInt(32 bits)
+    query2Pc.allowOverride; query2Pc := U(0, 32 bits)
+    val query2Valid = Bool()
+    query2Valid.allowOverride; query2Valid := False
     val invalidateAll = Bool()
     invalidateAll.allowOverride; invalidateAll := False
     queryPcPort = queryPc; queryValidPort = queryValid; invalidatePort = invalidateAll
 
-    // ---- combinational lookup (async read) ----
-    val qIdx   = idxOf(queryPc)
-    val qTag   = tagOf(queryPc)
-    val qEntry = mem.readAsync(qIdx)
-    val qValid = valids(qIdx)
-    val qHit   = qValid && (qEntry.tag === qTag)
-    // predict-taken: a hit with the bimodal counter in the taken band (>=2) OR an
-    // unconditional (brType==1 — force-taken even on the cycle it is first installed).
-    val qPredTaken = qHit && ((qEntry.counter >= U(2, 2 bits)) || (qEntry.brType === U(1, 2 bits)))
-
-    // ---- REGISTERED lookup output (the redirect path starts here) ----
-    val predValid    = RegInit(False)
-    val predTarget   = Reg(UInt(32 bits))
-    val predBranchPc = Reg(UInt(32 bits))
-    predValid.simPublic(); predTarget.simPublic(); predBranchPc.simPublic()
-    when(queryValid) {
-      predValid    := qPredTaken
-      predTarget   := qEntry.target
-      predBranchPc := queryPc
-    } otherwise {
-      predValid    := False
+    // ---- combinational lookup helper (async LUTRAM read + tag/counter decode) ----
+    def lookup(pc: UInt, valid: Bool): (Bool, UInt) = {
+      val idx   = idxOf(pc)
+      val tag   = tagOf(pc)
+      val entry = mem.readAsync(idx)
+      val hit   = valids(idx) && (entry.tag === tag)
+      // predict-taken: hit with counter in the taken band (>=2) OR an unconditional
+      // (brType==1, force-taken even on the cycle it is first installed).
+      val predTaken = valid && hit && ((entry.counter >= U(2, 2 bits)) || (entry.brType === U(1, 2 bits)))
+      (predTaken, entry.target)
     }
+
+    // ---- COMBINATIONAL lookup outputs (per-instruction PC, slice 1) ─────────────
+    // FetchAlign queries with the aligner's slot0/slot1 instruction PCs (decodePc and
+    // decodePc+slot0-len) and uses THESE combinational outputs IN THE SAME CYCLE to
+    // attribute the prediction to the emitted instruction + redirect fetch.
+    val (predTakenComb,  predTargetComb)  = lookup(queryPc,  queryValid)
+    val (predTaken2Comb, predTarget2Comb) = lookup(query2Pc, query2Valid)
+    predTakenComb.simPublic(); predTargetComb.simPublic()
+    predTaken2Comb.simPublic(); predTarget2Comb.simPublic()
 
     // ---- retire-time update (from the ROB's BtbUpdateService) ----
     val upd = host[BtbUpdateService].btbUpdate

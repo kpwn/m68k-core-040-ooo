@@ -59,13 +59,17 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // BTB invalidates on the SAME signal that clears the I-cache.
     val fa  = host[FetchAlignPlugin]
     val btb = host[BtbPlugin]
-    btb.logic.queryPc       := fa.logic.fetchPc
-    btb.logic.queryValid    := host[m68k040.services.FetchService].cmd.fire
     btb.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
-    // Feed the registered BTB prediction into FetchAlign's predict-redirect input.
-    fa.logic.predict.valid       := btb.logic.predValid
-    fa.logic.predict.payload.target   := btb.logic.predTarget
-    fa.logic.predict.payload.branchPc := btb.logic.predBranchPc
+    // Two per-instruction combinational BTB lookups (the aligner's slot0/slot1 PCs);
+    // the predict-taken + target return THIS cycle into FetchAlign's prediction inputs.
+    btb.logic.queryPc     := fa.logic.btbQueryPc0
+    btb.logic.queryValid  := fa.logic.btbQueryValid0
+    btb.logic.query2Pc    := fa.logic.btbQueryPc1
+    btb.logic.query2Valid := fa.logic.btbQueryValid1
+    fa.logic.btbPredTaken0  := btb.logic.predTakenComb
+    fa.logic.btbPredTarget0 := btb.logic.predTargetComb
+    fa.logic.btbPredTaken1  := btb.logic.predTaken2Comb
+    fa.logic.btbPredTarget1 := btb.logic.predTarget2Comb
     // STOP-halt: while the ROB is in the `stopped` state, quiesce the front-end (hold
     // fetch + feed at the STOP successor PC). The IRQ-entry vector redirect clears it.
     host[FetchAlignPlugin].logic.quiesce := rob.logic.stopped
