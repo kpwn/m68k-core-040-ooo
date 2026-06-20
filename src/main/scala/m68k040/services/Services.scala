@@ -44,6 +44,23 @@ trait FetchService {
   def rsp: Flow[FetchRsp]
 }
 
+/** Retire-time BTB update (fetch-time predictor, slice 1). The ROB drives this from
+  * a retiring branch's per-entry BTB-update capture; the BtbPlugin consumes it to
+  * write its table (alloc tag/target/brType + bump the 2-bit bimodal counter). A
+  * single update port (1 retiring branch/cycle — branches are retireAlone). */
+case class BtbUpdate() extends Bundle {
+  val pc     = UInt(32 bits)   // the retiring branch's PC (index/tag source)
+  val taken  = Bool()          // resolved taken (bimodal direction)
+  val target = UInt(32 bits)   // resolved taken-target (learned)
+  val brType = UInt(2 bits)    // 0=cond, 1=uncond
+}
+
+/** ROB exposes; BtbPlugin consumes. `update.valid` pulses the cycle a BTB-eligible
+  * branch retires. */
+trait BtbUpdateService {
+  def btbUpdate: Flow[BtbUpdate]
+}
+
 /** The ONE 68040 MMU control (TC enable + URP/SRP root pointer), shared by BOTH
   * the I-side ITLB and the D-side DTLB. One owner drives the regs (synth top input /
   * sim poke / future MOVEC); both TLBs read it. `mmuEnable` LOW => identity. */

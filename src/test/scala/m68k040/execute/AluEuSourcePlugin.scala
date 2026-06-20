@@ -93,6 +93,7 @@ class AluEuSourcePlugin extends FiberPlugin {
     uop.leaAddr      := False; uop.fromCcr := False; uop.fromSr := False
     uop.needsSupervisor := False; uop.keepCommit := False
     uop.firstOfInstr := False
+    uop.predTaken    := False; uop.predTarget := 0
     ctx.robId := iRobId
     eu.issue.valid   := iValid
     eu.issue.payload := ctx

@@ -67,6 +67,9 @@ class BranchEuSourcePlugin extends FiberPlugin {
     uop.isScc        := False
     uop.isDbcc       := False
     uop.faultUsesNextPc := False
+    // Fetch-time prediction: NOT predicted (predictor-inert) -> mispredict == taken.
+    uop.predTaken    := False
+    uop.predTarget   := 0
     uop.nextPc       := iPc + 2
     ctx.robId        := iRobId
 

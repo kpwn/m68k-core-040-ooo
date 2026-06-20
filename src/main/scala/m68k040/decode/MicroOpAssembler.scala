@@ -88,6 +88,7 @@ object MicroOpAssembler {
     u.indexLong   := False; u.indexScale := 0
     u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+    u.predTaken := False; u.predTarget := U(0, 32 bits)
     // Only the VERY FIRST emitted move of the whole MOVEM is the macro boundary
     // (firstOfInstr); every later move + the final An update is non-first, so an
     // interrupt is only taken at the MOVEM boundary (never mid-emission — the partly-
@@ -130,6 +131,7 @@ object MicroOpAssembler {
     u.indexLong   := False; u.indexScale := 0
     u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+    u.predTaken := False; u.predTarget := U(0, 32 bits)
     u.firstOfInstr := False    // trailing µop of the MOVEM macro
     u
   }
@@ -183,6 +185,7 @@ object MicroOpAssembler {
     u.indexLong   := False; u.indexScale := 0
     u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+    u.predTaken := False; u.predTarget := U(0, 32 bits)
     u.firstOfInstr := False
     u
   }
@@ -463,6 +466,7 @@ object MicroOpAssembler {
     opUop.indexLong     := False; opUop.indexScale := 0
     opUop.leaAddr := False; opUop.fromCcr := False; opUop.fromSr := False; opUop.needsSupervisor := False; opUop.keepCommit := False
     opUop.sysOp := False; opUop.sysKind := SysKind.NONE; opUop.sysReadDir := False
+    opUop.predTaken := False; opUop.predTarget := U(0, 32 bits)
     // CHK / DIV are group-2 traps (CHK vec6, DIV0 vec5) delivered execute-time via
     // euFault -> format-$2: they stack the NEXT instruction's PC (the 040 group-2
     // frame's PC = pc+len). The fault is conditional (set at execute), but faultPc is
@@ -709,6 +713,7 @@ object MicroOpAssembler {
     ldUop.indexLong     := ldIdxEa.indexLong;  ldUop.indexScale := ldIdxEa.indexScale
     ldUop.leaAddr := False; ldUop.fromCcr := False; ldUop.fromSr := False; ldUop.needsSupervisor := False; ldUop.keepCommit := False
     ldUop.sysOp := False; ldUop.sysKind := SysKind.NONE; ldUop.sysReadDir := False
+    ldUop.predTaken := False; ldUop.predTarget := U(0, 32 bits)
     ldUop.dstReg        := U(T0, 5 bits); ldUop.dstValid := True
     ldUop.useImm        := True
     // disp = rmwEaDisp (immEa for a line-0 immediate mem-dest, else srcEa). A (d16,PC)
@@ -759,6 +764,7 @@ object MicroOpAssembler {
     stUop.indexLong     := dstEa.indexLong; stUop.indexScale := dstEa.indexScale
     stUop.leaAddr := False; stUop.fromCcr := False; stUop.fromSr := False; stUop.needsSupervisor := False; stUop.keepCommit := False
     stUop.sysOp := False; stUop.sysKind := SysKind.NONE; stUop.sysReadDir := False
+    stUop.predTaken := False; stUop.predTarget := U(0, 32 bits)
     // Auto-update DEST EA (-(An)/(An)+): the store's (otherwise unused) int dst carries
     // the An write (An := An ± delta) — generalizing stkPush to any An. PREDEC: addr =
     // An-delta = the written An; POSTINC: addr = An, written An = An+delta. The LS EU
@@ -803,6 +809,7 @@ object MicroOpAssembler {
     rmwStUop.indexLong     := rmwIdxEa.indexLong; rmwStUop.indexScale := rmwIdxEa.indexScale
     rmwStUop.leaAddr := False; rmwStUop.fromCcr := False; rmwStUop.fromSr := False; rmwStUop.needsSupervisor := False; rmwStUop.keepCommit := False
     rmwStUop.sysOp := False; rmwStUop.sysKind := SysKind.NONE; rmwStUop.sysReadDir := False
+    rmwStUop.predTaken := False; rmwStUop.predTarget := U(0, 32 bits)
     // Auto-update RMW EA (-(An)/(An)+): the load + this store share ONE EA and ONE An
     // update — the store carries the An write (An := An ± delta) on its int dst (the
     // load carries the SAME eaAuto for its address but writes only T0). The An write
@@ -1423,6 +1430,7 @@ object MicroOpAssembler {
     divlUop.indexLong := False; divlUop.indexScale := 0
     divlUop.leaAddr := False; divlUop.fromCcr := False; divlUop.fromSr := False; divlUop.needsSupervisor := False; divlUop.keepCommit := False
     divlUop.sysOp := False; divlUop.sysKind := SysKind.NONE; divlUop.sysReadDir := False
+    divlUop.predTaken := False; divlUop.predTarget := U(0, 32 bits)
     divlUop.firstOfInstr  := True
     // 64-bit dividend high word Dr: carried in srcC (psrcC after rename). For the
     // 32-bit form psrcC is unused.
@@ -1459,6 +1467,7 @@ object MicroOpAssembler {
     divremUop.indexLong := False; divremUop.indexScale := 0
     divremUop.leaAddr := False; divremUop.fromCcr := False; divremUop.fromSr := False; divremUop.needsSupervisor := False; divremUop.keepCommit := False
     divremUop.sysOp := False; divremUop.sysKind := SysKind.NONE; divremUop.sysReadDir := False
+    divremUop.predTaken := False; divremUop.predTarget := U(0, 32 bits)
     divremUop.firstOfInstr  := False           // trailing crack µop
 
     // DIV.L is valid only when its divisor EA is reg/imm. A memSimple divisor would
@@ -1535,6 +1544,7 @@ object MicroOpAssembler {
     mullUop.indexLong := False; mullUop.indexScale := 0
     mullUop.leaAddr := False; mullUop.fromCcr := False; mullUop.fromSr := False; mullUop.needsSupervisor := False; mullUop.keepCommit := False
     mullUop.sysOp := False; mullUop.sysKind := SysKind.NONE; mullUop.sysReadDir := False
+    mullUop.predTaken := False; mullUop.predTarget := U(0, 32 bits)
     mullUop.firstOfInstr  := True
 
     // MULHI (high-product move) µop (.L64 only): CPLX, writes the EU's LATCHED high
@@ -1568,6 +1578,7 @@ object MicroOpAssembler {
     mulhiUop.indexLong := False; mulhiUop.indexScale := 0
     mulhiUop.leaAddr := False; mulhiUop.fromCcr := False; mulhiUop.fromSr := False; mulhiUop.needsSupervisor := False; mulhiUop.keepCommit := False
     mulhiUop.sysOp := False; mulhiUop.sysKind := SysKind.NONE; mulhiUop.sysReadDir := False
+    mulhiUop.predTaken := False; mulhiUop.predTarget := U(0, 32 bits)
     mulhiUop.firstOfInstr  := False           // trailing crack µop
 
     // MUL.L is valid only when its multiplier EA is reg/imm (a memSimple multiplier
@@ -1650,6 +1661,7 @@ object MicroOpAssembler {
       u.indexLong   := bfmEaDec.indexLong; u.indexScale := bfmEaDec.indexScale
       u.leaAddr     := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
       u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+      u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.firstOfInstr := first
       u
     }
@@ -1690,6 +1702,7 @@ object MicroOpAssembler {
       u.indexLong   := False; u.indexScale := 0
       u.leaAddr     := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
       u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+      u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.firstOfInstr := False
       u
     }
@@ -1778,6 +1791,7 @@ object MicroOpAssembler {
       u.indexLong   := c2SrcEa.indexLong; u.indexScale := c2SrcEa.indexScale
       u.leaAddr     := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
       u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+      u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.firstOfInstr := first
       u
     }
@@ -1820,6 +1834,7 @@ object MicroOpAssembler {
       u.indexLong   := False; u.indexScale := 0
       u.leaAddr     := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
       u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+      u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.firstOfInstr := False                                   // trailing (loads are first)
       u
     }
@@ -1872,6 +1887,7 @@ object MicroOpAssembler {
     ibrUop.indexLong := False; ibrUop.indexScale := 0
     ibrUop.leaAddr := False; ibrUop.fromCcr := False; ibrUop.fromSr := False; ibrUop.needsSupervisor := False; ibrUop.keepCommit := False
     ibrUop.sysOp := False; ibrUop.sysKind := SysKind.NONE; ibrUop.sysReadDir := False
+    ibrUop.predTaken := False; ibrUop.predTarget := U(0, 32 bits)
     // JMP is a single µop (its own first); JSR's ibranch is the TRAILING µop (the push
     // is first), so firstOfInstr is False for JSR.
     ibrUop.firstOfInstr  := !isJsrOp
@@ -1926,6 +1942,7 @@ object MicroOpAssembler {
       u.indexLong := False; u.indexScale := 0
       u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := keepCommit
       u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+      u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.firstOfInstr := first
       u
     }
@@ -2147,6 +2164,7 @@ object MicroOpAssembler {
       u.indexLong   := srcEa.indexLong; u.indexScale := srcEa.indexScale
       u.leaAddr     := True; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
       u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False   // (Track D fields; LEA is not a sysOp)
+      u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.firstOfInstr := leaFirst
       u
     }
@@ -2381,6 +2399,17 @@ object MicroOpAssembler {
       out.count   := 1
       out.uops(0) := opUop
       out.uops(1) := opUop
+    }
+    // ── Fetch-time prediction stamp (BTB + bimodal, slice 1) ────────────────────
+    // Stamp EVERY µop of this instruction with the SOURCE PACKET's predTaken/predTarget
+    // (last-wins, after the crack tree above). Only the branch µop's prediction is read
+    // by the branch EU; stamping the non-branch crack µops (push/load/An-update) is
+    // harmless. This uniformly covers BSR/JSR/RTS (mkUop cracks) + Bcc/BRA (opUop) +
+    // JMP (ibrUop) without per-builder threading. predTaken defaults False at the
+    // packet until the fetch redirect is live, so this is behavior-neutral in step 1.
+    for (i <- 0 until 3) {
+      out.uops(i).predTaken.allowOverride;  out.uops(i).predTaken  := pkt.predTaken
+      out.uops(i).predTarget.allowOverride; out.uops(i).predTarget := pkt.predTarget
     }
     out
   }

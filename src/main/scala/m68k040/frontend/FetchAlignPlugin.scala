@@ -196,8 +196,12 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       feed.payload(0).wordCount := 1
       feed.payload(0).lenWords  := 1
       feed.payload(0).words.foreach(_ := 0)
+      feed.payload(0).predTaken  := False
+      feed.payload(0).predTarget := U(0, 32 bits)
       feed.payload(1).valid     := False
       feed.payload(1).fault     := False
+      feed.payload(1).predTaken  := False
+      feed.payload(1).predTarget := U(0, 32 bits)
     }
     // Emit-once: latch faultEmitted when the faulted packet fires.
     when(faultHold && feed.fire) { faultEmitted := True }

@@ -347,4 +347,14 @@ case class DecodedUop() extends Bundle {
   val sysOp        = Bool()
   val sysKind      = SysKind()
   val sysReadDir   = Bool()
+  // ── Fetch-time branch prediction carry-down (BTB + bimodal, slice 1) ─────────
+  // predTaken : this µop's instruction was predicted-taken at fetch (the front-end
+  //   redirected to predTarget on its behalf). predTarget : the redirected-to target
+  //   (meaningful iff predTaken). Both ride DecodePacket -> here -> RenamedUop ->
+  //   IqContext -> branch EU `u1`, where the branch EU computes mispredict =
+  //   (predTaken != actualTaken) || (actualTaken && actualTarget != predTarget).
+  //   Every builder defaults these to False/0 (non-branch / not-predicted); the
+  //   DecodeStage choke point STAMPS the real fetch-time values onto a packet's µops.
+  val predTaken    = Bool()
+  val predTarget   = UInt(32 bits)
 }

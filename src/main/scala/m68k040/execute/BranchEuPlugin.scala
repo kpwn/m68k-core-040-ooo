@@ -7,11 +7,21 @@ import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
 
-/** Branch completion: robId + whether it mispredicted + the resolved next PC. */
+/** Branch completion: robId + whether it mispredicted + the resolved next PC.
+  * PLUS the BTB-update payload (fetch-time predictor, slice 1): the branch's own PC,
+  * its resolved taken direction + target, its brType, and `isBranch` (this completion
+  * is a real control-transfer branch worth learning). The ROB records these per-entry
+  * at completion and drives the BTB write port at retire (no wrong-path pollution). */
 case class BranchCompletion() extends Bundle {
   val robId      = UInt(6 bits)
   val mispredict = Bool()
   val nextPc     = UInt(32 bits)
+  // ── BTB-update fields ──
+  val isBranch   = Bool()         // a real predictable branch (Bcc/BRA/BSR/JMP/JSR/DBcc)
+  val btbPc      = UInt(32 bits)  // the branch instruction's PC (BTB index/tag source)
+  val btbTaken   = Bool()         // resolved taken (the bimodal counter direction)
+  val btbTarget  = UInt(32 bits)  // resolved taken-target (the learned BTB target)
+  val brType     = UInt(2 bits)   // 0=cond (Bcc/DBcc), 1=uncond (BRA/BSR/JMP/JSR)
 }
 
 /** Execute-time conditional fault completion (generalized from the original TRAPV-
@@ -154,14 +164,52 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     // use the assembler-computed u1.nextPc (also correct for a not-taken Bcc.w).
     val nextPc    = Mux(redirect, target, u1.nextPc)
 
+    // ---- S1: branch prediction verification (BTB + bimodal, slice 1) ────────────
+    // `redirect` is the ACTUAL taken/redirect condition (the old "mispredict" meaning).
+    // With the fetch-time predictor, the branch EU now VERIFIES the prediction:
+    //   actualTaken  = redirect (the existing taken/redirect condition)
+    //   actualTarget = target (the existing PC-relative / indirect target)
+    //   mispredict   = (predTaken != actualTaken) || (actualTaken && actualTarget != predTarget)
+    // A correctly-predicted branch (predTaken==actualTaken && target matches) does NOT
+    // mispredict -> NO commit-time flush -> the speculatively-fetched correct path
+    // retires (the win). predTaken defaults False everywhere until the fetch redirect is
+    // live, so this reduces to `mispredict == actualTaken` (== today's behavior).
+    // isCondTrap (TRAPV/TRAPcc) never redirects (redirect is forced False above) and is
+    // never predicted (predTaken False) -> mispredict stays False, as before.
+    val actualTaken  = redirect
+    val actualTarget = target
+    val mispredict   = (u1.predTaken =/= actualTaken) ||
+                       (actualTaken && (actualTarget =/= u1.predTarget))
+
+    // ── BTB-update classification (which branches the BTB learns) ────────────────
+    // In scope (slice 1): Bcc/BRA/BSR (relative) + JMP/JSR (ibranch, anInc==0). OUT:
+    //  - Scc (not a control transfer) and isCondTrap (TRAPV/TRAPcc, a fault) — never learned.
+    //  - RTS/RTR returns (ibranch with anInc != 0) — a last-target BTB is a poor return
+    //    predictor; the return-address stack is slice 2. Excluded here so the BTB never
+    //    learns a return and mis-predicts the next call site.
+    val isReturn   = u1.ibranch && (u1.anInc =/= U(0, 3 bits))
+    val isBtbBranch = s1Valid && !u1.isScc && !u1.isCondTrap && !isReturn &&
+                      (u1.ibranch || u1.isBranch)
+    // brType: uncond (1) = ibranch (JMP/JSR) OR an always-taken relative branch
+    // (cond==0: BRA/BSR). cond (0) = Bcc (cond>=2) / DBcc. Used to force-take an
+    // unconditional on a fresh BTB install + for stats.
+    val isUncond = u1.ibranch || (!u1.isDbcc && (u1.cond.asUInt === U(0, 4 bits)))
+    val brType   = Mux(isUncond, U(1, 2 bits), U(0, 2 bits))
+
     // ---- S1: completion (entry completes either way so it can retire) ----
-    // isCondTrap (TRAPV/TRAPcc): redirect is suppressed by the `|| u1.isCondTrap` gate
-    // above, so mispredict stays False and nextPc = the instruction's nextPc regardless
-    // of `taken`. A taken cond-trap raises trapvFault (below); not-taken retires as no-op.
     completionPort.valid              := s1Valid
     completionPort.payload.robId      := s1Ctx.robId
-    completionPort.payload.mispredict := s1Valid && redirect
+    completionPort.payload.mispredict := s1Valid && mispredict
     completionPort.payload.nextPc     := nextPc
+    // BTB-update payload: the branch's PC + resolved taken/target + brType. The ROB
+    // records these per-entry and drives the BTB write port at retire (no wrong-path
+    // pollution). btbTarget is the ACTUAL resolved target (learned even on a not-taken
+    // resolve, so a later taken hit predicts the right place).
+    completionPort.payload.isBranch  := isBtbBranch
+    completionPort.payload.btbPc     := u1.pc
+    completionPort.payload.btbTaken  := actualTaken
+    completionPort.payload.btbTarget := target
+    completionPort.payload.brType    := brType
 
     // ---- S1: branch-EU int write (RTS/RTR postinc A7, OR Scc/DBcc Dn write) ----
     // Three mutually-exclusive int-write sources, all to the renamed pdst:

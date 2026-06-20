@@ -52,6 +52,7 @@ class ChkSpec extends AnyFunSuite {
       uop.divSigned := False; uop.div64 := False; uop.divIsRem := False
       uop.isChk2 := False
       uop.firstOfInstr := True
+      uop.predTaken := False; uop.predTarget := 0
       uop.pc := 0x2000; uop.nextPc := 0x2002
       ctx.robId := iRobId
       eu.issue.valid := iValid; eu.issue.payload := ctx

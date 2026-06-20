@@ -123,6 +123,12 @@ case class RenamedUop() extends Bundle {
   val sysOp        = Bool()
   val sysKind      = m68k040.decode.SysKind()
   val sysReadDir   = Bool()
+  // Fetch-time branch prediction (BTB + bimodal, slice 1): predTaken/predTarget ride
+  // from decode -> here -> IqContext -> branch EU `u1`. The branch EU computes
+  // mispredict = (predTaken != actualTaken) || (actualTaken && actualTarget != predTarget).
+  // Non-branch / not-predicted µops carry predTaken=False. Threaded from decode.
+  val predTaken    = Bool()
+  val predTarget   = UInt(32 bits)
   val dstArch = UInt(5 bits)   // architectural int dst reg 0..17 (incl T0/T1); for commit RAT + CommitTrace
   val psrcA = UInt(intW bits); val psrcAValid = Bool()
   val psrcB = UInt(intW bits); val psrcBValid = Bool()
