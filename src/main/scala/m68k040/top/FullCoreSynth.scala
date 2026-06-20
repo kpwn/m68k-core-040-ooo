@@ -5,7 +5,7 @@ import m68k040.M68kSpinalConfig
 import m68k040.core.{M68kCore, ParamPlugin}
 import m68k040.cache.{IcachePlugin, DcachePlugin}
 import m68k040.mmu.{ItlbPlugin, DtlbPlugin, MmuControlPlugin}
-import m68k040.frontend.FetchAlignPlugin
+import m68k040.frontend.{FetchAlignPlugin, BtbPlugin}
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
 import m68k040.dispatch.DispatchPlugin
@@ -51,6 +51,21 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
     faRedir.valid   := doFlush
     faRedir.payload := flushPc
+
+    // ── Fetch-time BTB wiring (slice 1) ──────────────────────────────────────────
+    // Read port: query the BTB with the fetch window PC when a fetch is issued. The
+    // registered lookup result drives FetchAlign's predictRedirect (Step 3). Update
+    // port: consumed by the BtbPlugin from the ROB's BtbUpdateService (retire). The
+    // BTB invalidates on the SAME signal that clears the I-cache.
+    val fa  = host[FetchAlignPlugin]
+    val btb = host[BtbPlugin]
+    btb.logic.queryPc       := fa.logic.fetchPc
+    btb.logic.queryValid    := host[m68k040.services.FetchService].cmd.fire
+    btb.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+    // Feed the registered BTB prediction into FetchAlign's predict-redirect input.
+    fa.logic.predict.valid       := btb.logic.predValid
+    fa.logic.predict.payload.target   := btb.logic.predTarget
+    fa.logic.predict.payload.branchPc := btb.logic.predBranchPc
     // STOP-halt: while the ROB is in the `stopped` state, quiesce the front-end (hold
     // fetch + feed at the STOP successor PC). The IRQ-entry vector redirect clears it.
     host[FetchAlignPlugin].logic.quiesce := rob.logic.stopped
@@ -259,6 +274,7 @@ object GenFullCoreSynthVerilog {
           new DtlbPlugin(),
           new IcachePlugin(),
           new DcachePlugin(),
+          new BtbPlugin(),
           new FetchAlignPlugin(),
           new DecodeStage(),
           new RenameStage(),

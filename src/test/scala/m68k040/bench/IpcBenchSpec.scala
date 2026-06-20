@@ -4,7 +4,7 @@ import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
 import m68k040.mmu.{ItlbPlugin, DtlbPlugin, MmuControlPlugin}
 import m68k040.cache.{IcachePlugin, DcachePlugin, DcacheService}
-import m68k040.frontend.FetchAlignPlugin
+import m68k040.frontend.{FetchAlignPlugin, BtbPlugin}
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
 import m68k040.rob.RobPlugin
@@ -135,6 +135,17 @@ class IpcBenchSpec extends AnyFunSuite {
       faRedir.valid   := doFlush
       faRedir.payload := flushPc
 
+      // Fetch-time BTB wiring (slice 1): read off the fetch PC, invalidate off the
+      // I-cache, feed the registered prediction into FetchAlign's predict input.
+      val fa  = host[FetchAlignPlugin]
+      val btb = host[m68k040.frontend.BtbPlugin]
+      btb.logic.queryPc       := fa.logic.fetchPc
+      btb.logic.queryValid    := host[m68k040.services.FetchService].cmd.fire
+      btb.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+      fa.logic.predict.valid            := btb.logic.predValid
+      fa.logic.predict.payload.target   := btb.logic.predTarget
+      fa.logic.predict.payload.branchPc := btb.logic.predBranchPc
+
       val dc    = host[DcacheService]
       val xlate = host[DTranslationService]
       val exc   = rob.logic.exc
@@ -173,6 +184,7 @@ class IpcBenchSpec extends AnyFunSuite {
     val dtlb   = new DtlbPlugin
     val icache = new IcachePlugin
     val dcache = new DcachePlugin
+    val btb    = new BtbPlugin
     val fa     = new FetchAlignPlugin
     val dec    = new DecodeStage
     val ren    = new RenameStage
@@ -194,7 +206,7 @@ class IpcBenchSpec extends AnyFunSuite {
       intCtrl,
       itlb,
       dtlb,
-      icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
+      icache, dcache, btb, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
       rfInt, rfNzvc, rfX, wire)) }
   }
 

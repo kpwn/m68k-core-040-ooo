@@ -59,6 +59,19 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val quiesce = Bool()
     quiesce.allowOverride; quiesce := False
 
+    // ── Fetch-time BTB prediction input (slice 1) ────────────────────────────────
+    // The BtbPlugin drives this REGISTERED prediction (a fetch-window hit predicted
+    // taken): `target` = the predicted target, `branchPc` = the predicted branch's PC
+    // (so the aligner can attribute the prediction to the right word + suppress the
+    // post-branch words). Directionless, idle-defaulted with concrete zeros so a
+    // standalone DUT elaborates; the wiring layer / BtbPlugin overrides it. The
+    // predict->fetch redirect (predictRedirect, below) is wired in Step 3; in Step 2
+    // this is declared + absorbed (predictor not yet driving fetch).
+    val predict = Flow(PredictRedirect())
+    predict.valid.allowOverride;            predict.valid := False
+    predict.payload.target.allowOverride;   predict.payload.target := U(0, 32 bits)
+    predict.payload.branchPc.allowOverride; predict.payload.branchPc := U(0, 32 bits)
+
     // ---- State registers ----
     val decodePc      = Reg(UInt(32 bits)) init 0
     val fetchPc       = Reg(UInt(32 bits)) init 0   // 8-aligned

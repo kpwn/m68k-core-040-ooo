@@ -19,4 +19,5 @@ object Global {
   val L1I_KB          = Database.blocking[Int]()
   val L1I_WAYS        = Database.blocking[Int]()
   val L1I_LINE_BYTES  = Database.blocking[Int]()
+  val BTB_ENTRIES     = Database.blocking[Int]()
 }

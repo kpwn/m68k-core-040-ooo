@@ -174,6 +174,17 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       faRedir.valid   := doFlush
       faRedir.payload := flushPc
 
+      // Fetch-time BTB wiring (slice 1): read off the fetch PC, invalidate off the
+      // I-cache, feed the registered prediction into FetchAlign's predict input.
+      val faBtb = host[FetchAlignPlugin]
+      val btb   = host[m68k040.frontend.BtbPlugin]
+      btb.logic.queryPc       := faBtb.logic.fetchPc
+      btb.logic.queryValid    := host[m68k040.services.FetchService].cmd.fire
+      btb.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+      faBtb.logic.predict.valid            := btb.logic.predValid
+      faBtb.logic.predict.payload.target   := btb.logic.predTarget
+      faBtb.logic.predict.payload.branchPc := btb.logic.predBranchPc
+
       // ── Exception D-cache MUX (the LS EU arbitrates: it owns the cache ports, so
       // the exception unit's requests are routed THROUGH the LS EU's mux — see
       // LsEuPlugin.excActive/excLoad*/excStore*/excXlate*). The exc reads the cache
@@ -233,6 +244,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val dtlb   = new DtlbPlugin
     val icache = new IcachePlugin
     val dcache = new DcachePlugin
+    val btb    = new m68k040.frontend.BtbPlugin
     val fa     = new FetchAlignPlugin
     val dec    = new DecodeStage
     val ren    = new RenameStage
@@ -254,7 +266,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       intCtrl,
       itlb,
       dtlb,
-      icache, dcache, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
+      icache, dcache, btb, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
       rfInt, rfNzvc, rfX, wire)) }
   }
 

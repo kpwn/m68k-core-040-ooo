@@ -20,7 +20,7 @@ case class M68kParams(
     l1iLineBytes: Int = 64,
     l1dKb:        Int = 16,
     l2Kb:         Int = 1024,
-    btbEntries:   Int = 256,
+    btbEntries:   Int = 128,
     gshareHistory:Int = 16,
     gshareEntries:Int = 2048,
     tlbWays:      Int = 4,
