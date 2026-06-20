@@ -70,6 +70,16 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     fa.logic.btbPredTarget0 := btb.logic.predTargetComb
     fa.logic.btbPredTaken1  := btb.logic.predTaken2Comb
     fa.logic.btbPredTarget1 := btb.logic.predTarget2Comb
+    // RAS (slice 2): FetchAlign drives the push (call retPC) + pop (predicted return);
+    // the RAS returns its combinational top-of-stack predict. Invalidate on the same
+    // I-cache flush that clears the BTB.
+    val ras = host[m68k040.frontend.RasPlugin]
+    ras.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+    ras.logic.pushValid     := fa.logic.rasPushValid
+    ras.logic.pushRetPc     := fa.logic.rasPushRetPc
+    ras.logic.popValid      := fa.logic.rasPopValid
+    fa.logic.rasPredValid   := ras.logic.predValid
+    fa.logic.rasPredTarget  := ras.logic.predTarget
     // STOP-halt: while the ROB is in the `stopped` state, quiesce the front-end (hold
     // fetch + feed at the STOP successor PC). The IRQ-entry vector redirect clears it.
     host[FetchAlignPlugin].logic.quiesce := rob.logic.stopped
@@ -279,6 +289,7 @@ object GenFullCoreSynthVerilog {
           new IcachePlugin(),
           new DcachePlugin(),
           new BtbPlugin(),
+          new m68k040.frontend.RasPlugin(),
           new FetchAlignPlugin(),
           new DecodeStage(),
           new RenameStage(),

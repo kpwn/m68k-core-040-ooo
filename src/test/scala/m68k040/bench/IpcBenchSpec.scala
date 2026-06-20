@@ -148,6 +148,14 @@ class IpcBenchSpec extends AnyFunSuite {
       fa.logic.btbPredTarget0 := btb.logic.predTargetComb
       fa.logic.btbPredTaken1  := btb.logic.predTaken2Comb
       fa.logic.btbPredTarget1 := btb.logic.predTarget2Comb
+      // RAS (slice 2): drive push/pop, read the combinational predict.
+      val rasP = host[m68k040.frontend.RasPlugin]
+      rasP.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+      rasP.logic.pushValid     := fa.logic.rasPushValid
+      rasP.logic.pushRetPc     := fa.logic.rasPushRetPc
+      rasP.logic.popValid      := fa.logic.rasPopValid
+      fa.logic.rasPredValid    := rasP.logic.predValid
+      fa.logic.rasPredTarget   := rasP.logic.predTarget
 
       val dc    = host[DcacheService]
       val xlate = host[DTranslationService]
@@ -188,6 +196,7 @@ class IpcBenchSpec extends AnyFunSuite {
     val icache = new IcachePlugin
     val dcache = new DcachePlugin
     val btb    = new BtbPlugin
+    val ras    = new m68k040.frontend.RasPlugin
     val fa     = new FetchAlignPlugin
     val dec    = new DecodeStage
     val ren    = new RenameStage
@@ -209,7 +218,7 @@ class IpcBenchSpec extends AnyFunSuite {
       intCtrl,
       itlb,
       dtlb,
-      icache, dcache, btb, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
+      icache, dcache, btb, ras, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
       rfInt, rfNzvc, rfX, wire)) }
   }
 

@@ -21,6 +21,7 @@ case class M68kParams(
     l1dKb:        Int = 16,
     l2Kb:         Int = 1024,
     btbEntries:   Int = 128,
+    rasEntries:   Int = 16,
     gshareHistory:Int = 16,
     gshareEntries:Int = 2048,
     tlbWays:      Int = 4,

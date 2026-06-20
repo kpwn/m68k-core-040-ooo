@@ -187,6 +187,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       faBtb.logic.btbPredTarget0 := btb.logic.predTargetComb
       faBtb.logic.btbPredTaken1  := btb.logic.predTaken2Comb
       faBtb.logic.btbPredTarget1 := btb.logic.predTarget2Comb
+      // RAS (slice 2): drive push/pop, read the combinational predict.
+      val ras   = host[m68k040.frontend.RasPlugin]
+      ras.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+      ras.logic.pushValid     := faBtb.logic.rasPushValid
+      ras.logic.pushRetPc     := faBtb.logic.rasPushRetPc
+      ras.logic.popValid      := faBtb.logic.rasPopValid
+      faBtb.logic.rasPredValid  := ras.logic.predValid
+      faBtb.logic.rasPredTarget := ras.logic.predTarget
 
       // ── Exception D-cache MUX (the LS EU arbitrates: it owns the cache ports, so
       // the exception unit's requests are routed THROUGH the LS EU's mux — see
@@ -248,6 +256,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val icache = new IcachePlugin
     val dcache = new DcachePlugin
     val btb    = new m68k040.frontend.BtbPlugin
+    val ras    = new m68k040.frontend.RasPlugin
     val fa     = new FetchAlignPlugin
     val dec    = new DecodeStage
     val ren    = new RenameStage
@@ -269,7 +278,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       intCtrl,
       itlb,
       dtlb,
-      icache, dcache, btb, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
+      icache, dcache, btb, ras, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
       rfInt, rfNzvc, rfX, wire)) }
   }
 

@@ -77,6 +77,22 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     btbPredTaken1.allowOverride;  btbPredTaken1  := False
     btbPredTarget1.allowOverride; btbPredTarget1 := U(0, 32 bits)
 
+    // ── Fetch-time RAS interface (return-address stack, slice 2) ─────────────────
+    // FetchAlign DRIVES the push (call retPC) + pop (predicted return) and READS the
+    // combinational predict (top-of-stack, valid iff non-empty). Directionless plain
+    // wires (the BtbPlugin convention): the wiring layer connects push/pop OUT to the
+    // RasPlugin and the predict inputs back. Concrete idle defaults so FetchAlign
+    // elaborates standalone (RAS inert: no predict -> rasPredValid reads False).
+    //   rasPushValid/rasPushRetPc, rasPopValid : DRIVEN here (the emitted call/return).
+    //   rasPredValid/rasPredTarget : INPUT (the RAS's combinational top-of-stack).
+    // Push/pop are OUTPUTS always driven by FetchAlign below (no idle default — they
+    // are assigned exactly once, like the btbQueryPc* ports).
+    val rasPushValid = Bool(); val rasPushRetPc = UInt(32 bits)
+    val rasPopValid  = Bool()
+    val rasPredValid = Bool(); val rasPredTarget = UInt(32 bits)
+    rasPredValid.allowOverride;  rasPredValid  := False
+    rasPredTarget.allowOverride; rasPredTarget := U(0, 32 bits)
+
     // ---- State registers ----
     val decodePc      = Reg(UInt(32 bits)) init 0
     val fetchPc       = Reg(UInt(32 bits)) init 0   // 8-aligned
@@ -225,6 +241,24 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val predictedThisEmit = slot0IsPred
     val predTargetSel = btbPredTarget0
 
+    // ── RAS classification of the EMITTED slot0 (slice 2) ────────────────────────
+    // isCall / isReturn are recomputed from the emitted slot0 opword (already in the
+    // aligner slot) — the same classification the assembler uses to crack BSR/JSR/
+    // RTS/RTR. (ChunkPredecode carries only simple/lenWords, so deriving the call/
+    // return bit locally from the opword is the minimal threading; the opword is right
+    // here.) BSR = 0x61xx; JSR = 0100111010 mmmrrr; RTS = 0x4E75; RTR = 0x4E77.
+    val s0op       = res.slot0.words(0)
+    val s0IsBsr    = s0op(15 downto 8) === B"8'h61"
+    val s0IsJsr    = s0op(15 downto 6) === B"10'b0100111010"
+    val s0IsRts    = s0op === B"16'h4E75"
+    val s0IsRtr    = s0op === B"16'h4E77"
+    val s0IsCall   = res.slot0Valid && res.slot0.simple && (s0IsBsr || s0IsJsr)
+    val s0IsReturn = res.slot0Valid && res.slot0.simple && (s0IsRts || s0IsRtr)
+    // Return PC = the call's fall-through (slotPc + lenWords*2), from predecode.
+    val s0RetPc    = res.slot0.pc + (res.slot0.lenWords.resize(32) |<< 1)
+    // RAS predict for slot0 (a return with a non-empty stack predicts top-of-stack).
+    val rasPredictSlot0 = s0IsReturn && rasPredValid
+
     // ---- Feed valid logic ----
     // Emit when a packet is at head and not stalled. Complex packets emit once:
     // the cycle after they fire, the stalled latch suppresses re-emission.
@@ -288,6 +322,17 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
         stalled := True
       }
     }
+
+    // ── RAS push/pop bookkeeping (slice 2) ───────────────────────────────────────
+    // On the cycle the emitted slot0 fires (NOT a faulted packet): a call pushes its
+    // return PC; a (predicted) return pops. push XOR pop (a call XOR a return). The
+    // pop only fires when the RAS predicted (count>0); an empty-RAS return does not
+    // pop (it stays unpredicted, exactly as today). Bookkeeping is behavior-neutral
+    // while the predict is INERT (step 1) — the EU-verified architectural result is
+    // unchanged; only the speculative redirect (step 2) makes returns faster.
+    rasPushValid := feed.fire && !faultHold && s0IsCall
+    rasPushRetPc := s0RetPc
+    rasPopValid  := feed.fire && !faultHold && rasPredictSlot0
 
     // ── predict redirect (BTB hit, slice 1) — BELOW commit/external/resume ────────
     // When a predicted-taken branch was emitted this cycle (feed.fire), redirect fetch
