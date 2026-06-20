@@ -555,8 +555,35 @@ class IpcBenchSpec extends AnyFunSuite {
     Kernel("mixed", src, setup.size + reps * lines.size * 8)
   }
 
+  // 6. call/return: a loop that CALLS a leaf subroutine each iteration. The leaf's
+  //    `rts` is the kernel the RAS (slice 2) targets: without return prediction every
+  //    rts pays the ~5-6cyc commit-time squash; with the RAS warm the return target is
+  //    predicted (top-of-stack) -> ~zero squash. The loop back-edge (bne) is BTB-
+  //    predicted (slice 1). Per iter: bsr leaf ; subq #1,%d7 ; bne .Lcr (3 macros in the
+  //    loop) + the leaf's 2 macros (add + rts) = 5 macros/iter. The first iteration
+  //    warms the RAS/BTB; thereafter the call+return is fully predicted.
+  def kCallReturn: Kernel = {
+    val iters = 100
+    val setup = Seq("moveq #100,%d7", "moveq #0,%d0", "moveq #1,%d1",
+                    "moveq #0,%d2", "moveq #0,%d3")
+    // The loop body: call the leaf, then several INDEPENDENT ALU ops in the caller (so
+    // a correctly-predicted return lets these post-return instructions be fetched +
+    // issued WITHOUT waiting for the rts load to resolve — the squash a mispredicted
+    // return would cause is exactly what the RAS removes), then the decrement + back-edge.
+    // The leaf does one add + rts (a balanced call/return). Per iter:
+    //   bsr leaf ; add d1,d2 ; add d1,d3 ; sub d1,d2 ; subq #1,d7 ; bne ; leaf-add ; rts
+    //   = 8 macros/iter.
+    val loop  = ".Lcr: bsr leaf ; add.l %d1,%d2 ; add.l %d1,%d3 ; sub.l %d1,%d2 ; " +
+                "subq.l #1,%d7 ; bne.s .Lcr"
+    val tail  = "moveq #9,%d6 ; .Lend: bra.s .Lend ; leaf: add.l %d1,%d0 ; rts"
+    val src = (setup.mkString(" ; ")) + " ; " + loop + " ; " + tail
+    // Retired macros: setup(5) + per-iter [bsr, add, add, sub, subq, bne, leaf-add,
+    //   leaf-rts] = 8 * iters.
+    Kernel("call-return", src, setup.size + iters * 8)
+  }
+
   test("IPC microbenchmark suite", VerilatorTest) {
-    val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kBranchy, kHotLoop, kMixed)
+    val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kBranchy, kHotLoop, kMixed, kCallReturn)
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))

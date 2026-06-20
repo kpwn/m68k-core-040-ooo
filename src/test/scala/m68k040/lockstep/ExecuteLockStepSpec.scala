@@ -2483,6 +2483,40 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 8)
   }
 
+  test("lock-step: deep-nested call (3 levels, LIFO unwind) — RAS depth", VerilatorTest) {
+    // main calls a; a calls b; b calls c; each returns -> the RAS pushes 3 retPCs and
+    // pops them in LIFO order (c->b->a->main). With RAS prediction live every return is
+    // predicted; the architectural result must stay byte-identical vs Musashi.
+    // Flow to sentinel: moveq#1, bsr a, moveq#2, bsr b, moveq#3, bsr c, moveq#4,
+    //   rts(c->b), moveq#5, rts(b->a), moveq#6, rts(a->main) = 12.
+    runLockStep("bsr-deep-nested",
+      "moveq #1,%d0 ; bsr a ; .stop: bra .stop ; " +
+      "a: moveq #2,%d1 ; bsr b ; moveq #5,%d4 ; rts ; " +
+      "b: moveq #3,%d2 ; bsr c ; moveq #4,%d3 ; rts ; " +
+      "c: moveq #6,%d5 ; rts",
+      nInstr = 12)
+  }
+
+  test("lock-step: call/return with an interleaved mispredict — RAS corrupt-recovery", VerilatorTest) {
+    // A loop body CALLS a leaf subroutine and also contains a data-dependent Bcc whose
+    // direction the bimodal BTB will mispredict at least once (the loop's back-edge DBcc
+    // flips direction on the final iteration; the leaf's rts is RAS-predicted). On the
+    // mispredicting cycle the front-end speculatively walks the WRONG path — which may
+    // push/pop the RAS for a wrong-path call/return, corrupting the speculative sp. The
+    // EU verifies the REAL return target (loaded from the stack), so the commit-time
+    // redirect recovers; the ARCHITECTURAL result must still match Musashi byte-for-byte
+    // (proving EU-verify recovers a corrupt RAS — the spec's recovery=accept-corruption).
+    //   d7 = 3 loop count; each iter: bsr leaf (push+pop RAS), subq#1,d7, bne back.
+    //   leaf: addq#1,d0 ; rts.
+    // The bne is taken twice then NOT-taken once -> a guaranteed mispredict on the exit.
+    runLockStep("bsr-loop-mispredict",
+      "moveq #3,%d7 ; moveq #0,%d0 ; " +
+      "back: bsr leaf ; subq #1,%d7 ; bne back ; " +
+      "moveq #9,%d6 ; .stop: bra .stop ; " +
+      "leaf: addq #1,%d0 ; rts",
+      nInstr = 18)
+  }
+
   // ── JSR (call via the EA address) ──────────────────────────────────────────
   test("lock-step: jsr (An) ... rts", VerilatorTest) {
     // A0 = sub; jsr (A0) pushes retPC + jumps to sub; sub does moveq#3 + rts.

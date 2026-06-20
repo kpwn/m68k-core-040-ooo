@@ -238,8 +238,6 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // the (correct, single-slot) slot0 prediction path. Costs one dual-issue slot on the
     // predicted branch but reuses the proven slot0 redirect and keeps recovery simple.
     val slot1WouldPred = btbPredTaken1 && res.slot1Valid && res.slot0Valid && !slot0IsPred
-    val predictedThisEmit = slot0IsPred
-    val predTargetSel = btbPredTarget0
 
     // ── RAS classification of the EMITTED slot0 (slice 2) ────────────────────────
     // isCall / isReturn are recomputed from the emitted slot0 opword (already in the
@@ -259,6 +257,29 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // RAS predict for slot0 (a return with a non-empty stack predicts top-of-stack).
     val rasPredictSlot0 = s0IsReturn && rasPredValid
 
+    // A RETURN in slot1 (slot0 not predicted): defer it — suppress slot1 so the return
+    // becomes slot0 NEXT cycle and takes the (single-slot) slot0 RAS-predict path. This
+    // mirrors slot1WouldPred (the BTB slot1-branch deferral) and is essential: a leaf
+    // `add ; rts` emits add=slot0 + rts=slot1 in one cycle, so without deferral the rts
+    // never reaches the slot0 RAS-predict and every return mispredicts (the flush the
+    // RAS is meant to remove). The opword classification only needs slot1's opword.
+    val s1op       = res.slot1.words(0)
+    val s1IsRts    = s1op === B"16'h4E75"
+    val s1IsRtr    = s1op === B"16'h4E77"
+    val s1IsReturn = res.slot1Valid && res.slot1.simple && (s1IsRts || s1IsRtr)
+    val slot1WouldRasPred = s1IsReturn && rasPredValid && res.slot0Valid && !slot0IsPred && !rasPredictSlot0
+
+    // ── Compose the slot0 prediction source: isReturn ? RAS : BTB (slice 2) ───────
+    // A return is predicted by the RAS (top-of-stack); everything else by the BTB
+    // (slice 1). Returns + BTB hits are mutually exclusive (slice 1 never learns a
+    // return), so this is a clean either/or. The composed predicted-taken + target
+    // drive the SAME slice-1 machinery: slot1 suppression, predTaken/predTarget
+    // stamping, the effShift consume, and predictFire/redirect — so a RAS-predicted
+    // return is a predicted-taken redirect identical to a BTB taken branch.
+    val slot0Predicted    = slot0IsPred || rasPredictSlot0
+    val predictedThisEmit = slot0Predicted
+    val predTargetSel     = Mux(rasPredictSlot0, rasPredTarget, btbPredTarget0)
+
     // ---- Feed valid logic ----
     // Emit when a packet is at head and not stalled. Complex packets emit once:
     // the cycle after they fire, the stalled latch suppresses re-emission.
@@ -266,14 +287,16 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     feed.payload(1) := res.slot1
     slot1ValidOut   := res.slot1Valid
     // Suppress slot1 when slot0 is the predicted-taken branch (slot1 is wrong-path) OR
-    // when slot1 WOULD be a predicted branch (defer it to slot0 next cycle).
-    when(slot0IsPred || slot1WouldPred) {
+    // when slot1 WOULD be a predicted branch (defer it to slot0 next cycle). slot0Predicted
+    // folds in a RAS-predicted return (slice 2): its slot1 is equally wrong-path.
+    when(slot0Predicted || slot1WouldPred || slot1WouldRasPred) {
       slot1ValidOut := False
     }
-    // Stamp the prediction onto slot0 (rides to the EU).
-    when(slot0IsPred) {
+    // Stamp the prediction onto slot0 (rides to the EU). The target is the composed
+    // source (RAS top-of-stack for a return, BTB target otherwise).
+    when(slot0Predicted) {
       feed.payload(0).predTaken  := True
-      feed.payload(0).predTarget := btbPredTarget0
+      feed.payload(0).predTarget := predTargetSel
     }
     // Gate feed low while STOP-quiesced so no buffered successor word is dispatched /
     // allocated into the ROB while halted (the quiesce only ends on the wake redirect).
@@ -312,7 +335,7 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // branch deferred to next cycle), consume only slot0's words (lenWords); else the
     // aligner's full shift. Without this, suppressing slot1 would still CONSUME its
     // words from the IBuf — losing the deferred branch / the wrong-path successor.
-    val suppressSlot1 = slot0IsPred || slot1WouldPred
+    val suppressSlot1 = slot0Predicted || slot1WouldPred || slot1WouldRasPred
     val effShift = Mux(suppressSlot1, res.slot0.lenWords.resize(res.shiftWords.getWidth), res.shiftWords)
     when(feed.fire && !faultHold) {
       ibuf.io.shift := effShift
@@ -327,9 +350,11 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // On the cycle the emitted slot0 fires (NOT a faulted packet): a call pushes its
     // return PC; a (predicted) return pops. push XOR pop (a call XOR a return). The
     // pop only fires when the RAS predicted (count>0); an empty-RAS return does not
-    // pop (it stays unpredicted, exactly as today). Bookkeeping is behavior-neutral
-    // while the predict is INERT (step 1) — the EU-verified architectural result is
-    // unchanged; only the speculative redirect (step 2) makes returns faster.
+    // pop (it stays unpredicted, exactly as today). A predicted return ALSO drives the
+    // fetch redirect (predictFire below), so it is folded into redirectThisCycle — a
+    // same-cycle in-flight fetch is born stale (the slice-1 staleness-bug class). The
+    // EU always verifies the real return target, so a wrong RAS guess recovers via the
+    // existing commit-time redirect (a corrupt RAS is only a perf loss).
     rasPushValid := feed.fire && !faultHold && s0IsCall
     rasPushRetPc := s0RetPc
     rasPopValid  := feed.fire && !faultHold && rasPredictSlot0
