@@ -21,4 +21,6 @@ object Global {
   val L1I_LINE_BYTES  = Database.blocking[Int]()
   val BTB_ENTRIES     = Database.blocking[Int]()
   val RAS_ENTRIES     = Database.blocking[Int]()
+  val GHR_BITS        = Database.blocking[Int]()
+  val PHT_ENTRIES     = Database.blocking[Int]()
 }

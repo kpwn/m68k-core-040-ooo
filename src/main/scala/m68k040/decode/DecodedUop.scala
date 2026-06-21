@@ -357,4 +357,10 @@ case class DecodedUop() extends Bundle {
   //   DecodeStage choke point STAMPS the real fetch-time values onto a packet's µops.
   val predTaken    = Bool()
   val predTarget   = UInt(32 bits)
+  // ── gshare direction-predictor carry-down (slice 3) ─────────────────────────
+  // phtValid : a CONDITIONAL gshare-predicted branch carrying its fetch-time 11-bit
+  //   folded-XOR `phtIndex` to retire (the ROB trains pht[phtIndex] := saturate±1
+  //   (actualTaken)). Non-conditional / not-gshare-predicted µops carry phtValid=False.
+  val phtValid     = Bool()
+  val phtIndex     = UInt(11 bits)
 }

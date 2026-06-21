@@ -1,6 +1,6 @@
 package m68k040.rob
 
-import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate}
+import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate, GshareUpdateService, GshareUpdate}
 import m68k040.rename.RenamedUop
 import m68k040.types.CommitTrace
 import spinal.core._
@@ -19,7 +19,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   *
   * retireAlone entries (branches, for now) retire 1-wide.
   */
-class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService {
+class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService {
 
   /** One ROB entry's commit/free + trace payload. */
   case class RobPayload() extends Bundle {
@@ -95,6 +95,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     branchCompletion.payload.btbTaken.allowOverride;   branchCompletion.payload.btbTaken := False
     branchCompletion.payload.btbTarget.allowOverride;  branchCompletion.payload.btbTarget := U(0, 32 bits)
     branchCompletion.payload.brType.allowOverride;     branchCompletion.payload.brType := U(0, 2 bits)
+    branchCompletion.payload.phtValid.allowOverride;   branchCompletion.payload.phtValid := False
+    branchCompletion.payload.phtIndex.allowOverride;   branchCompletion.payload.phtIndex := U(0, 11 bits)
     branchCompletion.simPublic()
 
     // ── Retire-time BTB update output (BtbUpdateService) ────────────────────────
@@ -108,6 +110,15 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     btbUpdateFlow.payload.target := U(0, 32 bits)
     btbUpdateFlow.payload.brType := U(0, 2 bits)
     btbUpdateFlow.simPublic()
+    // ── Retire-time gshare PHT update output (GshareUpdateService, slice 3) ──────
+    // Pulses the cycle a CONDITIONAL gshare-predicted branch retires (driven below near
+    // branchRedirect). Concrete idle defaults so a standalone DUT (no GsharePlugin
+    // consumer) elaborates; the GsharePlugin reads it in the full core. 11-bit index.
+    val gshareUpdateFlow = Flow(GshareUpdate(11))
+    gshareUpdateFlow.valid := False
+    gshareUpdateFlow.payload.index := U(0, 11 bits)
+    gshareUpdateFlow.payload.taken := False
+    gshareUpdateFlow.simPublic()
     // mispredictStore MUST default False: a freshly-allocated branch entry is "not
     // yet known mispredicted" until its EU completion (branchCompletion) says so.
     // Without this, `doFlushReg := ... && mispredictStore(h0)` reads a stale/uninit
@@ -125,6 +136,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val btbTakenStore    = Vec.fill(depth)(RegInit(False))
     val btbTargetStore   = Vec.fill(depth)(Reg(UInt(32 bits)))
     val btbTypeStore     = Vec.fill(depth)(Reg(UInt(2 bits)))
+    // ── gshare PHT-update per-entry capture (slice 3) ───────────────────────────
+    // phtValidStore : this retiring branch is a CONDITIONAL gshare-predicted one whose
+    // carried fetch-time index (phtIndexStore) must be trained at retire. RegInit(False)
+    // so a never-allocated / re-used-but-not-yet-completed entry never spuriously updates
+    // the PHT (mirrors btbIsBranchStore's alloc-priority discipline). The resolved
+    // direction reuses btbTakenStore (== actualTaken).
+    val phtValidStore    = Vec.fill(depth)(RegInit(False))
+    val phtIndexStore    = Vec.fill(depth)(Reg(UInt(11 bits)))
     // Precise-fault per-entry capture — RegInit Vecs reset per-alloc (mirrors
     // mispredictStore). RegInit(False) guarantees a never-allocated / re-allocated
     // entry reads "not faulted / not RTE" deterministically (no uninit-Mem flake).
@@ -418,6 +437,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       btbTakenStore(branchCompletion.payload.robId)    := branchCompletion.payload.btbTaken
       btbTargetStore(branchCompletion.payload.robId)   := branchCompletion.payload.btbTarget
       btbTypeStore(branchCompletion.payload.robId)     := branchCompletion.payload.brType
+      // gshare PHT-update capture (slice 3): the conditional-predicted bit + the carried
+      // fetch-time index (read at retire to train the exact PHT entry the lookup read).
+      phtValidStore(branchCompletion.payload.robId)    := branchCompletion.payload.phtValid
+      phtIndexStore(branchCompletion.payload.robId)    := branchCompletion.payload.phtIndex
     }
     // CCR-value completion: record each completing instruction's NZVC/X VALUES per
     // entry (BEFORE the alloc-reset so a re-used index's alloc wins). One port/EU.
@@ -472,6 +495,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       completes(tail)       := False
       mispredictStore(tail) := False
       btbIsBranchStore(tail) := False
+      phtValidStore(tail)   := False
       faultedStore(tail)  := allocUopVec(0).faulted
       isRteStore(tail)    := allocUopVec(0).isRte
       faultVecStore(tail) := allocUopVec(0).faultVector
@@ -496,6 +520,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       completes(tail + 1)       := False
       mispredictStore(tail + 1) := False
       btbIsBranchStore(tail + 1) := False
+      phtValidStore(tail + 1)   := False
       faultedStore(tail + 1)  := allocUopVec(1).faulted
       isRteStore(tail + 1)    := allocUopVec(1).isRte
       faultVecStore(tail + 1) := allocUopVec(1).faultVector
@@ -543,6 +568,17 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       btbUpdateFlow.payload.taken  := btbTakenStore(h0)
       btbUpdateFlow.payload.target := btbTargetStore(h0)
       btbUpdateFlow.payload.brType := btbTypeStore(h0)
+    }
+    // ── Retire-time gshare PHT update (slice 3) ─────────────────────────────────
+    // When a CONDITIONAL gshare-predicted branch retires at the head (retire0 — branches
+    // are retireAlone → always slot 0), train pht[carried-index] toward its RESOLVED
+    // direction (btbTakenStore == actualTaken). ONLY at retire ⇒ no wrong-path pollution.
+    // The carried fetch-time index (phtIndexStore) — not a retire-time recompute — is
+    // mandatory (the speculative GHR has shifted by retire).
+    when(retire0 && phtValidStore(h0)) {
+      gshareUpdateFlow.valid        := True
+      gshareUpdateFlow.payload.index := phtIndexStore(h0)
+      gshareUpdateFlow.payload.taken := btbTakenStore(h0)
     }
 
     // ── Precise-fault exception-pending (combinational at faulted retire) ───────
@@ -797,4 +833,5 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   override def flushPc = logic.flushPcReg
 
   override def btbUpdate = logic.btbUpdateFlow
+  override def gshareUpdate = logic.gshareUpdateFlow
 }

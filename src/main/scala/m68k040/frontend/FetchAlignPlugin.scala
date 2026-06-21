@@ -93,6 +93,35 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     rasPredValid.allowOverride;  rasPredValid  := False
     rasPredTarget.allowOverride; rasPredTarget := U(0, 32 bits)
 
+    // ── Fetch-time gshare interface (direction predictor, slice 3) ───────────────
+    // FetchAlign DRIVES the two per-instruction query PCs (same slot0/slot1 PCs as the
+    // BTB) + the GHR shift (shiftValid/shiftDir) on the emitted predicted conditional,
+    // and READS the combinational PHT direction (gsPhtTaken0/1) + the folded-XOR index
+    // (gsPhtIndex0/1) for the carry-down. Directionless plain wires (the BtbPlugin
+    // convention): the wiring layer connects query/shift OUT to the GsharePlugin and the
+    // predict inputs back. Concrete idle defaults so FetchAlign elaborates standalone
+    // (gshare inert: gsPhtTaken reads not-taken, gsPhtIndex 0).
+    //   btbQueryPc0/1 (above) double as the gshare query PCs (same aligner slot PCs).
+    //   gsBtbHit0/1, gsBtbType0/1 : the BTB hit + brType (INPUT, to form condBtbHit).
+    //   gsPhtTaken0/1 : the PHT direction for that PC (INPUT).
+    //   gsPhtIndex0/1 : the 11-bit folded-XOR index (INPUT, carried down).
+    //   gsShiftValid/gsShiftDir : the GHR shift (OUTPUT, driven below).
+    val gsBtbHit0   = Bool(); val gsBtbType0 = UInt(2 bits)
+    val gsBtbHit1   = Bool(); val gsBtbType1 = UInt(2 bits)
+    val gsPhtTaken0 = Bool(); val gsPhtIndex0 = UInt(11 bits)
+    val gsPhtTaken1 = Bool(); val gsPhtIndex1 = UInt(11 bits)
+    gsBtbHit0.allowOverride;   gsBtbHit0   := False
+    gsBtbType0.allowOverride;  gsBtbType0  := U(0, 2 bits)
+    gsBtbHit1.allowOverride;   gsBtbHit1   := False
+    gsBtbType1.allowOverride;  gsBtbType1  := U(0, 2 bits)
+    gsPhtTaken0.allowOverride; gsPhtTaken0 := False
+    gsPhtIndex0.allowOverride; gsPhtIndex0 := U(0, 11 bits)
+    gsPhtTaken1.allowOverride; gsPhtTaken1 := False
+    gsPhtIndex1.allowOverride; gsPhtIndex1 := U(0, 11 bits)
+    // GHR shift outputs (driven below on the emitted predicted conditional).
+    val gsShiftValid = Bool()
+    val gsShiftDir   = Bool()
+
     // ---- State registers ----
     val decodePc      = Reg(UInt(32 bits)) init 0
     val fetchPc       = Reg(UInt(32 bits)) init 0   // 8-aligned
@@ -231,13 +260,33 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     btbQueryValid0 := predEnable && res.slot0Valid
     btbQueryPc1    := res.slot1.pc
     btbQueryValid1 := predEnable && res.slot1Valid
+    // ── gshare direction composition (slice 3) ──────────────────────────────────
+    // gshare OVERRIDES the DIRECTION of a CONDITIONAL branch that hit the BTB. The BTB
+    // still supplies the target; the predicted-taken bit becomes phtTaken (NOT the BTB
+    // bimodal counter) for a `condBtbHit`. Unconditionals (brType==uncond) keep the BTB
+    // force-taken; misses stay not-taken. `cond` brType == 0.
+    val condBtbHit0 = gsBtbHit0 && (gsBtbType0 === U(0, 2 bits))
+    val condBtbHit1 = gsBtbHit1 && (gsBtbType1 === U(0, 2 bits))
+    // Per-slot predicted-taken: for a conditional BTB hit use the PHT direction; else the
+    // BTB's own predict-taken (unconditional force-taken, or a non-cond bimodal). In
+    // STEP 1 (gshare inert) gsBtbHit*=False -> condBtbHit*=False -> this reduces to the
+    // BTB predict-taken (behavior-neutral); STEP 2 wires gsBtbHit/gsPhtTaken live.
+    val slot0PredTaken = Mux(condBtbHit0, gsPhtTaken0, btbPredTaken0)
+    val slot1PredTaken = Mux(condBtbHit1, gsPhtTaken1, btbPredTaken1)
     // slot0 predicted-taken: stamp slot0 + suppress slot1 + redirect (the proven path).
-    val slot0IsPred = btbPredTaken0 && res.slot0Valid
+    val slot0IsPred = slot0PredTaken && res.slot0Valid
     // slot1 predicted-taken (and slot0 is NOT): SUPPRESS slot1 this cycle so ONLY slot0
     // emits; decodePc advances to the branch, which becomes slot0 NEXT cycle and takes
     // the (correct, single-slot) slot0 prediction path. Costs one dual-issue slot on the
     // predicted branch but reuses the proven slot0 redirect and keeps recovery simple.
-    val slot1WouldPred = btbPredTaken1 && res.slot1Valid && res.slot0Valid && !slot0IsPred
+    val slot1WouldPred = slot1PredTaken && res.slot1Valid && res.slot0Valid && !slot0IsPred
+    // A slot1 CONDITIONAL BTB hit that is predicted NOT-taken (so slot1WouldPred is False)
+    // would otherwise emit alongside slot0 — but then TWO conditionals would be consumed
+    // this cycle and the single-ported GHR could shift only once. DEFER it (suppress slot1
+    // -> it becomes slot0 next cycle with the correct GHR context), mirroring the
+    // slot1WouldPred deferral, so exactly ONE conditional is emitted per cycle and the GHR
+    // shifts exactly once. (Only matters when slot0 is not itself a predicted-taken branch.)
+    val slot1WouldGsCond = condBtbHit1 && res.slot1Valid && res.slot0Valid && !slot0IsPred && !slot1WouldPred
 
     // ── RAS classification of the EMITTED slot0 (slice 2) ────────────────────────
     // isCall / isReturn are recomputed from the emitted slot0 opword (already in the
@@ -289,7 +338,7 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // Suppress slot1 when slot0 is the predicted-taken branch (slot1 is wrong-path) OR
     // when slot1 WOULD be a predicted branch (defer it to slot0 next cycle). slot0Predicted
     // folds in a RAS-predicted return (slice 2): its slot1 is equally wrong-path.
-    when(slot0Predicted || slot1WouldPred || slot1WouldRasPred) {
+    when(slot0Predicted || slot1WouldPred || slot1WouldRasPred || slot1WouldGsCond) {
       slot1ValidOut := False
     }
     // Stamp the prediction onto slot0 (rides to the EU). The target is the composed
@@ -297,6 +346,17 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     when(slot0Predicted) {
       feed.payload(0).predTaken  := True
       feed.payload(0).predTarget := predTargetSel
+    }
+    // ── gshare carry-down stamp (slice 3) ───────────────────────────────────────
+    // When slot0 is a CONDITIONAL BTB hit (condBtbHit0), it is the emitted conditional
+    // whose DIRECTION came from the PHT — carry its fetch-time index down so the ROB
+    // trains pht[gsPhtIndex0] toward the resolved direction at retire (the GHR will have
+    // shifted by retire, so only the carried index is right). This is INDEPENDENT of the
+    // predicted direction: a predicted-NOT-taken conditional (slot0 not redirecting) is
+    // ALSO trained, so both directions of the alternating beq learn.
+    when(condBtbHit0 && res.slot0Valid) {
+      feed.payload(0).phtValid := True
+      feed.payload(0).phtIndex := gsPhtIndex0
     }
     // Gate feed low while STOP-quiesced so no buffered successor word is dispatched /
     // allocated into the ROB while halted (the quiesce only ends on the wake redirect).
@@ -320,10 +380,14 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       feed.payload(0).words.foreach(_ := 0)
       feed.payload(0).predTaken  := False
       feed.payload(0).predTarget := U(0, 32 bits)
+      feed.payload(0).phtValid   := False
+      feed.payload(0).phtIndex   := U(0, 11 bits)
       feed.payload(1).valid     := False
       feed.payload(1).fault     := False
       feed.payload(1).predTaken  := False
       feed.payload(1).predTarget := U(0, 32 bits)
+      feed.payload(1).phtValid   := False
+      feed.payload(1).phtIndex   := U(0, 11 bits)
     }
     // Emit-once: latch faultEmitted when the faulted packet fires.
     when(faultHold && feed.fire) { faultEmitted := True }
@@ -335,7 +399,7 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // branch deferred to next cycle), consume only slot0's words (lenWords); else the
     // aligner's full shift. Without this, suppressing slot1 would still CONSUME its
     // words from the IBuf — losing the deferred branch / the wrong-path successor.
-    val suppressSlot1 = slot0Predicted || slot1WouldPred || slot1WouldRasPred
+    val suppressSlot1 = slot0Predicted || slot1WouldPred || slot1WouldRasPred || slot1WouldGsCond
     val effShift = Mux(suppressSlot1, res.slot0.lenWords.resize(res.shiftWords.getWidth), res.shiftWords)
     when(feed.fire && !faultHold) {
       ibuf.io.shift := effShift
@@ -345,6 +409,17 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
         stalled := True
       }
     }
+
+    // ── gshare GHR speculative shift (slice 3) ──────────────────────────────────
+    // Shift the GHR on EVERY emitted predicted CONDITIONAL (taken OR not — gated on
+    // condBtbHit0, NOT predictFire which is taken-only), with the predicted direction
+    // bit. slot0 is the emitted conditional (a slot1 conditional is deferred to slot0
+    // next cycle by slot1WouldPred / slot1WouldGsCond, so exactly ONE conditional is
+    // consumed per cycle -> exactly one shift). The lookup index used the GHR BEFORE this
+    // shift; the carried phtIndex (stamped above) matches, so the retire update trains
+    // the right entry. NOT checkpointed/restored on a flush (accept-corruption).
+    gsShiftValid := feed.fire && !faultHold && condBtbHit0 && res.slot0Valid
+    gsShiftDir   := slot0PredTaken
 
     // ── RAS push/pop bookkeeping (slice 2) ───────────────────────────────────────
     // On the cycle the emitted slot0 fires (NOT a faulted packet): a call pushes its

@@ -157,6 +157,28 @@ class IpcBenchSpec extends AnyFunSuite {
       fa.logic.rasPredValid    := rasP.logic.predValid
       fa.logic.rasPredTarget   := rasP.logic.predTarget
 
+      // gshare (slice 3): query the PHT with the aligner slot PCs, feed BTB hit/brType
+      // into FetchAlign (condBtbHit), shift the GHR on the emitted conditional, train at
+      // retire (ROB GshareUpdateService). Invalidate (GHR clear) on the I-cache flush.
+      val gsh = host[m68k040.frontend.GsharePlugin]
+      gsh.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+      gsh.logic.queryPc0      := fa.logic.btbQueryPc0
+      gsh.logic.queryValid0   := fa.logic.btbQueryValid0
+      gsh.logic.queryPc1      := fa.logic.btbQueryPc1
+      gsh.logic.queryValid1   := fa.logic.btbQueryValid1
+      fa.logic.gsBtbHit0      := btb.logic.predHitComb
+      fa.logic.gsBtbType0     := btb.logic.predTypeComb
+      fa.logic.gsBtbHit1      := btb.logic.predHit2Comb
+      fa.logic.gsBtbType1     := btb.logic.predType2Comb
+      fa.logic.gsPhtTaken0    := gsh.logic.phtTaken0
+      fa.logic.gsPhtIndex0    := gsh.logic.phtIndex0
+      fa.logic.gsPhtTaken1    := gsh.logic.phtTaken1
+      fa.logic.gsPhtIndex1    := gsh.logic.phtIndex1
+      gsh.logic.shiftValid    := fa.logic.gsShiftValid
+      gsh.logic.shiftDir      := fa.logic.gsShiftDir
+      gsh.gshareUpdate.valid   := rob.logic.gshareUpdateFlow.valid
+      gsh.gshareUpdate.payload := rob.logic.gshareUpdateFlow.payload
+
       val dc    = host[DcacheService]
       val xlate = host[DTranslationService]
       val exc   = rob.logic.exc
@@ -197,6 +219,7 @@ class IpcBenchSpec extends AnyFunSuite {
     val dcache = new DcachePlugin
     val btb    = new BtbPlugin
     val ras    = new m68k040.frontend.RasPlugin
+    val gsh    = new m68k040.frontend.GsharePlugin
     val fa     = new FetchAlignPlugin
     val dec    = new DecodeStage
     val ren    = new RenameStage
@@ -218,7 +241,7 @@ class IpcBenchSpec extends AnyFunSuite {
       intCtrl,
       itlb,
       dtlb,
-      icache, dcache, btb, ras, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
+      icache, dcache, btb, ras, gsh, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
       rfInt, rfNzvc, rfX, wire)) }
   }
 
