@@ -10,7 +10,11 @@ case class IbEntry() extends Bundle {
 }
 
 class InstructionBuffer extends Component {
-  val BUF_WORDS = 12
+  // Depth-2 fetch (VARIANT 1): the buffer must absorb up to TWO in-flight 4-word
+  // windows (8 words) on top of the live head. Bumped 12 -> 16 so a 2nd outstanding
+  // fetch can be issued without the IBuf back-pressuring the aligner head. HEAD_WORDS
+  // (the aligner visibility window) is unchanged at 10.
+  val BUF_WORDS = 16
   val HEAD_WORDS = 10
 
   val io = new Bundle {
@@ -24,6 +28,10 @@ class InstructionBuffer extends Component {
     val avail    = out UInt(4 bits)
     val shift    = in  UInt(4 bits)
     val flush    = in  Bool()
+    // Raw occupancy (depth-2 issue throttle: FetchAlign reserves landing space for ALL
+    // outstanding windows, not just the single push, so 2 in-flight responses cannot
+    // overflow the buffer). avail caps at HEAD_WORDS, so it cannot serve this purpose.
+    val cnt      = out UInt(log2Up(BUF_WORDS + 1) bits)
   }
 
   // Registers. `entries` are RegInit'd to a benign zero/non-simple value: SpinalSim
@@ -56,10 +64,13 @@ class InstructionBuffer extends Component {
   val entriesNext = Vec(IbEntry(), BUF_WORDS)
 
   // Default: shift-down the existing entries
+  val idxW = log2Up(BUF_WORDS + 1)   // wide enough to represent BUF_WORDS itself
   for (i <- 0 until BUF_WORDS) {
-    val srcIdx = i + io.shift   // UInt arithmetic
+    // Width the index to idxW so `< BUF_WORDS` is NOT an out-of-range constant (for
+    // small i the raw width could not reach BUF_WORDS, which SpinalHDL flags).
+    val srcIdx = U(i, idxW bits) + io.shift.resize(idxW)
     when(srcIdx < BUF_WORDS) {
-      entriesNext(i) := entries(srcIdx)
+      entriesNext(i) := entries(srcIdx.resize(log2Up(BUF_WORDS)))
     } .otherwise {
       entriesNext(i).word := 0
       entriesNext(i).pred.simple   := False
@@ -71,12 +82,17 @@ class InstructionBuffer extends Component {
   val countNext = UInt(log2Up(BUF_WORDS + 1) bits)
   when(io.push.fire) {
     for (j <- 0 until 4) {
-      val dst = afterShift + j
+      val dst = (afterShift + j).resize(idxW)
       when(U(j) < io.push.payload.n) {
         when(dst < BUF_WORDS) {
-          entriesNext(dst).word         := io.push.payload.words(j)
-          entriesNext(dst).pred.simple  := io.push.payload.preds(j).simple
-          entriesNext(dst).pred.lenWords := io.push.payload.preds(j).lenWords
+          // Resize the dynamic write index to the Vec address width. With BUF_WORDS=16
+          // `dst` is wider than log2Up(BUF_WORDS)=4 bits (afterShift is 5-bit), which
+          // SpinalHDL rejects for a Vec WRITE access; the `dst < BUF_WORDS` guard makes
+          // the truncation lossless (when in range dst fits in 4 bits exactly).
+          val dstIx = dst.resize(log2Up(BUF_WORDS))
+          entriesNext(dstIx).word         := io.push.payload.words(j)
+          entriesNext(dstIx).pred.simple  := io.push.payload.preds(j).simple
+          entriesNext(dstIx).pred.lenWords := io.push.payload.preds(j).lenWords
         }
       }
     }
@@ -114,4 +130,5 @@ class InstructionBuffer extends Component {
     U(HEAD_WORDS, 4 bits),
     count.resize(4)
   )
+  io.cnt := count
 }

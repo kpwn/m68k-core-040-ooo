@@ -177,10 +177,16 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val idleReadAddr  = (idleSet ## idleBeatSel).asUInt
     val idlePredEntry = Vec(predMem.map(_.readAsync(idleSet)))
 
-    // Single-in-flight: do not accept a new cmd into the T-stage while a translated
-    // fetch is being consumed (T-stage occupied), or a hit response is draining (S1 /
-    // rsp register). Costs nothing — the consumer is single-outstanding.
-    val inFlight = tValid || s1Valid || rspValidReg
+    // Depth-2 pipelined accept (VARIANT 1): the cache is a flow-through 3-stage pipe
+    // (T-stage -> S1 -> rsp), each a single register that ADVANCES every cycle. The
+    // T-stage is consumed (freed) every IDLE cycle it is valid, so a NEW cmd may be
+    // accepted INTO the T-stage the SAME cycle the prior translation is consumed into
+    // S1 — i.e. ≥2 fetches in flight (T + S1 + rsp). The downstream S1/rsp never
+    // back-pressure (flow-through), so the only accept block is the FSM not being in
+    // IDLE (a refill in progress). The single-outstanding `inFlight` gate is REMOVED;
+    // accept gates ONLY on the ITLB resolve (xlate.rsp.ready) inside IDLE. The consume
+    // `tValid := False` is reordered to NOT clobber a same-cycle cmdPort.fire (see the
+    // tAccept/tConsume split below) so the back-to-back accept is not dropped.
 
     // ---- FSM ----
     val fsm = new StateMachine {
@@ -190,7 +196,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
       val REPLAY    = new State
 
       // ----- IDLE: T-accept (translate) + consume the REGISTERED T-stage -----
-      // Two decoupled actions, both single-outstanding (inFlight gates each):
+      // Two decoupled, flow-through actions (depth-2: accept may overlap consume):
       //
       // (1) T-ACCEPT: present `cmdPort.pc` to the ITLB; once it has RESOLVED the
       //     translation (xlate.rsp.ready), REGISTER {ppn,pc[11:0]} + fault into the
@@ -205,18 +211,18 @@ class IcachePlugin extends FiberPlugin with FetchService {
       //     (s1Fault) WITHOUT a refill — the rsp carries fault -> DecodePacket.fault.
       IDLE.whenIsActive {
         activePc      := cmdPort.payload.pc
-        cmdPort.ready := !inFlight && xlate.rsp.ready
+        // Depth-2 accept: gate ONLY on the ITLB resolve (no single-outstanding block).
+        // The T-stage is freed every IDLE cycle (consume below), so a new cmd may enter
+        // it the same cycle. NOTE: a MISS this cycle leaves IDLE (goto REFILL); the
+        // accept is still permitted (cmdPort.ready is combinational and we are still in
+        // IDLE), and the same-cycle-accepted translation is held in the T-stage and
+        // re-consumed after the refill returns to IDLE — so it is NOT lost.
+        cmdPort.ready := xlate.rsp.ready
 
-        // (1) T-accept: register the resolved translation. tValid persists until the
-        // consume below clears it (next IDLE cycle), keeping single-outstanding.
-        when(cmdPort.fire) {
-          tValid := True
-          tPc    := cmdPort.payload.pc
-          tPaddr := (xlate.rsp.ppn ## cmdPort.payload.pc(11 downto 0)).asUInt
-          tFault := xlate.rsp.fault
-        }
-
-        // (2) Consume the registered translation.
+        // (2) Consume the registered translation FIRST (so its `tValid := False` is
+        // OVERRIDDEN by a same-cycle (1) T-accept's `tValid := True` below — the
+        // depth-2 back-to-back accept must not be dropped). The consume reads the
+        // REGISTERED tPc/tPaddr (old values), unaffected by the new accept's writes.
         when(tValid) {
           // FMax: arm the data-BRAM read whenever a translated fetch is present —
           // INDEPENDENT of the hit/fault decision. The result is only CONSUMED when
@@ -225,7 +231,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
           // compare is no longer in the data-BRAM `ENARDEN` critical path.
           dataReadAddr := idleReadAddr
           dataReadEn   := True
-          tValid := False   // consumed this cycle (later writes below may re-arm S1)
+          tValid := False   // consumed this cycle (a same-cycle accept re-sets it True)
 
           // Register the RAW per-way predMem entries (way-mux + window-decode deferred
           // to S1 keyed off s1Way). On a fault placeholder the entries are zeroed
@@ -258,6 +264,18 @@ class IcachePlugin extends FiberPlugin with FetchService {
             arSent    := False
             goto(REFILL)
           }
+        }
+
+        // (1) T-accept: register the resolved translation. Placed LAST so its
+        // `tValid := True` wins over the consume's `tValid := False` on a back-to-back
+        // accept cycle (depth-2). On a miss cycle this same-cycle accept is preserved
+        // across the refill (tValid stays True through REFILL/PREDECODE/REPLAY and is
+        // consumed on the IDLE return).
+        when(cmdPort.fire) {
+          tValid := True
+          tPc    := cmdPort.payload.pc
+          tPaddr := (xlate.rsp.ppn ## cmdPort.payload.pc(11 downto 0)).asUInt
+          tFault := xlate.rsp.fault
         }
       }
 
