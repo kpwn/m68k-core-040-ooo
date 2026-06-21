@@ -266,13 +266,20 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // bimodal counter) for a `condBtbHit`. Unconditionals (brType==uncond) keep the BTB
     // force-taken; misses stay not-taken. `cond` brType == 0.
     val condBtbHit0 = gsBtbHit0 && (gsBtbType0 === U(0, 2 bits))
-    val condBtbHit1 = gsBtbHit1 && (gsBtbType1 === U(0, 2 bits))
-    // Per-slot predicted-taken: for a conditional BTB hit use the PHT direction; else the
+    // slot0 predicted-taken: for a conditional BTB hit use the PHT direction; else the
     // BTB's own predict-taken (unconditional force-taken, or a non-cond bimodal). In
-    // STEP 1 (gshare inert) gsBtbHit*=False -> condBtbHit*=False -> this reduces to the
-    // BTB predict-taken (behavior-neutral); STEP 2 wires gsBtbHit/gsPhtTaken live.
+    // STEP 1 (gshare inert) gsBtbHit0=False -> condBtbHit0=False -> this reduces to the
+    // BTB predict-taken (behavior-neutral); STEP 2 wires gsBtbHit0/gsPhtTaken0 live.
     val slot0PredTaken = Mux(condBtbHit0, gsPhtTaken0, btbPredTaken0)
-    val slot1PredTaken = Mux(condBtbHit1, gsPhtTaken1, btbPredTaken1)
+    // slot1 predicted-taken: keep the SLICE-1 BTB source (NOT gshare). FMax: the slot1
+    // predict feeds slot1ValidOut -> the ibuf shift/suppress cone, which is the front-end
+    // critical path; injecting the gshare slot1 PHT read + condBtbHit1 there regressed
+    // FMax. A slot1 predicted-taken branch is only DEFERRED to slot0 next cycle anyway
+    // (slot1WouldPred), where slot0's gshare direction takes over — so sourcing the slot1
+    // DEFER decision from the BTB bimodal (vs gshare) is a pure micro-perf nuance on the
+    // defer cycle, never a correctness issue (the EU verifies; gshare drives it as slot0
+    // next cycle). This keeps the slot1ValidOut cone identical to slice-1/2.
+    val slot1PredTaken = btbPredTaken1
     // slot0 predicted-taken: stamp slot0 + suppress slot1 + redirect (the proven path).
     val slot0IsPred = slot0PredTaken && res.slot0Valid
     // slot1 predicted-taken (and slot0 is NOT): SUPPRESS slot1 this cycle so ONLY slot0
@@ -280,13 +287,16 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // the (correct, single-slot) slot0 prediction path. Costs one dual-issue slot on the
     // predicted branch but reuses the proven slot0 redirect and keeps recovery simple.
     val slot1WouldPred = slot1PredTaken && res.slot1Valid && res.slot0Valid && !slot0IsPred
-    // A slot1 CONDITIONAL BTB hit that is predicted NOT-taken (so slot1WouldPred is False)
-    // would otherwise emit alongside slot0 — but then TWO conditionals would be consumed
-    // this cycle and the single-ported GHR could shift only once. DEFER it (suppress slot1
-    // -> it becomes slot0 next cycle with the correct GHR context), mirroring the
-    // slot1WouldPred deferral, so exactly ONE conditional is emitted per cycle and the GHR
-    // shifts exactly once. (Only matters when slot0 is not itself a predicted-taken branch.)
-    val slot1WouldGsCond = condBtbHit1 && res.slot1Valid && res.slot0Valid && !slot0IsPred && !slot1WouldPred
+    // NOTE (FMax): we deliberately do NOT defer a predicted-NOT-taken slot1 conditional.
+    // If both slot0 and slot1 are conditionals emitted the same cycle, only slot0's GHR
+    // bit shifts (the single-ported GHR shifts once) — slot1's history bit is lost. That
+    // is a pure ACCURACY imperfection (the accept-corruption philosophy already tolerates
+    // GHR imprecision), NOT a correctness bug: each conditional carries its OWN fetch-time
+    // phtIndex down, so the retire-time train hits the exact entry the lookup read
+    // regardless of the GHR shift. Deferring slot1 instead pulled the BTB slot1 hit/brType
+    // (condBtbHit1) into the ibuf shift/suppress cone and regressed the fetch FMax, so it
+    // is intentionally omitted (the slot1-predicted-TAKEN defer, slot1WouldPred, stays —
+    // it already existed for the BTB and is needed for the redirect discipline).
 
     // ── RAS classification of the EMITTED slot0 (slice 2) ────────────────────────
     // isCall / isReturn are recomputed from the emitted slot0 opword (already in the
@@ -338,7 +348,7 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // Suppress slot1 when slot0 is the predicted-taken branch (slot1 is wrong-path) OR
     // when slot1 WOULD be a predicted branch (defer it to slot0 next cycle). slot0Predicted
     // folds in a RAS-predicted return (slice 2): its slot1 is equally wrong-path.
-    when(slot0Predicted || slot1WouldPred || slot1WouldRasPred || slot1WouldGsCond) {
+    when(slot0Predicted || slot1WouldPred || slot1WouldRasPred) {
       slot1ValidOut := False
     }
     // Stamp the prediction onto slot0 (rides to the EU). The target is the composed
@@ -399,7 +409,7 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // branch deferred to next cycle), consume only slot0's words (lenWords); else the
     // aligner's full shift. Without this, suppressing slot1 would still CONSUME its
     // words from the IBuf — losing the deferred branch / the wrong-path successor.
-    val suppressSlot1 = slot0Predicted || slot1WouldPred || slot1WouldRasPred || slot1WouldGsCond
+    val suppressSlot1 = slot0Predicted || slot1WouldPred || slot1WouldRasPred
     val effShift = Mux(suppressSlot1, res.slot0.lenWords.resize(res.shiftWords.getWidth), res.shiftWords)
     when(feed.fire && !faultHold) {
       ibuf.io.shift := effShift
@@ -411,13 +421,14 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     }
 
     // ── gshare GHR speculative shift (slice 3) ──────────────────────────────────
-    // Shift the GHR on EVERY emitted predicted CONDITIONAL (taken OR not — gated on
-    // condBtbHit0, NOT predictFire which is taken-only), with the predicted direction
-    // bit. slot0 is the emitted conditional (a slot1 conditional is deferred to slot0
-    // next cycle by slot1WouldPred / slot1WouldGsCond, so exactly ONE conditional is
-    // consumed per cycle -> exactly one shift). The lookup index used the GHR BEFORE this
-    // shift; the carried phtIndex (stamped above) matches, so the retire update trains
-    // the right entry. NOT checkpointed/restored on a flush (accept-corruption).
+    // Shift the GHR on the emitted slot0 predicted CONDITIONAL (taken OR not — gated on
+    // condBtbHit0, NOT predictFire which is taken-only), with the predicted direction bit.
+    // We shift for slot0 only: a slot1-predicted-TAKEN conditional is deferred to slot0
+    // next cycle (slot1WouldPred); a slot1 not-taken conditional that co-emits with slot0
+    // simply loses its GHR bit (accept-corruption — its carried phtIndex still trains the
+    // right entry at retire, so correctness is unaffected). The lookup index used the GHR
+    // BEFORE this shift; the carried phtIndex (stamped above) matches. NOT checkpointed/
+    // restored on a flush (accept-corruption).
     gsShiftValid := feed.fire && !faultHold && condBtbHit0 && res.slot0Valid
     gsShiftDir   := slot0PredTaken
 
