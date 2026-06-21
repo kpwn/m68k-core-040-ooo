@@ -336,6 +336,7 @@ object Microcode {
     // op-µop builder + the ROB serializing path, not the ROM). Default inert.
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
     u.predTaken := False; u.predTarget := U(0, 32 bits)
+    u.phtValid := False; u.phtIndex := U(0, 11 bits)
     u.firstOfInstr := Bool(d.isFirst)
     u
   }

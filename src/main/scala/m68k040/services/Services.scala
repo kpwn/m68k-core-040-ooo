@@ -61,6 +61,23 @@ trait BtbUpdateService {
   def btbUpdate: Flow[BtbUpdate]
 }
 
+/** Retire-time gshare PHT update (direction predictor, slice 3). The ROB drives this
+  * from a retiring CONDITIONAL branch that carried a fetch-time `phtIndex`; the
+  * GsharePlugin consumes it to train `pht[index]` toward the resolved direction
+  * (saturate +/-1). Using the FETCH-TIME index (carried) — not a retire-time recompute
+  * — is mandatory: the speculative GHR at retire differs from the GHR at the lookup, so
+  * only the carried index trains the exact entry the lookup read. */
+case class GshareUpdate(idxBits: Int) extends Bundle {
+  val index = UInt(idxBits bits)   // the fetch-time folded XOR index the lookup read
+  val taken = Bool()               // resolved actual direction (train toward this)
+}
+
+/** ROB exposes; GsharePlugin consumes. `update.valid` pulses the cycle a conditional
+  * gshare-predicted branch retires. */
+trait GshareUpdateService {
+  def gshareUpdate: Flow[GshareUpdate]
+}
+
 /** The ONE 68040 MMU control (TC enable + URP/SRP root pointer), shared by BOTH
   * the I-side ITLB and the D-side DTLB. One owner drives the regs (synth top input /
   * sim poke / future MOVEC); both TLBs read it. `mmuEnable` LOW => identity. */

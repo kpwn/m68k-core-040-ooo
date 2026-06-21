@@ -28,6 +28,10 @@ object Aligner {
     // default, not a don't-care a sim poke / FetchAlign drive can't see).
     r.slot0.predTaken := False; r.slot0.predTarget := U(0, 32 bits)
     r.slot1.predTaken := False; r.slot1.predTarget := U(0, 32 bits)
+    // gshare carry-down defaults (slice 3): not a gshare-predicted conditional. FetchAlign
+    // OVERRIDES phtValid/phtIndex on the emitted conditional's slot0 after the aligner runs.
+    r.slot0.phtValid := False; r.slot0.phtIndex := U(0, 11 bits)
+    r.slot1.phtValid := False; r.slot1.phtIndex := U(0, 11 bits)
 
     // Default control signals
     r.slot0Valid  := False

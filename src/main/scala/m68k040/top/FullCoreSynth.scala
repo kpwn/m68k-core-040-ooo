@@ -80,6 +80,30 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     ras.logic.popValid      := fa.logic.rasPopValid
     fa.logic.rasPredValid   := ras.logic.predValid
     fa.logic.rasPredTarget  := ras.logic.predTarget
+    // ── gshare direction predictor (slice 3) ────────────────────────────────────
+    // Query the PHT with the same slot0/slot1 aligner PCs the BTB sees; feed the BTB hit
+    // + brType into FetchAlign so it can form condBtbHit and source the conditional
+    // direction from the PHT. Drive the GHR shift on the emitted predicted conditional;
+    // train the PHT at retire (the ROB's GshareUpdateService). Invalidate (GHR clear) on
+    // the same I-cache flush that clears the BTB/RAS.
+    val gsh = host[m68k040.frontend.GsharePlugin]
+    gsh.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+    gsh.logic.queryPc0      := fa.logic.btbQueryPc0
+    gsh.logic.queryValid0   := fa.logic.btbQueryValid0
+    gsh.logic.queryPc1      := fa.logic.btbQueryPc1
+    gsh.logic.queryValid1   := fa.logic.btbQueryValid1
+    fa.logic.gsBtbHit0      := btb.logic.predHitComb
+    fa.logic.gsBtbType0     := btb.logic.predTypeComb
+    fa.logic.gsBtbHit1      := btb.logic.predHit2Comb
+    fa.logic.gsBtbType1     := btb.logic.predType2Comb
+    fa.logic.gsPhtTaken0    := gsh.logic.phtTaken0
+    fa.logic.gsPhtIndex0    := gsh.logic.phtIndex0
+    fa.logic.gsPhtTaken1    := gsh.logic.phtTaken1
+    fa.logic.gsPhtIndex1    := gsh.logic.phtIndex1
+    gsh.logic.shiftValid    := fa.logic.gsShiftValid
+    gsh.logic.shiftDir      := fa.logic.gsShiftDir
+    gsh.gshareUpdate.valid   := rob.logic.gshareUpdateFlow.valid
+    gsh.gshareUpdate.payload := rob.logic.gshareUpdateFlow.payload
     // STOP-halt: while the ROB is in the `stopped` state, quiesce the front-end (hold
     // fetch + feed at the STOP successor PC). The IRQ-entry vector redirect clears it.
     host[FetchAlignPlugin].logic.quiesce := rob.logic.stopped
@@ -290,6 +314,7 @@ object GenFullCoreSynthVerilog {
           new DcachePlugin(),
           new BtbPlugin(),
           new m68k040.frontend.RasPlugin(),
+          new m68k040.frontend.GsharePlugin(),
           new FetchAlignPlugin(),
           new DecodeStage(),
           new RenameStage(),

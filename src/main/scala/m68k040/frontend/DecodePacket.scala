@@ -20,4 +20,13 @@ case class DecodePacket() extends Bundle {
   //   Non-branch / not-predicted packets carry predTaken=False, predTarget=0.
   val predTaken  = Bool()
   val predTarget = UInt(32 bits)
+  // ── gshare direction-predictor carry-down (slice 3) ─────────────────────────
+  // phtValid : this instruction is a CONDITIONAL branch that hit the BTB and whose
+  //   DIRECTION was sourced from the gshare PHT (condBtbHit at fetch). It carries
+  //   `phtIndex` (the 11-bit fetch-time folded-XOR index the lookup read) down to
+  //   retire so the ROB trains the EXACT entry the lookup read (the GHR at retire
+  //   differs from the GHR at the lookup — only the carried index is right).
+  //   Non-conditional / not-gshare-predicted packets carry phtValid=False.
+  val phtValid   = Bool()
+  val phtIndex   = UInt(11 bits)
 }

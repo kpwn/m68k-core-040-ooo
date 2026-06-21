@@ -196,6 +196,28 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       faBtb.logic.rasPredValid  := ras.logic.predValid
       faBtb.logic.rasPredTarget := ras.logic.predTarget
 
+      // gshare (slice 3): query the PHT with the aligner slot PCs, feed BTB hit/brType
+      // into FetchAlign (condBtbHit), shift the GHR on the emitted conditional, train at
+      // retire (ROB GshareUpdateService). Invalidate (GHR clear) on the I-cache flush.
+      val gsh   = host[m68k040.frontend.GsharePlugin]
+      gsh.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+      gsh.logic.queryPc0      := faBtb.logic.btbQueryPc0
+      gsh.logic.queryValid0   := faBtb.logic.btbQueryValid0
+      gsh.logic.queryPc1      := faBtb.logic.btbQueryPc1
+      gsh.logic.queryValid1   := faBtb.logic.btbQueryValid1
+      faBtb.logic.gsBtbHit0   := btb.logic.predHitComb
+      faBtb.logic.gsBtbType0  := btb.logic.predTypeComb
+      faBtb.logic.gsBtbHit1   := btb.logic.predHit2Comb
+      faBtb.logic.gsBtbType1  := btb.logic.predType2Comb
+      faBtb.logic.gsPhtTaken0 := gsh.logic.phtTaken0
+      faBtb.logic.gsPhtIndex0 := gsh.logic.phtIndex0
+      faBtb.logic.gsPhtTaken1 := gsh.logic.phtTaken1
+      faBtb.logic.gsPhtIndex1 := gsh.logic.phtIndex1
+      gsh.logic.shiftValid    := faBtb.logic.gsShiftValid
+      gsh.logic.shiftDir      := faBtb.logic.gsShiftDir
+      gsh.gshareUpdate.valid   := rob.logic.gshareUpdateFlow.valid
+      gsh.gshareUpdate.payload := rob.logic.gshareUpdateFlow.payload
+
       // ── Exception D-cache MUX (the LS EU arbitrates: it owns the cache ports, so
       // the exception unit's requests are routed THROUGH the LS EU's mux — see
       // LsEuPlugin.excActive/excLoad*/excStore*/excXlate*). The exc reads the cache
@@ -257,6 +279,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val dcache = new DcachePlugin
     val btb    = new m68k040.frontend.BtbPlugin
     val ras    = new m68k040.frontend.RasPlugin
+    val gsh    = new m68k040.frontend.GsharePlugin
     val fa     = new FetchAlignPlugin
     val dec    = new DecodeStage
     val ren    = new RenameStage
@@ -278,7 +301,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       intCtrl,
       itlb,
       dtlb,
-      icache, dcache, btb, ras, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
+      icache, dcache, btb, ras, gsh, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
       rfInt, rfNzvc, rfX, wire)) }
   }
 

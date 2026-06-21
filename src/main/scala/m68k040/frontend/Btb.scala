@@ -80,25 +80,32 @@ class BtbPlugin extends FiberPlugin {
     queryPcPort = queryPc; queryValidPort = queryValid; invalidatePort = invalidateAll
 
     // ---- combinational lookup helper (async LUTRAM read + tag/counter decode) ----
-    def lookup(pc: UInt, valid: Bool): (Bool, UInt) = {
+    // Returns (predTaken, target, hit, brType): the bimodal predict-taken decision, the
+    // learned target, the raw tag-hit (gshare needs `hit && brType==cond` to override the
+    // direction of a CONDITIONAL BTB hit), and the entry's brType (0=cond, 1=uncond).
+    def lookup(pc: UInt, valid: Bool): (Bool, UInt, Bool, UInt) = {
       val idx   = idxOf(pc)
       val tag   = tagOf(pc)
       val entry = mem.readAsync(idx)
-      val hit   = valids(idx) && (entry.tag === tag)
+      val rawHit = valid && valids(idx) && (entry.tag === tag)
       // predict-taken: hit with counter in the taken band (>=2) OR an unconditional
       // (brType==1, force-taken even on the cycle it is first installed).
-      val predTaken = valid && hit && ((entry.counter >= U(2, 2 bits)) || (entry.brType === U(1, 2 bits)))
-      (predTaken, entry.target)
+      val predTaken = rawHit && ((entry.counter >= U(2, 2 bits)) || (entry.brType === U(1, 2 bits)))
+      (predTaken, entry.target, rawHit, entry.brType)
     }
 
     // ---- COMBINATIONAL lookup outputs (per-instruction PC, slice 1) ─────────────
     // FetchAlign queries with the aligner's slot0/slot1 instruction PCs (decodePc and
     // decodePc+slot0-len) and uses THESE combinational outputs IN THE SAME CYCLE to
-    // attribute the prediction to the emitted instruction + redirect fetch.
-    val (predTakenComb,  predTargetComb)  = lookup(queryPc,  queryValid)
-    val (predTaken2Comb, predTarget2Comb) = lookup(query2Pc, query2Valid)
+    // attribute the prediction to the emitted instruction + redirect fetch. `hit`/`brType`
+    // (slice 3) let FetchAlign form `condBtbHit = hit && brType==cond` to source the
+    // conditional's predicted-taken from gshare instead of the bimodal counter.
+    val (predTakenComb,  predTargetComb,  predHitComb,  predTypeComb)  = lookup(queryPc,  queryValid)
+    val (predTaken2Comb, predTarget2Comb, predHit2Comb, predType2Comb) = lookup(query2Pc, query2Valid)
     predTakenComb.simPublic(); predTargetComb.simPublic()
     predTaken2Comb.simPublic(); predTarget2Comb.simPublic()
+    predHitComb.simPublic(); predTypeComb.simPublic()
+    predHit2Comb.simPublic(); predType2Comb.simPublic()
 
     // ---- retire-time update (from the ROB's BtbUpdateService) ----
     val upd = host[BtbUpdateService].btbUpdate

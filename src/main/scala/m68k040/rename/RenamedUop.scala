@@ -129,6 +129,12 @@ case class RenamedUop() extends Bundle {
   // Non-branch / not-predicted µops carry predTaken=False. Threaded from decode.
   val predTaken    = Bool()
   val predTarget   = UInt(32 bits)
+  // gshare direction-predictor carry-down (slice 3): phtValid = a conditional
+  // gshare-predicted branch; phtIndex = its fetch-time 11-bit folded-XOR index (the
+  // ROB trains pht[phtIndex] toward the resolved direction at retire). Threaded from
+  // decode -> here -> IqContext -> branch EU -> BranchCompletion -> ROB.
+  val phtValid     = Bool()
+  val phtIndex     = UInt(11 bits)
   val dstArch = UInt(5 bits)   // architectural int dst reg 0..17 (incl T0/T1); for commit RAT + CommitTrace
   val psrcA = UInt(intW bits); val psrcAValid = Bool()
   val psrcB = UInt(intW bits); val psrcBValid = Bool()

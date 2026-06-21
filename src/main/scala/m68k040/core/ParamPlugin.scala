@@ -18,5 +18,7 @@ class ParamPlugin(p: M68kParams) extends FiberPlugin {
     Global.L1I_LINE_BYTES.set(p.l1iLineBytes)
     Global.BTB_ENTRIES.set(p.btbEntries)
     Global.RAS_ENTRIES.set(p.rasEntries)
+    Global.GHR_BITS.set(p.gshareHistory)
+    Global.PHT_ENTRIES.set(p.gshareEntries)
   }
 }
