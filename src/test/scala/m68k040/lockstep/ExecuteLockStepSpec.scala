@@ -187,6 +187,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       faBtb.logic.btbPredTarget0 := btb.logic.predTargetComb
       faBtb.logic.btbPredTaken1  := btb.logic.predTaken2Comb
       faBtb.logic.btbPredTarget1 := btb.logic.predTarget2Comb
+      // RAS (slice 2): drive push/pop, read the combinational predict.
+      val ras   = host[m68k040.frontend.RasPlugin]
+      ras.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+      ras.logic.pushValid     := faBtb.logic.rasPushValid
+      ras.logic.pushRetPc     := faBtb.logic.rasPushRetPc
+      ras.logic.popValid      := faBtb.logic.rasPopValid
+      faBtb.logic.rasPredValid  := ras.logic.predValid
+      faBtb.logic.rasPredTarget := ras.logic.predTarget
 
       // ── Exception D-cache MUX (the LS EU arbitrates: it owns the cache ports, so
       // the exception unit's requests are routed THROUGH the LS EU's mux — see
@@ -248,6 +256,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val icache = new IcachePlugin
     val dcache = new DcachePlugin
     val btb    = new m68k040.frontend.BtbPlugin
+    val ras    = new m68k040.frontend.RasPlugin
     val fa     = new FetchAlignPlugin
     val dec    = new DecodeStage
     val ren    = new RenameStage
@@ -269,7 +278,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       intCtrl,
       itlb,
       dtlb,
-      icache, dcache, btb, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
+      icache, dcache, btb, ras, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
       rfInt, rfNzvc, rfX, wire)) }
   }
 
@@ -2472,6 +2481,40 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "a: moveq #2,%d1 ; bsr b ; moveq #4,%d3 ; rts ; " +
       "b: moveq #3,%d2 ; rts",
       nInstr = 8)
+  }
+
+  test("lock-step: deep-nested call (3 levels, LIFO unwind) — RAS depth", VerilatorTest) {
+    // main calls a; a calls b; b calls c; each returns -> the RAS pushes 3 retPCs and
+    // pops them in LIFO order (c->b->a->main). With RAS prediction live every return is
+    // predicted; the architectural result must stay byte-identical vs Musashi.
+    // Flow to sentinel: moveq#1, bsr a, moveq#2, bsr b, moveq#3, bsr c, moveq#4,
+    //   rts(c->b), moveq#5, rts(b->a), moveq#6, rts(a->main) = 12.
+    runLockStep("bsr-deep-nested",
+      "moveq #1,%d0 ; bsr a ; .stop: bra .stop ; " +
+      "a: moveq #2,%d1 ; bsr b ; moveq #5,%d4 ; rts ; " +
+      "b: moveq #3,%d2 ; bsr c ; moveq #4,%d3 ; rts ; " +
+      "c: moveq #6,%d5 ; rts",
+      nInstr = 12)
+  }
+
+  test("lock-step: call/return with an interleaved mispredict — RAS corrupt-recovery", VerilatorTest) {
+    // A loop body CALLS a leaf subroutine and also contains a data-dependent Bcc whose
+    // direction the bimodal BTB will mispredict at least once (the loop's back-edge DBcc
+    // flips direction on the final iteration; the leaf's rts is RAS-predicted). On the
+    // mispredicting cycle the front-end speculatively walks the WRONG path — which may
+    // push/pop the RAS for a wrong-path call/return, corrupting the speculative sp. The
+    // EU verifies the REAL return target (loaded from the stack), so the commit-time
+    // redirect recovers; the ARCHITECTURAL result must still match Musashi byte-for-byte
+    // (proving EU-verify recovers a corrupt RAS — the spec's recovery=accept-corruption).
+    //   d7 = 3 loop count; each iter: bsr leaf (push+pop RAS), subq#1,d7, bne back.
+    //   leaf: addq#1,d0 ; rts.
+    // The bne is taken twice then NOT-taken once -> a guaranteed mispredict on the exit.
+    runLockStep("bsr-loop-mispredict",
+      "moveq #3,%d7 ; moveq #0,%d0 ; " +
+      "back: bsr leaf ; subq #1,%d7 ; bne back ; " +
+      "moveq #9,%d6 ; .stop: bra .stop ; " +
+      "leaf: addq #1,%d0 ; rts",
+      nInstr = 18)
   }
 
   // ── JSR (call via the EA address) ──────────────────────────────────────────
