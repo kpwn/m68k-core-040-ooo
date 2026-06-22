@@ -9,22 +9,45 @@ case class IbEntry() extends Bundle {
   val pred = ChunkPredecode()
 }
 
+/** CIRCULAR head/tail ring (LEVER 1): the instruction buffer is a circular ring of
+  * BUF_WORDS slots. Entries stay in FIXED physical slots; a `headPtr` marks the
+  * physical slot of logical word 0. Logical word `i` lives at physical slot
+  * `(headPtr + i) mod BUF_WORDS`.
+  *
+  *   - SHIFT advances `headPtr` by `io.shift` (mod BUF) and drops `shift` from `count`.
+  *   - PUSH writes `n` words at the tail = physical slot `(headPtr + count) mod BUF`
+  *     (the tail slot is INDEPENDENT of shift this cycle: after shift the new head is
+  *     headPtr+shift, the new tail logical position is count-shift, so the physical
+  *     tail = headPtr+shift+(count-shift) = headPtr+count, unchanged), then count
+  *     becomes (count - shift + n).
+  *   - HEAD outputs are a barrel-rotate of HEAD_WORDS slots (a small `headPtr`-indexed
+  *     read), NOT a rebuild of all BUF_WORDS entries.
+  *   - FLUSH resets count and the head pointer to 0.
+  *
+  * This ELIMINATES the per-cycle O(BUF_WORDS) shift mux that was regen2's binding FMax
+  * limiter in the shift-register IBuf (entries_0..entries_17 rebuilt combinationally
+  * each cycle): only the `n` pushed slots are written each cycle (a small enable-decode),
+  * and only HEAD_WORDS slots feed the read rotate.
+  *
+  * The external interface (head/headPred/avail/cnt/push/shift/flush) is byte-identical
+  * to the shift-register version, so FetchAlign/Aligner are unchanged.
+  *
+  * Depth-3 / push-4 context (adapted from the push-8 reference f1d47a2): the buffer must
+  * absorb up to THREE in-flight 4-word windows (12 words) on top of the live head, while
+  * the FetchAlign issue reservation (cnt + (ringCount+1)*4 <= BUF_WORDS) keeps the
+  * deepest (3rd) outstanding fetch from overflowing. Sized 20 so the 3rd outstanding
+  * fetch can issue with the live head still at cnt<=8 (cnt+12<=20). HEAD_WORDS (the
+  * aligner visibility window) is unchanged at 10, PUSH stays 4 words (NARROW window).
+  */
 class InstructionBuffer extends Component {
-  // Depth-3 fetch (ANGLE D): the buffer must absorb up to THREE in-flight 4-word
-  // windows (12 words) on top of the live head, while the FetchAlign issue reservation
-  // (cnt + (ringCount+1)*4 <= BUF_WORDS) keeps the deepest (3rd) outstanding fetch from
-  // overflowing. Sized 20 so the 3rd outstanding fetch can issue with the live head still
-  // at cnt<=8 (cnt+12<=20) — the same head headroom v1's depth-2 had (cnt<=8). HEAD_WORDS
-  // (the aligner visibility window) is unchanged at 10, so the aligner cone is identical;
-  // only the shift/push mux grows from 16->20 entries (still NARROW: push stays 4 words,
-  // the v3 wide-window 8-word push limiter is avoided).
-  val BUF_WORDS = 20
+  val BUF_WORDS  = 20
   val HEAD_WORDS = 10
+  val PUSH_WORDS = 4
 
   val io = new Bundle {
     val push = slave(Stream(new Bundle {
-      val words = Vec(Bits(16 bits), 4)
-      val preds = Vec(ChunkPredecode(), 4)
+      val words = Vec(Bits(16 bits), PUSH_WORDS)
+      val preds = Vec(ChunkPredecode(), PUSH_WORDS)
       val n     = UInt(3 bits)
     }))
     val head     = out Vec(Bits(16 bits), HEAD_WORDS)
@@ -32,16 +55,19 @@ class InstructionBuffer extends Component {
     val avail    = out UInt(4 bits)
     val shift    = in  UInt(4 bits)
     val flush    = in  Bool()
-    // Raw occupancy (depth-2 issue throttle: FetchAlign reserves landing space for ALL
-    // outstanding windows, not just the single push, so 2 in-flight responses cannot
+    // Raw occupancy (depth-3 issue throttle: FetchAlign reserves landing space for ALL
+    // outstanding windows, not just the single push, so in-flight responses cannot
     // overflow the buffer). avail caps at HEAD_WORDS, so it cannot serve this purpose.
     val cnt      = out UInt(log2Up(BUF_WORDS + 1) bits)
   }
 
-  // Registers. `entries` are RegInit'd to a benign zero/non-simple value: SpinalSim
-  // randomizes uninit Regs per-seed, and a `head(i)` read of a slot that count
-  // claims valid (e.g. a transient during refill) would otherwise return seed-random
-  // garbage -> flaky lock-step. Deterministic reset makes the buffer seed-stable.
+  val IDXW = log2Up(BUF_WORDS)   // physical slot index width
+
+  // Registers. `entries` are RegInit'd to a benign zero value: SpinalSim randomizes
+  // uninit Regs per-seed, and the head barrel-rotate reads HEAD_WORDS slots
+  // combinationally (gating the OUT-of-window ones to 0), so an uninit slot that the
+  // rotate transiently reads (then muxes away) would otherwise be seed-random garbage
+  // -> flaky lock-step. Deterministic reset makes the buffer seed-stable.
   val entries = Vec.fill(BUF_WORDS) {
     val e = Reg(IbEntry())
     e.word init 0
@@ -50,81 +76,87 @@ class InstructionBuffer extends Component {
     e
   }
   val count   = Reg(UInt(log2Up(BUF_WORDS + 1) bits)) init 0
+  val headPtr = Reg(UInt(IDXW bits)) init 0
   spinal.core.sim.SimPublic(count)
 
   // Push ready: accept when there's room for a full window.
-  // NB: use a width-extending add (+^) — `count` is only wide enough to hold
-  // BUF_WORDS (4 bits, max 15), so a plain `count + 4` OVERFLOWS at count=12
-  // (12+4=16 wraps to 0) and spuriously reports ready while the buffer is FULL,
-  // which then fires a push that wraps `count` back down (corrupting the head).
-  // This only surfaces when the buffer fills to BUF_WORDS under sustained
-  // back-pressure (e.g. the post-mispredict rename freelist re-init stall).
-  io.push.ready := (count +^ 4 <= BUF_WORDS)
+  // NB: use a width-extending add (+^) so a near-full `count + PUSH_WORDS` does not
+  // overflow the `count` width and spuriously report ready while the buffer is FULL
+  // (which then fires a push that wraps `count` back down, corrupting the head).
+  io.push.ready := (count +^ PUSH_WORDS <= BUF_WORDS)
 
-  // Compute next state combinationally
+  // --- next-state pointers/count (combinational) ---
   val afterShift = count - io.shift   // shift <= count by construction
-
-  // Build next entries as a Vec of signals (not registers)
-  val entriesNext = Vec(IbEntry(), BUF_WORDS)
-
-  // Default: shift-down the existing entries
-  val idxW = log2Up(BUF_WORDS + 1)   // wide enough to represent BUF_WORDS itself
-  for (i <- 0 until BUF_WORDS) {
-    // Width the index to idxW so `< BUF_WORDS` is NOT an out-of-range constant (for
-    // small i the raw width could not reach BUF_WORDS, which SpinalHDL flags).
-    val srcIdx = U(i, idxW bits) + io.shift.resize(idxW)
-    when(srcIdx < BUF_WORDS) {
-      entriesNext(i) := entries(srcIdx.resize(log2Up(BUF_WORDS)))
-    } .otherwise {
-      entriesNext(i).word := 0
-      entriesNext(i).pred.simple   := False
-      entriesNext(i).pred.lenWords := 0
-    }
+  val newHeadPtr = UInt(IDXW bits)
+  val hpPlusShift = (headPtr +^ io.shift)        // width-extended, may exceed BUF_WORDS
+  when(hpPlusShift >= BUF_WORDS) {
+    newHeadPtr := (hpPlusShift - BUF_WORDS).resize(IDXW)
+  } .otherwise {
+    newHeadPtr := hpPlusShift.resize(IDXW)
   }
 
-  // If push fires, overwrite slots [afterShift .. afterShift+n-1] with incoming words
-  val countNext = UInt(log2Up(BUF_WORDS + 1) bits)
-  when(io.push.fire) {
-    for (j <- 0 until 4) {
-      val dst = (afterShift + j).resize(idxW)
-      when(U(j) < io.push.payload.n) {
-        when(dst < BUF_WORDS) {
-          // Resize the dynamic write index to the Vec address width. With BUF_WORDS=16
-          // `dst` is wider than log2Up(BUF_WORDS)=4 bits (afterShift is 5-bit), which
-          // SpinalHDL rejects for a Vec WRITE access; the `dst < BUF_WORDS` guard makes
-          // the truncation lossless (when in range dst fits in 4 bits exactly).
-          val dstIx = dst.resize(log2Up(BUF_WORDS))
-          entriesNext(dstIx).word         := io.push.payload.words(j)
-          entriesNext(dstIx).pred.simple  := io.push.payload.preds(j).simple
-          entriesNext(dstIx).pred.lenWords := io.push.payload.preds(j).lenWords
+  // Tail physical slot = (headPtr + count) mod BUF_WORDS. Independent of shift this
+  // cycle (see the class comment). Push word j writes physical (tailBase + j) mod BUF.
+  val tailBase = UInt(IDXW bits)
+  val hpPlusCount = (headPtr +^ count)
+  when(hpPlusCount >= BUF_WORDS) {
+    tailBase := (hpPlusCount - BUF_WORDS).resize(IDXW)
+  } .otherwise {
+    tailBase := hpPlusCount.resize(IDXW)
+  }
+
+  // --- write the (up to PUSH_WORDS) pushed entries into their tail slots ---
+  // Each physical slot is written iff a push fires AND some pushed word j maps to it.
+  // We compute, per slot, the matching j (if any) and its enable. The push window is
+  // contiguous starting at tailBase, so at most one j hits each slot.
+  for (s <- 0 until BUF_WORDS) {
+    when(io.push.fire) {
+      for (j <- 0 until PUSH_WORDS) {
+        // physical slot for pushed word j = (tailBase + j) mod BUF_WORDS
+        val phys = UInt(IDXW bits)
+        val tb = (tailBase +^ j)
+        when(tb >= BUF_WORDS) {
+          phys := (tb - BUF_WORDS).resize(IDXW)
+        } .otherwise {
+          phys := tb.resize(IDXW)
+        }
+        when((U(j) < io.push.payload.n) && (phys === s)) {
+          entries(s).word          := io.push.payload.words(j)
+          entries(s).pred.simple   := io.push.payload.preds(j).simple
+          entries(s).pred.lenWords := io.push.payload.preds(j).lenWords
         }
       }
     }
-    countNext := afterShift + io.push.payload.n.resize(log2Up(BUF_WORDS + 1))
-  } .otherwise {
-    countNext := afterShift
   }
 
-  // Register the next values; flush overrides count to 0
+  // --- count / headPtr next ---
   when(io.flush) {
-    count := 0
+    count   := 0
+    headPtr := 0
   } .otherwise {
-    count := countNext
-  }
-
-  for (i <- 0 until BUF_WORDS) {
-    when(!io.flush) {
-      entries(i) := entriesNext(i)
-    }
-  }
-
-  // Combinational outputs
-  for (i <- 0 until HEAD_WORDS) {
-    when(U(i) < count) {
-      io.head(i)          := entries(i).word
-      io.headPred(i)      := entries(i).pred
+    when(io.push.fire) {
+      count := afterShift + io.push.payload.n.resize(log2Up(BUF_WORDS + 1))
     } .otherwise {
-      io.head(i)          := 0
+      count := afterShift
+    }
+    headPtr := newHeadPtr
+  }
+
+  // --- combinational head outputs: barrel-rotate of HEAD_WORDS slots ---
+  for (i <- 0 until HEAD_WORDS) {
+    // physical slot for logical word i = (headPtr + i) mod BUF_WORDS
+    val phys = UInt(IDXW bits)
+    val hp = (headPtr +^ i)
+    when(hp >= BUF_WORDS) {
+      phys := (hp - BUF_WORDS).resize(IDXW)
+    } .otherwise {
+      phys := hp.resize(IDXW)
+    }
+    when(U(i) < count) {
+      io.head(i)     := entries(phys).word
+      io.headPred(i) := entries(phys).pred
+    } .otherwise {
+      io.head(i)              := 0
       io.headPred(i).simple   := False
       io.headPred(i).lenWords := 0
     }
