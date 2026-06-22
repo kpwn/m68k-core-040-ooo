@@ -294,16 +294,60 @@ object MicroOpAssembler {
   // offload is per-SLOT (2 instances at decode), NOT per-IBuf-entry, so the IBuf shift mux
   // is untouched (no IBuf bloat). Byte-identical: OperationDecoder.decode(op) is the exact
   // same function whether evaluated here or one stage earlier.
+  //
+  // LEVER 2 (EaDecoder offload): the two PRIMARY EaDecoder.decode calls (srcEa = op[5:0]
+  // and dstEa = the MOVE dest field) feed the op-µop `imm` (the IMM-mode immediate via
+  // srcEa.imm) + the EA base/disp/auto/index routing, which is regen1's residual decode
+  // limiter (`fed_payload_packets -> pushReg_payload_uops_*_imm`). EaDecoder.decode is a
+  // PURE function of the EA field + size + the packet words (all available a full cycle
+  // pre-register), so pre-computing srcEa/dstEa on the aligner-output packet and carrying
+  // them in `Offload` collapses this cone to a registered read — byte-identical (same
+  // function, one stage earlier). The bespoke SHIFTED-words re-decodes (immEa / divl /
+  // mull / bfm / cmp2 / ucBfEaDec) are LEFT inline: they are narrow, op-class-specific,
+  // and not on the dominant `imm` fanout — offloading them would bloat the carried payload
+  // for little gain.
+  case class Offload() extends Bundle {
+    val spec  = OpSpec()
+    val srcEa = EaSpec()
+    val dstEa = EaSpec()
+  }
+
+  /** Compute the offload (spec + the two primary EAs) on the PRE-register packet.
+    * Carried through the FetchAlign->Decode register; `assemble` then reads it instead
+    * of re-running OperationDecoder + the two EaDecoders on the registered opword. */
+  def computeOffload(pkt: DecodePacket): Offload = {
+    val o = Offload()
+    o.spec := OperationDecoder.decode(pkt.words(0))
+    o.srcEa := EaDecoder.decode(pkt.words(0)(5 downto 0), o.spec.size, pkt.words)
+    val dstEaField = pkt.words(0)(8 downto 6) ## pkt.words(0)(11 downto 9)
+    o.dstEa := EaDecoder.decode(dstEaField, o.spec.size, pkt.words)
+    o
+  }
+
   def assemble(pkt: DecodePacket): AssembledUops = assemble(pkt, None)
-  def assemble(pkt: DecodePacket, specIn: Option[OpSpec]): AssembledUops = {
+  def assemble(pkt: DecodePacket, specIn: Option[OpSpec]): AssembledUops =
+    assembleImpl(pkt, specIn.map { s =>
+      // Standalone/spec caller passed only an OpSpec: derive the EAs inline (the EaDecoder
+      // offload applies only on the full DecodeStage path that supplies a complete Offload).
+      val o = Offload()
+      o.spec := s
+      o.srcEa := EaDecoder.decode(pkt.words(0)(5 downto 0), s.size, pkt.words)
+      val dstEaField = pkt.words(0)(8 downto 6) ## pkt.words(0)(11 downto 9)
+      o.dstEa := EaDecoder.decode(dstEaField, s.size, pkt.words)
+      o
+    })
+  def assemble(pkt: DecodePacket, offIn: Offload): AssembledUops = assembleImpl(pkt, Some(offIn))
+
+  private def assembleImpl(pkt: DecodePacket, offIn: Option[Offload]): AssembledUops = {
     val out = AssembledUops()
     val op  = pkt.words(0)
-    val spec = specIn.getOrElse(OperationDecoder.decode(op))
+    val off = offIn.getOrElse(computeOffload(pkt))
+    val spec = off.spec
 
     // EA fields. Source EA = op(5..0). Dest EA (MOVE) = dstMode(8..6) ## dstReg(11..9).
-    val srcEa = EaDecoder.decode(op(5 downto 0), spec.size, pkt.words)
-    val dstEaField = op(8 downto 6) ## op(11 downto 9)
-    val dstEa = EaDecoder.decode(dstEaField, spec.size, pkt.words)
+    // LEVER 2: read the offloaded (pre-register-computed) EAs instead of re-decoding.
+    val srcEa = off.srcEa
+    val dstEa = off.dstEa
 
     // Line-0 immediate (IMMEXT): the trailing extension word(s), sized by the op.
     // .L = words(1)##words(2) (the full 32-bit value); .B/.W = words(1) (sign-extended,
