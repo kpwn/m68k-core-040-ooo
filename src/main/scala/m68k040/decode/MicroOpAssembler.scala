@@ -284,10 +284,21 @@ object MicroOpAssembler {
     u
   }
 
-  def assemble(pkt: DecodePacket): AssembledUops = {
+  // FRONTEND-FMAX ANGLE E (predecode-offload): the OperationDecoder masked-pattern
+  // table is a PURE function of the opword (pkt.words(0)) — the dominant combinational
+  // cone half on the registered `fed_payload -> pushReg.uops` critical arc. By computing
+  // the OpSpec on the PRE-register (aligner-output) opword and carrying it through the
+  // FetchAlign->Decode register, the post-register `assemble` reads a REGISTERED spec
+  // (a thin select) instead of re-running the table. `specIn` is the offloaded spec; when
+  // None (decode-unit tests / standalone callers) the table runs inline as before. The
+  // offload is per-SLOT (2 instances at decode), NOT per-IBuf-entry, so the IBuf shift mux
+  // is untouched (no IBuf bloat). Byte-identical: OperationDecoder.decode(op) is the exact
+  // same function whether evaluated here or one stage earlier.
+  def assemble(pkt: DecodePacket): AssembledUops = assemble(pkt, None)
+  def assemble(pkt: DecodePacket, specIn: Option[OpSpec]): AssembledUops = {
     val out = AssembledUops()
     val op  = pkt.words(0)
-    val spec = OperationDecoder.decode(op)
+    val spec = specIn.getOrElse(OperationDecoder.decode(op))
 
     // EA fields. Source EA = op(5..0). Dest EA (MOVE) = dstMode(8..6) ## dstReg(11..9).
     val srcEa = EaDecoder.decode(op(5 downto 0), spec.size, pkt.words)

@@ -34,6 +34,15 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
   case class FedPacket() extends Bundle {
     val packets    = Vec(DecodePacket(), 2)
     val slot1Valid = Bool()
+    // FRONTEND-FMAX ANGLE E (predecode-offload): the per-slot OperationDecoder OpSpec,
+    // computed on the PRE-register (aligner-output) opword and carried through this
+    // register. The masked-pattern decode table is the dominant combinational cone half
+    // on the post-register `fed_payload -> pushReg.uops` critical arc; evaluating it on
+    // the input side of the FetchAlign->Decode register (whose pre-register / aligner cone
+    // is NOT the limiter) rebalances the two halves and shrinks the decode cone. OpSpec is
+    // a pure function of the opword, so this is byte-identical. 2 instances (per slot),
+    // NOT per-IBuf-entry -> the IBuf shift mux is unchanged (no IBuf bloat).
+    val specs      = Vec(OpSpec(), 2)
   }
 
   // Push payload registered between the decode/pack output and the MicroOpQueue write
@@ -68,6 +77,12 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     fedIn.payload.packets(0) := df.feed.payload(0)
     fedIn.payload.packets(1) := df.feed.payload(1)
     fedIn.payload.slot1Valid := df.slot1Valid
+    // ANGLE E offload: decode the per-slot OpSpec on the PRE-register opword (the aligner
+    // output, available a full cycle before `fed`). The result is registered alongside the
+    // packets so the post-register decode cone collapses to a select. Pure-function of the
+    // opword -> byte-identical to decoding the registered opword in `assemble`.
+    fedIn.payload.specs(0)   := OperationDecoder.decode(df.feed.payload(0).words(0))
+    fedIn.payload.specs(1)   := OperationDecoder.decode(df.feed.payload(1).words(0))
     df.feed.ready := fedIn.ready
 
     val fed = PipeStage(fedIn, pipeFlush)
@@ -81,8 +96,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // NOT lost. (RTR/RTS redirect -> a stashed wrong-path slot1 is harmlessly squashed
     // by pipeFlush; a mem-dest RMW does NOT redirect, so its slot1 is real and MUST be
     // preserved.) A 3-µop SLOT1 (after a <=2-µop slot0) is likewise stashed + replayed.
-    val a0 = MicroOpAssembler.assemble(fed.payload.packets(0))
-    val a1raw = MicroOpAssembler.assemble(fed.payload.packets(1))
+    // ANGLE E: pass the REGISTERED (offloaded) per-slot OpSpec into the assembler so the
+    // deep masked-pattern table is NOT re-evaluated on the post-register critical arc.
+    val a0 = MicroOpAssembler.assemble(fed.payload.packets(0), Some(fed.payload.specs(0)))
+    val a1raw = MicroOpAssembler.assemble(fed.payload.packets(1), Some(fed.payload.specs(1)))
 
     // Stash for a deferred slot1. FMax: stash the ALREADY-DECODED slot1 µops (computed
     // from a1raw, no second MicroOpAssembler instance) — the replay cycle reads these
@@ -107,7 +124,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // both the MOVEM and the microcoded slot1 markers — they cannot be emitted as a normal
     // crack; their real µops come from the FSM / µcode sequencer entered from the stashed
     // packet, so both MUST be excluded from the normal slot1 push to avoid a phantom commit).
-    val slot1Spec0        = OperationDecoder.decode(fed.payload.packets(1).words(0))
+    val slot1Spec0        = fed.payload.specs(1)   // ANGLE E: registered offloaded spec
     val slot1IsMovemEarly = fed.valid && fed.payload.slot1Valid && slot1Spec0.movem
     val slot1IsUcodeEarly = fed.valid && fed.payload.slot1Valid && slot1Spec0.microcoded
     // A slot1 MOVEP, like a slot1 MOVEM, cannot be emitted as a normal crack — its real
@@ -223,7 +240,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // a normal crack, so when slot0 is non-MOVEM and slot1 IS a MOVEM, slot0 emits this
     // cycle and the slot1 PACKET (opword+mask+pc+lenWords) is stashed; the FSM enters from
     // it next cycle (mirrors the 3-µop slot1 defer, but carries the raw packet).
-    val spec0  = OperationDecoder.decode(fed.payload.packets(0).words(0))
+    val spec0  = fed.payload.specs(0)   // ANGLE E: registered offloaded spec
     val slot0IsMovem = fed.valid && spec0.movem
     // MOVEP slot0 marker (shared CSE with spec0): owned by the MOVEP FSM (below),
     // mutually exclusive with the fast head AND the MOVEM/µcode sequencers.
