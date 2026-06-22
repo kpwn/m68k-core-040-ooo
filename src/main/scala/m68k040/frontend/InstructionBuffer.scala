@@ -10,11 +10,15 @@ case class IbEntry() extends Bundle {
 }
 
 class InstructionBuffer extends Component {
-  // Depth-2 fetch (VARIANT 1): the buffer must absorb up to TWO in-flight 4-word
-  // windows (8 words) on top of the live head. Bumped 12 -> 16 so a 2nd outstanding
-  // fetch can be issued without the IBuf back-pressuring the aligner head. HEAD_WORDS
-  // (the aligner visibility window) is unchanged at 10.
-  val BUF_WORDS = 16
+  // Depth-3 fetch (ANGLE D): the buffer must absorb up to THREE in-flight 4-word
+  // windows (12 words) on top of the live head, while the FetchAlign issue reservation
+  // (cnt + (ringCount+1)*4 <= BUF_WORDS) keeps the deepest (3rd) outstanding fetch from
+  // overflowing. Sized 20 so the 3rd outstanding fetch can issue with the live head still
+  // at cnt<=8 (cnt+12<=20) — the same head headroom v1's depth-2 had (cnt<=8). HEAD_WORDS
+  // (the aligner visibility window) is unchanged at 10, so the aligner cone is identical;
+  // only the shift/push mux grows from 16->20 entries (still NARROW: push stays 4 words,
+  // the v3 wide-window 8-word push limiter is avoided).
+  val BUF_WORDS = 20
   val HEAD_WORDS = 10
 
   val io = new Bundle {

@@ -149,7 +149,14 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // captured at ISSUE — immune to later redirects overwriting global state (the bug
     // that wedged nested-bsr-during-miss: a stale window mis-attributed to a redirect
     // target). A redirect marks ALL in-flight entries stale (recStale bug class).
-    val RING = 2
+    // ANGLE D (depth-3): extend the outstanding ring to 3. The I-cache is a 3-stage
+    // flow-through pipe (T-stage -> S1 -> rsp), so up to THREE fetches are physically in
+    // flight (one in each stage) before the oldest is consumed. With the 3-cycle hit
+    // latency, depth-3 fully hides it -> a fresh 8-byte (4-word) window can land EVERY
+    // cycle. The window stays NARROW (push-4) -> the IBuf shift mux stays small (the
+    // v3 wide-window FMax limiter is avoided). The ring is parameterized by RING, so the
+    // generalization is purely RING=3 (all per-entry: ringStale/ringDrop FIFO of 3).
+    val RING = 3
     val ringStale = Vec.fill(RING)(Reg(Bool()) init False)  // per-entry: redirect after issue -> discard rsp
     val ringDrop  = Vec.fill(RING)(Reg(UInt(2 bits)) init 0) // per-entry: leading words to drop (target[2:1])
     val ringHead  = Reg(UInt(log2Up(RING) bits)) init 0      // oldest in-flight: the NEXT rsp belongs to it
@@ -159,6 +166,12 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // single-outstanding code used. ringFull blocks issue when both slots are occupied.
     val recValid  = ringCount =/= 0
     val ringFull  = ringCount === RING
+    // Modular increment of a ring index (head/tail). RING=3 is NOT a power of two, so the
+    // log2Up(RING)=2-bit index cannot rely on natural binary wrap (2+1=3, not 0). Wrap
+    // explicitly at RING. For a power-of-two RING this folds to the plain +1 wrap.
+    def ringInc(idx: UInt): UInt =
+      if (isPow2(RING)) (idx + 1).resized
+      else Mux(idx === U(RING - 1, idx.getWidth bits), U(0, idx.getWidth bits), (idx + 1).resized)
     // Leading-word drop intent for the NEXT fetch to issue (set by a redirect to
     // target[2:1]; latched into the ring entry at issue, then cleared).
     val pendingDrop = Reg(UInt(2 bits)) init 0
@@ -187,18 +200,21 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // -> born stale. (mispredictRedirect/redirect/resume declared above; resume only when stalled.)
     val redirectThisCycle = redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid || predictFire
 
-    // ---- FetchControl: issue fetches (DEPTH-2 multi-outstanding) ----
-    // Issue while the ring has a free slot (!ringFull) — up to 2 in flight. Suppress
+    // ---- FetchControl: issue fetches (DEPTH-3 multi-outstanding, ANGLE D) ----
+    // Issue while the ring has a free slot (!ringFull) — up to 3 in flight. Suppress
     // fetching while holding an I-fetch fault OR while STOP-quiesced (wait for the
     // redirect / IRQ-entry vector to clear it).
     //
-    // IBuf absorption (depth-2): the IBuf's own push.ready only reserves space for ONE
-    // window (the push that lands this cycle). With 2 outstanding fetches, BOTH responses
-    // (up to 8 words) can land while the consumer is stalled. So the ISSUE gate reserves
-    // landing space for EVERY outstanding window PLUS the new one: cnt + (ringCount+1)*4
-    // <= BUF_WORDS. (Reserves a full 4 words/window — a leading-word drop only shrinks a
-    // window, so this is a safe upper bound.) BUF_WORDS=16 admits the 2nd fetch up to
-    // cnt<=8. This SUPERSEDES the single-window push.ready for the issue decision.
+    // IBuf absorption (depth-3): the IBuf's own push.ready only reserves space for ONE
+    // window (the push that lands this cycle). With up to 3 outstanding fetches, ALL three
+    // responses (up to 12 words) can land while the consumer is stalled. So the ISSUE gate
+    // reserves landing space for EVERY outstanding window PLUS the new one: cnt +
+    // (ringCount+1)*4 <= BUF_WORDS. (Reserves a full 4 words/window — a leading-word drop
+    // only shrinks a window, so this is a safe upper bound.) With BUF_WORDS=20 the deepest
+    // (3rd) outstanding fetch (ringCount=2) admits up to cnt<=8, exactly v1's depth-2 head
+    // headroom. This SUPERSEDES the single-window push.ready for the issue decision and is
+    // the no-overflow invariant: post-issue worst-case occupancy = cnt + (ringCount+1)*4
+    // <= BUF_WORDS (cnt only shrinks via shift before those windows land).
     val ibufRoomForIssue =
       (ibuf.io.cnt +^ ((ringCount +^ U(1)) * U(4))) <= U(ibuf.BUF_WORDS)
     ic.cmd.valid      := started && !ringFull && ibufRoomForIssue && !stalled && !faultHold && !quiesce
@@ -210,7 +226,7 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       // intent; consume it. Advance tail + count.
       ringStale(ringTail) := redirectThisCycle
       ringDrop(ringTail)  := pendingDrop
-      ringTail := (ringTail + 1).resized
+      ringTail := ringInc(ringTail)
       pendingDrop := 0
       // Advance the SEQUENTIAL fetch pointer at ISSUE (depth-2 needs fetchPc+8 ready for
       // the NEXT cycle's issue while this fetch is still in flight). Only for a live
@@ -250,7 +266,7 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       // Consume the HEAD ring entry: advance head. (fetchPc is advanced at ISSUE for
       // depth-2, NOT here — the sequential pointer must already be +8 for the 2nd
       // outstanding fetch while the 1st is in flight.)
-      ringHead := (ringHead + 1).resized
+      ringHead := ringInc(ringHead)
 
       when(!rspStaleHead && !ic.rsp.payload.fault) {
         // Leading-word drop carried by THIS fetch's record (the head entry's drop).
