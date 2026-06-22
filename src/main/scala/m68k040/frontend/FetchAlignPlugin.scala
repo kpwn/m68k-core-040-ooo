@@ -141,18 +141,41 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // a complex packet has shiftWords=0, so on its fire only `stalled` advances,
     // gating feed.valid until `resume` clears it.
 
-    // Per-fetch outstanding-record tracking (Slice 1: ONE record = single-outstanding;
-    // Slice 2 generalizes {recValid,recStale,recDrop} to a depth-N ring once the I-cache
-    // is pipelined). The in-flight fetch carries its OWN stale + leading-drop, captured at
-    // ISSUE — immune to later redirects overwriting global state (the bug that wedged
-    // nested-bsr-during-miss: a stale window mis-attributed to a redirect target).
-    val recValid = Reg(Bool()) init False   // a fetch is outstanding (replaces fetchInFlight)
-    val recStale = Reg(Bool()) init False   // a redirect happened after it issued -> discard its rsp
-    val recDrop  = Reg(UInt(2 bits)) init 0 // leading words to drop on its rsp (target[2:1])
+    // Per-fetch outstanding-record tracking — VARIANT 1: a DEPTH-2 RING (Slice 2
+    // generalizes the single-outstanding {recValid,recStale,recDrop} to a depth-N ring
+    // now that the I-cache is pipelined). The I-cache pipeline returns responses IN
+    // ORDER, so a simple 2-entry FIFO (head=oldest, consumed by the next rsp; tail=newest
+    // issued) tracks ≥2 fetches in flight. Each entry carries its OWN stale + leading-drop
+    // captured at ISSUE — immune to later redirects overwriting global state (the bug
+    // that wedged nested-bsr-during-miss: a stale window mis-attributed to a redirect
+    // target). A redirect marks ALL in-flight entries stale (recStale bug class).
+    // ANGLE D (depth-3): extend the outstanding ring to 3. The I-cache is a 3-stage
+    // flow-through pipe (T-stage -> S1 -> rsp), so up to THREE fetches are physically in
+    // flight (one in each stage) before the oldest is consumed. With the 3-cycle hit
+    // latency, depth-3 fully hides it -> a fresh 8-byte (4-word) window can land EVERY
+    // cycle. The window stays NARROW (push-4) -> the IBuf shift mux stays small (the
+    // v3 wide-window FMax limiter is avoided). The ring is parameterized by RING, so the
+    // generalization is purely RING=3 (all per-entry: ringStale/ringDrop FIFO of 3).
+    val RING = 3
+    val ringStale = Vec.fill(RING)(Reg(Bool()) init False)  // per-entry: redirect after issue -> discard rsp
+    val ringDrop  = Vec.fill(RING)(Reg(UInt(2 bits)) init 0) // per-entry: leading words to drop (target[2:1])
+    val ringHead  = Reg(UInt(log2Up(RING) bits)) init 0      // oldest in-flight: the NEXT rsp belongs to it
+    val ringTail  = Reg(UInt(log2Up(RING) bits)) init 0      // next slot to ISSUE into
+    val ringCount = Reg(UInt(log2Up(RING + 1) bits)) init 0  // # outstanding (0..RING)
+    // Back-compat alias: recValid (≥1 outstanding) drives the SAME guards/markers the
+    // single-outstanding code used. ringFull blocks issue when both slots are occupied.
+    val recValid  = ringCount =/= 0
+    val ringFull  = ringCount === RING
+    // Modular increment of a ring index (head/tail). RING=3 is NOT a power of two, so the
+    // log2Up(RING)=2-bit index cannot rely on natural binary wrap (2+1=3, not 0). Wrap
+    // explicitly at RING. For a power-of-two RING this folds to the plain +1 wrap.
+    def ringInc(idx: UInt): UInt =
+      if (isPow2(RING)) (idx + 1).resized
+      else Mux(idx === U(RING - 1, idx.getWidth bits), U(0, idx.getWidth bits), (idx + 1).resized)
     // Leading-word drop intent for the NEXT fetch to issue (set by a redirect to
-    // target[2:1]; latched into recDrop at issue, then cleared).
+    // target[2:1]; latched into the ring entry at issue, then cleared).
     val pendingDrop = Reg(UInt(2 bits)) init 0
-    spinal.core.sim.SimPublic(recValid, recStale, recDrop, pendingDrop)
+    spinal.core.sim.SimPublic(recValid, ringCount, ringHead, ringTail, pendingDrop)
 
     // ---- Default-drive IBuf inputs ----
     ibuf.io.push.valid   := False
@@ -177,53 +200,77 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // -> born stale. (mispredictRedirect/redirect/resume declared above; resume only when stalled.)
     val redirectThisCycle = redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid || predictFire
 
-    // ---- FetchControl: issue fetches (single-outstanding) ----
-    // Suppress fetching while holding an I-fetch fault OR while STOP-quiesced (wait for the
+    // ---- FetchControl: issue fetches (DEPTH-3 multi-outstanding, ANGLE D) ----
+    // Issue while the ring has a free slot (!ringFull) — up to 3 in flight. Suppress
+    // fetching while holding an I-fetch fault OR while STOP-quiesced (wait for the
     // redirect / IRQ-entry vector to clear it).
-    ic.cmd.valid      := started && !recValid && ibuf.io.push.ready && !stalled && !faultHold && !quiesce
+    //
+    // IBuf absorption (depth-3): the IBuf's own push.ready only reserves space for ONE
+    // window (the push that lands this cycle). With up to 3 outstanding fetches, ALL three
+    // responses (up to 12 words) can land while the consumer is stalled. So the ISSUE gate
+    // reserves landing space for EVERY outstanding window PLUS the new one: cnt +
+    // (ringCount+1)*4 <= BUF_WORDS. (Reserves a full 4 words/window — a leading-word drop
+    // only shrinks a window, so this is a safe upper bound.) With BUF_WORDS=20 the deepest
+    // (3rd) outstanding fetch (ringCount=2) admits up to cnt<=8, exactly v1's depth-2 head
+    // headroom. This SUPERSEDES the single-window push.ready for the issue decision and is
+    // the no-overflow invariant: post-issue worst-case occupancy = cnt + (ringCount+1)*4
+    // <= BUF_WORDS (cnt only shrinks via shift before those windows land).
+    val ibufRoomForIssue =
+      (ibuf.io.cnt +^ ((ringCount +^ U(1)) * U(4))) <= U(ibuf.BUF_WORDS)
+    ic.cmd.valid      := started && !ringFull && ibufRoomForIssue && !stalled && !faultHold && !quiesce
     ic.cmd.payload.pc := fetchPc
 
     when(ic.cmd.fire) {
-      // Capture this fetch's record. Born stale iff a redirect fires THIS cycle (this
-      // fetch used the old, now-wrong fetchPc). Latch the drop intent; consume it.
-      recValid := True
-      recStale := redirectThisCycle
-      recDrop  := pendingDrop
+      // Capture this fetch's record into the TAIL ring slot. Born stale iff a redirect
+      // fires THIS cycle (this fetch used the old, now-wrong fetchPc). Latch the drop
+      // intent; consume it. Advance tail + count.
+      ringStale(ringTail) := redirectThisCycle
+      ringDrop(ringTail)  := pendingDrop
+      ringTail := ringInc(ringTail)
       pendingDrop := 0
+      // Advance the SEQUENTIAL fetch pointer at ISSUE (depth-2 needs fetchPc+8 ready for
+      // the NEXT cycle's issue while this fetch is still in flight). Only for a live
+      // (non-redirect) issue: a redirect this cycle resets fetchPc to its target below
+      // (and overrides this), and a stale issue's window is discarded. Guarding on
+      // !redirectThisCycle keeps fetchPc from walking past a coincident redirect target.
+      when(!redirectThisCycle) {
+        fetchPc := fetchPc + 8
+      }
     }
+    // ringCount: +1 on a fire that is NOT consumed this cycle, -1 on a rsp consume that
+    // is not re-issued; net handled below where the rsp is consumed (both can happen the
+    // same cycle in steady state: one in, one out -> count unchanged).
 
     // ---- Enqueue: handle I-cache responses ----
     // Extract the 4 words from the 64-bit response data (LE: bits[15:0] = word 0 = lowest addr)
     val rspWords = ic.rsp.payload.data.subdivideIn(16 bits)
     val rspPreds = ic.rsp.payload.pred
 
+    // The response belongs to the HEAD ring entry (in-order pipeline). Its OWN
+    // stale/drop govern discard + leading-word drop.
+    val rspStaleHead = ringStale(ringHead)
+    val rspDropHead  = ringDrop(ringHead)
+
     // A fault response (not stale): latch the fault + the faulting fetch PC and stop
     // fetching. The faulted packet is emitted on the feed below; do NOT enqueue words.
     // Capture the FIRST fault only (gate on !faultHold): a fault response one cycle
     // before the hold engages can be followed by a second in-flight fault response for
     // the next window; the EA must be the FIRST faulting address, not the later one.
-    val rspFault = ic.rsp.valid && ic.rsp.payload.fault && !recStale && !faultHold
+    val rspFault = ic.rsp.valid && ic.rsp.payload.fault && !rspStaleHead && !faultHold
     when(rspFault) {
       faultHold := True
       faultPc   := ic.rsp.payload.pc
     }
 
     when(ic.rsp.valid) {
-      recValid := False          // the outstanding fetch's response arrived (record consumed)
-      // Advance the sequential fetch pointer ONLY for a live (non-stale) response. A
-      // STALE response belongs to a fetch issued before a redirect; the redirect already
-      // reset fetchPc to the new target window, so the next fetch must use THAT target —
-      // advancing here would walk fetchPc off the target (B+8 instead of B), enqueuing a
-      // window that the aligner cannot match against decodePc (lenWords=0 self-redirect).
-      // (Old global tracking advanced unconditionally; it relied on the redirect-cycle
-      // override and broke once the stale rsp arrived a cycle after the redirect.)
-      when(!recStale) {
-        fetchPc := fetchPc + 8
-      }
+      // Consume the HEAD ring entry: advance head. (fetchPc is advanced at ISSUE for
+      // depth-2, NOT here — the sequential pointer must already be +8 for the 2nd
+      // outstanding fetch while the 1st is in flight.)
+      ringHead := ringInc(ringHead)
 
-      when(!recStale && !ic.rsp.payload.fault) {
-        // Leading-word drop carried by THIS fetch's record.
-        val startWord = recDrop
+      when(!rspStaleHead && !ic.rsp.payload.fault) {
+        // Leading-word drop carried by THIS fetch's record (the head entry's drop).
+        val startWord = rspDropHead
         val nWords    = U(4, 3 bits) - startWord.resize(3)
         for (j <- 0 until 4) {
           when(U(j) < nWords) {
@@ -237,6 +284,18 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
         ibuf.io.push.valid     := True
       }
       // stale OR fault: enqueue nothing (discard), as before.
+    }
+
+    // ---- Ring occupancy update (single driver for ringCount) ----
+    // +1 when a fetch issues, -1 when a response is consumed; both can happen the same
+    // cycle (steady-state: one in / one out -> count unchanged). The issue/rsp guards
+    // above (!ringFull / ringHead consume) keep this in [0, RING].
+    val issFire = ic.cmd.fire
+    val rspFire = ic.rsp.valid
+    when(issFire && !rspFire) {
+      ringCount := (ringCount + 1).resized
+    } elsewhen(!issFire && rspFire) {
+      ringCount := (ringCount - 1).resized
     }
 
     // ---- Aligner: combinational decode of buffer head ----
@@ -464,7 +523,11 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       pendingDrop    := newPc(2 downto 1)
       // Mark the in-flight fetch (if any) stale — the speculative target window
       // supersedes it (the same recStale discipline the architectural redirects use).
-      when(recValid) { recStale := True }
+      // Depth-2: mark ALL ring entries stale — every fetch issued before this redirect
+      // (and one issued THIS cycle, born stale via redirectThisCycle) is wrong-path; its
+      // response must be discarded. Free slots' stale bits are don't-care (overwritten at
+      // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
+      ringStale.foreach(_ := True)
     }
 
     // ---- redirect (highest priority) ----
@@ -486,7 +549,11 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       // consumed + discarded in the rsp block. recValid is NOT cleared: the fetch is still
       // physically coming; its stale response clears recValid normally, preserving the
       // single-outstanding invariant — a new fetch issues only after that frees occupancy.)
-      when(recValid) { recStale := True }
+      // Depth-2: mark ALL ring entries stale — every fetch issued before this redirect
+      // (and one issued THIS cycle, born stale via redirectThisCycle) is wrong-path; its
+      // response must be discarded. Free slots' stale bits are don't-care (overwritten at
+      // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
+      ringStale.foreach(_ := True)
     }
 
     // ---- resume (lower priority than redirect, active when stalled) ----
@@ -498,7 +565,11 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       stalled        := False
       pendingDrop    := newPc(2 downto 1)
       // Per-fetch stale tracking (recValid/recStale/recDrop) replaces the single-bit rspStale/dropPending.
-      when(recValid) { recStale := True }
+      // Depth-2: mark ALL ring entries stale — every fetch issued before this redirect
+      // (and one issued THIS cycle, born stale via redirectThisCycle) is wrong-path; its
+      // response must be discarded. Free slots' stale bits are don't-care (overwritten at
+      // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
+      ringStale.foreach(_ := True)
     }
 
     // ---- commit-time mispredict redirect (HIGHEST priority) ----
@@ -523,7 +594,11 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       faultEmitted   := False
       pendingDrop    := newPc(2 downto 1)
       // Per-fetch stale tracking (recValid/recStale/recDrop) replaces the single-bit rspStale/dropPending.
-      when(recValid) { recStale := True }
+      // Depth-2: mark ALL ring entries stale — every fetch issued before this redirect
+      // (and one issued THIS cycle, born stale via redirectThisCycle) is wrong-path; its
+      // response must be discarded. Free slots' stale bits are don't-care (overwritten at
+      // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
+      ringStale.foreach(_ := True)
     }
   }
 
