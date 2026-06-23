@@ -4,12 +4,27 @@ import m68k040.cache.ChunkPredecode
 import spinal.core._
 
 object PredecodeWord {
-  def classify(op: Bits): ChunkPredecode = {
+  // `extW` = the word FOLLOWING the opword (the EA's first extension word). Needed to
+  // frame a 68020+ FULL-format indexed EA's variable length (1 + bd + od ext words);
+  // the brief path ignores it. Callers without an ext word use the 1-arg overload.
+  def classify(op: Bits): ChunkPredecode = classify(op, B(0, 16 bits))
+  def classify(op: Bits, extW: Bits): ChunkPredecode = {
     val r = ChunkPredecode()
     r.simple   := False
     r.lenWords := U(0, 3 bits)
 
     val cls = op(15 downto 12).asUInt
+
+    // Full-format (bit8=1) EA extension length = 1 (ext word) + bd + od words:
+    //   bd words: bits5:4 -> 00|01=0, 10=1, 11=2.  od words: bit1(present)? bit0(long)?2:1 : 0.
+    // `eaW` is the EA's FIRST extension word (the word after the opword for an EA-first op).
+    def fullExtLen(eaW: Bits): UInt = {
+      val bdSz  = eaW(5 downto 4).asUInt
+      val bdW   = Mux(bdSz === U(2, 2 bits), U(1, 3 bits),
+                  Mux(bdSz === U(3, 2 bits), U(2, 3 bits), U(0, 3 bits)))
+      val odW   = Mux(!eaW(1), U(0, 3 bits), Mux(eaW(0), U(2, 3 bits), U(1, 3 bits)))
+      (U(1, 3 bits) + bdW + odW).resize(3)
+    }
 
     // In-scope MEMSIMPLE RMW-DESTINATION EA: (An)=mode2 (0 ext), (An)+=mode3 (0 ext),
     // -(An)=mode4 (0 ext), (d16,An)=mode5 (1 ext), (xxx).W=mode7/reg0 (1 ext),
@@ -17,7 +32,7 @@ object PredecodeWord {
     // no extension word (the An side-effect is folded by the assembler crack). The indexed
     // (mode 6 / 7-3) + (d16,PC) (read-only, not alterable) + #imm modes are NOT in scope
     // -> ok=False -> COMPLEX. Used to frame the mem-dest RMW lengths (so nextPc is right).
-    def memDestExt(mode: UInt, reg: UInt): (Bool, UInt) = {
+    def memDestExt(mode: UInt, reg: UInt, eaW: Bits = B(0, 16 bits)): (Bool, UInt) = {
       val ok  = Bool(); val ext = UInt(3 bits)
       ok := False; ext := U(0, 3 bits)
       switch(mode) {
@@ -25,7 +40,9 @@ object PredecodeWord {
         is(U(3, 3 bits)) { ok := True; ext := U(0, 3 bits) }   // (An)+ postincrement (no ext)
         is(U(4, 3 bits)) { ok := True; ext := U(0, 3 bits) }   // -(An) predecrement (no ext)
         is(U(5, 3 bits)) { ok := True; ext := U(1, 3 bits) }   // (d16,An)
-        is(U(6, 3 bits)) { ok := True; ext := U(1, 3 bits) }   // (d8,An,Xn) brief indexed (alterable)
+        is(U(6, 3 bits)) {                                     // (d8,An,Xn) brief / full-format
+          ok := True; ext := Mux(eaW(8), fullExtLen(eaW), U(1, 3 bits))
+        }
         is(U(7, 3 bits)) {
           switch(reg) {
             is(U(0, 3 bits)) { ok := True; ext := U(1, 3 bits) }   // (xxx).W
@@ -39,8 +56,9 @@ object PredecodeWord {
       (ok, ext)
     }
 
-    // EA extension words; returns (ok, ext). ok=False => complex.
-    def eaExt(mode: UInt, reg: UInt, sizeL: Bool, allowImm: Boolean): (Bool, UInt) = {
+    // EA extension words; returns (ok, ext). ok=False => complex. `eaW` = the EA's first
+    // ext word (op+1 for an EA-first op) — used ONLY to frame a full-format indexed EA.
+    def eaExt(mode: UInt, reg: UInt, sizeL: Bool, allowImm: Boolean, eaW: Bits): (Bool, UInt) = {
       val ok  = Bool()
       val ext = UInt(3 bits)
       ok  := True
@@ -53,19 +71,17 @@ object PredecodeWord {
           ext := U(1, 3 bits)
         }
         is(U(6, 3 bits)) {
-          // Brief-format indexed (d8,An,Xn): 1 ext word. Predecode cannot see bit8 (full
-          // vs brief) — frame as brief len 1. A FULL-format EA (bit8=1) is illegalised by
-          // the assembler (MEMCOMPLEX -> vector-4 fault), where a mis-framed length is
-          // harmless (the illegal op flushes the pipeline at the faulting pc). Track B
-          // handles the full extension format precisely.
-          ext := U(1, 3 bits)
+          // (d8,An,Xn) brief = 1 ext word; FULL-format (bit8=1) = 1 + bd + od (1..5).
+          ext := Mux(eaW(8), fullExtLen(eaW), U(1, 3 bits))
         }
         is(U(7, 3 bits)) {
           switch(reg) {
             is(U(0, 3 bits)) { ext := U(1, 3 bits) }
             is(U(1, 3 bits)) { ext := U(2, 3 bits) }
             is(U(2, 3 bits)) { ext := U(1, 3 bits) }
-            is(U(3, 3 bits)) { ext := U(1, 3 bits) }   // (d8,PC,Xn) brief indexed: 1 ext word
+            is(U(3, 3 bits)) {                            // (d8,PC,Xn) brief / full-format
+              ext := Mux(eaW(8), fullExtLen(eaW), U(1, 3 bits))
+            }
             is(U(4, 3 bits)) {
               if (allowImm) {
                 ext := Mux(sizeL, U(2, 3 bits), U(1, 3 bits))
@@ -106,8 +122,11 @@ object PredecodeWord {
             r.simple := True; r.lenWords := (U(1, 3 bits) + immWords).resized   // data-reg dest
           } otherwise {
             // mem-dest RMW (ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea>): opword + imm words +
-            // the EA extension (imm precedes the EA ext). In-scope MEMSIMPLE dest only.
-            val (mok, mext) = memDestExt(mode, reg)
+            // the EA extension (imm precedes the EA ext). In-scope MEMSIMPLE dest only. For
+            // a full-format dst, the EA ext = op+1 ONLY when the imm is 1 word (.B/.W); a
+            // .L imm pushes the EA ext to op+2 (not visible -> brief framing).
+            val immDstEaW = Mux(ss === U(2, 2 bits), B(0, 16 bits), extW)
+            val (mok, mext) = memDestExt(mode, reg, immDstEaW)
             when(mok) {
               r.simple := True; r.lenWords := (U(1, 3 bits) + immWords + mext).resized
             }
@@ -127,7 +146,10 @@ object PredecodeWord {
           when(mode === U(0, 3 bits)) {                         // Dn dest (LONG)
             r.simple := True; r.lenWords := bitBase
           } otherwise {                                         // memory dest (BYTE) -> +EA ext
-            val (mok, mext) = memDestExt(mode, reg)
+            // Dynamic bit-op: EA ext = op+1 (no preceding word). Static: a bit-number word
+            // precedes the EA ext (op+1 is the bit word) -> brief framing.
+            val bitDstEaW = Mux(isStatBit, B(0, 16 bits), extW)
+            val (mok, mext) = memDestExt(mode, reg, bitDstEaW)
             when(mok) { r.simple := True; r.lenWords := (bitBase + mext).resized }
           }
         }
@@ -152,7 +174,9 @@ object PredecodeWord {
           // harmless: the illegal op flushes at the faulting pc).
           val ctrlMode = (mode === U(2, 3 bits)) || (mode === U(5, 3 bits)) ||
                          (mode === U(6, 3 bits)) || (mode === U(7, 3 bits))
-          val (ok, e) = eaExt(mode, reg, sizeL = False, allowImm = false)
+          // CMP2/CHK2 EA ext follows a PRECEDING ext word, so op+1 is NOT the EA ext;
+          // pass 0 to keep brief framing (full-format here is out of scope).
+          val (ok, e) = eaExt(mode, reg, sizeL = False, allowImm = false, eaW = B(0, 16 bits))
           when(ok && ctrlMode) {
             r.simple   := True
             r.lenWords := (U(2, 3 bits) + e).resized   // opword + ext word + EA ext
@@ -168,7 +192,8 @@ object PredecodeWord {
         val dstMode = op(8 downto 6).asUInt
         val dstReg  = op(11 downto 9).asUInt
 
-        val (sOk, sExt) = eaExt(srcMode, srcReg, sizeL, allowImm = true)
+        // MOVE source EA is the FIRST ext word -> extW is its ext word (full-format OK).
+        val (sOk, sExt) = eaExt(srcMode, srcReg, sizeL, allowImm = true, eaW = extW)
 
         // dst: modes 0-5 via eaExt(allowImm=false), mode 6 = brief indexed (1 ext word),
         // mode 7 only reg0/reg1, else complex. mode 7-3 ((d8,PC,Xn)) + 7-2 ((d16,PC)) are
@@ -180,6 +205,8 @@ object PredecodeWord {
         dOk  := True
         dExt := U(0, 3 bits)
 
+        // The dst EA's first ext word is op+1 only when the src ext = 0 (else brief).
+        val dstEaW0 = Mux(sExt === U(0, 3 bits), extW, B(0, 16 bits))
         when(dstMode === U(7, 3 bits)) {
           switch(dstReg) {
             is(U(0, 3 bits)) { dExt := U(1, 3 bits) }
@@ -187,9 +214,10 @@ object PredecodeWord {
             default          { dOk  := False }
           }
         } elsewhen(dstMode === U(6, 3 bits)) {
-          dExt := U(1, 3 bits)   // (d8,An,Xn) brief indexed destination: 1 ext word
+          // (d8,An,Xn) brief = 1 ext word; FULL-format dst (bit8=1) = 1 + bd + od.
+          dExt := Mux(dstEaW0(8), fullExtLen(dstEaW0), U(1, 3 bits))
         } otherwise {
-          val (o, e) = eaExt(dstMode, dstReg, sizeL, allowImm = false)
+          val (o, e) = eaExt(dstMode, dstReg, sizeL, allowImm = false, eaW = dstEaW0)
           dOk  := o
           dExt := e
         }
@@ -238,7 +266,7 @@ object PredecodeWord {
         when(isMoveToSr) {
           val srcMode = op(5 downto 3).asUInt
           val srcReg  = op(2 downto 0).asUInt
-          val (ok, e) = eaExt(srcMode, srcReg, sizeL = False, allowImm = true)  // .W source EA
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL = False, allowImm = true, eaW = extW)  // .W source EA
           when(ok) { r.simple := True; r.lenWords := (U(1, 3 bits) + e).resized }
         }
         val isMoveUsp = op(15 downto 4) === B"12'h4E6"
@@ -262,7 +290,7 @@ object PredecodeWord {
           val sizeL   = !op(7)                       // CHK.L when bit7=0
           val srcMode = op(5 downto 3).asUInt
           val srcReg  = op(2 downto 0).asUInt
-          val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = true)
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = true, eaW = extW)
           when(ok) {
             r.simple   := True
             r.lenWords := (U(1, 3 bits) + e).resized
@@ -276,7 +304,7 @@ object PredecodeWord {
         when(isDivL || isMulL) {
           val srcMode = op(5 downto 3).asUInt
           val srcReg  = op(2 downto 0).asUInt
-          val (ok, e) = eaExt(srcMode, srcReg, sizeL = True, allowImm = true)  // 32-bit source
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL = True, allowImm = true, eaW = B(0, 16 bits))  // EA ext follows the Dl/Dh word
           when(ok) {
             r.simple   := True
             r.lenWords := (U(2, 3 bits) + e).resized   // opword + ext word + EA ext
@@ -315,7 +343,7 @@ object PredecodeWord {
                          (u4o === U(0, 4 bits) || u4o === U(2, 4 bits) || u4o === U(4, 4 bits) ||
                           u4o === U(6, 4 bits) || u4o === U(0xA, 4 bits))
         when(isUnaryMem) {
-          val (mok, mext) = memDestExt(u4mode, op(2 downto 0).asUInt)
+          val (mok, mext) = memDestExt(u4mode, op(2 downto 0).asUInt, extW)   // EA is op+1
           when(mok) {
             r.simple   := True
             r.lenWords := (U(1, 3 bits) + mext).resized
@@ -362,7 +390,7 @@ object PredecodeWord {
         when(isJmp || isJsr) {
           val srcMode = op(5 downto 3).asUInt
           val srcReg  = op(2 downto 0).asUInt
-          val (ok, e) = eaExt(srcMode, srcReg, sizeL = False, allowImm = false)
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL = False, allowImm = false, eaW = extW)
           // Reg-direct (modes 0,1) and (An)+/-(An) (modes 3,4) are NOT control modes;
           // eaExt accepts them (ext 0) but they are illegal for JMP/JSR. Restrict to
           // the in-scope control modes so predecode frames the right length AND a
@@ -379,26 +407,26 @@ object PredecodeWord {
         // out-of-scope EA still frames its len via eaExt; the assembler faults the EA.
         val isLea = op(8) && (op(7 downto 6) === B"11") && (op(5 downto 3).asUInt >= 2)
         when(isLea) {
-          val (ok, e) = eaExt(op(5 downto 3).asUInt, op(2 downto 0).asUInt, sizeL = False, allowImm = false)
+          val (ok, e) = eaExt(op(5 downto 3).asUInt, op(2 downto 0).asUInt, sizeL = False, allowImm = false, eaW = extW)
           when(ok) { r.simple := True; r.lenWords := (U(1, 3 bits) + e).resized }
         }
         // ── PEA <ea> (0100 1000 01 mmmrrr): control EA, opword + EA ext.
         val isPea = op(15 downto 6) === B"10'b0100100001"
         when(isPea) {
-          val (ok, e) = eaExt(op(5 downto 3).asUInt, op(2 downto 0).asUInt, sizeL = False, allowImm = false)
+          val (ok, e) = eaExt(op(5 downto 3).asUInt, op(2 downto 0).asUInt, sizeL = False, allowImm = false, eaW = extW)
           when(ok) { r.simple := True; r.lenWords := (U(1, 3 bits) + e).resized }
         }
         // ── MOVE from SR (0x40C0) / from CCR (0x42C0): SR/CCR -> EA (.W), data EA.
         val isMoveFromSr  = op(15 downto 6) === B"10'b0100000011"
         val isMoveFromCcr = op(15 downto 6) === B"10'b0100001011"
         when(isMoveFromSr || isMoveFromCcr) {
-          val (ok, e) = eaExt(op(5 downto 3).asUInt, op(2 downto 0).asUInt, sizeL = False, allowImm = false)
+          val (ok, e) = eaExt(op(5 downto 3).asUInt, op(2 downto 0).asUInt, sizeL = False, allowImm = false, eaW = extW)
           when(ok) { r.simple := True; r.lenWords := (U(1, 3 bits) + e).resized }
         }
         // ── MOVE to CCR (0x44C0): EA(.W) -> CCR, data EA incl #imm.
         val isMoveToCcr = op(15 downto 6) === B"10'b0100010011"
         when(isMoveToCcr) {
-          val (ok, e) = eaExt(op(5 downto 3).asUInt, op(2 downto 0).asUInt, sizeL = False, allowImm = true)
+          val (ok, e) = eaExt(op(5 downto 3).asUInt, op(2 downto 0).asUInt, sizeL = False, allowImm = true, eaW = extW)
           when(ok) { r.simple := True; r.lenWords := (U(1, 3 bits) + e).resized }
         }
       }
@@ -415,7 +443,7 @@ object PredecodeWord {
           when(mode === U(0, 3 bits) || mode === U(1, 3 bits)) {   // ADDQ/SUBQ Dn / An
             r.simple := True; r.lenWords := U(1, 3 bits)
           } otherwise {                                            // ADDQ/SUBQ #n,<ea> mem-dest (RMW)
-            val (mok, mext) = memDestExt(mode, op(2 downto 0).asUInt)
+            val (mok, mext) = memDestExt(mode, op(2 downto 0).asUInt, extW)   // EA is op+1
             when(mok) { r.simple := True; r.lenWords := (U(1, 3 bits) + mext).resized }
           }
         } otherwise {                                              // ss == 11
@@ -492,14 +520,14 @@ object PredecodeWord {
           r.lenWords := U(1, 3 bits)
         } elsewhen(isDivuW || isDivsW || isMuluW || isMulsW) {
           // 16-bit multiplier/divisor EA (sizeL = false: word operand size for #imm).
-          val (ok, e) = eaExt(srcMode, srcReg, sizeL = False, allowImm = true)
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL = False, allowImm = true, eaW = extW)
           when(ok) {
             r.simple   := True
             r.lenWords := (U(1, 3 bits) + e).resized
           }
         } elsewhen(opmode =/= U(4, 3 bits) && opmode =/= U(5, 3 bits) && opmode =/= U(6, 3 bits) && !isMulDiv) {
           val sizeL = (opmode === U(2, 3 bits)) || (opmode === U(7, 3 bits))
-          val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = false)
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = false, eaW = extW)
           when(ok) {
             r.simple   := True
             r.lenWords := (U(1, 3 bits) + e).resized
@@ -535,7 +563,7 @@ object PredecodeWord {
             // ALU Dn,<ea> RMW (opmode 4/5/6 = .B/.W/.L mem-dest): opword + EA ext. The EA
             // MUST be a MEMSIMPLE alterable-memory mode (the assembler illegalises Dn/An/
             // MEMCOMPLEX). (DIVU/MULU are opmode 3/7, excluded.)
-            val (mok, mext) = memDestExt(srcMode, srcReg)
+            val (mok, mext) = memDestExt(srcMode, srcReg, extW)   // EA is op+1
             when(mok) {
               r.simple   := True
               r.lenWords := (U(1, 3 bits) + mext).resized
@@ -558,7 +586,7 @@ object PredecodeWord {
                       (opmode === U(6, 3 bits))
         when(isCmp) {
           val sizeL = (opmode === U(2, 3 bits)) || (opmode === U(7, 3 bits))
-          val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = false)
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = false, eaW = extW)
           when(ok) {
             r.simple   := True
             r.lenWords := (U(1, 3 bits) + e).resized
@@ -569,7 +597,7 @@ object PredecodeWord {
         } elsewhen(isEor) {
           // EOR Dn,<ea> mem-dest (RMW): opword + EA ext. In-scope MEMSIMPLE dest only;
           // An-direct (CMPM) / MEMCOMPLEX -> COMPLEX (the assembler's illegal path).
-          val (mok, mext) = memDestExt(srcMode, srcReg)
+          val (mok, mext) = memDestExt(srcMode, srcReg, extW)   // EA is op+1
           when(mok) {
             r.simple   := True
             r.lenWords := (U(1, 3 bits) + mext).resized
@@ -605,7 +633,8 @@ object PredecodeWord {
         val bfMemMode = op(5 downto 3).asUInt
         val isBitfieldMem = op(11) && (ss === U(3, 2 bits)) && (bfMemMode >= 2)
         when(isBitfieldMem) {
-          val (ok, e) = eaExt(bfMemMode, op(2 downto 0).asUInt, sizeL = False, allowImm = false)
+          // The bit-field EA ext follows the bf-ext word, so op+1 is NOT the EA ext.
+          val (ok, e) = eaExt(bfMemMode, op(2 downto 0).asUInt, sizeL = False, allowImm = false, eaW = B(0, 16 bits))
           when(ok) {
             r.simple   := True
             r.lenWords := (U(2, 3 bits) + e).resized   // opword + bf-ext + EA ext

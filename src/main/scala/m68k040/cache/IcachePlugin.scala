@@ -318,7 +318,13 @@ class IcachePlugin extends FiberPlugin with FetchService {
       PREDECODE.whenIsActive {
         activePc := missPC
         val words  = lineReg.subdivideIn(16 bits)
-        val chunks = Vec(words.map(w => PredecodeWord.classify(w)))
+        // Per-word predecode. A full-format indexed EA's length depends on its EXTENSION
+        // word (the word FOLLOWING the opword), so pass words(i+1) as `extW` (0 at the
+        // last in-line word — a full-format opword whose ext word spills to the next
+        // line is the inherent per-line predecode boundary, handled on re-frame).
+        val nWords = words.length
+        val chunks = Vec((0 until nWords).map(i =>
+          PredecodeWord.classify(words(i), if (i + 1 < nWords) words(i + 1) else B(0, 16 bits))))
         val packed = chunks.asBits
         for (w <- 0 until ways) {
           when(victimWay === U(w, wayBits bits)) {

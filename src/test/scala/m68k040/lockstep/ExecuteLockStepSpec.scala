@@ -4522,6 +4522,53 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       ".stop: bra .stop", nInstr = 6)
   }
 
+  // ── FULL-format NO-MEMORY-INDIRECT (68020+, I/IS=000) lock-step ──────────────
+  // base' + bd(word/long) + index'(scaled), suppressible base(BS)/index(IS). Single
+  // pass through the existing AGU (no microcode). A word/long BD forces full-format
+  // (a small disp fits brief), `%zaN`/`%zpc` suppress the base. All Musashi-verified.
+  test("lock-step fullext: no-mem-indir WORD bd + .L index*4 load", VerilatorTest) {
+    // word bd 0x100 forces full-format. a0=0x3000,d1=2; ea=0x3000+0x100+(2*4)=0x3108.
+    runLockStep("fx-noind-word-l4",
+      "move.l #0xCAFEBABE,%d0 ; move.l #0x3000,%a0 ; move.l %d0,0x108(%a0) ; " +   // [0x3108]
+      "move.l #2,%d1 ; move.l (0x100,%a0,%d1.l*4),%d2 ; " +
+      ".stop: bra .stop", nInstr = 6)
+  }
+  test("lock-step fullext: no-mem-indir LONG bd load", VerilatorTest) {
+    // long bd 0x10000 forces bd-size=11. a0=0x3000, d1=1, (0x10000,a0,d1.l*2)=0x3000+0x10000+2=0x13002.
+    runLockStep("fx-noind-long",
+      "move.l #0x11223344,%d0 ; move.l #0x13000,%a1 ; move.l %d0,2(%a1) ; " +   // [0x13002]
+      "move.l #0x3000,%a0 ; move.l #1,%d1 ; move.l (0x10000,%a0,%d1.l*2),%d2 ; " +
+      ".stop: bra .stop", nInstr = 6)
+  }
+  test("lock-step fullext: no-mem-indir BS base-suppressed (absolute bd+index)", VerilatorTest) {
+    // base suppressed -> ea = bd + index. bd=0x3000, d1=2*4=8 -> 0x3008. Seed there.
+    runLockStep("fx-noind-bs",
+      "move.l #0x55667788,%d0 ; move.l #0x3008,%a1 ; move.l %d0,(%a1) ; " +
+      "move.l #2,%d1 ; move.l (0x3000,%za0,%d1.l*4),%d2 ; " +     // BS -> base An ignored
+      ".stop: bra .stop", nInstr = 6)
+  }
+  test("lock-step fullext: no-mem-indir IS index-suppressed (base+bd only)", VerilatorTest) {
+    // index suppressed (%zd1) -> ea = base + bd. a0=0x3000, bd=0x100 -> 0x3100. Seed there.
+    runLockStep("fx-noind-is",
+      "move.l #0x99AABBCC,%d0 ; move.l #0x3000,%a0 ; move.l %d0,0x100(%a0) ; " +
+      "move.l (0x100,%a0,%zd1.l),%d2 ; " +   // %zd1 suppresses the index (IS=1), word bd
+      ".stop: bra .stop", nInstr = 5)
+  }
+  test("lock-step fullext: no-mem-indir scale *2 store", VerilatorTest) {
+    // store with full-format dst. a0=0x3000,d1=4; (0x100,a0,d1.l*2)=0x3000+0x100+8=0x3108
+    runLockStep("fx-noind-store",
+      "move.l #0x3000,%a0 ; move.l #4,%d1 ; move.l #0x0BADF00D,%d3 ; " +
+      "move.l %d3,(0x100,%a0,%d1.l*2) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3108L))
+  }
+  test("lock-step fullext: no-mem-indir ALU indexed source (ADD.L)", VerilatorTest) {
+    // [0x3108]=5; a0=0x3000,d1=4 (4*2=8); (0x100,a0,d1.l*2)=0x3108; add to d2=3 -> 8
+    runLockStep("fx-noind-alu-src",
+      "move.l #0x00000005,%d0 ; move.l #0x3000,%a0 ; move.l %d0,0x108(%a0) ; " +
+      "move.l #4,%d1 ; move.l #0x00000003,%d2 ; add.l (0x100,%a0,%d1.l*2),%d2 ; " +
+      ".stop: bra .stop", nInstr = 7)   // d2 = 3 + 5 = 8
+  }
+
   // ── TRAPcc lock-step: 020+ conditional trap (vector 7, format-$2) ────────────
   // TRAPcc is the generalisation of TRAPV: evaluates a 16-condition code `cccc`; if
   // TRUE raises vector 7 (same format-$2 as TRAPV). The stacked PC is the NEXT

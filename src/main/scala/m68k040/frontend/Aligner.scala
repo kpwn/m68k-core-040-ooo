@@ -48,11 +48,11 @@ object Aligner {
     } .elsewhen(!p0.simple) {
       // Complex head: emit complex packet for slot0
       r.slot0.pc        := headPc
-      for (i <- 0 until 5) {
+      for (i <- 0 until 6) {
         r.slot0.words(i) := words(i)
       }
-      // wordCount = min(avail, 5)
-      r.slot0.wordCount := (avail > 5).mux(U(5, 3 bits), avail.resize(3))
+      // wordCount = min(avail, 6)
+      r.slot0.wordCount := (avail > 6).mux(U(6, 3 bits), avail.resize(3))
       r.slot0.simple    := False
       r.slot0.complex   := True
       r.slot0.lenWords  := 0
@@ -71,7 +71,7 @@ object Aligner {
       } .otherwise {
         // Slot0 = simple packet
         r.slot0.pc       := headPc
-        for (i <- 0 until 5) {
+        for (i <- 0 until 6) {
           when(U(i) < L0) {
             r.slot0.words(i) := words(i)
           } .otherwise {
@@ -97,7 +97,7 @@ object Aligner {
         when(slot1Ok) {
           // Slot1 = simple packet
           r.slot1.pc := headPc + (L0.resize(32) |<< 1)
-          for (i <- 0 until 5) {
+          for (i <- 0 until 6) {
             val idx = (L0 +^ U(i)).resize(4)
             when(U(i) < L1) {
               r.slot1.words(i) := words(idx)

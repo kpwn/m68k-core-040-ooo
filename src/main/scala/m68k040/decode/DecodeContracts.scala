@@ -26,7 +26,11 @@ case class OperandSrc() extends Bundle {
 /** What an EA field decodes to (opcode-agnostic). This slice only produces the
   * register/immediate classes; the memory classes are reserved for later slices. */
 object EaClass extends SpinalEnum {
-  val DATAREG, ADDRREG, IMM, MEMSIMPLE, MEMCOMPLEX, ILLEGAL = newElement()
+  // MEMINDIRECT = a 68020+ full-format MEMORY-INDIRECT EA (`([bd,An,Xn],od)` pre-index
+  // or `([bd,An],Xn,od)` post-index): a mid-EA pointer LOAD followed by the host op on
+  // the loaded pointer + od (+ index for post). Routed to the microcode-v2 engine (the
+  // single-pass no-memory-indirect full-format I/IS=000 form stays MEMSIMPLE).
+  val DATAREG, ADDRREG, IMM, MEMSIMPLE, MEMINDIRECT, MEMCOMPLEX, ILLEGAL = newElement()
 }
 
 /** EA auto-update side-effect (predec/postinc): NONE for every non-auto EA;
@@ -62,6 +66,16 @@ case class EaSpec() extends Bundle {
   val indexReg   = UInt(5 bits)
   val indexLong  = Bool()
   val indexScale = UInt(2 bits)
+  // ── 68020+ full-format MEMORY-INDIRECT (EaClass.MEMINDIRECT) ─────────────────
+  // The pointer load's address = base'(per baseValid/pcRel) + bd(`disp`) + index'(for
+  // pre-index only). The OUTER displacement `od` is added to the LOADED pointer (the
+  // host op's `(T+od)` base). `memPost` selects post-index (`([bd,An],Xn,od)`: pointer
+  // loaded at base+bd, then +Xn+od) vs pre-index (`([bd,An,Xn],od)`: pointer at
+  // base+bd+Xn, then +od). The index fields (indexReg/Long/Scale/indexValid) are reused;
+  // for MEMINDIRECT they describe Xn (IS-suppressible: indexValid=!IS). All inert for the
+  // non-MEMINDIRECT classes. (No-memory-indirect I/IS=000 stays MEMSIMPLE — single pass.)
+  val od      = Bits(32 bits)
+  val memPost = Bool()
 }
 object EaSpec {
   def illegalDefault(): EaSpec = {
@@ -70,6 +84,7 @@ object EaSpec {
     e.baseValid := False; e.base := 0; e.disp := 0; e.pcRel := False
     e.autoMode := EaAuto.NONE; e.autoDelta := 0
     e.indexValid := False; e.indexReg := 0; e.indexLong := False; e.indexScale := 0
+    e.od := 0; e.memPost := False
     e
   }
 }
