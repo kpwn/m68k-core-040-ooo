@@ -394,7 +394,19 @@ object PredecodeRef {
         // (opword + the bit-field ext word). ss=11 with op[11]=0 (memory single-bit
         // shift) or mode!=0 (memory bit-field) -> COMPLEX (deferred RMW).
         val isBitfieldReg = (((op >> 11) & 1) == 1) && (ss == 3) && (((op >> 3) & 7) == 0)
+        // Bit-field MEMORY form (BFxxx <ea>): op[11]=1, ss==3, mode>=2 (memory EA). len =
+        // opword + bf-ext word + the EA's own ext words (per mode), i.e. 2 + eaExt. Predecode
+        // computes LENGTH only, identical for the load-only ops {BFTST/BFEXTU/BFEXTS/BFFFO}
+        // and the RMW ops {BFCHG/BFCLR/BFSET/BFINS}, so frame ALL of them (the LEGALITY split
+        // — PC-rel illegal for RMW, control-alterable only — is enforced in OperationDecoder).
+        // Mirrors the RTL PredecodeWord isBitfieldMem arm.
+        val bfMemMode = (op >> 3) & 7
+        val isBitfieldMem = (((op >> 11) & 1) == 1) && (ss == 3) && (bfMemMode >= 2)
         if (isBitfieldReg) CP(simple = true, lenWords = 2)
+        else if (isBitfieldMem) eaExt(bfMemMode, op & 7, sizeL = false, allowImm = false) match {
+          case Some(e) => CP(simple = true, lenWords = 2 + e)   // opword + bf-ext + EA ext
+          case None    => COMPLEX
+        }
         else if (ss != 3) CP(simple = true, lenWords = 1)
         else COMPLEX
       case _ => COMPLEX
