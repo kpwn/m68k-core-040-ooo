@@ -958,6 +958,24 @@ object MicroOpAssembler {
     // form is the one exception.
     val lineImmBad = isLineImm && !isBitOp && (srcEa.klass =/= EaClass.DATAREG) &&
                      (srcEa.klass =/= EaClass.MEMSIMPLE) && !isToCcr
+    // ── .L-immediate + FULL-FORMAT dst EA: gated ILLEGAL (silent-corruption hole) ──
+    // A line-0 immediate op with size .L AND a FULL-FORMAT indexed dst EA (mode 6 or
+    // 7-3, ext bit8=1) places the EA's first extension word at op+3 (after the 2-word
+    // .L immediate). The per-word PREDECODE window only reaches op+1/op+2, so it frames
+    // the instruction as BRIEF (too short) -> nextPc is short by the bd/od words and the
+    // FOLLOWING instruction mis-fetches (silent corruption). The .B/.W forms are FINE
+    // (their EA ext sits at op+2 = visible to predecode). Since predecode fundamentally
+    // cannot see op+3 for a .L immediate, the safe + honest resolution is an EXPLICIT
+    // illegal-instruction trap (vector 4) for this rare mode — NOT silent mis-execution.
+    // This covers BOTH classifications: the no-memory-indirect full-format (MEMSIMPLE-
+    // with-full-fields, which lineImmBad does NOT catch) AND the memory-indirect form.
+    // The ext word at op+3 (the .L imm consumes words(1)##words(2)) is pkt.words(3).
+    val limmDstMode       = op(5 downto 3)
+    val limmDstReg        = op(2 downto 0)
+    val limmDstIsFullEa   = (limmDstMode === B"3'b110") ||
+                            ((limmDstMode === B"3'b111") && (limmDstReg === B"3'b011"))
+    val limmFullFmtDstBad = opIsLineImm && immIsLong && !isBitOp && !isToCcr &&
+                            limmDstIsFullEa && pkt.words(3)(8)
     // Bit op (BTST/BCHG/BCLR/BSET, static or dynamic): the EA (op[5:0]) is the dest
     // (tested + written, except BTST). In scope: DATA-register (LONG, mod-32) OR a
     // MEMSIMPLE EA (BYTE, mod-8; BTST load-only, others mem-RMW crack). An / #imm /
@@ -1094,7 +1112,7 @@ object MicroOpAssembler {
               !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isUnlkOp && !isExgOp &&
               !isLeaOp && !isPeaOp && !isMoveFromSrOp && !isMoveFromCcrOp && !isMoveToCcrOp &&
               !isSysOp && !isRtdBad && !isCmp2Chk2Enc && !isBfMemSpec &&
-              (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
+              (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || limmFullFmtDstBad || addqMemBad || sccMemBad ||
                line4UnaryMemBad || aluRmwMemBad || bitOpMemBad || eaDstPcRelBad ||
                (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     // A JMP/JSR with a non-control EA is illegal (vector 4).

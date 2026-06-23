@@ -159,7 +159,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       (s1mi_isMove && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s1mi_isMove && (s1mi_dstEa.klass === EaClass.MEMINDIRECT)) ||
       (s1mi_isAlu && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s1mi_isImm && (s1mi_immEa.klass === EaClass.MEMINDIRECT)) ||
+      // .L-imm full-format dst (s1mi_immL): NOT routed to the engine — predecode mis-frames
+      // it (ext at op+3), so it falls to the normal slot1 crack where it is gated ILLEGAL.
+      (s1mi_isImm && !s1mi_immL && (s1mi_immEa.klass === EaClass.MEMINDIRECT)) ||
       (s1mi_isSingle && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)))
 
     // slot1 is emitted alongside slot0 only when: not replaying a stash, slot1 present,
@@ -300,11 +302,18 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val s0ImmEaVec   = Mux(s0ImmIsL, Vec(s0opw, s0pkt.words(3), s0pkt.words(4), s0pkt.words(5)),
                                      Vec(s0opw, s0pkt.words(2), s0pkt.words(3), s0pkt.words(4)))
     val s0ImmEa      = EaDecoder.decode(s0opw(5 downto 0), spec0.size, s0ImmEaVec)
+    // SILENT-CORRUPTION HOLE: a .L-immediate op with a FULL-FORMAT dst EA (mem-indirect
+    // here) places the EA's first ext word at op+3, beyond the per-word predecode window
+    // (op+1/op+2 only), so it frames BRIEF (too short) -> the FOLLOWING instr mis-fetches.
+    // Such an op is NOT routed to the engine; it falls through to the normal head where
+    // MicroOpAssembler gates it ILLEGAL (limmFullFmtDstBad, vector 4). The .B/.W imm-dst
+    // mem-indirect forms (ext at op+2, visible to predecode) stay routed to the engine.
+    val s0LimmFullDstBad = s0IsLineImm && s0ImmIsL && (s0ImmEa.klass === EaClass.MEMINDIRECT)
     val slot0IsMemInd = fed.valid && (
       ((s0IsMove && (s0srcEa.klass === EaClass.MEMINDIRECT))) ||
       ((s0IsMove && (s0dstEa.klass === EaClass.MEMINDIRECT))) ||
       (s0IsAluSrcLine && s0AluSrcMode && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s0IsLineImm && (s0ImmEa.klass === EaClass.MEMINDIRECT)) ||
+      (s0IsLineImm && !s0ImmIsL && (s0ImmEa.klass === EaClass.MEMINDIRECT)) ||
       (s0IsSingleEa && (s0srcEa.klass === EaClass.MEMINDIRECT)))
     // A slot0 owned by the µcode engine: an OperationDecoder-microcoded op OR a full-format
     // mem-indirect host (both enter the engine, excluded from the fast head).
