@@ -54,6 +54,12 @@ class TrapvSpec extends AnyFunSuite {
       uop.ibranch := False; uop.anInc := 0; uop.stkPush := False; uop.ccrRestore := False
       uop.pc := 0x2000; uop.nextPc := iNextPc; uop.faultUsesNextPc := True
       uop.pNzvcSrc := iPNzvcSrc; uop.readsNzvc := True
+      // Fetch-time predictor carry fields (added after this stub was written; a TRAPV is
+      // never fetch-predicted). assignDontCare() above randomizes them per-seed, and the
+      // branch-EU mispredict = (predTaken != actualTaken) reads predTaken — so leaving it
+      // don't-care made `mis` flakily true. Drive them to the not-predicted defaults.
+      uop.predTaken := False; uop.predTarget := 0
+      uop.phtValid := False; uop.phtIndex := 0
       ctx.robId := iRobId
       eu.issue.valid := iValid; eu.issue.payload := ctx
 

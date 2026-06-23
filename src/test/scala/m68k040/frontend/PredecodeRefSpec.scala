@@ -84,6 +84,21 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0xE493) == cp(true,1))   // ROXR.L #2,D3
     assert(classify(0xE0D8) == cp(false,0))  // ss=11 memory form -> complex
   }
+  // Bit-field MEMORY forms (op[11]=1, ss=3, mode>=2): simple, len = opword + bf-ext + EA ext.
+  test("line-E bit-field MEMORY forms -> simple len 2 + EA ext") {
+    assert(classify(0xE8D0) == cp(true,2))   // BFTST  (A0){...}    mode 2 -> 2 + 0
+    assert(classify(0xE9D0) == cp(true,2))   // BFEXTU (A0){...}    mode 2 -> 2 + 0
+    assert(classify(0xEBD0) == cp(true,2))   // BFEXTS (A0){...}    mode 2 -> 2 + 0
+    assert(classify(0xEDD0) == cp(true,2))   // BFFFO  (A0){...}    mode 2 -> 2 + 0
+    assert(classify(0xE8E8) == cp(true,3))   // BFTST  (d16,A0){..}  mode 5 -> 2 + 1
+    assert(classify(0xE8F9) == cp(true,4))   // BFTST  (xxx).L{..}   mode 7-1 -> 2 + 2
+    assert(classify(0xEAD0) == cp(true,2))   // BFCHG  (A0){...} RMW mode 2 -> 2 + 0
+    assert(classify(0xECD0) == cp(true,2))   // BFSET  (A0){...} RMW mode 2 -> 2 + 0
+    assert(classify(0xEFD0) == cp(true,2))   // BFINS  (A0){...} RMW mode 2 -> 2 + 0
+    assert(classify(0xE8C0) == cp(true,2))   // BFTST Dn (mode 0) -> register form (bitfieldReg) len2
+    assert(classify(0xE8F0) == cp(true,3))   // BFTST (d8,A0,Xn){..} mode 6 brief-indexed -> 2 + 1
+    assert(classify(0xE8FC) == cp(false,0))  // BFTST #imm{..} (mode 7-4) -> not allowed (eaExt allowImm=false) -> complex
+  }
   test("line-0 immediates ADDI/SUBI/ANDI/ORI/EORI/CMPI -> Dn (in scope)") {
     assert(classify(0x0000) == cp(true,2))   // ORI.B  #imm,D0 (.B = opword + 1 imm word)
     assert(classify(0x0240) == cp(true,2))   // ANDI.W #imm,D0 (.W = opword + 1 imm word)
