@@ -94,6 +94,13 @@ class AluEuSourcePlugin extends FiberPlugin {
     uop.needsSupervisor := False; uop.keepCommit := False
     uop.firstOfInstr := False
     uop.predTaken    := False; uop.predTarget := 0
+    // Fields added to RenamedUop after this stub was written (bit-field/system-op/EA-auto/
+    // gshare carry). The ALU EU does not consume them, but every bundle field needs a
+    // driver (else PhaseCheck_noLatchNoOverride aborts elaboration). Safe defaults.
+    uop.eaAuto       := m68k040.decode.EaAuto.NONE; uop.eaDelta := 0
+    uop.bfOp         := 0; uop.bfDynamic := False; uop.bfMem := False; uop.bfStoreForm := 0
+    uop.sysOp        := False; uop.sysKind := m68k040.decode.SysKind.NONE; uop.sysReadDir := False
+    uop.phtValid     := False; uop.phtIndex := 0
     ctx.robId := iRobId
     eu.issue.valid   := iValid
     eu.issue.payload := ctx

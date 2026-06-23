@@ -11,9 +11,10 @@ import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
 
 /** Fast/slow ALU split: fast ops (ADD) complete at latency-1 (S1) with bypass;
-  * the SHIFT slow op completes at latency-3 (S3) after the deep-pipeline split
-  * (stage1@S1, stage2@S2, writeback@S3). Latency-agnostic correctness: the slow
-  * result is correct, just two cycles later than a fast op. */
+  * the SHIFT slow op completes at S3 of the deep slow pipe S1/S1a/S1b/S2/S3
+  * (arch latency 5 after the FMax #3/#4 retimes split stage1 + the bit-field
+  * cone). Latency-agnostic correctness: the slow result is correct, just later
+  * than a fast op. */
 class AluFastSlowSpec extends AnyFunSuite {
   class Dut extends Component {
     val db   = new Database
@@ -119,7 +120,11 @@ class AluFastSlowSpec extends AnyFunSuite {
       issueMoveq(dut, 0x21, pdst = 3, robId = 0); cd.waitSampling()  // R3 = 0x21
       idle(dut); cd.waitSampling(6)
       val lat = latencyOf(dut, 9, window = 6) { issueLslImm(dut, pa = 3, count = 1, pdst = 4, robId = 9) }
-      assert(lat == 4, s"slow SHIFT completion latency=$lat (expected 4 = arch lat3 + harness pre-capture edge, ONE cycle deeper than the lat2 shifter)")
+      // The slow pipe is S1/S1a/S1b/S2/S3 (the FMax #3/#4 retimes split stage1 and the
+      // bit-field forward-funnel cone) => arch latency 5, completion at S3. The harness
+      // counts one extra pre-capture edge, so the measured latency is 6. (Was 4 when the
+      // pipe was the original 3-stage S1/S2/S3; result correctness is unchanged.)
+      assert(lat == 6, s"slow SHIFT completion latency=$lat (expected 6 = arch lat5 [S1/S1a/S1b/S2/S3] + harness pre-capture edge)")
       cd.waitSampling(4)
       dut.src.logic.obsIntAddr #= 4; sleep(1)
       assert(dut.src.logic.obsIntData.toBigInt == 0x42,
