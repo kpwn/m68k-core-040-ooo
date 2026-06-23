@@ -64,6 +64,29 @@ class DispatchSpec extends AnyFunSuite {
     u.pNzvcDst #= 0; u.writesNzvc #= false; u.pNzvcOld #= 0
     u.pXSrc #= 0; u.readsX #= false
     u.pXDst #= 0; u.writesX #= false; u.pXOld #= 0
+    // RenameUopSourcePlugin makes EVERY RenamedUop field a top-level INPUT (src.payload
+    // foreach in()), so any field NOT poked here is an undriven input -> randomized per
+    // sim seed. Many fields were added to RenamedUop after this stub was written; a
+    // randomized memOp/branch/cond-trap/LEA/sysOp etc. can change whether the IQ issues
+    // the µop, which made "issued robIds" flakily empty. Drive ALL of them to inert
+    // defaults (a plain INT-cluster ALU MOVE that issues immediately).
+    u.memOp #= m68k040.isa.MemOp.NONE
+    u.psrcC #= 0; u.psrcCValid #= false
+    u.ibranch #= false; u.anInc #= 0; u.stkPush #= false; u.ccrRestore #= false
+    u.isScc #= false; u.isDbcc #= false; u.isCondTrap #= false
+    u.divSigned #= false; u.div64 #= false; u.divIsRem #= false; u.isChk2 #= false
+    u.faultAddr #= 0; u.sswInstr #= false
+    u.eaAuto #= m68k040.decode.EaAuto.NONE; u.eaDelta #= 0
+    u.toCcr #= false; u.shiftOp #= 0; u.shiftDir #= false; u.bcdSub #= false; u.bitOp #= 0
+    u.bfOp #= 0; u.bfDynamic #= false; u.bfMem #= false; u.bfStoreForm #= 0
+    u.extByte #= false; u.isMovea #= false
+    u.indexLong #= false; u.indexScale #= 0
+    u.leaAddr #= false; u.fromCcr #= false; u.fromSr #= false; u.needsSupervisor #= false
+    u.keepCommit #= false
+    u.sysOp #= false; u.sysKind #= m68k040.decode.SysKind.NONE; u.sysReadDir #= false
+    u.firstOfInstr #= true
+    u.phtValid #= false; u.phtIndex #= 0
+    u.predTaken #= false; u.predTarget #= 0
   }
 
   def init(dut: Dut, cd: ClockDomain): Unit = {
