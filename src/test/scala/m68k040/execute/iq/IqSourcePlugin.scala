@@ -76,6 +76,25 @@ class IqSourcePlugin extends FiberPlugin {
       u.faultAddr    := 0; u.sswInstr := False
       u.firstOfInstr := True
       u.predTaken    := False; u.predTarget := 0
+      // Fields added to RenamedUop after this stub was first written (shifts/BCD/bit-ops/
+      // bit-field/MOVEA/LEA/MOVE-from-CCR-SR/system-ops/indexed-EA/gshare). None feed the
+      // IQ issue/wakeup logic under test, but every bundle field needs a driver (else the
+      // slot Reg is undriven -> PhaseCheck_noLatchNoOverride). Drive safe defaults.
+      u.eaAuto       := m68k040.decode.EaAuto.NONE
+      u.eaDelta      := 0
+      u.toCcr        := False
+      u.shiftOp      := 0; u.shiftDir := False
+      u.bcdSub       := False
+      u.bitOp        := 0
+      u.bfOp         := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0
+      u.extByte      := False
+      u.isMovea      := False
+      u.indexLong    := False; u.indexScale := 0
+      u.leaAddr      := False
+      u.fromCcr      := False; u.fromSr := False; u.needsSupervisor := False
+      u.keepCommit   := False
+      u.sysOp        := False; u.sysKind := m68k040.decode.SysKind.NONE; u.sysReadDir := False
+      u.phtValid     := False; u.phtIndex := 0
       c
     }
 

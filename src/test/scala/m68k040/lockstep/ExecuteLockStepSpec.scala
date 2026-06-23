@@ -3853,6 +3853,18 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      // Seed the int PRF arch-15 (A7, identity phys-15) to the boot SSP. The committed
+      // A7 banks (ss.usp/isp/msp) are LIVE-COHERENT with the architectural A7 read back
+      // from the PRF every cycle (the exc unit drives ss.writeA7), so the PRF arch-15 —
+      // NOT the poked ss.isp — is the boot SP source of truth. Without this seed, the
+      // live readback clobbers ss.isp to the PRF's boot value (0), so the supervisor
+      // frame is stacked at SP=0 (wrapping to 0xFFFFFFC4) instead of 0x00100000-60.
+      // (Mirrors the IRQ-entry boot below, which seeds arch-15 = 0x00100000.)
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
       cd.waitSampling()
       dut.fa.logic.redirect.valid   #= true
       dut.fa.logic.redirect.payload #= loadAddr

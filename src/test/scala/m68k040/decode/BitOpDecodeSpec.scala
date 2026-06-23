@@ -136,12 +136,15 @@ class BitOpDecodeSpec extends AnyFunSuite {
     }
   }
 
-  // ── MOVEP (dynamic mode 001) -> NOT a bit-op (illegal/deferred) ─────────────────
-  // MOVEP 0x0108 (0000 000 1 00 001 000, mode 001): must NOT decode as BITOP.
-  test("MOVEP 0x0108 (dynamic mode 001) -> NOT BITOP (illegal/deferred)", VerilatorTest) {
+  // ── MOVEP (dynamic mode 001) -> NOT a bit-op ────────────────────────────────────
+  // MOVEP 0x0108 (0000 000 1 00 001 000, mode 001): the dynamic-bit-op band (bit8=1)
+  // EXCLUDES mode 001, which is MOVEP. The crucial invariant is that MOVEP must NOT be
+  // misdecoded as a BITOP. (MOVEP has since SHIPPED — it is sequenced by the DecodeStage
+  // FSM as a real op, so it is no longer `unimplemented`; see MovepDecodeSpec. The
+  // original assertion that MOVEP is illegal/deferred is therefore stale.)
+  test("MOVEP 0x0108 (dynamic mode 001) -> NOT BITOP", VerilatorTest) {
     run { dut => drive(dut, 0x0108); sleep(1)
-      assert(dut.uop0.op.toEnum != DecOp.BITOP, "MOVEP is not a bit-op")
-      assert(dut.uop0.unimplemented.toBoolean, "MOVEP -> illegal/deferred")
+      assert(dut.uop0.op.toEnum != DecOp.BITOP, "MOVEP must NOT be misdecoded as a bit-op")
     }
   }
 
