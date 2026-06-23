@@ -4,11 +4,14 @@ import m68k040.cache.ChunkPredecode
 import spinal.core._
 
 object PredecodeWord {
-  // `extW` = the word FOLLOWING the opword (the EA's first extension word). Needed to
-  // frame a 68020+ FULL-format indexed EA's variable length (1 + bd + od ext words);
-  // the brief path ignores it. Callers without an ext word use the 1-arg overload.
-  def classify(op: Bits): ChunkPredecode = classify(op, B(0, 16 bits))
-  def classify(op: Bits, extW: Bits): ChunkPredecode = {
+  // `extW` = word op+1 (the EA's first ext word for an EA-FIRST op). `extW2` = word op+2
+  // (the EA's first ext word for a line-0 immediate op with a .B/.W immediate, where the
+  // EA ext follows the 1-word immediate). Needed to frame a 68020+ FULL-format indexed EA's
+  // variable length (1 + bd + od ext words); the brief path ignores them. Callers without
+  // ext words use the shorter overloads.
+  def classify(op: Bits): ChunkPredecode = classify(op, B(0, 16 bits), B(0, 16 bits))
+  def classify(op: Bits, extW: Bits): ChunkPredecode = classify(op, extW, B(0, 16 bits))
+  def classify(op: Bits, extW: Bits, extW2: Bits): ChunkPredecode = {
     val r = ChunkPredecode()
     r.simple   := False
     r.lenWords := U(0, 3 bits)
@@ -123,9 +126,9 @@ object PredecodeWord {
           } otherwise {
             // mem-dest RMW (ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea>): opword + imm words +
             // the EA extension (imm precedes the EA ext). In-scope MEMSIMPLE dest only. For
-            // a full-format dst, the EA ext = op+1 ONLY when the imm is 1 word (.B/.W); a
-            // .L imm pushes the EA ext to op+2 (not visible -> brief framing).
-            val immDstEaW = Mux(ss === U(2, 2 bits), B(0, 16 bits), extW)
+            // a full-format dst, the EA's first ext word = op+2 when the imm is 1 word
+            // (.B/.W -> extW2); a .L imm pushes it to op+3 (not visible -> brief framing).
+            val immDstEaW = Mux(ss === U(2, 2 bits), B(0, 16 bits), extW2)
             val (mok, mext) = memDestExt(mode, reg, immDstEaW)
             when(mok) {
               r.simple := True; r.lenWords := (U(1, 3 bits) + immWords + mext).resized
@@ -146,9 +149,9 @@ object PredecodeWord {
           when(mode === U(0, 3 bits)) {                         // Dn dest (LONG)
             r.simple := True; r.lenWords := bitBase
           } otherwise {                                         // memory dest (BYTE) -> +EA ext
-            // Dynamic bit-op: EA ext = op+1 (no preceding word). Static: a bit-number word
-            // precedes the EA ext (op+1 is the bit word) -> brief framing.
-            val bitDstEaW = Mux(isStatBit, B(0, 16 bits), extW)
+            // Dynamic bit-op: EA ext = op+1 (extW). Static: a bit-number word precedes the
+            // EA ext (op+1 is the bit word, EA ext = op+2 = extW2).
+            val bitDstEaW = Mux(isStatBit, extW2, extW)
             val (mok, mext) = memDestExt(mode, reg, bitDstEaW)
             when(mok) { r.simple := True; r.lenWords := (bitBase + mext).resized }
           }

@@ -135,11 +135,37 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // it from the normal slot1 push (the assembler's benign MOVE placeholder would
     // otherwise be a phantom commit).
     val slot1IsMovepEarly = fed.valid && fed.payload.slot1Valid && slot1Spec0.movep
+    // A slot1 full-format MEMORY-INDIRECT host (mirror slot1IsUcodeEarly): its real µops come
+    // from the µcode engine entered from the stashed slot1 packet, so it MUST be excluded from
+    // the normal slot1 push (else the assembler's illegal/placeholder crack is a phantom).
+    val s1mi_pkt   = fed.payload.packets(1)
+    val s1mi_srcEa = fed.payload.specs(1).srcEa
+    val s1mi_dstEa = fed.payload.specs(1).dstEa
+    val s1mi_opw   = s1mi_pkt.words(0)
+    val s1mi_line  = s1mi_opw(15 downto 12).asUInt
+    val s1mi_opmode= s1mi_opw(8 downto 6).asUInt
+    val s1mi_isMove= (s1mi_line === U(1, 4 bits)) || (s1mi_line === U(2, 4 bits)) || (s1mi_line === U(3, 4 bits))
+    val s1mi_isAlu = ((s1mi_line === U(8, 4 bits)) || (s1mi_line === U(9, 4 bits)) || (s1mi_line === U(0xB, 4 bits)) ||
+                      (s1mi_line === U(0xC, 4 bits)) || (s1mi_line === U(0xD, 4 bits))) &&
+                     ((s1mi_opmode === U(0, 3 bits)) || (s1mi_opmode === U(1, 3 bits)) || (s1mi_opmode === U(2, 3 bits)))
+    val s1mi_isSingle = (slot1Spec0.op === DecOp.CLR) || (slot1Spec0.op === DecOp.NEG) || (slot1Spec0.op === DecOp.NEGX) ||
+                        (slot1Spec0.op === DecOp.NOT) || (slot1Spec0.op === DecOp.TST)
+    val s1mi_isImm = slot1Spec0.srcB.kind === OperandKind.IMMEXT
+    val s1mi_immL  = s1mi_opw(7 downto 6) === B"10"
+    val s1mi_immVec= Mux(s1mi_immL, Vec(s1mi_opw, s1mi_pkt.words(3), s1mi_pkt.words(4), s1mi_pkt.words(5)),
+                                    Vec(s1mi_opw, s1mi_pkt.words(2), s1mi_pkt.words(3), s1mi_pkt.words(4)))
+    val s1mi_immEa = EaDecoder.decode(s1mi_opw(5 downto 0), slot1Spec0.size, s1mi_immVec)
+    val slot1IsMemIndEarly = fed.valid && fed.payload.slot1Valid && (
+      (s1mi_isMove && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
+      (s1mi_isMove && (s1mi_dstEa.klass === EaClass.MEMINDIRECT)) ||
+      (s1mi_isAlu && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
+      (s1mi_isImm && (s1mi_immEa.klass === EaClass.MEMINDIRECT)) ||
+      (s1mi_isSingle && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)))
 
     // slot1 is emitted alongside slot0 only when: not replaying a stash, slot1 present,
     // slot0 is NOT 3-µop, slot1 itself is NOT 3-µop (a 3-µop slot1 is deferred), and
     // slot1 is NOT a MOVEM/MOVEP (the FSM owns it — see slot1IsMovemEarly/slot1IsMovepEarly).
-    val slot1Emit = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Is3 && !slot1Is3 && !slot1IsMovemEarly && !slot1IsUcodeEarly && !slot1IsMovepEarly
+    val slot1Emit = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Is3 && !slot1Is3 && !slot1IsMovemEarly && !slot1IsUcodeEarly && !slot1IsMovepEarly && !slot1IsMemIndEarly
     // Defer slot1 to the stash when EITHER slot0 is a 3-µop crack (slot1 cannot fit
     // alongside 3 µops) OR slot1 itself is a 3-µop crack (cannot fit after a <=2-µop
     // slot0). In both cases emit slot0 this cycle + stash slot1's µops; replay next.
@@ -252,6 +278,37 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // is owned by the µcode SEQUENCER (below), mutually exclusive with the fast head AND
     // the MOVEM FSM (exactly as a MOVEM slot0 is owned by the MOVEM FSM).
     val slot0IsMicrocoded = fed.valid && spec0.microcoded
+    // ── FULL-format MEMORY-INDIRECT host detection (slot0) ───────────────────────
+    // An EA-taking op whose EA is a full-format memory-indirect mode routes through the
+    // µcode engine (like a microcoded slot0). Detect it here (off the offloaded slot0 EAs +
+    // a shifted re-decode for the immediate-dst family) so the begin/hold/consume guards can
+    // treat it like slot0IsMicrocoded. The full Ctx + entry are built in the ucEntryCtx block.
+    val s0pkt    = fed.payload.packets(0)
+    val s0srcEa  = fed.payload.specs(0).srcEa   // offloaded EA on op[5:0] @ words(1)
+    val s0dstEa  = fed.payload.specs(0).dstEa   // offloaded EA on the MOVE dst field
+    val s0opw    = s0pkt.words(0)
+    val s0line   = s0opw(15 downto 12).asUInt
+    val s0opmode = s0opw(8 downto 6).asUInt
+    val s0IsMove = (s0line === U(1, 4 bits)) || (s0line === U(2, 4 bits)) || (s0line === U(3, 4 bits))
+    val s0IsAluSrcLine = (s0line === U(8, 4 bits)) || (s0line === U(9, 4 bits)) ||
+                         (s0line === U(0xB, 4 bits)) || (s0line === U(0xC, 4 bits)) || (s0line === U(0xD, 4 bits))
+    val s0AluSrcMode = (s0opmode === U(0, 3 bits)) || (s0opmode === U(1, 3 bits)) || (s0opmode === U(2, 3 bits))
+    val s0IsSingleEa = (spec0.op === DecOp.CLR) || (spec0.op === DecOp.NEG) || (spec0.op === DecOp.NEGX) ||
+                       (spec0.op === DecOp.NOT) || (spec0.op === DecOp.TST)
+    val s0IsLineImm  = spec0.srcB.kind === OperandKind.IMMEXT
+    val s0ImmIsL     = s0opw(7 downto 6) === B"10"
+    val s0ImmEaVec   = Mux(s0ImmIsL, Vec(s0opw, s0pkt.words(3), s0pkt.words(4), s0pkt.words(5)),
+                                     Vec(s0opw, s0pkt.words(2), s0pkt.words(3), s0pkt.words(4)))
+    val s0ImmEa      = EaDecoder.decode(s0opw(5 downto 0), spec0.size, s0ImmEaVec)
+    val slot0IsMemInd = fed.valid && (
+      ((s0IsMove && (s0srcEa.klass === EaClass.MEMINDIRECT))) ||
+      ((s0IsMove && (s0dstEa.klass === EaClass.MEMINDIRECT))) ||
+      (s0IsAluSrcLine && s0AluSrcMode && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
+      (s0IsLineImm && (s0ImmEa.klass === EaClass.MEMINDIRECT)) ||
+      (s0IsSingleEa && (s0srcEa.klass === EaClass.MEMINDIRECT)))
+    // A slot0 owned by the µcode engine: an OperationDecoder-microcoded op OR a full-format
+    // mem-indirect host (both enter the engine, excluded from the fast head).
+    val slot0OwnedByUc = slot0IsMicrocoded || slot0IsMemInd
     // µcode engine state (declared early — referenced by normalHeadValid below). The
     // sequencer logic + transitions live in the µcode SEQUENCER region further down.
     val ucActive    = RegInit(False)
@@ -423,7 +480,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // regardless of what slot0 in the HELD next group is — even a MOVEM that waits), OR a
     // fresh slot0 that is NOT a MOVEM and no slot1 MOVEM is pending. A slot0 MOVEM (when not
     // replaying a stash) is owned by the FSM -> the normal head does not push it.
-    val normalHeadValid = stashValid || (fed.valid && !slot0IsMovem && !slot0IsMicrocoded && !slot0IsMovep && !movemPendValid && !ucPendValid && !ucActive && !movepPendValid && !movepActive)
+    val normalHeadValid = stashValid || (fed.valid && !slot0IsMovem && !slot0OwnedByUc && !slot0IsMovep && !movemPendValid && !ucPendValid && !ucActive && !movepPendValid && !movepActive)
 
     // Produce the push as a Stream. When the MOVEM FSM is active it OVERRIDES the source
     // (its 2 moves / the final An update); otherwise the normal crack drives it.
@@ -457,7 +514,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // Begin a µcode op: a pending slot1 microcoded op, OR a microcoded slot0 (not blocked
     // by a stash), while the engine + the MOVEM FSM are idle.
     val ucBegin = !ucActive && !movemActive && !movemPendValid && !movepActive && !movepPendValid &&
-                  (ucPendValid || (slot0IsMicrocoded && !stashValid))
+                  (ucPendValid || (slot0OwnedByUc && !stashValid))
     // Entering a slot0 microcoded op (not a pending one): its group is consumed on entry.
     val ucEnterSlot0 = ucBegin && !ucPendValid
     // The entry context, latched on ucBegin from the entry packet.
@@ -507,13 +564,118 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.bfDn2        := ucBfDn2
     ucEntryCtx.bfImm        := ucBfImm
     ucEntryCtx.bfNeedHi     := ucBfNeedHi
-    // The REAL entry: a bit-field RMW (microcoded BITFIELD) picks 5B vs 4B by needHi;
-    // every other microcoded op (BCD/ADDX/SUBX) keeps its OperationDecoder ucEntry.
+    // ── FULL-format MEMORY-INDIRECT host-op Ctx population (spec §5) ──────────────
+    // A general EA-taking op (MOVE/ALU/imm/single-EA) whose EA is a full-format memory-
+    // indirect mode routes through the engine: [LOAD.L pointer -> T0] then the host op at
+    // (T0 + od (+post-index)). OperationDecoder is ext-word-free + the host op is a NORMAL
+    // op (not pre-marked microcoded), so the routing is decided HERE from the re-decoded EA.
+    val ucEopw    = ucEntryPkt.words(0)
+    val ucMiSrcEa = EaDecoder.decode(ucEopw(5 downto 0), ucEntrySpec.size, ucEntryPkt.words)
+    val ucMiDstEa = EaDecoder.decode(ucEopw(8 downto 6) ## ucEopw(11 downto 9),
+                                     ucEntrySpec.size, ucEntryPkt.words)
+    val ucLine    = ucEopw(15 downto 12).asUInt
+    val ucOpmode  = ucEopw(8 downto 6).asUInt
+    // The host op + which EA carries the mem-indirect. The in-scope host families:
+    //   MOVE (line 1/2/3): src op[5:0] (load to Dn) OR dst op[11:6] (store from Dn).
+    //   ALU src (line 8/9/B/C/D, opmode 0/1/2 = <ea>,Dn ; CMP opmode 0/1/2): src op[5:0].
+    //   line-0 immediate op (ADDI/SUBI/ANDI/ORI/EORI/CMPI): dst op[5:0] (RMW; CMPI flags-only).
+    //   single-EA (CLR/NEG/NEGX/NOT/TST, line-4): dst op[5:0] (RMW; TST flags-only).
+    val ucIsMove   = (ucLine === U(1, 4 bits)) || (ucLine === U(2, 4 bits)) || (ucLine === U(3, 4 bits))
+    val ucMoveSrcMi= ucIsMove && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
+    val ucMoveDstMi= ucIsMove && (ucMiDstEa.klass === EaClass.MEMINDIRECT)
+    // ALU/CMP source (opmode 0/1/2): line 8/9/B/C/D with the EA as a source operand.
+    val ucIsAluSrcLine = (ucLine === U(8, 4 bits)) || (ucLine === U(9, 4 bits)) ||
+                         (ucLine === U(0xB, 4 bits)) || (ucLine === U(0xC, 4 bits)) ||
+                         (ucLine === U(0xD, 4 bits))
+    val ucAluSrcMode   = (ucOpmode === U(0, 3 bits)) || (ucOpmode === U(1, 3 bits)) || (ucOpmode === U(2, 3 bits))
+    val ucAluSrcMi = ucIsAluSrcLine && ucAluSrcMode && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
+    // line-0 immediate op dst-EA (ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea>): the immediate
+    // PRECEDES the EA ext, so re-decode the EA from a SHIFTED window. immWords = .L?2:1.
+    val ucImmIsL   = ucEopw(7 downto 6) === B"10"
+    val ucImmWords = Mux(ucImmIsL, U(2, 3 bits), U(1, 3 bits))
+    val ucImmEaVec = Mux(ucImmIsL, Vec(ucEopw, ucEntryPkt.words(3), ucEntryPkt.words(4), ucEntryPkt.words(5)),
+                                   Vec(ucEopw, ucEntryPkt.words(2), ucEntryPkt.words(3), ucEntryPkt.words(4)))
+    val ucImmEa    = EaDecoder.decode(ucEopw(5 downto 0), ucEntrySpec.size, ucImmEaVec)
+    val ucIsLineImm= ucEntrySpec.srcB.kind === OperandKind.IMMEXT
+    val ucImmDstMi = ucIsLineImm && (ucImmEa.klass === EaClass.MEMINDIRECT)
+    // single-EA op (CLR/NEG/NEGX/NOT/TST): the EA is op[5:0], the host op is spec.op.
+    val ucIsSingleEa = (ucEntrySpec.op === DecOp.CLR) || (ucEntrySpec.op === DecOp.NEG) ||
+                       (ucEntrySpec.op === DecOp.NEGX) || (ucEntrySpec.op === DecOp.NOT) ||
+                       (ucEntrySpec.op === DecOp.TST)
+    val ucSingleMi = ucIsSingleEa && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
+    // The chosen mem-indirect EaSpec (the pointer load's base/bd/index + od/post).
+    val ucMiEa = Mux(ucMoveDstMi, ucMiDstEa, Mux(ucImmDstMi, ucImmEa, ucMiSrcEa))
+    // The op IS a full-format mem-indirect host (route to the engine).
+    val ucIsMemInd = (ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucImmDstMi || ucSingleMi) &&
+                     fed.valid
+    // The host op's OTHER operand register:
+    //   MOVE src-EA (load to a reg)  -> the dst reg  = op[11:9] (Dn) / +8 for An (isMovea n/a here).
+    //   MOVE dst-EA (store from reg) -> the src reg  = op[5:0] (Dn/An, register-direct src).
+    //   ALU src-EA                   -> the other Dn = op[11:9].
+    // For a register-direct MOVE src/dst, the full reg id includes the An bit (mode 001).
+    val ucMoveSrcReg = ucEopw(2 downto 0).asUInt   // MOVE src field (the store-data reg for dst-EA)
+    val ucMoveSrcAn  = ucEopw(5 downto 3) === B"001"
+    val ucMiOtherReg = Mux(ucMoveDstMi,
+                           Mux(ucMoveSrcAn, (U(8, 5 bits) + ucMoveSrcReg).resize(5), ucMoveSrcReg.resize(5)),
+                           ucEopw(11 downto 9).asUInt.resize(5))   // Dn for MOVE-src/ALU
+    // CMPI / TST -> flags-only (no store). The op writes NZVC and (ADD/SUB/NEG/NEGX) X.
+    val ucMiOpIsCmp = ucEntrySpec.op === DecOp.CMP
+    val ucMiOpIsTst = ucEntrySpec.op === DecOp.TST
+    val ucMiFlagsOnly = ucMiOpIsCmp || ucMiOpIsTst
+    // Entry select: MOVE-src / MOVE-dst / ALU-src / imm-RMW (or FLAGS) / single-EA RMW (or FLAGS).
+    val ew = ucEntrySpec.ucEntry.getWidth
+    val ucMiEntry =
+      Mux(ucMoveSrcMi, U(Microcode.MI_MOVE_SRC_ENTRY, ew bits),
+      Mux(ucMoveDstMi, U(Microcode.MI_MOVE_DST_ENTRY, ew bits),
+      Mux(ucAluSrcMi,  U(Microcode.MI_ALU_SRC_ENTRY,  ew bits),
+      Mux(ucMiFlagsOnly, U(Microcode.MI_FLAGS_ENTRY, ew bits),
+                         U(Microcode.MI_RMW_ENTRY,    ew bits)))))
+    // Populate the MI Ctx group + (reuse the EA infra) the pointer-load EA fields. The host
+    // size = spec.size; the pointer load is always LONG. od/post from the chosen EaSpec.
+    ucEntryCtx.miOd         := ucMiEa.od
+    ucEntryCtx.miPost       := ucMiEa.memPost
+    ucEntryCtx.miOp         := ucEntrySpec.op
+    ucEntryCtx.miHostSize   := ucEntrySpec.size
+    ucEntryCtx.miIsDstEa    := ucMoveDstMi || ucImmDstMi || ucSingleMi
+    ucEntryCtx.miIsRmw      := (ucImmDstMi || ucSingleMi) && !ucMiFlagsOnly
+    ucEntryCtx.miOther      := ucMiOtherReg
+    ucEntryCtx.miOtherValid := ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || (ucImmDstMi && !ucIsSingleEa)
+    ucEntryCtx.miOtherIsImm := ucImmDstMi
+    // The line-0 immediate VALUE precedes the EA ext: words(1) (.B/.W, sign-extended) or
+    // words(1)##words(2) (.L). (Only consumed when miOtherIsImm.)
+    ucEntryCtx.miHostImm    := Mux(ucImmIsL, ucEntryPkt.words(1) ## ucEntryPkt.words(2),
+                                             ucEntryPkt.words(1).asSInt.resize(32).asBits)
+    ucEntryCtx.miOtherIsDst := ucMoveSrcMi
+    // Host op flag effects. All in-scope hosts (MOVE/ADD/SUB/AND/OR/EOR/CMP/CLR/NEG/NEGX/
+    // NOT/TST) write NZVC. X is written only by ADD/SUB/NEG/NEGX (not MOVE/logical/CMP/TST/
+    // CLR). NEGX additionally READS old NZ (clear-only Z) + X.
+    val ucMiWriteX    = (ucEntrySpec.op === DecOp.ADD) || (ucEntrySpec.op === DecOp.SUB) ||
+                        (ucEntrySpec.op === DecOp.NEG) || (ucEntrySpec.op === DecOp.NEGX)
+    ucEntryCtx.miWNzvc := True
+    ucEntryCtx.miWX    := ucMiWriteX
+    ucEntryCtx.miRNzvc := ucEntrySpec.op === DecOp.NEGX   // NEGX reads old NZ (clear-only Z)
+    ucEntryCtx.miRX    := ucEntrySpec.op === DecOp.NEGX
+    // Pointer-load EA fields (reuse the bit-field EA infra). disp = bd (the EaSpec disp);
+    // pcRel mem-indirect is rejected at decode (read-only EA), so no pc fold needed here.
+    when(ucIsMemInd) {
+      ucEntryCtx.eaBase       := ucMiEa.base
+      ucEntryCtx.eaBaseValid  := ucMiEa.baseValid
+      ucEntryCtx.eaIndexReg   := ucMiEa.indexReg
+      ucEntryCtx.eaIndexValid := ucMiEa.indexValid
+      ucEntryCtx.eaIndexLong  := ucMiEa.indexLong
+      ucEntryCtx.eaIndexScale := ucMiEa.indexScale
+      ucEntryCtx.eaDispLo     := ucMiEa.disp
+    }
+
+    // The REAL entry: a bit-field RMW (microcoded BITFIELD) picks 5B vs 4B by needHi; a
+    // full-format mem-indirect host picks its shape entry; every other microcoded op
+    // (BCD/ADDX/SUBX) keeps its OperationDecoder ucEntry.
     val ucIsBfRmw  = ucEntrySpec.microcoded && (ucEntrySpec.op === DecOp.BITFIELD)
-    val ucRealEntry = Mux(ucIsBfRmw,
-      Mux(ucBfNeedHi, U(Microcode.BF_RMW_5B_ENTRY, ucEntrySpec.ucEntry.getWidth bits),
-                      U(Microcode.BF_RMW_4B_ENTRY, ucEntrySpec.ucEntry.getWidth bits)),
-      ucEntrySpec.ucEntry)
+    val ucRealEntry = Mux(ucIsMemInd, ucMiEntry,
+      Mux(ucIsBfRmw,
+        Mux(ucBfNeedHi, U(Microcode.BF_RMW_5B_ENTRY, ew bits),
+                        U(Microcode.BF_RMW_4B_ENTRY, ew bits)),
+        ucEntrySpec.ucEntry))
 
     // Resolve every ROM row against the LATCHED ctx, then index by ucPc -> this cycle's
     // µop (the ROM is a compile-time Scala Vector; resolve each row to hardware + mux).
@@ -584,7 +746,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // µcode: hold `fed` while the engine is busy or about to begin; release exactly when
     // the LAST µop is accepted into pushReg (ucReleaseFed). A microcoded slot0 is owned by
     // the engine (like a MOVEM slot0), so the NORMAL fed.ready arm must NOT consume it.
-    val ucHoldsFed    = ucActive || ucPendValid || slot0IsMicrocoded
+    val ucHoldsFed    = ucActive || ucPendValid || slot0OwnedByUc
     // MOVEP: identical contract to MOVEM. A slot0 MOVEP is consumed on its ENTRY cycle
     // (movepEnterSlot0) — its state is latched into regs that cycle; its slot1 is stashed
     // and replayed after the FSM finishes. A slot1 MOVEP is entered from the stashed PACKET
@@ -611,7 +773,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         // The MOVEP FSM enters from it next cycle (mirrors the slot1 MOVEM pend).
         movepPendValid := True
         movepPendPkt   := fed.payload.packets(1)
-      } elsewhen(slot1IsUcodeEarly) {
+      } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly) {
         // slot0 (normal) emitted this cycle; stash the slot1 MICROCODED packet, consume fed.
         // The engine enters from it next cycle (mirrors the slot1 MOVEM pend).
         ucPendValid := True
@@ -717,7 +879,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         } elsewhen(slot1IsMovepEarly) {
           movepPendValid := True
           movepPendPkt   := fed.payload.packets(1)
-        } elsewhen(slot1IsUcodeEarly) {
+        } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly) {
           ucPendValid := True
           ucPendPkt   := fed.payload.packets(1)
         } otherwise {
@@ -761,7 +923,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         } elsewhen(slot1IsMovepEarly) {
           movepPendValid := True
           movepPendPkt   := fed.payload.packets(1)
-        } elsewhen(slot1IsUcodeEarly) {
+        } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly) {
           ucPendValid := True
           ucPendPkt   := fed.payload.packets(1)
         } otherwise {
