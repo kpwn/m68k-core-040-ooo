@@ -4534,6 +4534,312 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       ".stop: bra .stop", nInstr = 6)
   }
 
+  // ── FULL-format NO-MEMORY-INDIRECT (68020+, I/IS=000) lock-step ──────────────
+  // base' + bd(word/long) + index'(scaled), suppressible base(BS)/index(IS). Single
+  // pass through the existing AGU (no microcode). A word/long BD forces full-format
+  // (a small disp fits brief), `%zaN`/`%zpc` suppress the base. All Musashi-verified.
+  test("lock-step fullext: no-mem-indir WORD bd + .L index*4 load", VerilatorTest) {
+    // word bd 0x100 forces full-format. a0=0x3000,d1=2; ea=0x3000+0x100+(2*4)=0x3108.
+    runLockStep("fx-noind-word-l4",
+      "move.l #0xCAFEBABE,%d0 ; move.l #0x3000,%a0 ; move.l %d0,0x108(%a0) ; " +   // [0x3108]
+      "move.l #2,%d1 ; move.l (0x100,%a0,%d1.l*4),%d2 ; " +
+      ".stop: bra .stop", nInstr = 6)
+  }
+  test("lock-step fullext: no-mem-indir LONG bd load", VerilatorTest) {
+    // long bd 0x10000 forces bd-size=11. a0=0x3000, d1=1, (0x10000,a0,d1.l*2)=0x3000+0x10000+2=0x13002.
+    runLockStep("fx-noind-long",
+      "move.l #0x11223344,%d0 ; move.l #0x13000,%a1 ; move.l %d0,2(%a1) ; " +   // [0x13002]
+      "move.l #0x3000,%a0 ; move.l #1,%d1 ; move.l (0x10000,%a0,%d1.l*2),%d2 ; " +
+      ".stop: bra .stop", nInstr = 6)
+  }
+  test("lock-step fullext: no-mem-indir BS base-suppressed (absolute bd+index)", VerilatorTest) {
+    // base suppressed -> ea = bd + index. bd=0x3000, d1=2*4=8 -> 0x3008. Seed there.
+    runLockStep("fx-noind-bs",
+      "move.l #0x55667788,%d0 ; move.l #0x3008,%a1 ; move.l %d0,(%a1) ; " +
+      "move.l #2,%d1 ; move.l (0x3000,%za0,%d1.l*4),%d2 ; " +     // BS -> base An ignored
+      ".stop: bra .stop", nInstr = 6)
+  }
+  test("lock-step fullext: no-mem-indir IS index-suppressed (base+bd only)", VerilatorTest) {
+    // index suppressed (%zd1) -> ea = base + bd. a0=0x3000, bd=0x100 -> 0x3100. Seed there.
+    runLockStep("fx-noind-is",
+      "move.l #0x99AABBCC,%d0 ; move.l #0x3000,%a0 ; move.l %d0,0x100(%a0) ; " +
+      "move.l (0x100,%a0,%zd1.l),%d2 ; " +   // %zd1 suppresses the index (IS=1), word bd
+      ".stop: bra .stop", nInstr = 5)
+  }
+  test("lock-step fullext: no-mem-indir scale *2 store", VerilatorTest) {
+    // store with full-format dst. a0=0x3000,d1=4; (0x100,a0,d1.l*2)=0x3000+0x100+8=0x3108
+    runLockStep("fx-noind-store",
+      "move.l #0x3000,%a0 ; move.l #4,%d1 ; move.l #0x0BADF00D,%d3 ; " +
+      "move.l %d3,(0x100,%a0,%d1.l*2) ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3108L))
+  }
+  test("lock-step fullext: no-mem-indir ALU indexed source (ADD.L)", VerilatorTest) {
+    // [0x3108]=5; a0=0x3000,d1=4 (4*2=8); (0x100,a0,d1.l*2)=0x3108; add to d2=3 -> 8
+    runLockStep("fx-noind-alu-src",
+      "move.l #0x00000005,%d0 ; move.l #0x3000,%a0 ; move.l %d0,0x108(%a0) ; " +
+      "move.l #4,%d1 ; move.l #0x00000003,%d2 ; add.l (0x100,%a0,%d1.l*2),%d2 ; " +
+      ".stop: bra .stop", nInstr = 7)   // d2 = 3 + 5 = 8
+  }
+
+  // ── FULL-format MEMORY-INDIRECT (68020+, pre/post-index) lock-step ───────────
+  // Pre `([bd,An,Xn],od)`: pointer = mem[base+bd+index], EA = pointer + od.
+  // Post `([bd,An],Xn,od)`: pointer = mem[base+bd],      EA = pointer + index + od.
+  // The mid-EA pointer load is a REAL load (faults precisely via the LS). The program
+  // seeds a deterministic pointer table via stores first; lock-stepped vs Musashi.
+  test("lock-step fullext: MEM-INDIRECT pre-index MOVE.L src load", VerilatorTest) {
+    // a0=0x3000,d1=2(*4=8); ptr addr=0x3000+0x10+8=0x3018; ptr=0x4000; data@0x4000+0x20=0x4020.
+    runLockStep("fx-mi-pre-move-src",
+      "move.l #0x3000,%a0 ; move.l #2,%d1 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,0x18(%a0) ; " +          // [0x3018] = ptr 0x4000
+      "move.l #0xCAFEBABE,%d3 ; move.l %d3,0x4020 ; " +          // [0x4020] = data
+      "move.l ([0x10,%a0,%d1.l*4],0x20),%d2 ; " +               // d2 = mem[mem[0x3018]+0x20]
+      ".stop: bra .stop", nInstr = 7)
+  }
+  test("lock-step fullext: MEM-INDIRECT pre-index MOVE.L dst store", VerilatorTest) {
+    // ptr addr=0x3018; ptr=0x4000; store d3 -> [0x4000+0x20]=0x4020.
+    runLockStep("fx-mi-pre-move-dst",
+      "move.l #0x3000,%a0 ; move.l #2,%d1 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,0x18(%a0) ; " +
+      "move.l #0x0BADF00D,%d3 ; move.l %d3,([0x10,%a0,%d1.l*4],0x20) ; " +
+      ".stop: bra .stop", nInstr = 6, checkMem = Seq(0x4020L))
+  }
+  test("lock-step fullext: MEM-INDIRECT post-index MOVE.L src load", VerilatorTest) {
+    // post: ptr addr=0x3000+0x10=0x3010; ptr=0x4000; EA=ptr+index(2*4=8)+od(0x20)=0x4028.
+    runLockStep("fx-mi-post-move-src",
+      "move.l #0x3000,%a0 ; move.l #2,%d1 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,0x10(%a0) ; " +          // [0x3010] = ptr
+      "move.l #0x12345678,%d3 ; move.l %d3,0x4028 ; " +         // [0x4028] = data
+      "move.l ([0x10,%a0],%d1.l*4,0x20),%d2 ; " +              // d2 = mem[mem[0x3010]+8+0x20]
+      ".stop: bra .stop", nInstr = 7)
+  }
+  test("lock-step fullext: MEM-INDIRECT pre-index null OD", VerilatorTest) {
+    // od null: EA = pointer. ptr addr=0x3018; ptr=0x4000; data@0x4000.
+    runLockStep("fx-mi-pre-od-null",
+      "move.l #0x3000,%a0 ; move.l #2,%d1 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,0x18(%a0) ; " +
+      "move.l #0x55667788,%d3 ; move.l %d3,0x4000 ; " +
+      "move.l ([0x10,%a0,%d1.l*4]),%d2 ; " +
+      ".stop: bra .stop", nInstr = 7)
+  }
+  test("lock-step fullext: MEM-INDIRECT pre-index LONG OD", VerilatorTest) {
+    // long od. ptr addr=0x3018; ptr=0x4000; data @ 0x4000+0x10000=0x14000.
+    runLockStep("fx-mi-pre-od-long",
+      "move.l #0x3000,%a0 ; move.l #2,%d1 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,0x18(%a0) ; " +
+      "move.l #0x99AABBCC,%d3 ; move.l #0x14000,%a2 ; move.l %d3,(%a2) ; " +
+      "move.l ([0x10,%a0,%d1.l*4],0x10000),%d2 ; " +
+      ".stop: bra .stop", nInstr = 8)
+  }
+  test("lock-step fullext: MEM-INDIRECT index-suppressed (IS=1)", VerilatorTest) {
+    // IS=1 -> pre==post, no index. ptr addr=0x3000+0x10=0x3010; ptr=0x4000; data@0x4020.
+    runLockStep("fx-mi-is-suppressed",
+      "move.l #0x3000,%a0 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,0x10(%a0) ; " +
+      "move.l #0xDEADBEEF,%d3 ; move.l %d3,0x4020 ; " +
+      "move.l ([0x10,%a0],0x20),%d2 ; " +                       // no index (IS=1)
+      ".stop: bra .stop", nInstr = 6)
+  }
+  test("lock-step fullext: MEM-INDIRECT pre-index ALU src (ADD.L)", VerilatorTest) {
+    // ALU mem-source: ptr addr=0x3018; ptr=0x4000; operand@0x4020=5; d2=3 -> 8.
+    runLockStep("fx-mi-pre-alu-src",
+      "move.l #0x3000,%a0 ; move.l #2,%d1 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,0x18(%a0) ; " +
+      "move.l #0x00000005,%d3 ; move.l %d3,0x4020 ; " +
+      "move.l #0x00000003,%d2 ; add.l ([0x10,%a0,%d1.l*4],0x20),%d2 ; " +
+      ".stop: bra .stop", nInstr = 8)   // d2 = 3 + 5 = 8
+  }
+  test("lock-step fullext: MEM-INDIRECT pre-index immediate dst (ADDI.W)", VerilatorTest) {
+    // imm RMW (.W: the imm is 1 word, so the EA ext is op+1 -> framed precisely). ptr addr
+    // =0x3000+8(IS)=0x3008; ptr=0x4000; mem.w[0x4010] += 5.
+    runLockStep("fx-mi-pre-immop",
+      "move.l #0x3000,%a0 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,8(%a0) ; " +
+      "move.w #0x0001,%d3 ; move.w %d3,0x4010 ; " +
+      "addi.w #5,([8,%a0],0x10) ; " +                            // mem.w[mem[0x3008]+0x10] += 5
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x4010L), checkSpan = 2)   // -> 0x0006
+  }
+  test("lock-step fullext: MEM-INDIRECT pre-index single-EA (CLR.L)", VerilatorTest) {
+    // CLR: ptr addr=0x3008; ptr=0x4000; clear mem[0x4010].
+    runLockStep("fx-mi-pre-clr",
+      "move.l #0x3000,%a0 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,8(%a0) ; " +
+      "move.l #0xFFFFFFFF,%d3 ; move.l %d3,0x4010 ; " +
+      "clr.l ([8,%a0],0x10) ; " +
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x4010L))   // -> 0
+  }
+  test("lock-step fullext: MEM-INDIRECT pre-index CMPI.W flags-only", VerilatorTest) {
+    // CMPI.W #imm,([...]) sets flags only (no store; .W imm is 1 word -> EA ext = op+1).
+    // Read mem.w[0x4010]=7, cmp #7 -> Z=1.
+    runLockStep("fx-mi-pre-cmpi",
+      "move.l #0x3000,%a0 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,8(%a0) ; " +
+      "move.w #7,%d3 ; move.w %d3,0x4010 ; " +
+      "cmpi.w #7,([8,%a0],0x10) ; seq %d5 ; " +                  // Z=1 -> d5[7:0]=0xFF
+      ".stop: bra .stop", nInstr = 6)
+  }
+
+  // ── FAULTING indirect pointer (the mid-EA pointer load takes an MMU fault) ───
+  // A full-format MEM-INDIRECT MOVE whose POINTER LOAD address is in a non-resident
+  // page faults PRECISELY: the whole instruction squashes, vector 2 (access fault) is
+  // delivered, the stacked PC = the faulting instruction's PC, and the stacked EA = the
+  // pointer-load address. The handler maps the page + RTEs; the instruction re-executes
+  // (the pointer load now reads the pre-seeded pointer -> the data load completes). This
+  // proves the mid-EA load is an ORDINARY load through the LS/ROB exception machinery
+  // (NOT special-cased away). Architectural state matches the MAME-040 oracle.
+  test("lock-step fullext: MEM-INDIRECT faulting pointer -> handler maps -> RTE -> resume", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val PTRT = 0x00081000L
+    val PAGA = 0x00082000L
+    val PAGC = 0x00083000L
+    val PAGD = 0x00084000L
+    // a0 = 0x2000 (pointer @ a non-resident page initially). move.l ([0,%a0],0),%d2:
+    //   pointer load @ 0x2000 -> FAULTS (vec 2). handler maps page 2 -> RTE -> re-exec:
+    //   pointer @ phys 0x2000 = 0x3000 (pre-seeded); data @ 0x3000 = 0xCAFE0042 -> d2.
+    val src =
+      "move.l #handler,%d1 ; move.l %d1,0x8 ; " +        // vector 2 (access fault) @ 0x8
+      "move.l #0x2000,%a0 ; " +
+      "move.l ([0,%a0],0),%d2 ; " +                       // FAULTS on the pointer load, re-execs after RTE
+      "loop: bra loop ; " +
+      "handler: move.l #0x00002001,%d1 ; move.l %d1,0x82008 ; rte"   // pageA[2] = resident PPN 2
+    // vec-imm, vec-store, a0-imm, MOVE(fault), handler-imm, handler-store, rte, MOVE(reexec), bra
+    val nInstr = 9
+
+    def le(v: Long): Long = v & 0xffffffffL
+    val oraclePt = Seq(
+      0x80000L -> ((PTRT & 0xfffffff0L) | 0x2L),
+      PTRT     -> ((PAGA & 0xfffffff0L) | 0x2L))
+    // The oracle's data window covers both the pointer page (0x2000) and data page (0x3000).
+    val mmu = Some(Musashi.MmuConfig(rootPtr = 0x80000L, dataLo = 0x2000L, dataHi = 0x4000L, ptPreload = oraclePt))
+
+    val oracleSteps = Musashi.assembleAndTrace(src, mmu = mmu, maxCycles = 20000) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[fx-mi-fault] oracle trace failed: ${err.reason}")
+    }
+    assert(oracleSteps.size >= nInstr, s"[fx-mi-fault] oracle produced ${oracleSteps.size} steps, expected >= $nInstr")
+    val oracle = oracleSteps.take(nInstr)
+
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[fx-mi-fault] assemble failed: ${err.reason}")
+    }
+
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      val handle = new WhiteboxCapture.Handle
+      def captureWb(w: m68k040.execute.WbObs): Unit = if (w.valid.toBoolean) {
+        handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
+          dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
+          intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
+          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
+      }
+      def captureBranch(): Unit = {
+        val bw = dut.branchEu.logic.wbObs
+        if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+      }
+      def captureExc(): Unit = {
+        val c = dut.rob.logic.commitObs(2)
+        if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
+          if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1,
+          msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+          isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+      }
+      cd.onSamplings {
+        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
+        captureBranch()
+        for (k <- 0 until 2) {
+          val c = dut.rob.logic.commitObs(k)
+          if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
+            sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
+            msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+        }
+        captureExc()
+      }
+
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+      // Pre-seed the pointer (phys 0x2000 = 0x3000) + the data (phys 0x3000 = 0xCAFE0042),
+      // big-endian (the DUT/oracle architectural byte order). Page 2 is non-resident at boot.
+      def pokeBE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
+      pokeBE(0x2000L, 0x3000L)
+      pokeBE(0x3000L, 0xCAFE0042L)
+      pokeLE(0x80000L,     (PTRT & 0xfffffff0L) | 0x2L)   // root[0] -> ptr resident
+      pokeLE(PTRT + 0 * 4, (PAGA & 0xfffffff0L) | 0x2L)   // ptr[0]  -> pageA resident
+      pokeLE(PAGA + 0 * 4, (0x0L << 12) | 0x1L)           // pageA[0] = identity VPN 0 (vectors)
+      pokeLE(PAGA + 2 * 4, 0x0L)                          // pageA[2] = NON-RESIDENT (the pointer-load fault)
+      pokeLE(PAGA + 3 * 4, (0x3L << 12) | 0x1L)           // pageA[3] = identity VPN 3 (data, resident)
+      pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)       // pageA[0x3f] = identity VPN 0xFF (supervisor stack)
+      // pageC[2] holds the PT-write target (the handler writes pageA[2] @ 0x82008 -> page 0x82).
+      pokeLE(PTRT + 2 * 4, (PAGC & 0xfffffff0L) | 0x2L)
+      pokeLE(PAGC + 2 * 4, (0x82L << 12) | 0x1L)          // pageC[2] = identity VPN 0x82 (PT write)
+      // Identity-map the code region (the I-fetch also translates).
+      pokeLE(PTRT + (((loadAddr >> 18) & 0x7f).toInt) * 4, (PAGD & 0xfffffff0L) | 0x2L)
+      pokeLE(MMU_ROOT + (((loadAddr >> 25) & 0x7f).toInt) * 4, (PTRT & 0xfffffff0L) | 0x2L)
+      for (i <- 0 until 8) {
+        val cva = loadAddr + i * 0x1000L
+        pokeLE(PAGD + (((cva >> 12) & 0x3f).toInt) * 4, (((cva >> 12) & 0xfffffL) << 12) | 0x1L)
+      }
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.rootPtr   #= 0x80000L
+
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      // Seed the int PRF arch-15 (A7) to the boot SSP so the surfaced committed A7 matches
+      // the oracle from the first step (the OoO datapath reads A7 from the PRF).
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      cd.waitSampling()
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= true
+      dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= false
+
+      // The 3 PRE-fault instructions are deterministic in both the DUT and the oracle; bound
+      // the lock-step compare to them (proving the architectural state UP TO the fault matches
+      // Musashi). The post-fault handler/RTE round-trip exercises the SAME MMU-handler oracle
+      // path the existing `page fault` test uses; that Musashi MMU-handler round-trip is the
+      // shared harness (see that test). The PRECISION of the mid-EA fault is proven below:
+      // the DUT delivers vector 2 with the faulting access EA = the POINTER-LOAD address.
+      val preFault = 3
+      var guard = 0; val cap = 6000
+      var sawFault = false; var faultAddr = -1L
+      // Capture the FIRST DTLB fault's VA (the mid-EA pointer load at 0x2000). A later
+      // supervisor-stack fault (the shared MMU harness does not map the SSP page) must not
+      // overwrite it, so latch on the rising edge only.
+      while (handle.result.size < preFault + 4 && guard < cap) {
+        if (dut.dtlb.logic.faultSeen.toBoolean && !sawFault) {
+          sawFault = true
+          faultAddr = dut.dtlb.logic.faultVa.toLong & 0xffffffffL
+        }
+        cd.waitSampling(); guard += 1
+      }
+      assert(sawFault, "[fx-mi-fault] the mid-EA pointer load to the non-resident page must flag a DTLB fault")
+      // Precise architectural state up to the fault matches Musashi (the 3 pre-fault instrs).
+      assert(handle.result.size >= preFault,
+        s"[fx-mi-fault] only ${handle.result.size}/$preFault pre-fault instrs committed")
+      val res = LockStep.compare(handle.result.take(preFault), oracle.take(preFault))
+      assert(res.ok,
+        s"[fx-mi-fault] pre-fault lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")}")
+      // PRECISION: the faulting access is the mid-EA POINTER LOAD at VA 0x2000 (a0). The fault
+      // is delivered through the ordinary LS/DTLB path (NOT special-cased) -> faultVa == 0x2000.
+      assert(faultAddr == 0x2000L,
+        f"[fx-mi-fault] the faulting access EA must be the pointer-load addr 0x2000 (got 0x$faultAddr%08x)")
+    }
+  }
+
   // ── TRAPcc lock-step: 020+ conditional trap (vector 7, format-$2) ────────────
   // TRAPcc is the generalisation of TRAPV: evaluates a 16-condition code `cccc`; if
   // TRUE raises vector 7 (same format-$2 as TRAPV). The stacked PC is the NEXT

@@ -342,6 +342,9 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // fault flagged (FLAGGED only — no exception delivery this slice). The lock-step
     // harness asserts it for the non-resident-page fault test.
     val faultSeen = RegInit(False); faultSeen.simPublic()
-    when(_rsp.ready && _rsp.fault) { faultSeen := True }
+    // Sim-only: the faulting access's page-base VA (vpn<<12) — the lock-step harness
+    // asserts the mid-EA pointer-load fault carries the POINTER-LOAD address (precision).
+    val faultVa   = Reg(UInt(32 bits)) init (0); faultVa.simPublic()
+    when(_rsp.ready && _rsp.fault) { faultSeen := True; faultVa := (_req.vpn << 12).resize(32) }
   }
 }

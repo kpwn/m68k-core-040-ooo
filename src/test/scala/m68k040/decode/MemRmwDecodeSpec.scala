@@ -308,4 +308,54 @@ class MemRmwDecodeSpec extends AnyFunSuite {
       assert(!dut.uop2.indexLong.toBoolean && dut.uop2.indexScale.toInt == 0, "store .W / scale *1")
     }
   }
+
+  // ── .L-immediate + FULL-FORMAT dst EA: gated ILLEGAL (silent-corruption hole) ──
+  // A line-0 .L-immediate op with a full-format indexed dst EA (mode 6 / 7-3, ext
+  // bit8=1) puts the EA's first ext word at op+3 — beyond the per-word predecode window
+  // (op+1/op+2) — so predecode frames it BRIEF (too short) and the FOLLOWING instr
+  // mis-fetches. Both classifications (no-mem-indirect MEMSIMPLE-full AND mem-indirect)
+  // are gated ILLEGAL (vector 4) here rather than silently corrupting. (Musashi executes
+  // it; this is a documented, NON-silent illegal-trap gap — NOT a lock-step assertion.)
+  def assertIllegalVec4(dut: Dut): Unit = {
+    assert(dut.count.toInt == 1, s"illegal = 1 µop, got ${dut.count.toInt}")
+    assert(dut.uop0.op.toEnum == DecOp.ILLEGAL, "op = ILLEGAL")
+    assert(dut.uop0.unimplemented.toBoolean, "unimplemented")
+    assert(dut.uop0.faulted.toBoolean, "faulted")
+    assert(dut.uop0.faultVector.toInt == 4, s"vector 4, got ${dut.uop0.faultVector.toInt}")
+  }
+
+  test("ADDI.L #imm,(8,A0,D1.L*4) FULL-FORMAT no-mem-indirect dst -> ILLEGAL (vector 4)", VerilatorTest) {
+    // ADDI.L #imm,<full-format dst>: 0000 0110 10 110 000 = 0x06B0 (ADDI.L, dst mode6 reg0=A0).
+    // imm32 = words(1..2); the full-format ext word is at words(3): bit8=1 (full), Xn=D1,
+    // W/L=.L, scale=*4 (=2), bd-size=long (3), I/IS=000 (no-mem-indirect = MEMSIMPLE-full).
+    // ext = (1<<12)|(1<<11)|(2<<9)|(1<<8)|(3<<4)|0 = 0x1B30, then bd.l = words(4..5).
+    run { dut => drive2(dut, 0x06B0, Seq(0x1111, 0x2222, 0x1B30, 0x0000, 0x0008), len = 6)
+      dut.pkt.words(5) #= 0x0008; sleep(1)
+      assertIllegalVec4(dut)
+    }
+  }
+
+  test("ADDI.L #imm,([0x10,A0,D1.L*4],0x20) FULL-FORMAT MEM-INDIRECT dst -> ILLEGAL (vector 4)", VerilatorTest) {
+    // Same opword 0x06B0 (ADDI.L mode6 reg0). full-format ext at words(3): bit8=1, Xn=D1,
+    // .L, *4, bd-size=word(2), I/IS=010 (pre-index, word od) -> MEMINDIRECT. ext = 0x1B22.
+    // bd.w = words(4) = 0x0010, od.w = words(5) = 0x0020. imm32 = words(1..2).
+    run { dut => drive2(dut, 0x06B0, Seq(0x1111, 0x2222, 0x1B22, 0x0010), len = 6)
+      dut.pkt.words(5) #= 0x0020; sleep(1)
+      assertIllegalVec4(dut)
+    }
+  }
+
+  // The .B/.W immediate full-format dst forms are FINE (EA ext at op+2, visible to
+  // predecode) — they must NOT be gated illegal. ADDI.W #imm,(8,A0,D1.W*1) no-mem-indir:
+  //   0000 0110 01 110 000 = 0x0670, imm.W = words(1), full-ext at words(2): bit8=1,
+  //   Xn=D1, .W, *1, bd-size=word(2), I/IS=000 -> MEMSIMPLE-full RMW (NOT illegal).
+  //   ext = (1<<12)|(1<<8)|(2<<4) = 0x1120, bd.w = words(3) = 0x0008.
+  test(".W immediate full-format dst stays a legal RMW (NOT gated illegal)", VerilatorTest) {
+    run { dut => drive2(dut, 0x0670, Seq(0x1234, 0x1120, 0x0008), len = 4); sleep(1)
+      assert(dut.count.toInt == 3, "RMW triple (legal)")
+      assert(!dut.uop0.unimplemented.toBoolean, "load NOT unimplemented")
+      assert(!dut.uop1.unimplemented.toBoolean, "op NOT unimplemented")
+      assert(dut.uop1.op.toEnum == DecOp.ADD, "ADDI -> ADD")
+    }
+  }
 }

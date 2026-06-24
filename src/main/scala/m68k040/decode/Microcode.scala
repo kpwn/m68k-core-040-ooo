@@ -50,6 +50,10 @@ object Microcode {
   case object SEaDispLo   extends Sel   // selImm: the byteAddr disp (EA disp + offset>>3)
   case object SEaDispHi   extends Sel   // selImm: the byteAddr+4 disp (the spill byte)
   case object SBfImm      extends Sel   // selImm: the packed bfMem imm (bitOff/needHi/width/origOff)
+  // ── full-format MEMORY-INDIRECT host-op selectors ──────────────────────────
+  case object SMiOther    extends Sel   // (miOther, miOtherValid) — the host op's other reg (Dn/Dm)
+  case object SMiOd       extends Sel   // selImm: the outer displacement od (host access disp)
+  case object SMiImm      extends Sel   // selImm: the host op immediate (line-0 imm op)
 
   /** The op kind of a descriptor's template. */
   sealed trait UOp
@@ -57,6 +61,10 @@ object Microcode {
   case object UAddDrop   extends UOp    // ADD.L dst:=srcA+imm, divIsRem (dropped An write-back)
   case object UOpFromCtx extends UOp    // the latched op (BCD/ADDX/SUBX), flags from ctx
   case object UBfMem     extends UOp    // BITFIELD bfMem compute (RES/LO/HI funnel form); op=BITFIELD
+  // ── full-format MEMORY-INDIRECT host-op kinds ──────────────────────────────
+  case object UMiPtrLoad extends UOp    // LOAD.L pointer (eaBase + eaDispLo (+ pre-index)) -> T0
+  case object UMiHostMove extends UOp   // host MOVE load/store at (T0 + od (+post-index)); op=MOVE
+  case object UMiHostOp  extends UOp     // host ALU/unary compute (ctx.miOp): srcA,srcB -> dst + flags
 
   /** Memory role. */
   sealed trait Mem
@@ -77,6 +85,7 @@ object Microcode {
   case object SzCtx  extends Sz   // = ctx.size (BCD chain)
   case object SzLong extends Sz
   case object SzByte extends Sz
+  case object SzHost extends Sz   // = ctx.miHostSize (the full-format mem-indirect host access)
 
   /** One ROM row: a µop template + operand selectors + sequencing. */
   case class Desc(
@@ -94,6 +103,9 @@ object Microcode {
       indexFromEa: Boolean = false,  // LS row: srcC + indexLong/indexScale come from Ctx EA
       bfStoreForm: Int     = 0,      // UBfMem: 0=RES,1=LO4,2=LO5,3=HI5 (the funnel form)
       bfWritesNz:  Boolean = false,  // UBfMem: this compute writes the NZ flags (RES / LO4)
+      miPtrIndex:  Boolean = false,  // UMiPtrLoad: add the PRE-index (eaIndex) to the pointer addr
+      miHostIndex: Boolean = false,  // UMiHostMove LS row: add the POST-index (eaIndex) to (T0+od)
+      miMoveFlags: Boolean = false,  // UMiHostMove: this IS the host MOVE (sets NZVC per ctx.miWNzvc)
       isFirst: Boolean = false,   // firstOfInstr (the macro boundary)
       isLast:  Boolean = false    // releases `fed`
   )
@@ -163,10 +175,69 @@ object Microcode {
     Desc(UMove,  mem = MStore, srcA = SEaBase, srcB = ST0, useImm = true, imm = SEaDispLo,
          sz = SzLong, indexFromEa = true),                                     // µPC14 (b5)
     Desc(UMove,  mem = MStore, srcA = SEaBase, srcB = ST1, useImm = true, imm = SEaDispHi,
-         sz = SzByte, indexFromEa = true, isLast = true)                       // µPC15 (b6)
+         sz = SzByte, indexFromEa = true, isLast = true),                      // µPC15 (b6)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // FULL-format MEMORY-INDIRECT (68020+) host-op crack (spec §5). The shared
+    // POINTER LOAD reads the 32-bit pointer at base + bd (+ PRE-index for pre-index
+    // modes) -> T0 (UMiPtrLoad; miPtrIndex set for pre, clear for post). Then the
+    // HOST op re-runs as a (T0 + od (+ POST-index))-base access. Five entries, one
+    // per host shape (picked in DecodeStage by op + src/dst-EA). T0/T1 only (deepest
+    // = ALU-src/RMW: pointer T0 + operand T1 = 2 temps, no archDepth bump).
+
+    // MI_MOVE_SRC @16: MOVE src-EA -> a register. The LS load cannot compute the moved
+    // value's N/Z (it computes STORE-data flags only), so mirror the normal MOVE mem->Dn
+    // crack: load to T1, then a MOVE T1 -> Dn ALU µop that sets NZVC.
+    //   p0 LOAD.L ptr -> T0 (pre-index)            (isFirst)
+    //   p1 LOAD.host (T0+od (+post-idx)) -> T1
+    //   p2 MOVE T1 -> miOther (the dst Dn) + NZVC                       (isLast)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                      // µPC16
+    Desc(UMiHostMove, mem = MLoad, srcA = ST0, dst = ST1, useImm = true, imm = SMiOd,
+         sz = SzHost, miHostIndex = true),                                     // µPC17
+    // MOVE T1 -> Dn: the moved value rides srcB (the ALU MOVE result = src2); srcA = the
+    // dst Dn = the .B/.W partial-merge (old-value) source. Sets NZVC (data-reg dst).
+    Desc(UMiHostOp, srcA = SMiOther, srcB = ST1, dst = SMiOther, isLast = true),  // µPC18 (MOVE T1->Dn)
+
+    // MI_MOVE_DST @19: MOVE reg -> dst-EA (store).
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                      // µPC19
+    Desc(UMiHostMove, mem = MStore, srcA = ST0, srcB = SMiOther, useImm = true, imm = SMiOd,
+         sz = SzHost, miHostIndex = true, miMoveFlags = true, isLast = true),  // µPC20
+
+    // MI_ALU_SRC @21: ALU op with the EA as SOURCE: op (T0+od), Dm -> Dm + flags.
+    //   p0 LOAD.L ptr -> T0 ; p1 LOAD.host (T0+od) -> T1 ; p2 op T1,Dm -> Dm (+flags)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                      // µPC21
+    Desc(UMiHostMove, mem = MLoad, srcA = ST0, dst = ST1, useImm = true, imm = SMiOd,
+         sz = SzHost, miHostIndex = true),                                     // µPC22
+    Desc(UMiHostOp, srcA = ST1, srcB = SMiOther, dst = SMiOther, isLast = true),  // µPC23
+
+    // MI_RMW @24: dst-EA RMW (imm op ADDI/.../single-EA NEG/NOT/CLR): load, op, store.
+    //   p0 LOAD.L ptr -> T0 ; p1 LOAD.host (T0+od) -> T1 ; p2 op (T1 [, other]) -> T1
+    //   (+flags) ; p3 STORE.host T1 -> (T0+od)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                      // µPC24
+    Desc(UMiHostMove, mem = MLoad, srcA = ST0, dst = ST1, useImm = true, imm = SMiOd,
+         sz = SzHost, miHostIndex = true),                                     // µPC25
+    Desc(UMiHostOp, srcA = ST1, srcB = SMiOther, dst = ST1),                   // µPC26
+    Desc(UMiHostMove, mem = MStore, srcA = ST0, srcB = ST1, useImm = true, imm = SMiOd,
+         sz = SzHost, miHostIndex = true, isLast = true),                      // µPC27
+
+    // MI_FLAGS @28: dst-EA flags-only (CMPI / TST): load, op (flags), no store.
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                      // µPC28
+    Desc(UMiHostMove, mem = MLoad, srcA = ST0, dst = ST1, useImm = true, imm = SMiOd,
+         sz = SzHost, miHostIndex = true),                                     // µPC29
+    Desc(UMiHostOp, srcA = ST1, srcB = SMiOther, dst = SNone, isLast = true)   // µPC30
   )
   val BF_RMW_4B_ENTRY = 6
   val BF_RMW_5B_ENTRY = 9
+  val MI_MOVE_SRC_ENTRY = 16   // rows 16,17,18 (ptr-load, host-load->T1, MOVE T1->Dn)
+  val MI_MOVE_DST_ENTRY = 19   // rows 19,20    (ptr-load, host-store Dn->mem)
+  val MI_ALU_SRC_ENTRY  = 21   // rows 21,22,23 (ptr-load, host-load->T1, op T1,Dm->Dm)
+  val MI_RMW_ENTRY      = 24   // rows 24,25,26,27 (ptr-load, host-load->T1, op->T1, host-store)
+  val MI_FLAGS_ENTRY    = 28   // rows 28,29,30 (ptr-load, host-load->T1, op flags-only)
   def romSize: Int = rom.size
 
   /** Latched-instruction CONTEXT the engine resolves selectors against. v1 fields
@@ -197,6 +268,23 @@ object Microcode {
     val bfDn2        = UInt(5 bits)      // ext[14:12] (BFINS insert source register)
     val bfImm        = Bits(32 bits)     // the packed bfMem imm (identical layout to 3a bfmImm)
     val bfNeedHi     = Bool()            // (bitOff+width)>32 — picks the entry in DecodeStage
+    // ── full-format MEMORY-INDIRECT host-op group (the §5 host-op-to-temp crack) ──────
+    // The pointer-load address = eaBase + eaDispLo(=bd) + (pre: eaIndex). Post-index keeps
+    // the index for the HOST access. After [LOAD.L ptr -> T0], the host op re-runs as a
+    // (T0 + od (+post-index))-base access. These fields carry the host op identity.
+    val miOd         = Bits(32 bits)     // outer displacement (added to the loaded pointer)
+    val miPost       = Bool()            // True = post-index ([bd,An],Xn,od); index on the host access
+    val miOp         = DecOp()           // the host op (MOVE/ADD/SUB/AND/OR/CMP/CLR/NEG/NOT/TST/...)
+    val miHostSize   = Size()            // the host op access size (.B/.W/.L)
+    val miIsDstEa    = Bool()            // the EA is the host op's DESTINATION (store/RMW) vs SOURCE (load)
+    val miIsRmw      = Bool()            // dst-EA op that READS then WRITES the EA (imm op / CLR-family on mem)
+    val miOther      = UInt(5 bits)      // the host op's OTHER operand register (Dn/Dm); valid per miOtherValid
+    val miOtherValid = Bool()
+    val miOtherIsImm = Bool()            // the other operand is an immediate (line-0 imm op)
+    val miHostImm    = Bits(32 bits)     // the host op immediate (when miOtherIsImm)
+    val miOtherIsDst = Bool()            // MOVE src-EA: the loaded value goes straight to miOther (Dn dst)
+    val miWNzvc      = Bool(); val miWX = Bool()   // host op flag writes
+    val miRNzvc      = Bool(); val miRX = Bool()   // host op flag reads (NEGX/etc — not in the §7 set)
   }
 
   // ── selector → (regId, valid) ──────────────────────────────────────────────
@@ -211,6 +299,7 @@ object Microcode {
     case ST2     => (U(T2, 5 bits), True)
     case SEaBase => (ctx.eaBase, ctx.eaBaseValid)   // abs modes -> baseValid False (disp-only)
     case SDn2    => (ctx.bfDn2, True)
+    case SMiOther => (ctx.miOther, ctx.miOtherValid)
     case _       => (U(0, 5 bits), False)
   }
 
@@ -231,6 +320,8 @@ object Microcode {
     case SEaDispLo   => ctx.eaDispLo
     case SEaDispHi   => ctx.eaDispHi
     case SBfImm      => ctx.bfImm
+    case SMiOd       => ctx.miOd
+    case SMiImm      => ctx.miHostImm
     case _           => B(0, 32 bits)
   }
 
@@ -244,22 +335,37 @@ object Microcode {
     val (dstReg,  dstV)  = selReg(d.dst,  ctx)
     // srcC: an LS row whose `indexFromEa` is set carries the EA index reg; a UBfMem
     // compute row carries the BFINS insert source (Dn2) via d.srcC; otherwise inert.
+    // Full-format mem-indirect: the PRE-index rides the pointer-load srcC (miPtrIndex &&
+    // !miPost); the POST-index rides the host LS srcC (miHostIndex && miPost).
     val (srcCRegSel, srcCVSel) = selReg(d.srcC, ctx)
-    val srcCReg = if (d.indexFromEa) ctx.eaIndexReg else srcCRegSel
-    val srcCV   = if (d.indexFromEa) ctx.eaIndexValid else srcCVSel
+    val miPtrIdxUse  = Bool(d.miPtrIndex) && !ctx.miPost
+    val miHostIdxUse = Bool(d.miHostIndex) && ctx.miPost
+    val miIndexUse   = miPtrIdxUse || miHostIdxUse
+    val srcCReg = if (d.indexFromEa) ctx.eaIndexReg
+                  else if (d.miPtrIndex || d.miHostIndex) ctx.eaIndexReg
+                  else srcCRegSel
+    val srcCV   = if (d.indexFromEa) ctx.eaIndexValid
+                  else if (d.miPtrIndex || d.miHostIndex) (ctx.eaIndexValid && miIndexUse)
+                  else srcCVSel
 
     u.valid  := valid
     u.pc     := ctx.pc
     u.nextPc := ctx.nextPc
     d.uop match {
-      case UMove      => u.op := DecOp.MOVE
-      case UAddDrop   => u.op := DecOp.ADD
-      case UOpFromCtx => u.op := ctx.op
-      case UBfMem     => u.op := DecOp.BITFIELD
+      case UMove       => u.op := DecOp.MOVE
+      case UAddDrop    => u.op := DecOp.ADD
+      case UOpFromCtx  => u.op := ctx.op
+      case UBfMem      => u.op := DecOp.BITFIELD
+      case UMiPtrLoad  => u.op := DecOp.MOVE
+      case UMiHostMove => u.op := DecOp.MOVE
+      case UMiHostOp   => u.op := ctx.miOp
     }
     u.cluster := (d.uop match {
-      case UBfMem => Cluster.INT          // the bit-field compute runs on the ALU/slow pipe
-      case _      => (d.mem match { case MNone => Cluster.INT; case _ => Cluster.LS })
+      case UBfMem    => Cluster.INT          // the bit-field compute runs on the ALU/slow pipe
+      // The §7 host ALU/unary ops (MOVE/ADD/SUB/AND/OR/EOR/CMP/CLR/NEG/NEGX/NOT/TST) all run
+      // on the INT (ALU) pipe; CPLX/CHK/DIV are not full-format mem-indirect hosts in scope.
+      case UMiHostOp => Cluster.INT
+      case _         => (d.mem match { case MNone => Cluster.INT; case _ => Cluster.LS })
     })
     // The An write-back ADD is LONG; the BCD chain uses ctx.size; the bit-field chain rows
     // carry an explicit size (SzLong for lo/compute, SzByte for the hi spill byte).
@@ -269,6 +375,7 @@ object Microcode {
         case SzLong => u.size := Size.LONG
         case SzByte => u.size := Size.BYTE
         case SzCtx  => u.size := ctx.size
+        case SzHost => u.size := ctx.miHostSize
       }
     }
     u.memOp := (d.mem match {
@@ -277,18 +384,44 @@ object Microcode {
       case MStore => MemOp.STORE
     })
     u.srcAReg := srcAReg; u.srcAValid := srcAV
-    u.srcBReg := srcBReg; u.srcBValid := srcBV
+    u.srcBReg := srcBReg   // srcBValid assigned below (per-row, depends on the host-op kind)
     u.srcCReg := srcCReg; u.srcCValid := srcCV
     u.dstReg  := dstReg;  u.dstValid  := dstV
-    u.useImm  := Bool(d.useImm)
-    u.imm     := (if (d.useImm) selImm(d.imm, ctx) else B(0, 32 bits))
-    // Flags: the BCD/ADDX/SUBX op µop reads X + old-Z (clear-only Z) + writes NZVCX. The
-    // bit-field RES/LO4 compute writes NZ only (V=C=0, X UNTOUCHED) — like the 3a bfMem
-    // compute; the other bit-field rows + loads/stores/An-add write no flags.
-    u.readsNzvc  := Bool(d.writesFlags)
-    u.readsX     := Bool(d.writesFlags)
-    u.writesNzvc := Bool(d.writesFlags || d.bfWritesNz)
-    u.writesX    := Bool(d.writesFlags)
+    // ── useImm / imm / srcBValid / flags — assigned ONCE per row (Scala-if on d.uop) ──
+    if (d.uop == UMiHostOp) {
+      // The host ALU/MOVE/unary op. srcB is the ROM-selected register (ST1 for MOVE-src's
+      // moved value; SMiOther for an ALU other-Dn) UNLESS the other operand is an immediate
+      // (line-0 imm op -> useImm, srcB not read). A unary single-EA op (CLR/NEG/NOT/TST) has
+      // no other operand (miOtherValid False -> the SMiOther srcB is not read). Flags from ctx.
+      u.useImm     := ctx.miOtherIsImm
+      u.imm        := ctx.miHostImm
+      u.srcBValid  := Mux(ctx.miOtherIsImm, False, srcBV)
+      u.readsNzvc  := ctx.miRNzvc
+      u.readsX     := ctx.miRX
+      u.writesNzvc := ctx.miWNzvc
+      u.writesX    := ctx.miWX
+    } else if (d.uop == UMiHostMove) {
+      // The host MOVE (load-to-Dn / store-from-Dn) sets NZVC per ctx.miWNzvc (miMoveFlags
+      // rows). An intermediate host-load to T1 (ALU-src/RMW) writes NO flags (the host op
+      // µop owns them) -> miMoveFlags False on those rows.
+      u.useImm     := Bool(d.useImm)
+      u.imm        := (if (d.useImm) selImm(d.imm, ctx) else B(0, 32 bits))
+      u.srcBValid  := srcBV
+      u.readsNzvc  := False
+      u.readsX     := False
+      u.writesNzvc := Bool(d.miMoveFlags) && ctx.miWNzvc
+      u.writesX    := False
+    } else {
+      // Flags: the BCD/ADDX/SUBX op µop reads X + old-Z (clear-only Z) + writes NZVCX. The
+      // bit-field RES/LO4 compute writes NZ only (V=C=0, X UNTOUCHED). Other rows: no flags.
+      u.useImm     := Bool(d.useImm)
+      u.imm        := (if (d.useImm) selImm(d.imm, ctx) else B(0, 32 bits))
+      u.srcBValid  := srcBV
+      u.readsNzvc  := Bool(d.writesFlags)
+      u.readsX     := Bool(d.writesFlags)
+      u.writesNzvc := Bool(d.writesFlags || d.bfWritesNz)
+      u.writesX    := Bool(d.writesFlags)
+    }
     u.isBranch := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
     u.cond := 0; u.branchDisp := 0
     u.unimplemented := False
@@ -328,9 +461,14 @@ object Microcode {
         u.bfStoreForm := 0
     }
     u.isScc := False; u.isDbcc := False
-    // Indexed-EA descriptor fields (added by the indexed-modes slice): µcode µops never
-    // use an index — default inert (mirrors MicroOpAssembler's non-indexed cracks).
-    u.indexLong := False; u.indexScale := 0
+    // Indexed-EA descriptor fields. The bit-field chain and the full-format mem-indirect
+    // pointer/host LS rows carry the EA index (srcC) -> drive its size/scale from Ctx; all
+    // other µcode µops use no index (default inert).
+    if (d.indexFromEa || d.miPtrIndex || d.miHostIndex) {
+      u.indexLong := ctx.eaIndexLong; u.indexScale := ctx.eaIndexScale
+    } else {
+      u.indexLong := False; u.indexScale := 0
+    }
     u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
     // µcode µops are never commit-time system ops (the system ops ride the fast
     // op-µop builder + the ROB serializing path, not the ROM). Default inert.
