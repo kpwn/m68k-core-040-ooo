@@ -5162,4 +5162,23 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l (%a0),%d4"
     )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
   }
+
+  // CAS-in-a-loop lock-free counter (Task 4 stress): a tight CAS retry loop exercising
+  // back-to-back atomic RMW + store-queue drains. Single-threaded -> the compare ALWAYS
+  // matches (Z=1), so the retry `dbne` never re-loops on a CAS failure; the dbra drives the
+  // fixed 3 iterations. Each pass: load current -> Dc, Du = Dc+1, CAS (mem++), dbra. The
+  // counter ends at 3. Executed: prologue 4 + 3*(move,move,addq,cas,dbra=5) + epilogue 1 = 20.
+  test("lock-step: CAS-loop lock-free counter (atomic RMW under SQ drains)", VerilatorTest) {
+    runLockStep("cas-loop",
+      Seq(
+        "move.l #0x3000,%a0",                              // counter address
+        "moveq #0,%d4", "move.l %d4,(%a0)",                // counter := 0
+        "moveq #2,%d5",                                    // dbra count -> 3 passes
+        ".L: move.l (%a0),%d0",                            // Dc = current counter
+        "move.l %d0,%d1", "addq.l #1,%d1",                 // Du = current + 1
+        "cas.l %d0,%d1,(%a0)",                             // CAS: mem++ (match -> Z=1)
+        "dbra %d5,.L",                                     // loop the fixed count
+        "move.l (%a0),%d6"                                 // final counter (= 3)
+      ).mkString(" ; "), nInstr = 20, checkMem = Seq(0x3000L), checkSpan = 4)
+  }
 }

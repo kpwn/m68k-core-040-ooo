@@ -35,7 +35,7 @@ class BitfieldDecodeSpec extends AnyFunSuite {
     val opword     = in(Bits(16 bits))
     val s          = OperationDecoder.decode(opword)
     val microcoded = out(Bool());      microcoded := s.microcoded
-    val ucEntry    = out(UInt(5 bits)); ucEntry := s.ucEntry
+    val ucEntry    = out(UInt(6 bits)); ucEntry := s.ucEntry
     val illegal    = out(Bool());      illegal := s.illegal
     val bfOp       = out(Bits(3 bits)); bfOp := s.bfOp
     val op         = out(DecOp());      op := s.op
