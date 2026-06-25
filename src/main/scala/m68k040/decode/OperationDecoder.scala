@@ -175,6 +175,32 @@ object OperationDecoder {
           // A non-memory-alterable CAS EA (Dn/An/PC-rel/#imm) stays ILLEGAL
           // (the default o.illegal=True; the microcoded arm above did not fire) -> vector-4.
         }
+        // ── MOVES (010+ PRIVILEGED move to/from alternate address space) ────────
+        // Encoding `0000 1110 ss mmm rrr` + 1 ext word: op[15:8]=0x0E (op[15:11]=00001,
+        // op[10:8]=110), op[7:6]=ss (00=.B,01=.W,10=.L; 11 is NOT moves -> that is the CAS
+        // family). DISJOINT from CAS (op[7:6]=11), the line-0 immediates (need opmode in
+        // {0,1,2,3,5,6} = op[15:9] patterns, op[8]=0), the bit-ops (op[8]=1 or op[15:8]=
+        // 0x80), CMP2/CHK2 (op[7:6]=11). EA = memory-ALTERABLE (Musashi mask `A+-DXWL...`,
+        // SAME as CAS): (An)/(An)+/-(An)/(d16,An)/(d8,An,Xn)/(xxx).W/.L. Reject Dn/An/PC-rel/
+        // #imm. The dr/A-D/reg fields live in the ext word -> DecodeStage.ucBegin picks the
+        // WRITE vs READ entry; OperationDecoder just marks it microcoded + names op=MOVES +
+        // size. The privilege flag (needsSupervisor) is carried on the first µop via Ctx.
+        val isMovesFamily = (opword(15 downto 8) === B"00001110") &&
+                            (opword(7 downto 6) =/= B"11")
+        // Reuse the CAS EA legality (identical memory-alterable mask).
+        when(isMovesFamily && casEaOk) {
+          o.illegal    := False
+          o.microcoded := True
+          o.ucEntry    := U(Microcode.MOVES_WRITE_ENTRY, o.ucEntry.getWidth bits)  // placeholder; ucBegin picks WRITE/READ by dr
+          o.op         := DecOp.MOVES
+          o.cluster    := Cluster.INT
+          o.srcA       := easrc            // the EA (so predecode/EaDecoder frame it)
+          // size from op[7:6] (00=.B,01=.W,10=.L). NO CCR effect.
+          when(opword(7 downto 6) === B"00") { o.size := Size.BYTE }
+            .elsewhen(opword(7 downto 6) === B"01") { o.size := Size.WORD }
+            .otherwise { o.size := Size.LONG }
+        }
+        // A non-memory-alterable MOVES EA (Dn/An/PC-rel/#imm) stays ILLEGAL (default).
       }
       // ---- MOVEQ (0111 rrr0 dddddddd) ----
       is(0x7) {

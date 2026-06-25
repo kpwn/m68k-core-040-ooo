@@ -600,6 +600,26 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // autoMode/autoDelta for modes 3/4 (the A7-byte even rule folded in autoDelta).
     ucEntryCtx.casAutoMode  := ucCasEaDec.autoMode
     ucEntryCtx.casAutoDelta := ucCasEaDec.autoDelta
+    // ── MOVES Ctx population (spec §5) ────────────────────────────────────────────
+    // MOVES `0000 1110 ss mmm rrr` + ext1 + EA ext. ext1: dr=ext[11], A/D=ext[15],
+    // reg=ext[14:12]. movesRn = REG_DA[ext15:12] (0..15). The EA reuses the CAS EA decode
+    // (ucCasEaDec: the memory-alterable EA from the shifted window; auto modes populate
+    // casAutoMode/Delta above). movesDelta = the SIGNED An write-back (+size POSTINC /
+    // -size PREDEC / 0) for the READ-form An update µop. The signed byte count from the EA
+    // auto delta (already A7-byte-even-corrected by EaDecoder). needsSup defaults False;
+    // True only for a MOVES entry (the privilege trap, set on the first µop in resolve).
+    val ucMovesExt = ucEntryPkt.words(1)
+    val ucMovesRn  = ucMovesExt(15 downto 12).asUInt.resize(5)   // REG_DA 0..15 (A/D ## reg)
+    ucEntryCtx.movesRn    := ucMovesRn
+    ucEntryCtx.movesRnIsA := ucMovesExt(15)                      // 1 = An (sign-extend on read)
+    // signed An delta: POSTINC -> +autoDelta ; PREDEC -> -autoDelta ; NONE -> 0.
+    val ucMovesAutoDelta32 = ucCasEaDec.autoDelta.resize(32).asSInt
+    ucEntryCtx.movesDelta := ucCasEaDec.autoMode.mux(
+      EaAuto.POSTINC -> ucMovesAutoDelta32.asBits,
+      EaAuto.PREDEC  -> (-ucMovesAutoDelta32).asBits,
+      default        -> B(0, 32 bits))
+    val ucIsMoves = ucEntrySpec.microcoded && (ucEntrySpec.op === DecOp.MOVES)
+    ucEntryCtx.needsSup := ucIsMoves
     // ── FULL-format MEMORY-INDIRECT host-op Ctx population (spec §5) ──────────────
     // A general EA-taking op (MOVE/ALU/imm/single-EA) whose EA is a full-format memory-
     // indirect mode routes through the engine: [LOAD.L pointer -> T0] then the host op at
@@ -714,16 +734,31 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       ucEntryCtx.eaIndexScale := ucCasEaDec.indexScale
       ucEntryCtx.eaDispLo     := ucCasEaDec.disp
     }
+    // MOVES: the LOAD/STORE address is the memory-alterable EA (SAME decode infra as CAS).
+    when(ucIsMoves) {
+      ucEntryCtx.eaBase       := ucCasEaDec.base
+      ucEntryCtx.eaBaseValid  := ucCasEaDec.baseValid
+      ucEntryCtx.eaIndexReg   := ucCasEaDec.indexReg
+      ucEntryCtx.eaIndexValid := ucCasEaDec.indexValid
+      ucEntryCtx.eaIndexLong  := ucCasEaDec.indexLong
+      ucEntryCtx.eaIndexScale := ucCasEaDec.indexScale
+      ucEntryCtx.eaDispLo     := ucCasEaDec.disp
+    }
 
     // The REAL entry: a bit-field RMW (microcoded BITFIELD) picks 5B vs 4B by needHi; a
-    // full-format mem-indirect host picks its shape entry; every other microcoded op
-    // (BCD/ADDX/SUBX) keeps its OperationDecoder ucEntry.
+    // full-format mem-indirect host picks its shape entry; MOVES picks WRITE vs READ by the
+    // ext-word dr bit (ext1[11]); every other microcoded op (BCD/ADDX/SUBX/CAS) keeps its
+    // OperationDecoder ucEntry.
     val ucIsBfRmw  = ucEntrySpec.microcoded && (ucEntrySpec.op === DecOp.BITFIELD)
+    val ucMovesDr  = ucMovesExt(11)        // 1 = WRITE (Rn -> ea) ; 0 = READ (ea -> Rn)
+    val ucMovesEntry = Mux(ucMovesDr, U(Microcode.MOVES_WRITE_ENTRY, ew bits),
+                                      U(Microcode.MOVES_READ_ENTRY,  ew bits))
     val ucRealEntry = Mux(ucIsMemInd, ucMiEntry,
       Mux(ucIsBfRmw,
         Mux(ucBfNeedHi, U(Microcode.BF_RMW_5B_ENTRY, ew bits),
                         U(Microcode.BF_RMW_4B_ENTRY, ew bits)),
-        ucEntrySpec.ucEntry))
+      Mux(ucIsMoves, ucMovesEntry,
+        ucEntrySpec.ucEntry)))
 
     // Resolve every ROM row against the LATCHED ctx, then index by ucPc -> this cycle's
     // µop (the ROM is a compile-time Scala Vector; resolve each row to hardware + mux).
