@@ -5260,4 +5260,142 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         "move.l (%a0),%d6"                                 // final counter (= 3)
       ).mkString(" ; "), nInstr = 20, checkMem = Seq(0x3000L), checkSpan = 4)
   }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // MOVES .B/.W/.L (010+ PRIVILEGED move to/from alternate address space). gas syntax:
+  //   moves.sz Rn,<ea>  (dr=1, WRITE: store Rn -> mem)
+  //   moves.sz <ea>,Rn  (dr=0, READ:  load mem -> Rn; An sign-extends, Dn size-merges)
+  // The access is FLAT (Musashi `(void)fc`), so MOVES trace-matches a normal sized MOVE +
+  // the EA auto-inc/dec side effect + register state. NO CCR effect. Supervisor (boot SR
+  // 0x2700); the user-mode privilege trap is the separate test below. Seed mem via move,
+  // read mem/regs back + checkMem on the modified long vs Musashi.
+  // ════════════════════════════════════════════════════════════════════════════
+  val movesSeed = Seq(
+    "move.l #0x3000,%a0",
+    "move.l #0x11223344,%d7", "move.l %d7,(%a0)"           // mem[0x3000..3] = 11 22 33 44
+  )
+
+  // WRITE .L from a Dn: store Dn -> mem, read back.
+  test("lock-step: MOVES.L Dn -> (An) write, read-back", VerilatorTest) {
+    runLockStep("moves-l-wr-dn", (movesSeed ++ Seq(
+      "ori #0x10,%ccr",                                    // X=1 sentinel (MOVES leaves CCR)
+      "move.l #0xaabbccdd,%d0",
+      "moves.l %d0,(%a0)",                                 // mem := 0xAABBCCDD
+      "move.l (%a0),%d3"                                   // read-back
+    )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+  // WRITE .L from an An: store An -> mem (the A/D+reg 0-15 index source).
+  test("lock-step: MOVES.L An -> (An) write, read-back", VerilatorTest) {
+    runLockStep("moves-l-wr-an", (movesSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "move.l #0x0badf00d,%a2",
+      "moves.l %a2,(%a0)",                                 // mem := A2 = 0x0BADF00D
+      "move.l (%a0),%d3"
+    )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+  // WRITE .W / .B (sized store; upper mem bytes preserved).
+  test("lock-step: MOVES.W / MOVES.B Dn -> (An) write (sized store)", VerilatorTest) {
+    runLockStep("moves-wb-wr", (movesSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "move.l #0x0000beef,%d0", "moves.w %d0,(%a0)",       // mem[0x3000..1] := 0xBEEF
+      "move.l (%a0),%d3",
+      "move.l #0x000000a5,%d1", "moves.b %d1,(%a0)",       // mem[0x3000] := 0xA5
+      "move.l (%a0),%d4"
+    )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+
+  // READ .L into a Dn (full 32) and into an An (full 32).
+  test("lock-step: MOVES.L (An) -> Dn / -> An read", VerilatorTest) {
+    runLockStep("moves-l-rd", (movesSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "moves.l (%a0),%d1",                                 // D1 := mem = 0x11223344
+      "moves.l (%a0),%a3",                                 // A3 := mem = 0x11223344
+      "move.l %a3,%d2"                                     // surface A3 in a Dn
+    )).mkString(" ; "))
+  }
+  // READ .W / .B into a Dn — SIZE-MERGE: the upper bits of Dn are PRESERVED.
+  test("lock-step: MOVES.W / MOVES.B (An) -> Dn (size-merge, upper bits preserved)", VerilatorTest) {
+    runLockStep("moves-wb-rd-dn", (movesSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "move.l #0xdeadbeef,%d1", "moves.w (%a0),%d1",       // D1 := 0xDEAD3344 (low word from mem)
+      "move.l #0xcafef00d,%d2", "moves.b (%a0),%d2"        // D2 := 0xCAFEF044 (low byte from mem)
+    )).mkString(" ; "))
+  }
+  // READ .W / .B into an An — SIGN-EXTEND to 32 (Musashi MAKE_INT_16/8).
+  test("lock-step: MOVES.W / MOVES.B (An) -> An (sign-extend to 32)", VerilatorTest) {
+    runLockStep("moves-wb-rd-an", (Seq(
+      "move.l #0x3000,%a0",
+      "move.l #0x8001ff80,%d7", "move.l %d7,(%a0)",        // mem = 80 01 FF 80 (.W=0x8001 neg, .B=0x80 neg)
+      "ori #0x10,%ccr",
+      "moves.w (%a0),%a3",                                 // A3 := sext16(0x8001) = 0xFFFF8001
+      "move.l %a3,%d2",
+      "moves.b (%a0),%a4",                                 // A4 := sext8(0x80) = 0xFFFFFF80
+      "move.l %a4,%d3"
+    )).mkString(" ; "))
+  }
+
+  // (An)+ READ: the An side effect happens ONCE (postinc by size).
+  test("lock-step: MOVES.L (An)+ read -> An += 4 (postinc once)", VerilatorTest) {
+    runLockStep("moves-l-postinc-rd", (movesSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "moves.l (%a0)+,%d1",                                // D1 := mem; A0 := 0x3004
+      "move.l %a0,%d4"                                     // A0 must be 0x3004
+    )).mkString(" ; "))
+  }
+  // -(An) WRITE: the An side effect happens ONCE (predec by size), access at decremented addr.
+  test("lock-step: MOVES.L Dn -> -(An) write -> An -= 4 once, store at decremented addr", VerilatorTest) {
+    runLockStep("moves-l-predec-wr", (Seq(
+      "move.l #0x3004,%a0",                                // A0 = 0x3004
+      "move.l #0xaabbccdd,%d0",
+      "ori #0x10,%ccr",
+      "moves.l %d0,-(%a0)",                                // A0 := 0x3000; mem[0x3000] := 0xAABBCCDD
+      "move.l %a0,%d4",                                    // A0 must be 0x3000
+      "move.l (%a0),%d3"                                   // read-back at 0x3000
+    )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+  // (An)+ WRITE (size-correct postinc on .W/.B).
+  test("lock-step: MOVES.W (An)+ write -> An += 2 (size-correct postinc)", VerilatorTest) {
+    runLockStep("moves-w-postinc-wr", (movesSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "move.l #0x0000beef,%d0", "moves.w %d0,(%a0)+",      // mem[0x3000..1] := 0xBEEF; A0 := 0x3002
+      "move.l %a0,%d4",                                    // A0 = 0x3002
+      "move.l 0x3000,%d3"
+    )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+
+  // Multi-word EA: (d16,An) read, abs.L write (nextPc framing + correct address).
+  test("lock-step: MOVES.L (d16,An) read + abs.L write (multi-word EA)", VerilatorTest) {
+    runLockStep("moves-multiword", (Seq(
+      "move.l #0x2FFC,%a0",                                // base; (4,A0) = 0x3000
+      "move.l #0x11223344,%d7", "move.l %d7,0x3000",
+      "ori #0x10,%ccr",
+      "moves.l (4,%a0),%d1",                              // D1 := mem[0x3000]
+      "move.l #0xaabbccdd,%d0",
+      "moves.l %d0,0x3004",                               // abs.L dest: mem[0x3004] := 0xAABBCCDD
+      "move.l 0x3004,%d2"
+    )).mkString(" ; "), checkMem = Seq(0x3000L, 0x3004L), checkSpan = 4)
+  }
+
+  // MOVES does NOT touch CCR: seed N=1,V=1 via overflow, then a MOVES, then verify the CCR
+  // survives (the lock-step compares the full CCR at each commit -> any MOVES CCR write
+  // would diverge here AND at the trailing op).
+  test("lock-step: MOVES leaves CCR unchanged", VerilatorTest) {
+    runLockStep("moves-ccr", (movesSeed ++ Seq(
+      "move.l #0x7fffffff,%d6", "add.l %d6,%d6",           // N=1, V=1, C=0, X unchanged
+      "move.l #0x12345678,%d0", "moves.l %d0,(%a0)",       // WRITE — must not touch CCR
+      "moves.l (%a0),%d1",                                 // READ — must not touch CCR
+      "move.l #0x7fffffff,%d6", "add.l %d6,%d6"            // re-seed (proves the value path too)
+    )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+
+  // MOVEC SFC then MOVES (sanity: the SFC value does NOT change the flat MOVES result).
+  test("lock-step: MOVEC SFC := 5 then MOVES (flat access unaffected by SFC)", VerilatorTest) {
+    runLockStep("moves-after-sfc", (movesSeed ++ Seq(
+      "move.l #0x00000005,%d0", "movec %d0,%sfc",          // SFC := 5 (does not redirect address space)
+      "moves.l (%a0),%d1",                                 // D1 := mem = 0x11223344 (SAME flat read)
+      "move.l #0xaabbccdd,%d2", "movec %d2,%dfc",          // DFC := 5
+      "moves.l %d2,(%a0)",                                 // mem := 0xAABBCCDD (SAME flat write)
+      "move.l (%a0),%d3"
+    )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
 }
