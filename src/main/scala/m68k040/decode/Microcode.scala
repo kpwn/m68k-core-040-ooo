@@ -54,6 +54,17 @@ object Microcode {
   case object SMiOther    extends Sel   // (miOther, miOtherValid) — the host op's other reg (Dn/Dm)
   case object SMiOd       extends Sel   // selImm: the outer displacement od (host access disp)
   case object SMiImm      extends Sel   // selImm: the host op immediate (line-0 imm op)
+  // ── CAS / CAS2 selectors ────────────────────────────────────────────────────
+  case object SCasDc      extends Sel   // (casDc, True)   — CAS compare reg Dc = ext[2:0]
+  case object SCasDu      extends Sel   // (casDu, True)   — CAS update reg  Du = ext[8:6]
+  case object SCas2Rn1    extends Sel   // (cas2Rn1, True) — CAS2 addr reg 1 (REG_DA ext1[15:12])
+  case object SCas2Rn2    extends Sel   // (cas2Rn2, True) — CAS2 addr reg 2 (REG_DA ext2[15:12])
+  case object SCas2Dc1    extends Sel
+  case object SCas2Du1    extends Sel
+  case object SCas2Dc2    extends Sel
+  case object SCas2Du2    extends Sel
+  case object SCas2Da1    extends Sel   // selImm: bit0 = ext1[15] (BIT_1F, the Rn1 D/A bit)
+  case object SCas2Da2    extends Sel   // selImm: bit0 = ext2[15] (BIT_F,  the Rn2 D/A bit)
 
   /** The op kind of a descriptor's template. */
   sealed trait UOp
@@ -65,6 +76,10 @@ object Microcode {
   case object UMiPtrLoad extends UOp    // LOAD.L pointer (eaBase + eaDispLo (+ pre-index)) -> T0
   case object UMiHostMove extends UOp   // host MOVE load/store at (T0 + od (+post-index)); op=MOVE
   case object UMiHostOp  extends UOp     // host ALU/unary compute (ctx.miOp): srcA,srcB -> dst + flags
+  // ── CAS / CAS2 compute kind. The Desc carries the casForm + the flag mask; the op is
+  //    DecOp.CASOP and the ALU EU runs the compare/merge/select datapath. ──────────────
+  case class UCasOp(form: Int, writesNzvc: Boolean = false, readsNzvc: Boolean = false,
+                    dropCommit: Boolean = false) extends UOp
 
   /** Memory role. */
   sealed trait Mem
@@ -77,6 +92,13 @@ object Microcode {
   case object ANoAuto   extends Auto
   case object APredecAy extends Auto
   case object APredecAx extends Auto
+  // CAS auto-inc/dec EA: the LOAD + STORE both carry eaAuto/eaDelta from the latched ctx
+  // (ctx.casAutoMode/Delta) so they compute the SAME effective address (matching Musashi's
+  // M68KMAKE_GET_EA_AY single side-effect); the An := An ± size write-back rides the STORE
+  // (AEaCasStore writes the int dst = eaBase An when ctx.casAutoMode =/= NONE). NONE for the
+  // plain control modes (no An side effect) -> a harmless inert eaAuto.
+  case object AEaCasLoad  extends Auto   // load: eaAuto from ctx, NO An write (dst = T0)
+  case object AEaCasStore extends Auto   // store: eaAuto from ctx + An write-back (dst = eaBase)
 
   /** Explicit µop size for a row (overrides the ctx-size default). The bit-field chain
     * rows are LONG (lo load/store, the compute) or BYTE (the hi spill-byte load/store);
@@ -229,7 +251,60 @@ object Microcode {
          sz = SzLong, miPtrIndex = true, isFirst = true),                      // µPC28
     Desc(UMiHostMove, mem = MLoad, srcA = ST0, dst = ST1, useImm = true, imm = SMiOd,
          sz = SzHost, miHostIndex = true),                                     // µPC29
-    Desc(UMiHostOp, srcA = ST1, srcB = SMiOther, dst = SNone, isLast = true)   // µPC30
+    Desc(UMiHostOp, srcA = ST1, srcB = SMiOther, dst = SNone, isLast = true),   // µPC30
+
+    // ════════════════════════════════════════════════════════════════════════
+    // CAS .B/.W/.L (atomic compare-and-swap, single address) — 4 µops @ CAS_ENTRY=31.
+    // The EA (memory-alterable control mode) rides the shared eaBase/eaDispLo/eaIndex
+    // group (resolved by EaDecoder on op[5:0]). Dc=ext[2:0], Du=ext[8:6]. Atomicity is
+    // free (in-order single-pipe LS + store queue — see spec §1); the store is ALWAYS
+    // issued, writing the mux'd value (Du on match, the loaded value on mismatch — a
+    // RAM no-op; spec §6). 2 temps (T0=loaded, T2=store-data); no archDepth bump.
+    //   c0 LOAD.sz  (ea) -> T0                                             (isFirst)
+    //   c1 CASS  storeData T2 = eq ? Du : T0 (eq = T0.sz==Dc.sz)           (no flags)
+    //   c2 CASC  Dc := eq ? Dc : merge.sz(Dc,T0) ; NZVC = cmp(T0,Dc)       (KEPT commit)
+    //   c3 STORE.sz T2 -> (ea)                                             (isLast; rmw-drop)
+    // The LOAD + STORE both carry the CAS auto EA (eaAuto from ctx) so an (An)+/-(An) CAS
+    // computes ONE effective address for both accesses; the An := An ± size write-back rides
+    // the STORE (the side effect happens once, on BOTH match and mismatch — the always-store
+    // mux keeps mem byte-identical). For the control modes casAutoMode=NONE -> inert eaAuto.
+    Desc(UMove, mem = MLoad, auto = AEaCasLoad, srcA = SEaBase, dst = ST0, useImm = true,
+         imm = SEaDispLo, indexFromEa = true, isFirst = true),                 // µPC31 (c0)
+    Desc(UCasOp(CasForm.CASS), srcA = ST0, srcB = SCasDc, srcC = SCasDu, dst = ST2),  // µPC32 (c1)
+    Desc(UCasOp(CasForm.CASC, writesNzvc = true), srcA = ST0, srcB = SCasDc, dst = SCasDc),  // µPC33 (c2)
+    Desc(UMove, mem = MStore, auto = AEaCasStore, srcA = SEaBase, srcB = ST2, useImm = true,
+         imm = SEaDispLo, indexFromEa = true, isLast = true),                  // µPC34 (c3)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // CAS2 .W/.L (dual-address compare-and-swap) — 10 µops @ CAS2_ENTRY=35.
+    // Rn1=ext1[15:12], Rn2=ext2[15:12] (REG_DA register-indirect: the FULL 32-bit reg is
+    // the address). Both reads are UNCONDITIONAL (spec §2 fact 1). On ANY mismatch BOTH
+    // Dc1/Dc2 are updated (fact 2); flags = res2 if dest1==Dc1 else res1 (fact 3); writes
+    // only when BOTH match (fact 4) — modelled via the always-store mux. 3 temps T0/T1/T2.
+    //   d0 LOAD.sz (Rn1) -> T0                                             (isFirst)
+    //   d1 LOAD.sz (Rn2) -> T1
+    //   d2 CAS2C1  T2 = {eq1}        ; NZVC = cmp(T0,Dc1) = res1           (dropped)
+    //   d3 CAS2C2  T2 = {bothEq,eq2,eq1} (eq1<-T2) ; NZVC = eq1?res2:old   (KEPT commit)
+    //   d4 CAS2DC1 Dc1 := bothEq?Dc1:casUpd.sz(Dc1,T0,da=ext1[15])        (dropped)
+    //   d5 CAS2DC2 Dc2 := bothEq?Dc2:casUpd.sz(Dc2,T1,da=ext2[15])        (dropped)
+    //   d6 CAS2SEL storeData1 = bothEq?Du1:T0 -> T0  (reuse T0; read AFTER d4)
+    //   d7 CAS2SEL storeData2 = bothEq?Du2:T1 -> T1  (reuse T1; read AFTER d5)
+    //   d8 STORE.sz T0 -> (Rn1)                                            (rmw-drop)
+    //   d9 STORE.sz T1 -> (Rn2)                                            (isLast; rmw-drop)
+    Desc(UMove, mem = MLoad, srcA = SCas2Rn1, dst = ST0, isFirst = true),      // µPC35 (d0)
+    Desc(UMove, mem = MLoad, srcA = SCas2Rn2, dst = ST1),                      // µPC36 (d1)
+    Desc(UCasOp(CasForm.CAS2C1, writesNzvc = true, dropCommit = true),
+         srcA = ST0, srcB = SCas2Dc1, dst = ST2),                             // µPC37 (d2)
+    Desc(UCasOp(CasForm.CAS2C2, writesNzvc = true, readsNzvc = true),
+         srcA = ST1, srcB = SCas2Dc2, srcC = ST2, dst = ST2),                 // µPC38 (d3) KEPT
+    Desc(UCasOp(CasForm.CAS2DC, dropCommit = true), srcA = ST0, srcB = SCas2Dc1,
+         srcC = ST2, dst = SCas2Dc1, useImm = true, imm = SCas2Da1),          // µPC39 (d4)
+    Desc(UCasOp(CasForm.CAS2DC, dropCommit = true), srcA = ST1, srcB = SCas2Dc2,
+         srcC = ST2, dst = SCas2Dc2, useImm = true, imm = SCas2Da2),          // µPC40 (d5)
+    Desc(UCasOp(CasForm.CAS2SEL), srcA = ST0, srcB = SCas2Du1, srcC = ST2, dst = ST0),  // µPC41 (d6)
+    Desc(UCasOp(CasForm.CAS2SEL), srcA = ST1, srcB = SCas2Du2, srcC = ST2, dst = ST1),  // µPC42 (d7)
+    Desc(UMove, mem = MStore, srcA = SCas2Rn1, srcB = ST0),                    // µPC43 (d8)
+    Desc(UMove, mem = MStore, srcA = SCas2Rn2, srcB = ST1, isLast = true)      // µPC44 (d9)
   )
   val BF_RMW_4B_ENTRY = 6
   val BF_RMW_5B_ENTRY = 9
@@ -238,6 +313,8 @@ object Microcode {
   val MI_ALU_SRC_ENTRY  = 21   // rows 21,22,23 (ptr-load, host-load->T1, op T1,Dm->Dm)
   val MI_RMW_ENTRY      = 24   // rows 24,25,26,27 (ptr-load, host-load->T1, op->T1, host-store)
   val MI_FLAGS_ENTRY    = 28   // rows 28,29,30 (ptr-load, host-load->T1, op flags-only)
+  val CAS_ENTRY         = 31   // rows 31..34 (load, CASS, CASC, store)
+  val CAS2_ENTRY        = 35   // rows 35..44 (load×2, CAS2C1/C2, DC1/DC2, SEL×2, store×2)
   def romSize: Int = rom.size
 
   /** Latched-instruction CONTEXT the engine resolves selectors against. v1 fields
@@ -285,6 +362,21 @@ object Microcode {
     val miOtherIsDst = Bool()            // MOVE src-EA: the loaded value goes straight to miOther (Dn dst)
     val miWNzvc      = Bool(); val miWX = Bool()   // host op flag writes
     val miRNzvc      = Bool(); val miRX = Bool()   // host op flag reads (NEGX/etc — not in the §7 set)
+    // ── CAS / CAS2 group (populated at ucBegin from the ext words) ──────────────────────
+    // CAS: the EA address rides the shared eaBase/eaDispLo/eaIndex group above (resolved by
+    // EaDecoder on op[5:0]); ctx.size is the access size. Dc/Du are Dn register ids.
+    val casDc        = UInt(5 bits)      // CAS compare reg Dc = ext[2:0]
+    val casDu        = UInt(5 bits)      // CAS update  reg Du = ext[8:6]
+    // CAS auto-inc/dec EA side effect ((An)+ / -(An)): the LOAD + STORE carry this so they
+    // compute the SAME address; the An write-back rides the STORE. NONE for the other modes.
+    val casAutoMode  = EaAuto()
+    val casAutoDelta = UInt(3 bits)
+    // CAS2: two register-indirect addresses Rn1/Rn2 (REG_DA, Dn or An — the FULL 32-bit reg
+    // is the address), and the two compare/update register pairs + the per-Rn D/A bit.
+    val cas2Rn1      = UInt(5 bits); val cas2Rn2 = UInt(5 bits)
+    val cas2Dc1      = UInt(5 bits); val cas2Du1 = UInt(5 bits)
+    val cas2Dc2      = UInt(5 bits); val cas2Du2 = UInt(5 bits)
+    val cas2Da1      = Bool();       val cas2Da2 = Bool()   // ext1[15] / ext2[15] (sign-ext rule)
   }
 
   // ── selector → (regId, valid) ──────────────────────────────────────────────
@@ -300,6 +392,14 @@ object Microcode {
     case SEaBase => (ctx.eaBase, ctx.eaBaseValid)   // abs modes -> baseValid False (disp-only)
     case SDn2    => (ctx.bfDn2, True)
     case SMiOther => (ctx.miOther, ctx.miOtherValid)
+    case SCasDc   => (ctx.casDc, True)
+    case SCasDu   => (ctx.casDu, True)
+    case SCas2Rn1 => (ctx.cas2Rn1, True)
+    case SCas2Rn2 => (ctx.cas2Rn2, True)
+    case SCas2Dc1 => (ctx.cas2Dc1, True)
+    case SCas2Du1 => (ctx.cas2Du1, True)
+    case SCas2Dc2 => (ctx.cas2Dc2, True)
+    case SCas2Du2 => (ctx.cas2Du2, True)
     case _       => (U(0, 5 bits), False)
   }
 
@@ -322,6 +422,8 @@ object Microcode {
     case SBfImm      => ctx.bfImm
     case SMiOd       => ctx.miOd
     case SMiImm      => ctx.miHostImm
+    case SCas2Da1    => ctx.cas2Da1.asBits.resize(32)   // bit0 = ext1[15] (BIT_1F)
+    case SCas2Da2    => ctx.cas2Da2.asBits.resize(32)   // bit0 = ext2[15] (BIT_F)
     case _           => B(0, 32 bits)
   }
 
@@ -359,12 +461,14 @@ object Microcode {
       case UMiPtrLoad  => u.op := DecOp.MOVE
       case UMiHostMove => u.op := DecOp.MOVE
       case UMiHostOp   => u.op := ctx.miOp
+      case _: UCasOp   => u.op := DecOp.CASOP
     }
     u.cluster := (d.uop match {
       case UBfMem    => Cluster.INT          // the bit-field compute runs on the ALU/slow pipe
       // The §7 host ALU/unary ops (MOVE/ADD/SUB/AND/OR/EOR/CMP/CLR/NEG/NEGX/NOT/TST) all run
       // on the INT (ALU) pipe; CPLX/CHK/DIV are not full-format mem-indirect hosts in scope.
       case UMiHostOp => Cluster.INT
+      case _: UCasOp => Cluster.INT          // CAS/CAS2 compute runs on the ALU pipe
       case _         => (d.mem match { case MNone => Cluster.INT; case _ => Cluster.LS })
     })
     // The An write-back ADD is LONG; the BCD chain uses ctx.size; the bit-field chain rows
@@ -386,7 +490,15 @@ object Microcode {
     u.srcAReg := srcAReg; u.srcAValid := srcAV
     u.srcBReg := srcBReg   // srcBValid assigned below (per-row, depends on the host-op kind)
     u.srcCReg := srcCReg; u.srcCValid := srcCV
-    u.dstReg  := dstReg;  u.dstValid  := dstV
+    // The CAS auto STORE writes its int dst = the base An (the (An)+/-(An) side effect), gated
+    // on a non-NONE ctx.casAutoMode; the LS-EU computes An := An ± size per eaAuto. All other
+    // rows take the ROM-selected dst. (Only the STORE writes An — the load's dst is T0.)
+    if (d.auto == AEaCasStore) {
+      u.dstReg   := ctx.eaBase
+      u.dstValid := ctx.casAutoMode =/= EaAuto.NONE
+    } else {
+      u.dstReg  := dstReg;  u.dstValid  := dstV
+    }
     // ── useImm / imm / srcBValid / flags — assigned ONCE per row (Scala-if on d.uop) ──
     if (d.uop == UMiHostOp) {
       // The host ALU/MOVE/unary op. srcB is the ROM-selected register (ST1 for MOVE-src's
@@ -411,6 +523,19 @@ object Microcode {
       u.readsX     := False
       u.writesNzvc := Bool(d.miMoveFlags) && ctx.miWNzvc
       u.writesX    := False
+    } else if (d.uop.isInstanceOf[UCasOp]) {
+      // CAS/CAS2 compute. srcB (Dc / Du) is always read; srcC (Du / status temp) is set
+      // by the ROM (handled above). The imm (the CAS2.W D/A bit) rides useImm. Flags per
+      // the Desc-carried masks: CASC/CAS2C1/CAS2C2 write NZVC; CAS2C2 also READS NZVC
+      // (to preserve res1 in the !eq1 case). CAS/CAS2 never touch X.
+      val co = d.uop.asInstanceOf[UCasOp]
+      u.useImm     := Bool(d.useImm)
+      u.imm        := (if (d.useImm) selImm(d.imm, ctx) else B(0, 32 bits))
+      u.srcBValid  := srcBV
+      u.readsNzvc  := Bool(co.readsNzvc)
+      u.readsX     := False
+      u.writesNzvc := Bool(co.writesNzvc)
+      u.writesX    := False
     } else {
       // Flags: the BCD/ADDX/SUBX op µop reads X + old-Z (clear-only Z) + writes NZVCX. The
       // bit-field RES/LO4 compute writes NZ only (V=C=0, X UNTOUCHED). Other rows: no flags.
@@ -431,18 +556,24 @@ object Microcode {
     // The two An write-back ADDs are DROPPED crack µops (divIsRem): the commit
     // observation is dropped, but the An write lands in the PRF + is verified by a later
     // reader (the program reads Ay/Ax into a Dn after the op). Mirrors anUpdUop / LINK.
-    u.divIsRem := Bool(d.uop == UAddDrop)
+    // CAS2's CAS2C1 (the res1 compare) + the two CAS2DC Dc-update µops are likewise DROPPED:
+    // their NZVC/Dc1/Dc2 writes still land + fold (the lock-step reads Dc1/Dc2 back), but
+    // CAS2 maps to exactly ONE oracle step (the kept CAS2C2, which carries the final NZVC).
+    u.divIsRem := Bool(d.uop == UAddDrop || (d.uop.isInstanceOf[UCasOp] && d.uop.asInstanceOf[UCasOp].dropCommit))
     u.isChk2   := False
     // Auto-update: the LOAD carries PREDEC so the LS-EU computes addr = An - eaDelta (the
     // load does NOT write An — the LS-EU writes An only on an eaAuto STORE). The store
     // accesses the already-decremented Ax with NO auto. eaDelta is the byte count.
-    val (autoMode, autoDelta) = d.auto match {
-      case ANoAuto   => (EaAuto.NONE,   U(0, 3 bits))
-      case APredecAy => (EaAuto.PREDEC, deltaBytesU(ayReg(ctx), ctx))
-      case APredecAx => (EaAuto.PREDEC, deltaBytesU(axReg(ctx), ctx))
+    d.auto match {
+      case ANoAuto     => u.eaAuto := EaAuto.NONE;   u.eaDelta := U(0, 3 bits)
+      case APredecAy   => u.eaAuto := EaAuto.PREDEC; u.eaDelta := deltaBytesU(ayReg(ctx), ctx)
+      case APredecAx   => u.eaAuto := EaAuto.PREDEC; u.eaDelta := deltaBytesU(axReg(ctx), ctx)
+      // CAS (An)+/-(An): the LOAD + STORE carry the latched ctx auto so they compute the
+      // SAME effective address (PREDEC: An-delta; POSTINC: An). For the control modes
+      // casAutoMode=NONE -> inert eaAuto (addr = An + disp + index, the normal CAS EA).
+      case AEaCasLoad  => u.eaAuto := ctx.casAutoMode; u.eaDelta := ctx.casAutoDelta
+      case AEaCasStore => u.eaAuto := ctx.casAutoMode; u.eaDelta := ctx.casAutoDelta
     }
-    u.eaAuto  := autoMode
-    u.eaDelta := autoDelta
     u.ccrRestore := False; u.toCcr := False
     u.shiftOp := 0; u.shiftDir := False
     u.bcdSub := ctx.bcdSub
@@ -475,6 +606,11 @@ object Microcode {
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
     u.predTaken := False; u.predTarget := U(0, 32 bits)
     u.phtValid := False; u.phtIndex := U(0, 11 bits)
+    // CAS/CAS2 compute sub-form (DecOp.CASOP); 0 for every other µop.
+    u.casForm := (d.uop match {
+      case co: UCasOp => B(co.form, 3 bits)
+      case _          => B(0, 3 bits)
+    })
     u.firstOfInstr := Bool(d.isFirst)
     u
   }

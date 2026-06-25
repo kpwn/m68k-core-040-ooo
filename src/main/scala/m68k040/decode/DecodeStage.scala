@@ -502,7 +502,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // microcoded op immediately FOLLOWED by another microcoded/MOVEM op in the SAME fetch
     // group is the untested edge — the slot1 stash carries a NORMAL slot1 (the tested
     // programs put a normal instr / NOP after each X-mem op).
-    val ucPc     = Reg(UInt(5 bits))
+    val ucPc     = Reg(UInt(6 bits))   // µPC into the ROM (romSize 45 -> needs 6 bits)
     val ucCtx    = Reg(Microcode.Ctx())
     when(pipeFlush) { ucActive := False }
 
@@ -573,6 +573,33 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.bfDn2        := ucBfDn2
     ucEntryCtx.bfImm        := ucBfImm
     ucEntryCtx.bfNeedHi     := ucBfNeedHi
+    // ── CAS / CAS2 Ctx population (the ext words; OperationDecoder is ext-word-free) ──
+    // CAS  `0000 1ss0 11 mmm rrr` + ext1: Dc=ext1[2:0], Du=ext1[8:6]; the EA (op[5:0],
+    // memory-alterable control) is decoded from the SHIFTED window (the EA ext FOLLOWS
+    // ext1, so words(2..) hold it). CAS2 `...111100` + ext1 + ext2: Rn1=ext1[15:12]
+    // (REG_DA), Du1=ext1[8:6], Dc1=ext1[2:0], Da1=ext1[15]; ext2 -> Rn2/Du2/Dc2/Da2.
+    val ucCasExt1 = ucEntryPkt.words(1)
+    val ucCasExt2 = ucEntryPkt.words(2)
+    val ucIsCas   = ucEntrySpec.microcoded && (ucEntrySpec.op === DecOp.CASOP)
+    val ucIsCas2  = ucIsCas && (ucEntryPkt.words(0)(5 downto 0) === B"111100")
+    // CAS EA from the shifted vector (opword + the words AFTER ext1).
+    val ucCasEaDec = EaDecoder.decode(ucEntryPkt.words(0)(5 downto 0), ucEntrySpec.size,
+                                      Vec(ucEntryPkt.words(0), ucEntryPkt.words(2), ucEntryPkt.words(3)))
+    ucEntryCtx.casDc   := ucCasExt1(2 downto 0).asUInt.resize(5)              // Dn 0..7
+    ucEntryCtx.casDu   := ucCasExt1(8 downto 6).asUInt.resize(5)              // Dn 0..7
+    ucEntryCtx.cas2Rn1 := ucCasExt1(15 downto 12).asUInt.resize(5)           // REG_DA 0..15
+    ucEntryCtx.cas2Du1 := ucCasExt1(8 downto 6).asUInt.resize(5)
+    ucEntryCtx.cas2Dc1 := ucCasExt1(2 downto 0).asUInt.resize(5)
+    ucEntryCtx.cas2Da1 := ucCasExt1(15)                                       // BIT_1F
+    ucEntryCtx.cas2Rn2 := ucCasExt2(15 downto 12).asUInt.resize(5)
+    ucEntryCtx.cas2Du2 := ucCasExt2(8 downto 6).asUInt.resize(5)
+    ucEntryCtx.cas2Dc2 := ucCasExt2(2 downto 0).asUInt.resize(5)
+    ucEntryCtx.cas2Da2 := ucCasExt2(15)                                       // BIT_F
+    // CAS (An)+/-(An) auto side effect: carried on the LOAD + STORE (same address) + the An
+    // write-back rides the STORE. NONE for the control modes (no side effect). EaDecoder set
+    // autoMode/autoDelta for modes 3/4 (the A7-byte even rule folded in autoDelta).
+    ucEntryCtx.casAutoMode  := ucCasEaDec.autoMode
+    ucEntryCtx.casAutoDelta := ucCasEaDec.autoDelta
     // ── FULL-format MEMORY-INDIRECT host-op Ctx population (spec §5) ──────────────
     // A general EA-taking op (MOVE/ALU/imm/single-EA) whose EA is a full-format memory-
     // indirect mode routes through the engine: [LOAD.L pointer -> T0] then the host op at
@@ -674,6 +701,18 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       ucEntryCtx.eaIndexLong  := ucMiEa.indexLong
       ucEntryCtx.eaIndexScale := ucMiEa.indexScale
       ucEntryCtx.eaDispLo     := ucMiEa.disp
+    }
+    // CAS (single address): the LOAD/STORE address is the memory-alterable EA. Override the
+    // shared EA group with the CAS EA decode (mutually exclusive with bit-field/mem-indirect,
+    // which are different opwords). CAS2 needs no eaBase override (Rn1/Rn2 are the addresses).
+    when(ucIsCas && !ucIsCas2) {
+      ucEntryCtx.eaBase       := ucCasEaDec.base
+      ucEntryCtx.eaBaseValid  := ucCasEaDec.baseValid
+      ucEntryCtx.eaIndexReg   := ucCasEaDec.indexReg
+      ucEntryCtx.eaIndexValid := ucCasEaDec.indexValid
+      ucEntryCtx.eaIndexLong  := ucCasEaDec.indexLong
+      ucEntryCtx.eaIndexScale := ucCasEaDec.indexScale
+      ucEntryCtx.eaDispLo     := ucCasEaDec.disp
     }
 
     // The REAL entry: a bit-field RMW (microcoded BITFIELD) picks 5B vs 4B by needHi; a

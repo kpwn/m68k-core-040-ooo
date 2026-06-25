@@ -82,7 +82,15 @@ object DecOp extends SpinalEnum {
       // and writes the CCR RMW {oldN, Z, oldV, C} (readsNzvc + writesNzvc, preserving
       // N/V). For CHK2 (`isChk2`) an out-of-bounds C raises EuFault{vector 6}; CMP2
       // never traps. Z := Rn==lower||Rn==upper; C := signed(Rn<lower||Rn>upper).
-      CMP2CHK2 = newElement()
+      CMP2CHK2,
+      // CAS/CAS2 atomic compare-and-swap compute (020+, ALU EU). The whole instruction
+      // is cracked through the v2 microcode engine; CASOP is the compute kernel, with the
+      // exact sub-operation selected by the µop's `casForm` field (see DecodedUop.casForm).
+      // It reuses the existing CMP NZVC datapath (res = loaded - Dc) for the flags and a
+      // match predicate `eq = (loaded.sz == Dc.sz)` for the always-store mux + the Dc
+      // merge. NO conditional store (the engine always stores the mux'd value; see the
+      // CAS/CAS2 design spec §6). Default-inert for every non-CAS µop.
+      CASOP = newElement()
 }
 
 /** Commit-time privileged-system-op kind (DecodedUop.sysOp / .sysKind). Selects how
@@ -363,4 +371,30 @@ case class DecodedUop() extends Bundle {
   //   (actualTaken)). Non-conditional / not-gshare-predicted µops carry phtValid=False.
   val phtValid     = Bool()
   val phtIndex     = UInt(11 bits)
+  // ── CAS/CAS2 compute sub-form (DecOp.CASOP) ─────────────────────────────────
+  // Selects which CAS/CAS2 compute kernel this µop runs in the ALU EU. The two
+  // address-loaded operands ride srcA (= the loaded memory value, T0/T1) and srcB
+  // (= the compare register Dc/Dc1/Dc2); srcC carries either Du (CASS) or the packed
+  // eq/bothEq status temp (the CAS2 forms). `eq = (srcA.sz == srcB.sz)` is the match.
+  //   CASS  : store-data    = eq ? Du(srcC) : T0(srcA)            ; no flags.
+  //   CASC  : Dc'           = eq ? Dc(srcB) : merge.sz(Dc,T0)     ; NZVC = cmp(T0,Dc).
+  //   CAS2C1: status T2[0]  = eq1                                  ; NZVC = cmp(T0,Dc1).
+  //   CAS2C2: status T2     = {bothEq[2],eq2[1],eq1[0]} (eq1 from srcC[0]);
+  //           NZVC          = eq1 ? cmp(T1,Dc2) : oldNZVC (reads NZVC to preserve).
+  //   CAS2DC: Dc'           = bothEq(srcC[2]) ? Dc(srcB) : casUpd.sz(Dc,T0,daBit=imm[0]);
+  //           no flags (a dropped crack µop; the PRF write still lands).
+  //   CAS2SEL: store-data   = bothEq(srcC[2]) ? Du(srcB) : T0(srcA) ; no flags.
+  // imm[0] carries the Rn D/A bit (BIT_1F/BIT_F) for the CAS2.W Dc sign-extend rule.
+  // Default 0 (a non-CAS µop never reads casForm — gated by op === CASOP).
+  val casForm      = Bits(3 bits)
+}
+
+/** CAS/CAS2 compute sub-form codes (DecodedUop.casForm). */
+object CasForm {
+  val CASS    = 0   // store-data mux (single CAS)
+  val CASC    = 1   // Dc compare+merge + NZVC (single CAS)
+  val CAS2C1  = 2   // first compare (NZVC=res1; eq1 -> status)
+  val CAS2C2  = 3   // second compare (final NZVC; bothEq/eq2 -> status)
+  val CAS2DC  = 4   // Dc update on mismatch (bothEq?Dc:update)
+  val CAS2SEL = 5   // store-data mux (CAS2)
 }

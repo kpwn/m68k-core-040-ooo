@@ -470,9 +470,20 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // words from the IBuf — losing the deferred branch / the wrong-path successor.
     val suppressSlot1 = slot0Predicted || slot1WouldPred || slot1WouldRasPred
     val effShift = Mux(suppressSlot1, res.slot0.lenWords.resize(res.shiftWords.getWidth), res.shiftWords)
+    // FMax (front-end floor): RETIME the decodePc advance so the late suppressSlot1 decision
+    // (BTB/RAS prediction cones) muxes the 32-bit ADD RESULT instead of the adder's addend.
+    // effShift is either slot0.lenWords (suppress) or shiftWords (full) — both aligner outputs;
+    // precompute decodePc + (each<<1) in PARALLEL and select by suppressSlot1. This pulls the
+    // 6-deep decodePc CARRY8 chain OUT from behind the effShift mux (the `pred_lenWords ->
+    // L0L1 -> slot1Ok/suppress -> addend -> adder` arc was the bistable-ordering 194MHz
+    // limiter): the adders now start as soon as their length is ready, and suppressSlot1 only
+    // drives a final 1-LUT 32-bit 2:1 result mux. Byte-identical: same value, restructured.
+    val decodePcSuppress = decodePc + (res.slot0.lenWords.resize(32) |<< 1)   // slot1 suppressed
+    val decodePcFull     = decodePc + (res.shiftWords.resize(32) |<< 1)       // full aligner shift
+    val decodePcNext     = Mux(suppressSlot1, decodePcSuppress, decodePcFull)
     when(feed.fire && !faultHold) {
       ibuf.io.shift := effShift
-      decodePc      := decodePc + (effShift.resize(32) |<< 1)
+      decodePc      := decodePcNext
       when(res.complex) {
         // Complex instruction: stall after emitting — wait for resume
         stalled := True

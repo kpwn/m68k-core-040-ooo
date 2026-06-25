@@ -96,6 +96,24 @@ object PredecodeRef {
             case Some(e) if ctrlMode => CP(simple = true, lenWords = 2 + e)
             case _                   => COMPLEX
           }
+        } else if (((op >> 11) & 0x1f) == 0x01 && bit8 == 0 && ((op >> 6) & 3) == 3 &&
+                   ((op >> 9) & 3) != 0) {
+          // CAS / CAS2 (020+ atomic compare-and-swap). CAS `0000 1ss0 11 mmm rrr` +
+          // 1 ext + EA ext: op[15:11]=00001, bit8=0, op[7:6]=11, op[10:9]=size (=/=00).
+          // CAS2 `...111100` = FIXED 3 words (opword + 2 ext). (Disjoint from CMP2/CHK2,
+          // which needs op[11]=0; CAS needs op[11]=1.)
+          val isCas2 = (op & 0x3f) == 0x3c                  // mode 7 / reg 4
+          if (isCas2) CP(simple = true, lenWords = 3)        // opword + 2 ext words
+          else {
+            // memory-ALTERABLE EA (Musashi `A+-DXWL...`): (An)=2, (An)+=3, -(An)=4,
+            // (d16,An)=5, (d8,An,Xn)=6, (xxx).W/.L=7/0,1. INCLUDES auto-inc/dec.
+            val casOk = mode == 2 || mode == 3 || mode == 4 || mode == 5 || mode == 6 ||
+                        (mode == 7 && (reg == 0 || reg == 1))
+            eaExt(mode, reg, sizeL = false, allowImm = false) match {
+              case Some(e) if casOk => CP(simple = true, lenWords = 2 + e)  // opword + 1 ext + EA ext
+              case _                => COMPLEX
+            }
+          }
         } else COMPLEX
       case 0x1 | 0x2 | 0x3 =>
         val sizeL   = cls == 0x2
