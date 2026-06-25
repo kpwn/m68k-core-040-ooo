@@ -5072,4 +5072,94 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.b (%a0),%d6"
     )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 1)
   }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // CAS2 .W/.L (dual-address compare-and-swap). gas syntax:
+  //   cas2 Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
+  // Both addresses are read UNCONDITIONALLY. If BOTH match (dest1==Dc1 && dest2==Dc2):
+  // write Du1->Rn1, Du2->Rn2, Dc1/Dc2 unchanged. Else: no writes, BOTH Dc1:=dest1 AND
+  // Dc2:=dest2 (.W via the BIT_1F/BIT_F sign-ext rule). flags = res2 if dest1==Dc1 else res1.
+  // ALWAYS-STORE: on any mismatch the loaded values are written back (RAM no-op) so mem is
+  // byte-identical to Musashi. The kept commit (CAS2C2) carries only the final CCR; the
+  // Dc1/Dc2 writes land in the PRF and are verified by reading them back.
+  // mem[0x3000]=11223344, mem[0x3004]=55667788.
+  // ════════════════════════════════════════════════════════════════════════════
+  val cas2Seed = Seq(
+    "move.l #0x3000,%a0", "move.l #0x3004,%a1",
+    "move.l #0x11223344,%d7", "move.l %d7,(%a0)",
+    "move.l #0x55667788,%d7", "move.l %d7,(%a1)"
+  )
+  test("lock-step: CAS2.L both-match -> both written, flags=res2 (Z=1)", VerilatorTest) {
+    runLockStep("cas2-l-both", (cas2Seed ++ Seq(
+      "ori #0x10,%ccr",                                    // X=1 sentinel
+      "move.l #0x11223344,%d0",                            // Dc1 = mem1 -> eq1
+      "move.l #0x55667788,%d1",                            // Dc2 = mem2 -> eq2
+      "move.l #0xa1a1a1a1,%d2", "move.l #0xb2b2b2b2,%d3",  // Du1, Du2
+      "cas2.l %d0:%d1,%d2:%d3,(%a0):(%a1)",                // both match -> mem1:=Du1, mem2:=Du2
+      "move.l (%a0),%d4", "move.l (%a1),%d5"               // read-back both
+    )).mkString(" ; "), checkMem = Seq(0x3000L, 0x3004L), checkSpan = 4)
+  }
+  test("lock-step: CAS2.L 1st-mismatch -> flags=res1, Dc1:=dest1 AND Dc2:=dest2, no writes", VerilatorTest) {
+    runLockStep("cas2-l-mis1", (cas2Seed ++ Seq(
+      "ori #0x10,%ccr",
+      "move.l #0xdeadbeef,%d0",                            // Dc1 != mem1 -> MISMATCH (1st)
+      "move.l #0x55667788,%d1",                            // Dc2 == mem2
+      "move.l #0xa1a1a1a1,%d2", "move.l #0xb2b2b2b2,%d3",  // Du (NOT written)
+      "cas2.l %d0:%d1,%d2:%d3,(%a0):(%a1)",                // no writes; Dc1:=mem1, Dc2:=mem2
+      "move.l %d0,%d4", "move.l %d1,%d5",                  // Dc1/Dc2 read-back (=mem1/mem2)
+      "move.l (%a0),%d6", "move.l (%a1),%d7"               // mem read-back (unchanged values)
+    )).mkString(" ; "), checkMem = Seq(0x3000L, 0x3004L), checkSpan = 4)
+  }
+  test("lock-step: CAS2.L 2nd-mismatch (1st matches) -> flags=res2, both Dc updated, no writes", VerilatorTest) {
+    runLockStep("cas2-l-mis2", (cas2Seed ++ Seq(
+      "ori #0x10,%ccr",
+      "move.l #0x11223344,%d0",                            // Dc1 == mem1 (1st matches)
+      "move.l #0x00000001,%d1",                            // Dc2 != mem2 -> MISMATCH (2nd)
+      "move.l #0xa1a1a1a1,%d2", "move.l #0xb2b2b2b2,%d3",
+      "cas2.l %d0:%d1,%d2:%d3,(%a0):(%a1)",                // no writes; Dc1:=mem1, Dc2:=mem2
+      "move.l %d0,%d4", "move.l %d1,%d5",
+      "move.l (%a0),%d6", "move.l (%a1),%d7"
+    )).mkString(" ; "), checkMem = Seq(0x3000L, 0x3004L), checkSpan = 4)
+  }
+  test("lock-step: CAS2.W both-match + a mismatch (.W Dc sign-ext/merge)", VerilatorTest) {
+    runLockStep("cas2-w", (cas2Seed ++ Seq(
+      "ori #0x10,%ccr",
+      // both-match (.W compares low words 0x3344 / 0x7788).
+      "move.l #0xdead3344,%d0",                            // Dc1.W = 0x3344 == mem1.W
+      "move.l #0xbeef7788,%d1",                            // Dc2.W = 0x7788 == mem2.W
+      "move.l #0x0000c0c0,%d2", "move.l #0x0000d0d0,%d3",  // Du1.W, Du2.W
+      "cas2.w %d0:%d1,%d2:%d3,(%a0):(%a1)",                // both match -> mem.W writes
+      "move.l (%a0),%d4", "move.l (%a1),%d5",
+      // mismatch (.W): Dc.W != mem.W -> Dc update uses BIT_1F/BIT_F. Both Rn are An (D/A=1)
+      // -> sign-extend the loaded 16-bit value into the full Dc. mem1.W is now 0xC0C0.
+      "move.l #0x00000000,%d6",                            // Dc1.W = 0x0000 != 0xC0C0 -> MISMATCH
+      "move.l #0x55667788,%d7",                            // Dc2 == mem2.W (0xD0D0? mem2.W=0xD0D0 now)
+      "cas2.w %d6:%d7,%d2:%d3,(%a0):(%a1)",                // no writes; Dc1:=sext(0xC0C0)
+      "move.l %d6,%d0", "move.l %d7,%d1"                   // Dc1/Dc2 read-back (sign-extended)
+    )).mkString(" ; "), checkMem = Seq(0x3000L, 0x3004L), checkSpan = 2)
+  }
+  test("lock-step: CAS2.L mixed An+Dn as Rn (REG_DA 0-15)", VerilatorTest) {
+    runLockStep("cas2-mixed", (Seq(
+      "move.l #0x3000,%a0",                                // Rn1 = A0
+      "move.l #0x3004,%d6",                                // Rn2 = D6 (a DATA reg as address!)
+      "move.l #0x11223344,%d7", "move.l %d7,(%a0)",
+      "move.l #0x55667788,%d7", "move.l %d7,0x3004",
+      "ori #0x10,%ccr",
+      "move.l #0x11223344,%d0", "move.l #0x55667788,%d1",  // both match
+      "move.l #0xa1a1a1a1,%d2", "move.l #0xb2b2b2b2,%d3",
+      "cas2.l %d0:%d1,%d2:%d3,(%a0):(%d6)",                // Rn2 is a Dn -> both written
+      "move.l (%a0),%d4", "move.l 0x3004,%d5"
+    )).mkString(" ; "), checkMem = Seq(0x3000L, 0x3004L), checkSpan = 4)
+  }
+  test("lock-step: CAS2.L Rn1==Rn2 (same address) -> match Musashi read1,read2", VerilatorTest) {
+    runLockStep("cas2-samadr", (Seq(
+      "move.l #0x3000,%a0", "move.l #0x3000,%a1",          // SAME address
+      "move.l #0x11223344,%d7", "move.l %d7,(%a0)",
+      "ori #0x10,%ccr",
+      "move.l #0x11223344,%d0", "move.l #0x11223344,%d1",  // both compare to the same loaded value
+      "move.l #0xa1a1a1a1,%d2", "move.l #0xb2b2b2b2,%d3",  // both match -> last write (Du2) wins
+      "cas2.l %d0:%d1,%d2:%d3,(%a0):(%a1)",
+      "move.l (%a0),%d4"
+    )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
 }
