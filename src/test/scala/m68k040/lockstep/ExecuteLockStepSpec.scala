@@ -2772,6 +2772,29 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 1)   // d2 == 0
   }
 
+  // MOVEC SFC/DFC round-trip (NEW — fixes the latent RAZ-WI divergence). Musashi stores
+  // REG_SFC/REG_DFC as 3-bit (`& 7`) and reads them back zero-extended. Write D0 (only the
+  // low 3 bits survive) to SFC/DFC, read back into D1 -> D1 == D0 & 7. The read value is
+  // then folded through a normal ALU op (`move.l %d1,%d2 ; addq.l #1,%d2`) so the read-back
+  // value lands in a NORMAL EU writeback that the whitebox compares vs Musashi (the bare
+  // MOVEC-read commits via the sys path, whose PRF value the whitebox does not see — so a
+  // downstream consumer is required to actually verify the round-trip). Supervisor.
+  test("lock-step: MOVEC D0,SFC ; MOVEC SFC,D1 round-trip", VerilatorTest) {
+    runLockStep("movec-sfc",
+      "move.l #0x0abc0005,%d0 ; movec %d0,%sfc ; movec %sfc,%d1 ; " +
+      "move.l %d1,%d2 ; addq.l #1,%d2 ; " +
+      ".stop: bra .stop",
+      nInstr = 5)   // d1 == 0x00000005, d2 == 0x00000006
+  }
+
+  test("lock-step: MOVEC D0,DFC ; MOVEC DFC,D1 round-trip", VerilatorTest) {
+    runLockStep("movec-dfc",
+      "move.l #0x12345003,%d0 ; movec %d0,%dfc ; movec %dfc,%d1 ; " +
+      "move.l %d1,%d2 ; addq.l #1,%d2 ; " +
+      ".stop: bra .stop",
+      nInstr = 5)   // d1 == 0x00000003, d2 == 0x00000004
+  }
+
   // MOVEC VBR then an exception: set VBR := 0x3000, install the illegal-instruction
   // handler at VBR+4*4 = 0x3010 (a runtime store the DUT D-cache + Musashi both see),
   // then `illegal` (vector 4) -> the FSM fetches the vector at VBR+0x10 = 0x3010 ->

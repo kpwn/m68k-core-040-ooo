@@ -38,7 +38,14 @@ class SystemState extends Area {
   val usp   = RegInit(U(0, 32 bits))
   val isp   = RegInit(U(0, 32 bits))     // M=0 supervisor bank (Interrupt Stack Pointer)
   val msp   = RegInit(U(0, 32 bits))     // M=1 supervisor bank (Master Stack Pointer)
+  // SFC / DFC: the 3-bit source/destination function-code registers (MOVES bus FC source).
+  // Simple committed regs (no banking), updated only by MOVEC (a serializing commit-time
+  // sysOp). Musashi stores them masked `& 7` and reads them zero-extended. The FC value is
+  // unused by this core's flat memory model (MOVES is flat) but must round-trip via MOVEC.
+  val sfc   = RegInit(U(0, 3 bits))
+  val dfc   = RegInit(U(0, 3 bits))
   srSys.simPublic(); vbr.simPublic(); usp.simPublic(); isp.simPublic(); msp.simPublic()
+  sfc.simPublic(); dfc.simPublic()
 
   /** Committed S (supervisor) and M (master) bits. */
   val s = srSys(S_BIT); s.simPublic()
@@ -56,6 +63,8 @@ class SystemState extends Area {
   val setIsp   = Flow(UInt(32 bits))
   val setMsp   = Flow(UInt(32 bits))
   val writeA7  = Flow(UInt(32 bits))   // writes the bank selected by committed (S, M)
+  val setSfc   = Flow(UInt(3 bits))
+  val setDfc   = Flow(UInt(3 bits))
   // Default idle; allowOverride so a standalone/test DUT (and ExceptionUnit) can drive them.
   setSrSys.valid.allowOverride; setSrSys.valid := False; setSrSys.payload.allowOverride; setSrSys.payload := U(0, 8 bits)
   setVbr.valid.allowOverride;   setVbr.valid := False;   setVbr.payload.allowOverride;   setVbr.payload := U(0, 32 bits)
@@ -63,6 +72,8 @@ class SystemState extends Area {
   setIsp.valid.allowOverride;   setIsp.valid := False;   setIsp.payload.allowOverride;   setIsp.payload := U(0, 32 bits)
   setMsp.valid.allowOverride;   setMsp.valid := False;   setMsp.payload.allowOverride;   setMsp.payload := U(0, 32 bits)
   writeA7.valid.allowOverride;  writeA7.valid := False;  writeA7.payload.allowOverride;  writeA7.payload := U(0, 32 bits)
+  setSfc.valid.allowOverride;   setSfc.valid := False;   setSfc.payload.allowOverride;   setSfc.payload := U(0, 3 bits)
+  setDfc.valid.allowOverride;   setDfc.valid := False;   setDfc.payload.allowOverride;   setDfc.payload := U(0, 3 bits)
 
   // ── commit-time updates ──────────────────────────────────────────────────
   when(setSrSys.valid) { srSys := setSrSys.payload }
@@ -76,4 +87,6 @@ class SystemState extends Area {
   when(setUsp.valid)   { usp := setUsp.payload }
   when(setIsp.valid)   { isp := setIsp.payload }
   when(setMsp.valid)   { msp := setMsp.payload }
+  when(setSfc.valid)   { sfc := setSfc.payload }
+  when(setDfc.valid)   { dfc := setDfc.payload }
 }
