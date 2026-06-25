@@ -142,9 +142,17 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       iq.lsNzvcWakeup.valid   := lsEu.wakeupNzvc.valid
       iq.lsNzvcWakeup.payload := lsEu.wakeupNzvc.payload
       // ROB retire (slot 0) -> SQ commit; doFlush -> SQ flush (squash speculative).
+      // ALSO squash speculative SQ entries with a ONE-CYCLE pulse at exception ENTRY (the
+      // rising edge of excActive): a privilege-trapped / faulted STORE-form op (e.g. MOVES
+      // write in user mode) leaves an UNCOMMITTED store in the SQ; the exc FSM's E_DRAIN
+      // waits for sqDrained, which would deadlock on that orphan. The flush KEEPS committed
+      // entries (only speculative ones are squashed). It MUST be a single-cycle pulse: a HELD
+      // flush gates `headReady` (drain), blocking committed stores from draining into the
+      // handler frame -> the pulse squashes the orphan, then E_DRAIN drains committed stores.
       lsEu.sqCommit.valid   := rob.logic.retire0
       lsEu.sqCommit.payload := rob.logic.h0
-      lsEu.sqFlush          := host[RedirectService].doFlush
+      val excEntering = rob.logic.excActive && !RegNext(rob.logic.excActive, init = False)
+      lsEu.sqFlush          := host[RedirectService].doFlush || excEntering
 
       // ── DTLB U/M deferred-write queue wiring (mirrors top/FullCoreSynth) ──
       val dtlb = host[m68k040.mmu.DtlbPlugin]
@@ -5376,6 +5384,20 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     )).mkString(" ; "), checkMem = Seq(0x3000L, 0x3004L), checkSpan = 4)
   }
 
+  // Indexed EA (d8,An,Xn): the brief-format index rides the EA; nextPc framing + address.
+  test("lock-step: MOVES.L (d8,An,Xn) read + write (indexed EA)", VerilatorTest) {
+    runLockStep("moves-indexed", (Seq(
+      "move.l #0x2000,%a0",                                // base
+      "move.l #0x1000,%d6",                               // index -> (0,A0,D6.l) = 0x3000
+      "move.l #0x11223344,%d7", "move.l %d7,0x3000",
+      "ori #0x10,%ccr",
+      "moves.l (0,%a0,%d6.l),%d1",                        // D1 := mem[0x3000]
+      "move.l #0xaabbccdd,%d0",
+      "moves.l %d0,(0,%a0,%d6.l)",                        // mem[0x3000] := 0xAABBCCDD
+      "move.l 0x3000,%d2"
+    )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+
   // MOVES does NOT touch CCR: seed N=1,V=1 via overflow, then a MOVES, then verify the CCR
   // survives (the lock-step compares the full CCR at each commit -> any MOVES CCR write
   // would diverge here AND at the trailing op).
@@ -5397,5 +5419,30 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moves.l %d2,(%a0)",                                 // mem := 0xAABBCCDD (SAME flat write)
       "move.l (%a0),%d3"
     )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+
+  // MOVES is PRIVILEGED: in USER mode (S=0) it raises a vector-8 privilege violation
+  // (format-$0) BEFORE executing — the memory is NOT modified. We BOOT in supervisor (so the
+  // supervisor ISP = 0x00100000 matches Musashi's reset SP, and the trap frame addresses
+  // agree), install the vector-8 handler + seed mem + a USP, then DROP to user via
+  // `move.w #0x0000,%sr`. The MOVES then TRAPs -> the supervisor handler (on the ISP) bumps
+  // the stacked PC past the 4-byte MOVES and RTEs back to user mode. Handler-entry PC/SR/A7
+  // + the RTE return are lock-stepped vs Musashi; mem is checkMem'd (the seed value survives
+  // -> the MOVES did NOT execute). The handler is installed at VBR(0)+8*4 = 0x20.
+  test("lock-step: MOVES in USER mode -> vector-8 privilege violation (op does not execute)", VerilatorTest) {
+    runLockStep("moves-priv",
+      // Supervisor setup: install vector 8 @ 0x20, seed mem, set USP, then drop to user.
+      "move.l #handler,%d0 ; move.l %d0,0x20 ; " +         // vector 8 @ 0x20 := handler
+      "move.l #0x3000,%a0 ; move.l #0x11223344,%d7 ; move.l %d7,(%a0) ; " +
+      "move.l #0x00080000,%d5 ; movec %d5,%usp ; " +       // seed USP (the user A7 after the SR drop)
+      "move.l #0xaabbccdd,%d4 ; " +
+      "move.w #0x0000,%sr ; " +                            // S := 0 -> USER mode (A7 := USP)
+      "moves.l %d4,(%a0) ; " +                             // PRIVILEGED in user mode -> vector 8 (mem unchanged)
+      "moveq #9,%d3 ; " +                                  // resume target after the handler RTEs past MOVES
+      "loop: bra loop ; " +
+      // vector-8 handler (supervisor): bump the stacked PC (format-$0: PC at 2(A7)) past the
+      // 4-byte MOVES so RTE resumes at `moveq #9` (else it re-faults forever); then RTE.
+      "handler: move.l 2(%a7),%d1 ; addq.l #4,%d1 ; move.l %d1,2(%a7) ; moveq #1,%d2 ; rte",
+      nInstr = 14, checkMem = Seq(0x3000L), checkSpan = 4)
   }
 }
