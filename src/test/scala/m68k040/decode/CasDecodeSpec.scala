@@ -65,14 +65,24 @@ class CasDecodeSpec extends AnyFunSuite {
     runDec(casOp(3, 7, 0)) { dut => assert(dut.o.microcoded.toBoolean, "(xxx).W ok") }
     runDec(casOp(3, 7, 1)) { dut => assert(dut.o.microcoded.toBoolean, "(xxx).L ok") }
   }
+  // CAS is memory-ALTERABLE (Musashi mask `A+-DXWL...`): (An)+ and -(An) ARE legal.
+  test("CAS.L (%a0)+ (mode3) / -(%a0) (mode4): microcoded (memory-alterable auto modes)", VerilatorTest) {
+    runDec(casOp(3, 3, 0)) { dut =>
+      assert(!dut.o.illegal.toBoolean && dut.o.microcoded.toBoolean, "CAS (An)+ legal")
+      assert(dut.o.ucEntry.toInt == Microcode.CAS_ENTRY)
+    }
+    runDec(casOp(3, 4, 0)) { dut =>
+      assert(!dut.o.illegal.toBoolean && dut.o.microcoded.toBoolean, "CAS -(An) legal")
+      assert(dut.o.ucEntry.toInt == Microcode.CAS_ENTRY)
+    }
+  }
 
   // ── Illegal CAS EAs (NOT memory-alterable) ──────────────────────────────────
-  // NOTE: mode7/reg4 (op[5:0]=111100) is NOT "CAS #imm" — it is the CAS2 marker (legal),
-  // so it is excluded here. The remaining non-memory-alterable EAs are illegal for CAS.
-  test("CAS Dn / An / (An)+ / -(An) / (d16,PC) / (d8,PC,Xn) -> ILLEGAL", VerilatorTest) {
+  // NOTE: mode7/reg4 (op[5:0]=111100) is the CAS2 marker (legal). (An)+ (3) and -(An) (4)
+  // ARE memory-alterable (legal). Only Dn/An/PC-rel are illegal for CAS.
+  test("CAS Dn / An / (d16,PC) / (d8,PC,Xn) -> ILLEGAL", VerilatorTest) {
     val badModes = Seq(
-      (0, 1, "Dn"), (1, 2, "An"), (3, 3, "(An)+"), (4, 4, "-(An)"),
-      (7, 2, "(d16,PC)"), (7, 3, "(d8,PC,Xn)"))
+      (0, 1, "Dn"), (1, 2, "An"), (7, 2, "(d16,PC)"), (7, 3, "(d8,PC,Xn)"))
     for ((mode, reg, name) <- badModes) {
       runDec(casOp(3, mode, reg)) { dut =>
         assert(dut.o.illegal.toBoolean, s"CAS $name must be ILLEGAL")
@@ -116,6 +126,10 @@ class CasDecodeSpec extends AnyFunSuite {
 
   test("predecode: CAS (An) -> simple len 2 (opword + 1 ext)", VerilatorTest) {
     runPre(0x0ED0) { dut => assert(dut.simple.toBoolean && dut.len.toInt == 2, "CAS (An) len 2") }
+  }
+  test("predecode: CAS (An)+ / -(An) -> simple len 2 (no EA ext, auto side effect)", VerilatorTest) {
+    runPre(casOp(3, 3, 0)) { dut => assert(dut.simple.toBoolean && dut.len.toInt == 2, "CAS (An)+ len 2") }
+    runPre(casOp(3, 4, 0)) { dut => assert(dut.simple.toBoolean && dut.len.toInt == 2, "CAS -(An) len 2") }
   }
   test("predecode: CAS (d16,An) -> simple len 3 (opword + ext + disp)", VerilatorTest) {
     runPre(casOp(3, 5, 3)) { dut => assert(dut.simple.toBoolean && dut.len.toInt == 3, "CAS (d16,An) len 3") }

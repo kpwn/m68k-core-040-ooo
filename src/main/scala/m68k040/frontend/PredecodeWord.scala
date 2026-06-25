@@ -201,10 +201,11 @@ object PredecodeWord {
           when(isCas2Pre) {
             r.simple := True; r.lenWords := U(3, 3 bits)        // opword + 2 ext words
           } otherwise {
-            // memory-alterable EA only ((An)/(d16,An)/(d8,An,Xn)/(xxx).W/.L); reject
-            // Dn/An/(An)+/-(An)/PC-rel/#imm -> stays COMPLEX (decode illegalises it).
-            val casOk = (mode === U(2, 3 bits)) || (mode === U(5, 3 bits)) ||
-                        (mode === U(6, 3 bits)) ||
+            // memory-ALTERABLE EA (Musashi `A+-DXWL...`): (An)/(An)+/-(An)/(d16,An)/
+            // (d8,An,Xn)/(xxx).W/.L. (An)+/-(An) carry 0 EA ext (like (An)). Reject
+            // Dn/An/PC-rel/#imm -> stays COMPLEX (decode illegalises it).
+            val casOk = (mode === U(2, 3 bits)) || (mode === U(3, 3 bits)) || (mode === U(4, 3 bits)) ||
+                        (mode === U(5, 3 bits)) || (mode === U(6, 3 bits)) ||
                         ((mode === U(7, 3 bits)) && ((reg === U(0, 3 bits)) || (reg === U(1, 3 bits))))
             val (ok, e) = eaExt(mode, reg, sizeL = False, allowImm = false, eaW = B(0, 16 bits))
             when(ok && casOk) {

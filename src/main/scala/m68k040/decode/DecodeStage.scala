@@ -595,6 +595,11 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.cas2Du2 := ucCasExt2(8 downto 6).asUInt.resize(5)
     ucEntryCtx.cas2Dc2 := ucCasExt2(2 downto 0).asUInt.resize(5)
     ucEntryCtx.cas2Da2 := ucCasExt2(15)                                       // BIT_F
+    // CAS (An)+/-(An) auto side effect: carried on the LOAD + STORE (same address) + the An
+    // write-back rides the STORE. NONE for the control modes (no side effect). EaDecoder set
+    // autoMode/autoDelta for modes 3/4 (the A7-byte even rule folded in autoDelta).
+    ucEntryCtx.casAutoMode  := ucCasEaDec.autoMode
+    ucEntryCtx.casAutoDelta := ucCasEaDec.autoDelta
     // ── FULL-format MEMORY-INDIRECT host-op Ctx population (spec §5) ──────────────
     // A general EA-taking op (MOVE/ALU/imm/single-EA) whose EA is a full-format memory-
     // indirect mode routes through the engine: [LOAD.L pointer -> T0] then the host op at

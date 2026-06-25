@@ -126,7 +126,8 @@ object OperationDecoder {
         // ── CAS / CAS2 (020+ atomic compare-and-swap) ──────────────────────────
         // CAS  `0000 1ss0 11 mmm rrr` + 1 ext word: op[15:11]=00001, op[8]=0,
         // op[7:6]=11, op[10:9]=size (01=.B,10=.W,11=.L). EA op[5:0] = memory-ALTERABLE
-        // (control + (An), reject Dn/An/(An)+/-(An)/PC-rel/#imm).
+        // (Musashi mask `A+-DXWL...`): (An)/(An)+/-(An)/(d16,An)/(d8,An,Xn)/(xxx).W/.L —
+        // INCLUDES the auto-inc/dec modes. Reject Dn/An/PC-rel/#imm.
         // CAS2 `0000 1ss0 11 111100` + 2 ext words: same family, op[5:0]=111100 (mode7/
         // reg4). Both route through the v2 microcode engine (CAS 4 µops, CAS2 10 µops) —
         // the whole crack EXCEEDS the fast budget. OperationDecoder marks `microcoded`
@@ -138,11 +139,14 @@ object OperationDecoder {
         val casFamily = (opword(15 downto 11) === B"00001") && !opword(8) &&
                         (opword(7 downto 6) === B"11")
         val isCas2    = opword(5 downto 0) === B"111100"   // mode 7 / reg 4
-        // CAS EA legality (memory-alterable control): (An)=2, (d16,An)=5, (d8,An,Xn)=6,
-        // (xxx).W=7/0, (xxx).L=7/1. Reject everything else (Dn/An/(An)+/-(An)/PC-rel/#imm).
+        // CAS EA legality (memory-ALTERABLE, Musashi mask `A+-DXWL...`): (An)=2, (An)+=3,
+        // -(An)=4, (d16,An)=5, (d8,An,Xn)=6, (xxx).W=7/0, (xxx).L=7/1. Memory-alterable
+        // INCLUDES auto-inc/dec (it is NOT alterable-CONTROL). Reject Dn/An (0/1), PC-rel
+        // (7/2, 7/3) and #imm (7/4).
         val casMode   = opword(5 downto 3)
         val casReg    = opword(2 downto 0)
-        val casEaOk   = (casMode === B"010") || (casMode === B"101") || (casMode === B"110") ||
+        val casEaOk   = (casMode === B"010") || (casMode === B"011") || (casMode === B"100") ||
+                        (casMode === B"101") || (casMode === B"110") ||
                         ((casMode === B"111") && ((casReg === B"000") || (casReg === B"001")))
         def setCasSize(): Unit = {
           when(opword(10 downto 9) === B"01") { o.size := Size.BYTE }
@@ -168,7 +172,7 @@ object OperationDecoder {
             o.srcA := easrc                  // the EA (so predecode/EaDecoder frame it)
             o.writesNzvc := True             // NZVC from cmp(dest,Dc) (no X)
           }
-          // A non-memory-alterable CAS EA (Dn/An/(An)+/-(An)/PC-rel/#imm) stays ILLEGAL
+          // A non-memory-alterable CAS EA (Dn/An/PC-rel/#imm) stays ILLEGAL
           // (the default o.illegal=True; the microcoded arm above did not fire) -> vector-4.
         }
       }

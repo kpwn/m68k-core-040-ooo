@@ -5073,6 +5073,62 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 1)
   }
 
+  // CAS auto-inc/dec EA modes ((An)+ / -(An)) — memory-ALTERABLE, Musashi mask `A+-DXWL...`.
+  // The auto side effect happens ONCE during EA computation (BEFORE the compare), so An
+  // updates on BOTH match and mismatch; the LOAD and the (always-)STORE use the SAME
+  // captured address. (An)+: addr=An, An+=size. -(An): An-=size first, addr=new An.
+  test("lock-step: CAS.L (%a0)+ match -> mem:=Du, An += 4 (postinc)", VerilatorTest) {
+    runLockStep("cas-l-postinc-match", (casSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "move.l #0x11223344,%d2", "move.l #0xaabbccdd,%d1",  // Dc=mem -> match, Du
+      "cas.l %d2,%d1,(%a0)+",                              // mem[0x3000]:=Du; A0 := 0x3004
+      "move.l %a0,%d4"                                     // A0 must be 0x3004 (postinc by 4)
+    )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+  test("lock-step: CAS.L (%a0)+ mismatch -> mem unchanged, An += 4 (postinc on mismatch too)", VerilatorTest) {
+    runLockStep("cas-l-postinc-mis", (casSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "move.l #0x55667788,%d2", "move.l #0xaabbccdd,%d1",  // Dc!=mem -> mismatch
+      "cas.l %d2,%d1,(%a0)+",                              // Dc:=mem; mem unchanged; A0 := 0x3004
+      "move.l %a0,%d4"                                     // A0 STILL postinc'd to 0x3004
+    )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+  test("lock-step: CAS.W/.B (%a0)+ -> An += 2 / += 1 (size-correct postinc)", VerilatorTest) {
+    runLockStep("cas-wb-postinc", (casSeed ++ Seq(
+      "ori #0x10,%ccr",
+      // .W (An)+: compare low word, A0 += 2.
+      "move.l #0x00003344,%d2", "move.l #0x0000beef,%d1",
+      "cas.w %d2,%d1,(%a0)+",                              // A0: 0x3000 -> 0x3002
+      "move.l %a0,%d4",
+      // .B (An)+: A0 += 1.
+      "move.l #0x3000,%a1", "move.b (%a1),%d5",            // mem[0x3000] low byte (now 0xBE from .W write)
+      "cas.b %d5,%d6,(%a1)+",                              // compare byte, A1 += 1
+      "move.l %a1,%d7"
+    )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 2)
+  }
+  test("lock-step: CAS.L -(%a0) match -> An -= 4 once, access at decremented addr", VerilatorTest) {
+    runLockStep("cas-l-predec-match", (Seq(
+      "move.l #0x3004,%a0",                                // A0 base; -(A0) accesses 0x3000
+      "move.l #0x11223344,%d7", "move.l %d7,0x3000",       // seed mem[0x3000]
+      "ori #0x10,%ccr",
+      "move.l #0x11223344,%d2", "move.l #0xaabbccdd,%d1",  // Dc=mem -> match
+      "cas.l %d2,%d1,-(%a0)",                              // A0 := 0x3000 first; mem[0x3000]:=Du
+      "move.l %a0,%d4",                                    // A0 must be 0x3000 (decremented once)
+      "move.l (%a0),%d3"                                   // read-back at the decremented addr
+    )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+  test("lock-step: CAS.L -(%a0) mismatch -> An -= 4 once, mem unchanged", VerilatorTest) {
+    runLockStep("cas-l-predec-mis", (Seq(
+      "move.l #0x3004,%a0",
+      "move.l #0x11223344,%d7", "move.l %d7,0x3000",
+      "ori #0x10,%ccr",
+      "move.l #0x55667788,%d2", "move.l #0xaabbccdd,%d1",  // Dc!=mem -> mismatch
+      "cas.l %d2,%d1,-(%a0)",                              // A0 := 0x3000; Dc:=mem; mem unchanged
+      "move.l %a0,%d4",                                    // A0 = 0x3000 (decremented once)
+      "move.l (%a0),%d3"
+    )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+
   // ════════════════════════════════════════════════════════════════════════════
   // CAS2 .W/.L (dual-address compare-and-swap). gas syntax:
   //   cas2 Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)

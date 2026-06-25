@@ -92,6 +92,13 @@ object Microcode {
   case object ANoAuto   extends Auto
   case object APredecAy extends Auto
   case object APredecAx extends Auto
+  // CAS auto-inc/dec EA: the LOAD + STORE both carry eaAuto/eaDelta from the latched ctx
+  // (ctx.casAutoMode/Delta) so they compute the SAME effective address (matching Musashi's
+  // M68KMAKE_GET_EA_AY single side-effect); the An := An ± size write-back rides the STORE
+  // (AEaCasStore writes the int dst = eaBase An when ctx.casAutoMode =/= NONE). NONE for the
+  // plain control modes (no An side effect) -> a harmless inert eaAuto.
+  case object AEaCasLoad  extends Auto   // load: eaAuto from ctx, NO An write (dst = T0)
+  case object AEaCasStore extends Auto   // store: eaAuto from ctx + An write-back (dst = eaBase)
 
   /** Explicit µop size for a row (overrides the ctx-size default). The bit-field chain
     * rows are LONG (lo load/store, the compute) or BYTE (the hi spill-byte load/store);
@@ -257,12 +264,16 @@ object Microcode {
     //   c1 CASS  storeData T2 = eq ? Du : T0 (eq = T0.sz==Dc.sz)           (no flags)
     //   c2 CASC  Dc := eq ? Dc : merge.sz(Dc,T0) ; NZVC = cmp(T0,Dc)       (KEPT commit)
     //   c3 STORE.sz T2 -> (ea)                                             (isLast; rmw-drop)
-    Desc(UMove, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
-         indexFromEa = true, isFirst = true),                                  // µPC31 (c0)
+    // The LOAD + STORE both carry the CAS auto EA (eaAuto from ctx) so an (An)+/-(An) CAS
+    // computes ONE effective address for both accesses; the An := An ± size write-back rides
+    // the STORE (the side effect happens once, on BOTH match and mismatch — the always-store
+    // mux keeps mem byte-identical). For the control modes casAutoMode=NONE -> inert eaAuto.
+    Desc(UMove, mem = MLoad, auto = AEaCasLoad, srcA = SEaBase, dst = ST0, useImm = true,
+         imm = SEaDispLo, indexFromEa = true, isFirst = true),                 // µPC31 (c0)
     Desc(UCasOp(CasForm.CASS), srcA = ST0, srcB = SCasDc, srcC = SCasDu, dst = ST2),  // µPC32 (c1)
     Desc(UCasOp(CasForm.CASC, writesNzvc = true), srcA = ST0, srcB = SCasDc, dst = SCasDc),  // µPC33 (c2)
-    Desc(UMove, mem = MStore, srcA = SEaBase, srcB = ST2, useImm = true, imm = SEaDispLo,
-         indexFromEa = true, isLast = true),                                   // µPC34 (c3)
+    Desc(UMove, mem = MStore, auto = AEaCasStore, srcA = SEaBase, srcB = ST2, useImm = true,
+         imm = SEaDispLo, indexFromEa = true, isLast = true),                  // µPC34 (c3)
 
     // ════════════════════════════════════════════════════════════════════════
     // CAS2 .W/.L (dual-address compare-and-swap) — 10 µops @ CAS2_ENTRY=35.
@@ -356,6 +367,10 @@ object Microcode {
     // EaDecoder on op[5:0]); ctx.size is the access size. Dc/Du are Dn register ids.
     val casDc        = UInt(5 bits)      // CAS compare reg Dc = ext[2:0]
     val casDu        = UInt(5 bits)      // CAS update  reg Du = ext[8:6]
+    // CAS auto-inc/dec EA side effect ((An)+ / -(An)): the LOAD + STORE carry this so they
+    // compute the SAME address; the An write-back rides the STORE. NONE for the other modes.
+    val casAutoMode  = EaAuto()
+    val casAutoDelta = UInt(3 bits)
     // CAS2: two register-indirect addresses Rn1/Rn2 (REG_DA, Dn or An — the FULL 32-bit reg
     // is the address), and the two compare/update register pairs + the per-Rn D/A bit.
     val cas2Rn1      = UInt(5 bits); val cas2Rn2 = UInt(5 bits)
@@ -475,7 +490,15 @@ object Microcode {
     u.srcAReg := srcAReg; u.srcAValid := srcAV
     u.srcBReg := srcBReg   // srcBValid assigned below (per-row, depends on the host-op kind)
     u.srcCReg := srcCReg; u.srcCValid := srcCV
-    u.dstReg  := dstReg;  u.dstValid  := dstV
+    // The CAS auto STORE writes its int dst = the base An (the (An)+/-(An) side effect), gated
+    // on a non-NONE ctx.casAutoMode; the LS-EU computes An := An ± size per eaAuto. All other
+    // rows take the ROM-selected dst. (Only the STORE writes An — the load's dst is T0.)
+    if (d.auto == AEaCasStore) {
+      u.dstReg   := ctx.eaBase
+      u.dstValid := ctx.casAutoMode =/= EaAuto.NONE
+    } else {
+      u.dstReg  := dstReg;  u.dstValid  := dstV
+    }
     // ── useImm / imm / srcBValid / flags — assigned ONCE per row (Scala-if on d.uop) ──
     if (d.uop == UMiHostOp) {
       // The host ALU/MOVE/unary op. srcB is the ROM-selected register (ST1 for MOVE-src's
@@ -541,13 +564,16 @@ object Microcode {
     // Auto-update: the LOAD carries PREDEC so the LS-EU computes addr = An - eaDelta (the
     // load does NOT write An — the LS-EU writes An only on an eaAuto STORE). The store
     // accesses the already-decremented Ax with NO auto. eaDelta is the byte count.
-    val (autoMode, autoDelta) = d.auto match {
-      case ANoAuto   => (EaAuto.NONE,   U(0, 3 bits))
-      case APredecAy => (EaAuto.PREDEC, deltaBytesU(ayReg(ctx), ctx))
-      case APredecAx => (EaAuto.PREDEC, deltaBytesU(axReg(ctx), ctx))
+    d.auto match {
+      case ANoAuto     => u.eaAuto := EaAuto.NONE;   u.eaDelta := U(0, 3 bits)
+      case APredecAy   => u.eaAuto := EaAuto.PREDEC; u.eaDelta := deltaBytesU(ayReg(ctx), ctx)
+      case APredecAx   => u.eaAuto := EaAuto.PREDEC; u.eaDelta := deltaBytesU(axReg(ctx), ctx)
+      // CAS (An)+/-(An): the LOAD + STORE carry the latched ctx auto so they compute the
+      // SAME effective address (PREDEC: An-delta; POSTINC: An). For the control modes
+      // casAutoMode=NONE -> inert eaAuto (addr = An + disp + index, the normal CAS EA).
+      case AEaCasLoad  => u.eaAuto := ctx.casAutoMode; u.eaDelta := ctx.casAutoDelta
+      case AEaCasStore => u.eaAuto := ctx.casAutoMode; u.eaDelta := ctx.casAutoDelta
     }
-    u.eaAuto  := autoMode
-    u.eaDelta := autoDelta
     u.ccrRestore := False; u.toCcr := False
     u.shiftOp := 0; u.shiftDir := False
     u.bcdSub := ctx.bcdSub

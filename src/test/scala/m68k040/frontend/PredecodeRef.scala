@@ -105,8 +105,9 @@ object PredecodeRef {
           val isCas2 = (op & 0x3f) == 0x3c                  // mode 7 / reg 4
           if (isCas2) CP(simple = true, lenWords = 3)        // opword + 2 ext words
           else {
-            // memory-alterable EA: (An)=2, (d16,An)=5, (d8,An,Xn)=6, (xxx).W/.L=7/0,1.
-            val casOk = mode == 2 || mode == 5 || mode == 6 ||
+            // memory-ALTERABLE EA (Musashi `A+-DXWL...`): (An)=2, (An)+=3, -(An)=4,
+            // (d16,An)=5, (d8,An,Xn)=6, (xxx).W/.L=7/0,1. INCLUDES auto-inc/dec.
+            val casOk = mode == 2 || mode == 3 || mode == 4 || mode == 5 || mode == 6 ||
                         (mode == 7 && (reg == 0 || reg == 1))
             eaExt(mode, reg, sizeL = false, allowImm = false) match {
               case Some(e) if casOk => CP(simple = true, lenWords = 2 + e)  // opword + 1 ext + EA ext
