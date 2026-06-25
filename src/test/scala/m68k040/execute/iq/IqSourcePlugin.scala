@@ -95,6 +95,7 @@ class IqSourcePlugin extends FiberPlugin {
       u.keepCommit   := False
       u.sysOp        := False; u.sysKind := m68k040.decode.SysKind.NONE; u.sysReadDir := False
       u.phtValid     := False; u.phtIndex := 0
+      u.casForm      := 0
       c
     }
 

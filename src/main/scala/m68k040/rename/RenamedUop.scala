@@ -135,6 +135,10 @@ case class RenamedUop() extends Bundle {
   // decode -> here -> IqContext -> branch EU -> BranchCompletion -> ROB.
   val phtValid     = Bool()
   val phtIndex     = UInt(11 bits)
+  // CAS/CAS2 compute sub-form (DecOp.CASOP): selects the compute kernel in the ALU EU
+  // (CASS/CASC/CAS2C1/CAS2C2/CAS2DC/CAS2SEL — see DecodedUop.casForm / CasForm). Threaded
+  // decode -> here -> IqContext -> ALU EU. Default 0 (a non-CAS µop never reads it).
+  val casForm      = Bits(3 bits)
   val dstArch = UInt(5 bits)   // architectural int dst reg 0..17 (incl T0/T1); for commit RAT + CommitTrace
   val psrcA = UInt(intW bits); val psrcAValid = Bool()
   val psrcB = UInt(intW bits); val psrcBValid = Bool()

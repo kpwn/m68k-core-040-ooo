@@ -288,6 +288,65 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val bfrWd       = Mux(bfrDw, s1RdB(4 downto 0),  s1Src2(9 downto 5))
     val bfResolveRes = (B(0, 22 bits) ## bfrWd ## bfrOff).resize(32)
 
+    // ── CAS / CAS2 compute datapath (DecOp.CASOP, FAST lat-1) ───────────────────
+    // The whole CAS/CAS2 instruction is cracked through the v2 microcode engine; this
+    // is the compute kernel selected by u1.casForm (CasForm). Operands:
+    //   a   = s1Src1            (the loaded memory value T0/T1)
+    //   bRaw= s1RdB             (the compare/update register Dc/Du — RAW rdB, bypassing
+    //                            the useImm mux so CAS2DC can carry the D/A bit in imm)
+    //   c   = s1RdC             (Du for CASS / the packed eq/bothEq status temp for CAS2)
+    //   oldNzvc = s1Nzvc        (preserve res1 in CAS2C2's !eq1 case)
+    //   daBit  = s1Src2(0)      (= imm[0] when useImm: the CAS2.W Rn D/A bit, BIT_1F/BIT_F)
+    // `eq` is the size-masked match (loaded == Dc); the CMP NZVC (res = loaded - Dc) reuses
+    // the AluDatapath SUB/CMP cone via a dedicated instance below.
+    val casIsOp   = u1.op === DecOp.CASOP
+    val casA      = s1Src1
+    val casBraw   = s1RdB
+    val casC      = s1RdC
+    val casDaBit  = s1Src2(0)
+    // size mask + size-masked equality (the "match" predicate).
+    def maskOf(sz: Size.C): Bits = sz.mux(
+      Size.BYTE -> B(0x000000ffL, 32 bits), Size.WORD -> B(0x0000ffffL, 32 bits),
+      Size.LONG -> B(0xffffffffL, 32 bits))
+    val casMask   = maskOf(u1.size)
+    val casEqAB   = (casA & casMask) === (casBraw & casMask)
+    // CMP NZVC = res = loaded(casA) - Dc(casBraw), size-correct. A dedicated AluDatapath
+    // (op=CMP) reuses the exact subtract/flag cone (matches Musashi's NFLAG/VFLAG_SUB/...).
+    val casCmpCmd = AluCmd()
+    casCmpCmd.op := DecOp.CMP; casCmpCmd.size := u1.size
+    casCmpCmd.src1 := casA; casCmpCmd.src2 := casBraw
+    casCmpCmd.xIn := False; casCmpCmd.extByte := False; casCmpCmd.bitOp := 0
+    val casCmpRsp = AluDatapath(casCmpCmd)         // nzvc = cmp(loaded, Dc)
+    // merge.sz(Dc, loaded): .L = loaded full; .B/.W = Dc upper bits + loaded low byte/word.
+    val casMerge  = u1.size.mux(
+      Size.BYTE -> (casBraw(31 downto 8)  ## casA(7 downto 0)),
+      Size.WORD -> (casBraw(31 downto 16) ## casA(15 downto 0)),
+      Size.LONG -> casA)
+    // CAS2 .W Dc-update (Musashi BIT_1F/BIT_F rule): da ? sext16(loaded) : merge16(Dc,loaded).
+    // .L is the plain full assignment (= loaded). The size-mux picks .W vs .L; CAS2 is
+    // never .B, so the BYTE arm is a don't-care (defaults to the .W form).
+    val casSext16 = casA(15 downto 0).asSInt.resize(32).asBits
+    val cas2DcW   = Mux(casDaBit, casSext16, casBraw(31 downto 16) ## casA(15 downto 0))
+    val cas2DcUpd = Mux(u1.size === Size.LONG, casA, cas2DcW)
+    // Status-temp bits (CAS2): eq1 rides bit0, eq2 bit1, bothEq bit2.
+    val casEq1In  = casC(0)                         // CAS2C2 reads eq1 from the C1 status temp
+    val casBothEq = casC(2)                         // CAS2DC/SEL read bothEq from the C2 status
+    // Per-form result + NZVC.
+    import m68k040.decode.CasForm
+    val casResult = u1.casForm.mux(
+      B(CasForm.CASS,    3 bits) -> Mux(casEqAB, casC, casA),          // store-data = eq?Du:T0
+      B(CasForm.CASC,    3 bits) -> Mux(casEqAB, casBraw, casMerge),   // Dc = eq?Dc:merge
+      B(CasForm.CAS2C1,  3 bits) -> (B(0, 31 bits) ## casEqAB),        // status T2 = {eq1}
+      B(CasForm.CAS2C2,  3 bits) -> (B(0, 29 bits) ## (casEq1In && casEqAB) ## casEqAB ## casEq1In), // {bothEq,eq2,eq1}
+      B(CasForm.CAS2DC,  3 bits) -> Mux(casBothEq, casBraw, cas2DcUpd),// Dc = bothEq?Dc:update
+      B(CasForm.CAS2SEL, 3 bits) -> Mux(casBothEq, casBraw, casA),     // store-data = bothEq?Du:T0
+      default                    -> casA)
+    // NZVC: CASC + CAS2C1 = cmp(loaded,Dc); CAS2C2 = eq1 ? cmp(T1,Dc2) : oldNZVC (preserve
+    // res1). The store-data / Dc-update / status forms write no flags (writesNzvc=False).
+    val casNzvc = u1.casForm.mux(
+      B(CasForm.CAS2C2, 3 bits) -> Mux(casEq1In, casCmpRsp.nzvc, s1Nzvc(3 downto 0)),
+      default                   -> casCmpRsp.nzvc)
+
     // ---- S1: size-merge of the FAST int writeback (68k partial-register semantics) ----
     // A .B / .W op updates ONLY the low byte / word of the destination register; the
     // upper bits are PRESERVED. For ADD/SUB/AND/OR/EOR the destination operand is srcA
@@ -332,7 +391,11 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
       Size.WORD -> (s1Src1(31 downto 16) ## srcForMove(15 downto 0)),
       Size.LONG -> srcForMove)
     val isFromCcrSr = u1.fromCcr || u1.fromSr
-    val mergedResult = Mux(u1.isMovea, moveaResult, Mux(isFromCcrSr, sizeMergedMove, sizeMerged))
+    // CASOP writes the FULL computed value (the .B/.W partial-register merge is folded
+    // INSIDE the CASOP datapath, since the merge depends on the match predicate) -> bypass
+    // the generic size-merge (like MOVEA / fromCcr-Sr).
+    val mergedResult = Mux(casIsOp, casResult,
+                       Mux(u1.isMovea, moveaResult, Mux(isFromCcrSr, sizeMergedMove, sizeMerged)))
 
     // ---- S1: ANDI/ORI/EORI #imm,CCR (toCcr) — CCR read-modify-write (FAST path) ----
     // Assemble the current 5-bit CCR {X,N,Z,V,C} from the flag PRFs, apply the logical
@@ -350,9 +413,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val ccrNzvc = ccrNew(3 downto 0)
     val ccrX    = ccrNew(4)
 
-    // Fast final flags: CCR-rmw for toCcr, BCD decimal carry/quirky-N/V for BCD, else
-    // the ALU datapath (NO shifter). X = the BCD decimal carry/borrow for a BCD op.
-    val finalNzvc = Mux(u1.toCcr, ccrNzvc, Mux(isBcd, bcdNzvc, aluNzvc))
+    // Fast final flags: CASOP cmp/preserve flags for CAS/CAS2, CCR-rmw for toCcr, BCD
+    // decimal carry/quirky-N/V for BCD, else the ALU datapath (NO shifter). X = the BCD
+    // decimal carry/borrow for a BCD op (CAS/CAS2 never write X).
+    val finalNzvc = Mux(casIsOp, casNzvc, Mux(u1.toCcr, ccrNzvc, Mux(isBcd, bcdNzvc, aluNzvc)))
     val finalX    = Mux(u1.toCcr, ccrX, Mux(isBcd, bcdCarry, rsp.xOut))
 
     // ---- S1: FAST writeback (gated by masks; suppressed for a slow op) ----

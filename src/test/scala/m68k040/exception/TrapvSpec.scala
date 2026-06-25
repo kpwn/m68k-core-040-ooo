@@ -60,6 +60,7 @@ class TrapvSpec extends AnyFunSuite {
       // don't-care made `mis` flakily true. Drive them to the not-predicted defaults.
       uop.predTaken := False; uop.predTarget := 0
       uop.phtValid := False; uop.phtIndex := 0
+      uop.casForm := 0
       ctx.robId := iRobId
       eu.issue.valid := iValid; eu.issue.payload := ctx
 

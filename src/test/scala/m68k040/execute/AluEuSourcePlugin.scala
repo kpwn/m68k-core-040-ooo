@@ -101,6 +101,7 @@ class AluEuSourcePlugin extends FiberPlugin {
     uop.bfOp         := 0; uop.bfDynamic := False; uop.bfMem := False; uop.bfStoreForm := 0
     uop.sysOp        := False; uop.sysKind := m68k040.decode.SysKind.NONE; uop.sysReadDir := False
     uop.phtValid     := False; uop.phtIndex := 0
+    uop.casForm      := 0
     ctx.robId := iRobId
     eu.issue.valid   := iValid
     eu.issue.payload := ctx

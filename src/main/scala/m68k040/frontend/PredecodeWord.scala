@@ -185,6 +185,34 @@ object PredecodeWord {
             r.lenWords := (U(2, 3 bits) + e).resized   // opword + ext word + EA ext
           }
         }
+        // ── CAS / CAS2 (020+ atomic compare-and-swap) ──────────────────────────
+        // CAS  `0000 1ss0 11 mmm rrr` + 1 ext word + the EA ext: op[15:11]=00001,
+        // bit8=0, op[7:6]=11, op[10:9]=size (=/=00). len = opword + 1 ext + EA ext.
+        // The EA ext FOLLOWS the (single) compare/update ext word, so op+1 is NOT the
+        // EA ext -> pass eaW=0 (brief framing; full-format CAS EA is out of scope and
+        // would mis-frame, but the in-scope memory-alterable EAs (An/(d16,An)/(d8,An,Xn)/
+        // (xxx).W/.L) all fit the brief lengths). CAS2 `...111100` is a FIXED 3-word
+        // instruction (opword + 2 ext) — no EA. (Disjoint from CMP2/CHK2: that needs
+        // op[11]=0; CAS needs op[11]=1.)
+        val isCasFamily = (op(15 downto 11) === B"00001") && !bit8 &&
+                          (op(7 downto 6) === B"11") && (op(10 downto 9) =/= B"00")
+        val isCas2Pre   = op(5 downto 0) === B"111100"
+        when(isCasFamily) {
+          when(isCas2Pre) {
+            r.simple := True; r.lenWords := U(3, 3 bits)        // opword + 2 ext words
+          } otherwise {
+            // memory-alterable EA only ((An)/(d16,An)/(d8,An,Xn)/(xxx).W/.L); reject
+            // Dn/An/(An)+/-(An)/PC-rel/#imm -> stays COMPLEX (decode illegalises it).
+            val casOk = (mode === U(2, 3 bits)) || (mode === U(5, 3 bits)) ||
+                        (mode === U(6, 3 bits)) ||
+                        ((mode === U(7, 3 bits)) && ((reg === U(0, 3 bits)) || (reg === U(1, 3 bits))))
+            val (ok, e) = eaExt(mode, reg, sizeL = False, allowImm = false, eaW = B(0, 16 bits))
+            when(ok && casOk) {
+              r.simple   := True
+              r.lenWords := (U(2, 3 bits) + e).resized          // opword + 1 ext + EA ext
+            }
+          }
+        }
       }
 
       // MOVE.B / MOVE.L / MOVE.W
