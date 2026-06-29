@@ -65,6 +65,10 @@ object Microcode {
   case object SCas2Du2    extends Sel
   case object SCas2Da1    extends Sel   // selImm: bit0 = ext1[15] (BIT_1F, the Rn1 D/A bit)
   case object SCas2Da2    extends Sel   // selImm: bit0 = ext2[15] (BIT_F,  the Rn2 D/A bit)
+  // ── MOVES selectors ──────────────────────────────────────────────────────────
+  case object SMovesRn    extends Sel   // (movesRn, True) — the moved register Rn = REG_DA[ext15:12] (0..15)
+  case object SMovesAn    extends Sel   // (eaBase An, casAutoMode =/= NONE) — the (An)+/-(An) write-back target
+  case object SMovesDelta extends Sel   // selImm: the SIGNED An delta (+size POSTINC / -size PREDEC / 0)
 
   /** The op kind of a descriptor's template. */
   sealed trait UOp
@@ -80,6 +84,10 @@ object Microcode {
   //    DecOp.CASOP and the ALU EU runs the compare/merge/select datapath. ──────────────
   case class UCasOp(form: Int, writesNzvc: Boolean = false, readsNzvc: Boolean = false,
                     dropCommit: Boolean = false) extends UOp
+  // MOVES read writeback: MOVE T0 -> Rn. An (ext15=1): sign-extend.sz(T0) to 32 (isMovea
+  // path, extended to .B). Dn (ext15=0): size-merge.sz(Dn, T0) (read Rn as srcA = the merge
+  // source). The An-vs-Dn choice + isMovea is resolved from ctx.movesRnIsA. NO CCR write.
+  case object UMovesRead extends UOp
 
   /** Memory role. */
   sealed trait Mem
@@ -128,6 +136,9 @@ object Microcode {
       miPtrIndex:  Boolean = false,  // UMiPtrLoad: add the PRE-index (eaIndex) to the pointer addr
       miHostIndex: Boolean = false,  // UMiHostMove LS row: add the POST-index (eaIndex) to (T0+od)
       miMoveFlags: Boolean = false,  // UMiHostMove: this IS the host MOVE (sets NZVC per ctx.miWNzvc)
+      keepCommit:  Boolean = false,  // force-keep the macro commit (a no-flags store that IS the
+                                     // single oracle step, e.g. the MOVES write store) — overrides
+                                     // the EaAutoDrop / RMW-store DROP in the whitebox
       isFirst: Boolean = false,   // firstOfInstr (the macro boundary)
       isLast:  Boolean = false    // releases `fed`
   )
@@ -304,7 +315,38 @@ object Microcode {
     Desc(UCasOp(CasForm.CAS2SEL), srcA = ST0, srcB = SCas2Du1, srcC = ST2, dst = ST0),  // µPC41 (d6)
     Desc(UCasOp(CasForm.CAS2SEL), srcA = ST1, srcB = SCas2Du2, srcC = ST2, dst = ST1),  // µPC42 (d7)
     Desc(UMove, mem = MStore, srcA = SCas2Rn1, srcB = ST0),                    // µPC43 (d8)
-    Desc(UMove, mem = MStore, srcA = SCas2Rn2, srcB = ST1, isLast = true)      // µPC44 (d9)
+    Desc(UMove, mem = MStore, srcA = SCas2Rn2, srcB = ST1, isLast = true),     // µPC44 (d9)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // MOVES .B/.W/.L (010+ PRIVILEGED move to/from alternate address space). The access
+    // is FLAT (Musashi `(void)fc` — the FC is stored in SFC/DFC but never redirects address
+    // space), so functionally it is a normal sized MOVE + the EA auto-inc/dec side effect +
+    // a privilege trap. The EA (memory-alterable, incl (An)+/-(An)) rides the shared
+    // eaBase/eaDispLo/eaIndex group; the CAS auto EA machinery (eaAuto from ctx) carries the
+    // (An)+/-(An) single side effect. Privilege: the FIRST µop carries needsSupervisor (set
+    // in resolve from ctx) -> the ROB delivers a vector-8 if committed S==0 (op does NOT
+    // execute). NO CCR effect (the UMove / UMovesRead rows write no flags).
+    //
+    // WRITE form (dr=1) @ MOVES_WRITE_ENTRY=45 — 1 µop:
+    //   w0 STORE.sz Rn -> (ea)   (eaAuto An write-back rides the store, like CAS store —
+    //        AEaCasStore writes dst=eaBase An iff casAutoMode =/= NONE, single side effect)
+    Desc(UMove, mem = MStore, auto = AEaCasStore, srcA = SEaBase, srcB = SMovesRn,
+         useImm = true, imm = SEaDispLo, indexFromEa = true, keepCommit = true,
+         isFirst = true, isLast = true),                                       // µPC45 (w0)
+
+    // READ form (dr=0) @ MOVES_READ_ENTRY=46 — 2 or 3 µops:
+    //   r0 LOAD.sz (ea) -> T0  (eaAuto from ctx for the address calc; the load does NOT
+    //        write An — its dst is T0. For PREDEC addr=An-delta; POSTINC addr=An.)
+    //   r1 MOVE T0 -> Rn (UMovesRead): An sign-ext.sz / Dn size-merge.sz; NO CCR.
+    //   r2 ADD An + signedDelta -> An  (the (An)+/-(An) write-back; a DROPPED crack µop,
+    //        like the BCD/MOVEM An update. signedDelta = +size (POSTINC) / -size (PREDEC) /
+    //        0 (no auto -> an identity An:=An+0 NOP, harmless). isLast.) The An side effect
+    //        thus happens EXACTLY ONCE (matching Musashi M68KMAKE_GET_EA_AY).
+    Desc(UMove, mem = MLoad, auto = AEaCasLoad, srcA = SEaBase, dst = ST0, useImm = true,
+         imm = SEaDispLo, indexFromEa = true, isFirst = true),                 // µPC46 (r0)
+    Desc(UMovesRead, srcA = SMovesRn, srcB = ST0, dst = SMovesRn),             // µPC47 (r1)
+    Desc(UAddDrop, srcA = SMovesAn, dst = SMovesAn, useImm = true, imm = SMovesDelta,
+         isLast = true)                                                        // µPC48 (r2)
   )
   val BF_RMW_4B_ENTRY = 6
   val BF_RMW_5B_ENTRY = 9
@@ -315,6 +357,8 @@ object Microcode {
   val MI_FLAGS_ENTRY    = 28   // rows 28,29,30 (ptr-load, host-load->T1, op flags-only)
   val CAS_ENTRY         = 31   // rows 31..34 (load, CASS, CASC, store)
   val CAS2_ENTRY        = 35   // rows 35..44 (load×2, CAS2C1/C2, DC1/DC2, SEL×2, store×2)
+  val MOVES_WRITE_ENTRY = 45   // row 45      (store Rn -> (ea), eaAuto An write-back, keepCommit)
+  val MOVES_READ_ENTRY  = 46   // rows 46..48 (load -> T0, MOVE T0->Rn sign-ext/merge, An update)
   def romSize: Int = rom.size
 
   /** Latched-instruction CONTEXT the engine resolves selectors against. v1 fields
@@ -377,6 +421,16 @@ object Microcode {
     val cas2Dc1      = UInt(5 bits); val cas2Du1 = UInt(5 bits)
     val cas2Dc2      = UInt(5 bits); val cas2Du2 = UInt(5 bits)
     val cas2Da1      = Bool();       val cas2Da2 = Bool()   // ext1[15] / ext2[15] (sign-ext rule)
+    // ── MOVES group (populated at ucBegin from the ext word + EaDecoder) ────────────────
+    // The EA rides the shared eaBase/eaDispLo/eaIndex + casAutoMode/casAutoDelta group
+    // (reusing the CAS auto machinery for (An)+/-(An)). movesRn = REG_DA[ext15:12] (0..15,
+    // the moved register); movesRnIsA = ext[15] (1=An -> sign-extend on read; 0=Dn -> merge).
+    val movesRn      = UInt(5 bits)      // REG_DA[ext15:12] (0..15)
+    val movesRnIsA   = Bool()            // ext[15] (1=An sign-ext, 0=Dn merge) on a READ
+    val movesDelta   = Bits(32 bits)     // signed An write-back delta (+size POSTINC / -size PREDEC / 0)
+    // needsSupervisor: set True for the MOVES first µop (the privilege trap; ROB vector-8 if
+    // committed S==0). Default False (every other microcode customer is unprivileged).
+    val needsSup     = Bool()
   }
 
   // ── selector → (regId, valid) ──────────────────────────────────────────────
@@ -400,6 +454,10 @@ object Microcode {
     case SCas2Du1 => (ctx.cas2Du1, True)
     case SCas2Dc2 => (ctx.cas2Dc2, True)
     case SCas2Du2 => (ctx.cas2Du2, True)
+    case SMovesRn => (ctx.movesRn, True)
+    // The (An)+/-(An) write-back target: the base An, valid ONLY when an auto mode is set
+    // (a non-auto / abs EA -> the r2 ADD writes no reg, an inert NOP).
+    case SMovesAn => (ctx.eaBase, ctx.casAutoMode =/= EaAuto.NONE)
     case _       => (U(0, 5 bits), False)
   }
 
@@ -424,6 +482,7 @@ object Microcode {
     case SMiImm      => ctx.miHostImm
     case SCas2Da1    => ctx.cas2Da1.asBits.resize(32)   // bit0 = ext1[15] (BIT_1F)
     case SCas2Da2    => ctx.cas2Da2.asBits.resize(32)   // bit0 = ext2[15] (BIT_F)
+    case SMovesDelta => ctx.movesDelta                  // signed An write-back delta
     case _           => B(0, 32 bits)
   }
 
@@ -461,6 +520,7 @@ object Microcode {
       case UMiPtrLoad  => u.op := DecOp.MOVE
       case UMiHostMove => u.op := DecOp.MOVE
       case UMiHostOp   => u.op := ctx.miOp
+      case UMovesRead  => u.op := DecOp.MOVE   // MOVE T0 -> Rn (sign-ext An / merge Dn in EU)
       case _: UCasOp   => u.op := DecOp.CASOP
     }
     u.cluster := (d.uop match {
@@ -468,6 +528,7 @@ object Microcode {
       // The §7 host ALU/unary ops (MOVE/ADD/SUB/AND/OR/EOR/CMP/CLR/NEG/NEGX/NOT/TST) all run
       // on the INT (ALU) pipe; CPLX/CHK/DIV are not full-format mem-indirect hosts in scope.
       case UMiHostOp => Cluster.INT
+      case UMovesRead => Cluster.INT         // the MOVES read writeback runs on the ALU pipe
       case _: UCasOp => Cluster.INT          // CAS/CAS2 compute runs on the ALU pipe
       case _         => (d.mem match { case MNone => Cluster.INT; case _ => Cluster.LS })
     })
@@ -580,7 +641,11 @@ object Microcode {
     // Bit-field RMW compute (UBfMem): op=BITFIELD + bfMem (so the ALU EU funnel datapath
     // runs) + bfOp (CHG/CLR/SET/INS) from the latched ctx.op + the store-form selector. The
     // funnel reads bitOff/needHi/width/origOff from the packed bfImm (= u.imm, set above).
-    u.bitOp := 0; u.bfDynamic := False; u.extByte := False; u.isMovea := False
+    // isMovea: a MOVES READ writeback to an An (ctx.movesRnIsA) sign-extends the loaded
+    // value to 32 (the moveaResult path, extended to .B for MOVES). A Dn read leaves it
+    // False -> the generic size-merge preserves the upper bits. Default False for all others.
+    u.bitOp := 0; u.bfDynamic := False; u.extByte := False
+    u.isMovea := (if (d.uop == UMovesRead) ctx.movesRnIsA else False)
     d.uop match {
       case UBfMem =>
         u.bfMem       := True
@@ -600,7 +665,12 @@ object Microcode {
     } else {
       u.indexLong := False; u.indexScale := 0
     }
-    u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+    // needsSupervisor: set on the FIRST µop of a MOVES (ctx.needsSup) — the ROB delivers a
+    // vector-8 privilege violation if the head retires with committed S==0 (the op does NOT
+    // execute). keepCommit: a ROM row may force-keep its commit (the MOVES write store).
+    u.leaAddr := False; u.fromCcr := False; u.fromSr := False
+    u.needsSupervisor := ctx.needsSup && Bool(d.isFirst)
+    u.keepCommit := Bool(d.keepCommit)
     // µcode µops are never commit-time system ops (the system ops ride the fast
     // op-µop builder + the ROB serializing path, not the ROM). Default inert.
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False

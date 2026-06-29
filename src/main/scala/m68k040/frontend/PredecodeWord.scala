@@ -214,6 +214,23 @@ object PredecodeWord {
             }
           }
         }
+        // ── MOVES (010+ PRIVILEGED) `0000 1110 ss mmm rrr` + 1 ext + EA ext ────
+        // op[15:8]=0x0E, op[7:6]=ss in {00,01,10} (11 is CAS). The EA ext FOLLOWS the
+        // (single) dr/A-D/reg ext word, so op+1 is NOT the EA ext -> pass eaW=0 (brief
+        // framing; the in-scope memory-alterable EAs all fit the brief lengths). len =
+        // opword + 1 ext + EA ext. (An)+/-(An) carry 0 EA ext (like (An)). Reject
+        // Dn/An/PC-rel/#imm -> stays COMPLEX (decode illegalises it). Same EA mask as CAS.
+        val isMovesFamily = (op(15 downto 8) === B"00001110") && (op(7 downto 6) =/= B"11")
+        when(isMovesFamily) {
+          val movesOk = (mode === U(2, 3 bits)) || (mode === U(3, 3 bits)) || (mode === U(4, 3 bits)) ||
+                        (mode === U(5, 3 bits)) || (mode === U(6, 3 bits)) ||
+                        ((mode === U(7, 3 bits)) && ((reg === U(0, 3 bits)) || (reg === U(1, 3 bits))))
+          val (ok, e) = eaExt(mode, reg, sizeL = False, allowImm = false, eaW = B(0, 16 bits))
+          when(ok && movesOk) {
+            r.simple   := True
+            r.lenWords := (U(2, 3 bits) + e).resized            // opword + 1 ext + EA ext
+          }
+        }
       }
 
       // MOVE.B / MOVE.L / MOVE.W

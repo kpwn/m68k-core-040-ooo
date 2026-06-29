@@ -90,7 +90,14 @@ object DecOp extends SpinalEnum {
       // match predicate `eq = (loaded.sz == Dc.sz)` for the always-store mux + the Dc
       // merge. NO conditional store (the engine always stores the mux'd value; see the
       // CAS/CAS2 design spec §6). Default-inert for every non-CAS µop.
-      CASOP = newElement()
+      CASOP,
+      // MOVES (010+ PRIVILEGED move to/from alternate address space). The whole
+      // instruction is cracked through the v2 microcode engine; this is just the
+      // OperationDecoder marker (the engine picks the WRITE vs READ µop chain from the
+      // ext-word dr bit in DecodeStage.ucBegin). The access is FLAT (Musashi `(void)fc`),
+      // so the data movement is byte-identical to a normal sized MOVE + the An side effect.
+      // Privileged: the first µop carries needsSupervisor (ROB vector-8 if committed S==0).
+      MOVES = newElement()
 }
 
 /** Commit-time privileged-system-op kind (DecodedUop.sysOp / .sysKind). Selects how

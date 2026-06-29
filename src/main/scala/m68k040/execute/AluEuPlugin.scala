@@ -369,11 +369,14 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
       Size.BYTE -> (s1Src1(31 downto 8)  ## opResult(7 downto 0)),
       Size.WORD -> (s1Src1(31 downto 16) ## opResult(15 downto 0)),
       Size.LONG -> opResult)
-    // MOVEA (MOVE to An): An is ALWAYS written full-32 — NO partial merge. The .W form
-    // SIGN-EXTENDS the 16-bit source (the MOVE source is src2); .L writes it whole.
-    // (MOVEA never reaches a .B form — byte MOVEA is illegal in the ISA.)
-    val moveaResult = Mux(u1.size === Size.WORD,
-      s1Src2(15 downto 0).asSInt.resize(32).asBits, s1Src2)
+    // MOVEA (MOVE to An): An is ALWAYS written full-32 — NO partial merge. The source
+    // (src2) is SIGN-EXTENDED to 32 from the op size. Normal MOVEA reaches only .W/.L
+    // (byte MOVEA is illegal in the ISA); the MOVES read-to-An form (which reuses isMovea)
+    // ALSO reaches .B -> add the BYTE sign-extend (Musashi MAKE_INT_8). .L writes whole.
+    val moveaResult = u1.size.mux(
+      Size.BYTE -> s1Src2(7 downto 0).asSInt.resize(32).asBits,
+      Size.WORD -> s1Src2(15 downto 0).asSInt.resize(32).asBits,
+      Size.LONG -> s1Src2)
     // ── MOVE from CCR / from SR int result (fromCcr / fromSr) ───────────────────
     // fromCcr: zero-extended CCR byte {0..0, X,N,Z,V,C} (CCR layout X=4,N=3,Z=2,V=1,C=0).
     // fromSr : zero-extended 16-bit SR = {srSys(8), 0,0,0, X,N,Z,V,C}. The op is .W so the

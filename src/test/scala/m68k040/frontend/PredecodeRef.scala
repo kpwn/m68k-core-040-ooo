@@ -114,6 +114,17 @@ object PredecodeRef {
               case _                => COMPLEX
             }
           }
+        } else if (((op >> 8) & 0xff) == 0x0e && ((op >> 6) & 3) != 3) {
+          // MOVES (010+ PRIVILEGED) `0000 1110 ss mmm rrr` + 1 ext + EA ext: op[15:8]=0x0E,
+          // op[7:6]=ss in {00,01,10} (11 is CAS). len = opword + 1 ext + EA ext. Memory-
+          // ALTERABLE EA (SAME mask as CAS): (An)=2,(An)+=3,-(An)=4,(d16,An)=5,(d8,An,Xn)=6,
+          // (xxx).W/.L=7/0,1. Reject Dn/An/PC-rel/#imm -> COMPLEX (decode illegalises it).
+          val movesOk = mode == 2 || mode == 3 || mode == 4 || mode == 5 || mode == 6 ||
+                        (mode == 7 && (reg == 0 || reg == 1))
+          eaExt(mode, reg, sizeL = false, allowImm = false) match {
+            case Some(e) if movesOk => CP(simple = true, lenWords = 2 + e)  // opword + 1 ext + EA ext
+            case _                  => COMPLEX
+          }
         } else COMPLEX
       case 0x1 | 0x2 | 0x3 =>
         val sizeL   = cls == 0x2

@@ -619,17 +619,24 @@ class ExceptionUnit(
           when(sysCapReadDir) {                     // Rc -> Rn : read the committed reg
             sysRegWriteValid := True
             sysRegWritePhys  := sysCapDstPhys
-            // Rc id: VBR=0x801, USP=0x800, CACR=0x002 (RAZ), SFC=0x000/DFC=0x001 (RAZ).
+            // Rc id: VBR=0x801, USP=0x800, SFC=0x000, DFC=0x001 (3-bit, zero-extended),
+            // CACR=0x002 (RAZ). SFC/DFC are real 3-bit committed regs (Musashi reads them
+            // zero-extended; round-trips with the write below).
             sysRegWriteData  := sysCapRc.mux(
               U(0x801, 12 bits) -> ss.vbr,
               U(0x800, 12 bits) -> ss.usp,
-              default           -> U(0, 32 bits))   // CACR/SFC/DFC/other -> RAZ (read 0)
+              U(0x000, 12 bits) -> ss.sfc.resize(32),
+              U(0x001, 12 bits) -> ss.dfc.resize(32),
+              default           -> U(0, 32 bits))   // CACR/other -> RAZ (read 0)
           } otherwise {                             // Rn -> Rc : write the committed reg
             switch(sysCapRc) {
               is(U(0x801, 12 bits)) { ss.setVbr.valid := True; ss.setVbr.payload := sysCapVal.asUInt }
               is(U(0x800, 12 bits)) { ss.setUsp.valid := True; ss.setUsp.payload := sysCapVal.asUInt }
-              // CACR (0x002) / SFC (0x000) / DFC (0x001) / other: WI (write-ignored,
-              // RAZ-WI — this core has no cache-enable / alt-space access path).
+              // SFC/DFC: write the low 3 bits (Musashi masks `& 7`); upper bits ignored.
+              is(U(0x000, 12 bits)) { ss.setSfc.valid := True; ss.setSfc.payload := sysCapVal(2 downto 0).asUInt }
+              is(U(0x001, 12 bits)) { ss.setDfc.valid := True; ss.setDfc.payload := sysCapVal(2 downto 0).asUInt }
+              // CACR (0x002) / other: WI (write-ignored, RAZ-WI — this core has no
+              // cache-enable path).
             }
           }
         }

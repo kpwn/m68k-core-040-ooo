@@ -189,9 +189,16 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     iq.lsNzvcWakeup.valid   := lsEu.wakeupNzvc.valid
     iq.lsNzvcWakeup.payload := lsEu.wakeupNzvc.payload
     // ROB retire (slot 0) -> SQ commit; doFlush -> SQ flush (squash speculative).
+    // ALSO squash speculative SQ entries with a ONE-CYCLE pulse at exception ENTRY (the
+    // rising edge of excActive): a privilege-trapped / faulted STORE-form op (e.g. MOVES
+    // write in user mode) leaves an UNCOMMITTED store in the SQ; the exc FSM's E_DRAIN waits
+    // for sqDrained, which would deadlock on that orphan. The flush KEEPS committed entries
+    // (only speculative ones squash). It MUST be a single-cycle pulse: a HELD flush gates
+    // `headReady` (drain), blocking committed stores from draining into the handler frame.
     lsEu.sqCommit.valid   := rob.logic.retire0
     lsEu.sqCommit.payload := rob.logic.h0
-    lsEu.sqFlush          := doFlush
+    val excEnteringSq = rob.logic.excActive && !RegNext(rob.logic.excActive, init = False)
+    lsEu.sqFlush          := doFlush || excEnteringSq
 
     // ── DTLB U/M deferred-write queue wiring ──
     // The walk tags its U/M descriptor write with the LS EU's in-flight access
