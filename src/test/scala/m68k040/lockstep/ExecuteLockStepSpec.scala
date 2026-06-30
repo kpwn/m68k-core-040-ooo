@@ -1382,6 +1382,36 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #5,%d2",  "moveq #30,%d3", "bftst (%a0){%d2:%d3}"       // SPILL
     )).mkString(" ; "))
   }
+  // ── RMW DYNAMIC (BFCHG/BFCLR/BFSET) — modify mem then read back THROUGH memory + checkMem.
+  // NZ from the ORIGINAL field; X untouched. Small/large/NEGATIVE offset, spill, width 0->32.
+  test("lock-step: BFSET mem DYNAMIC off/wd/both (read-back, neg offset, spill)", VerilatorTest) {
+    runLockStep("bf3c-set", (bfDynSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "moveq #0,%d2",  "moveq #16,%d3", "bfset (%a0){%d2:%d3}",      // both dyn: set top 16 of 0x9ABCDEF0
+      "moveq #8,%d2",  "moveq #8,%d3",  "bfset (%a0){%d2:%d3}",      // off8 wd8
+      "moveq #-8,%d2", "moveq #8,%d3",  "bfset (%a0){%d2:%d3}",      // NEG -> byteBase 0x3003
+      "moveq #5,%d2",  "moveq #30,%d3", "bfset (%a0){%d2:%d3}",      // SPILL (5-byte store)
+      "move.l (%a0),%d4", "move.l -4(%a0),%d5", "move.l 4(%a0),%d6"  // read modified longs
+    )).mkString(" ; "), checkMem = Seq(0x3000L, 0x3004L, 0x3008L), checkSpan = 4)
+  }
+  test("lock-step: BFCLR mem DYNAMIC off/wd/both (read-back, neg offset, spill)", VerilatorTest) {
+    runLockStep("bf3c-clr", (bfDynSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "moveq #4,%d2",  "moveq #12,%d3", "bfclr (%a0){%d2:%d3}",      // bitOff4 wd12
+      "moveq #0,%d2",  "moveq #0,%d3",  "bfclr (%a0){%d2:%d3}",      // dyn wd=0 -> 32
+      "moveq #-1,%d2", "moveq #8,%d3",  "bfclr (%a0){%d2:%d3}",      // NEG off-1 bitOff7
+      "move.l (%a0),%d4", "move.l -4(%a0),%d5"
+    )).mkString(" ; "), checkMem = Seq(0x3000L, 0x3004L), checkSpan = 4)
+  }
+  test("lock-step: BFCHG mem DYNAMIC off/wd/both (read-back, width 1/8/32)", VerilatorTest) {
+    runLockStep("bf3c-chg", (bfDynSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "moveq #0,%d2",  "moveq #1,%d3",  "bfchg (%a0){%d2:%d3}",      // flip MSB
+      "moveq #3,%d2",  "moveq #8,%d3",  "bfchg (%a0){%d2:%d3}",      // 8-bit at bitOff3
+      "moveq #7,%d2",  "moveq #28,%d3", "bfchg (%a0){%d2:%d3}",      // SPILL bitOff7 wd28
+      "move.l (%a0),%d4", "move.l 4(%a0),%d5"
+    )).mkString(" ; "), checkMem = Seq(0x3000L, 0x3004L), checkSpan = 4)
+  }
 
   // ════════════════════════════════════════════════════════════════════════════
   // Bit-field MEMORY RMW forms (BFCHG/BFCLR/BFSET/BFINS <ea>) — slice 3b. RMW then

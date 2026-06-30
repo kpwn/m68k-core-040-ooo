@@ -530,7 +530,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // microcoded op immediately FOLLOWED by another microcoded/MOVEM op in the SAME fetch
     // group is the untested edge — the slot1 stash carries a NORMAL slot1 (the tested
     // programs put a normal instr / NOP after each X-mem op).
-    val ucPc     = Reg(UInt(6 bits))   // µPC into the ROM (romSize 45 -> needs 6 bits)
+    val ucPc     = Reg(UInt(7 bits))   // µPC into the ROM (romSize 87 with 3c dyn-mem -> needs 7 bits)
     val ucCtx    = Reg(Microcode.Ctx())
     when(pipeFlush) { ucActive := False }
 
@@ -808,13 +808,22 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       Mux(ucBfEntOp === 5, U(Microcode.BF_DYN_FFO_DO1_ENTRY, ew bits),
                            U(Microcode.BF_DYN_RD_DO1_ENTRY,  ew bits)),
       U(Microcode.BF_DYN_RD_DO0_ENTRY, ew bits))
+    // Bit-field RMW DYNAMIC (slice 3c): BFCHG(2)/BFCLR(4)/BFSET(6) with Do||Dw -> the dynamic
+    // RMW entry (Do=1 recomputes byteBase; Do=0 folds). BFINS(7) dynamic is DEFERRED -> a
+    // vector-4 ILLEGAL entry (the prefunnel+register-form path hits the X-preservation bug).
+    val ucBfRmwOp   = ucEntryPkt.words(0)(10 downto 8)
+    val ucIsBfRmwDyn = ucIsBfRmw && (ucBfDo || ucBfDw)
+    val ucBfRmwDynEntry = Mux(ucBfRmwOp === 7, U(Microcode.BF_DYN_ILLEGAL_ENTRY, ew bits),
+      Mux(ucBfDo, U(Microcode.BF_DYN_RMW_DO1_ENTRY, ew bits),
+                  U(Microcode.BF_DYN_RMW_DO0_ENTRY, ew bits)))
     val ucRealEntry = Mux(ucIsMemInd, ucMiEntry,
       Mux(ucIsBfDynRd, ucBfDynRdEntry,
+      Mux(ucIsBfRmwDyn, ucBfRmwDynEntry,
       Mux(ucIsBfRmw,
         Mux(ucBfNeedHi, U(Microcode.BF_RMW_5B_ENTRY, ew bits),
                         U(Microcode.BF_RMW_4B_ENTRY, ew bits)),
       Mux(ucIsMoves, ucMovesEntry,
-        ucEntrySpec.ucEntry))))
+        ucEntrySpec.ucEntry)))))
 
     // Resolve every ROM row against the LATCHED ctx, then index by ucPc -> this cycle's
     // µop (the ROM is a compile-time Scala Vector; resolve each row to hardware + mux).

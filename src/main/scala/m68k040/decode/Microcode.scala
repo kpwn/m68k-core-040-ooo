@@ -151,6 +151,7 @@ object Microcode {
       bfDrop:      Boolean = false,  // divIsRem: DROP this µop's oracle-step observation (its reg/NZVC writes still
                                      // land+fold) — the BFFFO Do=1 funnel writes the index+flags to a temp; the
                                      // trailing ADD is the single committed step carrying Dn2 + the funnel's flags
+      bfIllegal:   Boolean = false,  // deliver an ILLEGAL (vector-4) µop — BFINS mem-dynamic is DEFERRED (gated)
       miPtrIndex:  Boolean = false,  // UMiPtrLoad: add the PRE-index (eaIndex) to the pointer addr
       miHostIndex: Boolean = false,  // UMiHostMove LS row: add the POST-index (eaIndex) to (T0+od)
       miMoveFlags: Boolean = false,  // UMiHostMove: this IS the host MOVE (sets NZVC per ctx.miWNzvc)
@@ -419,11 +420,68 @@ object Microcode {
     Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = ST0, sz = SzLong,
          bfDyn = true, bfTstForm = true),                                      // µPC64 (prefunnel: field32 -> T0)
     Desc(UBfMem, srcA = ST0, srcB = SBfOffReg, srcC = ST2, dst = SBfRdDst, sz = SzLong,
-         bfDyn = true, bfWritesNz = true, bfStoreForm = 6, isLast = true)      // µPC65 (FFOFULL: Dn2 = Dn[off] + index, +NZ)
+         bfDyn = true, bfWritesNz = true, bfStoreForm = 6, isLast = true),     // µPC65 (FFOFULL: Dn2 = Dn[off] + index, +NZ)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Bit-field DYNAMIC offset/width MEMORY RMW (BFCHG/BFCLR/BFSET) — slice 3c. All-bfMem
+    // funnels (RES -> LO5/HI5 -> store), mirroring the 3b 5-byte chain but with the packed
+    // {bitOff/needHi/origOff/rawWidth} from the BFRESOLVE temp (srcC) instead of the static
+    // imm. ALWAYS-5-byte. NZ flags from the ORIGINAL field (the RES compute). BFINS (Dn2
+    // insert) is DEFERRED (its prefunnel+register-form path hits the X-preservation bug).
+
+    // BF_DYN_RMW_DO0 @66 — STATIC offset (Do=0, Dw=1). byteBase folds; LO5/HI5 use imm bitOff.
+    Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
+         imm = SBfResImm, sz = SzLong, isFirst = true),                        // µPC66 (packed -> T2)
+    Desc(UMove, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, indexFromEa = true),                                     // µPC67 (lo -> T0)
+    Desc(UMove, mem = MLoad, srcA = SEaBase, dst = ST1, useImm = true, imm = SEaDispHi,
+         sz = SzByte, indexFromEa = true),                                     // µPC68 (hi -> T1)
+    Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = ST2, sz = SzLong,
+         bfDyn = true, bfWritesNz = true),                                     // µPC69 (RES -> T2; +NZ from orig field)
+    Desc(UBfMem, srcA = ST0, srcB = ST2, dst = ST0, sz = SzLong, bfStoreForm = 2),  // µPC70 (LO5: lo' -> T0, imm bitOff)
+    Desc(UBfMem, srcA = ST1, srcB = ST2, dst = ST1, sz = SzLong, bfStoreForm = 3),  // µPC71 (HI5: hi' -> T1, imm bitOff)
+    Desc(UMove, mem = MStore, srcA = SEaBase, srcB = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, indexFromEa = true),                                     // µPC72 (store lo')
+    Desc(UMove, mem = MStore, srcA = SEaBase, srcB = ST1, useImm = true, imm = SEaDispHi,
+         sz = SzByte, indexFromEa = true, isLast = true),                      // µPC73 (store hi')
+
+    // BF_DYN_RMW_DO1 @74 — DYNAMIC offset (Do=1). byteBase = eaBase + (Dn[off]>>>3) recomputed
+    // for the load + store phases; LO5RAW/HI5RAW read bitOff from Dn[off] (srcC) so `packed`
+    // need not be held (3 temps).
+    Desc(UBfResolve, srcA = SBfOffReg, dst = ST0, useImm = true, imm = SBfDeltaImm,
+         sz = SzLong, isFirst = true),                                         // µPC74 (byteDelta -> T0)
+    Desc(UBfAdd, srcA = SEaBase, srcB = ST0, dst = ST2, sz = SzLong),          // µPC75 (Tb)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, indexFromEa = true),                                     // µPC76 (lo -> T0)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST1, useImm = true, imm = SEaDispHi,
+         sz = SzByte, indexFromEa = true),                                     // µPC77 (hi -> T1)
+    Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
+         imm = SBfResImm, sz = SzLong),                                        // µPC78 (packed -> T2)
+    Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = ST2, sz = SzLong,
+         bfDyn = true, bfWritesNz = true),                                     // µPC79 (RES -> T2; +NZ)
+    Desc(UBfMem, srcA = ST0, srcB = ST2, srcC = SBfOffReg, dst = ST0, sz = SzLong,
+         bfStoreForm = 4),                                                     // µPC80 (LO5RAW: lo' -> T0, bitOff=Dn[off]&7)
+    Desc(UBfMem, srcA = ST1, srcB = ST2, srcC = SBfOffReg, dst = ST1, sz = SzLong,
+         bfStoreForm = 5),                                                     // µPC81 (HI5RAW: hi' -> T1)
+    Desc(UBfResolve, srcA = SBfOffReg, dst = ST2, useImm = true, imm = SBfDeltaImm,
+         sz = SzLong),                                                         // µPC82 (byteDelta -> T2)
+    Desc(UBfAdd, srcA = SEaBase, srcB = ST2, dst = ST2, sz = SzLong),          // µPC83 (Tb recompute)
+    Desc(UMove, mem = MStore, srcA = ST2, srcB = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, indexFromEa = true),                                     // µPC84 (store lo')
+    Desc(UMove, mem = MStore, srcA = ST2, srcB = ST1, useImm = true, imm = SEaDispHi,
+         sz = SzByte, indexFromEa = true, isLast = true),                      // µPC85 (store hi')
+
+    // BF_DYN_ILLEGAL @86 — a single vector-4 ILLEGAL µop. BFINS mem-dynamic routes here
+    // (DEFERRED: its prefunnel+register-form path hits the X-preservation bug). Traps, NOT
+    // silent-wrong.
+    Desc(UMove, bfIllegal = true, isFirst = true, isLast = true)               // µPC86
   )
   val BF_DYN_RD_DO0_ENTRY  = 49
   val BF_DYN_RD_DO1_ENTRY  = 53
   val BF_DYN_FFO_DO1_ENTRY = 59
+  val BF_DYN_RMW_DO0_ENTRY = 66
+  val BF_DYN_RMW_DO1_ENTRY = 74
+  val BF_DYN_ILLEGAL_ENTRY = 86
   val BF_RMW_4B_ENTRY = 6
   val BF_RMW_5B_ENTRY = 9
   val MI_MOVE_SRC_ENTRY = 16   // rows 16,17,18 (ptr-load, host-load->T1, MOVE T1->Dn)
@@ -708,8 +766,9 @@ object Microcode {
     }
     u.isBranch := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
     u.cond := 0; u.branchDisp := 0
-    u.unimplemented := False
-    u.faulted := False; u.faultVector := 0; u.faultUsesNextPc := False
+    // bfIllegal: deliver a vector-4 ILLEGAL (BFINS mem-dynamic is DEFERRED — see RD/FFO X-bug).
+    u.unimplemented := Bool(d.bfIllegal)
+    u.faulted := Bool(d.bfIllegal); u.faultVector := (if (d.bfIllegal) U(4, 8 bits) else U(0, 8 bits)); u.faultUsesNextPc := False
     u.faultAddr := ctx.pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
     u.divSigned := False; u.div64 := False
     // The two An write-back ADDs are DROPPED crack µops (divIsRem): the commit
