@@ -1792,8 +1792,13 @@ object MicroOpAssembler {
       u.firstOfInstr := False
       u
     }
-    // A bit-field memory op with a non-control EA -> illegal (vector 4).
-    val bfmBad = isBfMemSpec && !bfmEaOk
+    // A bit-field memory op with a non-control EA -> illegal (vector 4). DYNAMIC read-only mem
+    // (Do||Dw, slice 3c) that REACHES the 3a crack is gated illegal here: the supported dynamic
+    // read-only ops (BFTST/BFEXTU/BFEXTS) are routed to the µcode engine (slot0IsBfDynMem) and
+    // their 3a output is DISCARDED, so this is harmless for them; BFFFO dynamic-mem is NOT routed
+    // (deferred — a slow-pipe prefunnel→flag-writer X-preservation interaction) so it traps here
+    // rather than mis-cracking as static. (The static read-only mem forms keep the 3a crack.)
+    val bfmBad = isBfMemSpec && (!bfmEaOk || bfDo || bfDw)
     when(bfmBad) {
       opUop.op            := DecOp.ILLEGAL
       opUop.cluster       := Cluster.INT

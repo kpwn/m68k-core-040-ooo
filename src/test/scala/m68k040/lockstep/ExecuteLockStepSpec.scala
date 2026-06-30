@@ -1323,6 +1323,67 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  // Bit-field DYNAMIC offset/width MEMORY read-only forms (slice 3c). Dn-sourced
+  // offset (Do=ext[11]) and/or width (Dw=ext[5]). byteBase = eaBase + (offsetDn >>>signed 3);
+  // bitOff = offsetDn & 7; width = ((widthDn-1)&31)+1 (0->32). ALWAYS-5-byte (spill) span.
+  // Verified step-for-step vs Musashi (Dn2 + N/Z, X untouched). A0 = 0x3004 (mid-buffer) so
+  // NEGATIVE offsets stay in seeded memory. mem: 3000=12 34 56 78  3004=9A BC DE F0  3008=0F 1E 2D 3C
+  // ════════════════════════════════════════════════════════════════════════════
+  val bfDynSeed = Seq(
+    "move.l #0x3000,%a0",
+    "move.l #0x12345678,%d0", "move.l %d0,(%a0)",
+    "move.l #0x9abcdef0,%d0", "move.l %d0,4(%a0)",
+    "move.l #0x0f1e2d3c,%d0", "move.l %d0,8(%a0)",
+    "move.l #0x3004,%a0"
+  )
+  test("lock-step: BFEXTU mem DYNAMIC off/wd/both (small/large/neg offset, spill, wd32)", VerilatorTest) {
+    runLockStep("bf3c-extu", (bfDynSeed ++ Seq(
+      "ori #0x10,%ccr",                                            // X=1 sentinel (X untouched)
+      "moveq #0,%d2",  "moveq #16,%d3", "bfextu (%a0){%d2:%d3},%d1", // both dyn: off0 wd16 -> 0x9ABC
+      "moveq #8,%d2",  "moveq #8,%d3",  "bfextu (%a0){%d2:%d3},%d4", // off8 wd8 -> 0xBC
+      "moveq #4,%d2",  "bfextu (%a0){%d2:#12},%d5",                 // dyn OFF only: bitOff4 wd12
+      "moveq #16,%d2", "moveq #16,%d3", "bfextu (%a0){%d2:%d3},%d6", // off16 -> byteBase+2 -> 0xDEF0
+      "moveq #-8,%d2", "moveq #8,%d3",  "bfextu (%a0){%d2:%d3},%d7", // NEG off-8 -> byteBase-1 bitOff0 -> 0x78
+      "moveq #-1,%d2", "bfextu (%a0){%d2:#8},%d0",                  // NEG off-1 -> byteBase-1 bitOff7
+      "moveq #0,%d3",  "bfextu (%a0){#0:%d3},%d1",                  // dyn WD only: wd Dn=0 -> 32 -> 0x9ABCDEF0
+      "moveq #6,%d2",  "moveq #30,%d3", "bfextu (%a0){%d2:%d3},%d4" // SPILL: bitOff6 wd30 -> 5-byte span
+    )).mkString(" ; "))
+  }
+  test("lock-step: BFEXTS mem DYNAMIC off/wd/both (sign-extend, neg offset, spill)", VerilatorTest) {
+    runLockStep("bf3c-exts", (bfDynSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "moveq #0,%d2",  "moveq #8,%d3",  "bfexts (%a0){%d2:%d3},%d1", // 0x9A top bit 1 -> sign-ext 0xFFFFFF9A
+      "moveq #8,%d2",  "bfexts (%a0){%d2:#4},%d4",                   // 0xB -> top bit 1 -> 0xFFFFFFFB
+      "moveq #-8,%d2", "moveq #8,%d3",  "bfexts (%a0){%d2:%d3},%d5", // NEG -> byte 0x78 top bit 0 -> +0x78
+      "moveq #7,%d2",  "moveq #28,%d3", "bfexts (%a0){%d2:%d3},%d6"  // SPILL spanning bytes
+    )).mkString(" ; "))
+  }
+  // DEFERRED (slice 3c): BFFFO mem-dynamic needs a prefunnel (4-input: lo/hi/packed/offset) then
+  // a flag-writing funnel. That prefunnel→flag-writer slow-pipe pattern triggers an X-preservation
+  // bug (X cleared though no µop writes X) not yet root-caused; BFFFO dynamic-mem is gated ILLEGAL
+  // (traps, NOT silent-wrong) until fixed. The single-op path is byte-correct; the failure is only
+  // when an instruction follows. Re-enable (remove the bfOp=5 routing exclusion) once fixed.
+  ignore("lock-step: BFFFO mem DYNAMIC off/wd/both (offset+index, neg offset, all-zero) [DEFERRED]") {
+    runLockStep("bf3c-ffo", (bfDynSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "moveq #0,%d2",  "moveq #8,%d3",  "bfffo (%a0){%d2:%d3},%d1", // 0x9A=1001_1010 -> 0 lz -> off0+0=0
+      "moveq #8,%d2",  "moveq #8,%d3",  "bfffo (%a0){%d2:%d3},%d4",  // 0xBC=1011_1100 -> off8+0=8
+      "moveq #1,%d2",  "bfffo (%a0){%d2:#8},%d5",                    // dyn off only -> off1 + index
+      "moveq #-8,%d2", "moveq #8,%d3",  "bfffo (%a0){%d2:%d3},%d6",  // NEG off -> 0x78=0111_1000 -> off-8+1=-7
+      "moveq #16,%d2", "moveq #32,%d3", "bfffo (%a0){%d2:%d3},%d7"   // dyn wd32 over 0xDEF0... -> off16+index
+    )).mkString(" ; "))
+  }
+  test("lock-step: BFTST mem DYNAMIC off/wd/both (flags only, X untouched)", VerilatorTest) {
+    runLockStep("bf3c-tst", (bfDynSeed ++ Seq(
+      "ori #0x10,%ccr",
+      "moveq #0,%d2",  "moveq #1,%d3",  "bftst (%a0){%d2:%d3}",      // MSB of 0x9A = 1 -> N=1
+      "moveq #8,%d2",  "moveq #8,%d3",  "bftst (%a0){%d2:%d3}",      // 0xBC field
+      "moveq #-1,%d2", "bftst (%a0){%d2:#8}",                        // NEG off
+      "moveq #5,%d2",  "moveq #30,%d3", "bftst (%a0){%d2:%d3}"       // SPILL
+    )).mkString(" ; "))
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // Bit-field MEMORY RMW forms (BFCHG/BFCLR/BFSET/BFINS <ea>) — slice 3b. RMW then
   // READ BACK THROUGH MEMORY (a following bfextu/move into a Dn) to catch stored-byte
   // divergence, PLUS checkMem on the modified longs vs Musashi. The flags are from the

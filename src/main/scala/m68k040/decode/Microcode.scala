@@ -69,6 +69,14 @@ object Microcode {
   case object SMovesRn    extends Sel   // (movesRn, True) — the moved register Rn = REG_DA[ext15:12] (0..15)
   case object SMovesAn    extends Sel   // (eaBase An, casAutoMode =/= NONE) — the (An)+/-(An) write-back target
   case object SMovesDelta extends Sel   // selImm: the SIGNED An delta (+size POSTINC / -size PREDEC / 0)
+  // ── Bit-field DYNAMIC memory selectors (slice 3c) ─────────────────────────────
+  case object SBfOffReg   extends Sel   // (bfOffDn, True)   — Dn[off] ALWAYS read (ASR/byteBase + LO5RAW/HI5RAW srcC + FFO add)
+  case object SBfOffDyn   extends Sel   // (bfOffDn, bfDo)   — Dn[off] read iff Do (BFRESOLVE srcA)
+  case object SBfWdDyn    extends Sel   // (bfWdDn,  bfDw)   — Dn[wd]  read iff Dw (BFRESOLVE srcB)
+  case object SBfDn2      extends Sel   // (bfDn2,   True)   — BFINS insert source (register-form prefunnel consumer)
+  case object SBfRdDst    extends Sel   // (bfDn2, bfOp in {1,3,5}) — read-only result reg (EXTU/EXTS/FFO write; TST none)
+  case object SBfResImm   extends Sel   // selImm: the BFRESOLVE imm (Do/Dw/staticOff/staticWidth/memMode)
+  case object SBfDeltaImm extends Sel   // selImm: byte-delta mode bit (imm[13]) — BFRESOLVE outputs offset>>>3
 
   /** The op kind of a descriptor's template. */
   sealed trait UOp
@@ -76,6 +84,11 @@ object Microcode {
   case object UAddDrop   extends UOp    // ADD.L dst:=srcA+imm, divIsRem (dropped An write-back)
   case object UOpFromCtx extends UOp    // the latched op (BCD/ADDX/SUBX), flags from ctx
   case object UBfMem     extends UOp    // BITFIELD bfMem compute (RES/LO/HI funnel form); op=BITFIELD
+  // ── Bit-field DYNAMIC memory kinds (slice 3c) ───────────────────────────────
+  case object UBfResolve extends UOp    // BFRESOLVE (mem layout): packed {origOff/needHi/bitOff/rawWidth} -> temp
+  case object UBfShiftOff extends UOp   // ASR.L Dn[off],#3 -> temp (byteDelta = offset >>>signed 3); NO flags
+  case object UBfAdd     extends UOp    // ADD.L srcA + srcB -> temp; NO flags (byteBase = eaBase + byteDelta / FFO offset add)
+  case object UBfReg     extends UOp    // BITFIELD register-form dynamic (bfMem=False, bfDynamic): BFINS over the prefunnelled field32
   // ── full-format MEMORY-INDIRECT host-op kinds ──────────────────────────────
   case object UMiPtrLoad extends UOp    // LOAD.L pointer (eaBase + eaDispLo (+ pre-index)) -> T0
   case object UMiHostMove extends UOp   // host MOVE load/store at (T0 + od (+post-index)); op=MOVE
@@ -131,8 +144,13 @@ object Microcode {
       sz:     Sz      = SzCtx,    // explicit µop size (SzCtx = ctx.size, the BCD default)
       writesFlags: Boolean = false,  // reads X+old-Z, writes NZVCX (the op µop)
       indexFromEa: Boolean = false,  // LS row: srcC + indexLong/indexScale come from Ctx EA
-      bfStoreForm: Int     = 0,      // UBfMem: 0=RES,1=LO4,2=LO5,3=HI5 (the funnel form)
-      bfWritesNz:  Boolean = false,  // UBfMem: this compute writes the NZ flags (RES / LO4)
+      bfStoreForm: Int     = 0,      // UBfMem: 0=RES,1=LO4,2=LO5,3=HI5,4=LO5RAW,5=HI5RAW (funnel form)
+      bfWritesNz:  Boolean = false,  // UBfMem/UBfReg: this compute writes the NZ flags (RES / LO4 / BFINS)
+      bfDyn:       Boolean = false,  // UBfMem/UBfReg: set bfDynamic (read packed {bitOff/width} via srcC, slice 3c)
+      bfTstForm:   Boolean = false,  // UBfMem: force bfOp=0 (BFTST) — the prefunnel emits field32 as its result
+      bfDrop:      Boolean = false,  // divIsRem: DROP this µop's oracle-step observation (its reg/NZVC writes still
+                                     // land+fold) — the BFFFO Do=1 funnel writes the index+flags to a temp; the
+                                     // trailing ADD is the single committed step carrying Dn2 + the funnel's flags
       miPtrIndex:  Boolean = false,  // UMiPtrLoad: add the PRE-index (eaIndex) to the pointer addr
       miHostIndex: Boolean = false,  // UMiHostMove LS row: add the POST-index (eaIndex) to (T0+od)
       miMoveFlags: Boolean = false,  // UMiHostMove: this IS the host MOVE (sets NZVC per ctx.miWNzvc)
@@ -346,8 +364,66 @@ object Microcode {
          imm = SEaDispLo, indexFromEa = true, isFirst = true),                 // µPC46 (r0)
     Desc(UMovesRead, srcA = SMovesRn, srcB = ST0, dst = SMovesRn),             // µPC47 (r1)
     Desc(UAddDrop, srcA = SMovesAn, dst = SMovesAn, useImm = true, imm = SMovesDelta,
-         isLast = true)                                                        // µPC48 (r2)
+         isLast = true),                                                       // µPC48 (r2)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Bit-field DYNAMIC offset/width MEMORY forms (slice 3c). The dynamic offset/width
+    // come from Dn[off]=ext[8:6] (iff Do=ext[11]) / Dn[wd]=ext[2:0] (iff Dw=ext[5]). A
+    // BFRESOLVE-mem µop packs {origOff[18:14], needHi=1[13], bitOff[12:10], rawWidth[9:5]}
+    // into a temp (T2) the funnel reads via srcC (bfDyn). ALWAYS-5-byte (needHi forced True;
+    // the funnel leaves the spill byte unchanged when the field doesn't reach it). Signed
+    // byteBase: for Do=0 the static offset>>3 folds into eaDispLo (like 3a); for Do=1 the
+    // runtime byteDelta = Dn[off] >>>signed 3 (ASR.L #3) + eaBase -> Tb is recomputed per
+    // access (kept within T0/T1/T2 — NO archDepth bump). All three live temps {lo,hi,packed}
+    // are read by the funnel; the funnel result goes to Dn2 (EXTU/EXTS/FFO) / none (TST).
+
+    // BF_DYN_RD_DO0 @49 — read-only, STATIC offset (Do=0, Dw=1). byteBase folded.
+    //   resolve -> T2 ; load.L lo -> T0 ; load.B hi -> T1 ; funnel -> Dn2/none (+NZ)
+    Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
+         imm = SBfResImm, sz = SzLong, isFirst = true),                        // µPC49
+    Desc(UMove, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, indexFromEa = true),                                     // µPC50
+    Desc(UMove, mem = MLoad, srcA = SEaBase, dst = ST1, useImm = true, imm = SEaDispHi,
+         sz = SzByte, indexFromEa = true),                                     // µPC51
+    Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = SBfRdDst, sz = SzLong,
+         bfDyn = true, bfWritesNz = true, isLast = true),                      // µPC52
+
+    // BF_DYN_RD_DO1 @53 — read-only (NOT FFO), DYNAMIC offset (Do=1). byteBase recomputed.
+    //   ASR Dn[off],#3 -> T0 ; ADD eaBase+T0 -> Tb(T2) ; load.L lo -> T0 ; load.B hi -> T1
+    //   ; resolve -> T2 ; funnel -> Dn2/none (+NZ)
+    Desc(UBfResolve, srcA = SBfOffReg, dst = ST0, useImm = true, imm = SBfDeltaImm,
+         sz = SzLong, isFirst = true),                                       // µPC53
+    Desc(UBfAdd, srcA = SEaBase, srcB = ST0, dst = ST2, sz = SzLong),          // µPC54 (Tb)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, indexFromEa = true),                                     // µPC55
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST1, useImm = true, imm = SEaDispHi,
+         sz = SzByte, indexFromEa = true),                                     // µPC56
+    Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
+         imm = SBfResImm, sz = SzLong),                                        // µPC57
+    Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = SBfRdDst, sz = SzLong,
+         bfDyn = true, bfWritesNz = true, isLast = true),                      // µPC58
+
+    // BF_DYN_FFO_DO1 @59 — BFFFO, DYNAMIC offset (Do=1). One KEPT funnel writes Dn2 + flags:
+    // a prefunnel collapses lo/hi -> field32 (T0), then a register-form FFO over field32 sets
+    // ffoBase = the FULL signed Dn[off] (srcB) so the result = Dn[off] + first-set-index in ONE
+    // committed step (Musashi: result = original_offset + index; N/Z from the field).
+    Desc(UBfResolve, srcA = SBfOffReg, dst = ST0, useImm = true, imm = SBfDeltaImm,
+         sz = SzLong, isFirst = true),                                       // µPC59 (byteDelta -> T0)
+    Desc(UBfAdd, srcA = SEaBase, srcB = ST0, dst = ST2, sz = SzLong),          // µPC60 (Tb = eaBase + byteDelta)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, indexFromEa = true),                                     // µPC61 (lo -> T0)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST1, useImm = true, imm = SEaDispHi,
+         sz = SzByte, indexFromEa = true),                                     // µPC62 (hi -> T1)
+    Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
+         imm = SBfResImm, sz = SzLong),                                        // µPC63 (packed -> T2)
+    Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = ST0, sz = SzLong,
+         bfDyn = true, bfTstForm = true),                                      // µPC64 (prefunnel: field32 -> T0)
+    Desc(UBfMem, srcA = ST0, srcB = SBfOffReg, srcC = ST2, dst = SBfRdDst, sz = SzLong,
+         bfDyn = true, bfWritesNz = true, bfStoreForm = 6, isLast = true)      // µPC65 (FFOFULL: Dn2 = Dn[off] + index, +NZ)
   )
+  val BF_DYN_RD_DO0_ENTRY  = 49
+  val BF_DYN_RD_DO1_ENTRY  = 53
+  val BF_DYN_FFO_DO1_ENTRY = 59
   val BF_RMW_4B_ENTRY = 6
   val BF_RMW_5B_ENTRY = 9
   val MI_MOVE_SRC_ENTRY = 16   // rows 16,17,18 (ptr-load, host-load->T1, MOVE T1->Dn)
@@ -389,6 +465,12 @@ object Microcode {
     val bfDn2        = UInt(5 bits)      // ext[14:12] (BFINS insert source register)
     val bfImm        = Bits(32 bits)     // the packed bfMem imm (identical layout to 3a bfmImm)
     val bfNeedHi     = Bool()            // (bitOff+width)>32 — picks the entry in DecodeStage
+    // ── v2 bit-field DYNAMIC params (slice 3c) ──────────────────────────────────────────
+    val bfOffDn      = UInt(5 bits)      // Dn[off] = ext[8:6]  (offset register, 0..7)
+    val bfWdDn       = UInt(5 bits)      // Dn[wd]  = ext[2:0]  (width  register, 0..7)
+    val bfDo         = Bool()            // ext[11] (offset is dynamic)
+    val bfDw         = Bool()            // ext[5]  (width  is dynamic)
+    val bfResImm     = Bits(32 bits)     // BFRESOLVE imm: [4:0]=staticOff,[9:5]=staticWidth,[10]=Do,[11]=Dw,[12]=memMode(1)
     // ── full-format MEMORY-INDIRECT host-op group (the §5 host-op-to-temp crack) ──────
     // The pointer-load address = eaBase + eaDispLo(=bd) + (pre: eaIndex). Post-index keeps
     // the index for the HOST access. After [LOAD.L ptr -> T0], the host op re-runs as a
@@ -455,6 +537,12 @@ object Microcode {
     case SCas2Dc2 => (ctx.cas2Dc2, True)
     case SCas2Du2 => (ctx.cas2Du2, True)
     case SMovesRn => (ctx.movesRn, True)
+    case SBfOffReg => (ctx.bfOffDn, True)
+    case SBfOffDyn => (ctx.bfOffDn, ctx.bfDo)
+    case SBfWdDyn  => (ctx.bfWdDn,  ctx.bfDw)
+    case SBfDn2    => (ctx.bfDn2,   True)
+    // read-only result reg = Dn2 (ext[14:12]); written by BFEXTU(1)/BFEXTS(3)/BFFFO(5), NOT BFTST(0).
+    case SBfRdDst  => (ctx.bfDn2, (ctx.bfOp === 1) || (ctx.bfOp === 3) || (ctx.bfOp === 5))
     // The (An)+/-(An) write-back target: the base An, valid ONLY when an auto mode is set
     // (a non-auto / abs EA -> the r2 ADD writes no reg, an inert NOP).
     case SMovesAn => (ctx.eaBase, ctx.casAutoMode =/= EaAuto.NONE)
@@ -483,6 +571,8 @@ object Microcode {
     case SCas2Da1    => ctx.cas2Da1.asBits.resize(32)   // bit0 = ext1[15] (BIT_1F)
     case SCas2Da2    => ctx.cas2Da2.asBits.resize(32)   // bit0 = ext2[15] (BIT_F)
     case SMovesDelta => ctx.movesDelta                  // signed An write-back delta
+    case SBfResImm   => ctx.bfResImm                    // BFRESOLVE imm (slice 3c)
+    case SBfDeltaImm => B(1, 32 bits) |<< 13            // imm[13]=1 -> BFRESOLVE byte-delta mode
     case _           => B(0, 32 bits)
   }
 
@@ -517,6 +607,10 @@ object Microcode {
       case UAddDrop    => u.op := DecOp.ADD
       case UOpFromCtx  => u.op := ctx.op
       case UBfMem      => u.op := DecOp.BITFIELD
+      case UBfReg      => u.op := DecOp.BITFIELD
+      case UBfResolve  => u.op := DecOp.BFRESOLVE
+      case UBfShiftOff => u.op := DecOp.SHIFT
+      case UBfAdd      => u.op := DecOp.ADD
       case UMiPtrLoad  => u.op := DecOp.MOVE
       case UMiHostMove => u.op := DecOp.MOVE
       case UMiHostOp   => u.op := ctx.miOp
@@ -525,6 +619,10 @@ object Microcode {
     }
     u.cluster := (d.uop match {
       case UBfMem    => Cluster.INT          // the bit-field compute runs on the ALU/slow pipe
+      case UBfReg    => Cluster.INT          // register-form bit-field (BFINS prefunnel consumer)
+      case UBfResolve => Cluster.INT
+      case UBfShiftOff => Cluster.INT
+      case UBfAdd    => Cluster.INT
       // The §7 host ALU/unary ops (MOVE/ADD/SUB/AND/OR/EOR/CMP/CLR/NEG/NEGX/NOT/TST) all run
       // on the INT (ALU) pipe; CPLX/CHK/DIV are not full-format mem-indirect hosts in scope.
       case UMiHostOp => Cluster.INT
@@ -620,7 +718,7 @@ object Microcode {
     // CAS2's CAS2C1 (the res1 compare) + the two CAS2DC Dc-update µops are likewise DROPPED:
     // their NZVC/Dc1/Dc2 writes still land + fold (the lock-step reads Dc1/Dc2 back), but
     // CAS2 maps to exactly ONE oracle step (the kept CAS2C2, which carries the final NZVC).
-    u.divIsRem := Bool(d.uop == UAddDrop || (d.uop.isInstanceOf[UCasOp] && d.uop.asInstanceOf[UCasOp].dropCommit))
+    u.divIsRem := Bool(d.uop == UAddDrop || d.bfDrop || (d.uop.isInstanceOf[UCasOp] && d.uop.asInstanceOf[UCasOp].dropCommit))
     u.isChk2   := False
     // Auto-update: the LOAD carries PREDEC so the LS-EU computes addr = An - eaDelta (the
     // load does NOT write An — the LS-EU writes An only on an eaAuto STORE). The store
@@ -644,13 +742,19 @@ object Microcode {
     // isMovea: a MOVES READ writeback to an An (ctx.movesRnIsA) sign-extends the loaded
     // value to 32 (the moveaResult path, extended to .B for MOVES). A Dn read leaves it
     // False -> the generic size-merge preserves the upper bits. Default False for all others.
-    u.bitOp := 0; u.bfDynamic := False; u.extByte := False
+    u.bitOp := 0; u.bfDynamic := Bool(d.bfDyn); u.extByte := False
     u.isMovea := (if (d.uop == UMovesRead) ctx.movesRnIsA else False)
     d.uop match {
       case UBfMem =>
         u.bfMem       := True
-        u.bfOp        := ctx.bfOp        // CHG=2/CLR=4/SET=6/INS=7 (latched at ucBegin)
-        u.bfStoreForm := U(d.bfStoreForm, 2 bits)
+        // bfOp = ctx.bfOp (CHG=2/CLR=4/SET=6/INS=7); a prefunnel row forces bfOp=0 (BFTST)
+        // whose bfMem result IS field32 = (lo<<bitOff)|(needHi?hi>>(8-bitOff):0).
+        u.bfOp        := (if (d.bfTstForm) B(0, 3 bits) else ctx.bfOp)
+        u.bfStoreForm := U(d.bfStoreForm, 3 bits)
+      case UBfReg =>
+        u.bfMem       := False           // register form: dy = srcA = field32; offset = packed[4:0] = 0
+        u.bfOp        := ctx.bfOp        // BFINS = 7 (the only UBfReg customer, slice 3c)
+        u.bfStoreForm := 0
       case _ =>
         u.bfMem       := False
         u.bfOp        := 0
