@@ -12,8 +12,12 @@ Static-offset/width memory bit-field (BFTST/BFEXTU/BFEXTS/BFFFO + BFCHG/BFCLR/BF
 on memory EAs) shipped in 3a/3b. 3c adds the **dynamic** forms (ext `Do=bit11` → offset is a
 Dn; `Dw=bit5` → width is a Dn). The register-form dynamic (Do/Dw on a Dn EA) already works
 (`BFRESOLVE` + `bfDynamic` funnel). Predecode already frames the dynamic memory forms (Do/Dw
-add no ext words). The dynamic memory forms are currently **gated illegal**; 3c un-gates +
-cracks them.
+add no ext words). **CORRECTION (found during investigation): the dynamic memory forms are
+NOT gated illegal — they currently SILENTLY MIS-CRACK as static** (the static-mem path reads
+the Do/offset-Dn/Dw/width-Dn ext fields as *literal* static offset/width → a SILENT WRONG
+RESULT for a valid instruction; untested — no dynamic-mem lock-step exists). This is a latent
+correctness bug. 3c must **detect Do/Dw on a memory bit-field and route it AWAY from the
+static crack** to the correct dynamic crack (not merely "un-gate").
 
 **GOVERNING CONSTRAINT (user directive): this is a COLD instruction — FMax-neutrality
 dominates µop/latency efficiency.** Spend extra µops/cycles freely; add NO new FMax-critical
@@ -108,9 +112,12 @@ the bytewise spill read/write) and match it — the dynamic path only changes ho
 
 ## 4. Decode / predecode
 
-- **Un-gate** the dynamic memory forms (currently illegal in `OperationDecoder` /
-  `MicroOpAssembler` — static-only). Route Do/Dw memory forms through the v2 engine with the
-  dynamic crack. Reuse the register-form's dynamic offset/width-Dn latching path to keep the
+- **Detect + route** the dynamic memory forms. They currently SILENTLY MIS-CRACK as static
+  (NOT illegal): `MicroOpAssembler.isBfMemSpec` runs the 3a static crack with `bfDynamic=False`,
+  and `DecodeStage` ucBegin computes offset/needHi from the static fields — both misread the
+  Do/Dw fields. T1 must detect `ext[11]||ext[5]` on a memory bit-field and route to the dynamic
+  crack (read-only: a `DecodeStage` hook like `slot0IsMemInd`; RMW: a dynamic `ucBegin` entry).
+  Reuse the register-form's dynamic offset/width-Dn latching path to keep the
   **decode-area footprint minimal** (the CAS lesson: decode-area growth perturbs the front-end
   floor).
 - Legality unchanged from 3b: control-alterable EA only for RMW; PC-rel (7-2/7-3) illegal for
