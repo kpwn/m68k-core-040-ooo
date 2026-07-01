@@ -45,6 +45,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     umAccessRobId = UInt(6 bits)
     umCommitValid = Bool()
     umCommitId    = UInt(6 bits)
+    umCommitBValid = Bool()
+    umCommitBId    = UInt(6 bits)
     umFlush       = Bool()
   }
 
@@ -56,6 +58,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
   var umAccessRobId: UInt = null
   var umCommitValid: Bool = null
   var umCommitId:    UInt = null
+  var umCommitBValid: Bool = null   // retire slot 1 (dual-retire) — see UmWriteQueue.commitB
+  var umCommitBId:    UInt = null
   var umFlush:       Bool = null
   // AXI port for the walker + U/M descriptor write drain (full Axi4). Surfaces as
   // top IO so the testbench / synth top attaches the page-table memory.
@@ -78,6 +82,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     umAccessRobId.allowOverride; umAccessRobId := U(0, 6 bits)
     umCommitValid.allowOverride; umCommitValid := False
     umCommitId.allowOverride;    umCommitId    := U(0, 6 bits)
+    umCommitBValid.allowOverride; umCommitBValid := False
+    umCommitBId.allowOverride;    umCommitBId    := U(0, 6 bits)
     umFlush.allowOverride;       umFlush       := False
 
     // The ONE 68040 MMU control is owned by MmuControlPlugin and shared with the
@@ -256,6 +262,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     umq.io.alloc.payload.newByte:= walker.io.rsp.umWrite.newByte
     umq.io.commit.valid   := umCommitValid
     umq.io.commit.payload := umCommitId
+    umq.io.commitB.valid   := umCommitBValid
+    umq.io.commitB.payload := umCommitBId
     umq.io.flush          := umFlush
 
     // ---- U/M drain: single-byte RMW over the DTLB AXI write channel ----
