@@ -38,11 +38,20 @@ class FuzzGenSpec extends AnyFunSuite {
               }
           }
       }
-      // FUZZ_GEN_DUMP=<seed>: print that seed's full source (works with
-      // FUZZ_SKIP etc. since generation reads the same env) for triage.
-      if (sys.env.get("FUZZ_GEN_DUMP").contains(seed.toString)) {
-        println(s"[fuzzgen] ==== seed=$seed source (FUZZ_SKIP=${sys.env.getOrElse("FUZZ_SKIP", "")}) ====")
-        println(src)
+      // FUZZ_GEN_DUMP=<seed>[,<seed>...]: print those seeds' sources (works
+      // with FUZZ_SKIP etc. since generation reads the same env) for triage.
+      // FUZZ_GEN_DUMP_DIR: write each to <dir>/seed_<n>.s instead (offline
+      // triage: assemble + objdump + musashi trace without the JVM).
+      val dumpSeeds = sys.env.get("FUZZ_GEN_DUMP").map(_.split(",").map(_.trim).toSet).getOrElse(Set.empty[String])
+      if (dumpSeeds.contains(seed.toString)) {
+        sys.env.get("FUZZ_GEN_DUMP_DIR") match {
+          case Some(dir) =>
+            java.nio.file.Files.write(java.nio.file.Paths.get(dir, s"seed_$seed.s"),
+              src.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+          case None =>
+            println(s"[fuzzgen] ==== seed=$seed source (FUZZ_SKIP=${sys.env.getOrElse("FUZZ_SKIP", "")}) ====")
+            println(src)
+        }
       }
     }
     if (bad.nonEmpty) {
