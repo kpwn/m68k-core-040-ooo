@@ -615,20 +615,33 @@ object ProgGen {
       val (lo, hi) = { val x = rand32() & posMax
                        val l = x / 2
                        (l, math.min(l + 1 + r.nextInt(64), posMax)) }    // hi stays positive (signed lo<=hi)
-      val rn = if (r.nextBoolean()) d() else a()
+      // Rn must be DISJOINT from the bounds-pointer An: the An init comes
+      // AFTER the Rn init and would clobber the in-bounds value -> a CHK2 trap
+      // to an uninstalled vector (a first-sweep oracle-runaway GENFAIL).
+      val rn = if (r.nextBoolean()) d()
+               else { var x = a(); while (x == an) x = a(); x }
       val chk2 = r.nextInt(4) == 0
       val rv = if (chk2) lo + (hi - lo) / 2 else rand32() & 0xffffL  // CHK2 in-bounds by construction
       val (st, mv) = sz match {
         case 'b' => ("b", 1L); case 'w' => ("w", 2L); case _ => ("l", 4L)
       }
       val t = d()
+      // Defense in depth: install the vector-6 handler for CHK2 anyway (a
+      // trapping CHK2 then round-trips like the CHK template instead of
+      // running away through an uninstalled vector).
+      val (hInstall, hBody) = if (chk2) {
+        val h = lbl("c2h"); val e = lbl("c2e")
+        (Vector(s"\tmove.l #$h,$t", s"\tmove.l $t,0x18"),
+         Vector(s"\tbra.s $e", s"$h:", s"\trte", s"$e:"))
+      } else (Vector.empty[String], Vector.empty[String])
+      hInstall ++
       Vector(s"\tmove.l #${hex(lo)},$t",
              s"\tmove.$st $t,(${hex(addr)}).l",
              s"\tmove.l #${hex(hi)},$t",
              s"\tmove.$st $t,(${hex(addr + mv)}).l",
              s"\tmove.l #${hex(rv)},$rn",
              s"\tmove.l #${hex(addr)},$an",
-             s"\t${if (chk2) "chk2" else "cmp2"}.$sz ($an),$rn")
+             s"\t${if (chk2) "chk2" else "cmp2"}.$sz ($an),$rn") ++ hBody
     }
 
     private def tCas(): Vector[String] = {

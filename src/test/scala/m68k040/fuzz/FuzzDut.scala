@@ -96,17 +96,23 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     iq.lsNzvcWakeup.payload := lsEu.wakeupNzvc.payload
     lsEu.sqCommit.valid   := rob.logic.retire0
     lsEu.sqCommit.payload := rob.logic.h0
+    lsEu.sqCommitB.valid   := rob.logic.retire1
+    lsEu.sqCommitB.payload := rob.logic.h1
     val excEntering = rob.logic.excActive && !RegNext(rob.logic.excActive, init = False)
     lsEu.sqFlush          := host[RedirectService].doFlush || excEntering
 
     val dtlb = host[m68k040.mmu.DtlbPlugin]
     dtlb.umAccessRobId := lsEu.xlateRobId
     dtlb.umCommitValid := rob.logic.retire0
+    dtlb.umCommitBValid := rob.logic.retire1
+    dtlb.umCommitBId    := rob.logic.h1
     dtlb.umCommitId    := rob.logic.h0
     dtlb.umFlush       := host[RedirectService].doFlush
     val itlb = host[m68k040.mmu.ItlbPlugin]
     itlb.umAccessRobId := U(0, 6 bits)
     itlb.umCommitValid := rob.logic.retire0
+    itlb.umCommitBValid := rob.logic.retire1
+    itlb.umCommitBId    := rob.logic.h1
     itlb.umCommitId    := rob.logic.h0
     itlb.umFlush       := host[RedirectService].doFlush
 

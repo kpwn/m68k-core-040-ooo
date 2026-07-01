@@ -38,6 +38,12 @@ class FuzzGenSpec extends AnyFunSuite {
               }
           }
       }
+      // FUZZ_GEN_DUMP=<seed>: print that seed's full source (works with
+      // FUZZ_SKIP etc. since generation reads the same env) for triage.
+      if (sys.env.get("FUZZ_GEN_DUMP").contains(seed.toString)) {
+        println(s"[fuzzgen] ==== seed=$seed source (FUZZ_SKIP=${sys.env.getOrElse("FUZZ_SKIP", "")}) ====")
+        println(src)
+      }
     }
     if (bad.nonEmpty) {
       bad.take(3).foreach { case (s, m) => println(s"[fuzzgen] seed=$s FAIL: $m") }
