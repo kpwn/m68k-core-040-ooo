@@ -1,0 +1,247 @@
+package m68k040.fuzz
+
+import m68k040.M68kParams
+import m68k040.core.ParamPlugin
+import m68k040.mmu.{ItlbPlugin, DtlbPlugin, MmuControlPlugin}
+import m68k040.cache.{IcachePlugin, DcachePlugin, DcacheService}
+import m68k040.frontend.FetchAlignPlugin
+import m68k040.decode.DecodeStage
+import m68k040.rename.RenameStage
+import m68k040.rob.RobPlugin
+import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin, DivEuPlugin}
+import m68k040.execute.iq.{IssueQueuePlugin, IssueQueueService}
+import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
+import m68k040.services.{RedirectService, DTranslationService}
+import spinal.core._
+import spinal.core.sim._
+import spinal.lib._
+import spinal.lib.bus.amba4.axi.Axi4ReadOnly
+import spinal.lib.bus.amba4.axi.sim.{Axi4ReadOnlySlaveAgent, SparseMemory}
+import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
+import spinal.lib.misc.database.Database
+
+/** Full-core DUT + backend wiring for the FUZZ lock-step harness.
+  *
+  * DELIBERATE DUPLICATION of `lockstep.ExecuteLockStepSpec.{BackendWiringPlugin,
+  * FullCoreDut, attachProgram}`: the shared file is under active edit in a
+  * parallel worktree and a refactor there guarantees a merge conflict. The copy
+  * is verbatim (see the original for the full commentary). CONSOLIDATION TODO:
+  * once the parallel work lands, hoist ONE wiring plugin + DUT into a shared
+  * test-support file and point both specs at it. */
+class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin,
+                       lsEu: LsEuPlugin, divEu: DivEuPlugin) extends FiberPlugin {
+  var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
+  var seedWr: m68k040.execute.regfile.RegFileWritePort = null
+  var a7Rd: m68k040.execute.regfile.RegFileReadPort = null
+  during setup {
+    a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
+    seedWr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7", priority = 1)
+    a7Rd   = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
+  }
+  val logic = during build new Area {
+    val seedValid = in Bool (); val seedAddr = in UInt (6 bits); val seedData = in Bits (32 bits)
+    seedValid.simPublic(); seedAddr.simPublic(); seedData.simPublic()
+    seedWr.valid := seedValid; seedWr.address := seedAddr; seedWr.data := seedData
+    val iq  = host[IssueQueueService]
+    val rob = host[RobPlugin]
+    eu0.issue << iq.issue(0)
+    eu1.issue << iq.issue(1)
+    eu0.srSysIn := rob.logic.exc.ss.srSys
+    eu1.srSysIn := rob.logic.exc.ss.srSys
+    iq.aluSlowWakeup(0).valid   := eu0.slowWakeup.valid
+    iq.aluSlowWakeup(0).payload := eu0.slowWakeup.payload
+    iq.aluSlowWakeup(1).valid   := eu1.slowWakeup.valid
+    iq.aluSlowWakeup(1).payload := eu1.slowWakeup.payload
+    branchEu.issue << iq.issue(2)
+    rob.logic.branchCompletion.valid   := branchEu.completion.valid
+    rob.logic.branchCompletion.payload := branchEu.completion.payload
+    rob.logic.euFaultCompletion.valid   := branchEu.trapvFault.valid
+    rob.logic.euFaultCompletion.payload := branchEu.trapvFault.payload
+    rob.logic.completion(0).valid   := eu0.completion.valid
+    rob.logic.completion(0).payload := eu0.completion.payload
+    rob.logic.completion(1).valid   := eu1.completion.valid
+    rob.logic.completion(1).payload := eu1.completion.payload
+    def wireCcr(idx: Int, w: m68k040.execute.WbObs): Unit = {
+      rob.logic.ccrCompletion(idx).valid            := w.valid
+      rob.logic.ccrCompletion(idx).payload.robId    := w.robId
+      rob.logic.ccrCompletion(idx).payload.nzvc     := w.nzvc.asUInt
+      rob.logic.ccrCompletion(idx).payload.nzvcWrite:= w.nzvcWrite
+      rob.logic.ccrCompletion(idx).payload.x        := w.x
+      rob.logic.ccrCompletion(idx).payload.xWrite   := w.xWrite
+      rob.logic.ccrCompletion(idx).payload.result   := w.result
+      rob.logic.ccrCompletion(idx).payload.intWrite := w.intWrite
+    }
+    wireCcr(0, eu0.logic.wbObs); wireCcr(1, eu1.logic.wbObs); wireCcr(2, lsEu.logic.wbObs)
+    wireCcr(3, divEu.logic.wbObs)
+
+    divEu.issue << iq.issue(4)
+    divEu.cplxFlush := host[RedirectService].doFlush || rob.logic.excActive
+    rob.logic.completion(3).valid   := divEu.completion.valid
+    rob.logic.completion(3).payload := divEu.completion.payload
+    iq.cplxWakeup.valid   := divEu.wakeup.valid
+    iq.cplxWakeup.payload := divEu.wakeup.payload
+    when(divEu.euFault.valid) {
+      rob.logic.euFaultCompletion.valid   := True
+      rob.logic.euFaultCompletion.payload := divEu.euFault.payload
+    }
+
+    lsEu.issue << iq.issue(3)
+    rob.logic.completion(2).valid   := lsEu.completion.valid
+    rob.logic.completion(2).payload := lsEu.completion.payload
+    rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
+    rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
+    iq.lsWakeup.valid   := lsEu.wakeup.valid
+    iq.lsWakeup.payload := lsEu.wakeup.payload
+    iq.lsNzvcWakeup.valid   := lsEu.wakeupNzvc.valid
+    iq.lsNzvcWakeup.payload := lsEu.wakeupNzvc.payload
+    lsEu.sqCommit.valid   := rob.logic.retire0
+    lsEu.sqCommit.payload := rob.logic.h0
+    val excEntering = rob.logic.excActive && !RegNext(rob.logic.excActive, init = False)
+    lsEu.sqFlush          := host[RedirectService].doFlush || excEntering
+
+    val dtlb = host[m68k040.mmu.DtlbPlugin]
+    dtlb.umAccessRobId := lsEu.xlateRobId
+    dtlb.umCommitValid := rob.logic.retire0
+    dtlb.umCommitId    := rob.logic.h0
+    dtlb.umFlush       := host[RedirectService].doFlush
+    val itlb = host[m68k040.mmu.ItlbPlugin]
+    itlb.umAccessRobId := U(0, 6 bits)
+    itlb.umCommitValid := rob.logic.retire0
+    itlb.umCommitId    := rob.logic.h0
+    itlb.umFlush       := host[RedirectService].doFlush
+
+    val doFlush = host[RedirectService].doFlush
+    val flushPc = host[RedirectService].flushPc
+    val excActive = rob.logic.excActive
+    iq.flushPort := doFlush || excActive
+    host[DecodeStage].logic.pipeFlush := doFlush || excActive
+    host[RenameStage].logic.pipeFlush := doFlush || excActive
+    val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
+    faRedir.valid   := doFlush
+    faRedir.payload := flushPc
+
+    val faBtb = host[FetchAlignPlugin]
+    val btb   = host[m68k040.frontend.BtbPlugin]
+    btb.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+    btb.logic.queryPc     := faBtb.logic.btbQueryPc0
+    btb.logic.queryValid  := faBtb.logic.btbQueryValid0
+    btb.logic.query2Pc    := faBtb.logic.btbQueryPc1
+    btb.logic.query2Valid := faBtb.logic.btbQueryValid1
+    faBtb.logic.btbPredTaken0  := btb.logic.predTakenComb
+    faBtb.logic.btbPredTarget0 := btb.logic.predTargetComb
+    faBtb.logic.btbPredTaken1  := btb.logic.predTaken2Comb
+    faBtb.logic.btbPredTarget1 := btb.logic.predTarget2Comb
+    val ras   = host[m68k040.frontend.RasPlugin]
+    ras.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+    ras.logic.pushValid     := faBtb.logic.rasPushValid
+    ras.logic.pushRetPc     := faBtb.logic.rasPushRetPc
+    ras.logic.popValid      := faBtb.logic.rasPopValid
+    faBtb.logic.rasPredValid  := ras.logic.predValid
+    faBtb.logic.rasPredTarget := ras.logic.predTarget
+
+    val gsh   = host[m68k040.frontend.GsharePlugin]
+    gsh.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+    gsh.logic.queryPc0      := faBtb.logic.btbQueryPc0
+    gsh.logic.queryValid0   := faBtb.logic.btbQueryValid0
+    gsh.logic.queryPc1      := faBtb.logic.btbQueryPc1
+    gsh.logic.queryValid1   := faBtb.logic.btbQueryValid1
+    faBtb.logic.gsBtbHit0   := btb.logic.predHitComb
+    faBtb.logic.gsBtbType0  := btb.logic.predTypeComb
+    faBtb.logic.gsBtbHit1   := btb.logic.predHit2Comb
+    faBtb.logic.gsBtbType1  := btb.logic.predType2Comb
+    faBtb.logic.gsPhtTaken0 := gsh.logic.phtTaken0
+    faBtb.logic.gsPhtIndex0 := gsh.logic.phtIndex0
+    faBtb.logic.gsPhtTaken1 := gsh.logic.phtTaken1
+    faBtb.logic.gsPhtIndex1 := gsh.logic.phtIndex1
+    gsh.logic.shiftValid    := faBtb.logic.gsShiftValid
+    gsh.logic.shiftDir      := faBtb.logic.gsShiftDir
+    gsh.gshareUpdate.valid   := rob.logic.gshareUpdateFlow.valid
+    gsh.gshareUpdate.payload := rob.logic.gshareUpdateFlow.payload
+
+    val dc    = host[DcacheService]
+    val xlate = host[DTranslationService]
+    val exc   = rob.logic.exc
+    exc.dcLoadRsp.valid   := dc.loadRsp.valid
+    exc.dcLoadRsp.payload := dc.loadRsp.payload
+    exc.dcLoadBusy        := dc.loadBusy
+    exc.dcStoreAck        := dc.storeAck
+    exc.dtRsp.ready       := xlate.rsp.ready
+    exc.dtRsp.ppn         := xlate.rsp.ppn
+    exc.dtRsp.cacheMode   := xlate.rsp.cacheMode
+    exc.dtRsp.fault       := xlate.rsp.fault
+    lsEu.excActive            := excActive
+    lsEu.excLoadCmdValid      := exc.dcLoadCmd.valid
+    lsEu.excLoadCmdVaddr      := exc.dcLoadCmd.payload.vaddr
+    lsEu.excLoadCmdSize       := exc.dcLoadCmd.payload.size
+    exc.dcLoadCmd.ready       := lsEu.excLoadCmdReady
+    lsEu.excStoreValid        := exc.dcStore.valid
+    lsEu.excStorePayload      := exc.dcStore.payload
+    lsEu.excXlateValid        := exc.dtReq.valid
+    lsEu.excXlateVpn          := exc.dtReq.vpn
+    lsEu.excXlateWrite        := exc.dtReq.write
+    lsEu.excXlateSupervisor   := exc.dtReq.supervisor
+    exc.sqDrained             := lsEu.sqEmptySig
+    a7Wr.valid   := exc.a7WriteValid || exc.sysRegWriteValid
+    a7Wr.address := Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
+                                              host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth))
+    a7Wr.data    := Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits)
+    a7Rd.addr := host[RenameStage].committedPhysA7.resize(a7Rd.addr.getWidth)
+    exc.committedA7In := a7Rd.data.asUInt
+  }
+}
+
+/** Full-core DUT (duplicated from ExecuteLockStepSpec.FullCoreDut — see the
+  * duplication note on FuzzWiringPlugin). */
+class FuzzCoreDut extends Component {
+  val db    = new Database
+  val host  = db on (new PluginHost)
+  val ctrl   = new MmuControlPlugin
+  val intCtrl = new m68k040.exception.InterruptControlPlugin
+  val itlb   = new ItlbPlugin
+  val dtlb   = new DtlbPlugin
+  val icache = new IcachePlugin
+  val dcache = new DcachePlugin
+  val btb    = new m68k040.frontend.BtbPlugin
+  val ras    = new m68k040.frontend.RasPlugin
+  val gsh    = new m68k040.frontend.GsharePlugin
+  val fa     = new FetchAlignPlugin
+  val dec    = new DecodeStage
+  val ren    = new RenameStage
+  val disp   = new m68k040.dispatch.DispatchPlugin
+  val rob    = new RobPlugin
+  val iq     = new IssueQueuePlugin
+  val eu0    = new AluEuPlugin
+  val eu1    = new AluEuPlugin
+  val branchEu = new BranchEuPlugin
+  val lsEu   = new LsEuPlugin
+  val divEu  = new DivEuPlugin
+  val rfInt  = new RegFilePluginInt
+  val rfNzvc = new RegFilePluginNzvc
+  val rfX    = new RegFilePluginX
+  val wire   = new FuzzWiringPlugin(eu0, eu1, branchEu, lsEu, divEu)
+  db.on { host.asHostOf(Seq[FiberPlugin](
+    new ParamPlugin(M68kParams()),
+    ctrl,
+    intCtrl,
+    itlb,
+    dtlb,
+    icache, dcache, btb, ras, gsh, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
+    rfInt, rfNzvc, rfX, wire)) }
+}
+
+object FuzzDut {
+  /** Behavioral AXI read-only memory holding the program image (byte-swap
+    * convention duplicated from ExecuteLockStepSpec.attachProgram). */
+  def attachProgram(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long, bytes: Vector[Int]): Axi4ReadOnlySlaveAgent = {
+    val mem = SparseMemory()
+    val nWords = bytes.length / 2
+    for (i <- 0 until nWords) {
+      val w = ((bytes(2 * i) & 0xff) << 8) | (bytes(2 * i + 1) & 0xff)
+      mem.write(loadAddr + 2 * i,     (w & 0xff).toByte)
+      mem.write(loadAddr + 2 * i + 1, ((w >> 8) & 0xff).toByte)
+    }
+    new Axi4ReadOnlySlaveAgent(axi, cd) {
+      override def readByte(address: BigInt, id: Int): Byte = mem.read(address.toLong)
+    }
+  }
+}
