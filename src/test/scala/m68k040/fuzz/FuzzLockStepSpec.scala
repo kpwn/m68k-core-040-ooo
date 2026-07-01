@@ -219,11 +219,19 @@ object FuzzRunner {
   }
 
   /** Greedy chunked minimization: repeatedly try removing chunks of removable
-    * body blocks (sizes 8,4,2,1), keeping any removal that still diverges. */
-  def minimize(blocks: Vector[ProgGen.Block], simSeed: Int, maxAttempts: Int): (Vector[ProgGen.Block], Outcome) = {
+    * body blocks (sizes 8,4,2,1), keeping any removal that still diverges.
+    * `pinKind` keeps a removal only if the divergence KIND matches the
+    * original (a HANG stays a HANG) — useful when triaging a specific class;
+    * None accepts any divergence (smaller repros). */
+  def minimize(blocks: Vector[ProgGen.Block], simSeed: Int, maxAttempts: Int,
+               pinKind: Option[String] = None): (Vector[ProgGen.Block], Outcome) = {
     var cur = blocks
     var lastDiv: Outcome = Diverged("?", "?", "")
     var attempts = 0
+    def keeps(o: Outcome): Option[Diverged] = o match {
+      case d: Diverged if pinKind.forall(_ == d.kind) => Some(d)
+      case _                                          => None
+    }
     for (chunk <- Seq(8, 4, 2, 1)) {
       var progress = true
       while (progress && attempts < maxAttempts) {
@@ -234,9 +242,9 @@ object FuzzRunner {
           if (slice.nonEmpty && slice.forall(_.removable)) {
             val cand = cur.patch(i, Nil, chunk)
             attempts += 1
-            run(ProgGen.render(cand), simSeed) match {
-              case d: Diverged => cur = cand; lastDiv = d; progress = true
-              case _           => ()
+            keeps(run(ProgGen.render(cand), simSeed)) match {
+              case Some(d) => cur = cand; lastDiv = d; progress = true
+              case None    => ()
             }
           }
           i -= chunk
@@ -280,8 +288,9 @@ class FuzzLockStepSpec extends AnyFunSuite {
           val budgetLeft = divergedSeeds.size < minimizeMax
           println(f"[fuzz] seed=$seed DIVERGED[$kind] ($dtGen%.1fs): $detail" +
                   (if (doMinimize && budgetLeft) " — minimizing..." else " — reporting unminimized (budget)"))
+          val pinKind = if (envInt("FUZZ_MIN_SAMEKIND", 0) == 1) Some(kind) else None
           val (minBlocks, minDiv) =
-            if (doMinimize && budgetLeft) FuzzRunner.minimize(prog.blocks, simSeed, minAttempts)
+            if (doMinimize && budgetLeft) FuzzRunner.minimize(prog.blocks, simSeed, minAttempts, pinKind)
             else (prog.blocks, d: FuzzRunner.Outcome)
           val (mk, md, mc) = minDiv match {
             case FuzzRunner.Diverged(k2, d2, c2) => (k2, d2, c2)

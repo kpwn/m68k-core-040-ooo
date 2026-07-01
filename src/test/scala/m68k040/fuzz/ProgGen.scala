@@ -921,40 +921,56 @@ object ProgGen {
              s"$e:")
     }
 
-    // weighted template table
-    private val templates: Vector[(Int, () => Vector[String])] = Vector(
-      6 -> tMoveq _,   8 -> tAluReg _,   3 -> tEorReg _,    6 -> tAluImm _,
-      3 -> tAluSrcImm _, 4 -> tAddqSubq _, 3 -> tAdda _,    2 -> tAdaMemSrc _,
-      5 -> tMoveRegReg _, 5 -> tMoveImm _, 8 -> tMoveLoad _, 3 -> tMoveaLoad _,
-      9 -> tMoveStore _, 2 -> tMoveMemMem _,
-      5 -> tAluMemSrc _, 5 -> tAluMemRmw _, 3 -> tAluImmRmw _, 2 -> tQuickMemRmw _,
-      4 -> tUnaryReg _, 3 -> tUnaryMem _,
-      5 -> tShiftImm _, 4 -> tShiftReg _,
-      3 -> tBitopReg _, 3 -> tBitopMem _,
-      3 -> tBitfieldReg _, 3 -> tBitfieldMem _,
-      3 -> tExtSwapTas _,
-      3 -> tAddxSubxReg _, 2 -> tAddxSubxMem _,
-      2 -> tBcdReg _, 1 -> tBcdMem _,
-      2 -> tPackUnpk _, 2 -> tExg _,
-      4 -> tCcrOps _, 2 -> tMoveCcrDn _, 1 -> tMoveFromSr _, 1 -> tMoveCcrStore _,
-      3 -> tMul _, 3 -> tDiv _,
-      2 -> tCmp2Chk2 _, 2 -> tCas _, 1 -> tCas2 _,
-      3 -> tMovem _, 2 -> tMovep _,
-      3 -> tLea _, 2 -> tPea _, 2 -> tLinkUnlk _,
-      3 -> tScc _,
-      5 -> tBccForward _, 2 -> tBraForward _, 1 -> tJmpForward _,
-      3 -> tDbcc _,
-      3 -> tBsrRts _, 2 -> tJsrRts _, 1 -> tBsrRtd _, 1 -> tRtr _,
-      1 -> tMoveUsp _, 1 -> tMovec _, 2 -> tMoves _,
-      1 -> tChk _, 1 -> tTrap _, 1 -> tTrapv _, 1 -> tTrapcc _
+    // weighted template table (tag, weight, gen). Tags feed FUZZ_SKIP — a
+    // TRIAGE quarantine knob (comma-separated tags) so a sweep can look
+    // BENEATH an already-reported hot bug class. Default: everything ON.
+    // FUZZ_SKIP is NOT an exclusion list: a skipped tag must already be a
+    // reported finding.
+    private val allTemplates: Vector[(String, Int, () => Vector[String])] = Vector(
+      ("moveq",      6, tMoveq _),      ("alu-reg",    8, tAluReg _),
+      ("eor",        3, tEorReg _),     ("alu-imm",    6, tAluImm _),
+      ("alu-srcimm", 3, tAluSrcImm _),  ("quick",      4, tAddqSubq _),
+      ("adda",       3, tAdda _),       ("adda-mem",   2, tAdaMemSrc _),
+      ("move-rr",    5, tMoveRegReg _), ("move-imm",   5, tMoveImm _),
+      ("move-load",  8, tMoveLoad _),   ("movea-load", 3, tMoveaLoad _),
+      ("move-store", 9, tMoveStore _),  ("move-mm",    2, tMoveMemMem _),
+      ("alu-memsrc", 5, tAluMemSrc _),  ("alu-rmw",    5, tAluMemRmw _),
+      ("imm-rmw",    3, tAluImmRmw _),  ("quick-rmw",  2, tQuickMemRmw _),
+      ("unary",      4, tUnaryReg _),   ("unary-mem",  3, tUnaryMem _),
+      ("shift-imm",  5, tShiftImm _),   ("shift-reg",  4, tShiftReg _),
+      ("bitop",      3, tBitopReg _),   ("bitop-mem",  3, tBitopMem _),
+      ("bf-reg",     3, tBitfieldReg _),("bf-mem",     3, tBitfieldMem _),
+      ("ext",        3, tExtSwapTas _),
+      ("addx",       3, tAddxSubxReg _),("addx-mem",   2, tAddxSubxMem _),
+      ("bcd",        2, tBcdReg _),     ("bcd-mem",    1, tBcdMem _),
+      ("pack",       2, tPackUnpk _),   ("exg",        2, tExg _),
+      ("ccr",        4, tCcrOps _),     ("move-ccr",   2, tMoveCcrDn _),
+      ("fromsr",     1, tMoveFromSr _), ("fromccr-mem",1, tMoveCcrStore _),
+      ("mul",        3, tMul _),        ("div",        3, tDiv _),
+      ("cmp2",       2, tCmp2Chk2 _),   ("cas",        2, tCas _),
+      ("cas2",       1, tCas2 _),
+      ("movem",      3, tMovem _),      ("movep",      2, tMovep _),
+      ("lea",        3, tLea _),        ("pea",        2, tPea _),
+      ("link",       2, tLinkUnlk _),   ("scc",        3, tScc _),
+      ("bcc",        5, tBccForward _), ("bra",        2, tBraForward _),
+      ("jmp",        1, tJmpForward _), ("dbcc",       3, tDbcc _),
+      ("bsr",        3, tBsrRts _),     ("jsr",        2, tJsrRts _),
+      ("rtd",        1, tBsrRtd _),     ("rtr",        1, tRtr _),
+      ("usp",        1, tMoveUsp _),    ("movec",      1, tMovec _),
+      ("moves",      2, tMoves _),
+      ("chk",        1, tChk _),        ("trap",       1, tTrap _),
+      ("trapv",      1, tTrapv _),      ("trapcc",     1, tTrapcc _)
     )
-    private val totalWeight = templates.map(_._1).sum
+    private val skipTags: Set[String] =
+      sys.env.get("FUZZ_SKIP").map(_.split(",").map(_.trim).filter(_.nonEmpty).toSet).getOrElse(Set.empty)
+    private val templates = allTemplates.filterNot(t => skipTags.contains(t._1))
+    private val totalWeight = templates.map(_._2).sum
 
     def nextBlock(): Block = {
       var w = r.nextInt(totalWeight)
       var i = 0
-      while (w >= templates(i)._1) { w -= templates(i)._1; i += 1 }
-      val body = templates(i)._2()
+      while (w >= templates(i)._2) { w -= templates(i)._2; i += 1 }
+      val body = templates(i)._3()
       // 0/1 two-byte filler prefix: shifts the template across BOTH fetch-group
       // slots (slot-1 is where the decode-race class lives). NOT `nop`: NOP
       // (0x4E71) currently decodes ILLEGAL in the DUT (fuzz finding — the
