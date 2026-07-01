@@ -41,6 +41,7 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     // poke them in sim (simPublic).
     val flush = Bool()
     val commitPorts = Vec.fill(2)(Flow(CommitSlot()))
+    spinal.core.sim.SimPublic(commitPorts)   // sim-only debug (bf3c bring-up)
 
     // ── Committed-identity init ────────────────────────────────────────────────
     // Counter 0..(ARCH_INT_REGS-1) drives intRat.commits(0) with (addr=i, data=i) —
@@ -250,6 +251,12 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     uopsPort.payload(1) := slot1
     uopsPort.payload(0).valid.allowOverride; uopsPort.payload(0).valid := du.uops.valid
     uopsPort.payload(1).valid.allowOverride; uopsPort.payload(1).valid := uop1Sig
+    // sim-only debug visibility (bf3c bring-up)
+    spinal.core.sim.SimPublic(fire, uop1Sig)
+    uopsPort.payload.foreach { p =>
+      spinal.core.sim.SimPublic(p.pc, p.dstArch, p.pdst, p.pdstOld, p.pdstValid,
+                                p.psrcA, p.psrcB, p.psrcC)
+    }
 
     // ── Commit + init mux on intRat.commits(0) ─────────────────────────────────
     when(!initDone) {
