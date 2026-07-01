@@ -4,6 +4,7 @@ import m68k040.frontend.{DecodePacket, PipeStage}
 import m68k040.services.{DecodeFeedService, DecodeUopService}
 import m68k040.isa.Size
 import spinal.core._
+import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
 
@@ -171,7 +172,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
                                       Vec(s1mi_opw, s1mi_pkt.words(2), s1mi_pkt.words(3)))
     val slot1IsBfDynMemEarly = fed.valid && fed.payload.slot1Valid &&
       (slot1Spec0.op === DecOp.BITFIELD) && !slot1Spec0.microcoded &&
-      ((slot1Spec0.bfOp === 0) || (slot1Spec0.bfOp === 1) || (slot1Spec0.bfOp === 3)) &&  // BFFFO(5) deferred
+      ((slot1Spec0.bfOp === 0) || (slot1Spec0.bfOp === 1) || (slot1Spec0.bfOp === 3) || (slot1Spec0.bfOp === 5)) &&
       (s1bfExt(11) || s1bfExt(5)) &&
       (s1bfEa.klass === EaClass.MEMSIMPLE) && (s1bfEa.autoMode === EaAuto.NONE) && s1bfEa.baseValid
 
@@ -335,9 +336,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // base EAs (MEMSIMPLE, no auto, baseValid) — abs/PC-rel dynamic deferred (stay on 3a).
     val s0bfExt    = s0pkt.words(1)
     val s0bfDynM   = s0bfExt(11) || s0bfExt(5)
-    // BFFFO (bfOp=5) dynamic-mem DEFERRED (prefunnel->flag-writer X-preservation hazard): NOT
-    // routed -> falls to the 3a crack which gates it illegal. BFTST/BFEXTU/BFEXTS (0/1/3) route.
-    val s0bfRdOnly = (spec0.bfOp === 0) || (spec0.bfOp === 1) || (spec0.bfOp === 3)
+    // All four read-only ops route: BFTST(0)/BFEXTU(1)/BFEXTS(3)/BFFFO(5). BFFFO rides the
+    // FFOFULL redesign (prefunnel -> one committed bfMem funnel carrying Dn2+NZ; no
+    // flag-carrying trailing ADD -> X untouched by construction).
+    val s0bfRdOnly = (spec0.bfOp === 0) || (spec0.bfOp === 1) || (spec0.bfOp === 3) || (spec0.bfOp === 5)
     val s0bfEa     = EaDecoder.decode(s0opw(5 downto 0), Size.LONG,
                                       Vec(s0opw, s0pkt.words(2), s0pkt.words(3)))
     val s0bfEaOk   = (s0bfEa.klass === EaClass.MEMSIMPLE) && (s0bfEa.autoMode === EaAuto.NONE) && s0bfEa.baseValid
@@ -350,6 +352,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // sequencer logic + transitions live in the µcode SEQUENCER region further down.
     val ucActive    = RegInit(False)
     val ucPendValid = RegInit(False)
+    ucActive.simPublic(); ucPendValid.simPublic()
     val slot1IsMovem = slot1IsMovemEarly   // slot1's MOVEM marker (decoded above, shared via CSE)
     val movemPendValid = RegInit(False)
     val movemPendPkt   = Reg(DecodePacket())
@@ -531,6 +534,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // group is the untested edge — the slot1 stash carries a NORMAL slot1 (the tested
     // programs put a normal instr / NOP after each X-mem op).
     val ucPc     = Reg(UInt(7 bits))   // µPC into the ROM (romSize 87 with 3c dyn-mem -> needs 7 bits)
+    ucPc.simPublic()
     val ucCtx    = Reg(Microcode.Ctx())
     when(pipeFlush) { ucActive := False }
 
@@ -809,13 +813,23 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
                            U(Microcode.BF_DYN_RD_DO1_ENTRY,  ew bits)),
       U(Microcode.BF_DYN_RD_DO0_ENTRY, ew bits))
     // Bit-field RMW DYNAMIC (slice 3c): BFCHG(2)/BFCLR(4)/BFSET(6) with Do||Dw -> the dynamic
-    // RMW entry (Do=1 recomputes byteBase; Do=0 folds). BFINS(7) dynamic is DEFERRED -> a
-    // vector-4 ILLEGAL entry (the prefunnel+register-form path hits the X-preservation bug).
+    // RMW entry (Do=1 recomputes byteBase; Do=0 folds). BFINS(7) dynamic -> the dedicated INS
+    // entries (prefunnel -> register-form insert -> reload+inverse-funnel; X untouched).
+    // Do=1 at an ABS EA (baseValid=False, (xxx).W/.L) is OUT OF SCOPE (the DO1 chains'
+    // UBfAdd reads SEaBase as a REGISTER — an abs EA has none, so the byteBase add would
+    // read garbage): route it to the vector-4 ILLEGAL entry (traps, NOT silent-wrong) —
+    // mirroring the read-only path, where the !baseValid dynamic falls to the 3a bfmBad
+    // illegal gate. Do=0 abs is IN scope (byteBase folds into the disp; the loads/stores
+    // take the LS disp-only path exactly like the static 3b abs chain).
     val ucBfRmwOp   = ucEntryPkt.words(0)(10 downto 8)
     val ucIsBfRmwDyn = ucIsBfRmw && (ucBfDo || ucBfDw)
-    val ucBfRmwDynEntry = Mux(ucBfRmwOp === 7, U(Microcode.BF_DYN_ILLEGAL_ENTRY, ew bits),
-      Mux(ucBfDo, U(Microcode.BF_DYN_RMW_DO1_ENTRY, ew bits),
-                  U(Microcode.BF_DYN_RMW_DO0_ENTRY, ew bits)))
+    val ucBfRmwDynEntry = Mux(ucBfDo && !ucBfEaDec.baseValid,
+      U(Microcode.BF_DYN_ILLEGAL_ENTRY, ew bits),
+      Mux(ucBfRmwOp === 7,
+        Mux(ucBfDo, U(Microcode.BF_DYN_INS_DO1_ENTRY, ew bits),
+                    U(Microcode.BF_DYN_INS_DO0_ENTRY, ew bits)),
+        Mux(ucBfDo, U(Microcode.BF_DYN_RMW_DO1_ENTRY, ew bits),
+                    U(Microcode.BF_DYN_RMW_DO0_ENTRY, ew bits))))
     val ucRealEntry = Mux(ucIsMemInd, ucMiEntry,
       Mux(ucIsBfDynRd, ucBfDynRdEntry,
       Mux(ucIsBfRmwDyn, ucBfRmwDynEntry,
@@ -880,6 +894,21 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     queue.io.push.count := pushReg.payload.count
     queue.io.push.uops  := pushReg.payload.uops
     pushReg.ready       := queue.io.push.ready
+    // ── sim-only debug probes (bf3c bring-up; TEMPORARY) ──
+    pushReg.valid.simPublic(); pushReg.payload.count.simPublic()
+    queue.io.push.ready.simPublic()
+    for (i <- 0 until 4) {
+      pushReg.payload.uops(i).pc.simPublic(); pushReg.payload.uops(i).faulted.simPublic()
+      pushReg.payload.uops(i).faultVector.simPublic(); pushReg.payload.uops(i).firstOfInstr.simPublic()
+    }
+    fed.valid.simPublic(); fed.ready.simPublic()
+    fed.payload.packets(0).pc.simPublic(); fed.payload.packets(1).pc.simPublic()
+    fed.payload.packets(0).words(0).simPublic(); fed.payload.packets(0).words(1).simPublic()
+    fed.payload.packets(0).simple.simPublic(); fed.payload.packets(0).lenWords.simPublic()
+    fed.payload.packets(0).fault.simPublic(); fed.payload.packets(0).wordCount.simPublic()
+    fed.payload.slot1Valid.simPublic()
+    stashValid.simPublic(); normalHeadValid.simPublic(); ucBegin.simPublic()
+    pipeFlush.simPublic()
 
     // ── fed.ready + stash/MOVEM consume/advance (when the produced group is accepted) ──
     // Normal: consume `fed` when the produced group enters pushReg (not while replaying a
@@ -963,6 +992,16 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         } elsewhen(slot1IsMovepEarly) {
           movepPendValid := True
           movepPendPkt   := fed.payload.packets(1)
+        } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly) {
+          // A µCODE-OWNED slot1 (CAS/MOVES/BCD-mem/mem-indirect/bf-dyn) behind a slot0
+          // MOVEM must stash the PACKET for the engine (ucPend), NOT the a1raw µops —
+          // the assembler's placeholder crack of a microcoded opword is an ILLEGAL/
+          // benign-MOVE phantom that would replay as a spurious committed µop. The
+          // ucBegin/movepBegin stash arms below already had this elsewhen; this arm was
+          // MISSING it (latent phantom-commit bug for a {MOVEM, µcoded} fetch pair —
+          // proven by the movem-ucode-s1 lock-step, which diverges without this arm).
+          ucPendValid := True
+          ucPendPkt   := fed.payload.packets(1)
         } otherwise {
           stashValid  := True
           stashCount  := a1raw.count

@@ -151,6 +151,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // handler frame -> the pulse squashes the orphan, then E_DRAIN drains committed stores.
       lsEu.sqCommit.valid   := rob.logic.retire0
       lsEu.sqCommit.payload := rob.logic.h0
+      // 2-WIDE retire: a store retiring in SLOT 1 must ALSO mark its SQ entry committed
+      // (h0-only wiring wedged the SQ head — see StoreQueue.commit1).
+      lsEu.sqCommit1.valid   := rob.logic.retire1
+      lsEu.sqCommit1.payload := rob.logic.h1
       val excEntering = rob.logic.excActive && !RegNext(rob.logic.excActive, init = False)
       lsEu.sqFlush          := host[RedirectService].doFlush || excEntering
 
@@ -159,12 +163,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dtlb.umAccessRobId := lsEu.xlateRobId
       dtlb.umCommitValid := rob.logic.retire0
       dtlb.umCommitId    := rob.logic.h0
+      dtlb.umCommit1Valid := rob.logic.retire1
+      dtlb.umCommit1Id    := rob.logic.h1
       dtlb.umFlush       := host[RedirectService].doFlush
       // ── ITLB U deferred-write queue wiring (U-only; mirrors top/FullCoreSynth) ──
       val itlb = host[m68k040.mmu.ItlbPlugin]
       itlb.umAccessRobId := U(0, 6 bits)
       itlb.umCommitValid := rob.logic.retire0
       itlb.umCommitId    := rob.logic.h0
+      itlb.umCommit1Valid := rob.logic.retire1
+      itlb.umCommit1Id    := rob.logic.h1
       itlb.umFlush       := host[RedirectService].doFlush
 
       // ── Commit-time mispredict redirect fan-out (registered doFlush pulse) ──
@@ -585,6 +593,55 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val cap   = 4000
       while (handle.result.size < n && guard < cap) {
         cd.waitSampling(); guard += 1
+        if (sys.env.contains("CR_DECTRACE") && guard < 700) {
+          val d = dut.dec.logic
+          if (d.pushReg.valid.toBoolean) {
+            val cnt = d.pushReg.payload.count.toInt
+            val rdy = d.queue.io.push.ready.toBoolean
+            val us = (0 until (cnt min 4)).map { i =>
+              val u = d.pushReg.payload.uops(i)
+              f"pc=0x${u.pc.toLong & 0xffffffffL}%08x${if (u.firstOfInstr.toBoolean) "F" else " "}${if (u.faulted.toBoolean) f"!v${u.faultVector.toInt}" else ""}"
+            }.mkString(" | ")
+            println(f"[dtr] g=$guard%4d PUSH${if (rdy) "" else "(held)"} n=$cnt $us  ucAct=${d.ucActive.toBoolean} ucBeg=${d.ucBegin.toBoolean} ucPend=${d.ucPendValid.toBoolean} ucPc=${d.ucPc.toInt} fedV=${d.fed.valid.toBoolean} fedR=${d.fed.ready.toBoolean} f0=0x${d.fed.payload.packets(0).pc.toLong & 0xffffffffL}%08x[w0=0x${d.fed.payload.packets(0).words(0).toLong & 0xffffL}%04x w1=0x${d.fed.payload.packets(0).words(1).toLong & 0xffffL}%04x s=${d.fed.payload.packets(0).simple.toBoolean} len=${d.fed.payload.packets(0).lenWords.toInt} wc=${d.fed.payload.packets(0).wordCount.toInt} ft=${d.fed.payload.packets(0).fault.toBoolean}] f1=0x${d.fed.payload.packets(1).pc.toLong & 0xffffffffL}%08x s1v=${d.fed.payload.slot1Valid.toBoolean} stash=${d.stashValid.toBoolean} flush=${d.pipeFlush.toBoolean}")
+          } else if (d.ucBegin.toBoolean || d.pipeFlush.toBoolean) {
+            println(f"[dtr] g=$guard%4d      ucAct=${d.ucActive.toBoolean} ucBeg=${d.ucBegin.toBoolean} ucPend=${d.ucPendValid.toBoolean} ucPc=${d.ucPc.toInt} fedV=${d.fed.valid.toBoolean} fedR=${d.fed.ready.toBoolean} f0=0x${d.fed.payload.packets(0).pc.toLong & 0xffffffffL}%08x f1=0x${d.fed.payload.packets(1).pc.toLong & 0xffffffffL}%08x s1v=${d.fed.payload.slot1Valid.toBoolean} stash=${d.stashValid.toBoolean} flush=${d.pipeFlush.toBoolean}")
+          }
+        }
+        if (sys.env.contains("CR_RENTRACE") && guard < 900) {
+          val rn = dut.ren.logic
+          if (rn.fire.toBoolean) {
+            val n = if (rn.uop1Sig.toBoolean) 2 else 1
+            for (s <- 0 until n) {
+              val u = rn.uopsPort.payload(s)
+              println(f"[ren] g=$guard%4d s$s pc=0x${u.pc.toLong & 0xffffffffL}%08x dst=${u.dstArch.toInt}%2d(v=${if (u.pdstValid.toBoolean) 1 else 0}) pdst=${u.pdst.toInt}%2d old=${u.pdstOld.toInt}%2d srcA=${u.psrcA.toInt}%2d srcB=${u.psrcB.toInt}%2d srcC=${u.psrcC.toInt}%2d")
+            }
+          }
+          val ws = dut.rfInt.logic.dbgW
+          for (i <- 0 until ws.size) {
+            if (ws(i).valid.toBoolean) {
+              println(f"[prf] g=$guard%4d w$i p${ws(i).address.toInt}%2d := 0x${ws(i).data.toLong & 0xffffffffL}%08x")
+            }
+          }
+          for (k <- 0 until 2) {
+            val c = dut.ren.logic.commitPorts(k)
+            if (c.valid.toBoolean) {
+              val p = c.payload
+              println(f"[cmt] g=$guard%4d k$k arch=${p.intArch.toInt}%2d new=${p.intNew.toInt}%2d old=${p.intOld.toInt}%2d iw=${if (p.intWrite.toBoolean) 1 else 0}")
+            }
+          }
+          val fl = dut.ren.logic.intFree
+          println(f"[fl ] g=$guard%4d head=${fl.head.toInt}%2d tail=${fl.tail.toInt}%2d cnt=${fl.count.toInt}%2d pa0=${fl.dbgPushAddr(0).toInt}%2d pa1=${fl.dbgPushAddr(1).toInt}%2d")
+        }
+        if (sys.env.contains("CR_STALL") && guard > cap - 40) {
+          println(f"[$name] STALL g=$guard committed=${handle.result.size} ucAct=${dut.dec.logic.ucActive.toBoolean} ucPend=${dut.dec.logic.ucPendValid.toBoolean} ucPc=${dut.dec.logic.ucPc.toInt} robHead=${dut.rob.logic.head.toInt} robCount=${dut.rob.logic.count.toInt} exc=${dut.rob.logic.excActive.toBoolean} vec=${dut.rob.logic.exc.curVec.toInt} excPc=0x${dut.rob.logic.exc.curPc.toLong & 0xffffffffL}%08x")
+          if (guard == cap) {
+            val q = dut.lsEu.logic.sq
+            println(f"[$name] SQ head=${q.head.toInt} tail=${q.tail.toInt} count=${q.count.toInt}")
+            for (i <- 0 until 8) {
+              println(f"[$name] SQ[$i] v=${q.valids(i).toBoolean} c=${q.committed(i).toBoolean} rob=${q.robIds(i).toInt} pa=0x${q.paddrs(i).toLong & 0xffffffffL}%08x")
+            }
+          }
+        }
       }
       assert(handle.result.size >= n,
         s"[$name] only ${handle.result.size}/$n instructions committed within $cap cycles")
@@ -1358,19 +1415,23 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #7,%d2",  "moveq #28,%d3", "bfexts (%a0){%d2:%d3},%d6"  // SPILL spanning bytes
     )).mkString(" ; "))
   }
-  // DEFERRED (slice 3c): BFFFO mem-dynamic needs a prefunnel (4-input: lo/hi/packed/offset) then
-  // a flag-writing funnel. That prefunnel→flag-writer slow-pipe pattern triggers an X-preservation
-  // bug (X cleared though no µop writes X) not yet root-caused; BFFFO dynamic-mem is gated ILLEGAL
-  // (traps, NOT silent-wrong) until fixed. The single-op path is byte-correct; the failure is only
-  // when an instruction follows. Re-enable (remove the bfOp=5 routing exclusion) once fixed.
-  ignore("lock-step: BFFFO mem DYNAMIC off/wd/both (offset+index, neg offset, all-zero) [DEFERRED]") {
+  // BFFFO mem-dynamic (un-deferred): the FFOFULL redesign — a prefunnel (bfMem BFTST form)
+  // collapses lo/hi+bitOff -> field32, then ONE committed bfMem funnel (bfStoreForm=6) computes
+  // Dn2 = full-signed-Dn[off] + first-set-index with N/Z from the field. NO flag-carrying
+  // trailing ADD (the deferred design carried the flags on a generic writesFlags ADD µop,
+  // whose writesX=True clobbered X with the ADD's carry-out — the historical "X spuriously
+  // cleared"). X-untouched is asserted through the REAL datapath: the trailing ADDX reads the
+  // physical X (d0 = 0+0+X = 1 iff the sentinel survived the whole chain).
+  test("lock-step: BFFFO mem DYNAMIC off/wd/both (offset+index, neg offset, all-zero)", VerilatorTest) {
     runLockStep("bf3c-ffo", (bfDynSeed ++ Seq(
       "ori #0x10,%ccr",
       "moveq #0,%d2",  "moveq #8,%d3",  "bfffo (%a0){%d2:%d3},%d1", // 0x9A=1001_1010 -> 0 lz -> off0+0=0
       "moveq #8,%d2",  "moveq #8,%d3",  "bfffo (%a0){%d2:%d3},%d4",  // 0xBC=1011_1100 -> off8+0=8
       "moveq #1,%d2",  "bfffo (%a0){%d2:#8},%d5",                    // dyn off only -> off1 + index
       "moveq #-8,%d2", "moveq #8,%d3",  "bfffo (%a0){%d2:%d3},%d6",  // NEG off -> 0x78=0111_1000 -> off-8+1=-7
-      "moveq #16,%d2", "moveq #32,%d3", "bfffo (%a0){%d2:%d3},%d7"   // dyn wd32 over 0xDEF0... -> off16+index
+      "moveq #16,%d2", "moveq #32,%d3", "bfffo (%a0){%d2:%d3},%d7",  // dyn wd32 over 0xDEF0... -> off16+index
+      "moveq #0,%d0",  "addx.l %d0,%d0",                             // X CONSUMER: d0 = X (must be 1)
+      "nop"
     )).mkString(" ; "))
   }
   test("lock-step: BFTST mem DYNAMIC off/wd/both (flags only, X untouched)", VerilatorTest) {
@@ -1412,6 +1473,25 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l (%a0),%d4", "move.l 4(%a0),%d5"
     )).mkString(" ; "), checkMem = Seq(0x3000L, 0x3004L), checkSpan = 4)
   }
+  // BFINS mem DYNAMIC: insert Dn into the (dynamic offset/width) memory field; N/Z from the
+  // INSERTED value (Musashi: insert_base = Dn<<(32-width)), V=C=0, X untouched. Read back
+  // through memory + checkMem. Small/large/NEGATIVE offset, spill, width 0->32; the SR is
+  // compared at every commit so the N/Z from each insert is asserted; the trailing ADDX
+  // asserts X-untouched through the REAL physical-X datapath (d0 = 0+0+X = 1).
+  test("lock-step: BFINS mem DYNAMIC off/wd/both (insert, N/Z from inserted, neg offset, spill, wd32)", VerilatorTest) {
+    runLockStep("bf3c-ins", (bfDynSeed ++ Seq(
+      "ori #0x10,%ccr",                                                           // X=1 sentinel (X untouched)
+      "move.l #0xffffffff,%d1", "moveq #-32,%d2", "moveq #8,%d3",  "bfins %d1,(%a0){%d2:%d3}",  // NEG off -32 -> byteBase 0x3000 ALIGNED (N=1)
+      "move.l #0x1234,%d1",     "moveq #0,%d2",   "moveq #16,%d3", "bfins %d1,(%a0){%d2:%d3}",  // both dyn: off0 wd16
+      "move.l #0x2aaaaaaa,%d1", "moveq #6,%d2",   "moveq #30,%d3", "bfins %d1,(%a0){%d2:%d3}",  // SPILL: bitOff6 wd30 (5-byte span)
+      "moveq #0x5a,%d1",        "moveq #9,%d2",                    "bfins %d1,(%a0){%d2:#7}",   // dyn OFF only, static wd
+      "move.l #0xdeadbeef,%d1", "moveq #0,%d3",                    "bfins %d1,(%a0){#4:%d3}",   // dyn WD only: wd 0 -> 32 (spill)
+      "moveq #0,%d1",           "moveq #-1,%d2",  "moveq #4,%d3",  "bfins %d1,(%a0){%d2:%d3}",  // NEG off-1 (bitOff7), insert 0 -> Z=1
+      "moveq #0,%d0",           "addx.l %d0,%d0",                                               // X CONSUMER: d0 = X (must be 1)
+      "move.l (%a0),%d4", "move.l -4(%a0),%d5", "move.l 4(%a0),%d6",                            // read back through memory
+      "nop"
+    )).mkString(" ; "), checkMem = Seq(0x3000L, 0x3004L, 0x3008L), checkSpan = 4)
+  }
 
   // ════════════════════════════════════════════════════════════════════════════
   // Bit-field MEMORY RMW forms (BFCHG/BFCLR/BFSET/BFINS <ea>) — slice 3b. RMW then
@@ -1420,6 +1500,48 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // LOADED field (before modify). Cover bitOff=0 (lomask=0 corner) and bitOff>0; span
   // 1..5 bytes incl. the 5-byte hi' BYTE store; width 1/8/16/32; BFINS Dn2 0/-1/partial.
   // ════════════════════════════════════════════════════════════════════════════
+
+  // ── SQ slot-1-retire commit regression (Bug-2 blast radius; NOT bit-field-specific) ──
+  // The ROB retires 2 µops/cycle but the SQ commit port carried only h0: a store retiring
+  // in SLOT 1 (h1) never got its SQ entry marked committed -> the entry wedged the SQ head
+  // (headReady needs committed(head)) -> any younger PARTIAL/same-line-overlap load stalled
+  // forever = core deadlock. A back-to-back byte-store burst retires in pairs (some stores
+  // land at h1), and the trailing LONG loads partially overlap them (byte-vs-long -> no
+  // full forward -> must wait for the DRAIN that never came). Fixed by the 2-wide SQ
+  // commit (StoreQueue.commit1 wired to retire1/h1).
+  test("lock-step: store burst + partial-overlap load (SQ slot-1-retire commit)", VerilatorTest) {
+    runLockStep("sq-slot1-commit", Seq(
+      "move.l #0x2000,%a0",
+      "moveq #0x11,%d0", "moveq #0x22,%d1",
+      "move.b %d0,(%a0)",  "move.b %d1,1(%a0)",
+      "move.b %d0,2(%a0)", "move.b %d1,3(%a0)",
+      "move.b %d0,4(%a0)", "move.b %d1,5(%a0)",
+      "move.b %d0,6(%a0)", "move.b %d1,7(%a0)",
+      "move.l (%a0),%d2",  "move.l 4(%a0),%d3",   // LONG loads partial-overlap the byte stores
+      "nop"
+    ).mkString(" ; "), checkMem = Seq(0x2000L, 0x2004L), checkSpan = 4)
+  }
+  // ── MOVEM-slot0 + µCODED-slot1 fetch pair (decode stash ownership regression) ─────────
+  // When a fetch group pairs {slot0 = MOVEM, slot1 = µcode-owned op (CAS here)}, the MOVEM
+  // FSM's entry stash arm must stash the slot1 PACKET for the µcode engine (ucPend) — the
+  // ucBegin/movepBegin arms did, but the movemBegin arm stashed the a1raw PLACEHOLDER µops
+  // (the assembler's illegal/benign crack of a microcoded opword) and replayed them as a
+  // phantom committed µop. Latent for any {MOVEM, CAS/MOVES/BCD-mem/mem-indirect/bf-dyn}
+  // adjacency that the aligner pairs.
+  test("lock-step: MOVEM slot0 + CAS slot1 fetch pair (ucode stash ownership)", VerilatorTest) {
+    runLockStep("movem-ucode-s1", Seq(
+      "move.l #0x2000,%a0", "move.l #0x3000,%a1",
+      "move.l #0x11111111,%d0", "move.l #0x22222222,%d1",
+      "moveq #5,%d2", "moveq #9,%d3",
+      "move.l %d2,(%a0)",            // mem = Dc -> CAS matches
+      "nop",                         // pairing filler: aligns MOVEM to a group's SLOT 0
+      "movem.l %d0-%d1,(%a1)",       // 2-word MOVEM (slot0 of the pair)
+      "cas.l %d2,%d3,(%a0)",         // 2-word µcoded CAS (slot1 of the pair)
+      "move.l (%a0),%d4",            // 9 if the CAS executed exactly once
+      "move.l (%a1),%d5", "move.l 4(%a1),%d6",
+      "nop"
+    ).mkString(" ; "), checkMem = Seq(0x2000L, 0x3000L, 0x3004L), checkSpan = 4)
+  }
 
   // BFSET bitOff=0 (lomask=0 corner) — set 16 bits at byte 0, read back through memory.
   test("lock-step: BFSET mem (An) bitOff=0 width16, read-back", VerilatorTest) {
