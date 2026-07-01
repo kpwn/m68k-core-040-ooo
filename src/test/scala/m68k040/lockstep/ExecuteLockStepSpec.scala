@@ -919,6 +919,59 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  // ── ADDA/SUBA/CMPA (An-destination arithmetic) — FUZZER-CAUGHT decode bug ───
+  // The decoder routed srcA=EA / srcB=An while the ALU computes a-b, so SUBA
+  // computed src-An (the exact negative) and CMPA's flags were reversed; ADDA.L
+  // was masked by commutativity but ADDA.W also size-merged the old An upper 16
+  // instead of carry-propagating the full-32 add of the sign-extended source.
+  // Musashi: `AX ± MAKE_INT_16(src)` / 32-bit `dst - src` flags for CMPA.
+  test("lock-step: ADDA/SUBA .W/.L reg/An sources (operand order + .W sign-extend + carry)", VerilatorTest) {
+    runLockStep("adda-suba-reg", Seq(
+      "move.l #0x00001000,%a2", "move.l #0x00000123,%d1", "suba.l %d1,%a2",  // An - src = 0xedd
+      "move.l %a2,%d2",
+      "move.l #0x00001000,%a3", "adda.l %d1,%a3", "move.l %a3,%d3",          // 0x1123
+      // .W source sign-extends: 0xffff -> -1; the full-32 op carry-propagates
+      "move.l #0x00010000,%a4", "move.l #0x0000ffff,%d4", "suba.w %d4,%a4",  // 0x10000-(-1)=0x10001
+      "move.l %a4,%d5",
+      "move.l #0x00010000,%a5", "adda.w %d4,%a5", "move.l %a5,%d6",          // 0x10000+(-1)=0xffff
+      // positive .W source (no sign-extend)
+      "move.l #0x00000010,%d0", "suba.w %d0,%a5", "move.l %a5,%d7",          // 0xffef
+      // An-direct source
+      "move.l #0x00000100,%a1", "suba.l %a1,%a4", "adda.l %a1,%a5",
+      "move.l %a4,%d2", "move.l %a5,%d3"
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: CMPA.W/.L flags (Z/N/C/V cases, sign-extended .W source, no write)", VerilatorTest) {
+    runLockStep("cmpa-flags", Seq(
+      "move.l #5,%a1", "move.l #5,%d1", "cmpa.l %d1,%a1",                    // equal -> Z
+      "move.l #3,%a2", "move.l #7,%d2", "cmpa.l %d2,%a2",                    // 3-7 -> N,C
+      "move.l #0x80000000,%a3", "move.l #1,%d3", "cmpa.l %d3,%a3",           // INT_MIN-1 -> V
+      "move.l #7,%a4", "move.l #3,%d4", "cmpa.l %d4,%a4",                    // 7-3 -> none
+      "move.l #0x7fffffff,%a6", "move.l #0xffffffff,%d5", "cmpa.l %d5,%a6",  // MAX-(-1) -> V,C
+      // .W: source sign-extends to -1
+      "move.l #0,%a5", "move.l #0xffff,%d6", "cmpa.w %d6,%a5",               // 0-(-1) -> C
+      "move.l #0xffffffff,%a5", "cmpa.w %d6,%a5",                            // -1-(-1) -> Z
+      "move.l #0x10,%d7", "cmpa.w %d7,%a5",                                  // -1-16 -> N
+      "cmpa.l %a4,%a3",                                                      // An-direct source
+      "move.l %a3,%d0"                                                       // A3 unchanged readback
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: ADDA/SUBA/CMPA memory sources (.W/.L)", VerilatorTest) {
+    runLockStep("adda-family-mem", Seq(
+      "move.l #0x3000,%a0",
+      "move.l #0xfffffffe,%d0", "move.l %d0,(%a0)",                          // mem[0x3000]=-2
+      "move.l #0x100,%a1", "suba.l (%a0),%a1", "move.l %a1,%d1",             // 0x100-(-2)=0x102
+      "move.l #0x100,%a2", "adda.w (%a0),%a2", "move.l %a2,%d2",             // +sext(0xffff)=0xff
+      "move.l #0x100,%a3", "cmpa.w (%a0),%a3",                               // 0x100-(-1) flags
+      "cmpa.l (%a0),%a3",                                                    // 0x100-(-2) flags
+      "move.l #0x00000042,%d3", "move.l %d3,(0x3004).l",                     // positive word
+      "move.l #0x100,%a4", "adda.l (0x3004).l,%a4", "move.l %a4,%d4",        // abs.l source
+      "suba.w (0x3006).w,%a4", "move.l %a4,%d5"                              // low word 0x0042
+    ).mkString(" ; "))
+  }
+
   test("lock-step: mixed straight-line (~24 instrs)", VerilatorTest) {
     runLockStep("mixed", Seq(
       "moveq #1,%d0", "moveq #2,%d1", "moveq #3,%d2", "moveq #4,%d3",

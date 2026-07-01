@@ -169,11 +169,19 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     issuePort.ready := !((s1Valid && isSlow) || s1aValid || s1bValid || s2Valid || s3Valid)
 
     // ---- S1: FAST execute (ALU datapath; NO shifter, NO CCR-RMW on this cone) ----
+    // ── ADDA/SUBA/CMPA "An-wide" marker: isMovea on a non-MOVE ALU op. The op runs
+    // FULL-32 regardless of the size field (An has no partial write), the .W source
+    // is SIGN-EXTENDED to 32 first (Musashi MAKE_INT_16), and (CMPA) the flags are
+    // computed at 32-bit width. The size field still sized the cracked LOAD for a
+    // .W memory source; here it only selects the sign-extension. ──────────────────
+    val anWide = u1.isMovea && (u1.op =/= DecOp.MOVE)
+    val anWideSrc2 = Mux(u1.size === Size.WORD,
+                         s1Src2(15 downto 0).asSInt.resize(32).asBits, s1Src2)
     val cmd = AluCmd()
     cmd.op      := u1.op
-    cmd.size    := u1.size
+    cmd.size    := Mux(anWide, Size.LONG, u1.size)
     cmd.src1    := s1Src1
-    cmd.src2    := s1Src2
+    cmd.src2    := Mux(anWide, anWideSrc2, s1Src2)
     cmd.xIn     := s1X                    // current X (NEGX: 0 - Dn - X)
     cmd.extByte := u1.extByte             // EXT/EXTB byte-source marker
     cmd.bitOp   := u1.bitOp               // BTST/BCHG/BCLR/BSET sub-kind
@@ -397,8 +405,11 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // CASOP writes the FULL computed value (the .B/.W partial-register merge is folded
     // INSIDE the CASOP datapath, since the merge depends on the match predicate) -> bypass
     // the generic size-merge (like MOVEA / fromCcr-Sr).
+    // anWide (ADDA/SUBA): the full-32 datapath result, NO merge (the WORD size field
+    // would otherwise merge the old An's upper 16 over the carry-propagated result).
     val mergedResult = Mux(casIsOp, casResult,
-                       Mux(u1.isMovea, moveaResult, Mux(isFromCcrSr, sizeMergedMove, sizeMerged)))
+                       Mux(anWide, opResult,
+                       Mux(u1.isMovea, moveaResult, Mux(isFromCcrSr, sizeMergedMove, sizeMerged))))
 
     // ---- S1: ANDI/ORI/EORI #imm,CCR (toCcr) — CCR read-modify-write (FAST path) ----
     // Assemble the current 5-bit CCR {X,N,Z,V,C} from the flag PRFs, apply the logical

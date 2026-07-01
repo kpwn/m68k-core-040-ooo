@@ -795,8 +795,13 @@ object OperationDecoder {
             when(line === 0xD || line === 0x9) { o.writesNzvc := True; o.writesX := True }   // ADD/SUB
               .elsewhen(line === 0xC || line === 0x8 || line === 0xB) { o.writesNzvc := True } // AND/OR/CMP
           } .elsewhen(opmode === 3 || opmode === 7) {
-            // ADDA/SUBA/CMPA : srcA = EA, srcB = An, dst An
-            o.srcA := easrc; o.srcB := anField; o.dst := anField
+            // ADDA/SUBA/CMPA : srcA = An (the DESTINATION operand — the ALU computes
+            // a-b, so the An must be the minuend for SUBA/CMPA), srcB = EA (the
+            // source), dst An. The .W form sign-extends the 16-bit source to 32 and
+            // the op runs full-32 (no partial merge; Musashi adda/suba/cmpa .W use
+            // MAKE_INT_16(src) against the whole An) — the assembler marks the op
+            // µop isMovea (the An-wide marker) and the ALU EU widens it.
+            o.srcA := anField; o.srcB := easrc; o.dst := anField
             when(line =/= 0xB) { o.dstWrites := True }
             when(line === 0xB) { o.writesNzvc := True }  // CMPA sets flags, no write
             when(opmode === 3) { o.size := Size.WORD } .otherwise { o.size := Size.LONG }
