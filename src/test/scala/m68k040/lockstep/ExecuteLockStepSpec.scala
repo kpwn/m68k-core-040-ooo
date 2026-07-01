@@ -151,6 +151,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // handler frame -> the pulse squashes the orphan, then E_DRAIN drains committed stores.
       lsEu.sqCommit.valid   := rob.logic.retire0
       lsEu.sqCommit.payload := rob.logic.h0
+      lsEu.sqCommitB.valid   := rob.logic.retire1
+      lsEu.sqCommitB.payload := rob.logic.h1
       val excEntering = rob.logic.excActive && !RegNext(rob.logic.excActive, init = False)
       lsEu.sqFlush          := host[RedirectService].doFlush || excEntering
 
@@ -158,12 +160,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val dtlb = host[m68k040.mmu.DtlbPlugin]
       dtlb.umAccessRobId := lsEu.xlateRobId
       dtlb.umCommitValid := rob.logic.retire0
+      dtlb.umCommitBValid := rob.logic.retire1
+      dtlb.umCommitBId    := rob.logic.h1
       dtlb.umCommitId    := rob.logic.h0
       dtlb.umFlush       := host[RedirectService].doFlush
       // ── ITLB U deferred-write queue wiring (U-only; mirrors top/FullCoreSynth) ──
       val itlb = host[m68k040.mmu.ItlbPlugin]
       itlb.umAccessRobId := U(0, 6 bits)
       itlb.umCommitValid := rob.logic.retire0
+      itlb.umCommitBValid := rob.logic.retire1
+      itlb.umCommitBId    := rob.logic.h1
       itlb.umCommitId    := rob.logic.h0
       itlb.umFlush       := host[RedirectService].doFlush
 
@@ -3471,6 +3477,20 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     runLockStep("exc-trapv-clear",
       "moveq #5,%d4 ; trapv ; moveq #7,%d3 ; loop: bra loop",
       nInstr = 4)
+  }
+
+  // A store that completes EARLY behind a long-latency head (DIV ~30cy) sits complete at
+  // h1 when the head finishes -> BOTH retire in one cycle -> the store retires in SLOT 1.
+  // The SQ commit mark must fire for slot 1 too (commitB), else the entry is never
+  // committed -> never drains (or is squashed by the next flush) = SILENT MEMORY LOSS.
+  test("lock-step: store dual-retires at SLOT 1 behind a completing DIV (SQ commitB)", VerilatorTest) {
+    runLockStep("sq-commit-slot1",
+      "move.l #0x3000,%a0 ; move.l #0xcafebabe,%d3 ; " +
+      "moveq #100,%d0 ; moveq #7,%d1 ; " +
+      "divu.w %d1,%d0 ; " +            // ~30cy at ROB head, uncompleted
+      "move.l %d3,(%a0) ; " +          // store completes early; sits at h1; dual-retires at SLOT 1
+      "moveq #1,%d5",                  // sentinel
+      nInstr = 7, checkMem = Seq(0x3000L), checkSpan = 4)
   }
 
   // ── DIVU.W / DIVS.W lock-step (32/16 -> Dn = {rem16, q16}, N/Z/V) ────────────

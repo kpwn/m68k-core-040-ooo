@@ -44,6 +44,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     umAccessRobId = UInt(6 bits)
     umCommitValid = Bool()
     umCommitId    = UInt(6 bits)
+    umCommitBValid = Bool()
+    umCommitBId    = UInt(6 bits)
     umFlush       = Bool()
   }
 
@@ -52,6 +54,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
   var umAccessRobId: UInt = null
   var umCommitValid: Bool = null
   var umCommitId:    UInt = null
+  var umCommitBValid: Bool = null   // retire slot 1 (dual-retire) — see UmWriteQueue.commitB
+  var umCommitBId:    UInt = null
   var umFlush:       Bool = null
   // Dedicated AXI port for THIS ITLB's walker + the U descriptor-write drain.
   var walkerAxi: Axi4 = null
@@ -71,6 +75,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     umAccessRobId.allowOverride; umAccessRobId := U(0, 6 bits)
     umCommitValid.allowOverride; umCommitValid := False
     umCommitId.allowOverride;    umCommitId    := U(0, 6 bits)
+    umCommitBValid.allowOverride; umCommitBValid := False
+    umCommitBId.allowOverride;    umCommitBId    := U(0, 6 bits)
     umFlush.allowOverride;       umFlush       := False
 
     // The ONE shared 68040 MMU control (read, not owned).
@@ -189,6 +195,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     umq.io.alloc.payload.newByte:= walker.io.rsp.umWrite.newByte
     umq.io.commit.valid   := umCommitValid
     umq.io.commit.payload := umCommitId
+    umq.io.commitB.valid   := umCommitBValid
+    umq.io.commitB.payload := umCommitBId
     umq.io.flush          := umFlush
 
     // ---- U drain: single-byte RMW over the ITLB AXI write channel ----

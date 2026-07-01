@@ -58,6 +58,11 @@ class StoreQueue(depth: Int = 8) extends Component {
     val alloc    = slave(Flow(SqAlloc()))
     val fwd      = new Bundle { val query = in(SqFwdQuery()); val rsp = out(SqFwdRsp()) }
     val commit   = slave(Flow(UInt(6 bits)))
+    // Second same-cycle commit port: a store can retire in EITHER slot of the 2-wide
+    // retire (slot 1 when it completed early behind a long-latency head, e.g. DIV).
+    // Marking a cycle LATE is unsafe — a flush arriving the next cycle would squash
+    // the already-retired store — so both retire slots must mark in the retire cycle.
+    val commitB  = slave(Flow(UInt(6 bits)))
     val flush    = in(Bool())
     val drain    = master(Flow(DStoreCmd()))
     // Memory-write acknowledge for the in-flight drain. The oldest committed entry
@@ -231,10 +236,14 @@ class StoreQueue(depth: Int = 8) extends Component {
   io.fwd.rsp.data  := best.data
   io.fwd.rsp.stall := (anyPartial || anySameLine) && !fullValid   // a clean full forward resolves the load
 
-  // ---- commit: mark the matching valid entry committed ----
+  // ---- commit: mark the matching valid entry committed (either retire slot) ----
   when(io.commit.valid) {
     for (i <- 0 until depth)
       when(valids(i) && (robIds(i) === io.commit.payload)) { committed(i) := True }
+  }
+  when(io.commitB.valid) {
+    for (i <- 0 until depth)
+      when(valids(i) && (robIds(i) === io.commitB.payload)) { committed(i) := True }
   }
 
   // ---- alloc: push at tail (speculative) ----

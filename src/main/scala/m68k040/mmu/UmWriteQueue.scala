@@ -35,6 +35,9 @@ class UmWriteQueue(depth: Int = 4) extends Component {
   val io = new Bundle {
     val alloc    = slave(Flow(UmWriteAlloc()))
     val commit   = slave(Flow(UInt(6 bits)))
+    // Slot-1 retire commit (a tagged op can dual-retire at h1 behind a long-latency
+    // head; both retire slots must mark the SAME cycle — see StoreQueue.commitB).
+    val commitB  = slave(Flow(UInt(6 bits)))
     val flush    = in Bool ()
     val drain    = master(Flow(UmWriteDrain()))
     val drainAck = in Bool ()
@@ -68,6 +71,10 @@ class UmWriteQueue(depth: Int = 4) extends Component {
   when(io.commit.valid) {
     for (i <- 0 until depth)
       when(valids(i) && (robIds(i) === io.commit.payload)) { committed(i) := True }
+  }
+  when(io.commitB.valid) {
+    for (i <- 0 until depth)
+      when(valids(i) && (robIds(i) === io.commitB.payload)) { committed(i) := True }
   }
 
   // ---- alloc: push at tail (speculative) ----
