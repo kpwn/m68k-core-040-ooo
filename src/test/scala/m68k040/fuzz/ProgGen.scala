@@ -824,7 +824,11 @@ object ProgGen {
 
     private def tBsrRtd(): Vector[String] = {
       val sub = lbl("sub"); val end = lbl("end")
-      Vector(s"\tmove.l ${imm32()},-(%sp)",
+      val t = d()
+      // arg push goes through a register: MOVE #imm,<mem> is the documented
+      // imm-source-store decode gap (was a residual-HANG generator bug).
+      Vector(s"\tmove.l ${imm32()},$t",
+             s"\tmove.l $t,-(%sp)",
              s"\tbsr $sub",
              s"\tbra.s $end",
              s"$sub:", s"\trtd #4", s"$end:")
