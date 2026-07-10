@@ -64,7 +64,13 @@ class DcachePlugin extends FiberPlugin with DcacheService {
 
     // ---- storage (sync-read BRAM: write + readSync ONLY, no readAsync) ----
     val dataMem = Seq.fill(ways)(Mem(Bits(128 bits), sets))
-    val tagMem  = Seq.fill(ways)(Mem(UInt(tagBits bits), sets))
+    // tagMem is write+readSync only (see above) but its narrow width (tagBits ~
+    // 20b x 128 sets) leads Vivado to infer IMPLIED DISTRIBUTED RAM (RAM64M8 LUTRAM)
+    // instead of BRAM, unlike the wider dataMem which gets BRAM by default. This is
+    // the exact structure the placer's congestion dump names (ldS1Tag_reg / tagMem_
+    // spinal_port1 nets, iter_100_CongestedCLBsAndNets.txt) -- force BRAM (95% free
+    // budget) to both decongest the hot corridor and remove ~192 LUTRAM LUTs/way.
+    val tagMem  = Seq.fill(ways)(Mem(UInt(tagBits bits), sets).addAttribute("ram_style", "block"))
     val valids  = Vec.fill(ways)(Vec.fill(sets)(RegInit(False)))
     val victim  = Vec.fill(sets)(RegInit(U(0, wayBits bits)))
 
