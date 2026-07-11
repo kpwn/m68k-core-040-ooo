@@ -452,8 +452,15 @@ object MicroOpAssembler {
 
     // MOVE reg -> memSimple destination -> a single STORE µop (data = the register
     // source). RMW (ALU op with a memory dst) is deferred (only MOVE stores). The store
-    // data is the MOVE source register (srcB EASRC slot).
-    val crackStore = (spec.op === DecOp.MOVE) && usesDstEa && dstIsMem && srcIsReg
+    // data is the MOVE source register (srcB EASRC slot). MOVE #imm -> memSimple is ALSO
+    // a crackStore (immToMemCase below): the immediate data cannot ride the STORE's own
+    // useImm/imm (already dedicated to the dest EA's address displacement), so it is
+    // materialized into T1 by a leading opUop first (2-µop crack), while the register-
+    // source case stays the existing 1-µop [stUop] fast path.
+    val crackStore = (spec.op === DecOp.MOVE) && usesDstEa && dstIsMem && (srcIsReg || srcEa.klass === EaClass.IMM)
+    // MOVE #imm -> memSimple: the immediate-source flavor of crackStore. Needs the 2-µop
+    // materialize-then-store crack (opUop writes imm -> T1; stUop stores T1).
+    val immToMemCase = crackStore && (srcEa.klass === EaClass.IMM)
     // MOVE mem -> mem: source memSimple AND dest memSimple (any combination of plain /
     // predec / postinc). Cracked into [load src -> T0] [store T0 -> dst], with the dest
     // An update folded into the store and the SOURCE An update as a separate ADD µop
@@ -603,6 +610,16 @@ object MicroOpAssembler {
     }
     when(spec.dst.kind =/= OperandKind.NONE && spec.dstWrites) { opUop.dstValid := True }
     when(spec.dst.kind =/= OperandKind.NONE && !spec.dstWrites) { opUop.dstValid := False } // CMP/CMPA
+
+    // MOVE #imm,<mem> materialize (immToMemCase): override the generic EADST dst-routing
+    // above (which pointed at dstEa.reg — meaningless for a MEMSIMPLE dest) so the op µop
+    // writes the immediate into T1 instead. useImm/imm are already correctly populated by
+    // the srcB EASRC-IMM case above (spec.srcB.kind===EASRC, srcEa.klass===IMM); the
+    // trailing stUop then stores T1 (srcBReg mux below).
+    when(immToMemCase) {
+      opUop.dstReg   := U(T1, 5 bits)
+      opUop.dstValid := True
+    }
 
     // CLR mem-dest crack: the op writes 0 (no load precedes it), so it must NOT read T0
     // (there is no producing load). Drop the srcA/srcB reads — CLR ignores its input.
@@ -813,6 +830,22 @@ object MicroOpAssembler {
     ldUop.shiftOp := 0; ldUop.shiftDir := False; ldUop.isMovea := False; ldUop.isScc := False; ldUop.isDbcc := False; ldUop.extByte := False; ldUop.bitOp := 0; ldUop.bfOp := 0; ldUop.bfDynamic := False; ldUop.bfMem := False; ldUop.bfStoreForm := 0; ldUop.bcdSub := False
     ldUop.firstOfInstr  := True    // the LOAD is the FIRST µop of a cracked instruction
 
+    // MOVE #imm,<mem> destination EA RE-DECODE (immToMemCase only): the immediate
+    // SOURCE precedes the destination EA's own extension words in the instruction
+    // stream, so the offloaded `dstEa` (computed on the immediate-oblivious words
+    // vector — words(1) assumed to be the dst's own first ext word) mis-reads disp/
+    // index for any dst mode that HAS its own ext word ((d16,An)/(d8,An,Xn)/abs.W/
+    // abs.L) — mirrors the immEa RMW re-decode above (shift by the imm word count).
+    // (An)/(An)+/-(An) carry NO ext word (base/klass/autoMode come straight off the
+    // opword mode/reg bits, independent of word content) so they are byte-identical
+    // either way; only `disp`/index need the shift.
+    val immDstEaField = op(8 downto 6) ## op(11 downto 9)
+    val immDstEa = EaDecoder.decode(
+      immDstEaField, spec.size,
+      Mux(immIsLong, Vec(pkt.words(0), pkt.words(3), pkt.words(4)),
+                     Vec(pkt.words(0), pkt.words(2), pkt.words(3))))
+    val stDstEa = Mux(immToMemCase, immDstEa, dstEa)
+
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
     // Address = dst base An (psrcA) + dst disp(imm); data = the MOVE source register
     // (srcB). No int dst. MOVE to memory DOES set NZVC from the moved value (N=sign,
@@ -828,15 +861,16 @@ object MicroOpAssembler {
     stUop.cluster       := Cluster.LS
     stUop.size          := spec.size
     stUop.memOp         := MemOp.STORE
-    stUop.srcAReg       := dstEa.base; stUop.srcAValid := dstEa.baseValid
+    stUop.srcAReg       := stDstEa.base; stUop.srcAValid := stDstEa.baseValid
     // store DATA: the MOVE source register (reg-to-mem), OR the loaded value T0 for a
-    // mem-to-mem MOVE (the leading load wrote T0). The same store µop folds the dest-EA
-    // An update + the MOVE-to-mem NZVC for both forms.
-    stUop.srcBReg       := Mux(crackMemMem, U(T0, 5 bits), srcEa.reg); stUop.srcBValid := True
+    // mem-to-mem MOVE (the leading load wrote T0), OR the materialized immediate T1 for
+    // a MOVE #imm,<mem> (immToMemCase — the leading opUop wrote T1). The same store µop
+    // folds the dest-EA An update + the MOVE-to-mem NZVC for all three forms.
+    stUop.srcBReg       := Mux(crackMemMem, U(T0, 5 bits), Mux(immToMemCase, U(T1, 5 bits), srcEa.reg)); stUop.srcBValid := True
     // Indexed MOVE destination: the dest-EA index reg rides srcC (store DATA is srcB). A
     // mem-to-mem MOVE composes: srcA=dst base, srcB=T0 (loaded data), srcC=dst index.
-    stUop.srcCReg       := dstEa.indexReg;  stUop.srcCValid := dstEa.indexValid
-    stUop.indexLong     := dstEa.indexLong; stUop.indexScale := dstEa.indexScale
+    stUop.srcCReg       := stDstEa.indexReg;  stUop.srcCValid := stDstEa.indexValid
+    stUop.indexLong     := stDstEa.indexLong; stUop.indexScale := stDstEa.indexScale
     stUop.leaAddr := False; stUop.fromCcr := False; stUop.fromSr := False; stUop.needsSupervisor := False; stUop.keepCommit := False
     stUop.sysOp := False; stUop.sysKind := SysKind.NONE; stUop.sysReadDir := False
     stUop.predTaken := False; stUop.predTarget := U(0, 32 bits)
@@ -845,14 +879,14 @@ object MicroOpAssembler {
     // the An write (An := An ± delta) — generalizing stkPush to any An. PREDEC: addr =
     // An-delta = the written An; POSTINC: addr = An, written An = An+delta. The LS EU
     // selects compData per eaAuto. A non-auto store writes no int reg (dstValid False).
-    stUop.dstReg        := dstEa.base; stUop.dstValid  := dstAuto
+    stUop.dstReg        := stDstEa.base; stUop.dstValid  := dstAuto
     stUop.useImm        := True
-    val stPcRelAddr = (pkt.pc + U(2, 32 bits) + dstEa.disp.asUInt).asBits
-    stUop.imm           := Mux(dstEa.pcRel, stPcRelAddr, dstEa.disp)
+    val stPcRelAddr = (pkt.pc + U(2, 32 bits) + stDstEa.disp.asUInt).asBits
+    stUop.imm           := Mux(stDstEa.pcRel, stPcRelAddr, stDstEa.disp)
     stUop.readsNzvc     := False; stUop.readsX := False
     stUop.writesNzvc    := True;  stUop.writesX := False   // MOVE to memory sets NZVC
     stUop.isBranch      := False; stUop.ibranch := False; stUop.stkPush := False; stUop.anInc := 0; stUop.ccrRestore := False; stUop.toCcr := False; stUop.cond := 0
-    stUop.eaAuto        := dstEa.autoMode; stUop.eaDelta := dstEa.autoDelta
+    stUop.eaAuto        := stDstEa.autoMode; stUop.eaDelta := stDstEa.autoDelta
     stUop.branchDisp    := 0
     stUop.unimplemented := False
     stUop.faulted       := False; stUop.faultVector := 0; stUop.isRte := False
@@ -861,8 +895,9 @@ object MicroOpAssembler {
     stUop.divSigned     := False; stUop.div64 := False; stUop.divIsRem := False
     stUop.isChk2        := False
     stUop.shiftOp := 0; stUop.shiftDir := False; stUop.isMovea := False; stUop.isScc := False; stUop.isDbcc := False; stUop.extByte := False; stUop.bitOp := 0; stUop.bfOp := 0; stUop.bfDynamic := False; stUop.bfMem := False; stUop.bfStoreForm := 0; stUop.bcdSub := False
-    // A single reg-to-mem STORE is its own first µop; a mem-to-mem store TRAILS the load.
-    stUop.firstOfInstr  := !crackMemMem
+    // A single reg-to-mem STORE is its own first µop; a mem-to-mem store TRAILS the load,
+    // and an immediate-materialize store (immToMemCase) TRAILS the materialize opUop.
+    stUop.firstOfInstr  := !crackMemMem && !immToMemCase
 
     // ── rmwStUop = the STORE of a memory-destination RMW (crackRmw / crackClr) ──
     // The EA is op[5:0] = `srcEa` (the SAME descriptor the load used — MEMSIMPLE has no
@@ -2451,9 +2486,11 @@ object MicroOpAssembler {
       out.uops(2) := exgU2
     } elsewhen(crackStore) {
       // MOVE reg -> mem [-(An)/(An)+]: single STORE; the dest An update is FOLDED into
-      // the store (its int dst), so no extra µop.
-      out.count   := 1
-      out.uops(0) := stUop
+      // the store (its int dst), so no extra µop (register-source fast path, UNCHANGED).
+      // MOVE #imm -> mem (immToMemCase): 2-µop materialize-then-store crack: [opUop
+      // writes imm -> T1] [stUop stores T1 -> <ea>].
+      out.count   := Mux(immToMemCase, U(2, 2 bits), U(1, 2 bits))
+      out.uops(0) := Mux(immToMemCase, opUop, stUop)
       out.uops(1) := stUop
     } elsewhen(crackMemMem) {
       // MOVE mem -> mem [-(Ay)/(Ay)+ , -(Ax)/(Ax)+]: [load src -> T0] [src An ADD (drop)]

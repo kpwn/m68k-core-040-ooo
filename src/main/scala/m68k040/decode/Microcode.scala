@@ -44,6 +44,8 @@ object Microcode {
   case object ST2         extends Sel   // the 3rd temp (bit-field RMW `res`)
   case object SNegDeltaAy extends Sel   // -deltaAy (Ay predec write-back imm, LONG)
   case object SNegDeltaAx extends Sel   // -deltaAx (Ax predec write-back imm, LONG)
+  case object SDeltaAy    extends Sel   // +deltaAy (Ay postinc write-back imm, LONG — CMPM)
+  case object SDeltaAx    extends Sel   // +deltaAx (Ax postinc write-back imm, LONG — CMPM)
   // ── v2 bit-field RMW selectors ─────────────────────────────────────────────
   case object SEaBase     extends Sel   // (eaBase, eaBaseValid) — the bit-field EA base An
   case object SDn2        extends Sel   // (bfDn2, True) — the BFINS insert source register
@@ -97,9 +99,11 @@ object Microcode {
 
   /** Auto-update (PREDEC) of the µop's base An, keyed to which An. */
   sealed trait Auto
-  case object ANoAuto   extends Auto
-  case object APredecAy extends Auto
-  case object APredecAx extends Auto
+  case object ANoAuto    extends Auto
+  case object APredecAy  extends Auto
+  case object APredecAx  extends Auto
+  case object APostincAy extends Auto   // (Ay)+ — CMPM: addr = Ay (unmodified); delta write-back separate
+  case object APostincAx extends Auto   // (Ax)+ — CMPM: addr = Ax (unmodified); delta write-back separate
   // CAS auto-inc/dec EA: the LOAD + STORE both carry eaAuto/eaDelta from the latched ctx
   // (ctx.casAutoMode/Delta) so they compute the SAME effective address (matching Musashi's
   // M68KMAKE_GET_EA_AY single side-effect); the An := An ± size write-back rides the STORE
@@ -130,6 +134,7 @@ object Microcode {
       imm:    Sel     = SNone,    // when useImm, the imm comes from this selector
       sz:     Sz      = SzCtx,    // explicit µop size (SzCtx = ctx.size, the BCD default)
       writesFlags: Boolean = false,  // reads X+old-Z, writes NZVCX (the op µop)
+      nzvcOnly:    Boolean = false,  // writes NZVC only (X UNTOUCHED, no NZVC/X read) — CMPM
       indexFromEa: Boolean = false,  // LS row: srcC + indexLong/indexScale come from Ctx EA
       bfStoreForm: Int     = 0,      // UBfMem: 0=RES,1=LO4,2=LO5,3=HI5 (the funnel form)
       bfWritesNz:  Boolean = false,  // UBfMem: this compute writes the NZ flags (RES / LO4)
@@ -353,7 +358,26 @@ object Microcode {
          imm = SEaDispLo, indexFromEa = true, isFirst = true),                 // µPC46 (r0)
     Desc(UMovesRead, srcA = SMovesRn, srcB = ST0, dst = SMovesRn),             // µPC47 (r1)
     Desc(UAddDrop, srcA = SMovesAn, dst = SMovesAn, useImm = true, imm = SMovesDelta,
-         isLast = true)                                                        // µPC48 (r2)
+         isLast = true),                                                       // µPC48 (r2)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // CMPM.B/.W/.L (Ay)+,(Ax)+ — 5 µops @ CMPM_ENTRY=49. Template: BCD_MEM_ENTRY's dual-
+    // address-register chain, swapped from PREDECREMENT to POSTINCREMENT (postinc reads
+    // the UNMODIFIED An as the access address; the +delta write-back rides a separate
+    // dropped ADD, same shape as the predec chain) and with a flags-only CMP compute tail
+    // (NO destination write, X UNTOUCHED — `nzvcOnly`) instead of a BCD op + store.
+    // Musashi (m68k_in.c CMPM): src=read(Ay)+ FIRST; dst=read(Ax)+ SECOND; res=dst-src;
+    // N/Z/V/C from res; X untouched; no register/memory write beyond the two postincs.
+    //   e0 LOAD.sz (Ay) -> T0, auto=POSTINC(Ay)                              (isFirst)
+    //   e1 ADD.L Ay + deltaAy -> Ay   (the Ay postinc write-back; dropped crack µop)
+    //   e2 LOAD.sz (Ax) -> T1, auto=POSTINC(Ax)
+    //   e3 ADD.L Ax + deltaAx -> Ax   (the Ax postinc write-back; dropped crack µop)
+    //   e4 CMP.sz srcA=T1(Ax,dst) srcB=T0(Ay,src) -> flags only (NZVC; X untouched)
+    Desc(UMove, mem = MLoad, auto = APostincAy, srcA = SAy, dst = ST0, isFirst = true),  // µPC49 (e0)
+    Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SDeltaAy),                // µPC50 (e1)
+    Desc(UMove, mem = MLoad, auto = APostincAx, srcA = SAx, dst = ST1),                  // µPC51 (e2)
+    Desc(UAddDrop, srcA = SAx, dst = SAx, useImm = true, imm = SDeltaAx),                // µPC52 (e3)
+    Desc(UOpFromCtx, srcA = ST1, srcB = ST0, nzvcOnly = true, isLast = true)              // µPC53 (e4)
   )
   val BF_RMW_4B_ENTRY = 6
   val BF_RMW_5B_ENTRY = 9
@@ -366,6 +390,7 @@ object Microcode {
   val CAS2_ENTRY        = 35   // rows 35..44 (load×2, CAS2C1/C2, DC1/DC2, SEL×2, store×2)
   val MOVES_WRITE_ENTRY = 45   // row 45      (store Rn -> (ea), eaAuto An write-back, keepCommit)
   val MOVES_READ_ENTRY  = 46   // rows 46..48 (load -> T0, MOVE T0->Rn sign-ext/merge, An update)
+  val CMPM_ENTRY        = 49   // rows 49..53 (load Ay/postinc, load Ax/postinc, CMP flags-only)
   def romSize: Int = rom.size
 
   /** Latched-instruction CONTEXT the engine resolves selectors against. v1 fields
@@ -481,9 +506,15 @@ object Microcode {
   private def negDelta(anReg: UInt, ctx: Ctx): Bits =
     (-(deltaBytesU(anReg, ctx).resize(32).asSInt)).asBits
 
+  /** The postinc write-back imm = +deltaAn (LONG) — CMPM. */
+  private def posDelta(anReg: UInt, ctx: Ctx): Bits =
+    deltaBytesU(anReg, ctx).resize(32).asBits
+
   private def selImm(sel: Sel, ctx: Ctx): Bits = sel match {
     case SNegDeltaAy => negDelta(ayReg(ctx), ctx)
     case SNegDeltaAx => negDelta(axReg(ctx), ctx)
+    case SDeltaAy    => posDelta(ayReg(ctx), ctx)
+    case SDeltaAx    => posDelta(axReg(ctx), ctx)
     case SEaDispLo   => ctx.eaDispLo
     case SEaDispHi   => ctx.eaDispHi
     case SBfImm      => ctx.bfImm
@@ -612,13 +643,15 @@ object Microcode {
       u.writesX    := False
     } else {
       // Flags: the BCD/ADDX/SUBX op µop reads X + old-Z (clear-only Z) + writes NZVCX. The
-      // bit-field RES/LO4 compute writes NZ only (V=C=0, X UNTOUCHED). Other rows: no flags.
+      // bit-field RES/LO4 compute writes NZ only (V=C=0, X UNTOUCHED). CMPM's compute
+      // (nzvcOnly) writes NZVC only (no NZVC/X read, X UNTOUCHED — like a register CMP).
+      // Other rows: no flags.
       u.useImm     := Bool(d.useImm)
       u.imm        := (if (d.useImm) selImm(d.imm, ctx) else B(0, 32 bits))
       u.srcBValid  := srcBV
       u.readsNzvc  := Bool(d.writesFlags)
       u.readsX     := Bool(d.writesFlags)
-      u.writesNzvc := Bool(d.writesFlags || d.bfWritesNz)
+      u.writesNzvc := Bool(d.writesFlags || d.bfWritesNz || d.nzvcOnly)
       u.writesX    := Bool(d.writesFlags)
     }
     u.isBranch := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
@@ -639,9 +672,14 @@ object Microcode {
     // load does NOT write An — the LS-EU writes An only on an eaAuto STORE). The store
     // accesses the already-decremented Ax with NO auto. eaDelta is the byte count.
     d.auto match {
-      case ANoAuto     => u.eaAuto := EaAuto.NONE;   u.eaDelta := U(0, 3 bits)
-      case APredecAy   => u.eaAuto := EaAuto.PREDEC; u.eaDelta := deltaBytesU(ayReg(ctx), ctx)
-      case APredecAx   => u.eaAuto := EaAuto.PREDEC; u.eaDelta := deltaBytesU(axReg(ctx), ctx)
+      case ANoAuto     => u.eaAuto := EaAuto.NONE;    u.eaDelta := U(0, 3 bits)
+      case APredecAy   => u.eaAuto := EaAuto.PREDEC;  u.eaDelta := deltaBytesU(ayReg(ctx), ctx)
+      case APredecAx   => u.eaAuto := EaAuto.PREDEC;  u.eaDelta := deltaBytesU(axReg(ctx), ctx)
+      // CMPM (Ay)+,(Ax)+: the LOAD accesses the UNMODIFIED An (LsEuPlugin's POSTINC disp
+      // branch forces disp=0); the An += delta write-back rides the separate dropped ADD
+      // row (mirrors PREDEC's separate write-back row — the load itself writes T0/T1, not An).
+      case APostincAy  => u.eaAuto := EaAuto.POSTINC; u.eaDelta := deltaBytesU(ayReg(ctx), ctx)
+      case APostincAx  => u.eaAuto := EaAuto.POSTINC; u.eaDelta := deltaBytesU(axReg(ctx), ctx)
       // CAS (An)+/-(An): the LOAD + STORE carry the latched ctx auto so they compute the
       // SAME effective address (PREDEC: An-delta; POSTINC: An). For the control modes
       // casAutoMode=NONE -> inert eaAuto (addr = An + disp + index, the normal CAS EA).

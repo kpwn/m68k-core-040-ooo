@@ -2103,6 +2103,55 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 1)
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CMPM (Ay)+,(Ax)+ (fuzzer-found gap): a new 5-row microcode entry, template =
+  // BCD_MEM_ENTRY swapped from PREDECREMENT to POSTINCREMENT with a flags-only CMP
+  // compute tail (no register/memory write beyond the two postincs; X untouched).
+  // Musashi: src=read(Ay)+ FIRST; dst=read(Ax)+ SECOND; res=dst-src; NZVC from res.
+  // Previously NOT DECODED AT ALL (falls through to the COMPLEX/illegal path, vector 4).
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  test("lock-step: CMPM.L (A1)+,(A0)+ equal operands (Z=1) + An postinc", VerilatorTest) {
+    runLockStep("cmpm-l-equal", Seq(
+      "move.l #0x3000,%a0", "move.l #0x12345678,%d0", "move.l %d0,(%a0)",   // mem[0x3000]=0x12345678 (dst=Ax)
+      "move.l #0x4000,%a1", "move.l #0x12345678,%d1", "move.l %d1,(%a1)",   // mem[0x4000]=0x12345678 (src=Ay)
+      "move.l #0x3000,%a0", "move.l #0x4000,%a1",
+      "cmpm.l (%a1)+,(%a0)+",                                                // dst-src = 0 -> Z=1
+      "move.l %a0,%d3", "move.l %a1,%d4"                                     // A0=0x3004, A1=0x4004
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: CMPM.B (A1)+,(A0)+ borrow (N=1,C=1) + An postinc", VerilatorTest) {
+    runLockStep("cmpm-b-borrow", Seq(
+      "move.l #0x3000,%a0", "move.l #0x00000005,%d0", "move.b %d0,(%a0)",   // mem[0x3000]=5 (dst=Ax)
+      "move.l #0x4000,%a1", "move.l #0x0000000a,%d1", "move.b %d1,(%a1)",   // mem[0x4000]=0xa (src=Ay)
+      "move.l #0x3000,%a0", "move.l #0x4000,%a1",
+      "cmpm.b (%a1)+,(%a0)+",                                                // 5-10 = -5 -> N=1,C=1(borrow),Z=0
+      "move.l %a0,%d3", "move.l %a1,%d4"                                     // A0=0x3001, A1=0x4001
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: CMPM.B (A1)+,(A0)+ signed overflow (V=1)", VerilatorTest) {
+    runLockStep("cmpm-b-overflow", Seq(
+      "move.l #0x3000,%a0", "move.l #0x00000080,%d0", "move.b %d0,(%a0)",   // mem[0x3000]=0x80 (-128, dst=Ax)
+      "move.l #0x4000,%a1", "move.l #0x00000001,%d1", "move.b %d1,(%a1)",   // mem[0x4000]=1 (src=Ay)
+      "move.l #0x3000,%a0", "move.l #0x4000,%a1",
+      "cmpm.b (%a1)+,(%a0)+",                                                // -128-1 overflows -> V=1
+      "move.l %a0,%d3", "move.l %a1,%d4"
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: CMPM.W (A1)+,(A0)+ does NOT touch X (ADDX consumer)", VerilatorTest) {
+    runLockStep("cmpm-w-x-untouched", Seq(
+      "moveq #-1,%d6", "addi.b #1,%d6",                                      // X=1 (0xff+1 overflows)
+      "move.l #0x3000,%a0", "move.l #0x00001111,%d0", "move.w %d0,(%a0)",
+      "move.l #0x4000,%a1", "move.l #0x00001111,%d1", "move.w %d1,(%a1)",
+      "move.l #0x3000,%a0", "move.l #0x4000,%a1",
+      "cmpm.w (%a1)+,(%a0)+",                                                // equal -> Z=1; MUST NOT touch X
+      "moveq #0,%d7", "addx.b %d7,%d7"                                       // X=1 preserved -> D7=1
+    ).mkString(" ; "))
+  }
+
   test("lock-step: NOT.B/.W/.L (NZ, V=C=0, upper preserved)", VerilatorTest) {
     runLockStep("not", Seq(
       "move.l #0x0000000f,%d0", "not.b %d0",                  // .B ~0x0f=0xf0, N=1
@@ -4364,6 +4413,59 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l #0x01020304,%d7 ; move.l #0x3000,%a0 ; move.l %d7,(%a0) ; " +
       "move.l #0x3000,%a0 ; move.l (%a0)+,%d0 ; addq.l #4,%a0 ; move.l %a0,%d1 ; " +
       ".stop: bra .stop", nInstr = 7)   // D0=val, A0=D1=0x3008 (0x3000+4 postinc +4 addq)
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // MOVE #imm,<mem> (fuzzer-found gap): a materialize-then-store 2-µop crack
+  // ([opUop writes imm -> T1][stUop stores T1 -> <ea>]) — previously trapped illegal
+  // (crackStore required a register source). NZVC from the moved value (N/Z; V=C=0),
+  // X untouched. Covers (An)/(An)+/-(An)/(d16,An)/abs.W/abs.L across .B/.W/.L.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  test("lock-step: MOVE.L #imm,(An) immediate-to-mem crack (N=1)", VerilatorTest) {
+    runLockStep("move-imm-mem-l-reg-indirect", Seq(
+      "move.l #0x3000,%a0", "move.l #0x92345678,(%a0)"    // N=1 (bit31 set), Z=0
+    ).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+
+  test("lock-step: MOVE.W #imm,(An)+ immediate-to-mem crack postinc (Z=1) + An", VerilatorTest) {
+    runLockStep("move-imm-mem-w-postinc", Seq(
+      "move.l #0x3010,%a0", "move.w #0x0000,(%a0)+",       // Z=1, mem[0x3010..11]=0
+      "move.l %a0,%d1"                                       // A0 postinc by 2 -> 0x3012
+    ).mkString(" ; "), checkMem = Seq(0x3010L), checkSpan = 2)
+  }
+
+  test("lock-step: MOVE.B #imm,-(An) immediate-to-mem crack predec (N=1) + An", VerilatorTest) {
+    runLockStep("move-imm-mem-b-predec", Seq(
+      "move.l #0x3021,%a0", "move.b #0x80,-(%a0)",         // N=1 (byte bit7), mem[0x3020]=0x80
+      "move.l %a0,%d1"                                       // A0 predec by 1 -> 0x3020
+    ).mkString(" ; "), checkMem = Seq(0x3020L), checkSpan = 1)
+  }
+
+  test("lock-step: MOVE.L #imm,(d16,An) immediate-to-mem crack", VerilatorTest) {
+    runLockStep("move-imm-mem-l-disp", Seq(
+      "move.l #0x3030,%a0", "move.l #0xdeadbeef,4(%a0)"    // mem[0x3034..37]=0xdeadbeef
+    ).mkString(" ; "), checkMem = Seq(0x3034L), checkSpan = 4)
+  }
+
+  test("lock-step: MOVE.W #imm,abs.W immediate-to-mem crack", VerilatorTest) {
+    runLockStep("move-imm-mem-w-absw", Seq(
+      "move.w #0x1234,0x3050"                                // mem[0x3050..51]=0x1234
+    ).mkString(" ; "), checkMem = Seq(0x3050L), checkSpan = 2)
+  }
+
+  test("lock-step: MOVE.L #imm,abs.L immediate-to-mem crack", VerilatorTest) {
+    runLockStep("move-imm-mem-l-absl", Seq(
+      "move.l #0x7fffffff,0x00403060"                        // mem[0x403060..63]=0x7fffffff
+    ).mkString(" ; "), checkMem = Seq(0x403060L), checkSpan = 4)
+  }
+
+  test("lock-step: MOVE.B #imm,(An) does NOT touch X (ADDX consumer)", VerilatorTest) {
+    runLockStep("move-imm-mem-b-x-untouched", Seq(
+      "moveq #-1,%d6", "addi.b #1,%d6",                     // X=1 (0xff+1 overflows)
+      "move.l #0x3070,%a0", "move.b #0x05,(%a0)",           // MUST NOT touch X
+      "moveq #0,%d7", "addx.b %d7,%d7"                       // X=1 -> D7=0+0+1=1 (would be 0 if X clobbered)
+    ).mkString(" ; "), checkMem = Seq(0x3070L), checkSpan = 1)
   }
 
   // ════════════════════════════════════════════════════════════════════════════

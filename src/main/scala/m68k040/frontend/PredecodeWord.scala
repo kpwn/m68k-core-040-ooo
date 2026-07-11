@@ -633,6 +633,10 @@ object PredecodeWord {
         // mode0) dest -> simple len1; An-direct (CMPM) and memory-dest (RMW) -> COMPLEX.
         val isEor   = (opmode === U(4, 3 bits)) || (opmode === U(5, 3 bits)) ||
                       (opmode === U(6, 3 bits))
+        // CMPM (Ay)+,(Ax)+ : same opmode band as EOR, but An-direct (srcMode 1) — the
+        // slot EOR's Dn-dest / mem-dest branches both exclude. Single opword, NO
+        // extension words (mirrors the isAddxSubxReg||isBcdReg carve-out above).
+        val isCmpm  = isEor && (srcMode === U(1, 3 bits))
         when(isCmp) {
           val sizeL = (opmode === U(2, 3 bits)) || (opmode === U(7, 3 bits))
           val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = false, eaW = extW)
@@ -643,6 +647,9 @@ object PredecodeWord {
         } elsewhen(isEor && (srcMode === U(0, 3 bits))) {
           r.simple   := True
           r.lenWords := U(1, 3 bits)                  // EOR Dn,Dm (register dest)
+        } elsewhen(isCmpm) {
+          r.simple   := True
+          r.lenWords := U(1, 3 bits)                  // CMPM (Ay)+,(Ax)+ (single opword)
         } elsewhen(isEor) {
           // EOR Dn,<ea> mem-dest (RMW): opword + EA ext. In-scope MEMSIMPLE dest only;
           // An-direct (CMPM) / MEMCOMPLEX -> COMPLEX (the assembler's illegal path).
