@@ -734,6 +734,7 @@ object OperationDecoder {
           o.srcB := easrc                 // 16-bit divisor EA
           o.dst := dnField; o.dstWrites := True   // result -> Dn
           o.writesNzvc := True            // DIV sets N/Z/V (C=0)
+          o.readsNzvc  := True            // overflow preserves old N/Z/C (Musashi: only V set)
           o.divSigned := isDivsW
         } .elsewhen((isMuluW || isMulsW) && (opword(5 downto 3) =/= 1)) {
           // MULU.W/MULS.W: 16x16 -> Dn[31:0]. The multiplier EA is a DATA addressing

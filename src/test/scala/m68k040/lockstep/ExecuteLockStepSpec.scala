@@ -3563,6 +3563,27 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #5,%d2 ; loop: bra loop", nInstr = 5)
   }
 
+  // ── FUZZER-CAUGHT (B5): DIV overflow must PRESERVE N/Z/C (only V is set) ─────
+  // Musashi's divs/divu overflow path is `FLAG_V = VFLAG_SET; return;` — N, Z and C
+  // keep their PRE-DIV values. The DUT wrote NZVC=0010 (clearing a live N). Pin N=1
+  // (tst of a negative) before each overflowing DIV and lock-step the committed CCR.
+  test("lock-step: DIVS.W/DIVU.W overflow preserves N/Z/C (only V set)", VerilatorTest) {
+    runLockStep("div-w-ovf-nzc",
+      // NOTE: no readback of the DIV DEST after an overflow — on overflow the dest
+      // physreg is (correctly) never written, and a later READER of that renamed dest
+      // hangs (pre-existing dataflow gap, separate from this flag fix; see report).
+      "move.l #0x26f0c934,%d0 ; move.l #0x0d00,%d1 ; " +             // operands FIRST (they set flags)
+      "moveq #-1,%d7 ; tst.l %d7 ; " +                               // then pin N=1
+      "divu.w %d1,%d0 ; " +                                          // unsigned ovf; N must stay 1
+      "move.l #0x40000000,%d3 ; moveq #2,%d4 ; " +
+      "moveq #-1,%d7 ; tst.l %d7 ; " +                               // re-pin N=1
+      "divs.w %d4,%d3 ; " +                                          // signed ovf; N must stay 1
+      "move.l #0x10000,%d6 ; moveq #1,%d4 ; " +
+      "moveq #0,%d7 ; tst.l %d7 ; " +                                // pin Z=1 (N=0)
+      "divu.w %d4,%d6 ; " +                                          // ovf; Z must stay 1
+      ".stop: bra .stop", nInstr = 16)
+  }
+
   // DIVU.W divide-by-zero -> vector 5 (format-$2) -> handler -> RTE -> resume.
   // The handler's last flag-writer reproduces the entry CCR (Z=1 from `moveq #0,%d2`)
   // so the sim whitebox's reconstructed CCR matches the oracle's RTE-restored CCR at

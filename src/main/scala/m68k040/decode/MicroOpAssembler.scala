@@ -1511,7 +1511,7 @@ object MicroOpAssembler {
       divlUop.useImm  := False; divlUop.imm := 0
     }
     divlUop.dstReg        := divlDq; divlUop.dstValid := True              // quotient -> Dq
-    divlUop.readsNzvc     := False; divlUop.readsX := False
+    divlUop.readsNzvc     := True;  divlUop.readsX := False   // overflow preserves old N/Z/C (Musashi: only V set)
     divlUop.writesNzvc    := True;  divlUop.writesX := False               // DIV sets N/Z/V
     divlUop.isBranch      := False; divlUop.ibranch := False; divlUop.stkPush := False; divlUop.anInc := 0; divlUop.ccrRestore := False; divlUop.toCcr := False; divlUop.cond := 0; divlUop.branchDisp := 0
     divlUop.eaAuto        := EaAuto.NONE; divlUop.eaDelta := 0
