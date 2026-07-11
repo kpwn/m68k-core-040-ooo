@@ -108,7 +108,7 @@ class MovesDecodeSpec extends AnyFunSuite {
     val ext1  = in Bits (16 bits)
     val ext2  = in Bits (16 bits)
     val simple = out Bool ()
-    val len    = out UInt (3 bits)
+    val len    = out UInt (4 bits)
     val r = m68k040.frontend.PredecodeWord.classify(op, ext1, ext2)
     simple := r.simple
     len    := r.lenWords

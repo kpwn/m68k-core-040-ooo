@@ -35,7 +35,12 @@ class BitfieldDecodeSpec extends AnyFunSuite {
     val opword     = in(Bits(16 bits))
     val s          = OperationDecoder.decode(opword)
     val microcoded = out(Bool());      microcoded := s.microcoded
-    val ucEntry    = out(UInt(6 bits)); ucEntry := s.ucEntry
+    // PRE-EXISTING GAP found 2026-07-11 while validating the F1/F2/F3 predecode-overflow
+    // fix (same class as the PredecodeRef NOP/CMPM gaps): OpSpec.ucEntry grew 6->7 bits in
+    // an earlier microcode-ROM-growth slice (DecodeContracts.scala), but this test DUT was
+    // never updated, so every `runSpec` test here was failing elaboration with a width
+    // mismatch — unrelated to the F-series bugs, fixed here for the same reason.
+    val ucEntry    = out(UInt(7 bits)); ucEntry := s.ucEntry
     val illegal    = out(Bool());      illegal := s.illegal
     val bfOp       = out(Bits(3 bits)); bfOp := s.bfOp
     val op         = out(DecOp());      op := s.op
@@ -47,7 +52,7 @@ class BitfieldDecodeSpec extends AnyFunSuite {
     val w0 = in(Bits(16 bits))
     val r  = m68k040.frontend.PredecodeWord.classify(w0)
     val simple   = out(Bool());        simple := r.simple
-    val lenWords = out(UInt(3 bits));  lenWords := r.lenWords
+    val lenWords = out(UInt(4 bits));  lenWords := r.lenWords
   }
   def runPre(check: PreDut => Unit): Unit = SimConfig.withVerilator.compile(new PreDut).doSim(check)
 

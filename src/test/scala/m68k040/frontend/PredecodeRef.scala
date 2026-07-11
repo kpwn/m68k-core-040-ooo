@@ -133,7 +133,21 @@ object PredecodeRef {
         val se = eaExt(srcMode, srcReg, sizeL, allowImm = true)
         val de = dstMode match {
           case 0 | 1 | 2 | 3 | 4 | 5 => eaExt(dstMode, dstReg, sizeL, allowImm = false)
-          case 6 => Some(1)   // (d8,An,Xn) brief indexed destination: 1 ext word
+          case 6 =>
+            // (d8,An,Xn) brief indexed destination: 1 ext word — but this reference model
+            // (like the RTL `classify()` it mirrors) only ever has a 2-word lookahead past
+            // the opword (extW@op+1, extW2@op+2). The dest's OWN ext word sits at
+            // op+1+se, which is visible only when se<=1. When se>=2 (e.g. an #imm.L
+            // source, which itself consumes op+1+op+2), the dest's brief-vs-full status
+            // is UNKNOWABLE here -> COMPLEX (F1 fix, 2026-07-11: reject rather than
+            // silently assume brief — this exhaustive sweep drives extW=extW2=0, so a
+            // naive "always brief" answer would happen to self-consistently match the
+            // OLD, buggy RTL, but not the FIXED RTL, which now correctly refuses to
+            // guess in this case).
+            se match {
+              case Some(s) if s <= 1 => Some(1)
+              case _                 => None
+            }
           // mode 7 reg 2/3 ((d16,PC)/(d8,PC,Xn)) are PC-relative => NOT a MOVE dest -> None.
           case 7 => dstReg match { case 0 => Some(1); case 1 => Some(2); case _ => None }
           case _ => None
@@ -153,6 +167,14 @@ object PredecodeRef {
         // RTS (0x4E75) / RTR (0x4E77): single-word return instructions (simple len-1).
         val isRts   = op == 0x4e75
         val isRtr   = op == 0x4e77
+        // NOP (0x4E71): single-word, no architectural effect (simple len-1). PRE-EXISTING
+        // GAP found 2026-07-11 while validating the F1/F2/F3 predecode-overflow fix: this
+        // reference model was never updated when NOP predecode support was added to the
+        // RTL (`6f6b9ac feat(isa): NOP (0x4E71)`), so the exhaustive 65536-opword sweep
+        // was silently failing at op=0x4E71 (rtl simple=true, ref simple=false) before this
+        // fix — unrelated to the F-series bugs, but caught (and fixed) here since a stale
+        // reference model defeats this test's whole purpose as a regression guard.
+        val isNop   = op == 0x4e71
         // CHK.W/CHK.L (0100 ddd 1 s 0 mmmrrr): bit8=1, bit6=0; bound is an EA source
         // (sizeL = .L when bit7=0). 1 opword + the EA extension words.
         val isChk = ((op >> 8) & 1) == 1 && ((op >> 6) & 1) == 0
@@ -195,7 +217,7 @@ object PredecodeRef {
         val isUnlk = (op & 0xfff8) == 0x4e58
         if (isLink) CP(simple = true, lenWords = 2)
         else if (isUnlk) CP(simple = true, lenWords = 1)
-        else if (isTrap || isTrapv || isRts || isRtr) CP(simple = true, lenWords = 1)
+        else if (isTrap || isTrapv || isRts || isRtr || isNop) CP(simple = true, lenWords = 1)
         else if (isUnary) CP(simple = true, lenWords = 1)
         else if (isUnaryMem) memDestExt(u4mode, op & 7) match {
           case Some(e) => CP(simple = true, lenWords = 1 + e)
@@ -400,9 +422,18 @@ object PredecodeRef {
         val srcMode = (op >> 3) & 7; val srcReg = op & 7
         // CMP (opmode 0/1/2 = .B/.W/.L, EA source) and CMPA (3/7). EOR (opmode 4/5/6)
         // is a SEPARATE family: EA is the DESTINATION (read AND written). This slice
-        // frames the register (data-reg, mode0) EOR dest as simple len1; An-direct
-        // (mode1 = CMPM) and memory-dest EOR (RMW) are deferred -> COMPLEX.
-        val isEor = opmode == 4 || opmode == 5 || opmode == 6
+        // frames the register (data-reg, mode0) EOR dest as simple len1; memory-dest
+        // EOR (RMW) as simple opword+EA-ext; An-direct (mode1) is CMPM (Ay)+,(Ax)+, a
+        // single opword with NO extension words (see isCmpm below).
+        val isEor  = opmode == 4 || opmode == 5 || opmode == 6
+        // CMPM (Ay)+,(Ax)+: same opmode band as EOR, but An-direct (srcMode==1) — a
+        // FIXED single-opword encoding (the "mode 001" bits here are literally CMPM's own
+        // opcode pattern, not a real EA mode). PRE-EXISTING GAP found 2026-07-11 (same
+        // class as the NOP gap above): this reference model never got a CMPM case when
+        // CMPM predecode support was added to the RTL (`2e93d88`/`2e04cc8`), so the
+        // exhaustive sweep was silently failing at every CMPM opword (e.g. 0xB108) —
+        // unrelated to the F-series bugs, fixed here for the same reason as NOP.
+        val isCmpm = isEor && srcMode == 1
         if (opmode == 0 || opmode == 1 || opmode == 2 || opmode == 3 || opmode == 7) {
           val sizeL = opmode == 2 || opmode == 7
           eaExt(srcMode, srcReg, sizeL, allowImm = false) match {
@@ -410,9 +441,10 @@ object PredecodeRef {
             case None    => COMPLEX
           }
         } else if (isEor && srcMode == 0) CP(simple = true, lenWords = 1)  // EOR Dn,Dm
+        else if (isCmpm) CP(simple = true, lenWords = 1)                   // CMPM (Ay)+,(Ax)+
         else if (isEor) memDestExt(srcMode, srcReg) match {                // EOR Dn,<ea> mem-dest
           case Some(e) => CP(simple = true, lenWords = 1 + e)
-          case None    => COMPLEX                                          // An-direct (CMPM) / MEMCOMPLEX
+          case None    => COMPLEX                                          // MEMCOMPLEX
         }
         else COMPLEX
       // Line-E register-form shifts/rotates (1110 ccc d ss i tt rrr): single-word.

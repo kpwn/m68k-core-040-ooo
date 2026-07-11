@@ -6,11 +6,17 @@ import spinal.core._
 case class DecodePacket() extends Bundle {
   val valid     = Bool()
   val pc        = UInt(32 bits)
-  val words     = Vec(Bits(16 bits), 6)   // opword + up to 5 following words (12 bytes max; full-format
-                                          // memory-indirect bd.l+od.l = 1 op + 5 EA-ext words = 6 words)
-  val wordCount = UInt(3 bits)            // valid words in `words` (1..6)
+  // Widened 6->10 (deep-audit F3, 2026-07-11): sized to the front-end's actual visibility
+  // ceiling (InstructionBuffer.HEAD_WORDS / Aligner.WINDOW = 10), not just the single-EA
+  // full-format case. A MOVE with TWO full-format/mem-indirect EAs (e.g. mem-indirect src
+  // + (d16,An) dest) can legally need 7 words; sizing to the full 10-word front-end window
+  // (rather than a narrower guess) means the packet never silently truncates ANY
+  // instruction the aligner could otherwise present as `simple` — PredecodeWord.classify
+  // gates any (rare) longer combination as COMPLEX instead of over-running this array.
+  val words     = Vec(Bits(16 bits), 10)
+  val wordCount = UInt(4 bits)            // valid words in `words` (1..10)
   val simple    = Bool()
-  val lenWords  = UInt(3 bits)            // predecode length in words (meaningful iff simple)
+  val lenWords  = UInt(4 bits)            // predecode length in words (meaningful iff simple)
   val complex   = Bool()                  // !simple
   val fault     = Bool()
   // ── Fetch-time branch prediction (BTB + bimodal, slice 1) ───────────────────

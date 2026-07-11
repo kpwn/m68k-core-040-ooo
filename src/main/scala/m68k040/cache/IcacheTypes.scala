@@ -3,10 +3,21 @@ package m68k040.cache
 import spinal.core._
 
 /** Per-16-bit-word predecode result (one per chunk; 32 per 64-byte line).
-  * `lenWords` (1..5 = 2/4/6/8/10 bytes) is meaningful only when `simple`. 4 bits. */
+  * `lenWords` (1..10 words = 2..20 bytes) is meaningful only when `simple`. Widened
+  * 3->4 bits (2026-07-11, deep-audit F2/F1/F3): a MOVE with a full-format-indexed
+  * SOURCE (up to 5 ext words: 1 base + 2 bd.L + 2 od.L) and a full-format-indexed
+  * DEST (up to 5 more) sums to as much as opword+5+5=11 words, which overflowed the
+  * old 3-bit field (max 7) and WRAPPED — the F2 livelock (wraps to 0 -> shiftWords=0
+  * -> decodePc never advances) and the F1/F3 silent mis-framing (wraps to a small
+  * nonzero length -> the aligner truncates mid-instruction). 4 bits (max 15) is wide
+  * enough for the true worst case with headroom; PredecodeWord additionally gates any
+  * MOVE whose true total would exceed 10 (the front-end's HEAD_WORDS/Aligner.WINDOW
+  * visibility ceiling) as COMPLEX rather than risk the aligner stalling forever on an
+  * unreachable length (same "ucEntry 5->6->7" width-growth precedent as the microcode
+  * ROM). */
 case class ChunkPredecode() extends Bundle {
   val simple   = Bool()
-  val lenWords = UInt(3 bits)
+  val lenWords = UInt(4 bits)
 }
 
 object CacheMode extends SpinalEnum {
