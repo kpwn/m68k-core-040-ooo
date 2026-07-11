@@ -324,9 +324,26 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
                       !faultedStore(h0) && !isRteStore(h0) &&
                       excIdle; sysRetire.simPublic()
 
+    // ── NMI (level 7) edge-latch ─────────────────────────────────────────────────
+    // Real 68040 NMI is EDGE-triggered (Musashi m68kcpu.c:m68k_set_irq — `if(old_level
+    // != 0x0700 && CPU_INT_LEVEL == 0x0700) nmi_pending = TRUE;`, consumed+cleared once
+    // in m68ki_check_interrupts). A plain level compare (`iplIn === 7`) would
+    // re-recognize NMI EVERY CYCLE the line is merely HELD at 7 -> infinite re-entry.
+    // Latch on a <7 -> ==7 transition; clear when that NMI is actually taken (below,
+    // after `interruptPending` is driven). Levels 1..6 stay level-sensitive (compared
+    // against the live SR I-mask every cycle) — unaffected. Computed here (independent
+    // of the exc unit) so `interruptLevel`/`interruptVec` can consult it below: once
+    // latched, the CPU services vector/level 7 even if `iplIn` is later dropped by the
+    // SoC before the FSM gets around to recognizing it (mirrors Musashi always calling
+    // `m68ki_exception_interrupt(7)` on a consumed nmi_pending, not the live level).
+    val iplInPrev  = RegNext(iplIn, init = U(0, 3 bits))
+    val nmiEdge    = (iplInPrev =/= U(7, 3 bits)) && (iplIn === U(7, 3 bits))
+    val nmiPending = RegInit(False); nmiPending.simPublic()
+    when(nmiEdge) { nmiPending := True }
+
     // ── Interrupt recognition (precise, at a macro-instruction boundary) ─────────
     // Take an interrupt BETWEEN instructions when ALL hold:
-    //   (a) iplIn > srSys[2:0] (the SR I-mask) OR iplIn == 7 (NMI always);
+    //   (a) iplIn > srSys[2:0] (the SR I-mask) OR a latched NMI edge is pending;
     //   (b) the ROB head is the FIRST µop of an instruction (firstStore(h0)) — never
     //       mid-cracked-instruction;
     //   (c) the head is NOT faulted / NOT RTE (its own exception/return has priority);
@@ -338,10 +355,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // `interruptPending` is FORWARD-DECLARED here (retire0 gates on it) and DRIVEN
     // after the exc unit is built (it reads the SR I-mask from exc.ss.srSys).
     val interruptPending = Bool(); interruptPending.simPublic()
-    val interruptLevel = UInt(3 bits); interruptLevel := iplIn; interruptLevel.simPublic()
+    val interruptLevel = UInt(3 bits)
+    interruptLevel := Mux(nmiPending, U(7, 3 bits), iplIn); interruptLevel.simPublic()
     // Simple-protocol vector: autovector (24+level) or the vectored input.
     val interruptVec = UInt(8 bits)
-    interruptVec := Mux(iackAvec, (U(24, 8 bits) + iplIn).resized, iackVector)
+    interruptVec := Mux(iackAvec, (U(24, 8 bits) + interruptLevel).resized, iackVector)
     interruptVec.simPublic()
     // While stopped (ROB empty), stack the latched STOP-successor PC (the resume point);
     // otherwise the preempted head instruction's PC. (`stopped`/`stoppedPc` are Regs above.)
@@ -727,18 +745,27 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     }
 
     // ── Drive interrupt recognition (needs the SR I-mask from exc.ss, built above) ─
-    // iplIn > srSys[2:0] (mask) OR iplIn==7 (NMI), at a first-µop non-faulted/non-RTE
-    // head, excIdle, head present, not flushing. (Forward-declared above so retire0
-    // can gate on it.) A pending PRIVILEGE VIOLATION takes priority over an interrupt
-    // (the head's own exception delivers first), so exclude it.
+    // iplIn > srSys[2:0] (mask) OR a latched NMI edge (level 7, `nmiPending` above), at
+    // a first-µop non-faulted/non-RTE head, excIdle, head present, not flushing.
+    // (Forward-declared above so retire0 can gate on it.) A pending PRIVILEGE VIOLATION
+    // takes priority over an interrupt (the head's own exception delivers first), so
+    // exclude it.
     val maskI = exc.ss.srSys(2 downto 0)
-    val iplActive = (iplIn > maskI) || (iplIn === U(7, 3 bits))
+    val iplActive = (iplIn > maskI) || nmiPending
     // Normal recognition: a first-µop non-faulted/non-RTE/non-sysOp head is present. When
     // STOPPED the ROB is empty (count==0, no head) and the IRQ must wake the halted core
     // with no head present, so OR in `stopped` as a recognition gate.
     val normalIrqGate = (count > 0) && firstStore(h0) && !faultedStore(h0) &&
                         !isRteStore(h0) && !privViolation && !sysOpStore(h0)
     interruptPending := (normalIrqGate || stopped) && !flushing && excIdle && iplActive
+    // Consume the NMI latch the same cycle it is actually taken — gated on `nmiPending`
+    // itself (not the live `iplIn`), so a latched edge is serviced as vector/level 7
+    // even if the SoC has already dropped the line by the recognition cycle (mirrors
+    // Musashi clearing nmi_pending in m68ki_check_interrupts right as it converts to
+    // m68ki_exception_interrupt(7), independent of the current CPU_INT_LEVEL). A held
+    // level-7 line does NOT re-arm nmiPending (no new edge) -> no re-entry until the
+    // line drops and rises again.
+    when(interruptPending && nmiPending) { nmiPending := False }
     // STOP halts the core after its serializing retire (supervisor only; S=0 -> vector-8
     // via sysPrivFault). The interrupt entry RESUMES it: clear `stopped` when an interrupt
     // is recognized. (sysTriggerSig / interruptPending are both built above.)

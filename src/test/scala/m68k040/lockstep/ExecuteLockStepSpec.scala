@@ -893,6 +893,75 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       irqEvents = Seq((0x40800014L, 7)), avec = true, initialSr = 0x2700)
   }
 
+  // ── HELD IPL=7 must NOT cause infinite NMI re-entry (HIGH: hang fix) ─────────
+  // Root cause: RobPlugin's interrupt recognition previously compared `iplIn === 7`
+  // EVERY CYCLE (level-sensitive), so a line HELD at 7 re-recognized NMI at every
+  // subsequent instruction boundary -> infinite re-entry (a hang). Real 68040 NMI is
+  // EDGE-triggered (Musashi m68kcpu.c:m68k_set_irq — `if(old_level != 0x0700 &&
+  // CPU_INT_LEVEL == 0x0700) nmi_pending = TRUE;`, consumed+cleared ONCE by
+  // m68ki_check_interrupts). `runIrqLockStep`'s harness auto-drops iplIn on the entry
+  // commit (a one-shot edge, by design — see its doc comment), which is exactly why
+  // this bug was invisible to every existing IRQ lock-step test. This test instead
+  // holds `iplIn`=7 CONTINUOUSLY (no auto-drop) across many instruction boundaries —
+  // spanning the first NMI's entry -> handler -> RTE -> many more loop iterations —
+  // and confirms the ROB's recognition pulse (`interruptPending`) fires EXACTLY ONCE
+  // while held, then confirms a genuine drop-and-reraise (a fresh edge) DOES re-fire.
+  test("NMI (level 7) held continuously does NOT re-fire; a fresh edge DOES", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    // Install the level-7 autovector handler @ VBR(0)+31*4=0x7C via a REAL CPU store
+    // (`move.l #handler,%d0 ; move.l %d0,0x7c`) — the SAME proven-correct idiom every
+    // `runIrqLockStep` program uses, so there is no raw-testbench-poke byte-order risk.
+    // Then a tight loop (many instruction boundaries pass while IPL=7 is held); the
+    // bare `rte` pops the entry FSM's own format-0 frame (no program-authored frame
+    // needed).
+    val src = "move.l #handler,%d0 ; move.l %d0,0x7c ; " +
+              "loop: addq.l #1,%d1 ; bra loop ; " +
+              "handler: rte"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i
+      case Left(e)  => fail(s"assemble failed: ${e.reason}")
+    }
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.rootPtr #= 0
+      dut.intCtrl.logic.iplIn #= 0; dut.intCtrl.logic.iackAvec #= true; dut.intCtrl.logic.iackVector #= 0
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.srSys #= 0x27   // boot supervisor, mask 7 (NMI is always taken regardless)
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(0x00100000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      // Let the vector-install prologue (move.l #handler,%d0 ; move.l %d0,0x7c) fully
+      // commit and the CPU settle into the tight loop before raising IPL.
+      cd.waitSampling(60)
+
+      var pulses = 0
+      cd.onSamplings { if (dut.rob.logic.interruptPending.toBoolean) pulses += 1 }
+
+      // Raise IPL=7 (rising edge) and HOLD it (no auto-drop) across many boundaries.
+      dut.intCtrl.logic.iplIn #= 7
+      cd.waitSampling(400)
+      assert(pulses == 1, s"held IPL=7 must recognize NMI EXACTLY ONCE (edge-triggered), got $pulses pulses")
+
+      // Drop the line, then raise it again -- a genuine second edge must re-fire.
+      dut.intCtrl.logic.iplIn #= 0
+      cd.waitSampling(20)
+      dut.intCtrl.logic.iplIn #= 7
+      cd.waitSampling(400)
+      assert(pulses == 2, s"a fresh <7->7 edge must re-fire NMI once more, got $pulses total pulses")
+    }
+  }
+
   // Nested: a level-3 IRQ enters handlerA (mask raised to 3); inside handlerA a
   // level-5 IRQ (5 > 3) preempts it -> handlerB -> RTE -> back into handlerA -> RTE
   // -> resume. Two events: at the main load boundary (level 3) and inside handlerA
