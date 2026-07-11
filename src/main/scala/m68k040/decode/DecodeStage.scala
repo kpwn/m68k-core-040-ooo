@@ -671,9 +671,16 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // For a register-direct MOVE src/dst, the full reg id includes the An bit (mode 001).
     val ucMoveSrcReg = ucEopw(2 downto 0).asUInt   // MOVE src field (the store-data reg for dst-EA)
     val ucMoveSrcAn  = ucEopw(5 downto 3) === B"001"
+    // MOVEA (a MOVE whose DST mode field op[8:6] is An-direct 001) with a mem-indirect
+    // SOURCE: the dst register is an ADDRESS reg (+8), the host MOVE µop is isMovea
+    // (full-32 An write, .W sign-extend) and writes NO CCR (FUZZER-CAUGHT: the crack
+    // set NZVC and targeted the Dn register file half).
+    val ucMoveDstIsAn = ucIsMove && (ucEopw(8 downto 6) === B"001")
+    val ucMiMovea     = ucMoveSrcMi && ucMoveDstIsAn
     val ucMiOtherReg = Mux(ucMoveDstMi,
                            Mux(ucMoveSrcAn, (U(8, 5 bits) + ucMoveSrcReg).resize(5), ucMoveSrcReg.resize(5)),
-                           ucEopw(11 downto 9).asUInt.resize(5))   // Dn for MOVE-src/ALU
+                           Mux(ucMiMovea, (U(8, 5 bits) + ucEopw(11 downto 9).asUInt).resize(5),
+                               ucEopw(11 downto 9).asUInt.resize(5)))   // Dn for MOVE-src/ALU; An for MOVEA-src
     // CMPI / TST -> flags-only (no store). The op writes NZVC and (ADD/SUB/NEG/NEGX) X.
     val ucMiOpIsCmp = ucEntrySpec.op === DecOp.CMP
     val ucMiOpIsTst = ucEntrySpec.op === DecOp.TST
@@ -702,12 +709,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.miHostImm    := Mux(ucImmIsL, ucEntryPkt.words(1) ## ucEntryPkt.words(2),
                                              ucEntryPkt.words(1).asSInt.resize(32).asBits)
     ucEntryCtx.miOtherIsDst := ucMoveSrcMi
+    ucEntryCtx.miMovea      := ucMiMovea
     // Host op flag effects. All in-scope hosts (MOVE/ADD/SUB/AND/OR/EOR/CMP/CLR/NEG/NEGX/
-    // NOT/TST) write NZVC. X is written only by ADD/SUB/NEG/NEGX (not MOVE/logical/CMP/TST/
-    // CLR). NEGX additionally READS old NZ (clear-only Z) + X.
+    // NOT/TST) write NZVC — EXCEPT MOVEA (An dst), which never touches CCR. X is written
+    // only by ADD/SUB/NEG/NEGX (not MOVE/logical/CMP/TST/CLR). NEGX additionally READS
+    // old NZ (clear-only Z) + X.
     val ucMiWriteX    = (ucEntrySpec.op === DecOp.ADD) || (ucEntrySpec.op === DecOp.SUB) ||
                         (ucEntrySpec.op === DecOp.NEG) || (ucEntrySpec.op === DecOp.NEGX)
-    ucEntryCtx.miWNzvc := True
+    ucEntryCtx.miWNzvc := !ucMiMovea
     ucEntryCtx.miWX    := ucMiWriteX
     ucEntryCtx.miRNzvc := ucEntrySpec.op === DecOp.NEGX   // NEGX reads old NZ (clear-only Z)
     ucEntryCtx.miRX    := ucEntrySpec.op === DecOp.NEGX

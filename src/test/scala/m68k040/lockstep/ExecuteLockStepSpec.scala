@@ -4782,6 +4782,58 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       ".stop: bra .stop", nInstr = 6)
   }
 
+  // ── FUZZER-CAUGHT: CMP.<sz> with a MEM-INDIRECT source ──────────────────────
+  // The MI_ALU_SRC host-op row (a) read srcA=T1/srcB=Dn (reversed a-b -> reversed
+  // NZVC) and (b) kept the shared dst slot live, so the compare result CLOBBERED
+  // the Dn. CMP writes NO register — flags only, all NZVC cases + Dn readback.
+  test("lock-step fullext: MEM-INDIRECT CMP.L/.W/.B src (flags only, Dn unchanged)", VerilatorTest) {
+    runLockStep("fx-mi-cmp-src",
+      "move.l #0x3000,%a0 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,0x10(%a0) ; " +           // [0x3010] = ptr 0x4000
+      "move.l #0x11223344,%d1 ; move.l %d1,0x4020 ; " +          // [0x4020] = data
+      "move.l #0x11223344,%d2 ; cmp.l ([0x10,%a0],0x20),%d2 ; " + // equal -> Z; d2 UNCHANGED
+      "move.l %d2,%d3 ; " +                                       // readback proves no clobber
+      "moveq #1,%d4 ; cmp.l ([0x10,%a0],0x20),%d4 ; " +           // 1-0x11223344 -> N/C order
+      "move.l %d4,%d5 ; " +
+      "cmp.w ([0x10,%a0],0x22),%d2 ; " +                          // .W: 0x3344 == d2.w -> Z
+      "cmp.b ([0x10,%a0],0x23),%d2 ; " +                          // .B: 0x44 == d2.b -> Z
+      ".stop: bra .stop", nInstr = 12)
+  }
+
+  // ── FUZZER-CAUGHT: MOVEA with a MEM-INDIRECT source ─────────────────────────
+  // The MI_MOVE_SRC crack targeted the Dn register half (no +8) and SET NZVC;
+  // MOVEA writes the full-32 An (.W sign-extends) and NEVER touches CCR. The
+  // TST before each MOVEA pins a known CCR the MOVEA must preserve.
+  test("lock-step fullext: MEM-INDIRECT MOVEA.L/.W src (An dst, CCR unchanged)", VerilatorTest) {
+    runLockStep("fx-mi-movea-src",
+      "move.l #0x3000,%a0 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,0x10(%a0) ; " +           // [0x3010] = ptr 0x4000
+      "move.l #0xDEADBEEF,%d1 ; move.l %d1,0x4020 ; " +          // [0x4020] = data
+      "moveq #-1,%d3 ; tst.l %d3 ; " +                            // pin N=1
+      "movea.l ([0x10,%a0],0x20),%a1 ; " +                        // a1=0xDEADBEEF, CCR stays N
+      "move.l %a1,%d4 ; " +
+      "moveq #0,%d5 ; tst.l %d5 ; " +                             // pin Z=1
+      "movea.w ([0x10,%a0],0x20),%a2 ; " +                        // a2=sext(0xDEAD), CCR stays Z
+      "move.l %a2,%d6 ; " +
+      ".stop: bra .stop", nInstr = 12)
+  }
+
+  // ── MEM-INDIRECT ALU src operand ORDER + .B/.W merge (same row as the CMP fix):
+  // SUB must compute Dn-mem (not mem-Dn) and a .B/.W op must merge into the Dn's
+  // upper bits (pre-fix it merged the loaded T1's upper bits).
+  test("lock-step fullext: MEM-INDIRECT SUB/ADD.B/OR.W src (order + partial merge)", VerilatorTest) {
+    runLockStep("fx-mi-alu-order",
+      "move.l #0x3000,%a0 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,0x10(%a0) ; " +           // [0x3010] = ptr 0x4000
+      "move.l #0x00000011,%d1 ; move.l %d1,0x4020 ; " +          // [0x4020] = 0x11
+      "move.l #0x00001000,%d2 ; sub.l ([0x10,%a0],0x20),%d2 ; " + // 0x1000-0x11=0xFEF
+      "move.l %d2,%d3 ; " +
+      "move.l #0x55AA1234,%d4 ; add.b ([0x10,%a0],0x23),%d4 ; " + // .B: 0x34+0x11=0x45, upper kept
+      "move.l %d4,%d5 ; " +
+      "move.l #0xFFFF0000,%d6 ; or.w ([0x10,%a0],0x22),%d6 ; " +  // .W: |=0x0011, upper kept
+      ".stop: bra .stop", nInstr = 12)
+  }
+
   // ── FAULTING indirect pointer (the mid-EA pointer load takes an MMU fault) ───
   // A full-format MEM-INDIRECT MOVE whose POINTER LOAD address is in a non-resident
   // page faults PRECISELY: the whole instruction squashes, vector 2 (access fault) is

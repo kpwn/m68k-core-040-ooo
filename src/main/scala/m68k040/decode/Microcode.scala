@@ -239,12 +239,19 @@ object Microcode {
          sz = SzHost, miHostIndex = true, miMoveFlags = true, isLast = true),  // µPC20
 
     // MI_ALU_SRC @21: ALU op with the EA as SOURCE: op (T0+od), Dm -> Dm + flags.
-    //   p0 LOAD.L ptr -> T0 ; p1 LOAD.host (T0+od) -> T1 ; p2 op T1,Dm -> Dm (+flags)
+    //   p0 LOAD.L ptr -> T0 ; p1 LOAD.host (T0+od) -> T1 ; p2 op Dm,T1 -> Dm (+flags)
+    // Operand order (FUZZER-CAUGHT): the ALU computes a-b with srcA as BOTH the
+    // destination operand and the .B/.W partial-merge (old-value) source, so the
+    // host op must read srcA = Dm (the dest Dn) and srcB = T1 (the loaded EA value)
+    // — `cmp/sub <ea>,Dm` is Dm - mem. (The pre-fix ST1/SMiOther order produced
+    // reversed CMP flags, a mem-minus-Dm SUB, and a T1-upper .B/.W merge.)
+    // CMP additionally writes NO register — resolve() forces dstValid off for a
+    // CMP host op (the ROM dst slot is only meaningful for the writing ops).
     Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
          sz = SzLong, miPtrIndex = true, isFirst = true),                      // µPC21
     Desc(UMiHostMove, mem = MLoad, srcA = ST0, dst = ST1, useImm = true, imm = SMiOd,
          sz = SzHost, miHostIndex = true),                                     // µPC22
-    Desc(UMiHostOp, srcA = ST1, srcB = SMiOther, dst = SMiOther, isLast = true),  // µPC23
+    Desc(UMiHostOp, srcA = SMiOther, srcB = ST1, dst = SMiOther, isLast = true),  // µPC23
 
     // MI_RMW @24: dst-EA RMW (imm op ADDI/.../single-EA NEG/NOT/CLR): load, op, store.
     //   p0 LOAD.L ptr -> T0 ; p1 LOAD.host (T0+od) -> T1 ; p2 op (T1 [, other]) -> T1
@@ -404,6 +411,8 @@ object Microcode {
     val miOtherIsImm = Bool()            // the other operand is an immediate (line-0 imm op)
     val miHostImm    = Bits(32 bits)     // the host op immediate (when miOtherIsImm)
     val miOtherIsDst = Bool()            // MOVE src-EA: the loaded value goes straight to miOther (Dn dst)
+    val miMovea      = Bool()            // MOVE src-EA whose dst is an ADDRESS reg (MOVEA): the host
+                                         // MOVE µop gets isMovea (full-32 An write, .W sign-extend) + NO CCR
     val miWNzvc      = Bool(); val miWX = Bool()   // host op flag writes
     val miRNzvc      = Bool(); val miRX = Bool()   // host op flag reads (NEGX/etc — not in the §7 set)
     // ── CAS / CAS2 group (populated at ucBegin from the ext words) ──────────────────────
@@ -573,6 +582,10 @@ object Microcode {
       u.readsX     := ctx.miRX
       u.writesNzvc := ctx.miWNzvc
       u.writesX    := ctx.miWX
+      // CMP writes NO result register (flags only) — the MI_ALU_SRC row's dst slot
+      // (SMiOther, shared with the writing ALU ops) must not land for a CMP host
+      // (FUZZER-CAUGHT: `cmp.<sz> ([...]),Dn` clobbered Dn with the compare result).
+      when(ctx.miOp === DecOp.CMP) { u.dstValid := False }
     } else if (d.uop == UMiHostMove) {
       // The host MOVE (load-to-Dn / store-from-Dn) sets NZVC per ctx.miWNzvc (miMoveFlags
       // rows). An intermediate host-load to T1 (ALU-src/RMW) writes NO flags (the host op
@@ -643,9 +656,15 @@ object Microcode {
     // funnel reads bitOff/needHi/width/origOff from the packed bfImm (= u.imm, set above).
     // isMovea: a MOVES READ writeback to an An (ctx.movesRnIsA) sign-extends the loaded
     // value to 32 (the moveaResult path, extended to .B for MOVES). A Dn read leaves it
-    // False -> the generic size-merge preserves the upper bits. Default False for all others.
+    // False -> the generic size-merge preserves the upper bits. A mem-indirect MOVEA
+    // host op (ctx.miMovea, MI_MOVE_SRC with an An dst) likewise takes the moveaResult
+    // path (.W sign-extend, full-32 An write). Default False for all others.
     u.bitOp := 0; u.bfDynamic := False; u.extByte := False
-    u.isMovea := (if (d.uop == UMovesRead) ctx.movesRnIsA else False)
+    u.isMovea := (d.uop match {
+      case UMovesRead => ctx.movesRnIsA
+      case UMiHostOp  => ctx.miMovea
+      case _          => False
+    })
     d.uop match {
       case UBfMem =>
         u.bfMem       := True
