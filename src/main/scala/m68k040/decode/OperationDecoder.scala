@@ -605,6 +605,12 @@ object OperationDecoder {
         // a non-reg EA to illegal). An-direct (mode 1) is CMPM, NOT EOR -> excluded.
         // Flags: NZ, V=C=0 (no X). srcA=EA (dst operand), srcB=Dn, dst=EA.
         val isEor = (line === 0xB) && isRmw && (opword(5 downto 3) =/= 1)
+        // CMPM (Ay)+,(Ax)+ (line B, opmode 4/5/6, `opword(5 downto 3)===1` — the An-direct
+        // slot isEor excludes): `1011 xxx1 ss001 yyy`, Ax=op[11:9], size=op[7:6], Ay=op[2:0].
+        // Single opword, NO extension words. A new 5-row microcode entry (dual postinc LOAD
+        // Ay/Ax -> CMP flags-only); microcoded ops bypass normal srcA/srcB/dst operand
+        // routing (DecodeStage.scala reads ucEntry/opword directly), so none is set here.
+        val isCmpm = (line === 0xB) && isRmw && (opword(5 downto 3) === 1)
         // DIVU.W (line 0x8 opmode 3) / DIVS.W (line 0x8 opmode 7): 32-bit dividend Dn
         // (bits 11:9) / 16-bit divisor EA -> Dn = {rem[31:16], q[15:0]}. BOTH DIVs are
         // line 8 (the OR group). MULU.W (line 0xC opmode 3) / MULS.W (line 0xC opmode
@@ -748,6 +754,17 @@ object OperationDecoder {
           o.dst := dnField; o.dstWrites := True   // product -> Dn[31:0]
           o.writesNzvc := True            // MUL sets N/Z (V=0, C=0)
           o.divSigned := isMulsW          // reuse divSigned as the MULS marker
+        } .elsewhen(isCmpm) {
+          // CMPM (Ay)+,(Ax)+ : Musashi (m68k_in.c) src=read(Ay)+ FIRST; dst=read(Ax)+
+          // SECOND; res=dst-src; N/Z/V/C from res; X untouched; no register/memory write.
+          o.illegal    := False
+          o.op         := DecOp.CMP
+          o.microcoded := True
+          o.ucEntry    := U(Microcode.CMPM_ENTRY, o.ucEntry.getWidth bits)
+          when(opmode === 4) { o.size := Size.BYTE }
+            .elsewhen(opmode === 5) { o.size := Size.WORD }
+            .otherwise { o.size := Size.LONG }
+          o.writesNzvc := True             // NZVC from res; X untouched (the µcode compute row)
         } .elsewhen(isEor) {
           // EOR Dn,<ea>: srcA = EA (dst operand), srcB = Dn, dst = EA (same field).
           o.illegal := False
