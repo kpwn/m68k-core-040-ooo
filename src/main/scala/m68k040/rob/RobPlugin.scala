@@ -1,6 +1,6 @@
 package m68k040.rob
 
-import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate, GshareUpdateService, GshareUpdate}
+import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate, GshareUpdateService, GshareUpdate, PrivilegeService}
 import m68k040.rename.RenamedUop
 import m68k040.types.CommitTrace
 import spinal.core._
@@ -19,7 +19,23 @@ import spinal.lib.misc.plugin.FiberPlugin
   *
   * retireAlone entries (branches, for now) retire 1-wide.
   */
-class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService {
+class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService {
+
+  // PrivilegeService: the wire is allocated in `setup` (BEFORE any plugin's `build`
+  // runs) and driven inside `logic` (build) below, mirroring TranslationService's
+  // _req/_rsp pattern. This is NOT cosmetic: `logic`'s very first statement
+  // (`host[RenameCommitService]`) blocks on RenameStage, which blocks on Decode, which
+  // blocks on FetchAlign, which blocks on IcachePlugin's OWN `cmd` output — so a
+  // consumer (IcachePlugin) resolving `host[PrivilegeService].supervisor` as a member
+  // of `logic` would deadlock the whole Fiber chain in a cycle (Icache -> Rob -> Rename
+  // -> Decode -> FetchAlign -> Icache). Exposing a pre-allocated wire from `setup`
+  // breaks the cycle: IcachePlugin gets a stable wire reference immediately and only
+  // combinationally taps its (later-driven) value.
+  private var _supervisor: Bool = null
+  override def supervisor: Bool = _supervisor
+  during setup {
+    _supervisor = Bool()
+  }
 
   /** One ROB entry's commit/free + trace payload. */
   case class RobPayload() extends Bundle {
@@ -293,9 +309,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // NOT drive a normal int/flag commit. The exception FSM (exc) gates these so a
     // trigger fires once per event (excIdle).
     val excIdle = Bool()   // driven below from exc.active
-    // Committed S (supervisor) bit — FORWARD-DECLARED (the privilege check below gates on
-    // it); DRIVEN from exc.ss.s after the exc unit is built.
-    val committedS = Bool(); committedS.simPublic()
+    // Committed S (supervisor) bit — the SAME wire as the PrivilegeService `_supervisor`
+    // pre-allocated in `setup` (see the class-level comment above); FORWARD-DECLARED
+    // here too (the privilege check below gates on it) and DRIVEN from exc.ss.s after
+    // the exc unit is built.
+    val committedS = _supervisor; committedS.simPublic()
     val headReady   = (count > 0) && completes(h0) && !flushing
     // Privilege violation: a needsSupervisor head retiring in USER mode (committed S==0)
     // takes a vector-8 (format-$0) exception. Treated like a faulted head — the op does
@@ -867,4 +885,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
 
   override def btbUpdate = logic.btbUpdateFlow
   override def gshareUpdate = logic.gshareUpdateFlow
+
+  // `supervisor` (PrivilegeService) is implemented above via the `setup`-allocated
+  // `_supervisor` wire — see the class-level comment near its declaration.
 }

@@ -1,6 +1,6 @@
 package m68k040.cache
 
-import m68k040.services.{FetchService, TranslationService}
+import m68k040.services.{FetchService, TranslationService, PrivilegeService}
 import m68k040.frontend.PredecodeWord
 import spinal.core._
 import spinal.lib._
@@ -41,10 +41,20 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
     // ---- resolve TranslationService ----
     val xlate = host[TranslationService]
+    // The current architectural S bit (ROB-owned, same signal the privilege-violation
+    // check gates on) — an instruction fetch's function code must reflect the ACTUAL
+    // current privilege level, not a hardcoded one. A hardcoded False here meant any
+    // supervisor-only code page (the normal kernel configuration) permission-denied
+    // EVERY fetch once the MMU was enabled — a permanent boot-blocker (the CPU could
+    // never fetch its own supervisor code). Mirrors the DTLB-side fix in LsEuPlugin.
+    // `host.get` (optional): a standalone I-cache DUT with no RobPlugin/PrivilegeService
+    // wired defaults to False (user), exactly the prior hardcoded behavior — unchanged
+    // for every existing non-full-core test.
+    val privCtrl = host.get[PrivilegeService]
     val activePc = UInt(32 bits)
     xlate.req.valid      := True
     xlate.req.vpn        := activePc(31 downto 12)
-    xlate.req.supervisor := False
+    xlate.req.supervisor := privCtrl.map(_.supervisor).getOrElse(False)
     xlate.req.write      := False
 
     // ---- storage arrays ----

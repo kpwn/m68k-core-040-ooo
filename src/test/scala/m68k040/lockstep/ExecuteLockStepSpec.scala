@@ -3750,6 +3750,89 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
   }
 
+  // ── Bug 3: I-side MMU boot-blocker (supervisor-only code page) ───────────────
+  // Root cause: I-fetches hardcoded `xlate.req.supervisor := False` in IcachePlugin
+  // (now PrivilegeService-driven off the live architectural S bit — see RobPlugin's
+  // `supervisor` = `committedS`). Combined with the permission check
+  // `permFault(sup) = sup && !req.supervisor` (ItlbPlugin.scala), a supervisor-only
+  // code page (S bit, MmuTypes.pgSupervisor = descriptor bit 7 — the NORMAL kernel
+  // configuration) would deny EVERY instruction fetch once the MMU was enabled: a
+  // PERMANENT boot-blocker (the CPU could never fetch its own supervisor code).
+  // Directed (Musashi models no 040 MMU): builds a page table with the CODE region
+  // marked supervisor-only, then confirms (a) a SUPERVISOR-mode fetch succeeds (the
+  // program keeps committing, the ITLB never flags a fault) and (b) a USER-mode fetch
+  // from the SAME page STILL correctly faults (the permission check itself is
+  // unchanged — only WHICH privilege level it is checked against was fixed).
+  private val SUP_ROOT = 0x00090000L
+  private val SUP_PTRT = 0x00091000L
+  private val SUP_PAGT = 0x00092000L
+  private def buildSupervisorCodeTable(mem: m68k040.ls.BehavioralMemAgent, loadAddr: Long): Unit = {
+    def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) mem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+    for (i <- 0 until 4) {
+      val cva = loadAddr + i * 0x1000L
+      val rootIdx = ((cva >> 25) & 0x7f).toInt
+      val ptrIdx  = ((cva >> 18) & 0x7f).toInt
+      val pageIdx = ((cva >> 12) & 0x3f).toInt
+      pokeWordLE(SUP_ROOT + rootIdx * 4, (SUP_PTRT & 0xfffffff0L) | 0x3L)   // table descriptor, resident
+      pokeWordLE(SUP_PTRT + ptrIdx * 4,  (SUP_PAGT & 0xfffffff0L) | 0x3L)   // table descriptor, resident
+      // Page descriptor: S bit (bit7) SET (supervisor-protect) + PDT=01 (resident),
+      // identity PPN = VPN (MmuTypes.pgSupervisor = d(7), pgResident = PDT in {01,11}).
+      pokeWordLE(SUP_PAGT + pageIdx * 4, (((cva >> 12) & 0xfffffL) << 12) | 0x80L | 0x1L)
+    }
+  }
+  private def runSupCodePageFetch(userMode: Boolean): (Boolean, Int) = {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val src = "moveq #1,%d1 ; moveq #2,%d2 ; moveq #3,%d3 ; moveq #4,%d4 ; loop: bra loop"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i
+      case Left(e)  => fail(s"assemble failed: ${e.reason}")
+    }
+    var committed = 0
+    var faulted = false
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val ptmem     = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      buildSupervisorCodeTable(ptmem, loadAddr)
+      buildSupervisorCodeTable(itlbPtmem, loadAddr)
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.rootPtr   #= SUP_ROOT
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.usp #= 0x00200000L
+      if (userMode) dut.rob.logic.exc.ss.srSys #= 0x00 else dut.rob.logic.exc.ss.srSys #= 0x27
+      val bootA7 = if (userMode) 0x00200000L else 0x00100000L
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(bootA7)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      var guard = 0
+      while (guard < 1500 && !faulted && committed < 4) {
+        if (dut.itlb.logic.faultSeen.toBoolean) faulted = true
+        for (k <- 0 until 2) if (dut.rob.logic.commitObs(k).fire.toBoolean) committed += 1
+        cd.waitSampling(); guard += 1
+      }
+    }
+    (faulted, committed)
+  }
+
+  test("MMU boot-blocker: supervisor fetch from a supervisor-only code page succeeds", VerilatorTest) {
+    val (faulted, committed) = runSupCodePageFetch(userMode = false)
+    assert(!faulted, "a SUPERVISOR-mode fetch from a supervisor-only page must NOT flag an ITLB fault")
+    assert(committed >= 4, s"expected >=4 committed instructions, got $committed (boot-blocker: fetch stalled)")
+  }
+  test("MMU: user fetch from a supervisor-only code page still faults (permission check unchanged)", VerilatorTest) {
+    val (faulted, _) = runSupCodePageFetch(userMode = true)
+    assert(faulted, "a USER-mode fetch from a supervisor-only page must still flag an ITLB fault")
+  }
+
   // ── PRECISE EXCEPTION lock-step: illegal-instruction -> handler -> RTE ───────
   // A program that installs the illegal-instruction vector (4) at VBR+0x10 (a
   // runtime store, so both the DUT D-cache and Musashi see it), executes an
