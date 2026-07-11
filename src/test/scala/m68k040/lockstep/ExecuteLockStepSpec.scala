@@ -919,6 +919,59 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  // ── ADDA/SUBA/CMPA (An-destination arithmetic) — FUZZER-CAUGHT decode bug ───
+  // The decoder routed srcA=EA / srcB=An while the ALU computes a-b, so SUBA
+  // computed src-An (the exact negative) and CMPA's flags were reversed; ADDA.L
+  // was masked by commutativity but ADDA.W also size-merged the old An upper 16
+  // instead of carry-propagating the full-32 add of the sign-extended source.
+  // Musashi: `AX ± MAKE_INT_16(src)` / 32-bit `dst - src` flags for CMPA.
+  test("lock-step: ADDA/SUBA .W/.L reg/An sources (operand order + .W sign-extend + carry)", VerilatorTest) {
+    runLockStep("adda-suba-reg", Seq(
+      "move.l #0x00001000,%a2", "move.l #0x00000123,%d1", "suba.l %d1,%a2",  // An - src = 0xedd
+      "move.l %a2,%d2",
+      "move.l #0x00001000,%a3", "adda.l %d1,%a3", "move.l %a3,%d3",          // 0x1123
+      // .W source sign-extends: 0xffff -> -1; the full-32 op carry-propagates
+      "move.l #0x00010000,%a4", "move.l #0x0000ffff,%d4", "suba.w %d4,%a4",  // 0x10000-(-1)=0x10001
+      "move.l %a4,%d5",
+      "move.l #0x00010000,%a5", "adda.w %d4,%a5", "move.l %a5,%d6",          // 0x10000+(-1)=0xffff
+      // positive .W source (no sign-extend)
+      "move.l #0x00000010,%d0", "suba.w %d0,%a5", "move.l %a5,%d7",          // 0xffef
+      // An-direct source
+      "move.l #0x00000100,%a1", "suba.l %a1,%a4", "adda.l %a1,%a5",
+      "move.l %a4,%d2", "move.l %a5,%d3"
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: CMPA.W/.L flags (Z/N/C/V cases, sign-extended .W source, no write)", VerilatorTest) {
+    runLockStep("cmpa-flags", Seq(
+      "move.l #5,%a1", "move.l #5,%d1", "cmpa.l %d1,%a1",                    // equal -> Z
+      "move.l #3,%a2", "move.l #7,%d2", "cmpa.l %d2,%a2",                    // 3-7 -> N,C
+      "move.l #0x80000000,%a3", "move.l #1,%d3", "cmpa.l %d3,%a3",           // INT_MIN-1 -> V
+      "move.l #7,%a4", "move.l #3,%d4", "cmpa.l %d4,%a4",                    // 7-3 -> none
+      "move.l #0x7fffffff,%a6", "move.l #0xffffffff,%d5", "cmpa.l %d5,%a6",  // MAX-(-1) -> V,C
+      // .W: source sign-extends to -1
+      "move.l #0,%a5", "move.l #0xffff,%d6", "cmpa.w %d6,%a5",               // 0-(-1) -> C
+      "move.l #0xffffffff,%a5", "cmpa.w %d6,%a5",                            // -1-(-1) -> Z
+      "move.l #0x10,%d7", "cmpa.w %d7,%a5",                                  // -1-16 -> N
+      "cmpa.l %a4,%a3",                                                      // An-direct source
+      "move.l %a3,%d0"                                                       // A3 unchanged readback
+    ).mkString(" ; "))
+  }
+
+  test("lock-step: ADDA/SUBA/CMPA memory sources (.W/.L)", VerilatorTest) {
+    runLockStep("adda-family-mem", Seq(
+      "move.l #0x3000,%a0",
+      "move.l #0xfffffffe,%d0", "move.l %d0,(%a0)",                          // mem[0x3000]=-2
+      "move.l #0x100,%a1", "suba.l (%a0),%a1", "move.l %a1,%d1",             // 0x100-(-2)=0x102
+      "move.l #0x100,%a2", "adda.w (%a0),%a2", "move.l %a2,%d2",             // +sext(0xffff)=0xff
+      "move.l #0x100,%a3", "cmpa.w (%a0),%a3",                               // 0x100-(-1) flags
+      "cmpa.l (%a0),%a3",                                                    // 0x100-(-2) flags
+      "move.l #0x00000042,%d3", "move.l %d3,(0x3004).l",                     // positive word
+      "move.l #0x100,%a4", "adda.l (0x3004).l,%a4", "move.l %a4,%d4",        // abs.l source
+      "suba.w (0x3006).w,%a4", "move.l %a4,%d5"                              // low word 0x0042
+    ).mkString(" ; "))
+  }
+
   test("lock-step: mixed straight-line (~24 instrs)", VerilatorTest) {
     runLockStep("mixed", Seq(
       "moveq #1,%d0", "moveq #2,%d1", "moveq #3,%d2", "moveq #4,%d3",
@@ -3510,6 +3563,27 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #5,%d2 ; loop: bra loop", nInstr = 5)
   }
 
+  // ── FUZZER-CAUGHT (B5): DIV overflow must PRESERVE N/Z/C (only V is set) ─────
+  // Musashi's divs/divu overflow path is `FLAG_V = VFLAG_SET; return;` — N, Z and C
+  // keep their PRE-DIV values. The DUT wrote NZVC=0010 (clearing a live N). Pin N=1
+  // (tst of a negative) before each overflowing DIV and lock-step the committed CCR.
+  test("lock-step: DIVS.W/DIVU.W overflow preserves N/Z/C (only V set)", VerilatorTest) {
+    runLockStep("div-w-ovf-nzc",
+      // NOTE: no readback of the DIV DEST after an overflow — on overflow the dest
+      // physreg is (correctly) never written, and a later READER of that renamed dest
+      // hangs (pre-existing dataflow gap, separate from this flag fix; see report).
+      "move.l #0x26f0c934,%d0 ; move.l #0x0d00,%d1 ; " +             // operands FIRST (they set flags)
+      "moveq #-1,%d7 ; tst.l %d7 ; " +                               // then pin N=1
+      "divu.w %d1,%d0 ; " +                                          // unsigned ovf; N must stay 1
+      "move.l #0x40000000,%d3 ; moveq #2,%d4 ; " +
+      "moveq #-1,%d7 ; tst.l %d7 ; " +                               // re-pin N=1
+      "divs.w %d4,%d3 ; " +                                          // signed ovf; N must stay 1
+      "move.l #0x10000,%d6 ; moveq #1,%d4 ; " +
+      "moveq #0,%d7 ; tst.l %d7 ; " +                                // pin Z=1 (N=0)
+      "divu.w %d4,%d6 ; " +                                          // ovf; Z must stay 1
+      ".stop: bra .stop", nInstr = 16)
+  }
+
   // DIVU.W divide-by-zero -> vector 5 (format-$2) -> handler -> RTE -> resume.
   // The handler's last flag-writer reproduces the entry CCR (Z=1 from `moveq #0,%d2`)
   // so the sim whitebox's reconstructed CCR matches the oracle's RTE-restored CCR at
@@ -4416,6 +4490,26 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       checkMem = Seq(0x3fc4L), checkSpan = 60)
   }
 
+  // ── FUZZER-CAUGHT (B6): MOVEM.(An)+ LOAD with the base An IN the register list ──
+  // Musashi (movem, er, pi) loads REG_DA[i] for every listed register (An included)
+  // and then overwrites An with `AY = ea` (the post-incremented final address) — the
+  // value loaded into An is DISCARDED. The DUT kept the loaded value (and later
+  // elements' addresses walked off the loaded An). [0x4004] (the word loaded into a0)
+  // is a VALID pointer so the pre-fix wrong-address path stays in mapped memory.
+  test("lock-step: MOVEM.L/.W (An)+ load with base An in the list (An := final addr)", VerilatorTest) {
+    runLockStep("movem-postinc-base-in-list",
+      "move.l #0x11112222,%d0 ; move.l %d0,0x4000 ; " +
+      "move.l #0x4100,%d1 ; move.l %d1,0x4004 ; " +           // loaded into a0, must be discarded
+      "move.l #0x33334444,%d2 ; move.l %d2,0x4008 ; " +
+      "move.l #0x4000,%a0 ; " +
+      "movem.l (%a0)+,%d3/%a0/%a1 ; " +                        // d3=[4000], a0 load DISCARDED, a1=[4008]; a0:=0x400c
+      "move.l %a0,%d4 ; move.l %a1,%d5 ; move.l %d3,%d6 ; " +  // readbacks
+      "move.l #0x4000,%a2 ; " +
+      "movem.w (%a2)+,%d7/%a2 ; " +                            // .W: d7=sext(1111), a2 load discarded; a2:=0x4004
+      "move.l %a2,%d0 ; move.l %d7,%d1 ; " +
+      ".stop: bra .stop", nInstr = 16)
+  }
+
   // Front-end-stall-then-resume: a long MOVEM (held fed ~8 cycles) immediately followed by
   // an ALU chain + a branch — the FSM must release `fed` cleanly and the trailing
   // instructions must execute (no deadlock, correct next-instruction stream).
@@ -4727,6 +4821,58 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.w #7,%d3 ; move.w %d3,0x4010 ; " +
       "cmpi.w #7,([8,%a0],0x10) ; seq %d5 ; " +                  // Z=1 -> d5[7:0]=0xFF
       ".stop: bra .stop", nInstr = 6)
+  }
+
+  // ── FUZZER-CAUGHT: CMP.<sz> with a MEM-INDIRECT source ──────────────────────
+  // The MI_ALU_SRC host-op row (a) read srcA=T1/srcB=Dn (reversed a-b -> reversed
+  // NZVC) and (b) kept the shared dst slot live, so the compare result CLOBBERED
+  // the Dn. CMP writes NO register — flags only, all NZVC cases + Dn readback.
+  test("lock-step fullext: MEM-INDIRECT CMP.L/.W/.B src (flags only, Dn unchanged)", VerilatorTest) {
+    runLockStep("fx-mi-cmp-src",
+      "move.l #0x3000,%a0 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,0x10(%a0) ; " +           // [0x3010] = ptr 0x4000
+      "move.l #0x11223344,%d1 ; move.l %d1,0x4020 ; " +          // [0x4020] = data
+      "move.l #0x11223344,%d2 ; cmp.l ([0x10,%a0],0x20),%d2 ; " + // equal -> Z; d2 UNCHANGED
+      "move.l %d2,%d3 ; " +                                       // readback proves no clobber
+      "moveq #1,%d4 ; cmp.l ([0x10,%a0],0x20),%d4 ; " +           // 1-0x11223344 -> N/C order
+      "move.l %d4,%d5 ; " +
+      "cmp.w ([0x10,%a0],0x22),%d2 ; " +                          // .W: 0x3344 == d2.w -> Z
+      "cmp.b ([0x10,%a0],0x23),%d2 ; " +                          // .B: 0x44 == d2.b -> Z
+      ".stop: bra .stop", nInstr = 12)
+  }
+
+  // ── FUZZER-CAUGHT: MOVEA with a MEM-INDIRECT source ─────────────────────────
+  // The MI_MOVE_SRC crack targeted the Dn register half (no +8) and SET NZVC;
+  // MOVEA writes the full-32 An (.W sign-extends) and NEVER touches CCR. The
+  // TST before each MOVEA pins a known CCR the MOVEA must preserve.
+  test("lock-step fullext: MEM-INDIRECT MOVEA.L/.W src (An dst, CCR unchanged)", VerilatorTest) {
+    runLockStep("fx-mi-movea-src",
+      "move.l #0x3000,%a0 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,0x10(%a0) ; " +           // [0x3010] = ptr 0x4000
+      "move.l #0xDEADBEEF,%d1 ; move.l %d1,0x4020 ; " +          // [0x4020] = data
+      "moveq #-1,%d3 ; tst.l %d3 ; " +                            // pin N=1
+      "movea.l ([0x10,%a0],0x20),%a1 ; " +                        // a1=0xDEADBEEF, CCR stays N
+      "move.l %a1,%d4 ; " +
+      "moveq #0,%d5 ; tst.l %d5 ; " +                             // pin Z=1
+      "movea.w ([0x10,%a0],0x20),%a2 ; " +                        // a2=sext(0xDEAD), CCR stays Z
+      "move.l %a2,%d6 ; " +
+      ".stop: bra .stop", nInstr = 12)
+  }
+
+  // ── MEM-INDIRECT ALU src operand ORDER + .B/.W merge (same row as the CMP fix):
+  // SUB must compute Dn-mem (not mem-Dn) and a .B/.W op must merge into the Dn's
+  // upper bits (pre-fix it merged the loaded T1's upper bits).
+  test("lock-step fullext: MEM-INDIRECT SUB/ADD.B/OR.W src (order + partial merge)", VerilatorTest) {
+    runLockStep("fx-mi-alu-order",
+      "move.l #0x3000,%a0 ; " +
+      "move.l #0x4000,%d0 ; move.l %d0,0x10(%a0) ; " +           // [0x3010] = ptr 0x4000
+      "move.l #0x00000011,%d1 ; move.l %d1,0x4020 ; " +          // [0x4020] = 0x11
+      "move.l #0x00001000,%d2 ; sub.l ([0x10,%a0],0x20),%d2 ; " + // 0x1000-0x11=0xFEF
+      "move.l %d2,%d3 ; " +
+      "move.l #0x55AA1234,%d4 ; add.b ([0x10,%a0],0x23),%d4 ; " + // .B: 0x34+0x11=0x45, upper kept
+      "move.l %d4,%d5 ; " +
+      "move.l #0xFFFF0000,%d6 ; or.w ([0x10,%a0],0x22),%d6 ; " +  // .W: |=0x0011, upper kept
+      ".stop: bra .stop", nInstr = 12)
   }
 
   // ── FAULTING indirect pointer (the mid-EA pointer load takes an MMU fault) ───

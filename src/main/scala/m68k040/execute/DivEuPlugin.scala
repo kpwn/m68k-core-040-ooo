@@ -319,8 +319,13 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val qN = Mux(u1.size === Size.WORD, resQ(15), resQ(31))
     val qZ = Mux(u1.size === Size.WORD, resQ(15 downto 0) === 0, resQ === 0)
     val divNzvcNormal = (qN ## qZ ## False ## False).asBits          // N Z V(0) C(0)
-    val divNzvcOver   = (False ## False ## True ## False).asBits     // overflow: V=1
-    // On overflow: V=1, NO result write (Dn unchanged). On DIV0: euFault vec5, no write.
+    // Overflow flags (FUZZER-CAUGHT B5): Musashi's divs/divu overflow path is
+    // `FLAG_V = VFLAG_SET; return;` — N, Z and C keep their PRE-DIV values. Only V
+    // is set. The old NZVC is read via the CMP2/CHK2 nzvcRd port (DIV µops set
+    // readsNzvc) and latched in s1Nzvc.
+    val divNzvcOver   = (s1Nzvc(3) ## s1Nzvc(2) ## True ## s1Nzvc(0)).asBits  // {oldN, oldZ, V=1, oldC}
+    // On overflow: V=1 (N/Z/C preserved), NO result write (Dn unchanged). On DIV0:
+    // euFault vec5, no write.
 
     // ---- DIVREM (remainder-move) support: latch the just-finished DIV's REMAINDER
     // (and whether it overflowed) so the trailing DIVREM µop writes Dr. The DIVREM is

@@ -723,6 +723,21 @@ object MicroOpAssembler {
       opUop.isMovea := True
     }
 
+    // ── ADDA/SUBA/CMPA (An-destination arithmetic; dst = REGFIELD An) ──────────
+    // An is written full-32 with NO partial merge and (ADDA/SUBA) NO flags; the .W
+    // form SIGN-EXTENDS the 16-bit source to 32 before the full-32 op (Musashi
+    // adda/suba/cmpa: `AX ± MAKE_INT_16(src)` / `dst - MAKE_INT_16(src)` at 32-bit
+    // width, incl. CMPA's flags). Reuse `isMovea` as the "An-wide" marker on a
+    // non-MOVE ALU op: the ALU EU widens the op to LONG, sign-extends src2 from
+    // the .W size, bypasses the size-merge, and computes (CMPA) flags at 32-bit.
+    // (isMovea on op==MOVE keeps its existing MOVEA meaning — the EU discriminates
+    // on the op.)
+    val anArith = (spec.dst.kind === OperandKind.REGFIELD) && spec.dst.isAddr &&
+                  ((spec.op === DecOp.ADD) || (spec.op === DecOp.SUB) || (spec.op === DecOp.CMP))
+    when(anArith) {
+      opUop.isMovea := True
+    }
+
     // ── ADDQ/SUBQ #n,An — full-32, NO flags (like ADDA/SUBA) ───────────────────
     // ADDQ/SUBQ (srcB = IMMQ3) whose DESTINATION EA (op[5:0] = srcEa, since dst=EASRC)
     // resolves to an ADDRESS register: the operation is full-32 regardless of the .B/.W
@@ -1496,7 +1511,7 @@ object MicroOpAssembler {
       divlUop.useImm  := False; divlUop.imm := 0
     }
     divlUop.dstReg        := divlDq; divlUop.dstValid := True              // quotient -> Dq
-    divlUop.readsNzvc     := False; divlUop.readsX := False
+    divlUop.readsNzvc     := True;  divlUop.readsX := False   // overflow preserves old N/Z/C (Musashi: only V set)
     divlUop.writesNzvc    := True;  divlUop.writesX := False               // DIV sets N/Z/V
     divlUop.isBranch      := False; divlUop.ibranch := False; divlUop.stkPush := False; divlUop.anInc := 0; divlUop.ccrRestore := False; divlUop.toCcr := False; divlUop.cond := 0; divlUop.branchDisp := 0
     divlUop.eaAuto        := EaAuto.NONE; divlUop.eaDelta := 0
