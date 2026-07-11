@@ -1893,6 +1893,86 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     assert(!saw, "supervisor MOVE-from-SR must NOT raise a privilege violation")
   }
 
+  // ── RTE PRIVILEGE ESCALATION (CRITICAL security fix) ─────────────────────────
+  // Directed (mirrors runMoveFromSrPriv exactly): boot USER mode (S=0), execute a
+  // bare `rte`. Musashi's handler (m68k_in.c M68KMAKE_OP(rte,32,.,.)) is:
+  //   if(FLAG_S) { ...pop the frame, m68ki_jump/m68ki_set_sr... } m68ki_exception_privilege_violation();
+  // i.e. a user-mode RTE takes a vector-8 privilege violation BEFORE the stack frame
+  // is EVER read/popped — no attacker-controlled SR/PC ever reaches the CPU. Confirms
+  // (a) a precise vector-8 exception is raised, (b) the ROB's real RTE pop/redirect
+  // FSM (`rteRetire`) is NEVER triggered (the USP is completely untouched — no pop
+  // occurred), (c) the USP register value itself never changes. A regression that
+  // supervisor-mode RTE still round-trips normally is covered by re-running the full
+  // IRQ/exception lock-step suite (every one of those tests' return path IS a
+  // supervisor `rte`).
+  private def runRteUserPriv(): (Boolean, Int, Boolean, BigInt, BigInt) = {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    // `rte` is the sole instruction; a spinning label follows only so the image is
+    // well-formed (unreachable in user mode -- the RTE never executes as an RTE).
+    val src = "rte ; handler: bra.s handler"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i
+      case Left(e)  => fail(s"assemble failed: ${e.reason}")
+    }
+    var sawPriv = false
+    var vec = -1
+    var sawRteRetire = false
+    var uspBefore = BigInt(0)
+    var uspAfter  = BigInt(0)
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.rootPtr #= 0
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      // Install a vector-8 handler @ VBR(0)+8*4=0x20 (just spins; we only observe entry).
+      // Big-endian byte order (MSB at the lowest address) — a raw testbench poke
+      // consumed by the exception unit's vector fetch.
+      val handlerPc = loadAddr + 2   // `handler:` after the 1-word RTE opcode
+      for (i <- 0 until 4) dmem.pokeByte(0x20 + i, ((handlerPc >> (8 * (3 - i))) & 0xff).toInt)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.usp #= 0x00200000L
+      dut.rob.logic.exc.ss.srSys #= 0x00   // boot USER mode (S=0)
+      val bootA7 = 0x00200000L
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(bootA7)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      uspBefore = dut.rob.logic.exc.ss.usp.toBigInt
+      var guard = 0
+      while (!sawPriv && guard < 600) {
+        if (dut.rob.logic.rteRetire.toBoolean) sawRteRetire = true
+        if (dut.rob.logic.exceptionPending.toBoolean) {
+          sawPriv = true
+          vec = dut.rob.logic.exceptionVector.toInt
+        }
+        cd.waitSampling(); guard += 1
+      }
+      // Let the entry FSM fully settle (frame push onto the SUPERVISOR stack, not USP).
+      cd.waitSampling(30)
+      uspAfter = dut.rob.logic.exc.ss.usp.toBigInt
+    }
+    (sawPriv, vec, sawRteRetire, uspBefore, uspAfter)
+  }
+
+  test("RTE in USER mode raises a vector-8 privilege violation (does NOT execute)", VerilatorTest) {
+    val (saw, vec, sawRteRetire, uspBefore, uspAfter) = runRteUserPriv()
+    assert(saw, "user-mode RTE must raise a precise exception")
+    assert(vec == 8, s"privilege violation must be vector 8, got $vec")
+    assert(!sawRteRetire, "the RTE pop/redirect FSM must NEVER trigger for a user-mode RTE")
+    assert(uspBefore == uspAfter,
+      f"the USP must be completely UNTOUCHED by a rejected RTE (no pop): before=0x$uspBefore%08x after=0x$uspAfter%08x")
+  }
+
   // ── Slow-ALU (shift, latency-2) DEPENDENT CHAINS ────────────────────────────
   // Exercises the IQ aluSlow dynamic-wakeup (lat2): an op that consumes a SHIFT's
   // INT result, NZVC result, and X result must wait one extra cycle and then read

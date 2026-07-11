@@ -1178,6 +1178,13 @@ object MicroOpAssembler {
       opUop.unimplemented := False
       opUop.faulted := False; opUop.faultVector := 0
       opUop.isRte   := True
+      // RTE is PRIVILEGED (Musashi m68k_op_rte_32 checks FLAG_S and raises a privilege
+      // violation BEFORE touching the stack when not supervisor). needsSupervisor routes
+      // through the same commit-time privViolation gate as MOVE-from-SR (Track C):
+      // RobPlugin's rteRetire excludes a privViolation head, so a user-mode RTE takes the
+      // vector-8 fault path (faultRetire/privOnly) instead of the RTE pop/redirect FSM —
+      // the frame is never popped and A7/S are left untouched.
+      opUop.needsSupervisor := True
     }
     when(bad) {
       opUop.op            := DecOp.ILLEGAL

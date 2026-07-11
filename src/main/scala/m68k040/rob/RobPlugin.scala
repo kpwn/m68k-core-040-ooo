@@ -305,7 +305,13 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // violation. Both route through the same entry FSM (faultPcStore / faultVecStore are
     // overridden below for the privilege case).
     val faultRetire = headReady && (faultedStore(h0) || privViolation) && excIdle; faultRetire.simPublic()
-    val rteRetire   = headReady && isRteStore(h0)   && excIdle; rteRetire.simPublic()
+    // An RTE head that ALSO needs supervisor (Track C: needsSupStore set at decode) and
+    // is retiring in USER mode is a privViolation, not a real RTE — exclude it here so it
+    // routes through faultRetire/privOnly (vector-8, format-$0, stack untouched) instead
+    // of the RTE pop/redirect FSM. In supervisor mode privViolation is False and RTE
+    // proceeds normally (unaffected — this mirrors the existing MOVE-from-SR privilege
+    // gate, not a new mechanism).
+    val rteRetire   = headReady && isRteStore(h0)   && !privViolation && excIdle; rteRetire.simPublic()
     // A commit-time PRIVILEGED SYSTEM op (MOVE-to-SR / MOVE-USP / MOVEC) at the head:
     // serializing (retires ALONE, like fault/RTE). It triggers either the system-op
     // FSM (S=1 supervisor) OR a vector-8 privilege fault (S=0 user) — resolved below
