@@ -53,6 +53,13 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
 
     val ram = Mem(Bits(spec.dataWidth bits), spec.depth)
 
+    // sim-only debug: expose the merged physical write buses (bf3c bring-up)
+    val dbgW = Vec(phys.map { w =>
+      val b = RegFileWritePort(spec.addressWidth, spec.dataWidth)
+      b.valid := w.valid; b.address := w.address; b.data := w.data; b
+    })
+    spinal.core.sim.SimPublic(dbgW)
+
     // init-zero boot sweep: write 0 to every address through physical write 0
     // before normal operation (no fetch happens until the first redirect).
     // Counter counts 0..depth (inclusive); init writes addresses 0..depth-1

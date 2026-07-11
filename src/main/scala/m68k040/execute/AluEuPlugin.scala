@@ -292,9 +292,28 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val isBfResolve = u1.op === DecOp.BFRESOLVE
     val bfrDo       = s1Src2(10)
     val bfrDw       = s1Src2(11)
-    val bfrOff      = Mux(bfrDo, s1Src1(4 downto 0), s1Src2(4 downto 0))
+    // imm[12] = MEM mode (slice 3c): produce the bfMem packed layout instead of the
+    // register-form layout. The register form uses {rawWidth[9:5], offset[4:0]}; the
+    // memory form needs {origOff[18:14], needHi[13], bitOff[12:10], rawWidth[9:5], 0[4:0]}
+    // (the SAME layout the static bfMem imm uses, so the funnel reads it via srcC unchanged).
+    val bfrMem      = s1Src2(12)
+    val bfrOff      = Mux(bfrDo, s1Src1(4 downto 0), s1Src2(4 downto 0))   // offset & 31
     val bfrWd       = Mux(bfrDw, s1RdB(4 downto 0),  s1Src2(9 downto 5))
-    val bfResolveRes = (B(0, 22 bits) ## bfrWd ## bfrOff).resize(32)
+    val bfrRegRes   = (B(0, 22 bits) ## bfrWd ## bfrOff)
+    // bitOff = offset & 7 (low 3 bits, valid for negative offsets via two's-complement);
+    // needHi forced True (always-5-byte span — the funnel leaves the spill byte unchanged
+    // when the field doesn't reach it); origOff = Do ? 0 : staticOff (Do=1 BFFFO adds the
+    // full signed offset in a trailing cold ADD, so its funnel base must be 0).
+    val bfrBitOff   = bfrOff(2 downto 0)
+    val bfrOrigOff  = Mux(bfrDo, B(0, 5 bits), s1Src2(4 downto 0))
+    val bfrMemRes   = (bfrOrigOff ## True ## bfrBitOff ## bfrWd ## B(0, 5 bits))   // 19 bits
+    // imm[13] = BYTE-DELTA mode (slice 3c Do=1): output = offsetDn >>>signed 3 = the signed
+    // byteBase delta (a FAST shift-by-constant, NOT the slow barrel shifter — so the dynamic-
+    // mem crack has only ONE slow-pipe op, the funnel, matching the register-form dynamic).
+    val bfrDelta    = s1Src2(13)
+    val bfrByteDelta = (s1Src1.asSInt >> 3).resize(32).asBits                      // offset >>>signed 3 (sign-extended)
+    val bfResolveRes = Mux(bfrDelta, bfrByteDelta,
+                           Mux(bfrMem, bfrMemRes.resize(32), bfrRegRes.resize(32)))
 
     // ── CAS / CAS2 compute datapath (DecOp.CASOP, FAST lat-1) ───────────────────
     // The whole CAS/CAS2 instruction is cracked through the v2 microcode engine; this
@@ -509,9 +528,22 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     //   imm[4:0]=0 (rotate offset), imm[9:5]=rawWidth, imm[12:10]=bitOff,
     //   imm[13]=needHi, imm[18:14]=origOffset.
     val bfMem      = u1.bfMem
-    val bfMemImm   = s1Src2
-    val bfMemBitOff = bfMemImm(12 downto 10).asUInt          // 0..7
-    val bfMemNeedHi = bfMemImm(13)
+    // DYNAMIC mem (slice 3c): the packed {origOff/needHi/bitOff/rawWidth} rides srcC (the
+    // BFRESOLVE-produced temp), not the static imm. (bfPacked already muxes rawWidth.)
+    val bfMemImm   = Mux(bfMem && u1.bfDynamic, s1RdC, s1Src2)
+    // LO5RAW/HI5RAW (bfStoreForm 4/5, slice 3c Do=1 RMW): the inverse funnel reads bitOff
+    // from srcC = the raw offset reg Dn[off] (bitOff = Dn[off]&7) so the resolved `packed`
+    // temp is NOT held across the store reconstruction — keeps the live set within T0/T1/T2
+    // (no archDepth bump). needHi/origOff are unused by the LO5/HI5 inverse funnel.
+    val bfRawOffForm = (u1.bfStoreForm === U(4, 3 bits)) || (u1.bfStoreForm === U(5, 3 bits))
+    // FFOFULL (bfStoreForm=6, slice 3c dynamic-mem BFFFO): the field is ALREADY left-aligned
+    // (prefunnelled into srcA) so bitOff=0 / needHi=0; ffoBase = srcB = the FULL signed Dn[off]
+    // (Musashi result = original_offset + first-set-index). A bfMem op (NOT register-form) so it
+    // rides the proven bfMem slow path.
+    val bfFfoFull   = u1.bfStoreForm === U(6, 3 bits)
+    val bfMemBitOff = Mux(bfRawOffForm, s1RdC(2 downto 0).asUInt,
+                         Mux(bfFfoFull, U(0, 3 bits), bfMemImm(12 downto 10).asUInt))  // 0..7
+    val bfMemNeedHi = Mux(bfFfoFull, False, bfMemImm(13))
     val bfMemOrigOff= bfMemImm(18 downto 14).asUInt          // 0..31
     val bfLo       = s1Src1                                   // T0 (the misaligned long)
     val bfHi       = s1RdB                                    // T1 (the spill byte, low 8 bits)
@@ -539,9 +571,14 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     bfCmd.offset   := Mux(bfMem, U(0, 5 bits), bfPacked(4 downto 0).asUInt)
     bfCmd.rawWidth := bfPacked(9 downto 5).asUInt
     bfCmd.bfOp     := u1.bfOp
-    // FFO additive base: register form -> the field offset; memory form -> the ORIGINAL
-    // memory bit offset (the rotate offset is 0 for the memory form).
-    bfCmd.ffoBase  := Mux(bfMem, bfMemOrigOff.resize(6), bfPacked(4 downto 0).asUInt.resize(6))
+    // FFO additive base (32-bit): static-mem -> origOff (the memory bit offset); register form
+    // -> the field offset (offset&31). DYNAMIC mem BFFFO (slice 3c, prefunnelled register-form:
+    // bfMem=False, bfOp=5, with a valid srcB carrying Dn[off]) -> the FULL signed 32-bit offset
+    // (Musashi result = original_offset + first-set-index). Register-form BFFFO (Dn) has srcB
+    // invalid -> falls to offset&31.
+    bfCmd.ffoBase  := Mux(bfFfoFull, s1RdB.asUInt,
+                         Mux(bfMem, bfMemOrigOff.resize(32),
+                             bfPacked(4 downto 0).asUInt.resize(32)))
     val bfStoreForm = u1.bfStoreForm
     // ── S1 -> S1a CUT: register the Bitfield inputs (post forward-funnel) + the inverse-
     // funnel raw inputs (bitOff, storeForm, the lo/hi merge source s1Src1, the LO5/HI5 res
@@ -593,9 +630,11 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // result (registered from S1a); LO5/HI5 take the inverse-funnel output computed THIS
     // stage. HI5 writes only the low byte (the store µop is BYTE-sized; upper bits d/c).
     val s1bBfRes  = s1bStoreForm.mux(
-      U(1, 2 bits) -> s1bLoStore,                          // LO4
-      U(2, 2 bits) -> s1bLoStore,                          // LO5
-      U(3, 2 bits) -> s1bHiStore.resize(32),               // HI5 (low byte)
+      U(1, 3 bits) -> s1bLoStore,                          // LO4
+      U(2, 3 bits) -> s1bLoStore,                          // LO5
+      U(3, 3 bits) -> s1bHiStore.resize(32),               // HI5 (low byte)
+      U(4, 3 bits) -> s1bLoStore,                          // LO5RAW (3c Do=1: bitOff from Dn[off])
+      U(5, 3 bits) -> s1bHiStore.resize(32),               // HI5RAW (low byte)
       default      -> s1bBfFunnelRes)                      // 0 = RES / load-only
     // ── S1a: stage1b (the deep variable shifts) off the registered amounts -> register
     // the ShiftStage1 midpoint into S1b (the FMax#3 cut). FMax#4 added the S1b stage so

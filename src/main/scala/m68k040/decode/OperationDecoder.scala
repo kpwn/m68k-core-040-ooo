@@ -462,6 +462,19 @@ object OperationDecoder {
           o.sysReadDir := !opword(0)             // 0x4E7A (bit0=0) = Rc->Rn (read); 0x4E7B = Rn->Rc (write)
           // operands resolved by the assembler from the ext word (A/D + reg# + Rc).
         }
+        // ── NOP (0x4E71): no architectural effect — commits and advances PC, nothing
+        // else. (The real 040 NOP is a pipeline synchronizer; an in-order-retiring
+        // no-write µop is architecturally equivalent — Musashi's m68k_op_nop body is
+        // empty.) Decoded as a no-operand, no-dst, no-flags MOVE: the op-µop writes no
+        // register (dstWrites=False) and no CCR bits, so the commit is a pure PC step.
+        // Was MISSING entirely (predecode had no case either) -> a NOP trapped vector-4
+        // (found by the first lock-step program that actually committed a NOP).
+        when(opword === B"16'h4E71") {
+          o.illegal := False
+          o.op := DecOp.MOVE
+          o.size := Size.LONG
+          o.dst.setNone(); o.dstWrites := False
+        }
         // ── RESET (0x4E70): privileged; asserts the external reset line for 512 clks.
         // Architecturally a NOP (no state change). A COMMIT-TIME SYSTEM op so it serializes
         // + advances PC like the other sysOps; S=0 -> vector-8. The FSM does nothing but

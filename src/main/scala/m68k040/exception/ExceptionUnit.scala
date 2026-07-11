@@ -127,8 +127,8 @@ class ExceptionUnit(
   val sqDrained = Bool(); sqDrained.allowOverride; sqDrained := True
 
   // ── captured per-event state ────────────────────────────────────────────────
-  val curVec   = Reg(UInt(8 bits))
-  val curPc    = Reg(UInt(32 bits))   // ENTRY: faulting PC to stack; RTE: restored PC
+  val curVec   = Reg(UInt(8 bits)); curVec.simPublic()
+  val curPc    = Reg(UInt(32 bits)); curPc.simPublic()   // ENTRY: faulting PC to stack; RTE: restored PC
   val oldSr    = Reg(UInt(16 bits))   // ENTRY: SR to stack
   val frameBase= Reg(UInt(32 bits))   // ENTRY: new SP = supervisor bank (M?MSP:ISP) - frame size; RTE: old SP
   val vecTarget= Reg(UInt(32 bits))   // redirect target

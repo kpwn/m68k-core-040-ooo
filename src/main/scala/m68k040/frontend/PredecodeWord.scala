@@ -294,7 +294,13 @@ object PredecodeWord {
         // nextPc itself is unused — but the length must be right for fetch framing).
         val isRts   = op === B"16'h4E75"
         val isRtr   = op === B"16'h4E77"
-        when(isTrap || isTrapv || isRts || isRtr) {
+        // NOP (0x4E71): single-word, no architectural effect. MUST be predecode-framed
+        // (simple, len 1) — without a case it fell to the COMPLEX head path, and the
+        // assembler's `!pkt.simple` gate turned a plain NOP into a spurious vector-4
+        // ILLEGAL (found by the first lock-step program that actually committed a NOP —
+        // the bf3c BFINS test; every earlier program happened to never execute one).
+        val isNop   = op === B"16'h4E71"
+        when(isTrap || isTrapv || isRts || isRtr || isNop) {
           r.simple   := True
           r.lenWords := U(1, 3 bits)
         }

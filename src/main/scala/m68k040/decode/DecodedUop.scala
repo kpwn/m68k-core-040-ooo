@@ -282,7 +282,7 @@ case class DecodedUop() extends Bundle {
   //   3 = HI5  : the 5-byte chain's hi' = (hi & himask) | ((res << (8-bitOff)) & 0xff), where
   //              hi = srcA (T1) and res = srcB (T2). NO flags. The stored spill BYTE.
   // Default 0 (RES / load-only / non-bit-field).
-  val bfStoreForm  = UInt(2 bits)
+  val bfStoreForm  = UInt(3 bits)
   // ── Line-4 EXT/EXTB source-width marker (DecOp.EXT) ──────────────────────────
   // EXT sign-extends the low byte/word of Dn. `extByte` = the source is a BYTE
   // (Dn[7:0]) rather than a word (Dn[15:0]): EXT.W (byte->word, size WORD, extByte)
