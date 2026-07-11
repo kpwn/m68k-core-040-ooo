@@ -4490,6 +4490,26 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       checkMem = Seq(0x3fc4L), checkSpan = 60)
   }
 
+  // ── FUZZER-CAUGHT (B6): MOVEM.(An)+ LOAD with the base An IN the register list ──
+  // Musashi (movem, er, pi) loads REG_DA[i] for every listed register (An included)
+  // and then overwrites An with `AY = ea` (the post-incremented final address) — the
+  // value loaded into An is DISCARDED. The DUT kept the loaded value (and later
+  // elements' addresses walked off the loaded An). [0x4004] (the word loaded into a0)
+  // is a VALID pointer so the pre-fix wrong-address path stays in mapped memory.
+  test("lock-step: MOVEM.L/.W (An)+ load with base An in the list (An := final addr)", VerilatorTest) {
+    runLockStep("movem-postinc-base-in-list",
+      "move.l #0x11112222,%d0 ; move.l %d0,0x4000 ; " +
+      "move.l #0x4100,%d1 ; move.l %d1,0x4004 ; " +           // loaded into a0, must be discarded
+      "move.l #0x33334444,%d2 ; move.l %d2,0x4008 ; " +
+      "move.l #0x4000,%a0 ; " +
+      "movem.l (%a0)+,%d3/%a0/%a1 ; " +                        // d3=[4000], a0 load DISCARDED, a1=[4008]; a0:=0x400c
+      "move.l %a0,%d4 ; move.l %a1,%d5 ; move.l %d3,%d6 ; " +  // readbacks
+      "move.l #0x4000,%a2 ; " +
+      "movem.w (%a2)+,%d7/%a2 ; " +                            // .W: d7=sext(1111), a2 load discarded; a2:=0x4004
+      "move.l %a2,%d0 ; move.l %d7,%d1 ; " +
+      ".stop: bra .stop", nInstr = 16)
+  }
+
   // Front-end-stall-then-resume: a long MOVEM (held fed ~8 cycles) immediately followed by
   // an ALU chain + a branch — the FSM must release `fed` cleanly and the trailing
   // instructions must execute (no deadlock, correct next-instruction stream).

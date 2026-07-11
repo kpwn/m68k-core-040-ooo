@@ -249,12 +249,24 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // commit). The 2nd-of-pair is never the macro's last µop when a final exists, so it is
     // always dropped alongside the first when movemHasFinal.
     val movemFirst0 = movemEmitted === 0
+    // FUZZER-CAUGHT (B6): a POSTINC MOVEM *LOAD* whose target register IS the base An
+    // must DISCARD the loaded value — Musashi (movem, er, pi) loads REG_DA[i] in the
+    // loop and then overwrites An with `AY = ea` (the post-incremented address) AFTER
+    // it. Redirect that element's load DEST to the T0 scratch: the memory access (and
+    // its fault behavior) is kept, but the base An is never renamed mid-macro, so
+    // (a) later elements' addresses still read the ORIGINAL base and (b) the final
+    // An-update µop computes origAn + count*step (not loadedValue + count*step).
+    // Control-mode loads ((An)/(d16,An), movemDoAnUpd=False) keep An := loaded value
+    // (Musashi's er,. variant has no AY writeback). Stores are unaffected (isLoad).
+    def movemLoadDst(reg: UInt): UInt =
+      Mux(movemIsLoad && movemDoAnUpd && movemBaseValid && (reg === movemBaseReg),
+          U(MicroOpAssembler.T0, 5 bits), reg)
     val movemUop0 = MicroOpAssembler.movemMoveUop(
-      reg = movemReg0, base = movemBaseReg, baseValid = movemBaseValid, disp = movemImm0,
+      reg = movemLoadDst(movemReg0), base = movemBaseReg, baseValid = movemBaseValid, disp = movemImm0,
       sizeLong = movemSizeLong, isLoad = movemIsLoad, first = movemFirst0, drop = movemHasFinal,
       valid = True, pc = movemPc, nextPc = movemNextPc)
     val movemUop1 = MicroOpAssembler.movemMoveUop(
-      reg = movemReg1, base = movemBaseReg, baseValid = movemBaseValid, disp = movemImm1,
+      reg = movemLoadDst(movemReg1), base = movemBaseReg, baseValid = movemBaseValid, disp = movemImm1,
       sizeLong = movemSizeLong, isLoad = movemIsLoad, first = False, drop = movemHasFinal,
       valid = True, pc = movemPc, nextPc = movemNextPc)
     // The final An update (kept macro commit): An := An + emitted*step for (An)+/-(An)
