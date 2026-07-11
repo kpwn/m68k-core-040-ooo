@@ -391,9 +391,11 @@ class ExceptionUnit(
         // (bit2) if a supervisor access; rw = read?1:write?0 (MAME m68ki_aerr).
         // The faulting access's privilege = the PRE-exception S bit (SR bit13 =
         // srSys bit5), read here BEFORE the FSM sets S. (The LS EU's translate-time
-        // supervisor flag is a slice-1 user-only simplification, so the SSW's super
-        // bit comes from the architectural SR, matching the MAME oracle which reads
-        // the SR S bit.) entryFaultSup is retained for a future MOVES/SFC-driven mode.
+        // supervisor flag — reqDrvSup, PrivilegeService-driven since the I/D-side MMU
+        // privilege fix — now tracks this same architectural S bit too, so the two
+        // agree; the SSW still reads the SR directly here to stay exactly byte-for-byte
+        // with the MAME oracle, which reads the SR S bit, not a future MOVES/SFC mode.)
+        // entryFaultSup is retained for a future MOVES/SFC-driven mode.
         val faultSuper = ss.srSys(5) || entryFaultSup
         // FC space (bit2=supervisor): DATA access => bit0 set (01/101); INSTRUCTION
         // fetch => program space, bit1 set (10/110). Mirrors MAME's m68040 SSW TM/FC

@@ -151,6 +151,16 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   val logic = during build new Area {
     val dcache = host[DcacheService]
     val xlate  = host[DTranslationService]
+    // The current architectural S bit (ROB-owned) — a normal LOAD/STORE's DTLB
+    // request must reflect the ACTUAL current privilege level, not the hardcoded
+    // `False` this slice previously used (a "slice-1 user-only simplification" — see
+    // reqDrvSup below and the matching note in ExceptionUnit.scala). A supervisor-mode
+    // data access to a supervisor-only page would otherwise fault. `host.get`
+    // (optional): a standalone LS-EU DUT with no RobPlugin/PrivilegeService wired
+    // defaults to False (user), unchanged for every existing non-full-core test. Does
+    // NOT affect the exception sequencer's own physical accesses (excXlateSupervisor,
+    // always True — those are a separate override, last-wins, below).
+    val privCtrl = host.get[m68k040.services.PrivilegeService]
 
     // exc-arbitration inputs default-idle (allowOverride): a DUT that doesn't wire
     // the exception unit (standalone LS tests) sees excActive=False -> the LS EU
@@ -429,7 +439,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // next-line base (a shallow stage off s1Va), NOT on the eaDelta->tag arc the cache
     // cmd registered away. `valid` asserts whenever a memory µop is resident in S1 (a
     // real translation demand -> the DTLB may walk on a miss). `write` selects the store
-    // M-bit / write-protect check. supervisor=False (user accesses this slice).
+    // M-bit / write-protect check. `supervisor` = the live architectural S bit
+    // (reqDrvSup below), NOT hardcoded.
     val xlateVaddr = Mux(llReg.bDone, s1AddrB, s1Va)
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -464,7 +475,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val reqDrvRobId = UInt(6 bits)
     reqDrvValid := s1Valid && (isLoad || isStore)
     reqDrvVpn   := xlateVaddr(31 downto 12)   // FMax #1's live access VPN (NOT the llReg cmd)
-    reqDrvSup   := False
+    reqDrvSup   := privCtrl.map(_.supervisor).getOrElse(False)
     reqDrvWrite := isStore
     reqDrvRobId := s1Ctx.robId
 

@@ -893,6 +893,75 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       irqEvents = Seq((0x40800014L, 7)), avec = true, initialSr = 0x2700)
   }
 
+  // ── HELD IPL=7 must NOT cause infinite NMI re-entry (HIGH: hang fix) ─────────
+  // Root cause: RobPlugin's interrupt recognition previously compared `iplIn === 7`
+  // EVERY CYCLE (level-sensitive), so a line HELD at 7 re-recognized NMI at every
+  // subsequent instruction boundary -> infinite re-entry (a hang). Real 68040 NMI is
+  // EDGE-triggered (Musashi m68kcpu.c:m68k_set_irq — `if(old_level != 0x0700 &&
+  // CPU_INT_LEVEL == 0x0700) nmi_pending = TRUE;`, consumed+cleared ONCE by
+  // m68ki_check_interrupts). `runIrqLockStep`'s harness auto-drops iplIn on the entry
+  // commit (a one-shot edge, by design — see its doc comment), which is exactly why
+  // this bug was invisible to every existing IRQ lock-step test. This test instead
+  // holds `iplIn`=7 CONTINUOUSLY (no auto-drop) across many instruction boundaries —
+  // spanning the first NMI's entry -> handler -> RTE -> many more loop iterations —
+  // and confirms the ROB's recognition pulse (`interruptPending`) fires EXACTLY ONCE
+  // while held, then confirms a genuine drop-and-reraise (a fresh edge) DOES re-fire.
+  test("NMI (level 7) held continuously does NOT re-fire; a fresh edge DOES", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    // Install the level-7 autovector handler @ VBR(0)+31*4=0x7C via a REAL CPU store
+    // (`move.l #handler,%d0 ; move.l %d0,0x7c`) — the SAME proven-correct idiom every
+    // `runIrqLockStep` program uses, so there is no raw-testbench-poke byte-order risk.
+    // Then a tight loop (many instruction boundaries pass while IPL=7 is held); the
+    // bare `rte` pops the entry FSM's own format-0 frame (no program-authored frame
+    // needed).
+    val src = "move.l #handler,%d0 ; move.l %d0,0x7c ; " +
+              "loop: addq.l #1,%d1 ; bra loop ; " +
+              "handler: rte"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i
+      case Left(e)  => fail(s"assemble failed: ${e.reason}")
+    }
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.rootPtr #= 0
+      dut.intCtrl.logic.iplIn #= 0; dut.intCtrl.logic.iackAvec #= true; dut.intCtrl.logic.iackVector #= 0
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.srSys #= 0x27   // boot supervisor, mask 7 (NMI is always taken regardless)
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(0x00100000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      // Let the vector-install prologue (move.l #handler,%d0 ; move.l %d0,0x7c) fully
+      // commit and the CPU settle into the tight loop before raising IPL.
+      cd.waitSampling(60)
+
+      var pulses = 0
+      cd.onSamplings { if (dut.rob.logic.interruptPending.toBoolean) pulses += 1 }
+
+      // Raise IPL=7 (rising edge) and HOLD it (no auto-drop) across many boundaries.
+      dut.intCtrl.logic.iplIn #= 7
+      cd.waitSampling(400)
+      assert(pulses == 1, s"held IPL=7 must recognize NMI EXACTLY ONCE (edge-triggered), got $pulses pulses")
+
+      // Drop the line, then raise it again -- a genuine second edge must re-fire.
+      dut.intCtrl.logic.iplIn #= 0
+      cd.waitSampling(20)
+      dut.intCtrl.logic.iplIn #= 7
+      cd.waitSampling(400)
+      assert(pulses == 2, s"a fresh <7->7 edge must re-fire NMI once more, got $pulses total pulses")
+    }
+  }
+
   // Nested: a level-3 IRQ enters handlerA (mask raised to 3); inside handlerA a
   // level-5 IRQ (5 > 3) preempts it -> handlerB -> RTE -> back into handlerA -> RTE
   // -> resume. Two events: at the main load boundary (level 3) and inside handlerA
@@ -1891,6 +1960,86 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   test("MOVE SR,Dn in SUPERVISOR mode raises NO exception", VerilatorTest) {
     val (saw, _) = runMoveFromSrPriv(userMode = false)
     assert(!saw, "supervisor MOVE-from-SR must NOT raise a privilege violation")
+  }
+
+  // ── RTE PRIVILEGE ESCALATION (CRITICAL security fix) ─────────────────────────
+  // Directed (mirrors runMoveFromSrPriv exactly): boot USER mode (S=0), execute a
+  // bare `rte`. Musashi's handler (m68k_in.c M68KMAKE_OP(rte,32,.,.)) is:
+  //   if(FLAG_S) { ...pop the frame, m68ki_jump/m68ki_set_sr... } m68ki_exception_privilege_violation();
+  // i.e. a user-mode RTE takes a vector-8 privilege violation BEFORE the stack frame
+  // is EVER read/popped — no attacker-controlled SR/PC ever reaches the CPU. Confirms
+  // (a) a precise vector-8 exception is raised, (b) the ROB's real RTE pop/redirect
+  // FSM (`rteRetire`) is NEVER triggered (the USP is completely untouched — no pop
+  // occurred), (c) the USP register value itself never changes. A regression that
+  // supervisor-mode RTE still round-trips normally is covered by re-running the full
+  // IRQ/exception lock-step suite (every one of those tests' return path IS a
+  // supervisor `rte`).
+  private def runRteUserPriv(): (Boolean, Int, Boolean, BigInt, BigInt) = {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    // `rte` is the sole instruction; a spinning label follows only so the image is
+    // well-formed (unreachable in user mode -- the RTE never executes as an RTE).
+    val src = "rte ; handler: bra.s handler"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i
+      case Left(e)  => fail(s"assemble failed: ${e.reason}")
+    }
+    var sawPriv = false
+    var vec = -1
+    var sawRteRetire = false
+    var uspBefore = BigInt(0)
+    var uspAfter  = BigInt(0)
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.rootPtr #= 0
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      // Install a vector-8 handler @ VBR(0)+8*4=0x20 (just spins; we only observe entry).
+      // Big-endian byte order (MSB at the lowest address) — a raw testbench poke
+      // consumed by the exception unit's vector fetch.
+      val handlerPc = loadAddr + 2   // `handler:` after the 1-word RTE opcode
+      for (i <- 0 until 4) dmem.pokeByte(0x20 + i, ((handlerPc >> (8 * (3 - i))) & 0xff).toInt)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.usp #= 0x00200000L
+      dut.rob.logic.exc.ss.srSys #= 0x00   // boot USER mode (S=0)
+      val bootA7 = 0x00200000L
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(bootA7)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      uspBefore = dut.rob.logic.exc.ss.usp.toBigInt
+      var guard = 0
+      while (!sawPriv && guard < 600) {
+        if (dut.rob.logic.rteRetire.toBoolean) sawRteRetire = true
+        if (dut.rob.logic.exceptionPending.toBoolean) {
+          sawPriv = true
+          vec = dut.rob.logic.exceptionVector.toInt
+        }
+        cd.waitSampling(); guard += 1
+      }
+      // Let the entry FSM fully settle (frame push onto the SUPERVISOR stack, not USP).
+      cd.waitSampling(30)
+      uspAfter = dut.rob.logic.exc.ss.usp.toBigInt
+    }
+    (sawPriv, vec, sawRteRetire, uspBefore, uspAfter)
+  }
+
+  test("RTE in USER mode raises a vector-8 privilege violation (does NOT execute)", VerilatorTest) {
+    val (saw, vec, sawRteRetire, uspBefore, uspAfter) = runRteUserPriv()
+    assert(saw, "user-mode RTE must raise a precise exception")
+    assert(vec == 8, s"privilege violation must be vector 8, got $vec")
+    assert(!sawRteRetire, "the RTE pop/redirect FSM must NEVER trigger for a user-mode RTE")
+    assert(uspBefore == uspAfter,
+      f"the USP must be completely UNTOUCHED by a rejected RTE (no pop): before=0x$uspBefore%08x after=0x$uspAfter%08x")
   }
 
   // ── Slow-ALU (shift, latency-2) DEPENDENT CHAINS ────────────────────────────
@@ -3599,6 +3748,89 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       assert(dut.dtlb.logic.faultSeen.toBoolean,
         "a data access to a non-resident page must flag DTLB rsp.fault (flagged, not delivered)")
     }
+  }
+
+  // ── Bug 3: I-side MMU boot-blocker (supervisor-only code page) ───────────────
+  // Root cause: I-fetches hardcoded `xlate.req.supervisor := False` in IcachePlugin
+  // (now PrivilegeService-driven off the live architectural S bit — see RobPlugin's
+  // `supervisor` = `committedS`). Combined with the permission check
+  // `permFault(sup) = sup && !req.supervisor` (ItlbPlugin.scala), a supervisor-only
+  // code page (S bit, MmuTypes.pgSupervisor = descriptor bit 7 — the NORMAL kernel
+  // configuration) would deny EVERY instruction fetch once the MMU was enabled: a
+  // PERMANENT boot-blocker (the CPU could never fetch its own supervisor code).
+  // Directed (Musashi models no 040 MMU): builds a page table with the CODE region
+  // marked supervisor-only, then confirms (a) a SUPERVISOR-mode fetch succeeds (the
+  // program keeps committing, the ITLB never flags a fault) and (b) a USER-mode fetch
+  // from the SAME page STILL correctly faults (the permission check itself is
+  // unchanged — only WHICH privilege level it is checked against was fixed).
+  private val SUP_ROOT = 0x00090000L
+  private val SUP_PTRT = 0x00091000L
+  private val SUP_PAGT = 0x00092000L
+  private def buildSupervisorCodeTable(mem: m68k040.ls.BehavioralMemAgent, loadAddr: Long): Unit = {
+    def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) mem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+    for (i <- 0 until 4) {
+      val cva = loadAddr + i * 0x1000L
+      val rootIdx = ((cva >> 25) & 0x7f).toInt
+      val ptrIdx  = ((cva >> 18) & 0x7f).toInt
+      val pageIdx = ((cva >> 12) & 0x3f).toInt
+      pokeWordLE(SUP_ROOT + rootIdx * 4, (SUP_PTRT & 0xfffffff0L) | 0x3L)   // table descriptor, resident
+      pokeWordLE(SUP_PTRT + ptrIdx * 4,  (SUP_PAGT & 0xfffffff0L) | 0x3L)   // table descriptor, resident
+      // Page descriptor: S bit (bit7) SET (supervisor-protect) + PDT=01 (resident),
+      // identity PPN = VPN (MmuTypes.pgSupervisor = d(7), pgResident = PDT in {01,11}).
+      pokeWordLE(SUP_PAGT + pageIdx * 4, (((cva >> 12) & 0xfffffL) << 12) | 0x80L | 0x1L)
+    }
+  }
+  private def runSupCodePageFetch(userMode: Boolean): (Boolean, Int) = {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val src = "moveq #1,%d1 ; moveq #2,%d2 ; moveq #3,%d3 ; moveq #4,%d4 ; loop: bra loop"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i
+      case Left(e)  => fail(s"assemble failed: ${e.reason}")
+    }
+    var committed = 0
+    var faulted = false
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val ptmem     = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      buildSupervisorCodeTable(ptmem, loadAddr)
+      buildSupervisorCodeTable(itlbPtmem, loadAddr)
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.rootPtr   #= SUP_ROOT
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.usp #= 0x00200000L
+      if (userMode) dut.rob.logic.exc.ss.srSys #= 0x00 else dut.rob.logic.exc.ss.srSys #= 0x27
+      val bootA7 = if (userMode) 0x00200000L else 0x00100000L
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(bootA7)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      var guard = 0
+      while (guard < 1500 && !faulted && committed < 4) {
+        if (dut.itlb.logic.faultSeen.toBoolean) faulted = true
+        for (k <- 0 until 2) if (dut.rob.logic.commitObs(k).fire.toBoolean) committed += 1
+        cd.waitSampling(); guard += 1
+      }
+    }
+    (faulted, committed)
+  }
+
+  test("MMU boot-blocker: supervisor fetch from a supervisor-only code page succeeds", VerilatorTest) {
+    val (faulted, committed) = runSupCodePageFetch(userMode = false)
+    assert(!faulted, "a SUPERVISOR-mode fetch from a supervisor-only page must NOT flag an ITLB fault")
+    assert(committed >= 4, s"expected >=4 committed instructions, got $committed (boot-blocker: fetch stalled)")
+  }
+  test("MMU: user fetch from a supervisor-only code page still faults (permission check unchanged)", VerilatorTest) {
+    val (faulted, _) = runSupCodePageFetch(userMode = true)
+    assert(faulted, "a USER-mode fetch from a supervisor-only page must still flag an ITLB fault")
   }
 
   // ── PRECISE EXCEPTION lock-step: illegal-instruction -> handler -> RTE ───────
