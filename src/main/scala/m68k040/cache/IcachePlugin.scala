@@ -1,6 +1,6 @@
 package m68k040.cache
 
-import m68k040.services.{FetchService, TranslationService}
+import m68k040.services.{FetchService, TranslationService, PrivilegeService}
 import m68k040.frontend.PredecodeWord
 import spinal.core._
 import spinal.lib._
@@ -41,10 +41,20 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
     // ---- resolve TranslationService ----
     val xlate = host[TranslationService]
+    // The current architectural S bit (ROB-owned, same signal the privilege-violation
+    // check gates on) — an instruction fetch's function code must reflect the ACTUAL
+    // current privilege level, not a hardcoded one. A hardcoded False here meant any
+    // supervisor-only code page (the normal kernel configuration) permission-denied
+    // EVERY fetch once the MMU was enabled — a permanent boot-blocker (the CPU could
+    // never fetch its own supervisor code). Mirrors the DTLB-side fix in LsEuPlugin.
+    // `host.get` (optional): a standalone I-cache DUT with no RobPlugin/PrivilegeService
+    // wired defaults to False (user), exactly the prior hardcoded behavior — unchanged
+    // for every existing non-full-core test.
+    val privCtrl = host.get[PrivilegeService]
     val activePc = UInt(32 bits)
     xlate.req.valid      := True
     xlate.req.vpn        := activePc(31 downto 12)
-    xlate.req.supervisor := False
+    xlate.req.supervisor := privCtrl.map(_.supervisor).getOrElse(False)
     xlate.req.write      := False
 
     // ---- storage arrays ----
@@ -52,7 +62,13 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // async so hit/miss is resolved in the accept cycle (a miss starts REFILL with
     // no added latency).
     val tagMem  = Seq.fill(ways)(Mem(UInt(tagBits bits), sets))
-    val predMem = Seq.fill(ways)(Mem(Bits(128 bits), sets))
+    // Packed per-line predecode width = ChunkPredecode's bit width * 32 words/line. Was a
+    // hardcoded 128 (= 4 bits/word * 32) back when ChunkPredecode was 4 bits; DERIVED now
+    // (deep-audit F1/F2/F3, 2026-07-11: ChunkPredecode widened 4->5 bits, so this grows to
+    // 160) so a future width change can't silently desync this packing from the real size.
+    val PRED_BITS_PER_WORD = ChunkPredecode().getBitsWidth
+    val PRED_BITS_PER_LINE = PRED_BITS_PER_WORD * 32
+    val predMem = Seq.fill(ways)(Mem(Bits(PRED_BITS_PER_LINE bits), sets))
     // Data: synchronous-read BRAM. 2 beats x 64 sets = 128 entries per way.
     val dataMem = Seq.fill(ways)(Mem(Bits(256 bits), sets * beatsPerLine))
     // Valid bits: register array, cleared by invalidateAll
@@ -115,7 +131,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // + windowPred OUT of the IDLE consume cone (which was the route-dominated arc into
     // s1Pred). A fault placeholder registers all-zero entries (windowPred of zero = a
     // zeroed predecode, matching the old getZero placeholder).
-    val s1PredEntries = Reg(Vec(Bits(128 bits), ways))
+    val s1PredEntries = Reg(Vec(Bits(PRED_BITS_PER_LINE bits), ways))
     s1Valid := False   // default each cycle; armed in IDLE-hit / REPLAY below
 
     // ---- rsp output register stage ----
@@ -126,9 +142,15 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val rspPredReg  = Reg(Vec(ChunkPredecode(), 4))
 
     // ---- window predecode helper ----
+    // A "window" = 4 words (8 bytes, matching the 64-bit FetchRsp granularity). A 64B line
+    // holds 32/4=8 windows, selected by pc(5:3) (3 bits, 0..7 — independent of
+    // PRED_BITS_PER_WORD, so this selector width is unaffected by the F1/F2/F3 widening).
+    // Each window-chunk is 4*PRED_BITS_PER_WORD bits (was the hardcoded 16 = 4*4 when
+    // ChunkPredecode was 4 bits); each of the 4 per-window entries is PRED_BITS_PER_WORD
+    // bits (was the hardcoded 4).
     def windowPred(entry: Bits, pc: UInt): Vec[ChunkPredecode] = {
-      val win  = entry.subdivideIn(16 bits)(pc(5 downto 3))
-      val nibs = win.subdivideIn(4 bits)
+      val win  = entry.subdivideIn(4 * PRED_BITS_PER_WORD bits)(pc(5 downto 3))
+      val nibs = win.subdivideIn(PRED_BITS_PER_WORD bits)
       Vec(nibs.map(b => b.as(ChunkPredecode())))
     }
 
@@ -243,7 +265,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
             s1Pc    := idlePc
             s1Fault := True
             s1Lane  := idleLaneIdx
-            s1PredEntries := Vec.fill(ways)(B(0, 128 bits))
+            s1PredEntries := Vec.fill(ways)(B(0, PRED_BITS_PER_LINE bits))
           } elsewhen(isHit) {
             // Hit: the data BRAM read is already armed above; latch the S1 control.
             s1Valid := True
@@ -322,12 +344,30 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // word: at op+1 (an EA-first op) or op+2 (a line-0 immediate / static bit-op, whose
         // EA ext follows a 1-word imm/bit word). Pass words(i+1) + words(i+2) (0 past the
         // line end — a full-format opword whose ext word spills to the next line is the
-        // inherent per-line predecode boundary, handled on re-frame).
+        // inherent per-line predecode boundary).
+        //
+        // F5 FIX (deep-audit 2026-07-11): the OLD code zero-filled the spilled word and
+        // relied on a "handled on re-frame" comment for a re-frame mechanism that never
+        // existed anywhere in the tree — a zero-filled ext word reads as brief-format
+        // (bit8=0), so any full-format op landing at this exact per-line boundary silently
+        // mis-framed as brief (same silent-corruption class as F1), and nothing ever
+        // corrected it. There is no general "wait for the next line" mechanism here (predecode
+        // runs per-line, independently, before the next line may even be fetched), so —
+        // mirroring how this predecoder already treats any OTHER out-of-scope EA (reject ->
+        // COMPLEX, the assembler's illegal/refetch path) — we now tell `classify` explicitly
+        // that a boundary-zero-filled word is NOT real data (`extWValid`/`extW2Valid`, below).
+        // `classify` then refuses to guess brief-vs-full for anything that would need to read
+        // that word's content (mode 6 / mode7-reg3 full-format detection) and instead rejects
+        // (COMPLEX) — a safe trap instead of a silent mis-frame. `i` is a plain Scala Int
+        // here (this whole predecode is elaborated once per line-word, 32 instances), so
+        // "is word i+1/i+2 past the line end" is a compile-time constant, not new hardware.
         val nWords = words.length
         val chunks = Vec((0 until nWords).map(i =>
           PredecodeWord.classify(words(i),
             if (i + 1 < nWords) words(i + 1) else B(0, 16 bits),
-            if (i + 2 < nWords) words(i + 2) else B(0, 16 bits))))
+            if (i + 2 < nWords) words(i + 2) else B(0, 16 bits),
+            extWValid  = i + 1 < nWords,
+            extW2Valid = i + 2 < nWords)))
         val packed = chunks.asBits
         for (w <- 0 until ways) {
           when(victimWay === U(w, wayBits bits)) {

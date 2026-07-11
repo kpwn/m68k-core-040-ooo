@@ -77,10 +77,23 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
   test("EOR.B D2,(A0) (mem dest) -> leading LOAD (RMW crack)", VerilatorTest) { run { dut => drive(dut, 0xB510); sleep(1)
     assert(!dut.uop.unimplemented.toBoolean && dut.uop.memOp.toEnum == MemOp.LOAD)
   }}
-  // EOR.B D2,A0 (0xB508, An-direct): not a valid EOR EA (CMPM region) -> illegal.
-  test("EOR.B D2,A0 (An-direct) -> unimplemented", VerilatorTest) { run { dut => drive(dut, 0xB508); sleep(1)
-    assert(dut.uop.unimplemented.toBoolean)
-  }}
+  // 0xB508 (EOR.B D2,A0, An-direct) is the CMPM (Ay)+,(Ax)+ ENCODING, not a bad EOR EA.
+  // PRE-EXISTING STALE TEST found 2026-07-11 while validating the F1/F2/F3 predecode-
+  // overflow fix (same class as the PredecodeRef NOP/CMPM gaps + the BitfieldDecodeSpec
+  // ucEntry-width gap): this test predates CMPM support (`2e04cc8`/`2e93d88`), which routes
+  // this exact encoding through OperationDecoder's `isCmpm` -> `microcoded` (Microcode.
+  // CMPM_ENTRY) — the DecodeStage substitutes the REAL µcode-engine µops for a microcoded
+  // op's slot entirely, discarding whatever `MicroOpAssembler.assemble()` alone produces
+  // (same "benign placeholder crack" pattern as MOVEM/CAS/MOVES), so `unimplemented` here
+  // is no longer meaningful for 0xB508 — it is a REAL, legal, executed instruction.
+  // Re-pointed at an EA that is STILL genuinely illegal for EOR (mode7/reg4 = #imm, which
+  // can never be a destination) to preserve this test's original intent: the `eorMemBad`
+  // gate (non-DATAREG, non-MEMSIMPLE EOR destination -> illegal).
+  test("EOR.B D2,#imm (mode7/reg4, not a valid EOR dest) -> unimplemented", VerilatorTest) {
+    run { dut => drive(dut, 0xB53C); sleep(1)
+      assert(dut.uop.unimplemented.toBoolean)
+    }
+  }
   // Line-0 immediates: srcA = EA reg (Dn dst operand), srcB = the trailing imm
   // word(s) via useImm, dst = EA reg. ADDI.L #imm,D0 (0x0680) + imm32 = words(1..2).
   test("ADDI.L #0x12345678,D0 (reg dest): srcA=D0, useImm imm32, dst=D0, NZVCX", VerilatorTest) {

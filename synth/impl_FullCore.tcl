@@ -15,6 +15,30 @@ phys_opt_design
 route_design
 report_timing_summary -max_paths 10 -file synth/fullcore_route_timing.rpt
 report_utilization -file synth/fullcore_route_util.rpt
+# ── congestion + attribution reports (always-on; routing congestion is a first-class
+# gate metric alongside FMax — the recurring limiters are 58-82% ROUTE-dominated) ──
+# 0) netlist provenance: which _zz_ regen ordering was gated (regen is bistable)
+catch { puts "NETLIST_MD5 [lindex [exec md5sum generated/M68kFullCoreSynth.v] 0]" }
+# 1) router congestion windows + per-path logic-vs-route attribution
+catch { report_design_analysis -congestion -file synth/fullcore_congestion.rpt }
+catch { report_design_analysis -timing -max_paths 10 -file synth/fullcore_path_analysis.rpt }
+# 2) top fanout nets (catches un-replicated control broadcasts)
+catch { report_high_fanout_nets -max_nets 10 -file synth/fullcore_fanout.rpt }
+# 3) per-pblock utilization (floorplan capture sanity)
+catch { report_utilization -pblocks [get_pblocks] -file synth/fullcore_pblock_util.rpt }
+# 4) module-pair slack matrix: which plugin PAIR limits (top-100 worst endpoints)
+catch {
+  set fp [open synth/fullcore_slack_matrix.rpt w]
+  foreach p [get_timing_paths -max_paths 100 -nworst 1 -setup] {
+    puts $fp [format "%.3f  %s -> %s" [get_property SLACK $p] \
+      [get_property STARTPOINT_PIN $p] [get_property ENDPOINT_PIN $p]]
+  }
+  close $fp
+}
+# 5) archive the router's congestion dump if it dropped one (else it gets overwritten)
+catch { file copy -force iter_100_CongestedCLBsAndNets.txt synth/fullcore_congested_nets.txt }
+# 6) reopenable snapshot for offline congestion forensics
+catch { write_checkpoint -force synth/fullcore_routed.dcp }
 set paths [get_timing_paths -max_paths 1 -nworst 1 -setup]
 set wns [get_property SLACK $paths]
 puts "########### FULLCORE POST-ROUTE @ 250MHz (xcku5p-ffvb676-2) ###########"

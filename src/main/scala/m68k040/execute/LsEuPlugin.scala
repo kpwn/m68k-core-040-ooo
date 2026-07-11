@@ -17,7 +17,9 @@ import spinal.lib.misc.plugin.FiberPlugin
 trait LsEuService {
   def issue: Stream[IqContext]
   def completion: Flow[UInt]   // robId (dynamic-completion wakeup source)
-  def sqCommit: Flow[UInt]     // ROB retired this store robId
+  def sqCommit: Flow[UInt]     // ROB retired this store robId (retire slot 0)
+  def sqCommitB: Flow[UInt]    // retire slot 1 — a store CAN dual-retire at h1 (behind
+                               // a long-latency head); missing this slot loses the store
   def sqFlush: Bool            // mispredict squash
   // Dynamic load-wakeup broadcast: valid (with the produced pdst) the cycle a LOAD
   // completes and its data is in the PRF. Registered alongside the completion stage
@@ -67,6 +69,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   var issuePort: Stream[IqContext] = null
   var completionPort: Flow[UInt]   = null
   var sqCommitPort: Flow[UInt]     = null
+  var sqCommitBPort: Flow[UInt]    = null
   var sqFlushSig: Bool             = null
   var wakeupPort: Flow[UInt]       = null
   var wakeupNzvcPort: Flow[UInt]   = null
@@ -84,6 +87,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   override def issue: Stream[IqContext] = issuePort
   override def completion: Flow[UInt]   = completionPort
   override def sqCommit: Flow[UInt]     = sqCommitPort
+  override def sqCommitB: Flow[UInt]    = sqCommitBPort
   override def sqFlush: Bool            = sqFlushSig
   override def wakeup: Flow[UInt]       = wakeupPort
   override def wakeupNzvc: Flow[UInt]   = wakeupNzvcPort
@@ -115,6 +119,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     issuePort      = Stream(IqContext())
     completionPort = Flow(UInt(6 bits))
     sqCommitPort   = Flow(UInt(6 bits))
+    // Slot-1 commit: defaults to idle (allowOverride) so single-retire benches/stubs
+    // need no wiring; the full-core wiring overrides it with {retire1, h1}.
+    sqCommitBPort  = Flow(UInt(6 bits))
+    sqCommitBPort.valid.allowOverride;   sqCommitBPort.valid   := False
+    sqCommitBPort.payload.allowOverride; sqCommitBPort.payload := U(0, 6 bits)
     sqFlushSig     = Bool()
     wakeupPort     = Flow(UInt(6 bits))
     wakeupNzvcPort = Flow(UInt(4 bits))   // pNzvcDst of a completing NZVC-writing LS op
@@ -142,6 +151,16 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   val logic = during build new Area {
     val dcache = host[DcacheService]
     val xlate  = host[DTranslationService]
+    // The current architectural S bit (ROB-owned) — a normal LOAD/STORE's DTLB
+    // request must reflect the ACTUAL current privilege level, not the hardcoded
+    // `False` this slice previously used (a "slice-1 user-only simplification" — see
+    // reqDrvSup below and the matching note in ExceptionUnit.scala). A supervisor-mode
+    // data access to a supervisor-only page would otherwise fault. `host.get`
+    // (optional): a standalone LS-EU DUT with no RobPlugin/PrivilegeService wired
+    // defaults to False (user), unchanged for every existing non-full-core test. Does
+    // NOT affect the exception sequencer's own physical accesses (excXlateSupervisor,
+    // always True — those are a separate override, last-wins, below).
+    val privCtrl = host.get[m68k040.services.PrivilegeService]
 
     // exc-arbitration inputs default-idle (allowOverride): a DUT that doesn't wire
     // the exception unit (standalone LS tests) sees excActive=False -> the LS EU
@@ -160,7 +179,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
 
     // ---- store queue instance ----
     val sq = new StoreQueue(8)
-    sq.io.commit << sqCommitPort
+    sq.io.commit  << sqCommitPort
+    sq.io.commitB << sqCommitBPort
     sq.io.flush  := sqFlushSig
     dcache.store << sq.io.drain
     sq.io.drainAck := dcache.storeAck   // pop a drained entry only once memory is written
@@ -419,7 +439,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // next-line base (a shallow stage off s1Va), NOT on the eaDelta->tag arc the cache
     // cmd registered away. `valid` asserts whenever a memory µop is resident in S1 (a
     // real translation demand -> the DTLB may walk on a miss). `write` selects the store
-    // M-bit / write-protect check. supervisor=False (user accesses this slice).
+    // M-bit / write-protect check. `supervisor` = the live architectural S bit
+    // (reqDrvSup below), NOT hardcoded.
     val xlateVaddr = Mux(llReg.bDone, s1AddrB, s1Va)
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -454,7 +475,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val reqDrvRobId = UInt(6 bits)
     reqDrvValid := s1Valid && (isLoad || isStore)
     reqDrvVpn   := xlateVaddr(31 downto 12)   // FMax #1's live access VPN (NOT the llReg cmd)
-    reqDrvSup   := False
+    reqDrvSup   := privCtrl.map(_.supervisor).getOrElse(False)
     reqDrvWrite := isStore
     reqDrvRobId := s1Ctx.robId
 

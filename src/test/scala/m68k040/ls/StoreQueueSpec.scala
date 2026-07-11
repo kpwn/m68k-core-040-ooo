@@ -47,6 +47,7 @@ class StoreQueueSpec extends AnyFunSuite {
     cd.forkStimulus(period = 10)
     dut.io.alloc.valid #= false
     dut.io.commit.valid #= false
+    dut.io.commitB.valid #= false; dut.io.commitB.payload #= 0
     dut.io.flush #= false
     dut.io.drainAck #= false
     setQuery(dut, 0, 0, Size.LONG)

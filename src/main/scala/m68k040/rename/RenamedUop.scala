@@ -86,7 +86,7 @@ case class RenamedUop() extends Bundle {
   // Bit-field RMW store-form (DecOp.BITFIELD bfMem, slice 3b): 0=RES,1=LO4,2=LO5,3=HI5 —
   // the inverse-funnel output the ALU EU emits for a memory RMW compute µop. Threaded
   // decode->EU. Default 0 (RES / load-only).
-  val bfStoreForm  = UInt(2 bits)
+  val bfStoreForm  = UInt(3 bits)
   // Line-4 EXT/EXTB byte-source marker (DecOp.EXT): the sign-extend source is a BYTE
   // (EXT.W / EXTB.L) rather than a word (EXT.L). Threaded from decode to the ALU EU.
   val extByte      = Bool()

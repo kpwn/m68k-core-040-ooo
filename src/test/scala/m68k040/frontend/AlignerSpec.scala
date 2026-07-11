@@ -60,4 +60,37 @@ class AlignerSpec extends AnyFunSuite {
       assert(!dut.res.slot0Valid.toBoolean && dut.res.stall.toBoolean && dut.res.shiftWords.toInt == 0)
     }
   }
+
+  // ── F3 directed test (deep-audit 2026-07-11) ──────────────────────────────────
+  // A legal 7-word "simple" instruction (matching the F3 lock-step scenario: a MOVE
+  // with a full mem-indirect source + a (d16,An) destination — src consumes 6 words
+  // (opword..words(5)) and the dest's OWN displacement is words(6)) must carry ALL 7
+  // words through the aligner intact, not just the first 6. BEFORE the fix,
+  // `DecodePacket.words` was `Vec(Bits(16 bits), 6)` — index 6 didn't even EXIST (a
+  // compile-time-impossible access, not just a runtime truncation), and the aligner's
+  // copy loop was hardcoded `for (i <- 0 until 6)`, so word 6 (here: the dest
+  // displacement) was UNCONDITIONALLY LOST regardless of `lenWords`. AFTER the fix,
+  // `words` holds WINDOW(10) entries and the loop copies all of them, so the real
+  // word 6 value survives. (This is orthogonal to F2's overflow: 7 already fit the OLD
+  // 3-bit lenWords field with no wraparound — F3 is purely about the packet's own
+  // capacity, not the length field's width, which the ExecuteLockStepSpec F3 lock-step
+  // test alone cannot isolate since the only known-reachable 7-word MOVE combination
+  // routes through a separately-broken µcode entry that never even reads word 6.)
+  test("F3 FIX: word index 6 (7th word) of a 7-word simple instruction survives to slot0 " +
+       "(was structurally unrepresentable in the old 6-wide DecodePacket.words)", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      dut.headPc #= 0x6000
+      setAll(dut, simple = true, len = 1)
+      setPred(dut, 0, simple = true, len = 7)
+      for (i <- 0 until 10) { dut.words(i) #= (0xA000 + i) }   // distinct per-word marker values
+      dut.avail #= 10
+      sleep(1)
+      assert(dut.res.slot0Valid.toBoolean, "slot0 must be valid (simple, len=7, avail=10)")
+      assert(dut.res.slot0.wordCount.toInt == 7, s"wordCount must be 7, got ${dut.res.slot0.wordCount.toInt}")
+      for (i <- 0 until 7) {
+        assert(dut.res.slot0.words(i).toInt == (0xA000 + i),
+          f"word $i must survive intact: got 0x${dut.res.slot0.words(i).toInt}%04x exp 0x${0xA000 + i}%04x")
+      }
+    }
+  }
 }

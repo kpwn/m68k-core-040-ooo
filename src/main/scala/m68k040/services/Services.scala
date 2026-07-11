@@ -78,6 +78,18 @@ trait GshareUpdateService {
   def gshareUpdate: Flow[GshareUpdate]
 }
 
+/** Owned by the ROB (the committed/architectural S bit — `exc.ss.s`, the SAME signal
+  * the privilege-violation check gates on). Consumed by the fetch/execute-stage
+  * plugins that must present the CURRENT privilege level on a translation request's
+  * function code (supervisor vs user), instead of hardcoding one — the I-cache (ITLB)
+  * and the LS EU (DTLB, normal — not the exception sequencer's own always-supervisor
+  * physical accesses) both read this. Combinational passthrough of a register (no
+  * added latency); S only changes at a serializing exception-entry/RTE/system-op
+  * boundary, so it is stable for any access issued between those boundaries. */
+trait PrivilegeService {
+  def supervisor: Bool
+}
+
 /** The ONE 68040 MMU control (TC enable + URP/SRP root pointer), shared by BOTH
   * the I-side ITLB and the D-side DTLB. One owner drives the regs (synth top input /
   * sim poke / future MOVEC); both TLBs read it. `mmuEnable` LOW => identity. */

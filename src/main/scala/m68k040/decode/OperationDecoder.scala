@@ -462,6 +462,19 @@ object OperationDecoder {
           o.sysReadDir := !opword(0)             // 0x4E7A (bit0=0) = Rc->Rn (read); 0x4E7B = Rn->Rc (write)
           // operands resolved by the assembler from the ext word (A/D + reg# + Rc).
         }
+        // ── NOP (0x4E71): no architectural effect — commits and advances PC, nothing
+        // else. (The real 040 NOP is a pipeline synchronizer; an in-order-retiring
+        // no-write µop is architecturally equivalent — Musashi's m68k_op_nop body is
+        // empty.) Decoded as a no-operand, no-dst, no-flags MOVE: the op-µop writes no
+        // register (dstWrites=False) and no CCR bits, so the commit is a pure PC step.
+        // Was MISSING entirely (predecode had no case either) -> a NOP trapped vector-4
+        // (found by the first lock-step program that actually committed a NOP).
+        when(opword === B"16'h4E71") {
+          o.illegal := False
+          o.op := DecOp.MOVE
+          o.size := Size.LONG
+          o.dst.setNone(); o.dstWrites := False
+        }
         // ── RESET (0x4E70): privileged; asserts the external reset line for 512 clks.
         // Architecturally a NOP (no state change). A COMMIT-TIME SYSTEM op so it serializes
         // + advances PC like the other sysOps; S=0 -> vector-8. The FSM does nothing but
@@ -605,6 +618,12 @@ object OperationDecoder {
         // a non-reg EA to illegal). An-direct (mode 1) is CMPM, NOT EOR -> excluded.
         // Flags: NZ, V=C=0 (no X). srcA=EA (dst operand), srcB=Dn, dst=EA.
         val isEor = (line === 0xB) && isRmw && (opword(5 downto 3) =/= 1)
+        // CMPM (Ay)+,(Ax)+ (line B, opmode 4/5/6, `opword(5 downto 3)===1` — the An-direct
+        // slot isEor excludes): `1011 xxx1 ss001 yyy`, Ax=op[11:9], size=op[7:6], Ay=op[2:0].
+        // Single opword, NO extension words. A new 5-row microcode entry (dual postinc LOAD
+        // Ay/Ax -> CMP flags-only); microcoded ops bypass normal srcA/srcB/dst operand
+        // routing (DecodeStage.scala reads ucEntry/opword directly), so none is set here.
+        val isCmpm = (line === 0xB) && isRmw && (opword(5 downto 3) === 1)
         // DIVU.W (line 0x8 opmode 3) / DIVS.W (line 0x8 opmode 7): 32-bit dividend Dn
         // (bits 11:9) / 16-bit divisor EA -> Dn = {rem[31:16], q[15:0]}. BOTH DIVs are
         // line 8 (the OR group). MULU.W (line 0xC opmode 3) / MULS.W (line 0xC opmode
@@ -734,6 +753,7 @@ object OperationDecoder {
           o.srcB := easrc                 // 16-bit divisor EA
           o.dst := dnField; o.dstWrites := True   // result -> Dn
           o.writesNzvc := True            // DIV sets N/Z/V (C=0)
+          o.readsNzvc  := True            // overflow preserves old N/Z/C (Musashi: only V set)
           o.divSigned := isDivsW
         } .elsewhen((isMuluW || isMulsW) && (opword(5 downto 3) =/= 1)) {
           // MULU.W/MULS.W: 16x16 -> Dn[31:0]. The multiplier EA is a DATA addressing
@@ -748,6 +768,17 @@ object OperationDecoder {
           o.dst := dnField; o.dstWrites := True   // product -> Dn[31:0]
           o.writesNzvc := True            // MUL sets N/Z (V=0, C=0)
           o.divSigned := isMulsW          // reuse divSigned as the MULS marker
+        } .elsewhen(isCmpm) {
+          // CMPM (Ay)+,(Ax)+ : Musashi (m68k_in.c) src=read(Ay)+ FIRST; dst=read(Ax)+
+          // SECOND; res=dst-src; N/Z/V/C from res; X untouched; no register/memory write.
+          o.illegal    := False
+          o.op         := DecOp.CMP
+          o.microcoded := True
+          o.ucEntry    := U(Microcode.CMPM_ENTRY, o.ucEntry.getWidth bits)
+          when(opmode === 4) { o.size := Size.BYTE }
+            .elsewhen(opmode === 5) { o.size := Size.WORD }
+            .otherwise { o.size := Size.LONG }
+          o.writesNzvc := True             // NZVC from res; X untouched (the µcode compute row)
         } .elsewhen(isEor) {
           // EOR Dn,<ea>: srcA = EA (dst operand), srcB = Dn, dst = EA (same field).
           o.illegal := False
@@ -795,8 +826,13 @@ object OperationDecoder {
             when(line === 0xD || line === 0x9) { o.writesNzvc := True; o.writesX := True }   // ADD/SUB
               .elsewhen(line === 0xC || line === 0x8 || line === 0xB) { o.writesNzvc := True } // AND/OR/CMP
           } .elsewhen(opmode === 3 || opmode === 7) {
-            // ADDA/SUBA/CMPA : srcA = EA, srcB = An, dst An
-            o.srcA := easrc; o.srcB := anField; o.dst := anField
+            // ADDA/SUBA/CMPA : srcA = An (the DESTINATION operand — the ALU computes
+            // a-b, so the An must be the minuend for SUBA/CMPA), srcB = EA (the
+            // source), dst An. The .W form sign-extends the 16-bit source to 32 and
+            // the op runs full-32 (no partial merge; Musashi adda/suba/cmpa .W use
+            // MAKE_INT_16(src) against the whole An) — the assembler marks the op
+            // µop isMovea (the An-wide marker) and the ALU EU widens it.
+            o.srcA := anField; o.srcB := easrc; o.dst := anField
             when(line =/= 0xB) { o.dstWrites := True }
             when(line === 0xB) { o.writesNzvc := True }  // CMPA sets flags, no write
             when(opmode === 3) { o.size := Size.WORD } .otherwise { o.size := Size.LONG }

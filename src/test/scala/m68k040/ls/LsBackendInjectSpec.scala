@@ -62,6 +62,8 @@ class LsBackendInjectSpec extends AnyFunSuite {
       iq.lsNzvcWakeup.payload := lsEu.wakeupNzvc.payload
       lsEu.sqCommit.valid   := rob.logic.retire0
       lsEu.sqCommit.payload := rob.logic.h0
+      lsEu.sqCommitB.valid   := rob.logic.retire1
+      lsEu.sqCommitB.payload := rob.logic.h1
       lsEu.sqFlush          := host[m68k040.services.RedirectService].doFlush
     }
   }

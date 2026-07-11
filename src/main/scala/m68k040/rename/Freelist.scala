@@ -54,6 +54,11 @@ case class Freelist(
   val head  = Reg(UInt(ptrW   bits)) init 0
   val tail  = Reg(UInt(ptrW   bits)) init 0
   val count = Reg(UInt(countW bits)) init 0
+  spinal.core.sim.SimPublic(head, tail, count)   // sim-only debug (bf3c bring-up)
+  val dbgPushAddr = Vec(UInt(ptrW bits), pushPorts)   // sim-only debug (bf3c bring-up)
+  dbgPushAddr.foreach(_ := 0)
+  dbgPushAddr.allowOverride
+  spinal.core.sim.SimPublic(dbgPushAddr)
 
   // ── Init counter ──────────────────────────────────────────────────────────
   // After reset: fill ram[0..freeN-1] with ids archCount..physCount-1, one per cycle.
@@ -85,12 +90,23 @@ case class Freelist(
 
   // Power-on RAM fill ONLY (driven by reset's !initDone, NOT by flush): write one id
   // per cycle into ram[0..freeN-1]. Flush no longer clears initDone.
+  //
+  // GOTCHA (silent-corruption class, root of the bf3c freelist double-alloc): SpinalHDL
+  // Mem.write with an EXPLICIT `enable` REPLACES the surrounding when-condition — it is
+  // NOT ANDed with it. The old `ram.write(..., enable = True)` INSIDE when(!initDone)
+  // therefore wrote EVERY cycle forever: after init, initCounter parks at 0, so ram[0]
+  // was stomped with id `archCount` each cycle — any push landing at slot 0 (every 2^ptrW
+  // pushes, at the tail wraparound) was destroyed, and the next pop of slot 0 handed out
+  // id `archCount` while it was live = a physreg double-allocation (two in-flight writers
+  // on one physical register -> stale-operand corruption). Same class for the push writes
+  // below (their when(initDone && !io.flush) was equally ignored). ALL Mem writes here
+  // now carry their COMPLETE condition in the explicit enable, at top scope.
+  ram.write(
+    address = initCounter.resized,
+    data    = (U(archCount, idW bits) + initCounter).resized,
+    enable  = !initDone
+  )
   when(!initDone) {
-    ram.write(
-      address = initCounter.resized,
-      data    = (U(archCount, idW bits) + initCounter).resized,
-      enable  = True
-    )
     when(initCounter === U(freeN - 1)) {
       initDone    := True
       initCounter := 0
@@ -146,10 +162,13 @@ case class Freelist(
       val lowerValids =
         if (j == 0) U(0, pcW bits)
         else (0 until j).map(i => io.push(i).valid.asUInt.resize(pcW)).reduce(_ +^ _).resize(pcW)
+      dbgPushAddr(j) := (tail + lowerValids.resized).resized
+      // COMPLETE explicit enable (see the init-write gotcha note above): the when-scope
+      // condition must be repeated here — Mem.write's explicit enable ignores the scope.
       ram.write(
-        address = (tail + lowerValids.resized).resized,
+        address = dbgPushAddr(j),
         data    = io.push(j).payload,
-        enable  = io.push(j).valid
+        enable  = initDone && !io.flush && io.push(j).valid
       )
     }
 

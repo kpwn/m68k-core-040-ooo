@@ -197,6 +197,11 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // `headReady` (drain), blocking committed stores from draining into the handler frame.
     lsEu.sqCommit.valid   := rob.logic.retire0
     lsEu.sqCommit.payload := rob.logic.h0
+    // Slot-1 retire: a store CAN dual-retire at h1 (completed early behind a
+    // long-latency head, e.g. DIV) — missing this commit pulse loses the store
+    // (never drains, or squashed by the next flush). Same-cycle mark is required.
+    lsEu.sqCommitB.valid   := rob.logic.retire1
+    lsEu.sqCommitB.payload := rob.logic.h1
     val excEnteringSq = rob.logic.excActive && !RegNext(rob.logic.excActive, init = False)
     lsEu.sqFlush          := doFlush || excEnteringSq
 
@@ -229,6 +234,8 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     intCtrlPlug.logic.iackVector := RegNext(iackVectorIn) init 0
     dtlb.umAccessRobId := lsEu.xlateRobId
     dtlb.umCommitValid := rob.logic.retire0
+    dtlb.umCommitBValid := rob.logic.retire1
+    dtlb.umCommitBId    := rob.logic.h1
     dtlb.umCommitId    := rob.logic.h0
     dtlb.umFlush       := doFlush
     // ── ITLB U deferred-write queue wiring (U-only; instruction fetch sets U not M) ──
@@ -237,6 +244,8 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     val itlb = host[m68k040.mmu.ItlbPlugin]
     itlb.umAccessRobId := U(0, 6 bits)
     itlb.umCommitValid := rob.logic.retire0
+    itlb.umCommitBValid := rob.logic.retire1
+    itlb.umCommitBId    := rob.logic.h1
     itlb.umCommitId    := rob.logic.h0
     itlb.umFlush       := doFlush
     // The D-cache's `axi` is declared master() inside its plugin and surfaces as a

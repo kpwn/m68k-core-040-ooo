@@ -41,18 +41,18 @@ object Aligner {
     r.complex     := False
 
     val p0 = preds(0)
-    val L0 = p0.lenWords  // UInt(3 bits)
+    val L0 = p0.lenWords  // UInt(4 bits)
 
     when(avail === 0) {
       // keep defaults: stall, nothing valid
     } .elsewhen(!p0.simple) {
       // Complex head: emit complex packet for slot0
       r.slot0.pc        := headPc
-      for (i <- 0 until 6) {
+      for (i <- 0 until WINDOW) {
         r.slot0.words(i) := words(i)
       }
-      // wordCount = min(avail, 6)
-      r.slot0.wordCount := (avail > 6).mux(U(6, 3 bits), avail.resize(3))
+      // wordCount = min(avail, WINDOW)
+      r.slot0.wordCount := (avail > U(WINDOW, 4 bits)).mux(U(WINDOW, 4 bits), avail.resize(4))
       r.slot0.simple    := False
       r.slot0.complex   := True
       r.slot0.lenWords  := 0
@@ -71,7 +71,7 @@ object Aligner {
       } .otherwise {
         // Slot0 = simple packet
         r.slot0.pc       := headPc
-        for (i <- 0 until 6) {
+        for (i <- 0 until WINDOW) {
           when(U(i) < L0) {
             r.slot0.words(i) := words(i)
           } .otherwise {
@@ -91,13 +91,24 @@ object Aligner {
         val p1 = preds(L0.resize(4))
         val L1 = p1.lenWords
 
-        val L0L1     = (L0 +^ L1).resize(5)   // 4-bit sum (max 5+5=10, fits in 5 bits)
-        val slot1Ok  = p1.simple && (avail.resize(5) >= L0L1) && (L0L1 <= U(10))
+        // L0/L1 are each up to WINDOW (10); +^ width-extends by 1 bit regardless of operand
+        // width, so the sum (max 10+10=20) safely fits the 5-bit resize. slot1Ok additionally
+        // requires the COMBINED length to fit within one WINDOW's worth of visible words
+        // (else slot1's words weren't actually all present in `words`/`preds`, both sized
+        // WINDOW) — gated on WINDOW itself, not a bare coincidental constant.
+        val L0L1     = (L0 +^ L1).resize(5)
+        val slot1Ok  = p1.simple && (avail.resize(5) >= L0L1) && (L0L1 <= U(WINDOW, 5 bits))
 
         when(slot1Ok) {
           // Slot1 = simple packet
           r.slot1.pc := headPc + (L0.resize(32) |<< 1)
-          for (i <- 0 until 6) {
+          for (i <- 0 until WINDOW) {
+            // `words` is a WINDOW(10)-element Vec, whose dynamic index must be EXACTLY
+            // log2Up(WINDOW)=4 bits wide (SpinalHDL errors on an over-wide Vec index) —
+            // so resize(4), not the full +^ width. Safe: slot1Ok already guarantees
+            // L0+L1<=WINDOW, and this index is only ever CONSUMED (below) when i<L1, so
+            // the real max is L0+i <= L0+L1-1 <= WINDOW-1, which fits in 4 bits without
+            // truncation; the (i>=L1) high-`i` iterations are don't-care (discarded below).
             val idx = (L0 +^ U(i)).resize(4)
             when(U(i) < L1) {
               r.slot1.words(i) := words(idx)
