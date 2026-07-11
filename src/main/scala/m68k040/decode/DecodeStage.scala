@@ -1151,6 +1151,35 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // re-decodes from scratch on re-fetch.
     when(pipeFlush) { movepActive := False; movepPendValid := False }
 
+    // ── A1 FIX (deep-audit 2026-07-11): flush-ordering phantom-commit ──────────────
+    // `stashValid`/`movemPendValid`/`ucPendValid` are each SET from inside THREE different
+    // FSM-entry blocks above (movemBegin/ucBegin/movepBegin can each stash a slot1 owned by
+    // ANY of the other two engines, or a plain decoded-µop stash) as well as (stashValid
+    // only) the normal fed-consume arm. Each of those signals ALSO has an early flush-clear
+    // (stashValid @ its declaration; movemPendValid/ucPendValid a bit further down), but
+    // that clear is textually BEFORE some of the later SET arms — and in SpinalHDL, multiple
+    // drivers to the same signal resolve by SOURCE ORDER (the LAST `:=` wins), not by which
+    // `when` "looks more specific". So a flush landing the SAME cycle as, say, ucBegin's
+    // slot1-is-MOVEM stash (`movemPendValid := True` inside the ucBegin block, which is
+    // textually AFTER movemPendValid's own early clear) left the pending marker VALID after
+    // the flush — the stashed/pending wrong-path op then PHANTOM-COMMITS on replay, one
+    // cycle after it should have been squashed. `movepPendValid` was accidentally immune:
+    // its own late clear (right above, at the very end of the Area) happens to be the LAST
+    // statement touching it, so it already wins over every SET arm.
+    //
+    // Fix: mirror movepPendValid's shape for the other three — an unconditional
+    // `when(pipeFlush){ ... := False }` as the ABSOLUTE LAST statement in this Area touching
+    // each signal, so it always wins regardless of which FSM-begin block set it this same
+    // cycle. (The earlier per-signal flush-clears above are left in place — harmless,
+    // redundant, and matches the existing movepPendValid style of a belt-and-suspenders
+    // early clear plus an authoritative late one.)
+    when(pipeFlush) {
+      stashValid     := False
+      movemPendValid := False
+      ucPendValid    := False
+      movepPendValid := False
+    }
+
     // ── Rename-facing output ───────────────────────────────────────────────────
     val uopsOut = queue.io.pop
     val uop1Sig = queue.io.pop1Valid
