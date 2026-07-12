@@ -107,6 +107,10 @@ case class RenamedUop() extends Bundle {
   val indexScale = UInt(2 bits)
   // LEA address-generate (LS): write s1Va to the int dst, no mem access. Threaded.
   val leaAddr  = Bool()
+  // MOVES write-form Rn==An aliasing (A2 fix, LS): store the auto-updated An value
+  // (s1AnWb) instead of the raw Rn read when Rn statically aliases the EA's An.
+  // See DecodedUop.movesAliasStore for the full rationale. Threaded.
+  val movesAliasStore = Bool()
   // MOVE from/to CCR/SR (ALU). fromCcr/fromSr select the CCR/SR int result; needs-
   // Supervisor = privileged (ROB vector-8 check on the committed S bit). Threaded.
   val fromCcr  = Bool()

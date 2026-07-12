@@ -79,6 +79,7 @@ class LsEuSourcePlugin extends FiberPlugin {
     // LEA address-generate, MOVE-from-CCR/SR, and the lock-step macro-commit marker
     // are likewise not exercised by this plain aligned load/store source — inert.
     uop.leaAddr      := False
+    uop.movesAliasStore := False
     uop.fromCcr      := False; uop.fromSr := False; uop.needsSupervisor := False
     uop.keepCommit   := False
     uop.toCcr        := False

@@ -56,6 +56,9 @@ object Microcode {
   case object SMiOther    extends Sel   // (miOther, miOtherValid) — the host op's other reg (Dn/Dm)
   case object SMiOd       extends Sel   // selImm: the outer displacement od (host access disp)
   case object SMiImm      extends Sel   // selImm: the host op immediate (line-0 imm op)
+  // ── mem-indirect EA<->EA selectors (task #119 follow-up) ────────────────────
+  case object SMiOtherEaBase   extends Sel   // (miOtherEaBase, miOtherEaBaseValid) — the plain (non-MI) side's base
+  case object SMiOtherEaDispLo extends Sel   // selImm: the plain (non-MI) side's disp
   // ── CAS / CAS2 selectors ────────────────────────────────────────────────────
   case object SCasDc      extends Sel   // (casDc, True)   — CAS compare reg Dc = ext[2:0]
   case object SCasDu      extends Sel   // (casDu, True)   — CAS update reg  Du = ext[8:6]
@@ -149,6 +152,8 @@ object Microcode {
       writesFlags: Boolean = false,  // reads X+old-Z, writes NZVCX (the op µop)
       nzvcOnly:    Boolean = false,  // writes NZVC only (X UNTOUCHED, no NZVC/X read) — CMPM
       indexFromEa: Boolean = false,  // LS row: srcC + indexLong/indexScale come from Ctx EA
+      indexFromMiOtherEa: Boolean = false,  // LS row: srcC + indexLong/indexScale come from
+                                             // Ctx.miOtherEa* (task #119 EA<->EA plain side)
       bfStoreForm: Int     = 0,      // UBfMem: 0=RES,1=LO4,2=LO5,3=HI5,4=LO5RAW,5=HI5RAW (funnel form)
       bfWritesNz:  Boolean = false,  // UBfMem/UBfReg: this compute writes the NZ flags (RES / LO4 / BFINS)
       bfDyn:       Boolean = false,  // UBfMem/UBfReg: set bfDynamic (read packed {bitOff/width} via srcC, slice 3c)
@@ -368,16 +373,24 @@ object Microcode {
     // READ form (dr=0) @ MOVES_READ_ENTRY=46 — 2 or 3 µops:
     //   r0 LOAD.sz (ea) -> T0  (eaAuto from ctx for the address calc; the load does NOT
     //        write An — its dst is T0. For PREDEC addr=An-delta; POSTINC addr=An.)
-    //   r1 MOVE T0 -> Rn (UMovesRead): An sign-ext.sz / Dn size-merge.sz; NO CCR.
-    //   r2 ADD An + signedDelta -> An  (the (An)+/-(An) write-back; a DROPPED crack µop,
+    //   r1 ADD An + signedDelta -> An  (the (An)+/-(An) write-back; a DROPPED crack µop,
     //        like the BCD/MOVEM An update. signedDelta = +size (POSTINC) / -size (PREDEC) /
-    //        0 (no auto -> an identity An:=An+0 NOP, harmless). isLast.) The An side effect
-    //        thus happens EXACTLY ONCE (matching Musashi M68KMAKE_GET_EA_AY).
+    //        0 (no auto -> an identity An:=An+0 NOP, harmless).) Placed BEFORE the Rn
+    //        write (A2 fix): Musashi's GET_EA_AY macro mutates An as part of the EA calc,
+    //        THEN `REG_DA[Rn] = read(...)` OVERWRITES whatever Rn currently holds — so
+    //        when Rn IS the EA's An, the auto-update is moot/overwritten by the load. Our
+    //        µop order must match: the write that can alias (Rn) must land LAST so it
+    //        wins, exactly like MOVEM's `movemLoadDst` already orders AnUpdate before the
+    //        kept write.
+    //   r2 MOVE T0 -> Rn (UMovesRead): An sign-ext.sz / Dn size-merge.sz; NO CCR. isLast
+    //        (the macro's kept commit). moveaResult (the isMovea/An-dest path) reads ONLY
+    //        srcB=T0 — srcA=SMovesRn (used for the Dn size-merge's "old value") is a
+    //        DIFFERENT physical register in the Dn case (never aliases An), so the reorder
+    //        is safe both ways.
     Desc(UMove, mem = MLoad, auto = AEaCasLoad, srcA = SEaBase, dst = ST0, useImm = true,
          imm = SEaDispLo, indexFromEa = true, isFirst = true),                 // µPC46 (r0)
-    Desc(UMovesRead, srcA = SMovesRn, srcB = ST0, dst = SMovesRn),             // µPC47 (r1)
-    Desc(UAddDrop, srcA = SMovesAn, dst = SMovesAn, useImm = true, imm = SMovesDelta,
-         isLast = true),                                                       // µPC48 (r2)
+    Desc(UAddDrop, srcA = SMovesAn, dst = SMovesAn, useImm = true, imm = SMovesDelta),  // µPC47 (r1)
+    Desc(UMovesRead, srcA = SMovesRn, srcB = ST0, dst = SMovesRn, isLast = true),        // µPC48 (r2)
 
     // ════════════════════════════════════════════════════════════════════════
     // Bit-field DYNAMIC offset/width MEMORY forms (slice 3c). The dynamic offset/width
@@ -584,7 +597,52 @@ object Microcode {
     Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SDeltaAy),                // µPC116 (e1)
     Desc(UMove, mem = MLoad, auto = APostincAx, srcA = SAx, dst = ST1),                  // µPC117 (e2)
     Desc(UAddDrop, srcA = SAx, dst = SAx, useImm = true, imm = SDeltaAx),                // µPC118 (e3)
-    Desc(UOpFromCtx, srcA = ST1, srcB = ST0, nzvcOnly = true, isLast = true)              // µPC119 (e4)
+    Desc(UOpFromCtx, srcA = ST1, srcB = ST0, nzvcOnly = true, isLast = true),             // µPC119 (e4)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // MI_MOVE_EAEA @120 (task #119, deep-audit follow-up): MOVE mem-indirect src-EA ->
+    // a PLAIN (non-register) memory dst-EA. Neither operand is a register, so the value
+    // moves straight from the loaded temp to the store — no register write, no dst-side
+    // pointer load (the plain side's address rides its OWN independent base/disp/index
+    // group, ctx.miOtherEa*, decoded separately from the mem-indirect side's eaBase/
+    // eaDispLo/eaIndex, which stays dedicated to the pointer-load).
+    //   f0 LOAD.L ptr -> T0 (pre-index)                                        (isFirst)
+    //   f1 LOAD.host (T0+od (+post-idx)) -> T1
+    //   f2 STORE.host T1 -> (miOtherEaBase+miOtherEaDispLo(+miOtherIndex))     (isLast)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                                 // µPC120 (f0)
+    Desc(UMiHostMove, mem = MLoad, srcA = ST0, dst = ST1, useImm = true, imm = SMiOd,
+         sz = SzHost, miHostIndex = true),                                                // µPC121 (f1)
+    Desc(UMiHostMove, mem = MStore, srcA = SMiOtherEaBase, srcB = ST1, useImm = true,
+         imm = SMiOtherEaDispLo, sz = SzHost, indexFromMiOtherEa = true,
+         miMoveFlags = true, isLast = true),                                              // µPC122 (f2)
+
+    // MI_MOVE_EAEA_REV @123 — CURRENTLY UNUSED / NOT ROUTED (task #119 partial): the
+    // MIRROR direction — MOVE a PLAIN (non-register) memory src-EA -> a mem-indirect
+    // dst-EA. Same "no register write" shape as MI_MOVE_EAEA, reversed: load straight
+    // from the plain side (no pointer needed for it), then store through the
+    // mem-indirect pointer. DecodeStage.scala currently routes this shape to the
+    // illegal trap instead (`ucMoveDstMiEaEaBroken`) — a directed lock-step test found
+    // the store lands at the wrong address and the root cause wasn't pinned down in the
+    // time available. The rows are left here (dead code, unreferenced by any routing
+    // Mux) for a future debugging session; do NOT wire ucMoveDstMiEaEa to this entry
+    // without re-verifying end to end.
+    //   g0 LOAD.L ptr -> T0 (pre-index)                                        (isFirst)
+    //   g1 LOAD.host (miOtherEaBase+miOtherEaDispLo(+miOtherIndex)) -> T1
+    //   g2 STORE.host T1 -> (T0+od (+post-idx))                                (isLast)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                                 // µPC123 (g0)
+    Desc(UMiHostMove, mem = MLoad, srcA = SMiOtherEaBase, dst = ST1, useImm = true,
+         imm = SMiOtherEaDispLo, sz = SzHost, indexFromMiOtherEa = true),                  // µPC124 (g1)
+    Desc(UMiHostMove, mem = MStore, srcA = ST0, srcB = ST1, useImm = true, imm = SMiOd,
+         sz = SzHost, miHostIndex = true, miMoveFlags = true, isLast = true),              // µPC125 (g2)
+
+    // MI_MOVE_BOTH_MI_ILLEGAL @126 (task #119 scope limit): a MOVE with BOTH src AND dst
+    // full-format memory-indirect simultaneously needs a 4-µop/2-pointer/3-temp chain
+    // (deliberately out of scope for this slice — rare in practice). Trap vector-4 rather
+    // than silently mis-executing (the F2-class failure mode this whole task exists to
+    // avoid); a real completeness gap, but safe.
+    Desc(UMove, bfIllegal = true, isFirst = true, isLast = true)                          // µPC126
   )
   val BF_DYN_RD_DO0_ENTRY  = 49
   val BF_DYN_RD_DO1_ENTRY  = 53
@@ -604,8 +662,11 @@ object Microcode {
   val CAS_ENTRY         = 31   // rows 31..34 (load, CASS, CASC, store)
   val CAS2_ENTRY        = 35   // rows 35..44 (load×2, CAS2C1/C2, DC1/DC2, SEL×2, store×2)
   val MOVES_WRITE_ENTRY = 45   // row 45      (store Rn -> (ea), eaAuto An write-back, keepCommit)
-  val MOVES_READ_ENTRY  = 46   // rows 46..48 (load -> T0, MOVE T0->Rn sign-ext/merge, An update)
+  val MOVES_READ_ENTRY  = 46   // rows 46..48 (load -> T0, An update, MOVE T0->Rn sign-ext/merge — A2: Rn write LAST so an aliased Rn==An wins)
   val CMPM_ENTRY        = 115  // rows 115..119 (load Ay/postinc, load Ax/postinc, CMP flags-only)
+  val MI_MOVE_EAEA_ENTRY = 120 // rows 120..122 (ptr-load, host-load->T1, host-store T1->plain EA)
+  val MI_MOVE_EAEA_REV_ENTRY = 123 // rows 123..125 (ptr-load, host-load plain EA->T1, host-store T1->(ptr+od))
+  val MI_MOVE_BOTH_MI_ILLEGAL_ENTRY = 126 // row 126 (both src+dst mem-indirect — scoped out, traps illegal)
   def romSize: Int = rom.size
 
   /** Latched-instruction CONTEXT the engine resolves selectors against. v1 fields
@@ -686,6 +747,19 @@ object Microcode {
     // needsSupervisor: set True for the MOVES first µop (the privilege trap; ROB vector-8 if
     // committed S==0). Default False (every other microcode customer is unprivileged).
     val needsSup     = Bool()
+    // ── mem-indirect EA<->EA group (task #119 follow-up) ────────────────────────────────
+    // When the mem-indirect side is combined with a PLAIN (non-register) memory EA on the
+    // OTHER side, that other side needs its OWN independent base/disp/index — the shared
+    // eaBase/eaDispLo/eaIndex* group above is already spoken for by the pointer-load.
+    // Populated only for the MI_MOVE_EAEA entry; DecodeStage decodes the non-selected side
+    // (the one that is NOT MEMINDIRECT) with EaDecoder and threads it here.
+    val miOtherEaBase       = UInt(5 bits)
+    val miOtherEaBaseValid  = Bool()
+    val miOtherEaIndexReg   = UInt(5 bits)
+    val miOtherEaIndexValid = Bool()
+    val miOtherEaIndexLong  = Bool()
+    val miOtherEaIndexScale = UInt(2 bits)
+    val miOtherEaDispLo     = Bits(32 bits)
   }
 
   // ── selector → (regId, valid) ──────────────────────────────────────────────
@@ -699,6 +773,7 @@ object Microcode {
     case ST1     => (U(T1, 5 bits), True)
     case ST2     => (U(T2, 5 bits), True)
     case SEaBase => (ctx.eaBase, ctx.eaBaseValid)   // abs modes -> baseValid False (disp-only)
+    case SMiOtherEaBase => (ctx.miOtherEaBase, ctx.miOtherEaBaseValid)  // task #119 EA<->EA plain side
     case SDn2    => (ctx.bfDn2, True)
     case SMiOther => (ctx.miOther, ctx.miOtherValid)
     case SCasDc   => (ctx.casDc, True)
@@ -744,6 +819,7 @@ object Microcode {
     case SDeltaAx    => posDelta(axReg(ctx), ctx)
     case SEaDispLo   => ctx.eaDispLo
     case SEaDispHi   => ctx.eaDispHi
+    case SMiOtherEaDispLo => ctx.miOtherEaDispLo   // task #119 EA<->EA plain side
     case SBfImm      => ctx.bfImm
     case SMiOd       => ctx.miOd
     case SMiImm      => ctx.miHostImm
@@ -772,9 +848,11 @@ object Microcode {
     val miHostIdxUse = Bool(d.miHostIndex) && ctx.miPost
     val miIndexUse   = miPtrIdxUse || miHostIdxUse
     val srcCReg = if (d.indexFromEa) ctx.eaIndexReg
+                  else if (d.indexFromMiOtherEa) ctx.miOtherEaIndexReg
                   else if (d.miPtrIndex || d.miHostIndex) ctx.eaIndexReg
                   else srcCRegSel
     val srcCV   = if (d.indexFromEa) ctx.eaIndexValid
+                  else if (d.indexFromMiOtherEa) ctx.miOtherEaIndexValid
                   else if (d.miPtrIndex || d.miHostIndex) (ctx.eaIndexValid && miIndexUse)
                   else srcCVSel
 
@@ -942,6 +1020,14 @@ object Microcode {
       case UMiHostOp  => ctx.miMovea
       case _          => False
     })
+    // A2 fix: the MOVES write µop (the sole SMovesRn-as-srcB MStore row, µPC45) reads
+    // Rn AND folds the (An)+/-(An) auto write-back into the same atomic store. Compare
+    // the two STATIC (decode-time, opcode-field-derived) register numbers — movesRn
+    // (REG_DA 0..15) vs ctx.eaBase (REG_DA 0..15, An = 8+reg) — both already resolved
+    // by the time resolve() runs; no runtime register VALUE is involved. See DecodedUop
+    // for the full rationale.
+    u.movesAliasStore := Bool(d.srcB == SMovesRn && d.mem == MStore) &&
+      ctx.movesRnIsA && (ctx.movesRn === ctx.eaBase) && (ctx.casAutoMode =/= EaAuto.NONE)
     d.uop match {
       case UBfMem =>
         u.bfMem       := True
@@ -964,6 +1050,8 @@ object Microcode {
     // other µcode µops use no index (default inert).
     if (d.indexFromEa || d.miPtrIndex || d.miHostIndex) {
       u.indexLong := ctx.eaIndexLong; u.indexScale := ctx.eaIndexScale
+    } else if (d.indexFromMiOtherEa) {
+      u.indexLong := ctx.miOtherEaIndexLong; u.indexScale := ctx.miOtherEaIndexScale
     } else {
       u.indexLong := False; u.indexScale := 0
     }

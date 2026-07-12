@@ -294,6 +294,15 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     //   POSTINC -> base + eaDelta
     val s1AnPost = (s1Base + u1.eaDelta).asBits
     val s1AnWb   = Mux(u1.eaAuto === m68k040.decode.EaAuto.POSTINC, s1AnPost, s1Va.asBits)
+    // A2 fix: the MOVES write µop reads Rn AND folds the (An)+/-(An) auto write-back
+    // into the SAME atomic store. When Rn statically aliases the EA's An (decode-time
+    // marker, see DecodedUop.movesAliasStore), Musashi's actual byte-written value is
+    // the AUTO-UPDATED An (the EA calc mutates An first, then the store reads it) — NOT
+    // the raw Rn register read (which, read at S0 from the SAME physical register,
+    // still reflects the pre-this-µop value). s1AnWb is already the exact value the An
+    // write-back itself commits this cycle; reuse it as the store data instead of
+    // inventing a second adder.
+    val s1StoreData = Mux(u1.movesAliasStore, s1AnWb, s1Data)
 
     // ---- AGU cross-line / cross-page detection (S1, off s1Va) ----
     // The cross-detection / next-line base USED to be computed in S0 off the
@@ -400,9 +409,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val bytesInA   = (U(16) - stOff.resize(5 bits))     // 1..16
     val nbytesA_st = Mux(s1TwoAccess, bytesInA.resize(3 bits), stBytes)
     val nbytesB_st = Mux(s1TwoAccess, (stBytes - bytesInA).resize(3 bits), U(0, 3 bits))
-    val splitDataA = m68k040.cache.DcacheByteLane.storeDataA(stOff, u1.size, s1Data)
+    val splitDataA = m68k040.cache.DcacheByteLane.storeDataA(stOff, u1.size, s1StoreData)
     val splitStrbA = m68k040.cache.DcacheByteLane.storeStrbA(stOff, u1.size)
-    val splitDataB = m68k040.cache.DcacheByteLane.storeDataB(stOff, u1.size, s1Data)
+    val splitDataB = m68k040.cache.DcacheByteLane.storeDataB(stOff, u1.size, s1StoreData)
     val splitStrbB = m68k040.cache.DcacheByteLane.storeStrbB(stOff, u1.size)
     val s1PaddrB   = s1AddrB   // identity translation
 
@@ -410,7 +419,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sq.io.alloc.valid          := False
     sq.io.alloc.payload.robId  := s1Ctx.robId
     sq.io.alloc.payload.paddr  := s2Paddr
-    sq.io.alloc.payload.data   := s1Data
+    sq.io.alloc.payload.data   := s1StoreData
     sq.io.alloc.payload.size   := u1.size
     sq.io.alloc.payload.nbytesA   := nbytesA_st
     // Aligned store: drain via {data,size} (fast path). Split store: explicit strobe.

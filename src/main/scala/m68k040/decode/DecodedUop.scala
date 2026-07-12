@@ -327,6 +327,18 @@ case class DecodedUop() extends Bundle {
   // The LS EU completes it in IDLE with s1Va as the result (reusing the stkPush
   // address-writeback precedent). Default False.
   val leaAddr  = Bool()
+  // ── MOVES write-form Rn==An aliasing (A2 fix) ───────────────────────────────
+  // The MOVES write µop (STORE.sz Rn -> (ea) with the (An)+/-(An) auto side effect
+  // folded into the SAME store) reads Rn and computes the auto-updated An in one
+  // atomic cycle. When Rn IS the EA's An register, Musashi computes the EA (mutating
+  // An FIRST via the GET_EA_AY macro) and only THEN reads the register for the store
+  // data — so the byte pattern written to memory is the NEW (auto-updated) An value,
+  // not the value Rn held before this instruction. True only for that one ROM row
+  // (µPC45) AND only when Rn statically aliases the EA base register (decode-time
+  // comparison of two opcode-field-derived register numbers, not a runtime value).
+  // The LS-EU muxes its store-data source between the raw register read and the
+  // already-computed auto-update value (s1AnWb) on this bit. Default False.
+  val movesAliasStore = Bool()
   // ── MOVE from/to SR/CCR (ALU cluster) ───────────────────────────────────────
   // fromCcr: the int result = the CCR byte {X,N,Z,V,C} zero-extended (.W). fromSr:
   // the int result = the 16-bit SR = {srSysIn, CCR byte} zero-extended (.W). Both

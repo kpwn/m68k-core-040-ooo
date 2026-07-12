@@ -687,8 +687,74 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // op (not pre-marked microcoded), so the routing is decided HERE from the re-decoded EA.
     val ucEopw    = ucEntryPkt.words(0)
     val ucMiSrcEa = EaDecoder.decode(ucEopw(5 downto 0), ucEntrySpec.size, ucEntryPkt.words)
+    // task #119 (deep-audit follow-up): the destination's own ext-word data does NOT
+    // unconditionally start at words(1) — MOVE's extension-word ORDER is always
+    // src-then-dst, so the dst's ext data starts wherever the SOURCE's own ext words
+    // end. This was previously masked: every op family that consumes `ucMiDstEa` paired
+    // it with a REGISTER-direct source (0 ext words), so the unshifted read happened to
+    // be correct by coincidence. Now that a non-register (plain-memory / mem-indirect)
+    // source is possible, the shift is REQUIRED — and is a no-op (0 words) for every
+    // previously-supported register-direct-source case, so this is a strict, backward-
+    // compatible generalization, not a new special case.
+    //
+    // The mem-indirect base ext word's own bd/od-size fields (mirrors EaDecoder's
+    // fBdSize/fOdPresent/fOdLong extraction, EaDecoder.scala:76-96) — used to count a
+    // FULL-FORMAT source's own word count (1 base + bd words + od words, up to 5).
+    def miEaWordCount(baseExtW: Bits): UInt = {
+      val bdSize    = baseExtW(5 downto 4).asUInt
+      val bdWords   = Mux(bdSize === U(2, 2 bits), U(1, 3 bits),
+                       Mux(bdSize === U(3, 2 bits), U(2, 3 bits), U(0, 3 bits)))
+      val odPresent = baseExtW(1)
+      val odLong    = baseExtW(0)
+      val odWords   = Mux(!odPresent, U(0, 3 bits), Mux(odLong, U(2, 3 bits), U(1, 3 bits)))
+      (U(1, 3 bits) + bdWords + odWords).resize(3)
+    }
+    // General per-mode EA word count (0/1/2 for the plain modes; the full-format
+    // formula above for mode 6 / mode 7-3 when bit8 is set). Computed directly against
+    // the ALREADY-FRAMED full packet — no predecode lookahead limit, unlike
+    // PredecodeWord.eaExt (which this mirrors structurally).
+    def eaWordCount(mode: UInt, reg: UInt): UInt = {
+      val n = UInt(3 bits); n := 0
+      switch(mode) {
+        is(U(5, 3 bits)) { n := 1 }                                  // (d16,An)
+        is(U(6, 3 bits)) {                                           // (d8,An,Xn) brief / full-format
+          when(ucEntryPkt.words(1)(8)) { n := miEaWordCount(ucEntryPkt.words(1)) }
+            .otherwise { n := 1 }
+        }
+        is(U(7, 3 bits)) {
+          switch(reg) {
+            is(U(0, 3 bits)) { n := 1 }   // (xxx).W
+            is(U(1, 3 bits)) { n := 2 }   // (xxx).L
+            is(U(2, 3 bits)) { n := 1 }   // (d16,PC)
+            is(U(3, 3 bits)) {            // (d8,PC,Xn) brief / full-format
+              when(ucEntryPkt.words(1)(8)) { n := miEaWordCount(ucEntryPkt.words(1)) }
+                .otherwise { n := 1 }
+            }
+            is(U(4, 3 bits)) { n := Mux(ucEntrySpec.size === Size.LONG, U(2, 3 bits), U(1, 3 bits)) }  // #imm
+          }
+        }
+      }
+      n   // default 0: Dn/An/(An)/(An)+/-(An)
+    }
+    // Dynamic (runtime-indexed) word read, bounded by the Vec length (mirrors
+    // EaDecoder.fOdWordAt's pattern).
+    def wordAtDyn(words: Vec[Bits], idx: UInt): Bits = {
+      val out = Bits(16 bits); out := B(0, 16 bits)
+      switch(idx) {
+        for (i <- 0 until words.length) { is(U(i, idx.getWidth bits)) { out := words(i) } }
+      }
+      out
+    }
+    val ucMoveSrcWordCount = eaWordCount(ucEopw(5 downto 3).asUInt, ucEopw(2 downto 0).asUInt)
+    // Shifted view for the destination's EA decode: index 0 unused (EaDecoder.decode
+    // never reads it), indices 1..5 = words(1+shift .. 5+shift) (covers the full-format
+    // fOdWordAt range, bd=LONG+od=LONG needing relative index up to 5).
+    val ucDstEaWords = Vec.tabulate(6) { i =>
+      if (i == 0) B(0, 16 bits)
+      else wordAtDyn(ucEntryPkt.words, (U(i, 5 bits) + ucMoveSrcWordCount.resize(5)).resize(5))
+    }
     val ucMiDstEa = EaDecoder.decode(ucEopw(8 downto 6) ## ucEopw(11 downto 9),
-                                     ucEntrySpec.size, ucEntryPkt.words)
+                                     ucEntrySpec.size, ucDstEaWords)
     val ucLine    = ucEopw(15 downto 12).asUInt
     val ucOpmode  = ucEopw(8 downto 6).asUInt
     // The host op + which EA carries the mem-indirect. The in-scope host families:
@@ -699,6 +765,26 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val ucIsMove   = (ucLine === U(1, 4 bits)) || (ucLine === U(2, 4 bits)) || (ucLine === U(3, 4 bits))
     val ucMoveSrcMi= ucIsMove && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
     val ucMoveDstMi= ucIsMove && (ucMiDstEa.klass === EaClass.MEMINDIRECT)
+    // task #119 (deep-audit follow-up): a mem-indirect MOVE whose OTHER side is NOT a
+    // register (newly reachable once F2's predecode fix let a 7+-word dual-full-EA MOVE
+    // frame correctly at all — previously it just livelocked before execution got this
+    // far). Distinguish register-direct (Dn=000/An=001 mode) from everything else.
+    val ucMoveDstModeIsReg = ucIsMove && ((ucEopw(8 downto 6) === B"000") || (ucEopw(8 downto 6) === B"001"))
+    val ucMoveSrcModeIsReg = ucIsMove && ((ucEopw(5 downto 3) === B"000") || (ucEopw(5 downto 3) === B"001"))
+    val ucMoveSrcMiEaEa = ucMoveSrcMi && !ucMoveDstModeIsReg && !ucMoveDstMi  // src=MI, dst=plain memory
+    // dst=MI, src=plain memory (the MIRROR direction): a `MI_MOVE_EAEA_REV_ENTRY` chain
+    // exists in the ROM for this shape, but its store lands at the wrong address in
+    // testing (a bug not yet root-caused — the analogous src=MI/dst=plain direction
+    // above is fully verified; this direction is NOT). Trap illegal (below) rather than
+    // ship a silently-wrong chain; NOT wired to ucMoveDstMiEaEa until debugged.
+    val ucMoveDstMiEaEaBroken = ucMoveDstMi && !ucMoveSrcModeIsReg && !ucMoveSrcMi
+    val ucMoveDstMiEaEa = False   // scoped out (see above) — always route to the illegal trap
+    val ucMoveBothMi    = (ucMoveSrcMi && ucMoveDstMi) || ucMoveDstMiEaEaBroken  // -> scoped-out illegal (below)
+    // The mem-indirect side's counterpart EA (the plain, non-register side) for the EA<->EA
+    // chains: whichever of src/dst is NOT the pointer-load target. Computed unconditionally
+    // (mirrors the movesRn/bit-field-EA ctx groups elsewhere in this function) — harmless
+    // when unused, since only the new MI_MOVE_EAEA*/rows read ctx.miOtherEa*.
+    val ucMiOtherEa = Mux(ucMoveDstMiEaEa, ucMiSrcEa, ucMiDstEa)
     // ALU/CMP source (opmode 0/1/2): line 8/9/B/C/D with the EA as a source operand.
     val ucIsAluSrcLine = (ucLine === U(8, 4 bits)) || (ucLine === U(9, 4 bits)) ||
                          (ucLine === U(0xB, 4 bits)) || (ucLine === U(0xC, 4 bits)) ||
@@ -745,14 +831,20 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val ucMiOpIsCmp = ucEntrySpec.op === DecOp.CMP
     val ucMiOpIsTst = ucEntrySpec.op === DecOp.TST
     val ucMiFlagsOnly = ucMiOpIsCmp || ucMiOpIsTst
-    // Entry select: MOVE-src / MOVE-dst / ALU-src / imm-RMW (or FLAGS) / single-EA RMW (or FLAGS).
+    // Entry select: both-MI (illegal) / EA<->EA (task #119) / MOVE-src / MOVE-dst / ALU-src /
+    // imm-RMW (or FLAGS) / single-EA RMW (or FLAGS). The EA<->EA + both-MI checks are
+    // strictly narrower subsets of ucMoveSrcMi/ucMoveDstMi, so placing them FIRST in the
+    // priority chain correctly carves them out before the register-case fallbacks below.
     val ew = ucEntrySpec.ucEntry.getWidth
     val ucMiEntry =
+      Mux(ucMoveBothMi,    U(Microcode.MI_MOVE_BOTH_MI_ILLEGAL_ENTRY, ew bits),
+      Mux(ucMoveSrcMiEaEa, U(Microcode.MI_MOVE_EAEA_ENTRY,     ew bits),
+      Mux(ucMoveDstMiEaEa, U(Microcode.MI_MOVE_EAEA_REV_ENTRY, ew bits),
       Mux(ucMoveSrcMi, U(Microcode.MI_MOVE_SRC_ENTRY, ew bits),
       Mux(ucMoveDstMi, U(Microcode.MI_MOVE_DST_ENTRY, ew bits),
       Mux(ucAluSrcMi,  U(Microcode.MI_ALU_SRC_ENTRY,  ew bits),
       Mux(ucMiFlagsOnly, U(Microcode.MI_FLAGS_ENTRY, ew bits),
-                         U(Microcode.MI_RMW_ENTRY,    ew bits)))))
+                         U(Microcode.MI_RMW_ENTRY,    ew bits))))))))
     // Populate the MI Ctx group + (reuse the EA infra) the pointer-load EA fields. The host
     // size = spec.size; the pointer load is always LONG. od/post from the chosen EaSpec.
     ucEntryCtx.miOd         := ucMiEa.od
@@ -780,6 +872,17 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.miWX    := ucMiWriteX
     ucEntryCtx.miRNzvc := ucEntrySpec.op === DecOp.NEGX   // NEGX reads old NZ (clear-only Z)
     ucEntryCtx.miRX    := ucEntrySpec.op === DecOp.NEGX
+    // The EA<->EA plain side's OWN address (task #119): independent of the pointer-load's
+    // eaBase/eaDispLo/eaIndex group above, which stays dedicated to whichever side IS
+    // mem-indirect. Computed unconditionally (harmless when unused — only the new
+    // MI_MOVE_EAEA*/rows' Desc entries read ctx.miOtherEa*).
+    ucEntryCtx.miOtherEaBase       := ucMiOtherEa.base
+    ucEntryCtx.miOtherEaBaseValid  := ucMiOtherEa.baseValid
+    ucEntryCtx.miOtherEaIndexReg   := ucMiOtherEa.indexReg
+    ucEntryCtx.miOtherEaIndexValid := ucMiOtherEa.indexValid
+    ucEntryCtx.miOtherEaIndexLong  := ucMiOtherEa.indexLong
+    ucEntryCtx.miOtherEaIndexScale := ucMiOtherEa.indexScale
+    ucEntryCtx.miOtherEaDispLo     := ucMiOtherEa.disp
     // Pointer-load EA fields (reuse the bit-field EA infra). disp = bd (the EaSpec disp);
     // pcRel mem-indirect is rejected at decode (read-only EA), so no pc fold needed here.
     when(ucIsMemInd) {
