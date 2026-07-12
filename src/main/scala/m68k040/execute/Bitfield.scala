@@ -32,13 +32,43 @@ case class BitfieldRsp() extends Bundle {
   val z      = Bool()
 }
 
+/** FMax split point (task #123, Fable audit 2026-07-12 finding F1): the intermediate
+  * result between `Bitfield.stage1` (the 4 parallel rotates + left-justify, cheap) and
+  * `Bitfield.stage2` (the 32-input clz priority encoder + the 8-way result mux, the
+  * deep half). Meant to be REGISTERED between the two stages by the caller — mirrors
+  * the existing `Shifter.stage1a`/`stage1b` split. Carries the rotate/shift outputs
+  * PLUS the small set of cmd fields stage2 still needs (dy/bfOp/ffoBase), so the
+  * caller does not also have to thread the original BitfieldCmd across the cut. */
+case class BitfieldMid() extends Bundle {
+  val dy       = Bits(32 bits)   // pass-through: mask-modify (chg/clr/set/ins) + BFTST result
+  val bfOp     = Bits(3 bits)    // pass-through: the final result/flag mux selector
+  val ffoBase  = UInt(32 bits)   // pass-through: BFFFO's additive base
+  val mask     = Bits(32 bits)
+  val rotL     = Bits(32 bits)
+  val dyShL    = Bits(32 bits)
+  val insVal   = Bits(32 bits)
+  val insPos   = Bits(32 bits)
+  val extU     = Bits(32 bits)
+  val extS     = Bits(32 bits)
+  val fieldLJ  = Bits(32 bits)
+  val width6   = UInt(6 bits)    // 1..32; needed to clamp the stage2 clz count
+}
+
 /** Combinational bit-field datapath, transcribed from Musashi's `_32_d` BFxxx forms.
   *
   * m68k bit numbering: offset 0 = bit 31 (the MSB); the field is `width` bits from
   * bit (31-offset) toward the LSB. `mask = ROR_32(0xffffffff << (32-width), offset)`.
   * All eight ops share the rotate (`rotL = ROL_32(Dy, offset)`); the result mux +
   * the CLZ priority-encode (BFFFO) + the arithmetic-vs-logical extract shift complete
-  * the datapath. Reused on the ALU EU's slow/shifter (lat-matched) path. */
+  * the datapath. Reused on the ALU EU's slow/shifter (lat-matched) path.
+  *
+  * Split into `stage1`/`stage2` (task #123): the ORIGINAL single-cycle `apply` chained
+  * 4 parallel barrel rotates into an 8-way result mux whose BFFFO leg carries a
+  * 32-input clz — 20 LUT levels in one cone (the post-ISA-completion #1 critical
+  * path). `stage1` computes the rotates/shifts (cheap); the caller registers the
+  * `BitfieldMid` result; `stage2` computes the clz + mask-modify + final mux off the
+  * registered midpoint. `apply` is kept as a thin single-cycle composition (stage1
+  * then stage2, no register) for any caller that doesn't need the split. */
 object Bitfield {
   // ROL_32(x, n) via a 64-bit funnel: (x##x) rotated. n in 0..31.
   private def rol32(x: Bits, n: UInt): Bits = {
@@ -51,8 +81,9 @@ object Bitfield {
     rol32(x, back)
   }
 
-  def apply(cmd: BitfieldCmd): BitfieldRsp = new Area {
-    val rsp = BitfieldRsp()
+  /** Stage 1 (cheap half): the rotate/shift/left-justify cone. No clz, no result mux. */
+  def stage1(cmd: BitfieldCmd): BitfieldMid = new Area {
+    val mid = BitfieldMid()
 
     val offset = cmd.offset
     // width = ((rawWidth - 1) & 31) + 1  -> 1..32 (rawWidth 0 -> 32).
@@ -86,30 +117,50 @@ object Bitfield {
     // Equivalent: clz of (extU left-justified to bit (width-1)). We left-justify the
     // width-bit field to the MSB via (extU << (32-width)) and CLZ that, clamped to width.
     val fieldLJ = (extU.asUInt << shAmt)(31 downto 0).asBits   // width-bit field at the top
-    val clzRaw  = clz32(fieldLJ)                               // 0..32 (32 if all-zero)
-    val clzClamped = Mux(clzRaw > width6, width6, clzRaw)      // clamp to width
+
+    mid.dy      := cmd.dy
+    mid.bfOp    := cmd.bfOp
+    mid.ffoBase := cmd.ffoBase
+    mid.mask    := mask
+    mid.rotL    := rotL
+    mid.dyShL   := dyShL
+    mid.insVal  := insVal
+    mid.insPos  := insPos
+    mid.extU    := extU
+    mid.extS    := extS
+    mid.fieldLJ := fieldLJ
+    mid.width6  := width6
+  }.mid
+
+  /** Stage 2 (deep half): the clz + mask-modify + 8-way result/flag mux, off an
+    * ALREADY-REGISTERED `BitfieldMid`. */
+  def stage2(mid: BitfieldMid): BitfieldRsp = new Area {
+    val rsp = BitfieldRsp()
+
+    val clzRaw  = clz32(mid.fieldLJ)                            // 0..32 (32 if all-zero)
+    val clzClamped = Mux(clzRaw > mid.width6, mid.width6, clzRaw)  // clamp to width
     // FFO result = ffoBase + clz. ffoBase = offset for the register form (set by the
     // caller); the memory form left-justifies the field (rotate offset = 0) and sets
     // ffoBase = the ORIGINAL memory bit offset so the result is original_offset + clz.
-    val ffoRes  = (cmd.ffoBase + clzClamped.resize(32)).asBits
+    val ffoRes  = (mid.ffoBase + clzClamped.resize(32)).asBits
 
     // CHG/CLR/SET mask-modify.
-    val chgRes = (cmd.dy.asUInt ^ mask.asUInt).asBits
-    val clrRes = (cmd.dy.asUInt & ~mask.asUInt).asBits
-    val setRes = (cmd.dy.asUInt | mask.asUInt).asBits
+    val chgRes = (mid.dy.asUInt ^ mid.mask.asUInt).asBits
+    val clrRes = (mid.dy.asUInt & ~mid.mask.asUInt).asBits
+    val setRes = (mid.dy.asUInt | mid.mask.asUInt).asBits
     // BFINS: (Dy & ~mask) | insPos.
-    val insRes = ((cmd.dy.asUInt & ~mask.asUInt) | insPos.asUInt).asBits
+    val insRes = ((mid.dy.asUInt & ~mid.mask.asUInt) | mid.insPos.asUInt).asBits
 
     // ── N flag ──────────────────────────────────────────────────────────────────
     // TST/CHG/CLR/SET: N = bit31 of (Dy<<offset). EXTU/EXTS/FFO: N = rotL[31].
     // INS: N = bit31 of insVal (the inserted value, pre-position).
-    val nShift = dyShL(31)
-    val nRot   = rotL(31)
-    val nIns   = insVal(31)
+    val nShift = mid.dyShL(31)
+    val nRot   = mid.rotL(31)
+    val nIns   = mid.insVal(31)
     // bfOp = op[10:8] (the 020 bit-field encoding): 0=BFTST,1=BFEXTU,2=BFCHG,
     // 3=BFEXTS,4=BFCLR,5=BFFFO,6=BFSET,7=BFINS. EXTU/EXTS/FFO (1/3/5) use rotL[31];
     // INS (7) uses the inserted-value MSB; TST/CHG/CLR/SET (0/2/4/6) use (Dy<<offset)[31].
-    val n = cmd.bfOp.mux(
+    val n = mid.bfOp.mux(
       B"3'd1" -> nRot, B"3'd3" -> nRot, B"3'd5" -> nRot,   // EXTU/EXTS/FFO
       B"3'd7" -> nIns,                                       // INS
       default -> nShift)                                    // TST/CHG/CLR/SET
@@ -117,22 +168,22 @@ object Bitfield {
     // ── Z flag (value == 0) ───────────────────────────────────────────────────────
     // TST/CHG/CLR/SET: Z = (Dy & mask) == 0. EXTU: extU==0. EXTS: extS==0. FFO: field
     // (=extU) ==0. INS: insVal==0.
-    val zTstFamily = (cmd.dy.asUInt & mask.asUInt) === 0
-    val zExtU      = extU.asUInt === 0
-    val zExtS      = extS.asUInt === 0
-    val zFfo       = extU.asUInt === 0
-    val zIns       = insVal.asUInt === 0
-    val z = cmd.bfOp.mux(
+    val zTstFamily = (mid.dy.asUInt & mid.mask.asUInt) === 0
+    val zExtU      = mid.extU.asUInt === 0
+    val zExtS      = mid.extS.asUInt === 0
+    val zFfo       = mid.extU.asUInt === 0
+    val zIns       = mid.insVal.asUInt === 0
+    val z = mid.bfOp.mux(
       B"3'd1" -> zExtU, B"3'd3" -> zExtS, B"3'd5" -> zFfo,
       B"3'd7" -> zIns,
       default -> zTstFamily)
 
     // ── result mux ────────────────────────────────────────────────────────────────
-    val result = cmd.bfOp.mux(
-      B"3'd0" -> cmd.dy,          // BFTST: no write (don't-care; dstValid=False)
-      B"3'd1" -> extU,            // BFEXTU
+    val result = mid.bfOp.mux(
+      B"3'd0" -> mid.dy,          // BFTST: no write (don't-care; dstValid=False)
+      B"3'd1" -> mid.extU,        // BFEXTU
       B"3'd2" -> chgRes,          // BFCHG
-      B"3'd3" -> extS,            // BFEXTS
+      B"3'd3" -> mid.extS,        // BFEXTS
       B"3'd4" -> clrRes,          // BFCLR
       B"3'd5" -> ffoRes,          // BFFFO
       B"3'd6" -> setRes,          // BFSET
@@ -142,6 +193,10 @@ object Bitfield {
     rsp.n := n
     rsp.z := z
   }.rsp
+
+  /** Single-cycle composition (stage1 then stage2, no register in between) — kept for
+    * any caller that doesn't need the FMax split. */
+  def apply(cmd: BitfieldCmd): BitfieldRsp = stage2(stage1(cmd))
 
   /** Count leading zeros of a 32-bit value: 0..32 (32 if all zero). Linear priority
     * encode (Vivado retimes); BFFFO-only path, off the existing critical cone. If a
