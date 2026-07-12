@@ -90,7 +90,7 @@ class AluEuSourcePlugin extends FiberPlugin {
     uop.isScc        := False; uop.isDbcc := False
     uop.bitOp        := 0
     uop.indexLong    := False; uop.indexScale := 0
-    uop.leaAddr      := False; uop.fromCcr := False; uop.fromSr := False
+    uop.leaAddr      := False; uop.movesAliasStore := False; uop.fromCcr := False; uop.fromSr := False
     uop.needsSupervisor := False; uop.keepCommit := False
     uop.firstOfInstr := False
     uop.predTaken    := False; uop.predTarget := 0

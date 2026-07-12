@@ -129,13 +129,20 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val stalled       = Reg(Bool()) init False       // complex-instruction stall
     val started       = Reg(Bool()) init False       // don't fetch until first redirect
     // I-fetch fault hold: a translation fault (ITLB non-resident / protect) on a
-    // fetch response. We emit ONE faulted DecodePacket (slot0.fault, pc = the faulting
-    // fetch PC) and STOP fetching until a redirect (the exception delivers + vectors).
-    // Without this hold the front-end would keep fetching the bad page (a flood of
-    // faulted uops that starves the commit-side exception sequencer).
+    // fetch response. We STOP issuing further real fetches immediately (the fetch
+    // pipeline can be up to RING windows ahead of decode), but do NOT immediately
+    // squash whatever is still legitimately buffered in the IBuf ahead of decodePc —
+    // those are real, already-fetched, pre-fault instructions that must still
+    // execute (a real 68040 defers a prefetch fault until the CPU actually reaches
+    // it). We only emit the ONE synthetic faulted DecodePacket (slot0.fault, pc =
+    // decodePc) once decode has genuinely drained everything buffered before the
+    // fault (see `emittingFaultPacket` below) — at that point decodePc IS the
+    // faulting instruction's PC. STOP fetching resumes only via a redirect (the
+    // exception delivers + vectors, or an earlier buffered branch mispredict-
+    // redirects away from the fault entirely — both existing redirect paths already
+    // clear faultHold).
     val faultHold     = Reg(Bool()) init False
     val faultEmitted  = Reg(Bool()) init False   // the faulted packet was already emitted
-    val faultPc       = Reg(UInt(32 bits)) init 0
 
     // Complex emit-once is enforced by the `stalled` latch (no separate delay reg):
     // a complex packet has shiftWords=0, so on its fire only `stalled` advances,
@@ -259,7 +266,6 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val rspFault = ic.rsp.valid && ic.rsp.payload.fault && !rspStaleHead && !faultHold
     when(rspFault) {
       faultHold := True
-      faultPc   := ic.rsp.payload.pc
     }
 
     when(ic.rsp.valid) {
@@ -430,10 +436,18 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // Gate feed low while STOP-quiesced so no buffered successor word is dispatched /
     // allocated into the ROB while halted (the quiesce only ends on the wake redirect).
     feed.valid      := res.slot0Valid && !stalled && !quiesce
-    // I-fetch fault: override the feed with a single faulted DecodePacket (slot0
-    // only), emitted EXACTLY ONCE (faultEmitted suppresses re-emission). Its bytes are
-    // don't-care; decode turns it into a faulted vector-2 µop that delivers at retire.
-    when(faultHold) {
+    // I-fetch fault: once decode has drained everything legitimately buffered ahead
+    // of the fault (no more aligned instruction available -> !res.slot0Valid), AND
+    // we're not mid-complex-stall/quiesce (waiting on an earlier, unrelated resume),
+    // decodePc IS the faulting instruction's PC. Only THEN override the feed with a
+    // single faulted DecodePacket (slot0 only), emitted EXACTLY ONCE (faultEmitted
+    // suppresses re-emission). Its bytes are don't-care; decode turns it into a
+    // faulted vector-2 µop that delivers at retire. Gating on !res.slot0Valid (rather
+    // than the raw faultHold latch) is what lets still-buffered pre-fault instructions
+    // keep draining normally instead of being squashed the instant the fault response
+    // lands (up to RING windows before decode actually reaches it).
+    val emittingFaultPacket = faultHold && !res.slot0Valid && !stalled && !quiesce
+    when(emittingFaultPacket) {
       feed.valid             := !faultEmitted
       slot1ValidOut          := False
       feed.payload(0).valid     := True
@@ -459,11 +473,11 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       feed.payload(1).phtIndex   := U(0, 11 bits)
     }
     // Emit-once: latch faultEmitted when the faulted packet fires.
-    when(faultHold && feed.fire) { faultEmitted := True }
+    when(emittingFaultPacket && feed.fire) { faultEmitted := True }
 
     // When feed fires (normal, NOT the faulted-packet override): consume words from
     // the buffer and advance decodePc. A faulted feed shifts nothing (its bytes came
-    // from faultPc, not the IBuf).
+    // from decodePc directly, not the IBuf).
     // Effective shift: when slot1 is SUPPRESSED (a predicted slot0 branch, or a slot1
     // branch deferred to next cycle), consume only slot0's words (lenWords); else the
     // aligner's full shift. Without this, suppressing slot1 would still CONSUME its
@@ -481,7 +495,7 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val decodePcSuppress = decodePc + (res.slot0.lenWords.resize(32) |<< 1)   // slot1 suppressed
     val decodePcFull     = decodePc + (res.shiftWords.resize(32) |<< 1)       // full aligner shift
     val decodePcNext     = Mux(suppressSlot1, decodePcSuppress, decodePcFull)
-    when(feed.fire && !faultHold) {
+    when(feed.fire && !emittingFaultPacket) {
       ibuf.io.shift := effShift
       decodePc      := decodePcNext
       when(res.complex) {

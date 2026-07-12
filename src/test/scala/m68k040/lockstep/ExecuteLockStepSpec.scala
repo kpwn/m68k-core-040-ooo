@@ -4795,6 +4795,122 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
   }
 
+  // ── ITLB lock-step (c): F4 regression — resident instructions BUFFERED AHEAD of
+  // an I-fetch fault must still all execute, and the fault PC must be the true
+  // faulting instruction, not wherever decode happened to be when the fault
+  // RESPONSE first landed (up to RING=3 fetch windows ahead of decode). Unlike
+  // itlb-b (where the branch target IS the first faulting instruction, so nothing
+  // is ever buffered ahead of the fault), here the branch lands INSIDE the resident
+  // page near ITS end (0x1fe0, 32 bytes before the 0x2000 page-2 boundary) and falls
+  // straight through 16 real moveq instructions with NO further branch — by
+  // construction, several of those must still be draining out of the IBuf when the
+  // fault response for the [0x2000,...) window lands (RING=3 * 4 words = 12 words of
+  // fetch-ahead, well inside the 16-instruction/32-byte run). Pre-fix, the front end
+  // would squash whatever was still buffered and stamp the fault with the
+  // (too-early) decodePc it happened to be sitting at -> fewer than 16 moveqs
+  // retire and/or the stacked EA != farVA.
+  test("lock-step ITLB: resident run BUFFERED AHEAD of a fault must drain before the fault fires (F4)", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress       // 0x40800000
+    val farVA    = loadAddr + 0x2000L                        // 0x40802000 (non-resident I-page)
+    val runStart = loadAddr + 0x1fe0L                        // 32 bytes before farVA, still page-1 resident
+    val PTRT = 0x00081000L; val PAGA = 0x00082000L; val PAGD = 0x0003F000L
+    val descVA = PAGD + 2*4
+    val farPpn   = (farVA >> 12) & 0xfffffL
+    val farDescLE = ((farPpn << 12) | 0x1L) & 0xffffffffL
+    val farDescBE = java.lang.Long.reverseBytes(farDescLE) >>> 32
+    val filler = (0 until 24).map(_ => "moveq #0,%d7").mkString(" ; ")
+    // 16 distinct-register/value moveqs, landing EXACTLY at farVA (16 * 2 bytes = 32).
+    val runInstrs = (0 until 16).map(i => s"moveq #${i + 1},%d${i % 8}").mkString(" ; ")
+    val src =
+      "move.l #handler,%d1 ; move.l %d1,0x8 ; " +
+      "moveq #1,%d4 ; moveq #2,%d5 ; moveq #3,%d6 ; " +
+      "bra.w far ; " +
+      filler + " ; " +
+      f"handler: move.l #0x$farDescBE%08x,%%d1 ; move.l %%d1,0x3F008 ; rte ; " +
+      ".org 0x1fe0 ; far: " + runInstrs
+    // vec-imm, vec-store, 3x moveq, bra, 16x run-moveq, [fault], handler-imm, handler-store, rte
+    val nInstr = 2 + 3 + 1 + 16 + 3
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i; case Left(e) => fail(s"[itlb-c] assemble: ${e.reason}") }
+
+    val rIdx = ((loadAddr >> 25) & 0x7f).toInt
+    val pIdx = ((loadAddr >> 18) & 0x7f).toInt
+    val oraclePt = Seq(
+      (0x80000L + rIdx*4) -> ((PTRT & 0xfffffff0L) | 0x2L),
+      (PTRT + pIdx*4)     -> ((PAGD & 0xfffffff0L) | 0x2L),
+      (PAGD + 2*4)        -> 0x0L) ++
+      (0 until 8).filter(_ != 2).map(i => (PAGD + i*4) -> ((((loadAddr>>12)&0xfffffL)+i) << 12 | 0x1L))
+    val mmu = Some(Musashi.MmuConfig(rootPtr = 0x80000L, dataLo = 0L, dataHi = 0L,
+      ptPreload = oraclePt, instrLo = farVA, instrHi = farVA + 0x1000L))
+    val oracleSteps = Musashi.assembleAndTrace(src, mmu = mmu, maxCycles = 20000) match {
+      case Right(v)  => v; case Left(e) => fail(s"[itlb-c] oracle: ${e.reason}") }
+    assert(oracleSteps.size >= nInstr, s"[itlb-c] oracle produced ${oracleSteps.size} steps (< $nInstr)")
+    val oracle = oracleSteps.take(nInstr)
+
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      val handle = new WhiteboxCapture.Handle
+      wireWhitebox(dut, handle)
+
+      val icmem = SparseMemory()
+      writeCodeAt(icmem, loadAddr, image.bytes)
+      new Axi4ReadOnlySlaveAgent(dut.icache.logic.axi, cd) {
+        override def readByte(address: BigInt, id: Int): Byte = icmem.read(address.toLong)
+      }
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+      pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)
+      pokeLE(PTRT + 0*4,      (PAGA & 0xfffffff0L) | 0x2L)
+      pokeLE(PAGA + 0*4,      (0x0L << 12) | 0x1L)
+      pokeLE(PAGA + 0x3f*4,   (0x3fL << 12) | 0x1L)
+      pokeLE(0x80000L + rIdx*4, (PTRT & 0xfffffff0L) | 0x2L)
+      pokeLE(PTRT + pIdx*4,     (PAGD & 0xfffffff0L) | 0x2L)
+      for (i <- 0 until 8) {
+        val v = if (i == 2) 0x0L else ((((loadAddr>>12)&0xfffffL)+i) << 12 | 0x1L)
+        pokeLE(PAGD + i*4, v)
+      }
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.rootPtr   #= 0x80000L
+
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+
+      var guard = 0; val cap = 12000; var sawFault = false
+      while (handle.result.size < nInstr && guard < cap) {
+        if (dut.itlb.logic.faultSeen.toBoolean) sawFault = true
+        cd.waitSampling(); guard += 1
+      }
+      assert(sawFault, "[itlb-c] the I-fetch to the non-resident page must flag an ITLB fault")
+      assert(handle.result.size >= nInstr,
+        s"[itlb-c] only ${handle.result.size}/$nInstr committed within $cap cycles " +
+        "(F4: buffered pre-fault instructions were squashed instead of draining)")
+      val fb = 0x100000L - 60
+      def pk16(a: Long): Int = ((dmem.peekByte(a) << 8) | dmem.peekByte(a + 1)) & 0xffff
+      def pk32(a: Long): Long = ((pk16(a).toLong << 16) | pk16(a + 2)) & 0xffffffffL
+      assert(pk16(fb + 6) == 0x7008, f"[itlb-c] frame fmt/vec=0x${pk16(fb + 6)}%04x expected 0x7008")
+      assert(pk32(fb + 8) == farVA,
+        f"[itlb-c] frame EA=0x${pk32(fb + 8)}%08x expected 0x$farVA%08x " +
+        "(F4: fault stamped too early, at a pre-drain decodePc)")
+      assert(pk32(fb + 0x14) == farVA, f"[itlb-c] frame faultAddr=0x${pk32(fb + 0x14)}%08x expected 0x$farVA%08x")
+
+      val res = LockStep.compare(handle.result.take(nInstr), oracle)
+      assert(res.ok, s"[itlb-c] lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")} " +
+        s"(matched ${res.matched}, dut ${handle.result.size}, oracle $nInstr)")
+    }
+  }
+
   // ───────────────────────────────────────────────────────────────────────────
   // -(An) / (An)+ predecrement / postincrement addressing modes.
   //
@@ -5449,26 +5565,23 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // sentinel MOVEQ right after proves nextPc landed exactly on the following
     // instruction (not mid-instruction, not stalled).
     //
-    // `pcOnly=true`: this exact instruction shape — a MOVE whose SOURCE is full
-    // MEM-INDIRECT and whose DESTINATION is a separate, non-register memory location —
-    // is correctly FRAMED (this test's whole point) but does NOT correctly EXECUTE
-    // today: a genuine, SEPARATE, pre-existing gap in `Microcode.scala`'s
-    // `MI_MOVE_SRC_ENTRY` (rows 16-18, "MOVE src-EA -> a register") — it was only ever
-    // built/tested for a REGISTER destination (every existing MEM-INDIRECT MOVE lock-step
-    // test uses %d2/%a1/%a2 as dst) and mis-targets the opword's dst-register BIT FIELD
-    // as if it were a real register number even when the destination is actually a
-    // memory EA (abs.L here) — a µcode-completeness gap, not a predecode bug, and NEWLY
-    // REACHABLE only because this F2 fix stops the front-end from hanging on it first.
-    // Reported separately as an out-of-scope finding; NOT fixed here. `pcOnly` verifies
-    // exactly F2's own claim (no livelock, correct nextPc) without asserting execution
-    // correctness of the separately-broken data path.
+    // UPGRADED (task #119, deep-audit follow-up): this exact instruction shape — a MOVE
+    // whose SOURCE is full MEM-INDIRECT and whose DESTINATION is a separate, non-register
+    // memory location — was correctly FRAMED (F2's original claim, `pcOnly`) but did NOT
+    // correctly EXECUTE: `Microcode.scala`'s `MI_MOVE_SRC_ENTRY` (rows 16-18) was only
+    // ever built/tested for a REGISTER destination and mis-targeted the opword's
+    // dst-register BIT FIELD as if it were a real register number even when the
+    // destination was actually a memory EA (abs.L here). Fixed by routing this shape to
+    // the new `MI_MOVE_EAEA_ENTRY` (load src -> temp, store temp -> the independently-
+    // decoded plain dst EA, no register write). Now asserts FULL execution correctness
+    // (checkMem), not just the framing/nextPc claim.
     runLockStep("f2-lenwords-overflow-livelock",
       "move.l #0x3000,%a0 ; move.l #0,%d1 ; " +
       "move.l #0x00020000,%d0 ; move.l %d0,0x13000 ; " +            // [0x13000] = ptr 0x20000
       "move.l #0xCAFEBABE,%d3 ; move.l %d3,0x30000 ; " +            // [0x30000] = payload
       "move.l ([0x10000,%a0,%d1.l*4],0x10000),0x600000 ; " +        // the F2 trigger (8 words)
       "moveq #0x33,%d7 ; " +                                        // sentinel: nextPc must land here
-      ".stop: bra .stop", nInstr = 9, pcOnly = true)
+      ".stop: bra .stop", nInstr = 9, checkMem = Seq(0x600000L))    // mem[0x600000] = 0xCAFEBABE
   }
 
   test("lock-step F1 FIX: #imm.W src (sExt=1) + full-format-indexed dst -> dst len " +
@@ -5514,19 +5627,29 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // for the old 6-entry (indices 0..5) DecodePacket.words, so it silently read as 0
     // (dst EA = a1+0 instead of a1+0x10). NEW: DecodePacket.words holds 10 entries and
     // the Aligner copies all of them, so the real displacement (0x10) survives intact.
-    // `pcOnly=true`: SAME reason as the F2 test above — src is MEM-INDIRECT and dst is a
-    // separate, non-register memory EA, hitting the same out-of-scope
-    // `MI_MOVE_SRC_ENTRY` register-only-destination gap. This test verifies exactly F3's
-    // own claim (the packet correctly carries all 7 words through the front end, i.e.
-    // nextPc/framing is right) via the PC sequence, not full data execution.
+    // UPGRADED (task #119, deep-audit follow-up): SAME shape as the F2 test above — src
+    // is MEM-INDIRECT and dst is a separate, non-register memory EA — routed through the
+    // new `MI_MOVE_EAEA_ENTRY`. Now asserts FULL execution correctness (checkMem) in
+    // addition to F3's original framing/nextPc claim.
     runLockStep("f3-7word-dual-full-ea",
       "move.l #0x3000,%a0 ; move.l #0,%d1 ; move.l #0x3000,%a1 ; " +
       "move.l #0x00020000,%d0 ; move.l %d0,0x13000 ; " +            // [0x13000] = ptr 0x20000
       "move.l #0x99887766,%d3 ; move.l %d3,0x30000 ; " +            // [0x30000] = payload
       "move.l ([0x10000,%a0,%d1.l*4],0x10000),0x10(%a1) ; " +       // the F3 trigger (7 words)
       "moveq #0x55,%d7 ; " +                                        // sentinel
-      ".stop: bra .stop", nInstr = 10, pcOnly = true)
+      ".stop: bra .stop", nInstr = 10, checkMem = Seq(0x3010L))     // mem[0x3010] = 0x99887766
   }
+
+  // task #119 (deep-audit follow-up): the MIRROR direction — a PLAIN (non-register)
+  // memory src moved to a mem-indirect dst — was ALSO silently wrong before this
+  // session's fix (the pre-existing routing treated the source's EA field as a fake
+  // register number whenever the destination alone was mem-indirect), a second,
+  // previously-unreported instance of the same bug class the F2/F3 fix uncovered. A
+  // `MI_MOVE_EAEA_REV_ENTRY` chain was built for it but a directed test found its store
+  // lands at the wrong address (root cause not pinned down in the time available), so
+  // DecodeStage.scala currently traps it illegal instead (`ucMoveDstMiEaEaBroken`,
+  // safe: it no longer silently corrupts, it just doesn't execute) pending further
+  // debugging — see Microcode.scala's MI_MOVE_EAEA_REV_ENTRY comment.
 
   // ── FUZZER-CAUGHT: MOVEA with a MEM-INDIRECT source ─────────────────────────
   // The MI_MOVE_SRC crack targeted the Dn register half (no +8) and SET NZVC;
@@ -6272,6 +6395,60 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moves.l %d2,(%a0)",                                 // mem := 0xAABBCCDD (SAME flat write)
       "move.l (%a0),%d3"
     )).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+
+  // ── A2 fix: MOVES Rn==An aliasing (the moved register IS the EA's address register) ──
+  // Musashi computes the EA via the GET_EA_AY macro, which MUTATES An as part of the EA
+  // calc, and only THEN reads/writes the register for the moved value — so when Rn IS
+  // the EA's An, the auto-update's effect is visible to the Rn access. No directed test
+  // existed for this before (deep-audit finding A2).
+  //
+  // WRITE -(An), Rn==An: EA = An-4 (decremented FIRST); the STORED value is the register
+  // read AFTER that decrement -> the NEW (decremented) An, not the value An held before
+  // the instruction.
+  test("lock-step: MOVES.L %a2,-(%a2) — Rn==An predec write stores the DECREMENTED An", VerilatorTest) {
+    runLockStep("moves-l-wr-alias-pd", Seq(
+      "move.l #0x3000,%a1",                 // A1: a stable pointer to read the store back with
+      "move.l #0x3004,%a2",                 // A2: the aliased Rn==An register
+      "ori #0x10,%ccr",
+      "moves.l %a2,-(%a2)",                 // EA=A2-4=0x3000 (predec first); store A2's NEW value
+      "move.l %a2,%d1",                     // surface final A2 (expect 0x3000)
+      "move.l (%a1),%d2"                    // surface the stored bytes (expect 0x3000)
+    ).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+  // WRITE (An)+, Rn==An: EA = OLD An (used for the address); An then increments as part
+  // of the SAME EA calc; the STORED value is the register read AFTER that increment ->
+  // the NEW (incremented) An, even though the write lands at the OLD address.
+  test("lock-step: MOVES.L %a2,(%a2)+ — Rn==An postinc write stores the INCREMENTED An", VerilatorTest) {
+    runLockStep("moves-l-wr-alias-pi", Seq(
+      "move.l #0x3000,%a1",                 // A1: a stable pointer to the write address
+      "move.l #0x3000,%a2",                 // A2: the aliased Rn==An register
+      "ori #0x10,%ccr",
+      "moves.l %a2,(%a2)+",                 // EA=A2=0x3000 (old); A2 -> 0x3004; store A2's NEW value
+      "move.l %a2,%d1",                     // surface final A2 (expect 0x3004)
+      "move.l (%a1),%d2"                    // surface the stored bytes at 0x3000 (expect 0x3004)
+    ).mkString(" ; "), checkMem = Seq(0x3000L), checkSpan = 4)
+  }
+  // READ (An)+, Rn==An: the load overwrites An LAST, so the auto-update's effect on An is
+  // moot — the final An is simply the LOADED value, not old_An+delta.
+  test("lock-step: MOVES.L (%a2)+,%a2 — Rn==An postinc read: loaded value wins over the auto-update", VerilatorTest) {
+    runLockStep("moves-l-rd-alias-pi", Seq(
+      "move.l #0x3000,%a1", "move.l #0xcafebabe,%d7", "move.l %d7,(%a1)",  // mem[0x3000]=0xCAFEBABE
+      "move.l #0x3000,%a2",                 // A2: the aliased Rn==An register
+      "ori #0x10,%ccr",
+      "moves.l (%a2)+,%a2",                 // load mem[0x3000] -> A2 (auto-update to 0x3004 is moot)
+      "move.l %a2,%d1"                      // surface final A2 (expect 0xCAFEBABE, NOT 0x3004)
+    ).mkString(" ; "))
+  }
+  // READ -(An), Rn==An: same overwrite-last-wins rule with the predec address calc.
+  test("lock-step: MOVES.L -(%a2),%a2 — Rn==An predec read: loaded value wins over the auto-update", VerilatorTest) {
+    runLockStep("moves-l-rd-alias-pd", Seq(
+      "move.l #0x3000,%a1", "move.l #0xdeadbeef,%d7", "move.l %d7,(%a1)", // mem[0x3000]=0xDEADBEEF
+      "move.l #0x3004,%a2",                 // A2: the aliased Rn==An register
+      "ori #0x10,%ccr",
+      "moves.l -(%a2),%a2",                 // EA=A2-4=0x3000 (predec); load -> A2 (auto-update to 0x3000 is moot)
+      "move.l %a2,%d1"                      // surface final A2 (expect 0xDEADBEEF, NOT 0x3000)
+    ).mkString(" ; "))
   }
 
   // MOVES is PRIVILEGED: in USER mode (S=0) it raises a vector-8 privilege violation

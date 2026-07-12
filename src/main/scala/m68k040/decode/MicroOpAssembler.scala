@@ -86,7 +86,7 @@ object MicroOpAssembler {
     u.isMovea     := isLoad && !sizeLong
     u.isScc       := False; u.isDbcc := False
     u.indexLong   := False; u.indexScale := 0
-    u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+    u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
     u.predTaken := False; u.predTarget := U(0, 32 bits)
     u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
@@ -130,7 +130,7 @@ object MicroOpAssembler {
     u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.extByte := False
     u.isMovea     := False; u.isScc := False; u.isDbcc := False
     u.indexLong   := False; u.indexScale := 0
-    u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+    u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
     u.predTaken := False; u.predTarget := U(0, 32 bits)
     u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
@@ -185,7 +185,7 @@ object MicroOpAssembler {
     u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.extByte := False
     u.isMovea     := False; u.isScc := False; u.isDbcc := False
     u.indexLong   := False; u.indexScale := 0
-    u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+    u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
     u.predTaken := False; u.predTarget := U(0, 32 bits)
     u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
@@ -529,7 +529,7 @@ object MicroOpAssembler {
     opUop.isMovea       := False
     opUop.isScc         := False; opUop.isDbcc := False
     opUop.indexLong     := False; opUop.indexScale := 0
-    opUop.leaAddr := False; opUop.fromCcr := False; opUop.fromSr := False; opUop.needsSupervisor := False; opUop.keepCommit := False
+    opUop.leaAddr := False; opUop.movesAliasStore := False; opUop.fromCcr := False; opUop.fromSr := False; opUop.needsSupervisor := False; opUop.keepCommit := False
     opUop.sysOp := False; opUop.sysKind := SysKind.NONE; opUop.sysReadDir := False
     opUop.predTaken := False; opUop.predTarget := U(0, 32 bits)
     opUop.phtValid := False; opUop.phtIndex := U(0, 11 bits); opUop.casForm := 0
@@ -802,7 +802,7 @@ object MicroOpAssembler {
     val ldIdxEa = Mux(opIsLineImm, immEa, srcEa)
     ldUop.srcCReg       := ldIdxEa.indexReg;   ldUop.srcCValid := ldIdxEa.indexValid
     ldUop.indexLong     := ldIdxEa.indexLong;  ldUop.indexScale := ldIdxEa.indexScale
-    ldUop.leaAddr := False; ldUop.fromCcr := False; ldUop.fromSr := False; ldUop.needsSupervisor := False; ldUop.keepCommit := False
+    ldUop.leaAddr := False; ldUop.movesAliasStore := False; ldUop.fromCcr := False; ldUop.fromSr := False; ldUop.needsSupervisor := False; ldUop.keepCommit := False
     ldUop.sysOp := False; ldUop.sysKind := SysKind.NONE; ldUop.sysReadDir := False
     ldUop.predTaken := False; ldUop.predTarget := U(0, 32 bits)
     ldUop.phtValid := False; ldUop.phtIndex := U(0, 11 bits); ldUop.casForm := 0
@@ -871,7 +871,7 @@ object MicroOpAssembler {
     // mem-to-mem MOVE composes: srcA=dst base, srcB=T0 (loaded data), srcC=dst index.
     stUop.srcCReg       := stDstEa.indexReg;  stUop.srcCValid := stDstEa.indexValid
     stUop.indexLong     := stDstEa.indexLong; stUop.indexScale := stDstEa.indexScale
-    stUop.leaAddr := False; stUop.fromCcr := False; stUop.fromSr := False; stUop.needsSupervisor := False; stUop.keepCommit := False
+    stUop.leaAddr := False; stUop.movesAliasStore := False; stUop.fromCcr := False; stUop.fromSr := False; stUop.needsSupervisor := False; stUop.keepCommit := False
     stUop.sysOp := False; stUop.sysKind := SysKind.NONE; stUop.sysReadDir := False
     stUop.predTaken := False; stUop.predTarget := U(0, 32 bits)
     stUop.phtValid := False; stUop.phtIndex := U(0, 11 bits); stUop.casForm := 0
@@ -918,7 +918,7 @@ object MicroOpAssembler {
     val rmwIdxEa = Mux(opIsLineImm, immEa, srcEa)
     rmwStUop.srcCReg       := rmwIdxEa.indexReg;  rmwStUop.srcCValid := rmwIdxEa.indexValid
     rmwStUop.indexLong     := rmwIdxEa.indexLong; rmwStUop.indexScale := rmwIdxEa.indexScale
-    rmwStUop.leaAddr := False; rmwStUop.fromCcr := False; rmwStUop.fromSr := False; rmwStUop.needsSupervisor := False; rmwStUop.keepCommit := False
+    rmwStUop.leaAddr := False; rmwStUop.movesAliasStore := False; rmwStUop.fromCcr := False; rmwStUop.fromSr := False; rmwStUop.needsSupervisor := False; rmwStUop.keepCommit := False
     rmwStUop.sysOp := False; rmwStUop.sysKind := SysKind.NONE; rmwStUop.sysReadDir := False
     rmwStUop.predTaken := False; rmwStUop.predTarget := U(0, 32 bits)
     rmwStUop.phtValid := False; rmwStUop.phtIndex := U(0, 11 bits); rmwStUop.casForm := 0
@@ -1565,7 +1565,7 @@ object MicroOpAssembler {
     divlUop.isChk2        := False
     divlUop.shiftOp := 0; divlUop.shiftDir := False; divlUop.isMovea := False; divlUop.isScc := False; divlUop.isDbcc := False; divlUop.extByte := False; divlUop.bitOp := 0; divlUop.bfOp := 0; divlUop.bfDynamic := False; divlUop.bfMem := False; divlUop.bfStoreForm := 0; divlUop.bcdSub := False
     divlUop.indexLong := False; divlUop.indexScale := 0
-    divlUop.leaAddr := False; divlUop.fromCcr := False; divlUop.fromSr := False; divlUop.needsSupervisor := False; divlUop.keepCommit := False
+    divlUop.leaAddr := False; divlUop.movesAliasStore := False; divlUop.fromCcr := False; divlUop.fromSr := False; divlUop.needsSupervisor := False; divlUop.keepCommit := False
     divlUop.sysOp := False; divlUop.sysKind := SysKind.NONE; divlUop.sysReadDir := False
     divlUop.predTaken := False; divlUop.predTarget := U(0, 32 bits)
     divlUop.phtValid := False; divlUop.phtIndex := U(0, 11 bits); divlUop.casForm := 0
@@ -1603,7 +1603,7 @@ object MicroOpAssembler {
     divremUop.isChk2        := False
     divremUop.shiftOp := 0; divremUop.shiftDir := False; divremUop.isMovea := False; divremUop.isScc := False; divremUop.isDbcc := False; divremUop.extByte := False; divremUop.bitOp := 0; divremUop.bfOp := 0; divremUop.bfDynamic := False; divremUop.bfMem := False; divremUop.bfStoreForm := 0; divremUop.bcdSub := False
     divremUop.indexLong := False; divremUop.indexScale := 0
-    divremUop.leaAddr := False; divremUop.fromCcr := False; divremUop.fromSr := False; divremUop.needsSupervisor := False; divremUop.keepCommit := False
+    divremUop.leaAddr := False; divremUop.movesAliasStore := False; divremUop.fromCcr := False; divremUop.fromSr := False; divremUop.needsSupervisor := False; divremUop.keepCommit := False
     divremUop.sysOp := False; divremUop.sysKind := SysKind.NONE; divremUop.sysReadDir := False
     divremUop.predTaken := False; divremUop.predTarget := U(0, 32 bits)
     divremUop.phtValid := False; divremUop.phtIndex := U(0, 11 bits); divremUop.casForm := 0
@@ -1681,7 +1681,7 @@ object MicroOpAssembler {
     mullUop.isChk2        := False
     mullUop.shiftOp := 0; mullUop.shiftDir := False; mullUop.isMovea := False; mullUop.isScc := False; mullUop.isDbcc := False; mullUop.extByte := False; mullUop.bitOp := 0; mullUop.bfOp := 0; mullUop.bfDynamic := False; mullUop.bfMem := False; mullUop.bfStoreForm := 0; mullUop.bcdSub := False
     mullUop.indexLong := False; mullUop.indexScale := 0
-    mullUop.leaAddr := False; mullUop.fromCcr := False; mullUop.fromSr := False; mullUop.needsSupervisor := False; mullUop.keepCommit := False
+    mullUop.leaAddr := False; mullUop.movesAliasStore := False; mullUop.fromCcr := False; mullUop.fromSr := False; mullUop.needsSupervisor := False; mullUop.keepCommit := False
     mullUop.sysOp := False; mullUop.sysKind := SysKind.NONE; mullUop.sysReadDir := False
     mullUop.predTaken := False; mullUop.predTarget := U(0, 32 bits)
     mullUop.phtValid := False; mullUop.phtIndex := U(0, 11 bits); mullUop.casForm := 0
@@ -1716,7 +1716,7 @@ object MicroOpAssembler {
     mulhiUop.isChk2        := False
     mulhiUop.shiftOp := 0; mulhiUop.shiftDir := False; mulhiUop.isMovea := False; mulhiUop.isScc := False; mulhiUop.isDbcc := False; mulhiUop.extByte := False; mulhiUop.bitOp := 0; mulhiUop.bfOp := 0; mulhiUop.bfDynamic := False; mulhiUop.bfMem := False; mulhiUop.bfStoreForm := 0; mulhiUop.bcdSub := False
     mulhiUop.indexLong := False; mulhiUop.indexScale := 0
-    mulhiUop.leaAddr := False; mulhiUop.fromCcr := False; mulhiUop.fromSr := False; mulhiUop.needsSupervisor := False; mulhiUop.keepCommit := False
+    mulhiUop.leaAddr := False; mulhiUop.movesAliasStore := False; mulhiUop.fromCcr := False; mulhiUop.fromSr := False; mulhiUop.needsSupervisor := False; mulhiUop.keepCommit := False
     mulhiUop.sysOp := False; mulhiUop.sysKind := SysKind.NONE; mulhiUop.sysReadDir := False
     mulhiUop.predTaken := False; mulhiUop.predTarget := U(0, 32 bits)
     mulhiUop.phtValid := False; mulhiUop.phtIndex := U(0, 11 bits); mulhiUop.casForm := 0
@@ -1800,7 +1800,7 @@ object MicroOpAssembler {
       u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.extByte := False
       u.isMovea     := False; u.isScc := False; u.isDbcc := False
       u.indexLong   := bfmEaDec.indexLong; u.indexScale := bfmEaDec.indexScale
-      u.leaAddr     := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+      u.leaAddr     := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
       u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
       u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
@@ -1842,7 +1842,7 @@ object MicroOpAssembler {
       u.bfOp        := bfmBfOp; u.bfDynamic := False; u.bfMem := True; u.bfStoreForm := 0; u.extByte := False
       u.isMovea     := False; u.isScc := False; u.isDbcc := False
       u.indexLong   := False; u.indexScale := 0
-      u.leaAddr     := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+      u.leaAddr     := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
       u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
       u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
@@ -1937,7 +1937,7 @@ object MicroOpAssembler {
       u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.extByte := False
       u.isMovea     := False; u.isScc := False; u.isDbcc := False
       u.indexLong   := c2SrcEa.indexLong; u.indexScale := c2SrcEa.indexScale
-      u.leaAddr     := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+      u.leaAddr     := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
       u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
       u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
@@ -1981,7 +1981,7 @@ object MicroOpAssembler {
       u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.extByte := False
       u.isMovea     := False; u.isScc := False; u.isDbcc := False
       u.indexLong   := False; u.indexScale := 0
-      u.leaAddr     := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+      u.leaAddr     := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
       u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
       u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
@@ -2035,7 +2035,7 @@ object MicroOpAssembler {
     ibrUop.isChk2        := False
     ibrUop.shiftOp := 0; ibrUop.shiftDir := False; ibrUop.isMovea := False; ibrUop.isScc := False; ibrUop.isDbcc := False; ibrUop.extByte := False; ibrUop.bitOp := 0; ibrUop.bfOp := 0; ibrUop.bfDynamic := False; ibrUop.bfMem := False; ibrUop.bfStoreForm := 0; ibrUop.bcdSub := False
     ibrUop.indexLong := False; ibrUop.indexScale := 0
-    ibrUop.leaAddr := False; ibrUop.fromCcr := False; ibrUop.fromSr := False; ibrUop.needsSupervisor := False; ibrUop.keepCommit := False
+    ibrUop.leaAddr := False; ibrUop.movesAliasStore := False; ibrUop.fromCcr := False; ibrUop.fromSr := False; ibrUop.needsSupervisor := False; ibrUop.keepCommit := False
     ibrUop.sysOp := False; ibrUop.sysKind := SysKind.NONE; ibrUop.sysReadDir := False
     ibrUop.predTaken := False; ibrUop.predTarget := U(0, 32 bits)
     ibrUop.phtValid := False; ibrUop.phtIndex := U(0, 11 bits); ibrUop.casForm := 0
@@ -2091,7 +2091,7 @@ object MicroOpAssembler {
       u.isChk2 := False
       u.shiftOp := 0; u.shiftDir := False; u.isMovea := False; u.isScc := False; u.isDbcc := False; u.extByte := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.bcdSub := False
       u.indexLong := False; u.indexScale := 0
-      u.leaAddr := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := keepCommit
+      u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := keepCommit
       u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
       u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
@@ -2314,7 +2314,7 @@ object MicroOpAssembler {
       u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.extByte := False
       u.isMovea     := False; u.isScc := False; u.isDbcc := False
       u.indexLong   := srcEa.indexLong; u.indexScale := srcEa.indexScale
-      u.leaAddr     := True; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+      u.leaAddr     := True; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
       u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False   // (Track D fields; LEA is not a sysOp)
       u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0

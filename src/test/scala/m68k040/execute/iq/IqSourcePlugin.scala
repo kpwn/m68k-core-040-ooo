@@ -91,6 +91,7 @@ class IqSourcePlugin extends FiberPlugin {
       u.isMovea      := False
       u.indexLong    := False; u.indexScale := 0
       u.leaAddr      := False
+      u.movesAliasStore := False
       u.fromCcr      := False; u.fromSr := False; u.needsSupervisor := False
       u.keepCommit   := False
       u.sysOp        := False; u.sysKind := m68k040.decode.SysKind.NONE; u.sysReadDir := False
