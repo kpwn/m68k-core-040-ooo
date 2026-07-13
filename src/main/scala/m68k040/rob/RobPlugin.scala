@@ -119,21 +119,35 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // Pulses the cycle a BTB-eligible branch retires (driven below near branchRedirect,
     // where retire0/h0 are in scope). Concrete idle defaults so a standalone DUT (no
     // BtbPlugin consumer) elaborates; the BtbPlugin reads it in the full core.
+    // btbUpdateComb is the raw combinational decision; the EXPOSED btbUpdateFlow is a
+    // REGISTERED copy of it (task #124, Fable audit F6) — training is latency-
+    // insensitive (only affects FUTURE fetches, long after this retire), so the extra
+    // cycle is free and removes this write from the retire-cone fanout. Registering
+    // the EXPOSED name (not a separate wrapper) means every existing consumer — the
+    // BtbUpdateService getter AND the handful of test DUTs that wire
+    // `rob.logic.btbUpdateFlow` directly — picks up the fix with no further changes.
+    val btbUpdateComb = Flow(BtbUpdate())
+    btbUpdateComb.valid := False
+    btbUpdateComb.payload.pc     := U(0, 32 bits)
+    btbUpdateComb.payload.taken  := False
+    btbUpdateComb.payload.target := U(0, 32 bits)
+    btbUpdateComb.payload.brType := U(0, 2 bits)
     val btbUpdateFlow = Flow(BtbUpdate())
-    btbUpdateFlow.valid := False
-    btbUpdateFlow.payload.pc     := U(0, 32 bits)
-    btbUpdateFlow.payload.taken  := False
-    btbUpdateFlow.payload.target := U(0, 32 bits)
-    btbUpdateFlow.payload.brType := U(0, 2 bits)
+    btbUpdateFlow.valid   := RegNext(btbUpdateComb.valid) init False
+    btbUpdateFlow.payload := RegNext(btbUpdateComb.payload)
     btbUpdateFlow.simPublic()
     // ── Retire-time gshare PHT update output (GshareUpdateService, slice 3) ──────
     // Pulses the cycle a CONDITIONAL gshare-predicted branch retires (driven below near
     // branchRedirect). Concrete idle defaults so a standalone DUT (no GsharePlugin
     // consumer) elaborates; the GsharePlugin reads it in the full core. 11-bit index.
+    // Same registered-output treatment as btbUpdateFlow above (task #124).
+    val gshareUpdateComb = Flow(GshareUpdate(11))
+    gshareUpdateComb.valid := False
+    gshareUpdateComb.payload.index := U(0, 11 bits)
+    gshareUpdateComb.payload.taken := False
     val gshareUpdateFlow = Flow(GshareUpdate(11))
-    gshareUpdateFlow.valid := False
-    gshareUpdateFlow.payload.index := U(0, 11 bits)
-    gshareUpdateFlow.payload.taken := False
+    gshareUpdateFlow.valid   := RegNext(gshareUpdateComb.valid) init False
+    gshareUpdateFlow.payload := RegNext(gshareUpdateComb.payload)
     gshareUpdateFlow.simPublic()
     // mispredictStore MUST default False: a freshly-allocated branch entry is "not
     // yet known mispredicted" until its EU completion (branchCompletion) says so.
@@ -451,7 +465,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // the sibling DispatchPlugin DRIVES allocFireSig/allocUopVec/allocSlot1Sig
     // (do NOT default-drive them here — that would double-drive). allocReadySig /
     // robId1Sig are driven here (ROB produces them).
-    val allocReadySig = Bool(); allocReadySig := count <= (depth - 2)
+    // allocReadySig: forward-declared here, WIRED below (task #124, Fable audit F4) as
+    // a REGISTERED next-cycle predicate — mirrors the IssueQueue's readyReg pattern.
+    // The live combinational `count <= depth-2` comparator was a top-2 fanout net
+    // (5114 net) gating the whole rename->decode->fetch chain every cycle.
+    val allocReadySig = Bool()
     val allocFireSig  = Bool()                 // DRIVEN by DispatchPlugin
     val allocUopVec   = Vec(RenamedUop(), 2)   // DRIVEN by DispatchPlugin
     val allocSlot1Sig = Bool()                 // DRIVEN by DispatchPlugin
@@ -589,7 +607,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     head := head + Mux(retire1, U(2, robIdW bits), Mux(retire0, U(1, robIdW bits), U(0, robIdW bits)))
 
     // ── count update (alloc + retire) ──────────────────────────────────────────
-    count := count + allocThisCycle - retiredThisCycle
+    val countNext = count + allocThisCycle - retiredThisCycle
+    count := countNext
+    // allocReadySig: registered off countNext (no extra adder — reuses the SAME
+    // expression that drives count itself), so only the COMPARE result is a register
+    // instead of a live combinational `count <= depth-2` read every cycle. init True
+    // matches count=0 at reset. Overridden to True on a flush below (mirrors the
+    // IssueQueue readyReg pattern: count resets to 0 there too, always <= depth-2).
+    allocReadySig := RegNext(countNext <= (depth - 2)) init True
 
     // ── Commit-time mispredict redirect (REGISTERED pulse) ──────────────────────
     // When the retiring head is a mispredicting branch (retireAlone), register the
@@ -605,11 +630,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // with its captured PC/target/brType + resolved direction. ONLY at retire => no
     // wrong-path pollution (a squashed wrong-path branch never reaches retire).
     when(retire0 && btbIsBranchStore(h0)) {
-      btbUpdateFlow.valid         := True
-      btbUpdateFlow.payload.pc     := btbPcStore(h0)
-      btbUpdateFlow.payload.taken  := btbTakenStore(h0)
-      btbUpdateFlow.payload.target := btbTargetStore(h0)
-      btbUpdateFlow.payload.brType := btbTypeStore(h0)
+      btbUpdateComb.valid         := True
+      btbUpdateComb.payload.pc     := btbPcStore(h0)
+      btbUpdateComb.payload.taken  := btbTakenStore(h0)
+      btbUpdateComb.payload.target := btbTargetStore(h0)
+      btbUpdateComb.payload.brType := btbTypeStore(h0)
     }
     // ── Retire-time gshare PHT update (slice 3) ─────────────────────────────────
     // When a CONDITIONAL gshare-predicted branch retires at the head (retire0 — branches
@@ -618,9 +643,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // The carried fetch-time index (phtIndexStore) — not a retire-time recompute — is
     // mandatory (the speculative GHR has shifted by retire).
     when(retire0 && phtValidStore(h0)) {
-      gshareUpdateFlow.valid        := True
-      gshareUpdateFlow.payload.index := phtIndexStore(h0)
-      gshareUpdateFlow.payload.taken := btbTakenStore(h0)
+      gshareUpdateComb.valid        := True
+      gshareUpdateComb.payload.index := phtIndexStore(h0)
+      gshareUpdateComb.payload.taken := btbTakenStore(h0)
     }
 
     // ── Precise-fault exception-pending (combinational at faulted retire) ───────
@@ -811,6 +836,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     when(flushing) {
       tail  := head
       count := 0
+      // The ROB is empty next cycle (count=0 <= depth-2 always) — re-assert immediately
+      // rather than waiting a cycle for the RegNext(countNext<=...) path to catch up
+      // (countNext was computed off the PRE-flush count/alloc/retire this cycle).
+      allocReadySig := True
     }
     rc.flushPort := flushing
 
