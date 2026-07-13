@@ -161,12 +161,15 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // (s1aValid/s2Valid/s3Valid are the RegNext chain of `s1Valid && isSlow`, declared in
     // the SLOW PATH section below; forward-declared here as plain Bools and wired there.)
     // FMax #3 added the S1a stage (split stage1); FMax #4 added the S1b stage (split the
-    // bit-field forward-funnel -> modify cone), so the slow pipe is now S1/S1a/S1b/S2/S3.
+    // bit-field forward-funnel -> modify cone); task #123 added the S1a2 stage (split the
+    // bit-field modify's clz+mux from its rotate/shift half), so the slow pipe is now
+    // S1/S1a/S1a2/S1b/S2/S3.
     val s1aValid = Bool()
+    val s1a2Valid = Bool()
     val s1bValid = Bool()
     val s2Valid  = Bool()
     val s3Valid  = Bool()
-    issuePort.ready := !((s1Valid && isSlow) || s1aValid || s1bValid || s2Valid || s3Valid)
+    issuePort.ready := !((s1Valid && isSlow) || s1aValid || s1a2Valid || s1bValid || s2Valid || s3Valid)
 
     // ---- S1: FAST execute (ALU datapath; NO shifter, NO CCR-RMW on this cone) ----
     // ── ADDA/SUBA/CMPA "An-wide" marker: isMovea on a non-MOVE ALU op. The op runs
@@ -589,9 +592,24 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val s1aBfInvSrc1 = RegNext(s1Src1)        // lo/hi merge source (srcA = T0/T1)
     val s1aBfT2      = RegNext(s1RdB)          // LO5/HI5 res source (srcB = T2)
 
-    // S1a: the Bitfield datapath MODIFY (chg/clr/set/ins/ext/ffo) off the registered
-    // funnelled inputs. This is the second half of the split cone.
-    val bfRsp = Bitfield(s1aBfCmd)
+    // S1a: the Bitfield datapath rotate/shift/left-justify cone (task #123, Fable audit
+    // 2026-07-12 finding F1). This is the FIRST half of the (now further-split) modify
+    // cone — see Bitfield.stage1/stage2's doc comment. The clz + mask-modify + result
+    // mux (the deep half, 20 LUT levels combined with the rotates in the ORIGINAL
+    // single-cycle `Bitfield.apply`) now runs a cycle later in S1a2, off a REGISTERED
+    // BitfieldMid — mirroring the FMax#4 precedent that split the forward-funnel from
+    // the modify (S1 -> S1a) below.
+    val s1aBfMid = Bitfield.stage1(s1aBfCmd)
+    // ── S1a -> S1a2 CUT: register the rotate/shift midpoint + the OTHER S1a-registered
+    // inverse-funnel inputs (they must move in lockstep with bfMid, one more cycle). ──
+    val s1a2BfMid    = RegNext(s1aBfMid)
+    val s1a2BfStoreF1 = RegNext(s1aBfStoreF1)
+    val s1a2BfBitOff1 = RegNext(s1aBfBitOff1)
+    val s1a2BfInvSrc1 = RegNext(s1aBfInvSrc1)
+    val s1a2BfT2      = RegNext(s1aBfT2)
+
+    // S1a2: the clz + mask-modify + 8-way result/flag mux, off the REGISTERED midpoint.
+    val bfRsp = Bitfield.stage2(s1a2BfMid)
     // ── MEMORY bit-field RMW INVERSE FUNNEL (store-back, slice 3b) ───────────────
     // The RMW chains (BFCHG/BFCLR/BFSET/BFINS) route through the microcode engine; each
     // compute µop carries a bfStoreForm (DecodedUop): 0=RES, 1=LO4 (4-byte combined),
@@ -606,15 +624,15 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // bitOff) so it does NOT stack in series with the modify in one cone; for LO5/HI5 each
     // is its OWN µop (one funnel-depth, naturally shallow).
     // `res` driving the inverse funnel: LO4 (form 1) recomputes it inline from the funnel;
-    // LO5/HI5 (forms 2/3) read it from T2 (registered s1aBfT2). The lo/hi source for the
-    // merge = srcA (T0 for lo / T1 for hi) = registered s1aBfInvSrc1.
-    val bfInvResS1a = Mux(s1aBfStoreF1 === U(1, 2 bits), bfRsp.result, s1aBfT2)
-    val bfInvSrcS1a = s1aBfInvSrc1
-    // ── S1a -> S1b CUT: register the inverse-funnel inputs + the modify result/flags. ──
-    val s1bInvRes    = RegNext(bfInvResS1a)
-    val s1bInvSrc    = RegNext(bfInvSrcS1a)
-    val s1bBitOff    = RegNext(s1aBfBitOff1)
-    val s1bStoreForm = RegNext(s1aBfStoreF1)
+    // LO5/HI5 (forms 2/3) read it from T2 (registered s1a2BfT2). The lo/hi source for the
+    // merge = srcA (T0 for lo / T1 for hi) = registered s1a2BfInvSrc1.
+    val bfInvResS1a2 = Mux(s1a2BfStoreF1 === U(1, 2 bits), bfRsp.result, s1a2BfT2)
+    val bfInvSrcS1a2 = s1a2BfInvSrc1
+    // ── S1a2 -> S1b CUT: register the inverse-funnel inputs + the modify result/flags. ──
+    val s1bInvRes    = RegNext(bfInvResS1a2)
+    val s1bInvSrc    = RegNext(bfInvSrcS1a2)
+    val s1bBitOff    = RegNext(s1a2BfBitOff1)
+    val s1bStoreForm = RegNext(s1a2BfStoreF1)
     val s1bBfFunnelRes = RegNext(bfRsp.result)
     val s1bBfN       = RegNext(bfRsp.n)
     val s1bBfZ       = RegNext(bfRsp.z)
@@ -636,15 +654,23 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
       U(4, 3 bits) -> s1bLoStore,                          // LO5RAW (3c Do=1: bitOff from Dn[off])
       U(5, 3 bits) -> s1bHiStore.resize(32),               // HI5RAW (low byte)
       default      -> s1bBfFunnelRes)                      // 0 = RES / load-only
-    // ── S1a: stage1b (the deep variable shifts) off the registered amounts -> register
-    // the ShiftStage1 midpoint into S1b (the FMax#3 cut). FMax#4 added the S1b stage so
-    // the shift pipe stays lat-matched with the (now one cycle longer) bit-field pipe; the
-    // shift midpoint and ctx/src1 pass THROUGH S1b unmodified into S2. ──
-    val s1Stage1 = Shifter.stage1b(s1aStage1a)
-    s1bValid     := RegNext(s1aValid) init False
+    // ── S1a -> S1a2: pure pass-through for the shift/ctx/valid/src1 chain (no shifter
+    // computation here) — keeps the shift pipe lat-matched with the bit-field pipe's
+    // NEW S1a2 stage (task #123). ──
+    s1a2Valid      := RegNext(s1aValid) init False
+    val s1a2Stage1a = RegNext(s1aStage1a)
+    val s1a2Ctx    = RegNext(s1aCtx)
+    val s1a2Src1   = RegNext(s1aSrc1)
+    // ── S1a2: stage1b (the deep variable shifts) off the registered amounts -> register
+    // the ShiftStage1 midpoint into S1b (the FMax#3 cut). FMax#4 added the S1b stage, and
+    // task #123 added this S1a2 stage, so the shift pipe stays lat-matched with the (now
+    // two cycles longer) bit-field pipe; the shift midpoint and ctx/src1 pass THROUGH S1b
+    // unmodified into S2. ──
+    val s1Stage1 = Shifter.stage1b(s1a2Stage1a)
+    s1bValid     := RegNext(s1a2Valid) init False
     val s1bStage1 = RegNext(s1Stage1)
-    val s1bCtx    = RegNext(s1aCtx)
-    val s1bSrc1   = RegNext(s1aSrc1)
+    val s1bCtx    = RegNext(s1a2Ctx)
+    val s1bSrc1   = RegNext(s1a2Src1)
     // ── S1b -> S2: register the shift midpoint (pass-through) + the finished bit-field
     // result/flags (computed in S1b above), so a single S2/S3 stage serves both. ──
     s2Valid      := RegNext(s1bValid) init False
