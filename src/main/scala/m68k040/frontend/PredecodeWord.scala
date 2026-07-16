@@ -667,8 +667,23 @@ object PredecodeWord {
             r.lenWords := (U(1, 3 bits) + e).resized
           }
         } elsewhen(opmode =/= U(4, 3 bits) && opmode =/= U(5, 3 bits) && opmode =/= U(6, 3 bits) && !isMulDiv) {
+          // Task #140: OR/SUB/AND/ADD <ea>,Dn (opmode 0/1/2) AND their ADDA/SUBA
+          // <ea>,An variants (opmode 3/7) all admit an IMMEDIATE source EA on real
+          // 68k (identical semantics to ORI/SUBI/ANDI/ADDI, just the alternate
+          // encoding assemblers rarely emit) -- allowImm was wrongly False here,
+          // so predecode framed `adda.l #imm,An` (and the whole ADD/SUB/AND/OR/
+          // ADDA/SUBA-with-#imm-source family) as simple=false/lenWords=0. That
+          // starves the front-end (nextPc=pc, matches the documented "len=0 ->
+          // stall" class of predecode gaps) until it eventually decodes as
+          // whatever garbage bytes follow, which can misdecode as a genuine
+          // illegal-instruction opword -- a spurious vector-4 trap whose vector-
+          // fetch then reads an uninitialized table entry, landing PC at garbage.
+          // Root-caused via fuzz seed 13 (see
+          // eori-mem-then-adda-spurious-illegal-2026-07-16 memory); minimal repro
+          // is `adda.l #imm,An` completely standalone (no preceding instruction
+          // needed at all).
           val sizeL = (opmode === U(2, 3 bits)) || (opmode === U(7, 3 bits))
-          val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = false, eaW = extW, eaWKnown = extWKnown)
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = true, eaW = extW, eaWKnown = extWKnown)
           when(ok) {
             r.simple   := True
             r.lenWords := (U(1, 3 bits) + e).resized
@@ -730,8 +745,15 @@ object PredecodeWord {
         // extension words (mirrors the isAddxSubxReg||isBcdReg carve-out above).
         val isCmpm  = isEor && (srcMode === U(1, 3 bits))
         when(isCmp) {
+          // Task #140 follow-up: CMP/CMPA <ea>,Dn/An (opmode 0/1/2/3/7) admits an
+          // IMMEDIATE source EA on real 68k (same alternate-encoding legality as
+          // ADD/SUB/AND/OR/ADDA/SUBA, fixed for line 8/9/C/D above but this line-B
+          // block was never touched) -- allowImm was wrongly False here, so predecode
+          // framed `cmpa.l #imm,An` (and CMP #imm,Dn via this encoding) as
+          // simple=false/lenWords=0, the same front-end stall -> wild-PC cascade as
+          // task #140. Root-caused via fuzz seed=154 (cmpa.l #0x1,%a2).
           val sizeL = (opmode === U(2, 3 bits)) || (opmode === U(7, 3 bits))
-          val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = false, eaW = extW, eaWKnown = extWKnown)
+          val (ok, e) = eaExt(srcMode, srcReg, sizeL, allowImm = true, eaW = extW, eaWKnown = extWKnown)
           when(ok) {
             r.simple   := True
             r.lenWords := (U(1, 3 bits) + e).resized
