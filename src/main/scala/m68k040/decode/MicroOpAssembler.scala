@@ -1102,6 +1102,14 @@ object MicroOpAssembler {
     // stack-frame ops cracked below (NOT illegal). op[15:4]==0x4E5, op[3] selects.
     val isLinkOp = (op(15 downto 4) === B"12'h4E5") && !op(3)
     val isUnlkOp = (op(15 downto 4) === B"12'h4E5") &&  op(3)
+    // LINK An,#disp32 (68020+, 0100 1000 0000 1 aaa, op[15:3]==0x901): the 32-bit-
+    // displacement sibling of LINK.W above, distinct opcode region — cracked below with
+    // the SAME machinery (linkPush/linkA7/linkAnU), just a wider displacement read from
+    // words(1)##words(2) instead of a sign-extended words(1). Ported-tests triage
+    // (link_long_unlk.s): previously entirely unhandled (fell through to `bad` ->
+    // illegal vector 4, and with no vector-4 handler installed in the bare-metal test
+    // harness the resulting fault cascade hung rather than trapped cleanly).
+    val isLinkLOp = op(15 downto 3) === B(0x901, 13 bits)
     // EXG (line C, bit8=1, opmode in {01000,01001,10001}): a reg-reg swap cracked below
     // into 3 MOVE µops. Its opmode lands in the AND-RMW band (5/6) with a reg-direct EA,
     // which aluRmwMemBad would illegalise -> exclude from `bad` (mirror !isRtrBad).
@@ -1159,7 +1167,7 @@ object MicroOpAssembler {
     // bfDynamic]) below. There are no truly-illegal register-form Do/Dw combos. The
     // memory-operand forms (mode!=0) stay illegal via OperationDecoder (spec.illegal).
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isTrapccOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
-              !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isUnlkOp && !isExgOp &&
+              !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isLinkLOp && !isUnlkOp && !isExgOp &&
               !isLeaOp && !isPeaOp && !isMoveFromSrOp && !isMoveFromCcrOp && !isMoveToCcrOp &&
               !isSysOp && !isRtdBad && !isCmp2Chk2Enc && !isBfMemSpec &&
               (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || limmFullFmtDstBad || addqMemBad || sccMemBad ||
@@ -2180,7 +2188,10 @@ object MicroOpAssembler {
     // The intermediate A7-fold ALU µop sets `divIsRem` — reused as the generic ALU
     // crack-DROP marker (its A7 write still folds; the ALU EU surfaces it as wbObs.divRem).
     val linkAn  = (U(8, 5 bits) + op(2 downto 0).asUInt).resized
-    val linkDisp = pkt.words(1).asSInt.resize(32)                    // sext(disp16)
+    // LINK.W: sext(disp16) = words(1). LINK.L (isLinkLOp): the full 32-bit disp32 =
+    // words(1)##words(2) (no sign-extension needed, already 32 bits).
+    val linkDisp = Mux(isLinkLOp, (pkt.words(1) ## pkt.words(2)).asSInt,
+                                  pkt.words(1).asSInt.resize(32))
     val negDisp  = (-linkDisp).asBits                                // -disp (for An:=A7-disp)
 
     // ADD-class crack µop (LONG, no flags): dst := srcA + imm. `drop` marks it a dropped
@@ -2478,8 +2489,10 @@ object MicroOpAssembler {
       out.uops(0) := rtrCcr
       out.uops(1) := rtrPc
       out.uops(2) := rtrBranch
-    } elsewhen(isLinkOp) {
-      // LINK -> [stkPush store dst=An, push old An] + [A7 := A7+disp (drop)] + [An := A7-disp (kept)].
+    } elsewhen(isLinkOp || isLinkLOp) {
+      // LINK(.W disp16 / .L disp32) -> [stkPush store dst=An, push old An] +
+      // [A7 := A7+disp (drop)] + [An := A7-disp (kept)]. Same crack for both forms —
+      // linkDisp above already picks the right width/source words.
       out.count   := 3
       out.uops(0) := linkPush
       out.uops(1) := linkA7

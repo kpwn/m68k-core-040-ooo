@@ -388,6 +388,15 @@ object PredecodeWord {
         val isUnlk = (op(15 downto 4) === B"12'h4E5") &&  op(3)
         when(isLink) { r.simple := True; r.lenWords := U(2, 4 bits) }
         when(isUnlk) { r.simple := True; r.lenWords := U(1, 4 bits) }
+        // LINK An,#disp32 (68020+, 0100 1000 0000 1 aaa, op[15:3]==0x901): opword + a
+        // disp32 (2-word) extension -> SIMPLE len 3. Distinct opcode region from LINK.W/
+        // UNLK (0x4E5x) above -- ported-tests triage (link_long_unlk.s), previously
+        // entirely unhandled here (fell through to the illegal/complex default, framing
+        // 0 extra words and desyncing the next fetch -- the eventual observed symptom was
+        // a HANG, not a trap, since the wild PC/illegal cascade never reaches a sentinel
+        // write in this bare-metal harness).
+        val isLinkL = op(15 downto 3) === B(0x901, 13 bits)
+        when(isLinkL) { r.simple := True; r.lenWords := U(3, 4 bits) }
         // ── Privileged commit-time SYSTEM ops (frame the length so nextPc is right) ─
         // MOVE to SR (0100 0110 11 mmmrrr): opword + the source EA's ext words (the
         // EA is a .W source). MOVE USP (0100 1110 0110 d rrr = 0x4E6x): single word.
