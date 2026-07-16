@@ -210,16 +210,24 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // robId; the queue drains at that robId's commit (same retire port as the SQ)
     // and discards on flush.
     val dtlb = host[m68k040.mmu.DtlbPlugin]
-    // Drive the ONE shared MMU control from registered synth-top inputs: (a) so they
-    // are not UNASSIGNED (clean elaboration — sim-poked / future-MOVEC-driven, no RTL
-    // driver otherwise), and (b) so OOC synth cannot const-fold mmuEnable to its init
+    // Drive the ONE shared MMU control from registered synth-top inputs: (a) so
+    // they are not UNASSIGNED (clean elaboration — sim-poked only, no RTL driver
+    // otherwise), and (b) so OOC synth cannot const-fold mmuEnable to its init
     // (False) and prune the DTLB/ITLB/walkers — the gate must measure the MMU
     // translate path (BOTH TLBs + both walkers) in the netlist.
+    // RESTORED 2026-07-16 (task #131 revert): a MOVEC-driven write path was
+    // attempted here (removing the need for this override, since MOVEC would be a
+    // real, non-constant-foldable driver) but was REVERTED after it broke sim-poke
+    // persistence on these same regs — see MmuControlPlugin's doc comment. mmuEnable/
+    // urp/srp are back to sim-poke-only, so this override is needed again (now TWO
+    // root-pointer inputs, urp+srp, instead of the old single rootPtr).
     val mmuCtrl = host[m68k040.services.MmuControlService]
     val mmuEnableIn = in Bool ()
-    val rootPtrIn   = in UInt (32 bits)
+    val urpIn       = in UInt (32 bits)
+    val srpIn       = in UInt (32 bits)
     mmuCtrl.mmuEnable := RegNext(mmuEnableIn) init False
-    mmuCtrl.rootPtr   := RegNext(rootPtrIn) init 0
+    mmuCtrl.urp       := RegNext(urpIn) init 0
+    mmuCtrl.srp       := RegNext(srpIn) init 0
     // ── Interrupt inputs (simple protocol) from REGISTERED OOC inputs ──
     // Mirror the mmuEnable/rootPtr pattern: drive the InterruptControlPlugin's regs
     // from RegNext(in...) init 0 so the IPL-compare + vector-select cone is LIVE in
