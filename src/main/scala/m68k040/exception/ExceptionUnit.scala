@@ -153,6 +153,24 @@ class ExceptionUnit(
   val curFault = Reg(UInt(32 bits))   // faulting VA (EA + fault-address fields of $7)
   val curSsw   = Reg(UInt(16 bits))   // $7 special status word
 
+  // ── Task #132: interrupt-with-M=1 throwaway frame (format-$1, Slice B) ──────────
+  // Real 68040 semantics (Musashi m68ki_exception_interrupt, m68kcpu.h:2226-2235):
+  // an INTERRUPT taken while M=1 stacks a NORMAL format-$0 frame on the CURRENT
+  // active stack (MSP, since M hasn't been cleared yet), THEN clears M (rebanking
+  // to ISP) and stacks a SECOND, format-$1 "throwaway" frame — same {PC,SR,vector}
+  // content, just a different format nibble — on the NOW-active ISP. The handler
+  // runs on ISP with M=0. RTE reads the throwaway frame first: it applies the
+  // frame's SR (which still carries M=1, so A7 re-banks BACK to MSP) and DISCARDS
+  // the frame's PC, then — still within the SAME rte instruction — re-reads the
+  // format word now sitting at the top of MSP (the real format-$0 frame) and pops
+  // THAT one for real (PC used, final SR applied). Net effect: both stacks end up
+  // back at their pre-entry depth; only ONE observable commit (the final pop).
+  // curThrowaway/frameBase2/stFrame2 are the ENTRY-side bookkeeping; the RTE side
+  // needs no extra state — `popIs1` (mirrors popIs7/popIs2) drives the loop-back.
+  val curThrowaway = RegInit(False)   // this INTERRUPT entry needs a $1 throwaway frame
+  val frameBase2   = Reg(UInt(32 bits))   // ISP-relative base for the $1 frame (entry only)
+  val stFrame2     = RegInit(False)       // E_STORE loop is currently on the 2nd ($1) frame
+
   // ── Commit-time SYSTEM op captured state (latched at sysTrigger) ─────────────
   val sysCapKind    = Reg(UInt(3 bits))
   val sysCapReadDir = Reg(Bool())
@@ -174,6 +192,11 @@ class ExceptionUnit(
   // bytes and resumes at the stacked PC (= the next instruction; TRAPV is not
   // restarted), discarding the format word + PPC. Matches Musashi RTE case 2.
   val popIs2 = RegInit(False); popIs2.simPublic()
+  // format-$1 (top nibble 1, task #132): the M=1-interrupt throwaway frame. RTE
+  // applies its SR (re-banking back to MSP, M restored to 1) and DISCARDS its PC,
+  // then loops back to pop the REAL format-$0 frame now at the top of MSP — see
+  // R_REDIR. Musashi: m68k_in.c rte's `case 1: /* Throwaway */ ... goto rte_loop`.
+  val popIs1 = RegInit(False); popIs1.simPublic()
   val popFmtWord = Reg(UInt(16 bits)); popFmtWord.simPublic()
 
   // ── redirect outputs (the ROB ORs these into its registered redirect) ────────
@@ -323,13 +346,21 @@ class ExceptionUnit(
   //     [+0x14]=faultAddr hi [+0x16]=faultAddr lo [+0x18..0x3a]=0 (18 words).
   //   stStep counts WORDS (5 bits, 0..29). lastStep = 3 ($0) or 29 ($7).
   val stStep = Reg(UInt(5 bits)) init 0; stStep.simPublic()
+  // lastStep: curIs7/curIs2 are always False for an interrupt entry (never $7/$2),
+  // so this already correctly reads 4 words (U(3)) for BOTH passes of a throwaway
+  // entry (frame $0 then frame $1, each 8 bytes) — no stFrame2 dependency needed.
   val lastStep = Mux(curIs7, U(29, 5 bits), Mux(curIs2, U(5, 5 bits), U(3, 5 bits)))
-  def frameWordAddr(step: UInt): UInt = (frameBase + (step << 1)).resized
+  // Task #132: while stacking the 2nd (throwaway) frame, address off frameBase2
+  // (ISP-relative) instead of frameBase (MSP-relative).
+  def frameWordAddr(step: UInt): UInt = (Mux(stFrame2, frameBase2, frameBase) + (step << 1)).resized
   // Common low-4-word prefix: SR, PC hi, PC lo, format/vector word. The format/vector
-  // word is curVec<<2 for $0, 0x2000|(curVec<<2) for $2, 0x7000|(curVec<<2) for $7.
-  val fmtVecWord = Mux(curIs7, (U(0x7000, 16 bits) | (curVec << 2).resize(16)),
+  // word is curVec<<2 for $0, 0x2000|(curVec<<2) for $2, 0x7000|(curVec<<2) for $7,
+  // 0x1000|(curVec<<2) for the $1 throwaway frame (task #132; stFrame2 selects it —
+  // curIs7/curIs2 are already False for any interrupt, so no conflict with those).
+  val fmtVecWord = Mux(stFrame2,        (U(0x1000, 16 bits) | (curVec << 2).resize(16)),
+                   Mux(curIs7, (U(0x7000, 16 bits) | (curVec << 2).resize(16)),
                    Mux(curIs2, (U(0x2000, 16 bits) | (curVec << 2).resize(16)),
-                               (curVec << 2).resize(16)))
+                               (curVec << 2).resize(16))))
   def frameWordData(step: UInt): Bits = {
     val out = Bits(16 bits)
     out := B(0, 16 bits)
@@ -425,6 +456,12 @@ class ExceptionUnit(
         val supSp = Mux(ss.m, ss.msp, ss.isp)
         val nb = Mux(is7, supSp - 60, Mux(is2, supSp - 12, supSp - 8))
         frameBase := nb
+        // Task #132: an INTERRUPT taken while M=1 needs the format-$1 throwaway
+        // frame. ss.m itself has no readback lag (it's a plain srSys bit, unlike
+        // ss.msp/ss.isp which mirror the committed-A7 PRF readback with settle
+        // latency) — safe to read live here, same as is7/is2 above.
+        curThrowaway := entryIsInterrupt && ss.m
+        stFrame2     := False
         // compute vector fetch base = VBR + vec*4
         vecTarget := (ss.vbr + (entryVector << 2)).resized
         stStep    := 0
@@ -458,6 +495,12 @@ class ExceptionUnit(
         // (format-$0 = 8, format-$2 = 12, format-$7 = 60 bytes).
         val supSp = Mux(ss.m, ss.msp, ss.isp)
         frameBase := Mux(curIs7, supSp - 60, Mux(curIs2, supSp - 12, supSp - 8))
+        // Task #132: the throwaway ($1) frame's base — settled ISP minus 8 bytes.
+        // ss.m is True here (curThrowaway only set when it was), so ss.isp is
+        // exactly the bank that will become active once M clears — same settle
+        // treatment as frameBase above (read from the settled bank at E_DRAIN, not
+        // the possibly-stale IDLE-time snapshot).
+        frameBase2 := ss.isp - 8
         goto(E_STORE)
       }
     }
@@ -485,7 +528,17 @@ class ExceptionUnit(
       // stAwDone/stWDone) could drop a beat. One idle cycle guarantees the machine
       // is idle before the next store.
       when(dcStoreAck) {
-        when(stStep === lastStep) { goto(E_VECREQ) } otherwise { stStep := stStep + 1; goto(E_STORE) }
+        when(stStep === lastStep) {
+          // Task #132: after finishing frame $0 (stFrame2 still False), a throwaway
+          // entry loops back into E_STORE for the SECOND ($1) frame instead of
+          // proceeding to the vector fetch. frameWordAddr/fmtVecWord above already
+          // switch to frameBase2/format-1 once stFrame2 is True.
+          when(curThrowaway && !stFrame2) {
+            stFrame2 := True; stStep := 0; goto(E_STORE)
+          } otherwise {
+            goto(E_VECREQ)
+          }
+        } otherwise { stStep := stStep + 1; goto(E_STORE) }
       }
     }
     // ── ENTRY: fetch the handler vector ─────────────────────────────────────────
@@ -506,14 +559,23 @@ class ExceptionUnit(
       // commit the architectural side-effects + redirect
       // NB: ss.writeA7 (live readback) also fires every cycle, but setIsp/setMsp here
       // WIN by SystemState's later-when ordering — this serializing SP write is authoritative.
-      when(ss.m) { ss.setMsp.valid := True; ss.setMsp.payload := frameBase }
+      // Task #132: a throwaway entry stacked to BOTH banks (frame $0 -> MSP, frame $1
+      // -> ISP) — write BOTH, not just the (single, old-ss.m-selected) bank the
+      // non-throwaway path uses.
+      when(curThrowaway) {
+        ss.setMsp.valid := True; ss.setMsp.payload := frameBase
+        ss.setIsp.valid := True; ss.setIsp.payload := frameBase2
+      } .elsewhen(ss.m) { ss.setMsp.valid := True; ss.setMsp.payload := frameBase }
       .otherwise { ss.setIsp.valid := True; ss.setIsp.payload := frameBase }
       // enter supervisor, clear trace: set S (bit5), clear T1/T0 (bits 7,6).
       // For an INTERRUPT entry ALSO raise the SR I-mask (bits 2:0) to the interrupt
       // level so equal/lower interrupts are held until RTE (NMI sets 7); fault/trap
       // entries leave the mask unchanged. (newSysBase clears S/T only; the mask bits
       // 2:0 are preserved for faults, overwritten with curLevel for interrupts.)
-      val newSysBase = (ss.srSys | U(0x20, 8 bits)) & U(0x3f, 8 bits)
+      // Task #132: a throwaway entry ALSO clears M (bit4) here — the handler runs
+      // on ISP with M=0; M=1 only comes back when RTE re-pops the $1 frame's SR.
+      val keepMask = Mux(curThrowaway, U(0x2f, 8 bits), U(0x3f, 8 bits))
+      val newSysBase = (ss.srSys | U(0x20, 8 bits)) & keepMask
       val newSys = Mux(curIsInt,
                        (newSysBase & U(0xf8, 8 bits)) | curLevel.resize(8),
                        newSysBase)
@@ -522,12 +584,14 @@ class ExceptionUnit(
       redirectPc    := vecTarget
       // commit observation: the faulting instruction's trace step == handler entry
       // with the post-exception SR system byte (S set, T cleared) + A7 = new SSP.
-      // (CCR is unchanged by the exception -> the whitebox carries it.)
+      // (CCR is unchanged by the exception -> the whitebox carries it.) For a
+      // throwaway entry the HANDLER runs on ISP (M now 0), so obsA7 = frameBase2
+      // (the new ISP), not frameBase (the now-inactive MSP result).
       obsFire    := True
       obsIsEntry := True
       obsPc      := vecTarget
       obsSysByte := newSys
-      obsA7      := frameBase
+      obsA7      := Mux(curThrowaway, frameBase2, frameBase)
       obsIsInterrupt := curIsInt
       goto(IDLE)
     }
@@ -567,42 +631,67 @@ class ExceptionUnit(
       dtoVld := True; dtoVpn := (frameBase + 6)(31 downto 12)
       when(dcLoadRsp.valid) {
         // top nibble selects the pop size: 7 => format-$7 (60 bytes), 2 => format-$2
-        // (12 bytes), else format-$0 (8 bytes).
+        // (12 bytes), 1 => format-$1 throwaway (task #132, see below), else format-$0
+        // (8 bytes).
         popFmtWord := dcLoadRsp.payload.data(15 downto 0).asUInt
         popIs7 := dcLoadRsp.payload.data(15 downto 12).asUInt === U(7, 4 bits)
         popIs2 := dcLoadRsp.payload.data(15 downto 12).asUInt === U(2, 4 bits)
+        popIs1 := dcLoadRsp.payload.data(15 downto 12).asUInt === U(1, 4 bits)
         goto(R_REDIR)
       }
     }
     R_REDIR.whenIsActive {
-      // restore the full SR (system byte). A7 banks automatically by the new S.
+      // restore the SR (system byte) — same mechanism for BOTH the throwaway ($1)
+      // pop and the real pop; only WHICH bytes were popped / what happens next differs.
       ss.setSrSys.valid := True; ss.setSrSys.payload := popSr(15 downto 8)
-      // SSP += frame size (8 for $0, 60 for $7). The CURRENT A7 is SSP (we were
-      // supervisor); after restoring SR the bank may switch to USP, so write SSP
-      // explicitly. For $7 the popPc is the faulting instruction's PC -> RTE resumes
-      // by RE-EXECUTING it (the handler has fixed the mapping), matching MAME.
-      val newSsp = frameBase + Mux(popIs7, U(60, 32 bits), Mux(popIs2, U(12, 32 bits), U(8, 32 bits)))
-      when(ss.m) { ss.setMsp.valid := True; ss.setMsp.payload := newSsp }
-      .otherwise { ss.setIsp.valid := True; ss.setIsp.payload := newSsp }
-      redirectValid := True
-      redirectPc    := popPc
-      // commit observation: RTE's trace step == restored PC + restored SR sysByte
-      // + A7. A7 after RTE = popped-SSP if S restored supervisor, else USP. The CCR
-      // is restored from the frame too, but the whitebox carries it (RTE restores
-      // the same CCR the matching exception entry saved -> reconstructed CCR holds).
-      obsFire    := True
-      obsPc      := popPc
-      obsSysByte := popSr(15 downto 8)
-      // A7 after RTE = restored-(S,M) bank. popSr(13)=S, popSr(12)=M. For Slice A
-      // (fault/trap), M is unchanged so the popped bank == the restored supervisor bank
-      // and obsA7 resolves to Mux(S, newSsp, usp) — identical to the old behavior.
-      // The poppedSameBank==False branch (an RTE that CHANGES M, reading rsupBank) is
-      // defensive for a later slice and is UNVALIDATED in Slice A — no in-scope RTE flips
-      // M. It also reads the shadow banks (see the SETTLE CAVEAT above). Slice-B territory.
-      val poppedSameBank = (popSr(12) === ss.m)
-      val rsupBank = Mux(popSr(12), ss.msp, ss.isp)
-      obsA7 := Mux(popSr(13), Mux(poppedSameBank, newSsp, rsupBank), ss.usp)
-      goto(IDLE)
+      when(popIs1) {
+        // Task #132: this was the format-$1 THROWAWAY frame — its PC is discarded
+        // (Musashi: m68ki_fake_pull_32 for the PC). Its SR still carries M=1 (it was
+        // captured before M was cleared at entry), so applying it re-banks A7 back
+        // to MSP. Reclaim the frame's 8 bytes on the CURRENT (ISP) bank — we are
+        // guaranteed supervisor here (RTE only runs at S=1) and M was 0 while the
+        // handler ran, so ISP was the active bank; frameBase is exactly where THIS
+        // frame was popped from. Do NOT redirect / do NOT fire an obs — this is not
+        // a real completion yet (Musashi's `goto rte_loop`, still inside ONE rte
+        // instruction). Re-read ss.msp: it was untouched since entry (only ISP/M
+        // moved while M=0), so it is exactly frame $0's base — loop back to pop it.
+        ss.setIsp.valid := True; ss.setIsp.payload := frameBase + 8
+        frameBase := ss.msp
+        goto(R_SRREQ)
+      } .otherwise {
+        // SSP += frame size (8 for $0/$1, 12 for $2, 60 for $7). The CURRENT A7 is
+        // SSP (we were supervisor); after restoring SR the bank may switch to USP, so
+        // write SSP explicitly. For $7 the popPc is the faulting instruction's PC ->
+        // RTE resumes by RE-EXECUTING it (the handler has fixed the mapping), matching
+        // MAME. For a throwaway's SECOND (real, format-$0) pop, popIs1 is False here
+        // (this frame's own format nibble is 0) — the bank write below correctly
+        // targets ss.m, which by this point already reads True (the throwaway pass's
+        // setSrSys landed a cycle ago, restoring M=1) — same code path as any other
+        // format-$0 RTE, no throwaway-specific branch needed.
+        val newSsp = frameBase + Mux(popIs7, U(60, 32 bits), Mux(popIs2, U(12, 32 bits), U(8, 32 bits)))
+        when(ss.m) { ss.setMsp.valid := True; ss.setMsp.payload := newSsp }
+        .otherwise { ss.setIsp.valid := True; ss.setIsp.payload := newSsp }
+        redirectValid := True
+        redirectPc    := popPc
+        // commit observation: RTE's trace step == restored PC + restored SR sysByte
+        // + A7. A7 after RTE = popped-SSP if S restored supervisor, else USP. The CCR
+        // is restored from the frame too, but the whitebox carries it (RTE restores
+        // the same CCR the matching exception entry saved -> reconstructed CCR holds).
+        obsFire    := True
+        obsPc      := popPc
+        obsSysByte := popSr(15 downto 8)
+        // A7 after RTE = restored-(S,M) bank. popSr(13)=S, popSr(12)=M. For a plain
+        // (non-throwaway) format-$0/$2/$7 RTE, M is unchanged so the popped bank ==
+        // the restored supervisor bank and obsA7 resolves to Mux(S, newSsp, usp) —
+        // identical to the old (pre-#132) behavior. For a throwaway's SECOND pop,
+        // popSr(12) is again M=1 (frame $0's own captured SR) and ss.m already reads
+        // True (set by the first pass), so poppedSameBank is True and obsA7 = newSsp
+        // (the fully-unwound MSP) — correct, matches the "final A7==MSP_TOP" spec.
+        val poppedSameBank = (popSr(12) === ss.m)
+        val rsupBank = Mux(popSr(12), ss.msp, ss.isp)
+        obsA7 := Mux(popSr(13), Mux(poppedSameBank, newSsp, rsupBank), ss.usp)
+        goto(IDLE)
+      }
     }
 
     // ── Commit-time SYSTEM op: APPLY the effect to committed state (1 cycle) ──────
