@@ -812,6 +812,16 @@ object PredecodeWord {
         }
       }
 
+      // Line-1010 ("Line-A") / Line-1111 ("Line-F") emulator traps: real 68040 hardware
+      // raises vector 10 / vector 11 unconditionally on the top nibble alone, with NO
+      // further decode of the rest of the opword (unimplemented FPU ops land here on
+      // real F-line hardware too, since this core has no FPU) -> SIMPLE single-word,
+      // no extension words consumed. See OperationDecoder (spec.illegal stays default
+      // True for these lines) + MicroOpAssembler's `bad` fallback, which picks vector
+      // 10/11 instead of the generic vector 4 based on this same top-nibble check.
+      is(U(0xA, 4 bits)) { r.simple := True; r.lenWords := U(1, 4 bits) }
+      is(U(0xF, 4 bits)) { r.simple := True; r.lenWords := U(1, 4 bits) }
+
       default { /* complex: r stays simple=False, lenWords=0 */ }
     }
     r

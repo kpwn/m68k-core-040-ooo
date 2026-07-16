@@ -839,6 +839,42 @@ object OperationDecoder {
           }
         }
       }
+
+      // ── CPUSH (line-1111, top byte 0xF4: 1111 0100 ss CCC Ann): privileged cache
+      // push/invalidate. Real encoding: bit11=0,bit10=1,bit9=0,bit8=0 (bits7:6=scope,
+      // 5:3=cache selector, 2:0=An — all ignored, no cache hierarchy modeled here). A
+      // COMMIT-TIME SYSTEM op, same "no real effect" treatment as RESET: it serializes
+      // + advances PC; S=0 -> vector-8. (PFLUSH/PFLUSHA live in the adjacent 0xF5xx
+      // range, bit8=1 — see the PFLUSHA arm below.) Everything else under line-F stays
+      // illegal (falls to illegalDefault, vector 11, via MicroOpAssembler's top-nibble
+      // faultVector select).
+      is(0xF) {
+        val isCpush = !opword(11) && opword(10) && !opword(9) && !opword(8)
+        when(isCpush) {
+          o.illegal := False
+          o.op := DecOp.MOVE
+          o.size := Size.LONG
+          o.sysOp := True
+          o.sysKind := SysKind.CPUSH
+          o.sysReadDir := False
+          o.dst.setNone(); o.dstWrites := False
+        }
+        // ── PFLUSHA (0xF518 exactly, verified via GNU-as's own `pflusha` disassembly):
+        // privileged "flush ALL ATC/TLB entries, both address spaces". A REAL effect
+        // (unlike CPUSH/RESET) — a COMMIT-TIME SYSTEM op that pulses a flushAll signal
+        // consumed by DtlbPlugin/ItlbPlugin (see ExceptionUnit's S_APPLY + the top-level
+        // wiring). S=0 -> vector-8. Selective PFLUSH (FC/mask/EA-qualified) and
+        // PFLUSHAN/PFLUSHN stay illegal/deferred — only this exact opword is in scope.
+        when(opword === B"16'hF518") {
+          o.illegal := False
+          o.op := DecOp.MOVE
+          o.size := Size.LONG
+          o.sysOp := True
+          o.sysKind := SysKind.PFLUSHA
+          o.sysReadDir := False
+          o.dst.setNone(); o.dstWrites := False
+        }
+      }
     }
     o
   }

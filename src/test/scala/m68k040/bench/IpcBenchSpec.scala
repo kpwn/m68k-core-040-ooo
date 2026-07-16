@@ -130,6 +130,8 @@ class IpcBenchSpec extends AnyFunSuite {
       itlb.umCommitBId    := rob.logic.h1
       itlb.umCommitId    := rob.logic.h0
       itlb.umFlush       := host[RedirectService].doFlush
+      dtlb.flushAll      := rob.logic.exc.sysFlushAllValid
+      itlb.flushAll      := rob.logic.exc.sysFlushAllValid
 
       val doFlush = host[RedirectService].doFlush
       val flushPc = host[RedirectService].flushPc

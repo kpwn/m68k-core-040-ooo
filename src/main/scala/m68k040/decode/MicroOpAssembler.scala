@@ -1201,10 +1201,18 @@ object MicroOpAssembler {
       opUop.unimplemented := True
       opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
       opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
-      // Illegal instruction -> precise fault, vector 4. The op µop retires as the
-      // faulting head; the exception FSM stacks the frame + vectors.
+      // Illegal instruction -> precise fault. Line-1010/Line-1111 ("Line-A"/"Line-F")
+      // opcodes get their own dedicated vectors (10/11) per real 68040 hardware (Musashi
+      // m68kcpu.h: opword top nibble 0xA/0xF traps unconditionally, distinct from the
+      // generic vector-4 illegal-instruction path); everything else illegal is vector 4.
+      // The op µop retires as the faulting head; the exception FSM stacks the frame +
+      // vectors (both land in the generic short format-$0 frame, same as vector 4/8).
       opUop.faulted     := True
-      opUop.faultVector := 4
+      opUop.faultVector := (op(15 downto 12).asUInt).mux(
+        U(0xA, 4 bits) -> U(10, 8 bits),
+        U(0xF, 4 bits) -> U(11, 8 bits),
+        default        -> U(4, 8 bits)
+      )
     }
     // ── ANDI/ORI/EORI #imm,CCR: a CCR read-modify-write op µop (ALU cluster) ─────
     // The base opUop already carries op = AND/OR/EOR + useImm/imm = the imm byte (via
@@ -1377,6 +1385,18 @@ object MicroOpAssembler {
         opUop.srcAValid := False; opUop.srcBValid := False; opUop.dstValid := False
         opUop.useImm := True
         opUop.imm := pkt.words(1).asUInt.resize(32).asBits   // imm16 -> new SR (zero-ext)
+      }
+      // CPUSH: no cache hierarchy modeled -> same "no real effect" treatment as RESET.
+      // The An/scope/cache-selector bits are read by nothing; clear all operands.
+      when(spec.sysKind === SysKind.CPUSH) {
+        opUop.srcAValid := False; opUop.srcBValid := False; opUop.dstValid := False
+        opUop.useImm := False
+      }
+      // PFLUSHA: no operands (opword-only), the flushAll pulse fires from S_APPLY
+      // regardless of any register content.
+      when(spec.sysKind === SysKind.PFLUSHA) {
+        opUop.srcAValid := False; opUop.srcBValid := False; opUop.dstValid := False
+        opUop.useImm := False
       }
     }
     when(isTrapOp) {

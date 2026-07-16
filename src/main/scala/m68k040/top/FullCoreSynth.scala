@@ -256,6 +256,10 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     itlb.umCommitBId    := rob.logic.h1
     itlb.umCommitId    := rob.logic.h0
     itlb.umFlush       := doFlush
+    // PFLUSHA (task #136): the commit-time flush-all pulse reaches both TLBs the same
+    // way umFlush does — direct top-level fan-out, no service round-trip.
+    dtlb.flushAll      := rob.logic.exc.sysFlushAllValid
+    itlb.flushAll      := rob.logic.exc.sysFlushAllValid
     // The D-cache's `axi` is declared master() inside its plugin and surfaces as a
     // top-level IO automatically (like the I-cache's), so no extra wiring needed.
 

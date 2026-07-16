@@ -113,7 +113,18 @@ object SysKind extends SpinalEnum {
       // STOP (0x4E72) + imm16: privileged; SR := imm16 (reuses the MOVE-to-SR SR-write +
       // banking) then HALT until an interrupt with level > the new I-mask. SR write is the
       // S_APPLY path; the halt is the ROB `stopped` state. S=0 -> vector 8.
-      STOP          // (RESET=4, STOP=5 — needs the 3-bit FSM ctx widened in T0.)
+      STOP,         // (RESET=4, STOP=5 — needs the 3-bit FSM ctx widened in T0.)
+      // CPUSH (line-1111, 1111 0100 1ss CCC Ann): privileged cache-push/invalidate.
+      // Architecturally a NOP here (no cache hierarchy modeled) — same treatment as
+      // RESET, just its own named kind for clarity. S=0 -> vector 8.
+      CPUSH,
+      // PFLUSHA (line-1111, 0xF518): privileged "flush all ATC/TLB entries". A REAL
+      // effect (unlike CPUSH/RESET) — pulses a flushAll signal that both DtlbPlugin and
+      // ItlbPlugin clear their TLB + walk-result latch on, mirroring the existing
+      // umFlush top-level fan-out pattern. S=0 -> vector 8. (value 7 — last slot in the
+      // current 3-bit sysKind field; a further addition needs a width bump, see task
+      // #136 for the deferred selective-PFLUSH/PFLUSHN forms.)
+      PFLUSHA
       = newElement()
 }
 

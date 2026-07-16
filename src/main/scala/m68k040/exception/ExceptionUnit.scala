@@ -224,6 +224,10 @@ class ExceptionUnit(
   val sysRegWriteValid = Bool();        sysRegWriteValid := False;        sysRegWriteValid.simPublic()
   val sysRegWritePhys  = UInt(6 bits);  sysRegWritePhys  := U(0, 6 bits);  sysRegWritePhys.simPublic()
   val sysRegWriteData  = UInt(32 bits); sysRegWriteData  := U(0, 32 bits); sysRegWriteData.simPublic()
+  // PFLUSHA: a 1-cycle pulse consumed by DtlbPlugin/ItlbPlugin's `flushAll` port (mirrors
+  // the existing `umFlush` top-level fan-out — see FullCoreSynth.scala/the test DUTs).
+  // Only PFLUSHA drives this (S_APPLY sysCapKind=7); everything else leaves it False.
+  val sysFlushAllValid = Bool();        sysFlushAllValid := False;        sysFlushAllValid.simPublic()
 
   // ── SystemState write defaults (the FSM pulses them) ────────────────────────
   ss.setSrSys.valid := False; ss.setSrSys.payload := U(0, 8 bits)
@@ -669,6 +673,14 @@ class ExceptionUnit(
           // new I-mask), CCR = sysVal[4:0]. A7 re-banks on an S flip (S_REDIR via ss.a7).
           // The HALT itself is the ROB `stopped` state (set on the STOP sysRetire).
           ss.setSrSys.valid := True; ss.setSrSys.payload := sysCapVal(15 downto 8).asUInt
+        }
+        is(U(6, 3 bits)) {                          // CPUSH : no cache hierarchy modeled
+          // No cache to push/invalidate in this core — an internal NOP, like RESET.
+        }
+        is(U(7, 3 bits)) {                          // PFLUSHA : flush all ATC/TLB entries
+          // A REAL effect, unlike CPUSH/RESET — pulses the 1-cycle flushAll signal that
+          // DtlbPlugin/ItlbPlugin clear their TLB + walk-result latch on.
+          sysFlushAllValid := True
         }
       }
       goto(S_REDIR)
