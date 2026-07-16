@@ -36,6 +36,12 @@ import spinal.lib.fsm._
   */
 class ExceptionUnit(
     val ss: SystemState,
+    // The ONE 68040 MMU control (task #131): the MOVEC READ case below reads
+    // mmuCtrl.mmuEnable/urp/srp for the Rc->Rn direction (TCR/URP/SRP). The WRITE
+    // direction (real supervisor code programming the MMU) was ATTEMPTED and
+    // REVERTED — see MmuControlPlugin's doc comment for the confirmed regression
+    // it caused. Those Rc values fall through to the default RAZ/WI case on write.
+    mmuCtrl: m68k040.services.MmuControlService,
     entryTrigger: Bool, entryVector: UInt, entryPc: UInt,
     // Format-$2 group-2 trap PPC = the trapping INSTRUCTION's PC (TRAPV/CHK/DIV0). For
     // TRAPV this equals entryPc-2 (a 2-byte op), but CHK/DIV0 are variable-length, so
@@ -622,13 +628,21 @@ class ExceptionUnit(
             sysRegWriteValid := True
             sysRegWritePhys  := sysCapDstPhys
             // Rc id: VBR=0x801, USP=0x800, SFC=0x000, DFC=0x001 (3-bit, zero-extended),
-            // CACR=0x002 (RAZ). SFC/DFC are real 3-bit committed regs (Musashi reads them
-            // zero-extended; round-trips with the write below).
+            // CACR=0x002 (RAZ), TCR=0x003 (E bit only — bit 15; P/page-size + other
+            // bits RAZ, this core is 4K-pages-only, task #131), URP=0x806, SRP=0x807.
+            // SFC/DFC are real 3-bit committed regs (Musashi reads them zero-extended;
+            // round-trips with the write below). ITT0/ITT1/DTT0/DTT1/MSP/ISP are NOT
+            // modeled (RAZ via default) — deferred, no transparent-translation windows
+            // or MOVEC-direct MSP/ISP access yet (MSP/ISP banking itself works via the
+            // S/M-bit A7 Mux, just not as separately MOVEC-addressable regs).
             sysRegWriteData  := sysCapRc.mux(
               U(0x801, 12 bits) -> ss.vbr,
               U(0x800, 12 bits) -> ss.usp,
               U(0x000, 12 bits) -> ss.sfc.resize(32),
               U(0x001, 12 bits) -> ss.dfc.resize(32),
+              U(0x003, 12 bits) -> Mux(mmuCtrl.mmuEnable, U(0x8000, 32 bits), U(0, 32 bits)),
+              U(0x806, 12 bits) -> mmuCtrl.urp,
+              U(0x807, 12 bits) -> mmuCtrl.srp,
               default           -> U(0, 32 bits))   // CACR/other -> RAZ (read 0)
           } otherwise {                             // Rn -> Rc : write the committed reg
             switch(sysCapRc) {
@@ -637,8 +651,12 @@ class ExceptionUnit(
               // SFC/DFC: write the low 3 bits (Musashi masks `& 7`); upper bits ignored.
               is(U(0x000, 12 bits)) { ss.setSfc.valid := True; ss.setSfc.payload := sysCapVal(2 downto 0).asUInt }
               is(U(0x001, 12 bits)) { ss.setDfc.valid := True; ss.setDfc.payload := sysCapVal(2 downto 0).asUInt }
-              // CACR (0x002) / other: WI (write-ignored, RAZ-WI — this core has no
-              // cache-enable path).
+              // CACR (0x002) / TCR (0x003) / URP (0x806) / SRP (0x807) / other: WI
+              // (write-ignored, RAZ-WI). TCR/URP/SRP real-write support was ATTEMPTED
+              // (task #131) and REVERTED after a confirmed sim-poke-persistence
+              // regression — see MmuControlPlugin's doc comment. The READ side above
+              // still surfaces whatever urp/srp/mmuEnable currently hold (sim-poke or
+              // default), consistent with how CACR has always behaved here.
             }
           }
         }
