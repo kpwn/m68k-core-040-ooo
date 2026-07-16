@@ -112,7 +112,8 @@ class DtlbSpec extends AnyFunSuite {
       val va = 0x00402000L
       buildTable(mem, va, ppn = 0x12345L)
       dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.rootPtr   #= ROOT
+      dut.ctrl.logic.urp   #= ROOT
+      dut.ctrl.logic.srp   #= ROOT
       cd.waitSampling(2)
 
       // Count every walker AR burst. With the registered trigger, holding the
@@ -156,7 +157,8 @@ class DtlbSpec extends AnyFunSuite {
       val va = 0x00802000L
       buildTable(mem, va, ppn = 0xABCDEL)
       dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.rootPtr   #= ROOT
+      dut.ctrl.logic.urp   #= ROOT
+      dut.ctrl.logic.srp   #= ROOT
       cd.waitSampling(2)
 
       // count walker AR bursts to prove the second lookup is a TLB hit (no walk)
@@ -187,6 +189,107 @@ class DtlbSpec extends AnyFunSuite {
       val (r3, _, f3) = lookup(dut, cd, vpnOf(vaBad))
       assert(r3, "faulting walk still resolves (ready)")
       assert(f3, "non-resident page must flag rsp.fault")
+    }
+  }
+
+  // Task #136: PFLUSHA's real effect is `DtlbPlugin.flushAll` clearing the TLB array
+  // (via `tlb.io.invalidateAll`, already proven single-cycle in TlbSpec) AND the
+  // 1-entry walk-result latch (which otherwise bypasses the TLB array on a same-VPN
+  // hit even after the array itself is cleared). This test proves BOTH halves matter:
+  // fill the TLB, confirm a hit (no walk), pulse flushAll, confirm the NEXT lookup of
+  // the SAME vpn re-walks (proving neither the array nor the latch served it stale).
+  test("task #136: flushAll (PFLUSHA) clears TLB + walk-result latch -> next lookup re-walks", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new BehavioralMemAgent(dut.walkerAxi, cd)
+      dut.probe.logic.reqIn.valid #= false
+      dut.probe.logic.reqIn.vpn #= 0; dut.probe.logic.reqIn.write #= false; dut.probe.logic.reqIn.supervisor #= false
+      dut.dtlb.flushAll #= false
+      cd.waitSampling(4)
+
+      val va = 0x00802000L
+      buildTable(mem, va, ppn = 0xABCDEL)
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp   #= ROOT
+      dut.ctrl.logic.srp   #= ROOT
+      cd.waitSampling(2)
+
+      var arCount = 0
+      fork { while (true) { cd.waitSampling()
+        if (dut.walkerAxi.ar.valid.toBoolean && dut.walkerAxi.ar.ready.toBoolean) arCount += 1 } }
+
+      // first lookup: miss -> walk -> fill.
+      val (r1, p1, f1) = lookup(dut, cd, vpnOf(va))
+      assert(r1 && !f1 && p1 == 0xABCDEL, "first lookup walks and resolves correctly")
+      val afterFirst = arCount
+      assert(afterFirst >= 3, s"a 3-level walk issues >=3 reads; got $afterFirst")
+      dut.probe.logic.reqIn.valid #= false
+      cd.waitSampling(2)
+
+      // second lookup of the SAME vpn: TLB hit, no new walk (sanity — matches the
+      // existing miss->walk->fill->hit test, just re-confirmed before the flush).
+      val (r2, p2, f2) = lookup(dut, cd, vpnOf(va))
+      assert(r2 && !f2 && p2 == 0xABCDEL, "second lookup hits with correct ppn")
+      assert(arCount == afterFirst, s"TLB hit must issue no walk before the flush: $afterFirst -> $arCount")
+      dut.probe.logic.reqIn.valid #= false
+      cd.waitSampling(2)
+
+      // pulse flushAll for exactly one cycle (mirrors how the real S_APPLY FSM pulses
+      // ExceptionUnit.sysFlushAllValid for a single cycle).
+      dut.dtlb.flushAll #= true
+      cd.waitSampling()
+      dut.dtlb.flushAll #= false
+      cd.waitSampling(2)
+
+      // third lookup of the SAME vpn: must walk again (both the TLB array AND the
+      // walk-result latch were cleared) -> arCount increases, and the result is still
+      // correct (the page table itself is untouched, only the cache was flushed).
+      val (r3, p3, f3) = lookup(dut, cd, vpnOf(va))
+      assert(r3 && !f3 && p3 == 0xABCDEL, "post-flush lookup re-resolves correctly")
+      assert(arCount > afterFirst, s"post-flushAll lookup of the same vpn must re-walk: $afterFirst -> $arCount")
+    }
+  }
+
+  // Task #137: bisecting a full-core lock-step failure — a write to a resident,
+  // write-protected (W bit set) page did not fault in ExecuteLockStepSpec's new WP
+  // test, even though TableWalkerSpec's ISOLATED walker test already proves the
+  // walker itself correctly flags WRITE_PROTECT. This test checks the SAME thing at
+  // the DtlbPlugin (TLB+walker+permFault) layer, one level up from the raw walker
+  // but still far short of the full core (no LS-EU/AGU in between) — narrows down
+  // whether the bug is in DtlbPlugin or specifically in how the full pipeline drives
+  // TranslationReq.write for a real STORE.
+  test("task #137: write-protected resident page -> write faults, read does not", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new BehavioralMemAgent(dut.walkerAxi, cd)
+      dut.probe.logic.reqIn.valid #= false
+      dut.probe.logic.reqIn.vpn #= 0; dut.probe.logic.reqIn.write #= false; dut.probe.logic.reqIn.supervisor #= false
+      cd.waitSampling(4)
+
+      val va = 0x00902000L
+      pokeWordLE(mem, ROOT + rootIdx(va) * 4, (PTRT & 0xfffffff0L) | 0x3L)
+      pokeWordLE(mem, PTRT + ptrIdx(va) * 4, (PAGT & 0xfffffff0L) | 0x3L)
+      val ppn = 0x77L
+      val wpDesc = ((ppn << 12) & 0xfffff000L) | 0x4L | 0x1L   // resident, W=1
+      pokeWordLE(mem, PAGT + pageIdx(va) * 4, wpDesc)
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp   #= ROOT
+      dut.ctrl.logic.srp   #= ROOT
+      cd.waitSampling(2)
+
+      // WRITE first (fresh TLB, forces a walk on the write access itself).
+      val (rw, pw, fw) = lookup(dut, cd, vpnOf(va), write = true)
+      assert(rw, "write to WP page still resolves (ready)")
+      assert(fw, "write to a write-protected resident page must flag rsp.fault")
+      dut.probe.logic.reqIn.valid #= false
+      cd.waitSampling(2)
+
+      // READ of the SAME page must NOT fault.
+      val (rr, pr, fr) = lookup(dut, cd, vpnOf(va), write = false)
+      assert(rr && !fr, "read of a write-protected (but resident) page must NOT fault")
+      assert(pr == ppn, f"read ppn: got 0x$pr%x expected 0x$ppn%x")
     }
   }
 }

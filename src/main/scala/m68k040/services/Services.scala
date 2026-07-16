@@ -90,12 +90,17 @@ trait PrivilegeService {
   def supervisor: Bool
 }
 
-/** The ONE 68040 MMU control (TC enable + URP/SRP root pointer), shared by BOTH
-  * the I-side ITLB and the D-side DTLB. One owner drives the regs (synth top input /
-  * sim poke / future MOVEC); both TLBs read it. `mmuEnable` LOW => identity. */
+/** The ONE 68040 MMU control (TC enable + separate URP/SRP root pointers), shared
+  * by BOTH the I-side ITLB and the D-side DTLB. One owner (MmuControlPlugin) drives
+  * the regs; both TLBs read `mmuEnable`/`urp`/`srp` and select URP vs SRP themselves
+  * per-access (the walker request already carries `isSuper`, mirroring real 68040
+  * hardware: a supervisor-space access walks SRP, a user-space access walks URP).
+  * `mmuEnable` LOW => identity. Sim-pokeable only (task #131's attempted commit-time
+  * MOVEC write path was REVERTED — see MmuControlPlugin's doc comment for why). */
 trait MmuControlService {
   def mmuEnable: Bool
-  def rootPtr:   UInt   // 32 bits
+  def urp: UInt   // 32 bits — user root pointer
+  def srp: UInt   // 32 bits — supervisor root pointer
 }
 
 /** The external interrupt inputs (simple protocol): a 3-bit IPL plus the SoC's

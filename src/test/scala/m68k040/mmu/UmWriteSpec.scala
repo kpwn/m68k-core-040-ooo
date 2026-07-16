@@ -99,7 +99,8 @@ class UmWriteSpec extends AnyFunSuite {
     dut.probe.logic.flush #= false
     cd.waitSampling(4)
     dut.ctrl.logic.mmuEnable #= true
-    dut.ctrl.logic.rootPtr   #= ROOT
+    dut.ctrl.logic.urp   #= ROOT
+    dut.ctrl.logic.srp   #= ROOT
     cd.waitSampling(2)
     (cd, mem)
   }

@@ -11,7 +11,7 @@ import spinal.lib.misc.plugin.FiberPlugin
 /** D-side MMU plugin: a banked DTLB + a hardware 3-level table walker behind
   * `DTranslationService`, replacing the identity stub.
   *
-  *  - `mmuEnable` (test-poked; MOVEC decode deferred): when LOW the plugin is a pure
+  *  - `mmuEnable` (sim-pokeable AND commit-time MOVEC-writable, task #131): when LOW the plugin is a pure
   *    identity passthrough (ppn=vpn, cacheable, no fault, always ready) — every
   *    existing MMU-disabled test/lock-step is unchanged.
   *  - When HIGH: on a translation demand (`req.valid`), look up the TLB. A HIT
@@ -25,7 +25,8 @@ import spinal.lib.misc.plugin.FiberPlugin
   *  - The walk's deferred U/M descriptor write is exposed on `umWrite` (drained at
   *    commit by the U/M-write queue — Task 4); the DTLB does NOT write it itself.
   *
-  * `rootPtr` (URP/SRP) is a test-poked register until a real MOVEC path exists. */
+  * `urp`/`srp` are sim-pokeable AND commit-time MOVEC-writable (task #131); the
+  * walk root is selected per-access from the request's own supervisor bit. */
 class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
                  ways: Int = Tlb.DefaultWays,
                  banks: Int = Tlb.DefaultBanks) extends FiberPlugin with DTranslationService {
@@ -48,6 +49,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     umCommitBValid = Bool()
     umCommitBId    = UInt(6 bits)
     umFlush       = Bool()
+    flushAll      = Bool()
   }
 
   // U/M deferred-write queue hooks (driven by the LS-cluster wiring):
@@ -61,6 +63,9 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
   var umCommitBValid: Bool = null   // retire slot 1 (dual-retire) — see UmWriteQueue.commitB
   var umCommitBId:    UInt = null
   var umFlush:       Bool = null
+  // PFLUSHA: flush ALL TLB entries + the walk-result latch (task #136). Mirrors umFlush's
+  // default-idle/allowOverride shape so a standalone DUT elaborates.
+  var flushAll:      Bool = null
   // AXI port for the walker + U/M descriptor write drain (full Axi4). Surfaces as
   // top IO so the testbench / synth top attaches the page-table memory.
   var walkerAxi: Axi4 = null
@@ -85,16 +90,18 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     umCommitBValid.allowOverride; umCommitBValid := False
     umCommitBId.allowOverride;    umCommitBId    := U(0, 6 bits)
     umFlush.allowOverride;       umFlush       := False
+    flushAll.allowOverride;      flushAll      := False; flushAll.simPublic()
 
     // The ONE 68040 MMU control is owned by MmuControlPlugin and shared with the
     // ITLB; the DTLB only READS it (no longer owns its own enable/root regs).
     val ctrl = host[MmuControlService]
     val mmuEnable = ctrl.mmuEnable
-    val rootPtr   = ctrl.rootPtr
+    val urp       = ctrl.urp
+    val srp       = ctrl.srp
 
     // ---- TLB lookup (combinational) ----
     tlb.io.lookupVpn := _req.vpn
-    tlb.io.invalidateAll := False
+    tlb.io.invalidateAll := flushAll
     val tlbHit   = tlb.io.hit
     val tlbEntry = tlb.io.hitEntry
 
@@ -200,8 +207,13 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       missReqReg.robId := umAccessRobId
     }
 
+    // Real 68040 semantics: a supervisor-space access walks SRP, a user-space
+    // access walks URP (task #131 — previously both shared ONE `rootPtr`, which
+    // was architecturally wrong: MOVEC-driven user code couldn't have its OWN
+    // page tables independent of supervisor's). missReqReg.sup is the SAME bit
+    // already latched for walker.io.req.isSuper below.
     walker.io.req.vpn     := missReqReg.vpn
-    walker.io.req.rootPtr := rootPtr
+    walker.io.req.rootPtr := Mux(missReqReg.sup, srp, urp)
     walker.io.req.isWrite := missReqReg.write
     walker.io.req.isSuper := missReqReg.sup
     walker.io.start       := missReqReg.valid
@@ -232,7 +244,19 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       latchWp    := walker.io.rsp.writeProt
       latchSup   := walker.io.rsp.supervisor
       latchCmode := walker.io.rsp.cacheMode
-      latchFault := walker.io.rsp.fault
+      // Task #137 fix: only latch the walker's fault verdict as STICKY when the
+      // reason is access-INDEPENDENT (NON_RESIDENT — any access to a non-resident
+      // page always faults, regardless of read/write/privilege). WRITE_PROTECT and
+      // SUPERVISOR are access-DEPENDENT (a write-protected page faults on a WRITE
+      // but not a READ; a supervisor page faults for USER but not SUPERVISOR) — for
+      // those, latchFault must NOT be sticky-true, or a later `latchMatch` hit from
+      // a DIFFERENT access (e.g. a read right after the write that triggered this
+      // walk) incorrectly inherits the ORIGINAL access's fault verdict. permFault()
+      // below already correctly RE-derives write-protect/supervisor faults live
+      // against the current request (latchWp/latchSup are captured unconditionally,
+      // regardless of fault status) — latchFault only needs to cover the case
+      // permFault can't: non-residency.
+      latchFault := walker.io.rsp.fault && (walker.io.rsp.faultReason === MmuFaultReason.NON_RESIDENT)
       when(!walker.io.rsp.fault) {
         tlb.io.fillValid := True
       }
@@ -247,6 +271,13 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // forces one re-walk). The filled TLB is left intact (it only holds resident
     // translations, which remain valid across a flush).
     when(umFlush) {
+      latchValid := False
+    }
+    // PFLUSHA: the TLB array itself is cleared combinationally via tlb.io.invalidateAll
+    // above; the 1-entry walk-result latch needs its own explicit clear (it bypasses the
+    // TLB array entirely on a match) or a same-VPN access right after the flush would
+    // still hit stale latched state.
+    when(flushAll) {
       latchValid := False
     }
 

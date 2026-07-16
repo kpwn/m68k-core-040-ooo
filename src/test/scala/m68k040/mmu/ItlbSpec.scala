@@ -103,7 +103,8 @@ class ItlbSpec extends AnyFunSuite {
       val va = 0x00402000L
       buildTable(mem, va, ppn = 0x12345L)
       dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.rootPtr   #= ROOT
+      dut.ctrl.logic.urp   #= ROOT
+      dut.ctrl.logic.srp   #= ROOT
       cd.waitSampling(2)
 
       // Count every walker AR burst. With the registered trigger, holding the
@@ -146,7 +147,8 @@ class ItlbSpec extends AnyFunSuite {
       val va = 0x00802000L
       buildTable(mem, va, ppn = 0xABCDEL)
       dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.rootPtr   #= ROOT
+      dut.ctrl.logic.urp   #= ROOT
+      dut.ctrl.logic.srp   #= ROOT
       cd.waitSampling(2)
 
       var arCount = 0

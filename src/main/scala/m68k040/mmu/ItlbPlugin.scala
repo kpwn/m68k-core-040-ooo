@@ -47,6 +47,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     umCommitBValid = Bool()
     umCommitBId    = UInt(6 bits)
     umFlush       = Bool()
+    flushAll      = Bool()
   }
 
   // U deferred-write queue hooks (driven by the LS-cluster wiring, mirroring the DTLB;
@@ -57,6 +58,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
   var umCommitBValid: Bool = null   // retire slot 1 (dual-retire) — see UmWriteQueue.commitB
   var umCommitBId:    UInt = null
   var umFlush:       Bool = null
+  // PFLUSHA: flush ALL TLB entries + the walk-result latch (task #136).
+  var flushAll:      Bool = null
   // Dedicated AXI port for THIS ITLB's walker + the U descriptor-write drain.
   var walkerAxi: Axi4 = null
   def axiCfg: Axi4Config = Axi4Config(addressWidth = 32, dataWidth = 128, idWidth = 4)
@@ -78,15 +81,17 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     umCommitBValid.allowOverride; umCommitBValid := False
     umCommitBId.allowOverride;    umCommitBId    := U(0, 6 bits)
     umFlush.allowOverride;       umFlush       := False
+    flushAll.allowOverride;      flushAll      := False; flushAll.simPublic()
 
     // The ONE shared 68040 MMU control (read, not owned).
     val ctrl = host[MmuControlService]
     val mmuEnable = ctrl.mmuEnable
-    val rootPtr   = ctrl.rootPtr
+    val urp       = ctrl.urp
+    val srp       = ctrl.srp
 
     // ---- TLB lookup (combinational) ----
     tlb.io.lookupVpn := _req.vpn
-    tlb.io.invalidateAll := False
+    tlb.io.invalidateAll := flushAll
     val tlbHit   = tlb.io.hit
     val tlbEntry = tlb.io.hitEntry
 
@@ -141,8 +146,10 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       missReqReg.robId := umAccessRobId
     }
 
+    // Real 68040 semantics: a supervisor-space fetch walks SRP, a user-space fetch
+    // walks URP (task #131 — see DtlbPlugin's identical treatment).
     walker.io.req.vpn     := missReqReg.vpn
-    walker.io.req.rootPtr := rootPtr
+    walker.io.req.rootPtr := Mux(missReqReg.sup, srp, urp)
     walker.io.req.isWrite := False
     walker.io.req.isSuper := missReqReg.sup
     walker.io.start       := missReqReg.valid
@@ -182,6 +189,11 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // descriptor) instead of re-reading the stale non-resident fault. Harmless on a
     // branch-mispredict flush (one extra re-walk). The filled TLB stays intact.
     when(umFlush) {
+      latchValid := False
+    }
+    // PFLUSHA: the TLB array is cleared combinationally via tlb.io.invalidateAll above;
+    // the 1-entry walk-result latch needs its own explicit clear (see DtlbPlugin).
+    when(flushAll) {
       latchValid := False
     }
 
