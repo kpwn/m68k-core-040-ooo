@@ -131,6 +131,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val slot1Spec0        = fed.payload.specs(1).spec   // ANGLE E: registered offloaded spec
     val slot1IsMovemEarly = fed.valid && fed.payload.slot1Valid && slot1Spec0.movem
     val slot1IsUcodeEarly = fed.valid && fed.payload.slot1Valid && slot1Spec0.microcoded
+    slot1IsUcodeEarly.simPublic()  // debug-only (task #144)
     // A slot1 MOVEP, like a slot1 MOVEM, cannot be emitted as a normal crack — its real
     // µops come from the MOVEP FSM (entered next cycle from the stashed packet). Exclude
     // it from the normal slot1 push (the assembler's benign MOVE placeholder would
@@ -146,9 +147,15 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val s1mi_line  = s1mi_opw(15 downto 12).asUInt
     val s1mi_opmode= s1mi_opw(8 downto 6).asUInt
     val s1mi_isMove= (s1mi_line === U(1, 4 bits)) || (s1mi_line === U(2, 4 bits)) || (s1mi_line === U(3, 4 bits))
+    // ADDA/SUBA/CMPA (opmode 3/7, An-dest arithmetic) mirror s0AnArith/ucAnArith below —
+    // see the s0AnArith comment (task #144 follow-up) for why this is needed and why it
+    // does not affect DIVU/DIVS (line 8) / MULU/MULS (line C).
+    val s1mi_anArith = (slot1Spec0.dst.kind === OperandKind.REGFIELD) && slot1Spec0.dst.isAddr &&
+                       ((slot1Spec0.op === DecOp.ADD) || (slot1Spec0.op === DecOp.SUB) || (slot1Spec0.op === DecOp.CMP))
     val s1mi_isAlu = ((s1mi_line === U(8, 4 bits)) || (s1mi_line === U(9, 4 bits)) || (s1mi_line === U(0xB, 4 bits)) ||
                       (s1mi_line === U(0xC, 4 bits)) || (s1mi_line === U(0xD, 4 bits))) &&
-                     ((s1mi_opmode === U(0, 3 bits)) || (s1mi_opmode === U(1, 3 bits)) || (s1mi_opmode === U(2, 3 bits)))
+                     ((s1mi_opmode === U(0, 3 bits)) || (s1mi_opmode === U(1, 3 bits)) || (s1mi_opmode === U(2, 3 bits)) ||
+                      (s1mi_anArith && ((s1mi_opmode === U(3, 3 bits)) || (s1mi_opmode === U(7, 3 bits)))))
     val s1mi_isSingle = (slot1Spec0.op === DecOp.CLR) || (slot1Spec0.op === DecOp.NEG) || (slot1Spec0.op === DecOp.NEGX) ||
                         (slot1Spec0.op === DecOp.NOT) || (slot1Spec0.op === DecOp.TST)
     val s1mi_isImm = slot1Spec0.srcB.kind === OperandKind.IMMEXT
@@ -164,6 +171,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       // it (ext at op+3), so it falls to the normal slot1 crack where it is gated ILLEGAL.
       (s1mi_isImm && !s1mi_immL && (s1mi_immEa.klass === EaClass.MEMINDIRECT)) ||
       (s1mi_isSingle && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)))
+    slot1IsMemIndEarly.simPublic()  // debug-only (task #144)
     // slot1 DYNAMIC read-only bit-field (slice 3c) — mirror slot1IsMemIndEarly: its real µops
     // come from the engine (entered from the stashed slot1 packet), so EXCLUDE it from the
     // normal slot1 push (the 3a crack misreads Do/Dw as static -> phantom). Scoped to An-base.
@@ -318,7 +326,18 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val s0IsMove = (s0line === U(1, 4 bits)) || (s0line === U(2, 4 bits)) || (s0line === U(3, 4 bits))
     val s0IsAluSrcLine = (s0line === U(8, 4 bits)) || (s0line === U(9, 4 bits)) ||
                          (s0line === U(0xB, 4 bits)) || (s0line === U(0xC, 4 bits)) || (s0line === U(0xD, 4 bits))
-    val s0AluSrcMode = (s0opmode === U(0, 3 bits)) || (s0opmode === U(1, 3 bits)) || (s0opmode === U(2, 3 bits))
+    // ADDA/SUBA/CMPA (opmode 3/7, An-dest arithmetic — mirrors MicroOpAssembler.scala's
+    // `anArith`): these are ALSO ALU-src-EA ops (source = EA, dest = An) and need the SAME
+    // mem-indirect routing as the Dn-dest opmode 0/1/2 forms (task #144 follow-up: ADDA
+    // with a full-format mem-indirect source silently fell through to the ordinary,
+    // mem-indirect-unaware assembler path instead of tripping any illegal-gate, producing
+    // a garbage EA/wild PC). DIVU/DIVS (line 8) and MULU/MULS (line C) also use opmode
+    // 3/7 but resolve to a different DecOp (not ADD/SUB/CMP), so s0AnArith naturally
+    // excludes them — this does NOT change their routing.
+    val s0AnArith = (spec0.dst.kind === OperandKind.REGFIELD) && spec0.dst.isAddr &&
+                    ((spec0.op === DecOp.ADD) || (spec0.op === DecOp.SUB) || (spec0.op === DecOp.CMP))
+    val s0AluSrcMode = (s0opmode === U(0, 3 bits)) || (s0opmode === U(1, 3 bits)) || (s0opmode === U(2, 3 bits)) ||
+                       (s0AnArith && ((s0opmode === U(3, 3 bits)) || (s0opmode === U(7, 3 bits))))
     val s0IsSingleEa = (spec0.op === DecOp.CLR) || (spec0.op === DecOp.NEG) || (spec0.op === DecOp.NEGX) ||
                        (spec0.op === DecOp.NOT) || (spec0.op === DecOp.TST)
     val s0IsLineImm  = spec0.srcB.kind === OperandKind.IMMEXT
@@ -596,6 +615,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val ucPc     = Reg(UInt(7 bits))   // µPC into the ROM (romSize 87 with 3c dyn-mem -> needs 7 bits)
     ucPc.simPublic()
     val ucCtx    = Reg(Microcode.Ctx())
+    ucCtx.miOther.simPublic(); ucCtx.miOtherValid.simPublic()  // debug-only (task #144)
     when(pipeFlush) { ucActive := False }
 
     // Pending slot1 microcoded op (mirrors movemPendValid/movemPendPkt): when slot0 is a
@@ -611,6 +631,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // entry needs its own decode (its opword differs from slot0). One extra cone, not two.
     val ucPendSpec  = OperationDecoder.decode(ucPendPkt.words(0))
     val ucEntrySpec = Mux(ucPendValid, ucPendSpec, spec0)
+    ucEntryPkt.pc.simPublic(); ucEntryPkt.words(0).simPublic()  // debug-only (task #144)
 
     // Begin a µcode op: a pending slot1 microcoded op, OR a microcoded slot0 (not blocked
     // by a stash), while the engine + the MOVEM FSM are idle.
@@ -618,6 +639,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
                   (ucPendValid || (slot0OwnedByUc && !stashValid))
     // Entering a slot0 microcoded op (not a pending one): its group is consumed on entry.
     val ucEnterSlot0 = ucBegin && !ucPendValid
+    ucEnterSlot0.simPublic()  // debug-only (task #144)
     // The entry context, latched on ucBegin from the entry packet.
     val ucEntryCtx = Microcode.Ctx()
     ucEntryCtx.opword       := ucEntryPkt.words(0)
@@ -844,7 +866,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val ucIsAluSrcLine = (ucLine === U(8, 4 bits)) || (ucLine === U(9, 4 bits)) ||
                          (ucLine === U(0xB, 4 bits)) || (ucLine === U(0xC, 4 bits)) ||
                          (ucLine === U(0xD, 4 bits))
-    val ucAluSrcMode   = (ucOpmode === U(0, 3 bits)) || (ucOpmode === U(1, 3 bits)) || (ucOpmode === U(2, 3 bits))
+    // ADDA/SUBA/CMPA (opmode 3/7, An-dest arithmetic) mirror s0AnArith/s1mi_anArith above —
+    // see s0AnArith's comment (task #144 follow-up) for why this is needed and why it does
+    // not affect DIVU/DIVS (line 8) / MULU/MULS (line C), whose opmode 3/7 resolve to a
+    // different DecOp (not ADD/SUB/CMP).
+    val ucAnArith = (ucEntrySpec.dst.kind === OperandKind.REGFIELD) && ucEntrySpec.dst.isAddr &&
+                    ((ucEntrySpec.op === DecOp.ADD) || (ucEntrySpec.op === DecOp.SUB) || (ucEntrySpec.op === DecOp.CMP))
+    val ucAluSrcMode   = (ucOpmode === U(0, 3 bits)) || (ucOpmode === U(1, 3 bits)) || (ucOpmode === U(2, 3 bits)) ||
+                         (ucAnArith && ((ucOpmode === U(3, 3 bits)) || (ucOpmode === U(7, 3 bits))))
     val ucAluSrcMi = ucIsAluSrcLine && ucAluSrcMode && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
     // line-0 immediate op dst-EA (ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea>): the immediate
     // PRECEDES the EA ext, so re-decode the EA from a SHIFTED window. immWords = .L?2:1.
@@ -862,9 +891,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val ucSingleMi = ucIsSingleEa && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
     // The chosen mem-indirect EaSpec (the pointer load's base/bd/index + od/post).
     val ucMiEa = Mux(ucMoveDstMi, ucMiDstEa, Mux(ucImmDstMi, ucImmEa, ucMiSrcEa))
-    // The op IS a full-format mem-indirect host (route to the engine).
+    // The op IS a full-format mem-indirect host (route to the engine). The entry packet
+    // is valid either because it's the correctly-latched stash (ucPendValid) or because
+    // it's this cycle's live fed packet -- gating on bare fed.valid alone was WRONG (task
+    // #144: on the stashed-slot1 path, this cycle's live fed.valid is unrelated to the
+    // stashed packet's validity and can independently be false, e.g. a bubble, silently
+    // zeroing ucIsMemInd and misrouting the µcode entry to the wrong default row).
     val ucIsMemInd = (ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucImmDstMi || ucSingleMi) &&
-                     fed.valid
+                     (ucPendValid || fed.valid)
     // The host op's OTHER operand register:
     //   MOVE src-EA (load to a reg)  -> the dst reg  = op[11:9] (Dn) / +8 for An (isMovea n/a here).
     //   MOVE dst-EA (store from reg) -> the src reg  = op[5:0] (Dn/An, register-direct src).
@@ -877,11 +911,16 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // (full-32 An write, .W sign-extend) and writes NO CCR (FUZZER-CAUGHT: the crack
     // set NZVC and targeted the Dn register file half).
     val ucMoveDstIsAn = ucIsMove && (ucEopw(8 downto 6) === B"001")
-    val ucMiMovea     = ucMoveSrcMi && ucMoveDstIsAn
+    // ucMiMovea ("An-wide" marker) also covers ADDA/SUBA/CMPA-with-mem-indirect-source
+    // (ucAnArith, task #144 follow-up): same full-32/.W-sign-extend widening the ALU EU
+    // already applies via `anWide := isMovea && op=/=MOVE` (AluEuPlugin.scala) for the
+    // ordinary (non-mem-indirect) ADDA/SUBA/CMPA path. miWNzvc below discriminates the
+    // CMPA-writes-flags case from the ADDA/SUBA/MOVEA-writes-no-flags case.
+    val ucMiMovea     = (ucMoveSrcMi && ucMoveDstIsAn) || ucAnArith
     val ucMiOtherReg = Mux(ucMoveDstMi,
                            Mux(ucMoveSrcAn, (U(8, 5 bits) + ucMoveSrcReg).resize(5), ucMoveSrcReg.resize(5)),
                            Mux(ucMiMovea, (U(8, 5 bits) + ucEopw(11 downto 9).asUInt).resize(5),
-                               ucEopw(11 downto 9).asUInt.resize(5)))   // Dn for MOVE-src/ALU; An for MOVEA-src
+                               ucEopw(11 downto 9).asUInt.resize(5)))   // Dn for MOVE-src/ALU; An for MOVEA/ADDA-src
     // CMPI / TST -> flags-only (no store). The op writes NZVC and (ADD/SUB/NEG/NEGX) X.
     val ucMiOpIsCmp = ucEntrySpec.op === DecOp.CMP
     val ucMiOpIsTst = ucEntrySpec.op === DecOp.TST
@@ -900,6 +939,15 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       Mux(ucAluSrcMi,  U(Microcode.MI_ALU_SRC_ENTRY,  ew bits),
       Mux(ucMiFlagsOnly, U(Microcode.MI_FLAGS_ENTRY, ew bits),
                          U(Microcode.MI_RMW_ENTRY,    ew bits))))))))
+    // ---- debug-only observability (task #139 mechanism #2 investigation) ----
+    // Zero synth impact (sim tap only, not referenced by any RTL logic).
+    ucMiEntry.simPublic()
+    ucIsMemInd.simPublic()
+    ucLine.simPublic(); ucOpmode.simPublic()
+    ucAluSrcMi.simPublic()
+    ucMoveSrcMi.simPublic(); ucMoveDstMi.simPublic()
+    ucMoveSrcMiEaEa.simPublic(); ucMoveDstMiEaEa.simPublic(); ucMoveBothMi.simPublic()
+    ucMiFlagsOnly.simPublic()
     // Populate the MI Ctx group + (reuse the EA infra) the pointer-load EA fields. The host
     // size = spec.size; the pointer load is always LONG. od/post from the chosen EaSpec.
     ucEntryCtx.miOd         := ucMiEa.od
@@ -923,8 +971,15 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // old NZ (clear-only Z) + X.
     val ucMiWriteX    = (ucEntrySpec.op === DecOp.ADD) || (ucEntrySpec.op === DecOp.SUB) ||
                         (ucEntrySpec.op === DecOp.NEG) || (ucEntrySpec.op === DecOp.NEGX)
-    ucEntryCtx.miWNzvc := !ucMiMovea
-    ucEntryCtx.miWX    := ucMiWriteX
+    // ADDA/SUBA/CMPA (ucAnArith): An-dest arithmetic never writes X, and NZVC is written
+    // ONLY by CMPA (not ADDA/SUBA) — the plain `!ucMiMovea`/`ucMiWriteX` formulas below are
+    // correct for the Dn-dest ALU-src case and the MOVEA case, but wrong for ucAnArith
+    // (which reuses ucMiMovea for its OWN, different reason — the widening, not "no
+    // flags"). Resolve from ucEntrySpec.writesNzvc directly for this case, which
+    // OperationDecoder.scala already computes correctly (True only for CMPA, opmode 3/7
+    // on line 0xB; False for ADDA/SUBA).
+    ucEntryCtx.miWNzvc := Mux(ucAnArith, ucEntrySpec.writesNzvc, !ucMiMovea)
+    ucEntryCtx.miWX    := Mux(ucAnArith, False, ucMiWriteX)
     ucEntryCtx.miRNzvc := ucEntrySpec.op === DecOp.NEGX   // NEGX reads old NZ (clear-only Z)
     ucEntryCtx.miRX    := ucEntrySpec.op === DecOp.NEGX
     // The EA<->EA plain side's OWN address (task #119): independent of the pointer-load's
@@ -1022,6 +1077,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
                         U(Microcode.BF_RMW_4B_ENTRY, ew bits)),
       Mux(ucIsMoves, ucMovesEntry,
         ucEntrySpec.ucEntry)))))
+    ucRealEntry.simPublic()  // debug-only (task #144)
 
     // Resolve every ROM row against the LATCHED ctx, then index by ucPc -> this cycle's
     // µop (the ROM is a compile-time Scala Vector; resolve each row to hardware + mux).
@@ -1087,6 +1143,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     }
     fed.valid.simPublic(); fed.ready.simPublic()
     fed.payload.packets(0).pc.simPublic(); fed.payload.packets(1).pc.simPublic()
+    fed.payload.packets(1).words(0).simPublic(); fed.payload.packets(1).words(1).simPublic()
+    fed.payload.packets(1).words(2).simPublic(); fed.payload.packets(1).words(3).simPublic()
+    fed.payload.packets(1).words(4).simPublic(); fed.payload.packets(1).wordCount.simPublic()
+    fed.payload.packets(1).simple.simPublic(); fed.payload.packets(1).complex.simPublic()  // debug-only (task #144)
     fed.payload.packets(0).words(0).simPublic(); fed.payload.packets(0).words(1).simPublic()
     fed.payload.packets(0).simple.simPublic(); fed.payload.packets(0).lenWords.simPublic()
     fed.payload.packets(0).fault.simPublic(); fed.payload.packets(0).wordCount.simPublic()

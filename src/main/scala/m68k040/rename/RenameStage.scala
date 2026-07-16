@@ -3,6 +3,7 @@ package m68k040.rename
 import m68k040.services.{DecodeUopService, RenameUopService, RenameCommitService}
 import m68k040.rob.CommitSlot
 import spinal.core._
+import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
 
@@ -199,6 +200,10 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.psrcBValid := dec.srcBValid
       r.psrcC      := intRat.io.reads(6 + s).data
       r.psrcCValid := dec.srcCValid
+      // debug-only (task #144): does this mu-op's architectural srcBReg (pre-rename)
+      // correctly resolve to the LATEST RAT mapping (psrcB, post-rename)?
+      dec.pc.simPublic(); dec.srcBReg.simPublic(); dec.srcBValid.simPublic()
+      r.psrcB.simPublic(); r.psrcBValid.simPublic(); slotEn.simPublic()
 
       // int dst allocation
       intFree.io.pop(s).take := slotEn && dec.dstValid
