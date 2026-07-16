@@ -410,6 +410,20 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
             // Trailing remainder-move: write the latched remainder to Dr. If the
             // preceding DIV overflowed, NO dest was written -> skip this write too
             // (writeInt=!ovLatch). Sets no flags (the DIV µop already set NZVC).
+            // KNOWN RESIDUAL GAP (ported-tests triage, divl_basic.s): unlike the DIV
+            // µop's own overflow branch (fixed above to write s1A = Dq's old value
+            // through, so its pdst still gets marked ready), this DIVREM µop has NO
+            // real source operand (srcAValid=False -- it has no register dependency,
+            // only an implicit ordering one on the preceding DIV) to copy Dr's old
+            // value from, so on ovLatch=True its pdst is left permanently not-ready
+            // the SAME way the DIV's used to be -- a latent scoreboard-deadlock hazard
+            // for any FUTURE overflow case the divide-by-(-1) erratum (DivUnit.scala)
+            // doesn't also suppress. Not currently reachable by any known test (the
+            // only exercised overflow case, INT_MIN/-1, is now suppressed by the
+            // erratum fix so ovLatch is False for it), so left unfixed here rather
+            // than rushing a new real Dr-source operand into the crack. Proper fix:
+            // give divremUop a real srcA = divlDr (old Dr value) and write it through
+            // here on overflow, mirroring the DIV µop's s1A fix above.
             captureComplete(remLatch, B(0, 4 bits), False, !ovLatch)
             s1Valid := False
           } elsewhen(isDiv) {
@@ -450,9 +464,19 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
           // for the .L forms the DIVREM writes Dr from this latch.
           remLatch := resR.asBits
           ovLatch  := divUnit.io.overflow
-          // Overflow -> V=1, NO register write. Normal -> write quotient + N/Z (V=0).
+          // Overflow -> V=1, Dq ARCHITECTURALLY unchanged. Normal -> write quotient + N/Z (V=0).
+          // On overflow this WRITES s1A (Dq's own OLD/pre-divide value, already read as the
+          // dividend source -- same register, so s1A IS "the old Dq") back through to the
+          // µop's freshly-renamed pdst, rather than skipping the write: in a renamed OoO
+          // pipe, "leave the destination unchanged" for an instruction whose decode-time
+          // pdstValid is True still allocates a NEW physical register for the old arch reg,
+          // so *something* must write it or that pdst's scoreboard/ready bit never sets and
+          // any consumer waiting on it stalls forever (found via ported-tests triage,
+          // divl_basic.s: a genuine ROB-head deadlock, not a divider hang -- DivCore is a
+          // fixed 64-cycle iterator that always completes). writeInt=True here (was False)
+          // fixes that hazard generally, independent of the divide-by-(-1) erratum above.
           when(divUnit.io.overflow) {
-            captureComplete(B(0, 32 bits), divNzvcOver, True, False)
+            captureComplete(s1A, divNzvcOver, True, True)
           } otherwise {
             captureComplete(divResult, divNzvcNormal, u1.writesNzvc, True)
           }

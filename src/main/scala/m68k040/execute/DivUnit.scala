@@ -48,6 +48,11 @@ class DivUnit extends Component {
   val signDivisor  = RegInit(False)
   val signedReg    = RegInit(False)
   val formReg      = Reg(DivForm())
+  // Divisor magnitude, latched at start (used by the divide-by-(-1) erratum check
+  // below -- see its comment). Not strictly required for correctness given io.divisor
+  // is held stable by the EU for the whole DIVING state, but latching mirrors the
+  // existing sign-capture pattern and avoids depending on that assumption.
+  val dvsrMagReg   = Reg(UInt(32 bits))
 
   // Magnitudes: for signed, negate a negative operand. The dividend is a 64-bit
   // sign-extended value; the divisor is 32-bit sign-extended.
@@ -65,6 +70,7 @@ class DivUnit extends Component {
     signDivisor  := dvsrNeg
     signedReg    := io.signed
     formReg      := io.form
+    dvsrMagReg   := dvsrMag
   }
 
   io.busy      := core.io.busy
@@ -114,10 +120,23 @@ class DivUnit extends Component {
   }
   val ovW   = overflowFor(16)
   val ovL   = overflowFor(32)
+  // 68020+ DIVS.L/DIVU.L divide-by-(-1) erratum (documented real-silicon behavior,
+  // matched by Musashi -- our lock-step/whitebox oracle): dividing by exactly -1 in
+  // the 32-bit-quotient LONG divide form does NOT set V even when the mathematical
+  // result overflows (INT_MIN / -1 being the canonical case). Scoped to the LONG
+  // forms only -- the original .W 16-bit-quotient divide is not documented/tested as
+  // sharing this erratum. Ported-tests triage (divl_basic.s Test 5): without this,
+  // the overflow path's writeInt=False left the DIV's (and the trailing DIVREM's)
+  // destination physical register permanently not-ready in the scoreboard (no
+  // wakeup ever fires for a register nothing ever writes), deadlocking the ROB head
+  // on the very next consumer -- not a "hang in the divider" (DivCore is a fixed
+  // 64-cycle iterator, always completes) but a downstream scoreboard-starvation hang
+  // caused by taking this overflow branch in a case Musashi does not.
+  val divisorIsNegOne = signedReg && signDivisor && (dvsrMagReg === U(1, 32 bits))
   io.overflow := formReg.mux(
     DivForm.W   -> ovW,
-    DivForm.L32 -> ovL,
-    DivForm.L64 -> ovL)
+    DivForm.L32 -> (ovL && !divisorIsNegOne),
+    DivForm.L64 -> (ovL && !divisorIsNegOne))
 
   io.done := core.io.done
 }

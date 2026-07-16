@@ -117,6 +117,29 @@ object PortedTestRunner {
         }
       }
 
+      // debug-only, env-gated trace for the DIVU.L/DIVS.L 32/32 crack (DIV + trailing
+      // DIVREM) -- ported-tests triage (divl_basic HANG). Prints every ROB commit +
+      // every DivEu writeback, so a stall shows up as "commits stop advancing" with no
+      // further DIV-WB, pinning whether the divider itself never completes or a
+      // downstream resource (scoreboard/ROB slot) never frees. Zero cost unless
+      // PORTED_TRACE_DIV is set.
+      if (sys.env.contains("PORTED_TRACE_DIV")) {
+        var trCyc = 0
+        cd.onSamplings {
+          trCyc += 1
+          for (k <- 0 until 2) {
+            val c = dut.rob.logic.commitObs(k)
+            if (c.fire.toBoolean) {
+              println(f"[divtrace] COMMIT cyc=$trCyc%6d port=$k robId=${c.robId.toInt} pc=0x${c.pc.toLong & 0xffffffffL}%08x")
+            }
+          }
+          if (dut.divEu.logic.wbObs.valid.toBoolean) {
+            val w = dut.divEu.logic.wbObs
+            println(f"[divtrace] DIV-WB cyc=$trCyc%6d rid=${w.robId.toInt} dstArch=${w.dstArch.toInt} result=0x${w.result.toLong & 0xffffffffL}%08x nzvc=0x${w.nzvc.toInt & 0xf}%x")
+          }
+        }
+      }
+
       var cyc = 0L
       var word = 0L
       while (word == 0 && cyc < timeoutCycles) {
