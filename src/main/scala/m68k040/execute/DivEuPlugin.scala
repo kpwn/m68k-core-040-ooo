@@ -160,12 +160,9 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     compFault     := False
 
     // ---- CHK compare (single-cycle) ----
-    // CHK.W compares the low 16 bits (sign-extended); CHK.L the full 32. N=1 if
-    // Dn<0, N=0 if Dn>bound; trap (vector 6) iff Dn<0 || Dn>bound. CHK writes no
-    // register and (per Musashi) sets N as above; Z/V/C are left to match Musashi
-    // (validated in lock-step). We do NOT write NZVC here (CHK leaves CCR per the
-    // 68k "undefined except N" rule; the lock-step reconstructs CCR and the handler
-    // never depends on the unchanged bits — the directed ChkSpec checks N + trap).
+    // CHK.W compares the low 16 bits (sign-extended); CHK.L the full 32. Trap
+    // (vector 6) iff Dn<0 || Dn>bound. CHK writes no register, but DOES commit a
+    // full NZVC every execution (both trap and no-trap paths) — see chkNzvc below.
     val isChk = u1.op === DecOp.CHK
     val chkDn = u1.size.mux(
       Size.WORD -> s1A(15 downto 0).asSInt.resize(32),
@@ -179,10 +176,15 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val chkOver  = chkDn > chkBound
     val chkTrap  = chkNeg || chkOver
     // N flag per the rule: N=1 if Dn<0, N=0 otherwise (incl. Dn>bound and in-bounds).
-    // Z/V/C = 0 (matches Musashi's CHK CCR for both trap and no-trap paths). CHK
-    // ALWAYS commits this NZVC (even on the trap path, so the stacked CCR's N matches).
+    // Z = (Dn==0) — Musashi's m68k_op_chk_{16,32}_d: `FLAG_Z = ZFLAG_16/32(src)`, set
+    // UNCONDITIONALLY from the checked value's own zero-ness (labeled "Undocumented" in
+    // Musashi but real, oracle-matching 68k behavior — NOT hardcoded 0 as previously
+    // assumed here; found via a 200-seed fuzz campaign, task #139, 2026-07-16). V/C are
+    // genuinely always 0 (also "Undocumented" in Musashi, confirmed unconditional).
+    // CHK ALWAYS commits this NZVC (even on the trap path, so the stacked CCR matches).
     val chkN     = chkNeg
-    val chkNzvc  = (chkN ## False ## False ## False).asBits   // N Z(0) V(0) C(0)
+    val chkZ     = chkDn === 0
+    val chkNzvc  = (chkN ## chkZ ## False ## False).asBits   // N Z V(0) C(0)
 
     // ─────────────────────────────────────────────────────────────────────────
     // CMP2 / CHK2 bounds compare (single-cycle, transcribed VERBATIM from Musashi
