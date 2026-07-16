@@ -85,6 +85,38 @@ object PortedTestRunner {
       cd.waitSampling()
       dut.fa.logic.redirect.valid   #= false
 
+      // debug-only, env-gated trace for the MI_MOVE_EAEA_REV (memory-indirect dst,
+      // plain-memory src) MOVE crack -- ported-tests triage (move_l_abs_memind_dst).
+      // Zero cost unless PORTED_TRACE_MI is set. Mirrors FuzzLockStepSpec.scala's
+      // FUZZ_TRACE_CPLX ucBegin trace pattern.
+      if (sys.env.contains("PORTED_TRACE_MI")) {
+        var trCyc = 0
+        cd.onSamplings {
+          trCyc += 1
+          if (dut.dec.logic.ucBegin.toBoolean) {
+            val entryPc  = dut.dec.logic.ucEntryPkt.pc.toLong & 0xffffffffL
+            val realEntry = dut.dec.logic.ucRealEntry.toInt
+            val isMemInd = dut.dec.logic.ucIsMemInd.toBoolean
+            val moveDstMi = dut.dec.logic.ucMoveDstMi.toBoolean
+            val moveSrcMi = dut.dec.logic.ucMoveSrcMi.toBoolean
+            val dstEaEa  = dut.dec.logic.ucMoveDstMiEaEa.toBoolean
+            val srcEaEa  = dut.dec.logic.ucMoveSrcMiEaEa.toBoolean
+            val eaBase   = dut.dec.logic.ucEntryCtx.eaBase.toInt
+            val eaBaseV  = dut.dec.logic.ucEntryCtx.eaBaseValid.toBoolean
+            val eaDisp   = dut.dec.logic.ucEntryCtx.eaDispLo.toLong & 0xffffffffL
+            val miOd     = dut.dec.logic.ucEntryCtx.miOd.toLong & 0xffffffffL
+            val miPost   = dut.dec.logic.ucEntryCtx.miPost.toBoolean
+            val otherBase  = dut.dec.logic.ucEntryCtx.miOtherEaBase.toInt
+            val otherBaseV = dut.dec.logic.ucEntryCtx.miOtherEaBaseValid.toBoolean
+            val otherDisp  = dut.dec.logic.ucEntryCtx.miOtherEaDispLo.toLong & 0xffffffffL
+            println(f"[mitrace] UC-BEGIN cyc=$trCyc%5d entryPc=0x$entryPc%08x realEntry=$realEntry isMemInd=$isMemInd " +
+              f"moveDstMi=$moveDstMi moveSrcMi=$moveSrcMi dstEaEa=$dstEaEa srcEaEa=$srcEaEa " +
+              f"eaBase=$eaBase eaBaseV=$eaBaseV eaDisp=0x$eaDisp%08x miOd=0x$miOd%08x miPost=$miPost " +
+              f"otherBase=$otherBase otherBaseV=$otherBaseV otherDisp=0x$otherDisp%08x")
+          }
+        }
+      }
+
       var cyc = 0L
       var word = 0L
       while (word == 0 && cyc < timeoutCycles) {

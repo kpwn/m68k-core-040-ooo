@@ -333,9 +333,57 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // MicroOpAssembler gates it ILLEGAL (limmFullFmtDstBad, vector 4). The .B/.W imm-dst
     // mem-indirect forms (ext at op+2, visible to predecode) stay routed to the engine.
     val s0LimmFullDstBad = s0IsLineImm && s0ImmIsL && (s0ImmEa.klass === EaClass.MEMINDIRECT)
+    // ported-tests triage (move_l_abs_memind_dst): the OFFLOADED s0dstEa (Offload /
+    // computeOffload in MicroOpAssembler.scala) reads the MOVE dst's own ext word at a
+    // FIXED words(1)/words(2) position — correct only when the SOURCE EA is register-direct
+    // (0 ext words). Whenever the source itself consumes >=1 ext word (abs.W/abs.L/(d16,An)/
+    // mem-indirect/...), a full-format (bit8=1) dst EA's base ext word actually sits further
+    // down the stream than the offload assumes, so s0dstEa misreads a stale word there — for
+    // dst mode 6 / mode 7-reg3 this silently misclassifies a REAL memory-indirect dst as
+    // brief MEMSIMPLE (the misread bit8 happens to be 0), producing a false-negative
+    // slot0IsMemInd: the instruction never enters the µcode engine and instead mis-executes
+    // on the normal fast path (wrong store address, not a trap). This mirrors the
+    // ucMiDstEa/ucDstEaWords shift fix (task #119) applied further down for the µcode
+    // engine's OWN entry re-decode — duplicated locally here (rather than reordering ~80
+    // lines to hoist ucMiDstEa above this point) because THIS classification is what gates
+    // entry into the engine in the first place. Repro: move_l_abs_memind_dst.s (MOVE.L
+    // (abs).W src -> ([bd.W,An],od) memind dst, no index) — now correctly detected.
+    val s0dstModeIsFullCandidate = s0IsMove &&
+      ((s0opw(8 downto 6) === B"110") || ((s0opw(8 downto 6) === B"111") && (s0opw(11 downto 9) === B"011")))
+    def s0miWordsOf(extW: Bits): UInt = {
+      val bdSize  = extW(5 downto 4).asUInt
+      val bdWords = Mux(bdSize === U(2, 2 bits), U(1, 3 bits), Mux(bdSize === U(3, 2 bits), U(2, 3 bits), U(0, 3 bits)))
+      val odWords = Mux(!extW(1), U(0, 3 bits), Mux(extW(0), U(2, 3 bits), U(1, 3 bits)))
+      (U(1, 3 bits) + bdWords + odWords).resize(3)
+    }
+    val s0srcModeF = s0opw(5 downto 3).asUInt
+    val s0srcRegF  = s0opw(2 downto 0).asUInt
+    val s0srcWordCount = UInt(3 bits)
+    s0srcWordCount := 0
+    switch(s0srcModeF) {
+      is(U(5, 3 bits)) { s0srcWordCount := 1 }                         // (d16,An)
+      is(U(6, 3 bits)) { s0srcWordCount := Mux(s0pkt.words(1)(8), s0miWordsOf(s0pkt.words(1)), U(1, 3 bits)) }
+      is(U(7, 3 bits)) {
+        switch(s0srcRegF) {
+          is(U(0, 3 bits)) { s0srcWordCount := 1 }                     // (xxx).W
+          is(U(1, 3 bits)) { s0srcWordCount := 2 }                     // (xxx).L
+          is(U(2, 3 bits)) { s0srcWordCount := 1 }                     // (d16,PC)
+          is(U(3, 3 bits)) { s0srcWordCount := Mux(s0pkt.words(1)(8), s0miWordsOf(s0pkt.words(1)), U(1, 3 bits)) }
+          is(U(4, 3 bits)) { s0srcWordCount := Mux(spec0.size === Size.LONG, U(2, 3 bits), U(1, 3 bits)) }  // #imm
+        }
+      }
+    }
+    def s0WordAtDyn(idx: UInt): Bits = {
+      val out = Bits(16 bits); out := B(0, 16 bits)
+      switch(idx) { for (i <- 0 until s0pkt.words.length) { is(U(i, idx.getWidth bits)) { out := s0pkt.words(i) } } }
+      out
+    }
+    val s0dstExtW0Shifted = s0WordAtDyn((U(1, 5 bits) + s0srcWordCount.resize(5)).resize(5))
+    val s0dstIsMemIndShifted = s0dstModeIsFullCandidate && s0dstExtW0Shifted(8) &&
+                               (s0dstExtW0Shifted(2 downto 0).asUInt =/= U(0, 3 bits))
     val slot0IsMemInd = fed.valid && (
       ((s0IsMove && (s0srcEa.klass === EaClass.MEMINDIRECT))) ||
-      ((s0IsMove && (s0dstEa.klass === EaClass.MEMINDIRECT))) ||
+      ((s0IsMove && ((s0dstEa.klass === EaClass.MEMINDIRECT) || s0dstIsMemIndShifted))) ||
       (s0IsAluSrcLine && s0AluSrcMode && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s0IsLineImm && !s0ImmIsL && (s0ImmEa.klass === EaClass.MEMINDIRECT)) ||
       (s0IsSingleEa && (s0srcEa.klass === EaClass.MEMINDIRECT)))
@@ -773,13 +821,20 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val ucMoveSrcModeIsReg = ucIsMove && ((ucEopw(5 downto 3) === B"000") || (ucEopw(5 downto 3) === B"001"))
     val ucMoveSrcMiEaEa = ucMoveSrcMi && !ucMoveDstModeIsReg && !ucMoveDstMi  // src=MI, dst=plain memory
     // dst=MI, src=plain memory (the MIRROR direction): a `MI_MOVE_EAEA_REV_ENTRY` chain
-    // exists in the ROM for this shape, but its store lands at the wrong address in
-    // testing (a bug not yet root-caused — the analogous src=MI/dst=plain direction
-    // above is fully verified; this direction is NOT). Trap illegal (below) rather than
-    // ship a silently-wrong chain; NOT wired to ucMoveDstMiEaEa until debugged.
-    val ucMoveDstMiEaEaBroken = ucMoveDstMi && !ucMoveSrcModeIsReg && !ucMoveSrcMi
-    val ucMoveDstMiEaEa = False   // scoped out (see above) — always route to the illegal trap
-    val ucMoveBothMi    = (ucMoveSrcMi && ucMoveDstMi) || ucMoveDstMiEaEaBroken  // -> scoped-out illegal (below)
+    // exists in the ROM for this shape. Previously left unwired ("store lands at the
+    // wrong address" per an earlier debugging session, not root-caused at the time) —
+    // task #147 (ported-tests triage) root-caused it: the earlier failure predated the
+    // ucDstEaWords word-count SHIFT (task #119, added for the forward MI_MOVE_EAEA
+    // direction's dst-side re-decode) ever being re-validated against THIS reverse
+    // direction. ucMiDstEa (the pointer side here) already reads through that same
+    // shifted-words decode regardless of direction, and ucMiOtherEa's Mux already
+    // selects ucMiSrcEa (the plain side) when ucMoveDstMiEaEa is true — both were
+    // already correct, just never wired live. Verified via move_l_abs_memind_dst.s
+    // (abs-src -> memind-dst no-index): now PASSes.
+    val ucMoveDstMiEaEa = ucMoveDstMi && !ucMoveSrcModeIsReg && !ucMoveSrcMi
+    val ucMoveBothMi    = ucMoveSrcMi && ucMoveDstMi   // both sides mem-indirect -> scoped-out illegal (below)
+    // (ucMoveDstMiEaEa/ucMoveSrcMiEaEa/ucMoveBothMi are already simPublic'd further
+    // below, in the existing "debug-only observability (task #139...)" block.)
     // The mem-indirect side's counterpart EA (the plain, non-register side) for the EA<->EA
     // chains: whichever of src/dst is NOT the pointer-load target. Computed unconditionally
     // (mirrors the movesRn/bit-field-EA ctx groups elsewhere in this function) — harmless
@@ -916,6 +971,11 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       ucEntryCtx.eaIndexScale := ucCasEaDec.indexScale
       ucEntryCtx.eaDispLo     := ucCasEaDec.disp
     }
+    // debug-only observability (ported-tests triage: move_l_abs_memind_dst / MI_MOVE_EAEA_REV)
+    ucEntryCtx.eaBase.simPublic(); ucEntryCtx.eaBaseValid.simPublic(); ucEntryCtx.eaDispLo.simPublic()
+    ucEntryCtx.miOd.simPublic(); ucEntryCtx.miPost.simPublic()
+    ucEntryCtx.miOtherEaBase.simPublic(); ucEntryCtx.miOtherEaBaseValid.simPublic()
+    ucEntryCtx.miOtherEaDispLo.simPublic()
 
     // The REAL entry: a bit-field RMW (microcoded BITFIELD) picks 5B vs 4B by needHi; a
     // full-format mem-indirect host picks its shape entry; MOVES picks WRITE vs READ by the
