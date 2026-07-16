@@ -349,8 +349,28 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // latency added on the forward (payload) path — which is exactly the arc we are
     // cutting. For the always-ready ALU/branch EUs this drains every cycle (no
     // bubble); for the LS EU it back-pressures into the IQ as before.
+    // Task #139 fix: `m2sPipe(flush = flushSignal)` clears the pipe's internal valid
+    // REGISTER on a flush, but that clear only takes effect the FOLLOWING cycle (a
+    // Reg update, like any other) -- it does NOT combinationally suppress the pipe's
+    // OUTPUT on the SAME cycle the flush pulse fires. If a slot won selection and
+    // entered this registered stage on the cycle BEFORE a flush (legitimately, per
+    // the pre-flush `!flushSignal` gate on `selPorts` above), its payload is already
+    // latched and its `.valid` output still reads True on the flush cycle itself,
+    // and if the downstream EU also happens to be `.ready` that exact cycle, the
+    // handshake FIRES -- a genuine wrong-path issue reaching the EU on the flush
+    // cycle, contradicting this file's own stated intent ("a squashed selection
+    // never reaches the EU"). Root-caused via cycle-accurate trace (task #139
+    // finding #1, fuzz-campaign-divergence-2026-07-16 memory): a wrong-path STORE
+    // issued to the LS EU on the EXACT SAME cycle as a branch-mispredict flush,
+    // later allocating a permanently-orphaned entry into the StoreQueue that blocks
+    // head-of-line drain and hangs the pipeline. Explicitly AND `!flushSignal` into
+    // the FINAL output valid (on top of what m2sPipe's own `flush` already does) so
+    // a same-cycle race can never present a stale, pre-flush payload as valid.
     for (k <- 0 until 5) {
-      issuePorts(k) << selPorts(k).m2sPipe(collapsBubble = false, flush = flushSignal)
+      val piped = selPorts(k).m2sPipe(collapsBubble = false, flush = flushSignal)
+      issuePorts(k).valid   := piped.valid && !flushSignal
+      issuePorts(k).payload := piped.payload
+      piped.ready           := issuePorts(k).ready
     }
 
     // Free chosen slots when their SELECT port fires (i.e. when the uop moves into
@@ -378,8 +398,21 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // including ohB here that trigger would never clear (the branch fires on port 2,
     // not 0/1) and the consumer would hang. A plain branch (no int pdst) generates a
     // harmless no-consumer event. The branch EU's An bypass covers the same-cycle read.
+    //
+    // Task #141 fix (2nd half): LS (port 3) and CPLX (port 4) MUST be included too, for
+    // the same reason as ohB above. Per the push-time logic just above, a static sb*
+    // scoreboard slot (and its physToSlot-derived trigger) CAN be recorded for a producer
+    // that fires on port 3 or 4: LS's own int/NZVC dsts always route to the dynamic
+    // lsBusy/lsNzvcBusy bitmaps instead (so ohL is a harmless no-op event source in
+    // practice today), but CPLX's NZVC dst (e.g. CMP2/CHK2) has no dynamic-tracker
+    // equivalent and goes through plain static sbNzvc -- so a dependent's trigger CAN
+    // reference a CPLX-fired slot, and without ohC here that trigger would never clear,
+    // hanging the dependent forever (exactly the seed-62 CMP2/CHK2-then-ADDX repro; see
+    // fuzz-campaign-divergence-2026-07-16 memory). Included symmetrically with the
+    // busy-clear loop above, which now also covers all 5 ports.
     val events = oh0.andMask(selPorts(0).fire) | oh1.andMask(selPorts(1).fire) |
-                 ohB.andMask(selPorts(2).fire)
+                 ohB.andMask(selPorts(2).fire) | ohL.andMask(selPorts(3).fire) |
+                 ohC.andMask(selPorts(4).fire)
 
     // ---- Depend-on-READ trigger init for the two newly-pushed slots ----
     // Slot0 lands at priority `slot0Prio` (lines.last.ways(0)), slot1 at
@@ -729,7 +762,25 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // depend on an already-result-available producer. A SLOW (shift) producer is in the
     // aluSlow* bitmaps, NOT sb*, so its sb*-clear here is a harmless no-op; aluSlow* is
     // cleared at the lat2 wakeup (below), NOT at issue.
-    for (k <- 0 until wayCount) {
+    //
+    // Task #141 fix: this loop MUST cover every issue port (selPorts has 5: ALU0/ALU1/
+    // Branch/LS/CPLX), not just `wayCount` (=2, the DISPATCH width -- an unrelated
+    // constant that happened to also be 2, masking the bug for a long time). A static
+    // (sbInt/sbNzvc/sbX) producer that fires on port 2/3/4 never had its busy bit
+    // cleared here, so any later consumer's trigger referencing that slot could latch
+    // permanently (the trigger only clears via THIS SAME clearing event, which never
+    // came). LS's own int/NZVC producers are unaffected in practice (they route through
+    // the separate `lsBusy`/`lsNzvcBusy` dynamic bitmaps instead, never touching sb* in
+    // the first place — confirmed harmless no-op for that case), and the branch port
+    // already had a hand-patched partial fix below (now redundant, left in place as a
+    // harmless idempotent duplicate). The concretely CONFIRMED victim: CMP2/CHK2 (CPLX,
+    // port 4) writes NZVC via the plain static `sbNzvc` path (no CPLX-specific dynamic
+    // NZVC tracker exists, unlike its int dst which correctly uses `cplxBusy`) -- its
+    // busy bit never cleared on issue, permanently blocking any later NZVC reader (e.g.
+    // a following ADDX/ADD/SUB reading the flags CMP2/CHK2 just wrote). Root-caused via
+    // live trace, task #139/#141, seed 62 (see fuzz-campaign-divergence-2026-07-16
+    // memory); repro: repros/fuzz-seed62-cmp2-hang.s.
+    for (k <- selPorts.indices) {
       val ctx = selPorts(k).payload
       val slowFire = isAluSlowProducer(ctx.uop)
       when(selPorts(k).fire && !slowFire) {
@@ -741,6 +792,9 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // The BRANCH port (port 2) also clears its int pdst busy: an RTS/RTR ibranch is a
     // latency-1 int producer (A7) in sbInt, so a later push must not record a static
     // trigger on its already-issued (result-available) slot. (A branch writes no flags.)
+    // NOTE: redundant with the widened loop above (now covers port 2 too); left in
+    // place as a harmless idempotent duplicate rather than risk touching more lines
+    // than necessary for this fix.
     {
       val bctx = selPorts(2).payload
       when(selPorts(2).fire && bctx.uop.pdstValid) { sbInt.busy(bctx.uop.pdst) := False }

@@ -117,6 +117,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     excXlateWrite   = Bool(); excXlateSupervisor = Bool()
     sqEmptySig      = Bool()
     issuePort      = Stream(IqContext())
+    issuePort.valid.simPublic(); issuePort.ready.simPublic(); issuePort.payload.robId.simPublic() // debug-only, task #139 finding #1; zero synth impact
     completionPort = Flow(UInt(6 bits))
     sqCommitPort   = Flow(UInt(6 bits))
     // Slot-1 commit: defaults to idle (allowOverride) so single-retire benches/stubs
@@ -250,6 +251,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // cone ends here. `s1Data` is the registered store data (off the AGU cone).
     val s1Valid = RegInit(False)
     val s1Ctx   = Reg(IqContext())
+    s1Ctx.robId.simPublic() // debug-only observability, task #139 finding #1 investigation; zero synth impact
     val s1Base  = Reg(UInt(32 bits))
     val s1Data  = Reg(Bits(32 bits))
     // Registered scaled index term (brief-format indexed EA): 0 for a non-indexed access.
@@ -519,7 +521,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // agnostic). All comp* are RegInit/Reg (no uninit fanout).
     val compValid     = RegInit(False)
     val compRobId     = Reg(UInt(6 bits))
+    compValid.simPublic(); compRobId.simPublic() // debug-only, task #139 finding #1; zero synth impact
     val compData      = Reg(Bits(32 bits))
+    compData.simPublic() // debug-only, task #144
     val compPdst      = Reg(UInt(6 bits))
     val compPdstValid = RegInit(False)
     val compIsLoad    = RegInit(False)   // load (writes a reg + wakes) vs store
@@ -559,8 +563,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val compDstArch   = Reg(UInt(5 bits))
     // NZVC writeback for a MOVE-to-memory store (N/Z of the moved value, V=C=0).
     val compNzvc      = Reg(Bits(4 bits))
+    compNzvc.simPublic() // debug-only, task #144
     val compNzvcWrite = RegInit(False)
     val compNzvcDst   = Reg(UInt(nzvcW.address.getWidth bits))
+    compNzvcWrite.simPublic(); compNzvcDst.simPublic() // debug-only, task #139/#141 lsNzvc investigation
     // RTR CCR-restore (X := loaded[4]); NZVC := loaded[3:0] reuses compNzvc.
     val compX         = RegInit(False)
     val compXWrite    = RegInit(False)
@@ -763,6 +769,38 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // this only stalls issue for that one extra cycle.
     issuePort.ready := !busy && !s1Valid && !compValid
 
+    // Task #139 finding #1 mechanism #2: this core recovers branch mispredicts at
+    // RETIRE time only (task #116 -- resolve-time recovery is a pending IPC lever),
+    // so `sqFlushSig` (== the ROB's registered doFlush pulse) can fire many cycles
+    // AFTER a wrong-path µop was legitimately issued into this EU (issued back when
+    // it still looked correct-path). `sqFlushSig` itself is only a ONE-CYCLE pulse,
+    // but a straggling access can still be several states deep (XLATE/RESOLVE/WAIT/
+    // etc) when it fires and take several MORE cycles to reach its own completion --
+    // well past that one-cycle window. Nothing previously caught this: the StoreQueue
+    // squashes its OWN then-resident uncommitted entries on `io.flush` (StoreQueue.
+    // scala's `when(io.flush){ keep := valids&&committed... }`), but a store that
+    // hadn't reached `sq.io.alloc.valid` YET at the flush cycle sails through
+    // unchecked afterwards (`when(io.alloc.valid && !io.flush)` only reads the
+    // CURRENT cycle's flush). Root-caused via a direct SQ-ALLOC-vs-pcStore trace
+    // (fuzz-campaign-divergence-2026-07-16 memory): a wrong-path store's SQ entry
+    // was allocated under a robId number the ROB later reclaimed and reused for a
+    // real, later instruction -- the orphan entry (never `committed`, since its
+    // true wrong-path owner never retires) sits at the SQ ring head forever,
+    // permanently blocking drain (classic head-of-line block, same symptom class as
+    // finding #1's original same-cycle-race mechanism, but a genuinely different
+    // multi-cycle root cause). `poisoned` sticky-latches across a straggling
+    // access's remaining lifetime so its eventual terminal action can be dropped
+    // with NO observable side effect (no SQ alloc, no ROB completion/wakeup) --
+    // exactly as if it had never been issued, matching what SHOULD happen to a
+    // squashed instruction.
+    val poisoned = RegInit(False); poisoned.simPublic()
+    when(issuePort.fire) {
+      poisoned := False
+    } elsewhen(sqFlushSig && (busy || s1Valid)) {
+      poisoned := True
+    }
+    sqFlushSig.simPublic()
+
     // S0 -> S1 advance (only when not busy in a wait state). The bypassed BASE operand
     // (`base0`) is latched here — NOT the computed effective address — so the deep
     // ALU->base cone ends at the `s1Base` flop. The effective address `s1Va`, the
@@ -814,7 +852,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
             // LEA address-generate: complete immediately with the computed EA address
             // (s1Va) as the int result. NO translate, NO cache access -> never page-faults.
             // The int dst (An / T0) write + wakeup ride captureCompletion's leaAddr path.
-            captureCompletion(s1Va.asBits)
+            // Task #139 mechanism #2: suppress for a poisoned (squashed) access.
+            when(!poisoned) { captureCompletion(s1Va.asBits) }
             busy    := False
             s1Valid := False
           } elsewhen(isLoad || isStore) {
@@ -839,7 +878,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
                 // resident / write-protect / supervisor). The access does NOT
                 // proceed (no SQ alloc / no cache launch); it completes as a FAULT
                 // (vector 2) so the ROB flags the entry for precise delivery.
-                captureFault()
+                // Task #139 mechanism #2: suppress for a poisoned (squashed) access.
+                when(!poisoned) { captureFault() }
                 busy    := False
                 s1Valid := False
                 goto(IDLE)
@@ -853,7 +893,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
               s1Valid := True
             }
           } otherwise {
-            captureCompletion(B(0, 32 bits))   // non-memory (defensive)
+            when(!poisoned) { captureCompletion(B(0, 32 bits)) }   // non-memory (defensive)
           }
         }
       }
@@ -878,7 +918,17 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           // commit incrementally in ROB order and drain (hold-until-ack), freeing a slot.
           // `sq.io.full` is read ONLY here in the execute FSM (off the IQ select cone),
           // mirroring the push-only `lsBusy` discipline — no IQ-critical-path impact.
-          when(!sq.io.full) {
+          //
+          // Task #139 mechanism #2: a poisoned (squashed) store must NEVER reach
+          // `sq.io.alloc` — that's the root cause this fix closes (an orphaned
+          // wrong-path SQ entry that never becomes `committed`, permanently blocking
+          // ring drain). Drop it immediately, bypassing the full-check/WAIT_SQ path
+          // entirely (no need to wait for ring space for a store we won't commit).
+          when(poisoned) {
+            busy    := False
+            s1Valid := False
+            goto(IDLE)
+          } elsewhen(!sq.io.full) {
             sq.io.alloc.valid := True
             captureCompletion(B(0, 32 bits))
             busy    := False
@@ -909,7 +959,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
         busy := True
         when(fwdHit && !s1TwoAccess) {
           // full-overlap forward: skip the cache (aligned only).
-          captureCompletion(fwdData)
+          // Task #139 mechanism #2: suppress for a poisoned (squashed) access.
+          when(!poisoned) { captureCompletion(fwdData) }
           busy    := False
           s1Valid := False
           goto(IDLE)
@@ -958,7 +1009,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       WAIT.whenIsActive {
         busy := True
         when(dcache.loadRsp.valid) {
-          captureCompletion(dcache.loadRsp.payload.data)
+          // Task #139 mechanism #2: suppress for a poisoned (squashed) access.
+          when(!poisoned) { captureCompletion(dcache.loadRsp.payload.data) }
           busy    := False
           s1Valid := False
           goto(IDLE)
@@ -994,7 +1046,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
         when(dcache.loadRsp.valid) {
           val merged = m68k040.cache.DcacheByteLane.extractCross(
             lineA, dcache.loadRsp.payload.line, lineOff, u1.size)
-          captureCompletion(merged)
+          // Task #139 mechanism #2: suppress for a poisoned (squashed) access.
+          when(!poisoned) { captureCompletion(merged) }
           busy    := False
           s1Valid := False
           goto(IDLE)
@@ -1009,7 +1062,14 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       // are strictly older — incremental ROB-order commit guarantees forward progress).
       WAIT_SQ.whenIsActive {
         busy := True
-        when(!sq.io.full) {
+        // Task #139 mechanism #2: a poisoned (squashed) store must never reach
+        // `sq.io.alloc` -- drop it immediately rather than continuing to wait
+        // for ring space for a store we will not commit.
+        when(poisoned) {
+          busy    := False
+          s1Valid := False
+          goto(IDLE)
+        } elsewhen(!sq.io.full) {
           sq.io.alloc.valid := True
           captureCompletion(B(0, 32 bits))
           busy    := False
@@ -1018,6 +1078,21 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
         }
       }
     }
+
+    // ---- debug-only FSM-state observability (task #139 finding #1 investigation) ----
+    // Zero synth impact (sim tap only, not referenced by any RTL logic).
+    val dbgIsIdle    = fsm.isActive(fsm.IDLE);    dbgIsIdle.simPublic()
+    val dbgIsXlate   = fsm.isActive(fsm.XLATE);   dbgIsXlate.simPublic()
+    val dbgIsResolve = fsm.isActive(fsm.RESOLVE); dbgIsResolve.simPublic()
+    val dbgIsLaunch  = fsm.isActive(fsm.LAUNCH);  dbgIsLaunch.simPublic()
+    val dbgIsWait    = fsm.isActive(fsm.WAIT);    dbgIsWait.simPublic()
+    val dbgIsWaitA   = fsm.isActive(fsm.WAIT_A);  dbgIsWaitA.simPublic()
+    val dbgIsWaitB   = fsm.isActive(fsm.WAIT_B);  dbgIsWaitB.simPublic()
+    val dbgIsWaitSQ  = fsm.isActive(fsm.WAIT_SQ); dbgIsWaitSQ.simPublic()
+    sq.io.full.simPublic()
+    u1.eaAuto.simPublic(); isLoad.simPublic(); isStore.simPublic()
+    sq.io.fwd.query.robId.simPublic()
+    sq.io.fwd.rsp.hit.simPublic(); sq.io.fwd.rsp.stall.simPublic()
 
     // ---- wbObs (sim-only whitebox) ----
     // Driven straight from the registered completion stage (already a register), so
