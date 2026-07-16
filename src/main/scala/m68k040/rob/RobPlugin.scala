@@ -47,6 +47,19 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val retireAlone = Bool()
   }
 
+  /** BTB/gshare retire-time training payload (task #129, area). Written ONLY by
+    * branchCompletion (a single writer — never at alloc, see below), so this is a
+    * plain single-write-port sync-read Mem: safe to map to BRAM (no multi-writer
+    * collision arbitration needed, unlike `payload` which has 2 alloc write ports).
+    */
+  case class BranchTrainPayload() extends Bundle {
+    val pc       = UInt(32 bits)
+    val taken    = Bool()
+    val target   = UInt(32 bits)
+    val brType   = UInt(2 bits)
+    val phtIndex = UInt(11 bits)
+  }
+
   val logic = during build new Area {
     val rc = host[RenameCommitService]
     // External interrupt inputs (simple protocol). The recognition logic (Task 3)
@@ -70,6 +83,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // ── Ring storage ────────────────────────────────────────────────────────
     val payload   = Mem(RobPayload(), depth)
     val completes = Vec.fill(depth)(RegInit(False))
+    completes.foreach(_.simPublic()) // debug-only, task #139 finding #1; zero synth impact
     val head  = Reg(UInt(robIdW bits)) init 0
     val tail  = Reg(UInt(robIdW bits)) init 0
     val count = Reg(UInt(log2Up(depth + 1) bits)) init 0
@@ -119,35 +133,30 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // Pulses the cycle a BTB-eligible branch retires (driven below near branchRedirect,
     // where retire0/h0 are in scope). Concrete idle defaults so a standalone DUT (no
     // BtbPlugin consumer) elaborates; the BtbPlugin reads it in the full core.
-    // btbUpdateComb is the raw combinational decision; the EXPOSED btbUpdateFlow is a
-    // REGISTERED copy of it (task #124, Fable audit F6) — training is latency-
-    // insensitive (only affects FUTURE fetches, long after this retire), so the extra
-    // cycle is free and removes this write from the retire-cone fanout. Registering
+    // btbUpdateValidComb is the raw combinational decision; the EXPOSED btbUpdateFlow's
+    // .valid is a REGISTERED copy of it (task #124, Fable audit F6) — training is
+    // latency-insensitive (only affects FUTURE fetches, long after this retire), so the
+    // extra cycle is free and removes this write from the retire-cone fanout. Registering
     // the EXPOSED name (not a separate wrapper) means every existing consumer — the
     // BtbUpdateService getter AND the handful of test DUTs that wire
     // `rob.logic.btbUpdateFlow` directly — picks up the fix with no further changes.
-    val btbUpdateComb = Flow(BtbUpdate())
-    btbUpdateComb.valid := False
-    btbUpdateComb.payload.pc     := U(0, 32 bits)
-    btbUpdateComb.payload.taken  := False
-    btbUpdateComb.payload.target := U(0, 32 bits)
-    btbUpdateComb.payload.brType := U(0, 2 bits)
+    // The PAYLOAD is driven directly from branchTrainMem's readSync output below (task
+    // #129, area) — that Mem read is ITSELF the register (readSync has 1-cycle latency,
+    // matching what the old RegNext(btbUpdateComb.payload) provided), so there is no
+    // separate comb payload stage anymore.
+    val btbUpdateValidComb = Bool(); btbUpdateValidComb := False
     val btbUpdateFlow = Flow(BtbUpdate())
-    btbUpdateFlow.valid   := RegNext(btbUpdateComb.valid) init False
-    btbUpdateFlow.payload := RegNext(btbUpdateComb.payload)
+    btbUpdateFlow.valid := RegNext(btbUpdateValidComb) init False
     btbUpdateFlow.simPublic()
     // ── Retire-time gshare PHT update output (GshareUpdateService, slice 3) ──────
     // Pulses the cycle a CONDITIONAL gshare-predicted branch retires (driven below near
     // branchRedirect). Concrete idle defaults so a standalone DUT (no GsharePlugin
     // consumer) elaborates; the GsharePlugin reads it in the full core. 11-bit index.
-    // Same registered-output treatment as btbUpdateFlow above (task #124).
-    val gshareUpdateComb = Flow(GshareUpdate(11))
-    gshareUpdateComb.valid := False
-    gshareUpdateComb.payload.index := U(0, 11 bits)
-    gshareUpdateComb.payload.taken := False
+    // Same registered-output treatment as btbUpdateFlow above (task #124); payload same
+    // Mem-readSync treatment as btbUpdateFlow above (task #129).
+    val gshareUpdateValidComb = Bool(); gshareUpdateValidComb := False
     val gshareUpdateFlow = Flow(GshareUpdate(11))
-    gshareUpdateFlow.valid   := RegNext(gshareUpdateComb.valid) init False
-    gshareUpdateFlow.payload := RegNext(gshareUpdateComb.payload)
+    gshareUpdateFlow.valid := RegNext(gshareUpdateValidComb) init False
     gshareUpdateFlow.simPublic()
     // mispredictStore MUST default False: a freshly-allocated branch entry is "not
     // yet known mispredicted" until its EU completion (branchCompletion) says so.
@@ -155,6 +164,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // bit and can spuriously flush (a branch that completes via the normal port).
     // Reset per-alloc below (mirrors `completes`), with alloc-priority on a reused index.
     val mispredictStore = Vec.fill(depth)(RegInit(False))
+    mispredictStore.foreach(_.simPublic()) // debug-only observability, task #139 investigation; zero synth impact
     val nextPcStore     = Vec.fill(depth)(Reg(UInt(32 bits)))
     // ── BTB-update per-entry capture (fetch-time predictor, slice 1) ────────────
     // Recorded from branchCompletion (the branch EU) and read at retire to drive the
@@ -162,18 +172,24 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // so a never-allocated / re-used-but-not-yet-completed entry never spuriously
     // updates the BTB (mirrors mispredictStore's alloc-priority discipline).
     val btbIsBranchStore = Vec.fill(depth)(RegInit(False))
-    val btbPcStore       = Vec.fill(depth)(Reg(UInt(32 bits)))
-    val btbTakenStore    = Vec.fill(depth)(RegInit(False))
-    val btbTargetStore   = Vec.fill(depth)(Reg(UInt(32 bits)))
-    val btbTypeStore     = Vec.fill(depth)(Reg(UInt(2 bits)))
     // ── gshare PHT-update per-entry capture (slice 3) ───────────────────────────
     // phtValidStore : this retiring branch is a CONDITIONAL gshare-predicted one whose
-    // carried fetch-time index (phtIndexStore) must be trained at retire. RegInit(False)
+    // carried fetch-time index (in branchTrainMem) must be trained at retire. RegInit(False)
     // so a never-allocated / re-used-but-not-yet-completed entry never spuriously updates
     // the PHT (mirrors btbIsBranchStore's alloc-priority discipline). The resolved
-    // direction reuses btbTakenStore (== actualTaken).
+    // direction reuses branchTrainMem's `taken` field (== actualTaken).
     val phtValidStore    = Vec.fill(depth)(RegInit(False))
-    val phtIndexStore    = Vec.fill(depth)(Reg(UInt(11 bits)))
+    // pc/taken/target/brType/phtIndex: task #129 (area) — folded into ONE sync-read
+    // Mem (branchTrainMem, below) instead of 5 separate Reg-Vec arrays. NO alloc-time
+    // reset write: btbIsBranchStore/phtValidStore (above, unchanged Reg-Vecs) are the
+    // alloc-reset GATES that make a stale/never-written Mem row unreachable — a retiring
+    // entry only ever reads branchTrainMem(h0) when one of those gates is True, which is
+    // only ever set True by the SAME branchCompletion write that freshens this row, and
+    // completion always strictly precedes retire in time. This keeps branchTrainMem to a
+    // SINGLE write port (branchCompletion only) — safe for BRAM (no same-cycle multi-
+    // writer collision arbitration needed, unlike `payload`'s 2 alloc write ports; see
+    // [[fpga-synth-multiwrite-mem]] for why a naive multi-write sync-read Mem is unsafe).
+    val branchTrainMem   = Mem(BranchTrainPayload(), depth)
     // Precise-fault per-entry capture — RegInit Vecs reset per-alloc (mirrors
     // mispredictStore). RegInit(False) guarantees a never-allocated / re-allocated
     // entry reads "not faulted / not RTE" deterministically (no uninit-Mem flake).
@@ -239,6 +255,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // reads deterministically.
     val firstStore = Vec.fill(depth)(RegInit(False))
     val pcStore    = Vec.fill(depth)(RegInit(U(0, 32 bits)))
+    pcStore.foreach(_.simPublic()) // debug-only, task #139 finding #1; zero synth impact
     // LS access-fault completion (driven by the LS-cluster wiring, like
     // branchCompletion). Default-idle (allowOverride) so a standalone DUT elaborates.
     val lsFaultCompletion = Flow(m68k040.execute.LsFault())
@@ -493,14 +510,18 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       nextPcStore(branchCompletion.payload.robId)     := branchCompletion.payload.nextPc
       // BTB-update capture (read at retire to drive the BTB write port).
       btbIsBranchStore(branchCompletion.payload.robId) := branchCompletion.payload.isBranch
-      btbPcStore(branchCompletion.payload.robId)       := branchCompletion.payload.btbPc
-      btbTakenStore(branchCompletion.payload.robId)    := branchCompletion.payload.btbTaken
-      btbTargetStore(branchCompletion.payload.robId)   := branchCompletion.payload.btbTarget
-      btbTypeStore(branchCompletion.payload.robId)     := branchCompletion.payload.brType
-      // gshare PHT-update capture (slice 3): the conditional-predicted bit + the carried
-      // fetch-time index (read at retire to train the exact PHT entry the lookup read).
+      // gshare PHT-update capture (slice 3): the conditional-predicted bit (read at
+      // retire to train the exact PHT entry the lookup read).
       phtValidStore(branchCompletion.payload.robId)    := branchCompletion.payload.phtValid
-      phtIndexStore(branchCompletion.payload.robId)    := branchCompletion.payload.phtIndex
+      // Single write port into branchTrainMem (task #129) — see the comment at its
+      // declaration for why this is the ONLY writer.
+      val btrainWr = BranchTrainPayload()
+      btrainWr.pc       := branchCompletion.payload.btbPc
+      btrainWr.taken    := branchCompletion.payload.btbTaken
+      btrainWr.target   := branchCompletion.payload.btbTarget
+      btrainWr.brType   := branchCompletion.payload.brType
+      btrainWr.phtIndex := branchCompletion.payload.phtIndex
+      branchTrainMem.write(branchCompletion.payload.robId, btrainWr)
     }
     // CCR-value completion: record each completing instruction's NZVC/X VALUES per
     // entry (BEFORE the alloc-reset so a re-used index's alloc wins). One port/EU.
@@ -624,28 +645,36 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // into it below (after the exc unit is built).
     val branchRedirect = retire0 && p0.retireAlone && mispredictStore(h0)
 
+    // ── branchTrainMem retire-time read (task #129, area) ───────────────────────
+    // A single readSync port, enabled on every retire0 (regardless of which consumer
+    // below needs it — cheaper than two separately-gated read ports, and harmless when
+    // neither gate fires since the *Flow.valid stays False that cycle). This read IS the
+    // register: its output lands the cycle AFTER retire0, exactly matching the old
+    // RegNext(*Comb.payload) timing, so BtbPlugin/GsharePlugin see no timing change.
+    val branchTrainRd = branchTrainMem.readSync(h0, retire0)
+    btbUpdateFlow.payload.pc     := branchTrainRd.pc
+    btbUpdateFlow.payload.taken  := branchTrainRd.taken
+    btbUpdateFlow.payload.target := branchTrainRd.target
+    btbUpdateFlow.payload.brType := branchTrainRd.brType
+    gshareUpdateFlow.payload.index := branchTrainRd.phtIndex
+    gshareUpdateFlow.payload.taken := branchTrainRd.taken
+
     // ── Retire-time BTB update (fetch-time predictor, slice 1) ──────────────────
     // When a BTB-eligible branch retires at the head (retire0 — branches are
     // retireAlone, so they always retire in slot 0), drive the BtbPlugin write port
     // with its captured PC/target/brType + resolved direction. ONLY at retire => no
     // wrong-path pollution (a squashed wrong-path branch never reaches retire).
     when(retire0 && btbIsBranchStore(h0)) {
-      btbUpdateComb.valid         := True
-      btbUpdateComb.payload.pc     := btbPcStore(h0)
-      btbUpdateComb.payload.taken  := btbTakenStore(h0)
-      btbUpdateComb.payload.target := btbTargetStore(h0)
-      btbUpdateComb.payload.brType := btbTypeStore(h0)
+      btbUpdateValidComb := True
     }
     // ── Retire-time gshare PHT update (slice 3) ─────────────────────────────────
     // When a CONDITIONAL gshare-predicted branch retires at the head (retire0 — branches
     // are retireAlone → always slot 0), train pht[carried-index] toward its RESOLVED
-    // direction (btbTakenStore == actualTaken). ONLY at retire ⇒ no wrong-path pollution.
-    // The carried fetch-time index (phtIndexStore) — not a retire-time recompute — is
-    // mandatory (the speculative GHR has shifted by retire).
+    // direction (branchTrainRd.taken == actualTaken). ONLY at retire ⇒ no wrong-path
+    // pollution. The carried fetch-time index (branchTrainRd.phtIndex) — not a
+    // retire-time recompute — is mandatory (the speculative GHR has shifted by retire).
     when(retire0 && phtValidStore(h0)) {
-      gshareUpdateComb.valid        := True
-      gshareUpdateComb.payload.index := phtIndexStore(h0)
-      gshareUpdateComb.payload.taken := btbTakenStore(h0)
+      gshareUpdateValidComb := True
     }
 
     // ── Precise-fault exception-pending (combinational at faulted retire) ───────
@@ -728,8 +757,26 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // PC); a fault/trap uses them, an interrupt overrides with its own vector/PC.
     val excEntryVector  = Mux(interruptPending, interruptVec, exceptionVector)
     val excEntryPc      = Mux(interruptPending, interruptPc,  exceptionPc)
+    // MMU control (task #131): resolved here so the exception FSM's MOVEC read-side
+    // case (Rc->Rn: TCR/URP/SRP) can read mmuCtrl.mmuEnable/urp/srp — MmuControlPlugin
+    // has no dependencies of its own, so this is a plain leaf lookup (no Fiber-cycle
+    // risk, unlike PrivilegeService). The write-side (real supervisor code
+    // PROGRAMMING the MMU via MOVEC) was reverted — see MmuControlPlugin's doc
+    // comment — so mmuCtrl is READ-ONLY here now.
+    // OPTIONAL (host.get, mirrors intCtrl below): standalone ROB unit-test DUTs
+    // (RobPluginSpec/RobFaultSpec/etc.) don't instantiate an MmuControlPlugin — fall
+    // back to a throwaway idle implementation so those DUTs keep elaborating
+    // unchanged. The full-core DUTs DO include MmuControlPlugin (same pattern DtlbPlugin/
+    // ItlbPlugin already rely on).
+    val mmuCtrl: m68k040.services.MmuControlService =
+      host.get[m68k040.services.MmuControlService].getOrElse(new m68k040.services.MmuControlService {
+        override def mmuEnable = False
+        override def urp = U(0, 32 bits)
+        override def srp = U(0, 32 bits)
+      })
     val exc = new m68k040.exception.ExceptionUnit(
       ss = new m68k040.exception.SystemState,
+      mmuCtrl = mmuCtrl,
       entryTrigger = excEntryTrigger, entryVector = excEntryVector, entryPc = excEntryPc,
       // PPC for a format-$2 group-2 trap (TRAPV/CHK/DIV0) = the trapping INSTRUCTION's
       // PC. pcStore(h0) holds the instruction PC (variable-length safe; entryPc-2 only
