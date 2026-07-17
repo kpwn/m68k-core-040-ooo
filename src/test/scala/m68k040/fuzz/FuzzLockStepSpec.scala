@@ -124,6 +124,13 @@ object FuzzRunner {
               sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
               msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
               isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+            // Task #144: directly map robId -> the lock-step comparator's own "idx"
+            // (handle.result.size right after this commit is processed), sidestepping
+            // ALL manual PC-arithmetic/instruction-length correlation -- the previous
+            // 3 manual attempts this session were unreliable; this is authoritative.
+            if (sys.env.contains("FUZZ_TRACE_CPLX")) {
+              println(f"[cplxtrace] IDX-MAP port=$k robId=${c.robId.toInt} pc=0x${c.pc.toLong & 0xffffffffL}%08x -> idx=${handle.result.size - 1}")
+            }
           }
         }
         {
@@ -138,12 +145,245 @@ object FuzzRunner {
         }
       }
 
+      // TEMP DEBUG (task #139 CMP2/CHK2 hang, env-gated so it's a complete no-op
+      // unless explicitly enabled -- guarantees EXACT reproduction since it rides
+      // the REAL FuzzRunner.run harness rather than a hand-rolled boot sequence
+      // that can silently diverge in wrong-path/SparseMemory fill content via
+      // scala.util.Random state differences).
+      if (sys.env.contains("FUZZ_TRACE_CPLX")) {
+        var trCyc = 0
+        var trLastLine = ""
+        cd.onSamplings {
+          trCyc += 1
+          // Task #141: log EVERY X-flag scoreboard push/clear from cycle 0, to name
+          // the exact instruction (PC + robId) that leaks a permanently-stuck sbX bit.
+          if (dut.iq.pushPort.valid.toBoolean) {
+            if (dut.iq.logic.pushUop0.writesX.toBoolean) {
+              val pc = dut.iq.logic.pushUop0.pc.toLong & 0xffffffffL
+              val rid = dut.iq.pushPort.payload(0).robId.toInt
+              val pxd = dut.iq.logic.pushUop0.pXDst.toInt
+              println(f"[cplxtrace] SBX-PUSH0 cyc=$trCyc%5d rid=$rid pc=0x$pc%08x pXDst=$pxd")
+            }
+            if (dut.iq.pushSlot1Port.toBoolean && dut.iq.logic.pushUop1.writesX.toBoolean) {
+              val pc = dut.iq.logic.pushUop1.pc.toLong & 0xffffffffL
+              val rid = dut.iq.pushPort.payload(1).robId.toInt
+              val pxd = dut.iq.logic.pushUop1.pXDst.toInt
+              println(f"[cplxtrace] SBX-PUSH1 cyc=$trCyc%5d rid=$rid pc=0x$pc%08x pXDst=$pxd")
+            }
+            // Task #141: log every STATIC sbInt claim (the `.otherwise` branch of
+            // IssueQueuePlugin.scala:723-727 -- pdstValid, not LS/CPLX/aluSlow) to
+            // name whichever instruction claims int-physreg 42 (the confirmed-stuck
+            // bit) and check whether it's later flushed before its completion clear.
+            if (dut.iq.logic.pushUop0.pdstValid.toBoolean) {
+              val pc = dut.iq.logic.pushUop0.pc.toLong & 0xffffffffL
+              val rid = dut.iq.pushPort.payload(0).robId.toInt
+              val pdst = dut.iq.logic.pushUop0.pdst.toInt
+              println(f"[cplxtrace] SBINT-PUSH0 cyc=$trCyc%5d rid=$rid pc=0x$pc%08x pdst=$pdst")
+            }
+            if (dut.iq.pushSlot1Port.toBoolean && dut.iq.logic.pushUop1.pdstValid.toBoolean) {
+              val pc = dut.iq.logic.pushUop1.pc.toLong & 0xffffffffL
+              val rid = dut.iq.pushPort.payload(1).robId.toInt
+              val pdst = dut.iq.logic.pushUop1.pdst.toInt
+              println(f"[cplxtrace] SBINT-PUSH1 cyc=$trCyc%5d rid=$rid pc=0x$pc%08x pdst=$pdst")
+            }
+            // Task #141: log every writesNzvc push to name whoever claims pNzvcDst=7/8.
+            if (dut.iq.logic.pushUop0.writesNzvc.toBoolean) {
+              val pc = dut.iq.logic.pushUop0.pc.toLong & 0xffffffffL
+              val rid = dut.iq.pushPort.payload(0).robId.toInt
+              val pnd = dut.iq.logic.pushUop0.pNzvcDst.toInt
+              val isLsN = dut.iq.logic.push0IsLsNzvc.toBoolean
+              println(f"[cplxtrace] SBNZVC-PUSH0 cyc=$trCyc%5d rid=$rid pc=0x$pc%08x pNzvcDst=$pnd isLsNzvc=$isLsN")
+            }
+            if (dut.iq.pushSlot1Port.toBoolean && dut.iq.logic.pushUop1.writesNzvc.toBoolean) {
+              val pc = dut.iq.logic.pushUop1.pc.toLong & 0xffffffffL
+              val rid = dut.iq.pushPort.payload(1).robId.toInt
+              val pnd = dut.iq.logic.pushUop1.pNzvcDst.toInt
+              val isLsN = dut.iq.logic.push1IsLsNzvc.toBoolean
+              println(f"[cplxtrace] SBNZVC-PUSH1 cyc=$trCyc%5d rid=$rid pc=0x$pc%08x pNzvcDst=$pnd isLsNzvc=$isLsN")
+            }
+            // Task #144: op + psrcB (physical) at IQ-push time, keyed by robId/pc together
+            // -- unambiguously identifies which mu-op (of a multi-mu-op crack) a given
+            // psrcB value belongs to, unlike a rename-time trace which lacks robId.
+            {
+              val pc = dut.iq.logic.pushUop0.pc.toLong & 0xffffffffL
+              val rid = dut.iq.pushPort.payload(0).robId.toInt
+              val op = dut.iq.logic.pushUop0.op.toEnum
+              val psrcB = dut.iq.logic.pushUop0.psrcB.toInt
+              val psrcBValid = dut.iq.logic.pushUop0.psrcBValid.toBoolean
+              val ucPc = dut.dec.logic.ucPc.toInt
+              val ucAct = dut.dec.logic.ucActive.toBoolean
+              println(f"[cplxtrace] PUSH0-OP cyc=$trCyc%5d rid=$rid pc=0x$pc%08x op=$op psrcB=$psrcB psrcBValid=$psrcBValid ucPc=$ucPc ucActive=$ucAct")
+            }
+            if (dut.iq.pushSlot1Port.toBoolean) {
+              val pc = dut.iq.logic.pushUop1.pc.toLong & 0xffffffffL
+              val rid = dut.iq.pushPort.payload(1).robId.toInt
+              val op = dut.iq.logic.pushUop1.op.toEnum
+              val psrcB = dut.iq.logic.pushUop1.psrcB.toInt
+              val psrcBValid = dut.iq.logic.pushUop1.psrcBValid.toBoolean
+              val ucPc = dut.dec.logic.ucPc.toInt
+              val ucAct = dut.dec.logic.ucActive.toBoolean
+              println(f"[cplxtrace] PUSH1-OP cyc=$trCyc%5d rid=$rid pc=0x$pc%08x op=$op psrcB=$psrcB psrcBValid=$psrcBValid ucPc=$ucPc ucActive=$ucAct")
+            }
+          }
+          val deV = dut.divEu.issuePort.valid.toBoolean
+          val deR = dut.divEu.issuePort.ready.toBoolean
+          val deBusy = dut.divEu.logic.busy.toBoolean
+          val iqSlots = dut.iq.logic.slots.zipWithIndex.filter(_._1.sel.toBoolean).map { case (s, i) =>
+            f"s$i(rid=${s.context.robId.toInt},op=${s.context.uop.op.toEnum},lsWait=${s.lsWait.toBoolean},cplxWait=${s.cplxWait.toBoolean},trig=0x${s.triggers.toBigInt.toString(16)},pA=${s.context.uop.psrcA.toInt}(v=${s.context.uop.psrcAValid.toBoolean}),pB=${s.context.uop.psrcB.toInt}(v=${s.context.uop.psrcBValid.toBoolean}),pC=${s.context.uop.psrcC.toInt}(v=${s.context.uop.psrcCValid.toBoolean}),readsNzvc=${s.context.uop.readsNzvc.toBoolean},pNzvcSrc=${s.context.uop.pNzvcSrc.toInt})"
+          }.mkString(" ")
+          val lsBusyHex = dut.iq.logic.lsBusy.toBigInt.toString(16)
+          val sbXBusyHex = dut.iq.logic.sbX.busy.toBigInt.toString(16)
+          val sbIntBusyHex = dut.iq.logic.sbInt.busy.toBigInt.toString(16)
+          val sbNzvcBusyHex = dut.iq.logic.sbNzvc.busy.toBigInt.toString(16)
+          val lsNzvcBusyHex = dut.iq.logic.lsNzvcBusy.toBigInt.toString(16)
+          val lsWakeV = dut.iq.lsWakeupPort.valid.toBoolean
+          val lsWakeP = dut.iq.lsWakeupPort.payload.toInt
+          val lsNzvcWakeV = dut.iq.lsNzvcWakeup.valid.toBoolean
+          val lsNzvcWakeP = dut.iq.lsNzvcWakeup.payload.toInt
+          // Task #144: value-level taps -- what does the LS EU actually load, and what
+          // does the ALU EU actually compute (result + flags), keyed by robId, so a
+          // wrong VALUE (not a control-flow/scoreboard issue -- those are cleared, see
+          // fuzz-campaign-divergence-2026-07-16 memory) can be caught directly.
+          if (dut.lsEu.logic.compValid.toBoolean) {
+            val rid = dut.lsEu.logic.compRobId.toInt
+            val dat = dut.lsEu.logic.compData.toLong & 0xffffffffL
+            val nzvc = dut.lsEu.logic.compNzvc.toInt & 0xf
+            val nzvcW = dut.lsEu.logic.compNzvcWrite.toBoolean
+            println(f"[cplxtrace] LSU-COMP cyc=$trCyc%5d rid=$rid data=0x$dat%08x nzvc=0x$nzvc%x nzvcWrite=$nzvcW")
+          }
+          if (dut.eu0.logic.fastFire.toBoolean) {
+            val rid = dut.eu0.logic.s1Ctx.robId.toInt
+            val res = dut.eu0.logic.mergedResult.toLong & 0xffffffffL
+            val nzvc = dut.eu0.logic.finalNzvc.toInt & 0xf
+            println(f"[cplxtrace] EU0-FIRE cyc=$trCyc%5d rid=$rid result=0x$res%08x nzvc=0x$nzvc%x")
+          }
+          if (dut.eu1.logic.fastFire.toBoolean) {
+            val rid = dut.eu1.logic.s1Ctx.robId.toInt
+            val res = dut.eu1.logic.mergedResult.toLong & 0xffffffffL
+            val nzvc = dut.eu1.logic.finalNzvc.toInt & 0xf
+            println(f"[cplxtrace] EU1-FIRE cyc=$trCyc%5d rid=$rid result=0x$res%08x nzvc=0x$nzvc%x")
+          }
+          // Task #144: does the store mu-op's architectural srcBReg (pre-rename) resolve
+          // to a physical register (psrcB) that matches the CURRENT RAT mapping? Print
+          // for both dispatch slots whenever the group fires, to correlate against DIV's
+          // own pdst=5 (SBINT-PUSH trace) and see if the store ever reads srcBReg==2 (D2).
+          {
+            val fireV = dut.ren.logic.fire.toBoolean
+            val uop1  = dut.ren.logic.uop1Sig.toBoolean
+            if (fireV) {
+              val pc0 = dut.ren.logic.dec0.pc.toLong & 0xffffffffL
+              val srcBReg0 = dut.ren.logic.dec0.srcBReg.toInt
+              val srcBValid0 = dut.ren.logic.dec0.srcBValid.toBoolean
+              val psrcB0 = dut.ren.logic.raw(0).psrcB.toInt
+              val psrcBValid0 = dut.ren.logic.raw(0).psrcBValid.toBoolean
+              println(f"[cplxtrace] REN-SLOT0 cyc=$trCyc%5d pc=0x$pc0%08x srcBReg=$srcBReg0 srcBValid=$srcBValid0 psrcB=$psrcB0 psrcBValid=$psrcBValid0")
+            }
+            if (fireV && uop1) {
+              val pc1 = dut.ren.logic.dec1.pc.toLong & 0xffffffffL
+              val srcBReg1 = dut.ren.logic.dec1.srcBReg.toInt
+              val srcBValid1 = dut.ren.logic.dec1.srcBValid.toBoolean
+              val psrcB1 = dut.ren.logic.raw(1).psrcB.toInt
+              val psrcBValid1 = dut.ren.logic.raw(1).psrcBValid.toBoolean
+              println(f"[cplxtrace] REN-SLOT1 cyc=$trCyc%5d pc=0x$pc1%08x srcBReg=$srcBReg1 srcBValid=$srcBValid1 psrcB=$psrcB1 psrcBValid=$psrcBValid1")
+            }
+          }
+          if (dut.divEu.logic.wbObs.valid.toBoolean) {
+            val w = dut.divEu.logic.wbObs
+            val rid = w.robId.toInt
+            val res = w.result.toLong & 0xffffffffL
+            val dst = w.dstArch.toInt
+            val nzvc = w.nzvc.toInt & 0xf
+            println(f"[cplxtrace] DIV-WB cyc=$trCyc%5d rid=$rid dstArch=$dst result=0x$res%08x nzvc=0x$nzvc%x")
+          }
+          // Task #144: watch ucCtx.miOther/miOtherValid directly across the mu-code
+          // engine's sequencing, whenever active -- sidesteps guessing which cycle
+          // corresponds to which row (the push-time ucPc tap turned out stale/offset
+          // by an unknown pipeline delay).
+          if (dut.dec.logic.ucActive.toBoolean) {
+            val ucPc = dut.dec.logic.ucPc.toInt
+            val miOther = dut.dec.logic.ucCtx.miOther.toInt
+            val miOtherValid = dut.dec.logic.ucCtx.miOtherValid.toBoolean
+            println(f"[cplxtrace] UC-ACTIVE cyc=$trCyc%5d ucPc=$ucPc miOther=$miOther miOtherValid=$miOtherValid")
+          }
+          // Task #144 final check: is memory-indirect EA detection itself firing on
+          // the SECOND (post-flush, real) decode attempt at all? Print every cycle
+          // ucIsMemInd is true (decode-time, independent of whether ucBegin actually
+          // latches it) to see every candidate entry point, not just successful ones.
+          if (dut.dec.logic.ucIsMemInd.toBoolean) {
+            val moveDst = dut.dec.logic.ucMoveDstMi.toBoolean
+            println(f"[cplxtrace] UC-ISMEMIND cyc=$trCyc%5d ucMoveDstMi=$moveDst")
+          }
+          // Task #144: fire exactly on ucBegin -- the actual entry-point decision --
+          // to see precisely what packet/entry was chosen, bypassing all downstream
+          // pipeline-stage-offset guessing.
+          if (dut.dec.logic.ucBegin.toBoolean) {
+            val entryPc = dut.dec.logic.ucEntryPkt.pc.toLong & 0xffffffffL
+            val entryW0 = dut.dec.logic.ucEntryPkt.words(0).toLong & 0xffffL
+            val realEntry = dut.dec.logic.ucRealEntry.toInt
+            val isMemInd = dut.dec.logic.ucIsMemInd.toBoolean
+            val pendV = dut.dec.logic.ucPendValid.toBoolean
+            val fedV = dut.dec.logic.fed.valid.toBoolean
+            val moveDstMi = dut.dec.logic.ucMoveDstMi.toBoolean
+            println(f"[cplxtrace] UC-BEGIN cyc=$trCyc%5d entryPc=0x$entryPc%08x entryW0=0x$entryW0%04x realEntry=$realEntry isMemInd=$isMemInd ucPendValid=$pendV fedValid=$fedV moveDstMi=$moveDstMi")
+          }
+          // Task #144: does `fed` ever carry the target instruction's PC at all on the
+          // real (post-flush) attempt, regardless of whether ucIsMemInd fires for it?
+          if (dut.dec.logic.fed.valid.toBoolean) {
+            val pc0 = dut.dec.logic.fed.payload.packets(0).pc.toLong & 0xffffffffL
+            val pc1 = dut.dec.logic.fed.payload.packets(1).pc.toLong & 0xffffffffL
+            if ((pc0 >= 0x40800108L && pc0 <= 0x40800125L) || (pc1 >= 0x40800108L && pc1 <= 0x40800125L)) {
+              val s1v = dut.dec.logic.fed.payload.slot1Valid.toBoolean
+              val ucode = dut.dec.logic.slot1IsUcodeEarly.toBoolean
+              val memInd = dut.dec.logic.slot1IsMemIndEarly.toBoolean
+              val pendV = dut.dec.logic.ucPendValid.toBoolean
+              val enter0 = dut.dec.logic.ucEnterSlot0.toBoolean
+              val w0 = dut.dec.logic.fed.payload.packets(1).words(0).toLong & 0xffffL
+              val w1 = dut.dec.logic.fed.payload.packets(1).words(1).toLong & 0xffffL
+              val w2 = dut.dec.logic.fed.payload.packets(1).words(2).toLong & 0xffffL
+              val w3 = dut.dec.logic.fed.payload.packets(1).words(3).toLong & 0xffffL
+              val w4 = dut.dec.logic.fed.payload.packets(1).words(4).toLong & 0xffffL
+              val wc = dut.dec.logic.fed.payload.packets(1).wordCount.toInt
+              val simp = dut.dec.logic.fed.payload.packets(1).simple.toBoolean
+              val cplx = dut.dec.logic.fed.payload.packets(1).complex.toBoolean
+              println(f"[cplxtrace] FED-VALID cyc=$trCyc%5d pc0=0x$pc0%08x pc1=0x$pc1%08x slot1Valid=$s1v slot1IsUcodeEarly=$ucode slot1IsMemIndEarly=$memInd ucPendValid=$pendV ucEnterSlot0=$enter0 w0=0x$w0%04x w1=0x$w1%04x w2=0x$w2%04x w3=0x$w3%04x w4=0x$w4%04x wc=$wc simple=$simp complex=$cplx")
+            }
+          }
+          val poisoned = dut.lsEu.logic.poisoned.toBoolean
+          val sqFlush  = dut.lsEu.sqFlushSig.toBoolean
+          val doFlush  = dut.rob.logic.doFlushReg.toBoolean
+          val lsuBusy  = dut.lsEu.logic.busy.toBoolean
+          val lsuS1V   = dut.lsEu.logic.s1Valid.toBoolean
+          val lsuCompV = dut.lsEu.logic.compValid.toBoolean
+          val line = f"deIssueV=$deV deIssueR=$deR deBusy=$deBusy robHead=${dut.rob.logic.head.toInt} lsBusy=0x$lsBusyHex sbXBusy=0x$sbXBusyHex sbIntBusy=0x$sbIntBusyHex sbNzvcBusy=0x$sbNzvcBusyHex lsNzvcBusy=0x$lsNzvcBusyHex poisoned=$poisoned sqFlush=$sqFlush doFlush=$doFlush lsuBusy=$lsuBusy lsuS1V=$lsuS1V lsuCompV=$lsuCompV iqSlots=[$iqSlots]"
+          if (line != trLastLine || lsWakeV || lsNzvcWakeV || sqFlush || doFlush) {
+            println(f"[cplxtrace] cyc=$trCyc%5d lsWakeV=$lsWakeV lsWakeP=$lsWakeP lsNzvcWakeV=$lsNzvcWakeV lsNzvcWakeP=$lsNzvcWakeP $line")
+            trLastLine = line
+          }
+        }
+      }
+
       FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
       new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
       new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // Task #143: Musashi's oracle (m68k_ref.cpp cb_read8) returns a HARDCODED 0xFF
+      // for any address it was never told about, deterministic and seed-independent.
+      // The DUT's SparseMemory-backed dmem defaults unwritten bytes to a genuinely
+      // RANDOM, seed-derived pattern instead -- structurally incompatible with
+      // Musashi's fixed default. A program that reads a sandbox byte no earlier
+      // instruction wrote (including one that FuzzRunner.minimize's greedy chunk
+      // removal can manufacture by deleting the write while keeping the read) would
+      // near-certainly diverge on the resulting CCR/register value even though
+      // nothing in the RTL is wrong -- a false positive. Pre-fill the whole sandbox
+      // window to 0xFF on the DUT side, matching Musashi's default exactly, so an
+      // unwritten read agrees on both sides by construction. See
+      // fuzz-campaign-divergence-2026-07-16 memory, "DEFINITIVE ROOT CAUSE CONFIRMED".
+      for (a <- ProgGen.SandboxBase until (ProgGen.SandboxBase + ProgGen.SandboxSize)) {
+        dmem.mem.write(a, 0xff.toByte)
+      }
       dut.ctrl.logic.mmuEnable #= false
-      dut.ctrl.logic.rootPtr   #= 0
+      dut.ctrl.logic.urp   #= 0
+      dut.ctrl.logic.srp   #= 0
       dut.intCtrl.logic.iplIn #= 0
       dut.intCtrl.logic.iackAvec #= false
       dut.intCtrl.logic.iackVector #= 0
