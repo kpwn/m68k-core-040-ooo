@@ -101,6 +101,12 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val s1Valid = RegInit(False)
     issuePort.ready := !busy && !s1Valid
 
+    // ---- debug-only observability (task #139 CMP2/CHK2 hang investigation) ----
+    // Zero synth impact (sim tap only, not referenced by any RTL logic).
+    busy.simPublic(); s1Valid.simPublic()
+    issuePort.valid.simPublic(); issuePort.ready.simPublic()
+    issuePort.payload.robId.simPublic(); issuePort.payload.uop.op.simPublic()
+
     // ---- S0 -> S1 register (M2S), captured on issue.fire ----
     val s1Ctx   = Reg(IqContext())
     val s1A     = Reg(Bits(32 bits))

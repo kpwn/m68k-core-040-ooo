@@ -83,6 +83,10 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
 
   during setup {
     issuePort = Stream(IqContext())
+    // Debug-only observability (task #139 hang investigation, 2026-07-16): simPublic
+    // is a pure sim-visibility tag, never affects synthesized behavior. Left in place
+    // afterward — harmless if unused, and useful for any future issue-readiness trace.
+    issuePort.valid.simPublic(); issuePort.ready.simPublic()
     completionPort = Flow(BranchCompletion())
     trapvFaultPort = Flow(EuFault())
     nzRd = host[NzvcRegFileService].newRead(forceNoBypass = false)

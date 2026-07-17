@@ -116,6 +116,16 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       }
     }
     val slots = lines.flatMap(_.ways) // index == priority
+    // ---- debug-only observability (task #139 finding #1 investigation) ----
+    // Zero synth impact (sim tap only, not referenced by any RTL logic).
+    slots.foreach { s => s.sel.simPublic(); s.context.robId.simPublic(); s.context.uop.op.simPublic()
+      s.lsWait.simPublic(); s.cplxWait.simPublic(); s.triggers.simPublic()
+      s.context.uop.psrcA.simPublic(); s.context.uop.psrcAValid.simPublic()
+      s.context.uop.psrcB.simPublic(); s.context.uop.psrcBValid.simPublic()
+      s.context.uop.pXSrc.simPublic(); s.context.uop.readsX.simPublic()
+      s.context.uop.pNzvcSrc.simPublic(); s.context.uop.readsNzvc.simPublic()
+      s.context.uop.psrcC.simPublic(); s.context.uop.psrcCValid.simPublic() }
+    flushSignal.simPublic()
 
     val slotIdxW = log2Up(slotCount) // 4 bits
 
@@ -142,7 +152,10 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val physIntN = m68k040.Global.PHYS_INT_REGS.get
     val sbInt  = new Scoreboard(physIntN) // int physregs
     val sbNzvc = new Scoreboard(16) // NZVC flag physregs (width 4)
+    sbNzvc.busy.simPublic()  // debug-only (task #141)
     val sbX    = new Scoreboard(16) // X flag physregs (width 4)
+    sbX.busy.simPublic(); sbX.physToSlot.simPublic()  // debug-only (task #141 X-flag hang investigation)
+    sbInt.busy.simPublic(); sbInt.physToSlot.simPublic()  // debug-only (task #141)
 
     // ---- Dynamic-completion (variant A) LS scoreboard ----
     // lsBusy[p] => int physreg p is produced by an in-flight LS LOAD that has NOT
@@ -151,12 +164,14 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // mechanism (which assumes latency-1): LS producers are tracked ONLY here, not
     // in sbInt, so trigInit never sets a static (auto-clearing) trigger for them.
     val lsBusy = Reg(Bits(physIntN bits)) init 0
+    lsBusy.simPublic()  // debug-only (task #139 CMP2/CHK2 hang investigation)
     // lsNzvcBusy[p] => NZVC physreg p is produced by an in-flight (not-yet-completed) LS
     // op that writes NZVC (a MOVE-to-memory store / RTR CCR-restore). A flag-reader of p
     // is held NOT-ready until lsNzvcWakeup(p). SEPARATE from sbNzvc (static latency-1): an
     // LS NZVC producer issues on the LS port and generates NO static ALU/branch event, so
     // a static sbNzvc trigger on it would never clear (it would hang the reader).
     val lsNzvcBusy = Reg(Bits(16 bits)) init 0
+    lsNzvcBusy.simPublic()  // debug-only (task #139 seed=3 CCR investigation)
     // cplxBusy[p] => int physreg p is produced by an in-flight (not-yet-completed)
     // multi-cycle DIV. A consumer reading it is held NOT-ready until cplxWakeup(p).
     // Same dynamic-completion mechanism as lsBusy, separate bitmap + wakeup port.
@@ -448,6 +463,19 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
 
     val pushUop0 = pushPort.payload(0).uop
     val pushUop1 = pushPort.payload(1).uop
+    // debug-only (task #141 X-flag/scoreboard leak investigation)
+    pushPort.valid.simPublic(); pushSlot1Port.simPublic()
+    pushPort.payload(0).robId.simPublic(); pushUop0.pc.simPublic()
+    pushUop0.writesX.simPublic(); pushUop0.writesNzvc.simPublic(); pushUop0.pdstValid.simPublic()
+    pushUop0.pXDst.simPublic(); pushUop0.pdst.simPublic(); pushUop0.pNzvcDst.simPublic()
+    pushPort.payload(1).robId.simPublic(); pushUop1.pc.simPublic()
+    pushUop1.writesX.simPublic(); pushUop1.writesNzvc.simPublic(); pushUop1.pdstValid.simPublic()
+    pushUop1.pXDst.simPublic(); pushUop1.pdst.simPublic(); pushUop1.pNzvcDst.simPublic()
+    // debug-only (task #144): op + srcB physical register at IQ-push time, keyed
+    // directly by the same robId/pc already tapped above (avoids needing to
+    // correlate rename-cycle timing to a robId separately).
+    pushUop0.op.simPublic(); pushUop0.psrcB.simPublic(); pushUop0.psrcBValid.simPublic()
+    pushUop1.op.simPublic(); pushUop1.psrcB.simPublic(); pushUop1.psrcBValid.simPublic()
     val trig0 = trigInit(pushUop0, slot0Prio + 1)
     val trig1 = trigInit(pushUop1, slot1Prio + 1)
 
@@ -724,6 +752,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // sbNzvc (static lat1) — it issues on the LS port and produces no static event.
     val push0IsLsNzvc = isLsNzvcProducer(pushUop0)
     val push1IsLsNzvc = isLsNzvcProducer(pushUop1)
+    push0IsLsNzvc.simPublic(); push1IsLsNzvc.simPublic()  // debug-only (task #139 seed=3 CCR investigation)
     when(pushPort.fire) {
       when(pushUop0.pdstValid) {
         when(push0IsLs)       { lsBusy(pushUop0.pdst) := True }

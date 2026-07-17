@@ -460,6 +460,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     intW.valid   := fastFire && u1.pdstValid;  intW.address   := u1.pdst;     intW.data   := mergedResult
     nzvcW.valid  := fastFire && u1.writesNzvc; nzvcW.address  := u1.pNzvcDst;  nzvcW.data  := finalNzvc
     xW.valid     := fastFire && u1.writesX;    xW.address     := u1.pXDst;     xW.data     := B(finalX)
+    fastFire.simPublic(); mergedResult.simPublic(); finalNzvc.simPublic(); s1Ctx.robId.simPublic()  // debug-only (task #144)
 
     // ---- S1: FAST bypass (mirror the writes; forwards to a dependent reading now) ----
     intByp.valid  := intW.valid;  intByp.address  := intW.address;  intByp.data  := intW.data

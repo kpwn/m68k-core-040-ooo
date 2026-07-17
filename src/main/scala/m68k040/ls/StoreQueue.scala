@@ -3,6 +3,7 @@ package m68k040.ls
 import m68k040.cache.DStoreCmd
 import m68k040.isa.Size
 import spinal.core._
+import spinal.core.sim._
 import spinal.lib._
 
 case class SqAlloc() extends Bundle {
@@ -334,4 +335,16 @@ class StoreQueue(depth: Int = 8) extends Component {
 
   // ---- empty: no resident entry AND no drain in flight ----
   io.empty := !valids.reduce(_ || _) && !drainBusy
+
+  // ---- debug-only observability (task #139 finding #1 investigation) ----
+  // Zero synth impact (sim tap only, not referenced by any RTL logic).
+  head.simPublic(); tail.simPublic()
+  drainBusy.simPublic(); drainPhaseB.simPublic()
+  valids.foreach(_.simPublic()); committed.foreach(_.simPublic())
+  robIds.foreach(_.simPublic())
+  io.drain.valid.simPublic(); io.drainAck.simPublic(); io.flush.simPublic()
+  // Task #139 mechanism #2: catch the ORIGINATING alloc of any SQ entry, so a
+  // later-observed stuck head can be traced back to the actual allocating PC
+  // even after the ROB has reused that robId number for a newer instruction.
+  io.alloc.valid.simPublic(); io.alloc.payload.robId.simPublic(); io.alloc.payload.paddr.simPublic()
 }

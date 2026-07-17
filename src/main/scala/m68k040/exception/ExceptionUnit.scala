@@ -803,4 +803,16 @@ class ExceptionUnit(
 
   // `active` high whenever the FSM is mid-sequence (not IDLE).
   active := !fsm.isActive(fsm.IDLE)
+
+  // ---- debug-only observability (task #139 wild-PC / a7-minus-8 investigation) ----
+  // Zero synth impact (sim tap only, not referenced by any RTL logic).
+  active.simPublic()
+  redirectValid.simPublic(); redirectPc.simPublic()
+  val dbgFsmIsIdle    = fsm.isActive(fsm.IDLE);      dbgFsmIsIdle.simPublic()
+  val dbgFsmIsEDrain  = fsm.isActive(fsm.E_DRAIN);   dbgFsmIsEDrain.simPublic()
+  val dbgFsmIsEStore  = fsm.isActive(fsm.E_STORE);   dbgFsmIsEStore.simPublic()
+  val dbgFsmIsEStWait = fsm.isActive(fsm.E_STWAIT);  dbgFsmIsEStWait.simPublic()
+  val dbgFsmIsEVecReq = fsm.isActive(fsm.E_VECREQ);  dbgFsmIsEVecReq.simPublic()
+  val dbgFsmIsEVecWait= fsm.isActive(fsm.E_VECWAIT); dbgFsmIsEVecWait.simPublic()
+  val dbgFsmIsERedir  = fsm.isActive(fsm.E_REDIR);   dbgFsmIsERedir.simPublic()
 }
