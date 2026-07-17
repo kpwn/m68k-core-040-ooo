@@ -172,6 +172,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       itlb.umCommitBId    := rob.logic.h1
       itlb.umCommitId    := rob.logic.h0
       itlb.umFlush       := host[RedirectService].doFlush
+      dtlb.flushAll      := rob.logic.exc.sysFlushAllValid
+      itlb.flushAll      := rob.logic.exc.sysFlushAllValid
 
       // ── Commit-time mispredict redirect fan-out (registered doFlush pulse) ──
       val doFlush = host[RedirectService].doFlush
@@ -543,10 +545,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           buildMmuTable(ptmem, dataPageVA, ppn)
           buildMmuTable(itlbPtmem, dataPageVA, ppn)
           dut.ctrl.logic.mmuEnable #= true
-          dut.ctrl.logic.rootPtr   #= MMU_ROOT
+          dut.ctrl.logic.urp   #= MMU_ROOT
+          dut.ctrl.logic.srp   #= MMU_ROOT
         case None =>
           dut.ctrl.logic.mmuEnable #= false
-          dut.ctrl.logic.rootPtr   #= 0
+          dut.ctrl.logic.urp   #= 0
+          dut.ctrl.logic.srp   #= 0
       }
 
       // Idle the frontend; consumer-driven ready ports default high downstream.
@@ -719,13 +723,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     * both DUT committed srSys and the oracle reset SR are set to it). */
   def runIrqLockStep(name: String, src: String, nInstr: Int,
                      irqEvents: Seq[(Long, Int)], avec: Boolean = true,
-                     vectorIn: Int = 0, initialSr: Int = 0x2700): Unit = {
+                     vectorIn: Int = 0, initialSr: Int = 0x2700,
+                     initialMsp: Option[Long] = None): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
     val ackVector = if (avec) None else Some(vectorIn)
 
     val oracleSteps: Vector[OracleStep] =
       Musashi.assembleAndTrace(src, irqEvents = irqEvents, interruptAckVector = ackVector,
-                               initialSr = Some(initialSr)) match {
+                               initialSr = Some(initialSr), initialMsp = initialMsp) match {
         case Right(v)  => v
         case Left(err) => fail(s"[$name] Musashi.assembleAndTrace failed: ${err.reason}")
       }
@@ -817,7 +822,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
       new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
       dut.ctrl.logic.mmuEnable #= false
-      dut.ctrl.logic.rootPtr   #= 0
+      dut.ctrl.logic.urp   #= 0
+      dut.ctrl.logic.srp   #= 0
       dut.intCtrl.logic.iplIn #= 0
       dut.intCtrl.logic.iackAvec #= false
       dut.intCtrl.logic.iackVector #= 0
@@ -831,17 +837,22 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      // Task #132: seed MSP when the caller wants a boot M=1 scenario (the
+      // throwaway-frame tests). Inactive-bank default (0) is harmless when unused.
+      dut.rob.logic.exc.ss.msp #= BigInt(initialMsp.getOrElse(0L) & 0xffffffffL)
       // Boot the committed SR to initialSr's system byte (lower the I-mask so a
       // non-NMI level is taken; matches the oracle's --initial-sr).
       dut.rob.logic.exc.ss.srSys #= (initialSr >> 8) & 0xff
       // Seed the int PRF arch-15 (A7, identity phys-15) to the boot SSP. The committed
       // A7 banks (ss.usp/isp/msp) are now LIVE-COHERENT with the architectural A7 read
       // back from the PRF every cycle (the exc unit drives ss.writeA7), so the PRF
-      // arch-15 — not the poked ss.isp — is the boot SP source of truth. All IRQ tests
-      // boot supervisor (initialSr S=1), so the active bank is ISP = 0x00100000.
+      // arch-15 — not the poked ss.isp — is the boot SP source of truth. IRQ tests
+      // boot supervisor (initialSr S=1); the active bank is MSP if initialSr also has
+      // M=1 (bit 12, task #132 throwaway-frame tests), else ISP = 0x00100000.
+      val bootM1 = ((initialSr >> 12) & 1) == 1
       dut.wire.logic.seedValid #= true
       dut.wire.logic.seedAddr  #= 15
-      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      dut.wire.logic.seedData  #= (if (bootM1) BigInt(initialMsp.getOrElse(0x00100000L) & 0xffffffffL) else BigInt(0x00100000L))
       cd.waitSampling(2)
       dut.wire.logic.seedValid #= false
       cd.waitSampling()
@@ -883,6 +894,40 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // event @ load PC = 6+4+6+4 = 0x14 in -> 0x40800014.
     runIrqLockStep("irq-avec", src, nInstr = 10,
       irqEvents = Seq((0x40800014L, 5)), avec = true, initialSr = 0x2000)
+  }
+
+  // Task #132 — the M=1 interrupt throwaway frame (format-$1). NOTE: M=1 is entered
+  // via a REAL in-program `move.w #imm,%sr` (matching the proven "M-bit MSP/ISP
+  // banking" test's pattern below), NOT via `initialSr` baked into boot — an attempt
+  // to boot directly with M=1 via `initialSr`+`initialMsp` together hit an ORACLE
+  // ordering quirk (`musashi_run.cpp` calls `set_reg(SR,...)` — which internally
+  // bank-swaps the active SP — BEFORE `set_reg(MSP,...)`, so the swap reads the
+  // not-yet-set MSP shadow and clobbers ISP; a pure boot-time repro diverged at
+  // commit 0, `isp: dut=0x00100000 oracle=0x00000000`, before any interrupt logic
+  // even ran). Executing the SR write as a real instruction sidesteps this (Musashi's
+  // real MOVE-to-SR opcode handler manages the bank swap correctly); `initialMsp` is
+  // still used to seed the INACTIVE (M=1) bank ahead of time — that raw `set_reg`
+  // has no bank-swap side effect (M stays 0 at that point), so it's safe.
+  //
+  // Once M=1: entry pushes format-$0 to MSP (->0x0009FFF8), clears M, pushes
+  // format-$1 (throwaway) to ISP (->0x000FFFF8); the handler runs ON ISP; RTE pops
+  // $1 (discards its PC, restores M=1 rebanking to MSP), loops back and pops the
+  // REAL $0 frame off MSP (restores the true PC/SR), resuming with A7 back at the
+  // untouched 0x000A0000 — both stacks fully unwound. The harness's onCommit already
+  // tracks msp/isp every step, so a wrong bank/base anywhere in this dance diverges.
+  test("lock-step IRQ: M=1 -> format-$1 throwaway + format-$0 on MSP -> handler on ISP -> RTE unwinds both", VerilatorTest) {
+    val src =
+      "move.w #0x3000,%sr ; " +                       // (1) S=1,M=1,I=0 (real instr)
+      "move.l #0x11223344,%d0 ; move.l %d0,0x90 ; " +
+      "move.l #handler,%d0 ; move.l %d0,0x74 ; " +
+      "move.l 0x90,%d1 ; moveq #2,%d2 ; " +
+      "loop: bra loop ; " +
+      "handler: moveq #9,%d3 ; rte"
+    // event PC shifted +4 (one new 4-byte instr) from the plain autovector test's
+    // 0x40800014 -> 0x40800018.
+    runIrqLockStep("irq-avec-m1-throwaway", src, nInstr = 11,
+      irqEvents = Seq((0x40800018L, 5)), avec = true,
+      initialMsp = Some(0x000A0000L))
   }
 
   // Vectored: the SoC presents a vectored vector (0x46 = 70) instead of autovector;
@@ -956,7 +1001,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
       new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
       new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
-      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.rootPtr #= 0
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
       dut.intCtrl.logic.iplIn #= 0; dut.intCtrl.logic.iackAvec #= true; dut.intCtrl.logic.iackVector #= 0
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
@@ -1948,7 +1993,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
       new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
       new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
-      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.rootPtr #= 0
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
       dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
@@ -2024,7 +2069,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
       new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
       new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
-      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.rootPtr #= 0
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
       dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
@@ -3218,7 +3263,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
       new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
       dut.ctrl.logic.mmuEnable #= false
-      dut.ctrl.logic.rootPtr   #= 0
+      dut.ctrl.logic.urp   #= 0
+      dut.ctrl.logic.srp   #= 0
       dut.intCtrl.logic.iplIn #= 0
       dut.intCtrl.logic.iackAvec #= false
       dut.intCtrl.logic.iackVector #= 0
@@ -3294,6 +3340,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 5)   // d1 == 0x00000003, d2 == 0x00000004
   }
 
+  // Task #131 — MOVEC URP/SRP/TC real-write support was ATTEMPTED and REVERTED
+  // (confirmed to break sim-poke persistence on mmuEnable for every MMU-enabled
+  // lock-step test — see MmuControlPlugin's doc comment). These Rc values are back
+  // to RAZ/WI (same as CACR), so there is no write-capability test here to keep.
+  // See task #131 for the redesign follow-up and task #135 for a separate,
+  // still-open oracle gap (Musashi's own MOVEC URP/SRP/TC handlers are unimplemented
+  // stubs, so even a future correct write implementation won't be lock-step
+  // testable without first extending tools/musashi/musashi/m68k_in.c).
+
   // MOVEC VBR then an exception: set VBR := 0x3000, install the illegal-instruction
   // handler at VBR+4*4 = 0x3010 (a runtime store the DUT D-cache + Musashi both see),
   // then `illegal` (vector 4) -> the FSM fetches the vector at VBR+0x10 = 0x3010 ->
@@ -3307,6 +3362,217 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "loop: bra loop ; " +
       "handler: move.l 2(%a7),%d0 ; addq.l #2,%d0 ; move.l %d0,2(%a7) ; moveq #1,%d2 ; rte",
       nInstr = 11)
+  }
+
+  // Task #136 prerequisite: line-1010 ("Line-A") / line-1111 ("Line-F") opcodes must
+  // raise their OWN dedicated vectors (10 / 11), not the generic vector-4 illegal path
+  // — confirmed real via Musashi's m68kcpu.h (the top opword nibble traps unconditionally,
+  // no further decode). `.word 0xA000`/`.word 0xFD00` emit raw unassigned line-A/line-F
+  // opcodes (GNU as has no mnemonic for these — they're intentionally unimplemented).
+  // MOVEC VBR first (same trick as the vector-4 test above) so the handler addr is a
+  // runtime store both DUT and Musashi observe; handler bumps the stacked PC past the
+  // 2-byte faulting opword + RTEs. Commit PC/SR/A7 lock-stepped across entry/handler/RTE.
+  //
+  // ORACLE GAP (found while picking the line-F test opcode, NOT an RTL bug): the vendored
+  // Musashi is built with CPU_TYPE_68040, which sets HAS_PMMU=1 (m68kcpu.c) — a modeling
+  // leftover from the 68851/68030-era PMMU COPROCESSOR interface that real 68040 hardware
+  // does not have (the 68040's MMU is integrated, MOVEC-programmed, no coprocessor opcodes
+  // involved). Musashi's generated opcode table (m68kops.c: m68k_op_cpgen_32/cpscc_32/
+  // cpbcc_32/pmmu_32/{040fpu0,040fpu1}_32) OVERWRITES the generic m68k_op_1111 handler for
+  // most of the 0xF000-0xF3FF sub-range with these coprocessor/PMMU/FPU stubs, which for
+  // CPU_TYPE_68040 (CPU_TYPE_IS_EC020_PLUS) just log-and-return WITHOUT raising vector 11
+  // (see m68k_op_cpgen_32 / m68k_op_pmmu_32 in m68kops.c). So `.word 0xF000` silently
+  // no-ops on this oracle instead of faulting — confirmed via a standalone musashi_run
+  // trace (PC skips straight over it, no exception, D3 never gets set). `0xFD00` (bits
+  // 11-9=110, bit8=1) falls outside every one of those overlapping masks and correctly
+  // reaches the real m68k_op_1111 -> m68ki_exception_1111() path — verified standalone
+  // before using it here. This same quirk will resurface for real CPUSH/PFLUSH lock-step
+  // tests later (task #136) since their real encodings also live in the F0xx-F3xx range;
+  // whitebox verification (like task #131's MOVEC URP/SRP) may be needed there instead.
+  test("lock-step: line-A opcode -> vector 10 -> handler via VBR+0x28 -> RTE", VerilatorTest) {
+    runLockStep("line-a-vec10",
+      "move.l #0x3000,%d0 ; movec %d0,%vbr ; move.l #handler,%d1 ; move.l %d1,0x3028 ; " +
+      ".word 0xA000 ; moveq #7,%d3 ; " +
+      "loop: bra loop ; " +
+      "handler: move.l 2(%a7),%d0 ; addq.l #2,%d0 ; move.l %d0,2(%a7) ; moveq #1,%d2 ; rte",
+      nInstr = 11)
+  }
+
+  test("lock-step: line-F opcode -> vector 11 -> handler via VBR+0x2c -> RTE", VerilatorTest) {
+    runLockStep("line-f-vec11",
+      "move.l #0x3000,%d0 ; movec %d0,%vbr ; move.l #handler,%d1 ; move.l %d1,0x302c ; " +
+      ".word 0xFD00 ; moveq #7,%d3 ; " +
+      "loop: bra loop ; " +
+      "handler: move.l 2(%a7),%d0 ; addq.l #2,%d0 ; move.l %d0,2(%a7) ; moveq #1,%d2 ; rte",
+      nInstr = 11)
+  }
+
+  // CPUSH (line-1111, real 0xF4xx encoding): a real, non-illegal 68040 instruction this
+  // core has no cache hierarchy to model, so it's architecturally a NOP (matches this
+  // project's established "commit-time SYSTEM op with no real effect" treatment, same as
+  // RESET) — privileged, so a user-mode CPUSH must still trap vector 8.
+  //
+  // NOT LOCK-STEP-VERIFIABLE (2 separate, independently-confirmed Musashi oracle gaps,
+  // both empirically verified via standalone `tools/musashi/musashi_run` before writing
+  // these whitebox tests):
+  //  1. PRIVILEGE: Musashi's cpbcc_32/cpgen_32/cpscc_32 coprocessor-format stubs (the
+  //     SAME HAS_PMMU-adjacent CPU_TYPE_68040 quirk documented above for line-F vector-11)
+  //     cover the ENTIRE CPUSH bit8=0 encoding space unconditionally (every possible
+  //     bits7:6 combination is claimed by one of cpgen(00)/cpscc(01)/cpbcc(1x) — there is
+  //     no CPUSH encoding that avoids it), and — unlike MOVEC's real privilege check —
+  //     NONE of those handlers check FLAG_S before returning. Confirmed: a user-mode
+  //     `cpusha bc` on standalone musashi_run completes with NO exception (D3 gets set by
+  //     a following instruction with no diversion).
+  //  2. STEP-COUNTING: `cpbcc_32`'s CPU_TYPE-68040 cycle-cost entry is 0 (`m68kops.c`
+  //     table `{m68k_op_cpbcc_32, 0xf180, 0xf080, {0,0,4,4,0}}` — last column = 68040).
+  //     Confirmed via a standalone musashi_run trace: the per-instruction trace callback
+  //     never fires for the CPUSH retire itself — its effect is silently folded into the
+  //     SAME callback as the NEXT instruction, permanently off-by-one-ing any step-indexed
+  //     lock-step comparison even though Musashi's FINAL architectural state (PC/regs) is
+  //     actually correct. This is independent of gap #1 and affects BOTH privilege modes.
+  // Both directions verified via whitebox instead (mirrors runMoveFromSrPriv exactly —
+  // drives the real FullCoreDut through the real decode/commit path, asserts on
+  // `dut.rob.logic.exceptionPending`/`exceptionVector` directly, no oracle dependency).
+  private def runCpushPriv(userMode: Boolean): (Boolean, Int) = {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val src = "cpusha %bc ; handler: bra.s handler"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i
+      case Left(e)  => fail(s"assemble failed: ${e.reason}")
+    }
+    var sawPriv = false
+    var vec = -1
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      val handlerPc = loadAddr + 2   // the `handler:` label (after the 1-word CPUSHA)
+      for (i <- 0 until 4) dmem.pokeByte(0x20 + i, ((handlerPc >> (8 * i)) & 0xff).toInt)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.usp #= 0x00200000L
+      if (userMode) dut.rob.logic.exc.ss.srSys #= 0x00 else dut.rob.logic.exc.ss.srSys #= 0x27
+      val bootA7 = if (userMode) 0x00200000L else 0x00100000L
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(bootA7)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      var guard = 0
+      while (!sawPriv && guard < 600) {
+        if (dut.rob.logic.exceptionPending.toBoolean) {
+          sawPriv = true
+          vec = dut.rob.logic.exceptionVector.toInt
+        }
+        cd.waitSampling(); guard += 1
+      }
+    }
+    (sawPriv, vec)
+  }
+
+  test("CPUSHA in USER mode raises a vector-8 privilege violation", VerilatorTest) {
+    val (saw, vec) = runCpushPriv(userMode = true)
+    assert(saw, "user-mode CPUSHA must raise a precise exception")
+    assert(vec == 8, s"privilege violation must be vector 8, got $vec")
+  }
+  test("CPUSHA in SUPERVISOR mode raises NO exception", VerilatorTest) {
+    val (saw, _) = runCpushPriv(userMode = false)
+    assert(!saw, "supervisor CPUSHA must NOT raise a privilege violation")
+  }
+
+  // PFLUSHA (0xF518, task #136): "flush all ATC/TLB entries". Unlike CPUSH, this
+  // dispatches to Musashi's OWN dedicated (if functionally unimplemented — logs
+  // "68040: unhandled PFLUSH") PFLUSH handler, NOT the stale coprocessor-format stubs
+  // (verified: bit8=1 and bits11:9=010 avoid every one of cpgen(bit8=0)/cpscc(bit8=0)/
+  // cpbcc(bit8=0)/pmmu(bits11:9=000)'s masks). Confirmed via standalone musashi_run:
+  // it consumes exactly 1 word and advances PC correctly with no side effects on
+  // visible register/memory state — so the supervisor-mode (non-faulting) direction
+  // IS lock-step-verifiable (the TLB-specific effect itself isn't observable via
+  // lock-step anyway; that's verified separately in DtlbSpec's whitebox flushAll test).
+  // Musashi does NOT check FLAG_S for PFLUSHA either (confirmed empirically, same as
+  // CPUSH), so the privilege-trap direction still needs whitebox verification.
+  test("lock-step: PFLUSHA supervisor mode -> no-op (TLB-invisible), PC advances 1 word", VerilatorTest) {
+    runLockStep("pflusha-super-noop",
+      "moveq #5,%d1 ; pflusha ; moveq #7,%d3 ; .stop: bra .stop",
+      nInstr = 3)
+  }
+
+  private def runPflushaPriv(userMode: Boolean): (Boolean, Int) = {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val src = "pflusha ; handler: bra.s handler"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i
+      case Left(e)  => fail(s"assemble failed: ${e.reason}")
+    }
+    var sawPriv = false
+    var vec = -1
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      val handlerPc = loadAddr + 2   // the `handler:` label (after the 1-word PFLUSHA)
+      for (i <- 0 until 4) dmem.pokeByte(0x20 + i, ((handlerPc >> (8 * i)) & 0xff).toInt)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.usp #= 0x00200000L
+      if (userMode) dut.rob.logic.exc.ss.srSys #= 0x00 else dut.rob.logic.exc.ss.srSys #= 0x27
+      val bootA7 = if (userMode) 0x00200000L else 0x00100000L
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(bootA7)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      var guard = 0
+      while (!sawPriv && guard < 600) {
+        if (dut.rob.logic.exceptionPending.toBoolean) {
+          sawPriv = true
+          vec = dut.rob.logic.exceptionVector.toInt
+        }
+        cd.waitSampling(); guard += 1
+      }
+    }
+    (sawPriv, vec)
+  }
+
+  test("PFLUSHA in USER mode raises a vector-8 privilege violation", VerilatorTest) {
+    val (saw, vec) = runPflushaPriv(userMode = true)
+    assert(saw, "user-mode PFLUSHA must raise a precise exception")
+    assert(vec == 8, s"privilege violation must be vector 8, got $vec")
+  }
+  test("PFLUSHA in SUPERVISOR mode raises NO exception", VerilatorTest) {
+    val (saw, _) = runPflushaPriv(userMode = false)
+    assert(!saw, "supervisor PFLUSHA must NOT raise a privilege violation")
+  }
+
+  // Task #139 (found by a 200-seed fuzz campaign, 2026-07-16, minimized seed=10001):
+  // CHK.W in-bounds (no trap) with the checked value == 0 must set Z. Musashi's
+  // m68k_op_chk_16_d/_32_d: `FLAG_Z = ZFLAG_16/32(src)` — set UNCONDITIONALLY from the
+  // checked value's own zero-ness on EVERY execution (labeled "Undocumented" in Musashi
+  // but real, oracle-matching 68k behavior), not hardcoded 0 as this core's DivEuPlugin
+  // previously assumed (chkNzvc). Bound=1, checked value(D5)=0 -> in-bounds, no trap,
+  // but Z must still be set.
+  test("lock-step: CHK.W in-bounds with checked value==0 -> Z flag set (task #139)", VerilatorTest) {
+    runLockStep("chk-w-zero-inbounds",
+      "move.l #0x1,%d4 ; move.l #0x0,%d5 ; chk.w %d4,%d5 ; moveq #7,%d3 ; .stop: bra .stop",
+      nInstr = 4)
   }
 
   test("lock-step: jsr (xxx).L ... rts", VerilatorTest) {
@@ -3678,6 +3944,22 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       checkMem = Seq(0x2003L), checkSpan = 2)
   }
 
+  // m68k-ooo test-porting (exc_addr_error.s intent): unaligned .L access must NOT
+  // raise vector 3 (address error) on a real 68040 — unlike 68000/68020, the 040's
+  // LSU silently splits an unaligned access into aligned beats. This repo's RTL has
+  // NO address-error (vector 3) exception path implemented AT ALL (grep for it in
+  // src/main/scala/m68k040/exception finds nothing) — so unlike m68k-ooo (where this
+  // test guards against a REAL trap path misfiring), here it's structurally
+  // impossible to trap vector 3. Still worth locking in as a regression: proves the
+  // split-beat LSU produces the CORRECT VALUE for a plain unaligned LONG store+load
+  // (existing misalign coverage above is WORD-at-odd-offset and LONG-crossing-a-
+  // CACHE-LINE; this is a LONG at an odd BYTE offset within a line, untested before).
+  test("lock-step: unaligned .L store then load-back (odd byte offset, no address-error trap)", VerilatorTest) {
+    runLockStep("misaligned-long-odd",
+      "move.l #0x11223344,%d0 ; move.l %d0,0x2001 ; moveq #0,%d1 ; move.l 0x2001,%d1",
+      checkMem = Seq(0x2001L), checkSpan = 4)
+  }
+
   test("lock-step: page-crossing word store then load-back", VerilatorTest) {
     // move.w %d0,0x2FFF : a WORD at page offset 0xFFF spans 0x2FFF..0x3000 -> crosses
     // the 4 KB page boundary (identity translation: two translations, both succeed).
@@ -3756,7 +4038,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
       buildFaultTable(ptmem); buildFaultTable(itlbPtmem)
       dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.rootPtr   #= MMU_ROOT
+      dut.ctrl.logic.urp   #= MMU_ROOT
+      dut.ctrl.logic.srp   #= MMU_ROOT
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
@@ -3827,7 +4110,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       buildSupervisorCodeTable(ptmem, loadAddr)
       buildSupervisorCodeTable(itlbPtmem, loadAddr)
       dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.rootPtr   #= SUP_ROOT
+      dut.ctrl.logic.urp   #= SUP_ROOT
+      dut.ctrl.logic.srp   #= SUP_ROOT
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
       cd.waitSampling(2)
@@ -3921,6 +4205,27 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                               // banking is still exercised (A7: SSP 0x100000 -> USP 0 on S->0, back on the trap).
   }
 
+  // Task #131 gap-closing verification (m68k-ooo priv_user_movec_traps.s intent):
+  // ANY user-mode MOVEC must trap vector-8, regardless of Rc — including our NEW
+  // URP/SRP/TC cases (previously RAZ/WI defaults, now real read/write paths). This
+  // is Rc-independent by construction on both sides: Musashi's movec_cr/movec_rc
+  // check `FLAG_S` BEFORE the Rc switch (`m68k_in.c`: `if(FLAG_S){switch(...)} ;
+  // m68ki_exception_privilege_violation();`), and our RTL's `sysPrivFault :=
+  // sysRetire && !exc.ss.s` fires before/independent of the sysCapRc switch — so a
+  // single directed case (movec %d0,%urp) genuinely exercises the shared check, not
+  // just one Rc's plumbing. If our new URP case accidentally bypassed the privilege
+  // gate, this would diverge immediately (Musashi traps, DUT would execute instead).
+  test("lock-step: MOVEC (URP) in USER mode -> vector-8 privilege violation (op does not execute)", VerilatorTest) {
+    runLockStep("movec-urp-user-priv",
+      "move.l #handler,%d0 ; move.l %d0,0x20 ; move.w #0x0000,%d1 ; move %d1,%sr ; " + // -> user (S=0)
+      "move.l #0x11111111,%d2 ; movec %d2,%urp ; " +                                   // privileged -> trap; URP unchanged
+      "moveq #7,%d3 ; " +                                                              // resume here
+      "loop: bra loop ; " +
+      "handler: move.l 2(%a7),%d0 ; addq.l #4,%d0 ; move.l %d0,2(%a7) ; " +            // bump stacked PC past the 4-byte op
+      "moveq #1,%d4 ; rte",
+      nInstr = 12, usp = 0)
+  }
+
   test("lock-step: TRAP #5 -> handler -> RTE (format-$0 delivery)", VerilatorTest) {
     runLockStep("exc-trap",
       "move.l #handler,%d0 ; move.l %d0,0x94 ; trap #5 ; moveq #7,%d3 ; " +
@@ -3936,10 +4241,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // logic (ss.msp / ss.isp updated at commit time, surfaced every step, compared
   // vs Musashi's REG_MSP / REG_ISP every step).
   //
-  // CONSTRAINT: M=1 may only pair with a TRAP/illegal/privileged exception — NOT
-  // an interrupt.  The interrupt-with-M=1 throwaway frame (format $1) is a later
-  // slice and is NOT implemented.  A TRAP while M=1 stacks a normal format-$0
-  // frame on the master stack (no throwaway frame); Musashi matches this exactly.
+  // A TRAP while M=1 stacks a normal format-$0 frame on the master stack (no
+  // throwaway frame) — Musashi matches this exactly. An INTERRUPT while M=1 is
+  // DIFFERENT (stacks format-$0 on MSP + a format-$1 throwaway on ISP, handler runs
+  // on ISP) — that path is task #132 (Slice B), now implemented; see "lock-step
+  // IRQ: M=1 -> format-$1 throwaway ..." below in the interrupt test section.
 
   // Test 1: seed MSP=0x000A0000 (via initialMsp), then MOVE-to-SR to switch to M=1
   // (arch-15 is still at phys-15 identity alias when the exc FSM fires, so the
@@ -4497,7 +4803,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         pokeLE(PAGD + (((cva >> 12) & 0x3f).toInt) * 4, (((cva >> 12) & 0xfffffL) << 12) | 0x1L)
       }
       dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.rootPtr   #= 0x80000L
+      dut.ctrl.logic.urp   #= 0x80000L
+      dut.ctrl.logic.srp   #= 0x80000L
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
@@ -4557,6 +4864,157 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val pa = (dataPPN << 12) | (0x2000L & 0xfffL)
       assert(dmem.peekByte(pa + 3) == 0x2a,
         f"[pagefault] re-executed store must land 0x2a at PA 0x${pa + 3}%08x (got 0x${dmem.peekByte(pa + 3)}%02x)")
+    }
+  }
+
+  // m68k-ooo test-porting (mmu_wp_user_vs_super.s intent, task #131 gap-closing):
+  // a WRITE to a write-protected (W-bit set) RESIDENT page must fault (vector 2,
+  // format-$7) exactly like a non-resident page — genuinely untested before this
+  // (grep for writeProt/WRITE_PROTECT in src/test/scala found zero hits despite the
+  // RTL — Tlb.scala/MmuTypes.scala — already tracking write-protect per-entry).
+  // IDENTICAL program/layout to the non-resident test above (same VA, same fault
+  // PC, same SSW — a WP fault and a non-resident fault produce the SAME SSW bit
+  // pattern in this RTL, since SSW only encodes rw/fc, not fault REASON) — the only
+  // difference is the leaf descriptor starts RESIDENT+W=1 instead of non-resident,
+  // and the handler clears W (not PDT) before RTE. Confirmed the oracle's custom
+  // MMU shim (`m68k_ref.cpp: bool wp = (pgDesc & 0x4u); if (rw && wp) return
+  // fault();`) implements write-protect, unlike the MOVEC-URP/SRP stubs — this IS
+  // lock-step verifiable.
+  test("lock-step: MMU write-protect fault (W-bit set, resident) -> handler clears W -> RTE -> resume", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val PTRT = 0x00081000L
+    val PAGA = 0x00082000L
+    val PAGC = 0x00083000L
+    val dataPPN = 0x42L
+
+    val src =
+      "move.l #handler,%d1 ; move.l %d1,0x8 ; " +
+      "moveq #42,%d0 ; move.l %d0,0x2000 ; " +           // FAULTS (write to W=1 page), then re-runs after RTE
+      "loop: bra loop ; " +
+      "handler: move.l #0x01200400,%d1 ; move.l %d1,0x82008 ; rte"  // clears W (PDT=01, W=0)
+    val nInstr = 8
+
+    val leafWp = ((dataPPN << 12) & 0xfffff000L) | 0x4L | 0x1L   // resident, W=1
+    val oraclePt = Seq(
+      0x80000L -> ((PTRT & 0xfffffff0L) | 0x2L),
+      PTRT     -> ((PAGA & 0xfffffff0L) | 0x2L),
+      (PAGA + 2 * 4) -> leafWp)   // leaf: resident + write-protected from the start
+    val mmu = Some(Musashi.MmuConfig(rootPtr = 0x80000L, dataLo = 0x2000L, dataHi = 0x3000L, ptPreload = oraclePt))
+
+    val oracleSteps = Musashi.assembleAndTrace(src, mmu = mmu, maxCycles = 20000) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[wpfault] oracle trace failed: ${err.reason}")
+    }
+    assert(oracleSteps.size >= nInstr, s"[wpfault] oracle produced ${oracleSteps.size} steps, expected >= $nInstr")
+    val oracle = oracleSteps.take(nInstr)
+
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[wpfault] assemble failed: ${err.reason}")
+    }
+
+    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      val handle = new WhiteboxCapture.Handle
+
+      def captureWb(w: m68k040.execute.WbObs): Unit = if (w.valid.toBoolean) {
+        handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
+          dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
+          intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
+          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
+      }
+      def captureBranch(): Unit = {
+        val bw = dut.branchEu.logic.wbObs
+        if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+      }
+      def captureExc(): Unit = {
+        val c = dut.rob.logic.commitObs(2)
+        if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
+          if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1,
+          msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+          isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+      }
+      cd.onSamplings {
+        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
+        captureBranch()
+        for (k <- 0 until 2) {
+          val c = dut.rob.logic.commitObs(k)
+          if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
+            sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
+            msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+        }
+        captureExc()
+      }
+
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+      pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)
+      pokeLE(PTRT + 0 * 4,    (PAGA & 0xfffffff0L) | 0x2L)
+      pokeLE(PTRT + 2 * 4,    (PAGC & 0xfffffff0L) | 0x2L)
+      pokeLE(PAGA + 0 * 4,    (0x0L << 12) | 0x1L)
+      pokeLE(PAGA + 2 * 4,    leafWp)                        // pageA[2] = resident, W=1 (the fault)
+      pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)
+      pokeLE(PAGC + 2 * 4,    (0x82L << 12) | 0x1L)
+      val PAGD = 0x00084000L
+      pokeLE(PTRT + (((loadAddr >> 18) & 0x7f).toInt) * 4, (PAGD & 0xfffffff0L) | 0x2L)
+      pokeLE(MMU_ROOT + (((loadAddr >> 25) & 0x7f).toInt) * 4, (PTRT & 0xfffffff0L) | 0x2L)
+      for (i <- 0 until 8) {
+        val cva = loadAddr + i * 0x1000L
+        pokeLE(PAGD + (((cva >> 12) & 0x3f).toInt) * 4, (((cva >> 12) & 0xfffffL) << 12) | 0x1L)
+      }
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp   #= 0x80000L
+      dut.ctrl.logic.srp   #= 0x80000L
+
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= true
+      dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= false
+
+      var guard = 0; val cap = 6000
+      var sawFault = false
+      while (handle.result.size < nInstr && guard < cap) {
+        if (dut.dtlb.logic.faultSeen.toBoolean) sawFault = true
+        cd.waitSampling(); guard += 1
+      }
+      assert(sawFault, "[wpfault] the write to a write-protected page must flag a DTLB fault")
+      assert(handle.result.size >= nInstr,
+        s"[wpfault] only ${handle.result.size}/$nInstr committed within $cap cycles")
+      val fb = 0x100000L - 60
+      def pk16(a: Long): Int = ((dmem.peekByte(a) << 8) | dmem.peekByte(a + 1)) & 0xffff
+      def pk32(a: Long): Long = ((pk16(a).toLong << 16) | pk16(a + 2)) & 0xffffffffL
+      assert(pk16(fb + 6) == 0x7008, f"[wpfault] frame fmt/vec=0x${pk16(fb + 6)}%04x expected 0x7008 (vector 2)")
+      assert(pk16(fb + 0xc) == 0x0405, f"[wpfault] frame SSW=0x${pk16(fb + 0xc)}%04x expected 0x0405 (write-protect uses the SAME rw/fc encoding as non-resident)")
+      assert(pk32(fb + 0x14) == 0x2000L, f"[wpfault] frame faultAddr=0x${pk32(fb + 0x14)}%08x expected 0x2000")
+
+      val res = LockStep.compare(handle.result.take(nInstr), oracle)
+      assert(res.ok,
+        s"[wpfault] lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")} " +
+          s"(matched ${res.matched}, dut commits ${handle.result.size}, oracle steps $nInstr)")
+
+      cd.waitSampling(200)
+      val pa = (dataPPN << 12) | (0x2000L & 0xfffL)
+      assert(dmem.peekByte(pa + 3) == 0x2a,
+        f"[wpfault] re-executed store must land 0x2a at PA 0x${pa + 3}%08x (got 0x${dmem.peekByte(pa + 3)}%02x)")
     }
   }
 
@@ -4639,7 +5097,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
       build(ptmem); build(itlbPtmem)
       dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.rootPtr   #= MMU_ROOT
+      dut.ctrl.logic.urp   #= MMU_ROOT
+      dut.ctrl.logic.srp   #= MMU_ROOT
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
@@ -4756,7 +5215,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         pokeLE(PAGD + i*4, v)
       }
       dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.rootPtr   #= 0x80000L
+      dut.ctrl.logic.urp   #= 0x80000L
+      dut.ctrl.logic.srp   #= 0x80000L
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
@@ -4872,7 +5332,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         pokeLE(PAGD + i*4, v)
       }
       dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.rootPtr   #= 0x80000L
+      dut.ctrl.logic.urp   #= 0x80000L
+      dut.ctrl.logic.srp   #= 0x80000L
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
@@ -5790,7 +6251,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         pokeLE(PAGD + (((cva >> 12) & 0x3f).toInt) * 4, (((cva >> 12) & 0xfffffL) << 12) | 0x1L)
       }
       dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.rootPtr   #= 0x80000L
+      dut.ctrl.logic.urp   #= 0x80000L
+      dut.ctrl.logic.srp   #= 0x80000L
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false

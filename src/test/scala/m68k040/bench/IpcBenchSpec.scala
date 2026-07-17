@@ -381,7 +381,8 @@ class IpcBenchSpec extends AnyFunSuite {
 
       // MMU off (identity).
       dut.ctrl.logic.mmuEnable #= false
-      dut.ctrl.logic.rootPtr   #= 0
+      dut.ctrl.logic.urp   #= 0
+      dut.ctrl.logic.srp   #= 0
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
