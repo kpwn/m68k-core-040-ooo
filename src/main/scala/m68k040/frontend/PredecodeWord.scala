@@ -73,11 +73,19 @@ object PredecodeWord {
         is(U(4, 3 bits)) { ok := True; ext := U(0, 3 bits) }   // -(An) predecrement (no ext)
         is(U(5, 3 bits)) { ok := True; ext := U(1, 3 bits) }   // (d16,An)
         is(U(6, 3 bits)) {                                     // (d8,An,Xn) brief / full-format
-          when(eaWKnown) {
-            ok := True; ext := Mux(eaW(8), fullExtLen(eaW), U(1, 3 bits))
-          } otherwise {
-            ok := False   // can't tell brief vs full -> COMPLEX (safe), not a silent guess
-          }
+          // ASSUME brief (1 ext word) when the ext word isn't resident yet
+          // (IcachePlugin at an I-cache-line boundary), rather than reject as
+          // COMPLEX (task #170-cluster10). Rejecting here forced an ordinary
+          // crackable memory-RMW instruction (CLR/NEG/NOT/TAS/Scc/shift-mem/
+          // EOR-mem/ADDQ-mem/etc, whichever routes through this helper) to a
+          // spurious vector-4 illegal trap purely because ITS OWN extension
+          // word happened to straddle a 64-byte cache-line boundary -- a
+          // permanent wild-PC HANG in the bare-metal ported-test harness
+          // (no vector-4 handler), strictly worse than the rare full-format
+          // mis-framing this trades for. Mirrors the line-0-immediate
+          // mem-dest .L-imm case's identical "assume brief" tradeoff below.
+          ok := True
+          ext := Mux(eaWKnown, Mux(eaW(8), fullExtLen(eaW), U(1, 3 bits)), U(1, 3 bits))
         }
         is(U(7, 3 bits)) {
           switch(reg) {
@@ -108,11 +116,11 @@ object PredecodeWord {
         }
         is(U(6, 3 bits)) {
           // (d8,An,Xn) brief = 1 ext word; FULL-format (bit8=1) = 1 + bd + od (1..5).
-          when(eaWKnown) {
-            ext := Mux(eaW(8), fullExtLen(eaW), U(1, 3 bits))
-          } otherwise {
-            ok := False   // can't tell brief vs full (see memDestExt's eaWKnown comment)
-          }
+          // ASSUME brief when unknown (task #170-cluster10) -- see memDestExt's
+          // identical mode-6 fix for the full rationale (an I-cache-line-
+          // boundary "can't tell" rejection was forcing ordinary crackable
+          // ALU-src/etc <ea>,Dn instructions to a spurious illegal trap).
+          ext := Mux(eaWKnown, Mux(eaW(8), fullExtLen(eaW), U(1, 3 bits)), U(1, 3 bits))
         }
         is(U(7, 3 bits)) {
           switch(reg) {
@@ -177,15 +185,20 @@ object PredecodeWord {
             // a full-format dst, the EA's first ext word = op+2 when the imm is 1 word
             // (.B/.W -> extW2); a .L imm pushes it to op+3 -> extW3 (task #153: a 3rd
             // lookahead word, threaded through from IcachePlugin's already-resident cache
-            // line — see `classify`'s extW3 doc comment). When extW3 genuinely isn't
+            // line — see `classify`'s extW3 doc comment). When extW3/extW2 genuinely isn't
             // available (every pre-existing caller, or IcachePlugin at a cache-line
-            // boundary), this reproduces the ORIGINAL "assume brief" framing exactly
-            // (immDstEaW forced 0, immDstEaKnown forced True) rather than F5's "reject
-            // unknown" doctrine — changing that fallback would flip the RTL-vs-reference
-            // equivalence for the 1-arg `classify(op)` overload (PredecodeWordSpec's
-            // exhaustive 65536-opword test), which never supplies ext words at all.
-            val immDstEaW = Mux(ss === U(2, 2 bits), Mux(extW3Known, extW3, B(0, 16 bits)), extW2)
-            val immDstEaKnown = Mux(ss === U(2, 2 bits), True, extW2Known)
+            // boundary), `memDestExt` itself now assumes brief internally for its mode-6
+            // case (task #170-cluster10 — previously ONLY the .L path here faked
+            // known:=True/eaW:=0 to get that same "assume brief" outcome, leaving .B/.W
+            // to pass its real (possibly False) extW2Known straight through into the
+            // OLD memDestExt's "reject unknown -> COMPLEX" branch — a real, hit gap,
+            // see byte_lane_indexed_rmw's CMPI.B repro). Passing the real extW2Known/
+            // extW3Known through unconditionally now (no forced-True faking needed) is
+            // simpler AND uniform across .B/.W/.L, and doesn't change the .L path's
+            // outcome (a zero-filled fake word already had bit8=0="brief" -> ext=1,
+            // exactly what memDestExt's internal fallback now also returns directly).
+            val immDstEaW = Mux(ss === U(2, 2 bits), extW3, extW2)
+            val immDstEaKnown = Mux(ss === U(2, 2 bits), extW3Known, extW2Known)
             val (mok, mext) = memDestExt(mode, reg, immDstEaW, immDstEaKnown)
             when(mok) {
               r.simple := True; r.lenWords := (U(1, 3 bits) + immWords + mext).resized
