@@ -1130,7 +1130,16 @@ object MicroOpAssembler {
     // reject `=/= MEMSIMPLE`; a pcRel MEMSIMPLE (d16,PC)/(d8,PC,Xn) would otherwise slip
     // through (memDest is now false for pcRel, so no RMW crack fires -> would mis-crack a
     // leading load). Force the illegal path. Source pcRel (read) stays valid.
-    val eaDstPcRelBad = eaIsDst && srcIsMem && srcEa.pcRel
+    // `&& spec.dstWrites` (task #169, ported-tests triage, btst_pcrel_src HANG): BTST
+    // uniquely (PRM §4.16) accepts a PC-relative READ-ONLY target -- its `dst` field is
+    // still set to the SAME `easrc` operand as BCHG/BCLR/BSET (OperationDecoder's shared
+    // bit-op table always sets `o.dst := easrc`, for table uniformity), but `dstWrites`
+    // is False for BTST specifically (tt==00), True for the other three. Without this
+    // guard, this gate treated BTST identically to a REAL write and forced it illegal
+    // even though nothing was ever going to be written -- the generic crackLoad path
+    // (which already correctly folds pcRel into the load address, per ldUop's own
+    // comment) never got a chance to fire.
+    val eaDstPcRelBad = eaIsDst && srcIsMem && srcEa.pcRel && spec.dstWrites
     // ── Line-5 Scc / DBcc / TRAPcc (0101 cccc 11 mmmrrr) ────────────────────────
     // ss == 11 (op[7:6]). mode = op[5:3]. DBcc = mode 001 (+ disp16 word). Scc = any
     // other mode (a byte set on cond); in-scope = mode 000 (Dn). TRAPcc = mode 111 with
@@ -1766,7 +1775,7 @@ object MicroOpAssembler {
     divremUop.cluster       := Cluster.CPLX
     divremUop.size          := Size.LONG
     divremUop.memOp         := MemOp.NONE
-    divremUop.srcAReg       := 0; divremUop.srcAValid := False
+    divremUop.srcAReg       := divlDr; divremUop.srcAValid := True   // Dr's OLD value (overflow write-through)
     divremUop.srcBReg       := 0; divremUop.srcBValid := False
     divremUop.srcCReg       := 0; divremUop.srcCValid := False
     divremUop.useImm        := False; divremUop.imm := 0

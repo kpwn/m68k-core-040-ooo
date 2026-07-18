@@ -202,6 +202,10 @@ object PredecodeWord {
         val isDynBit  = bit8 && (mode =/= U(1, 3 bits))         // exclude MOVEP
         val isStatBit = op(11 downto 8) === B"1000"            // opmode 4
         val bitBase   = Mux(isStatBit, U(2, 4 bits), U(1, 4 bits))   // +1 for the static bit word
+        // tt (bits 7:6) selects the bit-op sub-kind, identically positioned for both the
+        // dynamic and static encodings: 00=BTST, 01=BCHG, 10=BCLR, 11=BSET.
+        val bitTt    = op(7 downto 6)
+        val isBtstOp = (isDynBit || isStatBit) && (bitTt === B(0, 2 bits))
         when(isDynBit || isStatBit) {
           when(mode === U(0, 3 bits)) {                         // Dn dest (LONG)
             r.simple := True; r.lenWords := bitBase
@@ -211,7 +215,25 @@ object PredecodeWord {
             val bitDstEaW    = Mux(isStatBit, extW2, extW)
             val bitDstEaKnown = Mux(isStatBit, extW2Known, extWKnown)
             val (mok, mext) = memDestExt(mode, reg, bitDstEaW, bitDstEaKnown)
-            when(mok) { r.simple := True; r.lenWords := (bitBase + mext).resized }
+            when(mok) {
+              r.simple := True; r.lenWords := (bitBase + mext).resized
+            } elsewhen(isBtstOp && (mode === U(7, 3 bits)) && (reg === U(2, 3 bits))) {
+              // BTST uniquely (PRM §4.16) also accepts PC-relative READ-ONLY targets --
+              // NOT shared with BCHG/BCLR/BSET, which require a data-alterable (writable)
+              // EA and correctly stay COMPLEX/illegal here (memDestExt has no PC-relative
+              // case at all, by design, for those 3). Task #169 (ported-tests triage,
+              // btst_pcrel_src HANG): memDestExt's shared mem-dest table rejected mode=7
+              // entirely except reg 0/1 (abs.W/.L), so BTST Dm,(d16,PC) fell to COMPLEX ->
+              // illegal (vector 4, no handler in the bare-metal harness) -> wild-PC HANG.
+              // (d16,PC): 1 ext word (the displacement), same shape as (d16,An).
+              r.simple := True; r.lenWords := (bitBase + U(1, 3 bits)).resized
+            } elsewhen(isBtstOp && (mode === U(7, 3 bits)) && (reg === U(3, 3 bits))) {
+              // BTST Dm,(d8,PC,Xn) brief/full-format -- same PRM §4.16 read-only allowance.
+              when(bitDstEaKnown) {
+                r.simple := True
+                r.lenWords := (bitBase + Mux(bitDstEaW(8), fullExtLen(bitDstEaW), U(1, 3 bits))).resized
+              }
+            }
           }
         }
         // ── MOVEP (0000 rrr 1 oo 001 aaa) + disp16 ──────────────────────────────
