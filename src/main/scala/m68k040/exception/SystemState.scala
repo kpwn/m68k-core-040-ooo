@@ -44,8 +44,15 @@ class SystemState extends Area {
   // unused by this core's flat memory model (MOVES is flat) but must round-trip via MOVEC.
   val sfc   = RegInit(U(0, 3 bits))
   val dfc   = RegInit(U(0, 3 bits))
+  // CACR: cache control register. Round-trippable via MOVEC (task #170-cluster10) but
+  // with NO functional effect on the D-cache (this core's D-cache always caches
+  // regardless of CACR bits — matches the pre-existing documented behavior; only the
+  // storage/round-trip half was previously missing, unlike TCR/URP/SRP which are
+  // consumed by the page walker and were reverted after a sim-poke regression, task
+  // #131 — CACR has no such consumer, so it's a plain, low-risk committed register).
+  val cacr  = RegInit(U(0, 32 bits))
   srSys.simPublic(); vbr.simPublic(); usp.simPublic(); isp.simPublic(); msp.simPublic()
-  sfc.simPublic(); dfc.simPublic()
+  sfc.simPublic(); dfc.simPublic(); cacr.simPublic()
 
   /** Committed S (supervisor) and M (master) bits. */
   val s = srSys(S_BIT); s.simPublic()
@@ -65,6 +72,7 @@ class SystemState extends Area {
   val writeA7  = Flow(UInt(32 bits))   // writes the bank selected by committed (S, M)
   val setSfc   = Flow(UInt(3 bits))
   val setDfc   = Flow(UInt(3 bits))
+  val setCacr  = Flow(UInt(32 bits))
   // Default idle; allowOverride so a standalone/test DUT (and ExceptionUnit) can drive them.
   setSrSys.valid.allowOverride; setSrSys.valid := False; setSrSys.payload.allowOverride; setSrSys.payload := U(0, 8 bits)
   setVbr.valid.allowOverride;   setVbr.valid := False;   setVbr.payload.allowOverride;   setVbr.payload := U(0, 32 bits)
@@ -74,6 +82,7 @@ class SystemState extends Area {
   writeA7.valid.allowOverride;  writeA7.valid := False;  writeA7.payload.allowOverride;  writeA7.payload := U(0, 32 bits)
   setSfc.valid.allowOverride;   setSfc.valid := False;   setSfc.payload.allowOverride;   setSfc.payload := U(0, 3 bits)
   setDfc.valid.allowOverride;   setDfc.valid := False;   setDfc.payload.allowOverride;   setDfc.payload := U(0, 3 bits)
+  setCacr.valid.allowOverride;  setCacr.valid := False;  setCacr.payload.allowOverride;  setCacr.payload := U(0, 32 bits)
 
   // ── commit-time updates ──────────────────────────────────────────────────
   when(setSrSys.valid) { srSys := setSrSys.payload }
@@ -89,4 +98,5 @@ class SystemState extends Area {
   when(setMsp.valid)   { msp := setMsp.payload }
   when(setSfc.valid)   { sfc := setSfc.payload }
   when(setDfc.valid)   { dfc := setDfc.payload }
+  when(setCacr.valid)  { cacr := setCacr.payload }
 }

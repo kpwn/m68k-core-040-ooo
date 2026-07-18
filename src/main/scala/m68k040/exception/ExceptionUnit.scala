@@ -793,9 +793,10 @@ class ExceptionUnit(
               U(0x000, 12 bits) -> ss.sfc.resize(32),
               U(0x001, 12 bits) -> ss.dfc.resize(32),
               U(0x003, 12 bits) -> Mux(mmuCtrl.mmuEnable, U(0x8000, 32 bits), U(0, 32 bits)),
+              U(0x002, 12 bits) -> ss.cacr,
               U(0x806, 12 bits) -> mmuCtrl.urp,
               U(0x807, 12 bits) -> mmuCtrl.srp,
-              default           -> U(0, 32 bits))   // CACR/other -> RAZ (read 0)
+              default           -> U(0, 32 bits))   // other unmodeled Rc -> RAZ (read 0)
           } otherwise {                             // Rn -> Rc : write the committed reg
             switch(sysCapRc) {
               is(U(0x801, 12 bits)) { ss.setVbr.valid := True; ss.setVbr.payload := sysCapVal.asUInt }
@@ -803,12 +804,19 @@ class ExceptionUnit(
               // SFC/DFC: write the low 3 bits (Musashi masks `& 7`); upper bits ignored.
               is(U(0x000, 12 bits)) { ss.setSfc.valid := True; ss.setSfc.payload := sysCapVal(2 downto 0).asUInt }
               is(U(0x001, 12 bits)) { ss.setDfc.valid := True; ss.setDfc.payload := sysCapVal(2 downto 0).asUInt }
-              // CACR (0x002) / TCR (0x003) / URP (0x806) / SRP (0x807) / other: WI
-              // (write-ignored, RAZ-WI). TCR/URP/SRP real-write support was ATTEMPTED
-              // (task #131) and REVERTED after a confirmed sim-poke-persistence
-              // regression — see MmuControlPlugin's doc comment. The READ side above
-              // still surfaces whatever urp/srp/mmuEnable currently hold (sim-poke or
-              // default), consistent with how CACR has always behaved here.
+              // CACR (0x002): real committed storage (task #170-cluster10), round-
+              // trippable via MOVEC but with NO functional effect on the D-cache (it
+              // always caches regardless — matches this core's pre-existing behavior,
+              // only the storage/round-trip half was missing). Unlike TCR/URP/SRP
+              // (0x003/0x806/0x807, still WI below) CACR has no page-walker consumer,
+              // so it doesn't share the sim-poke-persistence regression risk that got
+              // task #131's TCR/URP/SRP write mechanism reverted.
+              is(U(0x002, 12 bits)) { ss.setCacr.valid := True; ss.setCacr.payload := sysCapVal.asUInt }
+              // TCR (0x003) / URP (0x806) / SRP (0x807) / other: WI (write-ignored,
+              // RAZ-WI). Real-write support was ATTEMPTED (task #131) and REVERTED
+              // after a confirmed sim-poke-persistence regression — see
+              // MmuControlPlugin's doc comment. The READ side above still surfaces
+              // whatever urp/srp/mmuEnable currently hold (sim-poke or default).
             }
           }
         }
