@@ -38,7 +38,11 @@ vendor_one() {
   cp "$SRC/$name.s" "$DST/$name.s"
   local args="$SRC/$name.args"
   if [ -f "$args" ]; then
-    grep -o '+timeout=[0-9]*' "$args" | cut -d= -f2 > "$DST/$name.timeout"
+    local t
+    t=$(grep -o '+timeout=[0-9]*' "$args" | cut -d= -f2)
+    if [ -n "$t" ]; then
+      echo "$t" > "$DST/$name.timeout"
+    fi
   fi
   echo "  [OK]   $name"
 }
