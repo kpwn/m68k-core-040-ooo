@@ -20,9 +20,20 @@ object PredecodeWord {
   // constant per predecode instantiation, not a runtime signal — free to plumb through as a
   // Boolean). Default True preserves existing behavior for every other caller (unit tests +
   // the 1/2/3-arg overloads above), which always supply real data.
-  def classify(op: Bits, extW: Bits, extW2: Bits, extWValid: Boolean, extW2Valid: Boolean): ChunkPredecode = {
+  // task #153 (ported-tests memind cluster): a 5th `extW3` word (op+3) is needed ONLY to
+  // correctly frame a line-0 .L-immediate op with a full-format mem-indirect DESTINATION
+  // (the 2-word .L immediate pushes the EA's first ext word from op+2 to op+3, one word
+  // beyond the original 2-word lookahead — see the dedicated comment at its use site below).
+  // Every pre-existing caller (unit tests + this 5-arg overload) keeps the OLD "extW3
+  // unknown" behavior bit-for-bit (extW3Valid=false) — ONLY IcachePlugin's real 7-arg call
+  // (below), which has the whole cache line already resident, supplies real data.
+  def classify(op: Bits, extW: Bits, extW2: Bits, extWValid: Boolean, extW2Valid: Boolean): ChunkPredecode =
+    classify(op, extW, extW2, B(0, 16 bits), extWValid, extW2Valid, extW3Valid = false)
+  def classify(op: Bits, extW: Bits, extW2: Bits, extW3: Bits,
+               extWValid: Boolean, extW2Valid: Boolean, extW3Valid: Boolean): ChunkPredecode = {
     val extWKnown  = Bool(extWValid)
     val extW2Known = Bool(extW2Valid)
+    val extW3Known = Bool(extW3Valid)
     val r = ChunkPredecode()
     r.simple   := False
     r.lenWords := U(0, 4 bits)
@@ -157,16 +168,17 @@ object PredecodeWord {
             // mem-dest RMW (ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea>): opword + imm words +
             // the EA extension (imm precedes the EA ext). In-scope MEMSIMPLE dest only. For
             // a full-format dst, the EA's first ext word = op+2 when the imm is 1 word
-            // (.B/.W -> extW2); a .L imm pushes it to op+3 (not visible -> brief framing).
-            val immDstEaW = Mux(ss === U(2, 2 bits), B(0, 16 bits), extW2)
-            // .L imm: immDstEaW is ALWAYS forced 0 above regardless of extW2's real content
-            // (op+3 is structurally out of this function's 2-word lookahead) — that's a
-            // pre-existing, separately-documented/mitigated hole (MicroOpAssembler's
-            // `limmFullFmtDstBad` illegal-gate), NOT a line-boundary artifact, so it keeps
-            // its existing "assume brief" framing unchanged (eaWKnown=True) here. .B/.W imm:
-            // immDstEaW genuinely IS extW2 -> gate on whether extW2 was actually available
-            // (F5).
-            val immDstEaKnown = (ss === U(2, 2 bits)) || extW2Known
+            // (.B/.W -> extW2); a .L imm pushes it to op+3 -> extW3 (task #153: a 3rd
+            // lookahead word, threaded through from IcachePlugin's already-resident cache
+            // line — see `classify`'s extW3 doc comment). When extW3 genuinely isn't
+            // available (every pre-existing caller, or IcachePlugin at a cache-line
+            // boundary), this reproduces the ORIGINAL "assume brief" framing exactly
+            // (immDstEaW forced 0, immDstEaKnown forced True) rather than F5's "reject
+            // unknown" doctrine — changing that fallback would flip the RTL-vs-reference
+            // equivalence for the 1-arg `classify(op)` overload (PredecodeWordSpec's
+            // exhaustive 65536-opword test), which never supplies ext words at all.
+            val immDstEaW = Mux(ss === U(2, 2 bits), Mux(extW3Known, extW3, B(0, 16 bits)), extW2)
+            val immDstEaKnown = Mux(ss === U(2, 2 bits), True, extW2Known)
             val (mok, mext) = memDestExt(mode, reg, immDstEaW, immDstEaKnown)
             when(mok) {
               r.simple := True; r.lenWords := (U(1, 3 bits) + immWords + mext).resized

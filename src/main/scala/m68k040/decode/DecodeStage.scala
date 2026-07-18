@@ -176,9 +176,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       (s1mi_isAlu && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s1mi_isAluDst && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s1mi_isAddqSubq && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
-      // .L-imm full-format dst (s1mi_immL): NOT routed to the engine — predecode mis-frames
-      // it (ext at op+3), so it falls to the normal slot1 crack where it is gated ILLEGAL.
-      (s1mi_isImm && !s1mi_immL && (s1mi_immEa.klass === EaClass.MEMINDIRECT)) ||
+      // task #153: the .L-imm case (s1mi_immL) is now routed too (predecode correctly
+      // frames it via extW3) -- see the s0IsLineImm mirror below for the full explanation.
+      (s1mi_isImm && (s1mi_immEa.klass === EaClass.MEMINDIRECT)) ||
       (s1mi_isSingle && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)))
     slot1IsMemIndEarly.simPublic()  // debug-only (task #144)
     // slot1 DYNAMIC read-only bit-field (slice 3c) — mirror slot1IsMemIndEarly: its real µops
@@ -366,12 +366,20 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val s0ImmEaVec   = Mux(s0ImmIsL, Vec(s0opw, s0pkt.words(3), s0pkt.words(4), s0pkt.words(5)),
                                      Vec(s0opw, s0pkt.words(2), s0pkt.words(3), s0pkt.words(4)))
     val s0ImmEa      = EaDecoder.decode(s0opw(5 downto 0), spec0.size, s0ImmEaVec)
-    // SILENT-CORRUPTION HOLE: a .L-immediate op with a FULL-FORMAT dst EA (mem-indirect
-    // here) places the EA's first ext word at op+3, beyond the per-word predecode window
-    // (op+1/op+2 only), so it frames BRIEF (too short) -> the FOLLOWING instr mis-fetches.
-    // Such an op is NOT routed to the engine; it falls through to the normal head where
-    // MicroOpAssembler gates it ILLEGAL (limmFullFmtDstBad, vector 4). The .B/.W imm-dst
-    // mem-indirect forms (ext at op+2, visible to predecode) stay routed to the engine.
+    // FORMERLY a SILENT-CORRUPTION HOLE (task #153 fix): a .L-immediate op with a
+    // FULL-FORMAT dst EA (mem-indirect here) places the EA's first ext word at op+3, one
+    // word beyond the ORIGINAL 2-word predecode lookahead (op+1/op+2 only) -- it used to
+    // frame BRIEF (too short), mis-fetching the FOLLOWING instruction, and was never routed
+    // to the engine (fell through to the normal head, gated ILLEGAL by
+    // MicroOpAssembler's `limmFullFmtDstBad`, vector 4). PredecodeWord.classify/
+    // IcachePlugin now thread a 3rd lookahead word (extW3, op+3) so this frames correctly
+    // (see PredecodeWord.scala's extW3 doc comment) and routes here exactly like the
+    // .B/.W imm-dst mem-indirect forms below. `s0LimmFullDstBad` now only fires for the
+    // residual, much narrower edge case where extW3 itself is unavailable (this exact
+    // opword landing at the very end of a fetched cache line) — predecode's F5-precedent
+    // fallback there still frames BRIEF, so this op still correctly stays ungated/illegal
+    // rather than silently mis-executing. (Declared for documentation/future diagnostic
+    // use; not currently read elsewhere.)
     val s0LimmFullDstBad = s0IsLineImm && s0ImmIsL && (s0ImmEa.klass === EaClass.MEMINDIRECT)
     // ported-tests triage (move_l_abs_memind_dst): the OFFLOADED s0dstEa (Offload /
     // computeOffload in MicroOpAssembler.scala) reads the MOVE dst's own ext word at a
@@ -427,7 +435,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       (s0IsAluSrcLine && s0AluSrcMode && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s0IsAluSrcLine && s0AluDstMode && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s0IsAddqSubq && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s0IsLineImm && !s0ImmIsL && (s0ImmEa.klass === EaClass.MEMINDIRECT)) ||
+      // task #153: the .L-imm case (s0ImmIsL) is NOW routed too -- predecode correctly
+      // frames it (extW3), so s0ImmEa's klass is trustworthy for it exactly like .B/.W.
+      (s0IsLineImm && (s0ImmEa.klass === EaClass.MEMINDIRECT)) ||
       (s0IsSingleEa && (s0srcEa.klass === EaClass.MEMINDIRECT)))
     // ── Bit-field DYNAMIC read-only MEMORY detection (slice 3c) ──────────────────
     // BFTST/BFEXTU/BFEXTS/BFFFO at a memory EA with Do(ext[11])||Dw(ext[5]) set route through

@@ -361,13 +361,24 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // (COMPLEX) — a safe trap instead of a silent mis-frame. `i` is a plain Scala Int
         // here (this whole predecode is elaborated once per line-word, 32 instances), so
         // "is word i+1/i+2 past the line end" is a compile-time constant, not new hardware.
+        // task #153 (ported-tests memind cluster): also pass a 3rd lookahead word (op+3) —
+        // needed ONLY to correctly frame a line-0 .L-immediate op with a full-format
+        // mem-indirect destination (the 2-word .L immediate pushes the EA's first ext word
+        // from op+2 to op+3, one word beyond the original 2-word lookahead). `words` is the
+        // WHOLE cache line, already resident in `lineReg` this same cycle (see the F5 comment
+        // above) — words(i+3) costs nothing new in hardware, just a wider static mux inside
+        // `classify` itself. Same F5 boundary discipline: unavailable (line-end) -> `classify`
+        // falls back to its pre-existing "assume brief" framing for this specific shape (NOT
+        // the F5 reject-as-COMPLEX doctrine — see `classify`'s extW3 comment for why).
         val nWords = words.length
         val chunks = Vec((0 until nWords).map(i =>
           PredecodeWord.classify(words(i),
             if (i + 1 < nWords) words(i + 1) else B(0, 16 bits),
             if (i + 2 < nWords) words(i + 2) else B(0, 16 bits),
+            if (i + 3 < nWords) words(i + 3) else B(0, 16 bits),
             extWValid  = i + 1 < nWords,
-            extW2Valid = i + 2 < nWords)))
+            extW2Valid = i + 2 < nWords,
+            extW3Valid = i + 3 < nWords)))
         val packed = chunks.asBits
         for (w <- 0 until ways) {
           when(victimWay === U(w, wayBits bits)) {
