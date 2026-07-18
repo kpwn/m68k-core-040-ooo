@@ -429,14 +429,32 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
       Size.WORD -> (s1Src1(31 downto 16) ## srcForMove(15 downto 0)),
       Size.LONG -> srcForMove)
     val isFromCcrSr = u1.fromCcr || u1.fromSr
+    // ── ANDI/ORI/EORI #imm,SR (word form): PRIVILEGED commit-time SR read-modify- ──
+    // write. Shares SysKind.MOVE_TO_SR's ExceptionUnit S_APPLY case (write srSys from
+    // result[15:8] + surface result[4:0] as the new CCR) with the TRUE MOVE.W <ea>,SR
+    // (a plain direct write, op=MOVE) — distinguished here by op being AND/OR/EOR
+    // instead: combine the OLD SR (read from the committed srSysIn/CCR via the SAME
+    // fromSrRes fold MOVE-from-SR uses, NOT a register — this µop's srcA/srcB carry
+    // no real operand) with the immediate (s1Src2, threaded via the generic IMMEXT
+    // srcB slot in MicroOpAssembler). result -> wbObs.result -> ROB sysValStore ->
+    // the SAME S_APPLY MOVE_TO_SR write-through (see RobPlugin/ExceptionUnit).
+    val isLogicSr  = u1.sysOp && (u1.sysKind === m68k040.decode.SysKind.MOVE_TO_SR) && (u1.op =/= DecOp.MOVE)
+    val srOldVal   = fromSrRes(15 downto 0).asUInt
+    val srImmVal   = s1Src2(15 downto 0).asUInt
+    val srLogicRes = u1.op.mux(
+      DecOp.AND -> (srOldVal & srImmVal),
+      DecOp.OR  -> (srOldVal | srImmVal),
+      default   -> (srOldVal ^ srImmVal))              // EOR (the only other reachable op)
+    val srLogicResult = (B(0, 16 bits) ## srLogicRes.asBits)
     // CASOP writes the FULL computed value (the .B/.W partial-register merge is folded
     // INSIDE the CASOP datapath, since the merge depends on the match predicate) -> bypass
     // the generic size-merge (like MOVEA / fromCcr-Sr).
     // anWide (ADDA/SUBA): the full-32 datapath result, NO merge (the WORD size field
     // would otherwise merge the old An's upper 16 over the carry-propagated result).
-    val mergedResult = Mux(casIsOp, casResult,
+    val mergedResult = Mux(isLogicSr, srLogicResult,
+                       Mux(casIsOp, casResult,
                        Mux(anWide, opResult,
-                       Mux(u1.isMovea, moveaResult, Mux(isFromCcrSr, sizeMergedMove, sizeMerged))))
+                       Mux(u1.isMovea, moveaResult, Mux(isFromCcrSr, sizeMergedMove, sizeMerged)))))
 
     // ---- S1: ANDI/ORI/EORI #imm,CCR (toCcr) — CCR read-modify-write (FAST path) ----
     // Assemble the current 5-bit CCR {X,N,Z,V,C} from the flag PRFs, apply the logical

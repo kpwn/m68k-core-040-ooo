@@ -141,12 +141,19 @@ object PredecodeWord {
     }
 
     switch(cls) {
-      // Line-0 immediates: ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea> + the to-CCR forms.
-      // 0000 ooo0 ss mmmrrr + imm. opmode ooo (11:9) in {0=ORI,1=ANDI,2=SUBI,3=ADDI,
-      // 5=EORI,6=CMPI}; bit8=0; size ss (7:6) in {00=.B,01=.W,10=.L}; imm words = 1
-      // for .B/.W, 2 for .L (the imm precedes any EA ext). Data-reg dest (mode0) =>
-      // 1+immWords; to-CCR (...00 111100, byte, ANDI/ORI/EORI only) => 1+1. SR / mem
-      // destinations are deferred (privileged / RMW) => COMPLEX. (Mirrors PredecodeRef.)
+      // Line-0 immediates: ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea> + the to-CCR/to-SR
+      // forms. 0000 ooo0 ss mmmrrr + imm. opmode ooo (11:9) in {0=ORI,1=ANDI,2=SUBI,
+      // 3=ADDI,5=EORI,6=CMPI}; bit8=0; size ss (7:6) in {00=.B,01=.W,10=.L}; imm words
+      // = 1 for .B/.W, 2 for .L (the imm precedes any EA ext). Data-reg dest (mode0)
+      // => 1+immWords; to-CCR/to-SR (...00/01 111100, ANDI/ORI/EORI only) => 1+1 (a
+      // SINGLE 16-bit ext word regardless of ss=00(CCR)/01(SR) -- the low byte is all
+      // that's meaningful for CCR, but the encoding always carries a full word). Was:
+      // "SR dest (mode7/reg4 .W) ... -> COMPLEX (deferred)" -- found via the cluster-6
+      // exception/priv triage to be a genuine predecode-framing gap stacked on top of
+      // a separate MicroOpAssembler illegal-classification gap (same 2-bug shape as
+      // task #152/#158-160: a decode-side fix alone does not resolve the hang/fault
+      // unless predecode ALSO learns the instruction's length). Mem destinations stay
+      // deferred (RMW) => COMPLEX. (Mirrors PredecodeRef.)
       is(U(0, 4 bits)) {
         val opmode = op(11 downto 9).asUInt
         val bit8   = op(8)
@@ -157,11 +164,11 @@ object PredecodeWord {
                                 opmode === 3 || opmode === 5 || opmode === 6)
         val sizeOk   = ss =/= 3
         val immWords = Mux(ss === 2, U(2, 3 bits), U(1, 3 bits))   // .L=2, .B/.W=1
-        val isToCcr  = (mode === 7) && (reg === 4) && (ss === 0)
+        val isToCcrSr = (mode === 7) && (reg === 4) && (ss === 0 || ss === 1)
         val ccrOk    = opmode === 0 || opmode === 1 || opmode === 5   // ANDI/ORI/EORI only
         when(isImmOp && sizeOk) {
-          when(isToCcr) {
-            when(ccrOk) { r.simple := True; r.lenWords := U(2, 4 bits) }   // opword + imm byte word
+          when(isToCcrSr) {
+            when(ccrOk) { r.simple := True; r.lenWords := U(2, 4 bits) }   // opword + imm word (CCR byte or SR word)
           } elsewhen(mode === 0) {
             r.simple := True; r.lenWords := (U(1, 3 bits) + immWords).resized   // data-reg dest
           } otherwise {

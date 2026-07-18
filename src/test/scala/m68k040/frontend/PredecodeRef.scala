@@ -49,9 +49,14 @@ object PredecodeRef {
       // bit-ops-dynamic / MOVEP). size ss (bits 7:6): 00=.B,01=.W,10=.L; 11 illegal.
       // imm words: .B/.W = 1, .L = 2 (the imm precedes any EA extension).
       //   - reg dest (mode 0 = Dn): 1 + immWords. (An-direct mode1 is illegal for these.)
-      //   - to-CCR (...00 111100, size byte, mode7/reg4): 1 + 1 (the imm byte word).
-      // SR forms (...01 111100, word) are privileged -> COMPLEX (out of scope). Memory
-      // destinations are the deferred RMW slice -> COMPLEX. Everything else COMPLEX.
+      //   - to-CCR/to-SR (...00/01 111100, mode7/reg4): 1 + 1 (a single 16-bit ext
+      //     word regardless of ss=00(CCR, byte)/01(SR, word) — the encoding always
+      //     carries one full word; only the low byte is meaningful for CCR). Was
+      //     previously "SR forms -> COMPLEX (out of scope, privileged)" — the RTL
+      //     now implements ANDI/ORI/EORI #imm,SR as a privileged commit-time sysOp
+      //     (cluster-6 exception/priv triage), so the reference model's framing must
+      //     match. Memory destinations are the deferred RMW slice -> COMPLEX.
+      // Everything else COMPLEX.
       case 0x0 =>
         val opmode = (op >> 9) & 7
         val bit8   = (op >> 8) & 1
@@ -61,8 +66,8 @@ object PredecodeRef {
         val isImmOp = bit8 == 0 && (opmode == 0 || opmode == 1 || opmode == 2 ||
                                     opmode == 3 || opmode == 5 || opmode == 6)
         val immWords = ss match { case 0 | 1 => 1; case 2 => 2; case _ => -1 }  // -1 = illegal size
-        val isToCcr = mode == 7 && reg == 4 && ss == 0           // ANDI/ORI/EORI #imm,CCR (byte)
-        val ccrOk   = opmode == 0 || opmode == 1 || opmode == 5  // ANDI/ORI/EORI only (to CCR)
+        val isToCcr = mode == 7 && reg == 4 && (ss == 0 || ss == 1)  // ANDI/ORI/EORI #imm,CCR/SR
+        val ccrOk   = opmode == 0 || opmode == 1 || opmode == 5  // ANDI/ORI/EORI only (to CCR/SR)
         // Bit ops: dynamic 0000 rrr 1 tt mmmrrr (bit8=1, NOT mode 001=MOVEP); static
         // 0000 1000 tt mmmrrr (bits 11:8 == 1000) + bit-number word. Dn dest -> 1
         // (dynamic) / 2 (static); memory -> +EA ext. An/#imm/MEMCOMPLEX -> COMPLEX.

@@ -966,6 +966,25 @@ object MicroOpAssembler {
     val isLineImm  = spec.srcB.kind === OperandKind.IMMEXT
     val isToCcr    = isLineImm && (op(5 downto 0) === B"6'b111100") && (spec.size === Size.BYTE) &&
                      (spec.op === DecOp.AND || spec.op === DecOp.OR || spec.op === DecOp.EOR)
+    // ── ANDI/ORI/EORI #imm,SR (the PRIVILEGED to-SR forms) ───────────────────────
+    // Same encoding shape as the non-privileged to-CCR form above (line0, opmode in
+    // {0=ORI,1=ANDI,5=EORI}, EA=mode7/reg4 = op[5:0]==0x3C) disambiguated purely by
+    // SIZE: CCR is the .B (ss=00) form, SR is the .W (ss=01) form -- OperationDecoder
+    // makes no distinction (both ride the generic line-0-immediate AND/OR/EOR path
+    // with EA=easrc/srcB=immext). Was previously left on the generic illegal path
+    // (task risk: ANDI/ORI/EORI #imm,SR traps vector 4 instead of being a privileged
+    // sysOp -- found via the cluster-6 exception/priv triage: EVERY test that used
+    // `andi.w #0xDFFF,%sr` to drop to user mode faulted vector 4 on THAT instruction
+    // itself, before even reaching the instruction under test). Reuses
+    // SysKind.MOVE_TO_SR's ExceptionUnit S_APPLY case (writes srSys from result[15:8]
+    // + surfaces result[4:0] as the new CCR) -- see AluEuPlugin's `isLogicSr`, which
+    // recognizes sysKind===MOVE_TO_SR with op=/=MOVE as a "combine-with-old-SR" write
+    // (old SR read from the committed srSysIn/CCR, not a register) instead of
+    // MOVE_TO_SR's own plain direct write. srcA/srcB below don't carry the real
+    // operand VALUE for this case -- only imm/useImm matter (already correctly
+    // threaded by the generic IMMEXT srcB slot).
+    val isToSr     = isLineImm && (op(5 downto 0) === B"6'b111100") && (spec.size === Size.WORD) &&
+                     (spec.op === DecOp.AND || spec.op === DecOp.OR || spec.op === DecOp.EOR)
     // EOR (line B, register dest): the EA (op[5:0]) is the DESTINATION, read AND
     // written. This slice supports a DATA-REGISTER destination only; a memory EA is
     // the deferred RMW (load-op-store) form -> illegal. `eorMemBad` forces the illegal
@@ -974,7 +993,7 @@ object MicroOpAssembler {
     // A MEMSIMPLE EA is now a valid RMW destination (load-op-store crack); only An /
     // #imm / MEMCOMPLEX stay illegal -> reject "not DATAREG and not MEMSIMPLE".
     val eorMemBad = (spec.op === DecOp.EOR) && (srcEa.klass =/= EaClass.DATAREG) &&
-                    (srcEa.klass =/= EaClass.MEMSIMPLE) && !isToCcr
+                    (srcEa.klass =/= EaClass.MEMSIMPLE) && !isToCcr && !isToSr
     // ALU Dn,<ea> RMW (line 8/9/C/D opmode 4/5/6): the EA MUST be a memory-alterable mode
     // (MEMSIMPLE in scope). EA=Dn/An (the encoding overlaps no valid op) or MEMCOMPLEX ->
     // illegal. OperationDecoder named these (op != illegal); gate the bad EAs here.
@@ -1009,7 +1028,7 @@ object MicroOpAssembler {
     // OR a MEMSIMPLE EA (the RMW crack); An / #imm / MEMCOMPLEX stay illegal. The to-CCR
     // form is the one exception.
     val lineImmBad = isLineImm && !isBitOp && (srcEa.klass =/= EaClass.DATAREG) &&
-                     (srcEa.klass =/= EaClass.MEMSIMPLE) && !isToCcr
+                     (srcEa.klass =/= EaClass.MEMSIMPLE) && !isToCcr && !isToSr
     // ── .L-immediate + FULL-FORMAT dst EA: gated ILLEGAL (silent-corruption hole) ──
     // A line-0 immediate op with size .L AND a FULL-FORMAT indexed dst EA (mode 6 or
     // 7-3, ext bit8=1) places the EA's first extension word at op+3 (after the 2-word
@@ -1237,6 +1256,25 @@ object MicroOpAssembler {
       opUop.dstValid  := False
       opUop.readsNzvc := True;  opUop.readsX  := True
       opUop.writesNzvc := True; opUop.writesX := True
+      opUop.unimplemented := False
+    }
+    // ── ANDI/ORI/EORI #imm,SR (PRIVILEGED): a commit-time system op ──────────────
+    // (mirrors the true MOVE.W <ea>,SR sysOp wiring in the isSysOp block below, but
+    // op stays AND/OR/EOR instead of being forced to MOVE, and there is no register/
+    // memory EA source -- only the immediate). needsSupervisor is NOT used here (that
+    // gate is for Track C ops); privilege is enforced the SAME way as every other
+    // sysOp: RobPlugin's sysPrivFault (sysRetire && !committed-S), keyed off
+    // opUop.sysOp/sysKind, independent of how op/toCcr/etc are set.
+    when(isToSr) {
+      opUop.cluster    := Cluster.INT
+      opUop.sysOp      := True
+      opUop.sysKind    := SysKind.MOVE_TO_SR
+      opUop.sysReadDir := False
+      opUop.firstOfInstr := True
+      opUop.srcAValid  := False
+      opUop.dstValid   := False
+      opUop.readsNzvc  := False; opUop.readsX  := False
+      opUop.writesNzvc := False; opUop.writesX := False
       opUop.unimplemented := False
     }
     // ── MOVE to CCR (0x44C0 | ea): CCR {X,N,Z,V,C} := src[4:0] (DIRECT, no fold). ──

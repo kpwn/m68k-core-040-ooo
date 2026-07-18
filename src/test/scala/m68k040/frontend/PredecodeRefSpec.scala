@@ -107,11 +107,15 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x0A40) == cp(true,2))   // EORI.W #imm,D0
     assert(classify(0x0C80) == cp(true,3))   // CMPI.L #imm,D0
   }
-  test("line-0 ANDI/ORI/EORI #imm,CCR (...00 111100 byte) -> simple len2; SR/CMPI-to-ccr complex") {
+  test("line-0 ANDI/ORI/EORI #imm,CCR/SR (...00/01 111100) -> simple len2; CMPI-to-ccr complex") {
     assert(classify(0x023C) == cp(true,2))   // ANDI #imm,CCR
     assert(classify(0x003C) == cp(true,2))   // ORI  #imm,CCR
     assert(classify(0x0A3C) == cp(true,2))   // EORI #imm,CCR
-    assert(classify(0x027C) == cp(false,0))  // ANDI #imm,SR (word, privileged) -> deferred
+    // ANDI/ORI/EORI #imm,SR (word, privileged): now a commit-time sysOp (cluster-6
+    // exception/priv triage) -- same 1-imm-word framing as the CCR (byte) form.
+    assert(classify(0x027C) == cp(true,2))   // ANDI #imm,SR
+    assert(classify(0x007C) == cp(true,2))   // ORI  #imm,SR
+    assert(classify(0x0A7C) == cp(true,2))   // EORI #imm,SR
     assert(classify(0x0C3C) == cp(false,0))  // CMPI #imm,<#imm> (no CMPI-to-CCR) -> illegal
   }
   test("line-0 memory-dest immediate (RMW) + illegal size + out-of-scope") {
