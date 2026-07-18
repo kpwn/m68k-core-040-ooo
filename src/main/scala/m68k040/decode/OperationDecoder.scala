@@ -387,9 +387,29 @@ object OperationDecoder {
         // when active). The EA mode field DISAMBIGUATES from EXT.W (0x4880, mode 000) /
         // EXT.L (0x48C0, mode 000), which share bit11=1 & bits9:7=001 but use Dn-direct
         // (mode 0): a real MOVEM EA is a MEMORY mode (>=2), so EXCLUDE reg-direct modes 0/1.
-        // (Indexed mode 6 / 7-3 stay framed COMPLEX by predecode -> never enter the FSM.)
+        // Indexed (mode 6) / (d8,PC,Xn) (mode 7 reg 3) / #imm+reserved (mode 7 reg>=4) are
+        // OUT OF SCOPE (the FSM has no index-register read port — see the cluster-2
+        // PC-indexed-MOVEM triage). task #165 (ported-tests triage): this classifier used
+        // to read `mmMode4 >= 2` UNCONDITIONALLY, on the (FALSE) assumption that
+        // PredecodeWord.scala's `isMovem` COMPLEX framing alone would keep an indexed
+        // MOVEM out of the DecodeStage FSM — but `slot0IsMovem` (DecodeStage.scala) gates
+        // PURELY on this decoder's `spec0.movem`, independent of predecode's simple/complex
+        // marking. An indexed MOVEM opword therefore silently entered the FSM anyway, with
+        // its unhandled EA mode falling through DecodeStage's mode-switch default (base
+        // invalid, disp=0) — executing as a garbage-address MOVEM to/from address 0 instead
+        // of cleanly faulting. Worse: since nothing in this codebase ever drives
+        // FetchAlignPlugin's `resume` port (only a real redirect/exception clears its
+        // `stalled` latch, set the instant predecode's OWN complex/COMPLEX framing was
+        // emitted), the frontend never resumed fetching once the FSM silently "completed" —
+        // a PERMANENT stall (observed as a HANG, not a FAIL/illegal-trap). Restricting this
+        // classifier's EA-mode gate to exactly the FSM-supported shapes (mirroring
+        // PredecodeWord's own `mmOk` table) leaves indexed MOVEM `illegal=True` (the
+        // OpSpec.illegalDefault()), so it now takes the ordinary vector-4 path instead.
         val mmMode4 = opword(5 downto 3)
-        when(opword(11) && (opword(9 downto 7) === B"001") && (mmMode4.asUInt >= 2)) {
+        val mmReg4  = opword(2 downto 0)
+        val movemEaOk = (mmMode4.asUInt >= 2 && mmMode4.asUInt <= 5) ||
+                        (mmMode4 === B"3'b111" && mmReg4.asUInt <= 2)
+        when(opword(11) && (opword(9 downto 7) === B"001") && movemEaOk) {
           o.illegal := False
           o.op := DecOp.MOVE                     // benign placeholder; the FSM produces the real µops
           o.movem := True
