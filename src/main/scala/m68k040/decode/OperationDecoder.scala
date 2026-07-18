@@ -910,13 +910,29 @@ object OperationDecoder {
           o.sysReadDir := False
           o.dst.setNone(); o.dstWrites := False
         }
-        // ── PFLUSHA (0xF518 exactly, verified via GNU-as's own `pflusha` disassembly):
-        // privileged "flush ALL ATC/TLB entries, both address spaces". A REAL effect
-        // (unlike CPUSH/RESET) — a COMMIT-TIME SYSTEM op that pulses a flushAll signal
-        // consumed by DtlbPlugin/ItlbPlugin (see ExceptionUnit's S_APPLY + the top-level
-        // wiring). S=0 -> vector-8. Selective PFLUSH (FC/mask/EA-qualified) and
-        // PFLUSHAN/PFLUSHN stay illegal/deferred — only this exact opword is in scope.
-        when(opword === B"16'hF518") {
+        // ── PFLUSH family (0xF500-0xF51F, mode field op[5:3] in {0,1,2,3}): privileged
+        // "flush ATC/TLB entries" — task #166 (ported-tests triage, cluster 9). Real
+        // 68040 encoding `1111 0101 00 mmm rrr` (op[7:6]=00 fixed): mode(op[5:3])
+        // 000=PFLUSHN(An) [flush non-global entries matching An], 001=PFLUSH(An)
+        // [flush ALL entries matching An], 010=PFLUSHAN [flush all entries, FC
+        // don't-care], 011=PFLUSHA (reg field ignored/0) [flush ALL ATC entries, both
+        // address spaces]. This core's MMU has no real per-VA/per-FC selective ATC
+        // tracking (DtlbPlugin/ItlbPlugin's Tlb only exposes a blanket
+        // `invalidateAll`) — a "stub" MMU per the ported test's own header comment
+        // ("stub MMU drops the ATC tag... no global tracking in stub"), so EVERY mode
+        // in this family is treated identically: a COMMIT-TIME SYSTEM op that pulses
+        // the SAME flushAll signal PFLUSHA already drives (over-invalidating relative
+        // to the selective PRM semantics is always functionally SAFE, just less
+        // precise — no test in this corpus checks selectivity). S=0 -> vector-8.
+        // Previously only the single exact PFLUSHA opword (0xF518) was admitted;
+        // PFLUSH(An)/PFLUSHN(An)/PFLUSHAN fell to the illegal default (vector 4, no
+        // handler in the bare-metal ported-test harness -> permanent wild-PC HANG).
+        // The register field (op[2:0]) is read as An by predecode/EaDecoder's normal
+        // srcA framing is NOT needed here (no real per-VA effect) — left unread, same
+        // as the pre-existing PFLUSHA treatment.
+        val isPflushFamily = (opword(15 downto 6) === B"10'b1111010100") &&
+                             (opword(5 downto 3).asUInt <= 3)
+        when(isPflushFamily) {
           o.illegal := False
           o.op := DecOp.MOVE
           o.size := Size.LONG
