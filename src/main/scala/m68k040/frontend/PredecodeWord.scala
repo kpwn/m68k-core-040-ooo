@@ -898,6 +898,23 @@ object PredecodeWord {
             r.lenWords := (U(2, 3 bits) + e).resized   // opword + bf-ext + EA ext
           }
         }
+        // Line-E MEMORY-form shift/rotate (1110 ttt d 11 mmm rrr, task #170-cluster10,
+        // ASL/ASR/LSL/LSR/ROXL/ROXR/ROL/ROR <ea>, word-only, implicit count=1): op[11]=0
+        // (distinguishes from the bit-field register/memory forms above, which both
+        // require op[11]=1), ss=11 (op[7:6]==3). Alterable memory EA only (modes 2-6,
+        // mode7 reg0/1) via the same memDestExt table CLR/NEG/NOT/TAS/Scc-mem already
+        // use (mode 0/Dn and mode 1/An naturally fall to ok=False -> COMPLEX/illegal,
+        // matching the real ISA -- this instruction has no register-direct form at
+        // this encoding, RO/RS's Dn opword lives entirely under ss!=3 above).
+        val shiftMemMode = op(5 downto 3).asUInt
+        val isShiftMem = !op(11) && (ss === U(3, 2 bits))
+        when(isShiftMem) {
+          val (mok, mext) = memDestExt(shiftMemMode, op(2 downto 0).asUInt, extW, extWKnown)
+          when(mok) {
+            r.simple   := True
+            r.lenWords := (U(1, 3 bits) + mext).resized
+          }
+        }
       }
 
       // Line-1010 ("Line-A") / Line-1111 ("Line-F") emulator traps: real 68040 hardware

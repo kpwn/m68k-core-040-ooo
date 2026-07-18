@@ -705,7 +705,13 @@ object MicroOpAssembler {
     // Fixed-field operands: srcA = dst = Dr (op[2:0], the shifted data reg). Count:
     //  i=0 (shiftImm) -> immediate ccc = op[11:9]; ccc==0 means 8 (useImm/imm).
     //  i=1            -> 2nd data-reg source Dc = op[11:9] (srcB).
-    when(spec.op === DecOp.SHIFT) {
+    // GATED to the REGISTER form only (spec.dst.kind =/= EASRC): the MEMORY form
+    // (task #170-cluster10, below) already has srcA=dst=easrc set by the decoder,
+    // so the generic EASRC switch above has ALREADY routed srcAReg/dstReg to
+    // T0/T1 (crackRmw's load/store temps) -- this fixed-field Dr/ccc routing must
+    // not clobber that (op[2:0]/op[11:9] mean something totally different for the
+    // memory form: the EA's register field and the shift TYPE, not Dr/Dc).
+    when(spec.op === DecOp.SHIFT && (spec.dst.kind =/= OperandKind.EASRC)) {
       val dr = op(2 downto 0).asUInt.resize(5)
       val ccc = op(11 downto 9).asUInt
       opUop.srcAReg := dr; opUop.srcAValid := True       // Dr (shift input)
@@ -721,6 +727,17 @@ object MicroOpAssembler {
         opUop.srcBReg := ccc.resize(5); opUop.srcBValid := True
         opUop.useImm  := False
       }
+    }
+    // ── Line-E MEMORY-form shift/rotate operand routing (task #170-cluster10) ──
+    // srcA/dst are already generically routed to T0/T1 by the ordinary EASRC
+    // switch above (crackRmw's load produces T0; the compute op reads/writes it
+    // via T1, same as CLR/NEG/NOT/TAS-mem). Only the implicit count needs
+    // forcing here -- the real ISA's memory-form shift always shifts exactly 1
+    // bit; there is no register/immediate count operand at this encoding.
+    when(spec.op === DecOp.SHIFT && (spec.dst.kind === OperandKind.EASRC)) {
+      opUop.useImm    := True
+      opUop.imm       := U(1, 32 bits).asBits
+      opUop.srcBValid := False
     }
 
     // ── PACK/UNPK register form operand routing ─────────────────────────────────

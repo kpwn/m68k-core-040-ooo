@@ -589,6 +589,31 @@ object OperationDecoder {
           o.writesX := !isRo
           o.readsX  := !isRo                // AS/LS/ROX read X (count-0 preserve + ROX-through-X)
         }
+        // ── Line-E MEMORY-form shift/rotate (1110 ttt d 11 mmm rrr, task #170-
+        // cluster10): op[11]=0 (op[11]=1 at ss=11 is the bit-field register/memory
+        // forms, handled separately below), ss=11 (op[7:6]==3), mode != 000/001
+        // (Dn/An -- illegal, no register-direct form at this encoding; the Dn form
+        // lives entirely under ss!=3 above). Word-only, implicit count=1 (real ISA:
+        // memory shifts always shift exactly 1 bit, never a register/immediate
+        // count). EA is the operand read AND written back (RMW), same srcA=dst=easrc
+        // shape CLR/NEG/NOT/TAS/Scc-mem already use -- rides the existing generic
+        // `crackRmw` load->op->store path unmodified once MicroOpAssembler routes
+        // the memory form's operands (see `isShiftMem` there).
+        val isShiftMem = !opword(11) && (ss === 3) && (mode =/= 0) && (mode =/= 1)
+        when(isShiftMem) {
+          o.illegal := False
+          o.op := DecOp.SHIFT
+          o.cluster := Cluster.INT
+          o.size := Size.WORD
+          o.shiftOp  := opword(10 downto 9)   // same AS/LS/ROX/RO encoding as the reg form's tt
+          o.shiftDir := opword(8)
+          o.shiftImm := True                  // implicit count=1 (MicroOpAssembler forces imm=1)
+          o.srcA := easrc; o.dst := easrc; o.dstWrites := True
+          o.writesNzvc := True
+          val isRoMem = (opword(10 downto 9) === 3)
+          o.writesX := !isRoMem
+          o.readsX  := !isRoMem
+        }
         // ── Bit-field register form (BFxxx Dn{#off:#wd}) — slice 1 ──────────────
         // 1110 1ooo 11 000 rrr: ss=11 (op[7:6]==3), op[11]=1 (op[11:8]>=8), mode 000
         // (Dn). bfOp = op[10:8], real 020 encoding (0=BFTST,1=BFEXTU,2=BFCHG,3=BFEXTS,
