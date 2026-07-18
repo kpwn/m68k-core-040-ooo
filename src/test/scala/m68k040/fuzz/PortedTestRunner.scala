@@ -46,6 +46,24 @@ object PortedTestRunner {
       new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
       new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
 
+      // Also seed the D-SIDE view of the program image (ported-tests triage, cluster 2
+      // / PC-relative indexed): `FuzzDut.attachProgram` above writes the I-cache's own
+      // private SparseMemory with a per-16-bit-word BYTE-SWAPPED layout (its own
+      // established, Axi4ReadOnlySlaveAgent-specific convention -- NOT a plain
+      // byte-at-address mapping; do not "fix" it, every existing instruction-fetch test
+      // depends on it exactly as-is). The D-cache's `BehavioralMemAgent` (`dmem`) is a
+      // SEPARATE, independently-random-filled SparseMemory using the ordinary plain
+      // byte-at-address convention (the same one every passing store/load ported test
+      // already relies on). A PC-relative data read of a literal/table value embedded
+      // in the code region (e.g. `move.b (d8,PC,Xn),Dn` reading a ROM-style jump/data
+      // table right after the opcode) goes through the D-side pipeline, so it previously
+      // saw pure random fill instead of the real program bytes even though the AGU/
+      // decode/cache path all resolved the exact correct address. Write the SAME
+      // `image.bytes` into `dmem.mem` using dmem's OWN plain convention (no swap) so a
+      // D-side literal-pool read observes the identical bytes the I-cache fetched as
+      // code, matching how a real 68040's unified physical memory would behave.
+      for (i <- image.bytes.indices) dmem.mem.write(loadAddr + i, image.bytes(i).toByte)
+
       // The sentinel word must start at a KNOWN value, not SparseMemory's
       // random fill for never-written bytes (same reasoning as the sandbox
       // pre-fill in FuzzLockStepSpec.scala's task #143 fix) -- otherwise a
