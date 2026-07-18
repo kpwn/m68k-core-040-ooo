@@ -168,6 +168,10 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     rob.logic.completion(3).payload := divEu.completion.payload
     iq.cplxWakeup.valid   := divEu.wakeup.valid
     iq.cplxWakeup.payload := divEu.wakeup.payload
+    // Dynamic NZVC wakeup (task #167): a completing CPLX flag-writer (DIV/MUL/CHK/
+    // CMP2/CHK2) wakes a flag-reader of its NZVC. Mirrors lsNzvcWakeup below.
+    iq.cplxNzvcWakeup.valid   := divEu.wakeupNzvc.valid
+    iq.cplxNzvcWakeup.payload := divEu.wakeupNzvc.payload
     // DivEu euFault shares the generalized ROB euFaultCompletion with the branch EU's
     // TRAPV. They are mutually exclusive in practice (different EUs, single-outstanding),
     // but to be safe the branch EU's fault takes priority via last-driver: drive the

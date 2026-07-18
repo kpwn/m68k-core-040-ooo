@@ -80,6 +80,11 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     rob.logic.completion(3).payload := divEu.completion.payload
     iq.cplxWakeup.valid   := divEu.wakeup.valid
     iq.cplxWakeup.payload := divEu.wakeup.payload
+    // Dynamic NZVC wakeup (task #167): a completing CPLX flag-writer (DIV/MUL/CHK/
+    // CMP2/CHK2) wakes a flag-reader of its NZVC. Mirrors FullCoreSynth.scala's wiring
+    // (this class is a DELIBERATE DUPLICATION, per the class-doc comment above).
+    iq.cplxNzvcWakeup.valid   := divEu.wakeupNzvc.valid
+    iq.cplxNzvcWakeup.payload := divEu.wakeupNzvc.payload
     when(divEu.euFault.valid) {
       rob.logic.euFaultCompletion.valid   := True
       rob.logic.euFaultCompletion.payload := divEu.euFault.payload

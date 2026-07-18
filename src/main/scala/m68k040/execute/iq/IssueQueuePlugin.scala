@@ -30,6 +30,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
   var lsWakeupPort  : Flow[UInt]             = null
   var lsNzvcWakeupPort: Flow[UInt]           = null
   var cplxWakeupPort: Flow[UInt]             = null
+  var cplxNzvcWakeupPort: Flow[UInt]         = null
   var aluSlowWakeupPorts: Vec[Flow[AluSlowWakeup]] = null
 
   override def push: Stream[Vec[IqContext]]  = pushPort
@@ -39,6 +40,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
   override def lsWakeup: Flow[UInt]          = lsWakeupPort
   override def lsNzvcWakeup: Flow[UInt]      = lsNzvcWakeupPort
   override def cplxWakeup: Flow[UInt]        = cplxWakeupPort
+  override def cplxNzvcWakeup: Flow[UInt]    = cplxNzvcWakeupPort
   override def aluSlowWakeup: Vec[Flow[AluSlowWakeup]] = aluSlowWakeupPorts
 
   during setup {
@@ -51,6 +53,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     lsWakeupPort  = Flow(UInt(6 bits))   // carries a completed-load pdst
     lsNzvcWakeupPort = Flow(UInt(4 bits)) // carries a completed NZVC-writing-store pNzvcDst
     cplxWakeupPort= Flow(UInt(6 bits))   // carries a completed-DIV pdst
+    cplxNzvcWakeupPort = Flow(UInt(4 bits)) // carries a completed CPLX flag-writer's pNzvcDst (task #167)
     // ONE slow-shift wakeup per ALU EU (2): each carries a completed shift's int+NZVC+X.
     aluSlowWakeupPorts = Vec.fill(2)(Flow(AluSlowWakeup()))
   }
@@ -68,6 +71,9 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     cplxWakeupPort.valid.allowOverride;   cplxWakeupPort.valid   := False
     cplxWakeupPort.payload.allowOverride; cplxWakeupPort.payload := U(0, 6 bits)
     cplxWakeupPort.simPublic()
+    cplxNzvcWakeupPort.valid.allowOverride;   cplxNzvcWakeupPort.valid   := False
+    cplxNzvcWakeupPort.payload.allowOverride; cplxNzvcWakeupPort.payload := U(0, 4 bits)
+    cplxNzvcWakeupPort.simPublic()
     aluSlowWakeupPorts.foreach { p =>
       p.valid.allowOverride; p.valid := False
       p.payload.allowOverride
@@ -107,9 +113,18 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
         // store) waits here. SEPARATE bit from lsWait so a uop reading BOTH an LS int
         // source (T0) AND an LS NZVC source (a store) waits on each independently.
         val lsNzvcWait = Reg(Bool()) init False
+        // CPLX NZVC dynamic dependency (task #167): identical mechanism to lsNzvcWait,
+        // but on cplxNzvcBusy / cplxNzvcWakeup. A flag-reader of an in-flight CPLX
+        // (DivEu) flag-writer (DIV/MUL/CHK/CMP2/CHK2) waits here instead of the static
+        // sbNzvc scoreboard — CPLX ops are variable-latency (CMP2/CHK2 near-immediate,
+        // DIV/MUL many cycles), so a static latency-1 trigger is wrong for them (it was
+        // being force-cleared at ISSUE time, not real completion — see cplxNzvcWakeup's
+        // doc comment in IqContext.scala). SEPARATE bit from cplxWait (int dst): CHK2/
+        // CMP2/CHK write NZVC with no int dst at all.
+        val cplxNzvcWait = Reg(Bool()) init False
         // default: hold (overridden by compaction-shift and wakeup-clear below).
-        // triggers==0 (static lat1) AND no pending LS / CPLX / slow-ALU / LS-NZVC source -> ready.
-        val ready    = sel && (if (priority == 0) True else triggers(priority - 1 downto 0) === 0) && !lsWait && !cplxWait && !aluSlowWait && !lsNzvcWait
+        // triggers==0 (static lat1) AND no pending LS / CPLX / slow-ALU / LS-NZVC / CPLX-NZVC source -> ready.
+        val ready    = sel && (if (priority == 0) True else triggers(priority - 1 downto 0) === 0) && !lsWait && !cplxWait && !aluSlowWait && !lsNzvcWait && !cplxNzvcWait
 
         when(fire) { selComb := False }
         sel := selComb
@@ -119,7 +134,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // ---- debug-only observability (task #139 finding #1 investigation) ----
     // Zero synth impact (sim tap only, not referenced by any RTL logic).
     slots.foreach { s => s.sel.simPublic(); s.context.robId.simPublic(); s.context.uop.op.simPublic()
-      s.lsWait.simPublic(); s.cplxWait.simPublic(); s.triggers.simPublic()
+      s.lsWait.simPublic(); s.cplxWait.simPublic(); s.triggers.simPublic(); s.cplxNzvcWait.simPublic()
       s.context.uop.psrcA.simPublic(); s.context.uop.psrcAValid.simPublic()
       s.context.uop.psrcB.simPublic(); s.context.uop.psrcBValid.simPublic()
       s.context.uop.pXSrc.simPublic(); s.context.uop.readsX.simPublic()
@@ -176,6 +191,15 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // multi-cycle DIV. A consumer reading it is held NOT-ready until cplxWakeup(p).
     // Same dynamic-completion mechanism as lsBusy, separate bitmap + wakeup port.
     val cplxBusy = Reg(Bits(physIntN bits)) init 0
+    // cplxNzvcBusy[p] => NZVC physreg p is produced by an in-flight (not-yet-completed)
+    // CPLX (DivEu) op that writes flags (DIV/MUL/CHK/CMP2/CHK2). A flag-reader of p is
+    // held NOT-ready until cplxNzvcWakeup(p). Task #167: SEPARATE from cplxBusy (int dst)
+    // and from sbNzvc (static lat1) — a CPLX flag-writer must NOT use the static scoreboard
+    // (its busy bit is force-cleared at ISSUE time by the task #141 clear loop below, long
+    // before a multi-cycle DIV/MUL's real flag writeback lands, exposing a stale-flag read
+    // by any immediately-following Bcc/flag-consumer).
+    val cplxNzvcBusy = Reg(Bits(16 bits)) init 0
+    cplxNzvcBusy.simPublic()  // debug-only (task #167 IQ-NZVC trace)
     // SLOW-ALU (shift, latency-2) dynamic-completion scoreboards: one per reg class the
     // shift writes (int dst + NZVC + X). A consumer reading any of these is held NOT-
     // ready until the matching aluSlowWakeup. SEPARATE from the static sbInt/sbNzvc/sbX
@@ -194,6 +218,11 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // A CPLX *producer* with dynamic latency = a DIV that writes a physreg. CHK writes
     // nothing (no producer). Only such producers populate cplxBusy / drive cplxWakeup.
     def isCplxProducer(u: RenamedUop): Bool = isCplx(u) && u.pdstValid
+    // A CPLX op that writes flags = a dynamic (variable-latency) NZVC producer (task
+    // #166). Includes CHK/CMP2/CHK2 (no int dst at all) as well as DIV/MUL (which may
+    // ALSO be an isCplxProducer int-dst producer at the same time — the two bitmaps are
+    // independent, exactly like isLsNzvcProducer/isLs below).
+    def isCplxNzvcProducer(u: RenamedUop): Bool = isCplx(u) && u.writesNzvc
 
     // SLOW-ALU producer: a line-E SHIFT (DecOp.SHIFT) — the latency-2 EU path. (toCcr
     // stays latency-1.) Tracked in the aluSlow* bitmaps (dynamic lat2 wakeup), NOT the
@@ -538,6 +567,19 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       (s0IsCplxProd && srcBIsReg(pushUop1) && (pushUop1.psrcB === pushUop0.pdst)) ||
       (s0IsCplxProd && pushUop1.psrcCValid && (pushUop1.psrcC === pushUop0.pdst))
 
+    // Push-time CPLX-NZVC (DivEu flag-writer) dependency (task #167): same mechanism as
+    // lsNzvcDep but on cplxNzvcBusy / cplxNzvcWakeup. A flag-reader of an in-flight CPLX
+    // op (DIV/MUL/CHK/CMP2/CHK2) latches cplxNzvcWait instead of the static sbNzvc trigger.
+    def stillCplxNzvcBusy(p: UInt): Bool =
+      cplxNzvcBusy(p) && !(cplxNzvcWakeupPort.valid && cplxNzvcWakeupPort.payload === p)
+    def cplxNzvcDepInit(uop: RenamedUop): Bool = uop.readsNzvc && stillCplxNzvcBusy(uop.pNzvcSrc)
+    val cplxNzvcDep0 = cplxNzvcDepInit(pushUop0)
+    val cplxNzvcDep1Base = cplxNzvcDepInit(pushUop1)
+    // Intra-push: slot1 reads slot0's NZVC and slot0 is a CPLX flag-writer -> slot1 waits.
+    val s0IsCplxNzvc = isCplxNzvcProducer(pushUop0)
+    val cplxNzvcDep1 = cplxNzvcDep1Base ||
+      (s0IsCplxNzvc && pushUop1.readsNzvc && (pushUop1.pNzvcSrc === pushUop0.pNzvcDst))
+
     // Push-time SLOW-ALU (shift) dependency: same mechanism as LS/CPLX but across the
     // shift's THREE output classes (int / NZVC / X) and BOTH ALU-EU wakeup ports. A
     // consumer reading any in-flight shift output latches aluSlowWait. `still*` guards
@@ -581,8 +623,10 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val s0WritesInt  = pushUop0.pdstValid && !s0IsLsIntProd && !s0IsCplxProd && !s0IsAluSlowProd
     // Likewise suppress the static NZVC trigger for an LS NZVC producer (a MOVE-to-mem
     // store): it issues on the LS port (no static event) -> its NZVC dep is carried by
-    // lsNzvcDep1 [feat/bit-ops: the latent LS-NZVC deadlock fix].
-    val s0WritesNzvc = pushUop0.writesNzvc && !s0IsAluSlowProd && !s0IsLsNzvc
+    // lsNzvcDep1 [feat/bit-ops: the latent LS-NZVC deadlock fix]. Task #167: also suppress
+    // it for a CPLX flag-writer (DIV/MUL/CHK/CMP2/CHK2) -> carried by cplxNzvcDep1 instead
+    // (a static latency-1 trigger is wrong for a variable-latency CPLX producer).
+    val s0WritesNzvc = pushUop0.writesNzvc && !s0IsAluSlowProd && !s0IsLsNzvc && !s0IsCplxNzvc
     val s0WritesX    = pushUop0.writesX    && !s0IsAluSlowProd
     when(s0WritesInt  && pushUop1.psrcAValid && pushUop1.psrcA === pushUop0.pdst)              { trig1(slot0Prio) := True }
     when(s0WritesInt  && srcBIsReg(pushUop1) && pushUop1.psrcB === pushUop0.pdst) { trig1(slot0Prio) := True }
@@ -603,6 +647,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
           wDst.cplxWait := wSrc.cplxWait   // CPLX (DIV) dependency shifts with the slot
           wDst.aluSlowWait := wSrc.aluSlowWait // slow-ALU (shift) dependency shifts too
           wDst.lsNzvcWait  := wSrc.lsNzvcWait  // LS-NZVC dependency shifts with the slot
+          wDst.cplxNzvcWait := wSrc.cplxNzvcWait // CPLX-NZVC dependency shifts too (task #167)
         }
       }
       // New uops into the last line.
@@ -617,6 +662,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       wDst0.cplxWait := cplxDep0
       wDst0.aluSlowWait := aluSlowDep0
       wDst0.lsNzvcWait  := lsNzvcDep0
+      wDst0.cplxNzvcWait := cplxNzvcDep0
       wDst1.context  := wSrc1
       wDst1.triggers := trig1
       wDst1.sel      := pushSlot1Port
@@ -624,6 +670,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       wDst1.cplxWait := cplxDep1
       wDst1.aluSlowWait := aluSlowDep1
       wDst1.lsNzvcWait  := lsNzvcDep1
+      wDst1.cplxNzvcWait := cplxNzvcDep1
     }
 
     // ---- Apply wakeup events (clears trigger bits). MUST come after the
@@ -695,6 +742,20 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       }
     }
 
+    // ---- CPLX-NZVC dynamic wakeup (task #167): clear cplxNzvcWait for slots reading
+    // the woken NZVC physreg (identical shift discipline to lsNzvcWakeMatch, on the
+    // pNzvcSrc). ----
+    val cplxNzvcWakeMatch = Vec(slots.map { s =>
+      val u = s.context.uop
+      cplxNzvcWakeupPort.valid && s.sel && u.readsNzvc && (u.pNzvcSrc === cplxNzvcWakeupPort.payload)
+    })
+    for (i <- 0 until slotCount) {
+      when(cplxNzvcWakeMatch(i)) {
+        when(pushPort.fire) { if (i >= wayCount) slots(i - wayCount).cplxNzvcWait := False }
+          .otherwise        { slots(i).cplxNzvcWait := False }
+      }
+    }
+
     // ---- SLOW-ALU (shift) dynamic wakeup: clear aluSlowWait for slots reading ANY of
     // the woken int/NZVC/X dsts, on EITHER ALU-EU wakeup port (same shift discipline as
     // cplxWakeMatch). ----
@@ -753,6 +814,12 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val push0IsLsNzvc = isLsNzvcProducer(pushUop0)
     val push1IsLsNzvc = isLsNzvcProducer(pushUop1)
     push0IsLsNzvc.simPublic(); push1IsLsNzvc.simPublic()  // debug-only (task #139 seed=3 CCR investigation)
+    // A CPLX flag-writer (DIV/MUL/CHK/CMP2/CHK2) goes in cplxNzvcBusy (dynamic wakeup),
+    // NOT sbNzvc (static lat1) — task #167: it is variable-latency (a multi-cycle DIV/MUL
+    // or a near-immediate CHK2), and the static scoreboard's busy bit is force-cleared at
+    // ISSUE time (task #141's clear loop below), not real completion.
+    val push0IsCplxNzvc = isCplxNzvcProducer(pushUop0)
+    val push1IsCplxNzvc = isCplxNzvcProducer(pushUop1)
     when(pushPort.fire) {
       when(pushUop0.pdstValid) {
         when(push0IsLs)       { lsBusy(pushUop0.pdst) := True }
@@ -763,6 +830,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       when(pushUop0.writesNzvc) {
         when(push0IsAluSlow) { aluSlowNzvcBusy(pushUop0.pNzvcDst) := True }
           .elsewhen(push0IsLsNzvc) { lsNzvcBusy(pushUop0.pNzvcDst) := True }
+          .elsewhen(push0IsCplxNzvc) { cplxNzvcBusy(pushUop0.pNzvcDst) := True }
           .otherwise { sbNzvc.busy(pushUop0.pNzvcDst) := True; sbNzvc.physToSlot(pushUop0.pNzvcDst) := slot0Prio }
       }
       when(pushUop0.writesX) {
@@ -779,6 +847,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
         when(pushUop1.writesNzvc) {
           when(push1IsAluSlow) { aluSlowNzvcBusy(pushUop1.pNzvcDst) := True }
             .elsewhen(push1IsLsNzvc) { lsNzvcBusy(pushUop1.pNzvcDst) := True }
+            .elsewhen(push1IsCplxNzvc) { cplxNzvcBusy(pushUop1.pNzvcDst) := True }
             .otherwise { sbNzvc.busy(pushUop1.pNzvcDst) := True; sbNzvc.physToSlot(pushUop1.pNzvcDst) := slot1Prio }
         }
         when(pushUop1.writesX) {
@@ -851,6 +920,13 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       when(pushUop0.pdstValid && push0IsCplxProd) { cplxBusy(pushUop0.pdst) := True }
       when(pushSlot1Port && pushUop1.pdstValid && push1IsCplxProd) { cplxBusy(pushUop1.pdst) := True }
     }
+    // ---- Dynamic CPLX-NZVC wakeup (task #167): clear cplxNzvcBusy for the completed
+    // flag-writer's pNzvcDst. Same priority discipline (a same-cycle re-allocation wins).
+    when(cplxNzvcWakeupPort.valid) { cplxNzvcBusy(cplxNzvcWakeupPort.payload) := False }
+    when(pushPort.fire) {
+      when(pushUop0.writesNzvc && push0IsCplxNzvc) { cplxNzvcBusy(pushUop0.pNzvcDst) := True }
+      when(pushSlot1Port && pushUop1.writesNzvc && push1IsCplxNzvc) { cplxNzvcBusy(pushUop1.pNzvcDst) := True }
+    }
     // ---- Dynamic SLOW-ALU (shift) wakeup: clear the aluSlow* bitmaps for the completed
     // shift's int/NZVC/X dsts. Same priority discipline (a same-cycle re-allocation by a
     // newly-pushed shift wins). ----
@@ -892,6 +968,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       lsBusy      := 0
       lsNzvcBusy  := 0
       cplxBusy    := 0
+      cplxNzvcBusy := 0
       aluSlowIntBusy  := 0
       aluSlowNzvcBusy := 0
       aluSlowXBusy    := 0

@@ -153,7 +153,48 @@ object PortedTestRunner {
           }
           if (dut.divEu.logic.wbObs.valid.toBoolean) {
             val w = dut.divEu.logic.wbObs
-            println(f"[divtrace] DIV-WB cyc=$trCyc%6d rid=${w.robId.toInt} dstArch=${w.dstArch.toInt} result=0x${w.result.toLong & 0xffffffffL}%08x nzvc=0x${w.nzvc.toInt & 0xf}%x")
+            println(f"[divtrace] DIV-WB cyc=$trCyc%6d rid=${w.robId.toInt} dstArch=${w.dstArch.toInt} result=0x${w.result.toLong & 0xffffffffL}%08x nzvc=0x${w.nzvc.toInt & 0xf}%x " +
+              f"nzvcWrite=${w.nzvcWrite.toBoolean} iqCplxNzvcWakeupValid=${dut.iq.cplxNzvcWakeupPort.valid.toBoolean} " +
+              f"iqCplxNzvcWakeupPayload=${dut.iq.cplxNzvcWakeupPort.payload.toInt}")
+          }
+        }
+      }
+
+      // debug-only, env-gated trace for D-cache load commands (task #169, ported-tests
+      // triage, btst_pcrel_src investigation). Zero cost unless PORTED_TRACE_DLOAD is set.
+      if (sys.env.contains("PORTED_TRACE_DLOAD")) {
+        var trCyc = 0
+        cd.onSamplings {
+          trCyc += 1
+          if (dut.dcache.logic.loadCmdPort.valid.toBoolean) {
+            println(f"[dload] cyc=$trCyc%6d CMD vaddr=0x${dut.dcache.logic.loadCmdPort.payload.vaddr.toLong & 0xffffffffL}%08x")
+          }
+          if (dut.dcache.logic.loadRspPort.valid.toBoolean) {
+            println(f"[dload] cyc=$trCyc%6d RSP data=0x${dut.dcache.logic.loadRspPort.payload.data.toLong & 0xffffffffL}%08x")
+          }
+        }
+      }
+
+      // debug-only, env-gated trace for the CPLX-NZVC dynamic wakeup (task #167,
+      // ported-tests triage cluster 9 mull_basic HANG investigation). Prints the
+      // wakeup port + any slot with cplxNzvcWait latched, so a permanently-latched
+      // wait bit (never cleared by a matching wakeup) shows up directly. Zero cost
+      // unless PORTED_TRACE_IQNZVC is set.
+      if (sys.env.contains("PORTED_TRACE_IQNZVC")) {
+        var trCyc = 0
+        cd.onSamplings {
+          trCyc += 1
+          if (dut.iq.cplxNzvcWakeupPort.valid.toBoolean) {
+            println(f"[iqnzvc] cyc=$trCyc%6d WAKEUP payload=${dut.iq.cplxNzvcWakeupPort.payload.toInt}")
+          }
+          val busyHex = dut.iq.logic.cplxNzvcBusy.toBigInt.toString(16)
+          if (dut.iq.logic.cplxNzvcBusy.toBigInt != 0) {
+            println(f"[iqnzvc] cyc=$trCyc%6d cplxNzvcBusy=0x$busyHex")
+          }
+          val waiting = dut.iq.logic.slots.zipWithIndex.filter { case (s, _) => s.sel.toBoolean && s.cplxNzvcWait.toBoolean }
+          waiting.foreach { case (s, i) =>
+            println(f"[iqnzvc] cyc=$trCyc%6d slot=$i%2d WAIT robId=${s.context.robId.toInt} " +
+              f"readsNzvc=${s.context.uop.readsNzvc.toBoolean} pNzvcSrc=${s.context.uop.pNzvcSrc.toInt}")
           }
         }
       }

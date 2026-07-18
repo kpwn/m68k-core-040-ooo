@@ -17,6 +17,12 @@ trait DivEuService {
   def issue: Stream[IqContext]
   def completion: Flow[UInt]   // robId (ROB completion port)
   def wakeup: Flow[UInt]       // pdst of a completing DIV (dynamic-completion wakeup)
+  /** pNzvcDst of a completing CPLX op that writes flags (dynamic-completion NZVC
+    * wakeup — task #167). SEPARATE from `wakeup` (int pdst): CHK2/CMP2/CHK write NZVC
+    * with no int dst at all, and DIV/MUL's int dst and NZVC dst can wake at different
+    * moments relative to a consumer that only reads one or the other. Mirrors
+    * LsEuService's `wakeupNzvc`. */
+  def wakeupNzvc: Flow[UInt]
   /** Execute-time conditional fault (CHK -> vector 6, DIV0 -> vector 5). The ROB
     * consumes it like the branch EU's trapvFault (generalized euFault). */
   def euFault: Flow[EuFault]
@@ -50,6 +56,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
   var issuePort: Stream[IqContext] = null
   var completionPort: Flow[UInt]   = null
   var wakeupPort: Flow[UInt]       = null
+  var wakeupNzvcPort: Flow[UInt]   = null
   var euFaultPort: Flow[EuFault]   = null
   var rdA, rdB, rdH: RegFileReadPort = null
   var intW: RegFileWritePort = null;  var intByp: RegFileBypassPort = null
@@ -60,6 +67,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
   override def issue: Stream[IqContext] = issuePort
   override def completion: Flow[UInt]   = completionPort
   override def wakeup: Flow[UInt]       = wakeupPort
+  override def wakeupNzvc: Flow[UInt]   = wakeupNzvcPort
   override def euFault: Flow[EuFault]   = euFaultPort
   override def cplxFlush: Bool          = flushSig
 
@@ -67,6 +75,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     issuePort      = Stream(IqContext())
     completionPort = Flow(UInt(6 bits))
     wakeupPort     = Flow(UInt(6 bits))
+    wakeupNzvcPort = Flow(UInt(4 bits))
     euFaultPort    = Flow(EuFault()); euFaultPort.simPublic()
     flushSig       = Bool()
     // default-driven idle (allowOverride) so a standalone test that does not wire a
@@ -415,24 +424,17 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
               .otherwise { captureComplete(B(0, 32 bits), c2Nzvc, True, False) }
             s1Valid := False
           } elsewhen(isDivRem) {
-            // Trailing remainder-move: write the latched remainder to Dr. If the
-            // preceding DIV overflowed, NO dest was written -> skip this write too
-            // (writeInt=!ovLatch). Sets no flags (the DIV µop already set NZVC).
-            // KNOWN RESIDUAL GAP (ported-tests triage, divl_basic.s): unlike the DIV
-            // µop's own overflow branch (fixed above to write s1A = Dq's old value
-            // through, so its pdst still gets marked ready), this DIVREM µop has NO
-            // real source operand (srcAValid=False -- it has no register dependency,
-            // only an implicit ordering one on the preceding DIV) to copy Dr's old
-            // value from, so on ovLatch=True its pdst is left permanently not-ready
-            // the SAME way the DIV's used to be -- a latent scoreboard-deadlock hazard
-            // for any FUTURE overflow case the divide-by-(-1) erratum (DivUnit.scala)
-            // doesn't also suppress. Not currently reachable by any known test (the
-            // only exercised overflow case, INT_MIN/-1, is now suppressed by the
-            // erratum fix so ovLatch is False for it), so left unfixed here rather
-            // than rushing a new real Dr-source operand into the crack. Proper fix:
-            // give divremUop a real srcA = divlDr (old Dr value) and write it through
-            // here on overflow, mirroring the DIV µop's s1A fix above.
-            captureComplete(remLatch, B(0, 4 bits), False, !ovLatch)
+            // Trailing remainder-move: write the latched remainder to Dr. Task #168
+            // (ported-tests triage, divl_sz1_overflow HANG) closes the residual gap
+            // documented here since task #149: on a DIV overflow (V=1, Dq/Dr BOTH
+            // architecturally unchanged), this µop now writes s1A (Dr's own OLD value,
+            // read via the new real srcA=divlDr operand in MicroOpAssembler.scala)
+            // THROUGH to its freshly-renamed pdst -- exactly mirroring the DIV µop's
+            // own s1A/Dq overflow fix (task #149) -- instead of skipping the write
+            // (writeInt=False), which left the pdst permanently not-ready and
+            // deadlocked any later reader of Dr. writeInt is now unconditionally True;
+            // only the DATA differs (old Dr on overflow, the fresh remainder otherwise).
+            captureComplete(Mux(ovLatch, s1A, remLatch), B(0, 4 bits), False, True)
             s1Valid := False
           } elsewhen(isDiv) {
             when(divisor32 === 0) {
@@ -530,6 +532,12 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // Dynamic-completion wakeup: a completing DIV that produced a physreg.
     wakeupPort.valid   := compLive && compPdstValid && !compFault
     wakeupPort.payload := compPdst
+    // Dynamic-completion NZVC wakeup (task #167): a completing CPLX op that wrote flags
+    // (DIV/MUL/CHK/CMP2/CHK2 — NOT the flagless DIVREM/MULHI crack tail). Gated the same
+    // way as the int wakeup (!compFault: a faulting µop's rename rolls back, so its pdst
+    // is never really live for a surviving consumer) so the two wakeups stay symmetric.
+    wakeupNzvcPort.valid   := compLive && compNzvcWrite && !compFault
+    wakeupNzvcPort.payload := compNzvcDst
     // Generalized euFault (CHK vec6 / DIV0 vec5).
     euFaultPort.valid         := compLive && compFault
     euFaultPort.payload.robId := compRobId

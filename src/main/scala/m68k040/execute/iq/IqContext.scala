@@ -40,6 +40,20 @@ trait IssueQueueService {
     * that physreg become ready. Separate Flow from lsWakeup so a same-cycle LS load
     * + DIV completion never collide on one wakeup port. */
   def cplxWakeup: Flow[UInt]
+  /** Dynamic-completion NZVC wakeup for the CPLX cluster (DivEu): broadcasts the
+    * pNzvcDst of a just-completed CPLX op that writes flags (DIV/MUL normal + overflow,
+    * CHK, CMP2/CHK2 — everything on the CPLX/DivEu port except the trailing DIVREM/MULHI
+    * crack µops, which write no flags). Task #167 (ported-tests triage): before this
+    * port existed, a CPLX NZVC producer was tracked ONLY in the static (latency-1)
+    * `sbNzvc` scoreboard, whose busy bit is cleared the cycle the op ISSUES to DivEu
+    * (task #141's `!slowFire` clear loop), not when its multi-cycle FSM actually
+    * completes — correct only for CMP2/CHK2 (near-single-cycle) and accidentally
+    * unnoticed for DIV/MUL (whose flags land many cycles later) because every prior
+    * test happened to need a POST-op flag value equal to the STALE pre-op one. A
+    * `bvc`/`bvs` immediately after a genuine DIV/MUL overflow (V=1) exposed it: the
+    * branch read the stale (pre-multiply) flags instead of waiting for the real
+    * writeback. Mirrors `lsNzvcWakeup` exactly, on the CPLX port instead of LS. */
+  def cplxNzvcWakeup: Flow[UInt]
   /** Dynamic-completion wakeup for the SLOW ALU path (shift, latency-2): each ALU EU
     * broadcasts the int+NZVC+X dsts of its just-completed shift. A dependent of a shift
     * (int OR flag source) is held NOT-ready until a matching broadcast fires. The shift

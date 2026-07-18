@@ -102,6 +102,9 @@ class IpcBenchSpec extends AnyFunSuite {
       rob.logic.completion(3).payload := divEu.completion.payload
       iq.cplxWakeup.valid   := divEu.wakeup.valid
       iq.cplxWakeup.payload := divEu.wakeup.payload
+      // Dynamic NZVC wakeup (task #167): mirrors top/FullCoreSynth.
+      iq.cplxNzvcWakeup.valid   := divEu.wakeupNzvc.valid
+      iq.cplxNzvcWakeup.payload := divEu.wakeupNzvc.payload
       when(divEu.euFault.valid) {
         rob.logic.euFaultCompletion.valid   := True
         rob.logic.euFaultCompletion.payload := divEu.euFault.payload
