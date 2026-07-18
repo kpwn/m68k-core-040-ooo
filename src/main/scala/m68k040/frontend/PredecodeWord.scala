@@ -498,11 +498,25 @@ object PredecodeWord {
         }
         // CLR/NEG/NEGX/NOT/TST <ea> mem-dest (the RMW crack): mode != 000, ss != 11,
         // oooo in {0,2,4,6,A}, bit8=0. In-scope MEMSIMPLE dest -> opword + EA ext.
-        // SWAP/EXT/TAS are Dn-only (mode 000, matched above); TAS-mem deferred.
+        // SWAP/EXT are Dn-only (mode 000, matched above); TAS-mem is framed separately
+        // below (its ss field is ALWAYS 11, which this ss!=11 filter exists specifically
+        // to exclude, since ss=11 at mode=000 is the Dn-form TAS opword, not TST).
         val isUnaryMem = !op(8) && (u4ss =/= U(3, 2 bits)) && (u4mode =/= U(0, 3 bits)) &&
                          (u4o === U(0, 4 bits) || u4o === U(2, 4 bits) || u4o === U(4, 4 bits) ||
                           u4o === U(6, 4 bits) || u4o === U(0xA, 4 bits))
         when(isUnaryMem) {
+          val (mok, mext) = memDestExt(u4mode, op(2 downto 0).asUInt, extW, extWKnown)   // EA is op+1
+          when(mok) {
+            r.simple   := True
+            r.lenWords := (U(1, 3 bits) + mext).resized
+          }
+        }
+        // TAS <ea> mem-dest (task #158): op[15:6]==0b0100101011, mode != 000 (mode=000 is
+        // the Dn form, already matched by `isTas` above). Opword + EA ext, same shape as
+        // isUnaryMem but keyed off the full fixed opcode (not o4/ss, which collide with
+        // TST at mode=000 only -- irrelevant here since mode is forced non-zero).
+        val isTasMem = (op(15 downto 6) === B"10'b0100101011") && (u4mode =/= U(0, 3 bits))
+        when(isTasMem) {
           val (mok, mext) = memDestExt(u4mode, op(2 downto 0).asUInt, extW, extWKnown)   // EA is op+1
           when(mok) {
             r.simple   := True

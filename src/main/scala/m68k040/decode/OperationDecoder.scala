@@ -341,8 +341,12 @@ object OperationDecoder {
           o.srcA := easrc; o.dst := easrc; o.dstWrites := True
           o.writesNzvc := True
         }
-        // TAS Dn (0100 1010 11 000 rrr, op[15:3]==0x0958): N/Z from Dn[7:0]; Dn[7]:=1.
-        when(opword(15 downto 3) === B"13'b0100101011000") {
+        // TAS Dn / TAS <ea> (0100 1010 11 mmmrrr, op[15:6]==0x0958>>3==0b0100101011):
+        // N/Z from the operand's original byte; bit7:=1. Dn-direct is a single ALU µop
+        // (srcA=dst=Dn); a MEMSIMPLE EA is the generic load-op-store RMW crack (the
+        // assembler's `rmwOpInScope`/`line4UnaryMemBad` gate the EA class -- An-direct/
+        // #imm/MEMCOMPLEX/pcRel stay illegal there). Task #158.
+        when(opword(15 downto 6) === B"10'b0100101011") {
           o.illegal := False
           o.op := DecOp.TAS; o.size := Size.BYTE
           o.srcA := easrc; o.dst := easrc; o.dstWrites := True

@@ -405,8 +405,10 @@ object MicroOpAssembler {
     //   crackLoadOnly : [load.sz <ea> -> T0] [op (flags only)]                 (TST / CMPI / CMP-mem; NO store)
     //   crackClr      : [CLR -> T1 (=0) + Z/N flags]                            [store.sz T1 -> <ea>] (NO load)
     // The EA is op[5:0] = `srcEa` (the SAME descriptor for load and store: MEMSIMPLE has
-    // no side effect, so both recompute base+disp identically). SWAP/EXT/TAS are Dn-only
-    // (TAS-mem deferred) -> a memory EA there stays illegal (line4UnaryMemBad below).
+    // no side effect, so both recompute base+disp identically). SWAP/EXT are Dn-only;
+    // TAS <ea> (task #158) now rides the SAME crackRmw load-op-store path -- its ALU
+    // datapath (AluDatapath.tasRes) is already generic over srcA's origin (register or
+    // the RMW crack's loaded T0), so no EU change was needed.
     // ── Bit op (BTST/BCHG/BCLR/BSET) size/modulo resolution ────────────────────
     // The dest sets the width: Dn (DATAREG) -> LONG (bit mod 32); memory (MEMSIMPLE) ->
     // BYTE (bit mod 8: BTST load-only, BSET/BCLR/BCHG mem-RMW crack). The EU applies the
@@ -428,7 +430,7 @@ object MicroOpAssembler {
     val srcEaDelta     = Mux(bitOpIsMem, bitOpByteDelta, srcEa.autoDelta)
 
     val eaIsDst       = (spec.dst.kind === OperandKind.EASRC)
-    val rmwOpInScope  = !(spec.op === DecOp.SWAP || spec.op === DecOp.EXT || spec.op === DecOp.TAS)
+    val rmwOpInScope  = !(spec.op === DecOp.SWAP || spec.op === DecOp.EXT)
     // PC-relative EAs (d16,PC)/(d8,PC,Xn) are NOT alterable -> never a mem-dest RMW/store
     // destination (the 68k forbids writes to PC-space). They are SOURCE-only. Excluding
     // pcRel here keeps an indexed/displaced PC-rel RMW-dest on the illegal path (the
@@ -998,9 +1000,9 @@ object MicroOpAssembler {
     val addqMemBad = (spec.srcB.kind === OperandKind.IMMQ3) &&
                      (srcEa.klass =/= EaClass.DATAREG) && (srcEa.klass =/= EaClass.ADDRREG) &&
                      (srcEa.klass =/= EaClass.MEMSIMPLE)
-    // Line-4 unary (CLR/NEG/NEGX/NOT/TST/SWAP/EXT/TAS): DATA-register OR (CLR/NEG/NEGX/
-    // NOT/TST) a MEMSIMPLE EA (the RMW crack). SWAP/EXT/TAS are Dn-only (TAS-mem deferred)
-    // -> a non-data-reg EA there stays illegal. An / #imm / MEMCOMPLEX always illegal.
+    // Line-4 unary (CLR/NEG/NEGX/NOT/TST/TAS/SWAP/EXT): DATA-register OR (CLR/NEG/NEGX/
+    // NOT/TST/TAS) a MEMSIMPLE EA (the RMW crack). SWAP/EXT are Dn-only -> a non-data-reg
+    // EA there stays illegal. An / #imm / MEMCOMPLEX always illegal.
     val line4UnaryMemBad = isLine4Unary && (srcEa.klass =/= EaClass.DATAREG) &&
                            !(rmwOpInScope && (srcEa.klass === EaClass.MEMSIMPLE))
     // Line-0 immediate (srcB = IMMEXT): the EA (op[5:0]) is the DESTINATION. DATA-register
