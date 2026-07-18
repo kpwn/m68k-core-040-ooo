@@ -162,6 +162,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
                         ((s1mi_opmode === U(4, 3 bits)) || (s1mi_opmode === U(5, 3 bits)) || (s1mi_opmode === U(6, 3 bits)))
     val s1mi_isSingle = (slot1Spec0.op === DecOp.CLR) || (slot1Spec0.op === DecOp.NEG) || (slot1Spec0.op === DecOp.NEGX) ||
                         (slot1Spec0.op === DecOp.NOT) || (slot1Spec0.op === DecOp.TST)
+    // ADDQ/SUBQ #n,<ea> (task #150 follow-up, mirrors s0IsAddqSubq/ucAddqSubqMi).
+    val s1mi_isAddqSubq = slot1Spec0.srcB.kind === OperandKind.IMMQ3
     val s1mi_isImm = slot1Spec0.srcB.kind === OperandKind.IMMEXT
     val s1mi_immL  = s1mi_opw(7 downto 6) === B"10"
     val s1mi_immVec= Mux(s1mi_immL, Vec(s1mi_opw, s1mi_pkt.words(3), s1mi_pkt.words(4), s1mi_pkt.words(5)),
@@ -172,6 +174,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       (s1mi_isMove && (s1mi_dstEa.klass === EaClass.MEMINDIRECT)) ||
       (s1mi_isAlu && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s1mi_isAluDst && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
+      (s1mi_isAddqSubq && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
       // .L-imm full-format dst (s1mi_immL): NOT routed to the engine — predecode mis-frames
       // it (ext at op+3), so it falls to the normal slot1 crack where it is gated ILLEGAL.
       (s1mi_isImm && !s1mi_immL && (s1mi_immEa.klass === EaClass.MEMINDIRECT)) ||
@@ -349,6 +352,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // engine AT ALL; without it a memory-indirect RMW dst falls through to the ordinary
     // fast head with a garbage EA (wild PC), regardless of the later ucAluDstMi fix.
     val s0AluDstMode = (s0opmode === U(4, 3 bits)) || (s0opmode === U(5, 3 bits)) || (s0opmode === U(6, 3 bits))
+    // ADDQ/SUBQ #n,<ea> (task #150 follow-up, mirrors ucAddqSubqMi below): another
+    // dst-EA RMW form, srcB.kind=IMMQ3 (distinct from the line-0 IMMEXT immediate).
+    val s0IsAddqSubq = spec0.srcB.kind === OperandKind.IMMQ3
     val s0IsSingleEa = (spec0.op === DecOp.CLR) || (spec0.op === DecOp.NEG) || (spec0.op === DecOp.NEGX) ||
                        (spec0.op === DecOp.NOT) || (spec0.op === DecOp.TST)
     val s0IsLineImm  = spec0.srcB.kind === OperandKind.IMMEXT
@@ -416,6 +422,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       ((s0IsMove && ((s0dstEa.klass === EaClass.MEMINDIRECT) || s0dstIsMemIndShifted))) ||
       (s0IsAluSrcLine && s0AluSrcMode && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s0IsAluSrcLine && s0AluDstMode && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
+      (s0IsAddqSubq && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s0IsLineImm && !s0ImmIsL && (s0ImmEa.klass === EaClass.MEMINDIRECT)) ||
       (s0IsSingleEa && (s0srcEa.klass === EaClass.MEMINDIRECT)))
     // ── Bit-field DYNAMIC read-only MEMORY detection (slice 3c) ──────────────────
@@ -902,6 +909,19 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // classify as MEMINDIRECT, so this condition cannot misfire onto them.
     val ucAluDstMode = (ucOpmode === U(4, 3 bits)) || (ucOpmode === U(5, 3 bits)) || (ucOpmode === U(6, 3 bits))
     val ucAluDstMi = ucIsAluSrcLine && ucAluDstMode && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
+    // ADDQ/SUBQ #n,<ea> (line 5, `0101 ddd q ss mmmrrr`, ss=/=11): another dst-EA RMW
+    // form (task #150 follow-up, b2_addq_subq_memind_null_od) sharing the SAME gap as
+    // ucAluDstMi above -- OperationDecoder names it srcB.kind=IMMQ3 (distinct from the
+    // line-0 IMMEXT immediate ucImmDstMi below), so neither existing classifier caught
+    // it. The "other operand" is the 3-bit quick immediate (op[11:9], 0 means 8), not a
+    // register -- reuses the SAME miOtherIsImm/miHostImm immediate-feed mechanism the
+    // line-0 immediate family already uses (SMiOther resolves to the imm when
+    // miOtherIsImm is set), just with a different immediate SOURCE (opword bits, not an
+    // ext word).
+    val ucIsAddqSubq = ucEntrySpec.srcB.kind === OperandKind.IMMQ3
+    val ucAddqSubqMi = ucIsAddqSubq && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
+    val ucAddqSubqQuick = ucEopw(11 downto 9).asUInt
+    val ucAddqSubqImm = Mux(ucAddqSubqQuick === U(0, 3 bits), U(8, 32 bits), ucAddqSubqQuick.resize(32 bits)).asBits
     // line-0 immediate op dst-EA (ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea>): the immediate
     // PRECEDES the EA ext, so re-decode the EA from a SHIFTED window. immWords = .L?2:1.
     val ucImmIsL   = ucEopw(7 downto 6) === B"10"
@@ -924,7 +944,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // #144: on the stashed-slot1 path, this cycle's live fed.valid is unrelated to the
     // stashed packet's validity and can independently be false, e.g. a bubble, silently
     // zeroing ucIsMemInd and misrouting the µcode entry to the wrong default row).
-    val ucIsMemInd = (ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || ucImmDstMi || ucSingleMi) &&
+    val ucIsMemInd = (ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || ucAddqSubqMi || ucImmDstMi || ucSingleMi) &&
                      (ucPendValid || fed.valid)
     // The host op's OTHER operand register:
     //   MOVE src-EA (load to a reg)  -> the dst reg  = op[11:9] (Dn) / +8 for An (isMovea n/a here).
@@ -971,7 +991,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucMiEntry.simPublic()
     ucIsMemInd.simPublic()
     ucLine.simPublic(); ucOpmode.simPublic()
-    ucAluSrcMi.simPublic(); ucAluDstMi.simPublic()
+    ucAluSrcMi.simPublic(); ucAluDstMi.simPublic(); ucAddqSubqMi.simPublic()
     ucMoveSrcMi.simPublic(); ucMoveDstMi.simPublic()
     ucMoveSrcMiEaEa.simPublic(); ucMoveDstMiEaEa.simPublic(); ucMoveBothMi.simPublic()
     ucMiFlagsOnly.simPublic()
@@ -981,15 +1001,18 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.miPost       := ucMiEa.memPost
     ucEntryCtx.miOp         := ucEntrySpec.op
     ucEntryCtx.miHostSize   := ucEntrySpec.size
-    ucEntryCtx.miIsDstEa    := ucMoveDstMi || ucImmDstMi || ucSingleMi || ucAluDstMi
-    ucEntryCtx.miIsRmw      := (ucImmDstMi || ucSingleMi || ucAluDstMi) && !ucMiFlagsOnly
+    ucEntryCtx.miIsDstEa    := ucMoveDstMi || ucImmDstMi || ucSingleMi || ucAluDstMi || ucAddqSubqMi
+    ucEntryCtx.miIsRmw      := (ucImmDstMi || ucSingleMi || ucAluDstMi || ucAddqSubqMi) && !ucMiFlagsOnly
     ucEntryCtx.miOther      := ucMiOtherReg
     ucEntryCtx.miOtherValid := ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || (ucImmDstMi && !ucIsSingleEa)
-    ucEntryCtx.miOtherIsImm := ucImmDstMi
+    ucEntryCtx.miOtherIsImm := ucImmDstMi || ucAddqSubqMi
     // The line-0 immediate VALUE precedes the EA ext: words(1) (.B/.W, sign-extended) or
-    // words(1)##words(2) (.L). (Only consumed when miOtherIsImm.)
-    ucEntryCtx.miHostImm    := Mux(ucImmIsL, ucEntryPkt.words(1) ## ucEntryPkt.words(2),
-                                             ucEntryPkt.words(1).asSInt.resize(32).asBits)
+    // words(1)##words(2) (.L). ADDQ/SUBQ's immediate is instead the 3-bit quick field
+    // (op[11:9], 0 means 8) carried directly in the opword, no ext word. (Only consumed
+    // when miOtherIsImm.)
+    ucEntryCtx.miHostImm    := Mux(ucAddqSubqMi, ucAddqSubqImm,
+                                Mux(ucImmIsL, ucEntryPkt.words(1) ## ucEntryPkt.words(2),
+                                              ucEntryPkt.words(1).asSInt.resize(32).asBits))
     ucEntryCtx.miOtherIsDst := ucMoveSrcMi
     ucEntryCtx.miMovea      := ucMiMovea
     // Host op flag effects. All in-scope hosts (MOVE/ADD/SUB/AND/OR/EOR/CMP/CLR/NEG/NEGX/
