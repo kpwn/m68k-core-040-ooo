@@ -152,10 +152,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // does not affect DIVU/DIVS (line 8) / MULU/MULS (line C).
     val s1mi_anArith = (slot1Spec0.dst.kind === OperandKind.REGFIELD) && slot1Spec0.dst.isAddr &&
                        ((slot1Spec0.op === DecOp.ADD) || (slot1Spec0.op === DecOp.SUB) || (slot1Spec0.op === DecOp.CMP))
-    val s1mi_isAlu = ((s1mi_line === U(8, 4 bits)) || (s1mi_line === U(9, 4 bits)) || (s1mi_line === U(0xB, 4 bits)) ||
-                      (s1mi_line === U(0xC, 4 bits)) || (s1mi_line === U(0xD, 4 bits))) &&
+    val s1mi_isAluLine = (s1mi_line === U(8, 4 bits)) || (s1mi_line === U(9, 4 bits)) || (s1mi_line === U(0xB, 4 bits)) ||
+                         (s1mi_line === U(0xC, 4 bits)) || (s1mi_line === U(0xD, 4 bits))
+    val s1mi_isAlu = s1mi_isAluLine &&
                      ((s1mi_opmode === U(0, 3 bits)) || (s1mi_opmode === U(1, 3 bits)) || (s1mi_opmode === U(2, 3 bits)) ||
                       (s1mi_anArith && ((s1mi_opmode === U(3, 3 bits)) || (s1mi_opmode === U(7, 3 bits)))))
+    // ALU Dn,<ea> RMW dst-EA (task #150, mirrors s0AluDstMode/ucAluDstMi): opmode 4/5/6.
+    val s1mi_isAluDst = s1mi_isAluLine &&
+                        ((s1mi_opmode === U(4, 3 bits)) || (s1mi_opmode === U(5, 3 bits)) || (s1mi_opmode === U(6, 3 bits)))
     val s1mi_isSingle = (slot1Spec0.op === DecOp.CLR) || (slot1Spec0.op === DecOp.NEG) || (slot1Spec0.op === DecOp.NEGX) ||
                         (slot1Spec0.op === DecOp.NOT) || (slot1Spec0.op === DecOp.TST)
     val s1mi_isImm = slot1Spec0.srcB.kind === OperandKind.IMMEXT
@@ -167,6 +171,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       (s1mi_isMove && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s1mi_isMove && (s1mi_dstEa.klass === EaClass.MEMINDIRECT)) ||
       (s1mi_isAlu && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
+      (s1mi_isAluDst && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
       // .L-imm full-format dst (s1mi_immL): NOT routed to the engine — predecode mis-frames
       // it (ext at op+3), so it falls to the normal slot1 crack where it is gated ILLEGAL.
       (s1mi_isImm && !s1mi_immL && (s1mi_immEa.klass === EaClass.MEMINDIRECT)) ||
@@ -338,6 +343,12 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
                     ((spec0.op === DecOp.ADD) || (spec0.op === DecOp.SUB) || (spec0.op === DecOp.CMP))
     val s0AluSrcMode = (s0opmode === U(0, 3 bits)) || (s0opmode === U(1, 3 bits)) || (s0opmode === U(2, 3 bits)) ||
                        (s0AnArith && ((s0opmode === U(3, 3 bits)) || (s0opmode === U(7, 3 bits))))
+    // ALU Dn,<ea> RMW dst-EA (task #150, mirrors ucAluDstMi below): opmode 4/5/6 on the
+    // SAME op[5:0] EA field, just read/written instead of only read. Needed here too —
+    // this early slot0 gate is what decides whether the instruction enters the µcode
+    // engine AT ALL; without it a memory-indirect RMW dst falls through to the ordinary
+    // fast head with a garbage EA (wild PC), regardless of the later ucAluDstMi fix.
+    val s0AluDstMode = (s0opmode === U(4, 3 bits)) || (s0opmode === U(5, 3 bits)) || (s0opmode === U(6, 3 bits))
     val s0IsSingleEa = (spec0.op === DecOp.CLR) || (spec0.op === DecOp.NEG) || (spec0.op === DecOp.NEGX) ||
                        (spec0.op === DecOp.NOT) || (spec0.op === DecOp.TST)
     val s0IsLineImm  = spec0.srcB.kind === OperandKind.IMMEXT
@@ -404,6 +415,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       ((s0IsMove && (s0srcEa.klass === EaClass.MEMINDIRECT))) ||
       ((s0IsMove && ((s0dstEa.klass === EaClass.MEMINDIRECT) || s0dstIsMemIndShifted))) ||
       (s0IsAluSrcLine && s0AluSrcMode && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
+      (s0IsAluSrcLine && s0AluDstMode && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s0IsLineImm && !s0ImmIsL && (s0ImmEa.klass === EaClass.MEMINDIRECT)) ||
       (s0IsSingleEa && (s0srcEa.klass === EaClass.MEMINDIRECT)))
     // ── Bit-field DYNAMIC read-only MEMORY detection (slice 3c) ──────────────────
@@ -875,6 +887,21 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val ucAluSrcMode   = (ucOpmode === U(0, 3 bits)) || (ucOpmode === U(1, 3 bits)) || (ucOpmode === U(2, 3 bits)) ||
                          (ucAnArith && ((ucOpmode === U(3, 3 bits)) || (ucOpmode === U(7, 3 bits))))
     val ucAluSrcMi = ucIsAluSrcLine && ucAluSrcMode && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
+    // ALU Dn,<ea> RMW dst-EA (OR/SUB/AND/ADD/EOR opmode 4/5/6 -- `Dn op <ea> -> <ea>`,
+    // OperationDecoder's "ALU Dn,<ea> RMW" arm @ line ~791 + the EOR arm @ ~782): the
+    // SAME op[5:0] EA field as the ALU-src form above, just read/written instead of
+    // only read. Task #150 (ported-tests memind cluster, add_l_dn_memind_dst): this
+    // shape had NO classifier reaching ucIsMemInd at all -- ucAluSrcMi is gated to
+    // ucAluSrcMode (opmode 0/1/2 only), so a full-format mem-indirect RMW dst-EA
+    // (opmode 4/5/6) fell all the way through to the ordinary non-microcoded fast
+    // path with a garbage EA, producing a wild PC (same class of bug as #144/#145).
+    // Opmode 4/5/6 on lines 8/9/B/C/D is EXCLUSIVELY this Dn-op-mem RMW form when the
+    // ea klass is MEMINDIRECT (mode 6 / mode-7-reg-3 full-format ext) -- the other
+    // opmode-4/5/6 encodings sharing this opcode space (ADDX/SUBX reg, ABCD/SBCD,
+    // EXG, PACK/UNPK) are all register-DIRECT (mode 000/001), which can never
+    // classify as MEMINDIRECT, so this condition cannot misfire onto them.
+    val ucAluDstMode = (ucOpmode === U(4, 3 bits)) || (ucOpmode === U(5, 3 bits)) || (ucOpmode === U(6, 3 bits))
+    val ucAluDstMi = ucIsAluSrcLine && ucAluDstMode && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
     // line-0 immediate op dst-EA (ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea>): the immediate
     // PRECEDES the EA ext, so re-decode the EA from a SHIFTED window. immWords = .L?2:1.
     val ucImmIsL   = ucEopw(7 downto 6) === B"10"
@@ -897,7 +924,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // #144: on the stashed-slot1 path, this cycle's live fed.valid is unrelated to the
     // stashed packet's validity and can independently be false, e.g. a bubble, silently
     // zeroing ucIsMemInd and misrouting the µcode entry to the wrong default row).
-    val ucIsMemInd = (ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucImmDstMi || ucSingleMi) &&
+    val ucIsMemInd = (ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || ucImmDstMi || ucSingleMi) &&
                      (ucPendValid || fed.valid)
     // The host op's OTHER operand register:
     //   MOVE src-EA (load to a reg)  -> the dst reg  = op[11:9] (Dn) / +8 for An (isMovea n/a here).
@@ -944,7 +971,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucMiEntry.simPublic()
     ucIsMemInd.simPublic()
     ucLine.simPublic(); ucOpmode.simPublic()
-    ucAluSrcMi.simPublic()
+    ucAluSrcMi.simPublic(); ucAluDstMi.simPublic()
     ucMoveSrcMi.simPublic(); ucMoveDstMi.simPublic()
     ucMoveSrcMiEaEa.simPublic(); ucMoveDstMiEaEa.simPublic(); ucMoveBothMi.simPublic()
     ucMiFlagsOnly.simPublic()
@@ -954,10 +981,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.miPost       := ucMiEa.memPost
     ucEntryCtx.miOp         := ucEntrySpec.op
     ucEntryCtx.miHostSize   := ucEntrySpec.size
-    ucEntryCtx.miIsDstEa    := ucMoveDstMi || ucImmDstMi || ucSingleMi
-    ucEntryCtx.miIsRmw      := (ucImmDstMi || ucSingleMi) && !ucMiFlagsOnly
+    ucEntryCtx.miIsDstEa    := ucMoveDstMi || ucImmDstMi || ucSingleMi || ucAluDstMi
+    ucEntryCtx.miIsRmw      := (ucImmDstMi || ucSingleMi || ucAluDstMi) && !ucMiFlagsOnly
     ucEntryCtx.miOther      := ucMiOtherReg
-    ucEntryCtx.miOtherValid := ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || (ucImmDstMi && !ucIsSingleEa)
+    ucEntryCtx.miOtherValid := ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || (ucImmDstMi && !ucIsSingleEa)
     ucEntryCtx.miOtherIsImm := ucImmDstMi
     // The line-0 immediate VALUE precedes the EA ext: words(1) (.B/.W, sign-extended) or
     // words(1)##words(2) (.L). (Only consumed when miOtherIsImm.)
