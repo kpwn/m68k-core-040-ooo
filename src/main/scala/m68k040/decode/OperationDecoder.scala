@@ -236,6 +236,16 @@ object OperationDecoder {
             .otherwise { o.size := Size.LONG }
           o.writesNzvc := True; o.writesX := True   // Dn dest; assembler clears for An dest
         }
+        // Scc <ea> memory-destination size fix-up (task #160): the assembler builds the
+        // WHOLE Scc instruction by hand (branch-EU condition write; illegal-gating is
+        // via the assembler's isSccOp exclusion, not spec.illegal), so this decoder does
+        // NOT otherwise touch Scc/DBcc/TRAPcc (ss==3) at all. But `o.spec.size` feeds
+        // BOTH the offloaded EaDecoder call (autoDelta for -(An)/(An)+ EAs -- WITHOUT
+        // this, a byte Scc predec/postinc would decrement/increment An by the WRONG
+        // amount, the WORD default) and the assembler's rmwStUop (the memory-form's
+        // trailing store size). Harmless for DBcc/TRAPcc (neither reads srcEa-derived
+        // size/delta in its own hand-built crack).
+        when(ss === 3) { o.size := Size.BYTE }
       }
       // ---- MOVE.B/.W/.L (00 ss ...) src EA = bits 5-0, dst EA = bits 11-6 ----
       is(0x1, 0x3, 0x2) {

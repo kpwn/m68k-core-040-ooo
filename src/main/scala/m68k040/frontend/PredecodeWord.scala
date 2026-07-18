@@ -612,7 +612,11 @@ object PredecodeWord {
       //   ss != 11 (ADDQ/SUBQ): dest EA mode 0/1 (Dn/An) -> SIMPLE len1; memory dest is
       //     the deferred RMW -> COMPLEX (the assembler's illegal path).
       //   ss == 11: mode 001 -> DBcc (opword + disp16) -> SIMPLE len2; mode 000 -> Scc Dn
-      //     -> SIMPLE len1; other modes (memory Scc / TRAPcc) deferred -> COMPLEX.
+      //     -> SIMPLE len1; mode 7 ttt in {2,3,4} -> TRAPcc; mode 7 ttt in {0,1} (abs.W/
+      //     .L) and modes 2-6 -> Scc <ea> memory dest (task #160, the RMW-store crack --
+      //     opword + EA ext, same memDestExt table CLR/NEG/NOT-mem and ADDQ/SUBQ mem-dest
+      //     already use above). mode 7 ttt in {5,6,7} stays COMPLEX (memDestExt rejects
+      //     mode7 outside reg 0/1 -> mok=False -> falls through un-simple).
       is(U(5, 4 bits)) {
         val ss   = op(7 downto 6).asUInt
         val mode = op(5 downto 3).asUInt
@@ -628,7 +632,7 @@ object PredecodeWord {
             r.simple := True; r.lenWords := U(2, 4 bits)
           } elsewhen(mode === U(0, 3 bits)) {                      // Scc Dn
             r.simple := True; r.lenWords := U(1, 4 bits)
-          } elsewhen(mode === U(7, 3 bits)) {                      // TRAPcc (mode 7)
+          } elsewhen(mode === U(7, 3 bits)) {                      // TRAPcc (mode 7) / Scc abs.W/.L
             val ttt = op(2 downto 0).asUInt
             when(ttt === U(4, 3 bits)) {                           // TRAPcc (no operand, 1 word)
               r.simple := True; r.lenWords := U(1, 4 bits)
@@ -636,8 +640,14 @@ object PredecodeWord {
               r.simple := True; r.lenWords := U(2, 4 bits)
             } elsewhen(ttt === U(3, 3 bits)) {                     // TRAPcc.L (#data32, 3 words)
               r.simple := True; r.lenWords := U(3, 4 bits)
+            } otherwise {                                          // Scc (xxx).W/.L (ttt 0/1)
+              val (mok, mext) = memDestExt(mode, op(2 downto 0).asUInt, extW, extWKnown)
+              when(mok) { r.simple := True; r.lenWords := (U(1, 3 bits) + mext).resized }
             }
-            // other ttt -> COMPLEX (stays ILLEGAL)
+            // ttt 5/6/7 -> memDestExt(mode=7, reg>=5) rejects -> mok=False -> COMPLEX
+          } otherwise {                                            // Scc <ea> memory (modes 2-6)
+            val (mok, mext) = memDestExt(mode, op(2 downto 0).asUInt, extW, extWKnown)   // EA is op+1
+            when(mok) { r.simple := True; r.lenWords := (U(1, 3 bits) + mext).resized }
           }
         }
       }

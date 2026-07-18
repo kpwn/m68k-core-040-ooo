@@ -1052,7 +1052,15 @@ object MicroOpAssembler {
     val rrr5       = op(2 downto 0).asUInt.resize(5)
     val rrr5raw    = op(2 downto 0).asUInt
     val isDbccOp   = isLine5 && (ss5 === 3) && (mode5 === 1)
-    val isSccOp    = isLine5 && (ss5 === 3) && (mode5 === 0)          // Scc Dn (in scope)
+    // Scc <ea>: any mode except DBcc's mode=1, and (mode=7 valid only for reg 0/1 =
+    // abs.W/abs.L; reg>=2 is TRAPcc's ttt operand-count selector, or a reserved mode-7
+    // sub-form -- neither is a valid Scc destination). Task #160 widened this from
+    // Dn-only (mode5===0) to the full memory-alterable EA set (mirroring CLR/NEG/NOT-
+    // mem's "any MEMSIMPLE dest, non-pcRel" pattern); srcEa.klass (already EA-agnostic,
+    // decoded from this SAME op[5:0] field regardless of instruction family) is what
+    // the `when(isSccOp)` crack below actually branches on (DATAREG vs MEMSIMPLE).
+    val isSccOp    = isLine5 && (ss5 === 3) && (mode5 =/= 1) &&
+                     !((mode5 === 7) && (rrr5raw >= 2))
     // TRAPcc: line-5 ss==11, mode==7 (reg field is the ttt operand form), ttt ∈ {2,3,4}.
     //   ttt=4 (reg=4): no operand (1 word). ttt=2 (reg=2): #data16 (2 words).
     //   ttt=3 (reg=3): #data32 (3 words). Other ttt -> illegal (stays sccMemBad).
@@ -1471,6 +1479,13 @@ object MicroOpAssembler {
     // it never redirects (the branch EU's Scc path forces taken/mispredict off and the
     // int write through anW). NO flags, NO ALU action. cond = cccc; the byte value is
     // computed in the EU from `taken`.
+    // Scc <ea> memory destination (task #160): the EA (op[5:0] = srcEa, EA-agnostic and
+    // already decoded regardless of instruction family) is MEMSIMPLE and non-pcRel (Scc
+    // cannot target PC-space, and the broadened isSccOp already excludes every pcRel
+    // encoding via its mode7-reg>=2 gate, so this is a defensive re-check, not load-
+    // bearing). sccIsMem selects the 2-µop [compute cond -> T1][store T1 -> EA] crack
+    // (below, at the final uops-array assembly) instead of the 1-µop Dn form.
+    val sccIsMem = isSccOp && srcIsMem && !srcEa.pcRel
     when(isSccOp) {
       opUop.op            := DecOp.ILLEGAL    // no ALU action; the branch EU drives the write
       opUop.cluster       := Cluster.INT
@@ -1479,15 +1494,32 @@ object MicroOpAssembler {
       opUop.isScc         := True
       opUop.cond          := cccc5
       opUop.readsNzvc     := True             // read NZVC for the condition
-      opUop.srcAReg       := rrr5; opUop.srcAValid := True   // old Dn (merge upper-24 source)
-      opUop.srcBValid     := False
-      opUop.dstReg        := rrr5; opUop.dstValid := True    // Dn (byte-merged result)
       opUop.useImm        := False
       opUop.writesNzvc    := False; opUop.writesX := False
       opUop.branchDisp    := 0
       opUop.unimplemented := False
       opUop.faulted       := False; opUop.faultVector := 0
       opUop.isRte         := False; opUop.isCondTrap := False; opUop.ibranch := False
+      when(sccIsMem) {
+        // Memory dest: the branch EU write targets TEMP T1 instead of an architectural
+        // Dn; a trailing plain STORE µop (rmwStUop -- the SAME generic memory-RMW
+        // trailing-store helper MOVE-from-CCR/SR's mem-dest form already reuses) writes
+        // T1's low BYTE to the computed EA, handling -(An)/(An)+ side effects and abs/
+        // d16/indexed addressing via the proven srcEa/rmwStUop machinery, UNCHANGED.
+        // NO leading load (the stored byte never depends on the OLD memory content,
+        // unlike CLR/NEG/NOT-mem's RMW crack) -- mirrors crackClr's "no load precedes
+        // it" shape. srcA is UNUSED (the branch EU's internal .B-merge upper-24 bits
+        // would land in T1[31:8], discarded anyway since the trailing store is BYTE-
+        // sized) -- drop the read entirely rather than wire a meaningless merge source.
+        opUop.srcAValid := False
+        opUop.srcBValid := False
+        opUop.dstReg     := U(T1, 5 bits); opUop.dstValid := True
+        opUop.keepCommit := True   // the kept commit; the trailing store is dropped
+      } otherwise {
+        opUop.srcAReg       := rrr5; opUop.srcAValid := True   // old Dn (merge upper-24 source)
+        opUop.srcBValid     := False
+        opUop.dstReg        := rrr5; opUop.dstValid := True    // Dn (byte-merged result)
+      }
     }
     // ── DBcc Dn,disp (0101 cccc 11 001rrr + disp16) — decrement-and-branch ──────
     // A branch-class µop. READS Dn (srcA = the counter / merge source) + WRITES Dn (dst
@@ -2585,6 +2617,13 @@ object MicroOpAssembler {
       out.count   := 2
       out.uops(0) := bfResolveUop
       out.uops(1) := opUop
+    } elsewhen(sccIsMem) {
+      // Scc <ea> memory dest (task #160) -> [compute cond -> T1 (branch EU)] [store.b
+      // T1 -> <ea>] (rmwStUop; NO leading load, like crackClr). The -(An)/(An)+ side
+      // effect (An update) rides the trailing store, same as every other rmwStUop user.
+      out.count   := 2
+      out.uops(0) := opUop
+      out.uops(1) := rmwStUop
     } otherwise {
       out.count   := 1
       out.uops(0) := opUop
