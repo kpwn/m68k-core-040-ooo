@@ -3,6 +3,7 @@ package m68k040.cache
 import m68k040.isa.Size
 import m68k040.services.DTranslationService
 import spinal.core._
+import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.bus.amba4.axi.{Axi4, Axi4Config}
 import spinal.lib.fsm._
@@ -46,7 +47,9 @@ class DcachePlugin extends FiberPlugin with DcacheService {
 
     // ---- service ports (plain directionless Stream/Flow) ----
     val loadCmdPort = Stream(DLoadCmd())
+    loadCmdPort.valid.simPublic(); loadCmdPort.ready.simPublic(); loadCmdPort.payload.simPublic()
     val loadRspPort = Flow(DLoadRsp())
+    loadRspPort.valid.simPublic(); loadRspPort.payload.simPublic()
     val loadBusyReg = Bool()
     val storePort   = Flow(DStoreCmd())
     val storeAckReg = Bool()

@@ -158,6 +158,36 @@ object PortedTestRunner {
         }
       }
 
+      // debug-only, env-gated trace for the exception-frame odd-SP D-cache push
+      // (ported-tests triage, exc_aline_odd_sp_mmu_dcache) -- prints every dcStore
+      // command the exception FSM issues (paddr/size/data) so a cross-cache-line
+      // frame-word push can be inspected directly. Zero cost unless PORTED_TRACE_EXC
+      // is set.
+      if (sys.env.contains("PORTED_TRACE_EXC")) {
+        var trCyc = 0
+        cd.onSamplings {
+          trCyc += 1
+          if (dut.rob.logic.exc.dcStore.valid.toBoolean) {
+            val p = dut.rob.logic.exc.dcStore.payload
+            println(f"[exctrace] DCSTORE cyc=$trCyc%6d paddr=0x${p.paddr.toLong & 0xffffffffL}%08x " +
+              f"size=${p.size.toEnum} data=0x${p.data.toLong & 0xffffffffL}%08x useStrb=${p.useStrb.toBoolean} " +
+              f"strb=0x${p.strb.toLong & 0xffffL}%04x")
+          }
+          if (dut.dcache.logic.loadCmdPort.valid.toBoolean && dut.dcache.logic.loadCmdPort.ready.toBoolean) {
+            val c = dut.dcache.logic.loadCmdPort.payload
+            println(f"[exctrace] LOADCMD cyc=$trCyc%6d vaddr=0x${c.vaddr.toLong & 0xffffffffL}%08x " +
+              f"paddr=0x${c.paddr.toLong & 0xffffffffL}%08x size=${c.size.toEnum}")
+          }
+          if (dut.dcache.logic.loadRspPort.valid.toBoolean) {
+            val r = dut.dcache.logic.loadRspPort.payload
+            println(f"[exctrace] LOADRSP cyc=$trCyc%6d data=0x${r.data.toLong & 0xffffffffL}%08x fault=${r.fault.toBoolean}")
+          }
+          if (dut.rob.logic.exc.redirectValid.toBoolean) {
+            println(f"[exctrace] EXCREDIRECT cyc=$trCyc%6d pc=0x${dut.rob.logic.exc.redirectPc.toLong & 0xffffffffL}%08x")
+          }
+        }
+      }
+
       var cyc = 0L
       var word = 0L
       while (word == 0 && cyc < timeoutCycles) {
@@ -168,6 +198,12 @@ object PortedTestRunner {
         val b2 = dmem.mem.read(SentinelAddr + 2).toLong & 0xffL
         val b3 = dmem.mem.read(SentinelAddr + 3).toLong & 0xffL
         word = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+      }
+      if (sys.env.contains("PORTED_TRACE_EXC")) {
+        for (a <- 0xFFF0L to 0x10010L) {
+          val v = dmem.mem.read(a).toLong & 0xffL
+          println(f"[exctrace] MEM 0x$a%08x = 0x$v%02x")
+        }
       }
       outcome =
         if (word == 0) PortedHang(cyc)
