@@ -874,6 +874,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // far). Distinguish register-direct (Dn=000/An=001 mode) from everything else.
     val ucMoveDstModeIsReg = ucIsMove && ((ucEopw(8 downto 6) === B"000") || (ucEopw(8 downto 6) === B"001"))
     val ucMoveSrcModeIsReg = ucIsMove && ((ucEopw(5 downto 3) === B"000") || (ucEopw(5 downto 3) === B"001"))
+    // MOVE #imm,<mem-indirect-dst> (task #156, ported-tests memind cluster): mode7/reg4
+    // (#imm) is neither register-direct nor a readable memory EA -- it must NOT fall into
+    // ucMoveDstMiEaEa below (which assumes the "other" side is a plain MEMORY location to
+    // LOAD from; MI_MOVE_EAEA_REV's g1 row would read garbage at whatever address the
+    // immediate's raw BITS happened to decode as). It needs the SAME treatment as a
+    // register source (MI_MOVE_DST_ENTRY, store-only, "other" value fed via
+    // miOtherIsImm/miHostImm — already built for the line-0-imm/ADDQ families).
+    val ucMoveSrcIsImm = ucIsMove && (ucEopw(5 downto 3) === B"111") && (ucEopw(2 downto 0) === B"100")
     val ucMoveSrcMiEaEa = ucMoveSrcMi && !ucMoveDstModeIsReg && !ucMoveDstMi  // src=MI, dst=plain memory
     // dst=MI, src=plain memory (the MIRROR direction): a `MI_MOVE_EAEA_REV_ENTRY` chain
     // exists in the ROM for this shape. Previously left unwired ("store lands at the
@@ -885,8 +893,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // shifted-words decode regardless of direction, and ucMiOtherEa's Mux already
     // selects ucMiSrcEa (the plain side) when ucMoveDstMiEaEa is true — both were
     // already correct, just never wired live. Verified via move_l_abs_memind_dst.s
-    // (abs-src -> memind-dst no-index): now PASSes.
-    val ucMoveDstMiEaEa = ucMoveDstMi && !ucMoveSrcModeIsReg && !ucMoveSrcMi
+    // (abs-src -> memind-dst no-index): now PASSes. `!ucMoveSrcIsImm` (task #156) excludes
+    // the immediate-source shape (see its own comment above) — that falls through to the
+    // register-source entry (MI_MOVE_DST_ENTRY) below instead.
+    val ucMoveDstMiEaEa = ucMoveDstMi && !ucMoveSrcModeIsReg && !ucMoveSrcMi && !ucMoveSrcIsImm
     val ucMoveBothMi    = ucMoveSrcMi && ucMoveDstMi   // both sides mem-indirect -> scoped-out illegal (below)
     // (ucMoveDstMiEaEa/ucMoveSrcMiEaEa/ucMoveBothMi are already simPublic'd further
     // below, in the existing "debug-only observability (task #139...)" block.)
@@ -1046,14 +1056,20 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.miIsRmw      := (ucImmDstMi || ucSingleMi || ucAluDstMi || ucAddqSubqMi) && !ucMiFlagsOnly
     ucEntryCtx.miOther      := ucMiOtherReg
     ucEntryCtx.miOtherValid := ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || (ucImmDstMi && !ucIsSingleEa)
-    ucEntryCtx.miOtherIsImm := ucImmDstMi || ucAddqSubqMi
+    // MOVE #imm,<mem-indirect-dst> (task #156): the "other" side is the literal immediate,
+    // not a register -- same miOtherIsImm/miHostImm feed as the line-0-imm/ADDQ families.
+    val ucMoveDstMiImm = ucMoveDstMi && ucMoveSrcIsImm
+    ucEntryCtx.miOtherIsImm := ucImmDstMi || ucAddqSubqMi || ucMoveDstMiImm
     // The line-0 immediate VALUE precedes the EA ext: words(1) (.B/.W, sign-extended) or
     // words(1)##words(2) (.L). ADDQ/SUBQ's immediate is instead the 3-bit quick field
-    // (op[11:9], 0 means 8) carried directly in the opword, no ext word. (Only consumed
-    // when miOtherIsImm.)
+    // (op[11:9], 0 means 8) carried directly in the opword, no ext word. MOVE's #imm
+    // source sits at words(1)[..2] too (it's MOVE's FIRST ext field, same position
+    // `eaWordCount`'s mode7/reg4 branch already assumes for the dst-side word-count
+    // shift). (Only consumed when miOtherIsImm.)
     ucEntryCtx.miHostImm    := Mux(ucAddqSubqMi, ucAddqSubqImm,
-                                Mux(ucImmIsL, ucEntryPkt.words(1) ## ucEntryPkt.words(2),
-                                              ucEntryPkt.words(1).asSInt.resize(32).asBits))
+                                Mux(ucImmIsL || (ucMoveDstMiImm && ucEntrySpec.size === Size.LONG),
+                                    ucEntryPkt.words(1) ## ucEntryPkt.words(2),
+                                    ucEntryPkt.words(1).asSInt.resize(32).asBits))
     ucEntryCtx.miOtherIsDst := ucMoveSrcMi
     ucEntryCtx.miMovea      := ucMiMovea
     // Host op flag effects. All in-scope hosts (MOVE/ADD/SUB/AND/OR/EOR/CMP/CLR/NEG/NEGX/

@@ -311,17 +311,24 @@ object PredecodeWord {
         // word (sExt>=1, e.g. (d16,An)) silently forced dstEaW0=0, mis-framing a full-format
         // dest as brief (1 word) instead of its true 2-5 -> the aligner desynced from the
         // real instruction boundary (silent corruption, not a trap). Correct position:
-        //   sExt==0 -> op+1 = extW (still within classify()'s 2-word lookahead)
-        //   sExt==1 -> op+2 = extW2 (also within the 2-word lookahead)
-        //   sExt>=2 -> op+3.. : BEYOND classify()'s lookahead (the source is ITSELF
-        //     full-format, consuming 2+ ext words) — we cannot see that far, so we must NOT
-        //     guess; dstEaKnown=False routes this (rare: both EAs full-format) through the
-        //     eaWKnown gate below, which safely rejects (COMPLEX) rather than silently
-        //     assuming brief.
+        //   sExt==0 -> op+1 = extW  (2-word lookahead)
+        //   sExt==1 -> op+2 = extW2 (2-word lookahead)
+        //   sExt==2 -> op+3 = extW3 (task #155, ported-tests memind cluster: a source
+        //     consuming exactly 2 ext words -- abs.L, #imm.L -- combined with a
+        //     full-format dst, e.g. `MOVE.L (xxx).L,([bd.W,An],od.W)`; extW3 is the SAME
+        //     3rd lookahead word added for the line-0 .L-immediate case above, reused
+        //     here verbatim)
+        //   sExt>=3 -> op+4.. : STILL beyond even the 3-word lookahead (the source is
+        //     ITSELF full-format, consuming 3+ ext words) — we cannot see that far, so we
+        //     must NOT guess; dstEaKnown=False routes this (rare: both EAs full-format)
+        //     through the eaWKnown gate below, which safely rejects (COMPLEX) rather than
+        //     silently assuming brief.
         val dstEaW0    = Mux(sExt === U(0, 3 bits), extW,
-                          Mux(sExt === U(1, 3 bits), extW2, B(0, 16 bits)))
+                          Mux(sExt === U(1, 3 bits), extW2,
+                          Mux(sExt === U(2, 3 bits), extW3, B(0, 16 bits))))
         val dstEaKnown = Mux(sExt === U(0, 3 bits), extWKnown,
-                          Mux(sExt === U(1, 3 bits), extW2Known, False))
+                          Mux(sExt === U(1, 3 bits), extW2Known,
+                          Mux(sExt === U(2, 3 bits), extW3Known, False)))
         when(dstMode === U(7, 3 bits)) {
           switch(dstReg) {
             is(U(0, 3 bits)) { dExt := U(1, 3 bits) }
