@@ -352,6 +352,23 @@ object OperationDecoder {
           o.srcA := easrc; o.dst := easrc; o.dstWrites := True
           o.writesNzvc := True
         }
+        // NBCD Dn (0100 1000 00 000 rrr, op[15:3]==0b0100100000000): Dn := BCD(0-Dn-X)
+        // (register form ONLY -- memory-EA NBCD stays deferred/illegal, task #159; the
+        // 68k NBCD memory-dest RMW crack, like TAS-mem previously, needs its own
+        // predecode framing + assembler RMW-crack wiring, not attempted this slice).
+        // srcA=srcB=Dn (EASRC, mode 000 -> DATAREG -> both read the SAME register): srcA
+        // is the .B-merge upper-24 source (sizeMerged always reads s1Src1), srcB supplies
+        // the "dy" operand the SBCD datapath subtracts. AluEuPlugin forces the SBCD
+        // formula's "dx" (normally s1Src1, Dx) to the constant 0 when op==NBCD, reusing
+        // the bcdSub=True (subtract) cone verbatim otherwise. Flags mirror SBCD exactly.
+        when(opword(15 downto 3) === B"13'b0100100000000") {
+          o.illegal := False
+          o.op := DecOp.NBCD; o.size := Size.BYTE
+          o.srcA := easrc; o.srcB := easrc; o.dst := easrc; o.dstWrites := True
+          o.bcdSub := True
+          o.writesNzvc := True; o.writesX := True
+          o.readsX := True; o.readsNzvc := True
+        }
         // MOVEM (0100 1 d 001 s mmmrrr) + 16-bit register-mask ext word: bit11=1, bit10=d
         // (0 store / 1 load), bits 9:7=001, bit6=s (0 .W / 1 .L). The DecodeStage micro-
         // sequencer FSM owns the µop emission (reads movem/movemDir/movemSizeLong + the EA

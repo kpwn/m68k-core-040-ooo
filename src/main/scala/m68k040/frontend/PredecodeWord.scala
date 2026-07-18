@@ -492,7 +492,10 @@ object PredecodeWord {
         val isExtL  = op(15 downto 3) === B"13'b0100100011000"   // 0x48C0-C7
         val isExtbL = op(15 downto 3) === B"13'b0100100111000"   // 0x49C0-C7
         val isTas   = op(15 downto 3) === B"13'b0100101011000"   // 0x4AC0-C7
-        when(isUnaryArith || isSwap || isExtW || isExtL || isExtbL || isTas) {
+        // NBCD Dn (0x4800-07, task #159): register form only (memory-EA NBCD stays
+        // deferred/illegal -- no memDestExt framing added, unlike TAS-mem above).
+        val isNbcd  = op(15 downto 3) === B"13'b0100100000000"   // 0x4800-07
+        when(isUnaryArith || isSwap || isExtW || isExtL || isExtbL || isTas || isNbcd) {
           r.simple   := True
           r.lenWords := U(1, 4 bits)
         }

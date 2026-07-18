@@ -46,6 +46,16 @@ object DecOp extends SpinalEnum {
       // N=res[7] and V=bit7(~rawLoSum & res) are computed to MATCH Musashi (officially
       // "undefined" but the full-CCR lock-step compares them). Routed to the ALU EU.
       BCD,
+      // NBCD Dn (negate packed-BCD, register form ONLY -- memory-EA NBCD stays deferred/
+      // illegal, task #159). Dn := BCD(0 - Dn - X); reuses the SBCD (subtract) formula
+      // with the minuend forced to 0 in the ALU datapath (AluEuPlugin: `dx := 0` when
+      // isNbcd), while srcA=srcB=Dn (EASRC, same register read twice: srcA supplies the
+      // .B-merge upper-24 AND the "dy" subtrahend via srcB) so the merge still preserves
+      // Dn[31:8]. Trivial case (Dn[7:0]==0 && X==0): result unchanged, X=C=V=0, Z sticky-
+      // preserved (falls out of the SBCD formula/clear-only-Z rule automatically, no
+      // special-casing needed). Flags: readsX/readsNzvc (old Z) + writesNzvc/writesX,
+      // exactly like SBCD.
+      NBCD,
       // Bit op (BTST/BCHG/BCLR/BSET): tests bit n -> Z = complement of that bit; all
       // but BTST then set/clear/toggle it. The op carries `bitOp` (tt: 00 BTST, 01
       // BCHG, 10 BCLR, 11 BSET). Bit number = the immediate (static, useImm) or srcB=Dn

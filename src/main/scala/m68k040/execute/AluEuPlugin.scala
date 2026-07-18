@@ -216,8 +216,13 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // pre-masking — the un-masked intermediate is what the C compares). Widths are kept
     // at Musashi's 32 bits deliberately (the lock-step is the arbiter; not hand-narrowed).
     //   dx = s1Src1[7:0] (the dst byte), dy = s1Src2[7:0] (the source byte), xin = old X.
-    val isBcd = u1.op === DecOp.BCD
-    val dx    = s1Src1(7 downto 0).asUInt
+    // NBCD (task #159) reuses this SAME cone (bcdSub=True, the subtract formula) with
+    // `dx` forced to the constant 0 (Musashi: res = 0 - dst - X): srcA still carries Dn
+    // (for the .B-merge upper-24 preserve via s1Src1) and srcB also carries Dn (dy), but
+    // the "dx" operand position in the formula is overridden to 0 regardless of s1Src1.
+    val isNbcd = u1.op === DecOp.NBCD
+    val isBcd = u1.op === DecOp.BCD || isNbcd
+    val dx    = Mux(isNbcd, U(0, 8 bits), s1Src1(7 downto 0).asUInt)
     val dy    = s1Src2(7 downto 0).asUInt
     val xin   = s1X.asUInt                                   // 0/1
     val dxLo  = dx(3 downto 0).resize(32)                    // LOW_NIBBLE(dst)
