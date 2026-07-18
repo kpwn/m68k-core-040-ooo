@@ -543,6 +543,19 @@ object PredecodeWord {
             r.lenWords := (U(1, 3 bits) + mext).resized
           }
         }
+        // TST.W/TST.L An (68020+, task #170-cluster10): mode=001 (An-direct) is a
+        // legal TST operand for WORD/LONG only (TST.B An stays illegal, matching
+        // real silicon -- byte-size address-register operands are never legal).
+        // Unlike CLR/NEG/NEGX/NOT (which need an alterable dst and correctly
+        // reject An via memDestExt's missing mode==1 case), TST never writes back,
+        // so An is fine here. Register-direct -> 0 ext words, same as the Dn form
+        // isUnaryArith already frames above.
+        val isTstAn = !op(8) && (u4ss =/= U(3, 2 bits)) && (u4ss =/= U(0, 2 bits)) &&
+                      (u4mode === U(1, 3 bits)) && (u4o === U(0xA, 4 bits))
+        when(isTstAn) {
+          r.simple   := True
+          r.lenWords := U(1, 4 bits)
+        }
         // TAS <ea> mem-dest (task #158): op[15:6]==0b0100101011, mode != 000 (mode=000 is
         // the Dn form, already matched by `isTas` above). Opword + EA ext, same shape as
         // isUnaryMem but keyed off the full fixed opcode (not o4/ss, which collide with

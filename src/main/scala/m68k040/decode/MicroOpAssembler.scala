@@ -1090,10 +1090,17 @@ object MicroOpAssembler {
     val addqMemBad = (spec.srcB.kind === OperandKind.IMMQ3) &&
                      (srcEa.klass =/= EaClass.DATAREG) && (srcEa.klass =/= EaClass.ADDRREG) &&
                      (srcEa.klass =/= EaClass.MEMSIMPLE)
+    // TST.W/TST.L An (68020+, task #170-cluster10): TST never writes back, so an
+    // address-register-direct EA is architecturally legal (unlike CLR/NEG/NEGX/NOT,
+    // which need an alterable dst and correctly reject An) -- for WORD/LONG only;
+    // TST.B An stays illegal (matches real silicon, no byte-size An operand exists).
+    // Mirrors the existing `addqAddrDst`/`addqMemBad` ADDRREG-whitelist precedent.
+    val isTstAn = (spec.op === DecOp.TST) && (srcEa.klass === EaClass.ADDRREG) &&
+                  (spec.size =/= Size.BYTE)
     // Line-4 unary (CLR/NEG/NEGX/NOT/TST/TAS/SWAP/EXT): DATA-register OR (CLR/NEG/NEGX/
     // NOT/TST/TAS) a MEMSIMPLE EA (the RMW crack). SWAP/EXT are Dn-only -> a non-data-reg
-    // EA there stays illegal. An / #imm / MEMCOMPLEX always illegal.
-    val line4UnaryMemBad = isLine4Unary && (srcEa.klass =/= EaClass.DATAREG) &&
+    // EA there stays illegal. An / #imm / MEMCOMPLEX always illegal (except TST.W/.L An).
+    val line4UnaryMemBad = isLine4Unary && (srcEa.klass =/= EaClass.DATAREG) && !isTstAn &&
                            !(rmwOpInScope && (srcEa.klass === EaClass.MEMSIMPLE))
     // Line-0 immediate (srcB = IMMEXT): the EA (op[5:0]) is the DESTINATION. DATA-register
     // OR a MEMSIMPLE EA (the RMW crack); An / #imm / MEMCOMPLEX stay illegal. The to-CCR
