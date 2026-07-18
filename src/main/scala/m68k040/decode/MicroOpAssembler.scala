@@ -312,6 +312,73 @@ object MicroOpAssembler {
     val dstEa = EaSpec()
   }
 
+  // ── MOVE dst-EA extension-word SHIFT (task #164) ───────────────────────────────
+  // Plain MOVE.B/.W/.L is the ONLY op family whose `dst.kind === OperandKind.EADST`
+  // (OperationDecoder.scala's sole `o.dst := eadst` site, MOVE opcode lines 0x1-0x3) --
+  // i.e. the only op with TWO independent EA operands. The encoding's extension-word
+  // ORDER is always src-then-dst, so the dst's own ext word(s) do NOT unconditionally
+  // start at words(1) -- they start wherever the SOURCE EA's own ext words end. Both
+  // `computeOffload` and the standalone `assemble` fallback below decoded `dstEa`
+  // directly against the raw, UNSHIFTED `pkt.words`, which only happened to be correct
+  // when the source consumed 0 ext words (Dn/An/(An)/(An)+/-(An) sources -- the only
+  // shapes covered by the pilot MOVE tests). Any MOVE whose source has its OWN ext
+  // word(s) -- (d16,An)/(d16,PC)/abs.W/abs.L/#imm/(d8,An,Xn) brief-or-full -- silently
+  // misread the dst's disp/index from the SOURCE's own ext word instead, corrupting
+  // the computed destination address (root cause of the movel_mem_to_mem /
+  // move_abs_mem_to_abs / move_l_full_src_d16_dst / move_idx_idx / etc. failure
+  // cluster -- ported-tests triage, cluster 8). Mirrors DecodeStage.scala's
+  // `eaWordCount`/`miEaWordCount` (task #119), duplicated here (not shared -- that
+  // copy is scoped to the µcode engine's `ucEntryPkt`, a distinct packet binding)
+  // against a generic `words: Vec[Bits]`. A no-op (shift=0) for every register-direct
+  // source, so this is a strict, backward-compatible generalization matching #119's
+  // own precedent, not a new special case.
+  private def miEaWordCountG(baseExtW: Bits): UInt = {
+    val bdSize    = baseExtW(5 downto 4).asUInt
+    val bdWords   = Mux(bdSize === U(2, 2 bits), U(1, 3 bits),
+                     Mux(bdSize === U(3, 2 bits), U(2, 3 bits), U(0, 3 bits)))
+    val odPresent = baseExtW(1)
+    val odLong    = baseExtW(0)
+    val odWords   = Mux(!odPresent, U(0, 3 bits), Mux(odLong, U(2, 3 bits), U(1, 3 bits)))
+    (U(1, 3 bits) + bdWords + odWords).resize(3)
+  }
+  private def srcEaWordCount(mode: UInt, reg: UInt, size: Size.C, words: Vec[Bits]): UInt = {
+    val n = UInt(3 bits); n := 0
+    switch(mode) {
+      is(U(5, 3 bits)) { n := 1 }                                  // (d16,An)
+      is(U(6, 3 bits)) {                                           // (d8,An,Xn) brief / full-format
+        when(words(1)(8)) { n := miEaWordCountG(words(1)) }
+          .otherwise { n := 1 }
+      }
+      is(U(7, 3 bits)) {
+        switch(reg) {
+          is(U(0, 3 bits)) { n := 1 }   // (xxx).W
+          is(U(1, 3 bits)) { n := 2 }   // (xxx).L
+          is(U(2, 3 bits)) { n := 1 }   // (d16,PC)
+          is(U(3, 3 bits)) {            // (d8,PC,Xn) brief / full-format
+            when(words(1)(8)) { n := miEaWordCountG(words(1)) }
+              .otherwise { n := 1 }
+          }
+          is(U(4, 3 bits)) { n := Mux(size === Size.LONG, U(2, 3 bits), U(1, 3 bits)) }  // #imm
+        }
+      }
+    }
+    n   // default 0: Dn/An/(An)/(An)+/-(An)
+  }
+  private def wordAtDynG(words: Vec[Bits], idx: UInt): Bits = {
+    val out = Bits(16 bits); out := B(0, 16 bits)
+    switch(idx) {
+      for (i <- 0 until words.length) { is(U(i, 5 bits)) { out := words(i) } }
+    }
+    out
+  }
+  // Shifted view for the dst-EA decode: index 0 unused (EaDecoder.decode never reads
+  // it), indices 1.. = words(1+shift, 2+shift, ...).
+  private def shiftedWordsFor(words: Vec[Bits], shift: UInt): Vec[Bits] =
+    Vec.tabulate(words.length) { i =>
+      if (i == 0) B(0, 16 bits)
+      else wordAtDynG(words, (U(i, 5 bits) + shift.resize(5)).resize(5))
+    }
+
   /** Compute the offload (spec + the two primary EAs) on the PRE-register packet.
     * Carried through the FetchAlign->Decode register; `assemble` then reads it instead
     * of re-running OperationDecoder + the two EaDecoders on the registered opword. */
@@ -320,7 +387,9 @@ object MicroOpAssembler {
     o.spec := OperationDecoder.decode(pkt.words(0))
     o.srcEa := EaDecoder.decode(pkt.words(0)(5 downto 0), o.spec.size, pkt.words)
     val dstEaField = pkt.words(0)(8 downto 6) ## pkt.words(0)(11 downto 9)
-    o.dstEa := EaDecoder.decode(dstEaField, o.spec.size, pkt.words)
+    val dstShift = srcEaWordCount(pkt.words(0)(5 downto 3).asUInt, pkt.words(0)(2 downto 0).asUInt,
+                                   o.spec.size, pkt.words)
+    o.dstEa := EaDecoder.decode(dstEaField, o.spec.size, shiftedWordsFor(pkt.words, dstShift))
     o
   }
 
@@ -333,7 +402,9 @@ object MicroOpAssembler {
       o.spec := s
       o.srcEa := EaDecoder.decode(pkt.words(0)(5 downto 0), s.size, pkt.words)
       val dstEaField = pkt.words(0)(8 downto 6) ## pkt.words(0)(11 downto 9)
-      o.dstEa := EaDecoder.decode(dstEaField, s.size, pkt.words)
+      val dstShift = srcEaWordCount(pkt.words(0)(5 downto 3).asUInt, pkt.words(0)(2 downto 0).asUInt,
+                                     s.size, pkt.words)
+      o.dstEa := EaDecoder.decode(dstEaField, s.size, shiftedWordsFor(pkt.words, dstShift))
       o
     })
   def assemble(pkt: DecodePacket, offIn: Offload): AssembledUops = assembleImpl(pkt, Some(offIn))
