@@ -710,6 +710,8 @@ object Microcode {
     val miOd         = Bits(32 bits)     // outer displacement (added to the loaded pointer)
     val miPost       = Bool()            // True = post-index ([bd,An],Xn,od); index on the host access
     val miOp         = DecOp()           // the host op (MOVE/ADD/SUB/AND/OR/CMP/CLR/NEG/NOT/TST/...)
+    val miBitOp      = Bits(2 bits)      // BITOP sub-kind (op[7:6]): 00 BTST/01 BCHG/10 BCLR/11 BSET
+                                         // (only meaningful when miOp===DecOp.BITOP; task #152)
     val miHostSize   = Size()            // the host op access size (.B/.W/.L)
     val miIsDstEa    = Bool()            // the EA is the host op's DESTINATION (store/RMW) vs SOURCE (load)
     val miIsRmw      = Bool()            // dst-EA op that READS then WRITES the EA (imm op / CLR-family on mem)
@@ -1014,7 +1016,13 @@ object Microcode {
     // False -> the generic size-merge preserves the upper bits. A mem-indirect MOVEA
     // host op (ctx.miMovea, MI_MOVE_SRC with an An dst) likewise takes the moveaResult
     // path (.W sign-extend, full-32 An write). Default False for all others.
-    u.bitOp := 0; u.bfDynamic := Bool(d.bfDyn); u.extByte := False
+    // BITOP sub-kind: forced 0 (BTST, no-op result) for every OTHER microcode customer
+    // (bitOp is otherwise don't-care for them), but a real mem-indirect BCHG/BCLR/BSET
+    // MUST carry its actual tt through, else AluDatapath's bitRes mux always takes the
+    // BTST arm ("no change") regardless of the real op -- silently turning every
+    // mem-indirect BCHG/BCLR/BSET into a no-op store (task #152).
+    u.bitOp := Mux(ctx.miOp === DecOp.BITOP, ctx.miBitOp, B(0, 2 bits))
+    u.bfDynamic := Bool(d.bfDyn); u.extByte := False
     u.isMovea := (d.uop match {
       case UMovesRead => ctx.movesRnIsA
       case UMiHostOp  => ctx.miMovea

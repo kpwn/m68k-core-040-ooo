@@ -165,7 +165,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // ADDQ/SUBQ #n,<ea> (task #150 follow-up, mirrors s0IsAddqSubq/ucAddqSubqMi).
     val s1mi_isAddqSubq = slot1Spec0.srcB.kind === OperandKind.IMMQ3
     val s1mi_isImm = slot1Spec0.srcB.kind === OperandKind.IMMEXT
-    val s1mi_immL  = s1mi_opw(7 downto 6) === B"10"
+    // task #152: exclude the bit-op tt/.L-size field collision (see ucImmIsL's comment).
+    val s1mi_immL  = (slot1Spec0.op =/= DecOp.BITOP) && (s1mi_opw(7 downto 6) === B"10")
     val s1mi_immVec= Mux(s1mi_immL, Vec(s1mi_opw, s1mi_pkt.words(3), s1mi_pkt.words(4), s1mi_pkt.words(5)),
                                     Vec(s1mi_opw, s1mi_pkt.words(2), s1mi_pkt.words(3), s1mi_pkt.words(4)))
     val s1mi_immEa = EaDecoder.decode(s1mi_opw(5 downto 0), slot1Spec0.size, s1mi_immVec)
@@ -358,7 +359,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val s0IsSingleEa = (spec0.op === DecOp.CLR) || (spec0.op === DecOp.NEG) || (spec0.op === DecOp.NEGX) ||
                        (spec0.op === DecOp.NOT) || (spec0.op === DecOp.TST)
     val s0IsLineImm  = spec0.srcB.kind === OperandKind.IMMEXT
-    val s0ImmIsL     = s0opw(7 downto 6) === B"10"
+    // task #152: op[7:6] doubles as the bit-op tt sub-kind (BCLR=10 collides with the .L
+    // size encoding) -- see ucImmIsL's comment below for the full explanation. Excluded
+    // here too (this early gate is what decides engine entry in the first place).
+    val s0ImmIsL     = (spec0.op =/= DecOp.BITOP) && (s0opw(7 downto 6) === B"10")
     val s0ImmEaVec   = Mux(s0ImmIsL, Vec(s0opw, s0pkt.words(3), s0pkt.words(4), s0pkt.words(5)),
                                      Vec(s0opw, s0pkt.words(2), s0pkt.words(3), s0pkt.words(4)))
     val s0ImmEa      = EaDecoder.decode(s0opw(5 downto 0), spec0.size, s0ImmEaVec)
@@ -924,7 +928,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val ucAddqSubqImm = Mux(ucAddqSubqQuick === U(0, 3 bits), U(8, 32 bits), ucAddqSubqQuick.resize(32 bits)).asBits
     // line-0 immediate op dst-EA (ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea>): the immediate
     // PRECEDES the EA ext, so re-decode the EA from a SHIFTED window. immWords = .L?2:1.
-    val ucImmIsL   = ucEopw(7 downto 6) === B"10"
+    // op[7:6] is a SIZE field (ss) for ADDI/SUBI/.../CMPI, but the SAME bit position is the
+    // tt bit-op sub-kind (00 BTST/01 BCHG/10 BCLR/11 BSET) for a static bit op (task #152:
+    // an unguarded check here misfired "true" for BCLR (tt=10 happens to equal ss=.L),
+    // mis-shifting its EA re-decode and silently mis-detecting it as NOT mem-indirect --
+    // it fell through to the ordinary fast path instead of the µcode engine). A static bit
+    // op's immediate (the bit-number ext word) is ALWAYS exactly 1 word, so it can never be
+    // the .L-immediate shape -> unconditionally excluded here.
+    val ucImmIsL   = (ucEntrySpec.op =/= DecOp.BITOP) && (ucEopw(7 downto 6) === B"10")
     val ucImmWords = Mux(ucImmIsL, U(2, 3 bits), U(1, 3 bits))
     val ucImmEaVec = Mux(ucImmIsL, Vec(ucEopw, ucEntryPkt.words(3), ucEntryPkt.words(4), ucEntryPkt.words(5)),
                                    Vec(ucEopw, ucEntryPkt.words(2), ucEntryPkt.words(3), ucEntryPkt.words(4)))
@@ -971,7 +982,13 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // CMPI / TST -> flags-only (no store). The op writes NZVC and (ADD/SUB/NEG/NEGX) X.
     val ucMiOpIsCmp = ucEntrySpec.op === DecOp.CMP
     val ucMiOpIsTst = ucEntrySpec.op === DecOp.TST
-    val ucMiFlagsOnly = ucMiOpIsCmp || ucMiOpIsTst
+    // BTST (BITOP tt==00) is ALSO flags-only -- it tests but never writes memory (unlike
+    // BCHG/BCLR/BSET, tt 01/10/11, which are real RMW). Task #152 follow-up: without this,
+    // BTST via the mem-indirect engine still issued a (harmless but real, non-architectural)
+    // store of the read-back-unchanged value through MI_RMW_ENTRY.
+    val ucIsBitOp   = ucEntrySpec.op === DecOp.BITOP
+    val ucMiOpIsBtst = ucIsBitOp && (ucEopw(7 downto 6) === B"00")
+    val ucMiFlagsOnly = ucMiOpIsCmp || ucMiOpIsTst || ucMiOpIsBtst
     // Entry select: both-MI (illegal) / EA<->EA (task #119) / MOVE-src / MOVE-dst / ALU-src /
     // imm-RMW (or FLAGS) / single-EA RMW (or FLAGS). The EA<->EA + both-MI checks are
     // strictly narrower subsets of ucMoveSrcMi/ucMoveDstMi, so placing them FIRST in the
@@ -1000,7 +1017,21 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.miOd         := ucMiEa.od
     ucEntryCtx.miPost       := ucMiEa.memPost
     ucEntryCtx.miOp         := ucEntrySpec.op
-    ucEntryCtx.miHostSize   := ucEntrySpec.size
+    // BITOP (BTST/BCHG/BCLR/BSET) tt sub-kind (task #152): OperationDecoder carries it as
+    // opword[7:6] regardless of static/dynamic form (see OperationDecoder.scala's `tt`),
+    // so it can be read directly off the opword here without any static/dynamic split.
+    ucEntryCtx.miBitOp      := ucEopw(7 downto 6)
+    // BITOP's size is dest-dependent (Dn -> LONG mod32, memory -> BYTE mod8) and
+    // OperationDecoder deliberately leaves spec.size at its unrelated default (the bit-op
+    // opword has no size field -- op[7:6] is the tt sub-kind) for the fast-path assembler
+    // to resolve (MicroOpAssembler.scala's `bitOpSize`). The mem-indirect entry here reads
+    // ucEntrySpec.size directly and never went through that resolution -- every mem-indirect
+    // BITOP host access always targets MEMORY (the EA classified MEMINDIRECT), so BYTE is
+    // unconditionally correct here (task #152; mirrors bitOpSize's `bitOpIsMem` case).
+    // Without this, the host load over-read into ADJACENT memory (wrong size), and because
+    // 68k is big-endian the loaded temp's low-order bits came from the WRONG byte -- the
+    // subsequent bit-test/mask read a stale neighbor byte instead of the real target.
+    ucEntryCtx.miHostSize   := Mux(ucIsBitOp, Size.BYTE, ucEntrySpec.size)
     ucEntryCtx.miIsDstEa    := ucMoveDstMi || ucImmDstMi || ucSingleMi || ucAluDstMi || ucAddqSubqMi
     ucEntryCtx.miIsRmw      := (ucImmDstMi || ucSingleMi || ucAluDstMi || ucAddqSubqMi) && !ucMiFlagsOnly
     ucEntryCtx.miOther      := ucMiOtherReg
