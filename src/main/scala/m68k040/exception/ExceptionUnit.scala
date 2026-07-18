@@ -816,15 +816,20 @@ class ExceptionUnit(
             sysRegWritePhys  := sysCapDstPhys
             // Rc id: VBR=0x801, USP=0x800, SFC=0x000, DFC=0x001 (3-bit, zero-extended),
             // CACR=0x002 (RAZ), TCR=0x003 (E bit only — bit 15; P/page-size + other
-            // bits RAZ, this core is 4K-pages-only, task #131), URP=0x806, SRP=0x807.
-            // SFC/DFC are real 3-bit committed regs (Musashi reads them zero-extended;
-            // round-trips with the write below). ITT0/ITT1/DTT0/DTT1/MSP/ISP are NOT
-            // modeled (RAZ via default) — deferred, no transparent-translation windows
-            // or MOVEC-direct MSP/ISP access yet (MSP/ISP banking itself works via the
-            // S/M-bit A7 Mux, just not as separately MOVEC-addressable regs).
+            // bits RAZ, this core is 4K-pages-only, task #131), URP=0x806, SRP=0x807,
+            // MSP=0x803, ISP=0x804 (task #170-cluster10: MSP/ISP banking itself already
+            // works via the S/M-bit A7 Mux -- ss.msp/ss.isp ARE the real committed
+            // registers backing it -- but they were not yet separately MOVEC-addressable;
+            // exposing them here is a direct passthrough to those same registers, no new
+            // storage). SFC/DFC are real 3-bit committed regs (Musashi reads them
+            // zero-extended; round-trips with the write below). ITT0/ITT1/DTT0/DTT1 are
+            // NOT modeled (RAZ via default) — deferred, no transparent-translation
+            // windows yet.
             sysRegWriteData  := sysCapRc.mux(
               U(0x801, 12 bits) -> ss.vbr,
               U(0x800, 12 bits) -> ss.usp,
+              U(0x803, 12 bits) -> ss.msp,
+              U(0x804, 12 bits) -> ss.isp,
               U(0x000, 12 bits) -> ss.sfc.resize(32),
               U(0x001, 12 bits) -> ss.dfc.resize(32),
               U(0x003, 12 bits) -> Mux(mmuCtrl.mmuEnable, U(0x8000, 32 bits), U(0, 32 bits)),
@@ -847,6 +852,13 @@ class ExceptionUnit(
               // so it doesn't share the sim-poke-persistence regression risk that got
               // task #131's TCR/URP/SRP write mechanism reverted.
               is(U(0x002, 12 bits)) { ss.setCacr.valid := True; ss.setCacr.payload := sysCapVal.asUInt }
+              // MSP (0x803) / ISP (0x804), task #170-cluster10: direct writes to the
+              // SAME committed registers the S/M-bit A7 Mux already reads (ss.msp/
+              // ss.isp) — no new storage, this is purely exposing the existing bank
+              // registers as MOVEC-addressable. Low regression risk (unlike TCR/URP/
+              // SRP below): nothing outside SystemState's own A7 Mux consumes these.
+              is(U(0x803, 12 bits)) { ss.setMsp.valid := True; ss.setMsp.payload := sysCapVal.asUInt }
+              is(U(0x804, 12 bits)) { ss.setIsp.valid := True; ss.setIsp.payload := sysCapVal.asUInt }
               // TCR (0x003) / URP (0x806) / SRP (0x807) / other: WI (write-ignored,
               // RAZ-WI). Real-write support was ATTEMPTED (task #131) and REVERTED
               // after a confirmed sim-poke-persistence regression — see
