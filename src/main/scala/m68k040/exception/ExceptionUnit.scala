@@ -180,6 +180,20 @@ class ExceptionUnit(
   val sysCapPc      = Reg(UInt(32 bits))
   val sysCapNextPc  = Reg(UInt(32 bits))
 
+  // RTE-own-PC, captured at rteTrigger (task #177): `rtePc` aliases a LIVE ROB
+  // signal (pcStore(h0)) indexed by the head pointer. The RTE FSM is multi-cycle
+  // (IDLE -rteTrigger-> R_DRAIN -> ... -> the format-check state that actually
+  // consumes rtePc, many cycles later). While the FSM runs, `excSquash` (asserted
+  // every cycle once `exc.active`) forces the ROB's `tail := head` every cycle, so
+  // any younger speculative µop the front-end allocates in the meantime reuses the
+  // SAME physical ROB slot h0 still points at -- silently overwriting pcStore(h0)
+  // with a DIFFERENT (soon-to-be-squashed) instruction's PC before the format-error
+  // path ever reads it. Reading the live `rtePc` wire late (as the format-error path
+  // used to) therefore returns garbage, not RTE's own PC -- it must be LATCHED here,
+  // on the SAME cycle rteTrigger fires (before excActive/excSquash starts reusing
+  // the slot), exactly like sysCapPc is latched at sysTrigger below.
+  val rteCapPc = Reg(UInt(32 bits))
+
   // RTE pop accumulators
   val popSr = Reg(UInt(16 bits))
   val popPc = Reg(UInt(32 bits))
@@ -499,6 +513,9 @@ class ExceptionUnit(
         // reading garbage SR/PC/format from the wrong stack address — a wild-PC hang.
         // Route through R_DRAIN first (mirrors E_DRAIN) to wait for the SQ to drain
         // and recompute frameBase from the SETTLED bank.
+        // Task #177: latch RTE's own PC NOW (this cycle, before excActive/excSquash
+        // starts reusing the ROB slot h0 still points at — see rteCapPc's comment).
+        rteCapPc := rtePc
         goto(R_DRAIN)
       } elsewhen(sysTrigger) {
         // Commit-time SYSTEM op (supervisor; the user-mode case is a vector-8 fault via
@@ -717,12 +734,17 @@ class ExceptionUnit(
           // path unchanged (mirrors the IDLE->entryTrigger setup above, specialized to
           // a non-interrupt/non-$7/non-$2/non-throwaway format-$0 case).
           curVec       := U(14, 8 bits)
-          curPc        := rtePc
+          // Task #177: use the LATCHED rteCapPc (captured at rteTrigger), not the
+          // live `rtePc` wire — by this state (many cycles past rteTrigger) the ROB
+          // slot h0 pointed at has been continuously reused by excSquash's per-cycle
+          // `tail := head`, so a late live read of `rtePc` no longer reflects RTE's
+          // own PC.
+          curPc        := rteCapPc
           curIs7       := False
           curIs2       := False
           curIsInt     := False
           curLevel     := U(0, 3 bits)
-          curPpc       := rtePc
+          curPpc       := rteCapPc
           curFault     := U(0, 32 bits)
           curThrowaway := False
           stFrame2     := False

@@ -782,7 +782,13 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // PC. pcStore(h0) holds the instruction PC (variable-length safe; entryPc-2 only
       // worked for the 2-byte TRAPV). Interrupts ignore entryPpc (format-$0).
       entryPpc     = pcStore(h0),
-      rteTrigger   = rteRetire,        rtePc        = p0.predNextPc,
+      // rtePc = the RTE instruction's OWN PC (task #177 fix; was p0.predNextPc = RTE's
+      // pc+length, i.e. the address AFTER RTE, which broke the format-error retry
+      // contract -- a vec-14 handler that patches the malformed frame and re-RTEs must
+      // land back ON the original RTE, not 2 bytes past it). RTE retires solely at h0
+      // (rteRetire is gated on isRteStore(h0)), so pcStore(h0) is RTE's own committed
+      // PC, mirroring entryPpc's pattern just above.
+      rteTrigger   = rteRetire,        rtePc        = pcStore(h0),
       committedCcr = ccrForException,
       // Access-fault (vector 2) extras for the format-$7 frame.
       entryFaultAddr = faultAddrStore(h0),
