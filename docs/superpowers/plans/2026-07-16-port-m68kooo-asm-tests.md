@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Vendor and run m68k-ooo's 766 no-interrupt-sweep directed asm tests against this core, via a new sentinel-based ScalaTest suite that reuses the existing fuzz-harness infrastructure.
+**Goal:** Vendor and run m68k-ooo's 766 no-interrupt-sweep directed asm tests (actual: 763) against this core, via a new sentinel-based ScalaTest suite that reuses the existing fuzz-harness infrastructure.
 
 **Architecture:** A shared `PortedTestRunner` object (compile-once DUT, mirroring `FuzzRunner`) assembles each vendored `.s` file with the existing `ProgramAssembler`, boots the DUT with the same sequence `FuzzLockStepSpec` already uses, and polls the backing `SparseMemory` for a write to `0xFFFF0000`. A data-driven `PortedM68kOooSpec` generates one named ScalaTest case per vendored file. A shared bash script vendors files from the sibling `m68k-ooo` checkout in either `--list` (pilot) or `--all` (bulk, idempotent) mode.
 
@@ -12,7 +12,7 @@
 
 - Load address: `0x40800000` (m68k-ooo's own convention; matches this project's `ProgramAssembler.DefaultLoadAddress` exactly — no translation).
 - Sentinel address: `0xFFFF0000`; PASS iff the written word equals `0xC0FFEE00`; any other write is FAIL; no write before timeout is HANG.
-- Only the 766 tests needing no `+ipl=` sweep are in scope (see spec: `docs/superpowers/specs/2026-07-16-port-m68kooo-asm-tests-design.md`). Never vendor a test whose `.args` contains `+ipl=` or any flag beyond `+timeout=`.
+- Only the 766 tests needing no `+ipl=` sweep are in scope (actual: 763; see spec: `docs/superpowers/specs/2026-07-16-port-m68kooo-asm-tests-design.md`). Never vendor a test whose `.args` contains `+ipl=` or any flag beyond `+timeout=`.
 - Every FAIL/HANG found is treated as a real bug in this core and triaged individually — no deferred-list import from m68k-ooo's own `deferred.txt`.
 - JVM discipline: one Verilator compile per JVM run (`lazy val compiled`), matching `FuzzRunner.compiled` — never re-compile per test.
 
@@ -495,7 +495,7 @@ Each fix gets its own commit, following the project's existing convention (one c
 ### Task 5: Bulk vendoring — remaining ~740 tests
 
 **Files:**
-- Create (via running the script): the remaining `src/test/resources/m68kooo-ported-tests/asm/*.s` (+ `.timeout` sidecars) files, bringing the total to 766.
+- Create (via running the script): the remaining `src/test/resources/m68kooo-ported-tests/asm/*.s` (+ `.timeout` sidecars) files, bringing the total to 766 (actual: 763).
 
 **Interfaces:** none new — reuses Task 1's script and Task 3's suite (which already scans the whole directory dynamically).
 
@@ -514,13 +514,13 @@ Expected: ~740 `[OK]` lines (the 26 pilot names are skipped as already-vendored 
 ls src/test/resources/m68kooo-ported-tests/asm/*.s | wc -l
 ```
 
-Expected: `766`
+Expected: `766` (actual: 763)
 
 ```bash
 ls src/test/resources/m68kooo-ported-tests/asm/*.timeout | wc -l
 ```
 
-Expected: `36`
+Expected: `36` (actual: 30)
 
 - [ ] **Step 3: Commit**
 
@@ -606,7 +606,7 @@ free -g
 tools/fuzz/ported-sweep.sh 100
 ```
 
-Expected: 8 batches (766/100), each logged to `ported_logs/batch_*.log`. Given Task 4 already found and fixed the pilot's issues, most of the remaining 740 should pass, but treat any new FAIL/HANG exactly like Task 4 Steps 3-5 (own task, own investigation, own commit).
+Expected: 8 batches (766/100, actual: 763), each logged to `ported_logs/batch_*.log`. Given Task 4 already found and fixed the pilot's issues, most of the remaining 740 should pass, but treat any new FAIL/HANG exactly like Task 4 Steps 3-5 (own task, own investigation, own commit).
 
 - [ ] **Step 4: Record the final tally in project memory**
 

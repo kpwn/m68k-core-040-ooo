@@ -12,6 +12,7 @@ import scala.jdk.CollectionConverters._
   *   ~/sbt/bin/sbt "testOnly m68k040.fuzz.PortedM68kOooSpec"
   * Run one test:
   *   ~/sbt/bin/sbt "testOnly m68k040.fuzz.PortedM68kOooSpec -- -z neg_not"
+  * NOTE: -z is a substring filter, not an exact match — it may run multiple tests if the substring is a prefix of other test names.
   */
 class PortedM68kOooSpec extends AnyFunSuite {
   private val DefaultTimeoutCycles = 200000L

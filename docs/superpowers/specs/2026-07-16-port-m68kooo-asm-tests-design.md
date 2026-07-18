@@ -5,7 +5,7 @@
 Bring m68k-ooo's hand-authored directed test suite (`tb/tests/asm/`, 828 self-checking
 68040 assembly programs) into this project as an independent, additional verification
 corpus, complementary to the existing Musashi-lock-step and fuzz-campaign harnesses.
-This phase covers the 766 tests that need no interrupt-timing sweep; the remaining 62
+This phase covers the 766 tests (later verified as 763 — see docs/superpowers/ported-tests-results-2026-07-18.md) that need no interrupt-timing sweep; the remaining 62
 `+ipl=`-sweep/other-flag tests are explicitly out of scope, deferred to a future,
 separately-brainstormed phase.
 
@@ -29,14 +29,14 @@ Of the 828 tests, 98 have a companion `.args` file passing extra plusargs to m68
 C++ testbench. Auditing all 98:
 
 - 730 tests have no `.args` file at all (pure defaults).
-- 36 more have `.args` containing only `+timeout=<N>`.
+- 36 more have `.args` containing only `+timeout=<N>` (later verified as 30 — see docs/superpowers/ported-tests-results-2026-07-18.md).
 - 58 use `+ipl=<cycle>:<level>` — cycle-keyed interrupt injection, sometimes 500+
   injection points across one test, timeouts up to 50,000,000 cycles.
 - A handful use other flags: `+ddr_read_delay=`, `+post_sentinel_drain=`,
   `+divergence_check`, `+expect_dbl_fault`, `+nowaves`.
 
 **766 tests (730 + 36) need nothing beyond "assemble, boot, run until sentinel-write-or-
-timeout."** That's this phase's scope. The 62 IPL-sweep/other-flag tests need a
+timeout."** (Note: actual verified count is 763 total with 30 timeout sidecars, per ported-tests-results-2026-07-18.md.) That's this phase's scope. The 62 IPL-sweep/other-flag tests need a
 materially different mechanism (cycle-keyed interrupt injection, much larger timeout
 budgets) and are deferred to a separate design pass.
 
@@ -55,7 +55,7 @@ confirmed by grep. No conflict.
 
 ## Vendoring
 
-Copy the 766 target `.s` files into a new resource directory:
+Copy the 766 target `.s` files (actual verified count: 763) into a new resource directory:
 
 ```
 src/test/resources/m68kooo-ported-tests/asm/<name>.s
@@ -103,7 +103,7 @@ m68k-ooo's own testbench (`tb/tb_top.cpp:53`) falls back to 10,000,000 cycles wh
 on. Matching that number is the *correct*-by-fidelity default, but this project's Scala/
 SpinalSim `doSim` loop may have very different cycles/second throughput than m68k-ooo's
 native C++/Verilator harness — paying a 10M-cycle ceiling on every genuine hang could be
-expensive in aggregate across 766 tests. **The pilot's job includes measuring actual
+expensive in aggregate across 766 tests (actual: 763). **The pilot's job includes measuring actual
 cycles/second for this harness** and deciding whether the default needs scaling down
 (with the `.timeout` sidecar mechanism already in place to raise it back up for any
 specific test that genuinely needs the full 10M). Do not guess this number before the
@@ -114,7 +114,7 @@ the resource directory listing at suite-construction time — gives per-test PAS
 HANG visibility in sbt's own test reporter, matching both m68k-ooo's own one-test-per-
 corner-case convention and this project's `ExecuteLockStepSpec` convention.
 
-**Running the full set**: `testOnly` against all 766 generated cases in one JVM works
+**Running the full set**: `testOnly` against all 766 generated cases (actual: 763) in one JVM works
 (compile-once avoids the OOM issue), but for practical batching (progress visibility,
 resuming after an interruption) a `tools/fuzz/ported-sweep.sh` script will be added,
 matching `tools/fuzz/sweep.sh`'s existing batch-per-JVM convention.
