@@ -692,11 +692,46 @@ class ExceptionUnit(
         // top nibble selects the pop size: 7 => format-$7 (60 bytes), 2 => format-$2
         // (12 bytes), 1 => format-$1 throwaway (task #132, see below), else format-$0
         // (8 bytes).
+        val nib = dcLoadRsp.payload.data(15 downto 12).asUInt
+        // This core only ever STACKS formats $0/$1/$2/$7 (see frameWordData/fmtVecWord
+        // above) — any OTHER format nibble in a popped frame is malformed (hand-built,
+        // corrupted, or a format this core never produces) and real 68020+ silicon
+        // raises the format-error exception (vector 14) instead of blindly restoring
+        // SR/PC from it (task #170-cluster10; previously there was NO vector-14
+        // dispatch anywhere — a bad format nibble silently fell through to the
+        // format-$0 8-byte-pop default and mis-executed). Musashi/PRM semantics: the
+        // malformed frame is left UNTOUCHED on the stack (SR/PC are never applied from
+        // it), and a NEW format-$0 frame is pushed BELOW it for vector 14, with the
+        // saved PC = the address of the RTE instruction itself (so a vec-14 handler
+        // that patches the frame and RTEs again re-attempts the SAME original RTE).
         popFmtWord := dcLoadRsp.payload.data(15 downto 0).asUInt
-        popIs7 := dcLoadRsp.payload.data(15 downto 12).asUInt === U(7, 4 bits)
-        popIs2 := dcLoadRsp.payload.data(15 downto 12).asUInt === U(2, 4 bits)
-        popIs1 := dcLoadRsp.payload.data(15 downto 12).asUInt === U(1, 4 bits)
-        goto(R_REDIR)
+        popIs7 := nib === U(7, 4 bits)
+        popIs2 := nib === U(2, 4 bits)
+        popIs1 := nib === U(1, 4 bits)
+        val fmtOk = (nib === U(0, 4 bits)) || (nib === U(1, 4 bits)) ||
+                    (nib === U(2, 4 bits)) || (nib === U(7, 4 bits))
+        when(fmtOk) {
+          goto(R_REDIR)
+        } otherwise {
+          // Synthesize a vector-14 format-$0 ENTRY, reusing the normal E_* frame-push
+          // path unchanged (mirrors the IDLE->entryTrigger setup above, specialized to
+          // a non-interrupt/non-$7/non-$2/non-throwaway format-$0 case).
+          curVec       := U(14, 8 bits)
+          curPc        := rtePc
+          curIs7       := False
+          curIs2       := False
+          curIsInt     := False
+          curLevel     := U(0, 3 bits)
+          curPpc       := rtePc
+          curFault     := U(0, 32 bits)
+          curThrowaway := False
+          stFrame2     := False
+          oldSr        := (ss.srSys ## committedCcr.resize(8 bits)).asUInt
+          vecTarget    := (ss.vbr + (U(14, 8 bits) << 2)).resized
+          stStep       := 0
+          stSplitLow   := False
+          goto(E_DRAIN)
+        }
       }
     }
     R_REDIR.whenIsActive {
