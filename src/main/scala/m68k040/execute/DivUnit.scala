@@ -53,6 +53,9 @@ class DivUnit extends Component {
   // is held stable by the EU for the whole DIVING state, but latching mirrors the
   // existing sign-capture pattern and avoids depending on that assumption.
   val dvsrMagReg   = Reg(UInt(32 bits))
+  // Raw (pre-sign-normalize) 64-bit dividend, latched at start -- used ONLY by the
+  // L64 divide-by-(-1) erratum's exact-pattern check below (task #168).
+  val dividendReg  = Reg(UInt(64 bits))
 
   // Magnitudes: for signed, negate a negative operand. The dividend is a 64-bit
   // sign-extended value; the divisor is 32-bit sign-extended.
@@ -71,6 +74,7 @@ class DivUnit extends Component {
     signedReg    := io.signed
     formReg      := io.form
     dvsrMagReg   := dvsrMag
+    dividendReg  := io.dividend
   }
 
   io.busy      := core.io.busy
@@ -121,22 +125,45 @@ class DivUnit extends Component {
   val ovW   = overflowFor(16)
   val ovL   = overflowFor(32)
   // 68020+ DIVS.L/DIVU.L divide-by-(-1) erratum (documented real-silicon behavior,
-  // matched by Musashi -- our lock-step/whitebox oracle): dividing by exactly -1 in
-  // the 32-bit-quotient LONG divide form does NOT set V even when the mathematical
-  // result overflows (INT_MIN / -1 being the canonical case). Scoped to the LONG
-  // forms only -- the original .W 16-bit-quotient divide is not documented/tested as
-  // sharing this erratum. Ported-tests triage (divl_basic.s Test 5): without this,
-  // the overflow path's writeInt=False left the DIV's (and the trailing DIVREM's)
+  // matched by Musashi -- our lock-step/whitebox oracle, tools/musashi/musashi/
+  // m68kops.c m68k_op_divl_32_d): dividing by exactly -1 does NOT set V for one
+  // EXACT dividend pattern per form, even though the mathematical result overflows.
+  // Musashi's own source has TWO SEPARATE special cases with DIFFERENT dividend
+  // patterns -- this is NOT one blanket "any divisor==-1" rule:
+  //   L32 (32-bit dividend, BIT_A=0 path): `dividend_lo == 0x80000000` (i.e. the
+  //     32-bit dividend IS exactly INT32_MIN -- the only dividend for which a 32-bit
+  //     value divided by -1 can overflow at all, so this is equivalent to "any
+  //     signed L32 divide by -1").
+  //   L64 (64-bit dividend, BIT_A=1 path): `dividend_hi == 0 && dividend_lo ==
+  //     0x80000000` -- i.e. the RAW 64-bit dividend bit pattern is EXACTLY
+  //     0x00000000_80000000 (+2^31, NOT INT64_MIN = 0x80000000_00000000). This is a
+  //     narrow, essentially-arbitrary Musashi implementation quirk, NOT "any negative
+  //     divisor" -- unlike L32, a 64-bit dividend divided by -1 overflows for MANY
+  //     different dividend values (any |dividend| > 2^31-ish), and Musashi does NOT
+  //     suppress V for those -- only for this one exact pattern.
+  // Task #167 (ported-tests triage, divl_sz1_overflow.s Test 2) FIXED a regression
+  // from task #149's original fix: task #149 validated only the L32 case (divl_basic.s
+  // Test 5, dividend=INT32_MIN) and over-generalized the suppression to "any signed
+  // divisor==-1" for L64 too, which incorrectly ALSO suppressed V for INT64_MIN/-1 (a
+  // completely different dividend pattern that Musashi does NOT special-case) --
+  // silently producing a WRONG V=0 instead of the correct V=1. Ported-tests triage
+  // (divl_basic.s Test 5, task #149): without SOME suppression for the L32 case, the
+  // overflow path's writeInt=False left the DIV's (and the trailing DIVREM's)
   // destination physical register permanently not-ready in the scoreboard (no
   // wakeup ever fires for a register nothing ever writes), deadlocking the ROB head
   // on the very next consumer -- not a "hang in the divider" (DivCore is a fixed
   // 64-cycle iterator, always completes) but a downstream scoreboard-starvation hang
-  // caused by taking this overflow branch in a case Musashi does not.
+  // caused by taking this overflow branch in a case Musashi does not. (That hazard is
+  // now ALSO closed generally, independent of this erratum, via DIVREM's own real
+  // srcA=Dr fix -- see DivEuPlugin.scala's isDivRem branch -- so an L64 overflow that
+  // legitimately DOES set V, like INT64_MIN/-1, no longer deadlocks either.)
   val divisorIsNegOne = signedReg && signDivisor && (dvsrMagReg === U(1, 32 bits))
+  val l32DividendIsIntMin = dividendReg(31 downto 0) === U(0x80000000L, 32 bits)
+  val l64DividendIsExactPattern = dividendReg === U(0x80000000L, 64 bits)   // hi=0, lo=0x80000000
   io.overflow := formReg.mux(
     DivForm.W   -> ovW,
-    DivForm.L32 -> (ovL && !divisorIsNegOne),
-    DivForm.L64 -> (ovL && !divisorIsNegOne))
+    DivForm.L32 -> (ovL && !(divisorIsNegOne && l32DividendIsIntMin)),
+    DivForm.L64 -> (ovL && !(divisorIsNegOne && l64DividendIsExactPattern)))
 
   io.done := core.io.done
 }

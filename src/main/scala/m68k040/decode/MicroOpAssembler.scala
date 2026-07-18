@@ -1746,9 +1746,18 @@ object MicroOpAssembler {
     divlUop.srcCReg       := divlDr; divlUop.srcCValid := divl64
 
     // DIVREM (remainder-move) µop: CPLX, writes the DivEu's latched remainder to Dr.
-    // No real register source (the remainder is the DivEu's internal latch) -> it has
-    // an implicit dependency on the immediately-preceding DIV, enforced by age-ordered
-    // single-outstanding CPLX issue. It writes Dr; sets no flags.
+    // Task #168 (ported-tests triage, divl_sz1_overflow HANG): srcA = Dr's OLD value
+    // (a REAL register read, not the implicit-ordering-only placeholder this used to
+    // be) so that on a DIV overflow (V=1, both Dq/Dr architecturally UNCHANGED per the
+    // 68020+ PRM) DivEuPlugin can write Dr's old value back through instead of skipping
+    // the write entirely -- mirroring the DIV µop's own s1A/Dq overflow fix (task #149).
+    // Without a real srcA, "skip the write" left Dr's freshly-renamed pdst permanently
+    // not-ready (writeInt=False -> the scoreboard/wakeup never fires), deadlocking any
+    // later reader of Dr -- exactly task #149's own documented "KNOWN RESIDUAL GAP",
+    // now hit for real by a 64/32 SZ=1 overflow test (divl_sz1_overflow.s) where Dr
+    // (not just Dq) is preserved. The remainder itself (the non-overflow case) still
+    // comes from the DivEu's internal latch, not this register read -- srcA exists
+    // SOLELY to carry the old value through on the overflow path.
     val divremUop = DecodedUop()
     divremUop.valid         := pkt.valid
     divremUop.pc            := pkt.pc
