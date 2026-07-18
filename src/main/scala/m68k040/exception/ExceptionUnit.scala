@@ -346,6 +346,24 @@ class ExceptionUnit(
   //     [+0x14]=faultAddr hi [+0x16]=faultAddr lo [+0x18..0x3a]=0 (18 words).
   //   stStep counts WORDS (5 bits, 0..29). lastStep = 3 ($0) or 29 ($7).
   val stStep = Reg(UInt(5 bits)) init 0; stStep.simPublic()
+  // Task #163: a frame word can land at a D-cache LINE-relative offset of 15 (the
+  // last byte of a 16-byte line) whenever frameBase/frameBase2 is ODD-aligned such
+  // that (frameBase + step*2) & 0xF == 15 -- the WORD's second byte then belongs to
+  // the NEXT cache line entirely. `driveStoreNoXlate`'s plain {paddr,size} store
+  // path (DcachePlugin's non-useStrb DcacheByteLane.storeStrb/storeData) has NO
+  // cross-line-boundary handling (unlike the ordinary LsEuPlugin store path, which
+  // explicitly computes a two-access split for exactly this case) -- it silently
+  // DROPS the byte that would fall at offset 16 (storeStrb's `bits` array only spans
+  // indices 0..15, so a would-be index-16 strobe bit never gets set) while
+  // storeData's `out(off+1)` wraps a 4-bit index mod 16 back to offset 0 (harmless
+  // there ONLY because storeStrb correctly leaves that merged byte un-strobed).  Net
+  // effect: the crossing word's SECOND byte is never written -- neither into the
+  // cache nor the AXI write-through -- leaving stale memory content, discovered via
+  // exc_aline_odd_sp_mmu_dcache (frameBase=0xFFFD lands word[1]=PC[31:16] at line
+  // offset 15..16). FIX: when a frame word would cross, split it into two ordinary
+  // (non-crossing, single-byte) driveStoreNoXlate pushes instead of one WORD push.
+  // `stSplitLow` sequences the second (low) byte of a just-split word.
+  val stSplitLow = Reg(Bool()) init False
   // lastStep: curIs7/curIs2 are always False for an interrupt entry (never $7/$2),
   // so this already correctly reads 4 words (U(3)) for BOTH passes of a throwaway
   // entry (frame $0 then frame $1, each 8 bytes) — no stFrame2 dependency needed.
@@ -467,6 +485,7 @@ class ExceptionUnit(
         // compute vector fetch base = VBR + vec*4
         vecTarget := (ss.vbr + (entryVector << 2)).resized
         stStep    := 0
+        stSplitLow := False   // task #163: clear any split-word carry from a prior entry
         goto(E_DRAIN)
       } elsewhen(rteTrigger) {
         // RTE reads the frame at the CURRENT A7 (SSP). Do NOT capture frameBase yet —
@@ -527,7 +546,18 @@ class ExceptionUnit(
       // REGISTERED store every cycle -> the SAME word stored many times, a
       // nondeterministic count that races the cache store machine and corrupts the
       // frame). One cycle here -> exactly one registered store pulse.
-      driveStoreNoXlate(frameWordAddr(stStep), Size.WORD, frameWordData(stStep))
+      // Task #163: split a line-crossing word (line-relative offset 15) into two
+      // single-byte pushes — see stSplitLow's doc comment above.
+      val addr    = frameWordAddr(stStep)
+      val data    = frameWordData(stStep)
+      val crosses = addr(3 downto 0) === U(15, 4 bits)
+      when(stSplitLow) {
+        driveStoreNoXlate(addr + U(1, 32 bits), Size.BYTE, data(7 downto 0))
+      } elsewhen(crosses) {
+        driveStoreNoXlate(addr, Size.BYTE, data(15 downto 8))
+      } otherwise {
+        driveStoreNoXlate(addr, Size.WORD, data)
+      }
       goto(E_STWAIT)
     }
     E_STWAIT.whenIsActive {
@@ -539,17 +569,27 @@ class ExceptionUnit(
       // stAwDone/stWDone) could drop a beat. One idle cycle guarantees the machine
       // is idle before the next store.
       when(dcStoreAck) {
-        when(stStep === lastStep) {
-          // Task #132: after finishing frame $0 (stFrame2 still False), a throwaway
-          // entry loops back into E_STORE for the SECOND ($1) frame instead of
-          // proceeding to the vector fetch. frameWordAddr/fmtVecWord above already
-          // switch to frameBase2/format-1 once stFrame2 is True.
-          when(curThrowaway && !stFrame2) {
-            stFrame2 := True; stStep := 0; goto(E_STORE)
-          } otherwise {
-            goto(E_VECREQ)
-          }
-        } otherwise { stStep := stStep + 1; goto(E_STORE) }
+        val addr    = frameWordAddr(stStep)
+        val crosses = addr(3 downto 0) === U(15, 4 bits)
+        when(crosses && !stSplitLow) {
+          // Just issued the HIGH byte of a split word; issue the LOW byte next
+          // (same stStep, same frame word — do not advance).
+          stSplitLow := True
+          goto(E_STORE)
+        } otherwise {
+          stSplitLow := False
+          when(stStep === lastStep) {
+            // Task #132: after finishing frame $0 (stFrame2 still False), a throwaway
+            // entry loops back into E_STORE for the SECOND ($1) frame instead of
+            // proceeding to the vector fetch. frameWordAddr/fmtVecWord above already
+            // switch to frameBase2/format-1 once stFrame2 is True.
+            when(curThrowaway && !stFrame2) {
+              stFrame2 := True; stStep := 0; goto(E_STORE)
+            } otherwise {
+              goto(E_VECREQ)
+            }
+          } otherwise { stStep := stStep + 1; goto(E_STORE) }
+        }
       }
     }
     // ── ENTRY: fetch the handler vector ─────────────────────────────────────────
