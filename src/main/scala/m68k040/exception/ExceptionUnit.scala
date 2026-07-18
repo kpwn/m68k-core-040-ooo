@@ -392,6 +392,8 @@ class ExceptionUnit(
     val E_VECWAIT = new State    // await vector load rsp
     val E_REDIR   = new State    // pulse redirect, commit SSP/SR, done
     // RTE path
+    val R_DRAIN   = new State    // wait for the SQ to drain + the live-A7 readback to
+                                  // settle before capturing frameBase (mirrors E_DRAIN)
     val R_SRREQ   = new State    // load SR word @ base+0
     val R_SRWAIT  = new State
     val R_PCREQ   = new State    // load PC long @ base+2
@@ -467,9 +469,18 @@ class ExceptionUnit(
         stStep    := 0
         goto(E_DRAIN)
       } elsewhen(rteTrigger) {
-        // RTE reads the frame at the CURRENT A7 (SSP). frameBase := SSP.
-        frameBase := Mux(ss.m, ss.msp, ss.isp)   // RTE reads the current supervisor stack
-        goto(R_SRREQ)
+        // RTE reads the frame at the CURRENT A7 (SSP). Do NOT capture frameBase yet —
+        // ss.msp/ss.isp mirror the committed-A7 PRF readback with the SAME ~1-cycle
+        // settle latency the ENTRY path's E_DRAIN state exists to wait out (see its
+        // comment). An RTE whose immediately-preceding instruction is an ordinary
+        // renamed A7-modifying store (e.g. a hand-built frame pushed via `move -(%a7)`,
+        // as opposed to the exception FSM's OWN internal E_STORE writes, which apply
+        // synchronously and were therefore always already-settled by the time a LATER
+        // RTE observed them) would otherwise capture a STALE pre-push frameBase here,
+        // reading garbage SR/PC/format from the wrong stack address — a wild-PC hang.
+        // Route through R_DRAIN first (mirrors E_DRAIN) to wait for the SQ to drain
+        // and recompute frameBase from the SETTLED bank.
+        goto(R_DRAIN)
       } elsewhen(sysTrigger) {
         // Commit-time SYSTEM op (supervisor; the user-mode case is a vector-8 fault via
         // entryTrigger). Latch the captured context; apply next cycle.
@@ -597,6 +608,14 @@ class ExceptionUnit(
     }
 
     // ── RTE: pop the frame, restore SR + PC, SSP += 8, redirect ─────────────────
+    // Wait for older committed stores to fully drain (mirrors E_DRAIN) before reading
+    // the live supervisor-bank A7 for frameBase -- see the rteTrigger comment above.
+    R_DRAIN.whenIsActive {
+      when(sqDrained) {
+        frameBase := Mux(ss.m, ss.msp, ss.isp)   // RTE reads the SETTLED current supervisor stack
+        goto(R_SRREQ)
+      }
+    }
     R_SRREQ.whenIsActive {
       dtoVld := True; dtoVpn := (frameBase + 0)(31 downto 12)
       ldoVld := True; ldoVaddr := frameBase + 0; ldoSize := Size.WORD
