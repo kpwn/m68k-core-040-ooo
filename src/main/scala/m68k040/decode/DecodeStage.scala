@@ -1084,6 +1084,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.miOtherEaIndexLong  := ucMiOtherEa.indexLong
     ucEntryCtx.miOtherEaIndexScale := ucMiOtherEa.indexScale
     ucEntryCtx.miOtherEaDispLo     := ucMiOtherEa.disp
+    // (An)+/-(An) auto-update on the "other" side (task #154): EaDecoder already computes
+    // this correctly as part of the normal EaSpec decode, just never threaded into Ctx.
+    ucEntryCtx.miOtherEaAutoMode   := ucMiOtherEa.autoMode
+    ucEntryCtx.miOtherEaAutoDelta  := ucMiOtherEa.autoDelta
     // Pointer-load EA fields (reuse the bit-field EA infra). disp = bd (the EaSpec disp);
     // pcRel mem-indirect is rejected at decode (read-only EA), so no pc fold needed here.
     when(ucIsMemInd) {

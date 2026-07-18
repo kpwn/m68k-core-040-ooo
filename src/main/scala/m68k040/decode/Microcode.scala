@@ -127,6 +127,14 @@ object Microcode {
   // plain control modes (no An side effect) -> a harmless inert eaAuto.
   case object AEaCasLoad  extends Auto   // load: eaAuto from ctx, NO An write (dst = T0)
   case object AEaCasStore extends Auto   // store: eaAuto from ctx + An write-back (dst = eaBase)
+  // Mem-indirect EA<->EA "other" (plain) side auto-inc/dec (task #154): mirrors
+  // AEaCasLoad/Store but keyed to ctx.miOtherEaAutoMode/Delta + ctx.miOtherEaBase (the
+  // "other" side's OWN base register, distinct from ctx.eaBase which is reserved for the
+  // mem-indirect pointer). MI_MOVE_EAEA's STORE (other=dst, e.g. MOVE ([...]),-(A7)) uses
+  // AEaMiOtherStore; MI_MOVE_EAEA_REV's LOAD (other=src, e.g. MOVE -(A7),([...])) uses
+  // AEaMiOtherLoad. NONE for every other mem-indirect customer (a harmless inert eaAuto).
+  case object AEaMiOtherLoad  extends Auto   // load: eaAuto from ctx, NO An write (dst = T1)
+  case object AEaMiOtherStore extends Auto   // store: eaAuto from ctx + An write-back (dst = miOtherEaBase)
 
   /** Explicit µop size for a row (overrides the ctx-size default). The bit-field chain
     * rows are LONG (lo load/store, the compute) or BYTE (the hi spill-byte load/store);
@@ -609,27 +617,42 @@ object Microcode {
     //   f0 LOAD.L ptr -> T0 (pre-index)                                        (isFirst)
     //   f1 LOAD.host (T0+od (+post-idx)) -> T1
     //   f2 STORE.host T1 -> (miOtherEaBase+miOtherEaDispLo(+miOtherIndex))     (isLast)
+    // task #154 (ported-tests memind cluster): f2 carries `auto = AEaMiOtherStore` so a
+    // (Am)+/-(Am) "other" dst (e.g. MOVE ([...]),-(A7) / MOVE ([...]),(A1)+) gets its
+    // auto-inc/dec address adjustment + An write-back, exactly like the ordinary MOVE
+    // crack's crackStore already does for a non-mem-indirect dst.
     Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
          sz = SzLong, miPtrIndex = true, isFirst = true),                                 // µPC120 (f0)
     Desc(UMiHostMove, mem = MLoad, srcA = ST0, dst = ST1, useImm = true, imm = SMiOd,
          sz = SzHost, miHostIndex = true),                                                // µPC121 (f1)
-    Desc(UMiHostMove, mem = MStore, srcA = SMiOtherEaBase, srcB = ST1, useImm = true,
-         imm = SMiOtherEaDispLo, sz = SzHost, indexFromMiOtherEa = true,
+    Desc(UMiHostMove, mem = MStore, auto = AEaMiOtherStore, srcA = SMiOtherEaBase, srcB = ST1,
+         useImm = true, imm = SMiOtherEaDispLo, sz = SzHost, indexFromMiOtherEa = true,
          miMoveFlags = true, isLast = true),                                              // µPC122 (f2)
 
-    // MI_MOVE_EAEA_REV @123 — CURRENTLY UNUSED / NOT ROUTED (task #119 partial): the
-    // MIRROR direction — MOVE a PLAIN (non-register) memory src-EA -> a mem-indirect
-    // dst-EA. Same "no register write" shape as MI_MOVE_EAEA, reversed: load straight
-    // from the plain side (no pointer needed for it), then store through the
-    // mem-indirect pointer. DecodeStage.scala currently routes this shape to the
-    // illegal trap instead (`ucMoveDstMiEaEaBroken`) — a directed lock-step test found
-    // the store lands at the wrong address and the root cause wasn't pinned down in the
-    // time available. The rows are left here (dead code, unreferenced by any routing
-    // Mux) for a future debugging session; do NOT wire ucMoveDstMiEaEa to this entry
-    // without re-verifying end to end.
+    // MI_MOVE_EAEA_REV @123 (task #147 wired this entry live): the MIRROR direction —
+    // MOVE a PLAIN (non-register) memory src-EA -> a mem-indirect dst-EA. Same "no
+    // register write" shape as MI_MOVE_EAEA, reversed: load straight from the plain side
+    // (no pointer needed for it), then store through the mem-indirect pointer.
     //   g0 LOAD.L ptr -> T0 (pre-index)                                        (isFirst)
     //   g1 LOAD.host (miOtherEaBase+miOtherEaDispLo(+miOtherIndex)) -> T1
     //   g2 STORE.host T1 -> (T0+od (+post-idx))                                (isLast)
+    // KNOWN RESIDUAL GAP (task #154, deliberately NOT fixed here, mirrors the DIVREM
+    // gap documented in DivEuPlugin.scala/task #149): unlike MI_MOVE_EAEA's STORE (the
+    // ONLY µop touching the "other" side, so folding its auto-update + An write-back into
+    // ONE µop via AEaMiOtherStore's dst-override trick — mirroring AEaCasStore — is
+    // correct and complete), this LOAD is likewise the ONLY µop touching the "other"
+    // side, but the established convention for a load-side auto (APredecAy/APredecAx,
+    // see their own comment above) is "eaAuto adjusts the ACCESS address but never
+    // writes An — a SEPARATE dropped UAddDrop µop does that" (a 2-µop idiom, e.g. rows
+    // 190-193). Naively reusing AEaMiOtherStore's single-µop trick here would compute
+    // the CORRECT loaded value but silently leave An un-updated for a (Am)+/-(Am) "other"
+    // SOURCE (e.g. `MOVE -(A7),([...])`) — a real but narrower gap (data correct, An
+    // stale) than a full miscompute, and NOT currently exercised by any known ported
+    // test (every failing MOVE-family test needing this fix is the FORWARD direction,
+    // src=mem-indirect / dst=plain (An)+/-(An) — MI_MOVE_EAEA's g2, not this entry's
+    // g1). Proper fix: insert a dropped `UAddDrop` row after g1 (mirrors rows 190-193),
+    // bumping MI_MOVE_BOTH_MI_ILLEGAL_ENTRY's row constant by 1 — deferred as a
+    // follow-up given no known repro exercises it yet.
     Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
          sz = SzLong, miPtrIndex = true, isFirst = true),                                 // µPC123 (g0)
     Desc(UMiHostMove, mem = MLoad, srcA = SMiOtherEaBase, dst = ST1, useImm = true,
@@ -762,6 +785,14 @@ object Microcode {
     val miOtherEaIndexLong  = Bool()
     val miOtherEaIndexScale = UInt(2 bits)
     val miOtherEaDispLo     = Bits(32 bits)
+    // (An)+/-(An) auto-update on the "other" (plain) side of an EA<->EA mem-indirect MOVE
+    // (task #154, ported-tests memind cluster): MI_MOVE_EAEA's store (other=dst) / _REV's
+    // load (other=src) need the SAME auto-postinc/predec + An write-back the ordinary
+    // MOVE crack already gets via crackLoad/crackStore -- this was entirely missing (the
+    // "other" side's EaDecoder output already computes autoMode/autoDelta correctly; it
+    // was just never threaded into Ctx). NONE for every other mem-indirect customer.
+    val miOtherEaAutoMode  = EaAuto()
+    val miOtherEaAutoDelta = UInt(3 bits)
   }
 
   // ── selector → (regId, valid) ──────────────────────────────────────────────
@@ -914,6 +945,11 @@ object Microcode {
     if (d.auto == AEaCasStore) {
       u.dstReg   := ctx.eaBase
       u.dstValid := ctx.casAutoMode =/= EaAuto.NONE
+    } else if (d.auto == AEaMiOtherStore) {
+      // Mirrors AEaCasStore, keyed to the "other" (plain) side's OWN base register
+      // (task #154) instead of the mem-indirect pointer's ctx.eaBase.
+      u.dstReg   := ctx.miOtherEaBase
+      u.dstValid := ctx.miOtherEaAutoMode =/= EaAuto.NONE
     } else {
       u.dstReg  := dstReg;  u.dstValid  := dstV
     }
@@ -1004,6 +1040,10 @@ object Microcode {
       // casAutoMode=NONE -> inert eaAuto (addr = An + disp + index, the normal CAS EA).
       case AEaCasLoad  => u.eaAuto := ctx.casAutoMode; u.eaDelta := ctx.casAutoDelta
       case AEaCasStore => u.eaAuto := ctx.casAutoMode; u.eaDelta := ctx.casAutoDelta
+      // Mem-indirect EA<->EA "other" side (task #154): same LOAD/STORE split as CAS above,
+      // keyed to ctx.miOtherEaAutoMode/Delta instead of ctx.casAutoMode/Delta.
+      case AEaMiOtherLoad  => u.eaAuto := ctx.miOtherEaAutoMode; u.eaDelta := ctx.miOtherEaAutoDelta
+      case AEaMiOtherStore => u.eaAuto := ctx.miOtherEaAutoMode; u.eaDelta := ctx.miOtherEaAutoDelta
     }
     u.ccrRestore := False; u.toCcr := False
     u.shiftOp := 0; u.shiftDir := False
