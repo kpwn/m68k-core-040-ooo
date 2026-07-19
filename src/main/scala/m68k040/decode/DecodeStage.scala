@@ -816,12 +816,18 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // formula above for mode 6 / mode 7-3 when bit8 is set). Computed directly against
     // the ALREADY-FRAMED full packet — no predecode lookahead limit, unlike
     // PredecodeWord.eaExt (which this mirrors structurally).
-    def eaWordCount(mode: UInt, reg: UInt): UInt = {
+    // `baseWord` (task #178, ported-tests cluster 11): the EA's OWN first ext word --
+    // defaults to `ucEntryPkt.words(1)` (correct for the SOURCE, whose ext word is always
+    // op+1) but is an explicit PARAMETER so a caller computing the DESTINATION's word count
+    // can pass the correctly-SHIFTED word instead (the dst's own first ext word sits wherever
+    // the source's ext words end, exactly like `ucDstEaWords`/`ucMiDstEa` already account for
+    // — see `ucMoveDstWordCount` below).
+    def eaWordCount(mode: UInt, reg: UInt, baseWord: Bits = ucEntryPkt.words(1)): UInt = {
       val n = UInt(3 bits); n := 0
       switch(mode) {
         is(U(5, 3 bits)) { n := 1 }                                  // (d16,An)
         is(U(6, 3 bits)) {                                           // (d8,An,Xn) brief / full-format
-          when(ucEntryPkt.words(1)(8)) { n := miEaWordCount(ucEntryPkt.words(1)) }
+          when(baseWord(8)) { n := miEaWordCount(baseWord) }
             .otherwise { n := 1 }
         }
         is(U(7, 3 bits)) {
@@ -830,7 +836,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
             is(U(1, 3 bits)) { n := 2 }   // (xxx).L
             is(U(2, 3 bits)) { n := 1 }   // (d16,PC)
             is(U(3, 3 bits)) {            // (d8,PC,Xn) brief / full-format
-              when(ucEntryPkt.words(1)(8)) { n := miEaWordCount(ucEntryPkt.words(1)) }
+              when(baseWord(8)) { n := miEaWordCount(baseWord) }
                 .otherwise { n := 1 }
             }
             is(U(4, 3 bits)) { n := Mux(ucEntrySpec.size === Size.LONG, U(2, 3 bits), U(1, 3 bits)) }  // #imm
@@ -868,6 +874,43 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val ucIsMove   = (ucLine === U(1, 4 bits)) || (ucLine === U(2, 4 bits)) || (ucLine === U(3, 4 bits))
     val ucMoveSrcMi= ucIsMove && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
     val ucMoveDstMi= ucIsMove && (ucMiDstEa.klass === EaClass.MEMINDIRECT)
+    // ── Real decode-time instruction length + front-end complex-resume (task #178,
+    // ported-tests cluster 11: move_abs_src_full_memind_dst) ──────────────────────────
+    // PredecodeWord.scala/IcachePlugin.scala conservatively give up (packet.complex=true,
+    // packet.lenWords=0) whenever a full-format EA's own extension word spills past the
+    // 64-byte I-cache line being predecoded (its `extWValid`/`extW2Valid`/`extW3Valid`
+    // gating) -- a SAFE trap for predecode's own per-line framing/shift bookkeeping, but
+    // `ucEntryCtx.nextPc` (line ~680 above) blindly trusted that same (now-zero) lenWords.
+    // At ucBegin the FULL up-to-10-word aligner window is already resident regardless of
+    // that per-line blackout (only predecode's OWN shift arithmetic gave up, not the actual
+    // word delivery), so recompute the real length here from the live packet content --
+    // exact, and a strict superset of predecode's own (already-correct-when-available) value.
+    // Scoped to `ucIsMove` (the only family confirmed to reach this blackout so far).
+    val ucMoveDstWordCount = eaWordCount(ucOpmode, ucEopw(11 downto 9).asUInt, ucDstEaWords(1))
+    val ucMoveRealLenWords = (U(1, 5 bits) + ucMoveSrcWordCount.resize(5) + ucMoveDstWordCount.resize(5)).resize(5)
+    val ucMoveRealNextPc   = (ucEntryPkt.pc + (ucMoveRealLenWords.resize(32) |<< 1)).resize(32)
+    when(ucIsMove) { ucEntryCtx.nextPc := ucMoveRealNextPc }
+    // FetchAlignPlugin permanently stalls fetch after emitting a genuinely `complex` packet
+    // until its `resume` port fires -- but NOTHING in this codebase drives that port (a
+    // previous investigation of indexed MOVEM hit the identical gap and worked around it by
+    // making that shape illegal instead, relying on the exception redirect as a substitute
+    // "resume"; see OperationDecoder.scala's MOVEM comment). A memory-indirect MOVE landing
+    // in this blackout is a LEGITIMATE, fully-executable instruction (verified: every load/
+    // store lands at the correct address with the correct data) -- it must NOT be made
+    // illegal, so this drives the genuinely-missing resume wiring instead, using the real
+    // length computed above. Fired immediately at ucBegin (NOT gated on the µcode engine
+    // finishing execution) -- exactly mirroring how a `simple`-framed mem-indirect MOVE
+    // already lets fetch continue in parallel with its own FSM execution; the front end
+    // does not need to wait for the LOAD/STORE chain to retire, only to know how many bytes
+    // the instruction occupies. A sibling wiring plugin connects this to
+    // `FetchAlignPlugin.logic.resume` (mirrors the existing `mispredictRedirect`/`pipeFlush`
+    // wiring pattern -- see FuzzDut.scala/FullCoreSynth.scala/ExecuteLockStepSpec.scala/
+    // IpcBenchSpec.scala). A different complex-routed family (not MOVE) hitting this same
+    // blackout remains an OPEN, characterized gap -- not observed in the ported-test corpus,
+    // deliberately not generalized here (see the cluster-11 report).
+    val ucComplexResume = Flow(UInt(32 bits))
+    ucComplexResume.valid   := ucBegin && ucEntryPkt.complex && ucIsMove
+    ucComplexResume.payload := ucMoveRealNextPc
     // task #119 (deep-audit follow-up): a mem-indirect MOVE whose OTHER side is NOT a
     // register (newly reachable once F2's predecode fix let a 7+-word dual-full-EA MOVE
     // frame correctly at all — previously it just livelocked before execution got this

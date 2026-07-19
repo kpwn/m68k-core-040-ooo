@@ -52,6 +52,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     loadRspPort.valid.simPublic(); loadRspPort.payload.simPublic()
     val loadBusyReg = Bool()
     val storePort   = Flow(DStoreCmd())
+    storePort.valid.simPublic(); storePort.payload.simPublic()  // debug-only (ported-tests cluster 11 trace)
     val storeAckReg = Bool()
     val axi         = master(Axi4(axiCfg))
 

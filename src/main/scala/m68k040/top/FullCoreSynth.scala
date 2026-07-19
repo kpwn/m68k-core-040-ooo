@@ -48,9 +48,18 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     host[DecodeStage].logic.pipeFlush := doFlush || excActive // FE skid (decode->rename)
     host[RenameStage].logic.pipeFlush := doFlush || excActive // FE skid (rename->dispatch)
     // RAT-rollback (rename.flushPort) already driven by the ROB (rc.flushPort).
+    // Front-end complex-packet resume (task #178, ported-tests cluster 11): a genuinely-
+    // `complex` predecode packet permanently stalls FetchAlignPlugin until its `resume`
+    // port fires, but `resume` is a TEST-BOOT-ONLY external port -- `mispredictRedirect`
+    // is the established INTERNAL wiring point instead (its handler already does exactly
+    // what a `resume` would: ibuf flush + stalled:=False + decodePc:=newPc, WITHOUT
+    // touching `pipeFlush`, so an in-flight µcode engine keeps running -- only the
+    // front-end fetch pointer is unstuck). See DecodeStage.scala's `ucComplexResume`
+    // comment for the full story. Priority: a real doFlush wins over a same-cycle resume.
+    val ucComplexResume = host[DecodeStage].logic.ucComplexResume
     val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
-    faRedir.valid   := doFlush
-    faRedir.payload := flushPc
+    faRedir.valid   := doFlush || ucComplexResume.valid
+    faRedir.payload := Mux(doFlush, flushPc, ucComplexResume.payload)
 
     // ── Fetch-time BTB wiring (slice 1) ──────────────────────────────────────────
     // Read port: query the BTB with the fetch window PC when a fetch is issued. The

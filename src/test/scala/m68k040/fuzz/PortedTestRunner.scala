@@ -135,6 +135,29 @@ object PortedTestRunner {
         }
       }
 
+      // debug-only, env-gated trace for the fetch/predecode `fed` packet stream
+      // (ported-tests triage cluster 11, move_abs_src_full_memind_dst investigation) --
+      // prints every accepted fed group's packet(0) pc/simple/complex/fault/wordCount,
+      // so a stall from a mis-framed length (predecode) can be distinguished from a
+      // downstream stall (decode/issue/microcode). Zero cost unless PORTED_TRACE_FED
+      // is set.
+      if (sys.env.contains("PORTED_TRACE_FED")) {
+        var trCyc = 0
+        cd.onSamplings {
+          trCyc += 1
+          if (dut.dec.logic.fed.valid.toBoolean && dut.dec.logic.fed.ready.toBoolean) {
+            val p0 = dut.dec.logic.fed.payload.packets(0)
+            val slot1V = dut.dec.logic.fed.payload.slot1Valid.toBoolean
+            val p1pc = dut.dec.logic.fed.payload.packets(1).pc.toLong & 0xffffffffL
+            println(f"[fedtrace] cyc=$trCyc%6d FED pc=0x${p0.pc.toLong & 0xffffffffL}%08x " +
+              f"simple=${p0.simple.toBoolean} fault=${p0.fault.toBoolean} " +
+              f"wordCount=${p0.wordCount.toInt} lenWords=${p0.lenWords.toInt} " +
+              f"w0=0x${p0.words(0).toLong & 0xffffL}%04x w1=0x${p0.words(1).toLong & 0xffffL}%04x " +
+              f"slot1Valid=$slot1V" + (if (slot1V) f" p1pc=0x$p1pc%08x" else ""))
+          }
+        }
+      }
+
       // debug-only, env-gated trace for the DIVU.L/DIVS.L 32/32 crack (DIV + trailing
       // DIVREM) -- ported-tests triage (divl_basic HANG). Prints every ROB commit +
       // every DivEu writeback, so a stall shows up as "commits stop advancing" with no
@@ -171,6 +194,19 @@ object PortedTestRunner {
           }
           if (dut.dcache.logic.loadRspPort.valid.toBoolean) {
             println(f"[dload] cyc=$trCyc%6d RSP data=0x${dut.dcache.logic.loadRspPort.payload.data.toLong & 0xffffffffL}%08x")
+          }
+          if (dut.dcache.logic.storePort.valid.toBoolean) {
+            val sp = dut.dcache.logic.storePort.payload
+            println(f"[dstore] cyc=$trCyc%6d CMD paddr=0x${sp.paddr.toLong & 0xffffffffL}%08x data=0x${sp.data.toLong & 0xffffffffL}%08x")
+          }
+          for (k <- 0 until 2) {
+            val c = dut.rob.logic.commitObs(k)
+            if (c.fire.toBoolean) {
+              println(f"[commit] cyc=$trCyc%6d port=$k robId=${c.robId.toInt} pc=0x${c.pc.toLong & 0xffffffffL}%08x")
+            }
+          }
+          if (dut.dec.logic.ucActive.toBoolean) {
+            println(f"[ucstate] cyc=$trCyc%6d ucActive=true ucPc=${dut.dec.logic.ucPc.toInt}")
           }
         }
       }

@@ -129,9 +129,21 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     iq.flushPort := doFlush || excActive
     host[DecodeStage].logic.pipeFlush := doFlush || excActive
     host[RenameStage].logic.pipeFlush := doFlush || excActive
+    // Front-end complex-packet resume (task #178, ported-tests cluster 11): a genuinely-
+    // `complex` predecode packet permanently stalls FetchAlignPlugin until its `resume`
+    // port fires, but `resume` is a TEST-BOOT-ONLY external port (poked directly by the
+    // testbench for the initial fetch redirect) -- driving it here would fight that poke.
+    // `mispredictRedirect` is the established INTERNAL wiring point instead (already
+    // designed as a directionless, sibling-plugin-driven Flow) and its handler already does
+    // exactly what a `resume` would (ibuf flush + stalled:=False + decodePc:=newPc) WITHOUT
+    // touching `pipeFlush` (driven separately below), so the in-flight µcode engine
+    // correctly keeps running -- only the front-end fetch pointer is unstuck. Priority:
+    // a real doFlush (branch mispredict / exception) wins over a same-cycle resume (should
+    // never coincide in practice; doFlush is the architecturally "real" redirect).
+    val ucComplexResume = host[DecodeStage].logic.ucComplexResume
     val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
-    faRedir.valid   := doFlush
-    faRedir.payload := flushPc
+    faRedir.valid   := doFlush || ucComplexResume.valid
+    faRedir.payload := Mux(doFlush, flushPc, ucComplexResume.payload)
 
     val faBtb = host[FetchAlignPlugin]
     val btb   = host[m68k040.frontend.BtbPlugin]

@@ -189,9 +189,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       host[RenameStage].logic.pipeFlush := doFlush || excActive
       // RAT-rollback flush (rename.flushPort) is already driven by the ROB
       // (rc.flushPort := flushing). Fetch redirect to the resolved target:
+      // Front-end complex-packet resume (task #178, ported-tests cluster 11) -- see
+      // DecodeStage.scala's `ucComplexResume` comment / FullCoreSynth.scala's mirror.
+      val ucComplexResume = host[DecodeStage].logic.ucComplexResume
       val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
-      faRedir.valid   := doFlush
-      faRedir.payload := flushPc
+      faRedir.valid   := doFlush || ucComplexResume.valid
+      faRedir.payload := Mux(doFlush, flushPc, ucComplexResume.payload)
 
       // Fetch-time BTB wiring (slice 1): read off the fetch PC, invalidate off the
       // I-cache, feed the registered prediction into FetchAlign's predict input.
