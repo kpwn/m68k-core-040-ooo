@@ -665,7 +665,41 @@ object Microcode {
     // (deliberately out of scope for this slice — rare in practice). Trap vector-4 rather
     // than silently mis-executing (the F2-class failure mode this whole task exists to
     // avoid); a real completeness gap, but safe.
-    Desc(UMove, bfIllegal = true, isFirst = true, isLast = true)                          // µPC126
+    Desc(UMove, bfIllegal = true, isFirst = true, isLast = true),                         // µPC126
+
+    // MI_MOVE_DST_IMM @127 (task #178, ported-tests cluster 11: move_bwl_imm_src_memind_dst):
+    // MOVE #imm,<mem-indirect-dst> — the immediate SOURCE variant of MI_MOVE_DST_ENTRY (@19,
+    // which only ever worked for a REGISTER source). Appended as a NEW entry (not merged into
+    // @19/@20) rather than renumbering every entry after it — pure addition, zero blast radius
+    // on the many already-passing entries/tests keyed to the existing row numbers.
+    //
+    // ROOT CAUSE this entry fixes: `UMiHostMove` (the µop kind MI_MOVE_DST_ENTRY's store row
+    // @20 uses) NEVER reads `ctx.miOtherIsImm`/`ctx.miHostImm` — only `UMiHostOp` (the ALU-op
+    // host kind used by MI_RMW_ENTRY/MI_FLAGS_ENTRY/etc, task #156's "already built for the
+    // line-0-imm/ADDQ families") does. A plain MOVE's store row is a `UMiHostMove` (its own
+    // `useImm`/`imm` slot is ALREADY spoken for by the STORE ADDRESS's od displacement,
+    // `SMiOd` — one row cannot carry both an address immediate AND a data immediate at once,
+    // exactly the constraint MicroOpAssembler.scala's `immToMemCase` comment documents for the
+    // ORDINARY (non-mem-indirect) `MOVE #imm,<mem>` crack). Reusing @19/@20 unmodified for an
+    // immediate source therefore silently read `ctx.miOther`/`ctx.miOtherValid` as if they were
+    // a REAL register — but the src EA's #imm encoding's `reg` bits (mode7/reg4) are NOT a
+    // register id, so this read garbage (observed: D4's stale/reset value, 0, silently stored
+    // instead of the real immediate — a genuine data-corruption bug, not a hang).
+    //
+    // FIX (mirrors MicroOpAssembler.scala's established "materialize immediate into a scratch
+    // temp, then store the temp" 2-µop idiom for the identical non-mem-indirect problem):
+    //   h0 LOAD.L ptr -> T0 (pre-index)                                        (isFirst)
+    //   h1 MOVE ctx.miHostImm -> T1  (plain `UMove`, not `UMiHostOp` -- deliberately does NOT
+    //      write flags: `writesFlags`/`nzvcOnly` both default False on the generic `UMove`
+    //      resolve() path, unlike `UMiHostOp` which unconditionally ties `writesNzvc` to
+    //      `ctx.miWNzvc` regardless of isLast -- using `UMiHostOp` here would have made this
+    //      intermediate materialize row ALSO commit flags, alongside the real store row below)
+    //   h2 STORE.host T1 -> (T0+od (+post-idx)), sets NZVC per ctx.miWNzvc              (isLast)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                                 // µPC127 (h0)
+    Desc(UMove, useImm = true, imm = SMiImm, dst = ST1),                                  // µPC128 (h1)
+    Desc(UMiHostMove, mem = MStore, srcA = ST0, srcB = ST1, useImm = true, imm = SMiOd,
+         sz = SzHost, miHostIndex = true, miMoveFlags = true, isLast = true)              // µPC129 (h2)
   )
   val BF_DYN_RD_DO0_ENTRY  = 49
   val BF_DYN_RD_DO1_ENTRY  = 53
@@ -690,6 +724,7 @@ object Microcode {
   val MI_MOVE_EAEA_ENTRY = 120 // rows 120..122 (ptr-load, host-load->T1, host-store T1->plain EA)
   val MI_MOVE_EAEA_REV_ENTRY = 123 // rows 123..125 (ptr-load, host-load plain EA->T1, host-store T1->(ptr+od))
   val MI_MOVE_BOTH_MI_ILLEGAL_ENTRY = 126 // row 126 (both src+dst mem-indirect — scoped out, traps illegal)
+  val MI_MOVE_DST_IMM_ENTRY = 127 // rows 127..129 (ptr-load, materialize #imm->T1, host-store T1->mem)
   def romSize: Int = rom.size
 
   /** Latched-instruction CONTEXT the engine resolves selectors against. v1 fields

@@ -645,7 +645,15 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // microcoded op immediately FOLLOWED by another microcoded/MOVEM op in the SAME fetch
     // group is the untested edge — the slot1 stash carries a NORMAL slot1 (the tested
     // programs put a normal instr / NOP after each X-mem op).
-    val ucPc     = Reg(UInt(7 bits))   // µPC into the ROM (romSize 87 with 3c dyn-mem -> needs 7 bits)
+    // µPC into the ROM. WAS 7 bits ("romSize 87 with 3c dyn-mem -> needs 7 bits") until task
+    // #178 appended MI_MOVE_DST_IMM_ENTRY at rows 127-129 (romSize 130): a 7-bit ucPc can
+    // represent the ENTRY value 127 itself (7 bits' max is 127) but silently WRAPS to 0 on
+    // the very first straight-line `ucPc := ucPc + 1` past it (128 truncates to 0 mod 128) —
+    // caught live via PORTED_TRACE_DLOAD's ucstate trace showing ucPc jump 127 -> 0 -> 1 -> 2
+    // instead of 127 -> 128 -> 129, silently re-executing BCD_MEM_ENTRY's rows instead of the
+    // new entry's materialize+store. Widened to 8 bits (plenty of headroom to romSize's
+    // current 130).
+    val ucPc     = Reg(UInt(8 bits))
     ucPc.simPublic()
     val ucCtx    = Reg(Microcode.Ctx())
     ucCtx.miOther.simPublic(); ucCtx.miOtherValid.simPublic()  // debug-only (task #144)
@@ -1057,15 +1065,22 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // strictly narrower subsets of ucMoveSrcMi/ucMoveDstMi, so placing them FIRST in the
     // priority chain correctly carves them out before the register-case fallbacks below.
     val ew = ucEntrySpec.ucEntry.getWidth
+    // MOVE #imm,<mem-indirect-dst> (task #178, ported-tests cluster 11): a NARROWER subset
+    // of ucMoveDstMi (mirrors ucMoveDstMiEaEa's placement above it in this priority chain) —
+    // must be checked BEFORE the plain ucMoveDstMi/MI_MOVE_DST_ENTRY fallback, which reads
+    // the "other" side as a REGISTER (wrong for an immediate source — see the dedicated
+    // MI_MOVE_DST_IMM_ENTRY comment in Microcode.scala for the full root-cause story).
+    val ucMoveDstMiImmEarly = ucMoveDstMi && ucMoveSrcIsImm
     val ucMiEntry =
       Mux(ucMoveBothMi,    U(Microcode.MI_MOVE_BOTH_MI_ILLEGAL_ENTRY, ew bits),
       Mux(ucMoveSrcMiEaEa, U(Microcode.MI_MOVE_EAEA_ENTRY,     ew bits),
       Mux(ucMoveDstMiEaEa, U(Microcode.MI_MOVE_EAEA_REV_ENTRY, ew bits),
       Mux(ucMoveSrcMi, U(Microcode.MI_MOVE_SRC_ENTRY, ew bits),
+      Mux(ucMoveDstMiImmEarly, U(Microcode.MI_MOVE_DST_IMM_ENTRY, ew bits),
       Mux(ucMoveDstMi, U(Microcode.MI_MOVE_DST_ENTRY, ew bits),
       Mux(ucAluSrcMi,  U(Microcode.MI_ALU_SRC_ENTRY,  ew bits),
       Mux(ucMiFlagsOnly, U(Microcode.MI_FLAGS_ENTRY, ew bits),
-                         U(Microcode.MI_RMW_ENTRY,    ew bits))))))))
+                         U(Microcode.MI_RMW_ENTRY,    ew bits)))))))))
     // ---- debug-only observability (task #139 mechanism #2 investigation) ----
     // Zero synth impact (sim tap only, not referenced by any RTL logic).
     ucMiEntry.simPublic()
@@ -1101,7 +1116,11 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.miOtherValid := ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || (ucImmDstMi && !ucIsSingleEa)
     // MOVE #imm,<mem-indirect-dst> (task #156): the "other" side is the literal immediate,
     // not a register -- same miOtherIsImm/miHostImm feed as the line-0-imm/ADDQ families.
-    val ucMoveDstMiImm = ucMoveDstMi && ucMoveSrcIsImm
+    // (`ucMoveDstMiImmEarly`, computed earlier alongside `ucMiEntry`'s selection, is the SAME
+    // condition -- reused here under its original name so downstream ctx wiring is unchanged;
+    // task #178 fixed the entry this routes to, MI_MOVE_DST_IMM_ENTRY, to actually consume
+    // miOtherIsImm/miHostImm, which MI_MOVE_DST_ENTRY's own store row never did.)
+    val ucMoveDstMiImm = ucMoveDstMiImmEarly
     ucEntryCtx.miOtherIsImm := ucImmDstMi || ucAddqSubqMi || ucMoveDstMiImm
     // The line-0 immediate VALUE precedes the EA ext: words(1) (.B/.W, sign-extended) or
     // words(1)##words(2) (.L). ADDQ/SUBQ's immediate is instead the 3-bit quick field
@@ -1109,8 +1128,19 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // source sits at words(1)[..2] too (it's MOVE's FIRST ext field, same position
     // `eaWordCount`'s mode7/reg4 branch already assumes for the dst-side word-count
     // shift). (Only consumed when miOtherIsImm.)
+    // task #178 (ported-tests cluster 11, move_bwl_imm_src_memind_dst): `ucImmIsL` alone is
+    // NOT a safe gate here for a MOVE -- it reads opword bits[7:6] as a size field, which is
+    // only true for the line-0-immediate family (ucIsLineImm); for a MOVE opword those same
+    // two bits are the LOW two bits of the DESTINATION MODE field (op[8:6]) and collide by
+    // coincidence (e.g. MOVE.W's dst-mode=6 full-format encodes exactly bits[7:6]=="10" —
+    // the SAME collision class task #152 already fixed for the BITOP tt sub-kind, just for
+    // MOVE's dst-mode field this time). Unguarded, this misread a WORD-size MOVE #imm as a
+    // 2-word LONG immediate, concatenating the real 1-word immediate with the FOLLOWING
+    // word (the dst EA's own first ext word) into a garbage 32-bit value. Gate `ucImmIsL`
+    // with `ucIsLineImm` (true only for the real line-0-imm family it was designed for) so
+    // a MOVE always falls through to its OWN correct condition (size-checked explicitly).
     ucEntryCtx.miHostImm    := Mux(ucAddqSubqMi, ucAddqSubqImm,
-                                Mux(ucImmIsL || (ucMoveDstMiImm && ucEntrySpec.size === Size.LONG),
+                                Mux((ucIsLineImm && ucImmIsL) || (ucMoveDstMiImm && ucEntrySpec.size === Size.LONG),
                                     ucEntryPkt.words(1) ## ucEntryPkt.words(2),
                                     ucEntryPkt.words(1).asSInt.resize(32).asBits))
     ucEntryCtx.miOtherIsDst := ucMoveSrcMi
@@ -1185,6 +1215,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.miOd.simPublic(); ucEntryCtx.miPost.simPublic()
     ucEntryCtx.miOtherEaBase.simPublic(); ucEntryCtx.miOtherEaBaseValid.simPublic()
     ucEntryCtx.miOtherEaDispLo.simPublic()
+    // debug-only (task #178, ported-tests cluster 11 investigation)
+    ucEntryCtx.miHostImm.simPublic(); ucEntryCtx.miOtherIsImm.simPublic()
+    ucMiEntry.simPublic()
 
     // The REAL entry: a bit-field RMW (microcoded BITFIELD) picks 5B vs 4B by needHi; a
     // full-format mem-indirect host picks its shape entry; MOVES picks WRITE vs READ by the
@@ -1449,7 +1482,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       // RMW the real entry is picked from the latched bfNeedHi (4-byte vs 5-byte chain),
       // since OperationDecoder is ext-word-free and emitted only the 4-byte default.
       ucActive := True
-      ucPc     := ucRealEntry
+      ucPc     := ucRealEntry.resize(8)
       ucCtx    := ucEntryCtx
       // A pending slot1 microcoded op is now consumed by this entry.
       when(ucPendValid) { ucPendValid := False }

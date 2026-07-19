@@ -127,10 +127,14 @@ object PortedTestRunner {
             val otherBase  = dut.dec.logic.ucEntryCtx.miOtherEaBase.toInt
             val otherBaseV = dut.dec.logic.ucEntryCtx.miOtherEaBaseValid.toBoolean
             val otherDisp  = dut.dec.logic.ucEntryCtx.miOtherEaDispLo.toLong & 0xffffffffL
+            val miHostImm   = dut.dec.logic.ucEntryCtx.miHostImm.toLong & 0xffffffffL
+            val miOtherIsImm= dut.dec.logic.ucEntryCtx.miOtherIsImm.toBoolean
+            val miEntry     = dut.dec.logic.ucMiEntry.toInt
             println(f"[mitrace] UC-BEGIN cyc=$trCyc%5d entryPc=0x$entryPc%08x realEntry=$realEntry isMemInd=$isMemInd " +
               f"moveDstMi=$moveDstMi moveSrcMi=$moveSrcMi dstEaEa=$dstEaEa srcEaEa=$srcEaEa " +
               f"eaBase=$eaBase eaBaseV=$eaBaseV eaDisp=0x$eaDisp%08x miOd=0x$miOd%08x miPost=$miPost " +
-              f"otherBase=$otherBase otherBaseV=$otherBaseV otherDisp=0x$otherDisp%08x")
+              f"otherBase=$otherBase otherBaseV=$otherBaseV otherDisp=0x$otherDisp%08x " +
+              f"miHostImm=0x$miHostImm%08x miOtherIsImm=$miOtherIsImm miEntry=$miEntry")
           }
         }
       }
