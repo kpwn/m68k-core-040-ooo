@@ -377,6 +377,19 @@ object OperationDecoder {
           o.srcA := easrc; o.srcB := easrc; o.dst := easrc; o.dstWrites := True
           o.bcdSub := True
           o.writesNzvc := True; o.writesX := True
+        }
+        // BKPT #n (0100 1000 0100 1 vvv, op[15:3]==0b0100100001001, task #178
+        // cluster12/exc_bkpt_decode): no operands, no flags, no state change --
+        // decoded as a plain no-op (mirrors the NOP 0x4E71 case below exactly).
+        // Real 040 silicon runs a breakpoint-acknowledge bus cycle here (illegal-
+        // trapping if unacknowledged); that bus-level protocol is not modeled --
+        // this core simply commits BKPT like NOP, which is sufficient for it to
+        // retire cleanly and be observable at commit (the harness-side "clean
+        // debug halt" detection watches for exactly that commit event).
+        when(opword(15 downto 3) === B"13'b0100100001001") {
+          o.illegal := False
+          o.op := DecOp.MOVE; o.size := Size.LONG
+          o.dst.setNone(); o.dstWrites := False
           o.readsX := True; o.readsNzvc := True
         }
         // MOVEM (0100 1 d 001 s mmmrrr) + 16-bit register-mask ext word: bit11=1, bit10=d

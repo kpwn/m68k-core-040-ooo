@@ -537,7 +537,13 @@ object PredecodeWord {
         // NBCD Dn (0x4800-07, task #159): register form only (memory-EA NBCD stays
         // deferred/illegal -- no memDestExt framing added, unlike TAS-mem above).
         val isNbcd  = op(15 downto 3) === B"13'b0100100000000"   // 0x4800-07
-        when(isUnaryArith || isSwap || isExtW || isExtL || isExtbL || isTas || isNbcd) {
+        // BKPT #n (0x4848-4F, task #178 cluster12/exc_bkpt_decode): single-word,
+        // no operands, no EA -- decoded as a plain no-op (like NOP/RESET) so it
+        // commits cleanly through the ROB instead of illegal-trapping. The 3-bit
+        // breakpoint vector (op[2:0]) is architecturally irrelevant here (no bus-
+        // level breakpoint-acknowledge cycle is modeled).
+        val isBkpt  = op(15 downto 3) === B"13'b0100100001001"   // 0x4848-4F
+        when(isUnaryArith || isSwap || isExtW || isExtL || isExtbL || isTas || isNbcd || isBkpt) {
           r.simple   := True
           r.lenWords := U(1, 4 bits)
         }

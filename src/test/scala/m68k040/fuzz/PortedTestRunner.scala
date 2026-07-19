@@ -36,6 +36,27 @@ object PortedTestRunner {
       case Left(err) => return PortedGenFail(s"assemble: ${err.reason}")
     }
 
+    // Harness-side "clean debug halt" detection for BKPT (task #178 cluster12,
+    // exc_bkpt_decode.s): m68k-ooo's own C++ testbench (tb/tb_top.cpp) watches a
+    // `dbg_break_uop_fire`-style signal and injects the PASS sentinel itself --
+    // a BKPT test's guest program is, by construction, never expected to reach
+    // a sentinel write (see that test's own header comment). We reconstruct the
+    // equivalent from the assembled image: scan for any 16-bit word in the BKPT
+    // range 0x4848-0x484F and watch the ROB's commit-observation ports for that
+    // exact PC actually retiring -- which only happens if control flow really
+    // executes it as an instruction (BKPT decodes as a NOP-shaped commit, see
+    // OperationDecoder.scala), not merely if the bit pattern appears as data.
+    val bkptPcs: Set[Long] = {
+      var pcs = Set.empty[Long]
+      var i = 0
+      while (i + 1 < image.bytes.length) {
+        val w = ((image.bytes(i).toLong & 0xffL) << 8) | (image.bytes(i + 1).toLong & 0xffL)
+        if ((w & 0xfff8L) == 0x4848L) pcs += (loadAddr + i)
+        i += 2
+      }
+      pcs
+    }
+
     runIdx += 1
     var outcome: PortedOutcome = PortedHang(0)
     compiled.doSim(s"ported_$runIdx", simSeed) { dut =>
@@ -269,9 +290,19 @@ object PortedTestRunner {
         }
       }
 
+      var bkptFired = false
+      if (bkptPcs.nonEmpty) {
+        cd.onSamplings {
+          for (k <- 0 until 2) {
+            val c = dut.rob.logic.commitObs(k)
+            if (c.fire.toBoolean && bkptPcs.contains(c.pc.toLong & 0xffffffffL)) bkptFired = true
+          }
+        }
+      }
+
       var cyc = 0L
       var word = 0L
-      while (word == 0 && cyc < timeoutCycles) {
+      while (word == 0 && !bkptFired && cyc < timeoutCycles) {
         cd.waitSampling()
         cyc += 1
         val b0 = dmem.mem.read(SentinelAddr).toLong & 0xffL
@@ -287,7 +318,8 @@ object PortedTestRunner {
         }
       }
       outcome =
-        if (word == 0) PortedHang(cyc)
+        if (bkptFired) PortedPass
+        else if (word == 0) PortedHang(cyc)
         else if (word == PassWord) PortedPass
         else PortedFail(word)
     }
