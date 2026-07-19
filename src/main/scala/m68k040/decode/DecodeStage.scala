@@ -897,7 +897,27 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val ucMoveDstWordCount = eaWordCount(ucOpmode, ucEopw(11 downto 9).asUInt, ucDstEaWords(1))
     val ucMoveRealLenWords = (U(1, 5 bits) + ucMoveSrcWordCount.resize(5) + ucMoveDstWordCount.resize(5)).resize(5)
     val ucMoveRealNextPc   = (ucEntryPkt.pc + (ucMoveRealLenWords.resize(32) |<< 1)).resize(32)
-    when(ucIsMove) { ucEntryCtx.nextPc := ucMoveRealNextPc }
+    // SAFETY GUARD (found investigating move_l_memind_to_memind / cluster 11's characterized
+    // both-mem-indirect scope limit, task #119): the "FULL up-to-10-word window is always
+    // resident" claim above is only true when the aligner's `wordCount` (how many of the 10
+    // word slots hold REAL fetched bytes, bounded by however much the InstructionBuffer had
+    // buffered at emission time -- NOT always the full WINDOW even for a `complex` packet)
+    // actually covers the words this recomputation reads. A both-mem-indirect MOVE landing at
+    // the SAME per-line blackout as the single-mem-indirect case above, but ALSO with a small
+    // `wordCount` (observed: 2, vs. the 5 real words the instruction needs), read GARBAGE at
+    // `ucDstEaWords(1)` -- silently misclassifying the dst as non-mem-indirect (bypassing the
+    // deliberate MI_MOVE_BOTH_MI_ILLEGAL_ENTRY safety net entirely) AND computing a
+    // too-short `ucMoveRealLenWords`, which would have resynced fetch 2 bytes into the
+    // MIDDLE of the real instruction's last extension word. Gating the override + the resume
+    // drive below on `ucMoveRealLenWords <= wordCount` makes this SAFE (falls back to
+    // predecode's own nextPc / no resume -- i.e. the front end stays stalled exactly as it
+    // did before this task's fix, for this one narrow, already-failing, already-characterized
+    // input shape) instead of silently wrong. Harmless for every currently-passing shape:
+    // wordCount==lenWords exactly for a `simple` packet (predecode already agrees), and every
+    // currently-passing `complex` case observed in this corpus had wordCount==10 (the full
+    // window, comfortably >= any real length).
+    val ucMoveLenKnown = ucMoveRealLenWords <= ucEntryPkt.wordCount.resize(5)
+    when(ucIsMove && ucMoveLenKnown) { ucEntryCtx.nextPc := ucMoveRealNextPc }
     // FetchAlignPlugin permanently stalls fetch after emitting a genuinely `complex` packet
     // until its `resume` port fires -- but NOTHING in this codebase drives that port (a
     // previous investigation of indexed MOVEM hit the identical gap and worked around it by
@@ -917,7 +937,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // blackout remains an OPEN, characterized gap -- not observed in the ported-test corpus,
     // deliberately not generalized here (see the cluster-11 report).
     val ucComplexResume = Flow(UInt(32 bits))
-    ucComplexResume.valid   := ucBegin && ucEntryPkt.complex && ucIsMove
+    ucComplexResume.valid   := ucBegin && ucEntryPkt.complex && ucIsMove && ucMoveLenKnown
     ucComplexResume.payload := ucMoveRealNextPc
     // task #119 (deep-audit follow-up): a mem-indirect MOVE whose OTHER side is NOT a
     // register (newly reachable once F2's predecode fix let a 7+-word dual-full-EA MOVE
