@@ -562,6 +562,13 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     wbObs.divRem    := compDivRem
     wbObs.keepCommit := False
     wbObs.simPublic()
+
+    // ---- ccrObs (task #176) ----
+    // DivEu's `wbObs` above is ALREADY driven straight from `compLive` — the same
+    // signal that drives `completionPort.valid` — so it carries no extra delay (unlike
+    // the ALU EU's sim-delayed `wbObs`). A plain alias, so the ROB wiring can uniformly
+    // source the real `ccrCompletion` from `.logic.ccrObs` across all 4 EUs.
+    val ccrObs = wbObs
     // CHK N flag observation (sim-only) for directed tests.
     val chkNObs = Bool(); chkNObs := chkN && isChk && s1Valid; chkNObs.simPublic()
   }

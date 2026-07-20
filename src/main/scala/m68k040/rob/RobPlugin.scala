@@ -33,8 +33,32 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   // combinationally taps its (later-driven) value.
   private var _supervisor: Bool = null
   override def supervisor: Bool = _supervisor
+  // RTE CCR-restore write ports (task #176): the flags/X PRFs' `newWrite` MUST be
+  // called during `setup` (RegfileService's contract — see RegfileService.scala's doc
+  // comment), mirroring how every EU plugin allocates its own ports. Optional
+  // (`host.get`, mirrors the MmuControlService fallback below in `logic`): several
+  // standalone ROB-only unit-test DUTs (RobPluginSpec, RobFaultSpec, RteSpec, ...)
+  // don't instantiate RegFilePluginNzvc/X at all, so a hard `host[...]` lookup here
+  // would break their elaboration. When absent, `_rteNzvcW`/`_rteXW` are unconnected
+  // local bundles (still driven in `logic`, just never observed by anything real).
+  private var _rteNzvcW: m68k040.execute.regfile.RegFileWritePort = null
+  private var _rteXW: m68k040.execute.regfile.RegFileWritePort = null
   during setup {
     _supervisor = Bool()
+    val nzvcSvc = host.get[m68k040.execute.regfile.NzvcRegFileService]
+    val xSvc    = host.get[m68k040.execute.regfile.XRegFileService]
+    _rteNzvcW = nzvcSvc match {
+      case Some(s) => s.newWrite(latency = 1)
+      case None    => m68k040.execute.regfile.RegFileWritePort(
+        m68k040.execute.regfile.RegfileSpec.Nzvc.addressWidth,
+        m68k040.execute.regfile.RegfileSpec.Nzvc.dataWidth)
+    }
+    _rteXW = xSvc match {
+      case Some(s) => s.newWrite(latency = 1)
+      case None    => m68k040.execute.regfile.RegFileWritePort(
+        m68k040.execute.regfile.RegfileSpec.X.addressWidth,
+        m68k040.execute.regfile.RegfileSpec.X.dataWidth)
+    }
   }
 
   /** One ROB entry's commit/free + trace payload. */
@@ -838,6 +862,38 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       rc.commitPorts(0).intWrite  := p0.intWrite
       rc.commitPorts(0).nzvcWrite := False
       rc.commitPorts(0).xWrite    := False
+    }
+
+    // ── RTE CCR restore -> REAL flags PRF (task #176) ───────────────────────────
+    // Write the frame's popped CCR into the rename-allocated pNzvcDst/pXDst physical
+    // regs (p0.nzvcNew/p0.xNew — populated because the RTE op µop now carries
+    // writesNzvc/writesX, decode) via dedicated write ports, THEN commit the arch->
+    // phys mapping into nzvcRat/xRat (mirrors the sysOp-READ int commit just above) so
+    // a later instruction's rename read observes the restored CCR. Without this,
+    // RTE's restore only ever reached `committedCcr` (used solely to stage a FUTURE
+    // exception's stacked SR) and never the flags a real Bcc/flag-consumer reads —
+    // the architectural disconnect a prior session confirmed for `exc_rte_ccr_restore`.
+    // `exc.rteCcrCommit` fires ONLY on RTE's real (non-throwaway) frame pop — mutually
+    // exclusive in time with retire0/retire1 (excSquash blocks them while the FSM
+    // runs) and with the sysOp block above (a head is exactly one of RTE/sysOp/normal).
+    _rteNzvcW.valid   := exc.rteNzvcWriteValid
+    _rteNzvcW.address := p0.nzvcNew
+    _rteNzvcW.data    := exc.rteNzvcWriteData
+    _rteXW.valid      := exc.rteXWriteValid
+    _rteXW.address    := p0.xNew
+    _rteXW.data       := exc.rteXWriteData.asBits
+    when(exc.rteCcrCommit) {
+      rc.commitPorts(0).valid     := True
+      rc.commitPorts(0).intArch   := p0.archRegId
+      rc.commitPorts(0).intNew    := p0.intNew
+      rc.commitPorts(0).intOld    := p0.intOld
+      rc.commitPorts(0).intWrite  := False
+      rc.commitPorts(0).nzvcNew   := p0.nzvcNew
+      rc.commitPorts(0).nzvcOld   := p0.nzvcOld
+      rc.commitPorts(0).nzvcWrite := p0.nzvcWrite
+      rc.commitPorts(0).xNew      := p0.xNew
+      rc.commitPorts(0).xOld      := p0.xOld
+      rc.commitPorts(0).xWrite    := p0.xWrite
     }
 
     // ── Drive interrupt recognition (needs the SR I-mask from exc.ss, built above) ─

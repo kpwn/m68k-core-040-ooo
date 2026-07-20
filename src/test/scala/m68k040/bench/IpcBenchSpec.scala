@@ -87,8 +87,8 @@ class IpcBenchSpec extends AnyFunSuite {
         rob.logic.ccrCompletion(idx).payload.x        := w.x
         rob.logic.ccrCompletion(idx).payload.xWrite   := w.xWrite
       }
-      wireCcr(0, eu0.logic.wbObs); wireCcr(1, eu1.logic.wbObs); wireCcr(2, lsEu.logic.wbObs)
-      wireCcr(3, divEu.logic.wbObs)
+      wireCcr(0, eu0.logic.ccrObs); wireCcr(1, eu1.logic.ccrObs); wireCcr(2, lsEu.logic.ccrObs)
+      wireCcr(3, divEu.logic.ccrObs)
 
       lsEu.issue << iq.issue(3)
       rob.logic.completion(2).valid   := lsEu.completion.valid

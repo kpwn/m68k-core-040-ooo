@@ -266,6 +266,23 @@ class ExceptionUnit(
   // Only PFLUSHA drives this (S_APPLY sysCapKind=7); everything else leaves it False.
   val sysFlushAllValid = Bool();        sysFlushAllValid := False;        sysFlushAllValid.simPublic()
 
+  // ── RTE CCR restore -> REAL flags PRF (task #176) ────────────────────────────
+  // Fires exactly at RTE's REAL frame pop (R_REDIR, non-throwaway branch — the SAME
+  // cycle obsFire/redirectValid fire for RTE). Carries the frame's popped CCR bits
+  // {X,N,Z,V,C}; the ROB wiring writes them into the rename-allocated pNzvcDst/pXDst
+  // physical regs (p0.nzvcNew/p0.xNew — populated because decode now gives the RTE
+  // op µop writesNzvc/writesX) via dedicated write ports — NOT just `committedCcr`
+  // (which only stages a FUTURE exception's stacked SR and is never read by an
+  // ordinary Bcc/flag-consuming instruction). `rteCcrCommit` is the matching pulse
+  // the ROB uses to commit the arch->phys mapping into nzvcRat/xRat (freeing the old
+  // phys regs) the same cycle, so a later instruction's rename read sees the restored
+  // CCR. Default idle; only the RTE FSM branch below drives these.
+  val rteNzvcWriteValid = Bool();       rteNzvcWriteValid := False;       rteNzvcWriteValid.simPublic()
+  val rteNzvcWriteData  = Bits(4 bits); rteNzvcWriteData  := B(0, 4 bits); rteNzvcWriteData.simPublic()
+  val rteXWriteValid    = Bool();       rteXWriteValid    := False;       rteXWriteValid.simPublic()
+  val rteXWriteData     = Bool();       rteXWriteData     := False;       rteXWriteData.simPublic()
+  val rteCcrCommit      = Bool();       rteCcrCommit      := False;       rteCcrCommit.simPublic()
+
   // ── SystemState write defaults (the FSM pulses them) ────────────────────────
   ss.setSrSys.valid := False; ss.setSrSys.payload := U(0, 8 bits)
   ss.setIsp.valid   := False; ss.setIsp.payload   := U(0, 32 bits)
@@ -447,10 +464,17 @@ class ExceptionUnit(
         val is7 = !entryIsInterrupt && (entryVector === 2)   // access fault -> format-$7
         // The 68040 group-2 traps stack a 6-word format-$2 frame {SR, PC(=nextPc),
         // 0x2000|vec<<2, PPC} (Musashi m68ki_stack_frame_0010): TRAPV (vector 7), CHK
-        // (vector 6), and DIV0/integer-divide-by-zero (vector 5). PC = the next
-        // instruction (faultUsesNextPc); PPC = the trapping instruction's own PC.
+        // (vector 6), DIV0/integer-divide-by-zero (vector 5), AND the Line-1111
+        // Emulator (F-line, vector 11) -- task #176's exc_user_vbr_rte_matrix
+        // investigation found vector 11 was missing here, so an F-line trap stacked
+        // the WRONG (format-$0, 8-byte) frame instead of format-$2 (12-byte, with the
+        // PPC word) -- confirmed against the MC68040 User's Manual exception-vector
+        // table (F-line is a group-2 emulator trap, like A-line's group-1 counterpart
+        // is format-$0). PC = the next instruction (faultUsesNextPc); PPC = the
+        // trapping instruction's own PC (both already correctly threaded for F-line
+        // by decode's line-4 trap framing, per [[traps-trap-trapv]]).
         val is2 = !entryIsInterrupt &&
-                  ((entryVector === 7) || (entryVector === 6) || (entryVector === 5))
+                  ((entryVector === 7) || (entryVector === 6) || (entryVector === 5) || (entryVector === 11))
         // PPC: supplied explicitly (variable-length CHK/DIV0); fall back to entryPc-2
         // for callers that don't pass it (the TRAPV-only unit tests, 2-byte op).
         val ppc = if (entryPpc != null) entryPpc else (entryPc - 2).resized
@@ -789,6 +813,14 @@ class ExceptionUnit(
         .otherwise { ss.setIsp.valid := True; ss.setIsp.payload := newSsp }
         redirectValid := True
         redirectPc    := popPc
+        // task #176: restore the popped CCR {X,N,Z,V,C} into the REAL flags PRF (not
+        // just committedCcr) so a later Bcc/flag-reader actually observes it. SR bit
+        // layout: bit4=X, bits3..0=N,Z,V,C (matches our internal 4-bit nzvc field).
+        rteNzvcWriteValid := True
+        rteNzvcWriteData  := popSr(3 downto 0).asBits
+        rteXWriteValid    := True
+        rteXWriteData     := popSr(4)
+        rteCcrCommit      := True
         // commit observation: RTE's trace step == restored PC + restored SR sysByte
         // + A7. A7 after RTE = popped-SSP if S restored supervisor, else USP. The CCR
         // is restored from the frame too, but the whitebox carries it (RTE restores

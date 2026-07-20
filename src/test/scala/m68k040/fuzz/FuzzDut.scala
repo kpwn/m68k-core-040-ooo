@@ -71,8 +71,8 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
       rob.logic.ccrCompletion(idx).payload.result   := w.result
       rob.logic.ccrCompletion(idx).payload.intWrite := w.intWrite
     }
-    wireCcr(0, eu0.logic.wbObs); wireCcr(1, eu1.logic.wbObs); wireCcr(2, lsEu.logic.wbObs)
-    wireCcr(3, divEu.logic.wbObs)
+    wireCcr(0, eu0.logic.ccrObs); wireCcr(1, eu1.logic.ccrObs); wireCcr(2, lsEu.logic.ccrObs)
+    wireCcr(3, divEu.logic.ccrObs)
 
     divEu.issue << iq.issue(4)
     divEu.cplxFlush := host[RedirectService].doFlush || rob.logic.excActive

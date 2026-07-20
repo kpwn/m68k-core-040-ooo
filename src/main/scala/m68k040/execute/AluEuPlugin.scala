@@ -793,5 +793,33 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // its trailing store is an rmwStore drop). fromCcr/fromSr are fast-path only.
     wbObs.keepCommit := RegNext(Mux(s3Valid, u3.keepCommit, u1.keepCommit)) init False
     wbObs.simPublic()
+
+    // ---- REAL-TIME completion (task #176 fix) ----
+    // `wbObs` above is DELIBERATELY delayed one extra cycle past `completionPort`/the
+    // real PRF nzvcW/xW writes, so the sim-only lock-step whitebox join lines up with
+    // the ROB's matching-delayed `commitObs` (see RobPlugin.scala's commitObs, also a
+    // RegNext of retire0/retire1 — a SEPARATE, sim-only reconstruction mechanism).
+    // `ccrObs` is the SYNTHESIZABLE counterpart: it fires the SAME cycle as
+    // `completionPort.valid` (S1 for a fast op via `fastFire`, S3 for a slow op via
+    // `s3Valid`) — exactly the cycle the real nzvcW/xW/intW hardware writes land. This
+    // is what must feed the ROB's `ccrCompletion` (-> nzvcWrStore/nzvcValStore ->
+    // committedCcr), because `completes(robId)` (which gates retire0/retire1) is ALSO
+    // driven from `completionPort` with no extra delay. Wiring `ccrCompletion` from the
+    // delayed `wbObs` instead (the pre-#176 bug) let a fast flag-writer (e.g. CMP)
+    // retire ONE CYCLE BEFORE its flags landed in nzvcWrStore/nzvcValStore, permanently
+    // dropping the write (the ROB entry frees the same cycle it retires — no 2nd chance).
+    val ccrObs = WbObs()
+    ccrObs.valid      := obsValidS
+    ccrObs.robId      := obsRobId
+    ccrObs.dstArch    := obsDstArch
+    ccrObs.result     := obsResult
+    ccrObs.intWrite   := obsIntW
+    ccrObs.nzvc       := obsNzvc
+    ccrObs.nzvcWrite  := obsNzvcW
+    ccrObs.x          := obsX
+    ccrObs.xWrite     := obsXW
+    ccrObs.divRem     := Mux(s3Valid, u3.divIsRem, u1.divIsRem)
+    ccrObs.keepCommit := Mux(s3Valid, u3.keepCommit, u1.keepCommit)
+    ccrObs.simPublic()
   }
 }

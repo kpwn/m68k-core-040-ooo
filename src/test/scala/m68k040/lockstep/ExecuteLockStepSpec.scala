@@ -115,8 +115,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         rob.logic.ccrCompletion(idx).payload.result   := w.result
         rob.logic.ccrCompletion(idx).payload.intWrite := w.intWrite
       }
-      wireCcr(0, eu0.logic.wbObs); wireCcr(1, eu1.logic.wbObs); wireCcr(2, lsEu.logic.wbObs)
-      wireCcr(3, divEu.logic.wbObs)
+      wireCcr(0, eu0.logic.ccrObs); wireCcr(1, eu1.logic.ccrObs); wireCcr(2, lsEu.logic.ccrObs)
+      wireCcr(3, divEu.logic.ccrObs)
 
       // ── CPLX (DivEu) wiring (mirrors top/FullCoreSynth) ──
       // Issue port 4 -> DivEu; completion (port 3) + dynamic wakeup + euFault.
@@ -3415,13 +3415,31 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 11)
   }
 
+  // `pcOnly` (task #176, m68k-ooo triage): a SECOND confirmed Musashi CPU_TYPE_68040
+  // oracle gap (same class as the CPUSH gap documented above, found while fixing the
+  // ported `exc_user_vbr_rte_matrix` test's F-line handling). Musashi's
+  // `m68ki_exception_1111` (m68kcpu.h) unconditionally stacks a format-$0 (8-byte)
+  // frame via `m68ki_stack_frame_0000` for EVERY CPU type — it never special-cases
+  // CPU_TYPE_68040. Real 68040 hardware (and the vendored m68k-ooo ported-test corpus,
+  // which now passes: `exc_user_vbr_rte_matrix`'s `_h_fline` handler explicitly checks
+  // SSP == base-12, i.e. format-$2) stacks a format-$2 (12-byte, WITH the PPC word) frame
+  // for the Line-1111 Emulator exception — the SAME group-2 shape as TRAPV/CHK/DIV0, NOT
+  // the group-1 (format-$0) shape A-line (vector 10) correctly uses. `ExceptionUnit.scala`
+  // was fixed to add vector 11 to its `is2` (format-$2) selector; that fix is what makes
+  // this DUT's stacked SSP (0x1FFF4) correctly diverge from Musashi's (0x1FFF8) — a REAL
+  // 8-vs-12-byte frame-size mismatch confirmed via direct simulation, not a probe artifact.
+  // `pcOnly` narrows the assertion to the committed PC sequence (proving the DUT takes
+  // the F-line trap, dispatches to VBR+0x2c, and RTEs back to the correct resume PC) while
+  // being honest that the full a7/CCR/register lock-step is unverifiable against this
+  // oracle for vector 11 specifically — mirrors the CPUSH tests' whitebox-instead-of-
+  // lock-step treatment for the identical underlying Musashi limitation.
   test("lock-step: line-F opcode -> vector 11 -> handler via VBR+0x2c -> RTE", VerilatorTest) {
     runLockStep("line-f-vec11",
       "move.l #0x3000,%d0 ; movec %d0,%vbr ; move.l #handler,%d1 ; move.l %d1,0x302c ; " +
       ".word 0xFD00 ; moveq #7,%d3 ; " +
       "loop: bra loop ; " +
       "handler: move.l 2(%a7),%d0 ; addq.l #2,%d0 ; move.l %d0,2(%a7) ; moveq #1,%d2 ; rte",
-      nInstr = 11)
+      nInstr = 11, pcOnly = true)
   }
 
   // CPUSH (line-1111, real 0xF4xx encoding): a real, non-illegal 68040 instruction this

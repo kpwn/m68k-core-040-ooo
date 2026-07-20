@@ -285,7 +285,10 @@ object PortedTestRunner {
             println(f"[exctrace] LOADRSP cyc=$trCyc%6d data=0x${r.data.toLong & 0xffffffffL}%08x fault=${r.fault.toBoolean}")
           }
           if (dut.rob.logic.exc.redirectValid.toBoolean) {
-            println(f"[exctrace] EXCREDIRECT cyc=$trCyc%6d pc=0x${dut.rob.logic.exc.redirectPc.toLong & 0xffffffffL}%08x")
+            println(f"[exctrace] EXCREDIRECT cyc=$trCyc%6d pc=0x${dut.rob.logic.exc.redirectPc.toLong & 0xffffffffL}%08x " +
+              f"a7=0x${dut.rob.logic.exc.ss.a7.toLong & 0xffffffffL}%08x s=${dut.rob.logic.exc.ss.s.toBoolean} " +
+              f"m=${dut.rob.logic.exc.ss.m.toBoolean} isp=0x${dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL}%08x " +
+              f"usp=0x${dut.rob.logic.exc.ss.usp.toLong & 0xffffffffL}%08x")
           }
         }
       }

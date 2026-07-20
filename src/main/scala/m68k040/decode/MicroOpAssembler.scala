@@ -1332,7 +1332,15 @@ object MicroOpAssembler {
       opUop.cluster       := Cluster.INT
       opUop.memOp         := MemOp.NONE
       opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
-      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
+      // writesNzvc/writesX = True (task #176): RTE restores the frame's CCR into the
+      // REAL flags PRF, not just the ROB's committedCcr (which only stages a future
+      // exception's stacked SR). Setting these makes rename allocate a real pNzvcDst/
+      // pXDst for this µop, exactly like the MOVEC/MOVE-USP READ-direction sysOps
+      // (dstValid=True there): the execute-time fastFire ALU pass writes a throwaway
+      // value into the fresh phys reg (harmless — RTE is serializing, so no consumer
+      // can be renamed before the FSM's real write, at the actual frame pop, overrides
+      // it — see ExceptionUnit's rteNzvcWriteValid/rteCcrCommit + RobPlugin's wiring).
+      opUop.writesNzvc := True; opUop.writesX := True; opUop.isBranch := False
       opUop.unimplemented := False
       opUop.faulted := False; opUop.faultVector := 0
       opUop.isRte   := True

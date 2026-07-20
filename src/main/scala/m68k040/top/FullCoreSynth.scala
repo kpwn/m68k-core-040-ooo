@@ -153,7 +153,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
       rob.logic.ccrCompletion(idx).payload.result   := w.result
       rob.logic.ccrCompletion(idx).payload.intWrite := w.intWrite
     }
-    wireCcr(0, eu0.logic.wbObs); wireCcr(1, eu1.logic.wbObs); wireCcr(2, lsEu.logic.wbObs)
+    wireCcr(0, eu0.logic.ccrObs); wireCcr(1, eu1.logic.ccrObs); wireCcr(2, lsEu.logic.ccrObs)
 
     // ---- LS cluster wiring ----
     // LS issue port (3) -> LS EU. Its completion is BOTH a ROB completion (3rd
@@ -190,7 +190,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
       rob.logic.euFaultCompletion.valid   := True
       rob.logic.euFaultCompletion.payload := divEu.euFault.payload
     }
-    wireCcr(3, divEu.logic.wbObs)
+    wireCcr(3, divEu.logic.ccrObs)
     // The IQ dynamic wakeup is keyed by the producer pdst. The LS EU drives a
     // dedicated `wakeup` Flow from its REGISTERED completion stage (valid only for a
     // completing LOAD that produces a physreg — a store completes too but writes no

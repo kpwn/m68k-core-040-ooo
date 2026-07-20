@@ -1117,6 +1117,15 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     wbObs.keepCommit := compKeepCommit
     wbObs.simPublic()
 
+    // ---- ccrObs (task #176) ----
+    // Unlike the ALU EU's `wbObs` (deliberately delayed one extra cycle past its
+    // completionPort, to match the sim-only `commitObs` reconstruction join), the LS
+    // EU's `wbObs` above is ALREADY driven straight from the same registered
+    // `compValid`/`compRobId`/... that drive `completionPort` — no extra delay. A plain
+    // alias, so the ROB wiring can uniformly source the real `ccrCompletion` from
+    // `.logic.ccrObs` across all 4 EUs regardless of which ones needed the #176 fix.
+    val ccrObs = wbObs
+
     // ── Exception-unit cache arbitration MUX (LAST drivers — override the LS EU's
     // cache/TLB requests while the commit-side exception sequencer is ACTIVELY
     // accessing the cache). Placed at the end of `logic` (same scope) so the LS
