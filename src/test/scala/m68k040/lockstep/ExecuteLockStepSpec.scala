@@ -37,6 +37,17 @@ import org.scalatest.funsuite.AnyFunSuite
   */
 class ExecuteLockStepSpec extends AnyFunSuite {
 
+  // Perf: compile FullCoreDut ONCE and reuse across all ~394 tests in this suite via
+  // repeated .doSim calls, instead of a fresh Verilator recompile per test (previously
+  // every runLockStep/runIrqLockStep call did its own M68kSim().withVerilator.compile(...),
+  // making this suite's wall-clock dominated by redundant compiles rather than simulation
+  // time — the SAME fix PortedTestRunner.scala already applies via its own `lazy val
+  // compiled`). `simCounter` guarantees a unique doSim job name even if two call sites
+  // happen to reuse the same logical test `name`.
+  lazy val compiledDut = M68kSim().withVerilator.compile(new FullCoreDut)
+  private val simCounter = new java.util.concurrent.atomic.AtomicInteger(0)
+  private def freshSimName(name: String): String = s"$name-${simCounter.incrementAndGet()}"
+
   /** Wires IQ issue ports to the two ALU EUs + the branch EU, the EU completions
     * to the ROB, and the ROB's commit-time mispredict redirect (RedirectService)
     * to the IQ flush. (Frontend pipeFlush / RAT-rollback flush / fetch redirect are
@@ -453,7 +464,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       s"[$name] oracle produced ${oracleSteps.size} steps, expected >= $n (program ran past its end?)")
     val oracle = oracleSteps.take(n)
 
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       var wbCount = 0; var commitCount = 0
@@ -750,7 +761,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val eventPcs = irqEvents.map(_._1 & 0xffffffffL).toSet
     val levelByPc = irqEvents.map { case (pc, l) => (pc & 0xffffffffL) -> l }.toMap
 
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       var wbCount = 0; var commitCount = 0
@@ -1001,7 +1012,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Right(i) => i
       case Left(e)  => fail(s"assemble failed: ${e.reason}")
     }
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
@@ -1992,7 +2003,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
     var sawPriv = false
     var vec = -1
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
@@ -2068,7 +2079,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     var sawRteRetire = false
     var uspBefore = BigInt(0)
     var uspAfter  = BigInt(0)
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
@@ -3219,7 +3230,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     assert(oracleSteps.size >= nInstr, s"[$name] oracle produced ${oracleSteps.size}, expected >= $nInstr")
     val oracle = oracleSteps.take(nInstr)
 
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       var irqRaised = false
@@ -3448,7 +3459,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
     var sawPriv = false
     var vec = -1
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
@@ -3521,7 +3532,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
     var sawPriv = false
     var vec = -1
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
@@ -4023,7 +4034,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Right(i)  => i
       case Left(err) => fail(s"assemble failed: ${err.reason}")
     }
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
@@ -4107,7 +4118,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
     var committed = 0
     var faulted = false
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
@@ -4746,7 +4757,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Left(err) => fail(s"[pagefault] assemble failed: ${err.reason}")
     }
 
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
 
@@ -4919,7 +4930,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Left(err) => fail(s"[wpfault] assemble failed: ${err.reason}")
     }
 
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
 
@@ -5083,7 +5094,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val image = ProgramAssembler.assemble(src, loadAddr) match {
       case Right(i) => i; case Left(e) => fail(s"[itlb-a] assemble: ${e.reason}") }
 
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       wireWhitebox(dut, handle)
@@ -5188,7 +5199,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     assert(oracleSteps.size >= nInstr, s"[itlb-b] oracle produced ${oracleSteps.size} steps (< $nInstr)")
     val oracle = oracleSteps.take(nInstr)
 
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       wireWhitebox(dut, handle)
@@ -5313,7 +5324,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     assert(oracleSteps.size >= nInstr, s"[itlb-c] oracle produced ${oracleSteps.size} steps (< $nInstr)")
     val oracle = oracleSteps.take(nInstr)
 
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       wireWhitebox(dut, handle)
@@ -6197,7 +6208,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Left(err) => fail(s"[fx-mi-fault] assemble failed: ${err.reason}")
     }
 
-    M68kSim().withVerilator.compile(new FullCoreDut).doSim { dut =>
+    compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       def captureWb(w: m68k040.execute.WbObs): Unit = if (w.valid.toBoolean) {
