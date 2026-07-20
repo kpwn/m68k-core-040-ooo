@@ -856,6 +856,7 @@ class ExceptionUnit(
               U(0x001, 12 bits) -> ss.dfc.resize(32),
               U(0x003, 12 bits) -> Mux(mmuCtrl.mmuEnable, U(0x8000, 32 bits), U(0, 32 bits)),
               U(0x002, 12 bits) -> ss.cacr,
+              U(0x004, 12 bits) -> ss.itt0,
               U(0x806, 12 bits) -> mmuCtrl.urp,
               U(0x807, 12 bits) -> mmuCtrl.srp,
               default           -> U(0, 32 bits))   // other unmodeled Rc -> RAZ (read 0)
@@ -874,6 +875,13 @@ class ExceptionUnit(
               // so it doesn't share the sim-poke-persistence regression risk that got
               // task #131's TCR/URP/SRP write mechanism reverted.
               is(U(0x002, 12 bits)) { ss.setCacr.valid := True; ss.setCacr.payload := sysCapVal.asUInt }
+              // ITT0 (0x004), task #180: real committed storage (mirrors CACR exactly),
+              // round-trippable via MOVEC with NO functional transparent-translation
+              // effect — this core's ITLB has no TT-window matching logic (deferred,
+              // much larger gap; see the Cluster-7 MMU findings). ITT1/DTT0/DTT1 stay
+              // unimplemented (RAZ/WI via default below) — no test in this corpus
+              // exercises them individually.
+              is(U(0x004, 12 bits)) { ss.setItt0.valid := True; ss.setItt0.payload := sysCapVal.asUInt }
               // MSP (0x803) / ISP (0x804), task #170-cluster10: direct writes to the
               // SAME committed registers the S/M-bit A7 Mux already reads (ss.msp/
               // ss.isp) — no new storage, this is purely exposing the existing bank

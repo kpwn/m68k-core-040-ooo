@@ -51,8 +51,17 @@ class SystemState extends Area {
   // consumed by the page walker and were reverted after a sim-poke regression, task
   // #131 — CACR has no such consumer, so it's a plain, low-risk committed register).
   val cacr  = RegInit(U(0, 32 bits))
+  // ITT0: instruction transparent-translation register 0. Round-trippable via MOVEC
+  // (task #180, ported-tests triage cluster13/movec_itt0) with NO functional effect —
+  // this core's ITLB has no transparent-translation-window matching logic at all (a
+  // much larger, deliberately-deferred gap per the Cluster-7 MMU findings; DTT0/DTT1/
+  // ITT1 stay unimplemented too, no test in this corpus exercises them individually).
+  // Same low-risk pattern as CACR (task #170-cluster10): plain committed storage, no
+  // page-walker consumer, so no sim-poke-persistence regression risk (unlike TCR/URP/
+  // SRP, task #131, reverted).
+  val itt0  = RegInit(U(0, 32 bits))
   srSys.simPublic(); vbr.simPublic(); usp.simPublic(); isp.simPublic(); msp.simPublic()
-  sfc.simPublic(); dfc.simPublic(); cacr.simPublic()
+  sfc.simPublic(); dfc.simPublic(); cacr.simPublic(); itt0.simPublic()
 
   /** Committed S (supervisor) and M (master) bits. */
   val s = srSys(S_BIT); s.simPublic()
@@ -73,6 +82,7 @@ class SystemState extends Area {
   val setSfc   = Flow(UInt(3 bits))
   val setDfc   = Flow(UInt(3 bits))
   val setCacr  = Flow(UInt(32 bits))
+  val setItt0  = Flow(UInt(32 bits))
   // Default idle; allowOverride so a standalone/test DUT (and ExceptionUnit) can drive them.
   setSrSys.valid.allowOverride; setSrSys.valid := False; setSrSys.payload.allowOverride; setSrSys.payload := U(0, 8 bits)
   setVbr.valid.allowOverride;   setVbr.valid := False;   setVbr.payload.allowOverride;   setVbr.payload := U(0, 32 bits)
@@ -83,6 +93,7 @@ class SystemState extends Area {
   setSfc.valid.allowOverride;   setSfc.valid := False;   setSfc.payload.allowOverride;   setSfc.payload := U(0, 3 bits)
   setDfc.valid.allowOverride;   setDfc.valid := False;   setDfc.payload.allowOverride;   setDfc.payload := U(0, 3 bits)
   setCacr.valid.allowOverride;  setCacr.valid := False;  setCacr.payload.allowOverride;  setCacr.payload := U(0, 32 bits)
+  setItt0.valid.allowOverride;  setItt0.valid := False;  setItt0.payload.allowOverride;  setItt0.payload := U(0, 32 bits)
 
   // ── commit-time updates ──────────────────────────────────────────────────
   when(setSrSys.valid) { srSys := setSrSys.payload }
@@ -99,4 +110,5 @@ class SystemState extends Area {
   when(setSfc.valid)   { sfc := setSfc.payload }
   when(setDfc.valid)   { dfc := setDfc.payload }
   when(setCacr.valid)  { cacr := setCacr.payload }
+  when(setItt0.valid)  { itt0 := setItt0.payload }
 }
