@@ -979,6 +979,37 @@ object OperationDecoder {
           o.sysReadDir := False
           o.dst.setNone(); o.dstWrites := False
         }
+        // FSF (xxx).L — task #180 (ported-tests triage, cluster13/exc_fsf_xxx_l_no_fline):
+        // opword 0xF27F, ext1 0x0000 (the FScc "false" predicate — condition field is
+        // OPER_I_16()&0x3f per Musashi's fscc(), 0 selects always-false), then a 2-word
+        // abs.L address. VERIFIED via toolchain (m68k-linux-gnu-as -m68040 -m68881):
+        // the CANONICAL FSF (xxx).L per the standard <ea> table (mode=111,reg=001) is
+        // actually opword 0xF279 -- 0xF27F is mode=111,reg=111, a RESERVED <ea> encoding
+        // under the standard MC68000PRM Table 2-4 (matches no as/objdump mnemonic either).
+        // BUT this exact literal byte sequence is independently confirmed as real,
+        // static Q700 boot-ROM bytes (docs/bug_b_atrap_divergence.md, ROM SHA1
+        // 7a8ee468d16e64f2ad10cb8d1a45e6f07cc9e212, offset 0x4088D244) that real 68040+FPU
+        // silicon executes successfully (Q700/MAME boot past this point) -- almost
+        // certainly an undocumented real-hardware EA-decode quirk this project's docs
+        // couldn't independently re-derive from first principles (manual bit derivation
+        // "left genuine ambiguity" per the prior triage session). Since the condition is
+        // always-false, FSF's ENTIRE effect is "store byte 0 at <ea>, no compute, no
+        // exception, CCR unaffected" -- reusing CLR's op semantics (writes a constant 0)
+        // but with writesNzvc FALSE (unlike CLR's own Dn form): real FScc never touches
+        // condition codes, and this narrow single-literal-opcode carve-out doesn't
+        // generalize to the rest of the FScc/FBcc/FDBcc family (still F-line vec 11).
+        // MicroOpAssembler.scala substitutes a hardcoded abs.L EA field (mode7/reg1) +
+        // a words-shifted-by-1 view (skipping the discarded ext1) ONLY for this exact
+        // opword bit pattern -- EaDecoder.scala's shared <ea> table is untouched (mode7/
+        // reg7 stays ILLEGAL for every other opcode in the ISA, zero blast radius).
+        when(opword === B"16'hF27F") {
+          o.illegal := False
+          o.op := DecOp.CLR
+          o.size := Size.BYTE
+          o.srcA := easrc; o.dst := easrc
+          o.dstWrites := True
+          o.writesNzvc := False
+        }
       }
     }
     o

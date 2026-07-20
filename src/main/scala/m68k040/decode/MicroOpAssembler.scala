@@ -379,13 +379,30 @@ object MicroOpAssembler {
       else wordAtDynG(words, (U(i, 5 bits) + shift.resize(5)).resize(5))
     }
 
+  // ── FSF (xxx).L single-EA override (task #180) ──────────────────────────────────
+  // FSF's real <ea> field bits (op[5:0] = mode7/reg7) are a RESERVED encoding under
+  // the standard <ea> table — see OperationDecoder.scala's comment on opword 0xF27F
+  // for the full derivation. ONLY for that exact literal opword, substitute a
+  // hardcoded abs.L field (mode=111/reg=001) and a words view shifted by 1 (the
+  // discarded FScc condition ext word at words(1) is skipped, so the abs.L address's
+  // own 2 ext words land where EaDecoder's abs.L case expects them: words(1)##words(2)
+  // of the shifted view = pkt.words(2)##pkt.words(3)). EaDecoder.scala's shared table
+  // is untouched — mode7/reg7 stays ILLEGAL for every other opcode in the ISA.
+  private def srcEaFor(pkt: DecodePacket, size: Size.C): EaSpec = {
+    val isFsfAbsL = pkt.words(0) === B"16'hF27F"
+    EaDecoder.decode(
+      Mux(isFsfAbsL, B"6'b111001", pkt.words(0)(5 downto 0)),
+      size,
+      Mux(isFsfAbsL, shiftedWordsFor(pkt.words, U(1, 3 bits)), pkt.words))
+  }
+
   /** Compute the offload (spec + the two primary EAs) on the PRE-register packet.
     * Carried through the FetchAlign->Decode register; `assemble` then reads it instead
     * of re-running OperationDecoder + the two EaDecoders on the registered opword. */
   def computeOffload(pkt: DecodePacket): Offload = {
     val o = Offload()
     o.spec := OperationDecoder.decode(pkt.words(0))
-    o.srcEa := EaDecoder.decode(pkt.words(0)(5 downto 0), o.spec.size, pkt.words)
+    o.srcEa := srcEaFor(pkt, o.spec.size)
     val dstEaField = pkt.words(0)(8 downto 6) ## pkt.words(0)(11 downto 9)
     val dstShift = srcEaWordCount(pkt.words(0)(5 downto 3).asUInt, pkt.words(0)(2 downto 0).asUInt,
                                    o.spec.size, pkt.words)
@@ -400,7 +417,7 @@ object MicroOpAssembler {
       // offload applies only on the full DecodeStage path that supplies a complete Offload).
       val o = Offload()
       o.spec := s
-      o.srcEa := EaDecoder.decode(pkt.words(0)(5 downto 0), s.size, pkt.words)
+      o.srcEa := srcEaFor(pkt, s.size)
       val dstEaField = pkt.words(0)(8 downto 6) ## pkt.words(0)(11 downto 9)
       val dstShift = srcEaWordCount(pkt.words(0)(5 downto 3).asUInt, pkt.words(0)(2 downto 0).asUInt,
                                      s.size, pkt.words)

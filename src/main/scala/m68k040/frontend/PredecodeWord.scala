@@ -944,7 +944,18 @@ object PredecodeWord {
       // True for these lines) + MicroOpAssembler's `bad` fallback, which picks vector
       // 10/11 instead of the generic vector 4 based on this same top-nibble check.
       is(U(0xA, 4 bits)) { r.simple := True; r.lenWords := U(1, 4 bits) }
-      is(U(0xF, 4 bits)) { r.simple := True; r.lenWords := U(1, 4 bits) }
+      is(U(0xF, 4 bits)) {
+        // FSF (xxx).L narrow carve-out (task #180, exc_fsf_xxx_l_no_fline): opword
+        // 0xF27F + ext1 (discarded) + a 2-word abs.L address = 4 words total, unlike
+        // every other line-F op admitted so far (all single-word). See
+        // OperationDecoder.scala for the full derivation/rationale.
+        when(op === B"16'hF27F") {
+          r.simple   := True
+          r.lenWords := U(4, 4 bits)
+        } .otherwise {
+          r.simple := True; r.lenWords := U(1, 4 bits)
+        }
+      }
 
       default { /* complex: r stays simple=False, lenWords=0 */ }
     }
