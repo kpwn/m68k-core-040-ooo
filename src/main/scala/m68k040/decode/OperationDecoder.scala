@@ -377,6 +377,7 @@ object OperationDecoder {
           o.srcA := easrc; o.srcB := easrc; o.dst := easrc; o.dstWrites := True
           o.bcdSub := True
           o.writesNzvc := True; o.writesX := True
+          o.readsX := True; o.readsNzvc := True
         }
         // BKPT #n (0100 1000 0100 1 vvv, op[15:3]==0b0100100001001, task #178
         // cluster12/exc_bkpt_decode): no operands, no flags, no state change --
@@ -390,7 +391,6 @@ object OperationDecoder {
           o.illegal := False
           o.op := DecOp.MOVE; o.size := Size.LONG
           o.dst.setNone(); o.dstWrites := False
-          o.readsX := True; o.readsNzvc := True
         }
         // MOVEM (0100 1 d 001 s mmmrrr) + 16-bit register-mask ext word: bit11=1, bit10=d
         // (0 store / 1 load), bits 9:7=001, bit6=s (0 .W / 1 .L). The DecodeStage micro-
