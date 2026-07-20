@@ -1724,6 +1724,56 @@ object MicroOpAssembler {
       opUop.sswInstr      := True            // instruction fetch (program-space SSW)
     }
 
+    // ── Shared MEM-source LOAD µop for DIV.L/MUL.L (task #180, ported-tests triage
+    // cluster13/muldiv_indexed_mem_src) ──────────────────────────────────────────
+    // Loads size=LONG from an arbitrary `ea: EaSpec` into T0 — this is what lets a
+    // memSimple divisor/multiplier (previously force-illegal-trapped, "defer for
+    // now") actually execute instead of dropping the whole instruction. Mirrors the
+    // bit-field memory load-crack shape (`bfmLoadUop` below) but parameterized over
+    // the EA so DIV.L and MUL.L share one helper. autoMode (An)+/-(An) is EXCLUDED
+    // by the caller (divLOk/mulLOk below) -- an auto-update would need a 4th µop
+    // (a dropped ADD, like crackMemMem's anUpdUop) and the .L64 forms are already at
+    // the 3-µop budget ceiling (load+op+opHi) with zero room left, so auto-inc mem
+    // divisors/multipliers stay illegal-trapped, unchanged from before. PC-relative
+    // EAs fold pc+4 (not pc+2): the DIV.L/MUL.L selector ext word occupies pc+2, so
+    // the EA's OWN ext word starts one word later than the "plain EA-first"
+    // convention — identical shape to CMP2/CHK2/the bit-field memory crack below.
+    def divMulLoadUop(ea: EaSpec): DecodedUop = {
+      val u = DecodedUop()
+      u.valid       := pkt.valid
+      u.pc          := pkt.pc
+      u.nextPc      := nextPc
+      u.op          := DecOp.MOVE
+      u.cluster     := Cluster.LS
+      u.size        := Size.LONG
+      u.memOp       := MemOp.LOAD
+      u.srcAReg     := ea.base; u.srcAValid := ea.baseValid
+      u.srcBReg     := 0;       u.srcBValid := False
+      u.srcCReg     := ea.indexReg; u.srcCValid := ea.indexValid
+      u.dstReg      := U(T0, 5 bits); u.dstValid := True
+      u.useImm      := True
+      u.imm         := Mux(ea.pcRel, (pkt.pc + U(4, 32 bits) + ea.disp.asUInt).asBits, ea.disp)
+      u.readsNzvc   := False; u.readsX := False
+      u.writesNzvc  := False; u.writesX := False
+      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
+      u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
+      u.ccrRestore  := False; u.toCcr := False
+      u.cond        := 0; u.branchDisp := 0
+      u.unimplemented := False
+      u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+      u.faultAddr   := pkt.pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
+      u.divSigned   := False; u.div64 := False; u.divIsRem := False; u.isChk2 := False
+      u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.extByte := False
+      u.isMovea     := False; u.isScc := False; u.isDbcc := False
+      u.indexLong   := ea.indexLong; u.indexScale := ea.indexScale
+      u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+      u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+      u.predTaken := False; u.predTarget := U(0, 32 bits)
+      u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+      u.firstOfInstr := True
+      u
+    }
+
     // ── DIVU.L / DIVS.L (32/32 and 64/32) — line-4 extension-word forms ─────────
     // Opword 0100 1100 01 mmmrrr (op[15:6]==0x131); the EA (op[5:0]) is the 32-bit
     // divisor. The EXTENSION WORD words(1) carries: Dq=ext[14:12] (quotient dst +
@@ -1790,7 +1840,9 @@ object MicroOpAssembler {
     divlUop.sysOp := False; divlUop.sysKind := SysKind.NONE; divlUop.sysReadDir := False
     divlUop.predTaken := False; divlUop.predTarget := U(0, 32 bits)
     divlUop.phtValid := False; divlUop.phtIndex := U(0, 11 bits); divlUop.casForm := 0
-    divlUop.firstOfInstr  := True
+    // firstOfInstr: True unless a leading LOAD µop precedes it (memSimple divisor,
+    // task #180 — the load becomes uops(0) and divlUop moves to uops(1)).
+    divlUop.firstOfInstr  := !divlDivisorIsMem
     // 64-bit dividend high word Dr: carried in srcC (psrcC after rename). For the
     // 32-bit form psrcC is unused.
     divlUop.srcCReg       := divlDr; divlUop.srcCValid := divl64
@@ -1817,7 +1869,35 @@ object MicroOpAssembler {
     divremUop.size          := Size.LONG
     divremUop.memOp         := MemOp.NONE
     divremUop.srcAReg       := divlDr; divremUop.srcAValid := True   // Dr's OLD value (overflow write-through)
-    divremUop.srcBReg       := 0; divremUop.srcBValid := False
+    // srcB = Dq (divlUop's OWN destination), task #180 (ported-tests triage
+    // cluster13/muldiv_indexed_mem_src): a REAL rename/scoreboard dependency on the
+    // immediately-preceding DIV's destination, not just for its VALUE (unused by the
+    // DIVREM compute below, which reads only s1A + the DivEu's internal remLatch) but
+    // to CLOSE A LATENT ISSUE-ORDERING RACE. DIVREM's completion previously relied
+    // SOLELY on "age-ordered single-outstanding CPLX issue" (an assumed invariant,
+    // per the doc comment above) -- but IssueQueuePlugin's CPLX port picks the OLDEST
+    // *READY* op each cycle, not a hard "older-blocks-younger" barrier. DIVREM has NO
+    // real source operand of its own (srcA/Dr is unrelated to Dq whenever Dr!=Dq, the
+    // common rem-producing case), so with reg/imm divisors DIV becomes ready fast
+    // enough that DIVREM (pushed one cycle later) never actually got a chance to race
+    // ahead -- but a memSimple divisor (task #180's new leading-LOAD crack) gives DIV
+    // real latency, and DIVREM (deps-free) raced ahead and read `remLatch` before DIV
+    // ever ran, confirmed via PORTED_TRACE_DIV (a stale/garbage writeback landed
+    // BEFORE the DIV's own writeback in the trace). Reading Dq forces the rename
+    // scoreboard to hold DIVREM not-ready until DIV's own completion writes it,
+    // which is correct EVERY time regardless of the leading op's latency.
+    // GATED to the memSimple-divisor case only: an earlier version of this fix made
+    // the dependency unconditional and it REGRESSED 5 previously-PASSING reg/imm
+    // ported tests (divl_basic, divl_sz0_dual_dest, divl_sz1_signed_neg,
+    // divl_sz1_unsigned_basic, divide_test — all deadbeef/wrong-result, confirmed via
+    // a stash-and-rerun bisection against the pre-fix baseline) — root cause not
+    // fully chased down (something about the extra same-cycle intra-bundle rename
+    // read tripping a scoreboard/free-list interaction for the reg/imm path, which
+    // apparently relied on more than just "age-ordered issue" in a way this session
+    // didn't have time to fully characterize), so the safe fix is to add the barrier
+    // ONLY where it's actually needed (the new memSimple-divisor path, which has no
+    // prior working behavior to regress).
+    divremUop.srcBReg       := divlDq; divremUop.srcBValid := divlDivisorIsMem
     divremUop.srcCReg       := 0; divremUop.srcCValid := False
     divremUop.useImm        := False; divremUop.imm := 0
     divremUop.dstReg        := divlDr; divremUop.dstValid := True          // remainder -> Dr
@@ -1839,10 +1919,15 @@ object MicroOpAssembler {
     divremUop.phtValid := False; divremUop.phtIndex := U(0, 11 bits); divremUop.casForm := 0
     divremUop.firstOfInstr  := False           // trailing crack µop
 
-    // DIV.L is valid only when its divisor EA is reg/imm. A memSimple divisor would
-    // need a leading load crack too (3-µop) -> defer for now; reg/imm cover the
-    // lock-step + common cases.
-    val divLOk = divlDivisorIsReg || divlDivisorIsImm
+    // DIV.L divisor EA: reg/imm (always OK), OR a memSimple (non-auto-update) EA —
+    // task #180 (ported-tests triage cluster13/muldiv_indexed_mem_src): a leading
+    // LOAD µop (divlLoadUop below) now supplies T0, so a memSimple divisor is no
+    // longer force-illegal-trapped. (An)+/-(An) still isn't supported (would need a
+    // 4th µop for the auto-update ADD — no room left at the .L64 3-µop ceiling) and
+    // stays illegal, unchanged from before.
+    val divlDivisorOkMem = divlDivisorIsMem && (divlSrcEa.autoMode === EaAuto.NONE)
+    val divLOk = divlDivisorIsReg || divlDivisorIsImm || divlDivisorOkMem
+    val divlLoadUop = divMulLoadUop(divlSrcEa)
 
     // An unsupported DIV.L (memSimple divisor) -> mark the op µop illegal (vector 4),
     // exactly like the `bad` path. opUop is already illegal for the 4C4x opword
@@ -1915,12 +2000,37 @@ object MicroOpAssembler {
     mullUop.sysOp := False; mullUop.sysKind := SysKind.NONE; mullUop.sysReadDir := False
     mullUop.predTaken := False; mullUop.predTarget := U(0, 32 bits)
     mullUop.phtValid := False; mullUop.phtIndex := U(0, 11 bits); mullUop.casForm := 0
-    mullUop.firstOfInstr  := True
+    // firstOfInstr: True unless a leading LOAD µop precedes it (memSimple multiplier,
+    // task #180 — the load becomes uops(0) and mullUop moves to uops(1)).
+    mullUop.firstOfInstr  := !mullMulIsMem
 
     // MULHI (high-product move) µop (.L64 only): CPLX, writes the EU's LATCHED high
-    // product to Dh. No real register source (the high product is an internal latch)
-    // -> implicit dependency on the immediately-preceding MUL, enforced by age-ordered
-    // single-outstanding CPLX issue. Writes Dh; sets no flags (the MUL set N/Z; V=0).
+    // product to Dh. The high product itself is an internal EU latch (no real source
+    // for the VALUE) -- but srcA reads Dl (mullUop's OWN destination) purely as a
+    // rename/scoreboard ORDERING BARRIER, task #180 (ported-tests triage
+    // cluster13/muldiv_indexed_mem_src): this used to rely SOLELY on "age-ordered
+    // single-outstanding CPLX issue" (an assumed invariant) -- but IssueQueuePlugin's
+    // CPLX port picks the OLDEST *READY* op each cycle, not a hard "older-blocks-
+    // younger" barrier. With a reg/imm multiplier, MUL became ready fast enough that
+    // deps-free MULHI (pushed one cycle later) never actually got a chance to race
+    // ahead -- but a memSimple multiplier (task #180's new leading-LOAD crack) gives
+    // MUL real latency, and MULHI raced ahead and read `mulHiLatch` before MUL ever
+    // ran, confirmed via PORTED_TRACE_DIV (a stale/garbage writeback landed BEFORE
+    // the MUL's own writeback in the trace). Reading Dl forces the rename scoreboard
+    // to hold MULHI not-ready until MUL's own completion writes it, which is correct
+    // EVERY time regardless of the leading op's latency.
+    // GATED to the memSimple-multiplier case only (srcAValid := mullMulIsMem, not
+    // unconditional True): an earlier version of this fix made the dependency
+    // unconditional and it REGRESSED a previously-PASSING reg/imm ported test
+    // (mull_sz1_64bit_product went from PASS to a different FAIL — actually already
+    // failing on baseline for THIS specific test but the same class of divl_*
+    // regressions was confirmed via a stash-and-rerun bisection for DIVREM's
+    // analogous case) — root cause not fully chased down (something about the extra
+    // same-cycle intra-bundle rename read tripping a scoreboard/free-list
+    // interaction for the reg/imm path this session didn't have time to fully
+    // characterize), so the barrier is added ONLY where it's actually needed (the
+    // new memSimple-multiplier path, which has no prior working behavior to regress).
+    // Writes Dh; sets no flags (the MUL set N/Z; V=0).
     val mulhiUop = DecodedUop()
     mulhiUop.valid         := pkt.valid
     mulhiUop.pc            := pkt.pc
@@ -1929,7 +2039,7 @@ object MicroOpAssembler {
     mulhiUop.cluster       := Cluster.CPLX
     mulhiUop.size          := Size.LONG
     mulhiUop.memOp         := MemOp.NONE
-    mulhiUop.srcAReg       := 0; mulhiUop.srcAValid := False
+    mulhiUop.srcAReg       := mullDl; mulhiUop.srcAValid := mullMulIsMem
     mulhiUop.srcBReg       := 0; mulhiUop.srcBValid := False
     mulhiUop.srcCReg       := 0; mulhiUop.srcCValid := False
     mulhiUop.useImm        := False; mulhiUop.imm := 0
@@ -1952,9 +2062,15 @@ object MicroOpAssembler {
     mulhiUop.phtValid := False; mulhiUop.phtIndex := U(0, 11 bits); mulhiUop.casForm := 0
     mulhiUop.firstOfInstr  := False           // trailing crack µop
 
-    // MUL.L is valid only when its multiplier EA is reg/imm (a memSimple multiplier
-    // would need a leading load crack -> defer; reg/imm cover lock-step + common cases).
-    val mulLOk = mullMulIsReg || mullMulIsImm
+    // MUL.L multiplier EA: reg/imm (always OK), OR a memSimple (non-auto-update) EA —
+    // task #180 (ported-tests triage cluster13/muldiv_indexed_mem_src): a leading
+    // LOAD µop (mullLoadUop below) now supplies T0, so a memSimple multiplier is no
+    // longer force-illegal-trapped. (An)+/-(An) still isn't supported (would need a
+    // 4th µop for the auto-update ADD — no room left at the .L64 3-µop ceiling) and
+    // stays illegal, unchanged from before.
+    val mullMulOkMem = mullMulIsMem && (mullSrcEa.autoMode === EaAuto.NONE)
+    val mulLOk = mullMulIsReg || mullMulIsImm || mullMulOkMem
+    val mullLoadUop = divMulLoadUop(mullSrcEa)
     when(isMulLOp && !mulLOk) {
       opUop.op            := DecOp.ILLEGAL
       opUop.cluster       := Cluster.INT
@@ -2656,6 +2772,19 @@ object MicroOpAssembler {
         out.count   := 1
         out.uops(0) := opUop      // forced illegal (vector 4) above
         out.uops(1) := opUop
+      } elsewhen(divlDivisorIsMem) {
+        // memSimple divisor (task #180): [load.L <ea> -> T0] prepended. divlUop reads
+        // T0 (already wired above) instead of a register/immediate.
+        when(divlHasRem) {
+          out.count   := 3
+          out.uops(0) := divlLoadUop
+          out.uops(1) := divlUop      // quotient -> Dq
+          out.uops(2) := divremUop    // remainder -> Dr
+        } otherwise {
+          out.count   := 2
+          out.uops(0) := divlLoadUop
+          out.uops(1) := divlUop      // quotient-only (Dr==Dq)
+        }
       } elsewhen(divlHasRem) {
         out.count   := 2
         out.uops(0) := divlUop      // quotient -> Dq
@@ -2670,6 +2799,19 @@ object MicroOpAssembler {
         out.count   := 1
         out.uops(0) := opUop        // forced illegal (vector 4) above
         out.uops(1) := opUop
+      } elsewhen(mullMulIsMem) {
+        // memSimple multiplier (task #180): [load.L <ea> -> T0] prepended. mullUop
+        // reads T0 (already wired above) instead of a register/immediate.
+        when(mull64) {
+          out.count   := 3
+          out.uops(0) := mullLoadUop
+          out.uops(1) := mullUop      // low product -> Dl
+          out.uops(2) := mulhiUop     // high product -> Dh
+        } otherwise {
+          out.count   := 2
+          out.uops(0) := mullLoadUop
+          out.uops(1) := mullUop      // 32x32->32 (single dest Dl)
+        }
       } elsewhen(mull64) {
         out.count   := 2
         out.uops(0) := mullUop      // low product -> Dl
