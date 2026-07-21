@@ -317,6 +317,22 @@ class ExceptionUnit(
   // committing to this same physical register while RTE's serializing FSM owns the
   // ROB head (retire0/1 are blocked the whole time), so a same-cycle multi-writer
   // collision cannot occur, and there is no freelist pop/push at all to race.
+  //
+  // task #192: this SAME pair of ports is now ALSO pulsed by S_REDIR for a
+  // MOVE-to-SR / STOP commit (sysCapKind 1/5, which write the FULL CCR via
+  // `obsSetCcr5`). Before this fix, MOVE-to-SR/STOP's CCR write landed ONLY in
+  // RobPlugin's `committedCcr` whitebox-tracking shadow (fed by `obsSetCcr5Valid`,
+  // consumed for exception-frame stacking + lock-step comparison) -- never in the
+  // REAL NZVC/X physical registers an ordinary Bcc/ADDX/flag-consumer actually
+  // reads. A Bcc immediately following `MOVE #imm,SR`/`MOVE Dn,SR`/`MOVE <ea>,SR`/
+  // STOP therefore saw STALE flags (ported-tests move_ea_sr_ccr_direct family).
+  // Reusing rteNzvcWriteValid/rteXWriteValid (rather than adding a new port) is
+  // safe: this is the SAME single FSM, RTE's own pulse (R_POP/R_SRREQ family, see
+  // below) and this sysOp pulse (S_REDIR) are DIFFERENT states of the SAME `fsm`,
+  // so `whenIsActive` makes the two drivers mutually exclusive by construction --
+  // and MOVE-to-SR/STOP are themselves serializing sysOps (sysRetire retires the
+  // ROB head ALONE), so the same "nothing else can be committing to this physical
+  // register concurrently" safety argument applies unchanged.
   val rteNzvcWriteValid = Bool();       rteNzvcWriteValid := False;       rteNzvcWriteValid.simPublic()
   val rteNzvcWriteData  = Bits(4 bits); rteNzvcWriteData  := B(0, 4 bits); rteNzvcWriteData.simPublic()
   val rteXWriteValid    = Bool();       rteXWriteValid    := False;       rteXWriteValid.simPublic()
@@ -1133,6 +1149,15 @@ class ExceptionUnit(
       when(sysCapKind === U(1, 3 bits) || sysCapKind === U(5, 3 bits)) {
         obsSetCcr5Valid := True
         obsSetCcr5      := sysCapVal(4 downto 0).asUInt
+        // task #192: ALSO land the CCR in the REAL NZVC/X physical registers (not
+        // just the whitebox `committedCcr` shadow above) -- see the class-level doc
+        // comment on rteNzvcWriteValid for the full rationale/safety argument. SR/CCR
+        // bit layout: bit4=X, bits3..0=N,Z,V,C (matches RTE's popSr(3 downto 0)/
+        // popSr(4) split above).
+        rteNzvcWriteValid := True
+        rteNzvcWriteData  := sysCapVal(3 downto 0)
+        rteXWriteValid    := True
+        rteXWriteData     := sysCapVal(4)
       }
       redirectValid := True
       redirectPc    := sysCapNextPc
