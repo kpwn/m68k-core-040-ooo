@@ -1046,8 +1046,22 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           // check traps first), restoring the pre-task-189 behavior for the
           // faulting case while leaving the bus-error mechanism fully live for
           // every ordinary load.
+          //
+          // FURTHER EXCEPTION (2nd code-review fix): the suppression above must
+          // only apply when the access is genuinely user-mode — gating on the
+          // STATIC `u1.needsSupervisor` tag alone (regardless of the actual
+          // runtime S bit) silently swallowed a real bus error for a SUPERVISOR-
+          // mode `MOVE <ea>,SR`: the later sysOp's own privilege check would then
+          // correctly NOT trap (already supervisor), so nothing else catches the
+          // fault, and garbage/stale `loadRsp.payload.data` (meaningless on a
+          // bus-error response — no line was allocated) would silently commit
+          // into SR. Re-check the LIVE `xlate.req.supervisor` (the same signal
+          // `captureFault` itself already reads into `compFaultSup` below) so the
+          // suppression only fires for the genuine user-mode race this was built
+          // for; a supervisor-mode bus error reports normally.
           when(!poisoned) {
-            when(dcache.loadRsp.payload.fault && !u1.needsSupervisor) { captureFault(atc = false) }
+            val suppressForLaterPrivCheck = u1.needsSupervisor && !xlate.req.supervisor
+            when(dcache.loadRsp.payload.fault && !suppressForLaterPrivCheck) { captureFault(atc = false) }
             .otherwise { captureCompletion(dcache.loadRsp.payload.data) }
           }
           busy    := False
