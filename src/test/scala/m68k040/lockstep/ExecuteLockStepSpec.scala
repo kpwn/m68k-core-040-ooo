@@ -3415,24 +3415,21 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 11)
   }
 
-  // `pcOnly` (task #176, m68k-ooo triage): a SECOND confirmed Musashi CPU_TYPE_68040
-  // oracle gap (same class as the CPUSH gap documented above, found while fixing the
-  // ported `exc_user_vbr_rte_matrix` test's F-line handling). Musashi's
-  // `m68ki_exception_1111` (m68kcpu.h) unconditionally stacks a format-$0 (8-byte)
-  // frame via `m68ki_stack_frame_0000` for EVERY CPU type — it never special-cases
-  // CPU_TYPE_68040. Real 68040 hardware (and the vendored m68k-ooo ported-test corpus,
-  // which now passes: `exc_user_vbr_rte_matrix`'s `_h_fline` handler explicitly checks
-  // SSP == base-12, i.e. format-$2) stacks a format-$2 (12-byte, WITH the PPC word) frame
-  // for the Line-1111 Emulator exception — the SAME group-2 shape as TRAPV/CHK/DIV0, NOT
-  // the group-1 (format-$0) shape A-line (vector 10) correctly uses. `ExceptionUnit.scala`
-  // was fixed to add vector 11 to its `is2` (format-$2) selector; that fix is what makes
-  // this DUT's stacked SSP (0x1FFF4) correctly diverge from Musashi's (0x1FFF8) — a REAL
-  // 8-vs-12-byte frame-size mismatch confirmed via direct simulation, not a probe artifact.
-  // `pcOnly` narrows the assertion to the committed PC sequence (proving the DUT takes
-  // the F-line trap, dispatches to VBR+0x2c, and RTEs back to the correct resume PC) while
-  // being honest that the full a7/CCR/register lock-step is unverifiable against this
-  // oracle for vector 11 specifically — mirrors the CPUSH tests' whitebox-instead-of-
-  // lock-step treatment for the identical underlying Musashi limitation.
+  // `pcOnly` (task #176 follow-up, DISPUTED — see `ExceptionUnit.scala`'s `is2` comment
+  // for the full writeup): Musashi's `m68ki_exception_1111` unconditionally stacks
+  // format-$0 (8 bytes) for vector 11 regardless of CPU_TYPE, and a strict reading of
+  // the MC68040 User's Manual (9.6.1) suggests format-$0 is also correct on real
+  // hardware for a genuinely illegal/unrecognized F-line opcode (format-$2 is
+  // documented only for a recognized-but-hardware-unimplemented FPU coprocessor-ID-1
+  // opcode, cpID==001 — `0xFD00` here has cpID=110, arguably still the illegal case).
+  // BUT the vendored ported test `exc_user_vbr_rte_matrix` hardcodes an explicit
+  // format-$2 (SSP=base-12) expectation for its own F-line opcode, and this project's
+  // standing goal is to match the m68k-ooo test corpus — so `ExceptionUnit.scala` keeps
+  // format-$2 for vector 11, diverging from Musashi (same treatment as the CPUSH gap
+  // below). `pcOnly` narrows this test's assertion to the committed PC sequence
+  // accordingly. This is a genuinely unresolved disagreement between two sources of
+  // truth (Musashi vs. the ported corpus), not a confidently-settled fact — a future
+  // session with more primary-source clarity may want to revisit which side is right.
   test("lock-step: line-F opcode -> vector 11 -> handler via VBR+0x2c -> RTE", VerilatorTest) {
     runLockStep("line-f-vec11",
       "move.l #0x3000,%d0 ; movec %d0,%vbr ; move.l #handler,%d1 ; move.l %d1,0x302c ; " +

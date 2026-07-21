@@ -464,15 +464,28 @@ class ExceptionUnit(
         val is7 = !entryIsInterrupt && (entryVector === 2)   // access fault -> format-$7
         // The 68040 group-2 traps stack a 6-word format-$2 frame {SR, PC(=nextPc),
         // 0x2000|vec<<2, PPC} (Musashi m68ki_stack_frame_0010): TRAPV (vector 7), CHK
-        // (vector 6), DIV0/integer-divide-by-zero (vector 5), AND the Line-1111
-        // Emulator (F-line, vector 11) -- task #176's exc_user_vbr_rte_matrix
-        // investigation found vector 11 was missing here, so an F-line trap stacked
-        // the WRONG (format-$0, 8-byte) frame instead of format-$2 (12-byte, with the
-        // PPC word) -- confirmed against the MC68040 User's Manual exception-vector
-        // table (F-line is a group-2 emulator trap, like A-line's group-1 counterpart
-        // is format-$0). PC = the next instruction (faultUsesNextPc); PPC = the
-        // trapping instruction's own PC (both already correctly threaded for F-line
-        // by decode's line-4 trap framing, per [[traps-trap-trapv]]).
+        // (vector 6), DIV0/integer-divide-by-zero (vector 5), AND F-line (vector 11).
+        //
+        // F-line's inclusion here is DISPUTED, not settled — flagging honestly rather
+        // than re-asserting task #176's original "confirmed" framing, which a code
+        // review found overconfident. Musashi's own m68ki_exception_1111 unconditionally
+        // uses format-$0 for vector 11 regardless of CPU_TYPE, and the MC68040 User's
+        // Manual (9.6.1) ties format-$2 specifically to a RECOGNIZED-but-hardware-
+        // unimplemented FPU coprocessor-ID-1 opcode (cpID = op[11:9] == 001, Table
+        // 9-10) — a genuinely illegal/unrecognized F-line opcode (which is arguably ALL
+        // this FPU-less core can ever produce, since it has zero FPU decode) should by
+        // that reading stack format-$0 instead, matching Musashi. BUT the vendored
+        // m68k-ooo ported test `exc_user_vbr_rte_matrix.s` hardcodes an explicit
+        // `cmp.l #0x0001FFF4,%a7` check (i.e. format-$2, 12 bytes) for its own F-line
+        // opcode (`0xF123`, cpID=000 — the "illegal" case by the manual reading above),
+        // and this project's standing goal is to match the m68k-ooo test corpus. Kept
+        // format-$2 here (diverging from Musashi, like the already-established CPUSH
+        // gap below) to match the test corpus; the corresponding ExecuteLockStepSpec
+        // "line-F opcode" test uses `pcOnly` for the same reason. If a future session
+        // gets more definitive primary-source clarity (e.g. finding real 68040 silicon
+        // or a more complete manual excerpt that resolves the cpID question), revisit
+        // this — it's a genuine unresolved disagreement between two sources of truth,
+        // not a confidently-verified fact either direction.
         val is2 = !entryIsInterrupt &&
                   ((entryVector === 7) || (entryVector === 6) || (entryVector === 5) || (entryVector === 11))
         // PPC: supplied explicitly (variable-length CHK/DIV0); fall back to entryPc-2
