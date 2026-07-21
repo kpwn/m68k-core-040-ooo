@@ -187,14 +187,19 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val s1bfExt    = s1mi_pkt.words(1)
     val s1bfEa     = EaDecoder.decode(s1mi_opw(5 downto 0), Size.LONG,
                                       Vec(s1mi_opw, s1mi_pkt.words(2), s1mi_pkt.words(3)))
-    // task #197: baseValid dropped -- mirrors slot0IsBfDynMem's identical relaxation above
-    // (abs.W/.L EAs are MEMSIMPLE/baseValid=False; the Do=1-abs case is separately carved
-    // out to the illegal entry at ucBfDynRdEntry, not pre-filtered here).
+    // task #197: baseValid dropped for TRUE abs EAs only -- mirrors slot0IsBfDynMem's
+    // identical relaxation above (abs.W/.L EAs are MEMSIMPLE/baseValid=False; the Do=1-abs
+    // case is separately carved out to the illegal entry at ucBfDynRdEntry, not pre-filtered
+    // here). `!s1bfEa.pcRel` keeps (d16,PC) OUT of this engine (see s0bfEaOk's comment above
+    // for the full rationale — neither the DO0 fold nor the DO1 byteBase recompute fold the
+    // PC value, so admitting it here would silently miscompute instead of the pre-existing
+    // fail-safe illegal trap).
     val slot1IsBfDynMemEarly = fed.valid && fed.payload.slot1Valid &&
       (slot1Spec0.op === DecOp.BITFIELD) && !slot1Spec0.microcoded &&
       ((slot1Spec0.bfOp === 0) || (slot1Spec0.bfOp === 1) || (slot1Spec0.bfOp === 3) || (slot1Spec0.bfOp === 5)) &&
       (s1bfExt(11) || s1bfExt(5)) &&
-      (s1bfEa.klass === EaClass.MEMSIMPLE) && (s1bfEa.autoMode === EaAuto.NONE)
+      (s1bfEa.klass === EaClass.MEMSIMPLE) && (s1bfEa.autoMode === EaAuto.NONE) &&
+      (s1bfEa.baseValid || !s1bfEa.pcRel)
 
     // slot1 is emitted alongside slot0 only when: not replaying a stash, slot1 present,
     // slot0 is NOT 3-µop, slot1 itself is NOT 3-µop (a 3-µop slot1 is deferred), and
@@ -469,7 +474,22 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // Do=1 (dynamic OFFSET) abs EA is separately carved out to the illegal entry at
     // ucBfDynRdEntry (mirrors ucBfRmwDynEntry's identical abs+Do1 carve-out) -- this gate
     // only needs to admit the EA class here, not pre-filter Do.
-    val s0bfEaOk   = (s0bfEa.klass === EaClass.MEMSIMPLE) && (s0bfEa.autoMode === EaAuto.NONE)
+    //
+    // `!s0bfEa.pcRel` (review follow-up): PC-relative (d16,PC) is ALSO klass=MEMSIMPLE/
+    // baseValid=False, so the plain baseValid-drop above would ALSO newly admit a dynamic
+    // (d16,PC) read into this engine -- but neither ucBfDispLo (Do=0 fold) nor the DO1
+    // UBfAdd byteBase recompute (Do=1) fold the PC value at all (unlike the OLD
+    // MicroOpAssembler crack's `bfmDispLo`, which explicitly Muxes on `.pcRel`). Admitting
+    // it here would silently compute a WRONG address (missing +pc+4+disp) instead of the
+    // pre-existing fail-safe illegal trap (bfmBad fires for ANY bfDo||bfDw regardless of
+    // baseValid) -- trading a clean trap for a silent miscompute, strictly worse. Proper
+    // (d16,PC) dynamic bit-field read support (task #197's bf_pcrel_read.s) is a real,
+    // separate, NOT-YET-IMPLEMENTED feature (needs a PC+disp constant folded into the
+    // engine, a new Ctx field + selector + likely dedicated PC-rel DO0/DO1 ROM entries) --
+    // deliberately excluded here so it keeps falling through to the existing fail-safe
+    // trap, exactly as it did before this task's abs-EA fix.
+    val s0bfEaOk   = (s0bfEa.klass === EaClass.MEMSIMPLE) && (s0bfEa.autoMode === EaAuto.NONE) &&
+                      (s0bfEa.baseValid || !s0bfEa.pcRel)
     val slot0IsBfDynMem = fed.valid && (spec0.op === DecOp.BITFIELD) && !spec0.microcoded &&
                           s0bfRdOnly && s0bfDynM && s0bfEaOk
     // A slot0 owned by the µcode engine: an OperationDecoder-microcoded op OR a full-format
