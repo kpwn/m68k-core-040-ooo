@@ -194,12 +194,21 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // for the full rationale — neither the DO0 fold nor the DO1 byteBase recompute fold the
     // PC value, so admitting it here would silently miscompute instead of the pre-existing
     // fail-safe illegal trap).
+    // Task #199 (bf_pcrel_read/bf_pcrel_idx_traps_alive): a DYNAMIC-OFFSET (Do=1, ext[11])
+    // (d16,PC) read is now admitted too — the new BF_DYN_RD_PCREL_DO1/BF_DYN_FFO_PCREL_DO1
+    // ROM entries (see Microcode.scala) fold a decode-time `pc+4` constant into the byteBase
+    // recompute instead of reading SEaBase as a register, exactly filling the gap this
+    // comment used to describe. A Dw-only (dynamic WIDTH, static offset — the DO0 shape)
+    // (d16,PC) read has NO working entry yet (the static-offset fold would need `pc+4+disp`
+    // threaded into `eaDispLo` itself, a separate follow-up) -- `s1bfDo` scopes the admit to
+    // Do=1 only, leaving the DO0 PC-rel shape on its pre-existing fail-safe illegal trap.
+    val s1bfDo = s1bfExt(11)
     val slot1IsBfDynMemEarly = fed.valid && fed.payload.slot1Valid &&
       (slot1Spec0.op === DecOp.BITFIELD) && !slot1Spec0.microcoded &&
       ((slot1Spec0.bfOp === 0) || (slot1Spec0.bfOp === 1) || (slot1Spec0.bfOp === 3) || (slot1Spec0.bfOp === 5)) &&
       (s1bfExt(11) || s1bfExt(5)) &&
       (s1bfEa.klass === EaClass.MEMSIMPLE) && (s1bfEa.autoMode === EaAuto.NONE) &&
-      (s1bfEa.baseValid || !s1bfEa.pcRel)
+      (s1bfEa.baseValid || !s1bfEa.pcRel || s1bfDo)
     // slot1 MEMORY-INDIRECT read-only bit-field (task #197) — mirrors slot0IsBfMemindMem's
     // identical rationale above (no baseValid/Do||Dw filter; no-index only).
     val slot1IsBfMemindMemEarly = fed.valid && fed.payload.slot1Valid &&
@@ -489,13 +498,22 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // it here would silently compute a WRONG address (missing +pc+4+disp) instead of the
     // pre-existing fail-safe illegal trap (bfmBad fires for ANY bfDo||bfDw regardless of
     // baseValid) -- trading a clean trap for a silent miscompute, strictly worse. Proper
-    // (d16,PC) dynamic bit-field read support (task #197's bf_pcrel_read.s) is a real,
-    // separate, NOT-YET-IMPLEMENTED feature (needs a PC+disp constant folded into the
-    // engine, a new Ctx field + selector + likely dedicated PC-rel DO0/DO1 ROM entries) --
-    // deliberately excluded here so it keeps falling through to the existing fail-safe
-    // trap, exactly as it did before this task's abs-EA fix.
+    // (d16,PC) dynamic bit-field read support (task #197's bf_pcrel_read.s) WAS a real,
+    // separate, NOT-YET-IMPLEMENTED feature — task #199 implemented the Do=1 (dynamic
+    // OFFSET) half of it: a new `ctx.bfPcRelConst` field (= pc+4, the address of the EA's
+    // own extension word, computed at ucBegin — see ucBfPcRelConst below) + `SBfPcRelConst`
+    // selector + dedicated BF_DYN_RD_PCREL_DO1/BF_DYN_FFO_PCREL_DO1 ROM entries that fold
+    // it into the byteBase recompute (replacing the DO1 chain's `UBfAdd srcA=SEaBase` — a
+    // REGISTER read that would read garbage for a PC-rel EA — with `srcA=T0(byteDelta),
+    // useImm=true, imm=SBfPcRelConst`; `eaDispLo` already carries the raw EA disp
+    // unchanged, exactly like the register-base case, so it still applies on top). `s0bfDo`
+    // scopes the admit to Do=1 ONLY: a Dw-only (dynamic WIDTH, static offset — DO0) (d16,PC)
+    // read has NO working entry yet (the static-offset fold would need `pc+4+disp` threaded
+    // into `eaDispLo` itself at ucBegin, a separate, smaller follow-up not needed by any
+    // currently-known test) -- it stays on the pre-existing fail-safe illegal trap.
+    val s0bfDo = s0bfExt(11)
     val s0bfEaOk   = (s0bfEa.klass === EaClass.MEMSIMPLE) && (s0bfEa.autoMode === EaAuto.NONE) &&
-                      (s0bfEa.baseValid || !s0bfEa.pcRel)
+                      (s0bfEa.baseValid || !s0bfEa.pcRel || s0bfDo)
     val slot0IsBfDynMem = fed.valid && (spec0.op === DecOp.BITFIELD) && !spec0.microcoded &&
                           s0bfRdOnly && s0bfDynM && s0bfEaOk
     // ── Bit-field MEMORY-INDIRECT read-only detection (task #197) ─────────────────
@@ -797,9 +815,24 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val ucBfBitOff  = (ucBfOffset5 & U(7, 5 bits)).resize(3)   // 0..7
     val ucBfNeedHi  = (ucBfBitOff.resize(6) + ucBfWidth.resize(6)) > U(32, 6 bits)
     // byteAddr disp = EA disp + (offset>>3). PC-rel is ILLEGAL for RMW (never reaches the
-    // engine), so the base is always an An or absolute -> no pcRel fold needed.
+    // engine -- OperationDecoder's `ctrlAlterable` gate excludes mode 7-2/7-3 for the RMW
+    // forms), so for RMW the base is always an An or absolute -> no pcRel fold needed. The
+    // READ-ONLY Do=1 (dynamic-offset) forms CAN be PC-rel (task #199) -- see
+    // `ucBfPcRelConst` below, folded in via the NEW PC-rel DO1 ROM entries instead of here.
     val ucBfDispLo  = (ucBfEaDec.disp.asUInt + ucBfByteOff).asBits
     val ucBfDispHi  = (ucBfDispLo.asUInt + U(4, 32 bits)).asBits   // byteAddr+4 (spill byte)
+    // Task #199 (bf_pcrel_read/bf_pcrel_idx_traps_alive): the PC-relative reference point
+    // for a dynamic-offset (Do=1) bit-field read = the address of the EA's OWN extension
+    // word = pc+4 (2 leading words: opword + bf-ext word — mirrors the OLD 3a
+    // MicroOpAssembler crack's `bfmPcRelAddr` and MicroOpAssembler's CMP2/CHK2 EA re-decode
+    // shift). Deliberately does NOT fold `ucBfEaDec.disp` in here (unlike the 3a crack's
+    // `bfmPcRelAddr`) — the NEW BF_DYN_RD_PCREL_DO1/BF_DYN_FFO_PCREL_DO1 ROM entries add
+    // this as the byteBase (replacing the DO1 chain's register-sourced `SEaBase`), and the
+    // EXISTING `eaDispLo` (already `ucBfEaDec.disp` for Do=1, since `ucBfByteOff` is forced
+    // 0) still applies on top at the load rows, exactly like the register-base case —
+    // folding disp into BOTH would double-count it. Harmless (unread) for every non-PC-rel
+    // customer.
+    val ucBfPcRelConst = (ucEntryPkt.pc + U(4, 32 bits)).asBits
     // imm packing identical to the 3a bfmImm (AluEu already decodes this layout):
     //   imm[4:0]=0 (rotate offset), imm[9:5]=rawWidth, imm[12:10]=bitOff, imm[13]=needHi,
     //   imm[18:14]=origOffset.
@@ -813,6 +846,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.eaIndexScale := ucBfEaDec.indexScale
     ucEntryCtx.eaDispLo     := ucBfDispLo
     ucEntryCtx.eaDispHi     := ucBfDispHi
+    ucEntryCtx.bfPcRelConst := ucBfPcRelConst
     // task #197: the POST-dereference byte address for a memory-indirect bit-field EA (the
     // MI_BF_* entries' loads/stores anchor on the resolved-pointer TEMP, not SEaBase, so
     // they need this separate from eaDispLo/Hi above, which stay reserved for the POINTER's
@@ -1347,12 +1381,20 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // slot0IsBfDynMem/slot1IsBfDynMemEarly no longer require baseValid; previously it never
     // reached the engine at all, falling to the 3a bfmBad illegal gate instead — this Mux
     // arm preserves that same fail-safe outcome via the engine's own illegal entry).
-    val ucBfDynRdEntry = Mux(ucBfDo && !ucBfEaDec.baseValid,
-      U(Microcode.BF_DYN_ILLEGAL_ENTRY, ew bits),
-      Mux(ucBfDo,
-        Mux(ucBfEntOp === 5, U(Microcode.BF_DYN_FFO_DO1_ENTRY, ew bits),
-                             U(Microcode.BF_DYN_RD_DO1_ENTRY,  ew bits)),
-        U(Microcode.BF_DYN_RD_DO0_ENTRY, ew bits)))
+    // Do=1 at a PC-REL EA (baseValid=False, pcRel=True) is task #199's newly-IMPLEMENTED
+    // case (bf_pcrel_read.s cases 6-10) -- route to the dedicated PC-rel DO1 entries
+    // (which fold `ctx.bfPcRelConst`=pc+4 into the byteBase recompute instead of reading
+    // SEaBase as a register) rather than falling into the abs-EA's ILLEGAL carve-out above.
+    // Checked BEFORE the plain abs carve-out so it takes priority for the pcRel subset.
+    val ucBfDynRdEntry = Mux(ucBfDo && !ucBfEaDec.baseValid && ucBfEaDec.pcRel,
+      Mux(ucBfEntOp === 5, U(Microcode.BF_DYN_FFO_PCREL_DO1_ENTRY, ew bits),
+                           U(Microcode.BF_DYN_RD_PCREL_DO1_ENTRY,  ew bits)),
+      Mux(ucBfDo && !ucBfEaDec.baseValid,
+        U(Microcode.BF_DYN_ILLEGAL_ENTRY, ew bits),
+        Mux(ucBfDo,
+          Mux(ucBfEntOp === 5, U(Microcode.BF_DYN_FFO_DO1_ENTRY, ew bits),
+                               U(Microcode.BF_DYN_RD_DO1_ENTRY,  ew bits)),
+          U(Microcode.BF_DYN_RD_DO0_ENTRY, ew bits))))
     // Bit-field RMW DYNAMIC (slice 3c): BFCHG(2)/BFCLR(4)/BFSET(6) with Do||Dw -> the dynamic
     // RMW entry (Do=1 recomputes byteBase; Do=0 folds). BFINS(7) dynamic -> the dedicated INS
     // entries (prefunnel -> register-form insert -> reload+inverse-funnel; X untouched).

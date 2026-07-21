@@ -2180,7 +2180,20 @@ object MicroOpAssembler {
     val bfmEaDec = EaDecoder.decode(op(5 downto 0), Size.LONG, Vec(pkt.words(0), pkt.words(2), pkt.words(3)))
     // CONTROL modes only (MEMSIMPLE, no auto-update). (An)+/-(An) (autoMode != NONE) and
     // reg-direct/#imm are rejected -> illegal (vector 4).
-    val bfmEaOk  = (bfmEaDec.klass === EaClass.MEMSIMPLE) && (bfmEaDec.autoMode === EaAuto.NONE)
+    // Task #199 (bf_pcrel_idx_traps_alive): an INDEXED PC-relative EA — brief-format
+    // (d8,PC,Xn) OR full-format (bd.W,PC,Xn.W) no-memind — is klass=MEMSIMPLE/pcRel=True/
+    // indexValid=True, same as a plain (d16,PC) EA except for the index. This 3a static
+    // crack's `bfmPcRelAddr` folds pc+4+disp into a pure absolute (base-less) displacement
+    // at DECODE time; the index register is applied SEPARATELY by the LS-EU AGU at
+    // EXECUTE time (same generic index-add path as any other indexed load) — so this
+    // shape is not actually known-broken, but it is DELIBERATELY still out of scope (the
+    // vendored test's own contract is fail-SAFE-not-fail-CORRECT: "architecturally legal
+    // read EAs the decoder does not implement yet" — see that test's header comment,
+    // which explicitly anticipates a FUTURE widening to a real value check once someone
+    // does that verification work). Reject it here (same fail-safe illegal trap as
+    // memory-indirect, autoMode, etc.) rather than let it silently execute.
+    val bfmEaOk  = (bfmEaDec.klass === EaClass.MEMSIMPLE) && (bfmEaDec.autoMode === EaAuto.NONE) &&
+                   !(bfmEaDec.pcRel && bfmEaDec.indexValid)
     val bfmOffset5 = bfExt(10 downto 6).asUInt              // static offset 0..31
     val bfmWidthRaw= bfExt(4 downto 0).asUInt               // raw width (0->32)
     val bfmWidth   = (((bfmWidthRaw - 1) & U(31, 5 bits)) + 1)   // 1..32

@@ -82,6 +82,7 @@ object Microcode {
   case object SBfRdDst    extends Sel   // (bfDn2, bfOp in {1,3,5}) — read-only result reg (EXTU/EXTS/FFO write; TST none)
   case object SBfResImm   extends Sel   // selImm: the BFRESOLVE imm (Do/Dw/staticOff/staticWidth/memMode)
   case object SBfDeltaImm extends Sel   // selImm: byte-delta mode bit (imm[13]) — BFRESOLVE outputs offset>>>3
+  case object SBfPcRelConst extends Sel // selImm: ctx.bfPcRelConst (pc+4) — task #199 PC-rel DO1 byteBase
   // ── Bit-field MEMORY-INDIRECT selectors (task #197) ────────────────────────────
   // The pointer's OWN address (An + bd, no byteOff — the byteOff/width fold happens AFTER
   // dereference) rides the EXISTING SEaBase/SEaDispLo pair (ctx.eaBase/eaDispLo are already
@@ -943,8 +944,54 @@ object Microcode {
          sz = SzByte),                                                                    // µPC175 (n3)
     Desc(UShiftR8, srcA = ST1, dst = ST2, useImm = true, imm = SShift8, sz = SzLong),      // µPC176 (n4)
     Desc(UMove, mem = MStore, auto = APredecAx, srcA = SAx, srcB = ST2, dst = SAx,
-         sz = SzByte, isLast = true)                                                      // µPC177 (n5)
+         sz = SzByte, isLast = true),                                                     // µPC177 (n5)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Bit-field DYNAMIC-OFFSET (Do=1) PC-RELATIVE read-only forms @178 (task #199,
+    // bf_pcrel_read.s cases 6-10). Byte-identical to BF_DYN_RD_DO1/BF_DYN_FFO_DO1 above
+    // (see that family's header comment for the full read-only-dynamic shape) EXCEPT the
+    // byteBase-recompute row: a (d16,PC) EA has baseValid=False (no An register), so
+    // `UBfAdd srcA=SEaBase` (a REGISTER read) would read garbage instead of the implicit
+    // PC base — substitute `srcA=T0(byteDelta), useImm=true, imm=SBfPcRelConst(=pc+4)`.
+    // `eaDispLo` (still `ucBfEaDec.disp`, the raw EA disp — unaffected by this substitution)
+    // applies on top at the load rows exactly like the register-base case, so the final
+    // byte address is `pc+4 + disp + byteDelta`, matching the OLD 3a static crack's
+    // `bfmPcRelAddr` reference point. Do=0 (dynamic-WIDTH-only, static offset) PC-rel stays
+    // unimplemented (falls through to the pre-existing fail-safe illegal trap) — see
+    // DecodeStage.scala's `s0bfDo`/`ucBfDynRdEntry` comments.
+
+    // BF_DYN_RD_PCREL_DO1 @178 — read-only (NOT FFO), DYNAMIC offset, PC-relative EA.
+    Desc(UBfResolve, srcA = SBfOffReg, dst = ST0, useImm = true, imm = SBfDeltaImm,
+         sz = SzLong, isFirst = true),                                       // µPC178 (byteDelta -> T0)
+    Desc(UBfAdd, srcA = ST0, dst = ST2, useImm = true, imm = SBfPcRelConst,
+         sz = SzLong),                                                       // µPC179 (Tb = byteDelta + pc+4)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, indexFromEa = true),                                   // µPC180 (lo -> T0)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST1, useImm = true, imm = SEaDispHi,
+         sz = SzByte, indexFromEa = true),                                   // µPC181 (hi -> T1)
+    Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
+         imm = SBfResImm, sz = SzLong),                                      // µPC182 (packed -> T2)
+    Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = SBfRdDst, sz = SzLong,
+         bfDyn = true, bfWritesNz = true, isLast = true),                    // µPC183 (funnel)
+
+    // BF_DYN_FFO_PCREL_DO1 @184 — BFFFO, DYNAMIC offset, PC-relative EA.
+    Desc(UBfResolve, srcA = SBfOffReg, dst = ST0, useImm = true, imm = SBfDeltaImm,
+         sz = SzLong, isFirst = true),                                       // µPC184 (byteDelta -> T0)
+    Desc(UBfAdd, srcA = ST0, dst = ST2, useImm = true, imm = SBfPcRelConst,
+         sz = SzLong),                                                       // µPC185 (Tb = byteDelta + pc+4)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, indexFromEa = true),                                   // µPC186 (lo -> T0)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST1, useImm = true, imm = SEaDispHi,
+         sz = SzByte, indexFromEa = true),                                   // µPC187 (hi -> T1)
+    Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
+         imm = SBfResImm, sz = SzLong),                                      // µPC188 (packed -> T2)
+    Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = ST0, sz = SzLong,
+         bfDyn = true, bfTstForm = true),                                    // µPC189 (prefunnel: field32 -> T0)
+    Desc(UBfMem, srcA = ST0, srcB = SBfOffReg, srcC = ST2, dst = SBfRdDst, sz = SzLong,
+         bfDyn = true, bfWritesNz = true, bfStoreForm = 6, isLast = true)    // µPC190 (FFOFULL)
   )
+  val BF_DYN_RD_PCREL_DO1_ENTRY  = 178   // rows 178..183
+  val BF_DYN_FFO_PCREL_DO1_ENTRY = 184   // rows 184..190
   val MI_BF_RD_DO0_ENTRY  = 130
   val MI_BF_RD_DO1_ENTRY  = 135
   val MI_BF_RMW_DO0_ENTRY = 142
@@ -1000,6 +1047,14 @@ object Microcode {
     val eaIndexScale = UInt(2 bits)
     val eaDispLo     = Bits(32 bits)     // resolved byteAddr disp = EA.disp + (offset>>3)
     val eaDispHi     = Bits(32 bits)     // = eaDispLo + 4 (byteAddr+4, the spill byte)
+    // Task #199 (bf_pcrel_read): the PC-relative reference point for a DYNAMIC-OFFSET
+    // (Do=1) bit-field read = pc+4 (the address of the EA's own extension word — 2
+    // leading words: opword + bf-ext word). Used ONLY by the BF_DYN_RD_PCREL_DO1/
+    // BF_DYN_FFO_PCREL_DO1 entries' byteBase-recompute row (in place of reading SEaBase
+    // as a register, which a PC-rel EA has none of); `eaDispLo` still supplies the raw
+    // EA displacement on top, exactly like the register-base DO1 chain. Harmless
+    // (unread) for every other microcode customer.
+    val bfPcRelConst = Bits(32 bits)
     // ── v2 bit-field static params ────────────────────────────────────────────────────
     val bfOp         = Bits(3 bits)      // op[10:8] = 2 BFCHG / 4 BFCLR / 6 BFSET / 7 BFINS
     val bfDn2        = UInt(5 bits)      // ext[14:12] (BFINS insert source register)
@@ -1156,6 +1211,7 @@ object Microcode {
     case SMovesDelta => ctx.movesDelta                  // signed An write-back delta
     case SBfResImm   => ctx.bfResImm                    // BFRESOLVE imm (slice 3c)
     case SBfDeltaImm => B(1, 32 bits) |<< 13            // imm[13]=1 -> BFRESOLVE byte-delta mode
+    case SBfPcRelConst => ctx.bfPcRelConst              // task #199: pc+4 (PC-rel DO1 byteBase)
     case SBfMiDispLo => ctx.bfMiDispLo                  // task #197: mem-indirect post-deref byteAddr disp
     case SBfMiDispHi => ctx.bfMiDispHi
     case SPackAdj    => ctx.packAdj                     // task #198: PACK/UNPK mem-form adj16
