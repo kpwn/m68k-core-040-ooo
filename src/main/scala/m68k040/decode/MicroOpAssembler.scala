@@ -463,6 +463,14 @@ object MicroOpAssembler {
     // offset-independent and identical; only `disp` differs.)
     val opIsLineImm = spec.srcB.kind === OperandKind.IMMEXT
     val rmwEaDisp = Mux(opIsLineImm, immEa.disp, srcEa.disp)
+    // Task #199 (btst_pcrel_src static-bit-number sub-case): the (d16,PC)/(d8,PC,Xn)
+    // PC-relative reference point is the ADDRESS OF THE EA's OWN EXTENSION WORD, not
+    // unconditionally op+2 — for an `opIsLineImm` shape (static BTST/BCHG/BCLR/BSET
+    // #n,<ea> or CMPI #imm,<ea>) the EA's own ext word is displaced past the
+    // immediate's own word(s) (1 word for .B/.W-sized bit-number/immediate, 2 for
+    // .L), i.e. its address is op+4 (or op+6 for .L), NOT op+2. Every other
+    // (non-immediate) PC-rel family's EA ext word IS at op+2, so this is 0 for them.
+    val pcRelImmShiftWords = Mux(opIsLineImm, Mux(immIsLong, U(2, 3 bits), U(1, 3 bits)), U(0, 3 bits))
 
     // ── Operand classification ───────────────────────────────────────────────
     val srcIsReg = (srcEa.klass === EaClass.DATAREG) || (srcEa.klass === EaClass.ADDRREG)
@@ -942,8 +950,28 @@ object MicroOpAssembler {
     ldUop.dstReg        := U(T0, 5 bits); ldUop.dstValid := True
     ldUop.useImm        := True
     // disp = rmwEaDisp (immEa for a line-0 immediate mem-dest, else srcEa). A (d16,PC)
-    // source folds pc into the absolute disp (never a line-0 immediate -> srcEa.disp).
-    val pcRelAddr = (pkt.pc + U(2, 32 bits) + srcEa.disp.asUInt).asBits
+    // source folds pc into the absolute disp.
+    // Task #199 (btst_pcrel_src static-bit-number sub-case): a static bit-op
+    // (BTST/BCHG/BCLR/BSET #n,<ea>) is ALSO an `opIsLineImm` shape (srcB=IMMEXT,
+    // same as ADDI/CMPI/etc — OperationDecoder's shared bit-op table sets
+    // `o.srcB := immext` for the static form) whose EA's own extension word(s)
+    // sit AFTER the bit-number ext word, i.e. `rmwEaDisp` (immEa.disp, already
+    // correctly shifted by the imm word count) is the right displacement — NOT
+    // the raw `srcEa.disp` (decoded against UNSHIFTED words, so for a static
+    // bit-op it misreads the bit-number word itself as the d16 displacement).
+    // This previously miscomputed the PC-relative absolute address for BOTH
+    // static BTST #n,(d16,PC)/(d8,PC,Xn) (the only bit-op family whose PC-rel
+    // target is architecturally legal, since it's read-only) and a CMPI
+    // #imm,(d16,PC)/(d8,PC,Xn) source (also legal, also read-only) — no
+    // corpus test exercised the CMPI case, but it shares the exact same bug.
+    // `rmwEaDisp` already resolves opIsLineImm vs not (see its definition
+    // above), so reusing it here (instead of the narrower `srcEa.disp`) fixes
+    // the displacement value; `pcRelImmShiftWords` (see its definition above)
+    // corrects the REFERENCE POINT itself (op+2 normally, op+4/op+6 for a
+    // static-bit-op/CMPI immediate shape whose EA ext word is displaced past
+    // the imm word(s)).
+    val pcRelAddr = (pkt.pc + U(2, 32 bits) + (pcRelImmShiftWords << 1).resize(32 bits) +
+                      rmwEaDisp.asUInt).asBits
     ldUop.imm           := Mux(srcEa.pcRel, pcRelAddr, rmwEaDisp)
     ldUop.readsNzvc     := False; ldUop.readsX := False
     ldUop.writesNzvc    := False; ldUop.writesX := False
