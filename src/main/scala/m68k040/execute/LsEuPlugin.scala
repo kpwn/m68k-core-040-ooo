@@ -44,13 +44,20 @@ trait LsEuService {
 /** LS access-fault completion payload: which ROB entry faulted (vector 2 implied),
   * the faulting VA, and the SSW access attributes. `write` = store (R/W=write),
   * `sizeBits` = encoded access size (00=byte,01=word,10=long), `supervisor` = the
-  * access function-code supervisor bit. */
+  * access function-code supervisor bit. `atc` (task #189): True for a genuine
+  * MMU/ATC-detected translation fault (DTLB rsp.fault — non-resident / write-
+  * protect / supervisor), False for a plain PHYSICAL bus error (a D-cache refill
+  * whose AXI response errored — SLVERR/DECERR — with zero MMU involvement). Feeds
+  * the format-$7 frame's SSW.ATC bit (bit 10) — see ExceptionUnit's
+  * `entryFaultAtc`. Was previously hardcoded True unconditionally (moot before
+  * this task since the ONLY existing fault source was the MMU path). */
 case class LsFault() extends Bundle {
   val robId      = UInt(6 bits)
   val faultAddr  = UInt(32 bits)
   val write      = Bool()
   val sizeBits   = UInt(2 bits)
   val supervisor = Bool()
+  val atc        = Bool()
 }
 
 /** AGU + Load/Store EU (LS-1 slice): conservative single-outstanding pipe.
@@ -582,6 +589,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val compFaultWr   = RegInit(False)
     val compFaultSize = Reg(UInt(2 bits))
     val compFaultSup  = RegInit(False)
+    // Task #189: True for the existing MMU/ATC (DTLB) fault path, False for a
+    // plain physical bus error (D-cache refill AXI resp error) — see LsFault.atc.
+    val compFaultAtc  = RegInit(True)
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax #2: PIPELINE the SQ-forward query result -> completion decision.
@@ -694,7 +704,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // fault (no reg write / no store alloc / no wakeup); drives faultCompletion. The
     // SSW attrs: write = store, sizeBits = encoded access size, supervisor = the
     // access function-code supervisor bit (xlate.req.supervisor for this access).
-    def captureFault(): Unit = {
+    // `atc` (task #189): True (default, preserves the pre-existing MMU-fault
+    // behavior) for the DTLB-translation-fault call site; the NEW bus-error call
+    // site (D-cache refill AXI resp error, WAIT state below) passes False.
+    def captureFault(atc: Boolean = true): Unit = {
       compValid     := True
       compRobId     := s1Ctx.robId
       compPdstValid := False
@@ -715,6 +728,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
         m68k040.isa.Size.WORD -> U(1, 2 bits),
         m68k040.isa.Size.LONG -> U(2, 2 bits))
       compFaultSup  := xlate.req.supervisor
+      compFaultAtc  := Bool(atc)
     }
 
     // ---- drive completion / writeback / wakeup from the registered stage ----
@@ -761,6 +775,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     faultCompletionPort.payload.write      := compFaultWr
     faultCompletionPort.payload.sizeBits   := compFaultSize
     faultCompletionPort.payload.supervisor := compFaultSup
+    faultCompletionPort.payload.atc        := compFaultAtc
 
     val busy = RegInit(False); busy.simPublic(); s1Valid.simPublic()
     // Single-outstanding: do not accept a new µop while a decision is pending
@@ -1009,8 +1024,32 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       WAIT.whenIsActive {
         busy := True
         when(dcache.loadRsp.valid) {
-          // Task #139 mechanism #2: suppress for a poisoned (squashed) access.
-          when(!poisoned) { captureCompletion(dcache.loadRsp.payload.data) }
+          // Task #189: a genuine physical bus error (D-cache refill AXI resp
+          // errored — SLVERR/DECERR) rides `dcache.loadRsp.payload.fault`. This
+          // field was previously dead (DcachePlugin wrote it from a stale/always-
+          // False source; nothing downstream ever read it — MMU faults are
+          // detected earlier, straight off `xlate.rsp.fault`, never reaching the
+          // cache at all). Now repurposed as the bus-fault carrier: complete as a
+          // FAULT (vector 2, SSW.ATC=0 — atc=false) instead of a normal load.
+          //
+          // EXCEPTION (code-review fix): `u1.needsSupervisor` is also (task #189,
+          // MicroOpAssembler's ldUop comment) tagged True for the generic load
+          // that feeds a memory-source privileged commit-time SYSTEM op (e.g.
+          // MOVE <ea>,SR). That load is program-order EARLIER than the sysOp µop
+          // that owns the ACTUAL privilege check (RobPlugin's Track-D
+          // sysPrivFault, at the sysOp's own commit) — a bus-fault on THIS load
+          // would otherwise squash the sysOp before its privilege check ever
+          // runs, wrongly delivering vector 2 instead of vector 8 for a user-mode
+          // access (move_ea_sr_memsrc_priv.s). Suppress the fault report for
+          // exactly this crack shape: complete normally with don't-care data (the
+          // value is never actually applied — the later sysOp's own Track-D
+          // check traps first), restoring the pre-task-189 behavior for the
+          // faulting case while leaving the bus-error mechanism fully live for
+          // every ordinary load.
+          when(!poisoned) {
+            when(dcache.loadRsp.payload.fault && !u1.needsSupervisor) { captureFault(atc = false) }
+            .otherwise { captureCompletion(dcache.loadRsp.payload.data) }
+          }
           busy    := False
           s1Valid := False
           goto(IDLE)

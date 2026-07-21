@@ -241,8 +241,21 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // faultedStore) so a re-used index never carries a stale MMU fault.
     val faultAddrStore = Vec.fill(depth)(RegInit(U(0, 32 bits)))
     val faultWrStore   = Vec.fill(depth)(RegInit(False))
-    val faultSizeStore = Vec.fill(depth)(RegInit(U(0, 2 bits)))
+    // RegInit(2) = our LsFault.sizeBits "LONG" encoding, which ExceptionUnit's SSW
+    // builder translates to SSW.SIZE=00 ("long") — the SAME bit pattern the SSW's
+    // SIZE field always read before task #189 wired it up (it was simply never
+    // populated, always reading 0b00). Keeps any vector-2 fault that DOESN'T flow
+    // through LsEuPlugin's captureFault() (i.e. never writes this Vec) — e.g. a
+    // static alloc-time / ITLB-sourced vector-2 fault — byte-for-byte unchanged
+    // from pre-task-189 behavior instead of picking up a new SIZE value nobody
+    // ever computed for it.
+    val faultSizeStore = Vec.fill(depth)(RegInit(U(2, 2 bits)))
     val faultSupStore  = Vec.fill(depth)(RegInit(False))
+    // Task #189: True = MMU/ATC-detected (DTLB) fault, False = plain physical bus
+    // error (SLVERR/DECERR). RegInit(True) so a re-used index defaults to the
+    // pre-existing (MMU) behavior unless a NEW fault explicitly clears it — see
+    // LsFault.atc / LsEuPlugin's captureFault(atc=...).
+    val faultAtcStore  = Vec.fill(depth)(RegInit(True))
     // Instruction-fetch access-fault: set at ALLOC for a faulted (vector-2) µop whose
     // fault came from the I-cache (sswInstr). Selects a program-space SSW in the $7
     // frame. RegInit(False), reset per-alloc (mirrors faultedStore).
@@ -265,6 +278,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     lsFaultCompletion.payload.write.allowOverride;    lsFaultCompletion.payload.write := False
     lsFaultCompletion.payload.sizeBits.allowOverride; lsFaultCompletion.payload.sizeBits := U(0, 2 bits)
     lsFaultCompletion.payload.supervisor.allowOverride; lsFaultCompletion.payload.supervisor := False
+    lsFaultCompletion.payload.atc.allowOverride;      lsFaultCompletion.payload.atc := True
     lsFaultCompletion.simPublic()
     // Execute-time conditional fault completion (generalized; driven by the branch EU
     // for TRAPV and the div EU for CHK/DIV0). When an execute-time check raises a
@@ -277,6 +291,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     euFaultCompletion.valid.allowOverride;          euFaultCompletion.valid := False
     euFaultCompletion.payload.robId.allowOverride;  euFaultCompletion.payload.robId := U(0, robIdW bits)
     euFaultCompletion.payload.vector.allowOverride; euFaultCompletion.payload.vector := U(0, 8 bits)
+    euFaultCompletion.payload.faultAddr.allowOverride; euFaultCompletion.payload.faultAddr := U(0, 32 bits)
     euFaultCompletion.simPublic()
     // Per-entry committed-CCR VALUE capture (set at completion from the EU writeback
     // values via ccrCompletion). Folded into committedCcr at retire (for the stacked
@@ -552,23 +567,32 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultWrStore(lsFaultCompletion.payload.robId)   := lsFaultCompletion.payload.write
       faultSizeStore(lsFaultCompletion.payload.robId) := lsFaultCompletion.payload.sizeBits
       faultSupStore(lsFaultCompletion.payload.robId)  := lsFaultCompletion.payload.supervisor
+      faultAtcStore(lsFaultCompletion.payload.robId)  := lsFaultCompletion.payload.atc
       // A DATA (LS) access fault is data-space, NEVER an instruction fetch — clear the
       // SSW-instr bit explicitly so it does not inherit the alloc'd µop's sswInstr
       // (which is only meaningful for I-fetch-fault µops). Without this the SSW
       // data/program bit was seed-flaky (the µop's unset sswInstr randomized).
       faultInstrStore(lsFaultCompletion.payload.robId) := False
     }
-    // Execute-time conditional fault (TRAPV / CHK / DIV0): flip the entry FAULTED +
-    // the CARRIED vector. faultPc is already the µop's nextPc (captured at alloc into
-    // faultPcStore via faultUsesNextPc), so the format-$2 frame stacks the right PC;
-    // the PPC is pcStore. The entry also completes via its normal completion port (so
-    // it can retire + trigger the exception). Placed BEFORE alloc-reset (alloc wins on
-    // a re-used index). NOT an instruction-fetch fault -> clear the SSW-instr bit.
+    // Execute-time conditional fault (TRAPV / CHK / DIV0 / address-error task #189):
+    // flip the entry FAULTED + the CARRIED vector. faultPc is already the µop's own
+    // pc or nextPc (captured at alloc into faultPcStore via faultUsesNextPc, per-op —
+    // see MicroOpAssembler), so the format-$2 frame stacks the right PC; the PPC/
+    // ADDRESS field is pcStore for the PPC-style traps (TRAPV/CHK/DIV0) OR the
+    // execute-time faultAddr (odd target) for address error — see faultAddrStore
+    // below + ExceptionUnit's `entryVector === 3` mux. The entry also completes via
+    // its normal completion port (so it can retire + trigger the exception). Placed
+    // BEFORE alloc-reset (alloc wins on a re-used index). NOT an instruction-fetch
+    // fault -> clear the SSW-instr bit.
     when(euFaultCompletion.valid) {
       faultedStore(euFaultCompletion.payload.robId)    := True
       faultVecStore(euFaultCompletion.payload.robId)   := euFaultCompletion.payload.vector
       faultInstrStore(euFaultCompletion.payload.robId) := False
-      // faultPcStore is already the µop's nextPc (captured at alloc) — no write.
+      // Only meaningful for vector 3 (address error) — ExceptionUnit only reads
+      // entryFaultAddr for the is2 frame when entryVector===3. Harmless (unused) 0
+      // for TRAPV/CHK/DIV0.
+      faultAddrStore(euFaultCompletion.payload.robId)  := euFaultCompletion.payload.faultAddr
+      // faultPcStore is already the µop's own pc/nextPc (captured at alloc) — no write.
     }
 
     when(alloc0) {
@@ -705,6 +729,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val exceptionFaultSize = UInt(2 bits);  exceptionFaultSize := faultSizeStore(h0); exceptionFaultSize.simPublic()
     val exceptionFaultSup  = Bool();        exceptionFaultSup  := faultSupStore(h0);  exceptionFaultSup.simPublic()
     val exceptionFaultInstr= Bool();        exceptionFaultInstr:= faultInstrStore(h0);exceptionFaultInstr.simPublic()
+    // Task #189: ATC bit source (True=MMU/ATC fault, False=plain bus error) — was
+    // previously hardcoded True unconditionally in ExceptionUnit (see its SSW-
+    // builder comment); now genuinely per-fault.
+    val exceptionFaultAtc  = Bool();        exceptionFaultAtc  := faultAtcStore(h0); exceptionFaultAtc.simPublic()
 
     // ── Committed CCR (X N Z V C, bits 4..0) — VALUE, folded at retire ───────────
     // The ROB has no CCR value on its payload (only phys IDs), so the EU writeback
@@ -795,6 +823,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       entryFaultWr   = faultWrStore(h0),
       entryFaultSup  = faultSupStore(h0),
       entryFaultInstr= faultInstrStore(h0),
+      // Task #189: SIZE field + ATC bit — both now genuinely threaded (were
+      // previously computed here but the SIZE one was never passed at all, and
+      // ATC was hardcoded true in ExceptionUnit; see that file's SSW-builder).
+      entryFaultSize = faultSizeStore(h0),
+      entryFaultAtc  = faultAtcStore(h0),
       entryIsInterrupt = interruptPending,
       entryIplLevel    = interruptLevel,
       // ── Commit-time SYSTEM op (supervisor): drive the S_APPLY FSM ──────────────

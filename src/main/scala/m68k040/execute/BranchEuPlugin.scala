@@ -30,14 +30,23 @@ case class BranchCompletion() extends Bundle {
 /** Execute-time conditional fault completion (generalized from the original TRAPV-
   * only fault). An EU drives this when an execute-time check raises a synchronous
   * fault that carries an exception VECTOR: TRAPV (vector 7, branch EU), CHK (vector
-  * 6, div EU), DIV0 (vector 5, div EU). The ROB marks the entry faulted + the
-  * carried vector. The stacked PC (= nextPc for these group-2 traps) and the PPC
-  * (= the instruction PC) are already captured per-entry at alloc (faultPcStore /
-  * pcStore), so only {robId, vector} are needed here (cf. lsFaultCompletion, which
-  * must also carry the execute-computed EA). All three are format-$2 group-2 traps. */
+  * 6, div EU), DIV0 (vector 5, div EU), ADDRESS ERROR (vector 3, branch EU — task
+  * #189: a taken control transfer whose target has bit0 set). The ROB marks the
+  * entry faulted + the carried vector. The stacked PC (= nextPc for the group-2
+  * traps, = the transfer instruction's OWN pc for address error — see
+  * MicroOpAssembler's ibrUop.faultUsesNextPc=False) is already captured per-entry
+  * at alloc (faultPcStore / pcStore), so normally only {robId, vector} would be
+  * needed here (cf. lsFaultCompletion, which must also carry the execute-computed
+  * EA). Address error is the one exception: its format-$2 frame's extra "ADDRESS"
+  * word (SP+8) must carry the faulting ODD TARGET, which is only known at execute
+  * time (unlike CHK/DIV0/TRAPV's PPC field, which is just the already-alloc-known
+  * instruction PC) — `faultAddr` carries it, ROB-plumbed into faultAddrStore /
+  * ExceptionUnit.entryFaultAddr exactly like an LS access-fault EA. Zero/unused for
+  * TRAPV/CHK/DIV0 (their is2 path never reads entryFaultAddr). */
 case class EuFault() extends Bundle {
-  val robId  = UInt(6 bits)
-  val vector = UInt(8 bits)
+  val robId     = UInt(6 bits)
+  val vector    = UInt(8 bits)
+  val faultAddr = UInt(32 bits)
 }
 
 /** Sim-only whitebox observation. A plain branch writes no reg; an RTS/RTR ibranch
@@ -190,9 +199,32 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     // isCondTrap (TRAPV/TRAPcc): NEVER redirects regardless of `taken` — it is a
     // fault, not a control transfer. Gate explicitly (cond carries the real condition,
     // not the fixed F=cond1 of the old TRAPV, so the `taken` path must be suppressed).
-    val redirect  = Mux(u1.isScc || u1.isCondTrap, False,
-                    Mux(u1.isDbcc, dbBranch,
-                    Mux(u1.ibranch, True, taken)))
+    val rawRedirect = Mux(u1.isScc || u1.isCondTrap, False,
+                      Mux(u1.isDbcc, dbBranch,
+                      Mux(u1.ibranch, True, taken)))
+    // ── Address error (task #189, vector 3) ───────────────────────────────────────
+    // The 68040 requires the PC to always be even (M68040UM §8.2.3). ANY taken
+    // control transfer (JMP/JSR/BRA/Bcc/BSR/DBcc/RTS/RTR — everything that can set
+    // `rawRedirect`) whose resolved target has bit0 set must raise address error
+    // instead of actually transferring control. Unlike isCondTrap (a STATIC, decode-
+    // known fault), this is discovered dynamically here in S1 from the computed
+    // `target` — any of the ibranch/relative-branch paths can produce an odd target
+    // at runtime. Scc/isCondTrap are automatically excluded (rawRedirect is already
+    // forced False for them, so target's LSB is never consulted).
+    val addrErr   = rawRedirect && target(0)
+    // Suppress the actual control transfer on an address-error target — exactly like
+    // isCondTrap, this µop does NOT redirect fetch; the precise commit-time exception
+    // FSM (driven by the euFault pulse below) performs the REAL redirect to the
+    // vector-3 handler once this entry retires as faulted. This also naturally gives
+    // the documented per-stage semantics for free via the existing fault/retire
+    // machinery: a JSR/BSR's return-address push is a SEPARATE, earlier µop (the
+    // crack's store phase) that already retired normally before this (later) branch
+    // phase reaches retire and takes the fault; an RTS/RTR's A7 postinc / a DBcc's Dn
+    // decrement below (anWrite) is explicitly gated off `addrErr` so the faulting
+    // µop's register effect never reaches the PRF at all (belt-and-suspenders on top
+    // of the normal rename/retire discipline, which alone would already prevent a
+    // faulted entry's speculative write from ever becoming the architectural mapping).
+    val redirect  = rawRedirect && !addrErr
     // Fall-through PC = the instruction's POST-PC (pc + length). DBcc is a 2-word
     // instruction (opword + disp16) so its not-taken/expiry PC is pc+4, NOT pc+2 —
     // use the assembler-computed u1.nextPc (also correct for a not-taken Bcc.w).
@@ -221,8 +253,11 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     //  - RTS/RTR returns (ibranch with anInc != 0) — a last-target BTB is a poor return
     //    predictor; the return-address stack is slice 2. Excluded here so the BTB never
     //    learns a return and mis-predicts the next call site.
+    // addrErr is ALSO excluded from BTB training (task #189) — a faulting branch
+    // never actually executed a control transfer, so learning its (invalid, odd)
+    // target would poison a future correctly-encoded taken prediction at the same PC.
     val isReturn   = u1.ibranch && (u1.anInc =/= U(0, 3 bits))
-    val isBtbBranch = s1Valid && !u1.isScc && !u1.isCondTrap && !isReturn &&
+    val isBtbBranch = s1Valid && !u1.isScc && !u1.isCondTrap && !isReturn && !addrErr &&
                       (u1.ibranch || u1.isBranch)
     // brType: uncond (1) = ibranch (JMP/JSR) OR an always-taken relative branch
     // (cond==0: BRA/BSR). cond (0) = Bcc (cond>=2) / DBcc. Used to force-take an
@@ -261,17 +296,29 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     val newAn      = (s1AnBase + u1.anInc).resize(32)
     val condIntVal = Mux(u1.isScc, sccResult, dbResult)              // Scc vs DBcc
     val condIntWr  = (u1.isScc || u1.isDbcc) && u1.pdstValid
-    val anWrite    = s1Valid && ((u1.ibranch && u1.pdstValid) || condIntWr)
+    // addrErr excluded (task #189): an RTS/RTR that faults on an odd popped target
+    // must NOT update A7 (the odd return address stays on the stack, unpopped); a
+    // faulting DBcc must NOT commit its counter decrement. Scc is unaffected (never
+    // redirects, so addrErr is always False for it).
+    val anWrite    = s1Valid && !addrErr && ((u1.ibranch && u1.pdstValid) || condIntWr)
     val intData    = Mux(condIntWr, condIntVal, newAn.asBits)
     anW.valid     := anWrite;  anW.address := u1.pdst;  anW.data := intData
     anByp.valid   := anWrite;  anByp.address := u1.pdst; anByp.data := intData
 
-    // ---- S1: isCondTrap execute-time conditional fault (vector 7 if cond taken) ----
-    // Covers TRAPV (cond=9=VS, taken iff V) and TRAPcc (cond=cccc). Both deliver
-    // vector 7 (format-$2 group-2 trap); the redirect is suppressed above.
-    trapvFaultPort.valid          := s1Valid && u1.isCondTrap && taken
-    trapvFaultPort.payload.robId  := s1Ctx.robId
-    trapvFaultPort.payload.vector := U(7, 8 bits)   // vector 7 (TRAPV / TRAPcc)
+    // ---- S1: isCondTrap execute-time conditional fault (vector 7 if cond taken) OR
+    // an address-error fault (vector 3, task #189) ----
+    // isCondTrap covers TRAPV (cond=9=VS, taken iff V) and TRAPcc (cond=cccc); both
+    // deliver vector 7 (format-$2 group-2 trap). addrErr (see above) covers ANY taken
+    // control transfer to an odd target; it delivers vector 3, ALSO a format-$2 frame,
+    // but with the frame's extra "ADDRESS" word (SP+8) carrying the faulting target
+    // (`faultAddr`) rather than the instruction's own PC (which the PPC/PC fields
+    // already get for free via faultPcStore's alloc-time capture — see ibrUop's
+    // faultUsesNextPc=False in MicroOpAssembler). The two fault sources are mutually
+    // exclusive: isCondTrap ops force rawRedirect (hence addrErr) False above.
+    trapvFaultPort.valid             := s1Valid && ((u1.isCondTrap && taken) || addrErr)
+    trapvFaultPort.payload.robId     := s1Ctx.robId
+    trapvFaultPort.payload.vector    := Mux(u1.isCondTrap, U(7, 8 bits), U(3, 8 bits))
+    trapvFaultPort.payload.faultAddr := target   // meaningful only for the addrErr (vec 3) case
 
     // ---- S1: sim-only whitebox. A plain branch writes NO reg; an RTS/RTR ibranch
     // writes A7 (the postincremented SP); Scc/DBcc write Dn. Report that int write +

@@ -538,10 +538,13 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // is never really live for a surviving consumer) so the two wakeups stay symmetric.
     wakeupNzvcPort.valid   := compLive && compNzvcWrite && !compFault
     wakeupNzvcPort.payload := compNzvcDst
-    // Generalized euFault (CHK vec6 / DIV0 vec5).
-    euFaultPort.valid         := compLive && compFault
-    euFaultPort.payload.robId := compRobId
-    euFaultPort.payload.vector:= compFaultVec
+    // Generalized euFault (CHK vec6 / DIV0 vec5). faultAddr is unused for these
+    // (only the branch EU's address-error case, vector 3, reads entryFaultAddr in
+    // the is2 frame path — task #189); default 0.
+    euFaultPort.valid            := compLive && compFault
+    euFaultPort.payload.robId    := compRobId
+    euFaultPort.payload.vector   := compFaultVec
+    euFaultPort.payload.faultAddr:= U(0, 32 bits)
 
     // ---- sim-only whitebox ----
     val wbObs = WbObs()

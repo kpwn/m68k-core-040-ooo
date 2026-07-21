@@ -63,7 +63,14 @@ object PortedTestRunner {
       val cd = dut.clockDomain; cd.forkStimulus(10)
 
       FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      // Task #189: inject a real DECERR for the D-side data bus on a genuinely
+      // undecoded physical address (mirrors the real SoC's axi_xbar decode the
+      // ported-test corpus's exc_bus_error* headers describe — see
+      // BehavioralMem.decoded's doc comment). Opt-in ONLY for this (data) agent —
+      // the ITLB/DTLB table-walker memories below are untouched (a separate MMU
+      // concern, out of this task's scope; changing their behavior risked
+      // regressing the whole MMU test cluster for no benefit here).
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, injectBusErrors = true)
       new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
       new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
 
@@ -232,6 +239,25 @@ object PortedTestRunner {
           }
           if (dut.dec.logic.ucActive.toBoolean) {
             println(f"[ucstate] cyc=$trCyc%6d ucActive=true ucPc=${dut.dec.logic.ucPc.toInt}")
+          }
+        }
+      }
+
+      // debug-only, env-gated trace for the D-cache store RMW hit/miss + load-side
+      // hit/miss decisions (task #189 investigation, exc_addr_error_odd_rte data
+      // corruption chase). Zero cost unless PORTED_TRACE_DCHIT is set.
+      if (sys.env.contains("PORTED_TRACE_DCHIT")) {
+        var trCyc = 0
+        cd.onSamplings {
+          trCyc += 1
+          if (dut.dcache.logic.stS2Valid.toBoolean) {
+            val hv = (0 until 4).map(i => if (dut.dcache.logic.stS2HitVec(i).toBoolean) "1" else "0").mkString
+            println(f"[dchit] cyc=$trCyc%6d ST-S2 paddr=0x${dut.dcache.logic.stS2Payload.paddr.toLong & 0xffffffffL}%08x " +
+              f"size=${dut.dcache.logic.stS2Payload.size.toEnum} hitVec=$hv useStrb=${dut.dcache.logic.stS2Payload.useStrb.toBoolean}")
+          }
+          if (dut.dcache.logic.ldS1Valid.toBoolean) {
+            println(f"[dchit] cyc=$trCyc%6d LD-S1 set=${dut.dcache.logic.ldS1Set.toInt}%3d tag=0x${dut.dcache.logic.ldS1Tag.toLong & 0xfffffL}%06x " +
+              f"off=${dut.dcache.logic.ldS1Off.toInt}%2d size=${dut.dcache.logic.ldS1Size.toEnum} hit=${dut.dcache.logic.ldS1Hit.toBoolean} way=${dut.dcache.logic.ldS1HitWay.toInt}")
           }
         }
       }

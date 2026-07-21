@@ -109,6 +109,20 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val missSize  = Reg(Size())
     val victimWay = Reg(UInt(wayBits bits))
     val arSent    = Reg(Bool()) init False
+    // Task #189 (bus error): latched across REFILL->REPLAY — did the AXI read
+    // response for this refill come back with a non-OKAY resp (SLVERR/DECERR, e.g.
+    // the test harness's BehavioralMemAgent DECERR-ing a genuinely-unmapped
+    // address)? On an error the line is NOT allocated (no valid/tag/data write —
+    // there is no real data to cache) and the fault rides through REPLAY into
+    // `ldS1Fault` (a field that, before this task, was written by DcachePlugin but
+    // never actually consumed downstream — LsEuPlugin's OWN MMU-fault detection
+    // happens earlier, straight off `xlate.rsp.fault`, entirely bypassing this
+    // field). Repurposed here as the (now real) BUS-fault carrier: LsEuPlugin's
+    // aligned-load WAIT state reads it to raise a vector-2 access fault with
+    // SSW.ATC=0 (a physical bus error, not an MMU/ATC-detected one) — see
+    // LsEuPlugin's `captureFault(atc=false)` call site and ExceptionUnit's
+    // `entryFaultAtc`.
+    val missFault = Reg(Bool()) init False
 
     // ---- defaults ----
     loadCmdPort.ready := False
@@ -159,6 +173,9 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       ldS1HitVec(w) := valids(w)(ldS1Set) && (rdTag(w) === ldS1Tag)
     val ldS1Hit     = ldS1HitVec.orR
     val ldS1HitWay  = OHToUInt(ldS1HitVec)
+    // DEBUG (task #189 investigation, temporary): sim-only visibility.
+    ldS1Valid.simPublic(); ldS1Set.simPublic(); ldS1Tag.simPublic(); ldS1Off.simPublic()
+    ldS1Size.simPublic(); ldS1Hit.simPublic(); ldS1HitWay.simPublic()
     val ldS1Line    = rdData(ldS1HitWay)
     // Respond ONLY on a HIT (the fault flag rides along with the hit response,
     // matching baseline: `s1Fault := xlate.rsp.fault` was set ONLY in the hit branch).
@@ -168,10 +185,19 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // by short-circuiting a garbage cache response here).
     val ldS1Resp    = ldS1Valid && ldS1Hit
 
-    loadRspPort.valid         := ldS1Resp
+    // Task #189 (bus error): a REFILL that came back with a non-OKAY AXI response
+    // never allocates the line (see REFILL below), so a normal ldS1Valid/hit
+    // re-launch in REPLAY would MISS again and loop the refill forever. Instead
+    // REPLAY drives this one-cycle pulse directly (bypassing ldS1Valid/Hit
+    // entirely) to deliver a fault response for exactly one cycle. Declared here
+    // (default False) and overridden by REPLAY below (later-assignment-wins).
+    val busFaultResp = Bool(); busFaultResp := False
+    busFaultResp.simPublic()   // DEBUG (task #189), temporary
+
+    loadRspPort.valid         := ldS1Resp || busFaultResp
     loadRspPort.payload.data  := DcacheByteLane.extract(ldS1Line, ldS1Off, ldS1Size)
     loadRspPort.payload.line  := ldS1Line
-    loadRspPort.payload.fault := ldS1Fault
+    loadRspPort.payload.fault := Mux(busFaultResp, True, ldS1Fault)
 
     // ---- STORE write-through (PIPELINED RMW: S0 latch / S1 read / S2 merge+write) ----
     // FMax: the store RMW (old line readAsync + 16-lane byte-merge + write) used to
@@ -222,6 +248,9 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val stS2Off     = stS2Payload.paddr(offBits - 1 downto 0)
     val stS2Tag     = stS2Payload.paddr(31 downto offBits + setBits)
     stS2Valid := False  // default; armed when S1's read launches
+    // DEBUG (task #189 investigation, temporary): sim-only visibility into the
+    // store RMW hit/miss decision. simPublic is a no-op for synthesis.
+    stS2Valid.simPublic(); stS2Payload.simPublic()
 
     // S0 -> S1: advance the latched payload into S1.
     when(s0Valid) {
@@ -315,33 +344,51 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         }
         axi.r.ready := True
         when(axi.r.valid) {
-          for (w <- 0 until ways) when(victimWay === U(w, wayBits bits)) {
-            wrEn(w)    := True
-            wrSet(w)   := missSet
-            wrData(w)  := axi.r.payload.data
-            wrTagEn(w) := True
-            wrTag(w)   := missTag
-            valids(w)(missSet) := True
+          // Task #189: a non-OKAY response (SLVERR/DECERR — genuinely unmapped or
+          // erroring physical memory) carries NO real data. Do NOT allocate the
+          // line (no valid/tag/data write — matches the existing no-allocate-on-
+          // miss store policy just below in this file) and latch the fault for
+          // REPLAY to report instead of re-launching a (bogus) hit.
+          val respErr = axi.r.payload.resp =/= Axi4.resp.OKAY
+          when(!respErr) {
+            for (w <- 0 until ways) when(victimWay === U(w, wayBits bits)) {
+              wrEn(w)    := True
+              wrSet(w)   := missSet
+              wrData(w)  := axi.r.payload.data
+              wrTagEn(w) := True
+              wrTag(w)   := missTag
+              valids(w)(missSet) := True
+            }
+            victim(missSet) := victim(missSet) + 1
           }
-          victim(missSet) := victim(missSet) + 1
+          missFault := respErr
           goto(REPLAY)
         }
       }
 
       REPLAY.whenIsActive {
         busy := True
-        // Re-launch the read for the just-filled line; resolve as a guaranteed hit
-        // into the response register one cycle later via the ldS1 path.
-        rdSet        := missSet
-        rdEn         := True
-        loadUsesPort := True
-        ldS1Valid    := True
-        ldS1Set      := missSet
-        ldS1Tag      := missTag
-        ldS1Off      := missOff
-        ldS1Size     := missSize
-        ldS1Fault    := False
-        ldS1Paddr    := missPaddr
+        when(missFault) {
+          // Task #189: the refill's AXI response errored — no line was allocated
+          // (REFILL above skipped the wr*/valids writes), so there is nothing to
+          // "replay" as a hit. Delivered directly via busFaultResp (one pulse);
+          // do NOT touch ldS1Valid/rdSet/rdEn here (a real re-launch would MISS
+          // again forever — the line is still, correctly, not resident).
+          busFaultResp := True
+        } otherwise {
+          // Re-launch the read for the just-filled line; resolve as a guaranteed hit
+          // into the response register one cycle later via the ldS1 path.
+          rdSet        := missSet
+          rdEn         := True
+          loadUsesPort := True
+          ldS1Valid    := True
+          ldS1Set      := missSet
+          ldS1Tag      := missTag
+          ldS1Off      := missOff
+          ldS1Size     := missSize
+          ldS1Fault    := False
+          ldS1Paddr    := missPaddr
+        }
         goto(IDLE)
       }
     }
@@ -371,6 +418,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val stS2HitVec = Vec(Bool(), ways)
     for (w <- 0 until ways)
       stS2HitVec(w) := valids(w)(stS2Set) && (rdTag(w) === stS2Tag)
+    stS2HitVec.simPublic()   // DEBUG (task #189), temporary
     // Aligned/probe path derives the merge from {data,size,offset}; a SPLIT store
     // slot supplies an explicit line-relative strobe + 128-bit line-aligned data.
     val mergeData = Mux(stS2Payload.useStrb,

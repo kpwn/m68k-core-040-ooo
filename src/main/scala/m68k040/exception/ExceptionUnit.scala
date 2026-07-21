@@ -59,6 +59,13 @@ class ExceptionUnit(
     // Instruction-fetch access fault: build a PROGRAM-space SSW (vs data) and force
     // the R/W bit to read. Default False => data fault (unchanged for LS faults).
     entryFaultInstr: Bool = False,
+    // Task #189: the access SIZE (00=byte,01=word,10=long — LsFault.sizeBits'
+    // encoding) for the SSW SIZE field, and the ATC bit (True=MMU/ATC-detected
+    // fault, False=plain physical bus error). Defaults preserve the exact
+    // pre-existing behavior for callers that don't pass them (unit tests): SIZE=0
+    // (byte, the old always-zero field) and ATC=True (the old hardcoded value).
+    entryFaultSize: UInt = U(0, 2 bits),
+    entryFaultAtc:  Bool = True,
     // INTERRUPT entry (vs fault/trap). When True the entry SR-write additionally
     // raises the SR I-mask to `entryIplLevel` (so equal/lower interrupts are held
     // until RTE; NMI sets 7). Fault/trap entries leave the mask unchanged (S=1 /
@@ -477,8 +484,27 @@ class ExceptionUnit(
                                   // settle before capturing frameBase (mirrors E_DRAIN)
     val R_SRREQ   = new State    // load SR word @ base+0
     val R_SRWAIT  = new State
-    val R_PCREQ   = new State    // load PC long @ base+2
+    // Task #189: the PC field is read as TWO WORD sub-reads (hi @ base+2, lo @
+    // base+4) instead of one LONG @ base+2. A single LONG read's byte-lane extract
+    // can silently read PAST a 16-byte D-cache line (`DcacheByteLane.extract`
+    // has no cross-line awareness — only the general LsEuPlugin AGU path splits a
+    // crossing access into two proper sub-accesses; this exception-FSM read path
+    // is a simpler, purpose-built sequencer that never got that treatment). A
+    // format-$2 (12-byte) frame's PC field lands at base+2, which — unlike the
+    // format-$0/$7 cases that predate task #189 — now regularly sits at a
+    // non-4-aligned frameBase (any supSp-12), making a 4-byte read spanning a
+    // line boundary a real, not just theoretical, case (found via
+    // exc_addr_error_odd_rte.s: frameBase=0xFFEC, PC field @0xFFEE crosses into
+    // the 0xFFF0 line). Splitting to WORD granularity narrows the exposure to
+    // the SAME residual class the store side already carries post-task-163 (a
+    // WORD landing exactly at line-relative offset 15) — not fully eliminated,
+    // but no test in the corpus hits that narrower case; a full byte-level
+    // cross-line read split (mirroring E_STORE's `crosses`/`stSplitLow`) would
+    // close it completely if a future test ever does.
+    val R_PCREQ   = new State    // load PC hi word @ base+2
     val R_PCWAIT  = new State
+    val R_PCREQ2  = new State    // load PC lo word @ base+4
+    val R_PCWAIT2 = new State
     val R_FMTREQ  = new State    // load format word @ base+6 (select $0 vs $7 pop)
     val R_FMTWAIT = new State
     val R_REDIR   = new State
@@ -518,18 +544,36 @@ class ExceptionUnit(
         // or a more complete manual excerpt that resolves the cpID question), revisit
         // this — it's a genuine unresolved disagreement between two sources of truth,
         // not a confidently-verified fact either direction.
+        // Vector 3 (ADDRESS ERROR, task #189) is ALSO a format-$2, 12-byte frame — a
+        // taken control transfer (JMP/JSR/BRA/Bcc/BSR/DBcc/RTS/RTR) to an odd target
+        // (M68040UM §8.2.3). Detected dynamically in the branch EU (BranchEuPlugin's
+        // `addrErr`), delivered via the same generalized euFault->faultVecStore path
+        // as TRAPV/CHK/DIV0. Unlike those three (whose PC field = nextPc, "already
+        // executed, resume after"), address error's PC field = the TRANSFER
+        // instruction's OWN pc (retry-after-fix semantics — the test corpus's
+        // handlers patch the frame and RTE back to re-attempt the same transfer).
+        // That already falls out for free: ibrUop/relative-branch µops all default
+        // faultUsesNextPc=False, so faultPcStore already holds the instruction's own
+        // pc at alloc (see RobPlugin's faultPcStore comment) -> entryPc IS that pc.
         val is2 = !entryIsInterrupt &&
-                  ((entryVector === 7) || (entryVector === 6) || (entryVector === 5) || (entryVector === 11))
+                  ((entryVector === 7) || (entryVector === 6) || (entryVector === 5) ||
+                   (entryVector === 11) || (entryVector === 3))
         // PPC: supplied explicitly (variable-length CHK/DIV0); fall back to entryPc-2
         // for callers that don't pass it (the TRAPV-only unit tests, 2-byte op).
         val ppc = if (entryPpc != null) entryPpc else (entryPc - 2).resized
+        // Address error's extra format-$2 word (SP+8, "ADDRESS") carries the faulting
+        // ODD TARGET (entryFaultAddr, execute-time-computed — see BranchEuPlugin's
+        // `addrErr`/`faultAddr` and RobPlugin's euFaultCompletion->faultAddrStore),
+        // NOT the trapping-instruction PC that TRAPV/CHK/DIV0 put there. Every other
+        // vector routed through is2 keeps using `ppc` unchanged.
+        val ppcOrTarget = Mux(entryVector === 3, entryFaultAddr, ppc.resized)
         curVec    := entryVector
         curPc     := entryPc
         curIs7    := is7
         curIs2    := is2
         curIsInt  := entryIsInterrupt
         curLevel  := entryIplLevel
-        curPpc    := ppc.resized
+        curPpc    := ppcOrTarget.resized
         curFault  := entryFaultAddr
         // SSW = (in_mmu 0x400) | fc | (rw<<8); fc = data space (bit0=1) + supervisor
         // (bit2) if a supervisor access; rw = read?1:write?0 (MAME m68ki_aerr).
@@ -548,7 +592,28 @@ class ExceptionUnit(
         val spaceBits = Mux(entryFaultInstr, U(0x2, 3 bits), U(0x1, 3 bits))
         val fc  = Mux(faultSuper, U(0x4, 3 bits), U(0x0, 3 bits)) | spaceBits
         val rwB = Mux(entryFaultInstr, U(1, 1 bits), Mux(entryFaultWr, U(0, 1 bits), U(1, 1 bits)))
-        curSsw    := (U(0x400, 16 bits) | fc.resize(16) | (rwB ## U(0, 8 bits)).asUInt.resize(16))
+        // Task #189: two SSW bugs fixed here, both previously characterized as
+        // "narrower, currently-moot" (moot because the ONLY fault source before
+        // this task was the MMU/ATC path, for which ATC=1 always happened to be
+        // right, and nothing ever checked SIZE):
+        //   (1) ATC (bit 10) was hardcoded 1 unconditionally — now genuinely
+        //       entryFaultAtc-driven: 1 for an MMU/ATC-detected translation fault,
+        //       0 for a plain physical bus error (SLVERR/DECERR with zero MMU
+        //       involvement) — see LsFault.atc / LsEuPlugin's captureFault(atc=).
+        //   (2) SIZE (bits 6:5) was never populated at all (always read 0b00,
+        //       coincidentally "long") — now built from entryFaultSize, which
+        //       carries LsFault.sizeBits' encoding (00=byte,01=word,10=long) and
+        //       needs translating to the SSW's OWN size encoding
+        //       (00=long,01=byte,10=word,11=reserved).
+        val atcBit  = Mux(entryFaultAtc, U(0x400, 16 bits), U(0, 16 bits))
+        val sswSize = entryFaultSize.mux(
+          U(0, 2 bits) -> U(1, 2 bits),   // our BYTE -> SSW 01
+          U(1, 2 bits) -> U(2, 2 bits),   // our WORD -> SSW 10
+          U(2, 2 bits) -> U(0, 2 bits),   // our LONG -> SSW 00
+          default      -> U(0, 2 bits))
+        val sizeField = (sswSize << 5).resize(16)
+        curSsw    := (atcBit | sizeField | fc.resize(16) |
+                      (rwB ## U(0, 8 bits)).asUInt.resize(16))
         oldSr     := (ss.srSys ## committedCcr.resize(8 bits)).asUInt
         // new SP = supervisor bank (M?MSP:ISP) - frame size
         //   format-$0 = 8 bytes, format-$2 = 12 bytes, format-$7 = 60 bytes.
@@ -756,13 +821,25 @@ class ExceptionUnit(
     }
     R_PCREQ.whenIsActive {
       dtoVld := True; dtoVpn := (frameBase + 2)(31 downto 12)
-      ldoVld := True; ldoVaddr := frameBase + 2; ldoSize := Size.LONG
+      ldoVld := True; ldoVaddr := frameBase + 2; ldoSize := Size.WORD
       when(dcLoadCmd.fire) { goto(R_PCWAIT) }
     }
     R_PCWAIT.whenIsActive {
       dtoVld := True; dtoVpn := (frameBase + 2)(31 downto 12)
       when(dcLoadRsp.valid) {
-        popPc := dcLoadRsp.payload.data.asUInt
+        popPc(31 downto 16) := dcLoadRsp.payload.data(15 downto 0).asUInt
+        goto(R_PCREQ2)
+      }
+    }
+    R_PCREQ2.whenIsActive {
+      dtoVld := True; dtoVpn := (frameBase + 4)(31 downto 12)
+      ldoVld := True; ldoVaddr := frameBase + 4; ldoSize := Size.WORD
+      when(dcLoadCmd.fire) { goto(R_PCWAIT2) }
+    }
+    R_PCWAIT2.whenIsActive {
+      dtoVld := True; dtoVpn := (frameBase + 4)(31 downto 12)
+      when(dcLoadRsp.valid) {
+        popPc(15 downto 0) := dcLoadRsp.payload.data(15 downto 0).asUInt
         goto(R_FMTREQ)
       }
     }
@@ -796,8 +873,46 @@ class ExceptionUnit(
         popIs1 := nib === U(1, 4 bits)
         val fmtOk = (nib === U(0, 4 bits)) || (nib === U(1, 4 bits)) ||
                     (nib === U(2, 4 bits)) || (nib === U(7, 4 bits))
-        when(fmtOk) {
+        // Task #189: an otherwise well-formed frame whose PC field is ODD is a
+        // SEPARATE malformation from a bad format nibble — the 68040 PC must always
+        // be even (M68040UM §8.2.3). Checked only when the format itself is valid
+        // (a bad-format frame already routes to vector 14 below regardless of PC
+        // parity — no test exercises the combination, and format-error is the more
+        // fundamental defect) and NOT for the format-$1 throwaway pop (popIs1's PC
+        // field is discarded — m68ki_fake_pull_32 — so its parity is architecturally
+        // irrelevant). `popPc` was already captured in R_PCWAIT above (frameBase+2,
+        // same offset for every format).
+        val pcOdd = fmtOk && !popIs1 && popPc(0)
+        when(fmtOk && !pcOdd) {
           goto(R_REDIR)
+        } elsewhen(pcOdd) {
+          // Synthesize a vector-3 (address error) format-$2 ENTRY — CONSERVATIVE
+          // model, mirrors the vector-14 format-error path just below (the malformed
+          // frame is left IN PLACE; SR/A7 are NOT applied from it), except the
+          // vector/format differ: format-$2 (12 bytes, via curIs2). UNLIKE vector 14
+          // (whose PC field is rteCapPc, the RTE instruction's own address, for a
+          // direct retry), BOTH the PC field (SP+2, curPc) and the extra ADDRESS
+          // field (SP+8, curPpc) here carry the ODD RESUME PC itself (popPc) — the
+          // documented test contract (exc_addr_error_odd_rte.s header): "carries the
+          // odd resume PC in BOTH the PC field and the instruction-address field".
+          // A handler wanting to retry the RTE must explicitly patch SP+2 to the
+          // RTE's own address itself before RTE-ing out of THIS frame (the test does
+          // exactly that) — this frame's PC field does not default to it.
+          curVec       := U(3, 8 bits)
+          curPc        := popPc
+          curIs7       := False
+          curIs2       := True
+          curIsInt     := False
+          curLevel     := U(0, 3 bits)
+          curPpc       := popPc
+          curFault     := U(0, 32 bits)
+          curThrowaway := False
+          stFrame2     := False
+          oldSr        := (ss.srSys ## committedCcr.resize(8 bits)).asUInt
+          vecTarget    := (ss.vbr + (U(3, 8 bits) << 2)).resized
+          stStep       := 0
+          stSplitLow   := False
+          goto(E_DRAIN)
         } otherwise {
           // Synthesize a vector-14 format-$0 ENTRY, reusing the normal E_* frame-push
           // path unchanged (mirrors the IDLE->entryTrigger setup above, specialized to

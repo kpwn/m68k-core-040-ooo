@@ -909,7 +909,33 @@ object MicroOpAssembler {
     val ldIdxEa = Mux(opIsLineImm, immEa, srcEa)
     ldUop.srcCReg       := ldIdxEa.indexReg;   ldUop.srcCValid := ldIdxEa.indexValid
     ldUop.indexLong     := ldIdxEa.indexLong;  ldUop.indexScale := ldIdxEa.indexScale
-    ldUop.leaAddr := False; ldUop.movesAliasStore := False; ldUop.fromCcr := False; ldUop.fromSr := False; ldUop.needsSupervisor := False; ldUop.keepCommit := False
+    // Task #189 code-review fix: a MEMORY-source privileged commit-time SYSTEM op
+    // (e.g. MOVE.W <ea>,SR with a memory <ea> — move_ea_sr_memsrc_priv.s) cracks
+    // into THIS generic load (reading <ea> into T0) followed by the sysOp µop
+    // (which applies T0 to SR and is where the EXISTING privilege check —
+    // RobPlugin's Track-D `sysPrivFault`, gated at the sysOp's OWN commit — lives).
+    // On real 68k hardware the privilege check happens BEFORE the operand is even
+    // fetched; this core's crack does the load unconditionally and only checks
+    // privilege later, at the sysOp. That ordering gap was previously DORMANT
+    // (harmless) because the load could never itself raise an architectural fault
+    // — until task #189 added genuine bus-error delivery: a user-mode access to
+    // an unmapped EA now faults THIS load (a program-order-EARLIER ROB entry than
+    // the sysOp), which — being an earlier fault — squashes everything younger
+    // (including the sysOp) before its privilege check ever runs, wrongly
+    // delivering vector 2 instead of vector 8. Tagging this load `needsSupervisor`
+    // (mirroring Track C's existing per-µop flag, harmless to reuse: RobPlugin's
+    // `privOnly = privViolation && !faultedStore(h0)` already refuses to let a
+    // FAULTED head take the priv vector, so this alone does not misfire when the
+    // load actually faults) lets LsEuPlugin's bus-error path (task #189) check it
+    // and suppress the fault report for exactly this one crack shape — see that
+    // file's WAIT-state comment — restoring the ORIGINAL (pre-task-189) behavior
+    // for the faulting case (the load completes with unused/don't-care data; the
+    // sysOp's own Track-D check still correctly delivers vector 8) while ALSO
+    // fixing the non-faulting case for free (a privileged memory-source sysOp
+    // accessing ordinary, mapped, but still user-inaccessible memory now correctly
+    // traps via Track C at the load itself, instead of relying solely on the
+    // later sysOp commit).
+    ldUop.leaAddr := False; ldUop.movesAliasStore := False; ldUop.fromCcr := False; ldUop.fromSr := False; ldUop.needsSupervisor := spec.sysOp; ldUop.keepCommit := False
     ldUop.sysOp := False; ldUop.sysKind := SysKind.NONE; ldUop.sysReadDir := False
     ldUop.predTaken := False; ldUop.predTarget := U(0, 32 bits)
     ldUop.phtValid := False; ldUop.phtIndex := U(0, 11 bits); ldUop.casForm := 0
