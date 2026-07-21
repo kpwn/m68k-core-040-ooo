@@ -1337,15 +1337,21 @@ object MicroOpAssembler {
       opUop.cluster       := Cluster.INT
       opUop.memOp         := MemOp.NONE
       opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
-      // writesNzvc/writesX = True (task #176): RTE restores the frame's CCR into the
-      // REAL flags PRF, not just the ROB's committedCcr (which only stages a future
-      // exception's stacked SR). Setting these makes rename allocate a real pNzvcDst/
-      // pXDst for this µop, exactly like the MOVEC/MOVE-USP READ-direction sysOps
-      // (dstValid=True there): the execute-time fastFire ALU pass writes a throwaway
-      // value into the fresh phys reg (harmless — RTE is serializing, so no consumer
-      // can be renamed before the FSM's real write, at the actual frame pop, overrides
-      // it — see ExceptionUnit's rteNzvcWriteValid/rteCcrCommit + RobPlugin's wiring).
-      opUop.writesNzvc := True; opUop.writesX := True; opUop.isBranch := False
+      // writesNzvc/writesX = False (task #176 REVERTED this to True, then task-176-
+      // regression reverted it back to False — see ExceptionUnit.scala's
+      // rteNzvcWriteValid doc comment for the full story). RTE restores the frame's
+      // CCR into the REAL flags PRF via a DIRECT write into whatever physical
+      // register nzvcRat/xRat's COMMITTED mapping currently names (mirrors
+      // a7WriteValid/a7WriteData's already-safe pattern) — it does NOT need, and
+      // must NOT take, a fresh rename allocation: a rename-allocated pNzvcDst/pXDst
+      // sits "uncommitted" from the freelist's perspective for the FULL multi-cycle
+      // R_DRAIN..R_REDIR FSM run (RenameStage's freelist-flush/RAT-rollback is fed by
+      // `flushing`, which stays asserted via `excSquash` for that whole window), so a
+      // wrong-path instruction renamed during that window can be handed the EXACT
+      // SAME physical register RTE itself is mid-flight with — a confirmed silent-
+      // corruption regression under back-to-back/nested exception storms
+      // (exc_stack_atomicity_stress, pea_aline_irq_storm, via1_t1_irq_storm).
+      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
       opUop.unimplemented := False
       opUop.faulted := False; opUop.faultVector := 0
       opUop.isRte   := True

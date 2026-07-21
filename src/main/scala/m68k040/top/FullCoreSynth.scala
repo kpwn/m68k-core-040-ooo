@@ -29,9 +29,17 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
   // Int PRF READ port for the LIVE committed A7 readback (arch-15 committed phys). Feeds
   // exc.committedA7In so ss.usp/isp/msp continuously mirror the architectural A7.
   var a7Rd: m68k040.execute.regfile.RegFileReadPort = null
+  // NZVC/X PRF write ports for RTE's CCR restore (task #176-regression): a DIRECT
+  // write into whatever physical register nzvcRat/xRat's COMMITTED mapping currently
+  // names, mirroring a7Wr's already-safe pattern -- see ExceptionUnit.scala's
+  // rteNzvcWriteValid doc comment for why this replaced a rename-allocation approach.
+  var nzvcWr: m68k040.execute.regfile.RegFileWritePort = null
+  var xWr:    m68k040.execute.regfile.RegFileWritePort = null
   during setup {
     a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
     a7Rd = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
+    nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
+    xWr    = host[m68k040.execute.regfile.XRegFileService].newWrite(latency = 1, sharingKey = "rteX")
   }
   val logic = during build new Area {
     val iq  = host[IssueQueueService]
@@ -317,6 +325,19 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // committed S,M) so ss.usp/isp/msp track the architectural A7 of the active bank.
     a7Rd.addr := host[RenameStage].committedPhysA7.resize(a7Rd.addr.getWidth)
     exc.committedA7In := a7Rd.data.asUInt
+    // RTE CCR restore -> REAL flags PRF (task #176-regression): DIRECT write into
+    // whatever physical register nzvcRat/xRat's committed mapping currently names.
+    // Safe for the same reason a7Wr's direct write is safe: nothing else can be
+    // committing to this same physical register while RTE's serializing FSM owns the
+    // ROB head (retire0/1 blocked the whole time) -- no rename allocation, no
+    // freelist interaction, no RAT remap, so no exposure to the ROB-head-serializing
+    // squash window at all.
+    nzvcWr.valid   := exc.rteNzvcWriteValid
+    nzvcWr.address := host[RenameStage].committedPhysNzvc.resize(nzvcWr.address.getWidth)
+    nzvcWr.data    := exc.rteNzvcWriteData
+    xWr.valid      := exc.rteXWriteValid
+    xWr.address    := host[RenameStage].committedPhysX.resize(xWr.address.getWidth)
+    xWr.data       := exc.rteXWriteData.asBits
 
     // Synth anchors (registered top outputs) so synthesis can't trim the core.
     val eu0Res = out(RegNext(eu0.intW.data))   // EU0 int result -> anchors datapath+PRF

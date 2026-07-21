@@ -56,7 +56,17 @@ class IpcBenchSpec extends AnyFunSuite {
 
   class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin, divEu: m68k040.execute.DivEuPlugin) extends FiberPlugin {
     var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
-    during setup { a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7") }
+    // NZVC/X PRF write ports for RTE's CCR restore (task #176-regression): a DIRECT
+    // write into whatever physical register nzvcRat/xRat's COMMITTED mapping
+    // currently names, mirroring a7Wr's already-safe pattern -- see
+    // ExceptionUnit.scala's rteNzvcWriteValid doc comment.
+    var nzvcWr: m68k040.execute.regfile.RegFileWritePort = null
+    var xWr:    m68k040.execute.regfile.RegFileWritePort = null
+    during setup {
+      a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
+      nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
+      xWr    = host[m68k040.execute.regfile.XRegFileService].newWrite(latency = 1, sharingKey = "rteX")
+    }
     val logic = during build new Area {
       val iq  = host[IssueQueueService]
       val rob = host[RobPlugin]
@@ -219,6 +229,12 @@ class IpcBenchSpec extends AnyFunSuite {
       a7Wr.valid   := exc.a7WriteValid
       a7Wr.address := U(15, a7Wr.address.getWidth bits)
       a7Wr.data    := exc.a7WriteData.asBits
+      nzvcWr.valid   := exc.rteNzvcWriteValid
+      nzvcWr.address := host[RenameStage].committedPhysNzvc.resize(nzvcWr.address.getWidth)
+      nzvcWr.data    := exc.rteNzvcWriteData
+      xWr.valid      := exc.rteXWriteValid
+      xWr.address    := host[RenameStage].committedPhysX.resize(xWr.address.getWidth)
+      xWr.data       := exc.rteXWriteData.asBits
     }
   }
 

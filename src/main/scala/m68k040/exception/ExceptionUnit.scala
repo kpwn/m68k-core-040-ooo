@@ -266,22 +266,54 @@ class ExceptionUnit(
   // Only PFLUSHA drives this (S_APPLY sysCapKind=7); everything else leaves it False.
   val sysFlushAllValid = Bool();        sysFlushAllValid := False;        sysFlushAllValid.simPublic()
 
-  // ── RTE CCR restore -> REAL flags PRF (task #176) ────────────────────────────
+  // ── RTE CCR restore -> REAL flags PRF (task #176, redesigned task-176-regression) ──
   // Fires exactly at RTE's REAL frame pop (R_REDIR, non-throwaway branch — the SAME
   // cycle obsFire/redirectValid fire for RTE). Carries the frame's popped CCR bits
-  // {X,N,Z,V,C}; the ROB wiring writes them into the rename-allocated pNzvcDst/pXDst
-  // physical regs (p0.nzvcNew/p0.xNew — populated because decode now gives the RTE
-  // op µop writesNzvc/writesX) via dedicated write ports — NOT just `committedCcr`
-  // (which only stages a FUTURE exception's stacked SR and is never read by an
-  // ordinary Bcc/flag-consuming instruction). `rteCcrCommit` is the matching pulse
-  // the ROB uses to commit the arch->phys mapping into nzvcRat/xRat (freeing the old
-  // phys regs) the same cycle, so a later instruction's rename read sees the restored
-  // CCR. Default idle; only the RTE FSM branch below drives these.
+  // {X,N,Z,V,C}.
+  //
+  // ORIGINAL (task #176) design wrote these into a FRESH rename-allocated pNzvcDst/
+  // pXDst (RTE's µop carried writesNzvc/writesX so decode/rename popped new physical
+  // registers), then a RobPlugin commit block folded the new arch->phys mapping into
+  // nzvcRat/xRat. That mechanism caused a CONFIRMED regression under back-to-back/
+  // nested exception storms (exc_stack_atomicity_stress, pea_aline_irq_storm,
+  // via1_t1_irq_storm): RTE's OWN freelist pop sits "uncommitted" (from the
+  // Freelist's `commHead` perspective) for the ENTIRE multi-cycle R_DRAIN..R_REDIR
+  // FSM run, because `flushing` (which gates the ROB's retire0/1 AND, via
+  // `rc.flushPort`, RenameStage's RAT-rollback/freelist-flush) stays asserted the
+  // WHOLE time via `excSquash`. The freelist's `head := commHead` fires EVERY cycle
+  // during that window, so RTE's own not-yet-pushed pNzvcDst/pXDst are treated as
+  // still-speculative and their ring slot is handed right back out — and since
+  // `IssueQueuePlugin` forces `push.ready` True during its OWN matching flush
+  // (`readyReg := True` in its flush branch), the frontend/rename keep firing and
+  // popping the SAME (never-advanced) id for the whole window. A wrong-path
+  // instruction renamed during this window can therefore receive the EXACT SAME
+  // physical nzvc/x register RTE itself is mid-flight with; if that wrong-path uop's
+  // EU write lands (it can survive briefly once the IQ's flush finally drops for one
+  // cycle before the frontend's OWN redirect lands), it silently clobbers the
+  // register RTE's OWN restore -- now also the live nzvcRat/xRat mapping, because of
+  // the same commit -- is relying on. Confirmed via direct trace + a bisection
+  // matrix: disabling ONLY the RobPlugin commit-block (keeping the write ports)
+  // cured all 3 regressions; disabling ONLY the write ports (keeping the commit)
+  // did not.
+  //
+  // NEW design mirrors the ALREADY-PROVEN-SAFE `a7WriteValid`/`a7WriteData` pattern
+  // (SystemState's committed A7 restore, ExceptionUnit.scala class-level comment
+  // above): NZVC/X are archDepth=1 singleton "architectural registers" whose
+  // COMMITTED physical mapping essentially never needs to change here -- only its
+  // CONTENTS do. So RTE's µop keeps writesNzvc/writesX FALSE (no rename allocation,
+  // no freelist interaction, no RAT remap, no exposure window at all) and the wiring
+  // plugins write `rteNzvcWriteData`/`rteXWriteData` DIRECTLY into whatever physical
+  // register `RenameStage.committedPhysNzvc`/`committedPhysX` CURRENTLY names (a
+  // plain in-place content update, exactly like `a7Wr.address := committedPhysA7`) --
+  // see FullCoreSynth.scala/FuzzDut.scala/IpcBenchSpec.scala/ExecuteLockStepSpec.scala.
+  // Safe for the same reason A7's direct write is safe: nothing else can be
+  // committing to this same physical register while RTE's serializing FSM owns the
+  // ROB head (retire0/1 are blocked the whole time), so a same-cycle multi-writer
+  // collision cannot occur, and there is no freelist pop/push at all to race.
   val rteNzvcWriteValid = Bool();       rteNzvcWriteValid := False;       rteNzvcWriteValid.simPublic()
   val rteNzvcWriteData  = Bits(4 bits); rteNzvcWriteData  := B(0, 4 bits); rteNzvcWriteData.simPublic()
   val rteXWriteValid    = Bool();       rteXWriteValid    := False;       rteXWriteValid.simPublic()
   val rteXWriteData     = Bool();       rteXWriteData     := False;       rteXWriteData.simPublic()
-  val rteCcrCommit      = Bool();       rteCcrCommit      := False;       rteCcrCommit.simPublic()
 
   // ── SystemState write defaults (the FSM pulses them) ────────────────────────
   ss.setSrSys.valid := False; ss.setSrSys.payload := U(0, 8 bits)
@@ -826,14 +858,17 @@ class ExceptionUnit(
         .otherwise { ss.setIsp.valid := True; ss.setIsp.payload := newSsp }
         redirectValid := True
         redirectPc    := popPc
-        // task #176: restore the popped CCR {X,N,Z,V,C} into the REAL flags PRF (not
-        // just committedCcr) so a later Bcc/flag-reader actually observes it. SR bit
-        // layout: bit4=X, bits3..0=N,Z,V,C (matches our internal 4-bit nzvc field).
+        // task #176 (redesigned, task-176-regression): restore the popped CCR
+        // {X,N,Z,V,C} into the REAL flags PRF (not just committedCcr) so a later
+        // Bcc/flag-reader actually observes it -- a DIRECT in-place write into
+        // whatever physical register is CURRENTLY nzvcRat/xRat's committed mapping
+        // (see the class-level doc comment on rteNzvcWriteValid above), driven by the
+        // wiring plugins exactly like a7WriteValid/a7WriteData. SR bit layout: bit4=X,
+        // bits3..0=N,Z,V,C (matches our internal 4-bit nzvc field).
         rteNzvcWriteValid := True
         rteNzvcWriteData  := popSr(3 downto 0).asBits
         rteXWriteValid    := True
         rteXWriteData     := popSr(4)
-        rteCcrCommit      := True
         // commit observation: RTE's trace step == restored PC + restored SR sysByte
         // + A7. A7 after RTE = popped-SSP if S restored supervisor, else USP. The CCR
         // is restored from the frame too, but the whitebox carries it (RTE restores

@@ -323,6 +323,15 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     * with the architectural A7 every cycle (driven by the backend wiring layer). */
   def committedPhysA7: UInt = logic.intRat.committedPhys(15)
 
+  /** COMMITTED phys mapping of the singleton NZVC / X "architectural registers"
+    * (archDepth=1, always arch index 0). task #176-regression: RTE's CCR restore
+    * writes DIRECTLY into whatever physical register these currently name (mirrors
+    * committedPhysA7's already-safe pattern) instead of rename-allocating a fresh
+    * pNzvcDst/pXDst — see ExceptionUnit.scala's rteNzvcWriteValid doc comment for why
+    * the rename-allocation approach was reverted. */
+  def committedPhysNzvc: UInt = logic.nzvcRat.committedPhys(0)
+  def committedPhysX:    UInt = logic.xRat.committedPhys(0)
+
   override def commitPorts: Vec[Flow[CommitSlot]] = logic.commitPorts
   override def flushPort:   Bool                  = logic.flush
 }

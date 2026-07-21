@@ -33,10 +33,18 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
   var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
   var seedWr: m68k040.execute.regfile.RegFileWritePort = null
   var a7Rd: m68k040.execute.regfile.RegFileReadPort = null
+  // NZVC/X PRF write ports for RTE's CCR restore (task #176-regression): a DIRECT
+  // write into whatever physical register nzvcRat/xRat's COMMITTED mapping currently
+  // names, mirroring a7Wr's already-safe pattern -- see ExceptionUnit.scala's
+  // rteNzvcWriteValid doc comment for why this replaced a rename-allocation approach.
+  var nzvcWr: m68k040.execute.regfile.RegFileWritePort = null
+  var xWr:    m68k040.execute.regfile.RegFileWritePort = null
   during setup {
     a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
     seedWr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7", priority = 1)
     a7Rd   = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
+    nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
+    xWr    = host[m68k040.execute.regfile.XRegFileService].newWrite(latency = 1, sharingKey = "rteX")
   }
   val logic = during build new Area {
     val seedValid = in Bool (); val seedAddr = in UInt (6 bits); val seedData = in Bits (32 bits)
@@ -212,6 +220,12 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     a7Wr.data    := Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits)
     a7Rd.addr := host[RenameStage].committedPhysA7.resize(a7Rd.addr.getWidth)
     exc.committedA7In := a7Rd.data.asUInt
+    nzvcWr.valid   := exc.rteNzvcWriteValid
+    nzvcWr.address := host[RenameStage].committedPhysNzvc.resize(nzvcWr.address.getWidth)
+    nzvcWr.data    := exc.rteNzvcWriteData
+    xWr.valid      := exc.rteXWriteValid
+    xWr.address    := host[RenameStage].committedPhysX.resize(xWr.address.getWidth)
+    xWr.data       := exc.rteXWriteData.asBits
   }
 }
 

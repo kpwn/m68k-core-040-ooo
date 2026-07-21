@@ -293,6 +293,33 @@ object PortedTestRunner {
         }
       }
 
+      // debug-only, env-gated trace for the task #176 RTE-CCR regression (task
+      // #176-regression: exc_stack_atomicity_stress / pea_aline_irq_storm /
+      // via1_t1_irq_storm): prints every rteRetire (trigger) pulse + the RTE's direct
+      // NZVC/X restore writes (exc.rteNzvcWriteValid/rteXWriteValid, now a direct
+      // write into whatever physical register nzvcRat/xRat's committed mapping
+      // currently names — see ExceptionUnit.scala's rteNzvcWriteValid doc comment)
+      // + every redirect, with the SSP/A7 bank state. Zero cost unless
+      // PORTED_TRACE_RTECCR is set.
+      if (sys.env.contains("PORTED_TRACE_RTECCR")) {
+        var trCyc = 0
+        cd.onSamplings {
+          trCyc += 1
+          val rc = dut.rob.logic
+          if (rc.rteRetire.toBoolean) {
+            println(f"[rteccr] cyc=$trCyc%6d RTE_RETIRE head=${rc.head.toInt}%3d tail=${rc.tail.toInt}%3d count=${rc.count.toInt}%3d")
+          }
+          if (dut.rob.logic.exc.rteNzvcWriteValid.toBoolean || dut.rob.logic.exc.rteXWriteValid.toBoolean) {
+            println(f"[rteccr] cyc=$trCyc%6d RTE_CCR_RESTORE nzvcData=0x${dut.rob.logic.exc.rteNzvcWriteData.toBigInt.toString(16)} " +
+              f"xData=${dut.rob.logic.exc.rteXWriteData.toBoolean}")
+          }
+          if (dut.rob.logic.exc.redirectValid.toBoolean) {
+            println(f"[rteccr] cyc=$trCyc%6d REDIRECT pc=0x${dut.rob.logic.exc.redirectPc.toLong & 0xffffffffL}%08x " +
+              f"a7=0x${dut.rob.logic.exc.ss.a7.toLong & 0xffffffffL}%08x isp=0x${dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL}%08x msp=0x${dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL}%08x usp=0x${dut.rob.logic.exc.ss.usp.toLong & 0xffffffffL}%08x")
+          }
+        }
+      }
+
       var bkptFired = false
       if (bkptPcs.nonEmpty) {
         cd.onSamplings {
