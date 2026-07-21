@@ -166,6 +166,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val mispredictStore = Vec.fill(depth)(RegInit(False))
     mispredictStore.foreach(_.simPublic()) // debug-only observability, task #139 investigation; zero synth impact
     val nextPcStore     = Vec.fill(depth)(Reg(UInt(32 bits)))
+    // Task #193 (trace exception T0): the branch EU's RESOLVED taken/redirect decision
+    // (BranchCompletion.btbTaken == `actualTaken`, driven UNCONDITIONALLY for every
+    // completing branch-family µop regardless of BTB eligibility — see BranchEuPlugin's
+    // `redirect`/`actualTaken`). This is EXACTLY 68k trace-T0's "taken change of flow"
+    // condition (ibranch always True; Bcc/BRA iff taken; DBcc iff looping) — reused
+    // as-is rather than re-deriving it. RegInit(False), reset per-alloc like
+    // mispredictStore (a never-completed/re-used index reads "not taken").
+    val branchTakenStore = Vec.fill(depth)(RegInit(False))
     // ── BTB-update per-entry capture (fetch-time predictor, slice 1) ────────────
     // Recorded from branchCompletion (the branch EU) and read at retire to drive the
     // BTB write port (the BtbUpdate service below). btbIsBranchStore RegInit(False)
@@ -429,15 +437,42 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // otherwise the preempted head instruction's PC. (`stopped`/`stoppedPc` are Regs above.)
     val interruptPc = UInt(32 bits); interruptPc := Mux(stopped, stoppedPc, pcStore(h0)); interruptPc.simPublic()
 
+    // ── Trace exception (T0/T1), task #193 ───────────────────────────────────────
+    // A POSTPONED exception (vector 9, format-$2): fires AFTER a traced instruction
+    // has fully, normally retired, at the NEXT macro-instruction boundary (never
+    // mid-crack — see the arming/dispatch split below). `tracePendingReg` latches
+    // "some already-retired instruction was trace-armed and is awaiting dispatch";
+    // `tracePendingPc`/`tracePendingPpc` latch its {resume PC, own PC} for the
+    // eventual format-$2 frame (PC field = resume address = the NEXT instruction;
+    // PPC field = the traced instruction's own address — mirrors Musashi's
+    // REG_PC/REG_PPC split in m68ki_exception_trace/m68ki_stack_frame_0010).
+    //
+    // `tracePendingFire` (FORWARD-DECLARED here, retire0/retire1 gate on it; DRIVEN
+    // after the exc unit is built, since it needs exc.ss.srSys) mirrors
+    // `interruptPending`'s own forward-declaration precedent exactly. `h0TraceArmed`
+    // (also forward-declared) says "the instruction ABOUT to retire at h0 THIS cycle
+    // is itself trace-armed" — used to force single-wide retire (block retire1) so a
+    // paired h1 never slips past a boundary that must be traced before it executes
+    // (prm_trace_t1_before_next.s's exact concern, generalized to 2-wide retire).
+    val tracePendingFire = Bool(); tracePendingFire.simPublic()
+    val h0TraceArmed     = Bool(); h0TraceArmed.simPublic()
+    val tracePendingReg  = RegInit(False); tracePendingReg.simPublic()
+    val tracePendingPc   = Reg(UInt(32 bits)); tracePendingPc.simPublic()
+    val tracePendingPpc  = Reg(UInt(32 bits)); tracePendingPpc.simPublic()
+
     // A normal retire is also blocked while an interrupt is pending (the head does
     // not commit — like the faulted-head case).
     // retire0 blocked by: a faulted/RTE/sysOp head (all serializing), a pending interrupt,
-    // OR a privilege-violation head (Track C MOVE-from-SR in user mode). retire1 likewise
-    // excludes a needsSupervisor (C) or sysOp (D) head from slot-1 (both serializing).
+    // a pending TRACE dispatch (task #193), OR a privilege-violation head (Track C
+    // MOVE-from-SR in user mode). retire1 likewise excludes a needsSupervisor (C) or
+    // sysOp (D) head from slot-1 (both serializing), AND a trace-armed h0 (so h1 never
+    // retires in the same cycle as the instruction that just armed a pending trace —
+    // it must wait for the trace exception to be taken first).
     val retire0 = headReady && !faultedStore(h0) && !isRteStore(h0) && !sysOpStore(h0) &&
-                  !interruptPending && !privViolation && !stopped
+                  !interruptPending && !privViolation && !stopped && !tracePendingFire
     val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone &&
-                  !faultedStore(h1) && !isRteStore(h1) && !needsSupStore(h1) && !sysOpStore(h1)
+                  !faultedStore(h1) && !isRteStore(h1) && !needsSupStore(h1) && !sysOpStore(h1) &&
+                  !h0TraceArmed
 
     val traceVec     = Vec(CommitTrace(), 2)
     val traceFireVec = Vec(Bool(), 2)
@@ -523,6 +558,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       completes(branchCompletion.payload.robId)       := True
       mispredictStore(branchCompletion.payload.robId) := branchCompletion.payload.mispredict
       nextPcStore(branchCompletion.payload.robId)     := branchCompletion.payload.nextPc
+      // Task #193: capture the resolved taken/redirect decision (trace-T0 gate).
+      branchTakenStore(branchCompletion.payload.robId) := branchCompletion.payload.btbTaken
       // BTB-update capture (read at retire to drive the BTB write port).
       btbIsBranchStore(branchCompletion.payload.robId) := branchCompletion.payload.isBranch
       // gshare PHT-update capture (slice 3): the conditional-predicted bit (read at
@@ -599,6 +636,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       payload.write(tail, payloadFrom(allocUopVec(0)))
       completes(tail)       := False
       mispredictStore(tail) := False
+      branchTakenStore(tail) := False
       btbIsBranchStore(tail) := False
       phtValidStore(tail)   := False
       faultedStore(tail)  := allocUopVec(0).faulted
@@ -624,6 +662,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       payload.write(tail + 1, payloadFrom(allocUopVec(1)))
       completes(tail + 1)       := False
       mispredictStore(tail + 1) := False
+      branchTakenStore(tail + 1) := False
       btbIsBranchStore(tail + 1) := False
       phtValidStore(tail + 1)   := False
       faultedStore(tail + 1)  := allocUopVec(1).faulted
@@ -780,11 +819,24 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // requires !faulted(h0)). For an interrupt entry the vector = the simple-protocol
     // curVec (interruptVec), the stacked PC = the head INSTRUCTION's PC (interruptPc),
     // entryIsInterrupt selects the SR I-mask:=level update + format-$0 (not $7/$2).
-    val excEntryTrigger = exceptionPending || interruptPending
+    // Task #193: a pending TRACE dispatch (vector 9) is a THIRD entryTrigger source,
+    // prioritized BETWEEN exceptionPending (real synchronous faults/priv — highest)
+    // and interruptPending (lowest) per Motorola's exception-priority grouping (trace
+    // outranks interrupts but a genuine fault/priv violation at the SAME boundary
+    // still wins — see tracePendingFire's own gating, which already excludes a
+    // faulted/priv/sysOp/RTE head). Mutually exclusive with both by construction:
+    // tracePendingFire requires !faultedStore(h0)/!privViolation/!sysOpStore(h0)
+    // (excludes exceptionPending's sources) and is independent of iplActive/stopped's
+    // interrupt-only gating (though both CAN be simultaneously ready at one boundary —
+    // the Mux order below is what actually enforces trace-over-interrupt priority).
+    val excEntryTrigger = exceptionPending || tracePendingFire || interruptPending
     // exceptionVector/exceptionPc already fold in the sysPrivFault (vector 8 + the sysOp
-    // PC); a fault/trap uses them, an interrupt overrides with its own vector/PC.
-    val excEntryVector  = Mux(interruptPending, interruptVec, exceptionVector)
-    val excEntryPc      = Mux(interruptPending, interruptPc,  exceptionPc)
+    // PC); a fault/trap uses them, trace overrides with vector 9 + its latched resume
+    // PC, else an interrupt overrides with its own vector/PC.
+    val excEntryVector  = Mux(exceptionPending, exceptionVector,
+                          Mux(tracePendingFire, U(9, 8 bits), interruptVec))
+    val excEntryPc      = Mux(exceptionPending, exceptionPc,
+                          Mux(tracePendingFire, tracePendingPc, interruptPc))
     // MMU control (task #131): resolved here so the exception FSM's MOVEC read-side
     // case (Rc->Rn: TCR/URP/SRP) can read mmuCtrl.mmuEnable/urp/srp — MmuControlPlugin
     // has no dependencies of its own, so this is a plain leaf lookup (no Fiber-cycle
@@ -808,8 +860,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       entryTrigger = excEntryTrigger, entryVector = excEntryVector, entryPc = excEntryPc,
       // PPC for a format-$2 group-2 trap (TRAPV/CHK/DIV0) = the trapping INSTRUCTION's
       // PC. pcStore(h0) holds the instruction PC (variable-length safe; entryPc-2 only
-      // worked for the 2-byte TRAPV). Interrupts ignore entryPpc (format-$0).
-      entryPpc     = pcStore(h0),
+      // worked for the 2-byte TRAPV). Interrupts ignore entryPpc (format-$0). Task #193:
+      // a pending TRACE dispatch's PPC is `tracePendingPpc` (the ALREADY-RETIRED traced
+      // instruction's own PC, latched at arm time) — by the time tracePendingFire fires,
+      // h0/pcStore(h0) point at the NEXT (about to be preempted) instruction, not the
+      // traced one, so pcStore(h0) would be wrong here.
+      entryPpc     = Mux(tracePendingFire, tracePendingPpc, pcStore(h0)),
       // rtePc = the RTE instruction's OWN PC (task #177 fix; was p0.predNextPc = RTE's
       // pc+length, i.e. the address AFTER RTE, which broke the format-error retry
       // contract -- a vec-14 handler that patches the malformed frame and re-RTEs must
@@ -923,6 +979,60 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       stoppedPc := p0.predNextPc      // STOP's nextPc = the resume point (IRQ stacks this)
     }
     when(interruptPending) { stopped := False }
+
+    // ── Drive trace-exception (T0/T1) recognition (task #193) ───────────────────
+    // T1/T0 are bits 7/6 of the SR SYSTEM byte (srSys(7)=T1, srSys(6)=T0 — see
+    // SystemState's class doc). Read COMBINATIONALLY here: any SAME-cycle SR write
+    // from a retiring sysOp (S_APPLY) or RTE (R_REDIR) only LANDS in srSys the
+    // FOLLOWING cycle (`when(setSrSys.valid){srSys:=...}` is a plain register
+    // update), so this always observes the value as of BEFORE this cycle's own
+    // retiring instruction — exactly the "changes to T0/T1 take effect starting
+    // the FOLLOWING instruction" semantics (matches Musashi's m68ki_trace_t1(),
+    // sampled at the TOP of each instruction's execution, i.e. before it runs).
+    val t1Armed = exc.ss.srSys(7)
+    val t0Armed = exc.ss.srSys(6)
+    // T0 fires only for a genuinely-resolved TAKEN change of flow, and only for the
+    // one retiring µop that actually IS the branch-family op (p0.retireAlone) — an
+    // ordinary ALU/LS head is never itself a change of flow. branchTakenStore mirrors
+    // Musashi's m68ki_trace_t0() call sites (only inside a taken-branch code path).
+    val h0ChangeOfFlow = p0.retireAlone && branchTakenStore(h0)
+    h0TraceArmed := t1Armed || (t0Armed && h0ChangeOfFlow)
+    // ARM: latch a pending trace whenever a genuinely-committing instruction retires
+    // under an active trace condition. Covers BOTH retire0 (ordinary ALU/LS/branch
+    // heads) and sysRetire (the serializing MOVE-to-SR/ANDI-ORI-EORI-SR/MOVEC/
+    // MOVE-USP/STOP/etc. apply, task #193) — a memory-source MOVE-to-SR macro's
+    // LEADING load (plain retire0, non-sysOp) and its trailing sysOp apply
+    // (sysRetire) belong to the SAME macro and carry IDENTICAL pc/nextPc (one
+    // fetched/predecoded instruction, cracked -- see MicroOpAssembler: every crack
+    // µop of one macro shares the same `pc`/`nextPc`), and SR cannot change
+    // mid-macro (only the sysOp phase itself writes it, landing the cycle AFTER
+    // ITS OWN retire) -- so latching from EITHER phase (or both, redundantly) reads
+    // the same t1Armed and produces the identical latched {pc,ppc}. This is what
+    // keeps a multi-µop crack (e.g. `move (sp)+,sr`, trace_storm_move_sp_postinc_
+    // sr_tmp1.s) from mis-arming with a WRONG boundary — see `traceNormalGate`
+    // below for the (separate) DISPATCH-side guard that keeps the exception from
+    // firing mid-crack.
+    when(retire0 && h0TraceArmed) {
+      tracePendingReg := True
+      tracePendingPc  := commitPc0        // resume PC = the address AFTER the traced instr
+      tracePendingPpc := pcStore(h0)      // the traced instruction's OWN pc (format-$2 PPC)
+    }
+    when(sysRetire && t1Armed) {
+      tracePendingReg := True
+      tracePendingPc  := p0.predNextPc    // = sysNextPc, the sysOp's own resume point
+      tracePendingPpc := pcStore(h0)
+    }
+    // DISPATCH: only at a genuine NEW-macro boundary (firstStore(h0)), exactly like
+    // normalIrqGate — this is what defers a trace armed mid-crack (e.g. the LOAD half
+    // of a memory-source MOVE-to-SR) until the crack's sysOp phase has ALSO retired
+    // (sysOpStore(h0) is excluded here, so a forced-firstOfInstr sysOp uop — see
+    // MicroOpAssembler's `opUop.firstOfInstr := True` inside `when(isSysOp)` — can
+    // never itself be mistaken for "a new macro boundary" and cause an early fire).
+    val traceNormalGate = (count > 0) && firstStore(h0) && !faultedStore(h0) &&
+                          !isRteStore(h0) && !privViolation && !sysOpStore(h0)
+    tracePendingFire := tracePendingReg && traceNormalGate && !flushing && excIdle
+    when(tracePendingFire) { tracePendingReg := False }
+
     // Squash + serialize while the FSM runs (NOT on the trigger cycle, when the FSM
     // is still IDLE and the fault/RTE head must retire-trigger). On the trigger cycle
     // excActive is False, so faultRetire/rteRetire fire and the exc captures; next
