@@ -1241,10 +1241,15 @@ object MicroOpAssembler {
     val isJsrOp = (op(15 downto 6) === B"10'b0100111010")
     // A JMP/JSR control EA is the in-scope MEMSIMPLE set (the EaDecoder classifies
     // (An)/(d16,An)/(xxx)/(d16,PC) as MEMSIMPLE; predec/postinc are MEMCOMPLEX, reg-direct
-    // DATAREG/ADDRREG, imm IMM). Indexed (d8,An,Xn)/(d8,PC,Xn) is now MEMSIMPLE too, but an
-    // INDEXED JMP/JSR target is DEFERRED here (the branch-EU AGU reads no index register —
-    // it would silently drop the index). Reject an indexed control EA rather than mis-jump.
-    val ctrlEaOk = srcIsMem && !srcEa.indexValid
+    // DATAREG/ADDRREG, imm IMM). Indexed (d8,An,Xn)/(d8,PC,Xn) brief-format is MEMSIMPLE too
+    // (task #187): the branch EU now has its own index-register read port (mirroring the
+    // LS-EU AGU's), so a brief-indexed control EA is no longer rejected — `ibrUop` threads
+    // srcC/indexLong/indexScale from `srcEa` below and the branch EU's target adder folds
+    // in the scaled index. Full-format MEMORY-INDIRECT (EaClass.MEMINDIRECT, a genuinely
+    // different EA class requiring a memory load of the pointer) is NOT in scope here —
+    // `srcIsMem` already excludes it (only MEMSIMPLE), so it stays illegal/unimplemented
+    // until a future µcode-sequencer extension gives JMP/JSR/LEA/PEA memory-indirect support.
+    val ctrlEaOk = srcIsMem
     // RTS (0x4E75) / RTR (0x4E77) are line-4 returns cracked below (NOT illegal).
     val isRtsBad = (op === B"16'h4E75")
     val isRtrBad = (op === B"16'h4E77")
@@ -2371,7 +2376,10 @@ object MicroOpAssembler {
     ibrUop.memOp         := MemOp.NONE
     ibrUop.srcAReg       := srcEa.base; ibrUop.srcAValid := srcEa.baseValid   // EA base An
     ibrUop.srcBReg       := 0;          ibrUop.srcBValid := False
-    ibrUop.srcCReg       := 0;          ibrUop.srcCValid := False
+    // Brief-indexed control EA (task #187): the index register Xn rides srcC, exactly like
+    // the LS-EU AGU / LEA's leaGenUop. Non-indexed JMP/JSR leaves indexValid=False -> the
+    // branch EU's index term is forced to zero (mirrors the LS EU's psrcCValid gating).
+    ibrUop.srcCReg       := srcEa.indexReg; ibrUop.srcCValid := srcEa.indexValid
     ibrUop.dstReg        := 0;          ibrUop.dstValid  := False
     ibrUop.useImm        := True
     ibrUop.imm           := Mux(srcEa.pcRel, ctrlPcRelAddr, srcEa.disp)
@@ -2388,7 +2396,7 @@ object MicroOpAssembler {
     ibrUop.divSigned     := False; ibrUop.div64 := False; ibrUop.divIsRem := False
     ibrUop.isChk2        := False
     ibrUop.shiftOp := 0; ibrUop.shiftDir := False; ibrUop.isMovea := False; ibrUop.isScc := False; ibrUop.isDbcc := False; ibrUop.extByte := False; ibrUop.bitOp := 0; ibrUop.bfOp := 0; ibrUop.bfDynamic := False; ibrUop.bfMem := False; ibrUop.bfStoreForm := 0; ibrUop.bcdSub := False
-    ibrUop.indexLong := False; ibrUop.indexScale := 0
+    ibrUop.indexLong := srcEa.indexLong; ibrUop.indexScale := srcEa.indexScale
     ibrUop.leaAddr := False; ibrUop.movesAliasStore := False; ibrUop.fromCcr := False; ibrUop.fromSr := False; ibrUop.needsSupervisor := False; ibrUop.keepCommit := False
     ibrUop.sysOp := False; ibrUop.sysKind := SysKind.NONE; ibrUop.sysReadDir := False
     ibrUop.predTaken := False; ibrUop.predTarget := U(0, 32 bits)

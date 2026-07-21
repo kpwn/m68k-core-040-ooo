@@ -77,6 +77,12 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
   var anRd: RegFileReadPort = null
   var anW:  RegFileWritePort = null
   var anByp: RegFileBypassPort = null
+  // Int read port for a brief-indexed control EA's index register (psrcC = Xn, task
+  // #187): mirrors LsEuPlugin's `rdIndex` AGU port. JMP/JSR (d8,An,Xn)/(d8,PC,Xn) thread
+  // the index register through `ibrUop.srcC*`; a plain (non-indexed) ibranch leaves
+  // psrcCValid=False so the read is architecturally a don't-care (the S1 term is forced
+  // to zero, exactly like the LS EU's `idxTerm0` gating).
+  var idxRd: RegFileReadPort = null
   override def issue = issuePort
   override def completion = completionPort
   override def trapvFault = trapvFaultPort
@@ -94,14 +100,28 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     anRd  = host[IntRegFileService].newRead(forceNoBypass = false)
     anW   = host[IntRegFileService].newWrite(latency = 1)
     anByp = host[IntRegFileService].newBypass()
+    idxRd = host[IntRegFileService].newRead(forceNoBypass = false)
   }
 
   val logic = during build new Area {
-    // ---- S0: read NZVC source + (ibranch) the int target base ----
+    // ---- S0: read NZVC source + (ibranch) the int target base + index ----
     issuePort.ready := True              // fixed-latency EU never structurally stalls
-    nzRd.addr  := issuePort.payload.uop.pNzvcSrc
-    tgtRd.addr := issuePort.payload.uop.psrcA
-    anRd.addr  := issuePort.payload.uop.psrcB     // pre-pop A7 base (RTS/RTR postinc)
+    val u0 = issuePort.payload.uop
+    nzRd.addr  := u0.pNzvcSrc
+    tgtRd.addr := u0.psrcA
+    anRd.addr  := u0.psrcB     // pre-pop A7 base (RTS/RTR postinc)
+    // Brief-indexed control EA (task #187): the index register Xn rides psrcC, sized+
+    // scaled exactly like LsEuPlugin's `rdIndex`/`idxTerm0` AGU port (.W sign-extends the
+    // low 16 bits, .L uses the full 32; then shift-left by the scale exponent 0..3 =>
+    // *1/2/4/8). Zero when non-indexed (psrcCValid False) so a plain JMP/JSR/Bcc/RTS/RTR
+    // adds nothing extra. Read in S0 (off the regfile, possibly bypassed); the scaled
+    // term is REGISTERED into s1Index at the S0->S1 boundary so the target adder stays a
+    // shallow stage off flops, mirroring `s1TgtBase` (no deep ALU-bypass cone).
+    idxRd.addr := u0.psrcC
+    val idxRaw0   = Mux(u0.indexLong, idxRd.data.asUInt,
+                        idxRd.data(15 downto 0).asSInt.resize(32).asUInt)
+    val idxScaled = ((idxRaw0 << u0.indexScale).resize(32))
+    val idxTerm0  = Mux(u0.psrcCValid, idxScaled, U(0, 32 bits))
 
     // ---- S0 -> S1 register (M2S) ----
     val s1Valid = RegNext(issuePort.valid) init False
@@ -111,7 +131,9 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     // Registered int target base (psrcA). For an absolute / PC-folded ibranch the
     // assembler leaves psrcAValid=False (base contribution must be ZERO; the folded
     // value rides in imm), exactly as the LS EU's base-mux for absolute/PC EAs.
-    val s1TgtBase = RegNext(Mux(issuePort.payload.uop.psrcAValid, tgtRd.data.asUInt, U(0, 32 bits)))
+    val s1TgtBase = RegNext(Mux(u0.psrcAValid, tgtRd.data.asUInt, U(0, 32 bits)))
+    // Registered scaled index term (brief-indexed control EA): 0 for a non-indexed ibranch.
+    val s1Index = RegNext(idxTerm0)
     val u1 = s1Ctx.uop
 
     // ---- S1: condition eval (cond[3:0]) ----
@@ -134,11 +156,16 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
       14 -> (!z && (n === v)),     // GT
       15 -> (z || (n =/= v))       // LE
     )
-    // PC-relative target (Bcc/BRA/BSR). INDIRECT (ibranch) target = base + imm (a
-    // tiny AGU: base = psrcA for (An)/(d16,An)/RTS-RTR-T0, 0 for absolute/PC-folded;
-    // imm = displacement / folded absolute / folded PC / 0).
+    // PC-relative target (Bcc/BRA/BSR). INDIRECT (ibranch) target = base + imm + scaled
+    // index (a tiny AGU: base = psrcA for (An)/(d16,An)/RTS-RTR-T0, 0 for absolute/PC-
+    // folded; imm = displacement / folded absolute / folded PC / 0; index = scaled Xn for
+    // a brief-indexed control EA, 0 otherwise — task #187). All three terms are flops
+    // (s1TgtBase/s1Index) or uop-derived (u1.imm, no ALU-result bypass), so this is a
+    // SINGLE shallow 3-input adder off held flops, not a second serial add stage chained
+    // onto s1TgtBase — mirrors LsEuPlugin's `s1Va = s1Base + s1Disp + s1Index` exactly
+    // (see that file's FMax rationale comment).
     val relTarget = (u1.pc + 2 + u1.branchDisp.asUInt)
-    val indTarget = (s1TgtBase + u1.imm.asUInt)
+    val indTarget = (s1TgtBase + u1.imm.asUInt + s1Index)
     val target    = Mux(u1.ibranch, indTarget, relTarget)
 
     // ── Line-5 Scc / DBcc — the condition-path int writes + DBcc branch ─────────

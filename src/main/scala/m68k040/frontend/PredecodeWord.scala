@@ -632,9 +632,16 @@ object PredecodeWord {
           // Reg-direct (modes 0,1) and (An)+/-(An) (modes 3,4) are NOT control modes;
           // eaExt accepts them (ext 0) but they are illegal for JMP/JSR. Restrict to
           // the in-scope control modes so predecode frames the right length AND a
-          // non-control EA stays complex (-> the assembler's illegal path).
+          // non-control EA stays complex (-> the assembler's illegal path). Mode 6
+          // ((d8,An,Xn) brief/full-format indexed) IS a control mode (task #187: the
+          // branch EU gained an index-register read port, mirroring CMP2/CHK2's own
+          // ctrlMode two cases below, which already included it) -- omitting it here
+          // was a predecode-framing bug independent of MicroOpAssembler's ctrlEaOk gate:
+          // a mode-6 JMP/JSR fell through with lenWords at its prior/default value (0),
+          // so the assembled `nextPc`/pushed return address was WRONG (nextPc==pc) even
+          // though eaExt itself already computes the correct 1-ext-word brief length.
           val ctrlMode = (srcMode === U(2, 3 bits)) || (srcMode === U(5, 3 bits)) ||
-                         (srcMode === U(7, 3 bits))
+                         (srcMode === U(6, 3 bits)) || (srcMode === U(7, 3 bits))
           when(ok && ctrlMode) {
             r.simple   := True
             r.lenWords := (U(1, 3 bits) + e).resized   // opword + EA ext
