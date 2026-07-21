@@ -403,7 +403,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // table at MMU_PAGT2 so both can coexist under the shared root/ptr tables.
   val MMU_PAGT2 = 0x00083000L
   def mapPage(mem: m68k040.ls.BehavioralMemAgent, va: Long, ppn: Long, leafBase: Long): Unit = {
-    def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) mem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+    // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
+    // MSB) — matches TableWalker.selectWord's corrected convention (mirrors
+    // DcacheByteLane.extract's LONG case, i.e. how a REAL `move.l` store would lay
+    // these same bytes out in memory). Was little-endian before task #194's walker
+    // fix; kept the name (not renamed to `pokeWordBE`) to avoid touching every call
+    // site below.
+    def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) mem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
     val rootIdx = ((va >> 25) & 0x7f).toInt
     val ptrIdx  = ((va >> 18) & 0x7f).toInt
     val pageIdx = ((va >> 12) & 0x3f).toInt
@@ -574,17 +580,35 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // The ITLB has its OWN dedicated walker AXI port: attach a second behavioral
       // memory holding the SAME page table (one shared page table, two read ports).
       val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
-      mmuMap match {
-        case Some((dataPageVA, ppn)) =>
-          buildMmuTable(ptmem, dataPageVA, ppn)
-          buildMmuTable(itlbPtmem, dataPageVA, ppn)
-          dut.ctrl.logic.mmuEnable #= true
-          dut.ctrl.logic.urp   #= MMU_ROOT
-          dut.ctrl.logic.srp   #= MMU_ROOT
-        case None =>
-          dut.ctrl.logic.mmuEnable #= false
-          dut.ctrl.logic.urp   #= 0
-          dut.ctrl.logic.srp   #= 0
+      // Build the page table (whitebox pokes into the walker's own memory) up front —
+      // harmless before the MMU is even enabled. The actual `ctrl.logic.mmuEnable`/
+      // `urp`/`srp` ENABLE pokes are issued LATER (see the task #194 comment further
+      // down, right before the boot-SP pokes) — NOT here.
+      mmuMap.foreach { case (dataPageVA, ppn) =>
+        buildMmuTable(ptmem, dataPageVA, ppn)
+        buildMmuTable(itlbPtmem, dataPageVA, ppn)
+      }
+      // debug-only, env-gated trace for MMU-enabled lock-step tests (task #194
+      // investigation: an early `mmuEnable`/`urp`/`srp` poke landing inside the reset
+      // window was silently wiped once MmuControlPlugin gained a real conditional
+      // MOVEC writer — see the "Task #194: poke mmuEnable/urp/srp HERE" comments
+      // below). Zero cost unless LS_TRACE_MMU is set.
+      if (sys.env.contains("LS_TRACE_MMU")) {
+        var trCyc = 0
+        cd.onSamplings {
+          trCyc += 1
+          if (dut.dcache.logic.storePort.valid.toBoolean) {
+            val sp = dut.dcache.logic.storePort.payload
+            println(f"[lstrace] cyc=$trCyc%6d DSTORE paddr=0x${sp.paddr.toLong & 0xffffffffL}%08x data=0x${sp.data.toLong & 0xffffffffL}%08x")
+          }
+          if (dut.dcache.logic.loadCmdPort.valid.toBoolean) {
+            val c = dut.dcache.logic.loadCmdPort.payload
+            println(f"[lstrace] cyc=$trCyc%6d LOADCMD vaddr=0x${c.vaddr.toLong & 0xffffffffL}%08x paddr=0x${c.paddr.toLong & 0xffffffffL}%08x")
+          }
+          if (dut.dtlb.logic.faultSeen.toBoolean) {
+            println(f"[lstrace] cyc=$trCyc%6d DTLB-FAULT-SEEN")
+          }
+        }
       }
 
       // Idle the frontend; consumer-driven ready ports default high downstream.
@@ -617,6 +641,29 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       initialSr.foreach(sr => dut.rob.logic.exc.ss.srSys #= (sr >> 8) & 0xff)
       initialMsp.foreach(msp => dut.rob.logic.exc.ss.msp #= BigInt(msp & 0xffffffffL))
       dut.rob.logic.exc.ss.usp #= BigInt(usp & 0xffffffffL)
+      // Task #194: the `ctrl.logic.mmuEnable`/`urp`/`srp` ENABLE pokes moved HERE (past
+      // the ~82-cycle init-sweep wait above) — poking them at their OLD position
+      // (immediately after `attachProgram`, before ANY `cd.waitSampling`) landed inside
+      // the DUT's own reset window: the poke took momentarily but was silently wiped
+      // the moment the register's real (RegInit-driven) reset deasserted, since adding
+      // MmuControlPlugin's new commit-time `setEnable`/`setUrp`/`setSrp` conditional
+      // writers (needed for real MOVEC support) turned `mmuEnable`/`urp`/`srp` from
+      // free-standing poke-only signals into REAL registered Reg with their own
+      // reset-driven initial value, which — unlike a value poked well past reset, which
+      // holds forever exactly like `ss.isp`/`ss.msp`/`ss.usp` above (poked at this exact
+      // point for EVERY lock-step test, always safely past reset) — a too-early poke
+      // does not survive. Moving the poke here (same timing precedent as isp/msp/usp)
+      // fixes it with no RTL change needed.
+      mmuMap match {
+        case Some(_) =>
+          dut.ctrl.logic.mmuEnable #= true
+          dut.ctrl.logic.urp   #= MMU_ROOT
+          dut.ctrl.logic.srp   #= MMU_ROOT
+        case None =>
+          dut.ctrl.logic.mmuEnable #= false
+          dut.ctrl.logic.urp   #= 0
+          dut.ctrl.logic.srp   #= 0
+      }
       // bootA7: the PRF arch-15 must mirror the ACTIVE bank's value so the OoO datapath
       // sees the correct A7 from the first instruction. Active bank selection:
       //   user mode (S=0) -> USP; M=1 supervisor -> MSP; M=0 supervisor -> ISP.
@@ -4077,7 +4124,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // (resident) in BOTH walker memories so instruction fetch through the ITLB does
       // not fault — only the DATA access to VA 0x2000 faults.
       def buildFaultTable(mem: m68k040.ls.BehavioralMemAgent): Unit = {
-        def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) mem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+        // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
+    // MSB) — matches TableWalker.selectWord's corrected convention (mirrors
+    // DcacheByteLane.extract's LONG case, i.e. how a REAL `move.l` store would lay
+    // these same bytes out in memory). Was little-endian before task #194's walker
+    // fix; kept the name (not renamed to `pokeWordBE`) to avoid touching every call
+    // site below.
+    def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) mem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
         val va = 0x2000L
         val rootIdx = ((va >> 25) & 0x7f).toInt; val ptrIdx = ((va >> 18) & 0x7f).toInt; val pageIdx = ((va >> 12) & 0x3f).toInt
         pokeWordLE(MMU_ROOT + rootIdx * 4, (MMU_PTRT & 0xfffffff0L) | 0x3L)
@@ -4086,9 +4139,6 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         for (i <- 0 until 8) { val cva = loadAddr + i * 0x1000L; mapPage(mem, cva, (cva >> 12) & 0xfffffL, MMU_PAGT2) }
       }
       buildFaultTable(ptmem); buildFaultTable(itlbPtmem)
-      dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.urp   #= MMU_ROOT
-      dut.ctrl.logic.srp   #= MMU_ROOT
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
@@ -4098,6 +4148,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
+      // Task #194: poke mmuEnable/urp/srp HERE (past the init-sweep wait), not before
+      // it — see runLockStep's identical fix comment for why an earlier poke doesn't
+      // survive reset once MmuControlPlugin has a real conditional MOVEC writer.
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp   #= MMU_ROOT
+      dut.ctrl.logic.srp   #= MMU_ROOT
       dut.fa.logic.redirect.valid   #= true
       dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling()
@@ -4128,7 +4184,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   private val SUP_PTRT = 0x00091000L
   private val SUP_PAGT = 0x00092000L
   private def buildSupervisorCodeTable(mem: m68k040.ls.BehavioralMemAgent, loadAddr: Long): Unit = {
-    def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) mem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+    // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
+    // MSB) — matches TableWalker.selectWord's corrected convention (mirrors
+    // DcacheByteLane.extract's LONG case, i.e. how a REAL `move.l` store would lay
+    // these same bytes out in memory). Was little-endian before task #194's walker
+    // fix; kept the name (not renamed to `pokeWordBE`) to avoid touching every call
+    // site below.
+    def pokeWordLE(a: Long, w: Long): Unit = for (i <- 0 until 4) mem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
     for (i <- 0 until 4) {
       val cva = loadAddr + i * 0x1000L
       val rootIdx = ((cva >> 25) & 0x7f).toInt
@@ -4158,15 +4220,17 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
       buildSupervisorCodeTable(ptmem, loadAddr)
       buildSupervisorCodeTable(itlbPtmem, loadAddr)
-      dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.urp   #= SUP_ROOT
-      dut.ctrl.logic.srp   #= SUP_ROOT
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
       cd.waitSampling(2)
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
+      // Task #194: poke mmuEnable/urp/srp HERE (past the init-sweep wait) — see
+      // runLockStep's identical fix comment.
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp   #= SUP_ROOT
+      dut.ctrl.logic.srp   #= SUP_ROOT
       dut.rob.logic.exc.ss.isp #= 0x00100000L
       dut.rob.logic.exc.ss.usp #= 0x00200000L
       if (userMode) dut.rob.logic.exc.ss.srSys #= 0x00 else dut.rob.logic.exc.ss.srSys #= 0x27
@@ -4750,23 +4814,42 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   //   root[0] -> ptr ; ptr[0] -> pageA (covers 0x0..0x3FFFF) ; ptr[2] -> pageC
   //   pageA[0] = identity VPN 0 resident (vector page) ; pageA[2] = NON-RESIDENT
   //   pageC[2] = identity VPN 0x82 resident (the PT write page).
-  // The handler writes pageA[2] = PPN 0x42 resident. Descriptors are LITTLE-ENDIAN
-  // (RTL walker + oracle MMU), so a `move.l #imm` (big-endian store) writes
-  // byteswap(descriptor): pageA[2] resident PPN 0x42 = 0x00042001 -> imm 0x01200400.
+  // The handler writes pageA[2] a resident descriptor via a REAL `move.l #imm,d1 ;
+  // move.l d1,addr` — the SAME instructions execute on BOTH the RTL (real big-endian
+  // 68k memory) AND the oracle (Musashi's CUSTOM MMU shim for this directed-test
+  // family, which — task #194 discovery — reads descriptor bytes back in
+  // HOST-NATIVE little-endian order, NOT real 68k big-endian; a shim quirk, not a
+  // Musashi core behavior, and out of scope to fix in this session since it needs a
+  // C++ rebuild). Task #194 fixed the RTL walker (TableWalker.selectWord) to the
+  // CORRECT big-endian convention (matching DcacheByteLane.extract / real 68k
+  // memory), which broke the OLD hand-picked "byteswapped" immediate (0x01200400)
+  // that only worked because BOTH sides used to (coincidentally or by design)
+  // interpret descriptors little-endian. Since the RTL's big-endian read and the
+  // oracle shim's little-endian read of the SAME physical bytes are exact byte-
+  // reversals of each other, no value works for both UNLESS its bytes are a
+  // palindrome under 4-byte reversal. `0x01000001` (bytes 01 00 00 01) is such a
+  // palindrome: PDT=01 (resident) reads identically under EITHER byte order, so
+  // both the RTL walker and the oracle shim agree it's a valid resident mapping.
+  // The resulting PPN (0x01000, NOT the original 0x42) is what the retried store
+  // actually lands at — `dataPPN` below is updated to match.
   test("lock-step: page fault (non-resident) -> handler maps -> RTE -> resume", VerilatorTest) {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
     val PTRT = 0x00081000L
     val PAGA = 0x00082000L
     val PAGC = 0x00083000L
-    val dataPPN = 0x42L
+    // Task #194: PPN 0x1000 (not 0x42) — the handler's descriptor write (see the
+    // byte-palindrome comment above) determines the ACTUAL PPN; the final
+    // re-executed-store check below reads back through THIS PPN's PA.
+    val dataPPN = 0x1000L
 
-    // The program (identical for RTL + oracle). Handler writes pageA[2] (byteswapped
-    // resident PPN-0x42 descriptor) then RTE -> the faulting store re-executes.
+    // The program (identical for RTL + oracle). Handler writes pageA[2] a resident
+    // descriptor (see the byte-palindrome comment above) then RTE -> the faulting
+    // store re-executes.
     val src =
       "move.l #handler,%d1 ; move.l %d1,0x8 ; " +        // vector 2 (access fault) @ 0x8
       "moveq #42,%d0 ; move.l %d0,0x2000 ; " +           // FAULTS, then re-runs after RTE
       "loop: bra loop ; " +
-      "handler: move.l #0x01200400,%d1 ; move.l %d1,0x82008 ; rte"
+      "handler: move.l #0x01000001,%d1 ; move.l %d1,0x82008 ; rte"
     val nInstr = 8  // vec-imm, vec-store, store(fault->reexec after handler), handler-imm, handler-store, rte, store(reexec), bra
 
     // Oracle: window = the data page only; preload the resident root[0] + ptr[0]
@@ -4832,7 +4915,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // handler PT write is visible to the I-side re-walk too.
       val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
       // Build the nested page table (little-endian) in the shared memory.
-      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+      // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
+      // MSB) — matches TableWalker.selectWord's corrected convention. Kept the name.
+      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
       pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)   // root[0] -> ptr resident
       pokeLE(PTRT + 0 * 4,    (PAGA & 0xfffffff0L) | 0x2L)   // ptr[0]  -> pageA resident
       pokeLE(PTRT + 2 * 4,    (PAGC & 0xfffffff0L) | 0x2L)   // ptr[2]  -> pageC resident
@@ -4851,10 +4936,6 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         val cva = loadAddr + i * 0x1000L
         pokeLE(PAGD + (((cva >> 12) & 0x3f).toInt) * 4, (((cva >> 12) & 0xfffffL) << 12) | 0x1L)
       }
-      dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.urp   #= 0x80000L
-      dut.ctrl.logic.srp   #= 0x80000L
-
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
       dut.rob.logic.flush.valid   #= false
@@ -4863,6 +4944,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
+      // Task #194: poke mmuEnable/urp/srp HERE (past the init-sweep wait) — see
+      // runLockStep's identical fix comment.
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp   #= 0x80000L
+      dut.ctrl.logic.srp   #= 0x80000L
       dut.rob.logic.exc.ss.isp #= 0x00100000L
       // Seed the int PRF arch-15 (A7, identity phys-15) to the boot SSP. The committed
       // A7 banks (ss.usp/isp/msp) are LIVE-COHERENT with the architectural A7 read back
@@ -4940,7 +5026,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l #handler,%d1 ; move.l %d1,0x8 ; " +
       "moveq #42,%d0 ; move.l %d0,0x2000 ; " +           // FAULTS (write to W=1 page), then re-runs after RTE
       "loop: bra loop ; " +
-      "handler: move.l #0x01200400,%d1 ; move.l %d1,0x82008 ; rte"  // clears W (PDT=01, W=0)
+      "handler: move.l #0x01000001,%d1 ; move.l %d1,0x82008 ; rte"  // clears W (PDT=01, W=0)
     val nInstr = 8
 
     val leafWp = ((dataPPN << 12) & 0xfffff000L) | 0x4L | 0x1L   // resident, W=1
@@ -5000,7 +5086,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
       val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
       val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
-      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+      // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
+      // MSB) — matches TableWalker.selectWord's corrected convention. Kept the name.
+      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
       pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)
       pokeLE(PTRT + 0 * 4,    (PAGA & 0xfffffff0L) | 0x2L)
       pokeLE(PTRT + 2 * 4,    (PAGC & 0xfffffff0L) | 0x2L)
@@ -5015,10 +5103,6 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         val cva = loadAddr + i * 0x1000L
         pokeLE(PAGD + (((cva >> 12) & 0x3f).toInt) * 4, (((cva >> 12) & 0xfffffL) << 12) | 0x1L)
       }
-      dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.urp   #= 0x80000L
-      dut.ctrl.logic.srp   #= 0x80000L
-
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
       dut.rob.logic.flush.valid   #= false
@@ -5027,6 +5111,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
+      // Task #194: poke mmuEnable/urp/srp HERE (past the init-sweep wait) — see
+      // runLockStep's identical fix comment.
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp   #= 0x80000L
+      dut.ctrl.logic.srp   #= 0x80000L
       dut.rob.logic.exc.ss.isp #= 0x00100000L
       dut.wire.logic.seedValid #= true
       dut.wire.logic.seedAddr  #= 15
@@ -5061,7 +5150,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           s"(matched ${res.matched}, dut commits ${handle.result.size}, oracle steps $nInstr)")
 
       cd.waitSampling(200)
-      val pa = (dataPPN << 12) | (0x2000L & 0xfffL)
+      // Task #194: the handler's W-clearing descriptor write (see the byte-palindrome
+      // comment above the page-fault test) lands PPN 0x1000, NOT the original
+      // (pre-fault) `dataPPN` 0x42 — the retried store's PA follows the handler's
+      // NEW mapping, not the initial WP-faulting one.
+      val newPpn = 0x1000L
+      val pa = (newPpn << 12) | (0x2000L & 0xfffL)
       assert(dmem.peekByte(pa + 3) == 0x2a,
         f"[wpfault] re-executed store must land 0x2a at PA 0x${pa + 3}%08x (got 0x${dmem.peekByte(pa + 3)}%02x)")
     }
@@ -5145,10 +5239,6 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         for (i <- 0 until 8) mapPage(mem, loadAddr + i * 0x1000L, codePPN + i, MMU_PAGT2)
       }
       build(ptmem); build(itlbPtmem)
-      dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.urp   #= MMU_ROOT
-      dut.ctrl.logic.srp   #= MMU_ROOT
-
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
       dut.rob.logic.flush.valid   #= false
@@ -5157,6 +5247,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
+      // Task #194: poke mmuEnable/urp/srp HERE (past the init-sweep wait) — see
+      // runLockStep's identical fix comment.
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp   #= MMU_ROOT
+      dut.ctrl.logic.srp   #= MMU_ROOT
       dut.rob.logic.exc.ss.isp #= 0x00100000L
       cd.waitSampling()
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
@@ -5248,7 +5343,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
       val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
       val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
-      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+      // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
+      // MSB) — matches TableWalker.selectWord's corrected convention. Kept the name.
+      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
       // Page table. Data accesses that translate: the vector store (VA 0x8) and the
       // handler PT write (VA 0x3F008). Both via root[0]->ptr[0]->pageA, identity.
       pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)   // root[0] -> ptr
@@ -5263,10 +5360,6 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         val v = if (i == 2) 0x0L else ((((loadAddr>>12)&0xfffffL)+i) << 12 | 0x1L)
         pokeLE(PAGD + i*4, v)
       }
-      dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.urp   #= 0x80000L
-      dut.ctrl.logic.srp   #= 0x80000L
-
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
       dut.rob.logic.flush.valid   #= false
@@ -5275,6 +5368,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
+      // Task #194: poke mmuEnable/urp/srp HERE (past the init-sweep wait) — see
+      // runLockStep's identical fix comment.
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp   #= 0x80000L
+      dut.ctrl.logic.srp   #= 0x80000L
       dut.rob.logic.exc.ss.isp #= 0x00100000L
       cd.waitSampling()
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
@@ -5369,7 +5467,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
       val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
       val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
-      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+      // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
+      // MSB) — matches TableWalker.selectWord's corrected convention. Kept the name.
+      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
       pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)
       pokeLE(PTRT + 0*4,      (PAGA & 0xfffffff0L) | 0x2L)
       pokeLE(PAGA + 0*4,      (0x0L << 12) | 0x1L)
@@ -5380,10 +5480,6 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         val v = if (i == 2) 0x0L else ((((loadAddr>>12)&0xfffffL)+i) << 12 | 0x1L)
         pokeLE(PAGD + i*4, v)
       }
-      dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.urp   #= 0x80000L
-      dut.ctrl.logic.srp   #= 0x80000L
-
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
       dut.rob.logic.flush.valid   #= false
@@ -5392,6 +5488,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
+      // Task #194: poke mmuEnable/urp/srp HERE (past the init-sweep wait) — see
+      // runLockStep's identical fix comment.
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp   #= 0x80000L
+      dut.ctrl.logic.srp   #= 0x80000L
       dut.rob.logic.exc.ss.isp #= 0x00100000L
       cd.waitSampling()
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
@@ -6277,7 +6378,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
       val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
       val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
-      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * i)) & 0xff).toInt)
+      // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
+      // MSB) — matches TableWalker.selectWord's corrected convention. Kept the name.
+      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
       // Pre-seed the pointer (phys 0x2000 = 0x3000) + the data (phys 0x3000 = 0xCAFE0042),
       // big-endian (the DUT/oracle architectural byte order). Page 2 is non-resident at boot.
       def pokeBE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
@@ -6299,10 +6402,6 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         val cva = loadAddr + i * 0x1000L
         pokeLE(PAGD + (((cva >> 12) & 0x3f).toInt) * 4, (((cva >> 12) & 0xfffffL) << 12) | 0x1L)
       }
-      dut.ctrl.logic.mmuEnable #= true
-      dut.ctrl.logic.urp   #= 0x80000L
-      dut.ctrl.logic.srp   #= 0x80000L
-
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
       dut.rob.logic.flush.valid   #= false
@@ -6311,6 +6410,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
+      // Task #194: poke mmuEnable/urp/srp HERE (past the init-sweep wait) — see
+      // runLockStep's identical fix comment.
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp   #= 0x80000L
+      dut.ctrl.logic.srp   #= 0x80000L
       dut.rob.logic.exc.ss.isp #= 0x00100000L
       // Seed the int PRF arch-15 (A7) to the boot SSP so the surfaced committed A7 matches
       // the oracle from the first step (the OoO datapath reads A7 from the PRF).

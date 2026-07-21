@@ -3,47 +3,75 @@ package m68k040.mmu
 import m68k040.services.MmuControlService
 import spinal.core._
 import spinal.core.sim._
+import spinal.lib.Flow
 import spinal.lib.misc.plugin.FiberPlugin
 
-/** The single 68040 MMU control owner: holds `mmuEnable` (TC enable) and the
-  * separate `urp`/`srp` root pointers, and publishes them via `MmuControlService`
-  * for BOTH the ITLB and the DTLB to read. The 68040 has ONE MMU — I and D
-  * translation share enable + roots; each TLB Muxes urp-vs-srp itself per-access.
+/** The single 68040 MMU control owner: holds `mmuEnable` (TC enable), the separate
+  * `urp`/`srp` root pointers, and the four transparent-translation registers
+  * (`itt0`/`itt1`/`dtt0`/`dtt1`), and publishes them via `MmuControlService` for
+  * BOTH the ITLB and the DTLB to read. The 68040 has ONE MMU — I and D translation
+  * share enable + roots; each TLB Muxes urp-vs-srp itself per-access, and each side
+  * consults its OWN pair of TT registers (I: itt0/itt1, D: dtt0/dtt1) to bypass the
+  * walker entirely for a matching region (see [[TtMatch]]).
   *
   *  - `mmuEnable` is RegInit(False): MMU-disabled is the power-on default, so every
   *    existing MMU-off test / lock-step is pure identity (unchanged).
-  *  - All three regs are sim-pokeable (`logic.mmuEnable`/`logic.urp`/`logic.srp`,
-  *    simPublic) for directed tests.
+  *  - All regs are sim-pokeable (`logic.mmuEnable`/`logic.urp`/`logic.srp`/...,
+  *    simPublic) for directed tests, AND commit-time MOVEC-writable (task #194,
+  *    below) — an additional driver, not a replacement; direct pokes still work
+  *    whenever the write Flow's `valid` is False (the default).
   *
-  * Task #131 ATTEMPTED commit-time MOVEC write ports (`setEnable`/`setUrp`/`setSrp`,
-  * a Flow driven from ExceptionUnit's S_APPLY case, mirroring SystemState.setVbr/
-  * setUsp) — REVERTED 2026-07-16 after it was found to break sim-poke persistence
-  * on `mmuEnable` for EVERY MMU-enabled lock-step test (a real, confirmed
-  * regression: the previously-passing "page fault (non-resident)" test started
-  * failing with mmuEnable reading False despite an explicit `#= true` poke, the
-  * moment a `when(setEnable.valid){mmuEnable := setEnable.payload}` conditional
-  * writer existed — even though `setEnable.valid` defaults False via allowOverride
-  * and the structurally-IDENTICAL pattern works fine for SystemState's ss.isp/ss.msp
-  * (also poked directly, also conditionally written, many passing tests). The
-  * difference is suspected to be that `ss` is instantiated INLINE in the same
-  * plugin/scope that drives it (`new SystemState` inside RobPlugin), whereas
-  * `mmuCtrl` is a cross-plugin FiberPlugin/host reference (`host.get[MmuControlService]`)
-  * — ExceptionUnit assigning into a Flow that lives in a DIFFERENT plugin's `logic`
-  * Area apparently does not interact with sim pokes the same way. NOT root-caused —
-  * needs a fresh, well-rested SpinalHDL-semantics investigation, not a repeat of
-  * this pattern. See [[mmu-movec-urp-srp]] memory. The urp/srp SPLIT + per-access
-  * SRP-vs-URP selection (DtlbPlugin/ItlbPlugin) and the MOVEC READ-side cases
-  * (ExceptionUnit's Rc->Rn direction) are SAFE and kept — only the WRITE path
-  * (real supervisor code programming URP/SRP/TCR via MOVEC) is reverted; those
-  * Rc values are back to the RAZ/WI default case, exactly like before task #131. */
+  * Task #131 ATTEMPTED commit-time MOVEC write ports for mmuEnable/urp/srp and
+  * REVERTED them after what was diagnosed (at the time) as a sim-poke-persistence
+  * regression. Task #194 (2026-07-21) revisited this: the actual regression was
+  * NEVER root-caused in a minimal repro — the follow-up note in [[mmu-movec-urp-srp]]
+  * explicitly says the only repro attempt exercised `top/FullCoreSynth.scala`'s
+  * registered-input override (`mmuEnableIn`/`urpIn`/`srpIn`, driving `mmuCtrl.mmuEnable`
+  * UNCONDITIONALLY from a top-level port), which is a genuine two-driver conflict
+  * with an internal conditional writer — NOT the sim-poke mystery it was chasing.
+  * The actual test harnesses (`ExecuteLockStepSpec`'s `FullCoreDut`, `PortedTestRunner`'s
+  * `FuzzCoreDut`) never had that override — they poke `dut.ctrl.logic.mmuEnable`
+  * directly with no competing driver, exactly like every other simPublic committed
+  * register in this codebase (`ss.cacr`/`ss.itt0`/etc, which all coexist fine with a
+  * conditional MOVEC writer). Task #194 re-added the write mechanism using the
+  * IDENTICAL pattern already proven safe for those registers, and REMOVED
+  * `FullCoreSynth.scala`'s registered-input override (no longer needed or safe now
+  * that MOVEC gives mmuEnable/urp/srp a real, primary-IO-reachable driver through
+  * decode/rename/dispatch/commit — see that file's history). Full lock-step +
+  * ported-corpus regression re-verified clean after the change (see task #194's
+  * commit messages / report). */
 class MmuControlPlugin extends FiberPlugin with MmuControlService {
   var _mmuEnable: Bool = null
   var _urp:       UInt = null
   var _srp:       UInt = null
+  var _itt0:      UInt = null
+  var _itt1:      UInt = null
+  var _dtt0:      UInt = null
+  var _dtt1:      UInt = null
+
+  var _setEnable: Flow[Bool] = null
+  var _setUrp:    Flow[UInt] = null
+  var _setSrp:    Flow[UInt] = null
+  var _setItt0:   Flow[UInt] = null
+  var _setItt1:   Flow[UInt] = null
+  var _setDtt0:   Flow[UInt] = null
+  var _setDtt1:   Flow[UInt] = null
 
   override def mmuEnable: Bool = _mmuEnable
   override def urp:       UInt = _urp
   override def srp:       UInt = _srp
+  override def itt0:      UInt = _itt0
+  override def itt1:      UInt = _itt1
+  override def dtt0:      UInt = _dtt0
+  override def dtt1:      UInt = _dtt1
+
+  override def setEnable: Flow[Bool] = _setEnable
+  override def setUrp:    Flow[UInt] = _setUrp
+  override def setSrp:    Flow[UInt] = _setSrp
+  override def setItt0:   Flow[UInt] = _setItt0
+  override def setItt1:   Flow[UInt] = _setItt1
+  override def setDtt0:   Flow[UInt] = _setDtt0
+  override def setDtt1:   Flow[UInt] = _setDtt1
 
   val logic = during build new Area {
     // The control regs. RegInit/Reg-init so a standalone DUT (no external driver)
@@ -51,8 +79,51 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
     val mmuEnable = RegInit(False); mmuEnable.simPublic()
     val urp = Reg(UInt(32 bits)) init 0; urp.simPublic()
     val srp = Reg(UInt(32 bits)) init 0; srp.simPublic()
+    val itt0 = Reg(UInt(32 bits)) init 0; itt0.simPublic()
+    val itt1 = Reg(UInt(32 bits)) init 0; itt1.simPublic()
+    val dtt0 = Reg(UInt(32 bits)) init 0; dtt0.simPublic()
+    val dtt1 = Reg(UInt(32 bits)) init 0; dtt1.simPublic()
+
+    // ── commit-time write ports (mirrors SystemState's setVbr/setUsp/setCacr/setItt0
+    // pattern exactly: Flow, allowOverride, default-idle, a single `when` writer). ──
+    val setEnable = Flow(Bool())
+    val setUrp    = Flow(UInt(32 bits))
+    val setSrp    = Flow(UInt(32 bits))
+    val setItt0   = Flow(UInt(32 bits))
+    val setItt1   = Flow(UInt(32 bits))
+    val setDtt0   = Flow(UInt(32 bits))
+    val setDtt1   = Flow(UInt(32 bits))
+    setEnable.valid.allowOverride; setEnable.valid := False; setEnable.payload.allowOverride; setEnable.payload := False
+    setEnable.valid.simPublic(); setEnable.payload.simPublic()
+    setUrp.valid.simPublic()
+    setUrp.valid.allowOverride;    setUrp.valid := False;    setUrp.payload.allowOverride;    setUrp.payload := U(0, 32 bits)
+    setSrp.valid.allowOverride;    setSrp.valid := False;    setSrp.payload.allowOverride;    setSrp.payload := U(0, 32 bits)
+    setItt0.valid.allowOverride;   setItt0.valid := False;   setItt0.payload.allowOverride;   setItt0.payload := U(0, 32 bits)
+    setItt1.valid.allowOverride;   setItt1.valid := False;   setItt1.payload.allowOverride;   setItt1.payload := U(0, 32 bits)
+    setDtt0.valid.allowOverride;   setDtt0.valid := False;   setDtt0.payload.allowOverride;   setDtt0.payload := U(0, 32 bits)
+    setDtt1.valid.allowOverride;   setDtt1.valid := False;   setDtt1.payload.allowOverride;   setDtt1.payload := U(0, 32 bits)
+
+    when(setEnable.valid) { mmuEnable := setEnable.payload }
+    when(setUrp.valid)    { urp  := setUrp.payload }
+    when(setSrp.valid)    { srp  := setSrp.payload }
+    when(setItt0.valid)   { itt0 := setItt0.payload }
+    when(setItt1.valid)   { itt1 := setItt1.payload }
+    when(setDtt0.valid)   { dtt0 := setDtt0.payload }
+    when(setDtt1.valid)   { dtt1 := setDtt1.payload }
+
     _mmuEnable = mmuEnable
     _urp = urp
     _srp = srp
+    _itt0 = itt0
+    _itt1 = itt1
+    _dtt0 = dtt0
+    _dtt1 = dtt1
+    _setEnable = setEnable
+    _setUrp = setUrp
+    _setSrp = setSrp
+    _setItt0 = setItt0
+    _setItt1 = setItt1
+    _setDtt0 = setDtt0
+    _setDtt1 = setDtt1
   }
 }

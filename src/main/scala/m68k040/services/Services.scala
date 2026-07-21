@@ -90,17 +90,36 @@ trait PrivilegeService {
   def supervisor: Bool
 }
 
-/** The ONE 68040 MMU control (TC enable + separate URP/SRP root pointers), shared
-  * by BOTH the I-side ITLB and the D-side DTLB. One owner (MmuControlPlugin) drives
-  * the regs; both TLBs read `mmuEnable`/`urp`/`srp` and select URP vs SRP themselves
-  * per-access (the walker request already carries `isSuper`, mirroring real 68040
-  * hardware: a supervisor-space access walks SRP, a user-space access walks URP).
-  * `mmuEnable` LOW => identity. Sim-pokeable only (task #131's attempted commit-time
-  * MOVEC write path was REVERTED — see MmuControlPlugin's doc comment for why). */
+/** The ONE 68040 MMU control (TC enable + separate URP/SRP root pointers + the four
+  * transparent-translation registers ITT0/ITT1/DTT0/DTT1), shared by BOTH the I-side
+  * ITLB and the D-side DTLB. One owner (MmuControlPlugin) drives the regs; both TLBs
+  * read `mmuEnable`/`urp`/`srp` and select URP vs SRP themselves per-access (the
+  * walker request already carries `isSuper`, mirroring real 68040 hardware: a
+  * supervisor-space access walks SRP, a user-space access walks URP). `mmuEnable`
+  * LOW => identity. Sim-pokeable AND (task #194, reviving task #131's reverted
+  * attempt) commit-time MOVEC-writable via the `setX` Flow ports — see
+  * MmuControlPlugin's doc comment for why the original write mechanism was reverted
+  * and what changed to make it safe to re-add. */
 trait MmuControlService {
   def mmuEnable: Bool
   def urp: UInt   // 32 bits — user root pointer
   def srp: UInt   // 32 bits — supervisor root pointer
+  // Transparent-translation registers (task #194): base[31:24]/mask[23:16]/E[15]/
+  // S[14:13]/CM[6:5], mirroring the page-descriptor CM field layout (MmuDesc). A
+  // matching TTR bypasses the walker entirely (PA=VA) for the covered region.
+  def itt0: UInt
+  def itt1: UInt
+  def dtt0: UInt
+  def dtt1: UInt
+
+  // ── commit-time write ports (driven from ExceptionUnit's MOVEC S_APPLY case) ──
+  def setEnable: Flow[Bool]
+  def setUrp: Flow[UInt]
+  def setSrp: Flow[UInt]
+  def setItt0: Flow[UInt]
+  def setItt1: Flow[UInt]
+  def setDtt0: Flow[UInt]
+  def setDtt1: Flow[UInt]
 }
 
 /** The external interrupt inputs (simple protocol): a 3-bit IPL plus the SoC's

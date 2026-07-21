@@ -1057,15 +1057,16 @@ class ExceptionUnit(
             sysRegWritePhys  := sysCapDstPhys
             // Rc id: VBR=0x801, USP=0x800, SFC=0x000, DFC=0x001 (3-bit, zero-extended),
             // CACR=0x002 (RAZ), TCR=0x003 (E bit only — bit 15; P/page-size + other
-            // bits RAZ, this core is 4K-pages-only, task #131), URP=0x806, SRP=0x807,
+            // bits RAZ, this core is 4K-pages-only), URP=0x806, SRP=0x807,
             // MSP=0x803, ISP=0x804 (task #170-cluster10: MSP/ISP banking itself already
             // works via the S/M-bit A7 Mux -- ss.msp/ss.isp ARE the real committed
             // registers backing it -- but they were not yet separately MOVEC-addressable;
             // exposing them here is a direct passthrough to those same registers, no new
             // storage). SFC/DFC are real 3-bit committed regs (Musashi reads them
-            // zero-extended; round-trips with the write below). ITT0/ITT1/DTT0/DTT1 are
-            // NOT modeled (RAZ via default) — deferred, no transparent-translation
-            // windows yet.
+            // zero-extended; round-trips with the write below). ITT0/ITT1/DTT0/DTT1
+            // (task #194) are now real, functional transparent-translation registers
+            // owned by MmuControlPlugin — see its doc comment for the TT-window match
+            // logic (TtMatch) consumed by ItlbPlugin/DtlbPlugin.
             sysRegWriteData  := sysCapRc.mux(
               U(0x801, 12 bits) -> ss.vbr,
               U(0x800, 12 bits) -> ss.usp,
@@ -1075,7 +1076,10 @@ class ExceptionUnit(
               U(0x001, 12 bits) -> ss.dfc.resize(32),
               U(0x003, 12 bits) -> Mux(mmuCtrl.mmuEnable, U(0x8000, 32 bits), U(0, 32 bits)),
               U(0x002, 12 bits) -> ss.cacr,
-              U(0x004, 12 bits) -> ss.itt0,
+              U(0x004, 12 bits) -> mmuCtrl.itt0,
+              U(0x005, 12 bits) -> mmuCtrl.itt1,
+              U(0x006, 12 bits) -> mmuCtrl.dtt0,
+              U(0x007, 12 bits) -> mmuCtrl.dtt1,
               U(0x806, 12 bits) -> mmuCtrl.urp,
               U(0x807, 12 bits) -> mmuCtrl.srp,
               default           -> U(0, 32 bits))   // other unmodeled Rc -> RAZ (read 0)
@@ -1089,30 +1093,33 @@ class ExceptionUnit(
               // CACR (0x002): real committed storage (task #170-cluster10), round-
               // trippable via MOVEC but with NO functional effect on the D-cache (it
               // always caches regardless — matches this core's pre-existing behavior,
-              // only the storage/round-trip half was missing). Unlike TCR/URP/SRP
-              // (0x003/0x806/0x807, still WI below) CACR has no page-walker consumer,
-              // so it doesn't share the sim-poke-persistence regression risk that got
-              // task #131's TCR/URP/SRP write mechanism reverted.
+              // only the storage/round-trip half was missing).
               is(U(0x002, 12 bits)) { ss.setCacr.valid := True; ss.setCacr.payload := sysCapVal.asUInt }
-              // ITT0 (0x004), task #180: real committed storage (mirrors CACR exactly),
-              // round-trippable via MOVEC with NO functional transparent-translation
-              // effect — this core's ITLB has no TT-window matching logic (deferred,
-              // much larger gap; see the Cluster-7 MMU findings). ITT1/DTT0/DTT1 stay
-              // unimplemented (RAZ/WI via default below) — no test in this corpus
-              // exercises them individually.
-              is(U(0x004, 12 bits)) { ss.setItt0.valid := True; ss.setItt0.payload := sysCapVal.asUInt }
+              // TCR (0x003), task #194 (revives task #131's reverted attempt — see
+              // MmuControlPlugin's doc comment for why this is now believed safe):
+              // only the E (enable) bit, TCR bit 15, is modeled (this core is
+              // 4K-pages-only — P/page-size + other bits are don't-cares, WI).
+              is(U(0x003, 12 bits)) { mmuCtrl.setEnable.valid := True; mmuCtrl.setEnable.payload := sysCapVal(15) }
+              // ITT0/ITT1 (0x004/0x005) and DTT0/DTT1 (0x006/0x007), task #194: real,
+              // FUNCTIONAL transparent-translation registers (TtMatch, consumed by
+              // ItlbPlugin/DtlbPlugin to bypass the walker for a covered region) —
+              // previously ITT0 was inert storage (task #180) and ITT1/DTT0/DTT1 were
+              // entirely unmodeled.
+              is(U(0x004, 12 bits)) { mmuCtrl.setItt0.valid := True; mmuCtrl.setItt0.payload := sysCapVal.asUInt }
+              is(U(0x005, 12 bits)) { mmuCtrl.setItt1.valid := True; mmuCtrl.setItt1.payload := sysCapVal.asUInt }
+              is(U(0x006, 12 bits)) { mmuCtrl.setDtt0.valid := True; mmuCtrl.setDtt0.payload := sysCapVal.asUInt }
+              is(U(0x007, 12 bits)) { mmuCtrl.setDtt1.valid := True; mmuCtrl.setDtt1.payload := sysCapVal.asUInt }
               // MSP (0x803) / ISP (0x804), task #170-cluster10: direct writes to the
               // SAME committed registers the S/M-bit A7 Mux already reads (ss.msp/
               // ss.isp) — no new storage, this is purely exposing the existing bank
-              // registers as MOVEC-addressable. Low regression risk (unlike TCR/URP/
-              // SRP below): nothing outside SystemState's own A7 Mux consumes these.
+              // registers as MOVEC-addressable.
               is(U(0x803, 12 bits)) { ss.setMsp.valid := True; ss.setMsp.payload := sysCapVal.asUInt }
               is(U(0x804, 12 bits)) { ss.setIsp.valid := True; ss.setIsp.payload := sysCapVal.asUInt }
-              // TCR (0x003) / URP (0x806) / SRP (0x807) / other: WI (write-ignored,
-              // RAZ-WI). Real-write support was ATTEMPTED (task #131) and REVERTED
-              // after a confirmed sim-poke-persistence regression — see
-              // MmuControlPlugin's doc comment. The READ side above still surfaces
-              // whatever urp/srp/mmuEnable currently hold (sim-poke or default).
+              // URP (0x806) / SRP (0x807), task #194 (revives task #131's reverted
+              // attempt): real MOVEC-driven root-pointer write.
+              is(U(0x806, 12 bits)) { mmuCtrl.setUrp.valid := True; mmuCtrl.setUrp.payload := sysCapVal.asUInt }
+              is(U(0x807, 12 bits)) { mmuCtrl.setSrp.valid := True; mmuCtrl.setSrp.payload := sysCapVal.asUInt }
+              // other Rc: WI (write-ignored, RAZ-WI default).
             }
           }
         }

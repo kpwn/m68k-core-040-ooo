@@ -98,6 +98,20 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val mmuEnable = ctrl.mmuEnable
     val urp       = ctrl.urp
     val srp       = ctrl.srp
+    val dtt0      = ctrl.dtt0
+    val dtt1      = ctrl.dtt1
+
+    // ---- DTT0/DTT1 transparent-translation match (task #194) ----
+    // A hit bypasses the walker/TLB entirely: PA=VA, no fault, no page table
+    // consulted. Only consulted while the MMU is enabled (mmuEnable=False is
+    // ALREADY pure identity below — TTRs add no observable difference there, and
+    // gating this way keeps every pre-existing MMU-disabled test bit-for-bit
+    // unchanged). DTT0 has priority over DTT1 when both match (checked first).
+    val vaHi8   = _req.vpn(19 downto 12)   // == va[31:24] (vpn is va[31:12])
+    val dtt0Hit = mmuEnable && TtMatch.hit(dtt0, vaHi8, _req.supervisor)
+    val dtt1Hit = mmuEnable && !dtt0Hit && TtMatch.hit(dtt1, vaHi8, _req.supervisor)
+    val ttHit   = dtt0Hit || dtt1Hit
+    val ttInhibited = Mux(dtt0Hit, TtMatch.inhibited(dtt0), TtMatch.inhibited(dtt1))
 
     // ---- TLB lookup (combinational) ----
     tlb.io.lookupVpn := _req.vpn
@@ -165,7 +179,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // Suppress re-trigger on the `done` cycle: busy has dropped but the fill/latch
     // (registered) have not yet taken effect, so a naive needWalk would spuriously
     // restart the walker for the just-resolved VPN.
-    val needWalk   = mmuEnable && _req.valid && !tlbHit && !latchMatch &&
+    val needWalk   = mmuEnable && _req.valid && !tlbHit && !latchMatch && !ttHit &&
                      !walker.io.busy && !walker.io.done
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -354,6 +368,14 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       _rsp.ready     := True
       _rsp.ppn       := _req.vpn
       _rsp.cacheMode := CacheMode.CACHEABLE
+      _rsp.fault     := False
+    } elsewhen(ttHit) {
+      // DTT0/DTT1 transparent-translation hit (task #194): bypasses the walker/TLB
+      // entirely, exactly like real 68040 hardware checks the TTRs before the ATC.
+      // PA=VA, never faults, no page table consulted.
+      _rsp.ready     := True
+      _rsp.ppn       := _req.vpn
+      _rsp.cacheMode := Mux(ttInhibited, CacheMode.INHIBITED, CacheMode.CACHEABLE)
       _rsp.fault     := False
     } elsewhen(hrMatch) {
       // hit served from the REGISTERED result (the deep hitVec cone ended at hr*).

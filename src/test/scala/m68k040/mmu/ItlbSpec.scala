@@ -51,8 +51,10 @@ class ItlbSpec extends AnyFunSuite {
   val PTRT = 0x11000L
   val PAGT = 0x12000L
 
+  // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
+  // MSB) — matches TableWalker.selectWord's corrected convention. Kept the name.
   def pokeWordLE(mem: BehavioralMemAgent, addr: Long, w: Long): Unit =
-    for (i <- 0 until 4) mem.pokeByte(addr + i, ((w >> (8 * i)) & 0xff).toInt)
+    for (i <- 0 until 4) mem.pokeByte(addr + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
   def rootIdx(va: Long): Int = ((va >> 25) & 0x7f).toInt
   def ptrIdx(va: Long): Int  = ((va >> 18) & 0x7f).toInt
   def pageIdx(va: Long): Int = ((va >> 12) & 0x3f).toInt

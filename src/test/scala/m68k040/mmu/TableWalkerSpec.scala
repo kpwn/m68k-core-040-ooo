@@ -11,8 +11,9 @@ import org.scalatest.funsuite.AnyFunSuite
 
 /** Directed tests for the 68040 hardware 3-level table walker.
   *
-  * A hand-built 3-level table is poked into a BehavioralMem (little-endian 32-bit
-  * descriptors, consistent with the walker's lane decode). The walker is driven
+  * A hand-built 3-level table is poked into a BehavioralMem (big-endian 32-bit
+  * descriptors, task #194 — consistent with the walker's lane decode AND with what a
+  * real architected `move.l` store would lay down). The walker is driven
   * with a VPN + root pointer + access class and the result is checked:
   *  - a resident walk -> non-identity PPN + perms + cache mode
   *  - a non-resident descriptor -> NON_RESIDENT fault
@@ -71,8 +72,11 @@ class TableWalkerSpec extends AnyFunSuite {
   val PTRT = 0x11000L
   val PAGT = 0x12000L
 
+  // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
+  // MSB) — matches TableWalker.selectWord's corrected convention (mirrors real 68k
+  // memory / DcacheByteLane.extract's LONG case). Kept the name.
   def pokeWordLE(mem: BehavioralMemAgent, addr: Long, w: Long): Unit =
-    for (i <- 0 until 4) mem.pokeByte(addr + i, ((w >> (8 * i)) & 0xff).toInt)
+    for (i <- 0 until 4) mem.pokeByte(addr + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
 
   // VA fields for a 4 KB page: root(7)|ptr(7)|page(6)|offset(12)
   def rootIdx(va: Long): Int = ((va >> 25) & 0x7f).toInt
@@ -136,7 +140,9 @@ class TableWalkerSpec extends AnyFunSuite {
       // (PDT resident), new = 0x01|0x08 = 0x09. Deferred write produced.
       assert(dut.umValid.toBoolean, "read walk must queue a U-bit descriptor write")
       assert((dut.umByte.toInt & 0xff) == 0x09, f"U-write byte=0x${dut.umByte.toInt}%x expected 0x09")
-      assert(dut.umAddr.toLong == (PAGT + pageIdx(va1) * 4), "U-write addr = page descriptor")
+      // Task #194: the U/M byte lives at the descriptor's LOW byte, which in real
+      // big-endian memory is the descriptor's HIGHEST byte address (base+3).
+      assert(dut.umAddr.toLong == (PAGT + pageIdx(va1) * 4 + 3), "U-write addr = page descriptor low byte")
 
       // ---- (2) inhibited + supervisor page, supervisor read ----
       val va2 = 0x00C04000L
@@ -181,7 +187,7 @@ class TableWalkerSpec extends AnyFunSuite {
       assert(dut.umValid.toBoolean, "write walk queues U+M descriptor write")
       // low byte 0x01 -> set U (0x08) and M (0x10) -> 0x19
       assert((dut.umByte.toInt & 0xff) == 0x19, f"U+M byte=0x${dut.umByte.toInt}%x expected 0x19")
-      assert(dut.umAddr.toLong == pAddr, "U/M-write addr = page descriptor")
+      assert(dut.umAddr.toLong == pAddr + 3, "U/M-write addr = page descriptor low byte")
     }
   }
 }

@@ -101,3 +101,39 @@ case class WalkRsp() extends Bundle {
   // byte (the byte holding U/M/PDT bits).
   val umWrite     = WalkUmWrite()
 }
+
+/** Transparent-translation register (TTR) match logic (task #194): ITT0/ITT1 (I-side)
+  * and DTT0/DTT1 (D-side) each carry a 32-bit register in the SAME field layout as a
+  * long-format page descriptor's upper attribute byte (MC68040 UM S3.1.2):
+  *
+  *   [31:24] base   — compared against the access VA's [31:24]
+  *   [23:16] mask   — a SET bit means "don't care" (ignore that base bit in the compare)
+  *   [15]    E      — enable (0 = this TTR is disabled, never matches)
+  *   [14:13] S      — supervisor field: 00 = match user-mode only, 01 = match
+  *                    supervisor-mode only, 1x = match either mode
+  *   [6:5]   CM     — cache mode; CM[1] (bit 6) set = non-cacheable (mirrors
+  *                    MmuDesc.pgInhibited's bit position exactly)
+  *
+  * A matching, enabled TTR makes the access TRANSPARENT: the walker/TLB are bypassed
+  * entirely, PA=VA, and the access never faults (no page table is even consulted).
+  * Per the 68040 PRM, DTT0 has priority over DTT1 (ITT0 over ITT1) when both match —
+  * callers check `hit(ttr0, ...)` before `hit(ttr1, ...)`. */
+object TtMatch {
+  /** True when `ttr` transparently covers a VA (given as its top byte, VA[31:24] —
+    * that's all a TTR's base/mask fields ever compare against) for an access of the
+    * given supervisor-ness. */
+  def hit(ttr: UInt, vaHi8: UInt, isSuper: Bool): Bool = {
+    val e      = ttr(15)
+    val sHigh  = ttr(14)
+    val sLow   = ttr(13)
+    val base   = ttr(31 downto 24)
+    val mask   = ttr(23 downto 16)
+    val baseMatch = ((vaHi8 ^ base) & ~mask) === U(0, 8 bits)
+    val sMatch    = sHigh || (sLow === isSuper)
+    e && baseMatch && sMatch
+  }
+
+  /** CM[1] (bit 6) — non-cacheable/inhibited, same bit position as a page
+    * descriptor's `pgInhibited` (MmuDesc.pgInhibited). */
+  def inhibited(ttr: UInt): Bool = ttr(6)
+}

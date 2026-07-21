@@ -71,8 +71,20 @@ object PortedTestRunner {
       // concern, out of this task's scope; changing their behavior risked
       // regressing the whole MMU test cluster for no benefit here).
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, injectBusErrors = true)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // Task #194: SHARE dmem's backing SparseMemory with both MMU table-walker AXI
+      // ports. Architecturally the page table lives in ordinary RAM — a directed
+      // ported test builds it with REAL `move.l #imm,addr` instructions through the
+      // D-cache (exactly like real 68040 boot code), so the walker's independent AXI
+      // read port must observe the SAME memory image, not its own private
+      // random-filled one (which is what every one of the 9 MMU-cluster ported tests
+      // was actually hitting before this fix — the walker read garbage descriptors
+      // off an unrelated SparseMemory and spuriously page-faulted regardless of RTL
+      // correctness). `BehavioralMemAgent`'s `sharedMem` param already existed for
+      // exactly this (see its doc comment) — `ExecuteLockStepSpec`'s MMU tests never
+      // needed it because they poke the walker's memory directly via a whitebox
+      // `buildMmuTable` helper instead of running real architected store instructions.
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
 
       // Also seed the D-SIDE view of the program image (ported-tests triage, cluster 2
       // / PC-relative indexed): `FuzzDut.attachProgram` above writes the I-cache's own

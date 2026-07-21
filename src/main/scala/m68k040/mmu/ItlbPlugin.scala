@@ -88,6 +88,18 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     val mmuEnable = ctrl.mmuEnable
     val urp       = ctrl.urp
     val srp       = ctrl.srp
+    val itt0      = ctrl.itt0
+    val itt1      = ctrl.itt1
+
+    // ---- ITT0/ITT1 transparent-translation match (task #194) — mirrors DtlbPlugin's
+    // DTT0/DTT1 treatment exactly, on the I-side. A hit bypasses the walker/TLB
+    // entirely: PA=VA, no fault. Only consulted while the MMU is enabled. ITT0 has
+    // priority over ITT1 when both match. ---- ----
+    val vaHi8   = _req.vpn(19 downto 12)   // == va[31:24]
+    val itt0Hit = mmuEnable && TtMatch.hit(itt0, vaHi8, _req.supervisor)
+    val itt1Hit = mmuEnable && !itt0Hit && TtMatch.hit(itt1, vaHi8, _req.supervisor)
+    val ttHit   = itt0Hit || itt1Hit
+    val ttInhibited = Mux(itt0Hit, TtMatch.inhibited(itt0), TtMatch.inhibited(itt1))
 
     // ---- TLB lookup (combinational) ----
     tlb.io.lookupVpn := _req.vpn
@@ -105,7 +117,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
 
     // ---- walker control. Fetch is always a READ (write=False). ----
     val latchMatch = latchValid && (latchVpn === _req.vpn)
-    val needWalk   = mmuEnable && _req.valid && !tlbHit && !latchMatch &&
+    val needWalk   = mmuEnable && _req.valid && !tlbHit && !latchMatch && !ttHit &&
                      !walker.io.busy && !walker.io.done
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -262,6 +274,13 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       _rsp.ready     := True
       _rsp.ppn       := _req.vpn
       _rsp.cacheMode := CacheMode.CACHEABLE
+      _rsp.fault     := False
+    } elsewhen(ttHit) {
+      // ITT0/ITT1 transparent-translation hit (task #194): bypasses the walker/TLB
+      // entirely — PA=VA, never faults.
+      _rsp.ready     := True
+      _rsp.ppn       := _req.vpn
+      _rsp.cacheMode := Mux(ttInhibited, CacheMode.INHIBITED, CacheMode.CACHEABLE)
       _rsp.fault     := False
     } elsewhen(tlbHit) {
       _rsp.ready     := True

@@ -21,8 +21,16 @@ import spinal.lib.fsm._
   * AXI: a dedicated 128-bit read-only port (same geometry as the D-cache / behavioral
   * memory). A descriptor is a 32-bit longword; the read returns the 16-byte line and
   * the walker selects the 4-byte lane by descAddr[3:2]. Descriptor bytes are read
-  * LITTLE-ENDIAN (byte at the lowest address is bit[7:0]) — consistent with how the
-  * D-side BehavioralMem stores/loads data, so the test page table is built the same way.
+  * BIG-ENDIAN (task #194 fix — byte at the LOWEST address is the descriptor's MSB),
+  * mirroring `DcacheByteLane.extract`'s LONG case EXACTLY: this walker has its own
+  * dedicated AXI port straight to physical memory, so it must reconstruct a 32-bit
+  * value from raw AXI bytes the SAME way the D-cache's own load path does, or a page
+  * table built by REAL supervisor `move.l` stores (68k memory is big-endian
+  * architecturally) reads back completely byte-reversed. Was previously little-endian
+  * (byte at the lowest address = bit[7:0]) — silently correct only for whitebox tests
+  * that poke descriptor bytes directly in that same (wrong, relative to a real
+  * architected store) order via `pokeWordLE`; the first ported test to build a page
+  * table with real `move.l` instructions (the m68k-ooo MMU cluster) exposed it.
   *
   * Bounded latency: three dependent reads. Single-outstanding (one walk at a time). */
 class TableWalker extends Component {
@@ -69,11 +77,20 @@ class TableWalker extends Component {
 
   donePulse := False
 
-  // ---- 128-bit line -> selected 32-bit descriptor (little-endian lane) ----
-  // descAddr[3:2] selects the 4-byte word within the 16-byte line.
+  // ---- 128-bit line -> selected 32-bit descriptor (BIG-ENDIAN lane, task #194) ----
+  // descAddr[3:2] selects the 4-byte word within the 16-byte line. Reconstructs the
+  // descriptor the SAME way DcacheByteLane.extract's LONG case does: the byte at the
+  // LOWEST address is the descriptor's MSB (real 68k memory is big-endian) — NOT a
+  // naive `subdivideIn(32 bits)` lane select, which would treat the raw AXI byte
+  // order as little-endian and byte-reverse every descriptor a real `move.l` wrote.
   def selectWord(line: Bits, addr: UInt): Bits = {
-    val words = line.subdivideIn(32 bits)   // words(0) = bytes[0..3] (low address)
-    words(addr(3 downto 2))
+    val bytes = line.subdivideIn(8 bits)   // bytes(i) = the line's byte i (line-base + i)
+    val base  = (addr(3 downto 2) ## U(0, 2 bits)).asUInt   // descriptor's first byte offset within the line
+    val b0 = bytes(base)
+    val b1 = bytes(base + 1)
+    val b2 = bytes(base + 2)
+    val b3 = bytes(base + 3)
+    b0 ## b1 ## b2 ## b3
   }
 
   val fsm = new StateMachine {
@@ -184,7 +201,13 @@ class TableWalker extends Component {
         // only queue if a bit actually changes
         val changes = (newByte =/= curByte)
         rUmValid := noFault && changes
-        rUmAddr  := descAddr        // low byte holds PDT/W/U/M
+        // Task #194 (big-endian fix): `d(7 downto 0)` is the descriptor's numeric LOW
+        // byte (holds PDT/W/U/M per the 68k page-descriptor format) — but real 68k
+        // memory is big-endian, so that numeric LSB physically lives at the HIGHEST
+        // byte of the 4-byte descriptor (descAddr+3), not descAddr+0. Previously (the
+        // little-endian `d` composition) descAddr+0 WAS that byte, so this was
+        // correct only relative to the old (wrong) read convention.
+        rUmAddr  := descAddr + 3
         rUmByte  := newByte
         goto(FINISH)
       }

@@ -853,6 +853,17 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
         override def mmuEnable = False
         override def urp = U(0, 32 bits)
         override def srp = U(0, 32 bits)
+        override def itt0 = U(0, 32 bits)
+        override def itt1 = U(0, 32 bits)
+        override def dtt0 = U(0, 32 bits)
+        override def dtt1 = U(0, 32 bits)
+        override def setEnable = { val f = Flow(Bool()); f.valid := False; f.payload := False; f }
+        override def setUrp    = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
+        override def setSrp    = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
+        override def setItt0   = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
+        override def setItt1   = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
+        override def setDtt0   = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
+        override def setDtt1   = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
       })
     val exc = new m68k040.exception.ExceptionUnit(
       ss = new m68k040.exception.SystemState,

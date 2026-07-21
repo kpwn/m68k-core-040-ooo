@@ -59,8 +59,10 @@ class UmWriteSpec extends AnyFunSuite {
   val PTRT = 0x11000L
   val PAGT = 0x12000L
 
+  // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
+  // MSB) — matches TableWalker.selectWord's corrected convention. Kept the name.
   def pokeWordLE(mem: BehavioralMemAgent, addr: Long, w: Long): Unit =
-    for (i <- 0 until 4) mem.pokeByte(addr + i, ((w >> (8 * i)) & 0xff).toInt)
+    for (i <- 0 until 4) mem.pokeByte(addr + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
   def rootIdx(va: Long): Int = ((va >> 25) & 0x7f).toInt
   def ptrIdx(va: Long): Int  = ((va >> 18) & 0x7f).toInt
   def pageIdx(va: Long): Int = ((va >> 12) & 0x3f).toInt
@@ -110,13 +112,13 @@ class UmWriteSpec extends AnyFunSuite {
       val (cd, mem) = init(dut)
       val va = 0x00802000L
       val pageAddr = buildTable(mem, va, ppn = 0xABCDEL)
-      assert(mem.peekByte(pageAddr) == 0x01, "initial descriptor low byte = PDT resident")
+      assert(mem.peekByte(pageAddr + 3) == 0x01, "initial descriptor low byte = PDT resident")
 
       // a WRITE access (robId 7) -> walk queues U+M descriptor write (low byte 0x01|U|M = 0x19)
       walk(dut, cd, va, write = true, robId = 7)
       // not yet committed -> memory must be UNCHANGED (speculative, not drained)
       cd.waitSampling(5)
-      assert(mem.peekByte(pageAddr) == 0x01, "U/M write must NOT drain before commit")
+      assert(mem.peekByte(pageAddr + 3) == 0x01, "U/M write must NOT drain before commit")
 
       // commit robId 7 -> drain RMW
       dut.probe.logic.commitValid #= true
@@ -125,7 +127,7 @@ class UmWriteSpec extends AnyFunSuite {
       dut.probe.logic.commitValid #= false
       // let the drain write-through land
       cd.waitSampling(20)
-      assert(mem.peekByte(pageAddr) == 0x19, f"descriptor byte after commit-drain = 0x${mem.peekByte(pageAddr)}%x expected 0x19")
+      assert(mem.peekByte(pageAddr + 3) == 0x19, f"descriptor byte after commit-drain = 0x${mem.peekByte(pageAddr + 3)}%x expected 0x19")
     }
   }
 
@@ -134,7 +136,7 @@ class UmWriteSpec extends AnyFunSuite {
       val (cd, mem) = init(dut)
       val va = 0x00C04000L
       val pageAddr = buildTable(mem, va, ppn = 0x12300L)
-      assert(mem.peekByte(pageAddr) == 0x01, "initial descriptor")
+      assert(mem.peekByte(pageAddr + 3) == 0x01, "initial descriptor")
 
       // a WRITE access (robId 3) queues a U+M write...
       walk(dut, cd, va, write = true, robId = 3)
@@ -143,13 +145,13 @@ class UmWriteSpec extends AnyFunSuite {
       cd.waitSampling()
       dut.probe.logic.flush #= false
       cd.waitSampling(20)
-      assert(mem.peekByte(pageAddr) == 0x01, "flushed U/M write must NOT drain (memory unchanged)")
+      assert(mem.peekByte(pageAddr + 3) == 0x01, "flushed U/M write must NOT drain (memory unchanged)")
 
       // a subsequent commit of robId 3 must do nothing (entry was discarded)
       dut.probe.logic.commitValid #= true; dut.probe.logic.commitId #= 3
       cd.waitSampling(); dut.probe.logic.commitValid #= false
       cd.waitSampling(20)
-      assert(mem.peekByte(pageAddr) == 0x01, "no drain after a discarded entry")
+      assert(mem.peekByte(pageAddr + 3) == 0x01, "no drain after a discarded entry")
     }
   }
 }
