@@ -187,11 +187,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val s1bfExt    = s1mi_pkt.words(1)
     val s1bfEa     = EaDecoder.decode(s1mi_opw(5 downto 0), Size.LONG,
                                       Vec(s1mi_opw, s1mi_pkt.words(2), s1mi_pkt.words(3)))
+    // task #197: baseValid dropped -- mirrors slot0IsBfDynMem's identical relaxation above
+    // (abs.W/.L EAs are MEMSIMPLE/baseValid=False; the Do=1-abs case is separately carved
+    // out to the illegal entry at ucBfDynRdEntry, not pre-filtered here).
     val slot1IsBfDynMemEarly = fed.valid && fed.payload.slot1Valid &&
       (slot1Spec0.op === DecOp.BITFIELD) && !slot1Spec0.microcoded &&
       ((slot1Spec0.bfOp === 0) || (slot1Spec0.bfOp === 1) || (slot1Spec0.bfOp === 3) || (slot1Spec0.bfOp === 5)) &&
       (s1bfExt(11) || s1bfExt(5)) &&
-      (s1bfEa.klass === EaClass.MEMSIMPLE) && (s1bfEa.autoMode === EaAuto.NONE) && s1bfEa.baseValid
+      (s1bfEa.klass === EaClass.MEMSIMPLE) && (s1bfEa.autoMode === EaAuto.NONE)
 
     // slot1 is emitted alongside slot0 only when: not replaying a stash, slot1 present,
     // slot0 is NOT 3-µop, slot1 itself is NOT 3-µop (a 3-µop slot1 is deferred), and
@@ -454,7 +457,19 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val s0bfRdOnly = (spec0.bfOp === 0) || (spec0.bfOp === 1) || (spec0.bfOp === 3) || (spec0.bfOp === 5)
     val s0bfEa     = EaDecoder.decode(s0opw(5 downto 0), Size.LONG,
                                       Vec(s0opw, s0pkt.words(2), s0pkt.words(3)))
-    val s0bfEaOk   = (s0bfEa.klass === EaClass.MEMSIMPLE) && (s0bfEa.autoMode === EaAuto.NONE) && s0bfEa.baseValid
+    // task #197 (bitfield-memind cluster): baseValid is NOT required here -- (xxx).W/.L
+    // abs EAs are MEMSIMPLE with baseValid=False (disp-only), and the engine's SEaBase
+    // selector already tolerates that (selReg's abs-mode comment). Dropping the baseValid
+    // requirement lets a Do=0 (static-offset) dynamic-width abs-EA read (e.g.
+    // bfextu_mem_dyn_single.s's case 4) reach the engine instead of falling to the OLD
+    // MicroOpAssembler 3a crack, whose `bfmBad` gate (bfDo||bfDw) unconditionally routes
+    // ANY dynamic form to an ILLEGAL trap regardless of baseValid -- with no vector-4
+    // handler installed, that traps into the reset vector's garbage and free-runs forever
+    // (a HANG from the test harness's viewpoint, not a clean fail). A genuinely-unsupported
+    // Do=1 (dynamic OFFSET) abs EA is separately carved out to the illegal entry at
+    // ucBfDynRdEntry (mirrors ucBfRmwDynEntry's identical abs+Do1 carve-out) -- this gate
+    // only needs to admit the EA class here, not pre-filter Do.
+    val s0bfEaOk   = (s0bfEa.klass === EaClass.MEMSIMPLE) && (s0bfEa.autoMode === EaAuto.NONE)
     val slot0IsBfDynMem = fed.valid && (spec0.op === DecOp.BITFIELD) && !spec0.microcoded &&
                           s0bfRdOnly && s0bfDynM && s0bfEaOk
     // A slot0 owned by the µcode engine: an OperationDecoder-microcoded op OR a full-format
@@ -1254,10 +1269,19 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val ucBfEntRdOnly = (ucBfEntOp === 0) || (ucBfEntOp === 1) || (ucBfEntOp === 3) || (ucBfEntOp === 5)
     val ucIsBfDynRd   = !ucEntrySpec.microcoded && (ucEntrySpec.op === DecOp.BITFIELD) &&
                         ucBfEntRdOnly && (ucBfDo || ucBfDw)
-    val ucBfDynRdEntry = Mux(ucBfDo,
-      Mux(ucBfEntOp === 5, U(Microcode.BF_DYN_FFO_DO1_ENTRY, ew bits),
-                           U(Microcode.BF_DYN_RD_DO1_ENTRY,  ew bits)),
-      U(Microcode.BF_DYN_RD_DO0_ENTRY, ew bits))
+    // Do=1 at an ABS EA (baseValid=False, (xxx).W/.L) is OUT OF SCOPE for the SAME reason
+    // as the RMW carve-out below (UBfAdd's byteBase-recompute reads SEaBase as a REGISTER,
+    // which an abs EA has none of) -- route to the vector-4 ILLEGAL entry instead of
+    // silently computing a wrong address (task #197: this case is newly REACHABLE now that
+    // slot0IsBfDynMem/slot1IsBfDynMemEarly no longer require baseValid; previously it never
+    // reached the engine at all, falling to the 3a bfmBad illegal gate instead — this Mux
+    // arm preserves that same fail-safe outcome via the engine's own illegal entry).
+    val ucBfDynRdEntry = Mux(ucBfDo && !ucBfEaDec.baseValid,
+      U(Microcode.BF_DYN_ILLEGAL_ENTRY, ew bits),
+      Mux(ucBfDo,
+        Mux(ucBfEntOp === 5, U(Microcode.BF_DYN_FFO_DO1_ENTRY, ew bits),
+                             U(Microcode.BF_DYN_RD_DO1_ENTRY,  ew bits)),
+        U(Microcode.BF_DYN_RD_DO0_ENTRY, ew bits)))
     // Bit-field RMW DYNAMIC (slice 3c): BFCHG(2)/BFCLR(4)/BFSET(6) with Do||Dw -> the dynamic
     // RMW entry (Do=1 recomputes byteBase; Do=0 folds). BFINS(7) dynamic -> the dedicated INS
     // entries (prefunnel -> register-form insert -> reload+inverse-funnel; X untouched).
