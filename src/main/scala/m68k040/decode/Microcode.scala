@@ -471,8 +471,10 @@ object Microcode {
          sz = SzByte, indexFromEa = true),                                     // µPC68 (hi -> T1)
     Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = ST2, sz = SzLong,
          bfDyn = true, bfWritesNz = true),                                     // µPC69 (RES -> T2; +NZ from orig field)
-    Desc(UBfMem, srcA = ST0, srcB = ST2, dst = ST0, sz = SzLong, bfStoreForm = 2),  // µPC70 (LO5: lo' -> T0, imm bitOff)
-    Desc(UBfMem, srcA = ST1, srcB = ST2, dst = ST1, sz = SzLong, bfStoreForm = 3),  // µPC71 (HI5: hi' -> T1, imm bitOff)
+    Desc(UBfMem, srcA = ST0, srcB = ST2, dst = ST0, useImm = true, imm = SBfImm,
+         sz = SzLong, bfStoreForm = 2),                                    // µPC70 (LO5: lo' -> T0, imm bitOff)
+    Desc(UBfMem, srcA = ST1, srcB = ST2, dst = ST1, useImm = true, imm = SBfImm,
+         sz = SzLong, bfStoreForm = 3),                                    // µPC71 (HI5: hi' -> T1, imm bitOff)
     Desc(UMove, mem = MStore, srcA = SEaBase, srcB = ST0, useImm = true, imm = SEaDispLo,
          sz = SzLong, indexFromEa = true),                                     // µPC72 (store lo')
     Desc(UMove, mem = MStore, srcA = SEaBase, srcB = ST1, useImm = true, imm = SEaDispHi,
