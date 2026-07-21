@@ -131,10 +131,23 @@ object SysKind extends SpinalEnum {
       // PFLUSHA (line-1111, 0xF518): privileged "flush all ATC/TLB entries". A REAL
       // effect (unlike CPUSH/RESET) — pulses a flushAll signal that both DtlbPlugin and
       // ItlbPlugin clear their TLB + walk-result latch on, mirroring the existing
-      // umFlush top-level fan-out pattern. S=0 -> vector 8. (value 7 — last slot in the
-      // current 3-bit sysKind field; a further addition needs a width bump, see task
-      // #136 for the deferred selective-PFLUSH/PFLUSHN forms.)
-      PFLUSHA
+      // umFlush top-level fan-out pattern. S=0 -> vector 8. (value 7 — was the last slot
+      // in the old 3-bit sysKind field; PTEST below bumped the field to 4 bits.)
+      PFLUSHA,
+      // PTEST{R,W} (An) (line-1111, 0xF548-0xF54F/0xF568-0xF56F — task #198): privileged
+      // MMU-probe "translate An, latch status in MMUSR". This core's MMU has no real
+      // per-page R/W/CM/fault status to probe (same "stub MMU" limitation PFLUSHA/PFLUSH
+      // already lean on): when the MMU is disabled — the only configuration the ported
+      // corpus's ptest_w_an exercises — PA=VA and the page is always "resident" (R=1),
+      // which is architecturally EXACT (not an approximation) for that configuration.
+      // ExceptionUnit's S_APPLY writes MMUSR := (An & 0xFFFFF000) | 1 (page-aligned
+      // address, R bit set, every other status bit 0). Direction is always "write" (An
+      // -> MMUSR; sysReadDir=False) — the result is read back separately via a normal
+      // MOVEC %mmusr,Rn (Rc id 0x805, a new MmuControlPlugin-owned register). S=0 ->
+      // vector 8. (value 8 — the 9th SysKind element, bumping the field from 3 to 4
+      // bits; see ExceptionUnit.scala's `sysKind`/`sysCapKind` + RobPlugin's
+      // `.resize(...)` call, all updated together.)
+      PTEST
       = newElement()
 }
 

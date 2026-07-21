@@ -979,6 +979,34 @@ object OperationDecoder {
           o.sysReadDir := False
           o.dst.setNone(); o.dstWrites := False
         }
+        // ── PTEST{R,W} (An) (0xF548-0xF54F / 0xF568-0xF56F): privileged MMU-probe —
+        // task #198. Derived from the ported test's own literal opwords (ptest_w_an.s):
+        // 0xF548=ptestw(a0), 0xF549=ptestw(a1), 0xF568=ptestr(a0), 0xF56A=ptestr(a2).
+        // Fixed bits: [15:8]=0xF5, [7]=0, [6]=1 (this is what disambiguates it from the
+        // PFLUSH family right above, which has [6]=0 over the same [15:8]=0xF5 byte),
+        // [4]=0, [3]=1. Free bits: [5]=R/W direction (unused here — this stub-MMU
+        // implementation treats PTESTR/PTESTW identically, matching the "MMU disabled:
+        // PA=VA, R=1" case the ported test itself documents as the only one exercised),
+        // [2:0]=An. A COMMIT-TIME SYSTEM op like PFLUSHA: no GPR write (the result lands
+        // in MMUSR, read back separately via `movec %mmusr,Rn` — Rc id 0x805, added to
+        // the MOVEC read mux in ExceptionUnit.scala). sysReadDir=False (An -> MMUSR is a
+        // "write" direction in the sysOp sense, mirroring MOVE_USP's An->USP arm) — the
+        // assembler overrides srcB with the REAL An bit position (op[2:0], not the
+        // standard op[11:9] `anField`), same precedent as MOVE_USP/MOVEC. S=0 -> vector 8
+        // (automatic: ANY sysOp head retiring at S=0 traps, no separate needsSupervisor
+        // needed — see RobPlugin's sysPrivFault).
+        val isPtest = (opword(15 downto 8) === B"8'hF5") && !opword(7) && opword(6) &&
+                      !opword(4) && opword(3)
+        when(isPtest) {
+          o.illegal := False
+          o.op := DecOp.MOVE
+          o.size := Size.LONG
+          o.sysOp := True
+          o.sysKind := SysKind.PTEST
+          o.sysReadDir := False
+          o.srcB := anField   // placeholder; MicroOpAssembler overrides with the real op[2:0] An
+          o.dst.setNone(); o.dstWrites := False
+        }
         // FSF (xxx).L — task #180 (ported-tests triage, cluster13/exc_fsf_xxx_l_no_fline):
         // opword 0xF27F, ext1 0x0000 (the FScc "false" predicate — condition field is
         // OPER_I_16()&0x3f per Musashi's fscc(), 0 selects always-false), then a 2-word

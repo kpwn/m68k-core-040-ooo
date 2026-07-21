@@ -857,6 +857,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
         override def itt1 = U(0, 32 bits)
         override def dtt0 = U(0, 32 bits)
         override def dtt1 = U(0, 32 bits)
+        override def mmusr = U(0, 32 bits)
         override def setEnable = { val f = Flow(Bool()); f.valid := False; f.payload := False; f }
         override def setUrp    = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
         override def setSrp    = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
@@ -864,6 +865,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
         override def setItt1   = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
         override def setDtt0   = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
         override def setDtt1   = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
+        override def setMmusr  = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
       })
     val exc = new m68k040.exception.ExceptionUnit(
       ss = new m68k040.exception.SystemState,
@@ -902,7 +904,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // available only after exc is built) and driven below. The captured context comes
       // straight from the head's per-entry sysOp stores + the captured value.
       sysTrigger = sysTriggerSig,
-      sysKind    = sysKindStore(h0).asBits.asUInt.resize(3),
+      sysKind    = sysKindStore(h0).asBits.asUInt.resize(4),   // task #198: 4 bits (PTEST=8)
       sysReadDir = sysReadDirStore(h0),
       sysVal     = sysValStore(h0),
       sysRc      = sysRcStore(h0),

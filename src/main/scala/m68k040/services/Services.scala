@@ -111,6 +111,10 @@ trait MmuControlService {
   def itt1: UInt
   def dtt0: UInt
   def dtt1: UInt
+  // MMUSR (task #198): PTEST's result register — MOVEC Rc id 0x805, read-only from the
+  // arch side (no MOVEC write case; real hardware has none either). Written at PTEST's
+  // S_APPLY (ExceptionUnit) via `setMmusr`.
+  def mmusr: UInt
 
   // ── commit-time write ports (driven from ExceptionUnit's MOVEC S_APPLY case) ──
   def setEnable: Flow[Bool]
@@ -120,6 +124,9 @@ trait MmuControlService {
   def setItt1: Flow[UInt]
   def setDtt0: Flow[UInt]
   def setDtt1: Flow[UInt]
+  // Written from PTEST's S_APPLY case (ExceptionUnit), not the MOVEC write switch —
+  // MMUSR has no MOVEC write case (RAZ/WI in real hardware too).
+  def setMmusr: Flow[UInt]
 }
 
 /** The external interrupt inputs (simple protocol): a 3-bit IPL plus the SoC's

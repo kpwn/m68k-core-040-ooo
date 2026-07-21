@@ -1612,6 +1612,17 @@ object MicroOpAssembler {
         opUop.srcAValid := False; opUop.srcBValid := False; opUop.dstValid := False
         opUop.useImm := False
       }
+      // PTEST: the An is op[2:0] (NOT the standard op[11:9] `anField`) — same override
+      // precedent as MOVE_USP's uspAn. Always the "write" arm (An's value -> srcB, read
+      // by the ALU EU as a plain MOVE result -> captured into sysValStore for the
+      // S_APPLY commit-time MMUSR write); PTEST never writes a GPR directly.
+      when(spec.sysKind === SysKind.PTEST) {
+        val ptestAn = (U(8, 5 bits) + op(2 downto 0).asUInt).resize(5)
+        opUop.srcBReg := ptestAn; opUop.srcBValid := True
+        opUop.srcAValid := False
+        opUop.dstValid := False
+        opUop.useImm := False
+      }
     }
     when(isTrapOp) {
       // Unconditional faulted µop: vector 32+n, delivered at retire (format-$0).

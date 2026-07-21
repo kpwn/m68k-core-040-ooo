@@ -59,6 +59,7 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
   var _itt1:      UInt = null
   var _dtt0:      UInt = null
   var _dtt1:      UInt = null
+  var _mmusr:     UInt = null
 
   var _setEnable: Flow[Bool] = null
   var _setUrp:    Flow[UInt] = null
@@ -67,6 +68,7 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
   var _setItt1:   Flow[UInt] = null
   var _setDtt0:   Flow[UInt] = null
   var _setDtt1:   Flow[UInt] = null
+  var _setMmusr:  Flow[UInt] = null
 
   override def mmuEnable: Bool = _mmuEnable
   override def urp:       UInt = _urp
@@ -75,6 +77,7 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
   override def itt1:      UInt = _itt1
   override def dtt0:      UInt = _dtt0
   override def dtt1:      UInt = _dtt1
+  override def mmusr:     UInt = _mmusr
 
   override def setEnable: Flow[Bool] = _setEnable
   override def setUrp:    Flow[UInt] = _setUrp
@@ -83,6 +86,7 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
   override def setItt1:   Flow[UInt] = _setItt1
   override def setDtt0:   Flow[UInt] = _setDtt0
   override def setDtt1:   Flow[UInt] = _setDtt1
+  override def setMmusr:  Flow[UInt] = _setMmusr
 
   val logic = during build new Area {
     // The control regs. RegInit/Reg-init so a standalone DUT (no external driver)
@@ -94,6 +98,10 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
     val itt1 = Reg(UInt(32 bits)) init 0; itt1.simPublic()
     val dtt0 = Reg(UInt(32 bits)) init 0; dtt0.simPublic()
     val dtt1 = Reg(UInt(32 bits)) init 0; dtt1.simPublic()
+    // MMUSR (task #198): PTEST's result register. No sim-poke precedent needed (nothing
+    // pokes it directly today), but simPublic for consistency/debuggability like every
+    // other committed reg here.
+    val mmusr = Reg(UInt(32 bits)) init 0; mmusr.simPublic()
 
     // ── commit-time write ports (mirrors SystemState's setVbr/setUsp/setCacr/setItt0
     // pattern exactly: Flow, allowOverride, default-idle, a single `when` writer). ──
@@ -104,6 +112,7 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
     val setItt1   = Flow(UInt(32 bits))
     val setDtt0   = Flow(UInt(32 bits))
     val setDtt1   = Flow(UInt(32 bits))
+    val setMmusr  = Flow(UInt(32 bits))
     setEnable.valid.allowOverride; setEnable.valid := False; setEnable.payload.allowOverride; setEnable.payload := False
     setEnable.valid.simPublic(); setEnable.payload.simPublic()
     setUrp.valid.simPublic()
@@ -113,6 +122,7 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
     setItt1.valid.allowOverride;   setItt1.valid := False;   setItt1.payload.allowOverride;   setItt1.payload := U(0, 32 bits)
     setDtt0.valid.allowOverride;   setDtt0.valid := False;   setDtt0.payload.allowOverride;   setDtt0.payload := U(0, 32 bits)
     setDtt1.valid.allowOverride;   setDtt1.valid := False;   setDtt1.payload.allowOverride;   setDtt1.payload := U(0, 32 bits)
+    setMmusr.valid.allowOverride;  setMmusr.valid := False;  setMmusr.payload.allowOverride;  setMmusr.payload := U(0, 32 bits)
 
     when(setEnable.valid) { mmuEnable := setEnable.payload }
     when(setUrp.valid)    { urp  := setUrp.payload }
@@ -121,6 +131,7 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
     when(setItt1.valid)   { itt1 := setItt1.payload }
     when(setDtt0.valid)   { dtt0 := setDtt0.payload }
     when(setDtt1.valid)   { dtt1 := setDtt1.payload }
+    when(setMmusr.valid)  { mmusr := setMmusr.payload }
 
     _mmuEnable = mmuEnable
     _urp = urp
@@ -129,6 +140,7 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
     _itt1 = itt1
     _dtt0 = dtt0
     _dtt1 = dtt1
+    _mmusr = mmusr
     _setEnable = setEnable
     _setUrp = setUrp
     _setSrp = setSrp
@@ -136,5 +148,6 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
     _setItt1 = setItt1
     _setDtt0 = setDtt0
     _setDtt1 = setDtt1
+    _setMmusr = setMmusr
   }
 }

@@ -77,7 +77,9 @@ class ExceptionUnit(
     // vector-8 fault delivered via entryTrigger instead). The FSM applies the effect
     // (write committed SR/USP/VBR + re-bank A7, or read system->Rn), pulses the obs
     // (post-state sysByte + re-banked A7), and redirects to sysNextPc (serialize).
-    //   sysKind     : 1=MOVE-to-SR, 2=MOVE-USP, 3=MOVEC (mirrors decode.SysKind enum).
+    //   sysKind     : 1=MOVE-to-SR, 2=MOVE-USP, 3=MOVEC, ..., 8=PTEST (mirrors
+    //                 decode.SysKind enum; 4 bits since task #198 added PTEST as the
+    //                 9th kind, bumping the field past the old 3-bit ceiling).
     //   sysReadDir  : read SYSTEM->Rn (True) vs write Rn->SYSTEM (False).
     //   sysVal      : the captured source VALUE (for a write).
     //   sysRc       : the 12-bit MOVEC control-reg id.
@@ -85,7 +87,7 @@ class ExceptionUnit(
     //   sysPc       : the sysOp instruction's PC (the obs commit PC).
     //   sysNextPc   : the next instruction's PC (the redirect target after serialize).
     sysTrigger:   Bool = False,
-    sysKind:      UInt = U(0, 3 bits),
+    sysKind:      UInt = U(0, 4 bits),
     sysReadDir:   Bool = False,
     sysVal:       Bits = B(0, 32 bits),
     sysRc:        UInt = U(0, 12 bits),
@@ -179,7 +181,7 @@ class ExceptionUnit(
   val stFrame2     = RegInit(False)       // E_STORE loop is currently on the 2nd ($1) frame
 
   // ── Commit-time SYSTEM op captured state (latched at sysTrigger) ─────────────
-  val sysCapKind    = Reg(UInt(3 bits))
+  val sysCapKind    = Reg(UInt(4 bits))   // 4 bits since task #198 (PTEST, kind=8)
   val sysCapReadDir = Reg(Bool())
   val sysCapVal     = Reg(Bits(32 bits))
   val sysCapRc      = Reg(UInt(12 bits))
@@ -1030,11 +1032,12 @@ class ExceptionUnit(
     }
 
     // ── Commit-time SYSTEM op: APPLY the effect to committed state (1 cycle) ──────
-    // sysCapKind: 1=MOVE-to-SR, 2=MOVE-USP, 3=MOVEC. The write direction's source value
-    // is sysCapVal; the read direction writes the int PRF arch-reg (sysRegWrite*).
+    // sysCapKind: 1=MOVE-to-SR, 2=MOVE-USP, 3=MOVEC, ..., 8=PTEST. The write
+    // direction's source value is sysCapVal; the read direction writes the int PRF
+    // arch-reg (sysRegWrite*).
     S_APPLY.whenIsActive {
       switch(sysCapKind) {
-        is(U(1, 3 bits)) {                          // MOVE to SR : sysVal.W -> SR
+        is(U(1, 4 bits)) {                          // MOVE to SR : sysVal.W -> SR
           // System byte = sysVal[15:8], CCR = sysVal[4:0]. Writing srSys may flip S ->
           // A7 re-banks. The committed CCR is tracked in the ROB; we surface the new SR
           // (sysByte) in the obs, and the ROB folds sysVal[4:0] into committedCcr (so the
@@ -1042,7 +1045,7 @@ class ExceptionUnit(
           // the NEW-S bank's value (computed from the post-write S in S_REDIR via ss.a7).
           ss.setSrSys.valid := True; ss.setSrSys.payload := sysCapVal(15 downto 8).asUInt
         }
-        is(U(2, 3 bits)) {                          // MOVE USP : An<->USP
+        is(U(2, 4 bits)) {                          // MOVE USP : An<->USP
           when(sysCapReadDir) {                     // USP -> An : write the int PRF[pdst]
             sysRegWriteValid := True
             sysRegWritePhys  := sysCapDstPhys
@@ -1051,7 +1054,7 @@ class ExceptionUnit(
             ss.setUsp.valid := True; ss.setUsp.payload := sysCapVal.asUInt
           }
         }
-        is(U(3, 3 bits)) {                          // MOVEC : Rc<->Rn
+        is(U(3, 4 bits)) {                          // MOVEC : Rc<->Rn
           when(sysCapReadDir) {                     // Rc -> Rn : read the committed reg
             sysRegWriteValid := True
             sysRegWritePhys  := sysCapDstPhys
@@ -1082,6 +1085,10 @@ class ExceptionUnit(
               U(0x007, 12 bits) -> mmuCtrl.dtt1,
               U(0x806, 12 bits) -> mmuCtrl.urp,
               U(0x807, 12 bits) -> mmuCtrl.srp,
+              // MMUSR (0x805), task #198: PTEST's result register, read-only from the
+              // arch side (real hardware has no MOVEC-write case for it either — falls
+              // to the `other Rc: WI` default below).
+              U(0x805, 12 bits) -> mmuCtrl.mmusr,
               default           -> U(0, 32 bits))   // other unmodeled Rc -> RAZ (read 0)
           } otherwise {                             // Rn -> Rc : write the committed reg
             switch(sysCapRc) {
@@ -1123,23 +1130,36 @@ class ExceptionUnit(
             }
           }
         }
-        is(U(4, 3 bits)) {                          // RESET : no architectural state change
+        is(U(4, 4 bits)) {                          // RESET : no architectural state change
           // The external reset line is not modeled for lock-step; RESET is an internal NOP.
           // S_REDIR just advances PC (the obs carries the UNCHANGED sysByte + A7).
         }
-        is(U(5, 3 bits)) {                          // STOP : SR := sysVal[15:0]
+        is(U(5, 4 bits)) {                          // STOP : SR := sysVal[15:0]
           // Identical SR write to MOVE-to-SR: system byte = sysVal[15:8] (S/T/I incl. the
           // new I-mask), CCR = sysVal[4:0]. A7 re-banks on an S flip (S_REDIR via ss.a7).
           // The HALT itself is the ROB `stopped` state (set on the STOP sysRetire).
           ss.setSrSys.valid := True; ss.setSrSys.payload := sysCapVal(15 downto 8).asUInt
         }
-        is(U(6, 3 bits)) {                          // CPUSH : no cache hierarchy modeled
+        is(U(6, 4 bits)) {                          // CPUSH : no cache hierarchy modeled
           // No cache to push/invalidate in this core — an internal NOP, like RESET.
         }
-        is(U(7, 3 bits)) {                          // PFLUSHA : flush all ATC/TLB entries
+        is(U(7, 4 bits)) {                          // PFLUSHA : flush all ATC/TLB entries
           // A REAL effect, unlike CPUSH/RESET — pulses the 1-cycle flushAll signal that
           // DtlbPlugin/ItlbPlugin clear their TLB + walk-result latch on.
           sysFlushAllValid := True
+        }
+        is(U(8, 4 bits)) {                          // PTEST : (An) -> MMUSR
+          // This core's MMU has no real per-page R/W/CM/fault status to probe (same
+          // "stub MMU" limitation PFLUSH/PFLUSHA already lean on). When the MMU is
+          // disabled — the only configuration the ported corpus's ptest_w_an exercises
+          // — PA=VA (identity) and the page is always "resident" (R=1), which is
+          // architecturally EXACT for that configuration, not an approximation.
+          // MMUSR := (An & page-mask) | R(=1); every other MMUSR status bit (B/G/U0/
+          // U1/S/CM/M/W/T) reads 0 (no real translation-fault/write-protect/CM
+          // probing modeled). sysCapVal carries An's value (write direction, exactly
+          // like MOVE_USP's An->USP arm — see MicroOpAssembler's PTEST case).
+          mmuCtrl.setMmusr.valid   := True
+          mmuCtrl.setMmusr.payload := (sysCapVal.asUInt & U(0xFFFFF000L, 32 bits)) | U(1, 32 bits)
         }
       }
       goto(S_REDIR)
@@ -1161,7 +1181,7 @@ class ExceptionUnit(
       // MOVE-to-SR (sysCapKind==1) AND STOP (sysCapKind==5) write the full CCR (sysVal[4:0])
       // -> surface it so the whitebox resyncs its running CCR to this absolute value. Other
       // sysOps (MOVE-USP/MOVEC/RESET) leave CCR untouched.
-      when(sysCapKind === U(1, 3 bits) || sysCapKind === U(5, 3 bits)) {
+      when(sysCapKind === U(1, 4 bits) || sysCapKind === U(5, 4 bits)) {
         obsSetCcr5Valid := True
         obsSetCcr5      := sysCapVal(4 downto 0).asUInt
         // task #192: ALSO land the CCR in the REAL NZVC/X physical registers (not
