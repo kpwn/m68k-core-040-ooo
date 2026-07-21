@@ -162,8 +162,10 @@ case class OpSpec() extends Bundle {
   // entry µPC into the Microcode ROM. Widened 4 -> 5 bits in slice 3b; widened 5 -> 6 bits
   // for CAS/CAS2 (romSize hits 45: BCD 6 + bit-field 10 + full-ext mem-indirect 15 + CAS 4
   // + CAS2 10), so 5 bits (0..31) overflowed. slice 3c dynamic-mem bit-field pushes romSize
-  // past 64 (entries up to 86), so 7 bits (0..127). FMax-neutral (cold decode field).
-  val ucEntry       = UInt(7 bits)
+  // past 64 (entries up to 86), so 7 bits (0..127). task #197's MI_BF_* family (memory-
+  // indirect bit-field) pushes romSize past 128 (entries up to 165), so 8 bits (0..255).
+  // FMax-neutral (cold decode field).
+  val ucEntry       = UInt(8 bits)
   // ── Commit-time PRIVILEGED SYSTEM ops (MOVE-to-SR / MOVE-USP / MOVEC) ─────────
   // Classification only (the assembler builds the op µop carrying these): `sysOp`
   // marks a serializing commit-time system op, `sysKind` selects which, `sysReadDir`

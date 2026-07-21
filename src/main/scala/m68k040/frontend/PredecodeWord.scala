@@ -917,8 +917,25 @@ object PredecodeWord {
         val bfMemMode = op(5 downto 3).asUInt
         val isBitfieldMem = op(11) && (ss === U(3, 2 bits)) && (bfMemMode >= 2)
         when(isBitfieldMem) {
-          // The bit-field EA ext follows the bf-ext word, so op+1 is NOT the EA ext.
-          val (ok, e) = eaExt(bfMemMode, op(2 downto 0).asUInt, sizeL = False, allowImm = false, eaW = B(0, 16 bits))
+          // The bit-field EA ext follows the bf-ext word, so op+1 is NOT the EA ext -- the
+          // EA's OWN first ext word is at op+2 = extW2 (same shift as the static bit-OP
+          // family's `bitDstEaW` above / the line-0 .B/.W-immediate family's `immDstEaW`).
+          //
+          // task #197 (bitfield-memory-indirect cluster) FOUND + FIXED: this previously
+          // passed `eaW = B(0, 16 bits)` (a HARDCODED zero) with the default `eaWKnown =
+          // True` -- telling `eaExt` "the real ext word is definitely all-zero" instead of
+          // "unknown" or "here it is". For mode 6 / mode-7-reg-3, `eaExt` reads `eaW(8)` to
+          // pick brief- (1 ext word) vs full-format (1+bd+od, up to 5); with a hardcoded
+          // zero, `eaW(8)` was ALWAYS 0 -> ALWAYS assumed brief, even for a genuine 68020+
+          // full-format memory-indirect bit-field EA. `lenWords` therefore came out too
+          // SHORT for every such EA, silently resyncing fetch mid-instruction -- a wild-PC
+          // HANG completely independent of (and upstream of) any bit-field decode/microcode
+          // logic. Passing the REAL extW2 (+ eaWKnown = extW2Known, so an unresident/past-
+          // line-end word correctly falls back to the existing eaWKnown=False "assume
+          // brief" safety net, exactly like every other mode-6/mode-7-3 caller in this file)
+          // fixes it.
+          val (ok, e) = eaExt(bfMemMode, op(2 downto 0).asUInt, sizeL = False, allowImm = false,
+                              eaW = extW2, eaWKnown = extW2Known)
           when(ok) {
             r.simple   := True
             r.lenWords := (U(2, 3 bits) + e).resized   // opword + bf-ext + EA ext

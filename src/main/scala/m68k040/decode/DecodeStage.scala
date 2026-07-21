@@ -200,11 +200,17 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       (s1bfExt(11) || s1bfExt(5)) &&
       (s1bfEa.klass === EaClass.MEMSIMPLE) && (s1bfEa.autoMode === EaAuto.NONE) &&
       (s1bfEa.baseValid || !s1bfEa.pcRel)
+    // slot1 MEMORY-INDIRECT read-only bit-field (task #197) — mirrors slot0IsBfMemindMem's
+    // identical rationale above (no baseValid/Do||Dw filter; no-index only).
+    val slot1IsBfMemindMemEarly = fed.valid && fed.payload.slot1Valid &&
+      (slot1Spec0.op === DecOp.BITFIELD) && !slot1Spec0.microcoded &&
+      ((slot1Spec0.bfOp === 0) || (slot1Spec0.bfOp === 1) || (slot1Spec0.bfOp === 3) || (slot1Spec0.bfOp === 5)) &&
+      (s1bfEa.klass === EaClass.MEMINDIRECT) && !s1bfEa.indexValid
 
     // slot1 is emitted alongside slot0 only when: not replaying a stash, slot1 present,
     // slot0 is NOT 3-µop, slot1 itself is NOT 3-µop (a 3-µop slot1 is deferred), and
     // slot1 is NOT a MOVEM/MOVEP (the FSM owns it — see slot1IsMovemEarly/slot1IsMovepEarly).
-    val slot1Emit = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Is3 && !slot1Is3 && !slot1IsMovemEarly && !slot1IsUcodeEarly && !slot1IsMovepEarly && !slot1IsMemIndEarly && !slot1IsBfDynMemEarly
+    val slot1Emit = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Is3 && !slot1Is3 && !slot1IsMovemEarly && !slot1IsUcodeEarly && !slot1IsMovepEarly && !slot1IsMemIndEarly && !slot1IsBfDynMemEarly && !slot1IsBfMemindMemEarly
     // Defer slot1 to the stash when EITHER slot0 is a 3-µop crack (slot1 cannot fit
     // alongside 3 µops) OR slot1 itself is a 3-µop crack (cannot fit after a <=2-µop
     // slot0). In both cases emit slot0 this cycle + stash slot1's µops; replay next.
@@ -492,9 +498,33 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
                       (s0bfEa.baseValid || !s0bfEa.pcRel)
     val slot0IsBfDynMem = fed.valid && (spec0.op === DecOp.BITFIELD) && !spec0.microcoded &&
                           s0bfRdOnly && s0bfDynM && s0bfEaOk
+    // ── Bit-field MEMORY-INDIRECT read-only detection (task #197) ─────────────────
+    // BFTST/BFEXTU/BFEXTS/BFFFO at a full-format memory-indirect EA (mode 6 / mode-7-reg-3
+    // with the full-format bit8 set AND a real I/IS memind selector) currently fall through
+    // to NEITHER slot0IsMemInd (BITFIELD isn't in that family's op list) NOR slot0IsBfDynMem
+    // (requires MEMSIMPLE, and MEMINDIRECT is a DISTINCT EaClass) -- OperationDecoder still
+    // marks them non-illegal/non-microcoded (its `isBitfieldMem` gate only checks the raw
+    // `mode>=2` field, which mode 6 satisfies regardless of brief-vs-full-format), so they
+    // fall to the OLD MicroOpAssembler 3a crack, whose `bfmEaOk` gate requires MEMSIMPLE too
+    // -- `bfmBad` fires unconditionally, an ILLEGAL trap (a HANG in a handler-less repro,
+    // same class as the abs-EA gap fixed above). UNLIKE the abs-EA case, this is not just a
+    // missing engine route -- even IF something routed a memind EA through the STATIC 3a/3b
+    // machinery, `bfmEaDec.disp`/`ucBfEaDec.disp` for a MEMINDIRECT EA is `bd` (the FIRST-
+    // level, PRE-dereference displacement), not a real byte address -- so any accidental
+    // routing there would silently read the WRONG memory (An+bd instead of *(An+bd)+od).
+    // Route to the NEW MI_BF_RD_DO0/DO1 entries instead (see Microcode.scala's family
+    // header comment) -- ALL read-only forms (static OR dynamic Do/Dw) need this, since the
+    // static form has NO working path at all for a memind EA (unlike MEMSIMPLE, where the
+    // 3a crack already handles static correctly) -- so, unlike s0bfDynM above, Do/Dw are NOT
+    // required here. No-index only (mirrors the ROM family's own scope) -- a pre/post-
+    // indexed memind EA (indexValid=True) is a separate, NOT-YET-IMPLEMENTED gap, excluded
+    // here so it keeps falling through to the existing fail-safe illegal trap.
+    val s0bfMemindOk = (s0bfEa.klass === EaClass.MEMINDIRECT) && !s0bfEa.indexValid
+    val slot0IsBfMemindMem = fed.valid && (spec0.op === DecOp.BITFIELD) && !spec0.microcoded &&
+                             s0bfRdOnly && s0bfMemindOk
     // A slot0 owned by the µcode engine: an OperationDecoder-microcoded op OR a full-format
     // mem-indirect host OR a dynamic read-only bit-field (all enter the engine, off the fast head).
-    val slot0OwnedByUc = slot0IsMicrocoded || slot0IsMemInd || slot0IsBfDynMem
+    val slot0OwnedByUc = slot0IsMicrocoded || slot0IsMemInd || slot0IsBfDynMem || slot0IsBfMemindMem
     // µcode engine state (declared early — referenced by normalHeadValid below). The
     // sequencer logic + transitions live in the µcode SEQUENCER region further down.
     val ucActive    = RegInit(False)
@@ -733,8 +763,16 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // mirroring the 3a MicroOpAssembler `bfm` block. The bf-ext word is words(1); the EA's
     // OWN ext words FOLLOW it (words(2..)) -> re-decode the EA from a SHIFTED vector.
     val ucBfExt    = ucEntryPkt.words(1)
-    val ucBfEaDec  = EaDecoder.decode(ucEntryPkt.words(0)(5 downto 0), Size.LONG,
-                                      Vec(ucEntryPkt.words(0), ucEntryPkt.words(2), ucEntryPkt.words(3)))
+    // task #197: widened from a 3-element vec (words(0),(2),(3)) to the FULL shifted range
+    // (dropping only words(1), the bf-ext descriptor) -- the 3-element form silently read 0
+    // for a full-format memory-indirect EA's od (and a bd-LONG's high word), since EaDecoder
+    // indexes candidate bd/od positions up to relative index 5 (fOdWordAt/wAt bound-check
+    // against the passed Vec's OWN length, not the real packet). Harmless widening for every
+    // non-memind bit-field EA (those never read past index 2 of this vec regardless).
+    val ucBfEaWords = Vec.tabulate(6) { i =>
+      if (i == 0) ucEntryPkt.words(0) else ucEntryPkt.words(i + 1)
+    }
+    val ucBfEaDec  = EaDecoder.decode(ucEntryPkt.words(0)(5 downto 0), Size.LONG, ucBfEaWords)
     val ucBfOffset5 = ucBfExt(10 downto 6).asUInt              // static offset 0..31
     val ucBfWidthRaw= ucBfExt(4 downto 0).asUInt               // raw width (0->32)
     val ucBfWidth   = (((ucBfWidthRaw - 1) & U(31, 5 bits)) + 1)   // 1..32
@@ -770,6 +808,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.eaIndexScale := ucBfEaDec.indexScale
     ucEntryCtx.eaDispLo     := ucBfDispLo
     ucEntryCtx.eaDispHi     := ucBfDispHi
+    // task #197: the POST-dereference byte address for a memory-indirect bit-field EA (the
+    // MI_BF_* entries' loads/stores anchor on the resolved-pointer TEMP, not SEaBase, so
+    // they need this separate from eaDispLo/Hi above, which stay reserved for the POINTER's
+    // own bd via the UMiPtrLoad rows). = od + byteOff (byteOff already forced 0 for Do=1 by
+    // ucBfByteOff's own Mux above, matching the register-direct DO1 convention). Harmless
+    // (unread) for every non-memind bit-field customer.
+    ucEntryCtx.bfMiDispLo   := (ucBfEaDec.od.asUInt + ucBfByteOff).asBits
+    ucEntryCtx.bfMiDispHi   := (ucBfEaDec.od.asUInt + ucBfByteOff + U(4, 32 bits)).asBits
     ucEntryCtx.bfOp         := ucEntryPkt.words(0)(10 downto 8)
     ucEntryCtx.bfDn2        := ucBfDn2
     ucEntryCtx.bfImm        := ucBfImm
@@ -1320,14 +1366,51 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
                     U(Microcode.BF_DYN_INS_DO0_ENTRY, ew bits)),
         Mux(ucBfDo, U(Microcode.BF_DYN_RMW_DO1_ENTRY, ew bits),
                     U(Microcode.BF_DYN_RMW_DO0_ENTRY, ew bits))))
-    val ucRealEntry = Mux(ucIsMemInd, ucMiEntry,
+    // ── Bit-field MEMORY-INDIRECT routing (task #197) ──────────────────────────────
+    // Reuses the SAME EXISTING generic MI pointer-resolve pattern (UMiPtrLoad) already
+    // built for the §5 host-op crack, chained into the SAME bit-field funnel/RES/LO5/HI5
+    // compute the register-direct BF_DYN_* family already uses — see Microcode.scala's
+    // MI_BF_* family header comment for the full design + temp-budget rationale.
+    //
+    // This OVERRIDES both the read-only (ucIsBfDynRd, which never checks EA klass at all —
+    // it would otherwise treat a memind EA's `bd` as a complete byte address, same silent-
+    // wrong bug class) and the RMW (ucIsBfRmw/ucIsBfRmwDyn, SAME bug — `ucBfEaDec.disp` is
+    // `bd`, the PRE-dereference displacement, for a MEMINDIRECT EA) paths, so it MUST be
+    // checked with higher priority in the ucRealEntry Mux below (both conditions are proper
+    // SUBSETS of ucIsBfDynRd/ucIsBfRmw when ucBfIsMemind is true — an ordinary AND with the
+    // klass check, not an independent condition).
+    //
+    // No-index only (mirrors slot0IsBfMemindMem's own scope): a pre/post-indexed memind bit-
+    // field EA is a separate, NOT-YET-IMPLEMENTED gap and stays on its pre-existing fail-
+    // safe illegal-trap behavior (never routed to ANY of these entries).
+    //
+    // Dynamic-OFFSET (Do=1) RMW/INS is a REAL, characterized-not-fixed gap (the 3-temp
+    // engine budget can't hold {freshly-reloaded pointer, runtime byteDelta} AND the
+    // finished lo'/hi' simultaneously for the store-side EA recompute — see the ROM family
+    // header comment) — routed to the existing BF_DYN_ILLEGAL_ENTRY (a clean vector-4 trap)
+    // rather than either silently miscomputing or blocking this task's DO0 fixes.
+    val ucBfIsMemind = (ucBfEaDec.klass === EaClass.MEMINDIRECT) && !ucBfEaDec.indexValid
+    val ucIsBfMemindRd  = !ucEntrySpec.microcoded && (ucEntrySpec.op === DecOp.BITFIELD) &&
+                          ucBfEntRdOnly && ucBfIsMemind
+    val ucIsBfMemindRmw = ucIsBfRmw && ucBfIsMemind
+    val ucBfMemindRdEntry = Mux(ucBfDo,
+      Mux(ucBfEntOp === 5, U(Microcode.BF_DYN_ILLEGAL_ENTRY, ew bits),   // FFO+dyn-offset memind: NOT implemented
+                           U(Microcode.MI_BF_RD_DO1_ENTRY,  ew bits)),
+      U(Microcode.MI_BF_RD_DO0_ENTRY, ew bits))
+    val ucBfMemindRmwEntry = Mux(ucBfDo,
+      U(Microcode.BF_DYN_ILLEGAL_ENTRY, ew bits),                       // dyn-offset RMW/INS: 3-temp budget wall
+      Mux(ucBfRmwOp === 7, U(Microcode.MI_BF_INS_DO0_ENTRY, ew bits),
+                           U(Microcode.MI_BF_RMW_DO0_ENTRY, ew bits)))
+    val ucRealEntry = Mux(ucIsBfMemindRmw, ucBfMemindRmwEntry,
+      Mux(ucIsBfMemindRd, ucBfMemindRdEntry,
+      Mux(ucIsMemInd, ucMiEntry,
       Mux(ucIsBfDynRd, ucBfDynRdEntry,
       Mux(ucIsBfRmwDyn, ucBfRmwDynEntry,
       Mux(ucIsBfRmw,
         Mux(ucBfNeedHi, U(Microcode.BF_RMW_5B_ENTRY, ew bits),
                         U(Microcode.BF_RMW_4B_ENTRY, ew bits)),
       Mux(ucIsMoves, ucMovesEntry,
-        ucEntrySpec.ucEntry)))))
+        ucEntrySpec.ucEntry)))))))
     ucRealEntry.simPublic()  // debug-only (task #144)
 
     // Resolve every ROM row against the LATCHED ctx, then index by ucPc -> this cycle's
@@ -1445,7 +1528,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         // The MOVEP FSM enters from it next cycle (mirrors the slot1 MOVEM pend).
         movepPendValid := True
         movepPendPkt   := fed.payload.packets(1)
-      } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly) {
+      } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
         // slot0 (normal) emitted this cycle; stash the slot1 MICROCODED packet, consume fed.
         // The engine enters from it next cycle (mirrors the slot1 MOVEM pend).
         ucPendValid := True
@@ -1487,7 +1570,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         } elsewhen(slot1IsMovepEarly) {
           movepPendValid := True
           movepPendPkt   := fed.payload.packets(1)
-        } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly) {
+        } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
           // A µCODE-OWNED slot1 (CAS/MOVES/BCD-mem/mem-indirect/bf-dyn) behind a slot0
           // MOVEM must stash the PACKET for the engine (ucPend), NOT the a1raw µops —
           // the assembler's placeholder crack of a microcoded opword is an ILLEGAL/
@@ -1561,7 +1644,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         } elsewhen(slot1IsMovepEarly) {
           movepPendValid := True
           movepPendPkt   := fed.payload.packets(1)
-        } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly) {
+        } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
           ucPendValid := True
           ucPendPkt   := fed.payload.packets(1)
         } otherwise {
@@ -1605,7 +1688,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         } elsewhen(slot1IsMovepEarly) {
           movepPendValid := True
           movepPendPkt   := fed.payload.packets(1)
-        } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly) {
+        } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
           ucPendValid := True
           ucPendPkt   := fed.payload.packets(1)
         } otherwise {

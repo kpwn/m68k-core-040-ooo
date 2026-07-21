@@ -82,6 +82,17 @@ object Microcode {
   case object SBfRdDst    extends Sel   // (bfDn2, bfOp in {1,3,5}) — read-only result reg (EXTU/EXTS/FFO write; TST none)
   case object SBfResImm   extends Sel   // selImm: the BFRESOLVE imm (Do/Dw/staticOff/staticWidth/memMode)
   case object SBfDeltaImm extends Sel   // selImm: byte-delta mode bit (imm[13]) — BFRESOLVE outputs offset>>>3
+  // ── Bit-field MEMORY-INDIRECT selectors (task #197) ────────────────────────────
+  // The pointer's OWN address (An + bd, no byteOff — the byteOff/width fold happens AFTER
+  // dereference) rides the EXISTING SEaBase/SEaDispLo pair (ctx.eaBase/eaDispLo are already
+  // populated from the bit-field's own EaDecoder output for EVERY bit-field op, memind or
+  // not — see DecodeStage's ucBf* population). Only the POST-dereference byte address needs
+  // NEW selectors: SBfMiDispLo/Hi = ctx.miOd + byteOff (Do=0 static fold) or ctx.miOd + 0
+  // (Do=1 — byteOff is forced 0 for the dynamic-offset case, matching ucBfByteOff's own
+  // existing Mux; the runtime byteDelta is added to the POINTER temp instead, mirroring the
+  // register-direct DO1 chain's Tb recompute).
+  case object SBfMiDispLo extends Sel   // selImm: ctx.miOd + byteOff (the post-deref byteAddr disp)
+  case object SBfMiDispHi extends Sel   // selImm: SBfMiDispLo + 4 (the spill byte)
 
   /** The op kind of a descriptor's template. */
   sealed trait UOp
@@ -701,8 +712,172 @@ object Microcode {
          sz = SzLong, miPtrIndex = true, isFirst = true),                                 // µPC127 (h0)
     Desc(UMove, useImm = true, imm = SMiImm, dst = ST1),                                  // µPC128 (h1)
     Desc(UMiHostMove, mem = MStore, srcA = ST0, srcB = ST1, useImm = true, imm = SMiOd,
-         sz = SzHost, miHostIndex = true, miMoveFlags = true, isLast = true)              // µPC129 (h2)
+         sz = SzHost, miHostIndex = true, miMoveFlags = true, isLast = true),             // µPC129 (h2)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Bit-field MEMORY-INDIRECT (68020+ full-format [bd,An],od / [bd,An,od]) — task #197.
+    // Reuses the EXISTING generic MI pointer-resolve pattern (UMiPtrLoad, identical to the
+    // §5 host-op crack above) to materialize the pointer into a temp, THEN chains into the
+    // SAME bit-field funnel/RES/LO5/HI5 compute already used by the register-direct BF_DYN_*
+    // family (slice 3c) — no parallel ROM family built from scratch. Every row anchors its
+    // load/store on the TEMP holding the resolved pointer (srcA=STn) instead of SEaBase (an
+    // architectural An), using the NEW SBfMiDispLo/Hi selectors (= ctx.miOd + byteOff, the
+    // POST-dereference byte address) instead of SEaDispLo/Hi (which stay reserved for the
+    // POINTER's own bd, used only by the UMiPtrLoad rows). No-index only (od present, Xn
+    // absent — [bd,An],od / [bd,An],od with I/IS=100); pre/post-indexed memind bit-fields
+    // are a separate, NOT-YET-IMPLEMENTED gap (see the isa docs / task #197 report).
+    //
+    // TEMP BUDGET (why RMW/INS is DO0-only): the engine has exactly 3 temps (T0/T1/T2). A
+    // no-index memind RMW/INS needs the pointer ALIVE at both the initial loads AND (after
+    // the RES/splice compute consumes lo/hi/packed, all 3 temps) AGAIN for the final
+    // store(s) — since dereferencing needs its own LOAD, the established, already-proven
+    // fix is "EA-recompute" (re-run the SAME 1-µop pointer load a second time; see MI_BF_
+    // RMW_DO0/INS_DO0 below) rather than trying to hold it live throughout. That recompute
+    // itself needs ONLY 1 temp for a STATIC offset (Do=0 — byteOff folds into the disp at
+    // decode time, cost-free). For a DYNAMIC offset (Do=1) the recompute ALSO needs a live
+    // byteDelta (Dn[off]>>>3) added to the freshly-reloaded pointer — a 4th concurrently-
+    // live value (freshly-reloaded ptr + byteDelta, both temps, needed simultaneously for
+    // the ADD, while the other 2 temps already hold the finished lo'/hi' awaiting their
+    // store) that does NOT fit in the 3-temp budget. Read-only memind has NO such problem
+    // (no store phase, so no EA-recompute is ever needed) — MI_BF_RD_DO1 below covers BOTH
+    // static AND dynamic offset. RMW/INS with Do=1 (dynamic offset) is therefore A REAL,
+    // characterized-not-fixed gap: routed to the existing BF_DYN_ILLEGAL_ENTRY (a clean
+    // vector-4 trap, not a silent miscompute) rather than risking a 4th temp / rename-pool
+    // change under this task's scope.
+
+    // MI_BF_RD_DO0 @130 — read-only (BFTST/BFEXTU/BFEXTS/BFFFO), STATIC offset (Do=0; width
+    // may be dynamic). byteOff folds into ctx.bfMiDispLo/Hi (computed at ucBegin exactly
+    // like the register-direct ucBfDispLo/Hi fold, just based on ctx.miOd instead of the
+    // EA's own disp). Mirrors BF_DYN_RD_DO0's shape with a 1-µop pointer-resolve prefix.
+    //   i0 LOAD.L ptr = (An+bd) -> T2                                          (isFirst)
+    //   i1 LOAD.L  [ptr+byteAddr]   -> T0 (lo)
+    //   i2 LOAD.B  [ptr+byteAddr+4] -> T1 (hi)
+    //   i3 BFRESOLVE {off,wid} -> T2 (packed; ptr dead, reused)
+    //   i4 BITFIELD bfMem funnel -> Dn2/none (+NZ)                             (isLast)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST2, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                                 // µPC130 (i0)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST0, useImm = true, imm = SBfMiDispLo,
+         sz = SzLong),                                                                    // µPC131 (i1)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST1, useImm = true, imm = SBfMiDispHi,
+         sz = SzByte),                                                                    // µPC132 (i2)
+    Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
+         imm = SBfResImm, sz = SzLong),                                                   // µPC133 (i3)
+    Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = SBfRdDst, sz = SzLong,
+         bfDyn = true, bfWritesNz = true, isLast = true),                                 // µPC134 (i4)
+
+    // MI_BF_RD_DO1 @135 — read-only, DYNAMIC offset (Do=1; covers BFTST/BFEXTU/BFEXTS —
+    // BFFFO's dynamic-offset memind form is a narrower NOT-YET-IMPLEMENTED sub-gap, routed
+    // to BF_DYN_ILLEGAL_ENTRY by DecodeStage, mirroring the register-direct FFO_DO1 split).
+    // No store phase -> no EA-recompute needed (see the family header comment above) — the
+    // pointer temp (T2) stays live as "Tb" (ptr + runtime byteDelta) straight through both
+    // loads, exactly like the register-direct DO1 chain's Tb.
+    //   j0 LOAD.L ptr = (An+bd) -> T2                                          (isFirst)
+    //   j1 BFRESOLVE byteDelta = Dn[off]>>>3 -> T0
+    //   j2 ADD Tb = ptr + byteDelta -> T2
+    //   j3 LOAD.L  [Tb+od]   -> T0 (lo)
+    //   j4 LOAD.B  [Tb+od+4] -> T1 (hi; Tb dead after this, no store phase)
+    //   j5 BFRESOLVE {off,wid} -> T2 (packed)
+    //   j6 BITFIELD bfMem funnel -> Dn2/none (+NZ)                             (isLast)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST2, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                                 // µPC135 (j0)
+    Desc(UBfResolve, srcA = SBfOffReg, dst = ST0, useImm = true, imm = SBfDeltaImm,
+         sz = SzLong),                                                                    // µPC136 (j1)
+    Desc(UBfAdd, srcA = ST2, srcB = ST0, dst = ST2, sz = SzLong),                          // µPC137 (j2, Tb)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST0, useImm = true, imm = SBfMiDispLo,
+         sz = SzLong),                                                                    // µPC138 (j3)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST1, useImm = true, imm = SBfMiDispHi,
+         sz = SzByte),                                                                    // µPC139 (j4)
+    Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
+         imm = SBfResImm, sz = SzLong),                                                   // µPC140 (j5)
+    Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = SBfRdDst, sz = SzLong,
+         bfDyn = true, bfWritesNz = true, isLast = true),                                 // µPC141 (j6)
+
+    // MI_BF_RMW_DO0 @142 — BFCHG/BFCLR/BFSET, STATIC offset (Do=0; width may be dynamic).
+    // Mirrors BF_DYN_RMW_DO0's RES/LO5/HI5 shape, EA-recomputed (a 2nd 1-µop pointer LOAD)
+    // before the store pair (see the family header comment for why).
+    //   k0 LOAD.L ptr = (An+bd) -> T2                                          (isFirst)
+    //   k1 LOAD.L  [ptr+byteAddr]   -> T0 (lo)
+    //   k2 LOAD.B  [ptr+byteAddr+4] -> T1 (hi; ptr dead)
+    //   k3 BFRESOLVE {off,wid} -> T2 (packed)
+    //   k4 BITFIELD bfMem RES  srcA=T0,srcB=T1,srcC=T2 -> T2 (res; +NZ from orig field)
+    //   k5 BITFIELD bfMem LO5  srcA=T0,srcB=T2,imm=static bitOff -> T0 (lo')
+    //   k6 BITFIELD bfMem HI5  srcA=T1,srcB=T2,imm=static bitOff -> T1 (hi'; res dead)
+    //   k7 LOAD.L ptr (RECOMPUTE) = (An+bd) -> T2
+    //   k8 STORE.L T0(lo') -> [ptr+byteAddr]
+    //   k9 STORE.B T1(hi') -> [ptr+byteAddr+4]                                 (isLast)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST2, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                                 // µPC142 (k0)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST0, useImm = true, imm = SBfMiDispLo,
+         sz = SzLong),                                                                    // µPC143 (k1)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST1, useImm = true, imm = SBfMiDispHi,
+         sz = SzByte),                                                                    // µPC144 (k2)
+    Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
+         imm = SBfResImm, sz = SzLong),                                                   // µPC145 (k3)
+    Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = ST2, sz = SzLong,
+         bfDyn = true, bfWritesNz = true),                                                // µPC146 (k4)
+    Desc(UBfMem, srcA = ST0, srcB = ST2, dst = ST0, useImm = true, imm = SBfImm,
+         sz = SzLong, bfStoreForm = 2),                                                   // µPC147 (k5)
+    Desc(UBfMem, srcA = ST1, srcB = ST2, dst = ST1, useImm = true, imm = SBfImm,
+         sz = SzLong, bfStoreForm = 3),                                                   // µPC148 (k6)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST2, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true),                                                 // µPC149 (k7, recompute)
+    Desc(UMove, mem = MStore, srcA = ST2, srcB = ST0, useImm = true, imm = SBfMiDispLo,
+         sz = SzLong),                                                                    // µPC150 (k8)
+    Desc(UMove, mem = MStore, srcA = ST2, srcB = ST1, useImm = true, imm = SBfMiDispHi,
+         sz = SzByte, isLast = true),                                                     // µPC151 (k9)
+
+    // MI_BF_INS_DO0 @152 — BFINS, STATIC offset (Do=0; width may be dynamic). Mirrors
+    // BF_DYN_INS_DO0's prefunnel/register-BFINS/reload+inverse-funnel shape, EA-recomputed
+    // TWICE (once to re-derive the load address for the lo/hi RELOAD, once more for the
+    // final store pair) — each recompute is a single 1-µop pointer LOAD, always ≤3 temps
+    // concurrently live (verified per-row in the family header comment's budget analysis).
+    //   l0 LOAD.L ptr = (An+bd) -> T2                                          (isFirst)
+    //   l1 LOAD.L  [ptr+byteAddr]   -> T0 (lo)
+    //   l2 LOAD.B  [ptr+byteAddr+4] -> T1 (hi)
+    //   l3 BFRESOLVE {off,wid} -> T2 (packed)
+    //   l4 BITFIELD bfMem prefunnel (bfTstForm) srcA=T0,srcB=T1,srcC=T2 -> T0 (field32)
+    //   l5 BITFIELD bfReg register-BFINS srcA=T0,srcB=Dn2,srcC=T2 -> T2 (newField32; +N/Z)
+    //   l6 LOAD.L ptr (RECOMPUTE) = (An+bd) -> T0
+    //   l7 LOAD.L  [ptr+byteAddr]   -> T1 (lo reload; ptr(T0) still needed)
+    //   l8 BITFIELD bfMem LO5 srcA=T1,srcB=T2,imm=static bitOff -> T1 (lo')
+    //   l9 LOAD.B  [ptr+byteAddr+4] -> T0 (hi reload; overwrites dead ptr; T1=lo' preserved)
+    //   l10 BITFIELD bfMem HI5 srcA=T0,srcB=T2,imm=static bitOff -> T0 (hi'; newField32 dead)
+    //   l11 LOAD.L ptr (RECOMPUTE #2) = (An+bd) -> T2
+    //   l12 STORE.L T1(lo') -> [ptr+byteAddr]
+    //   l13 STORE.B T0(hi') -> [ptr+byteAddr+4]                                (isLast)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST2, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                                 // µPC152 (l0)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST0, useImm = true, imm = SBfMiDispLo,
+         sz = SzLong),                                                                    // µPC153 (l1)
+    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST1, useImm = true, imm = SBfMiDispHi,
+         sz = SzByte),                                                                    // µPC154 (l2)
+    Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
+         imm = SBfResImm, sz = SzLong),                                                   // µPC155 (l3)
+    Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = ST0, sz = SzLong,
+         bfDyn = true, bfTstForm = true),                                                 // µPC156 (l4)
+    Desc(UBfReg, srcA = ST0, srcB = SBfDn2, srcC = ST2, dst = ST2, sz = SzLong,
+         bfDyn = true, bfWritesNz = true),                                                // µPC157 (l5)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true),                                                 // µPC158 (l6, recompute)
+    Desc(UMove, mem = MLoad, srcA = ST0, dst = ST1, useImm = true, imm = SBfMiDispLo,
+         sz = SzLong),                                                                    // µPC159 (l7)
+    Desc(UBfMem, srcA = ST1, srcB = ST2, dst = ST1, useImm = true, imm = SBfImm,
+         sz = SzLong, bfStoreForm = 2),                                                   // µPC160 (l8)
+    Desc(UMove, mem = MLoad, srcA = ST0, dst = ST0, useImm = true, imm = SBfMiDispHi,
+         sz = SzByte),                                                                    // µPC161 (l9)
+    Desc(UBfMem, srcA = ST0, srcB = ST2, dst = ST0, useImm = true, imm = SBfImm,
+         sz = SzLong, bfStoreForm = 3),                                                   // µPC162 (l10)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST2, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true),                                                 // µPC163 (l11, recompute #2)
+    Desc(UMove, mem = MStore, srcA = ST2, srcB = ST1, useImm = true, imm = SBfMiDispLo,
+         sz = SzLong),                                                                    // µPC164 (l12)
+    Desc(UMove, mem = MStore, srcA = ST2, srcB = ST0, useImm = true, imm = SBfMiDispHi,
+         sz = SzByte, isLast = true)                                                      // µPC165 (l13)
   )
+  val MI_BF_RD_DO0_ENTRY  = 130
+  val MI_BF_RD_DO1_ENTRY  = 135
+  val MI_BF_RMW_DO0_ENTRY = 142
+  val MI_BF_INS_DO0_ENTRY = 152
   val BF_DYN_RD_DO0_ENTRY  = 49
   val BF_DYN_RD_DO1_ENTRY  = 53
   val BF_DYN_FFO_DO1_ENTRY = 59
@@ -763,6 +938,11 @@ object Microcode {
     val bfDo         = Bool()            // ext[11] (offset is dynamic)
     val bfDw         = Bool()            // ext[5]  (width  is dynamic)
     val bfResImm     = Bits(32 bits)     // BFRESOLVE imm: [4:0]=staticOff,[9:5]=staticWidth,[10]=Do,[11]=Dw,[12]=memMode(1)
+    // ── Bit-field MEMORY-INDIRECT post-dereference byte address (task #197) ─────────────
+    // = ctx.miOd + byteOff (0 for Do=1). Only meaningful for the MI_BF_* entries; harmless
+    // (unread) for every other bit-field/microcode customer.
+    val bfMiDispLo   = Bits(32 bits)
+    val bfMiDispHi   = Bits(32 bits)
     // ── full-format MEMORY-INDIRECT host-op group (the §5 host-op-to-temp crack) ──────
     // The pointer-load address = eaBase + eaDispLo(=bd) + (pre: eaIndex). Post-index keeps
     // the index for the HOST access. After [LOAD.L ptr -> T0], the host op re-runs as a
@@ -898,6 +1078,8 @@ object Microcode {
     case SMovesDelta => ctx.movesDelta                  // signed An write-back delta
     case SBfResImm   => ctx.bfResImm                    // BFRESOLVE imm (slice 3c)
     case SBfDeltaImm => B(1, 32 bits) |<< 13            // imm[13]=1 -> BFRESOLVE byte-delta mode
+    case SBfMiDispLo => ctx.bfMiDispLo                  // task #197: mem-indirect post-deref byteAddr disp
+    case SBfMiDispHi => ctx.bfMiDispHi
     case _           => B(0, 32 bits)
   }
 
