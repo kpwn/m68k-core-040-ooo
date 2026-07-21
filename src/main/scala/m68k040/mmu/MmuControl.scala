@@ -22,24 +22,35 @@ import spinal.lib.misc.plugin.FiberPlugin
   *    whenever the write Flow's `valid` is False (the default).
   *
   * Task #131 ATTEMPTED commit-time MOVEC write ports for mmuEnable/urp/srp and
-  * REVERTED them after what was diagnosed (at the time) as a sim-poke-persistence
-  * regression. Task #194 (2026-07-21) revisited this: the actual regression was
-  * NEVER root-caused in a minimal repro — the follow-up note in [[mmu-movec-urp-srp]]
-  * explicitly says the only repro attempt exercised `top/FullCoreSynth.scala`'s
-  * registered-input override (`mmuEnableIn`/`urpIn`/`srpIn`, driving `mmuCtrl.mmuEnable`
-  * UNCONDITIONALLY from a top-level port), which is a genuine two-driver conflict
-  * with an internal conditional writer — NOT the sim-poke mystery it was chasing.
-  * The actual test harnesses (`ExecuteLockStepSpec`'s `FullCoreDut`, `PortedTestRunner`'s
-  * `FuzzCoreDut`) never had that override — they poke `dut.ctrl.logic.mmuEnable`
-  * directly with no competing driver, exactly like every other simPublic committed
-  * register in this codebase (`ss.cacr`/`ss.itt0`/etc, which all coexist fine with a
-  * conditional MOVEC writer). Task #194 re-added the write mechanism using the
-  * IDENTICAL pattern already proven safe for those registers, and REMOVED
-  * `FullCoreSynth.scala`'s registered-input override (no longer needed or safe now
-  * that MOVEC gives mmuEnable/urp/srp a real, primary-IO-reachable driver through
-  * decode/rename/dispatch/commit — see that file's history). Full lock-step +
-  * ported-corpus regression re-verified clean after the change (see task #194's
-  * commit messages / report). */
+  * REVERTED them after what was diagnosed (at the time) as a single, unexplained
+  * sim-poke-persistence regression. Task #194 (2026-07-21) revisited this and found
+  * it was actually TWO SEPARATE real issues, not one mystery — reconciling them here
+  * since the original single-cause diagnosis (and this project's git history) doesn't
+  * describe either precisely:
+  *
+  *  1. `top/FullCoreSynth.scala` had a registered-input override (`mmuEnableIn`/
+  *     `urpIn`/`srpIn`, driving `mmuCtrl.mmuEnable` UNCONDITIONALLY from a top-level
+  *     port) — a genuine two-driver conflict with an internal conditional writer.
+  *     This ONLY affected that one synth-target DUT, not the test harnesses. Task
+  *     #194 removed it (no longer needed or safe now that MOVEC gives mmuEnable/urp/
+  *     srp a real, primary-IO-reachable driver through decode/rename/dispatch/commit).
+  *
+  *  2. SEPARATELY, the actual test harnesses (`ExecuteLockStepSpec`'s `FullCoreDut`,
+  *     `PortedTestRunner`'s `FuzzCoreDut`) poke `dut.ctrl.logic.mmuEnable`/`urp`/`srp`
+  *     directly with no competing driver — the SAME pattern already proven safe for
+  *     every other simPublic committed register in this codebase (`ss.cacr`/
+  *     `ss.itt0`/etc). But several `ExecuteLockStepSpec` tests were poking THESE
+  *     specific registers very early, DURING the DUT's ~82-cycle reset/init-sweep
+  *     window — harmless while the register was permanently RAZ/WI (nothing to
+  *     reset-clobber), but once a real conditional writer exists, an early poke is
+  *     just an ordinary register write that reset then overwrites, same as poking
+  *     any other Reg too early. Task #194 fixed this by moving those pokes past the
+  *     init-sweep wait — the SAME timing precedent already used for `ss.isp`/`msp`/
+  *     `usp` in every other passing lock-step test.
+  *
+  * Both fixes were independently verified via `ExecuteLockStepSpec`'s own full
+  * 394-test suite (byte-identical fail-list before/after, git-stash A/B) and the
+  * full 763-test ported corpus (see task #194's commit messages / report). */
 class MmuControlPlugin extends FiberPlugin with MmuControlService {
   var _mmuEnable: Bool = null
   var _urp:       UInt = null
