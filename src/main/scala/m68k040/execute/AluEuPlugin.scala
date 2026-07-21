@@ -273,8 +273,19 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // Both transcribed verbatim from Musashi m68k_op_pack_16_rr / m68k_op_unpk_16_rr.
     val isPack = u1.op === DecOp.PACK
     val isUnpk = u1.op === DecOp.UNPK
+    // ── PACK MEMORY-form (task #198): u1.extByte is repurposed as the mode marker (see
+    // Microcode.scala resolve()'s doc comment) — True ONLY for the microcode-ROM PACK
+    // compute row (PACK_MEM_ENTRY); the register form (a single-µop MicroOpAssembler fast
+    // crack, never routed through that ROM) always leaves extByte at its ordinary False
+    // default. When set, combine the two predec-loaded byte temps — srcA=T0 (the FIRST
+    // read, Musashi's un-shifted `src=read8`) and s1RdB=T1 (the SECOND read, Musashi's
+    // `src|=read8<<8`) — into the SAME 16-bit "src" the register form reads directly from
+    // a single Dy, bit-identical to Musashi's own mem-form src assembly.
+    val packMemForm = isPack && u1.extByte
     // PACK: src = (Dy + adj) & 0xffff (Dy from s1RdB, adj from s1Src2)
-    val packDy      = s1RdB.asUInt                                          // Dy (32-bit)
+    val packDy      = Mux(packMemForm,
+                          ((s1RdB(7 downto 0) ## s1Src1(7 downto 0)).asUInt).resize(32),
+                          s1RdB.asUInt)                                      // Dy (32-bit)
     val packAdj     = s1Src2.asUInt                                         // adj16 (sign-extended 32-bit)
     val packSrc32   = (packDy + packAdj) & U(0xFFFF, 32 bits)              // (Dy+adj) & 0xffff
     val packNibHi   = (packSrc32 >> 4)(7 downto 0) & U(0xF0, 8 bits)      // (src>>4) & 0xF0, 8-bit masked

@@ -756,6 +756,11 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.size         := ucEntrySpec.size
     ucEntryCtx.sizeBytesLog := ucEntrySpec.size.mux(
       Size.BYTE -> U(0, 2 bits), Size.WORD -> U(1, 2 bits), default -> U(2, 2 bits))
+    // PACK/UNPK memory-form adj16 (task #198): the ext word right after the opword
+    // (ucEntryPkt.words(1)), sign-extended — mirrors the register form's own imm
+    // routing (MicroOpAssembler's packUnpkReg block) exactly. Harmlessly latched for
+    // every other microcode customer too (unread unless ctx.op is PACK/UNPK).
+    ucEntryCtx.packAdj      := ucEntryPkt.words(1).asSInt.resize(32).asBits
 
     // ── v2 bit-field RMW Ctx population (slice 3b) ────────────────────────────────
     // The bit-field RMW ops route through the engine. OperationDecoder is ext-word-free,

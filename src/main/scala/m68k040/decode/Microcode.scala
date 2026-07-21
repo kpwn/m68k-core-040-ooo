@@ -93,12 +93,15 @@ object Microcode {
   // register-direct DO1 chain's Tb recompute).
   case object SBfMiDispLo extends Sel   // selImm: ctx.miOd + byteOff (the post-deref byteAddr disp)
   case object SBfMiDispHi extends Sel   // selImm: SBfMiDispLo + 4 (the spill byte)
+  // ── PACK/UNPK MEMORY-form selectors (task #198) ─────────────────────────────
+  case object SPackAdj extends Sel   // selImm: ctx.packAdj (the adj16 ext word, sign-extended)
+  case object SShift8  extends Sel   // selImm: the constant 8 (UNPK's high-byte LSR count)
 
   /** The op kind of a descriptor's template. */
   sealed trait UOp
   case object UMove      extends UOp    // plain move / load / store data move (DecOp.MOVE)
   case object UAddDrop   extends UOp    // ADD.L dst:=srcA+imm, divIsRem (dropped An write-back)
-  case object UOpFromCtx extends UOp    // the latched op (BCD/ADDX/SUBX), flags from ctx
+  case object UOpFromCtx extends UOp    // the latched op (BCD/ADDX/SUBX/PACK/UNPK), flags from ctx
   case object UBfMem     extends UOp    // BITFIELD bfMem compute (RES/LO/HI funnel form); op=BITFIELD
   // ── Bit-field DYNAMIC memory kinds (slice 3c) ───────────────────────────────
   case object UBfResolve extends UOp    // BFRESOLVE (mem layout): packed {origOff/needHi/bitOff/rawWidth} -> temp
@@ -109,6 +112,12 @@ object Microcode {
   case object UMiPtrLoad extends UOp    // LOAD.L pointer (eaBase + eaDispLo (+ pre-index)) -> T0
   case object UMiHostMove extends UOp   // host MOVE load/store at (T0 + od (+post-index)); op=MOVE
   case object UMiHostOp  extends UOp     // host ALU/unary compute (ctx.miOp): srcA,srcB -> dst + flags
+  // ── PACK/UNPK MEMORY-form kind (task #198) ──────────────────────────────────
+  case object UShiftR8   extends UOp    // SHIFT.L T,#8 (LSR, right, real barrel shifter) -> dst; NO
+                                         // flags — UNPK's high-result-byte extraction (moves the
+                                         // unpacked value's [15:8] down into the new dst's [7:0] so
+                                         // a plain BYTE store picks it up, mirroring the LOW result
+                                         // byte's plain truncating BYTE store of the un-shifted value).
   // ── CAS / CAS2 compute kind. The Desc carries the casForm + the flag mask; the op is
   //    DecOp.CASOP and the ALU EU runs the compare/merge/select datapath. ──────────────
   case class UCasOp(form: Int, writesNzvc: Boolean = false, readsNzvc: Boolean = false,
@@ -153,6 +162,7 @@ object Microcode {
   sealed trait Sz
   case object SzCtx  extends Sz   // = ctx.size (BCD chain)
   case object SzLong extends Sz
+  case object SzWord extends Sz   // UNPK's compute row (result occupies the low 16 bits)
   case object SzByte extends Sz
   case object SzHost extends Sz   // = ctx.miHostSize (the full-format mem-indirect host access)
 
@@ -872,7 +882,68 @@ object Microcode {
     Desc(UMove, mem = MStore, srcA = ST2, srcB = ST1, useImm = true, imm = SBfMiDispLo,
          sz = SzLong),                                                                    // µPC164 (l12)
     Desc(UMove, mem = MStore, srcA = ST2, srcB = ST0, useImm = true, imm = SBfMiDispHi,
-         sz = SzByte, isLast = true)                                                      // µPC165 (l13)
+         sz = SzByte, isLast = true),                                                     // µPC165 (l13)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // PACK -(Ay),-(Ax),#adj @166 (task #198). Musashi (m68k_in.c m68k_op_pack_16_mm):
+    //   REG_A[srcreg]--; src  = read8(Ay)          (FIRST read -> LOW byte of src)
+    //   REG_A[srcreg]--; src |= read8(Ay)<<8        (SECOND read -> HIGH byte of src)
+    //   src += adj (16-bit, wraps mod 0x10000)
+    //   REG_A[dstreg]--; write8(Ax, ((src>>4)&0xF0)|(src&0x0F))
+    // Same dual-predec-LOAD-from-Ay shape as BCD_MEM_ENTRY's Ay/Ax pair, but BOTH loads
+    // come from the SAME register (Ay), and the compute REUSES the existing register-
+    // form PACK datapath (AluEuPlugin's isPack cone) via UOpFromCtx (ctx.op=PACK) — the
+    // ALU is told this is the MEMORY form (combine two separate byte temps instead of
+    // reading a single 16-bit Dy) via `u.extByte`, set True by resolve() for exactly
+    // this row (see resolve()'s op-select block; register-form PACK never reaches this
+    // ROM at all — it's a single-µop fast crack in MicroOpAssembler — so ctx.op===PACK
+    // can ONLY mean "this UOpFromCtx row", no collision risk).
+    //   m0 LOAD.B (Ay) -> T0, auto=PREDEC(Ay)                                  (isFirst)
+    //   m1 ADD.L Ay - deltaAy -> Ay   (1st Ay predec write-back; dropped)
+    //   m2 LOAD.B (Ay) -> T1, auto=PREDEC(Ay)
+    //   m3 ADD.L Ay - deltaAy -> Ay   (2nd Ay predec write-back; dropped)
+    //   m4 PACK  srcA=T0(lo), srcB=T1(hi), imm=adj16 -> T2 (packed byte, low 8 bits)
+    //   m5 STORE.B T2 -> (Ax), auto=PREDEC(Ax), dst=Ax (self-write-back)      (isLast)
+    Desc(UMove, mem = MLoad, auto = APredecAy, srcA = SAy, dst = ST0, sz = SzByte,
+         isFirst = true),                                                                 // µPC166 (m0)
+    Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SNegDeltaAy),               // µPC167 (m1)
+    Desc(UMove, mem = MLoad, auto = APredecAy, srcA = SAy, dst = ST1, sz = SzByte),        // µPC168 (m2)
+    Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SNegDeltaAy),               // µPC169 (m3)
+    Desc(UOpFromCtx, srcA = ST0, srcB = ST1, dst = ST2, useImm = true, imm = SPackAdj,
+         sz = SzByte),                                                                    // µPC170 (m4)
+    Desc(UMove, mem = MStore, auto = APredecAx, srcA = SAx, srcB = ST2, dst = SAx,
+         sz = SzByte, isLast = true),                                                     // µPC171 (m5)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // UNPK -(Ay),-(Ax),#adj @172 (task #198). Musashi (m68k_in.c m68k_op_unpk_16_mm):
+    //   REG_A[srcreg]--; src = read8(Ay)
+    //   src = ((src<<4)&0x0F00) | (src&0x000F)       (expand BCD nibbles into a byte pair)
+    //   src += adj (16-bit, wraps mod 0x10000)
+    //   REG_A[dstreg]--; write8(Ax, src)              (LOW  byte -> (Ax-1), FIRST write)
+    //   REG_A[dstreg]--; write8(Ax, src>>8)            (HIGH byte -> (Ax-2), SECOND write)
+    // The compute REUSES the existing register-form UNPK datapath unchanged (AluEuPlugin's
+    // isUnpk cone already reads srcB via the raw rdB port as "Dy&0xffff" — memory-form's
+    // single loaded byte T0 (0..255) is already a valid subset of that same 16-bit domain,
+    // so NO mode flag / ALU change is needed for UNPK, unlike PACK). The result's HIGH byte
+    // (bits 15:8) needs a real LSR-by-8 (UShiftR8, the barrel shifter) before its own BYTE
+    // store, since a BYTE store always truncates to a register's LOW 8 bits.
+    //   n0 LOAD.B (Ay) -> T0, auto=PREDEC(Ay)                                  (isFirst)
+    //   n1 ADD.L Ay - deltaAy -> Ay   (Ay predec write-back; dropped)
+    //   n2 UNPK  srcA=T0(dummy merge src, unused), srcB=T0, imm=adj16 -> T1 (unpacked
+    //      16-bit result; T1[7:0]=LOW result byte, T1[15:8]=HIGH result byte)
+    //   n3 STORE.B T1 -> (Ax), auto=PREDEC(Ax), dst=Ax   (LOW byte, written FIRST)
+    //   n4 SHIFT.L T1 LSR #8 -> T2 (moves T1[15:8] down into T2[7:0])
+    //   n5 STORE.B T2 -> (Ax), auto=PREDEC(Ax), dst=Ax   (HIGH byte, written SECOND) (isLast)
+    Desc(UMove, mem = MLoad, auto = APredecAy, srcA = SAy, dst = ST0, sz = SzByte,
+         isFirst = true),                                                                 // µPC172 (n0)
+    Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SNegDeltaAy),               // µPC173 (n1)
+    Desc(UOpFromCtx, srcA = ST0, srcB = ST0, dst = ST1, useImm = true, imm = SPackAdj,
+         sz = SzWord),                                                                    // µPC174 (n2)
+    Desc(UMove, mem = MStore, auto = APredecAx, srcA = SAx, srcB = ST1, dst = SAx,
+         sz = SzByte),                                                                    // µPC175 (n3)
+    Desc(UShiftR8, srcA = ST1, dst = ST2, useImm = true, imm = SShift8, sz = SzLong),      // µPC176 (n4)
+    Desc(UMove, mem = MStore, auto = APredecAx, srcA = SAx, srcB = ST2, dst = SAx,
+         sz = SzByte, isLast = true)                                                      // µPC177 (n5)
   )
   val MI_BF_RD_DO0_ENTRY  = 130
   val MI_BF_RD_DO1_ENTRY  = 135
@@ -902,6 +973,8 @@ object Microcode {
   val MI_MOVE_EAEA_REV_ENTRY = 123 // rows 123..125 (ptr-load, host-load plain EA->T1, host-store T1->(ptr+od))
   val MI_MOVE_BOTH_MI_ILLEGAL_ENTRY = 126 // row 126 (both src+dst mem-indirect — scoped out, traps illegal)
   val MI_MOVE_DST_IMM_ENTRY = 127 // rows 127..129 (ptr-load, materialize #imm->T1, host-store T1->mem)
+  val PACK_MEM_ENTRY = 166 // rows 166..171 (load Ay/predec x2, PACK compute, store Ax/predec)
+  val UNPK_MEM_ENTRY = 172 // rows 172..177 (load Ay/predec, UNPK compute, store lo, shift, store hi)
   def romSize: Int = rom.size
 
   /** Latched-instruction CONTEXT the engine resolves selectors against. v1 fields
@@ -1010,6 +1083,11 @@ object Microcode {
     // was just never threaded into Ctx). NONE for every other mem-indirect customer.
     val miOtherEaAutoMode  = EaAuto()
     val miOtherEaAutoDelta = UInt(3 bits)
+    // ── PACK/UNPK MEMORY-form group (task #198) ─────────────────────────────────────────
+    // adj16 (the ext word right after the opword), sign-extended — mirrors the register
+    // form's own imm routing (MicroOpAssembler's packUnpkReg block) exactly. Ay/Ax reuse
+    // the shared SAy/SAx selectors (ctx.opword bits 2:0 / 11:9), same as the BCD chain.
+    val packAdj = Bits(32 bits)
   }
 
   // ── selector → (regId, valid) ──────────────────────────────────────────────
@@ -1080,6 +1158,8 @@ object Microcode {
     case SBfDeltaImm => B(1, 32 bits) |<< 13            // imm[13]=1 -> BFRESOLVE byte-delta mode
     case SBfMiDispLo => ctx.bfMiDispLo                  // task #197: mem-indirect post-deref byteAddr disp
     case SBfMiDispHi => ctx.bfMiDispHi
+    case SPackAdj    => ctx.packAdj                     // task #198: PACK/UNPK mem-form adj16
+    case SShift8     => U(8, 32 bits).asBits             // task #198: UNPK's high-byte LSR count
     case _           => B(0, 32 bits)
   }
 
@@ -1119,6 +1199,7 @@ object Microcode {
       case UBfReg      => u.op := DecOp.BITFIELD
       case UBfResolve  => u.op := DecOp.BFRESOLVE
       case UBfShiftOff => u.op := DecOp.SHIFT
+      case UShiftR8    => u.op := DecOp.SHIFT   // task #198: UNPK's high-byte LSR #8
       case UBfAdd      => u.op := DecOp.ADD
       case UMiPtrLoad  => u.op := DecOp.MOVE
       case UMiHostMove => u.op := DecOp.MOVE
@@ -1145,6 +1226,7 @@ object Microcode {
       case UAddDrop => u.size := Size.LONG
       case _        => d.sz match {
         case SzLong => u.size := Size.LONG
+        case SzWord => u.size := Size.WORD
         case SzByte => u.size := Size.BYTE
         case SzCtx  => u.size := ctx.size
         case SzHost => u.size := ctx.miHostSize
@@ -1265,7 +1347,11 @@ object Microcode {
       case AEaMiOtherStore => u.eaAuto := ctx.miOtherEaAutoMode; u.eaDelta := ctx.miOtherEaAutoDelta
     }
     u.ccrRestore := False; u.toCcr := False
-    u.shiftOp := 0; u.shiftDir := False
+    // shiftOp: 0 for every row EXCEPT UShiftR8 (task #198, UNPK's high-byte LSR #8),
+    // which needs the real barrel shifter's LSL/LSR family (tt=01) selected — see
+    // AluEuPlugin's shiftCmd wiring (u1.shiftOp/u1.shiftDir), the SAME mechanism the
+    // standalone movepShiftUop helper already uses for an analogous byte-extract shift.
+    u.shiftOp := (if (d.uop == UShiftR8) B"01" else B"00"); u.shiftDir := False
     u.bcdSub := ctx.bcdSub
     // Bit-field RMW compute (UBfMem): op=BITFIELD + bfMem (so the ALU EU funnel datapath
     // runs) + bfOp (CHG/CLR/SET/INS) from the latched ctx.op + the store-form selector. The
@@ -1281,7 +1367,16 @@ object Microcode {
     // BTST arm ("no change") regardless of the real op -- silently turning every
     // mem-indirect BCHG/BCLR/BSET into a no-op store (task #152).
     u.bitOp := Mux(ctx.miOp === DecOp.BITOP, ctx.miBitOp, B(0, 2 bits))
-    u.bfDynamic := Bool(d.bfDyn); u.extByte := False
+    u.bfDynamic := Bool(d.bfDyn)
+    // extByte is repurposed here (task #198) as the PACK MEMORY-FORM marker: True only for
+    // this ROM's UOpFromCtx/PACK compute row, telling AluEuPlugin's isPack cone to combine
+    // srcA/srcB (the two predec-loaded bytes) instead of reading a single 16-bit Dy via the
+    // raw rdB port. Safe reuse: the register-form PACK (a single-µop MicroOpAssembler fast
+    // crack, NEVER routed through this ROM) is the field's only other consumer-context, and
+    // it always leaves extByte at its ordinary False default. Every other UOpFromCtx customer
+    // (BCD/ADDX/SUBX/CMPM's CMP/UNPK) ignores extByte entirely (EXT/EXTB's own real meaning
+    // for `extByte` is likewise a different op entirely, never reached via this ROM).
+    u.extByte := Bool(d.uop == UOpFromCtx) && (ctx.op === DecOp.PACK)
     u.isMovea := (d.uop match {
       case UMovesRead => ctx.movesRnIsA
       case UMiHostOp  => ctx.miMovea

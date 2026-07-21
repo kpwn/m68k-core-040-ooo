@@ -750,6 +750,17 @@ object OperationDecoder {
         // adj16 is pkt.words(1), carried in `imm` (useImm=True). NO CCR effect.
         val isPackReg = (line === 0x8) && (opmode === 5) && (opword(5 downto 3) === B"3'b000")
         val isUnpkReg = (line === 0x8) && (opmode === 6) && (opword(5 downto 3) === B"3'b000")
+        // ── PACK/UNPK MEMORY forms -(Ay),-(Ax),#adj (task #198): op[5:3]=`001` (An-direct
+        // predec) instead of the register form's `000` — same discriminator ADDX/SUBX/BCD
+        // use for their own reg-vs-mem split. A >3-µop sequence via the SAME DecodeStage
+        // µcode SEQUENCER as BCD_MEM_ENTRY (Microcode.PACK_MEM_ENTRY / UNPK_MEM_ENTRY),
+        // reusing the EXISTING register-form PACK/UNPK ALU compute cone (AluEuPlugin's
+        // isPack/isUnpk) fed from two/one predec-loaded byte temp(s) instead of a real Dy
+        // register — see Microcode.scala's PACK_MEM_ENTRY/UNPK_MEM_ENTRY header comments.
+        // Predecode already frames this exact opword pattern as len=2 (opword+adj16) —
+        // see PredecodeWord.scala's `isPackUnpkFrame` (framed BOTH forms from day one).
+        val isPackMem = (line === 0x8) && (opmode === 5) && (opword(5 downto 3) === B"3'b001")
+        val isUnpkMem = (line === 0x8) && (opmode === 6) && (opword(5 downto 3) === B"3'b001")
         // ABCD (line C) / SBCD (line 8), REGISTER form: 1xx0 xxx 1 0000 0 yyy.
         //   bit8=1 + bits7:6=00 = opmode 4 (the AND/OR-RMW band); bits 5:4=00 + bit3=0
         //   ("00000") select the DATA-register form. xxx(11:9)=Dx (dst + a source),
@@ -787,6 +798,18 @@ object OperationDecoder {
           o.srcB    := easrc              // EA 000yyy -> DATAREG Dy (the source)
           o.dst     := dnField; o.dstWrites := True
           // adj16 in imm (pkt.words(1)) routed at assemble time; no CCR reads or writes
+        } .elsewhen(isPackMem) {
+          o.illegal    := False
+          o.microcoded := True
+          o.ucEntry    := U(Microcode.PACK_MEM_ENTRY, o.ucEntry.getWidth bits)
+          o.op         := DecOp.PACK     // carried to Microcode.Ctx.op for the compute row
+          o.size       := Size.BYTE      // byte-wise predec reads/store
+        } .elsewhen(isUnpkMem) {
+          o.illegal    := False
+          o.microcoded := True
+          o.ucEntry    := U(Microcode.UNPK_MEM_ENTRY, o.ucEntry.getWidth bits)
+          o.op         := DecOp.UNPK
+          o.size       := Size.BYTE
         } .elsewhen(isBcdMem) {
           o.illegal := False
           o.microcoded := True
