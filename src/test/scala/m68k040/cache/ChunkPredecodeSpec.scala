@@ -5,7 +5,7 @@ import spinal.lib._
 import org.scalatest.funsuite.AnyFunSuite
 
 class ChunkPredecodeSpec extends AnyFunSuite {
-  test("ChunkPredecode is 5 bits; FetchRsp carries 4 of them") {
+  test("ChunkPredecode is 6 bits; FetchRsp carries 4 of them") {
     SpinalConfig().generateVerilog(new Component {
       val c = ChunkPredecode()
       assert(c.simple.isInstanceOf[Bool])
@@ -13,7 +13,9 @@ class ChunkPredecodeSpec extends AnyFunSuite {
       // comment (a MOVE with two full-format EAs can need up to 11 words, which overflowed
       // the old 3-bit field).
       assert(c.lenWords.getWidth == 4)
-      assert(c.asBits.getWidth == 5)
+      // Widened 5->6 bits (task #202, 2026-07-22): added `ambiguousLine`, a 1-bit flag
+      // for the I-cache-line-boundary predecode fix (see ChunkPredecode's field comment).
+      assert(c.asBits.getWidth == 6)
       val r = master(Flow(FetchRsp()))
       r.valid := False
       r.payload.assignDontCare()
