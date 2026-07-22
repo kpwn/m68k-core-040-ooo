@@ -153,8 +153,33 @@ object Aligner {
         // requires the COMBINED length to fit within one WINDOW's worth of visible words
         // (else slot1's words weren't actually all present in `words`/`preds`, both sized
         // WINDOW) — gated on WINDOW itself, not a bare coincidental constant.
+        //
+        // task #209 (bf_memind_dyn_straddle wild-PC): `p1` comes STRAIGHT from the
+        // statically-baked, per-64-byte-line `preds` array (baked ONCE at IcachePlugin
+        // REFILL time) with NO live-reclassify equivalent to slot0's `p0Live` above (task
+        // #202) and — critically — with no `ambiguousLine` check at all. When the
+        // candidate slot1 instruction's OWN opword lands on the LAST word of its 64-byte
+        // I-cache line, its extension-word lookahead (needed to disambiguate brief- vs
+        // full-format mode-6/mode7-reg3 EAs) falls past the line boundary at bake time,
+        // so the baked prediction is a GUESSED "assume brief" with `ambiguousLine=True` —
+        // exactly the case task #202 fixed for slot0 via `p0Live`, but slot1 was never
+        // given the same treatment. Trusting that guessed (too-short) `L1` here silently
+        // truncates the real instruction, leaving its own trailing extension word(s)
+        // behind as bogus "leftover" bytes the next fetch mis-decodes as a stray
+        // instruction — confirmed via PORTED_TRACE_MI/PORTED_TRACE_FED/PORTED_TRACE_EXC
+        // on `bf_memind_dyn_straddle` (a memory-indirect BFEXTS landing on word 31 of
+        // line 0 lost its own `bd` extension word this way, read a garbage pointer,
+        // DECERR'd, and vectored through an unseeded vector table to a wild PC). Simplest
+        // safe fix, mirroring the `p0.ambiguousLine` stall arm above: refuse to pack an
+        // ambiguous prediction into slot1 this cycle at all (`slot1Ok=False`) — the
+        // candidate instruction is re-attempted as the NEXT cycle's `headPc` instead,
+        // where it goes through the exact `p0Live` live-reclassify path and resolves
+        // correctly once `avail` has grown enough (bounded, same as every other
+        // `ambiguousLine` stall in this file — no new livelock risk). Costs at most one
+        // extra front-end bubble on the rare cache-line-boundary case; zero effect on
+        // every non-ambiguous slot1 (the overwhelming majority).
         val L0L1     = (L0 +^ L1).resize(5)
-        val slot1Ok  = p1.simple && (avail.resize(5) >= L0L1) && (L0L1 <= U(WINDOW, 5 bits))
+        val slot1Ok  = p1.simple && !p1.ambiguousLine && (avail.resize(5) >= L0L1) && (L0L1 <= U(WINDOW, 5 bits))
 
         when(slot1Ok) {
           // Slot1 = simple packet
