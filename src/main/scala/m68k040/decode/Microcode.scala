@@ -65,6 +65,11 @@ object Microcode {
   // ── mem-indirect EA<->EA selectors (task #119 follow-up) ────────────────────
   case object SMiOtherEaBase   extends Sel   // (miOtherEaBase, miOtherEaBaseValid) — the plain (non-MI) side's base
   case object SMiOtherEaDispLo extends Sel   // selImm: the plain (non-MI) side's disp
+  // task #204 (both-sides-memory-indirect MOVE): when the "other" side is ITSELF a
+  // full-format mem-indirect EA (not the plain-memory case SMiOtherEaBase/DispLo above
+  // were built for), it needs its OWN outer displacement — mirrors SMiOd (ctx.miOd,
+  // dedicated to the PRIMARY/src pointer) but for the SECOND (dst) pointer instead.
+  case object SMiOtherOd       extends Sel   // selImm: the "other" (dst) pointer's own od
   // ── CAS / CAS2 selectors ────────────────────────────────────────────────────
   case object SCasDc      extends Sel   // (casDc, True)   — CAS compare reg Dc = ext[2:0]
   case object SCasDu      extends Sel   // (casDu, True)   — CAS update reg  Du = ext[8:6]
@@ -709,10 +714,16 @@ object Microcode {
          sz = SzHost, miHostIndex = true, miMoveFlags = true, isLast = true),              // µPC125 (g2)
 
     // MI_MOVE_BOTH_MI_ILLEGAL @126 (task #119 scope limit): a MOVE with BOTH src AND dst
-    // full-format memory-indirect simultaneously needs a 4-µop/2-pointer/3-temp chain
-    // (deliberately out of scope for this slice — rare in practice). Trap vector-4 rather
+    // full-format memory-indirect simultaneously needed a 4-µop/2-pointer/3-temp chain
+    // (deliberately out of scope for that slice — rare in practice). Trap vector-4 rather
     // than silently mis-executing (the F2-class failure mode this whole task exists to
     // avoid); a real completeness gap, but safe.
+    // task #204: the non-post-indexed-dst subset of this shape is now HANDLED (see
+    // MI_MOVE_BOTH_MI_ENTRY @238, routed via DecodeStage's `ucMoveBothMiOk`). This entry
+    // remains live ONLY for a post-indexed dst (`([bd,An],Xn,od)` — Xn would need to apply
+    // at the FINAL store, which @238's single second-pointer-load doesn't thread through) —
+    // still a real, narrower, deliberately-scoped-out completeness gap, but safe (traps
+    // rather than mis-executing).
     Desc(UMove, bfIllegal = true, isFirst = true, isLast = true),                         // µPC126
 
     // MI_MOVE_DST_IMM @127 (task #178, ported-tests cluster 11: move_bwl_imm_src_memind_dst):
@@ -1238,7 +1249,49 @@ object Microcode {
     Desc(UMove, mem = MStore, srcA = ST3, srcB = ST1, useImm = true, imm = SBfMiDispHi,
          sz = SzByte, isLast = true),                                                     // µPC237 (s11)
   )
-  val rom: Vector[Desc] = romP1() ++ romP2() ++ romP3() ++ romP4() ++ romP5() ++ romP6() ++ romP7()
+  private def romP8(): Vector[Desc] = Vector(
+    // ════════════════════════════════════════════════════════════════════════
+    // MI_MOVE_BOTH_MI @238 (task #204): MOVE mem-indirect src-EA -> mem-indirect dst-EA,
+    // BOTH sides full-format. Resumes task #198's abandoned design sketch (reverted
+    // incomplete, no ROM rows ever existed for it) — re-derived from scratch against the
+    // infrastructure this session has since built out (tasks #144-203). Scoped to a
+    // NON-post-indexed dst (see `ucMoveBothMiOk` in DecodeStage.scala): a post-indexed
+    // dst's Xn would need to apply at the FINAL store, which this narrow first entry
+    // doesn't thread through — that harder case still falls to the pre-existing
+    // MI_MOVE_BOTH_MI_ILLEGAL_ENTRY (task #119's original scope limit, unchanged, still
+    // live for that shape). The src side is UNRESTRICTED (pre- OR post-indexed, any od) —
+    // it reuses the EXISTING primary eaBase/eaDispLo/eaIndex/miOd/miPost machinery
+    // completely unchanged (t0/t1 below are byte-for-byte the same shape as MI_MOVE_SRC's
+    // p0/p1 @16/17).
+    //
+    // KEY SIMPLIFICATION (found investigating whether this needed a whole new dual-
+    // pointer ctx group, mirroring task #201's LEA/PEA/JMP/JSR finding that a resolved
+    // ADDRESS needs LESS infrastructure than a loaded VALUE): the "other" (dst) side's
+    // pointer load needs EXACTLY the ctx.miOtherEa{Base,DispLo,Index*} group MI_MOVE_EAEA
+    // (task #119) already built for its plain-memory "other" side — that group already
+    // carries a full EaDecoder output (base/disp/index), and `indexFromMiOtherEa` already
+    // applies that index UNCONDITIONALLY (no ctx.miPost gating), which is EXACTLY the
+    // semantics a non-post-indexed dst needs (index-before-load, same as a pre-indexed
+    // primary pointer). The only genuinely NEW piece is the dst pointer's own OUTER
+    // displacement (od) for the FINAL store — `SMiOtherOd`/`ctx.miOtherOd`, mirroring the
+    // existing `SMiOd`/`ctx.miOd` pair but for the second pointer. Everything else (the
+    // second UMiPtrLoad, the final UMiHostMove store) is a straight reuse of existing Desc
+    // shapes with different selectors. 3 temps (T0=src ptr, T1=loaded value, T2=dst ptr) —
+    // already an established budget (the bit-field MI family uses T0-T3; no archDepth bump).
+    //   t0 LOAD.L srcPtr = (srcEaBase+bd (+pre-idx))       -> T0        (isFirst)
+    //   t1 LOAD.host (T0+srcOd (+src post-idx))             -> T1
+    //   t2 LOAD.L dstPtr = (dstEaBase+bd (+idx, uncond.))   -> T2
+    //   t3 STORE.host T1 -> (T2+dstOd), sets NZVC per ctx.miWNzvc               (isLast)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                                 // µPC238 (t0)
+    Desc(UMiHostMove, mem = MLoad, srcA = ST0, dst = ST1, useImm = true, imm = SMiOd,
+         sz = SzHost, miHostIndex = true),                                                // µPC239 (t1)
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SMiOtherEaBase, dst = ST2, useImm = true,
+         imm = SMiOtherEaDispLo, sz = SzLong, indexFromMiOtherEa = true),                 // µPC240 (t2)
+    Desc(UMiHostMove, mem = MStore, srcA = ST2, srcB = ST1, useImm = true, imm = SMiOtherOd,
+         sz = SzHost, miMoveFlags = true, isLast = true),                                 // µPC241 (t3)
+  )
+  val rom: Vector[Desc] = romP1() ++ romP2() ++ romP3() ++ romP4() ++ romP5() ++ romP6() ++ romP7() ++ romP8()
   val BF_DYN_RD_PCREL_DO1_ENTRY  = 178   // rows 178..183
   val BF_DYN_FFO_PCREL_DO1_ENTRY = 184   // rows 184..190
   val MI_BF_RD_DO0_ENTRY  = 130
@@ -1271,7 +1324,8 @@ object Microcode {
   val CMPM_ENTRY        = 115  // rows 115..119 (load Ay/postinc, load Ax/postinc, CMP flags-only)
   val MI_MOVE_EAEA_ENTRY = 120 // rows 120..122 (ptr-load, host-load->T1, host-store T1->plain EA)
   val MI_MOVE_EAEA_REV_ENTRY = 123 // rows 123..125 (ptr-load, host-load plain EA->T1, host-store T1->(ptr+od))
-  val MI_MOVE_BOTH_MI_ILLEGAL_ENTRY = 126 // row 126 (both src+dst mem-indirect — scoped out, traps illegal)
+  val MI_MOVE_BOTH_MI_ILLEGAL_ENTRY = 126 // row 126 (both src+dst mem-indirect, post-indexed dst — scoped out, traps illegal)
+  val MI_MOVE_BOTH_MI_ENTRY = 238 // rows 238..241 (task #204: both src+dst mem-indirect, dst NOT post-indexed)
   val MI_MOVE_DST_IMM_ENTRY = 127 // rows 127..129 (ptr-load, materialize #imm->T1, host-store T1->mem)
   val PACK_MEM_ENTRY = 166 // rows 166..171 (load Ay/predec x2, PACK compute, store Ax/predec)
   val UNPK_MEM_ENTRY = 172 // rows 172..177 (load Ay/predec, UNPK compute, store lo, shift, store hi)
@@ -1387,6 +1441,11 @@ object Microcode {
     val miOtherEaIndexLong  = Bool()
     val miOtherEaIndexScale = UInt(2 bits)
     val miOtherEaDispLo     = Bits(32 bits)
+    // task #204 (both-sides-memory-indirect MOVE): populated ONLY when the "other" side is
+    // ITSELF a full-format mem-indirect EA (ucMoveBothMiOk) — its own outer displacement,
+    // added to the SECOND pointer (loaded via miOtherEaBase/DispLo/Index above) by the
+    // MI_MOVE_BOTH_MI_ENTRY final store row. Harmless (unread) for every other customer.
+    val miOtherOd           = Bits(32 bits)
     // (An)+/-(An) auto-update on the "other" (plain) side of an EA<->EA mem-indirect MOVE
     // (task #154, ported-tests memind cluster): MI_MOVE_EAEA's store (other=dst) / _REV's
     // load (other=src) need the SAME auto-postinc/predec + An write-back the ordinary
@@ -1462,6 +1521,7 @@ object Microcode {
     case SEaDispLo   => ctx.eaDispLo
     case SEaDispHi   => ctx.eaDispHi
     case SMiOtherEaDispLo => ctx.miOtherEaDispLo   // task #119 EA<->EA plain side
+    case SMiOtherOd  => ctx.miOtherOd              // task #204 both-MI: the dst pointer's own od
     case SBfImm      => ctx.bfImm
     case SMiOd       => ctx.miOd
     case SMiImm      => ctx.miHostImm

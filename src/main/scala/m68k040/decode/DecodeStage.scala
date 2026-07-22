@@ -1229,6 +1229,22 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val ucMoveBothMi    = ucMoveSrcMi && ucMoveDstMi   // both sides mem-indirect -> scoped-out illegal (below)
     // (ucMoveDstMiEaEa/ucMoveSrcMiEaEa/ucMoveBothMi are already simPublic'd further
     // below, in the existing "debug-only observability (task #139...)" block.)
+    // task #204: a NARROWER, now-SUPPORTED subset of ucMoveBothMi — both sides mem-indirect
+    // AND the dst is NOT REAL-post-indexed (`([bd,An],Xn,od)` WITH an actual Xn: the index
+    // would need to apply at the FINAL store, which this entry's single second-pointer-load
+    // doesn't thread through — see MI_MOVE_BOTH_MI_ENTRY's own comment in Microcode.scala).
+    // A post-indexed dst (or any other both-MI shape) still falls through to the existing
+    // MI_MOVE_BOTH_MI_ILLEGAL_ENTRY safety net below. `ucMiDstEa.memPost`/`.indexValid` are
+    // already the real dst-side EaSpec (independent of which side ucMiEa/ucMiOtherEa pick as
+    // "primary"). CAUGHT investigating this task's own repro (move_l_memind_to_memind, a
+    // NO-INDEX-on-both-sides shape): EaDecoder's `memPost` is the RAW I/IS ext-word bit2,
+    // set REGARDLESS of whether the index is actually suppressed (`indexValid = !fIs`, a
+    // SEPARATE bit) — EaDecoder's own comment even says so ("IS=1 collapses to pre with
+    // Xn=0"), so a genuinely no-index dst can still report memPost=True despite having no
+    // Xn to apply at any stage. Gating on bare `memPost` wrongly excluded that (very common,
+    // this task's own G1 "both no-idx" strategy) shape from ucMoveBothMiOk entirely. The
+    // real exclusion is only a post-indexed dst WITH a real index register.
+    val ucMoveBothMiOk  = ucMoveBothMi && !(ucMiDstEa.memPost && ucMiDstEa.indexValid)
     // The mem-indirect side's counterpart EA (the plain, non-register side) for the EA<->EA
     // chains: whichever of src/dst is NOT the pointer-load target. Computed unconditionally
     // (mirrors the movesRn/bit-field-EA ctx groups elsewhere in this function) — harmless
@@ -1316,7 +1332,16 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val ucJsrMi = ucIsJsr && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
     // The chosen mem-indirect EaSpec (the pointer load's base/bd/index + od/post). LEA/
     // PEA/JMP/JSR's EA is ucMiSrcEa (op[5:0]) -- already the else-fallback, no change here.
-    val ucMiEa = Mux(ucMoveDstMi, ucMiDstEa, Mux(ucImmDstMi, ucImmEa, ucMiSrcEa))
+    // task #204: for a both-MI MOVE the PRIMARY pointer (T0, the shared eaBase/eaDispLo/
+    // eaIndex/miOd/miPost group) is the SRC side — MI_MOVE_BOTH_MI_ENTRY's own shape is
+    // "src ptr-load -> src host-load -> dst ptr-load -> dst host-store", mirroring
+    // MI_MOVE_EAEA's src-primary convention. Checked BEFORE the plain `ucMoveDstMi` arm
+    // (which would otherwise pick the DST side, correct for the single-sided dst-MI entries
+    // but wrong here) — `ucMoveBothMi` is a strict subset of `ucMoveDstMi` so ordering
+    // matters. Harmless for the (still-illegal) post-indexed-dst both-MI case too: that
+    // entry (MI_MOVE_BOTH_MI_ILLEGAL_ENTRY) reads no ctx.eaBase/miOd/etc at all.
+    val ucMiEa = Mux(ucMoveBothMi, ucMiSrcEa,
+                 Mux(ucMoveDstMi, ucMiDstEa, Mux(ucImmDstMi, ucImmEa, ucMiSrcEa)))
     // The op IS a full-format mem-indirect host (route to the engine). The entry packet
     // is valid either because it's the correctly-latched stash (ucPendValid) or because
     // it's this cycle's live fed packet -- gating on bare fed.valid alone was WRONG (task
@@ -1375,6 +1400,11 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // MI_MOVE_DST_IMM_ENTRY comment in Microcode.scala for the full root-cause story).
     val ucMoveDstMiImmEarly = ucMoveDstMi && ucMoveSrcIsImm
     val ucMiEntry =
+      // task #204: ucMoveBothMiOk (both-MI, dst NOT post-indexed) is a strict subset of
+      // ucMoveBothMi — checked FIRST so it wins over the illegal fallback; a post-indexed
+      // dst (or any other both-MI shape ucMoveBothMiOk excludes) still falls through to the
+      // existing MI_MOVE_BOTH_MI_ILLEGAL_ENTRY arm below.
+      Mux(ucMoveBothMiOk,  U(Microcode.MI_MOVE_BOTH_MI_ENTRY, ew bits),
       Mux(ucMoveBothMi,    U(Microcode.MI_MOVE_BOTH_MI_ILLEGAL_ENTRY, ew bits),
       Mux(ucMoveSrcMiEaEa, U(Microcode.MI_MOVE_EAEA_ENTRY,     ew bits),
       Mux(ucMoveDstMiEaEa, U(Microcode.MI_MOVE_EAEA_REV_ENTRY, ew bits),
@@ -1390,7 +1420,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       Mux(ucPeaMi, U(Microcode.MI_PEA_ENTRY, ew bits),
       Mux(ucJmpMi, U(Microcode.MI_JMP_ENTRY, ew bits),
       Mux(ucJsrMi, U(Microcode.MI_JSR_ENTRY, ew bits),
-                         U(Microcode.MI_RMW_ENTRY,    ew bits)))))))))))))
+                         U(Microcode.MI_RMW_ENTRY,    ew bits))))))))))))))
     // ---- debug-only observability (task #139 mechanism #2 investigation) ----
     // Zero synth impact (sim tap only, not referenced by any RTL logic).
     ucMiEntry.simPublic()
@@ -1492,6 +1522,12 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.miOtherEaIndexLong  := ucMiOtherEa.indexLong
     ucEntryCtx.miOtherEaIndexScale := ucMiOtherEa.indexScale
     ucEntryCtx.miOtherEaDispLo     := ucMiOtherEa.disp
+    // task #204 (both-sides-memory-indirect MOVE): the "other" side's OWN outer displacement
+    // (od), meaningful only when that side is ITSELF full-format mem-indirect (ucMoveBothMiOk
+    // — MI_MOVE_BOTH_MI_ENTRY's final store row reads this). Harmless/unread otherwise
+    // (ucMiOtherEa.od is 0 for the plain-EA case the EAEA family uses, since EaDecoder only
+    // ever populates a non-zero od for a real MEMINDIRECT-class EA).
+    ucEntryCtx.miOtherOd           := ucMiOtherEa.od
     // (An)+/-(An) auto-update on the "other" side (task #154): EaDecoder already computes
     // this correctly as part of the normal EaSpec decode, just never threaded into Ctx.
     ucEntryCtx.miOtherEaAutoMode   := ucMiOtherEa.autoMode
