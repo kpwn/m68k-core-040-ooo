@@ -31,7 +31,7 @@ case class ChunkPredecode() extends Bundle {
   // fetch-ahead pipeline routinely already holds the next line's words by the time
   // decode reaches this instruction, even though IcachePlugin's one-shot per-line
   // REFILL predecode could not see them. Defaults False (every other classification
-  // is unaffected; a caller that never sets it behaves exactly as before). */
+  // is unaffected; a caller that never sets it behaves exactly as before).
   val ambiguousLine = Bool()
 }
 
