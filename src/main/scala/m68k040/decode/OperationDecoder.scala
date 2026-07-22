@@ -400,9 +400,23 @@ object OperationDecoder {
         // when active). The EA mode field DISAMBIGUATES from EXT.W (0x4880, mode 000) /
         // EXT.L (0x48C0, mode 000), which share bit11=1 & bits9:7=001 but use Dn-direct
         // (mode 0): a real MOVEM EA is a MEMORY mode (>=2), so EXCLUDE reg-direct modes 0/1.
-        // Indexed (mode 6) / (d8,PC,Xn) (mode 7 reg 3) / #imm+reserved (mode 7 reg>=4) are
-        // OUT OF SCOPE (the FSM has no index-register read port — see the cluster-2
-        // PC-indexed-MOVEM triage). task #165 (ported-tests triage): this classifier used
+        // Indexed (mode 6) / #imm+reserved (mode 7 reg>=4) remain OUT OF SCOPE (mode 6 has
+        // no An-indexed EA support in the FSM at all — pinned illegal by
+        // movem_idx_unimpl_traps.s). `(d8,PC,Xn)` (mode 7 reg 3) GAINED an index-register
+        // read port in the FSM (task #200, MicroOpAssembler.movemMoveUop's new srcC/
+        // indexLong/indexScale threading) — admitted here ONLY for `.L` (bit6=1): the `.W`
+        // sub-case is DELIBERATELY left illegal (movem_idx_unimpl_traps.s's `_c4` pins
+        // `movem.w (0,%pc,Dn.w),...` as a clean vec-4 trap; only `.L` PC-indexed MOVEM is
+        // exercised by the ported-tests corpus / was in scope this session). A `.L` opword
+        // here is ALWAYS `complex`-framed by PredecodeWord.scala (its `mmOk` table never
+        // marks mode-7-reg-3 `simple`) — DecodeStage.scala's MOVEM FSM drives a dedicated
+        // `movemPcIdx*`-prefixed front-end resume (mirroring the existing mem-indirect-MOVE
+        // `ucComplexResume` mechanism) to unstick fetch instead of hanging. Full-format
+        // `(bd,PC,Xn)` (ext word bit8=1) is NOT distinguishable from brief here (this
+        // classifier only sees the first opword) — it silently computes a wrong-but-bounded
+        // EA (never a hang, see DecodeStage.scala's `eIsPcIdxMovem` comment); untested,
+        // out of scope, characterized not fixed (task #200 report). task #165 (ported-tests
+        // triage): this classifier used
         // to read `mmMode4 >= 2` UNCONDITIONALLY, on the (FALSE) assumption that
         // PredecodeWord.scala's `isMovem` COMPLEX framing alone would keep an indexed
         // MOVEM out of the DecodeStage FSM — but `slot0IsMovem` (DecodeStage.scala) gates
@@ -421,7 +435,8 @@ object OperationDecoder {
         val mmMode4 = opword(5 downto 3)
         val mmReg4  = opword(2 downto 0)
         val movemEaOk = (mmMode4.asUInt >= 2 && mmMode4.asUInt <= 5) ||
-                        (mmMode4 === B"3'b111" && mmReg4.asUInt <= 2)
+                        (mmMode4 === B"3'b111" && mmReg4.asUInt <= 2) ||
+                        (mmMode4 === B"3'b111" && mmReg4 === B"3'b011" && opword(6))  // (d8,PC,Xn), .L only
         when(opword(11) && (opword(9 downto 7) === B"001") && movemEaOk) {
           o.illegal := False
           o.op := DecOp.MOVE                     // benign placeholder; the FSM produces the real µops

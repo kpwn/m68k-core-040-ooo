@@ -48,7 +48,8 @@ object MicroOpAssembler {
     *  - STORE: reg -> [base+disp] (srcBReg=reg = the stored data, no int dst, NO flags).
     */
   def movemMoveUop(reg: UInt, base: UInt, baseValid: Bool, disp: Bits, sizeLong: Bool,
-                   isLoad: Bool, first: Bool, drop: Bool, valid: Bool, pc: UInt, nextPc: UInt): DecodedUop = {
+                   isLoad: Bool, first: Bool, drop: Bool, valid: Bool, pc: UInt, nextPc: UInt,
+                   idxReg: UInt, idxValid: Bool, idxLong: Bool, idxScale: UInt): DecodedUop = {
     val u = DecodedUop()
     u.valid       := valid
     u.pc          := pc
@@ -61,7 +62,12 @@ object MicroOpAssembler {
     u.srcAReg     := base; u.srcAValid := baseValid
     // STORE data = the moved register (srcB); LOAD reads no srcB.
     u.srcBReg     := Mux(isLoad, U(0, 5 bits), reg); u.srcBValid := !isLoad
-    u.srcCReg     := 0;   u.srcCValid := False
+    // Index register for `(d8,PC,Xn)` brief-indexed MOVEM (task #200): rides srcC exactly
+    // like any other indexed LS-cluster µop (see DecodedUop's srcC/indexLong/indexScale
+    // doc). The FSM latches ONE constant idx* set for the whole macro (the index term does
+    // NOT auto-update per element, unlike the running `disp`); idxValid=False for every
+    // non-indexed MOVEM EA (the AGU zeroes the index contribution when srcCValid=False).
+    u.srcCReg     := idxReg; u.srcCValid := idxValid
     // LOAD writes the register; STORE writes no int reg (no eaAuto fold here).
     u.dstReg      := reg; u.dstValid := isLoad
     u.useImm      := True; u.imm := disp
@@ -85,7 +91,7 @@ object MicroOpAssembler {
     // Reuse isMovea as the ".W load -> sign-extend the full 32-bit reg" marker (LOAD only).
     u.isMovea     := isLoad && !sizeLong
     u.isScc       := False; u.isDbcc := False
-    u.indexLong   := False; u.indexScale := 0
+    u.indexLong   := idxLong; u.indexScale := idxScale
     u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
     u.predTaken := False; u.predTarget := U(0, 32 bits)
@@ -135,6 +141,58 @@ object MicroOpAssembler {
     u.predTaken := False; u.predTarget := U(0, 32 bits)
     u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
     u.firstOfInstr := False    // trailing µop of the MOVEM macro
+    u
+  }
+
+  /** MOVEM base/index register SNAPSHOT (task #200): a plain int-cluster register copy
+    * (`dst := src + 0`, no flags) emitted ONCE at FSM entry, BEFORE any move µop, for the
+    * two addressing shapes at risk of "in-list self-corruption": a CONTROL-mode base
+    * ((An)/(d16,An) with the base An itself in the register list — case 3 of
+    * movem_an_in_list.s) and a `(d8,PC,Xn)` index register that is itself in the list
+    * (movem_pc_indexed.s). Every element's address then reads the immutable snapshot
+    * (T0/T1) instead of the real architectural register, so an EARLIER move in the SAME
+    * macro that happens to write that same architectural register can no longer corrupt
+    * a LATER element's address via rename (the real register still receives its normal
+    * load, if any — unlike `movemLoadDst`'s auto-update-mode redirect, which DISCARDS the
+    * loaded value outright because Musashi's postinc/predec writeback wins there; here the
+    * loaded value is genuinely KEPT — this copy only protects the SEPARATE addressing
+    * use). Dropped from the oracle step count (like every intermediate MOVEM move); its
+    * Tn write is real and consumed by every later per-element move via rename. Always the
+    * macro's first emitted µop when present (the interrupt/firstOfInstr boundary). */
+  def movemSnapUop(dst: UInt, src: UInt, valid: Bool, pc: UInt, nextPc: UInt): DecodedUop = {
+    val u = DecodedUop()
+    u.valid       := valid
+    u.pc          := pc
+    u.nextPc      := nextPc
+    u.op          := DecOp.ADD
+    u.cluster     := Cluster.INT
+    u.size        := Size.LONG
+    u.memOp       := MemOp.NONE
+    u.srcAReg     := src; u.srcAValid := True
+    u.srcBReg     := 0;   u.srcBValid := False
+    u.srcCReg     := 0;   u.srcCValid := False
+    u.dstReg      := dst; u.dstValid := True
+    u.useImm      := True; u.imm := 0
+    u.readsNzvc   := False; u.readsX := False
+    u.writesNzvc  := False; u.writesX := False     // MOVEM affects NO condition codes
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
+    u.cond        := 0; u.branchDisp := 0
+    u.unimplemented := False
+    u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+    u.faultAddr   := pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
+    u.divSigned   := False; u.div64 := False
+    u.divIsRem    := True     // dropped: never the macro's kept commit
+    u.isChk2      := False
+    u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
+    u.ccrRestore  := False; u.toCcr := False
+    u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.extByte := False
+    u.isMovea     := False; u.isScc := False; u.isDbcc := False
+    u.indexLong   := False; u.indexScale := 0
+    u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+    u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+    u.predTaken := False; u.predTarget := U(0, 32 bits)
+    u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+    u.firstOfInstr := True
     u
   }
 
