@@ -1021,9 +1021,17 @@ object PredecodeWord {
         // 0xF27F + ext1 (discarded) + a 2-word abs.L address = 4 words total, unlike
         // every other line-F op admitted so far (all single-word). See
         // OperationDecoder.scala for the full derivation/rationale.
+        // MOVE16 (Ax)+,(Ay)+ (task #207): opword 0xF620|Ax + 1 ext word carrying Ay
+        // (ext[14:12]) = 2 words total. Only THIS exact form (op & 0xFFF8 == 0xF620) is
+        // framed as 2 words — the other 3 absolute-addressing MOVE16 forms (F600/F608/
+        // F610/F618) are out of scope and stay on the existing 1-word `otherwise` arm
+        // (matching real F-line-trap behavior: vector 11, no further decode).
         when(op === B"16'hF27F") {
           r.simple   := True
           r.lenWords := U(4, 4 bits)
+        } .elsewhen(op(15 downto 3) === U(0xF620 >> 3, 13 bits).asBits) {
+          r.simple   := True
+          r.lenWords := U(2, 4 bits)
         } .otherwise {
           r.simple := True; r.lenWords := U(1, 4 bits)
         }

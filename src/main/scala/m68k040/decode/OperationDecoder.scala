@@ -986,6 +986,25 @@ object OperationDecoder {
           o.sysReadDir := False
           o.dst.setNone(); o.dstWrites := False
         }
+        // ── MOVE16 (Ax)+,(Ay)+ (0xF620|Ax, task #207): 68040 INTEGER cache-line-move —
+        // ONLY the (Ax)+,(Ay)+ post-increment form is decoded (opword bits[2:0]=Ax; the
+        // extension word's bits[14:12]=Ay). The 3 absolute-addressing forms (F600/F608/
+        // F610/F618) deliberately stay on the F-line illegal default (vector 11) — see
+        // the ported test's own doc comment (move16_basic.s): only the (Ax)+,(Ay)+ form
+        // exists in Musashi, this project's golden lock-step oracle. A >3-µop sequence
+        // (four LONG (Ax)+n -> (Ay)+n transfers using the SNAPSHOTTED ORIGINAL Ax/Ay,
+        // then Ax+=16 and Ay+=16 unconditionally) — microcoded via Microcode.MOVE16_ENTRY
+        // (see its own header comment for the exact row shape + why the two write-backs
+        // are ordered Ax-then-Ay to get Musashi's documented Ax==Ay "+32 net" behavior
+        // for free from ordinary program-order rename semantics, no special-casing).
+        val isMove16 = (opword(15 downto 3) === U(0xF620 >> 3, 13 bits).asBits)
+        when(isMove16) {
+          o.illegal    := False
+          o.microcoded := True
+          o.ucEntry    := U(Microcode.MOVE16_ENTRY, o.ucEntry.getWidth bits)
+          o.op         := DecOp.MOVE
+          o.size       := Size.LONG
+        }
         // ── PFLUSH family (0xF500-0xF51F, mode field op[5:3] in {0,1,2,3}): privileged
         // "flush ATC/TLB entries" — task #166 (ported-tests triage, cluster 9). Real
         // 68040 encoding `1111 0101 00 mmm rrr` (op[7:6]=00 fixed): mode(op[5:3])

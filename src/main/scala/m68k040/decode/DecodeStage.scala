@@ -1031,6 +1031,11 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       default        -> B(0, 32 bits))
     val ucIsMoves = ucEntrySpec.microcoded && (ucEntrySpec.op === DecOp.MOVES)
     ucEntryCtx.needsSup := ucIsMoves
+    // MOVE16 (task #207): the dst An (Ay) = ext word[14:12] (8 + that field, matching the
+    // SAy/SAx An-numbering convention). Populated unconditionally off ucEntryPkt.words(1)
+    // (mirrors ucMovesRn's own ext-word extraction, one nibble down) — harmless/unread for
+    // every other microcode customer.
+    ucEntryCtx.move16Ay := (U(8, 5 bits) + ucEntryPkt.words(1)(14 downto 12).asUInt).resize(5)
     // ── FULL-format MEMORY-INDIRECT host-op Ctx population (spec §5) ──────────────
     // A general EA-taking op (MOVE/ALU/imm/single-EA) whose EA is a full-format memory-
     // indirect mode routes through the engine: [LOAD.L pointer -> T0] then the host op at

@@ -111,6 +111,12 @@ object Microcode {
   // ── control-transfer / address-generate MEMORY-INDIRECT selectors (task #201) ────────
   case object SA7   extends Sel   // (15, True) — the constant A7 stack-pointer reg id
   case object SRetPc extends Sel  // selImm: ctx.nextPc (JSR-memind's pushed return PC)
+  // ── MOVE16 selectors (task #207) ─────────────────────────────────────────────
+  case object SMove16Ay extends Sel  // (ctx.move16Ay, True) — the dst An, ext word[14:12]
+  case object SImm4  extends Sel     // selImm: constant 4  (MOVE16 transfer offset)
+  case object SImm8  extends Sel     // selImm: constant 8  (MOVE16 transfer offset)
+  case object SImm12 extends Sel     // selImm: constant 12 (MOVE16 transfer offset)
+  case object SImm16 extends Sel     // selImm: constant 16 (MOVE16 Ax/Ay += 16 write-back)
 
   /** The op kind of a descriptor's template. */
   sealed trait UOp
@@ -1290,6 +1296,65 @@ object Microcode {
          imm = SMiOtherEaDispLo, sz = SzLong, indexFromMiOtherEa = true),                 // µPC240 (t2)
     Desc(UMiHostMove, mem = MStore, srcA = ST2, srcB = ST1, useImm = true, imm = SMiOtherOd,
          sz = SzHost, miMoveFlags = true, isLast = true),                                 // µPC241 (t3)
+
+    // ════════════════════════════════════════════════════════════════════════
+    // MOVE16 (Ax)+,(Ay)+ @242 (task #207, ported-tests move16_basic): 68040 INTEGER
+    // cache-line-move — ONLY the (Ax)+,(Ay)+ post-increment form (opword 0xF620|Ax, ext
+    // word bits[14:12]=Ay; the 3 absolute forms stay on the F-line illegal default).
+    // Semantics locked to Musashi (this repo's golden oracle), NOT real 68040 silicon:
+    // four PLAIN LONG transfers (Ax)+0/4/8/12 -> (Ay)+0/4/8/12 using the register values
+    // as they stood BEFORE either updates (NO 16-byte alignment masking — Musashi doesn't
+    // mask), then Ax += 16 and Ay += 16 UNCONDITIONALLY (two independent write-backs, NOT
+    // a single "if different registers" branch). No CCR effect at all.
+    //
+    // Address computation deliberately does NOT use the eaAuto/predec-postinc machinery
+    // (APostincAy/APostincAx, the CMPM precedent) — those compute addr=An THEN bump An by
+    // a size-dependent delta (with the A7-byte-odd quirk), neither of which MOVE16 wants
+    // (its 4 transfer addresses are FIXED +0/+4/+8/+12 offsets off the ORIGINAL An, and its
+    // final delta is a flat +16 regardless of size or A7). So the 4 transfers instead reuse
+    // the full-format mem-indirect host-op idiom (a plain register base + a useImm/imm
+    // literal displacement, e.g. MI_MOVE_EAEA's shape) with the offsets as new SImm4/8/12
+    // constant selectors, and the two write-backs are plain UAddDrop rows (mirrors CMPM's
+    // e1/e3 dropped-crack ADD) with a NEW flat SImm16 constant (not SDeltaAx/Ay's ctx-size-
+    // dependent delta). Ax (source, opword[2:0]) reuses the EXISTING generic SAy selector
+    // (which is really just "the register named by opword[2:0]", despite its name); Ay
+    // (dest, ext word[14:12]) needs a NEW SMove16Ay selector + ctx field (populated at
+    // ucBegin, mirrors ctx.movesRn's ext-word extraction).
+    //
+    // ORDERING IS LOAD-BEARING for the Ax==Ay case: all 8 loads/stores (using the
+    // UNCHANGED architectural Ax/Ay) come FIRST, and the two write-back ADDs come LAST,
+    // Ax THEN Ay. If Ax==Ay, the renamer resolves the second ADD's SMove16Ay read against
+    // the FIRST ADD's just-written result (ordinary in-order-decode RAW dependency, no
+    // special-casing needed) -> the register nets Ax_orig+16+16 = +32, exactly matching
+    // the ported test's stage-3 assertion (Musashi: `[Ax] += 16; [Ay] += 16;` sequentially
+    // in program order, same net effect when Ax==Ay).
+    //   m0 LOAD.L  (Ax+0)  -> T0                                              (isFirst)
+    //   m1 LOAD.L  (Ax+4)  -> T1
+    //   m2 STORE.L T0 -> (Ay+0)
+    //   m3 STORE.L T1 -> (Ay+4)
+    //   m4 LOAD.L  (Ax+8)  -> T0
+    //   m5 LOAD.L  (Ax+12) -> T1
+    //   m6 STORE.L T0 -> (Ay+8)
+    //   m7 STORE.L T1 -> (Ay+12)
+    //   m8 ADD.L Ax + 16 -> Ax   (dropped crack µop)
+    //   m9 ADD.L Ay + 16 -> Ay   (dropped crack µop)                          (isLast)
+    Desc(UMove, mem = MLoad, srcA = SAy, dst = ST0, sz = SzLong, isFirst = true),          // µPC242 (m0)
+    Desc(UMove, mem = MLoad, srcA = SAy, dst = ST1, useImm = true, imm = SImm4,
+         sz = SzLong),                                                                    // µPC243 (m1)
+    Desc(UMove, mem = MStore, srcA = SMove16Ay, srcB = ST0, sz = SzLong),                 // µPC244 (m2)
+    Desc(UMove, mem = MStore, srcA = SMove16Ay, srcB = ST1, useImm = true, imm = SImm4,
+         sz = SzLong),                                                                    // µPC245 (m3)
+    Desc(UMove, mem = MLoad, srcA = SAy, dst = ST0, useImm = true, imm = SImm8,
+         sz = SzLong),                                                                    // µPC246 (m4)
+    Desc(UMove, mem = MLoad, srcA = SAy, dst = ST1, useImm = true, imm = SImm12,
+         sz = SzLong),                                                                    // µPC247 (m5)
+    Desc(UMove, mem = MStore, srcA = SMove16Ay, srcB = ST0, useImm = true, imm = SImm8,
+         sz = SzLong),                                                                    // µPC248 (m6)
+    Desc(UMove, mem = MStore, srcA = SMove16Ay, srcB = ST1, useImm = true, imm = SImm12,
+         sz = SzLong),                                                                    // µPC249 (m7)
+    Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SImm16),                   // µPC250 (m8)
+    Desc(UAddDrop, srcA = SMove16Ay, dst = SMove16Ay, useImm = true, imm = SImm16,
+         isLast = true),                                                                  // µPC251 (m9)
   )
   val rom: Vector[Desc] = romP1() ++ romP2() ++ romP3() ++ romP4() ++ romP5() ++ romP6() ++ romP7() ++ romP8()
   val BF_DYN_RD_PCREL_DO1_ENTRY  = 178   // rows 178..183
@@ -1326,6 +1391,7 @@ object Microcode {
   val MI_MOVE_EAEA_REV_ENTRY = 123 // rows 123..125 (ptr-load, host-load plain EA->T1, host-store T1->(ptr+od))
   val MI_MOVE_BOTH_MI_ILLEGAL_ENTRY = 126 // row 126 (both src+dst mem-indirect, post-indexed dst — scoped out, traps illegal)
   val MI_MOVE_BOTH_MI_ENTRY = 238 // rows 238..241 (task #204: both src+dst mem-indirect, dst NOT post-indexed)
+  val MOVE16_ENTRY = 242 // rows 242..251 (task #207: MOVE16 (Ax)+,(Ay)+, 4 LONG transfers + Ax/Ay += 16)
   val MI_MOVE_DST_IMM_ENTRY = 127 // rows 127..129 (ptr-load, materialize #imm->T1, host-store T1->mem)
   val PACK_MEM_ENTRY = 166 // rows 166..171 (load Ay/predec x2, PACK compute, store Ax/predec)
   val UNPK_MEM_ENTRY = 172 // rows 172..177 (load Ay/predec, UNPK compute, store lo, shift, store hi)
@@ -1459,6 +1525,11 @@ object Microcode {
     // form's own imm routing (MicroOpAssembler's packUnpkReg block) exactly. Ay/Ax reuse
     // the shared SAy/SAx selectors (ctx.opword bits 2:0 / 11:9), same as the BCD chain.
     val packAdj = Bits(32 bits)
+    // ── MOVE16 group (task #207) ────────────────────────────────────────────────────────
+    // The dst An = ext word[14:12] (8 + that field, matching the SAy/SAx An-numbering
+    // convention). Populated at ucBegin from ucEntryPkt.words(1), mirrors ctx.movesRn's
+    // own ext-word extraction. Harmless (unread) for every other microcode customer.
+    val move16Ay = UInt(5 bits)
   }
 
   // ── selector → (regId, valid) ──────────────────────────────────────────────
@@ -1495,6 +1566,7 @@ object Microcode {
     // (a non-auto / abs EA -> the r2 ADD writes no reg, an inert NOP).
     case SMovesAn => (ctx.eaBase, ctx.casAutoMode =/= EaAuto.NONE)
     case SA7      => (U(15, 5 bits), True)   // task #201: the constant A7 stack pointer
+    case SMove16Ay => (ctx.move16Ay, True)   // task #207: MOVE16 dst An (ext word[14:12])
     case _       => (U(0, 5 bits), False)
   }
 
@@ -1536,6 +1608,10 @@ object Microcode {
     case SPackAdj    => ctx.packAdj                     // task #198: PACK/UNPK mem-form adj16
     case SShift8     => U(8, 32 bits).asBits             // task #198: UNPK's high-byte LSR count
     case SRetPc      => ctx.nextPc.asBits                // task #201: JSR-memind's pushed return PC
+    case SImm4       => U(4, 32 bits).asBits              // task #207: MOVE16 transfer offset
+    case SImm8       => U(8, 32 bits).asBits              // task #207: MOVE16 transfer offset
+    case SImm12      => U(12, 32 bits).asBits             // task #207: MOVE16 transfer offset
+    case SImm16      => U(16, 32 bits).asBits             // task #207: MOVE16 An += 16 write-back
     case _           => B(0, 32 bits)
   }
 
