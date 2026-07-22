@@ -187,7 +187,7 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // ---- Default-drive IBuf inputs ----
     ibuf.io.push.valid   := False
     ibuf.io.push.payload.words.foreach(_ := 0)
-    ibuf.io.push.payload.preds.foreach { p => p.simple := False; p.lenWords := 0 }
+    ibuf.io.push.payload.preds.foreach { p => p.simple := False; p.lenWords := 0; p.ambiguousLine := False }
     ibuf.io.push.payload.n := 0
     ibuf.io.shift        := 0
     ibuf.io.flush        := False
@@ -281,9 +281,10 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
         for (j <- 0 until 4) {
           when(U(j) < nWords) {
             val srcIdx = (startWord + U(j, 2 bits)).resize(2)
-            ibuf.io.push.payload.words(j)          := rspWords(srcIdx)
-            ibuf.io.push.payload.preds(j).simple   := rspPreds(srcIdx).simple
-            ibuf.io.push.payload.preds(j).lenWords := rspPreds(srcIdx).lenWords
+            ibuf.io.push.payload.words(j)                 := rspWords(srcIdx)
+            ibuf.io.push.payload.preds(j).simple          := rspPreds(srcIdx).simple
+            ibuf.io.push.payload.preds(j).lenWords        := rspPreds(srcIdx).lenWords
+            ibuf.io.push.payload.preds(j).ambiguousLine   := rspPreds(srcIdx).ambiguousLine
           }
         }
         ibuf.io.push.payload.n := nWords

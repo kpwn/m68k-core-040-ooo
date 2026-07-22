@@ -73,6 +73,7 @@ class InstructionBuffer extends Component {
     e.word init 0
     e.pred.simple init False
     e.pred.lenWords init 0
+    e.pred.ambiguousLine init False
     e
   }
   val count   = Reg(UInt(log2Up(BUF_WORDS + 1) bits)) init 0
@@ -121,9 +122,10 @@ class InstructionBuffer extends Component {
           phys := tb.resize(IDXW)
         }
         when((U(j) < io.push.payload.n) && (phys === s)) {
-          entries(s).word          := io.push.payload.words(j)
-          entries(s).pred.simple   := io.push.payload.preds(j).simple
-          entries(s).pred.lenWords := io.push.payload.preds(j).lenWords
+          entries(s).word                := io.push.payload.words(j)
+          entries(s).pred.simple         := io.push.payload.preds(j).simple
+          entries(s).pred.lenWords       := io.push.payload.preds(j).lenWords
+          entries(s).pred.ambiguousLine  := io.push.payload.preds(j).ambiguousLine
         }
       }
     }
@@ -156,9 +158,10 @@ class InstructionBuffer extends Component {
       io.head(i)     := entries(phys).word
       io.headPred(i) := entries(phys).pred
     } .otherwise {
-      io.head(i)              := 0
-      io.headPred(i).simple   := False
-      io.headPred(i).lenWords := 0
+      io.head(i)                     := 0
+      io.headPred(i).simple          := False
+      io.headPred(i).lenWords        := 0
+      io.headPred(i).ambiguousLine   := False
     }
   }
 

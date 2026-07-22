@@ -40,10 +40,36 @@ object Aligner {
     r.stall       := True
     r.complex     := False
 
-    val p0 = preds(0)
+    // task #202 (I-cache-line-boundary predecode gap): `preds(0)` was baked ONCE, per
+    // 64-byte line, at IcachePlugin REFILL time — it could not see past that line, so an
+    // EA whose brief-vs-full-format framing needed a lookahead word beyond the boundary
+    // was GUESSED (`ambiguousLine` marks this; see ChunkPredecode's doc comment). By the
+    // time this instruction is the buffer HEAD here, the front-end's independent
+    // multi-outstanding fetch pipeline has very likely ALREADY pulled the next line's
+    // words into this SAME buffer too — `words`/`avail` are PC-relative, not
+    // line-relative, so they transparently span physical I-cache lines. Re-run the exact
+    // same classify() logic against the LIVE buffered words, gated on how many of ITS OWN
+    // lookahead words `avail` actually covers, and prefer that live answer whenever the
+    // baked one was a guess. If `avail` is still too small to resolve it for real, the
+    // live reclass reports `ambiguousLine=True` again (byte-identical guess) — the stall
+    // check below treats that as "not enough data yet" (same shape as `avail < L0`), so
+    // the aligner just waits: fetch keeps running independently of a stalled decode (see
+    // FetchAlignPlugin's `ic.cmd.valid`, not gated on this stall), so `avail` keeps
+    // growing until it genuinely resolves — no new hang, bounded by HEAD_WORDS=10 >> the
+    // <=3-word lookahead any single case needs. Selected by a single bit (`ambiguousLine`
+    // is False for the overwhelming majority of instructions), but see the commit
+    // message / task202 report for the synth-gate verdict on whether instantiating a 2nd
+    // classify() here is FMax-safe on this front-end-critical path.
+    val p0Live = PredecodeWord.classify(words(0), words(1), words(2), words(3),
+      extWValid = avail >= U(2, 4 bits), extW2Valid = avail >= U(3, 4 bits), extW3Valid = avail >= U(4, 4 bits))
+    val p0 = Mux(preds(0).ambiguousLine, p0Live, preds(0))
     val L0 = p0.lenWords  // UInt(4 bits)
 
     when(avail === 0) {
+      // keep defaults: stall, nothing valid
+    } .elsewhen(p0.ambiguousLine) {
+      // Still can't resolve for real (avail hasn't grown enough yet) -- wait rather than
+      // emit a possibly-wrong guess. Identical shape to the `avail < L0` stall below.
       // keep defaults: stall, nothing valid
     } .elsewhen(!p0.simple) {
       // Complex head: emit complex packet for slot0

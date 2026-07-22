@@ -18,6 +18,21 @@ import spinal.core._
 case class ChunkPredecode() extends Bundle {
   val simple   = Bool()
   val lenWords = UInt(4 bits)
+  // task #202 (I-cache-line-boundary predecode gap): True iff `simple`/`lenWords` were
+  // computed by GUESSING (the "assume brief when unknown" fallback in PredecodeWord's
+  // eaExt/memDestExt mode-6 / mode7-reg3 cases) because the real extension word needed
+  // to disambiguate brief- vs full-format wasn't resident at REFILL-time predecode (it
+  // lives past the 64-byte I-cache line boundary, in a not-yet-fetched line). The guess
+  // is architecturally correct ONLY when the real EA happens to be brief; a genuine
+  // full-format EA landing at this exact boundary is silently under-framed (wrong
+  // lenWords) if trusted as-is. Aligner (FetchAlignPlugin) uses this bit to gate a
+  // LIVE re-classification of slot0 from the buffer's own already-fetched raw words
+  // once enough of them are actually available (see Aligner.align) — the buffer's
+  // fetch-ahead pipeline routinely already holds the next line's words by the time
+  // decode reaches this instruction, even though IcachePlugin's one-shot per-line
+  // REFILL predecode could not see them. Defaults False (every other classification
+  // is unaffected; a caller that never sets it behaves exactly as before). */
+  val ambiguousLine = Bool()
 }
 
 object CacheMode extends SpinalEnum {
