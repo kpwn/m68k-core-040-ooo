@@ -351,7 +351,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // The final An update (kept macro commit): An := An + emitted*step for (An)+/-(An)
     // (movemStep carries the sign), or An := An + 0 for the control (An)/(d16,An) modes
     // (a no-op An write that commits the macro + advances PC). emitted = the total count.
-    val movemAnDelta = Mux(movemDoAnUpd, (movemEmitted.asSInt.resize(32) * movemStep).resize(32), S(0, 32 bits))
+    // FOUND (task #200, movem_store_predec_all16.s — "5-bit counter" upper bound): a plain
+    // `movemEmitted.asSInt` REINTERPRETS the 5-bit UNSIGNED count as SIGNED — count=16
+    // (0b10000) sign-flips to -16, corrupting the final An delta for exactly the "all 16
+    // registers" MOVEM (D0-D7/A0-A7) case (16 * step became -16 * step, e.g. -64 -> +64).
+    // Widen to 8 bits FIRST (still all-zero in the new top bits for any real count <=16,
+    // so the value's own MSB never lands on the new sign bit) THEN reinterpret as signed —
+    // `.resize` on a UInt zero-extends, unlike `.asSInt` on the narrow width directly.
+    val movemAnDelta = Mux(movemDoAnUpd, (movemEmitted.resize(8 bits).asSInt.resize(32) * movemStep).resize(32), S(0, 32 bits))
     val movemAnUop = MicroOpAssembler.movemAnUpdUop(
       an = movemAnReg, signedDelta = movemAnDelta,
       valid = True, pc = movemPc, nextPc = movemNextPc)
