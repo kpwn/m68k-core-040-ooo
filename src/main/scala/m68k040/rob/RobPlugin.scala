@@ -647,6 +647,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // Instruction-fetch fault: capture the fetch PC as the EA + the SSW-instr bit.
       faultAddrStore(tail)  := allocUopVec(0).faultAddr
       faultInstrStore(tail) := allocUopVec(0).sswInstr
+      // Task #211: explicit per-alloc write (mirrors faultInstrStore) so a REUSED
+      // index never inherits a stale ATC bit left behind by an earlier LS bus-fault
+      // occupant of this same slot — the RegInit(True) default alone only covered a
+      // never-yet-written slot, not a reused one.
+      faultAtcStore(tail)   := allocUopVec(0).faultAtc
       firstStore(tail) := allocUopVec(0).firstOfInstr
       needsSupStore(tail) := allocUopVec(0).needsSupervisor
       pcStore(tail)    := allocUopVec(0).pc
@@ -672,6 +677,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultWrStore(tail + 1)  := False; faultSupStore(tail + 1) := False
       faultAddrStore(tail + 1)  := allocUopVec(1).faultAddr
       faultInstrStore(tail + 1) := allocUopVec(1).sswInstr
+      faultAtcStore(tail + 1)   := allocUopVec(1).faultAtc
       firstStore(tail + 1) := allocUopVec(1).firstOfInstr
       needsSupStore(tail + 1) := allocUopVec(1).needsSupervisor
       pcStore(tail + 1)    := allocUopVec(1).pc

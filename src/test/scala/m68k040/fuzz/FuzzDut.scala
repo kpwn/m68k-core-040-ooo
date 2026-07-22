@@ -283,4 +283,28 @@ object FuzzDut {
       override def readByte(address: BigInt, id: Int): Byte = mem.read(address.toLong)
     }
   }
+
+  /** Task #211: like `attachProgram`, but the read agent injects a genuine AXI
+    * DECERR (task #189's `BehavioralMem.decoded`/`injectBusErrors` model) for an
+    * address outside the decoded range, instead of silently serving a zero-filled
+    * OKAY read. Needed so an instruction fetch to genuinely-unmapped space (e.g.
+    * exc_ifetch_bus_error.s's 0xAAAA0000 target) can exercise IcachePlugin's
+    * REFILL resp-check at all — the stock `Axi4ReadOnlySlaveAgent` used by
+    * `attachProgram` has no per-access response-code hook (see
+    * `BehavioralMemAgent`'s doc comment), so this uses the new
+    * `Axi4ReadOnlyBehavioralAgent` instead. The memory-population convention
+    * (per-16-bit-word byte order) is BYTE-IDENTICAL to `attachProgram`'s above —
+    * every existing passing fetch test is unaffected; only the resp field changes
+    * for a genuinely undecoded address. */
+  def attachProgramWithBusErrors(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long,
+                                  bytes: Vector[Int]): m68k040.ls.Axi4ReadOnlyBehavioralAgent = {
+    val agent = new m68k040.ls.Axi4ReadOnlyBehavioralAgent(axi, cd, injectBusErrors = true)
+    val nWords = bytes.length / 2
+    for (i <- 0 until nWords) {
+      val w = ((bytes(2 * i) & 0xff) << 8) | (bytes(2 * i + 1) & 0xff)
+      agent.mem.write(loadAddr + 2 * i,     (w & 0xff).toByte)
+      agent.mem.write(loadAddr + 2 * i + 1, ((w >> 8) & 0xff).toByte)
+    }
+    agent
+  }
 }

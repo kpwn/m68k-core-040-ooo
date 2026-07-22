@@ -205,6 +205,12 @@ case class DecodedUop() extends Bundle {
   // instead of data-space). Both default to 0/False (data faults / no fault).
   val faultAddr    = UInt(32 bits)
   val sswInstr     = Bool()
+  // Task #211: which cause raised an INSTRUCTION-FETCH fault — True (default) for
+  // the pre-existing ITLB/MMU-detected translation fault (non-resident / supervisor
+  // I-page), False for a physical AXI bus error (SLVERR/DECERR) on an I-cache
+  // REFILL. Meaningful only when `sswInstr` is set; selects ExceptionUnit's SSW ATC
+  // bit exactly like LsFault.atc already does for D-side faults (task #189).
+  val faultAtc     = Bool()
   // RTE (return-from-exception): a serializing exception-return µop. Default False.
   val isRte        = Bool()
   // isCondTrap: a branch-class execute-time CONDITIONAL trap µop (isBranch + readsNzvc).

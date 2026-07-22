@@ -19,6 +19,12 @@ case class DecodePacket() extends Bundle {
   val lenWords  = UInt(4 bits)            // predecode length in words (meaningful iff simple)
   val complex   = Bool()                  // !simple
   val fault     = Bool()
+  // Task #211: which cause raised `fault` — True (default/don't-care-safe) for the
+  // pre-existing ITLB/MMU-detected translation fault, False for a physical AXI bus
+  // error (SLVERR/DECERR) on an I-cache REFILL. Meaningful only when `fault` is set;
+  // carried from IcachePlugin's FetchRsp.atc through FetchAlignPlugin's synthetic
+  // faulted packet. Mirrors LsFault.atc on the D-side (task #189).
+  val faultAtc  = Bool()
   // ── Fetch-time branch prediction (BTB + bimodal, slice 1) ───────────────────
   // predTaken : this instruction's fetch window hit the BTB with predict-taken (the
   //   front-end was redirected to predTarget on its behalf). predTarget : the target

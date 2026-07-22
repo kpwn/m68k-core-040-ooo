@@ -106,6 +106,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val beatCnt   = Reg(UInt(1 bits)) init U(0, 1 bits)
     val arSent    = Reg(Bool()) init False
     val lineReg   = Reg(Bits(512 bits))
+    // Task #211: latched across REFILL->FAULT — did any AXI read-beat response for
+    // this refill come back with a non-OKAY resp (SLVERR/DECERR)? On an error the
+    // line is NOT allocated (PREDECODE's tag/pred/valid writes are skipped entirely
+    // — see the REFILL->FAULT transition below) and the fault is delivered via the
+    // new FAULT state, mirroring DcachePlugin's missFault/busFaultResp (task #189).
+    val missBusFault = Reg(Bool()) init False
 
     // ---- shared data-array read port (synchronous; BRAM) ----
     // Address+enable are driven by the FSM (IDLE hit accept, or REPLAY). The
@@ -123,6 +129,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val s1Way   = Reg(UInt(wayBits bits))
     val s1Pc    = Reg(UInt(32 bits))
     val s1Fault = Reg(Bool())
+    // Task #211: which cause armed s1Fault — True = ITLB/MMU translation fault
+    // (tFault below), False = a physical AXI bus error caught in REFILL (new FAULT
+    // state below). Only meaningful when s1Fault is set; rides to rsp.payload.atc.
+    val s1Atc   = Reg(Bool())
     val s1Lane  = Reg(UInt(2 bits))
     // FMax: register the RAW per-way predMem entries (the readAsync results, indexed
     // by the page-invariant set bits — NOT a hit-way select), and defer the way-mux +
@@ -139,6 +149,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val rspPcReg    = Reg(UInt(32 bits))
     val rspDataReg  = Reg(Bits(64 bits))
     val rspFaultReg = Reg(Bool())
+    val rspAtcReg   = Reg(Bool())
     val rspPredReg  = Reg(Vec(ChunkPredecode(), 4))
 
     // ---- window predecode helper ----
@@ -165,6 +176,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     rspPcReg    := s1Pc
     rspDataReg  := s1Window
     rspFaultReg := s1Fault
+    rspAtcReg   := s1Atc
     rspPredReg  := s1PredW
 
     // ---- rsp outputs (combinational from the registered stage) ----
@@ -172,6 +184,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     rspPort.payload.pc    := rspPcReg
     rspPort.payload.data  := rspDataReg
     rspPort.payload.fault := rspFaultReg
+    rspPort.payload.atc   := rspAtcReg
     rspPort.payload.pred  := rspPredReg
 
     // ---- default output assignments ----
@@ -216,6 +229,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
       val REFILL    = new State
       val PREDECODE = new State
       val REPLAY    = new State
+      // Task #211: a REFILL whose AXI read response(s) came back non-OKAY
+      // (SLVERR/DECERR — genuinely unmapped or erroring physical memory). No line
+      // is allocated (PREDECODE, which does the tag/pred/valid writes, is skipped
+      // entirely); this delivers a one-shot fault response instead, mirroring
+      // DcachePlugin's REPLAY/busFaultResp handling (task #189).
+      val FAULT     = new State
 
       // ----- IDLE: T-accept (translate) + consume the REGISTERED T-stage -----
       // Two decoupled, flow-through actions (depth-2: accept may overlap consume):
@@ -264,6 +283,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
             s1Way   := U(0, wayBits bits)
             s1Pc    := idlePc
             s1Fault := True
+            s1Atc   := True   // ITLB/MMU-detected (task #211)
             s1Lane  := idleLaneIdx
             s1PredEntries := Vec.fill(ways)(B(0, PRED_BITS_PER_LINE bits))
           } elsewhen(isHit) {
@@ -272,6 +292,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
             s1Way   := hitWayIdx
             s1Pc    := idlePc
             s1Fault := False
+            s1Atc   := False
             s1Lane  := idleLaneIdx
             s1PredEntries := idlePredEntry
           } otherwise {
@@ -284,6 +305,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
             victimWay := victim(idleSet)
             beatCnt   := U(0, 1 bits)
             arSent    := False
+            missBusFault := False   // task #211: reset per-refill
             goto(REFILL)
           }
         }
@@ -320,6 +342,15 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
         axi.r.ready := True
         when(axi.r.valid) {
+          // Task #211: a non-OKAY response (SLVERR/DECERR — genuinely unmapped or
+          // erroring physical memory) on EITHER beat of this 2-beat line burst means
+          // there is no real data to cache. Still absorb the beat (dataMem/lineReg
+          // writes are harmless — the line's valid bit is never set on this path, so
+          // it can never be read back as a hit), but latch the error so the FSM
+          // routes to FAULT instead of PREDECODE once the burst completes (mirrors
+          // DcachePlugin's REFILL respErr handling, task #189).
+          val respErr = axi.r.payload.resp =/= Axi4.resp.OKAY
+          when(respErr) { missBusFault := True }
           val writeAddr = (missSet ## beatCnt).asUInt
           for (w <- 0 until ways) {
             when(victimWay === U(w, wayBits bits)) {
@@ -332,8 +363,27 @@ class IcachePlugin extends FiberPlugin with FetchService {
             lineReg(511 downto 256) := axi.r.payload.data
           }
           beatCnt := beatCnt + 1
-          when(axi.r.payload.last) { goto(PREDECODE) }
+          when(axi.r.payload.last) {
+            when(missBusFault || respErr) { goto(FAULT) } otherwise { goto(PREDECODE) }
+          }
         }
+      }
+
+      // ----- FAULT: deliver a one-shot bus-error fault response; no allocation -----
+      // Task #211: reached only via REFILL's non-OKAY AXI response. PREDECODE (the
+      // tag/pred/valid writes) is skipped entirely — no line is allocated, matching
+      // the D-side no-allocate-on-error policy — and the victim pointer is NOT
+      // advanced (this way was never actually filled).
+      FAULT.whenIsActive {
+        activePc := missPC
+        s1Valid := True
+        s1Way   := U(0, wayBits bits)
+        s1Pc    := missPC
+        s1Fault := True
+        s1Atc   := False   // physical bus error, not ATC/MMU-detected
+        s1Lane  := missPC(4 downto 3)
+        s1PredEntries := Vec.fill(ways)(B(0, PRED_BITS_PER_LINE bits))
+        goto(IDLE)
       }
 
       // ----- PREDECODE: classify line, write predMem + tag/valid -----
@@ -405,8 +455,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
         s1Pc    := missPC
         // A refill only happens for a NON-faulting translation (the T-stage fault
         // path emits a placeholder without refilling), so the replayed line is fault-
-        // free by construction — off the live ITLB rsp entirely.
+        // free by construction — off the live ITLB rsp entirely. A bus-erroring
+        // refill never reaches REPLAY (it routes to FAULT instead, task #211).
         s1Fault := False
+        s1Atc   := False
         s1Lane  := missPC(4 downto 3)
         s1PredEntries := replayPredEntry
 

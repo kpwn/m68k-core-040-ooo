@@ -2,7 +2,7 @@ package m68k040.ls
 
 import spinal.core._
 import spinal.core.sim._
-import spinal.lib.bus.amba4.axi.{Axi4, Axi4Config}
+import spinal.lib.bus.amba4.axi.{Axi4, Axi4Config, Axi4ReadOnly}
 import spinal.lib.sim.{SparseMemory, StreamDriver, StreamMonitor, StreamReadyRandomizer}
 
 import scala.collection.mutable
@@ -245,4 +245,63 @@ class BehavioralMemAgent(axi: Axi4, cd: ClockDomain, sharedMem: SparseMemory = n
     (0 until BehavioralMem.BYTES).foldLeft(BigInt(0)) { (acc, i) =>
       acc | (BigInt(peekByte(addr + i)) << (8 * i))
     }
+}
+
+/** Task #211 (I-fetch bus error): read-only counterpart of `BehavioralMemAgent`'s
+  * hand-rolled read path, for AXI masters with no write channels — e.g. the
+  * I-cache's `Axi4ReadOnly` master. The stock `Axi4ReadOnlySlaveAgent` (used by
+  * `FuzzDut.attachProgram`) has no per-access response-code hook (see
+  * `BehavioralMemAgent`'s own doc comment above) — always OKAY — so an
+  * instruction fetch to genuinely-unmapped space (e.g.
+  * exc_ifetch_bus_error.s's 0xAAAA0000 target) could never exercise
+  * IcachePlugin's new REFILL resp-check without this. Byte-for-byte port of
+  * `BehavioralMemAgent`'s read side (lines above); `injectBusErrors` defaults
+  * False so any OTHER call site is unaffected. */
+class Axi4ReadOnlyBehavioralAgent(axi: Axi4ReadOnly, cd: ClockDomain,
+                                   sharedMem: SparseMemory = null,
+                                   injectBusErrors: Boolean = false) {
+  val mem = if (sharedMem != null) sharedMem else SparseMemory()
+
+  private val busConfig = axi.config
+
+  private case class ArState(addr: BigInt, size: Int, len: Int, burst: Int, id: Int)
+
+  private def readBeatData(base: Long, bytes: Int): BigInt = {
+    var v = BigInt(0)
+    for (i <- 0 until bytes) v = v | (BigInt(mem.read(base + i).toInt & 0xff) << (8 * i))
+    v
+  }
+
+  private val rQueue = mutable.Queue[() => Unit]()
+
+  val arMonitor = StreamMonitor(axi.ar, cd) { ar =>
+    val id    = if (busConfig.useId) ar.id.toInt else 0
+    val size  = if (busConfig.useSize) ar.size.toInt else log2Up(busConfig.dataWidth / 8)
+    val len   = if (busConfig.useLen) ar.len.toInt else 0
+    val burst = if (busConfig.useBurst) ar.burst.toInt else 1
+    val st = ArState(ar.addr.toBigInt, size, len, burst, id)
+    val bpb = 1 << st.size
+    for (beat <- 0 to st.len) {
+      val base = (st.burst match {
+        case 1 => st.addr + BigInt(bpb) * beat   // INCR
+        case _ => st.addr                         // FIXED
+      }).toLong
+      val isLast = beat == st.len
+      val bad = injectBusErrors && !BehavioralMem.decoded(base)
+      rQueue += { () =>
+        if (busConfig.useId)   axi.r.id   #= id
+        axi.r.data #= (if (bad) BigInt(0) else readBeatData(base, bpb))
+        if (busConfig.useResp) axi.r.resp #= (if (bad) 3 else 0)   // DECERR : OKAY
+        if (busConfig.useLast) axi.r.last #= isLast
+      }
+    }
+  }
+
+  val rDriver = StreamDriver(axi.r, cd) { _ =>
+    if (rQueue.nonEmpty) { rQueue.dequeue().apply(); true } else false
+  }
+  val arDriver = StreamReadyRandomizer(axi.ar, cd, () => rQueue.size < 8)
+
+  def pokeByte(addr: Long, value: Int): Unit = mem.write(addr, value.toByte)
+  def peekByte(addr: Long): Int             = mem.read(addr).toInt & 0xff
 }

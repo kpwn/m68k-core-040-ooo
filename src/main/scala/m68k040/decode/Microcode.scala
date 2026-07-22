@@ -1778,7 +1778,7 @@ object Microcode {
     // RMW/INS forms route here — trap, NOT silent-wrong).
     u.unimplemented := Bool(d.bfIllegal)
     u.faulted := Bool(d.bfIllegal); u.faultVector := (if (d.bfIllegal) U(4, 8 bits) else U(0, 8 bits)); u.faultUsesNextPc := False
-    u.faultAddr := ctx.pc; u.sswInstr := False; u.isRte := False; u.isCondTrap := False
+    u.faultAddr := ctx.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     u.divSigned := False; u.div64 := False
     // The two An write-back ADDs are DROPPED crack µops (divIsRem): the commit
     // observation is dropped, but the An write lands in the PRF + is verified by a later

@@ -62,7 +62,14 @@ object PortedTestRunner {
     compiled.doSim(s"ported_$runIdx", simSeed) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
 
-      FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      // Task #211: use the DECERR-capable read agent (mirrors `dmem` below) so an
+      // instruction fetch to genuinely-unmapped space (e.g. exc_ifetch_bus_error.s's
+      // 0xAAAA0000 target) gets a real AXI bus error instead of a silently-successful
+      // zero-filled read — IcachePlugin's REFILL resp-check (task #211) can only ever
+      // be exercised by the ported-test corpus if this harness can actually produce
+      // one. Population convention is byte-identical to the old `attachProgram`, so
+      // every other (mapped) fetch is unaffected.
+      FuzzDut.attachProgramWithBusErrors(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       // Task #189: inject a real DECERR for the D-side data bus on a genuinely
       // undecoded physical address (mirrors the real SoC's axi_xbar decode the
       // ported-test corpus's exc_bus_error* headers describe — see

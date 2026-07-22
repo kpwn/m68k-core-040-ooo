@@ -50,6 +50,11 @@ case class FetchRsp() extends Bundle {
   val data  = Bits(64 bits)   // little-endian window: data[7:0] = byte at pc+0 ... data[63:56] = byte at pc+7
                               // (architectural big-endian byte-order is the fetch/align stage's concern, deferred)
   val fault = Bool()
+  // Task #211: which cause raised `fault` — True = ITLB/MMU-detected translation
+  // fault (non-resident / supervisor I-page); False = a physical AXI bus error
+  // (SLVERR/DECERR) on a REFILL (e.g. a fetch to genuinely-unmapped space). Only
+  // meaningful when `fault` is set. Mirrors LsFault.atc on the D-side (task #189).
+  val atc   = Bool()
   val pred  = Vec(ChunkPredecode(), 4)   // predecode for the 4 words of the returned window
 }
 

@@ -143,6 +143,11 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // clear faultHold).
     val faultHold     = Reg(Bool()) init False
     val faultEmitted  = Reg(Bool()) init False   // the faulted packet was already emitted
+    // Task #211: which cause raised the held fault — latched from the FIRST fault
+    // response's `atc` bit (True=ITLB/MMU translation fault, False=physical AXI bus
+    // error) alongside faultHold below, and carried onto the synthetic faulted
+    // DecodePacket's `faultAtc` so it survives to ExceptionUnit's SSW ATC bit.
+    val faultAtcHold  = Reg(Bool()) init True
 
     // Complex emit-once is enforced by the `stalled` latch (no separate delay reg):
     // a complex packet has shiftWords=0, so on its fire only `stalled` advances,
@@ -265,7 +270,8 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // the next window; the EA must be the FIRST faulting address, not the later one.
     val rspFault = ic.rsp.valid && ic.rsp.payload.fault && !rspStaleHead && !faultHold
     when(rspFault) {
-      faultHold := True
+      faultHold    := True
+      faultAtcHold := ic.rsp.payload.atc   // task #211: capture the cause of the FIRST fault
     }
 
     when(ic.rsp.valid) {
@@ -453,6 +459,7 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       slot1ValidOut          := False
       feed.payload(0).valid     := True
       feed.payload(0).fault     := True
+      feed.payload(0).faultAtc  := faultAtcHold   // task #211
       // EA / faulting-instruction PC = the architectural fetch PC (decodePc, = the
       // branch/redirect target), NOT the 8-byte I-cache fetch window (which can be one
       // window ahead of the faulting instruction).
