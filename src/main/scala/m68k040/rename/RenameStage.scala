@@ -46,10 +46,10 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
 
     // ── Committed-identity init ────────────────────────────────────────────────
     // Counter 0..(ARCH_INT_REGS-1) drives intRat.commits(0) with (addr=i, data=i) —
-    // identity for D0-7/A0-7 AND the three temp arch regs T0/T1/T2 (16,17,18); the
-    // flag RATs commit (addr 0, data 0) on the first cycle. Gate normal operation
+    // identity for D0-7/A0-7 AND the four temp arch regs T0/T1/T2/T3 (16,17,18,19);
+    // the flag RATs commit (addr 0, data 0) on the first cycle. Gate normal operation
     // until done. The terminal compare is driven by the canonical arch count so a
-    // bump of Isa.ARCH_INT_REGS flows here automatically. Counter is 5 bits (0..18 fits).
+    // bump of Isa.ARCH_INT_REGS flows here automatically. Counter is 5 bits (0..19 fits).
     val initDone    = Reg(Bool()) init False
     val initCounter = Reg(UInt(5 bits)) init 0   // 0..(ARCH_INT_REGS-1)
     when(!initDone) {

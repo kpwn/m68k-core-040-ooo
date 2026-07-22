@@ -3,8 +3,8 @@ package m68k040.isa
 import org.scalatest.funsuite.AnyFunSuite
 
 class IsaSpec extends AnyFunSuite {
-  test("19 architectural integer regs: D0-D7, A0-A7 + 3 EA-cracking temps T0/T1/T2") {
-    assert(Isa.ARCH_INT_REGS == 19)
+  test("20 architectural integer regs: D0-D7, A0-A7 + 4 EA-cracking temps T0/T1/T2/T3") {
+    assert(Isa.ARCH_INT_REGS == 20)
   }
   test("CCR bit positions match m68k (X N Z V C)") {
     assert(Isa.CCR_C == 0 && Isa.CCR_V == 1 && Isa.CCR_Z == 2 && Isa.CCR_N == 3 && Isa.CCR_X == 4)

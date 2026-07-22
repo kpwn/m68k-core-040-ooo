@@ -19,10 +19,13 @@ object MicroOpAssembler {
 
   /** Internal int temp arch regs targeted by EA cracking. T2 is the 3rd temp added for
     * the microcode engine's 5-byte bit-field RMW chain (3 simultaneously-live temps
-    * {lo,hi,res}); arch count = Isa.ARCH_INT_REGS = 19. */
+    * {lo,hi,res}); T3 (task #203) is the 4th, holding the memory-indirect dynamic-
+    * offset bit-field RMW/INS chains' resolved pointer/Tb live across the funnel
+    * compute. arch count = Isa.ARCH_INT_REGS = 20. */
   val T0 = 16
   val T1 = 17
   val T2 = 18
+  val T3 = 19
 
   case class AssembledUops() extends Bundle {
     // Up to 3 µops per instruction (RTR = pop.w CCR + pop.l PC + ibranch). uops(0)
