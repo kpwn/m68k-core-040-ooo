@@ -71,13 +71,44 @@ object Aligner {
       // Still can't resolve for real (avail hasn't grown enough yet) -- wait rather than
       // emit a possibly-wrong guess. Identical shape to the `avail < L0` stall below.
       // keep defaults: stall, nothing valid
+    } .elsewhen(!p0.simple && (avail < U(WINDOW, 4 bits))) {
+      // task #204 (both-sides-memory-indirect MOVE investigation): a complex packet used
+      // to be emitted IMMEDIATELY on whatever `avail` happened to be this cycle, instead of
+      // waiting for the full lookahead window -- DecodeStage's own "the FULL up-to-10-word
+      // aligner window is always resident" claim (see its ucMoveRealLenWords/ucMoveLenKnown
+      // comment) was only true BY LUCK: decode is usually busy enough for `avail` to have
+      // already ramped up to WINDOW by the time it gets around to consuming a complex
+      // packet, but a complex mem-indirect MOVE reached VERY early (e.g. right after boot,
+      // few outstanding fetches yet) can be latched with `wordCount` as small as 2 -- and
+      // PipeStage.scala's 1-deep skid buffer ALWAYS grabs into an empty slot regardless of
+      // downstream readiness (`slotFree = !valid || out.ready`), so there is no way for
+      // DecodeStage to defer that first latch itself. A both-mem-indirect full-format MOVE
+      // whose dst extension words are still beyond the small `avail` window reads GARBAGE
+      // at `ucDstEaWords`, silently misclassifying the dst as non-mem-indirect (bypassing
+      // MI_MOVE_BOTH_MI_ENTRY/MI_MOVE_BOTH_MI_ILLEGAL_ENTRY both) -- observed directly via
+      // PORTED_TRACE_MI on move_l_memind_to_memind (avail=2 at the complex head, needs 5).
+      // FIX: simply wait for `avail>=WINDOW` before ever emitting a complex packet at all
+      // -- mirrors the pre-existing `avail < L0` stall the SIMPLE-packet arm below already
+      // uses, and makes the "full window always resident" invariant every downstream
+      // consumer (DecodeStage's bit-field/CAS/MOVES/mem-indirect families) already assumes
+      // ACTUALLY hold, instead of holding by coincidence. Zero regression risk for any
+      // currently-passing complex-packet case: DecodeStage's own comment already notes
+      // "every currently passing complex case observed in this corpus had wordCount==10"
+      // -- i.e. no passing test relies on a sub-WINDOW `avail` snapshot. `avail` is driven
+      // by InstructionBuffer's independent multi-outstanding fetch pipeline (unrelated to
+      // whether THIS packet is consumed) and caps at WINDOW itself, so this cannot
+      // deadlock in this simulator (memory reads never structurally fail — see the
+      // `SparseMemory` model), only add a few extra stall cycles the very first time a
+      // complex packet is reached early after a redirect/boot.
+      // keep defaults: stall, nothing valid (identical shape to the `avail < L0` stall
+      // below and to the `avail === 0`/`ambiguousLine` stalls above)
     } .elsewhen(!p0.simple) {
-      // Complex head: emit complex packet for slot0
+      // Complex head: emit complex packet for slot0 (avail >= WINDOW guaranteed here)
       r.slot0.pc        := headPc
       for (i <- 0 until WINDOW) {
         r.slot0.words(i) := words(i)
       }
-      // wordCount = min(avail, WINDOW)
+      // wordCount = min(avail, WINDOW) = WINDOW (avail>=WINDOW guaranteed by the gate above)
       r.slot0.wordCount := (avail > U(WINDOW, 4 bits)).mux(U(WINDOW, 4 bits), avail.resize(4))
       r.slot0.simple    := False
       r.slot0.complex   := True
