@@ -97,6 +97,9 @@ object Microcode {
   // ── PACK/UNPK MEMORY-form selectors (task #198) ─────────────────────────────
   case object SPackAdj extends Sel   // selImm: ctx.packAdj (the adj16 ext word, sign-extended)
   case object SShift8  extends Sel   // selImm: the constant 8 (UNPK's high-byte LSR count)
+  // ── control-transfer / address-generate MEMORY-INDIRECT selectors (task #201) ────────
+  case object SA7   extends Sel   // (15, True) — the constant A7 stack-pointer reg id
+  case object SRetPc extends Sel  // selImm: ctx.nextPc (JSR-memind's pushed return PC)
 
   /** The op kind of a descriptor's template. */
   sealed trait UOp
@@ -113,6 +116,17 @@ object Microcode {
   case object UMiPtrLoad extends UOp    // LOAD.L pointer (eaBase + eaDispLo (+ pre-index)) -> T0
   case object UMiHostMove extends UOp   // host MOVE load/store at (T0 + od (+post-index)); op=MOVE
   case object UMiHostOp  extends UOp     // host ALU/unary compute (ctx.miOp): srcA,srcB -> dst + flags
+  // ── control-transfer / address-generate MEMORY-INDIRECT kinds (task #201) ──────────
+  // LEA/PEA/JMP/JSR resolve their EA directly (no loaded VALUE, unlike the §7 host-op
+  // family above) — the pointer load (UMiPtrLoad, reused unchanged) yields T0, then ONE
+  // of these folds T0 + od (+ post-index) into the FINAL address, routed straight to its
+  // real consumer (An / a push / the branch target) instead of a generic temp+host-op.
+  case object UMiLeaFinal    extends UOp  // ADDR-GENERATE (leaAddr, LS-EU AGU, no mem access):
+                                           // T0 + od (+ post-idx) -> dst (LEA's An / PEA's temp)
+  case object UMiPushFinal   extends UOp  // stack push STORE: -(A7) := srcB (data), dst=A7 (PEA's
+                                           // computed addr / JSR's retPC via imm when srcB invalid)
+  case object UMiBranchFinal extends UOp  // INDIRECT BRANCH: target = T0 + od (+ post-idx)
+                                           // (JMP/JSR-memind's redirect, mirrors ibrUop)
   // ── PACK/UNPK MEMORY-form kind (task #198) ──────────────────────────────────
   case object UShiftR8   extends UOp    // SHIFT.L T,#8 (LSR, right, real barrel shifter) -> dst; NO
                                          // flags — UNPK's high-result-byte extraction (moves the
@@ -206,7 +220,7 @@ object Microcode {
     * (BCD vs ADDX vs SUBX), size, and bcdSub come from the CONTEXT, so ONE 6-row sequence
     * serves all four mem forms (they differ only in ctx fields). */
   val BCD_MEM_ENTRY = 0
-  val rom: Vector[Desc] = Vector(
+  private def romP1(): Vector[Desc] = Vector(
     // µPC0: LOAD.sz (Ay) -> T0  (predec Ay address; the load writes T0; NO An write here —
     //        the LS-EU writes An only on an eaAuto STORE, so the Ay write-back is µPC1).
     Desc(UMove, mem = MLoad, auto = APredecAy, srcA = SAy, dst = ST0, isFirst = true),
@@ -330,6 +344,8 @@ object Microcode {
          sz = SzHost, miHostIndex = true),                                     // µPC29
     Desc(UMiHostOp, srcA = ST1, srcB = SMiOther, dst = SNone, isLast = true),   // µPC30
 
+  )
+  private def romP2(): Vector[Desc] = Vector(
     // ════════════════════════════════════════════════════════════════════════
     // CAS .B/.W/.L (atomic compare-and-swap, single address) — 4 µops @ CAS_ENTRY=31.
     // The EA (memory-alterable control mode) rides the shared eaBase/eaDispLo/eaIndex
@@ -534,6 +550,8 @@ object Microcode {
     // numbering above undisturbed.
     Desc(UMove, bfIllegal = true, isFirst = true, isLast = true),              // µPC86
 
+  )
+  private def romP3(): Vector[Desc] = Vector(
     // ════════════════════════════════════════════════════════════════════════
     // Bit-field DYNAMIC offset/width MEMORY BFINS (slice 3c). The RES compute for CHG/CLR/SET
     // reads {lo, hi, packed} on srcA/B/C; BFINS additionally needs the Dn2 INSERT source — a
@@ -725,6 +743,8 @@ object Microcode {
     Desc(UMiHostMove, mem = MStore, srcA = ST0, srcB = ST1, useImm = true, imm = SMiOd,
          sz = SzHost, miHostIndex = true, miMoveFlags = true, isLast = true),             // µPC129 (h2)
 
+  )
+  private def romP4(): Vector[Desc] = Vector(
     // ════════════════════════════════════════════════════════════════════════
     // Bit-field MEMORY-INDIRECT (68020+ full-format [bd,An],od / [bd,An,od]) — task #197.
     // Reuses the EXISTING generic MI pointer-resolve pattern (UMiPtrLoad, identical to the
@@ -885,6 +905,8 @@ object Microcode {
     Desc(UMove, mem = MStore, srcA = ST2, srcB = ST0, useImm = true, imm = SBfMiDispHi,
          sz = SzByte, isLast = true),                                                     // µPC165 (l13)
 
+  )
+  private def romP5(): Vector[Desc] = Vector(
     // ════════════════════════════════════════════════════════════════════════
     // PACK -(Ay),-(Ax),#adj @166 (task #198). Musashi (m68k_in.c m68k_op_pack_16_mm):
     //   REG_A[srcreg]--; src  = read8(Ay)          (FIRST read -> LOW byte of src)
@@ -988,8 +1010,55 @@ object Microcode {
     Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = ST0, sz = SzLong,
          bfDyn = true, bfTstForm = true),                                    // µPC189 (prefunnel: field32 -> T0)
     Desc(UBfMem, srcA = ST0, srcB = SBfOffReg, srcC = ST2, dst = SBfRdDst, sz = SzLong,
-         bfDyn = true, bfWritesNz = true, bfStoreForm = 6, isLast = true)    // µPC190 (FFOFULL)
+         bfDyn = true, bfWritesNz = true, bfStoreForm = 6, isLast = true),   // µPC190 (FFOFULL)
+
   )
+  private def romP6(): Vector[Desc] = Vector(
+    // ════════════════════════════════════════════════════════════════════════
+    // Control-transfer / address-generate full-format MEMORY-INDIRECT (task #201):
+    // LEA/PEA/JMP/JSR with a mode-6 / mode-7-reg-3 full-format EA. Unlike the §7 host-op
+    // family above (which loads a VALUE through the resolved pointer), these need only the
+    // RESOLVED ADDRESS itself: pointer = mem.L[base+bd(+pre-idx)] (the SAME UMiPtrLoad row
+    // every other MI entry already uses), final = pointer + od (+ post-idx). LEA/PEA route
+    // that final address straight to their real destination (An / a push) via the LS-EU's
+    // existing `leaAddr` short-circuit (address-generate only, NO translate/NO cache access
+    // — see LsEuPlugin's `when(u1.leaAddr)`, already used by the fast-path LEA/PEA crack);
+    // JMP/JSR route it to the branch-EU's target adder (mirrors `ibrUop`/RTS's T0-based
+    // ibranch — BranchEuPlugin already reads ANY int physical register as psrcA, not just
+    // an architectural An, per RTS/RTR's existing T0-target precedent).
+
+    // MI_LEA_ENTRY @191 (rows 191,192): ptr-load -> T0, then T0+od(+post-idx) -> An.
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                       // µPC191
+    Desc(UMiLeaFinal, srcA = ST0, dst = SMiOther, useImm = true, imm = SMiOd,
+         sz = SzLong, miHostIndex = true, isLast = true),                       // µPC192
+
+    // MI_PEA_ENTRY @193 (rows 193,194,195): ptr-load -> T0, T0+od(+post-idx) -> T1,
+    // push T1 -> -(A7) (the sole kept commit — mirrors the fast-path `peaPush.keepCommit`).
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                       // µPC193
+    Desc(UMiLeaFinal, srcA = ST0, dst = ST1, useImm = true, imm = SMiOd,
+         sz = SzLong, miHostIndex = true),                                      // µPC194
+    Desc(UMiPushFinal, mem = MStore, srcA = SA7, srcB = ST1, dst = SA7,
+         sz = SzLong, keepCommit = true, isLast = true),                        // µPC195
+
+    // MI_JMP_ENTRY @196 (rows 196,197): ptr-load -> T0, ibranch to T0+od(+post-idx).
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),                       // µPC196
+    Desc(UMiBranchFinal, srcA = ST0, useImm = true, imm = SMiOd,
+         sz = SzLong, miHostIndex = true, isLast = true),                       // µPC197
+
+    // MI_JSR_ENTRY @198 (rows 198,199,200): push retPC -> -(A7) (mirrors the fast-path
+    // `jsrPush`, NOT keepCommit — the trailing ibranch is the macro's real oracle step,
+    // exactly like the non-memind JSR crack), ptr-load -> T0, ibranch to T0+od(+post-idx).
+    Desc(UMiPushFinal, mem = MStore, srcA = SA7, useImm = true, imm = SRetPc, dst = SA7,
+         sz = SzLong, isFirst = true),                                          // µPC198
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true),                                       // µPC199
+    Desc(UMiBranchFinal, srcA = ST0, useImm = true, imm = SMiOd,
+         sz = SzLong, miHostIndex = true, isLast = true)                        // µPC200
+  )
+  val rom: Vector[Desc] = romP1() ++ romP2() ++ romP3() ++ romP4() ++ romP5() ++ romP6()
   val BF_DYN_RD_PCREL_DO1_ENTRY  = 178   // rows 178..183
   val BF_DYN_FFO_PCREL_DO1_ENTRY = 184   // rows 184..190
   val MI_BF_RD_DO0_ENTRY  = 130
@@ -1022,6 +1091,10 @@ object Microcode {
   val MI_MOVE_DST_IMM_ENTRY = 127 // rows 127..129 (ptr-load, materialize #imm->T1, host-store T1->mem)
   val PACK_MEM_ENTRY = 166 // rows 166..171 (load Ay/predec x2, PACK compute, store Ax/predec)
   val UNPK_MEM_ENTRY = 172 // rows 172..177 (load Ay/predec, UNPK compute, store lo, shift, store hi)
+  val MI_LEA_ENTRY = 191 // rows 191,192 (ptr-load, T0+od(+post-idx) -> An)
+  val MI_PEA_ENTRY = 193 // rows 193..195 (ptr-load, T0+od(+post-idx) -> T1, push T1 -> -(A7))
+  val MI_JMP_ENTRY = 196 // rows 196,197 (ptr-load, ibranch T0+od(+post-idx))
+  val MI_JSR_ENTRY = 198 // rows 198..200 (push retPC -> -(A7), ptr-load, ibranch T0+od(+post-idx))
   def romSize: Int = rom.size
 
   /** Latched-instruction CONTEXT the engine resolves selectors against. v1 fields
@@ -1177,6 +1250,7 @@ object Microcode {
     // The (An)+/-(An) write-back target: the base An, valid ONLY when an auto mode is set
     // (a non-auto / abs EA -> the r2 ADD writes no reg, an inert NOP).
     case SMovesAn => (ctx.eaBase, ctx.casAutoMode =/= EaAuto.NONE)
+    case SA7      => (U(15, 5 bits), True)   // task #201: the constant A7 stack pointer
     case _       => (U(0, 5 bits), False)
   }
 
@@ -1216,6 +1290,7 @@ object Microcode {
     case SBfMiDispHi => ctx.bfMiDispHi
     case SPackAdj    => ctx.packAdj                     // task #198: PACK/UNPK mem-form adj16
     case SShift8     => U(8, 32 bits).asBits             // task #198: UNPK's high-byte LSR count
+    case SRetPc      => ctx.nextPc.asBits                // task #201: JSR-memind's pushed return PC
     case _           => B(0, 32 bits)
   }
 
@@ -1260,6 +1335,9 @@ object Microcode {
       case UMiPtrLoad  => u.op := DecOp.MOVE
       case UMiHostMove => u.op := DecOp.MOVE
       case UMiHostOp   => u.op := ctx.miOp
+      case UMiLeaFinal    => u.op := DecOp.MOVE     // address-generate (leaAddr short-circuits memOp)
+      case UMiPushFinal   => u.op := DecOp.MOVE     // stack-push store (mirrors pushUop/peaPush)
+      case UMiBranchFinal => u.op := DecOp.BRANCH   // indirect branch (mirrors ibrUop)
       case UMovesRead  => u.op := DecOp.MOVE   // MOVE T0 -> Rn (sign-ext An / merge Dn in EU)
       case _: UCasOp   => u.op := DecOp.CASOP
     }
@@ -1272,6 +1350,12 @@ object Microcode {
       // The §7 host ALU/unary ops (MOVE/ADD/SUB/AND/OR/EOR/CMP/CLR/NEG/NEGX/NOT/TST) all run
       // on the INT (ALU) pipe; CPLX/CHK/DIV are not full-format mem-indirect hosts in scope.
       case UMiHostOp => Cluster.INT
+      // UMiLeaFinal needs the LS-EU's AGU (leaAddr short-circuit, base+imm+scaled-index) —
+      // an explicit override since d.mem=MNone would otherwise default to Cluster.INT
+      // (mirrors the fast-path leaGenUop's `u.cluster := Cluster.LS`). UMiPushFinal
+      // (d.mem=MStore) and UMiBranchFinal (d.mem=MNone -> Cluster.INT, mirrors ibrUop's
+      // own `Cluster.INT`) both already resolve correctly via the `_` default below.
+      case UMiLeaFinal => Cluster.LS
       case UMovesRead => Cluster.INT         // the MOVES read writeback runs on the ALU pipe
       case _: UCasOp => Cluster.INT          // CAS/CAS2 compute runs on the ALU pipe
       case _         => (d.mem match { case MNone => Cluster.INT; case _ => Cluster.LS })
@@ -1364,7 +1448,10 @@ object Microcode {
       u.writesNzvc := Bool(d.writesFlags || d.bfWritesNz || d.nzvcOnly)
       u.writesX    := Bool(d.writesFlags)
     }
-    u.isBranch := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
+    // task #201: UMiBranchFinal is an indirect branch (mirrors ibrUop); UMiPushFinal is a
+    // stack-push store (mirrors pushUop/peaPush). Every other µcode customer is neither.
+    u.isBranch := Bool(d.uop == UMiBranchFinal); u.ibranch := Bool(d.uop == UMiBranchFinal)
+    u.stkPush  := Bool(d.uop == UMiPushFinal);   u.anInc   := 0
     u.cond := 0; u.branchDisp := 0
     // bfIllegal: deliver a vector-4 ILLEGAL (the out-of-scope Do=1-at-abs-EA dynamic
     // RMW/INS forms route here — trap, NOT silent-wrong).
@@ -1476,7 +1563,9 @@ object Microcode {
     // needsSupervisor: set on the FIRST µop of a MOVES (ctx.needsSup) — the ROB delivers a
     // vector-8 privilege violation if the head retires with committed S==0 (the op does NOT
     // execute). keepCommit: a ROM row may force-keep its commit (the MOVES write store).
-    u.leaAddr := False; u.fromCcr := False; u.fromSr := False
+    // task #201: UMiLeaFinal is an address-generate (leaAddr short-circuit on the LS EU —
+    // mirrors the fast-path leaGenUop). Every other µcode customer is not.
+    u.leaAddr := Bool(d.uop == UMiLeaFinal); u.fromCcr := False; u.fromSr := False
     u.needsSupervisor := ctx.needsSup && Bool(d.isFirst)
     u.keepCommit := Bool(d.keepCommit)
     // µcode µops are never commit-time system ops (the system ops ride the fast

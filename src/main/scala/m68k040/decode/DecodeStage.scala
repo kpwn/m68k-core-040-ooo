@@ -170,6 +170,17 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val s1mi_immVec= Mux(s1mi_immL, Vec(s1mi_opw, s1mi_pkt.words(3), s1mi_pkt.words(4), s1mi_pkt.words(5)),
                                     Vec(s1mi_opw, s1mi_pkt.words(2), s1mi_pkt.words(3), s1mi_pkt.words(4)))
     val s1mi_immEa = EaDecoder.decode(s1mi_opw(5 downto 0), slot1Spec0.size, s1mi_immVec)
+    // Control-transfer / address-generate full-format mem-indirect (task #201): LEA/PEA/
+    // JMP/JSR are NEVER recognized by OperationDecoder (it leaves them illegal=True even
+    // in their brief/register-EA form — MicroOpAssembler re-derives their identity from
+    // the raw opword independently), so slot1Spec0.op/.illegal carry NO usable signal for
+    // them; classify straight off `s1mi_opw` bits, mirroring MicroOpAssembler's own
+    // isLeaOp/isPeaOp/isJmpOp/isJsrOp patterns exactly.
+    val s1mi_isLea = (s1mi_opw(15 downto 12) === B"4'h4") && s1mi_opw(8) &&
+                     (s1mi_opw(7 downto 6) === B"11") && (s1mi_opw(5 downto 3).asUInt >= 2)
+    val s1mi_isPea = (s1mi_opw(15 downto 6) === B"10'b0100100001") && (s1mi_opw(5 downto 3).asUInt >= 2)
+    val s1mi_isJmp = s1mi_opw(15 downto 6) === B"10'b0100111011"
+    val s1mi_isJsr = s1mi_opw(15 downto 6) === B"10'b0100111010"
     val slot1IsMemIndEarly = fed.valid && fed.payload.slot1Valid && (
       (s1mi_isMove && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s1mi_isMove && (s1mi_dstEa.klass === EaClass.MEMINDIRECT)) ||
@@ -179,7 +190,11 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       // task #153: the .L-imm case (s1mi_immL) is now routed too (predecode correctly
       // frames it via extW3) -- see the s0IsLineImm mirror below for the full explanation.
       (s1mi_isImm && (s1mi_immEa.klass === EaClass.MEMINDIRECT)) ||
-      (s1mi_isSingle && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)))
+      (s1mi_isSingle && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
+      (s1mi_isLea && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
+      (s1mi_isPea && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
+      (s1mi_isJmp && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
+      (s1mi_isJsr && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)))
     slot1IsMemIndEarly.simPublic()  // debug-only (task #144)
     // slot1 DYNAMIC read-only bit-field (slice 3c) — mirror slot1IsMemIndEarly: its real µops
     // come from the engine (entered from the stashed slot1 packet), so EXCLUDE it from the
@@ -494,6 +509,16 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val s0dstExtW0Shifted = s0WordAtDyn((U(1, 5 bits) + s0srcWordCount.resize(5)).resize(5))
     val s0dstIsMemIndShifted = s0dstModeIsFullCandidate && s0dstExtW0Shifted(8) &&
                                (s0dstExtW0Shifted(2 downto 0).asUInt =/= U(0, 3 bits))
+    // Control-transfer / address-generate full-format mem-indirect (task #201): see the
+    // s1mi_isLea/isPea/isJmp/isJsr comment (mirrored here for slot0) — OperationDecoder
+    // never recognizes JMP/JSR at all (illegal=True always) and marks LEA/PEA non-illegal
+    // for ANY EA mode>=2 (not gated on EA class), so `spec0` carries no usable signal for
+    // this classification; derive straight off `s0opw` bits instead.
+    val s0IsLea = (s0opw(15 downto 12) === B"4'h4") && s0opw(8) &&
+                  (s0opw(7 downto 6) === B"11") && (s0opw(5 downto 3).asUInt >= 2)
+    val s0IsPea = (s0opw(15 downto 6) === B"10'b0100100001") && (s0opw(5 downto 3).asUInt >= 2)
+    val s0IsJmp = s0opw(15 downto 6) === B"10'b0100111011"
+    val s0IsJsr = s0opw(15 downto 6) === B"10'b0100111010"
     val slot0IsMemInd = fed.valid && (
       ((s0IsMove && (s0srcEa.klass === EaClass.MEMINDIRECT))) ||
       ((s0IsMove && ((s0dstEa.klass === EaClass.MEMINDIRECT) || s0dstIsMemIndShifted))) ||
@@ -503,7 +528,11 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       // task #153: the .L-imm case (s0ImmIsL) is NOW routed too -- predecode correctly
       // frames it (extW3), so s0ImmEa's klass is trustworthy for it exactly like .B/.W.
       (s0IsLineImm && (s0ImmEa.klass === EaClass.MEMINDIRECT)) ||
-      (s0IsSingleEa && (s0srcEa.klass === EaClass.MEMINDIRECT)))
+      (s0IsSingleEa && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
+      (s0IsLea && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
+      (s0IsPea && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
+      (s0IsJmp && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
+      (s0IsJsr && (s0srcEa.klass === EaClass.MEMINDIRECT)))
     // ── Bit-field DYNAMIC read-only MEMORY detection (slice 3c) ──────────────────
     // BFTST/BFEXTU/BFEXTS/BFFFO at a memory EA with Do(ext[11])||Dw(ext[5]) set route through
     // the µcode engine (the static-offset/width read-only forms keep the 3a MicroOpAssembler
@@ -1249,7 +1278,26 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
                        (ucEntrySpec.op === DecOp.NEGX) || (ucEntrySpec.op === DecOp.NOT) ||
                        (ucEntrySpec.op === DecOp.TST)
     val ucSingleMi = ucIsSingleEa && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
-    // The chosen mem-indirect EaSpec (the pointer load's base/bd/index + od/post).
+    // ── LEA/PEA/JMP/JSR full-format mem-indirect (task #201) ────────────────────────────
+    // Architecturally the SIMPLEST possible mem-indirect consumers: they need only the
+    // RESOLVED ADDRESS (pointer + od (+post-idx)), never a loaded VALUE, so they route to
+    // their OWN dedicated 2/3-row entries (MI_LEA/PEA/JMP/JSR_ENTRY) instead of the generic
+    // §7 host-op family. OperationDecoder never recognizes JMP/JSR at all (illegal=True
+    // always) and marks LEA/PEA non-illegal for ANY EA mode>=2 regardless of EA class, so
+    // `ucEntrySpec` carries no usable identity signal here -- classify straight off
+    // `ucEopw` bits, mirroring MicroOpAssembler's own isLeaOp/isPeaOp/isJmpOp/isJsrOp
+    // patterns exactly (same technique the slot0/slot1 early-gate mirrors already use).
+    val ucIsLea = (ucEopw(15 downto 12) === B"4'h4") && ucEopw(8) &&
+                  (ucEopw(7 downto 6) === B"11") && (ucEopw(5 downto 3).asUInt >= 2)
+    val ucIsPea = (ucEopw(15 downto 6) === B"10'b0100100001") && (ucEopw(5 downto 3).asUInt >= 2)
+    val ucIsJmp = ucEopw(15 downto 6) === B"10'b0100111011"
+    val ucIsJsr = ucEopw(15 downto 6) === B"10'b0100111010"
+    val ucLeaMi = ucIsLea && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
+    val ucPeaMi = ucIsPea && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
+    val ucJmpMi = ucIsJmp && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
+    val ucJsrMi = ucIsJsr && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
+    // The chosen mem-indirect EaSpec (the pointer load's base/bd/index + od/post). LEA/
+    // PEA/JMP/JSR's EA is ucMiSrcEa (op[5:0]) -- already the else-fallback, no change here.
     val ucMiEa = Mux(ucMoveDstMi, ucMiDstEa, Mux(ucImmDstMi, ucImmEa, ucMiSrcEa))
     // The op IS a full-format mem-indirect host (route to the engine). The entry packet
     // is valid either because it's the correctly-latched stash (ucPendValid) or because
@@ -1257,7 +1305,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // #144: on the stashed-slot1 path, this cycle's live fed.valid is unrelated to the
     // stashed packet's validity and can independently be false, e.g. a bubble, silently
     // zeroing ucIsMemInd and misrouting the µcode entry to the wrong default row).
-    val ucIsMemInd = (ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || ucAddqSubqMi || ucImmDstMi || ucSingleMi) &&
+    val ucIsMemInd = (ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || ucAddqSubqMi || ucImmDstMi || ucSingleMi ||
+                       ucLeaMi || ucPeaMi || ucJmpMi || ucJsrMi) &&
                      (ucPendValid || fed.valid)
     // The host op's OTHER operand register:
     //   MOVE src-EA (load to a reg)  -> the dst reg  = op[11:9] (Dn) / +8 for An (isMovea n/a here).
@@ -1277,10 +1326,15 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // ordinary (non-mem-indirect) ADDA/SUBA/CMPA path. miWNzvc below discriminates the
     // CMPA-writes-flags case from the ADDA/SUBA/MOVEA-writes-no-flags case.
     val ucMiMovea     = (ucMoveSrcMi && ucMoveDstIsAn) || ucAnArith
+    // LEA-memind's destination is An = op[11:9]+8 — the SAME bit field/width as the
+    // MOVEA/ADDA-src "An-wide" arm below (task #201); fold `ucLeaMi` into that arm's
+    // condition rather than adding a new Mux level. Harmless for ctx.miMovea itself
+    // (left unmodified) since MI_LEA_ENTRY's row never reads it (see Microcode.scala's
+    // resolve(), UMiLeaFinal falls into the `case _ => False` isMovea default).
     val ucMiOtherReg = Mux(ucMoveDstMi,
                            Mux(ucMoveSrcAn, (U(8, 5 bits) + ucMoveSrcReg).resize(5), ucMoveSrcReg.resize(5)),
-                           Mux(ucMiMovea, (U(8, 5 bits) + ucEopw(11 downto 9).asUInt).resize(5),
-                               ucEopw(11 downto 9).asUInt.resize(5)))   // Dn for MOVE-src/ALU; An for MOVEA/ADDA-src
+                           Mux(ucMiMovea || ucLeaMi, (U(8, 5 bits) + ucEopw(11 downto 9).asUInt).resize(5),
+                               ucEopw(11 downto 9).asUInt.resize(5)))   // Dn for MOVE-src/ALU; An for MOVEA/ADDA-src/LEA
     // CMPI / TST -> flags-only (no store). The op writes NZVC and (ADD/SUB/NEG/NEGX) X.
     val ucMiOpIsCmp = ucEntrySpec.op === DecOp.CMP
     val ucMiOpIsTst = ucEntrySpec.op === DecOp.TST
@@ -1311,7 +1365,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       Mux(ucMoveDstMi, U(Microcode.MI_MOVE_DST_ENTRY, ew bits),
       Mux(ucAluSrcMi,  U(Microcode.MI_ALU_SRC_ENTRY,  ew bits),
       Mux(ucMiFlagsOnly, U(Microcode.MI_FLAGS_ENTRY, ew bits),
-                         U(Microcode.MI_RMW_ENTRY,    ew bits)))))))))
+      // task #201: LEA/PEA/JMP/JSR each get their OWN dedicated entry (address-generate /
+      // push / ibranch — none of them are a §7 host-op load/store/RMW at all, so they
+      // sit OUTSIDE that family's priority chain rather than inside it).
+      Mux(ucLeaMi, U(Microcode.MI_LEA_ENTRY, ew bits),
+      Mux(ucPeaMi, U(Microcode.MI_PEA_ENTRY, ew bits),
+      Mux(ucJmpMi, U(Microcode.MI_JMP_ENTRY, ew bits),
+      Mux(ucJsrMi, U(Microcode.MI_JSR_ENTRY, ew bits),
+                         U(Microcode.MI_RMW_ENTRY,    ew bits)))))))))))))
     // ---- debug-only observability (task #139 mechanism #2 investigation) ----
     // Zero synth impact (sim tap only, not referenced by any RTL logic).
     ucMiEntry.simPublic()
@@ -1321,6 +1382,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucMoveSrcMi.simPublic(); ucMoveDstMi.simPublic()
     ucMoveSrcMiEaEa.simPublic(); ucMoveDstMiEaEa.simPublic(); ucMoveBothMi.simPublic()
     ucMiFlagsOnly.simPublic()
+    ucLeaMi.simPublic(); ucPeaMi.simPublic(); ucJmpMi.simPublic(); ucJsrMi.simPublic()
     // Populate the MI Ctx group + (reuse the EA infra) the pointer-load EA fields. The host
     // size = spec.size; the pointer load is always LONG. od/post from the chosen EaSpec.
     ucEntryCtx.miOd         := ucMiEa.od
@@ -1344,7 +1406,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     ucEntryCtx.miIsDstEa    := ucMoveDstMi || ucImmDstMi || ucSingleMi || ucAluDstMi || ucAddqSubqMi
     ucEntryCtx.miIsRmw      := (ucImmDstMi || ucSingleMi || ucAluDstMi || ucAddqSubqMi) && !ucMiFlagsOnly
     ucEntryCtx.miOther      := ucMiOtherReg
-    ucEntryCtx.miOtherValid := ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || (ucImmDstMi && !ucIsSingleEa)
+    // ucLeaMi (task #201): LEA-memind's dst = An (op[11:9]+8), fed via ucMiOtherReg above.
+    ucEntryCtx.miOtherValid := ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || (ucImmDstMi && !ucIsSingleEa) || ucLeaMi
     // MOVE #imm,<mem-indirect-dst> (task #156): the "other" side is the literal immediate,
     // not a register -- same miOtherIsImm/miHostImm feed as the line-0-imm/ADDQ families.
     // (`ucMoveDstMiImmEarly`, computed earlier alongside `ucMiEntry`'s selection, is the SAME
