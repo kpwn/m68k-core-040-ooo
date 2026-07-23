@@ -103,6 +103,15 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     rob.logic.completion(2).payload := lsEu.completion.payload
     rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
     rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
+    // Precise-path SQ<->ROB loop (Task P2.5, mirrors top/FullCoreSynth).
+    rob.logic.completion(4).valid   := lsEu.sqCompletionPort.valid
+    rob.logic.completion(4).payload := lsEu.sqCompletionPort.payload
+    rob.logic.sqFaultCompletion.valid   := lsEu.sqFaultCompletionPort.valid
+    rob.logic.sqFaultCompletion.payload := lsEu.sqFaultCompletionPort.payload
+    rob.logic.preciseDrainBusyIn        := lsEu.preciseDrainBusySig
+    lsEu.robHeadIn           := rob.logic.h0
+    lsEu.robHeadValidIn      := rob.logic.count > 0
+    lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
     iq.lsWakeup.valid   := lsEu.wakeup.valid
     iq.lsWakeup.payload := lsEu.wakeup.payload
     iq.lsNzvcWakeup.valid   := lsEu.wakeupNzvc.valid

@@ -500,9 +500,23 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // it must wait for the trace exception to be taken first).
     val retire0 = headReady && !faultedStore(h0) && !isRteStore(h0) && !sysOpStore(h0) &&
                   !interruptPending && !privViolation && !stopped && !tracePendingFire
+    // Root-cause fix (post-Task-P2.5 lock-step investigation): completion port 4
+    // (the SQ precise-path at-head drain) fires ASYNCHRONOUSLY, many cycles after
+    // its store's issue -- unlike every other completion source, which settles
+    // (compValid) at EXECUTE time, long before its instruction reaches h0 (so an
+    // external async input like an interrupt line has had many prior cycles to be
+    // sampled/recognized before a dual-retire pairing can occur). A precise store's
+    // own h0 retire-eligibility can therefore arrive on the SAME cycle its
+    // immediate successor (h1) has ALSO been sitting completes-ready for a while,
+    // letting h1 slip through in the SAME dual-retire cycle before any observer
+    // reacting to h0's retire (e.g. a testbench/interrupt-controller sampling at
+    // instruction boundaries) gets a chance to act on it. Mirrors `h0TraceArmed`'s
+    // existing "force single-wide retire" precedent exactly (same rationale: a
+    // paired h1 must never slip past a boundary that needs a settle cycle first).
+    val h0JustPreciseCompleted = RegNext(completion(4).valid && (completion(4).payload === h0), init = False)
     val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone &&
                   !faultedStore(h1) && !isRteStore(h1) && !needsSupStore(h1) && !sysOpStore(h1) &&
-                  !h0TraceArmed
+                  !h0TraceArmed && !h0JustPreciseCompleted
 
     val traceVec     = Vec(CommitTrace(), 2)
     val traceFireVec = Vec(Bool(), 2)
@@ -549,6 +563,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // branch -> the slot-1 Mux is harmless.
     val commitPc0 = Mux(p0.retireAlone, nextPcStore(h0), p0.predNextPc)
     val commitPc1 = Mux(p1.retireAlone, nextPcStore(h1), p1.predNextPc)
+    // Sim-only taps (root-cause fix, post-Task-P2.5 lock-step investigation): the
+    // IRQ lock-step harness's reactive interrupt-line poke needs to react to the
+    // RAW retire event (not `commitObs`, which is ANOTHER RegNext cycle behind --
+    // see `commitObs(0).fire := RegNext(retire0)` below) to have any chance of
+    // landing in time for the immediate successor's OWN retire decision, which is
+    // only ONE raw cycle behind h0's retire (head advances the very next cycle).
+    retire0.simPublic(); retire1.simPublic()
+    commitPc0.simPublic(); commitPc1.simPublic()
     when(retire0) { driveCommit(0, p0, commitPc0) }
     when(retire1) { driveCommit(1, p1, commitPc1) }
     // (A commit-time SYSTEM op READ commits its dst arch->pdst mapping at the trigger —

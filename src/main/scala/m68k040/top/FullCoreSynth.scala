@@ -174,6 +174,17 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // for precise format-$7 delivery at retire).
     rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
     rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
+    // Precise-path SQ<->ROB loop (Task P2.5): SQ completion/fault-completion ->
+    // ROB's 5th completion port + sqFaultCompletion; ROB head/preempt-pending ->
+    // SQ's at-head drain trigger (via the LsEuPlugin pass-throughs).
+    rob.logic.completion(4).valid   := lsEu.sqCompletionPort.valid
+    rob.logic.completion(4).payload := lsEu.sqCompletionPort.payload
+    rob.logic.sqFaultCompletion.valid   := lsEu.sqFaultCompletionPort.valid
+    rob.logic.sqFaultCompletion.payload := lsEu.sqFaultCompletionPort.payload
+    rob.logic.preciseDrainBusyIn        := lsEu.preciseDrainBusySig
+    lsEu.robHeadIn           := rob.logic.h0
+    lsEu.robHeadValidIn      := rob.logic.count > 0
+    lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
 
     // ---- CPLX (DivEu) wiring: issue port 4 -> DivEu; completion (port 3) + dynamic
     // wakeup + euFault (CHK vec6 / DIV0 vec5). ----

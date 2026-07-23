@@ -154,6 +154,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // for precise format-$7 delivery at retire).
       rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
       rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
+      // Precise-path SQ<->ROB loop (Task P2.5, mirrors top/FullCoreSynth).
+      rob.logic.completion(4).valid   := lsEu.sqCompletionPort.valid
+      rob.logic.completion(4).payload := lsEu.sqCompletionPort.payload
+      rob.logic.sqFaultCompletion.valid   := lsEu.sqFaultCompletionPort.valid
+      rob.logic.sqFaultCompletion.payload := lsEu.sqFaultCompletionPort.payload
+      rob.logic.preciseDrainBusyIn        := lsEu.preciseDrainBusySig
+      lsEu.robHeadIn           := rob.logic.h0
+      lsEu.robHeadValidIn      := rob.logic.count > 0
+      lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
       // The dynamic wakeup must fire ONLY for a completing LOAD (it produces a
       // physreg). A STORE also completes (to retire) but writes NO register; its
       // s1Ctx.uop.pdst is stale/garbage and could spuriously match a consumer's
@@ -539,6 +548,19 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                 xWrite    = false))
           }
         }
+        // Precise-path store completion (Task P2.5): the SQ's at-head drain fires
+        // rob.logic.completion(4)/lsEu.sqCompletionPort instead of lsEu.completion
+        // for a precise store -- no lsEu.logic.wbObs pulse accompanies it (compValid
+        // is never asserted on that path), so synthesize a no-op Wb here (mirrors the
+        // branch EU's no-write capture above), or the later onCommit for this robId
+        // finds no Wb record and throws.
+        {
+          val sc = dut.lsEu.sqCompletionPort
+          if (sc.valid.toBoolean) {
+            wbCount += 1
+            handle.onWb(sc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+          }
+        }
         for (k <- 0 until 2) {
           val c = dut.rob.logic.commitObs(k)
           if (c.fire.toBoolean) {
@@ -822,8 +844,35 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     assert(oracleSteps.size >= nInstr,
       s"[$name] oracle produced ${oracleSteps.size} steps, expected >= $nInstr")
     val oracle = oracleSteps.take(nInstr)
-    val eventPcs = irqEvents.map(_._1 & 0xffffffffL).toSet
-    val levelByPc = irqEvents.map { case (pc, l) => (pc & 0xffffffffL) -> l }.toMap
+    // Root-cause fix (post-Task-P2.5 lock-step investigation), NMI-specific extra
+    // lead time: level 7 can NEVER be recognized via the direct `iplIn > mask`
+    // compare when mask is also 7 (7 > 7 is false, by 68k design -- NMI is
+    // unmaskable only through EDGE detection) -- RobPlugin's `nmiEdge`/`nmiPending`
+    // latch adds ONE MORE register stage beyond the raw retire0/retire1 tap this
+    // harness otherwise uses (see the retire0/commitPc0 comment below), so a
+    // level-7 event needs its `iplIn` transition poked a full instruction earlier
+    // than every other level (which resolves the SAME cycle via the direct
+    // compare). Computed from the oracle trace itself: the trigger pc is the
+    // TARGET instruction's own PREDECESSOR's pc (one step earlier), so `iplIn`
+    // is already 7 by the cycle the target's immediate predecessor retires --
+    // still strictly AFTER that predecessor's own retire decision (so it is never
+    // itself at risk of being wrongly preempted), but a full cycle ahead of the
+    // direct-compare case.
+    val eventPcs = irqEvents.map { case (pc, level) =>
+      val evPc = pc & 0xffffffffL
+      if (level == 7) {
+        val idx = oracleSteps.indexWhere(_.pc == evPc)
+        if (idx > 0) oracleSteps(idx - 1).pc & 0xffffffffL else evPc
+      } else evPc
+    }.toSet
+    val levelByPc = irqEvents.map { case (pc, l) =>
+      val evPc = pc & 0xffffffffL
+      val triggerPc = if (l == 7) {
+        val idx = oracleSteps.indexWhere(_.pc == evPc)
+        if (idx > 0) oracleSteps(idx - 1).pc & 0xffffffffL else evPc
+      } else evPc
+      triggerPc -> l
+    }.toMap
 
     compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
@@ -855,23 +904,59 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
           }
         }
+        // Precise-path store completion (Task P2.5): see the captureSq comment
+        // elsewhere in this file -- no lsEu.logic.wbObs pulse accompanies a precise
+        // store's completion, so synthesize a no-op Wb here too.
+        {
+          val sc = dut.lsEu.sqCompletionPort
+          if (sc.valid.toBoolean) {
+            wbCount += 1
+            handle.onWb(sc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+          }
+        }
+        // Root-cause fix (post-Task-P2.5 lock-step investigation): react to the RAW
+        // retire0/retire1 signals (NOT commitObs, which trails by ANOTHER
+        // `RegNext` cycle -- see `commitObs(0).fire := RegNext(retire0)`) so the
+        // poke lands in time for the immediate successor's OWN retire decision.
+        // Only ONE raw cycle separates h0's retire from its successor's own
+        // retire eligibility (head advances the very next cycle) -- commitObs's
+        // extra register stage ate that entire margin, letting the successor
+        // retire (dual-retire OR solo) on stale (pre-poke) `iplIn`. This is what
+        // the P2.5 regression's IRQ-family divergences traced to: a precise
+        // store's completion (async, many cycles after issue, unlike every other
+        // completion source which settles at execute time long before reaching
+        // h0) coincides with its immediate successor already being
+        // completes-ready, newly exposing this pre-existing one-decision-cycle
+        // gap in the reactive-poke technique (previously masked because a fast
+        // store's completion timing never happened to align a dual-retire pair,
+        // or a same-margin solo retire, exactly at an injection boundary).
+        {
+          val rawPc0 = dut.rob.logic.commitPc0.toLong & 0xffffffffL
+          val rawPc1 = dut.rob.logic.commitPc1.toLong & 0xffffffffL
+          if (dut.rob.logic.retire0.toBoolean && eventPcs.contains(rawPc0) && !firedEvents.contains(rawPc0)) {
+            firedEvents += rawPc0
+            dut.intCtrl.logic.iplIn      #= levelByPc(rawPc0)
+            dut.intCtrl.logic.iackAvec   #= avec
+            dut.intCtrl.logic.iackVector #= vectorIn
+          }
+          if (dut.rob.logic.retire1.toBoolean && eventPcs.contains(rawPc1) && !firedEvents.contains(rawPc1)) {
+            firedEvents += rawPc1
+            dut.intCtrl.logic.iplIn      #= levelByPc(rawPc1)
+            dut.intCtrl.logic.iackAvec   #= avec
+            dut.intCtrl.logic.iackVector #= vectorIn
+          }
+        }
         for (k <- 0 until 2) {
           val c = dut.rob.logic.commitObs(k)
           if (c.fire.toBoolean) {
             commitCount += 1
             val pc = c.pc.toLong & 0xffffffffL
+            if (sys.env.contains("CR_RAW")) {
+              println(f"[$name] RAWCOMMIT k=$k t=${simTime()} rob=${c.robId.toInt} pc=0x$pc%08x iplIn=${dut.intCtrl.logic.iplIn.toInt}")
+            }
             handle.onCommit(c.robId.toInt, pc, sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
               msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
               isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
-            // The just-committed instruction's successor is `pc`. If an IRQ event is
-            // scheduled at `pc` and not yet fired, raise iplIn so the next head
-            // (the eventPc instruction) recognizes the interrupt before committing.
-            if (eventPcs.contains(pc) && !firedEvents.contains(pc)) {
-              firedEvents += pc
-              dut.intCtrl.logic.iplIn      #= levelByPc(pc)
-              dut.intCtrl.logic.iackAvec   #= avec
-              dut.intCtrl.logic.iackVector #= vectorIn
-            }
           }
         }
         {
@@ -3312,6 +3397,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
         val bw = dut.branchEu.logic.wbObs
         if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+        // Precise-path store completion (Task P2.5): see the captureSq comment
+        // elsewhere in this file -- no lsEu.logic.wbObs pulse accompanies a precise
+        // store's completion, so synthesize a no-op Wb here too.
+        val sc = dut.lsEu.sqCompletionPort
+        if (sc.valid.toBoolean) handle.onWb(sc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
         for (k <- 0 until 2) {
           val c = dut.rob.logic.commitObs(k)
           if (c.fire.toBoolean)
@@ -4886,6 +4976,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         val bw = dut.branchEu.logic.wbObs
         if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
       }
+      // Precise-path store completion (Task P2.5): the SQ's at-head drain fires
+      // rob.logic.completion(4)/lsEu.sqCompletionPort instead of lsEu.completion for
+      // a precise store -- no lsEu.logic.wbObs pulse accompanies it (compValid is
+      // never asserted on that path), so synthesize a no-op Wb here (mirrors the
+      // branch EU's no-write capture above), or the later onCommit for this robId
+      // finds no Wb record and throws.
+      def captureSq(): Unit = {
+        val sc = dut.lsEu.sqCompletionPort
+        if (sc.valid.toBoolean) handle.onWb(sc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+      }
       def captureExc(): Unit = {
         val c = dut.rob.logic.commitObs(2)
         if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
@@ -4896,6 +4996,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.onSamplings {
         captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
         captureBranch()
+        captureSq()
         for (k <- 0 until 2) {
           val c = dut.rob.logic.commitObs(k)
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
@@ -5062,6 +5163,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         val bw = dut.branchEu.logic.wbObs
         if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
       }
+      // Precise-path store completion (Task P2.5): the SQ's at-head drain fires
+      // rob.logic.completion(4)/lsEu.sqCompletionPort instead of lsEu.completion for
+      // a precise store -- no lsEu.logic.wbObs pulse accompanies it (compValid is
+      // never asserted on that path), so synthesize a no-op Wb here (mirrors the
+      // branch EU's no-write capture above), or the later onCommit for this robId
+      // finds no Wb record and throws.
+      def captureSq(): Unit = {
+        val sc = dut.lsEu.sqCompletionPort
+        if (sc.valid.toBoolean) handle.onWb(sc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+      }
       def captureExc(): Unit = {
         val c = dut.rob.logic.commitObs(2)
         if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
@@ -5072,6 +5183,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.onSamplings {
         captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
         captureBranch()
+        captureSq()
         for (k <- 0 until 2) {
           val c = dut.rob.logic.commitObs(k)
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
@@ -5185,6 +5297,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
       val bw = dut.branchEu.logic.wbObs
       if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+      // Precise-path store completion (Task P2.5): see the captureSq comment above
+      // (other helpers in this file) -- no lsEu.logic.wbObs pulse accompanies a
+      // precise store's completion, so synthesize a no-op Wb here too.
+      val sc = dut.lsEu.sqCompletionPort
+      if (sc.valid.toBoolean) handle.onWb(sc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
       for (k <- 0 until 2) {
         val c = dut.rob.logic.commitObs(k)
         if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
@@ -6354,6 +6471,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         val bw = dut.branchEu.logic.wbObs
         if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
       }
+      // Precise-path store completion (Task P2.5): the SQ's at-head drain fires
+      // rob.logic.completion(4)/lsEu.sqCompletionPort instead of lsEu.completion for
+      // a precise store -- no lsEu.logic.wbObs pulse accompanies it (compValid is
+      // never asserted on that path), so synthesize a no-op Wb here (mirrors the
+      // branch EU's no-write capture above), or the later onCommit for this robId
+      // finds no Wb record and throws.
+      def captureSq(): Unit = {
+        val sc = dut.lsEu.sqCompletionPort
+        if (sc.valid.toBoolean) handle.onWb(sc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+      }
       def captureExc(): Unit = {
         val c = dut.rob.logic.commitObs(2)
         if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
@@ -6364,6 +6491,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.onSamplings {
         captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
         captureBranch()
+        captureSq()
         for (k <- 0 until 2) {
           val c = dut.rob.logic.commitObs(k)
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,

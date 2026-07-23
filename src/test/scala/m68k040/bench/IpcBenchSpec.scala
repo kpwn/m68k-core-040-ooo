@@ -105,6 +105,15 @@ class IpcBenchSpec extends AnyFunSuite {
       rob.logic.completion(2).payload := lsEu.completion.payload
       rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
       rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
+      // Precise-path SQ<->ROB loop (Task P2.5, mirrors top/FullCoreSynth).
+      rob.logic.completion(4).valid   := lsEu.sqCompletionPort.valid
+      rob.logic.completion(4).payload := lsEu.sqCompletionPort.payload
+      rob.logic.sqFaultCompletion.valid   := lsEu.sqFaultCompletionPort.valid
+      rob.logic.sqFaultCompletion.payload := lsEu.sqFaultCompletionPort.payload
+      rob.logic.preciseDrainBusyIn        := lsEu.preciseDrainBusySig
+      lsEu.robHeadIn           := rob.logic.h0
+      lsEu.robHeadValidIn      := rob.logic.count > 0
+      lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
 
       // CPLX (DivEu) wiring (mirrors top/FullCoreSynth).
       divEu.issue << iq.issue(4)
@@ -364,6 +373,19 @@ class IpcBenchSpec extends AnyFunSuite {
           if (bw.valid.toBoolean) {
             val wb = WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false)
             handle.onWb(bw.robId.toInt, wb); wbMap(bw.robId.toInt) = wb
+          }
+        }
+        // Precise-path store completion (Task P2.5): the SQ's at-head drain fires
+        // rob.logic.completion(4)/lsEu.sqCompletionPort instead of lsEu.completion
+        // for a precise store -- no lsEu.logic.wbObs pulse accompanies it (compValid
+        // is never asserted on that path), so synthesize a no-op Wb here too (mirrors
+        // the branch EU capture above), or handle.onCommit below finds no Wb record
+        // and throws.
+        locally {
+          val sc = dut.lsEu.sqCompletionPort
+          if (sc.valid.toBoolean) {
+            val wb = WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false)
+            handle.onWb(sc.payload.toInt, wb); wbMap(sc.payload.toInt) = wb
           }
         }
 

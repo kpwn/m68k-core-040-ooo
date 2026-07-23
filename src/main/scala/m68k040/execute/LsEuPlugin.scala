@@ -115,6 +115,15 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   var excXlateWrite: Bool = null;   var excXlateSupervisor: Bool = null
   var sqEmptySig: Bool = null   // store queue drained (no committed store in flight)
 
+  // ── Precise-path SQ<->ROB pass-throughs (Task P2.5 wires these end-to-end;
+  // mirrors the excActive/excLoadCmdValid pattern above exactly). ──
+  var robHeadIn: UInt = null
+  var robHeadValidIn: Bool = null
+  var irqPreemptPendingIn: Bool = null
+  var sqCompletionPort: Flow[UInt] = null
+  var sqFaultCompletionPort: Flow[LsFault] = null
+  var preciseDrainBusySig: Bool = null
+
   during setup {
     excActive       = Bool()
     excLoadCmdValid = Bool(); excLoadCmdVaddr = UInt(32 bits); excLoadCmdSize = m68k040.isa.Size()
@@ -123,6 +132,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     excXlateValid   = Bool(); excXlateVpn = UInt(20 bits)
     excXlateWrite   = Bool(); excXlateSupervisor = Bool()
     sqEmptySig      = Bool()
+    robHeadIn              = UInt(6 bits)
+    robHeadValidIn         = Bool()
+    irqPreemptPendingIn    = Bool()
+    sqCompletionPort       = Flow(UInt(6 bits))
+    sqFaultCompletionPort  = Flow(LsFault())
+    preciseDrainBusySig    = Bool()
     issuePort      = Stream(IqContext())
     issuePort.valid.simPublic(); issuePort.ready.simPublic(); issuePort.payload.robId.simPublic() // debug-only, task #139 finding #1; zero synth impact
     completionPort = Flow(UInt(6 bits))
@@ -196,6 +211,13 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     excXlateSupervisor.allowOverride;   excXlateSupervisor := True
     excLoadCmdReady.allowOverride;      excLoadCmdReady := False
 
+    // Precise-path pass-throughs default-idle (allowOverride): a DUT that doesn't
+    // wire the ROB (standalone LS tests) sees robHeadValidIn=False -> headPreciseReady
+    // can never assert, matching the SQ's own pre-P2.5 dead-wired defaults.
+    robHeadIn.allowOverride;           robHeadIn := U(0, 6 bits)
+    robHeadValidIn.allowOverride;      robHeadValidIn := False
+    irqPreemptPendingIn.allowOverride; irqPreemptPendingIn := False
+
     // ---- store queue instance ----
     val sq = new StoreQueue(8)
     sq.io.commit  << sqCommitPort
@@ -203,18 +225,36 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sq.io.flush  := sqFlushSig
     dcache.store << sq.io.drain
     sq.io.drainAck := dcache.storeAck   // pop a drained entry only once memory is written
+    sq.io.drainErr := dcache.storeErr
     sqEmptySig := sq.io.empty           // surfaced for the exception FSM's drain wait
-    // ---- precise-path at-head drain inputs (Task P2.4): still DEAD-WIRED here --
-    // robHeadValidIn defaults False so headPreciseReady can never assert yet, and
-    // drainErr defaults False so no precise drain can ever be observed to fault.
-    // Task P2.5 replaces these four with the real ROB head / preempt-pending /
-    // dcache.storeErr signals (routed through LsEuPlugin's own new pass-through
-    // wires) and routes sqCompletion/sqFaultCompletion/preciseDrainBusy out to the
-    // ROB -- StoreQueue itself is already fully correct as of this task.
-    sq.io.robHeadIn           := U(0, 6 bits)
-    sq.io.robHeadValidIn      := False
-    sq.io.irqPreemptPendingIn := False
-    sq.io.drainErr            := False
+    // ---- precise-path at-head drain (Task P2.5): now fully closed-loop, routed
+    // through LsEuPlugin's own pass-through wires (host DUT wires these to the
+    // ROB's h0/count/interruptPending/tracePendingFire and drains sqCompletion/
+    // sqFaultCompletion/preciseDrainBusy back into the ROB's 5th completion port). ----
+    sq.io.robHeadIn           := robHeadIn
+    sq.io.robHeadValidIn      := robHeadValidIn
+    sq.io.irqPreemptPendingIn := irqPreemptPendingIn
+    // sqCompletionPort/sqFaultCompletionPort are NOT a raw passthrough of
+    // sq.io.sqCompletion/sqFaultCompletion -- see the ready/apply/flush block
+    // below (near `deferCompletion`/`pendMem`). ROB retire-eligibility (port 4 /
+    // `completes(robId)`) must not race ahead of the deferred wbObs replay that
+    // shares the SAME robId -- a real observed corruption
+    // (`bsr-loop-mispredict`): `completes()` firing off the RAW `sq.io.
+    // sqCompletion` let the ROB retire (and, once retired, its physical robId
+    // slot could be REALLOCATED to a brand-new, later instruction) BEFORE a
+    // collision-delayed replay had actually applied -- landing the STALE replay
+    // on the wrong (by-then-reallocated) robId. Idle-default here; driven from
+    // the SAME apply event as the wbObs replay so the two can never separate.
+    sqCompletionPort.valid   := False
+    sqCompletionPort.payload := U(0, 6 bits)
+    sqFaultCompletionPort.valid := False
+    sqFaultCompletionPort.payload.assignDontCare()
+    preciseDrainBusySig    := sq.io.preciseDrainBusy
+    // Sim-only tap: the lock-step/fuzz/IPC-bench harnesses read sqCompletionPort
+    // directly (to synthesize a placeholder Wb record for a precise store's
+    // completion, since no lsEu.logic.wbObs pulse accompanies it) -- needs
+    // simPublic() like every other debug-only tap in this file.
+    sqCompletionPort.simPublic()
 
     // ---- S0: read operands ----
     val u0 = issuePort.payload.uop
@@ -403,6 +443,30 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val fastStore = mmuCtrl2.map(_.mmuEnable).getOrElse(False) &&
                     (s2Cmode =/= m68k040.cache.CacheMode.INHIBITED) &&
                     cacheCtrl.map(_.dcacheEnabled).getOrElse(False)
+    // Root-cause fix (post-Task-P2.5 lock-step investigation): a privileged STORE
+    // (e.g. MOVES.L Dn,<ea>) executed in user mode must NEVER let its memory write
+    // reach the SQ at all -- mirrors the EXISTING `suppressForLaterPrivCheck`
+    // pattern above (line ~1254, same `u1.needsSupervisor && !xlate.req.supervisor`
+    // check, there for a memory-SOURCE sysOp's leading load) for the memory-DEST
+    // case. Why not instead gate the SQ's at-head drain (`headPreciseReady`) on
+    // `!privViolation`? Tried first -- deadlocks: RobPlugin's `privViolation`
+    // itself requires `headReady` (== `completes(h0)`), which for a PRECISE store
+    // is driven EXCLUSIVELY by this very drain completing -- a genuine circular
+    // dependency once the drain is blocked pending a violation-check that can
+    // itself never resolve without the (now-blocked) drain. The PRE-P2 baseline
+    // was never exposed to this: `captureCompletion` fired eagerly at alloc
+    // (completes() immediately, matching normal instructions), while the
+    // ACTUAL WRITE waited on `committed(head)` (itself downstream of `retire0`,
+    // already gated `!privViolation`) -- i.e. completes()-the-bookkeeping and
+    // write-the-memory were ALREADY decoupled, just not through the SQ's new
+    // precise-path proxy. This restores exactly that decoupling for the one case
+    // that needs it: complete immediately (matching every other instruction; the
+    // orphaned register/flag effects are invisible either way -- retire0 excludes
+    // `privViolation`, and the flush that follows rolls back the speculative
+    // rename mapping, the SAME mechanism that already hides every wrong-path
+    // effect in this OoO design) but skip `sq.io.alloc` ENTIRELY, so no memory
+    // write is ever queued.
+    val storePrivBlocked = u1.needsSupervisor && !xlate.req.supervisor
     // Debug-only observability (mirrors compValid/compRobId's task #139 taps just
     // below): zero synth impact, lets a directed test inspect the classification
     // decision directly instead of inferring it from completion timing alone.
@@ -646,6 +710,14 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // Task #189: True for the existing MMU/ATC (DTLB) fault path, False for a
     // plain physical bus error (D-cache refill AXI resp error) — see LsFault.atc.
     val compFaultAtc  = RegInit(True)
+    // Root-cause fix (post-P2.5 lock-step investigation): True the one cycle
+    // `captureCompletion`/`captureFault` actually drives the shared comp*/completion
+    // stage (the LIVE EU pipe's own decision this cycle). The deferred precise-store
+    // replay below (see `pendMem`/`deferCompletion`) reads this AFTER the fsm (later
+    // in elaboration order -> sees the fully-resolved value) to give the live path
+    // strict priority for the single shared completion stage, retrying next cycle on
+    // a collision instead of silently dropping either completion.
+    val liveCompletionFires = Bool()
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax #2: PIPELINE the SQ-forward query result -> completion decision.
@@ -706,6 +778,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // crack µop); so the An write is selected ONLY for an eaAuto STORE.
     val isAutoStoreAn = isStore && (u1.eaAuto =/= m68k040.decode.EaAuto.NONE)
     def captureCompletion(result: Bits): Unit = {
+      liveCompletionFires := True
       compValid     := True
       compRobId     := s1Ctx.robId
       // MOVEM.W LOAD sign-extends the loaded word to the full 32-bit register (Musashi
@@ -762,6 +835,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // behavior) for the DTLB-translation-fault call site; the NEW bus-error call
     // site (D-cache refill AXI resp error, WAIT state below) passes False.
     def captureFault(atc: Boolean = true): Unit = {
+      liveCompletionFires := True
       compValid     := True
       compRobId     := s1Ctx.robId
       compPdstValid := False
@@ -783,6 +857,96 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
         m68k040.isa.Size.LONG -> U(2, 2 bits))
       compFaultSup  := xlate.req.supervisor
       compFaultAtc  := Bool(atc)
+    }
+
+    // ── Precise-store deferred-completion replay (root-cause fix, post-P2.5
+    // lock-step investigation) ──────────────────────────────────────────────
+    // Task P2.2 makes `captureCompletion` for a store CONDITIONAL on `fastStore`,
+    // intentionally withholding compValid (and therefore the real int/NZVC/X PRF
+    // writes, the dynamic wakeups, `completionPort`, AND the sim-only `wbObs`
+    // whitebox tap) for a precise store at alloc time — its ROB *retire-eligibility*
+    // (`completes`) is separately and correctly driven via completion port 4 /
+    // `sq.io.sqCompletion` (Task P2.3/P2.4), but nothing ever replayed the withheld
+    // captureCompletion effects once the SQ actually confirmed the drain. That gap
+    // is the root cause of the P2.5 lock-step regression (142/394 instead of
+    // 390/394, "commit robId=N with no writeback observed" on almost every
+    // LS-touching test — including pure LOADS whose *prologue* stores, under the
+    // MMU-off default, are classified precise): WhiteboxCapture.onCommit requires
+    // an `onWb` record for every retiring robId, and a precise store's An
+    // auto-update / MOVE-to-mem NZVC write never happened at all, in REAL hardware
+    // too (not just the sim tap) — `intW`/`nzvcW`/`wakeupPort` are driven from the
+    // exact same comp* registers as `wbObs`.
+    //
+    // Fix: latch exactly what `captureCompletion` would have captured into a small
+    // side FIFO at alloc time (depth = the SQ's own capacity — a precise store can
+    // never be resident beyond the SQ's 8 entries), and REPLAY it into the shared
+    // comp* stage when `sq.io.sqCompletion` confirms the drain. Success vs fault is
+    // distinguished per-entry (`pendFault`); a faulted drain's effects are dropped
+    // entirely (never applied) — that store's exception delivery already happens
+    // via the separately-wired `sq.io.sqFaultCompletion` -> `rob.logic.sqFaultCompletion`
+    // (mirrors `lsFaultCompletion`), so replaying anything here would be redundant
+    // (or, if compIsFault were (mis)used, would spuriously double-fire
+    // `faultCompletionPort` with stale fields). A flush discards any NOT-YET-
+    // confirmed entries (mirrors StoreQueue's own squash-uncommitted-on-flush rule
+    // — an unconfirmed entry is, by construction, still speculative); an
+    // already-confirmed-but-not-yet-applied entry is left alone (it already reached
+    // the ROB head and completed, so it is guaranteed older than anything a later
+    // flush could legitimately discard).
+    case class PendingStoreWb() extends Bundle {
+      val robId      = UInt(6 bits)
+      val dstArch    = UInt(5 bits)
+      val data       = Bits(32 bits)
+      val pdst       = UInt(6 bits)
+      val pdstValid  = Bool()
+      val wakes      = Bool()
+      val stkPush    = Bool()
+      val eaAutoDrop = Bool()
+      val rmwStore   = Bool()
+      val crackDrop  = Bool()
+      val keepCommit = Bool()
+      val nzvc       = Bits(4 bits)
+      val nzvcWrite  = Bool()
+      val nzvcDst    = UInt(nzvcW.address.getWidth bits)
+    }
+    val pendDepth = 8   // == StoreQueue(8)'s own depth; see comment above
+    val pendMem   = Vec.fill(pendDepth)(Reg(PendingStoreWb()))
+    val pendFault = Vec.fill(pendDepth)(RegInit(False))
+    // Latched verbatim from `sq.io.sqFaultCompletion.payload` the cycle it fires
+    // (a Flow, valid for exactly that one cycle) -- replayed out through
+    // `sqFaultCompletionPort` at the (possibly much later) apply cycle, alongside
+    // `sqCompletionPort`, so the two ROB-facing signals never separate from the
+    // wbObs replay they must stay synchronized with (see the port-driving
+    // comment above the `sqCompletionPort.valid := False` default).
+    val pendFaultPayload = Vec.fill(pendDepth)(Reg(LsFault()))
+    val pendPtrW  = log2Up(pendDepth)
+    val pendPush  = Reg(UInt(pendPtrW bits)) init 0   // next free slot to WRITE (alloc time)
+    val pendReady = Reg(UInt(pendPtrW bits)) init 0   // SQ has confirmed the drain up to here
+    val pendApply = Reg(UInt(pendPtrW bits)) init 0   // already replayed into comp* up to here
+
+    // Called instead of `captureCompletion` on the `!fastStore` (precise) store-alloc
+    // arms — same decision cycle, same live u1/s1 signals, just latched for later
+    // instead of driving comp* immediately.
+    def deferCompletion(): Unit = {
+      val e = PendingStoreWb()
+      e.robId      := s1Ctx.robId
+      e.dstArch    := u1.dstArch
+      // A store never reaches captureCompletion's leaAddr/ldResult branches (those
+      // are load/LEA-only) -- the store result Mux collapses to exactly this.
+      e.data       := Mux(u1.stkPush, s1Va.asBits, Mux(isAutoStoreAn, s1AnWb, B(0, 32 bits)))
+      e.pdst       := u1.pdst
+      e.pdstValid  := u1.pdstValid
+      e.wakes      := u1.stkPush || (isAutoStoreAn && u1.pdstValid)
+      e.stkPush    := u1.stkPush
+      e.eaAutoDrop := isAutoStoreAn && !u1.writesNzvc
+      e.rmwStore   := isStore && !u1.pdstValid && !u1.writesNzvc && !u1.stkPush
+      e.crackDrop  := u1.divIsRem
+      e.keepCommit := u1.keepCommit
+      e.nzvc       := storeNzvc
+      e.nzvcWrite  := u1.writesNzvc
+      e.nzvcDst    := u1.pNzvcDst
+      pendMem(pendPush) := e
+      pendFault(pendPush) := False   // fresh slot: clear any stale fault flag from a prior occupant
+      pendPush := pendPush + 1
     }
 
     // ---- drive completion / writeback / wakeup from the registered stage ----
@@ -894,6 +1058,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     compNzvcWrite := False
     compXWrite := False
     compIsFault := False
+    // Default-clear; set True by captureCompletion/captureFault below (read AFTER
+    // the fsm closes, by the deferred-replay arbitration -- see its comment).
+    liveCompletionFires := False
 
     val fsm = new StateMachine {
       val IDLE    = new State with EntryPoint
@@ -998,12 +1165,25 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
             busy    := False
             s1Valid := False
             goto(IDLE)
+          } elsewhen(storePrivBlocked) {
+            // Privileged store (e.g. MOVES.L) in user mode: complete immediately
+            // (matching every other instruction's eager completes()) but NEVER
+            // touch `sq.io.alloc` -- no memory write is ever queued. See
+            // `storePrivBlocked`'s declaration comment for the full story.
+            captureCompletion(B(0, 32 bits))
+            busy    := False
+            s1Valid := False
+            goto(IDLE)
           } elsewhen(!sq.io.full) {
             sq.io.alloc.valid           := True
             sq.io.alloc.payload.precise := !fastStore
             when(fastStore) {
               // exactly today's path: architectural completion the SAME cycle as alloc.
               captureCompletion(B(0, 32 bits))
+            } otherwise {
+              // precise: latch the withheld completion for later replay (see
+              // `deferCompletion` above) when the SQ confirms the drain.
+              deferCompletion()
             }
             // !fastStore: allocate WITHOUT completing. The LS EU's single-outstanding
             // contract does not depend on completion -- it frees here regardless; the
@@ -1189,12 +1369,111 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
         } elsewhen(!sq.io.full) {
           sq.io.alloc.valid           := True
           sq.io.alloc.payload.precise := !fastStore
-          when(fastStore) { captureCompletion(B(0, 32 bits)) }
+          when(fastStore) { captureCompletion(B(0, 32 bits)) } otherwise { deferCompletion() }
           busy    := False
           s1Valid := False
           goto(IDLE)
         }
       }
+    }
+
+    // ── Precise-store deferred-completion replay: ready/apply/flush (root-cause
+    // fix, post-P2.5 lock-step investigation) — see the `deferCompletion` comment
+    // above for the full design. Placed AFTER the fsm (elaboration-order-later, so
+    // `liveCompletionFires` below reads this cycle's FULLY resolved value). ──────
+    //
+    // The SQ confirms the OLDEST outstanding precise entry's drain -- `sqCompletion`
+    // corresponds 1:1, in order, with `pendReady` (both advance exactly once per
+    // precise-store SQ pop, success or fault).
+    when(sq.io.sqCompletion.valid) {
+      pendFault(pendReady) := sq.io.sqFaultCompletion.valid
+      // Latch the WHOLE fault payload now (this Flow pulse is the only cycle it is
+      // valid) so it can be replayed out `sqFaultCompletionPort` at apply time,
+      // however much later that lands -- see `sqCompletionPort`'s port-driving
+      // comment above the SQ instance for why it can no longer be a raw passthrough.
+      pendFaultPayload(pendReady) := sq.io.sqFaultCompletion.payload
+      pendReady := pendReady + 1
+    }
+    // Flush discards any NOT-YET-confirmed entries (mirrors StoreQueue's own
+    // squash-uncommitted-on-flush `keep` rule). Already-confirmed entries
+    // (< pendReady) are untouched -- see the design comment above for why that is
+    // always safe. GOTCHA (found via a real observed bug: `bsr-loop-mispredict`'s
+    // RAS-recovery test corrupted a LATER a7 fold after a same-cycle flush):
+    // `pendReady` is a Reg -- reading it here (a SEPARATE `when` from the block
+    // above) sees this cycle's OLD value even when `sq.io.sqCompletion.valid` ALSO
+    // fires this exact cycle, so collapsing `pendPush` to the raw (pre-increment)
+    // `pendReady` would discard the entry that is completing THIS SAME cycle --
+    // whose memory write has ALREADY unconditionally happened (the drain already
+    // fired), so it is by definition confirmed, not speculative, and must still be
+    // replayed. Add the same +1 explicitly so a same-cycle
+    // flush-races-a-completion never regresses `pendPush` below the true
+    // (post-this-cycle) ready count.
+    val pendReadyAfterThisCycle = pendReady + (sq.io.sqCompletion.valid ? U(1, pendPtrW bits) | U(0, pendPtrW bits))
+    when(sqFlushSig) {
+      pendPush := pendReadyAfterThisCycle
+    }
+    // Replay the oldest ready-but-not-yet-applied entry's effects into the SHARED
+    // comp*/completion stage, UNLESS the live EU pipe already claimed it this cycle
+    // (liveCompletionFires) -- a collision just retries next cycle; the backlog is
+    // bounded by the SQ's own depth (pendPush can never outrun pendApply by more
+    // than `pendDepth`, since a new precise alloc is itself gated on `!sq.io.full`).
+    // A FAULTED entry's register/flag/wbObs effects are dropped entirely (no
+    // compValid at all -- firing it would be at best redundant and at worst wrong,
+    // since compIsFault also drives `faultCompletionPort`, a DIFFERENT port meant
+    // only for the DTLB/MMU-fault path). `sqCompletionPort`/`sqFaultCompletionPort`
+    // (ROB retire-eligibility, port 4) fire HERE -- the SAME cycle as the wbObs
+    // replay, success or fault -- never off the raw (possibly much earlier)
+    // `sq.io.sqCompletion`, so the ROB can never retire (and reallocate) this
+    // robId before its own replay has actually landed. See the port-driving
+    // comment above the SQ instance for the corruption this fixes.
+    //
+    // FAST PATH (no existing backlog): apply THIS SAME cycle off the RAW `sq.io.
+    // sqCompletion`/`sqFaultCompletion` -- `pendFault`/`pendFaultPayload` for
+    // THIS entry are not written until NEXT cycle (see the block above), so the
+    // fast path reads the live SQ signals directly instead. Without this, EVERY
+    // precise completion would gain a full extra cycle of latency vs. the
+    // pre-this-fix baseline (`pendReady` is a Reg -- `pendApply =/= pendReady`
+    // cannot see a same-cycle `sqCompletion.valid` at all) -- found via a real
+    // observed bug: `irq-nmi` needs EXACTLY one extra register stage (RobPlugin's
+    // own nmiEdge/nmiPending latch) beyond a direct-compare interrupt's timing,
+    // calibrated against this SAME-cycle fast path; the always-registered version
+    // added a SECOND stage on top and mis-timed the injection by a cycle.
+    // BACKLOG PATH (an earlier entry is still waiting, or this cycle lost a
+    // `liveCompletionFires` collision on a prior cycle): apply from the
+    // REGISTERED `pendFault`/`pendFaultPayload`, exactly as before.
+    val applyFast    = (pendApply === pendReady) && sq.io.sqCompletion.valid
+    val applyBacklog = pendApply =/= pendReady
+    val applyFault   = Mux(applyFast, sq.io.sqFaultCompletion.valid, pendFault(pendApply))
+    when((applyFast || applyBacklog) && !liveCompletionFires) {
+      val e = pendMem(pendApply)
+      sqCompletionPort.valid   := True
+      sqCompletionPort.payload := e.robId
+      when(!applyFault) {
+        compValid      := True
+        compRobId      := e.robId
+        compData       := e.data
+        compPdst       := e.pdst
+        compPdstValid  := e.pdstValid
+        compIsLoad     := False
+        compWakes      := e.wakes
+        compStkPush    := e.stkPush
+        compCcrRestore := False
+        compEaAutoDrop := e.eaAutoDrop
+        compRmwStore   := e.rmwStore
+        compCrackDrop  := e.crackDrop
+        compKeepCommit := e.keepCommit
+        compDstArch    := e.dstArch
+        compNzvc       := e.nzvc
+        compNzvcWrite  := e.nzvcWrite
+        compNzvcDst    := e.nzvcDst
+        compX          := False
+        compXWrite     := False
+        compIsFault    := False
+      } otherwise {
+        sqFaultCompletionPort.valid   := True
+        sqFaultCompletionPort.payload := Mux(applyFast, sq.io.sqFaultCompletion.payload, pendFaultPayload(pendApply))
+      }
+      pendApply := pendApply + 1
     }
 
     // ---- debug-only FSM-state observability (task #139 finding #1 investigation) ----
