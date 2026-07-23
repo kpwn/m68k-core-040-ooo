@@ -170,6 +170,17 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // always True — those are a separate override, last-wins, below).
     val privCtrl = host.get[m68k040.services.PrivilegeService]
 
+    // fast/precise store classification (Task P2.2). OPTIONAL (host.get, mirrors
+    // privCtrl above / RobPlugin's own mmuCtrl fallback): a standalone LS-EU DUT
+    // with no MmuControlPlugin/RobPlugin wired (most existing directed LS tests —
+    // they use DIdentityTranslationPlugin, no MMU present) falls back to the real
+    // architectural reset defaults (mmuEnable=0, CACR.DE=0) below, at the point
+    // `fastStore` is computed — i.e. those DUTs classify every store as precise,
+    // which mirrors actual 68040 reset-state hardware (MMU off, D-cache off), not a
+    // test-harness special case.
+    val mmuCtrl2  = host.get[m68k040.services.MmuControlService]
+    val cacheCtrl = host.get[m68k040.services.CacheControlService]
+
     // exc-arbitration inputs default-idle (allowOverride): a DUT that doesn't wire
     // the exception unit (standalone LS tests) sees excActive=False -> the LS EU
     // owns the cache exactly as before.
@@ -371,6 +382,21 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val s2Fault  = RegInit(False)
     val s2Cmode  = Reg(m68k040.cache.CacheMode())
 
+    // Task P2.2: fast := mmuEnabled && cacheable(s2Cmode) && CACR.DE — a pure
+    // combinational read of already-latched architectural facts (mmuEnable/CACR.DE
+    // are live config state; s2Cmode is REGISTERED at XLATE, same stage s2Paddr is
+    // available), no probe/filter/history. A store for which this is False (MMU-
+    // off, INHIBITED, or DE=0) is a PRECISE-path store: the XLATE/WAIT_SQ store
+    // arms below allocate it into the SQ but withhold `captureCompletion` — its ROB
+    // completion instead comes later from the SQ's at-head drain (Task P2.4).
+    val fastStore = mmuCtrl2.map(_.mmuEnable).getOrElse(False) &&
+                    (s2Cmode =/= m68k040.cache.CacheMode.INHIBITED) &&
+                    cacheCtrl.map(_.dcacheEnabled).getOrElse(False)
+    // Debug-only observability (mirrors compValid/compRobId's task #139 taps just
+    // below): zero synth impact, lets a directed test inspect the classification
+    // decision directly instead of inferring it from completion timing alone.
+    fastStore.simPublic(); s2Cmode.simPublic()
+
     // ─────────────────────────────────────────────────────────────────────────
     // FMax #1: REGISTER the AGU effective address at the D-cache boundary.
     //
@@ -450,7 +476,13 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sq.io.alloc.payload.vaddrB     := s1AddrB
     sq.io.alloc.payload.cacheMode  := s2Cmode
     sq.io.alloc.payload.supervisor := xlate.req.supervisor
-    sq.io.alloc.payload.precise    := False   // Task P2.2 replaces this with the real !fast classification
+    // Task P2.2: the real fast/precise classification (was a `False` placeholder in
+    // Task P2.1). Live default off `fastStore`, matching every other field's
+    // unconditional-default-before-the-FSM style above; the XLATE/WAIT_SQ
+    // alloc-success branches below re-state it explicitly alongside the
+    // conditional `captureCompletion` call for readability (same value, harmless
+    // last-assignment-wins restatement).
+    sq.io.alloc.payload.precise    := !fastStore
     sq.io.fwd.query.robId := s1Ctx.robId
     sq.io.fwd.query.paddr := s2Paddr
     sq.io.fwd.query.size  := u1.size
@@ -956,8 +988,16 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
             s1Valid := False
             goto(IDLE)
           } elsewhen(!sq.io.full) {
-            sq.io.alloc.valid := True
-            captureCompletion(B(0, 32 bits))
+            sq.io.alloc.valid           := True
+            sq.io.alloc.payload.precise := !fastStore
+            when(fastStore) {
+              // exactly today's path: architectural completion the SAME cycle as alloc.
+              captureCompletion(B(0, 32 bits))
+            }
+            // !fastStore: allocate WITHOUT completing. The LS EU's single-outstanding
+            // contract does not depend on completion -- it frees here regardless; the
+            // store's ROB completion arrives later from the SQ's at-head drain
+            // (StoreQueue's sqCompletion/sqFaultCompletion Flows, Task P2.4).
             busy    := False
             s1Valid := False
             goto(IDLE)
@@ -1136,8 +1176,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           s1Valid := False
           goto(IDLE)
         } elsewhen(!sq.io.full) {
-          sq.io.alloc.valid := True
-          captureCompletion(B(0, 32 bits))
+          sq.io.alloc.valid           := True
+          sq.io.alloc.payload.precise := !fastStore
+          when(fastStore) { captureCompletion(B(0, 32 bits)) }
           busy    := False
           s1Valid := False
           goto(IDLE)
