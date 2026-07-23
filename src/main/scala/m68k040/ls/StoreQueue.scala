@@ -461,4 +461,9 @@ class StoreQueue(depth: Int = 8) extends Component {
   // later-observed stuck head can be traced back to the actual allocating PC
   // even after the ROB has reused that robId number for a newer instruction.
   io.alloc.valid.simPublic(); io.alloc.payload.robId.simPublic(); io.alloc.payload.paddr.simPublic()
+  // Task P2.5 post-review fix: expose the RAW at-head drain-confirm pulse (before
+  // LsEuPlugin's own apply/collision-retry arbitration) so a directed test can
+  // distinguish "the SQ confirmed the drain this cycle" from "the replay actually
+  // applied it" -- the whole point of the `liveCompletionFires` collision test.
+  io.sqCompletion.valid.simPublic(); io.sqCompletion.payload.simPublic()
 }

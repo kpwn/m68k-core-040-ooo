@@ -510,13 +510,33 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // immediate successor (h1) has ALSO been sitting completes-ready for a while,
     // letting h1 slip through in the SAME dual-retire cycle before any observer
     // reacting to h0's retire (e.g. a testbench/interrupt-controller sampling at
-    // instruction boundaries) gets a chance to act on it. Mirrors `h0TraceArmed`'s
-    // existing "force single-wide retire" precedent exactly (same rationale: a
-    // paired h1 must never slip past a boundary that needs a settle cycle first).
-    val h0JustPreciseCompleted = RegNext(completion(4).valid && (completion(4).payload === h0), init = False)
+    // instruction boundaries) gets a chance to act on it. STICKY, level-sensitive
+    // latch (post-review fix -- the original was a one-shot RegNext pulse that
+    // self-cleared exactly one cycle after the completion(4) pulse regardless of
+    // whether h0's own retire0 had actually fired that cycle yet; if retire0 was
+    // ADDITIONALLY delayed past that single cycle by an unrelated stall coincident
+    // with h0 -- interruptPending, tracePendingFire, stopped, all of which also gate
+    // retire0 above -- the guard would have already self-cleared before h0's real
+    // retire cycle, silently reopening the exact dual-retire race this mechanism
+    // exists to prevent). Sets on the completion(4) pulse and clears only when
+    // retire0 actually fires (h0 itself retires and head is about to advance past
+    // it) -- this now mirrors `h0TraceArmed`'s level-sensitive "stays asserted every
+    // cycle until retire0 actually fires" behavior EXACTLY, not just its "force
+    // single-wide retire" intent.
+    val h0PreciseCompletedSticky = RegInit(False)
+    when(retire0) {
+      h0PreciseCompletedSticky := False
+    }.elsewhen(completion(4).valid && (completion(4).payload === h0)) {
+      // retire0 given priority above is intentionally defensive: architecturally a
+      // fresh completion(4) pulse for the exact entry that is ALSO retiring this
+      // same cycle cannot occur (that pulse would have had to fire a prior cycle to
+      // make completes(h0)/retire0 true in the first place), but ordering it this
+      // way costs nothing and removes any ambiguity.
+      h0PreciseCompletedSticky := True
+    }
     val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone &&
                   !faultedStore(h1) && !isRteStore(h1) && !needsSupStore(h1) && !sysOpStore(h1) &&
-                  !h0TraceArmed && !h0JustPreciseCompleted
+                  !h0TraceArmed && !h0PreciseCompletedSticky
 
     val traceVec     = Vec(CommitTrace(), 2)
     val traceFireVec = Vec(Bool(), 2)

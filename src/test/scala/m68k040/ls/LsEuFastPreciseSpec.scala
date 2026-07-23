@@ -33,6 +33,34 @@ class CacheControlStubPlugin extends FiberPlugin with CacheControlService {
   }
 }
 
+/** Task P2.5 post-review fix: a minimal glue plugin mirroring FullCoreSynth's
+  * `BackendWiringPlugin` pattern (see FullCoreSynth.scala's `lsEu.robHeadIn :=
+  * rob.logic.h0` block). `LsEuPlugin.robHeadIn`/`robHeadValidIn`/`sqCompletionPort`
+  * are bare plugin-level pass-through fields (populated during `setup`, driven/read
+  * in `logic`'s `during build`), not proper `in()`/`out()` IO nested in an Area. In
+  * a standalone LS-only DUT (no RobPlugin providing a real HDL-level override),
+  * `robHeadIn`'s only driver is its own idle default (`robHeadIn := U(0,6 bits)`) --
+  * Verilog generation constant-folds it away entirely, so a raw sim poke on it
+  * (even simPublic-tagged) cannot work. Likewise `sqCompletionPort`, having no
+  * consumer at all in a standalone DUT, gets pruned despite simPublic(). This
+  * plugin gives both a genuine IO-backed detour: real `in()` ports drive
+  * `robHeadIn`/`robHeadValidIn` (a real HDL-level override, exactly like
+  * FullCoreSynth's own wiring), and real `out()` ports mirror `sqCompletionPort`
+  * for observation -- both are then real, freely sim-pokeable/readable signals. */
+class TbPreciseDrainWirePlugin(eu: LsEuPlugin) extends FiberPlugin {
+  val logic = during build new Area {
+    val iRobHeadIn      = in UInt (6 bits)
+    val iRobHeadValidIn = in Bool ()
+    eu.robHeadIn      := iRobHeadIn
+    eu.robHeadValidIn := iRobHeadValidIn
+
+    val oSqCompValid   = out Bool ()
+    val oSqCompPayload = out UInt (6 bits)
+    oSqCompValid   := eu.sqCompletionPort.valid
+    oSqCompPayload := eu.sqCompletionPort.payload
+  }
+}
+
 /** Task P2.2 directed tests: LsEuPlugin's fast-vs-precise store classification
   * (`fastStore := mmuEnable && cacheable(s2Cmode) && CACR.DE`) and the resulting
   * CONDITIONAL `captureCompletion` at the SQ-alloc point.
@@ -63,7 +91,8 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
     val cacheCtrl = new CacheControlStubPlugin
     val eu        = new LsEuPlugin
     val src       = new LsEuSourcePlugin
-    db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, ctrl, dtlb, dcache, cacheCtrl, eu, src)) }
+    val wire      = new TbPreciseDrainWirePlugin(eu)
+    db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, ctrl, dtlb, dcache, cacheCtrl, eu, src, wire)) }
   }
 
   def simConfig = M68kSim().withVerilator
@@ -100,11 +129,12 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
     val ptmem = new BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
-    s.iStkPush #= false
+    s.iStkPush #= false; s.iLeaAddr #= false
     s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false
     dut.ctrl.logic.mmuEnable #= false
     dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
     dut.cacheCtrl.logic.dcacheEnabled #= false
+    dut.wire.logic.iRobHeadIn #= 0; dut.wire.logic.iRobHeadValidIn #= false
     cd.waitSampling(80) // PRF init sweep
     (cd, mem, ptmem)
   }
@@ -118,6 +148,27 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
     s.iPdstValid #= false; s.iPdst #= 0; s.iRobId #= robId
     cd.waitSamplingWhere(s.iReady.toBoolean)
     s.iValid #= false
+  }
+
+  /** LEA address-generate: completes deterministically (NO translate, NO cache/AXI
+    * access at all -- see LsEuPlugin's `IDLE.whenIsActive` `when(u1.leaAddr)` arm) a
+    * FIXED 2 cycles after issue is accepted (capture at accept+1, ready-for-next-issue
+    * at accept+3). Used as the "live op" in the `liveCompletionFires` collision test
+    * below: its captureCompletion timing has zero dependency on the randomized AXI
+    * write-ready timing that governs a precise store's real background drain, so a
+    * continuous back-to-back LEA train gives a fully deterministic (for a fixed sim
+    * seed), period-3 stream of `liveCompletionFires` pulses to collide against. */
+  def issueLea(dut: Dut, cd: ClockDomain, basePreg: Int, robId: Int): Unit = {
+    val s = dut.src.logic
+    s.iValid #= true; s.iMemOp #= MemOp.LOAD; s.iSize #= Size.LONG
+    s.iPsrcA #= basePreg; s.iPsrcAValid #= true
+    s.iPsrcB #= 0; s.iPsrcBValid #= false
+    s.iImm #= 0
+    s.iPdstValid #= false; s.iPdst #= 0; s.iRobId #= robId
+    s.iLeaAddr #= true
+    cd.waitSamplingWhere(s.iReady.toBoolean)
+    s.iValid #= false
+    s.iLeaAddr #= false
   }
 
   /** Poll for the SQ alloc pulse. Returns (entryIdx, completedNextCycle) — the SQ
@@ -195,6 +246,107 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
       cd.waitSampling(2)
       assert(dut.eu.logic.sq.robIds(idx).toInt == 6, "sanity: allocated entry belongs to this store")
       assert(!dut.eu.logic.sq.precises(idx).toBoolean, "MMU-on WRITETHROUGH DE=1 store must classify precise=False")
+    }
+  }
+
+  // ── Task P2.5 post-review fix: `liveCompletionFires` same-cycle collision ────────
+  // (LsEuPlugin.scala's deferred-completion replay: `deferCompletion`/`pendMem`/
+  // `pendReady`/`pendApply`/`liveCompletionFires`). If the live EU pipe's own
+  // `captureCompletion`/`captureFault` and a pending replay entry BOTH want the
+  // shared `comp*` stage on the SAME cycle, the replay must yield and retry the NEXT
+  // available cycle -- never drop the entry.
+  //
+  // This directed test engineers that exact collision: it drives the SQ's real
+  // precise-path at-head drain (`robHeadIn`/`robHeadValidIn`, normally supplied by
+  // RobPlugin -- see the `simPublic()` taps added to those pass-throughs for exactly
+  // this purpose) for a full BATCH of precise stores, WHILE a continuous,
+  // fully-deterministic LEA train (LEA never translates / never touches the D-cache
+  // or AXI at all -- see `issueLea`'s doc comment: a fixed period-3 `liveCompletionFires`
+  // pulse train) runs concurrently through the same single-outstanding EU pipe. A
+  // precise store's drain-confirm cycle (`sq.io.sqCompletion`) is timed by the
+  // D-cache write path's randomized AXI-ready handshake (`BehavioralMemAgent`'s
+  // `StreamReadyRandomizer`s) -- running a whole batch (one per SQ slot, 8 independent
+  // draws) with the LEA train active throughout reliably produces at least one
+  // exact-cycle collision for a FIXED sim seed. Pinning the seed makes the entire run
+  // (including every AXI-ready draw) bit-for-bit reproducible, so this is
+  // deterministic on every future run, not flaky -- `collisionSeen` is asserted
+  // explicitly so a future change that accidentally stops exercising the collision
+  // path fails loudly instead of silently passing a vacuous test.
+  test("liveCompletionFires collision: a same-cycle live capture defers (never drops) the pending SQ-drain replay", VerilatorTest) {
+    simConfig.compile(new Dut).doSim(2) { dut =>
+      val (cd, mem, ptmem) = initDut(dut)
+      val base = 0x5000L
+      seed(dut, cd, preg = 10, value = base)          // store base
+      seed(dut, cd, preg = 11, value = 0xC001C0DEL)   // store data
+      seed(dut, cd, preg = 12, value = 0x9000L)       // LEA base (unrelated address space)
+
+      val numStores   = 8   // == the SQ's own depth: maximizes independent drain-latency draws
+      val storeRobIds = (0 until numStores).map(20 + _)
+
+      // Phase 1: allocate every precise store UP FRONT (robHeadValidIn stays False --
+      // no drain trigger yet), one at a time through the single-outstanding EU pipe.
+      for ((robId, i) <- storeRobIds.zipWithIndex) {
+        issueStore(dut, cd, basePreg = 10, disp = i * 4, dataPreg = 11, Size.LONG, robId = robId)
+      }
+      // A few extra cycles of margin: `iReady` returning for store N only guarantees
+      // store N-1 has already allocated, not that store N itself has (its own
+      // translate/resolve still needs a couple more cycles) -- wait for it to settle.
+      cd.waitSampling(10)
+      assert(dut.eu.logic.sq.io.full.toBoolean, s"all $numStores stores must be resident (SQ full) before draining starts")
+
+      // Phase 2: start the SQ's real background drain (auto-track whichever entry is
+      // CURRENTLY at the ring head -- entries drain strictly in order) AND a
+      // continuous LEA train through the SAME EU pipe, concurrently, via forks.
+      val doneFlag = new java.util.concurrent.atomic.AtomicBoolean(false)
+      fork {
+        while (!doneFlag.get()) {
+          val h = dut.eu.logic.sq.head.toInt
+          dut.wire.logic.iRobHeadIn      #= dut.eu.logic.sq.robIds(h).toInt
+          dut.wire.logic.iRobHeadValidIn #= dut.eu.logic.sq.valids(h).toBoolean
+          cd.waitSampling()
+        }
+      }
+      fork {
+        var i = 0
+        while (!doneFlag.get()) {
+          issueLea(dut, cd, basePreg = 12, robId = 40 + (i % 8))
+          i += 1
+        }
+      }
+
+      // Observe: every precise store's sqCompletionPort pulse (must land EXACTLY
+      // once each, never dropped/duplicated even across a collision), and whether a
+      // genuine liveCompletionFires collision with a wants-to-apply pending entry was
+      // observed (the interesting path this test exists to exercise).
+      val seenCounts = scala.collection.mutable.Map[Int, Int]().withDefaultValue(0)
+      var collisionSeen = false
+      var n = 0
+      val maxCycles = 4000
+      while (seenCounts.keySet.size < numStores && n < maxCycles) {
+        val wantsApply =
+          (dut.eu.logic.pendApply.toInt == dut.eu.logic.pendReady.toInt && dut.eu.logic.sq.io.sqCompletion.valid.toBoolean) ||
+          (dut.eu.logic.pendApply.toInt != dut.eu.logic.pendReady.toInt)
+        if (wantsApply && dut.eu.logic.liveCompletionFires.toBoolean) collisionSeen = true
+        if (dut.wire.logic.oSqCompValid.toBoolean) {
+          val rid = dut.wire.logic.oSqCompPayload.toInt
+          seenCounts(rid) += 1
+        }
+        cd.waitSampling()
+        n += 1
+      }
+      doneFlag.set(true)
+      cd.waitSampling(4)
+
+      assert(n < maxCycles, s"timed out waiting for all $numStores precise-store completions (only saw ${seenCounts.keySet.size})")
+      assert(collisionSeen,
+        "test failed to engineer a liveCompletionFires collision with a wants-to-apply pending entry -- " +
+        "adjust numStores/seed (this assertion is intentional: it proves the interesting retry path was " +
+        "actually exercised, not merely inferred)")
+      assert(storeRobIds.forall(seenCounts.contains),
+        s"every store's robId must be observed via sqCompletionPort, got ${seenCounts.keySet}")
+      assert(storeRobIds.forall(r => seenCounts(r) == 1),
+        "every precise store's sqCompletionPort pulse must fire EXACTLY once (no drop, no duplicate) " +
+        s"even across a liveCompletionFires collision, got $seenCounts")
     }
   }
 }

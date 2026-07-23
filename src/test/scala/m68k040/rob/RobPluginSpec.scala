@@ -756,4 +756,106 @@ class RobPluginSpec extends AnyFunSuite {
       assert(seen, "tracePendingFire must fire once preciseDrainBusyIn drops (sanity)")
     }
   }
+
+  // ── Task P2.5 post-review fix: `h0PreciseCompletedSticky` must be LEVEL-sensitive
+  // (stays asserted every cycle until retire0 actually fires), not a one-shot pulse
+  // that self-clears exactly one cycle after completion(4) regardless of whether h0's
+  // OWN retire has happened yet. The old one-shot `RegNext` would have already
+  // self-cleared by the time a STACKED, unrelated stall finally lets h0 retire,
+  // silently reopening the dual-retire race the mechanism exists to prevent.
+  //
+  // Stall choice: `stopped` (one of retire0's own gating terms, `!stopped`) rather
+  // than interruptPending/tracePendingFire -- those two are ALSO `excEntryTrigger`
+  // sources (see the entryTrigger comment above `excEntryTrigger`'s definition):
+  // recognizing them doesn't just delay retire0, it fires the exception-entry FSM
+  // and self-SQUASHES the ROB (pointer-reset flush, count->0 immediately) instead of
+  // ever letting h0 retire normally via fireOut -- confirmed by direct instrumentation
+  // during this test's development (excActive flips true, count drops to 0 via a
+  // flush, fireOut(0) never fires). `stopped` has no such side effect: it only gates
+  // retire0's own `!stopped` term and ORs into interruptPending's `normalIrqGate`
+  // (neutralized here since iplIn/iackAvec are never touched, so iplActive stays
+  // False and interruptPending never actually fires/flushes). Directly sim-poking
+  // `stopped` (a plain RegInit(False) with only two conditional HDL drivers -- a
+  // retiring STOP setting it, `interruptPending` clearing it, both inert/False here)
+  // gives a clean, side-effect-free artificial stall.
+  //
+  // This test proves the sticky fix: completion(4) fires for h0 WHILE `stopped` is
+  // ALSO held for several extra cycles past the single cycle the old one-shot would
+  // have covered, and retire1 (h1, completes-ready throughout) must stay blocked for
+  // EVERY cycle of that stall -- not just the first -- and only retire the cycle
+  // AFTER h0 itself actually retires (forced single-wide retire, mirrors
+  // h0TraceArmed exactly).
+  test("h0PreciseCompletedSticky stays asserted across a stacked retire0 stall (task-P2.5 post-review fix)") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      // Allocate h0 (robId 0) and h1 (robId 1), 2-wide.
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0xE00, dstArch = 3, pdst = 20, pdstValid = true, pdstOld = 3)
+      pokeRu(dut.rsrc.logic.src.payload(1), pc = 0xE02, dstArch = 5, pdst = 21, pdstValid = true, pdstOld = 5)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= true
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      dut.rsrc.logic.u1v #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 2, s"2 in flight, got ${dut.rob.logic.count.toInt}")
+
+      // h1 becomes completes-ready via the ordinary completion port 0 -- `completes`
+      // is a sticky per-entry register, stays set until h1 itself retires, so h1 is
+      // completes-ready for the ENTIRE remainder of this test.
+      markComplete(dut, 1)
+      cd.waitSampling()
+      clearComplete(dut)
+
+      // Raise the artificial, side-effect-free stall BEFORE firing completion(4), so
+      // the completion(4) pulse and h0's actual retire are separated by several
+      // cycles -- the stacked-stall scenario the OLD one-shot RegNext missed.
+      dut.rob.logic.stopped #= true
+      cd.waitSampling()
+      assert(!dut.rob.logic.retire0.toBoolean, "retire0 must be blocked by the stall")
+
+      // Fire completion(4) for h0 (the SQ precise-drain port) WHILE the stall is
+      // active -- h0PreciseCompletedSticky sets this cycle, but retire0 stays blocked.
+      dut.rob.logic.completion(4).valid #= true
+      dut.rob.logic.completion(4).payload #= 0
+      cd.waitSampling()
+      dut.rob.logic.completion(4).valid #= false
+
+      // Hold the stall SEVERAL MORE cycles past the single cycle the OLD one-shot
+      // RegNext would have covered. retire1/fireOut(1) must stay blocked EVERY cycle
+      // of this window (h1 is completes-ready the whole time -- the ONLY thing
+      // stopping it is retire0 itself being blocked, but this also proves the sticky
+      // bit hasn't spuriously done anything wrong yet).
+      for (_ <- 0 until 5) {
+        assert(!dut.tsink.logic.fireOut(1).toBoolean, "retire1 must stay blocked through the whole stalled window")
+        assert(!dut.rob.logic.retire0.toBoolean, "retire0 must stay blocked (stall still held)")
+        cd.waitSampling()
+      }
+
+      // Drop the stall -- h0 finally retires, several cycles after the completion(4)
+      // pulse (well past the OLD one-shot's 1-cycle window). With the sticky fix,
+      // h0PreciseCompletedSticky is STILL asserted this cycle (it only clears when
+      // retire0 itself fires -- same cycle, so its REGISTERED clear takes effect NEXT
+      // cycle), so retire1 must be forced blocked on h0's own retire cycle too
+      // (single-wide retire) -- the exact race the OLD one-shot would have reopened
+      // (it would have self-cleared cycles ago, letting h1 dual-retire with h0).
+      // CHECK-FIRST (fireOut is a self-clearing one-cycle pulse that can fire as
+      // early as the very next cycle -- waitSamplingWhere would consume/miss it).
+      dut.rob.logic.stopped #= false
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean, max = 50)
+      assert(dut.tsink.logic.fireOut(0).toBoolean, "h0 finally retires once the stall clears")
+      assert(!dut.tsink.logic.fireOut(1).toBoolean,
+        "retire1 must STILL be blocked on h0's own retire cycle (forced single-wide retire -- " +
+        "the OLD one-shot bug would have already self-cleared here, letting h1 dual-retire with h0)")
+
+      // h1 (now the sole head) retires the very next cycle, single-wide, once the
+      // sticky bit has actually cleared.
+      cd.waitSampling()
+      assert(dut.tsink.logic.fireOut(0).toBoolean, "h1 (now head) retires the cycle after h0")
+      assert(dut.tsink.logic.traceOut(0).archRegId.toInt == 5, "the retiring entry must be h1 (archRegId=5)")
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 0, "ROB drained")
+    }
+  }
 }

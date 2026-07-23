@@ -217,6 +217,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     robHeadIn.allowOverride;           robHeadIn := U(0, 6 bits)
     robHeadValidIn.allowOverride;      robHeadValidIn := False
     irqPreemptPendingIn.allowOverride; irqPreemptPendingIn := False
+    // Debug-only taps (zero synth impact, matches every other tap in this file):
+    // a standalone LS-EU-only DUT (no real RobPlugin) needs to sim-poke these
+    // directly to exercise the precise-drain path (e.g. the `liveCompletionFires`
+    // collision-retry directed test in LsEuFastPreciseSpec).
+    robHeadIn.simPublic(); robHeadValidIn.simPublic(); irqPreemptPendingIn.simPublic()
 
     // ---- store queue instance ----
     val sq = new StoreQueue(8)
@@ -922,6 +927,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val pendPush  = Reg(UInt(pendPtrW bits)) init 0   // next free slot to WRITE (alloc time)
     val pendReady = Reg(UInt(pendPtrW bits)) init 0   // SQ has confirmed the drain up to here
     val pendApply = Reg(UInt(pendPtrW bits)) init 0   // already replayed into comp* up to here
+    // Debug-only taps (zero synth impact): let a directed test observe the
+    // ready/apply backlog pointers directly, to confirm a `liveCompletionFires`
+    // collision genuinely occurred (rather than inferring it indirectly).
+    pendPush.simPublic(); pendReady.simPublic(); pendApply.simPublic()
+    liveCompletionFires.simPublic()
 
     // Called instead of `captureCompletion` on the `!fastStore` (precise) store-alloc
     // arms — same decision cycle, same live u1/s1 signals, just latched for later
