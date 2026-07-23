@@ -62,19 +62,25 @@ alone and every store eats a full AXI round trip at retirement (§3.2
 quantifies this); fix Fact 2 alone and the unmapped-store tests stay red.
 Hence one combined design.
 
-A sharpening worth stating explicitly, because it drives the whole design: in
-both blocked SSW tests **the MMU is off**, so the identity translation path
-(`DtlbPlugin.scala:366-371`) classifies *everything* — including the unmapped
-probe address `0xAAAA0000` — as `CACHEABLE`. Cacheability alone therefore
-cannot separate fast from slow stores. What separates them is **residency /
-proven backing**: `0xAAAA0000` can never have a resident line (its refill
-DECERRs, `BehavioralMem.scala:44-58,112-119`), while any line that *has* been
-successfully refilled once is proven to be backed by decoded memory. That is
-exactly the human engineer's principle — "cacheable writes don't need
-write-ack if they fall on a resident line; uncached accesses always need to be
-acked to commit" — and this document refines "resident" into "proven-backed"
-(§4.2), which turns out to be both cheaper and sounder than a literal
-same-cycle residency check.
+A sharpening worth stating explicitly, because it drives the whole design:
+the trust boundary is **software-configured cacheability, not physical
+backing**. When the MMU is ON and software has deliberately declared a page
+CACHEABLE (page-descriptor CM bits / DTT windows), the CPU trusts that
+declaration *unconditionally* — a store to such a page completes and retires
+exactly as today, and if the declaration was a lie (page tables pointing at
+nothing real), the error surfaces later, at eviction-writeback time, as an
+explicitly **imprecise, non-restartable diagnostic fault** (a configuration
+error, not something the CPU protects against with precision). When the MMU
+is OFF — which is exactly the regime both blocked SSW tests run in — there
+is no deliberate software declaration to trust (`DtlbPlugin.scala:366-371`
+merely defaults everything, including the unmapped `0xAAAA0000`, to
+CACHEABLE mechanically), so MMU-off stores take the conservative precise
+path: retirement waits for a real, contemporaneous bus response, per the
+standing user decision (§5.1). Cache-inhibited stores likewise. Crucially,
+the CPU **never** bases any decision on assumptions about the SoC's
+physical address decode ("this address answered OK before, so it is safe
+forever") — that entire class of mechanism is banned by a standing
+project-wide constraint (§4.2).
 
 ---
 
@@ -144,56 +150,65 @@ landed" to close a stale-refill window; §5.6 re-audits this under copyback.
 
 ## 3. Candidate approaches
 
-### 3.1 Approach A — proven-backed fast path + at-head slow path (refined version of the proposed principle) — RECOMMENDED
+### 3.1 Approach A — trust software-configured cacheability unconditionally; precise at-head machinery only where there is nothing to trust — RECOMMENDED (this is the user's stated intent)
 
-Summary: classify every store **at execute time** (where the DTLB response
-and the LS EU FSM already are) into:
+Two paths, selected by one architectural fact the CPU legitimately owns —
+what software told the MMU:
 
-- **Fast path** — cacheable (CM = write-through or copyback, and D-cache
-  enabled) **and** the target line/page is *proven backed*: complete at
-  SQ-alloc exactly as today; retire timing unchanged; drain post-commit into
-  the cache (dirty for copyback, cache+AXI for write-through).
-- **Slow path A (cacheable, not yet proven backed)**: before SQ-alloc, run a
-  **probe-refill** — architecturally a *load* of the target line through the
-  existing load LAUNCH/WAIT machinery. A refill that returns OKAY allocates
-  the line (normal load refill) and *proves the page backed*; the store then
-  proceeds down the fast path. A refill that errors takes the **existing**
-  task-#189 execute-time bus-fault path: `captureFault(atc=false)` → precise
-  vector-2, SSW W=1/SIZE/ATC=0 all correct, younger instructions never
-  retire. This is the crucial trick: **the fault is discovered at execute
-  time, pre-completion, so no new ROB retirement machinery is needed for the
-  cacheable case at all.** A speculative refill *read* is side-effect-free by
-  the cacheable contract, so doing it for a (possibly wrong-path,
-  pre-commit) store is safe — it is just a prefetch.
-- **Slow path B (cache-inhibited)**: the write itself is the only possible
-  transaction and it must not happen speculatively (MMIO). The store
-  allocates into the SQ but its **completion is withheld**; the SQ drains it
-  **at ROB head** (non-speculative: all older instructions retired), waits
-  for the real B response, then reports either a completion (retire proceeds)
-  or a fault (`atc=0`) into the ROB. This is the only place new
-  retirement-interlock machinery is needed, and inhibited accesses are rare.
+- **Fast path — MMU-on, page declared cacheable (CM=WT or CB), CACR.DE=1**:
+  the store is trusted **unconditionally**. Complete at SQ-alloc, retire
+  immediately — byte-for-byte today's timing (`LsEuPlugin.scala:946-951`
+  unchanged). No probe, no filter, no residency check, no classification
+  beyond the page attribute itself. The drain happens post-commit into the
+  cache (merge+dirty under copyback; +write-through beat under WT;
+  write-allocate refill on a drain miss). If software's cacheability
+  declaration was a *lie* (page tables mapping a region no hardware backs),
+  the CPU finds out only when a bus transaction on behalf of that data
+  eventually errors — eviction writeback, drain-miss refill, WT beat — and
+  reports it as an **asynchronous, imprecise, non-restartable diagnostic
+  fault** (§4.2): a sticky core-fault record surfaced for JTAG/debug, on
+  which **the core halts** (quiesces, frozen for post-mortem; only
+  debug/reset recovers it — optionally an NMI instead, §5.4), by design
+  NOT attributable to the originating instruction (that information is
+  architecturally gone by eviction time, and that is accepted — this is a
+  configuration error, not a case precision protects against).
+- **Precise path — everything else**: MMU-off (identity translation
+  defaults everything to "cacheable" mechanically; that is not a software
+  declaration and is NOT trusted — per the standing §5.1 user decision,
+  MMU-off is a conservative cold path), cache-INHIBITED pages, and
+  CACR.DE=0. These stores allocate into the SQ but their **ROB completion
+  is withheld**; the SQ drains them **at ROB head** (non-speculative: all
+  older instructions retired, preemption gated), waits for the real,
+  contemporaneous AXI B response, and then reports either a completion
+  (retire proceeds) or a fault (`atc=0`) into the ROB → the untouched
+  format-$7/SSW machinery. This is exactly the machinery the MMIO case
+  needs in any correct design; MMU-off simply shares it.
+
+This split is what makes the blocked SSW tests pass (they run MMU-off →
+precise path → the store to unmapped `0xAAAA0000` faults precisely, younger
+FAIL-sentinel instructions never retire) while keeping MMU-on production
+code at full speed.
 
 Plus the copyback substrate (dirty bits, hit-drain without AXI, eviction
 writeback, CPUSH/CINV/CACR) detailed in §4.
 
 Tradeoffs, honestly:
 
-- **Performance**: common-case stores (fast path) are *identical to today* —
-  no probe, no wait, completion at SQ-alloc. Only the *first* store to an
-  unproven page pays a probe (≈ one load-miss refill, which also warms the
-  cache); a small "proven-backed pages" filter (§4.2) makes repeats free.
-  Copyback additionally *improves* drain throughput: a hit-drain acks in ~3
-  cycles instead of a full AXI write round trip, which directly relieves the
-  SQ-full (`WAIT_SQ`) backpressure MOVEM-style store bursts hit today.
-  Inhibited stores serialize at retirement — architecturally unavoidable for
-  precise uncached writes.
-- **Complexity**: the probe reuses the existing load LAUNCH/WAIT/WAIT_A/
-  WAIT_B states nearly verbatim (a "probe, discard data, then SQ-alloc"
-  flag); the fault path reuses `captureFault`/`lsFaultCompletion`/SSW wholesale.
-  The genuinely new machinery is: dirty bits + eviction writeback FSM in
-  `DcachePlugin`, the at-head-drain interlock for inhibited stores
-  (§4.4 — including an interrupt-preemption gate that must be exactly
-  right), and the CPUSH/CINV/CACR plumbing.
+- **Performance**: MMU-on cacheable stores — the entire hot path of real
+  workloads — are *cycle-identical to today* at execute and retire, and
+  copyback additionally improves drain throughput (hit-drain acks in ~3
+  cycles instead of an AXI B round trip, relieving the SQ-full/`WAIT_SQ`
+  backpressure MOVEM-style bursts hit today). MMU-off and inhibited stores
+  serialize at retirement on a real bus ack — the deliberate price of
+  precision where nothing softer is trustworthy; MMU-off is explicitly a
+  cold path (boot/bring-up; also the ported-test corpus — §5.1 quantifies
+  the sim-time consequence honestly).
+- **Complexity**: the smallest of every variant considered: no filter, no
+  probe, no per-store classification machinery beyond reading the already-
+  computed `cacheMode`. The genuinely new pieces: cache-mode plumbing,
+  deferred-completion for precise-path stores, the at-head drain trigger +
+  preempt interlock, the async diagnostic-fault channel, dirty bits +
+  eviction writeback, CPUSH/CINV/CACR.
 - **FMax risk**: moderate. Nothing new lands on the known-critical load-tag
   arc or the IQ select cone. Dirty bits add a 512-FF vec in the already
   congested D-cache corridor (`iter_100_CongestedCLBsAndNets.txt` named
@@ -226,10 +241,11 @@ resp. No cache changes beyond reading `axi.b.resp`.
   instruction stream; at the current aggregate IPC ≈ 0.53 (CPI ≈ 1.9),
   adding even 8 cycles to 15% of instructions is +1.2 CPI → IPC ≈ 0.32, a
   ~40% regression, worse with real-SoC latencies. It also serializes retire
-  (a waiting head blocks slot-1 retire entirely). And note it does **not**
-  need less new machinery than Approach A's slow path B — it needs the *same*
-  at-head-drain interlock and interrupt gating, just applied to every store.
-  The only thing it saves is the probe/filter and the copyback substrate.
+  (a waiting head blocks slot-1 retire entirely). And note it is exactly
+  Approach A's precise path applied to *every* store — the identical
+  at-head-drain interlock and interrupt gating — so it saves no machinery;
+  it only forgoes the trusted fast path (and, optionally, the copyback
+  substrate) that make A fast.
 - **Verdict**: unacceptable as the end state; possibly acceptable as a
   *temporary* internal milestone during implementation (bring-up of the
   at-head interlock before the fast path exists), if staged carefully.
@@ -302,58 +318,54 @@ drain-throughput cost.
   (`RobPlugin.scala:23-38`) applies identically here (DcachePlugin ←
   RobPlugin dependency direction).
 
-### 4.1 Layer 1 — precise store bus faults
+### 4.1 Layer 1 — store retirement paths and fault reporting
 
-**LS EU store flow (cacheable):** in XLATE, consult the classification:
+**LS EU store flow:** in XLATE, the classification is a pure read of
+already-available architectural facts — no probe, no filter, no history:
 
 ```
-fast  := mmuEnabled && cacheable(s2Cmode) && dcacheEnabled &&
-         backedFilterHit(storePage)
+fast := mmuEnabled && cacheable(s2Cmode) && dcacheEnabled(CACR.DE)
 ```
 
-(The `mmuEnabled` term is a USER DECISION, 2026-07-19: MMU-off stays
-conservative/cold-path — identity-translated stores do NOT get the
-proven-backed fast-path treatment; they take the slow paths below, which
-makes them precise by construction. Rationale: MMU-off is a boot/bring-up
-regime; the performance case for the fast path lives where real page
-attributes exist. See §5.1.)
+(The `mmuEnabled` term is a USER DECISION, 2026-07-19, reconfirmed
+2026-07-23: MMU-off stays conservative/cold-path — an identity translation
+that merely *defaults* to "cacheable" is not a deliberate software
+declaration and is not trusted. The cacheability term is trusted
+**unconditionally** when it comes from real software configuration —
+page-descriptor CM bits or DTT windows — per the 2026-07-23 user
+statement of intent; see §4.2 for the trust model.)
 
-- `fast` → exactly today's path: SQ-alloc + `captureCompletion`
-  (`LsEuPlugin.scala:946-951` unchanged).
-- `!fast` (cacheable) → route through the existing RESOLVE→LAUNCH→WAIT load
-  states with a new `probe` flag: drive `loadCmd` for the store's line
-  (both lines via WAIT_A/WAIT_B when `s1TwoAccess` — the machinery exists,
-  `:1077-1108`); on `loadRsp` OK → seed the backed filter, then SQ-alloc +
-  `captureCompletion`; on `loadRsp.fault` → `captureFault(atc=false)`
-  (`:710-732`) — **the identical path task #189 built for load bus errors**,
-  which already produces the right SSW via `lsFaultCompletion` →
-  `faultedStore` → format-$7. `compFaultWr := isStore` is already generic.
-  One small fix rides along: for a slot-B (second line) fault,
-  `compFaultAddr` must be `s1AddrB`, not `s1Va` (`:724` hardcodes `s1Va`).
-  The `poisoned` suppression (`:811-816`) applies as-is to wrong-path
-  probes.
-- Probe misses allocate the line normally (it *is* a load refill), so the
-  later drain hits — probe doubles as write-allocate.
-
-**The proven-backed filter** (§4.2) keeps the probe off the common path.
-
-**Inhibited stores (slow path B):** in XLATE, `s2Cmode === INHIBITED` (or
-DE=0 if the human opts for real DE semantics, §5.2) →
-SQ-alloc with `uncached := True` and **no `captureCompletion`**. The LS EU
-frees (its single-outstanding contract doesn't depend on completion). Then:
+- `fast` → exactly today's path, end to end: SQ-alloc + `captureCompletion`
+  (`LsEuPlugin.scala:946-951` unchanged), retire on normal schedule, drain
+  post-commit (hit → merge+dirty/WT-beat; miss → post-commit write-allocate
+  or WT write, §4.3). Any bus error later incurred on behalf of this store
+  (drain-miss refill, WT beat, eventual eviction writeback) is reported on
+  the **asynchronous diagnostic-fault channel** (§4.2) — imprecise and
+  non-restartable by design.
+- `!fast` (MMU-off, INHIBITED, or DE=0) → **precise path**:
+  SQ-alloc with `precise := True` and **no ROB completion yet**. The LS EU
+  frees (its single-outstanding contract doesn't depend on completion);
+  the store's completion arrives later from the SQ at-head drain, below.
 
 - **SQ at-head drain trigger** (`StoreQueue.scala` around `:144-147`):
   ```
-  headUncachedReady := valids(head) && !committed(head) && uncached(head) &&
-                       (robIds(head) === robHeadIn) && robHeadValidIn &&
-                       !io.flush && !irqPreemptPendingIn
-  headReady := (valids(head) && committed(head) && !io.flush) || headUncachedReady
+  headPreciseReady := valids(head) && !committed(head) && precise(head) &&
+                      (robIds(head) === robHeadIn) && robHeadValidIn &&
+                      !io.flush && !irqPreemptPendingIn
+  headReady := (valids(head) && committed(head) && !io.flush) || headPreciseReady
   ```
   New SQ inputs `robHeadIn`/`robHeadValidIn` (= `rob.logic.h0`,
-  `count > 0`) and `irqPreemptPendingIn` come via top wiring. In-order SQ
-  drain guarantees all older stores drained first; ROB in-order retire
-  guarantees all older instructions retired — so the drain is
-  non-speculative.
+  `count > 0`) and `irqPreemptPendingIn` come via top wiring. This is
+  deadlock-free because SQ ring order == program order: LS µops issue
+  strictly in program order (verified — `IssueQueuePlugin.scala:316-337`
+  explicitly enforces oldest-occupied-LS-only issue), so when a precise
+  store's robId reaches the ROB head it is necessarily the SQ ring head
+  (all program-older stores allocated earlier and already drained). ROB
+  in-order retire guarantees all older instructions retired — so the
+  drain is non-speculative. Drain semantics for a precise store: MMU-off
+  cacheable → today's write-through drain (cache update on hit, no
+  allocate on miss) but with the B response *awaited and checked* before
+  completion; INHIBITED/DE=0 → AXI-only (no cache touch), same wait.
 - **Resolution:** the D-cache must expose, alongside `storeAck`, an error
   qualifier: `storeErr := axi.b.valid && axi.b.ready &&
   (axi.b.payload.resp =/= OKAY)` (the one-line core of Gap 2,
@@ -375,14 +387,14 @@ frees (its single-outstanding contract doesn't depend on completion). Then:
 - **Interrupt/trace preemption interlock — the one genuinely dangerous
   race:** `interruptPending` and `tracePendingFire` preempt a head *without*
   requiring `completes(h0)` (`RobPlugin.scala:416-438,984,1052`); a
-  preempted head re-executes after RTE. If the uncached write has been
+  preempted head re-executes after RTE. If the precise-path write has been
   issued (or completed) when preemption fires, the store executes twice —
   fatal for MMIO. Gating, both directions:
-  - SQ side: `headUncachedReady` includes `!irqPreemptPendingIn`
+  - SQ side: `headPreciseReady` includes `!irqPreemptPendingIn`
     (= `interruptPending || tracePendingFire` from the ROB) — don't launch
     into a cycle that wants to preempt.
   - ROB side: `normalIrqGate` (`:982-984`) and `traceNormalGate` (`:1050-52`)
-    gain `&& !uncachedDrainBusyIn` (a registered busy from the SQ covering
+    gain `&& !preciseDrainBusyIn` (a registered busy from the SQ covering
     launch-through-resolution *and* the one cycle between ack-OK and
     retire).
   Because the SQ launch decision should be registered and the ROB samples
@@ -395,13 +407,18 @@ frees (its single-outstanding contract doesn't depend on completion). Then:
   flushes originate only from a retiring head (a store is not a branch),
   and `excSquash` requires the exc FSM active, which `excIdle` gating
   prevents while the head is a plain store.
-- **Exception-FSM E_DRAIN compatibility**: a *faulted* uncached entry pops on
+- **Exception-FSM E_DRAIN compatibility**: a *faulted* precise entry pops on
   its error before the exception FSM starts, so `sqEmpty`
   (`ExceptionUnit.scala:694-713`) still resolves; the `excEnteringSq`
   one-cycle flush (`FullCoreSynth.scala:226-227`) remains the backstop for
-  a *never-launched* uncached orphan (e.g. its instruction was flushed) —
-  uncommitted entries squash, which now includes uncached ones; verify the
+  a *never-launched* precise orphan (e.g. its instruction was flushed) —
+  uncommitted entries squash, which now includes precise ones; verify the
   `keep` logic (`StoreQueue.scala:302-313`) counts them correctly.
+- **Store-fault EA precision detail**: `sqFaultCompletion.vaddr` must
+  report the failing *slot's* logical address for a split (cross-line/
+  cross-page) store — slot A's vaddr or the slot-B address — so the
+  format-$7 EA field is the actually-faulting half (the SQ already tracks
+  per-slot paddrs; carry per-slot vaddrs alongside).
 
 **Also in Layer 1 (cheap, closes latent load gaps):** gate line *allocation*
 on cacheability — an INHIBITED load must not allocate (add
@@ -411,39 +428,88 @@ force `ldS1Hit := False` for an inhibited access). Same bypass for inhibited
 stores at drain-S2 (`:431-439`): skip the line write, AXI-only. Exact-size
 (non-16B) AXI reads for MMIO loads are deferred — §5.5.
 
-### 4.2 The proven-backed filter (what "resident line" actually means)
+### 4.2 The trust model, the standing constraint, and the async diagnostic-fault channel
 
-A literal "resident right now" check is the wrong invariant: residency can
-change between check and use (evictions by younger loads between a store's
-execute and its post-commit drain), and chasing that race leads to
-drain-time re-classification and at-head machinery for *every* store. The
-invariant that is actually needed for precision is weaker and **monotone**:
+**Standing project-wide constraint (user, 2026-07-23, ABSOLUTE):** the core
+must **never** depend on any assumption about the SoC-side physical address
+map — in particular, never on any variant of "this physical address/page
+responded OK before, therefore it is safe forever." No mechanism of that
+shape may exist anywhere in the core, regardless of how much it simplifies
+or speeds anything up.
 
-> A store may retire un-acked iff *some* AXI transaction to its target page
-> has previously completed OKAY — because the SoC address decode is static,
-> a page that responded OKAY once can never DECERR/SLVERR later.
+**What the CPU legitimately relies on** — exactly three evidence classes,
+each either architectural or contemporaneous:
 
-"Responded OKAY once" is established by any successful refill (load miss,
-store probe). Because the property is monotone, the filter **never needs
-invalidation** — eviction of the line afterwards is irrelevant to fault
-precision (the post-commit write-through/write-allocate to that page cannot
-error), only to data placement (handled at drain as normal hit/miss).
+1. **Software-configured MMU cacheability** (page-descriptor CM bits, DTT
+   windows, CACR.DE). This is an *architectural input*, trusted
+   unconditionally as a statement of intent — and it is re-read on every
+   access from structures with real, CPU-controlled invalidation (TLB
+   entries invalidated by PFLUSH; TTR/CACR are live registers). If
+   software lies (declares cacheable a region nothing backs), the
+   consequence is the diagnostic channel below — a reported configuration
+   error, never silent corruption and never a precision obligation.
+2. **CPU-internal cache state** (a line being valid/dirty). Legitimate for
+   the same reason TLB caching is: it is invalidated by architected
+   instructions the CPU itself executes (CINV/CPUSH — made real by this
+   design) plus its own eviction machinery.
+3. **A real, contemporaneous bus response** for the very transaction being
+   decided on (the precise path's awaited B/R responses; the load path's
+   existing task-#189/#211 resp checks).
 
-Concretely: a 4-entry, page-granular (VPN[31:12]… physical PPN, since backing
-is physical — use `s2Paddr(31:12)`) register CAM in the LS EU, seeded on
-every OKAY refill/probe response, checked combinationally in XLATE. A store
-line already resident in the D-cache also implies proven-backed, but the
-filter alone suffices and avoids adding a tag-probe read-port user at
-execute time (the FMax retimes deliberately serialized that port —
-`DcachePlugin.scala:261-275`). Sequential store bursts (MOVEM, memset) probe
-once per new page, then fly. Reset clears the filter; nothing else touches it.
+**The disqualified variant, recorded permanently so it is never
+re-proposed:** an earlier revision of this document proposed an
+execute-time probe-refill plus a persistent "proven-backed pages" filter — a
+CAM of pages that had once answered OKAY, never invalidated, justified by
+"the SoC decode map is static." That mechanism is **banned** by the
+constraint above: it bakes an unverifiable assumption about the outside
+world into the core's correctness argument, has no CPU-controlled
+invalidation path (unlike TLB/PFLUSH or cache/CINV), and would break
+silently on any SoC with remappable/hot-pluggable decode. It is also
+unnecessary: the design above needs no residency or backing knowledge at
+all — the fast path trusts software configuration (class 1), and every
+path that cannot rest on that trust waits for class-3 evidence.
 
-The one assumption to sign off: **the SoC decode map is static and
-page-uniform** (a 4 KB page is either wholly backed or wholly not). The sim
-harness's decode (`BehavioralMem.scala:53-58`, top-nibble + 0xFFFF page) is
-coarser than 4 KB, so this holds there; a future SoC with sub-page holes
-would need the granularity dropped to line (16B) at some filter-hit-rate
-cost. Flagged in §5.4.
+**The asynchronous diagnostic-fault channel** (the *only* error path for
+trusted fast-path stores — USER DECISION 2026-07-19/2026-07-23):
+every post-commit AXI transaction performed on behalf of trusted cacheable
+data — dirty-line **eviction writebacks**, **drain-miss write-allocate
+refills**, **write-through beats**, **CPUSH writebacks** — has its response
+checked (never ignored), and a non-OKAY response raises a machine-level
+diagnostic fault that is explicitly **imprecise and non-restartable**:
+- a sticky fault record in the D-cache (`diagFaultValid` + first-error
+  {addr, resp, kind}), surfaced as a top-level output for JTAG/debug and
+  `simPublic` for the harness;
+- **the core HALTS** (user, 2026-07-23): on the fault the core quiesces —
+  no further fetch, retire, or bus activity — leaving the machine frozen
+  for JTAG post-mortem rather than executing onward from a known-corrupt
+  memory state. Implementation shape: a sticky variant of the existing
+  STOP quiesce plumbing (`RobPlugin.scala:233-243` `stopped` gates
+  retire + fetch already), but not interrupt-wakeable — only debug/reset
+  leaves it;
+- sim-side: fatal `assert` in any test not explicitly expecting it;
+- NO architectural exception, NO attempt to attribute it to the
+  originating instruction — that information is architecturally gone by
+  eviction time, and that is accepted: this reports a software/hardware
+  configuration error, it does not recover from it.
+Hardware surfacing is DECIDED (§5.4): a core fault, not architecturally
+visible by default (no exception, no frame) — a top-level status output now,
+foldable into the future dbg_axi register set, with an optional NMI trigger
+left as a possible later follow-up knob, not part of the base slices.
+
+**Sanity sweep of the existing core for the banned pattern (done
+2026-07-23, result: clean):** the DTLB/ITLB/walk-result latch cache
+positive translations invalidated by PFLUSHA/`flushAll` and clear the
+fault latch on `umFlush` (`DtlbPlugin.scala:287-296`) — CPU-controlled,
+legitimate (class 2 pattern). Neither cache ever *caches an error
+verdict*: the D-side refill error allocates nothing and re-probes the bus
+on re-access (`DcachePlugin.scala:352-365`), and the I-side does the same
+(`IcachePlugin.scala:345-375`, task #211). No existing mechanism assumes
+"OK once ⇒ OK forever"; the banned filter would have been the first.
+One adjacent flag for the record: until this design's CPUSH/CINV land,
+the I/D caches have NO invalidation path at all (CINV is a no-op) — a
+*staleness* cousin of the anti-pattern (cached data with no
+CPU-controlled invalidation), already known as the D-cache-coherency gap
+and closed by Layer 2.
 
 ### 4.3 Layer 2 — copyback substrate + CPUSH/CINV/CACR
 
@@ -454,30 +520,53 @@ cost. Flagged in §5.4.
   - COPYBACK hit → merge + line write + `dirtys := True`; **no AXI write**;
     pulse `storeAck` immediately (S2 or the following cycle). This is the
     drain-throughput win.
-  - WRITETHROUGH hit → today's behavior exactly (line write + AXI beat,
-    ack on B). Retirement was never gated on this B (fast path), and the
-    proven-backed invariant makes its resp architecturally ignorable —
-    but still *check* it and (sim-only) assert/log, so the "can't happen"
-    claim is machine-checked (§5.4).
-  - Cacheable miss at drain (only reachable via the probe→evict race) →
-    fall back to write-through-no-allocate exactly as today, resp logged
-    not trapped (post-commit; proven-backed makes an error unreachable).
-    Alternative — drain-time write-allocate — is more traffic-faithful to a
-    real 040 but adds a post-commit refill FSM entanglement for a rare
-    race; recommend the simple fallback, revisit if the cache-mode tests
-    care (they don't appear to).
-  - INHIBITED → AXI-only (Layer 1), no line touch.
+  - WRITETHROUGH hit (fast path) → today's behavior exactly (line write +
+    AXI beat, ack on B). Retirement was never gated on this B; its resp is
+    *checked* and a non-OKAY raises the §4.2 async diagnostic fault (a
+    lied-about-cacheable configuration error — never silent, never
+    precise).
+  - COPYBACK miss at drain (fast path) → **post-commit write-allocate**:
+    the store-side requests a refill from the (shared, single) refill
+    engine, merges, writes the line + dirty. The refill's R resp is
+    checked → non-OKAY = async diagnostic fault (no allocation). This is
+    a normal event (first store to a cold line), entirely off the retire
+    path — it costs SQ-drain latency only.
+  - WRITETHROUGH miss at drain (fast path) → no-allocate AXI write exactly
+    as today, resp checked → async diagnostic fault on error. (Optional
+    later refinement: write-allocate for WT too, purely a
+    traffic/locality tuning knob.)
+  - Precise-path drains (MMU-off / INHIBITED / DE=0) → per §4.1: awaited,
+    resp-checked, precise.
+- **Drain-vs-refill same-set interlock (REQUIRED for copyback; also a
+  pre-existing latent bug today)**: the store drain's S1 tag read and its
+  S2 hit-detect/write are one cycle apart, and a *concurrent* load-refill
+  (a younger load can legitimately be in REFILL while the SQ drains — the
+  SQ `sameLine` stall only covers same-LINE overlaps, not same-SET
+  different-line) can write tags/valids into that same set in the window:
+  S2 then hit-detects on the stale registered tag read. Concrete failure
+  today: refill replaces way W's line X with line Y at the cycle between
+  the store's S1 read and S2 write → S2 still sees X → merges X-based
+  data into a way now tagged Y (write-through masks the damage in memory
+  but the CACHED line Y is corrupt). Under copyback the same window
+  becomes a lost store (refill-priority discards the store's only write).
+  Fix: a 2-cycle mutual exclusion — hold the refill's array write (delay
+  `axi.r.ready`/the write by ≤2 cycles) while a store drain is in S1/S2,
+  or replay the drain from S1 when any same-set array write landed in the
+  window. Recommend the hold (trivially correct, bounded cost). Flag the
+  today's-code exposure for the standing memory record as its own
+  candidate bug, independent of this design.
 - **Eviction writeback**: the load-refill FSM (`:331-367`) must, when the
   chosen victim way is valid+dirty, first read the victim line (one shared-
   port read — the FSM owns the port during REFILL, no new arbitration) and
   issue a line write to `tagOf(victim)`-derived address, wait B, then
   proceed with AR/refill. New states ≈ {EVICT_RD, EVICT_WR(aw/w/b)} ahead of
-  the existing REFILL. Writeback B errors: USER DECISION (2026-07-19) —
-  handle imprecisely with a **diagnostic crash**: sim-side `assert`/fatal,
-  and in hardware a sticky fatal-error flag surfaced as a top-level output
-  (for a future SoC to wire to NMI/reset) — never an architectural trap
-  (the line was proven backed, so this fires only on a broken SoC decode
-  contract; §5.4). Note the store-S2
+  the existing REFILL. Writeback B errors: USER DECISION (2026-07-19,
+  confirmed 2026-07-23 as the ENTIRE fault story for trusted-cacheable
+  data): the §4.2 async diagnostic-fault channel — sim-side fatal
+  `assert`, sticky hardware fault record surfaced for JTAG/debug — never
+  an architectural trap, explicitly imprecise and non-restartable (the
+  originating instruction is long retired; this reports a configuration
+  lie, it does not recover from one). Note the store-S2
   write and refill write already share the muxed write port with
   refill-priority (`:413-417` comment) — the eviction path must respect the
   same single-writer discipline.
@@ -524,9 +613,11 @@ cost. Flagged in §5.4.
   race store A's S2 write (BRAM readSync returns pre-write data, losing A's
   bytes in B's merge): add an S2→S1 same-set/way line bypass, or a 1-cycle
   conflict hold (recommend the hold first — trivially correct, costs a cycle
-  only on same-line pairs); (b) a drain that turns out to be a miss or
-  inhibited falls back to the serialized AXI path and stalls the pipeline
-  behind it (rare by construction — probes make drains hit). The SQ pop and
+  only on same-line pairs); (b) a drain that turns out to be a miss (first
+  store to a cold line → the post-commit write-allocate) or a precise-path
+  entry falls back to the serialized AXI path and stalls the drain pipeline
+  behind it — an uncommon, self-limiting event (the allocate warms the line
+  for the rest of the burst). The SQ pop and
   forwarding-retention logic generalize from "one in-flight drain"
   (`drainBusy`) to a small in-flight count; the existing hold-until-ack
   forwarding contract is preserved per entry. This is what actually converts
@@ -537,22 +628,25 @@ cost. Flagged in §5.4.
 The design is built so that these hold, and each should be checked (IPC
 bench + directed cycle counts) at the corresponding slice gate:
 
-1. **The common store path is cycle-identical to today.** A cacheable store
-   to a proven-backed page takes the exact IDLE→XLATE→alloc+complete
-   sequence it takes now; retirement timing, wakeups, and SQ occupancy are
-   unchanged. The `backedFilterHit` check is a 4-entry 20-bit CAM compare in
-   XLATE, off the IQ/retire cones — no new stall condition on the fast path.
+1. **The MMU-on cacheable store path is cycle-identical to today.** It
+   takes the exact IDLE→XLATE→alloc+complete sequence it takes now;
+   retirement timing, wakeups, and SQ occupancy are unchanged. The `fast`
+   classification is a read of two already-latched facts (`s2Cmode`,
+   CACR.DE) — no lookup, no CAM, no new stall condition anywhere on the
+   fast path.
 2. **The load path gains nothing on its hit arc.** The only load-side edits
    (inhibited no-allocate/bypass, eviction-writeback states) are in the
    miss FSM, behind the existing `busy` serialization; the S1 registered
    hit-compare and the shared read-port arbitration (the FMax-sensitive
    nets) are untouched.
-3. **Costs are confined to events that are either already slow or new
-   correctness requirements**: first store to an unproven page (one
-   refill, which also warms the line — amortized to ~1/page by the filter);
-   dirty-victim eviction (adds a line writeback to a refill that already
-   pays an AXI round trip); inhibited stores (at-head serialization is the
-   *price of precise uncached writes*, unavoidable in any correct design).
+3. **Costs are confined to events that are either already slow, off the
+   retire path, or deliberate cold paths**: drain-miss write-allocate
+   (post-commit, SQ-drain latency only, warms the line); dirty-victim
+   eviction (adds a line writeback to a refill that already pays an AXI
+   round trip); inhibited and MMU-off stores (at-head serialization is
+   the *price of precision* where software has declared nothing
+   trustworthy — unavoidable in any correct design, and explicitly a
+   cold path per the §5.1 decision).
 4. **Copyback is a net throughput improvement where it applies**: hit-drain
    ack in ~3 cycles vs a full AXI write round trip relieves the
    SQ-full/`WAIT_SQ` backpressure that bounds MOVEM-style store bursts
@@ -586,28 +680,26 @@ bench + directed cycle counts) at the corresponding slice gate:
 
 ## 5. Open questions / risks (need human decisions or sign-off)
 
-1. **MMU-off treatment — DECIDED (user, 2026-07-19): conservative
-   cold path.** An earlier revision of this document proposed
-   copyback-as-the-MMU-off-default plus the proven-backed fast path for
-   identity-translated stores; the user has overruled that: **MMU-off
-   stores do NOT get the proven-backed fast-path treatment.** Recorded
-   semantics: under identity translation the backed filter is bypassed
-   (`fast` requires `mmuEnabled`, §4.1); every MMU-off cacheable store
-   resolves through a slow path before completion. Interpretation left to
-   the plan pass, with a recommendation: use the **probe path** (not
-   at-head-ack) for MMU-off cacheable stores — it is equally precise, and
-   a probe of an already-resident line is a ~3–4 cycle cache hit, which
-   keeps whole-corpus sim time sane (at-head-ack for every MMU-off store
-   would put an AXI B round trip on every store retirement across the
-   entire MMU-off corpus). MMU-off performance is explicitly *not* a goal
-   (boot/bring-up regime); the performance machinery (filter fast path,
-   copyback hit-drain, pipelined drain) is scoped to MMU-on pages with
-   real CM attributes. This also removes the copyback-by-default harness
-   question: with MMU-off drains still writing memory through (probe →
-   resident → drain hits; identity default mode stays WRITETHROUGH),
-   sentinel polling and end-of-run `checkMem` keep working unchanged; the
-   cache-overlay peek helper shrinks to a nice-to-have for MMU-on
-   copyback lock-step tests only.
+1. **MMU-off treatment — DECIDED (user, 2026-07-19, reconfirmed
+   2026-07-23): conservative cold path.** MMU-off stores never take the
+   trusted fast path (`fast` requires `mmuEnabled`, §4.1): an identity
+   translation that mechanically defaults to "cacheable" is not a
+   software declaration and is not trusted. With the probe/filter
+   machinery gone from the design entirely, the one remaining slow
+   mechanism — the at-head drain awaiting a real B response — is what
+   MMU-off stores use, sharing it verbatim with INHIBITED/DE=0. Honest
+   consequence, stated for sign-off rather than hidden: every MMU-off
+   store's retirement waits an AXI B round trip (~5–15 sim cycles), which
+   slows the (entirely MMU-off) ported-test corpus and MMU-off lock-step
+   programs at retirement; MOVEM-burst-heavy tests feel it most. This is
+   the deliberate price of the decision (MMU-off = boot/bring-up regime,
+   performance explicitly a non-goal there); per-test timeouts may need
+   raising, and the §6.1 dual-posture sweep provides the DE=1/MMU-on
+   fast-path coverage those same tests would otherwise never give.
+   Identity default mode stays WRITETHROUGH, so MMU-off drains still
+   write memory through — sentinel polling and end-of-run `checkMem`
+   keep working unchanged; the cache-overlay peek helper is only needed
+   for MMU-on copyback lock-step tests.
 2. **CACR.DE=0 policy — DECIDED (user, 2026-07-19): literally fully
    uncached, matching real silicon** (no documented divergence). §4.3
    records the semantics. Consequences the plan pass must own: reset
@@ -636,14 +728,22 @@ bench + directed cycle counts) at the corresponding slice gate:
    `a3-multiaccess-restartability-assessment`), not solvable by store
    retiming alone. Set expectations accordingly: 2 of the 3 named tests go
    green from this design; this one needs A3 work on top.
-4. **The "proven-backed ⇒ no future bus error" assumption** (static,
-   page-uniform SoC decode). Holds in the harness; must be stated in the
-   top-level integration contract for the eventual SoC (the drop-in-
-   replacement work). Mitigation if ever violated: drop filter granularity
-   to 16B lines. Additionally: put sim-only asserts on every
-   post-commit-resp-ignored path (WT hit write-through, drain-miss
-   fallback, eviction writeback) so a violation screams in sim instead of
-   silently corrupting.
+4. **Async diagnostic-fault surfacing — DECIDED (user, 2026-07-23).**
+   The §4.2 channel is a **core fault**: a sticky fault record
+   {valid, addr, resp, kind} observable via the JTAG/debug seam (exposed
+   as a top-level status output now; foldable into the dbg_axi
+   debug-slave register set the drop-in-replacement plan already scopes),
+   and **not architecturally visible by default** — no exception, no
+   frame; **the core hangs in this condition** (quiesces fetch/retire,
+   frozen for post-mortem — §4.2's halt semantics; only debug/reset
+   recovers it). An **optional NMI trigger**
+   off the same record is a possible follow-up knob (software-observable
+   crash reporting for systems that want it) — left out of the base
+   slices; if added later it is a plain level-7 assertion into the
+   existing `iplIn` recognition path, nothing new architecturally. Sim
+   behavior is decided (fatal assert unless a test opts in); the sticky
+   record itself lands with Layer 2 regardless of the final pin/register
+   plumbing.
 5. **MMIO read width.** An INHIBITED load still issues a 16-byte AXI read
    today (over-read of device registers with read side effects). Correct
    MMIO needs exact-size AR (`ar.size` = access size). No current test has
@@ -678,6 +778,19 @@ bench + directed cycle counts) at the corresponding slice gate:
     immediately; a lock-step program that CINVs a dirty copyback line would
     diverge (by design — real data loss). No current lock-step program does
     this; add a guard note to the lock-step docs rather than machinery.
+11. **Pre-existing drain-vs-refill same-set window — flag as its own bug
+    candidate in TODAY'S code, independent of this design.** Found while
+    analyzing §4.3's interlock: a committed store's drain (S1 tag read →
+    S2 stale-registered hit-detect + write) can overlap a younger load's
+    concurrent REFILL array-write into the same SET but a different LINE
+    (the SQ `sameLine` stall is line-granular and does not stop that
+    load), letting S2 merge old-line data into a way the refill just
+    re-tagged — a cached-line corruption that today's write-through only
+    partially masks (memory stays right; the cached copy of the refilled
+    line is wrong and a later load HITS it). Deserves a directed repro +
+    fix attempt on its own track (likely related to the known
+    "D-cache coherency race" memory item); the §4.3 interlock this design
+    mandates would close it as a side effect.
 
 ---
 
@@ -691,10 +804,10 @@ layers. Honest sizing (new/changed lines, excluding tests):
 |---|---|---|
 | `cache/IcacheTypes.scala` | CacheMode 3-way, TranslationRsp | ~15 |
 | `cache/DcacheTypes.scala` | cmd cacheMode fields, service err/ack | ~30 |
-| `cache/DcachePlugin.scala` | dirty vec, mode-aware drain, resp check + storeErr, eviction WB FSM, inhibited no-allocate/bypass, flush engine | ~300–450 (largest single piece) |
+| `cache/DcachePlugin.scala` | dirty vec, mode-aware drain, resp check + storeErr, store-side write-allocate refill, drain-vs-refill same-set interlock, eviction WB FSM, async diag-fault record, inhibited no-allocate/bypass, flush engine | ~320–470 (largest single piece) |
 | `mmu/DtlbPlugin.scala` + `Tlb`/`TableWalker`/identity stubs | 3-way CM production | ~40–60 |
-| `execute/LsEuPlugin.scala` | s2Cmode capture, probe routing + flag, backed filter, uncached deferred-completion path, SqAlloc fields, slot-B faultAddr fix | ~120–200 |
-| `ls/StoreQueue.scala` | entry fields, at-head drain trigger + interlock, completion/fault out-Flows, error-pop | ~100–150 |
+| `execute/LsEuPlugin.scala` | s2Cmode/vaddr/sup capture into SqAlloc, `fast` classification (two-term read), deferred-completion gating for precise-path stores | ~50–90 |
+| `ls/StoreQueue.scala` | entry fields (cacheMode/vaddr/sup/precise), at-head drain trigger + interlock, completion/fault out-Flows (per-slot fault vaddr), error-pop | ~100–150 |
 | `rob/RobPlugin.scala` | 5th completion port, 2nd lsFault port, IRQ/trace gates | ~40–60 |
 | `exception/ExceptionUnit.scala` + `SystemState.scala` | CPUSH dispatch + wait, CacheControlService | ~50–80 |
 | `decode/OperationDecoder.scala` + `MicroOpAssembler.scala` | CPUSH/CINV fields + An routing | ~40–60 |
@@ -702,17 +815,23 @@ layers. Honest sizing (new/changed lines, excluding tests):
 | `ls/StoreQueue.scala` + `cache/DcachePlugin.scala` (again) | pipelined hit-drain (in-flight count, same-line hold) | ~80–120 |
 | Harness | CACR reset-poke in lock-step/fuzz/IPC DUT inits (§5.2), optional cache-overlay peek for MMU-on copyback lock-step tests, sim asserts | ~60–100 |
 
-Total ≈ **1000–1450 lines across ~14 files**, i.e. several sessions with the
-project's slice discipline. Suggested slicing for the plan-writing pass:
+Total ≈ **900–1350 lines across ~14 files** (down from the previous
+revision — the probe path and filter structure are gone entirely), i.e.
+several sessions with the project's slice discipline. Suggested slicing for
+the plan-writing pass:
 
 1. Slice P1: CacheMode plumbing + `b.resp` check + `storeErr` (inert) +
    inhibited load no-allocate. Low risk, synth-gated.
-2. Slice P2: backed filter + store probe path + slot-B faultAddr fix →
+2. Slice P2: precise path — deferred completion + SQ at-head drain +
+   completion/fault return ports (MMU-off + INHIBITED share it) →
    `exc_ssw_size_field` / `ssw_atc_bus_error_rw_consistency` green
    (the harness's DECERR injection already exists).
-3. Slice P3: uncached at-head drain interlock (+ IRQ-race directed test).
-4. Slice P4: dirty bits + copyback drain + eviction writeback (with the
-   decided diagnostic-crash error posture) — exercised via MMU-on
+3. Slice P3: preempt-interlock hardening (+ IRQ-race directed test —
+   note the interlock is soaked constantly by every MMU-off store from
+   P2 onward, so P3 is verification-hardening more than new mechanism).
+4. Slice P4: dirty bits + copyback drain + drain-miss write-allocate +
+   drain-vs-refill interlock + eviction writeback + the async
+   diagnostic-fault record (§4.2 channel) — exercised via MMU-on
    DTT/page CM=copyback directed tests; identity default stays
    WRITETHROUGH per the §5.1 decision.
 5. Slice P5: CPUSH/CINV + real CACR.DE=0-fully-uncached semantics (§5.2
@@ -733,9 +852,10 @@ Per the §5.2 CACR.DE=0 decision, the bulk of the existing corpus will
 exercise the D-cache in only ONE mode by default per test (uncached unless
 that test's own author already set CACR/DTT bits). That under-exercises the
 new fast/copyback path outside the small number of tests in §1's acceptance
-list — real coverage of the new machinery (backed filter, dirty-bit
-drain, eviction writeback, pipelined hit-drain) would otherwise rest on a
-handful of dedicated tests, which is thin for a change of this size.
+list — real coverage of the new machinery (trusted fast path, dirty-bit
+drain, drain-miss write-allocate, eviction writeback, pipelined hit-drain)
+would otherwise rest on a handful of dedicated tests, which is thin for a
+change of this size.
 
 Decision: identify the existing ported tests that meaningfully stress the
 LSU (predecrement/postincrement load-store bursts, MOVEM, memory-indirect
