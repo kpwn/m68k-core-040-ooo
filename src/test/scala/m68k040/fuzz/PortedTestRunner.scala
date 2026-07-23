@@ -4,6 +4,17 @@ import m68k040.M68kSim
 import m68k040.oracle.ProgramAssembler
 import spinal.core.sim._
 
+/** Cache posture for ported-test execution. */
+sealed trait CachePosture
+object CachePosture {
+  /** Run exactly as the test source configures CACR/MMU/DTT itself (today's only
+    * behavior). */
+  case object AsWritten extends CachePosture
+  /** Harness-injected prologue: poke CACR.DE=1 + a cacheable identity/DTT mapping
+    * over the test's working set before execution starts (Slice P6's §6.1 sweep). */
+  case object ForceCacheableCopyback extends CachePosture
+}
+
 /** Outcome of running one m68k-ooo-ported directed asm test. */
 sealed trait PortedOutcome
 case object PortedPass extends PortedOutcome
@@ -30,7 +41,8 @@ object PortedTestRunner {
   lazy val compiled = M68kSim().withVerilator.compile(new FuzzCoreDut)
   private var runIdx = 0
 
-  def run(name: String, src: String, timeoutCycles: Long, simSeed: Int = 1): PortedOutcome = {
+  def run(name: String, src: String, timeoutCycles: Long, simSeed: Int = 1,
+        cachePosture: CachePosture = CachePosture.AsWritten): PortedOutcome = {
     val image = ProgramAssembler.assemble(src, loadAddr) match {
       case Right(i)  => i
       case Left(err) => return PortedGenFail(s"assemble: ${err.reason}")
