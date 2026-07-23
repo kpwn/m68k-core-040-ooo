@@ -443,6 +443,14 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sq.io.alloc.payload.nbytesB   := nbytesB_st
     sq.io.alloc.payload.strbB     := splitStrbB
     sq.io.alloc.payload.lineDataB := splitDataB
+    // Precise-path fields (P2): placeholder wiring, replaced for real in Task P2.2
+    // (the fast/precise classification). vaddr/vaddrB/cacheMode/supervisor are the
+    // real live values already computed above for this access.
+    sq.io.alloc.payload.vaddr      := s1Va
+    sq.io.alloc.payload.vaddrB     := s1AddrB
+    sq.io.alloc.payload.cacheMode  := s2Cmode
+    sq.io.alloc.payload.supervisor := xlate.req.supervisor
+    sq.io.alloc.payload.precise    := False   // Task P2.2 replaces this with the real !fast classification
     sq.io.fwd.query.robId := s1Ctx.robId
     sq.io.fwd.query.paddr := s2Paddr
     sq.io.fwd.query.size  := u1.size

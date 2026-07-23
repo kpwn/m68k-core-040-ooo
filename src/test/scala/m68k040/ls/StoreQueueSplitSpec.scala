@@ -24,6 +24,7 @@ class StoreQueueSplitSpec extends AnyFunSuite {
     a.valid #= true
     a.payload.robId #= robId
     a.payload.paddr #= paddrA
+    a.payload.vaddr #= paddrA   // identity for this test (no vaddr-specific case here)
     a.payload.data #= 0
     a.payload.size #= Size.LONG
     a.payload.nbytesA #= nbytesA
@@ -32,9 +33,13 @@ class StoreQueueSplitSpec extends AnyFunSuite {
     a.payload.lineDataA #= lineA
     a.payload.validB #= true
     a.payload.paddrB #= paddrB
+    a.payload.vaddrB #= paddrB   // identity for this test
     a.payload.nbytesB #= nbytesB
     a.payload.strbB #= strbB
     a.payload.lineDataB #= lineB
+    a.payload.cacheMode #= m68k040.cache.CacheMode.WRITETHROUGH
+    a.payload.supervisor #= false
+    a.payload.precise #= false
     cd.waitSampling()
     a.valid #= false
   }
@@ -44,6 +49,7 @@ class StoreQueueSplitSpec extends AnyFunSuite {
     a.valid #= true
     a.payload.robId #= robId
     a.payload.paddr #= paddr
+    a.payload.vaddr #= paddr   // identity for this test (no vaddr-specific case here)
     a.payload.data #= data
     a.payload.size #= size
     a.payload.nbytesA #= (size match { case Size.BYTE => 1; case Size.WORD => 2; case _ => 4 })
@@ -52,9 +58,13 @@ class StoreQueueSplitSpec extends AnyFunSuite {
     a.payload.lineDataA #= 0
     a.payload.validB #= false
     a.payload.paddrB #= 0
+    a.payload.vaddrB #= 0
     a.payload.nbytesB #= 0
     a.payload.strbB #= 0
     a.payload.lineDataB #= 0
+    a.payload.cacheMode #= m68k040.cache.CacheMode.WRITETHROUGH
+    a.payload.supervisor #= false
+    a.payload.precise #= false
     cd.waitSampling()
     a.valid #= false
   }

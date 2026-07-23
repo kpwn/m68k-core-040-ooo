@@ -9,10 +9,14 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class StoreQueueSpec extends AnyFunSuite {
 
-  def alloc(dut: StoreQueue, cd: ClockDomain, robId: Int, paddr: Long, data: Long, size: SpinalEnumElement[Size.type]): Unit = {
+  def alloc(dut: StoreQueue, cd: ClockDomain, robId: Int, paddr: Long, data: Long, size: SpinalEnumElement[Size.type],
+            vaddr: Long = -1, cacheMode: SpinalEnumElement[m68k040.cache.CacheMode.type] = m68k040.cache.CacheMode.WRITETHROUGH,
+            supervisor: Boolean = false, precise: Boolean = false): Unit = {
     dut.io.alloc.valid #= true
     dut.io.alloc.payload.robId #= robId
     dut.io.alloc.payload.paddr #= paddr
+    // default: logical == physical (identity), matching most callers' intent unless overridden.
+    dut.io.alloc.payload.vaddr #= (if (vaddr == -1) paddr else vaddr)
     dut.io.alloc.payload.data #= data
     dut.io.alloc.payload.size #= size
     // aligned (single-slot) store: covered byte count from the size, no slot B.
@@ -22,9 +26,13 @@ class StoreQueueSpec extends AnyFunSuite {
     dut.io.alloc.payload.lineDataA #= 0
     dut.io.alloc.payload.validB #= false
     dut.io.alloc.payload.paddrB #= 0
+    dut.io.alloc.payload.vaddrB #= 0
     dut.io.alloc.payload.nbytesB #= 0
     dut.io.alloc.payload.strbB #= 0
     dut.io.alloc.payload.lineDataB #= 0
+    dut.io.alloc.payload.cacheMode #= cacheMode
+    dut.io.alloc.payload.supervisor #= supervisor
+    dut.io.alloc.payload.precise #= precise
     cd.waitSampling()
     dut.io.alloc.valid #= false
   }
@@ -264,6 +272,44 @@ class StoreQueueSpec extends AnyFunSuite {
       sleep(1)
       assert(!dut.io.fwd.rsp.hit.toBoolean, "partial -> no full hit")
       assert(dut.io.fwd.rsp.stall.toBoolean, "partial overlap -> stall")
+      cd.waitSampling(2)
+    }
+  }
+
+  test("P2.1: alloc stores per-entry vaddr/cacheMode/supervisor/precise (SqAlloc widening)", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      // slot A: logical addr 0x2000_0100, physical 0x100 (identity NOT assumed -- a
+      // deliberately DIFFERENT vaddr/paddr pair, so this test can't pass by accident
+      // if the two ever got swapped/aliased).
+      alloc(dut, cd, robId = 4, paddr = 0x100, data = 0xCAFEBABEL, Size.LONG,
+        vaddr = 0x20000100L, cacheMode = m68k040.cache.CacheMode.COPYBACK,
+        supervisor = true, precise = true)
+      sleep(1)
+      val head = dut.head.toInt
+      assert(dut.vaddrAs(head).toLong == 0x20000100L,
+        s"vaddrA mismatch: ${dut.vaddrAs(head).toLong.toHexString}")
+      assert(dut.cacheModes(head).toEnum == m68k040.cache.CacheMode.COPYBACK,
+        s"cacheMode mismatch: ${dut.cacheModes(head).toEnum}")
+      assert(dut.supervisors(head).toBoolean, "supervisor bit not stored")
+      assert(dut.precises(head).toBoolean, "precise bit not stored")
+
+      // a second, non-supervisor/fast entry -> fields must be independently tracked
+      // per-slot (not a single shared latch).
+      alloc(dut, cd, robId = 8, paddr = 0x200, data = 0x11111111L, Size.LONG,
+        vaddr = 0x30000200L, cacheMode = m68k040.cache.CacheMode.WRITETHROUGH,
+        supervisor = false, precise = false)
+      sleep(1)
+      val head2 = (head + 1) & 7
+      assert(dut.vaddrAs(head2).toLong == 0x30000200L,
+        s"second entry vaddrA mismatch: ${dut.vaddrAs(head2).toLong.toHexString}")
+      assert(dut.cacheModes(head2).toEnum == m68k040.cache.CacheMode.WRITETHROUGH,
+        s"second entry cacheMode mismatch: ${dut.cacheModes(head2).toEnum}")
+      assert(!dut.supervisors(head2).toBoolean, "second entry supervisor should be false")
+      assert(!dut.precises(head2).toBoolean, "second entry precise should be false")
+      // the FIRST entry's fields must be unaffected by the second alloc.
+      assert(dut.supervisors(head).toBoolean, "first entry supervisor clobbered by second alloc")
+      assert(dut.precises(head).toBoolean, "first entry precise clobbered by second alloc")
       cd.waitSampling(2)
     }
   }

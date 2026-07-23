@@ -1,6 +1,6 @@
 package m68k040.ls
 
-import m68k040.cache.DStoreCmd
+import m68k040.cache.{CacheMode, DStoreCmd}
 import m68k040.isa.Size
 import spinal.core._
 import spinal.core.sim._
@@ -10,6 +10,9 @@ case class SqAlloc() extends Bundle {
   val robId = UInt(6 bits)
   // ---- slot A (always present) ----
   val paddr = UInt(32 bits)
+  val vaddr = UInt(32 bits)   // logical address of slot A -- the SSW EA field for a
+                               // precise-path fault must be the LOGICAL address (the
+                               // SQ only stored paddr before this task)
   val data  = Bits(32 bits)
   val size  = Size()
   val nbytesA   = UInt(3 bits)        // covered byte count of slot A (for overlap)
@@ -19,9 +22,14 @@ case class SqAlloc() extends Bundle {
   // ---- slot B (optional second slot of a SPLIT store; one entry = one atomic store) ----
   val validB    = Bool()
   val paddrB    = UInt(32 bits)
+  val vaddrB    = UInt(32 bits)   // logical address of slot B (cross-line/page)
   val nbytesB   = UInt(3 bits)
   val strbB     = Bits(16 bits)
   val lineDataB = Bits(128 bits)
+  // ---- cache-mode / precision classification (captured at translate) ----
+  val cacheMode  = CacheMode()
+  val supervisor = Bool()
+  val precise    = Bool()   // !fast -- withhold ROB completion; drain at head, awaited
 }
 
 case class SqFwdQuery() extends Bundle {
@@ -114,6 +122,19 @@ class StoreQueue(depth: Int = 8) extends Component {
   val paddrHiBs = Vec.fill(depth)(RegInit(U(0, 32 bits)))
   // drain phase of the head entry: false = slot A, true = slot B (split only)
   val drainPhaseB = RegInit(False)
+
+  // ---- precise-path fields (P2): logical addresses (SSW EA needs LOGICAL, not
+  // physical), per-entry cache mode (drives the real write-through/copyback/
+  // inhibited drain policy), the supervisor bit (fault frame's FC/SSW), and the
+  // `precise` classification (withholds ROB completion until a real bus response
+  // for this entry, at head, is observed). All inert until later P2 tasks wire
+  // consumers -- populated at alloc below, same indexing convention as the
+  // existing per-entry Vecs. ----
+  val vaddrAs    = Vec.fill(depth)(RegInit(U(0, 32 bits)))
+  val vaddrBs    = Vec.fill(depth)(RegInit(U(0, 32 bits)))
+  val cacheModes = Vec.fill(depth)(RegInit(CacheMode.WRITETHROUGH))
+  val supervisors= Vec.fill(depth)(RegInit(False))
+  val precises   = Vec.fill(depth)(RegInit(False))
 
   val head = RegInit(U(0, ptrW bits))   // oldest
   val tail = RegInit(U(0, ptrW bits))   // next free
@@ -273,6 +294,11 @@ class StoreQueue(depth: Int = 8) extends Component {
     paddrHiBs(tail) := io.alloc.payload.paddrB + io.alloc.payload.nbytesB
     strbBs(tail)    := io.alloc.payload.strbB
     lineDataBs(tail):= io.alloc.payload.lineDataB
+    vaddrAs(tail)     := io.alloc.payload.vaddr
+    vaddrBs(tail)     := io.alloc.payload.vaddrB
+    cacheModes(tail)  := io.alloc.payload.cacheMode
+    supervisors(tail) := io.alloc.payload.supervisor
+    precises(tail)    := io.alloc.payload.precise
     tail := tail + 1
   }
 
@@ -344,6 +370,10 @@ class StoreQueue(depth: Int = 8) extends Component {
   drainBusy.simPublic(); drainPhaseB.simPublic()
   valids.foreach(_.simPublic()); committed.foreach(_.simPublic())
   robIds.foreach(_.simPublic())
+  // P2.1: per-entry precise-path storage (vaddr/cacheMode/supervisor/precise), tapped
+  // so directed alloc-then-inspect tests can verify the ring stored what was allocated.
+  vaddrAs.foreach(_.simPublic()); vaddrBs.foreach(_.simPublic())
+  cacheModes.foreach(_.simPublic()); supervisors.foreach(_.simPublic()); precises.foreach(_.simPublic())
   io.drain.valid.simPublic(); io.drainAck.simPublic(); io.flush.simPublic()
   // Task #139 mechanism #2: catch the ORIGINATING alloc of any SQ entry, so a
   // later-observed stuck head can be traced back to the actual allocating PC
