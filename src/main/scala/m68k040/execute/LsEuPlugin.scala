@@ -369,6 +369,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val s2Paddr  = Reg(UInt(32 bits))
     val s2PaddrB = Reg(UInt(32 bits))
     val s2Fault  = RegInit(False)
+    val s2Cmode  = Reg(m68k040.cache.CacheMode())
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax #1: REGISTER the AGU effective address at the D-cache boundary.
@@ -391,6 +392,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       val addrB     = Reg(UInt(32 bits))
       val paddrB    = Reg(UInt(32 bits))
       val size      = Reg(m68k040.isa.Size())
+      val cmode     = Reg(m68k040.cache.CacheMode())
       val twoAccess = RegInit(False)
       val bDone     = RegInit(False)   // slot A launched; now presenting slot B (cross)
     }
@@ -408,6 +410,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     dcache.loadCmd.payload.vaddr := loadVaddr
     dcache.loadCmd.payload.paddr := loadPaddr
     dcache.loadCmd.payload.size  := llReg.size
+    dcache.loadCmd.payload.cacheMode := llReg.cmode
 
     // ---- store split (byte-lane) for the SQ entry ----
     // Under identity translation paddr == vaddr, so slot B's physical address is
@@ -902,6 +905,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
                 s2Paddr  := s1Paddr
                 s2PaddrB := s1PaddrB
                 s2Fault  := xlateFault
+                s2Cmode  := xlate.rsp.cacheMode
                 goto(XLATE)
               }
             } otherwise {
@@ -996,6 +1000,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           llReg.addrB     := s1AddrB
           llReg.paddrB    := s2PaddrB
           llReg.size      := u1.size
+          llReg.cmode     := s2Cmode
           llReg.twoAccess := s1TwoAccess
           llReg.bDone     := False
           goto(LAUNCH)
@@ -1192,6 +1197,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       // exception sequencer runs MMU-off (identity, slice-1): paddr == vaddr.
       dcache.loadCmd.payload.paddr := excLoadCmdVaddr
       dcache.loadCmd.payload.size  := excLoadCmdSize
+      // identity-physical, matching dcStore's exc-path cacheMode default.
+      dcache.loadCmd.payload.cacheMode := m68k040.cache.CacheMode.WRITETHROUGH
     }
     when(excActive && excStoreValid) {
       dcache.store.valid          := True

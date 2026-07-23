@@ -41,6 +41,7 @@ class DcacheSpec extends AnyFunSuite {
     dut.probe.logic.loadCmdIn.payload.vaddr #= vaddr
     dut.probe.logic.loadCmdIn.payload.paddr #= vaddr   // identity translation in this spec
     dut.probe.logic.loadCmdIn.payload.size #= size
+    dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
     cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.ready.toBoolean && dut.probe.logic.loadCmdIn.valid.toBoolean)
     dut.probe.logic.loadCmdIn.valid #= false
     cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
@@ -53,6 +54,7 @@ class DcacheSpec extends AnyFunSuite {
     dut.probe.logic.storeIn.payload.data #= data
     dut.probe.logic.storeIn.payload.size #= size
     dut.probe.logic.storeIn.payload.useStrb #= false
+    dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
     cd.waitSampling()
     dut.probe.logic.storeIn.valid #= false
     cd.waitSampling(12)
@@ -66,6 +68,7 @@ class DcacheSpec extends AnyFunSuite {
     dut.probe.logic.storeIn.payload.data #= data
     dut.probe.logic.storeIn.payload.size #= Size.WORD
     dut.probe.logic.storeIn.payload.useStrb #= false
+    dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
     cd.waitSampling()
     dut.probe.logic.storeIn.valid #= false
     // storeAck == AXI B handshake (b.ready is held True by the cache).

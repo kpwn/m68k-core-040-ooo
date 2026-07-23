@@ -377,6 +377,11 @@ class ExceptionUnit(
   dcStore.payload.useStrb := False
   dcStore.payload.strb    := B(0, 16 bits)
   dcStore.payload.lineData:= B(0, 128 bits)
+  // The exception sequencer's frame/vector pushes are always identity-physical
+  // writes (MMU-off in slice-1); constant WRITETHROUGH matches today's
+  // unconditional write-through timing exactly (P2/P4 don't need this path
+  // to vary -- exception frame stores are never copyback-cached).
+  dcStore.payload.cacheMode := m68k040.cache.CacheMode.WRITETHROUGH
 
   // ── D-cache LOAD + D-TLB req: REGISTERED outputs (FMax). The frame/vector load
   // vaddr (off `frameBase`/`vecTarget`) drives the D-cache hit/miss-tag + the LS
@@ -392,6 +397,8 @@ class ExceptionUnit(
   // exception sequencer runs MMU-off (identity, slice-1): paddr == vaddr.
   dcLoadCmd.payload.paddr := RegNext(ldoVaddr)
   dcLoadCmd.payload.size  := RegNext(ldoSize)
+  // Identity-physical, same rationale as dcStore.payload.cacheMode above.
+  dcLoadCmd.payload.cacheMode := m68k040.cache.CacheMode.WRITETHROUGH
 
   val dtoVld = Bool();        dtoVld := False
   val dtoVpn = UInt(20 bits); dtoVpn := U(0, 20 bits)

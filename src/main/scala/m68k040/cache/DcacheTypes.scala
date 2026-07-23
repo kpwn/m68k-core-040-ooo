@@ -11,9 +11,10 @@ import spinal.core._
   * paddr == vaddr; for the exception serializing path paddr is the identity vaddr.
   * `paddr[11:0]` must equal `vaddr[11:0]` (same page offset) by construction. */
 case class DLoadCmd() extends Bundle {
-  val vaddr = UInt(32 bits)
-  val paddr = UInt(32 bits)
-  val size  = Size()
+  val vaddr     = UInt(32 bits)
+  val paddr     = UInt(32 bits)
+  val size      = Size()
+  val cacheMode = CacheMode()
 }
 
 /** Load response: size-extracted (byte-lane, big-endian) data + fault. `line` is
@@ -35,12 +36,13 @@ case class DLoadRsp() extends Bundle {
   * (cross-line/page) store slot whose byte count need not be a clean 1/2/4 Size
   * (e.g. a 3-byte slot). Aligned stores leave `useStrb=false` (unchanged path). */
 case class DStoreCmd() extends Bundle {
-  val paddr    = UInt(32 bits)
-  val data     = Bits(32 bits)
-  val size     = Size()
-  val useStrb  = Bool()
-  val strb     = Bits(16 bits)
-  val lineData = Bits(128 bits)
+  val paddr     = UInt(32 bits)
+  val data      = Bits(32 bits)
+  val size      = Size()
+  val useStrb   = Bool()
+  val strb      = Bits(16 bits)
+  val lineData  = Bits(128 bits)
+  val cacheMode = CacheMode()
 }
 
 /** D-cache service contract (spec 4.2). */
