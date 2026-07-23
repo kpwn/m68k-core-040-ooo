@@ -1,6 +1,6 @@
 package m68k040.rob
 
-import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate, GshareUpdateService, GshareUpdate, PrivilegeService}
+import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate, GshareUpdateService, GshareUpdate, PrivilegeService, CacheControlService}
 import m68k040.rename.RenamedUop
 import m68k040.types.CommitTrace
 import spinal.core._
@@ -19,7 +19,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   *
   * retireAlone entries (branches, for now) retire 1-wide.
   */
-class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService {
+class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService {
 
   // PrivilegeService: the wire is allocated in `setup` (BEFORE any plugin's `build`
   // runs) and driven inside `logic` (build) below, mirroring TranslationService's
@@ -33,8 +33,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   // combinationally taps its (later-driven) value.
   private var _supervisor: Bool = null
   override def supervisor: Bool = _supervisor
+  // CacheControlService: same setup-allocated-wire pattern as PrivilegeService above,
+  // for the identical reason (breaks the DcachePlugin <- RobPlugin Fiber dependency
+  // cycle). Mirrors ss.cacr(31) combinationally; INERT in P1 (no consumer yet).
+  private var _dcacheEnabled: Bool = null
+  override def dcacheEnabled: Bool = _dcacheEnabled
   during setup {
-    _supervisor = Bool()
+    _supervisor    = Bool()
+    _dcacheEnabled = Bool()
   }
 
   /** One ROB entry's commit/free + trace payload. */
@@ -921,6 +927,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val excActive = exc.active; excActive.simPublic()
     // Drive the forward-declared committed-S (the privilege check gates on it).
     committedS := exc.ss.s
+    _dcacheEnabled := exc.ss.cacr(31)
     // The commit-time system op's S=1 vs S=0 split (needs exc.ss.s): S=1 supervisor ->
     // drive the S_APPLY FSM (sysTrigger); S=0 user -> a vector-8 privilege fault.
     sysTriggerSig := sysRetire && exc.ss.s

@@ -1,6 +1,6 @@
 package m68k040.rob
 
-import m68k040.services.{RenameUopService, RenameCommitService, RobAllocService}
+import m68k040.services.{RenameUopService, RenameCommitService, RobAllocService, CacheControlService}
 import m68k040.rename.RenamedUop
 import spinal.core._
 import spinal.core.sim._
@@ -59,4 +59,14 @@ class RenameCommitSinkPlugin extends FiberPlugin with RenameCommitService {
   }
   override def commitPorts: Vec[Flow[CommitSlot]] = logic.commits
   override def flushPort:   Bool                  = logic.flushP
+}
+
+/** Test-only: exposes CacheControlService as top-level IO for SpinalSim.
+  * Test reads dut.cacheCtrl.logic.dcacheEnabledOut. */
+class CacheControlSinkPlugin extends FiberPlugin {
+  val logic = during build new Area {
+    val cc = host[CacheControlService]
+    val dcacheEnabledOut = out(Bool())
+    dcacheEnabledOut := cc.dcacheEnabled
+  }
 }

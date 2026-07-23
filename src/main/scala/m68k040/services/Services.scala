@@ -90,6 +90,18 @@ trait PrivilegeService {
   def supervisor: Bool
 }
 
+/** Owned by the ROB (mirrors `ss.cacr(31)` — the SAME committed register the
+  * `cacr_bit31_roundtrip.s` ported test round-trips via MOVEC). Consumed by the
+  * LS EU's fast/precise store classification (P2) and the D-cache's
+  * fully-uncached CACR.DE=0 semantics (P5). Uses the SAME setup-allocated-wire
+  * pattern as PrivilegeService above and for the identical reason: the
+  * DcachePlugin <- RobPlugin dependency direction would otherwise deadlock the
+  * Fiber chain (RobPlugin.scala's PrivilegeService comment explains the general
+  * shape of this hazard). */
+trait CacheControlService {
+  def dcacheEnabled: Bool
+}
+
 /** The ONE 68040 MMU control (TC enable + separate URP/SRP root pointers + the four
   * transparent-translation registers ITT0/ITT1/DTT0/DTT1), shared by BOTH the I-side
   * ITLB and the D-side DTLB. One owner (MmuControlPlugin) drives the regs; both TLBs

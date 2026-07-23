@@ -26,8 +26,9 @@ class RobPluginSpec extends AnyFunSuite {
     val rob  = new RobPlugin
     val csink = new RenameCommitSinkPlugin
     val tsink = new CommitTraceSinkPlugin
+    val cacheCtrl = new CacheControlSinkPlugin
     db.on { host.asHostOf(Seq[FiberPlugin](
-      new ParamPlugin(M68kParams()), rsrc, drv, rob, csink, tsink)) }
+      new ParamPlugin(M68kParams()), rsrc, drv, rob, csink, tsink, cacheCtrl)) }
   }
 
   /** Poke a RenamedUop slot with sane defaults. */
@@ -382,6 +383,29 @@ class RobPluginSpec extends AnyFunSuite {
         cd.waitSampling()
       }
       assert(dut.rob.logic.count.toInt == 0, "branch retired normally, ROB drained")
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  test("CacheControlService.dcacheEnabled mirrors ss.cacr(31) combinationally") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      // CACR.DE clear -> dcacheEnabled low.
+      dut.rob.logic.exc.ss.cacr #= 0
+      sleep(1)
+      assert(!dut.cacheCtrl.logic.dcacheEnabledOut.toBoolean, "dcacheEnabled must be low when CACR.DE=0")
+
+      // Set CACR bit 31 (DE) -> dcacheEnabled tracks it combinationally, same cycle.
+      dut.rob.logic.exc.ss.cacr #= (1L << 31)
+      sleep(1)
+      assert(dut.cacheCtrl.logic.dcacheEnabledOut.toBoolean, "dcacheEnabled must be high when CACR.DE=1")
+
+      // Other bits set but DE=0 -> still low (isolates bit 31, not "any bit set").
+      dut.rob.logic.exc.ss.cacr #= 0x7fffffffL
+      sleep(1)
+      assert(!dut.cacheCtrl.logic.dcacheEnabledOut.toBoolean, "dcacheEnabled must ignore non-DE CACR bits")
     }
   }
 
