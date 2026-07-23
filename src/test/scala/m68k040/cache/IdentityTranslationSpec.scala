@@ -24,7 +24,7 @@ class IdentityTranslationSpec extends AnyFunSuite {
     svc.req.vpn := io.vpn
     svc.req.supervisor := False
     io.ppn := svc.rsp.ppn
-    io.cacheable := (svc.rsp.cacheMode === CacheMode.CACHEABLE)
+    io.cacheable := (svc.rsp.cacheMode === CacheMode.WRITETHROUGH)
   }
 
   test("identity translation: ppn==vpn, cacheable, no fault", VerilatorTest) {

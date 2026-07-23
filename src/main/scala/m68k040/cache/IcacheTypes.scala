@@ -36,7 +36,25 @@ case class ChunkPredecode() extends Bundle {
 }
 
 object CacheMode extends SpinalEnum {
-  val CACHEABLE, INHIBITED = newElement()
+  val WRITETHROUGH, COPYBACK, INHIBITED = newElement()
+
+  /** Decode a raw 2-bit CM field (page-descriptor bits[6:5] / TTR bits[6:5],
+    * MC68040 UM S3.1.2): 00=writethrough, 01=copyback, 10/11=inhibited (this
+    * core's single-outstanding LS pipe is already serialized, so the two
+    * "inhibited"/"inhibited serialized" encodings collapse to one INHIBITED
+    * value — no fourth enum element is needed). `cm2(1)` = bit6 (the existing
+    * `pgInhibited`/`TtMatch.inhibited` bit), `cm2(0)` = bit5. */
+  def decode(cm2: Bits): CacheMode.C = {
+    val m = CacheMode()
+    when(cm2(1)) {
+      m := INHIBITED
+    } elsewhen (cm2(0)) {
+      m := COPYBACK
+    } otherwise {
+      m := WRITETHROUGH
+    }
+    m
+  }
 }
 
 /** Upstream fetch request: a 32-bit PC. */

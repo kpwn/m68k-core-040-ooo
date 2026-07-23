@@ -190,7 +190,7 @@ class TableWalker extends Component {
         rPpn   := MmuDesc.pgPpn(d)
         rWp    := wp
         rSup   := sup
-        rCmode := MmuDesc.pgInhibited(d) ? CacheMode.INHIBITED | CacheMode.CACHEABLE
+        rCmode := CacheMode.decode(MmuDesc.pgCacheMode(d))
         // Deferred U/M descriptor write: set U (and M on a write). Only when the
         // page is resident & not faulting on perms (a faulting access sets no bits).
         val noFault = MmuDesc.pgResident(d) &&

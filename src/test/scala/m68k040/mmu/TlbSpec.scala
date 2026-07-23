@@ -25,7 +25,7 @@ class TlbSpec extends AnyFunSuite {
     dut.io.fillEntry.vpnTag     #= 0
     dut.io.fillEntry.writeProt  #= wp
     dut.io.fillEntry.supervisor #= sup
-    dut.io.fillEntry.cacheMode  #= (if (inhibited) CacheMode.INHIBITED else CacheMode.CACHEABLE)
+    dut.io.fillEntry.cacheMode  #= (if (inhibited) CacheMode.INHIBITED else CacheMode.WRITETHROUGH)
     dut.io.fillValid #= true
     cd.waitSampling()
     dut.io.fillValid #= false

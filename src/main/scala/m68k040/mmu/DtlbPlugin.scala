@@ -111,7 +111,6 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val dtt0Hit = mmuEnable && TtMatch.hit(dtt0, vaHi8, _req.supervisor)
     val dtt1Hit = mmuEnable && !dtt0Hit && TtMatch.hit(dtt1, vaHi8, _req.supervisor)
     val ttHit   = dtt0Hit || dtt1Hit
-    val ttInhibited = Mux(dtt0Hit, TtMatch.inhibited(dtt0), TtMatch.inhibited(dtt1))
 
     // ---- TLB lookup (combinational) ----
     tlb.io.lookupVpn := _req.vpn
@@ -364,10 +363,11 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       (_req.write && wp) || (sup && !_req.supervisor)
 
     when(!mmuEnable) {
-      // identity passthrough (existing behavior)
+      // identity passthrough — §5.1 USER DECISION: stays WRITETHROUGH (not COPYBACK)
+      // so MMU-off drains still write memory through unchanged.
       _rsp.ready     := True
       _rsp.ppn       := _req.vpn
-      _rsp.cacheMode := CacheMode.CACHEABLE
+      _rsp.cacheMode := CacheMode.WRITETHROUGH
       _rsp.fault     := False
     } elsewhen(ttHit) {
       // DTT0/DTT1 transparent-translation hit (task #194): bypasses the walker/TLB
@@ -375,7 +375,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       // PA=VA, never faults, no page table consulted.
       _rsp.ready     := True
       _rsp.ppn       := _req.vpn
-      _rsp.cacheMode := Mux(ttInhibited, CacheMode.INHIBITED, CacheMode.CACHEABLE)
+      _rsp.cacheMode := TtMatch.cacheMode(Mux(dtt0Hit, dtt0, dtt1))
       _rsp.fault     := False
     } elsewhen(hrMatch) {
       // hit served from the REGISTERED result (the deep hitVec cone ended at hr*).
@@ -395,7 +395,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       // miss: walking (rsp not ready -> consumer stalls).
       _rsp.ready     := False
       _rsp.ppn       := _req.vpn
-      _rsp.cacheMode := CacheMode.CACHEABLE
+      _rsp.cacheMode := CacheMode.WRITETHROUGH   // don't-care (rsp not ready)
       _rsp.fault     := False
     }
 

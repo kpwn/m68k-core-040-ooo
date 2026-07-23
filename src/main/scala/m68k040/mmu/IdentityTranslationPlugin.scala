@@ -21,7 +21,7 @@ class IdentityTranslationPlugin extends FiberPlugin with TranslationService {
     // always resolved this cycle (no walk).
     _rsp.ready     := True
     _rsp.ppn       := _req.vpn
-    _rsp.cacheMode := CacheMode.CACHEABLE
+    _rsp.cacheMode := CacheMode.WRITETHROUGH
     _rsp.fault     := False
   }
 }

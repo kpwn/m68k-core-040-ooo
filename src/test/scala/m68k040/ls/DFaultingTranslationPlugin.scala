@@ -27,7 +27,7 @@ class DFaultingTranslationPlugin extends FiberPlugin with DTranslationService {
     val hit = faultEn && (_req.vpn === faultVpn)
     _rsp.ready     := True
     _rsp.ppn       := _req.vpn
-    _rsp.cacheMode := CacheMode.CACHEABLE
+    _rsp.cacheMode := CacheMode.WRITETHROUGH
     _rsp.fault     := hit
   }
 }

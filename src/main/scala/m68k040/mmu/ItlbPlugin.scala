@@ -273,14 +273,18 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     when(!mmuEnable) {
       _rsp.ready     := True
       _rsp.ppn       := _req.vpn
-      _rsp.cacheMode := CacheMode.CACHEABLE
+      _rsp.cacheMode := CacheMode.WRITETHROUGH
       _rsp.fault     := False
     } elsewhen(ttHit) {
       // ITT0/ITT1 transparent-translation hit (task #194): bypasses the walker/TLB
-      // entirely — PA=VA, never faults.
+      // entirely — PA=VA, never faults. The I-side never inspects WRITETHROUGH vs
+      // COPYBACK (no I-side stores), so collapsing the cacheable case to a fixed
+      // WRITETHROUGH rather than calling TtMatch.cacheMode is an intentional
+      // simplification, not a bug: it only needs the inhibited/cacheable boolean
+      // it already had.
       _rsp.ready     := True
       _rsp.ppn       := _req.vpn
-      _rsp.cacheMode := Mux(ttInhibited, CacheMode.INHIBITED, CacheMode.CACHEABLE)
+      _rsp.cacheMode := Mux(ttInhibited, CacheMode.INHIBITED, CacheMode.WRITETHROUGH)
       _rsp.fault     := False
     } elsewhen(tlbHit) {
       _rsp.ready     := True
@@ -295,7 +299,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     } otherwise {
       _rsp.ready     := False
       _rsp.ppn       := _req.vpn
-      _rsp.cacheMode := CacheMode.CACHEABLE
+      _rsp.cacheMode := CacheMode.WRITETHROUGH   // don't-care (rsp not ready)
       _rsp.fault     := False
     }
 

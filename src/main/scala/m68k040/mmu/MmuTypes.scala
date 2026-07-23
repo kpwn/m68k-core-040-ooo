@@ -136,4 +136,11 @@ object TtMatch {
   /** CM[1] (bit 6) — non-cacheable/inhibited, same bit position as a page
     * descriptor's `pgInhibited` (MmuDesc.pgInhibited). */
   def inhibited(ttr: UInt): Bool = ttr(6)
+
+  /** CM[6:5] decoded via CacheMode.decode — same field position as a page
+    * descriptor's CM (MmuDesc.pgCacheMode). Callers must check `hit`/`inhibited`
+    * separately when they only need the boolean; this is for producers that
+    * need the full 3-way mode (DtlbPlugin's DTT hit response). */
+  def cacheMode(ttr: UInt): CacheMode.C =
+    CacheMode.decode(ttr(6 downto 5).asBits)
 }
