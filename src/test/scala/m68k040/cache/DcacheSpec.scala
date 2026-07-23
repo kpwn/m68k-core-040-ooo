@@ -36,25 +36,27 @@ class DcacheSpec extends AnyFunSuite {
     (0 until size).foldLeft(BigInt(0))((acc, i) => (acc << 8) | BigInt(memByte(base + i)))
 
   /** Drive a load cmd, wait accept, wait rsp.valid; return data. */
-  def load(dut: Dut, cd: ClockDomain, vaddr: Long, size: SpinalEnumElement[Size.type]): BigInt = {
+  def load(dut: Dut, cd: ClockDomain, vaddr: Long, size: SpinalEnumElement[Size.type],
+           cacheMode: SpinalEnumElement[CacheMode.type] = CacheMode.WRITETHROUGH): BigInt = {
     dut.probe.logic.loadCmdIn.valid #= true
     dut.probe.logic.loadCmdIn.payload.vaddr #= vaddr
     dut.probe.logic.loadCmdIn.payload.paddr #= vaddr   // identity translation in this spec
     dut.probe.logic.loadCmdIn.payload.size #= size
-    dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+    dut.probe.logic.loadCmdIn.payload.cacheMode #= cacheMode
     cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.ready.toBoolean && dut.probe.logic.loadCmdIn.valid.toBoolean)
     dut.probe.logic.loadCmdIn.valid #= false
     cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
     dut.probe.logic.loadRspOut.payload.data.toBigInt
   }
 
-  def doStore(dut: Dut, cd: ClockDomain, paddr: Long, data: BigInt, size: SpinalEnumElement[Size.type]): Unit = {
+  def doStore(dut: Dut, cd: ClockDomain, paddr: Long, data: BigInt, size: SpinalEnumElement[Size.type],
+              cacheMode: SpinalEnumElement[CacheMode.type] = CacheMode.WRITETHROUGH): Unit = {
     dut.probe.logic.storeIn.valid #= true
     dut.probe.logic.storeIn.payload.paddr #= paddr
     dut.probe.logic.storeIn.payload.data #= data
     dut.probe.logic.storeIn.payload.size #= size
     dut.probe.logic.storeIn.payload.useStrb #= false
-    dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+    dut.probe.logic.storeIn.payload.cacheMode #= cacheMode
     cd.waitSampling()
     dut.probe.logic.storeIn.valid #= false
     cd.waitSampling(12)
@@ -75,10 +77,44 @@ class DcacheSpec extends AnyFunSuite {
     cd.waitSamplingWhere(dut.dcache.logic.axi.b.valid.toBoolean && dut.dcache.logic.axi.b.ready.toBoolean)
   }
 
+  /** Same ack-gated single-WORD-store shape as `doStoreAckGated`, but also samples
+    * `storeErrReg` (task P1.4, `simPublic`) at the exact B handshake cycle and
+    * returns whether it pulsed — `storeErrReg` is a combinational net off
+    * axi.b.valid/ready/resp (same cycle class as `storeAckReg`), so reading it right
+    * after `waitSamplingWhere` returns observes the value live for that handshake. */
+  def doStoreAckGatedObserveErr(dut: Dut, cd: ClockDomain, paddr: Long, data: BigInt,
+                                 cacheMode: SpinalEnumElement[CacheMode.type] = CacheMode.WRITETHROUGH): Boolean = {
+    dut.probe.logic.storeIn.valid #= true
+    dut.probe.logic.storeIn.payload.paddr #= paddr
+    dut.probe.logic.storeIn.payload.data #= data
+    dut.probe.logic.storeIn.payload.size #= Size.WORD
+    dut.probe.logic.storeIn.payload.useStrb #= false
+    dut.probe.logic.storeIn.payload.cacheMode #= cacheMode
+    cd.waitSampling()
+    dut.probe.logic.storeIn.valid #= false
+    cd.waitSamplingWhere(dut.dcache.logic.axi.b.valid.toBoolean && dut.dcache.logic.axi.b.ready.toBoolean)
+    val err = dut.dcache.logic.storeErrReg.toBoolean
+    cd.waitSampling(4)
+    err
+  }
+
   def initDut(dut: Dut): (ClockDomain, BehavioralMemAgent) = {
     val cd = dut.clockDomain
     cd.forkStimulus(period = 10)
     val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+    dut.probe.logic.loadCmdIn.valid #= false
+    dut.probe.logic.storeIn.valid #= false
+    cd.waitSampling(4)
+    (cd, mem)
+  }
+
+  /** Task P1.4: `BehavioralMemAgent` with `injectBusErrors` enabled, so an access
+    * to an address outside `BehavioralMem.decoded` gets a genuine AXI DECERR (see
+    * that class's doc comment) instead of a silently-successful OKAY. */
+  def initDutErrInject(dut: Dut): (ClockDomain, BehavioralMemAgent) = {
+    val cd = dut.clockDomain
+    cd.forkStimulus(period = 10)
+    val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd, injectBusErrors = true)
     dut.probe.logic.loadCmdIn.valid #= false
     dut.probe.logic.storeIn.valid #= false
     cd.waitSampling(4)
@@ -227,6 +263,100 @@ class DcacheSpec extends AnyFunSuite {
         assert(mem.peekByte(base + i * 2)     == hi, f"word $i%d hi byte @+${i*2}%x")
         assert(mem.peekByte(base + i * 2 + 1) == lo, f"word $i%d lo byte @+${i*2+1}%x")
       }
+    }
+  }
+
+  // ---- Task P1.4: inhibited (MMIO) load/store bypass + storeErr ----
+
+  // (g) an INHIBITED load never allocates a line: repeated inhibited loads to the
+  // SAME address each issue a fresh AXI refill (no resident line is ever created).
+  test("inhibited load never allocates a line", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x8000L
+      preload(mem, base, 16)
+
+      var arCount = 0
+      fork { while (true) { cd.waitSampling()
+        if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1 } }
+
+      val got1 = load(dut, cd, base, Size.LONG, CacheMode.INHIBITED)
+      assert(got1 == expected(base, 4), "inhibited load still returns correct data")
+      val after1 = arCount
+      assert(after1 == 1, s"first inhibited load must refill once: $after1")
+
+      val got2 = load(dut, cd, base, Size.LONG, CacheMode.INHIBITED)
+      assert(got2 == expected(base, 4), "second inhibited load still returns correct data")
+      val after2 = arCount
+      assert(after2 == after1 + 1,
+        s"a SECOND inhibited load to the SAME line must ALSO refill (no line was ever allocated): $after1 -> $after2")
+      cd.waitSampling(4)
+    }
+  }
+
+  // (h) an INHIBITED load bypasses a resident cached alias: a prior CACHEABLE load
+  // at the same address left a line resident; memory is then mutated directly
+  // (bypassing the cache, like an MMIO register changing on its own). The inhibited
+  // load must see the NEW value, never the stale resident alias.
+  test("inhibited load bypasses a resident cached alias", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x9000L
+      preload(mem, base, 16)
+
+      val cachedVal = load(dut, cd, base, Size.LONG, CacheMode.WRITETHROUGH)
+      assert(cachedVal == expected(base, 4), "warm cacheable load")
+
+      mem.pokeByte(base + 0, 0xAA); mem.pokeByte(base + 1, 0xBB)
+      mem.pokeByte(base + 2, 0xCC); mem.pokeByte(base + 3, 0xDD)
+
+      val got = load(dut, cd, base, Size.LONG, CacheMode.INHIBITED)
+      assert(got == BigInt("AABBCCDD", 16),
+        s"inhibited load must bypass the stale resident alias: got ${got.toString(16)}")
+      cd.waitSampling(4)
+    }
+  }
+
+  // (i) an INHIBITED store skips the line write (drains AXI-only): memory updates,
+  // but a resident cached line at the same address is left untouched — a later
+  // CACHEABLE reload still observes the OLD (stale) cached value.
+  test("inhibited store skips the line write (drains AXI-only)", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0xA000L
+      preload(mem, base, 16)
+      val cachedVal = load(dut, cd, base, Size.LONG, CacheMode.WRITETHROUGH)
+      assert(cachedVal == expected(base, 4), "warm cacheable load")
+
+      doStore(dut, cd, base, BigInt("11223344", 16), Size.LONG, CacheMode.INHIBITED)
+      assert(mem.peekByte(base + 0) == 0x11, "mem written by the inhibited store")
+      assert(mem.peekByte(base + 1) == 0x22, "mem written by the inhibited store")
+      assert(mem.peekByte(base + 2) == 0x33, "mem written by the inhibited store")
+      assert(mem.peekByte(base + 3) == 0x44, "mem written by the inhibited store")
+
+      val got = load(dut, cd, base, Size.LONG, CacheMode.WRITETHROUGH)
+      assert(got == expected(base, 4),
+        s"cacheable reload must still see the STALE resident value (array untouched by the inhibited store): got ${got.toString(16)}")
+      cd.waitSampling(4)
+    }
+  }
+
+  // (j) storeErr pulses exactly on a non-OKAY B (SLVERR/DECERR), never otherwise.
+  // storeAck is unaffected either way (pulses on ANY B handshake).
+  test("storeErr pulses exactly on a non-OKAY B and never otherwise", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDutErrInject(dut)
+
+      val errGood1 = doStoreAckGatedObserveErr(dut, cd, 0x1000L, BigInt("ABCD", 16))
+      assert(!errGood1, "storeErr must NOT pulse on an OKAY B (decoded address)")
+
+      val errBad = doStoreAckGatedObserveErr(dut, cd, 0xAAAA0000L, BigInt("DEAD", 16))
+      assert(errBad, "storeErr MUST pulse on a non-OKAY B (undecoded address -> DECERR)")
+
+      val errGood2 = doStoreAckGatedObserveErr(dut, cd, 0x1010L, BigInt("1234", 16))
+      assert(!errGood2, "storeErr must not remain latched/stuck after a prior error pulse")
+
+      cd.waitSampling(4)
     }
   }
 }

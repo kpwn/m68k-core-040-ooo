@@ -54,6 +54,8 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val storePort   = Flow(DStoreCmd())
     storePort.valid.simPublic(); storePort.payload.simPublic()  // debug-only (ported-tests cluster 11 trace)
     val storeAckReg = Bool()
+    val storeErrReg = Bool()   // Task P1.4: 1-cycle pulse, non-OKAY B alongside storeAckReg
+    storeErrReg.simPublic()
     val axi         = master(Axi4(axiCfg))
 
     // ---- translation (D-side TLB) ----
@@ -107,6 +109,13 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val missTag   = Reg(UInt(tagBits bits))
     val missOff   = Reg(UInt(offBits bits))
     val missSize  = Reg(Size())
+    // Task P1.4: an INHIBITED (MMIO) miss never allocates a line on refill (no
+    // stale-data risk from caching a device register, no phantom "hit" on a
+    // later access to the same address that may have changed underneath us).
+    // Latched at miss-detect time so REFILL's allocate gate and REPLAY's
+    // direct-response path both see the SAME cacheability the missing access
+    // actually had (not a live signal that could have moved on).
+    val missCmode = Reg(CacheMode())
     val victimWay = Reg(UInt(wayBits bits))
     val arSent    = Reg(Bool()) init False
     // Task #189 (bus error): latched across REFILL->REPLAY — did the AXI read
@@ -123,6 +132,10 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // LsEuPlugin's `captureFault(atc=false)` call site and ExceptionUnit's
     // `entryFaultAtc`.
     val missFault = Reg(Bool()) init False
+    // Task P1.4: the just-fetched AXI beat for an INHIBITED miss, latched in
+    // REFILL for REPLAY to deliver directly (no line was allocated, so a
+    // re-launched "hit" read would only find garbage/stale BRAM contents).
+    val missLine  = Reg(Bits(128 bits))
 
     // ---- defaults ----
     loadCmdPort.ready := False
@@ -159,6 +172,12 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val ldS1Tag   = Reg(UInt(tagBits bits))
     val ldS1Off   = Reg(UInt(offBits bits))
     val ldS1Size  = Reg(Size())
+    // Task P1.4: the cacheability of the access that launched this S1 read. Gates
+    // the hit vector below — an INHIBITED (MMIO) access must never observe a
+    // stale resident alias left over from when the same physical line was
+    // (validly) cached under a different cacheability, and must never itself
+    // register a "hit" that would suppress the refill it architecturally needs.
+    val ldS1Cmode = Reg(CacheMode())
     val ldS1Fault = Reg(Bool())
     val ldS1Paddr = Reg(UInt(32 bits))   // physical addr (refill base on a miss)
     ldS1Valid := False                   // default; armed on an accept below
@@ -168,9 +187,12 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // tag), so the response is driven COMBINATIONALLY in S1 — the SAME load latency
     // as the old async-LUTRAM hit-detect (1 cycle after accept), but the arc is now
     // a short registered-compare instead of the readAsync->compare->dataMem cone.
+    // Task P1.4: `ldS1Cacheable` forces every way's hit bit low for an INHIBITED
+    // access — always falls through to the miss/REFILL path below.
+    val ldS1Cacheable = ldS1Cmode =/= CacheMode.INHIBITED
     val ldS1HitVec = Vec(Bool(), ways)
     for (w <- 0 until ways)
-      ldS1HitVec(w) := valids(w)(ldS1Set) && (rdTag(w) === ldS1Tag)
+      ldS1HitVec(w) := ldS1Cacheable && valids(w)(ldS1Set) && (rdTag(w) === ldS1Tag)
     val ldS1Hit     = ldS1HitVec.orR
     val ldS1HitWay  = OHToUInt(ldS1HitVec)
     // DEBUG (task #189 investigation, temporary): sim-only visibility.
@@ -194,9 +216,19 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val busFaultResp = Bool(); busFaultResp := False
     busFaultResp.simPublic()   // DEBUG (task #189), temporary
 
-    loadRspPort.valid         := ldS1Resp || busFaultResp
-    loadRspPort.payload.data  := DcacheByteLane.extract(ldS1Line, ldS1Off, ldS1Size)
-    loadRspPort.payload.line  := ldS1Line
+    // Task P1.4: an INHIBITED miss never allocates a line (see REFILL below), so
+    // — same shape as busFaultResp above — a normal ldS1Valid/hit re-launch in
+    // REPLAY would MISS again forever. REPLAY drives this one-cycle pulse
+    // directly instead, delivering the just-fetched AXI beat (`missLine`) without
+    // ever touching the (never-written) BRAM.
+    val inhibitedResp = Bool(); inhibitedResp := False
+    inhibitedResp.simPublic()   // DEBUG, temporary (mirrors busFaultResp)
+
+    loadRspPort.valid         := ldS1Resp || busFaultResp || inhibitedResp
+    loadRspPort.payload.data  := Mux(inhibitedResp,
+                                      DcacheByteLane.extract(missLine, missOff, missSize),
+                                      DcacheByteLane.extract(ldS1Line, ldS1Off, ldS1Size))
+    loadRspPort.payload.line  := Mux(inhibitedResp, missLine, ldS1Line)
     loadRspPort.payload.fault := Mux(busFaultResp, True, ldS1Fault)
 
     // ---- STORE write-through (PIPELINED RMW: S0 latch / S1 read / S2 merge+write) ----
@@ -306,6 +338,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           ldS1Tag      := cmdTag
           ldS1Off      := cmdOff
           ldS1Size     := loadCmdPort.payload.size
+          ldS1Cmode    := loadCmdPort.payload.cacheMode
           ldS1Fault    := xlate.rsp.fault
           ldS1Paddr    := cmdPaddr
         }
@@ -321,6 +354,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           missTag   := ldS1Tag
           missOff   := ldS1Off
           missSize  := ldS1Size
+          missCmode := ldS1Cmode
           victimWay := victim(ldS1Set)
           arSent    := False
           busy      := True
@@ -349,8 +383,15 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           // line (no valid/tag/data write — matches the existing no-allocate-on-
           // miss store policy just below in this file) and latch the fault for
           // REPLAY to report instead of re-launching a (bogus) hit.
-          val respErr = axi.r.payload.resp =/= Axi4.resp.OKAY
-          when(!respErr) {
+          // Task P1.4: an INHIBITED (MMIO) access ALSO never allocates, even on a
+          // clean OKAY response — a cacheable line must never be created from a
+          // deliberately-uncacheable access (would let a later access to the same
+          // physical line observe a stale device read as if it were a real cache
+          // hit). `missLine` always latches the beat (fault or not, allocated or
+          // not) so REPLAY's inhibitedResp path has real data to hand back.
+          val respErr    = axi.r.payload.resp =/= Axi4.resp.OKAY
+          val doAllocate = !respErr && (missCmode =/= CacheMode.INHIBITED)
+          when(doAllocate) {
             for (w <- 0 until ways) when(victimWay === U(w, wayBits bits)) {
               wrEn(w)    := True
               wrSet(w)   := missSet
@@ -361,6 +402,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
             }
             victim(missSet) := victim(missSet) + 1
           }
+          missLine  := axi.r.payload.data
           missFault := respErr
           goto(REPLAY)
         }
@@ -375,6 +417,11 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           // do NOT touch ldS1Valid/rdSet/rdEn here (a real re-launch would MISS
           // again forever — the line is still, correctly, not resident).
           busFaultResp := True
+        } elsewhen(missCmode === CacheMode.INHIBITED) {
+          // Task P1.4: no line was allocated (doAllocate was False above) — there
+          // is nothing to "replay" as a hit. Deliver the just-fetched beat
+          // directly, once, exactly like busFaultResp's one-pulse shape.
+          inhibitedResp := True
         } otherwise {
           // Re-launch the read for the just-filled line; resolve as a guaranteed hit
           // into the response register one cycle later via the ldS1 path.
@@ -386,6 +433,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           ldS1Tag      := missTag
           ldS1Off      := missOff
           ldS1Size     := missSize
+          ldS1Cmode    := missCmode
           ldS1Fault    := False
           ldS1Paddr    := missPaddr
         }
@@ -428,7 +476,12 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       stS2Payload.strb,
       DcacheByteLane.storeStrb(stS2Off, stS2Payload.size))
     val stS2MrgBytes = mergeData.subdivideIn(8 bits)
-    when(stS2Valid) {
+    // Task P1.4: an INHIBITED store never touches the cache array (skip the RMW
+    // line write entirely) — only the AXI write-through beat below is unconditional.
+    // Both WRITETHROUGH and INHIBITED still write through in P1; COPYBACK's "no
+    // AXI write on a hit" split is P4's job, out of scope here.
+    val stS2Cacheable = stS2Payload.cacheMode =/= CacheMode.INHIBITED
+    when(stS2Valid && stS2Cacheable) {
       for (w <- 0 until ways) when(stS2HitVec(w)) {
         val curBytes = rdData(w).subdivideIn(8 bits)
         val newBytes = Vec(Bits(8 bits), 16)
@@ -437,7 +490,9 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         wrSet(w)  := stS2Set
         wrData(w) := newBytes.asBits
       }
-      // latch the write-through beat payload (AXI aw/w fire after S2).
+    }
+    when(stS2Valid) {
+      // write-through beat latch stays UNCONDITIONAL in P1 (unchanged from today).
       stMergeReg := mergeData
       stStrbReg  := mergeStrb
       stAddrReg  := (stS2Payload.paddr(31 downto offBits) ## U(0, offBits bits)).asUInt  // line-aligned
@@ -467,6 +522,12 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // The write has landed in memory once the AXI B response handshakes (b.ready is
     // always True). The SQ holds the drained entry resident — still forwarding — until
     // this pulse, closing the stale-refill window for a younger load that misses L1D.
+    // Task P1.4: storeErrReg pulses alongside storeAckReg (same B handshake) when
+    // the response carried a non-OKAY resp (SLVERR/DECERR) — storeAckReg itself is
+    // UNCHANGED (still pulses on ANY B, ok or err). storeErrReg is INERT this task:
+    // nothing downstream reads it yet (wired into the SQ's precise-path drain
+    // resolution in P2.5, the async diagnostic-fault channel in P4.6).
+    storeErrReg := axi.b.valid && axi.b.ready && (axi.b.payload.resp =/= Axi4.resp.OKAY)
     storeAckReg := axi.b.valid && axi.b.ready
   }
 
@@ -475,4 +536,5 @@ class DcachePlugin extends FiberPlugin with DcacheService {
   override def loadBusy = logic.loadBusyReg
   override def store    = logic.storePort
   override def storeAck = logic.storeAckReg
+  override def storeErr = logic.storeErrReg
 }

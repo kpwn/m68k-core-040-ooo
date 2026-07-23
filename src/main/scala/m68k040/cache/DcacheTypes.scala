@@ -52,6 +52,11 @@ trait DcacheService {
   def loadBusy: Bool                          // high while a refill is in flight (back-pressures loads)
   def store:    spinal.lib.Flow[DStoreCmd]    // write-through: update line if hit + write memory
   def storeAck: Bool                          // 1-cycle pulse when a write-through landed in memory (AXI B)
+  // 1-cycle pulse, same cycle class as storeAck: the AXI B response for the
+  // just-drained store carried a non-OKAY resp (SLVERR/DECERR). storeAck itself
+  // is UNCHANGED (still pulses on ANY B handshake, ok or err) -- storeErr is an
+  // additional QUALIFIER a consumer checks alongside it, never a replacement.
+  def storeErr: Bool
 }
 
 /** Big-endian byte-lane helpers shared by load extraction and store merge.
