@@ -100,8 +100,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // completion(k).valid/payload; this ROB consumes them. Standalone tests poke
     // them in sim (simPublic). Mirrors the RenameCommitService.commitPorts wiring
     // convention (sibling-driven, directionless).
-    // 4 completion ports: ALU0, ALU1, LS EU, CPLX EU (DivEu) (sibling-driven).
-    val completion = Vec.fill(4)(Flow(UInt(robIdW bits)))
+    // 5 completion ports: ALU0, ALU1, LS EU, CPLX EU (DivEu), SQ precise-path drain
+    // (sibling-driven).
+    val completion = Vec.fill(5)(Flow(UInt(robIdW bits)))
     // Default-drive (idle) so the ROB elaborates standalone; a sibling EU-wiring
     // plugin OVERRIDES these via allowOverride, and standalone tests poke them in
     // sim (simPublic).
@@ -294,6 +295,29 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     lsFaultCompletion.payload.supervisor.allowOverride; lsFaultCompletion.payload.supervisor := False
     lsFaultCompletion.payload.atc.allowOverride;      lsFaultCompletion.payload.atc := True
     lsFaultCompletion.simPublic()
+    // SQ precise-path drain fault (Task P2.4): a second lsFaultCompletion-shaped port
+    // rather than sharing one -- the LS EU can fault a YOUNGER access (a translate-
+    // time MMU fault) the SAME cycle the SQ faults an OLDER, already-drained precise
+    // store's bus error. Identical shape/defaults to lsFaultCompletion above.
+    val sqFaultCompletion = Flow(m68k040.execute.LsFault())
+    sqFaultCompletion.valid.allowOverride;            sqFaultCompletion.valid := False
+    sqFaultCompletion.payload.robId.allowOverride;    sqFaultCompletion.payload.robId := U(0, robIdW bits)
+    sqFaultCompletion.payload.faultAddr.allowOverride;sqFaultCompletion.payload.faultAddr := U(0, 32 bits)
+    sqFaultCompletion.payload.write.allowOverride;    sqFaultCompletion.payload.write := False
+    sqFaultCompletion.payload.sizeBits.allowOverride; sqFaultCompletion.payload.sizeBits := U(0, 2 bits)
+    sqFaultCompletion.payload.supervisor.allowOverride; sqFaultCompletion.payload.supervisor := False
+    sqFaultCompletion.payload.atc.allowOverride;      sqFaultCompletion.payload.atc := True
+    sqFaultCompletion.simPublic()
+    // Interrupt/trace preemption interlock (ROB-side half; Task P2.4 builds the SQ-side
+    // half). Sibling-driven (the SQ), same allowOverride/simPublic convention as
+    // lsFaultCompletion/completion above. While a precise-path store is draining from
+    // the SQ, the head must NOT be preempted by an interrupt or trace exception (the
+    // drain has already left the ROB's own retire-time control and must be allowed to
+    // finish/fault on its own terms before any new exception vectors). Default-idle
+    // (False) so a standalone DUT elaborates with no gating; dead-wired until Task
+    // P2.5 wires it to the real SQ.
+    val preciseDrainBusyIn = Bool(); preciseDrainBusyIn.allowOverride; preciseDrainBusyIn := False
+    preciseDrainBusyIn.simPublic()
     // Execute-time conditional fault completion (generalized; driven by the branch EU
     // for TRAPV and the div EU for CHK/DIV0). When an execute-time check raises a
     // synchronous group-2 trap the EU drives this with {robId, vector}; the ROB marks
@@ -616,6 +640,20 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // (which is only meaningful for I-fetch-fault µops). Without this the SSW
       // data/program bit was seed-flaky (the µop's unset sswInstr randomized).
       faultInstrStore(lsFaultCompletion.payload.robId) := False
+    }
+    // SQ precise-path drain fault (Task P2.4): identical treatment to lsFaultCompletion
+    // above, a second independent port so an older drained store's bus error and a
+    // younger in-flight access's translate-time MMU fault can both land the same
+    // cycle. Placed BEFORE the alloc-reset (alloc wins on a re-used index).
+    when(sqFaultCompletion.valid) {
+      faultedStore(sqFaultCompletion.payload.robId)   := True
+      faultVecStore(sqFaultCompletion.payload.robId)  := U(2, 8 bits)
+      faultAddrStore(sqFaultCompletion.payload.robId) := sqFaultCompletion.payload.faultAddr
+      faultWrStore(sqFaultCompletion.payload.robId)   := sqFaultCompletion.payload.write
+      faultSizeStore(sqFaultCompletion.payload.robId) := sqFaultCompletion.payload.sizeBits
+      faultSupStore(sqFaultCompletion.payload.robId)  := sqFaultCompletion.payload.supervisor
+      faultAtcStore(sqFaultCompletion.payload.robId)  := sqFaultCompletion.payload.atc
+      faultInstrStore(sqFaultCompletion.payload.robId):= False
     }
     // Execute-time conditional fault (TRAPV / CHK / DIV0 / address-error task #189):
     // flip the entry FAULTED + the CARRIED vector. faultPc is already the µop's own
@@ -987,7 +1025,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // STOPPED the ROB is empty (count==0, no head) and the IRQ must wake the halted core
     // with no head present, so OR in `stopped` as a recognition gate.
     val normalIrqGate = (count > 0) && firstStore(h0) && !faultedStore(h0) &&
-                        !isRteStore(h0) && !privViolation && !sysOpStore(h0)
+                        !isRteStore(h0) && !privViolation && !sysOpStore(h0) &&
+                        !preciseDrainBusyIn
     interruptPending := (normalIrqGate || stopped) && !flushing && excIdle && iplActive
     // Consume the NMI latch the same cycle it is actually taken — gated on `nmiPending`
     // itself (not the live `iplIn`), so a latched edge is serviced as vector/level 7
@@ -1055,7 +1094,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // MicroOpAssembler's `opUop.firstOfInstr := True` inside `when(isSysOp)` — can
     // never itself be mistaken for "a new macro boundary" and cause an early fire).
     val traceNormalGate = (count > 0) && firstStore(h0) && !faultedStore(h0) &&
-                          !isRteStore(h0) && !privViolation && !sysOpStore(h0)
+                          !isRteStore(h0) && !privViolation && !sysOpStore(h0) &&
+                          !preciseDrainBusyIn
     tracePendingFire := tracePendingReg && traceNormalGate && !flushing && excIdle
     when(tracePendingFire) { tracePendingReg := False }
 

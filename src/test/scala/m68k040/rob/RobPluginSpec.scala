@@ -6,6 +6,7 @@ import m68k040.mmu.IdentityTranslationPlugin
 import m68k040.cache.{IcachePlugin, IcacheSim}
 import m68k040.frontend.FetchAlignPlugin
 import m68k040.decode.{DecodeStage, DecOp}
+import m68k040.exception.InterruptControlPlugin
 import m68k040.rename.{RenameStage, RenamedUop}
 import m68k040.isa.{Cluster, Size}
 import spinal.core._
@@ -533,6 +534,226 @@ class RobPluginSpec extends AnyFunSuite {
 
       assert(allocs >= totalUops, s"pipeline stalled: only $allocs of $totalUops allocated (freelist drained -> loop not closed)")
       assert(totalFires > 48, s"only $totalFires retires observed; loop not sustained past 48 (freelist would have drained)")
+    }
+  }
+
+  // ── Task P2.3: 5th completion port / sqFaultCompletion / preciseDrainBusyIn ────
+  // Directed-only: no driver exists yet (Task P2.5 wires these to the real SQ), so
+  // these tests poke the new ports/gate directly, mirroring how lsFaultCompletion /
+  // completion(0..3) / normalIrqGate-traceNormalGate are exercised elsewhere in this
+  // file / RobInterruptSpec.
+
+  test("completion(4) (5th, SQ precise-drain port) marks completes and retires the head") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+      dut.rob.logic.completion(4).valid #= false
+
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x900, dstArch = 4, pdst = 22, pdstValid = true, pdstOld = 4)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= false
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      cd.waitSampling()
+
+      // Complete robId 0 via ONLY the 5th completion port (ports 0-3 stay idle) --
+      // this is the SQ precise-path drain's own port, sibling-driven at Task P2.5.
+      dut.rob.logic.completion(4).valid #= true
+      dut.rob.logic.completion(4).payload #= 0
+      cd.waitSampling()
+      dut.rob.logic.completion(4).valid #= false
+
+      cd.waitSamplingWhere(dut.tsink.logic.fireOut(0).toBoolean)
+      assert(dut.tsink.logic.fireOut(0).toBoolean, "head retired via completion(4)")
+      assert(dut.tsink.logic.traceOut(0).archRegId.toInt == 4, "correct archRegId")
+    }
+  }
+
+  test("sqFaultCompletion flags entry vector 2 + records fault attrs (paired w/ completion(4))") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+      dut.rob.logic.completion(4).valid #= false
+      dut.rob.logic.sqFaultCompletion.valid #= false
+
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x1000)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= false
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      cd.waitSampling()
+
+      // Complete + fault robId 0 via the SQ-drain pair: completion(4) (completes) and
+      // sqFaultCompletion (faults) -- exactly the shape Task P2.5 wires from the SQ
+      // (an older, already-drained precise store's bus error).
+      dut.rob.logic.completion(4).valid #= true
+      dut.rob.logic.completion(4).payload #= 0
+      dut.rob.logic.sqFaultCompletion.valid #= true
+      dut.rob.logic.sqFaultCompletion.payload.robId #= 0
+      dut.rob.logic.sqFaultCompletion.payload.faultAddr #= BigInt(0x4000L)
+      dut.rob.logic.sqFaultCompletion.payload.write #= false
+      dut.rob.logic.sqFaultCompletion.payload.sizeBits #= 1
+      dut.rob.logic.sqFaultCompletion.payload.supervisor #= false
+      cd.waitSampling()
+      dut.rob.logic.completion(4).valid #= false
+      dut.rob.logic.sqFaultCompletion.valid #= false
+
+      var seen = false; var n = 0
+      while (!seen && n < 50) {
+        if (dut.rob.logic.exceptionPending.toBoolean) {
+          seen = true
+          assert(dut.rob.logic.exceptionVector.toInt == 2, s"vector=${dut.rob.logic.exceptionVector.toInt}")
+          assert(dut.rob.logic.exceptionPc.toLong == 0x1000L, f"excPc=0x${dut.rob.logic.exceptionPc.toLong}%x")
+          assert(dut.rob.logic.exceptionFaultAddr.toLong == 0x4000L,
+            f"faultAddr=0x${dut.rob.logic.exceptionFaultAddr.toLong}%x")
+          assert(!dut.rob.logic.exceptionFaultWr.toBoolean, "write attr false")
+          assert(dut.rob.logic.exceptionFaultSize.toInt == 1, "size attr")
+          assert(!dut.rob.logic.exceptionFaultSup.toBoolean, "supervisor attr false")
+          assert(!dut.csink.logic.commitValidOut(0).toBoolean, "faulted entry must NOT commit normally")
+        }
+        n += 1; cd.waitSampling()
+      }
+      assert(seen, "exceptionPending never pulsed for the sqFaultCompletion-faulted entry")
+    }
+  }
+
+  // ── preciseDrainBusyIn gates normalIrqGate/traceNormalGate (the ROB-side half of
+  // the interrupt/trace preemption interlock; Task P2.4 builds the SQ-side half that
+  // will drive it). Dut mirrors RobInterruptSpec's (adds InterruptControlPlugin so
+  // interruptPending is reachable; a plain SimpleDut has no iplIn source).
+  class GateDut extends Component {
+    val db   = new Database
+    val host = db on (new PluginHost)
+    val intCtrl = new InterruptControlPlugin
+    val rsrc = new RenameUopSourcePlugin
+    val drv  = new RobAllocDriverPlugin
+    val rob  = new RobPlugin
+    val csink = new RenameCommitSinkPlugin
+    val tsink = new CommitTraceSinkPlugin
+    db.on { host.asHostOf(Seq[FiberPlugin](
+      new ParamPlugin(M68kParams()), intCtrl, rsrc, drv, rob, csink, tsink)) }
+  }
+
+  /** Mirrors RobInterruptSpec's pokeRu -- explicitly sets every field that
+    * firstStore/faulted/isRte/interruptPending/tracePendingFire read, so those paths
+    * are deterministic (unset RenamedUop fields randomize per sim seed). */
+  def pokeGateRu(u: RenamedUop, pc: Long = 0, firstOfInstr: Boolean = true): Unit = {
+    u.valid #= true
+    u.pc #= pc
+    u.nextPc #= pc + 2
+    u.faultUsesNextPc #= false
+    u.op #= DecOp.MOVE
+    u.cluster #= Cluster.INT
+    u.size #= Size.LONG
+    u.useImm #= false; u.imm #= 0
+    u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0
+    u.unimplemented #= false
+    u.dstArch #= 0
+    u.psrcA #= 0; u.psrcAValid #= false
+    u.psrcB #= 0; u.psrcBValid #= false
+    u.pdst #= 0; u.pdstValid #= false; u.pdstOld #= 0
+    u.pNzvcSrc #= 0; u.readsNzvc #= false
+    u.pNzvcDst #= 0; u.writesNzvc #= false; u.pNzvcOld #= 0
+    u.pXSrc #= 0; u.readsX #= false
+    u.pXDst #= 0; u.writesX #= false; u.pXOld #= 0
+    u.faulted #= false; u.faultVector #= 0; u.isRte #= false
+    u.sysOp #= false; u.sysKind #= m68k040.decode.SysKind.NONE; u.sysReadDir #= false
+    u.needsSupervisor #= false
+    u.isCondTrap #= false
+    u.sswInstr #= false
+    u.faultAddr #= 0
+    u.firstOfInstr #= firstOfInstr
+  }
+
+  def initGate(dut: GateDut, cd: ClockDomain): Unit = {
+    dut.rsrc.logic.src.valid #= false
+    dut.rsrc.logic.u1v #= false
+    dut.rob.logic.flush.valid #= false
+    for (c <- dut.rob.logic.completion) { c.valid #= false; c.payload #= 0 }
+    dut.rob.logic.branchCompletion.valid #= false
+    dut.rob.logic.preciseDrainBusyIn #= false
+    dut.intCtrl.logic.iplIn #= 0
+    dut.intCtrl.logic.iackAvec #= false
+    dut.intCtrl.logic.iackVector #= 0
+    pokeGateRu(dut.rsrc.logic.src.payload(0))
+    pokeGateRu(dut.rsrc.logic.src.payload(1))
+    cd.waitSampling(3)
+  }
+
+  def allocGateOne(dut: GateDut, cd: ClockDomain, pc: Long): Unit = {
+    pokeGateRu(dut.rsrc.logic.src.payload(0), pc = pc)
+    dut.rsrc.logic.src.valid #= true
+    dut.rsrc.logic.u1v #= false
+    cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+    dut.rsrc.logic.src.valid #= false
+    cd.waitSampling()
+  }
+
+  def setGateMask(dut: GateDut, cd: ClockDomain, mask: Int): Unit = {
+    dut.rob.logic.exc.ss.srSys #= (0x20 | (mask & 0x7))
+    cd.waitSampling()
+  }
+
+  test("preciseDrainBusyIn blocks interruptPending even when ipl>mask at a first-uop head") {
+    M68kSim().compile(new GateDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initGate(dut, cd)
+      setGateMask(dut, cd, 2)
+      allocGateOne(dut, cd, pc = 0xB00)
+      dut.rob.logic.preciseDrainBusyIn #= true
+      dut.intCtrl.logic.iplIn #= 5   // > mask -- would normally recognize immediately
+      dut.intCtrl.logic.iackAvec #= true
+      for (_ <- 0 until 10) {
+        assert(!dut.rob.logic.interruptPending.toBoolean, "preciseDrainBusyIn must block interruptPending")
+        cd.waitSampling()
+      }
+      // Sanity: dropping the gate lets the SAME still-pending condition fire.
+      dut.rob.logic.preciseDrainBusyIn #= false
+      var seen = false; var n = 0
+      while (!seen && n < 10) {
+        if (dut.rob.logic.interruptPending.toBoolean) seen = true
+        n += 1; cd.waitSampling()
+      }
+      assert(seen, "interruptPending must fire once preciseDrainBusyIn drops (sanity)")
+    }
+  }
+
+  test("preciseDrainBusyIn blocks tracePendingFire even with an armed T1 trace at a first-uop head") {
+    M68kSim().compile(new GateDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initGate(dut, cd)
+      // S=1, T1=1 (srSys bit 7) -- every retiring instruction arms a pending trace.
+      dut.rob.logic.exc.ss.srSys #= 0xA0
+      cd.waitSampling()
+      dut.rob.logic.preciseDrainBusyIn #= true
+
+      // Alloc + retire ONE instruction (via completion port 0) to ARM tracePendingReg
+      // (retire0 && h0TraceArmed, h0TraceArmed = t1Armed here).
+      allocGateOne(dut, cd, pc = 0xC00)
+      dut.rob.logic.completion(0).valid #= true; dut.rob.logic.completion(0).payload #= 0
+      cd.waitSamplingWhere(dut.tsink.logic.fireOut(0).toBoolean)
+      dut.rob.logic.completion(0).valid #= false
+      cd.waitSampling()   // let tracePendingReg's write (registered) land
+      assert(dut.rob.logic.tracePendingReg.toBoolean, "trace must be armed after the T1-active retire")
+
+      // A second instruction is now the head, eligible (firstStore, non-faulted/RTE/
+      // sysOp) -- traceNormalGate does NOT wait on completes(h0), so WITHOUT the gate
+      // this fires immediately. With preciseDrainBusyIn held, it must never fire.
+      allocGateOne(dut, cd, pc = 0xC02)
+      for (_ <- 0 until 10) {
+        assert(!dut.rob.logic.tracePendingFire.toBoolean, "preciseDrainBusyIn must block tracePendingFire")
+        cd.waitSampling()
+      }
+      assert(dut.rob.logic.tracePendingReg.toBoolean, "the armed trace must still be pending (never consumed)")
+
+      // Sanity: dropping the gate lets the still-armed trace fire.
+      dut.rob.logic.preciseDrainBusyIn #= false
+      var seen = false; var n = 0
+      while (!seen && n < 10) {
+        if (dut.rob.logic.tracePendingFire.toBoolean) seen = true
+        n += 1; cd.waitSampling()
+      }
+      assert(seen, "tracePendingFire must fire once preciseDrainBusyIn drops (sanity)")
     }
   }
 }
