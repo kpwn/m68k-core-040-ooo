@@ -81,6 +81,11 @@ class StoreQueue(depth: Int = 8) extends Component {
     // the store left the SQ but its memory write was not yet visible — a younger
     // load that MISSED L1D could refill stale memory. Holding until ack closes it.
     val drainAck = in(Bool())
+    // Non-OKAY AXI B response for the store currently occupying the drain port
+    // (sampled the SAME cycle as drainAck -- DcachePlugin's storeAck/storeErr are
+    // driven off the identical `axi.b.valid && axi.b.ready` handshake, so they are
+    // always co-timed).
+    val drainErr = in(Bool())
     val empty    = out(Bool())   // no valid entry AND no drain in flight
     // Back-pressure to the LS-EU: high when the ring is FULL (all `depth` entries
     // resident). The LS-EU reads this ONLY in its execute/alloc FSM (a `WAIT_SQ`
@@ -88,6 +93,13 @@ class StoreQueue(depth: Int = 8) extends Component {
     // drains. The alloc Flow has no `ready`, so the EU is responsible for never
     // allocating while full; the sim assert below enforces that contract.
     val full     = out(Bool())
+    // ---- precise-path at-head drain (Task P2) ----
+    val robHeadIn           = in(UInt(6 bits))   // = rob.logic.h0
+    val robHeadValidIn      = in(Bool())         // = rob.logic.count > 0
+    val irqPreemptPendingIn = in(Bool())         // = rob.logic.interruptPending || rob.logic.tracePendingFire
+    val sqCompletion        = master(Flow(UInt(6 bits)))
+    val sqFaultCompletion   = master(Flow(m68k040.execute.LsFault()))
+    val preciseDrainBusy    = out(Bool())
   }
 
   // ---- ring storage (all RegInit) ----
@@ -147,6 +159,18 @@ class StoreQueue(depth: Int = 8) extends Component {
     n
   }
 
+  // ---- SSW-encoded access size (00=byte,01=word,10=long), mirrors LsEuPlugin's
+  // captureFault -- feeds sqFaultCompletion.payload.sizeBits below. ----
+  def sizeBitsOf(s: Size.C): UInt = {
+    val n = UInt(2 bits); n := 2   // default LONG-encoding, mirrors LsEuPlugin's captureFault
+    switch(s) {
+      is(Size.BYTE) { n := 0 }
+      is(Size.WORD) { n := 1 }
+      is(Size.LONG) { n := 2 }
+    }
+    n
+  }
+
   // ---- ROB circular age compare: is robId `a` strictly OLDER than `b`? ----
   // True iff (b - a) in (0, 32) -- a sits "behind" b within half the 6-bit window.
   def olderThan(a: UInt, b: UInt): Bool = {
@@ -163,7 +187,20 @@ class StoreQueue(depth: Int = 8) extends Component {
   // A SPLIT store (validB) drains ATOMICALLY: slot A first (drainPhaseB=false),
   // then slot B (drainPhaseB=true). The entry pops only after BOTH halves ACK.
   val drainBusy = RegInit(False)
-  val headReady = valids(head) && committed(head) && !io.flush
+  // Precise-path at-head drain: an UNCOMMITTED precise entry drains once its robId
+  // reaches the (non-speculative) ROB head -- i.e. every program-older instruction
+  // has already retired -- gated off a preempt-pending input (an interrupt/trace
+  // about to fire must not race a drain launch; see preciseDrainBusy below for the
+  // in-flight-drain side of that same gate). Deadlock-freedom (design doc §4.1): the
+  // SQ ring order equals program order (IssueQueuePlugin.scala:316-337 enforces
+  // oldest-occupied-LS-only issue), so a precise store's robId reaches the ROB head
+  // only once every program-older store has already allocated and drained -- i.e.
+  // `robIds(head) === io.robHeadIn` can only become true once this entry genuinely
+  // IS the SQ ring head too. Nothing here needs an explicit reordering check.
+  val headPreciseReady = valids(head) && !committed(head) && precises(head) &&
+                         (robIds(head) === io.robHeadIn) && io.robHeadValidIn &&
+                         !io.flush && !io.irqPreemptPendingIn
+  val headReady = (valids(head) && committed(head) && !io.flush) || headPreciseReady
   val drainIssue = headReady && !drainBusy   // one-cycle present to the D-cache
   io.drain.valid := drainIssue
   // Present slot A (phase false) or slot B (phase true).
@@ -174,7 +211,7 @@ class StoreQueue(depth: Int = 8) extends Component {
     io.drain.payload.useStrb  := useStrbAs(head)
     io.drain.payload.strb     := strbAs(head)
     io.drain.payload.lineData := lineDataAs(head)
-    io.drain.payload.cacheMode := m68k040.cache.CacheMode.WRITETHROUGH   // P2 replaces with the per-entry value
+    io.drain.payload.cacheMode := cacheModes(head)
   } otherwise {
     io.drain.payload.paddr    := paddrBs(head)
     io.drain.payload.data     := B(0, 32 bits)
@@ -182,7 +219,7 @@ class StoreQueue(depth: Int = 8) extends Component {
     io.drain.payload.useStrb  := True
     io.drain.payload.strb     := strbBs(head)
     io.drain.payload.lineData := lineDataBs(head)
-    io.drain.payload.cacheMode := m68k040.cache.CacheMode.WRITETHROUGH   // P2 replaces with the per-entry value
+    io.drain.payload.cacheMode := cacheModes(head)
   }
 
   // ---- forwarding (combinational), DUAL-SLOT ----
@@ -305,19 +342,73 @@ class StoreQueue(depth: Int = 8) extends Component {
   // ---- drain handshake: present -> busy; ack -> advance phase / pop ----
   // For a split store: ACK of slot A advances to slot B (no pop); ACK of slot B
   // pops. For a single-slot store: ACK pops directly.
+  //
+  // Precise-path completion/fault (design doc §4.1): a precise entry withholds ROB
+  // completion until its real bus response is observed here. sqCompletion fires on
+  // every successful (or terminally-popped, even faulted) ack of a precise head --
+  // the ROB's completes-required-even-for-a-fault contract needs both to fire
+  // together on error. sqFaultCompletion additionally fires (and carries the
+  // FAILING SLOT's own logical address, not always slot A's) only on a genuine
+  // AXI B error.
+  io.sqCompletion.valid   := False
+  io.sqCompletion.payload := robIds(head)
+  io.sqFaultCompletion.valid           := False
+  io.sqFaultCompletion.payload.robId   := robIds(head)
+  io.sqFaultCompletion.payload.faultAddr  := Mux(drainPhaseB, vaddrBs(head), vaddrAs(head))
+  io.sqFaultCompletion.payload.write      := True
+  io.sqFaultCompletion.payload.sizeBits   := sizeBitsOf(sizes(head))
+  io.sqFaultCompletion.payload.supervisor := supervisors(head)
+  io.sqFaultCompletion.payload.atc        := False   // a physical bus error, never MMU/ATC
+
   when(drainIssue) { drainBusy := True }
   when(io.drainAck && drainBusy) {
     drainBusy := False
-    when(!drainPhaseB && validBs(head)) {
-      // slot A acked -> drain slot B next (atomic two-half drain; do NOT pop yet)
-      drainPhaseB := True
-    } otherwise {
-      // single-slot store, or slot B of a split store -> pop the whole entry
+    when(precises(head) && io.drainErr) {
+      // Terminal error pop (design doc §4.1): do NOT continue to slot B / leave the
+      // entry for excEnteringSq -- pop it right here so drainBusy/phase state stays
+      // clean and there is no orphan class. The completion ALSO fires (headReady in
+      // the ROB requires completes(h0) even for a faulted entry) alongside the fault.
+      io.sqCompletion.valid      := True
+      io.sqFaultCompletion.valid := True
       drainPhaseB  := False
       valids(head) := False
       head := head + 1
+    } otherwise {
+      // CONCERN (flagged in the P2.4 report, not fixed here -- brief-specified
+      // behavior, unchanged from the design doc's own sketch): this fires on ANY
+      // ack of a precise head, including slot A's ack of a SPLIT precise store --
+      // i.e. BEFORE slot B has even been attempted. That lets the ROB's
+      // completes(h0) go true, and (once P2.5 wires this live) potentially retire
+      // the instruction, while slot B is still in flight. If slot B then faults,
+      // the fault is reported against a robId the ROB may already believe is
+      // retired (or has reused) -- see the P2.4 report for the full race. A
+      // candidate fix is to gate this on the TERMINAL ack only (the same condition
+      // guarding the pop below), but that is a behavior change beyond this task's
+      // scope -- flagging for P2.5/a follow-up rather than changing it here.
+      when(precises(head)) { io.sqCompletion.valid := True }
+      when(!drainPhaseB && validBs(head)) {
+        // slot A acked -> drain slot B next (atomic two-half drain; do NOT pop yet)
+        drainPhaseB := True
+      } otherwise {
+        // single-slot store, or slot B of a split store -> pop the whole entry
+        drainPhaseB  := False
+        valids(head) := False
+        head := head + 1
+      }
     }
   }
+
+  // ---- preciseDrainBusy: registered launch-through-resolution-plus-one-cycle busy
+  // (design doc §4.1: "the SQ launch decision should be registered and the ROB
+  // samples the registered busy"), asserted the cycle a precise drain LAUNCHES and
+  // held one extra cycle past its resolution (the ack-OK-to-retire handshake seam)
+  // so the ROB's normalIrqGate/traceNormalGate never race a same-cycle preempt
+  // against a drain that just resolved. ----
+  val preciseDrainBusyReg = RegInit(False)
+  val preciseResolves = io.drainAck && drainBusy && precises(head)
+  when(headPreciseReady && !drainBusy) { preciseDrainBusyReg := True }
+    .elsewhen(RegNext(preciseResolves, init = False)) { preciseDrainBusyReg := False }
+  io.preciseDrainBusy := preciseDrainBusyReg
 
   // ---- flush: squash speculative (uncommitted) entries. Roll tail back to just
   // past the youngest COMMITTED entry. Walk from head over committed entries. ----

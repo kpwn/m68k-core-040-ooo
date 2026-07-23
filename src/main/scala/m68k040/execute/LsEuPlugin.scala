@@ -204,6 +204,17 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     dcache.store << sq.io.drain
     sq.io.drainAck := dcache.storeAck   // pop a drained entry only once memory is written
     sqEmptySig := sq.io.empty           // surfaced for the exception FSM's drain wait
+    // ---- precise-path at-head drain inputs (Task P2.4): still DEAD-WIRED here --
+    // robHeadValidIn defaults False so headPreciseReady can never assert yet, and
+    // drainErr defaults False so no precise drain can ever be observed to fault.
+    // Task P2.5 replaces these four with the real ROB head / preempt-pending /
+    // dcache.storeErr signals (routed through LsEuPlugin's own new pass-through
+    // wires) and routes sqCompletion/sqFaultCompletion/preciseDrainBusy out to the
+    // ROB -- StoreQueue itself is already fully correct as of this task.
+    sq.io.robHeadIn           := U(0, 6 bits)
+    sq.io.robHeadValidIn      := False
+    sq.io.irqPreemptPendingIn := False
+    sq.io.drainErr            := False
 
     // ---- S0: read operands ----
     val u0 = issuePort.payload.uop

@@ -58,6 +58,8 @@ class StoreQueueSpec extends AnyFunSuite {
     dut.io.commitB.valid #= false; dut.io.commitB.payload #= 0
     dut.io.flush #= false
     dut.io.drainAck #= false
+    dut.io.drainErr #= false
+    dut.io.robHeadIn #= 0; dut.io.robHeadValidIn #= false; dut.io.irqPreemptPendingIn #= false
     setQuery(dut, 0, 0, Size.LONG)
     cd.waitSampling(3)
     cd
@@ -310,6 +312,200 @@ class StoreQueueSpec extends AnyFunSuite {
       // the FIRST entry's fields must be unaffected by the second alloc.
       assert(dut.supervisors(head).toBoolean, "first entry supervisor clobbered by second alloc")
       assert(dut.precises(head).toBoolean, "first entry precise clobbered by second alloc")
+      cd.waitSampling(2)
+    }
+  }
+
+  // ---- Task P2.4: precise-path at-head drain trigger, sqCompletion/sqFaultCompletion,
+  // error-pop, preciseDrainBusy. Directed per the design doc §4.1 mechanism. Note:
+  // robHeadValidIn/robHeadIn/irqPreemptPendingIn/drainErr are exercised DIRECTLY here
+  // (StoreQueue standalone) -- they stay dead-wired (False) from LsEuPlugin's side
+  // until Task P2.5, so these behaviors are NOT yet reachable through the full core. ----
+
+  test("P2.4: precise head at ROB head drains WITHOUT commit; ack-OK drives sqCompletion", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      alloc(dut, cd, robId = 4, paddr = 0x100, data = 0xCAFEBABEL, Size.LONG,
+        vaddr = 0x20000100L, precise = true)
+      sleep(1)
+      assert(!dut.io.drain.valid.toBoolean, "precise head must not drain before robHeadValidIn")
+      assert(!dut.committed(dut.head.toInt).toBoolean, "entry is genuinely uncommitted")
+      // robId reaches the (non-speculative) ROB head -> drains WITHOUT committed ever set
+      dut.io.robHeadIn #= 4
+      dut.io.robHeadValidIn #= true
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
+      assert(dut.io.drain.payload.paddr.toLong == 0x100, "drain presents the precise head entry")
+      assert(!dut.committed(dut.head.toInt).toBoolean, "still uncommitted at the moment of drain-issue")
+      cd.waitSampling()   // present -> held (drainBusy now registered True)
+      dut.io.drainAck #= true
+      sleep(1)
+      assert(dut.io.sqCompletion.valid.toBoolean, "ack-OK must drive sqCompletion")
+      assert(dut.io.sqCompletion.payload.toInt == 4, "sqCompletion carries the drained robId")
+      assert(!dut.io.sqFaultCompletion.valid.toBoolean, "no error -> no fault completion")
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      sleep(1)
+      assert(dut.io.empty.toBoolean, "the only entry popped -> queue empty")
+      cd.waitSampling(2)
+    }
+  }
+
+  test("P2.4: precise-path bus error drives sqCompletion+sqFaultCompletion with the failing slot's vaddr, pops terminally", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      alloc(dut, cd, robId = 5, paddr = 0x400, data = 0x11112222L, Size.LONG,
+        vaddr = 0x30004000L, supervisor = true, precise = true)
+      dut.io.robHeadIn #= 5
+      dut.io.robHeadValidIn #= true
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
+      cd.waitSampling()   // present -> held (drainBusy now registered True)
+      dut.io.drainAck #= true
+      dut.io.drainErr #= true
+      sleep(1)
+      assert(dut.io.sqCompletion.valid.toBoolean,
+        "an errored drain must STILL fire sqCompletion -- the ROB's completes-required-even-for-a-fault contract")
+      assert(dut.io.sqCompletion.payload.toInt == 5)
+      assert(dut.io.sqFaultCompletion.valid.toBoolean, "AXI B error must drive sqFaultCompletion")
+      assert(dut.io.sqFaultCompletion.payload.robId.toInt == 5)
+      assert(dut.io.sqFaultCompletion.payload.faultAddr.toLong == 0x30004000L,
+        s"faultAddr must be the failing slot's LOGICAL address: ${dut.io.sqFaultCompletion.payload.faultAddr.toLong.toHexString}")
+      assert(dut.io.sqFaultCompletion.payload.write.toBoolean, "a store fault is always a write")
+      assert(dut.io.sqFaultCompletion.payload.sizeBits.toInt == 2, "LONG-encoded size")
+      assert(dut.io.sqFaultCompletion.payload.supervisor.toBoolean, "supervisor bit carried through")
+      assert(!dut.io.sqFaultCompletion.payload.atc.toBoolean, "a physical bus error is never ATC/MMU")
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      dut.io.drainErr #= false
+      sleep(1)
+      assert(dut.io.empty.toBoolean, "terminal error-pop must not leave an orphan entry resident")
+      cd.waitSampling(2)
+    }
+  }
+
+  test("P2.4: split precise store faulting in slot B reports slot B's OWN vaddr (not slot A's)", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      val a = dut.io.alloc
+      a.valid #= true
+      a.payload.robId #= 7
+      a.payload.paddr #= 0x1000; a.payload.vaddr #= 0x21000000L
+      a.payload.data #= 0; a.payload.size #= Size.LONG
+      a.payload.nbytesA #= 2; a.payload.useStrbA #= true; a.payload.strbA #= 0x3; a.payload.lineDataA #= 0
+      a.payload.validB #= true
+      a.payload.paddrB #= 0x2000; a.payload.vaddrB #= 0x22000000L
+      a.payload.nbytesB #= 2; a.payload.strbB #= 0x3; a.payload.lineDataB #= 0
+      a.payload.cacheMode #= m68k040.cache.CacheMode.WRITETHROUGH
+      a.payload.supervisor #= false
+      a.payload.precise #= true
+      cd.waitSampling()
+      a.valid #= false
+
+      dut.io.robHeadIn #= 7
+      dut.io.robHeadValidIn #= true
+      // slot A drains cleanly (no error) -- entry does NOT pop yet (validB -> phase B next)
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
+      assert(dut.io.drain.payload.paddr.toLong == 0x1000, "slot A presented first")
+      cd.waitSampling()   // present -> held (drainBusy now registered True)
+      dut.io.drainAck #= true
+      sleep(1)
+      assert(!dut.io.sqFaultCompletion.valid.toBoolean, "slot A itself did not error")
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      // slot B now presented -> fault it
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
+      assert(dut.io.drain.payload.paddr.toLong == 0x2000, "slot B presented next (atomic two-half drain)")
+      cd.waitSampling()   // present -> held (drainBusy now registered True)
+      dut.io.drainAck #= true
+      dut.io.drainErr #= true
+      sleep(1)
+      assert(dut.io.sqFaultCompletion.valid.toBoolean)
+      assert(dut.io.sqFaultCompletion.payload.faultAddr.toLong == 0x22000000L,
+        s"faultAddr must be slot B's OWN vaddr, not slot A's: ${dut.io.sqFaultCompletion.payload.faultAddr.toLong.toHexString}")
+      cd.waitSampling()
+      dut.io.drainAck #= false; dut.io.drainErr #= false
+      sleep(1)
+      assert(dut.io.empty.toBoolean, "terminal error-pop must not leave an orphan entry resident")
+      cd.waitSampling(2)
+    }
+  }
+
+  test("P2.4: irqPreemptPendingIn blocks a not-yet-launched precise drain", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      alloc(dut, cd, robId = 9, paddr = 0x500, data = 0x55555555L, Size.LONG,
+        vaddr = 0x40005000L, precise = true)
+      dut.io.robHeadIn #= 9
+      dut.io.robHeadValidIn #= true
+      dut.io.irqPreemptPendingIn #= true
+      sleep(1)
+      assert(!dut.io.drain.valid.toBoolean, "a pending preempt must block launching a precise drain")
+      cd.waitSampling(3)
+      assert(!dut.io.drain.valid.toBoolean, "still blocked while irqPreemptPendingIn stays high")
+      // preempt clears -> the drain launches
+      dut.io.irqPreemptPendingIn #= false
+      sleep(1)
+      assert(dut.io.drain.valid.toBoolean, "drain must launch once the preempt-pending input clears")
+      cd.waitSampling()   // present -> held (drainBusy now registered True)
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      cd.waitSampling(2)
+    }
+  }
+
+  test("P2.4: a LAUNCHED precise drain (registered preciseDrainBusy) is unaffected by irqPreemptPendingIn going true mid-drain", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      alloc(dut, cd, robId = 11, paddr = 0x600, data = 0x66666666L, Size.LONG,
+        vaddr = 0x50006000L, precise = true)
+      assert(!dut.io.preciseDrainBusy.toBoolean, "not busy before launch")
+      dut.io.robHeadIn #= 11
+      dut.io.robHeadValidIn #= true
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)   // launch cycle (headPreciseReady && !drainBusy)
+      cd.waitSampling()   // one cycle after launch -> preciseDrainBusyReg registers True
+      sleep(1)
+      assert(dut.io.preciseDrainBusy.toBoolean, "preciseDrainBusy must be asserted while the drain is in flight")
+      // NOW an interrupt/trace becomes pending mid-drain -- must NOT cancel/un-launch it.
+      dut.io.irqPreemptPendingIn #= true
+      cd.waitSampling(2)
+      sleep(1)
+      assert(dut.io.preciseDrainBusy.toBoolean, "an in-flight drain must not be affected by a mid-drain preempt-pending")
+      assert(!dut.io.drain.valid.toBoolean, "must not re-present while busy/held")
+      // ack it -> completes normally despite irqPreemptPendingIn still being true
+      dut.io.drainAck #= true
+      sleep(1)
+      assert(dut.io.sqCompletion.valid.toBoolean, "the launched drain must resolve normally despite the preempt-pending input")
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      sleep(1)
+      assert(dut.io.empty.toBoolean, "entry popped after the ack")
+      // preciseDrainBusy drops one cycle after resolution (design doc: held one extra
+      // cycle past ack for the ack-OK-to-retire handshake seam).
+      assert(dut.io.preciseDrainBusy.toBoolean, "preciseDrainBusy stays held the cycle immediately after ack")
+      cd.waitSampling()
+      sleep(1)
+      assert(!dut.io.preciseDrainBusy.toBoolean, "preciseDrainBusy drops one cycle after resolution")
+      cd.waitSampling(2)
+    }
+  }
+
+  test("P2.4 (Step 5 regression): a flushed, never-drained precise entry does not linger (keep logic unchanged)", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      // precise entry, never committed, never given robHeadValidIn -> never drains.
+      alloc(dut, cd, robId = 13, paddr = 0x700, data = 0x77777777L, Size.LONG,
+        vaddr = 0x60007000L, precise = true)
+      sleep(1)
+      assert(!dut.io.drain.valid.toBoolean, "never-launched precise entry must not drain")
+      // its instruction gets flushed (mispredict/exception squash upstream) before
+      // ever reaching the ROB head.
+      dut.io.flush #= true
+      cd.waitSampling()
+      dut.io.flush #= false
+      sleep(1)
+      assert(!dut.valids(0).toBoolean, "an uncommitted precise entry must squash on flush like any other uncommitted entry")
+      assert(dut.io.empty.toBoolean, "queue must be empty -- no lingering orphan entry")
+      assert(!dut.io.drain.valid.toBoolean, "the squashed entry must never drain")
       cd.waitSampling(2)
     }
   }

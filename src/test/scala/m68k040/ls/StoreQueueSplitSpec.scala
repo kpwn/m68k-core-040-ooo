@@ -83,6 +83,8 @@ class StoreQueueSplitSpec extends AnyFunSuite {
     dut.io.alloc.valid #= false; dut.io.commit.valid #= false
     dut.io.commitB.valid #= false; dut.io.commitB.payload #= 0
     dut.io.flush #= false; dut.io.drainAck #= false
+    dut.io.drainErr #= false
+    dut.io.robHeadIn #= 0; dut.io.robHeadValidIn #= false; dut.io.irqPreemptPendingIn #= false
     dut.io.alloc.payload.validB #= false; dut.io.alloc.payload.useStrbA #= false
     setQuery(dut, 0, 0, Size.LONG)
     cd.waitSampling(3)
