@@ -409,6 +409,8 @@ class StoreQueueSpec extends AnyFunSuite {
       dut.io.drainAck #= true
       sleep(1)
       assert(!dut.io.sqFaultCompletion.valid.toBoolean, "slot A itself did not error")
+      assert(!dut.io.sqCompletion.valid.toBoolean,
+        "slot A's ack must NOT fire sqCompletion -- the entry hasn't popped yet (drainPhaseB just advanced)")
       cd.waitSampling()
       dut.io.drainAck #= false
       // slot B now presented -> fault it
@@ -425,6 +427,55 @@ class StoreQueueSpec extends AnyFunSuite {
       dut.io.drainAck #= false; dut.io.drainErr #= false
       sleep(1)
       assert(dut.io.empty.toBoolean, "terminal error-pop must not leave an orphan entry resident")
+      cd.waitSampling(2)
+    }
+  }
+
+  test("P2.4: split precise store cleanly draining fires sqCompletion exactly once, on slot B's terminal ack", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      val a = dut.io.alloc
+      a.valid #= true
+      a.payload.robId #= 8
+      a.payload.paddr #= 0x1000; a.payload.vaddr #= 0x21000000L
+      a.payload.data #= 0; a.payload.size #= Size.LONG
+      a.payload.nbytesA #= 2; a.payload.useStrbA #= true; a.payload.strbA #= 0x3; a.payload.lineDataA #= 0
+      a.payload.validB #= true
+      a.payload.paddrB #= 0x2000; a.payload.vaddrB #= 0x22000000L
+      a.payload.nbytesB #= 2; a.payload.strbB #= 0x3; a.payload.lineDataB #= 0
+      a.payload.cacheMode #= m68k040.cache.CacheMode.WRITETHROUGH
+      a.payload.supervisor #= false
+      a.payload.precise #= true
+      cd.waitSampling()
+      a.valid #= false
+
+      dut.io.robHeadIn #= 8
+      dut.io.robHeadValidIn #= true
+      // slot A drains cleanly (no error) -- entry does NOT pop yet (validB -> phase B next)
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
+      assert(dut.io.drain.payload.paddr.toLong == 0x1000, "slot A presented first")
+      cd.waitSampling()   // present -> held (drainBusy now registered True)
+      dut.io.drainAck #= true
+      sleep(1)
+      assert(!dut.io.sqCompletion.valid.toBoolean,
+        "slot A's clean ack must NOT fire sqCompletion -- the entry hasn't popped yet")
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      // slot B now presented -> ack it cleanly too
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
+      assert(dut.io.drain.payload.paddr.toLong == 0x2000, "slot B presented next (atomic two-half drain)")
+      cd.waitSampling()   // present -> held (drainBusy now registered True)
+      dut.io.drainAck #= true
+      sleep(1)
+      assert(dut.io.sqCompletion.valid.toBoolean,
+        "slot B's terminal (pop) ack must fire sqCompletion -- this is the only cycle it should fire")
+      assert(dut.io.sqCompletion.payload.toInt == 8, "sqCompletion carries the drained robId")
+      assert(!dut.io.sqFaultCompletion.valid.toBoolean, "no error -> no fault completion")
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      sleep(1)
+      assert(!dut.io.sqCompletion.valid.toBoolean, "sqCompletion must not still be asserted the cycle after the pop")
+      assert(dut.io.empty.toBoolean, "both slots drained -> queue empty")
       cd.waitSampling(2)
     }
   }

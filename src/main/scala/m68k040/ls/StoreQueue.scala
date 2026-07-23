@@ -374,23 +374,14 @@ class StoreQueue(depth: Int = 8) extends Component {
       valids(head) := False
       head := head + 1
     } otherwise {
-      // CONCERN (flagged in the P2.4 report, not fixed here -- brief-specified
-      // behavior, unchanged from the design doc's own sketch): this fires on ANY
-      // ack of a precise head, including slot A's ack of a SPLIT precise store --
-      // i.e. BEFORE slot B has even been attempted. That lets the ROB's
-      // completes(h0) go true, and (once P2.5 wires this live) potentially retire
-      // the instruction, while slot B is still in flight. If slot B then faults,
-      // the fault is reported against a robId the ROB may already believe is
-      // retired (or has reused) -- see the P2.4 report for the full race. A
-      // candidate fix is to gate this on the TERMINAL ack only (the same condition
-      // guarding the pop below), but that is a behavior change beyond this task's
-      // scope -- flagging for P2.5/a follow-up rather than changing it here.
-      when(precises(head)) { io.sqCompletion.valid := True }
       when(!drainPhaseB && validBs(head)) {
         // slot A acked -> drain slot B next (atomic two-half drain; do NOT pop yet)
         drainPhaseB := True
       } otherwise {
-        // single-slot store, or slot B of a split store -> pop the whole entry
+        // single-slot store, or slot B of a split store -> pop the whole entry.
+        // sqCompletion fires only on the ack that actually pops the entry, so a
+        // split store's slot-A ack does not prematurely signal ROB completion.
+        when(precises(head)) { io.sqCompletion.valid := True }
         drainPhaseB  := False
         valids(head) := False
         head := head + 1
