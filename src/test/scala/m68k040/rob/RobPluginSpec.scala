@@ -858,4 +858,95 @@ class RobPluginSpec extends AnyFunSuite {
       assert(dut.rob.logic.count.toInt == 0, "ROB drained")
     }
   }
+
+  // ── P2.7 review fix: `h0PreciseCompletedSticky` must ALSO clear on `flushing`, not
+  // only on `retire0`. Every head-consuming path OTHER than retire0 -- faultRetire (a
+  // precise store whose drain took a real bus error), rteRetire, sysRetire, a
+  // branch-mispredict redirect, a test flush -- ends in `flushing`, which does
+  // `count := 0; tail := head` and hands that SAME ROB index straight to the next,
+  // brand-new instruction. Clearing only on retire0 carried the guard across that
+  // boundary and force-serialized an unrelated successor (silent IPC loss; a chain of
+  // non-retire0 heads could hold it for many instructions).
+  //
+  // The test drives the mechanism end-to-end and DISCRIMINATES: fire completion(4) for
+  // h0 so the sticky arms, flush before h0 ever retires (so the OLD code has no clear
+  // event at all), then re-fill the ROB and require a genuine 2-WIDE retire. With the
+  // bug the sticky is still set when the new head becomes ready, so retire1 is blocked
+  // and the pair retires single-wide over two cycles -- reverting the `|| flushing`
+  // term makes the `fireOut(1)` assertion below fail (confirmed by revert-and-rerun).
+  test("h0PreciseCompletedSticky clears on a flush, not only on retire0 (P2.7 review fix)") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      // Allocate h0 (robId 0) + h1 (robId 1).
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0xF00, dstArch = 3, pdst = 20, pdstValid = true, pdstOld = 3)
+      pokeRu(dut.rsrc.logic.src.payload(1), pc = 0xF02, dstArch = 5, pdst = 21, pdstValid = true, pdstOld = 5)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= true
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      dut.rsrc.logic.u1v #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 2, s"2 in flight, got ${dut.rob.logic.count.toInt}")
+
+      // Arm the sticky: completion(4) (the SQ precise-drain port) for h0, while h0 is
+      // held back from retiring by `stopped` (the same side-effect-free stall the
+      // sibling test above uses -- see its comment for why interruptPending/trace are
+      // unusable here). h0 therefore NEVER retires: with the pre-fix code the sticky
+      // has no clear event whatsoever.
+      dut.rob.logic.stopped #= true
+      cd.waitSampling()
+      dut.rob.logic.completion(4).valid #= true
+      dut.rob.logic.completion(4).payload #= 0
+      cd.waitSampling()
+      dut.rob.logic.completion(4).valid #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.h0PreciseCompletedSticky.toBoolean,
+        "sticky must be armed by completion(4) for h0 (test precondition)")
+      assert(!dut.rob.logic.retire0.toBoolean, "h0 must NOT have retired (stall held)")
+
+      // Flush: squashes h0/h1 (count -> 0, tail -> head) and hands robId 0 straight
+      // back to the next allocation. THIS is the event the fix adds as a clear.
+      dut.rob.logic.flush.valid #= true
+      cd.waitSampling()
+      dut.rob.logic.flush.valid #= false
+      dut.rob.logic.stopped #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 0, "ROB squashed by the flush")
+      assert(!dut.rob.logic.h0PreciseCompletedSticky.toBoolean,
+        "P2.7 FIX: the sticky must be CLEARED by the flush -- the entry it was armed " +
+        "for is gone and its ROB index has been handed to a brand-new instruction")
+
+      // Re-fill with two fresh, ordinary (non-store) uops and let both complete. They
+      // must retire 2-WIDE: nothing about them should be serialized by a guard armed
+      // for a long-since-squashed predecessor.
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0xF80, dstArch = 4, pdst = 22, pdstValid = true, pdstOld = 4)
+      pokeRu(dut.rsrc.logic.src.payload(1), pc = 0xF82, dstArch = 6, pdst = 23, pdstValid = true, pdstOld = 6)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= true
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      dut.rsrc.logic.u1v #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 2, s"2 fresh uops in flight, got ${dut.rob.logic.count.toInt}")
+
+      // Complete the YOUNGER one first (head stays incomplete so nothing retires yet),
+      // then the head -- so both are completes-ready on the same cycle (same recipe as
+      // the "alloc + 2-wide retire" test at the top of this file).
+      markComplete(dut, 1)
+      cd.waitSampling()
+      dut.rob.logic.completion(0).payload #= 0
+      cd.waitSampling()
+      clearComplete(dut)
+
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean, max = 50)
+      assert(dut.tsink.logic.fireOut(1).toBoolean,
+        "P2.7 FIX: the two fresh uops must retire 2-WIDE. With the pre-fix code " +
+        "h0PreciseCompletedSticky is STILL set here (armed before the flush, cleared " +
+        "only by a retire0 that never happened), which force-serializes retire1.")
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 0, "ROB drained by the 2-wide retire")
+    }
+  }
 }

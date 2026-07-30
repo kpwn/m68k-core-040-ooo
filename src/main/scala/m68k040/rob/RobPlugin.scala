@@ -518,13 +518,27 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // with h0 -- interruptPending, tracePendingFire, stopped, all of which also gate
     // retire0 above -- the guard would have already self-cleared before h0's real
     // retire cycle, silently reopening the exact dual-retire race this mechanism
-    // exists to prevent). Sets on the completion(4) pulse and clears only when
-    // retire0 actually fires (h0 itself retires and head is about to advance past
-    // it) -- this now mirrors `h0TraceArmed`'s level-sensitive "stays asserted every
-    // cycle until retire0 actually fires" behavior EXACTLY, not just its "force
-    // single-wide retire" intent.
-    val h0PreciseCompletedSticky = RegInit(False)
-    when(retire0) {
+    // exists to prevent). Sets on the completion(4) pulse and clears when h0 stops
+    // being the entry it was armed for -- either retire0 fires (h0 itself retires and
+    // head advances past it) or `flushing` reassigns that ROB index (see the P2.7 note
+    // on the clear condition below) -- so it is level-sensitive like `h0TraceArmed`
+    // ("stays asserted every cycle until h0 is gone") rather than a one-shot pulse,
+    // which is what makes it deliver its "force single-wide retire" intent reliably.
+    val h0PreciseCompletedSticky = RegInit(False); h0PreciseCompletedSticky.simPublic()
+    when(retire0 || flushing) {
+      // `|| flushing` (P2.7 review fix): `retire0` is NOT the only way h0 stops being
+      // the entry this guard was armed for. Every OTHER head-consuming path --
+      // faultRetire (the drain took a real bus error -> faultedStore(h0) -> the
+      // exception FSM), rteRetire, sysRetire, a branch-mispredict redirect, or a test
+      // flush -- ends in `flushing`, which sets `count := 0` / `tail := head` and hands
+      // that same ROB index straight to the NEXT (brand-new) instruction. Clearing only
+      // on retire0 therefore carried the guard across the flush boundary and disabled
+      // 2-wide retire for an unrelated successor -- and for a back-to-back run of
+      // non-retire0 heads (a chain of sysOps/RTEs) it could stay asserted for many
+      // instructions. Correctness was never at risk (the guard only ever FORCES
+      // single-wide retire), but the IPC loss was silent. `flushing` is exactly the
+      // "this head index is being reassigned" event, so it is the right co-clear;
+      // h0TraceArmed needs no equivalent because it is combinational off h0.
       h0PreciseCompletedSticky := False
     }.elsewhen(completion(4).valid && (completion(4).payload === h0)) {
       // retire0 given priority above is intentionally defensive: architecturally a

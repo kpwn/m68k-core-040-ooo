@@ -954,9 +954,40 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       e.nzvc       := storeNzvc
       e.nzvcWrite  := u1.writesNzvc
       e.nzvcDst    := u1.pNzvcDst
-      pendMem(pendPush) := e
-      pendFault(pendPush) := False   // fresh slot: clear any stale fault flag from a prior occupant
-      pendPush := pendPush + 1
+      // ROOT CAUSE of the P2.7 ported-corpus regression's 15 HANGs (movea_sp_sp_plain_load,
+      // cmpa_word_imm_sentinel_branch, all 7 tmp1_reuse_loop_then_crack* variants, ...):
+      // this push MUST be gated on `!sqFlushSig`, LOCALLY and in the SAME cycle, mirroring
+      // StoreQueue's own `when(io.alloc.valid && !io.flush)` alloc gate. `pendMem` and
+      // the SQ ring are a lock-step PAIR -- every precise SQ entry has exactly one
+      // pendMem entry, in the same order -- and `sqCompletion` (which advances
+      // `pendReady`) is generated per SQ pop. If a flush drops the SQ alloc but the
+      // pendMem push still lands, the two streams desynchronize BY ONE FOREVER: from
+      // then on every precise store's drain replays the WRONG pendMem entry, so ROB
+      // completion port 4 fires for a STALE robId while the real store's robId never
+      // completes -> the ROB head parks on it permanently (HANG), and where the stale
+      // robId is still live its An-auto/A7/NZVC writeback is applied with the wrong
+      // data (WRONG ANSWER).
+      //
+      // Why the separate `when(sqFlushSig) { pendPush := pendReadyAfterThisCycle }`
+      // rollback below does NOT cover this (it was written believing it did): that
+      // block is a PLAIN component statement, while THIS code lives inside a
+      // `StateMachine` state body, and SpinalHDL elaborates StateMachine bodies from a
+      // pre-pop task -- i.e. AFTER every plain statement in the component. So the FSM's
+      // `pendPush := pendPush + 1` is emitted LAST and silently WINS over the rollback
+      // (confirmed in the generated Verilog: the rollback assignment precedes both FSM
+      // increments in the same always block, so the increments override it). The
+      // rollback is still needed and still correct for the MULTI-cycle case (entries
+      // pushed on earlier cycles whose drain the flush cancels); this gate handles the
+      // same-cycle case the rollback structurally cannot reach.
+      //
+      // `poisoned` (the sticky wrong-path latch) cannot cover it either: it is a Reg
+      // set BY this same flush pulse, so it only reads True from the NEXT cycle on --
+      // a store whose alloc arm fires ON the flush cycle still sees poisoned=False.
+      when(!sqFlushSig) {
+        pendMem(pendPush) := e
+        pendFault(pendPush) := False   // fresh slot: clear any stale fault flag from a prior occupant
+        pendPush := pendPush + 1
+      }
     }
 
     // ---- drive completion / writeback / wakeup from the registered stage ----

@@ -349,4 +349,105 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
         s"even across a liveCompletionFires collision, got $seenCounts")
     }
   }
+
+  // ── P2.7 ROOT-CAUSE regression test: `pendMem` and the SQ ring are a lock-step PAIR.
+  // A flush landing on the EXACT cycle a precise store's alloc arm fires must drop BOTH
+  // the SQ alloc (StoreQueue's own `when(io.alloc.valid && !io.flush)`) AND the pendMem
+  // push -- otherwise the two streams desynchronize by one FOREVER and, from then on,
+  // every precise store's drain replays the WRONG pendMem entry: ROB completion port 4
+  // fires for a stale robId while the real store's robId never completes (ROB head
+  // parks -> HANG), and the stale entry's An-auto/A7/NZVC writeback lands with the
+  // wrong data (WRONG ANSWER). This is what hung 15 ported-corpus tests.
+  //
+  // The pre-fix code believed the separate `when(sqFlushSig) { pendPush :=
+  // pendReadyAfterThisCycle }` rollback covered this. It cannot: that rollback is a
+  // PLAIN component statement while the push lives in a `StateMachine` state body, and
+  // SpinalHDL elaborates StateMachine bodies from a pre-pop task -- AFTER every plain
+  // statement -- so the FSM's `pendPush := pendPush + 1` is emitted last and silently
+  // overrides the rollback (visible directly in the generated Verilog). `poisoned`
+  // cannot cover it either: it is a Reg SET BY this same flush pulse, so it only reads
+  // True from the following cycle on.
+  //
+  // Reverting the `when(!sqFlushSig)` gate in `deferCompletion` makes BOTH assertions
+  // below fail (the pointer-skew one immediately, then the wrong-robId one) -- confirmed
+  // by revert-and-rerun.
+  test("P2.7: a flush on a precise store's alloc cycle drops the pendMem push in lock-step with the SQ alloc", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem, ptmem) = initDut(dut)
+      seed(dut, cd, preg = 10, value = 0x6000L)       // store base
+      seed(dut, cd, preg = 11, value = 0xFEEDFACEL)   // store data
+
+      // MMU off + DE=0 (initDut defaults) => every store is a PRECISE store.
+      assert(dut.eu.logic.pendPush.toInt == dut.eu.logic.pendReady.toInt,
+        "precondition: pend FIFO starts balanced")
+
+      // Sweep the flush's cycle offset relative to the store's issue handshake so one
+      // iteration provably lands the flush on the EXACT cycle the store's alloc arm
+      // fires -- the only offset that reaches the bug. (Offsets before it hit the
+      // multi-cycle `poisoned` path; offsets after it hit the multi-cycle `pendPush :=
+      // pendReadyAfterThisCycle` rollback. Both of those were already correct; it is
+      // only the coincidence cycle that the rollback structurally cannot reach.)
+      // A sweep rather than a hand-tuned constant because the LS EU's issue->alloc
+      // latency is an implementation detail that may legitimately change: the loop
+      // ASSERTS that the coincidence was actually observed, so it can never pass
+      // vacuously if that latency moves. NOTE the one-cycle sim offset: a `#=` poke
+      // issued right after `waitSampling()` becomes visible to the design on the
+      // FOLLOWING cycle, so the coincidence is checked after the poke's own
+      // `waitSampling`, not before it.
+      var coincidenceOffsets = List.empty[Int]
+      var skewOffsets        = List.empty[Int]
+      for (k <- 0 until 10) {
+        issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11, Size.LONG, robId = 5)
+        if (k > 0) cd.waitSampling(k)
+        dut.src.logic.iSqFlush #= true
+        cd.waitSampling()
+        // The flush is in effect for THIS cycle. If the alloc arm is firing in the same
+        // cycle, this iteration is the engineered coincidence.
+        if (dut.eu.logic.sq.io.alloc.valid.toBoolean && dut.eu.logic.sq.io.flush.toBoolean) {
+          coincidenceOffsets ::= k
+        }
+        dut.src.logic.iSqFlush #= false
+        cd.waitSampling(10)
+        // Whatever the offset, a flush squashes this (uncommitted, precise) store --
+        // either by dropping its alloc or by squashing the entry it just made -- so no
+        // SQ entry may survive, and pendMem MUST be back in lock-step with it.
+        assert(!dut.eu.logic.sq.valids.exists(_.toBoolean),
+          s"offset k=$k: the flush must leave NO resident SQ entry")
+        if (dut.eu.logic.pendPush.toInt != dut.eu.logic.pendReady.toInt) skewOffsets ::= k
+      }
+      assert(coincidenceOffsets.nonEmpty,
+        "the sweep never landed a flush on the store's actual SQ-alloc cycle -- this test would " +
+        "pass vacuously; widen the offset range (the LS EU's issue->alloc latency must have moved)")
+      assert(skewOffsets.isEmpty,
+        s"P2.7 FIX: a flush coincident with a precise store's SQ alloc (observed at offsets " +
+        s"$coincidenceOffsets) dropped the SQ alloc but NOT the pendMem push, leaving pendPush " +
+        s"skewed from pendReady at offsets $skewOffsets. pendMem and the SQ ring are a lock-step " +
+        "pair; a skew here mis-attributes EVERY later precise store's completion to the wrong " +
+        "robId, permanently (ROB head parks -> HANG; stale writeback -> WRONG ANSWER)")
+
+      // End-to-end consequence check: the NEXT precise store must have its OWN robId
+      // replayed out sqCompletionPort. With the skew, its drain would replay a squashed
+      // (robId 5) pendMem entry instead.
+      issueStore(dut, cd, basePreg = 10, disp = 8, dataPreg = 11, Size.LONG, robId = 7)
+      var m = 0
+      while (!dut.eu.logic.sq.valids.exists(_.toBoolean) && m < 200) { cd.waitSampling(); m += 1 }
+      assert(m < 200, "store B never became resident in the SQ")
+      // Park the ROB head on store B's robId so its at-head precise drain launches.
+      val h = dut.eu.logic.sq.head.toInt
+      dut.wire.logic.iRobHeadIn      #= dut.eu.logic.sq.robIds(h).toInt
+      dut.wire.logic.iRobHeadValidIn #= true
+
+      var seenRid = -1
+      var k = 0
+      while (seenRid < 0 && k < 400) {
+        if (dut.wire.logic.oSqCompValid.toBoolean) seenRid = dut.wire.logic.oSqCompPayload.toInt
+        cd.waitSampling(); k += 1
+      }
+      assert(seenRid >= 0, "store B's precise at-head drain never produced a completion")
+      assert(seenRid == 7,
+        s"P2.7 FIX: store B's drain must complete its OWN robId 7, got $seenRid -- a value of 5 " +
+        "is the flushed store A's stale pendMem entry being replayed under B's drain (the exact " +
+        "mis-attributed completion that hung 15 ported tests)")
+    }
+  }
 }
