@@ -53,7 +53,8 @@ case class WbObs() extends Bundle {
   * bypass + completion at S1 (latency-1) — the dependent-chain IPC path, UNCHANGED.
   * SLOW path (isShift || toCcr): the barrel shifter + the CCR-RMW are the 24-level
   * `s1Src2 -> NZVC` cone; they REGISTER into S2 and compute there, completing +
-  * writing back (separate write ports) + broadcasting `slowWakeup` at latency-2.
+  * writing back (SHARING the fast path's physical write ports — see `wbKey`) +
+  * broadcasting `slowWakeup` at latency-2.
   * A slow op in S1 deasserts `issue.ready` for that one cycle (single-outstanding)
   * so a fast op cannot enter S1 and collide with the slow op's S2 completion. */
 class AluEuPlugin extends FiberPlugin with AluEuService {
@@ -65,10 +66,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
   var intW: RegFileWritePort = null;  var intByp: RegFileBypassPort = null
   var nzvcW: RegFileWritePort = null; var nzvcByp: RegFileBypassPort = null
   var xW: RegFileWritePort = null;    var xByp: RegFileBypassPort = null
-  // SLOW-path write + bypass ports (latency-1 off the S2 stage => arch latency-2).
-  // Separate from the fast ports so a fast op (S1) and a slow op (S2) never contend
-  // for one write port; the single-outstanding S1 stall keeps their COMPLETION ports
-  // from colliding, but the writeback ports are independent for safety/clarity.
+  // SLOW-path write + bypass ports (latency-1 off the S3 stage => arch latency-3).
+  // The fast (S1) and slow (S3) writebacks SHARE one PHYSICAL write port per regfile
+  // (see `wbKey` below) because they are structurally mutually exclusive; the bypass
+  // ports stay separate (bypasses are pure read-side muxes, they cost no RAM bank).
   var intWs: RegFileWritePort = null;  var intByps: RegFileBypassPort = null
   var nzvcWs: RegFileWritePort = null; var nzvcByps: RegFileBypassPort = null
   var xWs: RegFileWritePort = null;    var xByps: RegFileBypassPort = null
@@ -87,6 +88,30 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
   override def completion: Flow[UInt]   = completionPort
   override def slowWakeup: Flow[AluSlowWakeup] = slowWakeupPort
 
+  // ── PRF write-port SHARING KEY (one per AluEuPlugin INSTANCE) ──────────────────
+  // Requests carrying the same key are merged by RegFilePlugin into ONE physical
+  // write port (highest-priority valid request wins, combinationally, at the write-
+  // port boundary). This EU's FAST (S1) and SLOW (S3) writebacks share a port because
+  // they are STRUCTURALLY mutually exclusive; proof:
+  //
+  //   s3Valid(T)  == s2Valid(T-1)                     [pure RegNext chain]
+  //   s2Valid(T-1) => issuePort.ready(T-1) == False   [`ready` ANDs in !s2Valid]
+  //   ready(T-1)==False => s1Valid(T) == False        [s1Valid := RegNext(valid && ready)]
+  //   s1Valid(T)==False => fastFire(T) == False       [fastFire := s1Valid && !isSlow]
+  //
+  // i.e. a slow op anywhere in S1..S3 holds `issuePort.ready` low, so no fast op can
+  // ever reach S1 in the cycle a slow op reaches S3. `s1Valid` is a LOCAL RegNext of
+  // the locally-computed `ready`, so no external driver (the IQ drives only `valid`,
+  // via a plain `eu.issue << iq.issue(n)`) can violate it. The design ALREADY depends
+  // on exactly this invariant for the SHARED `completionPort` and the shared
+  // wbObs/ccrObs `Mux(s3Valid, slow, fast)` selects, so it is load-bearing either way.
+  // Belt-and-suspenders: `priority` makes FAST win a (structurally impossible) tie.
+  //
+  // The key MUST be per-INSTANCE (`new Object`, not a shared string constant): eu0's
+  // and eu1's fast paths DO fire in the same cycle routinely, so merging ACROSS the
+  // two ALU EUs would be a silent-corruption bug.
+  private val wbKey = new Object
+
   during setup {
     issuePort      = Stream(IqContext())
     completionPort = Flow(UInt(6 bits))
@@ -96,15 +121,15 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // 3rd int read port: the BITFIELD-dynamic µop's srcC = T0 (BFRESOLVE-packed
     // offset/width). Only that op uses psrcC on the ALU EU (idle/psrcC=0 otherwise).
     rdC = irf.newRead()
-    intW = irf.newWrite(latency = 1); intByp = irf.newBypass()
-    intWs = irf.newWrite(latency = 1); intByps = irf.newBypass()
+    intW = irf.newWrite(latency = 1, sharingKey = wbKey, priority = 1); intByp = irf.newBypass()
+    intWs = irf.newWrite(latency = 1, sharingKey = wbKey, priority = 0); intByps = irf.newBypass()
     val nz = host[NzvcRegFileService]
-    nzvcW = nz.newWrite(latency = 1); nzvcByp = nz.newBypass()
-    nzvcWs = nz.newWrite(latency = 1); nzvcByps = nz.newBypass()
+    nzvcW = nz.newWrite(latency = 1, sharingKey = wbKey, priority = 1); nzvcByp = nz.newBypass()
+    nzvcWs = nz.newWrite(latency = 1, sharingKey = wbKey, priority = 0); nzvcByps = nz.newBypass()
     nzvcRd = nz.newRead(forceNoBypass = false)
     val xrf = host[XRegFileService]
-    xW = xrf.newWrite(latency = 1); xByp = xrf.newBypass()
-    xWs = xrf.newWrite(latency = 1); xByps = xrf.newBypass()
+    xW = xrf.newWrite(latency = 1, sharingKey = wbKey, priority = 1); xByp = xrf.newBypass()
+    xWs = xrf.newWrite(latency = 1, sharingKey = wbKey, priority = 0); xByps = xrf.newBypass()
     xRd = xrf.newRead(forceNoBypass = false)
     // Committed SR system byte input (for MOVE-from-SR). Created in setup (stable ref for
     // the wiring plugin); default-idle in build, the wiring overrides with exc.ss.srSys.
@@ -743,7 +768,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val slowNzvc   = Mux(s3IsBitfield, s3BfNzvc, s3ShiftNzvc)
     val slowX      = s3ShiftX   // BITFIELD leaves X untouched (writesX=False)
 
-    // ---- S3: SLOW writeback (separate ports; latency-3) ----
+    // ---- S3: SLOW writeback (latency-3). These drive the SAME physical PRF write
+    // ports as the fast S1 writeback above (merged by `wbKey`); the single-outstanding
+    // `issuePort.ready` stall makes `fastFire` and `s3Valid` mutually exclusive, and
+    // the fast requests carry the higher merge priority as a defensive tie-break. ----
     intWs.valid   := s3Valid && u3.pdstValid;  intWs.address  := u3.pdst;     intWs.data  := slowResult
     nzvcWs.valid  := s3Valid && u3.writesNzvc; nzvcWs.address := u3.pNzvcDst;  nzvcWs.data := slowNzvc
     xWs.valid     := s3Valid && u3.writesX;    xWs.address    := u3.pXDst;     xWs.data    := B(slowX)
