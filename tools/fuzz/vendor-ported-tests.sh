@@ -19,9 +19,13 @@ qualifies() {
   local name=$1
   local args="$SRC/$name.args"
   if [ ! -f "$args" ]; then return 0; fi
-  if grep -q '+ipl=' "$args"; then return 1; fi
-  # any line that ISN'T a comment, blank, or a bare +timeout=<N> disqualifies it
-  if grep -vE '^\s*(#|\+timeout=[0-9]+\s*$|\s*$)' "$args" | grep -q .; then return 1; fi
+  # Only non-comment lines count -- a comment merely MENTIONING +ipl= in prose
+  # (e.g. documenting that the sweep is applied externally) must not disqualify
+  # a test that carries no real +ipl= directive of its own.
+  if grep -vE '^\s*#' "$args" | grep -q '+ipl='; then return 1; fi
+  # any line that ISN'T a comment, blank, a bare +timeout=<N>, or +nowaves (a
+  # waveform-dump toggle that is a genuine no-op in this harness) disqualifies it
+  if grep -vE '^\s*(#|\+timeout=[0-9]+\s*$|\+nowaves\s*$|\s*$)' "$args" | grep -q .; then return 1; fi
   return 0
 }
 
@@ -39,7 +43,13 @@ vendor_one() {
   local args="$SRC/$name.args"
   if [ -f "$args" ]; then
     local t
-    t=$(grep -o '+timeout=[0-9]*' "$args" | cut -d= -f2)
+    # `|| true`: under `set -e -o pipefail`, a plain assignment from a pipeline
+    # whose FIRST stage (grep) matches nothing kills the whole script silently
+    # (pipefail propagates grep's exit 1 even though `cut` itself succeeds on
+    # empty input) -- unreachable before because every previously-vendored test
+    # either had no .args file or always carried a +timeout=, until the
+    # all-comment / +nowaves-only .args files this fix newly admits.
+    t=$( { grep -o '+timeout=[0-9]*' "$args" || true; } | cut -d= -f2)
     if [ -n "$t" ]; then
       echo "$t" > "$DST/$name.timeout"
     fi
