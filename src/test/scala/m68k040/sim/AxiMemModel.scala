@@ -215,9 +215,14 @@ class AxiProtocolChecker(cfg: AxiMemModelConfig, busConfig: Axi4Config) {
   * `resp`/`last` are frozen at AR-accept (exactly as the legacy model did,
   * `BehavioralMem.scala:116-117`); only the DATA is read lazily at drive time
   * (`:115`) so a write that lands between AR-accept and beat-drive is observed.
-  * `readyAt` is the earliest cycle this beat may be driven (latency model). */
+  * `readyAt` is the earliest cycle this beat may be driven (latency model).
+  * `installLine` is `Some(line)` exactly on the LAST beat of an AR that
+  * `latencyFor` classified as the PRIMARY fill for a brand-new miss -- the L2 line
+  * becomes resident (`l2Lines`) only when THIS beat is actually driven, never
+  * earlier (see `latencyFor`'s doc comment for why AR-accept time was wrong). */
 private case class RBeat(id: Int, base: Long, bytes: Int, bad: Boolean,
-                         isLast: Boolean, seq: Long, var readyAt: Long)
+                         isLast: Boolean, seq: Long, var readyAt: Long,
+                         installLine: Option[Long] = None)
 
 /** Read side of the model. Written against the raw `ar`/`r` streams (not `Axi4` /
   * `Axi4ReadOnly`) so the SAME implementation serves both master shapes -- this is
@@ -249,26 +254,39 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
     v
   }
 
-  /** Latency for the burst starting at `addr` covering `nBytes`, in cycles from now.
-    * Two-tier, L2-faithful (design doc §3.1) -- see `L2LatencyModel`. */
-  private def latencyFor(addr: Long, nBytes: Int): Long = {
+  /** Latency for the burst starting at `addr` covering `nBytes`, in cycles from now,
+    * plus (on the PRIMARY-miss path only) the line that must become resident once
+    * that primary's own fill actually completes. Two-tier, L2-faithful (design doc
+    * §3.1) -- see `L2LatencyModel`.
+    *
+    * IMPORTANT: a line must NOT become "resident" (`l2Lines`) until its fill has
+    * actually elapsed -- the caller installs it at LAST-BEAT-DRIVE time (see
+    * `RBeat.installLine`), never here at AR-accept time. Installing here would let
+    * a same-line AR arriving on the very next cycle (which is the ONLY way two ARs
+    * for the same line can ever be ordered, since a single AXI AR channel accepts
+    * at most one transaction per cycle) see the still-in-flight line as already
+    * resident and score an instant hit -- which would make the secondary-merge
+    * tier below (`l2InFlightLines`) permanently unreachable. */
+  private def latencyFor(addr: Long, nBytes: Int): (Long, Option[Long]) = {
     val L = cfg.latency
-    if (!L.enabled) return 0L
+    if (!L.enabled) return (0L, None)
     val line = addr & ~(L.lineBytes.toLong - 1)
-    if (l2Lines.contains(line)) { stats.l2Hits += 1; L.hitCycles.toLong }
+    if (l2Lines.contains(line)) { stats.l2Hits += 1; (L.hitCycles.toLong, None) }
     else l2InFlightLines.get(line) match {
       case Some(t) =>
         // Same-line secondary merge onto an already-in-flight primary miss
         // (`l2c_mshr.v:1-7,131`): shares the SAME completion time, no new fill.
+        // The line's install is the PRIMARY's responsibility (`Some(line)` only on
+        // the miss branch below), not this secondary's.
         stats.l2SecondaryMerges += 1
-        math.max(t - clk.now, L.hitCycles.toLong)
+        (math.max(t - clk.now, L.hitCycles.toLong), None)
       case None =>
         stats.l2Misses += 1
         // NO critical-word-first: the requester waits for the whole line.
         val t = L.dramCycles.toLong + L.fillFixedCycles.toLong +
                 (L.lineBytes / (busConfig.dataWidth / 8)).toLong
         l2InFlightLines(line) = clk.now + t
-        t
+        (t, Some(line))
     }
   }
 
@@ -302,7 +320,7 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
     liveArIds += id
     if (liveArIds.size > stats.maxConcurrentReads) stats.maxConcurrentReads = liveArIds.size
     val bpb   = 1 << size
-    val lat   = latencyFor(addr.toLong, bpb * (len + 1))
+    val (lat, installLine) = latencyFor(addr.toLong, bpb * (len + 1))
     val L     = cfg.latency
     for (beat <- 0 to len) {
       val base = (burst match {
@@ -310,15 +328,11 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
         case _ => addr                        // FIXED
       }).toLong
       val bad = cfg.injectBusErrors && !AxiMemModel.decoded(base)
+      val isLast = beat == len
       seqCounter += 1
-      queues(id) += RBeat(id, base, bpb, bad, beat == len, seqCounter,
-                          clk.now + lat + (if (L.enabled) beat.toLong * L.interBeatGap else 0L))
-    }
-    // A completed fill installs the line in the model's L2 image.
-    if (cfg.latency.enabled) {
-      val line = (addr.toLong) & ~(cfg.latency.lineBytes.toLong - 1)
-      l2Lines += line
-      l2InFlightLines.remove(line)
+      queues(id) += RBeat(id, base, bpb, bad, isLast, seqCounter,
+                          clk.now + lat + (if (L.enabled) beat.toLong * L.interBeatGap else 0L),
+                          if (isLast) installLine else None)
     }
   }
 
@@ -355,6 +369,14 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
       case None => false
       case Some(b) =>
         checker.onRBeat(b.id, b.isLast, liveArIds.contains(b.id), clk.now)
+        // A completed fill installs the line in the model's L2 image -- NOW, at the
+        // moment its last beat is actually driven, not back at AR-accept time (see
+        // `latencyFor`'s doc comment). Skipped on a bus-error response, matching the
+        // real L2's `fill_err` skip of `inst_valid` (`l2c_mshr.v` S_INSTALL).
+        if (!b.bad) b.installLine.foreach { line =>
+          l2Lines += line
+          l2InFlightLines.remove(line)
+        }
         if (busConfig.useId)   r.id   #= b.id
         r.data #= (if (b.bad) BigInt(0) else readBeatData(b.base, b.bytes))
         if (busConfig.useResp) r.resp #= (if (b.bad) 3 else 0)   // DECERR : OKAY
@@ -569,4 +591,32 @@ object AxiMemModel {
   /** D-side convention: plain byte-at-address, no swap. */
   def loadProgramData(mem: SparseMemory, loadAddr: Long, bytes: Vector[Int]): Unit =
     for (i <- bytes.indices) mem.write(loadAddr + i, bytes(i).toByte)
+}
+
+/** The configuration sweep every measurement task in this plan reports against
+  * (design doc §8.3). `N_MSHR` is a DUT-side build parameter and is swept separately;
+  * these are the MEMORY-side axes: latency tier x response mode x crossbar.
+  *
+  * `dramCycles` is UNMEASURED (design doc §3.4 U1) -- the two values below are a
+  * deliberate bracket, not a claim. No performance statement may quote one of them
+  * as "the" DRAM latency. */
+object L2Sweeps {
+  val zeroLatency   = AxiMemModelConfig()
+  val l2HitOnly     = AxiMemModelConfig(latency = L2LatencyModel(enabled = true, dramCycles = 0))
+  val l2DramFast    = AxiMemModelConfig(latency = L2LatencyModel(enabled = true, dramCycles = 20))
+  val l2DramSlow    = AxiMemModelConfig(latency = L2LatencyModel(enabled = true, dramCycles = 60))
+  val todaysCrossbar = AxiMemModelConfig(
+    latency = L2LatencyModel(enabled = true, dramCycles = 20),
+    idBusyBlock = true, crossbarSingleOutstanding = true)
+  val chaosDram = AxiMemModelConfig(
+    rspMode = AxiRspMode.Chaos,
+    latency = L2LatencyModel(enabled = true, dramCycles = 20), idBusyBlock = true)
+
+  val standard: Seq[(String, AxiMemModelConfig)] = Seq(
+    "zero-latency"       -> zeroLatency,
+    "l2-hit-only"        -> l2HitOnly,
+    "l2+dram(20)"        -> l2DramFast,
+    "l2+dram(60)"        -> l2DramSlow,
+    "todays-crossbar"    -> todaysCrossbar,
+    "chaos+dram(20)"     -> chaosDram)
 }

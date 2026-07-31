@@ -8,8 +8,13 @@ import spinal.lib.bus.amba4.axi._
 
 /** A trivial DUT that issues N reads with N distinct IDs and records the ORDER in
   * which their `last` beats come back. Proves the model's reordering modes actually
-  * reorder (and that InOrder does not). */
-class MultiIdReadDut(nIds: Int) extends Component {
+  * reorder (and that InOrder does not).
+  *
+  * `addrStride` (default 64, i.e. one 64B L2 line apart) lets a caller put two or
+  * more of the N reads in the SAME 64-byte line -- e.g. `addrStride = 16` with
+  * `nIds >= 2` lands id0 and id1 in the same line, to exercise the L2 model's
+  * hit/secondary-merge tiers (`L2LatencyModel`) instead of always missing. */
+class MultiIdReadDut(nIds: Int, addrStride: Int = 64) extends Component {
   val io = new Bundle {
     val axi  = master(Axi4ReadOnly(AxiMemModel.axiConfig(128, 4)))
     val go   = in Bool()
@@ -18,7 +23,7 @@ class MultiIdReadDut(nIds: Int) extends Component {
   val issued = RegInit(U(0, log2Up(nIds + 1) bits))
   val doneReg = RegInit(B(0, nIds bits)); io.done := doneReg
   io.axi.ar.valid         := io.go && (issued < nIds)
-  io.axi.ar.payload.addr  := (issued << 6).resize(32)
+  io.axi.ar.payload.addr  := (issued * addrStride).resize(32)
   io.axi.ar.payload.id    := issued.resize(4)
   io.axi.ar.payload.len   := U(0, 8 bits)
   io.axi.ar.payload.size  := U(4, 3 bits)
