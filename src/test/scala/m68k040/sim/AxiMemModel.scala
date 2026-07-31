@@ -72,9 +72,25 @@ case class L2LatencyModel(
   *                                  simpler model.
   *  - `crossbarSingleOutstanding` : model `macqd700-soc/rtl/soc/axi_xbar.v` as it
   *                                  EXISTS TODAY -- exactly ONE outstanding read and
-  *                                  ONE outstanding write per master port
-  *                                  (`axi_xbar.v:2278-2284,2388-2412` for reads,
-  *                                  `:1234-1258` for writes). This is the configuration
+  *                                  ONE outstanding write per master port. Reads: the
+  *                                  per-master `rs_state` FSM
+  *                                  (`RS_IDLE`/`RS_WAIT_SLV_AR`/`RS_WAIT_R` enum,
+  *                                  `axi_xbar.v:2722-2724`) only re-arms `RS_IDLE` after
+  *                                  the slave's RLAST (`RS_WAIT_SLV_AR` -> `RS_WAIT_R`
+  *                                  -> `RS_IDLE`, `:3219-3316`, IDLE-on-RLAST at
+  *                                  `:3285-3286`) -- one live AR per master port at a
+  *                                  time. Writes: `sw_owned` locks a slave's whole
+  *                                  AW->B sequence to one master, and combined with the
+  *                                  single per-master `ws_state` FSM this is 1
+  *                                  outstanding write per master AND per slave
+  *                                  (`:1449-1473`; the same comment block records that
+  *                                  AW pipelining was analysed 2026-07-21 and
+  *                                  deliberately NOT implemented). VERIFIED against
+  *                                  `macqd700-soc` commit `6bd833d0` (2026-07-30) --
+  *                                  re-check these line numbers if that repo's
+  *                                  `axi_xbar.v` moves again; the file has already
+  *                                  shifted once since an earlier citation of this
+  *                                  comment was written. This is the configuration
   *                                  against which slice D1's benefit must be shown to
   *                                  be REAL rather than asserted.
   *  - `checkIdUnique`             : assert if the DUT presents an AR/AW whose ID is
