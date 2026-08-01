@@ -400,17 +400,41 @@ object OperationDecoder {
         // when active). The EA mode field DISAMBIGUATES from EXT.W (0x4880, mode 000) /
         // EXT.L (0x48C0, mode 000), which share bit11=1 & bits9:7=001 but use Dn-direct
         // (mode 0): a real MOVEM EA is a MEMORY mode (>=2), so EXCLUDE reg-direct modes 0/1.
-        // Indexed (mode 6) / #imm+reserved (mode 7 reg>=4) remain OUT OF SCOPE (mode 6 has
-        // no An-indexed EA support in the FSM at all — pinned illegal by
+        // Indexed An-base (mode 6) / #imm+reserved (mode 7 reg>=4) remain OUT OF SCOPE
+        // (mode 6 has no An-indexed EA support in the FSM at all — pinned illegal by
         // movem_idx_unimpl_traps.s). `(d8,PC,Xn)` (mode 7 reg 3) GAINED an index-register
         // read port in the FSM (task #200, MicroOpAssembler.movemMoveUop's new srcC/
-        // indexLong/indexScale threading) — admitted here ONLY for `.L` (bit6=1): the `.W`
-        // sub-case is DELIBERATELY left illegal (movem_idx_unimpl_traps.s's `_c4` pins
-        // `movem.w (0,%pc,Dn.w),...` as a clean vec-4 trap; only `.L` PC-indexed MOVEM is
-        // exercised by the ported-tests corpus / was in scope this session). A `.L` opword
-        // here is ALWAYS `complex`-framed by PredecodeWord.scala (its `mmOk` table never
-        // marks mode-7-reg-3 `simple`) — DecodeStage.scala's MOVEM FSM drives a dedicated
-        // `movemPcIdx*`-prefixed front-end resume (mirroring the existing mem-indirect-MOVE
+        // indexLong/indexScale threading), originally admitted here ONLY for `.L` (bit6=1).
+        // ported-tests triage (movem_pc_idx_w HANG investigation): `.W` PC-indexed MOVEM is
+        // a real, supported 68040 addressing form and the FSM that computes the EA is
+        // ALREADY fully size-generic — `DecodeStage.scala`'s `movemBegin` block latches
+        // `movemSizeLong := eopw(6)` unconditionally (same register, same code path as
+        // every other MOVEM EA), and the PC-indexed extension-word length is fixed at
+        // exactly 1 word (opword+mask+ext = 3 words total) REGARDLESS of `.W` vs `.L` — the
+        // size only changes the per-element transfer width, not the EA shape. The `.L`-only
+        // gate here was therefore an unnecessary, narrowly-scoped restriction (not a real
+        // FSM limitation), and it hid a genuine correctness bug, not a clean illegal trap:
+        // `DecodeStage.scala`'s `eIsPcIdxMovem` trigger (`(eMode===7)&&(eReg===3)`) fires on
+        // the EA SHAPE alone, independent of size or of this decoder's `movem`/`illegal`
+        // classification — so a `.W` PC-indexed opword was ALREADY being recognized and
+        // length-framed by the front end's `movemPcIdx*` resume machinery below at fetch
+        // time, but then (because `movemEaOk` was False) it was separately classified
+        // `illegal=True` and taken down the ordinary vector-4 path. Since this test's own
+        // vector-4 handler was never installed (correctly so, once `.W` is admitted --
+        // this addressing form is meant to execute, not trap), the CPU vectored through
+        // whatever uninitialized garbage lived at vector 4 and free-ran forever: an
+        // apparent HANG that was actually a mis-vectored illegal exception, not a stalled
+        // front end. Admitting `.W` here (dropping the `opword(6)` restriction) routes the
+        // opword through the SAME already-working FSM/resume path as `.L` PC-indexed
+        // instead. `movem_idx_unimpl_traps.s`'s old `_c4` case (which pinned `.W`
+        // PC-indexed as a required illegal trap) is now stale and has been updated to drop
+        // that expectation, matching upstream m68k-ooo's own 2026-07-22 Phase-2 item #3 fix
+        // (which generalized the identical An-indexed-.W crack to also drop the PC-indexed
+        // `.L`-only restriction) — see `movem_pc_idx_w.s`'s header for the upstream
+        // rationale. A `.L`/`.W` opword here is ALWAYS `complex`-framed by
+        // PredecodeWord.scala (its `mmOk` table never marks mode-7-reg-3 `simple`, for
+        // EITHER size) — DecodeStage.scala's MOVEM FSM drives a dedicated `movemPcIdx*`-
+        // prefixed front-end resume (mirroring the existing mem-indirect-MOVE
         // `ucComplexResume` mechanism) to unstick fetch instead of hanging. Full-format
         // `(bd,PC,Xn)` (ext word bit8=1) is NOT distinguishable from brief here (this
         // classifier only sees the first opword) — it silently computes a wrong-but-bounded
@@ -436,7 +460,7 @@ object OperationDecoder {
         val mmReg4  = opword(2 downto 0)
         val movemEaOk = (mmMode4.asUInt >= 2 && mmMode4.asUInt <= 5) ||
                         (mmMode4 === B"3'b111" && mmReg4.asUInt <= 2) ||
-                        (mmMode4 === B"3'b111" && mmReg4 === B"3'b011" && opword(6))  // (d8,PC,Xn), .L only
+                        (mmMode4 === B"3'b111" && mmReg4 === B"3'b011")  // (d8,PC,Xn), .W and .L
         when(opword(11) && (opword(9 downto 7) === B"001") && movemEaOk) {
           o.illegal := False
           o.op := DecOp.MOVE                     // benign placeholder; the FSM produces the real µops

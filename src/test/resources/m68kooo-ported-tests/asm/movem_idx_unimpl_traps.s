@@ -1,10 +1,18 @@
 | movem_idx_unimpl_traps.s — MOVEM brief-indexed shapes with no decoder
-| row (mode-110 An-indexed load/store both sizes, and .W PC-indexed
-| load) must take a CLEAN vec-4 ILLEGAL — pinning the fail-safe
-| behaviour (no crack-wedge, no partial execution).  Verified against
-| the 2026-07-15 audit; MOVEM.L (d8,PC,Xn) load IS implemented (legacy
-| row) and is covered by fuzz, not here.  A5 arms the continuation for
-| the vec-4 handler; D5 counts traps.
+| row (mode-110 An-indexed load/store, both sizes) must take a CLEAN
+| vec-4 ILLEGAL — pinning the fail-safe behaviour (no crack-wedge, no
+| partial execution).  Originally written against the 2026-07-15 audit
+| to pin FOUR still-unimplemented shapes; ported-tests triage
+| (movem_pc_idx_w HANG investigation) implemented the fourth shape for
+| real (MOVEM.W (d8,PC,Xn) LOAD — the FSM that computes the EA was
+| already fully size-generic, only OperationDecoder.scala's decoder gate
+| artificially restricted PC-indexed MOVEM to `.L`; positive coverage:
+| movem_pc_idx_w.s), so pinning it as "must trap" here would now be
+| wrong — that case is REMOVED.  Mode-110 (An-indexed) load/store, both
+| sizes, remain a genuine unimplemented gap in this fork (no EA-compute
+| crack for that mode at all) and stay pinned.  MOVEM.L (d8,PC,Xn) load
+| IS implemented (legacy row) and is covered by fuzz, not here.  A5
+| arms the continuation for the vec-4 handler; D5 counts traps.
 |
 | PASS: 0xC0FFEE00.  FAIL: 0xDEADBEEF.
 
@@ -30,11 +38,7 @@ _c3:
     movem.w (0,%a0,%d0.l), %d6-%d7    | load .W An-indexed
     bra     _fail
 _c4:
-    lea     _c5, %a5
-    .word   0x4CBB, 0x00C0, 0x0000    | movem.w (0,%pc,%d0.w), %d6-%d7
-    bra     _fail
-_c5:
-    cmp.l   #4, %d5                   | all four must have trapped
+    cmp.l   #3, %d5                   | all three must have trapped
     bne     _fail
 
     | PASS
