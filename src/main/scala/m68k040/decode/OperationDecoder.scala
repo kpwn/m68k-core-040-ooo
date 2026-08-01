@@ -413,20 +413,22 @@ object OperationDecoder {
         // exactly 1 word (opword+mask+ext = 3 words total) REGARDLESS of `.W` vs `.L` — the
         // size only changes the per-element transfer width, not the EA shape. The `.L`-only
         // gate here was therefore an unnecessary, narrowly-scoped restriction (not a real
-        // FSM limitation), and it hid a genuine correctness bug, not a clean illegal trap:
-        // `DecodeStage.scala`'s `eIsPcIdxMovem` trigger (`(eMode===7)&&(eReg===3)`) fires on
-        // the EA SHAPE alone, independent of size or of this decoder's `movem`/`illegal`
-        // classification — so a `.W` PC-indexed opword was ALREADY being recognized and
-        // length-framed by the front end's `movemPcIdx*` resume machinery below at fetch
-        // time, but then (because `movemEaOk` was False) it was separately classified
-        // `illegal=True` and taken down the ordinary vector-4 path. Since this test's own
+        // FSM limitation), and it hid a genuine correctness bug, not a clean illegal trap.
+        // Pre-fix, `movemEaOk` was False for `.W` here, so `spec0.movem` was also False and
+        // `DecodeStage.scala`'s `movemBegin`/`movemPcIdx*` resume machinery NEVER engaged --
+        // that machinery is gated purely on this decoder's own classification, not on EA
+        // shape alone. What actually unstuck the front end pre-fix was a DIFFERENT,
+        // coincidental mechanism: `PredecodeWord.scala`'s `mmOk` table always frames
+        // mode-7-reg-3 as `complex` regardless of legality, and since `illegal=True` sent
+        // the opword down the ordinary vector-4 exception path, that exception's own
+        // redirect substituted for the missing explicit resume. Since this test's own
         // vector-4 handler was never installed (correctly so, once `.W` is admitted --
         // this addressing form is meant to execute, not trap), the CPU vectored through
         // whatever uninitialized garbage lived at vector 4 and free-ran forever: an
         // apparent HANG that was actually a mis-vectored illegal exception, not a stalled
         // front end. Admitting `.W` here (dropping the `opword(6)` restriction) routes the
         // opword through the SAME already-working FSM/resume path as `.L` PC-indexed
-        // instead. `movem_idx_unimpl_traps.s`'s old `_c4` case (which pinned `.W`
+        // instead, so the exception-path workaround is no longer needed for this case. `movem_idx_unimpl_traps.s`'s old `_c4` case (which pinned `.W`
         // PC-indexed as a required illegal trap) is now stale and has been updated to drop
         // that expectation, matching upstream m68k-ooo's own 2026-07-22 Phase-2 item #3 fix
         // (which generalized the identical An-indexed-.W crack to also drop the PC-indexed
