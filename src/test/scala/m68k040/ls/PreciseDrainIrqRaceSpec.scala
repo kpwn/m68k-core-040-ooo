@@ -55,11 +55,41 @@ class PreciseDrainIrqRaceSpec extends AnyFunSuite {
       // Count every AW fire that targets the aligned target line -- a double-
       // issue shows up as more AW beats than there were completed loop
       // iterations; a drop shows up as fewer.
+      //
+      // ALSO track AW/B pairing directly: the DcachePlugin store-write path
+      // is single-outstanding (see DcachePlugin.scala's "Single-outstanding:
+      // the producer never presents a 2nd store before this one's [ack]"
+      // comments, and its AW.id is a hardwired constant, U(1, 4 bits) --
+      // there is no per-ID or per-line disambiguation to do), so a single
+      // `outstandingAw` boolean is sufficient: set on an accepted AW to the
+      // target line, cleared on the next accepted B. A double-issue bug
+      // (relaunching the store while the previous one is still in flight)
+      // shows up as a second AW-to-the-line firing while `outstandingAw` is
+      // still true -- this is the actual, cycle-level assertion of the race
+      // the design doc names.
       var awCount = 0
+      var outstandingAw = false
+      var outstandingAwCycle = 0
+      var cyc = 0
       cd.onSamplings {
-        if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean &&
-            (dut.dcache.logic.axi.aw.payload.addr.toLong & ~0xFL) == (targetAddr & ~0xFL)) {
+        cyc += 1
+        val axi = dut.dcache.logic.axi
+        // Clear on B first: an AW and the B acking the *previous* write are
+        // allowed to fire in the same cycle (the ack already happened), so
+        // process the clear before the new-AW check to avoid a false
+        // positive on that legitimate back-to-back-but-acked case.
+        val bFire = axi.b.valid.toBoolean && axi.b.ready.toBoolean
+        if (bFire && outstandingAw) outstandingAw = false
+
+        val awFire = axi.aw.valid.toBoolean && axi.aw.ready.toBoolean
+        if (awFire && (axi.aw.payload.addr.toLong & ~0xFL) == (targetAddr & ~0xFL)) {
           awCount += 1
+          assert(!outstandingAw,
+            s"DOUBLE-ISSUE: AW fired to target line 0x${targetAddr.toHexString} at cycle $cyc while " +
+            s"the previous AW to that same line (fired at cycle $outstandingAwCycle) has not yet been " +
+            s"acknowledged via B -- relaunched-while-still-in-flight double issue")
+          outstandingAw = true
+          outstandingAwCycle = cyc
         }
       }
 
@@ -103,14 +133,22 @@ class PreciseDrainIrqRaceSpec extends AnyFunSuite {
         c += 7
       }
 
-      // A double-issue or a drop is architecturally distinguishable from
-      // memory alone (D0 free-runs and only the loop body writes it), but the
-      // AW-count check is the direct, cycle-level assertion of the hazard the
-      // design doc names -- assert it landed a plausible number of writes
-      // (i.e. the core made forward progress and did not livelock) and that
-      // consecutive writes are always separated by at least one B ack (no
-      // back-to-back AW without an intervening ack -- would indicate a
-      // relaunched-while-still-in-flight double issue).
+      // The AW/B pairing watchdog above is the direct, cycle-level assertion
+      // of the double-issue hazard the design doc names -- it already fired
+      // (failing the test) if any two AWs to the target line were ever
+      // in flight at once. The check below is a separate, coarser sanity
+      // check that the core made forward progress and did not livelock; it
+      // does NOT (and is not meant to) catch a double-issue or a silent drop
+      // by itself -- a few-percent systematic rate of either would still
+      // sail past ">100" undetected here.
+      //
+      // A silent drop (a store that should have fired an AW but never did)
+      // is architecturally distinguishable from memory alone -- D0 free-runs
+      // and only the loop body writes it, so the final value in D0 could be
+      // cross-checked against a reconstructed AW-derived count -- but doing
+      // so needs a way to read D0 out of the DUT post-run, which this
+      // harness doesn't currently provide; left as a documented known
+      // limitation rather than adding a new whitebox tap for it here.
       assert(awCount > 100, s"too few store writes observed under IRQ storm (awCount=$awCount) -- possible livelock")
     }
   }
