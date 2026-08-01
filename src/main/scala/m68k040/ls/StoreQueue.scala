@@ -200,6 +200,17 @@ class StoreQueue(depth: Int = 8) extends Component {
   val headPreciseReady = valids(head) && !committed(head) && precises(head) &&
                          (robIds(head) === io.robHeadIn) && io.robHeadValidIn &&
                          !io.flush && !io.irqPreemptPendingIn
+
+  // Flush-source review (design doc §4.1, recorded here per the plan's Slice P3
+  // hardening pass): a branch-mispredict flush (RobPlugin's doFlushReg) can only
+  // originate from a RETIRING head, and a store is never itself a mispredicting
+  // branch -- so a flush never races an in-flight precise drain's OWN instruction.
+  // excSquash (the commit-side exception sequencer) requires excIdle to have
+  // already gone false, which the exception-entry trigger itself gates on the
+  // head being a plain (non-precise-drain-holding) instruction -- a precise store
+  // occupying the head blocks faultRetire/rteRetire/sysRetire from firing (headReady
+  // there still requires completes(h0), which a not-yet-resolved precise entry has
+  // not set) exactly the same way it blocks retire0. No additional gating needed.
   val headReady = (valids(head) && committed(head) && !io.flush) || headPreciseReady
   val drainIssue = headReady && !drainBusy   // one-cycle present to the D-cache
   io.drain.valid := drainIssue
@@ -400,6 +411,19 @@ class StoreQueue(depth: Int = 8) extends Component {
   when(headPreciseReady && !drainBusy) { preciseDrainBusyReg := True }
     .elsewhen(RegNext(preciseResolves, init = False)) { preciseDrainBusyReg := False }
   io.preciseDrainBusy := preciseDrainBusyReg
+
+  // Priority-rule invariant (design doc §4.1/§5 item 8): once a precise drain has
+  // LAUNCHED (preciseDrainBusyReg true), io.irqPreemptPendingIn going true on a
+  // later cycle must NOT re-trigger drainIssue (headPreciseReady already requires
+  // !drainBusy, so a launched-and-still-busy entry can never re-present) and must
+  // NOT abort the in-flight drain (nothing in this file reads irqPreemptPendingIn
+  // anywhere except headPreciseReady's own term). This assert exists purely to
+  // catch a FUTURE edit that accidentally threads irqPreemptPendingIn into the
+  // busy path and silently reintroduces the double-issue hazard.
+  GenerationFlags.simulation {
+    assert(!(preciseDrainBusyReg && drainIssue && precises(head)),
+      "StoreQueue: a precise drain re-issued while preciseDrainBusyReg was already held")
+  }
 
   // ---- flush: squash speculative (uncommitted) entries. Roll tail back to just
   // past the youngest COMMITTED entry. Walk from head over committed entries. ----

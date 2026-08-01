@@ -1084,6 +1084,15 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
                         !isRteStore(h0) && !privViolation && !sysOpStore(h0) &&
                         !preciseDrainBusyIn
     interruptPending := (normalIrqGate || stopped) && !flushing && excIdle && iplActive
+    // Priority-rule invariant (design doc §4.1/§5 item 8): interruptPending can only
+    // go true when normalIrqGate held (which now requires !preciseDrainBusyIn), so a
+    // LAUNCHED precise drain must never coexist with a newly-recognized interrupt at
+    // the SAME head. This assert exists purely to catch a future edit that loosens
+    // normalIrqGate's preciseDrainBusyIn term.
+    GenerationFlags.simulation {
+      assert(!(interruptPending && preciseDrainBusyIn),
+        "RobPlugin: interruptPending recognized while a precise SQ drain was in flight")
+    }
     // Consume the NMI latch the same cycle it is actually taken — gated on `nmiPending`
     // itself (not the live `iplIn`), so a latched edge is serviced as vector/level 7
     // even if the SoC has already dropped the line by the recognition cycle (mirrors
