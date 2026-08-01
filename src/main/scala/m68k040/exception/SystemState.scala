@@ -91,7 +91,19 @@ class SystemState extends Area {
   setCacr.valid.allowOverride;  setCacr.valid := False;  setCacr.payload.allowOverride;  setCacr.payload := U(0, 32 bits)
 
   // ── commit-time updates ──────────────────────────────────────────────────
-  when(setSrSys.valid) { srSys := setSrSys.payload }
+  // SR_RESERVED_MASK: bit3 of the 8-bit system byte (= architectural SR bit 11)
+  // is reserved and MUST read back 0 on real 68040 hardware (ported-tests
+  // triage, sr_reserved_bits_masked.s / task memory_model_review BUG, 2026-08-01).
+  // Every write path funnels through this single Flow (MOVE-to-SR, ANDI/ORI/
+  // EORI-to-SR's RMW result via AluEuPlugin's isLogicSr, RTE's popSr, STOP,
+  // and exception entry's newSysBase) so masking here enforces the invariant
+  // uniformly instead of at each of those call sites individually. The other
+  // reserved field (SR bits 7:5, the low-byte/CCR side) never needs masking
+  // here: AluEuPlugin's fromSrRes already hard-codes those 3 bits to 0 on
+  // every SR *read* (composition), and the CCR storage itself is a bare
+  // 5-bit {X,N,Z,V,C} register with no room for garbage in that position.
+  val SR_RESERVED_MASK = U(0xF7, 8 bits)   // 1111_0111: clears system-byte bit3 (SR bit 11)
+  when(setSrSys.valid) { srSys := setSrSys.payload & SR_RESERVED_MASK }
   when(setVbr.valid)   { vbr   := setVbr.payload }
   // writeA7 routes by COMMITTED (S, M). Listed FIRST so an explicit setIsp/setMsp/setUsp
   // in the same cycle wins (later-`when` wins in SpinalHDL).
