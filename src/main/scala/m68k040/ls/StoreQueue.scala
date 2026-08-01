@@ -414,8 +414,8 @@ class StoreQueue(depth: Int = 8) extends Component {
 
   // Priority-rule invariant (design doc §4.1/§5 item 8): once a precise drain has
   // LAUNCHED (preciseDrainBusyReg true), io.irqPreemptPendingIn going true on a
-  // later cycle must NOT re-trigger drainIssue (headPreciseReady already requires
-  // !drainBusy, so a launched-and-still-busy entry can never re-present) and must
+  // later cycle must NOT re-trigger drainIssue (drainIssue's own `!drainBusy` term
+  // already excludes it, so a launched-and-still-busy entry can never re-present) and must
   // NOT abort the in-flight drain (nothing in this file reads irqPreemptPendingIn
   // anywhere except headPreciseReady's own term). This assert exists purely to
   // catch a FUTURE edit that accidentally threads irqPreemptPendingIn into the
