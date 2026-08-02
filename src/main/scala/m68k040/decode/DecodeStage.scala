@@ -165,6 +165,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // ADDQ/SUBQ #n,<ea> (task #150 follow-up, mirrors s0IsAddqSubq/ucAddqSubqMi).
     val s1mi_isAddqSubq = slot1Spec0.srcB.kind === OperandKind.IMMQ3
     val s1mi_isImm = slot1Spec0.srcB.kind === OperandKind.IMMEXT
+    // DYNAMIC bit-op mirror of s0IsDynBitOp above (see its doc comment for the full
+    // root-cause story, bit_dyn_indexed_memind.s cases 5/6): slot1's own copy of the
+    // same missing classifier.
+    val s1mi_isDynBitOp = (slot1Spec0.op === DecOp.BITOP) && (slot1Spec0.srcB.kind === OperandKind.REGFIELD)
     // task #152: exclude the bit-op tt/.L-size field collision (see ucImmIsL's comment).
     val s1mi_immL  = (slot1Spec0.op =/= DecOp.BITOP) && (s1mi_opw(7 downto 6) === B"10")
     val s1mi_immVec= Mux(s1mi_immL, Vec(s1mi_opw, s1mi_pkt.words(3), s1mi_pkt.words(4), s1mi_pkt.words(5)),
@@ -190,6 +194,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       // task #153: the .L-imm case (s1mi_immL) is now routed too (predecode correctly
       // frames it via extW3) -- see the s0IsLineImm mirror below for the full explanation.
       (s1mi_isImm && (s1mi_immEa.klass === EaClass.MEMINDIRECT)) ||
+      (s1mi_isDynBitOp && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s1mi_isSingle && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s1mi_isLea && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s1mi_isPea && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
@@ -441,6 +446,23 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val s0IsSingleEa = (spec0.op === DecOp.CLR) || (spec0.op === DecOp.NEG) || (spec0.op === DecOp.NEGX) ||
                        (spec0.op === DecOp.NOT) || (spec0.op === DecOp.TST)
     val s0IsLineImm  = spec0.srcB.kind === OperandKind.IMMEXT
+    // DYNAMIC bit-op (BTST/BCHG/BCLR/BSET Dn,<ea>): OperationDecoder gives its srcB a
+    // REGISTER (dnField, the bit-number Dn -- see OperationDecoder.scala's
+    // `o.srcB := Mux(isDynBit, dnField, immext)`), NOT an IMMEXT immediate like the
+    // static form (whose #n rides s0IsLineImm above via its own bit-number ext word).
+    // Bug repro: bit_dyn_indexed_memind.s cases 5/6 (BSET/BTST Dn,([bd,An],od)) --
+    // slot0IsMemInd below previously had NO clause covering this shape at all (only
+    // s0IsLineImm, which structurally cannot see a register-sourced srcB), so a
+    // dynamic bit-op with a full-format memory-indirect EA never entered the µcode
+    // engine and instead fell through to the ordinary fast path, where
+    // MicroOpAssembler's `bitOpMemBad` gate (srcEa.klass is MEMINDIRECT, neither
+    // DATAREG nor MEMSIMPLE) unconditionally illegalised it (vector 4) -- with no
+    // vector-4 handler installed, this bare-metal harness free-runs into random
+    // SparseMemory fill afterward (a HANG, not a trap). The EA ext word sits directly
+    // at op+1 for the dynamic form (no preceding bit-number word, unlike static), so
+    // this uses the SAME unshifted `s0srcEa` an ordinary ALU-src-EA op already uses --
+    // not the shifted `s0ImmEa` the static form needs.
+    val s0IsDynBitOp = (spec0.op === DecOp.BITOP) && (spec0.srcB.kind === OperandKind.REGFIELD)
     // task #152: op[7:6] doubles as the bit-op tt sub-kind (BCLR=10 collides with the .L
     // size encoding) -- see ucImmIsL's comment below for the full explanation. Excluded
     // here too (this early gate is what decides engine entry in the first place).
@@ -530,6 +552,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       // task #153: the .L-imm case (s0ImmIsL) is NOW routed too -- predecode correctly
       // frames it (extW3), so s0ImmEa's klass is trustworthy for it exactly like .B/.W.
       (s0IsLineImm && (s0ImmEa.klass === EaClass.MEMINDIRECT)) ||
+      (s0IsDynBitOp && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s0IsSingleEa && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s0IsLea && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
       (s0IsPea && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
@@ -1312,6 +1335,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val ucImmEa    = EaDecoder.decode(ucEopw(5 downto 0), ucEntrySpec.size, ucImmEaVec)
     val ucIsLineImm= ucEntrySpec.srcB.kind === OperandKind.IMMEXT
     val ucImmDstMi = ucIsLineImm && (ucImmEa.klass === EaClass.MEMINDIRECT)
+    // DYNAMIC bit-op mirror of s0IsDynBitOp/s1mi_isDynBitOp above (see s0IsDynBitOp's
+    // doc comment for the full root-cause story, bit_dyn_indexed_memind.s cases 5/6):
+    // the µcode engine's OWN entry re-decode needs the identical classifier as the
+    // slot0/slot1 gates that route the op INTO the engine in the first place. Uses the
+    // default-fallback `ucMiSrcEa` (see `ucMiEa`'s Mux chain below, whose final `else`
+    // arm already resolves to `ucMiSrcEa` for this case -- no new branch needed there).
+    val ucIsDynBitOp = (ucEntrySpec.op === DecOp.BITOP) && (ucEntrySpec.srcB.kind === OperandKind.REGFIELD)
+    val ucDynBitMi   = ucIsDynBitOp && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
     // single-EA op (CLR/NEG/NEGX/NOT/TST): the EA is op[5:0], the host op is spec.op.
     val ucIsSingleEa = (ucEntrySpec.op === DecOp.CLR) || (ucEntrySpec.op === DecOp.NEG) ||
                        (ucEntrySpec.op === DecOp.NEGX) || (ucEntrySpec.op === DecOp.NOT) ||
@@ -1353,7 +1384,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // #144: on the stashed-slot1 path, this cycle's live fed.valid is unrelated to the
     // stashed packet's validity and can independently be false, e.g. a bubble, silently
     // zeroing ucIsMemInd and misrouting the µcode entry to the wrong default row).
-    val ucIsMemInd = (ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || ucAddqSubqMi || ucImmDstMi || ucSingleMi ||
+    val ucIsMemInd = (ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || ucAddqSubqMi || ucImmDstMi || ucDynBitMi || ucSingleMi ||
                        ucLeaMi || ucPeaMi || ucJmpMi || ucJsrMi) &&
                      (ucPendValid || fed.valid)
     // The host op's OTHER operand register:
@@ -1463,11 +1494,20 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // 68k is big-endian the loaded temp's low-order bits came from the WRONG byte -- the
     // subsequent bit-test/mask read a stale neighbor byte instead of the real target.
     ucEntryCtx.miHostSize   := Mux(ucIsBitOp, Size.BYTE, ucEntrySpec.size)
-    ucEntryCtx.miIsDstEa    := ucMoveDstMi || ucImmDstMi || ucSingleMi || ucAluDstMi || ucAddqSubqMi
-    ucEntryCtx.miIsRmw      := (ucImmDstMi || ucSingleMi || ucAluDstMi || ucAddqSubqMi) && !ucMiFlagsOnly
+    // ucDynBitMi (dynamic bit-op mem-indirect, mirrors ucImmDstMi's static-bit-op
+    // treatment in all three lines below -- see ucIsDynBitOp's doc comment): BCHG/BCLR/
+    // BSET are real RMW hosts (miIsDstEa/miIsRmw) and the bit-number Dn is a genuine
+    // "other" register operand that must actually be read (miOtherValid) -- without
+    // these, BCHG/BCLR/BSET Dn,<mem-indirect> would enter the engine (via ucIsMemInd
+    // above) but never issue the write half, and the bit-number register read would
+    // never be requested (silently defaulting to whatever miOther happened to hold).
+    // BTST is flags-only regardless (gated by `!ucMiFlagsOnly` in miIsRmw, exactly like
+    // static BTST already is).
+    ucEntryCtx.miIsDstEa    := ucMoveDstMi || ucImmDstMi || ucDynBitMi || ucSingleMi || ucAluDstMi || ucAddqSubqMi
+    ucEntryCtx.miIsRmw      := (ucImmDstMi || ucDynBitMi || ucSingleMi || ucAluDstMi || ucAddqSubqMi) && !ucMiFlagsOnly
     ucEntryCtx.miOther      := ucMiOtherReg
     // ucLeaMi (task #201): LEA-memind's dst = An (op[11:9]+8), fed via ucMiOtherReg above.
-    ucEntryCtx.miOtherValid := ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || (ucImmDstMi && !ucIsSingleEa) || ucLeaMi
+    ucEntryCtx.miOtherValid := ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || (ucImmDstMi && !ucIsSingleEa) || ucDynBitMi || ucLeaMi
     // MOVE #imm,<mem-indirect-dst> (task #156): the "other" side is the literal immediate,
     // not a register -- same miOtherIsImm/miHostImm feed as the line-0-imm/ADDQ families.
     // (`ucMoveDstMiImmEarly`, computed earlier alongside `ucMiEntry`'s selection, is the SAME
