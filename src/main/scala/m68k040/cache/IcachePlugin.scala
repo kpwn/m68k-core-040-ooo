@@ -133,6 +133,13 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val beatCnt   = Reg(UInt(1 bits)) init U(0, 1 bits)
     val arSent    = Reg(Bool()) init False
     val lineReg   = Reg(Bits(512 bits))
+    // Task icache-burst-fault-fix: PREDECODE's dataMem commit-beat phase — which
+    // half of `lineReg` (and which dataMem address) the SINGLE write-port commit is
+    // targeting THIS cycle of PREDECODE's 2-cycle dwell. See PREDECODE below for why
+    // this must stay a single write-port/single-call-site design (SpinalHDL's
+    // multi-write-Mem blackboxing broke on a two-call-site version of this fix).
+    // Always starts a fresh refill's PREDECODE dwell at 0 (reset on wrap, below).
+    val commitBeat = Reg(UInt(1 bits)) init U(0, 1 bits)
     // Task #211: latched across REFILL->FAULT — did any AXI read-beat response for
     // this refill come back with a non-OKAY resp (SLVERR/DECERR)? On an error the
     // line is NOT allocated (PREDECODE's tag/pred/valid writes are skipped entirely
@@ -410,35 +417,45 @@ class IcachePlugin extends FiberPlugin with FetchService {
           // (UNCONDITIONAL — see below), but latch the error so the FSM routes to
           // FAULT instead of PREDECODE once the burst completes (mirrors
           // DcachePlugin's REFILL respErr handling, task #189). NOTE (updated by the
-          // icache-corruption-fix task): the ORIGINAL #211 comment here claimed the
-          // dataMem write was "harmless — the line's valid bit is never set on this
-          // path, so it can never be read back as a hit" — that reasoning was WRONG
-          // whenever the round-robin victim pointer aliases onto a way that IS valid
-          // for some other address (see `refillAllocate` below, which now actually
-          // gates the write instead of relying on that argument).
+          // icache-corruption-fix / icache-burst-fault-fix tasks): the ORIGINAL #211
+          // comment here claimed the dataMem write was "harmless — the line's valid
+          // bit is never set on this path, so it can never be read back as a hit" —
+          // that reasoning was WRONG whenever the round-robin victim pointer aliases
+          // onto a way that IS valid for some other address. dataMem is no longer
+          // written from this state at all (see below) — the actual array commit is
+          // deferred to PREDECODE (which now dwells 2 cycles for exactly this reason
+          // — see its comment below), reached only once the WHOLE burst's pass/fail
+          // is known, closing both the per-beat case (icache-corruption-fix)
+          // and the cross-beat case where an earlier OK beat is committed before a
+          // later beat's error is known (icache-burst-fault-fix).
           val respErr = axi.r.payload.resp =/= Axi4.resp.OKAY
           when(respErr) { missBusFault := True }
-          // Task icache-corruption-fix: this beat's dataMem write is now gated the
-          // SAME way PREDECODE gates tagMem/valids/predMem (see doAllocate below) —
-          // an unconditional write here was the primary bug (review of 69a867c). Also
-          // folds in the pre-existing, structurally identical bus-fault-miss risk
-          // (task #211's `missBusFault`/`respErr` write was unconditional too): a
-          // beat that itself errored, or follows an earlier errored beat in the same
-          // 2-beat burst, must not touch the array either — that refill routes to
-          // FAULT (never allocates; see below), so writing dataMem for it shares the
-          // exact same "unrelated valid way silently corrupted" shape this task
-          // fixes. `lineReg` below stays UNCONDITIONAL (the direct-delivery source,
-          // mirrors DcachePlugin's `missLine`) so PREDECODE/REPLAY always have the
-          // real fetched bytes regardless of whether this beat gets allocated.
-          val refillAllocate = missCacheable && !missBusFault && !respErr
-          val writeAddr = (missSet ## beatCnt).asUInt
-          when(refillAllocate) {
-            for (w <- 0 until ways) {
-              when(victimWay === U(w, wayBits bits)) {
-                dataMem(w).write(writeAddr, axi.r.payload.data)
-              }
-            }
-          }
+          // Task icache-burst-fault-fix (review of 156cf6b): dataMem is NO LONGER
+          // written here, per-beat, at all. The 156cf6b fix gated the per-beat write
+          // under `missBusFault`/`respErr` evaluated AT THAT BEAT — which correctly
+          // suppresses the write for a beat that itself errors, or any beat AFTER an
+          // earlier beat in the same burst errored (missBusFault, once latched,
+          // carries forward). It does NOT protect the opposite, equally legal AXI
+          // ordering: beat 0 returns OKAY (respErr=False, missBusFault still False)
+          // and gets written for real, and ONLY THEN does beat 1 (the LAST beat)
+          // return SLVERR/DECERR — at the moment beat 0 is written, nothing yet knows
+          // the burst will fault. The overall refill still correctly routes to FAULT
+          // (below) with tagMem/predMem/valids untouched, but beat 0's real data was
+          // already spliced into `dataMem(victimWay)` — corrupting that way exactly
+          // like the original 69a867c bug, just triggered by a mid-burst AXI error
+          // instead of a cache-mode setting, and NOT caught by the missBusFault gate
+          // because the fault isn't known yet at write time.
+          //
+          // Fix: mirror how tagMem/predMem/valids already dodge this — defer the
+          // ACTUAL array write until the full burst's pass/fail is known. `lineReg`
+          // (below) stays the UNCONDITIONAL per-beat accumulator (already safe: a
+          // register, not a shared array) and is now the ONLY source for the real
+          // dataMem commit, which happens over PREDECODE's 2-cycle dwell (see its
+          // comment below) — reached ONLY via REFILL's `otherwise { goto(PREDECODE) }`
+          // below, i.e. only when the ENTIRE burst (both beats) is confirmed OKAY. A
+          // burst that faults on any beat routes to FAULT instead, which never visits
+          // PREDECODE, so dataMem is byte-for-byte untouched for that refill — same
+          // discipline FAULT already gave tagMem/predMem/valids.
           when(beatCnt === U(0, 1 bits)) {
             lineReg(255 downto 0)   := axi.r.payload.data
           } otherwise {
@@ -453,9 +470,9 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
       // ----- FAULT: deliver a one-shot bus-error fault response; no allocation -----
       // Task #211: reached only via REFILL's non-OKAY AXI response. PREDECODE (the
-      // tag/pred/valid writes) is skipped entirely — no line is allocated, matching
-      // the D-side no-allocate-on-error policy — and the victim pointer is NOT
-      // advanced (this way was never actually filled).
+      // tag/pred/valid/dataMem writes) is skipped entirely — no line is allocated,
+      // matching the D-side no-allocate-on-error policy — and the victim pointer is
+      // NOT advanced (this way was never actually filled).
       FAULT.whenIsActive {
         activePc := missPC
         s1Valid := True
@@ -530,19 +547,51 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // mux (`s1FromMiss`) above and REPLAY below.
         val doAllocate = missCacheable
         missPred := packed
-        for (w <- 0 until ways) {
-          when(victimWay === U(w, wayBits bits)) {
-            when(doAllocate) {
-              predMem(w).write(missSet, packed)
-              tagMem(w).write(missSet, missTag)
-              valids(w)(missSet) := True
+        // Task icache-burst-fault-fix: dataMem's commit is deferred from REFILL to
+        // here (see the REFILL comment above) — reached only when the FULL 2-beat
+        // burst was confirmed OKAY, using `lineReg` (the safe, register-backed
+        // accumulator) as the source instead of the live `axi.r.payload.data`.
+        //
+        // PREDECODE now DWELLS for 2 cycles (`commitBeat` below) so the two beats
+        // commit through a SINGLE `dataMem(w).write(...)` call site — i.e. one
+        // physical write port per way, address/data MUXED by `commitBeat` — instead
+        // of two simultaneous writes in one cycle (which would need a genuine 2nd
+        // write port on what must stay a single-write-port BRAM; an earlier version
+        // of this fix split beat-0/beat-1 across two FSM states, PREDECODE+COMMIT,
+        // each with its own `.write()` call site, and that DID synthesize a real
+        // second write port — SpinalHDL's `MultiPortWritesSymplifier` then failed to
+        // blackbox it during simulation elaboration. One call site, muxed by a
+        // register, avoids the hazard entirely — mirrors REFILL's own original
+        // single-write-port-per-beat discipline). predMem/tagMem/valids/victim are
+        // unaffected by this — they were already single-call-site/single-cycle and
+        // only fire once, gated below by `commitBeat === 0`.
+        when(commitBeat === U(0, 1 bits)) {
+          for (w <- 0 until ways) {
+            when(victimWay === U(w, wayBits bits)) {
+              when(doAllocate) {
+                predMem(w).write(missSet, packed)
+                tagMem(w).write(missSet, missTag)
+                valids(w)(missSet) := True
+              }
             }
+          }
+          when(doAllocate) {
+            victim(missSet) := victim(missSet) + 1
           }
         }
         when(doAllocate) {
-          victim(missSet) := victim(missSet) + 1
+          for (w <- 0 until ways) {
+            when(victimWay === U(w, wayBits bits)) {
+              dataMem(w).write((missSet ## commitBeat).asUInt,
+                Mux(commitBeat === U(0, 1 bits), lineReg(255 downto 0), lineReg(511 downto 256)))
+            }
+          }
         }
-        goto(REPLAY)
+        commitBeat := commitBeat + 1
+        when(commitBeat === U(1, 1 bits)) {
+          commitBeat := U(0, 1 bits)   // reset for the NEXT refill's PREDECODE dwell
+          goto(REPLAY)
+        }
       }
 
       // ----- REPLAY: arm S1 read for the just-filled line, then IDLE -----

@@ -77,3 +77,72 @@ object IcacheSim {
     }
   }
 }
+
+/** Task icache-burst-fault-fix: a purpose-built AXI4-read-only responder that can
+  * fault an EXPLICIT beat index of an EXPLICIT upcoming line-refill, independent of
+  * address. Neither existing memory model can do this:
+  *
+  *  - `attachMemory`/`attachMemoryMutable` (`Axi4ReadOnlySlaveAgent`, above) has no
+  *    resp-injection hook at all (`readByte` only supplies data; the resp is always
+  *    OKAY).
+  *  - `AxiMemModel`'s `injectBusErrors` decides bad-vs-good purely from
+  *    `AxiMemModel.decoded(addr)`. Every decode boundary in that map is 64 KiB or
+  *    256 MiB, and BOTH are exact multiples of the 64-byte I-cache line size — so a
+  *    decode-based split can only ever place a WHOLE line's both beats on one side of
+  *    a boundary; it can never land the boundary strictly BETWEEN a single line's
+  *    beat 0 and beat 1. It is structurally incapable of producing the "beat 0 OKAY,
+  *    beat 1 SLVERR/DECERR, same burst" scenario the icache-burst-fault-fix test
+  *    needs.
+  *
+  * This driver instead lets a test arm a specific (lineBase, beatIdx) pair; the NEXT
+  * AR whose (line-aligned) address matches gets that ONE beat's resp overridden to a
+  * non-OKAY value (DECERR), with every other beat of that burst — and every other
+  * burst — served as plain OKAY from an explicit per-line content map (`writeLine`;
+  * unwritten lines read as all-zero). One AR in flight at a time is assumed (true of
+  * the I-cache DUT, which never issues a second AR before the first burst's `last`).
+  */
+class BeatFaultAxiResponder(axi: Axi4ReadOnly, cd: ClockDomain) {
+  private val lines = scala.collection.mutable.Map[Long, Array[Byte]]()
+  private var armed: Option[(Long, Int)] = None   // (lineBase, faultBeatIdx), one-shot
+
+  /** Install this line's 64 bytes of content, keyed by its (line-aligned) base
+    * address. Read back beat-by-beat, 32 bytes/beat (matches the I-cache's 256-bit
+    * AXI data width), little-endian within each beat. */
+  def writeLine(lineBase: Long, bytes: Array[Byte]): Unit = {
+    require(bytes.length == 64, "writeLine expects exactly one 64-byte I-cache line")
+    lines(lineBase) = bytes
+  }
+
+  /** Arm the next AR whose line-aligned address equals `lineBase`: beat `beatIdx`
+    * (0-based) of that burst returns DECERR instead of OKAY (data is still driven,
+    * but the I-cache RTL must not trust it). Consumed on match (one-shot). */
+  def armBeatFault(lineBase: Long, beatIdx: Int): Unit = armed = Some((lineBase, beatIdx))
+
+  axi.ar.ready #= true
+  axi.r.valid  #= false
+
+  fork {
+    while (true) {
+      cd.waitSamplingWhere(axi.ar.valid.toBoolean)
+      val lineBase = axi.ar.payload.addr.toBigInt.toLong
+      val len      = axi.ar.payload.len.toInt
+      val id       = axi.ar.payload.id.toBigInt
+      val bytes    = lines.getOrElse(lineBase, Array.fill(64)(0.toByte))
+      val (faultBase, faultBeat) = armed.getOrElse((-1L, -1))
+      val doFault = lineBase == faultBase
+      if (doFault) armed = None   // one-shot: consumed by this matching AR
+
+      for (beat <- 0 to len) {
+        var v = BigInt(0)
+        for (i <- 0 until 32) v = v | (BigInt(bytes(beat * 32 + i).toInt & 0xff) << (8 * i))
+        axi.r.valid         #= true
+        axi.r.payload.data  #= v
+        axi.r.payload.id    #= id
+        axi.r.payload.last  #= (beat == len)
+        axi.r.payload.resp  #= (if (doFault && beat == faultBeat) 3 else 0)   // DECERR : OKAY
+        cd.waitSamplingWhere(axi.r.ready.toBoolean)
+        axi.r.valid #= false
+      }
+    }
+  }
+}

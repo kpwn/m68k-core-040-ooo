@@ -538,4 +538,123 @@ class IcacheSpec extends AnyFunSuite {
       cd.waitSampling(4)
     }
   }
+
+  // (I-j) CRITICAL regression (review of 156cf6b, "icache: gate dataMem/predMem
+  // writes under doAllocate, fix silent corruption"): 156cf6b's `refillAllocate`
+  // gate is evaluated PER-BEAT, using `missBusFault`/`respErr` AS OF THAT BEAT. This
+  // correctly suppresses the dataMem write for a beat that itself errors, and for
+  // every beat AFTER an earlier beat in the same burst errored (missBusFault, once
+  // latched, carries forward). It does NOT protect the OPPOSITE, equally legal AXI
+  // ordering: beat 0 of a 2-beat line burst returns OKAY and gets written for real
+  // (nothing yet knows the burst will fail), and only THEN does beat 1 (the LAST
+  // beat) return SLVERR/DECERR. The overall refill still correctly routes to FAULT
+  // (no tag/pred/valid allocation), but beat 0's real fetched data was already
+  // spliced into `dataMem(victimWay)` by the time the fault is known — corrupting
+  // that way's beat-0 half exactly like the original 69a867c bug, just triggered by
+  // a mid-burst AXI error instead of a cache-mode setting.
+  //
+  // This test forces exactly that scenario: warm all 4 ways of set 0 (same
+  // round-robin-aliasing technique as the 156cf6b test above, wrapping the victim
+  // pointer back onto way 0), then trigger a miss at a DIFFERENT same-set address
+  // whose beat 0 succeeds (OKAY, real distinguishable data) and whose beat 1 (the
+  // last beat) DECERRs — using `BeatFaultAxiResponder` (IcacheSim.scala), a
+  // purpose-built driver, because neither `attachMemory`/`attachMemoryMutable` (no
+  // resp-injection hook at all) nor `AxiMemModel`'s `injectBusErrors` (address-decode
+  // boundaries are all multiples of the 64-byte line size, so a decode-based
+  // bad/good split can never fall strictly between one line's beat 0 and beat 1) can
+  // produce this specific per-beat pattern. Way 0's raw dataMem/tagMem/predMem/valid
+  // content must be byte-for-byte UNCHANGED afterward. FAILS against the pre-fix
+  // (156cf6b) code (way 0's beat-0 dataMem half is corrupted); PASSES after the fix.
+  test("beat-0-OK-then-beat-1-error mid-burst refill must not corrupt the aliased resident way", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      val mem = new BeatFaultAxiResponder(dut.icache.logic.axi, cd)
+
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      pulseInvalidateAll(dut, cd)
+
+      var arCount = 0
+      fork { while (true) { cd.waitSampling()
+        if (dut.icache.logic.axi.ar.valid.toBoolean && dut.icache.logic.axi.ar.ready.toBoolean) arCount += 1 } }
+
+      // A 64-byte line filled entirely with `byte` (distinguishable per warm way).
+      def line(byte: Int): Array[Byte] = Array.fill(64)(byte.toByte)
+      def lineWindow64(byte: Int): BigInt =
+        (0 until 8).foldLeft(BigInt(0)) { (acc, i) => acc | (BigInt(byte & 0xff) << (8 * i)) }
+
+      // 4 distinct tags, SAME set index (bits[11:6]=0), stride 0x1000 — warms ways
+      // 0..3 in order, leaving the round-robin victim pointer for set 0 wrapped back
+      // to way 0 (mirrors the 156cf6b aliasing test above).
+      val addrs = (0 until 4).map(i => i.toLong * 0x1000L)
+      addrs.zipWithIndex.foreach { case (a, i) => mem.writeLine(a, line(0x10 + i)) }
+      val faultBase = 0x4000L   // distinct tag, same set index (low 12 bits still 0)
+      // Beat 0 (first 32 bytes) = 0x77 repeated — deliberately distinct from every
+      // warm way's content (0x10..0x13), so a beat-0 corruption of way 0 is
+      // unambiguously detectable. Beat 1 content is irrelevant (its beat DECERRs).
+      mem.writeLine(faultBase, Array.tabulate(64)(i => if (i < 32) 0x77.toByte else 0x00.toByte))
+
+      addrs.zipWithIndex.foreach { case (a, i) =>
+        val got = fetch(dut, cd, a)
+        assert(got == lineWindow64(0x10 + i), s"warm fetch at 0x${a.toHexString} data mismatch")
+      }
+      val arAfterWarm = arCount
+      assert(arAfterWarm == 4, s"4 distinct-tag warm fetches must each refill once: $arAfterWarm")
+
+      // Snapshot way 0's raw array content BEFORE the faulting refill. Set index 0:
+      // dataMem address = set*beatsPerLine + beat (0 and 1); tagMem/predMem address =
+      // set (0).
+      val way0DataBefore  = Seq(0, 1).map(b => dut.icache.logic.dataMem(0).getBigInt(b))
+      val way0TagBefore   = dut.icache.logic.tagMem(0).getBigInt(0)
+      val way0PredBefore  = dut.icache.logic.predMem(0).getBigInt(0)
+      val way0ValidBefore = dut.icache.logic.valids(0)(0).toBoolean
+      assert(way0ValidBefore, "way 0 must be resident/valid after the warm fetches")
+
+      // Arm beat 1 (the LAST beat) of the upcoming refill at faultBase to DECERR;
+      // beat 0 returns OKAY with the real 0x77 data.
+      mem.armBeatFault(faultBase, 1)
+
+      // Trigger the fault-inducing fetch. Use a raw cmd/rsp drive (not the shared
+      // `fetch` helper) so the fault flag on the response can also be inspected.
+      dut.probe.logic.cmdIn.valid #= true
+      dut.probe.logic.cmdIn.payload.pc #= faultBase
+      cd.waitSamplingWhere(dut.probe.logic.cmdIn.ready.toBoolean && dut.probe.logic.cmdIn.valid.toBoolean)
+      dut.probe.logic.cmdIn.valid #= false
+      cd.waitSamplingWhere(dut.probe.logic.rspOut.valid.toBoolean)
+      assert(dut.probe.logic.rspOut.payload.fault.toBoolean,
+        "a mid-burst DECERR must be reported as a fault response (no line allocated)")
+      val arAfterFault = arCount
+      assert(arAfterFault == arAfterWarm + 1, s"faulting fetch must issue exactly one refill: $arAfterWarm -> $arAfterFault")
+
+      // THE regression check: way 0's raw array content must be COMPLETELY
+      // UNCHANGED, in particular its beat-0 half (the one 156cf6b's per-beat gate
+      // does NOT protect against this ordering).
+      val way0DataAfter  = Seq(0, 1).map(b => dut.icache.logic.dataMem(0).getBigInt(b))
+      val way0TagAfter   = dut.icache.logic.tagMem(0).getBigInt(0)
+      val way0PredAfter  = dut.icache.logic.predMem(0).getBigInt(0)
+      val way0ValidAfter = dut.icache.logic.valids(0)(0).toBoolean
+
+      assert(way0DataAfter == way0DataBefore,
+        s"way 0 dataMem CORRUPTED by a mid-burst (beat-0-OK, beat-1-error) refill: before=$way0DataBefore after=$way0DataAfter")
+      assert(way0TagAfter == way0TagBefore,
+        s"way 0 tagMem changed: before=0x${way0TagBefore.toString(16)} after=0x${way0TagAfter.toString(16)}")
+      assert(way0PredAfter == way0PredBefore,
+        s"way 0 predMem CORRUPTED by a mid-burst error refill: before=0x${way0PredBefore.toString(16)} after=0x${way0PredAfter.toString(16)}")
+      assert(way0ValidAfter == way0ValidBefore, "way 0 valid bit must be unaffected by the mid-burst error refill")
+
+      // Extra correctness check: a plain re-fetch of the ORIGINAL way-0 address must
+      // still HIT (no new AR) and return the correct, unpoisoned data.
+      val arBeforeRefetch = arCount
+      val got0 = fetch(dut, cd, addrs(0))
+      assert(got0 == lineWindow64(0x10),
+        s"way-0 address must still return correct (unpoisoned) data after the mid-burst-error alias: got 0x${got0.toString(16)}")
+      assert(arCount == arBeforeRefetch,
+        s"way-0 address must still HIT (no new AR): $arBeforeRefetch -> $arCount")
+
+      cd.waitSampling(4)
+    }
+  }
 }
