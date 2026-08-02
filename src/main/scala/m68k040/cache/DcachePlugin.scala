@@ -1077,6 +1077,18 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // filter and is not structurally a storeAck source at all. Zero synth cost.
     // Explicit `FAILURE` severity (3-arg form), matching this file's own
     // convention (see the diagFaultKind0Fires/diagFaultPulse asserts above).
+    //
+    // Why this can't fire: within one store, S2's when/elsewhen/otherwise picks
+    // exactly one of the three (COPYBACK-hit -> cbHitAckReg, COPYBACK-miss ->
+    // eventual storeAllocAckReg, WT/INHIBITED -> eventual storeBAck). Across
+    // stores, StoreQueue.scala's `drainIssue = headReady && !drainBusy` (with
+    // `drainBusy` cleared only by `io.drainAck`, wired in LsEuPlugin.scala as
+    // `sq.io.drainAck := dcache.storeAck` -- the exact OR of all three sources)
+    // is a real registered gate: the SQ cannot present a second store until the
+    // aggregate storeAckReg has already fired for the first. Unlike the
+    // kind=0/kind=1 diagnostic-pulse hazard above, this exclusivity is
+    // hardware-enforced (by StoreQueue's drainBusy register), not merely an
+    // unenforced timing coincidence -- it just lives in a different file.
     GenerationFlags.simulation {
       val ackSources = Seq(storeBAck, cbHitAckReg, storeAllocAckReg)
       assert(CountOne(ackSources) <= U(1),
