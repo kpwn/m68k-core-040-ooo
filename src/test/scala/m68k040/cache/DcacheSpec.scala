@@ -63,6 +63,7 @@ class DcacheSpec extends AnyFunSuite {
     dut.probe.logic.storeIn.payload.size #= size
     dut.probe.logic.storeIn.payload.useStrb #= false
     dut.probe.logic.storeIn.payload.cacheMode #= cacheMode
+    dut.probe.logic.storeIn.payload.precise #= false
     cd.waitSampling()
     dut.probe.logic.storeIn.valid #= false
     cd.waitSampling(12)
@@ -77,6 +78,7 @@ class DcacheSpec extends AnyFunSuite {
     dut.probe.logic.storeIn.payload.size #= Size.WORD
     dut.probe.logic.storeIn.payload.useStrb #= false
     dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+    dut.probe.logic.storeIn.payload.precise #= false
     cd.waitSampling()
     dut.probe.logic.storeIn.valid #= false
     // storeAck == AXI B handshake (b.ready is held True by the cache).
@@ -89,13 +91,19 @@ class DcacheSpec extends AnyFunSuite {
     * axi.b.valid/ready/resp (same cycle class as `storeAckReg`), so reading it right
     * after `waitSamplingWhere` returns observes the value live for that handshake. */
   def doStoreAckGatedObserveErr(dut: Dut, cd: ClockDomain, paddr: Long, data: BigInt,
-                                 cacheMode: SpinalEnumElement[CacheMode.type] = CacheMode.WRITETHROUGH): Boolean = {
+                                 cacheMode: SpinalEnumElement[CacheMode.type] = CacheMode.WRITETHROUGH,
+                                 precise: Boolean = false): Boolean = {
     dut.probe.logic.storeIn.valid #= true
     dut.probe.logic.storeIn.payload.paddr #= paddr
     dut.probe.logic.storeIn.payload.data #= data
     dut.probe.logic.storeIn.payload.size #= Size.WORD
     dut.probe.logic.storeIn.payload.useStrb #= false
     dut.probe.logic.storeIn.payload.cacheMode #= cacheMode
+    // Task P4.5: `precise` gates whether a B error routes to the async diagFault
+    // channel (false, this default) or would-be the SQ's precise-path fault source
+    // (true) -- explicitly pinned (SpinalHDL sim-poke gotcha: an unpoked testbench-
+    // driven input field is NOT guaranteed 0 across seeds/runs).
+    dut.probe.logic.storeIn.payload.precise #= precise
     cd.waitSampling()
     dut.probe.logic.storeIn.valid #= false
     cd.waitSamplingWhere(dut.dcache.logic.axi.b.valid.toBoolean && dut.dcache.logic.axi.b.ready.toBoolean)
@@ -984,6 +992,99 @@ class DcacheSpec extends AnyFunSuite {
         s"racing load never completed within $cyc cycles -- Fable5 Bug1 regression (LS EU hang)")
       val got = dut.probe.logic.loadRspOut.payload.data.toBigInt
       assert(got == expected(loadBase, 4), s"racing load must return correct data: got ${got.toString(16)}")
+      cd.waitSampling(4)
+    }
+  }
+
+  // ── Task P4.5: async diagnostic-fault channel ──────────────────────────────────
+  // (r) The NEW WT-beat / INHIBITED-drain site (kind=0): a non-precise (INHIBITED-
+  // drain `precise` defaults false in this DUT, matching a real fast-path drain)
+  // store's AXI-B error sticky-latches {addr,resp,kind}. A subsequent, DIFFERENT
+  // bus error must NOT overwrite the record (first-error-wins). storeErr/storeAck
+  // keep pulsing exactly as before this task (see the "storeErr pulses exactly..."
+  // test above) -- diagFault is purely additive, never a replacement.
+  test("diagFault sticky-latches exactly once on a WT-beat AXI-B error (kind=0), first-error-wins",
+       VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDutErrInject(dut)
+
+      // A clean (decoded-address) store must never pulse diagFault.
+      dut.dcache.logic.diagFaultExpected #= false
+      val errClean = doStoreAckGatedObserveErr(dut, cd, 0x1000L, BigInt("ABCD", 16))
+      assert(!errClean, "sanity: storeErr must not pulse on an OKAY B")
+      assert(!dut.dcache.logic.diagFaultValid.toBoolean, "diagFault must stay clear after an OKAY B")
+
+      // A bad (undecoded) WRITETHROUGH store errors -- this test WANTS that, so opt
+      // in via diagFaultExpected before triggering it (else the sim-side assert in
+      // DcachePlugin's own Step-1 GenerationFlags.simulation block fires fatally).
+      dut.dcache.logic.diagFaultExpected #= true
+      val badAddr1 = 0xAAAA0000L
+      val err1 = doStoreAckGatedObserveErr(dut, cd, badAddr1, BigInt("DEAD", 16))
+      assert(err1, "sanity: storeErr must pulse on the injected DECERR")
+      assert(dut.dcache.logic.diagFaultValid.toBoolean, "diagFault must latch on the WT-beat B error")
+      assert(dut.dcache.logic.diagFaultKind.toInt == 0, "kind=0 (WT-beat / INHIBITED-drain)")
+      assert(dut.dcache.logic.diagFaultResp.toInt == 3, "resp must carry the real DECERR code (3)")
+      val latchedAddr1 = dut.dcache.logic.diagFaultAddr.toBigInt
+      assert(latchedAddr1 == BigInt(badAddr1),
+        s"latched addr must be the erroring store's own line-aligned addr: got ${latchedAddr1.toString(16)}")
+
+      // A SECOND, DIFFERENT bad store must NOT overwrite the sticky record.
+      val badAddr2 = 0xBBBB1000L
+      val err2 = doStoreAckGatedObserveErr(dut, cd, badAddr2, BigInt("BEEF", 16))
+      assert(err2, "sanity: the second store's own (non-sticky) storeErr must still pulse")
+      assert(dut.dcache.logic.diagFaultValid.toBoolean, "diagFault must remain latched")
+      assert(dut.dcache.logic.diagFaultAddr.toBigInt == BigInt(badAddr1),
+        "first-error-wins: the sticky record must still hold the FIRST error's address")
+      assert(dut.dcache.logic.diagFaultKind.toInt == 0, "first-error-wins: kind unchanged")
+      assert(dut.dcache.logic.diagFaultResp.toInt == 3, "first-error-wins: resp unchanged")
+
+      cd.waitSampling(4)
+    }
+  }
+
+  // (s) The site pulled forward from Task P4.2 (kind=1, drain-miss write-allocate
+  // refill's own AXI-R error) also feeds this task's NEW sticky diagFaultValid
+  // latch -- no architectural fault, the drain is unconditionally acked via
+  // `storeAllocAckReg` regardless of the refill's own error.
+  test("diagFault sticky-latches on a COPYBACK write-allocate refill's AXI-R error (kind=1)",
+       VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDutErrInject(dut)
+      dut.dcache.logic.diagFaultExpected #= true
+
+      val storePaddr = 0xAAAA2004L   // undecoded -> the write-allocate refill's AR/R DECERRs
+      dut.probe.logic.storeIn.valid #= true
+      dut.probe.logic.storeIn.payload.paddr #= storePaddr
+      dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
+      dut.probe.logic.storeIn.payload.size #= Size.LONG
+      dut.probe.logic.storeIn.payload.useStrb #= false
+      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+      dut.probe.logic.storeIn.payload.precise #= false
+      cd.waitSampling()
+      dut.probe.logic.storeIn.valid #= false
+
+      // diagFaultValid (a sticky Reg) becomes visible the cycle after REPLAY's
+      // `missFault && refillReqIsStore` arm pulses diagFaultPulse (same cycle it
+      // also pulses `storeAllocAckReg`, the drain's own local ack). Poll manually
+      // (check-first, not `waitSamplingWhere` -- consumed one extra edge before its
+      // first check, which can walk past a value that is already stably true).
+      var gotIt = false
+      var n = 0
+      while (!gotIt && n < 200) {
+        gotIt = dut.dcache.logic.diagFaultValid.toBoolean
+        if (!gotIt) cd.waitSampling()
+        n += 1
+      }
+      assert(gotIt, "diagFaultValid never latched within 200 cycles")
+
+      assert(dut.dcache.logic.diagFaultValid.toBoolean,
+        "diagFault must latch on the write-allocate refill's own AXI-R error")
+      assert(dut.dcache.logic.diagFaultKind.toInt == 1, "kind=1 (drain-miss write-allocate refill)")
+      assert(dut.dcache.logic.diagFaultResp.toInt == 2,
+        "kind=1's resp is the hardcoded SLVERR-class placeholder (U(2,2 bits)), not the real DECERR")
+      assert(dut.dcache.logic.diagFaultAddr.toBigInt == BigInt(storePaddr),
+        "latched addr must be the store's own (un-line-aligned) paddr, per missPaddr's own convention")
+
       cd.waitSampling(4)
     }
   }

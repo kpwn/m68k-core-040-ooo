@@ -69,6 +69,12 @@ trait DcacheService {
   // `storeAllocAckReg` for a drain-miss write-allocate. It never pulses on an
   // eviction writeback's own B response (id === 2) -- that is diagnostic-only.
   def storeErr: Bool
+  // Sticky (once set, stays set until reset): a trusted-cacheable-path AXI
+  // transaction issued on the CORE's own behalf (WT-beat/INHIBITED-drain,
+  // drain-miss write-allocate refill, or a dirty-victim eviction writeback)
+  // came back with a non-OKAY response. First-error-wins; see
+  // `DcachePlugin.logic.diagFaultValid`'s doc comment for the per-site kinds.
+  def diagFault: Bool
 }
 
 /** Big-endian byte-lane helpers shared by load extraction and store merge.

@@ -1057,6 +1057,45 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val storeBAck = axi.b.valid && axi.b.ready && (axi.b.payload.id === U(1, 4 bits))
     storeErrReg := storeBAck && (axi.b.payload.resp =/= Axi4.resp.OKAY)
     storeAckReg := storeBAck || cbHitAckReg || storeAllocAckReg
+
+    // ---- Task P4.5: async diagnostic-fault channel ----
+    // WT-beat / INHIBITED-drain B-error site, ONLY for a FAST (non-precise) drain --
+    // a precise drain's B-error is ALREADY correctly, precisely handled by the SQ's
+    // sqFaultCompletion path (Task P2.4); routing it here TOO would be a double-report.
+    when(storeErrReg && !stPreciseReg) {
+      diagFaultPulse     := True
+      diagFaultPulseAddr := stAddrReg
+      diagFaultPulseResp := axi.b.payload.resp.asUInt.resize(2)
+      diagFaultPulseKind := U(0, 3 bits)   // kind=0: WT-beat / INHIBITED-drain
+    }
+
+    // Sticky latch across all diagFaultPulse sites (kind=0 here; kind=1 drain-miss
+    // write-allocate refill ~L822; kind=2 dirty-victim eviction writeback ~L738).
+    // First-error-wins: `!diagFaultValid` in the guard below means the latch, once
+    // set, is never overwritten by a later pulse.
+    val diagFaultValid = RegInit(False)
+    val diagFaultAddr  = Reg(UInt(32 bits))
+    val diagFaultResp  = Reg(UInt(2 bits))
+    val diagFaultKind  = Reg(UInt(3 bits))   // 0=WT-beat, 1=drain-miss write-allocate,
+                                              // 2=eviction writeback, 3=CPUSH writeback (P5)
+    diagFaultValid.simPublic(); diagFaultAddr.simPublic()
+    diagFaultResp.simPublic();  diagFaultKind.simPublic()
+
+    when(diagFaultPulse && !diagFaultValid) {
+      diagFaultValid := True
+      diagFaultAddr  := diagFaultPulseAddr
+      diagFaultResp  := diagFaultPulseResp
+      diagFaultKind  := diagFaultPulseKind
+    }
+
+    // Sim-side: fatal by default (design doc Sec 4.2/Sec 5 item 4) unless a directed
+    // test explicitly opts in. A test that WANTS to trigger this path pokes
+    // diagFaultExpected := True before doing so.
+    val diagFaultExpected = RegInit(False); diagFaultExpected.simPublic()
+    GenerationFlags.simulation {
+      assert(!(diagFaultPulse && !diagFaultExpected),
+        "DcachePlugin: unexpected async diagnostic fault (a trusted-cacheable-path AXI transaction errored) -- if this test intends to exercise it, poke diagFaultExpected := True first")
+    }
   }
 
   override def loadCmd  = logic.loadCmdPort
@@ -1065,4 +1104,5 @@ class DcachePlugin extends FiberPlugin with DcacheService {
   override def store    = logic.storePort
   override def storeAck = logic.storeAckReg
   override def storeErr = logic.storeErrReg
+  override def diagFault = logic.diagFaultValid
 }

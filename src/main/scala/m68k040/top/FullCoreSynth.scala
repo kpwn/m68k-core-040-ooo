@@ -123,7 +123,9 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     gsh.gshareUpdate.payload := rob.logic.gshareUpdateFlow.payload
     // STOP-halt: while the ROB is in the `stopped` state, quiesce the front-end (hold
     // fetch + feed at the STOP successor PC). The IRQ-entry vector redirect clears it.
-    host[FetchAlignPlugin].logic.quiesce := rob.logic.stopped
+    // CORE HALT (Task P4.5): a sticky, non-interrupt-clearable variant driven from the
+    // D-cache's async diagnostic-fault channel -- ORed in here so it quiesces fetch too.
+    host[FetchAlignPlugin].logic.quiesce := rob.logic.stopped || rob.logic.coreHalted
     eu0.issue << iq.issue(0)
     eu1.issue << iq.issue(1)
     // MOVE-from-SR int result needs the committed SR system byte: wire the ROB's
@@ -298,6 +300,10 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     exc.dcLoadRsp.payload := dc.loadRsp.payload
     exc.dcLoadBusy        := dc.loadBusy
     exc.dcStoreAck        := dc.storeAck
+    // Task P4.5: the D-cache's async diagnostic-fault channel (a non-OKAY AXI
+    // response on a trusted-cacheable-path transaction) latches a sticky,
+    // non-interrupt-wakeable CORE HALT.
+    rob.logic.coreHaltedIn := dc.diagFault
     exc.dtRsp.ready       := xlate.rsp.ready
     exc.dtRsp.ppn         := xlate.rsp.ppn
     exc.dtRsp.cacheMode   := xlate.rsp.cacheMode

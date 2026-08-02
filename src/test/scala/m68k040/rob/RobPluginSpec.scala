@@ -949,4 +949,56 @@ class RobPluginSpec extends AnyFunSuite {
       assert(dut.rob.logic.count.toInt == 0, "ROB drained by the 2-wide retire")
     }
   }
+
+  // ── Task P4.5: sticky, non-interrupt-wakeable CORE HALT ─────────────────────────
+  // Unlike `stopped` (interrupt-wakeable, self-clearing STOP quiesce), `coreHalted`
+  // is a one-way latch: once `coreHaltedIn` pulses, retire freezes permanently (only
+  // reset recovers it) and an otherwise-eligible interrupt must NOT be recognized --
+  // `headReady`'s `!coreHalted` term and `interruptPending`'s `!coreHalted` term.
+  // GateDut (has InterruptControlPlugin, so `interruptPending`/`iplIn` are reachable)
+  // is the SAME Dut the "preciseDrainBusyIn blocks interruptPending..." test above
+  // uses; that test's sibling ("preciseDrainBusyIn blocks tracePendingFire...")
+  // independently proves allocGateOne + completion(0) genuinely retires via
+  // fireOut(0) in this exact Dut shape with no gate active -- so this test doesn't
+  // need its own un-halted baseline phase to rule out a vacuously-never-ready head.
+  test("coreHaltedIn freezes retire and is NOT cleared by a subsequent interruptPending") {
+    M68kSim().compile(new GateDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initGate(dut, cd)
+      setGateMask(dut, cd, 0)   // mask=0 -- any ipl>0 is normally interrupt-eligible
+
+      // A 1-cycle coreHaltedIn pulse must latch coreHalted permanently.
+      dut.rob.logic.coreHaltedIn #= true
+      cd.waitSampling()
+      dut.rob.logic.coreHaltedIn #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.coreHalted.toBoolean, "coreHalted must latch after a 1-cycle coreHaltedIn pulse")
+
+      // Alloc + complete one instruction (robId 0) -- retire-eligible in every OTHER
+      // respect (same shape the sibling GateDut tests DO see retire via fireOut(0)).
+      allocGateOne(dut, cd, pc = 0xD00)
+      dut.rob.logic.completion(0).valid #= true; dut.rob.logic.completion(0).payload #= 0
+      cd.waitSampling()
+      dut.rob.logic.completion(0).valid #= false
+
+      for (_ <- 0 until 15) {
+        assert(!dut.tsink.logic.fireOut(0).toBoolean, "coreHalted must freeze retire (fireOut must never fire)")
+        assert(dut.rob.logic.count.toInt > 0, "coreHalted must freeze retire (count must never drop)")
+        cd.waitSampling()
+      }
+
+      // Raise an interrupt-eligible condition (ipl > mask). Unlike `stopped`,
+      // coreHalted must NOT be bypassed/cleared by this -- a halted core recognizes
+      // no interrupt at all (design doc decision), and retire must stay frozen.
+      dut.intCtrl.logic.iplIn #= 5
+      dut.intCtrl.logic.iackAvec #= true
+      for (_ <- 0 until 15) {
+        assert(!dut.rob.logic.interruptPending.toBoolean,
+          "a halted core recognizes no interrupt -- interruptPending must never fire")
+        assert(!dut.tsink.logic.fireOut(0).toBoolean, "retire must remain frozen despite the pending interrupt")
+        assert(dut.rob.logic.coreHalted.toBoolean, "coreHalted must remain latched (not interrupt-clearable)")
+        cd.waitSampling()
+      }
+    }
+  }
 }

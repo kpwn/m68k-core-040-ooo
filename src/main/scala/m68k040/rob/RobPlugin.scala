@@ -248,6 +248,17 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // STOP retire). While stopped the ROB is empty (count==0), so pcStore(h0) is stale — the
     // interrupt entry must stack THIS PC as the return address (else RTE resumes at garbage).
     val stoppedPc = Reg(UInt(32 bits)) init 0; stoppedPc.simPublic()
+    // ── CORE HALT (Task P4.5) ───────────────────────────────────────────────
+    // A sticky variant of the STOP quiesce shape (design doc Sec 4.2, USER
+    // DECISION 2026-07-23) -- gates retire + fetch -- but, unlike `stopped`,
+    // NEVER cleared by an interrupt (only debug/reset recovers it).
+    // Sibling-driven from the D-cache's diagFault (a configuration-error
+    // report, not a case precision protects against or an interrupt can
+    // meaningfully service).
+    val coreHaltedIn = Bool(); coreHaltedIn.allowOverride; coreHaltedIn := False
+    coreHaltedIn.simPublic()   // pokable from a standalone DUT, same convention as preciseDrainBusyIn
+    val coreHalted = RegInit(False); coreHalted.simPublic()
+    when(coreHaltedIn) { coreHalted := True }
     // MMU access-fault per-entry capture (set at COMPLETION from the LS EU's
     // faultCompletion, NOT at alloc — an MMU fault is discovered at execute). On a
     // faulting LS access the LS EU marks the entry faulted vector 2 + the faulting VA
@@ -398,7 +409,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // here too (the privilege check below gates on it) and DRIVEN from exc.ss.s after
     // the exc unit is built.
     val committedS = _supervisor; committedS.simPublic()
-    val headReady   = (count > 0) && completes(h0) && !flushing
+    val headReady   = (count > 0) && completes(h0) && !flushing && !coreHalted
     // Privilege violation: a needsSupervisor head retiring in USER mode (committed S==0)
     // takes a vector-8 (format-$0) exception. Treated like a faulted head — the op does
     // NOT commit its result (precise). Only meaningful when the head is otherwise ready.
@@ -1083,7 +1094,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val normalIrqGate = (count > 0) && firstStore(h0) && !faultedStore(h0) &&
                         !isRteStore(h0) && !privViolation && !sysOpStore(h0) &&
                         !preciseDrainBusyIn
-    interruptPending := (normalIrqGate || stopped) && !flushing && excIdle && iplActive
+    // A halted core (Task P4.5) recognizes no interrupt -- deliberately NOT
+    // wakeable, matching the design doc's decision (unlike `stopped`, which IS
+    // interrupt-wakeable).
+    interruptPending := (normalIrqGate || stopped) && !flushing && excIdle && iplActive && !coreHalted
     // Priority-rule invariant (design doc §4.1/§5 item 8): interruptPending can only
     // go true when normalIrqGate held (which now requires !preciseDrainBusyIn), so a
     // LAUNCHED precise drain must never coexist with a newly-recognized interrupt at
