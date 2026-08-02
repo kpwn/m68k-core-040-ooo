@@ -125,6 +125,20 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // actually had (not a live signal that could have moved on).
     val missCmode = Reg(CacheMode())
     val victimWay = Reg(UInt(wayBits bits))
+    // Task P4.3: the victim way's tag/line at the moment the miss/eviction
+    // decision was made -- captured HERE (not re-read at EVICT_WR time) because the
+    // shared read port that produced `rdTag(vw)`/`rdData(vw)` can be repointed at a
+    // different set before EVICT_WR would otherwise get to it (see Finding 1 of
+    // task-P4.3-report.md, folded in here via `pendingVictim*` below for the
+    // store-drain-miss trigger). The dirty BIT itself is not separately latched
+    // here (unlike tag/line) -- the miss-detect site's own `evictThis`/
+    // `pendingVictimDirty` already fully resolves the goto(EVICT_WR)-vs-
+    // goto(REFILL) decision at capture time and there is no later re-check that
+    // would need a stable snapshot of it (no FSM state, once entered, ever
+    // re-reads "was this a dirty victim" -- entering EVICT_WR at all already
+    // encodes that fact).
+    val victimEvictTag  = Reg(UInt(tagBits bits))
+    val victimEvictLine = Reg(Bits(128 bits))
     val arSent    = Reg(Bool()) init False
     // Task #189 (bus error): latched across REFILL->REPLAY — did the AXI read
     // response for this refill come back with a non-OKAY resp (SLVERR/DECERR, e.g.
@@ -158,6 +172,23 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val pendingStorePaddr  = Reg(UInt(32 bits))
     val pendingMergeData   = Reg(Bits(128 bits))
     val pendingMergeStrb   = Reg(Bits(16 bits))
+    // Task P4.3 Finding 1 fix: the victim way/dirty/tag/line for a store-drain-miss
+    // trigger, captured HERE at store-S2 (the SAME cycle `stS2HitVec` reads
+    // `rdTag`/`rdData` for `stS2Set` -- known-valid by construction, same read that
+    // resolved `stS2HitAny=False`) rather than re-derived live at the eventual IDLE
+    // pickup cycle. Re-deriving live is UNSAFE: `pendingStoreMiss` can be held for
+    // many cycles (retried every IDLE cycle "until the refill engine is free"), and
+    // the shared read port can legitimately be repointed at an unrelated set in the
+    // meantime (e.g. REPLAY's own re-launch for a concurrent, unrelated, higher-
+    // priority load miss) -- by pickup time `rdTag`/`rdData` could be reading a
+    // completely different set. Locking the victim *decision* itself here (not just
+    // its dirty/tag/line snapshot) is also strictly better than the old live
+    // `victim(pSet)` re-read: it keeps the eviction writeback and the later
+    // REFILL/REPLAY allocate consistent about which way is being replaced.
+    val pendingVictimWay   = Reg(UInt(wayBits bits))
+    val pendingVictimDirty = Reg(Bool())
+    val pendingVictimTag   = Reg(UInt(tagBits bits))
+    val pendingVictimLine  = Reg(Bits(128 bits))
     val storeAllocAckReg   = Bool(); storeAllocAckReg := False
 
     // Pulled forward from Task P4.5's own Step 1 (a plan-ordering bug: P4.5 declares
@@ -285,6 +316,71 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val stAddrReg  = Reg(UInt(32 bits))
     val stAwDone   = Reg(Bool()) init True   // True == no store in flight
     val stWDone    = Reg(Bool()) init True
+    // Task P4.3 AXI-hazard fix -- REVISION 3, the actual landed design. Two
+    // earlier revisions were tried and BOTH proven unsafe by DcacheSpec's own new
+    // AXI-hazard regression test (recorded here because the failure mode is
+    // subtle enough that a future maintainer must not "simplify" this back to
+    // either one):
+    //   - Revision 1: fully shared stAddrReg/stMergeReg/stStrbReg/stAwDone/
+    //     stWDone, EVICT_WR kickoff gated on store-idle, disambiguated via an AXI
+    //     `id` tag with a "did I get preempted, retry" loop. FAILED: if
+    //     EVICT_WR's AW handshakes before its W (or vice versa) and a store then
+    //     overwrites the shared registers mid-pair, the AXI4 AW/W FIFO-ordering
+    //     rule pairs the wrong address with the wrong data -- a genuine lost/
+    //     misattributed write, not just a benign retry.
+    //   - Revision 2: EVICT_WR given its OWN completion flags
+    //     (`evictAwDone`/`evictWDone`, kept below) and drives axi.aw/axi.w
+    //     directly from its own already-latched payload
+    //     (`victimEvictTag`/`missSet`/`victimEvictLine`), gated OFF whenever
+    //     `storeWantsAxi` (so it never physically contends with the store's own
+    //     unconditional drive). This closes revision 1's register-corruption
+    //     hole but NOT the underlying AXI4 ordering rule: this project's own AXI
+    //     mem model (`AxiWriteEngine.update()`) pairs `aw`/`w` via plain
+    //     per-channel FIFOs with NO per-master awareness -- if EITHER side's `w`
+    //     (or `aw`) completes while ITS OWN matching `aw` (or `w`) is still
+    //     outstanding, and the OTHER side's beat lands in the gap, the model
+    //     pairs the two mismatched entries. Confirmed via a live signal trace
+    //     (a temporary per-cycle aw/w/b valid/ready/id/addr printout, not kept
+    //     in-tree -- see task-P4.3-P4.4-combined-report.md's "AXI-hazard fix:
+    //     three revisions" section for the captured trace): EVICT_WR's `w`
+    //     accepted before its `aw`; the store's `aw` then landed while EVICT's
+    //     `w` was still the oldest unmatched entry -> the STORE's address got
+    //     EVICT's data, and (symmetrically, later) EVICT's address got the
+    //     STORE's data. `storeWantsAxi` protected EVICT_WR from the store's
+    //     open pair, but nothing protected the store from EVICT_WR's own open
+    //     pair -- a one-directional gate on a problem that is symmetric.
+    //   - Revision 3 (landed): the SAME `storeWantsAxi`-style gate, applied in
+    //     BOTH directions. `evictAxiPairOpen` (below) blocks the store-S2
+    //     write-through path's own AW/W KICKOFF (not its array RMW write, not
+    //     its cacheMode branching -- ONLY the AXI leg) for as long as EVICT_WR's
+    //     own aw+w pair is genuinely incomplete, via a `pendingWtKickoff` latch
+    //     (same shape as this file's existing `pendingStoreMiss` "retry every
+    //     cycle until the shared resource is free" idiom). This is a
+    //     deliberate, MINIMAL, BOUNDED exception to "the store side gets zero
+    //     new stall logic": the window is exactly one eviction beat's own AW+W
+    //     round trip (structurally the same shape as store-S1's own existing
+    //     hold-and-retry on read-port contention), not a general busy/refill-
+    //     duration stall, and it is the ONLY way to avoid the cross-attribution
+    //     corruption above given a single shared physical AXI4 write port and
+    //     this model's plain per-channel FIFO pairing -- proven necessary, not
+    //     assumed, by two independently-failed attempts to avoid it.
+    val evictAwDone = Reg(Bool()) init True   // True == no eviction beat in flight
+    val evictWDone  = Reg(Bool()) init True
+    // Does the store-S2 write-through path want (or currently hold) the physical
+    // AXI write channels THIS cycle? Store-S2's own drive below is completely
+    // unconditional on this signal (it never checks it) -- this exists PURELY to
+    // gate EVICT_WR's own drive off, so the two never physically collide.
+    val storeWantsAxi = !stAwDone || !stWDone
+    // The symmetric direction: is EVICT_WR's own aw+w pair currently open (one or
+    // both legs not yet accepted)? Gates the store-S2 write-through path's own
+    // AXI kickoff (see `pendingWtKickoff` at the S2 site and its consumer below).
+    val evictAxiPairOpen = !evictAwDone || !evictWDone
+    // Level-held "still need to actually kick off the AXI aw/w for a write-
+    // through/inhibited drain" latch -- set by store-S2 (one cycle, a pulse)
+    // INSTEAD OF directly setting stAwDone/stWDone False when `evictAxiPairOpen`
+    // holds it off; consumed (retried every cycle) below, exactly mirroring
+    // `pendingStoreMiss`'s existing shape.
+    val pendingWtKickoff = RegInit(False)
 
     // ---- store-S0: PURE payload latch (the cache-boundary flop) ----
     val s0Valid   = RegInit(False)
@@ -339,11 +435,29 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       rdEn  := True
     }
 
+    // ---- Drain-vs-refill same-SET array-write-port interlock (Task P4.4, design
+    // doc "Drain-vs-refill same-set interlock", also folded through EVICT_WR's own
+    // eventual REFILL/REPLAY transition per this combined task) ----
+    // A store drain's S1 tag-read (registers stS1Set) through its S2 write (stS2Set)
+    // is a 2-cycle window during which the store's OWN hit-detect is against a
+    // REGISTERED tag-read. A concurrent load-refill/write-allocate array write into
+    // the SAME set (a DIFFERENT line — same-line overlaps are already covered by the
+    // SQ's own `sameLine` stall, see StoreQueue.scala) landing inside that window
+    // would go unnoticed by the store's stale registered tag-read: S2 would then
+    // merge into a way the refill just re-tagged (write-through: cached-line
+    // corruption; copyback: a lost store — refill-priority silently discards the
+    // store's only write). Hold (delay, NEVER drop) the refill/eviction side's
+    // array write for up to 2 cycles while a same-set store drain is in its S1/S2
+    // window — the store side gets ZERO new stall logic; it is unconditionally
+    // unaffected by this signal.
+    val refillWriteHold = (stS1Valid && (stS1Set === missSet)) || (stS2Valid && (stS2Set === missSet))
+
     // ---- LOAD FSM (OVERRIDES the shared read port with PRIORITY over the store) ----
     val fsm = new StateMachine {
-      val IDLE   = new State with EntryPoint
-      val REFILL = new State
-      val REPLAY = new State
+      val IDLE     = new State with EntryPoint
+      val EVICT_WR = new State
+      val REFILL   = new State
+      val REPLAY   = new State
 
       // In-flight gate: do not accept a new load while one is resolving in S1 (its
       // combinational response is live this same cycle). Single-outstanding on the
@@ -384,17 +498,52 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           // relative to the old async hit-detect is latency-agnostic). A same-
           // cycle load miss takes priority over a pending store-drain miss
           // (mirrors this file's existing load>store read-port precedent).
+          val vw = victim(ldS1Set)
           missPaddr := ldS1Paddr
           missSet   := ldS1Set
           missTag   := ldS1Tag
           missOff   := ldS1Off
           missSize  := ldS1Size
           missCmode := ldS1Cmode
-          victimWay := victim(ldS1Set)
+          victimWay := vw
+          // Task P4.3: capture the victim's dirty/tag/line HERE — the shared read
+          // port was pointed at ldS1Set exactly one cycle ago (the accept cycle
+          // that launched this S1 read; load>store arbitration guarantees nothing
+          // else could have repointed it since, see the arbitration comment
+          // above), so `rdTag(vw)`/`rdData(vw)` are combinationally valid for
+          // ldS1Set right now.
+          //
+          // OWN FINDING (beyond the brief): only an access that will actually
+          // ALLOCATE the way (mirrors REFILL's own `doAllocate` gate just below,
+          // `missCmode =/= INHIBITED`) has a real "victim" worth evicting. An
+          // INHIBITED (MMIO) load ALWAYS reaches this branch (ldS1Cacheable forces
+          // every hit bit low, so INHIBITED never hits by construction) yet never
+          // allocates a way (doAllocate=False in REFILL) — round-robin `victim()`
+          // still returns SOME way here regardless, and on a warm cache that way
+          // will often be dirty. Without this guard EVERY MMIO load whose
+          // round-robin victim happened to be dirty would spuriously kick off a
+          // whole eviction writeback of an UNRELATED, still-resident line through
+          // the shared AXI registers this task also just made shareable with the
+          // store-drain path — for zero benefit (the way is never reallocated,
+          // its dirty bit is never cleared here either). Gating on the SAME
+          // condition REFILL already uses for `doAllocate` keeps "a victim is
+          // chosen" and "a victim is evicted" consistent.
+          val evictThis = dirtys(vw)(ldS1Set) && (ldS1Cmode =/= CacheMode.INHIBITED)
+          victimEvictTag  := rdTag(vw)
+          victimEvictLine := rdData(vw)
           refillReqIsStore := False
           arSent    := False
           busy      := True
-          goto(REFILL)
+          // evictAwDone/evictWDone reset ONLY when actually entering EVICT_WR --
+          // resetting them unconditionally here would strand them at False
+          // forever for every miss that skips straight to REFILL (a clean
+          // victim), permanently blocking every future store's own AXI kickoff
+          // via `evictAxiPairOpen` (a real bug caught by this task's own
+          // baseline DcacheSpec regression run, not by the new hazard test).
+          when(evictThis) {
+            evictAwDone := False; evictWDone := False
+            goto(EVICT_WR)
+          } otherwise { goto(REFILL) }
         } .elsewhen(pendingStoreMiss) {
           // A pending COPYBACK drain-miss (latched at store-S2, Step 2 above) --
           // held and retried every IDLE cycle until the refill engine is free.
@@ -406,12 +555,98 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           missOff   := pendingStorePaddr(offBits - 1 downto 0)
           missSize  := Size.LONG
           missCmode := CacheMode.COPYBACK
-          victimWay := victim(pSet)
+          // Task P4.3 Finding 1 fix: use the victim way/dirty/tag/line LOCKED at
+          // store-S2 time (`pendingVictim*`) instead of re-deriving live here —
+          // see that decl's comment for why a live re-derive is unsafe.
+          victimWay       := pendingVictimWay
+          victimEvictTag  := pendingVictimTag
+          victimEvictLine := pendingVictimLine
           refillReqIsStore := True
           pendingStoreMiss := False
           arSent    := False
           busy      := True
-          goto(REFILL)
+          when(pendingVictimDirty) {
+            evictAwDone := False; evictWDone := False
+            goto(EVICT_WR)
+          } otherwise { goto(REFILL) }
+        }
+      }
+
+      // ---- EVICT_WR: dirty-victim writeback before allocate (Task P4.3) ----
+      //
+      // REVISION HISTORY (recorded because the FIRST attempt here was proven
+      // unsafe by this task's OWN new regression test, not merely superseded by
+      // taste): revision 1 reused the store-S2 write-through's shared AXI
+      // registers (stAddrReg/stMergeReg/stStrbReg/stAwDone/stWDone), gated
+      // EVICT_WR's kickoff on the store machine being idle, and used a distinct
+      // AXI `id` (2 vs. the store's 1) plus a "did I get preempted, retry"
+      // detection loop to stay safe against a LATER unrelated store barging in
+      // mid-transaction. That design has a genuine AXI-PROTOCOL hole: if
+      // EVICT_WR's own AW handshakes (evictAwDone-equivalent true) before its W
+      // does, and a store then (per the mandate: unconditionally, no stall)
+      // overwrites stMergeReg/stWDone with ITS OWN payload before EVICT_WR's W
+      // goes out, the eventual W beat carries the STORE's data but AXI4's
+      // AW/W FIFO-ordering rule pairs it with EVICT_WR's ALREADY-SENT (older,
+      // unmatched) AW — the eviction's target address gets the STORE's data, and
+      // the store's own target address gets NOTHING (its own AW is now the
+      // NEWER, still-unmatched one, waiting on a W that never comes because the
+      // model already consumed the one W beat sent). `DcacheSpec`'s "AXI-hazard
+      // regression... (offset=N)" test caught this directly (an intermittent,
+      // literal "the store's own byte never lands in memory" failure) before
+      // this file was committed. Fixed here in revision 2: EVICT_WR gets its own
+      // completion flags (`evictAwDone`/`evictWDone` above) and drives the
+      // PHYSICAL `axi.aw`/`axi.w` directly from its own ALREADY-LATCHED payload
+      // (`victimEvictTag`/`missSet`/`victimEvictLine` — no new address/data
+      // registers needed, only the two done-flags), gated OFF on any cycle the
+      // store wants the bus (`storeWantsAxi`) so the two NEVER physically
+      // contend for `axi.aw`/`axi.w` on the same cycle — store-S2's own drive
+      // (below) is completely unconditional/untouched, exactly as before this
+      // task; EVICT_WR is the ONLY side that holds and retries. B-response
+      // routing still uses `id` (2 for EVICT_WR, 1 for the store, unchanged) to
+      // tell the two apart when both a store's and an eviction's B could
+      // legitimately be in flight together (the physical AW/W presentation is
+      // now mutually exclusive, but their B acks can still arrive out of order
+      // once both have been accepted) — EVICT_WR simply ignores any B that isn't
+      // tagged id=2 and keeps waiting; it never needs to guess or retry a
+      // kickoff because nothing can now corrupt its own payload registers.
+      EVICT_WR.whenIsActive {
+        busy := True
+        val evictAddr = (victimEvictTag ## missSet ## U(0, offBits bits)).asUInt
+        when(!evictAwDone && !storeWantsAxi) {
+          axi.aw.valid         := True
+          axi.aw.payload.addr  := evictAddr
+          axi.aw.payload.id    := U(2, 4 bits)
+          axi.aw.payload.len   := U(0, 8 bits)
+          axi.aw.payload.size  := U(4, 3 bits)
+          axi.aw.payload.burst := Axi4.burst.INCR
+          when(axi.aw.ready) { evictAwDone := True }
+        }
+        when(!evictWDone && !storeWantsAxi) {
+          axi.w.valid        := True
+          axi.w.payload.data := victimEvictLine
+          axi.w.payload.strb := B(0xFFFF, 16 bits)
+          axi.w.payload.last := True
+          when(axi.w.ready) { evictWDone := True }
+        }
+        when(evictAwDone && evictWDone) {
+          when(axi.b.valid && axi.b.payload.id === U(2, 4 bits)) {
+            when(axi.b.payload.resp =/= Axi4.resp.OKAY) {
+              diagFaultPulse     := True
+              diagFaultPulseAddr := evictAddr
+              diagFaultPulseResp := axi.b.payload.resp.asUInt.resize(2)
+              diagFaultPulseKind := U(2, 3 bits)   // kind=2: dirty-victim eviction writeback
+            }
+            // Task P4.4's `refillWriteHold` (declared above the FSM) does NOT need
+            // to gate THIS transition itself -- EVICT_WR never performs an array
+            // write of its own (only the AXI aw/w writeback above); it is REFILL's
+            // OWN allocate write (entered next, already gated via
+            // `axi.r.ready := !refillWriteHold`) that is the actual array-write
+            // site needing the interlock, and that gate applies regardless of
+            // which state was active immediately before REFILL.
+            goto(REFILL)
+          }
+          // else: either no B this cycle, or it's the store's own (id=1) --
+          // ignore it and keep waiting for OUR OWN id=2 ack.
         }
       }
 
@@ -429,8 +664,16 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           axi.ar.payload.burst := Axi4.burst.INCR
           when(axi.ar.ready) { arSent := True }
         }
-        axi.r.ready := True
-        when(axi.r.valid) {
+        // Task P4.4: hold off ACCEPTING the R beat (rather than accepting it and
+        // then trying to hold the array write separately) while `refillWriteHold`
+        // is asserted — the slave/model simply keeps the beat presented (normal
+        // AXI backpressure) until a same-set store drain's S1/S2 window closes.
+        // This delays (never drops) the eventual allocate write by construction:
+        // `doAllocate`'s wrEn/wrTagEn/valids/dirtys writes below only ever fire on
+        // the SAME cycle the beat is actually accepted (`axi.r.fire`), which by
+        // then is guaranteed `!refillWriteHold`.
+        axi.r.ready := !refillWriteHold
+        when(axi.r.fire) {
           // Task #189: a non-OKAY response (SLVERR/DECERR — genuinely unmapped or
           // erroring physical memory) carries NO real data. Do NOT allocate the
           // line (no valid/tag/data write — matches the existing no-allocate-on-
@@ -485,29 +728,41 @@ class DcachePlugin extends FiberPlugin with DcacheService {
             // again forever — the line is still, correctly, not resident).
             busFaultResp := True
           }
+          goto(IDLE)
         } elsewhen(missCmode === CacheMode.INHIBITED) {
           // Task P1.4: no line was allocated (doAllocate was False above) — there
           // is nothing to "replay" as a hit. Deliver the just-fetched beat
           // directly, once, exactly like busFaultResp's one-pulse shape.
           inhibitedResp := True
+          goto(IDLE)
         } elsewhen(refillReqIsStore) {
-          // Merge the store's bytes into the just-allocated line, mark it dirty, ack
-          // the drain LOCALLY -- entirely off the retire timeline (this is a
-          // post-commit event; the fast-path store retired long ago at SQ-alloc).
-          val curBytes = missLine.subdivideIn(8 bits)
-          val mBytes   = pendingMergeData.subdivideIn(8 bits)
-          val newBytes = Vec(Bits(8 bits), 16)
-          for (i <- 0 until 16) newBytes(i) := Mux(pendingMergeStrb(i), mBytes(i), curBytes(i))
-          for (w <- 0 until ways) when(victimWay === U(w, wayBits bits)) {
-            wrEn(w)   := True
-            wrSet(w)  := missSet
-            wrData(w) := newBytes.asBits
-            dirtys(w)(missSet) := True
+          // Task P4.4: this is an array-write site (write-allocate merge) — hold
+          // here (do NOT goto(IDLE), retry the SAME cycle's work next cycle)
+          // while `refillWriteHold` is asserted, exactly like REFILL's own
+          // allocate write above.
+          when(!refillWriteHold) {
+            // Merge the store's bytes into the just-allocated line, mark it dirty,
+            // ack the drain LOCALLY -- entirely off the retire timeline (this is a
+            // post-commit event; the fast-path store retired long ago at SQ-alloc).
+            val curBytes = missLine.subdivideIn(8 bits)
+            val mBytes   = pendingMergeData.subdivideIn(8 bits)
+            val newBytes = Vec(Bits(8 bits), 16)
+            for (i <- 0 until 16) newBytes(i) := Mux(pendingMergeStrb(i), mBytes(i), curBytes(i))
+            for (w <- 0 until ways) when(victimWay === U(w, wayBits bits)) {
+              wrEn(w)   := True
+              wrSet(w)  := missSet
+              wrData(w) := newBytes.asBits
+              dirtys(w)(missSet) := True
+            }
+            storeAllocAckReg := True
+            goto(IDLE)
           }
-          storeAllocAckReg := True
+          // else: held — stay in REPLAY, retry next cycle (retry-don't-drop).
         } otherwise {
           // Re-launch the read for the just-filled line; resolve as a guaranteed hit
-          // into the response register one cycle later via the ldS1 path.
+          // into the response register one cycle later via the ldS1 path. (No array
+          // WRITE here — just a read relaunch — so `refillWriteHold`, which guards
+          // the write port, does not apply to this branch.)
           rdSet        := missSet
           rdEn         := True
           loadUsesPort := True
@@ -519,8 +774,8 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           ldS1Cmode    := missCmode
           ldS1Fault    := False
           ldS1Paddr    := missPaddr
+          goto(IDLE)
         }
-        goto(IDLE)
       }
     }
 
@@ -602,19 +857,53 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         pendingStorePaddr := stS2Payload.paddr
         pendingMergeData  := mergeData
         pendingMergeStrb  := mergeStrb
+        // Task P4.3 Finding 1 fix: lock the victim way/dirty/tag/line HERE, not at
+        // the eventual IDLE pickup cycle -- see the `pendingVictim*` decl comment.
+        val pVw = victim(stS2Set)
+        pendingVictimWay   := pVw
+        pendingVictimDirty := dirtys(pVw)(stS2Set)
+        pendingVictimTag   := rdTag(pVw)
+        pendingVictimLine  := rdData(pVw)
       } .otherwise {
         // WRITETHROUGH hit/miss (fast path, unchanged from before this task) and
-        // INHIBITED (precise path, unchanged from before this task).
-        stAwDone := False
-        stWDone  := False
+        // INHIBITED (precise path, unchanged from before this task). The payload
+        // (stAddrReg/stMergeReg/stStrbReg, set unconditionally above) is ALWAYS
+        // latched immediately; the actual AXI KICKOFF fires IMMEDIATELY too
+        // (zero added latency, byte-for-byte as before this task) UNLESS
+        // EVICT_WR's own aw+w pair is genuinely still open THIS cycle (Task P4.3
+        // AXI-hazard fix revision 3 -- see `evictAxiPairOpen`'s decl comment),
+        // the rare case a `pendingWtKickoff` latch defers to the first later
+        // cycle it clears.
+        when(!evictAxiPairOpen) {
+          stAwDone := False
+          stWDone  := False
+        } otherwise {
+          pendingWtKickoff := True
+        }
       }
+    }
+
+    // Consume `pendingWtKickoff`: fire the actual stAwDone/stWDone kickoff the
+    // moment EVICT_WR's own aw+w pair is no longer open (immediately, the
+    // overwhelming majority of the time, since `evictAxiPairOpen` is False
+    // whenever no eviction is in flight) -- retried every cycle until then,
+    // mirroring `pendingStoreMiss`'s existing shape.
+    when(pendingWtKickoff && !evictAxiPairOpen) {
+      stAwDone := False
+      stWDone  := False
+      pendingWtKickoff := False
     }
 
     // 1-cycle-later local ack for a COPYBACK hit (design doc: "S2 or the following
     // cycle"). Combined into storeAckReg in Step 4 below.
     val cbHitAckReg = RegNext(stS2Valid && stS2Copyback && stS2HitAny, init = False)
 
-    // AXI write-through driver (single 128-bit beat).
+    // AXI write-through driver (single 128-bit beat) -- the store-S2 write-through
+    // path's OWN, EXCLUSIVE driver, byte-for-byte unchanged from before Task P4.3
+    // (id fixed at 1). EVICT_WR (Task P4.3) never touches these registers or this
+    // driver -- it has its own dedicated completion flags and drives axi.aw/axi.w
+    // directly (see EVICT_WR's own block above), gated off whenever this driver
+    // wants the bus (`storeWantsAxi`), so the two physically never collide.
     when(!stAwDone) {
       axi.aw.valid         := True
       axi.aw.payload.addr  := stAddrReg

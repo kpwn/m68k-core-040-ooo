@@ -225,6 +225,48 @@ class StoreQueueSpec extends AnyFunSuite {
     }
   }
 
+  // Task P4.4 Step 6 (design doc §5 item 6, copyback re-audit -- see the
+  // `sameLine` decl comment in StoreQueue.scala for the full review): `sameLine`
+  // is entirely cache-mode-agnostic (this DUT/queue carries no cacheMode field
+  // consulted by the forward/stall logic at all) -- an older, still-undrained,
+  // SAME-cache-line SQ entry must stall a younger load's query regardless of
+  // what cache mode that store will eventually drain under, exactly as it did
+  // before this task. This directed case names COPYBACK explicitly (allocating
+  // the older entry with cacheMode=COPYBACK) to make that mode-independence
+  // explicit in the regression, rather than relying on the pre-existing
+  // same-line test (which uses the WRITETHROUGH default) to imply it.
+  test("same-line stall still holds an older undrained entry under COPYBACK " +
+       "(Task P4.4 Step 6 copyback re-audit)", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      // An OLDER COPYBACK store at 0x102..0x103 (cache line 0x100..0x10F).
+      alloc(dut, cd, robId = 4, paddr = 0x102, data = 0xBEEFL, Size.WORD,
+        cacheMode = m68k040.cache.CacheMode.COPYBACK)
+      // A younger load at 0x108 -- no BYTE overlap with the store's own range at
+      // all (so it would MISS any byte-forward), but the SAME cache line -- must
+      // still stall (the sameLine refill hazard) regardless of the older store's
+      // cache mode.
+      setQuery(dut, robId = 6, paddr = 0x108, Size.BYTE)
+      cd.waitSampling()
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean, "no byte overlap -> not a forward")
+      assert(dut.io.fwd.rsp.stall.toBoolean,
+        "same-cache-line older COPYBACK entry, still undrained -> must stall")
+      // Drain the store (commit + drain + drainAck) -- the hazard must then clear.
+      commit(dut, cd, robId = 4)
+      cd.waitSampling()
+      assert(dut.io.drain.valid.toBoolean, "committed COPYBACK entry must present for drain")
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      cd.waitSampling(2)
+      setQuery(dut, robId = 6, paddr = 0x108, Size.BYTE)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.stall.toBoolean, "once drained, the same-line hazard must clear")
+      cd.waitSampling(2)
+    }
+  }
+
   test("io.full asserts at depth; a drain frees a slot so a further alloc succeeds", VerilatorTest) {
     M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
       val cd = initDut(dut)

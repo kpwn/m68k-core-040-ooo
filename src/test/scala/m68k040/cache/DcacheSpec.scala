@@ -551,4 +551,201 @@ class DcacheSpec extends AnyFunSuite {
       cd.waitSampling(4)
     }
   }
+
+  // (n) Task P4.3: EVICT_WR -- a dirty COPYBACK victim's line must be written back
+  // to memory BEFORE its way is reallocated by the incoming refill.
+  test("EVICT_WR: a dirty COPYBACK victim is written back before its way is reallocated",
+       VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val SET  = 30L
+      val base = SET * 16L
+      def addrK(k: Long): Long = base + k * 0x800L
+      for (k <- 0L until 5L) preload(mem, addrK(k), 16)
+
+      // Way 0: warm + dirty via a COPYBACK-hit store (design doc's drain-throughput
+      // path -- P4.1).
+      load(dut, cd, addrK(0), Size.LONG, CacheMode.WRITETHROUGH)
+      dut.probe.logic.storeIn.valid #= true
+      dut.probe.logic.storeIn.payload.paddr #= addrK(0) + 4
+      dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
+      dut.probe.logic.storeIn.payload.size #= Size.LONG
+      dut.probe.logic.storeIn.payload.useStrb #= false
+      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+      cd.waitSampling()
+      dut.probe.logic.storeIn.valid #= false
+      cd.waitSamplingWhere(dut.dcache.logic.storeAckReg.toBoolean)
+      cd.waitSampling(2)
+      val setIdx = SET.toInt
+      assert(dut.dcache.logic.dirtys(0)(setIdx).toBoolean, "way 0 must be dirty before the eviction")
+
+      // Ways 1..3: warm, clean -- victim round-robins back to way 0 on the 5th miss.
+      for (k <- 1L until 4L) load(dut, cd, addrK(k), Size.LONG, CacheMode.WRITETHROUGH)
+
+      var arCount = 0
+      var awCount = 0
+      var wCount  = 0
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1
+          if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean) awCount += 1
+          if (dut.dcache.logic.axi.w.valid.toBoolean  && dut.dcache.logic.axi.w.ready.toBoolean)  wCount  += 1
+        }
+      }
+
+      // The 5th distinct line (same set) misses, picks way 0 (dirty) as victim --
+      // must trigger EXACTLY one eviction beat (aw+w) before the new line's own AR.
+      val got = load(dut, cd, addrK(4), Size.LONG, CacheMode.WRITETHROUGH)
+      assert(got == expected(addrK(4), 4), s"the new line loads correctly after eviction: got ${got.toString(16)}")
+      cd.waitSampling(4)
+
+      assert(awCount == 1, s"exactly one eviction AW beat expected: got $awCount")
+      assert(wCount == 1, s"exactly one eviction W beat expected: got $wCount")
+      assert(arCount == 1, s"exactly one AR beat for the new line's own refill: got $arCount")
+
+      // The evicted (dirty) line landed in memory EXACTLY as it was cached --
+      // original preloaded bytes except the CAFEBABE-merged word at +4 (checked
+      // byte-by-byte, matching this file's existing peekByte convention, rather
+      // than via peek128's byte-order which is not otherwise exercised here).
+      for (i <- Seq(0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15))
+        assert(mem.peekByte(addrK(0) + i) == memByte(addrK(0) + i), s"evicted line byte +$i preserved")
+      assert(mem.peekByte(addrK(0) + 4) == 0xCA, "evicted line CAFEBABE byte 0 (+4) landed")
+      assert(mem.peekByte(addrK(0) + 5) == 0xFE, "evicted line CAFEBABE byte 1 (+5) landed")
+      assert(mem.peekByte(addrK(0) + 6) == 0xBA, "evicted line CAFEBABE byte 2 (+6) landed")
+      assert(mem.peekByte(addrK(0) + 7) == 0xBE, "evicted line CAFEBABE byte 3 (+7) landed")
+
+      // The way is now clean (a fresh allocate always clears dirty) and holds the
+      // NEW (addrK(4)) line -- a reload must NOT re-trigger a refill.
+      assert(!dut.dcache.logic.dirtys(0)(setIdx).toBoolean, "way 0 must be clean after reallocation")
+      val beforeAr = arCount
+      val got2 = load(dut, cd, addrK(4), Size.LONG, CacheMode.WRITETHROUGH)
+      assert(got2 == expected(addrK(4), 4), "reload of the new line is a clean hit")
+      assert(arCount == beforeAr, "reload of the new line must NOT trigger a second refill")
+      cd.waitSampling(4)
+    }
+  }
+
+  // (o) Task P4.3: a CLEAN victim (never dirtied) skips straight to REFILL -- no
+  // eviction writeback at all.
+  test("EVICT_WR: a clean victim skips straight to REFILL (no eviction writeback)",
+       VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val SET  = 31L
+      val base = SET * 16L
+      def addrK(k: Long): Long = base + k * 0x800L
+      for (k <- 0L until 5L) preload(mem, addrK(k), 16)
+
+      // All 4 ways warm + CLEAN (plain WRITETHROUGH loads only, never dirtied).
+      for (k <- 0L until 4L) load(dut, cd, addrK(k), Size.LONG, CacheMode.WRITETHROUGH)
+
+      var arCount = 0
+      var awCount = 0
+      var wCount  = 0
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1
+          if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean) awCount += 1
+          if (dut.dcache.logic.axi.w.valid.toBoolean  && dut.dcache.logic.axi.w.ready.toBoolean)  wCount  += 1
+        }
+      }
+
+      val got = load(dut, cd, addrK(4), Size.LONG, CacheMode.WRITETHROUGH)
+      assert(got == expected(addrK(4), 4), s"the new line loads correctly: got ${got.toString(16)}")
+      cd.waitSampling(4)
+
+      assert(awCount == 0, s"a CLEAN victim must issue ZERO eviction AW beats: got $awCount")
+      assert(wCount == 0, s"a CLEAN victim must issue ZERO eviction W beats: got $wCount")
+      assert(arCount == 1, s"exactly one AR beat for the new line's own refill: got $arCount")
+    }
+  }
+
+  // (p) Task P4.3 combined AXI-hazard synthesis: a concurrent ordinary store-S2
+  // write-through and an EVICT_WR dirty-victim writeback, fired close together (a
+  // range of relative offsets, to sweep near the contested cycle without depending
+  // on hitting one exact alignment), must NOT corrupt each other's shared AXI
+  // registers -- both writes must land correctly in memory, and both sides must
+  // eventually complete (storeAck / a correct reload), never silently drop either.
+  for (offset <- 0 to 4) {
+    test(s"AXI-hazard regression: concurrent store-S2 write and EVICT_WR writeback " +
+         s"do not corrupt each other (offset=$offset)", VerilatorTest) {
+      simConfig.compile(new Dut).doSim { dut =>
+        val (cd, mem) = initDut(dut)
+        val SET_A  = 40L
+        val baseA  = SET_A * 16L
+        def addrA(k: Long): Long = baseA + k * 0x800L
+        val SET_B  = 41L
+        val baseB  = SET_B * 16L
+        for (k <- 0L until 5L) preload(mem, addrA(k), 16)
+        preload(mem, baseB, 16)
+
+        // SET_A way 0: warm + dirty via a COPYBACK-hit store.
+        load(dut, cd, addrA(0), Size.LONG, CacheMode.WRITETHROUGH)
+        dut.probe.logic.storeIn.valid #= true
+        dut.probe.logic.storeIn.payload.paddr #= addrA(0) + 4
+        dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
+        dut.probe.logic.storeIn.payload.size #= Size.LONG
+        dut.probe.logic.storeIn.payload.useStrb #= false
+        dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+        cd.waitSampling()
+        dut.probe.logic.storeIn.valid #= false
+        cd.waitSamplingWhere(dut.dcache.logic.storeAckReg.toBoolean)
+        cd.waitSampling(2)
+
+        // SET_A ways 1..3: warm, clean -- victim wraps back to way 0.
+        for (k <- 1L until 4L) load(dut, cd, addrA(k), Size.LONG, CacheMode.WRITETHROUGH)
+
+        // Fire the young load that will trigger EVICT_WR (SET_A, way 0, dirty),
+        // then -- after `offset` cycles -- fire an UNRELATED ordinary WRITETHROUGH
+        // store to SET_B for exactly one cycle. Fire-and-forget both; we only
+        // check the end state (memory content + a clean reload), not exact timing.
+        dut.probe.logic.loadCmdIn.valid #= true
+        dut.probe.logic.loadCmdIn.payload.vaddr #= addrA(4)
+        dut.probe.logic.loadCmdIn.payload.paddr #= addrA(4)
+        dut.probe.logic.loadCmdIn.payload.size  #= Size.LONG
+        dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+        cd.waitSampling(offset)
+        dut.probe.logic.storeIn.valid #= true
+        dut.probe.logic.storeIn.payload.paddr #= baseB
+        dut.probe.logic.storeIn.payload.data #= BigInt("11223344", 16)
+        dut.probe.logic.storeIn.payload.size #= Size.LONG
+        dut.probe.logic.storeIn.payload.useStrb #= false
+        dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+
+        var storePulsed = false
+        for (_ <- 0 until 40) {
+          if (dut.probe.logic.loadCmdIn.ready.toBoolean) dut.probe.logic.loadCmdIn.valid #= false
+          cd.waitSampling()
+          if (!storePulsed) { dut.probe.logic.storeIn.valid #= false; storePulsed = true }
+        }
+        dut.probe.logic.loadCmdIn.valid #= false
+        dut.probe.logic.storeIn.valid   #= false
+        // Generous settle window -- both the eviction beat and the unrelated
+        // store's own beat (each a full AW/W/B handshake, possibly retried under
+        // this task's retry-on-preemption design) must have long since resolved.
+        cd.waitSampling(60)
+
+        // Both writes must have landed, uncorrupted, in memory.
+        assert(mem.peekByte(baseB) == 0x11, "unrelated store's OWN byte 0 must land (not stomped by EVICT_WR)")
+        assert(mem.peekByte(baseB + 1) == 0x22, "unrelated store's OWN byte 1 must land")
+        assert(mem.peekByte(baseB + 2) == 0x33, "unrelated store's OWN byte 2 must land")
+        assert(mem.peekByte(baseB + 3) == 0x44, "unrelated store's OWN byte 3 must land")
+        assert(mem.peekByte(addrA(0) + 4) == 0xCA, "evicted dirty line's CAFEBABE byte 0 must land (not stomped by the store)")
+        assert(mem.peekByte(addrA(0) + 5) == 0xFE, "evicted dirty line's CAFEBABE byte 1 must land")
+        assert(mem.peekByte(addrA(0) + 6) == 0xBA, "evicted dirty line's CAFEBABE byte 2 must land")
+        assert(mem.peekByte(addrA(0) + 7) == 0xBE, "evicted dirty line's CAFEBABE byte 3 must land")
+
+        // The new SET_A line must be resident (correctly refilled, not corrupted
+        // by a preempted/retried eviction) and the reload of SET_B's store target
+        // must observe the store's own value from the cache (uncorrupted hit).
+        val gotA = load(dut, cd, addrA(4), Size.LONG, CacheMode.WRITETHROUGH)
+        assert(gotA == expected(addrA(4), 4), s"new SET_A line correctly refilled: got ${gotA.toString(16)}")
+        val gotB = load(dut, cd, baseB, Size.LONG, CacheMode.WRITETHROUGH)
+        assert(gotB == BigInt("11223344", 16), s"SET_B's stored value correctly cached: got ${gotB.toString(16)}")
+        cd.waitSampling(4)
+      }
+    }
+  }
 }

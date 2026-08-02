@@ -273,6 +273,34 @@ class StoreQueue(depth: Int = 8) extends Component {
     val qLine    = q.paddr(31 downto 4)
     val sameLine = ent && ((lineA === qLine) || (validBs(i) && (lineB === qLine)))
   }
+  // Task P4.4 Step 6 (design doc §5 item 6): re-audit under COPYBACK. This logic
+  // predates copyback and was built for a "a store not yet in MEMORY" window
+  // (write-through: the only point of truth is memory once acked). Under
+  // copyback the CACHE itself becomes the point of truth for a hit. REVIEWED,
+  // CONCLUSION: still conservative-correct, no fix needed -- `sameLine`/`stall`
+  // (the `perEntry`/`fwd.rsp` block above) is entirely mode-agnostic: this file
+  // DOES carry a per-entry `cacheModes` array (used only for `io.drain.payload
+  // .cacheMode`, the drain-side handoff to DcachePlugin), but the forward/stall
+  // compare logic itself never reads it. LsEuPlugin's own load pipeline
+  // (`RESOLVE.whenIsActive`,
+  // `execute/LsEuPlugin.scala`) NEVER lets a load reach the cache's own hit-
+  // detect (`dcache.loadCmd` only fires from the LAUNCH state, only reachable
+  // via RESOLVE's `otherwise` arm) while `fwdStall` is asserted for that load --
+  // i.e. while ANY older, same-line, un-drained SQ entry exists. So by the time
+  // a load's `dcache.loadCmd` actually launches, no older same-line SQ entry can
+  // remain: the cache's own hit-detect (a dirty COPYBACK hit included) is then
+  // authoritative and entirely independent of SQ forwarding, exactly as it was
+  // for a write-through hit before this task. A load that MISSES a copyback
+  // line can only do so because no dirty resident copy exists (same as before);
+  // an older, still-undrained SAME-line SQ entry in that situation is still
+  // caught by this file's existing `sameLine` stall (Task P4.4's own drain-vs-
+  // refill same-set array-write interlock, `DcachePlugin.refillWriteHold`, is
+  // exactly what keeps this reasoning sound now that a refill can race a drain
+  // at the array level -- see that file). Re-run
+  // `StoreQueueSpec -- -z "forward partial-overlap boundary cases"` (the
+  // existing same-line-family test) plus the new
+  // "same-line stall still holds an older undrained entry (copyback-relevant)"
+  // case below -- both green, no RTL change needed here.
   // youngest older overlapping entry: among ALL overlapping matches (full OR
   // partial), the one closest (in ROB age) to the query. ONE reduce tree carrying
   // whether that youngest-overlapping entry is a FULL overlap. A clean forward is
