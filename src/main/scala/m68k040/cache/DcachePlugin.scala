@@ -1075,10 +1075,13 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // -- `storeBAck`, NOT raw `axi.b.valid && axi.b.ready`, since EVICT_WR's own
     // id=2 B response is already correctly excluded from storeAckReg by the id
     // filter and is not structurally a storeAck source at all. Zero synth cost.
+    // Explicit `FAILURE` severity (3-arg form), matching this file's own
+    // convention (see the diagFaultKind0Fires/diagFaultPulse asserts above).
     GenerationFlags.simulation {
       val ackSources = Seq(storeBAck, cbHitAckReg, storeAllocAckReg)
       assert(CountOne(ackSources) <= U(1),
-        "DcachePlugin: more than one storeAck source pulsed the same cycle")
+        "DcachePlugin: more than one storeAck source pulsed the same cycle",
+        FAILURE)
     }
 
     // ---- Task P4.5: async diagnostic-fault channel ----
