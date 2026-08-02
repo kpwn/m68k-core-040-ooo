@@ -875,4 +875,116 @@ class DcacheSpec extends AnyFunSuite {
       }
     }
   }
+
+  // (r) FABLE5 BUG1 REGRESSION: `loadCmdPort.ready` in IDLE must also gate on
+  // `!pendingStoreMiss`. Without that term, a load accepted on the SAME cycle
+  // IDLE's `.elsewhen(pendingStoreMiss)` arm is about to pick up a pending
+  // COPYBACK store-drain miss leaves that load's `ldS1Valid` armed while the FSM
+  // immediately leaves IDLE for REFILL/EVICT_WR to service the store. If that
+  // racing load then MISSES, its miss-handling (`when(ldS1Valid && !ldS1Hit)`,
+  // which only exists inside `IDLE.whenIsActive`) never runs next cycle (the FSM
+  // isn't in IDLE anymore) -- `ldS1Valid` self-clears with no response ever sent
+  // to `loadRsp`, hanging the LS EU's WAIT state forever. (A HIT would still
+  // resolve fine -- `ldS1Resp` is combinational and state-independent -- but
+  // there's no way to know that before accepting, hence the fix defers
+  // acceptance by one cycle instead.)
+  //
+  // Scenario: a COPYBACK store to a COLD line (no prior load) sets
+  // `pendingStoreMiss` (mirrors test (m) above, straight to REFILL -- an empty
+  // cache has nothing dirty to evict). An independent load, targeting a
+  // DIFFERENT cold line (guaranteed MISS, never resident), is driven from its
+  // own fork at a fixed absolute cycle offset from the store's own kickoff --
+  // this file's own established idiom for racing two independently-timed
+  // stimuli (see the (p)/(q) sweeps' doc comments: "present A, wait N, present
+  // B" is NOT reliable for hitting an exact single-cycle window here, because
+  // this harness's fork scheduling resolves a `waitSamplingWhere`-triggered poke
+  // one cycle too late to influence the very edge that made the condition true
+  // -- empirically confirmed while building this test: a condition-triggered
+  // poke on `pendingStoreMiss` consistently missed the race by exactly one
+  // cycle, landing after the FSM had already left IDLE). `LOAD_OFFSET` below was
+  // determined empirically against this store-drain's fixed S0->S1->S2 latency
+  // and is cross-checked below by a fix-independent scenario-sanity assertion
+  // (`loadValidAtRace`) rather than trusted blindly.
+  //
+  // The load's `valid` is held (re-driven every cycle, like the real LS EU's
+  // back-pressure path) until actually accepted, so pre-fix it fires on the SAME
+  // cycle as the race (the bug); post-fix it's deferred to a LATER IDLE cycle
+  // once the store-drain has been serviced -- either way the stimulus looks the
+  // same from outside, only the accept cycle differs.
+  //
+  // A bounded wait (200 cycles, generous slack above a normal store-drain-miss +
+  // load-miss round trip) on `loadRspOut.valid` turns a regression into a clean
+  // test FAILURE (assert false) instead of hanging the whole sbt run.
+  test("racing load MISS on the exact IDLE cycle pendingStoreMiss is picked up must not hang " +
+       "(Fable5 review Bug1 regression)", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val storeBase = 0xC000L   // COPYBACK store target, cold -> triggers pendingStoreMiss
+      val loadBase  = 0xC800L   // racing load target, cold, different set -> guaranteed MISS
+      preload(mem, storeBase, 16)
+      preload(mem, loadBase, 16)
+
+      // Fire the COPYBACK store to the cold line: store-S2 detects a miss and
+      // latches `pendingStoreMiss` (same shape as test (m) above).
+      dut.probe.logic.storeIn.valid #= true
+      dut.probe.logic.storeIn.payload.paddr #= storeBase + 4
+      dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
+      dut.probe.logic.storeIn.payload.size #= Size.LONG
+      dut.probe.logic.storeIn.payload.useStrb #= false
+      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+      cd.waitSampling()
+      dut.probe.logic.storeIn.valid #= false
+
+      // Fix-independent scenario sanity: was `loadCmdIn.valid` actually held
+      // during the SAME cycle `pendingStoreMiss` first became visible True (the
+      // exact cycle IDLE's `.elsewhen(pendingStoreMiss)` arm evaluates it)? This
+      // is true regardless of the fix (the load's `valid` is asserted starting
+      // `LOAD_OFFSET` and held for several cycles spanning the race window
+      // either way) -- it only proves the STIMULUS reached the intended window,
+      // not that the bug was hit. Guards against a future latency change
+      // silently turning this into a vacuous pass.
+      var loadValidAtRace = false
+      fork {
+        var seenPending = false
+        while (!seenPending) {
+          cd.waitSampling()
+          if (dut.dcache.logic.pendingStoreMiss.toBoolean) {
+            seenPending = true
+            loadValidAtRace = dut.probe.logic.loadCmdIn.valid.toBoolean
+          }
+        }
+      }
+
+      // Race the independent load in from its own fork, at the empirically-
+      // determined fixed offset (see doc comment above).
+      val LOAD_OFFSET = 3
+      fork {
+        cd.waitSampling(LOAD_OFFSET)
+        dut.probe.logic.loadCmdIn.valid #= true
+        dut.probe.logic.loadCmdIn.payload.vaddr #= loadBase
+        dut.probe.logic.loadCmdIn.payload.paddr #= loadBase
+        dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+        dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+        cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.ready.toBoolean &&
+                              dut.probe.logic.loadCmdIn.valid.toBoolean)
+        dut.probe.logic.loadCmdIn.valid #= false
+      }
+
+      var cyc       = 0
+      var responded = false
+      while (!responded && cyc < 200) {
+        cd.waitSampling()
+        cyc += 1
+        if (dut.probe.logic.loadRspOut.valid.toBoolean) responded = true
+      }
+      assert(loadValidAtRace,
+        "scenario sanity: the racing load's `valid` must be held during the exact cycle " +
+        "`pendingStoreMiss` first becomes visible True -- LOAD_OFFSET may need retuning")
+      assert(responded,
+        s"racing load never completed within $cyc cycles -- Fable5 Bug1 regression (LS EU hang)")
+      val got = dut.probe.logic.loadRspOut.payload.data.toBigInt
+      assert(got == expected(loadBase, 4), s"racing load must return correct data: got ${got.toString(16)}")
+      cd.waitSampling(4)
+    }
+  }
 }

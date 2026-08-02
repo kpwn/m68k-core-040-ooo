@@ -171,6 +171,9 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // existing load>store read-port precedent) -- the pending request simply stays
     // latched and is retried every IDLE cycle.
     val pendingStoreMiss   = RegInit(False)
+    pendingStoreMiss.simPublic()   // test-visibility only (Fable5 Bug1 regression test:
+    // times a racing load to land exactly on the IDLE cycle this is picked up).
+    // No-op for synthesis.
     val pendingStorePaddr  = Reg(UInt(32 bits))
     val pendingMergeData   = Reg(Bits(128 bits))
     val pendingMergeStrb   = Reg(Bits(16 bits))
@@ -568,7 +571,14 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         // identity). On a DTLB miss `rsp.ready` is False while the walker runs, so
         // the load is not accepted and the LS EU stays on its existing single-
         // outstanding back-pressure path (re-driving loadCmd.valid) until it hits.
-        loadCmdPort.ready := !inFlight && xlate.rsp.ready
+        // Also held off while a store-drain miss is about to be picked up this same
+        // cycle (the `elsewhen(pendingStoreMiss)` arm below): if a load were
+        // accepted here too, next cycle the FSM is servicing the store in REFILL
+        // and a load MISS has no handler (the miss-latch block above only runs
+        // inside IDLE.whenIsActive) -- `ldS1Valid` would self-clear with no
+        // response ever sent, hanging the LS EU forever. A load HIT would still
+        // resolve fine, but there's no way to know that before accepting.
+        loadCmdPort.ready := !inFlight && xlate.rsp.ready && !pendingStoreMiss
         when(loadCmdPort.fire) {
           // Launch the BRAM tag+data read for this set; resolve hit/miss in S1.
           rdSet        := cmdSet
