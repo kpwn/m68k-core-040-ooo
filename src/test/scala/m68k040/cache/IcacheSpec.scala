@@ -422,4 +422,120 @@ class IcacheSpec extends AnyFunSuite {
       cd.waitSampling(4)
     }
   }
+
+  // (I-i) CRITICAL regression (review of 69a867c, "icache: wire xlate.rsp.cacheMode
+  // into IcachePlugin"): that commit correctly gated tagMem/valids/victim-advance
+  // under doAllocate for an INHIBITED-mode miss, but left the ACTUAL dataMem write
+  // (REFILL) and predMem write (PREDECODE) unconditional. The round-robin `victim`
+  // pointer is the SAME pointer used by cacheable and INHIBITED misses alike: once a
+  // set has taken >=4 real allocations it wraps back onto a way that is CURRENTLY
+  // VALID/resident for some OTHER address. An unconditional write there silently
+  // corrupts that other way's data/pred while its tag/valid stay untouched -- still
+  // claiming the OLD address is validly resident -- so a later ordinary fetch to
+  // that address would silently return the WRONG bytes/predecode.
+  //
+  // This test forces exactly that scenario: warm all 4 ways of set 0 with distinct
+  // cacheable lines (the round-robin victim pointer wraps back to way 0 after the
+  // 4th fill), then trigger an INHIBITED-mode miss at a DIFFERENT address that maps
+  // to the SAME set index (aliasing onto victimWay=0, way 0's resident way). Way 0's
+  // raw dataMem/predMem/tagMem/valid content must be byte-for-byte UNCHANGED
+  // afterward -- not just that the inhibited fetch itself returned the right data,
+  // but that the OTHER, unrelated way was left completely alone -- and a plain
+  // re-fetch of the original way-0 address must still HIT (no new AR) with correct
+  // data. FAILS against the pre-fix (69a867c) code; PASSES after the fix.
+  test("INHIBITED miss aliasing the round-robin victim pointer must not corrupt the resident way", VerilatorTest) {
+    simConfig.compile(new Dut(new ICacheModeTranslationPlugin)).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      val (_, sparse) = IcacheSim.attachMemoryMutable(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+
+      // IcacheSim's default `memByte(addr) = (addr*7+0x11)&0xff` pattern is
+      // PERIODIC with period 256: for any two line-aligned addresses that share
+      // the same set index, addr mod 256 is ALWAYS 0 (the offset bits [5:0] are 0
+      // by line-alignment and the set-index bits [11:6] -- which fully determine
+      // the rest of addr mod 256 alongside the offset -- are, by construction,
+      // identical between any two same-set addresses). So EVERY line-aligned
+      // address in the same set reads back byte-IDENTICAL content under the
+      // default pattern, which would make a raw dataMem/predMem content
+      // comparison unable to distinguish "way 0 kept its original content" from
+      // "way 0 was silently overwritten with a byte-identical INHIBITED line" --
+      // masking the exact corruption this test exists to catch. Override each
+      // tested line with a distinct, address-tagged constant byte pattern instead.
+      def fillLine(addr: Long, byte: Int): Unit =
+        (0 until 64).foreach(o => sparse.write(addr + o, byte.toByte))
+      def lineWindow64(byte: Int): BigInt =
+        (0 until 8).foldLeft(BigInt(0)) { (acc, i) => acc | (BigInt(byte & 0xff) << (8 * i)) }
+
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      clearCmodeOverride(dut)
+      cd.waitSampling(2)
+      pulseInvalidateAll(dut, cd)
+
+      var arCount = 0
+      fork { while (true) { cd.waitSampling()
+        if (dut.icache.logic.axi.ar.valid.toBoolean && dut.icache.logic.axi.ar.ready.toBoolean) arCount += 1 } }
+
+      // 4 distinct tags, SAME set index (bits[11:6]=0), stride 0x1000 (mirrors the
+      // existing round-robin eviction test) -- warms ways 0,1,2,3 in order, leaving
+      // the round-robin victim pointer for set 0 wrapped back to way 0. Each line
+      // is filled with a unique byte (0x10+i repeated across all 64 bytes).
+      val addrs = (0 until 4).map(i => i.toLong * 0x1000L)
+      addrs.zipWithIndex.foreach { case (a, i) => fillLine(a, 0x10 + i) }
+      val inhibitedBase = 0x4000L
+      fillLine(inhibitedBase, 0x14)   // distinct from all 4 warm lines (0x10..0x13)
+
+      addrs.zipWithIndex.foreach { case (a, i) =>
+        val got = fetch(dut, cd, a)
+        assert(got == lineWindow64(0x10 + i), s"warm fetch at 0x${a.toHexString} data mismatch")
+      }
+      val arAfterWarm = arCount
+      assert(arAfterWarm == 4, s"4 distinct-tag warm fetches must each refill once: $arAfterWarm")
+
+      // Snapshot way 0's raw array content BEFORE the INHIBITED miss. Set index 0:
+      // dataMem address = set*beatsPerLine + beat (0 and 1); tagMem/predMem address
+      // = set (0).
+      val way0DataBefore  = Seq(0, 1).map(b => dut.icache.logic.dataMem(0).getBigInt(b))
+      val way0TagBefore   = dut.icache.logic.tagMem(0).getBigInt(0)
+      val way0PredBefore  = dut.icache.logic.predMem(0).getBigInt(0)
+      val way0ValidBefore = dut.icache.logic.valids(0)(0).toBoolean
+      assert(way0ValidBefore, "way 0 must be resident/valid after the warm fetches")
+
+      // Trigger an INHIBITED-mode miss to a DIFFERENT address that maps to the SAME
+      // set (low 12 bits still 0 -> set index 0), aliasing onto victimWay=0.
+      setInhibited(dut, inhibitedBase >> 12)
+      val gotInhibited = fetch(dut, cd, inhibitedBase)
+      assert(gotInhibited == lineWindow64(0x14),
+        "inhibited fetch itself must still return correct (distinguishable) data")
+      val arAfterInhibited = arCount
+      assert(arAfterInhibited == arAfterWarm + 1, s"inhibited fetch must refill once: $arAfterWarm -> $arAfterInhibited")
+
+      // THE regression check: way 0's raw array content must be COMPLETELY UNCHANGED.
+      val way0DataAfter  = Seq(0, 1).map(b => dut.icache.logic.dataMem(0).getBigInt(b))
+      val way0TagAfter   = dut.icache.logic.tagMem(0).getBigInt(0)
+      val way0PredAfter  = dut.icache.logic.predMem(0).getBigInt(0)
+      val way0ValidAfter = dut.icache.logic.valids(0)(0).toBoolean
+
+      assert(way0DataAfter == way0DataBefore,
+        s"way 0 dataMem CORRUPTED by an unrelated INHIBITED miss: before=$way0DataBefore after=$way0DataAfter")
+      assert(way0TagAfter == way0TagBefore,
+        s"way 0 tagMem changed: before=0x${way0TagBefore.toString(16)} after=0x${way0TagAfter.toString(16)}")
+      assert(way0PredAfter == way0PredBefore,
+        s"way 0 predMem CORRUPTED by an unrelated INHIBITED miss: before=0x${way0PredBefore.toString(16)} after=0x${way0PredAfter.toString(16)}")
+      assert(way0ValidAfter == way0ValidBefore, "way 0 valid bit must be unaffected by the INHIBITED miss")
+
+      // Extra correctness check: a plain re-fetch of the ORIGINAL way-0 address must
+      // still HIT (no new AR) and return the correct, unpoisoned data.
+      clearCmodeOverride(dut)
+      val arBeforeRefetch = arCount
+      val got0 = fetch(dut, cd, addrs(0))
+      assert(got0 == lineWindow64(0x10),
+        s"way-0 address must still return correct (unpoisoned) data after the INHIBITED alias: got 0x${got0.toString(16)}")
+      assert(arCount == arBeforeRefetch,
+        s"way-0 address must still HIT (no new AR): $arBeforeRefetch -> $arCount")
+
+      cd.waitSampling(4)
+    }
+  }
 }

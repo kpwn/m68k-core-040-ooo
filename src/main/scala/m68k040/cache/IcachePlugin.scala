@@ -3,6 +3,7 @@ package m68k040.cache
 import m68k040.services.{FetchService, TranslationService, PrivilegeService}
 import m68k040.frontend.PredecodeWord
 import spinal.core._
+import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.bus.amba4.axi.{Axi4Config, Axi4ReadOnly, Axi4}
 import spinal.lib.fsm._
@@ -76,6 +77,13 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // Round-robin victim pointer per set
     val victim  = Vec.fill(sets)(RegInit(U(0, wayBits bits)))
 
+    // DEBUG (icache-corruption-fix task, temporary — mirrors DcachePlugin's
+    // ldS1Valid/stS2Valid.simPublic() DEBUG hooks): exposes the raw shared arrays
+    // for a directed test to assert an UNRELATED way's tag/data/pred content is
+    // byte-for-byte unchanged by a same-set INHIBITED miss. No-op for synthesis.
+    for (w <- 0 until ways) { tagMem(w).simPublic(); predMem(w).simPublic(); dataMem(w).simPublic() }
+    valids.simPublic()
+
     // ---- invalidateAll: priority clear of all valid bits ----
     when(invalidateAll) {
       for (w <- 0 until ways; s <- 0 until sets) valids(w)(s) := False
@@ -131,6 +139,24 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // — see the REFILL->FAULT transition below) and the fault is delivered via the
     // new FAULT state, mirroring DcachePlugin's missFault/busFaultResp (task #189).
     val missBusFault = Reg(Bool()) init False
+    // Task icache-corruption-fix (review of 69a867c, "icache: wire xlate.rsp.cacheMode
+    // into IcachePlugin"): that commit correctly gated tagMem/valids/victim-advance
+    // under doAllocate for an INHIBITED-mode miss, but left the ACTUAL dataMem/predMem
+    // writes to the shared per-way arrays unconditional. The round-robin `victim`
+    // pointer is the SAME pointer used by cacheable and INHIBITED misses alike — once
+    // a set has taken >=4 real allocations it cycles back onto a way that is still
+    // VALID and resident for some other, unrelated address. An unconditional write
+    // there silently corrupts that other way's data/pred while its tag/valid stay
+    // untouched (still claiming the OLD address is validly resident) -> the next
+    // ordinary fetch to that address silently returns the WRONG bytes. Fix mirrors
+    // DcachePlugin's `missLine`/`inhibitedResp` direct-delivery pattern exactly:
+    // dataMem's write is now gated (REFILL, below) and `lineReg` (already latched
+    // UNCONDITIONALLY every REFILL beat) doubles as the data-side direct-delivery
+    // source; `missPred` is the NEW predecode-side counterpart, latched UNCONDITIONALLY
+    // in PREDECODE below so REPLAY can deliver an INHIBITED line's predecode straight
+    // from this register, entirely bypassing the (for that case, never-written) predMem
+    // array.
+    val missPred = Reg(Bits(PRED_BITS_PER_LINE bits))
 
     // ---- shared data-array read port (synchronous; BRAM) ----
     // Address+enable are driven by the FSM (IDLE hit accept, or REPLAY). The
@@ -161,6 +187,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // s1Pred). A fault placeholder registers all-zero entries (windowPred of zero = a
     // zeroed predecode, matching the old getZero placeholder).
     val s1PredEntries = Reg(Vec(Bits(PRED_BITS_PER_LINE bits), ways))
+    // Task icache-corruption-fix: True only for a REPLAY of a non-allocated
+    // (INHIBITED-mode) miss — routes the S1->rsp mux below to deliver straight from
+    // the `lineReg`/`missPred` bypass registers instead of `dataBeat`/`s1PredEntries`
+    // (the shared arrays, which were never written for that case). Explicitly set at
+    // EVERY s1Valid-arming site (mirrors s1Fault/s1Atc), never left to a stale value.
+    val s1FromMiss = Reg(Bool())
     s1Valid := False   // default each cycle; armed in IDLE-hit / REPLAY below
 
     // ---- rsp output register stage ----
@@ -188,9 +220,16 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // Way-mux the registered raw beats/pred by s1Way, then window-decode — all off
     // REGISTERED state (s1Way/s1Lane/s1Pc), so neither the data nor the pred select
     // is in the IDLE hit cone.
-    val s1Beat   = dataBeat(s1Way)
+    // Task icache-corruption-fix: bypass mux — for a REPLAY of a non-allocated
+    // (INHIBITED) miss (s1FromMiss), deliver directly from the miss-latch registers
+    // (mirrors DcachePlugin's inhibitedResp/missLine) instead of the shared arrays,
+    // which were never written for that line. `lineReg` is 2 beats (512b); select
+    // the same half REPLAY's array-based `replayBeatSel` would have (s1Pc(5), s1Pc
+    // already holds missPC here).
+    val missDataBeat = Mux(s1Pc(5), lineReg(511 downto 256), lineReg(255 downto 0))
+    val s1Beat   = Mux(s1FromMiss, missDataBeat, dataBeat(s1Way))
     val s1Window = s1Beat.subdivideIn(64 bits)(s1Lane)
-    val s1PredW  = windowPred(s1PredEntries(s1Way), s1Pc)
+    val s1PredW  = Mux(s1FromMiss, windowPred(missPred, s1Pc), windowPred(s1PredEntries(s1Way), s1Pc))
     rspValidReg := s1Valid
     rspPcReg    := s1Pc
     rspDataReg  := s1Window
@@ -305,6 +344,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
             s1Atc   := True   // ITLB/MMU-detected (task #211)
             s1Lane  := idleLaneIdx
             s1PredEntries := Vec.fill(ways)(B(0, PRED_BITS_PER_LINE bits))
+            s1FromMiss := False
           } elsewhen(isHit) {
             // Hit: the data BRAM read is already armed above; latch the S1 control.
             s1Valid := True
@@ -314,6 +354,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
             s1Atc   := False
             s1Lane  := idleLaneIdx
             s1PredEntries := idlePredEntry
+            s1FromMiss := False
           } otherwise {
             missPC    := idlePc
             missSet   := idleSet
@@ -365,17 +406,37 @@ class IcachePlugin extends FiberPlugin with FetchService {
         when(axi.r.valid) {
           // Task #211: a non-OKAY response (SLVERR/DECERR — genuinely unmapped or
           // erroring physical memory) on EITHER beat of this 2-beat line burst means
-          // there is no real data to cache. Still absorb the beat (dataMem/lineReg
-          // writes are harmless — the line's valid bit is never set on this path, so
-          // it can never be read back as a hit), but latch the error so the FSM
-          // routes to FAULT instead of PREDECODE once the burst completes (mirrors
-          // DcachePlugin's REFILL respErr handling, task #189).
+          // there is no real data to cache. Still absorb the beat into `lineReg`
+          // (UNCONDITIONAL — see below), but latch the error so the FSM routes to
+          // FAULT instead of PREDECODE once the burst completes (mirrors
+          // DcachePlugin's REFILL respErr handling, task #189). NOTE (updated by the
+          // icache-corruption-fix task): the ORIGINAL #211 comment here claimed the
+          // dataMem write was "harmless — the line's valid bit is never set on this
+          // path, so it can never be read back as a hit" — that reasoning was WRONG
+          // whenever the round-robin victim pointer aliases onto a way that IS valid
+          // for some other address (see `refillAllocate` below, which now actually
+          // gates the write instead of relying on that argument).
           val respErr = axi.r.payload.resp =/= Axi4.resp.OKAY
           when(respErr) { missBusFault := True }
+          // Task icache-corruption-fix: this beat's dataMem write is now gated the
+          // SAME way PREDECODE gates tagMem/valids/predMem (see doAllocate below) —
+          // an unconditional write here was the primary bug (review of 69a867c). Also
+          // folds in the pre-existing, structurally identical bus-fault-miss risk
+          // (task #211's `missBusFault`/`respErr` write was unconditional too): a
+          // beat that itself errored, or follows an earlier errored beat in the same
+          // 2-beat burst, must not touch the array either — that refill routes to
+          // FAULT (never allocates; see below), so writing dataMem for it shares the
+          // exact same "unrelated valid way silently corrupted" shape this task
+          // fixes. `lineReg` below stays UNCONDITIONAL (the direct-delivery source,
+          // mirrors DcachePlugin's `missLine`) so PREDECODE/REPLAY always have the
+          // real fetched bytes regardless of whether this beat gets allocated.
+          val refillAllocate = missCacheable && !missBusFault && !respErr
           val writeAddr = (missSet ## beatCnt).asUInt
-          for (w <- 0 until ways) {
-            when(victimWay === U(w, wayBits bits)) {
-              dataMem(w).write(writeAddr, axi.r.payload.data)
+          when(refillAllocate) {
+            for (w <- 0 until ways) {
+              when(victimWay === U(w, wayBits bits)) {
+                dataMem(w).write(writeAddr, axi.r.payload.data)
+              }
             }
           }
           when(beatCnt === U(0, 1 bits)) {
@@ -404,6 +465,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
         s1Atc   := False   // physical bus error, not ATC/MMU-detected
         s1Lane  := missPC(4 downto 3)
         s1PredEntries := Vec.fill(ways)(B(0, PRED_BITS_PER_LINE bits))
+        s1FromMiss := False
         goto(IDLE)
       }
 
@@ -454,18 +516,24 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // Task (I-side cacheMode wiring, mirrors DcachePlugin task P1.4): an
         // INHIBITED-mode fetch never allocates a line — no tag/valid write, no
         // victim-pointer advance (this way is not consumed; the same victim way is
-        // tried again on the NEXT real allocation to this set). predMem/dataMem are
-        // still written unconditionally (dataMem already was, in REFILL above) so
-        // REPLAY can deliver the just-fetched data + predecode directly — that
-        // delivery never goes through the hit/valid path, so leaving the array
-        // entries written-but-unclaimed is harmless (mirrors the D-side's
-        // missLine/inhibitedResp direct-delivery shape, adapted to this file's
-        // already-separated data-write (REFILL) / tag-claim (PREDECODE) stages).
+        // tried again on the NEXT real allocation to this set).
+        //
+        // Task icache-corruption-fix (review of 69a867c): predMem's write is now
+        // ALSO gated under doAllocate (it previously was NOT — the primary bug this
+        // task fixes: the shared per-way array can alias onto a way that is still
+        // VALID/resident for some other address via the round-robin victim pointer,
+        // and an unconditional write there silently corrupts that other way's
+        // predecode while its tag/valid stay untouched). `missPred` latches `packed`
+        // UNCONDITIONALLY below (mirrors DcachePlugin's `missLine`) so REPLAY can
+        // still deliver an INHIBITED line's predecode directly, entirely bypassing
+        // the (for that case, never-written) predMem array — see the S1->rsp bypass
+        // mux (`s1FromMiss`) above and REPLAY below.
         val doAllocate = missCacheable
+        missPred := packed
         for (w <- 0 until ways) {
           when(victimWay === U(w, wayBits bits)) {
-            predMem(w).write(missSet, packed)
             when(doAllocate) {
+              predMem(w).write(missSet, packed)
               tagMem(w).write(missSet, missTag)
               valids(w)(missSet) := True
             }
@@ -496,7 +564,16 @@ class IcachePlugin extends FiberPlugin with FetchService {
         s1Fault := False
         s1Atc   := False
         s1Lane  := missPC(4 downto 3)
+        // Task icache-corruption-fix: `replayPredEntry`/`dataBeat` (armed via
+        // dataReadAddr/dataReadEn above) only hold meaningful content when the line
+        // was actually allocated (missCacheable) — for a non-allocated (INHIBITED)
+        // miss neither array was written THIS refill and may still hold stale,
+        // unrelated content left by a prior allocation to this same way/set.
+        // `s1FromMiss` routes the S1->rsp mux to the `lineReg`/`missPred` bypass
+        // registers instead for that case, so latching these array reads regardless
+        // is harmless (simply unused).
         s1PredEntries := replayPredEntry
+        s1FromMiss := !missCacheable
 
         goto(IDLE)
       }
