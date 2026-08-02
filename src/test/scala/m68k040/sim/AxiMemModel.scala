@@ -432,6 +432,18 @@ class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
   private val liveAwIds = mutable.Set[Int]()
   private var qPending = 0
 
+  // Task P4.7: a ONE-SHOT non-OKAY (DECERR) response for the NEXT beat whose target
+  // address matches exactly, independent of `AxiMemModel.decoded`. Needed for
+  // eviction-writeback fault injection: the SAME physical address must succeed on an
+  // earlier READ (the line's original load/warm, which must land resident+dirty for
+  // there to be anything to evict) and then fail on a LATER WRITE (its own eviction) --
+  // a purely address-decode-based split (`injectBusErrors`) can never produce that,
+  // since `decoded(addr)` is a pure function of the address and applies identically to
+  // both directions. Mirrors `IcacheSim.scala`'s `BeatFaultAxiResponder.armBeatFault`
+  // rationale for the read side, ported here to the write-completion (B) side.
+  private var armedWriteFault: Option[Long] = None
+  def armWriteFault(addr: Long): Unit = armedWriteFault = Some(addr)
+
   private def bytesPerBeat = busConfig.dataWidth / 8
 
   private def applyBeat(st: AwState, data: BigInt, strb: BigInt, bad: Boolean): Unit = {
@@ -456,7 +468,9 @@ class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
       checker.onWBeat(st.id, wlast, isLast, strb, bytesPerBeat, clk.now)
       val bpb  = 1 << st.size
       val base = (st.burst match { case 1 => st.addr + BigInt(bpb) * st.beat; case _ => st.addr }).toLong
-      val bad  = cfg.injectBusErrors && !AxiMemModel.decoded(base)
+      val armedBad = armedWriteFault.contains(base)
+      if (armedBad) armedWriteFault = None   // one-shot: consumed on match
+      val bad  = (cfg.injectBusErrors && !AxiMemModel.decoded(base)) || armedBad
       applyBeat(st, data, strb, bad)
       stats.wBeats += 1
       if (isLast) {
@@ -532,6 +546,11 @@ class AxiMemModel private (busConfig: Axi4Config, cd: ClockDomain,
     for (i <- 0 until 16) pokeByte(addr + i, ((data >> (8 * i)) & 0xff).toInt)
   def peek128(addr: Long): BigInt =
     (0 until 16).foldLeft(BigInt(0)) { (acc, i) => acc | (BigInt(peekByte(addr + i)) << (8 * i)) }
+
+  /** Task P4.7: see `AxiWriteEngine.armWriteFault` -- forces the NEXT write beat that
+    * targets `addr` exactly to DECERR, independent of `decoded(addr)`. Only valid on a
+    * model attached via `attachFull` (a read-only attachment has no write engine). */
+  def armWriteFault(addr: Long): Unit = writeEngine.armWriteFault(addr)
 }
 
 object AxiMemModel {

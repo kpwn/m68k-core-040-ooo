@@ -1097,4 +1097,159 @@ class DcacheSpec extends AnyFunSuite {
       cd.waitSampling(4)
     }
   }
+
+  // ── Task P4.7: eviction-writeback diagnostic fault (kind=2) ────────────────────
+  // (t) The third diagFault site: a non-OKAY response on a dirty-victim eviction's
+  // OWN AXI B (EVICT_WR, `DcachePlugin.scala` ~L746-752) also sticky-latches this
+  // task's async diagFault channel. Unlike kind=0/kind=1 above, a plain undecoded
+  // target address is NOT enough here: the eviction's own AW/W target is the
+  // VICTIM'S OLD line address -- the SAME address that must have already succeeded
+  // on an EARLIER read (the line's original load/warm; there is nothing to evict
+  // otherwise). `AxiMemModel.decoded` is a pure function of the address, so a
+  // decode-based split can never make one direction succeed and the other fail for
+  // the same address. This test instead uses the new one-shot
+  // `BehavioralMemAgent.armWriteFault` hook (`AxiMemModel.scala`, added for this
+  // task, mirrors `IcacheSim.scala`'s `BeatFaultAxiResponder.armBeatFault` rationale
+  // for the read side): everything through the dirty warm-up is a plain,
+  // error-free `initDut` run (same recipe as the "EVICT_WR: a dirty COPYBACK
+  // victim..." test above), and only the SPECIFIC eviction beat (targeting the
+  // victim's own old line address) is armed to DECERR right before the evicting
+  // load is issued.
+  test("a non-OKAY eviction-writeback response (kind=2) sticky-latches diagFault and never raises an architectural fault",
+       VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val SET  = 60L
+      val base = SET * 16L
+      def addrK(k: Long): Long = base + k * 0x800L
+      for (k <- 0L until 5L) preload(mem, addrK(k), 16)
+
+      // Way 0: warm + dirty via a COPYBACK-hit store (same recipe as the "EVICT_WR:
+      // a dirty COPYBACK victim..." test above).
+      load(dut, cd, addrK(0), Size.LONG, CacheMode.WRITETHROUGH)
+      dut.probe.logic.storeIn.valid #= true
+      dut.probe.logic.storeIn.payload.paddr #= addrK(0) + 4
+      dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
+      dut.probe.logic.storeIn.payload.size #= Size.LONG
+      dut.probe.logic.storeIn.payload.useStrb #= false
+      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+      cd.waitSampling()
+      dut.probe.logic.storeIn.valid #= false
+      cd.waitSamplingWhere(dut.dcache.logic.storeAckReg.toBoolean)
+      cd.waitSampling(2)
+      val setIdx = SET.toInt
+      assert(dut.dcache.logic.dirtys(0)(setIdx).toBoolean, "way 0 must be dirty before the eviction")
+
+      // Ways 1..3: warm, clean -- victim round-robins back to way 0 on the 5th miss.
+      for (k <- 1L until 4L) load(dut, cd, addrK(k), Size.LONG, CacheMode.WRITETHROUGH)
+
+      // This test intentionally triggers the async diagFault path -- opt in first
+      // (else the sim-side assert in DcachePlugin's own GenerationFlags.simulation
+      // block fires fatally), same contract as the kind=0/kind=1 tests above. Then
+      // arm the ONE beat that must fail: the victim's own OLD line address (exactly
+      // the address EVICT_WR's `evictAddr` computes -- `victimEvictTag ## missSet ##
+      // 0` -- which for this already-line-aligned `addrK(0)` is `addrK(0)` itself).
+      dut.dcache.logic.diagFaultExpected #= true
+      mem.armWriteFault(addrK(0))
+
+      var arCount = 0
+      var awCount = 0
+      var wCount  = 0
+      var faulted = false
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1
+          if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean) awCount += 1
+          if (dut.dcache.logic.axi.w.valid.toBoolean  && dut.dcache.logic.axi.w.ready.toBoolean)  wCount  += 1
+          if (dut.dcache.logic.busFaultResp.toBoolean) faulted = true
+        }
+      }
+
+      // The 5th distinct line (same set) misses, picks way 0 (dirty) as victim --
+      // EVICT_WR fires its one aw+w beat, whose B now DECERRs (armed above), then
+      // proceeds to REFILL the new line exactly as if nothing had gone wrong (kind=2
+      // is diagnostic-only, never architectural/precise, per the design doc).
+      val got = load(dut, cd, addrK(4), Size.LONG, CacheMode.WRITETHROUGH)
+      assert(got == expected(addrK(4), 4),
+        s"the new line must still load correctly despite the eviction's own error: got ${got.toString(16)}")
+      cd.waitSampling(4)
+
+      assert(!faulted, "a non-OKAY EVICTION response must never raise busFaultResp (diagnostic-only, never architectural)")
+      assert(awCount == 1, s"exactly one eviction AW beat expected: got $awCount")
+      assert(wCount == 1, s"exactly one eviction W beat expected: got $wCount")
+      assert(arCount == 1, s"exactly one AR beat for the new line's own (unrelated, clean) refill: got $arCount")
+
+      // The armed fault genuinely took effect at the AXI-model level (not just a
+      // flag poke): the evicted line's own CAFEBABE-merged bytes must NOT have
+      // landed in memory (contrast with the "EVICT_WR: a dirty COPYBACK victim..."
+      // test above, where they DO land -- this is the differentiator proving the
+      // write really errored instead of the assertion below being vacuous).
+      assert(mem.peekByte(addrK(0) + 4) == memByte(addrK(0) + 4),
+        "a DECERR'd eviction write must NOT actually land in memory (armed fault genuinely took effect)")
+
+      // The sticky diagFault record must latch (poll -- lands the same cycle EVICT_WR
+      // sees its own bad B, a few cycles before the load above even returns; same
+      // defensive-poll idiom as the kind=1 test above, robust either way).
+      var gotIt = false
+      var n = 0
+      while (!gotIt && n < 200) {
+        gotIt = dut.dcache.logic.diagFaultValid.toBoolean
+        if (!gotIt) cd.waitSampling()
+        n += 1
+      }
+      assert(gotIt, "diagFaultValid never latched within 200 cycles")
+      assert(dut.dcache.logic.diagFaultKind.toInt == 2, "kind=2 (dirty-victim eviction writeback)")
+      assert(dut.dcache.logic.diagFaultResp.toInt == 3, "resp must carry the real DECERR code (3)")
+      assert(dut.dcache.logic.diagFaultAddr.toBigInt == BigInt(addrK(0)),
+        s"latched addr must be the EVICTED (old) line's own address, not the new incoming line's: " +
+        s"got 0x${dut.dcache.logic.diagFaultAddr.toBigInt.toString(16)}")
+
+      // The way is still cleanly reallocated (REFILL's own allocate write is
+      // unconditional on the eviction's B response -- EVICT_WR's `goto(REFILL)` above
+      // fires regardless of `axi.b.payload.resp`) and holds the NEW line; a reload
+      // must not re-trigger a refill.
+      assert(!dut.dcache.logic.dirtys(0)(setIdx).toBoolean, "way 0 must be clean after reallocation")
+      val beforeAr = arCount
+      val got2 = load(dut, cd, addrK(4), Size.LONG, CacheMode.WRITETHROUGH)
+      assert(got2 == expected(addrK(4), 4), "reload of the new line is a clean hit")
+      assert(arCount == beforeAr, "reload of the new line must NOT trigger a second refill")
+
+      // ---- coreHalted/retire-freeze: Option A (documented, deliberately NOT built
+      // here) ----
+      //
+      // The original brief also wants an end-to-end check that this diagFault drives
+      // `RobPlugin.coreHalted` and freezes retire. Investigated directly (grep, not
+      // assumed): as of this task, NONE of the 3 test-harness DUTs
+      // (`ExecuteLockStepSpec.scala`'s `FullCoreDut`, `FuzzDut.scala`'s
+      // `FuzzCoreDut`, `IpcBenchSpec.scala`'s DUT) wire
+      // `rob.logic.coreHaltedIn := dc.diagFault` -- only the real production
+      // top-level (`FullCoreSynth.scala:306`) has that line. This matches the
+      // earlier P4.5 finding, still current.
+      //
+      // `RobPluginSpec.scala`'s own directed test ("coreHaltedIn freezes retire and
+      // is NOT cleared by a subsequent interruptPending") already proves
+      // `coreHaltedIn` genuinely freezes retire (and survives a later
+      // interrupt-eligible condition) in isolation, on RobPlugin's own whitebox DUT.
+      // Combined with THIS test proving kind=2 genuinely sticky-latches
+      // `diagFaultValid` (`DcachePlugin.diagFault`'s override target), every link in
+      // the "bad eviction B -> diagFault -> coreHaltedIn -> coreHalted -> retire
+      // frozen" chain is independently, directly proven -- the ONLY thing neither
+      // test exercises is the ONE-LINE wire itself
+      // (`rob.logic.coreHaltedIn := dc.diagFault`), which is identical in shape to
+      // `FullCoreSynth.scala`'s own line and carries essentially zero independent
+      // logic to get wrong.
+      //
+      // Building a genuine combined end-to-end DUT would mean adding that wire to
+      // the shared, 394-test `FullCoreDut` (`ExecuteLockStepSpec.scala`) purely to
+      // cover a single, visually-trivial, direct signal connection -- judged
+      // disproportionate effort/risk relative to what it would additionally prove,
+      // given the two existing directed tests already compose to cover every real
+      // link in the chain. This is Option A per the task brief's own explicit menu.
+      // If a future task wants a true single-DUT end-to-end halt-on-cache-fault
+      // regression (e.g. as part of wiring up the production top-level's own
+      // lock-step coverage), this comment is the pointer to why it wasn't done here.
+      cd.waitSampling(4)
+    }
+  }
 }

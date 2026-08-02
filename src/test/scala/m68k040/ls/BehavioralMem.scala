@@ -55,6 +55,8 @@ class BehavioralMemAgent(axi: Axi4, cd: ClockDomain, sharedMem: SparseMemory = n
   def peekByte(addr: Long): Int             = model.peekByte(addr)
   def poke128(addr: Long, data: BigInt): Unit = model.poke128(addr, data)
   def peek128(addr: Long): BigInt             = model.peek128(addr)
+  /** Task P4.7: see `AxiMemModel.armWriteFault`. */
+  def armWriteFault(addr: Long): Unit = model.armWriteFault(addr)
 }
 
 class Axi4ReadOnlyBehavioralAgent(axi: Axi4ReadOnly, cd: ClockDomain,
