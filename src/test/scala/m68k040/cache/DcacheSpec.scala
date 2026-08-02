@@ -26,6 +26,12 @@ class DcacheSpec extends AnyFunSuite {
 
   def simConfig = M68kSim().withVerilator
 
+  /** ONE shared verilator build reused by the post-P4.3/P4.4-review regression sweeps
+    * below (9 offsets; recompiling per offset costs minutes for zero
+    * benefit -- the DUT is identical). Same pattern as ExecuteLockStepSpec's shared
+    * FullCoreDut build. */
+  lazy val sharedCompiled = simConfig.compile(new Dut)
+
   /** Deterministic image byte. */
   def memByte(addr: Long): Int = ((addr * 5 + 0x23) & 0xff).toInt
   def preload(mem: BehavioralMemAgent, base: Long, n: Int): Unit =
@@ -745,6 +751,127 @@ class DcacheSpec extends AnyFunSuite {
         val gotB = load(dut, cd, baseB, Size.LONG, CacheMode.WRITETHROUGH)
         assert(gotB == BigInt("11223344", 16), s"SET_B's stored value correctly cached: got ${gotB.toString(16)}")
         cd.waitSampling(4)
+      }
+    }
+  }
+
+  // (q) POST-P4.3 REVIEW, BUG 1 REGRESSION: EVICT_WR is a SECOND AXI write issuer on
+  // the one physical write port, tagged id=2 (the store-S2 write-through path is
+  // id=1). `storeAckReg`/`storeErrReg` accepted ANY axi.b beat, so every dirty-victim
+  // eviction's own B response fired a SPURIOUS store ack.
+  //
+  // That is architecturally load-bearing, not cosmetic: `sq.io.drainAck :=
+  // dcache.storeAck` (LsEuPlugin), so a spurious ack pops the StoreQueue head and
+  // clears drainBusy BEFORE that store's own AW/W have been accepted -- the next
+  // drain is then free to re-kick the SHARED stAddrReg/stMergeReg/stStrbReg while the
+  // first store's beat is still notionally in flight. `exc.dcStoreAck` likewise
+  // sequences the ExceptionUnit's E_STWAIT frame writer, and `storeErrReg` feeds
+  // `sq.io.drainErr` (inert today, the precise-path fault source per the design doc --
+  // an eviction writeback's non-OKAY response must stay diagnostic-only, never
+  // architectural).
+  //
+  // Scenario: the same shape as the (p) sweep above -- exactly ONE ordinary
+  // WRITETHROUGH store (id=1, one AW/W/B round trip) racing exactly ONE dirty-victim
+  // eviction (id=2, one AW/W/B round trip); the racing load's own refill is AR/R only
+  // and produces no B at all. So EXACTLY ONE storeAck pulse is architecturally
+  // correct. Pre-fix this observed 2 on every non-degenerate offset.
+  //
+  // The two stimuli are driven from independent forks at ABSOLUTE cycles rather than
+  // "present the load, wait N, present the store": the naive form silently degenerates
+  // at offset 0 (the load's `valid` is deasserted before its first clock edge, so no
+  // load -- and therefore no eviction -- ever happens).
+  for (storeCycle <- 0 to 8) {
+    test(s"EVICT_WR's own B (id=2) must NOT pulse storeAck (storeCycle=$storeCycle)",
+         VerilatorTest) {
+      sharedCompiled.doSim(s"evictBAck_$storeCycle", 1) { dut =>
+        val (cd, mem) = initDut(dut)
+        val SET_A  = 50L
+        val baseA  = SET_A * 16L
+        def addrA(k: Long): Long = baseA + k * 0x800L
+        val SET_B  = 51L
+        val baseB  = SET_B * 16L
+        for (k <- 0L until 5L) preload(mem, addrA(k), 16)
+        preload(mem, baseB, 16)
+
+        // SET_A way 0: warm + dirty via a COPYBACK-hit store, so the 5th miss's
+        // round-robin victim (way 0) is DIRTY -> EVICT_WR.
+        load(dut, cd, addrA(0), Size.LONG, CacheMode.WRITETHROUGH)
+        dut.probe.logic.storeIn.valid #= true
+        dut.probe.logic.storeIn.payload.paddr #= addrA(0) + 4
+        dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
+        dut.probe.logic.storeIn.payload.size #= Size.LONG
+        dut.probe.logic.storeIn.payload.useStrb #= false
+        dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+        cd.waitSampling()
+        dut.probe.logic.storeIn.valid #= false
+        cd.waitSamplingWhere(dut.dcache.logic.storeAckReg.toBoolean)
+        cd.waitSampling(2)
+        // SET_A ways 1..3: warm, clean.
+        for (k <- 1L until 4L) load(dut, cd, addrA(k), Size.LONG, CacheMode.WRITETHROUGH)
+        cd.waitSampling(4)
+
+        // Count storeAck / storeErr pulses ONLY across the racing window (the setup
+        // above legitimately produced one COPYBACK-hit local ack of its own).
+        var counting    = false
+        var ackCount    = 0
+        var errCount    = 0
+        var evictBCount = 0
+        var storeBCount = 0
+        fork {
+          while (true) {
+            cd.waitSampling()
+            if (counting) {
+              if (dut.dcache.logic.storeAckReg.toBoolean) ackCount += 1
+              if (dut.dcache.logic.storeErrReg.toBoolean) errCount += 1
+              if (dut.dcache.logic.axi.b.valid.toBoolean && dut.dcache.logic.axi.b.ready.toBoolean) {
+                if (dut.dcache.logic.axi.b.payload.id.toInt == 2) evictBCount += 1 else storeBCount += 1
+              }
+            }
+          }
+        }
+        counting = true
+
+        val LOAD_CYCLE = 4
+        fork {
+          cd.waitSampling(LOAD_CYCLE)
+          dut.probe.logic.loadCmdIn.valid #= true
+          dut.probe.logic.loadCmdIn.payload.vaddr #= addrA(4)
+          dut.probe.logic.loadCmdIn.payload.paddr #= addrA(4)
+          dut.probe.logic.loadCmdIn.payload.size  #= Size.LONG
+          dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+          cd.waitSampling()
+          dut.probe.logic.loadCmdIn.valid #= false
+        }
+        fork {
+          if (storeCycle > 0) cd.waitSampling(storeCycle)
+          dut.probe.logic.storeIn.valid #= true
+          dut.probe.logic.storeIn.payload.paddr #= baseB
+          dut.probe.logic.storeIn.payload.data #= BigInt("11223344", 16)
+          dut.probe.logic.storeIn.payload.size #= Size.LONG
+          dut.probe.logic.storeIn.payload.useStrb #= false
+          dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+          cd.waitSampling()
+          dut.probe.logic.storeIn.valid #= false
+        }
+        cd.waitSampling(100)
+        counting = false
+
+        // Scenario sanity: the run must actually have contained exactly one eviction
+        // writeback and exactly one store write-through (otherwise the ack-count
+        // assertion below would be vacuous).
+        assert(evictBCount == 1,
+          s"scenario sanity: expected exactly one EVICT_WR B (id=2), got $evictBCount")
+        assert(storeBCount == 1,
+          s"scenario sanity: expected exactly one store-through B (id=1), got $storeBCount")
+        assert(ackCount == 1,
+          s"exactly ONE storeAck expected (the single id=1 write-through store); got $ackCount " +
+          s"-- an eviction's own B (id=2) must never be mistaken for a store completion")
+        assert(errCount == 0, s"no storeErr expected on an all-OKAY run: got $errCount")
+
+        // ...and the functional end state stays correct (guards against "fixing" the
+        // ack count by dropping one of the two writes).
+        assert(mem.peekByte(baseB) == 0x11, "the store's own byte still lands in memory")
+        assert(mem.peekByte(addrA(0) + 4) == 0xCA, "the evicted dirty line still lands in memory")
       }
     }
   }
