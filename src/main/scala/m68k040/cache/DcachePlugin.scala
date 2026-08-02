@@ -125,6 +125,8 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // actually had (not a live signal that could have moved on).
     val missCmode = Reg(CacheMode())
     val victimWay = Reg(UInt(wayBits bits))
+    victimWay.simPublic()   // test-visibility only (DcacheDrainRefillRaceSpec's
+    // same-way-collision coincidence check); no-op for synthesis.
     // Task P4.3: the victim way's tag/line at the moment the miss/eviction
     // decision was made -- captured HERE (not re-read at EVICT_WR time) because the
     // shared read port that produced `rdTag(vw)`/`rdData(vw)` can be repointed at a
@@ -443,6 +445,8 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // EXACT predicate for "store-S2 drives wrEn/wrSet/wrData this cycle" — must stay
     // bit-identical to the guard on the S2 RMW write block below.
     val stS2ArrayWrite = stS2Valid && !stS2Inhibited && stS2HitAny
+    stS2ArrayWrite.simPublic()   // test-visibility only (DcacheDrainRefillRaceSpec's
+    // same-way-collision coincidence check); no-op for synthesis.
 
     // S0 -> S1: advance the latched payload into S1.
     when(s0Valid) {
@@ -466,9 +470,10 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       rdEn  := True
     }
 
-    // ---- Drain-vs-refill same-SET array-write-port interlock (Task P4.4, design
-    // doc "Drain-vs-refill same-set/same-way interlock", also folded through EVICT_WR's own
-    // eventual REFILL/REPLAY transition per this combined task) ----
+    // ---- Drain-vs-refill array-write-port interlock (same-set OR same-way,
+    // Task P4.4, design doc "Drain-vs-refill same-set/same-way interlock", also
+    // folded through EVICT_WR's own eventual REFILL/REPLAY transition per this
+    // combined task) ----
     // A store drain's S1 tag-read (registers stS1Set) through its S2 write (stS2Set)
     // is a 2-cycle window during which the store's OWN hit-detect is against a
     // REGISTERED tag-read. A concurrent load-refill/write-allocate array write into
@@ -507,9 +512,38 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // than comparing an OHToUInt-decoded way index) also stays correct if the hit
     // vector were ever non-one-hot — the S2 write arm itself writes every hit way.
     // Same hold-and-retry philosophy: the refill is delayed, the store is never
-    // dropped; the hold lasts at most the single cycle store-S2 is valid.
+    // dropped.
+    //
+    // Why this can't livelock (CORRECTED — the previous version of this comment
+    // claimed the hold "lasts at most the single cycle store-S2 is valid", which
+    // is FACTUALLY WRONG: under a back-to-back store stream `stS2Valid` (and
+    // therefore `stS1Valid`) can be True on every consecutive cycle indefinitely
+    // — trace their own `:=` assignments above, there is no structural 1-cycle
+    // bound. The real invariant is a CONTRACT on the store producer, not a
+    // width-of-signal fact: `DcacheService.store` (an unbuffered `Flow`, no
+    // backpressure) is driven single-outstanding and ack-gated by the SQ/LS EU
+    // — at most one store is ever "in flight" contesting this hold at a time,
+    // and that store's ack always eventually arrives regardless of the hold
+    // (WT ack rides the AXI B response, which this hold never gates; a
+    // COPYBACK-hit ack comes from `cbHitAckReg`, likewise ungated; a
+    // COPYBACK-miss store contributes `stS2HitAny = False`, so it can't assert
+    // `stS2ArrayWrite`/hold its own refill in the first place). Once that one
+    // store's ack lands the next store (if any) is a fresh contender, so the
+    // hold can never accumulate an unbounded queue behind it. THIS MAKES THE
+    // HOLD'S LIVENESS A CONTRACT the store side must preserve, not a
+    // structural guarantee derived from this file alone — if the store side
+    // ever grows a real multi-outstanding queue, this invariant (and this
+    // whole no-livelock argument) would need re-examination.
     val refillWriteHold = (stS1Valid && (stS1Set === missSet)) ||
                           (stS2Valid && (stS2Set === missSet)) ||
+                          // NOTE: this 3rd (same-way) term only means anything
+                          // while `victimWay` holds a currently-relevant value,
+                          // i.e. during REFILL/REPLAY immediately after a
+                          // miss-detect latched it. In IDLE `victimWay` is
+                          // stale from the previous miss and this term is
+                          // harmless-but-meaningless there (nothing consumes
+                          // `refillWriteHold` in IDLE today) — don't reuse it
+                          // in an IDLE-adjacent context without re-checking.
                           (stS2ArrayWrite && stS2HitVec(victimWay))
 
     // ---- LOAD FSM (OVERRIDES the shared read port with PRIORITY over the store) ----
@@ -1001,7 +1035,16 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // sequences the ExceptionUnit's E_STWAIT frame writer. And an eviction writeback's
     // non-OKAY response is diagnostic-only by design (kind=2 above) -- it must never
     // reach `sq.io.drainErr`, which P2.5 turns into an architectural fault source.
-    val storeBAck = axi.b.valid && axi.b.ready && (axi.b.payload.id =/= U(2, 4 bits))
+    //
+    // Demux by `=== id 1` (the store's OWN id), NOT `=/= id 2` (EVICT_WR's id):
+    // fail CLOSED, not fail open. Today only ids 1 and 2 ever reach the B
+    // channel so both forms are functionally identical, but `=/= 2` silently
+    // acks on ANY future third AXI write issuer's completion if one is ever
+    // added here without updating this site (exactly the spurious-ack failure
+    // class this whole fix exists to close). `=== 1` instead makes an
+    // unrecognized id simply not ack anything — a hung drain, which is loud
+    // and debuggable, instead of a silent spurious ack.
+    val storeBAck = axi.b.valid && axi.b.ready && (axi.b.payload.id === U(1, 4 bits))
     storeErrReg := storeBAck && (axi.b.payload.resp =/= Axi4.resp.OKAY)
     storeAckReg := storeBAck || cbHitAckReg || storeAllocAckReg
   }

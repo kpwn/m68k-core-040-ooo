@@ -59,9 +59,15 @@ trait DcacheService {
   def store:    spinal.lib.Flow[DStoreCmd]    // write-through: update line if hit + write memory
   def storeAck: Bool                          // 1-cycle pulse when a write-through landed in memory (AXI B)
   // 1-cycle pulse, same cycle class as storeAck: the AXI B response for the
-  // just-drained store carried a non-OKAY resp (SLVERR/DECERR). storeAck itself
-  // is UNCHANGED (still pulses on ANY B handshake, ok or err) -- storeErr is an
-  // additional QUALIFIER a consumer checks alongside it, never a replacement.
+  // just-drained store carried a non-OKAY resp (SLVERR/DECERR). storeErr is an
+  // additional QUALIFIER a consumer checks alongside storeAck, never a
+  // replacement. NOTE (post-P4.4 fix, DcachePlugin.scala's `storeBAck`):
+  // storeAck no longer pulses on ANY B handshake -- it is demultiplexed by AXI
+  // `id` and only pulses on (a) the store's own write-through completion
+  // (id === 1), or the two purely-local ack paths that never touch the AXI B
+  // channel at all: (b) `cbHitAckReg` for a COPYBACK hit, (c)
+  // `storeAllocAckReg` for a drain-miss write-allocate. It never pulses on an
+  // eviction writeback's own B response (id === 2) -- that is diagnostic-only.
   def storeErr: Bool
 }
 

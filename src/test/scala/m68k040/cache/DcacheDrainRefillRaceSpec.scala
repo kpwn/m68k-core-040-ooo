@@ -187,18 +187,46 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     cd.waitSampling(4)
   }
 
+  /** Result of one `raceSameWay` run: the racing refill's AR count (scenario sanity)
+    * plus whether the actual array-write-port collision cycle was ever observed --
+    * see `collisionHit`'s doc below. */
+  case class RaceResult(arCount: Int, collisionHit: Boolean)
+
   /** Presents the racing pair on EXACT, independent cycles (two forks) rather than
     * "present A, wait N, present B". The naive form is not offset-independent: at
     * offset 0 the load's `valid` gets deasserted before its first clock edge and the
     * load never happens at all -- silently turning the test into a no-op. */
   def raceSameWay(dut: Dut, cd: ClockDomain, storeCycle: Int,
-                  storeMode: SpinalEnumElement[CacheMode.type]): Int = {
+                  storeMode: SpinalEnumElement[CacheMode.type]): RaceResult = {
     val LOAD_CYCLE = 4
     var arCount = 0
+    // I2 (post-P4.4-cleanup review): a coincidence tap proving the sweep actually
+    // EXERCISES the same-way collision at some offset, not merely that the final
+    // DATA assertions happen to pass at every offset (which would also pass
+    // vacuously if the race were never reached at all, e.g. after a future
+    // refill-latency or RNG-stream change).
+    //
+    // NOTE this is deliberately `axi.r.valid` (an R beat PRESENTED), not
+    // `axi.r.fire`: `refillWriteHold`'s same-way term
+    // (`stS2ArrayWrite && stS2HitVec(victimWay)`) combinationally forces
+    // `axi.r.ready` False on any cycle it is True (see DcachePlugin.scala's
+    // `axi.r.ready := !refillWriteHold`), so on a CORRECTLY-fixed core
+    // `axi.r.fire && stS2ArrayWrite && stS2HitVec(victimWay)` can never be True
+    // simultaneously -- that is the entire point of the fix, and asserting on
+    // `axi.r.fire` would make this tap permanently (and misleadingly) vacuous.
+    // `axi.r.valid` catches the moment the interlock actually had something to
+    // hold off: the refill beat was presented WHILE the store's own S2 array
+    // write was hitting the exact way (`victimWay`) that refill is about to
+    // allocate -- i.e. the real collision cycle this whole regression targets.
+    var collisionHit = false
     fork {
       while (true) {
         cd.waitSampling()
         if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1
+        if (dut.dcache.logic.axi.r.valid.toBoolean && dut.dcache.logic.stS2ArrayWrite.toBoolean) {
+          val vw = dut.dcache.logic.victimWay.toInt
+          if (dut.dcache.logic.stS2HitVec(vw).toBoolean) collisionHit = true
+        }
       }
     }
     fork {
@@ -212,7 +240,9 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
       dut.probe.logic.loadCmdIn.valid #= false
     }
     fork {
-      if (storeCycle > 0) cd.waitSampling(storeCycle)
+      // waitSampling(0) is a documented no-op in SpinalHDL sim, so no `if` guard
+      // is needed here for the storeCycle=0 case.
+      cd.waitSampling(storeCycle)
       dut.probe.logic.storeIn.valid #= true
       dut.probe.logic.storeIn.payload.paddr #= addrB + 4
       dut.probe.logic.storeIn.payload.data  #= BigInt("DEADBEEF", 16)
@@ -223,8 +253,16 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
       dut.probe.logic.storeIn.valid #= false
     }
     cd.waitSampling(80)
-    arCount
+    RaceResult(arCount, collisionHit)
   }
+
+  // I2: aggregated across the whole sweep -- did ANY offset actually hit the real
+  // array-write-port collision cycle (`raceSameWay`'s `collisionHit`)? Checked by a
+  // final test appended after each sweep (below), so a future refill-latency/RNG
+  // change that silently makes every offset miss the race fails LOUDLY instead of
+  // all offsets' DATA assertions merely (and vacuously) continuing to pass.
+  var wtCollisionHitAny = false
+  var cbCollisionHitAny = false
 
   for (storeCycle <- 0 to 10) {
     test(s"same-WAY different-SET refill must not silently drop a store-S2 array " +
@@ -238,11 +276,12 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
         cd.waitSampling(5)
         warmSameWaySetup(dut, cd, mem)
 
-        val arCount = raceSameWay(dut, cd, storeCycle, CacheMode.WRITETHROUGH)
+        val race = raceSameWay(dut, cd, storeCycle, CacheMode.WRITETHROUGH)
+        if (race.collisionHit) wtCollisionHitAny = true
 
         // Scenario sanity: the racing refill must actually have happened (otherwise
         // the assertions below would be vacuously satisfied).
-        assert(arCount == 1, s"scenario sanity: expected exactly one racing refill AR, got $arCount")
+        assert(race.arCount == 1, s"scenario sanity: expected exactly one racing refill AR, got ${race.arCount}")
         // Memory always gets the bytes (the write-through beat is unconditional) --
         // this only confirms the store really happened; it does NOT detect the bug.
         assert(mem.peekByte(addrB + 4) == 0xDE, "write-through beat reached memory")
@@ -264,6 +303,16 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     }
   }
 
+  test("I2 scenario sanity: the same-way collision cycle was actually hit at least " +
+       "once across the WRITETHROUGH storeCycle sweep") {
+    assert(wtCollisionHitAny,
+      "NONE of the WRITETHROUGH sweep's offsets ever produced the real array-write-port " +
+      "collision cycle (axi.r.valid && stS2ArrayWrite && stS2HitVec(victimWay)) -- the " +
+      "sweep above is VACUOUS: its data assertions could pass without ever exercising " +
+      "the race this file targets. This likely means refill latency or the storeCycle " +
+      "range no longer aligns with the collision window and needs re-tuning.")
+  }
+
   for (storeCycle <- 0 to 10) {
     test(s"same-WAY different-SET refill must not leave a COPYBACK line dirty with " +
          s"stale data (storeCycle=$storeCycle)", VerilatorTest) {
@@ -276,8 +325,9 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
         cd.waitSampling(5)
         warmSameWaySetup(dut, cd, mem)
 
-        val arCount = raceSameWay(dut, cd, storeCycle, CacheMode.COPYBACK)
-        assert(arCount == 1, s"scenario sanity: expected exactly one racing refill AR, got $arCount")
+        val race = raceSameWay(dut, cd, storeCycle, CacheMode.COPYBACK)
+        if (race.collisionHit) cbCollisionHitAny = true
+        assert(race.arCount == 1, s"scenario sanity: expected exactly one racing refill AR, got ${race.arCount}")
 
         // A COPYBACK-hit store resolves ENTIRELY on-chip: the ONLY copy of the stored
         // data is the cache line itself. If the array write was dropped, the line is
@@ -295,5 +345,15 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
           f"EVICT_WR would later write back to memory as if it were the store's result")
       }
     }
+  }
+
+  test("I2 scenario sanity: the same-way collision cycle was actually hit at least " +
+       "once across the COPYBACK storeCycle sweep") {
+    assert(cbCollisionHitAny,
+      "NONE of the COPYBACK sweep's offsets ever produced the real array-write-port " +
+      "collision cycle (axi.r.valid && stS2ArrayWrite && stS2HitVec(victimWay)) -- the " +
+      "sweep above is VACUOUS: its data assertions could pass without ever exercising " +
+      "the race this file targets. This likely means refill latency or the storeCycle " +
+      "range no longer aligns with the collision window and needs re-tuning.")
   }
 }

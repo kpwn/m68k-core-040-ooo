@@ -677,7 +677,7 @@ class DcacheSpec extends AnyFunSuite {
   for (offset <- 0 to 4) {
     test(s"AXI-hazard regression: concurrent store-S2 write and EVICT_WR writeback " +
          s"do not corrupt each other (offset=$offset)", VerilatorTest) {
-      simConfig.compile(new Dut).doSim { dut =>
+      sharedCompiled.doSim(s"axiHazard_$offset", 1) { dut =>
         val (cd, mem) = initDut(dut)
         val SET_A  = 40L
         val baseA  = SET_A * 16L
