@@ -1069,6 +1069,18 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     storeErrReg := storeBAck && (axi.b.payload.resp =/= Axi4.resp.OKAY)
     storeAckReg := storeBAck || cbHitAckReg || storeAllocAckReg
 
+    // Task P4.6: pins design doc §5 item 7's one-ack-per-store contract now that
+    // storeAckReg has three sources (store-S2 write-through AXI B, copyback-hit
+    // S2, drain-miss write-allocate). Mirrors storeAckReg's drive above exactly
+    // -- `storeBAck`, NOT raw `axi.b.valid && axi.b.ready`, since EVICT_WR's own
+    // id=2 B response is already correctly excluded from storeAckReg by the id
+    // filter and is not structurally a storeAck source at all. Zero synth cost.
+    GenerationFlags.simulation {
+      val ackSources = Seq(storeBAck, cbHitAckReg, storeAllocAckReg)
+      assert(CountOne(ackSources) <= U(1),
+        "DcachePlugin: more than one storeAck source pulsed the same cycle")
+    }
+
     // ---- Task P4.5: async diagnostic-fault channel ----
     // WT-beat / INHIBITED-drain B-error site, ONLY for a FAST (non-precise) drain --
     // a precise drain's B-error is ALREADY correctly, precisely handled by the SQ's
