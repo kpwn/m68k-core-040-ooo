@@ -414,6 +414,14 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // NOT accept the load) on its existing single-outstanding path until ready.
     // (req drivers are set after loadVaddr is declared, below.)
     val s1Paddr = (xlate.rsp.ppn ## s1Va(11 downto 0)).asUInt
+    // Slot-B (split-access second half) translated physical address: SAME `xlate.rsp`
+    // port, combined with addrB's OWN page offset (not s1Va's — a line-crossing split
+    // stays within the same page but at a different 12-bit offset; only a page-
+    // crossing split shares offset 0). Only meaningful the cycle the LIVE xlate
+    // request/response actually corresponds to addrB's VPN (the new XLATE_B FSM
+    // state below arms this via `xlateBArm` -> `xlateVaddr`, mirroring exactly how
+    // `s1Paddr` above is only meaningful while IDLE is resolving slot A's request).
+    val s1PaddrB = (xlate.rsp.ppn ## s1AddrB(11 downto 0)).asUInt
     val xlateReady = xlate.rsp.ready    // False on an enabled-MMU TLB miss (walking)
     val xlateFault = xlate.rsp.fault
 
@@ -503,6 +511,16 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       val bDone     = RegInit(False)   // slot A launched; now presenting slot B (cross)
     }
 
+    // Slot-B (split-access second half) DTLB translate-request arm (mmu-split-
+    // second-half fix): set for the duration of the new XLATE_B FSM state, while
+    // resolving addrB's REAL translation. Selects addrB as the LIVE `xlate.req` VPN
+    // via `xlateVaddr` below. Deliberately INDEPENDENT of `llReg.bDone` (which
+    // selects addrB for the REGISTERED cache-launch command at a later pipeline
+    // point, once slot A's line has already landed) — this Reg governs only the
+    // DTLB request interface, and only during the translate phase (well before the
+    // cache is ever launched for either slot).
+    val xlateBArm = RegInit(False)
+
     // ---- dcache load cmd: driven from the REGISTERED launch stage (llReg) ----
     // slot A = llReg.vaddr/paddr; slot B (cross) = llReg.addrB/paddrB (selected once
     // slot A is captured -> bDone). The cache tags on this REGISTERED address (the AGU
@@ -519,8 +537,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     dcache.loadCmd.payload.cacheMode := llReg.cmode
 
     // ---- store split (byte-lane) for the SQ entry ----
-    // Under identity translation paddr == vaddr, so slot B's physical address is
-    // s1AddrB directly (the real-DTLB slice will translate addrB's VPN separately).
+    // Slot B's physical address is `s1PaddrB` (declared above alongside `s1Paddr`) —
+    // the REAL DTLB translation of addrB's own VPN, resolved by the XLATE_B FSM
+    // state before `s2PaddrB` (below) latches it. addrB can land on a different
+    // page than s1Va with entirely different perms/residency (mmu-split-second-half
+    // fix) — it is NOT assumed identity-mapped.
     // sizeBytes of the store; bytes in slot A = (16 - lineOffSt), spill -> slot B.
     val stOff      = s1Va(3 downto 0)
     val stBytes    = sizeBytes(u1.size)                 // 1/2/4
@@ -531,7 +552,6 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val splitStrbA = m68k040.cache.DcacheByteLane.storeStrbA(stOff, u1.size)
     val splitDataB = m68k040.cache.DcacheByteLane.storeDataB(stOff, u1.size, s1StoreData)
     val splitStrbB = m68k040.cache.DcacheByteLane.storeStrbB(stOff, u1.size)
-    val s1PaddrB   = s1AddrB   // identity translation
 
     // ---- SQ alloc + fwd defaults ----
     sq.io.alloc.valid          := False
@@ -573,16 +593,30 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // ---- drive the D-side translation request (translate-at-execute) ----
     // VPN = the access address the EU is currently presenting. With FMax #1 the cache
     // `loadCmd` is now driven off the REGISTERED `llReg`; the DTLB request must instead
-    // track the LIVE access being translated (translation runs in IDLE, BEFORE the
-    // registered cache launch — it feeds s2Paddr, which llReg later captures). So drive
-    // the VPN from `xlateVaddr` (s1Va for slot A / s1AddrB for slot B, selected by the
-    // same `llReg.bDone` the cache cmd uses). s1AddrB is the registered-base-derived
-    // next-line base (a shallow stage off s1Va), NOT on the eaDelta->tag arc the cache
-    // cmd registered away. `valid` asserts whenever a memory µop is resident in S1 (a
-    // real translation demand -> the DTLB may walk on a miss). `write` selects the store
-    // M-bit / write-protect check. `supervisor` = the live architectural S bit
-    // (reqDrvSup below), NOT hardcoded.
-    val xlateVaddr = Mux(llReg.bDone, s1AddrB, s1Va)
+    // track the LIVE access being translated (translation runs in IDLE/XLATE_B, BEFORE
+    // the registered cache launch — it feeds s2Paddr/s2PaddrB, which llReg later
+    // captures). So drive the VPN from `xlateVaddr` (s1Va for slot A / s1AddrB for
+    // slot B, selected by `xlateBArm` — set for the duration of the new XLATE_B state,
+    // which performs addrB's REAL DTLB translate; mmu-split-second-half fix). s1AddrB
+    // is the registered-base-derived next-line base (a shallow stage off s1Va), NOT on
+    // the eaDelta->tag arc the cache cmd registered away. `valid` asserts whenever a
+    // memory µop is resident in S1 (a real translation demand -> the DTLB may walk on
+    // a miss) — for EITHER slot, sequenced one after the other (the DTLB is a single-
+    // outstanding resource: one walker instance, one miss-request register — see
+    // DtlbPlugin). `write` selects the store M-bit / write-protect check (the SAME
+    // access class for both slots of one instruction). `supervisor` = the live
+    // architectural S bit (reqDrvSup below), NOT hardcoded.
+    //
+    // NOTE: `xlateVaddr` deliberately does NOT also select on `llReg.bDone` (the
+    // cache-launch slot-B select, set later in WAIT_A once slot A's line has landed).
+    // Before this fix it did — but that request's response was never consumed (slot
+    // B's paddr was a hardcoded identity shortcut, see the mmu-split-second-half
+    // design note above `s1PaddrB`), so it was pure wasted DTLB traffic. Now that
+    // XLATE_B performs addrB's real translate BEFORE the cache is ever launched (i.e.
+    // strictly before WAIT_A), re-requesting the SAME vpn again in WAIT_A would be
+    // redundant AND would risk double-pushing this access's addrB U/M-descriptor
+    // write into the (unguarded-capacity) UmWriteQueue — see DtlbPlugin's `umq`.
+    val xlateVaddr = Mux(xlateBArm, s1AddrB, s1Va)
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax #2: REGISTER the LS-EU -> DTLB translation-request INTERFACE.
@@ -839,7 +873,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // `atc` (task #189): True (default, preserves the pre-existing MMU-fault
     // behavior) for the DTLB-translation-fault call site; the NEW bus-error call
     // site (D-cache refill AXI resp error, WAIT state below) passes False.
-    def captureFault(atc: Boolean = true): Unit = {
+    // `faultAddr` (mmu-split-second-half fix): defaults to s1Va (slot A / every
+    // pre-existing call site, unchanged) — the XLATE_B call site (addrB's own
+    // translation faulting) passes s1AddrB so the SSW/format-$7 frame reports the
+    // ACTUAL faulting half's address, not slot A's.
+    def captureFault(atc: Boolean = true, faultAddr: UInt = s1Va): Unit = {
       liveCompletionFires := True
       compValid     := True
       compRobId     := s1Ctx.robId
@@ -854,7 +892,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compCrackDrop := False
       compKeepCommit := False
       compIsFault   := True
-      compFaultAddr := s1Va
+      compFaultAddr := faultAddr
       compFaultWr   := isStore
       compFaultSize := u1.size.mux(
         m68k040.isa.Size.BYTE -> U(0, 2 bits),
@@ -1105,6 +1143,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
 
     val fsm = new StateMachine {
       val IDLE    = new State with EntryPoint
+      val XLATE_B = new State  // split access ONLY: real DTLB translate of addrB (2nd half)
       val XLATE   = new State  // registered translated paddr -> SQ-fwd query / store alloc
       val RESOLVE = new State  // registered SQ-fwd result -> completion / cache launch
       val LAUNCH  = new State  // registered cache launch: drive loadCmd off llReg (FMax #1)
@@ -1162,16 +1201,66 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
                 goto(IDLE)
               } otherwise {
                 s2Paddr  := s1Paddr
-                s2PaddrB := s1PaddrB
                 s2Fault  := xlateFault
                 s2Cmode  := xlate.rsp.cacheMode
-                goto(XLATE)
+                // mmu-split-second-half fix: a split access's second half (addrB) can
+                // land on a genuinely different page than slot A, with independent
+                // residency/perms — it needs its OWN real DTLB translation, not an
+                // identity shortcut. Arm it (xlateBArm -> xlateVaddr selects addrB) and
+                // resolve it in XLATE_B before falling through to the EXISTING XLATE
+                // state (store-alloc / SQ-fwd-query logic there is entirely unchanged —
+                // it already consumes s2PaddrB, just now genuinely translated). An
+                // aligned (non-split) access skips XLATE_B entirely -> zero added
+                // latency for the overwhelming-common case.
+                when(s1TwoAccess) {
+                  xlateBArm := True
+                  goto(XLATE_B)
+                } otherwise {
+                  s2PaddrB := s1AddrB   // unused (sq.io.alloc.payload.validB=False / no
+                                        // load ever reads llReg.paddrB without bDone),
+                                        // kept deterministic for readability only.
+                  goto(XLATE)
+                }
               }
             } otherwise {
               s1Valid := True
             }
           } otherwise {
             when(!poisoned) { captureCompletion(B(0, 32 bits)) }   // non-memory (defensive)
+          }
+        }
+      }
+
+      // XLATE_B (mmu-split-second-half fix): split-access second half (addrB) real
+      // DTLB translate. Entered ONLY from IDLE's slot-A resolve when `s1TwoAccess`.
+      // Mirrors IDLE's own translate-and-wait pattern exactly (`xlateReady &&
+      // reqMatch`), just for addrB's VPN (selected via `xlateBArm` -> `xlateVaddr`)
+      // instead of s1Va's. The DTLB is a single-outstanding resource (one walker
+      // instance, one miss-request register — see DtlbPlugin) so this necessarily
+      // SEQUENCES after slot A's translate completed, never runs concurrently with
+      // it. On a DTLB miss for addrB's page the walker may run (multi-cycle); the
+      // FSM simply holds here (busy), exactly like IDLE holds S1 on a slot-A miss —
+      // architecturally correct extra latency, not a regression (the fast/common
+      // case, a TLB hit or the same page as slot A re-hitting `hrMatch`, resolves in
+      // the same +1 cycle pattern as slot A's own translate).
+      XLATE_B.whenIsActive {
+        busy := True
+        when(xlateReady && reqMatch) {
+          when(xlateFault) {
+            // addrB's OWN translation faulted (independently of slot A, which already
+            // resolved cleanly — that's exactly why this state exists). Report the
+            // fault at addrB's own address, not slot A's.
+            when(!poisoned) { captureFault(faultAddr = s1AddrB) }
+            xlateBArm := False
+            busy    := False
+            s1Valid := False
+            goto(IDLE)
+          } otherwise {
+            // s1PaddrB (declared alongside s1Paddr, above) combines THIS response's
+            // ppn with addrB's own page offset — the REAL translated physical address.
+            s2PaddrB  := s1PaddrB
+            xlateBArm := False
+            goto(XLATE)
           }
         }
       }
@@ -1520,6 +1609,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // ---- debug-only FSM-state observability (task #139 finding #1 investigation) ----
     // Zero synth impact (sim tap only, not referenced by any RTL logic).
     val dbgIsIdle    = fsm.isActive(fsm.IDLE);    dbgIsIdle.simPublic()
+    val dbgIsXlateB  = fsm.isActive(fsm.XLATE_B); dbgIsXlateB.simPublic()
     val dbgIsXlate   = fsm.isActive(fsm.XLATE);   dbgIsXlate.simPublic()
     val dbgIsResolve = fsm.isActive(fsm.RESOLVE); dbgIsResolve.simPublic()
     val dbgIsLaunch  = fsm.isActive(fsm.LAUNCH);  dbgIsLaunch.simPublic()
