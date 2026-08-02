@@ -9,15 +9,19 @@ import spinal.lib.bus.amba4.axi.{Axi4, Axi4Config}
 import spinal.lib.fsm._
 import spinal.lib.misc.plugin.FiberPlugin
 
-/** Synthesizable VIPT write-through L1 data cache.
+/** Synthesizable VIPT L1 data cache, mode-aware per the page's MMU cache attribute
+  * (WRITETHROUGH / COPYBACK / INHIBITED).
   *
   * Geometry: 128 sets, 4 ways, 16-byte lines (8 KiB total). One 128-bit AXI beat
-  * == one whole line (len=0). Write-through / no-allocate / never-dirty:
+  * == one whole line (len=0).
   *   - LOAD: VIPT 2-cycle read (S0 launch BRAM tag+data read + translate; S1
   *     tag-compare against the REGISTERED tag-read, way-mux, byte-lane extract).
   *     Miss -> single-beat refill -> replay.
-  *   - STORE: physical (SQ already translated). RMW the line if it hits; ALWAYS
-  *     issue an AXI write (write-through). No allocate on a miss.
+  *   - STORE: physical (SQ already translated). RMW the line if it hits.
+  *     WRITETHROUGH/INHIBITED: ALWAYS issue an AXI write, no allocate on a miss
+  *     (original behavior, unchanged). COPYBACK hit (Task P4.1): resolves ENTIRELY
+  *     on-chip -- merge + set the line's dirty bit + local ack, zero AXI traffic.
+  *     COPYBACK miss: write-allocate (Task P4.2).
   *
   * FMax (P0.1): ALL D-cache RAM reads are SYNCHRONOUS so Vivado infers BRAM
   * (RAMB36) instead of async distributed-RAM (LUTRAM / RAMD64E):

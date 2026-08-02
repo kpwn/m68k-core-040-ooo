@@ -28,7 +28,9 @@ case class DLoadRsp() extends Bundle {
 }
 
 /** Store command from the SQ drain: a PHYSICAL address (already translated),
-  * the store data in the low bytes per size, and the access size. Write-through.
+  * the store data in the low bytes per size, and the access size. Mode-aware
+  * (WRITETHROUGH/COPYBACK/INHIBITED) per `cacheMode` -- see `DcachePlugin`'s own
+  * class doc for the per-mode drain policy.
   *
   * `useStrb` selects an explicit line-relative byte strobe + 128-bit line-aligned
   * data (`strb`/`lineData`) instead of deriving the merge from {data,size,paddr-
