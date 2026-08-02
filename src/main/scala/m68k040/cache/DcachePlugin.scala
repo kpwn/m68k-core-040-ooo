@@ -144,6 +144,31 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // REFILL for REPLAY to deliver directly (no line was allocated, so a
     // re-launched "hit" read would only find garbage/stale BRAM contents).
     val missLine  = Reg(Bits(128 bits))
+    // Task P4.2: does this in-flight refill service a store-drain miss (True)
+    // or an ordinary load miss (False)? Distinguishes REPLAY's write-allocate
+    // merge path from the load-fill/direct-response paths above.
+    val refillReqIsStore = Reg(Bool()) init False
+
+    // Store-drain-miss request, latched from store-S2 when a COPYBACK drain misses
+    // (stS2Copyback && !stS2HitAny). Held until the (shared, single) refill engine
+    // picks it up; a same-cycle load miss takes priority (mirrors this file's
+    // existing load>store read-port precedent) -- the pending request simply stays
+    // latched and is retried every IDLE cycle.
+    val pendingStoreMiss   = RegInit(False)
+    val pendingStorePaddr  = Reg(UInt(32 bits))
+    val pendingMergeData   = Reg(Bits(128 bits))
+    val pendingMergeStrb   = Reg(Bits(16 bits))
+    val storeAllocAckReg   = Bool(); storeAllocAckReg := False
+
+    // Pulled forward from Task P4.5's own Step 1 (a plan-ordering bug: P4.5 declares
+    // these but P4.2, which comes first, needs to drive them). P4.5's own eventual
+    // dispatch must NOT re-declare these -- it only adds the sticky diagFaultValid/
+    // diagFaultAddr/diagFaultResp/diagFaultKind registers and the WT-beat error site's
+    // own pulse-driving `when` block.
+    val diagFaultPulse     = Bool(); diagFaultPulse     := False
+    val diagFaultPulseAddr = UInt(32 bits); diagFaultPulseAddr := U(0, 32 bits)
+    val diagFaultPulseResp = UInt(2 bits);  diagFaultPulseResp := U(0, 2 bits)
+    val diagFaultPulseKind = UInt(3 bits);  diagFaultPulseKind := U(0, 3 bits)
 
     // ---- defaults ----
     loadCmdPort.ready := False
@@ -356,7 +381,9 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         // REFILL unconditionally; only the hit branch carried xlate.rsp.fault).
         when(ldS1Valid && !ldS1Hit) {
           // Miss: latch miss-state and start the refill (the +1-cycle deferral
-          // relative to the old async hit-detect is latency-agnostic).
+          // relative to the old async hit-detect is latency-agnostic). A same-
+          // cycle load miss takes priority over a pending store-drain miss
+          // (mirrors this file's existing load>store read-port precedent).
           missPaddr := ldS1Paddr
           missSet   := ldS1Set
           missTag   := ldS1Tag
@@ -364,6 +391,24 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           missSize  := ldS1Size
           missCmode := ldS1Cmode
           victimWay := victim(ldS1Set)
+          refillReqIsStore := False
+          arSent    := False
+          busy      := True
+          goto(REFILL)
+        } .elsewhen(pendingStoreMiss) {
+          // A pending COPYBACK drain-miss (latched at store-S2, Step 2 above) --
+          // held and retried every IDLE cycle until the refill engine is free.
+          val pSet = pendingStorePaddr(offBits + setBits - 1 downto offBits)
+          val pTag = pendingStorePaddr(31 downto offBits + setBits)
+          missPaddr := pendingStorePaddr
+          missSet   := pSet
+          missTag   := pTag
+          missOff   := pendingStorePaddr(offBits - 1 downto 0)
+          missSize  := Size.LONG
+          missCmode := CacheMode.COPYBACK
+          victimWay := victim(pSet)
+          refillReqIsStore := True
+          pendingStoreMiss := False
           arSent    := False
           busy      := True
           goto(REFILL)
@@ -407,6 +452,9 @@ class DcachePlugin extends FiberPlugin with DcacheService {
               wrTagEn(w) := True
               wrTag(w)   := missTag
               valids(w)(missSet) := True
+              dirtys(w)(missSet) := False   // a fresh allocate is always clean until
+                                             // the write-allocate merge below (or a
+                                             // later hit) dirties it
             }
             victim(missSet) := victim(missSet) + 1
           }
@@ -419,17 +467,44 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       REPLAY.whenIsActive {
         busy := True
         when(missFault) {
-          // Task #189: the refill's AXI response errored — no line was allocated
-          // (REFILL above skipped the wr*/valids writes), so there is nothing to
-          // "replay" as a hit. Delivered directly via busFaultResp (one pulse);
-          // do NOT touch ldS1Valid/rdSet/rdEn here (a real re-launch would MISS
-          // again forever — the line is still, correctly, not resident).
-          busFaultResp := True
+          when(refillReqIsStore) {
+            // Drain-miss refill errored: NO allocation happened (doAllocate was
+            // False). Task P4.5 wires this into the async diagnostic-fault channel
+            // -- never architectural, never precise (a COPYBACK drain is always
+            // fast-path by construction: !fast requires the page NOT be cacheable).
+            diagFaultPulse     := True
+            diagFaultPulseAddr := missPaddr
+            diagFaultPulseResp := U(2, 2 bits)   // SLVERR-class; Task P4.5 refines
+            diagFaultPulseKind := U(1, 3 bits)   // kind=1: drain-miss write-allocate refill
+            storeAllocAckReg   := True           // still ack the (already-retired) drain
+          } otherwise {
+            // Task #189: the refill's AXI response errored — no line was allocated
+            // (REFILL above skipped the wr*/valids writes), so there is nothing to
+            // "replay" as a hit. Delivered directly via busFaultResp (one pulse);
+            // do NOT touch ldS1Valid/rdSet/rdEn here (a real re-launch would MISS
+            // again forever — the line is still, correctly, not resident).
+            busFaultResp := True
+          }
         } elsewhen(missCmode === CacheMode.INHIBITED) {
           // Task P1.4: no line was allocated (doAllocate was False above) — there
           // is nothing to "replay" as a hit. Deliver the just-fetched beat
           // directly, once, exactly like busFaultResp's one-pulse shape.
           inhibitedResp := True
+        } elsewhen(refillReqIsStore) {
+          // Merge the store's bytes into the just-allocated line, mark it dirty, ack
+          // the drain LOCALLY -- entirely off the retire timeline (this is a
+          // post-commit event; the fast-path store retired long ago at SQ-alloc).
+          val curBytes = missLine.subdivideIn(8 bits)
+          val mBytes   = pendingMergeData.subdivideIn(8 bits)
+          val newBytes = Vec(Bits(8 bits), 16)
+          for (i <- 0 until 16) newBytes(i) := Mux(pendingMergeStrb(i), mBytes(i), curBytes(i))
+          for (w <- 0 until ways) when(victimWay === U(w, wayBits bits)) {
+            wrEn(w)   := True
+            wrSet(w)  := missSet
+            wrData(w) := newBytes.asBits
+            dirtys(w)(missSet) := True
+          }
+          storeAllocAckReg := True
         } otherwise {
           // Re-launch the read for the just-filled line; resolve as a guaranteed hit
           // into the response register one cycle later via the ldS1 path.
@@ -518,13 +593,18 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         // comes from cbHitAckReg below instead.
         stAwDone := True
         stWDone  := True
-      } otherwise {
-        // WRITETHROUGH hit/miss (fast path, unchanged from before this task),
-        // INHIBITED (precise path, unchanged from before this task), and COPYBACK
-        // MISS (fast path -- Task P4.2 intercepts this case and overrides stAwDone/
-        // stWDone back to True + routes to write-allocate instead; left as the
-        // "issue an AXI beat" default here so P4.2's own gate is a pure ADDITION,
-        // not a rewrite of this block).
+      } .elsewhen(stS2Copyback && !stS2HitAny) {
+        // COPYBACK MISS: post-commit write-allocate, off the retire path entirely.
+        // No AXI beat is issued directly from S2 -- the refill engine issues the AR.
+        stAwDone := True
+        stWDone  := True
+        pendingStoreMiss  := True
+        pendingStorePaddr := stS2Payload.paddr
+        pendingMergeData  := mergeData
+        pendingMergeStrb  := mergeStrb
+      } .otherwise {
+        // WRITETHROUGH hit/miss (fast path, unchanged from before this task) and
+        // INHIBITED (precise path, unchanged from before this task).
         stAwDone := False
         stWDone  := False
       }
@@ -562,7 +642,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // nothing downstream reads it yet (wired into the SQ's precise-path drain
     // resolution in P2.5, the async diagnostic-fault channel in P4.6).
     storeErrReg := axi.b.valid && axi.b.ready && (axi.b.payload.resp =/= Axi4.resp.OKAY)
-    storeAckReg := (axi.b.valid && axi.b.ready) || cbHitAckReg
+    storeAckReg := (axi.b.valid && axi.b.ready) || cbHitAckReg || storeAllocAckReg
   }
 
   override def loadCmd  = logic.loadCmdPort

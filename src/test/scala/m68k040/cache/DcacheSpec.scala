@@ -470,4 +470,85 @@ class DcacheSpec extends AnyFunSuite {
       cd.waitSampling(4)
     }
   }
+
+  // (m) Task P4.2: a COPYBACK store to a NOT-resident line (cold, no prior load)
+  // drains via post-commit write-allocate off the (shared) load-refill engine --
+  // exactly one AXI AR/R refill, ZERO AXI aw/w beats (the merge happens on-chip
+  // after the line lands), the merged line is left dirty, and a subsequent hit
+  // load observes the merged value with NO further refill. `busFaultResp` (the
+  // architectural-fault carrier) must never pulse -- this is a clean drain, not
+  // a fault path.
+  test("COPYBACK miss drains via write-allocate: sets valid+dirty, no architectural fault",
+       VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0xB000L
+      preload(mem, base, 16)
+      // No prior load -- the line is NOT resident at this address.
+
+      var arCount = 0
+      var awCount = 0
+      var wCount  = 0
+      var faulted = false
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1
+          if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean) awCount += 1
+          if (dut.dcache.logic.axi.w.valid.toBoolean  && dut.dcache.logic.axi.w.ready.toBoolean)  wCount  += 1
+          if (dut.dcache.logic.busFaultResp.toBoolean) faulted = true
+        }
+      }
+
+      dut.probe.logic.storeIn.valid #= true
+      dut.probe.logic.storeIn.payload.paddr #= base + 4
+      dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
+      dut.probe.logic.storeIn.payload.size #= Size.LONG
+      dut.probe.logic.storeIn.payload.useStrb #= false
+      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+      cd.waitSampling()
+      dut.probe.logic.storeIn.valid #= false
+
+      // The drain now depends on an actual AXI refill round trip (AR handshake +
+      // R data + REPLAY merge), unlike the COPYBACK-hit case's immediate local
+      // ack -- give it real slack.
+      var cyc = 0
+      var acked = false
+      while (!acked && cyc < 60) {
+        cd.waitSampling()
+        cyc += 1
+        if (dut.dcache.logic.storeAckReg.toBoolean) acked = true
+      }
+      assert(acked, s"COPYBACK-miss drain must eventually ack via write-allocate (none seen by cycle $cyc)")
+
+      cd.waitSampling(6)
+      assert(!faulted, "a clean COPYBACK-miss drain must never raise busFaultResp (no architectural fault)")
+      assert(arCount == 1, s"write-allocate refill must issue exactly one AXI AR beat: got $arCount")
+      assert(awCount == 0, s"COPYBACK-miss drain must issue ZERO AXI aw beats (merge is on-chip): got $awCount")
+      assert(wCount == 0, s"COPYBACK-miss drain must issue ZERO AXI w beats (merge is on-chip): got $wCount")
+
+      // Memory must remain UNTOUCHED by the store's own bytes -- no AXI write ever
+      // happened; only the refill's READ of the preloaded image occurred.
+      assert(mem.peekByte(base + 4) == memByte(base + 4), "mem byte +4 unwritten (write-allocate is on-chip only)")
+      assert(mem.peekByte(base + 7) == memByte(base + 7), "mem byte +7 unwritten (write-allocate is on-chip only)")
+
+      // The dirty bit for this set (some way) must now be set.
+      val setIdx = ((base + 4) >> 4) & 0x7F
+      val anyDirty = (0 until 4).exists(w => dut.dcache.logic.dirtys(w)(setIdx.toInt).toBoolean)
+      assert(anyDirty, s"dirtys must be set for set $setIdx after a COPYBACK-miss write-allocate drain")
+
+      // The line is now resident (valid): a subsequent hit load sees the merged
+      // value WITHOUT triggering a second refill.
+      val beforeAr = arCount
+      val got = load(dut, cd, base + 4, Size.LONG, CacheMode.COPYBACK)
+      assert(got == BigInt("CAFEBABE", 16), s"write-allocated line holds the merged store: got ${got.toString(16)}")
+      assert(arCount == beforeAr, s"post-allocate reload must be a HIT (no second refill): $beforeAr -> $arCount")
+
+      // Neighboring bytes (not covered by the store's strobe) came from the
+      // refill's read of the original preloaded image, untouched by the merge.
+      val neighbor = load(dut, cd, base, Size.LONG, CacheMode.COPYBACK)
+      assert(neighbor == expected(base, 4), s"neighbor bytes preserved from refill image: got ${neighbor.toString(16)}")
+      cd.waitSampling(4)
+    }
+  }
 }
