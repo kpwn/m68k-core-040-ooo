@@ -206,6 +206,16 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val diagFaultPulseResp = UInt(2 bits);  diagFaultPulseResp := U(0, 2 bits)
     val diagFaultPulseKind = UInt(3 bits);  diagFaultPulseKind := U(0, 3 bits)
 
+    // Review-added (kind=0/kind=1 collision detector -- see the sticky-latch comment
+    // below near `diagFaultValid`): each site additionally raises its OWN
+    // single-driver flag so a same-cycle collision between kind=0 (WT-beat, an
+    // ordinary combinational `when`) and kind=1 (drain-miss write-allocate refill,
+    // inside REPLAY's `whenIsActive`) can be asserted on directly, independent of
+    // which one wins the shared diagFaultPulse*/Kind wires. Zero synth cost beyond
+    // the assert itself (sim-only consumer).
+    val diagFaultKind0Fires = Bool(); diagFaultKind0Fires := False
+    val diagFaultKind1Fires = Bool(); diagFaultKind1Fires := False
+
     // ---- defaults ----
     loadCmdPort.ready := False
     axi.ar.valid := False
@@ -823,6 +833,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
             diagFaultPulseAddr := missPaddr
             diagFaultPulseResp := U(2, 2 bits)   // SLVERR-class; Task P4.5 refines
             diagFaultPulseKind := U(1, 3 bits)   // kind=1: drain-miss write-allocate refill
+            diagFaultKind1Fires := True          // review-added collision detector
             storeAllocAckReg   := True           // still ack the (already-retired) drain
           } otherwise {
             // Task #189: the refill's AXI response errored — no line was allocated
@@ -1067,12 +1078,32 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       diagFaultPulseAddr := stAddrReg
       diagFaultPulseResp := axi.b.payload.resp.asUInt.resize(2)
       diagFaultPulseKind := U(0, 3 bits)   // kind=0: WT-beat / INHIBITED-drain
+      diagFaultKind0Fires := True          // review-added collision detector
     }
 
     // Sticky latch across all diagFaultPulse sites (kind=0 here; kind=1 drain-miss
     // write-allocate refill ~L822; kind=2 dirty-victim eviction writeback ~L738).
     // First-error-wins: `!diagFaultValid` in the guard below means the latch, once
     // set, is never overwritten by a later pulse.
+    //
+    // Review note: kind=0 (this WT-beat site, an ordinary combinational `when`) and
+    // kind=1 (the drain-miss write-allocate refill site, ~L822, inside REPLAY's
+    // `whenIsActive` body) are NOT structurally mutually exclusive by construction --
+    // unlike kind=0/kind=2 (both gate on the same single-valued `axi.b.payload.id`,
+    // so they can never both be true the same cycle) and kind=1/kind=2 (different,
+    // mutually-exclusive FSM states). Today kind=0 and kind=1 never collide only
+    // because this file's own "single-outstanding store" producer contract
+    // (see the STORE write-through comment block above, ~L315-319) guarantees the
+    // WT-beat's AXI B and a drain-miss refill can never both be in flight at once --
+    // that is a PRODUCER-DISCIPLINE invariant, not a hardware interlock on this
+    // latch. If that contract were ever violated, `StateMachine` bodies elaborate as
+    // a `prePopTask` (this file's own documented wrEn/wrData last-assignment-wins
+    // gotcha, see the P4.4 array-write-port comment above, ~L495-501) -- so kind=1's
+    // `diagFaultPulse := True` would elaborate AFTER kind=0's, and on a genuine
+    // same-cycle collision kind=1 would silently WIN, dropping the WT-beat error
+    // from this diagnostic channel with no visible sign (both pulses still feed the
+    // same `diagFaultPulse`/`diagFaultPulseKind` wires -- last-assignment-wins on
+    // the whole bundle, not a per-kind merge).
     val diagFaultValid = RegInit(False)
     val diagFaultAddr  = Reg(UInt(32 bits))
     val diagFaultResp  = Reg(UInt(2 bits))
@@ -1088,13 +1119,38 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       diagFaultKind  := diagFaultPulseKind
     }
 
+    // Review-added: make the kind=0/kind=1 hazard documented above loudly
+    // detectable instead of silently possible. This does NOT protect the sticky
+    // latch (a real fix would need a proper per-kind arbiter/merge) -- it only
+    // proves whether the "single-outstanding store" producer contract the
+    // hazard's absence relies on is ever actually violated. See the sticky-latch
+    // comment above for the full hazard description.
+    GenerationFlags.simulation {
+      assert(!(diagFaultKind0Fires && diagFaultKind1Fires),
+        "DcachePlugin: kind=0 (WT-beat) and kind=1 (drain-miss write-allocate refill) diagnostic-fault pulses fired the SAME cycle -- the single-outstanding-store producer contract this file relies on to avoid arbitrating between them was violated; the sticky latch just silently dropped one of the two errors",
+        FAILURE)
+    }
+
     // Sim-side: fatal by default (design doc Sec 4.2/Sec 5 item 4) unless a directed
     // test explicitly opts in. A test that WANTS to trigger this path pokes
     // diagFaultExpected := True before doing so.
+    //
+    // Explicit `FAILURE` severity (3-arg form) -- NOT relying on the 2-arg
+    // assert(cond, msg) overload's default severity (which, as of SpinalHDL
+    // 1.14.1, does also happen to be FAILURE, confirmed by direct bytecode
+    // inspection + a live-sim probe test). This is written explicitly anyway so
+    // this call stays fatal even if a future SpinalHDL version changes that
+    // default -- `FAILURE` is the one severity that actually emits a Verilog
+    // `$finish` (via SpinalSim's fatal-assert detection); `ERROR`/`WARNING`/`NOTE`
+    // only `$display`/`$warning`/`$info` and let simulation continue. NOTE: none
+    // of this matters unless the enclosing SpinalConfig also has
+    // `.includeSimulation` set (see M68kSim.scala) -- without it this whole
+    // `GenerationFlags.simulation { ... }` block is never even elaborated.
     val diagFaultExpected = RegInit(False); diagFaultExpected.simPublic()
     GenerationFlags.simulation {
       assert(!(diagFaultPulse && !diagFaultExpected),
-        "DcachePlugin: unexpected async diagnostic fault (a trusted-cacheable-path AXI transaction errored) -- if this test intends to exercise it, poke diagFaultExpected := True first")
+        "DcachePlugin: unexpected async diagnostic fault (a trusted-cacheable-path AXI transaction errored) -- if this test intends to exercise it, poke diagFaultExpected := True first",
+        FAILURE)
     }
   }
 

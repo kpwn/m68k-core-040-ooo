@@ -438,8 +438,13 @@ class StoreQueue(depth: Int = 8) extends Component {
   // against a drain that just resolved. ----
   val preciseDrainBusyReg = RegInit(False)
   val preciseResolves = io.drainAck && drainBusy && precises(head)
+  // Named (not just inlined in the `.elsewhen` below) so the fatal-assert fix
+  // (Task: verification-integrity gap, 2026-08-02) can reuse it as the
+  // "did a genuine ack just explain this re-issue" discriminator below --
+  // see that assert's comment for why.
+  val precisePhaseJustAdvanced = RegNext(preciseResolves, init = False)
   when(headPreciseReady && !drainBusy) { preciseDrainBusyReg := True }
-    .elsewhen(RegNext(preciseResolves, init = False)) { preciseDrainBusyReg := False }
+    .elsewhen(precisePhaseJustAdvanced) { preciseDrainBusyReg := False }
   io.preciseDrainBusy := preciseDrainBusyReg
 
   // Priority-rule invariant (design doc §4.1/§5 item 8): once a precise drain has
@@ -450,9 +455,36 @@ class StoreQueue(depth: Int = 8) extends Component {
   // anywhere except headPreciseReady's own term). This assert exists purely to
   // catch a FUTURE edit that accidentally threads irqPreemptPendingIn into the
   // busy path and silently reintroduces the double-issue hazard.
+  //
+  // FIX (Task: verification-integrity gap, 2026-08-02): making this fatal for the
+  // first time (previously `GenerationFlags.simulation` was never actually
+  // elaborated in this project's sim configs -- see M68kSim.scala) immediately
+  // exposed a FALSE POSITIVE, not a real bug: a SPLIT precise store's legitimate
+  // slot-A-ack -> slot-B-drainIssue transition ALSO satisfies the original
+  // `preciseDrainBusyReg && drainIssue && precises(head)` condition, because
+  // `preciseDrainBusyReg` is (correctly, deliberately) held continuously across
+  // BOTH halves of an atomic split drain (see the drain-handshake block above:
+  // slot A's ack advances `drainPhaseB` without popping the entry, and
+  // `drainBusy` clearing on that same ack is exactly what re-arms `drainIssue`
+  // for slot B). That is by design, not the hazard this assert is meant to catch
+  // -- confirmed via StoreQueueSpec's own two "split precise store ..." tests,
+  // which predate this assert and specifically exercise that exact sequence.
+  // The ACTUAL hazard (irqPreemptPendingIn or similar getting threaded into
+  // `drainBusy`'s clear path, letting `drainIssue` refire WITHOUT a genuine ack)
+  // is distinguished from the legitimate split-drain advance by whether a real
+  // `io.drainAck && drainBusy && precises(head)` (`preciseResolves`) fired the
+  // PRECEDING cycle -- `precisePhaseJustAdvanced` above already computes exactly
+  // that (it is also what legitimately clears `preciseDrainBusyReg` on a final
+  // pop). Excluding it here keeps the assert catching the real hazard (a
+  // re-issue with NO intervening ack) while no longer false-triggering on an
+  // ack-explained phase advance.
+  // Explicit `FAILURE` severity -- see M68kSim.scala for why `.includeSimulation`
+  // must also be set on the enclosing SpinalConfig for this block to elaborate at
+  // all (without it, `GenerationFlags.simulation { ... }` is silently skipped).
   GenerationFlags.simulation {
-    assert(!(preciseDrainBusyReg && drainIssue && precises(head)),
-      "StoreQueue: a precise drain re-issued while preciseDrainBusyReg was already held")
+    assert(!(preciseDrainBusyReg && drainIssue && precises(head) && !precisePhaseJustAdvanced),
+      "StoreQueue: a precise drain re-issued while preciseDrainBusyReg was already held, with no intervening ack to explain it",
+      FAILURE)
   }
 
   // ---- flush: squash speculative (uncommitted) entries. Roll tail back to just
@@ -492,9 +524,13 @@ class StoreQueue(depth: Int = 8) extends Component {
   // alloc Flow has no ready, so a missing WAIT_SQ back-pressure would silently
   // overrun the ring and corrupt `count`/`head`/`tail`). A flush this cycle squashes
   // speculative entries, so allow alloc+flush coincidence.
+  // Explicit `FAILURE` severity -- see M68kSim.scala for why `.includeSimulation`
+  // must also be set on the enclosing SpinalConfig for this block to elaborate at
+  // all (without it, `GenerationFlags.simulation { ... }` is silently skipped).
   GenerationFlags.simulation {
     assert(!(io.alloc.valid && io.full && !io.flush),
-      "StoreQueue: alloc fired while full — missing LS-EU back-pressure (WAIT_SQ)")
+      "StoreQueue: alloc fired while full — missing LS-EU back-pressure (WAIT_SQ)",
+      FAILURE)
   }
 
   // ---- empty: no resident entry AND no drain in flight ----

@@ -1103,9 +1103,13 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // LAUNCHED precise drain must never coexist with a newly-recognized interrupt at
     // the SAME head. This assert exists purely to catch a future edit that loosens
     // normalIrqGate's preciseDrainBusyIn term.
+    // Explicit `FAILURE` severity -- see M68kSim.scala for why `.includeSimulation`
+    // must also be set on the enclosing SpinalConfig for this block to elaborate at
+    // all (without it, `GenerationFlags.simulation { ... }` is silently skipped).
     GenerationFlags.simulation {
       assert(!(interruptPending && preciseDrainBusyIn),
-        "RobPlugin: interruptPending recognized while a precise SQ drain was in flight")
+        "RobPlugin: interruptPending recognized while a precise SQ drain was in flight",
+        FAILURE)
     }
     // Consume the NMI latch the same cycle it is actually taken — gated on `nmiPending`
     // itself (not the live `iplIn`), so a latched edge is serviced as vector/level 7

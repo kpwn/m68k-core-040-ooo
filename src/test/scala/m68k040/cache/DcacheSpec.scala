@@ -361,11 +361,20 @@ class DcacheSpec extends AnyFunSuite {
     simConfig.compile(new Dut).doSim { dut =>
       val (cd, mem) = initDutErrInject(dut)
 
+      dut.dcache.logic.diagFaultExpected #= false
       val errGood1 = doStoreAckGatedObserveErr(dut, cd, 0x1000L, BigInt("ABCD", 16))
       assert(!errGood1, "storeErr must NOT pulse on an OKAY B (decoded address)")
 
+      // This store deliberately drives a bus error (undecoded address -> DECERR) to
+      // exercise storeErr -- opt in via diagFaultExpected before triggering it (else
+      // the sim-side assert in DcachePlugin's own P4.5 GenerationFlags.simulation
+      // block fires fatally, per that file's documented "poke diagFaultExpected :=
+      // True first" contract; same pattern as the "diagFault sticky-latches..."
+      // tests below).
+      dut.dcache.logic.diagFaultExpected #= true
       val errBad = doStoreAckGatedObserveErr(dut, cd, 0xAAAA0000L, BigInt("DEAD", 16))
       assert(errBad, "storeErr MUST pulse on a non-OKAY B (undecoded address -> DECERR)")
+      dut.dcache.logic.diagFaultExpected #= false
 
       val errGood2 = doStoreAckGatedObserveErr(dut, cd, 0x1010L, BigInt("1234", 16))
       assert(!errGood2, "storeErr must not remain latched/stuck after a prior error pulse")
