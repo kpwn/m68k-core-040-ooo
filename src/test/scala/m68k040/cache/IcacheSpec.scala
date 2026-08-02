@@ -2,6 +2,7 @@ package m68k040.cache
 
 import m68k040.{M68kParams, VerilatorTest}
 import m68k040.mmu.IdentityTranslationPlugin
+import m68k040.services.TranslationService
 import m68k040.core.ParamPlugin
 import spinal.core._
 import spinal.core.sim._
@@ -15,12 +16,16 @@ import org.scalatest.funsuite.AnyFunSuite
 class IcacheSpec extends AnyFunSuite {
 
   // ---- Dut: host plugins; IcachePlugin's during-build ports become top-level IO automatically ----
-  class Dut extends Component {
+  // `xlateFactory` defaults to the plain identity stub (every existing test below is
+  // unaffected); the cacheMode-directed tests pass `new ICacheModeTranslationPlugin`
+  // instead, so a specific fetch's cache mode (WRITETHROUGH vs INHIBITED) can be
+  // sim-poked without standing up a full ITLB + page-table walker.
+  class Dut(xlateFactory: => FiberPlugin with TranslationService = new IdentityTranslationPlugin) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
 
     val param  = new ParamPlugin(M68kParams())
-    val xlate  = new IdentityTranslationPlugin
+    val xlate  = xlateFactory
     val icache = new IcachePlugin
     val probe  = new FetchProbePlugin   // exposes cmdIn/rspOut top-level IO
 
@@ -318,6 +323,102 @@ class IcacheSpec extends AnyFunSuite {
         assert(got == IcacheSim.window64(base + off),
           s"streaming hit at +$off mismatch: got 0x${got.toString(16)} expected 0x${IcacheSim.window64(base + off).toString(16)}")
       }
+      cd.waitSampling(4)
+    }
+  }
+
+  // ---- I-side cacheMode wiring (mirrors DcachePlugin task P1.4's D-side tests) ----
+
+  /** Configure the poke-able translation stub so `vpn` (addr >> 12) resolves to
+    * INHIBITED; every other VPN stays WRITETHROUGH (the stub's default). */
+  def setInhibited(dut: Dut, vpn: Long): Unit = {
+    val x = dut.xlate.asInstanceOf[ICacheModeTranslationPlugin]
+    x.logic.cmodeEn  #= true
+    x.logic.cmodeVpn #= vpn
+    x.logic.cmodeSel #= CacheMode.INHIBITED
+  }
+
+  def clearCmodeOverride(dut: Dut): Unit =
+    dut.xlate.asInstanceOf[ICacheModeTranslationPlugin].logic.cmodeEn #= false
+
+  // (I-g) an INHIBITED-mode fetch never allocates an I-cache line: repeated fetches
+  // to the SAME address each issue a fresh AXI refill (no resident line is ever
+  // created) — mirrors DcacheSpec's "inhibited load never allocates a line".
+  test("inhibited fetch never allocates an I-cache line", VerilatorTest) {
+    simConfig.compile(new Dut(new ICacheModeTranslationPlugin)).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      clearCmodeOverride(dut)
+      cd.waitSampling(2)
+      pulseInvalidateAll(dut, cd)
+
+      val base = 0xB000L
+      setInhibited(dut, base >> 12)
+
+      var arCount = 0
+      fork { while (true) { cd.waitSampling()
+        if (dut.icache.logic.axi.ar.valid.toBoolean && dut.icache.logic.axi.ar.ready.toBoolean) arCount += 1 } }
+
+      val got1 = fetch(dut, cd, base)
+      assert(got1 == IcacheSim.window64(base), "inhibited fetch still returns correct data")
+      val after1 = arCount
+      assert(after1 == 1, s"first inhibited fetch must refill once: $after1")
+
+      val got2 = fetch(dut, cd, base)
+      assert(got2 == IcacheSim.window64(base), "second inhibited fetch still returns correct data")
+      val after2 = arCount
+      assert(after2 == after1 + 1,
+        s"a SECOND inhibited fetch to the SAME line must ALSO refill (no line was ever allocated): $after1 -> $after2")
+      cd.waitSampling(4)
+    }
+  }
+
+  // (I-h) an INHIBITED-mode fetch bypasses a resident cached alias: a prior
+  // CACHEABLE (WRITETHROUGH) fetch at the same address left a line resident;
+  // memory is then mutated directly (bypassing the cache entirely, like an MMIO
+  // register changing on its own, or a page whose cache-mode attribute changed
+  // after the line was cached). The inhibited fetch must see the NEW value, never
+  // the stale resident alias — mirrors DcacheSpec's "inhibited load bypasses a
+  // resident cached alias".
+  test("inhibited fetch bypasses a stale resident cached alias", VerilatorTest) {
+    simConfig.compile(new Dut(new ICacheModeTranslationPlugin)).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      val (_, sparse) = IcacheSim.attachMemoryMutable(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      clearCmodeOverride(dut)
+      cd.waitSampling(2)
+      pulseInvalidateAll(dut, cd)
+
+      val base = 0xC000L
+      // warm the line as ordinary cacheable (WRITETHROUGH, the stub's default)
+      val warm = fetch(dut, cd, base)
+      assert(warm == IcacheSim.window64(base), "warm cacheable fetch")
+
+      // mutate memory underneath the now-resident line, bypassing the cache
+      // entirely (the freshly poked bytes deliberately differ from memByte()).
+      sparse.write(base + 0, 0xAA.toByte)
+      sparse.write(base + 1, 0xBB.toByte)
+      sparse.write(base + 2, 0xCC.toByte)
+      sparse.write(base + 3, 0xDD.toByte)
+      sparse.write(base + 4, 0x11.toByte)
+      sparse.write(base + 5, 0x22.toByte)
+      sparse.write(base + 6, 0x33.toByte)
+      sparse.write(base + 7, 0x44.toByte)
+      val mutated = BigInt("44332211DDCCBBAA", 16)
+
+      setInhibited(dut, base >> 12)
+      val got = fetch(dut, cd, base)
+      assert(got == mutated,
+        s"inhibited fetch must bypass the stale resident alias: got 0x${got.toString(16)} expected 0x${mutated.toString(16)}")
       cd.waitSampling(4)
     }
   }

@@ -43,6 +43,29 @@ object IcacheSim {
     }
   }
 
+  /** Same as `attachMemory`, but also returns the backing `SparseMemory` so a test
+    * can mutate it AFTER attach (e.g. simulating an MMIO register / device memory
+    * changing underneath a resident I-cache line, bypassing the cache entirely) —
+    * `attachMemory` above returns only the agent, with no way to poke memory post-
+    * attach. Mirrors `DcacheSpec`'s `BehavioralMemAgent.pokeByte` used for the
+    * analogous D-side "inhibited load bypasses a resident cached alias" test. */
+  def attachMemoryMutable(
+      axi: Axi4ReadOnly,
+      cd: ClockDomain,
+      base: Long,
+      size: Int
+  ): (Axi4ReadOnlySlaveAgent, SparseMemory) = {
+    val mem = SparseMemory()
+    val img = Array.tabulate(size)(i => memByte(base + i).toByte)
+    mem.writeArray(base, img)
+
+    val agent = new Axi4ReadOnlySlaveAgent(axi, cd) {
+      override def readByte(address: BigInt, id: Int): Byte =
+        mem.read(address.toLong)
+    }
+    (agent, mem)
+  }
+
   def attachMemoryWithWords(axi: Axi4ReadOnly, cd: ClockDomain, base: Long, words: Seq[Int]): Axi4ReadOnlySlaveAgent = {
     val mem = SparseMemory()
     words.zipWithIndex.foreach { case (w, i) =>

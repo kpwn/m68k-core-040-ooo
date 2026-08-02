@@ -96,12 +96,31 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val tPc    = Reg(UInt(32 bits))
     val tPaddr = Reg(UInt(32 bits))   // {ppn, pc[11:0]} captured at translate time
     val tFault = RegInit(False)
+    // Cache-mode attribute (MMU page CM bits / DTT-ITT window), captured alongside
+    // tPaddr/tFault at the SAME translate-time register point. An INHIBITED I-fetch
+    // must never allocate into the I-cache (device/MMIO instruction space, or a
+    // deliberately non-cacheable region — self-modifying-code / debug scenarios rely
+    // on every fetch seeing fresh memory) and must never be satisfied by a stale
+    // resident line left over from before the mapping's cache-mode attribute changed.
+    // Mirrors DcachePlugin's ldS1Cmode/missCmode (task P1.4).
+    val tCmode = Reg(CacheMode())
+
+    // Derived off the REGISTERED tCmode (same register the hit-detect cone already
+    // reads tPaddr from) — an INHIBITED fetch forces every way's hit bit low below,
+    // so a stale resident alias is bypassed rather than served, and it always falls
+    // through to the miss/REFILL path (which itself refuses to allocate — see the
+    // PREDECODE `doAllocate` gate below).
+    val tCacheable = tCmode =/= CacheMode.INHIBITED
 
     // ---- miss-state latches ----
     val missPC    = Reg(UInt(32 bits))
     val missPA    = Reg(UInt(32 bits))   // translated physical line address (refill AXI)
     val missSet   = Reg(UInt(setBits bits))
     val missTag   = Reg(UInt(tagBits bits))
+    // Cacheability of the access that caused this miss, latched at miss-detect time
+    // (same instant missPA/missSet/missTag are latched) so REFILL/PREDECODE's
+    // allocate gate sees the SAME cache-mode the missing fetch actually had.
+    val missCacheable = Reg(Bool())
     val victimWay = Reg(UInt(wayBits bits))
     val beatCnt   = Reg(UInt(1 bits)) init U(0, 1 bits)
     val arSent    = Reg(Bool()) init False
@@ -204,7 +223,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val idleTag   = tPaddr(31 downto 12)
     val hitVec = Vec(Bool(), ways)
     for (w <- 0 until ways)
-      hitVec(w) := valids(w)(idleSet) && (tagMem(w).readAsync(idleSet) === idleTag)
+      hitVec(w) := tCacheable && valids(w)(idleSet) && (tagMem(w).readAsync(idleSet) === idleTag)
     val isHit       = hitVec.orR
     val hitWayIdx   = OHToUInt(hitVec)
     val idleBeatSel = idlePc(5)
@@ -302,6 +321,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
             // PHYSICAL line base for the refill: the registered translated PA =
             // {ppn, pc[11:0]} (MMU-off identity: ppn == pc[31:12], == the VA).
             missPA    := tPaddr
+            missCacheable := tCacheable
             victimWay := victim(idleSet)
             beatCnt   := U(0, 1 bits)
             arSent    := False
@@ -320,6 +340,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
           tPc    := cmdPort.payload.pc
           tPaddr := (xlate.rsp.ppn ## cmdPort.payload.pc(11 downto 0)).asUInt
           tFault := xlate.rsp.fault
+          tCmode := xlate.rsp.cacheMode
         }
       }
 
@@ -430,14 +451,29 @@ class IcachePlugin extends FiberPlugin with FetchService {
             extW2Valid = i + 2 < nWords,
             extW3Valid = i + 3 < nWords)))
         val packed = chunks.asBits
+        // Task (I-side cacheMode wiring, mirrors DcachePlugin task P1.4): an
+        // INHIBITED-mode fetch never allocates a line — no tag/valid write, no
+        // victim-pointer advance (this way is not consumed; the same victim way is
+        // tried again on the NEXT real allocation to this set). predMem/dataMem are
+        // still written unconditionally (dataMem already was, in REFILL above) so
+        // REPLAY can deliver the just-fetched data + predecode directly — that
+        // delivery never goes through the hit/valid path, so leaving the array
+        // entries written-but-unclaimed is harmless (mirrors the D-side's
+        // missLine/inhibitedResp direct-delivery shape, adapted to this file's
+        // already-separated data-write (REFILL) / tag-claim (PREDECODE) stages).
+        val doAllocate = missCacheable
         for (w <- 0 until ways) {
           when(victimWay === U(w, wayBits bits)) {
             predMem(w).write(missSet, packed)
-            tagMem(w).write(missSet, missTag)
-            valids(w)(missSet) := True
+            when(doAllocate) {
+              tagMem(w).write(missSet, missTag)
+              valids(w)(missSet) := True
+            }
           }
         }
-        victim(missSet) := victim(missSet) + 1
+        when(doAllocate) {
+          victim(missSet) := victim(missSet) + 1
+        }
         goto(REPLAY)
       }
 
