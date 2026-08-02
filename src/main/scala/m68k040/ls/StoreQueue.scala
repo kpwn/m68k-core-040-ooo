@@ -223,6 +223,7 @@ class StoreQueue(depth: Int = 8) extends Component {
     io.drain.payload.strb     := strbAs(head)
     io.drain.payload.lineData := lineDataAs(head)
     io.drain.payload.cacheMode := cacheModes(head)
+    io.drain.payload.precise  := precises(head)
   } otherwise {
     io.drain.payload.paddr    := paddrBs(head)
     io.drain.payload.data     := B(0, 32 bits)
@@ -231,6 +232,7 @@ class StoreQueue(depth: Int = 8) extends Component {
     io.drain.payload.strb     := strbBs(head)
     io.drain.payload.lineData := lineDataBs(head)
     io.drain.payload.cacheMode := cacheModes(head)
+    io.drain.payload.precise  := precises(head)
   }
 
   // ---- forwarding (combinational), DUAL-SLOT ----

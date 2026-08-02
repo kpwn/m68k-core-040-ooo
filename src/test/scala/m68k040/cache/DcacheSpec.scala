@@ -359,4 +359,115 @@ class DcacheSpec extends AnyFunSuite {
       cd.waitSampling(4)
     }
   }
+
+  // (k) Task P4.1: a COPYBACK-hit store drain resolves ENTIRELY on-chip -- it merges
+  // into the line, sets the line's dirty bit, and acks off the registered S2-local
+  // pulse (cbHitAckReg) instead of an AXI B round trip. ZERO axi.aw/axi.w activity.
+  test("COPYBACK hit drain resolves locally: no AXI aw/w, acks within ~3 cycles, sets dirtys",
+       VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x4000L
+      preload(mem, base, 16)
+      // Warm the line. Allocation on a cold miss is unconditional for any non-
+      // INHIBITED mode (the resident tag/valid array carries no cache-mode of its
+      // own), so which mode warms it is irrelevant to hit-detection.
+      load(dut, cd, base, Size.LONG, CacheMode.WRITETHROUGH)
+
+      var awCount = 0
+      var wCount  = 0
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean) awCount += 1
+          if (dut.dcache.logic.axi.w.valid.toBoolean  && dut.dcache.logic.axi.w.ready.toBoolean)  wCount  += 1
+        }
+      }
+
+      dut.probe.logic.storeIn.valid #= true
+      dut.probe.logic.storeIn.payload.paddr #= base + 4
+      dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
+      dut.probe.logic.storeIn.payload.size #= Size.LONG
+      dut.probe.logic.storeIn.payload.useStrb #= false
+      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+      cd.waitSampling()
+      dut.probe.logic.storeIn.valid #= false
+
+      // Local ack (cbHitAckReg -> storeAckReg) must land within ~3 cycles of the
+      // drain being presented (design doc: "S2 or the following cycle") -- give a
+      // small margin above the expected 3 to avoid pipeline-count brittleness.
+      var cyc = 0
+      var acked = false
+      while (!acked && cyc < 5) {
+        cd.waitSampling()
+        cyc += 1
+        if (dut.dcache.logic.storeAckReg.toBoolean) acked = true
+      }
+      assert(acked, s"COPYBACK-hit drain must ack within ~3 cycles (none seen by cycle $cyc)")
+      assert(cyc <= 4, s"COPYBACK-hit drain ack landed suspiciously late (cycle $cyc), expected ~3")
+
+      cd.waitSampling(6)
+      assert(awCount == 0, s"COPYBACK hit drain must issue ZERO AXI aw beats: got $awCount")
+      assert(wCount == 0, s"COPYBACK hit drain must issue ZERO AXI w beats: got $wCount")
+
+      // Memory must remain UNTOUCHED -- no AXI write ever happened on this path; the
+      // merged data lives only in the cache line + its new dirty bit.
+      assert(mem.peekByte(base + 4) == memByte(base + 4), "mem byte +4 must be unwritten (copyback hit, no AXI beat)")
+      assert(mem.peekByte(base + 5) == memByte(base + 5), "mem byte +5 must be unwritten (copyback hit, no AXI beat)")
+      assert(mem.peekByte(base + 6) == memByte(base + 6), "mem byte +6 must be unwritten (copyback hit, no AXI beat)")
+      assert(mem.peekByte(base + 7) == memByte(base + 7), "mem byte +7 must be unwritten (copyback hit, no AXI beat)")
+
+      // The dirty bit for this set (some way) must now be set.
+      val setIdx = ((base + 4) >> 4) & 0x7F
+      val anyDirty = (0 until 4).exists(w => dut.dcache.logic.dirtys(w)(setIdx.toInt).toBoolean)
+      assert(anyDirty, s"dirtys must be set for set $setIdx after a COPYBACK hit drain")
+
+      // The merge landed in the cache array: a subsequent hit load sees the new value.
+      val got = load(dut, cd, base + 4, Size.LONG, CacheMode.COPYBACK)
+      assert(got == BigInt("CAFEBABE", 16), s"COPYBACK hit line updated: got ${got.toString(16)}")
+      cd.waitSampling(4)
+    }
+  }
+
+  // (l) Task P4.1 regression guard: a WRITETHROUGH hit drain is BYTE-FOR-BYTE
+  // UNCHANGED from before this task -- still issues exactly one AXI aw+w beat pair,
+  // still writes memory synchronously, and NEVER sets a dirty bit (dirtys is a
+  // COPYBACK-only concept).
+  test("WRITETHROUGH hit drain is unchanged: issues one AXI beat, never sets dirtys",
+       VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x4200L
+      preload(mem, base, 16)
+      load(dut, cd, base, Size.LONG, CacheMode.WRITETHROUGH)
+
+      var awCount = 0
+      var wCount  = 0
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean) awCount += 1
+          if (dut.dcache.logic.axi.w.valid.toBoolean  && dut.dcache.logic.axi.w.ready.toBoolean)  wCount  += 1
+        }
+      }
+
+      doStore(dut, cd, base + 4, BigInt("11223344", 16), Size.LONG, CacheMode.WRITETHROUGH)
+
+      assert(awCount == 1, s"WRITETHROUGH hit drain must still issue exactly one AXI aw beat: got $awCount")
+      assert(wCount == 1, s"WRITETHROUGH hit drain must still issue exactly one AXI w beat: got $wCount")
+
+      assert(mem.peekByte(base + 4) == 0x11, "mem written through as before")
+      assert(mem.peekByte(base + 5) == 0x22, "mem written through as before")
+      assert(mem.peekByte(base + 6) == 0x33, "mem written through as before")
+      assert(mem.peekByte(base + 7) == 0x44, "mem written through as before")
+
+      val setIdx = ((base + 4) >> 4) & 0x7F
+      val anyDirty = (0 until 4).exists(w => dut.dcache.logic.dirtys(w)(setIdx.toInt).toBoolean)
+      assert(!anyDirty, "WRITETHROUGH must never set a dirty bit")
+
+      val got = load(dut, cd, base + 4, Size.LONG, CacheMode.WRITETHROUGH)
+      assert(got == BigInt("11223344", 16), s"cached line updated as before: got ${got.toString(16)}")
+      cd.waitSampling(4)
+    }
+  }
 }

@@ -382,6 +382,12 @@ class ExceptionUnit(
   // unconditional write-through timing exactly (P2/P4 don't need this path
   // to vary -- exception frame stores are never copyback-cached).
   dcStore.payload.cacheMode := m68k040.cache.CacheMode.WRITETHROUGH
+  // The exception sequencer's frame pushes are conceptually "always awaited" --
+  // driving precise=True means a hypothetical bus error there is simply never
+  // routed to the new async diagnostic channel (Task P4.5), which is correct:
+  // today's exception-store path has no fault-reporting mechanism at all and
+  // this task must not invent one for it.
+  dcStore.payload.precise := True
 
   // ── D-cache LOAD + D-TLB req: REGISTERED outputs (FMax). The frame/vector load
   // vaddr (off `frameBase`/`vecTarget`) drives the D-cache hit/miss-tag + the LS

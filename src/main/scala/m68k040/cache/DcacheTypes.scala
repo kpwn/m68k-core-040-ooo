@@ -43,6 +43,10 @@ case class DStoreCmd() extends Bundle {
   val strb      = Bits(16 bits)
   val lineData  = Bits(128 bits)
   val cacheMode = CacheMode()
+  val precise   = Bool()   // this drain is on the SQ's at-head precise path (Task P2) --
+                            // gates whether a bus error here goes to the SQ's
+                            // sqFaultCompletion (already true today, unaffected by this
+                            // task) or the NEW async diagnostic channel (Task P4.5)
 }
 
 /** D-cache service contract (spec 4.2). */

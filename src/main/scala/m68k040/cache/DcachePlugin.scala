@@ -54,6 +54,8 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val storePort   = Flow(DStoreCmd())
     storePort.valid.simPublic(); storePort.payload.simPublic()  // debug-only (ported-tests cluster 11 trace)
     val storeAckReg = Bool()
+    storeAckReg.simPublic()   // test-visibility only (P4.1 COPYBACK-hit directed test: no
+                               // AXI B to observe on that path); no-op for synthesis
     val storeErrReg = Bool()   // Task P1.4: 1-cycle pulse, non-OKAY B alongside storeAckReg
     storeErrReg.simPublic()
     val axi         = master(Axi4(axiCfg))
@@ -78,6 +80,8 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // budget) to both decongest the hot corridor and remove ~192 LUTRAM LUTs/way.
     val tagMem  = Seq.fill(ways)(Mem(UInt(tagBits bits), sets).addAttribute("ram_style", "block"))
     val valids  = Vec.fill(ways)(Vec.fill(sets)(RegInit(False)))
+    val dirtys  = Vec.fill(ways)(Vec.fill(sets)(RegInit(False)))
+    dirtys.simPublic()   // test-visibility only (P4.1 directed tests); no-op for synthesis
     val victim  = Vec.fill(sets)(RegInit(U(0, wayBits bits)))
 
     // ---- single muxed data/tag write port per way (refill + store-write) ----
@@ -478,27 +482,53 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val stS2MrgBytes = mergeData.subdivideIn(8 bits)
     // Task P1.4: an INHIBITED store never touches the cache array (skip the RMW
     // line write entirely) — only the AXI write-through beat below is unconditional.
-    // Both WRITETHROUGH and INHIBITED still write through in P1; COPYBACK's "no
-    // AXI write on a hit" split is P4's job, out of scope here.
-    val stS2Cacheable = stS2Payload.cacheMode =/= CacheMode.INHIBITED
-    when(stS2Valid && stS2Cacheable) {
-      for (w <- 0 until ways) when(stS2HitVec(w)) {
-        val curBytes = rdData(w).subdivideIn(8 bits)
-        val newBytes = Vec(Bits(8 bits), 16)
-        for (i <- 0 until 16) newBytes(i) := Mux(mergeStrb(i), stS2MrgBytes(i), curBytes(i))
-        wrEn(w)   := True
-        wrSet(w)  := stS2Set
-        wrData(w) := newBytes.asBits
+    // Task P4.1: a COPYBACK-hit store resolves ENTIRELY on-chip (RMW + dirty-bit,
+    // no AXI beat at all); WRITETHROUGH (hit or miss) and INHIBITED are unchanged.
+    val stS2Inhibited = stS2Payload.cacheMode === CacheMode.INHIBITED
+    val stS2Copyback  = stS2Payload.cacheMode === CacheMode.COPYBACK
+    val stS2HitAny    = stS2HitVec.orR
+
+    // Registered latch of the drain's identity, needed a cycle later by the AXI
+    // B-ack site (Task P4.5's diagnostic-channel gate) and by the WT/beat drive.
+    val stPreciseReg = Reg(Bool())
+
+    when(stS2Valid) {
+      when(!stS2Inhibited && stS2HitAny) {
+        for (w <- 0 until ways) when(stS2HitVec(w)) {
+          val curBytes = rdData(w).subdivideIn(8 bits)
+          val newBytes = Vec(Bits(8 bits), 16)
+          for (i <- 0 until 16) newBytes(i) := Mux(mergeStrb(i), stS2MrgBytes(i), curBytes(i))
+          wrEn(w)   := True
+          wrSet(w)  := stS2Set
+          wrData(w) := newBytes.asBits
+          when(stS2Copyback) { dirtys(w)(stS2Set) := True }
+        }
+      }
+      stMergeReg   := mergeData
+      stStrbReg    := mergeStrb
+      stAddrReg    := (stS2Payload.paddr(31 downto offBits) ## U(0, offBits bits)).asUInt
+      stPreciseReg := stS2Payload.precise
+      when(stS2Copyback && stS2HitAny) {
+        // COPYBACK HIT: the drain-throughput win -- resolved ENTIRELY on-chip, no
+        // AXI beat at all. stAwDone/stWDone stay True (no AXI in flight); the ack
+        // comes from cbHitAckReg below instead.
+        stAwDone := True
+        stWDone  := True
+      } otherwise {
+        // WRITETHROUGH hit/miss (fast path, unchanged from before this task),
+        // INHIBITED (precise path, unchanged from before this task), and COPYBACK
+        // MISS (fast path -- Task P4.2 intercepts this case and overrides stAwDone/
+        // stWDone back to True + routes to write-allocate instead; left as the
+        // "issue an AXI beat" default here so P4.2's own gate is a pure ADDITION,
+        // not a rewrite of this block).
+        stAwDone := False
+        stWDone  := False
       }
     }
-    when(stS2Valid) {
-      // write-through beat latch stays UNCONDITIONAL in P1 (unchanged from today).
-      stMergeReg := mergeData
-      stStrbReg  := mergeStrb
-      stAddrReg  := (stS2Payload.paddr(31 downto offBits) ## U(0, offBits bits)).asUInt  // line-aligned
-      stAwDone   := False
-      stWDone    := False
-    }
+
+    // 1-cycle-later local ack for a COPYBACK hit (design doc: "S2 or the following
+    // cycle"). Combined into storeAckReg in Step 4 below.
+    val cbHitAckReg = RegNext(stS2Valid && stS2Copyback && stS2HitAny, init = False)
 
     // AXI write-through driver (single 128-bit beat).
     when(!stAwDone) {
@@ -528,7 +558,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // nothing downstream reads it yet (wired into the SQ's precise-path drain
     // resolution in P2.5, the async diagnostic-fault channel in P4.6).
     storeErrReg := axi.b.valid && axi.b.ready && (axi.b.payload.resp =/= Axi4.resp.OKAY)
-    storeAckReg := axi.b.valid && axi.b.ready
+    storeAckReg := (axi.b.valid && axi.b.ready) || cbHitAckReg
   }
 
   override def loadCmd  = logic.loadCmdPort
