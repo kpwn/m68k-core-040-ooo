@@ -570,6 +570,44 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     maintBusyReg.simPublic()   // test-visibility (the P5.4 quiesce regression test);
                                 // no-op for synthesis
 
+    // POST-P5.4-REVIEW forward declarations. Same forward-declaration pattern as
+    // `maintBusyReg` directly above (and as `busFaultResp`/`inhibitedResp` earlier in
+    // this file): declared HERE with a default, driven LATER by the `maint` Area
+    // (last-assignment-wins), because consumers declared BEFORE that Area -- EVICT_WR,
+    // the store-S2 write-through kickoff, the store S1->S2 arbiter and the load FSM's
+    // latched-drain-miss pickup -- all need to read them.
+    //
+    // WHY these exist at all: the P5.4 review found the walk's mutual-exclusion story
+    // was ONE-DIRECTIONAL. `WRB`'s own `axiFree` already deferred the WALK against the
+    // store's and the eviction's open AXI write pairs, but nothing deferred the store
+    // or the eviction against the WALK's own open pair -- which is EXACTLY the P4.3
+    // "revision 1/2" failure mode recorded in EVICT_WR's REVISION HISTORY comment
+    // below (AXI4's AW/W FIFO-ordering rule cross-attributes two interleaved open
+    // pairs regardless of `id`). Same for the shared array READ port: the walk's
+    // `READ` state wins last-assignment-wins on `rdSet`/`rdEn`, but the store side had
+    // no way to KNOW it lost the port and so advanced S1->S2 on a silently-wrong read.
+    //
+    /** The maintenance walk's own AXI aw+w pair is open (one or both legs not yet
+      * accepted). The symmetric counterpart of `storeWantsAxi`/`evictAxiPairOpen`.
+      *
+      * Declared WITHOUT a default (unlike the two below): the `maint` Area drives it
+      * UNCONDITIONALLY and exactly once, so a default here would be a complete
+      * assignment overlap (`PhaseCheck_noLatchNoOverride` rejects it). Leaving it
+      * undriven-here also means a future refactor that drops that single driver fails
+      * loudly as a missing-driver error rather than silently reading `False` and
+      * re-opening the one-directional-gate hole this exists to close. */
+    val maintAxiPairOpen = Bool()
+    /** The maintenance walk drives the shared `rdSet`/`rdEn` read port THIS cycle
+      * (its `READ` state). Exactly mirrors the load FSM's own `loadUsesPort`, and is
+      * consumed by the SAME S1->S2 store arbiter, so a store that loses the port
+      * holds in S1 and retries instead of advancing on a stolen read. */
+    val maintUsesPort = Bool(); maintUsesPort := False
+    /** The walk is past its quiesce `WAIT` and is actively touching the arrays / AXI.
+      * Deliberately FALSE during `WAIT` -- see the load FSM's latched-drain-miss arm
+      * for why gating that arm on `maintBusyReg` (which IS set during `WAIT`) instead
+      * would be a genuine deadlock. Driven by the `maint` Area's own `walking`. */
+    val maintWalking = Bool(); maintWalking := False
+
     // ---- LOAD FSM (OVERRIDES the shared read port with PRIORITY over the store) ----
     val fsm = new StateMachine {
       val IDLE     = new State with EntryPoint
@@ -676,9 +714,32 @@ class DcachePlugin extends FiberPlugin with DcacheService {
             evictAwDone := False; evictWDone := False
             goto(EVICT_WR)
           } otherwise { goto(REFILL) }
-        } .elsewhen(pendingStoreMiss) {
+        } .elsewhen(pendingStoreMiss && !maintWalking) {
           // A pending COPYBACK drain-miss (latched at store-S2, Step 2 above) --
           // held and retried every IDLE cycle until the refill engine is free.
+          //
+          // POST-P5.4-REVIEW (`&& !maintWalking`): this arm picks up a PREVIOUSLY
+          // LATCHED miss, so -- unlike the new-load accept above, which is gated by
+          // `loadCmdPort.ready`'s own `!maintBusyReg` -- nothing stopped it pulling
+          // the load FSM out of IDLE into EVICT_WR/REFILL in the middle of an active
+          // maintenance walk, racing the walk for the shared array read port and (on
+          // a dirty victim) for the AXI write channels. Holding the latch is safe by
+          // construction: `pendingStoreMiss` is already designed to be held and
+          // retried indefinitely (see its own decl comment).
+          //
+          // GATE CHOICE -- `maintWalking`, NOT `maintBusyReg` (deviation from the fix
+          // brief, deliberate, and load-bearing): `maintBusyReg` is ALSO set during
+          // the walk's `WAIT` state, and `WAIT` only advances when `dcIdleForMaint`
+          // -- which itself requires `!pendingStoreMiss`. Gating on `maintBusyReg`
+          // would therefore make a maintenance command that arrives while a drain
+          // miss is still latched wait forever for a latch that can no longer ever be
+          // picked up: a REAL, reachable DEADLOCK (see DcacheSpec's
+          // "...requested while a COPYBACK drain-miss is still pending..." regression
+          // test, which hangs with the `maintBusyReg` form). `maintWalking` is False
+          // during `WAIT`, so the pending miss drains normally, `busy` (a register,
+          // conservatively True for the whole EVICT_WR/REFILL/REPLAY excursion and
+          // the first IDLE cycle after it) holds `WAIT` off meanwhile, and the walk
+          // starts only once the load FSM is genuinely back in IDLE.
           val pSet = pendingStorePaddr(offBits + setBits - 1 downto offBits)
           val pTag = pendingStorePaddr(31 downto offBits + setBits)
           missPaddr := pendingStorePaddr
@@ -744,7 +805,12 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       EVICT_WR.whenIsActive {
         busy := True
         val evictAddr = (victimEvictTag ## missSet ## U(0, offBits bits)).asUInt
-        when(!evictAwDone && !storeWantsAxi) {
+        // POST-P5.4-REVIEW: `&& !maintAxiPairOpen` extends revision 3's bidirectional
+        // gate to the THIRD AXI write issuer this file has grown -- the cache-
+        // maintenance walk's `WRB` writeback. `WRB` already gates itself off on
+        // `storeWantsAxi || evictAxiPairOpen`; without the term added here that gate
+        // was one-directional again, i.e. literally revision 2's proven-unsafe shape.
+        when(!evictAwDone && !storeWantsAxi && !maintAxiPairOpen) {
           axi.aw.valid         := True
           axi.aw.payload.addr  := evictAddr
           axi.aw.payload.id    := U(2, 4 bits)
@@ -753,7 +819,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           axi.aw.payload.burst := Axi4.burst.INCR
           when(axi.aw.ready) { evictAwDone := True }
         }
-        when(!evictWDone && !storeWantsAxi) {
+        when(!evictWDone && !storeWantsAxi && !maintAxiPairOpen) {
           axi.w.valid        := True
           axi.w.payload.data := victimEvictLine
           axi.w.payload.strb := B(0xFFFF, 16 bits)
@@ -963,17 +1029,53 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     //      requested mid-drain.
     //
     // ── Array read port ────────────────────────────────────────────────────────
-    // The walk drives `rdSet`/`rdEn`. While `maintBusyReg` no load can be accepted
-    // and the load FSM is pinned in IDLE (it only drives rdSet on a load-accept or in
-    // REPLAY), and no store can be in S1, so nothing else drives the port. The walk's
-    // own drives additionally elaborate AFTER the load FSM's (StateMachine bodies run
-    // as `prePopTask` in creation order, and this machine is created second), so it
-    // also wins last-assignment-wins if that invariant is ever broken. A sim assert
-    // below proves the invariant rather than assuming it.
+    // CORRECTED POST-P5.4-REVIEW. The ORIGINAL framing of this paragraph was: "the
+    // walk drives rdSet/rdEn; while maintBusyReg no load can be accepted and the load
+    // FSM is pinned in IDLE, and no store can be in S1, so nothing else drives the
+    // port." That was WRONG ON BOTH COUNTS as shipped, and (per this file's standing
+    // convention, cf. EVICT_WR's REVISION HISTORY) the wrong version is recorded here
+    // rather than silently overwritten:
+    //   - "the load FSM is pinned in IDLE": `maintBusyReg` gated only the NEW-LOAD
+    //     accept (`loadCmdPort.ready`). The IDLE state's OTHER exit arm -- picking up
+    //     an ALREADY-LATCHED `pendingStoreMiss` -- was ungated, so the load FSM could
+    //     still leave IDLE into EVICT_WR/REFILL mid-walk. Now gated on
+    //     `!maintWalking` (see that arm).
+    //   - "no store can be in S1": nothing structurally prevented it. `storePort` is
+    //     an unbuffered `Flow` with no backpressure; `dcIdleForMaint` omitted the LIVE
+    //     `storePort.valid` (fixed below), so a store presented on the very cycle
+    //     `WAIT` fell through to `READ` entered the pipe anyway and reached S1 during
+    //     the walk.
+    //
+    // The ACTUAL, now-true invariant is a two-layer one:
+    //   (1) LAST-ASSIGNMENT-WINS on the physical net: the walk's `rdSet`/`rdEn` drives
+    //       elaborate AFTER the load FSM's (StateMachine bodies run as `prePopTask` in
+    //       creation order and this machine is created second) and after the store's
+    //       S1 base drive, so while the walk's `READ` state is active the walk ALWAYS
+    //       physically owns the port. That much was, and remains, true.
+    //   (2) EVERY OTHER CONSUMER OF THAT READ NOW KNOWS IT LOST. That is the property
+    //       that actually matters, and the one that was missing: a stolen read is only
+    //       harmless if whoever lost it defers instead of silently consuming the wrong
+    //       data. New loads are refused (`maintBusyReg` on `loadCmdPort.ready`); a
+    //       latched drain-miss stays latched (`!maintWalking`); and a store that
+    //       reaches S1 anyway holds in S1 and retries (`maintUsesPort`, consumed by
+    //       the same S1->S2 arbiter that already handles `fsm.loadUsesPort`) instead
+    //       of advancing to S2 to RMW-merge against the walk's set.
+    // Layer (2) is defence in depth BEHIND `dcIdleForMaint`/`WAIT`, not a substitute
+    // for it: the sim asserts below still hold that no store is in S0..S2 and the load
+    // FSM is in IDLE for the whole walk. They prove the invariant rather than assume
+    // it; layer (2) makes the failure a bounded stall rather than silent corruption if
+    // it is ever violated.
 
-    /** Every D-cache datapath resource the walk needs, genuinely idle THIS cycle. */
+    /** Every D-cache datapath resource the walk needs, genuinely idle THIS cycle.
+      *
+      * POST-P5.4-REVIEW: `!storePort.valid` is a required conjunct, not belt-and-
+      * braces. Every OTHER term here is a REGISTER; `s0Valid` (the store's cache-
+      * boundary flop) only rises the cycle AFTER a store is presented. Without the
+      * live combinational term this signal read True with a store exactly one flop
+      * away from entering the pipe, and `WAIT` fell through to `READ` on precisely
+      * that cycle -- the store then ran its S0/S1/S2 concurrently with the walk. */
     val dcIdleForMaint = !busy && !ldS1Valid && !pendingStoreMiss && !pendingWtKickoff &&
-                         !s0Valid && !stS1Valid && !stS2Valid &&
+                         !storePort.valid && !s0Valid && !stS1Valid && !stS2Valid &&
                          stAwDone && stWDone && evictAwDone && evictWDone
     dcIdleForMaint.simPublic()
 
@@ -1009,14 +1111,19 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       val maintWDone  = Reg(Bool()) init True
       val wbAddrReg   = Reg(UInt(32 bits))
       val wbLineReg   = Reg(Bits(128 bits))
-      val maintAxiPairOpen = !maintAwDone || !maintWDone
+      // POST-P5.4-REVIEW: drives the FORWARD-DECLARED `maintAxiPairOpen` (above the
+      // load FSM) rather than being a local val, so the store-S2 write-through kickoff
+      // and EVICT_WR -- both declared earlier in the file -- can gate on it. Was a
+      // local val, which is why the AXI write-pair gate was one-directional.
+      maintAxiPairOpen := !maintAwDone || !maintWDone
       // "The walk is past its quiesce WAIT and is actively touching the arrays / AXI
       // this cycle." Distinct from `maintBusyReg` (which is deliberately also set
       // during WAIT, so loads are refused while we are still waiting for the datapath
       // to settle -- during WAIT a store IS legitimately still in the pipe; that is
       // the entire point of the state). The sim asserts below key on THIS signal.
-      val walking = Bool()
-      walking := False
+      // POST-P5.4-REVIEW: now an ALIAS of the forward-declared `maintWalking` (same
+      // net, same semantics) so the load FSM's latched-drain-miss arm can read it.
+      val walking = maintWalking
 
       // Does this command touch the D-cache array at all? sel: 01=DC, 10=IC, 11=BC.
       // An IC-only (10) command has no DC work -- Task P5.5 pulses the I-cache's own
@@ -1067,6 +1174,14 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           walking := True
           rdSet := walkSet
           rdEn  := True
+          // POST-P5.4-REVIEW: announce that WE own the shared read port this cycle,
+          // exactly as the load FSM's own read-launching arms set `loadUsesPort`. The
+          // store S1->S2 arbiter consumes both; without this, a store that reached S1
+          // during the walk had its BRAM read silently redirected to `walkSet` (the
+          // walk's drives elaborate last) yet still advanced to S2 believing its own
+          // read had landed -- RMW-merging against the wrong line's data and
+          // hit-detect. Now it holds in S1 and retries, same as against the load.
+          maintUsesPort := True
           goto(CHECK)
         }
 
@@ -1186,7 +1301,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       assert(!(maint.walking && !fsm.isActive(fsm.IDLE)),
         "DcachePlugin: the load/refill FSM left IDLE during a cache-maintenance walk -- it can drive the shared rdSet/rdEn port and open an eviction AXI pair, both of which the walk assumes are exclusively its own",
         FAILURE)
-      assert(!(maint.maintAxiPairOpen && (storeWantsAxi || evictAxiPairOpen)),
+      assert(!(maintAxiPairOpen && (storeWantsAxi || evictAxiPairOpen)),
         "DcachePlugin: the cache-maintenance writeback's AXI aw/w pair was open at the same time as the store's or the eviction's -- AXI4 AW/W FIFO ordering cross-attributes overlapping pairs regardless of id (the proven-unsafe P4.3 revision-1/2 failure mode)",
         FAILURE)
     }
@@ -1198,12 +1313,20 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // (loadUsesPort), the store's read was overridden -> hold in S1 and retry; else
     // its read launched -> advance to S2. This `loadUsesPort` consumer is a small
     // control register (stS2Valid/stS1Valid), NOT the high-fanout BRAM read-address.
+    //
+    // POST-P5.4-REVIEW: `maintUsesPort` joins `fsm.loadUsesPort` here. The cache-
+    // maintenance walk's `READ` state is a THIRD driver of `rdSet`/`rdEn`, elaborated
+    // after both of the others, so it likewise silently overrides the store's read --
+    // but nothing told this arbiter, so the store advanced to S2 and RMW-merged
+    // against the walk's set (wrong old data AND wrong hit-detect). Same hold-and-
+    // retry response as against the load: delay, never corrupt.
     when(stS1Valid) {
-      when(!fsm.loadUsesPort) {
+      when(!fsm.loadUsesPort && !maintUsesPort) {
         stS2Valid   := True
         stS2Payload := stS1Payload
       } otherwise {
-        // Port taken by the load: hold in S1, retry next cycle.
+        // Port taken by the load or by the maintenance walk: hold in S1, retry
+        // next cycle.
         stS1Valid   := True
       }
     }
@@ -1284,7 +1407,15 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         // AXI-hazard fix revision 3 -- see `evictAxiPairOpen`'s decl comment),
         // the rare case a `pendingWtKickoff` latch defers to the first later
         // cycle it clears.
-        when(!evictAxiPairOpen) {
+        //
+        // POST-P5.4-REVIEW: `maintAxiPairOpen` (the cache-maintenance walk's own
+        // writeback pair) joins `evictAxiPairOpen` here for exactly the same reason
+        // -- it is a third open AW/W pair on the same physical port, and AXI4's
+        // AW/W FIFO-ordering rule cross-attributes interleaved pairs regardless of
+        // `id`. Deadlock-free: deferring here leaves `stAwDone`/`stWDone` True, so
+        // `storeWantsAxi` stays FALSE and the walk's own `WRB` gate (`!storeWantsAxi
+        // && !evictAxiPairOpen`) is not blocked by the store that is waiting on it.
+        when(!evictAxiPairOpen && !maintAxiPairOpen) {
           stAwDone := False
           stWDone  := False
         } otherwise {
@@ -1298,7 +1429,9 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // overwhelming majority of the time, since `evictAxiPairOpen` is False
     // whenever no eviction is in flight) -- retried every cycle until then,
     // mirroring `pendingStoreMiss`'s existing shape.
-    when(pendingWtKickoff && !evictAxiPairOpen) {
+    // POST-P5.4-REVIEW: also held off while the maintenance walk's own writeback pair
+    // is open (see the S2 kickoff site above for the full reasoning).
+    when(pendingWtKickoff && !evictAxiPairOpen && !maintAxiPairOpen) {
       stAwDone := False
       stWDone  := False
       pendingWtKickoff := False

@@ -1509,4 +1509,164 @@ class DcacheSpec extends AnyFunSuite {
       assert(!anyDirtyIn(dut, base), "the line must be clean after the push completed")
     }
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // (P5.4-f) POST-P5.4-REVIEW REGRESSION #1 -- the ONE-CYCLE window (P5.4-e's mirror
+  // image): a store presented on EXACTLY the cycle the walk's `WAIT` falls through to
+  // `READ`.
+  //
+  // P5.4-e (above) presents the store FIRST and the maintenance command after, so by
+  // the time `WAIT` evaluates, the store is already visible in a REGISTER (`s0Valid`)
+  // and `dcIdleForMaint` correctly holds the walk off. This test reverses the order:
+  // the maintenance command is latched first, and the store is presented on the single
+  // cycle the walk sits in `WAIT` with every one of `dcIdleForMaint`'s REGISTER terms
+  // still idle. `storePort` is an unbuffered `Flow` with no backpressure, so that
+  // store WILL enter the pipe next cycle regardless -- and pre-fix `dcIdleForMaint`
+  // omitted the live combinational `storePort.valid`, so `WAIT` fell through to `READ`
+  // on precisely that cycle and the store ran its S0/S1/S2 CONCURRENTLY with the walk.
+  //
+  // The corruption that follows is the same silent one P5.4-e pins, reached through a
+  // different door: the warmed line lives in way 0 (fresh cache, round-robin victim
+  // starts at 0), so the walk's very first `CHECK` samples `dirtys(0)(set)` two cycles
+  // before the store's S2 sets it -- it sees a CLEAN line, pushes nothing, advances,
+  // and reports success. Memory keeps the ORIGINAL bytes forever (PUSH_LOST /
+  // WTSTORE_LOST). Pre-fix this ALSO trips the file's own FAILURE-severity sim assert
+  // "a STORE was in the S0..S2 pipeline while a cache-maintenance walk was actively
+  // running"; post-fix neither happens.
+  //
+  // NOTE ON WHY THE STORE IS PRESENTED DURING `WAIT` AND NOT DURING `walking`: a store
+  // presented while the walk is genuinely mid-array-walk is, by design, a CALLER
+  // CONTRACT VIOLATION that the shipped FAILURE-severity assert exists to catch (the
+  // `Flow` cannot be back-pressured, so `s0Valid` would rise no matter what the RTL
+  // does). The reachable, fixable race is exactly this `WAIT`-cycle one. The
+  // additional `maintUsesPort` S1-arbiter interlock added by the same review is
+  // defence in depth BEHIND that assert -- it converts what would otherwise be a
+  // silently-wrong read into a bounded hold -- and so is not separately observable in
+  // a test that must run against the asserts as shipped.
+  // ═══════════════════════════════════════════════════════════════════════════
+  test("a store presented on the walk's WAIT-fallthrough cycle is not raced by the walk",
+       VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x5C00L
+      preload(mem, base, 16)
+      load(dut, cd, base, Size.LONG, CacheMode.WRITETHROUGH)   // warm, clean, way 0
+      assert(!anyDirtyIn(dut, base), "precondition: the warmed line must start clean")
+      cd.waitSampling(4)
+
+      var walkedWhileStoreInPipe = 0
+      var violations = 0
+      fork {
+        while (true) {
+          cd.waitSampling()
+          val walking = dut.dcache.logic.maintWalkingDbg.toBoolean
+          val idle    = dut.dcache.logic.dcIdleForMaint.toBoolean
+          val stInPipe = dut.dcache.logic.stS2Valid.toBoolean
+          if (walking && !idle) violations += 1
+          if (walking && stInPipe) walkedWhileStoreInPipe += 1
+        }
+      }
+
+      // Latch the CPUSH first. `maintPulse` returns in the cycle immediately after the
+      // command was sampled -- which is the cycle the walk spends in `WAIT` with the
+      // whole datapath (registers) idle. This is the fall-through cycle.
+      maintPulse(dut, cd, push = true, invalidate = false, SCOPE_LINE, SEL_DC, base)
+
+      // Present the COPYBACK store DURING that exact cycle.
+      dut.probe.logic.storeIn.valid #= true
+      dut.probe.logic.storeIn.payload.paddr #= base + 4
+      dut.probe.logic.storeIn.payload.data #= BigInt("DEADBEEF", 16)
+      dut.probe.logic.storeIn.payload.size #= Size.LONG
+      dut.probe.logic.storeIn.payload.useStrb #= false
+      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+      dut.probe.logic.storeIn.payload.precise #= false
+      cd.waitSampling()
+      dut.probe.logic.storeIn.valid #= false
+
+      maintWait(dut, cd, budget = 2000)
+      cd.waitSampling(6)
+
+      assert(violations == 0,
+        s"the maintenance walk was ACTIVE on $violations cycle(s) when the D-cache was not " +
+        "idle for it -- dcIdleForMaint missed the live storePort.valid term")
+      assert(walkedWhileStoreInPipe == 0,
+        s"the maintenance walk ran on $walkedWhileStoreInPipe cycle(s) while a store occupied " +
+        "S2 -- it steals the shared array read port from the store's own RMW")
+
+      // THE PAYLOAD ASSERTION: the store's data reached memory via the CPUSH.
+      assert(mem.peekByte(base + 4) == 0xDE && mem.peekByte(base + 5) == 0xAD &&
+             mem.peekByte(base + 6) == 0xBE && mem.peekByte(base + 7) == 0xEF,
+        f"the store was LOST: CPUSH pushed stale data. mem[base+4..7] = " +
+        f"${mem.peekByte(base+4)}%02x${mem.peekByte(base+5)}%02x" +
+        f"${mem.peekByte(base+6)}%02x${mem.peekByte(base+7)}%02x, expected deadbeef")
+      assert(mem.peekByte(base + 0) == memByte(base + 0), "line byte +0 corrupted")
+      assert(mem.peekByte(base + 15) == memByte(base + 15), "line byte +15 corrupted")
+      assert(!anyDirtyIn(dut, base), "the line must be clean after the push completed")
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // (P5.4-g) POST-P5.4-REVIEW REGRESSION #2 -- LIVENESS. A maintenance command latched
+  // while a COPYBACK drain-miss is still PENDING must still complete.
+  //
+  // This test exists because the obvious form of the review's Critical-fix-2 gate --
+  // gating the load FSM's latched-`pendingStoreMiss` pickup arm on `!maintBusyReg` --
+  // is a REAL DEADLOCK, and this is the stimulus that proves it. `maintBusyReg` is set
+  // in `WAIT` as well as during the walk proper, and `WAIT` only advances on
+  // `dcIdleForMaint`, which itself requires `!pendingStoreMiss`. So a maintenance
+  // command that lands while a drain miss is latched would wait forever for a latch
+  // that can no longer ever be picked up. The landed gate is `!maintWalking` (False
+  // during `WAIT`), which lets the pending miss drain normally while `busy` keeps
+  // `WAIT` held off.
+  //
+  // Cycle alignment (deliberate, this is a 1-cycle-precision test): the store pulse
+  // returns with `s0Valid` set; +1 cycle puts the store in S1; the `maintPulse` is then
+  // sampled on the store's S2 cycle, so `maintBusyReg` is already set on the cycle
+  // `pendingStoreMiss` first reads True. With the `maintBusyReg` form this hangs (the
+  // `maintWait` budget assert fires); with the landed form it completes and the
+  // write-allocated line is pushed.
+  // ═══════════════════════════════════════════════════════════════════════════
+  test("a maintenance command latched while a COPYBACK drain-miss is pending still completes",
+       VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x6400L        // NEVER loaded -> the COPYBACK store MISSES
+      preload(mem, base, 16)
+      cd.waitSampling(4)
+
+      // Present the COPYBACK store to a non-resident line: its S2 latches
+      // `pendingStoreMiss` (post-commit write-allocate).
+      dut.probe.logic.storeIn.valid #= true
+      dut.probe.logic.storeIn.payload.paddr #= base + 4
+      dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
+      dut.probe.logic.storeIn.payload.size #= Size.LONG
+      dut.probe.logic.storeIn.payload.useStrb #= false
+      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+      dut.probe.logic.storeIn.payload.precise #= false
+      cd.waitSampling()                 // sampled: s0Valid rises
+      dut.probe.logic.storeIn.valid #= false
+      cd.waitSampling()                 // store now in S1
+
+      // Sampled on the store's S2 cycle => maintBusyReg is set on the very cycle
+      // pendingStoreMiss first reads True.
+      maintPulse(dut, cd, push = true, invalidate = false, SCOPE_LINE, SEL_DC, base)
+
+      // Fails loudly (budget assert) rather than hanging if the deadlock is present.
+      maintWait(dut, cd, budget = 2000)
+      cd.waitSampling(6)
+
+      // The drain miss write-allocated the line and dirtied it; the CPUSH then pushed
+      // it. Either way the store's bytes must be in memory and the line left clean.
+      assert(mem.peekByte(base + 4) == 0xCA && mem.peekByte(base + 5) == 0xFE &&
+             mem.peekByte(base + 6) == 0xBA && mem.peekByte(base + 7) == 0xBE,
+        f"the pending drain-miss store never reached memory: mem[base+4..7] = " +
+        f"${mem.peekByte(base+4)}%02x${mem.peekByte(base+5)}%02x" +
+        f"${mem.peekByte(base+6)}%02x${mem.peekByte(base+7)}%02x, expected cafebabe")
+      assert(mem.peekByte(base + 0) == memByte(base + 0), "line byte +0 corrupted")
+      assert(!anyDirtyIn(dut, base), "the line must be clean after the push completed")
+      // The cache must still be usable afterwards (no stuck latch / stuck FSM).
+      assert(load(dut, cd, base + 4, Size.LONG, CacheMode.COPYBACK) == BigInt("CAFEBABE", 16),
+        "the D-cache did not survive the pending-drain-miss + maintenance overlap")
+    }
+  }
 }
