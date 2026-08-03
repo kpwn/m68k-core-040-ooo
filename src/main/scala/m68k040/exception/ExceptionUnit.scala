@@ -144,6 +144,29 @@ class ExceptionUnit(
   // (which would silently drop that store). Default True (unit DUTs w/o an LS EU).
   val sqDrained = Bool(); sqDrained.allowOverride; sqDrained := True
 
+  // Task P5.4: the D-cache datapath is genuinely idle (load/refill FSM, eviction
+  // engine, store S0..S2 pipe, and BOTH AXI write-completion flag pairs). Wired from
+  // `DcacheService.maintQuiesced`; default True for the many unit DUTs that have no
+  // D-cache at all.
+  //
+  // WHY the commit-time sysOp path needs this (a confirmed real safety gap, not a
+  // theoretical one). CPUSH/CINV — unlike every sysOp before them (MOVEC / STOP /
+  // PFLUSHA / PTEST / RESET / MOVE-to-SR / MOVE-USP, none of which touch the D-cache
+  // at all) — hand a cache-maintenance walk the D-cache's shared array read port and
+  // its AXI write channels. `excActive` alone does NOT make that safe: it stops the
+  // LS EU from issuing anything NEW, but an OLDER, ALREADY-COMMITTED store can still
+  // be draining out of the StoreQueue (commit and drain are decoupled by the precise-
+  // drain design), and a load refill / dirty-victim eviction accepted before the flush
+  // landed can still be mid-AXI-transaction. Either one concurrently owns exactly the
+  // resources the walk would take.
+  //
+  // The ENTRY (`E_DRAIN`) and RTE (`R_DRAIN`) paths already wait on `sqDrained` for
+  // precisely the analogous reason ("wait for older committed stores to fully drain
+  // before we use the store port"); the sysOp path went straight to `S_APPLY` the very
+  // next cycle because no sysOp had ever needed the guarantee. `S_DRAIN` below closes
+  // that gap for the whole sysOp family.
+  val dcQuiesced = Bool(); dcQuiesced.allowOverride; dcQuiesced := True
+
   // ── captured per-event state ────────────────────────────────────────────────
   val curVec   = Reg(UInt(8 bits)); curVec.simPublic()
   val curPc    = Reg(UInt(32 bits)); curPc.simPublic()   // ENTRY: faulting PC to stack; RTE: restored PC
@@ -573,6 +596,11 @@ class ExceptionUnit(
     // Commit-time SYSTEM-op path (MOVE-to-SR / MOVE-USP / MOVEC). S_APPLY writes the
     // committed system state + the int PRF (read dir) in one cycle; S_REDIR pulses the
     // obs (post-state) + redirects (so the re-banked A7 / new S settle before the obs).
+    // Task P5.4: wait for the SQ to drain + the D-cache to go idle before APPLYing.
+    // Mirrors E_DRAIN/R_DRAIN's existing shape; see `dcQuiesced`'s doc comment above
+    // for the full rationale (CPUSH/CINV's maintenance walk takes the D-cache array
+    // port + AXI write channels, which excActive alone does NOT free).
+    val S_DRAIN   = new State
     val S_APPLY   = new State
     val S_REDIR   = new State
 
@@ -731,6 +759,33 @@ class ExceptionUnit(
         sysCapDstPhys := sysDstPhys
         sysCapPc      := sysPc
         sysCapNextPc  := sysNextPc
+        goto(S_DRAIN)
+      }
+    }
+
+    // Task P5.4: quiesce before applying a commit-time sysOp. See `dcQuiesced`'s
+    // doc comment for why this is REQUIRED (CPUSH/CINV) and safe for the sysOps that
+    // do not need it (a single extra cycle in the common case -- both conditions are
+    // already true the overwhelming majority of the time).
+    //
+    // DEADLOCK ANALYSIS (why this cannot hang):
+    //   - `sqDrained` == StoreQueue empty. Entering this state raises `excActive`,
+    //     whose RISING EDGE pulses `sqFlush` (FullCoreSynth's `excEnteringSq`) --
+    //     squashing SPECULATIVE younger stores (which would otherwise never retire and
+    //     never drain) while KEEPING committed ones, which continue draining under
+    //     their own machinery. That is byte-for-byte the same precondition E_DRAIN
+    //     relies on, and it is exercised on every exception in the corpus.
+    //   - The SQ's drain does NOT depend on this sysOp completing: the CPUSH/CINV is
+    //     at the ROB head and has not retired, but the SQ drains committed entries
+    //     asynchronously, gated only on the D-cache store port -- not on retirement of
+    //     anything younger. There is no cycle.
+    //   - `dcQuiesced` is a conjunction of "no transaction in flight" terms, every one
+    //     of which is cleared by a bounded, self-driving completion (the load FSM
+    //     always returns to IDLE, a pending store-miss is picked up at the next IDLE,
+    //     a pending write-through kickoff fires as soon as the eviction pair closes).
+    //     With the LS EU flushed, nothing re-arms them.
+    S_DRAIN.whenIsActive {
+      when(sqDrained && dcQuiesced) {
         goto(S_APPLY)
       }
     }

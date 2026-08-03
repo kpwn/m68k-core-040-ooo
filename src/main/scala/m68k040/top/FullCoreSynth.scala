@@ -320,6 +320,12 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     lsEu.excXlateWrite      := exc.dtReq.write
     lsEu.excXlateSupervisor := exc.dtReq.supervisor
     exc.sqDrained           := lsEu.sqEmptySig
+    // Task P5.4: the commit-time sysOp path (S_DRAIN) additionally waits for the
+    // D-cache datapath itself to go idle before applying -- CPUSH/CINV's maintenance
+    // walk takes the D-cache's shared array read port and AXI write channels, which
+    // `excActive` alone does NOT free (an older committed store can still be draining,
+    // and a refill/eviction accepted before the flush can still be in flight).
+    exc.dcQuiesced          := dc.maintQuiesced
     // A7 (arch-15) write on exc/RTE A7 change; the SAME port also serves a commit-time
     // SYSTEM op's READ direction (MOVE-USP/MOVEC Rc->Rn writes an arbitrary arch-Rn).
     // sysRegWrite fires in S_APPLY, a7Write in S_REDIR (consecutive -> no port collision).

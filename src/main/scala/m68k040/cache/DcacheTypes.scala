@@ -51,6 +51,23 @@ case class DStoreCmd() extends Bundle {
                             // task) or the NEW async diagnostic channel (Task P4.5)
 }
 
+/** Cache-maintenance (CPUSH / CINV) command — Task P5.1's decode encoding, issued
+  * by the ExceptionUnit's commit-time sysOp path and serviced by `DcachePlugin`'s
+  * standalone maintenance-walk FSM.
+  *
+  * `push` (CPUSH) writes dirty matching lines back to memory; `invalidate` (CINV,
+  * and CPUSH's own invalidating variant) clears valid+dirty on matches. `scope`
+  * selects Line(01) / Page(10) / All(11) — 00 is unused (decode never emits it).
+  * `sel` selects which cache(s): DC(01) / IC(10) / BC(11). `addr` is An's value,
+  * meaningful for Line/Page scope only. */
+case class CacheMaintCmd() extends Bundle {
+  val push       = Bool()
+  val invalidate = Bool()
+  val scope      = UInt(2 bits)
+  val sel        = UInt(2 bits)
+  val addr       = UInt(32 bits)
+}
+
 /** D-cache service contract (spec 4.2). */
 trait DcacheService {
   def loadCmd:  spinal.lib.Stream[DLoadCmd]   // virtual; cache translates (VIPT) + reads
@@ -75,6 +92,27 @@ trait DcacheService {
   // came back with a non-OKAY response. First-error-wins; see
   // `DcachePlugin.logic.diagFaultValid`'s doc comment for the per-site kinds.
   def diagFault: Bool
+
+  // ── Cache maintenance (CPUSH / CINV), Task P5.4 ────────────────────────────
+  /** Start a maintenance walk. A 1-cycle Flow pulse; the walk latches the payload.
+    * The ExceptionUnit's commit-time sysOp path is the SOLE driver, and it may
+    * ONLY pulse this once `maintQuiesced` is true (see that method's contract). */
+  def maintCmd: spinal.lib.Flow[CacheMaintCmd]
+  /** 1-cycle pulse: the walk started by `maintCmd` has fully completed. */
+  def maintDone: Bool
+  /** REQUIRED PRECONDITION for `maintCmd`, and the reason it exists: the whole
+    * D-cache datapath (load FSM, refill/eviction engine, the store S0..S2 pipe and
+    * BOTH sets of AXI write completion flags) is genuinely idle RIGHT NOW, so the
+    * maintenance walk can take the shared array read port and the AXI write channels
+    * without racing an in-flight transaction.
+    *
+    * This is NOT implied by `excActive`. `excActive` only stops the LS EU from
+    * issuing anything NEW; an older COMMITTED store still draining out of the
+    * StoreQueue, or a load-refill/dirty-victim eviction accepted before the flush
+    * landed, can still be mid-transaction for many cycles afterwards. The consumer
+    * must therefore wait on this (together with the SQ-drained signal) before
+    * pulsing `maintCmd` — see ExceptionUnit's `S_DRAIN` state. */
+  def maintQuiesced: Bool
 }
 
 /** Big-endian byte-lane helpers shared by load extraction and store merge.

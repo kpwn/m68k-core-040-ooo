@@ -39,6 +39,15 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val rspPort       = Flow(FetchRsp())
     val axi           = master(Axi4ReadOnly(axiCfg))
     val invalidateAll = in Bool()
+    // Task P5.4: an INTERNAL second invalidate-all source for the CINV/CPUSH cache
+    // maintenance selector (sel = IC or BC). Deliberately a separate wire from the
+    // external top-IO `invalidateAll` port above, which stays a bare `in Bool()` --
+    // so every existing sim poke and every existing top-level connection of it is
+    // completely unaffected. Task P5.5's ExceptionUnit dispatch is the future driver;
+    // it defaults idle here (allowOverride, so that driver can override it).
+    val maintInvalidateAll = Bool()
+    maintInvalidateAll.allowOverride
+    maintInvalidateAll := False
 
     // ---- resolve TranslationService ----
     val xlate = host[TranslationService]
@@ -85,7 +94,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     valids.simPublic()
 
     // ---- invalidateAll: priority clear of all valid bits ----
-    when(invalidateAll) {
+    when(invalidateAll || maintInvalidateAll) {
       for (w <- 0 until ways; s <- 0 until sets) valids(w)(s) := False
     }
 

@@ -118,6 +118,14 @@ class DcacheSpec extends AnyFunSuite {
     val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
     dut.probe.logic.loadCmdIn.valid #= false
     dut.probe.logic.storeIn.valid #= false
+    // Task P5.4: pin the maintenance port idle (an un-poked testbench-driven input is
+    // NOT guaranteed 0 across seeds/runs -- this project's documented sim gotcha).
+    dut.probe.logic.maintCmdIn.valid #= false
+    dut.probe.logic.maintCmdIn.payload.push #= false
+    dut.probe.logic.maintCmdIn.payload.invalidate #= false
+    dut.probe.logic.maintCmdIn.payload.scope #= 0
+    dut.probe.logic.maintCmdIn.payload.sel #= 0
+    dut.probe.logic.maintCmdIn.payload.addr #= 0
     cd.waitSampling(4)
     (cd, mem)
   }
@@ -131,6 +139,14 @@ class DcacheSpec extends AnyFunSuite {
     val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd, injectBusErrors = true)
     dut.probe.logic.loadCmdIn.valid #= false
     dut.probe.logic.storeIn.valid #= false
+    // Task P5.4: pin the maintenance port idle (an un-poked testbench-driven input is
+    // NOT guaranteed 0 across seeds/runs -- this project's documented sim gotcha).
+    dut.probe.logic.maintCmdIn.valid #= false
+    dut.probe.logic.maintCmdIn.payload.push #= false
+    dut.probe.logic.maintCmdIn.payload.invalidate #= false
+    dut.probe.logic.maintCmdIn.payload.scope #= 0
+    dut.probe.logic.maintCmdIn.payload.sel #= 0
+    dut.probe.logic.maintCmdIn.payload.addr #= 0
     cd.waitSampling(4)
     (cd, mem)
   }
@@ -1250,6 +1266,247 @@ class DcacheSpec extends AnyFunSuite {
       // regression (e.g. as part of wiring up the production top-level's own
       // lock-step coverage), this comment is the pointer to why it wasn't done here.
       cd.waitSampling(4)
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Task P5.4: cache-maintenance (CPUSH / CINV) walk
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  val SCOPE_LINE = 1
+  val SCOPE_PAGE = 2
+  val SCOPE_ALL  = 3
+  val SEL_DC     = 1
+  val SEL_IC     = 2
+  val SEL_BC     = 3
+
+  /** Pulse one maintenance command (1 cycle, a Flow). Does NOT wait for completion. */
+  def maintPulse(dut: Dut, cd: ClockDomain, push: Boolean, invalidate: Boolean,
+                 scope: Int, sel: Int, addr: Long): Unit = {
+    dut.probe.logic.maintCmdIn.valid #= true
+    dut.probe.logic.maintCmdIn.payload.push #= push
+    dut.probe.logic.maintCmdIn.payload.invalidate #= invalidate
+    dut.probe.logic.maintCmdIn.payload.scope #= scope
+    dut.probe.logic.maintCmdIn.payload.sel #= sel
+    dut.probe.logic.maintCmdIn.payload.addr #= addr
+    cd.waitSampling()
+    dut.probe.logic.maintCmdIn.valid #= false
+  }
+
+  /** Wait for `maintDone`, failing loudly (rather than hanging) on a stuck walk. */
+  def maintWait(dut: Dut, cd: ClockDomain, budget: Int = 40000): Int = {
+    var cyc = 0
+    var done = false
+    while (!done && cyc < budget) {
+      cd.waitSampling(); cyc += 1
+      if (dut.probe.logic.maintDoneOut.toBoolean) done = true
+    }
+    assert(done, s"cache-maintenance walk never pulsed maintDone within $budget cycles")
+    cyc
+  }
+
+  def setOf(addr: Long): Int = ((addr >> 4) & 0x7F).toInt
+  def anyDirtyIn(dut: Dut, addr: Long): Boolean =
+    (0 until 4).exists(w => dut.dcache.logic.dirtys(w)(setOf(addr)).toBoolean)
+
+  // (P5.4-a) CPUSH, Line scope: a dirty COPYBACK line is written back to memory and
+  // left CLEAN but still RESIDENT (push without invalidate).
+  test("CPUSH Line-scope pushes a dirty line to memory, leaving it clean and resident",
+       VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x4000L
+      preload(mem, base, 16)
+      load(dut, cd, base, Size.LONG, CacheMode.WRITETHROUGH)   // warm the line
+
+      // COPYBACK hit -> merges on-chip, sets dirty, writes NO memory.
+      doStore(dut, cd, base + 4, BigInt("DEADBEEF", 16), Size.LONG, CacheMode.COPYBACK)
+      assert(anyDirtyIn(dut, base), "precondition: the COPYBACK store must have dirtied the line")
+      assert(mem.peekByte(base + 4) == memByte(base + 4),
+        "precondition: a COPYBACK hit must not have written memory yet")
+
+      maintPulse(dut, cd, push = true, invalidate = false, SCOPE_LINE, SEL_DC, base)
+      maintWait(dut, cd)
+      cd.waitSampling(4)
+
+      assert(mem.peekByte(base + 4) == 0xDE && mem.peekByte(base + 5) == 0xAD &&
+             mem.peekByte(base + 6) == 0xBE && mem.peekByte(base + 7) == 0xEF,
+        f"CPUSH did not write the dirty line back: mem=${mem.peekByte(base+4)}%02x" +
+        f"${mem.peekByte(base+5)}%02x${mem.peekByte(base+6)}%02x${mem.peekByte(base+7)}%02x")
+      // Untouched bytes of the same line must round-trip unchanged (the whole 16-byte
+      // line is written back, so this also proves the merge/line content is intact).
+      assert(mem.peekByte(base + 0) == memByte(base + 0), "line byte +0 corrupted by the writeback")
+      assert(mem.peekByte(base + 15) == memByte(base + 15), "line byte +15 corrupted by the writeback")
+      assert(!anyDirtyIn(dut, base), "CPUSH must leave the pushed line CLEAN")
+      // Still resident: a load hits and returns the merged value with no refill.
+      assert(load(dut, cd, base + 4, Size.LONG, CacheMode.COPYBACK) == BigInt("DEADBEEF", 16),
+        "CPUSH (no invalidate) must leave the line RESIDENT with its merged contents")
+    }
+  }
+
+  // (P5.4-b) CINV, Line scope: drops the line with NO writeback -- the dirty data is
+  // deliberately discarded (that is what CINV means), so memory keeps the old value
+  // and the next load refills from memory.
+  test("CINV Line-scope invalidates without any writeback (dirty data discarded)",
+       VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x4200L
+      preload(mem, base, 16)
+      load(dut, cd, base, Size.LONG, CacheMode.WRITETHROUGH)
+      doStore(dut, cd, base + 4, BigInt("DEADBEEF", 16), Size.LONG, CacheMode.COPYBACK)
+      assert(anyDirtyIn(dut, base), "precondition: line must be dirty")
+
+      var awCount = 0
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean) awCount += 1
+        }
+      }
+
+      maintPulse(dut, cd, push = false, invalidate = true, SCOPE_LINE, SEL_DC, base)
+      maintWait(dut, cd)
+      cd.waitSampling(4)
+
+      assert(awCount == 0, s"CINV must issue ZERO AXI write beats, got $awCount")
+      assert(!anyDirtyIn(dut, base), "CINV must clear the dirty bit")
+      assert(mem.peekByte(base + 4) == memByte(base + 4),
+        "CINV must NOT write the dirty data back -- it is discarded by definition")
+      // The line is gone: the next load refills from memory and sees the OLD value.
+      assert(load(dut, cd, base + 4, Size.LONG, CacheMode.COPYBACK) == expected(base + 4, 4),
+        "after CINV the line must be non-resident (a load must refill the ORIGINAL memory contents)")
+    }
+  }
+
+  // (P5.4-c) All scope walks the entire array: several dirty lines in DIFFERENT sets
+  // are all pushed by a single CPUSH-All.
+  test("CPUSH All-scope walks the whole array and pushes every dirty line", VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      // Three lines in three DIFFERENT sets (0x40 apart -> distinct set indices).
+      val bases = Seq(0x5000L, 0x5040L, 0x5080L)
+      bases.foreach { b => preload(mem, b, 16) }
+      bases.foreach { b =>
+        load(dut, cd, b, Size.LONG, CacheMode.WRITETHROUGH)
+        doStore(dut, cd, b + 4, BigInt("A5A5A5A5", 16), Size.LONG, CacheMode.COPYBACK)
+        assert(anyDirtyIn(dut, b), f"precondition: line 0x$b%x must be dirty")
+      }
+
+      maintPulse(dut, cd, push = true, invalidate = true, SCOPE_ALL, SEL_DC, 0)
+      maintWait(dut, cd)
+      cd.waitSampling(4)
+
+      bases.foreach { b =>
+        assert(mem.peekByte(b + 4) == 0xA5 && mem.peekByte(b + 7) == 0xA5,
+          f"CPUSH-All missed the dirty line at 0x$b%x")
+        assert(!anyDirtyIn(dut, b), f"line 0x$b%x still dirty after CPUSH-All")
+      }
+    }
+  }
+
+  // (P5.4-d) An IC-only selector has no D-cache work: it completes without walking and
+  // without disturbing a resident dirty line.
+  test("an IC-only maintenance selector does no D-cache work at all", VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x5400L
+      preload(mem, base, 16)
+      load(dut, cd, base, Size.LONG, CacheMode.WRITETHROUGH)
+      doStore(dut, cd, base + 4, BigInt("DEADBEEF", 16), Size.LONG, CacheMode.COPYBACK)
+
+      maintPulse(dut, cd, push = true, invalidate = true, SCOPE_ALL, SEL_IC, 0)
+      val cycles = maintWait(dut, cd, budget = 32)
+      assert(cycles <= 4, s"an IC-only selector must complete immediately, took $cycles cycles")
+      assert(anyDirtyIn(dut, base), "an IC-only selector must not touch D-cache dirty state")
+      assert(load(dut, cd, base + 4, Size.LONG, CacheMode.COPYBACK) == BigInt("DEADBEEF", 16),
+        "an IC-only selector must leave the D-cache line resident and intact")
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // (P5.4-e) THE SAFETY REGRESSION -- the walk must not begin while a store is still
+  // in flight in the D-cache.
+  //
+  // WHAT THIS PINS. Task P5.4's brief claimed the maintenance walk could share the
+  // store path's array read port and AXI write registers "safely because excActive
+  // guarantees the load FSM / store-S0..S2 pipeline are idle". That claim is FALSE as
+  // stated, and is the same bug class this file already fixed twice (see EVICT_WR's
+  // revision history, ~L691, and `evictAwDone`'s, ~L344): `excActive` only stops the LS
+  // EU issuing anything NEW, while an OLDER, already-COMMITTED store drains out of the
+  // StoreQueue completely asynchronously.
+  //
+  // The scenario below is the minimal, concrete corruption: a COPYBACK store is
+  // presented (it merges on-chip and sets the dirty bit at its S2, several cycles
+  // later), and a Line-scope CPUSH of that SAME line is requested one cycle after.
+  // If the walk starts immediately it (a) steals rdSet/rdEn from the store's own S1
+  // read, and (b) samples `dirtys` BEFORE the store's S2 sets it -- so it sees a clean
+  // line, pushes nothing, and the store's data is silently LOST (memory keeps the old
+  // value forever, and the walk reports success).
+  //
+  // The fix is two independent gates, either of which alone prevents this: the caller
+  // (ExceptionUnit's new S_DRAIN state) waits on sqDrained + maintQuiesced, and the
+  // walk's OWN `WAIT` state re-checks `dcIdleForMaint` locally regardless of what the
+  // caller promised. This test drives `maintCmd` directly, so it exercises the SECOND
+  // gate -- the plugin defending itself.
+  // ═══════════════════════════════════════════════════════════════════════════
+  test("a maintenance walk requested mid-store-drain waits for quiesce and never loses the store",
+       VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x5800L
+      preload(mem, base, 16)
+      load(dut, cd, base, Size.LONG, CacheMode.WRITETHROUGH)   // warm, clean
+      assert(!anyDirtyIn(dut, base), "precondition: the warmed line must start clean")
+
+      // Continuously prove the invariant the whole design rests on: the walk is never
+      // ACTIVE on a cycle when the D-cache is not idle for it.
+      var violations = 0
+      var walkedWhileStoreInPipe = 0
+      fork {
+        while (true) {
+          cd.waitSampling()
+          val walking = dut.dcache.logic.maintWalkingDbg.toBoolean
+          val idle    = dut.dcache.logic.dcIdleForMaint.toBoolean
+          val stInPipe = dut.dcache.logic.stS2Valid.toBoolean
+          if (walking && !idle) violations += 1
+          if (walking && stInPipe) walkedWhileStoreInPipe += 1
+        }
+      }
+
+      // Present the COPYBACK store (1-cycle Flow pulse) ...
+      dut.probe.logic.storeIn.valid #= true
+      dut.probe.logic.storeIn.payload.paddr #= base + 4
+      dut.probe.logic.storeIn.payload.data #= BigInt("DEADBEEF", 16)
+      dut.probe.logic.storeIn.payload.size #= Size.LONG
+      dut.probe.logic.storeIn.payload.useStrb #= false
+      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+      dut.probe.logic.storeIn.payload.precise #= false
+      cd.waitSampling()
+      dut.probe.logic.storeIn.valid #= false
+
+      // ... and request the CPUSH of that same line IMMEDIATELY -- while the store is
+      // still only at S0/S1 and has NOT yet merged or set its dirty bit.
+      maintPulse(dut, cd, push = true, invalidate = false, SCOPE_LINE, SEL_DC, base)
+      maintWait(dut, cd)
+      cd.waitSampling(6)
+
+      assert(violations == 0,
+        s"the maintenance walk was ACTIVE on $violations cycle(s) when the D-cache was not idle " +
+        "for it -- the WAIT quiesce self-check did not hold it off")
+      assert(walkedWhileStoreInPipe == 0,
+        s"the maintenance walk ran on $walkedWhileStoreInPipe cycle(s) while a store occupied S2 " +
+        "-- it would steal the shared array read/write port from the store's own RMW")
+
+      // THE PAYLOAD ASSERTION: the store's data reached memory via the CPUSH. If the
+      // walk had started early it would have sampled `dirtys` before the store's S2 set
+      // it, pushed nothing, and left memory holding the ORIGINAL preloaded bytes.
+      assert(mem.peekByte(base + 4) == 0xDE && mem.peekByte(base + 5) == 0xAD &&
+             mem.peekByte(base + 6) == 0xBE && mem.peekByte(base + 7) == 0xEF,
+        f"the store was LOST: CPUSH pushed stale data. mem[base+4..7] = " +
+        f"${mem.peekByte(base+4)}%02x${mem.peekByte(base+5)}%02x" +
+        f"${mem.peekByte(base+6)}%02x${mem.peekByte(base+7)}%02x, expected deadbeef")
+      assert(!anyDirtyIn(dut, base), "the line must be clean after the push completed")
     }
   }
 }

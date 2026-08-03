@@ -85,6 +85,11 @@ class SysOpApplySpec extends AnyFunSuite {
     val sysTriggerIn = in Bool ()
     val sysKindIn    = in(SysKind())      // ENUM-typed, exactly like RobPlugin's store
     val sysValIn     = in Bits (32 bits)
+    // Task P5.4: the two quiesce preconditions the new S_DRAIN state waits on.
+    // FullCoreSynth drives these from `lsEu.sqEmptySig` / `dc.maintQuiesced`; here
+    // they are directly controllable so a test can prove S_APPLY genuinely blocks.
+    val sqDrainedIn  = in Bool ()
+    val dcQuiescedIn = in Bool ()
 
     val exc = new ExceptionUnit(
       ss = ss, mmuCtrl = mmu,
@@ -99,6 +104,9 @@ class SysOpApplySpec extends AnyFunSuite {
       sysVal     = sysValIn,
       sysPc      = U(NEXT_PC - 2, 32 bits),
       sysNextPc  = U(NEXT_PC, 32 bits))
+
+    exc.sqDrained  := sqDrainedIn
+    exc.dcQuiesced := dcQuiescedIn
 
     // ── observation ports ──
     val mmusrOut       = out UInt (32 bits); mmusrOut       := mmu.mmusrReg
@@ -142,6 +150,10 @@ class SysOpApplySpec extends AnyFunSuite {
     dut.sysTriggerIn #= false
     dut.sysKindIn    #= SysKind.NONE
     dut.sysValIn     #= 0
+    // Quiesced by default -- the normal steady state, so every pre-existing test
+    // below sees the same behaviour it always did (plus one S_DRAIN cycle).
+    dut.sqDrainedIn  #= true
+    dut.dcQuiescedIn #= true
     dut.clockDomain.waitSampling(4)
   }
 
@@ -226,6 +238,77 @@ class SysOpApplySpec extends AnyFunSuite {
       assert(dut.uspOut.toLong == 0x00087650L, f"USP=0x${dut.uspOut.toLong}%08x, expected 0x00087650")
       assert(!dut.flushSeen.toBoolean, "MOVE-USP must not pulse the TLB flushAll")
       assert(!dut.mmusrWriteSeen.toBoolean, "MOVE-USP must not write MMUSR")
+    }
+  }
+
+  /** Task P5.4 REGRESSION -- the commit-time sysOp path must quiesce before S_APPLY.
+    *
+    * THE BUG THIS PINS (a confirmed real gap, not a hypothetical): `sysTrigger` used to
+    * go straight from IDLE to `S_APPLY` the very next cycle, with NO drain wait --
+    * unlike exception entry (`E_DRAIN`) and RTE (`R_DRAIN`), both of which explicitly
+    * wait on `sqDrained` because, in E_DRAIN's own words, they must "wait for older
+    * committed stores to fully drain before we use the store port".
+    *
+    * That was harmless for every sysOp that existed before CPUSH/CINV (MOVEC / STOP /
+    * PFLUSHA / PTEST / RESET / MOVE-to-SR / MOVE-USP touch no D-cache state at all).
+    * CPUSH/CINV are the first sysOps to hand a cache-maintenance walk the D-cache's
+    * shared array read port and its AXI write channels -- resources an OLDER,
+    * ALREADY-COMMITTED store still draining out of the StoreQueue (commit and drain
+    * are decoupled by design), or a refill/dirty-victim eviction accepted before the
+    * flush landed, can still own for many cycles after `excActive` rises. `excActive`
+    * only stops the LS EU issuing anything NEW.
+    *
+    * PFLUSHA is used as the probe rather than CPUSH/CINV precisely because it has a
+    * loud, unambiguous, single-pulse S_APPLY side effect (`sysFlushAllValid`) to
+    * observe -- CPUSH/CINV are still architectural no-ops at this task. What is under
+    * test is the SHARED sysTrigger->S_APPLY path itself, which all of them take.
+    *
+    * Delete the `S_DRAIN` state (restore `goto(S_APPLY)` in the sysTrigger arm) and
+    * the FIRST assertion below fails immediately: the flush fires while the
+    * StoreQueue is still reported draining. */
+  test("a commit-time sysOp blocks in S_DRAIN until the SQ drains AND the D-cache quiesces (Task P5.4)") {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      init(dut)
+
+      // An older committed store is still draining out of the StoreQueue.
+      dut.sqDrainedIn  #= false
+      dut.dcQuiescedIn #= true
+      dut.sysKindIn    #= SysKind.PFLUSHA
+      dut.sysValIn     #= 0
+      dut.sysTriggerIn #= true
+      cd.waitSampling()                 // IDLE latches the context
+      dut.sysTriggerIn #= false
+
+      cd.waitSampling(20)
+      assert(dut.excActive.toBoolean,
+        "the FSM left the sysOp path entirely while the SQ was still draining -- it must park in S_DRAIN")
+      assert(!dut.flushSeen.toBoolean,
+        "S_APPLY FIRED while an older committed store was still draining out of the StoreQueue -- " +
+        "this is the P5.4 safety gap: for CPUSH/CINV this is the cache-maintenance walk taking the " +
+        "D-cache array port + AXI write channels out from under an in-flight store drain")
+
+      // SQ now drained, but the D-cache datapath itself is still busy (a refill /
+      // dirty-victim eviction accepted before the flush landed).
+      dut.sqDrainedIn  #= true
+      dut.dcQuiescedIn #= false
+      cd.waitSampling(20)
+      assert(dut.excActive.toBoolean, "the FSM must still be parked in S_DRAIN")
+      assert(!dut.flushSeen.toBoolean,
+        "S_APPLY FIRED while the D-cache load/refill FSM was still mid-transaction -- " +
+        "an in-flight refill/eviction owns the same shared array read port and AXI write channels " +
+        "the maintenance walk would take")
+
+      // Both preconditions met: the sysOp now applies, exactly once, and completes.
+      dut.dcQuiescedIn #= true
+      cd.waitSampling(8)
+      assert(dut.flushSeen.toBoolean, "S_APPLY never fired even after both quiesce conditions held")
+      assert(dut.flushCount.toInt == 1,
+        s"expected exactly 1 flush pulse, got ${dut.flushCount.toInt} -- S_DRAIN must not re-trigger S_APPLY")
+      assert(dut.redirSeen.toBoolean && dut.redirPc.toLong == NEXT_PC,
+        "the sysOp must still serialize + redirect to nextPc after the drain wait")
+      assert(!dut.excActive.toBoolean, "the FSM did not return to IDLE after the sysOp")
     }
   }
 }

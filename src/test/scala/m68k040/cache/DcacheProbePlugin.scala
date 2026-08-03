@@ -19,11 +19,21 @@ class DcacheProbePlugin extends FiberPlugin {
     val loadRspOut = master(Flow(DLoadRsp()))
     val loadBusyOut = out(Bool())
     val storeIn    = slave(Flow(DStoreCmd()))
+    // Task P5.4: cache-maintenance walk drive/observe. `maintCmd` is default-driven
+    // idle inside DcachePlugin (allowOverride) since it has no real driver until Task
+    // P5.5, so this overrides it rather than using `<<`.
+    val maintCmdIn      = slave(Flow(CacheMaintCmd()))
+    val maintDoneOut    = out(Bool())
+    val maintQuiescedOut = out(Bool())
 
     ds.loadCmd << loadCmdIn
     loadRspOut << ds.loadRsp
     loadBusyOut := ds.loadBusy
     ds.store << storeIn
+    ds.maintCmd.valid   := maintCmdIn.valid
+    ds.maintCmd.payload := maintCmdIn.payload
+    maintDoneOut        := ds.maintDone
+    maintQuiescedOut    := ds.maintQuiesced
 
     // drive the D-side translation request from the presented load (loads only here)
     val xlate = host[DTranslationService]

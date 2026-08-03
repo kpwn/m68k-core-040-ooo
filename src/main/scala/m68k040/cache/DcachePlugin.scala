@@ -559,6 +559,17 @@ class DcachePlugin extends FiberPlugin with DcacheService {
                           // in an IDLE-adjacent context without re-checking.
                           (stS2ArrayWrite && stS2HitVec(victimWay))
 
+    // ---- Task P5.4: cache-maintenance (CPUSH/CINV) walk, forward declarations ----
+    // Declared HERE (ahead of the load FSM) because the load FSM's own load-accept
+    // arm must read `maintBusyReg` -- while a maintenance walk owns the shared array
+    // read port, NO new load may be accepted (see the maintenance Area far below for
+    // the full mutual-exclusion argument; the short version is that this gate is what
+    // makes the load FSM provably unable to drive rdSet/rdEn, kick off an eviction,
+    // or open an AXI write pair for the entire duration of the walk).
+    val maintBusyReg = RegInit(False)
+    maintBusyReg.simPublic()   // test-visibility (the P5.4 quiesce regression test);
+                                // no-op for synthesis
+
     // ---- LOAD FSM (OVERRIDES the shared read port with PRIORITY over the store) ----
     val fsm = new StateMachine {
       val IDLE     = new State with EntryPoint
@@ -588,7 +599,14 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         // inside IDLE.whenIsActive) -- `ldS1Valid` would self-clear with no
         // response ever sent, hanging the LS EU forever. A load HIT would still
         // resolve fine, but there's no way to know that before accepting.
-        loadCmdPort.ready := !inFlight && xlate.rsp.ready && !pendingStoreMiss
+        // Task P5.4: ALSO held off for the whole duration of a cache-maintenance
+        // walk. The walk drives the shared rdSet/rdEn port and the AXI write
+        // channels; refusing new loads here is what keeps the load FSM pinned in
+        // IDLE (no accept -> no rdSet drive, no miss -> no EVICT_WR entry -> no
+        // eviction AXI pair) so the two can never contend. Bounded by construction
+        // (a walk is at most sets*ways iterations), and the LS EU is architecturally
+        // blocked from issuing anyway (the walk only ever runs under excActive).
+        loadCmdPort.ready := !inFlight && xlate.rsp.ready && !pendingStoreMiss && !maintBusyReg
         when(loadCmdPort.fire) {
           // Launch the BRAM tag+data read for this set; resolve hit/miss in S1.
           rdSet        := cmdSet
@@ -894,6 +912,285 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Task P5.4: cache-maintenance (CPUSH / CINV) walk engine
+    // ═══════════════════════════════════════════════════════════════════════════
+    //
+    // Services a Line/Page/All-scope push (writeback-dirty) and/or invalidate over
+    // the D-cache arrays, one (set, way) per iteration.
+    //
+    // ── SAFETY: why this does NOT reuse the store path's AXI registers ──────────
+    // The obvious implementation -- share `stAddrReg`/`stMergeReg`/`stAwDone`/
+    // `stWDone` with the store-S2 write-through path and disambiguate the responses
+    // with a distinct AXI `id` -- is EXACTLY "revision 1" of this file's Task P4.3
+    // eviction writeback, which was PROVEN UNSAFE by a live regression failure (see
+    // the long revision-history comment on `evictAwDone` above, ~L344, and EVICT_WR's
+    // own ~L691). Two independent holes: (a) a concurrent writer overwriting the
+    // shared address/data registers between our own AW and W hands the wrong data to
+    // the wrong address, and (b) AXI4's AW/W FIFO-ordering rule cross-attributes two
+    // interleaved open pairs regardless of `id` (ids demux the B RESPONSE, they do
+    // NOT pair AW with W). An `id`-tagged shared-register design is not made safe by
+    // the tag.
+    //
+    // The claim that "excActive guarantees the LS pipe is idle, so sharing is fine"
+    // is ALSO false as stated, and was verified false directly: ExceptionUnit's
+    // commit-time sysOp path (`sysTrigger`, which CPUSH/CINV take) used to go
+    // straight to `S_APPLY` the very next cycle, with NO drain wait -- unlike
+    // exception ENTRY (`E_DRAIN`) and RTE (`R_DRAIN`), both of which explicitly wait
+    // on `sqDrained` before touching any store-adjacent state. `excActive` stops the
+    // LS EU issuing anything NEW; it does nothing about an older COMMITTED store
+    // still draining out of the StoreQueue (commit and drain are decoupled by
+    // design), nor about a load-refill / dirty-victim eviction already accepted
+    // before the flush landed. No sysOp before CPUSH/CINV ever touched the D-cache
+    // AXI write registers, so this exposure is genuinely new.
+    //
+    // This engine is therefore protected THREE ways, deliberately redundantly:
+    //   1. Its own dedicated AXI completion flags (`maintAwDone`/`maintWDone`) and
+    //      its own latched address/data payload (`wbAddrReg`/`wbLineReg`) -- it never
+    //      touches `stAwDone`/`stWDone`/`stAddrReg`/`stMergeReg`. Even if the
+    //      quiescence invariant below were somehow violated, the failure mode is
+    //      bounded contention, never silent register cross-corruption.
+    //   2. Its AXI drive is gated off on any cycle either other writer holds an open
+    //      pair (`storeWantsAxi || evictAxiPairOpen`), the same bidirectional-gate
+    //      shape as P4.3's proven revision 3, so the three never physically present
+    //      overlapping AW/W pairs. Deadlock-free because the walk only ever OPENS its
+    //      pair when both of those are already false, and `maintBusyReg` then keeps
+    //      them false (no new load accepted -> no eviction; no store can arrive).
+    //   3. It refuses to START until `dcIdleForMaint` (below) is locally true -- a
+    //      self-check, independent of any promise made by the caller. The caller
+    //      (ExceptionUnit's new `S_DRAIN` state) separately waits on `sqDrained` AND
+    //      on this same signal exported as `maintQuiesced`, so a walk cannot even be
+    //      requested mid-drain.
+    //
+    // ── Array read port ────────────────────────────────────────────────────────
+    // The walk drives `rdSet`/`rdEn`. While `maintBusyReg` no load can be accepted
+    // and the load FSM is pinned in IDLE (it only drives rdSet on a load-accept or in
+    // REPLAY), and no store can be in S1, so nothing else drives the port. The walk's
+    // own drives additionally elaborate AFTER the load FSM's (StateMachine bodies run
+    // as `prePopTask` in creation order, and this machine is created second), so it
+    // also wins last-assignment-wins if that invariant is ever broken. A sim assert
+    // below proves the invariant rather than assuming it.
+
+    /** Every D-cache datapath resource the walk needs, genuinely idle THIS cycle. */
+    val dcIdleForMaint = !busy && !ldS1Valid && !pendingStoreMiss && !pendingWtKickoff &&
+                         !s0Valid && !stS1Valid && !stS2Valid &&
+                         stAwDone && stWDone && evictAwDone && evictWDone
+    dcIdleForMaint.simPublic()
+
+    val maintWalkingDbg = Bool(); maintWalkingDbg.simPublic()
+
+    val maintCmdPort = Flow(CacheMaintCmd())
+    maintCmdPort.valid.allowOverride
+    maintCmdPort.payload.flatten.foreach(_.allowOverride)
+    // Explicit ZERO defaults rather than `assignDontCare()`: a don't-care default
+    // both propagates X into the latch registers in sim and (per this project's
+    // documented SpinalHDL gotchas) hides a testbench poke from consumers. Nothing
+    // drives this yet -- Task P5.5's ExceptionUnit dispatch is the sole future driver.
+    maintCmdPort.valid            := False
+    maintCmdPort.payload.push       := False
+    maintCmdPort.payload.invalidate := False
+    maintCmdPort.payload.scope      := U(0, 2 bits)
+    maintCmdPort.payload.sel        := U(0, 2 bits)
+    maintCmdPort.payload.addr       := U(0, 32 bits)
+
+    // 1-cycle completion pulse (registered: default-False every cycle, driven True
+    // for exactly one cycle at the end of the walk).
+    val maintDoneReg = RegInit(False)
+    maintDoneReg := False
+    maintDoneReg.simPublic()
+
+    val maint = new Area {
+      val cmd     = Reg(CacheMaintCmd())
+      val walkSet = Reg(UInt(setBits bits))
+      val lastSet = Reg(UInt(setBits bits))
+      val curWay  = Reg(UInt(wayBits bits))
+      // Dedicated AXI write completion flags + latched payload -- NEVER the store's.
+      val maintAwDone = Reg(Bool()) init True
+      val maintWDone  = Reg(Bool()) init True
+      val wbAddrReg   = Reg(UInt(32 bits))
+      val wbLineReg   = Reg(Bits(128 bits))
+      val maintAxiPairOpen = !maintAwDone || !maintWDone
+      // "The walk is past its quiesce WAIT and is actively touching the arrays / AXI
+      // this cycle." Distinct from `maintBusyReg` (which is deliberately also set
+      // during WAIT, so loads are refused while we are still waiting for the datapath
+      // to settle -- during WAIT a store IS legitimately still in the pipe; that is
+      // the entire point of the state). The sim asserts below key on THIS signal.
+      val walking = Bool()
+      walking := False
+
+      // Does this command touch the D-cache array at all? sel: 01=DC, 10=IC, 11=BC.
+      // An IC-only (10) command has no DC work -- Task P5.5 pulses the I-cache's own
+      // invalidate separately -- so it completes immediately instead of walking 512
+      // (set, way) pairs to do nothing.
+      def touchesDc(c: CacheMaintCmd): Bool = (c.sel === U(1, 2 bits)) || (c.sel === U(3, 2 bits))
+
+      val sm = new StateMachine {
+        val IDLE  = new State with EntryPoint
+        val WAIT  = new State   // command latched; hold until the D-cache is quiesced
+        val READ  = new State   // launch the shared-port read at walkSet
+        val CHECK = new State   // registered tag/data landed; match + push/invalidate
+        val WRB   = new State   // one matching dirty line's writeback beat
+        val NEXTW = new State   // advance way, then set
+
+        IDLE.whenIsActive {
+          maintBusyReg := False
+          when(maintCmdPort.valid) {
+            val p      = maintCmdPort.payload
+            val tgtSet = p.addr(offBits + setBits - 1 downto offBits)
+            val isLine = p.scope === U(1, 2 bits)
+            cmd     := p
+            walkSet := Mux(isLine, tgtSet, U(0, setBits bits))
+            lastSet := Mux(isLine, tgtSet, U(sets - 1, setBits bits))
+            curWay  := 0
+            when(touchesDc(p)) {
+              maintBusyReg := True
+              goto(WAIT)
+            } otherwise {
+              // IC/BC-only: no D-cache work at all. Complete immediately (still a
+              // real, single completion pulse so the caller's handshake is uniform).
+              maintDoneReg := True
+            }
+          }
+        }
+
+        // Self-check (point 3 above): never begin touching the arrays / AXI until the
+        // D-cache datapath is genuinely idle, INDEPENDENT of the caller's own
+        // S_DRAIN wait. In the intended flow this is already true on entry and WAIT
+        // costs exactly one cycle.
+        WAIT.whenIsActive {
+          maintBusyReg := True
+          when(dcIdleForMaint) { goto(READ) }
+        }
+
+        READ.whenIsActive {
+          maintBusyReg := True
+          walking := True
+          rdSet := walkSet
+          rdEn  := True
+          goto(CHECK)
+        }
+
+        CHECK.whenIsActive {
+          maintBusyReg := True
+          walking := True
+          val target = cmd.addr
+          // Line scope: this exact line (set already fixed to the target set, but
+          // compare it anyway so the predicate reads standalone). Page scope: the
+          // 4K page number == paddr[31:12]; with tag = paddr[31:11] that is
+          // tag[tagBits-1:1]. A 4K page spans every set (256 lines over 128 sets),
+          // so Page and All both walk the whole array. All scope: everything.
+          val lineMatch = (walkSet === target(offBits + setBits - 1 downto offBits)) &&
+                          (rdTag(curWay) === target(31 downto offBits + setBits))
+          val pageMatch = rdTag(curWay)(tagBits - 1 downto 1) === target(31 downto 12)
+          val scopeHit  = Mux(cmd.scope === U(1, 2 bits), lineMatch,
+                          Mux(cmd.scope === U(2, 2 bits), pageMatch, True))
+          val resident  = valids(curWay)(walkSet)
+          val matches   = resident && scopeHit
+          val isDirty   = dirtys(curWay)(walkSet)
+          when(matches && cmd.push && isDirty) {
+            // Latch OUR OWN writeback payload now (point 1 above) -- the AXI leg
+            // never re-reads the shared array port.
+            wbAddrReg   := (rdTag(curWay) ## walkSet ## U(0, offBits bits)).asUInt
+            wbLineReg   := rdData(curWay)
+            maintAwDone := False
+            maintWDone  := False
+            goto(WRB)
+          } otherwise {
+            when(matches && cmd.invalidate) {
+              for (w <- 0 until ways) when(curWay === U(w, wayBits bits)) {
+                valids(w)(walkSet) := False
+                dirtys(w)(walkSet) := False
+              }
+            }
+            goto(NEXTW)
+          }
+        }
+
+        WRB.whenIsActive {
+          maintBusyReg := True
+          walking := True
+          // Gated off whenever either other AXI write issuer holds an open pair
+          // (point 2 above). Both are guaranteed false here in the intended flow;
+          // the gate is defence in depth, and is deadlock-free because neither can
+          // newly become true while maintBusyReg holds.
+          val axiFree = !storeWantsAxi && !evictAxiPairOpen
+          when(!maintAwDone && axiFree) {
+            axi.aw.valid         := True
+            axi.aw.payload.addr  := wbAddrReg
+            axi.aw.payload.id    := U(4, 4 bits)
+            axi.aw.payload.len   := U(0, 8 bits)
+            axi.aw.payload.size  := U(4, 3 bits)
+            axi.aw.payload.burst := Axi4.burst.INCR
+            when(axi.aw.ready) { maintAwDone := True }
+          }
+          when(!maintWDone && axiFree) {
+            axi.w.valid        := True
+            axi.w.payload.data := wbLineReg
+            axi.w.payload.strb := B(0xFFFF, 16 bits)
+            axi.w.payload.last := True
+            when(axi.w.ready) { maintWDone := True }
+          }
+          when(maintAwDone && maintWDone) {
+            // Demux the B by OUR OWN id (=== 4, fail-closed -- same reasoning as
+            // `storeBAck`'s `=== 1` comment below): ignore anything else and keep
+            // waiting. `axi.b.ready` is held True globally.
+            when(axi.b.valid && axi.b.payload.id === U(4, 4 bits)) {
+              when(axi.b.payload.resp =/= Axi4.resp.OKAY) {
+                // Imprecise DIAGNOSTIC only, per the design's locked decision that a
+                // writeback error is a diagnostic crash and not an architectural trap.
+                diagFaultPulse     := True
+                diagFaultPulseAddr := wbAddrReg
+                diagFaultPulseResp := axi.b.payload.resp.asUInt.resize(2)
+                diagFaultPulseKind := U(3, 3 bits)   // kind=3: CPUSH maintenance writeback
+              }
+              // The line is now clean in memory. CPUSH-without-invalidate keeps it
+              // resident-and-clean; the invalidating form drops it.
+              for (w <- 0 until ways) when(curWay === U(w, wayBits bits)) {
+                dirtys(w)(walkSet) := False
+                when(cmd.invalidate) { valids(w)(walkSet) := False }
+              }
+              goto(NEXTW)
+            }
+          }
+        }
+
+        NEXTW.whenIsActive {
+          maintBusyReg := True
+          walking := True
+          when(curWay === U(ways - 1, wayBits bits)) {
+            curWay := 0
+            when(walkSet === lastSet) {
+              maintDoneReg := True
+              maintBusyReg := False
+              goto(IDLE)
+            } otherwise {
+              walkSet := walkSet + 1
+              goto(READ)
+            }
+          } otherwise {
+            curWay := curWay + 1
+            goto(READ)
+          }
+        }
+      }
+    }
+
+    maintWalkingDbg := maint.walking
+
+    // Review-added: prove (rather than assume) the mutual-exclusion invariants the
+    // walk's array-port and AXI safety rest on. Sim-only; no synthesis cost.
+    GenerationFlags.simulation {
+      assert(!(maint.walking && (s0Valid || stS1Valid || stS2Valid)),
+        "DcachePlugin: a STORE was in the S0..S2 pipeline while a cache-maintenance walk was actively running -- the walk's caller pulsed maintCmd without waiting for the StoreQueue to drain (ExceptionUnit S_DRAIN / DcacheService.maintQuiesced), AND the walk's own WAIT self-check was bypassed",
+        FAILURE)
+      assert(!(maint.walking && !fsm.isActive(fsm.IDLE)),
+        "DcachePlugin: the load/refill FSM left IDLE during a cache-maintenance walk -- it can drive the shared rdSet/rdEn port and open an eviction AXI pair, both of which the walk assumes are exclusively its own",
+        FAILURE)
+      assert(!(maint.maintAxiPairOpen && (storeWantsAxi || evictAxiPairOpen)),
+        "DcachePlugin: the cache-maintenance writeback's AXI aw/w pair was open at the same time as the store's or the eviction's -- AXI4 AW/W FIFO ordering cross-attributes overlapping pairs regardless of id (the proven-unsafe P4.3 revision-1/2 failure mode)",
+        FAILURE)
+    }
+
     // ---- store read-port arbiter CONTROL (no BRAM-address logic here) ----
     // The store's read ADDRESS was already driven (as the base) before the FSM; the
     // FSM overrode rdSet/rdEn if a load used the port this cycle. So here we ONLY
@@ -1188,4 +1485,9 @@ class DcachePlugin extends FiberPlugin with DcacheService {
   override def storeAck = logic.storeAckReg
   override def storeErr = logic.storeErrReg
   override def diagFault = logic.diagFaultValid
+  override def maintCmd  = logic.maintCmdPort
+  override def maintDone = logic.maintDoneReg
+  // Exported precondition (see DcacheService.maintQuiesced's contract): the whole
+  // D-cache datapath is idle AND no walk is already running.
+  override def maintQuiesced = logic.dcIdleForMaint && !logic.maintBusyReg
 }
