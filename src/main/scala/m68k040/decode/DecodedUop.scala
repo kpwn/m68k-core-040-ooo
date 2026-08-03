@@ -125,14 +125,30 @@ object SysKind extends SpinalEnum {
       // S_APPLY path; the halt is the ROB `stopped` state. S=0 -> vector 8.
       STOP,         // (RESET=4, STOP=5 — needs the 3-bit FSM ctx widened in T0.)
       // CPUSH (line-1111, 1111 0100 1ss CCC Ann): privileged cache-push/invalidate.
-      // Architecturally a NOP here (no cache hierarchy modeled) — same treatment as
-      // RESET, just its own named kind for clarity. S=0 -> vector 8.
+      // Task P5.2: this decoder now produces CPUSH/CINV as distinct, correctly-decoded
+      // kinds (bit[5] selects: 1=CPUSH, 0=CINV), but the actual cache-maintenance effect
+      // is STILL a deliberate temporary NOP as of this task — same "no state change,
+      // just serialize + advance PC" treatment as RESET. This is NOT a permanent
+      // architectural choice: Slice P4 already made the D-cache's copyback/dirty-bit
+      // hierarchy fully real, and the rest of THIS slice (P5.4's DcachePlugin
+      // maintenance engine + P5.5's ExceptionUnit dispatch) wires CPUSH/CINV into real
+      // push-dirty-lines/invalidate-lines effects. S=0 -> vector 8.
       CPUSH,
+      // CINV (line-1111, same top byte 0xF4 as CPUSH -- bit[5]=0 selects CINV vs
+      // CPUSH's bit[5]=1, per Task P5.1's cross-checked encoding): discard (invalidate)
+      // matching cache lines WITHOUT writeback, regardless of dirty state -- the
+      // corpus's own cinv_line_basic.s / cpush_line_basic.s header comments are the
+      // authoritative spec for this. Like CPUSH above, real cache-maintenance effect
+      // lands in P5.4/P5.5; this task only adds correct decode.
+      CINV,
       // PFLUSHA (line-1111, 0xF518): privileged "flush all ATC/TLB entries". A REAL
       // effect (unlike CPUSH/RESET) — pulses a flushAll signal that both DtlbPlugin and
       // ItlbPlugin clear their TLB + walk-result latch on, mirroring the existing
-      // umFlush top-level fan-out pattern. S=0 -> vector 8. (value 7 — was the last slot
-      // in the old 3-bit sysKind field; PTEST below bumped the field to 4 bits.)
+      // umFlush top-level fan-out pattern. S=0 -> vector 8. (value 8 as of Task P5.2's
+      // CINV insertion — was value 7/"last slot in the old 3-bit field" before PTEST
+      // bumped the field to 4 bits; CINV's insertion above bumps every element from
+      // here down by one more ordinal. The field stays 4 bits either way — 10 elements
+      // still fit.)
       PFLUSHA,
       // PTEST{R,W} (An) (line-1111, 0xF548-0xF54F/0xF568-0xF56F — task #198): privileged
       // MMU-probe "translate An, latch status in MMUSR". This core's MMU has no real
@@ -144,9 +160,10 @@ object SysKind extends SpinalEnum {
       // address, R bit set, every other status bit 0). Direction is always "write" (An
       // -> MMUSR; sysReadDir=False) — the result is read back separately via a normal
       // MOVEC %mmusr,Rn (Rc id 0x805, a new MmuControlPlugin-owned register). S=0 ->
-      // vector 8. (value 8 — the 9th SysKind element, bumping the field from 3 to 4
-      // bits; see ExceptionUnit.scala's `sysKind`/`sysCapKind` + RobPlugin's
-      // `.resize(...)` call, all updated together.)
+      // vector 8. (value 9 as of Task P5.2's CINV insertion — was value 8/"the 9th
+      // SysKind element" when it first bumped the field from 3 to 4 bits; see
+      // ExceptionUnit.scala's `sysKind`/`sysCapKind` + RobPlugin's `.resize(...)` call,
+      // all updated together. Still fits comfortably in 4 bits with 10 elements total.)
       PTEST
       = newElement()
 }

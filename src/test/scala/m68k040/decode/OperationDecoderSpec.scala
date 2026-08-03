@@ -278,4 +278,47 @@ class OperationDecoderSpec extends AnyFunSuite {
       assert(!dut.o.sysReadDir.toBoolean)
     }
   }
+
+  // ── CPUSH/CINV (Task P5.2): line-1111 top byte 0xF4, bit[5] selects CPUSH(1)/
+  // CINV(0). The arm claims the WHOLE 0xF4xx byte unconditionally (CC/SS/AAA are not
+  // gated by this decoder), so it's always a non-illegal, commit-time SYSTEM MOVE/LONG
+  // with no dst write. Ground-truth opwords per Task P5.1's cross-check: 0xF448 has
+  // bit5=0 (CINV), 0xF468/0xF478 have bit5=1 (CPUSH).
+  test("CINV (0xF448): sysOp CINV, MOVE/LONG, no dst write, write dir", VerilatorTest) {
+    run(0xF448) { dut =>
+      assert(!dut.o.illegal.toBoolean, "CINV must not be illegal")
+      assert(dut.o.sysOp.toBoolean && dut.o.sysKind.toEnum == SysKind.CINV)
+      assert(dut.o.op.toEnum == DecOp.MOVE && dut.o.size.toEnum == Size.LONG)
+      assert(!dut.o.sysReadDir.toBoolean && !dut.o.dstWrites.toBoolean)
+    }
+  }
+  test("CPUSH (0xF468): sysOp CPUSH, MOVE/LONG, no dst write, write dir", VerilatorTest) {
+    run(0xF468) { dut =>
+      assert(!dut.o.illegal.toBoolean, "CPUSH must not be illegal")
+      assert(dut.o.sysOp.toBoolean && dut.o.sysKind.toEnum == SysKind.CPUSH)
+      assert(dut.o.op.toEnum == DecOp.MOVE && dut.o.size.toEnum == Size.LONG)
+      assert(!dut.o.sysReadDir.toBoolean && !dut.o.dstWrites.toBoolean)
+    }
+  }
+  test("CPUSH (0xF478): sysOp CPUSH (a different CC/SS/An bit pattern, same bit[5]=1)", VerilatorTest) {
+    run(0xF478) { dut =>
+      assert(!dut.o.illegal.toBoolean, "CPUSH must not be illegal")
+      assert(dut.o.sysOp.toBoolean && dut.o.sysKind.toEnum == SysKind.CPUSH)
+    }
+  }
+  // Every OTHER opword in the 0xF4xx/0xF5xx byte-pair does NOT hit the CPUSH/CINV arm
+  // (it requires bits[11:8]==0100, i.e. the fixed 0xF4 byte — 0xF5xx has bit8=1 and is
+  // claimed, if at all, by the separate PFLUSH/PTEST arms). These representative 0xF5xx
+  // opwords match neither the PFLUSH-family pattern (op[7:6]=00 fixed, mode field<=3)
+  // nor the PTEST pattern (op[7:6]=01, op[4]=0,op[3]=1) nor PFLUSHA/PTEST/MOVE16/FSF, so
+  // they correctly fall through to the F-line illegalDefault.
+  test("0xF520 (F5xx, mode field=4>3): not PFLUSH-family, not PTEST -> illegal", VerilatorTest) {
+    run(0xF520) { dut => assert(dut.o.illegal.toBoolean) }
+  }
+  test("0xF580 (F5xx, op[7:6]=10): not PFLUSH-family, not PTEST -> illegal", VerilatorTest) {
+    run(0xF580) { dut => assert(dut.o.illegal.toBoolean) }
+  }
+  test("0xF5C0 (F5xx, op[7:6]=11): not PFLUSH-family, not PTEST -> illegal", VerilatorTest) {
+    run(0xF5C0) { dut => assert(dut.o.illegal.toBoolean) }
+  }
 }

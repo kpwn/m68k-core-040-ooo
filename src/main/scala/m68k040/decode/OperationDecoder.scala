@@ -993,22 +993,31 @@ object OperationDecoder {
         }
       }
 
-      // ── CPUSH (line-1111, top byte 0xF4: 1111 0100 ss CCC Ann): privileged cache
-      // push/invalidate. Real encoding: bit11=0,bit10=1,bit9=0,bit8=0 (bits7:6=scope,
-      // 5:3=cache selector, 2:0=An — all ignored, no cache hierarchy modeled here). A
-      // COMMIT-TIME SYSTEM op, same "no real effect" treatment as RESET: it serializes
-      // + advances PC; S=0 -> vector-8. (PFLUSH/PFLUSHA live in the adjacent 0xF5xx
-      // range, bit8=1 — see the PFLUSHA arm below.) Everything else under line-F stays
-      // illegal (falls to illegalDefault, vector 11, via MicroOpAssembler's top-nibble
-      // faultVector select).
+      // Line-1111 (top nibble 0xF): CPUSH/CINV (top byte 0xF4, see the arm's own
+      // comment below), MOVE16, PFLUSH family, PTEST, and the single-literal FSF
+      // carve-out are the only non-illegal encodings; everything else under line-F
+      // stays illegal (falls to illegalDefault, vector 11, via MicroOpAssembler's
+      // top-nibble faultVector select).
       is(0xF) {
-        val isCpush = !opword(11) && opword(10) && !opword(9) && !opword(8)
-        when(isCpush) {
+        // ── CPUSH/CINV (line-1111, top byte 0xF4: 1111 0100 CC O SS AAA -- Task P5.1's
+        // cross-checked encoding): privileged cache push/invalidate. bit[5]=1 selects
+        // CPUSH (push, optionally invalidate, matching lines), bit[5]=0 selects CINV
+        // (invalidate matching lines WITHOUT writeback, discarding any dirty data) --
+        // see the corpus's own cpush_line_basic.s/cinv_line_basic.s header comments.
+        // This arm claims the ENTIRE 0xF4xx byte unconditionally (CC/SS/AAA are not
+        // gated here) -- a COMMIT-TIME SYSTEM op; serializes + advances PC; S=0 ->
+        // vector-8. The real cache-maintenance effect (which lines get pushed/
+        // invalidated) is wired up in Task P5.4 (DcachePlugin engine) + P5.5
+        // (ExceptionUnit dispatch); this task only adds correct decode of which
+        // op it is. Scope/cache-selector routing to MicroOpAssembler (the packed
+        // `imm` side-channel, mirroring MOVEC's Rc-id precedent) is Task P5.3.
+        val isCpushFamily = !opword(11) && opword(10) && !opword(9) && !opword(8)
+        when(isCpushFamily) {
           o.illegal := False
           o.op := DecOp.MOVE
           o.size := Size.LONG
           o.sysOp := True
-          o.sysKind := SysKind.CPUSH
+          o.sysKind := Mux(opword(5), SysKind.CPUSH, SysKind.CINV)
           o.sysReadDir := False
           o.dst.setNone(); o.dstWrites := False
         }
