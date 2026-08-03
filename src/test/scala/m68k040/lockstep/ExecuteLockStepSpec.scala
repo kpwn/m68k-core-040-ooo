@@ -34,6 +34,21 @@ import org.scalatest.funsuite.AnyFunSuite
   * Corpus is restricted to 2-byte instructions (MOVEQ, reg-reg .l ALU/CMP) so
   * the ROB's stubbed `predNextPc = pc + 2` exactly matches Musashi's
   * post-instruction PC.
+  *
+  * GUARD NOTE (design doc §5 item 10, task P5.1): Musashi models NO cache —
+  * it applies every store to memory immediately and has no notion of a dirty
+  * copyback line (it does not even execute CPUSH/CINV; both fall through its
+  * generic line-F "unimplemented instruction" trap, `m68ki_exception_1111`,
+  * per `tools/musashi/musashi/m68k_in.c`'s catch-all `1111............`
+  * pattern). A lock-step PROGRAM that runs CPUSH/CINV against a genuinely
+  * dirty copyback line will therefore architecturally DIVERGE from the
+  * oracle by design — the RTL correctly models real data loss/writeback
+  * that Musashi has no way to reproduce. This is NOT a lock-step bug to
+  * chase; it is an inherent limitation of comparing against a cache-less
+  * oracle. Do not add CPUSH/CINV programs to this suite's corpus without
+  * first re-reading this note. (Confirmed clean as of this note: no current
+  * program in this file exercises CPUSH/CINV — verified via
+  * `grep -in cinv src/test/scala/m68k040/lockstep/ExecuteLockStepSpec.scala`.)
   */
 class ExecuteLockStepSpec extends AnyFunSuite {
 
