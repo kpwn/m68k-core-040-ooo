@@ -57,6 +57,9 @@ class BehavioralMemAgent(axi: Axi4, cd: ClockDomain, sharedMem: SparseMemory = n
   def peek128(addr: Long): BigInt             = model.peek128(addr)
   /** Task P4.7: see `AxiMemModel.armWriteFault`. */
   def armWriteFault(addr: Long): Unit = model.armWriteFault(addr)
+  /** OPT-IN, DEFAULT-OFF: see `AxiWriteEngine.onByteWrite`. Not calling this leaves the
+    * agent byte-for-byte identical to before the hook existed. */
+  def setByteWriteObserver(f: (Long, Byte) => Unit): Unit = model.setByteWriteObserver(f)
 }
 
 class Axi4ReadOnlyBehavioralAgent(axi: Axi4ReadOnly, cd: ClockDomain,

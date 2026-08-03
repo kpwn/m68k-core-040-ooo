@@ -81,7 +81,7 @@ object PortedTestRunner {
       // be exercised by the ported-test corpus if this harness can actually produce
       // one. Population convention is byte-identical to the old `attachProgram`, so
       // every other (mapped) fetch is unaffected.
-      FuzzDut.attachProgramWithBusErrors(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val iAgent = FuzzDut.attachProgramWithBusErrors(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       // Task #189: inject a real DECERR for the D-side data bus on a genuinely
       // undecoded physical address (mirrors the real SoC's axi_xbar decode the
       // ported-test corpus's exc_bus_error* headers describe — see
@@ -89,7 +89,62 @@ object PortedTestRunner {
       // the ITLB/DTLB table-walker memories below are untouched (a separate MMU
       // concern, out of this task's scope; changing their behavior risked
       // regressing the whole MMU test cluster for no benefit here).
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, injectBusErrors = true)
+      //
+      // `sharedMem` is a `ConstFillSparseMemory(0xFF)` rather than the stock
+      // `SparseMemory()`: the vendored m68k-ooo corpus was written against a testbench
+      // that "initialises all unmapped RAM bytes to 0xFF" (verbatim from
+      // `cinv_line_basic.s`'s header), and cinv_line_basic / mmu_ttr_cm_copyback_vs_
+      // serialized compare a deliberately never-written address against a hardcoded
+      // 0xFFFFFFFF to prove a dirty line really was DROPPED rather than written back.
+      // SpinalHDL's stock SparseMemory fills a freshly-allocated 1 MiB chunk with
+      // deterministic pseudo-random bytes instead (see ConstFillSparseMemory's doc
+      // comment for the decompiled mechanism), which those tests can never satisfy.
+      // Scoped deliberately to the ported-test D side: no other harness's memory model
+      // changes, and the I-side agent above keeps SpinalHDL's stock random fill (which
+      // several instruction-fetch tests rely on to make beyond-program bytes decode as
+      // garbage rather than as a uniform, executable 0xFF... stream).
+      //
+      // KNOWN, INVESTIGATED CONSEQUENCE -- `rom_scc_mmio_btst_dbf_timeout`. That test
+      // polls `btst #0,(0x50f0c022)`, a Q700 SCC status mirror. `AxiMemModel.decoded`
+      // classifies top-nibble 0x5 as decoded, so the poll does NOT bus-fault here and
+      // simply reads the memory model's fill byte. Under the stock pseudo-random fill
+      // the byte at that one address happened to have bit 0 CLEAR, so the DBF loop ran
+      // its full 256 iterations and the test went green -- a coincidence of a single
+      // random byte, not evidence of anything. Under the corpus's real 0xFF convention
+      // the bit reads SET, the loop exits on iteration 1, and the test reports its own
+      // FAIL_MISMATCH (0xBADC0C22) diagnostic. Per its own header this test cannot
+      // legitimately pass in a harness with no SCC model backing 0x50f0c022 (the
+      // original m68k-ooo tb leaves that address unmapped, where it instead reports
+      // FAIL_NO_SCC) -- so it is left red rather than special-cased here. Backing the
+      // SCC window is a deliberate, separate decision, not a fill-convention fix.
+      val dsideMem = new m68k040.sim.ConstFillSparseMemory(0xff.toByte)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd,
+                                                   sharedMem = dsideMem, injectBusErrors = true)
+      // SELF-MODIFYING CODE: mirror every runtime D-side store byte into the I-side's
+      // SEPARATE program image. The I and D views are two different `SparseMemory`
+      // objects holding the SAME image in two DELIBERATELY INCOMPATIBLE byte
+      // conventions (see the big warning block in AxiMemModel.scala): the D side is
+      // plain byte-at-address, the I side stores each 16-bit big-endian opword
+      // LOW-BYTE-FIRST. Seeding both at setup (below) is enough for ordinary tests, but
+      // a RUNTIME store -- an SMC test patching its own code, or a test staging code in
+      // RAM and jumping to it -- only ever landed in the D-side memory, so instruction
+      // fetch could never observe it no matter how correct the RTL's D-cache/I-cache/
+      // CPUSH/CINV coherency handling was.
+      //
+      // The address transform is DERIVED from `AxiMemModel.loadProgramIFetch`'s own swap
+      // loop, not guessed: it writes the byte from plain offset 2i+1 to `loadAddr+2i`
+      // and the byte from plain offset 2i to `loadAddr+2i+1`, i.e. plain offset X lands
+      // at I-side offset X^1. `loadAddr` (0x40800000) is even, so this lifts to absolute
+      // addresses unchanged: plain address A <-> I-side address A^1. It holds per byte,
+      // needs no word alignment and no range restriction (mirroring a store to a stack
+      // or MMIO address just writes a byte the I-cache never reads).
+      //
+      // Only `dmem` gets the observer. The two MMU table-walker agents below SHARE
+      // `dmem.mem` but have their own independent write engines, and the only thing they
+      // ever write is a U/M-bit descriptor update into a page table the test built in a
+      // data region -- never code. Mirroring those would add a way to corrupt the I-side
+      // image for no benefit, so they are deliberately left unhooked.
+      dmem.setByteWriteObserver((addr, byte) => iAgent.mem.write(addr ^ 1L, byte))
       // Task #194: SHARE dmem's backing SparseMemory with both MMU table-walker AXI
       // ports. Architecturally the page table lives in ordinary RAM — a directed
       // ported test builds it with REAL `move.l #imm,addr` instructions through the
@@ -111,7 +166,7 @@ object PortedTestRunner {
       // established, Axi4ReadOnlySlaveAgent-specific convention -- NOT a plain
       // byte-at-address mapping; do not "fix" it, every existing instruction-fetch test
       // depends on it exactly as-is). The D-cache's `BehavioralMemAgent` (`dmem`) is a
-      // SEPARATE, independently-random-filled SparseMemory using the ordinary plain
+      // SEPARATE SparseMemory (0xFF-filled, see above) using the ordinary plain
       // byte-at-address convention (the same one every passing store/load ported test
       // already relies on). A PC-relative data read of a literal/table value embedded
       // in the code region (e.g. `move.b (d8,PC,Xn),Dn` reading a ROM-style jump/data
@@ -123,11 +178,13 @@ object PortedTestRunner {
       // code, matching how a real 68040's unified physical memory would behave.
       for (i <- image.bytes.indices) dmem.mem.write(loadAddr + i, image.bytes(i).toByte)
 
-      // The sentinel word must start at a KNOWN value, not SparseMemory's
-      // random fill for never-written bytes (same reasoning as the sandbox
-      // pre-fill in FuzzLockStepSpec.scala's task #143 fix) -- otherwise a
-      // random nonzero value there could be misread as an immediate (wrong)
-      // sentinel write before the program has even started.
+      // The sentinel word must start at ZERO, not at the D-side memory's fill value
+      // for never-written bytes (same reasoning as the sandbox pre-fill in
+      // FuzzLockStepSpec.scala's task #143 fix) -- otherwise a nonzero value there
+      // would be misread as an immediate (wrong) sentinel write before the program
+      // has even started. This is MANDATORY, not merely defensive: the sentinel poll
+      // below treats `word == 0` as "not written yet", and the 0xFF fill would
+      // otherwise read back as an instant 0xFFFFFFFF "FAIL" on cycle 1.
       for (i <- 0 until 4) dmem.mem.write(SentinelAddr + i, 0.toByte)
 
       dut.ctrl.logic.mmuEnable #= false

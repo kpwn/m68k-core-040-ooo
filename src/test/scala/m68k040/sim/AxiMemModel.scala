@@ -444,6 +444,21 @@ class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
   private var armedWriteFault: Option[Long] = None
   def armWriteFault(addr: Long): Unit = armedWriteFault = Some(addr)
 
+  /** OPTIONAL, DEFAULT-OFF write observer. Invoked with `(address, byte)` for every
+    * byte this engine ACTUALLY commits to `mem` -- i.e. only inside the existing
+    * `!bad` + WSTRB guards, so a suppressed (bus-errored or strobe-masked) byte never
+    * fires it, and the observer sees exactly the bytes a subsequent read would see.
+    *
+    * `null` (the default) means "no observer" and costs one null test per written
+    * byte: EVERY existing `AxiMemModel` / `BehavioralMemAgent` / `AxiWriteEngine`
+    * caller in the suite is bit-for-bit unaffected unless it opts in explicitly.
+    *
+    * The one opt-in caller today is `PortedTestRunner`, which uses it to mirror
+    * runtime D-side stores into the I-side's SEPARATE, byte-swapped program image so
+    * self-modifying code is visible to instruction fetch -- see the "TWO INCOMPATIBLE
+    * PROGRAM-IMAGE CONVENTIONS" block below and `PortedTestRunner.scala`'s wiring. */
+  var onByteWrite: (Long, Byte) => Unit = null
+
   private def bytesPerBeat = busConfig.dataWidth / 8
 
   private def applyBeat(st: AwState, data: BigInt, strb: BigInt, bad: Boolean): Unit = {
@@ -454,6 +469,7 @@ class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
         if (((strb >> i) & 1) == 1) {
           val byte = ((data >> (8 * i)) & 0xff).toInt.toByte
           mem.write((base + i).toLong, byte)
+          if (onByteWrite != null) onByteWrite((base + i).toLong, byte)
         }
       }
     }
@@ -551,6 +567,57 @@ class AxiMemModel private (busConfig: Axi4Config, cd: ClockDomain,
     * targets `addr` exactly to DECERR, independent of `decoded(addr)`. Only valid on a
     * model attached via `attachFull` (a read-only attachment has no write engine). */
   def armWriteFault(addr: Long): Unit = writeEngine.armWriteFault(addr)
+
+  /** OPT-IN, DEFAULT-OFF: see `AxiWriteEngine.onByteWrite`. Registers an observer that
+    * is called with `(address, byte)` for every byte this model's write engine actually
+    * commits to memory. No existing caller sets one, and not setting one leaves this
+    * model byte-for-byte identical to before the hook existed. */
+  def setByteWriteObserver(f: (Long, Byte) => Unit): Unit = {
+    require(writeEngine != null,
+      "setByteWriteObserver requires a full (read+write) attachment -- attachReadOnly has no write engine")
+    writeEngine.onByteWrite = f
+  }
+}
+
+/** A `SparseMemory` whose NEVER-WRITTEN bytes read back as a CONSTANT `fill` value.
+  *
+  * WHY THIS EXISTS. SpinalHDL's stock `spinal.lib.sim.SparseMemory` allocates memory
+  * one 1 MiB chunk at a time, lazily, on the first touch (read OR write) of any address
+  * inside it -- and fills that fresh chunk with PSEUDO-RANDOM bytes:
+  *
+  * {{{
+  *   def getElseAlocate(idx: Long) = content.get(idx) match {
+  *     case Some(a) => a
+  *     case None    => val rand = new RandomGen(seed ^ ((idx << 20) + randOffset))
+  *                     content(idx) = new Array[Byte](1 << 20)
+  *                     rand.nextBytes(content(idx)); content(idx)
+  *   }
+  * }}}
+  *
+  * (verified by decompiling `spinal/lib/sim/SparseMemory.class` out of
+  * `spinalhdl-lib_2.13-1.14.1.jar`; the fill is deterministic per `(seed, randOffset,
+  * chunk)`, NOT JVM array garbage and NOT zero, and there is no configuration point
+  * anywhere in `SparseMemory`, `AxiMemModelConfig` or the read engine to change it.)
+  *
+  * The m68k-ooo test corpus this project vendors was written against a testbench whose
+  * memory model "initialises all unmapped RAM bytes to 0xFF" (quoted verbatim from
+  * `cinv_line_basic.s`'s own header), and several of its tests compare a deliberately
+  * never-written address against a hardcoded `0xFFFFFFFF`. Overriding the single
+  * allocation choke point is the narrowest available fix: every `read`/`write`/
+  * `readBytes` path in `SparseMemory` goes through `getElseAlocate`, so a chunk that is
+  * born 0xFF-filled behaves exactly like stock in every other respect.
+  *
+  * OPT-IN ONLY: nothing constructs this unless it asks for it by name. `AxiMemModel`'s
+  * own default is still `SparseMemory()`. */
+class ConstFillSparseMemory(fill: Byte) extends SparseMemory(0L, 0L) {
+  private val chunkBytes = 1 << 20
+  override def getElseAlocate(idx: Long): Array[Byte] = content.get(idx) match {
+    case Some(a) => a
+    case None    =>
+      val a = Array.fill[Byte](chunkBytes)(fill)
+      content(idx) = a
+      a
+  }
 }
 
 object AxiMemModel {
