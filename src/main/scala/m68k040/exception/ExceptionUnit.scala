@@ -132,10 +132,13 @@ class ExceptionUnit(
   // `S_MAINTWAIT`.
   val maintDoneIn = Bool(); maintDoneIn.allowOverride; maintDoneIn := True
   // 1-cycle I-cache full-invalidate pulse, wired to `IcachePlugin.logic
-  // .maintInvalidateAll`. Pulsed by the SAME S_APPLY arms whenever the CPUSH/CINV
-  // cache selector names IC (10) or BC (11). Deliberately does NOT reach the branch
-  // predictors (BTB/RAS/gshare) — see IcachePlugin's `maintInvalidateAll` declaration
-  // for the full recorded rationale (Task P5.5 Step 9).
+  // .maintInvalidateAll`. Pulsed whenever the CPUSH/CINV cache selector names IC (10)
+  // or BC (11) — but NOT in the S_APPLY arm that issues the command: it fires on
+  // `S_MAINTWAIT`'s completion transition, AFTER the D-side maintenance walk has
+  // finished, so a fetch cannot re-cache pre-writeback code mid-walk (see the
+  // S_MAINTWAIT comment for the full reasoning). The same pulse also invalidates the
+  // BTB (fanned out at the wiring sites); RAS and gshare are deliberately NOT touched
+  // — see IcachePlugin's `maintInvalidateAll` declaration for the recorded rationale.
   val icMaintPulse = Bool(); icMaintPulse := False
 
   // ── exposed D-side translation request (wiring MUXes it onto DTranslationService) ─
@@ -1294,6 +1297,12 @@ class ExceptionUnit(
         // Line/Page scope only). The D-cache side ignores an IC-only (10) selector and
         // completes immediately (DcachePlugin's `touchesDc`), so the command is always
         // sent — the selector, not the caller, decides whether there is D-side work.
+        //
+        // The I-side half of the command (`icMaintPulse`, asserted when the selector
+        // names IC=10 or BC=11) is DELIBERATELY *not* pulsed in these arms. It fires
+        // later — in `S_MAINTWAIT`'s completion transition, once the D-side walk has
+        // actually finished. See that state's comment for why the ordering is
+        // load-bearing.
         is(skOrd(m68k040.decode.SysKind.CPUSH)) {   // CPUSH : push (writeback) dirty lines
           val cacheSel = sysCapRc(1 downto 0)
           val scope    = sysCapRc(3 downto 2)
@@ -1303,10 +1312,7 @@ class ExceptionUnit(
           maintCmdOut.payload.scope      := scope
           maintCmdOut.payload.sel        := cacheSel
           maintCmdOut.payload.addr       := sysCapVal.asUInt
-          // Selector names IC (10) or BC (11) -> also clear the I-cache. The I-cache is
-          // never dirty (read-only), so "push" and "invalidate" are the same operation
-          // on that side.
-          when(cacheSel === U(2, 2 bits) || cacheSel === U(3, 2 bits)) { icMaintPulse := True }
+          // (The I-cache clear for an IC/BC selector happens in S_MAINTWAIT, below.)
         }
         is(skOrd(m68k040.decode.SysKind.CINV)) {    // CINV : invalidate (no writeback)
           val cacheSel = sysCapRc(1 downto 0)
@@ -1317,7 +1323,7 @@ class ExceptionUnit(
           maintCmdOut.payload.scope      := scope
           maintCmdOut.payload.sel        := cacheSel
           maintCmdOut.payload.addr       := sysCapVal.asUInt
-          when(cacheSel === U(2, 2 bits) || cacheSel === U(3, 2 bits)) { icMaintPulse := True }
+          // (The I-cache clear for an IC/BC selector happens in S_MAINTWAIT, below.)
         }
         is(skOrd(m68k040.decode.SysKind.PFLUSHA)) { // PFLUSHA : flush all ATC/TLB entries
           // A REAL effect, unlike CPUSH/RESET — pulses the 1-cycle flushAll signal that
@@ -1357,8 +1363,32 @@ class ExceptionUnit(
     // `IDLE.when(maintCmdPort.valid)`, so a held-asserted command would re-trigger the
     // walk on completion instead of ending it. `maintDoneIn` defaults True for DUTs
     // with no D-cache wired, so this state costs them one cycle and never hangs.
+    //
+    // `icMaintPulse` (the I-side full invalidate, for a selector naming IC=10 or BC=11)
+    // is asserted HERE, on the walk's completion transition, and NOT back in S_APPLY.
+    // That ordering is load-bearing, not cosmetic: the architecturally correct CPUSH
+    // sequence is D-side-writeback-COMPLETES *then* I-side-invalidate. A BC-selector
+    // CPUSH ALL walk runs 1500+ cycles, and nothing gates instruction fetch on the
+    // exception FSM being active (`FetchAlignPlugin`'s `ic.cmd.valid` has no `excActive`
+    // term), so pulsing the I-invalidate at walk START would clear the I-cache and then
+    // leave a multi-thousand-cycle window in which a fetch can refill lines from memory
+    // the D-side has not yet written back — silently re-caching PRE-writeback (stale)
+    // code for exactly the lines the CPUSH exists to make coherent. Pulsing at
+    // completion closes that window. The I-cache is never dirty (read-only), so "push"
+    // and "invalidate" are the same operation on that side, and CPUSH and CINV share
+    // this single exit.
+    //
+    // `sysCapRc` is a Reg still holding the CPUSH/CINV opword fields here, so the cache
+    // selector is simply re-derived (same bit slice as the S_APPLY arms above).
+    //
+    // The BTB is fanned out from this same pulse at the wiring sites (FullCoreSynth +
+    // the test DUTs) and therefore inherits the corrected timing for free.
     S_MAINTWAIT.whenIsActive {
-      when(maintDoneIn) { goto(S_REDIR) }
+      when(maintDoneIn) {
+        val cacheSel = sysCapRc(1 downto 0)
+        when(cacheSel === U(2, 2 bits) || cacheSel === U(3, 2 bits)) { icMaintPulse := True }
+        goto(S_REDIR)
+      }
     }
     // S_REDIR: the system-state writes from S_APPLY have now COMMITTED (a cycle later),
     // so ss.a7 / ss.srSys reflect the new state. Pulse the obs (post-state sysByte +

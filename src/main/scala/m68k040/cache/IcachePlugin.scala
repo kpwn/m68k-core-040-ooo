@@ -49,31 +49,39 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // driver can override it), which is what keeps every DUT that does NOT wire it
     // (standalone I-cache tests) unchanged.
     //
-    // ── DECIDED, Task P5.5 Step 9: this wire does NOT invalidate predictor state ────
-    // The EXTERNAL `invalidateAll` port fans out to the BTB, RAS and gshare as well as
-    // to this array (see FullCoreSynth's btb/ras/gsh `.invalidateAll` lines). This
-    // INTERNAL one deliberately does not, and that asymmetry is a decision, not an
-    // oversight:
-    //   - Every predictor structure in this core (BTB, RAS, gshare) is a pure
-    //     SPECULATIVE HINT. Its output steers *fetch* only; it never writes
-    //     architectural state, and every misprediction is already caught and corrected
-    //     at resolve/retire by the standard `RobPlugin.branchRedirect` mechanism that
-    //     the whole OoO design depends on for correctness regardless of the cause of
-    //     the mispredict.
-    //   - So a stale BTB/RAS/gshare entry SURVIVING a CINV cannot produce a wrong
-    //     ARCHITECTURAL result. Self-modified code at the target PC is still fetched
-    //     correctly, because the I-cache line itself WAS invalidated by this same
-    //     command (see the refill-vs-invalidate guard in PREDECODE below) — the bytes
-    //     actually executed are the new ones. If the stale hint mispredicts the
-    //     branch/return that used to live there, the branch EU's normal resolve-time
-    //     correction fires exactly as it would for any other mispredict.
-    //   - The `valids` array is the opposite case, and that is precisely why it IS
-    //     cleared here: leaving it stale would make the core FETCH WRONG BYTES, which
-    //     is an architectural error, not a performance one.
-    // Net: this is a pure performance question (at most one extra bad prediction after
-    // self-modifying code), and the external port's broader fan-out is right for ITS
-    // purpose (a boot/reset-time full clear) while this one's narrow fan-out is right
-    // for a per-instruction CINV.
+    // ── DECIDED, Task P5.5 Step 9, CORRECTED in the P5.5 follow-up: BTB yes, RAS/gshare no ──
+    // This wire itself only ever touches the I-cache's own `valids` array (the `when`
+    // below). Predictor invalidation is fanned out from the SAME source signal
+    // (`ExceptionUnit.icMaintPulse`) at the wiring sites — FullCoreSynth plus the three
+    // test DUTs (ExecuteLockStepSpec / FuzzDut / IpcBenchSpec) — where each already has
+    // a `btb.logic.invalidateAll := ...` line. The split is:
+    //
+    //   - BTB: IS invalidated on a CINV/CPUSH-IC. Step 9 originally argued no predictor
+    //     needed it because every prediction is corrected at resolve. That argument is
+    //     WRONG for the BTB specifically. `FetchAlignPlugin`'s BTB lookup
+    //     (`btbQueryValid0 := predEnable && res.slot0Valid`) is NOT gated on predecode
+    //     agreeing the slot is a branch, so a stale BTB hit stamps `predTaken`/redirects
+    //     fetch on ANY instruction kind — and `predTaken` is read ONLY by
+    //     `BranchEuPlugin`, so an ALU/LS uop carrying a stale `predTaken` is verified by
+    //     nothing. SMC that replaces a taken branch at PC X with a non-branch, followed
+    //     by a correct CINV IC and a correct refetch of the new bytes, could still have
+    //     the stale BTB entry silently redirect fetch away from X, and the wrong-path
+    //     instructions RETIRE. That is an architectural divergence, not a perf artifact.
+    //   - RAS: NOT invalidated, and does not need to be. The RAS predict is gated on
+    //     `s0IsReturn`, recomputed every cycle from the FRESHLY FETCHED slot0 opword
+    //     (RTS=0x4E75 / RTR=0x4E77). If SMC replaces the return with something else, the
+    //     new bytes simply don't classify as a return and the RAS is never consulted.
+    //   - gshare: NOT invalidated, and does not need to be. It only overrides the
+    //     DIRECTION of a branch that hit the BTB, and `BranchEuPlugin`'s
+    //     `mispredict` cross-checks predicted direction AND target against the actual
+    //     resolved ones, so a stale gshare bit cannot survive uncaught. (It is also
+    //     already reachable via the BTB clear above: no BTB hit -> no gshare override.)
+    //
+    // The `valids` array is the plainest case, and that is why it IS cleared here:
+    // leaving it stale would make the core FETCH WRONG BYTES.
+    //
+    // The external `invalidateAll` port keeps its own broader fan-out (BTB + RAS +
+    // gshare + this array) — right for ITS purpose, a boot/reset-time full clear.
     val maintInvalidateAll = Bool()
     maintInvalidateAll.allowOverride
     maintInvalidateAll := False

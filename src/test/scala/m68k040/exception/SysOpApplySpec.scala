@@ -90,6 +90,14 @@ class SysOpApplySpec extends AnyFunSuite {
     // they are directly controllable so a test can prove S_APPLY genuinely blocks.
     val sqDrainedIn  = in Bool ()
     val dcQuiescedIn = in Bool ()
+    // Task P5.5: the CPUSH/CINV opword fields ride in on the MOVEC `sysRc` port
+    // ([3:2]=scope, [1:0]=cache selector), and `maintDoneIn` is the D-cache
+    // maintenance walk's completion handshake. Both directly controllable so a test
+    // can hold the FSM in S_MAINTWAIT for an arbitrary number of cycles (a real
+    // BC-selector CPUSH ALL walk is 1500+) and observe what does/doesn't pulse
+    // meanwhile.
+    val sysRcIn      = in UInt (12 bits)
+    val maintDoneIn  = in Bool ()
 
     val exc = new ExceptionUnit(
       ss = ss, mmuCtrl = mmu,
@@ -102,11 +110,13 @@ class SysOpApplySpec extends AnyFunSuite {
       // test-local re-derivation of it.
       sysKind    = sysKindIn.asBits.asUInt.resize(4),
       sysVal     = sysValIn,
+      sysRc      = sysRcIn,
       sysPc      = U(NEXT_PC - 2, 32 bits),
       sysNextPc  = U(NEXT_PC, 32 bits))
 
-    exc.sqDrained  := sqDrainedIn
-    exc.dcQuiesced := dcQuiescedIn
+    exc.sqDrained   := sqDrainedIn
+    exc.dcQuiesced  := dcQuiescedIn
+    exc.maintDoneIn := maintDoneIn
 
     // ── observation ports ──
     val mmusrOut       = out UInt (32 bits); mmusrOut       := mmu.mmusrReg
@@ -123,6 +133,20 @@ class SysOpApplySpec extends AnyFunSuite {
     when(exc.sysFlushAllValid) { flushSeenR := True; flushCountR := flushCountR + 1 }
     flushSeen  := flushSeenR
     flushCount := flushCountR
+
+    // Task P5.5 cache-maintenance observation: pulse COUNTS for the D-side command
+    // (`maintCmdOut.valid`, issued in S_APPLY) and the I-side full invalidate
+    // (`icMaintPulse`, issued on S_MAINTWAIT's completion exit). The counts are what
+    // make the ORDERING testable: the D command must be out and the I invalidate must
+    // still be at zero for the whole duration of the walk.
+    val maintCmdCount = out UInt (8 bits)
+    val icMaintCount  = out UInt (8 bits)
+    val maintCmdCountR = Reg(UInt(8 bits)) init 0
+    val icMaintCountR  = Reg(UInt(8 bits)) init 0
+    when(exc.maintCmdOut.valid) { maintCmdCountR := maintCmdCountR + 1 }
+    when(exc.icMaintPulse)      { icMaintCountR  := icMaintCountR + 1 }
+    maintCmdCount := maintCmdCountR
+    icMaintCount  := icMaintCountR
 
     // sticky redirect observation (every sysOp must serialize + redirect to sysNextPc).
     val redirSeen = out Bool ()
@@ -154,6 +178,11 @@ class SysOpApplySpec extends AnyFunSuite {
     // below sees the same behaviour it always did (plus one S_DRAIN cycle).
     dut.sqDrainedIn  #= true
     dut.dcQuiescedIn #= true
+    // Task P5.5 defaults: no CPUSH/CINV fields, and the maintenance walk reports done
+    // immediately (S_MAINTWAIT costs one cycle) -- so every pre-existing test below is
+    // unaffected.
+    dut.sysRcIn      #= 0
+    dut.maintDoneIn  #= true
     dut.clockDomain.waitSampling(4)
   }
 
@@ -309,6 +338,124 @@ class SysOpApplySpec extends AnyFunSuite {
       assert(dut.redirSeen.toBoolean && dut.redirPc.toLong == NEXT_PC,
         "the sysOp must still serialize + redirect to nextPc after the drain wait")
       assert(!dut.excActive.toBoolean, "the FSM did not return to IDLE after the sysOp")
+    }
+  }
+
+  /** Task P5.5 FOLLOW-UP REGRESSION -- the I-cache invalidate must fire AFTER the
+    * D-cache maintenance walk completes, not when it is kicked off.
+    *
+    * THE BUG THIS PINS (a real, reviewed finding, not a hypothetical): the CPUSH/CINV
+    * S_APPLY arms used to assert `icMaintPulse` in the SAME cycle they issued
+    * `maintCmdOut`. For a BC-selector CPUSH ALL the D-side writeback walk then runs for
+    * 1500+ more cycles in S_MAINTWAIT -- and NOTHING gates instruction fetch on the
+    * exception FSM being active (`FetchAlignPlugin`'s `ic.cmd.valid` has no `excActive`
+    * term). So for the canonical self-modifying-code sequence (patch code, CPUSH, fall
+    * into the modified code) the I-cache would be cleared FIRST and could then refill
+    * lines straight back from memory the D-side had not yet written back -- silently
+    * re-caching stale code for exactly the lines the CPUSH exists to make coherent.
+    * The architecturally correct order is D-push-completes THEN I-invalidate.
+    *
+    * Move the `icMaintPulse := True` back into the S_APPLY arms and the middle
+    * assertion below fails immediately: the count is already 1 while the walk is still
+    * running. */
+  test("CPUSH BC: icMaintPulse fires only when the D-cache walk COMPLETES, not when it starts (Task P5.5 follow-up)") {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      init(dut)
+
+      // The maintenance walk is LONG and not done yet.
+      dut.maintDoneIn #= false
+      // sysRc = 0b1111 : scope=11 (All), cache selector=11 (BC -> both caches).
+      dut.sysRcIn      #= 0xF
+      dut.sysKindIn    #= SysKind.CPUSH
+      dut.sysValIn     #= 0
+      dut.sysTriggerIn #= true
+      cd.waitSampling()                 // IDLE latches the context
+      dut.sysTriggerIn #= false
+
+      cd.waitSampling(40)
+      // The D-side command IS out (exactly one Flow pulse -- a held command would
+      // re-trigger DcachePlugin's `IDLE.when(maintCmdPort.valid)` walk entry).
+      assert(dut.maintCmdCount.toInt == 1,
+        s"expected exactly 1 maintCmdOut pulse, got ${dut.maintCmdCount.toInt}")
+      // ...and the FSM is parked waiting for it.
+      assert(dut.excActive.toBoolean, "the FSM must park in S_MAINTWAIT until the walk reports done")
+      assert(!dut.redirSeen.toBoolean, "the sysOp redirected before the maintenance walk finished")
+      // THE FIX: the I-cache invalidate has NOT fired yet. If it had, instruction fetch
+      // could re-cache PRE-writeback bytes for the remaining ~1500 walk cycles.
+      assert(dut.icMaintCount.toInt == 0,
+        s"icMaintPulse fired ${dut.icMaintCount.toInt} time(s) WHILE the D-cache writeback walk was still " +
+        "running -- an I-fetch in that window can refill stale, not-yet-written-back code")
+
+      // Walk completes -> the I-invalidate fires on the S_MAINTWAIT->S_REDIR transition,
+      // i.e. promptly and STRICTLY BEFORE the sysOp's redirect (which is S_REDIR's own
+      // job, the following cycle). Poll cycle-by-cycle rather than asserting an exact
+      // absolute cycle so the test does not encode the one-delta offset between a sim
+      // poke and the DUT observing it.
+      dut.maintDoneIn #= true
+      var icCycle    = -1
+      var redirCycle = -1
+      for (c <- 0 until 8) {
+        cd.waitSampling()
+        if (icCycle    < 0 && dut.icMaintCount.toInt >= 1) icCycle    = c
+        if (redirCycle < 0 && dut.redirSeen.toBoolean)     redirCycle = c
+      }
+      assert(icCycle >= 0,
+        "icMaintPulse never fired even after the maintenance walk reported done")
+      assert(icCycle <= 2,
+        s"icMaintPulse fired $icCycle cycles after the walk completed -- it must fire on the " +
+        "S_MAINTWAIT exit transition, not somewhere later")
+      assert(redirCycle >= 0, "the sysOp never redirected")
+      assert(icCycle < redirCycle,
+        s"the I-cache invalidate (cycle $icCycle) must land BEFORE the sysOp's redirect " +
+        s"(cycle $redirCycle) -- fetch resumes at the redirect")
+
+      cd.waitSampling(6)
+      assert(dut.icMaintCount.toInt == 1,
+        s"expected exactly 1 icMaintPulse for one CPUSH, got ${dut.icMaintCount.toInt}")
+      assert(dut.redirSeen.toBoolean && dut.redirPc.toLong == NEXT_PC,
+        "CPUSH must still serialize + redirect to nextPc after the maintenance walk")
+      assert(!dut.excActive.toBoolean, "the FSM did not return to IDLE after the CPUSH")
+    }
+  }
+
+  /** Guards the cache-selector bit slice at its NEW site (S_MAINTWAIT re-derives
+    * `cacheSel` from the `sysCapRc` Reg): a DC-only selector must still leave the
+    * I-cache completely alone, while the D-side walk runs exactly as before. */
+  test("CPUSH DC-only selector still issues the D-side walk and never pulses icMaintPulse") {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      init(dut)
+      // sysRc = 0b0101 : scope=01 (Line), cache selector=01 (DC only).
+      dut.sysRcIn #= 0x5
+      applySysOp(dut, SysKind.CPUSH, 0x12345abcL)
+      assert(dut.maintCmdCount.toInt == 1,
+        s"expected exactly 1 maintCmdOut pulse, got ${dut.maintCmdCount.toInt}")
+      assert(dut.icMaintCount.toInt == 0,
+        "a DC-only CPUSH must not invalidate the I-cache (or, via the same signal, the BTB)")
+      assert(dut.redirSeen.toBoolean && dut.redirPc.toLong == NEXT_PC,
+        "CPUSH must still serialize + redirect to nextPc")
+    }
+  }
+
+  /** The CINV arm re-derives the selector at the same S_MAINTWAIT exit, so cover its
+    * IC-only encoding too (the plain "CINV IC" an SMC sequence actually issues). */
+  test("CINV IC-only selector pulses icMaintPulse exactly once, at walk completion") {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      init(dut)
+      // sysRc = 0b1110 : scope=11 (All), cache selector=10 (IC only).
+      dut.sysRcIn #= 0xE
+      applySysOp(dut, SysKind.CINV, 0x12345abcL)
+      assert(dut.icMaintCount.toInt == 1,
+        s"expected exactly 1 icMaintPulse for one CINV IC, got ${dut.icMaintCount.toInt}")
+      assert(!dut.flushSeen.toBoolean,
+        "CINV spuriously pulsed the TLB flushAll (the P5.2 regression)")
+      assert(dut.redirSeen.toBoolean && dut.redirPc.toLong == NEXT_PC,
+        "CINV must still serialize + redirect to nextPc")
     }
   }
 }

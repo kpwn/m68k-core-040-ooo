@@ -73,14 +73,21 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // Read port: query the BTB with the fetch window PC when a fetch is issued. The
     // registered lookup result drives FetchAlign's predictRedirect (Step 3). Update
     // port: consumed by the BtbPlugin from the ROB's BtbUpdateService (retire). The
-    // BTB invalidates on the SAME signal that clears the I-cache.
+    // BTB invalidates on the SAME signal that clears the I-cache — BOTH sources: the
+    // external boot/reset port AND the internal CPUSH/CINV maintenance pulse. The BTB
+    // needs the latter because its lookup is not gated on the slot actually being a
+    // branch, so a stale entry can redirect fetch on a non-branch with nothing
+    // downstream to catch it (see IcachePlugin's `maintInvalidateAll` declaration).
     val fa  = host[FetchAlignPlugin]
     val btb = host[BtbPlugin]
-    btb.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
-    // Task P5.5: the INTERNAL, CPUSH/CINV-driven I-cache invalidate. Deliberately fans
-    // out to the I-cache ONLY, not to the BTB/RAS/gshare below (unlike the external
-    // `invalidateAll` port, which is a boot/reset-time full clear) — see IcachePlugin's
-    // `maintInvalidateAll` declaration for the recorded rationale.
+    btb.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll ||
+                               host[IcachePlugin].logic.maintInvalidateAll
+    // Task P5.5: the INTERNAL, CPUSH/CINV-driven I-cache invalidate. Fans out to the
+    // I-cache and the BTB (above) but deliberately NOT to the RAS/gshare below — those
+    // two are independently protected (RAS gates on live predecode; gshare's direction
+    // is cross-checked at resolve). See IcachePlugin's `maintInvalidateAll` declaration
+    // for the recorded rationale. Pulses only AFTER the D-side maintenance walk
+    // completes (ExceptionUnit's S_MAINTWAIT), so the BTB clear inherits that timing.
     host[IcachePlugin].logic.maintInvalidateAll := rob.logic.exc.icMaintPulse
     // Two per-instruction combinational BTB lookups (the aligner's slot0/slot1 PCs);
     // the predict-taken + target return THIS cycle into FetchAlign's prediction inputs.

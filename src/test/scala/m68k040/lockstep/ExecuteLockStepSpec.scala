@@ -243,7 +243,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // I-cache, feed the registered prediction into FetchAlign's predict input.
       val faBtb = host[FetchAlignPlugin]
       val btb   = host[m68k040.frontend.BtbPlugin]
-      btb.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+      // Both invalidate sources: the external boot/reset port AND the internal
+      // CPUSH/CINV maintenance pulse (P5.5 follow-up — a stale BTB entry can redirect
+      // fetch on a non-branch after SMC, with nothing downstream to catch it).
+      btb.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll ||
+                                 host[IcachePlugin].logic.maintInvalidateAll
       btb.logic.queryPc     := faBtb.logic.btbQueryPc0
       btb.logic.queryValid  := faBtb.logic.btbQueryValid0
       btb.logic.query2Pc    := faBtb.logic.btbQueryPc1
