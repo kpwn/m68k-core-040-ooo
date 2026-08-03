@@ -77,9 +77,12 @@ class ExceptionUnit(
     // vector-8 fault delivered via entryTrigger instead). The FSM applies the effect
     // (write committed SR/USP/VBR + re-bank A7, or read system->Rn), pulses the obs
     // (post-state sysByte + re-banked A7), and redirects to sysNextPc (serialize).
-    //   sysKind     : 1=MOVE-to-SR, 2=MOVE-USP, 3=MOVEC, ..., 8=PTEST (mirrors
-    //                 decode.SysKind enum; 4 bits since task #198 added PTEST as the
-    //                 9th kind, bumping the field past the old 3-bit ceiling).
+    //   sysKind     : the decode.SysKind enum's ENCODED value (RobPlugin sends
+    //                 `sysKindStore(h0).asBits.asUInt.resize(4)`). 4 bits since task
+    //                 #198 pushed the element count past the old 3-bit ceiling. Do NOT
+    //                 write raw ordinals against this field — S_APPLY dispatches via
+    //                 `skOrd(SysKind.X)`, which derives the literal from the enum (see
+    //                 the helper next to sysCapKind's declaration).
     //   sysReadDir  : read SYSTEM->Rn (True) vs write Rn->SYSTEM (False).
     //   sysVal      : the captured source VALUE (for a write).
     //   sysRc       : the 12-bit MOVEC control-reg id.
@@ -181,13 +184,40 @@ class ExceptionUnit(
   val stFrame2     = RegInit(False)       // E_STORE loop is currently on the 2nd ($1) frame
 
   // ── Commit-time SYSTEM op captured state (latched at sysTrigger) ─────────────
-  val sysCapKind    = Reg(UInt(4 bits))   // 4 bits since task #198 (PTEST, kind=8)
+  // Width is 4 bits since task #198 added PTEST (the 9th SysKind element) — but the
+  // S_APPLY switch below no longer hard-codes ANY ordinal: it compares against
+  // `skOrd(SysKind.X)` (see the helper right below), so an enum insertion/reorder can
+  // never silently re-point an arm again. The `require` next to that helper fails
+  // elaboration loudly if the enum ever outgrows this 4-bit field.
+  val sysCapKind    = Reg(UInt(4 bits))
   val sysCapReadDir = Reg(Bool())
   val sysCapVal     = Reg(Bits(32 bits))
   val sysCapRc      = Reg(UInt(12 bits))
   val sysCapDstPhys = Reg(UInt(6 bits))
   val sysCapPc      = Reg(UInt(32 bits))
   val sysCapNextPc  = Reg(UInt(32 bits))
+
+  // ── SysKind -> raw `sysKind`/`sysCapKind` ordinal (SYMBOLIC, elaboration-time) ──
+  // The `sysKind` port is a plain UInt, not a SpinalEnumCraft, because RobPlugin hands
+  // it over as `sysKindStore(h0).asBits.asUInt.resize(4)` (the ROB stores the enum, the
+  // port carries its encoded value). The S_APPLY switch below therefore has to compare
+  // against NUMBERS — but it must never SPELL those numbers out by hand: Task P5.2
+  // inserted SysKind.CINV between CPUSH and PFLUSHA, which shifted PFLUSHA 7->8 and
+  // PTEST 8->9 and silently re-pointed three hand-written literal arms (CINV took over
+  // PFLUSHA's TLB flush, PFLUSHA took over PTEST's MMUSR write, and PTEST's arm matched
+  // nothing at all). `skOrd` derives each literal from the enum itself, using the SAME
+  // encoding `asBits` uses on the producer side, so any future insertion/reorder is
+  // automatically tracked.
+  private def skOrd(e: SpinalEnumElement[m68k040.decode.SysKind.type]): UInt =
+    U(m68k040.decode.SysKind.defaultEncoding.getValue(e), 4 bits)
+  // Loud elaboration-time guard: if SysKind ever grows past 16 elements, the 4-bit
+  // `sysKind` port (and RobPlugin's `.resize(4)`) would silently TRUNCATE the ordinal.
+  // Fail the build instead.
+  require(
+    m68k040.decode.SysKind.defaultEncoding.getWidth(m68k040.decode.SysKind) <= 4,
+    s"SysKind no longer fits the 4-bit sysKind/sysCapKind field " +
+      s"(needs ${m68k040.decode.SysKind.defaultEncoding.getWidth(m68k040.decode.SysKind)} bits) — " +
+      "widen ExceptionUnit.sysKind/sysCapKind AND RobPlugin's .resize(...) together")
 
   // RTE-own-PC, captured at rteTrigger (task #177): `rtePc` aliases a LIVE ROB
   // signal (pcStore(h0)) indexed by the head pointer. The RTE FSM is multi-cycle
@@ -272,7 +302,8 @@ class ExceptionUnit(
   val sysRegWriteData  = UInt(32 bits); sysRegWriteData  := U(0, 32 bits); sysRegWriteData.simPublic()
   // PFLUSHA: a 1-cycle pulse consumed by DtlbPlugin/ItlbPlugin's `flushAll` port (mirrors
   // the existing `umFlush` top-level fan-out — see FullCoreSynth.scala/the test DUTs).
-  // Only PFLUSHA drives this (S_APPLY sysCapKind=7); everything else leaves it False.
+  // Only PFLUSHA drives this (S_APPLY's SysKind.PFLUSHA arm); every other sysKind —
+  // CPUSH/CINV included — leaves it False.
   val sysFlushAllValid = Bool();        sysFlushAllValid := False;        sysFlushAllValid.simPublic()
 
   // ── RTE CCR restore -> REAL flags PRF (task #176, redesigned task-176-regression) ──
@@ -321,7 +352,7 @@ class ExceptionUnit(
   // collision cannot occur, and there is no freelist pop/push at all to race.
   //
   // task #192: this SAME pair of ports is now ALSO pulsed by S_REDIR for a
-  // MOVE-to-SR / STOP commit (sysCapKind 1/5, which write the FULL CCR via
+  // MOVE-to-SR / STOP commit (the two sysKinds that write the FULL CCR via
   // `obsSetCcr5`). Before this fix, MOVE-to-SR/STOP's CCR write landed ONLY in
   // RobPlugin's `committedCcr` whitebox-tracking shadow (fed by `obsSetCcr5Valid`,
   // consumed for exception-frame stacking + lock-step comparison) -- never in the
@@ -1045,12 +1076,18 @@ class ExceptionUnit(
     }
 
     // ── Commit-time SYSTEM op: APPLY the effect to committed state (1 cycle) ──────
-    // sysCapKind: 1=MOVE-to-SR, 2=MOVE-USP, 3=MOVEC, ..., 8=PTEST. The write
-    // direction's source value is sysCapVal; the read direction writes the int PRF
-    // arch-reg (sysRegWrite*).
+    // Every arm below dispatches on `skOrd(SysKind.X)` — the ordinal derived FROM the
+    // enum (see skOrd's comment above), never a hand-written number — so inserting or
+    // reordering a SysKind element can no longer silently re-point these arms.
+    // The write direction's source value is sysCapVal; the read direction writes the
+    // int PRF arch-reg (sysRegWrite*). SysKind.NONE (and anything unmatched) does
+    // nothing: the switch has no `default`, and every effect below is a pulse onto a
+    // signal that is unconditionally defaulted idle earlier in this Area, so "no arm
+    // matched" is a genuine, side-effect-free no-op (S_APPLY still falls through to
+    // S_REDIR, which serializes + advances PC — the RESET/CPUSH/CINV behavior).
     S_APPLY.whenIsActive {
       switch(sysCapKind) {
-        is(U(1, 4 bits)) {                          // MOVE to SR : sysVal.W -> SR
+        is(skOrd(m68k040.decode.SysKind.MOVE_TO_SR)) { // MOVE to SR : sysVal.W -> SR
           // System byte = sysVal[15:8], CCR = sysVal[4:0]. Writing srSys may flip S ->
           // A7 re-banks. The committed CCR is tracked in the ROB; we surface the new SR
           // (sysByte) in the obs, and the ROB folds sysVal[4:0] into committedCcr (so the
@@ -1058,7 +1095,7 @@ class ExceptionUnit(
           // the NEW-S bank's value (computed from the post-write S in S_REDIR via ss.a7).
           ss.setSrSys.valid := True; ss.setSrSys.payload := sysCapVal(15 downto 8).asUInt
         }
-        is(U(2, 4 bits)) {                          // MOVE USP : An<->USP
+        is(skOrd(m68k040.decode.SysKind.MOVE_USP)) { // MOVE USP : An<->USP
           when(sysCapReadDir) {                     // USP -> An : write the int PRF[pdst]
             sysRegWriteValid := True
             sysRegWritePhys  := sysCapDstPhys
@@ -1067,7 +1104,7 @@ class ExceptionUnit(
             ss.setUsp.valid := True; ss.setUsp.payload := sysCapVal.asUInt
           }
         }
-        is(U(3, 4 bits)) {                          // MOVEC : Rc<->Rn
+        is(skOrd(m68k040.decode.SysKind.MOVEC)) {   // MOVEC : Rc<->Rn
           when(sysCapReadDir) {                     // Rc -> Rn : read the committed reg
             sysRegWriteValid := True
             sysRegWritePhys  := sysCapDstPhys
@@ -1143,25 +1180,35 @@ class ExceptionUnit(
             }
           }
         }
-        is(U(4, 4 bits)) {                          // RESET : no architectural state change
+        is(skOrd(m68k040.decode.SysKind.RESET)) {   // RESET : no architectural state change
           // The external reset line is not modeled for lock-step; RESET is an internal NOP.
           // S_REDIR just advances PC (the obs carries the UNCHANGED sysByte + A7).
         }
-        is(U(5, 4 bits)) {                          // STOP : SR := sysVal[15:0]
+        is(skOrd(m68k040.decode.SysKind.STOP)) {    // STOP : SR := sysVal[15:0]
           // Identical SR write to MOVE-to-SR: system byte = sysVal[15:8] (S/T/I incl. the
           // new I-mask), CCR = sysVal[4:0]. A7 re-banks on an S flip (S_REDIR via ss.a7).
           // The HALT itself is the ROB `stopped` state (set on the STOP sysRetire).
           ss.setSrSys.valid := True; ss.setSrSys.payload := sysCapVal(15 downto 8).asUInt
         }
-        is(U(6, 4 bits)) {                          // CPUSH : no cache hierarchy modeled
-          // No cache to push/invalidate in this core — an internal NOP, like RESET.
+        is(skOrd(m68k040.decode.SysKind.CPUSH)) {   // CPUSH : cache push/invalidate
+          // DELIBERATE, TEMPORARY architectural NOP (like RESET): the real
+          // push-dirty-lines effect lands with P5.4's DcachePlugin maintenance engine +
+          // P5.5's dispatch. Explicit empty arm, not a fallthrough.
         }
-        is(U(7, 4 bits)) {                          // PFLUSHA : flush all ATC/TLB entries
+        is(skOrd(m68k040.decode.SysKind.CINV)) {    // CINV : cache invalidate (no writeback)
+          // Same DELIBERATE, TEMPORARY architectural NOP as CPUSH above — Task P5.2 only
+          // added correct DECODE of CPUSH-vs-CINV (opword bit[5]); the real
+          // invalidate-lines effect lands in P5.4/P5.5. This arm exists EXPLICITLY (an
+          // empty body) rather than being left to fall through: before this fix CINV's
+          // freshly-inserted ordinal 7 landed on the hand-written literal arm that used
+          // to be PFLUSHA's and spuriously pulsed a full TLB flush.
+        }
+        is(skOrd(m68k040.decode.SysKind.PFLUSHA)) { // PFLUSHA : flush all ATC/TLB entries
           // A REAL effect, unlike CPUSH/RESET — pulses the 1-cycle flushAll signal that
           // DtlbPlugin/ItlbPlugin clear their TLB + walk-result latch on.
           sysFlushAllValid := True
         }
-        is(U(8, 4 bits)) {                          // PTEST : (An) -> MMUSR
+        is(skOrd(m68k040.decode.SysKind.PTEST)) {   // PTEST : (An) -> MMUSR
           // This core's MMU has no real per-page R/W/CM/fault status to probe (same
           // "stub MMU" limitation PFLUSH/PFLUSHA already lean on). When the MMU is
           // disabled — the only configuration the ported corpus's ptest_w_an exercises
@@ -1191,10 +1238,12 @@ class ExceptionUnit(
       obsPc      := sysCapNextPc            // the sysOp's commit step == its nextPc
       obsSysByte := ss.srSys                // post-write system byte (S/T/I)
       obsA7      := ss.a7                   // re-banked A7 (Mux on post-write S)
-      // MOVE-to-SR (sysCapKind==1) AND STOP (sysCapKind==5) write the full CCR (sysVal[4:0])
-      // -> surface it so the whitebox resyncs its running CCR to this absolute value. Other
-      // sysOps (MOVE-USP/MOVEC/RESET) leave CCR untouched.
-      when(sysCapKind === U(1, 4 bits) || sysCapKind === U(5, 4 bits)) {
+      // MOVE-to-SR AND STOP write the full CCR (sysVal[4:0]) -> surface it so the whitebox
+      // resyncs its running CCR to this absolute value. Other sysOps (MOVE-USP/MOVEC/
+      // RESET/CPUSH/CINV/PFLUSHA/PTEST) leave CCR untouched. Symbolic ordinals (skOrd),
+      // same reasoning as the S_APPLY switch above.
+      when(sysCapKind === skOrd(m68k040.decode.SysKind.MOVE_TO_SR) ||
+           sysCapKind === skOrd(m68k040.decode.SysKind.STOP)) {
         obsSetCcr5Valid := True
         obsSetCcr5      := sysCapVal(4 downto 0).asUInt
         // task #192: ALSO land the CCR in the REAL NZVC/X physical registers (not

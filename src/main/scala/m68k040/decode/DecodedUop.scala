@@ -124,7 +124,9 @@ object SysKind extends SpinalEnum {
       // banking) then HALT until an interrupt with level > the new I-mask. SR write is the
       // S_APPLY path; the halt is the ROB `stopped` state. S=0 -> vector 8.
       STOP,         // (RESET=4, STOP=5 — needs the 3-bit FSM ctx widened in T0.)
-      // CPUSH (line-1111, 1111 0100 1ss CCC Ann): privileged cache-push/invalidate.
+      // CPUSH (line-1111, top byte 0xF4 — bit[5]=1 selects CPUSH vs CINV's bit[5]=0,
+      // per Task P5.1's cross-checked encoding): privileged cache push (writeback of
+      // dirty lines) + invalidate.
       // Task P5.2: this decoder now produces CPUSH/CINV as distinct, correctly-decoded
       // kinds (bit[5] selects: 1=CPUSH, 0=CINV), but the actual cache-maintenance effect
       // is STILL a deliberate temporary NOP as of this task — same "no state change,
