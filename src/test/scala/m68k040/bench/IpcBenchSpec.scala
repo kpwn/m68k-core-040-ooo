@@ -451,6 +451,7 @@ class IpcBenchSpec extends AnyFunSuite {
       cd.waitSampling(80)
 
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       cd.waitSampling()
       dut.fa.logic.redirect.valid   #= true
       dut.fa.logic.redirect.payload #= loadAddr

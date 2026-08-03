@@ -402,6 +402,12 @@ object FuzzRunner {
       // USP default — the MOVE-USP template always writes before reading).
       dut.rob.logic.exc.ss.isp #= 0x00100000L
       dut.rob.logic.exc.ss.usp #= 0L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already
+                                                  // enabled the caches" (design doc
+                                                  // section 5.2); IE is inert (this
+                                                  // core's I-cache has no CACR
+                                                  // consumer) but poked for
+                                                  // documentation-of-intent parity
       dut.wire.logic.seedValid #= true
       dut.wire.logic.seedAddr  #= 15
       dut.wire.logic.seedData  #= BigInt(0x00100000L)

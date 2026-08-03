@@ -679,6 +679,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // the init sweep (it resets committed state) so the surfaced A7 (== SSP, S=1)
       // matches OracleStep.a(7) for every program.
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       // Boot mode: default supervisor (SR boot 0x2700, S=1). When `initialSr` overrides it
       // (e.g. user mode S=0 for the privilege-violation test), seed the committed SR system
       // byte AND the USP bank; in user mode the surfaced A7 == USP, so the int PRF arch-15
@@ -1032,6 +1033,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       // Task #132: seed MSP when the caller wants a boot M=1 scenario (the
       // throwaway-frame tests). Inactive-bank default (0) is harmless when unused.
       dut.rob.logic.exc.ss.msp #= BigInt(initialMsp.getOrElse(0L) & 0xffffffffL)
@@ -1205,6 +1207,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       dut.rob.logic.exc.ss.srSys #= 0x27   // boot supervisor, mask 7 (NMI is always taken regardless)
       dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(0x00100000L)
       cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
@@ -2201,6 +2204,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val handlerPc = loadAddr + 2   // the `handler:` label (after the 1-word MOVE)
       for (i <- 0 until 4) dmem.pokeByte(0x20 + i, ((handlerPc >> (8 * i)) & 0xff).toInt)
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       dut.rob.logic.exc.ss.usp #= 0x00200000L
       // Boot mode: user (S=0, SR 0x0000) or supervisor (S=1, 0x27 default).
       if (userMode) dut.rob.logic.exc.ss.srSys #= 0x00 else dut.rob.logic.exc.ss.srSys #= 0x27
@@ -2278,6 +2282,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val handlerPc = loadAddr + 2   // `handler:` after the 1-word RTE opcode
       for (i <- 0 until 4) dmem.pokeByte(0x20 + i, ((handlerPc >> (8 * (3 - i))) & 0xff).toInt)
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       dut.rob.logic.exc.ss.usp #= 0x00200000L
       dut.rob.logic.exc.ss.srSys #= 0x00   // boot USER mode (S=0)
       val bootA7 = 0x00200000L
@@ -3477,6 +3482,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       dut.rob.logic.exc.ss.srSys #= (initialSr >> 8) & 0xff
       cd.waitSampling()
       dut.fa.logic.redirect.valid   #= true
@@ -3675,6 +3681,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val handlerPc = loadAddr + 2   // the `handler:` label (after the 1-word CPUSHA)
       for (i <- 0 until 4) dmem.pokeByte(0x20 + i, ((handlerPc >> (8 * i)) & 0xff).toInt)
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       dut.rob.logic.exc.ss.usp #= 0x00200000L
       if (userMode) dut.rob.logic.exc.ss.srSys #= 0x00 else dut.rob.logic.exc.ss.srSys #= 0x27
       val bootA7 = if (userMode) 0x00200000L else 0x00100000L
@@ -3748,6 +3755,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val handlerPc = loadAddr + 2   // the `handler:` label (after the 1-word PFLUSHA)
       for (i <- 0 until 4) dmem.pokeByte(0x20 + i, ((handlerPc >> (8 * i)) & 0xff).toInt)
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       dut.rob.logic.exc.ss.usp #= 0x00200000L
       if (userMode) dut.rob.logic.exc.ss.srSys #= 0x00 else dut.rob.logic.exc.ss.srSys #= 0x27
       val bootA7 = if (userMode) 0x00200000L else 0x00100000L
@@ -4351,6 +4359,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.ctrl.logic.urp   #= SUP_ROOT
       dut.ctrl.logic.srp   #= SUP_ROOT
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       dut.rob.logic.exc.ss.usp #= 0x00200000L
       if (userMode) dut.rob.logic.exc.ss.srSys #= 0x00 else dut.rob.logic.exc.ss.srSys #= 0x27
       val bootA7 = if (userMode) 0x00200000L else 0x00100000L
@@ -5080,6 +5089,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.ctrl.logic.urp   #= 0x80000L
       dut.ctrl.logic.srp   #= 0x80000L
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       // Seed the int PRF arch-15 (A7, identity phys-15) to the boot SSP. The committed
       // A7 banks (ss.usp/isp/msp) are LIVE-COHERENT with the architectural A7 read back
       // from the PRF every cycle (the exc unit drives ss.writeA7), so the PRF arch-15 —
@@ -5258,6 +5268,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.ctrl.logic.urp   #= 0x80000L
       dut.ctrl.logic.srp   #= 0x80000L
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       dut.wire.logic.seedValid #= true
       dut.wire.logic.seedAddr  #= 15
       dut.wire.logic.seedData  #= BigInt(0x00100000L)
@@ -5399,6 +5410,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.ctrl.logic.urp   #= MMU_ROOT
       dut.ctrl.logic.srp   #= MMU_ROOT
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       cd.waitSampling()
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling(); dut.fa.logic.redirect.valid #= false
@@ -5520,6 +5532,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.ctrl.logic.urp   #= 0x80000L
       dut.ctrl.logic.srp   #= 0x80000L
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       cd.waitSampling()
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling(); dut.fa.logic.redirect.valid #= false
@@ -5640,6 +5653,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.ctrl.logic.urp   #= 0x80000L
       dut.ctrl.logic.srp   #= 0x80000L
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       cd.waitSampling()
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling(); dut.fa.logic.redirect.valid #= false
@@ -6573,6 +6587,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.ctrl.logic.urp   #= 0x80000L
       dut.ctrl.logic.srp   #= 0x80000L
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       // Seed the int PRF arch-15 (A7) to the boot SSP so the surfaced committed A7 matches
       // the oracle from the first step (the OoO datapath reads A7 from the PRF).
       dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
