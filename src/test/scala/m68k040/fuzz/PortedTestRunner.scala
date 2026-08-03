@@ -117,6 +117,20 @@ object PortedTestRunner {
       // original m68k-ooo tb leaves that address unmapped, where it instead reports
       // FAIL_NO_SCC) -- so it is left red rather than special-cased here. Backing the
       // SCC window is a deliberate, separate decision, not a fill-convention fix.
+      //
+      // Review note (harness-SMC-fix, post-commit): passing this non-null `sharedMem`
+      // means `AxiMemModel` no longer draws a `simRandom.nextLong()` seed for a fresh
+      // `SparseMemory()` here, shifting the shared PRNG stream every later
+      // `StreamReadyRandomizer` (ar/aw/w backpressure timing) consumes from for the
+      // REST of the sim -- every ported test's AXI-ready timing is re-rolled relative
+      // to pre-fix runs. Independently verified this does NOT explain any of the
+      // observed pass/fail deltas (a from-scratch isolation experiment holding the
+      // fill fixed while restoring the old stream position reproduced the exact same
+      // 13-fixed/1-new attribution) -- but if a FUTURE investigation on this branch
+      // sees an unexplained ported-test outcome shift with no corresponding RTL or
+      // harness diff, check here first before chasing a phantom RTL race (this project
+      // has been burned by exactly this PRNG-stream-position artifact class before,
+      // see the V1.6b MSHR investigation).
       val dsideMem = new m68k040.sim.ConstFillSparseMemory(0xff.toByte)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd,
                                                    sharedMem = dsideMem, injectBusErrors = true)
