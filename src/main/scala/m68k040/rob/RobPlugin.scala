@@ -1021,7 +1021,15 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // available only after exc is built) and driven below. The captured context comes
       // straight from the head's per-entry sysOp stores + the captured value.
       sysTrigger = sysTriggerSig,
-      sysKind    = sysKindStore(h0).asBits.asUInt.resize(4),   // task #198: 4 bits (PTEST=8)
+      sysKind    = sysKindStore(h0).asBits.asUInt.resize(4),   // task #198: 4 bits (10 SysKind
+                                                                // elements as of task P5.2's CINV
+                                                                // insertion -- ExceptionUnit's
+                                                                // S_APPLY dispatch reads this same
+                                                                // .asBits.asUInt.resize(4) shape via
+                                                                // symbolic skOrd(SysKind.X) helpers,
+                                                                // not hand-written ordinals, so this
+                                                                // comment no longer needs to track a
+                                                                // specific element's numeric value)
       sysReadDir = sysReadDirStore(h0),
       sysVal     = sysValStore(h0),
       sysRc      = sysRcStore(h0),
