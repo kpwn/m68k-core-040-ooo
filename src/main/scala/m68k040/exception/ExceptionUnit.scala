@@ -456,11 +456,35 @@ class ExceptionUnit(
   dcStore.payload.useStrb := False
   dcStore.payload.strb    := B(0, 16 bits)
   dcStore.payload.lineData:= B(0, 128 bits)
-  // The exception sequencer's frame/vector pushes are always identity-physical
-  // writes (MMU-off in slice-1); constant WRITETHROUGH matches today's
-  // unconditional write-through timing exactly (P2/P4 don't need this path
-  // to vary -- exception frame stores are never copyback-cached).
-  dcStore.payload.cacheMode := m68k040.cache.CacheMode.WRITETHROUGH
+  // ── Exception-sequencer D-cache access cacheability (Task P5.7 root-cause fix) ──
+  // The exception sequencer's frame/vector accesses are always identity-physical
+  // (MMU-off in slice-1), so there is no page attribute to consult -- but CACR.DE
+  // still applies. Task P5.6 made DE=0 mean LITERALLY fully uncached for every data
+  // access and folded that into `LsEuPlugin`'s `s2Cmode` capture; these two ports are
+  // the D-cache's OTHER data-access requesters and were missed, leaving a REAL
+  // coherency hole with DE=0:
+  //   - an ordinary program store is INHIBITED, so it writes AXI and NEVER touches
+  //     the L1D array (Task P1.4: `stS2Inhibited` skips the RMW entirely);
+  //   - this unit's frame/vector LOAD, hardcoded WRITETHROUGH, still MISSES ->
+  //     REFILLS -> **ALLOCATES** a resident line (`doAllocate` only excludes
+  //     INHIBITED);
+  //   - so once a line is resident, every later program store to it is invisible to
+  //     the array, and the NEXT exception-sequencer load of that line HITS the stale
+  //     copy.
+  // That is exactly the classic trap-handler idiom: the handler reads the stacked
+  // frame, PATCHES the stacked PC/SR with an ordinary store to skip the faulting
+  // instruction, then RTEs -- and the RTE's frame load reads back the UNPATCHED
+  // value, re-entering the same fault forever (a deterministic HANG, unaffected by
+  // raising the cycle budget). Same hole for a VBR vector the program rewrites after
+  // an earlier exception already pulled that line in.
+  // Fix: honour DE here too, exactly like `s2Cmode` does -- DE=0 => INHIBITED (no
+  // allocate, no array read, no stale hit); DE=1 => WRITETHROUGH, byte-for-byte the
+  // previous behaviour. `ss.cacr(31)` is the same bit RobPlugin already publishes as
+  // `CacheControlService.dcacheEnabled` (`_dcacheEnabled := exc.ss.cacr(31)`), read
+  // directly here since `ss` is this unit's own state -- no new port or dependency.
+  val excCacheMode = Mux(ss.cacr(31), m68k040.cache.CacheMode.WRITETHROUGH,
+                                      m68k040.cache.CacheMode.INHIBITED)
+  dcStore.payload.cacheMode := excCacheMode
   // The exception sequencer's frame pushes are conceptually "always awaited" --
   // driving precise=True means a hypothetical bus error there is simply never
   // routed to the new async diagnostic channel (Task P4.5), which is correct:
@@ -482,8 +506,14 @@ class ExceptionUnit(
   // exception sequencer runs MMU-off (identity, slice-1): paddr == vaddr.
   dcLoadCmd.payload.paddr := RegNext(ldoVaddr)
   dcLoadCmd.payload.size  := RegNext(ldoSize)
-  // Identity-physical, same rationale as dcStore.payload.cacheMode above.
-  dcLoadCmd.payload.cacheMode := m68k040.cache.CacheMode.WRITETHROUGH
+  // Identity-physical, same rationale (and same DE=0 fix) as dcStore.payload.cacheMode
+  // above -- this is in fact the ALLOCATING half of that coherency hole.
+  // NOTE: this particular field is currently INERT in every integrated DUT --
+  // FuzzDut/FullCoreSynth wire only `dcLoadCmd.payload.vaddr/size` into the LS EU and
+  // LsEuPlugin's exception-arbitration mux REGENERATES the cache mode itself. That mux
+  // carries the same DE fold (see its comment); this assignment is kept correct and in
+  // sync so the field is never a trap for a future wiring that does forward it.
+  dcLoadCmd.payload.cacheMode := excCacheMode
 
   val dtoVld = Bool();        dtoVld := False
   val dtoVpn = UInt(20 bits); dtoVpn := U(0, 20 bits)

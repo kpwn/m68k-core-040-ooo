@@ -367,9 +367,61 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // arrives 1-2 cycles later carrying a now-reused robId, and corrupts the
     // commit/whitebox join. Gating issue on !flushSignal is the correct squash
     // behavior (a single AND on the registered pulse, not a broadcast).
-    selPorts(0).valid   := oh0.orR && !flushSignal
+    // ── ALU registered-issue-stage HANDOFF HAZARD (Task P5.7 root-cause fix) ──────
+    // The static-latency-1 wakeup contract documented just above ("a producer selected
+    // at cycle C still executes exactly when a dependent — woken at C, selected at C+1
+    // — performs its read") silently assumed the ALU EU ALWAYS accepts from the
+    // registered stage the very next cycle. That assumption was true when it was
+    // written ("For ALU/branch the EU is always ready so the pipe always accepts",
+    // see the m2sPipe comment below) but has been FALSE since the ALU EU grew its
+    // multi-cycle SLOW path: `AluEuPlugin.issuePort.ready` is deasserted for the whole
+    // S1/S1a/S1a2/S1b/S2/S3 occupancy of a SHIFT/BITFIELD µop.
+    //
+    // The concrete failure (bfins_mem_dyn_both, Task P5.7 regression cluster):
+    //   C   : ALU0 is ready, so BOTH (a) the pipe hands a BITFIELD µop to ALU0 and
+    //         (b) the IQ selects producer P (BFRESOLVE -> T0) into ALU0's now-free
+    //         pipe REGISTER. `events` fires for P at C (select time) -> P's dependent
+    //         D (an ADD reading T0) has its static trigger cleared and is ready at C+1.
+    //   C+1..C+m : ALU0.issuePort.ready is LOW (the BITFIELD occupies the slow pipe),
+    //         so P just SITS in the pipe register — it has not read the PRF, has not
+    //         executed, has written nothing.
+    //   C+k : D is selected on the OTHER ALU port (ALU1, idle) and executes
+    //         immediately, reading P's destination physreg out of the PRF BEFORE P
+    //         ever wrote it -> D silently consumes the physreg's STALE previous
+    //         occupant. (Observed: the bit-field byteBase add produced eaBase+0x6a,
+    //         0x6a being a dead temp value left over from the previous instruction's
+    //         chain, so the whole 5-byte BFINS window loaded/merged at a garbage
+    //         address.) Pre-P5.6 this was latent: with cacheable/fast loads the µop
+    //         stream never backed up enough for a dependent pair to be queue-resident
+    //         and become ready TOGETHER, so the producer always won the select first.
+    //
+    // Fix: never let a µop enter the registered issue stage on the same cycle that
+    // stage hands a SLOW µop to its ALU EU. The pipe register then stays EMPTY for
+    // the whole stall (the IQ's own `selPorts(k).ready` is already the EU's `ready`,
+    // so nothing else can be selected until the EU frees), which restores the
+    // invariant the wakeup contract needs:
+    //     selPorts(k).fire at C  =>  issuePorts(k).fire at C+1
+    // Proof: firing at C requires EU_k.ready at C, i.e. no slow µop in S1..S3 at C.
+    // A slow µop can only be in S1 at C+1 if the EU accepted one at C — which is
+    // exactly the case this gate suppresses. Hence EU_k.ready at C+1. ∎
+    // Cost: ONE bubble cycle per slow ALU µop on that port (the queue can no longer
+    // pre-stage the next µop behind a shift/bitfield); the sibling ALU port and every
+    // other issue port are untouched. Reads only registers (the pipe's own valid/
+    // payload + the EU's ready, itself a function of EU state regs), so it adds a
+    // single AND to the select-valid cone and no new timing arc.
+    //
+    // NOT extended to ports 2/3/4 here: branch/LS/CPLX producers are already tracked
+    // by DYNAMIC (completion-broadcast) wakeups rather than the static latency-1
+    // trigger, so a held µop on those ports cannot expose this window. (The one known
+    // exception is an LS X-producer — RTR's CCR-restore — which still records a STATIC
+    // `sbX` trigger; that is a pre-existing, separate gap of the same class, not
+    // reachable from this regression cluster, and is left documented rather than
+    // speculatively rewired.)
+    def aluSlowHandoff(k: Int): Bool =
+      issuePorts(k).valid && issuePorts(k).ready && isAluSlowProducer(issuePorts(k).payload.uop)
+    selPorts(0).valid   := oh0.orR && !flushSignal && !aluSlowHandoff(0)
     selPorts(0).payload := MuxOH(oh0, contexts)
-    selPorts(1).valid   := oh1.orR && !flushSignal
+    selPorts(1).valid   := oh1.orR && !flushSignal && !aluSlowHandoff(1)
     selPorts(1).payload := MuxOH(oh1, contexts)
     selPorts(2).valid   := ohB.orR && !flushSignal
     selPorts(2).payload := MuxOH(ohB, contexts)

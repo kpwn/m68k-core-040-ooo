@@ -377,6 +377,79 @@ object PortedTestRunner {
         }
       }
 
+      // debug-only, env-gated PER-ROBID DATAFLOW trace (added for the Task P5.7
+      // regression root-cause, kept because nothing else in this file attributes a
+      // VALUE to a producing µop): every ALU-EU and LS-EU writeback with its
+      // robId/dstArch/result, every LS-EU XLATE (robId + load/store), every D-cache
+      // load/store command, and every commit. Reading a wrong effective address or a
+      // wrong stored value straight back to the exact µop that produced the operand
+      // is what identified the same-cycle dependent ALU dual-issue (see
+      // IssueQueuePlugin's `aluSlowHandoff` comment). Zero cost unless
+      // PORTED_TRACE_WBDBG is set.
+      if (sys.env.contains("PORTED_TRACE_WBDBG")) {
+        var trCyc = 0
+        cd.onSamplings {
+          trCyc += 1
+          for ((eu, nm) <- Seq((dut.eu0, "eu0"), (dut.eu1, "eu1"))) {
+            val o = eu.logic.wbObs
+            if (o.valid.toBoolean)
+              println(f"[bfdbg] cyc=$trCyc%6d $nm WB robId=${o.robId.toInt}%2d dstArch=${o.dstArch.toInt}%2d " +
+                f"intW=${o.intWrite.toBoolean} res=0x${o.result.toLong & 0xffffffffL}%08x")
+          }
+          val lo = dut.lsEu.logic.wbObs
+          if (lo.valid.toBoolean)
+            println(f"[bfdbg] cyc=$trCyc%6d lsu WB robId=${lo.robId.toInt}%2d dstArch=${lo.dstArch.toInt}%2d " +
+              f"intW=${lo.intWrite.toBoolean} res=0x${lo.result.toLong & 0xffffffffL}%08x")
+          if (dut.lsEu.logic.s1Valid.toBoolean && dut.lsEu.logic.dbgIsXlate.toBoolean)
+            println(f"[bfdbg] cyc=$trCyc%6d lsu XLATE robId=${dut.lsEu.logic.s1Ctx.robId.toInt}%2d " +
+              f"isLoad=${dut.lsEu.logic.isLoad.toBoolean} isStore=${dut.lsEu.logic.isStore.toBoolean}")
+          if (dut.dcache.logic.loadCmdPort.valid.toBoolean)
+            println(f"[bfdbg] cyc=$trCyc%6d dc LOADCMD vaddr=0x${dut.dcache.logic.loadCmdPort.payload.vaddr.toLong & 0xffffffffL}%08x")
+          if (dut.dcache.logic.storePort.valid.toBoolean)
+            println(f"[bfdbg] cyc=$trCyc%6d dc STORE paddr=0x${dut.dcache.logic.storePort.payload.paddr.toLong & 0xffffffffL}%08x data=0x${dut.dcache.logic.storePort.payload.data.toLong & 0xffffffffL}%08x")
+          for (k <- 0 until 2) {
+            val c = dut.rob.logic.commitObs(k)
+            if (c.fire.toBoolean)
+              println(f"[bfdbg] cyc=$trCyc%6d COMMIT p$k robId=${c.robId.toInt}%2d pc=0x${c.pc.toLong & 0xffffffffL}%08x")
+          }
+        }
+      }
+
+      // debug-only, env-gated ISSUE-QUEUE trace (added for the Task P5.7 regression
+      // root-cause, kept as the first direct view of IQ dependency state): every push
+      // (both dispatch slots, with pdst/psrcB so an intra-push producer/consumer pair
+      // is visible) plus, over an optional cycle window [IQDBG_LO, IQDBG_HI], a full
+      // dump of every OCCUPIED slot -- robId, op, the static trigger bitmap, the
+      // source physregs, and the dynamic LS/CPLX wait bits -- alongside sbInt.busy.
+      // This is what showed the dependent's trigger being cleared (producer selected)
+      // many cycles before the producer actually reached its EU. Zero cost unless
+      // PORTED_TRACE_IQDBG is set.
+      if (sys.env.contains("PORTED_TRACE_IQDBG")) {
+        val lo = sys.env.getOrElse("IQDBG_LO", "0").toInt
+        val hi = sys.env.getOrElse("IQDBG_HI", "999999").toInt
+        var trCyc = 0
+        cd.onSamplings {
+          trCyc += 1
+          val iql = dut.iq.logic
+          if (dut.iq.pushPort.valid.toBoolean) {
+            val p0 = dut.iq.pushPort.payload(0); val p1 = dut.iq.pushPort.payload(1)
+            println(f"[iqdbg] cyc=$trCyc%6d PUSHV s0 robId=${p0.robId.toInt}%2d op=${p0.uop.op.toEnum}%-12s " +
+              f"pdst=${p0.uop.pdst.toInt}%2d/${p0.uop.pdstValid.toBoolean} psrcB=${p0.uop.psrcB.toInt}%2d/${p0.uop.psrcBValid.toBoolean} | " +
+              f"s1en=${dut.iq.pushSlot1Port.toBoolean} s1 robId=${p1.robId.toInt}%2d op=${p1.uop.op.toEnum}%-12s " +
+              f"pdst=${p1.uop.pdst.toInt}%2d/${p1.uop.pdstValid.toBoolean} psrcB=${p1.uop.psrcB.toInt}%2d/${p1.uop.psrcBValid.toBoolean}")
+          }
+          if (trCyc >= lo && trCyc <= hi) {
+            println(f"[iqdbg] cyc=$trCyc%6d sbIntBusy=0x${iql.sbInt.busy.toBigInt.toString(16)}")
+            for ((s, i) <- iql.slots.zipWithIndex) if (s.sel.toBoolean) {
+              println(f"[iqdbg] cyc=$trCyc%6d   slot$i%2d robId=${s.context.robId.toInt}%2d op=${s.context.uop.op.toEnum}%-12s " +
+                f"trig=0x${s.triggers.toBigInt.toString(16)} psrcA=${s.context.uop.psrcA.toInt}%2d/${s.context.uop.psrcAValid.toBoolean} " +
+                f"psrcB=${s.context.uop.psrcB.toInt}%2d/${s.context.uop.psrcBValid.toBoolean} " +
+                f"lsW=${s.lsWait.toBoolean} cxW=${s.cplxWait.toBoolean}")
+            }
+          }
+        }
+      }
+
       var bkptFired = false
       if (bkptPcs.nonEmpty) {
         cd.onSamplings {

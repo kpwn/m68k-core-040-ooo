@@ -1680,8 +1680,33 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       // exception sequencer runs MMU-off (identity, slice-1): paddr == vaddr.
       dcache.loadCmd.payload.paddr := excLoadCmdVaddr
       dcache.loadCmd.payload.size  := excLoadCmdSize
-      // identity-physical, matching dcStore's exc-path cacheMode default.
-      dcache.loadCmd.payload.cacheMode := m68k040.cache.CacheMode.WRITETHROUGH
+      // identity-physical, matching dcStore's exc-path cacheMode.
+      //
+      // Task P5.7 root-cause fix -- CACR.DE MUST be honoured here too. This mux is
+      // the LIVE driver of the exception sequencer's frame/vector LOADS (FuzzDut /
+      // FullCoreSynth wire only `excLoadCmdVaddr/Size` across, NOT the
+      // ExceptionUnit's own `dcLoadCmd.payload.cacheMode` -- this line regenerates
+      // it), so P5.6's "DE=0 => literally fully uncached", folded into `s2Cmode`
+      // for LS-EU accesses, never reached the exception path. The resulting
+      // coherency hole with DE=0:
+      //   - an ordinary program store is INHIBITED: it writes AXI and NEVER touches
+      //     the L1D array (Task P1.4 `stS2Inhibited` skips the RMW entirely);
+      //   - this load, hardcoded WRITETHROUGH, still misses -> refills -> ALLOCATES
+      //     a resident line (DcachePlugin's `doAllocate` only excludes INHIBITED);
+      //   - from then on every program store to that line is invisible to the array
+      //     and the NEXT exception-sequencer load of it HITS the stale copy.
+      // That is precisely the universal trap-handler idiom -- read the stacked
+      // frame, PATCH the stacked PC with an ordinary store to step over the faulting
+      // instruction, RTE -- so RTE reloads the UNPATCHED PC and re-enters the same
+      // fault forever: a deterministic HANG no cycle budget can clear. Confirmed by
+      // cycle trace on priv_user_andi_sr_traps: the first trap's RTE read the patched
+      // PC (line not yet resident), the second read back the exception unit's OWN
+      // pushed frame word instead of the handler's patch (1-cycle response = array
+      // hit), looping on the same instruction forever.
+      // Same expression as `s2Cmode`'s own DE fold, for the same reason.
+      dcache.loadCmd.payload.cacheMode := Mux(cacheCtrl.map(_.dcacheEnabled).getOrElse(False),
+                                              m68k040.cache.CacheMode.WRITETHROUGH,
+                                              m68k040.cache.CacheMode.INHIBITED)
     }
     when(excActive && excStoreValid) {
       dcache.store.valid          := True
