@@ -446,16 +446,19 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val s2Fault  = RegInit(False)
     val s2Cmode  = Reg(m68k040.cache.CacheMode())
 
-    // Task P2.2: fast := mmuEnabled && cacheable(s2Cmode) && CACR.DE — a pure
-    // combinational read of already-latched architectural facts (mmuEnable/CACR.DE
-    // are live config state; s2Cmode is REGISTERED at XLATE, same stage s2Paddr is
-    // available), no probe/filter/history. A store for which this is False (MMU-
-    // off, INHIBITED, or DE=0) is a PRECISE-path store: the XLATE/WAIT_SQ store
-    // arms below allocate it into the SQ but withhold `captureCompletion` — its ROB
-    // completion instead comes later from the SQ's at-head drain (Task P2.4).
+    // Task P2.2: fast := mmuEnabled && cacheable(s2Cmode) — a pure combinational
+    // read of already-latched architectural facts (mmuEnable is live config state;
+    // s2Cmode is REGISTERED at XLATE, same stage s2Paddr is available), no
+    // probe/filter/history. CACR.DE is NOT tested directly here (Task P5.6): it is
+    // folded into s2Cmode's own capture upstream (s2Cmode reads as INHIBITED
+    // whenever DE=0, regardless of the page's own attribute), so this expression
+    // needs only 2 terms, not 3. A store for which this is False (MMU-off,
+    // INHIBITED, or DE=0-via-s2Cmode) is a PRECISE-path store: the XLATE/WAIT_SQ
+    // store arms below allocate it into the SQ but withhold `captureCompletion` —
+    // its ROB completion instead comes later from the SQ's at-head drain (Task
+    // P2.4).
     val fastStore = mmuCtrl2.map(_.mmuEnable).getOrElse(False) &&
-                    (s2Cmode =/= m68k040.cache.CacheMode.INHIBITED) &&
-                    cacheCtrl.map(_.dcacheEnabled).getOrElse(False)
+                    (s2Cmode =/= m68k040.cache.CacheMode.INHIBITED)
     // Root-cause fix (post-Task-P2.5 lock-step investigation): a privileged STORE
     // (e.g. MOVES.L Dn,<ea>) executed in user mode must NEVER let its memory write
     // reach the SQ at all -- mirrors the EXISTING `suppressForLaterPrivCheck`
@@ -1202,7 +1205,17 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
               } otherwise {
                 s2Paddr  := s1Paddr
                 s2Fault  := xlateFault
-                s2Cmode  := xlate.rsp.cacheMode
+                // CACR.DE=0 (design doc §4.3/§5 item 2, USER DECISION): literally
+                // fully uncached, matching real silicon -- effectiveMode = DE ?
+                // pageMode : INHIBITED for EVERY data access. Folding this in HERE
+                // (the single point s2Cmode is captured, regardless of whether the
+                // access is aligned or split -- XLATE_B never re-captures s2Cmode,
+                // see the file-level note above this state) makes every later
+                // consumer -- llReg.cmode (loads), sq.io.alloc.payload.cacheMode
+                // (stores), fastStore's classification -- automatically respect
+                // DE=0 with no other code changes anywhere.
+                s2Cmode  := Mux(cacheCtrl.map(_.dcacheEnabled).getOrElse(False),
+                                xlate.rsp.cacheMode, m68k040.cache.CacheMode.INHIBITED)
                 // mmu-split-second-half fix: a split access's second half (addrB) can
                 // land on a genuinely different page than slot A, with independent
                 // residency/perms — it needs its OWN real DTLB translation, not an

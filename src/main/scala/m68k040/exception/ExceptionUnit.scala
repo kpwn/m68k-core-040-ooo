@@ -1374,9 +1374,14 @@ class ExceptionUnit(
     // leave a multi-thousand-cycle window in which a fetch can refill lines from memory
     // the D-side has not yet written back — silently re-caching PRE-writeback (stale)
     // code for exactly the lines the CPUSH exists to make coherent. Pulsing at
-    // completion closes that window. The I-cache is never dirty (read-only), so "push"
-    // and "invalidate" are the same operation on that side, and CPUSH and CINV share
-    // this single exit.
+    // completion NARROWS that window (not fully closes it): a same-cycle-only guard
+    // elsewhere in IcachePlugin.scala means a refill whose AXI read was issued before
+    // this invalidate pulse but whose allocation commits after it can still install
+    // stale bytes. This re-timing eliminates the multi-thousand-cycle exposure for a
+    // long BC-selector walk, but a short op like a Line-scope CINV can still race it —
+    // that residual gap is tracked for a later task, not fixed here. The I-cache is
+    // never dirty (read-only), so "push" and "invalidate" are the same operation on
+    // that side, and CPUSH and CINV share this single exit.
     //
     // `sysCapRc` is a Reg still holding the CPUSH/CINV opword fields here, so the cache
     // selector is simply re-derived (same bit slice as the S_APPLY arms above).

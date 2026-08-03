@@ -100,8 +100,11 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     fa.logic.btbPredTaken1  := btb.logic.predTaken2Comb
     fa.logic.btbPredTarget1 := btb.logic.predTarget2Comb
     // RAS (slice 2): FetchAlign drives the push (call retPC) + pop (predicted return);
-    // the RAS returns its combinational top-of-stack predict. Invalidate on the same
-    // I-cache flush that clears the BTB.
+    // the RAS returns its combinational top-of-stack predict. Invalidate on the
+    // external boot/reset I-cache-invalidate port only (`invalidateAll`) -- unlike
+    // the BTB above, the RAS is deliberately NOT also wired to the internal
+    // CPUSH/CINV `maintInvalidateAll` pulse (see that wiring's own comment for why:
+    // the RAS is independently protected by gating on live predecode).
     val ras = host[m68k040.frontend.RasPlugin]
     ras.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
     ras.logic.pushValid     := fa.logic.rasPushValid
@@ -113,8 +116,11 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // Query the PHT with the same slot0/slot1 aligner PCs the BTB sees; feed the BTB hit
     // + brType into FetchAlign so it can form condBtbHit and source the conditional
     // direction from the PHT. Drive the GHR shift on the emitted predicted conditional;
-    // train the PHT at retire (the ROB's GshareUpdateService). Invalidate (GHR clear) on
-    // the same I-cache flush that clears the BTB/RAS.
+    // train the PHT at retire (the ROB's GshareUpdateService). Invalidate (GHR clear)
+    // on the external boot/reset I-cache-invalidate port only (`invalidateAll`) --
+    // like the RAS above (and unlike the BTB, which also fans in the internal
+    // CPUSH/CINV `maintInvalidateAll` pulse), gshare is independently protected
+    // (its predicted direction is cross-checked at resolve) so it does not need it.
     val gsh = host[m68k040.frontend.GsharePlugin]
     gsh.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
     gsh.logic.queryPc0      := fa.logic.btbQueryPc0

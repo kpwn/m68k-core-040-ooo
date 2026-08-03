@@ -116,6 +116,17 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
     pokeWordLE(mem, PAGT + pageIdx(va) * 4, pd)
   }
 
+  // Task P5.6: a COPYBACK page (CM=01, page-descriptor bit5 set per
+  // IcacheTypes.CacheMode.decode's bits[6:5] encoding — mirrors
+  // buildResidentWritethroughPage exactly, differing only in the CM bits) used to
+  // prove DE=0 overrides the page's OWN attribute down to INHIBITED.
+  def buildResidentCopybackPage(mem: BehavioralMemAgent, va: Long, ppn: Long): Unit = {
+    pokeWordLE(mem, ROOT + rootIdx(va) * 4, (PTRT & 0xfffffff0L) | 0x3L)
+    pokeWordLE(mem, PTRT + ptrIdx(va) * 4, (PAGT & 0xfffffff0L) | 0x3L)
+    val pd = ((ppn << 12) & 0xfffff000L) | 0x20L | 0x1L   // resident, CM=01 (COPYBACK), no write-protect
+    pokeWordLE(mem, PAGT + pageIdx(va) * 4, pd)
+  }
+
   def seed(dut: Dut, cd: ClockDomain, preg: Int, value: Long): Unit = {
     dut.src.logic.seedValid #= true; dut.src.logic.seedAddr #= preg; dut.src.logic.seedData #= BigInt(value & 0xffffffffL)
     cd.waitSampling()
@@ -246,6 +257,38 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
       cd.waitSampling(2)
       assert(dut.eu.logic.sq.robIds(idx).toInt == 6, "sanity: allocated entry belongs to this store")
       assert(!dut.eu.logic.sq.precises(idx).toBoolean, "MMU-on WRITETHROUGH DE=1 store must classify precise=False")
+    }
+  }
+
+  // Task P5.6: CACR.DE=0 must mean literally fully-uncached, matching real 68040
+  // silicon -- effectiveMode = DE ? pageMode : INHIBITED for EVERY data access,
+  // regardless of the page's own attribute. This is the direct counterpart of the
+  // DE=1 test immediately above: same MMU-on setup, but the page is COPYBACK (not
+  // WRITETHROUGH) and DE is poked to 0. If DE=0 correctly overrides the page's own
+  // COPYBACK classification, s2Cmode must read INHIBITED and the store must
+  // classify precise=True (exactly like a genuinely architecturally-INHIBITED page
+  // would) -- NOT precise=False just because the page itself is cacheable.
+  test("MMU-on COPYBACK-page store with DE=0 classifies precise=True and s2Cmode=INHIBITED (DE overrides page attribute)", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem, ptmem) = initDut(dut)
+      val base = 0x3000L
+      val vpn  = (base >> 12) & 0xfffff
+      buildResidentCopybackPage(ptmem, base, ppn = vpn)   // identity PPN=VPN
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp #= ROOT
+      dut.ctrl.logic.srp #= ROOT
+      dut.cacheCtrl.logic.dcacheEnabled #= false   // DE=0: literally fully uncached
+      seed(dut, cd, preg = 10, value = base)
+      seed(dut, cd, preg = 11, value = 0xFACEFEEDL)
+      issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11, Size.LONG, robId = 7)
+      val (idx, completedNextCycle) = waitAlloc(dut, cd, robId = 7)
+      assert(idx >= 0, "store must allocate into the SQ")
+      assert(!completedNextCycle, "DE=0 (precise-path) store must NOT drive completionPort right after allocating")
+      cd.waitSampling(2)
+      assert(dut.eu.logic.sq.robIds(idx).toInt == 7, "sanity: allocated entry belongs to this store")
+      assert(dut.eu.logic.sq.precises(idx).toBoolean, "MMU-on COPYBACK DE=0 store must classify precise=True -- DE=0 overrides the page's own COPYBACK attribute")
+      assert(dut.eu.logic.s2Cmode.toEnum == m68k040.cache.CacheMode.INHIBITED,
+        s"DE=0 must fold into s2Cmode as INHIBITED regardless of the page's own COPYBACK attribute, got ${dut.eu.logic.s2Cmode.toEnum}")
     }
   }
 
