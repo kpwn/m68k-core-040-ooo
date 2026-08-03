@@ -1689,11 +1689,23 @@ object MicroOpAssembler {
         opUop.useImm := True
         opUop.imm := pkt.words(1).asUInt.resize(32).asBits   // imm16 -> new SR (zero-ext)
       }
-      // CPUSH: no cache hierarchy modeled -> same "no real effect" treatment as RESET.
-      // The An/scope/cache-selector bits are read by nothing; clear all operands.
-      when(spec.sysKind === SysKind.CPUSH) {
-        opUop.srcAValid := False; opUop.srcBValid := False; opUop.dstValid := False
-        opUop.useImm := False
+      // CPUSH/CINV: route An like PTEST does (srcB -> EU result -> sysValStore, so
+      // S_APPLY has the address) + pack {scope,cacheSel} into imm[3:0] via the SAME
+      // side-channel mechanism MOVEC's Rc id already uses (imm is read regardless of
+      // useImm's IQ-operand-selection meaning). The actual cache-maintenance EFFECT is
+      // still not implemented here (that's P5.4's DcachePlugin engine + P5.5's
+      // ExceptionUnit dispatch) -- this arm only wires the operand ROUTING, which is
+      // real, not a no-op placeholder: An's register id rides srcB (its VALUE arrives
+      // via the normal EU writeback + sysValStore/sysCapVal capture, exactly like
+      // MOVEC/PTEST), and scope/cache-selector ride the packed imm[3:0] nibble.
+      // scope = opword[4:3], cacheSel = opword[7:6]; imm[3:2]=scope, imm[1:0]=cacheSel.
+      when(spec.sysKind === SysKind.CPUSH || spec.sysKind === SysKind.CINV) {
+        val maintAn = (U(8, 5 bits) + op(2 downto 0).asUInt).resize(5)
+        opUop.srcBReg := maintAn; opUop.srcBValid := True
+        opUop.srcAValid := False
+        opUop.dstValid := False
+        opUop.useImm := False   // srcB is a REAL register read (An), like MOVEC/PTEST
+        opUop.imm := (op(4 downto 3) ## op(7 downto 6)).resize(32)
       }
       // PFLUSHA: no operands (opword-only), the flushAll pulse fires from S_APPLY
       // regardless of any register content.

@@ -207,4 +207,34 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
       assert(!dut.uop.readsNzvc.toBoolean)   // a full MOVE-to-CCR does NOT read old CCR
     }
   }
+
+  // ── Task P5.3: CPUSH/CINV An routing (mirrors PTEST) + packed scope/cache-selector.
+  // opword layout: bits[2:0] = An (offset by 8 -> arch reg id), bits[4:3] = scope,
+  // bits[7:6] = cacheSel, bit[5] = CPUSH(1)/CINV(0) selector (irrelevant to this
+  // routing). imm[3:0] must carry {scope,cacheSel} MSB-first: imm[3:2]=scope,
+  // imm[1:0]=cacheSel — Task P5.5 reads sysCapRc(3 downto 2)/sysCapRc(1 downto 0)
+  // for scope/selector, so this bit ordering is load-bearing.
+  test("CINV (0xF448, An=A0, scope=01, cacheSel=01): An->srcB, no srcA/dst, imm={scope,cacheSel}", VerilatorTest) {
+    run { dut => drive(dut, 0xF448); sleep(1)
+      assert(dut.uop.sysKind.toEnum == SysKind.CINV)
+      assert(dut.uop.srcBReg.toInt == 8 && dut.uop.srcBValid.toBoolean)  // A0 = arch 8
+      assert(!dut.uop.srcAValid.toBoolean && !dut.uop.dstValid.toBoolean && !dut.uop.useImm.toBoolean)
+      assert((dut.uop.imm.toLong & 0xF) == 0x5)   // scope=01, cacheSel=01 -> {01,01} = 0101
+    }
+  }
+  test("CPUSH (0xF471, An=A1, scope=10, cacheSel=01): An->srcB, imm={scope,cacheSel}", VerilatorTest) {
+    run { dut => drive(dut, 0xF471); sleep(1)
+      assert(dut.uop.sysKind.toEnum == SysKind.CPUSH)
+      assert(dut.uop.srcBReg.toInt == 9 && dut.uop.srcBValid.toBoolean)  // A1 = arch 9
+      assert(!dut.uop.srcAValid.toBoolean && !dut.uop.dstValid.toBoolean && !dut.uop.useImm.toBoolean)
+      assert((dut.uop.imm.toLong & 0xF) == 0x9)   // scope=10, cacheSel=01 -> {10,01} = 1001
+    }
+  }
+  test("CPUSH (0xF478, An=A0, scope=11, cacheSel=01): imm={scope,cacheSel}", VerilatorTest) {
+    run { dut => drive(dut, 0xF478); sleep(1)
+      assert(dut.uop.sysKind.toEnum == SysKind.CPUSH)
+      assert(dut.uop.srcBReg.toInt == 8 && dut.uop.srcBValid.toBoolean)  // A0 = arch 8
+      assert((dut.uop.imm.toLong & 0xF) == 0xD)   // scope=11, cacheSel=01 -> {11,01} = 1101
+    }
+  }
 }
