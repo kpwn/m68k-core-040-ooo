@@ -116,6 +116,28 @@ class ExceptionUnit(
   dcLoadBusy.allowOverride;        dcLoadBusy := False
   dcStoreAck.allowOverride;        dcStoreAck := False
 
+  // ── Task P5.5: cache-maintenance (CPUSH / CINV) dispatch ports ───────────────
+  // `maintCmdOut` is a 1-cycle Flow pulse issued from S_APPLY's CPUSH/CINV arms and
+  // wired (by the top level / each test DUT) to `DcacheService.maintCmd`, which
+  // latches the payload and runs a multi-cycle Line/Page/All walk. It is DELIBERATELY
+  // a single-cycle pulse: DcachePlugin's walk entry is `IDLE.when(maintCmdPort.valid)`,
+  // so holding it asserted through the wait state below would re-trigger the walk.
+  val maintCmdOut = Flow(m68k040.cache.CacheMaintCmd())
+  maintCmdOut.valid := False
+  maintCmdOut.payload.assignDontCare()
+  // Completion handshake for the walk `maintCmdOut` kicked off (wired from
+  // `DcacheService.maintDone`). Defaults True — mirroring the `sqDrained`/`dcQuiesced`
+  // "no consumer wired, don't block" convention of this same file — so a standalone
+  // ExceptionUnit-only DUT with no D-cache at all does not hang forever in
+  // `S_MAINTWAIT`.
+  val maintDoneIn = Bool(); maintDoneIn.allowOverride; maintDoneIn := True
+  // 1-cycle I-cache full-invalidate pulse, wired to `IcachePlugin.logic
+  // .maintInvalidateAll`. Pulsed by the SAME S_APPLY arms whenever the CPUSH/CINV
+  // cache selector names IC (10) or BC (11). Deliberately does NOT reach the branch
+  // predictors (BTB/RAS/gshare) — see IcachePlugin's `maintInvalidateAll` declaration
+  // for the full recorded rationale (Task P5.5 Step 9).
+  val icMaintPulse = Bool(); icMaintPulse := False
+
   // ── exposed D-side translation request (wiring MUXes it onto DTranslationService) ─
   val dtReq = TranslationReq()
   val dtRsp = TranslationRsp()
@@ -602,6 +624,16 @@ class ExceptionUnit(
     // port + AXI write channels, which excActive alone does NOT free).
     val S_DRAIN   = new State
     val S_APPLY   = new State
+    // Task P5.5: CPUSH/CINV only. S_APPLY pulses `maintCmdOut` for exactly ONE cycle,
+    // but the D-cache maintenance walk it starts takes many cycles (a Page/All scope
+    // walks all 128 sets x 4 ways, and every dirty match adds an AXI writeback). Hold
+    // the sequencer here — still excActive, so the front-end stays squashed and the LS
+    // pipe stays idle — until `maintDoneIn` pulses, THEN redirect. Mirrors E_STWAIT's
+    // shape (issue in one state, await the ack in the next). Every OTHER sysKind skips
+    // this state entirely and goes straight to S_REDIR, so no existing sysOp pays for
+    // it. Distinct from and complementary to S_DRAIN, which waits for the D-cache to be
+    // idle BEFORE the walk starts.
+    val S_MAINTWAIT = new State
     val S_REDIR   = new State
 
     IDLE.whenIsActive {
@@ -1139,7 +1171,9 @@ class ExceptionUnit(
     // nothing: the switch has no `default`, and every effect below is a pulse onto a
     // signal that is unconditionally defaulted idle earlier in this Area, so "no arm
     // matched" is a genuine, side-effect-free no-op (S_APPLY still falls through to
-    // S_REDIR, which serializes + advances PC — the RESET/CPUSH/CINV behavior).
+    // S_REDIR, which serializes + advances PC — the RESET behavior). Task P5.5: CPUSH/
+    // CINV are no longer part of that no-op set; they issue a real maintenance command
+    // and detour through S_MAINTWAIT before S_REDIR (see the exit below).
     S_APPLY.whenIsActive {
       switch(sysCapKind) {
         is(skOrd(m68k040.decode.SysKind.MOVE_TO_SR)) { // MOVE to SR : sysVal.W -> SR
@@ -1245,18 +1279,45 @@ class ExceptionUnit(
           // The HALT itself is the ROB `stopped` state (set on the STOP sysRetire).
           ss.setSrSys.valid := True; ss.setSrSys.payload := sysCapVal(15 downto 8).asUInt
         }
-        is(skOrd(m68k040.decode.SysKind.CPUSH)) {   // CPUSH : cache push/invalidate
-          // DELIBERATE, TEMPORARY architectural NOP (like RESET): the real
-          // push-dirty-lines effect lands with P5.4's DcachePlugin maintenance engine +
-          // P5.5's dispatch. Explicit empty arm, not a fallthrough.
+        // ── CPUSH / CINV (Task P5.5): REAL cache-maintenance dispatch ──────────────
+        // Both arms exist EXPLICITLY rather than being left to fall through, and that
+        // is load-bearing history, not style: before Task P5.2 these were hand-written
+        // raw ordinal literals, and inserting SysKind.CINV between CPUSH and PFLUSHA
+        // silently re-pointed three arms — CINV's freshly-inserted ordinal 7 landed on
+        // what used to be PFLUSHA's literal arm and spuriously pulsed a full TLB flush.
+        // Every arm in this switch now derives its literal from the enum via `skOrd`.
+        //
+        // `sysCapRc` packs the CPUSH/CINV opword fields (MicroOpAssembler:
+        // `imm := op(4 downto 3) ## op(7 downto 6)`): bits [3:2] = SCOPE
+        // (01=Line, 10=Page, 11=All), bits [1:0] = CACHE SELECTOR (01=DC, 10=IC,
+        // 11=BC). `sysCapVal` carries An's value = the target address (meaningful for
+        // Line/Page scope only). The D-cache side ignores an IC-only (10) selector and
+        // completes immediately (DcachePlugin's `touchesDc`), so the command is always
+        // sent — the selector, not the caller, decides whether there is D-side work.
+        is(skOrd(m68k040.decode.SysKind.CPUSH)) {   // CPUSH : push (writeback) dirty lines
+          val cacheSel = sysCapRc(1 downto 0)
+          val scope    = sysCapRc(3 downto 2)
+          maintCmdOut.valid              := True
+          maintCmdOut.payload.push       := True
+          maintCmdOut.payload.invalidate := False
+          maintCmdOut.payload.scope      := scope
+          maintCmdOut.payload.sel        := cacheSel
+          maintCmdOut.payload.addr       := sysCapVal.asUInt
+          // Selector names IC (10) or BC (11) -> also clear the I-cache. The I-cache is
+          // never dirty (read-only), so "push" and "invalidate" are the same operation
+          // on that side.
+          when(cacheSel === U(2, 2 bits) || cacheSel === U(3, 2 bits)) { icMaintPulse := True }
         }
-        is(skOrd(m68k040.decode.SysKind.CINV)) {    // CINV : cache invalidate (no writeback)
-          // Same DELIBERATE, TEMPORARY architectural NOP as CPUSH above — Task P5.2 only
-          // added correct DECODE of CPUSH-vs-CINV (opword bit[5]); the real
-          // invalidate-lines effect lands in P5.4/P5.5. This arm exists EXPLICITLY (an
-          // empty body) rather than being left to fall through: before this fix CINV's
-          // freshly-inserted ordinal 7 landed on the hand-written literal arm that used
-          // to be PFLUSHA's and spuriously pulsed a full TLB flush.
+        is(skOrd(m68k040.decode.SysKind.CINV)) {    // CINV : invalidate (no writeback)
+          val cacheSel = sysCapRc(1 downto 0)
+          val scope    = sysCapRc(3 downto 2)
+          maintCmdOut.valid              := True
+          maintCmdOut.payload.push       := False
+          maintCmdOut.payload.invalidate := True
+          maintCmdOut.payload.scope      := scope
+          maintCmdOut.payload.sel        := cacheSel
+          maintCmdOut.payload.addr       := sysCapVal.asUInt
+          when(cacheSel === U(2, 2 bits) || cacheSel === U(3, 2 bits)) { icMaintPulse := True }
         }
         is(skOrd(m68k040.decode.SysKind.PFLUSHA)) { // PFLUSHA : flush all ATC/TLB entries
           // A REAL effect, unlike CPUSH/RESET — pulses the 1-cycle flushAll signal that
@@ -1277,7 +1338,27 @@ class ExceptionUnit(
           mmuCtrl.setMmusr.payload := (sysCapVal.asUInt & U(0xFFFFF000L, 32 bits)) | U(1, 32 bits)
         }
       }
-      goto(S_REDIR)
+      // Task P5.5: CPUSH/CINV just pulsed a maintenance command whose walk runs for
+      // many cycles; hold the (still serializing) sequencer until it reports done
+      // before redirecting. Every other sysKind's effect completed within this single
+      // S_APPLY cycle and goes straight on, exactly as before. Symbolic ordinals
+      // (skOrd), same reasoning as the switch above.
+      when(sysCapKind === skOrd(m68k040.decode.SysKind.CPUSH) ||
+           sysCapKind === skOrd(m68k040.decode.SysKind.CINV)) {
+        goto(S_MAINTWAIT)
+      } otherwise {
+        goto(S_REDIR)
+      }
+    }
+    // Task P5.5: await the maintenance walk's completion pulse. `maintCmdOut.valid` is
+    // driven True ONLY inside S_APPLY's CPUSH/CINV arms, so it has already dropped back
+    // to its declared `False` default by the time we get here — which is exactly right:
+    // `maintCmd` is a Flow and DcachePlugin's walk entry is
+    // `IDLE.when(maintCmdPort.valid)`, so a held-asserted command would re-trigger the
+    // walk on completion instead of ending it. `maintDoneIn` defaults True for DUTs
+    // with no D-cache wired, so this state costs them one cycle and never hangs.
+    S_MAINTWAIT.whenIsActive {
+      when(maintDoneIn) { goto(S_REDIR) }
     }
     // S_REDIR: the system-state writes from S_APPLY have now COMMITTED (a cycle later),
     // so ss.a7 / ss.srSys reflect the new state. Pulse the obs (post-state sysByte +

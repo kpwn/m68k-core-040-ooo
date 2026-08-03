@@ -1063,8 +1063,23 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // Layer (2) is defence in depth BEHIND `dcIdleForMaint`/`WAIT`, not a substitute
     // for it: the sim asserts below still hold that no store is in S0..S2 and the load
     // FSM is in IDLE for the whole walk. They prove the invariant rather than assume
-    // it; layer (2) makes the failure a bounded stall rather than silent corruption if
-    // it is ever violated.
+    // it; and for the SHARED ARRAY READ PORT specifically, layer (2) makes a violation
+    // a bounded stall rather than silent corruption.
+    //
+    // SCOPE CORRECTION (Task P5.5, folding in the P5.4 critical-fix review's finding
+    // I-1): the sentence above used to make that "bounded stall, not silent
+    // corruption" claim GENERALLY. It is only true of the read port. The walk's array
+    // WRITES -- the `valids`/`dirtys` clears in `CHECK` and `WRB` -- are NOT arbitrated
+    // against store-S2's own write to those same arrays, which elaborates FIRST, so a
+    // genuine same-cycle collision there would be last-assignment-wins (the walk's
+    // clear winning over the store's set), i.e. silent, not a stall. That ordering gap
+    // is UNREACHABLE today and stays documented rather than fixed: `dcIdleForMaint`
+    // (with its now-included live `!storePort.valid` term) plus `WAIT` mean no store is
+    // anywhere in S0..S2 when the walk starts, the FAILURE-severity sim assert below
+    // catches it if one ever is, and the caller (ExceptionUnit's `S_DRAIN` ->
+    // `S_APPLY` -> `S_MAINTWAIT` serialization, Task P5.5) additionally waits on
+    // `sqDrained && maintQuiesced` before requesting the walk and holds the whole
+    // sequencer until it completes.
 
     /** Every D-cache datapath resource the walk needs, genuinely idle THIS cycle.
       *

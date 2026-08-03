@@ -235,6 +235,14 @@ class IpcBenchSpec extends AnyFunSuite {
       lsEu.excXlateWrite        := exc.dtReq.write
       lsEu.excXlateSupervisor   := exc.dtReq.supervisor
       exc.sqDrained             := lsEu.sqEmptySig
+      // Task P5.4/P5.5 parity with FullCoreSynth (this block mirrors it by hand; the
+      // P5.4 `dcQuiesced` line was missing here, leaving the ExceptionUnit default of a
+      // hardcoded `True` and silently disabling S_DRAIN's D-cache-idle protection for
+      // any CPUSH/CINV now that the maintenance command is actually wired below).
+      exc.dcQuiesced            := dc.maintQuiesced
+      dc.maintCmd               := exc.maintCmdOut
+      exc.maintDoneIn           := dc.maintDone
+      host[IcachePlugin].logic.maintInvalidateAll := exc.icMaintPulse
       a7Wr.valid   := exc.a7WriteValid
       a7Wr.address := U(15, a7Wr.address.getWidth bits)
       a7Wr.data    := exc.a7WriteData.asBits

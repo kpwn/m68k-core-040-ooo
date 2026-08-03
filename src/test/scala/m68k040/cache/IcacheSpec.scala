@@ -191,6 +191,90 @@ class IcacheSpec extends AnyFunSuite {
     }
   }
 
+  // -------- Test 5b (Task P5.5): an invalidate landing on the EXACT refill-commit
+  // cycle must WIN over the refill's own valid-bit write --------
+  //
+  // The bug this pins down: `valids(w)(missSet) := True` (PREDECODE) elaborates LATER
+  // in IcachePlugin.scala than the `when(invalidateAll || maintInvalidateAll) { valids
+  // := False }` priority clear, so under last-assignment-wins the refill silently won
+  // any cycle both fired -- re-validating a line the invalidate was supposed to clear,
+  // leaving stale bytes fetchable after a CINV/CPUSH. Nothing gates instruction FETCH
+  // on `excActive` (only decode/rename/IQ are), so a run-ahead or wrong-path refill
+  // really can be committing on the exact cycle the commit-time CPUSH/CINV dispatch
+  // pulses the invalidate. Task P5.5, which first drives that internal wire, is what
+  // made the (identical, pre-existing) external-port gap live.
+  //
+  // `dbgAllocCommitCycle` is high for exactly the PREDECODE cycle that performs the
+  // tag/valid write. A testbench samples just BEFORE the edge that latches what it
+  // observed, so a poke issued at that sampling point only takes effect for the NEXT
+  // cycle -- triggering off `dbgAllocCommitCycle` itself lands the invalidate one cycle
+  // LATE, where it clears the (already set) valid bit and the test passes whether or
+  // not the guard exists. So we trigger off `dbgAllocCommitPending` (the cycle before)
+  // and then RE-CHECK `dbgAllocCommitCycle` on the next sampling point, so the test
+  // proves its own alignment instead of assuming it. The external port is poked rather
+  // than the internal `maintInvalidateAll` (which has no driver in this standalone
+  // DUT): the guard is a single `when` covering both, so this exercises identical logic.
+  test("an invalidateAll on the refill commit cycle wins over the refill's valid write", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      pulseInvalidateAll(dut, cd)
+
+      val pc  = 0x1040L
+      val set = ((pc >> 6) & 0x3F).toInt   // 64 sets, 64-byte lines -> pc[11:6]
+      // Fresh out of an invalidate, `victim(set)` is still 0, so this first allocation
+      // targets way 0.
+      val way = 0
+
+      // Race the invalidate onto the allocation write.
+      var aligned = false
+      val racer = fork {
+        // Trigger one cycle EARLY (see the comment above) so the pulse is high during
+        // the allocation-write cycle itself.
+        cd.waitSamplingWhere(dut.icache.logic.dbgAllocCommitPending.toBoolean)
+        dut.icache.logic.invalidateAll #= true
+        cd.waitSampling()
+        // Self-check: this sampling point observes the cycle the pulse was high for.
+        aligned = dut.icache.logic.dbgAllocCommitCycle.toBoolean
+        dut.icache.logic.invalidateAll #= false
+      }
+
+      val got = fetch(dut, cd, pc)
+      racer.join()
+      cd.waitSampling(4)
+
+      // If this ever fails the test below is vacuous, not passing -- fail loudly.
+      assert(aligned,
+        "test alignment lost: the invalidateAll pulse did not overlap the PREDECODE " +
+          "allocation-write cycle, so nothing was actually raced")
+
+      // The refill's DATA path is untouched by the guard (only `valids` is gated), so
+      // the in-flight fetch that caused the refill still gets its correct bytes.
+      assert(got == IcacheSim.window64(pc),
+        s"racing refill must still deliver correct data: got 0x${got.toString(16)} expected 0x${IcacheSim.window64(pc).toString(16)}")
+
+      // THE ASSERTION: the line must NOT be left resident. Pre-fix this read True.
+      assert(!dut.icache.logic.valids(way)(set).toBoolean,
+        s"invalidateAll fired on the refill's own commit cycle but valids($way)($set) is still set -- " +
+          "the refill's write won over the priority clear (elaboration-order race)")
+
+      // Positive control: with no invalidate racing it, the very next refill of the
+      // same address DOES leave the line resident -- so the assertion above is really
+      // detecting the race, not a permanently broken allocate path.
+      val got2 = fetch(dut, cd, pc)
+      cd.waitSampling(4)
+      assert(got2 == IcacheSim.window64(pc),
+        s"post-race refetch data mismatch: got 0x${got2.toString(16)} expected 0x${IcacheSim.window64(pc).toString(16)}")
+      assert((0 until 4).exists(w => dut.icache.logic.valids(w)(set).toBoolean),
+        s"positive control: an unraced refill of 0x${pc.toHexString} must leave set $set resident in some way")
+    }
+  }
+
   // -------- Test 6: predecode on miss -- fetched window carries PredecodeRef-matching chunks --------
   test("fetched window carries predecode matching PredecodeRef", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>

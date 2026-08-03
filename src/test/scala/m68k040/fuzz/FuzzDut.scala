@@ -223,6 +223,14 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     lsEu.excXlateWrite        := exc.dtReq.write
     lsEu.excXlateSupervisor   := exc.dtReq.supervisor
     exc.sqDrained             := lsEu.sqEmptySig
+    // Task P5.4/P5.5 parity with FullCoreSynth (this block mirrors it by hand; the
+    // P5.4 `dcQuiesced` line was missing here, leaving the ExceptionUnit default of a
+    // hardcoded `True` and silently disabling S_DRAIN's D-cache-idle protection for
+    // any CPUSH/CINV now that the maintenance command is actually wired below).
+    exc.dcQuiesced            := dc.maintQuiesced
+    dc.maintCmd               := exc.maintCmdOut
+    exc.maintDoneIn           := dc.maintDone
+    host[IcachePlugin].logic.maintInvalidateAll := exc.icMaintPulse
     a7Wr.valid   := exc.a7WriteValid || exc.sysRegWriteValid
     a7Wr.address := Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
                                               host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth))

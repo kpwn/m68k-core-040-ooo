@@ -43,8 +43,37 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // maintenance selector (sel = IC or BC). Deliberately a separate wire from the
     // external top-IO `invalidateAll` port above, which stays a bare `in Bool()` --
     // so every existing sim poke and every existing top-level connection of it is
-    // completely unaffected. Task P5.5's ExceptionUnit dispatch is the future driver;
-    // it defaults idle here (allowOverride, so that driver can override it).
+    // completely unaffected. Task P5.5 wired its real driver: ExceptionUnit's
+    // `icMaintPulse`, pulsed from the S_APPLY CPUSH/CINV arms whenever the cache
+    // selector names IC (10) or BC (11). It defaults idle here (allowOverride, so that
+    // driver can override it), which is what keeps every DUT that does NOT wire it
+    // (standalone I-cache tests) unchanged.
+    //
+    // ── DECIDED, Task P5.5 Step 9: this wire does NOT invalidate predictor state ────
+    // The EXTERNAL `invalidateAll` port fans out to the BTB, RAS and gshare as well as
+    // to this array (see FullCoreSynth's btb/ras/gsh `.invalidateAll` lines). This
+    // INTERNAL one deliberately does not, and that asymmetry is a decision, not an
+    // oversight:
+    //   - Every predictor structure in this core (BTB, RAS, gshare) is a pure
+    //     SPECULATIVE HINT. Its output steers *fetch* only; it never writes
+    //     architectural state, and every misprediction is already caught and corrected
+    //     at resolve/retire by the standard `RobPlugin.branchRedirect` mechanism that
+    //     the whole OoO design depends on for correctness regardless of the cause of
+    //     the mispredict.
+    //   - So a stale BTB/RAS/gshare entry SURVIVING a CINV cannot produce a wrong
+    //     ARCHITECTURAL result. Self-modified code at the target PC is still fetched
+    //     correctly, because the I-cache line itself WAS invalidated by this same
+    //     command (see the refill-vs-invalidate guard in PREDECODE below) — the bytes
+    //     actually executed are the new ones. If the stale hint mispredicts the
+    //     branch/return that used to live there, the branch EU's normal resolve-time
+    //     correction fires exactly as it would for any other mispredict.
+    //   - The `valids` array is the opposite case, and that is precisely why it IS
+    //     cleared here: leaving it stale would make the core FETCH WRONG BYTES, which
+    //     is an architectural error, not a performance one.
+    // Net: this is a pure performance question (at most one extra bad prediction after
+    // self-modifying code), and the external port's broader fan-out is right for ITS
+    // purpose (a boot/reset-time full clear) while this one's narrow fan-out is right
+    // for a per-instruction CINV.
     val maintInvalidateAll = Bool()
     maintInvalidateAll.allowOverride
     maintInvalidateAll := False
@@ -297,6 +326,28 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // `tValid := False` is reordered to NOT clobber a same-cycle cmdPort.fire (see the
     // tAccept/tConsume split below) so the back-to-back accept is not dropped.
 
+    // DEBUG (Task P5.5 regression test, mirrors the existing simPublic DEBUG hooks
+    // above): high for exactly the ONE cycle on which PREDECODE performs the
+    // tag/valid ALLOCATION write for a just-completed refill. Purely combinational off
+    // registers, so a directed test can read it right after a clock edge and line an
+    // `invalidateAll`/`maintInvalidateAll` pulse up with that write — the precise
+    // collision the refill-vs-invalidate priority guard below exists to survive. No-op
+    // for synthesis (drives nothing).
+    val dbgAllocCommitCycle = Bool()
+    dbgAllocCommitCycle := False
+    dbgAllocCommitCycle.simPublic()
+    // DEBUG companion, same purpose: high during the cycle IMMEDIATELY BEFORE
+    // `dbgAllocCommitCycle` — REFILL's final AXI beat, the cycle that transitions into
+    // PREDECODE's commitBeat==0. A testbench samples signals just before the clock edge
+    // that latches them, so a poke issued at that sampling point takes effect for the
+    // FOLLOWING cycle; the test therefore has to trigger off this one-cycle-earlier
+    // signal to get its invalidate pulse to overlap the allocation write. (It then
+    // re-checks `dbgAllocCommitCycle` on the next sampling point to prove the two
+    // really did line up, rather than assuming it.) No-op for synthesis.
+    val dbgAllocCommitPending = Bool()
+    dbgAllocCommitPending := False
+    dbgAllocCommitPending.simPublic()
+
     // ---- FSM ----
     val fsm = new StateMachine {
       val IDLE      = new State with EntryPoint
@@ -472,7 +523,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
           }
           beatCnt := beatCnt + 1
           when(axi.r.payload.last) {
-            when(missBusFault || respErr) { goto(FAULT) } otherwise { goto(PREDECODE) }
+            when(missBusFault || respErr) { goto(FAULT) } otherwise {
+              dbgAllocCommitPending := missCacheable   // DEBUG only (see its declaration)
+              goto(PREDECODE)
+            }
           }
         }
       }
@@ -575,12 +629,40 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // unaffected by this — they were already single-call-site/single-cycle and
         // only fire once, gated below by `commitBeat === 0`.
         when(commitBeat === U(0, 1 bits)) {
+          dbgAllocCommitCycle := doAllocate
           for (w <- 0 until ways) {
             when(victimWay === U(w, wayBits bits)) {
               when(doAllocate) {
                 predMem(w).write(missSet, packed)
                 tagMem(w).write(missSet, missTag)
-                valids(w)(missSet) := True
+                // Task P5.5 (NEW FINDING, fixed here): the `valids` write MUST yield to
+                // a same-cycle invalidate-all. The declaration site above calls itself a
+                // "priority clear of all valid bits", and that WAS the intent — but the
+                // clear (`when(invalidateAll || maintInvalidateAll) { valids := False }`)
+                // elaborates EARLIER in this file than this write, so under SpinalHDL's
+                // last-assignment-wins the refill's `True` silently won on any cycle
+                // both fired, re-validating a line the invalidate was supposed to clear.
+                //
+                // That collision is REACHABLE, not theoretical: nothing gates instruction
+                // FETCH on `excActive` (only decode/rename/IQ are held — see
+                // FullCoreSynth's `doFlush || excActive` fan-out; this plugin has no
+                // `excActive` awareness at all), so a wrong-path or run-ahead refill can
+                // be completing its PREDECODE commit on the exact cycle the commit-time
+                // CPUSH/CINV dispatch pulses `maintInvalidateAll`. Task P5.5 is what
+                // first drives that wire, which is what makes this live now; the
+                // EXTERNAL `invalidateAll` port carries the identical latent gap and is
+                // closed by the same guard for free.
+                //
+                // Same "two independently-firing control paths sharing mutable state
+                // with no interlock" bug class this session already found and fixed
+                // three times on the D-cache side (P4.3, P4.4, and P5.4's own critical
+                // fix). Only `valids` needs the guard: tagMem/predMem/dataMem content is
+                // meaningless unless `valids` says the line is resident, so leaving
+                // those writes unconditional is harmless and keeps the single-write-port
+                // discipline documented above intact.
+                when(!(invalidateAll || maintInvalidateAll)) {
+                  valids(w)(missSet) := True
+                }
               }
             }
           }

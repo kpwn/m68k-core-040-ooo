@@ -312,6 +312,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       lsEu.excXlateWrite        := exc.dtReq.write
       lsEu.excXlateSupervisor   := exc.dtReq.supervisor
       exc.sqDrained             := lsEu.sqEmptySig
+      // Task P5.4/P5.5 parity with FullCoreSynth (this block is a hand-maintained
+      // mirror of it, and the P5.4 `dcQuiesced` line was missing here — leaving the
+      // ExceptionUnit default of a hardcoded `True`, which would silently disable
+      // S_DRAIN's "wait for the D-cache to be idle" protection for every lock-step
+      // test that executes a CPUSH/CINV now that the maintenance command is actually
+      // wired below).
+      exc.dcQuiesced            := dc.maintQuiesced
+      dc.maintCmd               := exc.maintCmdOut
+      exc.maintDoneIn           := dc.maintDone
+      host[IcachePlugin].logic.maintInvalidateAll := exc.icMaintPulse
       // A7 (arch-15) write on exc/RTE A7 change. The SAME PRF write port also serves
       // a commit-time SYSTEM op's READ direction (MOVE-USP / MOVEC Rc->Rn writes an
       // arbitrary int arch-Rn): sysRegWrite fires in S_APPLY, a7Write in S_REDIR

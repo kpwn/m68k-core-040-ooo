@@ -77,6 +77,11 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     val fa  = host[FetchAlignPlugin]
     val btb = host[BtbPlugin]
     btb.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
+    // Task P5.5: the INTERNAL, CPUSH/CINV-driven I-cache invalidate. Deliberately fans
+    // out to the I-cache ONLY, not to the BTB/RAS/gshare below (unlike the external
+    // `invalidateAll` port, which is a boot/reset-time full clear) — see IcachePlugin's
+    // `maintInvalidateAll` declaration for the recorded rationale.
+    host[IcachePlugin].logic.maintInvalidateAll := rob.logic.exc.icMaintPulse
     // Two per-instruction combinational BTB lookups (the aligner's slot0/slot1 PCs);
     // the predict-taken + target return THIS cycle into FetchAlign's prediction inputs.
     btb.logic.queryPc     := fa.logic.btbQueryPc0
@@ -326,6 +331,12 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // `excActive` alone does NOT free (an older committed store can still be draining,
     // and a refill/eviction accepted before the flush can still be in flight).
     exc.dcQuiesced          := dc.maintQuiesced
+    // Task P5.5: the commit-time CPUSH/CINV dispatch itself. S_APPLY pulses
+    // `maintCmdOut` for one cycle (having already waited on S_DRAIN's
+    // sqDrained && dcQuiesced), then holds in S_MAINTWAIT until `maintDone` reports the
+    // walk finished.
+    dc.maintCmd             := exc.maintCmdOut
+    exc.maintDoneIn         := dc.maintDone
     // A7 (arch-15) write on exc/RTE A7 change; the SAME port also serves a commit-time
     // SYSTEM op's READ direction (MOVE-USP/MOVEC Rc->Rn writes an arbitrary arch-Rn).
     // sysRegWrite fires in S_APPLY, a7Write in S_REDIR (consecutive -> no port collision).
