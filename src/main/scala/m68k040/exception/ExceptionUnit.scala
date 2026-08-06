@@ -78,15 +78,19 @@ class ExceptionUnit(
     // (write committed SR/USP/VBR + re-bank A7, or read system->Rn), pulses the obs
     // (post-state sysByte + re-banked A7), and redirects to sysNextPc (serialize).
     //   sysKind     : the decode.SysKind enum's ENCODED value (RobPlugin sends
-    //                 `sysKindStore(h0).asBits.asUInt.resize(4)`). 4 bits since task
-    //                 #198 pushed the element count past the old 3-bit ceiling. Do NOT
-    //                 write raw ordinals against this field — S_APPLY dispatches via
+    //                 `payload.sysKind.asBits.asUInt.resize(4)` at h0 — folded from
+    //                 the old standalone `sysKindStore` Vec into RobPayload's Mem by
+    //                 LUT-reduction Task B1). 4 bits since task #198 pushed the
+    //                 element count past the old 3-bit ceiling. Do NOT write raw
+    //                 ordinals against this field — S_APPLY dispatches via
     //                 `skOrd(SysKind.X)`, which derives the literal from the enum (see
     //                 the helper next to sysCapKind's declaration).
     //   sysReadDir  : read SYSTEM->Rn (True) vs write Rn->SYSTEM (False).
     //   sysVal      : the captured source VALUE (for a write).
     //   sysRc       : the 12-bit MOVEC control-reg id.
-    //   sysDstArch  : the Rn arch reg for a READ (the FSM writes the int PRF).
+    //   sysDstPhys  : the PHYSICAL dst reg for a READ (the rename-allocated pdst of
+    //                 the read µop — see its own declaration below for the full
+    //                 rationale; the FSM writes the int PRF).
     //   sysPc       : the sysOp instruction's PC (the obs commit PC).
     //   sysNextPc   : the next instruction's PC (the redirect target after serialize).
     sysTrigger:   Bool = False,
@@ -268,17 +272,20 @@ class ExceptionUnit(
       "widen ExceptionUnit.sysKind/sysCapKind AND RobPlugin's .resize(...) together")
 
   // RTE-own-PC, captured at rteTrigger (task #177): `rtePc` aliases a LIVE ROB
-  // signal (pcStore(h0)) indexed by the head pointer. The RTE FSM is multi-cycle
-  // (IDLE -rteTrigger-> R_DRAIN -> ... -> the format-check state that actually
-  // consumes rtePc, many cycles later). While the FSM runs, `excSquash` (asserted
-  // every cycle once `exc.active`) forces the ROB's `tail := head` every cycle, so
-  // any younger speculative µop the front-end allocates in the meantime reuses the
-  // SAME physical ROB slot h0 still points at -- silently overwriting pcStore(h0)
-  // with a DIFFERENT (soon-to-be-squashed) instruction's PC before the format-error
-  // path ever reads it. Reading the live `rtePc` wire late (as the format-error path
-  // used to) therefore returns garbage, not RTE's own PC -- it must be LATCHED here,
-  // on the SAME cycle rteTrigger fires (before excActive/excSquash starts reusing
-  // the slot), exactly like sysCapPc is latched at sysTrigger below.
+  // signal (`payload.pc` read at h0, i.e. `p0.pc` -- folded from the old standalone
+  // `pcStore` Vec into RobPayload's Mem by LUT-reduction Task B1; same live-aliasing
+  // behavior, different storage) indexed by the head pointer. The RTE FSM is
+  // multi-cycle (IDLE -rteTrigger-> R_DRAIN -> ... -> the format-check state that
+  // actually consumes rtePc, many cycles later). While the FSM runs, `excSquash`
+  // (asserted every cycle once `exc.active`) forces the ROB's `tail := head` every
+  // cycle, so any younger speculative µop the front-end allocates in the meantime
+  // reuses the SAME physical ROB slot h0 still points at -- silently overwriting
+  // `p0.pc` with a DIFFERENT (soon-to-be-squashed) instruction's PC before the
+  // format-error path ever reads it. Reading the live `rtePc` wire late (as the
+  // format-error path used to) therefore returns garbage, not RTE's own PC -- it
+  // must be LATCHED here, on the SAME cycle rteTrigger fires (before
+  // excActive/excSquash starts reusing the slot), exactly like sysCapPc is latched
+  // at sysTrigger below.
   val rteCapPc = Reg(UInt(32 bits))
 
   // RTE pop accumulators

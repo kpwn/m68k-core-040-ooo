@@ -235,12 +235,16 @@ object Microcode {
 
   // ═══════════════════════════════════════════════════════════════════════════════
   // LUT-reduction Task A1: `DescBits` (hardware mirror of `Desc`) + `descToBits`
-  // (compile-time Desc -> hardware-literal DescBits). Nothing below consumes these
-  // yet — Task A2 builds `Mem(DescBits(), romSize)` from `descToBits`; Task A3
-  // rewrites `resolve()` into a runtime-hardware `resolveFromBits(d: DescBits, ...)`
-  // gated by Task A4's per-row equivalence test before Task A5 cuts the live decode
-  // path over. See docs/superpowers/specs/2026-08-06-lut-reduction-microcode-rob-
-  // bram-design.md, Feature A.
+  // (compile-time Desc -> hardware-literal DescBits). As of Task A5, `descToBits`
+  // IS live on the production path — its only caller is `DecodeStage.logic`'s
+  // `ucRomMem` init (`DecodeStage.scala`), NOT anything in this file — do not delete
+  // it as dead code just because nothing below in `Microcode.scala` calls it.
+  // `resolveFromBits(d: DescBits, ...)` (below) is the runtime-hardware rewrite of
+  // `resolve()` that reads rows out of that Mem; `resolve()`/`selReg`/`selImm` are
+  // deliberately KEPT as the permanent reference oracle for
+  // `MicrocodeResolveEquivalenceSpec` (Task A4), not production code. See
+  // docs/superpowers/specs/2026-08-06-lut-reduction-microcode-rob-bram-design.md,
+  // Feature A.
   //
   // `Sel`/`UOp`/`Mem`/`Auto`/`Sz` above are plain Scala `sealed trait`/`case object`
   // hierarchies (confirmed by direct read — no pre-existing SpinalEnum anywhere in
@@ -2233,6 +2237,12 @@ object Microcode {
   // NO `default` clause. Where the original had a real `case _` arm the pre-assignment
   // IS that arm; where the original was exhaustive the pre-assignment is dead but
   // harmless (and satisfies SpinalHDL's "combinational signal fully assigned" check).
+  // NOTE: this pre-assignment does NOT guard against an out-of-declared-range row
+  // encoding reaching `resolveFromBits` (SpinalHDL's switch lowering rewrites the
+  // LAST `is` arm into the Verilog `default`, so it provides no real protection for
+  // an undeclared enum value) — the actual safety net against that is Task A5's
+  // `ucNextPc < romSize` simulation-only assertion in `DecodeStage.scala`, which
+  // guards the Mem read address itself rather than anything in this function.
   // ═══════════════════════════════════════════════════════════════════════════════
 
   /** Hardware-typed sibling of `selReg` (selector → (regId, valid)). Identical arm-for-
