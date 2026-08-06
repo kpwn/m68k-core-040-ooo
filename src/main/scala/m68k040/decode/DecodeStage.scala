@@ -1726,6 +1726,20 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         ucEntrySpec.ucEntry)))))))
     ucRealEntry.simPublic()  // debug-only (task #144)
 
+    // LUT-reduction Task A2: the real `Mem(DescBits(), romSize)` (built from
+    // `Microcode.descToBits`, Task A1), relocated HERE (not on the `Microcode` singleton
+    // object) because a SpinalHDL `Mem` hardware node permanently binds to whichever
+    // Component was being elaborated the first time it's constructed — a singleton-owned
+    // `Mem` crashes every 2nd-or-later elaboration in the same JVM session. This `logic`
+    // Area is elaborated fresh every time a `DecodeStage` Component is built, matching the
+    // established, already-safe precedent `GsharePlugin.logic`'s `pht` field
+    // (`Gshare.scala`). NOT YET CONSUMED by production code — `ucResolved`/`ucCurUop`
+    // below still use the compile-time `Microcode.resolve(Desc, ...)` path unchanged;
+    // wiring `ucReadRow` into the live decode path is Task A5 (gated on Task A3/A4).
+    val ucRomMem = Mem(Microcode.DescBits(), Microcode.romSize) init
+      Vector.tabulate(Microcode.romSize)(i => Microcode.descToBits(Microcode.rom(i)))
+    def ucReadRow(addr: UInt): Microcode.DescBits = ucRomMem.readSync(addr)
+
     // Resolve every ROM row against the LATCHED ctx, then index by ucPc -> this cycle's
     // µop (the ROM is a compile-time Scala Vector; resolve each row to hardware + mux).
     val ucResolved = Vec(Microcode.rom.map(d => Microcode.resolve(d, ucCtx, True)))

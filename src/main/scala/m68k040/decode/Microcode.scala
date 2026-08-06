@@ -1674,27 +1674,34 @@ object Microcode {
   val MI_JSR_ENTRY = 198 // rows 198..200 (push retPC -> -(A7), ptr-load, ibranch T0+od(+post-idx))
   def romSize: Int = rom.size
 
-  // LUT-reduction Task A2: real `Mem(DescBits(), romSize)` built from `descToBits`
-  // (Task A1), with a registered (synchronous) read accessor. NOT YET CONSUMED by
-  // any production code — `DecodeStage.scala`'s `ucResolved`/`ucCurUop` still use
-  // the compile-time `Microcode.resolve(Desc, ...)` path unchanged. Wiring this Mem
-  // into the live decode path is Task A5, gated on Task A3 (`resolveFromBits`) and
-  // Task A4's mandatory per-row equivalence test. See docs/superpowers/specs/
-  // 2026-08-06-lut-reduction-microcode-rob-bram-design.md, Feature A, "Timing
-  // analysis" section for why a synchronous read here is latency-neutral once wired.
+  // LUT-reduction Task A2: the real `Mem(DescBits(), romSize)` (built from `descToBits`,
+  // Task A1) does NOT live here. `Microcode` is a plain Scala singleton `object` — its
+  // `val`s are evaluated exactly ONCE PER JVM PROCESS, but a SpinalHDL `Mem` hardware node
+  // permanently binds to whichever Component was being elaborated the first time it's
+  // constructed. A singleton-owned `Mem` therefore crashes every SECOND-OR-LATER
+  // elaboration of any Component that touches it in the same JVM session (this project
+  // builds many separate DecodeStage Component trees per JVM session, e.g. a single
+  // `MicrocodeSpec` run alone builds 4) — reproduced directly (a `HIERARCHY/SCOPE
+  // VIOLATION (OLD NETLIST RE-USED)` error on the 2nd elaboration) before this fix.
   //
-  // `init` syntax matches this codebase's one existing initialized-Mem precedent,
-  // `Gshare.scala`'s `pht` (`Mem(UInt(2 bits), phtEntries) init Seq.fill(...)`) —
-  // a `Seq[T]` of hardware literals following the `Mem(...)` constructor. Here each
-  // element is a `DescBits` hardware-literal bundle built by `descToBits`, which
-  // (per its own doc comment) only ever assigns compile-time-constant fields, so
-  // the result is safe as Mem initial content.
-  val romMem = Mem(DescBits(), romSize) init Vector.tabulate(romSize)(i => descToBits(rom(i)))
-
-  /** Registered (synchronous) read of `romMem` by microcode PC — genuinely maps to
-    * a BRAM read port (no combinational/async read). Signature/call sites for
-    * Task A5; unused today. */
-  def readRow(addr: UInt): DescBits = romMem.readSync(addr)
+  // The Mem construction + its registered-read accessor instead live in
+  // `DecodeStage.logic` (`DecodeStage.scala`, `ucRomMem`/`ucReadRow`), which is
+  // elaborated fresh every time a `DecodeStage` Component is built — matching the
+  // established, already-safe precedent `GsharePlugin.logic`'s `pht` field
+  // (`Gshare.scala`: `val logic = during build new Area { ... val pht = Mem(...) init
+  // Seq.fill(...) ... }`, a per-instance Component Area, not a singleton). `Microcode`
+  // keeps only the genuinely elaboration-safe-to-memoize content: `rom` (a pure
+  // `Vector[Desc]`), `romSize`, and `descToBits` (a pure function producing a fresh
+  // hardware-literal `DescBits` value each call — it doesn't bind a persistent hardware
+  // node, so memoizing IT is fine; only the `Mem` itself was the problem).
+  //
+  // NOT YET CONSUMED by any production code either way — `DecodeStage.scala`'s
+  // `ucResolved`/`ucCurUop` still use the compile-time `Microcode.resolve(Desc, ...)`
+  // path unchanged. Wiring `ucRomMem`/`ucReadRow` into the live decode path is Task A5,
+  // gated on Task A3 (`resolveFromBits`) and Task A4's mandatory per-row equivalence
+  // test. See docs/superpowers/specs/2026-08-06-lut-reduction-microcode-rob-bram-
+  // design.md, Feature A, "Timing analysis" section for why a synchronous read is
+  // latency-neutral once wired.
 
   /** Latched-instruction CONTEXT the engine resolves selectors against. v1 fields
     * (opword..sizeBytesLog) are UNCHANGED so the BCD/ADDX/SUBX chain resolves identically;
