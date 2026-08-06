@@ -1001,4 +1001,74 @@ class RobPluginSpec extends AnyFunSuite {
       }
     }
   }
+
+  // ── Task B2: directed round-trip for the 8 LUT-reduction-B1-folded RobPayload
+  // fields (isRte/sysOp/sysKind/sysReadDir/sysRc/needsSup/first/pc). Task B1 folded
+  // these from standalone Vec.fill(depth)(RegInit(...)) arrays into `payload` (the
+  // same Mem already holding predNextPc/archRegId/intNew/nzvcNew/xNew/retireAlone),
+  // verified there only INDIRECTLY via downstream consumers (rteRetire/sysRetire/
+  // privViolation/...). This test reads p0 DIRECTLY (now simPublic, task B2) with a
+  // distinct, non-default value for every one of the 8 fields, independently checked.
+  test("LUT-reduction B1: all 8 folded RobPayload fields round-trip through the Mem") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      val u = dut.rsrc.logic.src.payload(0)
+      pokeRu(u, pc = 0x00401234L, dstArch = 9, pdstValid = false)
+      // Override the 8 LUT-reduction-B1-folded fields with distinct, non-default
+      // values -- pokeRu itself hardcodes all of these to their "off" defaults.
+      u.isRte #= true
+      u.sysOp #= true
+      u.sysKind #= m68k040.decode.SysKind.MOVEC
+      u.sysReadDir #= true
+      u.needsSupervisor #= true
+      u.firstOfInstr #= true
+      // sysRc rides `imm` (RenamedUop.scala, near the sysOp/sysKind fields: "The MOVEC
+      // Rc id rides `imm`") -- payloadFrom maps p.sysRc := u.imm(11 downto 0).asUInt.
+      u.useImm #= true
+      u.imm #= 0xABC
+
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= false
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 1, "one entry allocated at robId 0")
+
+      // Mark robId 0 complete via completion port 0. `completes` is a registered Vec
+      // (RegInit(False)); empirically (confirmed via instrumentation during this
+      // test's development) the poke needs TWO waitSampling edges to be visibly
+      // reflected in `completes(0)` -- one edge for the sim-side poke of
+      // completion(0).valid/payload to settle onto the net, a second edge for the
+      // register itself to latch `when(c.valid) { completes(c.payload) := True }`.
+      // This matches the same 2-edge shape used by the "P2.7 review fix" test above
+      // (markComplete; waitSampling; clear; waitSampling; THEN assert the derived
+      // sticky register) -- a single edge is NOT enough to observably read back a
+      // freshly-poked completion here.
+      markComplete(dut, 0)
+      cd.waitSampling()
+      cd.waitSampling()
+      clearComplete(dut)
+
+      // headReady = count>0 && completes(h0) && !flushing && !coreHalted -- all four
+      // hold right now (no flush/halt ever asserted in this test). Read p0 in THIS
+      // SAME cycle, with NO further waitSampling before the asserts below -- an
+      // additional edge here would let retire/rteRetire/privViolation (isRte=true and
+      // needsSup=true are both live on this entry, so both would otherwise fire on the
+      // very next edge) advance head/tail past this entry, invalidating p0.
+      assert(dut.rob.logic.completes(0).toBoolean, "completes(0) must be set (test precondition)")
+      assert(dut.rob.logic.count.toInt > 0, "count>0 (test precondition)")
+
+      val p0 = dut.rob.logic.p0
+      assert(p0.pc.toLong == 0x00401234L, f"pc round-trip: got 0x${p0.pc.toLong}%x")
+      assert(p0.isRte.toBoolean, "isRte round-trip")
+      assert(p0.sysOp.toBoolean, "sysOp round-trip")
+      assert(p0.sysKind.toEnum == m68k040.decode.SysKind.MOVEC, s"sysKind round-trip, got ${p0.sysKind.toEnum}")
+      assert(p0.sysReadDir.toBoolean, "sysReadDir round-trip")
+      assert(p0.sysRc.toInt == 0xABC, f"sysRc round-trip: got 0x${p0.sysRc.toInt}%x")
+      assert(p0.needsSup.toBoolean, "needsSup round-trip")
+      assert(p0.first.toBoolean, "first (firstOfInstr) round-trip")
+    }
+  }
 }

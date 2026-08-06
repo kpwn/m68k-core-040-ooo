@@ -435,6 +435,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val h1 = head + 1
     val p0 = payload.readAsync(h0)
     val p1 = payload.readAsync(h1)
+    // debug-only, task B2: expose the raw payload read (incl. the 8 LUT-reduction-B1
+    // folded fields) so a directed test can round-trip-verify them directly instead of
+    // only through derived consumers (rteRetire/sysRetire/privViolation/...). Zero
+    // synthesis cost, same convention as head/tail/count/completes above.
+    p0.simPublic(); p1.simPublic()
     // Commit-time mispredict redirect is a REGISTERED pulse (declared here so the
     // retire guards can gate on it). `flushing` = test flush OR the registered
     // redirect pulse; it drives ONLY pointer/reg resets (no combinational fanout).
