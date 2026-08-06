@@ -2204,4 +2204,425 @@ object Microcode {
     u.firstOfInstr := Bool(d.isFirst)
     u
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // LUT-reduction Task A3: `resolveFromBits` — the RUNTIME-HARDWARE-DECODER twin of
+  // `resolve()` above.
+  //
+  // `resolve()` takes a compile-time Scala `Desc`, so every `match`/`if` on `d`'s
+  // fields collapses at ELABORATION time: each of the ~250 `resolve()` calls in
+  // DecodeStage generates its own dead-code-eliminated fragment specialized to that
+  // one row. That per-row specialization is exactly what makes "resolve all 250 rows
+  // every cycle, then mux" so LUT-expensive.
+  //
+  // `resolveFromBits` takes a `DescBits` (Task A1) — the SAME row data, but as a
+  // RUNTIME hardware value (read from the microcode `Mem`). Every Scala-level branch
+  // therefore becomes its runtime hardware equivalent: `match` -> `switch`, `if/else
+  // if/else` -> `when/elsewhen/otherwise`, value-producing `if` -> `Mux`, Scala `==`
+  // between two case objects -> hardware `===` between two enum values. The LOGIC is
+  // untouched — this is a pure type-level conversion of an already-correct decision
+  // tree, verified 1:1 against `resolve()` by Task A4's mandatory per-row equivalence
+  // test before Task A5 cuts the live decode path over. Every explanatory comment from
+  // `resolve()` is carried across verbatim (they explain WHY a branch exists — load-
+  // bearing institutional knowledge, several of them fuzzer-/ported-test-caught bugs).
+  //
+  // SWITCH-COMPLETENESS CONVENTION used throughout: SpinalHDL rejects an UNREACHABLE
+  // `default` clause on a `switch` whose `is` cases already cover every enum element.
+  // Rather than reason case-by-case about which switches are exhaustive, EVERY switch
+  // below is preceded by a plain default ASSIGNMENT of the target signal(s) and carries
+  // NO `default` clause. Where the original had a real `case _` arm the pre-assignment
+  // IS that arm; where the original was exhaustive the pre-assignment is dead but
+  // harmless (and satisfies SpinalHDL's "combinational signal fully assigned" check).
+  // ═══════════════════════════════════════════════════════════════════════════════
+
+  /** Hardware-typed sibling of `selReg` (selector → (regId, valid)). Identical arm-for-
+    * arm to `selReg`; the Scala `match` on the `Sel` case object becomes a `switch` on
+    * the `SelHw` enum value, and `selReg`'s trailing `case _ => (U(0, 5 bits), False)`
+    * becomes the pre-switch default assignment (see the convention note above).
+    * `selReg` itself is left UNCHANGED — `resolve()` still needs it. */
+  private def selRegHw(sel: SpinalEnumCraft[SelHw.type], ctx: Ctx): (UInt, Bool) = {
+    val reg = UInt(5 bits)
+    val v   = Bool()
+    reg := U(0, 5 bits); v := False        // = selReg's `case _ => (U(0, 5 bits), False)`
+    switch(sel) {
+      is(SelHw.SAy)     { reg := ayReg(ctx);    v := True }
+      is(SelHw.SAx)     { reg := axReg(ctx);    v := True }
+      is(SelHw.ST0)     { reg := U(T0, 5 bits); v := True }
+      is(SelHw.ST1)     { reg := U(T1, 5 bits); v := True }
+      is(SelHw.ST2)     { reg := U(T2, 5 bits); v := True }
+      is(SelHw.ST3)     { reg := U(T3, 5 bits); v := True }
+      is(SelHw.SEaBase) { reg := ctx.eaBase;    v := ctx.eaBaseValid }   // abs modes -> baseValid False (disp-only)
+      is(SelHw.SMiOtherEaBase) { reg := ctx.miOtherEaBase; v := ctx.miOtherEaBaseValid }  // task #119 EA<->EA plain side
+      is(SelHw.SDn2)    { reg := ctx.bfDn2;     v := True }
+      is(SelHw.SMiOther) { reg := ctx.miOther;  v := ctx.miOtherValid }
+      is(SelHw.SCasDc)   { reg := ctx.casDc;    v := True }
+      is(SelHw.SCasDu)   { reg := ctx.casDu;    v := True }
+      is(SelHw.SCas2Rn1) { reg := ctx.cas2Rn1;  v := True }
+      is(SelHw.SCas2Rn2) { reg := ctx.cas2Rn2;  v := True }
+      is(SelHw.SCas2Dc1) { reg := ctx.cas2Dc1;  v := True }
+      is(SelHw.SCas2Du1) { reg := ctx.cas2Du1;  v := True }
+      is(SelHw.SCas2Dc2) { reg := ctx.cas2Dc2;  v := True }
+      is(SelHw.SCas2Du2) { reg := ctx.cas2Du2;  v := True }
+      is(SelHw.SMovesRn) { reg := ctx.movesRn;  v := True }
+      is(SelHw.SBfOffReg) { reg := ctx.bfOffDn; v := True }
+      is(SelHw.SBfOffDyn) { reg := ctx.bfOffDn; v := ctx.bfDo }
+      is(SelHw.SBfWdDyn)  { reg := ctx.bfWdDn;  v := ctx.bfDw }
+      is(SelHw.SBfDn2)    { reg := ctx.bfDn2;   v := True }
+      // read-only result reg = Dn2 (ext[14:12]); written by BFEXTU(1)/BFEXTS(3)/BFFFO(5), NOT BFTST(0).
+      is(SelHw.SBfRdDst)  { reg := ctx.bfDn2;   v := (ctx.bfOp === 1) || (ctx.bfOp === 3) || (ctx.bfOp === 5) }
+      // The (An)+/-(An) write-back target: the base An, valid ONLY when an auto mode is set
+      // (a non-auto / abs EA -> the r2 ADD writes no reg, an inert NOP).
+      is(SelHw.SMovesAn)  { reg := ctx.eaBase;  v := ctx.casAutoMode =/= EaAuto.NONE }
+      is(SelHw.SA7)       { reg := U(15, 5 bits); v := True }   // task #201: the constant A7 stack pointer
+      is(SelHw.SMove16Ay) { reg := ctx.move16Ay;  v := True }   // task #207: MOVE16 dst An (ext word[14:12])
+    }
+    (reg, v)
+  }
+
+  /** Hardware-typed sibling of `selImm` (selector → 32-bit immediate). Identical arm-
+    * for-arm to `selImm`; `selImm`'s trailing `case _ => B(0, 32 bits)` becomes the
+    * pre-switch default assignment. `selImm` itself is left UNCHANGED.
+    *
+    * NOTE: `negDelta`/`posDelta`/`deltaBytesU`/`ayReg`/`axReg` need NO hardware-typed
+    * sibling — they were ALREADY pure hardware functions of `ctx` (+ a hardware `UInt`
+    * reg id); none of them branches on any Scala-level `Desc` field, so they are reused
+    * verbatim here (checked by direct read, not assumed). */
+  private def selImmHw(sel: SpinalEnumCraft[SelHw.type], ctx: Ctx): Bits = {
+    val imm = Bits(32 bits)
+    imm := B(0, 32 bits)                   // = selImm's `case _ => B(0, 32 bits)`
+    switch(sel) {
+      is(SelHw.SNegDeltaAy) { imm := negDelta(ayReg(ctx), ctx) }
+      is(SelHw.SNegDeltaAx) { imm := negDelta(axReg(ctx), ctx) }
+      is(SelHw.SDeltaAy)    { imm := posDelta(ayReg(ctx), ctx) }
+      is(SelHw.SDeltaAx)    { imm := posDelta(axReg(ctx), ctx) }
+      is(SelHw.SEaDispLo)   { imm := ctx.eaDispLo }
+      is(SelHw.SEaDispHi)   { imm := ctx.eaDispHi }
+      is(SelHw.SMiOtherEaDispLo) { imm := ctx.miOtherEaDispLo }   // task #119 EA<->EA plain side
+      is(SelHw.SMiOtherOd)  { imm := ctx.miOtherOd }              // task #204 both-MI: the dst pointer's own od
+      is(SelHw.SBfImm)      { imm := ctx.bfImm }
+      is(SelHw.SMiOd)       { imm := ctx.miOd }
+      is(SelHw.SMiImm)      { imm := ctx.miHostImm }
+      is(SelHw.SCas2Da1)    { imm := ctx.cas2Da1.asBits.resize(32) }   // bit0 = ext1[15] (BIT_1F)
+      is(SelHw.SCas2Da2)    { imm := ctx.cas2Da2.asBits.resize(32) }   // bit0 = ext2[15] (BIT_F)
+      is(SelHw.SMovesDelta) { imm := ctx.movesDelta }                  // signed An write-back delta
+      is(SelHw.SBfResImm)   { imm := ctx.bfResImm }                    // BFRESOLVE imm (slice 3c)
+      is(SelHw.SBfDeltaImm) { imm := B(1, 32 bits) |<< 13 }            // imm[13]=1 -> BFRESOLVE byte-delta mode
+      is(SelHw.SBfPcRelConst) { imm := ctx.bfPcRelConst }              // task #199: pc+4 (PC-rel DO1 byteBase)
+      is(SelHw.SBfMiDispLo) { imm := ctx.bfMiDispLo }                  // task #197: mem-indirect post-deref byteAddr disp
+      is(SelHw.SBfMiDispHi) { imm := ctx.bfMiDispHi }
+      is(SelHw.SPackAdj)    { imm := ctx.packAdj }                     // task #198: PACK/UNPK mem-form adj16
+      is(SelHw.SShift8)     { imm := U(8, 32 bits).asBits }            // task #198: UNPK's high-byte LSR count
+      is(SelHw.SRetPc)      { imm := ctx.nextPc.asBits }               // task #201: JSR-memind's pushed return PC
+      is(SelHw.SImm4)       { imm := U(4, 32 bits).asBits }            // task #207: MOVE16 transfer offset
+      is(SelHw.SImm8)       { imm := U(8, 32 bits).asBits }            // task #207: MOVE16 transfer offset
+      is(SelHw.SImm12)      { imm := U(12, 32 bits).asBits }           // task #207: MOVE16 transfer offset
+      is(SelHw.SImm16)      { imm := U(16, 32 bits).asBits }           // task #207: MOVE16 An += 16 write-back
+    }
+    imm
+  }
+
+  /** Resolve a HARDWARE descriptor (`DescBits`, read from the microcode `Mem`) +
+    * context into a fully-driven DecodedUop. Functionally identical to `resolve(d:
+    * Desc, ...)` for every reachable (row, ctx) combination — see the block comment
+    * above for the transform rules and Task A4 for the equivalence gate. Every field is
+    * assigned (mirrors MicroOpAssembler.movemMoveUop's fully-defaulted shape); `valid`
+    * is driven by the caller. */
+  def resolveFromBits(d: DescBits, ctx: Ctx, valid: Bool): DecodedUop = {
+    val u = DecodedUop()
+    val (srcAReg, srcAV) = selRegHw(d.srcA, ctx)
+    val (srcBReg, srcBV) = selRegHw(d.srcB, ctx)
+    val (dstReg,  dstV)  = selRegHw(d.dst,  ctx)
+    // srcC: an LS row whose `indexFromEa` is set carries the EA index reg; a UBfMem
+    // compute row carries the BFINS insert source (Dn2) via d.srcC; otherwise inert.
+    // Full-format mem-indirect: the PRE-index rides the pointer-load srcC (miPtrIndex &&
+    // !miPost); the POST-index rides the host LS srcC (miHostIndex && miPost).
+    val (srcCRegSel, srcCVSel) = selRegHw(d.srcC, ctx)
+    val miPtrIdxUse  = d.miPtrIndex && !ctx.miPost
+    val miHostIdxUse = d.miHostIndex && ctx.miPost
+    val miIndexUse   = miPtrIdxUse || miHostIdxUse
+    // The original's value-producing Scala if/else-if chain -> a Mux chain (SAME
+    // first-match-wins priority order; note it deliberately differs from the
+    // indexLong/indexScale chain further below, which groups miPtrIndex/miHostIndex
+    // WITH indexFromEa instead of after indexFromMiOtherEa — preserved verbatim).
+    val srcCReg = Mux(d.indexFromEa,          ctx.eaIndexReg,
+                  Mux(d.indexFromMiOtherEa,   ctx.miOtherEaIndexReg,
+                  Mux(d.miPtrIndex || d.miHostIndex, ctx.eaIndexReg, srcCRegSel)))
+    val srcCV   = Mux(d.indexFromEa,          ctx.eaIndexValid,
+                  Mux(d.indexFromMiOtherEa,   ctx.miOtherEaIndexValid,
+                  Mux(d.miPtrIndex || d.miHostIndex, ctx.eaIndexValid && miIndexUse, srcCVSel)))
+
+    u.valid  := valid
+    u.pc     := ctx.pc
+    u.nextPc := ctx.nextPc
+    u.op := DecOp.MOVE                     // pre-switch default (dead: the switch is exhaustive)
+    switch(d.uop) {
+      is(UOpHw.UMove)       { u.op := DecOp.MOVE }
+      is(UOpHw.UAddDrop)    { u.op := DecOp.ADD }
+      is(UOpHw.UOpFromCtx)  { u.op := ctx.op }
+      is(UOpHw.UBfMem)      { u.op := DecOp.BITFIELD }
+      is(UOpHw.UBfReg)      { u.op := DecOp.BITFIELD }
+      is(UOpHw.UBfResolve)  { u.op := DecOp.BFRESOLVE }
+      is(UOpHw.UBfShiftOff) { u.op := DecOp.SHIFT }
+      is(UOpHw.UShiftR8)    { u.op := DecOp.SHIFT }   // task #198: UNPK's high-byte LSR #8
+      is(UOpHw.UBfAdd)      { u.op := DecOp.ADD }
+      is(UOpHw.UMiPtrLoad)  { u.op := DecOp.MOVE }
+      is(UOpHw.UMiHostMove) { u.op := DecOp.MOVE }
+      is(UOpHw.UMiHostOp)   { u.op := ctx.miOp }
+      is(UOpHw.UMiLeaFinal)    { u.op := DecOp.MOVE }     // address-generate (leaAddr short-circuits memOp)
+      is(UOpHw.UMiPushFinal)   { u.op := DecOp.MOVE }     // stack-push store (mirrors pushUop/peaPush)
+      is(UOpHw.UMiBranchFinal) { u.op := DecOp.BRANCH }   // indirect branch (mirrors ibrUop)
+      is(UOpHw.UMovesRead)  { u.op := DecOp.MOVE }   // MOVE T0 -> Rn (sign-ext An / merge Dn in EU)
+      is(UOpHw.UCasOp)      { u.op := DecOp.CASOP }
+    }
+    // The original's `case _ => (d.mem match { case MNone => INT; case _ => LS })` default
+    // arm, hoisted ahead of the switch per the completeness convention.
+    u.cluster := Cluster.LS
+    when(d.mem === MemHw.MNone) { u.cluster := Cluster.INT }
+    switch(d.uop) {
+      is(UOpHw.UBfMem)      { u.cluster := Cluster.INT }  // the bit-field compute runs on the ALU/slow pipe
+      is(UOpHw.UBfReg)      { u.cluster := Cluster.INT }  // register-form bit-field (BFINS prefunnel consumer)
+      is(UOpHw.UBfResolve)  { u.cluster := Cluster.INT }
+      is(UOpHw.UBfShiftOff) { u.cluster := Cluster.INT }
+      is(UOpHw.UBfAdd)      { u.cluster := Cluster.INT }
+      // The §7 host ALU/unary ops (MOVE/ADD/SUB/AND/OR/EOR/CMP/CLR/NEG/NEGX/NOT/TST) all run
+      // on the INT (ALU) pipe; CPLX/CHK/DIV are not full-format mem-indirect hosts in scope.
+      is(UOpHw.UMiHostOp)   { u.cluster := Cluster.INT }
+      // UMiLeaFinal needs the LS-EU's AGU (leaAddr short-circuit, base+imm+scaled-index) —
+      // an explicit override since d.mem=MNone would otherwise default to Cluster.INT
+      // (mirrors the fast-path leaGenUop's `u.cluster := Cluster.LS`). UMiPushFinal
+      // (d.mem=MStore) and UMiBranchFinal (d.mem=MNone -> Cluster.INT, mirrors ibrUop's
+      // own `Cluster.INT`) both already resolve correctly via the pre-switch default above.
+      is(UOpHw.UMiLeaFinal) { u.cluster := Cluster.LS }
+      is(UOpHw.UMovesRead)  { u.cluster := Cluster.INT }  // the MOVES read writeback runs on the ALU pipe
+      is(UOpHw.UCasOp)      { u.cluster := Cluster.INT }  // CAS/CAS2 compute runs on the ALU pipe
+    }
+    // The An write-back ADD is LONG; the BCD chain uses ctx.size; the bit-field chain rows
+    // carry an explicit size (SzLong for lo/compute, SzByte for the hi spill byte).
+    u.size := ctx.size                     // pre-switch default (dead: the nested switch is exhaustive)
+    when(d.uop === UOpHw.UAddDrop) {
+      u.size := Size.LONG
+    } otherwise {
+      switch(d.sz) {
+        is(SzHw.SzLong) { u.size := Size.LONG }
+        is(SzHw.SzWord) { u.size := Size.WORD }
+        is(SzHw.SzByte) { u.size := Size.BYTE }
+        is(SzHw.SzCtx)  { u.size := ctx.size }
+        is(SzHw.SzHost) { u.size := ctx.miHostSize }
+      }
+    }
+    u.memOp := MemOp.NONE                  // pre-switch default (dead: the switch is exhaustive)
+    switch(d.mem) {
+      is(MemHw.MNone)  { u.memOp := MemOp.NONE }
+      is(MemHw.MLoad)  { u.memOp := MemOp.LOAD }
+      is(MemHw.MStore) { u.memOp := MemOp.STORE }
+    }
+    u.srcAReg := srcAReg; u.srcAValid := srcAV
+    u.srcBReg := srcBReg   // srcBValid assigned below (per-row, depends on the host-op kind)
+    u.srcCReg := srcCReg; u.srcCValid := srcCV
+    // The CAS auto STORE writes its int dst = the base An (the (An)+/-(An) side effect), gated
+    // on a non-NONE ctx.casAutoMode; the LS-EU computes An := An ± size per eaAuto. All other
+    // rows take the ROM-selected dst. (Only the STORE writes An — the load's dst is T0.)
+    when(d.auto === AutoHw.AEaCasStore) {
+      u.dstReg   := ctx.eaBase
+      u.dstValid := ctx.casAutoMode =/= EaAuto.NONE
+    } .elsewhen(d.auto === AutoHw.AEaMiOtherStore) {
+      // Mirrors AEaCasStore, keyed to the "other" (plain) side's OWN base register
+      // (task #154) instead of the mem-indirect pointer's ctx.eaBase.
+      u.dstReg   := ctx.miOtherEaBase
+      u.dstValid := ctx.miOtherEaAutoMode =/= EaAuto.NONE
+    } .otherwise {
+      u.dstReg  := dstReg;  u.dstValid  := dstV
+    }
+    // ── useImm / imm / srcBValid / flags — assigned ONCE per row (runtime `when` on d.uop) ──
+    // The `useImm ? selImm(d.imm) : 0` value is IDENTICAL in the three non-UMiHostOp arms
+    // below, so it is hoisted here (one shared selector mux instead of three) — a pure
+    // common-subexpression hoist, no behavior change.
+    val immVal = Mux(d.useImm, selImmHw(d.imm, ctx), B(0, 32 bits))
+    when(d.uop === UOpHw.UMiHostOp) {
+      // The host ALU/MOVE/unary op. srcB is the ROM-selected register (ST1 for MOVE-src's
+      // moved value; SMiOther for an ALU other-Dn) UNLESS the other operand is an immediate
+      // (line-0 imm op -> useImm, srcB not read). A unary single-EA op (CLR/NEG/NOT/TST) has
+      // no other operand (miOtherValid False -> the SMiOther srcB is not read). Flags from ctx.
+      u.useImm     := ctx.miOtherIsImm
+      u.imm        := ctx.miHostImm
+      u.srcBValid  := Mux(ctx.miOtherIsImm, False, srcBV)
+      u.readsNzvc  := ctx.miRNzvc
+      u.readsX     := ctx.miRX
+      u.writesNzvc := ctx.miWNzvc
+      u.writesX    := ctx.miWX
+      // CMP writes NO result register (flags only) — the MI_ALU_SRC row's dst slot
+      // (SMiOther, shared with the writing ALU ops) must not land for a CMP host
+      // (FUZZER-CAUGHT: `cmp.<sz> ([...]),Dn` clobbered Dn with the compare result).
+      // (Ordering preserved: this overrides the dstValid assigned by the d.auto chain above.)
+      when(ctx.miOp === DecOp.CMP) { u.dstValid := False }
+    } .elsewhen(d.uop === UOpHw.UMiHostMove) {
+      // The host MOVE (load-to-Dn / store-from-Dn) sets NZVC per ctx.miWNzvc (miMoveFlags
+      // rows). An intermediate host-load to T1 (ALU-src/RMW) writes NO flags (the host op
+      // µop owns them) -> miMoveFlags False on those rows.
+      u.useImm     := d.useImm
+      u.imm        := immVal
+      u.srcBValid  := srcBV
+      u.readsNzvc  := False
+      u.readsX     := False
+      u.writesNzvc := d.miMoveFlags && ctx.miWNzvc
+      u.writesX    := False
+    } .elsewhen(d.uop === UOpHw.UCasOp) {
+      // CAS/CAS2 compute. srcB (Dc / Du) is always read; srcC (Du / status temp) is set
+      // by the ROM (handled above). The imm (the CAS2.W D/A bit) rides useImm. Flags per
+      // the Desc-carried masks: CASC/CAS2C1/CAS2C2 write NZVC; CAS2C2 also READS NZVC
+      // (to preserve res1 in the !eq1 case). CAS/CAS2 never touch X.
+      // (The UCasOp payload — casForm/casWritesNzvc/casReadsNzvc/casDropCommit — rides as
+      // always-present sibling fields on DescBits, valid only in this arm; the original's
+      // `d.uop.asInstanceOf[UCasOp]` has no hardware equivalent and needs none.)
+      u.useImm     := d.useImm
+      u.imm        := immVal
+      u.srcBValid  := srcBV
+      u.readsNzvc  := d.casReadsNzvc
+      u.readsX     := False
+      u.writesNzvc := d.casWritesNzvc
+      u.writesX    := False
+    } .otherwise {
+      // Flags: the BCD/ADDX/SUBX op µop reads X + old-Z (clear-only Z) + writes NZVCX. The
+      // bit-field RES/LO4 compute writes NZ only (V=C=0, X UNTOUCHED). CMPM's compute
+      // (nzvcOnly) writes NZVC only (no NZVC/X read, X UNTOUCHED — like a register CMP).
+      // Other rows: no flags.
+      u.useImm     := d.useImm
+      u.imm        := immVal
+      u.srcBValid  := srcBV
+      u.readsNzvc  := d.writesFlags
+      u.readsX     := d.writesFlags
+      u.writesNzvc := d.writesFlags || d.bfWritesNz || d.nzvcOnly
+      u.writesX    := d.writesFlags
+    }
+    // task #201: UMiBranchFinal is an indirect branch (mirrors ibrUop); UMiPushFinal is a
+    // stack-push store (mirrors pushUop/peaPush). Every other µcode customer is neither.
+    u.isBranch := d.uop === UOpHw.UMiBranchFinal; u.ibranch := d.uop === UOpHw.UMiBranchFinal
+    u.stkPush  := d.uop === UOpHw.UMiPushFinal;   u.anInc   := 0
+    u.cond := 0; u.branchDisp := 0
+    // bfIllegal: deliver a vector-4 ILLEGAL (the out-of-scope Do=1-at-abs-EA dynamic
+    // RMW/INS forms route here — trap, NOT silent-wrong).
+    u.unimplemented := d.bfIllegal
+    u.faulted := d.bfIllegal; u.faultVector := Mux(d.bfIllegal, U(4, 8 bits), U(0, 8 bits)); u.faultUsesNextPc := False
+    u.faultAddr := ctx.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
+    u.divSigned := False; u.div64 := False
+    // The two An write-back ADDs are DROPPED crack µops (divIsRem): the commit
+    // observation is dropped, but the An write lands in the PRF + is verified by a later
+    // reader (the program reads Ay/Ax into a Dn after the op). Mirrors anUpdUop / LINK.
+    // CAS2's CAS2C1 (the res1 compare) + the two CAS2DC Dc-update µops are likewise DROPPED:
+    // their NZVC/Dc1/Dc2 writes still land + fold (the lock-step reads Dc1/Dc2 back), but
+    // CAS2 maps to exactly ONE oracle step (the kept CAS2C2, which carries the final NZVC).
+    u.divIsRem := (d.uop === UOpHw.UAddDrop) || d.bfDrop || ((d.uop === UOpHw.UCasOp) && d.casDropCommit)
+    u.isChk2   := False
+    // Auto-update: the LOAD carries PREDEC so the LS-EU computes addr = An - eaDelta (the
+    // load does NOT write An — the LS-EU writes An only on an eaAuto STORE). The store
+    // accesses the already-decremented Ax with NO auto. eaDelta is the byte count.
+    u.eaAuto := EaAuto.NONE; u.eaDelta := U(0, 3 bits)   // pre-switch default (dead: the switch is exhaustive)
+    switch(d.auto) {
+      is(AutoHw.ANoAuto)   { u.eaAuto := EaAuto.NONE;    u.eaDelta := U(0, 3 bits) }
+      is(AutoHw.APredecAy) { u.eaAuto := EaAuto.PREDEC;  u.eaDelta := deltaBytesU(ayReg(ctx), ctx) }
+      is(AutoHw.APredecAx) { u.eaAuto := EaAuto.PREDEC;  u.eaDelta := deltaBytesU(axReg(ctx), ctx) }
+      // CMPM (Ay)+,(Ax)+: the LOAD accesses the UNMODIFIED An (LsEuPlugin's POSTINC disp
+      // branch forces disp=0); the An += delta write-back rides the separate dropped ADD
+      // row (mirrors PREDEC's separate write-back row — the load itself writes T0/T1, not An).
+      is(AutoHw.APostincAy) { u.eaAuto := EaAuto.POSTINC; u.eaDelta := deltaBytesU(ayReg(ctx), ctx) }
+      is(AutoHw.APostincAx) { u.eaAuto := EaAuto.POSTINC; u.eaDelta := deltaBytesU(axReg(ctx), ctx) }
+      // CAS (An)+/-(An): the LOAD + STORE carry the latched ctx auto so they compute the
+      // SAME effective address (PREDEC: An-delta; POSTINC: An). For the control modes
+      // casAutoMode=NONE -> inert eaAuto (addr = An + disp + index, the normal CAS EA).
+      is(AutoHw.AEaCasLoad)  { u.eaAuto := ctx.casAutoMode; u.eaDelta := ctx.casAutoDelta }
+      is(AutoHw.AEaCasStore) { u.eaAuto := ctx.casAutoMode; u.eaDelta := ctx.casAutoDelta }
+      // Mem-indirect EA<->EA "other" side (task #154): same LOAD/STORE split as CAS above,
+      // keyed to ctx.miOtherEaAutoMode/Delta instead of ctx.casAutoMode/Delta.
+      is(AutoHw.AEaMiOtherLoad)  { u.eaAuto := ctx.miOtherEaAutoMode; u.eaDelta := ctx.miOtherEaAutoDelta }
+      is(AutoHw.AEaMiOtherStore) { u.eaAuto := ctx.miOtherEaAutoMode; u.eaDelta := ctx.miOtherEaAutoDelta }
+    }
+    u.ccrRestore := False; u.toCcr := False
+    // shiftOp: 0 for every row EXCEPT UShiftR8 (task #198, UNPK's high-byte LSR #8),
+    // which needs the real barrel shifter's LSL/LSR family (tt=01) selected — see
+    // AluEuPlugin's shiftCmd wiring (u1.shiftOp/u1.shiftDir), the SAME mechanism the
+    // standalone movepShiftUop helper already uses for an analogous byte-extract shift.
+    u.shiftOp := Mux(d.uop === UOpHw.UShiftR8, B"01", B"00"); u.shiftDir := False
+    u.bcdSub := ctx.bcdSub
+    // Bit-field RMW compute (UBfMem): op=BITFIELD + bfMem (so the ALU EU funnel datapath
+    // runs) + bfOp (CHG/CLR/SET/INS) from the latched ctx.op + the store-form selector. The
+    // funnel reads bitOff/needHi/width/origOff from the packed bfImm (= u.imm, set above).
+    // isMovea: a MOVES READ writeback to an An (ctx.movesRnIsA) sign-extends the loaded
+    // value to 32 (the moveaResult path, extended to .B for MOVES). A Dn read leaves it
+    // False -> the generic size-merge preserves the upper bits. A mem-indirect MOVEA
+    // host op (ctx.miMovea, MI_MOVE_SRC with an An dst) likewise takes the moveaResult
+    // path (.W sign-extend, full-32 An write). Default False for all others.
+    // BITOP sub-kind: forced 0 (BTST, no-op result) for every OTHER microcode customer
+    // (bitOp is otherwise don't-care for them), but a real mem-indirect BCHG/BCLR/BSET
+    // MUST carry its actual tt through, else AluDatapath's bitRes mux always takes the
+    // BTST arm ("no change") regardless of the real op -- silently turning every
+    // mem-indirect BCHG/BCLR/BSET into a no-op store (task #152).
+    u.bitOp := Mux(ctx.miOp === DecOp.BITOP, ctx.miBitOp, B(0, 2 bits))
+    u.bfDynamic := d.bfDyn
+    // extByte is repurposed here (task #198) as the PACK MEMORY-FORM marker: True only for
+    // this ROM's UOpFromCtx/PACK compute row, telling AluEuPlugin's isPack cone to combine
+    // srcA/srcB (the two predec-loaded bytes) instead of reading a single 16-bit Dy via the
+    // raw rdB port. Safe reuse: the register-form PACK (a single-µop MicroOpAssembler fast
+    // crack, NEVER routed through this ROM) is the field's only other consumer-context, and
+    // it always leaves extByte at its ordinary False default. Every other UOpFromCtx customer
+    // (BCD/ADDX/SUBX/CMPM's CMP/UNPK) ignores extByte entirely (EXT/EXTB's own real meaning
+    // for `extByte` is likewise a different op entirely, never reached via this ROM).
+    u.extByte := (d.uop === UOpHw.UOpFromCtx) && (ctx.op === DecOp.PACK)
+    u.isMovea := False                     // = the original's `case _ => False` arm
+    switch(d.uop) {
+      is(UOpHw.UMovesRead) { u.isMovea := ctx.movesRnIsA }
+      is(UOpHw.UMiHostOp)  { u.isMovea := ctx.miMovea }
+    }
+    // A2 fix: the MOVES write µop (the sole SMovesRn-as-srcB MStore row, µPC45) reads
+    // Rn AND folds the (An)+/-(An) auto write-back into the same atomic store. Compare
+    // the two STATIC (decode-time, opcode-field-derived) register numbers — movesRn
+    // (REG_DA 0..15) vs ctx.eaBase (REG_DA 0..15, An = 8+reg) — both already resolved
+    // by the time resolve() runs; no runtime register VALUE is involved. See DecodedUop
+    // for the full rationale. (The `d.srcB == SMovesRn && d.mem == MStore` row-identity
+    // test is now a hardware `===` pair over the ROM-read enum fields.)
+    u.movesAliasStore := (d.srcB === SelHw.SMovesRn) && (d.mem === MemHw.MStore) &&
+      ctx.movesRnIsA && (ctx.movesRn === ctx.eaBase) && (ctx.casAutoMode =/= EaAuto.NONE)
+    u.bfMem := False; u.bfOp := B(0, 3 bits); u.bfStoreForm := U(0, 3 bits)  // = the original's `case _` arm
+    switch(d.uop) {
+      is(UOpHw.UBfMem) {
+        u.bfMem       := True
+        // bfOp = ctx.bfOp (CHG=2/CLR=4/SET=6/INS=7); a prefunnel row forces bfOp=0 (BFTST)
+        // whose bfMem result IS field32 = (lo<<bitOff)|(needHi?hi>>(8-bitOff):0).
+        u.bfOp        := Mux(d.bfTstForm, B(0, 3 bits), ctx.bfOp)
+        u.bfStoreForm := d.bfStoreForm     // already UInt(3 bits) on DescBits — no U(_, 3 bits) lift needed
+      }
+      is(UOpHw.UBfReg) {
+        u.bfMem       := False           // register form: dy = srcA = field32; offset = packed[4:0] = 0
+        u.bfOp        := ctx.bfOp        // BFINS = 7 (the only UBfReg customer, slice 3c)
+        u.bfStoreForm := U(0, 3 bits)
+      }
+    }
+    u.isScc := False; u.isDbcc := False
+    // Indexed-EA descriptor fields. The bit-field chain and the full-format mem-indirect
+    // pointer/host LS rows carry the EA index (srcC) -> drive its size/scale from Ctx; all
+    // other µcode µops use no index (default inert).
+    when(d.indexFromEa || d.miPtrIndex || d.miHostIndex) {
+      u.indexLong := ctx.eaIndexLong; u.indexScale := ctx.eaIndexScale
+    } .elsewhen(d.indexFromMiOtherEa) {
+      u.indexLong := ctx.miOtherEaIndexLong; u.indexScale := ctx.miOtherEaIndexScale
+    } .otherwise {
+      u.indexLong := False; u.indexScale := 0
+    }
+    // needsSupervisor: set on the FIRST µop of a MOVES (ctx.needsSup) — the ROB delivers a
+    // vector-8 privilege violation if the head retires with committed S==0 (the op does NOT
+    // execute). keepCommit: a ROM row may force-keep its commit (the MOVES write store).
+    // task #201: UMiLeaFinal is an address-generate (leaAddr short-circuit on the LS EU —
+    // mirrors the fast-path leaGenUop). Every other µcode customer is not.
+    u.leaAddr := d.uop === UOpHw.UMiLeaFinal; u.fromCcr := False; u.fromSr := False
+    u.needsSupervisor := ctx.needsSup && d.isFirst
+    u.keepCommit := d.keepCommit
+    // µcode µops are never commit-time system ops (the system ops ride the fast
+    // op-µop builder + the ROB serializing path, not the ROM). Default inert.
+    u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+    u.predTaken := False; u.predTarget := U(0, 32 bits)
+    u.phtValid := False; u.phtIndex := U(0, 11 bits)
+    // CAS/CAS2 compute sub-form (DecOp.CASOP); 0 for every other µop.
+    u.casForm := Mux(d.uop === UOpHw.UCasOp, d.casForm.asBits, B(0, 3 bits))
+    u.firstOfInstr := d.isFirst
+    u
+  }
 }
