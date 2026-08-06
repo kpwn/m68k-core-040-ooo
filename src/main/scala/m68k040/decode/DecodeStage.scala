@@ -1733,20 +1733,44 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // `Mem` crashes every 2nd-or-later elaboration in the same JVM session. This `logic`
     // Area is elaborated fresh every time a `DecodeStage` Component is built, matching the
     // established, already-safe precedent `GsharePlugin.logic`'s `pht` field
-    // (`Gshare.scala`). NOT YET CONSUMED by production code — `ucResolved`/`ucCurUop`
-    // below still use the compile-time `Microcode.resolve(Desc, ...)` path unchanged;
-    // wiring `ucReadRow` into the live decode path is Task A5 (gated on Task A3/A4).
+    // (`Gshare.scala`). LIVE as of Task A5: `ucReadRow` below is the ONLY source of the
+    // executing µcode row (the old 252x `Microcode.resolve(Desc, ...)` + 252-way mux is
+    // gone). `Microcode.resolve()` is deliberately KEPT in Microcode.scala as the trusted
+    // reference oracle for `MicrocodeResolveEquivalenceSpec` (Task A4) — it is a pure
+    // elaboration-time Scala function, so with no production caller it costs zero LUTs.
     val ucRomMem = Mem(Microcode.DescBits(), Microcode.romSize) init
       Vector.tabulate(Microcode.romSize)(i => Microcode.descToBits(Microcode.rom(i)))
     def ucReadRow(addr: UInt): Microcode.DescBits = ucRomMem.readSync(addr)
 
-    // Resolve every ROM row against the LATCHED ctx, then index by ucPc -> this cycle's
-    // µop (the ROM is a compile-time Scala Vector; resolve each row to hardware + mux).
-    val ucResolved = Vec(Microcode.rom.map(d => Microcode.resolve(d, ucCtx, True)))
-    val ucLastVec  = Vec(Microcode.rom.map(d => Bool(d.isLast)))
-    val ucIdx      = ucPc.resize(log2Up(Microcode.romSize))
-    val ucCurUop   = ucResolved(ucIdx)
-    val ucCurLast  = ucLastVec(ucIdx)
+    // ── LUT-reduction Task A5: the LIVE microcode ROM read ────────────────────────
+    // WAS: `Vec(Microcode.rom.map(d => Microcode.resolve(d, ucCtx, True)))` — every one of
+    // the 252 ROM rows elaborated into its OWN full resolve() cone against the live ctx,
+    // then a 252-way Vec mux indexed by ucPc. That is ~252 copies of a wide combinational
+    // decoder, all but one of whose outputs is discarded every cycle: the single largest
+    // LUT consumer in DecodeStage. NOW: ONE synchronous-read BRAM row + ONE
+    // `resolveFromBits` cone (Task A3, proven bit-identical to `resolve()` by
+    // `MicrocodeResolveEquivalenceSpec`, Task A4).
+    //
+    // CYCLE ALIGNMENT (the one property this whole task turns on):
+    //   `ucRomMem.readSync` has ONE cycle of read latency — the address applied in cycle N
+    //   produces the row on the output in cycle N+1. `ucPc` is a Reg whose next value is
+    //   likewise computed combinationally in cycle N and visible in cycle N+1. So the Mem's
+    //   read address must be `ucNextPc` (the "what ucPc becomes NEXT cycle" combinational
+    //   value), NOT the current `ucPc`. Both the Mem's output register and `ucPc`'s Reg are
+    //   fed from the LITERALLY SAME expression on the same clock, so `ucRowBits` in cycle N
+    //   is by construction the row at the index `ucPc` holds in cycle N — exactly what the
+    //   old combinational `ucResolved(ucPc)` delivered. `ucNextPc` is DECLARED here (it is
+    //   the Mem read address) and DRIVEN in the µcode-sequencer transition block below,
+    //   where `pushProduced.ready` exists; it also drives `ucPc` itself, so the two can
+    //   never disagree.
+    //   No combinational loop: `ucNextPc -> mem address -> (registered) ucRowBits ->
+    //   ucCurLast -> ucNextPc` crosses the Mem's output register.
+    // `ucCtx` needs NO such adjustment: it is a Reg latched on ucBegin and constant for the
+    // whole chain, so reading it live (as before) is correct — the old code read the same Reg.
+    val ucNextPc  = UInt(8 bits)
+    val ucRowBits = ucReadRow(ucNextPc.resize(log2Up(Microcode.romSize)))
+    val ucCurUop  = Microcode.resolveFromBits(ucRowBits, ucCtx, True)
+    val ucCurLast = ucRowBits.isLast
 
         val pushProduced = Stream(PushPayload())
     when(movemActive) {
@@ -1979,13 +2003,50 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       movemPendValid  := False
     }
 
+    // ── µcode µPC NEXT-VALUE (LUT-reduction Task A5) ─────────────────────────────
+    // The SINGLE combinational "what ucPc's Reg holds NEXT cycle" value. It is used for
+    // TWO things that must never disagree: (1) it IS `ucPc`'s next value, and (2) it is the
+    // microcode Mem's read address this cycle (readSync = 1-cycle latency; see the ucRowBits
+    // block above). Three cases, identical to the pre-A5 `ucPc :=` chain below:
+    //   (a) ucBegin                                  -> the entry row
+    //   (b) ucActive && ready && !last               -> straight-line advance
+    //   (c) otherwise (idle / stalled / last row)    -> hold
+    // NOTE the ORDER: `when(ucBegin) ... elsewhen(ucActive)` is the same priority as the
+    // transition chain below, and `ucBegin` already requires `!ucActive`, so the two arms
+    // are mutually exclusive anyway.
+    ucNextPc := ucPc                                              // (c) hold
+    when(ucBegin) {
+      ucNextPc := ucRealEntry.resize(8)                           // (a) entry
+    } elsewhen(ucActive) {
+      when(pushProduced.ready && !ucCurLast) { ucNextPc := ucPc + 1 }   // (b) advance
+    }
+    ucPc := ucNextPc   // unconditional: case (c) is literally `ucPc := ucPc`, a no-op
+
+    // SAFETY (permanent, sim-only — requested by Task A3's review). The Mem is
+    // `Mem(DescBits(), romSize)` with romSize NOT a power of two, so its address space is
+    // `2**log2Up(romSize)` wide but only rows [0, romSize) are INITIALIZED. An out-of-range
+    // µPC would read undefined content that could easily decode to `isLast == false` and
+    // walk the sequencer off into garbage — silent wrong-microcode execution. The invariant
+    // (unchanged from the pre-A5 Vec-indexed code, and the exact thing task #178's 7-bit
+    // ucPc truncation bug violated) is: every `ucRealEntry` is a valid row index, and every
+    // reachable straight-line chain hits an `isLast` row before running past the last row.
+    // This assert is the net that catches a future ROM edit that breaks it. Gated on
+    // `ucBegin || ucActive` because `ucPc` has no reset value — while the engine is idle it
+    // holds an arbitrary (in sim, randomized) value that is never used as a live row.
+    GenerationFlags.simulation {
+      assert(!((ucBegin || ucActive) && ucNextPc >= U(Microcode.romSize, 8 bits)),
+        s"DecodeStage: the microcode µPC left the ROM (ucNextPc >= romSize=${Microcode.romSize}) while the µcode engine was entering or running -- either a ucEntry constant is stale/out of range, or a ROM chain ran past its last row without an isLast descriptor. The Mem rows at/above romSize are UNINITIALIZED, so continuing would execute undefined microcode.",
+        FAILURE)
+    }
+
     // ── µcode SEQUENCER transitions (mirror the MOVEM FSM begin/advance/abort) ────
     when(ucBegin) {
-      // Latch the entry context; start emitting next cycle from ucEntry. For a bit-field
-      // RMW the real entry is picked from the latched bfNeedHi (4-byte vs 5-byte chain),
-      // since OperationDecoder is ext-word-free and emitted only the 4-byte default.
+      // Latch the entry context; start emitting next cycle from ucEntry (via ucNextPc
+      // above, which is ALSO this cycle's Mem read address so the entry row lands exactly
+      // when ucPc becomes the entry index). For a bit-field RMW the real entry is picked
+      // from the latched bfNeedHi (4-byte vs 5-byte chain), since OperationDecoder is
+      // ext-word-free and emitted only the 4-byte default.
       ucActive := True
-      ucPc     := ucRealEntry.resize(8)
       ucCtx    := ucEntryCtx
       // A pending slot1 microcoded op is now consumed by this entry.
       when(ucPendValid) { ucPendValid := False }
@@ -2012,7 +2073,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     } elsewhen(ucActive) {
       when(pushProduced.ready) {
         when(ucCurLast) { ucActive := False }       // last µop accepted -> release fed (ucReleaseFed)
-          .otherwise    { ucPc := ucPc + 1 }        // advance the µPC (straight-line)
+        // the straight-line `ucPc + 1` advance now lives in the ucNextPc chain above
       }
     }
     // pipeFlush ABORTS the engine (LAST word, so a flush coinciding with ucBegin still
