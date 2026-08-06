@@ -1674,6 +1674,28 @@ object Microcode {
   val MI_JSR_ENTRY = 198 // rows 198..200 (push retPC -> -(A7), ptr-load, ibranch T0+od(+post-idx))
   def romSize: Int = rom.size
 
+  // LUT-reduction Task A2: real `Mem(DescBits(), romSize)` built from `descToBits`
+  // (Task A1), with a registered (synchronous) read accessor. NOT YET CONSUMED by
+  // any production code — `DecodeStage.scala`'s `ucResolved`/`ucCurUop` still use
+  // the compile-time `Microcode.resolve(Desc, ...)` path unchanged. Wiring this Mem
+  // into the live decode path is Task A5, gated on Task A3 (`resolveFromBits`) and
+  // Task A4's mandatory per-row equivalence test. See docs/superpowers/specs/
+  // 2026-08-06-lut-reduction-microcode-rob-bram-design.md, Feature A, "Timing
+  // analysis" section for why a synchronous read here is latency-neutral once wired.
+  //
+  // `init` syntax matches this codebase's one existing initialized-Mem precedent,
+  // `Gshare.scala`'s `pht` (`Mem(UInt(2 bits), phtEntries) init Seq.fill(...)`) —
+  // a `Seq[T]` of hardware literals following the `Mem(...)` constructor. Here each
+  // element is a `DescBits` hardware-literal bundle built by `descToBits`, which
+  // (per its own doc comment) only ever assigns compile-time-constant fields, so
+  // the result is safe as Mem initial content.
+  val romMem = Mem(DescBits(), romSize) init Vector.tabulate(romSize)(i => descToBits(rom(i)))
+
+  /** Registered (synchronous) read of `romMem` by microcode PC — genuinely maps to
+    * a BRAM read port (no combinational/async read). Signature/call sites for
+    * Task A5; unused today. */
+  def readRow(addr: UInt): DescBits = romMem.readSync(addr)
+
   /** Latched-instruction CONTEXT the engine resolves selectors against. v1 fields
     * (opword..sizeBytesLog) are UNCHANGED so the BCD/ADDX/SUBX chain resolves identically;
     * the v2 group (EA + bit-field static params) is populated at ucBegin from the EaDecoder
