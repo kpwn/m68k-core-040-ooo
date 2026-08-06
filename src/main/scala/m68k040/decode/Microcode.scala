@@ -1695,13 +1695,13 @@ object Microcode {
   // hardware-literal `DescBits` value each call — it doesn't bind a persistent hardware
   // node, so memoizing IT is fine; only the `Mem` itself was the problem).
   //
-  // NOT YET CONSUMED by any production code either way — `DecodeStage.scala`'s
-  // `ucResolved`/`ucCurUop` still use the compile-time `Microcode.resolve(Desc, ...)`
-  // path unchanged. Wiring `ucRomMem`/`ucReadRow` into the live decode path is Task A5,
-  // gated on Task A3 (`resolveFromBits`) and Task A4's mandatory per-row equivalence
-  // test. See docs/superpowers/specs/2026-08-06-lut-reduction-microcode-rob-bram-
-  // design.md, Feature A, "Timing analysis" section for why a synchronous read is
-  // latency-neutral once wired.
+  // As of Task A5, `DecodeStage.scala`'s production path reads `ucRomMem`/`ucReadRow`
+  // via `resolveFromBits` — the compile-time `Microcode.resolve(Desc, ...)` above is no
+  // longer on the production path, but is deliberately KEPT as the reference oracle for
+  // `MicrocodeResolveEquivalenceSpec` (Task A4's permanent regression gate); it is not
+  // dead code to remove. See docs/superpowers/specs/2026-08-06-lut-reduction-microcode-
+  // rob-bram-design.md, Feature A, "Timing analysis" section for why the synchronous
+  // read is latency-neutral as wired.
 
   /** Latched-instruction CONTEXT the engine resolves selectors against. v1 fields
     * (opword..sizeBytesLog) are UNCHANGED so the BCD/ADDX/SUBX chain resolves identically;
