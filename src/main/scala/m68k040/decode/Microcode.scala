@@ -233,6 +233,279 @@ object Microcode {
       isLast:  Boolean = false    // releases `fed`
   )
 
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // LUT-reduction Task A1: `DescBits` (hardware mirror of `Desc`) + `descToBits`
+  // (compile-time Desc -> hardware-literal DescBits). Nothing below consumes these
+  // yet — Task A2 builds `Mem(DescBits(), romSize)` from `descToBits`; Task A3
+  // rewrites `resolve()` into a runtime-hardware `resolveFromBits(d: DescBits, ...)`
+  // gated by Task A4's per-row equivalence test before Task A5 cuts the live decode
+  // path over. See docs/superpowers/specs/2026-08-06-lut-reduction-microcode-rob-
+  // bram-design.md, Feature A.
+  //
+  // `Sel`/`UOp`/`Mem`/`Auto`/`Sz` above are plain Scala `sealed trait`/`case object`
+  // hierarchies (confirmed by direct read — no pre-existing SpinalEnum anywhere in
+  // this codebase for any of them, unlike `DecOp`/`SysKind` in DecodedUop.scala,
+  // which already are SpinalEnums). Each gets a same-named-elements SpinalEnum below,
+  // suffixed `Hw` to keep every hardware enum's element namespace (e.g. `SelHw.SNone`)
+  // distinct from the identically-named compile-time `case object`s (e.g. bare
+  // `SNone`) already in scope in this `object Microcode` — Scala only needs the OUTER
+  // object name to disambiguate a qualified member access, so this is a naming
+  // convention for clarity, not a correctness requirement.
+  // ═══════════════════════════════════════════════════════════════════════════════
+
+  /** Hardware encoding of `Sel` (the operand-selector vocabulary) — one element per
+    * `Sel` case object (54), same names. */
+  object SelHw extends SpinalEnum {
+    val
+        SA7, SAx, SAy, SBfDeltaImm, SBfDn2, SBfImm,
+        SBfMiDispHi, SBfMiDispLo, SBfOffDyn, SBfOffReg, SBfPcRelConst, SBfRdDst,
+        SBfResImm, SBfWdDyn, SCas2Da1, SCas2Da2, SCas2Dc1, SCas2Dc2,
+        SCas2Du1, SCas2Du2, SCas2Rn1, SCas2Rn2, SCasDc, SCasDu,
+        SDeltaAx, SDeltaAy, SDn2, SEaBase, SEaDispHi, SEaDispLo,
+        SImm12, SImm16, SImm4, SImm8, SMiImm, SMiOd,
+        SMiOther, SMiOtherEaBase, SMiOtherEaDispLo, SMiOtherOd, SMove16Ay, SMovesAn,
+        SMovesDelta, SMovesRn, SNegDeltaAx, SNegDeltaAy, SNone, SPackAdj,
+        SRetPc, SShift8, ST0, ST1, ST2, ST3 = newElement()
+  }
+
+  /** Hardware encoding of `UOp` (the µop-template vocabulary) — one element per
+    * `UOp` case object (16), plus `UCasOp` as a single TAG element: unlike every
+    * other `UOp` case, the real `UCasOp` is a Scala CASE CLASS carrying its own
+    * sub-payload (`form: Int, writesNzvc/readsNzvc/dropCommit: Boolean`) — a
+    * SpinalEnum element cannot itself carry a payload, so `DescBits` below adds 4
+    * sibling fields (`casForm`/`casWritesNzvc`/`casReadsNzvc`/`casDropCommit`),
+    * valid only when `uop === UOpHw.UCasOp`. This mirrors the existing `Desc` idiom
+    * of siblings-to-`uop` payload fields for other per-kind extra data (e.g.
+    * `bfStoreForm` for `UBfMem`, `miPtrIndex` for `UMiPtrLoad`) — UCasOp's payload
+    * just happens to already be bundled into the Scala case class instead of being
+    * separate `Desc` fields. */
+  object UOpHw extends SpinalEnum {
+    val
+        UMove, UAddDrop, UOpFromCtx, UBfMem, UBfResolve, UBfShiftOff,
+        UBfAdd, UBfReg, UMiPtrLoad, UMiHostMove, UMiHostOp, UMiLeaFinal,
+        UMiPushFinal, UMiBranchFinal, UShiftR8, UMovesRead, UCasOp = newElement()
+  }
+
+  /** Hardware encoding of `Mem` (memory role) — one element per case object (3). */
+  object MemHw extends SpinalEnum {
+    val MNone, MLoad, MStore = newElement()
+  }
+
+  /** Hardware encoding of `Auto` (PREDEC/POSTINC auto-update kind) — one element
+    * per case object (9). */
+  object AutoHw extends SpinalEnum {
+    val
+        ANoAuto, APredecAy, APredecAx, APostincAy, APostincAx, AEaCasLoad,
+        AEaCasStore, AEaMiOtherLoad, AEaMiOtherStore = newElement()
+  }
+
+  /** Hardware encoding of `Sz` (explicit µop size override) — one element per case
+    * object (5). */
+  object SzHw extends SpinalEnum {
+    val SzCtx, SzLong, SzWord, SzByte, SzHost = newElement()
+  }
+
+  /** Hardware mirror of `Desc` (one ROM row). Every `Desc` field appears here,
+    * same name, hardware-typed: `SpinalEnum`s above for `UOp`/`Mem`/`Auto`/`Sel`/
+    * `Sz`, `Bool()` for each `Boolean` field, `UInt` sized to the field's actual
+    * used range for the one `Int` field (`bfStoreForm`). Plus the 4 `UCasOp`
+    * payload fields described on `UOpHw` above (not a `Desc` field itself — `Desc`
+    * only has `uop: UOp`, and `UCasOp`'s payload rides inside that one Scala value).
+    *
+    * Width note (`bfStoreForm`, `casForm`): both sized `UInt(3 bits)`, verified
+    * against real call-site usage, not guessed:
+    *   - `bfStoreForm`: `Microcode.rom` rows use values 0-6 (0=RES,1=LO4,2=LO5,
+    *     3=HI5,4=LO5RAW,5=HI5RAW,6=FFOFULL — the FFOFULL row comment only lists
+    *     0-5 but two live rows, µPC65/µPC190, pass 6). The EXISTING hardware sink
+    *     (`DecodedUop.bfStoreForm`, `DecodedUop.scala:344`, and `resolve()`'s own
+    *     `u.bfStoreForm := U(d.bfStoreForm, 3 bits)`, `Microcode.scala:1863`)
+    *     already commits to 3 bits (covers 0-7) — matched here, not re-derived.
+    *   - `casForm`: `CasForm` (`DecodedUop.scala:471`) defines CASS=0..CAS2SEL=5;
+    *     the existing sink `DecodedUop.casForm` (`DecodedUop.scala:467`) and
+    *     `resolve()`'s `B(co.form, 3 bits)` (`Microcode.scala:1899`) already commit
+    *     to 3 bits — matched here.
+    */
+  case class DescBits() extends Bundle {
+    val uop  = UOpHw()
+    val mem  = MemHw()
+    val auto = AutoHw()
+    val srcA = SelHw()
+    val srcB = SelHw()
+    val srcC = SelHw()    // 3rd operand: BFINS insert source (Dn2) for the RES/LO4 compute
+    val dst  = SelHw()
+    val useImm = Bool()
+    val imm    = SelHw()  // when useImm, the imm comes from this selector
+    val sz     = SzHw()   // explicit µop size (SzCtx = ctx.size, the BCD default)
+    val writesFlags = Bool()  // reads X+old-Z, writes NZVCX (the op µop)
+    val nzvcOnly    = Bool()  // writes NZVC only (X UNTOUCHED, no NZVC/X read) — CMPM
+    val indexFromEa = Bool()  // LS row: srcC + indexLong/indexScale come from Ctx EA
+    val indexFromMiOtherEa = Bool()  // LS row: srcC + indexLong/indexScale come from
+                                      // Ctx.miOtherEa* (task #119 EA<->EA plain side)
+    val bfStoreForm = UInt(3 bits)  // UBfMem: 0=RES,1=LO4,2=LO5,3=HI5,4=LO5RAW,5=HI5RAW,6=FFOFULL
+    val bfWritesNz  = Bool()  // UBfMem/UBfReg: this compute writes the NZ flags (RES / LO4 / BFINS)
+    val bfDyn       = Bool()  // UBfMem/UBfReg: set bfDynamic (read packed {bitOff/width} via srcC, slice 3c)
+    val bfTstForm   = Bool()  // UBfMem: force bfOp=0 (BFTST) — the prefunnel emits field32 as its result
+    val bfDrop      = Bool()  // divIsRem: DROP this µop's oracle-step observation (its reg/NZVC writes
+                               // still land+fold)
+    val bfIllegal   = Bool()  // deliver an ILLEGAL (vector-4) µop — BFINS mem-dynamic is DEFERRED (gated)
+    val miPtrIndex  = Bool()  // UMiPtrLoad: add the PRE-index (eaIndex) to the pointer addr
+    val miHostIndex = Bool()  // UMiHostMove LS row: add the POST-index (eaIndex) to (T0+od)
+    val miMoveFlags = Bool()  // UMiHostMove: this IS the host MOVE (sets NZVC per ctx.miWNzvc)
+    val keepCommit  = Bool()  // force-keep the macro commit (a no-flags store that IS the single
+                               // oracle step, e.g. the MOVES write store) — overrides the EaAutoDrop /
+                               // RMW-store DROP in the whitebox
+    val isFirst = Bool()  // firstOfInstr (the macro boundary)
+    val isLast  = Bool()  // releases `fed`
+    // `UCasOp`'s payload (see `UOpHw` doc above) — valid only when uop === UOpHw.UCasOp.
+    val casForm       = UInt(3 bits)  // CasForm.{CASS..CAS2SEL} = 0..5
+    val casWritesNzvc = Bool()
+    val casReadsNzvc  = Bool()
+    val casDropCommit = Bool()
+  }
+
+  /** Compile-time `Desc` -> hardware-literal `DescBits`, a direct 1:1 field mapping.
+    * Runs at Scala elaboration time (called once per ROM row when building the
+    * `Mem`'s initial content in Task A2) — every field is assigned a literal
+    * (constant) hardware value, so the result is safe to use as `Mem` initial
+    * content (no dependency on any runtime/live signal). */
+  def descToBits(d: Desc): DescBits = {
+    val b = DescBits()
+
+    val (uopHw, casF, casWn, casRn, casDc): (SpinalEnumElement[UOpHw.type], Int, Boolean, Boolean, Boolean) =
+      d.uop match {
+        case UMove          => (UOpHw.UMove, 0, false, false, false)
+        case UAddDrop       => (UOpHw.UAddDrop, 0, false, false, false)
+        case UOpFromCtx     => (UOpHw.UOpFromCtx, 0, false, false, false)
+        case UBfMem         => (UOpHw.UBfMem, 0, false, false, false)
+        case UBfResolve     => (UOpHw.UBfResolve, 0, false, false, false)
+        case UBfShiftOff    => (UOpHw.UBfShiftOff, 0, false, false, false)
+        case UBfAdd         => (UOpHw.UBfAdd, 0, false, false, false)
+        case UBfReg         => (UOpHw.UBfReg, 0, false, false, false)
+        case UMiPtrLoad     => (UOpHw.UMiPtrLoad, 0, false, false, false)
+        case UMiHostMove    => (UOpHw.UMiHostMove, 0, false, false, false)
+        case UMiHostOp      => (UOpHw.UMiHostOp, 0, false, false, false)
+        case UMiLeaFinal    => (UOpHw.UMiLeaFinal, 0, false, false, false)
+        case UMiPushFinal   => (UOpHw.UMiPushFinal, 0, false, false, false)
+        case UMiBranchFinal => (UOpHw.UMiBranchFinal, 0, false, false, false)
+        case UShiftR8       => (UOpHw.UShiftR8, 0, false, false, false)
+        case UMovesRead     => (UOpHw.UMovesRead, 0, false, false, false)
+        case co: UCasOp     => (UOpHw.UCasOp, co.form, co.writesNzvc, co.readsNzvc, co.dropCommit)
+      }
+    b.uop           := uopHw
+    b.casForm       := U(casF, 3 bits)
+    b.casWritesNzvc := Bool(casWn)
+    b.casReadsNzvc  := Bool(casRn)
+    b.casDropCommit := Bool(casDc)
+
+    b.mem := (d.mem match {
+      case MNone  => MemHw.MNone
+      case MLoad  => MemHw.MLoad
+      case MStore => MemHw.MStore
+    })
+
+    b.auto := (d.auto match {
+      case ANoAuto         => AutoHw.ANoAuto
+      case APredecAy       => AutoHw.APredecAy
+      case APredecAx       => AutoHw.APredecAx
+      case APostincAy      => AutoHw.APostincAy
+      case APostincAx      => AutoHw.APostincAx
+      case AEaCasLoad       => AutoHw.AEaCasLoad
+      case AEaCasStore      => AutoHw.AEaCasStore
+      case AEaMiOtherLoad   => AutoHw.AEaMiOtherLoad
+      case AEaMiOtherStore  => AutoHw.AEaMiOtherStore
+    })
+
+    def sel(s: Sel): SpinalEnumElement[SelHw.type] = s match {
+      case SA7 => SelHw.SA7
+      case SAx => SelHw.SAx
+      case SAy => SelHw.SAy
+      case SBfDeltaImm => SelHw.SBfDeltaImm
+      case SBfDn2 => SelHw.SBfDn2
+      case SBfImm => SelHw.SBfImm
+      case SBfMiDispHi => SelHw.SBfMiDispHi
+      case SBfMiDispLo => SelHw.SBfMiDispLo
+      case SBfOffDyn => SelHw.SBfOffDyn
+      case SBfOffReg => SelHw.SBfOffReg
+      case SBfPcRelConst => SelHw.SBfPcRelConst
+      case SBfRdDst => SelHw.SBfRdDst
+      case SBfResImm => SelHw.SBfResImm
+      case SBfWdDyn => SelHw.SBfWdDyn
+      case SCas2Da1 => SelHw.SCas2Da1
+      case SCas2Da2 => SelHw.SCas2Da2
+      case SCas2Dc1 => SelHw.SCas2Dc1
+      case SCas2Dc2 => SelHw.SCas2Dc2
+      case SCas2Du1 => SelHw.SCas2Du1
+      case SCas2Du2 => SelHw.SCas2Du2
+      case SCas2Rn1 => SelHw.SCas2Rn1
+      case SCas2Rn2 => SelHw.SCas2Rn2
+      case SCasDc => SelHw.SCasDc
+      case SCasDu => SelHw.SCasDu
+      case SDeltaAx => SelHw.SDeltaAx
+      case SDeltaAy => SelHw.SDeltaAy
+      case SDn2 => SelHw.SDn2
+      case SEaBase => SelHw.SEaBase
+      case SEaDispHi => SelHw.SEaDispHi
+      case SEaDispLo => SelHw.SEaDispLo
+      case SImm12 => SelHw.SImm12
+      case SImm16 => SelHw.SImm16
+      case SImm4 => SelHw.SImm4
+      case SImm8 => SelHw.SImm8
+      case SMiImm => SelHw.SMiImm
+      case SMiOd => SelHw.SMiOd
+      case SMiOther => SelHw.SMiOther
+      case SMiOtherEaBase => SelHw.SMiOtherEaBase
+      case SMiOtherEaDispLo => SelHw.SMiOtherEaDispLo
+      case SMiOtherOd => SelHw.SMiOtherOd
+      case SMove16Ay => SelHw.SMove16Ay
+      case SMovesAn => SelHw.SMovesAn
+      case SMovesDelta => SelHw.SMovesDelta
+      case SMovesRn => SelHw.SMovesRn
+      case SNegDeltaAx => SelHw.SNegDeltaAx
+      case SNegDeltaAy => SelHw.SNegDeltaAy
+      case SNone => SelHw.SNone
+      case SPackAdj => SelHw.SPackAdj
+      case SRetPc => SelHw.SRetPc
+      case SShift8 => SelHw.SShift8
+      case ST0 => SelHw.ST0
+      case ST1 => SelHw.ST1
+      case ST2 => SelHw.ST2
+      case ST3 => SelHw.ST3
+    }
+    b.srcA := sel(d.srcA)
+    b.srcB := sel(d.srcB)
+    b.srcC := sel(d.srcC)
+    b.dst  := sel(d.dst)
+    b.imm  := sel(d.imm)
+
+    b.sz := (d.sz match {
+      case SzCtx  => SzHw.SzCtx
+      case SzLong => SzHw.SzLong
+      case SzWord => SzHw.SzWord
+      case SzByte => SzHw.SzByte
+      case SzHost => SzHw.SzHost
+    })
+
+    b.useImm             := Bool(d.useImm)
+    b.writesFlags         := Bool(d.writesFlags)
+    b.nzvcOnly            := Bool(d.nzvcOnly)
+    b.indexFromEa         := Bool(d.indexFromEa)
+    b.indexFromMiOtherEa  := Bool(d.indexFromMiOtherEa)
+    b.bfStoreForm         := U(d.bfStoreForm, 3 bits)
+    b.bfWritesNz          := Bool(d.bfWritesNz)
+    b.bfDyn               := Bool(d.bfDyn)
+    b.bfTstForm           := Bool(d.bfTstForm)
+    b.bfDrop              := Bool(d.bfDrop)
+    b.bfIllegal           := Bool(d.bfIllegal)
+    b.miPtrIndex          := Bool(d.miPtrIndex)
+    b.miHostIndex         := Bool(d.miHostIndex)
+    b.miMoveFlags         := Bool(d.miMoveFlags)
+    b.keepCommit          := Bool(d.keepCommit)
+    b.isFirst             := Bool(d.isFirst)
+    b.isLast              := Bool(d.isLast)
+
+    b
+  }
+
   /** The ROM (index = µPC). v1 has one customer family (BCD/ADDX/SUBX mem). The op kind
     * (BCD vs ADDX vs SUBX), size, and bcdSub come from the CONTEXT, so ONE 6-row sequence
     * serves all four mem forms (they differ only in ctx fields). */
