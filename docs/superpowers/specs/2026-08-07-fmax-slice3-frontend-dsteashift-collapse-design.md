@@ -1,6 +1,52 @@
 # FMax closure, Slice 3: collapse slot-1's chained dst-EA shift barrels (design)
 
-## POST-IMPLEMENTATION CORRECTIONS (read this first)
+## THIS SLICE WAS REVERTED — 2026-08-07 (read this first)
+
+**Status: REVERTED.** Revert commit `df13342`
+("fmax: REVERT Slice 3 (frontend slot-1 dst-EA chained-shift collapse)").
+The RTL and interface changes described below are **no longer in the tree**;
+the affected files are byte-identical to `b6888f6` (Slice 2's final state).
+
+**Why.** The slice landed on probation with an explicit, pre-stated revert
+criterion — "the first thing to revert ... if the combined gate disappoints"
+(`.superpowers/sdd/progress-fmax-slice3.md`). The combined Slice-2 + Slice-3
+post-route gate disappointed:
+
+| configuration | commit | post-route WNS | post-route FMax |
+|---|---|---|---|
+| Slice 1 alone | `9d2f6a7` | -1.987 ns | 167.029 MHz |
+| Slice 2 alone | `e086a71` | -1.702 ns | **175.377 MHz** |
+| Slice 3 alone | `1b64ccc` | -1.967 ns | 167.588 MHz |
+| **Slice 2 + Slice 3** | `254eaf8` | **-2.215 ns** | **160.90 MHz** |
+
+The combined tip was slower than any slice measured alone — **-14.48 MHz
+against Slice 2 alone**, and even below the Slice-1 baseline both were
+measured against. Slice 2's own target fully succeeded (its critical-path
+family went from 87/100 to 0/100 of the worst post-route endpoints), but the
+frontend dst-EA cone — *this slice's* target — got WORSE in combination and
+ended up owning 65 of the top-100 worst endpoints including the #1 spot. OOC
+regressed in the same direction (-2.985 ns combined vs -1.920 ns for Slice 2
+alone), so the result is not purely placement noise. This is consistent with
+the mechanism correction already recorded below: the designed mechanism was
+disproven from the netlist, so there was never a mechanism to defend.
+
+**What was kept** (neither depends on this slice's RTL): the `EaDecoder.scala`
+comment correction (Minor-1 below — a stale pre-existing claim, independently
+confirmed wrong), and the exhaustive 65536-opword dst-EA contract sweep, folded
+into `OperationDecoderSpec` since it pins a permanent `OperationDecoder`
+invariant rather than anything about the collapse.
+
+**Still open, and the real lever**: the `moveLineSize` follow-on named in the
+"Real lever for this cone" bullet below (`spec.size` on the MOVE lines is
+literally `op[15:12]`, so reading it directly drops the ~1.2 ns
+`OperationDecoder` table out of the `L0 -> dstEa` cone). That was always the
+larger effect by two orders of magnitude and is untouched by this revert.
+The follow-on should also treat **slot 0** as a first-class target — the
+combined gate found it co-equal with slot 1 (29 vs 36 of the top-100 worst
+endpoints) and the *longer* cone at 25 logic levels; no slice has ever
+addressed it.
+
+## POST-IMPLEMENTATION CORRECTIONS (from the original landing; retained for the record)
 
 Implementation (commit `1b64ccc`) and an independent review both found this
 spec wrong in three material ways. The RTL landed anyway — see
