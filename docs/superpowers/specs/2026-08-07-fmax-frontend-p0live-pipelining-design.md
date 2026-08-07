@@ -130,6 +130,44 @@ when(flushCondition) {           // whatever this project's existing flush signa
                                    // flush lands exactly on an ambiguous head
 ```
 
+**CORRECTION (post-implementation, post-review — read this before implementing
+from this spec):** the flush-only invalidation gate sketched above is
+**INSUFFICIENT and was found to be a genuine bug** during Task 1's
+implementation, independently re-derived and empirically confirmed by the
+task reviewer. It only handles the cycle where the aligner is ALREADY
+stalled on an ambiguous head (where, as argued above, the head is provably
+immutable). It does **not** handle the cycle where the aligner TRANSITIONS
+INTO a newly-ambiguous head: a non-ambiguous instruction at the head is
+consumed and shifted out normally (no flush occurs), and the NEW head is
+ambiguous — but `p0LiveReg` still holds the OLD head's fully-resolved
+`classify()` result from the prior cycle, which `Aligner` would then wrongly
+consume as the new instruction's framing. This is a silent mis-frame, the
+same bug class as this project's historical wild-PC bugs (tasks #202/#209).
+
+The actual, implemented, independently-reviewed-and-confirmed-correct
+invalidation condition is a 3-term gate, not flush alone:
+
+```scala
+val p0LiveInvalidate = ibuf.io.flush || (ibuf.io.shift =/= 0) ||
+                       (ibuf.io.push.fire && (ibuf.io.cnt < U(4, ibuf.io.cnt.getWidth bits)))
+when(p0LiveInvalidate) {
+  p0LiveReg.ambiguousLine := True
+}
+```
+
+derived from the fact that `classify()`'s only hardware inputs are
+`ibuf.io.head(0..3)` and three `avail`-derived saturating valid flags
+(`avail>=2/3/4`), and these can only change via: (1) `flush` — resets
+everything (kept for defense-in-depth even though provably redundant with
+(2)/(3) once `push`/`shift` re-fire post-flush); (2) `shift != 0` — advances
+`headPtr`, covering exactly the transition-into-newly-ambiguous case above;
+(3) a `push` that lands in logical words 0..3 (`cnt < 4`) — covers every
+`avail` change that can move a valid flag, since the flags saturate at
+`avail>=4`. See `FetchAlignPlugin.scala`'s own comment block above this gate
+(added alongside the fix) for the full derivation, and the review record in
+`.superpowers/sdd/progress-fmax-p0live.md` for the empirical proof (reverting
+to the flush-only gate reproduces a decisive test failure).
+
 And in `Aligner.align` (`Aligner.scala`), change the signature to accept the
 registered value as an additional parameter (rather than computing `p0Live`
 inside `align` itself), e.g.:

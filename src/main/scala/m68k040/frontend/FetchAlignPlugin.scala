@@ -341,8 +341,18 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // an explicit "not resolved" that lands in `Aligner`'s pre-existing
     // `.elsewhen(p0.ambiguousLine)` stall arm — i.e. architecturally behaviour-identical
     // to the old same-cycle code, costing only a bounded handful of extra stall cycles on
-    // the already-rare, already-multi-cycle-tolerant ambiguous-head case (during such a
-    // stall `feed.fire` is False so shift==0, and `cnt` grows past 4 within one push).
+    // the already-rare, already-multi-cycle-tolerant ambiguous-head case. During such a
+    // stall `shift` stays 0 (no feed.fire on a stalled head — note this is the ordinary
+    // no-fault stall path; it does not need to reason about fault-packet overrides
+    // elsewhere in `Aligner`, since those only affect what gets EMITTED, not whether the
+    // IBuf head itself advances); `cnt` may cross 4 over more than one push while stalled
+    // (each push can land at most `n<=4` words), which is exactly why condition 3 is
+    // checked on `push.fire` every cycle rather than assumed to resolve in one shot.
+    //
+    // `flush` (condition 1) is provably redundant with `push`/`shift` becoming true again
+    // after a flush (a flush alone doesn't change `head`/`avail` until the next push or
+    // shift touches them) — kept anyway as explicit defense-in-depth so a reset-to-known-
+    // state is never load-bearing on the other two conditions' exact timing.
     //
     // NB the design spec's simpler argument ("the IBuf head entry is immutable while the
     // aligner stalls on ambiguousLine") is true but NOT sufficient on its own: it does not
