@@ -9,16 +9,33 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class AlignerSpec extends AnyFunSuite {
   class Dut extends Component {
-    val headPc = in UInt(32 bits)
-    val words  = in Vec(Bits(16 bits), Aligner.WINDOW)
-    val preds  = in Vec(ChunkPredecode(), Aligner.WINDOW)
-    val avail  = in UInt(4 bits)
-    val res    = out(Aligner.Result())
-    res := Aligner.align(headPc, words, preds, avail)
+    val headPc    = in UInt(32 bits)
+    val words     = in Vec(Bits(16 bits), Aligner.WINDOW)
+    val preds     = in Vec(ChunkPredecode(), Aligner.WINDOW)
+    val avail     = in UInt(4 bits)
+    // FMax closure slice 1 (2026-08-07): the live head re-classify is no longer computed
+    // inside `Aligner.align`; it is registered in FetchAlignPlugin and passed in.
+    val p0LiveReg = in(ChunkPredecode())
+    val res       = out(Aligner.Result())
+    res := Aligner.align(headPc, words, preds, avail, p0LiveReg)
   }
-  def setAll(dut: Dut, simple: Boolean, len: Int): Unit =
-    for (i <- 0 until Aligner.WINDOW) { dut.words(i) #= 0; dut.preds(i).simple #= simple; dut.preds(i).lenWords #= len }
-  def setPred(dut: Dut, i: Int, simple: Boolean, len: Int): Unit = { dut.preds(i).simple #= simple; dut.preds(i).lenWords #= len }
+  // `setAll` also drives every ChunkPredecode field (incl. the new `ambiguousLine`, which
+  // must default False so the existing tests exercise the plain `preds(0)` path) and puts
+  // `p0LiveReg` in its "not resolved yet" reset shape — every `in` port must be driven or
+  // SpinalSim reads X/garbage.
+  def setAll(dut: Dut, simple: Boolean, len: Int): Unit = {
+    for (i <- 0 until Aligner.WINDOW) {
+      dut.words(i) #= 0
+      dut.preds(i).simple #= simple; dut.preds(i).lenWords #= len; dut.preds(i).ambiguousLine #= false
+    }
+    setP0Live(dut, simple = false, len = 0, ambiguous = true)
+  }
+  def setPred(dut: Dut, i: Int, simple: Boolean, len: Int, ambiguous: Boolean = false): Unit = {
+    dut.preds(i).simple #= simple; dut.preds(i).lenWords #= len; dut.preds(i).ambiguousLine #= ambiguous
+  }
+  def setP0Live(dut: Dut, simple: Boolean, len: Int, ambiguous: Boolean): Unit = {
+    dut.p0LiveReg.simple #= simple; dut.p0LiveReg.lenWords #= len; dut.p0LiveReg.ambiguousLine #= ambiguous
+  }
 
   test("two adjacent 1-word simple ops -> 2-wide", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
@@ -91,6 +108,75 @@ class AlignerSpec extends AnyFunSuite {
         assert(dut.res.slot0.words(i).toInt == (0xA000 + i),
           f"word $i must survive intact: got 0x${dut.res.slot0.words(i).toInt}%04x exp 0x${0xA000 + i}%04x")
       }
+    }
+  }
+
+  // ── FMax closure slice 1 (2026-08-07): `p0LiveReg` consume semantics ─────────────
+  // The live re-classify of an `ambiguousLine` head (task #202) is no longer computed
+  // inside `align`; it is REGISTERED in FetchAlignPlugin and passed in. These three
+  // tests pin the Mux's contract at the `Aligner` boundary.
+
+  test("p0LiveReg slice-1: ambiguous head NOT yet resolved -> stall (no slot0, shift=0)", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      dut.headPc #= 0x7000
+      setAll(dut, simple = true, len = 1)
+      // Baked prediction says "simple, len=1" but flags it as a GUESS.
+      setPred(dut, 0, simple = true, len = 1, ambiguous = true)
+      // The registered live reclassify has not resolved it yet.
+      setP0Live(dut, simple = true, len = 1, ambiguous = true)
+      dut.avail #= 10   // plenty of words: the ONLY reason to stall is the ambiguity
+      sleep(1)
+      assert(!dut.res.slot0Valid.toBoolean, "must not emit an unresolved ambiguous head")
+      assert(!dut.res.slot1Valid.toBoolean, "slot1 must not be emitted either")
+      assert(dut.res.stall.toBoolean && dut.res.shiftWords.toInt == 0,
+        "must stall with shift=0 so the IBuf head cannot advance while unresolved")
+      assert(!dut.res.complex.toBoolean, "an unresolved ambiguous head is not a complex packet")
+    }
+  }
+
+  test("p0LiveReg slice-1: ambiguous head RESOLVED -> slot0 uses p0LiveReg, not preds(0)", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      dut.headPc #= 0x7100
+      setAll(dut, simple = true, len = 1)
+      // Baked (GUESSED, deliberately WRONG) prediction: "brief format, 1 word".
+      setPred(dut, 0, simple = true, len = 1, ambiguous = true)
+      // Registered live reclassify RESOLVED it: it is really a 3-word full-format EA
+      // (this is the real pea_memind shape: 0x4874 / 0x0164 / 0x0020).
+      setP0Live(dut, simple = true, len = 3, ambiguous = false)
+      for (i <- 0 until Aligner.WINDOW) dut.words(i) #= (0xB000 + i)
+      dut.avail #= 10
+      sleep(1)
+      assert(dut.res.slot0Valid.toBoolean, "resolved ambiguous head must emit")
+      assert(dut.res.slot0.lenWords.toInt == 3,
+        s"must take p0LiveReg's len (3), not preds(0)'s guess (1): got ${dut.res.slot0.lenWords.toInt}")
+      assert(dut.res.slot0.wordCount.toInt == 3, s"wordCount=${dut.res.slot0.wordCount.toInt}")
+      assert(!dut.res.slot0.complex.toBoolean && dut.res.slot0.simple.toBoolean,
+        "p0LiveReg.simple=true must select the simple-packet arm")
+      // slot1 starts at head+L0 words, i.e. preds(3) (len=1 from setAll) -> pc = +6, shift = 4.
+      assert(dut.res.slot1Valid.toBoolean && dut.res.slot1.pc.toLong == 0x7106,
+        s"slot1 pc=${dut.res.slot1.pc.toLong.toHexString} (slot1 must be framed off p0LiveReg's L0)")
+      assert(dut.res.shiftWords.toInt == 4, s"shift=${dut.res.shiftWords.toInt}")
+    }
+  }
+
+  test("p0LiveReg slice-1: NON-ambiguous head IGNORES p0LiveReg entirely", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      dut.headPc #= 0x7200
+      setAll(dut, simple = true, len = 1)
+      // Head's baked prediction is trustworthy: 3 words, NOT a guess.
+      setPred(dut, 0, simple = true, len = 3, ambiguous = false)
+      // p0LiveReg holds a stale/unrelated value that would produce a visibly different
+      // (wrong) answer if the Mux ever consumed it in the non-ambiguous case: it claims
+      // COMPLEX + len 7, which would route to the complex arm instead of a 3-word simple
+      // packet.
+      setP0Live(dut, simple = false, len = 7, ambiguous = false)
+      dut.avail #= 10
+      sleep(1)
+      assert(dut.res.slot0Valid.toBoolean && dut.res.slot0.simple.toBoolean && !dut.res.complex.toBoolean,
+        "non-ambiguous head must use preds(0) (simple), never p0LiveReg (complex)")
+      assert(dut.res.slot0.lenWords.toInt == 3,
+        s"must take preds(0)'s len (3), not p0LiveReg's (7): got ${dut.res.slot0.lenWords.toInt}")
+      assert(dut.res.shiftWords.toInt == 4, s"shift=${dut.res.shiftWords.toInt}")
     }
   }
 }

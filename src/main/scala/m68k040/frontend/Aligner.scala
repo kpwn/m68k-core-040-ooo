@@ -17,7 +17,13 @@ object Aligner {
     val complex    = Bool()
   }
 
-  def align(headPc: UInt, words: Vec[Bits], preds: Vec[ChunkPredecode], avail: UInt): Result = {
+  /** `p0LiveReg`: the REGISTERED live re-classification of the buffer head (see the task
+    * #202 comment block below, and FetchAlignPlugin's `p0LiveReg` for the mechanism +
+    * its head-window-change invalidation). Guaranteed by construction to be EITHER
+    * bit-identical to a same-cycle `PredecodeWord.classify()` of THIS cycle's
+    * `words`/`avail`, OR `ambiguousLine=True` ("not resolved yet" -> stall). */
+  def align(headPc: UInt, words: Vec[Bits], preds: Vec[ChunkPredecode], avail: UInt,
+            p0LiveReg: ChunkPredecode): Result = {
     val r = Result()
 
     // Default-assign all packet fields to don't-care first
@@ -57,12 +63,26 @@ object Aligner {
     // FetchAlignPlugin's `ic.cmd.valid`, not gated on this stall), so `avail` keeps
     // growing until it genuinely resolves — no new hang, bounded by HEAD_WORDS=10 >> the
     // <=3-word lookahead any single case needs. Selected by a single bit (`ambiguousLine`
-    // is False for the overwhelming majority of instructions), but see the commit
-    // message / task202 report for the synth-gate verdict on whether instantiating a 2nd
-    // classify() here is FMax-safe on this front-end-critical path.
-    val p0Live = PredecodeWord.classify(words(0), words(1), words(2), words(3),
-      extWValid = avail >= U(2, 4 bits), extW2Valid = avail >= U(3, 4 bits), extW3Valid = avail >= U(4, 4 bits))
-    val p0 = Mux(preds(0).ambiguousLine, p0Live, preds(0))
+    // is False for the overwhelming majority of instructions).
+    //
+    // FMax closure slice 1 (2026-08-07): that live re-classify is NO LONGER computed here.
+    // It lives in `FetchAlignPlugin` and is REGISTERED (`p0LiveReg`, passed in) rather than
+    // consumed same-cycle. Rationale: STA had to charge the FULL depth of a second real
+    // `classify()` decoder against `L0`'s arrival time for EVERY instruction (the Mux's
+    // select is a runtime bit STA cannot prove almost-always-false), and `L0` feeds nearly
+    // the whole rest of the front-end critical path (slot-1 PC, the realignment barrel, the
+    // BTB query, `effShift`, `decodePcNext`, the IBuf shift amount). A direct attribution
+    // measurement (not a guess) put this at ~1.6ns of this core's post-route FMax
+    // shortfall. See
+    // `docs/superpowers/specs/2026-08-07-fmax-frontend-p0live-pipelining-design.md`.
+    // ARCHITECTURALLY this is behaviour-preserving: FetchAlignPlugin invalidates
+    // `p0LiveReg` (forces `ambiguousLine=True`) on EVERY change of the classify inputs
+    // (`words(0..3)` / the avail-derived valid flags), so the value seen here is either
+    // exactly what a same-cycle classify() would have produced, or "not resolved yet" —
+    // which lands in the identical `.elsewhen(p0.ambiguousLine)` stall arm below. The only
+    // observable difference is at most a couple of extra stall cycles on the already-rare,
+    // already-multi-cycle-tolerant ambiguous-head case.
+    val p0 = Mux(preds(0).ambiguousLine, p0LiveReg, preds(0))
     val L0 = p0.lenWords  // UInt(4 bits)
 
     when(avail === 0) {
@@ -156,14 +176,14 @@ object Aligner {
         //
         // task #209 (bf_memind_dyn_straddle wild-PC): `p1` comes STRAIGHT from the
         // statically-baked, per-64-byte-line `preds` array (baked ONCE at IcachePlugin
-        // REFILL time) with NO live-reclassify equivalent to slot0's `p0Live` above (task
-        // #202) and — critically — with no `ambiguousLine` check at all. When the
+        // REFILL time) with NO live-reclassify equivalent to slot0's `p0LiveReg` above
+        // (task #202) and — critically — with no `ambiguousLine` check at all. When the
         // candidate slot1 instruction's OWN opword lands on the LAST word of its 64-byte
         // I-cache line, its extension-word lookahead (needed to disambiguate brief- vs
         // full-format mode-6/mode7-reg3 EAs) falls past the line boundary at bake time,
         // so the baked prediction is a GUESSED "assume brief" with `ambiguousLine=True` —
-        // exactly the case task #202 fixed for slot0 via `p0Live`, but slot1 was never
-        // given the same treatment. Trusting that guessed (too-short) `L1` here silently
+        // exactly the case task #202 fixed for slot0 via the live reclassify, but slot1
+        // was never given the same treatment. Trusting that guessed (too-short) `L1` here silently
         // truncates the real instruction, leaving its own trailing extension word(s)
         // behind as bogus "leftover" bytes the next fetch mis-decodes as a stray
         // instruction — confirmed via PORTED_TRACE_MI/PORTED_TRACE_FED/PORTED_TRACE_EXC
@@ -173,7 +193,7 @@ object Aligner {
         // safe fix, mirroring the `p0.ambiguousLine` stall arm above: refuse to pack an
         // ambiguous prediction into slot1 this cycle at all (`slot1Ok=False`) — the
         // candidate instruction is re-attempted as the NEXT cycle's `headPc` instead,
-        // where it goes through the exact `p0Live` live-reclassify path and resolves
+        // where it goes through the exact `p0LiveReg` live-reclassify path and resolves
         // correctly once `avail` has grown enough (bounded, same as every other
         // `ambiguousLine` stall in this file — no new livelock risk). Costs at most one
         // extra front-end bubble on the rare cache-line-boundary case; zero effect on

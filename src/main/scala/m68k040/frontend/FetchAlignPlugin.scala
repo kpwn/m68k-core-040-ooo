@@ -1,6 +1,6 @@
 package m68k040.frontend
 
-import m68k040.cache.{FetchCmd, FetchRsp}
+import m68k040.cache.{ChunkPredecode, FetchCmd, FetchRsp}
 import m68k040.services.{DecodeFeedService, FetchService}
 import spinal.core._
 import spinal.lib._
@@ -311,8 +311,66 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       ringCount := (ringCount - 1).resized
     }
 
+    // ---- p0LiveReg: REGISTERED live re-classify of the buffer head ----
+    // (FMax closure slice 1, 2026-08-07 —
+    //  docs/superpowers/specs/2026-08-07-fmax-frontend-p0live-pipelining-design.md)
+    //
+    // Computed EVERY cycle from the LIVE (unregistered) head words/avail — the identical
+    // `PredecodeWord.classify()` call `Aligner.align` used to run combinationally on its
+    // own `L0` consume path (see that file's task #202 comment block for the full
+    // rationale this preserves). The ONLY change: the result now lands in a REGISTER,
+    // consumed by `Aligner.align` one cycle later, instead of being charged against
+    // `L0`'s arrival time same-cycle for every instruction.
+    //
+    // CORRECTNESS (this is the load-bearing part — see below for why the design spec's
+    // "the head is immutable while stalled" argument alone is NOT sufficient):
+    // `classify()`'s effective inputs here are exactly (a) `ibuf.io.head(0..3)` and
+    // (b) the three avail-derived Bool valid flags, which SATURATE at avail>=4 (they are
+    // avail>=2 / >=3 / >=4). A registered value is therefore reusable next cycle iff
+    // NEITHER can have changed. `ibuf.io.head(i)` is `entries[(headPtr+i) mod BUF]` gated
+    // to 0 for `i >= count`, so head(0..3) / the valid flags can only change via:
+    //   1. `flush`      — resets headPtr/count.
+    //   2. `shift != 0` — advances headPtr (shift is only ever nonzero on a feed.fire).
+    //   3. a `push` that lands in logical words 0..3, i.e. `cnt < 4` (a push writes
+    //      logical `cnt .. cnt+n-1`); this ALSO covers every avail change that can move a
+    //      valid flag, since `avail = min(cnt, HEAD_WORDS)` and the flags saturate at 4.
+    // A push with `cnt >= 4` writes only beyond word 3 and leaves all three flags true —
+    // provably no effect on this classify.
+    // Forcing `ambiguousLine := True` ("not resolved yet") on exactly that union makes
+    // `p0LiveReg` EITHER bit-identical to a same-cycle classify of the current head, OR
+    // an explicit "not resolved" that lands in `Aligner`'s pre-existing
+    // `.elsewhen(p0.ambiguousLine)` stall arm — i.e. architecturally behaviour-identical
+    // to the old same-cycle code, costing only a bounded handful of extra stall cycles on
+    // the already-rare, already-multi-cycle-tolerant ambiguous-head case (during such a
+    // stall `feed.fire` is False so shift==0, and `cnt` grows past 4 within one push).
+    //
+    // NB the design spec's simpler argument ("the IBuf head entry is immutable while the
+    // aligner stalls on ambiguousLine") is true but NOT sufficient on its own: it does not
+    // cover the cycle the aligner TRANSITIONS INTO an ambiguous head (the previous cycle's
+    // non-ambiguous head was emitted + shifted out, so a bare register would still hold
+    // the PREVIOUS instruction's fully-resolved classify and `Aligner` would consume it as
+    // this instruction's length — a silent mis-frame). Condition 2 above is what closes
+    // that; conditions 1/3 close the flush and buffer-refill equivalents.
+    //
+    // `ibuf.io.flush`/`ibuf.io.shift` are plain nets driven further down this same Area;
+    // SpinalHDL resolves them as single nets, so reading them here sees their final value.
+    // No combinational loop: they only reach `p0LiveReg`'s D input (through the register).
+    val p0LiveReg = Reg(ChunkPredecode())
+    p0LiveReg.simple        init False
+    p0LiveReg.lenWords      init 0
+    p0LiveReg.ambiguousLine init True    // reset state must never read as "already resolved"
+    p0LiveReg := PredecodeWord.classify(ibuf.io.head(0), ibuf.io.head(1), ibuf.io.head(2), ibuf.io.head(3),
+      extWValid  = ibuf.io.avail >= U(2, 4 bits),
+      extW2Valid = ibuf.io.avail >= U(3, 4 bits),
+      extW3Valid = ibuf.io.avail >= U(4, 4 bits))
+    val p0LiveInvalidate = ibuf.io.flush || (ibuf.io.shift =/= 0) ||
+                           (ibuf.io.push.fire && (ibuf.io.cnt < U(4, ibuf.io.cnt.getWidth bits)))
+    when(p0LiveInvalidate) {
+      p0LiveReg.ambiguousLine := True
+    }
+
     // ---- Aligner: combinational decode of buffer head ----
-    val res = Aligner.align(decodePc, ibuf.io.head, ibuf.io.headPred, ibuf.io.avail)
+    val res = Aligner.align(decodePc, ibuf.io.head, ibuf.io.headPred, ibuf.io.avail, p0LiveReg)
     spinal.core.sim.SimPublic(ibuf.io.headPred(0).simple, ibuf.io.head(0))
 
     // ── Fetch-time prediction (BTB + bimodal, slice 1) ───────────────────────────
