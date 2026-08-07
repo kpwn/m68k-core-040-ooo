@@ -86,9 +86,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // collapses to a select. Pure-function of the opword+words -> byte-identical to decoding
     // the registered packet in `assemble`.
     fedIn.payload.specs(0)   := MicroOpAssembler.computeOffload(df.feed.payload(0))
-    // Slot 1 uses the slice-3 collapsed-shift overload (raw window + L0) — see its comment
-    // in MicroOpAssembler: byte-identical dstEa, one dynamic mux instead of two chained.
-    fedIn.payload.specs(1)   := MicroOpAssembler.computeOffload(df.feed.payload(1), df.slot1RawWords, df.slot1L0)
+    fedIn.payload.specs(1)   := MicroOpAssembler.computeOffload(df.feed.payload(1))
     df.feed.ready := fedIn.ready
 
     val fed = PipeStage(fedIn, pipeFlush)

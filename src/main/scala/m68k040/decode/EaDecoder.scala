@@ -18,9 +18,9 @@ object EaDecoder {
   // Dynamically select words(idx) for a full-format OD position (idx ∈ {2,3,4,5}),
   // bounded by the actual Vec length. Some callers (e.g. immEa/immDstEa, the bf/CMP2
   // re-decodes) pass only 3 entries -- those EAs never carry a full-format OD, so the
-  // out-of-range candidates read 0 for them. `MicroOpAssembler.shiftedWordsFor` (the
-  // caller for slot-1's dstEa, FMax closure slice 3) passes the FULL 10-word window, so
-  // for THAT caller this dynamic read is real and live over the whole idx ∈ {2..5} range
+  // out-of-range candidates read 0 for them. But `MicroOpAssembler.shiftedWordsFor` (the
+  // dstEa caller in `computeOffload`) passes the FULL 10-word window, so for THAT caller
+  // this dynamic read is real and live over the whole idx ∈ {2..5} range
   // -- do not assume "only 3 entries" holds for every caller when reasoning about this fn.
   private def fOdWordAt(words: Vec[Bits], idx: UInt): Bits = {
     val n = words.length

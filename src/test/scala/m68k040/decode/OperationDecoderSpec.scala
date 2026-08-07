@@ -321,4 +321,97 @@ class OperationDecoderSpec extends AnyFunSuite {
   test("0xF5C0 (F5xx, op[7:6]=11): not PFLUSH-family, not PTEST -> illegal", VerilatorTest) {
     run(0xF5C0) { dut => assert(dut.o.illegal.toBoolean) }
   }
+
+  /** EXHAUSTIVE dst-EA placement contract — a permanent, load-bearing invariant of
+    * `OperationDecoder` that `MicroOpAssembler` depends on but nothing else tests.
+    *
+    * Two claims, both swept over ALL 65536 opwords:
+    *
+    *   1. `dst.kind === EADST  ==>  opword(15 downto 12) in {1, 2, 3}`
+    *      i.e. plain MOVE.B/.W/.L is the ONLY family that architecturally consumes a
+    *      destination EA. `MicroOpAssembler.scala`'s `usesDstEa` is *literally* this
+    *      predicate, and it is the gate on every `dstEa`-derived decision there
+    *      (`crackStore`, `crackMemMem`, and the `dstOk` legality check). Any reasoning
+    *      about which extension words a dst EA may read — including the framing
+    *      guarantee that a MOVE's dst extension words live inside its own instruction
+    *      length — rests on this being true.
+    *
+    *   2. `srcA.kind`/`srcB.kind` are NEVER `EADST`. `MicroOpAssembler` has
+    *      `is(OperandKind.EADST)` arms in its srcA/srcB operand routing that read
+    *      `dstEa` WITHOUT the `usesDstEa` gate; those are safe today only because
+    *      `OperationDecoder` puts its single `eadst` value in `o.dst` and nowhere else.
+    *      That is an unstated premise everywhere else, so pin it here.
+    *
+    * A future opcode adding `o.dst := eadst` outside lines {1,2,3}, or routing `eadst`
+    * into a source slot, would silently invalidate those arguments with no other test
+    * failing.
+    *
+    * This RUNS TO COMPLETION and REPORTS COUNTS — violations are accumulated, never
+    * thrown at the first mismatch. (The project has been burned by `PredecodeWordSpec`'s
+    * "exhaustive" test, which aborts at its first mismatch and so silently
+    * under-reports; do not repeat that.) Non-vacuity is self-evident from the reported
+    * histogram and pinned by the exact-count asserts at the end: the invariant is
+    * satisfied by *matching* lines 1/2/3, not by "EADST never happens".
+    */
+  test("EXHAUSTIVE 65536-opword contract: dst.kind === EADST only on MOVE line nibbles, never in a source slot", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      var swept         = 0
+      var eadstCount    = 0
+      var srcAEadst     = 0
+      var srcBEadst     = 0
+      val lineHisto     = Array.fill(16)(0)
+      val violations    = scala.collection.mutable.ArrayBuffer[Int]()
+      val srcViolations = scala.collection.mutable.ArrayBuffer[Int]()
+
+      for (op <- 0 until 65536) {
+        dut.opword #= op
+        sleep(1)
+        if (dut.o.dst.kind.toEnum == OperandKind.EADST) {
+          eadstCount += 1
+          val line = (op >> 12) & 0xF
+          lineHisto(line) += 1
+          if (line != 1 && line != 2 && line != 3) violations += op    // accumulate, DO NOT abort
+        }
+        if (dut.o.srcA.kind.toEnum == OperandKind.EADST) { srcAEadst += 1; if (srcViolations.size < 64) srcViolations += op }
+        if (dut.o.srcB.kind.toEnum == OperandKind.EADST) { srcBEadst += 1; if (srcViolations.size < 64) srcViolations += op }
+        swept += 1
+      }
+
+      assert(swept == 65536, s"sweep did not run to completion: only $swept opwords")
+      val histo = (0 until 16).filter(lineHisto(_) > 0)
+                              .map(l => f"line$l%x=${lineHisto(l)}").mkString(" ")
+      println(s"[dstEa-contract] EXHAUSTIVE opword sweep: swept $swept/65536 opwords to completion; " +
+              s"dst.kind===EADST on $eadstCount of them; per-line histogram: $histo; " +
+              s"line-nibble violations: ${violations.size}; " +
+              s"srcA-EADST: $srcAEadst, srcB-EADST: $srcBEadst")
+
+      // (`violations.size == 0` rather than `.isEmpty`: ScalaTest's assert macro would
+      // otherwise dump the whole ArrayBuffer -- up to thousands of opwords -- ahead of the
+      // clue. Verified against a deliberate mutation: `1024 did not equal 0` + the clue.)
+      assert(violations.size == 0,
+        s"DST-EA CONTRACT BROKEN: ${violations.size} opword(s) set spec.dst.kind===EADST OUTSIDE the " +
+        s"MOVE line nibbles {1,2,3}. MicroOpAssembler's `usesDstEa` is exactly this predicate and gates " +
+        s"every dstEa-derived decision there (crackStore, crackMemMem, dstOk legality), including the " +
+        s"assumption that a dst EA's extension words lie inside the instruction's own framing. " +
+        s"Re-derive those arguments before adding this opcode. First 16 offending opwords: " +
+        s"${violations.take(16).map(o => f"0x$o%04X").mkString(",")}")
+
+      assert(srcAEadst == 0 && srcBEadst == 0,
+        s"OperationDecoder now routes EADST into a SOURCE operand slot ($srcAEadst srcA, $srcBEadst srcB). " +
+        s"MicroOpAssembler's srcA/srcB `is(OperandKind.EADST)` arms read dstEa WITHOUT the usesDstEa gate, " +
+        s"so every blast-radius argument about dstEa reads must be re-derived for those. First offenders: " +
+        s"${srcViolations.take(16).map(o => f"0x$o%04X").mkString(",")}")
+
+      // Exactness / non-vacuity. OperationDecoder's sole `o.dst := eadst` site is
+      // UNCONDITIONAL inside `is(0x1, 0x3, 0x2)`, so every one of the 3*4096 MOVE-line
+      // opwords must hit it and nothing else may. A deliberate narrowing (e.g. carving a
+      // sub-encoding out of a MOVE line) is still contract-safe -- update this expectation
+      // and say why. A count of 0 would mean the sweep is vacuous and proves nothing.
+      assert(eadstCount == 3 * 4096,
+        s"expected exactly ${3 * 4096} dst-EADST opwords (the whole of lines 1/2/3), got $eadstCount " +
+        s"(histogram: $histo)")
+      assert(lineHisto(1) == 4096 && lineHisto(2) == 4096 && lineHisto(3) == 4096,
+        s"MOVE lines are not uniformly dst-EADST (histogram: $histo)")
+    }
+  }
 }
