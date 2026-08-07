@@ -72,6 +72,19 @@ class MicroOpAssemblerOffloadSpec extends AnyFunSuite {
     private def eaOk(e: EaSpec): Bool = (e.klass === EaClass.DATAREG) || (e.klass === EaClass.ADDRREG)
     val dstEaOkMatch = out(Bool()); dstEaOkMatch := eaOk(oldOff.dstEa) === eaOk(newOff.dstEa)
 
+    // ── Slice-3 CONDITIONAL-INVARIANT observation points (test 4) ────────────────
+    // `usesDstEa` in MicroOpAssembler is literally `spec.dst.kind === OperandKind.EADST`;
+    // it is the gate under which every WORDS-DEPENDENT dstEa field is consumed. Expose it
+    // so the sweep can bind it to the opcode line nibble. Also expose the srcA/srcB kinds:
+    // MicroOpAssembler has `is(OperandKind.EADST)` arms in its srcA/srcB routing too, and
+    // those read `dstEa` WITHOUT `usesDstEa` — they are safe today only because
+    // OperationDecoder never puts EADST in a source slot (its single `eadst` value is
+    // assigned to `o.dst` and nowhere else). That is an unstated premise of the same
+    // argument, so the sweep pins it down as well.
+    val dstKindIsEadst  = out(Bool()); dstKindIsEadst  := oldOff.spec.dst.kind  === OperandKind.EADST
+    val srcAKindIsEadst = out(Bool()); srcAKindIsEadst := oldOff.spec.srcA.kind === OperandKind.EADST
+    val srcBKindIsEadst = out(Bool()); srcBKindIsEadst := oldOff.spec.srcB.kind === OperandKind.EADST
+
     // Decoded-value observation (independent "is it actually right" check).
     val dstDisp      = out(Bits(32 bits)); dstDisp := newOff.dstEa.disp
     val dstOd        = out(Bits(32 bits)); dstOd   := newOff.dstEa.od
@@ -258,6 +271,98 @@ class MicroOpAssemblerOffloadSpec extends AnyFunSuite {
       println(s"[slice3] unconditional spec/srcEa/dstEaOk identity over 4000 random points OK " +
               s"(dstEa raw-bit diffs seen in provably-unread beyond-L1 region: " +
               s"$otherDiff non-MOVE-line, $moveLineDiff MOVE-line-with-mismatched-L1)")
+    }
+  }
+
+  /** TEST 4 — the automated guard for slice 3's one CONDITIONAL premise.
+    *
+    * Tests 1-3 prove the collapse is bit-identical wherever `dstEa`'s words-dependent
+    * fields are read. WHY they are only read there is a separate claim, and until this
+    * test existed it was a COMMENT (see `MicroOpAssembler.computeOffload`'s 3-arg
+    * overload): "`spec.dst.kind === EADST` — the gate on every words-dependent dstEa
+    * consumer — is set at exactly one site, inside the MOVE.B/.W/.L line-nibble arm".
+    * A future opcode adding `o.dst := eadst` outside lines {1,2,3} would silently
+    * invalidate slice 3 with no existing test failing. This sweep turns that premise
+    * into an enforced invariant:
+    *
+    *     dst.kind === EADST  ==>  opword(15 downto 12) in {1, 2, 3}
+    *
+    * Enumerated over ALL 65536 opwords. It RUNS TO COMPLETION and REPORTS COUNTS —
+    * violations are accumulated, never thrown at the first mismatch. (The project has
+    * been burned by `PredecodeWordSpec`'s "exhaustive" test, which aborts at its first
+    * mismatch and so silently under-reports; do not repeat that.)
+    *
+    * Non-vacuity is self-evident from the reported histogram: the invariant is
+    * satisfied by *matching* lines 1/2/3, not by "EADST never happens".
+    */
+  test("slice3: EXHAUSTIVE 65536-opword guard -- dst.kind === EADST only on MOVE line nibbles", VerilatorTest) {
+    compiled.doSim { dut =>
+      // `oldOff.spec` is `OperationDecoder.decode(pkt.words(0))` — a pure function of
+      // word 0 alone. With L0=0 / L1=WINDOW, `pkt.words(0)` is `rawWords(0)`, so the
+      // opword is swept by poking that one input; the rest of the window is held at
+      // distinctive non-zero filler (never all-zero, so a harness slip that decoded the
+      // wrong index would show up as a wrong count, not as a silent pass).
+      for (i <- 0 until W) dut.rawWords(i) #= FILL_POST(i % FILL_POST.length)
+      dut.l0 #= 0
+      dut.l1 #= W
+
+      var swept        = 0
+      var eadstCount   = 0
+      var srcAEadst    = 0
+      var srcBEadst    = 0
+      val lineHisto    = Array.fill(16)(0)
+      val violations   = scala.collection.mutable.ArrayBuffer[Int]()
+      val srcViolations= scala.collection.mutable.ArrayBuffer[Int]()
+
+      for (op <- 0 until 65536) {
+        dut.rawWords(0) #= op
+        sleep(1)
+        if (dut.dstKindIsEadst.toBoolean) {
+          eadstCount += 1
+          val line = (op >> 12) & 0xF
+          lineHisto(line) += 1
+          if (line != 1 && line != 2 && line != 3) violations += op     // accumulate, DO NOT abort
+        }
+        if (dut.srcAKindIsEadst.toBoolean) { srcAEadst += 1; if (srcViolations.size < 64) srcViolations += op }
+        if (dut.srcBKindIsEadst.toBoolean) { srcBEadst += 1; if (srcViolations.size < 64) srcViolations += op }
+        swept += 1
+      }
+
+      assert(swept == 65536, s"sweep did not run to completion: only $swept opwords")
+      val histo = (0 until 16).filter(lineHisto(_) > 0)
+                              .map(l => f"line$l%x=${lineHisto(l)}").mkString(" ")
+      println(s"[slice3] EXHAUSTIVE opword guard: swept $swept/65536 opwords to completion; " +
+              s"dst.kind===EADST on $eadstCount of them; per-line histogram: $histo; " +
+              s"line-nibble violations: ${violations.size}; " +
+              s"srcA-EADST: $srcAEadst, srcB-EADST: $srcBEadst")
+
+      // (`violations.size == 0` rather than `.isEmpty`: ScalaTest's assert macro would
+      // otherwise dump the whole ArrayBuffer -- up to thousands of opwords -- ahead of the
+      // clue. Verified against a deliberate mutation: `1024 did not equal 0` + the clue.)
+      assert(violations.size == 0,
+        s"SLICE-3 INVARIANT BROKEN: ${violations.size} opword(s) set spec.dst.kind===EADST OUTSIDE the " +
+        s"MOVE line nibbles {1,2,3}. Every words-dependent dstEa field is gated on exactly this " +
+        s"predicate, and the slot-1 collapse in MicroOpAssembler.computeOffload(pkt, rawWords, l0) is " +
+        s"only sound because such reads stay inside the L1 region a MOVE's own framing guarantees. " +
+        s"Re-derive that argument (or revert the collapse) before adding this opcode. First 16 " +
+        s"offending opwords: ${violations.take(16).map(o => f"0x$o%04X").mkString(",")}")
+
+      assert(srcAEadst == 0 && srcBEadst == 0,
+        s"OperationDecoder now routes EADST into a SOURCE operand slot ($srcAEadst srcA, $srcBEadst srcB). " +
+        s"MicroOpAssembler's srcA/srcB `is(OperandKind.EADST)` arms read dstEa WITHOUT the usesDstEa gate, " +
+        s"so slice 3's blast-radius argument must be re-derived for those reads. First offenders: " +
+        s"${srcViolations.take(16).map(o => f"0x$o%04X").mkString(",")}")
+
+      // Exactness / non-vacuity. OperationDecoder's sole `o.dst := eadst` site is
+      // UNCONDITIONAL inside `is(0x1, 0x3, 0x2)`, so every one of the 3*4096 MOVE-line
+      // opwords must hit it and nothing else may. A deliberate narrowing (e.g. carving a
+      // sub-encoding out of a MOVE line) is still invariant-safe -- update this expectation
+      // and say why. A count of 0 would mean the guard is vacuous and proves nothing.
+      assert(eadstCount == 3 * 4096,
+        s"expected exactly ${3 * 4096} dst-EADST opwords (the whole of lines 1/2/3), got $eadstCount " +
+        s"(histogram: $histo)")
+      assert(lineHisto(1) == 4096 && lineHisto(2) == 4096 && lineHisto(3) == 4096,
+        s"MOVE lines are not uniformly dst-EADST (histogram: $histo)")
     }
   }
 }
