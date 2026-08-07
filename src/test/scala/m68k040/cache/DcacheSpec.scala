@@ -918,9 +918,10 @@ class DcacheSpec extends AnyFunSuite {
   // which only exists inside `IDLE.whenIsActive`) never runs next cycle (the FSM
   // isn't in IDLE anymore) -- `ldS1Valid` self-clears with no response ever sent
   // to `loadRsp`, hanging the LS EU's WAIT state forever. (A HIT would still
-  // resolve fine -- `ldS1Resp` is combinational and state-independent -- but
-  // there's no way to know that before accepting, hence the fix defers
-  // acceptance by one cycle instead.)
+  // resolve fine -- the hit response path, `ldS2Resp` since the Slice 2 S1a/S1b
+  // split and `ldS1Resp` before it, is FSM-state-independent -- but there's no
+  // way to know that before accepting, hence the fix defers acceptance by one
+  // cycle instead.)
   //
   // Scenario: a COPYBACK store to a COLD line (no prior load) sets
   // `pendingStoreMiss` (mirrors test (m) above, straight to REFILL -- an empty
