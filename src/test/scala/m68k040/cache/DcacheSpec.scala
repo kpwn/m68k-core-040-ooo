@@ -1669,4 +1669,125 @@ class DcacheSpec extends AnyFunSuite {
         "the D-cache did not survive the pending-drain-miss + maintenance overlap")
     }
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // FMax closure Slice 2 (2026-08-07): LOAD S1a/S1b split -- directed timing pins.
+  //
+  // The load hit RESPONSE build (way-select -> byte-lane extract -> loadRsp) moved
+  // out of S1 into a new S2 register stage, costing one uniform extra cycle of
+  // load-to-use latency on every D-cache hit. Hit/miss DETECTION and the whole
+  // EVICT_WR/REFILL/REPLAY machinery were deliberately NOT moved (they read only
+  // `ldS1Hit`). These two tests pin BOTH halves of that claim to the cycle:
+  //   * the hit response is exactly ONE cycle later than it used to be, and
+  //   * miss-detect / refill-kickoff timing is byte-for-byte what it was before.
+  // Measured against commit 90c1f36 (pre-split) the numbers were hit=1, miss=1,
+  // ar=2; post-split they are hit=2, miss=1, ar=2.
+  //
+  // These are EXACT equality asserts on purpose: a future change that silently
+  // adds (or removes) a load-pipeline cycle should fail here loudly rather than
+  // be absorbed by the latency-agnostic `waitSamplingWhere` style used everywhere
+  // else in this file.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** Cycles, counted from the load's accept edge, until each of three events first
+    * becomes observable:
+    *   `_1` -- `loadRsp.valid` (the response)
+    *   `_2` -- `ldS1Valid && !ldS1Hit` (the S1 miss DECISION, which drives the
+    *           `when(ldS1Valid && !ldS1Hit)` REFILL trigger)
+    *   `_3` -- the refill's AXI `ar.valid` ASSERTION (the refill kickoff)
+    * `0` means "already live in the same observation slot as the accept"; `-1`
+    * means "never happened before the response landed".
+    *
+    * All three are DUT-DRIVEN signals ONLY. Deliberately NOT the `ar` HANDSHAKE:
+    * `ar.ready` comes from `BehavioralMemAgent`, a forked sim thread, so reading it
+    * from this thread is sensitive to intra-timestep thread ordering (this project's
+    * documented SpinalSim gotcha) AND to the memory model's own latency shape --
+    * neither of which says anything about the D-cache's timing. `ar.valid` is a
+    * pure DUT output off the REFILL state and is fully deterministic. */
+  def loadTimed(dut: Dut, cd: ClockDomain, vaddr: Long,
+                size: SpinalEnumElement[Size.type],
+                cacheMode: SpinalEnumElement[CacheMode.type] = CacheMode.WRITETHROUGH,
+                budget: Int = 200): (Int, Int, Int) = {
+    dut.probe.logic.loadCmdIn.valid #= true
+    dut.probe.logic.loadCmdIn.payload.vaddr #= vaddr
+    dut.probe.logic.loadCmdIn.payload.paddr #= vaddr   // identity translation in this spec
+    dut.probe.logic.loadCmdIn.payload.size #= size
+    dut.probe.logic.loadCmdIn.payload.cacheMode #= cacheMode
+    cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.ready.toBoolean &&
+                          dut.probe.logic.loadCmdIn.valid.toBoolean)
+    dut.probe.logic.loadCmdIn.valid #= false
+    var rspAt  = -1
+    var missAt = -1
+    var arAt   = -1
+    var n      = 0
+    while (rspAt < 0 && n <= budget) {
+      if (missAt < 0 && dut.dcache.logic.ldS1Valid.toBoolean &&
+                        !dut.dcache.logic.ldS1Hit.toBoolean) missAt = n
+      if (arAt < 0 && dut.dcache.logic.axi.ar.valid.toBoolean) arAt = n
+      if (dut.probe.logic.loadRspOut.valid.toBoolean) rspAt = n
+      if (rspAt < 0) { cd.waitSampling(); n += 1 }
+    }
+    (rspAt, missAt, arAt)
+  }
+
+  test("FMax slice 2: a D-cache load HIT responds out of the NEW S2 stage " +
+       "(exactly one cycle later than the old S1 response)", VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x7A00L
+      preload(mem, base, 16)
+
+      // Warm the line (cold miss -> refill -> resident, clean).
+      assert(load(dut, cd, base, Size.LONG) == expected(base, 4), "priming load data")
+      cd.waitSampling(8)
+
+      val (rspAt, missAt, arAt) = loadTimed(dut, cd, base + 4, Size.LONG)
+      assert(missAt == -1, s"this load must HIT (no S1 miss decision seen), got missAt=$missAt")
+      assert(arAt == -1, s"a hit must issue no refill burst, got arAt=$arAt")
+      assert(!dut.probe.logic.loadBusyOut.toBoolean, "a hit must never set loadBusy")
+      assert(rspAt == 2,
+        s"load HIT response must land 2 cycles after accept (S1a compare/way-select, " +
+        s"S1b extract/respond); got $rspAt -- was 1 before the Slice 2 split, so a " +
+        s"value of 1 means the S2 register stage is gone and the -1.987ns critical " +
+        s"path is back")
+      assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == expected(base + 4, 4),
+        "the S2-registered response must still carry the right byte-extracted data")
+
+      // ...and a second back-to-back hit behaves identically (proves the extended
+      // `inFlight = ldS1Valid || ldS2Valid` gate does not wedge the accept path).
+      cd.waitSampling(4)
+      val (rspAt2, _, _) = loadTimed(dut, cd, base + 8, Size.LONG)
+      assert(rspAt2 == 2, s"second back-to-back hit must have the same latency, got $rspAt2")
+      assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == expected(base + 8, 4),
+        "second hit data")
+      cd.waitSampling(4)
+    }
+  }
+
+  test("FMax slice 2: miss DETECTION and refill kickoff timing are unchanged by the " +
+       "S1a/S1b split", VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x7B00L        // cold, never touched -> guaranteed MISS, clean victim
+      preload(mem, base, 16)
+      cd.waitSampling(4)
+
+      val (rspAt, missAt, arAt) = loadTimed(dut, cd, base, Size.LONG)
+      // These two are the numbers this slice promises NOT to move: `ldS1Hit` still
+      // feeds `when(ldS1Valid && !ldS1Hit)` straight out of S1, so the miss decision
+      // (and therefore the eviction/refill kickoff behind it) is on exactly the same
+      // cycle as before the split.
+      assert(missAt == 1,
+        s"the S1 miss decision must still be visible 1 cycle after accept; got $missAt " +
+        s"-- Slice 2 must NOT have delayed hit/miss detection")
+      assert(arAt == 2,
+        s"the refill's AXI ar.valid must still assert 2 cycles after accept; got $arAt")
+      // The response itself IS one cycle later than before (the REPLAY re-launch
+      // now runs S1a+S1b too), which is the accepted cost.
+      assert(rspAt > arAt, s"the refill response must follow the burst, got $rspAt")
+      assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == expected(base, 4),
+        "refilled data")
+      cd.waitSampling(4)
+    }
+  }
 }

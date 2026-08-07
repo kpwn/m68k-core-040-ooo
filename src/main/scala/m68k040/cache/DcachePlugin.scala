@@ -32,6 +32,11 @@ import spinal.lib.misc.plugin.FiberPlugin
   *     arbiter defers the store-read by a cycle on the rare overlap).
   *   - Hit/miss is resolved ONE CYCLE LATER (in S1, against the registered tag-read
   *     vs the registered ppn-tag) — latency-agnostic; lock-step absorbs the +1.
+  * FMax (Slice 2, 2026-08-07): the LOAD hit RESPONSE build (way-select -> byte-lane
+  *   extract -> loadRspPort) moved out of S1 into a new S2 register stage, so a load
+  *   hit is S0 accept / S1 compare+way-select / S2 extract+respond. Hit/miss
+  *   DETECTION and the whole EVICT_WR/REFILL/REPLAY machinery are unchanged (they
+  *   read only `ldS1Hit`). One uniform extra cycle of load-to-use latency.
   * Valids: register array. Victim: register array. */
 class DcachePlugin extends FiberPlugin with DcacheService {
 
@@ -284,7 +289,9 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // (baseline's miss branch goes to REFILL regardless of xlate.rsp.fault; the
     // genuine non-resident-page fault is handled by the LS EU's own fault path, not
     // by short-circuiting a garbage cache response here).
-    val ldS1Resp    = ldS1Valid && ldS1Hit
+    // (The actual response is built one cycle later, in the LOAD S2 block below --
+    // FMax closure Slice 2. The HIT-ONLY policy described here is unchanged; only
+    // the cycle the response leaves on moved.)
 
     // Task #189 (bus error): a REFILL that came back with a non-OKAY AXI response
     // never allocates the line (see REFILL below), so a normal ldS1Valid/hit
@@ -303,12 +310,43 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val inhibitedResp = Bool(); inhibitedResp := False
     inhibitedResp.simPublic()   // DEBUG, temporary (mirrors busFaultResp)
 
-    loadRspPort.valid         := ldS1Resp || busFaultResp || inhibitedResp
+    // ---- LOAD S2 (registered post-hit-detect response build) ----
+    // FMax closure Slice 2 (2026-08-07): the old S1 response build (way-select ->
+    // byte-lane extract -> loadRspPort) was one flat ~13-level combinational cone
+    // running from the BRAM tag-read output straight into LsEuPlugin's `compData`
+    // register -- the worst post-route path after Slice 1 (-1.987ns). See
+    // docs/superpowers/specs/2026-08-07-fmax-slice2-dcache-s1-split-design.md.
+    //
+    // S1's hit/miss DECISION (`ldS1Hit`, consumed ONLY by the miss/REFILL trigger
+    // in the load FSM below) is deliberately UNTOUCHED -- only the HIT RESPONSE
+    // DATA moves one cycle later, so miss-detect/eviction/refill timing is bit-for-
+    // bit identical to before. Costs one uniform extra cycle of load-to-use latency
+    // on every D-cache load hit (an explicitly accepted tradeoff, the 5th of this
+    // shape in this file). No consumer-side change is needed: LsEuPlugin's `WAIT`/
+    // `WAIT_A`/`WAIT_B` states and ExceptionUnit's vector-fetch / RTE-pop states are
+    // all `when(loadRsp.valid)` event-driven, exactly like the already-much-later
+    // busFaultResp/inhibitedResp REPLAY pulses they already handle.
+    val ldS2Valid = RegInit(False)
+    val ldS2Hit   = Reg(Bool())
+    val ldS2Line  = Reg(Bits(128 bits))
+    val ldS2Off   = Reg(UInt(offBits bits))
+    val ldS2Size  = Reg(Size())
+    val ldS2Fault = Reg(Bool())
+    ldS2Valid := ldS1Valid
+    ldS2Hit   := ldS1Hit
+    ldS2Line  := ldS1Line
+    ldS2Off   := ldS1Off
+    ldS2Size  := ldS1Size
+    ldS2Fault := ldS1Fault
+    val ldS2Resp = ldS2Valid && ldS2Hit
+    ldS2Valid.simPublic(); ldS2Hit.simPublic(); ldS2Resp.simPublic()
+
+    loadRspPort.valid         := ldS2Resp || busFaultResp || inhibitedResp
     loadRspPort.payload.data  := Mux(inhibitedResp,
                                       DcacheByteLane.extract(missLine, missOff, missSize),
-                                      DcacheByteLane.extract(ldS1Line, ldS1Off, ldS1Size))
-    loadRspPort.payload.line  := Mux(inhibitedResp, missLine, ldS1Line)
-    loadRspPort.payload.fault := Mux(busFaultResp, True, ldS1Fault)
+                                      DcacheByteLane.extract(ldS2Line, ldS2Off, ldS2Size))
+    loadRspPort.payload.line  := Mux(inhibitedResp, missLine, ldS2Line)
+    loadRspPort.payload.fault := Mux(busFaultResp, True, ldS2Fault)
 
     // ---- STORE write-through (PIPELINED RMW: S0 latch / S1 read / S2 merge+write) ----
     // FMax: the store RMW (old line readAsync + 16-lane byte-merge + write) used to
@@ -615,10 +653,21 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       val REFILL   = new State
       val REPLAY   = new State
 
-      // In-flight gate: do not accept a new load while one is resolving in S1 (its
-      // combinational response is live this same cycle). Single-outstanding on the
-      // load side — identical to the old `s1Valid || loadRspPort.valid` accounting.
-      val inFlight = ldS1Valid
+      // In-flight gate: do not accept a new load while one is resolving in S1 or S2.
+      // Single-outstanding on the load side — identical to the old
+      // `s1Valid || loadRspPort.valid` accounting.
+      //
+      // FMax closure Slice 2: `|| ldS2Valid` is REQUIRED, not belt-and-braces. The
+      // hit response now leaves in S2, so a load only stops being "in flight" one
+      // cycle later than before; without this term a new load could be accepted on
+      // the very cycle the previous load's response pulses, breaking the
+      // single-outstanding contract the whole load FSM (and the LS EU's own
+      // one-load-at-a-time protocol) is built on. Deliberately CONSERVATIVE: a load
+      // now takes 3 cycles (S0 accept / S1 compare+way-select / S2 extract+respond)
+      // with no other arbitration change. Overlapping a new load's S1 with the
+      // previous load's S2 (legal in principle — S2 touches neither the shared BRAM
+      // read port nor any AXI channel) is explicitly OUT of scope here.
+      val inFlight = ldS1Valid || ldS2Valid
 
       // Whether the load FSM uses the shared read port THIS cycle (set in the
       // load-accept and REPLAY arms below). The store arbiter reads this to defer.
@@ -660,7 +709,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           ldS1Paddr    := cmdPaddr
         }
         // S1 resolution of a launched load read. A HIT drives the response
-        // combinationally (ldS1Resp above, fault riding along). A MISS — fault or
+        // one cycle later out of S2 (ldS2Resp above, fault riding along). A MISS — fault or
         // not — starts the refill, EXACTLY as baseline (whose miss branch went to
         // REFILL unconditionally; only the hit branch carried xlate.rsp.fault).
         when(ldS1Valid && !ldS1Hit) {
@@ -1088,8 +1137,15 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       * boundary flop) only rises the cycle AFTER a store is presented. Without the
       * live combinational term this signal read True with a store exactly one flop
       * away from entering the pipe, and `WAIT` fell through to `READ` on precisely
-      * that cycle -- the store then ran its S0/S1/S2 concurrently with the walk. */
-    val dcIdleForMaint = !busy && !ldS1Valid && !pendingStoreMiss && !pendingWtKickoff &&
+      * that cycle -- the store then ran its S0/S1/S2 concurrently with the walk.
+      *
+      * FMax closure Slice 2: `!ldS2Valid` is REQUIRED for the same reason `!ldS1Valid`
+      * always was. This signal's documented intent is "every load/store pipeline stage
+      * fully drained"; the load pipe now has a third stage, and a maintenance walk's
+      * tag/valid/dirty invalidation must not start while a load response is still
+      * resolving in it. Costs at most one extra cycle of walk-start delay on an
+      * already-rare, ROB-serialized event. */
+    val dcIdleForMaint = !busy && !ldS1Valid && !ldS2Valid && !pendingStoreMiss && !pendingWtKickoff &&
                          !storePort.valid && !s0Valid && !stS1Valid && !stS2Valid &&
                          stAwDone && stWDone && evictAwDone && evictWDone
     dcIdleForMaint.simPublic()
