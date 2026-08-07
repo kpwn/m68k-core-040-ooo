@@ -1,6 +1,69 @@
 # FMax closure, Slice 3: collapse slot-1's chained dst-EA shift barrels (design)
 
-## Context
+## POST-IMPLEMENTATION CORRECTIONS (read this first)
+
+Implementation (commit `1b64ccc`) and an independent review both found this
+spec wrong in three material ways. The RTL landed anyway — see
+`.superpowers/sdd/progress-fmax-slice3.md` for the full record and the
+**PROBATIONARY** status — but do not trust the claims below as originally
+written; use this section instead.
+
+**1. Mechanism correction (the load-bearing one).** This spec models the two
+shifts as independent DATA muxes: `arr[a][b]` collapsible to a flat index
+`a+b`. **That model is wrong, confirmed from the actual post-route netlist
+path chain by both the implementer and an independent reviewer.**
+`dstShift` — the SECOND mux's SELECT — is itself downstream of the FIRST
+mux's DATA, via `OperationDecoder.decode(pkt.words(0)).size`:
+`L0 -> Aligner slot-1 mux -> pkt.words(0) -> OperationDecoder(~1.2ns) ->
+size -> srcEaWordCount -> dstShift -> second mux SELECT -> EaDecoder`. The
+two muxes were **never chained as data** on the real critical arc — the
+data side (`pkt.words(1..)`) had well over a nanosecond of slack relative
+to its own select the whole time. Consequently:
+- Re-sourcing the mux's DATA from `rawWords` (this spec's whole mechanism)
+  **cannot shorten the real critical path** — confirmed: OOC-synth-only
+  **regresses** by -0.137ns (the new `l0 +^ dstShift` adder lands directly
+  on the dominant SELECT chain, widening the dynamic index range).
+- The real post-route gate improved marginally (+0.020ns / +0.559MHz,
+  ~0.5% of the violation) and the originally-cited path family did
+  disappear from the worst-10 — but this is placement-equilibrium, **not
+  attributable to the designed mechanism**. Treat it as "functionally
+  clean, mechanism disproven, effect unattributed", not as a won FMax
+  delta, in any future accounting of this initiative.
+- **The real lever for this cone** (identified but NOT implemented): for
+  slot-1's dst path on the MOVE lines, `spec.size` is literally
+  `op[15:12]` — reading it directly instead of running the full
+  `OperationDecoder` table would drop that table (~1.2ns on the baseline
+  critical chain — two orders of magnitude more than this slice's actual
+  effect) out of the `L0 -> dstEa` cone entirely. This is the change a
+  follow-on slice should make; it likely subsumes this one, at which point
+  reverting this slice's interface threading becomes free and should be
+  done.
+
+**2. `EaDecoder` citation correction.** This spec (below) claims
+`EaDecoder.decode` reads its `words` argument "only at static indices 1,
+2, 3". False — `EaDecoder.scala`'s full-format outer-displacement path
+(`fOdWordAt`) is a DYNAMIC read over indices 2..5. The real consumed set is
+1..5, dynamic over 2..5. (Root cause: a pre-existing stale comment in
+`EaDecoder.scala` claiming "the shifted-vector callers pass only 3
+entries" — true for some callers, false for `shiftedWordsFor`, the one
+that matters here. That comment has been corrected.)
+
+**3. Correctness-invariant correction.** This spec states the algebraic
+identity holds "for every reachable `(L0, dstShift, words)` combination" —
+**false as written**. `Aligner.scala`'s slot-1 loop zero-fills
+`pkt.words(j)` for `j >= L1`; the new path reads the NEXT instruction's
+real words there instead. The TRUE (and sufficient) invariant is
+CONDITIONAL: `o.dstEa` is bit-identical only where it is actually
+consumed, which — after a full consumer-tree derivation independently
+re-verified by two people — is exactly the MOVE-line-gated region strictly
+inside `L1`. See `MicroOpAssembler.scala`'s comment above the 3-arg
+`computeOffload` overload for the full, current, correct derivation
+(including the `DecodeStage.scala` `s1mi_isMove` consumer this spec never
+analyzed). This conditional contract is now backed by an exhaustive
+65536-opword automated test in `MicroOpAssemblerOffloadSpec` (added
+post-review) rather than resting on comment-only enforcement.
+
+## Context (original — mechanism claims below are superseded, see above)
 
 Same initiative as Slice 2 (D-cache S1a/S1b split, its own design spec) —
 both cover the two paths tied for worst post-route path after Slice 1

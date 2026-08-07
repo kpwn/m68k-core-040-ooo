@@ -16,8 +16,12 @@ import spinal.lib._
   * `pkt.pc`). */
 object EaDecoder {
   // Dynamically select words(idx) for a full-format OD position (idx ∈ {2,3,4,5}),
-  // bounded by the actual Vec length (the shifted-vector callers pass only 3 entries —
-  // those EAs never carry a full-format OD, so the out-of-range candidates read 0).
+  // bounded by the actual Vec length. Some callers (e.g. immEa/immDstEa, the bf/CMP2
+  // re-decodes) pass only 3 entries -- those EAs never carry a full-format OD, so the
+  // out-of-range candidates read 0 for them. `MicroOpAssembler.shiftedWordsFor` (the
+  // caller for slot-1's dstEa, FMax closure slice 3) passes the FULL 10-word window, so
+  // for THAT caller this dynamic read is real and live over the whole idx ∈ {2..5} range
+  // -- do not assume "only 3 entries" holds for every caller when reasoning about this fn.
   private def fOdWordAt(words: Vec[Bits], idx: UInt): Bits = {
     val n = words.length
     val out = Bits(16 bits); out := B(0, 16 bits)
@@ -26,8 +30,9 @@ object EaDecoder {
     }
     out
   }
-  // Static word read bounded by the Vec length (the shifted-vector callers pass only 3
-  // entries; a full-format bd-long there would need words(3) which is absent -> read 0).
+  // Static word read bounded by the Vec length. Same caveat as `fOdWordAt` above: some
+  // callers pass only 3 entries (out-of-range reads 0 for them), but not all -- check the
+  // specific caller before assuming a fixed-width Vec.
   private def wAt(words: Vec[Bits], i: Int): Bits =
     if (i < words.length) words(i) else B(0, 16 bits)
 

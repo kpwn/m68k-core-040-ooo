@@ -472,12 +472,32 @@ object MicroOpAssembler {
   }
 
   // ── FMax closure slice 3 (2026-08-07): slot-1 chained-shift collapse ─────────────
-  // The 1-arg overload above, applied to SLOT 1, chains TWO independent ~10-way dynamic
-  // barrel muxes onto the `dstEa` cone: Aligner already built `pkt.words` by dynamically
-  // indexing the raw IBuf head window at `L0 + j` (Aligner.scala's slot1 word loop), and
-  // then `shiftedWordsFor(pkt.words, dstShift)` dynamically re-indexes THAT array again.
-  // Post-route STA charged the whole mux-of-mux against `ibuf/entries_*_pred_lenWords_reg`
-  // (L0's source) -> `..._specs_1_dstEa_disp_reg`, the 2nd-worst path after slice 1.
+  // PROBATIONARY (post-review correction, see the design spec's "Mechanism correction"
+  // section): this was ORIGINALLY designed on the theory that Aligner's L0 mux and this
+  // function's own dstShift mux chain as two independent DATA muxes, collapsible into one
+  // mux on the summed index. That theory is DISPROVEN -- confirmed independently from the
+  // post-route netlist by both the implementer and an independent reviewer. `dstShift` (the
+  // second mux's SELECT) is itself downstream of the first mux's DATA via
+  // `OperationDecoder.decode(pkt.words(0)).size`, so the two were never chained as data on
+  // the real critical arc; the data side had slack all along. Re-sourcing the data from
+  // `rawWords` cannot shorten that arc, and OOC-synth-only measurably REGRESSES (-0.137ns:
+  // the new `l0 +^ dstShift` adder lands directly on the dominant SELECT chain). The real
+  // post-route gate improved marginally (+0.020ns / +0.559MHz) and the originally-targeted
+  // path family is gone from the worst-10, but this effect is placement-equilibrium, NOT
+  // attributable to the designed mechanism -- treat any future FMax accounting for this
+  // slice as "functionally clean, mechanism disproven, effect unattributed", not as a
+  // won FMax delta. The real lever for this cone is a follow-on slice: for slot-1's dst
+  // path on the MOVE lines, `spec.size` is literally `op[15:12]` (see
+  // `OperationDecoder.scala`'s MOVE size decode) -- reading it directly would drop the
+  // whole `OperationDecoder` table (~1.2ns on the baseline critical chain, two orders of
+  // magnitude more than this slice's measured effect) out of the `L0 -> dstEa` cone
+  // entirely, likely subsuming this slice. See the design spec for the full derivation and
+  // `.superpowers/sdd/progress-fmax-slice3.md` for the review record.
+  //
+  // The mechanism above did not deliver as designed, but the CODE remains, because it is
+  // independently proven functionally safe (see the correctness derivation below) and the
+  // post-route gate -- this project's binding gate -- did not regress. Do not revert this
+  // without also considering the follow-on slice above, which likely makes reverting free.
   //
   // Collapse: for the words `EaDecoder.decode` actually consumes,
   //   shiftedWordsFor(pkt.words, dstShift)(i) == wordAtDynG(pkt.words, i + dstShift)
@@ -493,19 +513,35 @@ object MicroOpAssembler {
   // ZERO-FILLS `pkt.words(j)` for j >= L1, whereas `rawWords(L0+j)` there holds the NEXT
   // instruction's real words. So old and new differ exactly in the beyond-the-instruction
   // region. That region is never consumed:
-  //   * `dstEa` is architecturally read only when `spec.dst.kind === EADST`, which
-  //     OperationDecoder sets for plain MOVE.B/.W/.L ONLY (its sole `o.dst := eadst` site).
-  //     Every downstream use is MOVE-gated (crackStore / crackMemMem / moveDataDst /
-  //     moveAddrDst / writesNzvcIfDataDst / stDstEa); the one NON-MOVE-gated use, `dstEaOk`
-  //     (klass ∈ {DATAREG, ADDRREG}), depends on the EA MODE FIELD only, never on `words`.
+  //   * The words-DEPENDENT `dstEa` fields (disp/base/index/pcRel/autoMode/...) are
+  //     consumed only under `usesDstEa` (i.e. `spec.dst.kind === EADST`, which
+  //     OperationDecoder sets at exactly its sole `o.dst := eadst` site, the plain
+  //     MOVE.B/.W/.L opcode lines) -- covers `crackStore`/`crackMemMem`/`stDstEa`/`stUop` --
+  //     OR under `DecodeStage`'s `s1mi_isMove` gate (`slot1IsMemIndEarly`, keyed off the
+  //     SAME MOVE line nibble), which reads `dstEa.klass` to route a slot-1 memory-indirect
+  //     MOVE to the µcode engine. `moveDataDst`/`moveAddrDst` are gated on `spec.op ===
+  //     DecOp.MOVE` (a WIDER set than the MOVE lines -- MOVEQ/MOVE16/MOVE-from-SR etc also
+  //     set this op) but are safe anyway: they read only `klass ∈ {DATAREG,ADDRREG}`/`.reg`,
+  //     which `EaDecoder` produces solely from the EA mode/reg field, never from `words`.
+  //     `dstEaOk` (the one non-`usesDstEa` consumer) is likewise words-independent.
   //   * For a MOVE, L1 = predecode's framing = 1 + srcExtWords + dstExtWords, and
   //     dstShift = srcEaWordCount = srcExtWords, so the dst's own ext words occupy shifted
   //     indices 1..dstExtWords = up to L1-1-dstShift. `EaDecoder.decode` reads exactly
-  //     those (its bd/od reads are Mux-selected by the very BD-SIZE/OD-SIZE bits that
-  //     `miEaWordCountG` counts), so every word it consumes is inside the L1 region where
-  //     old and new are bit-identical.
+  //     those (its bd/od reads, INCLUDING the dynamic `fOdWordAt` full-format-OD reads over
+  //     idx 2..5, are Mux-selected by the very BD-SIZE/OD-SIZE bits that `miEaWordCountG`
+  //     counts), so every word it consumes is inside the L1 region where old and new are
+  //     bit-identical. `Aligner.slot1Ok` additionally guarantees the framing (`L1`) itself
+  //     is never a guess for a reachable slot-1 MOVE (`!p1.ambiguousLine`), so this isn't
+  //     contingent on a correct-but-unproven predecode guess.
   // Net: `o.dstEa` is bit-identical to the 1-arg overload's for every MOVE (the only op
-  // that consumes it), and differs only in provably-unread bits otherwise.
+  // that consumes its words-dependent fields), and differs only in provably-unread bits
+  // otherwise. CONTRACT WARNING: this is a CONDITIONAL invariant of `OperationDecoder` +
+  // `MicroOpAssembler` + `DecodeStage`, not an unconditional one -- a future opcode that
+  // sets `o.dst := eadst` (or an equivalent words-dependent dstEa read) outside the MOVE
+  // line nibble would silently break it with no test failure from the existing suite
+  // (guarded by `MicroOpAssemblerOffloadSpec`'s exhaustive-opword sweep, which enumerates
+  // every opword's `dst.kind === EADST` against its line nibble to keep this a tested
+  // invariant rather than a comment-only promise).
   //
   // `o.spec` / `o.srcEa` / `dstEaField` / `dstShift` are UNCHANGED (src's own ext words sit
   // at `pkt.words(1..)` directly — src never chains a second shift). Slot 0 keeps the 1-arg
