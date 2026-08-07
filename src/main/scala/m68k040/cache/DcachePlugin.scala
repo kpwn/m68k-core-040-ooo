@@ -1139,12 +1139,15 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       * away from entering the pipe, and `WAIT` fell through to `READ` on precisely
       * that cycle -- the store then ran its S0/S1/S2 concurrently with the walk.
       *
-      * FMax closure Slice 2: `!ldS2Valid` is REQUIRED for the same reason `!ldS1Valid`
-      * always was. This signal's documented intent is "every load/store pipeline stage
-      * fully drained"; the load pipe now has a third stage, and a maintenance walk's
-      * tag/valid/dirty invalidation must not start while a load response is still
-      * resolving in it. Costs at most one extra cycle of walk-start delay on an
-      * already-rare, ROB-serialized event. */
+      * FMax closure Slice 2: `!ldS2Valid` is REQUIRED, but for a DIFFERENT reason than
+      * `!ldS1Valid` -- `ldS2*`'s payload is a frozen register snapshot (no live shared-
+      * resource read behind it, unlike S1), so there is no corruption mechanism this
+      * term is closing. It exists to preserve this signal's documented intent --
+      * "every load/store pipeline stage fully drained" -- now that the load pipe has a
+      * third stage: a maintenance walk's tag/valid/dirty invalidation must not start
+      * while a load response is still resolving, even though that response's DATA
+      * cannot itself be corrupted by the walk. Costs at most one extra cycle of
+      * walk-start delay on an already-rare, ROB-serialized event. */
     val dcIdleForMaint = !busy && !ldS1Valid && !ldS2Valid && !pendingStoreMiss && !pendingWtKickoff &&
                          !storePort.valid && !s0Valid && !stS1Valid && !stS2Valid &&
                          stAwDone && stWDone && evictAwDone && evictWDone
