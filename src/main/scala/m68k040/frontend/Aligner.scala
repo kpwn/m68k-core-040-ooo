@@ -12,6 +12,16 @@ object Aligner {
     val slot0Valid = Bool()
     val slot1      = DecodePacket()
     val slot1Valid = Bool()
+    // FMax closure slice 3 (2026-08-07): the RAW (pre-L0-shift) IBuf head window and the
+    // slot-1 realignment amount `L0`, exposed verbatim so `MicroOpAssembler.computeOffload`
+    // can collapse its slot-1 dst-EA read (today a dynamic mux INTO the already-dynamically-
+    // muxed `slot1.words`) into a SINGLE dynamic mux on the summed index `L0 + dstShift`,
+    // applied straight to the raw window. Pure passthroughs of values that already exist
+    // inside `align()` — no new logic, and `slot1.words` itself is unchanged (still needed
+    // for the header/first-ext-word static reads and every other consumer).
+    // See docs/superpowers/specs/2026-08-07-fmax-slice3-frontend-dsteashift-collapse-design.md.
+    val slot1RawWords = Vec(Bits(16 bits), WINDOW)
+    val slot1L0       = UInt(4 bits)
     val shiftWords = UInt(4 bits)
     val stall      = Bool()
     val complex    = Bool()
@@ -84,6 +94,12 @@ object Aligner {
     // already-multi-cycle-tolerant ambiguous-head case.
     val p0 = Mux(preds(0).ambiguousLine, p0LiveReg, preds(0))
     val L0 = p0.lenWords  // UInt(4 bits)
+
+    // Slice-3 passthroughs (see Result's comment). Unconditional: they are pure copies of
+    // already-valid inputs, meaningful regardless of which arm below fires; `slot1Valid`
+    // still gates whether a consumer may look at them, exactly as it gates `r.slot1`.
+    r.slot1RawWords := words
+    r.slot1L0       := L0
 
     when(avail === 0) {
       // keep defaults: stall, nothing valid

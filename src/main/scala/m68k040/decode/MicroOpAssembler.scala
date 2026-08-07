@@ -471,6 +471,58 @@ object MicroOpAssembler {
     o
   }
 
+  // ── FMax closure slice 3 (2026-08-07): slot-1 chained-shift collapse ─────────────
+  // The 1-arg overload above, applied to SLOT 1, chains TWO independent ~10-way dynamic
+  // barrel muxes onto the `dstEa` cone: Aligner already built `pkt.words` by dynamically
+  // indexing the raw IBuf head window at `L0 + j` (Aligner.scala's slot1 word loop), and
+  // then `shiftedWordsFor(pkt.words, dstShift)` dynamically re-indexes THAT array again.
+  // Post-route STA charged the whole mux-of-mux against `ibuf/entries_*_pred_lenWords_reg`
+  // (L0's source) -> `..._specs_1_dstEa_disp_reg`, the 2nd-worst path after slice 1.
+  //
+  // Collapse: for the words `EaDecoder.decode` actually consumes,
+  //   shiftedWordsFor(pkt.words, dstShift)(i) == wordAtDynG(pkt.words, i + dstShift)
+  //                                          == rawWords(L0 + i + dstShift)
+  //                                          == shiftedWordsFor(rawWords, L0 + dstShift)(i)
+  // i.e. ONE dynamic select on the summed index, straight off the raw window. Index-range
+  // safety: Aligner's `slot1Ok` guarantees L0+L1 <= WINDOW(10), and the consumed indices
+  // satisfy i + dstShift <= L1-1 (see below), so L0+i+dstShift <= 9 — inside the window,
+  // and the 5-bit index arithmetic cannot wrap (max 9+15+7 = 31).
+  //
+  // WHY `i + dstShift <= L1-1` for every consumed word (the one place the identity is not
+  // unconditional, and the reason this is safe rather than merely plausible): Aligner
+  // ZERO-FILLS `pkt.words(j)` for j >= L1, whereas `rawWords(L0+j)` there holds the NEXT
+  // instruction's real words. So old and new differ exactly in the beyond-the-instruction
+  // region. That region is never consumed:
+  //   * `dstEa` is architecturally read only when `spec.dst.kind === EADST`, which
+  //     OperationDecoder sets for plain MOVE.B/.W/.L ONLY (its sole `o.dst := eadst` site).
+  //     Every downstream use is MOVE-gated (crackStore / crackMemMem / moveDataDst /
+  //     moveAddrDst / writesNzvcIfDataDst / stDstEa); the one NON-MOVE-gated use, `dstEaOk`
+  //     (klass ∈ {DATAREG, ADDRREG}), depends on the EA MODE FIELD only, never on `words`.
+  //   * For a MOVE, L1 = predecode's framing = 1 + srcExtWords + dstExtWords, and
+  //     dstShift = srcEaWordCount = srcExtWords, so the dst's own ext words occupy shifted
+  //     indices 1..dstExtWords = up to L1-1-dstShift. `EaDecoder.decode` reads exactly
+  //     those (its bd/od reads are Mux-selected by the very BD-SIZE/OD-SIZE bits that
+  //     `miEaWordCountG` counts), so every word it consumes is inside the L1 region where
+  //     old and new are bit-identical.
+  // Net: `o.dstEa` is bit-identical to the 1-arg overload's for every MOVE (the only op
+  // that consumes it), and differs only in provably-unread bits otherwise.
+  //
+  // `o.spec` / `o.srcEa` / `dstEaField` / `dstShift` are UNCHANGED (src's own ext words sit
+  // at `pkt.words(1..)` directly — src never chains a second shift). Slot 0 keeps the 1-arg
+  // overload: it starts at the IBuf head literally (no L0 pre-shift), so nothing to collapse.
+  // See docs/superpowers/specs/2026-08-07-fmax-slice3-frontend-dsteashift-collapse-design.md.
+  def computeOffload(pkt: DecodePacket, rawWords: Vec[Bits], l0: UInt): Offload = {
+    val o = Offload()
+    o.spec := OperationDecoder.decode(pkt.words(0))
+    o.srcEa := srcEaFor(pkt, o.spec.size)
+    val dstEaField = pkt.words(0)(8 downto 6) ## pkt.words(0)(11 downto 9)
+    val dstShift = srcEaWordCount(pkt.words(0)(5 downto 3).asUInt, pkt.words(0)(2 downto 0).asUInt,
+                                   o.spec.size, pkt.words)
+    val totalShift = (l0 +^ dstShift).resize(5)
+    o.dstEa := EaDecoder.decode(dstEaField, o.spec.size, shiftedWordsFor(rawWords, totalShift))
+    o
+  }
+
   def assemble(pkt: DecodePacket): AssembledUops = assemble(pkt, None)
   def assemble(pkt: DecodePacket, specIn: Option[OpSpec]): AssembledUops =
     assembleImpl(pkt, specIn.map { s =>

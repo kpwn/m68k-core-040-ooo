@@ -178,6 +178,13 @@ trait DTranslationService {
 trait DecodeFeedService {
   def feed: Stream[Vec[DecodePacket]]   // Vec length 2
   def slot1Valid: Bool
+  /** FMax closure slice 3: the RAW (pre-realignment) IBuf head window and slot-1's
+    * realignment amount `L0`, straight off `Aligner.Result`. Consumed ONLY by
+    * `DecodeStage`'s slot-1 `computeOffload` call, to collapse the two chained dynamic
+    * shift barrels on the `dstEa` cone into one. Meaningful under the same condition as
+    * `feed.payload(1)` itself (i.e. gated by `slot1Valid`). Vec length = Aligner.WINDOW. */
+  def slot1RawWords: Vec[Bits]
+  def slot1L0: UInt
 }
 
 /** Produced by the decode stage; consumed by the (future) rename stage.

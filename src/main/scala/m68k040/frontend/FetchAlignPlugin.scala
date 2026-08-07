@@ -706,4 +706,6 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
   // ---- DecodeFeedService implementation ----
   override def feed: Stream[Vec[DecodePacket]]  = logic.feed
   override def slot1Valid: Bool                 = logic.slot1ValidOut
+  override def slot1RawWords: Vec[Bits]         = logic.res.slot1RawWords
+  override def slot1L0: UInt                    = logic.res.slot1L0
 }
