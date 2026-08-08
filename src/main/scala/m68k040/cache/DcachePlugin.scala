@@ -200,6 +200,10 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val pendingVictimTag   = Reg(UInt(tagBits bits))
     val pendingVictimLine  = Reg(Bits(128 bits))
     val storeAllocAckReg   = Bool(); storeAllocAckReg := False
+    // test-visibility only (FMax Lever F's positive-control sweep in
+    // DcacheDrainRefillRaceSpec counts merge acks); already a live driver of
+    // storeAckReg, so this cannot change the synthesised netlist.
+    storeAllocAckReg.simPublic()
 
     // Pulled forward from Task P4.5's own Step 1 (a plan-ordering bug: P4.5 declares
     // these but P4.2, which comes first, needs to drive them). P4.5's own eventual
@@ -597,6 +601,64 @@ class DcachePlugin extends FiberPlugin with DcacheService {
                           // in an IDLE-adjacent context without re-checking.
                           (stS2ArrayWrite && stS2HitVec(victimWay))
 
+    // ---- FMax Lever F: REPLAY's OWN write-allocate hold — deliberately NOT
+    // `refillWriteHold` (design doc
+    // `docs/superpowers/specs/2026-08-08-fmax-leverf-upstream-storequeue-design.md`).
+    //
+    // `refillWriteHold`'s three terms are all live functions of the store-S2 tag
+    // compare (`stS2HitVec`, above), i.e. of the tag BRAM read output. REFILL's
+    // `axi.r.ready` (below) genuinely NEEDS that precision: a LOAD-miss refill runs
+    // fully concurrently with an unrelated store stream, so it must hold ONLY on a
+    // real same-set/same-way collision or it would stall every refill against every
+    // store anywhere in the cache. That site is deliberately left untouched.
+    //
+    // REPLAY's write-allocate merge is the opposite case. It only ever runs with
+    // `refillReqIsStore`, i.e. servicing a COPYBACK drain miss — and that drain's
+    // ONLY ack source is the very `storeAllocAckReg` that gate itself produces (its
+    // S2 arm issues no AXI beat, setting stAwDone/stWDone True, so `storeBAck`
+    // cannot fire; and it MISSED, so `cbHitAckReg` — which requires stS2HitAny —
+    // cannot fire either). So `StoreQueue.drainBusy` is still set for the whole
+    // EVICT_WR/REFILL/REPLAY excursion, `drainIssue = headReady && !drainBusy`
+    // (StoreQueue.scala) is False, and the ExceptionUnit's own store path is gated
+    // behind `sqDrained` == `sq.io.empty` == `!anyValid && !drainBusy`, False for
+    // the same reason. NO store can be in S0/S1/S2 while that merge is evaluated.
+    //
+    // This predicate is a STRICT SUPERSET of `refillWriteHold` (every one of its
+    // three terms requires `stS1Valid` or `stS2Valid`), so it CANNOT weaken the
+    // P4.4 array-write-port interlock — the "delay, never drop" property is
+    // preserved UNCONDITIONALLY, without relying on the single-outstanding producer
+    // contract for CORRECTNESS. The contract is relied on only for the
+    // (unreachable, hence unobservable) claim that this never actually holds, and
+    // `storeDrainHoldFired` below makes even that claim falsifiable. It also cannot
+    // livelock: `stS1Valid`/`stS2Valid` are a plain 2-deep pipe that advances with
+    // no dependency on any ack (S1 holds only on `fsm.loadUsesPort`/`maintUsesPort`,
+    // neither of which the REPLAY store arm can assert), so the hold is bounded at
+    // <=2 cycles even under a contract violation.
+    //
+    // FMax purpose: both terms are plain registers, so this gate — and with it
+    // `storeAllocAckReg` -> `storeAckReg` -> SQ `drainAck` -> `sqCompletion` -> the
+    // ROB fault-register write — launches from a flop instead of from the tag BRAM
+    // through the 21-bit store-S2 tag compare.
+    val storeDrainRefillHold = stS1Valid || stS2Valid
+
+    // Proves the producer-contract argument above instead of assuming it. Same shape
+    // as this file's diagFaultKind0Fires/Kind1Fires collision detectors, with the
+    // same poke-able opt-out as `diagFaultExpected` so a deliberately
+    // contract-violating directed positive control can exercise the hold on purpose.
+    val storeDrainHoldFired = Bool(); storeDrainHoldFired := False
+    storeDrainHoldFired.simPublic()
+    val storeDrainHoldExpected = RegInit(False); storeDrainHoldExpected.simPublic()
+    GenerationFlags.simulation {
+      assert(!(storeDrainHoldFired && !storeDrainHoldExpected),
+        "DcachePlugin: a store was in S1/S2 while a COPYBACK drain-miss write-allocate " +
+        "merge was held in REPLAY -- the single-outstanding store-producer contract " +
+        "(StoreQueue.drainBusy + the ExceptionUnit's sqDrained gate) that Lever F's " +
+        "timing argument rests on was violated. The merge was correctly DELAYED (not " +
+        "dropped), so this is not corruption -- but the contract must be re-derived " +
+        "before trusting the FMax claim.",
+        FAILURE)
+    }
+
     // ---- Task P5.4: cache-maintenance (CPUSH/CINV) walk, forward declarations ----
     // Declared HERE (ahead of the load FSM) because the load FSM's own load-accept
     // arm must read `maintBusyReg` -- while a maintenance walk owns the shared array
@@ -986,9 +1048,15 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         } elsewhen(refillReqIsStore) {
           // Task P4.4: this is an array-write site (write-allocate merge) — hold
           // here (do NOT goto(IDLE), retry the SAME cycle's work next cycle)
-          // while `refillWriteHold` is asserted, exactly like REFILL's own
+          // while the array-write interlock is asserted, exactly like REFILL's own
           // allocate write above.
-          when(!refillWriteHold) {
+          //
+          // FMax Lever F: this site uses `storeDrainRefillHold` (register-only,
+          // strictly stronger) rather than `refillWriteHold` (which depends on the
+          // tag-BRAM read + the 21-bit store-S2 tag compare). See that signal's
+          // declaration for the full argument; REFILL's `axi.r.ready` above is
+          // deliberately left on the precise `refillWriteHold`.
+          when(!storeDrainRefillHold) {
             // Merge the store's bytes into the just-allocated line, mark it dirty,
             // ack the drain LOCALLY -- entirely off the retire timeline (this is a
             // post-commit event; the fast-path store retired long ago at SQ-alloc).
@@ -1004,8 +1072,13 @@ class DcachePlugin extends FiberPlugin with DcacheService {
             }
             storeAllocAckReg := True
             goto(IDLE)
+          } otherwise {
+            // Held — stay in REPLAY, retry next cycle (retry-don't-drop). Per the
+            // producer-contract argument at `storeDrainRefillHold`'s declaration
+            // this arm is UNREACHABLE in the real core; the detector below is what
+            // makes that claim falsifiable rather than merely asserted.
+            storeDrainHoldFired := True
           }
-          // else: held — stay in REPLAY, retry next cycle (retry-don't-drop).
         } otherwise {
           // Re-launch the read for the just-filled line; resolve as a guaranteed hit
           // into the response register one cycle later via the ldS1 path. (No array

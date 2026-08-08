@@ -356,4 +356,154 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
       "the race this file targets. This likely means refill latency or the storeCycle " +
       "range no longer aligns with the collision window and needs re-tuning.")
   }
+
+  // ------------------------------------------------------------------------------
+  // FMax Lever F POSITIVE CONTROL for `storeDrainRefillHold`
+  // (design: docs/superpowers/specs/2026-08-08-fmax-leverf-upstream-storequeue-design.md
+  //  §10.2 item 3 -- the test that makes correctness properties C1/C2/C3 FALSIFIABLE
+  //  rather than merely argued.)
+  //
+  // Lever F replaces REPLAY's write-allocate-merge gate with the register-only,
+  // strictly-stronger `storeDrainRefillHold = stS1Valid || stS2Valid`. Its timing
+  // argument rests on that predicate being UNREACHABLE in the real core (the
+  // StoreQueue's `drainBusy` interlock plus the ExceptionUnit's `sqDrained` gate mean
+  // no store can be in the D-cache store pipe while a COPYBACK drain miss is being
+  // serviced) -- which is precisely why the real core can never exercise it, and why
+  // the hold's "delay, NEVER drop" behaviour would otherwise go completely untested.
+  //
+  // `DcacheProbePlugin` drives `storeIn` directly and is therefore the ONLY DUT in
+  // this project that CAN violate that producer contract. This sweep does exactly
+  // that on purpose (opting in via `storeDrainHoldExpected`, the same shape as
+  // `diagFaultExpected`) and asserts all three of:
+  //   (a) `storeDrainHoldFired` actually pulses -- the hold is LIVE, not dead code,
+  //       and this test is not vacuous (aggregated across the sweep below);
+  //   (b) the write-allocate merge is DELAYED, not DROPPED -- the allocated line's
+  //       final contents are the correct merge of the store's bytes over the refilled
+  //       line (C3, and by extension C1/C2's "the array write always still lands");
+  //   (c) the contract-violating second store's OWN array write also lands.
+  //
+  // Geometry: SET_C is never touched, so a COPYBACK store to it MISSES (-> the
+  // write-allocate drain miss) and its victim way is 0 (round-robin counter at reset).
+  // SET_D is warmed with a DUMMY line in way 0 first so the real target lands in way
+  // 1 -- deliberately NOT way 0, so `refillWriteHold`'s same-WAY term (which this
+  // lever does not touch, and which guards a DIFFERENT site, `axi.r.ready`) cannot
+  // fire and conflate the two mechanisms. The second store is WRITETHROUGH, not
+  // COPYBACK: a COPYBACK HIT acks via `cbHitAckReg`, which is `RegNext(stS2Valid &&
+  // ...)` and would therefore land on the EXACT cycle the just-released merge fires
+  // its own `storeAllocAckReg`, tripping DcachePlugin's one-ack-per-store assert --
+  // an artefact of the deliberate contract violation, not of the lever.
+  // ------------------------------------------------------------------------------
+  val SET_C   = 40L                       // drain-miss (write-allocate) target set -- COLD
+  val SET_D   = 41L                       // contract-violating second store's set -- WARM
+  val addrC   = SET_C * 16L               // never loaded => COPYBACK store to it MISSES
+  val addrDdm = SET_D * 16L               // dummy, fills SET_D way 0
+  val addrD   = SET_D * 16L + 0x800L      // real target, lands in SET_D way 1
+
+  val holdFiredAt = scala.collection.mutable.SortedSet[Int]()
+
+  // NOTE the sweep starts at 1, not 0: at offset 0 the two `storeIn` driver forks act
+  // on the SAME simulation cycle (store 1's deassert vs store 2's assert) and their
+  // execution order decides whether store 2 is presented at all -- the same
+  // offset-independence trap documented above `raceSameWay`. Offset 0 is degenerate
+  // for this scenario anyway (the second store retires long before REPLAY is reached,
+  // so the hold cannot fire there).
+  for (secondCycle <- 1 to 15) {
+    test(s"Lever F positive control: a store in S1/S2 must DELAY (never drop) the " +
+         s"COPYBACK drain-miss write-allocate merge (secondCycle=$secondCycle)",
+         VerilatorTest) {
+      compiled.doSim(s"leverFHold_$secondCycle", 1) { dut =>
+        val cd = dut.clockDomain
+        cd.forkStimulus(10)
+        val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+        dut.probe.logic.loadCmdIn.valid #= false
+        dut.probe.logic.storeIn.valid   #= false
+        dut.dcache.logic.storeDrainHoldExpected #= false
+        cd.waitSampling(5)
+
+        preload(mem, addrC, 16)
+        preload(mem, addrDdm, 16)
+        preload(mem, addrD, 16)
+        load(dut, cd, addrDdm, Size.LONG)   // SET_D way 0 (dummy)
+        load(dut, cd, addrD, Size.LONG)     // SET_D way 1 (the second store's target)
+        cd.waitSampling(4)
+
+        // Opt in to the deliberate producer-contract violation BEFORE it happens --
+        // otherwise DcachePlugin's own sim-side assert fires fatally (by design).
+        dut.dcache.logic.storeDrainHoldExpected #= true
+
+        var holdFired = false
+        var mergeSeen = 0
+        fork {
+          while (true) {
+            cd.waitSampling()
+            if (dut.dcache.logic.storeDrainHoldFired.toBoolean) holdFired = true
+            if (dut.dcache.logic.storeAllocAckReg.toBoolean) mergeSeen += 1
+          }
+        }
+        // Store 1 (cycle 0): COPYBACK, MISSES SET_C -> pendingStoreMiss -> REFILL
+        // (victim way 0 is clean, so no EVICT_WR) -> REPLAY's write-allocate merge.
+        fork {
+          dut.probe.logic.storeIn.valid #= true
+          dut.probe.logic.storeIn.payload.paddr #= addrC + 4
+          dut.probe.logic.storeIn.payload.data  #= BigInt("CAFEBABE", 16)
+          dut.probe.logic.storeIn.payload.size  #= Size.LONG
+          dut.probe.logic.storeIn.payload.useStrb #= false
+          dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+          cd.waitSampling()
+          dut.probe.logic.storeIn.valid #= false
+        }
+        // Store 2: the contract violation -- a second store presented while the first
+        // is still mid-excursion, swept across the REPLAY window.
+        fork {
+          cd.waitSampling(secondCycle + 1)
+          dut.probe.logic.storeIn.valid #= true
+          dut.probe.logic.storeIn.payload.paddr #= addrD + 4
+          dut.probe.logic.storeIn.payload.data  #= BigInt("DEADBEEF", 16)
+          dut.probe.logic.storeIn.payload.size  #= Size.LONG
+          dut.probe.logic.storeIn.payload.useStrb #= false
+          dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+          cd.waitSampling()
+          dut.probe.logic.storeIn.valid #= false
+        }
+        cd.waitSampling(160)
+        dut.dcache.logic.storeDrainHoldExpected #= false
+        if (holdFired) holdFiredAt += secondCycle
+
+        // (b) DELAYED, NOT DROPPED: the merge fired exactly once, and the allocated
+        // line holds the store's bytes over the refilled line's own data.
+        assert(mergeSeen == 1,
+          s"the write-allocate merge must fire EXACTLY once (delay, never drop / never " +
+          s"double-ack) -- storeAllocAckReg pulsed $mergeSeen times")
+        val gotC = load(dut, cd, addrC + 4, Size.LONG)
+        assert(gotC == BigInt("CAFEBABE", 16),
+          f"the HELD write-allocate merge was dropped or corrupted: cached read back " +
+          f"0x$gotC%08x, expected 0xCAFEBABE (0x${expected(addrC + 4, 4)}%08x would be the " +
+          f"un-merged refilled image)")
+        val gotCrest = load(dut, cd, addrC + 8, Size.LONG)
+        assert(gotCrest == expected(addrC + 8, 4),
+          f"the rest of the write-allocated line must be the refilled memory image: " +
+          f"got 0x$gotCrest%08x, expected 0x${expected(addrC + 8, 4)}%08x")
+
+        // (c) the contract-violating store's OWN array write landed too.
+        val gotD = load(dut, cd, addrD + 4, Size.LONG)
+        assert(gotD == BigInt("DEADBEEF", 16),
+          f"the second (contract-violating) store's array write was dropped: cached " +
+          f"read back 0x$gotD%08x, expected 0xDEADBEEF")
+        assert(mem.peekByte(addrD + 4) == 0xDE, "the second store's write-through beat reached memory")
+      }
+    }
+  }
+
+  // (a) NON-VACUITY: at least one offset must have actually asserted the hold. If none
+  // did, the sweep above proves nothing about `storeDrainRefillHold` at all -- every
+  // assertion in it would pass on a core with the gate deleted outright.
+  test("Lever F positive control scenario sanity: storeDrainRefillHold was actually " +
+       "asserted at least once across the secondCycle sweep") {
+    assert(holdFiredAt.nonEmpty,
+      "NONE of the Lever F sweep's offsets ever asserted `storeDrainRefillHold` inside " +
+      "REPLAY's write-allocate arm -- the sweep above is VACUOUS: its delay-never-drop " +
+      "assertions could all pass on a core with the hold removed entirely. Re-tune the " +
+      "secondCycle range against the current refill latency.")
+    info(s"storeDrainRefillHold asserted at secondCycle offsets: ${holdFiredAt.mkString(",")}")
+  }
 }
