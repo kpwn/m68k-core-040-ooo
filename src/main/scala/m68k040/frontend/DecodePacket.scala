@@ -42,4 +42,21 @@ case class DecodePacket() extends Bundle {
   //   Non-conditional / not-gshare-predicted packets carry phtValid=False.
   val phtValid   = Bool()
   val phtIndex   = UInt(11 bits)
+  // ── FMax "Lever B" (2026-08-08): precomputed operand size ────────────────────
+  // `OperationDecoder.decode(words(0)).size`, baked at I-cache REFILL time into
+  // `ChunkPredecode.size` and carried here by the Aligner. `MicroOpAssembler.computeOffload`
+  // consumes THIS instead of re-deriving the size in series with the destination-EA decode
+  // — that serial arc was 9 of the 21 logic levels (44%) of the design's OOC WNS path.
+  //
+  // INVARIANT (the whole correctness argument, gated live by `FedSpecsPacketPairingSpec`):
+  //   pkt.size === OperationDecoder.decode(pkt.words(0)).size
+  // It holds by construction rather than by proof — `PredecodeWord.classify` populates
+  // `ChunkPredecode.size` by CALLING the real decoder — so the only way it can break is
+  // PLUMBING (a `preds` index paired with the wrong `words` index, a default that doesn't
+  // match its co-located zeroed word, or a stash captured under a different enable).
+  //
+  // Only meaningful on packets the Aligner actually emits. Hand-built `DecodePacket`s in
+  // unit tests leave it unassigned, which is why `assemble(pkt)` (the 1-arg overload)
+  // routes to `computeOffloadFromWords` and never reads this field.
+  val size       = m68k040.isa.Size()
 }

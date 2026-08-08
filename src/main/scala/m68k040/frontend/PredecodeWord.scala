@@ -51,6 +51,17 @@ object PredecodeWord {
     // task #202: defaults False; set True only inside the specific branches below that
     // actually hit an eaExt/memDestExt "assume brief when unknown" guess.
     r.ambiguousLine := False
+    // FMax "Lever B": bake the operand size here, at REFILL-time predecode, by CALLING the
+    // real decoder — deliberately NOT a second re-derivation of the size tables. That makes
+    // `ChunkPredecode.size === OperationDecoder.decode(op).size` an equality BY
+    // CONSTRUCTION (same function, same word), so there is no cross-decoder equivalence
+    // obligation to discharge; only the plumbing/pairing invariant remains
+    // (FedSpecsPacketPairingSpec). Assigned ONCE, unconditionally, outside every branch
+    // below: `size` depends on the opword alone and must NOT be re-qualified by the
+    // extension-word-availability logic that drives `simple`/`lenWords`/`ambiguousLine`.
+    // Vivado prunes the ~40 other OpSpec fields at each of the 32 per-line instances, so
+    // the replicated cost is ~22 LUTs per word (measured: +715 logic LUTs total).
+    r.size          := m68k040.decode.OperationDecoder.decode(op).size
 
     val cls = op(15 downto 12).asUInt
 

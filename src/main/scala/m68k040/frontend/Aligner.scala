@@ -150,6 +150,12 @@ object Aligner {
       r.slot0.complex   := True
       r.slot0.lenWords  := 0
       r.slot0.fault     := False
+      // FMax Lever B: see the identical assignment in the simple-slot0 arm below for the
+      // full "why preds(0), not p0" derivation. A complex packet's `size` is unused by
+      // `computeOffload`'s consumers in practice, but it is carried anyway so the pairing
+      // invariant is unconditional (the gate checks every emitted packet, not just simple
+      // ones) and so no downstream consumer can ever read a don't-care.
+      r.slot0.size      := preds(0).size
 
       r.slot0Valid  := True
       r.slot1Valid  := False
@@ -206,6 +212,19 @@ object Aligner {
         r.slot0.complex   := False
         r.slot0.lenWords  := L0
         r.slot0.fault     := False
+        // FMax "Lever B": slot0's precomputed size. Read from `preds(0)` DIRECTLY, NOT from
+        // `p0` — this is load-bearing in both directions:
+        //  (a) CORRECTNESS: it is behaviour-identical. `p0 = Mux(preds(0).ambiguousLine,
+        //      p0LiveReg, preds(0))`, and `ambiguousLine` exists solely because
+        //      `simple`/`lenWords` can need an extension word that lay past the refill-time
+        //      64-byte line boundary. `size` needs ONLY the opword, which is `words(0)` in
+        //      both arms of that mux (the live reclassify classifies the same head word),
+        //      so both mux inputs carry the identical value.
+        //  (b) TIMING: `p0` is what produces `L0`, and `L0` feeds nearly the whole rest of
+        //      the front end. Bypassing the mux keeps `size` off `L0`'s arrival chain, so it
+        //      is available to `computeOffload` at t≈0 out of the `raw` register — which is
+        //      the entire point of the lever.
+        r.slot0.size      := preds(0).size
 
         r.slot0Valid := True
         r.stall      := False
@@ -282,6 +301,12 @@ object Aligner {
           r.slot1.lenWords  := L1
           r.slot1.complex   := False
           r.slot1.fault     := False
+          // FMax "Lever B": slot1's precomputed size, from `p1 = preds(L0)` — the SAME
+          // dynamic mux that already yields `L1` and that `words(idx)` above is paired
+          // against. No new mux rank is created: the existing `preds(L0)` select merely
+          // gets 2 bits wider. (Unlike slot0 there is no ambiguity mux to bypass here —
+          // `slot1Ok` already requires `!p1.ambiguousLine`.)
+          r.slot1.size      := p1.size
 
           r.slot1Valid  := True
           r.shiftWords  := L0L1.resize(4)

@@ -201,7 +201,11 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // ---- Default-drive IBuf inputs ----
     ibuf.io.push.valid   := False
     ibuf.io.push.payload.words.foreach(_ := 0)
-    ibuf.io.push.payload.preds.foreach { p => p.simple := False; p.lenWords := 0; p.ambiguousLine := False }
+    // FMax Lever B: the `size` default here must be BYTE, not LONG — it pairs with the
+    // `words.foreach(_ := 0)` default-drive on the line above, and `decode(0x0000).size`
+    // is `Size.BYTE` (`ORI.B #imm,D0`). See ChunkPredecode.size.
+    ibuf.io.push.payload.preds.foreach { p =>
+      p.simple := False; p.lenWords := 0; p.ambiguousLine := False; p.size := m68k040.isa.Size.BYTE }
     ibuf.io.push.payload.n := 0
     ibuf.io.shift        := 0
     ibuf.io.flush        := False
@@ -300,6 +304,9 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
             ibuf.io.push.payload.preds(j).simple          := rspPreds(srcIdx).simple
             ibuf.io.push.payload.preds(j).lenWords        := rspPreds(srcIdx).lenWords
             ibuf.io.push.payload.preds(j).ambiguousLine   := rspPreds(srcIdx).ambiguousLine
+            // FMax Lever B: indexed by the SAME `srcIdx` as `words(j)` above, which is what
+            // keeps `preds(j).size` paired with `words(j)` across the leading-word drop.
+            ibuf.io.push.payload.preds(j).size            := rspPreds(srcIdx).size
           }
         }
         ibuf.io.push.payload.n := nWords
@@ -378,6 +385,12 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     p0LiveReg.simple        init False
     p0LiveReg.lenWords      init 0
     p0LiveReg.ambiguousLine init True    // reset state must never read as "already resolved"
+    // FMax Lever B: `p0LiveReg.size` is DEAD by construction — Aligner deliberately takes
+    // slot0's size from `preds(0).size` rather than from the `p0` ambiguity mux (the two
+    // are identical, since `size` needs no lookahead word), so this field is pruned and
+    // the live reclassify is NOT a 33rd hardware instance of the size decoder. The init is
+    // kept only so the reg is deterministic if it ever does become read.
+    p0LiveReg.size          init m68k040.isa.Size.BYTE
     p0LiveReg := PredecodeWord.classify(ibuf.io.head(0), ibuf.io.head(1), ibuf.io.head(2), ibuf.io.head(3),
       extWValid  = ibuf.io.avail >= U(2, 4 bits),
       extW2Valid = ibuf.io.avail >= U(3, 4 bits),
@@ -555,6 +568,13 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       feed.payload(0).wordCount := 1
       feed.payload(0).lenWords  := 1
       feed.payload(0).words.foreach(_ := 0)
+      // FMax Lever B: the synthetic faulted packet zeroes `words`, so its `size` must be
+      // the size of opword 0x0000 — `Size.BYTE` (`ORI.B #imm,D0`) — to keep the pairing
+      // invariant `pkt.size === decode(pkt.words(0)).size` true on this path too. (The
+      // faulted packet's bytes are architecturally don't-care — decode turns it straight
+      // into a faulted vector-2 µop — but the invariant is checked unconditionally by
+      // FedSpecsPacketPairingSpec, and `FetchFaultSpec` exercises this path.)
+      feed.payload(0).size      := m68k040.isa.Size.BYTE
       feed.payload(0).predTaken  := False
       feed.payload(0).predTarget := U(0, 32 bits)
       feed.payload(0).phtValid   := False

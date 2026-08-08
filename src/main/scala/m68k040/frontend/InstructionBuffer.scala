@@ -74,6 +74,12 @@ class InstructionBuffer extends Component {
     e.pred.simple init False
     e.pred.lenWords init 0
     e.pred.ambiguousLine init False
+    // FMax Lever B: deterministic reset value, same reasoning as the fields above (an
+    // uninitialised Reg randomises per-seed in sim and makes lock-step flaky). BYTE, not
+    // LONG: `word init 0` pairs it with opword 0x0000 = `ORI.B #imm,D0`, and
+    // `OperationDecoder.decode(0x0000).size === Size.BYTE` — so the reset state satisfies
+    // the pairing invariant `pred.size === decode(word).size` rather than violating it.
+    e.pred.size init m68k040.isa.Size.BYTE
     e
   }
   val count   = Reg(UInt(log2Up(BUF_WORDS + 1) bits)) init 0
@@ -126,6 +132,7 @@ class InstructionBuffer extends Component {
           entries(s).pred.simple         := io.push.payload.preds(j).simple
           entries(s).pred.lenWords       := io.push.payload.preds(j).lenWords
           entries(s).pred.ambiguousLine  := io.push.payload.preds(j).ambiguousLine
+          entries(s).pred.size           := io.push.payload.preds(j).size   // FMax Lever B
         }
       }
     }
@@ -162,6 +169,11 @@ class InstructionBuffer extends Component {
       io.headPred(i).simple          := False
       io.headPred(i).lenWords        := 0
       io.headPred(i).ambiguousLine   := False
+      // FMax Lever B: this default is LOAD-BEARING and must be BYTE, not LONG. It pairs
+      // with the co-located `io.head(i) := 0` above, and the invariant every consumer
+      // relies on is `headPred(i).size === OperationDecoder.decode(head(i)).size`;
+      // `decode(0x0000).size === Size.BYTE` (opword 0x0000 is `ORI.B #imm,D0`).
+      io.headPred(i).size            := m68k040.isa.Size.BYTE
     }
   }
 

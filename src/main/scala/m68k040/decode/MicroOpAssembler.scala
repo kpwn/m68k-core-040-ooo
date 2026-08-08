@@ -457,19 +457,50 @@ object MicroOpAssembler {
       Mux(isFsfAbsL, shiftedWordsFor(pkt.words, U(1, 3 bits)), pkt.words))
   }
 
-  /** Compute the offload (spec + the two primary EAs) on the PRE-register packet.
-    * Carried through the FetchAlign->Decode register; `assemble` then reads it instead
-    * of re-running OperationDecoder + the two EaDecoders on the registered opword. */
-  def computeOffload(pkt: DecodePacket): Offload = {
+  /** Shared body of `computeOffload` / `computeOffloadFromWords`: identical in every
+    * respect except WHERE the operand size comes from (see both callers). */
+  private def offloadBody(pkt: DecodePacket, sz: Size.C): Offload = {
     val o = Offload()
+    // UNCHANGED, and deliberately so: the full OpSpec (including `spec.size`) still rides
+    // `fedIn.payload.specs(i)` for `assemble`. Lever B removes OperationDecoder from the
+    // SERIAL CHAIN INTO `dstEa`, not from the design — the `raw -> spec_*` endpoints remain
+    // a shallow reg-to-reg path with ample slack, which is where they belong.
     o.spec := OperationDecoder.decode(pkt.words(0))
-    o.srcEa := srcEaFor(pkt, o.spec.size)
+    o.srcEa := srcEaFor(pkt, sz)
     val dstEaField = pkt.words(0)(8 downto 6) ## pkt.words(0)(11 downto 9)
     val dstShift = srcEaWordCount(pkt.words(0)(5 downto 3).asUInt, pkt.words(0)(2 downto 0).asUInt,
-                                   o.spec.size, pkt.words)
-    o.dstEa := EaDecoder.decode(dstEaField, o.spec.size, shiftedWordsFor(pkt.words, dstShift))
+                                   sz, pkt.words)
+    o.dstEa := EaDecoder.decode(dstEaField, sz, shiftedWordsFor(pkt.words, dstShift))
     o
   }
+
+  /** Compute the offload (spec + the two primary EAs) on the PRE-register packet.
+    * Carried through the FetchAlign->Decode register; `assemble` then reads it instead
+    * of re-running OperationDecoder + the two EaDecoders on the registered opword.
+    *
+    * FMax "Lever B" (2026-08-08): the operand size feeding the two EA decodes is taken
+    * from `pkt.size` — precomputed at I-cache REFILL time (see `ChunkPredecode.size`) —
+    * instead of from `o.spec.size`. Before this, `size` arrived 9 logic levels / 2.288ns
+    * deep into `OperationDecoder`'s cone and then fed `srcEaWordCount -> shiftedWordsFor
+    * -> EaDecoder -> dstEa` IN SERIES, making the whole thing the design's 21-level OOC
+    * WNS path; sourcing it from the `raw` register instead retires that family (measured
+    * A/B: -1.216ns -> -0.824ns, +15.58MHz OOC, zero latency, zero IPC). The two are
+    * equal by construction — `PredecodeWord.classify` CALLS `OperationDecoder.decode`.
+    *
+    * ONLY safe on Aligner-produced packets. Anything that hand-builds a `DecodePacket`
+    * must call `computeOffloadFromWords` instead (and `assemble(pkt)` does). */
+  def computeOffload(pkt: DecodePacket): Offload = offloadBody(pkt, pkt.size)
+
+  /** Reference form: derives the operand size from the decoder itself, IGNORING
+    * `pkt.size`. Two users, both required:
+    *  - the standalone `assemble(pkt)` overload, used by ~14 unit specs that construct
+    *    `DecodePacket`s by hand and so have no meaningful `pkt.size` to read;
+    *  - `FedSpecsPacketPairingSpec`, where it is the REFERENCE MODEL that makes the gate a
+    *    genuine comparison rather than a tautology: it recomputes the offload from
+    *    `fed.packets(i).words` alone and demands bit equality with the `specs(i)` the
+    *    pipeline actually carried (which were computed via the plumbed `pkt.size`). */
+  def computeOffloadFromWords(pkt: DecodePacket): Offload =
+    offloadBody(pkt, OperationDecoder.decode(pkt.words(0)).size)
 
   def assemble(pkt: DecodePacket): AssembledUops = assemble(pkt, None)
   def assemble(pkt: DecodePacket, specIn: Option[OpSpec]): AssembledUops =
@@ -490,7 +521,12 @@ object MicroOpAssembler {
   private def assembleImpl(pkt: DecodePacket, offIn: Option[Offload]): AssembledUops = {
     val out = AssembledUops()
     val op  = pkt.words(0)
-    val off = offIn.getOrElse(computeOffload(pkt))
+    // FMax Lever B: the no-offload fallback is reached ONLY from the standalone
+    // `assemble(pkt)` overload, whose callers (~14 unit specs) hand-build `DecodePacket`s
+    // and leave `pkt.size` unassigned. It must therefore derive the size from the decoder
+    // (`computeOffloadFromWords`), NOT read `pkt.size`. The real DecodeStage path never
+    // reaches here — it always supplies a complete `Offload` via `assemble(pkt, offload)`.
+    val off = offIn.getOrElse(computeOffloadFromWords(pkt))
     val spec = off.spec
 
     // EA fields. Source EA = op(5..0). Dest EA (MOVE) = dstMode(8..6) ## dstReg(11..9).

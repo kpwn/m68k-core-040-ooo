@@ -33,6 +33,23 @@ case class ChunkPredecode() extends Bundle {
   // REFILL predecode could not see them. Defaults False (every other classification
   // is unaffected; a caller that never sets it behaves exactly as before).
   val ambiguousLine = Bool()
+  // FMax "Lever B" (2026-08-08): `OperationDecoder.decode(op).size` for THIS word, baked
+  // at I-cache REFILL time so DecodeStage's post-`raw` offload cone (`computeOffload`)
+  // need not re-derive it IN SERIES with the destination-EA decode. Measured on the
+  // pre-lever netlist, `OperationDecoder`'s size sub-cone sat at the HEAD of the design's
+  // OOC WNS path, costing 9 of its 21 logic levels (2.288ns / 44%); sourcing `size` from
+  // a register instead retires that family outright (+15.58MHz OOC, measured A/B).
+  //
+  // Unlike `lenWords`/`simple`, `size` is a pure function of the OPWORD ALONE — it needs
+  // no extension-word lookahead — so it is never `ambiguousLine`-qualified and is
+  // identical in both arms of Aligner's `p0` ambiguity mux (see Aligner.align, which
+  // deliberately reads `preds(0).size` rather than `p0.size` for exactly that reason).
+  //
+  // `PredecodeWord.classify` populates this by CALLING the real `OperationDecoder`, not by
+  // re-deriving it: equality with the decode-stage value therefore holds BY CONSTRUCTION,
+  // leaving only a plumbing/pairing invariant to prove (FedSpecsPacketPairingSpec). See
+  // `docs/superpowers/specs/2026-08-08-fmax-leverb-precompute-size-design.md`.
+  val size = m68k040.isa.Size()
 }
 
 object CacheMode extends SpinalEnum {

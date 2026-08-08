@@ -5,7 +5,7 @@ import spinal.lib._
 import org.scalatest.funsuite.AnyFunSuite
 
 class ChunkPredecodeSpec extends AnyFunSuite {
-  test("ChunkPredecode is 6 bits; FetchRsp carries 4 of them") {
+  test("ChunkPredecode is 8 bits; FetchRsp carries 4 of them") {
     SpinalConfig().generateVerilog(new Component {
       val c = ChunkPredecode()
       assert(c.simple.isInstanceOf[Bool])
@@ -15,7 +15,13 @@ class ChunkPredecodeSpec extends AnyFunSuite {
       assert(c.lenWords.getWidth == 4)
       // Widened 5->6 bits (task #202, 2026-07-22): added `ambiguousLine`, a 1-bit flag
       // for the I-cache-line-boundary predecode fix (see ChunkPredecode's field comment).
-      assert(c.asBits.getWidth == 6)
+      // Widened 6->8 bits (FMax "Lever B", 2026-08-08): added `size`, the 2-bit
+      // `OperationDecoder.decode(op).size` baked at REFILL time so DecodeStage need not
+      // re-derive it in series with the destination-EA decode. This width is what drives
+      // `IcachePlugin`'s `predMem` from 192 to 256 bits per line/way (the plugin itself
+      // needs no edit — every width there derives from `ChunkPredecode().getBitsWidth`).
+      assert(c.size.getBitsWidth == 2)
+      assert(c.asBits.getWidth == 8)
       val r = master(Flow(FetchRsp()))
       r.valid := False
       r.payload.assignDontCare()
