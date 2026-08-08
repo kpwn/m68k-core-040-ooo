@@ -17,8 +17,10 @@ import spinal.lib.misc.plugin.FiberPlugin
   * flushed on a mispredict (pipeFlush). The decode→rename skid that the previous
   * 1:1 passthrough provided is now the queue itself.
   *
-  * FRONTEND-FMAX SKID: the FetchAlign→DecodeStage boundary is registered by a
-  * 1-deep `PipeStage`. This SPLITS the standing route-dominated critical arc
+  * FRONTEND-FMAX SKID: the FetchAlign→DecodeStage boundary is registered by TWO
+  * chained 1-deep `PipeStage`s (`raw` then `fedIn`→`fed`; the first was added by
+  * FMax Frontend Lever C — see the `RawPacket` comment below). This SPLITS the
+  * standing route-dominated critical arc
   * `ibuf.count → Aligner predicated-length/branchDisp select → MicroOpQueue ring
   * write-enable` into two shorter halves: (1) `ibuf.count → Aligner → fedStage
   * register`, and (2) `fedStage register → MicroOpAssembler → queue ring`. The
@@ -28,6 +30,21 @@ import spinal.lib.misc.plugin.FiberPlugin
   * held in the register is squashed on a mispredict/exception redirect.
   */
 class DecodeStage extends FiberPlugin with DecodeUopService {
+
+  // FMAX "FRONTEND LEVER C" (docs/superpowers/specs/2026-08-08-fmax-frontend-leverc-register-split-design.md,
+  // .../plans/2026-08-08-fmax-frontend-leverc-register-split-plan.md): the RAW aligner-output
+  // payload — the 2 DecodePackets + slot1Valid, and NOTHING ELSE. This is the payload of a NEW
+  // pipeline register inserted BEFORE `computeOffload`, cutting the (previously single-cycle)
+  // `ibuf pred_lenWords -> Aligner -> computeOffload -> fed_payload_specs_*_dstEa_*` cone
+  // (measured 5.674ns / 17 logic levels, the design's WNS holder at -1.693ns) into two halves:
+  //   half 1 = ibuf + Aligner -> `raw`             (measured 2.23-2.57ns to the cut point)
+  //   half 2 = `raw` -> computeOffload -> `fedIn`  (measured 3.11-3.27ns from the cut point)
+  // A DISTINCT bundle (rather than `FedPacket` minus `specs`) is deliberate — it makes "this
+  // register carries no offload" structurally enforced rather than conventional (design §8 Q3).
+  case class RawPacket() extends Bundle {
+    val packets    = Vec(DecodePacket(), 2)
+    val slot1Valid = Bool()
+  }
 
   // Combined skid payload: the 2 DecodePackets plus the slot1-valid flag, carried
   // together through the registered FetchAlign→DecodeStage boundary so the second
@@ -75,20 +92,57 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // then decode the REGISTERED packets. This splits the standing route-dominated
     // arc (ibuf.count → Aligner → MicroOpQueue ring) at this boundary. pipeFlush
     // squashes a held wrong-path group (same broadcast that flushes the queue).
-    val fedIn = Stream(FedPacket())
-    fedIn.valid              := df.feed.valid
-    fedIn.payload.packets(0) := df.feed.payload(0)
-    fedIn.payload.packets(1) := df.feed.payload(1)
-    fedIn.payload.slot1Valid := df.slot1Valid
-    // ANGLE E + LEVER 2 offload: compute the per-slot Offload (OpSpec + srcEa/dstEa EAs)
-    // on the PRE-register packet (the aligner output, available a full cycle before `fed`).
-    // The result is registered alongside the packets so the post-register decode+imm cone
-    // collapses to a select. Pure-function of the opword+words -> byte-identical to decoding
-    // the registered packet in `assemble`.
-    fedIn.payload.specs(0)   := MicroOpAssembler.computeOffload(df.feed.payload(0))
-    fedIn.payload.specs(1)   := MicroOpAssembler.computeOffload(df.feed.payload(1))
-    df.feed.ready := fedIn.ready
+    // FMAX "FRONTEND LEVER C" — the NEW first register (see `RawPacket` above). The aligner
+    // output is captured RAW here; `computeOffload` then runs on the REGISTERED packet in the
+    // following cycle, so the two ~equal halves of the old single-cycle cone each get a whole
+    // clock period. Flushed by the SAME `pipeFlush` that already squashes `fed`, the queue,
+    // `pushReg` and every stash/FSM pending marker — no new plumbing, because `PipeStage.apply`
+    // makes `when(flush){valid := False}` the LAST assignment to `valid` (it wins over the
+    // same-cycle `when(slotFree){valid := in.valid}` capture), which is exactly the last-wins
+    // property the flush block at the bottom of this Area was written to guarantee. No FSM
+    // holds `raw` (every hold is expressed as `fed.ready`, one stage downstream) and no pending
+    // marker is fed from `raw` (`movemPendPkt`/`movepPendPkt`/`ucPendPkt` all take
+    // `fed.payload.packets(1)`), so this adds a squash TARGET, not a squash ORDERING problem.
+    val rawIn = Stream(RawPacket())
+    rawIn.valid              := df.feed.valid
+    rawIn.payload.packets(0) := df.feed.payload(0)
+    rawIn.payload.packets(1) := df.feed.payload(1)
+    rawIn.payload.slot1Valid := df.slot1Valid
+    df.feed.ready            := rawIn.ready
 
+    val raw = PipeStage(rawIn, pipeFlush)
+
+    // ── Registered FetchAlign→DecodeStage boundary (timing skid) ────────────────
+    // Pack the feed payload + slot1Valid into one stream, register it (PipeStage),
+    // then decode the REGISTERED packets. This splits the standing route-dominated
+    // arc (ibuf.count → Aligner → MicroOpQueue ring) at this boundary. pipeFlush
+    // squashes a held wrong-path group (same broadcast that flushes the queue).
+    // LEVER C: UNCHANGED in shape — only the SOURCE of every field moved from
+    // `df.feed.payload(i)` / `df.slot1Valid` (combinational aligner output) to
+    // `raw.payload.*` (the registered copy of those exact bits, one cycle later).
+    val fedIn = Stream(FedPacket())
+    fedIn.valid              := raw.valid
+    fedIn.payload.packets(0) := raw.payload.packets(0)
+    fedIn.payload.packets(1) := raw.payload.packets(1)
+    fedIn.payload.slot1Valid := raw.payload.slot1Valid
+    // ANGLE E + LEVER 2 offload: compute the per-slot Offload (OpSpec + srcEa/dstEa EAs)
+    // on the pre-`fed` packet (now the `raw` register's output rather than the raw aligner
+    // combinational output). The result is registered alongside the packets so the
+    // post-register decode+imm cone collapses to a select. `computeOffload` is a PURE
+    // function of `pkt.words` alone, so feeding it a REGISTERED copy of the identical packet
+    // one cycle later is bit-identical — this lever is a pure LATENCY change, no computed
+    // value differs.
+    fedIn.payload.specs(0)   := MicroOpAssembler.computeOffload(raw.payload.packets(0))
+    fedIn.payload.specs(1)   := MicroOpAssembler.computeOffload(raw.payload.packets(1))
+    raw.ready := fedIn.ready
+
+    // LEVER C, design §8 Q4: `packets` IS re-registered into `fed` (rather than letting
+    // `assemble` read `raw.payload.packets` directly and having `fed` carry only `specs`).
+    // The ~500 extra flops are deliberate and load-bearing: `assemble` — and Lever U1's
+    // `ucPendSpecReg` identity proof — require that `fed.payload.specs(i)` and
+    // `fed.payload.packets(i)` describe the SAME instruction group in the SAME cycle.
+    // Reading `raw.packets` downstream would misalign the packet from its own `specs` by
+    // exactly one cycle. ~+0.12pp of the device's flops; LUTs approximately neutral.
     val fed = PipeStage(fedIn, pipeFlush)
 
     // ── 3-µop-instruction handling (RTR / mem-dest RMW) ─────────────────────────
