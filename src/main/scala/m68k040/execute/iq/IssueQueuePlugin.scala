@@ -930,10 +930,44 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // a following ADDX/ADD/SUB reading the flags CMP2/CHK2 just wrote). Root-caused via
     // live trace, task #139/#141, seed 62 (see fuzz-campaign-divergence-2026-07-16
     // memory); repro: repros/fuzz-seed62-cmp2-hang.s.
+    //
+    // FMAX (netlist-grounded, 2026-08-08): this gate is deliberately `fire` ONLY --
+    // it must NOT re-test `isAluSlowProducer(ctx.uop)`. A previous `&& !slowFire`
+    // term here was measured (post-route, `xcku5p-ffvb676-2` @4.000ns, checkpoint
+    // `3cba17f`) to consume 5 of the 6 inputs of this gate's LUT6 --
+    //   when_IssueQueuePlugin_l936_4 = selPorts_4_fire && !(op===SHIFT || op===BITFIELD)
+    // -- which is the SINGLE mechanism that dragged the 6-bit `op` field's MuxOH out
+    // of the select cone and INTO the scoreboard-clear cone, making this family the
+    // design's WNS holder (9 of the 10 worst paths, -1.699ns). A `set_disable_timing`
+    // what-if on exactly that arc measured the family at -1.518ns. Zero latency, zero
+    // IPC, strictly less logic. (Grounding report: "FMax grounding: IssueQueuePlugin
+    // sb{Int,X,Nzvc}_busy", §2.1/§3/§8 Fix 1.)
+    //
+    // WHY THE TERM IS DEAD WEIGHT (re-derived from the push side above, NOT taken on
+    // faith): a slow-ALU producer NEVER sets ANY sb* bit, because every push-side
+    // branch that can write sb* tests `isAluSlow` FIRST and routes to the aluSlow*
+    // bitmaps instead --
+    //   pdstValid  (:876-881): isLs -> isCplxProd -> isAluSlow -> otherwise sbInt
+    //   writesNzvc (:882-887): isAluSlow FIRST -> ... -> otherwise sbNzvc
+    //   writesX    (:888-891): isAluSlow FIRST -> otherwise sbX
+    // (and slot1's identical chains at :892-909; these six sites plus the flush at
+    // the bottom are the ONLY writers of sb*.busy in the design). So for a slow
+    // producer the clear below targets a bit its own push left at 0, and under the
+    // ALREADY-RELIED-UPON one-producer-per-physreg invariant (:148-159) no OTHER
+    // in-flight producer owns that bit either -- the clear is a genuine no-op. This
+    // introduces NO new invariant: it leans on exactly the one `physToSlot` and the
+    // push/clear intra-cycle ordering already require.
+    //
+    // Consistency check (the decisive one): the LS, CPLX-int, LS-NZVC and CPLX-NZVC
+    // classes ALSO route away from sb* on push, and this loop has ALWAYS cleared sb*
+    // for them with NO guard at all (see the paragraph above, ":922-924"). If the
+    // "clearing a bit my own push did not set is a harmless no-op" argument were
+    // unsound, the design would already be broken for those four far more common
+    // classes. `!slowFire` was the lone asymmetric guard; dropping it makes
+    // SHIFT/BITFIELD consistent with them rather than special.
     for (k <- selPorts.indices) {
       val ctx = selPorts(k).payload
-      val slowFire = isAluSlowProducer(ctx.uop)
-      when(selPorts(k).fire && !slowFire) {
+      when(selPorts(k).fire) {
         when(ctx.uop.pdstValid)  { sbInt.busy(ctx.uop.pdst)     := False }
         when(ctx.uop.writesNzvc) { sbNzvc.busy(ctx.uop.pNzvcDst) := False }
         when(ctx.uop.writesX)    { sbX.busy(ctx.uop.pXDst)       := False }
