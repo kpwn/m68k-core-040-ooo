@@ -877,13 +877,39 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // PACKET is stashed; the engine enters from it next cycle. `fed` was already consumed
     // when the slot1 was stashed (the FOLLOWING group is held until the engine finishes).
     val ucPendPkt   = Reg(DecodePacket())
+    // FMAX "LEVER U1" (docs/superpowers/specs/2026-08-08-fmax-leveru1-ucpendpkt-reuse-design.md,
+    // .../plans/2026-08-08-fmax-leveru1-ucpendpkt-reuse-plan.md): the stashed slot-1 packet's
+    // OpSpec, captured from the ALREADY-COMPUTED, ALREADY-REGISTERED `fed.payload.specs(1).spec`
+    // in the very same `when` arms that write `ucPendPkt` itself, instead of re-deriving it a
+    // cycle later with a SECOND combinational `OperationDecoder.decode(ucPendPkt.words(0))`.
+    //
+    // PROVABLE IDENTITY (not an approximation): `fed.payload.specs(1).spec` is, by construction
+    // (`MicroOpAssembler.computeOffload`: `o.spec := OperationDecoder.decode(pkt.words(0))`,
+    // wired at `:88` from `df.feed.payload(1)` on the PRE-register side and carried through the
+    // SAME `fedIn -> fed` PipeStage as `packets(1)`), exactly
+    // `OperationDecoder.decode(fed.payload.packets(1).words(0))`. Every one of the four
+    // `ucPendPkt := fed.payload.packets(1)` writers (search this file for `ucPendSpecReg`) is
+    // paired one-for-one with a `ucPendSpecReg := fed.payload.specs(1).spec`, so at every cycle
+    // in which `ucPendValid` holds, `ucPendSpecReg === OperationDecoder.decode(ucPendPkt.words(0))`
+    // bit-for-bit. `OperationDecoder.decode` is a pure function of the opword alone -> same bits
+    // in, same bits out, one register earlier. (`UcPendSpecStashEquivalenceSpec` proves BOTH
+    // halves: the exhaustive 65536-opword value identity, and — with the OLD re-decode
+    // instantiated in the testbench and compared live against this register — the capture-site
+    // coverage over every reachable stash scenario.)
+    //
+    // The stash/replay CONTROL FLOW is untouched: `ucPendValid` gating, the hold duration and
+    // the replay trigger are all exactly as before; only the VALUE feeding `ucEntrySpec` moves
+    // from a combinational re-decode to a register read. This deletes a whole OperationDecoder
+    // instance from the `ucPendPkt.words(0) -> ... -> FetchAlignPlugin.decodePc` critical family
+    // (segment "B", 31.3% of that family's worst path) at zero latency cost.
+    val ucPendSpecReg = Reg(OpSpec())
     when(pipeFlush) { ucPendValid := False }
 
     // The source packet the engine enters from: the stashed slot1 microcoded op, else slot0.
     val ucEntryPkt = Mux(ucPendValid, ucPendPkt, fed.payload.packets(0))
-    // ucEntrySpec: reuse spec0 (the slot0 decode) for a slot0 entry; only the PENDING-slot1
-    // entry needs its own decode (its opword differs from slot0). One extra cone, not two.
-    val ucPendSpec  = OperationDecoder.decode(ucPendPkt.words(0))
+    // ucEntrySpec: reuse spec0 (the slot0 decode) for a slot0 entry; the PENDING-slot1 entry
+    // reads its own STASHED spec (Lever U1 above) — no second OperationDecoder cone at all now.
+    val ucPendSpec  = ucPendSpecReg
     val ucEntrySpec = Mux(ucPendValid, ucPendSpec, spec0)
     ucEntryPkt.pc.simPublic(); ucEntryPkt.words(0).simPublic()  // debug-only (task #144)
 
@@ -1888,6 +1914,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         // The engine enters from it next cycle (mirrors the slot1 MOVEM pend).
         ucPendValid := True
         ucPendPkt   := fed.payload.packets(1)
+        ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: stash the already-registered spec alongside the packet
       } elsewhen(deferSlot1 && fed.valid) {
         stashValid  := True                  // defer slot1 to next cycle (3-µop slot0 or slot1)
         stashCount  := a1raw.count
@@ -1951,6 +1978,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
           // proven by the movem-ucode-s1 lock-step, which diverges without this arm).
           ucPendValid := True
           ucPendPkt   := fed.payload.packets(1)
+          ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: stash the already-registered spec alongside the packet
         } otherwise {
           stashValid  := True
           stashCount  := a1raw.count
@@ -2064,6 +2092,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
           ucPendValid := True
           ucPendPkt   := fed.payload.packets(1)
+          ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: stash the already-registered spec alongside the packet
         } otherwise {
           stashValid := True
           stashCount := a1raw.count
@@ -2108,6 +2137,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
           ucPendValid := True
           ucPendPkt   := fed.payload.packets(1)
+          ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: stash the already-registered spec alongside the packet
         } otherwise {
           stashValid := True
           stashCount := a1raw.count
