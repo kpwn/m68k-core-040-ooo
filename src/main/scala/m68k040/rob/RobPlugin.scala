@@ -747,73 +747,33 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // with the other completion marks (BEFORE the alloc-reset) so alloc wins on a
     // re-used index. completes is set by the LS EU's normal completion port too (the
     // faulted access still completes so the entry can retire + trigger the exception).
-    // ── FMax "LS/ROB Lever C": per-entry write-select hoist ──────────────────
-    // (docs/superpowers/specs/2026-08-08-fmax-lsrob-leverc-writeenable-flatten-design.md,
-    //  docs/superpowers/plans/2026-08-08-fmax-lsrob-leverc-writeenable-flatten-plan.md)
-    //
-    // SpinalHDL ALREADY elaborates `when(p.valid){ store(p.robId) := d }` into
-    // exactly `for i: if(p.valid && oneHot(p.robId)(i)) store(i) <= d` (the emitted
-    // `_zz_ = 1 <<< robId` + per-entry `if(_zz[i])` bodies). Writing that form out
-    // by hand is therefore BIT-IDENTICAL — same boolean function, same signals,
-    // same cycle, same last-assign priority. Nothing is registered; no latency
-    // changes; ports #1/#2 keep INDEPENDENT selects so two different robIds can
-    // still be written the same cycle (the reason the two ports exist at all, see
-    // the port-declaration comment at the top of this plugin).
-    //
-    // The point of writing it out is the `keep` attribute. Without it the tool
-    // absorbs `p.valid` directly into every per-bit data mux, so the single LATE
-    // node ends up with fanout 2084 on the routed netlist. Load decomposition of
-    // that net: 2019 of 2083 loads are `faultAddrStore` (64x32) per-bit DATA
-    // muxes, only 64 are the per-entry write-ENABLE decode that sits on the
-    // critical path — i.e. the enable path pays a 0.671 ns route hop it does not
-    // cause, because it shares a driver with a 2019-load data-mux array. The
-    // named+kept per-entry select gives the data muxes a LOCAL (fanout ~33) node
-    // to consume instead.
-    //
-    // Textual order is load-bearing: the ls loop must stay before the sq loop, and
-    // both before euFaultCompletion / alloc0 / alloc1, so SpinalHDL's last-assign
-    // priority (alloc1 > alloc0 > eu > sq > ls) is bit-for-bit unchanged.
-    val lsFaultOh  = UIntToOh(lsFaultCompletion.payload.robId, depth)
-    val sqFaultOh  = UIntToOh(sqFaultCompletion.payload.robId, depth)
-    val lsFaultSel = Vec(Bool(), depth)
-    val sqFaultSel = Vec(Bool(), depth)
-    for (i <- 0 until depth) {
-      lsFaultSel(i) := lsFaultCompletion.valid && lsFaultOh(i)
-      sqFaultSel(i) := sqFaultCompletion.valid && sqFaultOh(i)
-      lsFaultSel(i).setName(s"lsFaultSel_$i").addAttribute("keep", "true")
-      sqFaultSel(i).setName(s"sqFaultSel_$i").addAttribute("keep", "true")
-    }
-    for (i <- 0 until depth) {
-      when(lsFaultSel(i)) {
-        faultedStore(i)   := True
-        faultVecStore(i)  := U(2, 8 bits)  // access fault
-        faultAddrStore(i) := lsFaultCompletion.payload.faultAddr
-        faultWrStore(i)   := lsFaultCompletion.payload.write
-        faultSizeStore(i) := lsFaultCompletion.payload.sizeBits
-        faultSupStore(i)  := lsFaultCompletion.payload.supervisor
-        faultAtcStore(i)  := lsFaultCompletion.payload.atc
-        // A DATA (LS) access fault is data-space, NEVER an instruction fetch — clear the
-        // SSW-instr bit explicitly so it does not inherit the alloc'd µop's sswInstr
-        // (which is only meaningful for I-fetch-fault µops). Without this the SSW
-        // data/program bit was seed-flaky (the µop's unset sswInstr randomized).
-        faultInstrStore(i) := False
-      }
+    when(lsFaultCompletion.valid) {
+      faultedStore(lsFaultCompletion.payload.robId)   := True
+      faultVecStore(lsFaultCompletion.payload.robId)  := U(2, 8 bits)  // access fault
+      faultAddrStore(lsFaultCompletion.payload.robId) := lsFaultCompletion.payload.faultAddr
+      faultWrStore(lsFaultCompletion.payload.robId)   := lsFaultCompletion.payload.write
+      faultSizeStore(lsFaultCompletion.payload.robId) := lsFaultCompletion.payload.sizeBits
+      faultSupStore(lsFaultCompletion.payload.robId)  := lsFaultCompletion.payload.supervisor
+      faultAtcStore(lsFaultCompletion.payload.robId)  := lsFaultCompletion.payload.atc
+      // A DATA (LS) access fault is data-space, NEVER an instruction fetch — clear the
+      // SSW-instr bit explicitly so it does not inherit the alloc'd µop's sswInstr
+      // (which is only meaningful for I-fetch-fault µops). Without this the SSW
+      // data/program bit was seed-flaky (the µop's unset sswInstr randomized).
+      faultInstrStore(lsFaultCompletion.payload.robId) := False
     }
     // SQ precise-path drain fault (Task P2.4): identical treatment to lsFaultCompletion
     // above, a second independent port so an older drained store's bus error and a
     // younger in-flight access's translate-time MMU fault can both land the same
     // cycle. Placed BEFORE the alloc-reset (alloc wins on a re-used index).
-    for (i <- 0 until depth) {
-      when(sqFaultSel(i)) {
-        faultedStore(i)   := True
-        faultVecStore(i)  := U(2, 8 bits)
-        faultAddrStore(i) := sqFaultCompletion.payload.faultAddr
-        faultWrStore(i)   := sqFaultCompletion.payload.write
-        faultSizeStore(i) := sqFaultCompletion.payload.sizeBits
-        faultSupStore(i)  := sqFaultCompletion.payload.supervisor
-        faultAtcStore(i)  := sqFaultCompletion.payload.atc
-        faultInstrStore(i):= False
-      }
+    when(sqFaultCompletion.valid) {
+      faultedStore(sqFaultCompletion.payload.robId)   := True
+      faultVecStore(sqFaultCompletion.payload.robId)  := U(2, 8 bits)
+      faultAddrStore(sqFaultCompletion.payload.robId) := sqFaultCompletion.payload.faultAddr
+      faultWrStore(sqFaultCompletion.payload.robId)   := sqFaultCompletion.payload.write
+      faultSizeStore(sqFaultCompletion.payload.robId) := sqFaultCompletion.payload.sizeBits
+      faultSupStore(sqFaultCompletion.payload.robId)  := sqFaultCompletion.payload.supervisor
+      faultAtcStore(sqFaultCompletion.payload.robId)  := sqFaultCompletion.payload.atc
+      faultInstrStore(sqFaultCompletion.payload.robId):= False
     }
     // Execute-time conditional fault (TRAPV / CHK / DIV0 / address-error task #189):
     // flip the entry FAULTED + the CARRIED vector. faultPc is already the µop's own
