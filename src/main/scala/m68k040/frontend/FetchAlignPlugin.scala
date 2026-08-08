@@ -385,11 +385,18 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     p0LiveReg.simple        init False
     p0LiveReg.lenWords      init 0
     p0LiveReg.ambiguousLine init True    // reset state must never read as "already resolved"
-    // FMax Lever B: `p0LiveReg.size` is DEAD by construction — Aligner deliberately takes
+    // FMax Lever B: `p0LiveReg.size` is UNREAD by construction — Aligner deliberately takes
     // slot0's size from `preds(0).size` rather than from the `p0` ambiguity mux (the two
-    // are identical, since `size` needs no lookahead word), so this field is pruned and
-    // the live reclassify is NOT a 33rd hardware instance of the size decoder. The init is
-    // kept only so the reg is deterministic if it ever does become read.
+    // are identical, since `size` needs no lookahead word, and bypassing the mux keeps
+    // `size` off `L0`'s arrival chain, which is the point of the lever).
+    //
+    // The design spec claims this field is therefore PRUNED, so that the live reclassify is
+    // "not a 33rd hardware instance of the size decoder". That claim is FALSE and was
+    // checked against the real netlist: `p0LiveReg_size` appears 117 times in the design
+    // spec's own probe netlist and 118 times here. It survives elaboration in both, so it
+    // is not a difference between them and not a regression — but do not rely on the
+    // pruning argument if this field's cost ever matters. The init below is for reset
+    // determinism only (an uninitialised Reg randomises per sim seed).
     p0LiveReg.size          init m68k040.isa.Size.BYTE
     p0LiveReg := PredecodeWord.classify(ibuf.io.head(0), ibuf.io.head(1), ibuf.io.head(2), ibuf.io.head(3),
       extWValid  = ibuf.io.avail >= U(2, 4 bits),
