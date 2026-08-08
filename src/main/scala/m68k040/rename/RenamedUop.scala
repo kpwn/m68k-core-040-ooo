@@ -1,7 +1,7 @@
 package m68k040.rename
 
 import m68k040.isa.{Cluster, Size, MemOp}
-import m68k040.decode.{DecOp, AluOpClass}
+import m68k040.decode.DecOp
 import spinal.core._
 
 /** Rename -> dispatch/ROB contract: DecodedUop fields + physical operands.
@@ -13,12 +13,6 @@ case class RenamedUop() extends Bundle {
   val pc           = UInt(32 bits)
   val nextPc       = UInt(32 bits)   // POST-instruction PC (pc + length); used for commit pc
   val op           = DecOp()
-  // FMax Lever N-A: the ALU op-class control PRE-DECODED from `op`. Purely derived —
-  // `aluCls === AluOpClass.of(op)` holds by construction (RenameStage assigns the two
-  // on adjacent lines from the same `dec.op`, and that is the ONLY producer). Carried
-  // so the ALU EU never re-derives `DecOp` compares combinationally in series with its
-  // adder. See `m68k040/decode/AluOpClass.scala` for the full rationale.
-  val aluCls       = AluOpClass()
   val cluster      = Cluster()
   val size         = Size()
   val memOp        = MemOp()

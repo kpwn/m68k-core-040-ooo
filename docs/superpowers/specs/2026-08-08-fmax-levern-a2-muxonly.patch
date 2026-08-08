@@ -1,0 +1,22 @@
+diff --git a/src/main/scala/m68k040/execute/AluEuPlugin.scala b/src/main/scala/m68k040/execute/AluEuPlugin.scala
+index d3443e9..114414d 100644
+--- a/src/main/scala/m68k040/execute/AluEuPlugin.scala
++++ b/src/main/scala/m68k040/execute/AluEuPlugin.scala
+@@ -511,8 +511,15 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
+     // Fast final flags: CASOP cmp/preserve flags for CAS/CAS2, CCR-rmw for toCcr, BCD
+     // decimal carry/quirky-N/V for BCD, else the ALU datapath (NO shifter). X = the BCD
+     // decimal carry/borrow for a BCD op (CAS/CAS2 never write X).
+-    val finalNzvc = Mux(casIsOp, casNzvc, Mux(u1.toCcr, ccrNzvc, Mux(isBcd, bcdNzvc, aluNzvc)))
+-    val finalX    = Mux(u1.toCcr, ccrX, Mux(isBcd, bcdCarry, rsp.xOut))
++    // LEVER N-A2 (mux re-association ONLY -- zero area, no uop change).
++    // Unconditionally value-identical to the old nesting; `useAluNzvc` is exactly the
++    // old chain's fall-through arm and the cas>toCcr>bcd priority is preserved.
++    // Hoists the ONE late input (aluNzvc, off the adder) to the outermost 2:1 mux.
++    val useAluNzvc = !casIsOp && !u1.toCcr && !isBcd
++    val nonAluNzvc = Mux(casIsOp, casNzvc, Mux(u1.toCcr, ccrNzvc, bcdNzvc))
++    val finalNzvc = Mux(useAluNzvc, aluNzvc, nonAluNzvc)
++    val useAluX   = !u1.toCcr && !isBcd
++    val finalX    = Mux(useAluX, rsp.xOut, Mux(u1.toCcr, ccrX, bcdCarry))
+ 
+     // ---- S1: FAST writeback (gated by masks; suppressed for a slow op) ----
+     val fastFire = s1Valid && !isSlow

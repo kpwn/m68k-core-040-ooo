@@ -259,3 +259,86 @@ Do not quote a projected MHz without a gate.
   deliberately NOT pre-decoded: they are either not pure functions of `op`, or
   their selects already arrive early and pre-decoding them would buy nothing but
   µop width.
+
+---
+
+## 9. RESULT: MEASURED, REJECTED, REVERTED (added 2026-08-08 after the gate)
+
+**Status change: this design is REJECTED on measured post-route evidence.** The
+RTL was reverted; the implementation is preserved at commit `eecbc2e` and can be
+re-applied wholesale (`git revert` of the revert) if a future context changes the
+conclusion.
+
+### 9.1 The numbers
+
+Three arms, identical flow (`synth/impl_FullCore.tcl` + a `NAPROBE` tail),
+`xcku5p-ffvb676-2-e`, OOC, 4.000 ns, isolated `git worktree` each, all inside one
+uncontended machine window (23-26 GB free, only a sibling JTAG session alive).
+Vivado P&R is deterministic given the netlist (this round's own control
+experiment), and the baseline arm reproduced the previously-recorded pinned-gate
+number to 5 significant figures (190.114 MHz), so the flow is validated.
+
+| arm | WNS | FMax | TNS | failing endpoints | LUTs | FFs |
+|---|---|---|---|---|---|---|
+| **baseline `344c0c5`** | -1.260 ns | **190.11 MHz** | -8,815.0 ns | 18,215 | 113,034 | 46,804 |
+| **N-A as designed** (µop field + mux re-assoc) | -1.551 ns | **180.15 MHz** | -13,532.3 ns | 26,393 | 111,966 | 47,131 |
+| **N-A2: mux re-association ONLY** (zero area) | -1.425 ns | **184.33 MHz** | -10,899.9 ns | 21,368 | 108,393 | 46,861 |
+
+Targeted family, worst slack per sink (post-route):
+
+| sink | baseline | N-A full | N-A2 mux-only |
+|---|---|---|---|
+| `nzvcValStore` | -1.260 (91 below -1 ns) | **-1.532** (91) | **-0.853 (0 below -1 ns)** |
+| `sysValStore` | -1.058 | -1.196 | -0.836 |
+| `xValStore` | -0.851 | -0.909 | -0.372 |
+| NZVC PRF write data | -1.082 | -1.489 | -0.998 |
+| X PRF write data | -0.545 | -0.636 | -0.179 |
+| Int PRF write data | -0.353 | -1.296 | -1.052 |
+
+OOC (`synth_design` only) told the OPPOSITE story — every sink improved by
++0.16 to +0.47 ns and the NZVC PRF leg went non-negative. **This is a fourth
+independent confirmation of this round's standing finding that OOC is not a valid
+gating instrument for this design**: OOC has no real placement, and this family
+is 72-76 % route delay.
+
+### 9.2 Why it failed — the mechanism, traced cell by cell
+
+`report_timing` on the N-A routed checkpoint, worst `s1Ctx_uop_op ->
+nzvcValStore` path (`-1.532 ns`, 16 levels):
+
+- **Logic delay DID improve as designed: 1.486 → 1.335 ns (-0.151 ns).**
+- **Route delay got worse: 3.756 → 4.179 ns (+0.423 ns).** Net +0.272 ns.
+
+So the lever's own mechanism worked — it just delivered ~1/3 of the projected
+0.4-0.55 ns, and placement/route ate several times that.
+
+**Why only 0.151 ns: the grounding report missed a SECOND op→flag path of nearly
+equal depth.** Node 2 of the post-lever critical path is
+`AluEuPlugin_logic_anWide0` — i.e. `anWide = u1.isMovea && (u1.op =/= DecOp.MOVE)`
+(`AluEuPlugin.scala:205`), which this very design spec (§8) explicitly declined
+to pre-decode on the grounds that "their selects already arrive early and
+pre-decoding them would buy nothing". That was **wrong**: `anWide` drives
+`cmd.size := Mux(anWide, Size.LONG, u1.size)`, and `cmd.size` selects the flag
+WIDTH through `bySize(p8/p16/p32)` — so `op → anWide → cmd.size → bySize → n/z/v/c`
+is a live, comparably deep op-to-flag path that survives the whole lever. Removing
+the operand-prep compares simply exposed it.
+
+### 9.3 The one genuinely positive result, and why it still isn't landable
+
+The **mux re-association alone (N-A2) does exactly what §3.4 predicted**: it
+RETIRES the targeted family (`nzvcValStore` -1.260 → -0.853 ns, and the count of
+its endpoints below -1.0 ns goes 91 → **0**), at **zero area cost — in fact
+-4,641 LUTs (-4.1 %)** — and hands WNS over to the `DcachePlugin tagMem ->
+RobPlugin faultAddrStore` family (Lever F's / the floorplan work's target).
+
+But it is still **not landable on today's evidence**: design WNS -1.260 → -1.425
+(-5.78 MHz), TNS +23.7 %, failing endpoints +17.3 %. The `tagMem` family it hands
+off to got WORSE (-1.199 → -1.425) — the same placement-equilibrium absorption
+pattern this round has now seen five times.
+
+**Recommendation for whoever picks this up:** re-test N-A2 (the zero-area
+half only, preserved as a 22-line patch) AFTER Lever F and/or the ROB-array
+floorplan work land. Its own family win is real, reproducible, structural, and
+free; it is currently masked by a family that is already separately targeted. Do
+NOT re-attempt the µop-field half without first also pre-decoding `anWide` — and
+even then, expect the route term to dominate.

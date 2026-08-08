@@ -64,9 +64,6 @@ class AluEuSourcePlugin extends FiberPlugin {
     uop.pXSrc        := iPXSrc; uop.readsX     := iReadsX
     uop.pXOld        := U(0)
     uop.op        := iOp
-    // FMax Lever N-A: mirror RenameStage — derive the pre-decoded ALU op class from
-    // the SAME op source. Never poke this from sim; it must stay `of(op)`.
-    uop.aluCls    := m68k040.decode.AluOpClass.of(iOp)
     uop.size      := iSize
     uop.useImm    := iUseImm
     uop.imm       := iImm

@@ -171,16 +171,12 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // toCcr writes only NZVC+X (flag physregs), which are tracked by the STATIC
     // latency-1 flag scoreboards (sbNzvc/sbX); a lat2 flag write would desync them.
     // (Re-confirmed by synth: moving the shifter alone clears the cone.) ──
-    // LEVER N-A: pre-decoded at rename (was `u1.op === DecOp.SHIFT`). `isSlow` feeds
-    // `issuePort.ready` (a combinational output back into the IQ's issue arbitration)
-    // as well as `fastFire`, which gates the NZVC/X PRF write enables.
-    val aluCls  = u1.aluCls
-    val isShift = aluCls.isShift
+    val isShift = u1.op === DecOp.SHIFT
     // The bit-field datapath (DecOp.BITFIELD) reuses the slow path: it adds two 32-bit
     // barrel rotates + a CLZ (BFFFO) — a comparable cone to the shifter — and writes
     // NZ only (V=C=0, X untouched). Routed lat-matched (S1->S3) like SHIFT, with the
     // same dynamic slowWakeup so a dependent waits on the result landing.
-    val isBitfield = aluCls.isBitfield   // LEVER N-A: pre-decoded
+    val isBitfield = u1.op === DecOp.BITFIELD
     val isSlow  = isShift || isBitfield
 
     // Single-outstanding SLOW: hold new issue while a slow op occupies ANY of S1/S2/S3
@@ -217,7 +213,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     cmd.xIn     := s1X                    // current X (NEGX: 0 - Dn - X)
     cmd.extByte := u1.extByte             // EXT/EXTB byte-source marker
     cmd.bitOp   := u1.bitOp               // BTST/BCHG/BCLR/BSET sub-kind
-    val rsp = AluDatapath(cmd, aluCls)   // LEVER N-A: pre-decoded op class, not re-derived
+    val rsp = AluDatapath(cmd)
 
     // ── Extended-arith family (NEGX/ADDX/SUBX): the 68k Z is CLEAR-ONLY ─────────
     // Z := Z_old && (result == 0). These ops read NZVC (-> s1Nzvc holds the old CCR), so
@@ -225,7 +221,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // the old Z so a zero result PRESERVES a prior Z=0 (only clears, never sets, Z) — the
     // multi-precision rule. N/V/C and X are unchanged from the datapath (X = carry/borrow
     // out). ADDX/SUBX reuse NEGX's merge verbatim (all three set readsNzvc).
-    val isExtended = aluCls.isExtended    // LEVER N-A: pre-decoded (NEGX|ADDX|SUBX)
+    val isExtended = (u1.op === DecOp.NEGX) || (u1.op === DecOp.ADDX) || (u1.op === DecOp.SUBX)
     val extZ       = rsp.nzvc(2) && s1Nzvc(2)
     val extNzvc    = rsp.nzvc(3) ## extZ ## rsp.nzvc(1 downto 0)
 
@@ -233,7 +229,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // Bit-ops set ONLY Z (= the tested bit's complement, in rsp.nzvc(2)); N/V/C come
     // from the OLD CCR (s1Nzvc — BITOP readsNzvc, so it holds the old flags). X is not
     // written (writesX=False). Same shallow merge mechanism as NEGX's partial Z.
-    val isBitOp  = aluCls.isBitOp         // LEVER N-A: pre-decoded
+    val isBitOp  = u1.op === DecOp.BITOP
     val bitNzvc  = s1Nzvc(3) ## rsp.nzvc(2) ## s1Nzvc(1) ## s1Nzvc(0)   // {N_old, Z, V_old, C_old}
     val aluNzvc  = Mux(isBitOp, bitNzvc, Mux(isExtended, extNzvc, rsp.nzvc))
 
@@ -249,8 +245,8 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // `dx` forced to the constant 0 (Musashi: res = 0 - dst - X): srcA still carries Dn
     // (for the .B-merge upper-24 preserve via s1Src1) and srcB also carries Dn (dy), but
     // the "dx" operand position in the formula is overridden to 0 regardless of s1Src1.
-    val isNbcd = aluCls.isNbcd            // LEVER N-A: pre-decoded
-    val isBcd  = aluCls.isBcd             // LEVER N-A: pre-decoded (BCD|NBCD)
+    val isNbcd = u1.op === DecOp.NBCD
+    val isBcd = u1.op === DecOp.BCD || isNbcd
     val dx    = Mux(isNbcd, U(0, 8 bits), s1Src1(7 downto 0).asUInt)
     val dy    = s1Src2(7 downto 0).asUInt
     val xin   = s1X.asUInt                                   // 0/1
@@ -374,7 +370,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     //   daBit  = s1Src2(0)      (= imm[0] when useImm: the CAS2.W Rn D/A bit, BIT_1F/BIT_F)
     // `eq` is the size-masked match (loaded == Dc); the CMP NZVC (res = loaded - Dc) reuses
     // the AluDatapath SUB/CMP cone via a dedicated instance below.
-    val casIsOp   = aluCls.isCasOp        // LEVER N-A: pre-decoded
+    val casIsOp   = u1.op === DecOp.CASOP
     val casA      = s1Src1
     val casBraw   = s1RdB
     val casC      = s1RdC
@@ -515,29 +511,8 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // Fast final flags: CASOP cmp/preserve flags for CAS/CAS2, CCR-rmw for toCcr, BCD
     // decimal carry/quirky-N/V for BCD, else the ALU datapath (NO shifter). X = the BCD
     // decimal carry/borrow for a BCD op (CAS/CAS2 never write X).
-    // LEVER N-A (mux re-association). UNCONDITIONALLY value-identical to the old
-    //   Mux(cas, C, Mux(toCcr, Cc, Mux(bcd, Bd, A)))
-    // — no mutual-exclusivity argument is needed: `useAluNzvc` is exactly "none of the
-    // three priority selects fired", i.e. the old chain's fall-through arm, and the
-    // relative priority cas > toCcr > bcd is preserved verbatim in `nonAluNzvc`. Check
-    // all four cases: cas=1 -> C; cas=0,toCcr=1 -> Cc; cas=0,toCcr=0,bcd=1 -> Bd; none
-    // -> A. Identical in every case, including the "impossible" overlaps.
-    //
-    // WHY: `aluNzvc` is the ONLY late-arriving input here (it comes off the 32-bit
-    // adder + flag generation); the other three legs and all three selects are built
-    // from registered µop bits / shallow folds and are stable long before it. Hoisting
-    // `aluNzvc` to the OUTERMOST 2:1 mux turns the old 3-LUT-deep serial chain out of
-    // `rsp.nzvc` (netlist-measured 0.401 ns / 3 levels, the tail of the
-    // `s1Ctx_uop_op -> RobPlugin nzvcValStore` WNS family) into 1 LUT level. Every
-    // other leg is same-or-shallower than before (cas 1, unchanged; ccr 2, unchanged;
-    // bcd 2, was 3), so nothing is traded away.
-    val useAluNzvc = !casIsOp && !u1.toCcr && !isBcd
-    val nonAluNzvc = Mux(casIsOp, casNzvc, Mux(u1.toCcr, ccrNzvc, bcdNzvc))
-    val finalNzvc = Mux(useAluNzvc, aluNzvc, nonAluNzvc)
-    // Same re-association for X (CAS never writes X, so only toCcr/bcd participate):
-    // Mux(toCcr, ccrX, Mux(bcd, bcdCarry, rsp.xOut)) with the late `rsp.xOut` hoisted.
-    val useAluX   = !u1.toCcr && !isBcd
-    val finalX    = Mux(useAluX, rsp.xOut, Mux(u1.toCcr, ccrX, bcdCarry))
+    val finalNzvc = Mux(casIsOp, casNzvc, Mux(u1.toCcr, ccrNzvc, Mux(isBcd, bcdNzvc, aluNzvc)))
+    val finalX    = Mux(u1.toCcr, ccrX, Mux(isBcd, bcdCarry, rsp.xOut))
 
     // ---- S1: FAST writeback (gated by masks; suppressed for a slow op) ----
     val fastFire = s1Valid && !isSlow
