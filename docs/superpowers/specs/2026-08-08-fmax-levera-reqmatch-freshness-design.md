@@ -84,6 +84,32 @@ stall shape — same one-more-cycle pattern, not a new latency class).
 
 ## The fix: a freshness flag instead of a value compare
 
+**CORRECTION (post-implementation, post-review — read before implementing
+from this spec):** the expression below, taken VERBATIM, is buggy and was
+never shipped. Implementation (commit `8d2b538`) and an independent
+review both confirmed, empirically (built the verbatim expression in an
+isolated worktree, ran the existing `page-crossing word load` test,
+watched it fail with a wrong final address), that `xlateBArmPrev =
+RegNext(xlateBArm)` lags `xlateBArm`'s real transition by one cycle:
+`xlateBArm` is WRITTEN at cycle T, but `xlateBArmPrev` only READS the new
+value at T+1 — so `presentedAccessChanging`'s `xlateBArm =/= xlateBArmPrev`
+term doesn't fire until T+1, one cycle later than the transition it needs
+to detect. Applied verbatim, this lets `XLATE_B` consume slot A's
+translation as slot B's — reintroducing the exact bug this project fixed
+once already in commit `d22a949`. The actual shipped expression detects
+`xlateBArm`'s transition directly (comparing against the PRE-write value
+in the same cycle the transition is armed, not a one-cycle-delayed
+`RegNext`) — see `LsEuPlugin.scala`'s comment above the real `reqMatch`
+definition for the corrected expression and its derivation. **Also
+missing from the closure argument below**: `reqReg`'s contents
+(`reqDrvVpn`/`reqDrvWrite`) have a SECOND writer beyond the base drive —
+the exception sequencer's last-wins override (`excActive &&
+excXlateValid`), which the OLD value-compare handled implicitly (any
+mismatch just read as `reqMatch=False`) but the event-driven flag must
+track explicitly (`reqExcOverride` in the shipped code). Both gaps are
+real, both were closed, both are documented in
+`.superpowers/sdd/progress-fmax-levers-2026-08-08.md`.
+
 **Key insight, established by tracing every event that can change what
 `xlateVaddr` presents (the closure argument below), not assumed:** since
 `reqReg` re-samples `xlateVaddr`'s VPN unconditionally every single cycle,
