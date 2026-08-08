@@ -36,7 +36,40 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
     //
     // Merge write requests sharing a key into one physical write port; within a
     // group the highest-priority valid request wins.
-    val phys = writeReq.groupBy(_.key).values.toSeq.map { grp =>
+    //
+    // ELABORATION DETERMINISM (do NOT reintroduce `groupBy` here): `groupBy` returns an
+    // immutable HashMap, whose `.values` iteration order is a function of the KEYS'
+    // hashCodes. The default sharing key is `new Object` (see `newWrite` above) whose
+    // hashCode is the JVM IDENTITY hash — not stable across JVM runs. That made the
+    // physical write-port slot order (`logic_phys_0..N`, and hence the whole XOR/LVT
+    // multi-write bank structure and every generated `_zz_RegFilePlugin*_logic_phys_*`
+    // name) a per-run lottery: two elaborations of byte-identical Scala source produced
+    // two distinct netlists, differing ONLY in this permutation (286 lines of a ~700k
+    // line file, 100% of them `_zz_RegFilePlugin{Int,Nzvc,X}_logic_phys_*`), and those
+    // two netlists implemented to post-route FMax 12.7-17.8 MHz apart — larger than any
+    // single RTL lever in the FMax campaign, and enough to invalidate any A/B gate.
+    // See scratchpad reports `fmax-final-combined-gate-report.md` and
+    // `fmax-leverb-task-report.md`.
+    //
+    // Group in FIRST-APPEARANCE order instead: `writeReq` is an ArrayBuffer appended in
+    // plugin-setup order, so the resulting slot order is a stable function of the source.
+    // LinkedHashMap still hashes for lookup but iterates in insertion order.
+    //
+    // The resulting Int-RF slot order is
+    //   0=AluEu0  1=AluEu1  2=BranchEu  3=LsEu  4=DivEu  5=RobPlugin exception ("excA7")
+    // which is a DIFFERENT permutation from either of the two lottery draws previously
+    // observed, so it has not itself been post-route-measured. The permutation IS a real
+    // (if second-order) FMax knob; it is now a deliberate, reproducible one. To sweep it,
+    // permute `byKey.values.toSeq` on the line below — nothing else in the design depends
+    // on the slot order (phys(0) is only special in that it also carries the reset-time
+    // init-zero sweep, which is complete long before any real write can occur).
+    val phys = {
+      // kept inside a block (not an Area member) so the private WriteReq type does not
+      // escape the plugin's scope through the anonymous Area's inferred type
+      val byKey = scala.collection.mutable.LinkedHashMap[Any, ArrayBuffer[WriteReq]]()
+      for (r <- writeReq) byKey.getOrElseUpdate(r.key, ArrayBuffer[WriteReq]()) += r
+      byKey.values.toSeq
+    }.map { grp =>
       // sort descending by priority so element 0 is the highest priority
       val sorted = grp.sortBy(-_.priority)
       val bus    = RegFileWritePort(spec.addressWidth, spec.dataWidth)
