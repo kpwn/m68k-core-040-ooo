@@ -1,6 +1,6 @@
 package m68k040.execute
 
-import m68k040.decode.DecOp
+import m68k040.decode.{DecOp, AluCin, AluOpClass}
 import m68k040.isa.Size
 import spinal.core._
 
@@ -29,7 +29,19 @@ case class AluRsp() extends Bundle {
 }
 
 object AluDatapath {
-  def apply(cmd: AluCmd): AluRsp = {
+
+  /** Convenience overload for callers that do NOT carry a pre-decoded op class (the
+    * unit-test DUTs, and the `op = DecOp.CMP` constant instance inside the CAS kernel,
+    * where `of()` constant-folds away). Derives the class on the spot from `cmd.op` —
+    * i.e. exactly the pre-Lever-N-A behaviour, and the by-construction definition of
+    * what the µop's `aluCls` field must equal. */
+  def apply(cmd: AluCmd): AluRsp = apply(cmd, AluOpClass.of(cmd.op))
+
+  /** FMax Lever N-A: `cls` is the op-class control PRE-DECODED at rename and carried
+    * in the µop (`RenamedUop.aluCls`). It is required to satisfy
+    * `cls === AluOpClass.of(cmd.op)`; the datapath below relies on that and never
+    * re-derives a `DecOp` compare for the operand-prep / flag control it covers. */
+  def apply(cmd: AluCmd, cls: AluOpClass): AluRsp = {
     val a = cmd.src1.asUInt
     val b = cmd.src2.asUInt
 
@@ -40,21 +52,23 @@ object AluDatapath {
     // For NEG/NEGX the operand Dn is src1 (a); the adder's `a` input is forced to 0 and
     // ~Dn / cin produce the negate. The piece() flags use a_eff/b_eff so C/V/N/Z match
     // a true subtract-from-zero at the operation size.
-    val isSub   = cmd.op === DecOp.SUB || cmd.op === DecOp.CMP
-    val isNeg   = cmd.op === DecOp.NEG
-    val isNegx  = cmd.op === DecOp.NEGX
     // ADDX/SUBX: ordinary two-operand ADD/SUB (a=src1=Dx, b=src2=Dy) with X folded into
     // the carry/borrow-in. ADDX = a + b + X  (cin := X); SUBX = a - b - X = a + ~b + !X
     // (cin := !X, the NEGX borrow form). Only NEG/NEGX force aEff=0; ADDX/SUBX use `a`.
-    val isAddx  = cmd.op === DecOp.ADDX
-    val isSubx  = cmd.op === DecOp.SUBX
-    val isArith = cmd.op === DecOp.ADD || isSub || isNeg || isNegx || isAddx || isSubx
+    //
+    // LEVER N-A: `cls.zeroA` (= NEG|NEGX), `cls.invB` (= SUB|CMP|SUBX) and `cls.cinSel`
+    // are the PRE-DECODED form of the six `DecOp` compares that used to be evaluated
+    // here, combinationally, in series with the carry chain below. They arrive as plain
+    // registered µop bits, so the operand-prep muxes start at t=0 of the S1 cycle.
+    val isArith = cls.isArith
     // The operand to negate (NEG/NEGX) is src1 (a); ordinary ADD/SUB(X) negate src2 (b).
-    val aEff = Mux(isNeg || isNegx, U(0, 32 bits), a)
-    val bEff = Mux(isNeg || isNegx, ~a, Mux(isSub || isSubx, ~b, b))   // SUBX subtracts (~b)
-    val cin  = Mux(isNegx || isSubx, !cmd.xIn,                         // SUBX borrow = !X
-                 Mux(isSub || isNeg, True,                             // SUB/NEG cin = 1
-                   Mux(isAddx, cmd.xIn, False)))                       // ADDX carry = X; ADD = 0
+    val aEff = Mux(cls.zeroA, U(0, 32 bits), a)
+    val bEff = Mux(cls.zeroA, ~a, Mux(cls.invB, ~b, b))                // SUBX subtracts (~b)
+    val cin  = cls.cinSel.mux(                                         // see AluCin
+      B(AluCin.ZERO, 2 bits) -> False,                                 // ADD / non-arith
+      B(AluCin.ONE,  2 bits) -> True,                                  // SUB/CMP/NEG cin = 1
+      B(AluCin.X,    2 bits) -> cmd.xIn,                               // ADDX carry = X
+      B(AluCin.NOTX, 2 bits) -> !cmd.xIn)                              // NEGX/SUBX borrow = !X
     val sum32 = aEff + bEff + cin.asUInt.resize(32)
 
     // ── SWAP / EXT / TAS / NOT / CLR bit-manipulation results ────────────────────
@@ -114,15 +128,16 @@ object AluDatapath {
 
     // TAS sets N/Z from the ORIGINAL Dn[7:0] (BEFORE bit7 is set), not from the result
     // (whose bit7 is always 1). N = a[7], Z = (a[7:0]==0).
-    val isTas   = cmd.op === DecOp.TAS
-    val isBitOp = cmd.op === DecOp.BITOP
+    val isTas   = cls.isTas      // LEVER N-A: pre-decoded (was `cmd.op === DecOp.TAS`)
+    val isBitOp = cls.isBitOp    // LEVER N-A: pre-decoded (was `cmd.op === DecOp.BITOP`)
     // BITOP Z = the tested bit's complement (data & mask)==0; N comes from the EU's
     // old-NZVC merge (bit-ops preserve N/V/C), so the datapath N is don't-care here.
     val n     = Mux(isTas, a(7), nGen)
     val z     = Mux(isTas, a(7 downto 0) === 0, Mux(isBitOp, bTestZ, zGen))
 
     // C: ADD/ADDX = cout, SUB/NEG/NEGX/SUBX = borrow = ~cout. Logical/bit (CLR/TAS) = 0.
-    val cFlag = Mux(isArith, Mux(isSub || isNeg || isNegx || isSubx, ~cout, cout), False)
+    // LEVER N-A: `cls.borrow` == the old `isSub || isNeg || isNegx || isSubx`.
+    val cFlag = Mux(isArith, Mux(cls.borrow, ~cout, cout), False)
     val vFlag = Mux(isArith, vArith, False)
 
     // CLR forces Z=1/N=0 (the result is 0 at every size). The generic n/z above already

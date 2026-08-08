@@ -133,6 +133,13 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.pc           := dec.pc
       r.nextPc       := dec.nextPc
       r.op           := dec.op
+      // FMax Lever N-A: bake the ALU op-class decode HERE (once, off any critical
+      // path) instead of re-deriving it combinationally in the ALU EU's S1 stage in
+      // series with the adder. MUST stay on the line after `r.op := dec.op` and MUST
+      // take the SAME `dec.op` — that adjacency is the whole correctness argument
+      // (`aluCls === AluOpClass.of(op)` by construction). Never hand-set a field of
+      // `aluCls` anywhere; it has exactly one producer, `AluOpClass.of`.
+      r.aluCls       := m68k040.decode.AluOpClass.of(dec.op)
       r.cluster      := dec.cluster
       r.size         := dec.size
       r.memOp        := dec.memOp
