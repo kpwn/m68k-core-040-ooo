@@ -617,6 +617,114 @@ class RobPluginSpec extends AnyFunSuite {
     }
   }
 
+  // ── SAME-CYCLE dual fault: lsFaultCompletion (#1) and sqFaultCompletion (#2)
+  // firing the SAME cycle for DIFFERENT robIds. This is the exact case the two
+  // ports were deliberately kept separate for (see RobPlugin's port-declaration
+  // comment: "the LS EU can fault a YOUNGER access the SAME cycle the SQ faults an
+  // OLDER, already-drained precise store"), and it had no directed coverage.
+  //
+  // It is also the precise failure mode of any restructuring of the two write
+  // blocks' per-entry write-select (FMax "LS/ROB Lever C", spec
+  // docs/superpowers/specs/2026-08-08-fmax-lsrob-leverc-writeenable-flatten-design.md):
+  // a broken select-vector would collapse the two same-cycle writes into one, or
+  // cross-alias one port's payload onto the other port's entry.
+  //
+  // Both directions are run (ls->younger/sq->older AND sq->younger/ls->older) and
+  // ALL FIVE attribute fields differ between the two ports, so an alias in either
+  // direction is caught. Only the ROB HEAD's fault state is architecturally
+  // observable (a faulted head does not retire, RobPlugin's `retire0`), so each
+  // direction observes the entry whose fault it targets at the head.
+  private def sameCycleDualFaultCheck(lsRobId: Int, sqRobId: Int): Unit = {
+    // Distinct in EVERY field so a cross-port alias cannot hide.
+    val lsAddr = 0x2000L; val lsWr = true;  val lsSize = 2; val lsSup = true
+    val sqAddr = 0x4000L; val sqWr = false; val sqSize = 1; val sqSup = false
+    // The observed entry is robId 1 -- whichever port targets it.
+    val obs = 1
+    val (eAddr, eWr, eSize, eSup) =
+      if (lsRobId == obs) (lsAddr, lsWr, lsSize, lsSup) else (sqAddr, sqWr, sqSize, sqSup)
+
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+      for (k <- 0 until 5) dut.rob.logic.completion(k).valid #= false
+      dut.rob.logic.lsFaultCompletion.valid #= false
+      dut.rob.logic.sqFaultCompletion.valid #= false
+
+      // Alloc robId 0,1 (2-wide) then robId 2.
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x1000, dstArch = 3, pdst = 20, pdstValid = true, pdstOld = 3)
+      pokeRu(dut.rsrc.logic.src.payload(1), pc = 0x1100)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= true
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false; dut.rsrc.logic.u1v #= false
+      cd.waitSampling()
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x1200)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= false
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      cd.waitSampling()
+
+      // THE cycle under test: entries 1 and 2 complete, and BOTH fault ports fire,
+      // for two DIFFERENT robIds, simultaneously.
+      dut.rob.logic.completion(0).valid #= true; dut.rob.logic.completion(0).payload #= 1
+      dut.rob.logic.completion(4).valid #= true; dut.rob.logic.completion(4).payload #= 2
+      dut.rob.logic.lsFaultCompletion.valid #= true
+      dut.rob.logic.lsFaultCompletion.payload.robId      #= lsRobId
+      dut.rob.logic.lsFaultCompletion.payload.faultAddr  #= BigInt(lsAddr)
+      dut.rob.logic.lsFaultCompletion.payload.write      #= lsWr
+      dut.rob.logic.lsFaultCompletion.payload.sizeBits   #= lsSize
+      dut.rob.logic.lsFaultCompletion.payload.supervisor #= lsSup
+      dut.rob.logic.lsFaultCompletion.payload.atc        #= false
+      dut.rob.logic.sqFaultCompletion.valid #= true
+      dut.rob.logic.sqFaultCompletion.payload.robId      #= sqRobId
+      dut.rob.logic.sqFaultCompletion.payload.faultAddr  #= BigInt(sqAddr)
+      dut.rob.logic.sqFaultCompletion.payload.write      #= sqWr
+      dut.rob.logic.sqFaultCompletion.payload.sizeBits   #= sqSize
+      dut.rob.logic.sqFaultCompletion.payload.supervisor #= sqSup
+      dut.rob.logic.sqFaultCompletion.payload.atc        #= true
+      cd.waitSampling()
+      dut.rob.logic.completion(0).valid #= false
+      dut.rob.logic.completion(4).valid #= false
+      dut.rob.logic.lsFaultCompletion.valid #= false
+      dut.rob.logic.sqFaultCompletion.valid #= false
+      cd.waitSampling()
+
+      // Now let the (unfaulted) head robId 0 complete + retire, exposing entry 1.
+      dut.rob.logic.completion(0).valid #= true; dut.rob.logic.completion(0).payload #= 0
+      cd.waitSampling()
+      dut.rob.logic.completion(0).valid #= false
+
+      var seen = false; var n = 0
+      while (!seen && n < 60) {
+        if (dut.rob.logic.exceptionPending.toBoolean) {
+          seen = true
+          assert(dut.rob.logic.exceptionVector.toInt == 2,
+            s"vector=${dut.rob.logic.exceptionVector.toInt}")
+          assert(dut.rob.logic.exceptionPc.toLong == 0x1100L,
+            f"wrong ENTRY faulted: excPc=0x${dut.rob.logic.exceptionPc.toLong}%x (want 0x1100)")
+          assert(dut.rob.logic.exceptionFaultAddr.toLong == eAddr,
+            f"faultAddr=0x${dut.rob.logic.exceptionFaultAddr.toLong}%x want 0x$eAddr%x " +
+            "(the OTHER port's payload landed here -> same-cycle writes aliased)")
+          assert(dut.rob.logic.exceptionFaultWr.toBoolean == eWr, "write attr aliased")
+          assert(dut.rob.logic.exceptionFaultSize.toInt == eSize, "size attr aliased")
+          assert(dut.rob.logic.exceptionFaultSup.toBoolean == eSup, "supervisor attr aliased")
+          assert(!dut.csink.logic.commitValidOut(0).toBoolean, "faulted entry must NOT commit normally")
+        }
+        n += 1; cd.waitSampling()
+      }
+      assert(seen, "exceptionPending never pulsed -> a same-cycle fault write was LOST")
+    }
+  }
+
+  test("same-cycle lsFaultCompletion + sqFaultCompletion, different robIds (ls->younger)") {
+    sameCycleDualFaultCheck(lsRobId = 1, sqRobId = 2)
+  }
+
+  test("same-cycle lsFaultCompletion + sqFaultCompletion, different robIds (sq->younger)") {
+    sameCycleDualFaultCheck(lsRobId = 2, sqRobId = 1)
+  }
+
   // ── preciseDrainBusyIn gates normalIrqGate/traceNormalGate (the ROB-side half of
   // the interrupt/trace preemption interlock; Task P2.4 builds the SQ-side half that
   // will drive it). Dut mirrors RobInterruptSpec's (adds InterruptControlPlugin so
