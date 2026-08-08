@@ -670,8 +670,81 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // after S1 advances) is never mistaken for THIS access's translation. Under identity
     // (MMU-off) rsp.ready is always True, but reqMatch still requires the flop to have
     // captured this vpn -> identical +1-cycle alignment in both MMU modes.
-    val reqMatch = reqReg.valid && (reqReg.vpn === xlateVaddr(31 downto 12)) &&
-                   (reqReg.write === isStore)
+    // FMax closure, "Lever A" (2026-08-08): reqMatch used to be a 20-bit VPN
+    // value-compare fed by two chained 32-bit adders (s1Va :367 -> s1AddrB :405) --
+    // ~56% (3.193ns) of a -1.779ns post-route critical path
+    // (s1Ctx_uop_eaAuto_reg -> RobPlugin faultAddrStore CE). Since `reqReg`
+    // re-captures the drive UNCONDITIONALLY every cycle (:1735-1739), the compare is
+    // really answering "does reqReg hold the request that corresponds to what the FSM
+    // is presenting RIGHT NOW" -- answerable by tracking the register-write EVENTS
+    // that can break that correspondence, without comparing any address value.
+    //
+    // The correspondence can break in exactly two ways, and the writer set for each is
+    // CLOSED (grepped, no third site):
+    //   (1) `xlateVaddr` (:622) changes value. `s1Va`/`s1AddrB` are purely
+    //       combinational off `s1Base`/`s1Ctx`/`s1Index`, which are Regs written ONLY
+    //       inside `when(issuePort.fire)` (:1126-1131); the Mux select `xlateBArm` is
+    //       a Reg written ONLY at :1229 (True) / :1267 / :1275 (False). `isStore` --
+    //       the other term the old compare tested -- is derived from `u1`/`s1Ctx`,
+    //       captured ATOMICALLY with s1Base at that same `issuePort.fire`, so it needs
+    //       no separate tracking.
+    //   (2) `reqReg` is captured from a DIFFERENT SOURCE than this access. `reqDrvVpn`/
+    //       `reqDrvWrite` have a SECOND, last-wins writer: the commit-side exception
+    //       sequencer's translation override at :1722-1729 (`excActive &&
+    //       excXlateValid`, real and frequently taken -- the E_VECT vector fetch and
+    //       the RTE frame reload both drive it). On such a cycle `reqReg` captures the
+    //       EXCEPTION UNIT's vpn, so the DTLB response the next cycle belongs to the
+    //       exc, not to this access. The old value-compare caught this implicitly
+    //       (the vpns differ); an event-driven flag must track it EXPLICITLY or a
+    //       poisoned/straggling LS access left in IDLE/XLATE_B when the exception
+    //       raises would consume the exception unit's translation and compute a WRONG
+    //       physical address. NOTE: the design spec's Step-1 closure argument
+    //       enumerated only source (1) and missed this override -- see the task report
+    //       for the derivation.
+    //
+    // TIMING OF EACH EVENT TERM (each must mark the cycle on which `reqReg` HOLDS a
+    // request that no longer corresponds to what is being presented -- i.e. the cycle
+    // AFTER the divergence-causing write, NOT the write cycle itself):
+    //   - `issuePort.fire` at cycle F writes s1Base/s1Ctx at the END of F, so s1Va (and
+    //     isStore) change at F+1, while reqReg captured the OLD xlateVaddr at the end of
+    //     F. Stale cycle = F+1  ->  needs RegNext(issuePort.fire).
+    //   - the exc override drives reqDrv* combinationally at cycle E; reqReg holds the
+    //     exc's vpn at E+1. Stale cycle = E+1  ->  needs RegNext(reqExcOverride).
+    //   - `xlateBArm := True` executes at cycle T (IDLE's slot-A resolve) but the Reg
+    //     only READS True at T+1, so xlateVaddr flips to s1AddrB at T+1 while reqReg
+    //     (captured at the end of T from the still-slot-A xlateVaddr) holds slot A's
+    //     vpn. Stale cycle = T+1 -- which is EXACTLY when `xlateBArm =/= xlateBArmPrev`
+    //     first reads True. So this term is ALREADY correctly aligned and must NOT be
+    //     RegNext'ed again.
+    //     >>> The design spec's proposed expression put all three terms behind a single
+    //     shared RegNext. That is off by one cycle for this term: it would leave
+    //     reqStale FALSE at T+1, letting XLATE_B consume slot A's translation as slot
+    //     B's. Harmless for a cross-LINE split (same page, same ppn) but WRONG for a
+    //     cross-PAGE split -- it would reintroduce exactly the "split-access second
+    //     half not translated" bug fixed by commit d22a949. Derived and confirmed by a
+    //     directed cycle-level test; see the task report.
+    //
+    // Divergence from the old compare (KNOWN, harmless, strictly MORE conservative):
+    // if a freshly-presented access's vpn happens to COINCIDE with whatever reqReg was
+    // already holding, the old bit-exact compare could read True one cycle EARLIER --
+    // the reachable instance being a cross-LINE (same-page) split access, where the old
+    // code consumed slot B at T+1 off slot A's still-registered (but identical) vpn.
+    // This flag never does that: it always forces the one-cycle settle, so slot B is
+    // consumed at T+2 off a genuinely re-captured request. Costs at most one extra
+    // stall cycle; can never consume early or stale.
+    // See docs/superpowers/specs/2026-08-08-fmax-levera-reqmatch-freshness-design.md.
+    val xlateBArmPrev = RegNext(xlateBArm, init = False)
+    // Already one cycle after the `xlateBArm :=` write -- do NOT delay further.
+    val xlateBArmSwitched = xlateBArm =/= xlateBArmPrev
+    // The exc sequencer owns the reqDrv* nets this cycle -> reqReg will hold ITS
+    // request next cycle, not this access's.
+    val reqExcOverride = excActive && excXlateValid
+    val reqReCaptured  = RegNext(issuePort.fire || reqExcOverride, init = False)
+    val reqStale = reqReCaptured || xlateBArmSwitched
+    val reqFresh = !reqStale
+    val reqMatch = reqReg.valid && reqFresh
+    // Directed-test probes only (LsEuCrossSpec's freshness waveform tests); zero synth impact.
+    reqFresh.simPublic(); reqMatch.simPublic(); reqStale.simPublic(); xlateBArm.simPublic()
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax: registered COMPLETION + WRITEBACK stage.

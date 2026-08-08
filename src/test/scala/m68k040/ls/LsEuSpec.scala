@@ -46,6 +46,8 @@ class LsEuSpec extends AnyFunSuite {
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
     s.iStkPush #= false
+    s.iLeaAddr #= false   // MUST default: undriven -> randomized per seed -> every load
+                          // takes the LEA address-generate path (dst = EA, not the data).
     s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false
     cd.waitSampling(80) // PRF init sweep
     (cd, mem)

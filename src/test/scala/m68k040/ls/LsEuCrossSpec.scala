@@ -54,6 +54,10 @@ class LsEuCrossSpec extends AnyFunSuite {
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
     s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false
+    s.iLeaAddr #= false   // MUST default (same class as iStkPush below): an undriven
+                          // leaAddr makes EVERY load take the LEA address-generate path,
+                          // writing the EA to the dst instead of the loaded data. Verilator
+                          // randomizes it per seed -> this spec failed ~1-in-3 runs.
     s.iStkPush #= false   // MUST default: an undriven stkPush makes a load PREDECREMENT,
                           // writing (base - size) to the dst instead of the loaded data.
     cd.waitSampling(80)
@@ -82,6 +86,70 @@ class LsEuCrossSpec extends AnyFunSuite {
 
   def preload(mem: BehavioralMemAgent, base: Long, n: Int): Unit =
     for (i <- 0 until n) mem.pokeByte(base + i, memByte(base + i))
+
+  /** One sampled cycle of the slot-A -> slot-B translation handover. */
+  case class Sample(bArm: Boolean, stale: Boolean, mtch: Boolean)
+
+  /** Run a split load and record {xlateBArm, reqStale, reqMatch} every cycle from the
+    * issue handshake until completion. NON-PORTABLE (reads LsEuPlugin internals). */
+  def traceSplit(dut: Dut, cd: ClockDomain, robId: Int, maxCycles: Int = 200): Seq[Sample] = {
+    val buf = scala.collection.mutable.ArrayBuffer[Sample]()
+    var n = 0; var done = false
+    while (n < maxCycles && !done) {
+      if (dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == robId) done = true
+      buf += Sample(dut.eu.logic.xlateBArm.toBoolean,
+                    dut.eu.logic.reqStale.toBoolean,
+                    dut.eu.logic.reqMatch.toBoolean)
+      cd.waitSampling(); n += 1
+    }
+    assert(done, s"split access robId=$robId never completed within $maxCycles cycles")
+    buf.toSeq
+  }
+
+  /** Assert the freshness-flag waveform across the slot-A -> slot-B handover:
+    * `xlateBArm` rises at some cycle T; `reqStale` must read True at T (the cycle
+    * `xlateVaddr` first presents s1AddrB while `reqReg` still holds slot A's request)
+    * and at NO other cycle of this access; `reqMatch` must therefore be False at T and
+    * True at T+1, when XLATE_B consumes slot B's genuinely re-captured translation. */
+  def assertHandoverWaveform(tr: Seq[Sample], label: String): Unit = {
+    def bits(f: Sample => Boolean) = tr.map(s => if (f(s)) 1 else 0).mkString
+    val wave = s"(bArm=${bits(_.bArm)}, stale=${bits(_.stale)}, match=${bits(_.mtch)})"
+    val rise = tr.indexWhere(_.bArm)
+    assert(rise > 0, s"$label: xlateBArm never rose -- not a split access? $wave")
+    val fall = tr.indexWhere(!_.bArm, rise)
+    assert(fall > rise, s"$label: xlateBArm never cleared -- XLATE_B livelock? $wave")
+
+    // (1) The binding property: on the cycle xlateVaddr first presents s1AddrB while
+    // reqReg still holds slot A's request, the flag MUST read stale and reqMatch False,
+    // so XLATE_B cannot consume slot A's response as slot B's.
+    assert(tr(rise).stale && !tr(rise).mtch,
+      s"$label: reqStale must be True / reqMatch False on the xlateBArm-rise cycle " +
+      s"($rise) -- otherwise XLATE_B consumes slot A's stale translation. $wave")
+
+    // (2) It must be EXACTLY one cycle: the request re-captures unconditionally, so a
+    // longer stall would be a livelock, not a settle.
+    assert(!tr(rise + 1).stale && tr(rise + 1).mtch,
+      s"$label: reqStale must clear and reqMatch re-assert exactly one cycle later " +
+      s"(${rise + 1}). $wave")
+    assert(fall == rise + 2,
+      s"$label: XLATE_B must consume at ${rise + 1} and leave at ${rise + 2}; " +
+      s"xlateBArm actually cleared at $fall. $wave")
+
+    // (3) Closure: reqStale reads True on EXACTLY the three cycles it should, and
+    // nowhere else. Cycle `rise` and `fall` come from `xlateBArmSwitched` (both edges
+    // are tracked -- the falling one is a deliberate, harmless over-approximation: the
+    // FSM has left XLATE_B by then and nothing reads reqMatch again for this access).
+    // The one remaining stale cycle is the RegNext(issuePort.fire) settle right after
+    // the issue handshake this trace starts on.
+    val staleCycles = tr.indices.filter(tr(_).stale)
+    val fireSettle  = staleCycles.filter(_ < rise)
+    assert(fireSettle.size == 1 && fireSettle.head <= 2,
+      s"$label: expected exactly one pre-handover stale cycle (the issuePort.fire " +
+      s"settle); got $fireSettle. $wave")
+    assert(staleCycles == Seq(fireSettle.head, rise, fall),
+      s"$label: reqStale must read True on exactly {fire-settle, xlateBArm rise, " +
+      s"xlateBArm fall} = ${Seq(fireSettle.head, rise, fall)}; got $staleCycles. $wave")
+  }
 
   test("aligned long load unchanged (fast path, single access)", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
@@ -129,4 +197,87 @@ class LsEuCrossSpec extends AnyFunSuite {
         s"page-cross ${dut.src.logic.obsIntData.toBigInt.toString(16)} exp ${expected(addr, 2).toString(16)}")
     }
   }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // FMax "Lever A" (2026-08-08): `reqMatch` is no longer a 20-bit VPN value
+  // compare but a 1-bit event-driven freshness flag. These tests pin the two
+  // scenarios the design spec calls out as binding.
+  //
+  // Both scenarios are split accesses, because the slot-A -> slot-B handover is
+  // the ONLY place a stale `reqReg` can be presented while the FSM is still
+  // consuming `reqMatch`: `issuePort.ready` is provably False for the whole
+  // window between "a translation becomes pending" and "it resolves", so no NEW
+  // access can supersede an in-flight one.
+  //
+  //   - CROSS-LINE (0x200E): slot A (0x200E) and slot B (0x2010) share a page,
+  //     so their VPNs COINCIDE. This is the design spec's "coincidental VPN
+  //     match" case. MEASURED, not assumed -- the pre-Lever-A commit was checked
+  //     out in a git worktree and instrumented with the same probes:
+  //
+  //                                     xlateBArm   reqMatch    XLATE_B dwell
+  //       pre-Lever-A  cross-LINE       0001000     0011111     1 cycle
+  //       pre-Lever-A  cross-PAGE       0001100     0010101     2 cycles
+  //       post-Lever-A cross-LINE       0001100     0010111     2 cycles
+  //       post-Lever-A cross-PAGE       0001100     0010111     2 cycles
+  //
+  //     i.e. the old bit-exact compare really did consume slot B ONE CYCLE
+  //     EARLIER when the VPNs coincided (reqMatch already True on the very first
+  //     XLATE_B cycle, off slot A's still-registered but numerically identical
+  //     vpn); the freshness flag always pays the settle. Where the VPNs genuinely
+  //     differ the two are identical, because the old compare stalled there too.
+  //     The new code is therefore never faster than the old -- it never consumes a
+  //     translation the old code would have rejected, only ever the reverse.
+  //   - CROSS-PAGE (0x2FFF): slot A (page 0x2) and slot B (page 0x3) have
+  //     DIFFERENT VPNs, so the old compare stalled here too. Old and new agree
+  //     cycle-for-cycle. Under identity translation ppn==vpn, so consuming slot
+  //     A's stale response for slot B would yield paddr 0x2000 instead of
+  //     0x3000 -- i.e. this test is a live regression guard against exactly the
+  //     "split-access second half not translated" bug fixed by commit d22a949.
+  //     (It is what caught the design spec's own proposed expression, which put
+  //     the `xlateBArm` term behind an extra RegNext and therefore left reqStale
+  //     False on the one cycle that matters. See the RTL comment.)
+
+  test("Lever A: reqStale/reqMatch waveform across a CROSS-LINE (same-VPN) slot-A->B handover", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val addr = 0x2000L + 14
+      preload(mem, 0x2000L, 32)
+      seed(dut, cd, preg = 10, value = addr)
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 23, robId = 8)
+      val tr = traceSplit(dut, cd, robId = 8)
+      assertHandoverWaveform(tr, "cross-line (coincident VPN)")
+      cd.waitSampling(4)
+      dut.src.logic.obsIntAddr #= 23; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == expected(addr, 4),
+        s"cross-line data ${dut.src.logic.obsIntData.toBigInt.toString(16)} exp ${expected(addr, 4).toString(16)}")
+    }
+  }
+
+  test("Lever A: reqStale/reqMatch waveform across a CROSS-PAGE (differing-VPN) slot-A->B handover", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val addr = 0x2FFFL
+      preload(mem, 0x2FF0L, 16); preload(mem, 0x3000L, 16)
+      seed(dut, cd, preg = 10, value = addr)
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.WORD, pdst = 24, robId = 9)
+      val tr = traceSplit(dut, cd, robId = 9)
+      assertHandoverWaveform(tr, "cross-page (differing VPN)")
+      cd.waitSampling(4)
+      dut.src.logic.obsIntAddr #= 24; sleep(1)
+      // The binding correctness property: slot B's ppn must come from slot B's OWN
+      // translation. Under identity xlate a stale slot-A consume yields 0x2000's
+      // bytes here, which are preloaded to DIFFERENT values than 0x3000's.
+      assert(dut.src.logic.obsIntData.toBigInt == expected(addr, 2),
+        s"page-cross data ${dut.src.logic.obsIntData.toBigInt.toString(16)} exp ${expected(addr, 2).toString(16)} " +
+        "-- a mismatch here means slot B consumed slot A's translation (stale-consume bug)")
+    }
+  }
+
+  // NOTE on why there is no absolute issue->completion cycle-count test here: the
+  // AXI memory model (`AxiMemModel`) drives its channels through
+  // `StreamReadyRandomizer`/`simRandom`, so end-to-end completion counts vary run to
+  // run (measured 18 and 23 cycles for the SAME cross-line load on the SAME commit).
+  // The XLATE_B dwell asserted above is deterministic because the whole slot-A ->
+  // slot-B translation handover happens BEFORE any cache line fill is launched, so no
+  // AXI traffic has occurred yet.
 }

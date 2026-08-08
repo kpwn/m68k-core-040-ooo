@@ -42,6 +42,7 @@ class StackOpSpec extends AnyFunSuite {
       val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
       val s = dut.src.logic
       s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false; s.iStkPush #= false
+      s.iLeaAddr #= false   // MUST default: undriven -> randomized per seed -> LEA path
       s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false
       s.iPsrcA #= 0; s.iPsrcB #= 0; s.iImm #= 0; s.iPdst #= 0; s.iPdstValid #= false; s.iRobId #= 0
       cd.waitSampling(80)

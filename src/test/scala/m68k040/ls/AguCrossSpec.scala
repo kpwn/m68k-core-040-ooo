@@ -40,6 +40,7 @@ class AguCrossSpec extends AnyFunSuite {
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
     s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false
+    s.iLeaAddr #= false   // MUST default: undriven -> randomized per seed -> LEA path
     s.iStkPush #= false   // an undriven stkPush would predecrement the probe load's EA
     cd.waitSampling(80)
     cd

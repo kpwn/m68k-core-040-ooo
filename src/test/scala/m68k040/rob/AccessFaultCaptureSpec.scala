@@ -54,6 +54,7 @@ class AccessFaultCaptureSpec extends AnyFunSuite {
       // PREDECREMENT (s1Va = base - szBytes), so VA 0x2000 became 0x1ffc -> VPN 0x1
       // (not the faulting VPN 0x2) on ~half the seeds. Pin it false (plain aligned store).
       s.iStkPush #= false
+      s.iLeaAddr #= false   // MUST default: undriven -> randomized per seed -> LEA path
       cd.waitSampling(80)
       // Fault VA 0x2000 -> VPN 0x2.
       dut.xlate.logic.faultEn  #= true
@@ -95,6 +96,7 @@ class AccessFaultCaptureSpec extends AnyFunSuite {
       s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
       s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false
       s.iStkPush #= false   // pin false (undriven -> per-seed predecrement); plain store
+      s.iLeaAddr #= false   // MUST default: undriven -> randomized per seed -> LEA path
       cd.waitSampling(80)
       dut.xlate.logic.faultEn #= false   // no faults
       s.seedValid #= true; s.seedAddr #= 10; s.seedData #= BigInt(0x3000L); cd.waitSampling()
