@@ -171,7 +171,8 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
                                host[IcachePlugin].logic.maintInvalidateAll
     btb.logic.queryPc     := faBtb.logic.btbQueryPc0
     btb.logic.queryValid  := faBtb.logic.btbQueryValid0
-    btb.logic.query2Pc    := faBtb.logic.btbQueryPc1
+    btb.logic.query2BasePc := faBtb.logic.btbQueryBasePc1
+    btb.logic.query2Sel    := faBtb.logic.btbQuerySel1
     btb.logic.query2Valid := faBtb.logic.btbQueryValid1
     faBtb.logic.btbPredTaken0  := btb.logic.predTakenComb
     faBtb.logic.btbPredTarget0 := btb.logic.predTargetComb

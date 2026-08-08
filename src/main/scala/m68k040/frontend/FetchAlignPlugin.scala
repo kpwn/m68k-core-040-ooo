@@ -69,6 +69,15 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     //   btbPredTaken0/1, btbPredTarget0/1 : INPUT (the BTB's combinational predict).
     val btbQueryPc0    = UInt(32 bits); val btbQueryValid0 = Bool()
     val btbQueryPc1    = UInt(32 bits); val btbQueryValid1 = Bool()
+    // FMax "Lever D" (2026-08-08): the BTB's slot-1 port is addressed as (base, sel), not
+    // as the pre-summed `btbQueryPc1`, so its RAM read never waits on `L0`. `btbQueryPc1`
+    // itself is KEPT — it is still the gshare slot-1 query PC and the architectural slot-1
+    // packet PC — but the BTB now takes these two instead. Invariant tying them together:
+    // `btbQueryPc1 == btbQueryBasePc1 + 2*btbQuerySel1` whenever `btbQueryValid1` is set
+    // (`decodePc` is `res.slot0.pc` in every arm that can raise `slot1Valid`, and
+    // `Aligner` computes `slot1.pc = headPc + (L0 << 1)` there). See `Btb.scala`'s
+    // `spec2*` block for the derivation and the equivalence proof.
+    val btbQueryBasePc1 = UInt(32 bits); val btbQuerySel1 = UInt(4 bits)
     val btbPredTaken0  = Bool(); val btbPredTarget0 = UInt(32 bits)
     val btbPredTaken1  = Bool(); val btbPredTarget1 = UInt(32 bits)
     // Inputs: idle-defaulted (allowOverride) so a standalone DUT (no BTB) reads not-taken.
@@ -400,6 +409,15 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     btbQueryValid0 := predEnable && res.slot0Valid
     btbQueryPc1    := res.slot1.pc
     btbQueryValid1 := predEnable && res.slot1Valid
+    // FMax "Lever D": the BTB slot-1 address, split. `decodePc` is a REGISTER (so the 9
+    // speculative reads start at cycle 0), and `slot1Sel` (== the aligner's raw `L0`) is
+    // consumed ONLY by the BTB's final 16:1 result mux — removing the
+    // `L0 -> index adder -> RAM read -> tag compare` serialization from the
+    // `headPtr -> L0 -> ... -> io_shift -> headPtr` feedback loop without adding any
+    // register to it. Deliberately `decodePc` rather than `res.slot0.pc`: identical value
+    // in every arm that can raise `slot1Valid`, but one arm-mux earlier.
+    btbQueryBasePc1 := decodePc
+    btbQuerySel1    := res.slot1Sel
     // ── gshare direction composition (slice 3) ──────────────────────────────────
     // gshare OVERRIDES the DIRECTION of a CONDITIONAL branch that hit the BTB. The BTB
     // still supplies the target; the predicted-taken bit becomes phtTaken (NOT the BTB

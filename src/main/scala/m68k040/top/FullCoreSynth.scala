@@ -93,7 +93,8 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // the predict-taken + target return THIS cycle into FetchAlign's prediction inputs.
     btb.logic.queryPc     := fa.logic.btbQueryPc0
     btb.logic.queryValid  := fa.logic.btbQueryValid0
-    btb.logic.query2Pc    := fa.logic.btbQueryPc1
+    btb.logic.query2BasePc := fa.logic.btbQueryBasePc1
+    btb.logic.query2Sel    := fa.logic.btbQuerySel1
     btb.logic.query2Valid := fa.logic.btbQueryValid1
     fa.logic.btbPredTaken0  := btb.logic.predTakenComb
     fa.logic.btbPredTarget0 := btb.logic.predTargetComb
