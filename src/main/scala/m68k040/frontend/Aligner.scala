@@ -149,10 +149,40 @@ object Aligner {
         // Slot0 = simple packet
         r.slot0.pc       := headPc
         for (i <- 0 until WINDOW) {
-          when(U(i) < L0) {
-            r.slot0.words(i) := words(i)
-          } .otherwise {
-            r.slot0.words(i) := 0
+          if (i == 0) {
+            // FMax "Frontend Lever A" (2026-08-08): the i==0 mask is a TAUTOLOGY and is
+            // deleted. At i==0 the guard reads `when(0 < L0)`, and this loop only runs
+            // inside the `.otherwise` arm of `!p0.simple` (line ~143) -- i.e. p0.simple is
+            // already known True here -- and `PredecodeWord.classify(...).simple` never
+            // coincides with `lenWords === 0`. That property is not asserted, it is PROVEN
+            // exhaustively by `PredecodeSimpleLenSpec` (all 65536 opwords x all extension-
+            // word content x all validity combos = 268,435,456 configurations, run to
+            // completion, mutation-checked); writing that test also uncovered and fixed the
+            // one place the property genuinely did NOT hold (a 3-bit length-sum wrap in
+            // PredecodeWord's line-0 immediate mem-dest site -- see its comment).
+            //
+            // WHY IT IS WORTH DELETING: the opword is the header word every downstream
+            // decode gate needs FIRST, and this mask put `L0` (itself the output of the
+            // predecode/`preds(0)` mux) in front of it, so `OperationDecoder`/`EaDecoder`'s
+            // whole cone could not start until L0 resolved. A netlist-level trace of this
+            // design's WNS-holding path (`ibuf pred_lenWords[0] -> DecodeStage
+            // specs_1_dstEa_disp[28]`) measured that dependency at >= 0.318ns via a direct
+            // `report_timing -through` probe of the unmasked sibling net on the routed
+            // checkpoint. See
+            // `docs/superpowers/specs/2026-08-08-fmax-frontend-levera-tautological-mask-design.md`.
+            //
+            // The i >= 1 masks below are UNTOUCHED and remain LOAD-BEARING: the offloaded
+            // `dstEa` computation (MicroOpAssembler.computeOffload) depends on the zero-fill
+            // beyond L0, per FMax slice 3's post-mortem correctness derivation. This slice
+            // removes the mask at the ONE index that is architecturally guaranteed to be
+            // inside the instruction whenever the loop runs at all.
+            r.slot0.words(0) := words(0)
+          } else {
+            when(U(i) < L0) {
+              r.slot0.words(i) := words(i)
+            } .otherwise {
+              r.slot0.words(i) := 0
+            }
           }
         }
         r.slot0.wordCount := L0
@@ -212,10 +242,23 @@ object Aligner {
             // the real max is L0+i <= L0+L1-1 <= WINDOW-1, which fits in 4 bits without
             // truncation; the (i>=L1) high-`i` iterations are don't-care (discarded below).
             val idx = (L0 +^ U(i)).resize(4)
-            when(U(i) < L1) {
-              r.slot1.words(i) := words(idx)
-            } .otherwise {
-              r.slot1.words(i) := 0
+            if (i == 0) {
+              // FMax "Frontend Lever A" -- same tautological-mask deletion as slot 0 above,
+              // against L1 instead of L0; see that comment for the full derivation, the
+              // exhaustive proof (`PredecodeSimpleLenSpec`) and the netlist measurement.
+              // Here the guard reads `when(0 < L1)`, and this loop only runs inside
+              // `when(slot1Ok)`, whose very first term is `p1.simple` (line ~202) -- so L1
+              // is the lenWords of an instruction already known simple, hence >= 1.
+              // `idx` at i==0 is just `L0`, so slot 1's opword is now available as soon as
+              // L0 resolves, without additionally waiting on L1.
+              // i >= 1 stays masked (load-bearing zero-fill beyond L1).
+              r.slot1.words(0) := words(idx)
+            } else {
+              when(U(i) < L1) {
+                r.slot1.words(i) := words(idx)
+              } .otherwise {
+                r.slot1.words(i) := 0
+              }
             }
           }
           r.slot1.wordCount := L1

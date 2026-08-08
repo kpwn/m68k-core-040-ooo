@@ -231,7 +231,26 @@ object PredecodeWord {
             val immDstEaKnown = Mux(ss === U(2, 2 bits), extW3Known, extW2Known)
             val (mok, mext, mamb) = memDestExt(mode, reg, immDstEaW, immDstEaKnown)
             when(mok) {
-              r.simple := True; r.lenWords := (U(1, 3 bits) + immWords + mext).resized
+              // F2-CLASS LENGTH-WRAP FIX (2026-08-08, found by the exhaustive
+              // `PredecodeSimpleLenSpec` proof this file's `simple => lenWords>=1`
+              // invariant now carries -- see that spec + the FMax "Frontend Lever A"
+              // design/plan under docs/superpowers/). This was the ONE `r.lenWords`
+              // site in this file summing THREE terms at a 3-bit width: `immWords`
+              // reaches 2 (.L immediate) and `mext` reaches 5 (a full-format mode-6
+              // mem destination with a long base displacement AND a long outer
+              // displacement), so the true total reaches 1+2+5 = 8 -- which the plain
+              // `+` (whose result width is max(operand widths) = 3 bits, NOT the 4-bit
+              // destination field's width) truncated to 0. Concrete pre-fix repro:
+              // `classify(op=0x00B0, extW3=0x0133, extW3Valid=True)` (ORI.L
+              // #imm,(bd,An,Xn) with a full-format destination extension word) returned
+              // `simple=True, lenWords=0` -- exactly the F2 livelock signature already
+              // documented for the MOVE path below (lenWords=0 -> Aligner shiftWords=0
+              // -> decodePc never advances). Fixed the same way that path was: use the
+              // WIDTH-EXTENDING `+^` (3->4->5 bits) so the true value (max 8) is
+              // computed exactly. No `<= WINDOW` guard is needed here (unlike MOVE,
+              // whose two independent full-format EAs can reach 11): 8 <= WINDOW(10),
+              // so the aligner's `avail < L0` stall always terminates.
+              r.simple := True; r.lenWords := (U(1, 3 bits) +^ immWords +^ mext).resized
               r.ambiguousLine := mamb
             }
           }
