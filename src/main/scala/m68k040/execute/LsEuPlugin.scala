@@ -120,6 +120,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   var excLoadCmdValid: Bool = null; var excLoadCmdVaddr: UInt = null; var excLoadCmdSize: m68k040.isa.Size.C = null
   var excLoadCmdReady: Bool = null
   var excStoreValid: Bool = null;   var excStorePayload: DStoreCmd = null
+  var excStoreReady: Bool = null
   var sqEmptySig: Bool = null   // store queue drained (no committed store in flight)
 
   // ── Precise-path SQ<->ROB pass-throughs (Task P2.5 wires these end-to-end;
@@ -135,7 +136,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     excActive       = Bool()
     excLoadCmdValid = Bool(); excLoadCmdVaddr = UInt(32 bits); excLoadCmdSize = m68k040.isa.Size()
     excLoadCmdReady = Bool()
-    excStoreValid   = Bool(); excStorePayload = DStoreCmd()
+    excStoreValid   = Bool(); excStorePayload = DStoreCmd(); excStoreReady = Bool()
     sqEmptySig      = Bool()
     robHeadIn              = UInt(6 bits)
     robHeadValidIn         = Bool()
@@ -229,10 +230,25 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sq.io.commit  << sqCommitPort
     sq.io.commitB << sqCommitBPort
     sq.io.flush  := sqFlushSig
-    dcache.store << sq.io.drain
-    sq.io.drainAck := dcache.storeAck   // pop a drained entry only once memory is written
-    sq.io.drainErr := dcache.storeErr
+    // Ordinary SQ traffic owns the elastic store command by default.  The
+    // exception sequencer may override it below only after quiescing the SQ; when
+    // it does, explicitly hold the SQ side so a command cannot be accepted under
+    // the exception payload.
+    dcache.store.valid   := sq.io.drain.valid
+    dcache.store.payload := sq.io.drain.payload
+    sq.io.drain.ready    := dcache.store.ready
+    // The terminal response is untagged. Retain the accepted owner because
+    // excActive is already high while E_DRAIN still lets ordinary SQ stores finish.
+    val excStoreOutstanding = RegInit(False)
+    excStoreOutstanding.simPublic()
+    sq.io.drainAck := dcache.storeAck && !excStoreOutstanding
+    sq.io.drainErr := dcache.storeErr && !excStoreOutstanding
     sqEmptySig := sq.io.empty           // surfaced for the exception FSM's drain wait
+    // Simulation-only visibility for the full-path exception/SQ arbitration proof.
+    // These are existing queue signals, not a second producer or a cross-plugin API.
+    sq.io.empty.simPublic()
+    sq.io.drain.valid.simPublic()
+    sq.io.drain.ready.simPublic()
     // ---- precise-path at-head drain (Task P2.5): now fully closed-loop, routed
     // through LsEuPlugin's own pass-through wires (host DUT wires these to the
     // ROB's h0/count/interruptPending/tracePendingFire and drains sqCompletion/
@@ -2009,9 +2025,18 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
                                               m68k040.cache.CacheMode.INHIBITED)
       dcache.loadCmd.payload.token := U(0x80, m68k040.cache.DLoadToken.Width bits)
     }
+    excStoreReady := False
     when(excActive && excStoreValid) {
-      dcache.store.valid          := True
-      dcache.store.payload        := excStorePayload
+      sq.io.drain.ready := False
+      excStoreReady := dcache.store.ready
+      dcache.store.valid   := True
+      dcache.store.payload := excStorePayload
+    }
+    when(dcache.storeAck && excStoreOutstanding) {
+      excStoreOutstanding := False
+    }
+    when(dcache.store.fire && excActive && excStoreValid) {
+      excStoreOutstanding := True
     }
     // Exception frame/vector accesses are already physical on the cache ports and
     // therefore must not create repeated tagged DTLB commands while excActive is

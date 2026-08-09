@@ -83,6 +83,7 @@ class StoreQueueSplitSpec extends AnyFunSuite {
     dut.io.alloc.valid #= false; dut.io.commit.valid #= false
     dut.io.commitB.valid #= false; dut.io.commitB.payload #= 0
     dut.io.flush #= false; dut.io.drainAck #= false
+    dut.io.drain.ready #= true
     dut.io.drainErr #= false
     dut.io.robHeadIn #= 0; dut.io.robHeadValidIn #= false; dut.io.irqPreemptPendingIn #= false
     dut.io.alloc.payload.validB #= false; dut.io.alloc.payload.useStrbA #= false
@@ -91,10 +92,10 @@ class StoreQueueSplitSpec extends AnyFunSuite {
     cd
   }
 
-  /** Auto-ack each presented drain the next cycle (1-cycle write-through). */
+  /** Auto-ack each accepted drain the next cycle (1-cycle D-cache model). */
   def forkDrainAck(dut: StoreQueue, cd: ClockDomain): Unit = fork {
     while (true) {
-      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean && dut.io.drain.ready.toBoolean)
       dut.io.drainAck #= true
       cd.waitSampling()
       dut.io.drainAck #= false
@@ -126,7 +127,7 @@ class StoreQueueSplitSpec extends AnyFunSuite {
       val cd = initDut(dut)
       val drained = scala.collection.mutable.ListBuffer[(Long, Long)]()
       fork { while (true) { cd.waitSampling()
-        if (dut.io.drain.valid.toBoolean)
+        if (dut.io.drain.valid.toBoolean && dut.io.drain.ready.toBoolean)
           drained += ((dut.io.drain.payload.paddr.toLong, dut.io.drain.payload.strb.toLong)) } }
       forkDrainAck(dut, cd)
       allocSplit(dut, cd, robId = 4,
@@ -149,7 +150,8 @@ class StoreQueueSplitSpec extends AnyFunSuite {
       val cd = initDut(dut)
       val drained = scala.collection.mutable.ListBuffer[Long]()
       fork { while (true) { cd.waitSampling()
-        if (dut.io.drain.valid.toBoolean) drained += dut.io.drain.payload.paddr.toLong } }
+        if (dut.io.drain.valid.toBoolean && dut.io.drain.ready.toBoolean)
+          drained += dut.io.drain.payload.paddr.toLong } }
       forkDrainAck(dut, cd)
       allocSplit(dut, cd, robId = 9,
         paddrA = 0x10E, nbytesA = 2, strbA = 0xC000, lineA = BigInt("11220000000000000000000000000000", 16),
@@ -168,7 +170,7 @@ class StoreQueueSplitSpec extends AnyFunSuite {
       val cd = initDut(dut)
       val drained = scala.collection.mutable.ListBuffer[(Long, Long)]()
       fork { while (true) { cd.waitSampling()
-        if (dut.io.drain.valid.toBoolean)
+        if (dut.io.drain.valid.toBoolean && dut.io.drain.ready.toBoolean)
           drained += ((dut.io.drain.payload.paddr.toLong, dut.io.drain.payload.data.toLong)) } }
       forkDrainAck(dut, cd)
       allocAligned(dut, cd, robId = 4, paddr = 0x100, data = 0xCAFEBABEL, Size.LONG)

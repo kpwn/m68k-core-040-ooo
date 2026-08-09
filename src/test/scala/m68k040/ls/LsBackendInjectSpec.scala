@@ -60,6 +60,16 @@ class LsBackendInjectSpec extends AnyFunSuite {
       rob.logic.completion(1).payload := eu1.completion.payload
       rob.logic.completion(2).valid   := lsEu.completion.valid
       rob.logic.completion(2).payload := lsEu.completion.payload
+      rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
+      rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
+      rob.logic.completion(4).valid   := lsEu.sqCompletionPort.valid
+      rob.logic.completion(4).payload := lsEu.sqCompletionPort.payload
+      rob.logic.sqFaultCompletion.valid   := lsEu.sqFaultCompletionPort.valid
+      rob.logic.sqFaultCompletion.payload := lsEu.sqFaultCompletionPort.payload
+      rob.logic.preciseDrainBusyIn        := lsEu.preciseDrainBusySig
+      lsEu.robHeadIn           := rob.logic.h0
+      lsEu.robHeadValidIn      := rob.logic.count > 0
+      lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
       iq.lsWakeup.valid   := lsEu.wakeup.valid
       iq.lsWakeup.payload := lsEu.wakeup.payload
       iq.lsNzvcWakeup.valid   := lsEu.wakeupNzvc.valid
@@ -129,12 +139,20 @@ class LsBackendInjectSpec extends AnyFunSuite {
     u.toCcr #= false; u.isCondTrap #= false
     u.faultAddr #= 0; u.sswInstr #= false
     u.divSigned #= false; u.divIsRem #= false
+    u.isChk2 #= false
     u.shiftOp #= 0; u.shiftDir #= false; u.extByte #= false
     u.isMovea #= false; u.isScc #= false; u.isDbcc #= false
     u.div64 #= false; u.bcdSub #= false; u.bitOp #= 0
+    u.bfOp #= 0; u.bfDynamic #= false; u.bfMem #= false; u.bfStoreForm #= 0
     u.indexLong #= false; u.indexScale #= 0
-    u.leaAddr #= false; u.fromCcr #= false; u.fromSr #= false
+    u.leaAddr #= false; u.movesAliasStore #= false
+    u.fromCcr #= false; u.fromSr #= false
     u.needsSupervisor #= false; u.keepCommit #= false
+    u.faultAtc #= false
+    u.sysOp #= false; u.sysKind #= m68k040.decode.SysKind.NONE; u.sysReadDir #= false
+    u.predTaken #= false; u.predTarget #= 0
+    u.phtValid #= false; u.phtIndex #= 0
+    u.casForm #= 0
     u.firstOfInstr #= true
   }
 

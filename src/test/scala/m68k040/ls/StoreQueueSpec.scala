@@ -58,6 +58,7 @@ class StoreQueueSpec extends AnyFunSuite {
     dut.io.commit.valid #= false
     dut.io.commitB.valid #= false; dut.io.commitB.payload #= 0
     dut.io.flush #= false
+    dut.io.drain.ready #= true
     dut.io.drainAck #= false
     dut.io.drainErr #= false
     dut.io.robHeadIn #= 0; dut.io.robHeadValidIn #= false; dut.io.irqPreemptPendingIn #= false
@@ -66,12 +67,10 @@ class StoreQueueSpec extends AnyFunSuite {
     cd
   }
 
-  /** Model the D-cache's write-through ack: a drained store is presented for one
-    * cycle (io.drain.valid) then HELD resident until ack. This fork acks the cycle
-    * after each drain-issue (a 1-cycle write-through), mirroring DcachePlugin.storeAck. */
+  /** Model a one-cycle D-cache completion for every accepted drain command. */
   def forkDrainAck(dut: StoreQueue, cd: ClockDomain): Unit = fork {
     while (true) {
-      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean && dut.io.drain.ready.toBoolean)
       dut.io.drainAck #= true
       cd.waitSampling()
       dut.io.drainAck #= false

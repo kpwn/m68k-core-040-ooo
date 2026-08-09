@@ -19,7 +19,7 @@ class DcacheProbePlugin extends FiberPlugin {
     val loadCmdIn  = slave(Stream(DLoadCmd()))
     val loadRspOut = master(Flow(DLoadRsp()))
     val loadBusyOut = out(Bool())
-    val storeIn    = slave(Flow(DStoreCmd()))
+    val storeIn    = slave(Stream(DStoreCmd()))
     // Task P5.4: cache-maintenance walk drive/observe. `maintCmd` is default-driven
     // idle inside DcachePlugin (allowOverride) since it has no real driver until Task
     // P5.5, so this overrides it rather than using `<<`.

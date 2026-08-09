@@ -28,8 +28,8 @@ import spinal.lib.misc.plugin.FiberPlugin
   *   - `dataMem` + `tagMem` are write + readSync ONLY (no readAsync) per way ->
   *     simple-dual-port BRAM (1 write + 1 sync-read).
   *   - The load data-read and the store-RMW old-line-read SHARE the one sync-read
-  *     port (the cache is single-outstanding per the LS pipe; an explicit load>store
-  *     arbiter defers the store-read by a cycle on the rare overlap).
+  *     port. A one-bit bounded arbiter alternates fresh loads with a waiting store;
+  *     internal replay/refill/maintenance work retains priority.
   *   - Hit/miss is resolved ONE CYCLE LATER (in S1, against the registered tag-read
   *     vs the registered ppn-tag) — latency-agnostic; lock-step absorbs the +1.
   * FMax (Slice 2, 2026-08-07): the LOAD hit RESPONSE build (way-select -> byte-lane
@@ -85,8 +85,8 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val loadRspPort = Flow(DLoadRsp())
     loadRspPort.valid.simPublic(); loadRspPort.payload.simPublic()
     val loadBusyReg = Bool()
-    val storePort   = Flow(DStoreCmd())
-    storePort.valid.simPublic(); storePort.payload.simPublic()  // debug-only (ported-tests cluster 11 trace)
+    val storePort   = Stream(DStoreCmd())
+    storePort.valid.simPublic(); storePort.ready.simPublic(); storePort.payload.simPublic()
     val storeAckReg = Bool()
     storeAckReg.simPublic()   // test-visibility only (P4.1 COPYBACK-hit directed test: no
                                // AXI B to observe on that path); no-op for synthesis
@@ -495,32 +495,32 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // The D-cache response fault bit is exclusively a physical AXI refill error.
     loadRspPort.payload.fault := busFaultResp
 
-    // ---- STORE write-through (PIPELINED RMW: S0 latch / S1 read / S2 merge+write) ----
+    // ---- STORE drain (elastic S0 / S1 read / S2 compare / S3 merge+write) ----
     // FMax: the store RMW (old line readAsync + 16-lane byte-merge + write) used to
     // be a combinational cycle fronted by the far-placed exc-FSM/DTLB cone. With all
     // reads SYNC the old line + hit-tag are read from BRAM:
-    //   store-S0 (on storePort.valid): latch the raw store payload into regs PHYSICALLY
+    //   store-S0 (on storePort.fire): latch the raw store payload into regs PHYSICALLY
     //     at the cache (a short route ending at a flop).
     //   store-S1 (next cycle): launch the SHARED sync read (old line + hit-tag) at the
     //     store's set — UNLESS the load FSM is using the read port this cycle (load
     //     priority); on conflict the store holds in S1 and retries next cycle.
-    //   store-S2 (after the read lands): resolve the hit (registered tag-read), merge
-    //     the registered old line with the store bytes, drive the dataMem write +
-    //     latch the AXI write-through beat.
-    // Single-outstanding: the producer never presents a 2nd store before this one's
-    // AXI B (storeAck) lands, so S0/S1/S2 never overlap a SECOND STORE. It does NOT,
-    // however, keep the cache arrays still across that window: the load-refill engine
+    //   store-S2 (after the read lands): resolve hit/way and capture the selected line.
+    //   store-S3: merge bytes, write the array/dirty state, and emit a local hit ack
+    //     or launch the serialized AXI/write-allocate backend.
+    // Resident COPYBACK hits overlap at every boundary and sustain II=1. Variable-
+    // latency classes are admission barriers. The load-refill engine
     // (REFILL's allocate write, REPLAY's write-allocate merge) is completely
-    // independent of the store side and can write valids/tagMem/dataMem at any point
-    // between S0 and S2. Two consequences, both interlocked by `refillWriteHold`
+    // independent of the store side and can write valids/tagMem/dataMem across that
+    // window. Two consequences, both
+    // interlocked by `refillWriteHold`
     // (declared just above the load FSM below -- read its comment before touching
     // any of this):
     //   - a same-SET refill landing inside the S1..S2 window would invalidate the
     //     store's REGISTERED tag-read, so its S2 hit-detect would be stale;
-    //   - a same-WAY refill (any set) landing on the S2 cycle itself would win the
+    //   - a same-WAY refill (any set) landing on the S3 cycle itself would win the
     //     shared per-way array write port and silently DROP the store's own write.
     // `refillWriteHold` holds the refill side off in both cases (delay, never drop),
-    // which is what makes the S2 hit-detect and the S2 array write correct.
+    // which is what makes the S2 lookup and S3 array write correct.
     val stMergeReg = Reg(Bits(128 bits))
     val stStrbReg  = Reg(Bits(16 bits))
     val stAddrReg  = Reg(UInt(32 bits))
@@ -560,7 +560,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     //     open pair, but nothing protected the store from EVICT_WR's own open
     //     pair -- a one-directional gate on a problem that is symmetric.
     //   - Revision 3 (landed): the SAME `storeWantsAxi`-style gate, applied in
-    //     BOTH directions. `evictAxiPairOpen` (below) blocks the store-S2
+    //     BOTH directions. `evictAxiPairOpen` (below) blocks the registered store-S3
     //     write-through path's own AW/W KICKOFF (not its array RMW write, not
     //     its cacheMode branching -- ONLY the AXI leg) for as long as EVICT_WR's
     //     own aw+w pair is genuinely incomplete, via a `pendingWtKickoff` latch
@@ -576,30 +576,44 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     //     assumed, by two independently-failed attempts to avoid it.
     val evictAwDone = Reg(Bool()) init True   // True == no eviction beat in flight
     val evictWDone  = Reg(Bool()) init True
-    // Does the store-S2 write-through path want (or currently hold) the physical
-    // AXI write channels THIS cycle? Store-S2's own drive below is completely
+    // Does the serialized store backend want (or currently hold) the physical
+    // AXI write channels THIS cycle? Its own drive below is completely
     // unconditional on this signal (it never checks it) -- this exists PURELY to
     // gate EVICT_WR's own drive off, so the two never physically collide.
     val storeWantsAxi = !stAwDone || !stWDone
     // The symmetric direction: is EVICT_WR's own aw+w pair currently open (one or
-    // both legs not yet accepted)? Gates the store-S2 write-through path's own
-    // AXI kickoff (see `pendingWtKickoff` at the S2 site and its consumer below).
+    // both legs not yet accepted)? Gates the registered store-result stage's AXI
+    // kickoff (see `pendingWtKickoff` and its consumer below).
     val evictAxiPairOpen = !evictAwDone || !evictWDone
     // Level-held "still need to actually kick off the AXI aw/w for a write-
-    // through/inhibited drain" latch -- set by store-S2 (one cycle, a pulse)
+    // through/inhibited drain" latch -- set by store-S3 (one cycle, a pulse)
     // INSTEAD OF directly setting stAwDone/stWDone False when `evictAxiPairOpen`
     // holds it off; consumed (retried every cycle) below, exactly mirroring
     // `pendingStoreMiss`'s existing shape.
     val pendingWtKickoff = RegInit(False)
 
-    // ---- store-S0: PURE payload latch (the cache-boundary flop) ----
+    // Ordered store-drain admission. COPYBACK hits may occupy the existing
+    // S0/S1/S2/S3 boundaries concurrently; variable-latency classes remain a
+    // single-owner barrier and a discovered COPYBACK miss freezes younger stages.
+    val storeOutstanding = RegInit(U(0, 3 bits)) // max: S0 + S1 + S2 + S3
+    val serialStoreInFlight = RegInit(False)
+    val storeMissBarrier = RegInit(False)
+    // A load miss snapshots its dirty victim when ldS1 resolves. Any older store
+    // already in S3 is forwarded into that snapshot; a store still in S1 has no
+    // final line yet and must remain parked until the load refill/replay finishes.
+    // This prevents a post-snapshot S3 write from being silently replaced by the
+    // refill while EVICT_WR writes the pre-store victim image to memory.
+    val loadMissStoreBarrier = RegInit(False)
+    val refillNeedsStoreDrain = Bool(); refillNeedsStoreDrain := False
+    storeOutstanding.simPublic(); serialStoreInFlight.simPublic(); storeMissBarrier.simPublic()
+    loadMissStoreBarrier.simPublic()
+    val inputStoreSerial = storePort.payload.precise ||
+      (storePort.payload.cacheMode =/= CacheMode.COPYBACK)
+
+    // ---- store-S0: elastic payload latch (the cache-boundary flop) ----
     val s0Valid   = RegInit(False)
     val s0Payload = Reg(DStoreCmd())
-    s0Valid := False  // default; armed on a store-accept below
-    when(storePort.valid) {
-      s0Valid   := True
-      s0Payload := storePort.payload
-    }
+    s0Valid.simPublic()
 
     // ---- store-S1: launch the shared sync read (old line + hit-tag) ----
     // Decoded off the REGISTERED S0 payload. The read launches onto the shared
@@ -607,26 +621,63 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // conflict the store stays in S1 (s1Pending) and retries next cycle.
     val stS1Valid   = RegInit(False)      // a store is in S1 awaiting its read launch
     val stS1Payload = Reg(DStoreCmd())
+    stS1Valid.simPublic()
     val stS1Set     = stS1Payload.paddr(offBits + setBits - 1 downto offBits)
     val stS1Off     = stS1Payload.paddr(offBits - 1 downto 0)
     val stS1Tag     = stS1Payload.paddr(31 downto offBits + setBits)
-    stS1Valid := False  // default; armed below when S0 advances / S1 holds
+    // Bounded arbitration only under real read-port contention.  One fresh load or
+    // probe may win over a waiting store; the next fresh read yields.  Internal
+    // replay/refill/maintenance work is never delayed by this bit.
+    val storeReadOwed = RegInit(False)
+    storeReadOwed.simPublic()
 
-    // ---- store-S2: registered old line + hit + merge + write ----
-    val stS2Valid   = RegInit(False)      // the store read has landed; merge+write now
+    // ---- store-S2: registered lookup request; terminate tag compare here ----
+    val stS2Valid   = RegInit(False)
     val stS2Payload = Reg(DStoreCmd())
     val stS2Set     = stS2Payload.paddr(offBits + setBits - 1 downto offBits)
     val stS2Off     = stS2Payload.paddr(offBits - 1 downto 0)
     val stS2Tag     = stS2Payload.paddr(31 downto offBits + setBits)
     stS2Valid := False  // default; armed when S1's read launches
+
+    // ---- store-S3: registered lookup result; merge/write/ack stage ----
+    // This cut is intentional for FPGA timing: tag BRAM + compare ends at these
+    // flops, while byte merge, dirty update and the array write start here.
+    val stS3Valid   = RegInit(False)
+    val stS3Payload = Reg(DStoreCmd())
+    val stS3Hit     = RegInit(False)
+    val stS3Way     = Reg(UInt(wayBits bits))
+    val stS3OldLine = Reg(Bits(128 bits))
+    val stS3Set     = stS3Payload.paddr(offBits + setBits - 1 downto offBits)
+    val stS3Off     = stS3Payload.paddr(offBits - 1 downto 0)
+    val stS3Tag     = stS3Payload.paddr(31 downto offBits + setBits)
+    val stS3Inhibited = stS3Payload.cacheMode === CacheMode.INHIBITED
+    val stS3Copyback  = stS3Payload.cacheMode === CacheMode.COPYBACK
+    stS3Valid := False
+
+    val stS3MergeData = Mux(stS3Payload.useStrb,
+      stS3Payload.lineData,
+      DcacheByteLane.storeData(stS3Off, stS3Payload.size, stS3Payload.data))
+    val stS3MergeStrb = Mux(stS3Payload.useStrb,
+      stS3Payload.strb,
+      DcacheByteLane.storeStrb(stS3Off, stS3Payload.size))
+    val stS3OldBytes = stS3OldLine.subdivideIn(8 bits)
+    val stS3MrgBytes = stS3MergeData.subdivideIn(8 bits)
+    val stS3NewBytes = Vec(Bits(8 bits), 16)
+    for (i <- 0 until 16)
+      stS3NewBytes(i) := Mux(stS3MergeStrb(i), stS3MrgBytes(i), stS3OldBytes(i))
+    val stS3MergedLine = stS3NewBytes.asBits
+    val stS3ArrayWrite = stS3Valid && stS3Hit && !stS3Inhibited
+
+    stS3Valid.simPublic(); stS3Payload.simPublic(); stS3Hit.simPublic()
+    stS3Way.simPublic(); stS3ArrayWrite.simPublic()
     // DEBUG (task #189 investigation, temporary): sim-only visibility into the
     // store RMW hit/miss decision. simPublic is a no-op for synthesis.
     stS2Valid.simPublic(); stS2Payload.simPublic()
 
     // Store-S2 hit-detect + cacheability decode. Declared HERE (rather than next to
     // the S2 merge/write block far below, where it used to live) purely so that
-    // `refillWriteHold` -- which must know whether store-S2 will drive the shared
-    // per-way array write port THIS cycle, and into WHICH way -- can be built before
+    // `refillWriteHold` -- which must know which registered S3 result will drive the
+    // shared per-way array write port -- can be built before
     // the load FSM that consumes it. Inputs are all registers/BRAM outputs available
     // at this point (valids, rdTag, stS2Payload); no behavioural change from the move.
     val stS2HitVec = Vec(Bool(), ways)
@@ -640,17 +691,34 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val stS2Inhibited = stS2Payload.cacheMode === CacheMode.INHIBITED
     val stS2Copyback  = stS2Payload.cacheMode === CacheMode.COPYBACK
     val stS2HitAny    = stS2HitVec.orR
-    // EXACT predicate for "store-S2 drives wrEn/wrSet/wrData this cycle" — must stay
-    // bit-identical to the guard on the S2 RMW write block below.
-    val stS2ArrayWrite = stS2Valid && !stS2Inhibited && stS2HitAny
+    val stS2HitWay    = OHToUInt(stS2HitVec)
+    val stS2MergeData = Mux(stS2Payload.useStrb,
+      stS2Payload.lineData,
+      DcacheByteLane.storeData(stS2Off, stS2Payload.size, stS2Payload.data))
+    val stS2MergeStrb = Mux(stS2Payload.useStrb,
+      stS2Payload.strb,
+      DcacheByteLane.storeStrb(stS2Off, stS2Payload.size))
+    val stS2RawHitLine = MuxOH(stS2HitVec, rdData)
+    // If the preceding store writes this physical line in S3 while this lookup's
+    // synchronous read returns, capture the preceding store's final line.  FPGA
+    // BRAM read-during-write behaviour is not part of the architectural contract.
+    val stS2UsesS3Line = stS3ArrayWrite && stS2HitAny &&
+      (stS2Set === stS3Set) && (stS2Tag === stS3Tag) && (stS2HitWay === stS3Way)
+    val stS2CapturedLine = Mux(stS2UsesS3Line, stS3MergedLine, stS2RawHitLine)
+    stS2UsesS3Line.simPublic()
+    // Historical test/debug alias: the physical write moved to registered S3.
+    val stS2ArrayWrite = stS3ArrayWrite
     stS2ArrayWrite.simPublic()   // test-visibility only (DcacheDrainRefillRaceSpec's
     // same-way-collision coincidence check); no-op for synthesis.
+    val storeMissDiscovered = stS2Valid && stS2Copyback && !stS2HitAny
+    val loadMissDiscovered  = ldS1Valid && !ldS1Hit
+    val loadVictimFromS3Dbg = Bool(); loadVictimFromS3Dbg := False; loadVictimFromS3Dbg.simPublic()
+    val storeVictimFromS3Dbg = Bool(); storeVictimFromS3Dbg := False; storeVictimFromS3Dbg.simPublic()
+    storeMissDiscovered.simPublic()
+    loadMissDiscovered.simPublic()
 
-    // S0 -> S1: advance the latched payload into S1.
-    when(s0Valid) {
-      stS1Valid   := True
-      stS1Payload := s0Payload
-    }
+    when(storeAllocAckReg) { storeMissBarrier := False }
+    when(storeMissDiscovered) { storeMissBarrier := True }
 
     // ---- shared read-port arbitration (FMax: keep the live load-accept cone OUT
     // of the high-fanout BRAM read-address net) ----
@@ -663,7 +731,11 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // get the port?" question (loadUsesPort) feeds ONLY the low-fanout stS2Valid
     // control register, NOT the BRAM address — breaking the post-route critical path
     // (loadCmdPort.ready -> arbiter -> tag/dataMem read-address).
-    when(stS1Valid) {
+    // A load-miss decision may speculatively repoint the read port at this S1
+    // descriptor; only the S1->S2 valid capture is held below. Keeping the raw
+    // address drive independent of combinational load hit/miss avoids a
+    // tag-BRAM-result -> next BRAM-address timing cone.
+    when(stS1Valid && !storeMissBarrier && !loadMissStoreBarrier) {
       rdSet := stS1Set
       rdEn  := True
     }
@@ -712,27 +784,13 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // Same hold-and-retry philosophy: the refill is delayed, the store is never
     // dropped.
     //
-    // Why this can't livelock (CORRECTED — the previous version of this comment
-    // claimed the hold "lasts at most the single cycle store-S2 is valid", which
-    // is FACTUALLY WRONG: under a back-to-back store stream `stS2Valid` (and
-    // therefore `stS1Valid`) can be True on every consecutive cycle indefinitely
-    // — trace their own `:=` assignments above, there is no structural 1-cycle
-    // bound. The real invariant is a CONTRACT on the store producer, not a
-    // width-of-signal fact: `DcacheService.store` (an unbuffered `Flow`, no
-    // backpressure) is driven single-outstanding and ack-gated by the SQ/LS EU
-    // — at most one store is ever "in flight" contesting this hold at a time,
-    // and that store's ack always eventually arrives regardless of the hold
-    // (WT ack rides the AXI B response, which this hold never gates; a
-    // COPYBACK-hit ack comes from `cbHitAckReg`, likewise ungated; a
-    // COPYBACK-miss store contributes `stS2HitAny = False`, so it can't assert
-    // `stS2ArrayWrite`/hold its own refill in the first place). Once that one
-    // store's ack lands the next store (if any) is a fresh contender, so the
-    // hold can never accumulate an unbounded queue behind it. THIS MAKES THE
-    // HOLD'S LIVENESS A CONTRACT the store side must preserve, not a
-    // structural guarantee derived from this file alone — if the store side
-    // ever grows a real multi-outstanding queue, this invariant (and this
-    // whole no-livelock argument) would need re-examination.
-    val refillWriteHold = (stS1Valid && (stS1Set === missSet)) ||
+    // Liveness with a real multi-flight Stream is explicit: once a refill waits,
+    // `refillNeedsStoreDrain` stops new store admission and the finite S0/S1/S2/S3
+    // pipe drains. Parked younger descriptors are excluded from this hold while a
+    // miss barrier owns the arrays, so they cannot deadlock the refill that will
+    // eventually release them.
+    val refillWriteHold = (stS1Valid && !storeMissBarrier && !loadMissStoreBarrier &&
+                           (stS1Set === missSet)) ||
                           (stS2Valid && (stS2Set === missSet)) ||
                           // NOTE: this 3rd (same-way) term only means anything
                           // while `victimWay` holds a currently-relevant value,
@@ -742,63 +800,25 @@ class DcachePlugin extends FiberPlugin with DcacheService {
                           // harmless-but-meaningless there (nothing consumes
                           // `refillWriteHold` in IDLE today) — don't reuse it
                           // in an IDLE-adjacent context without re-checking.
-                          (stS2ArrayWrite && stS2HitVec(victimWay))
+                          (stS3ArrayWrite && (stS3Way === victimWay))
 
-    // ---- FMax Lever F: REPLAY's OWN write-allocate hold — deliberately NOT
-    // `refillWriteHold` (design doc
-    // `docs/superpowers/specs/2026-08-08-fmax-leverf-upstream-storequeue-design.md`).
-    //
-    // `refillWriteHold`'s three terms are all live functions of the store-S2 tag
-    // compare (`stS2HitVec`, above), i.e. of the tag BRAM read output. REFILL's
-    // `axi.r.ready` (below) genuinely NEEDS that precision: a LOAD-miss refill runs
-    // fully concurrently with an unrelated store stream, so it must hold ONLY on a
-    // real same-set/same-way collision or it would stall every refill against every
-    // store anywhere in the cache. That site is deliberately left untouched.
-    //
-    // REPLAY's write-allocate merge is the opposite case. It only ever runs with
-    // `refillReqIsStore`, i.e. servicing a COPYBACK drain miss — and that drain's
-    // ONLY ack source is the very `storeAllocAckReg` that gate itself produces (its
-    // S2 arm issues no AXI beat, setting stAwDone/stWDone True, so `storeBAck`
-    // cannot fire; and it MISSED, so `cbHitAckReg` — which requires stS2HitAny —
-    // cannot fire either). So `StoreQueue.drainBusy` is still set for the whole
-    // EVICT_WR/REFILL/REPLAY excursion, `drainIssue = headReady && !drainBusy`
-    // (StoreQueue.scala) is False, and the ExceptionUnit's own store path is gated
-    // behind `sqDrained` == `sq.io.empty` == `!anyValid && !drainBusy`, False for
-    // the same reason. NO store can be in S0/S1/S2 while that merge is evaluated.
-    //
-    // This predicate is a STRICT SUPERSET of `refillWriteHold` (every one of its
-    // three terms requires `stS1Valid` or `stS2Valid`), so it CANNOT weaken the
-    // P4.4 array-write-port interlock — the "delay, never drop" property is
-    // preserved UNCONDITIONALLY, without relying on the single-outstanding producer
-    // contract for CORRECTNESS. The contract is relied on only for the
-    // (unreachable, hence unobservable) claim that this never actually holds, and
-    // `storeDrainHoldFired` below makes even that claim falsifiable. It also cannot
-    // livelock: `stS1Valid`/`stS2Valid` are a plain 2-deep pipe that advances with
-    // no dependency on any ack (S1 holds only on `fsm.loadUsesPort`/`maintUsesPort`,
-    // neither of which the REPLAY store arm can assert), so the hold is bounded at
-    // <=2 cycles even under a contract violation.
-    //
-    // FMax purpose: both terms are plain registers, so this gate — and with it
-    // `storeAllocAckReg` -> `storeAckReg` -> SQ `drainAck` -> `sqCompletion` -> the
-    // ROB fault-register write — launches from a flop instead of from the tag BRAM
-    // through the 21-bit store-S2 tag compare.
-    val storeDrainRefillHold = stS1Valid || stS2Valid
+    // REPLAY's store-miss merge must never collide with a real S2 array writer.
+    // Younger accepted descriptors are deliberately held in S0/S1 by
+    // `storeMissBarrier`; S1 occupancy alone is harmless because it has not launched
+    // a read and drives no write. Keeping this register-only S2 guard preserves the
+    // Lever-F timing cut while allowing the miss merge to complete in the presence
+    // of safely parked younger descriptors.
+    val storeDrainRefillHold = stS2Valid || stS3Valid
 
-    // Proves the producer-contract argument above instead of assuming it. Same shape
-    // as this file's diagFaultKind0Fires/Kind1Fires collision detectors, with the
-    // same poke-able opt-out as `diagFaultExpected` so a deliberately
-    // contract-violating directed positive control can exercise the hold on purpose.
+    // A live pulse remains as a non-vacuity/debug hook. Normal Stream/barrier logic
+    // makes it unreachable; a forced internal positive control may opt in.
     val storeDrainHoldFired = Bool(); storeDrainHoldFired := False
     storeDrainHoldFired.simPublic()
     val storeDrainHoldExpected = RegInit(False); storeDrainHoldExpected.simPublic()
     GenerationFlags.simulation {
       assert(!(storeDrainHoldFired && !storeDrainHoldExpected),
-        "DcachePlugin: a store was in S1/S2 while a COPYBACK drain-miss write-allocate " +
-        "merge was held in REPLAY -- the single-outstanding store-producer contract " +
-        "(StoreQueue.drainBusy + the ExceptionUnit's sqDrained gate) that Lever F's " +
-        "timing argument rests on was violated. The merge was correctly DELAYED (not " +
-        "dropped), so this is not corruption -- but the contract must be re-derived " +
-        "before trusting the FMax claim.",
+        "DcachePlugin: an S2 array writer survived into COPYBACK drain-miss REPLAY; " +
+        "the merge was delayed, but the miss barrier failed to park younger stores",
         FAILURE)
     }
 
@@ -850,6 +870,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       * for why gating that arm on `maintBusyReg` (which IS set during `WAIT`) instead
       * would be a genuine deadlock. Driven by the `maint` Area's own `walking`. */
     val maintWalking = Bool(); maintWalking := False
+    val freshLoadUsesPort = Bool(); freshLoadUsesPort := False
 
     // ---- LOAD FSM (OVERRIDES the shared read port with PRIORITY over the store) ----
     val fsm = new StateMachine {
@@ -898,7 +919,8 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         loadProbePort.ready := !loadShadowValid && !pendingStoreMiss && !maintBusyReg &&
                                earlyProbeHasAllocSlot &&
                                (!loadCmdPort.valid || useEarlyProbe) &&
-                               !(ldS1Valid && !ldS1Hit)
+                               !(ldS1Valid && !ldS1Hit) &&
+                               !(storeReadOwed && stS1Valid)
         when(loadProbePort.fire) {
           val canceledAtLaunch = loadProbeCancelPort.valid &&
                                  (loadProbeCancelPort.payload.all ||
@@ -906,6 +928,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           rdSet        := loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
           rdEn         := True
           loadUsesPort := True
+          freshLoadUsesPort := True
           when(!canceledAtLaunch) {
             earlyProbeValids(earlyProbeAllocIdx)  := True
             earlyProbeReadies(earlyProbeAllocIdx) := False
@@ -931,7 +954,8 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         val resolveOldProbeDuringMaint = earlyProbeOwnsCmd && !maintWalking
         loadCmdPort.ready := !loadShadowValid && !pendingStoreMiss &&
                              (!maintBusyReg || resolveOldProbeDuringMaint) &&
-                             (!earlyProbeTokenPresent || earlyProbeOwnsCmd)
+                             (!earlyProbeTokenPresent || earlyProbeOwnsCmd) &&
+                             (!(storeReadOwed && stS1Valid) || useEarlyProbe)
 
         when(loadCmdPort.fire && earlyProbeOwnsCmd) {
           // Full-queue consume-and-replace reuses this physical entry for the new
@@ -972,7 +996,6 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           // The queued VIPT result already contains the physical-tag-qualified,
           // size-extracted hit data. Bypass the redundant normal S1 read and land in
           // the existing registered S2 response stage.
-          loadUsesPort := True
           ldS2Valid      := True
           ldS2Hit        := True
           ldS2Direct     := True
@@ -985,6 +1008,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           rdSet        := cmdSet
           rdEn         := True
           loadUsesPort := True
+          freshLoadUsesPort := True
           ldS1Valid    := True
           ldS1Set      := cmdSet
           ldS1Tag      := cmdTag
@@ -998,7 +1022,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         }
         // S1 resolution of a launched load read. A HIT drives the response
         // one cycle later out of S2. A MISS starts the refill.
-        when(ldS1Valid && !ldS1Hit) {
+        when(loadMissDiscovered) {
           // Miss: latch miss-state and start the refill (the +1-cycle deferral
           // relative to the old async hit-detect is latency-agnostic). A same-
           // cycle load miss takes priority over a pending store-drain miss
@@ -1033,9 +1057,20 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           // its dirty bit is never cleared here either). Gating on the SAME
           // condition REFILL already uses for `doAllocate` keeps "a victim is
           // chosen" and "a victim is evicted" consistent.
-          val evictThis = dirtys(vw)(ldS1Set) && (ldS1Cmode =/= CacheMode.INHIBITED)
-          victimEvictTag  := rdTag(vw)
-          victimEvictLine := rdData(vw)
+          val victimFromS3 = stS3ArrayWrite && (stS3Set === ldS1Set) &&
+            (stS3Way === vw)
+          loadVictimFromS3Dbg := victimFromS3
+          val victimDirtyNow = dirtys(vw)(ldS1Set) ||
+            (victimFromS3 && stS3Copyback)
+          val evictThis = victimDirtyNow && (ldS1Cmode =/= CacheMode.INHIBITED)
+          victimEvictTag  := Mux(victimFromS3, stS3Tag, rdTag(vw))
+          victimEvictLine := Mux(victimFromS3, stS3MergedLine, rdData(vw))
+          loadMissStoreBarrier := True
+          GenerationFlags.simulation {
+            assert(!stS2Valid,
+              "DcachePlugin: load and store S2 simultaneously claimed the one synchronous read result",
+              FAILURE)
+          }
           refillReqIsStore := False
           arSent    := False
           busy      := True
@@ -1205,6 +1240,11 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         // `doAllocate`'s wrEn/wrTagEn/valids/dirtys writes below only ever fire on
         // the SAME cycle the beat is actually accepted (`axi.r.fire`), which by
         // then is guaranteed `!refillWriteHold`.
+        // Once the refill beat is waiting, stop accepting further store drains.
+        // The finite resident store pipe continues to drain where its ordering
+        // barriers permit, so the collision hold clears in bounded time even
+        // under an infinite producer.
+        refillNeedsStoreDrain := axi.r.valid && refillWriteHold
         axi.r.ready := !refillWriteHold
         when(axi.r.fire) {
           // Task #189: a non-OKAY response (SLVERR/DECERR — genuinely unmapped or
@@ -1261,6 +1301,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
             // do NOT touch ldS1Valid/rdSet/rdEn here (a real re-launch would MISS
             // again forever — the line is still, correctly, not resident).
             busFaultResp := True
+            loadMissStoreBarrier := False
           }
           goto(IDLE)
         } elsewhen(missCmode === CacheMode.INHIBITED) {
@@ -1268,6 +1309,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           // is nothing to "replay" as a hit. Deliver the just-fetched beat
           // directly, once, exactly like busFaultResp's one-pulse shape.
           inhibitedResp := True
+          loadMissStoreBarrier := False
           goto(IDLE)
         } elsewhen(refillReqIsStore) {
           // Task P4.4: this is an array-write site (write-allocate merge) — hold
@@ -1318,6 +1360,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           ldS1Size     := missSize
           ldS1Cmode    := missCmode
           ldS1Paddr    := missPaddr
+          loadMissStoreBarrier := False
           goto(IDLE)
         }
       }
@@ -1385,11 +1428,10 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     //     an ALREADY-LATCHED `pendingStoreMiss` -- was ungated, so the load FSM could
     //     still leave IDLE into EVICT_WR/REFILL mid-walk. Now gated on
     //     `!maintWalking` (see that arm).
-    //   - "no store can be in S1": nothing structurally prevented it. `storePort` is
-    //     an unbuffered `Flow` with no backpressure; `dcIdleForMaint` omitted the LIVE
-    //     `storePort.valid` (fixed below), so a store presented on the very cycle
-    //     `WAIT` fell through to `READ` entered the pipe anyway and reached S1 during
-    //     the walk.
+    //   - "no store can be in S1": nothing structurally prevented it. The
+    //     historical unbackpressured `storePort` Flow could enter on the WAIT→READ edge.
+    //     The current Stream instead lowers ready once maintenance is latched and
+    //     keeps held valid outside the quiescence predicate.
     //
     // The ACTUAL, now-true invariant is a two-layer one:
     //   (1) LAST-ASSIGNMENT-WINS on the physical net: the walk's `rdSet`/`rdEn` drives
@@ -1406,7 +1448,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     //       the same S1->S2 arbiter that already handles `fsm.loadUsesPort`) instead
     //       of advancing to S2 to RMW-merge against the walk's set.
     // Layer (2) is defence in depth BEHIND `dcIdleForMaint`/`WAIT`, not a substitute
-    // for it: the sim asserts below still hold that no store is in S0..S2 and the load
+    // for it: the sim asserts below still hold that no store is in S0..S3 and the load
     // FSM is in IDLE for the whole walk. They prove the invariant rather than assume
     // it; and for the SHARED ARRAY READ PORT specifically, layer (2) makes a violation
     // a bounded stall rather than silent corruption.
@@ -1415,12 +1457,12 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // I-1): the sentence above used to make that "bounded stall, not silent
     // corruption" claim GENERALLY. It is only true of the read port. The walk's array
     // WRITES -- the `valids`/`dirtys` clears in `CHECK` and `WRB` -- are NOT arbitrated
-    // against store-S2's own write to those same arrays, which elaborates FIRST, so a
+    // against store-S3's own write to those same arrays, which elaborates FIRST, so a
     // genuine same-cycle collision there would be last-assignment-wins (the walk's
     // clear winning over the store's set), i.e. silent, not a stall. That ordering gap
     // is UNREACHABLE today and stays documented rather than fixed: `dcIdleForMaint`
-    // (with its now-included live `!storePort.valid` term) plus `WAIT` mean no store is
-    // anywhere in S0..S2 when the walk starts, the FAILURE-severity sim assert below
+    // (registered-stage and accepted-count terms) plus `WAIT` mean no store is
+    // anywhere in S0..S3 when the walk starts, the FAILURE-severity sim assert below
     // catches it if one ever is, and the caller (ExceptionUnit's `S_DRAIN` ->
     // `S_APPLY` -> `S_MAINTWAIT` serialization, Task P5.5) additionally waits on
     // `sqDrained && maintQuiesced` before requesting the walk and holds the whole
@@ -1428,12 +1470,12 @@ class DcachePlugin extends FiberPlugin with DcacheService {
 
     /** Every D-cache datapath resource the walk needs, genuinely idle THIS cycle.
       *
-      * POST-P5.4-REVIEW: `!storePort.valid` is a required conjunct, not belt-and-
-      * braces. Every OTHER term here is a REGISTER; `s0Valid` (the store's cache-
-      * boundary flop) only rises the cycle AFTER a store is presented. Without the
-      * live combinational term this signal read True with a store exactly one flop
-      * away from entering the pipe, and `WAIT` fell through to `READ` on precisely
-      * that cycle -- the store then ran its S0/S1/S2 concurrently with the walk.
+      * The live Stream valid is deliberately NOT part of quiescence.  Once a
+      * maintenance command is latched, `maintBusyReg` lowers store ready, so a
+      * producer may legally hold valid while the resident store pipeline drains.
+      * Waiting for that valid to fall would deadlock a well-formed Stream.  The
+      * registered stages, accepted-count, miss barrier, and physical AXI pair
+      * flags below are the actual resource-occupancy proof.
       *
       * FMax closure Slice 2: `!ldS2Valid` is REQUIRED, but for a DIFFERENT reason than
       * `!ldS1Valid` -- `ldS2*`'s payload is a frozen register snapshot (no live shared-
@@ -1447,7 +1489,9 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val dcIdleForMaint = !busy && !ldS1Valid && !ldS2Valid && !loadShadowValid &&
                          !earlyProbeValid &&
                          !pendingStoreMiss && !pendingWtKickoff &&
-                         !storePort.valid && !s0Valid && !stS1Valid && !stS2Valid &&
+                         !s0Valid && !stS1Valid && !stS2Valid && !stS3Valid &&
+                         (storeOutstanding === 0) && !serialStoreInFlight &&
+                         !storeMissBarrier &&
                          stAwDone && stWDone && evictAwDone && evictWDone
     dcIdleForMaint.simPublic()
 
@@ -1667,8 +1711,8 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // Review-added: prove (rather than assume) the mutual-exclusion invariants the
     // walk's array-port and AXI safety rest on. Sim-only; no synthesis cost.
     GenerationFlags.simulation {
-      assert(!(maint.walking && (s0Valid || stS1Valid || stS2Valid)),
-        "DcachePlugin: a STORE was in the S0..S2 pipeline while a cache-maintenance walk was actively running -- the walk's caller pulsed maintCmd without waiting for the StoreQueue to drain (ExceptionUnit S_DRAIN / DcacheService.maintQuiesced), AND the walk's own WAIT self-check was bypassed",
+      assert(!(maint.walking && (s0Valid || stS1Valid || stS2Valid || stS3Valid)),
+        "DcachePlugin: a STORE was in the S0..S3 pipeline while a cache-maintenance walk was actively running -- the walk's caller pulsed maintCmd without waiting for the StoreQueue to drain (ExceptionUnit S_DRAIN / DcacheService.maintQuiesced), AND the walk's own WAIT self-check was bypassed",
         FAILURE)
       assert(!(maint.walking && !fsm.isActive(fsm.IDLE)),
         "DcachePlugin: the load/refill FSM left IDLE during a cache-maintenance walk -- it can drive the shared rdSet/rdEn port and open an eviction AXI pair, both of which the walk assumes are exclusively its own",
@@ -1692,101 +1736,109 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // but nothing told this arbiter, so the store advanced to S2 and RMW-merged
     // against the walk's set (wrong old data AND wrong hit-detect). Same hold-and-
     // retry response as against the load: delay, never corrupt.
-    when(stS1Valid) {
-      when(!fsm.loadUsesPort && !maintUsesPort) {
-        stS2Valid   := True
-        stS2Payload := stS1Payload
-      } otherwise {
-        // Port taken by the load or by the maintenance walk: hold in S1, retry
-        // next cycle.
-        stS1Valid   := True
-      }
+    val storePipeHeld = storeMissBarrier || storeMissDiscovered ||
+      loadMissStoreBarrier || loadMissDiscovered
+    val stS1Advance = stS1Valid && !fsm.loadUsesPort && !maintUsesPort && !storePipeHeld
+    val stS1Ready   = !stS1Valid || stS1Advance
+    val s0Advance   = s0Valid && stS1Ready && !storePipeHeld
+    val s0Ready     = !s0Valid || s0Advance
+
+    when(stS1Advance) { storeReadOwed := False }
+    when(freshLoadUsesPort && stS1Valid) { storeReadOwed := True }
+
+    // Admission is purely stage-credit based for COPYBACK. Serial/precise classes
+    // require an empty accepted stream; a discovered miss and a waiting refill stop
+    // new input while the already-resident shallow pipe drains/holds safely.
+    storePort.ready := s0Ready && !storePipeHeld && !serialStoreInFlight &&
+      !maintBusyReg && !refillNeedsStoreDrain &&
+      (!inputStoreSerial || (storeOutstanding === 0))
+
+    when(stS1Advance) { stS1Valid := False }
+    when(s0Advance) {
+      stS1Valid   := True
+      stS1Payload := s0Payload
+    }
+    when(s0Advance) { s0Valid := False }
+    when(storePort.fire) {
+      s0Valid   := True
+      s0Payload := storePort.payload
+    }
+    when(stS1Advance) {
+      stS2Valid   := True
+      stS2Payload := stS1Payload
     }
 
-    // ---- store-S2: merge old line + write (hit-detect hoisted above the FSM) ----
-    // This block and the load FSM's refill/write-allocate arms drive the SAME
-    // per-way wrEn/wrSet/wrData vectors, and the FSM's assignments elaborate LAST
-    // (StateMachine bodies run as a `prePopTask`), so a same-cycle refill write
-    // OVERRIDES this store write. That is NOT benign and is NOT prevented by
-    // single-outstanding: single-outstanding only serialises the store side against
-    // ITSELF; the load-refill engine runs completely independently of it. Both the
-    // same-SET case and the same-WAY/different-SET case (the shared port is per-way,
-    // not per-(way,set)) are what `refillWriteHold` above exists to interlock — it
-    // holds the REFILL side off so this store write is never silently dropped. Do
-    // not weaken that signal without re-reading its comment.
-    // Aligned/probe path derives the merge from {data,size,offset}; a SPLIT store
-    // slot supplies an explicit line-relative strobe + 128-bit line-aligned data.
-    val mergeData = Mux(stS2Payload.useStrb,
-      stS2Payload.lineData,
-      DcacheByteLane.storeData(stS2Off, stS2Payload.size, stS2Payload.data))
-    val mergeStrb = Mux(stS2Payload.useStrb,
-      stS2Payload.strb,
-      DcacheByteLane.storeStrb(stS2Off, stS2Payload.size))
-    val stS2MrgBytes = mergeData.subdivideIn(8 bits)
+    when(storeAckReg) { serialStoreInFlight := False }
+    when(storePort.fire && inputStoreSerial) { serialStoreInFlight := True }
+    when(storePort.fire && !storeAckReg) {
+      storeOutstanding := storeOutstanding + 1
+    } elsewhen(!storePort.fire && storeAckReg) {
+      storeOutstanding := storeOutstanding - 1
+    }
 
     // Registered latch of the drain's identity, needed a cycle later by the AXI
     // B-ack site (Task P4.5's diagnostic-channel gate) and by the WT/beat drive.
     val stPreciseReg = Reg(Bool())
 
+    // S2 either discovers the variable-latency COPYBACK miss or captures a fixed
+    // resident/serial result into S3.  `storeMissDiscovered` already freezes the
+    // younger S1 and S0 in this same cycle; they relaunch their lookup after refill,
+    // so no rollback tag or duplicate array read is required.
     when(stS2Valid) {
-      // Guard kept literally identical to `stS2ArrayWrite` (declared above the FSM,
-      // consumed by `refillWriteHold`): the interlock must fire on EXACTLY the cycles
-      // this block drives the shared array write port.
-      when(stS2ArrayWrite) {
-        for (w <- 0 until ways) when(stS2HitVec(w)) {
-          val curBytes = rdData(w).subdivideIn(8 bits)
-          val newBytes = Vec(Bits(8 bits), 16)
-          for (i <- 0 until 16) newBytes(i) := Mux(mergeStrb(i), stS2MrgBytes(i), curBytes(i))
-          wrEn(w)   := True
-          wrSet(w)  := stS2Set
-          wrData(w) := newBytes.asBits
-          when(stS2Copyback) { dirtys(w)(stS2Set) := True }
-        }
-      }
-      stMergeReg   := mergeData
-      stStrbReg    := mergeStrb
-      stAddrReg    := (stS2Payload.paddr(31 downto offBits) ## U(0, offBits bits)).asUInt
-      stPreciseReg := stS2Payload.precise
-      when(stS2Copyback && stS2HitAny) {
-        // COPYBACK HIT: the drain-throughput win -- resolved ENTIRELY on-chip, no
-        // AXI beat at all. stAwDone/stWDone stay True (no AXI in flight); the ack
-        // comes from cbHitAckReg below instead.
-        stAwDone := True
-        stWDone  := True
-      } .elsewhen(stS2Copyback && !stS2HitAny) {
+      when(stS2Copyback && !stS2HitAny) {
         // COPYBACK MISS: post-commit write-allocate, off the retire path entirely.
         // No AXI beat is issued directly from S2 -- the refill engine issues the AR.
         stAwDone := True
         stWDone  := True
         pendingStoreMiss  := True
         pendingStorePaddr := stS2Payload.paddr
-        pendingMergeData  := mergeData
-        pendingMergeStrb  := mergeStrb
+        pendingMergeData  := stS2MergeData
+        pendingMergeStrb  := stS2MergeStrb
         // Task P4.3 Finding 1 fix: lock the victim way/dirty/tag/line HERE, not at
         // the eventual IDLE pickup cycle -- see the `pendingVictim*` decl comment.
         val pVw = victim(stS2Set)
+        val pVictimFromS3 = stS3ArrayWrite && (stS3Set === stS2Set) &&
+          (stS3Way === pVw)
+        storeVictimFromS3Dbg := pVictimFromS3
         pendingVictimWay   := pVw
-        pendingVictimDirty := dirtys(pVw)(stS2Set)
-        pendingVictimTag   := rdTag(pVw)
-        pendingVictimLine  := rdData(pVw)
-      } .otherwise {
-        // WRITETHROUGH hit/miss (fast path, unchanged from before this task) and
-        // INHIBITED (precise path, unchanged from before this task). The payload
-        // (stAddrReg/stMergeReg/stStrbReg, set unconditionally above) is ALWAYS
-        // latched immediately; the actual AXI KICKOFF fires IMMEDIATELY too
-        // (zero added latency, byte-for-byte as before this task) UNLESS
-        // EVICT_WR's own aw+w pair is genuinely still open THIS cycle (Task P4.3
-        // AXI-hazard fix revision 3 -- see `evictAxiPairOpen`'s decl comment),
-        // the rare case a `pendingWtKickoff` latch defers to the first later
-        // cycle it clears.
-        //
-        // POST-P5.4-REVIEW: `maintAxiPairOpen` (the cache-maintenance walk's own
-        // writeback pair) joins `evictAxiPairOpen` here for exactly the same reason
-        // -- it is a third open AW/W pair on the same physical port, and AXI4's
-        // AW/W FIFO-ordering rule cross-attributes interleaved pairs regardless of
-        // `id`. Deadlock-free: deferring here leaves `stAwDone`/`stWDone` True, so
-        // `storeWantsAxi` stays FALSE and the walk's own `WRB` gate (`!storeWantsAxi
-        // && !evictAxiPairOpen`) is not blocked by the store that is waiting on it.
+        pendingVictimDirty := dirtys(pVw)(stS2Set) ||
+          (pVictimFromS3 && stS3Copyback)
+        pendingVictimTag   := Mux(pVictimFromS3, stS3Tag, rdTag(pVw))
+        pendingVictimLine  := Mux(pVictimFromS3, stS3MergedLine, rdData(pVw))
+      } otherwise {
+        stS3Valid   := True
+        stS3Payload := stS2Payload
+        stS3Hit     := stS2HitAny
+        stS3Way     := stS2HitWay
+        stS3OldLine := stS2CapturedLine
+      }
+    }
+
+    // S3 owns all hit-side effects.  The registered hit/way cut keeps the tag BRAM
+    // compare out of the byte-merge, dirty-bit, write-enable and local-ack cones.
+    when(stS3Valid) {
+      when(stS3ArrayWrite) {
+        for (w <- 0 until ways) when(stS3Way === U(w, wayBits bits)) {
+          wrEn(w)   := True
+          wrSet(w)  := stS3Set
+          wrData(w) := stS3MergedLine
+          when(stS3Copyback) { dirtys(w)(stS3Set) := True }
+        }
+      }
+
+      stMergeReg   := stS3MergeData
+      stStrbReg    := stS3MergeStrb
+      stAddrReg    := (stS3Payload.paddr(31 downto offBits) ## U(0, offBits bits)).asUInt
+      stPreciseReg := stS3Payload.precise
+
+      when(stS3Copyback) {
+        // A COPYBACK descriptor reaches S3 only on a resident hit.
+        stAwDone := True
+        stWDone  := True
+      } otherwise {
+        // WRITETHROUGH hit/miss and INHIBITED remain the sole accepted descriptor
+        // until AXI B.  If another physical writer has an open AW/W pair, retain the
+        // existing deferred-kickoff discipline.
         when(!evictAxiPairOpen && !maintAxiPairOpen) {
           stAwDone := False
           stWDone  := False
@@ -1823,12 +1875,12 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       }
     }
 
-    // 1-cycle-later local ack for a COPYBACK hit (design doc: "S2 or the following
-    // cycle"). Combined into storeAckReg in Step 4 below.
-    val cbHitAckReg = RegNext(stS2Valid && stS2Copyback && stS2HitAny, init = False)
+    // S3 is itself the registered local-result stage, so COPYBACK hit write and ack
+    // occur together without a further result register.
+    val cbHitAckReg = stS3Valid && stS3Copyback && stS3Hit
 
-    // AXI write-through driver (single 128-bit beat) -- the store-S2 write-through
-    // path's OWN, EXCLUSIVE driver, byte-for-byte unchanged from before Task P4.3
+    // AXI write-through driver (single 128-bit beat) -- the registered store result
+    // path's OWN, EXCLUSIVE driver
     // (id fixed at 1). EVICT_WR (Task P4.3) never touches these registers or this
     // driver -- it has its own dedicated completion flags and drives axi.aw/axi.w
     // directly (see EVICT_WR's own block above), gated off whenever this driver
@@ -1860,13 +1912,13 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // resolution in P2.5, the async diagnostic-fault channel in P4.6).
     //
     // CRITICAL (post-P4.3 review fix): since Task P4.3 there are TWO independent AXI
-    // write issuers on this one physical port -- the store-S2 write-through path
+    // write issuers on this one physical port -- the store write-through backend
     // (id=1) and EVICT_WR's dirty-victim writeback (id=2). B responses MUST be
     // demultiplexed by id, exactly as EVICT_WR's own completion check already does:
     // an eviction's B is NOT a store completion. Accepting any B here made every
     // dirty-victim writeback fire a SPURIOUS storeAck (and, on a non-OKAY writeback,
     // a spurious storeErr). That is not cosmetic: `sq.io.drainAck := dcache.storeAck`
-    // (LsEuPlugin), so a spurious ack pops the StoreQueue head and clears drainBusy
+    // (LsEuPlugin), so a spurious ack pops the StoreQueue head
     // BEFORE that store's own AW/W have been accepted, letting the next drain re-kick
     // the shared stAddrReg/stMergeReg/stStrbReg mid-flight; `exc.dcStoreAck` likewise
     // sequences the ExceptionUnit's E_STWAIT frame writer. And an eviction writeback's
@@ -1886,29 +1938,35 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     storeAckReg := storeBAck || cbHitAckReg || storeAllocAckReg
 
     // Task P4.6: pins design doc §5 item 7's one-ack-per-store contract now that
-    // storeAckReg has three sources (store-S2 write-through AXI B, copyback-hit
-    // S2, drain-miss write-allocate). Mirrors storeAckReg's drive above exactly
+    // storeAckReg has three sources (write-through AXI B, registered copyback-hit
+    // S3, drain-miss write-allocate). Mirrors storeAckReg's drive above exactly
     // -- `storeBAck`, NOT raw `axi.b.valid && axi.b.ready`, since EVICT_WR's own
     // id=2 B response is already correctly excluded from storeAckReg by the id
     // filter and is not structurally a storeAck source at all. Zero synth cost.
     // Explicit `FAILURE` severity (3-arg form), matching this file's own
     // convention (see the diagFaultKind0Fires/diagFaultPulse asserts above).
     //
-    // Why this can't fire: within one store, S2's when/elsewhen/otherwise picks
-    // exactly one of the three (COPYBACK-hit -> cbHitAckReg, COPYBACK-miss ->
-    // eventual storeAllocAckReg, WT/INHIBITED -> eventual storeBAck). Across
-    // stores, StoreQueue.scala's `drainIssue = headReady && !drainBusy` (with
-    // `drainBusy` cleared only by `io.drainAck`, wired in LsEuPlugin.scala as
-    // `sq.io.drainAck := dcache.storeAck` -- the exact OR of all three sources)
-    // is a real registered gate: the SQ cannot present a second store until the
-    // aggregate storeAckReg has already fired for the first. Unlike the
-    // kind=0/kind=1 diagnostic-pulse hazard above, this exclusivity is
-    // hardware-enforced (by StoreQueue's drainBusy register), not merely an
-    // unenforced timing coincidence -- it just lives in a different file.
+    // COPYBACK hits may now ack on consecutive cycles. Variable-latency classes are
+    // hardware barriers, so a WT B or store-allocate ack cannot overlap a hit ack.
     GenerationFlags.simulation {
+      assert(CountOne(stS2HitVec) <= U(1),
+        "DcachePlugin: multiple ways matched one store lookup",
+        FAILURE)
       val ackSources = Seq(storeBAck, cbHitAckReg, storeAllocAckReg)
       assert(CountOne(ackSources) <= U(1),
         "DcachePlugin: more than one storeAck source pulsed the same cycle",
+        FAILURE)
+      assert(!(storeAckReg && (storeOutstanding === 0)),
+        "DcachePlugin: storeAck pulsed with no accepted store descriptor",
+        FAILURE)
+      assert(!(serialStoreInFlight && (storeOutstanding =/= 1)),
+        "DcachePlugin: a serial/precise store coexisted with another accepted descriptor",
+        FAILURE)
+      assert(!(storePort.fire && inputStoreSerial && (storeOutstanding =/= 0)),
+        "DcachePlugin: serial/precise store accepted before older descriptors drained",
+        FAILURE)
+      assert(storeOutstanding <= U(4, 3 bits),
+        "DcachePlugin: store descriptor occupancy exceeded S0/S1/S2/S3 capacity",
         FAILURE)
     }
 
@@ -1935,11 +1993,9 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // unlike kind=0/kind=2 (both gate on the same single-valued `axi.b.payload.id`,
     // so they can never both be true the same cycle) and kind=1/kind=2 (different,
     // mutually-exclusive FSM states). Today kind=0 and kind=1 never collide only
-    // because this file's own "single-outstanding store" producer contract
-    // (see the STORE write-through comment block above, ~L315-319) guarantees the
-    // WT-beat's AXI B and a drain-miss refill can never both be in flight at once --
-    // that is a PRODUCER-DISCIPLINE invariant, not a hardware interlock on this
-    // latch. If that contract were ever violated, `StateMachine` bodies elaborate as
+    // because the cache's serial-class and miss barriers guarantee the WT-beat's
+    // AXI B and a drain-miss refill can never both be in flight at once. If that
+    // hardware invariant were ever violated, `StateMachine` bodies elaborate as
     // a `prePopTask` (this file's own documented wrEn/wrData last-assignment-wins
     // gotcha, see the P4.4 array-write-port comment above, ~L495-501) -- so kind=1's
     // `diagFaultPulse := True` would elaborate AFTER kind=0's, and on a genuine
@@ -1965,12 +2021,12 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // Review-added: make the kind=0/kind=1 hazard documented above loudly
     // detectable instead of silently possible. This does NOT protect the sticky
     // latch (a real fix would need a proper per-kind arbiter/merge) -- it only
-    // proves whether the "single-outstanding store" producer contract the
-    // hazard's absence relies on is ever actually violated. See the sticky-latch
+    // proves whether the store-backend barrier invariant the hazard's absence
+    // relies on is ever actually violated. See the sticky-latch
     // comment above for the full hazard description.
     GenerationFlags.simulation {
       assert(!(diagFaultKind0Fires && diagFaultKind1Fires),
-        "DcachePlugin: kind=0 (WT-beat) and kind=1 (drain-miss write-allocate refill) diagnostic-fault pulses fired the SAME cycle -- the single-outstanding-store producer contract this file relies on to avoid arbitrating between them was violated; the sticky latch just silently dropped one of the two errors",
+        "DcachePlugin: kind=0 (WT-beat) and kind=1 (drain-miss write-allocate refill) diagnostic-fault pulses fired the SAME cycle -- the serial store-backend barrier was violated; the sticky latch just silently dropped one of the two errors",
         FAILURE)
     }
 

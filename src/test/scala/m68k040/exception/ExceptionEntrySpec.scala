@@ -38,6 +38,10 @@ class ExceptionEntrySpec extends AnyFunSuite {
       val dc  = host[DcacheService]
       val xlate = host[m68k040.services.DTranslationService]
       val exc = rob.logic.exc
+      // Directed backpressure gate. The real full-core path returns D-cache ready
+      // through LsEu; this unit DUT can hold that handshake closed and prove the
+      // ExceptionUnit's registered store source does not emit a lossy pulse.
+      val storeAllow = in(Bool())
       // Exception frame/vector cache commands are explicitly physical in this
       // slice; keep the otherwise-unused tagged DTLB service quiescent.
       xlate.req.valid              := False
@@ -52,8 +56,9 @@ class ExceptionEntrySpec extends AnyFunSuite {
       exc.dcLoadRsp.valid   := dc.loadRsp.valid
       exc.dcLoadRsp.payload := dc.loadRsp.payload
       exc.dcLoadBusy        := dc.loadBusy
-      dc.store.valid   := exc.dcStore.valid
+      dc.store.valid   := exc.dcStore.valid && storeAllow
       dc.store.payload := exc.dcStore.payload
+      exc.dcStore.ready := dc.store.ready && storeAllow
       exc.dcStoreAck   := dc.storeAck
     }
   }
@@ -106,8 +111,17 @@ class ExceptionEntrySpec extends AnyFunSuite {
   test("illegal instruction at retire stacks format-$0 frame, fetches vector, redirects") {
     M68kSim().withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
+      dut.wire.logic.storeAllow #= false
       init(dut, cd)
       val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      var acceptedStores = 0
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.dcache.logic.storePort.valid.toBoolean &&
+              dut.dcache.logic.storePort.ready.toBoolean) acceptedStores += 1
+        }
+      }
 
       // System state: SSP=0x00100000, VBR=0. Vector 4 handler at 0x40009000.
       val ssp0 = 0x00100000L
@@ -135,6 +149,34 @@ class ExceptionEntrySpec extends AnyFunSuite {
       cd.waitSampling()
       dut.rob.logic.completion(0).valid #= false
 
+      // Hold the first frame word at the arbitration boundary. A one-cycle Flow
+      // producer would vanish here and leave E_STWAIT hung forever; the Stream
+      // producer must instead keep every payload bit stable until fire.
+      var waitStore = 0
+      while (!dut.rob.logic.exc.dcStore.valid.toBoolean && waitStore < 80) {
+        cd.waitSampling(); waitStore += 1
+      }
+      assert(dut.rob.logic.exc.dcStore.valid.toBoolean,
+        "exception entry never presented its first frame-store command")
+      val heldPaddr = dut.rob.logic.exc.dcStore.payload.paddr.toBigInt
+      val heldData  = dut.rob.logic.exc.dcStore.payload.data.toBigInt
+      val heldSize  = dut.rob.logic.exc.dcStore.payload.size.toEnum
+      val heldMode  = dut.rob.logic.exc.dcStore.payload.cacheMode.toEnum
+      val heldPrecise = dut.rob.logic.exc.dcStore.payload.precise.toBoolean
+      for (_ <- 0 until 6) {
+        assert(dut.rob.logic.exc.dcStore.valid.toBoolean,
+          "exception frame-store valid dropped before acceptance")
+        assert(dut.rob.logic.exc.dcStore.payload.paddr.toBigInt == heldPaddr &&
+               dut.rob.logic.exc.dcStore.payload.data.toBigInt == heldData &&
+               dut.rob.logic.exc.dcStore.payload.size.toEnum == heldSize &&
+               dut.rob.logic.exc.dcStore.payload.cacheMode.toEnum == heldMode &&
+               dut.rob.logic.exc.dcStore.payload.precise.toBoolean == heldPrecise,
+          "exception frame-store payload changed while ready was low")
+        assert(acceptedStores == 0, "a frame store crossed the closed ready gate")
+        cd.waitSampling()
+      }
+      dut.wire.logic.storeAllow #= true
+
       // Wait for the exception redirect (fetch retarget to the handler).
       var n = 0; var redirPc = -1L
       while (redirPc < 0 && n < 400) {
@@ -142,6 +184,8 @@ class ExceptionEntrySpec extends AnyFunSuite {
         n += 1; cd.waitSampling()
       }
       assert(redirPc == handler, f"redirect pc=0x$redirPc%x expected handler 0x$handler%x")
+      assert(acceptedStores == 4,
+        s"format-$$0 entry must accept exactly four frame words, saw $acceptedStores")
 
       // Let stores drain to memory.
       cd.waitSampling(50)

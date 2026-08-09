@@ -1,6 +1,9 @@
 # D-cache copyback + precise store retirement — combined design
 
-Date: 2026-07-23. Status: DESIGN PROPOSAL for human review (no code written).
+Date: 2026-07-23. Status: IMPLEMENTED through the binding P6 amendment dated
+2026-08-09. Sections describing the pre-P6 `Flow`/single-drain implementation
+are retained as historical problem analysis; the `Stream` and elastic S0-S3
+contract in §4.3 is normative for the current RTL.
 Scope: the two coupled gaps characterized in earlier sessions — (1) the D-cache
 has no real cacheability/copyback semantics, and (2) stores retire from the ROB
 before their physical write completes, making a store bus error impossible to
@@ -213,8 +216,11 @@ Tradeoffs, honestly:
   arc or the IQ select cone. Dirty bits add a 512-FF vec in the already
   congested D-cache corridor (`iter_100_CongestedCLBsAndNets.txt` named
   `tagMem`/`ldS1Tag` nets); the eviction-writeback FSM adds states but no
-  deep cones; the SQ at-head compare is a 6-bit equality. Standing ≥250 MHz
-  OOC gate + post-route check mandatory per project rule.
+  deep cones; the SQ at-head compare is a 6-bit equality. The current binding
+  acceptance floor is **200 MHz**. Keep the existing 250-MHz constraint as a
+  stress/census point and for apples-to-apples history, but judge pass/fail from
+  achieved post-route FMax against 200 MHz. The floorplanned post-route check is
+  mandatory; OOC alone cannot certify either timing or pblock fit.
 - **Verification**: large but the corpus already contains the acceptance
   tests (§1 list). Musashi models no cache, so lock-step is unaffected as
   long as memory-visible semantics stay equivalent; the corpus's own
@@ -605,7 +611,17 @@ and closed by Layer 2.
 - **Pipelined hit-drain (the store-throughput lever; binding P6 amendment,
   2026-08-09).** The SQ→D-cache boundary is a real `Stream[DStoreCmd]`:
   `valid` and the complete payload remain stable until `fire`, and only `fire`
-  consumes presentation credit. D-cache S0/S1/S2 plus a new registered S3 are an
+  consumes presentation credit. This contract applies to every store-port
+  producer, including the serializing ExceptionUnit frame writer: its registered
+  command must remain valid and payload-stable until the LS/cache arbiter returns
+  `ready`, and only an accepted command may advance to the terminal-ack wait.
+  LsEu records whether an accepted command came from the ExceptionUnit. During
+  exception quiescence (`E_DRAIN`), ordinary SQ commands and their terminal acks
+  continue normally even though `excActive` is high. Once a frame command fires,
+  its later untagged D-cache ack routes only to the ExceptionUnit and must never
+  decrement/pop the empty SQ. This ownership bit clears on terminal ack; source
+  ownership must not be inferred from a live `valid` level.
+  D-cache S0/S1/S2 plus a new registered S3 are an
   elastic in-order descriptor pipe. S0 turns over only when S1 can accept; S1
   turns over only when its synchronous array read actually launches; a load or
   maintenance-port conflict holds the descriptor without overwriting it. S2
@@ -642,7 +658,14 @@ and closed by Layer 2.
   same-line bursts using the already-registered S3 descriptor; no second tag/data
   RAM or store CAM is introduced. The same forwarding (or a one-cycle hold) is
   required when a simultaneous load/store miss snapshots the same set and victim
-  way, so dirty eviction can never capture the pre-store line.
+  way, so dirty eviction can never capture the pre-store line. More precisely, a
+  load miss may snapshot through the final merged value of an older store already
+  in S3. Load-S1 miss resolution and store-S2 are mutually exclusive by ownership
+  of the single synchronous read result and that invariant is asserted. An older
+  store still in store-S1 is frozen on the miss-decision cycle and replayed after
+  the refill. No store array write may become newly inevitable after a victim
+  snapshot unless its final line was included in that snapshot. This is a
+  registered-stage interlock/forward, not another cache read port or victim CAM.
 
   Flush never rewinds accepted work: only unsent speculative entries are
   removed. Already accepted entries are committed (or the one non-speculative
@@ -669,11 +692,12 @@ bench + directed cycle counts) at the corresponding slice gate:
    classification is a read of two already-latched facts (`s2Cmode`,
    CACR.DE) — no lookup, no CAM, no new stall condition anywhere on the
    fast path.
-2. **The load path gains nothing on its hit arc.** The only load-side edits
-   (inhibited no-allocate/bypass, eviction-writeback states) are in the
-   miss FSM, behind the existing `busy` serialization; the S1 registered
-   hit-compare and the shared read-port arbitration (the FMax-sensitive
-   nets) are untouched.
+2. **The resident load hit datapath remains registered and II=1.** Store/load
+   arbitration now includes a one-bit `storeReadOwed` fairness state, so the
+   shared read-port control is intentionally changed: after one competing fresh
+   load/probe, a waiting store receives the next slot. Internal replay, refill,
+   and maintenance retain priority. No extra cache port or load-hit data cone is
+   added.
 3. **Costs are confined to events that are either already slow, off the
    retire path, or deliberate cold paths**: drain-miss write-allocate
    (post-commit, SQ-drain latency only, warms the line); dirty-victim
@@ -683,7 +707,7 @@ bench + directed cycle counts) at the corresponding slice gate:
    trustworthy — unavoidable in any correct design, and explicitly a
    cold path per the §5.1 decision).
 4. **Copyback is a net throughput improvement where it applies**: hit-drain
-   ack in ~3 cycles vs a full AXI write round trip relieves the
+   ack from registered S3 vs a full AXI write round trip relieves the
    SQ-full/`WAIT_SQ` backpressure that bounds MOVEM-style store bursts
    today, and removes per-store bus traffic on CM=copyback pages.
 5. **The end state is a modern write-back/write-allocate L1D as the
@@ -704,8 +728,10 @@ bench + directed cycle counts) at the corresponding slice gate:
 - Rename/freelist/RAT, IQ, dispatch: untouched (no new wakeup semantics —
   the fast path completes exactly as today; slow paths complete later via
   the same robId-keyed ports, and a store wakes nothing).
-- The ExceptionUnit frame formats, SSW builder, RTE, sysOp FSM: untouched
-  except the CPUSH arm and the CACR wire-out.
+- The ExceptionUnit frame formats, SSW builder, RTE, and architectural sysOp
+  semantics are untouched except the CPUSH arm and CACR wire-out. Its D-cache
+  frame-store transport follows the shared `Stream` handshake above; this is a
+  protocol repair only and does not change frame contents or ordering.
 - The SQ forwarding logic: untouched (entries stay resident until
   ack/pop as today; forwarding correctness is unchanged in all paths).
 - Musashi oracle and the lock-step whitebox: untouched (Musashi models no
@@ -795,7 +821,7 @@ bench + directed cycle counts) at the corresponding slice gate:
    review pass + the existing `ls-store-drain-race` directed tests re-run,
    plus a new "dirty-hit vs refill" directed test.
 7. **One-ack-per-accepted-half contract with multiple ack sources.** `storeAck`
-   may pulse from copyback-hit S2, the store's own AXI B, or drain-miss
+   may pulse from a registered copyback-hit S3 result, the store's own AXI B, or drain-miss
    write-allocate, but the barrier rules make those sources mutually exclusive
    across variable-latency classes. The SQ accepted-half count decrements once
    per pulse; simulation asserts `ack ⇒ count != 0`, source one-hotness, no
@@ -874,10 +900,12 @@ the plan-writing pass:
 6. Slice P6: pipelined hit-drain (measured on the IPC bench's store-burst
    kernels; MOVEM throughput is the acceptance metric).
 
-Every slice ends with the standing full-core OOC synth gate (≥250 MHz) and,
-given the D-cache-corridor congestion history, at least one post-route
-`impl_FullCore.tcl` run on an uncontended machine before merge (see the open
-FMax-discrepancy note in project memory).
+Every slice ends with a full-core OOC directional check and, given the
+D-cache-corridor congestion history, at least one floorplanned post-route
+`impl_FullCore.tcl` run on an uncontended machine before physical acceptance.
+The binding floor is 200 MHz. The existing 250-MHz constraint remains useful as
+a stress/census point and preserves comparable endpoint data, but missing 250 MHz
+is not itself a failure; achieved post-route FMax below 200 MHz is.
 
 ### 6.1 Cross-cutting verification requirement: cache-mode sweep — USER
 ### DECISION (2026-07-23)

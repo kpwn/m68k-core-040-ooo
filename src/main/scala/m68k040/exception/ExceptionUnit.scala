@@ -109,7 +109,7 @@ class ExceptionUnit(
   val dcLoadCmd  = Stream(DLoadCmd())
   val dcLoadRsp  = Flow(DLoadRsp())
   val dcLoadBusy = Bool()
-  val dcStore    = Flow(DStoreCmd()); dcStore.simPublic()
+  val dcStore    = Stream(DStoreCmd()); dcStore.simPublic()
   val dcStoreAck = Bool()
   // consumer-side inputs default (wiring drives them; allowOverride so a DUT that
   // does NOT wire the exception D-cache ports still elaborates — the wiring layer
@@ -118,6 +118,7 @@ class ExceptionUnit(
   dcLoadRsp.valid.allowOverride;   dcLoadRsp.valid := False
   dcLoadRsp.payload.allowOverride; dcLoadRsp.payload.assignDontCare()
   dcLoadBusy.allowOverride;        dcLoadBusy := False
+  dcStore.ready.allowOverride;     dcStore.ready := False
   dcStoreAck.allowOverride;        dcStoreAck := False
 
   // ── Task P5.5: cache-maintenance (CPUSH / CINV) dispatch ports ───────────────
@@ -174,7 +175,7 @@ class ExceptionUnit(
   val sqDrained = Bool(); sqDrained.allowOverride; sqDrained := True
 
   // Task P5.4: the D-cache datapath is genuinely idle (load/refill FSM, eviction
-  // engine, store S0..S2 pipe, and BOTH AXI write-completion flag pairs). Wired from
+  // engine, store S0..S3 pipe, and BOTH AXI write-completion flag pairs). Wired from
   // `DcacheService.maintQuiesced`; default True for the many unit DUTs that have no
   // D-cache at all.
   //
@@ -451,15 +452,22 @@ class ExceptionUnit(
   // D-cache store port put `stStep -> store-merge -> SQ-overlap-compare` on the
   // LS EU's critical SQ-forward arc. We compute the store into combinational
   // `sto*` and REGISTER it onto `dcStore` (the exception FSM is serializing /
-  // multi-cycle + ack-gated, so the extra cycle is free). This cuts the arc. ────
+  // multi-cycle + ack-gated, so the extra cycle is free). The registered Stream
+  // remains valid and payload-stable until accepted; this cuts the arc without
+  // reverting to a one-cycle pulse that can be dropped. ────────────────────────
   val stoVld   = Bool();        stoVld := False
   val stoPaddr = UInt(32 bits); stoPaddr := U(0, 32 bits)
   val stoData  = Bits(32 bits); stoData := B(0, 32 bits)
   val stoSize  = Size();        stoSize := Size.LONG
-  dcStore.valid           := RegNext(stoVld) init False
-  dcStore.payload.paddr   := RegNext(stoPaddr)
-  dcStore.payload.data    := RegNext(stoData)
-  dcStore.payload.size    := RegNext(stoSize)
+  val stoValidReg = RegInit(False)
+  val stoPaddrReg = Reg(UInt(32 bits))
+  val stoDataReg  = Reg(Bits(32 bits))
+  val stoSizeReg  = Reg(Size())
+  val stoCmodeReg = Reg(m68k040.cache.CacheMode())
+  dcStore.valid           := stoValidReg
+  dcStore.payload.paddr   := stoPaddrReg
+  dcStore.payload.data    := stoDataReg
+  dcStore.payload.size    := stoSizeReg
   dcStore.payload.useStrb := False
   dcStore.payload.strb    := B(0, 16 bits)
   dcStore.payload.lineData:= B(0, 128 bits)
@@ -491,13 +499,28 @@ class ExceptionUnit(
   // directly here since `ss` is this unit's own state -- no new port or dependency.
   val excCacheMode = Mux(ss.cacr(31), m68k040.cache.CacheMode.WRITETHROUGH,
                                       m68k040.cache.CacheMode.INHIBITED)
-  dcStore.payload.cacheMode := excCacheMode
+  dcStore.payload.cacheMode := stoCmodeReg
   // The exception sequencer's frame pushes are conceptually "always awaited" --
   // driving precise=True means a hypothetical bus error there is simply never
   // routed to the new async diagnostic channel (Task P4.5), which is correct:
   // today's exception-store path has no fault-reporting mechanism at all and
   // this task must not invent one for it.
   dcStore.payload.precise := True
+  when(dcStore.fire) {
+    stoValidReg := False
+  }
+  when(stoVld) {
+    // E_STORE is a one-cycle capture state and cannot be re-entered until the
+    // previous store's terminal ack, so this never overwrites a held command.
+    assert(!stoValidReg,
+      "ExceptionUnit: attempted to overwrite an unaccepted frame-store command",
+      FAILURE)
+    stoValidReg := True
+    stoPaddrReg := stoPaddr
+    stoDataReg  := stoData
+    stoSizeReg  := stoSize
+    stoCmodeReg := excCacheMode
+  }
 
   // ── D-cache LOAD + D-TLB req: REGISTERED outputs (FMax). The frame/vector load
   // vaddr (off `frameBase`/`vecTarget`) drives the D-cache hit/miss-tag + the LS
@@ -571,10 +594,9 @@ class ExceptionUnit(
     stoData  := data.resize(32)
   }
 
-  // ENTRY frame-store step. The D-cache store path is single-outstanding, so each
-  // word is issued THEN we wait for the write-through ACK (AXI B) before the next —
-  // otherwise a back-to-back store overwrites the previous write-through beat before
-  // it drains (lost word). Word index is from frameBase (LOW address), ascending.
+  // ENTRY frame-store step. The ExceptionUnit deliberately keeps one frame word
+  // outstanding: issue through the held Stream, then wait for its write-through ACK
+  // before constructing the next. Word index is from frameBase (LOW address), ascending.
   //   format-$0 (illegal/privilege): 4 words [SR, PC hi, PC lo, vec<<2].
   //   format-$7 (access fault):     30 words ($3C) — MAME m68ki_stack_frame_0111:
   //     [+0x00]=SR [+0x02]=PChi [+0x04]=PClo [+0x06]=0x7000|(vec<<2)
@@ -904,15 +926,14 @@ class ExceptionUnit(
 
     // ── ENTRY: stack the frame (one word at a time) ─────────────────────────────
     E_STORE.whenIsActive {
-      // Issue the store EXACTLY ONCE (one cycle), then unconditionally wait its ACK.
+      // Capture the store EXACTLY ONCE, hold its registered Stream command until
+      // accepted, then wait its terminal ACK.
       // The exception sequencer is a supervisor PHYSICAL access: the store paddr is
-      // identity, and the D-cache store port is a backpressure-less Flow using that
-      // paddr directly — it needs NO translation. We must NOT gate on `dtRsp.ready`
+      // identity, and the D-cache store port uses that paddr directly — it needs NO
+      // translation. We must NOT gate on `dtRsp.ready`
       // (with the MMU live, the frame VPN walks and dtRsp.ready drops for several
-      // cycles, during which the combinational `driveStore` would re-pulse the
-      // REGISTERED store every cycle -> the SAME word stored many times, a
-      // nondeterministic count that races the cache store machine and corrupts the
-      // frame). One cycle here -> exactly one registered store pulse.
+      // cycles, during which a combinational `driveStore` would recapture the same
+      // word repeatedly). One cycle here captures exactly one stable Stream item.
       // Task #163: split a line-crossing word (line-relative offset 15) into two
       // single-byte pushes — see stSplitLow's doc comment above.
       val addr    = frameWordAddr(stStep)
@@ -928,13 +949,9 @@ class ExceptionUnit(
       goto(E_STWAIT)
     }
     E_STWAIT.whenIsActive {
-      // hold nothing on the store port (one-cycle pulse already issued); wait for
-      // the write-through to land (storeAck) before the next word / vector fetch.
-      // A SETTLE state separates back-to-back stores: the cache store port is a
-      // backpressure-less Flow that latches unconditionally, so issuing the next
-      // store the cycle after ack (while the cache machine is settling its
-      // stAwDone/stWDone) could drop a beat. One idle cycle guarantees the machine
-      // is idle before the next store.
+      // The registered command remains asserted here until dcStore.fire. Wait for
+      // the accepted write to reach storeAck before advancing to the next frame word
+      // or vector fetch. Stream ready now represents cache occupancy directly.
       when(dcStoreAck) {
         val addr    = frameWordAddr(stStep)
         val crosses = addr(3 downto 0) === U(15, 4 bits)

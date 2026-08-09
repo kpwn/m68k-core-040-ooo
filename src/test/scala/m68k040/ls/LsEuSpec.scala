@@ -26,8 +26,9 @@ class LsEuSpec extends AnyFunSuite {
     val dcache = new DcachePlugin
     val eu     = new LsEuPlugin
     val src    = new LsEuSourcePlugin
+    val phead  = new TbPreciseDrainWirePlugin(eu)
     db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, cacheCtrl,
-                                           xlate, dcache, eu, src)) }
+                                           xlate, dcache, eu, src, phead)) }
   }
 
   def simConfig = M68kSim().withVerilator
@@ -51,6 +52,8 @@ class LsEuSpec extends AnyFunSuite {
     s.iLeaAddr #= false   // MUST default: undriven -> randomized per seed -> every load
                           // takes the LEA address-generate path (dst = EA, not the data).
     s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false
+    dut.phead.logic.iRobHeadIn #= 0
+    dut.phead.logic.iRobHeadValidIn #= false
     // Make the fixture's advertised "hit" tests real: without a CacheControlService
     // the LS EU correctly forces every access INHIBITED, so no first load can allocate.
     cd.waitSampling(80) // PRF init sweep
@@ -194,12 +197,14 @@ class LsEuSpec extends AnyFunSuite {
         "a precise store must not complete before its acknowledged drain")
       // not committed yet -> memory unchanged
       assert(mem.peekByte(base + 4) != 0xDE, "store must not drain before commit")
-      // commit the store
-      dut.src.logic.iSqCommitValid #= true; dut.src.logic.iSqCommitRob #= 7
-      cd.waitSampling()
-      dut.src.logic.iSqCommitValid #= false
+      // A precise store launches when it reaches the ROB head; it cannot be marked
+      // committed before its acknowledged drain.  This standalone DUT has no ROB,
+      // so drive the real at-head contract directly instead of the legacy commit
+      // shortcut (which would make this test vacuous against precise serialization).
+      dut.phead.logic.iRobHeadIn #= 7; dut.phead.logic.iRobHeadValidIn #= true
       assert(waitCompletion(dut, cd, robId = 7),
         "committed precise store must complete after the memory ack")
+      dut.phead.logic.iRobHeadValidIn #= false
       cd.waitSampling(2)
       assert(mem.peekByte(base + 4) == 0xDE, "committed store drains to memory")
       assert(mem.peekByte(base + 7) == 0xEF, "store byte +7")
@@ -236,9 +241,7 @@ class LsEuSpec extends AnyFunSuite {
       // store (robId 3) then COMMIT it -> it begins draining to memory.
       issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11, Size.LONG, robId = 3)
       assert(waitStoreAlloc(dut, cd, robId = 3), "store must allocate before commit")
-      dut.src.logic.iSqCommitValid #= true; dut.src.logic.iSqCommitRob #= 3
-      cd.waitSampling()
-      dut.src.logic.iSqCommitValid #= false
+      dut.phead.logic.iRobHeadIn #= 3; dut.phead.logic.iRobHeadValidIn #= true
       // Immediately issue a YOUNGER load (robId 5) to the same addr. Even though the
       // line misses L1D and the store may already be mid-drain, the SQ entry stays
       // resident until its memory write is ACKed -> the load must FORWARD the store
@@ -249,16 +252,16 @@ class LsEuSpec extends AnyFunSuite {
       dut.src.logic.obsIntAddr #= 23; sleep(1)
       assert(dut.src.logic.obsIntData.toBigInt == BigInt(0x0BADF00DL),
         s"load must forward store data, got ${dut.src.logic.obsIntData.toBigInt.toString(16)} (stale = ${expectedLong(base).toString(16)})")
+      dut.phead.logic.iRobHeadValidIn #= false
     }
   }
 
   // DIRECTED REPRO of the cross-line store-after-load drain bug. A cross-line LONG
   // store (slot A low line / slot B high line), AFTER a cross-line LOAD to the same
   // address, must write BOTH slot A and slot B through to backing memory.
-  def commit(dut: Dut, cd: ClockDomain, robId: Int): Unit = {
-    dut.src.logic.iSqCommitValid #= true; dut.src.logic.iSqCommitRob #= robId
-    cd.waitSampling()
-    dut.src.logic.iSqCommitValid #= false
+  def presentPreciseAtHead(dut: Dut, robId: Int): Unit = {
+    dut.phead.logic.iRobHeadIn #= robId
+    dut.phead.logic.iRobHeadValidIn #= true
   }
   test("cross-line store after cross-line load drains BOTH slots", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
@@ -271,8 +274,9 @@ class LsEuSpec extends AnyFunSuite {
       seed(dut, cd, preg = 11, value = 0x12345678L)
       issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11, Size.LONG, robId = 1)
       assert(waitStoreAlloc(dut, cd, robId = 1), "seed store alloc")
-      commit(dut, cd, robId = 1)
+      presentPreciseAtHead(dut, robId = 1)
       assert(waitCompletion(dut, cd, robId = 1), "seed store acknowledged drain")
+      dut.phead.logic.iRobHeadValidIn #= false
       cd.waitSampling(2)
       assert(mem.peekByte(0x3FFEL) == 0x12, s"seed slotA drained: ${mem.peekByte(0x3FFEL).toHexString}")
       assert(mem.peekByte(0x4000L) == 0x56, s"seed slotB drained: ${mem.peekByte(0x4000L).toHexString}")
@@ -284,8 +288,9 @@ class LsEuSpec extends AnyFunSuite {
       seed(dut, cd, preg = 12, value = 0xCAFEBABEL)
       issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 12, Size.LONG, robId = 3)
       assert(waitStoreAlloc(dut, cd, robId = 3), "cross-line store alloc")
-      commit(dut, cd, robId = 3)
+      presentPreciseAtHead(dut, robId = 3)
       assert(waitCompletion(dut, cd, robId = 3), "cross-line store acknowledged drain")
+      dut.phead.logic.iRobHeadValidIn #= false
       cd.waitSampling(2)
       assert(mem.peekByte(0x3FFEL) == 0xCA, s"slotA write-through dropped: dut=0x${mem.peekByte(0x3FFEL).toHexString} exp=0xca")
       assert(mem.peekByte(0x3FFFL) == 0xFE, s"slotA byte1: dut=0x${mem.peekByte(0x3FFFL).toHexString} exp=0xfe")

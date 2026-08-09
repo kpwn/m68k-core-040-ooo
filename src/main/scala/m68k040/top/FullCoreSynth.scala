@@ -333,6 +333,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     exc.dcLoadCmd.ready     := lsEu.excLoadCmdReady
     lsEu.excStoreValid      := exc.dcStore.valid
     lsEu.excStorePayload    := exc.dcStore.payload
+    exc.dcStore.ready       := lsEu.excStoreReady
     exc.sqDrained           := lsEu.sqEmptySig
     // Task P5.4: the commit-time sysOp path (S_DRAIN) additionally waits for the
     // D-cache datapath itself to go idle before applying -- CPUSH/CINV's maintenance

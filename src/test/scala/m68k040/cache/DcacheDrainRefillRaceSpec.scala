@@ -75,10 +75,26 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     dut.probe.logic.loadCmdIn.payload.paddr #= vaddr
     dut.probe.logic.loadCmdIn.payload.size #= size
     dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+    dut.probe.logic.loadCmdIn.payload.token #= 0
     cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.ready.toBoolean && dut.probe.logic.loadCmdIn.valid.toBoolean)
     dut.probe.logic.loadCmdIn.valid #= false
     cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
     dut.probe.logic.loadRspOut.payload.data.toBigInt
+  }
+
+  def fireCopyback(dut: Dut, cd: ClockDomain, paddr: Long, data: BigInt): Unit = {
+    dut.probe.logic.storeIn.valid #= true
+    dut.probe.logic.storeIn.payload.paddr #= paddr
+    dut.probe.logic.storeIn.payload.data #= data
+    dut.probe.logic.storeIn.payload.size #= Size.LONG
+    dut.probe.logic.storeIn.payload.useStrb #= false
+    dut.probe.logic.storeIn.payload.strb #= 0
+    dut.probe.logic.storeIn.payload.lineData #= 0
+    dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+    dut.probe.logic.storeIn.payload.precise #= false
+    cd.waitSamplingWhere(dut.probe.logic.storeIn.valid.toBoolean &&
+      dut.probe.logic.storeIn.ready.toBoolean)
+    dut.probe.logic.storeIn.valid #= false
   }
 
   // Same set (5), distinct tags per k (k*0x800 steps clear of the set/offset bits).
@@ -104,30 +120,36 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
 
       // Fire the younger load (addrK(4), a miss -> REFILL, victim = way 0, which
       // currently holds addrK(0) = X) first, then ONE cycle later fire a store to
-      // addrK(0) (X, way 0) for exactly one cycle -- empirically the exact offset
+      // addrK(0) (X, way 0) -- empirically the exact offset
       // (Task P4.4 Step 1) that lands the store's S1 read-launch on the SAME cycle
       // the refill's AXI R response writes way 0 with the NEW line (addrK(4) = Z).
-      dut.probe.logic.loadCmdIn.valid #= true
-      dut.probe.logic.loadCmdIn.payload.vaddr #= addrK(4)
-      dut.probe.logic.loadCmdIn.payload.paddr #= addrK(4)
-      dut.probe.logic.loadCmdIn.payload.size  #= Size.LONG
-      dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
-      dut.clockDomain.waitSampling(1)   // the empirically-confirmed racing offset
-      dut.probe.logic.storeIn.valid #= true
-      dut.probe.logic.storeIn.payload.paddr #= addrK(0)
-      dut.probe.logic.storeIn.payload.data  #= BigInt("DEADBEEF", 16)
-      dut.probe.logic.storeIn.payload.size  #= Size.LONG
-      dut.probe.logic.storeIn.payload.useStrb #= false
-      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
-
-      var storePulsed = false
-      for (_ <- 0 until 30) {
-        if (dut.probe.logic.loadCmdIn.ready.toBoolean) dut.probe.logic.loadCmdIn.valid #= false
-        dut.clockDomain.waitSampling()
-        if (!storePulsed) { dut.probe.logic.storeIn.valid #= false; storePulsed = true }
+      fork {
+        dut.probe.logic.loadCmdIn.valid #= true
+        dut.probe.logic.loadCmdIn.payload.vaddr #= addrK(4)
+        dut.probe.logic.loadCmdIn.payload.paddr #= addrK(4)
+        dut.probe.logic.loadCmdIn.payload.size  #= Size.LONG
+        dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+        dut.probe.logic.loadCmdIn.payload.token #= 0
+        dut.clockDomain.waitSamplingWhere(
+          dut.probe.logic.loadCmdIn.valid.toBoolean && dut.probe.logic.loadCmdIn.ready.toBoolean)
+        dut.probe.logic.loadCmdIn.valid #= false
       }
-      dut.probe.logic.storeIn.valid #= false
-      dut.probe.logic.loadCmdIn.valid #= false
+      fork {
+        dut.clockDomain.waitSampling(1) // the empirically-confirmed racing offset
+        dut.probe.logic.storeIn.valid #= true
+        dut.probe.logic.storeIn.payload.paddr #= addrK(0)
+        dut.probe.logic.storeIn.payload.data  #= BigInt("DEADBEEF", 16)
+        dut.probe.logic.storeIn.payload.size  #= Size.LONG
+        dut.probe.logic.storeIn.payload.useStrb #= false
+        dut.probe.logic.storeIn.payload.strb #= 0
+        dut.probe.logic.storeIn.payload.lineData #= 0
+        dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+        dut.probe.logic.storeIn.payload.precise #= false
+        dut.clockDomain.waitSamplingWhere(
+          dut.probe.logic.storeIn.valid.toBoolean && dut.probe.logic.storeIn.ready.toBoolean)
+        dut.probe.logic.storeIn.valid #= false
+      }
+      dut.clockDomain.waitSampling(30)
       dut.clockDomain.waitSampling(20)
 
       // A clean load to Z (addrK(4)) must see Z's REAL fetched data, not the
@@ -188,9 +210,9 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
   }
 
   /** Result of one `raceSameWay` run: the racing refill's AR count (scenario sanity)
-    * plus whether the actual array-write-port collision cycle was ever observed --
-    * see `collisionHit`'s doc below. */
-  case class RaceResult(arCount: Int, collisionHit: Boolean)
+    * plus whether the new load-miss barrier actually parked the store before the
+    * formerly-dangerous array-write window. */
+  case class RaceResult(arCount: Int, barrierHit: Boolean)
 
   /** Presents the racing pair on EXACT, independent cycles (two forks) rather than
     * "present A, wait N, present B". The naive form is not offset-independent: at
@@ -200,33 +222,19 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
                   storeMode: SpinalEnumElement[CacheMode.type]): RaceResult = {
     val LOAD_CYCLE = 4
     var arCount = 0
-    // I2 (post-P4.4-cleanup review): a coincidence tap proving the sweep actually
-    // EXERCISES the same-way collision at some offset, not merely that the final
-    // DATA assertions happen to pass at every offset (which would also pass
-    // vacuously if the race were never reached at all, e.g. after a future
-    // refill-latency or RNG-stream change).
-    //
-    // NOTE this is deliberately `axi.r.valid` (an R beat PRESENTED), not
-    // `axi.r.fire`: `refillWriteHold`'s same-way term
-    // (`stS2ArrayWrite && stS2HitVec(victimWay)`) combinationally forces
-    // `axi.r.ready` False on any cycle it is True (see DcachePlugin.scala's
-    // `axi.r.ready := !refillWriteHold`), so on a CORRECTLY-fixed core
-    // `axi.r.fire && stS2ArrayWrite && stS2HitVec(victimWay)` can never be True
-    // simultaneously -- that is the entire point of the fix, and asserting on
-    // `axi.r.fire` would make this tap permanently (and misleadingly) vacuous.
-    // `axi.r.valid` catches the moment the interlock actually had something to
-    // hold off: the refill beat was presented WHILE the store's own S2 array
-    // write was hitting the exact way (`victimWay`) that refill is about to
-    // allocate -- i.e. the real collision cycle this whole regression targets.
-    var collisionHit = false
+    // The new dirty-victim repair is stronger than the historical refill-write
+    // coincidence interlock: a load miss freezes a waiting store-S1 before that
+    // store can become an S3 writer at all. Therefore an `r.valid && S3-write`
+    // witness is now structurally unreachable in this one-store sweep. Prove the
+    // replacement mechanism was exercised instead of retaining a stale/vacuous
+    // collision counter.
+    var barrierHit = false
     fork {
       while (true) {
         cd.waitSampling()
         if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1
-        if (dut.dcache.logic.axi.r.valid.toBoolean && dut.dcache.logic.stS2ArrayWrite.toBoolean) {
-          val vw = dut.dcache.logic.victimWay.toInt
-          if (dut.dcache.logic.stS2HitVec(vw).toBoolean) collisionHit = true
-        }
+        if (dut.dcache.logic.loadMissStoreBarrier.toBoolean &&
+            dut.dcache.logic.stS1Valid.toBoolean) barrierHit = true
       }
     }
     fork {
@@ -236,7 +244,9 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
       dut.probe.logic.loadCmdIn.payload.paddr #= addrA(4)
       dut.probe.logic.loadCmdIn.payload.size  #= Size.LONG
       dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
-      cd.waitSampling()
+      dut.probe.logic.loadCmdIn.payload.token #= 0
+      cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
+        dut.probe.logic.loadCmdIn.ready.toBoolean)
       dut.probe.logic.loadCmdIn.valid #= false
     }
     fork {
@@ -248,12 +258,16 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
       dut.probe.logic.storeIn.payload.data  #= BigInt("DEADBEEF", 16)
       dut.probe.logic.storeIn.payload.size  #= Size.LONG
       dut.probe.logic.storeIn.payload.useStrb #= false
+      dut.probe.logic.storeIn.payload.strb #= 0
+      dut.probe.logic.storeIn.payload.lineData #= 0
       dut.probe.logic.storeIn.payload.cacheMode #= storeMode
-      cd.waitSampling()
+      dut.probe.logic.storeIn.payload.precise #= false
+      cd.waitSamplingWhere(dut.probe.logic.storeIn.valid.toBoolean &&
+        dut.probe.logic.storeIn.ready.toBoolean)
       dut.probe.logic.storeIn.valid #= false
     }
     cd.waitSampling(80)
-    RaceResult(arCount, collisionHit)
+    RaceResult(arCount, barrierHit)
   }
 
   // I2: aggregated across the whole sweep -- did ANY offset actually hit the real
@@ -261,10 +275,13 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
   // final test appended after each sweep (below), so a future refill-latency/RNG
   // change that silently makes every offset miss the race fails LOUDLY instead of
   // all offsets' DATA assertions merely (and vacuously) continuing to pass.
-  var wtCollisionHitAny = false
-  var cbCollisionHitAny = false
+  var wtBarrierHitAny = false
+  var cbBarrierHitAny = false
 
-  for (storeCycle <- 0 to 10) {
+  // The result/write boundary moved from S2 to S3 in the II=1 pipeline. Keep a
+  // deliberately wider window than the historical 0..10 sweep so the non-vacuity
+  // witness follows that registered cycle instead of silently missing it.
+  for (storeCycle <- 0 to 18) {
     test(s"same-WAY different-SET refill must not silently drop a store-S2 array " +
          s"write (WRITETHROUGH, storeCycle=$storeCycle)", VerilatorTest) {
       compiled.doSim(s"sameWayWt_$storeCycle", 1) { dut =>
@@ -277,7 +294,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
         warmSameWaySetup(dut, cd, mem)
 
         val race = raceSameWay(dut, cd, storeCycle, CacheMode.WRITETHROUGH)
-        if (race.collisionHit) wtCollisionHitAny = true
+        if (race.barrierHit) wtBarrierHitAny = true
 
         // Scenario sanity: the racing refill must actually have happened (otherwise
         // the assertions below would be vacuously satisfied).
@@ -303,17 +320,14 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     }
   }
 
-  test("I2 scenario sanity: the same-way collision cycle was actually hit at least " +
-       "once across the WRITETHROUGH storeCycle sweep", VerilatorTest) {
-    assert(wtCollisionHitAny,
-      "NONE of the WRITETHROUGH sweep's offsets ever produced the real array-write-port " +
-      "collision cycle (axi.r.valid && stS2ArrayWrite && stS2HitVec(victimWay)) -- the " +
-      "sweep above is VACUOUS: its data assertions could pass without ever exercising " +
-      "the race this file targets. This likely means refill latency or the storeCycle " +
-      "range no longer aligns with the collision window and needs re-tuning.")
+  test("I2 scenario sanity: the load-miss barrier parked a WRITETHROUGH store in S1 " +
+       "for at least one sweep offset", VerilatorTest) {
+    assert(wtBarrierHitAny,
+      "NONE of the WRITETHROUGH sweep offsets exercised loadMissStoreBarrier with a " +
+      "resident store-S1; the data checks above would not prove the repaired race")
   }
 
-  for (storeCycle <- 0 to 10) {
+  for (storeCycle <- 0 to 18) {
     test(s"same-WAY different-SET refill must not leave a COPYBACK line dirty with " +
          s"stale data (storeCycle=$storeCycle)", VerilatorTest) {
       compiled.doSim(s"sameWayCb_$storeCycle", 1) { dut =>
@@ -326,7 +340,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
         warmSameWaySetup(dut, cd, mem)
 
         val race = raceSameWay(dut, cd, storeCycle, CacheMode.COPYBACK)
-        if (race.collisionHit) cbCollisionHitAny = true
+        if (race.barrierHit) cbBarrierHitAny = true
         assert(race.arCount == 1, s"scenario sanity: expected exactly one racing refill AR, got ${race.arCount}")
 
         // A COPYBACK-hit store resolves ENTIRELY on-chip: the ONLY copy of the stored
@@ -347,163 +361,323 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     }
   }
 
-  test("I2 scenario sanity: the same-way collision cycle was actually hit at least " +
-       "once across the COPYBACK storeCycle sweep", VerilatorTest) {
-    assert(cbCollisionHitAny,
-      "NONE of the COPYBACK sweep's offsets ever produced the real array-write-port " +
-      "collision cycle (axi.r.valid && stS2ArrayWrite && stS2HitVec(victimWay)) -- the " +
-      "sweep above is VACUOUS: its data assertions could pass without ever exercising " +
-      "the race this file targets. This likely means refill latency or the storeCycle " +
-      "range no longer aligns with the collision window and needs re-tuning.")
+  test("I2 scenario sanity: the load-miss barrier parked a COPYBACK store in S1 " +
+       "for at least one sweep offset", VerilatorTest) {
+    assert(cbBarrierHitAny,
+      "NONE of the COPYBACK sweep offsets exercised loadMissStoreBarrier with a " +
+      "resident store-S1; the data checks above would not prove the repaired race")
   }
 
-  // ------------------------------------------------------------------------------
-  // FMax Lever F POSITIVE CONTROL for `storeDrainRefillHold`
-  // (design: docs/superpowers/specs/2026-08-08-fmax-leverf-upstream-storequeue-design.md
-  //  §10.2 item 3 -- the test that makes correctness properties C1/C2/C3 FALSIFIABLE
-  //  rather than merely argued.)
-  //
-  // Lever F replaces REPLAY's write-allocate-merge gate with the register-only,
-  // strictly-stronger `storeDrainRefillHold = stS1Valid || stS2Valid`. Its timing
-  // argument rests on that predicate being UNREACHABLE in the real core (the
-  // StoreQueue's `drainBusy` interlock plus the ExceptionUnit's `sqDrained` gate mean
-  // no store can be in the D-cache store pipe while a COPYBACK drain miss is being
-  // serviced) -- which is precisely why the real core can never exercise it, and why
-  // the hold's "delay, NEVER drop" behaviour would otherwise go completely untested.
-  //
-  // `DcacheProbePlugin` drives `storeIn` directly and is therefore the ONLY DUT in
-  // this project that CAN violate that producer contract. This sweep does exactly
-  // that on purpose (opting in via `storeDrainHoldExpected`, the same shape as
-  // `diagFaultExpected`) and asserts all three of:
-  //   (a) `storeDrainHoldFired` actually pulses -- the hold is LIVE, not dead code,
-  //       and this test is not vacuous (aggregated across the sweep below);
-  //   (b) the write-allocate merge is DELAYED, not DROPPED -- the allocated line's
-  //       final contents are the correct merge of the store's bytes over the refilled
-  //       line (C3, and by extension C1/C2's "the array write always still lands");
-  //   (c) the contract-violating second store's OWN array write also lands.
-  //
-  // Geometry: SET_C is never touched, so a COPYBACK store to it MISSES (-> the
-  // write-allocate drain miss) and its victim way is 0 (round-robin counter at reset).
-  // SET_D is warmed with a DUMMY line in way 0 first so the real target lands in way
-  // 1 -- deliberately NOT way 0, so `refillWriteHold`'s same-WAY term (which this
-  // lever does not touch, and which guards a DIFFERENT site, `axi.r.ready`) cannot
-  // fire and conflate the two mechanisms. The second store is WRITETHROUGH, not
-  // COPYBACK: a COPYBACK HIT acks via `cbHitAckReg`, which is `RegNext(stS2Valid &&
-  // ...)` and would therefore land on the EXACT cycle the just-released merge fires
-  // its own `storeAllocAckReg`, tripping DcachePlugin's one-ack-per-store assert --
-  // an artefact of the deliberate contract violation, not of the lever.
-  // ------------------------------------------------------------------------------
-  val SET_C   = 40L                       // drain-miss (write-allocate) target set -- COLD
-  val SET_D   = 41L                       // contract-violating second store's set -- WARM
-  val addrC   = SET_C * 16L               // never loaded => COPYBACK store to it MISSES
-  val addrDdm = SET_D * 16L               // dummy, fills SET_D way 0
-  val addrD   = SET_D * 16L + 0x800L      // real target, lands in SET_D way 1
+  // The old Lever-F positive control deliberately violated a Flow producer
+  // contract.  The production boundary is now a Stream, so the meaningful hazard
+  // is a younger descriptor already accepted into S1 when an older S2 lookup
+  // discovers a COPYBACK miss.  In particular, a same-set younger S1 must not hold
+  // the older refill forever: it parks without driving the read/hold predicate,
+  // then relaunches after the allocation ack.
+  test("same-set younger COPYBACK hit parks behind a drain miss and resumes exactly once",
+       VerilatorTest) {
+    compiled.doSim("sameSetMissBarrier", 1) { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      dut.probe.logic.loadCmdIn.valid #= false
+      dut.probe.logic.storeIn.valid   #= false
+      val set = 40L
+      val missAddr = set * 16L
+      val hitAddr  = missAddr + 0x800L // same set, different tag
+      preload(mem, missAddr, 16)
+      preload(mem, hitAddr, 16)
+      load(dut, cd, hitAddr, Size.LONG)
+      cd.waitSampling(3)
 
-  val holdFiredAt = scala.collection.mutable.SortedSet[Int]()
-
-  // NOTE the sweep starts at 1, not 0: at offset 0 the two `storeIn` driver forks act
-  // on the SAME simulation cycle (store 1's deassert vs store 2's assert) and their
-  // execution order decides whether store 2 is presented at all -- the same
-  // offset-independence trap documented above `raceSameWay`. Offset 0 is degenerate
-  // for this scenario anyway (the second store retires long before REPLAY is reached,
-  // so the hold cannot fire there).
-  for (secondCycle <- 1 to 15) {
-    test(s"Lever F positive control: a store in S1/S2 must DELAY (never drop) the " +
-         s"COPYBACK drain-miss write-allocate merge (secondCycle=$secondCycle)",
-         VerilatorTest) {
-      compiled.doSim(s"leverFHold_$secondCycle", 1) { dut =>
-        val cd = dut.clockDomain
-        cd.forkStimulus(10)
-        val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
-        dut.probe.logic.loadCmdIn.valid #= false
-        dut.probe.logic.storeIn.valid   #= false
-        dut.dcache.logic.storeDrainHoldExpected #= false
-        cd.waitSampling(5)
-
-        preload(mem, addrC, 16)
-        preload(mem, addrDdm, 16)
-        preload(mem, addrD, 16)
-        load(dut, cd, addrDdm, Size.LONG)   // SET_D way 0 (dummy)
-        load(dut, cd, addrD, Size.LONG)     // SET_D way 1 (the second store's target)
-        cd.waitSampling(4)
-
-        // Opt in to the deliberate producer-contract violation BEFORE it happens --
-        // otherwise DcachePlugin's own sim-side assert fires fatally (by design).
-        dut.dcache.logic.storeDrainHoldExpected #= true
-
-        var holdFired = false
-        var mergeSeen = 0
-        fork {
-          while (true) {
-            cd.waitSampling()
-            if (dut.dcache.logic.storeDrainHoldFired.toBoolean) holdFired = true
-            if (dut.dcache.logic.storeAllocAckReg.toBoolean) mergeSeen += 1
-          }
-        }
-        // Store 1 (cycle 0): COPYBACK, MISSES SET_C -> pendingStoreMiss -> REFILL
-        // (victim way 0 is clean, so no EVICT_WR) -> REPLAY's write-allocate merge.
-        fork {
-          dut.probe.logic.storeIn.valid #= true
-          dut.probe.logic.storeIn.payload.paddr #= addrC + 4
-          dut.probe.logic.storeIn.payload.data  #= BigInt("CAFEBABE", 16)
-          dut.probe.logic.storeIn.payload.size  #= Size.LONG
-          dut.probe.logic.storeIn.payload.useStrb #= false
-          dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
-          cd.waitSampling()
-          dut.probe.logic.storeIn.valid #= false
-        }
-        // Store 2: the contract violation -- a second store presented while the first
-        // is still mid-excursion, swept across the REPLAY window.
-        fork {
-          cd.waitSampling(secondCycle + 1)
-          dut.probe.logic.storeIn.valid #= true
-          dut.probe.logic.storeIn.payload.paddr #= addrD + 4
-          dut.probe.logic.storeIn.payload.data  #= BigInt("DEADBEEF", 16)
-          dut.probe.logic.storeIn.payload.size  #= Size.LONG
-          dut.probe.logic.storeIn.payload.useStrb #= false
-          dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
-          cd.waitSampling()
-          dut.probe.logic.storeIn.valid #= false
-        }
-        cd.waitSampling(160)
-        dut.dcache.logic.storeDrainHoldExpected #= false
-        if (holdFired) holdFiredAt += secondCycle
-
-        // (b) DELAYED, NOT DROPPED: the merge fired exactly once, and the allocated
-        // line holds the store's bytes over the refilled line's own data.
-        assert(mergeSeen == 1,
-          s"the write-allocate merge must fire EXACTLY once (delay, never drop / never " +
-          s"double-ack) -- storeAllocAckReg pulsed $mergeSeen times")
-        val gotC = load(dut, cd, addrC + 4, Size.LONG)
-        assert(gotC == BigInt("CAFEBABE", 16),
-          f"the HELD write-allocate merge was dropped or corrupted: cached read back " +
-          f"0x$gotC%08x, expected 0xCAFEBABE (0x${expected(addrC + 4, 4)}%08x would be the " +
-          f"un-merged refilled image)")
-        val gotCrest = load(dut, cd, addrC + 8, Size.LONG)
-        assert(gotCrest == expected(addrC + 8, 4),
-          f"the rest of the write-allocated line must be the refilled memory image: " +
-          f"got 0x$gotCrest%08x, expected 0x${expected(addrC + 8, 4)}%08x")
-
-        // (c) the contract-violating store's OWN array write landed too.
-        val gotD = load(dut, cd, addrD + 4, Size.LONG)
-        assert(gotD == BigInt("DEADBEEF", 16),
-          f"the second (contract-violating) store's array write was dropped: cached " +
-          f"read back 0x$gotD%08x, expected 0xDEADBEEF")
-        assert(mem.peekByte(addrD + 4) == 0xDE, "the second store's write-through beat reached memory")
+      def fireStore(addr: Long, data: BigInt): Unit = {
+        dut.probe.logic.storeIn.valid #= true
+        dut.probe.logic.storeIn.payload.paddr #= addr
+        dut.probe.logic.storeIn.payload.data #= data
+        dut.probe.logic.storeIn.payload.size #= Size.LONG
+        dut.probe.logic.storeIn.payload.useStrb #= false
+        dut.probe.logic.storeIn.payload.strb #= 0
+        dut.probe.logic.storeIn.payload.lineData #= 0
+        dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+        dut.probe.logic.storeIn.payload.precise #= false
+        cd.waitSamplingWhere(dut.probe.logic.storeIn.valid.toBoolean &&
+          dut.probe.logic.storeIn.ready.toBoolean)
+        dut.probe.logic.storeIn.valid #= false
       }
+
+      fireStore(missAddr + 4, BigInt("CAFEBABE", 16))
+      fireStore(hitAddr + 4, BigInt("DEADBEEF", 16))
+
+      var barrierWithParkedS1 = false
+      var allocAcks = 0
+      var totalAcks = 0
+      var cycles = 0
+      while (totalAcks < 2 && cycles < 300) {
+        cd.waitSampling()
+        if (dut.dcache.logic.storeMissBarrier.toBoolean &&
+            dut.dcache.logic.stS1Valid.toBoolean) barrierWithParkedS1 = true
+        if (dut.dcache.logic.storeAllocAckReg.toBoolean) allocAcks += 1
+        if (dut.dcache.logic.storeAckReg.toBoolean) totalAcks += 1
+        cycles += 1
+      }
+      assert(barrierWithParkedS1,
+        "test never placed a same-set younger descriptor behind the live miss barrier")
+      assert(allocAcks == 1, s"older miss allocated/acked $allocAcks times")
+      assert(totalAcks == 2, s"expected two ordered terminal acks, saw $totalAcks")
+      assert(load(dut, cd, missAddr + 4, Size.LONG) == BigInt("CAFEBABE", 16),
+        "older COPYBACK miss merge was lost")
+      assert(load(dut, cd, hitAddr + 4, Size.LONG) == BigInt("DEADBEEF", 16),
+        "parked younger same-set hit was lost, duplicated, or merged from stale data")
     }
   }
 
-  // (a) NON-VACUITY: at least one offset must have actually asserted the hold. If none
-  // did, the sweep above proves nothing about `storeDrainRefillHold` at all -- every
-  // assertion in it would pass on a core with the gate deleted outright.
-  test("Lever F positive control scenario sanity: storeDrainRefillHold was actually " +
-       "asserted at least once across the secondCycle sweep", VerilatorTest) {
-    assert(holdFiredAt.nonEmpty,
-      "NONE of the Lever F sweep's offsets ever asserted `storeDrainRefillHold` inside " +
-      "REPLAY's write-allocate arm -- the sweep above is VACUOUS: its delay-never-drop " +
-      "assertions could all pass on a core with the hold removed entirely. Re-tune the " +
-      "secondCycle range against the current refill latency.")
-    info(s"storeDrainRefillHold asserted at secondCycle offsets: ${holdFiredAt.mkString(",")}")
+  // A load miss snapshots the chosen dirty victim before EVICT_WR starts. If an
+  // older COPYBACK hit is waiting in store-S1 on that exact decision cycle, letting
+  // it advance would write/ack the new bytes after the snapshot; EVICT_WR would then
+  // write the old snapshot and REFILL would replace the line, silently losing the
+  // store. The fix parks S1 until load replay, then naturally re-resolves it (as a
+  // store miss after the victim was evicted). This test checks final data, not merely
+  // the presence of a barrier pulse, and proves the exact race was reached.
+  test("load dirty-victim snapshot parks an older store-S1 until refill completes",
+       VerilatorTest) {
+    compiled.doSim("loadVictimStoreS1", 1) { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      dut.probe.logic.loadCmdIn.valid #= false
+      dut.probe.logic.storeIn.valid   #= false
+      cd.waitSampling(5)
+
+      val set = 52L
+      def line(k: Long): Long = set * 16L + k * 0x800L
+      for (k <- 0L until 5L) preload(mem, line(k), 16)
+      for (k <- 0L until 4L) load(dut, cd, line(k), Size.LONG)
+
+      def fireCopyback(addr: Long, data: BigInt): Unit = {
+        dut.probe.logic.storeIn.valid #= true
+        dut.probe.logic.storeIn.payload.paddr #= addr
+        dut.probe.logic.storeIn.payload.data #= data
+        dut.probe.logic.storeIn.payload.size #= Size.LONG
+        dut.probe.logic.storeIn.payload.useStrb #= false
+        dut.probe.logic.storeIn.payload.strb #= 0
+        dut.probe.logic.storeIn.payload.lineData #= 0
+        dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+        dut.probe.logic.storeIn.payload.precise #= false
+        cd.waitSamplingWhere(dut.probe.logic.storeIn.valid.toBoolean &&
+          dut.probe.logic.storeIn.ready.toBoolean)
+        dut.probe.logic.storeIn.valid #= false
+      }
+
+      // Make way 0 dirty first, so the racing load miss really takes EVICT_WR.
+      fireCopyback(line(0), BigInt("A5A55A5A", 16))
+      cd.waitSamplingWhere(dut.dcache.logic.storeAckReg.toBoolean)
+
+      var sawDecisionWithS1 = false
+      var sawHeldS1 = false
+      var measuredAcks = 0
+      var refillArs = 0
+      var victimAws = 0
+      var monitor = true
+      fork {
+        while (monitor) {
+          cd.waitSampling()
+          if (dut.dcache.logic.loadMissDiscovered.toBoolean &&
+              dut.dcache.logic.stS1Valid.toBoolean) sawDecisionWithS1 = true
+          if (dut.dcache.logic.loadMissStoreBarrier.toBoolean &&
+              dut.dcache.logic.stS1Valid.toBoolean) sawHeldS1 = true
+          if (dut.dcache.logic.storeAckReg.toBoolean) measuredAcks += 1
+          if (dut.dcache.logic.axi.ar.valid.toBoolean &&
+              dut.dcache.logic.axi.ar.ready.toBoolean) refillArs += 1
+          if (dut.dcache.logic.axi.aw.valid.toBoolean &&
+              dut.dcache.logic.axi.aw.ready.toBoolean &&
+              ((dut.dcache.logic.axi.aw.payload.addr.toLong & ~0xfL) == line(0)))
+            victimAws += 1
+        }
+      }
+
+      // Put the older store in S0, then launch the conflicting load read while S0
+      // advances to S1. On the next cycle the load miss chooses way 0 while the
+      // store is exactly at the dangerous pre-write stage.
+      fireCopyback(line(0) + 4, BigInt("DEADBEEF", 16))
+      dut.probe.logic.loadCmdIn.valid #= true
+      dut.probe.logic.loadCmdIn.payload.vaddr #= line(4)
+      dut.probe.logic.loadCmdIn.payload.paddr #= line(4)
+      dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+      dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadCmdIn.payload.token #= 7
+      cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
+        dut.probe.logic.loadCmdIn.ready.toBoolean)
+      dut.probe.logic.loadCmdIn.valid #= false
+      cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
+      assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == expected(line(4), 4),
+        "racing load refill returned the wrong target line")
+
+      var waitAck = 0
+      while (measuredAcks < 1 && waitAck < 300) { cd.waitSampling(); waitAck += 1 }
+      monitor = false
+      cd.waitSampling()
+      assert(sawDecisionWithS1,
+        "test never aligned the dirty-victim decision with an older store in S1")
+      assert(sawHeldS1,
+        "store-S1 was not retained throughout the load dirty-victim refill")
+      assert(measuredAcks == 1,
+        s"racing store must terminate exactly once, saw $measuredAcks acks")
+      assert(refillArs == 2,
+        s"expected one load refill plus one replayed store write-allocate, saw $refillArs ARs")
+      assert(victimAws == 1,
+        s"the dirty victim must be written back exactly once, saw $victimAws eviction AWs")
+      val evictedWord = (0 until 4).foldLeft(BigInt(0)) { (acc, i) =>
+        (acc << 8) | BigInt(mem.peekByte(line(0) + i))
+      }
+      assert(evictedWord == BigInt("A5A55A5A", 16),
+        f"dirty eviction wrote a pre-store victim image: memory=0x$evictedWord%08x")
+
+      assert(load(dut, cd, line(0), Size.LONG) == BigInt("A5A55A5A", 16),
+        "the first dirty bytes were lost across victim eviction/reload")
+      assert(load(dut, cd, line(0) + 4, Size.LONG) == BigInt("DEADBEEF", 16),
+        "older store-S1 was acked but lost after the load replaced its victim line")
+    }
+  }
+
+  test("load dirty-victim snapshot forwards the same-cycle S3 store result",
+       VerilatorTest) {
+    compiled.doSim("loadVictimFromS3", 1) { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      dut.probe.logic.loadCmdIn.valid #= false
+      dut.probe.logic.storeIn.valid #= false
+      cd.waitSampling(5)
+
+      val set = 53L
+      def line(k: Long): Long = set * 16L + k * 0x800L
+      for (k <- 0L until 5L) preload(mem, line(k), 16)
+      for (k <- 0L until 4L) load(dut, cd, line(k), Size.LONG)
+
+      // Establish a dirty victim, then measure a second hit which reaches S3 on the
+      // exact cycle the fifth-tag load snapshots way 0.
+      fireCopyback(dut, cd, line(0), BigInt("A5A55A5A", 16))
+      cd.waitSamplingWhere(dut.dcache.logic.storeAckReg.toBoolean)
+      cd.waitSampling(2)
+
+      var sawForward = false
+      var storeAcks = 0
+      var refillArs = 0
+      var victimAws = 0
+      var monitor = true
+      var stageTrace = Vector.empty[String]
+      fork {
+        while (monitor) {
+          cd.waitSampling()
+          stageTrace :+= s"s0=${dut.dcache.logic.s0Valid.toBoolean} " +
+            s"s1=${dut.dcache.logic.stS1Valid.toBoolean} " +
+            s"s2=${dut.dcache.logic.stS2Valid.toBoolean} " +
+            s"s3=${dut.dcache.logic.stS3Valid.toBoolean} " +
+            s"ld1=${dut.dcache.logic.ldS1Valid.toBoolean} " +
+            s"lm=${dut.dcache.logic.loadMissDiscovered.toBoolean} " +
+            s"fwd=${dut.dcache.logic.loadVictimFromS3Dbg.toBoolean}"
+          if (dut.dcache.logic.loadVictimFromS3Dbg.toBoolean) sawForward = true
+          if (dut.dcache.logic.storeAckReg.toBoolean) storeAcks += 1
+          if (dut.dcache.logic.axi.ar.valid.toBoolean &&
+              dut.dcache.logic.axi.ar.ready.toBoolean) refillArs += 1
+          if (dut.dcache.logic.axi.aw.valid.toBoolean &&
+              dut.dcache.logic.axi.aw.ready.toBoolean &&
+              ((dut.dcache.logic.axi.aw.payload.addr.toLong & ~0xfL) == line(0)))
+            victimAws += 1
+        }
+      }
+
+      fireCopyback(dut, cd, line(0) + 4, BigInt("DEADBEEF", 16))
+      // `waitSamplingWhere` returns after the matching sampling edge; starting the
+      // load while the store is in S1 makes its registered miss decision coincide
+      // with that store's later S3 write.
+      cd.waitSamplingWhere(dut.dcache.logic.stS1Valid.toBoolean)
+      dut.probe.logic.loadCmdIn.valid #= true
+      dut.probe.logic.loadCmdIn.payload.vaddr #= line(4)
+      dut.probe.logic.loadCmdIn.payload.paddr #= line(4)
+      dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+      dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadCmdIn.payload.token #= 8
+      cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
+        dut.probe.logic.loadCmdIn.ready.toBoolean)
+      dut.probe.logic.loadCmdIn.valid #= false
+      cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
+      assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == expected(line(4), 4),
+        "racing target load returned corrupt refill data")
+      cd.waitSampling(8)
+      monitor = false
+      cd.waitSampling()
+
+      assert(sawForward,
+        s"test never exercised the load victimFromS3 mux; trace=${stageTrace.mkString(" | ")}")
+      assert(storeAcks == 1, s"racing S3 store acknowledged $storeAcks times")
+      assert(refillArs == 1, s"target load issued $refillArs refill reads")
+      assert(victimAws == 1, s"dirty victim issued $victimAws eviction writes")
+      val evicted = (0 until 4).foldLeft(BigInt(0)) { (acc, i) =>
+        (acc << 8) | BigInt(mem.peekByte(line(0) + 4 + i))
+      }
+      assert(evicted == BigInt("DEADBEEF", 16),
+        f"load victim snapshot lost the same-cycle S3 update: 0x$evicted%08x")
+    }
+  }
+
+  test("COPYBACK miss victim snapshot forwards the preceding S3 store result",
+       VerilatorTest) {
+    compiled.doSim("storeVictimFromS3", 1) { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      dut.probe.logic.loadCmdIn.valid #= false
+      dut.probe.logic.storeIn.valid #= false
+      cd.waitSampling(5)
+
+      val set = 54L
+      def line(k: Long): Long = set * 16L + k * 0x800L
+      for (k <- 0L until 5L) preload(mem, line(k), 16)
+      for (k <- 0L until 4L) load(dut, cd, line(k), Size.LONG)
+
+      var sawForward = false
+      var storeAcks = 0
+      var refillArs = 0
+      var victimAws = 0
+      var monitor = true
+      fork {
+        while (monitor) {
+          cd.waitSampling()
+          if (dut.dcache.logic.storeVictimFromS3Dbg.toBoolean) sawForward = true
+          if (dut.dcache.logic.storeAckReg.toBoolean) storeAcks += 1
+          if (dut.dcache.logic.axi.ar.valid.toBoolean &&
+              dut.dcache.logic.axi.ar.ready.toBoolean) refillArs += 1
+          if (dut.dcache.logic.axi.aw.valid.toBoolean &&
+              dut.dcache.logic.axi.aw.ready.toBoolean &&
+              ((dut.dcache.logic.axi.aw.payload.addr.toLong & ~0xfL) == line(0)))
+            victimAws += 1
+        }
+      }
+
+      // Consecutive accepts align the older resident hit in S3 with the younger
+      // fifth-tag miss in S2. Way 0 was clean before this pair, so the younger miss
+      // can know it is dirty only through pVictimFromS3.
+      fireCopyback(dut, cd, line(0) + 4, BigInt("CAFEBABE", 16))
+      fireCopyback(dut, cd, line(4) + 4, BigInt("11223344", 16))
+      var waitAcks = 0
+      while (storeAcks < 2 && waitAcks < 300) { cd.waitSampling(); waitAcks += 1 }
+      cd.waitSampling(6)
+      monitor = false
+      cd.waitSampling()
+
+      assert(sawForward,
+        "test never exercised the store-miss pVictimFromS3 mux")
+      assert(storeAcks == 2, s"expected two ordered store acks, saw $storeAcks")
+      assert(refillArs == 1, s"younger COPYBACK miss issued $refillArs refill reads")
+      assert(victimAws == 1, s"newly dirtied victim issued $victimAws eviction writes")
+      val evicted = (0 until 4).foldLeft(BigInt(0)) { (acc, i) =>
+        (acc << 8) | BigInt(mem.peekByte(line(0) + 4 + i))
+      }
+      assert(evicted == BigInt("CAFEBABE", 16),
+        f"store-miss victim snapshot lost the preceding S3 update: 0x$evicted%08x")
+      assert(load(dut, cd, line(4) + 4, Size.LONG) == BigInt("11223344", 16),
+        "younger COPYBACK miss did not merge into its allocated line")
+    }
   }
 }

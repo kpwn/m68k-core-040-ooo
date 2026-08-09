@@ -119,8 +119,8 @@ trait DcacheService {
   def loadCmd:  spinal.lib.Stream[DLoadCmd]   // resolved VA+PA; virtual index, physical tag
   def loadRsp:  spinal.lib.Flow[DLoadRsp]     // fixed offset for a hit; valid late on a miss-refill
   def loadBusy: Bool                          // high while a refill is in flight (back-pressures loads)
-  def store:    spinal.lib.Flow[DStoreCmd]    // write-through: update line if hit + write memory
-  def storeAck: Bool                          // 1-cycle pulse when a write-through landed in memory (AXI B)
+  def store:    spinal.lib.Stream[DStoreCmd]  // elastic ordered drain; payload stable until fire
+  def storeAck: Bool                          // ordered 1-cycle terminal pulse: local hit, allocation, or AXI B
   // 1-cycle pulse, same cycle class as storeAck: the AXI B response for the
   // just-drained store carried a non-OKAY resp (SLVERR/DECERR). storeErr is an
   // additional QUALIFIER a consumer checks alongside storeAck, never a
@@ -147,7 +147,7 @@ trait DcacheService {
   /** 1-cycle pulse: the walk started by `maintCmd` has fully completed. */
   def maintDone: Bool
   /** REQUIRED PRECONDITION for `maintCmd`, and the reason it exists: the whole
-    * D-cache datapath (load FSM, refill/eviction engine, the store S0..S2 pipe and
+    * D-cache datapath (load FSM, refill/eviction engine, the store S0..S3 pipe and
     * BOTH sets of AXI write completion flags) is genuinely idle RIGHT NOW, so the
     * maintenance walk can take the shared array read port and the AXI write channels
     * without racing an in-flight transaction.

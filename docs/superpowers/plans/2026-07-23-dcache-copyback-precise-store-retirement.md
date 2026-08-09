@@ -14,7 +14,7 @@
 - **ExecuteLockStepSpec baseline: 390/394 passing.** 4 known pre-existing failures: `STOP #imm -> halt -> IRQ -> handler -> RTE -> resume`, and 3 ITLB tests. Every task's verification step and every slice's final verification task must re-confirm this EXACT count with byte-identical failing test names before and after — a new failure or a changed failure-name set is a regression even if the count is unchanged.
 - **Full ported-test corpus baseline: 713/763 passing.** `/tmp/final_fails_v14.txt` (50 lines) is the last known-good coordinator-confirmed fail list but may be STALE by the time implementation starts. The FIRST task of this plan (Task P1.1) re-establishes a FRESH baseline via a real, complete, untruncated corpus run — do not trust `/tmp/final_fails_v14.txt` blindly; treat it only as a sanity cross-check.
 - **`git worktree add` is MANDATORY for ANY isolated before/after comparison.** NEVER `git checkout <sha>` in the shared checkout — this project had a real collision incident from violating this. Use `git worktree add <path> <ref>` (and `git worktree remove <path>` when done); never reuse the main checkout's working tree for a "before" snapshot while other work may be landing there.
-- **Mandatory full-core OOC synth gate (>=250 MHz) at the end of every slice**, via `JAVA_OPTS=-Xmx10g timeout 1200 ~/sbt/bin/sbt "runMain m68k040.top.GenFullCoreSynthVerilog"` then `vivado -mode batch -nojournal -log synth/vivado_full.log -source synth/ooc_M68kFullCoreSynth.tcl` (reads `RESULT FullCore WNS ... FMAX ...`). PLUS at least one post-route `vivado -mode batch -nojournal -log synth/vivado_FullCore.log -source synth/impl_FullCore.tcl` check on an uncontended machine before any slice is considered mergeable. CAVEAT (known, unresolved): this shared machine has intermittent concurrent-vivado/Verilator contention that produces noisy FMax numbers — ALWAYS `pgrep -af vivado` before launching either synth job, NEVER run two Vivado invocations (or a Vivado + Verilator regression) concurrently, and do not trust a single OOC number under any suspicion of contention; post-route is deterministic (same netlist -> same FMax) and is the authoritative gate, OOC is a fast directional sanity check only.
+- **Mandatory physical timing gate, current acceptance floor 200 MHz.** Generate the full core, run OOC for a quick directional result, then run the existing floorplanned post-route flow on an uncontended machine before physical acceptance. Keep the existing 250-MHz constraint as a stress/census point and for apples-to-apples history; its reported achieved FMax must be at least 200 MHz, but failure to meet the 250-MHz stress constraint is not itself rejection. Record pblock utilization and placement changes as well as WNS/TNS/endpoints because this phase materially grows the SQ/D-cache corridor. CAVEAT (known, unresolved): this shared machine has intermittent concurrent-vivado/Verilator contention that produces noisy FMax numbers — ALWAYS `pgrep -af vivado` before launching either synth job, NEVER run two Vivado invocations (or a Vivado + Verilator regression) concurrently, and do not trust a single OOC number under any suspicion of contention; post-route is authoritative and OOC is a fast directional sanity check only.
 - **Work synchronously/foreground for verification commands.** If a command must be backgrounded (the ~48-minute full ported-corpus run), actually poll with `pgrep -f VerilatorTest` (or watch the sbt log for the final `Tests: ...` summary line) to confirm REAL completion before trusting any log — do not rely on Monitor/background-task tracking alone; this project has repeatedly had agents lose track of backgrounded sbt runs and report stale/partial results.
 - **Baseline test-run command reference:** `~/sbt/bin/sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"` (lock-step, ~394 cases); `~/sbt/bin/sbt "testOnly m68k040.fuzz.PortedM68kOooSpec"` (full ported corpus, NO `-z` filter, ~48 min); `~/sbt/bin/sbt "testOnly m68k040.fuzz.PortedM68kOooSpec" -- -z <name>` for one directed test only during dev iteration (never as the final gate). Diff fail-lists with `LC_ALL=C sort -u a.txt > a.sorted; LC_ALL=C sort -u b.txt > b.sorted; comm -23 a.sorted b.sorted` (only-in-before = fixed) and `comm -13 a.sorted b.sorted` (only-in-after = regressed).
 
@@ -798,7 +798,10 @@ vivado -mode batch -nojournal -log synth/vivado_full_p1.log -source synth/ooc_M6
 grep "RESULT FullCore" synth/vivado_full_p1.log
 ```
 
-Record the reported `FMAX`. Treat this as a fast directional sanity check only (pessimistic + unfloorplanned per the project's own synth-protocol notes) — it must read >=250 MHz, but do NOT treat a marginal OOC number as a hard fail without the post-route confirmation in Step 3, and do NOT treat a marginal OOC number as a hard pass either if it's within noise of 250 MHz.
+Record the reported `FMAX`. Treat this as a fast directional sanity check only
+(pessimistic + unfloorplanned per the project's own synth-protocol notes). An OOC
+estimate below the current 200-MHz floor is an immediate investigation trigger,
+but only the floorplanned post-route run in Step 3 makes the acceptance decision.
 
 - [ ] **Step 3: Post-route confirmation (authoritative; run on an uncontended machine)**
 
@@ -1897,7 +1900,7 @@ grep -E "POSTROUTE_FULLCORE|FMAX" synth/vivado_FullCore_p3.log
 
 - [ ] **Step 4: Compare against P2's post-route number**
 
-P3 adds only `GenerationFlags.simulation`-gated assertions (zero synth footprint) and a new test file (no RTL at all). Expect the post-route FMax to be IDENTICAL (or within sub-MHz noise) to P2's number, not just >=250 MHz — any measurable delta here is a synth-determinism red flag (re-run once uncontended before concluding a real regression).
+P3 adds only `GenerationFlags.simulation`-gated assertions (zero synth footprint) and a new test file (no RTL at all). Expect the post-route FMax to be IDENTICAL (or within sub-MHz noise) to P2's number—not merely above the current 200-MHz floor. Any measurable delta here is a synth-determinism red flag (re-run once uncontended before concluding a real regression).
 
 No commit for this task (read-only verification / synth-only; nothing staged).
 
@@ -2038,7 +2041,7 @@ git commit -m "$(cat <<'EOF'
 cache: dirty bits + copyback hit-drain resolves locally (no AXI write)
 
 A COPYBACK-hit store drain merges into the line, sets its dirty bit, and
-acks off a registered S2-local pulse instead of an AXI B round trip --
+acks off the registered S3 local-result stage instead of an AXI B round trip --
 the drain-throughput win the design doc names. WRITETHROUGH/INHIBITED
 drains are unchanged. DStoreCmd carries `precise` so a later task can
 route a fast-path store's bus error to the new async diagnostic channel
@@ -2712,7 +2715,7 @@ git commit -m "$(cat <<'EOF'
 cache: sim assert -- at most one storeAck source pulses per cycle
 
 Pins design doc §5 item 7's one-ack-per-store contract now that
-storeAckReg has three sources (AXI B, copyback-hit S2, drain-miss
+storeAckReg has three sources (AXI B, copyback-hit S3, drain-miss
 write-allocate). Zero synth cost.
 EOF
 )"
@@ -2876,7 +2879,7 @@ grep -E "POSTROUTE_FULLCORE|FMAX" synth/vivado_FullCore_p4.log
 
 - [ ] **Step 4: Compare against P3's post-route number — this is the highest FMax-risk slice in the plan**
 
-The design doc explicitly flags this slice's risk as "moderate": the 512-FF `dirtys` vec lands in the already-congested D-cache corridor (`iter_100_CongestedCLBsAndNets.txt` named `tagMem`/`ldS1Tag` nets), and the eviction-writeback FSM adds states (not deep cones). If post-route WNS regresses meaningfully below 250 MHz, check `synth/fullcore_congestion.rpt` and `synth/fullcore_pblock_util.rpt` for the D-cache pblock (`pb_dcache`, per `synth/floorplan_dcache.xdc`) before assuming a logic-depth problem — a congestion regression may need the pblock's column count widened (precedent: `floorplan: pb_dcache 46->52 cols for the STOP/RESET netlist growth`, a recent commit on this branch) rather than an RTL rework.
+The design doc explicitly flags this slice's risk as "moderate": the 512-FF `dirtys` vec lands in the already-congested D-cache corridor (`iter_100_CongestedCLBsAndNets.txt` named `tagMem`/`ldS1Tag` nets), and the eviction-writeback FSM adds states (not deep cones). If post-route FMax regresses meaningfully—or falls below the current 200-MHz floor—check `synth/fullcore_congestion.rpt` and `synth/fullcore_pblock_util.rpt` for the D-cache pblock (`pb_dcache`, per `synth/floorplan_dcache.xdc`) before assuming a logic-depth problem. A congestion regression may need the pblock's column count widened (precedent: `floorplan: pb_dcache 46->52 cols for the STOP/RESET netlist growth`, a recent commit on this branch) rather than an RTL rework.
 
 No commit for this task (read-only verification / synth-only; nothing staged).
 
@@ -3634,7 +3637,11 @@ No commit for this task (read-only verification / synth-only; nothing staged).
 
 Design doc refs: §4.3's "Pipelined hit-drain" bullet, §6.1 in full (a REQUIRED deliverable, not optional). Acceptance metric: MOVEM/memset-style store-burst throughput, measured via the IPC bench.
 
-**FLAGGED FOR HUMAN ATTENTION (see this plan's final report):** the design doc sketches this slice's mechanism only at a high level ("The SQ pop and forwarding-retention logic generalize from 'one in-flight drain' to a small in-flight count"). Task P6.1 below is THIS PLAN's own concrete proposal for that generalization (a `presentPtr`/`inFlight` split from the existing single `head`-driven presentation) — it is real, not a placeholder, but is a genuine design decision the source document left open, and deserves a design-review pass before an implementing session starts coding it.
+> **The entire original P6.1/P6.2 mechanism body below is non-normative and
+> obsolete**, including its interfaces, pseudocode, pointer/flush rules, assertions,
+> and named tests. It remains only as design-history evidence. Do not implement or
+> verify `presentPtr`, `inFlight`, `drainAccept`, or `drainStreamStall`; use the
+> binding §4.3 contract and the live `sendPtr`/accepted-halves/S0–S3 terminology.
 
 ### Task P6.1: `StoreQueue` — generalize `drainBusy` to a small in-flight count (`presentPtr`/`inFlight`)
 
@@ -3928,8 +3935,9 @@ Curate the grep output down to a genuinely LSU-stress-representative list (not e
 
 ```scala
 // src/test/scala/m68k040/fuzz/PortedTestRunner.scala, inside the `doSim` block,
-// AFTER the existing boot sequence (mmuEnable/isp/usp/redirect -- the same
-// anchor Task P5.7 used) and BEFORE the sentinel-poll loop
+// AFTER the existing register-seed boot sequence but BEFORE the initial fetch
+// redirect. The first instruction must be fetched under the injected posture;
+// changing ITT/TC after redirect would race that first request.
 cachePosture match {
   case CachePosture.AsWritten => ()   // today's exact behavior, no injection
   case CachePosture.ForceCacheableCopyback =>
@@ -3937,20 +3945,30 @@ cachePosture match {
     // cacheable-copyback identity mapping covering the test's working set,
     // WITHOUT touching the test's own program image. Simplest correct
     // mechanism: poke ss.cacr directly (mirrors Task P5.7's boot-time poke)
-    // PLUS a DTT0 identity-copyback window over the low 1 GB (covers every
-    // ported test's RAM working set; the sentinel region 0xFFFF0000 stays
-    // reachable via DTT1 non-cacheable so end-of-run polling is unaffected)
+    // PLUS the same proven transparent-translation partition used by the
+    // D-cache benchmarks: DTT0 maps the low 2 GiB identity/COPYBACK (covering
+    // RAM and the 0x40800000 program image), DTT1 maps the high 2 GiB identity/
+    // INHIBITED (so the 0xFFFF0000 sentinel and MMIO still reach AXI), and ITT0
+    // mirrors the low mapping so enabling TC cannot fault the first code fetch.
     // -- driven via the SAME MmuControlPlugin sim-pokeable regs the MMU-on
     // lock-step tests already use (dut.ctrl.logic.*), NOT via architected
     // movec instructions (this must not touch the assembled program image).
-    dut.ctrl.logic.mmuEnable #= true
-    dut.ctrl.logic.dtt0 #= BigInt("000FE020", 16)   // base=0x00 mask=0x0F E=1 CM=copyback
-    dut.ctrl.logic.dtt1 #= BigInt("FF00E060", 16)   // sentinel region stays non-cacheable
+    dut.ctrl.logic.itt0 #= BigInt("007FE020", 16)   // low 2 GiB, identity/COPYBACK
+    dut.ctrl.logic.itt1 #= 0
+    dut.ctrl.logic.dtt0 #= BigInt("007FE020", 16)   // low 2 GiB, identity/COPYBACK
+    dut.ctrl.logic.dtt1 #= BigInt("807FE060", 16)   // high 2 GiB, identity/INHIBITED
     dut.rob.logic.exc.ss.cacr #= 0x80008000L
+    dut.ctrl.logic.mmuEnable #= true
 }
 ```
 
-(`dut.ctrl.logic.dtt0`/`dtt1` — confirm the EXACT sim-pokeable field names against `MmuControlPlugin.scala`'s `logic` Area before implementing; this plan's earlier research did not read that file in full. If `dtt0`/`dtt1` are not directly `simPublic`-poked registers but only reachable via the `setDtt0`/`setDtt1` Flow write ports, drive those Flows for one cycle instead of a raw `#=` poke.)
+(`MmuControl.scala` confirms `mmuEnable`, `itt0`/`itt1`, and `dtt0`/`dtt1`
+are directly `simPublic` registers. These values are not estimates:
+`bench_fullpipe_dcache.s` uses the identical `0x007FE020`/`0x807FE060`
+partition and documents its TTR fields. `0x000FE020` is invalid here because
+its mask covers only `0x00xxxxxx-0x0Fxxxxxx`, missing the program at
+`0x40800000`; enabling TC without ITT0 would also leave instruction fetch to
+walk zero-valued roots.)
 
 - [ ] **Step 3: Widen `PortedM68kOooSpec` to generate the sweep's second test per named entry**
 
@@ -4091,7 +4109,17 @@ grep -E "POSTROUTE_FULLCORE|FMAX" synth/vivado_FullCore_p6.log
 
 - [ ] **Step 4: Compare against P5's post-route number**
 
-The `presentPtr`/`inFlight` split adds a second ring pointer + a small counter compare (bounded by `maxInFlight=3`) — expect a small, bounded FMax cost at most; the same-line hold is a single-set-compare gate. If this slice regresses FMax meaningfully, the most likely culprit is the `drainStreamStallReg`/`drainAcceptReg` cross-module handshake landing on the same congested D-cache corridor nets named throughout this plan (`tagMem`/`ldS1Tag`) — check `synth/fullcore_slack_matrix.rpt` for a new `StoreQueue<->DcachePlugin` worst-path pair before concluding this needs an RTL rework rather than a floorplan/pipeline-stage adjustment.
+The binding implementation adds `sendPtr`, accepted-half accounting, and a
+registered S3 result/write stage. Check the StoreQueue↔Dcache Stream-ready cone,
+tag-BRAM→S3 boundary, S3→array/dirty boundary, and the 4-way line-select plus
+same-line bypass in `synth/fullcore_slack_matrix.rpt`. Also compare every existing
+pblock's utilization, overflow, congestion, and cell ownership against the paired
+baseline: the larger LS/cache netlist may need a floorplan adjustment even when the
+logic depth is acceptable. The hard floor is 200 MHz achieved post-route. Continue
+using the 250-MHz constraint for stress and comparable endpoint census; do not call
+the phase physically accepted from OOC alone. Judge the result by post-route FMax,
+WNS/TNS/failing endpoints, floorplan health, and LUT/FF/BRAM/DSP deltas—not by the
+obsolete handshake signals.
 
 No commit for this task (read-only verification / synth-only; nothing staged).
 

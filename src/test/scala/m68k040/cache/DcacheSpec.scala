@@ -61,30 +61,33 @@ class DcacheSpec extends AnyFunSuite {
 
   def doStore(dut: Dut, cd: ClockDomain, paddr: Long, data: BigInt, size: SpinalEnumElement[Size.type],
               cacheMode: SpinalEnumElement[CacheMode.type] = CacheMode.WRITETHROUGH): Unit = {
+    fireStore(dut, cd, paddr, data, size, cacheMode)
+    cd.waitSampling(12)
+  }
+
+  /** Present one complete store Stream item and hold every payload bit until fire. */
+  def fireStore(dut: Dut, cd: ClockDomain, paddr: Long, data: BigInt,
+                size: SpinalEnumElement[Size.type],
+                cacheMode: SpinalEnumElement[CacheMode.type] = CacheMode.WRITETHROUGH,
+                precise: Boolean = false): Unit = {
     dut.probe.logic.storeIn.valid #= true
     dut.probe.logic.storeIn.payload.paddr #= paddr
     dut.probe.logic.storeIn.payload.data #= data
     dut.probe.logic.storeIn.payload.size #= size
     dut.probe.logic.storeIn.payload.useStrb #= false
+    dut.probe.logic.storeIn.payload.strb #= 0
+    dut.probe.logic.storeIn.payload.lineData #= 0
     dut.probe.logic.storeIn.payload.cacheMode #= cacheMode
-    dut.probe.logic.storeIn.payload.precise #= false
-    cd.waitSampling()
+    dut.probe.logic.storeIn.payload.precise #= precise
+    cd.waitSamplingWhere(dut.probe.logic.storeIn.valid.toBoolean &&
+      dut.probe.logic.storeIn.ready.toBoolean)
     dut.probe.logic.storeIn.valid #= false
-    cd.waitSampling(12)
   }
 
   /** Mimic the exception-FSM frame push: pulse one WORD store, then wait for the
     * write-through ACK (AXI B) before the next — single-outstanding, ack-gated. */
   def doStoreAckGated(dut: Dut, cd: ClockDomain, paddr: Long, data: BigInt): Unit = {
-    dut.probe.logic.storeIn.valid #= true
-    dut.probe.logic.storeIn.payload.paddr #= paddr
-    dut.probe.logic.storeIn.payload.data #= data
-    dut.probe.logic.storeIn.payload.size #= Size.WORD
-    dut.probe.logic.storeIn.payload.useStrb #= false
-    dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
-    dut.probe.logic.storeIn.payload.precise #= false
-    cd.waitSampling()
-    dut.probe.logic.storeIn.valid #= false
+    fireStore(dut, cd, paddr, data, Size.WORD, CacheMode.WRITETHROUGH)
     // storeAck == AXI B handshake (b.ready is held True by the cache).
     cd.waitSamplingWhere(dut.dcache.logic.axi.b.valid.toBoolean && dut.dcache.logic.axi.b.ready.toBoolean)
   }
@@ -97,19 +100,11 @@ class DcacheSpec extends AnyFunSuite {
   def doStoreAckGatedObserveErr(dut: Dut, cd: ClockDomain, paddr: Long, data: BigInt,
                                  cacheMode: SpinalEnumElement[CacheMode.type] = CacheMode.WRITETHROUGH,
                                  precise: Boolean = false): Boolean = {
-    dut.probe.logic.storeIn.valid #= true
-    dut.probe.logic.storeIn.payload.paddr #= paddr
-    dut.probe.logic.storeIn.payload.data #= data
-    dut.probe.logic.storeIn.payload.size #= Size.WORD
-    dut.probe.logic.storeIn.payload.useStrb #= false
-    dut.probe.logic.storeIn.payload.cacheMode #= cacheMode
     // Task P4.5: `precise` gates whether a B error routes to the async diagFault
     // channel (false, this default) or would-be the SQ's precise-path fault source
     // (true) -- explicitly pinned (SpinalHDL sim-poke gotcha: an unpoked testbench-
     // driven input field is NOT guaranteed 0 across seeds/runs).
-    dut.probe.logic.storeIn.payload.precise #= precise
-    cd.waitSampling()
-    dut.probe.logic.storeIn.valid #= false
+    fireStore(dut, cd, paddr, data, Size.WORD, cacheMode, precise)
     cd.waitSamplingWhere(dut.dcache.logic.axi.b.valid.toBoolean && dut.dcache.logic.axi.b.ready.toBoolean)
     val err = dut.dcache.logic.storeErrReg.toBoolean
     cd.waitSampling(4)
@@ -430,14 +425,7 @@ class DcacheSpec extends AnyFunSuite {
         }
       }
 
-      dut.probe.logic.storeIn.valid #= true
-      dut.probe.logic.storeIn.payload.paddr #= base + 4
-      dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
-      dut.probe.logic.storeIn.payload.size #= Size.LONG
-      dut.probe.logic.storeIn.payload.useStrb #= false
-      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
-      cd.waitSampling()
-      dut.probe.logic.storeIn.valid #= false
+      fireStore(dut, cd, base + 4, BigInt("CAFEBABE", 16), Size.LONG, CacheMode.COPYBACK)
 
       // Local ack (cbHitAckReg -> storeAckReg) must land within ~3 cycles of the
       // drain being presented (design doc: "S2 or the following cycle") -- give a
@@ -546,14 +534,7 @@ class DcacheSpec extends AnyFunSuite {
         }
       }
 
-      dut.probe.logic.storeIn.valid #= true
-      dut.probe.logic.storeIn.payload.paddr #= base + 4
-      dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
-      dut.probe.logic.storeIn.payload.size #= Size.LONG
-      dut.probe.logic.storeIn.payload.useStrb #= false
-      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
-      cd.waitSampling()
-      dut.probe.logic.storeIn.valid #= false
+      fireStore(dut, cd, base + 4, BigInt("CAFEBABE", 16), Size.LONG, CacheMode.COPYBACK)
 
       // The drain now depends on an actual AXI refill round trip (AR handshake +
       // R data + REPLAY merge), unlike the COPYBACK-hit case's immediate local
@@ -612,14 +593,7 @@ class DcacheSpec extends AnyFunSuite {
       // Way 0: warm + dirty via a COPYBACK-hit store (design doc's drain-throughput
       // path -- P4.1).
       load(dut, cd, addrK(0), Size.LONG, CacheMode.WRITETHROUGH)
-      dut.probe.logic.storeIn.valid #= true
-      dut.probe.logic.storeIn.payload.paddr #= addrK(0) + 4
-      dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
-      dut.probe.logic.storeIn.payload.size #= Size.LONG
-      dut.probe.logic.storeIn.payload.useStrb #= false
-      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
-      cd.waitSampling()
-      dut.probe.logic.storeIn.valid #= false
+      fireStore(dut, cd, addrK(0) + 4, BigInt("CAFEBABE", 16), Size.LONG, CacheMode.COPYBACK)
       cd.waitSamplingWhere(dut.dcache.logic.storeAckReg.toBoolean)
       cd.waitSampling(2)
       val setIdx = SET.toInt
@@ -729,14 +703,7 @@ class DcacheSpec extends AnyFunSuite {
 
         // SET_A way 0: warm + dirty via a COPYBACK-hit store.
         load(dut, cd, addrA(0), Size.LONG, CacheMode.WRITETHROUGH)
-        dut.probe.logic.storeIn.valid #= true
-        dut.probe.logic.storeIn.payload.paddr #= addrA(0) + 4
-        dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
-        dut.probe.logic.storeIn.payload.size #= Size.LONG
-        dut.probe.logic.storeIn.payload.useStrb #= false
-        dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
-        cd.waitSampling()
-        dut.probe.logic.storeIn.valid #= false
+        fireStore(dut, cd, addrA(0) + 4, BigInt("CAFEBABE", 16), Size.LONG, CacheMode.COPYBACK)
         cd.waitSamplingWhere(dut.dcache.logic.storeAckReg.toBoolean)
         cd.waitSampling(2)
 
@@ -764,15 +731,7 @@ class DcacheSpec extends AnyFunSuite {
                              dut.probe.logic.loadCmdIn.ready.toBoolean)
         dut.probe.logic.loadCmdIn.valid #= false
         cd.waitSampling(offset)
-        dut.probe.logic.storeIn.valid #= true
-        dut.probe.logic.storeIn.payload.paddr #= baseB
-        dut.probe.logic.storeIn.payload.data #= BigInt("11223344", 16)
-        dut.probe.logic.storeIn.payload.size #= Size.LONG
-        dut.probe.logic.storeIn.payload.useStrb #= false
-        dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
-
-        cd.waitSampling()
-        dut.probe.logic.storeIn.valid   #= false
+        fireStore(dut, cd, baseB, BigInt("11223344", 16), Size.LONG, CacheMode.WRITETHROUGH)
         cd.waitSampling(39)
         // Generous settle window -- both the eviction beat and the unrelated
         // store's own beat (each a full AW/W/B handshake, possibly retried under
@@ -842,14 +801,7 @@ class DcacheSpec extends AnyFunSuite {
         // SET_A way 0: warm + dirty via a COPYBACK-hit store, so the 5th miss's
         // round-robin victim (way 0) is DIRTY -> EVICT_WR.
         load(dut, cd, addrA(0), Size.LONG, CacheMode.WRITETHROUGH)
-        dut.probe.logic.storeIn.valid #= true
-        dut.probe.logic.storeIn.payload.paddr #= addrA(0) + 4
-        dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
-        dut.probe.logic.storeIn.payload.size #= Size.LONG
-        dut.probe.logic.storeIn.payload.useStrb #= false
-        dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
-        cd.waitSampling()
-        dut.probe.logic.storeIn.valid #= false
+        fireStore(dut, cd, addrA(0) + 4, BigInt("CAFEBABE", 16), Size.LONG, CacheMode.COPYBACK)
         cd.waitSamplingWhere(dut.dcache.logic.storeAckReg.toBoolean)
         cd.waitSampling(2)
         // SET_A ways 1..3: warm, clean.
@@ -885,19 +837,14 @@ class DcacheSpec extends AnyFunSuite {
           dut.probe.logic.loadCmdIn.payload.paddr #= addrA(4)
           dut.probe.logic.loadCmdIn.payload.size  #= Size.LONG
           dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
-          cd.waitSampling()
+          dut.probe.logic.loadCmdIn.payload.token #= 0
+          cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
+            dut.probe.logic.loadCmdIn.ready.toBoolean)
           dut.probe.logic.loadCmdIn.valid #= false
         }
         fork {
           if (storeCycle > 0) cd.waitSampling(storeCycle)
-          dut.probe.logic.storeIn.valid #= true
-          dut.probe.logic.storeIn.payload.paddr #= baseB
-          dut.probe.logic.storeIn.payload.data #= BigInt("11223344", 16)
-          dut.probe.logic.storeIn.payload.size #= Size.LONG
-          dut.probe.logic.storeIn.payload.useStrb #= false
-          dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
-          cd.waitSampling()
-          dut.probe.logic.storeIn.valid #= false
+          fireStore(dut, cd, baseB, BigInt("11223344", 16), Size.LONG, CacheMode.WRITETHROUGH)
         }
         cd.waitSampling(100)
         counting = false
@@ -973,14 +920,7 @@ class DcacheSpec extends AnyFunSuite {
 
       // Fire the COPYBACK store to the cold line: store-S2 detects a miss and
       // latches `pendingStoreMiss` (same shape as test (m) above).
-      dut.probe.logic.storeIn.valid #= true
-      dut.probe.logic.storeIn.payload.paddr #= storeBase + 4
-      dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
-      dut.probe.logic.storeIn.payload.size #= Size.LONG
-      dut.probe.logic.storeIn.payload.useStrb #= false
-      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
-      cd.waitSampling()
-      dut.probe.logic.storeIn.valid #= false
+      fireStore(dut, cd, storeBase + 4, BigInt("CAFEBABE", 16), Size.LONG, CacheMode.COPYBACK)
 
       // Fix-independent scenario sanity: was `loadCmdIn.valid` actually held
       // during the SAME cycle `pendingStoreMiss` first became visible True (the
@@ -1092,15 +1032,7 @@ class DcacheSpec extends AnyFunSuite {
       dut.dcache.logic.diagFaultExpected #= true
 
       val storePaddr = 0xAAAA2004L   // undecoded -> the write-allocate refill's AR/R DECERRs
-      dut.probe.logic.storeIn.valid #= true
-      dut.probe.logic.storeIn.payload.paddr #= storePaddr
-      dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
-      dut.probe.logic.storeIn.payload.size #= Size.LONG
-      dut.probe.logic.storeIn.payload.useStrb #= false
-      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
-      dut.probe.logic.storeIn.payload.precise #= false
-      cd.waitSampling()
-      dut.probe.logic.storeIn.valid #= false
+      fireStore(dut, cd, storePaddr, BigInt("CAFEBABE", 16), Size.LONG, CacheMode.COPYBACK)
 
       // diagFaultValid (a sticky Reg) becomes visible the cycle after REPLAY's
       // `missFault && refillReqIsStore` arm pulses diagFaultPulse (same cycle it
@@ -1157,14 +1089,7 @@ class DcacheSpec extends AnyFunSuite {
       // Way 0: warm + dirty via a COPYBACK-hit store (same recipe as the "EVICT_WR:
       // a dirty COPYBACK victim..." test above).
       load(dut, cd, addrK(0), Size.LONG, CacheMode.WRITETHROUGH)
-      dut.probe.logic.storeIn.valid #= true
-      dut.probe.logic.storeIn.payload.paddr #= addrK(0) + 4
-      dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
-      dut.probe.logic.storeIn.payload.size #= Size.LONG
-      dut.probe.logic.storeIn.payload.useStrb #= false
-      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
-      cd.waitSampling()
-      dut.probe.logic.storeIn.valid #= false
+      fireStore(dut, cd, addrK(0) + 4, BigInt("CAFEBABE", 16), Size.LONG, CacheMode.COPYBACK)
       cd.waitSamplingWhere(dut.dcache.logic.storeAckReg.toBoolean)
       cd.waitSampling(2)
       val setIdx = SET.toInt
@@ -1444,17 +1369,17 @@ class DcacheSpec extends AnyFunSuite {
   //
   // WHAT THIS PINS. Task P5.4's brief claimed the maintenance walk could share the
   // store path's array read port and AXI write registers "safely because excActive
-  // guarantees the load FSM / store-S0..S2 pipeline are idle". That claim is FALSE as
+  // guarantees the load FSM / store-S0..S3 pipeline are idle". That claim is FALSE as
   // stated, and is the same bug class this file already fixed twice (see EVICT_WR's
   // revision history, ~L691, and `evictAwDone`'s, ~L344): `excActive` only stops the LS
   // EU issuing anything NEW, while an OLDER, already-COMMITTED store drains out of the
   // StoreQueue completely asynchronously.
   //
   // The scenario below is the minimal, concrete corruption: a COPYBACK store is
-  // presented (it merges on-chip and sets the dirty bit at its S2, several cycles
+  // presented (it merges on-chip and sets the dirty bit at its S3, several cycles
   // later), and a Line-scope CPUSH of that SAME line is requested one cycle after.
   // If the walk starts immediately it (a) steals rdSet/rdEn from the store's own S1
-  // read, and (b) samples `dirtys` BEFORE the store's S2 sets it -- so it sees a clean
+  // read, and (b) samples `dirtys` BEFORE the store's S3 sets it -- so it sees a clean
   // line, pushes nothing, and the store's data is silently LOST (memory keeps the old
   // value forever, and the walk reports success).
   //
@@ -1482,22 +1407,15 @@ class DcacheSpec extends AnyFunSuite {
           cd.waitSampling()
           val walking = dut.dcache.logic.maintWalkingDbg.toBoolean
           val idle    = dut.dcache.logic.dcIdleForMaint.toBoolean
-          val stInPipe = dut.dcache.logic.stS2Valid.toBoolean
+          val stInPipe = dut.dcache.logic.stS2Valid.toBoolean ||
+                         dut.dcache.logic.stS3Valid.toBoolean
           if (walking && !idle) violations += 1
           if (walking && stInPipe) walkedWhileStoreInPipe += 1
         }
       }
 
-      // Present the COPYBACK store (1-cycle Flow pulse) ...
-      dut.probe.logic.storeIn.valid #= true
-      dut.probe.logic.storeIn.payload.paddr #= base + 4
-      dut.probe.logic.storeIn.payload.data #= BigInt("DEADBEEF", 16)
-      dut.probe.logic.storeIn.payload.size #= Size.LONG
-      dut.probe.logic.storeIn.payload.useStrb #= false
-      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
-      dut.probe.logic.storeIn.payload.precise #= false
-      cd.waitSampling()
-      dut.probe.logic.storeIn.valid #= false
+      // Accept the COPYBACK store through the real Stream handshake ...
+      fireStore(dut, cd, base + 4, BigInt("DEADBEEF", 16), Size.LONG, CacheMode.COPYBACK)
 
       // ... and request the CPUSH of that same line IMMEDIATELY -- while the store is
       // still only at S0/S1 and has NOT yet merged or set its dirty bit.
@@ -1509,11 +1427,11 @@ class DcacheSpec extends AnyFunSuite {
         s"the maintenance walk was ACTIVE on $violations cycle(s) when the D-cache was not idle " +
         "for it -- the WAIT quiesce self-check did not hold it off")
       assert(walkedWhileStoreInPipe == 0,
-        s"the maintenance walk ran on $walkedWhileStoreInPipe cycle(s) while a store occupied S2 " +
+        s"the maintenance walk ran on $walkedWhileStoreInPipe cycle(s) while a store occupied S2/S3 " +
         "-- it would steal the shared array read/write port from the store's own RMW")
 
       // THE PAYLOAD ASSERTION: the store's data reached memory via the CPUSH. If the
-      // walk had started early it would have sampled `dirtys` before the store's S2 set
+      // walk had started early it would have sampled `dirtys` before the store's S3 set
       // it, pushed nothing, and left memory holding the ORIGINAL preloaded bytes.
       assert(mem.peekByte(base + 4) == 0xDE && mem.peekByte(base + 5) == 0xAD &&
              mem.peekByte(base + 6) == 0xBE && mem.peekByte(base + 7) == 0xEF,
@@ -1524,41 +1442,10 @@ class DcacheSpec extends AnyFunSuite {
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // (P5.4-f) POST-P5.4-REVIEW REGRESSION #1 -- the ONE-CYCLE window (P5.4-e's mirror
-  // image): a store presented on EXACTLY the cycle the walk's `WAIT` falls through to
-  // `READ`.
-  //
-  // P5.4-e (above) presents the store FIRST and the maintenance command after, so by
-  // the time `WAIT` evaluates, the store is already visible in a REGISTER (`s0Valid`)
-  // and `dcIdleForMaint` correctly holds the walk off. This test reverses the order:
-  // the maintenance command is latched first, and the store is presented on the single
-  // cycle the walk sits in `WAIT` with every one of `dcIdleForMaint`'s REGISTER terms
-  // still idle. `storePort` is an unbuffered `Flow` with no backpressure, so that
-  // store WILL enter the pipe next cycle regardless -- and pre-fix `dcIdleForMaint`
-  // omitted the live combinational `storePort.valid`, so `WAIT` fell through to `READ`
-  // on precisely that cycle and the store ran its S0/S1/S2 CONCURRENTLY with the walk.
-  //
-  // The corruption that follows is the same silent one P5.4-e pins, reached through a
-  // different door: the warmed line lives in way 0 (fresh cache, round-robin victim
-  // starts at 0), so the walk's very first `CHECK` samples `dirtys(0)(set)` two cycles
-  // before the store's S2 sets it -- it sees a CLEAN line, pushes nothing, advances,
-  // and reports success. Memory keeps the ORIGINAL bytes forever (PUSH_LOST /
-  // WTSTORE_LOST). Pre-fix this ALSO trips the file's own FAILURE-severity sim assert
-  // "a STORE was in the S0..S2 pipeline while a cache-maintenance walk was actively
-  // running"; post-fix neither happens.
-  //
-  // NOTE ON WHY THE STORE IS PRESENTED DURING `WAIT` AND NOT DURING `walking`: a store
-  // presented while the walk is genuinely mid-array-walk is, by design, a CALLER
-  // CONTRACT VIOLATION that the shipped FAILURE-severity assert exists to catch (the
-  // `Flow` cannot be back-pressured, so `s0Valid` would rise no matter what the RTL
-  // does). The reachable, fixable race is exactly this `WAIT`-cycle one. The
-  // additional `maintUsesPort` S1-arbiter interlock added by the same review is
-  // defence in depth BEHIND that assert -- it converts what would otherwise be a
-  // silently-wrong read into a bounded hold -- and so is not separately observable in
-  // a test that must run against the asserts as shipped.
-  // ═══════════════════════════════════════════════════════════════════════════
-  test("a store presented on the walk's WAIT-fallthrough cycle is not raced by the walk",
+  // Stream-era mirror case: maintenance is latched first, then a store holds valid
+  // through WAIT/walking.  The cache must lower ready, complete the walk, accept the
+  // unchanged descriptor once, and preserve it for the following push.
+  test("a store held across a maintenance walk is backpressured then accepted exactly once",
        VerilatorTest) {
     sharedCompiled.doSim { dut =>
       val (cd, mem) = initDut(dut)
@@ -1575,7 +1462,8 @@ class DcacheSpec extends AnyFunSuite {
           cd.waitSampling()
           val walking = dut.dcache.logic.maintWalkingDbg.toBoolean
           val idle    = dut.dcache.logic.dcIdleForMaint.toBoolean
-          val stInPipe = dut.dcache.logic.stS2Valid.toBoolean
+          val stInPipe = dut.dcache.logic.stS2Valid.toBoolean ||
+                         dut.dcache.logic.stS3Valid.toBoolean
           if (walking && !idle) violations += 1
           if (walking && stInPipe) walkedWhileStoreInPipe += 1
         }
@@ -1586,33 +1474,52 @@ class DcacheSpec extends AnyFunSuite {
       // whole datapath (registers) idle. This is the fall-through cycle.
       maintPulse(dut, cd, push = true, invalidate = false, SCOPE_LINE, SEL_DC, base)
 
-      // Present the COPYBACK store DURING that exact cycle.
+      // Present the COPYBACK store during WAIT and obey the Stream contract: keep
+      // valid and payload stable until the cache reopens admission.
       dut.probe.logic.storeIn.valid #= true
       dut.probe.logic.storeIn.payload.paddr #= base + 4
       dut.probe.logic.storeIn.payload.data #= BigInt("DEADBEEF", 16)
       dut.probe.logic.storeIn.payload.size #= Size.LONG
       dut.probe.logic.storeIn.payload.useStrb #= false
+      dut.probe.logic.storeIn.payload.strb #= 0
+      dut.probe.logic.storeIn.payload.lineData #= 0
       dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
       dut.probe.logic.storeIn.payload.precise #= false
-      cd.waitSampling()
+      sleep(1)
+      var heldCycles = 0
+      while (!dut.probe.logic.storeIn.ready.toBoolean && heldCycles < 2000) {
+        assert(dut.probe.logic.storeIn.valid.toBoolean, "held store valid dropped")
+        assert(dut.probe.logic.storeIn.payload.paddr.toLong == base + 4,
+          "held store address changed under maintenance backpressure")
+        cd.waitSampling()
+        heldCycles += 1
+      }
+      assert(heldCycles > 0, "maintenance did not actually backpressure the store")
+      assert(heldCycles < 2000, "maintenance never reopened store admission")
+      cd.waitSamplingWhere(dut.probe.logic.storeIn.valid.toBoolean &&
+        dut.probe.logic.storeIn.ready.toBoolean)
       dut.probe.logic.storeIn.valid #= false
-
-      maintWait(dut, cd, budget = 2000)
-      cd.waitSampling(6)
+      cd.waitSamplingWhere(dut.dcache.logic.storeAckReg.toBoolean)
+      cd.waitSampling(3)
 
       assert(violations == 0,
-        s"the maintenance walk was ACTIVE on $violations cycle(s) when the D-cache was not " +
-        "idle for it -- dcIdleForMaint missed the live storePort.valid term")
+        s"the maintenance walk was ACTIVE on $violations cycle(s) when resident D-cache " +
+        "resources were not quiesced")
       assert(walkedWhileStoreInPipe == 0,
         s"the maintenance walk ran on $walkedWhileStoreInPipe cycle(s) while a store occupied " +
-        "S2 -- it steals the shared array read port from the store's own RMW")
+        "S2/S3 -- it would collide with the store's own lookup/write")
 
-      // THE PAYLOAD ASSERTION: the store's data reached memory via the CPUSH.
+      // The first push precedes the backpressured store.  Once admitted, the store
+      // must be resident+dirty exactly once; a second push proves its payload was
+      // neither lost nor duplicated.
+      assert(load(dut, cd, base + 4, Size.LONG, CacheMode.COPYBACK) == BigInt("DEADBEEF", 16),
+        "backpressured store did not update the resident line")
+      assert(anyDirtyIn(dut, base), "accepted COPYBACK store did not mark the line dirty")
+      maintPulse(dut, cd, push = true, invalidate = false, SCOPE_LINE, SEL_DC, base)
+      maintWait(dut, cd, budget = 2000)
       assert(mem.peekByte(base + 4) == 0xDE && mem.peekByte(base + 5) == 0xAD &&
              mem.peekByte(base + 6) == 0xBE && mem.peekByte(base + 7) == 0xEF,
-        f"the store was LOST: CPUSH pushed stale data. mem[base+4..7] = " +
-        f"${mem.peekByte(base+4)}%02x${mem.peekByte(base+5)}%02x" +
-        f"${mem.peekByte(base+6)}%02x${mem.peekByte(base+7)}%02x, expected deadbeef")
+        "second CPUSH did not write the accepted store payload exactly once")
       assert(mem.peekByte(base + 0) == memByte(base + 0), "line byte +0 corrupted")
       assert(mem.peekByte(base + 15) == memByte(base + 15), "line byte +15 corrupted")
       assert(!anyDirtyIn(dut, base), "the line must be clean after the push completed")
@@ -1633,7 +1540,7 @@ class DcacheSpec extends AnyFunSuite {
   // during `WAIT`), which lets the pending miss drain normally while `busy` keeps
   // `WAIT` held off.
   //
-  // Cycle alignment (deliberate, this is a 1-cycle-precision test): the store pulse
+  // Cycle alignment (deliberate, this is a 1-cycle-precision test): the store fire
   // returns with `s0Valid` set; +1 cycle puts the store in S1; the `maintPulse` is then
   // sampled on the store's S2 cycle, so `maintBusyReg` is already set on the cycle
   // `pendingStoreMiss` first reads True. With the `maintBusyReg` form this hangs (the
@@ -1650,15 +1557,7 @@ class DcacheSpec extends AnyFunSuite {
 
       // Present the COPYBACK store to a non-resident line: its S2 latches
       // `pendingStoreMiss` (post-commit write-allocate).
-      dut.probe.logic.storeIn.valid #= true
-      dut.probe.logic.storeIn.payload.paddr #= base + 4
-      dut.probe.logic.storeIn.payload.data #= BigInt("CAFEBABE", 16)
-      dut.probe.logic.storeIn.payload.size #= Size.LONG
-      dut.probe.logic.storeIn.payload.useStrb #= false
-      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
-      dut.probe.logic.storeIn.payload.precise #= false
-      cd.waitSampling()                 // sampled: s0Valid rises
-      dut.probe.logic.storeIn.valid #= false
+      fireStore(dut, cd, base + 4, BigInt("CAFEBABE", 16), Size.LONG, CacheMode.COPYBACK)
       cd.waitSampling()                 // store now in S1
 
       // Sampled on the store's S2 cycle => maintBusyReg is set on the very cycle
@@ -1830,6 +1729,69 @@ class DcacheSpec extends AnyFunSuite {
       assert(responses.map(_._2) == addrs.map(a => expected(a, 4)),
         s"responses must remain in accept order: got ${responses.map(_._2)}")
       cd.waitSampling(4)
+    }
+  }
+
+  test("mixed resident loads and a waiting store make bounded read-port progress",
+       VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val loadBase  = 0x7E00L
+      val storeBase = 0x7F40L
+      preload(mem, loadBase, 16)
+      preload(mem, storeBase, 16)
+      load(dut, cd, loadBase, Size.LONG, CacheMode.COPYBACK)
+      load(dut, cd, storeBase, Size.LONG, CacheMode.COPYBACK)
+      cd.waitSampling(6)
+
+      dut.probe.logic.loadCmdIn.valid #= true
+      dut.probe.logic.loadCmdIn.payload.vaddr #= loadBase
+      dut.probe.logic.loadCmdIn.payload.paddr #= loadBase
+      dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+      dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.COPYBACK
+      dut.probe.logic.loadCmdIn.payload.token #= 0
+      dut.probe.logic.storeIn.valid #= true
+      dut.probe.logic.storeIn.payload.paddr #= storeBase + 4
+      dut.probe.logic.storeIn.payload.data #= BigInt("DEADBEEF", 16)
+      dut.probe.logic.storeIn.payload.size #= Size.LONG
+      dut.probe.logic.storeIn.payload.useStrb #= false
+      dut.probe.logic.storeIn.payload.strb #= 0
+      dut.probe.logic.storeIn.payload.lineData #= 0
+      dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+      dut.probe.logic.storeIn.payload.precise #= false
+
+      var storeFired = false
+      var storeAcked = false
+      var sawOwed = false
+      var sawLoadYield = false
+      var loadFires = 0
+      var cycle = 0
+      while (!storeAcked && cycle < 24) {
+        cd.waitSampling()
+        cycle += 1
+        if (dut.probe.logic.loadCmdIn.valid.toBoolean &&
+            dut.probe.logic.loadCmdIn.ready.toBoolean) loadFires += 1
+        if (dut.probe.logic.loadCmdIn.valid.toBoolean &&
+            !dut.probe.logic.loadCmdIn.ready.toBoolean) sawLoadYield = true
+        if (dut.probe.logic.storeIn.valid.toBoolean &&
+            dut.probe.logic.storeIn.ready.toBoolean) {
+          assert(!storeFired, "store command fired more than once")
+          storeFired = true
+          dut.probe.logic.storeIn.valid #= false
+        }
+        if (dut.dcache.logic.storeReadOwed.toBoolean) sawOwed = true
+        if (dut.dcache.logic.storeAckReg.toBoolean) storeAcked = true
+      }
+      dut.probe.logic.loadCmdIn.valid #= false
+
+      assert(storeFired, "waiting store never crossed the Stream boundary")
+      assert(storeAcked, s"continuous resident loads starved the store for $cycle cycles")
+      assert(sawOwed && sawLoadYield,
+        "test did not exercise the registered one-load-then-store arbitration")
+      assert(loadFires >= 2, s"load side was not genuinely active during contention: $loadFires fires")
+      cd.waitSampling(6)
+      assert(load(dut, cd, storeBase + 4, Size.LONG, CacheMode.COPYBACK) ==
+        BigInt("DEADBEEF", 16), "the arbitrated store did not update the resident line")
     }
   }
 

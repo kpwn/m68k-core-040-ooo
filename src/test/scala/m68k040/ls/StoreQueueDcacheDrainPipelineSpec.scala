@@ -13,13 +13,10 @@ import spinal.lib._
 import spinal.lib.misc.database.Database
 import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
 
-/** Test-only elastic boundary between the real StoreQueue and DcachePlugin.
+/** Test-only visibility/throttle seam between the real StoreQueue and DcachePlugin.
   *
-  * Production still exposes the SQ drain as a Flow.  This one-entry fall-through
-  * adapter turns that pulse into a real Stream: a descriptor is accepted only on
-  * `fire`, remains stable under backpressure, and reaches the cache exactly once.
-  * The future production implementation may move the valid/ready storage into the
-  * SQ/cache themselves; the externally observed acceptance contract stays the same.
+  * Both production endpoints are Streams.  `boundaryReady` adds deliberate test
+  * backpressure without buffering or weakening the real valid/ready contract.
   */
 class SqDcacheDrainBoundaryPlugin(sq: StoreQueue) extends FiberPlugin {
   val logic = during build new Area {
@@ -27,32 +24,19 @@ class SqDcacheDrainBoundaryPlugin(sq: StoreQueue) extends FiberPlugin {
     val xlate = host[DTranslationService]
 
     val boundaryReady = in Bool ()
-    val pendingValid = RegInit(False)
-    val pendingPayload = Reg(DStoreCmd())
     val boundary = Stream(DStoreCmd())
-    boundary.valid := pendingValid || sq.io.drain.valid
+    boundary.valid := sq.io.drain.valid
     boundary.payload := sq.io.drain.payload
-    when(pendingValid) { boundary.payload := pendingPayload }
-    boundary.ready := boundaryReady
+    boundary.ready := boundaryReady && ds.store.ready
+    sq.io.drain.ready := boundary.ready
 
-    // A Flow producer cannot be backpressured.  The skid slot accepts one pulse;
-    // after that, seeing another pulse while the Stream is stalled is a real loss.
-    val sourceReady = !pendingValid || boundary.ready
-    when(boundary.fire) { pendingValid := False }
-    when(sq.io.drain.valid && sourceReady && (pendingValid || !boundary.ready)) {
-      pendingValid   := True
-      pendingPayload := sq.io.drain.payload
-    }
-    assert(!(sq.io.drain.valid && !sourceReady),
-      "SQ drain source overwrote a backpressured Stream descriptor", FAILURE)
-
-    ds.store.valid   := boundary.fire
+    ds.store.valid   := boundary.valid && boundaryReady
     ds.store.payload := boundary.payload
     sq.io.drainAck   := ds.storeAck
     sq.io.drainErr   := ds.storeErr
 
     val accepted = master(Flow(DStoreCmd()))
-    accepted.valid   := boundary.fire
+    accepted.valid   := sq.io.drain.fire
     accepted.payload := boundary.payload
     val ack = out Bool ()
     val err = out Bool ()
@@ -188,7 +172,11 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
                            peakOutstanding: Int, arCount: Int, awCount: Int,
                            wCount: Int, missCycles: Vector[Int],
                            sqCompletions: Vector[(Int, Int)],
-                           flushCycles: Vector[Int], flushFwdChecks: Int)
+                           flushCycles: Vector[Int], flushFwdChecks: Int,
+                           fullPipeCycles: Vector[Int], turnoverCycles: Vector[Int],
+                           sameLineBypassCycles: Vector[Int],
+                           missHadWaitingSource: Boolean,
+                           missAcceptedSameCycle: Boolean)
 
   private def modeName(m: SpinalEnumElement[CacheMode.type]): String = m.toString
 
@@ -318,6 +306,11 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
     var sqComps = Vector.empty[(Int, Int)]
     var flushCycles = Vector.empty[Int]
     var fwdChecks = 0
+    var fullPipeCycles = Vector.empty[Int]
+    var turnoverCycles = Vector.empty[Int]
+    var sameLineBypassCycles = Vector.empty[Int]
+    var missHadWaitingSource = false
+    var missAcceptedSameCycle = false
     var flushed = false
     var flushHigh = false
     var commitHigh = true
@@ -344,22 +337,30 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
       }
 
       sleep(1)
-      if (dut.bridge.logic.accepted.valid.toBoolean) {
+      // The query above describes descriptors that were already outstanding at the
+      // start of this cycle.  Check it before enqueueing a same-cycle acceptance;
+      // otherwise the first accepted descriptor would be compared against the
+      // deliberately idle address-0 query and create a false failure.
+      if (flushAtOutstanding > 0 && outstanding.nonEmpty) {
+        val d = outstanding.front
+        val req = reqByAddr(d.paddr)
+        assert(dut.fwdHitOut.toBoolean,
+          f"cycle=$cycle accepted committed store 0x${d.paddr}%08x stopped forwarding " +
+          s"before its ack; ack=${dut.bridge.logic.ack.toBoolean} flush=${dut.flushIn.toBoolean} " +
+          s"accepts=$accepts acks=$acks outstanding=$outstanding")
+        assert(dut.fwdDataOut.toBigInt == req.data,
+          f"forward data for 0x${d.paddr}%08x changed while in flight")
+        fwdChecks += 1
+      }
+      val acceptedNow = dut.bridge.logic.accepted.valid.toBoolean
+      val ackNow = dut.bridge.logic.ack.toBoolean
+      if (acceptedNow) {
         val d = acceptedDesc(dut)
         accepts :+= Event(cycle, d)
         outstanding.enqueue(d)
         peak = scala.math.max(peak, outstanding.size)
       }
-      if (flushAtOutstanding > 0 && outstanding.nonEmpty) {
-        val d = outstanding.front
-        val req = reqByAddr(d.paddr)
-        assert(dut.fwdHitOut.toBoolean,
-          f"accepted committed store 0x${d.paddr}%08x stopped forwarding before its ack")
-        assert(dut.fwdDataOut.toBigInt == req.data,
-          f"forward data for 0x${d.paddr}%08x changed while in flight")
-        fwdChecks += 1
-      }
-      if (dut.bridge.logic.ack.toBoolean) {
+      if (ackNow) {
         assert(outstanding.nonEmpty, s"cycle $cycle: D-cache ack without an accepted descriptor")
         localAckIdentity.foreach { actual =>
           assert(outstanding.front == actual,
@@ -378,7 +379,16 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
         awCount += 1
       if (dut.dcache.logic.axi.w.valid.toBoolean && dut.dcache.logic.axi.w.ready.toBoolean)
         wCount += 1
-      if (dut.dcache.logic.pendingStoreMiss.toBoolean) missCycles :+= cycle
+      if (dut.dcache.logic.storeMissDiscovered.toBoolean) {
+        missCycles :+= cycle
+        missHadWaitingSource = missHadWaitingSource || dut.bridge.logic.streamValid.toBoolean
+        missAcceptedSameCycle = missAcceptedSameCycle || acceptedNow
+      }
+      if (dut.dcache.logic.s0Valid.toBoolean && dut.dcache.logic.stS1Valid.toBoolean &&
+          dut.dcache.logic.stS2Valid.toBoolean && dut.dcache.logic.stS3Valid.toBoolean)
+        fullPipeCycles :+= cycle
+      if (acceptedNow && ackNow) turnoverCycles :+= cycle
+      if (dut.dcache.logic.stS2UsesS3Line.toBoolean) sameLineBypassCycles :+= cycle
       if (dut.sqCompValidOut.toBoolean)
         sqComps :+= ((cycle, dut.sqCompRobOut.toInt))
       if (dut.flushIn.toBoolean) flushCycles :+= cycle
@@ -407,7 +417,8 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
       s"saw ${accepts.size} accepts/${acks.size} acks, expected $expectedAcks; accepts=$accepts acks=$acks")
     assert(outstanding.isEmpty, s"unacknowledged accepted descriptors: $outstanding")
     Trace(accepts, acks, peak, arCount, awCount, wCount, missCycles,
-          sqComps, flushCycles, fwdChecks)
+          sqComps, flushCycles, fwdChecks, fullPipeCycles, turnoverCycles,
+          sameLineBypassCycles, missHadWaitingSource, missAcceptedSameCycle)
   }
 
   private def consecutive(events: Seq[Event], count: Int): Boolean =
@@ -451,7 +462,7 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
   test("warm COPYBACK drains accept and acknowledge unique descriptors at II1", VerilatorTest) {
     compiled.doSim("copybackIi1") { dut =>
       val (cd, mem) = initDut(dut)
-      val stores = (0 until 6).map { i =>
+      val stores = (0 until 8).map { i =>
         StoreReq(robId = 8 + i, paddr = 0x2000L + i * 0x10L,
                  data = BigInt(0x41000000L + i * 0x010101L))
       }
@@ -465,8 +476,15 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
       assert(tr.acks.map(_.desc) == expected, s"ack association/order: ${tr.acks}")
       assert(consecutive(tr.accepts, stores.size), s"COPYBACK accepts are not II1: ${tr.accepts}")
       assert(consecutive(tr.acks, stores.size), s"COPYBACK local acks are not II1: ${tr.acks}")
-      assert(tr.peakOutstanding >= 2,
+      assert(tr.peakOutstanding >= 4,
         s"test was vacuous: peak accepted-but-unacked depth=${tr.peakOutstanding}")
+      assert(tr.fullPipeCycles.nonEmpty,
+        s"S0/S1/S2/S3 were never simultaneously occupied: $tr")
+      assert(tr.turnoverCycles.nonEmpty,
+        s"no cycle accepted and acknowledged COPYBACK descriptors together: $tr")
+      assert(dut.sq.sendPtr.toInt == 0 && dut.sq.head.toInt == 0,
+        s"eight-entry drain did not wrap send/head cursors cleanly: " +
+        s"send=${dut.sq.sendPtr.toInt} head=${dut.sq.head.toInt}")
       assert(tr.awCount == 0 && tr.wCount == 0,
         s"COPYBACK hits leaked AXI writes: aw=${tr.awCount} w=${tr.wCount}")
       stores.foreach { s =>
@@ -512,6 +530,8 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
         "slot B bytes were lost by the following same-line RMW")
       assert(load(dut, cd, lineB + 4) == BigInt("11223344", 16),
         "following same-line descriptor did not merge")
+      assert(tr.sameLineBypassCycles.nonEmpty,
+        "same-line data passed without exercising the required S3-to-S2 bypass")
     }
   }
 
@@ -521,10 +541,13 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
       val hitA  = StoreReq(30, 0x4000L, BigInt("a0a1a2a3", 16))
       val missB = StoreReq(31, 0x5100L, BigInt("b0b1b2b3", 16))
       val hitC  = StoreReq(32, 0x4020L, BigInt("c0c1c2c3", 16))
-      val wtD   = StoreReq(33, 0x4030L, BigInt("d0d1d2d3", 16), mode = CacheMode.WRITETHROUGH)
+      val hitD  = StoreReq(33, 0x4030L, BigInt("d0d1d2d3", 16))
       val hitE  = StoreReq(34, 0x4040L, BigInt("e0e1e2e3", 16))
-      val stores = Seq(hitA, missB, hitC, wtD, hitE)
-      warm(dut, cd, mem, Seq(hitA.paddr, hitC.paddr, wtD.paddr, hitE.paddr))
+      val wtF   = StoreReq(35, 0x4050L, BigInt("f0f1f2f3", 16), mode = CacheMode.WRITETHROUGH)
+      val hitG  = StoreReq(36, 0x4060L, BigInt("01020304", 16))
+      val stores = Seq(hitA, missB, hitC, hitD, hitE, wtF, hitG)
+      warm(dut, cd, mem, Seq(hitA.paddr, hitC.paddr, hitD.paddr, hitE.paddr,
+                             wtF.paddr, hitG.paddr))
       preloadZero(mem, missB.paddr)
       stores.foreach(alloc(dut, cd, _))
       commitTailFirst(dut, cd, stores)
@@ -536,10 +559,14 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
       assert(tr.missCycles.nonEmpty, "cold COPYBACK descriptor never exercised the miss path")
       val missAckCycle = tr.acks.find(_.desc == descA(missB)).get.cycle
       val missDetected = tr.missCycles.head
-      assert(!tr.accepts.exists(e => e.cycle > missDetected && e.cycle < missAckCycle),
+      assert(tr.missHadWaitingSource,
+        "no younger descriptor was held valid on the COPYBACK-miss discovery cycle")
+      assert(!tr.missAcceptedSameCycle,
+        "a younger descriptor fired on the COPYBACK-miss discovery cycle")
+      assert(!tr.accepts.exists(e => e.cycle >= missDetected && e.cycle < missAckCycle),
         s"new descriptor accepted while miss barrier was active: accepts=${tr.accepts} miss=$missDetected..$missAckCycle")
-      val wtAckCycle = tr.acks.find(_.desc == descA(wtD)).get.cycle
-      val postWtAccept = tr.accepts.find(_.desc == descA(hitE)).get.cycle
+      val wtAckCycle = tr.acks.find(_.desc == descA(wtF)).get.cycle
+      val postWtAccept = tr.accepts.find(_.desc == descA(hitG)).get.cycle
       assert(postWtAccept >= wtAckCycle,
         s"younger COPYBACK accepted at $postWtAccept before WT ack at $wtAckCycle")
       assert(tr.arCount >= 1, "COPYBACK miss performed no refill read")

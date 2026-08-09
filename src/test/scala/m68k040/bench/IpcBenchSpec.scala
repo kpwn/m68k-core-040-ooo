@@ -240,6 +240,7 @@ class IpcBenchSpec extends AnyFunSuite {
       exc.dcLoadCmd.ready       := lsEu.excLoadCmdReady
       lsEu.excStoreValid        := exc.dcStore.valid
       lsEu.excStorePayload      := exc.dcStore.payload
+      exc.dcStore.ready         := lsEu.excStoreReady
       exc.sqDrained             := lsEu.sqEmptySig
       // Task P5.4/P5.5 parity with FullCoreSynth (this block mirrors it by hand; the
       // P5.4 `dcQuiesced` line was missing here, leaving the ExceptionUnit default of a
@@ -360,7 +361,9 @@ class IpcBenchSpec extends AnyFunSuite {
 
   /** A kernel: assembly source + the EXACT number of MACRO-instructions it retires
     * before stopping (the harness runs until that many commit). */
-  final case class Kernel(name: String, src: String, retiredInstrs: Int)
+  final case class Kernel(name: String, src: String, retiredInstrs: Int,
+                          copybackDtt: Boolean = false,
+                          expectedStoreDrains: Int = 0)
 
   /** Compile the core ONCE; return a handle that runs one kernel per call. Reusing
     * one compiled DUT across all kernels keeps this a single Verilator build. */
@@ -391,6 +394,25 @@ class IpcBenchSpec extends AnyFunSuite {
       var lastCommitCycle  = -1L
       val wbMap = scala.collection.mutable.HashMap[Int, WhiteboxCapture.Wb]()
 
+      // COPYBACK-store throughput observability.  Count real handshakes at every
+      // boundary; a valid pulse is deliberately not enough now that SQ -> D-cache
+      // is elastic.  These counters keep a poor macro-IPC result diagnostic instead
+      // of letting a starved cache pipe masquerade as a slow one.
+      var lsIssueFires      = 0
+      var sqAllocFires      = 0
+      var fastSqAllocs      = 0
+      var sqDrainFires      = 0
+      var dcStoreFires      = 0
+      var dcStoreAcks       = 0
+      var dcStoreHits       = 0
+      var dcStoreMisses     = 0
+      var lsIssueValidCyc   = 0
+      var drainValidCyc     = 0
+      var drainBlockedCyc   = 0
+      var maxSqAccepted     = 0
+      var maxSqResident     = 0
+      var maxDcOutstanding  = 0
+
       def isTempOnly(wb: WhiteboxCapture.Wb): Boolean =
         wb.intWrite && wb.dstArch >= 16 && !wb.nzvcWrite && !wb.xWrite
 
@@ -410,6 +432,32 @@ class IpcBenchSpec extends AnyFunSuite {
       }
 
       cd.onSamplings {
+        if (k.copybackDtt) {
+          if (dut.lsEu.issuePort.valid.toBoolean) lsIssueValidCyc += 1
+          if (dut.lsEu.issuePort.valid.toBoolean &&
+              dut.lsEu.issuePort.ready.toBoolean) lsIssueFires += 1
+          if (dut.lsEu.logic.sq.io.alloc.valid.toBoolean) {
+            sqAllocFires += 1
+            if (dut.lsEu.logic.fastStore.toBoolean) fastSqAllocs += 1
+          }
+          if (dut.lsEu.logic.sq.io.drain.valid.toBoolean) drainValidCyc += 1
+          if (dut.lsEu.logic.sq.io.drain.valid.toBoolean &&
+              !dut.lsEu.logic.sq.io.drain.ready.toBoolean) drainBlockedCyc += 1
+          if (dut.lsEu.logic.sq.io.drain.valid.toBoolean &&
+              dut.lsEu.logic.sq.io.drain.ready.toBoolean) sqDrainFires += 1
+          if (dut.dcache.logic.storePort.valid.toBoolean &&
+              dut.dcache.logic.storePort.ready.toBoolean) dcStoreFires += 1
+          if (dut.dcache.logic.storeAckReg.toBoolean) dcStoreAcks += 1
+          if (dut.dcache.logic.stS3Valid.toBoolean &&
+              dut.dcache.logic.stS3Hit.toBoolean) dcStoreHits += 1
+          if (dut.dcache.logic.storeMissDiscovered.toBoolean) dcStoreMisses += 1
+          maxSqAccepted = scala.math.max(maxSqAccepted,
+            dut.lsEu.logic.sq.acceptedHalves.toInt)
+          maxSqResident = scala.math.max(maxSqResident,
+            dut.lsEu.logic.sq.valids.count(_.toBoolean))
+          maxDcOutstanding = scala.math.max(maxDcOutstanding,
+            dut.dcache.logic.storeOutstanding.toInt)
+        }
         snapWb(dut.eu0.logic.wbObs); snapWb(dut.eu1.logic.wbObs); snapWb(dut.lsEu.logic.wbObs)
         // Branch EU writeback: no register/flag write — record a non-temp (it is a
         // macro instruction) and feed the handle so its commit-join succeeds.
@@ -468,11 +516,6 @@ class IpcBenchSpec extends AnyFunSuite {
       val ptmem     = AxiMemModel.attachFull(dut.dtlb.walkerAxi, cd, memCfg)
       val itlbPtmem = AxiMemModel.attachFull(dut.itlb.walkerAxi, cd, memCfg)
 
-      // MMU off (identity).
-      dut.ctrl.logic.mmuEnable #= false
-      dut.ctrl.logic.urp   #= 0
-      dut.ctrl.logic.srp   #= 0
-
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
       dut.rob.logic.flush.valid   #= false
@@ -483,6 +526,19 @@ class IpcBenchSpec extends AnyFunSuite {
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
 
+      // Program architectural controls only AFTER forkStimulus's reset has
+      // completed.  Programming these beside the initial port defaults silently
+      // lost the values to reset and made the COPYBACK benchmark take the precise
+      // MMU-off path.  Most kernels retain identity/MMU-off behavior; store-stream
+      // uses match-all transparent translations (VA==PA, no walker) with WT I-side
+      // and real COPYBACK D-side cache mode.
+      dut.ctrl.logic.mmuEnable #= k.copybackDtt
+      dut.ctrl.logic.urp   #= 0
+      dut.ctrl.logic.srp   #= 0
+      dut.ctrl.logic.itt0 #= (if (k.copybackDtt) 0x00FFC000L else 0L) // E|S|mask-all, WT
+      dut.ctrl.logic.itt1 #= 0
+      dut.ctrl.logic.dtt0 #= (if (k.copybackDtt) 0x00FFC020L else 0L) // E|S|mask-all, CB
+      dut.ctrl.logic.dtt1 #= 0
       dut.rob.logic.exc.ss.isp #= 0x00100000L
       dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       cd.waitSampling()
@@ -511,8 +567,30 @@ class IpcBenchSpec extends AnyFunSuite {
           }
         }
       }
-      // Let the last commit's cycle land in the histogram.
+      // Let the last commit's cycle land in the histogram.  For the COPYBACK
+      // throughput kernel, also drain the final committed store outside the IPC
+      // window so the boundary scoreboard can require exact command/ack counts.
       cd.waitSampling(2)
+      if (k.expectedStoreDrains > 0) {
+        var drainGuard = 0
+        while (dcStoreAcks < k.expectedStoreDrains && drainGuard < 1000) {
+          cd.waitSampling(); drainGuard += 1
+        }
+        assert(sqAllocFires >= k.expectedStoreDrains,
+          s"[${k.name}] only $sqAllocFires store allocations for ${k.expectedStoreDrains} architectural stores")
+        assert(fastSqAllocs == sqAllocFires,
+          s"[${k.name}] only $fastSqAllocs/$sqAllocFires allocations used the fast COPYBACK path")
+        assert(sqDrainFires == k.expectedStoreDrains,
+          s"[${k.name}] SQ drain handshakes=$sqDrainFires expected=${k.expectedStoreDrains}")
+        assert(dcStoreFires == k.expectedStoreDrains,
+          s"[${k.name}] D-cache store handshakes=$dcStoreFires expected=${k.expectedStoreDrains}")
+        assert(dcStoreAcks == k.expectedStoreDrains,
+          s"[${k.name}] terminal store acks=$dcStoreAcks expected=${k.expectedStoreDrains}")
+        assert(dcStoreHits == k.expectedStoreDrains && dcStoreMisses == 0,
+          s"[${k.name}] COPYBACK hits=$dcStoreHits misses=$dcStoreMisses expected all hits")
+        assert(maxSqAccepted >= 2 && maxDcOutstanding >= 2,
+          s"[${k.name}] pipeline never overlapped stores: sq=$maxSqAccepted dc=$maxDcOutstanding")
+      }
       assert(handle.result.size >= n,
         s"[${k.name}] only ${handle.result.size}/$n macro-instructions retired within $cap cycles")
 
@@ -530,12 +608,21 @@ class IpcBenchSpec extends AnyFunSuite {
       val dualCycles    = windowHisto.count(_ == 2)
 
       result = IpcResult(k.name, windowRetired, windowCycles, activeCycles, dualCycles)
+      if (k.copybackDtt) {
+        println(s"[store-path] lsIssue=$lsIssueFires sqAlloc=$sqAllocFires fastAlloc=$fastSqAllocs " +
+          s"sqDrainFire=$sqDrainFires dcStoreFire=$dcStoreFires ack=$dcStoreAcks " +
+          s"s3Hit=$dcStoreHits miss=$dcStoreMisses " +
+          s"issueValidCyc=$lsIssueValidCyc drainValidCyc=$drainValidCyc " +
+          s"drainBlockedCyc=$drainBlockedCyc maxSqResident=$maxSqResident " +
+          s"maxSqAccepted=$maxSqAccepted maxDcOutstanding=$maxDcOutstanding")
+      }
     }
     result
   }
 
   // ── Kernel suite ────────────────────────────────────────────────────────────
-  // All kernels: MMU off (identity), only implemented opcodes/EAs (reg-reg ALU,
+  // Kernels use identity addressing (MMU off, except store-stream's match-all
+  // transparent COPYBACK DTT), and only implemented opcodes/EAs (reg-reg ALU,
   // MOVEQ, MOVE, absolute & (An) loads/stores, Bcc). NO DIV/MUL/CHK.
 
   // 1. dependent-ALU: a long chain of dependent adds. Each add reads the previous
@@ -715,7 +802,26 @@ class IpcBenchSpec extends AnyFunSuite {
     Kernel("load-stream", src, setup.size + iters * (addrs.size + 2))
   }
 
-  // 5c. shift-stream: ALU SLOW-PATH (SHIFT) THROUGHPUT. This kernel exists to close a
+  // 5c. store-stream: real COPYBACK-hit StoreQueue→D-cache throughput. Match-all
+  // transparent translation keeps VA==PA but supplies COPYBACK mode. Six setup
+  // loads make the lines resident before the loop; the measured body is six
+  // independent stores plus loop control. Unlike `load/store`, no younger load can
+  // consume these stores by SQ forwarding, so sustained progress requires the SQ
+  // send cursor and D-cache S0/S1/S2/S3 drain pipeline to turn over.
+  def kStoreStream: Kernel = {
+    val iters = 60
+    val addrs = Seq(0x4200, 0x4210, 0x4220, 0x4230, 0x4240, 0x4250)
+    val setup = Seq("moveq #42,%d0", "moveq #60,%d7") ++
+      addrs.map(a => f"move.l 0x$a%x,%%d1")
+    val stores = addrs.map(a => f"move.l %%d0,0x$a%x")
+    val body = ".Lstst: " + stores.mkString(" ; ") +
+      " ; subq.l #1,%d7 ; bne.s .Lstst"
+    val src = setup.mkString(" ; ") + " ; " + body
+    Kernel("store-stream", src, setup.size + iters * (stores.size + 2),
+      copybackDtt = true, expectedStoreDrains = iters * stores.size)
+  }
+
+  // 5d. shift-stream: ALU SLOW-PATH (SHIFT) THROUGHPUT. This kernel exists to close a
   //     real BENCHMARK-COVERAGE GAP found by the 2026-08-09 EU-wide one-at-a-time-FSM
   //     audit: EVERY other kernel in this suite is shift-free and bit-field-free (see
   //     the `iq.aluSlowWakeup` note near the top of this file: "Inert for the shift-free
@@ -752,7 +858,7 @@ class IpcBenchSpec extends AnyFunSuite {
     Kernel("shift-stream", src, setup.size + iters * (shifts.size + 2))
   }
 
-  // 5d. shift-mixed: the AMPLIFIER the pure `shift-stream` kernel cannot show. The
+  // 5e. shift-mixed: the AMPLIFIER the pure `shift-stream` kernel cannot show. The
   //     pre-II1 gate was UNCONDITIONAL -- while a slow op occupied the pipe, that EU
   //     accepted NOTHING, so the machine dropped from 2-wide ALU issue to
   //     1-wide for the full 7-cycle window; and because the IQ maps oldest->port0 /
@@ -813,7 +919,8 @@ class IpcBenchSpec extends AnyFunSuite {
   }
 
   test("IPC microbenchmark suite", VerilatorTest) {
-    val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kLoadStream, kShiftStream, kShiftMixed, kBranchy, kHotLoop, kMixed, kCallReturn)
+    val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kLoadStream,
+      kStoreStream, kShiftStream, kShiftMixed, kBranchy, kHotLoop, kMixed, kCallReturn)
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))

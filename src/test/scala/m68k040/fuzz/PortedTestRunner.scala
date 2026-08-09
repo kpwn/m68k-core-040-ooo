@@ -13,6 +13,15 @@ object CachePosture {
   /** Harness-injected prologue: poke CACR.DE=1 + a cacheable identity/DTT mapping
     * over the test's working set before execution starts (Slice P6's §6.1 sweep). */
   case object ForceCacheableCopyback extends CachePosture
+
+  // The already-proven transparent-translation partition used by the D-cache
+  // performance programs. A set mask bit is "don't care", so 0x7F covers a
+  // full 2 GiB half rather than 128 MiB. Keeping the high half inhibited is
+  // essential: the harness observes completion through an AXI-visible store to
+  // 0xFFFF0000, which a copyback mapping could retain only in cache.
+  private[fuzz] val LowHalfCopybackTtr: BigInt = BigInt("007FE020", 16)
+  private[fuzz] val HighHalfInhibitedTtr: BigInt = BigInt("807FE060", 16)
+  private[fuzz] val CacrDataAndInstructionEnable: BigInt = BigInt("80008000", 16)
 }
 
 /** Outcome of running one m68k-ooo-ported directed asm test. */
@@ -228,6 +237,41 @@ object PortedTestRunner {
       cd.waitSampling(2)
       dut.wire.logic.seedValid #= false
       cd.waitSampling()
+
+      cachePosture match {
+        case CachePosture.AsWritten =>
+          // Preserve the existing boot posture exactly. In particular, do not
+          // add a cycle or write any architectural MMU/cache register here.
+          ()
+        case CachePosture.ForceCacheableCopyback =>
+          // Design §6.1 alternate posture. Cover the low 2 GiB (including the
+          // 0x40800000 program and normal RAM working sets) with identity/
+          // COPYBACK transparent translations on both instruction and data
+          // sides. Cover the high 2 GiB with identity/INHIBITED data translation
+          // so MMIO and the AXI-observed sentinel remain visible. Install the
+          // complete mapping before TC.E and before the first redirect.
+          dut.ctrl.logic.itt0 #= CachePosture.LowHalfCopybackTtr
+          dut.ctrl.logic.itt1 #= 0
+          dut.ctrl.logic.dtt0 #= CachePosture.LowHalfCopybackTtr
+          dut.ctrl.logic.dtt1 #= CachePosture.HighHalfInhibitedTtr
+          dut.rob.logic.exc.ss.cacr #= CachePosture.CacrDataAndInstructionEnable
+          dut.ctrl.logic.mmuEnable #= true
+          cd.waitSampling()
+
+          // Fail closed if the intended second posture silently decays into an
+          // AsWritten run because of a stale hierarchy name or non-sticky poke.
+          assert(dut.ctrl.logic.mmuEnable.toBoolean,
+            "ForceCacheableCopyback did not enable TC.E")
+          assert(dut.ctrl.logic.itt0.toBigInt == CachePosture.LowHalfCopybackTtr,
+            s"ForceCacheableCopyback ITT0 readback was 0x${dut.ctrl.logic.itt0.toBigInt.toString(16)}")
+          assert(dut.ctrl.logic.dtt0.toBigInt == CachePosture.LowHalfCopybackTtr,
+            s"ForceCacheableCopyback DTT0 readback was 0x${dut.ctrl.logic.dtt0.toBigInt.toString(16)}")
+          assert(dut.ctrl.logic.dtt1.toBigInt == CachePosture.HighHalfInhibitedTtr,
+            s"ForceCacheableCopyback DTT1 readback was 0x${dut.ctrl.logic.dtt1.toBigInt.toString(16)}")
+          assert(dut.rob.logic.exc.ss.cacr.toBigInt == CachePosture.CacrDataAndInstructionEnable,
+            s"ForceCacheableCopyback CACR readback was 0x${dut.rob.logic.exc.ss.cacr.toBigInt.toString(16)}")
+      }
+
       dut.fa.logic.redirect.valid   #= true
       dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling()

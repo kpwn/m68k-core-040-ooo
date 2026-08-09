@@ -222,6 +222,7 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     exc.dcLoadCmd.ready       := lsEu.excLoadCmdReady
     lsEu.excStoreValid        := exc.dcStore.valid
     lsEu.excStorePayload      := exc.dcStore.payload
+    exc.dcStore.ready         := lsEu.excStoreReady
     exc.sqDrained             := lsEu.sqEmptySig
     // Task P5.4/P5.5 parity with FullCoreSynth (this block mirrors it by hand; the
     // P5.4 `dcQuiesced` line was missing here, leaving the ExceptionUnit default of a

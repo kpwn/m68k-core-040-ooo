@@ -44,6 +44,7 @@ class RteSpec extends AnyFunSuite {
       exc.dcLoadBusy        := dc.loadBusy
       dc.store.valid   := exc.dcStore.valid
       dc.store.payload := exc.dcStore.payload
+      exc.dcStore.ready := dc.store.ready
       exc.dcStoreAck   := dc.storeAck
     }
   }
