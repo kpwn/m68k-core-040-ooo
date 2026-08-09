@@ -1,6 +1,6 @@
 # Fetch/Align Stage — Design
 
-**Status:** Draft for review
+**Status:** Historical baseline; the 2026-08-09 depth-3 ring addendum below is binding
 **Date:** 2026-05-31
 **Parent spec:** `docs/superpowers/specs/2026-05-31-m68k-040-ooo-architecture-design.md` (ch 1 Frontend; invariants #2 FMax, #3 plugin boundaries)
 **Builds on:** merged I-cache (`FetchService`) + predecode-on-miss (`FetchRsp.pred`).
@@ -28,7 +28,8 @@ Turn the I-cache's 8-byte fetch windows (+ per-word predecode) into a stream of 
 
 **Out of scope (later slices):**
 - The decode stage that consumes `DecodePacket` (and the real driver of `resume`).
-- Branch prediction (BTB/GShare/RAS) and branch-target computation in fetch — **no prediction this slice**; sequential fall-through + external `redirect`.
+- Further branch-predictor changes. BTB/gshare/RAS prediction was added by later
+  ratified slices and is intentionally unchanged by the depth-3 ring turnover update.
 - Loop-stream detector; the real `redirect` driver (backend mispredict).
 
 ---
@@ -44,10 +45,10 @@ Turn the I-cache's 8-byte fetch windows (+ per-word predecode) into a stream of 
 ```
 DecodePacket {                    // one m68k instruction handed to decode
   pc        : UInt(32)            // instruction start PC
-  words     : Vec(Bits(16), 5)    // opword + up to 4 buffered words (10 bytes max simple)
-  wordCount : UInt(3 bits)        // valid words in `words` (1..5; for complex = what was buffered)
+  words     : Vec(Bits(16), 10)   // live aligner visibility window
+  wordCount : UInt(4 bits)        // valid words in `words` (1..10)
   simple    : Bool                // predecode simple bit (false => complex)
-  lenWords  : UInt(3 bits)        // predecode length (meaningful iff simple)
+  lenWords  : UInt(4 bits)        // predecode length (meaningful iff simple)
   complex   : Bool                // !simple — decode/microcode resolves length
   fault     : Bool                // from FetchRsp.fault (translation/access fault at this PC)
 }
@@ -57,11 +58,16 @@ Output port: `Stream(Vec(DecodePacket, 2))` plus a per-cycle `slotValid: Vec(Boo
 ## 5. Components
 
 ### 5.1 `InstructionBuffer`
-- A queue of up to `BUF_WORDS` (= 12, i.e. 24 bytes) entries, each `{word: Bits(16), pred: ChunkPredecode}`.
+- A 20-word circular queue of `{word: Bits(16), pred: ChunkPredecode}`. The
+  aligner sees a 10-word head window and each fetch response pushes at most four
+  words. The extra capacity absorbs three outstanding 8-byte fetch windows while
+  retaining a live decode head.
 - **Enqueue:** when a `FetchRsp` arrives (8-byte window = 4 words + 4 preds), append the words at/after the fetch PC's position (the first fetch after a redirect may start mid-window: drop words before the decode PC). Each word carries its predecode chunk from `FetchRsp.pred`.
 - **Dequeue/shift:** the aligner consumes 0–N head words/cycle; shift the queue by the consumed count.
 - **Flush:** `redirect` clears it.
-- Holds ≥ two max simple instructions (2 × 5 words = 10 words ≤ 12). Implemented as a shift structure / small FIFO (LUTRAM/FF, async read on the hot path — invariant #2).
+- Implemented as a circular register ring: dequeue advances a head pointer and
+  enqueue writes only the tail slots. This avoids rebuilding the full buffer on
+  every shift while keeping the head read asynchronous (invariant #2).
 
 ### 5.2 `Aligner`
 Reads the head word + its predecode (and following words):
@@ -73,13 +79,43 @@ Reads the head word + its predecode (and following words):
 Output fires (`stream.valid`) when slot0 is emittable and the consumer is `ready`.
 
 ### 5.3 `FetchControl`
-- Issues `FetchService.cmd.pc = nextFetchPc` when buffer has room and no fetch is outstanding-beyond-capacity (the I-cache is single-outstanding; one cmd at a time, await `rsp`). Increments `nextFetchPc` by 8 per accepted fetch.
+- Tracks up to three accepted fetches in an in-order record ring. Each record owns
+  its redirect-stale bit and its first-window leading-word drop. The I-cache hit
+  pipeline returns responses in issue order, so the next response consumes the
+  record at the ring head while a new request allocates the tail.
+- Issues `FetchService.cmd.pc = nextFetchPc` when the IBuf reservation and record
+  capacity both permit it, incrementing `nextFetchPc` by 8 per accepted fetch.
+  The conservative landing-space invariant is
+  `ibufCount + 4*ringCount + 4 <= BUF_WORDS`: it reserves four words for every
+  existing response, including one arriving this cycle, plus the new request.
+- **Consume-and-replace invariant:** a full ring is available for issue when a
+  non-faulting head response is valid in that same cycle. Thus record capacity is
+  `ringCount < RING || (rsp.valid && !rsp.fault)`, not merely
+  `ringCount < RING`. A fault response intentionally receives no full-ring
+  turnover credit: `faultHold` first latches on this cycle, and the resident-hit
+  optimization must not admit an additional younger request at that boundary.
+  Non-full behavior is unchanged. On the full-ring
+  collision `head == tail`; response classification must read the old head
+  stale/drop record, while the clock edge writes the replacement tail record and
+  advances both pointers. Occupancy remains three. `rsp.valid` is registered and
+  independent of `cmd`, so this adds no combinational ready loop.
 - On `redirect`: `nextFetchPc := decodePc := redirect.payload`; flush buffer; ignore the in-flight response (staleness §6).
 - On `resume`: `nextFetchPc`/`decodePc` continue from `resume.payload` (used to restart after a complex stall, which may require refetching from that PC if the buffer was cleared past it).
 
 ## 6. Staleness / ordering
 
-The I-cache fetch port is single-outstanding (`cmd` back-pressured during a miss). `FetchControl` issues one `cmd` at a time and matches the `rsp` (which echoes `pc`). On `redirect`/`resume` mid-flight, a response for a pre-redirect PC is dropped (compare `rsp.pc` window-base against the current expected fetch PC; mismatch → discard). This keeps the buffer coherent with the decode PC.
+The I-cache resident-hit port is pipelined and returns accepted requests in order.
+The three-entry record ring associates each untagged response with the oldest
+request. A redirect/resume marks every existing record stale; an issue coincident
+with that redirect used the old fetch PC and is born stale as well. Its eventual
+response is discarded. The redirect's leading-word drop remains in `pendingDrop`
+for the first subsequently issued target window.
+
+Consume-and-replace does not weaken this rule. If response, replacement issue, and
+redirect coincide on a full ring, the response consumes the old head record, the
+replacement receives the same-cycle redirect-stale mark, and the redirect's drop
+belongs to the later target request. No response may observe the newly written
+tail metadata in place of the old head metadata.
 
 ## 7. Verification (end-to-end through the real frontend)
 
@@ -87,9 +123,23 @@ Host `ParamPlugin + IdentityTranslationPlugin + IcachePlugin + FetchAlignPlugin`
 1. **Sequential simple stream, 2-wide:** a run of 1-word simple ops (e.g. `MOVEQ`,`MOVE D0,D1`,…) emits two packets/cycle with correct `pc`/`lenWords`/`words`.
 2. **Mixed lengths:** `MOVE.L #imm32,Dn` (3 words) followed by `MOVEQ` (1) — correct boundaries, `words`/`wordCount`, PCs.
 3. **Window/line spanning:** an instruction whose words span two 8-byte fetch windows (and a 64-byte line) is emitted only once fully buffered, with correct bytes.
-4. **Complex stall→resume:** a complex instruction (e.g. `MULU`) emits a 1-wide `complex` packet, the aligner stalls; driving `resume` with the next PC continues the stream.
+4. **Complex stall→resume:** a deferred instruction (the directed fixture is
+   `NBCD (A0)`, opcode `0x4810`) emits a 1-wide `complex` packet, the aligner
+   stalls; driving `resume` with the next PC continues the stream.
 5. **Redirect:** mid-stream `redirect` flushes and restarts decode at the new PC; no stale packets.
 6. **Backpressure:** holding consumer `ready` low stalls the aligner without losing/duplicating packets.
+7. **Full-ring turnover:** reach `ringCount == 3`, present the head response while
+   the IBuf reservation permits another request, and require `cmd.fire` in that
+   same cycle. Prove both pointers advance, count stays three, and all responses
+   emerge in original request order.
+8. **Turnover redirect collision:** collide a full-ring head response, replacement
+   issue, and unaligned redirect. Prove all old-path records including the
+   replacement are discarded, then prove the target response applies its own
+   leading-word drop and is the first emitted packet.
+9. **Fault boundary:** with a full ring, inject a non-stale fault response and prove
+   no replacement command fires; the response frees one record and latches the
+   fault hold. This check prevents the hit-path optimization widening fault-path
+   speculation.
 
 These exercise **I-cache → predecode → align** together (the align test is a frontend integration test).
 
@@ -111,7 +161,10 @@ These exercise **I-cache → predecode → align** together (the align test is a
 - Resume semantics detail: does `resume` always require a refetch (buffer flushed) or can the buffer retain post-complex words? Baseline: flush at complex, refetch from `resume` PC (simplest; optimize later).
 
 ## 10. Known divergences / deferrals (logged)
-- No branch prediction / target calc; sequential fetch + external redirect. Taken branches fetch wrong-path until redirected (squashed downstream) — correct but not yet performant.
+- The later BTB/gshare/RAS predictor remains decode-directed: a correctly predicted
+  taken branch still redirects and restarts fetch. Fetch-directed prediction is a
+  separate design and is not part of this ring change.
 - Complex instructions are 1-wide and stall for `resume` (driven by tests now; real driver = decode slice).
-- Single-outstanding fetch (inherited from the I-cache); no fetch pipelining/multiple in-flight.
+- Three resident-hit fetches may be outstanding. Demand-refill ordering remains
+  blocking because `FetchRsp` itself is untagged.
 - No loop-stream detector.

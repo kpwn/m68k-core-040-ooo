@@ -10,10 +10,11 @@ import spinal.lib.misc.plugin.FiberPlugin
   * Aligner into a 2-wide DecodePacket stream (DecodeFeedService).
   *
   * Key design points:
-  *  - Single-outstanding fetch: one cmd in flight at a time.
-  *  - Leading-word drop on redirect/resume: only enqueue words from decodePc's
-  *    offset within the fetched 8-byte window.
-  *  - Staleness: in-flight rsp after a redirect/resume is silently dropped.
+  *  - Depth-3 in-order fetch ring: resident hits may occupy all three I-cache
+  *    stages, including same-cycle head-response/tail-replacement turnover.
+  *  - Per-request leading-word drop on redirect/resume: only enqueue words from
+  *    decodePc's offset within the fetched 8-byte target window.
+  *  - Per-request staleness: responses for pre-redirect requests are dropped.
   *  - Complex-stall: emit the complex packet once, then hold feed.valid low
   *    until resume. Emit-once is enforced by the `stalled` latch: when a complex
   *    packet fires, `stalled` latches True the next cycle and suppresses
@@ -226,9 +227,12 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val redirectThisCycle = redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid || predictFire
 
     // ---- FetchControl: issue fetches (DEPTH-3 multi-outstanding, ANGLE D) ----
-    // Issue while the ring has a free slot (!ringFull) — up to 3 in flight. Suppress
-    // fetching while holding an I-fetch fault OR while STOP-quiesced (wait for the
-    // redirect / IRQ-entry vector to clear it).
+    // Issue while the ring has a free slot — up to 3 in flight. A non-fault response
+    // consumes the HEAD this cycle, so it also makes room for a same-cycle replacement
+    // even when the pre-cycle count is full. `ic.rsp` is a registered Flow independent
+    // of `ic.cmd`, hence this creates no combinational ready loop. Suppress fetching
+    // while holding an I-fetch fault OR while STOP-quiesced (wait for the redirect /
+    // IRQ-entry vector to clear it).
     //
     // IBuf absorption (depth-3): the IBuf's own push.ready only reserves space for ONE
     // window (the push that lands this cycle). With up to 3 outstanding fetches, ALL three
@@ -240,9 +244,20 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // headroom. This SUPERSEDES the single-window push.ready for the issue decision and is
     // the no-overflow invariant: post-issue worst-case occupancy = cnt + (ringCount+1)*4
     // <= BUF_WORDS (cnt only shrinks via shift before those windows land).
+    // The landing reservation deliberately still counts the response arriving THIS
+    // cycle among `ringCount`: its up-to-4 words move from the outstanding reservation
+    // into the IBuf at the edge, while the replacement adds a new 4-word reservation.
+    // Thus the existing `cnt + (ringCount+1)*4` bound remains both safe and exact for
+    // the worst case; only the record-slot capacity needs post-consume credit.
     val ibufRoomForIssue =
       (ibuf.io.cnt +^ ((ringCount +^ U(1)) * U(4))) <= U(ibuf.BUF_WORDS)
-    ic.cmd.valid      := started && !ringFull && ibufRoomForIssue && !stalled && !faultHold && !quiesce
+    // Only a NON-FAULT response earns full-ring turnover credit. On a fault,
+    // `faultHold` first latches at this edge; admitting a replacement from the
+    // pre-edge `!faultHold` value would widen speculation by one younger request.
+    // When the ring is not full, behavior remains exactly as before.
+    val fullRingTurnover = ic.rsp.valid && !ic.rsp.payload.fault
+    val ringSlotAvailable = !ringFull || fullRingTurnover
+    ic.cmd.valid      := started && ringSlotAvailable && ibufRoomForIssue && !stalled && !faultHold && !quiesce
     ic.cmd.payload.pc := fetchPc
 
     when(ic.cmd.fire) {
@@ -317,8 +332,10 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
 
     // ---- Ring occupancy update (single driver for ringCount) ----
     // +1 when a fetch issues, -1 when a response is consumed; both can happen the same
-    // cycle (steady-state: one in / one out -> count unchanged). The issue/rsp guards
-    // above (!ringFull / ringHead consume) keep this in [0, RING].
+    // cycle (steady-state: one in / one out -> count unchanged). At full turnover
+    // `ringHead == ringTail`: rspStaleHead/rspDropHead read the OLD record
+    // combinationally, while the replacement metadata is written at the edge and both
+    // pointers advance. The availability/reservation guards keep count in [0, RING].
     val issFire = ic.cmd.fire
     val rspFire = ic.rsp.valid
     when(issFire && !rspFire) {
