@@ -16,11 +16,14 @@ The line-4 single-operand family on data registers: **CLR, NEG, NEGX, NOT, TST, 
 - **NEGX.B/.W/.L** (`0100 0000 ss …`): Dn := 0 − Dn − X; **NZVCX** (Z is CLEARED-only — preserves Z if result 0, the 68k NEGX/SUBX rule); partial merge. Reads X.
 - **NOT.B/.W/.L** (`0100 0110 ss …`): Dn := ~Dn; **NZ, V=0, C=0**; partial merge.
 - **TST.B/.W/.L** (`0100 1010 ss …`): test Dn(size); **NZ, V=0, C=0**; NO write.
+- **TST.W/TST.L An** (`0x4A48–0x4A4F` / `0x4A88–0x4A8F`, 68020+): the
+  address-register-direct read-only forms are also landed, simple/one-word. `TST.B An`
+  remains illegal because byte-size address-register operands do not exist.
 - **SWAP** (`0100 1000 0100 0rrr`): swap Dn[31:16]↔Dn[15:0] (full-32 write); **NZ from the 32-bit result, V=0, C=0**.
 - **EXT.W** (`0100 1000 1000 0rrr`): sign-extend Dn[7:0]→Dn[15:0] (.W, preserve upper16); **EXT.L** (`…11000 0rrr`): Dn[15:0]→Dn[31:0] (full-32); **EXTB.L** (`0100 1001 1100 0rrr`, 68020+): Dn[7:0]→Dn[31:0]. NZ, V=0, C=0.
 - **TAS** (`0100 1010 11 000rrr`): test Dn[7:0] → set **N/Z** from the byte, V=0, C=0; then set Dn[7] := 1 (byte write, partial merge). (The memory form is the atomic RMW — deferred.)
 
-**Out:** ALL memory-destination forms (CLR/NEG/NEGX/NOT/TST-mem, TAS-mem atomic) → deferred to the mem-RMW slice (TST-mem is load+flag, CLR-mem is store-0, NEG/NOT-mem are RMW, TAS-mem is atomic-RMW); MOVE from/to SR/CCR/USP, MOVEM, JMP/JSR/NBCD/PEA/LEA (other line-4 ops — separate slices).
+**Out:** ALL memory-destination forms (CLR/NEG/NEGX/NOT/TST-mem, TAS-mem atomic) → deferred to the mem-RMW slice (TST-mem is load+flag, CLR-mem is store-0, NEG/NOT-mem are RMW, TAS-mem is atomic-RMW); write-capable CLR/NEG/NEGX/NOT An-direct forms remain illegal; MOVE from/to SR/CCR/USP, MOVEM, JMP/JSR/NBCD/PEA/LEA (other line-4 ops — separate slices).
 
 ## 3. Components & dataflow
 

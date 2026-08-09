@@ -180,6 +180,28 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x4807) == cp(true, 1))
     assert(classify(0x4810) == cp(false, 0))
   }
+  test("68020+ TST An partition admits WORD/LONG only and no write-capable unary op") {
+    for {
+      size <- 0 until 4
+      an   <- 0 until 8
+    } {
+      val op = 0x4A00 | (size << 6) | 0x0008 | an
+      val expected = if (size == 1 || size == 2) cp(true, 1) else cp(false, 0)
+      assert(classify(op) == expected, f"TST size=$size A$an op=0x$op%04x")
+    }
+
+    // Mode 001 is legal here only because TST is read-only. These four sibling
+    // unary families write their operand and must keep rejecting address registers.
+    for {
+      unary <- Seq(0x0, 0x2, 0x4, 0x6)       // NEGX, CLR, NEG, NOT
+      size  <- 0 until 3
+      an    <- 0 until 8
+    } {
+      val op = 0x4000 | (unary << 8) | (size << 6) | 0x0008 | an
+      assert(classify(op) == cp(false, 0),
+        f"write unary=$unary size=$size A$an op=0x$op%04x")
+    }
+  }
   test("DIVU.W/DIVS.W (class 8 opmode 3/7) + MULU.W/MULS.W (class C) -> simple; An-direct MUL EA complex") {
     assert(classify(0x80C1) == cp(true,1))   // DIVU.W D1,D0 (reg divisor, 1 word)
     assert(classify(0x81C1) == cp(true,1))   // DIVS.W D1,D0

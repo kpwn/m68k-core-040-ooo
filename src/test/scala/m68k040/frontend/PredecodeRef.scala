@@ -222,7 +222,10 @@ object PredecodeRef {
         // Memory-EA NBCD remains deferred, so keep this exact 13-bit pattern rather
         // than widening the generic unary-EA table.
         val isNbcd  = is13 == 0x0900
-        val isUnary = isUnaryArith || isSwap || isExtW || isExtL || isExtbL || isTas || isNbcd
+        // 68020+ admits address-register direct for read-only TST.W/TST.L. TST.B An
+        // remains illegal, as do write-capable CLR/NEG/NEGX/NOT on An.
+        val isTstAn = u4o == 0xA && u4mode == 1 && (u4ss == 1 || u4ss == 2)
+        val isUnary = isUnaryArith || isSwap || isExtW || isExtL || isExtbL || isTas || isNbcd || isTstAn
         // CLR/NEG/NEGX/NOT/TST <ea> mem-dest (RMW): mode != 000, ss != 11, oooo in
         // {0,2,4,6,A}, bit8=0. In-scope MEMSIMPLE dest -> opword + EA ext. SWAP/EXT/TAS
         // are Dn-only (mode 000); TAS-mem deferred.
