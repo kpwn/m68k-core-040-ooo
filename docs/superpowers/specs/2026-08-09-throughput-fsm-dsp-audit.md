@@ -111,7 +111,7 @@ boundary**.
 |---|---:|---:|---|---|
 | integer `MulCore` | 4 | nominal 1 / 1 | `DivEuPlugin` makes issue about II=3 and single-outstanding | only one output register; DSP A/B/M registers are unused |
 | divider | 0 | about 66 / 67 | single iterative context | keep iterative unless a measured workload justifies a different algorithm |
-| MOVEM decode arithmetic | 2 | combinational | not a queue | accidental DSP cascade on a failing decode timing path; strength-reduce |
+| MOVEM decode arithmetic | 2 before strength reduction | combinational | not a queue | shift/mux/negate replacement implemented and simulation-gated; synthesized DSP/FMax confirmation pending |
 | FPU | not implemented | draft only | draft is explicitly busy-gated/single-outstanding | amend before implementation: fixed-latency FADD/FMUL should be elastic II=1 |
 
 All six synthesized DSP48s are accounted for: four in the integer multiplier and
@@ -146,13 +146,16 @@ at a time and cannot prove this contract.
 
 ### 4.2 MOVEM strength reduction
 
-`DecodeStage` computes `emitted * step` and `step * numThisCycle` even though
-`step` is only ±2/±4, `emitted` is 0–16, and the per-cycle count is 1/2.
-Synthesis maps this to the other two DSP48E2s. The routed endpoint is a measured
-4.094 ns, 12-level path with WNS -0.112 ns at 250 MHz. Replace the final delta
-with a left shift plus optional negate, and the running update with a select
-between `step` and `step << 1`. This should remove two DSPs and improve FMax
-without adding latency or state. It is the highest-confidence P0 cleanup.
+`DecodeStage` formerly computed `emitted * step` and `step * numThisCycle` even
+though `step` is only ±2/±4, `emitted` is 0–16, and the per-cycle count is 1/2.
+Synthesis mapped this to the other two DSP48E2s. The routed endpoint was a
+measured 4.094 ns, 12-level path with WNS -0.112 ns at 250 MHz. The RTL now uses
+a widened count left shift plus optional negate for the final delta, and selects
+between `step` and `step << 1` for the running update. No latency or state was
+added. Directed decode covers every offset and both ±64 final deltas for all 16
+registers; 11/11 decode and 8/8 MOVEM lock-step tests pass. `test-fast` remains
+at its 133/134 baseline with only `PredecodeRefSpec` failing. Confirmation that
+both DSPs disappear and the endpoint improves awaits the shared Vivado window.
 
 ### 4.3 FPU draft
 
@@ -215,8 +218,8 @@ debt; suppressing or ignoring it would make the gate less trustworthy.
 
 1. Run the paired routed FMax/LUT gate for the landed LSU/VIPT pipeline when the
    serialized Vivado window is free. Do not infer closure from simulation.
-2. Strength-reduce both MOVEM multipliers. This removes two DSPs and a measured
-   timing failure without changing sequencing.
+2. Verify the landed MOVEM strength reduction removes both decode DSPs and the
+   measured timing failure in the paired routed gate.
 3. Convert the existing ALU slow stages into a real elastic pipeline.
 4. Reconcile the binding MUL architecture, then implement the four-stage II=1
    DSP pipeline and completion protocol.

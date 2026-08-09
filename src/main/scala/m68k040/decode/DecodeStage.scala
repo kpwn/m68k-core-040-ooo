@@ -392,6 +392,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val movemImm0 = (movemBaseDisp.asSInt + movemOff).asBits
     val movemImm1 = (movemBaseDisp.asSInt + movemOff + movemStep).asBits
     val movemNumThisCycle = Mux(movemHas1, U(2, 3 bits), U(1, 3 bits))     // 2, or 1 odd tail
+    // `movemNumThisCycle` is exactly 1/2.  Express the running advance as a
+    // select between step and 2*step so synthesis cannot infer a general
+    // multiplier on the decode path.
+    val movemCycleDelta = Mux(movemHas1, (movemStep << 1).resize(32), movemStep)
 
     // The two move µops this cycle. movemFirst marks the macro boundary on the VERY FIRST
     // emitted move of the whole MOVEM (movemEmitted===0) only — UNLESS a snapshot µop
@@ -434,7 +438,15 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // Widen to 8 bits FIRST (still all-zero in the new top bits for any real count <=16,
     // so the value's own MSB never lands on the new sign bit) THEN reinterpret as signed —
     // `.resize` on a UInt zero-extends, unlike `.asSInt` on the narrow width directly.
-    val movemAnDelta = Mux(movemDoAnUpd, (movemEmitted.resize(8 bits).asSInt.resize(32) * movemStep).resize(32), S(0, 32 bits))
+    // emitted is 0..16 and the element size is exactly 2/4 bytes.  Shift the
+    // zero-extended count and optionally negate for predecrement instead of
+    // inferring the former 8x32 signed DSP cascade.  Widening before the shift
+    // preserves the all-16 case called out above.
+    val movemCountWords = (movemEmitted.resize(32) << 1).resize(32)
+    val movemCountBytes = Mux(movemSizeLong,
+      (movemCountWords << 1).resize(32), movemCountWords).asSInt
+    val movemSignedDelta = Mux(movemRev, -movemCountBytes, movemCountBytes)
+    val movemAnDelta = Mux(movemDoAnUpd, movemSignedDelta, S(0, 32 bits))
     val movemAnUop = MicroOpAssembler.movemAnUpdUop(
       an = movemAnReg, signedDelta = movemAnDelta,
       valid = True, pc = movemPc, nextPc = movemNextPc)
@@ -2064,7 +2076,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       } otherwise {
         when(pushProduced.ready) {
           movemMask    := movemMask2                                  // drop the 1-2 emitted bits
-          movemOff     := (movemOff + movemStep * movemNumThisCycle.asSInt.resize(32)).resize(32)
+          movemOff     := (movemOff + movemCycleDelta).resize(32)
           movemEmitted := movemEmitted + movemNumThisCycle.resize(5)
           // Mask drained after this cycle's extraction? (2 emitted -> movemMask2 / movemMask1
           // both 0 if <=2 bits; 1 emitted (odd tail) -> movemMask1 is the post-clear mask.)

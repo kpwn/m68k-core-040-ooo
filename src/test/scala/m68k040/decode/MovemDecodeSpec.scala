@@ -77,17 +77,22 @@ class MovemDecodeSpec extends AnyFunSuite {
     // The macro maps to ONE oracle step: an An-base mode emits a final KEPT An-update
     // (here An+=0, a no-op An write — Musashi leaves the control-mode An unchanged) so the
     // macro commits + advances PC; the 3 stores are dropped (verified via checkMem).
-    val us = collect(Seq(movem(0, 1, 2, 1), 0x0103, 0x4e71, 0x4e71), base, 4)
-    assert(us.length == 4, s"expected 3 stores + 1 An update, got ${us.length}: $us")
-    val st = us.take(3)
+    val us = collect(Seq(movem(0, 1, 2, 1), 0x0103, 0x4e71, 0x4e71), base, 5)
+    assert(us.length == 5, s"expected base snapshot + 3 stores + 1 An update, got ${us.length}: $us")
+    val snap = us.head
+    assert(snap.op == "ADD" && snap.mem == "NONE" && snap.dst == MicroOpAssembler.T0 &&
+           snap.dstV && snap.base == 9 && snap.baseV && snap.first,
+      s"control-mode base must be snapshotted before any transfer: $snap")
+    val st = us.slice(1, 4)
     // ascending order: D0->A1+0, D1->A1+4, A0->A1+8. base = A1 = arch 9.
     assert(st.forall(s => s.mem == "STORE" && !s.dstV), s"$st")
-    assert(st(0).srcB == 0 && st(0).base == 9 && st(0).baseV && st(0).imm == 0 && st(0).sizeL && st(0).first, s"u0=$us")
+    assert(st(0).srcB == 0 && st(0).base == MicroOpAssembler.T0 && st(0).baseV &&
+           st(0).imm == 0 && st(0).sizeL && !st(0).first, s"u0=$us")
     assert(st(1).srcB == 1 && st(1).imm == 4 && !st(1).first, s"u1=$us")
     assert(st(2).srcB == 8 && st(2).imm == 8 && !st(2).first, s"u2=$us")
     // final An update: A1 += 0 (control mode -> An unchanged), no mem, no flags.
-    assert(us(3).op == "ADD" && us(3).mem == "NONE" && us(3).dst == 9 && us(3).dstV &&
-           us(3).imm == 0 && !us(3).first, s"anUpd=$us")
+    assert(us(4).op == "ADD" && us(4).mem == "NONE" && us(4).dst == 9 && us(4).dstV &&
+           us(4).imm == 0 && !us(4).first, s"anUpd=$us")
   }
 
   test("MOVEM.L (A1)+,D0/D1/A0 load -> 3 LOAD uops + final An update (A1 += 12)", VerilatorTest) {
@@ -116,10 +121,11 @@ class MovemDecodeSpec extends AnyFunSuite {
 
   test("MOVEM.W D0/D1,(A1) store -> .W stores do NOT carry isMovea (store side)", VerilatorTest) {
     val base = 0x9280L
-    val us = collect(Seq(movem(0, 0, 2, 1), 0x0003, 0x4e71, 0x4e71), base, 3)
-    assert(us.length == 3, s"$us")
-    assert(us.take(2).forall(u => u.mem == "STORE" && !u.sizeL && !u.isMovea), s"$us")
-    assert(us(2).op == "ADD" && us(2).imm == 0, s"control (An) final An+=0: $us")
+    val us = collect(Seq(movem(0, 0, 2, 1), 0x0003, 0x4e71, 0x4e71), base, 4)
+    assert(us.length == 4, s"$us")
+    assert(us.head.dst == MicroOpAssembler.T0 && us.head.first, s"missing base snapshot: $us")
+    assert(us.slice(1, 3).forall(u => u.mem == "STORE" && !u.sizeL && !u.isMovea), s"$us")
+    assert(us(3).op == "ADD" && us(3).imm == 0, s"control (An) final An+=0: $us")
   }
 
   test("MOVEM.L D0-D7/A0-A6,-(A7) store predec -> reversed order, 8 cycles, final A7 -= 60", VerilatorTest) {
@@ -146,6 +152,27 @@ class MovemDecodeSpec extends AnyFunSuite {
     assert(an.op == "ADD" && an.dst == 15 && an.imm == ((-60L) & 0xffffffffL) && !an.first, s"anUpd=$us")
   }
 
+  test("MOVEM.L all 16 registers preserves +64/-64 running and final deltas", VerilatorTest) {
+    val postBase = 0x9340L
+    val post = collect(Seq(movem(1, 1, 3, 1), 0xffff, 0x4e71, 0x4e71), postBase, 17)
+    assert(post.length == 17, s"expected 16 loads + final An update, got ${post.length}: $post")
+    assert(post.take(16).zipWithIndex.forall { case (u, i) =>
+      u.mem == "LOAD" && u.imm == 4L * i
+    }, s"postincrement offsets must be 0..60 by four: $post")
+    assert(post.last.op == "ADD" && post.last.dst == 9 && post.last.imm == 64,
+      s"all-16 postincrement final delta must be +64: ${post.last}")
+
+    val preBase = 0x9360L
+    val pre = collect(Seq(movem(0, 1, 4, 7), 0xffff, 0x4e71, 0x4e71), preBase, 17)
+    assert(pre.length == 17, s"expected 16 stores + final An update, got ${pre.length}: $pre")
+    assert(pre.take(16).zipWithIndex.forall { case (u, i) =>
+      u.mem == "STORE" && u.imm == ((-4L * (i + 1)) & 0xffffffffL)
+    }, s"predecrement offsets must be -4..-64 by four: $pre")
+    assert(pre.last.op == "ADD" && pre.last.dst == 15 &&
+           pre.last.imm == ((-64L) & 0xffffffffL),
+      s"all-16 predecrement final delta must be -64: ${pre.last}")
+  }
+
   test("MOVEM.L (d16,PC),D0/D1 load -> addresses fold EA_PCDI = pc+4+d16 (base invalid)", VerilatorTest) {
     val base = 0x9380L
     // load (.L), mode 7 reg 2 ((d16,PC)), d16 = 0x20; mask D0,D1 = 0x3.
@@ -160,10 +187,11 @@ class MovemDecodeSpec extends AnyFunSuite {
 
   test("MOVEM.L D3,(A1) single register -> one STORE + final An+=0 (control)", VerilatorTest) {
     val base = 0x9400L
-    val us = collect(Seq(movem(0, 1, 2, 1), 0x0008, 0x4e71, 0x4e71), base, 2)
-    assert(us.length == 2, s"$us")
-    assert(us(0).mem == "STORE" && us(0).srcB == 3 && us(0).imm == 0 && us(0).first, s"u0=$us")
-    assert(us(1).op == "ADD" && us(1).dst == 9 && us(1).imm == 0, s"control single final An+=0: $us")
+    val us = collect(Seq(movem(0, 1, 2, 1), 0x0008, 0x4e71, 0x4e71), base, 3)
+    assert(us.length == 3, s"$us")
+    assert(us(0).dst == MicroOpAssembler.T0 && us(0).first, s"missing base snapshot: $us")
+    assert(us(1).mem == "STORE" && us(1).srcB == 3 && us(1).imm == 0 && !us(1).first, s"u0=$us")
+    assert(us(2).op == "ADD" && us(2).dst == 9 && us(2).imm == 0, s"control single final An+=0: $us")
   }
 
   test("MOVEM.L (A1)+,D3 single register load -> one LOAD + final An update (A1 += 4)", VerilatorTest) {
@@ -186,11 +214,12 @@ class MovemDecodeSpec extends AnyFunSuite {
   test("MOVEM then a following MOVEQ -> front-end resumes (the held fed releases cleanly)", VerilatorTest) {
     val base = 0x9600L
     // MOVEM.L D0/D1,(A1) (2 stores + final An+=0) then MOVEQ #7,D2 (0x7407).
-    val us = collect(Seq(movem(0, 1, 2, 1), 0x0003, 0x7407, 0x4e71), base, 4)
-    assert(us.length == 4, s"$us")
-    assert(us(0).mem == "STORE" && us(1).mem == "STORE", s"$us")
-    assert(us(2).op == "ADD" && us(2).imm == 0, s"control (An) final An+=0: $us")
-    assert(us(3).op == "MOVE" && us(3).mem == "NONE" && us(3).dst == 2 && us(3).imm == 7,
+    val us = collect(Seq(movem(0, 1, 2, 1), 0x0003, 0x7407, 0x4e71), base, 5)
+    assert(us.length == 5, s"$us")
+    assert(us(0).dst == MicroOpAssembler.T0 && us(0).first, s"missing base snapshot: $us")
+    assert(us(1).mem == "STORE" && us(2).mem == "STORE", s"$us")
+    assert(us(3).op == "ADD" && us(3).imm == 0, s"control (An) final An+=0: $us")
+    assert(us(4).op == "MOVE" && us(4).mem == "NONE" && us(4).dst == 2 && us(4).imm == 7,
       s"expected the trailing MOVEQ #7,D2 after the MOVEM: $us")
   }
 }
