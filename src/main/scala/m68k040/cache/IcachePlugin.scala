@@ -497,8 +497,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // testbench counts to derive design doc §8.3's "prefetch issued / useful /
     // wasted". Deliberately NOT synthesised counters -- the core must not carry
     // measurement-only registers.
-    val pfHitUseful  = Bool(); pfHitUseful  := False; pfHitUseful.simPublic()
-    val pfReqFromHit = Bool(); pfReqFromHit := False
+    val pfHitUseful     = Bool(); pfHitUseful     := False; pfHitUseful.simPublic()
+    val demandFillStart = Bool(); demandFillStart := False
 
     // ── Slice I3: the next-line prefetch candidate (rules P1–P4, design doc §4.1(ii)) ──
     //
@@ -530,32 +530,64 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // Same page also means the same page descriptor, hence the same CM bits -- so the
     // cacheability of the source access carries over, satisfying P1's INHIBITED rule
     // (the two trigger sites each additionally require their source to be cacheable).
-    val pfSrcVa = UInt(32 bits)
-    val pfSrcPa = UInt(32 bits)
-    pfSrcVa := missPC      // default: the REPLAY trigger (a demand fill just landed)
-    pfSrcPa := missPA
-    val pfNextVa   = ((pfSrcVa(31 downto 6) + 1) @@ U(0, 6 bits)).resize(32)
-    val pfSamePage = pfNextVa(31 downto 12) === pfSrcVa(31 downto 12)
-    val pfSet      = pfNextVa(11 downto 6)
-    val pfTag      = pfSrcPa(31 downto 12)
-    val pfPa       = pfSrcPa(31 downto 12) @@ pfNextVa(11 downto 0)
-    // Suppression: never prefetch a line that is already resident. (A line already in
-    // an MSHR, or in the same set as an active MSHR -- the D3-SET-I exclusion -- cannot
-    // arise: the fill engine is shared, so a prefetch is only ever started when it is
-    // free, and the prefetched set is always `sourceSet + 1`.)
-    val pfResident = Vec((0 until ways).map(w =>
-                       valids(w)(pfSet) && (tagMem(w).readAsync(pfSet) === pfTag))).orR
-    val prefetchArmed = prefetchEnable && pfSamePage && !pfResident
+    // *** FMAX-CRITICAL STRUCTURE — DO NOT COLLAPSE THIS BACK INTO ONE CYCLE. ***
+    // The first version of this computed the candidate combinationally from whichever
+    // address the trigger site had, and it cost 36.29 MHz post-route (207.17 -> 170.88).
+    // The measured critical path was, end to end in ONE cycle:
+    //     tPaddr/tPc -> source mux -> 26-bit "+1" incrementer (CARRY8 x3)
+    //                -> tagMem.readAsync(pfSet) (RAMD64E x2) -> 20-bit tag compare
+    //                -> pfResident -> prefetchArmed -> missPC/missPA/victimWay CE + FSM goto
+    // 18 logic levels, 67% route, WNS -1.852ns.
+    //
+    // Split into two register-to-register hops instead. The incrementer runs in the
+    // cycle the SOURCE is latched (parallel to the existing hit cone, feeding only
+    // registers), and the array probe + decision run off those registers later:
+    //     hop 1: idlePc(reg) -> +1 -> pfCand{Set,Tag,Pa,Ok} (registers)
+    //     hop 2: pfCandSet(reg) -> tagMem.readAsync -> compare -> prefetchArmed -> FSM
+    // Both triggers are naturally >= 1 cycle apart from their own use anyway: the
+    // demand-miss trigger latches at miss time and is consumed at REPLAY (many cycles
+    // later), and the useful-hit trigger now sets `pfReqPending` and starts the prefetch
+    // on the FOLLOWING IDLE cycle, which costs nothing (a prefetch has no consumer
+    // waiting on it).
+    val pfCandSet    = Reg(UInt(setBits bits))
+    val pfCandTag    = Reg(UInt(tagBits bits))
+    val pfCandPa     = Reg(UInt(32 bits))
+    val pfCandOk     = RegInit(False)
+    val pfReqPending = RegInit(False)
 
-    /** Re-point the shared fill engine at the prefetch candidate. Costs no new state:
+    /** Hop 1 — latch the next-line candidate from the (registered) T-stage address.
+      * Called from the demand-miss arm and the useful-prefetch-hit arm of `lookupTick`,
+      * both of which have a resolved translation in `tPaddr` for `idlePc`.
+      *
+      * `pfCandOk` folds in P4 (same page as the source, so no page cross on a guess)
+      * and P1's cacheability (same page => same descriptor => same CM bits). */
+    def latchPfCand(): Unit = {
+      val nextVa = ((idlePc(31 downto 6) + 1) @@ U(0, 6 bits)).resize(32)
+      pfCandSet := nextVa(11 downto 6)
+      pfCandTag := tPaddr(31 downto 12)
+      pfCandPa  := tPaddr(31 downto 12) @@ nextVa(11 downto 0)
+      pfCandOk  := (nextVa(31 downto 12) === idlePc(31 downto 12)) && tCacheable && !tFault
+    }
+
+    // Hop 2 — suppression + arming, entirely off registers. Never prefetch a line that
+    // is already resident. (A line already in an MSHR, or in the same set as an active
+    // MSHR -- the D3-SET-I exclusion -- cannot arise: the fill engine is shared, so a
+    // prefetch is only ever started when it is free, and the prefetched set is always
+    // sourceSet + 1.)
+    val pfResident = Vec((0 until ways).map(w =>
+                       valids(w)(pfCandSet) && (tagMem(w).readAsync(pfCandSet) === pfCandTag))).orR
+    val prefetchArmed = prefetchEnable && pfCandOk && !pfResident
+
+    /** Re-point the shared fill engine at the prefetch candidate. Every source is a
+      * register, so this adds no combinational depth of its own. Costs no new state:
       * a prefetch is never in flight at the same time as a demand fill. */
     def startPrefetch(): Unit = {
-      missPC        := pfPa      // unused (a prefetch produces no response); kept defined
-      missSet       := pfSet
-      missTag       := pfTag
-      missPA        := pfPa
+      missPC        := pfCandPa  // unused (a prefetch produces no response); kept defined
+      missSet       := pfCandSet
+      missTag       := pfCandTag
+      missPA        := pfCandPa
       missCacheable := True      // P1: same page as a cacheable source => same CM bits
-      victimWay     := victim(pfSet)
+      victimWay     := victim(pfCandSet)
       beatCnt       := U(0, 1 bits)
       arSent        := False
       missBusFault  := False
@@ -717,12 +749,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
               pfFilled(hitWayIdx)(idleSet) := False
               pfHitUseful := True
               if (canStartFill) {
-                pfReqFromHit := True
-                // Re-point the prefetch candidate at THIS hit's (already resolved)
-                // translation -- rule P1 needs a resident translation, and the T-stage
-                // has one for exactly this address.
-                pfSrcVa := idlePc
-                pfSrcPa := tPaddr
+                // Hop 1: latch the candidate off THIS hit's already-resolved translation
+                // (rule P1 needs a resident translation; the T-stage has one for exactly
+                // this address) and defer the start by one cycle -- see the FMax note on
+                // `pfCandSet`.
+                latchPfCand()
+                pfReqPending := True
               }
             }
           } otherwise {
@@ -739,6 +771,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
               arSent    := False
               missBusFault := False   // task #211: reset per-refill
               missPoison   := False    // slice I1: fresh fill, not yet invalidated
+              // Hop 1 for the demand-miss trigger: the candidate is the line AFTER the
+              // one about to be filled. Consumed at REPLAY, many cycles later.
+              latchPfCand()
+              demandFillStart := True
               goto(REFILL)
             } else {
               // MERGE / DEMOTION (plan I1.2 + I3.2): a demand miss arriving while a
@@ -774,11 +810,17 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // only start from IDLE (the fill engine is shared). Placed AFTER lookupTick so
         // a demand miss in the same cycle wins the engine -- demand always has
         // priority over prefetch.
-        // (`pfReqFromHit` is set only in the HIT arm, so it is mutually exclusive with
-        // the miss arm's `goto(REFILL)` -- demand can never lose the engine to it.)
-        when(pfReqFromHit && prefetchArmed) {
-          startPrefetch()
-          goto(PF_REFILL)
+        // A prefetch requested by the useful-prefetch hit trigger starts on the cycle
+        // AFTER the hit (hop 2). `demandFillStart` gives DEMAND absolute priority for
+        // the shared fill engine: this `when` elaborates after the miss arm's
+        // `goto(REFILL)`, so without the guard it would override it. Losing the request
+        // to a demand miss is harmless -- that fill triggers its own prefetch at REPLAY.
+        when(pfReqPending) {
+          pfReqPending := False
+          when(prefetchArmed && !demandFillStart) {
+            startPrefetch()
+            goto(PF_REFILL)
+          }
         }
       }
       // ----- REFILL / PF_REFILL: issue AXI AR; collect the 2 R beats -----
