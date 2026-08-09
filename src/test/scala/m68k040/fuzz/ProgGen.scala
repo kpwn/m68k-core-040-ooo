@@ -36,29 +36,33 @@ import scala.util.Random
   *   the stack (boot SSP 0x00100000); stack pushes are always balanced.
   *
   * ── TEMPLATE INVENTORY (the implemented-ISA whitelist) ─────────────────────
-  *   MOVEQ; ALU reg/imm (ADD/SUB/AND/OR/CMP/EOR + ADDI/SUBI/ANDI/ORI/EORI/CMPI,
+  *   NOP; MOVEQ; ALU reg/imm (ADD/SUB/AND/OR/CMP/EOR + ADDI/SUBI/ANDI/ORI/EORI/CMPI,
   *   .B/.W/.L); ADDQ/SUBQ (Dn/An/mem); ADDA/SUBA/CMPA; MOVE/MOVEA all EA modes
   *   ((An), (An)+, -(An), (d16,An), (d8,An,Xn.w/.l*1/2/4/8), abs.W/.L,
   *   full-format no-mem-indirect (word/long bd, BS/IS suppress), mem-indirect
-  *   pre/post-index) incl mem->mem; ALU mem-src + mem-dest RMW (+imm RMW);
+  *   pre/post-index) incl immediate->mem and mem->mem; ALU mem-src + mem-dest RMW (+imm RMW);
   *   CLR/NEG/NEGX/NOT/TST (Dn + mem); shifts/rotates ASL/ASR/LSL/LSR/ROXL/
   *   ROXR/ROL/ROR .B/.W/.L imm+reg counts (register form); BTST/BCHG/BCLR/
   *   BSET static+dynamic (Dn + mem byte incl (An)+/-(An)); bit-field REGISTER
   *   forms static+dynamic (all 8 ops) + MEMORY STATIC forms ((An)/(d16,An));
-  *   EXT/EXTB/SWAP/TAS-Dn; ADDX/SUBX (reg + -(An) mem); ABCD/SBCD (reg +
+  *   memory one-bit shifts/rotates; EXT/EXTB/SWAP/TAS-Dn + TAS-mem;
+  *   ADDX/SUBX (reg + -(An) mem); ABCD/SBCD (reg +
   *   -(An) mem); PACK/UNPK (reg); EXG; MULU/MULS .W/.L32/.L64; DIVU/DIVS
   *   .W/.L32/.L64 (divisor nonzero by construction); CMP2/CHK2 (.B/.W/.L,
   *   (An)/(d16,An)/(d8,An,Xn)); CAS .B/.W/.L ((An)/(An)+/-(An)) + CAS2 .W/.L;
   *   MOVEM .W/.L ((d16,An) store/load, (An)+ load, -(A7)/(A7)+ push-pop);
-  *   MOVEP .W/.L both directions; LEA/PEA (control EAs); LINK/UNLK;
-  *   Scc Dn; DBcc (small counts); Bcc/BRA forward; BSR/JSR/RTS/RTD/RTR;
+  *   CMPM .B/.W/.L; MOVEP .W/.L both directions; LEA/PEA (control EAs);
+  *   LINK/UNLK; Scc Dn/mem; DBcc (small counts); Bcc/BRA forward;
+  *   BSR/JSR/RTS/RTD/RTR;
   *   JMP (fwd, abs/(An)); MOVE to/from CCR + ANDI/ORI/EORI-to-CCR;
   *   MOVE from SR (supervisor boot); MOVE USP (write-then-read);
   *   MOVEC SFC/DFC round-trip; MOVES all sizes/dirs (supervisor);
   *   TRAP #n / TRAPV / TRAPcc / CHK (sparingly, self-installed handler).
   *
-  * ── EXCLUSION LIST (documented-by-design gaps ONLY — not real divergences) ─
-  *   - line-A / line-F (unimplemented traps, not fuzz-worthy yet)
+  * ── EXCLUSION LIST (intentional generator scope and known gaps) ─────────────
+  *   - line-A / line-F: architectural vector-10/11 delivery is implemented and
+  *     exhaustively directed-tested, but random exception programs need an
+  *     explicit handler/next-PC contract and are not generated here
   *   - .L-IMMEDIATE source with a full-format/mem-indirect (indexed) DEST:
   *     DUT traps by design this slice, Musashi executes (MOVE.L #imm,(bd,An,Xn)
   *     and ADDI.L-class #imm,(full-format)). .B/.W imm + full-format IS in.
@@ -66,15 +70,6 @@ import scala.util.Random
   *     slice 3c — currently silently MIS-CRACKS as static (known gap)
   *   - SR writes / STOP / RESET (v1 keeps the SR system byte stable; RESET is
   *     a serializing privileged nop, excluded with the other sysops)
-  *   - CMPM (An)+,(An)+ : not decoded (line-B mode-001 -> illegal in the DUT)
-  *   - MOVE #imm,<mem> (immediate-SOURCE store): the MOVE store crack requires
-  *     a REGISTER source (MicroOpAssembler crackStore srcIsReg) -> DUT illegal;
-  *     ADDI/…-class #imm,<mem> RMW IS in scope (separate crack)
-  *   - NOP (0x4E71): decodes ILLEGAL in the DUT (no line-4 arm) — FUZZ FINDING
-  *     (benign completeness gap, never executed by the directed suite); the
-  *     slot-parity filler uses moveq instead until NOP ships
-  *   - memory Scc / memory TAS / memory shifts (1-bit <ea> form): deferred in
-  *     the decode suite -> DUT illegal
   *   - PC-RELATIVE DATA references ((d16,PC)/(d8,PC,Xn) loads, LEA/PEA (d16,PC)):
   *     HARNESS limitation, not a DUT gap — the DUT's D-memory agent does not
   *     hold the program image, so a PC-relative data load reads different bytes
@@ -119,9 +114,10 @@ object ProgGen {
   def generate(seed: Long, nBodyBlocks: Int): Prog = {
     val r   = new Random(seed)
     val gen = new Gen(r)
-    // Sandbox seeding is register-mediated: MOVE #imm,<mem> is a documented
-    // decode gap (crackStore requires a REGISTER source), so each seed store is
-    // [move.l #rand,%dK ; move.l %dK,ABS]. NOT removable (loads depend on it).
+    // Keep sandbox seeding register-mediated so this non-removable harness
+    // foundation does not make every generated program depend on the
+    // immediate-to-memory crack. That form is exercised independently by a
+    // removable template below.
     val memSeeds = (0 until SandboxLongs).map { i =>
       val dr = s"%d${i % 8}"
       Block(Vector(f"\tmove.l #0x${r.nextLong() & 0xffffffffL}%x,$dr",
@@ -375,8 +371,13 @@ object ProgGen {
       setup :+ s"\tmove.$sz ${d()},$ea"
     }
 
-    // (NO tMoveImmStore: MOVE #imm,<mem> is a documented decode gap — the MOVE
-    // store crack requires a REGISTER source; see the exclusion list.)
+    private def tMoveImmStore(): Vector[String] = {
+      val sz = size()
+      // Keep the documented .L immediate + full-format/mem-indirect exclusion;
+      // .B/.W may exercise the wide EA matrix.
+      val (setup, ea, _) = if (sz == 'l') memEa(sz, wide = false) else memEa(sz)
+      setup :+ s"\tmove.$sz ${imm(sz)},$ea"
+    }
 
     private def tMoveMemMem(): Vector[String] = {
       val sz = size()
@@ -430,6 +431,12 @@ object ProgGen {
       val cnt = d(); val dst = d()
       Vector(s"\tmoveq #${r.nextInt(67)},$cnt",          // 0..66 exercises 0/mod-64/>=size
              s"\t$op.${size()} $cnt,$dst")
+    }
+
+    private def tShiftMem(): Vector[String] = {
+      val op = pick(Seq("asl", "asr", "lsl", "lsr", "roxl", "roxr", "rol", "ror"))
+      val (setup, ea, _) = memEa('w')
+      setup :+ s"\t$op.w $ea"
     }
 
     private def tBitopReg(): Vector[String] = {
@@ -509,6 +516,11 @@ object ProgGen {
       Vector(pick(Seq(s"\text.w ${d()}", s"\text.l ${d()}", s"\textb.l ${d()}",
                       s"\tswap ${d()}", s"\ttas ${d()}")))
 
+    private def tTasMem(): Vector[String] = {
+      val (setup, ea, _) = memEa('b')
+      setup :+ s"\ttas $ea"
+    }
+
     private def tAddxSubxReg(): Vector[String] =
       Vector(s"\t${pick(Seq("addx", "subx"))}.${size()} ${d()},${d()}")
 
@@ -532,6 +544,16 @@ object ProgGen {
       Vector(s"\tmove.l #${hex(a1 + 1)},$ay",
              s"\tmove.l #${hex(a2 + 1)},$ax",
              s"\t${pick(Seq("abcd", "sbcd"))} -($ay),-($ax)")
+    }
+
+    private def tCmpm(): Vector[String] = {
+      val sz = size(); val span = spanOf(sz)
+      val srcAddr = sbAddr(span, span); val dstAddr = sbAddr(span, span)
+      val ay = a(); val ax0 = a()
+      val ax = if (ax0 == ay) s"%a${(ay.drop(2).toInt + 1) % 7}" else ax0
+      Vector(s"\tmove.l #${hex(srcAddr)},$ay",
+             s"\tmove.l #${hex(dstAddr)},$ax",
+             s"\tcmpm.$sz ($ay)+,($ax)+")
     }
 
     private def tPackUnpk(): Vector[String] =
@@ -765,6 +787,11 @@ object ProgGen {
     private def tScc(): Vector[String] =
       Vector(s"\ts${pick(ccList :+ "t" :+ "f")} ${d()}")
 
+    private def tSccMem(): Vector[String] = {
+      val (setup, ea, _) = memEa('b')
+      setup :+ s"\ts${pick(ccList :+ "t" :+ "f")} $ea"
+    }
+
     private def tBccForward(): Vector[String] = {
       val skip = lbl("skip")
       val cc   = pick(ccList)
@@ -950,16 +977,19 @@ object ProgGen {
       ("adda",       3, tAdda _),       ("adda-mem",   2, tAdaMemSrc _),
       ("move-rr",    5, tMoveRegReg _), ("move-imm",   5, tMoveImm _),
       ("move-load",  8, tMoveLoad _),   ("movea-load", 3, tMoveaLoad _),
-      ("move-store", 9, tMoveStore _),  ("move-mm",    2, tMoveMemMem _),
+      ("move-store", 9, tMoveStore _),  ("move-imm-mem",2,tMoveImmStore _),
+      ("move-mm",    2, tMoveMemMem _),
       ("alu-memsrc", 5, tAluMemSrc _),  ("alu-rmw",    5, tAluMemRmw _),
       ("imm-rmw",    3, tAluImmRmw _),  ("quick-rmw",  2, tQuickMemRmw _),
       ("unary",      4, tUnaryReg _),   ("unary-mem",  3, tUnaryMem _),
       ("shift-imm",  5, tShiftImm _),   ("shift-reg",  4, tShiftReg _),
+      ("shift-mem",  2, tShiftMem _),
       ("bitop",      3, tBitopReg _),   ("bitop-mem",  3, tBitopMem _),
       ("bf-reg",     3, tBitfieldReg _),("bf-mem",     3, tBitfieldMem _),
-      ("ext",        3, tExtSwapTas _),
+      ("ext",        3, tExtSwapTas _), ("tas-mem",    2, tTasMem _),
       ("addx",       3, tAddxSubxReg _),("addx-mem",   2, tAddxSubxMem _),
       ("bcd",        2, tBcdReg _),     ("bcd-mem",    1, tBcdMem _),
+      ("cmpm",       2, tCmpm _),
       ("pack",       2, tPackUnpk _),   ("exg",        2, tExg _),
       ("ccr",        4, tCcrOps _),     ("move-ccr",   2, tMoveCcrDn _),
       ("fromsr",     1, tMoveFromSr _), ("fromccr-mem",1, tMoveCcrStore _),
@@ -969,6 +999,7 @@ object ProgGen {
       ("movem",      3, tMovem _),      ("movep",      2, tMovep _),
       ("lea",        3, tLea _),        ("pea",        2, tPea _),
       ("link",       2, tLinkUnlk _),   ("scc",        3, tScc _),
+      ("scc-mem",    2, tSccMem _),
       ("bcc",        5, tBccForward _), ("bra",        2, tBraForward _),
       ("jmp",        1, tJmpForward _), ("dbcc",       3, tDbcc _),
       ("bsr",        3, tBsrRts _),     ("jsr",        2, tJsrRts _),
@@ -988,11 +1019,10 @@ object ProgGen {
       var i = 0
       while (w >= templates(i)._2) { w -= templates(i)._2; i += 1 }
       val body = templates(i)._3()
-      // 0/1 two-byte filler prefix: shifts the template across BOTH fetch-group
-      // slots (slot-1 is where the decode-race class lives). NOT `nop`: NOP
-      // (0x4E71) currently decodes ILLEGAL in the DUT (fuzz finding — the
-      // directed suite never EXECUTES one), so a moveq stands in.
-      val lines = if (r.nextBoolean()) s"\tmoveq #${r.nextInt(256) - 128},${d()}" +: body else body
+      // 0/1 two-byte NOP prefix shifts the template across BOTH fetch-group
+      // slots (slot-1 is where the decode-race class lives) without perturbing
+      // register or condition-code state.
+      val lines = if (r.nextBoolean()) "\tnop" +: body else body
       Block(lines)
     }
   }
