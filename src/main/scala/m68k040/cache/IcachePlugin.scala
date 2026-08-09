@@ -122,7 +122,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // for every existing non-full-core test.
     val privCtrl = host.get[PrivilegeService]
     val activePc = UInt(32 bits)
-    xlate.req.valid      := True
+    // A translation is demanded only for a real offered fetch. Keeping this high
+    // while FetchAlign is idle lets an enabled ITLB launch a table walk for the
+    // unowned/irrelevant cmd payload (commonly reset PC 0), wasting walker bandwidth
+    // and potentially delaying the first architectural fetch. `cmd.ready` still reads
+    // the combinational response in the same cycle that cmd.valid is asserted.
+    xlate.req.valid      := cmdPort.valid
     xlate.req.vpn        := activePc(31 downto 12)
     xlate.req.supervisor := privCtrl.map(_.supervisor).getOrElse(False)
     xlate.req.write      := False

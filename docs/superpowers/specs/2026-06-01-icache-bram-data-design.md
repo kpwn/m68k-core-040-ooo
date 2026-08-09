@@ -1,6 +1,7 @@
 # I-cache BRAM Data Array — Design
 
-**Status:** Draft for review
+**Status:** Historical two-stage baseline; superseded by the binding resident-hit
+pipeline addendum in `2026-05-31-icache-slice-design.md`
 **Date:** 2026-06-01
 **Parent spec:** `docs/superpowers/specs/2026-05-31-icache-slice-design.md` (the original VIPT L1I); `.../2026-05-31-m68k-040-ooo-architecture-design.md` ch 2 (frontend), **invariant #2 (FMax 250 MHz / FPGA-mappable)**.
 **Builds on:** merged I-cache (`m68k040.cache.IcachePlugin`, IDLE→REFILL→PREDECODE→REPLAY, registered 1-cycle response) and `FetchAlignPlugin` (single-outstanding, latency-agnostic consumer).

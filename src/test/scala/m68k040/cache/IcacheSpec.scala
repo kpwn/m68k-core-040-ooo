@@ -438,6 +438,82 @@ class IcacheSpec extends AnyFunSuite {
     }
   }
 
+  // -------- Throughput: the three-cycle resident pipe has initiation interval one --------
+  // A serialized `fetch()` loop cannot prove this: it waits for each response before
+  // presenting the next command. Drive six unique same-line windows back-to-back and
+  // require both the accepts and their associated responses to be consecutive. The
+  // zero-AXI assertion proves the measured cadence is the resident path, not refills.
+  test("warm resident hits accept and respond every cycle at fixed three-cycle latency", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+
+      var cycle = 0
+      var arCount = 0
+      val accepts = scala.collection.mutable.ArrayBuffer.empty[(Int, Long)]
+      val responses = scala.collection.mutable.ArrayBuffer.empty[(Int, Long, BigInt)]
+      cd.onSamplings {
+        cycle += 1
+        if (dut.icache.logic.axi.ar.valid.toBoolean && dut.icache.logic.axi.ar.ready.toBoolean)
+          arCount += 1
+        if (dut.probe.logic.cmdIn.valid.toBoolean && dut.probe.logic.cmdIn.ready.toBoolean)
+          accepts += ((cycle, dut.probe.logic.cmdIn.payload.pc.toLong))
+        if (dut.probe.logic.rspOut.valid.toBoolean)
+          responses += ((cycle, dut.probe.logic.rspOut.payload.pc.toLong,
+            dut.probe.logic.rspOut.payload.data.toBigInt))
+      }
+
+      cd.waitSampling(2)
+      pulseInvalidateAll(dut, cd)
+      val base = 0x6000L
+      fetch(dut, cd, base) // demand-fill the line
+      cd.waitSampling(4)   // drain replay/S1/rsp before the measured burst
+      accepts.clear()
+      responses.clear()
+      val arBefore = arCount
+
+      val pcs = (0 until 6).map(i => base + i * 8L)
+      for (pc <- pcs) {
+        dut.probe.logic.cmdIn.valid #= true
+        dut.probe.logic.cmdIn.payload.pc #= pc
+        cd.waitSamplingWhere(dut.probe.logic.cmdIn.ready.toBoolean)
+      }
+      dut.probe.logic.cmdIn.valid #= false
+
+      var guard = 0
+      while (responses.size < pcs.size && guard < 20) {
+        cd.waitSampling()
+        guard += 1
+      }
+      assert(accepts.size == pcs.size,
+        s"expected ${pcs.size} measured accepts, got ${accepts.mkString(",")}")
+      assert(responses.size == pcs.size,
+        s"expected ${pcs.size} measured responses, got ${responses.mkString(",")}")
+      assert(accepts.map(_._1).sliding(2).forall(w => w(1) == w(0) + 1),
+        s"resident accepts must have II=1: ${accepts.map(_._1)}")
+      assert(responses.map(_._1).sliding(2).forall(w => w(1) == w(0) + 1),
+        s"resident responses must be bubble-free: ${responses.map(_._1)}")
+      for (((acceptCycle, acceptPc), (responseCycle, responsePc, data)) <-
+           accepts.zip(responses)) {
+        assert(responseCycle - acceptCycle == 3,
+          s"pc=0x${acceptPc.toHexString} latency=${responseCycle - acceptCycle}, expected 3")
+        assert(responsePc == acceptPc,
+          f"response order mismatch: accepted 0x$acceptPc%x, returned 0x$responsePc%x")
+        assert(data == IcacheSim.window64(acceptPc),
+          f"resident data mismatch at 0x$acceptPc%x")
+      }
+      assert(accepts.map(_._2).toSeq == pcs,
+        s"accept order mismatch: ${accepts.map(_._2).map(_.toHexString)}")
+      assert(arCount == arBefore,
+        s"warm same-line burst issued AXI reads: $arBefore -> $arCount")
+    }
+  }
+
   // -------- Test 3: crossing 64B boundary triggers a new refill --------
   test("crossing the 64B line boundary triggers a new refill", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>

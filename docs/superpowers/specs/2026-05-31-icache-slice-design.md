@@ -1,6 +1,7 @@
 # I-Cache Slice — Design
 
-**Status:** Draft for review
+**Status:** Historical baseline; the 2026-08-09 resident-hit pipeline addendum
+below is binding
 **Date:** 2026-05-31
 **Parent spec:** `docs/superpowers/specs/2026-05-31-m68k-040-ooo-architecture-design.md` (ch 1 Frontend, ch 7 LSU/MMU geometry, ch 9 Caches/Bus, invariants #2 FMax / #3 plugin boundaries)
 **Slice position:** First slice of the frontend (chapter #1). Builds the L1 instruction cache datapath in isolation; the ITLB/MMU, fetch/align + instruction buffer, branch prediction, and SoC bus plumbing are later slices.
@@ -182,3 +183,68 @@ correct address/len/size). No CPU or lock-step needed — this is a self-contain
 - Cacheable-only (no inhibited/MMIO bypass) until the MMU provides cache modes.
 - `invalidateAll` only (no per-line CINV.IC) until cache-control instructions are wired.
 - Single outstanding miss (no hit-under-miss) — a later IPC optimization.
+
+## 13. Binding resident-hit pipeline addendum (2026-08-09)
+
+The geometry and VIPT safety argument above remain binding: virtual
+`pc[11:6]` selects one of 64 sets, while the translated physical page number is
+the 20-bit tag. With 64-byte lines, index plus offset is exactly the 12-bit
+4-KiB page offset, so no coloring is required.
+
+The original §6 timing sketch is historical. The live FPGA-oriented hit path is
+a three-cycle, initiation-interval-one pipeline:
+
+1. At cycle N, `cmd.fire` presents the VPN to the combinational ITLB lookup and
+   captures `{pc, physical address, fault, cache mode}` into the translation
+   T-stage.
+2. At N+1, the registered physical tag is compared with the async tag/valid
+   arrays while the synchronous per-way data BRAM read is armed from the
+   page-invariant virtual set/offset. The selected way and raw prediction entries
+   enter S1.
+3. At N+2, registered BRAM data is way/lane selected and prediction metadata is
+   windowed into the response register.
+4. At N+3, `FetchRsp.valid` is visible. FetchAlign appends its four words at the
+   edge; simple instructions can first become useful decode packets at N+4.
+
+This is VIPT, but it intentionally does **not** start the cache tag/data lookup
+in parallel with the live ITLB result. The translation register severs the
+measured route-dominated ITLB-way-mux to cache-tag/data cone. Restoring the
+original live parallel cone or removing the response register is not an
+approved latency optimization without a new routed FMax result; either would
+place tag-hit way selection and the wide data/prediction mux back into one
+cycle.
+
+The translation request is a demand handshake: `TranslationReq.valid` is high
+only while `FetchService.cmd.valid` offers a real fetch. The combinational ITLB
+response may still determine `cmd.ready` in that cycle, but an idle/stopped
+frontend must not launch a table walk for an unowned `cmd.payload.pc` value.
+
+Latency is hidden with credits rather than collapsed. T, S1, and response
+advance every cycle on resident hits, so the port accepts and returns one fetch
+window per cycle. FetchAlign owns a three-entry in-order record ring and may
+consume the head response and allocate its replacement in the same cycle. The
+ring therefore covers the full three-cycle hit latency without a periodic
+full-ring issue bubble. Its conservative IBuf reservation may throttle excess
+fetch bandwidth when four fetched words per cycle outrun decode, but a warm
+two-wide stream of two-word instructions (four consumed words per cycle) must
+remain continuously useful from the IBuf. This bandwidth-matched stream exposes
+even a single missing response cycle instead of letting surplus words mask it.
+
+A decode-directed taken redirect is a separate boundary. With a resident target
+and no older miss, the current sequence is target command N+1, target response
+N+4, first target packet N+5: four dead restart cycles after the branch packet.
+Additional sequential ring depth cannot remove this because the target is not
+known at fetch time. Fetch-directed prediction/replay is the appropriate lever;
+collapsing the L1I stages is not.
+
+The non-vacuous resident gates are:
+
+- at least six distinct same-line commands accepted on consecutive cycles, with
+  six ordered responses on consecutive cycles at exactly three-cycle latency
+  and no new AXI read;
+- after warm-up, at least eight consecutive two-slot, two-word `feed.fire`
+  cycles with exact unique PCs/extension words and no lost or duplicated words;
+  and
+- a redirect colliding with a full-ring response/replacement, followed by only
+  the resident target stream, at the N+5 restart boundary. Existing directed
+  fault and stale/drop tests remain mandatory alongside this cadence test.
