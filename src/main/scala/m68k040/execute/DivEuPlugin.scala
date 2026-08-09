@@ -16,7 +16,7 @@ import spinal.lib.misc.plugin.FiberPlugin
 trait DivEuService {
   def issue: Stream[IqContext]
   def completion: Flow[UInt]   // robId (ROB completion port)
-  def wakeup: Flow[UInt]       // pdst of a completing DIV (dynamic-completion wakeup)
+  def wakeup: Flow[UInt]       // pdst of a completing CPLX op (dynamic wakeup)
   /** pNzvcDst of a completing CPLX op that writes flags (dynamic-completion NZVC
     * wakeup — task #167). SEPARATE from `wakeup` (int pdst): CHK2/CMP2/CHK write NZVC
     * with no int dst at all, and DIV/MUL's int dst and NZVC dst can wake at different
@@ -28,18 +28,61 @@ trait DivEuService {
   def euFault: Flow[EuFault]
   /** Mispredict/exception squash (the RedirectService doFlush pulse). A MULTI-CYCLE
     * op (DIV/MUL) in flight when a flush hits is WRONG-PATH: its late completion
-    * would land after the ROB reuses its robId. We abort the FSM + suppress the
-    * stale completion/writeback so it cannot pollute the reused entry. (The ROB also
-    * filters wrong-path completions by robId; this additionally protects against the
-    * multi-cycle straddle where completion lands after reuse.) */
+    * would land after the ROB reuses its robId. The fixed pipeline and result queues
+    * are cleared; the iterative divider is poisoned until its internal iteration
+    * finishes. All same-cycle and late side effects are suppressed. */
   def cplxFlush: Bool
 }
 
-/** CPLX execution unit: CHK (bound-check trap, single-cycle) + multi-cycle DIVU/DIVS.
+/** Pruned descriptor that follows the fixed MUL datapath.  Do not replace this
+  * with IqContext: the multiplier needs only result-routing and flag metadata. */
+case class MulPipeContext() extends Bundle {
+  val robId       = UInt(6 bits)
+  val pdst        = UInt(6 bits)
+  val pdstValid   = Bool()
+  val pNzvcDst    = UInt(4 bits)
+  val writesNzvc  = Bool()
+  val dstArch     = UInt(5 bits)
+  val size        = Size()
+  val signed      = Bool()
+  val is64        = Bool()
+}
+
+/** A cracked MULHI tail may arrive before its high product.  Queueing its small
+  * routing descriptor removes it from the sole CPLX issue port without carrying
+  * a full IqContext or inventing a false PRF dependency. */
+case class MulHiContext() extends Bundle {
+  val robId       = UInt(6 bits)
+  val pdst        = UInt(6 bits)
+  val dstArch     = UInt(5 bits)
+}
+
+/** One result waiting for the existing single CPLX completion/writeback lane. */
+case class CplxResult() extends Bundle {
+  val robId       = UInt(6 bits)
+  val data        = Bits(32 bits)
+  val pdst        = UInt(6 bits)
+  val pdstValid   = Bool()
+  val nzvc        = Bits(4 bits)
+  val nzvcWrite   = Bool()
+  val pNzvcDst    = UInt(4 bits)
+  val dstArch     = UInt(5 bits)
+  val fault       = Bool()
+  val faultVec    = UInt(8 bits)
+  val crackTail   = Bool()
+  val flushed     = Bool()
+  // Only a main .L64 MUL result uses these fields.  They are consumed when the
+  // low result leaves the MUL queue and become the ROB-keyed MULHI stash entry.
+  val mulHigh     = Bits(32 bits)
+  val mul64       = Bool()
+}
+
+/** CPLX execution unit: fixed-latency II=1 MUL, CHK/CMP2, and iterative DIV.
   *
-  * Single-outstanding, busy-gated, with a dynamic-completion wakeup (mirrors
-  * LsEuPlugin): the EU deasserts issue.ready while a divide iterates, and broadcasts
-  * the producing pdst the cycle the result lands. CHK is single-cycle (no iteration);
+  * The iterative/legacy lane remains single-outstanding, but MUL owns an independent
+  * four-stage descriptor/product pipeline and result FIFO.  It may accept every cycle
+  * while a divide iterates.  Both lanes retain the existing single dynamic-completion
+  * wakeup and PRF/ROB result port through a lossless arbiter. CHK is single-cycle;
   * it writes no register and, when out-of-bounds, raises euFault{vec6}. DIV writes the
   * quotient (+ the remainder via a trailing DIVREM crack) and on divisor==0 raises
   * euFault{vec5}; overflow sets V (no write, no trap).
@@ -103,12 +146,20 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val s0H = rdH.data
     val s0Nzvc = nzvcRd.data                    // {N(3),Z(2),V(1),C(0)}
 
-    // single-outstanding busy. A µop occupying s1 (not yet consumed) ALSO blocks a new
-    // issue — otherwise a 2nd µop (e.g. the cracked DIVREM following its DIV) would
-    // fire the cycle after the first while `busy` is still being set, overwriting s1.
+    // Iterative/legacy lane occupancy.  A main MUL bypasses this lane and has its own
+    // credit gate below; every other CPLX operation still uses s1 + the divider FSM.
     val busy = RegInit(False)
     val s1Valid = RegInit(False)
-    issuePort.ready := !busy && !s1Valid
+    val issueIsMul   = u0.op === DecOp.MUL
+    val issueIsMulHi = u0.op === DecOp.MULHI
+    val mulCanAccept = Bool(); mulCanAccept.allowOverride; mulCanAccept := False
+    val mulHiAvailable = Bool(); mulHiAvailable.allowOverride; mulHiAvailable := False
+    // The IQ connection is a non-collapsing registered Stream.  When its current
+    // valid is low, stale payload bits must not hold ready low or the IQ cannot load
+    // a new lane-eligible candidate behind an active divider.
+    issuePort.ready := !flushSig && (!issuePort.valid || Mux(issueIsMul,
+      mulCanAccept,
+      Mux(issueIsMulHi, mulHiAvailable, !busy && !s1Valid)))
 
     // ---- debug-only observability (task #139 CMP2/CHK2 hang investigation) ----
     // Zero synth impact (sim tap only, not referenced by any RTL logic).
@@ -124,31 +175,30 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val s1Nzvc  = Reg(Bits(4 bits))    // old {N,Z,V,C} for the CMP2/CHK2 RMW
     val u1 = s1Ctx.uop
 
-    // default: clear s1Valid unless held by busy (set on capture below)
-    when(issuePort.fire) {
+    // Main MUL and MULHI have independent pipelines/queues below.  Every other
+    // operation captures the legacy lane context and clears it explicitly on use.
+    when(issuePort.fire && !issueIsMul && !issueIsMulHi) {
       s1Valid := True
       s1Ctx   := issuePort.payload
       s1A     := s0A
       s1B     := s0B
       s1H     := s0H
       s1Nzvc  := s0Nzvc
-    } otherwise {
-      when(!busy) { s1Valid := False }
     }
 
     // Mispredict/exception squash: a 1-cycle doFlush pulse. Latch it so the eventual
-    // completion of a multi-cycle op (DIV/MUL) that was IN FLIGHT at the flush is
+    // completion of an iterative DIV that was IN FLIGHT at the flush is
     // suppressed — its robId may be reused by a correct-path op before the (late)
     // completion lands. `flushed` is set on any flush while busy/s1Valid (an in-flight
     // op); it is captured into compFlushed at the op's completion and cleared then.
     val flushed = RegInit(False)
     when(flushSig && (busy || s1Valid)) { flushed := True }
-    // A flush also drops a not-yet-launched s1 op (it never enters DIVING/MULING).
+    // A flush also drops a not-yet-launched legacy s1 op.
     when(flushSig) { s1Valid := False }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Registered COMPLETION / WRITEBACK stage (mirrors LsEu): the decision (CHK
-    // compare / DIV result) is captured into comp* registers and DRIVES the
+    // Registered COMPLETION / WRITEBACK stage (mirrors LsEu): the arbiter's result
+    // is captured into comp* registers and DRIVES the
     // completion/writeback/wakeup/euFault ports the SAME or next cycle. A 1-cycle
     // pulse: default-clear, set only by a capture.
     val compValid     = RegInit(False)
@@ -173,6 +223,12 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     compValid     := False
     compNzvcWrite := False
     compFault     := False
+
+    // CHK/CMP2/DIV/DIVREM produce into one held legacy result.  This removes
+    // the old direct multi-source assignments to comp*, so a simultaneous MUL result
+    // can remain queued rather than being overwritten on the Flow-only ROB port.
+    val legacyValid = RegInit(False)
+    val legacyResult = Reg(CplxResult())
 
     // ---- CHK compare (single-cycle) ----
     // CHK.W compares the low 16 bits (sign-extended); CHK.L the full 32. Trap
@@ -250,38 +306,43 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // write (e.g. DIV overflow: V=1 but Dn unchanged) without a second overlapping
     // assignment to compPdstValid.
     def captureComplete(result: Bits, nzvc: Bits, writesNzvc: Bool, writeInt: Bool): Unit = {
-      compValid     := True
-      compRobId     := s1Ctx.robId
-      compData      := result
-      compPdst      := u1.pdst
-      compPdstValid := u1.pdstValid && writeInt
-      compDstArch   := u1.dstArch
-      compNzvc      := nzvc
-      compNzvcWrite := writesNzvc
-      compNzvcDst   := u1.pNzvcDst
-      compFault     := False
+      legacyValid              := True
+      legacyResult.robId       := s1Ctx.robId
+      legacyResult.data        := result
+      legacyResult.pdst        := u1.pdst
+      legacyResult.pdstValid   := u1.pdstValid && writeInt
+      legacyResult.dstArch     := u1.dstArch
+      legacyResult.nzvc        := nzvc
+      legacyResult.nzvcWrite   := writesNzvc
+      legacyResult.pNzvcDst    := u1.pNzvcDst
+      legacyResult.fault       := False
+      legacyResult.faultVec    := 0
       // The trailing crack µop (DIVREM or MULHI) is coalesced into the preceding
       // op's oracle step (its own commit is dropped, the PRF write still lands).
-      compDivRem    := u1.divIsRem || (u1.op === DecOp.MULHI)
+      legacyResult.crackTail   := u1.divIsRem || (u1.op === DecOp.MULHI)
       // Was this op (or its in-flight predecessor) flushed? If so the completion is
       // wrong-path and must not drive any port (its robId may have been reused).
-      compFlushed   := flushed || flushSig
+      legacyResult.flushed     := flushed || flushSig
+      legacyResult.mulHigh     := 0
+      legacyResult.mul64       := False
       flushed       := False                 // captured -> consume the latch
     }
     def captureFault(vec: UInt, nzvc: Bits, writesNzvc: Bool): Unit = {
-      compValid     := True
-      compRobId     := s1Ctx.robId
-      compData      := B(0, 32 bits)
-      compPdst      := u1.pdst
-      compPdstValid := False
-      compDstArch   := u1.dstArch
-      compNzvc      := nzvc
-      compNzvcWrite := writesNzvc      // CHK still sets N even when it traps (Musashi)
-      compNzvcDst   := u1.pNzvcDst
-      compFault     := True
-      compFaultVec  := vec
-      compDivRem    := False
-      compFlushed   := flushed || flushSig
+      legacyValid              := True
+      legacyResult.robId       := s1Ctx.robId
+      legacyResult.data        := 0
+      legacyResult.pdst        := u1.pdst
+      legacyResult.pdstValid   := False
+      legacyResult.dstArch     := u1.dstArch
+      legacyResult.nzvc        := nzvc
+      legacyResult.nzvcWrite   := writesNzvc
+      legacyResult.pNzvcDst    := u1.pNzvcDst
+      legacyResult.fault       := True
+      legacyResult.faultVec    := vec
+      legacyResult.crackTail   := False
+      legacyResult.flushed     := flushed || flushSig
+      legacyResult.mulHigh     := 0
+      legacyResult.mul64       := False
       flushed       := False
     }
 
@@ -353,59 +414,112 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val ovLatch  = RegInit(False)
 
     // ─────────────────────────────────────────────────────────────────────────
-    // MUL integration (MULU/MULS): the registered DSP-mappable MulCore. MUL is the
-    // SAME CPLX EU (folded in, not a separate plugin) — it reuses this FSM, the
-    // busy-gated single-outstanding issue, the completion/wakeup ports, and the
-    // crack-latch mechanism (MULHI mirrors DIVREM). 2 source operands only (no psrcC).
-    //   .W   : 16x16 -> Dn[31:0]. Operands = s1A[15:0] / s1B[15:0], s/z-ext to 32.
-    //   .L32 : 32x32 -> Dl[31:0] + V(overflow). Operands = s1A / s1B (full 32).  (T4)
-    //   .L64 : 32x32 -> Dh:Dl. MUL writes Dl (low), MULHI writes Dh (latched high). (T5)
-    val isMul    = u1.op === DecOp.MUL
-    val isMulHi  = u1.op === DecOp.MULHI
-    val mulSigned = u1.divSigned          // reused as the MULS marker
-    // Operand A/B for MulCore: .W extends the low 16 bits; .L uses the full 32.
-    val mulA = Bits(32 bits)
-    val mulB = Bits(32 bits)
-    when(u1.size === Size.WORD) {
-      mulA := Mux(mulSigned && s1A(15), B(0xFFFF, 16 bits), B(0, 16 bits)) ## s1A(15 downto 0)
-      mulB := Mux(mulSigned && s1B(15), B(0xFFFF, 16 bits), B(0, 16 bits)) ## s1B(15 downto 0)
+    // MUL integration: a fixed four-stage DSP datapath, pruned descriptor pipe,
+    // and credit-reserved result FIFO.  It never occupies s1/busy and therefore
+    // continues to accept while DivUnit iterates.
+    val mulIssueA = Bits(32 bits)
+    val mulIssueB = Bits(32 bits)
+    when(u0.size === Size.WORD) {
+      mulIssueA := Mux(u0.divSigned && s0A(15), B(0xFFFF, 16 bits), B(0, 16 bits)) ## s0A(15 downto 0)
+      mulIssueB := Mux(u0.divSigned && s0B(15), B(0xFFFF, 16 bits), B(0, 16 bits)) ## s0B(15 downto 0)
     } otherwise {
-      mulA := s1A
-      mulB := s1B
+      mulIssueA := s0A
+      mulIssueB := s0B
     }
 
-    val mulCore = new MulCore
-    mulCore.io.start  := False
-    mulCore.io.a      := mulA
-    mulCore.io.b      := mulB
-    mulCore.io.signed := mulSigned
+    val mulResultDepth = 8
+    val mulResultQ = StreamFifo(CplxResult(), mulResultDepth)
+    val mulHiPendingQ = StreamFifo(MulHiContext(), mulResultDepth)
+    mulResultQ.io.flush := flushSig
+    mulHiPendingQ.io.flush := flushSig
 
-    // The full 64-bit product is split lo/hi by MulCore. For .W/.L32 the dest is the
-    // low 32; .L64 writes lo -> Dl + (latched) hi -> Dh. The high product is LATCHED
-    // at done for the trailing MULHI crack (no re-multiply), mirroring remLatch.
+    val mulReserved = Reg(UInt(log2Up(mulResultDepth + 1) bits)) init 0
+    val mulRetire = mulResultQ.io.pop.fire
+    mulCanAccept := (mulReserved =/= mulResultDepth) || mulRetire
+    mulHiAvailable := mulHiPendingQ.io.push.ready
+
+    val mulStart = issuePort.fire && issueIsMul
+    val mulHiAccept = issuePort.fire && issueIsMulHi
+    when(mulHiAccept) { assert(u0.pdstValid, "MULHI must carry an integer destination") }
+    mulHiPendingQ.io.push.valid := mulHiAccept
+    mulHiPendingQ.io.push.payload.robId := issuePort.payload.robId
+    mulHiPendingQ.io.push.payload.pdst := u0.pdst
+    mulHiPendingQ.io.push.payload.dstArch := u0.dstArch
+
+    switch(mulStart ## mulRetire) {
+      is(B"10") { mulReserved := mulReserved + 1 }
+      is(B"01") { mulReserved := mulReserved - 1 }
+    }
+    when(flushSig) { mulReserved := 0 }
+
+    val mulCore = new MulCore
+    mulCore.io.start  := mulStart
+    mulCore.io.a      := mulIssueA
+    mulCore.io.b      := mulIssueB
+    mulCore.io.signed := u0.divSigned
+
+    val mulCtx = Vec.fill(MulCore.Latency)(Reg(MulPipeContext()))
+    val mulCtxValid = Vec.fill(MulCore.Latency)(RegInit(False))
+    mulCtxValid(0) := mulStart
+    when(mulStart) {
+      mulCtx(0).robId      := issuePort.payload.robId
+      mulCtx(0).pdst       := u0.pdst
+      mulCtx(0).pdstValid  := u0.pdstValid
+      mulCtx(0).pNzvcDst   := u0.pNzvcDst
+      mulCtx(0).writesNzvc := u0.writesNzvc
+      mulCtx(0).dstArch    := u0.dstArch
+      mulCtx(0).size       := u0.size
+      mulCtx(0).signed     := u0.divSigned
+      mulCtx(0).is64       := u0.div64
+    }
+    for (i <- 1 until MulCore.Latency) {
+      mulCtxValid(i) := mulCtxValid(i - 1)
+      when(mulCtxValid(i - 1)) { mulCtx(i) := mulCtx(i - 1) }
+    }
+    when(flushSig) { mulCtxValid.foreach(_ := False) }
+
+    val mulDoneCtx = mulCtx.last
     val mulLo = mulCore.io.prodLo
     val mulHi = mulCore.io.prodHi
-    val mulHiLatch = Reg(Bits(32 bits))
-    // N/Z for the .W/.L32 forms come from the low 32-bit product.
     val mulLoN = mulLo(31)
-    val mulLoZ = mulLo === 0
-    // .L32 overflow: the full 64-bit product is not representable in 32 bits. Signed:
-    // high32 != the sign-extension of bit31 (i.e. != all-ones when lo<0, != 0 when
-    // lo>=0). Unsigned: high32 != 0. (.W can't overflow; .L64 V=0.)
     val mulSext = Mux(mulLoN, B(0xFFFFFFFFL, 32 bits), B(0, 32 bits))
-    val mulOverflow = Mux(mulSigned, mulHi =/= mulSext, mulHi =/= B(0, 32 bits))
-    val mulV = (u1.size =/= Size.WORD) && !u1.div64 && mulOverflow   // .L32 only
-    // .L64: N/Z come from the FULL 64-bit product (N=hi[31], Z=(hi|lo==0)); V=0.
-    // .W/.L32: N/Z from the low 32-bit product; V=overflow (.L32 only).
-    val mulN = Mux(u1.div64, mulHi(31), mulLoN)
-    val mulZ = Mux(u1.div64, (mulHi | mulLo) === 0, mulLoZ)
-    val mulNzvcW = (mulN ## mulZ ## mulV ## False).asBits   // N Z V C(0)
+    val mulOverflow = Mux(mulDoneCtx.signed, mulHi =/= mulSext, mulHi =/= B(0, 32 bits))
+    val mulV = (mulDoneCtx.size =/= Size.WORD) && !mulDoneCtx.is64 && mulOverflow
+    val mulN = Mux(mulDoneCtx.is64, mulHi(31), mulLoN)
+    val mulZ = Mux(mulDoneCtx.is64, (mulHi | mulLo) === 0, mulLo === 0)
+    val mulNzvc = (mulN ## mulZ ## mulV ## False).asBits
+
+    mulResultQ.io.push.valid := mulCtxValid.last && mulCore.io.done && !flushSig
+    mulResultQ.io.push.payload.robId       := mulDoneCtx.robId
+    mulResultQ.io.push.payload.data        := mulLo
+    mulResultQ.io.push.payload.pdst        := mulDoneCtx.pdst
+    mulResultQ.io.push.payload.pdstValid   := mulDoneCtx.pdstValid
+    mulResultQ.io.push.payload.nzvc        := mulNzvc
+    mulResultQ.io.push.payload.nzvcWrite   := mulDoneCtx.writesNzvc
+    mulResultQ.io.push.payload.pNzvcDst    := mulDoneCtx.pNzvcDst
+    mulResultQ.io.push.payload.dstArch     := mulDoneCtx.dstArch
+    mulResultQ.io.push.payload.fault       := False
+    mulResultQ.io.push.payload.faultVec    := 0
+    mulResultQ.io.push.payload.crackTail   := False
+    mulResultQ.io.push.payload.flushed     := False
+    mulResultQ.io.push.payload.mulHigh     := mulHi
+    mulResultQ.io.push.payload.mul64       := mulDoneCtx.is64
+    when(mulCtxValid.last) { assert(mulCore.io.done) }
+    assert(!mulResultQ.io.push.valid || mulResultQ.io.push.ready,
+      "reserved MUL result FIFO credit was not available at product completion")
+
+    // A main .L64 result is associated with the immediately following MULHI ROB
+    // entry.  Store high under (mainRob+1) so the queued tail indexes with its own id.
+    val mulHiMem = Mem(Bits(32 bits), 64)
+    val mulHiValid = Reg(Bits(64 bits)) init 0
+    val mulHiHead = mulHiPendingQ.io.pop.payload
+    val mulHiHeadReady = mulHiPendingQ.io.pop.valid && mulHiValid(mulHiHead.robId)
+    val mulHiData = mulHiMem.readAsync(mulHiHead.robId)
 
     // ---- FSM ----
     val fsm = new StateMachine {
       val IDLE  = new State with EntryPoint
       val DIVING = new State    // DivUnit iterating
-      val MULING = new State    // MulCore registering the product
 
       IDLE.whenIsActive {
         busy := False
@@ -447,17 +561,6 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
               s1Valid := False        // consumed into DIVING (its operands are latched)
               goto(DIVING)
             }
-          } elsewhen(isMulHi) {
-            // Trailing high-product move (.L64): write the latched high product to Dh.
-            // MUL can't overflow into a no-write (.L64 V=0), so always write. No flags.
-            captureComplete(mulHiLatch, B(0, 4 bits), False, True)
-            s1Valid := False
-          } elsewhen(isMul) {
-            // launch the registered DSP multiply (1-cycle); hold busy until done.
-            mulCore.io.start := True
-            busy := True
-            s1Valid := False          // consumed into MULING (operands latched in MulCore)
-            goto(MULING)
           } otherwise {
             // defensive complete (unexpected CPLX µop) so the pipe can't hang.
             captureComplete(B(0, 32 bits), B(0, 4 bits), False, False)
@@ -496,25 +599,74 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
         }
       }
 
-      MULING.whenIsActive {
-        busy := True
-        when(mulCore.io.done) {
-          // Latch the high product for a trailing MULHI (.L64). The .W form writes the
-          // low 32-bit product with N/Z from it (V=0, C=0). (.L32 V + .L64 N/Z = T4/T5.)
-          mulHiLatch := mulHi
-          captureComplete(mulLo, mulNzvcW, u1.writesNzvc, True)
-          busy    := False
-          s1Valid := False
-          goto(IDLE)
+    }
+
+    // Atomic three-source completion arbitration.  The legacy result and both
+    // FIFOs hold their payloads until selected, so the Flow-only ROB lane cannot
+    // lose a same-cycle DIV/MUL or MUL/MULHI collision.  Legacy wins to bound an
+    // older divider; a ready MULHI wins next; pure MUL drains every cycle.
+    mulResultQ.io.pop.ready := False
+    mulHiPendingQ.io.pop.ready := False
+    val arbCollisionObs = legacyValid && mulResultQ.io.pop.valid
+    arbCollisionObs.simPublic()
+
+    def captureArb(result: CplxResult): Unit = {
+      compValid     := True
+      compRobId     := result.robId
+      compData      := result.data
+      compPdst      := result.pdst
+      compPdstValid := result.pdstValid
+      compDstArch   := result.dstArch
+      compNzvc      := result.nzvc
+      compNzvcWrite := result.nzvcWrite
+      compNzvcDst   := result.pNzvcDst
+      compFault     := result.fault
+      compFaultVec  := result.faultVec
+      compDivRem    := result.crackTail
+      compFlushed   := result.flushed
+    }
+
+    when(!flushSig) {
+      when(legacyValid) {
+        captureArb(legacyResult)
+        legacyValid := False
+      } elsewhen(mulHiHeadReady) {
+        compValid     := True
+        compRobId     := mulHiHead.robId
+        compData      := mulHiData
+        compPdst      := mulHiHead.pdst
+        compPdstValid := True
+        compDstArch   := mulHiHead.dstArch
+        compNzvc      := 0
+        compNzvcWrite := False
+        compNzvcDst   := 0
+        compFault     := False
+        compFaultVec  := 0
+        compDivRem    := True
+        compFlushed   := False
+        mulHiPendingQ.io.pop.ready := True
+        mulHiValid(mulHiHead.robId) := False
+      } elsewhen(mulResultQ.io.pop.valid) {
+        captureArb(mulResultQ.io.pop.payload)
+        mulResultQ.io.pop.ready := True
+        when(mulResultQ.io.pop.payload.mul64) {
+          val tailRobId = (mulResultQ.io.pop.payload.robId + 1).resized
+          mulHiMem.write(tailRobId, mulResultQ.io.pop.payload.mulHigh)
+          mulHiValid(tailRobId) := True
         }
       }
+    }
+    when(flushSig) {
+      legacyValid := False
+      compValid := False
+      mulHiValid := 0
     }
 
     // ---- drive ports from the registered completion stage ----
     // compFlushed suppresses a WRONG-PATH completion (a multi-cycle op flushed in
     // flight): no completion / PRF write / wakeup / euFault — its robId may already
     // be reused by a correct-path op.
-    val compLive = compValid && !compFlushed
+    val compLive = compValid && !compFlushed && !flushSig
     completionPort.valid   := compLive
     completionPort.payload := compRobId
     intW.valid     := compLive && compPdstValid && !compFault
@@ -529,7 +681,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     nzvcByp.valid   := nzvcW.valid
     nzvcByp.address := nzvcW.address
     nzvcByp.data    := nzvcW.data
-    // Dynamic-completion wakeup: a completing DIV that produced a physreg.
+    // Dynamic-completion wakeup: a completing CPLX op that produced a physreg.
     wakeupPort.valid   := compLive && compPdstValid && !compFault
     wakeupPort.payload := compPdst
     // Dynamic-completion NZVC wakeup (task #167): a completing CPLX op that wrote flags

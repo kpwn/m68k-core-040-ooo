@@ -1,9 +1,11 @@
 # Throughput audit: one-at-a-time controllers, DSP pipelines, and Markdown reconciliation
 
-**Status:** REVIEW COMPLETE; this document records findings and priorities. It
-does not amend the fixed architecture by itself. Any item marked "spec update
-required" must be reconciled in the owning architecture document before RTL is
-changed.
+**Status:** REVIEW COMPLETE; the aligned LSU/VIPT, slow-ALU, MOVEM arithmetic,
+fetch-ring turnover, and fixed-latency CPLX MUL recommendations have landed and
+passed their simulation gates.  Their shared post-route FMax/area acceptance is
+still pending.  This document records findings and priorities; it does not amend
+the fixed architecture by itself. Any item marked "spec update required" must be
+reconciled in the owning architecture document before RTL is changed.
 
 **Scope:** repository-wide inventory of the 212 Markdown files visible with
 hidden progress ledgers included (96 specifications, 80 plans, 30 SDD progress
@@ -33,15 +35,18 @@ not a failure to overlap TLB and cache lookup.
 
 The remaining material one-at-a-time behavior is concentrated in four places:
 
-1. the ALU slow stages are physically pipelined but globally occupancy-gated;
-2. the combined CPLX EU serializes fixed-latency MUL/CHK/CMP2 behind DIV;
+1. changed-VPN DTLB hits cannot turn over every cycle because the registered
+   response is associated with the live VPN rather than a returned token;
+2. the CPLX legacy lane retains serial CHK/CMP2 and one iterative divider context,
+   even though fixed-latency MUL is now independent and II=1;
 3. the SQ producer waits for every store acknowledgement before presenting the
    next store; and
 4. a D-cache demand miss owns the sole miss engine until replay, so hits cannot
    pass it.
 
-The first three affect execution/store throughput directly. The fourth is off
-the all-hit path but becomes important at realistic miss rates.
+The latter two affect store/miss-heavy workloads. The first is an all-hit-path
+edge when adjacent accesses change pages; the second primarily leaves DIV and
+the much colder bound-check operations serialized.
 
 ## 2. Hot and performance-relevant controllers
 
@@ -51,9 +56,10 @@ the all-hit path but becomes important at realistic miss rates.
 | landed | aligned LS/L1D hit path (`LsEuPlugin`, `DcachePlugin`) | same-page resident load II=1; multiple operations in P2/P3/P4, descriptor ring, and VIPT-result queue | hottest memory path; hard, completed in simulation | retain pruned contexts, ordered untagged responses, accept-last turnover, and tokenized early results | precise fault order, store forwarding, flush poison, completion priority; routed area/FMax still required |
 | P1 | changed-VPN DTLB turnaround (`DtlbPlugin`) | same VPN II=1; back-to-back different VPNs require the registered result to settle | memory hot-path edge; moderate | return a decoupled/tagged hit result to an LS slot; keep one TLB and one walker | younger hit versus older walk ordering, U/M identity, faults, permissions, PFLUSHA, exception arbitration |
 | P1 | D-cache demand-miss engine (`DcachePlugin`) | one `IDLE/EVICT_WR/REFILL/REPLAY` context; no demand hit-under-demand-miss | miss path; moderate for one parked miss, hard for many | implement one parked MSHR plus hit-under-miss, with same-set/claimed-way exclusion and ordered completion; do not start with general multi-MSHR | untagged responses, dirty victim ordering, shared store RMW port, fault/flush association; the current SoC crossbar cannot exploit multiple simultaneous bus misses |
-| P1 | combined CPLX/divide EU (`DivEuPlugin`) | CHK/CMP2 about II=2, integrated MUL about II=3, DIV about II=67; only one operation in the EU | MUL is potentially hot; moderate–hard | separate the iterative divider context; make CHK/CMP2 and MUL fixed-latency elastic streams; buffer divider result and arbitrate completion | current global `s1Ctx`, poison, remainder, overflow, and high-product latches assume one outstanding operation |
+| landed | fixed-latency CPLX MUL (`MulCore`, `DivEuPlugin`) | four-stage datapath, II=1 integrated issue and completion; MUL remains live while DIV iterates | potentially hot; completed in simulation | retain pruned descriptor pipe, reserved result credits, one existing completion port, pending MULHI tails, and ROB-keyed high halves | routed DSP-register mapping, area, FMax, and issue/result endpoint timing still require the serialized physical gate |
+| P2 | legacy CPLX/divide lane (`DivEuPlugin`) | CHK/CMP2 about II=2; one DIV context about II=67; a parked second DIV can still block a younger MUL at the registered issue port | mostly cold/iterative; moderate | keep one divider; measure before adding a pending-DIV slot or IQ eligibility forecast; consider 32-step W/L32 iteration only if DIV matters | forecast must reserve the registered issue slot; global remainder/overflow association must be replaced before allowing multiple DIV families in flight |
 | P1/P2 | SQ-to-D-cache drain (`StoreQueue`, `DcachePlugin`) | producer holds one store until local cache ack or AXI B; split stores repeat serially | store-heavy hot path; moderate for copyback hits, hard for WT/MMIO | queue COPYBACK-hit drains first using send/ack pointers; keep SQ entries forwarding-visible until ack; later use one central 2–4-entry D-side write descriptor serializer | S1 read-port conflicts, WT error/B association, split phases, precise order, and proven AW/W cross-pair corruption if independent writers are loosened |
-| P2 | I-cache demand fill (`IcachePlugin`) | resident hit path II=1; one demand/prefetch fill engine closes demand fetch until replay | performance-relevant miss path; moderate–hard | retain next-line prefetch as the cheap mechanism; only if measured, add a tiny ordered fetch request/response queue around one demand MSHR | `FetchRsp` is untagged and FetchAlign attributes it to the ring head; bypass needs ordering or tags |
+| landed/P2 | L1I/frontend and demand fill (`IcachePlugin`, `FetchAlignPlugin`) | resident hit path is latency 3 / II=1 and its fetch ring now turns over at full occupancy; one demand/prefetch fill engine still closes demand fetch until replay | all-hit path completed in simulation; miss path remains moderate–hard | retain the staged TLB/cache path for FMax and the full-ring consume/replace credit; only if measured, add a tiny ordered fetch request/response queue around one demand MSHR | redirect first-use remains N+5 without fetch-directed prediction; `FetchRsp` is untagged, so miss bypass needs ordering or tags |
 
 ### 2.1 ALU evidence
 
@@ -91,6 +97,26 @@ and maintenance writes should converge on a central ordered descriptor/ack
 serializer rather than independently relaxing AW and W FSMs. The hazards in
 `2026-06-07-ls-store-drain-race-design.md` remain binding.
 
+### 2.4 L1I/frontend latency coverage
+
+The resident L1I is VIPT-safe but intentionally does not put live ITLB lookup
+and tag/data lookup in one combinational cycle: virtual `pc[11:6]` selects one
+of 64 sets and the physical page number supplies the tag, while registered T and
+S1 stages protect FMax.  A command accepted at N returns at N+3 and the frontend
+can use it at N+4.  The depth-three tagged fetch ring now grants a same-cycle
+consume/replace credit even when initially full, so that latency disappears from
+the sequential steady state.
+
+The real MMU-on integration test warms ITLB and L1I, then observes eight
+consecutive useful two-wide groups at four instruction words per cycle with
+exact PCs, opwords, and extensions and no cache or page-walker AXI traffic.  It
+also redirects a full ring and proves stale traffic is discarded and the target
+stream restarts in order.  Restoring the old `!ringFull` admission makes the test
+show repeated useful-feed bubbles.  The remaining clean-redirect cost is target
+command N+1 to first useful group N+5; collapsing T/S1 would rebuild a measured
+route-dominated TLB-to-cache cone, so fetch-directed prediction is the safer
+FPGA lever.
+
 ## 3. Controllers that should remain serial
 
 | controller | reason to keep one-at-a-time | better FPGA strategy if measurement later justifies work |
@@ -109,12 +135,13 @@ serializer rather than independently relaxing AW and W FSMs. The hazards in
 
 ## 4. DSP-backed users
 
-The answer to "are DSP users pipelined?" is **no at the execution-system
-boundary**.
+The integer DSP user is now pipelined at the execution-system boundary in RTL
+and directed simulation.  Physical confirmation that Vivado uses the intended
+DSP48E2 internal registers remains open.
 
 | user | DSP count | core latency / II | integrated behavior | finding |
 |---|---:|---:|---|---|
-| integer `MulCore` | 4 | nominal 1 / 1 | `DivEuPlugin` makes issue about II=3 and single-outstanding | only one output register; DSP A/B/M registers are unused |
+| integer `MulCore` | 4 expected | 4 / 1 | integrated `DivEuPlugin` accepts and completes dense MUL at II=1, including while DIV is active | simulation complete; confirm A/B/M/P register mapping and post-route timing |
 | divider | 0 | about 66 / 67 | single iterative context | keep iterative unless a measured workload justifies a different algorithm |
 | MOVEM decode arithmetic | 2 before strength reduction | combinational | not a queue | shift/mux/negate replacement implemented and simulation-gated; synthesized DSP/FMax confirmation pending |
 | FPU | not implemented | draft only | draft is explicitly busy-gated/single-outstanding | amend before implementation: fixed-latency FADD/FMUL should be elastic II=1 |
@@ -122,32 +149,36 @@ boundary**.
 All six synthesized DSP48s are accounted for: four in the integer multiplier and
 two in MOVEM decode. There are no arithmetic blackboxes.
 
-### 4.1 Integer multiply architecture mismatch
+### 4.1 Integer multiply reconciliation and landing
 
-The binding architecture document requires a roughly 3–4-cycle, fully
-pipelined fixed-latency MUL under the integer cluster
-(`2026-05-31-m68k-040-ooo-architecture-design.md`, execute sections). The live
-implementation instead puts a one-register `MulCore` behind the dynamic CPLX
-completion FSM. The later `2026-06-06-multiply-design.md` selected that CPLX
-integration without clearly amending the binding architecture. This is a real
-spec/implementation inconsistency and must be reconciled before MUL RTL changes.
+The former architecture mismatch is resolved in the binding architecture and
+the owning `2026-06-06-multiply-design.md`: logically integer MUL uses the
+existing shared CPLX operand/writeback gateway so no extra IQ, PRF, or ROB port
+is added.  The implementation now has:
 
-Vivado reports only one multiplier pipeline register where four are recommended;
-the DSP properties have `AREG=BREG=MREG=0`, with only cascade outputs using
-`PREG=1`. A correct MUL conversion therefore needs:
+- a four-stage A/B/M/P-shaped `MulCore` pipeline at II=1;
+- a pruned per-operation descriptor pipe rather than a full `IqContext` shift;
+- flush clearing for every fixed-pipeline valid, result credit, pending tail, and
+  ROB-keyed high-product entry;
+- a credit-reserved depth-eight result FIFO and atomic arbitration with held
+  legacy/DIV results through the existing one-result Flow port; and
+- a ROB-keyed high-product stash plus pending-tail FIFO for cracked `MULHI`,
+  including main ROB 63 to tail ROB 0 wrap.
 
-- a roughly four-stage DSP A/B/M/P pipeline at II=1;
-- a pruned per-operation descriptor/epoch pipe, not a full `IqContext` shift;
-- per-operation flush poison rather than the current global latch;
-- completion buffering/arbitration across zero-, fixed-, and iterative-latency
-  results; and
-- a ROB-keyed high-product stash for cracked `MULHI`, replacing the global
-  `mulHiLatch` assumption.
+The tests are deliberately protocol-level rather than a latency-window claim.
+`MulCoreSpec` drives eight starts on eight consecutive cycles.  The integrated
+test accepts twelve consecutive MULs, checks twelve consecutive exactly-once
+completions and both wakeup domains, overlaps two `.L64` pairs, observes a real
+simultaneous DIV/MUL arbiter collision, and immediately reuses ROB/physical
+destinations after a dense flush.  `IqCplxSpec` independently proves a consumer
+with two outstanding CPLX sources remains blocked after the first wake and is
+released only by the second.  Restoring the old single-outstanding EU fails the
+integrated test on its second consecutive request.
 
-Removing `busy` alone is incorrect. Required tests are consecutive-cycle MUL
-bursts, mixed CHK/CMP2/MUL/DIV completion collisions, multi-flight flush, and
-overlapping `.L64` crack sequences. `MulCoreSpec` currently drives one operation
-at a time and cannot prove this contract.
+The older physical baseline remains useful: Vivado reported only one multiplier
+pipeline register, `AREG=BREG=MREG=0`, and cascade `PREG=1`.  The open acceptance
+item is to prove the new registers map into the DSPs and that the added small
+FIFOs/control do not materially regress post-route FMax or area.
 
 ### 4.2 MOVEM strength reduction
 
@@ -192,6 +223,14 @@ association/order, backpressure, flush, and collision behavior. A latency window
 alone is insufficient because it can pass vacuously without demonstrating that
 multiple operations were ever resident.
 
+The multiplier phase applied the same rule to pre-existing CPLX fixtures.
+`DivWSpec` and `ChkSpec` formerly pulsed `valid` without observing `ready`; they
+now hold a transaction until handshake.  The CHK fixture now drives the real
+NZVC-write contract and distinguishes architectural fault-flag observation from
+renamed-destination wakeup.  DIV overflow now checks the required old-Dn
+write-through into the freshly renamed physical destination instead of expecting
+no write and silently blessing a scoreboard deadlock.
+
 The ALU phase uncovered two more stale assertions: ADDA was checked with the
 pre-fix source/destination order, and legal microcoded CMPM was still expected
 to decode as illegal. The repaired tests now assert the binding
@@ -212,6 +251,14 @@ Current gate evidence for the LSU change:
   1829/2030. Excluding `load-stream`, aggregate cycles improve slightly rather
   than regress.
 
+Current integrated MUL landing evidence:
+
+- focused `MulCore` + integrated CPLX + DIV/CHK + IQ dependency cluster: 15/15;
+- the integrated test's legacy single-outstanding negative control fails on the
+  second consecutive MUL request;
+- full-core synthesis-top elaboration passes; and
+- mandatory combined-branch `test-fast`: 138/138 across 144 suites.
+
 Spinal also emits an initial elaboration failure for three undriven
 `InterruptControlPlugin` fixture registers (`iplIn`, `iackAvec`, `iackVector`),
 then restarts and the interrupt tests pass. That should be repaired as fixture
@@ -221,7 +268,7 @@ debt; suppressing or ignoring it would make the gate less trustworthy.
 
 | document family | review result | action |
 |---|---|---|
-| binding core architecture | fully pipelined MUL requirement conflicts with live CPLX implementation | ratify one architecture before MUL RTL work |
+| binding core architecture | reconciled: four-stage II=1 integer MUL uses the existing shared CPLX gateway and ports | physical mapping/FMax/area acceptance remains open |
 | LS pipeline specs/plans | newest full-pipeline spec is correct and now carries measured D1/D2 results; older late-split documents are historical checkpoints | treat `2026-08-09-ipc-ls-eu-full-pipeline-design.md` as current |
 | ALU slow-path spec | implemented and simulation-gated at II=1 | run the paired routed FMax/LUT and IQ-endpoint census before final acceptance |
 | MSHR proposal | correctly prioritizes D-side hit-under-miss and warns about crossbar limits | implement one parked miss before general MSHRs |
@@ -238,8 +285,8 @@ debt; suppressing or ignoring it would make the gate less trustworthy.
    measured timing failure in the paired routed gate.
 3. Run the paired routed FMax/LUT and IQ-endpoint census for the landed ALU II=1
    pipeline; retain it only if the issue-select cone stays under control.
-4. Reconcile the binding MUL architecture, then implement the four-stage II=1
-   DSP pipeline and completion protocol.
+4. Run the paired routed DSP-register/FMax/LUT/FF gate for the landed four-stage
+   II=1 MUL pipeline and completion protocol.
 5. Measure D-cache miss occupancy, SQ-full/drain stalls, CPLX mix, and changed-VPN
    DTLB bubbles on representative workloads.
 6. Choose among one-MSHR D-cache hit-under-miss, COPYBACK store-drain queuing,

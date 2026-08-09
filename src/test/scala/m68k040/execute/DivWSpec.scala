@@ -66,6 +66,7 @@ class DivWSpec extends AnyFunSuite {
 
       val cValid  = out Bool ();        cValid  := eu.completion.valid
       val cRob    = out UInt (6 bits);  cRob    := eu.completion.payload
+      val iReady  = out Bool ();        iReady  := eu.issue.ready
       val fValid  = out Bool ();        fValid  := eu.euFault.valid
       val fVec    = out UInt (8 bits);  fVec    := eu.euFault.payload.vector
       val wbV     = out Bool ();        wbV     := host[DivEuPlugin].logic.wbObs.valid
@@ -96,7 +97,13 @@ class DivWSpec extends AnyFunSuite {
       cd.waitSampling(); s.wAValid #= false; s.wBValid #= false
       cd.waitSampling(3)
       s.iValid #= true; s.iRobId #= 7
-      cd.waitSampling(); s.iValid #= false
+      var issueGuard = 0
+      while (!s.iReady.toBoolean && issueGuard < 100) {
+        cd.waitSampling(); issueGuard += 1
+      }
+      assert(s.iReady.toBoolean, "DIV source never observed issue.ready")
+      cd.waitSampling() // valid && ready: the one accepted DIV transaction
+      s.iValid #= false
       var guard = 0
       var captured = false
       while (guard < 80 && !captured) {
@@ -124,10 +131,11 @@ class DivWSpec extends AnyFunSuite {
     assert((nzvc & 0x2) == 0, "V must be 0 (no overflow)")
   }
 
-  test("DIVU.W overflow: 0xFFFFFFFF / 1 -> V=1, no write", VerilatorTest) {
-    val (_, nzvc, intW, fvec) = runDivW(0xFFFFFFFFL, 1, signed = false)
+  test("DIVU.W overflow: V=1 and old Dn is written through renamed pdst", VerilatorTest) {
+    val (res, nzvc, intW, fvec) = runDivW(0xFFFFFFFFL, 1, signed = false)
     assert(fvec == -1, "overflow is NOT a trap")
-    assert(!intW, "overflow must NOT write the result")
+    assert(intW, "renamed destination must be made ready even when architectural Dn is unchanged")
+    assert(res == 0xFFFFFFFFL, f"overflow write-through changed old Dn: $res%08x")
     assert((nzvc & 0x2) != 0, "V must be 1 on overflow")
   }
 
@@ -146,9 +154,10 @@ class DivWSpec extends AnyFunSuite {
     assert(r == -2, s"signed remainder=$r expected -2 (dividend sign)")
   }
 
-  test("DIVS.W overflow: -2^31 / 1 -> V=1, no write", VerilatorTest) {
-    val (_, nzvc, intW, fvec) = runDivW(0x80000000L, 1, signed = true)
-    assert(fvec == -1 && !intW, "signed .W overflow: V set, no write")
+  test("DIVS.W overflow: V=1 and old Dn is written through renamed pdst", VerilatorTest) {
+    val (res, nzvc, intW, fvec) = runDivW(0x80000000L, 1, signed = true)
+    assert(fvec == -1 && intW, "signed .W overflow must ready the renamed pdst")
+    assert(res == 0x80000000L, f"overflow write-through changed old Dn: $res%08x")
     assert((nzvc & 0x2) != 0, "V must be 1")
   }
 }

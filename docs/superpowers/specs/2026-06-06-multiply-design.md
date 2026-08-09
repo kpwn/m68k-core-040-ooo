@@ -1,6 +1,7 @@
 # Multiply (MULU/MULS, full 040) — Design
 
-**Status:** Accepted; feature implementation landed, 2026-08-09 II=1 throughput amendment in progress.
+**Status:** Accepted; 2026-08-09 II=1 throughput amendment is simulation-complete,
+with physical acceptance pending.
 **Date:** 2026-06-06
 **Parent:** the divider ([[exception-subsystem]] CPLX cluster), the decode matrix ([[decode-matrix-framework]]).
 
@@ -30,10 +31,12 @@ Integer multiply MULU/MULS (all 68040 forms) on the CPLX cluster (the DivEu's ho
   the parent is updated in the same phase.  The purpose is to avoid duplicating
   the DSP chain or adding IQ/PRF/ROB ports.
 - **64-bit association:** the MUL µop writes Dl and deposits Dh in a ROB-id-keyed
-  high-product stash.  The trailing MULHI µop reads only the matching entry.
-  A single global high-product latch is forbidden once more than one multiply can
-  be in flight.  Both register and memory-source cracks carry a real low-result
-  dependency so MULHI cannot occupy the CPLX issue port before its producer lands.
+  high-product stash under the immediately following tail id
+  `(mainRobId + 1) mod 64`.  A small pending-tail descriptor FIFO accepts MULHI
+  even before Dh exists, removing it from the sole CPLX issue port; it may emit
+  only when its own ROB id is valid in the stash.  A single global high-product
+  latch and an invented PRF dependency are both forbidden once more than one
+  multiply can be in flight.
 - **Flags:** N/Z from the result (32-bit for .W/.L32, 64-bit for .L64); V = overflow (.L32 only); C always 0; X unaffected.
 - **Verification:** lock-step vs Musashi — MULU/MULS .W, .L32 (incl. overflow→V), .L64 (Dh:Dl) with normal/signed/edge operands (0, max, sign-boundary); N/Z/V step-for-step. ALL existing UNCHANGED. **POST-ROUTE gate** (impl_FullCore.tcl): report WNS/FMAX; must not meaningfully regress master's ~243 (default-directive) baseline.
 
@@ -62,10 +65,16 @@ CplxEU  : DSP-inferred a*b (4-stage, II=1) -> result FIFO -> shared completion a
   result FIFO must have enough reserved capacity for every product already in
   the non-stallable DSP pipeline; an assertion proves that a valid product never
   meets a non-ready FIFO input.
+- CPLX `issue.ready` advertises capacity when the registered Stream is invalid;
+  stale payload bits must never prevent the IQ from loading a lane-eligible MUL
+  behind an active divider.  Once valid, readiness is selected per operation.
 - The legacy CHK/CMP2/DIV path holds one completed result until the arbiter takes
   it.  The arbiter emits at most one result per cycle through the existing Flow
   completion interface; it may delay completion but may never overwrite, drop,
   or duplicate either source.
+- MULHI carries only `{robId,pdst,dstArch}` in its pending FIFO.  Its high half is
+  written into the stash only when the corresponding low result wins arbitration,
+  so the tail cannot complete before its primary.  ROB-id wrap 63→0 is defined.
 - A backend flush blocks same-cycle issue and output, clears all MUL descriptor
   valids, result credits/FIFO state, and ROB-keyed high-product valid bits.  The
   iterative divider may finish internally, but its poisoned result remains
@@ -99,3 +108,27 @@ CplxEU  : DSP-inferred a*b (4-stage, II=1) -> result FIFO -> shared completion a
 - Compare DSP/LUT/FF counts, CPLX issue/result endpoints, WNS, and post-route FMax
   against the pre-amendment branch.  The simulation landing is provisional until
   this shared serialized gate can run.
+
+## 6. Landing evidence and retained limits
+
+- `MulCoreSpec` proves eight consecutive starts and eight fixed-latency,
+  consecutively associated completions.  The integrated CPLX test proves twelve
+  consecutive accepts/completions, signed/unsigned `.W` and `.L32`, overlapping
+  `.L64` pairs including ROB 63→0, dense flush plus immediate ROB/pdst/pNZVC
+  reuse, and an observed simultaneous DIV/MUL arbiter collision with no lost or
+  duplicated Flow result.
+- `IqCplxSpec` proves that a consumer of two outstanding CPLX results remains
+  blocked after the first wake and issues only after the second; same-cycle
+  push+wake and flush clearing are also covered.
+- The focused five-suite arithmetic/protocol cluster passes 15/15; full-core
+  synthesis-top elaboration passes; and the mandatory combined-branch
+  `make SBT=~/sbt/bin/sbt test-fast` gate passes 138/138 across 144 suites.
+- The iterative divider deliberately remains one-context and non-pipelined.  A
+  second DIV can still occupy the registered CPLX issue slot and temporarily
+  head-of-line block a younger MUL; address this only with an eligibility
+  forecast or pending-DIV slot that reserves the registered handoff cycle.
+- `DIVREM` still relies on the single-divider remainder/overflow association.
+  Do not admit another DIV family before its exact tail consumes that state
+  unless it is replaced with ROB-keyed pair storage.  A flushed active divider
+  is poisoned and allowed to finish internally, so a new DIV may wait for it;
+  fixed-latency MUL remains available during that wait.

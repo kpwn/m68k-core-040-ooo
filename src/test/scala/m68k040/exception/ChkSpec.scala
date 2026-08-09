@@ -43,7 +43,7 @@ class ChkSpec extends AnyFunSuite {
       uop.psrcC := 0; uop.psrcCValid := False
       uop.pdst := 0; uop.pdstValid := False; uop.pdstOld := 0
       uop.pNzvcSrc := 0; uop.readsNzvc := False
-      uop.pNzvcDst := 0; uop.writesNzvc := False; uop.pNzvcOld := 0
+      uop.pNzvcDst := 1; uop.writesNzvc := True; uop.pNzvcOld := 0
       uop.readsX := False; uop.pXSrc := 0; uop.pXDst := 0; uop.writesX := False; uop.pXOld := 0
       uop.faulted := False; uop.faultVector := 0; uop.isRte := False
       uop.faultAddr := 0; uop.sswInstr := False
@@ -64,10 +64,13 @@ class ChkSpec extends AnyFunSuite {
 
       val cValid  = out Bool ();        cValid  := eu.completion.valid
       val cRob    = out UInt (6 bits);  cRob    := eu.completion.payload
+      val iReady  = out Bool ();        iReady  := eu.issue.ready
       val fValid  = out Bool ();        fValid  := eu.euFault.valid
       val fRob    = out UInt (6 bits);  fRob    := eu.euFault.payload.robId
       val fVec    = out UInt (8 bits);  fVec    := eu.euFault.payload.vector
       val nObs    = out Bool ();        nObs    := host[DivEuPlugin].logic.chkNObs
+      val wbNzvcWrite = out Bool ();    wbNzvcWrite := host[DivEuPlugin].logic.wbObs.valid && host[DivEuPlugin].logic.wbObs.nzvcWrite
+      val nzWakeValid = out Bool ();    nzWakeValid := eu.wakeupNzvc.valid
     }
   }
   class Dut extends Component {
@@ -79,9 +82,12 @@ class ChkSpec extends AnyFunSuite {
     db.on { host.asHostOf(Seq[FiberPlugin](rfInt, rfNzvc, eu, src)) }
   }
 
-  /** Returns (sawComplete, sawFault, vector, nFlagAtIssue). */
-  def runOne(dn: Long, bound: Long, word: Boolean): (Boolean, Boolean, Int, Boolean) = {
+  /** Returns (complete, fault, vector, nFlag, architectural-NZVC observation,
+    * physical-NZVC wakeup). A faulting CHK keeps its flags in ccrObs for stacking,
+    * but does not wake the rolled-back renamed destination. */
+  def runOne(dn: Long, bound: Long, word: Boolean): (Boolean, Boolean, Int, Boolean, Boolean, Boolean) = {
     var sawComplete = false; var sawFault = false; var vec = -1; var nAtIssue = false
+    var sawNzvcObs = false; var sawNzvcWake = false
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10); val s = dut.src.logic
       s.iValid #= false; s.iRobId #= 7; s.iPsrcA #= 3; s.iPsrcB #= 4; s.iWord #= word
@@ -93,6 +99,9 @@ class ChkSpec extends AnyFunSuite {
       cd.waitSampling(); s.wAValid #= false; s.wBValid #= false
       cd.waitSampling(3)
       s.iValid #= true; s.iPsrcA #= 3; s.iPsrcB #= 4; s.iRobId #= 7
+      var issueGuard = 0
+      while (!s.iReady.toBoolean && issueGuard < 20) { cd.waitSampling(); issueGuard += 1 }
+      assert(s.iReady.toBoolean, "CHK source never observed issue.ready")
       cd.waitSampling()
       if (dut.src.logic.nObs.toBoolean) nAtIssue = true
       s.iValid #= false
@@ -100,40 +109,47 @@ class ChkSpec extends AnyFunSuite {
         if (dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == 7) sawComplete = true
         if (dut.src.logic.fValid.toBoolean && dut.src.logic.fRob.toInt == 7) { sawFault = true; vec = dut.src.logic.fVec.toInt }
         if (dut.src.logic.nObs.toBoolean) nAtIssue = true
+        if (dut.src.logic.wbNzvcWrite.toBoolean) sawNzvcObs = true
+        if (dut.src.logic.nzWakeValid.toBoolean) sawNzvcWake = true
         cd.waitSampling()
       }
     }
-    (sawComplete, sawFault, vec, nAtIssue)
+    (sawComplete, sawFault, vec, nAtIssue, sawNzvcObs, sawNzvcWake)
   }
 
   test("CHK.W in-bounds (0 <= Dn <= bound) -> no trap, completes", VerilatorTest) {
-    val (complete, fault, _, _) = runOne(dn = 5, bound = 10, word = true)
+    val (complete, fault, _, _, nzvcObs, nzvcWake) = runOne(dn = 5, bound = 10, word = true)
     assert(complete, "in-bounds CHK must complete (retire as no-op)")
     assert(!fault, "in-bounds CHK must NOT fault")
+    assert(nzvcObs && nzvcWake, "live CHK must observe and wake its NZVC destination")
   }
 
   test("CHK.W Dn<0 -> trap vector 6, N=1", VerilatorTest) {
-    val (complete, fault, vec, n) = runOne(dn = 0xfffffffbL, bound = 10, word = true) // -5
+    val (complete, fault, vec, n, nzvcObs, nzvcWake) = runOne(dn = 0xfffffffbL, bound = 10, word = true) // -5
     assert(fault, "Dn<0 must trap")
     assert(vec == 6, s"CHK trap vector must be 6, got $vec")
     assert(n, "Dn<0 must set N=1")
     assert(complete, "the faulting CHK must also complete so it can retire")
+    assert(nzvcObs && !nzvcWake, "faulting CHK flags must be stacked, not wake a rolled-back NZVC pdst")
   }
 
   test("CHK.W Dn>bound -> trap vector 6, N=0", VerilatorTest) {
-    val (_, fault, vec, n) = runOne(dn = 20, bound = 10, word = true)
+    val (_, fault, vec, n, nzvcObs, nzvcWake) = runOne(dn = 20, bound = 10, word = true)
     assert(fault, "Dn>bound must trap")
     assert(vec == 6, s"CHK trap vector must be 6, got $vec")
     assert(!n, "Dn>bound must set N=0")
+    assert(nzvcObs && !nzvcWake)
   }
 
   test("CHK.L in-bounds with large 32-bit bound -> no trap", VerilatorTest) {
-    val (complete, fault, _, _) = runOne(dn = 0x12345, bound = 0x7fffffffL, word = false)
+    val (complete, fault, _, _, nzvcObs, nzvcWake) = runOne(dn = 0x12345, bound = 0x7fffffffL, word = false)
     assert(complete && !fault, "CHK.L in-bounds must complete without trapping")
+    assert(nzvcObs && nzvcWake)
   }
 
   test("CHK.L Dn>bound (32-bit) -> trap vector 6, N=0", VerilatorTest) {
-    val (_, fault, vec, n) = runOne(dn = 0x40000000L, bound = 0x1000, word = false)
+    val (_, fault, vec, n, nzvcObs, nzvcWake) = runOne(dn = 0x40000000L, bound = 0x1000, word = false)
     assert(fault && vec == 6 && !n, "CHK.L Dn>bound must trap vec6 with N=0")
+    assert(nzvcObs && !nzvcWake)
   }
 }

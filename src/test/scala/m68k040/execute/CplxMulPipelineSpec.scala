@@ -170,9 +170,9 @@ class CplxMulPipelineSpec extends AnyFunSuite {
 
       uop.dstArch := iDstArch
       uop.psrcA := iPsrcA
-      uop.psrcAValid := iOp === DecOp.MUL
+      uop.psrcAValid := (iOp === DecOp.MUL) || (iOp === DecOp.DIV)
       uop.psrcB := iPsrcB
-      uop.psrcBValid := iOp === DecOp.MUL
+      uop.psrcBValid := (iOp === DecOp.MUL) || (iOp === DecOp.DIV)
       uop.psrcC := 0
       uop.psrcCValid := False
       uop.pdst := iPdst
@@ -237,6 +237,11 @@ class CplxMulPipelineSpec extends AnyFunSuite {
 
       val faultValid = out Bool()
       faultValid := eu.euFault.valid
+
+      // Sim-only non-vacuity witness: a held legacy result and a queued MUL result
+      // were simultaneously eligible at the shared one-result arbiter.
+      val arbCollision = out Bool()
+      arbCollision := divEu.logic.arbCollisionObs
 
       val wbValid = out Bool()
       val wbRob = out UInt(6 bits)
@@ -328,8 +333,10 @@ class CplxMulPipelineSpec extends AnyFunSuite {
 
       var cycle = 0
       val seen = ArrayBuffer[Seen]()
+      var sawArbCollision = false
 
       def sample(): Unit = {
+        if (s.arbCollision.toBoolean) sawArbCollision = true
         assert(!s.faultValid.toBoolean, s"unexpected CPLX fault at cycle $cycle")
         assert(s.cValid.toBoolean == s.wbValid.toBoolean,
           s"completion/wb validity split at cycle $cycle")
@@ -505,15 +512,16 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       for (_ <- 0 until 3) tick()
       assert(seen.size == denseDone, "dense MUL emitted an extra completion")
 
-      // Two .L64 pairs overlap.  Pair A deliberately wraps main ROB 62 -> tail 63;
-      // pair B uses main ROB 0 -> tail 1, so no global high-product latch can pass.
-      val mainA = Req(62, 36, 13, 2, 0, 1,
+      // Two .L64 pairs overlap.  Pair A deliberately wraps main ROB 63 -> tail 0;
+      // pair B uses main ROB 1 -> tail 2, so both modulo association and the removal
+      // of the old global high-product latch are exercised.
+      val mainA = Req(63, 36, 13, 2, 0, 1,
         0xffffffffL, 0xffffffffL, signed = false, Size.LONG, is64 = true)
-      val tailA = Req(63, 37, 0, 3, 0, 0,
+      val tailA = Req(0, 37, 0, 3, 0, 0,
         mainA.a, mainA.b, mainA.signed, Size.LONG, is64 = true, tail = true)
-      val mainB = Req(0, 38, 14, 4, 2, 3,
+      val mainB = Req(1, 38, 14, 4, 2, 3,
         0x80000000L, 2, signed = true, Size.LONG, is64 = true)
-      val tailB = Req(1, 39, 0, 5, 0, 0,
+      val tailB = Req(2, 39, 0, 5, 0, 0,
         mainB.a, mainB.b, mainB.signed, Size.LONG, is64 = true, tail = true)
       val pairs = Seq(mainA, tailA, mainB, tailB)
       preload(pairs)
@@ -524,6 +532,71 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       val pairDone = seen.size
       for (_ <- 0 until 3) tick()
       assert(seen.size == pairDone, "overlapping L64 emitted an extra completion")
+
+      // Start an iterative divide, then place a dense MUL burst across its fixed
+      // completion window.  The sim-only witness proves this is a real two-source
+      // collision, not merely a test that happened to run both engines at different
+      // times.  Every Flow result still has to emerge once because there is no ROB
+      // backpressure with which to recover a dropped completion.
+      val collisionMuls = Seq.tabulate(8) { i =>
+        Req(40 + i, 24 + i, 1 + i, 8 + i, 2 * i, 2 * i + 1,
+          BigInt(0x10101 + i * 0x111), BigInt(3 + i),
+          signed = (i & 1) != 0, Size.LONG)
+      }
+      preload(collisionMuls)
+      s.preAValid #= true; s.preAAddr #= 20; s.preAData #= 100
+      s.preBValid #= true; s.preBAddr #= 21; s.preBData #= 7
+      tick()
+      s.preAValid #= false; s.preBValid #= false
+      tick()
+
+      s.iOp #= DecOp.DIV
+      s.iSize #= Size.WORD
+      s.iSigned #= false
+      s.iIs64 #= false
+      s.iRob #= 39
+      s.iPsrcA #= 20
+      s.iPsrcB #= 21
+      s.iPdst #= 40
+      s.iPNzvcDst #= 15
+      s.iDstArch #= 7
+      s.iWritesNzvc #= true
+      s.iValid #= true
+      sleep(1)
+      assert(s.iReady.toBoolean && s.iFire.toBoolean, "collision DIV was not accepted")
+      tick()
+      s.iValid #= false
+      val collisionFrom = seen.size
+
+      // DIV launch wrapper + 64 restoring steps puts its held result in this
+      // neighborhood; the burst is wide enough to cover minor wrapper retiming.
+      for (_ <- 0 until 58) tick()
+      issueDense(collisionMuls, "MUL while DIV active")
+      drainTo(collisionFrom + 1 + collisionMuls.length, 100, "DIV/MUL collision")
+      assert(sawArbCollision,
+        "DIV/MUL test never created simultaneous legacy and MUL arbiter sources")
+
+      val collisionSeen = seen.slice(collisionFrom, collisionFrom + 1 + collisionMuls.length).toSeq
+      val collisionExpected = collisionMuls.map(expected) :+ Expected(
+        rob = 39, pdst = 40, pNzvcDst = 15, dstArch = 7,
+        data = BigInt(0x0002000eL), nzvc = 0, nzvcWrite = true, tail = false)
+      assert(collisionSeen.map(_.rob).distinct.length == collisionExpected.length,
+        s"DIV/MUL collision duplicated a completion: ${collisionSeen.map(_.rob)}")
+      assert(collisionSeen.map(_.rob).toSet == collisionExpected.map(_.rob).toSet,
+        s"DIV/MUL collision lost/misrouted a completion: got=${collisionSeen.map(_.rob)}")
+      val expectedByRob = collisionExpected.map(e => e.rob -> e).toMap
+      collisionSeen.foreach { g =>
+        val e = expectedByRob(g.rob)
+        assert(g.pdst == e.pdst && g.dstArch == e.dstArch,
+          s"DIV/MUL collision routing mismatch for rob=${g.rob}")
+        assert(g.data == e.data,
+          f"DIV/MUL collision rob=${g.rob} data=0x${g.data}%08x expected=0x${e.data}%08x")
+        assert(g.nzvcWrite == e.nzvcWrite && g.nzvc == e.nzvc,
+          s"DIV/MUL collision flag mismatch for rob=${g.rob}")
+      }
+      val collisionDone = seen.size
+      for (_ <- 0 until 4) tick()
+      assert(seen.size == collisionDone, "DIV/MUL collision emitted an extra completion")
 
       // Fill the active pipeline/result path with distinct wrong values, flush, then
       // immediately reuse the same ROB IDs and destinations.  No pre-flush product,
