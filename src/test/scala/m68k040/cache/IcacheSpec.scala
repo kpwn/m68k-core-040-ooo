@@ -67,6 +67,19 @@ class IcacheSpec extends AnyFunSuite {
     simConfig.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
+      // This suite is the DEMAND-path unit test: every one of its assertions counts
+      // exact AXI bursts and exact round-robin victim-way sequences, both of which
+      // slice I3's next-line prefetch legitimately perturbs (an extra AR per fill, an
+      // extra victim advance in the NEXT set). Prefetch behaviour has its own suite,
+      // IcachePrefetchSpec, which turns this back on and asserts rules P1-P4. Using
+      // the real runtime control here rather than a compile-time knob is exactly what
+      // that control is for (design doc §8.3).
+      // `prefetchEnable` is a RegInit(True), so a single poke here would be overwritten
+      // by the reset value on the next edge (`forkStimulus` holds reset for the first
+      // cycles). Re-poke from a NON-BLOCKING fork instead: a blocking `waitSampling`
+      // here would run before `attachMemory` below, leaving the AXI port unserved while
+      // an uninitialised `cmdIn.valid` can start a refill that never completes.
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
 
       // attach behavioral AXI memory (cover a big range)
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
@@ -93,6 +106,19 @@ class IcacheSpec extends AnyFunSuite {
     simConfig.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
+      // This suite is the DEMAND-path unit test: every one of its assertions counts
+      // exact AXI bursts and exact round-robin victim-way sequences, both of which
+      // slice I3's next-line prefetch legitimately perturbs (an extra AR per fill, an
+      // extra victim advance in the NEXT set). Prefetch behaviour has its own suite,
+      // IcachePrefetchSpec, which turns this back on and asserts rules P1-P4. Using
+      // the real runtime control here rather than a compile-time knob is exactly what
+      // that control is for (design doc §8.3).
+      // `prefetchEnable` is a RegInit(True), so a single poke here would be overwritten
+      // by the reset value on the next edge (`forkStimulus` holds reset for the first
+      // cycles). Re-poke from a NON-BLOCKING fork instead: a blocking `waitSampling`
+      // here would run before `attachMemory` below, leaving the AXI port unserved while
+      // an uninitialised `cmdIn.valid` can start a refill that never completes.
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
 
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
 
@@ -134,6 +160,19 @@ class IcacheSpec extends AnyFunSuite {
     simConfig.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
+      // This suite is the DEMAND-path unit test: every one of its assertions counts
+      // exact AXI bursts and exact round-robin victim-way sequences, both of which
+      // slice I3's next-line prefetch legitimately perturbs (an extra AR per fill, an
+      // extra victim advance in the NEXT set). Prefetch behaviour has its own suite,
+      // IcachePrefetchSpec, which turns this back on and asserts rules P1-P4. Using
+      // the real runtime control here rather than a compile-time knob is exactly what
+      // that control is for (design doc §8.3).
+      // `prefetchEnable` is a RegInit(True), so a single poke here would be overwritten
+      // by the reset value on the next edge (`forkStimulus` holds reset for the first
+      // cycles). Re-poke from a NON-BLOCKING fork instead: a blocking `waitSampling`
+      // here would run before `attachMemory` below, leaving the AXI port unserved while
+      // an uninitialised `cmdIn.valid` can start a refill that never completes.
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
       dut.probe.logic.cmdIn.valid #= false
       dut.probe.logic.cmdIn.payload.pc #= 0
@@ -165,6 +204,19 @@ class IcacheSpec extends AnyFunSuite {
     simConfig.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
+      // This suite is the DEMAND-path unit test: every one of its assertions counts
+      // exact AXI bursts and exact round-robin victim-way sequences, both of which
+      // slice I3's next-line prefetch legitimately perturbs (an extra AR per fill, an
+      // extra victim advance in the NEXT set). Prefetch behaviour has its own suite,
+      // IcachePrefetchSpec, which turns this back on and asserts rules P1-P4. Using
+      // the real runtime control here rather than a compile-time knob is exactly what
+      // that control is for (design doc §8.3).
+      // `prefetchEnable` is a RegInit(True), so a single poke here would be overwritten
+      // by the reset value on the next edge (`forkStimulus` holds reset for the first
+      // cycles). Re-poke from a NON-BLOCKING fork instead: a blocking `waitSampling`
+      // here would run before `attachMemory` below, leaving the AXI port unserved while
+      // an uninitialised `cmdIn.valid` can start a refill that never completes.
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
       dut.probe.logic.cmdIn.valid #= false
       dut.probe.logic.cmdIn.payload.pc #= 0
@@ -218,6 +270,19 @@ class IcacheSpec extends AnyFunSuite {
     simConfig.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
+      // This suite is the DEMAND-path unit test: every one of its assertions counts
+      // exact AXI bursts and exact round-robin victim-way sequences, both of which
+      // slice I3's next-line prefetch legitimately perturbs (an extra AR per fill, an
+      // extra victim advance in the NEXT set). Prefetch behaviour has its own suite,
+      // IcachePrefetchSpec, which turns this back on and asserts rules P1-P4. Using
+      // the real runtime control here rather than a compile-time knob is exactly what
+      // that control is for (design doc §8.3).
+      // `prefetchEnable` is a RegInit(True), so a single poke here would be overwritten
+      // by the reset value on the next edge (`forkStimulus` holds reset for the first
+      // cycles). Re-poke from a NON-BLOCKING fork instead: a blocking `waitSampling`
+      // here would run before `attachMemory` below, leaving the AXI port unserved while
+      // an uninitialised `cmdIn.valid` can start a refill that never completes.
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
       dut.probe.logic.cmdIn.valid #= false
       dut.probe.logic.cmdIn.payload.pc #= 0
@@ -280,6 +345,19 @@ class IcacheSpec extends AnyFunSuite {
     simConfig.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
+      // This suite is the DEMAND-path unit test: every one of its assertions counts
+      // exact AXI bursts and exact round-robin victim-way sequences, both of which
+      // slice I3's next-line prefetch legitimately perturbs (an extra AR per fill, an
+      // extra victim advance in the NEXT set). Prefetch behaviour has its own suite,
+      // IcachePrefetchSpec, which turns this back on and asserts rules P1-P4. Using
+      // the real runtime control here rather than a compile-time knob is exactly what
+      // that control is for (design doc §8.3).
+      // `prefetchEnable` is a RegInit(True), so a single poke here would be overwritten
+      // by the reset value on the next edge (`forkStimulus` holds reset for the first
+      // cycles). Re-poke from a NON-BLOCKING fork instead: a blocking `waitSampling`
+      // here would run before `attachMemory` below, leaving the AXI port unserved while
+      // an uninitialised `cmdIn.valid` can start a refill that never completes.
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
       val base = 0x5000L
       val words = Seq(0x7005, 0x5240, 0x3200, 0x6000) // MOVEQ(simple1), ADDQ(complex), MOVE.W D0,D1(simple1), BRA.w(simple2)
       IcacheSim.attachMemoryWithWords(dut.icache.logic.axi, cd, base, words)
@@ -311,6 +389,19 @@ class IcacheSpec extends AnyFunSuite {
     simConfig.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
+      // This suite is the DEMAND-path unit test: every one of its assertions counts
+      // exact AXI bursts and exact round-robin victim-way sequences, both of which
+      // slice I3's next-line prefetch legitimately perturbs (an extra AR per fill, an
+      // extra victim advance in the NEXT set). Prefetch behaviour has its own suite,
+      // IcachePrefetchSpec, which turns this back on and asserts rules P1-P4. Using
+      // the real runtime control here rather than a compile-time knob is exactly what
+      // that control is for (design doc §8.3).
+      // `prefetchEnable` is a RegInit(True), so a single poke here would be overwritten
+      // by the reset value on the next edge (`forkStimulus` holds reset for the first
+      // cycles). Re-poke from a NON-BLOCKING fork instead: a blocking `waitSampling`
+      // here would run before `attachMemory` below, leaving the AXI port unserved while
+      // an uninitialised `cmdIn.valid` can start a refill that never completes.
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
       dut.probe.logic.cmdIn.valid #= false
       dut.probe.logic.cmdIn.payload.pc #= 0
@@ -352,6 +443,19 @@ class IcacheSpec extends AnyFunSuite {
     simConfig.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
+      // This suite is the DEMAND-path unit test: every one of its assertions counts
+      // exact AXI bursts and exact round-robin victim-way sequences, both of which
+      // slice I3's next-line prefetch legitimately perturbs (an extra AR per fill, an
+      // extra victim advance in the NEXT set). Prefetch behaviour has its own suite,
+      // IcachePrefetchSpec, which turns this back on and asserts rules P1-P4. Using
+      // the real runtime control here rather than a compile-time knob is exactly what
+      // that control is for (design doc §8.3).
+      // `prefetchEnable` is a RegInit(True), so a single poke here would be overwritten
+      // by the reset value on the next edge (`forkStimulus` holds reset for the first
+      // cycles). Re-poke from a NON-BLOCKING fork instead: a blocking `waitSampling`
+      // here would run before `attachMemory` below, leaving the AXI port unserved while
+      // an uninitialised `cmdIn.valid` can start a refill that never completes.
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
 
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
 
@@ -392,6 +496,19 @@ class IcacheSpec extends AnyFunSuite {
     simConfig.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
+      // This suite is the DEMAND-path unit test: every one of its assertions counts
+      // exact AXI bursts and exact round-robin victim-way sequences, both of which
+      // slice I3's next-line prefetch legitimately perturbs (an extra AR per fill, an
+      // extra victim advance in the NEXT set). Prefetch behaviour has its own suite,
+      // IcachePrefetchSpec, which turns this back on and asserts rules P1-P4. Using
+      // the real runtime control here rather than a compile-time knob is exactly what
+      // that control is for (design doc §8.3).
+      // `prefetchEnable` is a RegInit(True), so a single poke here would be overwritten
+      // by the reset value on the next edge (`forkStimulus` holds reset for the first
+      // cycles). Re-poke from a NON-BLOCKING fork instead: a blocking `waitSampling`
+      // here would run before `attachMemory` below, leaving the AXI port unserved while
+      // an uninitialised `cmdIn.valid` can start a refill that never completes.
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
       dut.probe.logic.cmdIn.valid #= false
       dut.probe.logic.cmdIn.payload.pc #= 0
@@ -432,6 +549,19 @@ class IcacheSpec extends AnyFunSuite {
     simConfig.compile(new Dut(new ICacheModeTranslationPlugin)).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
+      // This suite is the DEMAND-path unit test: every one of its assertions counts
+      // exact AXI bursts and exact round-robin victim-way sequences, both of which
+      // slice I3's next-line prefetch legitimately perturbs (an extra AR per fill, an
+      // extra victim advance in the NEXT set). Prefetch behaviour has its own suite,
+      // IcachePrefetchSpec, which turns this back on and asserts rules P1-P4. Using
+      // the real runtime control here rather than a compile-time knob is exactly what
+      // that control is for (design doc §8.3).
+      // `prefetchEnable` is a RegInit(True), so a single poke here would be overwritten
+      // by the reset value on the next edge (`forkStimulus` holds reset for the first
+      // cycles). Re-poke from a NON-BLOCKING fork instead: a blocking `waitSampling`
+      // here would run before `attachMemory` below, leaving the AXI port unserved while
+      // an uninitialised `cmdIn.valid` can start a refill that never completes.
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
 
       dut.probe.logic.cmdIn.valid #= false
@@ -473,6 +603,19 @@ class IcacheSpec extends AnyFunSuite {
     simConfig.compile(new Dut(new ICacheModeTranslationPlugin)).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
+      // This suite is the DEMAND-path unit test: every one of its assertions counts
+      // exact AXI bursts and exact round-robin victim-way sequences, both of which
+      // slice I3's next-line prefetch legitimately perturbs (an extra AR per fill, an
+      // extra victim advance in the NEXT set). Prefetch behaviour has its own suite,
+      // IcachePrefetchSpec, which turns this back on and asserts rules P1-P4. Using
+      // the real runtime control here rather than a compile-time knob is exactly what
+      // that control is for (design doc §8.3).
+      // `prefetchEnable` is a RegInit(True), so a single poke here would be overwritten
+      // by the reset value on the next edge (`forkStimulus` holds reset for the first
+      // cycles). Re-poke from a NON-BLOCKING fork instead: a blocking `waitSampling`
+      // here would run before `attachMemory` below, leaving the AXI port unserved while
+      // an uninitialised `cmdIn.valid` can start a refill that never completes.
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
       val (_, sparse) = IcacheSim.attachMemoryMutable(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
 
       dut.probe.logic.cmdIn.valid #= false
@@ -531,6 +674,19 @@ class IcacheSpec extends AnyFunSuite {
     simConfig.compile(new Dut(new ICacheModeTranslationPlugin)).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
+      // This suite is the DEMAND-path unit test: every one of its assertions counts
+      // exact AXI bursts and exact round-robin victim-way sequences, both of which
+      // slice I3's next-line prefetch legitimately perturbs (an extra AR per fill, an
+      // extra victim advance in the NEXT set). Prefetch behaviour has its own suite,
+      // IcachePrefetchSpec, which turns this back on and asserts rules P1-P4. Using
+      // the real runtime control here rather than a compile-time knob is exactly what
+      // that control is for (design doc §8.3).
+      // `prefetchEnable` is a RegInit(True), so a single poke here would be overwritten
+      // by the reset value on the next edge (`forkStimulus` holds reset for the first
+      // cycles). Re-poke from a NON-BLOCKING fork instead: a blocking `waitSampling`
+      // here would run before `attachMemory` below, leaving the AXI port unserved while
+      // an uninitialised `cmdIn.valid` can start a refill that never completes.
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
       val (_, sparse) = IcacheSim.attachMemoryMutable(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
 
       // IcacheSim's default `memByte(addr) = (addr*7+0x11)&0xff` pattern is
@@ -653,6 +809,19 @@ class IcacheSpec extends AnyFunSuite {
     simConfig.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
+      // This suite is the DEMAND-path unit test: every one of its assertions counts
+      // exact AXI bursts and exact round-robin victim-way sequences, both of which
+      // slice I3's next-line prefetch legitimately perturbs (an extra AR per fill, an
+      // extra victim advance in the NEXT set). Prefetch behaviour has its own suite,
+      // IcachePrefetchSpec, which turns this back on and asserts rules P1-P4. Using
+      // the real runtime control here rather than a compile-time knob is exactly what
+      // that control is for (design doc §8.3).
+      // `prefetchEnable` is a RegInit(True), so a single poke here would be overwritten
+      // by the reset value on the next edge (`forkStimulus` holds reset for the first
+      // cycles). Re-poke from a NON-BLOCKING fork instead: a blocking `waitSampling`
+      // here would run before `attachMemory` below, leaving the AXI port unserved while
+      // an uninitialised `cmdIn.valid` can start a refill that never completes.
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
       val mem = new BeatFaultAxiResponder(dut.icache.logic.axi, cd)
 
       dut.probe.logic.cmdIn.valid #= false

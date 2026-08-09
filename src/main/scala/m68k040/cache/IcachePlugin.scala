@@ -89,6 +89,26 @@ class IcachePlugin extends FiberPlugin with FetchService {
     maintInvalidateAll.allowOverride
     maintInvalidateAll := False
 
+    // ---- slice I3: next-line prefetch on/off control ----
+    // Design doc §8.3 requires the measurement sweep to run `prefetch in {on, off}`
+    // from ONE compiled DUT, so this cannot be a compile-time parameter.
+    //
+    // It is deliberately NOT a top-level `in Bool()` either. That was tried and is a
+    // TRAP: `prefetchEnable` is created inside the plugin's Area, so an `in Bool()`
+    // becomes a port of the TOP-LEVEL component, where SpinalHDL's `default(...)` has
+    // no parent to apply it at -- every full-core testbench would silently read it as
+    // 0 and prefetch would be dead in exactly the runs that measure it. (Confirmed:
+    // the first IPC sweep after adding it came back bit-identical to baseline.)
+    //
+    // A self-assigned RegInit is the pattern this codebase already uses for
+    // sim-pokeable controls (see `ICacheModeTranslationPlugin.cmodeEn`): pokeable from
+    // any testbench via `simPublic`, and in synthesis it is a register whose only
+    // driver is itself, so it constant-folds to True and costs nothing. Default ON, so
+    // no DUT anywhere needs a wiring change.
+    val prefetchEnable = RegInit(True)
+    prefetchEnable.simPublic()
+    prefetchEnable := prefetchEnable
+
     // ---- resolve TranslationService ----
     val xlate = host[TranslationService]
     // The current architectural S bit (ROB-owned, same signal the privilege-violation
@@ -129,6 +149,15 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val valids  = Vec.fill(ways)(Vec.fill(sets)(RegInit(False)))
     // Round-robin victim pointer per set
     val victim  = Vec.fill(sets)(RegInit(U(0, wayBits bits)))
+    // Slice I3: per-(way,set) "this line was installed by a PREFETCH and has not been
+    // demand-hit yet". 4 x 64 = 256 flops. It is LOAD-BEARING, not just telemetry: the
+    // trigger "first demand HIT in a line that was itself prefetched -> prefetch the
+    // next line" is what keeps the prefetch stream running once prefetching has caught
+    // up with the demand stream. Without it a prefetch can only be triggered by a
+    // demand MISS, which leaves the stream alternating miss/hit (half the available
+    // win) instead of fully covered. Cleared on a demand fill of the same way/set, on
+    // the first demand hit, and by invalidateAll.
+    val pfFilled = Vec.fill(ways)(Vec.fill(sets)(RegInit(False)))
 
     // DEBUG (icache-corruption-fix task, temporary — mirrors DcachePlugin's
     // ldS1Valid/stS2Valid.simPublic() DEBUG hooks): exposes the raw shared arrays
@@ -138,8 +167,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
     valids.simPublic()
 
     // ---- invalidateAll: priority clear of all valid bits ----
-    when(invalidateAll || maintInvalidateAll) {
+    val anyInvalidate = invalidateAll || maintInvalidateAll
+    when(anyInvalidate) {
       for (w <- 0 until ways; s <- 0 until sets) valids(w)(s) := False
+      for (w <- 0 until ways; s <- 0 until sets) pfFilled(w)(s) := False
     }
 
     // ---- T-stage: REGISTERED ITLB translation (FMax pipeline split) ----
@@ -221,6 +252,31 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // cycle and held for one cycle so commitBeat==1 can assemble the whole-line packed
     // value from {this, the high beat's freshly-classified result}. See PREDECODE.
     val predAccumLo = Reg(Bits(PRED_BITS_PER_BEAT bits))
+
+    // ── Slice I1, closure (2) of the `invalidateAll` hazard (design doc §6.5) ────
+    // An `invalidateAll` that lands while a fill is in flight must not be undone by
+    // that fill completing and re-installing the line it was told to drop. Closure (1)
+    // (the fill's `valids` write yields to a SAME-cycle invalidate) already exists;
+    // it does nothing for an invalidate that arrives one cycle EARLIER, mid-burst.
+    // So: poison the in-flight fill. A poisoned fill still runs to completion on the
+    // bus (there is no transaction-cancel in AXI -- design doc §10.F) and still
+    // delivers its response (see below), but allocates NOTHING.
+    //
+    // §6.5's bullet 3 ("invalidate the s1*/rsp*Reg stages") is DELIBERATELY NOT
+    // ADOPTED, and this is the reasoning, recorded so it is not re-derived:
+    // `FetchAlignPlugin` runs a depth-3 outstanding ring whose `ringCount` is
+    // incremented on `ic.cmd.fire` and decremented ONLY on `ic.rsp.valid`
+    // (FetchAlignPlugin.scala:171-190, :302-312). There is no timeout and no other
+    // decrement path. Cancelling an in-flight response would strand that ring entry
+    // forever: `ringCount` stays elevated, `ringFull` eventually blocks `ic.cmd.valid`
+    // permanently, and the front end stops fetching with no recovery -- a hard hang
+    // CREATED by the fix. The response is therefore always delivered; the data is
+    // still what was at that address when the fetch was issued, and CINV/CPUSH is
+    // architecturally a software synchronisation point. If a future requirement really
+    // needs the in-flight fetch discarded, the correct mechanism is FetchAlign's
+    // EXISTING `ringStale` bit (consumed-and-discarded, ring still retires) -- a
+    // FetchAlign change, not an IcachePlugin one.
+    val missPoison = RegInit(False)
 
     // ---- shared data-array read port (synchronous; BRAM) ----
     // Address+enable are driven by the FSM (IDLE hit accept, or REPLAY). The
@@ -428,12 +484,107 @@ class IcachePlugin extends FiberPlugin with FetchService {
     dbgAllocCommitPending := False
     dbgAllocCommitPending.simPublic()
 
+    // ══ Slice I1/I3 control nets — driven by the FSM, consumed by the hoisted
+    //    fill datapath below it (see that block for why the datapath is hoisted). ══
+    val refillActive      = Bool(); refillActive      := False
+    val refillIsPf        = Bool(); refillIsPf        := False
+    val refillDone        = Bool()   // driven by the datapath, read by the FSM
+    val refillErr         = Bool()
+    val predActive        = Bool(); predActive        := False
+    val predIsPf          = Bool(); predIsPf          := False
+    val fillArrayWrActive = Bool(); fillArrayWrActive := False
+    // Slice I3 telemetry: pure wires (zero flops, zero synthesis cost) that a
+    // testbench counts to derive design doc §8.3's "prefetch issued / useful /
+    // wasted". Deliberately NOT synthesised counters -- the core must not carry
+    // measurement-only registers.
+    val pfHitUseful  = Bool(); pfHitUseful  := False; pfHitUseful.simPublic()
+    val pfReqFromHit = Bool(); pfReqFromHit := False
+
+    // ── Slice I3: the next-line prefetch candidate (rules P1–P4, design doc §4.1(ii)) ──
+    //
+    // *** THESE RULES ARE BINDING. They are the standing no-SoC-address-map rule
+    //     (GC1) applied to speculation: the core may only prefetch where it has
+    //     class-(a) evidence -- a translation it ALREADY resolved -- and must never
+    //     record a verdict about an address it merely guessed at. ***
+    //
+    //   P1 — a prefetch is issued ONLY for a next line whose translation is ALREADY
+    //        RESIDENT in the ITLB and whose page is software-configured cacheable. A
+    //        prefetch must NEVER trigger a table walk and must never be issued for an
+    //        INHIBITED page.
+    //   P2 — a prefetch that receives a non-OKAY response is SILENTLY DISCARDED: no
+    //        allocation, no architectural fault, no sticky diagnostic record, no core
+    //        halt. Mandatory precisely BECAUSE the core cannot know whether the address
+    //        is backed; the prefetch never asserted that it was.
+    //   P3 — because P2 allocates nothing, a later DEMAND fetch of that line issues a
+    //        NEW REAL transaction and gets its own contemporaneous response, with the
+    //        existing task-#211 `r.resp` check delivering the fault precisely. No
+    //        cached verdict, in either direction.
+    //   P4 — a prefetch must never cross a page boundary on a GUESS.
+    //
+    // P1 and P4 are satisfied BY CONSTRUCTION here, with no ITLB probe at all and
+    // therefore no way to accidentally arm the walker: the prefetch line is
+    // `source + 64`, and it is issued ONLY when that address lies in the SAME 4 KiB
+    // page as the access whose translation is ALREADY resolved (`pfSrcPa`). A page
+    // holds 64 lines, so this covers 63 of every 64 next-lines; the 64th (a
+    // page-crossing next-line) is simply DROPPED, which is exactly what P4 requires.
+    // Same page also means the same page descriptor, hence the same CM bits -- so the
+    // cacheability of the source access carries over, satisfying P1's INHIBITED rule
+    // (the two trigger sites each additionally require their source to be cacheable).
+    val pfSrcVa = UInt(32 bits)
+    val pfSrcPa = UInt(32 bits)
+    pfSrcVa := missPC      // default: the REPLAY trigger (a demand fill just landed)
+    pfSrcPa := missPA
+    val pfNextVa   = ((pfSrcVa(31 downto 6) + 1) @@ U(0, 6 bits)).resize(32)
+    val pfSamePage = pfNextVa(31 downto 12) === pfSrcVa(31 downto 12)
+    val pfSet      = pfNextVa(11 downto 6)
+    val pfTag      = pfSrcPa(31 downto 12)
+    val pfPa       = pfSrcPa(31 downto 12) @@ pfNextVa(11 downto 0)
+    // Suppression: never prefetch a line that is already resident. (A line already in
+    // an MSHR, or in the same set as an active MSHR -- the D3-SET-I exclusion -- cannot
+    // arise: the fill engine is shared, so a prefetch is only ever started when it is
+    // free, and the prefetched set is always `sourceSet + 1`.)
+    val pfResident = Vec((0 until ways).map(w =>
+                       valids(w)(pfSet) && (tagMem(w).readAsync(pfSet) === pfTag))).orR
+    val prefetchArmed = prefetchEnable && pfSamePage && !pfResident
+
+    /** Re-point the shared fill engine at the prefetch candidate. Costs no new state:
+      * a prefetch is never in flight at the same time as a demand fill. */
+    def startPrefetch(): Unit = {
+      missPC        := pfPa      // unused (a prefetch produces no response); kept defined
+      missSet       := pfSet
+      missTag       := pfTag
+      missPA        := pfPa
+      missCacheable := True      // P1: same page as a cacheable source => same CM bits
+      victimWay     := victim(pfSet)
+      beatCnt       := U(0, 1 bits)
+      arSent        := False
+      missBusFault  := False
+      missPoison    := False
+      commitBeat    := U(0, 1 bits)
+    }
+
     // ---- FSM ----
     val fsm = new StateMachine {
       val IDLE      = new State with EntryPoint
       val REFILL    = new State
       val PREDECODE = new State
       val REPLAY    = new State
+      // ── Slice I3: the next-line PREFETCH fill ────────────────────────────────
+      // A prefetch reuses the SAME fill machinery as a demand refill (missPA/missSet/
+      // missTag/victimWay/beatCnt/arSent/lineReg/commitBeat and the single 16-instance
+      // classify group), which is why it costs no new line buffer, no second dataMem
+      // write port and no second predecode group. What makes that safe is design doc
+      // §6.2's key simplification: **a prefetch has NO waiting consumer.** It never
+      // produces a `FetchRsp`, never occupies a FetchAlign ring entry, never needs a
+      // tag and cannot produce a fault. It is a pure allocate -- so `FetchAlignPlugin`
+      // needs no change whatsoever and the `ibufRoomForIssue` reservation is untouched.
+      //
+      // These two states differ from REFILL/PREDECODE in exactly one way that matters:
+      // they keep the FETCH PORT OPEN and keep answering HITS (`lookupTick(false)`).
+      // That is the whole of the "non-blocking accept" this design can safely have --
+      // see the big ordering note on `lookupTick`.
+      val PF_REFILL = new State
+      val PF_PRED   = new State
       // Task #211: a REFILL whose AXI read response(s) came back non-OKAY
       // (SLVERR/DECERR — genuinely unmapped or erroring physical memory). No line
       // is allocated (PREDECODE, which does the tag/pred/valid writes, is skipped
@@ -455,14 +606,62 @@ class IcachePlugin extends FiberPlugin with FetchService {
       //     from the registered physical line base. A resolved translation that FAULTS
       //     (non-resident / supervisor I-page) is consumed as a fault placeholder
       //     (s1Fault) WITHOUT a refill — the rsp carries fault -> DecodePacket.fault.
-      IDLE.whenIsActive {
+      //
+      // ── SLICE I1: WHY THE FETCH PORT IS OPEN DURING A *PREFETCH* FILL AND NOT
+      //    DURING A *DEMAND* FILL. Read this before changing `canStartFill`. ──
+      //
+      // The ratified plan's I1 asks for a general non-blocking accept ("letting the
+      // cache keep accepting, and answering hits, during a refill"). That is NOT
+      // safely implementable here, and the reason is an ORDERING contract, not an
+      // effort budget: `FetchRsp` carries no tag, and `FetchAlignPlugin` attributes
+      // every response to its outstanding ring's HEAD (FetchAlignPlugin.scala:263,283)
+      // -- design doc §6.3 keeps it that way ON PURPOSE. So responses must leave this
+      // cache in the order the fetches were accepted. If a younger fetch that HITS
+      // were answered while an older fetch's DEMAND fill was still in flight, the hit's
+      // data would be attributed to the older ring entry and the fill's data to the
+      // younger one: silently mis-paired instruction bytes. Serving demand hits under a
+      // demand miss therefore requires response tagging plus a ring rework, which §6.3
+      // explicitly declines.
+      //
+      // A PREFETCH fill has no such problem, because it produces NO response at all.
+      // While one is in flight the only responses in flight are demand responses, and
+      // demand fetches are still issued and answered strictly in order. So:
+      //
+      //   - during a DEMAND fill  -> the fetch port stays closed (exactly as before),
+      //   - during a PREFETCH fill -> the fetch port stays OPEN and hits are served.
+      //
+      // The second bullet is what makes slice I3 pay: a prefetch takes as long as a
+      // miss (~78 cycles under DDR), and if it blocked the fetch port for that long it
+      // would cost more than it saved.
+      //
+      // The plan's I1.2 "same-line duplicate-miss suppression" and I3.2 "demotion"
+      // (a demand fetch attaching to an in-flight prefetch) are both delivered by the
+      // SAME cheap mechanism the plan itself sanctions: **hold the T-stage and
+      // re-look-up.** A demand miss during a prefetch fill is not consumed and not
+      // allocated; it simply retries every cycle, and once the fill lands it HITS.
+      // Observable requirement met: N same-line fetches produce exactly ONE AR. It also
+      // satisfies rules M1/M2/P2/P3 with no extra logic -- an errored fill allocates
+      // nothing, so the held fetch re-looks-up, misses, and issues its OWN real
+      // transaction, getting its own contemporaneous response and faulting precisely
+      // via the existing task-#211 FAULT path. No error verdict is ever cached, in
+      // either direction. M3 is satisfied structurally: an INHIBITED page is never
+      // allocated and never prefetched (rule P1), so there is nothing to merge across
+      // cacheability classes.
+      //
+      // `canStartFill` = false also carries the **D3-SET-I lookup-vs-fill-write rule**:
+      // a lookup that indexes the SET the in-flight fill is committing into must not be
+      // answered, because `tagMem` is a write-first async-read LUTRAM while `valids` is
+      // a register array -- on the commit cycle a same-set lookup would read the NEW
+      // tag against the OLD valid bit and could report a spurious HIT on a line whose
+      // data beat is being written that same cycle. Held instead, and retried.
+      def lookupTick(canStartFill: Boolean): Unit = {
         activePc      := cmdPort.payload.pc
         // Depth-2 accept: gate ONLY on the ITLB resolve (no single-outstanding block).
-        // The T-stage is freed every IDLE cycle (consume below), so a new cmd may enter
-        // it the same cycle. NOTE: a MISS this cycle leaves IDLE (goto REFILL); the
-        // accept is still permitted (cmdPort.ready is combinational and we are still in
-        // IDLE), and the same-cycle-accepted translation is held in the T-stage and
-        // re-consumed after the refill returns to IDLE — so it is NOT lost.
+        // The T-stage is freed every cycle it is consumed (below), so a new cmd may
+        // enter it the same cycle. NOTE: a MISS this cycle leaves IDLE (goto REFILL);
+        // the accept is still permitted (cmdPort.ready is combinational and we are
+        // still in IDLE), and the same-cycle-accepted translation is held in the
+        // T-stage and re-consumed after the refill returns to IDLE — so it is NOT lost.
         cmdPort.ready := xlate.rsp.ready
 
         // (2) Consume the registered translation FIRST (so its `tValid := False` is
@@ -477,12 +676,18 @@ class IcachePlugin extends FiberPlugin with FetchService {
           // compare is no longer in the data-BRAM `ENARDEN` critical path.
           dataReadAddr := idleReadAddr
           dataReadEn   := True
-          tValid := False   // consumed this cycle (a same-cycle accept re-sets it True)
+          // D3-SET-I (see above): under a prefetch fill, a lookup into the fill's own
+          // set is not answerable this cycle.
+          val setBlocked = if (canStartFill) False else (fillArrayWrActive && (idleSet === missSet))
+          when(!setBlocked) { tValid := False }   // consumed (a same-cycle accept re-sets it)
 
           // Register the RAW per-way predMem entries (way-mux + window-decode deferred
           // to S1 keyed off s1Way). On a fault placeholder the entries are zeroed
           // (windowPred(0) == the old getZero placeholder).
-          when(tFault) {
+          when(setBlocked) {
+            // HOLD: neither consume nor accept. Retried next cycle.
+            cmdPort.ready := False
+          } elsewhen(tFault) {
             // Translation fault: emit a fault response (no data, no refill).
             s1Valid := True
             s1Way   := U(0, wayBits bits)
@@ -502,19 +707,50 @@ class IcachePlugin extends FiberPlugin with FetchService {
             s1Lane  := idleLaneIdx
             s1PredEntries := idlePredEntry
             s1FromMiss := False
+            // Slice I3, second trigger (design doc §6.2): the FIRST demand hit in a
+            // line that was itself prefetched is the cheap "that prefetch was useful,
+            // keep going" heuristic. Consume the bit so it fires once per prefetched
+            // line, and request the next line. `pfHitUseful` is a pure wire (no
+            // register, no synthesis cost) that a testbench counts to derive the
+            // design doc §8.3 "prefetch useful" statistic.
+            when(pfFilled(hitWayIdx)(idleSet)) {
+              pfFilled(hitWayIdx)(idleSet) := False
+              pfHitUseful := True
+              if (canStartFill) {
+                pfReqFromHit := True
+                // Re-point the prefetch candidate at THIS hit's (already resolved)
+                // translation -- rule P1 needs a resident translation, and the T-stage
+                // has one for exactly this address.
+                pfSrcVa := idlePc
+                pfSrcPa := tPaddr
+              }
+            }
           } otherwise {
-            missPC    := idlePc
-            missSet   := idleSet
-            missTag   := idleTag
-            // PHYSICAL line base for the refill: the registered translated PA =
-            // {ppn, pc[11:0]} (MMU-off identity: ppn == pc[31:12], == the VA).
-            missPA    := tPaddr
-            missCacheable := tCacheable
-            victimWay := victim(idleSet)
-            beatCnt   := U(0, 1 bits)
-            arSent    := False
-            missBusFault := False   // task #211: reset per-refill
-            goto(REFILL)
+            if (canStartFill) {
+              missPC    := idlePc
+              missSet   := idleSet
+              missTag   := idleTag
+              // PHYSICAL line base for the refill: the registered translated PA =
+              // {ppn, pc[11:0]} (MMU-off identity: ppn == pc[31:12], == the VA).
+              missPA    := tPaddr
+              missCacheable := tCacheable
+              victimWay := victim(idleSet)
+              beatCnt   := U(0, 1 bits)
+              arSent    := False
+              missBusFault := False   // task #211: reset per-refill
+              missPoison   := False    // slice I1: fresh fill, not yet invalidated
+              goto(REFILL)
+            } else {
+              // MERGE / DEMOTION (plan I1.2 + I3.2): a demand miss arriving while a
+              // prefetch fill is in flight is HELD, not allocated and not dropped.
+              // Dropping it would lose a fetch and wedge FetchAlign's ring accounting.
+              // If it is the line being prefetched, the retry HITS once the fill lands
+              // (that is the demotion case, and it is where the prefetch pays off
+              // partially). If it is a different line, the retry allocates a normal
+              // demand fill once the prefetch completes.
+              tValid := True
+              cmdPort.ready := False
+            }
           }
         }
 
@@ -532,81 +768,56 @@ class IcachePlugin extends FiberPlugin with FetchService {
         }
       }
 
-      // ----- REFILL: issue AXI AR; collect 2 R beats into dataMem -----
-      REFILL.whenIsActive {
-        activePc := missPC
-        // Refill from the PHYSICAL line base (missPA, the translated PA); identity
-        // when the MMU is off (missPA == missPC).
-        val lineBase = missPA & ~U(63, 32 bits)
-
-        when(!arSent) {
-          axi.ar.valid         := True
-          axi.ar.payload.addr  := lineBase
-          axi.ar.payload.id    := U(AxiIds.I_DEMAND, AxiIds.ID_W bits)
-          axi.ar.payload.len   := U(1, 8 bits)
-          axi.ar.payload.size  := U(5, 3 bits)
-          axi.ar.payload.burst := Axi4.burst.INCR
-          when(axi.ar.ready) { arSent := True }
+      IDLE.whenIsActive {
+        lookupTick(canStartFill = true)
+        // A prefetch requested by the "useful prefetch => keep going" hit trigger can
+        // only start from IDLE (the fill engine is shared). Placed AFTER lookupTick so
+        // a demand miss in the same cycle wins the engine -- demand always has
+        // priority over prefetch.
+        // (`pfReqFromHit` is set only in the HIT arm, so it is mutually exclusive with
+        // the miss arm's `goto(REFILL)` -- demand can never lose the engine to it.)
+        when(pfReqFromHit && prefetchArmed) {
+          startPrefetch()
+          goto(PF_REFILL)
         }
+      }
+      // ----- REFILL / PF_REFILL: issue AXI AR; collect the 2 R beats -----
+      // Both states share ONE hoisted fill datapath (`refillActive`, below the FSM).
+      // The demand and prefetch fills are NOT allowed to run concurrently: they share
+      // `lineReg`/`beatCnt`/`missPA`/`missSet`/`missTag`/`victimWay`/`commitBeat` and
+      // the single 16-instance classify group, which is exactly why slice I3 costs no
+      // second line buffer, no second dataMem write port and no second predecode group.
+      // This is also honest about the SoC: the crossbar is ONE outstanding read per
+      // master port (design doc §3.2), so a second concurrent I-side fill would buy
+      // nothing end-to-end today anyway. Prefetch wins by starting a line's fill EARLY
+      // in TIME, not by overlapping it with another transaction (§6.2).
+      REFILL.whenIsActive {
+        activePc     := missPC
+        refillActive := True
+        when(refillDone) {
+          when(refillErr) { goto(FAULT) } otherwise { goto(PREDECODE) }
+        }
+      }
 
-        axi.r.ready := True
-        when(axi.r.valid) {
-          // Task #211: a non-OKAY response (SLVERR/DECERR — genuinely unmapped or
-          // erroring physical memory) on EITHER beat of this 2-beat line burst means
-          // there is no real data to cache. Still absorb the beat into `lineReg`
-          // (UNCONDITIONAL — see below), but latch the error so the FSM routes to
-          // FAULT instead of PREDECODE once the burst completes (mirrors
-          // DcachePlugin's REFILL respErr handling, task #189). NOTE (updated by the
-          // icache-corruption-fix / icache-burst-fault-fix tasks): the ORIGINAL #211
-          // comment here claimed the dataMem write was "harmless — the line's valid
-          // bit is never set on this path, so it can never be read back as a hit" —
-          // that reasoning was WRONG whenever the round-robin victim pointer aliases
-          // onto a way that IS valid for some other address. dataMem is no longer
-          // written from this state at all (see below) — the actual array commit is
-          // deferred to PREDECODE (which now dwells 2 cycles for exactly this reason
-          // — see its comment below), reached only once the WHOLE burst's pass/fail
-          // is known, closing both the per-beat case (icache-corruption-fix)
-          // and the cross-beat case where an earlier OK beat is committed before a
-          // later beat's error is known (icache-burst-fault-fix).
-          val respErr = axi.r.payload.resp =/= Axi4.resp.OKAY
-          when(respErr) { missBusFault := True }
-          // Task icache-burst-fault-fix (review of 156cf6b): dataMem is NO LONGER
-          // written here, per-beat, at all. The 156cf6b fix gated the per-beat write
-          // under `missBusFault`/`respErr` evaluated AT THAT BEAT — which correctly
-          // suppresses the write for a beat that itself errors, or any beat AFTER an
-          // earlier beat in the same burst errored (missBusFault, once latched,
-          // carries forward). It does NOT protect the opposite, equally legal AXI
-          // ordering: beat 0 returns OKAY (respErr=False, missBusFault still False)
-          // and gets written for real, and ONLY THEN does beat 1 (the LAST beat)
-          // return SLVERR/DECERR — at the moment beat 0 is written, nothing yet knows
-          // the burst will fault. The overall refill still correctly routes to FAULT
-          // (below) with tagMem/predMem/valids untouched, but beat 0's real data was
-          // already spliced into `dataMem(victimWay)` — corrupting that way exactly
-          // like the original 69a867c bug, just triggered by a mid-burst AXI error
-          // instead of a cache-mode setting, and NOT caught by the missBusFault gate
-          // because the fault isn't known yet at write time.
+      PF_REFILL.whenIsActive {
+        refillActive := True
+        refillIsPf   := True
+        // THE point of slice I1: the fetch port stays OPEN and hits keep being served
+        // for the whole prefetch fill. See `lookupTick`'s ordering note.
+        lookupTick(canStartFill = false)
+        when(refillDone) {
+          // P2 -- a prefetch that receives a non-OKAY response is SILENTLY DISCARDED:
+          // no allocation, no architectural fault, no sticky diagnostic record, no core
+          // halt. Mandatory precisely BECAUSE the core cannot know whether the address
+          // is backed; the prefetch never asserted that it was (design doc §4.1(ii) P2,
+          // and the standing no-SoC-address-map rule GC1). Note there is nothing to
+          // "deliver" either way -- a prefetch has no waiting consumer.
           //
-          // Fix: mirror how tagMem/predMem/valids already dodge this — defer the
-          // ACTUAL array write until the full burst's pass/fail is known. `lineReg`
-          // (below) stays the UNCONDITIONAL per-beat accumulator (already safe: a
-          // register, not a shared array) and is now the ONLY source for the real
-          // dataMem commit, which happens over PREDECODE's 2-cycle dwell (see its
-          // comment below) — reached ONLY via REFILL's `otherwise { goto(PREDECODE) }`
-          // below, i.e. only when the ENTIRE burst (both beats) is confirmed OKAY. A
-          // burst that faults on any beat routes to FAULT instead, which never visits
-          // PREDECODE, so dataMem is byte-for-byte untouched for that refill — same
-          // discipline FAULT already gave tagMem/predMem/valids.
-          when(beatCnt === U(0, 1 bits)) {
-            lineReg(255 downto 0)   := axi.r.payload.data
-          } otherwise {
-            lineReg(511 downto 256) := axi.r.payload.data
-          }
-          beatCnt := beatCnt + 1
-          when(axi.r.payload.last) {
-            when(missBusFault || respErr) { goto(FAULT) } otherwise {
-              goto(PREDECODE)
-            }
-          }
+          // P3 follows from P2: because nothing was allocated, a later DEMAND fetch of
+          // that line issues a NEW REAL transaction and gets its own contemporaneous
+          // response, with the task-#211 r.resp check below delivering the fault
+          // precisely through the FAULT state. No cached verdict, in either direction.
+          when(refillErr) { goto(IDLE) } otherwise { goto(PF_PRED) }
         }
       }
 
@@ -614,7 +825,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // Task #211: reached only via REFILL's non-OKAY AXI response. PREDECODE (the
       // tag/pred/valid/dataMem writes) is skipped entirely — no line is allocated,
       // matching the D-side no-allocate-on-error policy — and the victim pointer is
-      // NOT advanced (this way was never actually filled).
+      // NOT advanced (this way was never actually filled). A PREFETCH burst error never
+      // comes here (rule P2, above): it has no waiting fetch to fault.
       FAULT.whenIsActive {
         activePc := missPC
         s1Valid := True
@@ -628,174 +840,28 @@ class IcachePlugin extends FiberPlugin with FetchService {
         goto(IDLE)
       }
 
-      // ----- PREDECODE: classify line, write predMem + tag/valid -----
+      // ----- PREDECODE / PF_PRED: classify the line, write predMem + tag/valid -----
+      // Body hoisted to the shared `predActive` datapath below the FSM (single
+      // `dataMem(w).write(...)` / `predMem(w).write(...)` / `tagMem(w).write(...)` call
+      // site each -- see the icache-burst-fault-fix comment there for why a SECOND call
+      // site is not merely untidy but breaks SpinalHDL's MultiPortWritesSymplifier).
       PREDECODE.whenIsActive {
-        activePc := missPC
-        // ── Slice I2: ONE 16-instance classify group, used on BOTH of PREDECODE's
-        // two cycles (commitBeat 0 = low beat, commitBeat 1 = high beat). See
-        // `classifyBeat` above for the full rationale and the equivalence argument.
-        //
-        // The lookahead for the LOW beat's last 3 words (line words 13/14/15 need
-        // 16/17/18) is taken straight out of `lineReg`'s high half, which is already
-        // resident this cycle — so the beat-lag the design doc describes is not even
-        // needed here; the whole line is in a register by the time PREDECODE runs.
-        // For the HIGH beat the lookahead runs past the line end, which is the
-        // pre-existing `extWValid = false` boundary case.
-        val isLoBeat  = commitBeat === U(0, 1 bits)
-        val beatSrc   = Mux(isLoBeat, lineReg(255 downto 0), lineReg(511 downto 256))
-        val beatNext3 = Mux(isLoBeat, lineReg(303 downto 256), B(0, 48 bits))
-        val beatPred  = classifyBeat(beatSrc, beatNext3, isLoBeat)
-        // Whole-line packed value, meaningful only on commitBeat==1 (the low half is
-        // the previous cycle's registered result, the high half is live).
-        val packed = Bits(PRED_BITS_PER_LINE bits)
-        packed(PRED_BITS_PER_BEAT - 1 downto 0)                    := predAccumLo
-        packed(PRED_BITS_PER_LINE - 1 downto PRED_BITS_PER_BEAT)   := beatPred
-        when(isLoBeat) {
-          predAccumLo := beatPred
-          // DEBUG only: the cycle immediately BEFORE the allocation write (which slice
-          // I2 moved to commitBeat==1). Previously this was REFILL's final beat, which
-          // was the cycle before the then-commitBeat==0 write. Its one consumer, the
-          // IcacheSpec invalidate-race test, self-checks the pairing by re-reading
-          // `dbgAllocCommitCycle` on the next sampling point.
-          dbgAllocCommitPending := missCacheable
-        }
-        // Per-word predecode. A full-format indexed EA's length depends on its EXTENSION
-        // word: at op+1 (an EA-first op) or op+2 (a line-0 immediate / static bit-op, whose
-        // EA ext follows a 1-word imm/bit word). Pass words(i+1) + words(i+2) (0 past the
-        // line end — a full-format opword whose ext word spills to the next line is the
-        // inherent per-line predecode boundary).
-        //
-        // F5 FIX (deep-audit 2026-07-11): the OLD code zero-filled the spilled word and
-        // relied on a "handled on re-frame" comment for a re-frame mechanism that never
-        // existed anywhere in the tree — a zero-filled ext word reads as brief-format
-        // (bit8=0), so any full-format op landing at this exact per-line boundary silently
-        // mis-framed as brief (same silent-corruption class as F1), and nothing ever
-        // corrected it. There is no general "wait for the next line" mechanism here (predecode
-        // runs per-line, independently, before the next line may even be fetched), so —
-        // mirroring how this predecoder already treats any OTHER out-of-scope EA (reject ->
-        // COMPLEX, the assembler's illegal/refetch path) — we now tell `classify` explicitly
-        // that a boundary-zero-filled word is NOT real data (`extWValid`/`extW2Valid`, below).
-        // `classify` then refuses to guess brief-vs-full for anything that would need to read
-        // that word's content (mode 6 / mode7-reg3 full-format detection) and instead rejects
-        // (COMPLEX) — a safe trap instead of a silent mis-frame. `i` is a plain Scala Int
-        // here (this whole predecode is elaborated once per line-word, 32 instances), so
-        // "is word i+1/i+2 past the line end" is a compile-time constant, not new hardware.
-        // task #153 (ported-tests memind cluster): also pass a 3rd lookahead word (op+3) —
-        // needed ONLY to correctly frame a line-0 .L-immediate op with a full-format
-        // mem-indirect destination (the 2-word .L immediate pushes the EA's first ext word
-        // from op+2 to op+3, one word beyond the original 2-word lookahead). `words` is the
-        // WHOLE cache line, already resident in `lineReg` this same cycle (see the F5 comment
-        // above) — words(i+3) costs nothing new in hardware, just a wider static mux inside
-        // `classify` itself. Same F5 boundary discipline: unavailable (line-end) -> `classify`
-        // falls back to its pre-existing "assume brief" framing for this specific shape (NOT
-        // the F5 reject-as-COMPLEX doctrine — see `classify`'s extW3 comment for why).
-        //
-        // SLICE I2 NOTE: the 32-way unroll this paragraph describes is GONE; the same
-        // per-word contract is now delivered by two firings of the single 16-instance
-        // `classifyBeat` group above, which presents provably identical lookahead words
-        // and validity flags for all 32 word positions (`PerBeatPredecodeEquivSpec`).
-        // Everything the paragraph says about WHY those flags are what they are still
-        // holds verbatim — only the number of physical instances changed.
-        //
-        // Task (I-side cacheMode wiring, mirrors DcachePlugin task P1.4): an
-        // INHIBITED-mode fetch never allocates a line — no tag/valid write, no
-        // victim-pointer advance (this way is not consumed; the same victim way is
-        // tried again on the NEXT real allocation to this set).
-        //
-        // Task icache-corruption-fix (review of 69a867c): predMem's write is now
-        // ALSO gated under doAllocate (it previously was NOT — the primary bug this
-        // task fixes: the shared per-way array can alias onto a way that is still
-        // VALID/resident for some other address via the round-robin victim pointer,
-        // and an unconditional write there silently corrupts that other way's
-        // predecode while its tag/valid stay untouched). `missPred` latches `packed`
-        // UNCONDITIONALLY below (mirrors DcachePlugin's `missLine`) so REPLAY can
-        // still deliver an INHIBITED line's predecode directly, entirely bypassing
-        // the (for that case, never-written) predMem array — see the S1->rsp bypass
-        // mux (`s1FromMiss`) above and REPLAY below.
-        val doAllocate = missCacheable
-        // Slice I2: `packed` is only whole-line-complete on commitBeat==1 (its low half
-        // is `predAccumLo`, registered on commitBeat==0). So the predMem/tag/valid
-        // allocation write and the `missPred` bypass latch BOTH move from commitBeat==0
-        // to commitBeat==1. Nothing downstream shifts: REPLAY is entered the cycle AFTER
-        // commitBeat==1 either way, so its `predMem.readAsync` and its `missPred` read
-        // still both see the finished value, and the fetch's response latency is
-        // byte-identical to before (IcacheSpec's exact-cycle assertions are the gate).
-        when(commitBeat === U(1, 1 bits)) { missPred := packed }
-        // Task icache-burst-fault-fix: dataMem's commit is deferred from REFILL to
-        // here (see the REFILL comment above) — reached only when the FULL 2-beat
-        // burst was confirmed OKAY, using `lineReg` (the safe, register-backed
-        // accumulator) as the source instead of the live `axi.r.payload.data`.
-        //
-        // PREDECODE now DWELLS for 2 cycles (`commitBeat` below) so the two beats
-        // commit through a SINGLE `dataMem(w).write(...)` call site — i.e. one
-        // physical write port per way, address/data MUXED by `commitBeat` — instead
-        // of two simultaneous writes in one cycle (which would need a genuine 2nd
-        // write port on what must stay a single-write-port BRAM; an earlier version
-        // of this fix split beat-0/beat-1 across two FSM states, PREDECODE+COMMIT,
-        // each with its own `.write()` call site, and that DID synthesize a real
-        // second write port — SpinalHDL's `MultiPortWritesSymplifier` then failed to
-        // blackbox it during simulation elaboration. One call site, muxed by a
-        // register, avoids the hazard entirely — mirrors REFILL's own original
-        // single-write-port-per-beat discipline). predMem/tagMem/valids/victim are
-        // unaffected by this — they were already single-call-site/single-cycle and
-        // only fire once, gated below by `commitBeat === 1` (slice I2 moved it from 0
-        // to 1 — see the `missPred` comment above; the dataMem beat commit below still
-        // runs on BOTH cycles, one beat each, which is the whole reason for the dwell).
-        when(commitBeat === U(1, 1 bits)) {
-          dbgAllocCommitCycle := doAllocate
-          for (w <- 0 until ways) {
-            when(victimWay === U(w, wayBits bits)) {
-              when(doAllocate) {
-                predMem(w).write(missSet, packed)
-                tagMem(w).write(missSet, missTag)
-                // Task P5.5 (NEW FINDING, fixed here): the `valids` write MUST yield to
-                // a same-cycle invalidate-all. The declaration site above calls itself a
-                // "priority clear of all valid bits", and that WAS the intent — but the
-                // clear (`when(invalidateAll || maintInvalidateAll) { valids := False }`)
-                // elaborates EARLIER in this file than this write, so under SpinalHDL's
-                // last-assignment-wins the refill's `True` silently won on any cycle
-                // both fired, re-validating a line the invalidate was supposed to clear.
-                //
-                // That collision is REACHABLE, not theoretical: nothing gates instruction
-                // FETCH on `excActive` (only decode/rename/IQ are held — see
-                // FullCoreSynth's `doFlush || excActive` fan-out; this plugin has no
-                // `excActive` awareness at all), so a wrong-path or run-ahead refill can
-                // be completing its PREDECODE commit on the exact cycle the commit-time
-                // CPUSH/CINV dispatch pulses `maintInvalidateAll`. Task P5.5 is what
-                // first drives that wire, which is what makes this live now; the
-                // EXTERNAL `invalidateAll` port carries the identical latent gap and is
-                // closed by the same guard for free.
-                //
-                // Same "two independently-firing control paths sharing mutable state
-                // with no interlock" bug class this session already found and fixed
-                // three times on the D-cache side (P4.3, P4.4, and P5.4's own critical
-                // fix). Only `valids` needs the guard: tagMem/predMem/dataMem content is
-                // meaningless unless `valids` says the line is resident, so leaving
-                // those writes unconditional is harmless and keeps the single-write-port
-                // discipline documented above intact.
-                when(!(invalidateAll || maintInvalidateAll)) {
-                  valids(w)(missSet) := True
-                }
-              }
-            }
-          }
-          when(doAllocate) {
-            victim(missSet) := victim(missSet) + 1
-          }
-        }
-        when(doAllocate) {
-          for (w <- 0 until ways) {
-            when(victimWay === U(w, wayBits bits)) {
-              dataMem(w).write((missSet ## commitBeat).asUInt,
-                Mux(commitBeat === U(0, 1 bits), lineReg(255 downto 0), lineReg(511 downto 256)))
-            }
-          }
-        }
-        commitBeat := commitBeat + 1
-        when(commitBeat === U(1, 1 bits)) {
-          commitBeat := U(0, 1 bits)   // reset for the NEXT refill's PREDECODE dwell
-          goto(REPLAY)
-        }
+        activePc  := missPC
+        predActive := True
+        when(commitBeat === U(1, 1 bits)) { goto(REPLAY) }
+      }
+
+      PF_PRED.whenIsActive {
+        predActive := True
+        predIsPf   := True
+        // Slice I1 / D3-SET-I: the array-write cycle is the one cycle a concurrent
+        // lookup into the SAME set must not be answered (write-first async tagMem vs a
+        // register `valids` array -> a same-set lookup could read the NEW tag against
+        // the OLD valid bit and report a spurious hit on a half-written line). Held and
+        // retried instead.
+        fillArrayWrActive := True
+        lookupTick(canStartFill = false)
+        when(commitBeat === U(1, 1 bits)) { goto(IDLE) }
       }
 
       // ----- REPLAY: arm S1 read for the just-filled line, then IDLE -----
@@ -825,12 +891,185 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // `s1FromMiss` routes the S1->rsp mux to the `lineReg`/`missPred` bypass
         // registers instead for that case, so latching these array reads regardless
         // is harmless (simply unused).
+        //
+        // Slice I1: `missPoison` (an invalidateAll that landed mid-fill) suppresses the
+        // allocation too, so the same bypass must carry the response for that case --
+        // the arrays were deliberately NOT written, and the in-flight fetch must still
+        // be answered or FetchAlign's ring never retires its entry (see `missPoison`'s
+        // declaration for the full front-end-wedge analysis).
         s1PredEntries := replayPredEntry
-        s1FromMiss := !missCacheable
+        s1FromMiss := !missCacheable || missPoison
 
-        goto(IDLE)
+        // ── Slice I3 trigger #1: a demand fill just allocated line L -> prefetch L+64.
+        // Placed here rather than in PREDECODE so the demand's own response is already
+        // armed off the ARRAYS (stable) before the prefetch starts overwriting
+        // `lineReg`; the earliest a prefetch beat can land is two cycles after this, so
+        // the demand's S1->rsp read of `lineReg`/`missPred` (the INHIBITED/poison bypass
+        // path) is never raced.
+        when(prefetchArmed && missCacheable && !missPoison) {
+          startPrefetch()
+          goto(PF_REFILL)
+        } otherwise {
+          goto(IDLE)
+        }
       }
     }
+
+    // ══ Hoisted fill datapath — shared by the DEMAND and PREFETCH fills ═══════════
+    // Single call site per Mem write port, which is a hard requirement, not style:
+    // an earlier version of the icache-burst-fault fix split the two beats across two
+    // FSM states each with its own `.write()` call site, and that DID synthesize a real
+    // second write port -- SpinalHDL's `MultiPortWritesSymplifier` then failed to
+    // blackbox it during simulation elaboration. One call site, muxed by a register.
+
+    // ---- refill: AR + beat accumulation into lineReg ----
+    refillDone := False
+    refillErr  := False
+    when(refillActive) {
+      // Refill from the PHYSICAL line base (missPA, the translated PA); identity
+      // when the MMU is off (missPA == missPC).
+      val lineBase = missPA & ~U(63, 32 bits)
+      when(!arSent) {
+        axi.ar.valid         := True
+        axi.ar.payload.addr  := lineBase
+        // Routed by ID (design doc §1.2/§7.1): a prefetch's beats and a demand's beats
+        // must never be confusable. They cannot be outstanding together in this design,
+        // but the ID is still distinct so the SoC L2's `id_busy_c` front door does not
+        // serialise a prefetch behind an unrelated demand of the same ID, and so a bus
+        // monitor can attribute traffic.
+        axi.ar.payload.id    := Mux(refillIsPf,
+                                    U(AxiIds.I_PREFETCH, AxiIds.ID_W bits),
+                                    U(AxiIds.I_DEMAND,   AxiIds.ID_W bits))
+        axi.ar.payload.len   := U(1, 8 bits)
+        axi.ar.payload.size  := U(5, 3 bits)
+        axi.ar.payload.burst := Axi4.burst.INCR
+        when(axi.ar.ready) { arSent := True }
+      }
+
+      axi.r.ready := True
+      when(axi.r.valid) {
+        // Task #211: a non-OKAY response (SLVERR/DECERR — genuinely unmapped or
+        // erroring physical memory) on EITHER beat of this 2-beat line burst means
+        // there is no real data to cache. Still absorb the beat into `lineReg`
+        // (UNCONDITIONAL — a register, not a shared array, so it is safe), but latch
+        // the error so the FSM routes to FAULT (demand) or silently discards
+        // (prefetch, rule P2) once the burst completes.
+        //
+        // dataMem is NOT written here, per-beat, at all (icache-burst-fault-fix): a
+        // legal AXI ordering returns beat 0 OKAY and only then beat 1 SLVERR, so at
+        // beat-0-write time nothing yet knows the burst will fault, and beat 0's real
+        // data would already have been spliced into `dataMem(victimWay)` -- corrupting
+        // whatever OTHER address that round-robin-selected way is still validly
+        // resident for. The ACTUAL array commit is therefore deferred to the predecode
+        // dwell below, reached only when the ENTIRE burst is confirmed OKAY.
+        val respErr = axi.r.payload.resp =/= Axi4.resp.OKAY
+        when(respErr) { missBusFault := True }
+        when(beatCnt === U(0, 1 bits)) {
+          lineReg(255 downto 0)   := axi.r.payload.data
+        } otherwise {
+          lineReg(511 downto 256) := axi.r.payload.data
+        }
+        beatCnt := beatCnt + 1
+        when(axi.r.payload.last) {
+          refillDone := True
+          refillErr  := missBusFault || respErr
+        }
+      }
+    }
+
+    // ---- predecode dwell: classify both beats, then commit the arrays ----
+    // ── Slice I2: ONE 16-instance classify group, used on BOTH cycles of the dwell
+    // (commitBeat 0 = low beat, commitBeat 1 = high beat). See `classifyBeat` above for
+    // the full rationale and the equivalence argument.
+    //
+    // The lookahead for the LOW beat's last 3 words (line words 13/14/15 need 16/17/18)
+    // is taken straight out of `lineReg`'s high half, which is already resident this
+    // cycle — so the beat-lag the design doc describes is not even needed here; the
+    // whole line is in a register by the time the dwell runs. For the HIGH beat the
+    // lookahead runs past the line end, which is the pre-existing `extWValid = false`
+    // boundary case (the F5 fix): `classify` refuses to guess brief-vs-full for
+    // anything needing that word's content and rejects as COMPLEX instead of silently
+    // mis-framing, `ambiguousLine` marks it, and `Aligner.scala:63-65` re-classifies
+    // live from the instruction buffer's own already-fetched words.
+    val isLoBeat  = commitBeat === U(0, 1 bits)
+    val beatSrc   = Mux(isLoBeat, lineReg(255 downto 0), lineReg(511 downto 256))
+    val beatNext3 = Mux(isLoBeat, lineReg(303 downto 256), B(0, 48 bits))
+    val beatPred  = classifyBeat(beatSrc, beatNext3, isLoBeat)
+    // Whole-line packed value, meaningful only on commitBeat==1 (the low half is the
+    // previous cycle's registered result, the high half is live).
+    val packedPred = Bits(PRED_BITS_PER_LINE bits)
+    packedPred(PRED_BITS_PER_BEAT - 1 downto 0)                  := predAccumLo
+    packedPred(PRED_BITS_PER_LINE - 1 downto PRED_BITS_PER_BEAT) := beatPred
+
+    when(predActive) {
+      // An INHIBITED-mode fetch never allocates a line — no tag/valid write, no
+      // victim-pointer advance (that way is not consumed; the same victim way is tried
+      // again on the NEXT real allocation to this set). Slice I1 adds `missPoison`: an
+      // `invalidateAll` that landed mid-fill also suppresses the allocation, so a fill
+      // in flight when the cache was told to drop everything cannot quietly re-install
+      // its line one cycle later. (Closure (1), the same-cycle guard on the `valids`
+      // write, is still present below and covers the exactly-simultaneous case.)
+      val doAllocate = missCacheable && !missPoison
+      when(isLoBeat) {
+        predAccumLo := beatPred
+        // DEBUG only: the cycle immediately BEFORE the allocation write. Its one
+        // consumer, IcacheSpec's invalidate-race test, self-checks the pairing by
+        // re-reading `dbgAllocCommitCycle` on the next sampling point.
+        dbgAllocCommitPending := doAllocate
+      } otherwise {
+        // `packedPred` is only whole-line-complete on commitBeat==1, so the array
+        // commit and the `missPred` bypass latch both happen here. Nothing downstream
+        // shifts: REPLAY is entered the cycle AFTER commitBeat==1 either way.
+        missPred := packedPred
+        dbgAllocCommitCycle := doAllocate
+        for (w <- 0 until ways) {
+          when(victimWay === U(w, wayBits bits)) {
+            when(doAllocate) {
+              predMem(w).write(missSet, packedPred)
+              tagMem(w).write(missSet, missTag)
+              // The `valids` write MUST yield to a same-cycle invalidate-all. The
+              // declaration site above calls itself a "priority clear of all valid
+              // bits", and that WAS the intent — but the clear elaborates EARLIER in
+              // this file than this write, so under SpinalHDL's last-assignment-wins
+              // the refill's `True` silently won on any cycle both fired, re-validating
+              // a line the invalidate was supposed to clear. Reachable, not theoretical:
+              // nothing gates instruction FETCH on `excActive`, so a wrong-path or
+              // run-ahead refill really can be committing on the exact cycle a
+              // commit-time CPUSH/CINV dispatch pulses `maintInvalidateAll` -- and with
+              // slice I3 a PREFETCH fill widens that window further.
+              when(!anyInvalidate) {
+                valids(w)(missSet) := True
+              }
+              // Slice I3: remember whether this line arrived by prefetch. Set for a
+              // prefetch fill, CLEARED for a demand fill of the same way/set (so a
+              // demand-filled line never spuriously re-triggers the "useful prefetch"
+              // heuristic).
+              pfFilled(w)(missSet) := predIsPf && !anyInvalidate
+            }
+          }
+        }
+        when(doAllocate) {
+          victim(missSet) := victim(missSet) + 1
+        }
+      }
+      when(doAllocate) {
+        for (w <- 0 until ways) {
+          when(victimWay === U(w, wayBits bits)) {
+            dataMem(w).write((missSet ## commitBeat).asUInt,
+              Mux(isLoBeat, lineReg(255 downto 0), lineReg(511 downto 256)))
+          }
+        }
+      }
+      commitBeat := commitBeat + 1
+      when(!isLoBeat) {
+        commitBeat := U(0, 1 bits)   // reset for the NEXT fill's predecode dwell
+      }
+    }
+
+    // ---- slice I1 closure (2): poison an in-flight fill on invalidateAll ----
+    // See `missPoison`'s declaration for why the response is still delivered and why
+    // §6.5's "invalidate the s1*/rsp* stages" bullet is deliberately NOT adopted.
+    when(anyInvalidate && !fsm.isActive(fsm.IDLE)) { missPoison := True }
 
     // FetchService accessors
     def cmd: Stream[FetchCmd] = cmdPort
