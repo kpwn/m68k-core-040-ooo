@@ -1,7 +1,7 @@
 package m68k040.frontend
 
 import m68k040.Global
-import m68k040.services.GshareUpdateService
+import m68k040.services.{FtbLookupCmd, GshareUpdateService, GshareWindowRsp, GshareWindowService}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -40,12 +40,16 @@ import spinal.lib.misc.plugin.FiberPlugin
   * carries wrong-path bits that shift out naturally; the branch EU always verifies the
   * actual direction/target → a gshare misprediction is only a perf loss (the existing
   * commit-time redirect recovers). Mirrors the RAS. */
-class GsharePlugin extends FiberPlugin with GshareUpdateService {
+class GsharePlugin extends FiberPlugin with GshareUpdateService with GshareWindowService {
 
   // ---- public update port (exposed via the service; the ROB drives it at retire) ----
   // Declared at build (idxBits known then); the service accessor reads logic.updateFlow.
   var updateFlow: Flow[m68k040.services.GshareUpdate] = null
+  var windowCmdFlow: Flow[FtbLookupCmd] = null
+  var windowRspFlow: Flow[GshareWindowRsp] = null
   override def gshareUpdate: Flow[m68k040.services.GshareUpdate] = updateFlow
+  override def windowCmd: Flow[FtbLookupCmd] = windowCmdFlow
+  override def windowRsp: Flow[GshareWindowRsp] = windowRspFlow
 
   val logic = during build new Area {
     val ghrBits    = Global.GHR_BITS.get
@@ -96,6 +100,35 @@ class GsharePlugin extends FiberPlugin with GshareUpdateService {
     val phtTaken1 = (pht.readAsync(phtIndex1) >= U(2, 2 bits))
     phtIndex0.simPublic(); phtIndex1.simPublic()
     phtTaken0.simPublic(); phtTaken1.simPublic()
+
+    // Registered four-word window lookup for the fetch-directed FTB. All four reads
+    // use the same pre-edge GHR and return with the exact fetch-ring token at cmd+1.
+    val winCmd = Flow(FtbLookupCmd())
+    winCmd.valid.allowOverride; winCmd.valid := False
+    winCmd.payload.windowPc.allowOverride; winCmd.payload.windowPc := U(0, 32 bits)
+    winCmd.payload.token.ringSlot.allowOverride; winCmd.payload.token.ringSlot := U(0, 2 bits)
+    winCmd.payload.token.seq.allowOverride; winCmd.payload.token.seq := U(0, 8 bits)
+    windowCmdFlow = winCmd
+
+    val winIdxComb = Vec(UInt(idxBits bits), 4)
+    val winTakenComb = Vec(Bool(), 4)
+    for (i <- 0 until 4) {
+      winIdxComb(i) := indexOf(winCmd.payload.windowPc + U(i * 2, 32 bits))
+      winTakenComb(i) := pht.readAsync(winIdxComb(i)) >= U(2, 2 bits)
+    }
+    val winPayload = Reg(GshareWindowRsp(idxBits))
+    when(winCmd.valid) {
+      winPayload.token := winCmd.payload.token
+      for (i <- 0 until 4) {
+        winPayload.taken(i) := winTakenComb(i)
+        winPayload.phtIdx(i) := winIdxComb(i)
+      }
+    }
+    val winRsp = Flow(GshareWindowRsp(idxBits))
+    winRsp.valid := RegNext(winCmd.valid) init False
+    winRsp.payload := winPayload
+    windowRspFlow = winRsp
+    winRsp.valid.simPublic(); winRsp.payload.flatten.foreach(_.simPublic())
 
     // ---- retire-time PHT update (from the ROB's GshareUpdateService) ----
     // Declared here (idxBits known) + default-driven idle so a standalone DUT elaborates;

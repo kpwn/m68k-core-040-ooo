@@ -62,6 +62,49 @@ trait BtbUpdateService {
   def btbUpdate: Flow[BtbUpdate]
 }
 
+/** Exact association tag for a fetch-window predictor lookup. The sequence makes a
+  * recycled three-entry fetch-ring slot distinguishable from its prior occupant. */
+case class FetchPlanToken() extends Bundle {
+  val ringSlot = UInt(2 bits)
+  val seq      = UInt(8 bits)
+}
+
+case class FtbLookupCmd() extends Bundle {
+  val windowPc = UInt(32 bits)
+  val token    = FetchPlanToken()
+}
+
+case class FtbLookupRsp() extends Bundle {
+  val windowPc  = UInt(32 bits)
+  val token     = FetchPlanToken()
+  val hit       = Bool()
+  val brWordOff = UInt(2 bits)
+  val brLen     = UInt(4 bits)
+  val target    = UInt(32 bits)
+  val brType    = UInt(2 bits)
+}
+
+/** FtbPlugin is the sole provider. FetchAlign drives the command and mismatch
+  * clear Flows through this service and consumes the fixed cmd+1 response. */
+trait FtbLookupService {
+  def lookupCmd: Flow[FtbLookupCmd]
+  def lookupRsp: Flow[FtbLookupRsp]
+  def clearOne: Flow[UInt]
+}
+
+case class GshareWindowRsp(idxBits: Int) extends Bundle {
+  val token  = FetchPlanToken()
+  val taken  = Vec(Bool(), 4)
+  val phtIdx = Vec(UInt(idxBits bits), 4)
+}
+
+/** GsharePlugin is the sole provider. The window result is fixed cmd+1 and uses
+  * the same token as the FTB lookup launched for that fetch command. */
+trait GshareWindowService {
+  def windowCmd: Flow[FtbLookupCmd]
+  def windowRsp: Flow[GshareWindowRsp]
+}
+
 /** Retire-time gshare PHT update (direction predictor, slice 3). The ROB drives this
   * from a retiring CONDITIONAL branch that carried a fetch-time `phtIndex`; the
   * GsharePlugin consumes it to train `pht[index]` toward the resolved direction

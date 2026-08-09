@@ -2,7 +2,7 @@ package m68k040.frontend
 
 import m68k040.{M68kParams, VerilatorTest}
 import m68k040.core.ParamPlugin
-import m68k040.services.GshareUpdate
+import m68k040.services.{GshareUpdate, GshareWindowService}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -45,11 +45,14 @@ class GshareSpec extends AnyFunSuite {
   class GshareWirePlugin extends FiberPlugin {
     val logic = during build new Area {
       val g = host[GsharePlugin]
+      val win = host[GshareWindowService]
       val qPc0   = in UInt (32 bits); val qV0 = in Bool ()
       val sV     = in Bool ();        val sD = in Bool ()
       val inval  = in Bool ()
       val uV     = in Bool ()
       val uIdx   = in UInt (11 bits); val uTaken = in Bool ()
+      val wV     = in Bool ();        val wPc = in UInt (32 bits)
+      val wSlot  = in UInt (2 bits);  val wSeq = in UInt (8 bits)
       g.logic.queryPc0    := qPc0
       g.logic.queryValid0 := qV0
       g.logic.shiftValid  := sV
@@ -59,9 +62,18 @@ class GshareSpec extends AnyFunSuite {
       g.logic.upd.valid        := uV
       g.logic.upd.payload.index := uIdx
       g.logic.upd.payload.taken := uTaken
+      win.windowCmd.valid := wV
+      win.windowCmd.payload.windowPc := wPc
+      win.windowCmd.payload.token.ringSlot := wSlot
+      win.windowCmd.payload.token.seq := wSeq
       val oTaken = out(Bool());        oTaken := g.logic.phtTaken0
       val oIndex = out(UInt(11 bits)); oIndex := g.logic.phtIndex0
       val oGhr   = out(UInt(16 bits)); oGhr   := g.logic.ghr
+      val wRspV = out(Bool()); wRspV := win.windowRsp.valid
+      val wRspSlot = out(UInt(2 bits)); wRspSlot := win.windowRsp.payload.token.ringSlot
+      val wRspSeq = out(UInt(8 bits)); wRspSeq := win.windowRsp.payload.token.seq
+      val wRspTaken = out(Vec(Bool(), 4)); wRspTaken := win.windowRsp.payload.taken
+      val wRspIdx = out(Vec(UInt(11 bits), 4)); wRspIdx := win.windowRsp.payload.phtIdx
     }
   }
 
@@ -77,6 +89,8 @@ class GshareSpec extends AnyFunSuite {
     dut.wire.logic.qPc0 #= 0; dut.wire.logic.qV0 #= false
     dut.wire.logic.sV #= false; dut.wire.logic.sD #= false; dut.wire.logic.inval #= false
     dut.wire.logic.uV #= false; dut.wire.logic.uIdx #= 0; dut.wire.logic.uTaken #= false
+    dut.wire.logic.wV #= false; dut.wire.logic.wPc #= 0
+    dut.wire.logic.wSlot #= 0; dut.wire.logic.wSeq #= 0
     cd.waitSampling()
   }
 
@@ -176,6 +190,49 @@ class GshareSpec extends AnyFunSuite {
       dut.wire.logic.inval #= true; cd.waitSampling(); dut.wire.logic.inval #= false; cd.waitSampling()
       assert(dut.wire.logic.oGhr.toInt == ghrB, "GHR == ghrB (0 after invalidate)")
       assert(read(dut, cd, pc)._1, "context B (after-not-taken) predicts TAKEN")
+    }
+  }
+
+  test("registered four-way window lookup keeps cmd+1 token and changing-PC association", VerilatorTest) {
+    SimConfig.withVerilator.compile(new GshareDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
+      val w = dut.wire.logic
+
+      // Establish a nonzero history and train a mix of directions at the exact
+      // indices the four-wide reads will address.
+      shift(dut, cd, true); shift(dut, cd, false); shift(dut, cd, true)
+      val ghr = 5
+      val pcs = (0 until 8).map(i => 0x7000L + i * 8L)
+      val expectedTaken = Array.fill(8, 4)(true)
+      for (i <- pcs.indices; off <- 0 until 4) {
+        // Init is taken. Train a deterministic subset once to 1/not-taken.
+        if (((i + off) & 1) != 0) {
+          train(dut, cd, idxOf(pcs(i) + off * 2L, ghr), taken = false)
+          expectedTaken(i)(off) = false
+        }
+      }
+
+      var cmds = 0
+      var rsps = 0
+      for (i <- pcs.indices) {
+        w.wV #= true; w.wPc #= pcs(i); w.wSlot #= (i % 3); w.wSeq #= (0x90 + i)
+        cd.waitSampling(); sleep(1)
+        cmds += 1
+        assert(w.wRspV.toBoolean, s"missing window response $i")
+        assert(w.wRspSlot.toInt == i % 3 && w.wRspSeq.toInt == 0x90 + i,
+          s"window response $i lost its token")
+        for (off <- 0 until 4) {
+          val expectedIdx = idxOf(pcs(i) + off * 2L, ghr)
+          assert(w.wRspIdx(off).toInt == expectedIdx,
+            s"window $i word $off index ${w.wRspIdx(off).toInt} != $expectedIdx")
+          assert(w.wRspTaken(off).toBoolean == expectedTaken(i)(off),
+            s"window $i word $off direction mismatch")
+        }
+        rsps += 1
+      }
+      w.wV #= false; cd.waitSampling(); sleep(1)
+      assert(!w.wRspV.toBoolean, "window Flow must end after exactly eight results")
+      assert(cmds == 8 && rsps == 8)
     }
   }
 }

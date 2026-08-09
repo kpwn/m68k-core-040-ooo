@@ -5,7 +5,7 @@ import m68k040.M68kSpinalConfig
 import m68k040.core.{M68kCore, ParamPlugin}
 import m68k040.cache.{IcachePlugin, DcachePlugin}
 import m68k040.mmu.{ItlbPlugin, DtlbPlugin, MmuControlPlugin}
-import m68k040.frontend.{FetchAlignPlugin, BtbPlugin}
+import m68k040.frontend.{FetchAlignPlugin, BtbPlugin, FtbPlugin}
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
 import m68k040.dispatch.DispatchPlugin
@@ -80,8 +80,11 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // downstream to catch it (see IcachePlugin's `maintInvalidateAll` declaration).
     val fa  = host[FetchAlignPlugin]
     val btb = host[BtbPlugin]
-    btb.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll ||
-                               host[IcachePlugin].logic.maintInvalidateAll
+    val ftb = host[FtbPlugin]
+    val predictorInvalidate = host[IcachePlugin].logic.invalidateAll ||
+                              host[IcachePlugin].logic.maintInvalidateAll
+    btb.logic.invalidateAll := predictorInvalidate
+    ftb.logic.invalidateAll := predictorInvalidate
     // Task P5.5: the INTERNAL, CPUSH/CINV-driven I-cache invalidate. Fans out to the
     // I-cache and the BTB (above) but deliberately NOT to the RAS/gshare below — those
     // two are independently protected (RAS gates on live predecode; gshare's direction
@@ -412,6 +415,7 @@ object GenFullCoreSynthVerilog {
           new IcachePlugin(),
           new DcachePlugin(),
           new BtbPlugin(),
+          new FtbPlugin(),
           new m68k040.frontend.RasPlugin(),
           new m68k040.frontend.GsharePlugin(),
           new FetchAlignPlugin(),

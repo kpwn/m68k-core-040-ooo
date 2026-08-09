@@ -168,11 +168,14 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
 
     val faBtb = host[FetchAlignPlugin]
     val btb   = host[m68k040.frontend.BtbPlugin]
+    val ftb   = host[m68k040.frontend.FtbPlugin]
     // Both invalidate sources: the external boot/reset port AND the internal CPUSH/CINV
     // maintenance pulse (P5.5 follow-up — a stale BTB entry can redirect fetch on a
     // non-branch after SMC, with nothing downstream to catch it).
-    btb.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll ||
-                               host[IcachePlugin].logic.maintInvalidateAll
+    val predictorInvalidate = host[IcachePlugin].logic.invalidateAll ||
+                              host[IcachePlugin].logic.maintInvalidateAll
+    btb.logic.invalidateAll := predictorInvalidate
+    ftb.logic.invalidateAll := predictorInvalidate
     btb.logic.queryPc     := faBtb.logic.btbQueryPc0
     btb.logic.queryValid  := faBtb.logic.btbQueryValid0
     btb.logic.query2BasePc := faBtb.logic.btbQueryBasePc1
@@ -259,6 +262,7 @@ class FuzzCoreDut extends Component {
   val icache = new IcachePlugin
   val dcache = new DcachePlugin
   val btb    = new m68k040.frontend.BtbPlugin
+  val ftb    = new m68k040.frontend.FtbPlugin
   val ras    = new m68k040.frontend.RasPlugin
   val gsh    = new m68k040.frontend.GsharePlugin
   val fa     = new FetchAlignPlugin
@@ -282,7 +286,7 @@ class FuzzCoreDut extends Component {
     intCtrl,
     itlb,
     dtlb,
-    icache, dcache, btb, ras, gsh, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
+    icache, dcache, btb, ftb, ras, gsh, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
     rfInt, rfNzvc, rfX, wire)) }
 }
 
