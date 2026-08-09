@@ -131,6 +131,33 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x00C0) == cp(false,0))  // ss=11 illegal size
     assert(classify(0x0840) == cp(true,2))   // BCHG #n,D0 (static bit-op, opmode 4) — opword + bit word
   }
+  test("BTST PC-relative carve-out is exhaustive and excludes all three write bit-ops") {
+    // Dynamic encoding: 0000 ddd 1 tt 111 rrr. Sweep all 8 bit-number Dn fields,
+    // all 4 bit operations and both PC-relative EA encodings. Only tt=00 (BTST)
+    // is read-only and legal; BCHG/BCLR/BSET require a data-alterable destination.
+    for {
+      dn    <- 0 until 8
+      tt    <- 0 until 4
+      pcReg <- Seq(2, 3)                    // (d16,PC), (d8,PC,Xn)
+    } {
+      val op = (dn << 9) | 0x0100 | (tt << 6) | 0x0038 | pcReg
+      val expected = if (tt == 0) cp(true, 2) else cp(false, 0)
+      assert(classify(op) == expected,
+        f"dynamic bit-op D$dn tt=$tt pcReg=$pcReg op=0x$op%04x")
+    }
+
+    // Static encoding: 0000 1000 tt 111 rrr + bit-number word. The same BTST-only
+    // legality applies, with one additional word before the PC-relative EA extension.
+    for {
+      tt    <- 0 until 4
+      pcReg <- Seq(2, 3)
+    } {
+      val op = 0x0800 | (tt << 6) | 0x0038 | pcReg
+      val expected = if (tt == 0) cp(true, 3) else cp(false, 0)
+      assert(classify(op) == expected,
+        f"static bit-op tt=$tt pcReg=$pcReg op=0x$op%04x")
+    }
+  }
   test("DIVU.W/DIVS.W (class 8 opmode 3/7) + MULU.W/MULS.W (class C) -> simple; An-direct MUL EA complex") {
     assert(classify(0x80C1) == cp(true,1))   // DIVU.W D1,D0 (reg divisor, 1 word)
     assert(classify(0x81C1) == cp(true,1))   // DIVS.W D1,D0

@@ -74,6 +74,8 @@ object PredecodeRef {
         val isDynBit  = bit8 == 1 && mode != 1                   // exclude MOVEP (mode 001)
         val isStatBit = ((op >> 8) & 0xf) == 0x8                 // opmode 4
         val bitBase   = if (isStatBit) 2 else 1                  // +1 for the static bit word
+        val bitTt     = (op >> 6) & 3                            // 00=BTST, 01/10/11 write
+        val isBtst    = (isDynBit || isStatBit) && bitTt == 0
         if (isImmOp && immWords >= 0) {
           if (isToCcr) { if (ccrOk) CP(simple = true, lenWords = 1 + 1) else COMPLEX }
           else if (mode == 0) CP(simple = true, lenWords = 1 + immWords)  // data-reg dest
@@ -85,6 +87,12 @@ object PredecodeRef {
           if (mode == 0) CP(simple = true, lenWords = bitBase)    // Dn dest (LONG)
           else memDestExt(mode, reg) match {                      // memory dest (BYTE) -> +EA ext
             case Some(e) => CP(simple = true, lenWords = bitBase + e)
+            // BTST is read-only, so unlike BCHG/BCLR/BSET it also accepts the two
+            // PC-relative source EAs. The opword-only reference models indexed-PC as
+            // brief (+1), matching PredecodeWord.classify(op)'s zero extension word;
+            // the full RTL overload resolves a supplied full-format extension exactly.
+            case None if isBtst && mode == 7 && (reg == 2 || reg == 3) =>
+              CP(simple = true, lenWords = bitBase + 1)
             case None    => COMPLEX                               // An/#imm/MEMCOMPLEX -> deferred
           }
         } else if (bit8 == 1 && mode == 1) {

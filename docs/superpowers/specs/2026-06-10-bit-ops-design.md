@@ -41,9 +41,13 @@ All four ops live in line 0 (`0000`). Decode by `bit8` then disambiguate:
 - **EA mode 000 (Dn)** → operate on the full **LONG**; bit number **mod 32**.
 - **memory EA** → operate on a **BYTE** (read-modify-write); bit number **mod 8**.
 
-BTST may also read a PC-relative / immediate *source* (it only tests) — but the common
-register/memory destinations are this slice; an immediate-source BTST (`BTST Dn,#imm`) is
-covered if it falls out of the EA decode naturally, else deferred (note it).
+BTST may also read the two PC-relative *source* EAs because it only tests and never writes:
+`(d16,PC)` (mode 7/reg 2) and `(d8,PC,Xn)` (mode 7/reg 3), in both dynamic and static
+bit-number forms. Predecode must frame these as `bitBase + 1` words for the displacement/
+brief-indexed case (`bitBase=1` dynamic, `2` static); when the indexed extension selects
+full format, the RTL uses its actual 1–5-word extension length. BCHG/BCLR/BSET must continue
+to reject both PC-relative EAs because they require a data-alterable destination. The
+separate immediate-EA form (`BTST Dn,#imm`) remains deferred in this slice.
 
 ## Architecture
 
