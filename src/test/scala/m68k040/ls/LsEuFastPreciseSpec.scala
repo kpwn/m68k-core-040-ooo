@@ -391,7 +391,7 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
       sleep(1) // let ready reflect the just-captured S1 entry after the issue edge
 
       // Hold the younger store at issue until the front releases. At the accepting
-      // edge the older load must still occupy the cache back stage, and must not be
+      // edge the older load must still occupy the aligned descriptor ring, and must not be
       // completing on that same edge. This is the property the old monolithic FSM
       // could never satisfy: issue.ready stayed low through the entire miss/refill.
       val s = dut.src.logic
@@ -407,15 +407,15 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
         issueWait += 1
       }
       assert(issueWait < 200, "younger store never reached the released LS front")
-      val acceptedWithOlderPending = dut.eu.logic.bkBusy.toBoolean &&
-                                     !dut.eu.logic.bkCompletes.toBoolean &&
+      val acceptedWithOlderPending = dut.eu.logic.alignedCount.toInt != 0 &&
+                                     !dut.eu.logic.alignedRspFire.toBoolean &&
                                      !(s.cValid.toBoolean && s.cRob.toInt == olderRob)
       cd.waitSampling() // younger issue handshake
       s.iValid #= false
       assert(acceptedWithOlderPending,
         s"younger memory op must issue while the older cold load is still pending in the cache back stage " +
         s"(wait=$issueWait busy=${dut.eu.logic.busy.toBoolean} s1=${dut.eu.logic.s1Valid.toBoolean} " +
-        s"bkBusy=${dut.eu.logic.bkBusy.toBoolean} bkCompletes=${dut.eu.logic.bkCompletes.toBoolean} " +
+        s"alignedCount=${dut.eu.logic.alignedCount.toInt} alignedRsp=${dut.eu.logic.alignedRspFire.toBoolean} " +
         s"cValid=${s.cValid.toBoolean} cRob=${s.cRob.toInt})")
 
       // Go beyond mere acceptance: prove the younger op completes translation and
@@ -429,8 +429,8 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
         if (dut.eu.logic.sq.io.alloc.valid.toBoolean &&
             dut.eu.logic.sq.io.alloc.payload.robId.toInt == youngerRob) {
           allocSeen = true
-          allocWhileOlderPending = dut.eu.logic.bkBusy.toBoolean &&
-                                   !dut.eu.logic.bkCompletes.toBoolean &&
+          allocWhileOlderPending = dut.eu.logic.alignedCount.toInt != 0 &&
+                                   !dut.eu.logic.alignedRspFire.toBoolean &&
                                    !oldCompleted
         }
         if (!allocSeen) cd.waitSampling()
@@ -447,6 +447,150 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
       s.obsIntAddr #= 20; sleep(1)
       assert(s.obsIntData.toBigInt == loadWord,
         f"older load data corrupted across front/back overlap: got 0x${s.obsIntData.toBigInt}%08X")
+    }
+  }
+
+  test("aligned-load descriptor ring holds multiple cache loads and pairs untagged responses in order", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem, ptmem) = initDut(dut,
+        AxiMemModelConfig(latency = L2LatencyModel(enabled = true, dramCycles = 40)))
+      val baseA = 0xA000L
+      val baseB = 0xB000L
+      val wordA = BigInt("10203040", 16)
+      val wordB = BigInt("50607080", 16)
+
+      dut.cacheCtrl.logic.dcacheEnabled #= true
+      Seq(0x10, 0x20, 0x30, 0x40).zipWithIndex.foreach { case (b, i) => mem.pokeByte(baseA + i, b) }
+      Seq(0x50, 0x60, 0x70, 0x80).zipWithIndex.foreach { case (b, i) => mem.pokeByte(baseB + i, b) }
+      seed(dut, cd, preg = 10, value = baseA)
+      seed(dut, cd, preg = 11, value = baseB)
+
+      issueLoad(dut, cd, basePreg = 10, disp = 0, pdst = 20, robId = 10)
+      issueLoad(dut, cd, basePreg = 11, disp = 0, pdst = 21, robId = 11)
+
+      // A is already in refill when B reaches RESOLVE. The former one-entry back
+      // end stalled B there; C3 must enqueue both pruned descriptors concurrently.
+      var sawTwo = false
+      var earlyCompletion = false
+      var n = 0
+      while (!sawTwo && n < 80) {
+        sawTwo ||= dut.eu.logic.alignedCount.toInt >= 2
+        earlyCompletion ||= dut.src.logic.cValid.toBoolean
+        if (!sawTwo) cd.waitSampling()
+        n += 1
+      }
+      assert(sawTwo,
+        s"descriptor ring never held both aligned loads (count=${dut.eu.logic.alignedCount.toInt})")
+      assert(!earlyCompletion, "the delayed older refill must still be pending when both descriptors are resident")
+
+      val completions = scala.collection.mutable.ArrayBuffer.empty[Int]
+      n = 0
+      while (completions.size < 2 && n < 300) {
+        if (dut.src.logic.cValid.toBoolean) completions += dut.src.logic.cRob.toInt
+        if (completions.size < 2) cd.waitSampling()
+        n += 1
+      }
+      assert(completions == Seq(10, 11),
+        s"untagged cache responses must remain paired in acceptance order, got $completions")
+      cd.waitSampling(3)
+      dut.src.logic.obsIntAddr #= 20; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == wordA, "older queued load data")
+      dut.src.logic.obsIntAddr #= 21; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == wordB, "younger queued load data")
+      assert(dut.eu.logic.alignedCount.toInt == 0, "descriptor ring must drain completely")
+    }
+  }
+
+  test("aligned-load descriptor ring backpressures at four and pop-pushes without a bubble", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem, ptmem) = initDut(dut,
+        AxiMemModelConfig(latency = L2LatencyModel(enabled = true, dramCycles = 40)))
+      dut.cacheCtrl.logic.dcacheEnabled #= true
+
+      val bases = (0 until 5).map(i => 0x12000L + i * 0x1000L)
+      bases.zipWithIndex.foreach { case (base, i) =>
+        val bytes = Seq(0x20 + i, 0x30 + i, 0x40 + i, 0x50 + i)
+        bytes.zipWithIndex.foreach { case (b, j) => mem.pokeByte(base + j, b) }
+        seed(dut, cd, preg = 10 + i, value = base)
+      }
+
+      // The fifth µop may enter the front, but must park at RESOLVE while all four
+      // descriptor slots are occupied by older cold loads.
+      (0 until 5).foreach { i =>
+        issueLoad(dut, cd, basePreg = 10 + i, disp = 0,
+                  pdst = 20 + i, robId = 10 + i)
+      }
+
+      var sawFullStall = false
+      var n = 0
+      while (!sawFullStall && n < 100) {
+        sawFullStall = dut.eu.logic.alignedFull.toBoolean &&
+                       dut.eu.logic.dbgIsResolve.toBoolean &&
+                       dut.eu.logic.s1Ctx.robId.toInt == 14
+        if (!sawFullStall) cd.waitSampling()
+        n += 1
+      }
+      assert(sawFullStall,
+        s"fifth load did not hold at RESOLVE behind a full descriptor ring " +
+        s"(count=${dut.eu.logic.alignedCount.toInt})")
+
+      val completions = scala.collection.mutable.ArrayBuffer.empty[Int]
+      var sawPopPush = false
+      n = 0
+      while (completions.size < 5 && n < 700) {
+        sawPopPush ||= dut.eu.logic.alignedRspFire.toBoolean &&
+                       dut.eu.logic.alignedEnq.toBoolean
+        if (dut.src.logic.cValid.toBoolean)
+          completions += dut.src.logic.cRob.toInt
+        if (completions.size < 5) cd.waitSampling()
+        n += 1
+      }
+      assert(sawPopPush,
+        "a full-ring response must free and refill its slot on the same edge")
+      assert(completions == Seq(10, 11, 12, 13, 14),
+        s"full-ring untagged response association/order: got $completions")
+      assert(dut.eu.logic.alignedCount.toInt == 0, "full descriptor ring must drain")
+    }
+  }
+
+  test("flush poisons every resident aligned-load descriptor and drains without completion", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem, ptmem) = initDut(dut,
+        AxiMemModelConfig(latency = L2LatencyModel(enabled = true, dramCycles = 40)))
+      dut.cacheCtrl.logic.dcacheEnabled #= true
+      val bases = Seq(0x18000L, 0x19000L)
+      bases.zipWithIndex.foreach { case (base, i) =>
+        (0 until 16).foreach(j => mem.pokeByte(base + j, 0x70 + i * 0x10 + j))
+        seed(dut, cd, preg = 10 + i, value = base)
+      }
+      issueLoad(dut, cd, basePreg = 10, disp = 0, pdst = 20, robId = 10)
+      issueLoad(dut, cd, basePreg = 11, disp = 0, pdst = 21, robId = 11)
+
+      var n = 0
+      while (dut.eu.logic.alignedCount.toInt < 2 && n < 80) {
+        cd.waitSampling(); n += 1
+      }
+      assert(dut.eu.logic.alignedCount.toInt == 2, "precondition: two queued loads")
+      dut.src.logic.iSqFlush #= true
+      cd.waitSampling()
+      dut.src.logic.iSqFlush #= false
+
+      var leakedCompletion = false
+      n = 0
+      while (dut.eu.logic.alignedCount.toInt != 0 && n < 400) {
+        leakedCompletion ||= dut.src.logic.cValid.toBoolean &&
+                            Set(10, 11).contains(dut.src.logic.cRob.toInt)
+        cd.waitSampling(); n += 1
+      }
+      leakedCompletion ||= dut.src.logic.cValid.toBoolean &&
+                          Set(10, 11).contains(dut.src.logic.cRob.toInt)
+      assert(dut.eu.logic.alignedCount.toInt == 0,
+        "poisoned descriptors must still drain their untagged responses")
+      assert(!leakedCompletion, "a flushed queued load must not complete")
+      dut.src.logic.obsIntAddr #= 20; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == 0, "flushed older load wrote PRF")
+      dut.src.logic.obsIntAddr #= 21; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == 0, "flushed younger load wrote PRF")
     }
   }
 

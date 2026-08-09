@@ -789,9 +789,16 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         // blocked from issuing anyway (the walk only ever runs under excActive).
         // Early virtual-set lookup admission. A resolved command has priority on a
         // shared-port cycle; the LS producer holds probe.valid until this handshake.
-        loadProbePort.ready := !earlyProbeValid && !loadShadowValid &&
-                               !pendingStoreMiss && !maintBusyReg &&
-                               !loadCmdPort.valid && !ldS1Valid
+        // Accept-last turnover for a sustained VIPT hit stream.  When the resolved
+        // command consumes a matching fresh probe and its physical tag is already
+        // known to HIT, the current RAM output dies at this edge and the next token
+        // may start a new synchronous virtual-set read on the same edge.  Do NOT do
+        // this on an early-probe miss: that arm installs ldS1 and still needs the
+        // current set's tag output for the normal miss/victim decision next cycle.
+        val replaceEarlyProbeOnHit = loadCmdPort.valid && useEarlyProbe && earlyProbeHit
+        loadProbePort.ready := !loadShadowValid && !pendingStoreMiss && !maintBusyReg &&
+                               ((!earlyProbeValid && !loadCmdPort.valid && !ldS1Valid) ||
+                                replaceEarlyProbeOnHit)
         when(loadProbePort.fire) {
           val canceledAtLaunch = loadProbeCancelPort.valid &&
                                  (loadProbeCancelPort.payload.token === loadProbePort.payload.token)
@@ -860,8 +867,12 @@ class DcachePlugin extends FiberPlugin with DcacheService {
             ldS1Cmode := loadCmdPort.payload.cacheMode
             ldS1Paddr := cmdPaddr
           }
-          earlyProbeValid := False
-          earlyProbeFresh := False
+          // A same-cycle new probe replaces the consumed slot (the launch block
+          // above captured its metadata and kicked its RAM read). Otherwise free it.
+          when(!loadProbePort.fire) {
+            earlyProbeValid := False
+            earlyProbeFresh := False
+          }
         } elsewhen(loadCmdPort.fire) {
           // Launch the BRAM tag+data read for this set; resolve hit/miss in S1.
           rdSet        := cmdSet
@@ -1699,12 +1710,12 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // probe output. Keep its token metadata so the matching resolved command can
     // identify the stale optimization and fall back to a normal read; do not block
     // store drain or maintenance merely to preserve freshness.
-    when(earlyProbeValid && rdEn) {
+    when(earlyProbeValid && rdEn && !loadProbePort.fire) {
       earlyProbeFresh := False
     }
     // Forwarded/faulted/squashed loads never emit loadCmd. Their explicit cancel is
     // what releases the metadata slot and, importantly, lets maintenance quiesce.
-    when(loadProbeCancelPort.valid && earlyProbeValid &&
+    when(loadProbeCancelPort.valid && earlyProbeValid && !loadProbePort.fire &&
          loadProbeCancelPort.payload.token === earlyProbeToken) {
       earlyProbeValid := False
       earlyProbeFresh := False

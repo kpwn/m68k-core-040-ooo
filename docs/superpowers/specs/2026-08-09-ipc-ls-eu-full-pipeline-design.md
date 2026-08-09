@@ -1,13 +1,15 @@
 # IPC push: a genuine LS EU pipeline — replacing the one-µop-at-a-time FSM (design)
 
 **Status**: IMPLEMENTING. D-cache slices A, B, and the bounded replay part of C
-are implemented and simulation-gated. The LS late split is now integrated and
-its early-free mode is enabled: a directed delayed-refill test proves a younger
-store issues, translates, and allocates before the older load responds. This is
-a two-entry front/back checkpoint, not yet the final elastic II=1 LS pipeline.
-Across seeds 1–3 it cuts `load-stream` cycles by 43.9% (ideal) and 41.2%
-(L2-faithful). A full-suite seed-1 pair improves aggregate cycles by 12.8% and
-8.9%, respectively. The routed FMax/area gate has not yet been run.
+are implemented and simulation-gated. The LS late split has early-free enabled,
+and C3 replaces its aligned-load response slot with a four-entry in-order
+descriptor queue. The aligned cache-load hot path therefore no longer occupies
+a one-at-a-time back FSM; only rare split accesses retain a serial replay FSM.
+This remains a bounded front/queue checkpoint, not yet the final elastic II=1
+LS front pipeline. Across seeds 1–3 C2 cuts `load-stream` cycles by 43.9% (ideal)
+and 41.2% (L2-faithful). C3 then improves the seed-1 `load-stream` result by a
+further 7 ideal-memory cycles and 41 L2-faithful cycles, with every other kernel
+unchanged. The routed FMax/area gate has not yet been run.
 
 **2026-08-09 review amendment — binding corrections:**
 
@@ -40,10 +42,12 @@ Across seeds 1–3 it cuts `load-stream` cycles by 43.9% (ideal) and 41.2%
    liveness/fault-association blocker.
 5. The late split was retained as a bounded checkpoint. Its structural Slice 1
    (`cc38cc8`) was ported onto the tokenized VIPT interface after item 4 removed
-   the live-translation hazard; Slice 2 now sets `earlyFree = true`. The cache
-   back stage still has exactly one untagged response slot, while the front can
-   hold one younger translate/resolve operation. This does not supersede the
-   elastic-pipeline end state below.
+   the live-translation hazard; Slice 2 sets `earlyFree = true`. C3 replaces the
+   single aligned-response slot with four in-order descriptors. Untagged cache
+   responses retire against the oldest sent descriptor, while the split replay
+   waits for the aligned ring to drain. The front can still hold only one
+   translate/resolve operation, so this does not supersede the elastic-pipeline
+   end state below.
 6. Faster consumers expose invalid producer cadence assumptions. Every Stream
    source must hold `valid` and its entire payload until `fire`; it may not rely
    on the consumer's former multi-cycle `ready` gap. D-cache II=1 exposed one
@@ -392,6 +396,17 @@ response tags, or multiple MSHRs. Directed tests prove three resident hits are
 accepted and answered on consecutive cycles, and that the miss-shadow command
 cannot answer ahead of the miss. General hit-under-miss remains out of scope.
 
+The single early-probe metadata slot must also support **consume-and-replace on
+an early-probe hit**. On a cycle where the resolved command consumes a matching
+fresh probe and its physical-tag comparison is already known to hit, the shared
+RAM output is no longer needed after that edge; the next token may launch its
+virtual-set read on the same edge. This is safe only for the proven-hit arm. An
+early-probe miss still enters the normal S1 miss machinery, whose next-cycle
+tag/victim decision owns the RAM output, so probe admission remains blocked on
+that arm. Without this asymmetric accept-last rule, the cache can accept
+resolved commands at II=1 but VIPT latency hiding silently degrades to every
+other load under a sustained stream.
+
 ### 3.3 Gatekeeper 3 — the shared completion stage
 
 One `comp*` register set (`LsEuPlugin.scala:762-827`) drives one ROB completion
@@ -444,9 +459,9 @@ deleted** and replaced by per-stage valid bits.
 | **P2B** | `XLATE_B` (`:1332-1352`) | split-access second-half translate | *reuses P2's registers* — see §4.5 |
 | **P3** | `XLATE` (`:1357-1422`) | STORE: `sq.io.alloc` (+ `fastStore`/`deferCompletion`). LOAD: `sq.io.fwd` query → latch `fwd*` | `p3Ctx`, `p3Paddr/B`, `p3Cmode`, `p3StoreData`, `p3Poison` |
 | **P4** | `RESOLVE` (`:1432-1463`) | LOAD: `fwdHit` → data, else capture `llReg` | `p4Ctx`, `p4FwdHit/Data/Stall`, `p4Poison` |
-| **P5** | cache result/replay admission | accept the already-probed L1D result or occupy the bounded miss-shadow replay register | resolved command + replay state |
+| **P5** | cache result/replay admission | accept the already-probed L1D result or occupy the bounded miss-shadow replay register; enqueue its completion descriptor | resolved command + replay state, descriptor FIFO tail |
 | **P6/P7** | D-cache compare/extract pipeline | physically tagged way compare and registered extraction; one result per cycle | existing in-order D-cache stage registers |
-| **P8** | `WAIT`/`WAIT_A`/`WAIT_B` + `comp*` (`:1484-1568`, `:762-827`) | consume `loadRsp`; merge cross halves; drive the single `comp*` stage | `p8Ctx` (the late split's `bkCtx`), `lineA`, `aDone` |
+| **P8** | `WAIT`/`WAIT_A`/`WAIT_B` + `comp*` (`:1484-1568`, `:762-827`) | consume `loadRsp`; mark the matching in-order descriptor ready; merge cross halves; retire the oldest ready descriptor into the single `comp*` stage | completion descriptor FIFO head, `lineA`, `aDone` |
 
 Depth from issue to completion: **9 stages**, vs. today's 9-cycle
 *non-forwarded-load latency*. So the deepest class costs ~0–1 extra latency
@@ -490,7 +505,8 @@ Stall sources, all of which back-pressure the whole pipe in order:
 | `sq.io.full` | P3 | today's `WAIT_SQ` | rare |
 | `fwdStall` re-query loop | P4 | overlap with an older uncommitted store | workload-dependent |
 | `dcache.loadCmd` not ready | P5 | `inFlight`, refill in progress, `pendingStoreMiss`, `maintBusyReg` | miss-rate-dependent |
-| `loadRsp` not arrived | P8 | hit latency / refill | every cache load |
+| completion descriptor FIFO full | P5 | bounded response/completion association capacity | only when the front outruns completion |
+| oldest completion descriptor not ready | P8 | hit latency / refill; younger ready entries remain queued | every cache load at the head |
 | split-access second pass | P2B / P8 | §4.5 | ~1 in N accesses |
 
 ### 4.3 P1 translation/cache drive at II = 1
@@ -517,6 +533,26 @@ closure argument missed (`:696-703`).
 **Every LS µop drains through P8 and completes there.** A LEA, a store, and a
 forwarded load do not complete early at P1/P3/P4; they carry their result
 forward and complete at the same stage a cache load does.
+
+This requires an explicit **bounded in-order completion-descriptor FIFO**. The
+previous wording's single `p8Ctx` is insufficient: a cache hit has multiple
+cycles of response latency, so one waiting P8 context would back-pressure P5
+and make II=1 impossible. Every P5 admission allocates one FIFO entry in issue
+order. Non-cache results enter ready; an aligned cache load enters not-ready.
+Accepted cache loads also advance a cache-response pointer, and each untagged
+`DLoadRsp` marks exactly that oldest outstanding cache-load entry ready. P8
+retires only a ready FIFO head. Thus several cache hits may be resident and
+responses may arrive on consecutive cycles, while all completion and PRF/SQ
+side effects remain in LS issue order. Queue full, not ordinary hit latency, is
+the common-path backpressure condition.
+
+The queue depth is initially **four**: enough to cover the current registered
+launch plus D-cache S1/S2 response distance and the one-entry miss shadow,
+without multiplying the 365-bit full `IqContext`. Entries carry only the proven
+completion descriptor (the current `BkCtx` fields plus result/fault readiness).
+A directed test must fill all four entries with consecutive aligned hits and
+observe one completion per cycle after warm-up. If the measured cache latency
+or mutation test proves four insufficient, increase only from measured need.
 
 Consequences, all good:
 
@@ -697,9 +733,13 @@ split-not-translated bug for cross-**page** splits) — must be re-derived under
 stage ownership. *Test*: the existing `LsEuCrossSpec` freshness waveform tests,
 plus a cross-page split with a younger µop resident behind it.
 
-**H13 — `WAIT_B` ignores `loadRsp.payload.fault` for a cross load's second half
-(PRE-EXISTING gap).** Flagged by the Slice-1 review. Not created here; must not
-be silently inherited as "by construction". *Action*: fix or document explicitly.
+**H13 — split-load cache faults (PRE-EXISTING gap; fixed in C3).** The old
+`WAIT_B` ignored `loadRsp.payload.fault` for the second half, and the same audit
+showed `WAIT_A` would capture a faulted first-half line and continue to slot B.
+C3 terminates on either fault: slot A reports `vaddr`, slot B reports `addrB`,
+both with `atc=false`, and neither produces a register result. The completion
+collision guard includes a faulting `WAIT_A` because the front may already hold
+a younger µop. *Test*: physical bus errors injected independently on each half.
 
 **H14 — `IDLE`'s defensive `otherwise` double-completion (PRE-EXISTING, found by
 the Slice-1 review).** `:1314-1316` lacks the explicit `busy := False;
@@ -893,8 +933,9 @@ measured FMax reading on the exact cone at issue.
 | **B — implemented** | **Parallel VIPT probe** | launch DTLB request and virtual-set RAM read from the same registered boundary/token; remove live `xlate.rsp` reads at cache accept; cancel on forward/fault/squash | services, `LsEuPlugin`, `DcachePlugin`, DTLB tests | real-DTLB coincident launch; early-read consume; SQ-forward cancel; fault/cross regressions; post-route pair pending |
 | **C0 — implemented** | **Bounded miss-shadow replay** | accept all-hit commands at II=1; capture the one younger command accepted on older-S1 miss detection and replay it after refill | `DcachePlugin`, service token | sustained hit II=1; in-order miss replay; cache regressions; area/FMax pending |
 | **C2 — implemented checkpoint** | **LS front/back early free** | capture complete `bkCtx`/`llReg` at `RESOLVE`, keep one untagged cache back slot, release the front for one younger translate/resolve op | `LsEuPlugin`, LS test | delayed cold miss overlap; completion collision/cross/poison/RTE/cache regressions; `load-stream` −43.9%/−41.2% cycles (3 seeds ideal/L2); seed-1 aggregate −12.8%/−8.9%; area/FMax pending |
+| **C3 — implemented checkpoint** | **Aligned-load descriptor queue** | replace the aligned hot-path `BK_IDLE/LAUNCH/WAIT` single slot with a four-entry in-order command/response descriptor queue; add hit-only early-probe consume-and-replace; retain `WAIT_A/WAIT_B` only as a pipe-draining split-access replay; close split-half bus-fault handling | `LsEuPlugin`, `DcachePlugin`, LS/cache tests | focused cache/LS/RTE suite 105/105; full/backpressure/order/flush and both split-half bus faults pass; `test-fast` 133/134 with only the independently reproduced baseline predecode failure; seed-1 `load-stream` 1836→1829 ideal and 2071→2030 L2; area/FMax pending |
 | **C1 — optional** | **General hit-under-miss** | response tags + bounded miss state sufficient to keep accepting independent hits during refill | cache/service/LS files | hit-under-miss; queue-full backpressure; area/FMax |
-| **D** | **Elastic LS stages** | replace front/back one-at-a-time state with owned valid/context stages; uniform completion reservation | `LsEuPlugin` | IPC suite; lock-step/corpus; post-route pair |
+| **D** | **Elastic LS stages** | replace front one-at-a-time state with owned valid/context stages; extend C3's association queue into the uniform in-order completion FIFO of §4.4 | `LsEuPlugin` | IPC suite; lock-step/corpus; post-route pair |
 | **E** | **Context pruning** | prove non-use, shrink carried tokens | LS/cache files | LUT/FF delta; no functional change |
 
 Every slice ends with a hard correctness and `test-fast` gate; B–D additionally
@@ -902,7 +943,7 @@ need paired post-route evidence when the PM-serialized implementation window is
 available. A removed a disproven blocker; B and C0 establish real common-path
 cache capacity, and C2 opens bounded LS overlap before D makes admission elastic.
 C1 is not a prerequisite for
-the blocking, in-order elastic LS pipeline and should be justified separately
+the bounded, in-order elastic LS pipeline and should be justified separately
 against area and workload miss behavior.
 
 ### 8.3 Projected IPC
@@ -919,10 +960,10 @@ Baselines re-measured on `39f2e49` (late-split Task 2, 8 seeds, both models):
 
 `load-stream` is 360 non-forwarded loads (6 per iteration × 60) at II 9 ⇒ 3240
 predicted vs 3269 measured (0.9%). The cache-side II=3 ceiling has now been
-removed. C2 also removes the older cache tail from the front's occupancy, but
-still provides only one younger front slot and one untagged back-load slot.
-Therefore the following remain analytical projections until C2 is benchmarked
-and slice D opens fully elastic LS admission:
+removed. C2 also removes the older cache tail from the front's occupancy. C3
+replaces the untagged back-load slot with four ordered descriptors, but still
+provides only one younger front slot. Therefore the final II=1 row remains an
+analytical projection until slice D opens fully elastic LS admission:
 
 | | `load-stream` II | `load-stream` cyc | `load/store` | `mixed` | ideal aggregate |
 |---|---|---|---|---|---|
@@ -930,12 +971,14 @@ and slice D opens fully elastic LS admission:
 | historical D-cache II=3 projection | **3** | ~1080 | ~650 | ~430 | **~6500** = **+43%** |
 | slice-A cache II=2 projection | **2** | ~720 | ~620 | ~420 | **~6100** = **+52%** |
 | C2 measured, seed 1 (current 10-kernel suite) | bounded front/back | **1836** | **1034** | **559** | **10658 vs 12221 baseline = −12.8% cycles** |
+| C3 measured, seed 1 (current 10-kernel suite) | four aligned descriptors | **1829** | **1034** | **559** | **10651 ideal; 14230 L2 vs C2 14271** |
 | implemented cache capacity + elastic LS target | **1** | ~360 plus fill | to measure | to measure | **must be benchmarked** |
 
-The D-cache is no longer the common-hit acceptance bottleneck. C2 should make
-the first material IPC gain by overlapping the cache tail, but it cannot feed
-the cache at its all-hit II=1 limit. That limit becomes reachable only when the
-elastic LS stages can present consecutive loads. Under the realistic memory
+The D-cache is no longer the common-hit acceptance bottleneck. C2 made the
+first material IPC gain by overlapping the cache tail, and C3 removes the
+aligned response-slot serialization, but the single-resident front still cannot
+feed the cache at its all-hit II=1 limit. That limit becomes reachable only when
+the elastic LS stages can present consecutive loads. Under the realistic memory
 model, refill time still limits the benefit, so both memory models remain
 mandatory.
 
@@ -1126,7 +1169,10 @@ retreat.
 
 **Implementation checkpoint.** D-cache S1/S2 overlap, all-hit II=1 acceptance,
 one-entry in-order miss-shadow replay, live-DTLB decoupling, and the parallel
-virtual-set probe are implemented. Directed simulation covers consecutive hits,
-miss replay ordering, real-DTLB coincident launch, early-result consumption,
-and probe cancellation on SQ forwarding. The remaining architectural work is
-the elastic LS-stage rewrite, followed by IPC and paired routed FMax/LUT gates.
+virtual-set probe are implemented. The LS front releases cache loads into a
+four-entry aligned descriptor queue; untagged responses remain associated in
+order, and only split accesses use `WAIT_A/WAIT_B`. Directed simulation covers
+consecutive hits/probes, miss replay ordering, real-DTLB coincident launch,
+probe cancellation, queue-full consume-and-replace, flush poisoning, and both
+split-half bus faults. The remaining architectural work is the elastic LS-stage
+rewrite, followed by broader IPC and paired routed FMax/LUT gates.

@@ -71,8 +71,9 @@ case class LsFault() extends Bundle {
   *            (the dynamic wakeup) + wbObs.
   *     STORE: sq.alloc(robId, paddr, data, size); completion fires (store
   *            "executes" == SQ-allocated; it drains at commit).
-  * A non-forwarded load hands a complete descriptor to the one-entry cache back
-  * stage, freeing the front to translate/resolve one younger memory operation. */
+  * An aligned non-forwarded load enters a four-entry in-order descriptor ring, so
+  * multiple cache operations can remain resident while untagged responses preserve
+  * acceptance order. Split-line/page loads use a mutually-exclusive two-pass replay. */
 class LsEuPlugin extends FiberPlugin with LsEuService {
   // ─────────────────────────────────────────────────────────────────────────
   // LS EU LATE SPLIT (2026-08-09, spec docs/superpowers/specs/
@@ -80,8 +81,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   //
   // The FSM below is split into a FRONT stage (IDLE/XLATE_B/XLATE/RESOLVE/
   // WAIT_SQ — owns s1*, s2Paddr, busy; completes every store and every
-  // SQ-forwarded load exactly as before) and a BACK stage (BK_IDLE/LAUNCH/
-  // WAIT/WAIT_A/WAIT_B — owns llReg/lineA/aDone and the D-cache access).
+  // SQ-forwarded load exactly as before), an aligned command/response descriptor
+  // ring, and a split-only replay stage (BK_IDLE/LAUNCH/WAIT_A/WAIT_B — owns
+  // llReg/lineA/aDone for the rare two-pass D-cache access).
   //
   // `earlyFree` selects whether the front actually FREES S1 at the handoff:
   //   false (Slice 1) — the front parks in WAIT_BK holding busy/s1Valid until
@@ -92,9 +94,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   //                     was measured on 2026-08-09 to cost -6.55 MHz and
   //                     +4785 LUTs (the `!compValid` rejection — placement
   //                     ballast, not logic).
-  //   true  (Slice 2) — the front frees S1 at RESOLVE and stalls there only
-  //                     while `bkBusy` (NG1: exactly one load in the cache,
-  //                     because `DLoadRsp` carries no id).
+  //   true  (Slices 2/C3) — the front frees S1 at RESOLVE; aligned loads stall
+  //                          only when the four-entry descriptor ring is full,
+  //                          while split loads serialize against that ring.
   //
   // `issue.ready`'s EXPRESSION is deliberately unchanged in BOTH modes (GC13) —
   // only WHEN `busy` reads 0 changes. See spec §6.2.
@@ -583,20 +585,65 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       val xlateSup        = Bool()
     }
     val bkCtx      = Reg(BkCtx())
-    // Back stage occupied. NG1 (single-occupancy) is a CONTRACT, not an effort budget:
-    // `DLoadRsp` carries no id (DcacheTypes.scala:24-28) and the back FSM attributes
-    // `loadRsp` purely by its own state, so a second load must never enter.
+    // Rare split replay occupied. Aligned requests never set this bit; their untagged
+    // response association is owned by the ordered descriptor ring below.
     val bkBusy     = RegInit(False); bkBusy.simPublic()
-    // spec §3.2(e) — with two independent in-flight µops, one `poisoned` bit cannot
-    // serve both: a new `issuePort.fire` would clear the poison of the OLDER µop still
-    // draining in the back stage. Set from `poisoned` at handoff (ORed with a
-    // same-cycle `sqFlushSig`, because `poisoned` is a Reg that only reads True from
-    // the NEXT cycle) and re-set by any later flush while the back is occupied.
+    // Split replay poison is separate from the resident front poison: a new front
+    // issue must never clear an older split access still draining in the back stage.
+    // The aligned ring carries one poison bit per descriptor instead.
     val bkPoisoned = RegInit(False); bkPoisoned.simPublic()
+    // Sticky poison for the single resident front µop. Declared beside the back/
+    // queue poison state because aligned enqueue captures it before the front FSM is
+    // elaborated; its set/clear policy remains at the S0->S1 control block below.
+    val poisoned   = RegInit(False); poisoned.simPublic()
     // Combinational handoff pulse: the front's RESOLVE asserts it, the back's BK_IDLE
     // consumes it in the SAME cycle, so the back reaches LAUNCH on exactly the cycle
     // the pre-split FSM did (a Reg-based handshake would cost one extra cycle).
     val bkStart    = Bool(); bkStart := False; bkStart.simPublic()
+
+    // ── Aligned-load command/response descriptor queue (full-pipeline spec C3) ──
+    //
+    // The D-cache accepts and returns resident aligned hits at II=1, in order, but
+    // DLoadRsp deliberately carries no id.  The former single bkCtx/BK_WAIT slot
+    // threw that capacity away: the next load could not leave RESOLVE until the
+    // previous response arrived.  Keep four *pruned* descriptors in acceptance
+    // order instead.  `alignedSend` identifies the oldest descriptor whose command
+    // has not handshaken; `alignedRsp` identifies the oldest accepted command whose
+    // untagged response has not arrived.  A miss may stretch the distance between
+    // them, but cannot reorder either pointer (the cache's miss-shadow contract is
+    // also in order).
+    //
+    // Split accesses remain on the small BK LAUNCH/WAIT_A/WAIT_B replay FSM and are
+    // mutually exclusive with this queue.  They are rare and inherently two-pass;
+    // the aligned hot path no longer enters a one-at-a-time state machine.
+    case class AlignedLoadCtx() extends Bundle {
+      val bk        = BkCtx()
+      val vaddr     = UInt(32 bits)
+      val paddr     = UInt(32 bits)
+      val size      = m68k040.isa.Size()
+      val cmode     = m68k040.cache.CacheMode()
+    }
+    private val alignedDepth = 4
+    private val alignedPtrW  = log2Up(alignedDepth)
+    val alignedMem      = Vec.fill(alignedDepth)(Reg(AlignedLoadCtx()))
+    val alignedValid    = Vec.fill(alignedDepth)(RegInit(False))
+    val alignedSent     = Vec.fill(alignedDepth)(RegInit(False))
+    val alignedPoisoned = Vec.fill(alignedDepth)(RegInit(False))
+    val alignedPushPtr  = Reg(UInt(alignedPtrW bits)) init 0
+    val alignedSendPtr  = Reg(UInt(alignedPtrW bits)) init 0
+    val alignedRspPtr   = Reg(UInt(alignedPtrW bits)) init 0
+    val alignedCount    = Reg(UInt(log2Up(alignedDepth + 1) bits)) init 0
+    val alignedEnq      = Bool(); alignedEnq := False
+    val alignedFull     = alignedCount === alignedDepth
+    val alignedEmpty    = alignedCount === 0
+    val alignedSendValid = !alignedEmpty && alignedValid(alignedSendPtr) &&
+                           !alignedSent(alignedSendPtr) && !bkBusy && !excActive
+    val alignedRspValid = !alignedEmpty && alignedValid(alignedRspPtr) &&
+                          alignedSent(alignedRspPtr) && !bkBusy
+    val alignedRspFire  = alignedRspValid && dcache.loadRsp.valid
+    val alignedCanEnq   = !bkBusy && (!alignedFull || alignedRspFire)
+    alignedCount.simPublic(); alignedFull.simPublic(); alignedEnq.simPublic()
+    alignedSendValid.simPublic(); alignedRspFire.simPublic()
     // Observability for the arbitration tests: True the cycle a FRONT completion was
     // suppressed and held because the BACK claimed the shared comp* stage.
     val frontCompHeld = Bool(); frontCompHeld := False; frontCompHeld.simPublic()
@@ -616,21 +663,30 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // cache is ever launched for either slot).
     val xlateBArm = RegInit(False)
 
-    // ---- dcache load cmd: driven from the REGISTERED launch stage (llReg) ----
-    // slot A = llReg.vaddr/paddr; slot B (cross) = llReg.addrB/paddrB (selected once
-    // slot A is captured -> bDone). The cache tags on this REGISTERED address (the AGU
-    // sum that produced it ended at the llReg flop). `loadVaddr`/`loadPaddr` are kept
-    // as locals so the same nets feed the exc-arbitration MUX path unchanged.
+    // ---- dcache load cmd: registered aligned queue or split replay register ----
+    // Aligned commands come from `alignedSendPtr`; the rare split path retains llReg
+    // and selects slot B after slot A returns.  The two sources are mutually exclusive
+    // by construction (a split waits for alignedEmpty; aligned enqueue waits !bkBusy).
+    // Both addresses are therefore registered at this boundary and preserve FMax #1.
+    val alignedCmd = alignedMem(alignedSendPtr)
+    val useSplitCmd = bkBusy
     val loadVaddr = UInt(32 bits)
     val loadPaddr = UInt(32 bits)
-    loadVaddr := Mux(llReg.bDone, llReg.addrB,  llReg.vaddr)
-    loadPaddr := Mux(llReg.bDone, llReg.paddrB, llReg.paddr)
-    dcache.loadCmd.valid        := llReg.valid
+    loadVaddr := Mux(useSplitCmd,
+                     Mux(llReg.bDone, llReg.addrB, llReg.vaddr), alignedCmd.vaddr)
+    loadPaddr := Mux(useSplitCmd,
+                     Mux(llReg.bDone, llReg.paddrB, llReg.paddr), alignedCmd.paddr)
+    dcache.loadCmd.valid         := Mux(useSplitCmd, llReg.valid, alignedSendValid)
     dcache.loadCmd.payload.vaddr := loadVaddr
     dcache.loadCmd.payload.paddr := loadPaddr
-    dcache.loadCmd.payload.size  := llReg.size
-    dcache.loadCmd.payload.cacheMode := llReg.cmode
-    dcache.loadCmd.payload.token := (False ## llReg.bDone ## llReg.robId.asBits).asUInt
+    dcache.loadCmd.payload.size  := Mux(useSplitCmd, llReg.size, alignedCmd.size)
+    dcache.loadCmd.payload.cacheMode := Mux(useSplitCmd, llReg.cmode, alignedCmd.cmode)
+    dcache.loadCmd.payload.token := Mux(
+      useSplitCmd,
+      (False ## llReg.bDone ## llReg.robId.asBits).asUInt,
+      (False ## False ## alignedCmd.bk.robId.asBits).asUInt)
+    val alignedCmdFire = alignedSendValid && dcache.loadCmd.ready
+    alignedCmdFire.simPublic()
 
     // ---- store split (byte-lane) for the SQ entry ----
     // Slot B's physical address is `s1PaddrB` (declared above alongside `s1Paddr`) —
@@ -1122,42 +1178,43 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // the live `u1`/`s1Ctx`/`s1Va`. Every field the load path cannot reach is
     // hardcoded to its provable value (see BkCtx's declaration comment) rather than
     // carried as a flop.
-    def captureCompletionBk(result: Bits): Unit = {
+    def captureCompletionDesc(ctx: BkCtx, result: Bits): Unit = {
       liveCompletionFires := True
       compValid      := True
-      compRobId      := bkCtx.robId
-      compData       := Mux(bkCtx.signExtW, result(15 downto 0).asSInt.resize(32).asBits, result)
-      compPdst       := bkCtx.pdst
-      compPdstValid  := bkCtx.pdstValid
+      compRobId      := ctx.robId
+      compData       := Mux(ctx.signExtW, result(15 downto 0).asSInt.resize(32).asBits, result)
+      compPdst       := ctx.pdst
+      compPdstValid  := ctx.pdstValid
       compIsLoad     := True
-      compWakes      := bkCtx.wakes
+      compWakes      := ctx.wakes
       compStkPush    := False           // store-only marker; unreachable from RESOLVE
-      compCcrRestore := bkCtx.ccrRestore
+      compCcrRestore := ctx.ccrRestore
       compEaAutoDrop := False           // requires isStore
       compRmwStore   := False           // requires isStore
-      compCrackDrop  := bkCtx.crackDrop
-      compKeepCommit := bkCtx.keepCommit
-      compDstArch    := bkCtx.dstArch
+      compCrackDrop  := ctx.crackDrop
+      compKeepCommit := ctx.keepCommit
+      compDstArch    := ctx.dstArch
       // RTR CCR-restore: NZVC := loaded[3:0], X := loaded[4]. A plain load leaves
       // writesNzvc/writesX False, so these are don't-cares on that path (identical to
       // the pre-split behaviour, where the storeNzvc Mux arm was equally a don't-care).
       compNzvc       := result(3 downto 0)
-      compNzvcWrite  := bkCtx.writesNzvc
-      compNzvcDst    := bkCtx.pNzvcDst
+      compNzvcWrite  := ctx.writesNzvc
+      compNzvcDst    := ctx.pNzvcDst
       compX          := result(4)
-      compXWrite     := bkCtx.writesX
-      compXDst       := bkCtx.pXDst
+      compXWrite     := ctx.writesX
+      compXDst       := ctx.pXDst
       compIsFault    := False
     }
+    def captureCompletionBk(result: Bits): Unit = captureCompletionDesc(bkCtx, result)
 
-    // The back-stage twin of `captureFault`. Only ONE call site exists (a D-cache
-    // refill AXI bus error surfacing on `loadRsp.payload.fault`, task #189), so
-    // `atc` is always false and `faultAddr` is always slot A's address — which
-    // `llReg.vaddr` holds verbatim (RESOLVE captured it from s1Va).
-    def captureFaultBk(atc: Boolean): Unit = {
+    // Descriptor form of `captureFault`: aligned entries and both split halves pass
+    // their own captured context/address, so an untagged refill bus error remains
+    // precisely associated. Translation faults still complete in the front path.
+    def captureFaultDesc(ctx: BkCtx, vaddr: UInt, size: m68k040.isa.Size.C,
+                         atc: Boolean): Unit = {
       liveCompletionFires := True
       compValid      := True
-      compRobId      := bkCtx.robId
+      compRobId      := ctx.robId
       compPdstValid  := False
       compNzvcWrite  := False
       compXWrite     := False
@@ -1169,39 +1226,74 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compCrackDrop  := False
       compKeepCommit := False
       compIsFault    := True
-      compFaultAddr  := llReg.vaddr
+      compFaultAddr  := vaddr
       compFaultWr    := False           // requires isStore
-      compFaultSize  := llReg.size.mux(
+      compFaultSize  := size.mux(
         m68k040.isa.Size.BYTE -> U(0, 2 bits),
         m68k040.isa.Size.WORD -> U(1, 2 bits),
         m68k040.isa.Size.LONG -> U(2, 2 bits))
       // spec §3.2(d): the CAPTURED supervisor bit, never the live one.
-      compFaultSup   := bkCtx.xlateSup
+      compFaultSup   := ctx.xlateSup
       compFaultAtc   := Bool(atc)
     }
-
     // Capture the back-stage descriptor at the RESOLVE->LAUNCH handoff. Called from
     // the FRONT FSM's RESOLVE "no forward" arm, in the SAME cycle llReg is captured,
     // so every source is the still-resident S1 context of THIS load.
-    def captureBkCtx(): Unit = {
-      bkCtx.robId           := s1Ctx.robId
-      bkCtx.pdst            := u1.pdst
-      bkCtx.pdstValid       := u1.pdstValid && !u1.ccrRestore
+    def captureBkCtx(dst: BkCtx): Unit = {
+      dst.robId           := s1Ctx.robId
+      dst.pdst            := u1.pdst
+      dst.pdstValid       := u1.pdstValid && !u1.ccrRestore
       // Carried as the FULL pre-split expression rather than the load-only subset, so
       // this can never silently diverge if a future µop shape reaches RESOLVE.
-      bkCtx.wakes           := (isLoad && !u1.ccrRestore) || u1.stkPush || u1.leaAddr ||
-                               (isAutoStoreAn && u1.pdstValid)
-      bkCtx.ccrRestore      := u1.ccrRestore
-      bkCtx.signExtW        := u1.isMovea && isLoad && (u1.size === m68k040.isa.Size.WORD)
-      bkCtx.dstArch         := u1.dstArch
-      bkCtx.writesNzvc      := u1.writesNzvc
-      bkCtx.pNzvcDst        := u1.pNzvcDst
-      bkCtx.writesX         := u1.writesX
-      bkCtx.pXDst           := u1.pXDst
-      bkCtx.crackDrop       := u1.divIsRem
-      bkCtx.keepCommit      := u1.keepCommit
-      bkCtx.needsSupervisor := u1.needsSupervisor
-      bkCtx.xlateSup        := xlate.req.supervisor
+      dst.wakes           := (isLoad && !u1.ccrRestore) || u1.stkPush || u1.leaAddr ||
+                             (isAutoStoreAn && u1.pdstValid)
+      dst.ccrRestore      := u1.ccrRestore
+      dst.signExtW        := u1.isMovea && isLoad && (u1.size === m68k040.isa.Size.WORD)
+      dst.dstArch         := u1.dstArch
+      dst.writesNzvc      := u1.writesNzvc
+      dst.pNzvcDst        := u1.pNzvcDst
+      dst.writesX         := u1.writesX
+      dst.pXDst           := u1.pXDst
+      dst.crackDrop       := u1.divIsRem
+      dst.keepCommit      := u1.keepCommit
+      dst.needsSupervisor := u1.needsSupervisor
+      dst.xlateSup        := xlate.req.supervisor
+    }
+    def captureBkCtx(): Unit = captureBkCtx(bkCtx)
+
+    // Aligned descriptor ring bookkeeping.  Response retirement is emitted before
+    // enqueue so a full-ring pop+push to the same physical slot leaves the new entry
+    // valid (accept-last, matching the house elastic-stage convention).
+    when(alignedRspFire) {
+      alignedValid(alignedRspPtr)    := False
+      alignedSent(alignedRspPtr)     := False
+      alignedPoisoned(alignedRspPtr) := False
+      alignedRspPtr                  := alignedRspPtr + 1
+    }
+    when(alignedCmdFire) {
+      alignedSent(alignedSendPtr) := True
+      alignedSendPtr              := alignedSendPtr + 1
+    }
+    when(sqFlushSig) {
+      for (i <- 0 until alignedDepth) {
+        when(alignedValid(i)) { alignedPoisoned(i) := True }
+      }
+    }
+    when(alignedEnq) {
+      val dst = alignedMem(alignedPushPtr)
+      captureBkCtx(dst.bk)
+      dst.vaddr := s1Va
+      dst.paddr := s2Paddr
+      dst.size  := u1.size
+      dst.cmode := s2Cmode
+      alignedValid(alignedPushPtr)    := True
+      alignedSent(alignedPushPtr)     := False
+      alignedPoisoned(alignedPushPtr) := poisoned || sqFlushSig
+      alignedPushPtr                  := alignedPushPtr + 1
+    }
+    switch(alignedEnq ## alignedRspFire) {
+      is(B"10") { alignedCount := alignedCount + 1 }
+      is(B"01") { alignedCount := alignedCount - 1 }
     }
 
     // ── Precise-store deferred-completion replay (root-cause fix, post-P2.5
@@ -1407,7 +1499,6 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // with NO observable side effect (no SQ alloc, no ROB completion/wakeup) --
     // exactly as if it had never been issued, matching what SHOULD happen to a
     // squashed instruction.
-    val poisoned = RegInit(False); poisoned.simPublic()
     when(issuePort.fire) {
       poisoned := False
     } elsewhen(sqFlushSig && (busy || s1Valid)) {
@@ -1443,6 +1534,25 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // the fsm closes, by the deferred-replay arbitration -- see its comment).
     liveCompletionFires := False
 
+    // The untagged response belongs to the oldest SENT aligned descriptor.  This
+    // block is after the comp*/liveCompletionFires default clears, so its capture is
+    // the effective writer for the cycle.  A front completion observes
+    // `backCompFires` below and yields; a precise-store replay observes the resulting
+    // liveCompletionFires and retries.  A same-cycle flush poisons immediately even
+    // though alignedPoisoned itself is registered.
+    val alignedRspEntry    = alignedMem(alignedRspPtr)
+    val alignedRspIsPoison = alignedPoisoned(alignedRspPtr) || sqFlushSig
+    when(alignedRspFire && !alignedRspIsPoison) {
+      val suppressForLaterPrivCheck = alignedRspEntry.bk.needsSupervisor &&
+                                      !alignedRspEntry.bk.xlateSup
+      when(dcache.loadRsp.payload.fault && !suppressForLaterPrivCheck) {
+        captureFaultDesc(alignedRspEntry.bk, alignedRspEntry.vaddr,
+                         alignedRspEntry.size, atc = false)
+      } otherwise {
+        captureCompletionDesc(alignedRspEntry.bk, dcache.loadRsp.payload.data)
+      }
+    }
+
     // ── BACK STAGE FSM: owns the D-cache access (spec §3.1) ──────────────────
     // Declared BEFORE the front FSM so `bkFsm.isActive(...)` is available to the
     // front's completion-collision guards. It reads `bkStart`/`bkPoisoned`/`bkCtx`/
@@ -1450,8 +1560,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // elaboration-order dependency in the other direction.
     val bkFsm = new StateMachine {
       val BK_IDLE = new State with EntryPoint
-      val LAUNCH  = new State   // registered cache launch: drive loadCmd off llReg (FMax #1)
-      val WAIT    = new State   // aligned: cache load cmd accepted, awaiting loadRsp
+      val LAUNCH  = new State   // split replay: launch slot A off llReg (FMax #1)
       val WAIT_A  = new State   // cross: slot A accepted, awaiting line A
       val WAIT_B  = new State   // cross: slot B accepted, awaiting line B -> merge
 
@@ -1472,34 +1581,26 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           // WAIT_A awaits its response). For a cross access WAIT_A re-asserts the launch
           // for slot B (bDone) once slot A's line lands.
           llReg.valid := False
-          when(llReg.twoAccess) { aDone := False; goto(WAIT_A) }
-          .otherwise { goto(WAIT) }
-        }
-      }
-
-      WAIT.whenIsActive {
-        when(dcache.loadRsp.valid) {
-          when(!bkPoisoned) {
-            // spec §3.2(d): both terms come from `bkCtx`, NOT from the live `u1`/
-            // `xlate.req` — after the split those describe a DIFFERENT µop. See the
-            // pre-split comment block for the full task-#189 rationale this preserves:
-            // a user-mode `MOVE <ea>,SR` source load must NOT report a bus fault (the
-            // later sysOp's own privilege check owns the trap), but a SUPERVISOR-mode
-            // one must.
-            val suppressForLaterPrivCheck = bkCtx.needsSupervisor && !bkCtx.xlateSup
-            when(dcache.loadRsp.payload.fault && !suppressForLaterPrivCheck) { captureFaultBk(atc = false) }
-            .otherwise { captureCompletionBk(dcache.loadRsp.payload.data) }
-          }
-          bkBusy := False
-          goto(BK_IDLE)
+          // Only split accesses enter this FSM; aligned loads use the descriptor ring.
+          aDone := False
+          goto(WAIT_A)
         }
       }
 
       WAIT_A.whenIsActive {
         when(dcache.loadRsp.valid && !aDone) {
-          lineA       := dcache.loadRsp.payload.line
-          aDone       := True
-          llReg.bDone := True
+          when(dcache.loadRsp.payload.fault) {
+            when(!bkPoisoned) {
+              captureFaultDesc(bkCtx, llReg.vaddr, llReg.size, atc = false)
+            }
+            llReg.valid := False
+            bkBusy      := False
+            goto(BK_IDLE)
+          } otherwise {
+            lineA       := dcache.loadRsp.payload.line
+            aDone       := True
+            llReg.bDone := True
+          }
         }
         when(aDone) {
           llReg.valid := True
@@ -1514,7 +1615,13 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           // staleness bug as the supervisor read above.
           val merged = m68k040.cache.DcacheByteLane.extractCross(
             lineA, dcache.loadRsp.payload.line, llReg.vaddr(3 downto 0), llReg.size)
-          when(!bkPoisoned) { captureCompletionBk(merged) }
+          when(!bkPoisoned) {
+            when(dcache.loadRsp.payload.fault) {
+              captureFaultDesc(bkCtx, llReg.addrB, llReg.size, atc = false)
+            } otherwise {
+              captureCompletionBk(merged)
+            }
+          }
           bkBusy := False
           goto(BK_IDLE)
         }
@@ -1531,15 +1638,17 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     //
     // Derived from `bkFsm.isActive` rather than from an assignment inside either FSM,
     // so neither FSM's statement-emission order can affect it.
-    val bkInWait      = bkFsm.isActive(bkFsm.WAIT)
+    val bkInWaitA     = bkFsm.isActive(bkFsm.WAIT_A)
     val bkInWaitB     = bkFsm.isActive(bkFsm.WAIT_B)
     // The back RELEASES this cycle (poisoned or not) — the front's Slice-1 WAIT_BK
     // uses this to free S1 on exactly the pre-split cycle.
-    val bkCompletes   = (bkInWait || bkInWaitB) && dcache.loadRsp.valid
+    val bkCompletes   = (bkInWaitB && dcache.loadRsp.valid) ||
+                        (bkInWaitA && dcache.loadRsp.valid && dcache.loadRsp.payload.fault)
     bkCompletes.simPublic()
     // The back actually WRITES comp* this cycle (a poisoned back load writes nothing,
     // so the front is free to use the stage).
-    val backCompFires = bkCompletes && !bkPoisoned
+    val backCompFires = (bkCompletes && !bkPoisoned) ||
+                        (alignedRspFire && !alignedRspIsPoison)
     backCompFires.simPublic()
 
     // ── FRONT STAGE FSM: owns s1*/s2Paddr/busy; completes stores + forwarded loads ──
@@ -1828,38 +1937,42 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           // s1Va -> loadCmd.vaddr -> cmdTag/cmdSet AGU->tag arc). All inputs are flops/
           // shallow-stages off s1Base (s1Va/s1AddrB) or already-registered (s2Paddr/B).
           //
-          // NG1: exactly ONE load may be in the cache at a time, because `DLoadRsp`
-          // carries no id and the back FSM attributes responses purely by state. Stall
-          // here while the back is still occupied. (Deliberately NOT `!bkBusy ||
-          // bkCompletes`: that would put `dcache.loadRsp.valid` into the front's
-          // next-state cone, which is exactly the kind of perturbation this corridor
-          // was just measured to punish. Worth at most 1 cycle of II; see spec §6.2.)
-          when(!bkBusy) {
-            llReg.valid     := True
-            llReg.vaddr     := s1Va
-            llReg.paddr     := s2Paddr
-            llReg.addrB     := s1AddrB
-            llReg.paddrB    := s2PaddrB
-            llReg.size      := u1.size
-            llReg.cmode     := s2Cmode
-            llReg.robId     := s1Ctx.robId
-            llReg.twoAccess := s1TwoAccess
-            llReg.bDone     := False
-            captureBkCtx()
-            bkBusy  := True
-            // spec §3.2(e): `poisoned` is a Reg SET by `sqFlushSig`, so it only reads
-            // True from the NEXT cycle — a handoff on the flush cycle itself must OR in
-            // the live pulse or the back µop would drain unpoisoned. (Pre-split this was
-            // covered implicitly: the flush set `poisoned` while `busy` was still True
-            // and WAIT read it a cycle later.)
-            bkPoisoned := poisoned || sqFlushSig
-            bkStart := True
-            if (earlyFree) {
-              busy    := False
-              s1Valid := False
+          // Aligned loads enqueue a pruned descriptor and leave immediately.  Their
+          // registered commands and untagged responses advance through the ring in
+          // order, so ordinary hit latency no longer imposes single occupancy.  A
+          // split access is an explicitly serial, two-pass replay: wait until the
+          // aligned ring drains, then use llReg + WAIT_A/WAIT_B exclusively.
+          when(!s1TwoAccess) {
+            when(alignedCanEnq) {
+              alignedEnq := True
+              busy       := False
+              s1Valid    := False
               goto(IDLE)
-            } else {
-              goto(WAIT_BK)
+            }
+          } otherwise {
+            when(!bkBusy && alignedEmpty) {
+              llReg.valid     := True
+              llReg.vaddr     := s1Va
+              llReg.paddr     := s2Paddr
+              llReg.addrB     := s1AddrB
+              llReg.paddrB    := s2PaddrB
+              llReg.size      := u1.size
+              llReg.cmode     := s2Cmode
+              llReg.robId     := s1Ctx.robId
+              llReg.twoAccess := True
+              llReg.bDone     := False
+              captureBkCtx()
+              bkBusy  := True
+              // `poisoned` is registered, so OR the live flush on the handoff edge.
+              bkPoisoned := poisoned || sqFlushSig
+              bkStart := True
+              if (earlyFree) {
+                busy    := False
+                s1Valid := False
+                goto(IDLE)
+              } else {
+                goto(WAIT_BK)
+              }
             }
           }
         }
@@ -2028,7 +2141,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // BACK-stage taps. NAMES DELIBERATELY UNCHANGED from the pre-split front states —
     // `MiHangTraceSpec` and `P27HangTraceSpec` reference them by these exact names.
     val dbgIsLaunch  = bkFsm.isActive(bkFsm.LAUNCH);  dbgIsLaunch.simPublic()
-    val dbgIsWait    = bkFsm.isActive(bkFsm.WAIT);    dbgIsWait.simPublic()
+    // Retain the historical tap name for trace scripts; aligned loads no longer
+    // occupy a BK_WAIT state.
+    val dbgIsWait    = Bool(); dbgIsWait := False; dbgIsWait.simPublic()
     val dbgIsWaitA   = bkFsm.isActive(bkFsm.WAIT_A);  dbgIsWaitA.simPublic()
     val dbgIsWaitB   = bkFsm.isActive(bkFsm.WAIT_B);  dbgIsWaitB.simPublic()
     val dbgBkIdle    = bkFsm.isActive(bkFsm.BK_IDLE); dbgBkIdle.simPublic()

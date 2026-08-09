@@ -48,9 +48,10 @@ class LsEuCrossSpec extends AnyFunSuite {
     cd.waitSampling(2)
   }
 
-  def initDut(dut: Dut): (ClockDomain, BehavioralMemAgent) = {
+  def initDut(dut: Dut, injectBusErrors: Boolean = false): (ClockDomain, BehavioralMemAgent) = {
     val cd = dut.clockDomain; cd.forkStimulus(10)
-    val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+    val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd,
+                                     injectBusErrors = injectBusErrors)
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
     s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false
@@ -180,6 +181,63 @@ class LsEuCrossSpec extends AnyFunSuite {
       assert(dut.src.logic.obsIntData.toBigInt == expected(addr, 4),
         s"cross-line ${dut.src.logic.obsIntData.toBigInt.toString(16)} exp ${expected(addr, 4).toString(16)}")
     }
+  }
+
+  test("split load reports a physical bus fault from either half and never writes a result", VerilatorTest) {
+    val compiled = simConfig.compile(new Dut)
+
+    def run(label: String, addr: Long, expectedFaultAddr: Long, expectedAr: Int): Unit = {
+      compiled.doSim(label) { dut =>
+        val (cd, mem) = initDut(dut, injectBusErrors = true)
+        // These boundary addresses deliberately cross between the test model's
+        // decoded and unmapped top-nibble regions:
+        //   0x3ffffffe: slot A unmapped, slot B (0x40000000) decoded
+        //   0x0ffffffe: slot A decoded, slot B (0x10000000) unmapped
+        preload(mem, addr & ~0xFL, 32)
+        seed(dut, cd, preg = 10, value = addr)
+
+        var arCount = 0
+        fork {
+          while (true) {
+            cd.waitSampling()
+            if (dut.dcache.logic.axi.ar.valid.toBoolean &&
+                dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1
+          }
+        }
+
+        issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 22, robId = 12)
+        var sawFault = false
+        var sawCompletion = false
+        var faultAddr = 0L
+        var faultAtc = true
+        var n = 0
+        while ((!sawFault || !sawCompletion) && n < 200) {
+          if (dut.src.logic.fValid.toBoolean) {
+            sawFault = true
+            faultAddr = dut.src.logic.fAddr.toLong & 0xffffffffL
+            faultAtc = dut.src.logic.fAtc.toBoolean
+            assert(dut.src.logic.fRob.toInt == 12, s"$label fault robId")
+          }
+          if (dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == 12)
+            sawCompletion = true
+          if (!sawFault || !sawCompletion) cd.waitSampling()
+          n += 1
+        }
+        cd.waitSampling(4)
+        assert(sawFault && sawCompletion, s"$label must fault and complete")
+        assert(faultAddr == expectedFaultAddr,
+          f"$label faultAddr=0x$faultAddr%08x expected 0x$expectedFaultAddr%08x")
+        assert(!faultAtc, s"$label is a physical AXI fault, not an ATC fault")
+        assert(arCount == expectedAr,
+          s"$label refill count: got $arCount expected $expectedAr")
+        dut.src.logic.obsIntAddr #= 22; sleep(1)
+        assert(dut.src.logic.obsIntData.toBigInt == 0,
+          s"$label faulted split load must not write its destination")
+      }
+    }
+
+    run("splitFaultA", 0x3ffffffeL, 0x3ffffffeL, expectedAr = 1)
+    run("splitFaultB", 0x0ffffffeL, 0x10000000L, expectedAr = 2)
   }
 
   test("page-crossing word load (identity xlate, two accesses)", VerilatorTest) {

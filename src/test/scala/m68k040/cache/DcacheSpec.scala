@@ -1938,6 +1938,86 @@ class DcacheSpec extends AnyFunSuite {
     }
   }
 
+  test("VIPT slice C3: a proven-hit probe is consumed while the next virtual-set " +
+       "probe launches on the same edge", VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val addrA = 0x7E84L
+      val addrB = 0x7F48L
+      val tokenA = 0x31
+      val tokenB = 0x32
+      preload(mem, addrA & ~0xFL, 16)
+      preload(mem, addrB & ~0xFL, 16)
+      assert(load(dut, cd, addrA, Size.LONG) == expected(addrA, 4), "prime A")
+      assert(load(dut, cd, addrB, Size.LONG) == expected(addrB, 4), "prime B")
+      cd.waitSampling(8)
+
+      // Hold A's virtual-set result in the one-entry early-probe slot.
+      dut.probe.logic.loadProbeIn.valid #= true
+      dut.probe.logic.loadProbeIn.payload.vaddr #= addrA
+      dut.probe.logic.loadProbeIn.payload.token #= tokenA
+      cd.waitSamplingWhere(dut.probe.logic.loadProbeIn.valid.toBoolean &&
+                           dut.probe.logic.loadProbeIn.ready.toBoolean)
+      dut.probe.logic.loadProbeIn.valid #= false
+      cd.waitSampling(1)
+      assert(dut.dcache.logic.earlyProbeValid.toBoolean)
+      assert(dut.dcache.logic.earlyProbeFresh.toBoolean)
+
+      // Resolve A while presenting B's virtual probe. Because A is a proven
+      // physical-tag hit, both Streams must handshake on this same edge: A consumes
+      // the old RAM output and B replaces it with a new synchronous read.
+      dut.probe.logic.loadCmdIn.valid #= true
+      dut.probe.logic.loadCmdIn.payload.vaddr #= addrA
+      dut.probe.logic.loadCmdIn.payload.paddr #= addrA
+      dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+      dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadCmdIn.payload.token #= tokenA
+      dut.probe.logic.loadProbeIn.valid #= true
+      dut.probe.logic.loadProbeIn.payload.vaddr #= addrB
+      dut.probe.logic.loadProbeIn.payload.token #= tokenB
+      sleep(1)
+      assert(dut.dcache.logic.useEarlyProbe.toBoolean,
+        "A must consume its held VIPT result")
+      assert(dut.probe.logic.loadCmdIn.ready.toBoolean,
+        "A's resolved hit command must be accepted")
+      assert(dut.probe.logic.loadProbeIn.ready.toBoolean,
+        "B's virtual probe must replace A on the same proven-hit edge")
+      cd.waitSampling()
+      dut.probe.logic.loadCmdIn.valid #= false
+      dut.probe.logic.loadProbeIn.valid #= false
+
+      assert(dut.dcache.logic.earlyProbeValid.toBoolean,
+        "the slot must remain occupied by replacement probe B")
+      assert(dut.dcache.logic.earlyProbeFresh.toBoolean,
+        "B's just-launched RAM output must not be invalidated by A's consume")
+
+      // The very next resolved command must own B's replacement result, proving
+      // that the turnover did not merely leave stale A metadata marked valid.
+      dut.probe.logic.loadCmdIn.payload.vaddr #= addrB
+      dut.probe.logic.loadCmdIn.payload.paddr #= addrB
+      dut.probe.logic.loadCmdIn.payload.token #= tokenB
+      sleep(1)
+      assert(dut.dcache.logic.useEarlyProbe.toBoolean,
+        "B's token+VA must own the replacement VIPT result")
+      dut.probe.logic.loadCmdIn.valid #= true
+      cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
+                           dut.probe.logic.loadCmdIn.ready.toBoolean)
+      dut.probe.logic.loadCmdIn.valid #= false
+
+      val got = scala.collection.mutable.ArrayBuffer.empty[BigInt]
+      var cycles = 0
+      while (got.size < 2 && cycles < 10) {
+        if (dut.probe.logic.loadRspOut.valid.toBoolean)
+          got += dut.probe.logic.loadRspOut.payload.data.toBigInt
+        if (got.size < 2) cd.waitSampling()
+        cycles += 1
+      }
+      assert(got == Seq(expected(addrA, 4), expected(addrB, 4)),
+        s"consume-and-replace responses must remain ordered and correct, got $got")
+      cd.waitSampling(4)
+    }
+  }
+
   test("FMax slice 2: miss DETECTION and refill kickoff timing are unchanged by the " +
        "S1a/S1b split", VerilatorTest) {
     sharedCompiled.doSim { dut =>

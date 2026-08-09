@@ -111,6 +111,7 @@ class LsEuSourcePlugin extends FiberPlugin {
     val fWrite = out Bool ();        fWrite := eu.faultCompletion.payload.write
     val fSize  = out UInt (2 bits);  fSize  := eu.faultCompletion.payload.sizeBits
     val fSuper = out Bool ();        fSuper := eu.faultCompletion.payload.supervisor
+    val fAtc   = out Bool ();        fAtc   := eu.faultCompletion.payload.atc
 
     // ROB-side SQ commit / flush (sim-driven)
     val iSqCommitValid = in Bool (); val iSqCommitRob = in UInt (6 bits)
