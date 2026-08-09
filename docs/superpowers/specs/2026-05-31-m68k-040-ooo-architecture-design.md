@@ -201,22 +201,29 @@ The counter is used only for MOVEM / CAS(2) / bitfield / MOVES / CHK2/CMP2 / mic
 | Shift (barrel) | 1 | |
 | EA (complex) | 1 | |
 | Branch resolve | 1 | |
-| MUL | ~3–4, **fully pipelined**, fixed | DSP48 chain; div0/overflow via ROB |
+| MUL | 4 datapath stages, **fully pipelined**, II=1 | one shared DSP48 chain; completion is elastically arbitrated on the CPLX result port |
 | DIV | fixed cycle-count (data-independent) | iterative but always N cycles; div0/overflow via ROB |
 | Load (L1 + TLB hit) | fixed (~2–3) | optimistic; miss → replay (ch 6), no broadcast |
 | Store | addr+data at execute; write at commit | translation at execute is replayable |
 
-`ready_cycle = issue_cycle + staticLatency`. No completion broadcast for fixed-latency producers.
+`ready_cycle = issue_cycle + staticLatency` for producers using the INT static
+wakeup network.  MUL is the deliberate exception: its arithmetic latency is fixed,
+but the one area-efficient DSP chain shares CPLX's single PRF/ROB result port with
+CHK/CMP2 and the iterative divider.  It therefore uses the existing dynamic CPLX
+wakeup after shallow result arbitration.  This keeps the multiplier II=1 without
+adding an IQ port, a PRF write port, or a ROB completion port.
 
 ### 4.8 Cluster steering and inter-cluster forwarding
 
-- **INT:** ALU, logical, shift, MUL, DIV, MOVEQ, condition evaluation (`Scc/DBcc/Bcc` test).
+- **INT:** ALU, logical, shift, MOVEQ, condition evaluation (`Scc/DBcc/Bcc` test).
 - **EA:** **complex** address generation only — `(d8,An,Xn*scale)`, full 020+ indexed/memory-indirect
   modes, PC-relative-indexed. **Simple modes collapse into the LS µop** (see ch 6).
 - **LS:** load/store µops, own base+displacement AGU, store queue, store→load forwarding, D-cache +
   DTLB, replay validation.
-- **CPLX:** microcoded expansions (MOVEM, CAS/CAS2, bitfield, MOVES, CHK2/CMP2), MMU ops, cache
-  control, privileged/serializing ops.
+- **CPLX:** the single shared DSP multiplier, iterative divider, CHK/CHK2/CMP2,
+  microcoded expansions (MOVEM, CAS/CAS2, bitfield, MOVES), MMU ops, cache
+  control, privileged/serializing ops.  MUL and DIV share issue/result wiring but
+  do not share occupancy: fixed-latency MUL may remain II=1 while DIV iterates.
 
 **Inter-cluster forwarding (limited, registered — accept +1 cycle):**
 - `LS load-data → INT/EA` (primary path: a loaded value feeding compute/address).
@@ -282,11 +289,13 @@ global wakeup network. Inter-cluster forwarding per 4.8.
 
 ### 6.2 Execute (ch #5)
 
-- **INT:** ALU, barrel shifter, **fully-pipelined MUL** (DSP48), **fixed-cycle DIV**, condition eval.
-  div0/overflow raise via the normal ROB exception path.
+- **INT:** ALU, barrel shifter, condition eval.
 - **EA:** complex-mode address arithmetic only.
 - **LS:** AGU (simple modes), DTLB, L1D, store queue, forwarding — see ch 7.
-- **CPLX:** microcode sequencer datapath; serializing/privileged ops.
+- **CPLX:** one **fully-pipelined II=1 MUL** DSP48 chain, a separately occupied
+  fixed-cycle iterative DIV, CHK/CHK2/CMP2, microcode sequencer datapath, and
+  serializing/privileged ops.  The fixed and iterative engines feed one shallow
+  elastic result arbiter; div0/overflow raise via the normal ROB exception path.
 - **FPU:** not built; rename/ROB/cluster slots reserved.
 
 ---
