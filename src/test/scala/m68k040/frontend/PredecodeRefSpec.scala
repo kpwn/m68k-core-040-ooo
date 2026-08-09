@@ -49,6 +49,30 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x2183) == cp(true,2))   // MOVE.L D3,(d8,A0,Xn) dst mode 6
     assert(classify(0xD3B0) == cp(true,2))   // ADD.L D1,(d8,A0,Xn)  RMW dst mode 6
   }
+  test("JMP and JSR control-EA partition includes both brief-indexed modes") {
+    for {
+      base <- Seq(0x4E80, 0x4EC0)            // JSR, JMP
+      mode <- 0 until 8
+      reg  <- 0 until 8
+    } {
+      val op = base | (mode << 3) | reg
+      val expected = mode match {
+        case 2 => cp(true, 1)                 // (An)
+        case 5 => cp(true, 2)                 // (d16,An)
+        case 6 => cp(true, 2)                 // (d8,An,Xn), brief indexed
+        case 7 => reg match {
+          case 0 => cp(true, 2)               // (xxx).W
+          case 1 => cp(true, 3)               // (xxx).L
+          case 2 => cp(true, 2)               // (d16,PC)
+          case 3 => cp(true, 2)               // (d8,PC,Xn), brief indexed
+          case _ => cp(false, 0)
+        }
+        case _ => cp(false, 0)                // Dn/An/(An)+/-(An) are not control EAs
+      }
+      assert(classify(op) == expected,
+        f"${if (base == 0x4E80) "JSR" else "JMP"} mode=$mode reg=$reg op=0x$op%04x")
+    }
+  }
   test("ADDQ #n,(An) mem-dest -> simple (RMW now in scope)") {
     assert(classify(0x5290) == cp(true,1))   // ADDQ.L #1,(A0) -> (An) mem-dest RMW
     assert(classify(0x5268) == cp(true,2))   // ADDQ.W #1,(d16,A0) -> opword + disp16

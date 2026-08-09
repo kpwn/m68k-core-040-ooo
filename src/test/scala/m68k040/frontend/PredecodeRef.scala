@@ -6,8 +6,9 @@ object PredecodeRef {
   final case class CP(simple: Boolean, lenWords: Int)
   val COMPLEX = CP(false, 0)
 
-  /** Extension-word count for an EA mode/reg. None => complex (indexed/PC-indexed
-    * or, when allowImm=false, immediate). sizeL selects #imm width (long=2). */
+  /** Extension-word count for an EA mode/reg. None => an unsupported mode/reg pair
+    * (including immediate when allowImm=false). Brief indexed An/PC EAs are one word;
+    * sizeL selects #imm width (long=2). */
   def eaExt(mode: Int, reg: Int, sizeL: Boolean, allowImm: Boolean): Option[Int] = mode match {
     case 0 | 1 | 2 | 3 | 4 => Some(0)        // Dn, An, (An), (An)+, -(An)
     case 5                 => Some(1)        // (d16,An)
@@ -198,7 +199,8 @@ object PredecodeRef {
         val isMulL = ((op >> 6) & 0x3ff) == 0x130
         // JMP (0100111011 mmmrrr) / JSR (0100111010 mmmrrr): computed-target branch to
         // the EA address. 1 opword + control-EA ext. Control modes only:
-        // (An)=2, (d16,An)=5, (xxx).W/.L/(d16,PC)=mode7 reg0/1/2.
+        // (An)=2, (d16,An)=5, (d8,An,Xn)=6, and mode7 reg0/1/2/3 for
+        // (xxx).W/.L/(d16,PC)/(d8,PC,Xn).
         val isJmp = ((op >> 6) & 0x3ff) == 0x13b
         val isJsr = ((op >> 6) & 0x3ff) == 0x13a
         // Line-4 single-operand DATA-register family (the unary group): single-word ->
@@ -265,7 +267,7 @@ object PredecodeRef {
           }
         } else if (isJmp || isJsr) {
           val srcMode = (op >> 3) & 7; val srcReg = op & 7
-          val ctrlMode = srcMode == 2 || srcMode == 5 || srcMode == 7
+          val ctrlMode = srcMode == 2 || srcMode == 5 || srcMode == 6 || srcMode == 7
           eaExt(srcMode, srcReg, sizeL = false, allowImm = false) match {
             case Some(e) if ctrlMode => CP(simple = true, lenWords = 1 + e)
             case _                   => COMPLEX
