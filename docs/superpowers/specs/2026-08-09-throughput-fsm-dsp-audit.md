@@ -47,7 +47,7 @@ the all-hit path but becomes important at realistic miss rates.
 
 | Priority | controller | current initiation behavior | classification | FPGA-friendly action | difficulty and main hazards |
 |---|---|---:|---|---|---|
-| P0 | ALU slow path (`AluEuPlugin`) | six physical stages, but issue blocks while any is occupied: latency about 6, II about 7 | hot when shifts/bitfields occur; cheap–moderate | turn the existing registers into an elastic pipeline; reserve the completion stage before accept and mask IQ candidates when unavailable; do not replicate the shifter | single completion/PRF port collisions and static IQ select-to-fire assumptions |
+| landed | ALU slow path (`AluEuPlugin`) | six physical stages, now II=1 with consecutive issue/completion proof; fast ops reserve the shared S1/S3 write port exactly one cycle ahead | hot when shifts/bitfields occur; completed in simulation | retain the existing registers, stored IQ class bit, fail-safe forecast, flush poison, and precise immediate/memory X dependencies | routed area/FMax still required; mixed-loop residual belongs to the separately specified fetch-directed-BTB lever |
 | landed | aligned LS/L1D hit path (`LsEuPlugin`, `DcachePlugin`) | same-page resident load II=1; multiple operations in P2/P3/P4, descriptor ring, and VIPT-result queue | hottest memory path; hard, completed in simulation | retain pruned contexts, ordered untagged responses, accept-last turnover, and tokenized early results | precise fault order, store forwarding, flush poison, completion priority; routed area/FMax still required |
 | P1 | changed-VPN DTLB turnaround (`DtlbPlugin`) | same VPN II=1; back-to-back different VPNs require the registered result to settle | memory hot-path edge; moderate | return a decoupled/tagged hit result to an LS slot; keep one TLB and one walker | younger hit versus older walk ordering, U/M identity, faults, permissions, PFLUSHA, exception arbitration |
 | P1 | D-cache demand-miss engine (`DcachePlugin`) | one `IDLE/EVICT_WR/REFILL/REPLAY` context; no demand hit-under-demand-miss | miss path; moderate for one parked miss, hard for many | implement one parked MSHR plus hit-under-miss, with same-set/claimed-way exclusion and ordered completion; do not start with general multi-MSHR | untagged responses, dirty victim ordering, shared store RMW port, fault/flush association; the current SoC crossbar cannot exploit multiple simultaneous bus misses |
@@ -62,9 +62,14 @@ actionable follow-up:
 `docs/superpowers/specs/2026-08-09-ipc-alu-eu-slow-path-serialization-design.md`.
 It already describes the completion-port collision solution and small-area
 shape. The current ROM histogram attributes about 1.50% of operations to shifts
-and 0.37% to bitfields; the dedicated benchmarks measure `shift-stream` IPC
-0.286 and `shift-mixed` IPC 0.646. This controller is the clearest case where
-existing pipeline registers are being used as a one-entry FSM.
+and 0.37% to bitfields.  The baseline dedicated benchmarks measured
+`shift-stream` IPC 0.286 and `shift-mixed` IPC 0.646.  After enabling the
+existing pipe at II=1 and removing false immediate-shift X dependencies, the
+same pinned zero-latency measurements are 0.843 and 1.303; the L2-faithful
+measurements are 0.765 and 1.204.  Directed tests prove six consecutive accepts
+and six uniquely tagged consecutive completions, exact S1/S3 port reservation,
+candidate rerouting, and dense-pipe flush/reuse.  Physical route remains the
+handoff gate.
 
 ### 2.2 D-cache hit-under-miss boundary
 
@@ -185,6 +190,14 @@ association/order, backpressure, flush, and collision behavior. A latency window
 alone is insufficient because it can pass vacuously without demonstrating that
 multiple operations were ever resident.
 
+The ALU phase uncovered two more stale assertions: ADDA was checked with the
+pre-fix source/destination order, and legal microcoded CMPM was still expected
+to decode as illegal. The repaired tests now assert the binding
+`srcA=destination, srcB=source` contract and the exact `CMPM_ENTRY` association,
+including that the normal operand descriptors are unused. This is the preferred
+failure outcome: a broad gate exposed false expectations instead of driving RTL
+back toward them.
+
 Current gate evidence for the LSU change:
 
 - D-cache focused suite: 49/49;
@@ -207,7 +220,7 @@ debt; suppressing or ignoring it would make the gate less trustworthy.
 |---|---|---|
 | binding core architecture | fully pipelined MUL requirement conflicts with live CPLX implementation | ratify one architecture before MUL RTL work |
 | LS pipeline specs/plans | newest full-pipeline spec is correct and now carries measured D1/D2 results; older late-split documents are historical checkpoints | treat `2026-08-09-ipc-ls-eu-full-pipeline-design.md` as current |
-| ALU slow-path spec | evidence-backed and immediately actionable | next cheap pipeline implementation candidate |
+| ALU slow-path spec | implemented and simulation-gated at II=1 | run the paired routed FMax/LUT and IQ-endpoint census before final acceptance |
 | MSHR proposal | correctly prioritizes D-side hit-under-miss and warns about crossbar limits | implement one parked miss before general MSHRs |
 | store-drain/race documents | correctly require ordered AW/W and acknowledgement ownership | use a descriptor/ack queue, never independent loose FSMs |
 | old FMax retiming documents | valid for timing changes but some explicitly preserve single-outstanding behavior | do not read a retiming non-goal as a throughput endorsement |
@@ -220,7 +233,8 @@ debt; suppressing or ignoring it would make the gate less trustworthy.
    serialized Vivado window is free. Do not infer closure from simulation.
 2. Verify the landed MOVEM strength reduction removes both decode DSPs and the
    measured timing failure in the paired routed gate.
-3. Convert the existing ALU slow stages into a real elastic pipeline.
+3. Run the paired routed FMax/LUT and IQ-endpoint census for the landed ALU II=1
+   pipeline; retain it only if the issue-select cone stays under control.
 4. Reconcile the binding MUL architecture, then implement the four-stage II=1
    DSP pipeline and completion protocol.
 5. Measure D-cache miss occupancy, SQ-full/drain stalls, CPLX mix, and changed-VPN

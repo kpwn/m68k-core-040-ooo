@@ -147,12 +147,16 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     host[FetchAlignPlugin].logic.quiesce := rob.logic.stopped || rob.logic.coreHalted
     eu0.issue << iq.issue(0)
     eu1.issue << iq.issue(1)
+    iq.aluFastAcceptNext(0) := eu0.fastAcceptNext
+    iq.aluFastAcceptNext(1) := eu1.fastAcceptNext
+    eu0.flush := iq.flushPort
+    eu1.flush := iq.flushPort
     // MOVE-from-SR int result needs the committed SR system byte: wire the ROB's
     // exc.ss.srSys to both ALU EUs (read-only; the only srSys writer is exception
     // entry/RTE, which fully flushes -> no in-flight fromSr observes a stale value).
     eu0.srSysIn := rob.logic.exc.ss.srSys
     eu1.srSysIn := rob.logic.exc.ss.srSys
-    // SLOW-ALU (shift, latency-2) dynamic wakeup: ONE IQ port per ALU EU (both EUs can
+    // SLOW-ALU (SHIFT/BITFIELD, S3) dynamic wakeup: ONE IQ port per ALU EU (both EUs can
     // complete a distinct shift the same cycle, so no shared/OR'd port).
     iq.aluSlowWakeup(0).valid   := eu0.slowWakeup.valid
     iq.aluSlowWakeup(0).payload := eu0.slowWakeup.payload

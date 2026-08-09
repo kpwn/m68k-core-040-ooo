@@ -32,10 +32,24 @@ class SynthProbePlugin extends FiberPlugin {
       iq.flushPort      := RegNext(in Bool ()) init False
       iq.issue(0).ready := RegNext(in Bool ()) init False
       iq.issue(1).ready := RegNext(in Bool ()) init False
+      iq.issue(2).ready := RegNext(in Bool ()) init False
+      iq.issue(3).ready := RegNext(in Bool ()) init False
+      iq.issue(4).ready := RegNext(in Bool ()) init False
+      // Keep both sides of the fast-accept candidate masks live. These are
+      // independent registered probe inputs because this harness has no ALU EU
+      // from which to derive the real one-cycle-ahead reservation forecast.
+      iq.aluFastAcceptNext(0) := RegNext(in Bool ()) init False
+      iq.aluFastAcceptNext(1) := RegNext(in Bool ()) init False
       val iqIssue0V = out(RegNext(iq.issue(0).valid) init False)
       val iqIssue0R = out(RegNext(iq.issue(0).payload.robId))
       val iqIssue1V = out(RegNext(iq.issue(1).valid) init False)
       val iqIssue1R = out(RegNext(iq.issue(1).payload.robId))
+      val iqIssue2V = out(RegNext(iq.issue(2).valid) init False)
+      val iqIssue2R = out(RegNext(iq.issue(2).payload.robId))
+      val iqIssue3V = out(RegNext(iq.issue(3).valid) init False)
+      val iqIssue3R = out(RegNext(iq.issue(3).payload.robId))
+      val iqIssue4V = out(RegNext(iq.issue(4).valid) init False)
+      val iqIssue4R = out(RegNext(iq.issue(4).payload.robId))
     }
   }
 }

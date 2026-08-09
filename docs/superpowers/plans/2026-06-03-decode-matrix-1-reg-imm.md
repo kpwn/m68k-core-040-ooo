@@ -14,7 +14,7 @@
 - `DecodedUop` fields (unchanged target contract): `valid, pc, op:DecOp, cluster:Cluster, size:Size, srcAReg:UInt(4)/srcAValid, srcBReg:UInt(4)/srcBValid, dstReg:UInt(4)/dstValid, useImm/imm:Bits(32), readsNzvc/readsX/writesNzvc/writesX, isBranch, cond:Bits(4), branchDisp:Bits(32), unimplemented`. Reg ids: D0–7 = 0–7, A0–7 = 8–15.
 - `DecodePacket`: `valid, pc, words:Vec(Bits(16),5), wordCount:UInt(3), simple, lenWords:UInt(3), complex, fault`.
 - `DecOp` enum: `MOVE, ADD, SUB, AND, OR, CMP, BRANCH, ILLEGAL`. `Size`: `BYTE, WORD, LONG`. `Cluster`: `INT, EA, LS, CPLX`.
-- Existing operand conventions the new path MUST preserve (from `SimpleDecodeUnit` + `SimpleDecodeUnitSpec`): MOVE/MOVEQ put the source in **srcB** (ALU MOVE computes `result = src2`); ALU EA→Dn ops put dest-reg in **srcA** and EA operand in **srcB** (datapath computes `src1 op src2`, needed for SUB/CMP ordering); ADDA/SUBA/CMPA (opmode 3/7) put EA in srcA, An in srcB, dest An; CMP/CMPA do not write a reg (`dstValid=false`) but set `writesNzvc`.
+- Existing operand conventions the new path MUST preserve (from `SimpleDecodeUnit` + `SimpleDecodeUnitSpec`): MOVE/MOVEQ put the source in **srcB** (ALU MOVE computes `result = src2`); ALU EA→Dn ops put dest-reg in **srcA** and EA operand in **srcB**; ADDA/SUBA/CMPA (opmode 3/7) likewise put An destination in **srcA** and EA source in **srcB**. The datapath computes `src1 op src2`, so this ordering is required for SUB/CMP/SUBA/CMPA. CMP/CMPA do not write a reg (`dstValid=false`) but set `writesNzvc`.
 - m68k EA field = 6 bits: `mode = ea(5 downto 3)`, `reg = ea(2 downto 0)`. Reg-direct/imm modes only in this slice: `000`=Dn, `001`=An, `111`+reg `100`=`#imm`. All other modes → `EaClass.MEMSIMPLE`/`MEMCOMPLEX`/`ILLEGAL` (defined but unused → `unimplemented`).
 
 ---
@@ -327,11 +327,11 @@ class OperationDecoderSpec extends AnyFunSuite {
       assert(dut.o.op.toEnum == DecOp.CMP && !dut.o.dstWrites.toBoolean && dut.o.writesNzvc.toBoolean)
     }
   }
-  test("ADDA.L: opmode7, srcA EASRC, srcB REGFIELD(An), no flags", VerilatorTest) {
+  test("ADDA.L: opmode7, srcA REGFIELD(An destination), srcB EASRC, no flags", VerilatorTest) {
     run(0xD1C1) { dut =>
       assert(dut.o.op.toEnum == DecOp.ADD && dut.o.size.toEnum == Size.LONG)
-      assert(dut.o.srcA.kind.toEnum == OperandKind.EASRC)
-      assert(dut.o.srcB.kind.toEnum == OperandKind.REGFIELD && dut.o.srcB.isAddr)
+      assert(dut.o.srcA.kind.toEnum == OperandKind.REGFIELD && dut.o.srcA.isAddr)
+      assert(dut.o.srcB.kind.toEnum == OperandKind.EASRC)
       assert(dut.o.dst.kind.toEnum == OperandKind.REGFIELD && dut.o.dst.isAddr && dut.o.dstWrites.toBoolean)
       assert(!dut.o.writesNzvc.toBoolean && !dut.o.writesX.toBoolean)
     }
@@ -429,8 +429,8 @@ object OperationDecoder {
             when(line === 0xD || line === 0x9) { o.writesNzvc := True; o.writesX := True }   // ADD/SUB
               .elsewhen(line === 0xC || line === 0x8 || line === 0xB) { o.writesNzvc := True } // AND/OR/CMP
           } .elsewhen(opmode === 3 || opmode === 7) {
-            // ADDA/SUBA/CMPA : srcA = EA, srcB = An, dst An
-            o.srcA := easrc; o.srcB := anField; o.dst := anField
+            // ADDA/SUBA/CMPA : srcA = An destination, srcB = EA source, dst An
+            o.srcA := anField; o.srcB := easrc; o.dst := anField
             when(line =/= 0xB) { o.dstWrites := True }
             when(line === 0xB) { o.writesNzvc := True }  // CMPA sets flags, no write
             when(opmode === 3) { o.size := Size.WORD } .otherwise { o.size := Size.LONG }

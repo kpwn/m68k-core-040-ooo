@@ -29,7 +29,7 @@ class IqSourcePlugin extends FiberPlugin {
       val pNzvcSrc   = in UInt (4 bits); val pNzvcDst = in UInt (4 bits)
       val readsX     = in Bool (); val writesX = in Bool ()
       val pXSrc      = in UInt (4 bits); val pXDst = in UInt (4 bits)
-      // True => this uop is a line-E SHIFT (the slow-ALU latency-2 producer); else MOVE.
+      // True => this uop is a line-E SHIFT (the slow-ALU S3 producer); else MOVE.
       val isShift    = in Bool ()
     }
     val s0 = SlotIo()
@@ -107,12 +107,19 @@ class IqSourcePlugin extends FiberPlugin {
     iq.push.payload(1)  := mkSlot(s1)
     pushReady           := iq.push.ready
 
+    // Per-EU next-cycle fast acceptance (sim-driven).  These emulate the two ALU
+    // pipeline look-ahead bits so candidate-mask behavior can be tested directly.
+    val aluFastAccept0 = in Bool ()
+    val aluFastAccept1 = in Bool ()
+    iq.aluFastAcceptNext(0) := aluFastAccept0
+    iq.aluFastAcceptNext(1) := aluFastAccept1
+
     // Dynamic LS wakeup (sim-driven; overrides the IQ's idle default).
     val lsWakeupValid = in Bool (); val lsWakeupPdst = in UInt (6 bits)
     iq.lsWakeup.valid   := lsWakeupValid
     iq.lsWakeup.payload := lsWakeupPdst
 
-    // Dynamic SLOW-ALU (shift) wakeup (sim-driven; emulates the ALU EU's S2 broadcast).
+    // Dynamic SLOW-ALU (shift) wakeup (sim-driven; emulates the ALU EU's S3 broadcast).
     val aluSlowWakeupValid = in Bool ()
     val aluSlowWakeupPdst  = in UInt (6 bits); val aluSlowWakeupPdstV = in Bool ()
     val aluSlowWakeupNzvc  = in UInt (4 bits); val aluSlowWakeupNzvcV = in Bool ()

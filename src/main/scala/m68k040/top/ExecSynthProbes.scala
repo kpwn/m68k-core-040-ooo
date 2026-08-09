@@ -20,6 +20,11 @@ class IqSynthProbePlugin extends FiberPlugin {
     val flushIn     = in Bool ()
     val ready0In    = in Bool ()
     val ready1In    = in Bool ()
+    val ready2In    = in Bool ()
+    val ready3In    = in Bool ()
+    val ready4In    = in Bool ()
+    val fastAccept0In = in Bool ()
+    val fastAccept1In = in Bool ()
 
     iq.push.valid      := RegNext(pushValidIn) init False
     iq.push.payload(0) := RegNext(push0In)
@@ -28,12 +33,25 @@ class IqSynthProbePlugin extends FiberPlugin {
     iq.flushPort       := RegNext(flushIn) init False
     iq.issue(0).ready  := RegNext(ready0In) init False
     iq.issue(1).ready  := RegNext(ready1In) init False
+    iq.issue(2).ready  := RegNext(ready2In) init False
+    iq.issue(3).ready  := RegNext(ready3In) init False
+    iq.issue(4).ready  := RegNext(ready4In) init False
+    // Preserve the forecast-gated fast candidate cones in the OOC netlist. The
+    // standalone probe has no ALU pipeline, so these are explicit registered IO.
+    iq.aluFastAcceptNext(0) := RegNext(fastAccept0In) init False
+    iq.aluFastAcceptNext(1) := RegNext(fastAccept1In) init False
 
     val pushReadyOut = out(RegNext(iq.push.ready) init False)
     val issue0Valid  = out(RegNext(iq.issue(0).valid) init False)
     val issue0Rob    = out(RegNext(iq.issue(0).payload.robId))
     val issue1Valid  = out(RegNext(iq.issue(1).valid) init False)
     val issue1Rob    = out(RegNext(iq.issue(1).payload.robId))
+    val issue2Valid  = out(RegNext(iq.issue(2).valid) init False)
+    val issue2Rob    = out(RegNext(iq.issue(2).payload.robId))
+    val issue3Valid  = out(RegNext(iq.issue(3).valid) init False)
+    val issue3Rob    = out(RegNext(iq.issue(3).payload.robId))
+    val issue4Valid  = out(RegNext(iq.issue(4).valid) init False)
+    val issue4Rob    = out(RegNext(iq.issue(4).payload.robId))
   }
 }
 

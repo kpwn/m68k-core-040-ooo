@@ -100,11 +100,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val rob = host[RobPlugin]
       eu0.issue << iq.issue(0)
       eu1.issue << iq.issue(1)
+      iq.aluFastAcceptNext(0) := eu0.fastAcceptNext
+      iq.aluFastAcceptNext(1) := eu1.fastAcceptNext
+      eu0.flush := iq.flushPort
+      eu1.flush := iq.flushPort
       // MOVE-from-SR int result: wire the committed SR system byte to both ALU EUs
       // (mirrors top/FullCoreSynth.BackendWiringPlugin).
       eu0.srSysIn := rob.logic.exc.ss.srSys
       eu1.srSysIn := rob.logic.exc.ss.srSys
-      // SLOW-ALU (shift, latency-2) dynamic wakeup: ONE IQ port per ALU EU (mirrors
+      // SLOW-ALU (SHIFT/BITFIELD, S3) dynamic wakeup: ONE IQ port per ALU EU (mirrors
       // top/FullCoreSynth.BackendWiringPlugin). Without this the IQ's aluSlowWakeup
       // ports keep their setup default (valid:=False), so a shift's dependents (and
       // its own aluSlow* busy bitmaps) never wake -> deadlock.
@@ -1677,7 +1681,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
   // A bit-field result feeding a dependent op (exercises the slow-producer wakeup: the
-  // consumer must wait for the lat-4 bit-field result, not read a stale PRF).
+  // consumer must wait for the S3 bit-field result, not read a stale PRF).
   test("lock-step: BFEXTU result feeds a dependent ADD (slow-producer wakeup)", VerilatorTest) {
     runLockStep("bf-dep", Seq(
       "move.l #0x12345678,%d0", "bfextu %d0{#0:#16},%d1",  // d1 = 0x1234 (slow result)
@@ -2372,34 +2376,34 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       f"the USP must be completely UNTOUCHED by a rejected RTE (no pop): before=0x$uspBefore%08x after=0x$uspAfter%08x")
   }
 
-  // ── Slow-ALU (shift, latency-2) DEPENDENT CHAINS ────────────────────────────
-  // Exercises the IQ aluSlow dynamic-wakeup (lat2): an op that consumes a SHIFT's
+  // ── Slow-ALU (SHIFT, S3) DEPENDENT CHAINS ───────────────────────────────────
+  // Exercises the IQ aluSlow dynamic wakeup: an op that consumes a SHIFT's
   // INT result, NZVC result, and X result must wait one extra cycle and then read
   // the correct value. Pre-fix (the aluSlowWakeup port was unwired in the test
   // BackendWiringPlugin) these DEADLOCKED — the consumer's aluSlowWait never cleared.
-  test("lock-step: dependent chain through a SHIFT int result (lat2 wakeup)", VerilatorTest) {
+  test("lock-step: dependent chain through a SHIFT int result (S3 wakeup)", VerilatorTest) {
     runLockStep("shift-dep-int", Seq(
       "move.l #0x00000003,%d0", "lsl.l #4,%d0",    // d0 = 0x30 (slow producer)
-      "add.l %d0,%d1",                              // CONSUMES d0 (shift int result) -> waits lat2
+      "add.l %d0,%d1",                              // CONSUMES d0 (shift int result) -> waits for S3
       "move.l #0x0000000f,%d2", "lsl.l #2,%d2",    // d2 = 0x3c (slow)
       "move.l %d2,%d3",                             // CONSUMES d2 (shift result)
       "sub.l %d0,%d2"                               // CONSUMES d0 AND d2 (two shift results)
     ).mkString(" ; "))
   }
-  test("lock-step: dependent chain through a SHIFT NZVC result (lat2 wakeup)", VerilatorTest) {
+  test("lock-step: dependent chain through a SHIFT NZVC result (S3 wakeup)", VerilatorTest) {
     runLockStep("shift-dep-nzvc", Seq(
       "move.l #0x80000000,%d0", "asl.l #1,%d0",     // shift sets N/Z/V/C (slow producer)
-      "bne .skip",                                  // CONSUMES the shift's NZVC (cc read) -> lat2
+      "bne .skip",                                  // CONSUMES the shift's NZVC (cc read) -> waits for S3
       "moveq #1,%d1",
       ".skip: moveq #2,%d2"
     ).mkString(" ; "), nInstr = 4)
   }
-  test("lock-step: back-to-back SHIFT chain (X + int + NZVC all lat2)", VerilatorTest) {
+  test("lock-step: back-to-back SHIFT chain (X + int + NZVC all wake at S3)", VerilatorTest) {
     runLockStep("shift-chain-bb", Seq(
       "ori #0x10,%ccr",                             // X=1
       "move.l #0x00000001,%d0",
       "roxl.l #1,%d0",                              // ROX reads X, writes X (slow)
-      "roxl.l #1,%d0",                              // reads PRIOR shift's X + int result (slow->slow lat2)
+      "roxl.l #1,%d0",                              // reads prior shift's X + int result after S3
       "roxl.l #1,%d0",                              // chained again
       "add.l %d0,%d1"                               // consumes the final shift int result
     ).mkString(" ; "))

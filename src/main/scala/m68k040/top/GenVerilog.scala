@@ -76,8 +76,10 @@ object GenBackendSynthVerilog {
   * measured paths are the internal compaction / wakeup / age-select reg→reg. */
 object GenIqSynthVerilog {
   def main(args: Array[String]): Unit = {
+    val p = M68kParams()
     M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog(new M68kCore(Seq[FiberPlugin](
+        new ParamPlugin(p),
         new m68k040.execute.iq.IssueQueuePlugin(),
         new IqSynthProbePlugin()
       )).setDefinitionName("M68kIqSynth"))

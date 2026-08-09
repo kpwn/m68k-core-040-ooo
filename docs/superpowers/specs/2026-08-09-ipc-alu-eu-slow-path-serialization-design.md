@@ -3,9 +3,10 @@
 **Date**: 2026-08-09
 **Initiative**: IPC-push ("push ipc as high as reasonably possible without
 blowing up lut count or crashing fmax")
-**Status**: DESIGN ONLY — no RTL written. The benchmark kernels
-(`shift-stream`, `shift-mixed`) that make this measurable ARE landed, and their
-baselines are recorded below.
+**Status**: RTL and simulation gate complete; paired post-route FMax/LUT and IQ
+endpoint census pending on the serialized Vivado window. The benchmark kernels
+(`shift-stream`, `shift-mixed`) and their before/after measurements are recorded
+below.
 **Source finding**: `.superpowers/sdd/progress-ipc-push-2026-08-09.md`,
 "EU-wide audit COMPLETE: 14 blocks surveyed, 1 genuine new footgun found".
 **Governing principle**: "throughput over latency" (same ledger). This lever is
@@ -96,6 +97,8 @@ bit-packing code — exactly what this core's deployment target runs.
   (`IssueQueuePlugin.scala:370-421`).
 * G6. FMax-neutral (design WNS is currently held elsewhere; see §5) and
   LUT-neutral-to-negligible.
+* G7. Remove false X-source dependencies from shift forms whose count cannot be
+  zero, without changing any architectural flag result.
 
 **Non-goals**
 
@@ -105,8 +108,7 @@ bit-packing code — exactly what this core's deployment target runs.
   assignment is a separate lever with its own select-cone FMax cost.
 * N2. Shortening the slow op's 6-cycle *latency*. Those stages exist for
   measured FMax reasons (FMax #3, FMax #4, task #123) and must not be merged.
-* N3. Touching `DcachePlugin`'s II=3 load gate, the LS EU, the frontend, or
-  decode.
+* N3. Touching the D-cache, LS EU, or frontend.
 
 ---
 
@@ -152,7 +154,9 @@ val isSlowIn = (issuePort.payload.uop.op === DecOp.SHIFT) ||
 // S3 RESERVATION. A slow op at S2 this cycle lands its S3 writeback NEXT cycle,
 // which is exactly when a fast op accepted now would do its S1 writeback.
 // Block the fast op; never block a slow op (the 6 stages are a real pipeline).
-issuePort.ready := isSlowIn || !s2Valid
+// `!issuePort.valid` advertises capacity when the IQ's non-collapsing issue
+// register is empty; its retained payload is stale and must not block a SLOW load.
+issuePort.ready := !flushPort && (!issuePort.valid || isSlowIn || !s2Valid)
 ```
 
 `s1aValid`/`s1a2Valid`/`s1bValid`/`s3Valid` drop out of the `ready` expression
@@ -164,21 +168,25 @@ s1aValid -> s1a2Valid -> s1bValid -> s2Valid -> s3Valid` chain *is* that shift
 register, already built and already correct. `s2Valid` is precisely "a slow op
 will be at S3 in 1 cycle".
 
-Also export one bit per ALU EU on `AluEuService`:
+Also export the flush input and one look-ahead bit per ALU EU on `AluEuService`:
 
 ```scala
 /** True iff a FAST µop selected by the IQ this cycle is guaranteed to be
   * ACCEPTED next cycle (i.e. no slow op will be at S3 then). Needed by the IQ
   * to preserve the P5.7 select->fire invariant; see the design doc §4.2. */
 def fastAcceptNext: Bool   // = !s1bValid
+def flush: Bool
 ```
 
-(`s2Valid(C+1) == s1bValid(C)`.)
+(`s2Valid(C+1) == s1bValid(C)`.) `fastAcceptNext` is false during flush.
 
 ### 3.3 Change 2 — `IssueQueuePlugin` (the wakeup-contract gate)
 
 The existing `aluSlowHandoff(k)` gate (`:420-425`) is **deleted** and replaced
-by a candidate-mask term on the two ALU select ports:
+by a candidate-mask term on the two ALU select ports. `IssueQueueService` owns a
+plain `Vec[Bool]` input named `aluFastAcceptNext`; integration wiring connects
+each element to the corresponding `AluEuService.fastAcceptNext`, preserving the
+service-only plugin boundary:
 
 ```scala
 // Per-slot slow-ALU classification, STORED at push time (see FMax note §5.2),
@@ -187,8 +195,8 @@ val aluSlowSlot = B(slots.map(_.isAluSlow))          // slotCount bits, flop out
 
 // A port whose EU cannot accept a FAST µop next cycle considers only SLOW
 // candidates this cycle.
-val cand0 = aluReady & Mux(eu(0).fastAcceptNext, B.getAllTrue, aluSlowSlot)
-val cand1 = aluReady & Mux(eu(1).fastAcceptNext, B.getAllTrue, aluSlowSlot)
+val cand0 = aluReady & Mux(aluFastAcceptNext(0), B.getAllTrue, aluSlowSlot)
+val cand1 = aluReady & Mux(aluFastAcceptNext(1), B.getAllTrue, aluSlowSlot)
 val oh0   = OHMasking.first(cand0)
 val oh1   = OHMasking.first(cand1 & ~oh0)
 ...
@@ -210,7 +218,65 @@ construction** — they are per-physreg *bitmaps*, not counters, and
 in-flight slow operands ("With a deeper slow pipe the two producers' wakeups can
 be several cycles apart"). Nothing there needs to change.
 
-### 3.4 Cost
+### 3.4 Change 3 — precise X-source dependencies (selected after measurement)
+
+The first paired implementation measurement was intentionally checked against
+the projection in §6.  The pipe itself reached II=1, but the core-level result
+was only 1.51x/1.66x:
+
+| kernel | baseline cycles / IPC | II1-only cycles / IPC | gain |
+|---|---|---|---|
+| `shift-stream` | 1703 / 0.286 | 1127 / 0.432 | 1.51x |
+| `shift-mixed` | 1250 / 0.646 | 754 / 1.072 | 1.66x |
+
+The directed EU test proves six consecutive accepts and six consecutive,
+uniquely tagged completions, so accepting this shortfall as an EU-pipeline
+limit would be false.  The remaining serialization is decoder-created:
+The initial implementation set `readsX := !isRo` for every AS/LS/ROX form.
+That makes the six independent immediate `lsl.l #1,Dn` operations one
+architectural-X rename chain.
+
+The line-E architecture already distinguishes the cases:
+
+* immediate AS/LS counts are encoded as 1-8, so they always replace X and do
+  not need its previous value;
+* memory AS/LS has an implicit count of one and likewise does not read X;
+* register-count AS/LS can have count zero, so it must read X to preserve it;
+* ROX always reads X; RO never reads or writes X.
+
+Therefore decode shall annotate:
+
+```scala
+// register destination
+readsX := isRox || (isRegisterCount && !isRo)
+
+// memory destination, implicit count = 1
+readsX := isRoxMem
+```
+
+`writesX` is unchanged.  This is not speculative dependency prediction and it
+does not change the shifter or any flag value.  It only stops immediate/memory
+AS/LS from waiting for a value they provably cannot consume.  The binding
+shift/rotate design is updated in the same phase.
+
+The paired post-correction measurement validates that diagnosis:
+
+| kernel | zero cycles / IPC | L2-faithful cycles / IPC | zero gain | L2 gain |
+|---|---|---|---|---|
+| `shift-stream` | 578 / **0.843** | 637 / **0.765** | **2.95x** | **2.71x** |
+| `shift-mixed` | 620 / **1.303** | 671 / **1.204** | **2.02x** | **1.91x** |
+
+`shift-stream` reaches/exceeds the predeclared target.  `shift-mixed` remains
+below its 1.5-1.8 projection, but its residual is now independently bounded by
+the existing frontend measurements, not attributed to the ALU without proof:
+the body is 44 bytes (eleven 4-byte fetch windows minimum) and the current
+fetch path pays about 5.08 cycles per correctly predicted taken transfer
+(`2026-08-09-ipc-fetch-directed-btb-design.md`, §1).  Eleven window cycles plus
+that measured backedge cost predicts about 16 cycles/iteration; the observed
+620/40 = 15.5 cycles/iteration matches it.  The remaining amplifier is therefore
+the already-specified fetch-directed-BTB lever, not slow-pipe serialization.
+
+### 3.5 Cost
 
 | | delta |
 |---|---|
@@ -218,8 +284,9 @@ be several cycles apart"). Nothing there needs to change.
 | new PRF write ports | 0 |
 | new completion ports | 0 |
 | new latency | **0** cycles, fast or slow |
-| new EU->IQ signals | 2 (`fastAcceptNext`, one per ALU EU) |
+| new service wires | 2 EU->IQ forecasts (`fastAcceptNext`) + 2 IQ->EU flush wires, one pair per ALU EU |
 | LUTs | EU: net-negative (a 6-term NOR becomes a 2-term expression). IQ: one extra AND across a `slotCount`-wide mask per ALU port + 16 flops. Est. **< 100 LUTs net** against a 103,740-LUT design. |
+| decode dependency refinement | no new state or datapath; two small Boolean terms replace two coarse terms |
 
 ---
 
@@ -328,43 +395,25 @@ still defer the oldest fast µop (bounded, §4.3). Fixing the mapping properly i
 non-goal N1: re-measure `shift-mixed` after this lever and only revisit if a
 residual gap shows.
 
-### 4.5 Flush / wrong-path drain
+### 4.5 Flush / wrong-path kill — selected
 
-`AluEuPlugin` has **no flush gating at all** today (independently noted in
-`.superpowers/sdd/progress-fmax-levers-2026-08-08.md`: "ALU EU currently has NO
-flush gating on this path; `DivEuPlugin`'s `cplxFlush` is the reusable,
-already-proven fix pattern"). A slow µop already in S1..S3 when
-`RobPlugin.doFlushReg` fires still completes, still pulses `completionPort`
-(setting `completes(robId)`), and still writes the PRF via `intWs`/`nzvcWs`/`xWs`.
+Flush kill is part of this lever. Multiple in-flight slow operations make the
+pre-existing drain behavior unsafe through an additional channel: the IQ clears
+its `aluSlow*Busy` bitmaps on flush, but a stale later `slowWakeup` can match a
+new producer that reused the same physical register and incorrectly clear its
+busy bit. ROB/PRF reuse latency alone does not prove this safe.
 
-**Arrival-window argument**: the drain window is `[F, F+5]` — determined by the
-6-stage depth, *not* by occupancy. Today a single in-flight slow µop can already
-land its stale completion at any cycle in that window, including the latest one,
-`F+5`. This lever does not extend the window; it raises the *density* inside it
-from at most 1 to at most 6 (one per cycle), each on a distinct robId/physreg.
-Safety therefore still rests on the same pre-existing margin: after a flush,
-`tail := head; count := 0` and re-allocation cannot happen until a redirected
-fetch has traversed I-cache -> FetchAlign -> decode -> rename -> dispatch, which
-is unconditionally more than 5 cycles. Under that margin, all 6 stale
-completions land on entries that are still flushed-and-unallocated, and all 6
-stale PRF writes land on physregs the freelist has not yet handed out and no new
-instruction has yet written. **No new exposure in time; 6x more indices touched
-inside an already-covered window.**
-
-**Recommended hardening (scope decision required)**: kill the slow valid chain on
-flush —
+The ALU therefore blocks issue during flush, gates same-cycle fast/slow PRF
+writes, completion, `slowWakeup`, `ccrObs`, and delayed `wbObs`, and kills every
+slow valid stage on the next edge:
 
 ```scala
-s1aValid  := RegNext(s1Valid && isSlow) init False   // &&= !flushIn, etc. on all 5
+s1aValid  := RegNext(s1Valid && isSlow && !flushPort) init False
+// same `&& !flushPort` kill on S1a2/S1b/S2/S3
 ```
 
-~5 AND gates, zero latency, strictly safer than today, and it also removes the
-spurious PRF writes entirely. Cost: `AluEuPlugin` gains a flush input, which
-means wiring in `BackendWiringPlugin` **and** `FullCoreSynth` **and** the two
-test DUTs (`IpcBenchSpec`, `ExecuteLockStepSpec`) — files that concurrent work
-this session may be touching. **Decide at implementation time**: bundle it if
-those files are free, otherwise land the II fix alone (justified by the argument
-above) plus the directed flush test in §6.
+This costs about five valid-kill gates plus output-valid gating, adds no latency,
+and removes reliance on a redirect-pipeline timing margin.
 
 ### 4.6 Defence in depth: why the EU keeps its own `!s2Valid` term
 
@@ -454,23 +503,26 @@ shape as the `!isLs`/`!isCplx` terms already in `aluReady`.
 **Unit (`AluFastSlowSpec`, extend)**
 1. **II=1**: issue 6 distinct slow µops on 6 consecutive cycles; assert
    `issue.ready` was high on every one, and that all 6 results/flags land at S3
-   on 6 consecutive cycles, each correct against `ShiftRef`/`Bitfield`
-   references. Mix SHIFT and BITFIELD in one stream (they share the ctx chain).
-2. **INV-1 assertion**: a free-running randomized fast/slow issue stream with a
-   sim assertion that `fastFire && s3Valid` never co-occur, and that
-   `completionPort` never needs to report two robIds in one cycle. Run it long
-   enough to hit the boundary case (fast op offered exactly when `s2Valid`).
-3. **Latency unchanged**: the existing "completes at latency-3 (S3)" and
+   on 6 consecutive cycles, each with a distinct robId and checked result. The
+   landed burst is SHIFT; existing BITFIELD functional/lock-step tests cover the
+   same physical slow stages.
+2. **INV-1 assertion**: the landed directed boundary test offers a fast op
+   exactly when `s2Valid`, asserts `fastFire && s3Valid` is false, then proves
+   the fast op accepts on the next cycle. A longer randomized mixed
+   SHIFT/BITFIELD/fast soak remains desirable before final physical acceptance.
+3. **Latency unchanged**: the existing "completes at final S3" and
    "writeback lands at S3 (PRF holds old dst until then)" tests must pass
-   **byte-identically** (`lat == 6` assertion at `AluFastSlowSpec.scala:127`) —
-   this lever must not move latency.
+   **byte-identically** (`lat == 7` in the harness: six physical stages plus its
+   pre-capture sample) — this lever must not move latency.
 4. **Fast-op blocking is exactly 1 cycle**: assert `ready` is low for a fast µop
    iff `s2Valid`, never longer.
 
 **IQ**
-5. **Select->fire invariant as a live assertion**: over a randomized stream,
-   assert `selPorts(k).fire at C => issuePorts(k).fire at C+1` for k ∈ {0,1}.
-   This is the §4.2 obligation; it must be a *checked* property, not a comment.
+5. **Select->fire invariant**: the landed directed IQ test checks the forecast
+   masks and exact slow-around-blocked-fast routing, and the integrated ALU test
+   checks the forecast phase against real S2/S3 state. A randomized end-to-end
+   `sel.fire(C) => issue.fire(C+1)` soak is retained as a follow-up assertion;
+   it must drive ready consistently with the forecast promise.
 6. Directed re-run of the P5.7 regression cluster, including
    `bfins_mem_dyn_both` (the test that originally exposed this hazard class).
 7. Existing 17 IQ/dispatch specs green.
@@ -483,8 +535,7 @@ shape as the `!isLs`/`!isCplx` terms already in `aluReady`.
 10. **Flush-during-slow-stream directed test** (the §4.5 obligation): drive a
     dense slow stream, force a mispredict/exception flush mid-stream, and assert
     no stale `completes()` set on a re-allocated ROB index and no stale PRF write
-    to a re-issued physreg. Required whether or not the flush-kill hardening is
-    bundled.
+    to a re-issued physreg.
 
 **IPC**
 11. `shift-stream` + `shift-mixed`, paired `IPC_SEED=1`, **both** `IPC_MEM=zero`
@@ -493,13 +544,46 @@ shape as the `!isLs`/`!isCplx` terms already in `aluReady`.
     pre-existing kernels (especially `independent-ALU` at 2.000, which shares the
     ALU issue path).
 
-**Projection to check against** (state up front so the result can falsify the
-design, not be rationalised after): `shift-stream` should move from 0.286 toward
-~0.75-0.80 (the limiter becomes the per-register loop-carried slow-op latency of
-~8-9 cycles, not II); `shift-mixed` from 0.646 toward ~1.5-1.8. Both ≈ **2.4-2.8x**.
-A result materially below that means the head-of-line residual (§4.4) or the
-`aluSlowWait` dependency tracking is a bigger factor than modelled, and should be
-investigated rather than accepted.
+**Projection to check against** (stated before implementation so the result can
+falsify the design, not be rationalised after): `shift-stream` should move from
+0.286 toward ~0.75-0.80 (the limiter becomes the per-register loop-carried
+slow-op latency of ~8-9 cycles, not II); `shift-mixed` from 0.646 toward
+~1.5-1.8. Both ≈ **2.4-2.8x**.  The first result, 0.432/1.072, materially
+missed that range.  Investigation found the false immediate-shift X dependency
+in §3.4.  The corrected result is 0.843/1.303.  `shift-stream` validates the
+slow-pipe model; `shift-mixed`'s remaining gap is quantitatively explained by
+the separately measured frontend taken-transfer cost (also §3.4), which becomes
+the next limiter after the ALU gate is removed.
+
+### 6.1 Implementation verification record (2026-08-09)
+
+The implementation is complete through simulation and the mandatory fast gate;
+the physical gate in §5.3 remains pending on the PM-serialized Vivado window.
+The checks are deliberately association- and throughput-sensitive rather than
+latency-window-only:
+
+- `AluFastSlowSpec` + `IqAluSlowSpec`: 11/11, including six consecutive slow
+  accepts, six consecutive uniquely tagged completions, exact fast/S3 collision
+  reservation, slow-candidate bypass, and dense-pipeline flush/reuse;
+- existing IQ/dispatch regression set: 17/17;
+- `OperationDecoderSpec`: 46/46, including the immediate/register/memory X-read
+  distinctions and an exhaustive 65,536-opword operand-routing sweep;
+- focused Musashi shift/rotate dependency checks: 3/3, and the historical
+  `bfins_mem_dyn_both` wakeup-contract regression: 1/1;
+- `make SBT=~/sbt/bin/sbt test-fast`: 133/134. The sole failure is the
+  independently reproduced pre-existing `PredecodeRefSpec` EOR Dn,Dm mismatch;
+  no new ALU/IQ/decode test fails; and
+- full ten-kernel `IpcBenchSpec`, seed 1: 4,657 macros / 7,685 cycles
+  (0.606 aggregate IPC) with ideal memory and 4,658 / 11,212 (0.415) with the
+  5/70-cycle hierarchy. Both runs pass, `independent-ALU` remains exactly 2.000
+  IPC in the ideal model, and the eight pre-existing kernels retain their
+  D1/D2 LSU-phase cycle counts.
+
+During this gate, two old `OperationDecoderSpec` assertions were found to encode
+superseded behavior: reversed ADDA operands and illegal CMPM. They were repaired
+to verify the live ALU operand contract and the real `CMPM_ENTRY` microcode
+association. Updating the tests instead of changing correct RTL is part of the
+test-honesty requirement.
 
 ---
 
@@ -512,7 +596,7 @@ investigated rather than accepted.
 | A3 | Stall the slow pipe (enable-gate S1..S3) when a fast op collides | **Reject.** 6 wide stage enables (the bit-field chain alone is ~7 registers deep per stage), real area and timing on a proven-sensitive cone, and it inverts the standing "throughput over latency" principle. |
 | A4 | EU-only gate, leave `IssueQueuePlugin` untouched | **Proven impossible** (§4.2). Documented so it is not retried. |
 | A5 | Also fix the static oldest->port0 mapping (dynamic port assignment) | **Out of scope** (N1). The candidate-mask form of Change 2 recovers most of the benefit for free; re-measure before spending select-cone timing budget on the rest. |
-| A6 | Bundle the slow-chain flush kill | **Recommended, scope-dependent** (§4.5). Strictly safer than today, ~5 gates, but widens the diff to 4 wiring sites that concurrent agents may hold. |
+| A6 | Bundle the slow-chain flush kill | **Selected** (§4.5). Required to prevent stale dynamic wakeups from clearing a reused producer's busy bit. |
 | A7 | Do nothing — "shifts are rare" | **Reject on evidence.** 3-4% of instructions on the real target ROM, 7x IPC penalty measured, and the collateral damage to fast ops (`shift-mixed` active% = 40.2%) is larger than the direct cost. |
 
 ---
@@ -542,11 +626,10 @@ investigated rather than accepted.
   Logic-only changes in issue-select cones have surprised this initiative
   before. Post-route paired A/B is the only trustworthy check; OOC will not do.
 * **R7 — stale documentation (LOW severity, HIGH likelihood if rushed).** The
-  `wbKey` proof (`AluEuPlugin.scala:91-113`), the `:182-190` single-outstanding
-  comment, the `:766` "completes ONE op per cycle (single-outstanding)" note,
-  and the P5.7 block (`IssueQueuePlugin.scala:370-425`) all assert the invariant
-  being replaced. Every one must be rewritten to the new proof in the same
-  commit — this codebase's comments are load-bearing for future agents.
+  old `wbKey` proof, single-outstanding comments, completion note, and P5.7
+  handoff block all asserted the replaced invariant. They are rewritten to the
+  S3-reservation/select-forecast proof in this phase; future edits must preserve
+  that consistency because these comments are load-bearing for later audits.
 
 ---
 
@@ -554,15 +637,22 @@ investigated rather than accepted.
 
 | file | change |
 |---|---|
-| `src/main/scala/m68k040/execute/AluEuPlugin.scala` | `issuePort.ready` (§3.2); new `fastAcceptNext` on `AluEuService`; rewrite the `wbKey` / single-outstanding / `:766` comments (R7). Optional: flush kill (A6). |
+| `src/main/scala/m68k040/execute/AluEuPlugin.scala` | `issuePort.ready` (§3.2); new `fastAcceptNext` and `flush` on `AluEuService`; rewrite the stale latency/single-outstanding comments; flush-kill the valid chain and outputs. |
+| `src/main/scala/m68k040/execute/iq/IqContext.scala` | Expose `IssueQueueService.aluFastAcceptNext` without reaching into either EU's internals. |
 | `src/main/scala/m68k040/execute/iq/IssueQueuePlugin.scala` | per-slot `isAluSlow` flop (push + compaction), ALU candidate masks, delete `aluSlowHandoff` + its doc block, rewrite the P5.7 proof (§4.2). |
+| `src/main/scala/m68k040/decode/OperationDecoder.scala` | precise X-source annotations from §3.4; no datapath or flag-semantic change. |
+| `src/main/scala/m68k040/top/SynthProbePlugin.scala`, `ExecSynthProbes.scala` | registered forecast inputs keep both fast/slow candidate-mask cones live in synthesis-only IQ/backend probes. |
 | `src/test/scala/m68k040/execute/AluFastSlowSpec.scala` | verification items 1-4. |
 | `src/test/scala/m68k040/execute/iq/*` | verification items 5-7. |
+| `src/test/scala/m68k040/decode/OperationDecoderSpec.scala` | immediate/register/memory AS/LS/ROX/RO X-dependency checks. |
 | `src/test/scala/m68k040/bench/IpcBenchSpec.scala` | **already landed** (`shift-stream`, `shift-mixed`). |
 
-Wiring sites touched **only if** A6 (flush kill) is bundled:
-`BackendWiringPlugin` (in `IpcBenchSpec` + `ExecuteLockStepSpec`),
-`src/main/scala/m68k040/top/FullCoreSynth.scala`.
+Both the forecast and flush are wired at all six IQ+EU integrations:
+`FullCoreSynth`, `IpcBenchSpec`, `ExecuteLockStepSpec`, `FuzzDut`,
+`BackendWhiteboxSpec`, and `LsBackendInjectSpec`. Standalone IQ fixtures either
+drive the forecast explicitly or retain the fail-safe `False` default. The two
+synthesis-only IQ probes have no ALU EU; they expose registered top-level
+forecast inputs so neither candidate-mask branch is constant-trimmed.
 
 **Out of bounds for this lever** (concurrent work): `src/main/scala/m68k040/frontend/`,
-`src/main/scala/m68k040/decode/`, `src/main/scala/m68k040/execute/LsEuPlugin.scala`.
+`src/main/scala/m68k040/execute/LsEuPlugin.scala`.

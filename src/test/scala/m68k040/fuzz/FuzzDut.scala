@@ -54,6 +54,10 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     val rob = host[RobPlugin]
     eu0.issue << iq.issue(0)
     eu1.issue << iq.issue(1)
+    iq.aluFastAcceptNext(0) := eu0.fastAcceptNext
+    iq.aluFastAcceptNext(1) := eu1.fastAcceptNext
+    eu0.flush := iq.flushPort
+    eu1.flush := iq.flushPort
     eu0.srSysIn := rob.logic.exc.ss.srSys
     eu1.srSysIn := rob.logic.exc.ss.srSys
     iq.aluSlowWakeup(0).valid   := eu0.slowWakeup.valid

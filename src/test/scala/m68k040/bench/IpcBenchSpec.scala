@@ -78,8 +78,12 @@ class IpcBenchSpec extends AnyFunSuite {
       val rob = host[RobPlugin]
       eu0.issue << iq.issue(0)
       eu1.issue << iq.issue(1)
+      iq.aluFastAcceptNext(0) := eu0.fastAcceptNext
+      iq.aluFastAcceptNext(1) := eu1.fastAcceptNext
+      eu0.flush := iq.flushPort
+      eu1.flush := iq.flushPort
       eu0.srSysIn := U(0, 8 bits); eu1.srSysIn := U(0, 8 bits)  // MOVE-from-SR srSys input (unused here)
-      // SLOW-ALU (shift, lat2) dynamic wakeup — one IQ port per ALU EU (mirrors
+      // SLOW-ALU (SHIFT/BITFIELD, S3) dynamic wakeup — one IQ port per ALU EU (mirrors
       // top/FullCoreSynth). Inert for the shift-free IPC kernels, but required so a
       // shift's dependents could wake (consistency with the production wiring).
       iq.aluSlowWakeup(0).valid   := eu0.slowWakeup.valid
@@ -726,8 +730,8 @@ class IpcBenchSpec extends AnyFunSuite {
   //     the `iq.aluSlowWakeup` note near the top of this file: "Inert for the shift-free
   //     IPC kernels"), so the ALU EU's SLOW path -- `DecOp.SHIFT` and `DecOp.BITFIELD`,
   //     the S1/S1a/S1a2/S1b/S2/S3 pipe -- has never been measured at all, even though
-  //     `AluEuPlugin.scala:197` deasserts `issuePort.ready` for that op's ENTIRE 6-stage
-  //     occupancy (initiation interval = 7 cycles per ALU port, and the gate blocks that
+  //     the pre-II1 baseline deasserted `issuePort.ready` for that op's ENTIRE 6-stage
+  //     occupancy (initiation interval = 7 cycles per ALU port, and the gate blocked that
   //     EU's FAST ops too). A word histogram over the real Quadra 950 ROM puts
   //     register-form shifts at 1.50% and bit-field ops at 0.37% of all words, i.e. the
   //     order of 3-4% of real instructions -- concentrated in exactly the QuickDraw /
@@ -758,8 +762,8 @@ class IpcBenchSpec extends AnyFunSuite {
   }
 
   // 5d. shift-mixed: the AMPLIFIER the pure `shift-stream` kernel cannot show. The
-  //     `AluEuPlugin.scala:197` gate is UNCONDITIONAL -- while a slow op occupies the
-  //     pipe, that EU accepts NOTHING, so the machine drops from 2-wide ALU issue to
+  //     pre-II1 gate was UNCONDITIONAL -- while a slow op occupied the pipe, that EU
+  //     accepted NOTHING, so the machine dropped from 2-wide ALU issue to
   //     1-wide for the full 7-cycle window; and because the IQ maps oldest->port0 /
   //     second-oldest->port1 statically (`IssueQueuePlugin.scala:313-314`), the OLDEST
   //     ready ALU uop can be head-of-line-blocked on a busy port 0 while younger ops

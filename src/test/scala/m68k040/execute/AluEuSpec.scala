@@ -25,6 +25,7 @@ class AluEuSpec extends AnyFunSuite {
   // helper: safe defaults for the slow-path/flag-source ports (call once after stimulus)
   def initPorts(d: Dut): Unit = {
     val s = d.src.logic
+    s.iFlush #= false
     s.iShiftOp #= 0; s.iShiftDir #= false; s.iToCcr #= false
     s.iReadsNz #= false; s.iPNzvcSrc #= 0; s.iReadsX #= false; s.iPXSrc #= 0
   }

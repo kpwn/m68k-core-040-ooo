@@ -44,11 +44,11 @@ class OperationDecoderSpec extends AnyFunSuite {
       assert(dut.o.op.toEnum == DecOp.CMP && !dut.o.dstWrites.toBoolean && dut.o.writesNzvc.toBoolean)
     }
   }
-  test("ADDA.L: opmode7, srcA EASRC, srcB REGFIELD(An), no flags", VerilatorTest) {
+  test("ADDA.L: opmode7, srcA REGFIELD(An destination), srcB EASRC, no flags", VerilatorTest) {
     run(0xD1C1) { dut =>
       assert(dut.o.op.toEnum == DecOp.ADD && dut.o.size.toEnum == Size.LONG)
-      assert(dut.o.srcA.kind.toEnum == OperandKind.EASRC)
-      assert(dut.o.srcB.kind.toEnum == OperandKind.REGFIELD && dut.o.srcB.isAddr.toBoolean)
+      assert(dut.o.srcA.kind.toEnum == OperandKind.REGFIELD && dut.o.srcA.isAddr.toBoolean)
+      assert(dut.o.srcB.kind.toEnum == OperandKind.EASRC)
       assert(dut.o.dst.kind.toEnum == OperandKind.REGFIELD && dut.o.dst.isAddr.toBoolean && dut.o.dstWrites.toBoolean)
       assert(!dut.o.writesNzvc.toBoolean && !dut.o.writesX.toBoolean)
     }
@@ -87,10 +87,19 @@ class OperationDecoderSpec extends AnyFunSuite {
       assert(dut.o.op.toEnum == DecOp.EOR && dut.o.size.toEnum == Size.BYTE && !dut.o.illegal.toBoolean)
     }
   }
-  // CMPM (line B opmode 4/5/6, An-direct mode 1) is NOT EOR -> stays illegal here
-  // (this slice; the (An)+,(An)+ compare is deferred).
-  test("CMPM (lineB opmode4, An-direct) -> not EOR, illegal", VerilatorTest) {
-    run(0xB509) { dut => assert(dut.o.illegal.toBoolean && dut.o.op.toEnum != DecOp.EOR) }
+  // CMPM (line B opmode 4/5/6, mode 001) is a legal microcoded
+  // (Ay)+,(Ax)+ compare. Its µcode supplies the operands, so the normal routing
+  // descriptors remain NONE.
+  test("CMPM.B (A1)+,(A2)+ -> legal CMPM microcode entry", VerilatorTest) {
+    run(0xB509) { dut =>
+      assert(!dut.o.illegal.toBoolean)
+      assert(dut.o.op.toEnum == DecOp.CMP && dut.o.size.toEnum == Size.BYTE)
+      assert(dut.o.microcoded.toBoolean && dut.o.ucEntry.toInt == Microcode.CMPM_ENTRY)
+      assert(dut.o.writesNzvc.toBoolean && !dut.o.writesX.toBoolean && !dut.o.dstWrites.toBoolean)
+      assert(dut.o.srcA.kind.toEnum == OperandKind.NONE)
+      assert(dut.o.srcB.kind.toEnum == OperandKind.NONE)
+      assert(dut.o.dst.kind.toEnum == OperandKind.NONE)
+    }
   }
 
   // ── Line-0 immediates: 0000 ooo0 ss mmmrrr + imm. srcA=EA (Dn dst operand),
@@ -145,40 +154,53 @@ class OperationDecoderSpec extends AnyFunSuite {
   }
 
   // ── Line-E register-form shifts/rotates (1110 ccc d ss i tt rrr) ─────────────
-  test("ASL.L #1,D0 (0xE380): SHIFT tt=00 dir=left .L, imm, NZVC+X", VerilatorTest) {
+  test("ASL.L #1,D0 (0xE380): immediate AS writes but does not read X", VerilatorTest) {
     run(0xE380) { dut =>
       assert(dut.o.op.toEnum == DecOp.SHIFT && dut.o.size.toEnum == Size.LONG && !dut.o.illegal.toBoolean)
       assert(dut.o.shiftOp.toInt == 0 && dut.o.shiftDir.toBoolean && dut.o.shiftImm.toBoolean)
-      assert(dut.o.writesNzvc.toBoolean && dut.o.writesX.toBoolean && dut.o.dstWrites.toBoolean)
+      assert(dut.o.writesNzvc.toBoolean && dut.o.writesX.toBoolean && !dut.o.readsX.toBoolean && dut.o.dstWrites.toBoolean)
     }
   }
   test("ASR.W #3,D1 (0xE641): SHIFT tt=00 dir=right .W, imm, writesX", VerilatorTest) {
     run(0xE641) { dut =>
       assert(dut.o.op.toEnum == DecOp.SHIFT && dut.o.size.toEnum == Size.WORD)
-      assert(dut.o.shiftOp.toInt == 0 && !dut.o.shiftDir.toBoolean && dut.o.shiftImm.toBoolean && dut.o.writesX.toBoolean)
+      assert(dut.o.shiftOp.toInt == 0 && !dut.o.shiftDir.toBoolean && dut.o.shiftImm.toBoolean)
+      assert(dut.o.writesX.toBoolean && !dut.o.readsX.toBoolean)
     }
   }
   test("LSL.B Dc,D2 (0xE32A): SHIFT tt=01 dir=left .B, register count (i=1)", VerilatorTest) {
     run(0xE32A) { dut =>
       assert(dut.o.op.toEnum == DecOp.SHIFT && dut.o.size.toEnum == Size.BYTE)
-      assert(dut.o.shiftOp.toInt == 1 && dut.o.shiftDir.toBoolean && !dut.o.shiftImm.toBoolean && dut.o.writesX.toBoolean)
+      assert(dut.o.shiftOp.toInt == 1 && dut.o.shiftDir.toBoolean && !dut.o.shiftImm.toBoolean)
+      assert(dut.o.writesX.toBoolean && dut.o.readsX.toBoolean, "register-count AS/LS reads X for count=0 preservation")
     }
   }
   test("ROXR.L #2,D3 (0xE493): SHIFT tt=10 dir=right .L, imm, writesX", VerilatorTest) {
     run(0xE493) { dut =>
       assert(dut.o.op.toEnum == DecOp.SHIFT && dut.o.size.toEnum == Size.LONG)
-      assert(dut.o.shiftOp.toInt == 2 && !dut.o.shiftDir.toBoolean && dut.o.writesX.toBoolean)
+      assert(dut.o.shiftOp.toInt == 2 && !dut.o.shiftDir.toBoolean)
+      assert(dut.o.writesX.toBoolean && dut.o.readsX.toBoolean, "ROX always consumes X")
     }
   }
   test("ROR.W #1,D4 (0xE25C): SHIFT tt=11 dir=right .W, ROL/ROR do NOT write X", VerilatorTest) {
     run(0xE25C) { dut =>
       assert(dut.o.op.toEnum == DecOp.SHIFT && dut.o.size.toEnum == Size.WORD)
       assert(dut.o.shiftOp.toInt == 3 && !dut.o.shiftDir.toBoolean)
-      assert(dut.o.writesNzvc.toBoolean && !dut.o.writesX.toBoolean)
+      assert(dut.o.writesNzvc.toBoolean && !dut.o.writesX.toBoolean && !dut.o.readsX.toBoolean)
     }
   }
-  test("line-E ss=11 (memory single-bit form) -> illegal (deferred)", VerilatorTest) {
-    run(0xE0D0) { dut => assert(dut.o.illegal.toBoolean) }   // 1110 000 0 11 010000
+  test("ASR.W (A0): memory AS has implicit count=1 and does not read X", VerilatorTest) {
+    run(0xE0D0) { dut =>
+      assert(!dut.o.illegal.toBoolean && dut.o.op.toEnum == DecOp.SHIFT && dut.o.size.toEnum == Size.WORD)
+      assert(dut.o.shiftOp.toInt == 0 && dut.o.shiftImm.toBoolean)
+      assert(dut.o.writesX.toBoolean && !dut.o.readsX.toBoolean)
+    }
+  }
+  test("ROXR.W (A0): memory ROX reads and writes X", VerilatorTest) {
+    run(0xE4D0) { dut =>
+      assert(!dut.o.illegal.toBoolean && dut.o.op.toEnum == DecOp.SHIFT)
+      assert(dut.o.shiftOp.toInt == 2 && dut.o.readsX.toBoolean && dut.o.writesX.toBoolean)
+    }
   }
 
   // ── Track C: LEA / PEA / MOVE from-SR / from-CCR / to-CCR (line-4) ───────────

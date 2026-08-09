@@ -10,11 +10,9 @@ import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
 import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
 
-/** Fast/slow ALU split: fast ops (ADD) complete at latency-1 (S1) with bypass;
-  * the SHIFT slow op completes at S3 of the deep slow pipe S1/S1a/S1b/S2/S3
-  * (arch latency 5 after the FMax #3/#4 retimes split stage1 + the bit-field
-  * cone). Latency-agnostic correctness: the slow result is correct, just later
-  * than a fast op. */
+/** Fast/slow ALU split: fast ops (ADD) complete at S1 with bypass; SHIFT/BITFIELD
+  * complete at S3 of the deep S1/S1a/S1a2/S1b/S2/S3 pipe.  The slow datapath is
+  * fixed latency but accepts independent operations every cycle. */
 class AluFastSlowSpec extends AnyFunSuite {
   class Dut extends Component {
     val db   = new Database
@@ -29,6 +27,7 @@ class AluFastSlowSpec extends AnyFunSuite {
 
   def initPorts(d: Dut): Unit = {
     val s = d.src.logic
+    s.iFlush #= false
     s.iShiftOp #= 0; s.iShiftDir #= false; s.iToCcr #= false
     s.iReadsNz #= false; s.iPNzvcSrc #= 0; s.iReadsX #= false; s.iPXSrc #= 0
   }
@@ -77,7 +76,7 @@ class AluFastSlowSpec extends AnyFunSuite {
 
   // Issue exactly ONE cycle (drive at the current edge, then deassert) and count the
   // number of cycles from the issue edge until completion(robId) is observed. Returns
-  // the completion latency in cycles (1 for a lat1 op, 2 for a lat2 op), or -1.
+  // that observed harness latency, or -1 if the supplied window expires.
   // `drive` pokes the issue inputs for this single cycle.
   def latencyOf(d: Dut, robId: Int, window: Int)(drive: => Unit): Int = {
     val cd = d.clockDomain
@@ -111,7 +110,7 @@ class AluFastSlowSpec extends AnyFunSuite {
     }
   }
 
-  test("slow SHIFT (LSL #1) result correct, completes at latency-3 (S3)", VerilatorTest) {
+  test("slow SHIFT (LSL #1) result correct, completes at six-stage S3", VerilatorTest) {
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       initPorts(dut); idle(dut)
@@ -119,12 +118,11 @@ class AluFastSlowSpec extends AnyFunSuite {
       cd.waitSampling(80)
       issueMoveq(dut, 0x21, pdst = 3, robId = 0); cd.waitSampling()  // R3 = 0x21
       idle(dut); cd.waitSampling(6)
-      val lat = latencyOf(dut, 9, window = 6) { issueLslImm(dut, pa = 3, count = 1, pdst = 4, robId = 9) }
-      // The slow pipe is S1/S1a/S1b/S2/S3 (the FMax #3/#4 retimes split stage1 and the
-      // bit-field forward-funnel cone) => arch latency 5, completion at S3. The harness
-      // counts one extra pre-capture edge, so the measured latency is 6. (Was 4 when the
-      // pipe was the original 3-stage S1/S2/S3; result correctness is unchanged.)
-      assert(lat == 6, s"slow SHIFT completion latency=$lat (expected 6 = arch lat5 [S1/S1a/S1b/S2/S3] + harness pre-capture edge)")
+      val lat = latencyOf(dut, 9, window = 10) { issueLslImm(dut, pa = 3, count = 1, pdst = 4, robId = 9) }
+      // The active pipe includes S1a2, so S1/S1a/S1a2/S1b/S2/S3 is six stages.
+      // This harness samples once before the capture edge and therefore reports 7.
+      // The former six-cycle window was too short and could only report -1.
+      assert(lat == 7, s"slow SHIFT completion latency=$lat (expected 7 = six stages + harness pre-capture sample)")
       cd.waitSampling(4)
       dut.src.logic.obsIntAddr #= 4; sleep(1)
       assert(dut.src.logic.obsIntData.toBigInt == 0x42,
@@ -135,7 +133,7 @@ class AluFastSlowSpec extends AnyFunSuite {
   test("slow SHIFT writeback lands at S3 (PRF holds old dst until then)", VerilatorTest) {
     // The slow producer must NOT write the PRF / bypass its S1/S2 partial. Reading the
     // dst forceNoBypass while the shift is in S1 still observes the OLD value; only the
-    // S3 (lat3) write updates it. Verifies the result + the no-early-write property.
+      // final S3 write updates it. Verifies the result + the no-early-write property.
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       initPorts(dut); idle(dut)
@@ -155,7 +153,128 @@ class AluFastSlowSpec extends AnyFunSuite {
       cd.waitSampling(6)
       dut.src.logic.obsIntAddr #= 6; sleep(1)
       assert(dut.src.logic.obsIntData.toBigInt == 0x44,
-        s"R6 (LSL.L #2 of 0x11) got 0x${dut.src.logic.obsIntData.toBigInt.toString(16)} (expected 0x44 at lat3)")
+        s"R6 (LSL.L #2 of 0x11) got 0x${dut.src.logic.obsIntData.toBigInt.toString(16)} (expected 0x44 at final S3)")
+    }
+  }
+
+  test("six independent SHIFTs are accepted and complete on consecutive cycles", VerilatorTest) {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initPorts(dut); idle(dut)
+      dut.src.logic.obsIntAddr #= 0; dut.src.logic.obsNzvcAddr #= 0; dut.src.logic.obsXAddr #= 0
+      cd.waitSampling(80)
+      issueMoveq(dut, 1, pdst = 3, robId = 1); cd.waitSampling()
+      idle(dut); cd.waitSampling(6)
+
+      val completed = scala.collection.mutable.ArrayBuffer.empty[(Int, Int)]
+      var cycle = 0
+      def sampleCompletion(): Unit = {
+        if (dut.src.logic.cValid.toBoolean)
+          completed += ((dut.src.logic.cRob.toInt, cycle))
+      }
+
+      var acceptedWhileS2Reserved = false
+      for (i <- 0 until 6) {
+        issueLslImm(dut, pa = 3, count = i + 1, pdst = 10 + i, robId = 20 + i)
+        sleep(1)
+        assert(dut.src.logic.iReady.toBoolean, s"slow issue $i was not accepted at II=1")
+        acceptedWhileS2Reserved = acceptedWhileS2Reserved || dut.eu.logic.s2Valid.toBoolean
+        cd.waitSampling(); sleep(1); cycle += 1; sampleCompletion()
+      }
+      assert(acceptedWhileS2Reserved, "burst never exercised SLOW acceptance while S2 was occupied")
+      idle(dut)
+      while (completed.size < 6 && cycle < 20) {
+        cd.waitSampling(); sleep(1); cycle += 1; sampleCompletion()
+      }
+
+      assert(completed.map(_._1).toSeq == (20 until 26),
+        s"slow completion ROB sequence was ${completed.map(_._1).mkString(",")}")
+      assert(completed.map(_._2).sliding(2).forall(p => p.length < 2 || p(1) == p(0) + 1),
+        s"slow completions were not consecutive: ${completed.mkString(",")}")
+      // Completion and PRF write request coincide; the registered RAM write lands
+      // one edge later.  Wait explicitly so the last result is not sampled early.
+      cd.waitSampling(2); sleep(1)
+      for (i <- 0 until 6) {
+        dut.src.logic.obsIntAddr #= 10 + i; sleep(1)
+        assert(dut.src.logic.obsIntData.toBigInt == (BigInt(1) << (i + 1)),
+          s"SHIFT $i result was 0x${dut.src.logic.obsIntData.toBigInt.toString(16)}")
+      }
+    }
+  }
+
+  test("fast reservation blocks exactly the S2 collision cycle", VerilatorTest) {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initPorts(dut); idle(dut)
+      dut.src.logic.obsIntAddr #= 0; dut.src.logic.obsNzvcAddr #= 0; dut.src.logic.obsXAddr #= 0
+      cd.waitSampling(80)
+      issueMoveq(dut, 3, pdst = 1, robId = 1); cd.waitSampling()
+      issueMoveq(dut, 4, pdst = 2, robId = 2); cd.waitSampling()
+      idle(dut); cd.waitSampling(6)
+
+      issueLslImm(dut, pa = 1, count = 1, pdst = 8, robId = 30)
+      cd.waitSampling(); idle(dut); sleep(1)
+      while (!dut.eu.logic.s2Valid.toBoolean) { cd.waitSampling(); sleep(1) }
+
+      issueAdd(dut, pa = 1, pb = 2, pdst = 9, robId = 31)
+      sleep(1)
+      assert(!dut.src.logic.iReady.toBoolean, "FAST must be blocked while S2 reserves next S3")
+      cd.waitSampling(); sleep(1)
+      assert(dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == 30,
+        "the slow operation must complete on the reservation cycle")
+      assert(!dut.eu.logic.fastFire.toBoolean && dut.eu.logic.s3Valid.toBoolean,
+        "reservation cycle did not isolate slow S3 writeback")
+      assert(dut.src.logic.iReady.toBoolean, "FAST must be accepted immediately after the one collision cycle")
+      cd.waitSampling(); sleep(1)
+      idle(dut)
+      assert(dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == 31,
+        "the held FAST operation did not complete after its single blocked cycle")
+      assert(dut.eu.logic.fastFire.toBoolean && !dut.eu.logic.s3Valid.toBoolean,
+        "fast completion did not occupy its exclusive writeback cycle")
+    }
+  }
+
+  test("flush kills every in-flight slow completion, wakeup, and stale write", VerilatorTest) {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initPorts(dut); idle(dut)
+      dut.src.logic.obsIntAddr #= 0; dut.src.logic.obsNzvcAddr #= 0; dut.src.logic.obsXAddr #= 0
+      cd.waitSampling(80)
+      issueMoveq(dut, 1, pdst = 3, robId = 1); cd.waitSampling()
+      for (i <- 0 until 4) { issueMoveq(dut, 0x40 + i, pdst = 20 + i, robId = 2 + i); cd.waitSampling() }
+      idle(dut); cd.waitSampling(6)
+
+      for (i <- 0 until 4) {
+        issueLslImm(dut, pa = 3, count = i + 1, pdst = 20 + i, robId = 40 + i)
+        sleep(1); assert(dut.src.logic.iReady.toBoolean)
+        cd.waitSampling(); sleep(1)
+      }
+      // Advance until the oldest killed token is live in final S3. Assert flush
+      // in that exact cycle, while the three younger tokens remain dense behind
+      // it, so output gating and every valid-stage kill are both exercised.
+      idle(dut)
+      var waitedForS3 = 0
+      while (!dut.eu.logic.s3Valid.toBoolean && waitedForS3 < 8) {
+        cd.waitSampling(); sleep(1); waitedForS3 += 1
+      }
+      assert(dut.eu.logic.s3Valid.toBoolean, "directed flush never reached a live S3 token")
+      dut.src.logic.iFlush #= true; sleep(1)
+      assert(!dut.src.logic.iReady.toBoolean)
+      assert(!dut.src.logic.cValid.toBoolean && !dut.src.logic.slowWakeValid.toBoolean)
+      cd.waitSampling(); sleep(1)
+      dut.src.logic.iFlush #= false
+
+      // Immediately reuse one destination.  No killed slow result may overwrite it.
+      issueMoveq(dut, 0xA5, pdst = 20, robId = 50); cd.waitSampling(); sleep(1); idle(dut)
+      for (_ <- 0 until 10) {
+        assert(!dut.src.logic.slowWakeValid.toBoolean, "stale slow wakeup escaped after flush")
+        assert(!(dut.src.logic.cValid.toBoolean && (40 until 44).contains(dut.src.logic.cRob.toInt)),
+          s"stale slow completion escaped after flush: rob=${dut.src.logic.cRob.toInt}")
+        cd.waitSampling(); sleep(1)
+      }
+      dut.src.logic.obsIntAddr #= 20; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == 0xA5,
+        s"killed slow write overwrote reused physreg: 0x${dut.src.logic.obsIntData.toBigInt.toString(16)}")
     }
   }
 }

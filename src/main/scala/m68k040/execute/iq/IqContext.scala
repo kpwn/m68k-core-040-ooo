@@ -9,8 +9,8 @@ case class IqContext() extends Bundle {
   val robId = UInt(6 bits)
 }
 
-/** Dynamic-completion wakeup for the SLOW ALU path (shift, latency-2). The shift
-  * produces an int dst AND NZVC AND X atomically at S2, so the broadcast carries all
+/** Dynamic-completion wakeup for the six-stage SLOW ALU path. A SHIFT/BITFIELD
+  * produces its destinations atomically at S3, so the broadcast carries all
   * three physreg dsts (with per-class valid). The IQ clears its per-class slow-busy
   * bitmaps + any dependent's `aluSlowWait` matching ANY of the three. (Unlike LS/DIV,
   * which write only an int reg, a shift also writes the flag PRFs — hence the bundle.) */
@@ -24,6 +24,9 @@ trait IssueQueueService {
   def push: Stream[Vec[IqContext]]   // length 2
   def pushSlot1Valid: Bool
   def issue: Vec[Stream[IqContext]]  // length 5 (ALU0, ALU1, branch, LS, CPLX/DivEu)
+  /** Per-ALU look-ahead from the execution pipelines.  True means a FAST uop
+    * selected now is guaranteed to leave the registered issue stage next cycle. */
+  def aluFastAcceptNext: Vec[Bool]
   def flushPort: Bool
   /** Dynamic-completion wakeup (variant A): the LS EU broadcasts the pdst of a
     * just-completed load; slots reading that physreg become ready. */
@@ -54,11 +57,11 @@ trait IssueQueueService {
     * branch read the stale (pre-multiply) flags instead of waiting for the real
     * writeback. Mirrors `lsNzvcWakeup` exactly, on the CPLX port instead of LS. */
   def cplxNzvcWakeup: Flow[UInt]
-  /** Dynamic-completion wakeup for the SLOW ALU path (shift, latency-2): each ALU EU
-    * broadcasts the int+NZVC+X dsts of its just-completed shift. A dependent of a shift
-    * (int OR flag source) is held NOT-ready until a matching broadcast fires. The shift
+  /** Dynamic-completion wakeup for the SLOW ALU path: each ALU EU broadcasts the
+    * int+NZVC+X dsts of its just-completed SHIFT/BITFIELD at S3. A dependent
+    * (int OR flag source) is held NOT-ready until a matching broadcast fires. The op
     * is tracked in SEPARATE slow-busy bitmaps (NOT the static latency-1 scoreboards), so
-    * a dependent wakes at latency-2, not latency-1. ONE port per ALU EU (both can
+    * a dependent wakes from actual completion, not a static latency. ONE port per ALU EU (both can
     * complete a distinct shift the same cycle). */
   def aluSlowWakeup: Vec[Flow[AluSlowWakeup]]
 }

@@ -1,12 +1,19 @@
-# Shifts & rotates (line E, register forms) — Design
+# Shifts & rotates (line E) — Design
 
-**Status:** Draft (feature-completion slice 4). User: "you pick / batch it, features first."
+**Status:** Implemented. The original register-form slice was subsequently
+extended by the memory-RMW implementation; the current dependency rules for
+both forms are binding below.
 **Date:** 2026-06-07
 **Parent:** [[decode-matrix-framework]], [[isa-completion-roadmap]].
 
 ## 1. Purpose
 
-Add the line-E shift/rotate family in register-destination form: **ASL/ASR, LSL/LSR, ROXL/ROXR, ROL/ROR** (.B/.W/.L), with both immediate (count 1-8) and register (Dc mod 64) shift counts. These reuse the ALU EU with a new shifter datapath. Lock-stepped vs Musashi. **Gate: lock-step (correctness) + OOC-synth sanity proxy** — NOT post-route (which is currently unreliable/non-deterministic, see [[synth-gate-every-slice]]); shifts are FMax-neutral decode/ALU work.
+Define the line-E shift/rotate family: **ASL/ASR, LSL/LSR, ROXL/ROXR,
+ROL/ROR** (.B/.W/.L register forms plus the word-sized memory forms), with
+immediate, register, and implicit-one counts as encoded. These reuse the ALU
+EU's retimed slow pipeline and are lock-stepped against Musashi. Functional
+acceptance is lock-step plus the fast gate; structural throughput changes also
+require the paired post-route gate defined by the current ALU II=1 spec.
 
 ## 2. Scope
 
@@ -20,16 +27,28 @@ Add the line-E shift/rotate family in register-destination form: **ASL/ASR, LSL/
   - **V**: set by **ASL only** if the MSB changed at any point during the shift (sign overflow); 0 for all others.
   - Count==0 special cases per op (no flag change except as Musashi specifies).
 - **Register shift count** (`i=1`): count = `Dc mod 64` (a 2nd data-reg source read). 0 count → the count==0 flag rules.
+- **Memory-destination forms** (`1110 ccc d 11 mmmrrr`): word-sized
+  load-op-store RMW with an implicit count of one. The µop uses the same slow
+  pipeline after the cracked load; AS/LS do not read old X, ROX does, and RO
+  neither reads nor writes X.
+- **X dependency annotation:** ROXL/ROXR always read X.  Register-count
+  ASL/ASR/LSL/LSR also read X because a count of zero preserves X.  Immediate
+  ASL/ASR/LSL/LSR do **not** read X: their encoded count is always 1-8, so
+  they unconditionally replace X with the shifted-out bit.  ROL/ROR neither
+  read nor write X.  This distinction is architectural dependency metadata,
+  not a relaxation of the flag semantics.
 - **Verification:** lock-step vs Musashi — each op (8) × imm + reg count × .B/.W/.L, with operands exercising C/X/V/N/Z edges (shift-out-1, sign change for ASL-V, count 0, count ≥ size, ROX through X). ALL existing UNCHANGED.
 
-**Out:** **memory-destination single-bit shifts** (`1110 ccc d 11 mmmrrr` — shift <ea> by 1; deferred to the memory-RMW slice, needs the load-op-store crack); the line-E memory forms generally.
+**Out:** no line-E integer shift/rotate encoding. Floating-point and coprocessor
+line-F operations remain separate.
 
 ## 3. Components & dataflow
 
 ```
 decode line E (reg form) -> shift uop {op(8), dir, size, count (imm or Dc-read), Dr}
 ALU EU: barrel-shift(Dr, count, op, dir, size) -> result + C/X/V (+N/Z) -> Dr + flags
-  ROXL/ROXR read X (xRd) + write X; ROL/ROR leave X; ASL writes V on MSB-change
+  ROXL/ROXR read X (xRd) + write X; register-count AS/LS read X only for count-0 preservation
+  immediate AS/LS write X without reading it; ROL/ROR leave X; ASL writes V on MSB-change
 ```
 
 ## 4. Verification

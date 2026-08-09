@@ -29,6 +29,7 @@ class AluEuSourcePlugin extends FiberPlugin {
 
     // issue inputs (sim-driven)
     val iValid    = in Bool ()
+    val iFlush    = in Bool ()
     val iOp       = in(DecOp())
     val iSize     = in(Size())
     val iUseImm   = in Bool ()
@@ -105,12 +106,15 @@ class AluEuSourcePlugin extends FiberPlugin {
     ctx.robId := iRobId
     eu.issue.valid   := iValid
     eu.issue.payload := ctx
+    eu.flush         := iFlush
     iReady := eu.issue.ready
 
     // completion observation
     val cValid = out Bool (); val cRob = out UInt (6 bits)
     cValid := eu.completion.valid
     cRob   := eu.completion.payload
+    val slowWakeValid = out Bool ()
+    slowWakeValid := eu.slowWakeup.valid
 
     // PRF observation reads
     val obsIntAddr  = in UInt (6 bits); obsInt.addr := obsIntAddr

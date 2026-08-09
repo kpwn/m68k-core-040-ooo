@@ -622,7 +622,8 @@ object OperationDecoder {
       // rrr (bits 2:0) = Dr (the shifted data reg). The assembler fills the fixed-field
       // operands (srcA=Dr, dst=Dr, srcB=Dc for the reg form) + the immediate count.
       // Flags: N/Z always; V only for ASL (set in the EU); writesX for AS/LS/ROX, NOT
-      // for RO; readsX for AS/LS/ROX (count-0 preserves X) + ROX (rotate-through-X).
+      // for RO. ROX always reads X; AS/LS read X only for a register count,
+      // where count=0 must preserve it. Immediate counts are always 1..8.
       is(0xE) {
         val ss = opword(7 downto 6)
         val tt = opword(4 downto 3)
@@ -639,9 +640,10 @@ object OperationDecoder {
           o.shiftImm := !opword(5)          // i=0 -> immediate count
           o.dstWrites := True
           o.writesNzvc := True
+          val isRox = (tt === 2)            // ROXL/ROXR rotate through X
           val isRo = (tt === 3)             // ROL/ROR do NOT touch X
           o.writesX := !isRo
-          o.readsX  := !isRo                // AS/LS/ROX read X (count-0 preserve + ROX-through-X)
+          o.readsX  := isRox || (opword(5) && !isRo)
         }
         // ── Line-E MEMORY-form shift/rotate (1110 ttt d 11 mmm rrr, task #170-
         // cluster10): op[11]=0 (op[11]=1 at ss=11 is the bit-field register/memory
@@ -664,9 +666,10 @@ object OperationDecoder {
           o.shiftImm := True                  // implicit count=1 (MicroOpAssembler forces imm=1)
           o.srcA := easrc; o.dst := easrc; o.dstWrites := True
           o.writesNzvc := True
+          val isRoxMem = (opword(10 downto 9) === 2)
           val isRoMem = (opword(10 downto 9) === 3)
           o.writesX := !isRoMem
-          o.readsX  := !isRoMem
+          o.readsX  := isRoxMem              // implicit count=1: only ROX consumes old X
         }
         // ── Bit-field register form (BFxxx Dn{#off:#wd}) — slice 1 ──────────────
         // 1110 1ooo 11 000 rrr: ss=11 (op[7:6]==3), op[11]=1 (op[11:8]>=8), mode 000

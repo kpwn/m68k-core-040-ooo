@@ -26,6 +26,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
   var pushPort      : Stream[Vec[IqContext]] = null
   var pushSlot1Port : Bool                   = null
   var issuePorts    : Vec[Stream[IqContext]] = null
+  var aluFastAcceptNextPorts: Vec[Bool]       = null
   var flushSignal   : Bool                   = null
   var lsWakeupPort  : Flow[UInt]             = null
   var lsNzvcWakeupPort: Flow[UInt]           = null
@@ -36,6 +37,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
   override def push: Stream[Vec[IqContext]]  = pushPort
   override def pushSlot1Valid: Bool          = pushSlot1Port
   override def issue: Vec[Stream[IqContext]] = issuePorts
+  override def aluFastAcceptNext: Vec[Bool]   = aluFastAcceptNextPorts
   override def flushPort: Bool               = flushSignal
   override def lsWakeup: Flow[UInt]          = lsWakeupPort
   override def lsNzvcWakeup: Flow[UInt]      = lsNzvcWakeupPort
@@ -49,6 +51,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // 5 issue ports: 0,1 = ALU (non-branch, non-LS, non-CPLX), 2 = branch, 3 = LS,
     // 4 = CPLX (DivEu: CHK + DIV).
     issuePorts    = Vec.fill(5)(Stream(IqContext()))
+    aluFastAcceptNextPorts = Vec.fill(2)(Bool())
     flushSignal   = Bool()
     lsWakeupPort  = Flow(UInt(6 bits))   // carries a completed-load pdst
     lsNzvcWakeupPort = Flow(UInt(4 bits)) // carries a completed NZVC-writing-store pNzvcDst
@@ -82,6 +85,10 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       p.payload.pXDst := U(0, 4 bits); p.payload.xValid := False
       p.simPublic()
     }
+    // Fail-safe default: an omitted integration wire may stall fast ALU selection but
+    // must never re-open the select-time wakeup corruption window.  Standalone tests
+    // explicitly override these bits from their source harness.
+    aluFastAcceptNextPorts.foreach { p => p.allowOverride; p := False; p.simPublic() }
 
     // ---- Slot array (priority = line*wayCount + way; 0 = oldest) ----
     val lines = for (line <- 0 until lineCount) yield new Area {
@@ -92,6 +99,9 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
         val selComb  = CombInit(sel)                   // sel after issue this cycle
         val triggers = Reg(Bits((priority + 1) bits)) init 0
         val context  = Reg(IqContext())
+        // Stored slow-class bit.  Keep opcode decoding out of the timing-sensitive
+        // select cone; shift this bit with the slot during compaction.
+        val isAluSlow = Reg(Bool()) init False
         // Dynamic LS dependency: a REGISTERED per-slot bit (like `triggers`), set at
         // push if a source physreg is produced by an in-flight LS load, cleared on
         // the matching lsWakeup. Keeping it a single registered bit (vs reading the
@@ -104,9 +114,9 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
         // by cplxWakeup (a completing multi-cycle DIV). A consumer of a DIV result
         // waits here (DIV is variable-latency; no static issue-event).
         val cplxWait   = Reg(Bool()) init False
-        // SLOW-ALU (shift, latency-2) dynamic dependency: identical mechanism to
+        // SLOW-ALU (SHIFT/BITFIELD, six-stage) dynamic dependency: identical mechanism to
         // cplxWait, cleared by aluSlowWakeup. A consumer of a shift result (int OR flag
-        // source) waits here (the slow path is latency-2; no static latency-1 event).
+        // source) waits here (the slow path uses completion wakeup, not a static event).
         val aluSlowWait = Reg(Bool()) init False
         // LS NZVC dynamic dependency: identical mechanism to lsWait, but on lsNzvcBusy /
         // lsNzvcWakeup. A flag-reader of an in-flight LS-produced NZVC (a MOVE-to-memory
@@ -135,6 +145,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // Zero synth impact (sim tap only, not referenced by any RTL logic).
     slots.foreach { s => s.sel.simPublic(); s.context.robId.simPublic(); s.context.uop.op.simPublic()
       s.lsWait.simPublic(); s.cplxWait.simPublic(); s.triggers.simPublic(); s.cplxNzvcWait.simPublic()
+      s.isAluSlow.simPublic()
       s.context.uop.psrcA.simPublic(); s.context.uop.psrcAValid.simPublic()
       s.context.uop.psrcB.simPublic(); s.context.uop.psrcBValid.simPublic()
       s.context.uop.pXSrc.simPublic(); s.context.uop.readsX.simPublic()
@@ -200,10 +211,10 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // by any immediately-following Bcc/flag-consumer).
     val cplxNzvcBusy = Reg(Bits(16 bits)) init 0
     cplxNzvcBusy.simPublic()  // debug-only (task #167 IQ-NZVC trace)
-    // SLOW-ALU (shift, latency-2) dynamic-completion scoreboards: one per reg class the
+    // SLOW-ALU dynamic-completion scoreboards: one per reg class the
     // shift writes (int dst + NZVC + X). A consumer reading any of these is held NOT-
     // ready until the matching aluSlowWakeup. SEPARATE from the static sbInt/sbNzvc/sbX
-    // (latency-1) so a shift producer gets NO static trigger (its result is lat2).
+    // (latency-1) so a slow producer gets NO static trigger (it wakes at S3).
     val aluSlowIntBusy  = Reg(Bits(physIntN bits)) init 0
     val aluSlowNzvcBusy = Reg(Bits(16 bits)) init 0
     val aluSlowXBusy    = Reg(Bits(16 bits)) init 0
@@ -224,10 +235,10 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // independent, exactly like isLsNzvcProducer/isLs below).
     def isCplxNzvcProducer(u: RenamedUop): Bool = isCplx(u) && u.writesNzvc
 
-    // SLOW-ALU producer: a line-E SHIFT (DecOp.SHIFT) — the latency-2 EU path. (toCcr
-    // stays latency-1.) Tracked in the aluSlow* bitmaps (dynamic lat2 wakeup), NOT the
-    // static scoreboards. A shift writes int + NZVC + (X for non-rotate).
-    // BITFIELD shares the ALU slow path (lat-4, dynamic slowWakeup) with SHIFT, so a
+    // SLOW-ALU producer: line-E SHIFT or BITFIELD on the six-stage EU path. Tracked
+    // in the aluSlow* bitmaps (dynamic S3 wakeup), NOT the static scoreboards. A shift
+    // writes int + NZVC + (X for non-rotate).
+    // BITFIELD shares the same dynamic slowWakeup, so a
     // dependent of a bit-field op (its Dn2/Dy result) must wait on the slow wakeup too.
     def isAluSlowProducer(u: RenamedUop): Bool =
       (u.op === m68k040.decode.DecOp.SHIFT) || (u.op === m68k040.decode.DecOp.BITFIELD)
@@ -310,8 +321,12 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val cplxReady= B(slots.map(s => s.ready &&  isCplx(s.context.uop)))
     val contexts = Vec(slots.map(_.context))
 
-    val oh0 = OHMasking.first(aluReady)
-    val oh1 = OHMasking.first(aluReady & ~oh0)
+    val aluSlowSlots = B(slots.map(_.isAluSlow))
+    val allAluCandidates = B((BigInt(1) << slotCount) - 1, slotCount bits)
+    val cand0 = aluReady & Mux(aluFastAcceptNextPorts(0), allAluCandidates, aluSlowSlots)
+    val cand1 = aluReady & Mux(aluFastAcceptNextPorts(1), allAluCandidates, aluSlowSlots)
+    val oh0 = OHMasking.first(cand0)
+    val oh1 = OHMasking.first(cand1 & ~oh0)
     val ohB = OHMasking.first(brReady)
     // ---- LS issue is IN PROGRAM ORDER (no MOB / no load-store disambiguation) ----
     // The L1D is write-no-allocate and stores are visible only at commit (SQ drain),
@@ -367,61 +382,15 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // arrives 1-2 cycles later carrying a now-reused robId, and corrupts the
     // commit/whitebox join. Gating issue on !flushSignal is the correct squash
     // behavior (a single AND on the registered pulse, not a broadcast).
-    // ── ALU registered-issue-stage HANDOFF HAZARD (Task P5.7 root-cause fix) ──────
-    // The static-latency-1 wakeup contract documented just above ("a producer selected
-    // at cycle C still executes exactly when a dependent — woken at C, selected at C+1
-    // — performs its read") silently assumed the ALU EU ALWAYS accepts from the
-    // registered stage the very next cycle. That assumption was true when it was
-    // written ("For ALU/branch the EU is always ready so the pipe always accepts",
-    // see the m2sPipe comment below) but has been FALSE since the ALU EU grew its
-    // multi-cycle SLOW path: `AluEuPlugin.issuePort.ready` is deasserted for the whole
-    // S1/S1a/S1a2/S1b/S2/S3 occupancy of a SHIFT/BITFIELD µop.
-    //
-    // The concrete failure (bfins_mem_dyn_both, Task P5.7 regression cluster):
-    //   C   : ALU0 is ready, so BOTH (a) the pipe hands a BITFIELD µop to ALU0 and
-    //         (b) the IQ selects producer P (BFRESOLVE -> T0) into ALU0's now-free
-    //         pipe REGISTER. `events` fires for P at C (select time) -> P's dependent
-    //         D (an ADD reading T0) has its static trigger cleared and is ready at C+1.
-    //   C+1..C+m : ALU0.issuePort.ready is LOW (the BITFIELD occupies the slow pipe),
-    //         so P just SITS in the pipe register — it has not read the PRF, has not
-    //         executed, has written nothing.
-    //   C+k : D is selected on the OTHER ALU port (ALU1, idle) and executes
-    //         immediately, reading P's destination physreg out of the PRF BEFORE P
-    //         ever wrote it -> D silently consumes the physreg's STALE previous
-    //         occupant. (Observed: the bit-field byteBase add produced eaBase+0x6a,
-    //         0x6a being a dead temp value left over from the previous instruction's
-    //         chain, so the whole 5-byte BFINS window loaded/merged at a garbage
-    //         address.) Pre-P5.6 this was latent: with cacheable/fast loads the µop
-    //         stream never backed up enough for a dependent pair to be queue-resident
-    //         and become ready TOGETHER, so the producer always won the select first.
-    //
-    // Fix: never let a µop enter the registered issue stage on the same cycle that
-    // stage hands a SLOW µop to its ALU EU. The pipe register then stays EMPTY for
-    // the whole stall (the IQ's own `selPorts(k).ready` is already the EU's `ready`,
-    // so nothing else can be selected until the EU frees), which restores the
-    // invariant the wakeup contract needs:
-    //     selPorts(k).fire at C  =>  issuePorts(k).fire at C+1
-    // Proof: firing at C requires EU_k.ready at C, i.e. no slow µop in S1..S3 at C.
-    // A slow µop can only be in S1 at C+1 if the EU accepted one at C — which is
-    // exactly the case this gate suppresses. Hence EU_k.ready at C+1. ∎
-    // Cost: ONE bubble cycle per slow ALU µop on that port (the queue can no longer
-    // pre-stage the next µop behind a shift/bitfield); the sibling ALU port and every
-    // other issue port are untouched. Reads only registers (the pipe's own valid/
-    // payload + the EU's ready, itself a function of EU state regs), so it adds a
-    // single AND to the select-valid cone and no new timing arc.
-    //
-    // NOT extended to ports 2/3/4 here: branch/LS/CPLX producers are already tracked
-    // by DYNAMIC (completion-broadcast) wakeups rather than the static latency-1
-    // trigger, so a held µop on those ports cannot expose this window. (The one known
-    // exception is an LS X-producer — RTR's CCR-restore — which still records a STATIC
-    // `sbX` trigger; that is a pre-existing, separate gap of the same class, not
-    // reachable from this regression cluster, and is left documented rather than
-    // speculatively rewired.)
-    def aluSlowHandoff(k: Int): Bool =
-      issuePorts(k).valid && issuePorts(k).ready && isAluSlowProducer(issuePorts(k).payload.uop)
-    selPorts(0).valid   := oh0.orR && !flushSignal && !aluSlowHandoff(0)
+    // The static latency-1 wakeup fires at SELECT time, so a selected ALU producer
+    // must leave the registered stage exactly one cycle later.  A slow candidate is
+    // always accepted; a fast candidate is eligible only when fastAcceptNext says
+    // the EU will have no S3 collision next cycle.  The stored per-slot class keeps
+    // this guarantee out of the post-MuxOH opcode cone and also lets the sibling port
+    // take a skipped fast uop instead of creating a head-of-line bubble.
+    selPorts(0).valid   := oh0.orR && !flushSignal
     selPorts(0).payload := MuxOH(oh0, contexts)
-    selPorts(1).valid   := oh1.orR && !flushSignal && !aluSlowHandoff(1)
+    selPorts(1).valid   := oh1.orR && !flushSignal
     selPorts(1).payload := MuxOH(oh1, contexts)
     selPorts(2).valid   := ohB.orR && !flushSignal
     selPorts(2).payload := MuxOH(ohB, contexts)
@@ -470,9 +439,8 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     }
 
     // Free chosen slots when their SELECT port fires (i.e. when the uop moves into
-    // the registered issue stage). For ALU/branch the EU is always ready so the
-    // pipe always accepts (fire == valid); for LS the pipe back-pressures when the
-    // EU is busy, holding the slot — so no issued uop is ever lost.
+    // the registered issue stage).  The ALU candidate masks guarantee next-cycle
+    // acceptance; LS/CPLX may back-pressure and hold their slot.
     for ((slot, i) <- slots.zipWithIndex) {
       slot.fire := (selPorts(0).fire && oh0(i)) ||
                    (selPorts(1).fire && oh1(i)) ||
@@ -544,6 +512,8 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
 
     val pushUop0 = pushPort.payload(0).uop
     val pushUop1 = pushPort.payload(1).uop
+    val push0IsAluSlow = isAluSlowProducer(pushUop0)
+    val push1IsAluSlow = isAluSlowProducer(pushUop1)
     // debug-only (task #141 X-flag/scoreboard leak investigation)
     pushPort.valid.simPublic(); pushSlot1Port.simPublic()
     pushPort.payload(0).robId.simPublic(); pushUop0.pc.simPublic()
@@ -668,7 +638,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // Suppress the static trigger for an LS load, a DIV producer, OR a slow-ALU (shift)
     // producer (all latency>1, tracked dynamically via lsWait/cplxWait/aluSlowWait, not
     // static latency-1 triggers). For a shift this covers ALL THREE classes (int + NZVC
-    // + X), since the shift writes all of them at lat2 (the aluSlowDep1 carries them).
+    // + X), since the shift writes all of them at S3 (the aluSlowDep1 carries them).
     // LS-int producer (a LOAD or a stkPush STORE's predecremented-A7 side-effect) issues on
     // the LS port (no static int event) -> its int dep is carried dynamically (lsWait), not
     // the static scoreboard [feat/link-unlk: broadened from LOAD-only s0IsLsLoad].
@@ -693,6 +663,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
           val wSrc = lines(lineId + 1).ways(way)
           val wDst = lines(lineId).ways(way)
           wDst.context  := wSrc.context
+          wDst.isAluSlow := wSrc.isAluSlow
           wDst.triggers := (wSrc.triggers >> wayCount).resized
           wDst.sel      := wSrc.selComb
           wDst.lsWait   := wSrc.lsWait     // LS dependency shifts with the slot
@@ -708,6 +679,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       val wDst0 = lines.last.ways(0)
       val wDst1 = lines.last.ways(1)
       wDst0.context  := wSrc0
+      wDst0.isAluSlow := push0IsAluSlow
       wDst0.triggers := trig0
       wDst0.sel      := True
       wDst0.lsWait   := lsDep0
@@ -716,6 +688,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       wDst0.lsNzvcWait  := lsNzvcDep0
       wDst0.cplxNzvcWait := cplxNzvcDep0
       wDst1.context  := wSrc1
+      wDst1.isAluSlow := push1IsAluSlow
       wDst1.triggers := trig1
       wDst1.sel      := pushSlot1Port
       wDst1.lsWait   := lsDep1
@@ -858,9 +831,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val push0IsCplxProd = isCplxProducer(pushUop0)
     val push1IsCplxProd = isCplxProducer(pushUop1)
     // A slow-ALU (shift) producer's int + NZVC + X dsts go in the aluSlow* bitmaps
-    // (dynamic lat2 wakeup), NOT the static sb* scoreboards.
-    val push0IsAluSlow = isAluSlowProducer(pushUop0)
-    val push1IsAluSlow = isAluSlowProducer(pushUop1)
+    // (dynamic S3 wakeup), NOT the static sb* scoreboards.
     // An LS NZVC producer (MOVE-to-mem store) goes in lsNzvcBusy (dynamic wakeup), NOT
     // sbNzvc (static lat1) — it issues on the LS port and produces no static event.
     val push0IsLsNzvc = isLsNzvcProducer(pushUop0)
@@ -911,7 +882,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // On issue, clear busy for the issued producer's dst(s) so later pushes do not
     // depend on an already-result-available producer. A SLOW (shift) producer is in the
     // aluSlow* bitmaps, NOT sb*, so its sb*-clear here is a harmless no-op; aluSlow* is
-    // cleared at the lat2 wakeup (below), NOT at issue.
+    // cleared at the S3 wakeup (below), NOT at issue.
     //
     // Task #141 fix: this loop MUST cover every issue port (selPorts has 5: ALU0/ALU1/
     // Branch/LS/CPLX), not just `wayCount` (=2, the DISPATCH width -- an unrelated

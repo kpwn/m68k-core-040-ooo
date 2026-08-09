@@ -22,7 +22,11 @@ class DispatchSpec extends AnyFunSuite {
 
   /** Ties off the IQ flush port (no flush exercised in this unit test). */
   class IqFlushTiePlugin extends FiberPlugin {
-    val logic = during build new Area { host[IssueQueueService].flushPort := False }
+    val logic = during build new Area {
+      val iq = host[IssueQueueService]
+      iq.flushPort := False
+      iq.aluFastAcceptNext.foreach(_ := True)
+    }
   }
 
   class Dut extends Component {

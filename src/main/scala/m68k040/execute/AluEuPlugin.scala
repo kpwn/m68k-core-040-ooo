@@ -13,11 +13,18 @@ import spinal.lib.misc.plugin.FiberPlugin
 /** Plain-wire ports: producer (IQ/test) drives `issue`; consumer (ROB/test) reads `completion`. */
 trait AluEuService {
   def issue: Stream[IqContext]
+  /** Synchronous squash. Accepted wrong-path work must not write back, complete, or
+    * broadcast a dynamic wakeup after this pulse. */
+  def flush: Bool
   def completion: Flow[UInt]   // robId
-  /** Dynamic-completion wakeup (mirroring DivEu/LsEu): the SLOW path (shift, lat2)
-    * broadcasts its int+NZVC+X dsts the cycle the result lands (S2). The IQ holds a
+  /** Dynamic-completion wakeup (mirroring DivEu/LsEu): the six-stage SLOW path
+    * broadcasts its int+NZVC+X dsts the cycle the result lands at S3. The IQ holds a
     * dependent of a slow producer until this fires. Fast (lat1) ops do NOT drive it. */
   def slowWakeup: Flow[AluSlowWakeup]
+  /** True when a FAST uop selected by the IQ this cycle is guaranteed to be
+    * accepted from the registered issue stage next cycle.  The IQ uses this
+    * look-ahead to preserve its select-time static-wakeup contract. */
+  def fastAcceptNext: Bool
 }
 
 /** Sim-only per-instruction writeback observation (NaxRiscv-style whitebox). */
@@ -51,22 +58,24 @@ case class WbObs() extends Bundle {
 /** Fast/slow integer ALU EU. S0 read | M2S | S1 execute.
   * FAST path (ADD/SUB/AND/OR/EOR/CMP/MOVE/imm/CLR/NEGX/EXT/SWAP): writeback +
   * bypass + completion at S1 (latency-1) — the dependent-chain IPC path, UNCHANGED.
-  * SLOW path (isShift || toCcr): the barrel shifter + the CCR-RMW are the 24-level
-  * `s1Src2 -> NZVC` cone; they REGISTER into S2 and compute there, completing +
-  * writing back (SHARING the fast path's physical write ports — see `wbKey`) +
-  * broadcasting `slowWakeup` at latency-2.
-  * A slow op in S1 deasserts `issue.ready` for that one cycle (single-outstanding)
-  * so a fast op cannot enter S1 and collide with the slow op's S2 completion. */
+  * SLOW path (SHIFT || BITFIELD): the retimed barrel/funnel datapaths run through
+  * S1/S1a/S1a2/S1b/S2/S3, then write back (sharing the fast path's physical write
+  * ports — see `wbKey`) and broadcast `slowWakeup` at S3.
+  * The slow path is fully occupied as a pipeline (II=1).  A one-cycle reservation
+  * blocks only a FAST op that would collide with a slow S3 completion on the shared
+  * writeback/completion ports. */
 class AluEuPlugin extends FiberPlugin with AluEuService {
   var issuePort: Stream[IqContext] = null
+  var flushPort: Bool = null
   var completionPort: Flow[UInt]   = null
   var slowWakeupPort: Flow[AluSlowWakeup] = null
+  var fastAcceptNextPort: Bool = null
   // PRF ports (allocated in setup)
   var rdA, rdB, rdC: RegFileReadPort = null
   var intW: RegFileWritePort = null;  var intByp: RegFileBypassPort = null
   var nzvcW: RegFileWritePort = null; var nzvcByp: RegFileBypassPort = null
   var xW: RegFileWritePort = null;    var xByp: RegFileBypassPort = null
-  // SLOW-path write + bypass ports (latency-1 off the S3 stage => arch latency-3).
+  // SLOW-path write + bypass ports driven from the final S3 stage.
   // The fast (S1) and slow (S3) writebacks SHARE one PHYSICAL write port per regfile
   // (see `wbKey` below) because they are structurally mutually exclusive; the bypass
   // ports stay separate (bypasses are pure read-side muxes, they cost no RAM bank).
@@ -85,26 +94,25 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
   var srSysIn: UInt = null
 
   override def issue: Stream[IqContext] = issuePort
+  override def flush: Bool = flushPort
   override def completion: Flow[UInt]   = completionPort
   override def slowWakeup: Flow[AluSlowWakeup] = slowWakeupPort
+  override def fastAcceptNext: Bool = fastAcceptNextPort
 
   // ── PRF write-port SHARING KEY (one per AluEuPlugin INSTANCE) ──────────────────
   // Requests carrying the same key are merged by RegFilePlugin into ONE physical
   // write port (highest-priority valid request wins, combinationally, at the write-
   // port boundary). This EU's FAST (S1) and SLOW (S3) writebacks share a port because
-  // they are STRUCTURALLY mutually exclusive; proof:
+  // they are STRUCTURALLY mutually exclusive; proof under the S3 reservation:
   //
-  //   s3Valid(T)  == s2Valid(T-1)                     [pure RegNext chain]
-  //   s2Valid(T-1) => issuePort.ready(T-1) == False   [`ready` ANDs in !s2Valid]
-  //   ready(T-1)==False => s1Valid(T) == False        [s1Valid := RegNext(valid && ready)]
-  //   s1Valid(T)==False => fastFire(T) == False       [fastFire := s1Valid && !isSlow]
+  //   fastFire(T) => issuePort.fire(T-1) && !isSlowIn(T-1)
+  //   issue.valid(T-1) && !isSlowIn(T-1) && issue.ready(T-1) => !s2Valid(T-1)
+  //   !s2Valid(T-1) => !s3Valid(T)                    [pure RegNext chain]
   //
-  // i.e. a slow op anywhere in S1..S3 holds `issuePort.ready` low, so no fast op can
-  // ever reach S1 in the cycle a slow op reaches S3. `s1Valid` is a LOCAL RegNext of
-  // the locally-computed `ready`, so no external driver (the IQ drives only `valid`,
-  // via a plain `eu.issue << iq.issue(n)`) can violate it. The design ALREADY depends
-  // on exactly this invariant for the SHARED `completionPort` and the shared
-  // wbObs/ccrObs `Mux(s3Valid, slow, fast)` selects, so it is load-bearing either way.
+  // Slow uops always accept and advance one stage per cycle.  Only a presented FAST
+  // uop is blocked when the current S2 slow uop will write S3 on its S1 completion
+  // cycle.  The design depends on this invariant for the shared `completionPort` and
+  // the shared wbObs/ccrObs `Mux(s3Valid, slow, fast)` selects.
   // Belt-and-suspenders: `priority` makes FAST win a (structurally impossible) tie.
   //
   // The key MUST be per-INSTANCE (`new Object`, not a shared string constant): eu0's
@@ -114,8 +122,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
 
   during setup {
     issuePort      = Stream(IqContext())
+    flushPort      = Bool()
     completionPort = Flow(UInt(6 bits))
     slowWakeupPort = Flow(AluSlowWakeup())
+    fastAcceptNextPort = Bool()
     val irf = host[IntRegFileService]
     rdA = irf.newRead(); rdB = irf.newRead()
     // 3rd int read port: the BITFIELD-dynamic µop's srcC = T0 (BFRESOLVE-packed
@@ -165,11 +175,11 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
 
     // ── slow-op classification: the barrel shifter (DecOp.SHIFT) — the 64-wide
     // funnel + shTable + the ROX rmod subtract chain — is the deep part of the
-    // 24-level `s1Src2 -> NZVC` cone, so it goes to the 2-cycle (S1->S2) path.
+    // 24-level `s1Src2 -> NZVC` cone, so it uses the retimed S1-through-S3 path.
     // The CCR-RMW (toCcr) STAYS on the fast path: it is a shallow 5-bit logic fold
     // (NOT the deep cone), and keeping it fast avoids a flag-class dynamic wakeup —
     // toCcr writes only NZVC+X (flag physregs), which are tracked by the STATIC
-    // latency-1 flag scoreboards (sbNzvc/sbX); a lat2 flag write would desync them.
+    // latency-1 flag scoreboards (sbNzvc/sbX); a dynamic slow write would desync them.
     // (Re-confirmed by synth: moving the shifter alone clears the cone.) ──
     val isShift = u1.op === DecOp.SHIFT
     // The bit-field datapath (DecOp.BITFIELD) reuses the slow path: it adds two 32-bit
@@ -179,12 +189,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val isBitfield = u1.op === DecOp.BITFIELD
     val isSlow  = isShift || isBitfield
 
-    // Single-outstanding SLOW: hold new issue while a slow op occupies ANY of S1/S2/S3
-    // (it now completes at S3). Prevents (a) two slow ops contending for the single slow
-    // write/completion ports and (b) a fast op's completion coinciding with the slow op's
-    // S3 completion. Slow ops are rare; the sibling ALU EU + 2-wide IQ absorb the bubble.
-    // (s1aValid/s2Valid/s3Valid are the RegNext chain of `s1Valid && isSlow`, declared in
-    // the SLOW PATH section below; forward-declared here as plain Bools and wired there.)
+    // SLOW is a genuine six-stage pipeline.  A slow uop is always accepted.  A FAST
+    // uop is blocked only when the slow uop currently in S2 will reach S3 next cycle,
+    // exactly when the accepted fast uop would reach S1 and use the shared writeback.
+    // (s1aValid/s2Valid/s3Valid are the slow valid chain, forward-declared here.)
     // FMax #3 added the S1a stage (split stage1); FMax #4 added the S1b stage (split the
     // bit-field forward-funnel -> modify cone); task #123 added the S1a2 stage (split the
     // bit-field modify's clz+mux from its rotate/shift half), so the slow pipe is now
@@ -194,7 +202,16 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val s1bValid = Bool()
     val s2Valid  = Bool()
     val s3Valid  = Bool()
-    issuePort.ready := !((s1Valid && isSlow) || s1aValid || s1a2Valid || s1bValid || s2Valid || s3Valid)
+    s1Valid.simPublic(); s1aValid.simPublic(); s1a2Valid.simPublic()
+    s1bValid.simPublic(); s2Valid.simPublic(); s3Valid.simPublic()
+    val isSlowIn = (issuePort.payload.uop.op === DecOp.SHIFT) ||
+                   (issuePort.payload.uop.op === DecOp.BITFIELD)
+    // An empty upstream register must always see capacity: its retained payload is
+    // stale and must not prevent the IQ from loading a safe slow candidate.
+    issuePort.ready := !flushPort && (!issuePort.valid || isSlowIn || !s2Valid)
+    // A selection at C reaches this issue port at C+1.  s2Valid(C+1) equals
+    // s1bValid(C), so this tells the IQ whether a selected FAST uop is safe.
+    fastAcceptNextPort := !flushPort && !s1bValid
 
     // ---- S1: FAST execute (ALU datapath; NO shifter, NO CCR-RMW on this cone) ----
     // ── ADDA/SUBA/CMPA "An-wide" marker: isMovea on a non-MOVE ALU op. The op runs
@@ -515,7 +532,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val finalX    = Mux(u1.toCcr, ccrX, Mux(isBcd, bcdCarry, rsp.xOut))
 
     // ---- S1: FAST writeback (gated by masks; suppressed for a slow op) ----
-    val fastFire = s1Valid && !isSlow
+    val fastFire = s1Valid && !isSlow && !flushPort
     intW.valid   := fastFire && u1.pdstValid;  intW.address   := u1.pdst;     intW.data   := mergedResult
     nzvcW.valid  := fastFire && u1.writesNzvc; nzvcW.address  := u1.pNzvcDst;  nzvcW.data  := finalNzvc
     xW.valid     := fastFire && u1.writesX;    xW.address     := u1.pXDst;     xW.data     := B(finalX)
@@ -526,11 +543,11 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     nzvcByp.valid := nzvcW.valid; nzvcByp.address := nzvcW.address; nzvcByp.data := nzvcW.data
     xByp.valid    := xW.valid;    xByp.address    := xW.address;    xByp.data    := xW.data
 
-    // ============================ SLOW PATH (S1 -> S2) ============================
-    // Pipeline the barrel shifter ACROSS the S1->S2 boundary: COMPUTE the shifter in S1
+    // ======================= SLOW PATH (S1 through S3) ============================
+    // Pipeline the barrel shifter across the retimed slow stages: compute its first
     // (from the s1 operands, in parallel with the fast ALU but NOT on the fast S1
-    // writeback cone — its outputs go to S2 registers, not the fast write ports), then
-    // S2 does only the shallow size-merge + writeback. This keeps the deep shifter cone
+    // writeback cone — its outputs feed pipeline registers, not the fast write ports).
+    // S2/S3 perform only the shallow finish/merge/writeback. This keeps the deep cone
     // OFF both the fast S1 writeback path AND the S2->NZVC-RAM write path: the shifter's
     // long cone now ends at the local s2Shift* FFs (a register endpoint, off the central
     // flag-RAM routing), and S2's write cone is a shallow mux + RAM write.
@@ -563,7 +580,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     //
     // S1: stage1a (amounts) -> register into S1a.
     val s1Stage1a = Shifter.stage1a(shiftCmd)
-    s1aValid     := RegNext(s1Valid && isSlow) init False
+    s1aValid     := RegNext(s1Valid && isSlow && !flushPort) init False
     val s1aStage1a = RegNext(s1Stage1a)
     val s1aCtx     = RegNext(s1Ctx)
     val s1aSrc1    = RegNext(s1Src1)
@@ -717,7 +734,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // ── S1a -> S1a2: pure pass-through for the shift/ctx/valid/src1 chain (no shifter
     // computation here) — keeps the shift pipe lat-matched with the bit-field pipe's
     // NEW S1a2 stage (task #123). ──
-    s1a2Valid      := RegNext(s1aValid) init False
+    s1a2Valid      := RegNext(s1aValid && !flushPort) init False
     val s1a2Stage1a = RegNext(s1aStage1a)
     val s1a2Ctx    = RegNext(s1aCtx)
     val s1a2Src1   = RegNext(s1aSrc1)
@@ -727,13 +744,13 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // two cycles longer) bit-field pipe; the shift midpoint and ctx/src1 pass THROUGH S1b
     // unmodified into S2. ──
     val s1Stage1 = Shifter.stage1b(s1a2Stage1a)
-    s1bValid     := RegNext(s1a2Valid) init False
+    s1bValid     := RegNext(s1a2Valid && !flushPort) init False
     val s1bStage1 = RegNext(s1Stage1)
     val s1bCtx    = RegNext(s1a2Ctx)
     val s1bSrc1   = RegNext(s1a2Src1)
     // ── S1b -> S2: register the shift midpoint (pass-through) + the finished bit-field
     // result/flags (computed in S1b above), so a single S2/S3 stage serves both. ──
-    s2Valid      := RegNext(s1bValid) init False
+    s2Valid      := RegNext(s1bValid && !flushPort) init False
     val s2Stage1 = RegNext(s1bStage1)
     val s2Ctx    = RegNext(s1bCtx)
     val s2Src1   = RegNext(s1bSrc1)        // merge source preserved to S3
@@ -741,10 +758,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val s2BfN    = RegNext(s1bBfN)
     val s2BfZ    = RegNext(s1bBfZ)
 
-    // SLOW path stage 2 (S2): bit-extract + mux on the registered midpoint. Register
-    // the finished result/flags into S3 (arch latency-3).
+    // SLOW S2: bit-extract + mux on the registered midpoint. Register the finished
+    // result/flags into final stage S3.
     val s2Rsp    = Shifter.stage2(s2Stage1)
-    s3Valid     := RegNext(s2Valid) init False
+    s3Valid     := RegNext(s2Valid && !flushPort) init False
     val s3Ctx    = RegNext(s2Ctx)
     val s3Src1   = RegNext(s2Src1)
     val s3ShiftRes  = RegNext(s2Rsp.result)
@@ -754,6 +771,8 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val s3BfNzvc    = RegNext(s2BfN ## s2BfZ ## False ## False)   // {N,Z,V=0,C=0}
     val u3 = s3Ctx.uop
     val s3IsBitfield = u3.op === DecOp.BITFIELD
+    val slowFire = s3Valid && !flushPort
+    s2Valid.simPublic(); s3Valid.simPublic(); slowFire.simPublic()
 
     // ── S3: SHIFT int writeback — the shift dst is Dr = src1, so the .B/.W upper-
     // preserve merge applies exactly as for a fast op (merge against s3Src1). ──
@@ -762,19 +781,19 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
       Size.WORD -> (s3Src1(31 downto 16) ## s3ShiftRes(15 downto 0)),
       Size.LONG -> s3ShiftRes)
     // BITFIELD writes the FULL 32-bit result (no .B/.W merge); the shifter takes the
-    // size-merge. The slow path completes ONE op per cycle (single-outstanding), so a
-    // simple op-class mux is correct.
+    // size-merge. The slow path completes at most one op per cycle, so a simple
+    // op-class mux is correct.
     val slowResult = Mux(s3IsBitfield, s3BfRes, slowMerged)
     val slowNzvc   = Mux(s3IsBitfield, s3BfNzvc, s3ShiftNzvc)
     val slowX      = s3ShiftX   // BITFIELD leaves X untouched (writesX=False)
 
-    // ---- S3: SLOW writeback (latency-3). These drive the SAME physical PRF write
-    // ports as the fast S1 writeback above (merged by `wbKey`); the single-outstanding
-    // `issuePort.ready` stall makes `fastFire` and `s3Valid` mutually exclusive, and
-    // the fast requests carry the higher merge priority as a defensive tie-break. ----
-    intWs.valid   := s3Valid && u3.pdstValid;  intWs.address  := u3.pdst;     intWs.data  := slowResult
-    nzvcWs.valid  := s3Valid && u3.writesNzvc; nzvcWs.address := u3.pNzvcDst;  nzvcWs.data := slowNzvc
-    xWs.valid     := s3Valid && u3.writesX;    xWs.address    := u3.pXDst;     xWs.data    := B(slowX)
+    // ---- S3: SLOW writeback. These drive the SAME physical PRF write
+    // ports as the fast S1 writeback above (merged by `wbKey`); the S3 reservation
+    // makes `fastFire` and `s3Valid` mutually exclusive, and the fast requests carry
+    // the higher merge priority as a defensive tie-break. ----
+    intWs.valid   := slowFire && u3.pdstValid;  intWs.address  := u3.pdst;     intWs.data  := slowResult
+    nzvcWs.valid  := slowFire && u3.writesNzvc; nzvcWs.address := u3.pNzvcDst;  nzvcWs.data := slowNzvc
+    xWs.valid     := slowFire && u3.writesX;    xWs.address    := u3.pXDst;     xWs.data    := B(slowX)
     // ---- S3: SLOW bypass (forwards to a dependent reading the cycle S3 commits) ----
     intByps.valid  := intWs.valid;  intByps.address  := intWs.address;  intByps.data  := intWs.data
     nzvcByps.valid := nzvcWs.valid; nzvcByps.address := nzvcWs.address; nzvcByps.data := nzvcWs.data
@@ -783,7 +802,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // ---- SLOW dynamic-completion wakeup (mirror LsEu/DivEu): broadcast the shift's
     // int + NZVC + X dsts the cycle the result lands in the PRF (S3). The IQ holds a
     // dependent of the shift (int OR flag source) until this fires (aluSlowWait). ----
-    slowWakeupPort.valid            := s3Valid
+    slowWakeupPort.valid            := slowFire
     slowWakeupPort.payload.pdst     := u3.pdst
     slowWakeupPort.payload.pdstValid:= u3.pdstValid
     slowWakeupPort.payload.pNzvcDst := u3.pNzvcDst
@@ -792,29 +811,30 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     slowWakeupPort.payload.xValid   := u3.writesX
 
     // ---- completion: fast (S1) OR slow (S3) — single port, never both same cycle
-    // (the single-outstanding stall guarantees S1-fast and S3-slow never coincide). ----
-    completionPort.valid   := fastFire || s3Valid
-    completionPort.payload  := Mux(s3Valid, s3Ctx.robId, s1Ctx.robId)
+    // (the S3 reservation guarantees S1-fast and S3-slow never coincide). ----
+    completionPort.valid   := fastFire || slowFire
+    completionPort.payload  := Mux(slowFire, s3Ctx.robId, s1Ctx.robId)
 
     // ---- sim-only whitebox writeback observation (NaxRiscv-style) ----
     // Per-instruction value+flags+masks keyed by robId; the lock-step harness joins
     // this with the ROB commit-obs to reconstruct the architectural CommitObservation
     // stream. Registered (sim-only) so the harness reading wbObs in onSamplings gets
     // stable one-cycle pulses. A FAST op publishes from S1 (one extra reg => same cycle
-    // as its completion's downstream consumers expect); a SLOW op publishes from S2.
-    // The two never fire in the same source cycle (single-outstanding), so a single
+    // as its completion's downstream consumers expect); a SLOW op publishes from S3.
+    // The two never fire in the same source cycle (S3 reservation), so a single
     // muxed record per cycle is correct.
-    val obsValidS  = Mux(s3Valid, True, fastFire)
-    val obsRobId   = Mux(s3Valid, s3Ctx.robId, s1Ctx.robId)
-    val obsDstArch = Mux(s3Valid, u3.dstArch, u1.dstArch)
-    val obsResult  = Mux(s3Valid, slowResult, mergedResult)
-    val obsIntW    = Mux(s3Valid, u3.pdstValid, u1.pdstValid)
-    val obsNzvc    = Mux(s3Valid, slowNzvc, finalNzvc)
-    val obsNzvcW   = Mux(s3Valid, u3.writesNzvc, u1.writesNzvc)
-    val obsX       = Mux(s3Valid, slowX, finalX)
-    val obsXW      = Mux(s3Valid, u3.writesX, u1.writesX)
+    val obsValidS  = fastFire || slowFire
+    val obsRobId   = Mux(slowFire, s3Ctx.robId, s1Ctx.robId)
+    val obsDstArch = Mux(slowFire, u3.dstArch, u1.dstArch)
+    val obsResult  = Mux(slowFire, slowResult, mergedResult)
+    val obsIntW    = Mux(slowFire, u3.pdstValid, u1.pdstValid)
+    val obsNzvc    = Mux(slowFire, slowNzvc, finalNzvc)
+    val obsNzvcW   = Mux(slowFire, u3.writesNzvc, u1.writesNzvc)
+    val obsX       = Mux(slowFire, slowX, finalX)
+    val obsXW      = Mux(slowFire, u3.writesX, u1.writesX)
     val wbObs = WbObs()
-    wbObs.valid     := RegNext(obsValidS) init False
+    val wbObsValid = RegNext(obsValidS) init False
+    wbObs.valid     := wbObsValid && !flushPort
     wbObs.robId     := RegNext(obsRobId)
     wbObs.dstArch   := RegNext(obsDstArch)
     wbObs.result    := RegNext(obsResult)
@@ -826,11 +846,11 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // Generic ALU crack-drop marker: divIsRem is set ONLY on the CPLX DIVREM µop
     // (never a real ALU op), so the LINK/UNLK A7-fold ALU µops reuse it to DROP their
     // commit record (their A7 write still folds into the running architectural A7).
-    wbObs.divRem    := RegNext(Mux(s3Valid, u3.divIsRem, u1.divIsRem)) init False
+    wbObs.divRem    := RegNext(Mux(slowFire, u3.divIsRem, u1.divIsRem)) init False
     // Keep the macro-commit marker through (the mem-dest MOVE-from-CCR/SR op µop -> T1
     // sets keepCommit so the whitebox keeps it as the instruction's single oracle step;
     // its trailing store is an rmwStore drop). fromCcr/fromSr are fast-path only.
-    wbObs.keepCommit := RegNext(Mux(s3Valid, u3.keepCommit, u1.keepCommit)) init False
+    wbObs.keepCommit := RegNext(Mux(slowFire, u3.keepCommit, u1.keepCommit)) init False
     wbObs.simPublic()
 
     // ---- REAL-TIME completion (task #176 fix) ----
@@ -857,8 +877,8 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     ccrObs.nzvcWrite  := obsNzvcW
     ccrObs.x          := obsX
     ccrObs.xWrite     := obsXW
-    ccrObs.divRem     := Mux(s3Valid, u3.divIsRem, u1.divIsRem)
-    ccrObs.keepCommit := Mux(s3Valid, u3.keepCommit, u1.keepCommit)
+    ccrObs.divRem     := Mux(slowFire, u3.divIsRem, u1.divIsRem)
+    ccrObs.keepCommit := Mux(slowFire, u3.keepCommit, u1.keepCommit)
     ccrObs.simPublic()
   }
 }

@@ -68,6 +68,7 @@ class IssueQueueSpec extends AnyFunSuite {
   def idle(dut: Dut): Unit = {
     val s = dut.source.logic
     s.pushValid #= false; s.slot1Valid #= false; s.flush #= false
+    s.aluFastAccept0 #= true; s.aluFastAccept1 #= true
     for (slot <- Seq(s.s0, s.s1)) {
       slot.robId #= 0
       slot.cluster #= m68k040.isa.Cluster.INT; slot.memOp #= m68k040.isa.MemOp.NONE
