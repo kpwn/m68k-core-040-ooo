@@ -29,7 +29,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
   private val setBits      = geo.indexBits
   private val wayBits      = log2Up(ways)
 
-  val axiCfg = Axi4Config(addressWidth = 32, dataWidth = 256, idWidth = 2)
+  // idWidth widened 2 -> 4 (ratified slice V2a.1): socket-conformant (AXI_IW = 4)
+  // and, more immediately, the I side needs two DISTINCT ids the moment slice I3's
+  // prefetch MSHR can be outstanding alongside the demand MSHR. See AxiIds.
+  val axiCfg = Axi4Config(addressWidth = 32, dataWidth = 256, idWidth = AxiIds.ID_W)
 
   // ---- logic Area (built during build phase) ----
   val logic = during build new Area {
@@ -115,6 +118,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // 160) so a future width change can't silently desync this packing from the real size.
     val PRED_BITS_PER_WORD = ChunkPredecode().getBitsWidth
     val PRED_BITS_PER_LINE = PRED_BITS_PER_WORD * 32
+    // Slice I2 (per-beat predecode): one AXI beat is 32 bytes = 16 words of a 32-word
+    // line, so the single classify group is 16 wide and is used TWICE per refill.
+    val WORDS_PER_BEAT     = 16
+    val PRED_BITS_PER_BEAT = PRED_BITS_PER_WORD * WORDS_PER_BEAT
     val predMem = Seq.fill(ways)(Mem(Bits(PRED_BITS_PER_LINE bits), sets))
     // Data: synchronous-read BRAM. 2 beats x 64 sets = 128 entries per way.
     val dataMem = Seq.fill(ways)(Mem(Bits(256 bits), sets * beatsPerLine))
@@ -210,6 +217,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // from this register, entirely bypassing the (for that case, never-written) predMem
     // array.
     val missPred = Reg(Bits(PRED_BITS_PER_LINE bits))
+    // Slice I2: the low beat's predecode result, produced on PREDECODE's commitBeat==0
+    // cycle and held for one cycle so commitBeat==1 can assemble the whole-line packed
+    // value from {this, the high beat's freshly-classified result}. See PREDECODE.
+    val predAccumLo = Reg(Bits(PRED_BITS_PER_BEAT bits))
 
     // ---- shared data-array read port (synchronous; BRAM) ----
     // Address+enable are driven by the FSM (IDLE hit accept, or REPLAY). The
@@ -263,6 +274,67 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // Each window-chunk is 4*PRED_BITS_PER_WORD bits (was the hardcoded 16 = 4*4 when
     // ChunkPredecode was 4 bits); each of the 4 per-window entries is PRED_BITS_PER_WORD
     // bits (was the hardcoded 4).
+    /** Slice I2 (MSHR design doc §6.4, option I-b) — classify the 16 words of ONE beat.
+      *
+      * WAS: a single 32-way unrolled group inside PREDECODE, i.e. 32 independent
+      * instances of a ~860-line combinational decode tree (order 860 EA-length
+      * decoders and 160 3-bit adders) elaborated once and fired once per refill. That
+      * block is the largest single suspected LUT driver in the front end (§1.5,
+      * §11.Q8) and it is also the structural obstacle to I-side MSHRs, because it
+      * needs the WHOLE line present in one cycle.
+      *
+      * NOW: ONE 16-instance group, elaborated once and USED TWICE — on PREDECODE's
+      * commitBeat==0 cycle for the low beat and on its commitBeat==1 cycle for the
+      * high beat. PREDECODE already dwelt exactly 2 cycles (the single-write-port
+      * dataMem commit, see below), so this is a **2x instance cut at exactly today's
+      * latency** — no extra cycle anywhere.
+      *
+      * DEVIATION FROM THE PLAN, RECORDED DELIBERATELY: the ratified plan's I2 section
+      * computes a 4x cut (32 -> 8) and a ~-190-flop `lineReg` deletion. Both of those
+      * numbers assume slice V2b (narrow the I-cache AXI master 256 -> 128 bits, so a
+      * beat is 8 words and a line is 4 beats) has landed first. V2b is socket-
+      * conformance work and is OUT OF SCOPE for the IPC-push initiative this landed
+      * under, so the recomputed figures for today's 256-bit / 2-beat geometry are:
+      * **32 -> 16 instances (2x, the design doc's original I-b number)** and `lineReg`
+      * RETAINED. `lineReg` cannot be deleted at 2 beats/line: the icache-burst-fault
+      * fix requires the dataMem commit to be DEFERRED until the whole burst's pass/fail
+      * is known, so both beats must still be held somewhere, and it doubles as the
+      * INHIBITED direct-delivery source (`missDataBeat`). The only added state is
+      * `predAccumLo` (one beat's worth of predecode, held one cycle).
+      *
+      * `beat`      : the beat being classified (a half of `lineReg`).
+      * `nextLo`    : the NEXT beat's low 3 words, supplying the lookahead for this
+      *               beat's last 3 words.
+      * `nextValid` : whether `nextLo` is real data. False for the LAST beat of a line,
+      *               where the lookahead genuinely runs past the line end — the same
+      *               `extWValid = false` boundary discipline the whole-line predecode
+      *               already used (the F5 fix), which makes `classify` reject as
+      *               COMPLEX rather than guess brief-vs-full, or take the documented
+      *               assume-brief extW3 fallback. `ambiguousLine` then marks it and
+      *               `Aligner.scala:63-65` re-classifies live from the instruction
+      *               buffer's own already-fetched words.
+      *
+      * *** ZERO NEW AMBIGUITY. *** Exhaustively checked in
+      * `PerBeatPredecodeEquivSpec`: for every one of the 32 absolute word positions,
+      * this scheme presents `classify` the SAME three lookahead WORDS and the SAME
+      * three validity FLAGS the whole-line scheme did. Only the final 3 words of the
+      * line see `valid = false`, which is exactly the case that already existed. */
+    def classifyBeat(beat: Bits, nextLo: Bits, nextValid: Bool): Bits = {
+      val w  = beat.subdivideIn(16 bits)      // WORDS_PER_BEAT words, index 0 = lowest addr
+      val nx = nextLo.subdivideIn(16 bits)    // 3 words of the next beat
+      def word(i: Int): Bits =
+        if (i < WORDS_PER_BEAT) w(i) else Mux(nextValid, nx(i - WORDS_PER_BEAT), B(0, 16 bits))
+      def wordValid(i: Int): Bool =
+        if (i < WORDS_PER_BEAT) True else nextValid
+      Vec((0 until WORDS_PER_BEAT).map { i =>
+        PredecodeWord.classify(
+          w(i), word(i + 1), word(i + 2), word(i + 3),
+          extWValid  = wordValid(i + 1),
+          extW2Valid = wordValid(i + 2),
+          extW3Valid = wordValid(i + 3))
+      }).asBits
+    }
+
     def windowPred(entry: Bits, pc: UInt): Vec[ChunkPredecode] = {
       val win  = entry.subdivideIn(4 * PRED_BITS_PER_WORD bits)(pc(5 downto 3))
       val nibs = win.subdivideIn(PRED_BITS_PER_WORD bits)
@@ -470,7 +542,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
         when(!arSent) {
           axi.ar.valid         := True
           axi.ar.payload.addr  := lineBase
-          axi.ar.payload.id    := U(0, 2 bits)
+          axi.ar.payload.id    := U(AxiIds.I_DEMAND, AxiIds.ID_W bits)
           axi.ar.payload.len   := U(1, 8 bits)
           axi.ar.payload.size  := U(5, 3 bits)
           axi.ar.payload.burst := Axi4.burst.INCR
@@ -532,7 +604,6 @@ class IcachePlugin extends FiberPlugin with FetchService {
           beatCnt := beatCnt + 1
           when(axi.r.payload.last) {
             when(missBusFault || respErr) { goto(FAULT) } otherwise {
-              dbgAllocCommitPending := missCacheable   // DEBUG only (see its declaration)
               goto(PREDECODE)
             }
           }
@@ -560,7 +631,34 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // ----- PREDECODE: classify line, write predMem + tag/valid -----
       PREDECODE.whenIsActive {
         activePc := missPC
-        val words  = lineReg.subdivideIn(16 bits)
+        // ── Slice I2: ONE 16-instance classify group, used on BOTH of PREDECODE's
+        // two cycles (commitBeat 0 = low beat, commitBeat 1 = high beat). See
+        // `classifyBeat` above for the full rationale and the equivalence argument.
+        //
+        // The lookahead for the LOW beat's last 3 words (line words 13/14/15 need
+        // 16/17/18) is taken straight out of `lineReg`'s high half, which is already
+        // resident this cycle — so the beat-lag the design doc describes is not even
+        // needed here; the whole line is in a register by the time PREDECODE runs.
+        // For the HIGH beat the lookahead runs past the line end, which is the
+        // pre-existing `extWValid = false` boundary case.
+        val isLoBeat  = commitBeat === U(0, 1 bits)
+        val beatSrc   = Mux(isLoBeat, lineReg(255 downto 0), lineReg(511 downto 256))
+        val beatNext3 = Mux(isLoBeat, lineReg(303 downto 256), B(0, 48 bits))
+        val beatPred  = classifyBeat(beatSrc, beatNext3, isLoBeat)
+        // Whole-line packed value, meaningful only on commitBeat==1 (the low half is
+        // the previous cycle's registered result, the high half is live).
+        val packed = Bits(PRED_BITS_PER_LINE bits)
+        packed(PRED_BITS_PER_BEAT - 1 downto 0)                    := predAccumLo
+        packed(PRED_BITS_PER_LINE - 1 downto PRED_BITS_PER_BEAT)   := beatPred
+        when(isLoBeat) {
+          predAccumLo := beatPred
+          // DEBUG only: the cycle immediately BEFORE the allocation write (which slice
+          // I2 moved to commitBeat==1). Previously this was REFILL's final beat, which
+          // was the cycle before the then-commitBeat==0 write. Its one consumer, the
+          // IcacheSpec invalidate-race test, self-checks the pairing by re-reading
+          // `dbgAllocCommitCycle` on the next sampling point.
+          dbgAllocCommitPending := missCacheable
+        }
         // Per-word predecode. A full-format indexed EA's length depends on its EXTENSION
         // word: at op+1 (an EA-first op) or op+2 (a line-0 immediate / static bit-op, whose
         // EA ext follows a 1-word imm/bit word). Pass words(i+1) + words(i+2) (0 past the
@@ -591,16 +689,14 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // `classify` itself. Same F5 boundary discipline: unavailable (line-end) -> `classify`
         // falls back to its pre-existing "assume brief" framing for this specific shape (NOT
         // the F5 reject-as-COMPLEX doctrine — see `classify`'s extW3 comment for why).
-        val nWords = words.length
-        val chunks = Vec((0 until nWords).map(i =>
-          PredecodeWord.classify(words(i),
-            if (i + 1 < nWords) words(i + 1) else B(0, 16 bits),
-            if (i + 2 < nWords) words(i + 2) else B(0, 16 bits),
-            if (i + 3 < nWords) words(i + 3) else B(0, 16 bits),
-            extWValid  = i + 1 < nWords,
-            extW2Valid = i + 2 < nWords,
-            extW3Valid = i + 3 < nWords)))
-        val packed = chunks.asBits
+        //
+        // SLICE I2 NOTE: the 32-way unroll this paragraph describes is GONE; the same
+        // per-word contract is now delivered by two firings of the single 16-instance
+        // `classifyBeat` group above, which presents provably identical lookahead words
+        // and validity flags for all 32 word positions (`PerBeatPredecodeEquivSpec`).
+        // Everything the paragraph says about WHY those flags are what they are still
+        // holds verbatim — only the number of physical instances changed.
+        //
         // Task (I-side cacheMode wiring, mirrors DcachePlugin task P1.4): an
         // INHIBITED-mode fetch never allocates a line — no tag/valid write, no
         // victim-pointer advance (this way is not consumed; the same victim way is
@@ -617,7 +713,14 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // the (for that case, never-written) predMem array — see the S1->rsp bypass
         // mux (`s1FromMiss`) above and REPLAY below.
         val doAllocate = missCacheable
-        missPred := packed
+        // Slice I2: `packed` is only whole-line-complete on commitBeat==1 (its low half
+        // is `predAccumLo`, registered on commitBeat==0). So the predMem/tag/valid
+        // allocation write and the `missPred` bypass latch BOTH move from commitBeat==0
+        // to commitBeat==1. Nothing downstream shifts: REPLAY is entered the cycle AFTER
+        // commitBeat==1 either way, so its `predMem.readAsync` and its `missPred` read
+        // still both see the finished value, and the fetch's response latency is
+        // byte-identical to before (IcacheSpec's exact-cycle assertions are the gate).
+        when(commitBeat === U(1, 1 bits)) { missPred := packed }
         // Task icache-burst-fault-fix: dataMem's commit is deferred from REFILL to
         // here (see the REFILL comment above) — reached only when the FULL 2-beat
         // burst was confirmed OKAY, using `lineReg` (the safe, register-backed
@@ -635,8 +738,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // register, avoids the hazard entirely — mirrors REFILL's own original
         // single-write-port-per-beat discipline). predMem/tagMem/valids/victim are
         // unaffected by this — they were already single-call-site/single-cycle and
-        // only fire once, gated below by `commitBeat === 0`.
-        when(commitBeat === U(0, 1 bits)) {
+        // only fire once, gated below by `commitBeat === 1` (slice I2 moved it from 0
+        // to 1 — see the `missPred` comment above; the dataMem beat commit below still
+        // runs on BOTH cycles, one beat each, which is the whole reason for the dwell).
+        when(commitBeat === U(1, 1 bits)) {
           dbgAllocCommitCycle := doAllocate
           for (w <- 0 until ways) {
             when(victimWay === U(w, wayBits bits)) {
