@@ -924,7 +924,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         when(!evictAwDone && !storeWantsAxi && !maintAxiPairOpen) {
           axi.aw.valid         := True
           axi.aw.payload.addr  := evictAddr
-          axi.aw.payload.id    := U(2, 4 bits)
+          axi.aw.payload.id    := U(AxiIds.D_PUSH, AxiIds.ID_W bits)
           axi.aw.payload.len   := U(0, 8 bits)
           axi.aw.payload.size  := U(4, 3 bits)
           axi.aw.payload.burst := Axi4.burst.INCR
@@ -938,7 +938,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           when(axi.w.ready) { evictWDone := True }
         }
         when(evictAwDone && evictWDone) {
-          when(axi.b.valid && axi.b.payload.id === U(2, 4 bits)) {
+          when(axi.b.valid && axi.b.payload.id === U(AxiIds.D_PUSH, AxiIds.ID_W bits)) {
             when(axi.b.payload.resp =/= Axi4.resp.OKAY) {
               diagFaultPulse     := True
               diagFaultPulseAddr := evictAddr
@@ -967,7 +967,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         when(!arSent) {
           axi.ar.valid         := True
           axi.ar.payload.addr  := lineBase
-          axi.ar.payload.id    := U(0, 4 bits)
+          axi.ar.payload.id    := U(AxiIds.dRefill(0), AxiIds.ID_W bits)
           axi.ar.payload.len   := U(0, 8 bits)
           axi.ar.payload.size  := U(4, 3 bits)  // 16 bytes
           axi.ar.payload.burst := Axi4.burst.INCR
@@ -1379,7 +1379,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           when(!maintAwDone && axiFree) {
             axi.aw.valid         := True
             axi.aw.payload.addr  := wbAddrReg
-            axi.aw.payload.id    := U(4, 4 bits)
+            axi.aw.payload.id    := U(AxiIds.D_EVICT, AxiIds.ID_W bits)
             axi.aw.payload.len   := U(0, 8 bits)
             axi.aw.payload.size  := U(4, 3 bits)
             axi.aw.payload.burst := Axi4.burst.INCR
@@ -1396,7 +1396,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
             // Demux the B by OUR OWN id (=== 4, fail-closed -- same reasoning as
             // `storeBAck`'s `=== 1` comment below): ignore anything else and keep
             // waiting. `axi.b.ready` is held True globally.
-            when(axi.b.valid && axi.b.payload.id === U(4, 4 bits)) {
+            when(axi.b.valid && axi.b.payload.id === U(AxiIds.D_EVICT, AxiIds.ID_W bits)) {
               when(axi.b.payload.resp =/= Axi4.resp.OKAY) {
                 // Imprecise DIAGNOSTIC only, per the design's locked decision that a
                 // writeback error is a diagnostic crash and not an architectural trap.
@@ -1597,7 +1597,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     when(!stAwDone) {
       axi.aw.valid         := True
       axi.aw.payload.addr  := stAddrReg
-      axi.aw.payload.id    := U(1, 4 bits)
+      axi.aw.payload.id    := U(AxiIds.D_STORE, AxiIds.ID_W bits)
       axi.aw.payload.len   := U(0, 8 bits)
       axi.aw.payload.size  := U(4, 3 bits)
       axi.aw.payload.burst := Axi4.burst.INCR
@@ -1642,7 +1642,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // class this whole fix exists to close). `=== 1` instead makes an
     // unrecognized id simply not ack anything — a hung drain, which is loud
     // and debuggable, instead of a silent spurious ack.
-    val storeBAck = axi.b.valid && axi.b.ready && (axi.b.payload.id === U(1, 4 bits))
+    val storeBAck = axi.b.valid && axi.b.ready && (axi.b.payload.id === U(AxiIds.D_STORE, AxiIds.ID_W bits))
     storeErrReg := storeBAck && (axi.b.payload.resp =/= Axi4.resp.OKAY)
     storeAckReg := storeBAck || cbHitAckReg || storeAllocAckReg
 
