@@ -88,4 +88,33 @@ census_probe btb_all      "*BtbPlugin_logic_mem_reg*"    $prefix
 # (d) the Aligner preds(L0) -> slot1Ok -> io_shift family flagged in spec §5.3
 census_probe aligner_ibuf "*InstructionBuffer*"          $prefix
 census_probe fetchalign   "*FetchAlignPlugin*"           $prefix
+
+# -- LS-corridor probes (2026-08-09 LS EU late-split design, spec 6.3) --
+# These answer G-L1..G-L4 for the RESOLVE->LAUNCH split. Read-only; safe to re-run.
+census_probe ls_s1ctx    "*LsEuPlugin_logic_s1Ctx*"       $prefix
+census_probe ls_comp     "*LsEuPlugin_logic_comp*"        $prefix
+census_probe ls_llreg    "*LsEuPlugin_logic_llReg*"       $prefix
+census_probe ls_sq       "*LsEuPlugin_logic_sq*"          $prefix
+census_probe ls_busy     "*LsEuPlugin_logic_busy*"        $prefix
+census_probe iq_sel3     "*selPorts_3*"                   $prefix
+census_probe dc_tagmem   "*DcachePlugin_logic_tagMem*"    $prefix
+
+# ---- 4) G-L1: do any failing paths END at these cells? (-to, not -through) ----
+proc census_endpoint_probe {label pat} {
+  set cells [get_cells -quiet -hierarchical -filter "NAME =~ $pat"]
+  if {[llength $cells] == 0} { puts "CENSUS_ENDPOINT $label CELLS 0"; return }
+  set pp [get_timing_paths -quiet -setup -max_paths 5000 -nworst 1 \
+                           -slack_lesser_than 0 -to $cells]
+  puts "CENSUS_ENDPOINT $label CELLS [llength $cells] FAILING_ENDPOINTS [llength $pp]"
+}
+census_endpoint_probe ls_busy    "*LsEuPlugin_logic_busy*"
+census_endpoint_probe ls_s1valid "*LsEuPlugin_logic_s1Valid*"
+census_endpoint_probe ls_compv   "*LsEuPlugin_logic_compValid*"
+census_endpoint_probe iq_sel3    "*selPorts_3*"
+
+# ---- 5) G-L3: pblock occupancy headroom (pb_dcache holds every LsEuPlugin_logic* cell) ----
+catch { report_utilization -pblocks [get_pblocks] -file ${prefix}_pblock_util.rpt }
+foreach pb [get_pblocks -quiet] {
+  puts "CENSUS_PBLOCK $pb CELLS [llength [get_cells -quiet -of_objects $pb]]"
+}
 puts "########### CENSUS COMPLETE ###########"
