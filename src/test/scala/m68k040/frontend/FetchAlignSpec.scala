@@ -46,7 +46,11 @@ class FetchAlignSpec extends AnyFunSuite {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val base = 0x7000L
-      IcacheSim.attachMemoryWithWords(dut.ic.logic.axi, cd, base, Seq(0x7000,0xF000,0x7001,0x7002,0x7003,0x7004)) // MOVEQ, then a line-F coprocessor opword (still COMPLEX/unframed; 0x48E7 used to stand in here but is now a real MOVEM.L <list>,-(A7))
+      // 0x4810 is NBCD (A0): a one-word instruction deliberately deferred to the
+      // complex path.  Keep the fixture tied to that partition rather than line-F,
+      // whose emulator-trap form is now a framed SIMPLE instruction.
+      IcacheSim.attachMemoryWithWords(dut.ic.logic.axi, cd, base,
+        Seq(0x7000,0x4810,0x7001,0x7002,0x7003,0x7004))
       dut.probe.logic.feedOut.ready #= false; dut.fa.logic.resume.valid #= false; dut.fa.logic.redirect.valid #= false
       cd.waitSampling(2)
       redirect(dut, cd, base)
@@ -54,14 +58,20 @@ class FetchAlignSpec extends AnyFunSuite {
       var sawComplex = false; var guard = 0
       while (!sawComplex && guard < 80) {
         cd.waitSampling(); guard += 1
-        if (dut.probe.logic.feedOut.valid.toBoolean && dut.probe.logic.feedOut.payload(0).complex.toBoolean) {
-          assert(dut.probe.logic.feedOut.payload(0).pc.toLong == base + 2, s"complex pc=${dut.probe.logic.feedOut.payload(0).pc.toLong.toHexString}")
-          sawComplex = true
+        if (dut.probe.logic.feedOut.valid.toBoolean) {
+          assert(!(dut.probe.logic.s1v.toBoolean &&
+            dut.probe.logic.feedOut.payload(1).pc.toLong == base + 2),
+            "NBCD (A0) fixture escaped as a simple slot-1 instruction")
+          if (dut.probe.logic.feedOut.payload(0).pc.toLong == base + 2) {
+            assert(dut.probe.logic.feedOut.payload(0).complex.toBoolean,
+              "NBCD (A0) fixture must remain deferred to the complex path")
+            sawComplex = true
+          }
         }
       }
       assert(sawComplex, "expected a complex packet at base+2")
       cd.waitSampling(3)
-      // resume past the 1-word MULU -> next pc = base+4
+      // Resume past the one-word NBCD (A0) -> next pc = base+4.
       dut.fa.logic.resume.valid #= true; dut.fa.logic.resume.payload #= base + 4
       cd.waitSampling(); dut.fa.logic.resume.valid #= false
       cd.waitSamplingWhere(dut.probe.logic.feedOut.valid.toBoolean)
