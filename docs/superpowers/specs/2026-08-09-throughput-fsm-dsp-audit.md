@@ -1,15 +1,19 @@
 # Throughput audit: one-at-a-time controllers, DSP pipelines, and Markdown reconciliation
 
-**Status:** REVIEW COMPLETE; the aligned LSU/VIPT, slow-ALU, MOVEM arithmetic,
-fetch-ring turnover, and fixed-latency CPLX MUL recommendations have landed and
-passed their simulation gates.  Their shared post-route FMax/area acceptance is
-still pending.  This document records findings and priorities; it does not amend
-the fixed architecture by itself. Any item marked "spec update required" must be
+**Status:** REVIEW COMPLETE; the aligned LSU/VIPT, tagged changed-VPN DTLB,
+slow-ALU, MOVEM arithmetic, fetch-ring turnover, COPYBACK store-drain, fixed-
+latency CPLX MUL, and registered-token FTB recommendations have landed and
+passed their simulation gates. The broad pre-FTB/pre-deep-MUL physical
+checkpoint reached 173.430 MHz with healthy device-wide area but an overfull
+D-cache pblock. Final shared post-route FMax/area/floorplan acceptance is still
+pending. This document records findings and priorities; it does not amend the
+fixed architecture by itself. Any item marked "spec update required" must be
 reconciled in the owning architecture document before RTL is changed.
 
-**Scope:** repository-wide inventory of the 212 Markdown files visible with
-hidden progress ledgers included (96 specifications, 80 plans, 30 SDD progress
-files, and 6 other files), followed by RTL and routed-report checks for every
+**Scope:** repository-wide inventory, refreshed after the landed phases, of the
+218 Markdown files visible with hidden progress ledgers included (100
+specifications, 81 plans, 30 SDD progress files, and 7 other files), followed by
+RTL and routed-report checks for every
 controller relevant to steady-state issue, memory, cache, translation, DSP, and
 debug throughput. The tables below supersede the older 14-block throughput
 inventory in `.superpowers/sdd/progress-ipc-push-2026-08-09.md`, which did not
@@ -23,43 +27,43 @@ P1/P2/P3/P4 stages, a four-entry ordered aligned-load descriptor ring, and a
 four-entry tokenized VIPT-result queue. A directed eight-load burst proves
 consecutive issue, DTLB/VIPT launch, descriptor enqueue, D-cache command, and
 completion, with P2/P3/P4 occupied concurrently. Same-page warm L1D loads are
-therefore genuinely II=1.
+therefore genuinely II=1. The tagged DTLB result contract subsequently extended
+that proof to alternating resident VPNs with a fixed command-to-response offset
+of one cycle.
 
-VIPT is real and latency-hiding: `LsEuPlugin` launches the DTLB request and the
-virtual-set D-cache RAM probe from the same registered P2 token. The later
-resolved command supplies the physical tag and consumes the tokenized result;
-it does not repeat the RAM read on an early hit. A changed VPN can still insert a
-bubble because `DtlbPlugin`'s registered hit response is associated by the live
-VPN rather than a returned token. This is a DTLB response-contract limitation,
-not a failure to overlap TLB and cache lookup.
+VIPT is real and latency-hiding: `LsEuPlugin` launches the tagged DTLB command
+and virtual-set D-cache RAM probe from the same registered P2 token. The next-
+cycle translation response supplies the physical tag through
+`loadProbeResolve`, qualifies the original synchronous RAM read, and consumes
+the tokenized result; it does not repeat the RAM read on an early hit. The TLB
+remains one shallow 32-entry, four-way, two-bank structure with one walker—no
+CAM copy, hit-under-miss, or additional lookup bank was added.
 
-The remaining material one-at-a-time behavior is concentrated in four places:
+The remaining material one-at-a-time behavior is concentrated in three places:
 
-1. changed-VPN DTLB hits cannot turn over every cycle because the registered
-   response is associated with the live VPN rather than a returned token;
-2. the CPLX legacy lane retains serial CHK/CMP2 and one iterative divider context,
+1. the CPLX legacy lane retains serial CHK/CMP2 and one iterative divider context,
    even though fixed-latency MUL is now independent and II=1;
-3. the SQ producer waits for every store acknowledgement before presenting the
-   next store; and
-4. a D-cache demand miss owns the sole miss engine until replay, so hits cannot
-   pass it.
+2. a D-cache demand miss owns the sole miss engine until replay, so hits cannot
+   pass it; and
+3. an I-cache demand miss owns the single fetch fill/replay engine.
 
-The latter two affect store/miss-heavy workloads. The first is an all-hit-path
-edge when adjacent accesses change pages; the second primarily leaves DIV and
-the much colder bound-check operations serialized.
+The miss engines affect miss-heavy workloads. The legacy CPLX item primarily
+leaves DIV and the much colder bound-check operations serialized. COPYBACK-hit
+stores now run through an elastic S0–S3 pipe at II=1; precise, write-through,
+inhibited, and discovered-miss cases deliberately remain ordered barriers.
 
 ## 2. Hot and performance-relevant controllers
 
 | Priority | controller | current initiation behavior | classification | FPGA-friendly action | difficulty and main hazards |
 |---|---|---:|---|---|---|
 | landed | ALU slow path (`AluEuPlugin`) | six physical stages, now II=1 with consecutive issue/completion proof; fast ops reserve the shared S1/S3 write port exactly one cycle ahead | hot when shifts/bitfields occur; completed in simulation | retain the existing registers, stored IQ class bit, fail-safe forecast, flush poison, and precise immediate/memory X dependencies | routed area/FMax still required; mixed-loop residual belongs to the separately specified fetch-directed-BTB lever |
-| landed | aligned LS/L1D hit path (`LsEuPlugin`, `DcachePlugin`) | same-page resident load II=1; multiple operations in P2/P3/P4, descriptor ring, and VIPT-result queue | hottest memory path; hard, completed in simulation | retain pruned contexts, ordered untagged responses, accept-last turnover, and tokenized early results | precise fault order, store forwarding, flush poison, completion priority; routed area/FMax still required |
-| P1 | changed-VPN DTLB turnaround (`DtlbPlugin`) | same VPN II=1; back-to-back different VPNs require the registered result to settle | memory hot-path edge; moderate | return a decoupled/tagged hit result to an LS slot; keep one TLB and one walker | younger hit versus older walk ordering, U/M identity, faults, permissions, PFLUSHA, exception arbitration |
+| landed | aligned LS/L1D hit path (`LsEuPlugin`, `DcachePlugin`) | resident load II=1 across same or alternating VPNs; multiple operations in P2/P3/P4, descriptor ring, and VIPT-result queue | hottest memory path; hard, completed in simulation | retain pruned contexts, ordered untagged cache responses, accept-last turnover, and tokenized early results | precise fault order, store forwarding, flush poison, completion priority; routed area/FMax still required |
+| landed | changed-VPN DTLB turnaround (`DtlbPlugin`) | tagged command/result pipe is II=1 on resident hits, with one registered lookup cycle | memory hot-path edge; completed in simulation | retain one shallow TLB, one walker, ordered miss blocking, U/M credit reservation, and epoch/token cancellation | routed tag-result-to-D-cache resolve path remains a physical gate |
 | P1 | D-cache demand-miss engine (`DcachePlugin`) | one `IDLE/EVICT_WR/REFILL/REPLAY` context; no demand hit-under-demand-miss | miss path; moderate for one parked miss, hard for many | implement one parked MSHR plus hit-under-miss, with same-set/claimed-way exclusion and ordered completion; do not start with general multi-MSHR | untagged responses, dirty victim ordering, shared store RMW port, fault/flush association; the current SoC crossbar cannot exploit multiple simultaneous bus misses |
 | landed | fixed-latency CPLX MUL (`MulCore`, `DivEuPlugin`) | seven-stage datapath, II=1 integrated issue and completion; MUL remains live while DIV iterates | potentially hot; completed in simulation at the former latency | retain pruned descriptor pipe, reserved result credits, one existing completion port, pending MULHI tails, and ROB-keyed high halves | seven-stage DSP-register reshape and routed area/FMax acceptance remain |
 | P2 | legacy CPLX/divide lane (`DivEuPlugin`) | CHK/CMP2 about II=2; one DIV context about II=67; a parked second DIV can still block a younger MUL at the registered issue port | mostly cold/iterative; moderate | keep one divider; measure before adding a pending-DIV slot or IQ eligibility forecast; consider 32-step W/L32 iteration only if DIV matters | forecast must reserve the registered issue slot; global remainder/overflow association must be replaced before allowing multiple DIV families in flight |
-| P1/P2 | SQ-to-D-cache drain (`StoreQueue`, `DcachePlugin`) | producer holds one store until local cache ack or AXI B; split stores repeat serially | store-heavy hot path; moderate for copyback hits, hard for WT/MMIO | queue COPYBACK-hit drains first using send/ack pointers; keep SQ entries forwarding-visible until ack; later use one central 2–4-entry D-side write descriptor serializer | S1 read-port conflicts, WT error/B association, split phases, precise order, and proven AW/W cross-pair corruption if independent writers are loosened |
-| landed/P2 | L1I/frontend and demand fill (`IcachePlugin`, `FetchAlignPlugin`) | resident hit path is latency 3 / II=1 and its fetch ring now turns over at full occupancy; one demand/prefetch fill engine still closes demand fetch until replay | all-hit path completed in simulation; miss path remains moderate–hard | retain the staged TLB/cache path for FMax and the full-ring consume/replace credit; only if measured, add a tiny ordered fetch request/response queue around one demand MSHR | redirect first-use remains N+5 without fetch-directed prediction; `FetchRsp` is untagged, so miss bypass needs ordering or tags |
+| landed | SQ-to-D-cache drain (`StoreQueue`, `DcachePlugin`) | committed non-precise COPYBACK hits traverse elastic S0–S3 and acknowledge at II=1; send and ack cursors are independent | store-heavy hot path; completed in simulation | retain forwarding visibility through terminal ack, S3 same-line/victim bypass, and hard barriers for precise/WT/inhibited/miss traffic | S1 read-port fairness and StoreQueue↔D-cache ready corridor remain physical gates; never loosen independent AXI AW/W writers |
+| landed/P2 | L1I/frontend and demand fill (`IcachePlugin`, `FetchAlignPlugin`) | resident hit path is latency 3 / II=1, full-ring turnover hides it, and the registered-token FTB redirects predicted fetch before decode; one demand/prefetch fill engine still closes demand fetch until replay | all-hit path and prediction completed in simulation; miss path remains moderate–hard | retain the staged TLB/cache path, exact `{ringSlot,seq}` association, FTQ splice clamp, and decode-time fallback; only if measured, add a tiny ordered queue around one demand MSHR | `FetchRsp` is untagged, so miss bypass needs ordering or tags; FTB/floorplan physical acceptance remains open |
 
 ### 2.1 ALU evidence
 
@@ -88,14 +92,24 @@ conclusion and remains directionally correct.
 
 ### 2.3 Store-drain boundary
 
-The D-cache store datapath already has internal S0/S1/S2 storage, but the SQ
-producer is acknowledgement-gated. Declaring the cache store pipe "pipelined"
-therefore overstates system throughput. The first safe scope is COPYBACK hits,
-where acknowledgement is local and ordered. A dequeued entry must remain visible
-to load forwarding until its cache effect is acknowledged. WT, MMIO, eviction,
-and maintenance writes should converge on a central ordered descriptor/ack
-serializer rather than independently relaxing AW and W FSMs. The hazards in
-`2026-06-07-ls-store-drain-race-design.md` remain binding.
+The original D-cache store datapath had S0/S1/S2-looking registers but the SQ
+producer remained acknowledgement-gated and S1 could be overwritten under a
+read-port stall. The landed design changes the boundary to an honest Stream,
+adds a registered S3 result/write stage, and gives the SQ independent
+`sendPtr`/accepted-half and `head`/ack accounting. Committed non-precise
+COPYBACK hits can therefore occupy S0–S3 concurrently and acknowledge one per
+cycle after fill while every SQ entry remains forwarding-visible until its own
+terminal acknowledgement.
+
+This is intentionally not a general unordered store engine. Precise,
+write-through, inhibited, and split-sensitive commands are admission barriers;
+a COPYBACK miss discovered in S2 freezes younger descriptors until allocation
+completes. Same-line S3 forwarding, dirty-victim forwarding, refill/store
+interlocks, maintenance quiescence, and one central AXI AW/W serializer preserve
+ordering without adding another cache RAM port. The integrated test proves a
+dense warm burst, more than one accepted/unacknowledged half, same-line RMW,
+miss/WT/precise barriers, split ordering, flush survival of accepted committed
+work, and the forced-COPYBACK ported posture.
 
 ### 2.4 L1I/frontend latency coverage
 
@@ -114,8 +128,18 @@ also redirects a full ring and proves stale traffic is discarded and the target
 stream restarts in order.  Restoring the old `!ringFull` admission makes the test
 show repeated useful-feed bubbles.  The remaining clean-redirect cost is target
 command N+1 to first useful group N+5; collapsing T/S1 would rebuild a measured
-route-dominated TLB-to-cache cone, so fetch-directed prediction is the safer
+route-dominated TLB-to-cache cone, so fetch-directed prediction was the safer
 FPGA lever.
+
+That lever has now landed as a registered-token FTB plus a 32-entry FTQ. Each
+accepted fetch command launches FTB and gshare lookups tagged by exact
+`{ringSlot,seq}` identity; the C+1 result may steer the next fetch without a live
+PC-freshness comparison. The decode-time BTB/RAS path remains as fallback and
+confirmation authority. Exact `{pc,len,simple}` confirmation splices already-
+fetched target bytes without a flush; disagreement invalidates the entry and
+recovers precisely. Paired three-seed measurements improved the original
+seven-kernel aggregate by 19.757% ideal and 16.309% L2-faithful. Physical
+acceptance of the new FTB/FTQ storage and routing remains pending.
 
 ## 3. Controllers that should remain serial
 
@@ -125,7 +149,7 @@ FPGA lever.
 | divider core | one 64-step restoring register set; a fully pipelined or replicated divider is area-heavy | consider higher radix or a 32-step W/L32 mode, not a 64-stage pipe |
 | D-cache maintenance | cold, ROB/exception serialized, dependent on shared RAM and AXI ports | retime address/control if it limits FMax |
 | ITLB/DTLB page walkers | three dependent descriptor reads; I and D already have independent walkers | add a tiny upper-level walk cache if measured, not another walker |
-| deferred U/M drains | depth-four queues already hide the serialized commit-ordered drain | add real queue-full backpressure before considering more drain issue |
+| deferred U/M drains | depth-four queues reserve capacity before walker launch and hide the serialized commit-ordered drain | keep serial; full-turnover and flush/PFLUSHA poisoning are already directed-tested |
 | exception entry and RTE | cold and architecturally precise; partial frame/error ordering dominates | keep held Stream commands honest; do not parallelize frame words |
 | MOVEM expander | already emits up to two transfer µops/cycle, saturating normal width | remove arithmetic timing waste but retain macro sequencing |
 | microcode sequencer | rows are often T0/T1-dependent and macro boundaries must remain contiguous | only redesign after measured microcode occupancy, with namespaced temporaries |
@@ -143,11 +167,12 @@ DSP48E2 internal registers remains open.
 |---|---:|---:|---|---|
 | integer `MulCore` | 4 expected | 7 / 1 | integrated `DivEuPlugin` accepts and completes dense MUL at II=1, including while DIV is active | seven-stage reshape selected after physical mapping proved the four-cycle form left every MREG unused |
 | divider | 0 | about 66 / 67 | single iterative context | keep iterative unless a measured workload justifies a different algorithm |
-| MOVEM decode arithmetic | 2 before strength reduction | combinational | not a queue | shift/mux/negate replacement implemented and simulation-gated; synthesized DSP/FMax confirmation pending |
+| MOVEM decode arithmetic | 0 after strength reduction | combinational | not a queue | the 173.430-MHz checkpoint confirms the two accidental DSPs are gone; endpoint recovery remains part of the final route |
 | FPU | not implemented | draft only | draft is explicitly busy-gated/single-outstanding | amend before implementation: fixed-latency FADD/FMUL should be elastic II=1 |
 
-All six synthesized DSP48s are accounted for: four in the integer multiplier and
-two in MOVEM decode. There are no arithmetic blackboxes.
+All four DSP48s in the current physical checkpoint are accounted for by the
+integer multiplier. The two former MOVEM DSPs are gone. There are no arithmetic
+blackboxes.
 
 ### 4.1 Integer multiply reconciliation and landing
 
@@ -196,9 +221,10 @@ between `step` and `step << 1` for the running update. No latency or state was
 added. Directed decode covers every offset and both ±64 final deltas for all 16
 registers; 11/11 decode and 8/8 MOVEM lock-step tests pass. The phase-local
 `test-fast` result was 133/134 with only the stale `PredecodeRefSpec` line-B
-expectation; the combined branch passes 138/138 after the reference corrections.
-Confirmation that both DSPs disappear and the endpoint improves awaits the
-shared Vivado window.
+expectation; the current combined branch passes 145/145 after the exhaustive
+reference corrections. The physical checkpoint confirms total DSP use fell
+from six to four, so both decode multipliers disappeared. Whether the former
+MOVEM endpoint family is fully recovered remains a final-route question.
 
 ### 4.3 FPU draft
 
@@ -250,8 +276,8 @@ Current gate evidence for the LSU change:
 - focused LS suites: 24/24;
 - RTE regression: 1/1;
 - phase-local `test-fast`: 133/134 with only the independently reproduced stale
-  line-B oracle; combined-branch `test-fast`: 138/138 after the line-B and
-  subsequently exposed line-0 oracle corrections; and
+  line-B oracle; current combined-branch `test-fast`: 145/145 after the line-B,
+  line-0, and subsequently exposed full-opcode oracle corrections; and
 - seed-1 IPC: `load-stream` 638 cycles ideal and 769 L2-faithful, versus C3
   1829/2030. Excluding `load-stream`, aggregate cycles improve slightly rather
   than regress.
@@ -262,43 +288,46 @@ Current integrated MUL landing evidence:
 - the integrated test's legacy single-outstanding negative control fails on the
   second consecutive MUL request;
 - full-core synthesis-top elaboration passes; and
-- mandatory combined-branch `test-fast`: 138/138 across 144 suites.
+- mandatory combined-branch `test-fast`: 145/145 across 153 suites.
 
-Spinal also emits an initial elaboration failure for three undriven
-`InterruptControlPlugin` fixture registers (`iplIn`, `iackAvec`, `iackVector`),
-then restarts and the interrupt tests pass. That should be repaired as fixture
-debt; suppressing or ignoring it would make the gate less trustworthy.
+The gate also exposed and repaired undefined fixture inputs rather than
+tolerating them. Exception-entry, interrupt-entry, and RTE tests now attach the
+AXI responder before the first reset-release edge, so a random B response cannot
+fabricate a store acknowledgement. The interrupt-owner registers carry the
+explicit Spinal annotation for their intentional top-driven/test-poked shape;
+standalone interrupt tests no longer fail elaboration and retry first.
 
 ## 6. Markdown reconciliation
 
 | document family | review result | action |
 |---|---|---|
 | binding core architecture | reconciled: seven-stage II=1 integer MUL uses the existing shared CPLX gateway and ports | full-core physical mapping/FMax/area acceptance remains open |
-| LS pipeline specs/plans | newest full-pipeline spec is correct and now carries measured D1/D2 results; older late-split documents are historical checkpoints | treat `2026-08-09-ipc-ls-eu-full-pipeline-design.md` as current |
+| LS pipeline specs/plans | newest full-pipeline spec is correct and now carries aligned-load, tagged changed-VPN, U/M-credit, and split-page results; older late-split documents are historical checkpoints | treat `2026-08-09-ipc-ls-eu-full-pipeline-design.md` as current |
 | ALU slow-path spec | implemented and simulation-gated at II=1 | run the paired routed FMax/LUT and IQ-endpoint census before final acceptance |
 | MSHR proposal | correctly prioritizes D-side hit-under-miss and warns about crossbar limits | implement one parked miss before general MSHRs |
-| store-drain/race documents | correctly require ordered AW/W and acknowledgement ownership | use a descriptor/ack queue, never independent loose FSMs |
+| store-drain/race documents | binding amendment now owns the implemented Stream/S0–S3/send-vs-ack design; the old `presentPtr/inFlight` plan body is historical and non-normative | retain the implemented ordered barriers and one AXI serializer; never revive independent loose FSMs |
 | old FMax retiming documents | valid for timing changes but some explicitly preserve single-outstanding behavior | do not read a retiming non-goal as a throughput endorsement |
 | FPU draft | busy-gated fixed-latency operations conflict with the new throughput requirement | amend before RTL |
 | debug/JTAG | new core had no debug controller; sibling SoC contract was the only live compatibility definition | use the new JTAG-compatible debug-controller addendum |
 
 ## 7. Ordered implementation recommendation
 
-1. Run the paired routed FMax/LUT gate for the landed LSU/VIPT pipeline when the
-   serialized Vivado window is free. Do not infer closure from simulation.
-2. Verify the landed MOVEM strength reduction removes both decode DSPs and the
-   measured timing failure in the paired routed gate.
-3. Run the paired routed FMax/LUT and IQ-endpoint census for the landed ALU II=1
-   pipeline; retain it only if the issue-select cone stays under control.
-4. Run the paired routed DSP-register/FMax/LUT/FF gate for the landed seven-stage
-   II=1 MUL pipeline and completion protocol.
-5. Measure D-cache miss occupancy, SQ-full/drain stalls, CPLX mix, and changed-VPN
-   DTLB bubbles on representative workloads.
-6. Choose among one-MSHR D-cache hit-under-miss, COPYBACK store-drain queuing,
-   and tagged changed-VPN DTLB response based on those counters. These are
-   independent levers and should remain separately revertible.
-7. Consider a 32-step W/L32 divider only after the higher-value fixed-latency
-   paths are complete.
+1. When the serialized Vivado window is free, route the final landed set
+   (LSU/VIPT/DTLB, store S0–S3, ALU II=1, seven-stage MUL, and registered-token
+   FTB) at the standing 4-ns constraint. Do not infer closure from simulation.
+2. Report WNS/TNS/failing families, exact LUT/LUTRAM/FF/BRAM/DSP deltas, DSP
+   A/B/M/P properties, and every affected pblock's capture, occupancy, and
+   congestion. An area breach is a review checkpoint for the owner, not an
+   automatic rollback.
+3. Pivot to endpoint-driven timing and floorplan recovery immediately after that
+   characterization. The optimization goal remains 250 MHz and the deployment
+   floor remains 200 MHz; the earlier 173.430-MHz checkpoint is not acceptance.
+4. Measure D-cache miss occupancy and legacy CPLX/divide mix on representative
+   workloads. The changed-VPN and COPYBACK-hit counters should now confirm their
+   landed II=1 behavior rather than select whether to implement it.
+5. If measurements justify more IPC RTL after recovery, choose independently
+   between one parked D-cache miss/hit-under-miss and a pending-DIV/IQ-eligibility
+   slice. Consider a 32-step W/L32 divider only after those higher-value paths.
 
 Area/FMax discipline is uniform across these phases: use existing DSP internal
 registers, pruned descriptors, shallow FIFOs, and one parked context before
