@@ -14,6 +14,7 @@ import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePlug
 import m68k040.services.{RedirectService, DTranslationService}
 import m68k040.lockstep.WhiteboxCapture
 import m68k040.oracle.ProgramAssembler
+import m68k040.sim.{AxiMemModel, AxiMemModelConfig, L2LatencyModel}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -48,6 +49,11 @@ import scala.collection.mutable.ArrayBuffer
   * hard assertions are sanity bounds (dependent-ALU near 1; independent-ALU
   * meaningfully higher). A failed bound is a genuine finding, not a harness bug.
   */
+object IpcBenchSpec {
+  /** Pinned simulation seed (IPC_SEED=<int>); unset keeps the historical random seed. */
+  val simSeed: Int = sys.env.get("IPC_SEED").map(_.toInt).getOrElse(scala.util.Random.nextInt())
+}
+
 class IpcBenchSpec extends AnyFunSuite {
 
   // ── DUT (mirrors lockstep.ExecuteLockStepSpec.FullCoreDut byte-for-byte) ─────
@@ -299,7 +305,35 @@ class IpcBenchSpec extends AnyFunSuite {
 
   /** Attach the assembled program to the I-cache AXI (low-byte-first convention,
     * mirrors ExecuteLockStepSpec.attachProgram). */
-  def attachProgram(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long, bytes: Vector[Int]): Axi4ReadOnlySlaveAgent = {
+  // -- Memory-system model (env-selectable) ------------------------------------
+  // IPC_MEM unset (or "zero"): zero-latency memory -- the historical default, and
+  //   byte-for-byte the previous behaviour (BehavioralMemAgent IS attachFull with a
+  //   default AxiMemModelConfig, and the I-side keeps the stock agent).
+  // IPC_MEM=l2 : the L2-faithful two-tier model (m68k040.sim.AxiMemModel), 5-cycle
+  //   L2 hit / 70-cycle DDR by default; IPC_MEM=l2:<hit>:<dram> overrides. Applied
+  //   to BOTH the D-side and the I-side (an I-fetch refill is the dominant memory
+  //   stall for these kernels, so an I-side zero-latency model would make the
+  //   measurement meaningless).
+  val memCfg: AxiMemModelConfig = sys.env.get("IPC_MEM") match {
+    case None | Some("") | Some("zero") => AxiMemModelConfig()
+    case Some(spec) =>
+      val parts = spec.split(':')
+      require(parts(0) == "l2", s"unknown IPC_MEM=$spec (expected 'zero' or 'l2[:hit[:dram]]')")
+      val hit  = if (parts.length > 1) parts(1).toInt else 5
+      val dram = if (parts.length > 2) parts(2).toInt else 70
+      AxiMemModelConfig(latency = L2LatencyModel(enabled = true, hitCycles = hit, dramCycles = dram))
+  }
+  def memLabel: String =
+    if (!memCfg.latency.enabled) "zero-latency (ideal memory)"
+    else s"L2-faithful: L2 hit=${memCfg.latency.hitCycles}cyc, DDR=${memCfg.latency.dramCycles}cyc, 64B line"
+
+  def attachProgram(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long, bytes: Vector[Int]): Unit = {
+    if (memCfg.latency.enabled) {
+      val lm = spinal.lib.sim.SparseMemory()
+      AxiMemModel.loadProgramIFetch(lm, loadAddr, bytes)
+      AxiMemModel.attachReadOnly(axi, cd, memCfg, lm)
+      return
+    }
     val mem = SparseMemory()
     val nWords = bytes.length / 2
     for (i <- 0 until nWords) {
@@ -343,7 +377,10 @@ class IpcBenchSpec extends AnyFunSuite {
     }
 
     var result: IpcResult = null
-    compiled.doSim(k.name) { dut =>
+    // Deterministic, PAIRED measurement: SpinalHDL picks a RANDOM sim seed per
+    // doSim() by default, and the AXI agents' ready-randomizers consume it -- so
+    // an unpinned run has ~1%% aggregate run-to-run jitter. IPC_SEED pins it.
+    compiled.doSim(k.name, IpcBenchSpec.simSeed) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
 
@@ -432,9 +469,9 @@ class IpcBenchSpec extends AnyFunSuite {
 
       // Attach memories (I-cache program; zeroed D-cache + TLB walker memories).
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem      = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      val ptmem     = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      val dmem      = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, memCfg)
+      val ptmem     = AxiMemModel.attachFull(dut.dtlb.walkerAxi, cd, memCfg)
+      val itlbPtmem = AxiMemModel.attachFull(dut.itlb.walkerAxi, cd, memCfg)
 
       // MMU off (identity).
       dut.ctrl.logic.mmuEnable #= false
@@ -461,7 +498,7 @@ class IpcBenchSpec extends AnyFunSuite {
 
       val n = k.retiredInstrs
       var guard = 0
-      val cap   = 20000
+      val cap   = if (memCfg.latency.enabled) 500000 else 20000
       val debug = sys.env.contains("IPC_DEBUG")
       var lastSize = -1; var stuck = 0
       while (handle.result.size < n && guard < cap) {
@@ -689,6 +726,8 @@ class IpcBenchSpec extends AnyFunSuite {
     println("  68040 OoO 2-wide superscalar — IPC microbenchmark")
     println("  steady-state window = first-commit .. last-commit (fill/drain excluded)")
     println("  IPC = retired macro-instructions / window-cycles")
+    println(s"  memory model: $memLabel")
+    println(s"  sim seed: ${IpcBenchSpec.simSeed}")
     println("  dual%(act) = cycles retiring 2 / commit-active cycles (backend ILP)")
     println("  dual%(win) = cycles retiring 2 / all window cycles")
     println("  active%    = cycles retiring >=1 / all window cycles (backend occupancy)")
