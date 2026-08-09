@@ -720,6 +720,76 @@ class IpcBenchSpec extends AnyFunSuite {
     Kernel("load-stream", src, setup.size + iters * (addrs.size + 2))
   }
 
+  // 5c. shift-stream: ALU SLOW-PATH (SHIFT) THROUGHPUT. This kernel exists to close a
+  //     real BENCHMARK-COVERAGE GAP found by the 2026-08-09 EU-wide one-at-a-time-FSM
+  //     audit: EVERY other kernel in this suite is shift-free and bit-field-free (see
+  //     the `iq.aluSlowWakeup` note near the top of this file: "Inert for the shift-free
+  //     IPC kernels"), so the ALU EU's SLOW path -- `DecOp.SHIFT` and `DecOp.BITFIELD`,
+  //     the S1/S1a/S1a2/S1b/S2/S3 pipe -- has never been measured at all, even though
+  //     `AluEuPlugin.scala:197` deasserts `issuePort.ready` for that op's ENTIRE 6-stage
+  //     occupancy (initiation interval = 7 cycles per ALU port, and the gate blocks that
+  //     EU's FAST ops too). A word histogram over the real Quadra 950 ROM puts
+  //     register-form shifts at 1.50% and bit-field ops at 0.37% of all words, i.e. the
+  //     order of 3-4% of real instructions -- concentrated in exactly the QuickDraw /
+  //     blit / bit-packing code this core's deployment target runs.
+  //
+  //     Construction (deliberately mirrors `load-stream`, for the same reasons):
+  //       * 6 shifts per iteration on 6 DISTINCT data registers => six INDEPENDENT
+  //         slow-op streams, so what is measured is the slow path's THROUGHPUT
+  //         (initiation interval), not its ~8-9 cycle dependent-use latency.
+  //       * ZERO memory traffic => no LS EU / D-cache component in the number.
+  //       * a TIGHT backward loop (not a straight-line unroll) so the body stays
+  //         I-cache resident and the measurement does not turn into the documented
+  //         66-77% straight-line I-fetch loss under `IPC_MEM=l2:5:70`. The back-edge is
+  //         BTB-predicted after warmup (same mechanism `hot-loop` relies on).
+  //     HONEST CEILING: with one shift per register per iteration, the per-register
+  //     loop-carried slow-op chain (~8-9 cycles) puts a floor of ~9 cycles on the
+  //     iteration period. So even a perfect II=1 slow path cannot drive this kernel
+  //     past ~8/9 IPC; the point is the DELTA against today's issue-bound ~3 x 7 = 21
+  //     cycles/iteration, not an absolute ceiling.
+  //     Per iter: 6 shifts + subq + bne = 8 macros.
+  def kShiftStream: Kernel = {
+    val iters = 60
+    val setup = Seq("moveq #60,%d7") ++ (0 to 5).map(r => s"moveq #-1,%d$r")
+    val shifts = (0 to 5).map(r => s"lsl.l #1,%d$r")
+    val body  = ".Lsh: " + shifts.mkString(" ; ") + " ; subq.l #1,%d7 ; bne.s .Lsh"
+    val src   = setup.mkString(" ; ") + " ; " + body
+    Kernel("shift-stream", src, setup.size + iters * (shifts.size + 2))
+  }
+
+  // 5d. shift-mixed: the AMPLIFIER the pure `shift-stream` kernel cannot show. The
+  //     `AluEuPlugin.scala:197` gate is UNCONDITIONAL -- while a slow op occupies the
+  //     pipe, that EU accepts NOTHING, so the machine drops from 2-wide ALU issue to
+  //     1-wide for the full 7-cycle window; and because the IQ maps oldest->port0 /
+  //     second-oldest->port1 statically (`IssueQueuePlugin.scala:313-314`), the OLDEST
+  //     ready ALU uop can be head-of-line-blocked on a busy port 0 while younger ops
+  //     overtake it on port 1, stalling in-order retire. A realistic blit/bit-packing
+  //     inner loop is exactly this shape: a few shifts/bit-field ops surrounded by
+  //     plenty of independent cheap ALU work that SHOULD fill the other port.
+  //
+  //     Construction: 6 slow ops (4 shifts + 2 register-form BFEXTU, so BOTH slow op
+  //     classes are covered -- they share the identical S1..S3 pipe) on 6 independent
+  //     data registers, INTERLEAVED with 12 independent one-cycle `add.l %d6,%aN`
+  //     (ADDA, an ordinary FAST ALU op) over 6 independent address registers. d6 is a
+  //     read-only constant source, d7 the trip counter, a7 untouched. No memory traffic,
+  //     no branches other than the BTB-predicted back-edge.
+  //     Per iter: 4 lsl + 2 bfextu + 12 adda + subq + bne = 20 macros.
+  def kShiftMixed: Kernel = {
+    val iters = 40
+    val setup = Seq("moveq #40,%d7", "moveq #1,%d6") ++ (0 to 5).map(r => s"moveq #-1,%d$r")
+    def fast(n: Int) = s"add.l %d6,%a$n"
+    val body = Seq(
+      "lsl.l #1,%d0", fast(0), fast(1),
+      "lsl.l #1,%d1", fast(2), fast(3),
+      "lsl.l #1,%d2", fast(4), fast(5),
+      "lsl.l #1,%d3", fast(0), fast(1),
+      "bfextu %d4{#0:#8},%d4", fast(2), fast(3),
+      "bfextu %d5{#4:#12},%d5", fast(4), fast(5),
+      "subq.l #1,%d7", "bne.s .Lshm")
+    val src = setup.mkString(" ; ") + " ; .Lshm: " + body.mkString(" ; ")
+    Kernel("shift-mixed", src, setup.size + iters * body.size)
+  }
+
   // 6. call/return: a loop that CALLS a leaf subroutine each iteration. The leaf's
   //    `rts` is the kernel the RAS (slice 2) targets: without return prediction every
   //    rts pays the ~5-6cyc commit-time squash; with the RAS warm the return target is
@@ -748,7 +818,7 @@ class IpcBenchSpec extends AnyFunSuite {
   }
 
   test("IPC microbenchmark suite", VerilatorTest) {
-    val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kLoadStream, kBranchy, kHotLoop, kMixed, kCallReturn)
+    val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kLoadStream, kShiftStream, kShiftMixed, kBranchy, kHotLoop, kMixed, kCallReturn)
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))
