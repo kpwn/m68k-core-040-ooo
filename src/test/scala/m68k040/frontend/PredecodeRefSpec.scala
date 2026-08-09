@@ -170,6 +170,16 @@ class PredecodeRefSpec extends AnyFunSuite {
       assert(classify(op) == cp(false, 0), f"deferred NBCD memory mode=$mode op=0x$op%04x")
     }
   }
+  test("LINK.L partition is exactly 0x4808-0x480f and carries disp32") {
+    for (an <- 0 until 8) {
+      val op = 0x4808 | an
+      assert(classify(op) == cp(true, 3), f"LINK.L A$an,#disp32 op=0x$op%04x")
+    }
+    // Pin both partition boundaries: the preceding eight words are NBCD Dn and the
+    // following word starts the still-deferred NBCD memory-EA partition.
+    assert(classify(0x4807) == cp(true, 1))
+    assert(classify(0x4810) == cp(false, 0))
+  }
   test("DIVU.W/DIVS.W (class 8 opmode 3/7) + MULU.W/MULS.W (class C) -> simple; An-direct MUL EA complex") {
     assert(classify(0x80C1) == cp(true,1))   // DIVU.W D1,D0 (reg divisor, 1 word)
     assert(classify(0x81C1) == cp(true,1))   // DIVS.W D1,D0

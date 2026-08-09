@@ -15,7 +15,9 @@ Line-4 stack-frame ops (NO flags), reusing the existing call/return crack machin
   into An). Net: `An := mem[old An]`, `A7 := old An + 4`.
 
 DEFERRED (noted, not built):
-- `LINK.L An,#disp32` (`0x4808 | An`) — 68020+, out of scope.
+- `LINK.L An,#disp32` (`0x4808 | An`) — 68020+, landed as the same three-µop
+  crack as LINK.W with a 32-bit displacement; predecode is simple/three-word for
+  the exact `0x4808–0x480f` partition.
 - `LINK A7,#disp16` (An == A7) — a degenerate/nonsensical encoding (A7 is the SP, not a
   frame pointer). Musashi's a7-special case pushes the ALREADY-DECREMENTED A7 and the
   general crack here would push the original A7 / overwrite the final A7. Documented as a

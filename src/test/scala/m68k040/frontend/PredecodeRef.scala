@@ -232,7 +232,11 @@ object PredecodeRef {
         // UNLK An (op[3]=1): single word -> simple len 1. (bit6=1 here -> not isChk.)
         val isLink = (op & 0xfff8) == 0x4e50
         val isUnlk = (op & 0xfff8) == 0x4e58
-        if (isLink) CP(simple = true, lenWords = 2)
+        // 68020+ LINK.L An,#disp32 occupies the otherwise-An-direct NBCD region
+        // 0x4808-0x480f and carries two displacement extension words.
+        val isLinkL = (op & 0xfff8) == 0x4808
+        if (isLinkL) CP(simple = true, lenWords = 3)
+        else if (isLink) CP(simple = true, lenWords = 2)
         else if (isUnlk) CP(simple = true, lenWords = 1)
         else if (isTrap || isTrapv || isRts || isRtr || isNop) CP(simple = true, lenWords = 1)
         else if (isUnary) CP(simple = true, lenWords = 1)
