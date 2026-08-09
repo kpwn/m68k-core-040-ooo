@@ -682,6 +682,44 @@ class IpcBenchSpec extends AnyFunSuite {
     Kernel("mixed", src, setup.size + reps * lines.size * 8)
   }
 
+  // 5b. load-stream: NON-FORWARDED D-cache load throughput. This kernel exists to
+  //     close a real BENCHMARK-COVERAGE GAP found by the 2026-08-09 "LS EU pipeline
+  //     depth" grounding pass: `load/store` and `mixed` are BOTH same-address
+  //     store-then-load-back patterns whose every load is satisfied by the store
+  //     queue (100% SQ-forward, measured 25/25; LAUNCH/WAIT occupancy exactly 0
+  //     cycles). Neither of them ever performs a real D-cache read, so the suite
+  //     could not measure the far more common case — a load that does NOT forward.
+  //
+  //     Construction:
+  //       * ZERO stores anywhere in the kernel => the store queue is permanently
+  //         empty => `sq.io.fwd.rsp.hit`/`.stall` are always False => every load
+  //         takes the genuine cache path (LsEuPlugin RESOLVE -> LAUNCH -> WAIT ->
+  //         `dcache.loadRsp`). This is the exact path the two existing kernels skip.
+  //       * 6 loads per iteration to 6 DISTINCT long-aligned addresses spanning two
+  //         16-byte D-cache lines (0x4000..0x4014), each into a DIFFERENT destination
+  //         register => no load-to-load data dependency, so the measured rate is LS
+  //         EU + D-cache THROUGHPUT (initiation interval), not load-use latency.
+  //       * a TIGHT backward loop (not the straight-line unroll `load/store` uses) so
+  //         the body stays I-cache resident: under `IPC_MEM=l2:5:70` a long
+  //         straight-line unroll becomes I-fetch-bound (documented 66-77% loss on
+  //         straight-line kernels) and would mask the D-side effect entirely. The
+  //         back-edge is BTB-predicted after warmup (same mechanism `hot-loop`
+  //         relies on), so no commit-time redirect crosses the LS pipe.
+  //       * the working set is 2 lines / 32 bytes, far under L1D capacity, so after
+  //         the first iteration every access is an L1D HIT — this measures hit
+  //         throughput, not refill latency.
+  //     Per iter: 6 loads + subq + bne = 8 macros.
+  def kLoadStream: Kernel = {
+    val iters = 60
+    val addrs = Seq(0x4000, 0x4004, 0x4008, 0x400c, 0x4010, 0x4014)
+    val setup = Seq("moveq #60,%d7")
+    // d7 is the trip counter; d0..d5 are the six independent load destinations.
+    val loads = addrs.zipWithIndex.map { case (a, i) => f"move.l 0x$a%x,%%d$i" }
+    val body  = ".Lldst: " + loads.mkString(" ; ") + " ; subq.l #1,%d7 ; bne.s .Lldst"
+    val src   = setup.mkString(" ; ") + " ; " + body
+    Kernel("load-stream", src, setup.size + iters * (addrs.size + 2))
+  }
+
   // 6. call/return: a loop that CALLS a leaf subroutine each iteration. The leaf's
   //    `rts` is the kernel the RAS (slice 2) targets: without return prediction every
   //    rts pays the ~5-6cyc commit-time squash; with the RAS warm the return target is
@@ -710,7 +748,7 @@ class IpcBenchSpec extends AnyFunSuite {
   }
 
   test("IPC microbenchmark suite", VerilatorTest) {
-    val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kBranchy, kHotLoop, kMixed, kCallReturn)
+    val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kLoadStream, kBranchy, kHotLoop, kMixed, kCallReturn)
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))
