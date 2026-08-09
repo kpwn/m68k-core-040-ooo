@@ -1,6 +1,6 @@
 package m68k040.execute
 
-import m68k040.cache.{DcacheService, DLoadCmd, DStoreCmd}
+import m68k040.cache.{DcacheService, DLoadCmd, DStoreCmd, DTranslationToken}
 import m68k040.execute.iq.IqContext
 import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, XRegFileService, RegFileReadPort, RegFileWritePort, RegFileBypassPort}
 import m68k040.isa.MemOp
@@ -112,16 +112,14 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   override def xlateRobId: UInt         = xlateRobIdSig
 
   // ── Exception-unit cache arbitration (full-core wiring drives these) ─────────
-  // While `excActive`, the commit-side ExceptionUnit owns the D-cache + D-TLB
-  // request ports (the LS pipe is squashed/idle — serializing). The LS EU MUXes
-  // these exc requests onto the cache it already owns. Default-idle (allowOverride)
-  // so standalone LS tests / a DUT that doesn't wire them are unchanged.
+  // While `excActive`, the commit-side ExceptionUnit owns the D-cache request
+  // ports (the LS pipe is squashed/idle — serializing). Its frame/vector accesses
+  // are identity-physical and therefore do not enter the tagged DTLB service.
+  // Default-idle (allowOverride) keeps standalone LS tests unchanged.
   var excActive: Bool = null
   var excLoadCmdValid: Bool = null; var excLoadCmdVaddr: UInt = null; var excLoadCmdSize: m68k040.isa.Size.C = null
   var excLoadCmdReady: Bool = null
   var excStoreValid: Bool = null;   var excStorePayload: DStoreCmd = null
-  var excXlateValid: Bool = null;   var excXlateVpn: UInt = null
-  var excXlateWrite: Bool = null;   var excXlateSupervisor: Bool = null
   var sqEmptySig: Bool = null   // store queue drained (no committed store in flight)
 
   // ── Precise-path SQ<->ROB pass-throughs (Task P2.5 wires these end-to-end;
@@ -138,8 +136,6 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     excLoadCmdValid = Bool(); excLoadCmdVaddr = UInt(32 bits); excLoadCmdSize = m68k040.isa.Size()
     excLoadCmdReady = Bool()
     excStoreValid   = Bool(); excStorePayload = DStoreCmd()
-    excXlateValid   = Bool(); excXlateVpn = UInt(20 bits)
-    excXlateWrite   = Bool(); excXlateSupervisor = Bool()
     sqEmptySig      = Bool()
     robHeadIn              = UInt(6 bits)
     robHeadValidIn         = Bool()
@@ -190,8 +186,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // data access to a supervisor-only page would otherwise fault. `host.get`
     // (optional): a standalone LS-EU DUT with no RobPlugin/PrivilegeService wired
     // defaults to False (user), unchanged for every existing non-full-core test. Does
-    // NOT affect the exception sequencer's own physical accesses (excXlateSupervisor,
-    // always True — those are a separate override, last-wins, below).
+    // It does not affect the exception sequencer's separate identity-physical
+    // frame/vector accesses.
     val privCtrl = host.get[m68k040.services.PrivilegeService]
 
     // fast/precise store classification (Task P2.2). OPTIONAL (host.get, mirrors
@@ -214,10 +210,6 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     excLoadCmdSize.allowOverride;       excLoadCmdSize := m68k040.isa.Size.LONG
     excStoreValid.allowOverride;        excStoreValid := False
     excStorePayload.allowOverride;      excStorePayload.assignDontCare()
-    excXlateValid.allowOverride;        excXlateValid := False
-    excXlateVpn.allowOverride;          excXlateVpn := U(0, 20 bits)
-    excXlateWrite.allowOverride;        excXlateWrite := False
-    excXlateSupervisor.allowOverride;   excXlateSupervisor := True
     excLoadCmdReady.allowOverride;      excLoadCmdReady := False
 
     // Precise-path pass-throughs default-idle (allowOverride): a DUT that doesn't
@@ -450,6 +442,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       val paddr  = UInt(32 bits)
       val paddrB = UInt(32 bits)
       val cmode  = m68k040.cache.CacheMode()
+      val cmodeB = m68k040.cache.CacheMode()
     }
     case class ResolvePipeCtx() extends Bundle {
       val xlate    = XlatePipeCtx()
@@ -460,16 +453,20 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
 
     val tValid   = RegInit(False)              // P2: registered DTLB + VIPT request
     val tCtx     = Reg(FrontPipeCtx())
-    val tSecond  = RegInit(False)              // rare split: translating addrB
-    val tProbeDone = RegInit(False)            // this P2 token launched its VIPT read
-    val tPaddrA  = Reg(UInt(32 bits))
-    val tCmodeA  = Reg(m68k040.cache.CacheMode())
+    val txValid  = RegInit(False)              // P2T: accepted request awaiting response
+    val txCtx    = Reg(FrontPipeCtx())
+    val txSecond = RegInit(False)              // rare split: response/command is addrB
+    val txWaitingRsp = RegInit(False)
+    val txPaddrA = Reg(UInt(32 bits))
+    val txCmodeA = Reg(m68k040.cache.CacheMode())
+    val txToken  = Reg(UInt(DTranslationToken.Width bits))
+    val xlateEpoch = RegInit(False)
     val p3Valid  = RegInit(False)              // P3: registered PA -> SQ query/store
     val p3Ctx    = Reg(XlatePipeCtx())
     val p4Valid  = RegInit(False)              // P4: registered SQ response -> resolve
     val p4Ctx    = Reg(ResolvePipeCtx())
-    tValid.simPublic(); p3Valid.simPublic(); p4Valid.simPublic(); tSecond.simPublic()
-    tCtx.robId.simPublic(); p3Ctx.front.robId.simPublic(); p4Ctx.xlate.front.robId.simPublic()
+    tValid.simPublic(); txValid.simPublic(); p3Valid.simPublic(); p4Valid.simPublic(); txSecond.simPublic()
+    tCtx.robId.simPublic(); txCtx.robId.simPublic(); p3Ctx.front.robId.simPublic(); p4Ctx.xlate.front.robId.simPublic()
 
     // ---- translate-at-execute: the LS EU DRIVES the D-side translation port ----
     // It presents the access VPN (loadVaddr, which the FSM sets to s1Va for slot A
@@ -477,10 +474,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // `valid` (a real demand). In parallel, a load may launch a tokenized D-cache
     // virtual-set probe. The LS EU alone consumes rsp, registers the resolved PA and
     // cache mode, and later presents them in DLoadCmd; the D-cache never samples this
-    // live response. On a DTLB miss rsp.ready is False while the walker runs, so the
-    // LS EU holds the resident request and cancels any probe that cannot be consumed.
-    // (req drivers are set after loadVaddr is declared, below.)
-    val s1Paddr = (xlate.rsp.ppn ## tCtx.vaddr(11 downto 0)).asUInt
+    // tagged response. On a DTLB miss the response Stream remains invalid while the
+    // walker runs; P2T holds the matching context and P2 may retain one younger op.
+    // (request drivers are set after the stage controls are declared below.)
+    val s1Paddr = (xlate.rsp.payload.ppn ## txCtx.vaddr(11 downto 0)).asUInt
     // Slot-B (split-access second half) translated physical address: SAME `xlate.rsp`
     // port, combined with addrB's OWN page offset (not s1Va's — a line-crossing split
     // stays within the same page but at a different 12-bit offset; only a page-
@@ -488,9 +485,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // request/response actually corresponds to addrB's VPN (the new XLATE_B FSM
     // state below arms this via `xlateBArm` -> `xlateVaddr`, mirroring exactly how
     // `s1Paddr` above is only meaningful while IDLE is resolving slot A's request).
-    val s1PaddrB = (xlate.rsp.ppn ## tCtx.addrB(11 downto 0)).asUInt
-    val xlateReady = xlate.rsp.ready    // False on an enabled-MMU TLB miss (walking)
-    val xlateFault = xlate.rsp.fault
+    val s1PaddrB = (xlate.rsp.payload.ppn ## txCtx.addrB(11 downto 0)).asUInt
+    val xlateReady = xlate.rsp.valid
+    val xlateFault = xlate.rsp.payload.fault
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax #3: PIPELINE the DTLB lookup -> SQ-forward / store-alloc.
@@ -513,6 +510,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val s2Paddr  = p3Ctx.paddr
     val s2PaddrB = p3Ctx.paddrB
     val s2Cmode  = p3Ctx.cmode
+    val s2CmodeB = p3Ctx.cmodeB
 
     // Task P2.2: fast := mmuEnabled && cacheable(s2Cmode) — a pure combinational
     // read of already-latched architectural facts (mmuEnable is live config state;
@@ -526,11 +524,13 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // its ROB completion instead comes later from the SQ's at-head drain (Task
     // P2.4).
     val fastStore = mmuCtrl2.map(_.mmuEnable).getOrElse(False) &&
-                    (p3Ctx.cmode =/= m68k040.cache.CacheMode.INHIBITED)
+                    (p3Ctx.cmode =/= m68k040.cache.CacheMode.INHIBITED) &&
+                    (!p3Ctx.front.twoAccess ||
+                     (p3Ctx.cmodeB =/= m68k040.cache.CacheMode.INHIBITED))
     // Root-cause fix (post-Task-P2.5 lock-step investigation): a privileged STORE
     // (e.g. MOVES.L Dn,<ea>) executed in user mode must NEVER let its memory write
     // reach the SQ at all -- mirrors the EXISTING `suppressForLaterPrivCheck`
-    // pattern above (line ~1254, same `u1.needsSupervisor && !xlate.req.supervisor`
+    // pattern above (line ~1254, same `u1.needsSupervisor && !u1.supervisor`
     // check, there for a memory-SOURCE sysOp's leading load) for the memory-DEST
     // case. Why not instead gate the SQ's at-head drain (`headPreciseReady`) on
     // `!privViolation`? Tried first -- deadlocks: RobPlugin's `privViolation`
@@ -578,6 +578,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       val paddrB    = Reg(UInt(32 bits))
       val size      = Reg(m68k040.isa.Size())
       val cmode     = Reg(m68k040.cache.CacheMode())
+      val cmodeB    = Reg(m68k040.cache.CacheMode())
       val robId     = Reg(UInt(6 bits))
       val twoAccess = RegInit(False)
       val bDone     = RegInit(False)   // slot A launched; now presenting slot B (cross)
@@ -614,7 +615,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       val crackDrop       = Bool()
       val keepCommit      = Bool()
       val needsSupervisor = Bool()
-      // spec §3.2(d) — THE correctness fix. `WAIT` reads `xlate.req.supervisor` LIVE
+      // spec §3.2(d) — THE correctness fix. Never read a live translation request
       // today (`suppressForLaterPrivCheck`, and `captureFault`'s `compFaultSup`). The
       // registered DTLB request re-captures `reqDrvSup` (the LIVE architectural S bit)
       // EVERY cycle, so once the back stage outlives its own S1 residency those reads
@@ -695,7 +696,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // point, once slot A's line has already landed) — this Reg governs only the
     // DTLB request interface, and only during the translate phase (well before the
     // cache is ever launched for either slot).
-    val xlateBArm = tSecond
+    val xlateBArm = txValid && txSecond && !txWaitingRsp
 
     // ---- dcache load cmd: registered aligned queue or split replay register ----
     // Aligned commands come from `alignedSendPtr`; the rare split path retains llReg
@@ -714,7 +715,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     dcache.loadCmd.payload.vaddr := loadVaddr
     dcache.loadCmd.payload.paddr := loadPaddr
     dcache.loadCmd.payload.size  := Mux(useSplitCmd, llReg.size, alignedCmd.size)
-    dcache.loadCmd.payload.cacheMode := Mux(useSplitCmd, llReg.cmode, alignedCmd.cmode)
+    dcache.loadCmd.payload.cacheMode := Mux(
+      useSplitCmd, Mux(llReg.bDone, llReg.cmodeB, llReg.cmode), alignedCmd.cmode)
     dcache.loadCmd.payload.token := Mux(
       useSplitCmd,
       (False ## llReg.bDone ## llReg.robId.asBits).asUInt,
@@ -764,6 +766,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sq.io.alloc.payload.vaddr      := p3Ctx.front.vaddr
     sq.io.alloc.payload.vaddrB     := p3Ctx.front.addrB
     sq.io.alloc.payload.cacheMode  := p3Ctx.cmode
+    sq.io.alloc.payload.cacheModeB := p3Ctx.cmodeB
     sq.io.alloc.payload.supervisor := p3Ctx.front.supervisor
     // Task P2.2: the real fast/precise classification (was a `False` placeholder in
     // Task P2.1). Live default off `fastStore`, matching every other field's
@@ -782,69 +785,28 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val isLoad  = u1.memOp === MemOp.LOAD
     val isStore = u1.memOp === MemOp.STORE
 
-    // ---- drive the D-side translation request (translate-at-execute) ----
-    // VPN = the access address the EU is currently presenting. With FMax #1 the cache
-    // `loadCmd` is now driven off the REGISTERED `llReg`; the DTLB request must instead
-    // track the LIVE access being translated (translation runs in IDLE/XLATE_B, BEFORE
-    // the registered cache launch — it feeds s2Paddr/s2PaddrB, which llReg later
-    // captures). So drive the VPN from `xlateVaddr` (s1Va for slot A / s1AddrB for
-    // slot B, selected by `xlateBArm` — set for the duration of the new XLATE_B state,
-    // which performs addrB's REAL DTLB translate; mmu-split-second-half fix). s1AddrB
-    // is the registered-base-derived next-line base (a shallow stage off s1Va), NOT on
-    // the eaDelta->tag arc the cache cmd registered away. `valid` asserts whenever a
-    // memory µop is resident in S1 (a real translation demand -> the DTLB may walk on
-    // a miss) — for EITHER slot, sequenced one after the other (the DTLB is a single-
-    // outstanding resource: one walker instance, one miss-request register — see
-    // DtlbPlugin). `write` selects the store M-bit / write-protect check (the SAME
-    // access class for both slots of one instruction). `supervisor` = the live
-    // architectural S bit (reqDrvSup below), NOT hardcoded.
-    //
-    // NOTE: `xlateVaddr` deliberately does NOT also select on `llReg.bDone` (the
-    // cache-launch slot-B select, set later in WAIT_A once slot A's line has landed).
-    // Before this fix it did — but that request's response was never consumed (slot
-    // B's paddr was a hardcoded identity shortcut, see the mmu-split-second-half
-    // design note above `s1PaddrB`), so it was pure wasted DTLB traffic. Now that
-    // XLATE_B performs addrB's real translate BEFORE the cache is ever launched (i.e.
-    // strictly before WAIT_A), re-requesting the SAME vpn again in WAIT_A would be
-    // redundant AND would risk double-pushing this access's addrB U/M-descriptor
-    // write into the (unguarded-capacity) UmWriteQueue — see DtlbPlugin's `umq`.
-    val xlateVaddr = Mux(tSecond, tCtx.addrB, tCtx.vaddr)
-
-    // P2 is the LS request register boundary. The DTLB request below comes directly
-    // from the atomically captured P2 context, so a same-page hit may consume P2 and
-    // replace it every cycle. The DTLB's registered hit response supplies changed-VPN
-    // backpressure. `reqReg` remains only for the serial exception sequencer, which
-    // intentionally retains its historical extra translation cycle.
-    val reqDrvValid = Bool()
-    val reqDrvVaddr = UInt(32 bits)
-    val reqDrvVpn   = UInt(20 bits)
-    val reqDrvSup   = Bool()
-    val reqDrvWrite = Bool()
-    val reqDrvRobId = UInt(6 bits)
+    // ---- tagged elastic D-side translation command ─────────────────────────
+    // P2 launches a first-half command atomically with the virtual-set probe. P2T
+    // retains its pruned context until the matching response is consumed. A rare
+    // split reuses P2T for addrB and takes command priority over a younger P2 op.
+    val normalReqArm = Bool(); normalReqArm.allowOverride; normalReqArm := False
+    val splitReqArm  = Bool(); splitReqArm.allowOverride;  splitReqArm  := False
+    val reqFromSplit = splitReqArm
+    val reqDrvVaddr  = Mux(reqFromSplit, txCtx.addrB, tCtx.vaddr)
+    val reqDrvVpn    = reqDrvVaddr(31 downto 12)
+    val reqDrvSup    = Mux(reqFromSplit, txCtx.supervisor, tCtx.supervisor)
+    val reqDrvWrite  = Mux(reqFromSplit,
+      txCtx.memOp === MemOp.STORE, tCtx.memOp === MemOp.STORE)
+    val reqDrvRobId  = Mux(reqFromSplit, txCtx.robId, tCtx.robId)
+    val reqDrvToken  = (xlateEpoch ## reqFromSplit ## reqDrvRobId.asBits).asUInt
     val tIsLoad  = tCtx.memOp === MemOp.LOAD
     val tIsStore = tCtx.memOp === MemOp.STORE
     val tIsMem   = tIsLoad || tIsStore
-    reqDrvValid := tValid && tIsMem && !excActive
-    reqDrvVaddr := xlateVaddr
-    reqDrvVpn   := xlateVaddr(31 downto 12)   // FMax #1's live access VPN (NOT the llReg cmd)
-    reqDrvSup   := tCtx.supervisor
-    reqDrvWrite := tIsStore
-    reqDrvRobId := tCtx.robId
 
-    val reqReg = new Area {
-      val valid = RegInit(False)
-      val vaddr = Reg(UInt(32 bits))
-      val vpn   = Reg(UInt(20 bits))
-      val sup   = Reg(Bool())
-      val write = Reg(Bool())
-      val robId = Reg(UInt(6 bits))
-    }
-    // P2 request and context are atomic, so there is no stale-request cycle to track.
-    // `reqMatch` remains a named gate for directed timing probes; DTLB `rsp.ready`
-    // is the actual translation-valid gate.
+    // P2 request and context are atomic, so there is no freshness heuristic.
     val reqStale = False
     val reqFresh = True
-    val reqMatch = reqDrvValid
+    val reqMatch = normalReqArm || splitReqArm
     // Directed-test probes only (LsEuCrossSpec's freshness waveform tests); zero synth impact.
     reqFresh.simPublic(); reqMatch.simPublic(); reqStale.simPublic(); xlateBArm.simPublic()
 
@@ -854,8 +816,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // flops, so the page-invariant virtual-set RAM read starts in parallel with the
     // TLB lookup. The later resolved loadCmd carries the physical tag + same token.
     // Forward/fault cancels by token; squash/exception cancels the whole queue.
-    val probeWanted      = tValid && tIsLoad && !tSecond && !tProbeDone &&
-                           !sqFlushSig && !excActive
+    val probeWanted      = normalReqArm && tIsLoad
     val probeCancel      = Bool()
     val probeCancelAll   = sqFlushSig || excActive
     val probeCancelToken = UInt(m68k040.cache.DLoadToken.Width bits)
@@ -863,26 +824,26 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     probeCancelToken := U(0, m68k040.cache.DLoadToken.Width bits)
     val reqProbeToken = (False ## False ## tCtx.robId.asBits).asUInt
 
-    dcache.loadProbe.valid         := probeWanted && reqMatch
+    dcache.loadProbe.valid         := probeWanted && xlate.req.ready
     dcache.loadProbe.payload.vaddr := tCtx.vaddr
     dcache.loadProbe.payload.token := reqProbeToken
-    dcache.loadProbe.payload.resolved := xlateReady && !xlateFault
-    dcache.loadProbe.payload.paddr := s1Paddr
+    // The registered translation returns later; retain the raw virtual-set read and
+    // resolve it by token when the physical command arrives. No second RAM read.
+    dcache.loadProbe.payload.resolved := False
+    dcache.loadProbe.payload.paddr := tCtx.vaddr
     dcache.loadProbe.payload.size  := tCtx.size
-    dcache.loadProbe.payload.cacheMode := Mux(
-      cacheCtrl.map(_.dcacheEnabled).getOrElse(False),
-      xlate.rsp.cacheMode, m68k040.cache.CacheMode.INHIBITED)
+    dcache.loadProbe.payload.cacheMode := m68k040.cache.CacheMode.INHIBITED
     dcache.loadProbe.payload.needsLine := tCtx.twoAccess
     dcache.loadProbeCancel.valid         := probeCancel || probeCancelAll
     dcache.loadProbeCancel.payload.token := probeCancelToken
     dcache.loadProbeCancel.payload.all   := probeCancelAll
-    val parallelViptLaunch = dcache.loadProbe.fire && reqMatch && xlate.req.valid &&
-                             (dcache.loadProbe.payload.vaddr(31 downto 12) === xlate.req.vpn)
+    dcache.loadProbeResolve.valid             := False
+    dcache.loadProbeResolve.payload.token     := U(0, m68k040.cache.DLoadToken.Width bits)
+    dcache.loadProbeResolve.payload.paddr     := U(0, 32 bits)
+    dcache.loadProbeResolve.payload.cacheMode := m68k040.cache.CacheMode.INHIBITED
+    val parallelViptLaunch = dcache.loadProbe.fire && xlate.req.fire &&
+                             (dcache.loadProbe.payload.vaddr(31 downto 12) === xlate.req.payload.vpn)
     parallelViptLaunch.simPublic()
-
-    when(dcache.loadProbe.fire) {
-      tProbeDone       := True
-    }
     probeWanted.simPublic(); probeCancel.simPublic(); probeCancelAll.simPublic()
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1105,7 +1066,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // DTLB rsp.fault). Completes (compValid) so the ROB marks done, but flagged as a
     // fault (no reg write / no store alloc / no wakeup); drives faultCompletion. The
     // SSW attrs: write = store, sizeBits = encoded access size, supervisor = the
-    // access function-code supervisor bit (xlate.req.supervisor for this access).
+    // access function-code supervisor bit captured for this access.
     // `atc` (task #189): True (default, preserves the pre-existing MMU-fault
     // behavior) for the DTLB-translation-fault call site; the NEW bus-error call
     // site (D-cache refill AXI resp error, WAIT state below) passes False.
@@ -1631,6 +1592,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
             llReg.paddrB    := p4Ctx.xlate.paddrB
             llReg.size      := p4Front.size
             llReg.cmode     := p4Ctx.xlate.cmode
+            llReg.cmodeB    := p4Ctx.xlate.cmodeB
             llReg.robId     := p4Front.robId
             llReg.twoAccess := True
             llReg.bDone     := False
@@ -1692,18 +1654,83 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     }
     val p3Ready = !p3Valid || p3CanLeave
 
-    // P2 owns the registered DTLB request and launches the VIPT virtual-set read from
-    // those same flops. A split access holds only while translating addrB; ordinary
-    // same-page hits may consume-and-replace P2 every cycle.
+    // P2T owns an accepted tagged translation until its held response is consumed.
+    // Response A can advance while request B enters on the same cycle, so different
+    // resident VPNs have the same II=1 cadence as a same-page stream.
+    val txCanLeave       = Bool(); txCanLeave := False
+    val txToP3           = Bool(); txToP3 := False
+    val txFront          = txCtx
+    val txTokenMatch     = xlate.rsp.payload.token === txToken
+    val txMatchedRsp     = txValid && txWaitingRsp && xlate.rsp.valid && txTokenMatch
+    val txFirstSplitRsp  = !txSecond && txCtx.twoAccess
+    val olderThanTxComp  = backCompFires || preciseReplayClaimsComp ||
+                           p4CompletionFire || p3CompletionFire
+    val txCanConsumeRsp  = Bool(); txCanConsumeRsp := False
+    when(txMatchedRsp && !sqFlushSig && !excActive) {
+      when(xlateFault) {
+        txCanConsumeRsp := !olderThanTxComp
+      } elsewhen(txFirstSplitRsp) {
+        txCanConsumeRsp := True
+      } otherwise {
+        txCanConsumeRsp := p3Ready
+      }
+    }
+    // A stale response after flush has no owner and must vacate the one-entry DTLB
+    // slot. A live matching response is backpressured until P3/completion can take it.
+    xlate.rsp.ready := !txValid || !txWaitingRsp || !txTokenMatch ||
+                       sqFlushSig || excActive || txCanConsumeRsp
+    val txRspFire = xlate.rsp.fire && txValid && txWaitingRsp && txTokenMatch &&
+                    !sqFlushSig && !excActive
+
+    // The registered DTLB response and the synchronous virtual-set RAM output meet
+    // here on the aligned all-hit path. Qualify that exact read by token/physical
+    // tag; no extra CAM, raw-way holding buffer, or second cache read is required.
+    val txEffectiveCmode = Mux(cacheCtrl.map(_.dcacheEnabled).getOrElse(False),
+      xlate.rsp.payload.cacheMode, m68k040.cache.CacheMode.INHIBITED)
+    dcache.loadProbeResolve.valid := txRspFire && !xlateFault && !txSecond &&
+                                     (txCtx.memOp === MemOp.LOAD) && !txCtx.twoAccess
+    dcache.loadProbeResolve.payload.token :=
+      (False ## False ## txCtx.robId.asBits).asUInt
+    dcache.loadProbeResolve.payload.paddr := s1Paddr
+    dcache.loadProbeResolve.payload.cacheMode := txEffectiveCmode
+
+    val txOut = XlatePipeCtx()
+    txOut.front  := txCtx
+    txOut.paddr  := Mux(txSecond, txPaddrA, s1Paddr)
+    txOut.paddrB := Mux(txSecond, s1PaddrB, txCtx.addrB)
+    txOut.cmode  := Mux(txSecond, txCmodeA, txEffectiveCmode)
+    txOut.cmodeB := txEffectiveCmode
+
+    when(txRspFire) {
+      when(xlateFault) {
+        captureFaultFront(txCtx, Mux(txSecond, txCtx.addrB, txCtx.vaddr))
+        cancelProbeFor(txCtx.robId)
+        txCanLeave := True
+      } elsewhen(txFirstSplitRsp) {
+        txPaddrA := s1Paddr
+        txCmodeA := txEffectiveCmode
+        txSecond     := True
+        txWaitingRsp := False
+      } otherwise {
+        txToP3     := True
+        txCanLeave := True
+      }
+    }
+    val txReady = !txValid || txCanLeave
+
+    // A split's second translation reuses P2T and has priority over a younger P2
+    // command. Ordinary P2 loads reserve both the translation response slot and the
+    // virtual-probe queue before asserting either valid, making the two fires atomic.
+    splitReqArm := txValid && txSecond && !txWaitingRsp && !sqFlushSig && !excActive
+    normalReqArm := tValid && tIsMem && txReady && !splitReqArm &&
+                    !sqFlushSig && !excActive && (!tIsLoad || dcache.loadProbe.ready)
+    val normalReqFire = xlate.req.fire && !reqFromSplit && !excActive
+    val splitReqFire  = xlate.req.fire && reqFromSplit && !excActive
+
+    // P2 launches the tagged DTLB command and virtual-set probe. Memory operations
+    // leave only on a real command handshake; LEA/non-memory retain their shallow
+    // direct completion path.
     val tCanLeave       = Bool(); tCanLeave := False
-    val tToP3           = Bool(); tToP3 := False
-    val tOut             = XlatePipeCtx()
-    tOut.front  := tCtx
-    tOut.paddr  := Mux(tSecond, tPaddrA, s1Paddr)
-    tOut.paddrB := Mux(tSecond, s1PaddrB, tCtx.addrB)
-    tOut.cmode  := Mux(tSecond, tCmodeA,
-      Mux(cacheCtrl.map(_.dcacheEnabled).getOrElse(False),
-          xlate.rsp.cacheMode, m68k040.cache.CacheMode.INHIBITED))
     val olderThanTComp = backCompFires || preciseReplayClaimsComp ||
                          p4CompletionFire || p3CompletionFire
 
@@ -1716,27 +1743,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           tCanLeave := True
         }
       } otherwise {
-        when(xlateReady && reqMatch) {
-          when(xlateFault) {
-            when(olderThanTComp) {
-              frontCompHeld := True
-            } otherwise {
-              captureFaultFront(tCtx, Mux(tSecond, tCtx.addrB, tCtx.vaddr))
-              cancelProbeFor(tCtx.robId)
-              tCanLeave := True
-            }
-          } otherwise {
-            when(!tSecond && tCtx.twoAccess) {
-              tPaddrA := s1Paddr
-              tCmodeA := Mux(cacheCtrl.map(_.dcacheEnabled).getOrElse(False),
-                             xlate.rsp.cacheMode, m68k040.cache.CacheMode.INHIBITED)
-              tSecond := True
-            } elsewhen(p3Ready) {
-              tToP3     := True
-              tCanLeave := True
-            }
-          }
-        }
+        when(normalReqFire) { tCanLeave := True }
       }
     }
     val tReady = !tValid || tCanLeave
@@ -1752,11 +1759,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // intentionally win when a stage consumes and accepts on the same edge.
     when(p4CanLeave) { p4Valid := False }
     when(p3CanLeave) { p3Valid := False }
-    when(tCanLeave)  {
-      tValid     := False
-      tSecond    := False
-      tProbeDone := False
-    }
+    when(txCanLeave) { txValid := False; txSecond := False; txWaitingRsp := False }
+    when(tCanLeave)  { tValid := False }
     when(s1ToT) { s1Valid := False }
 
     when(p3ToP4) {
@@ -1766,14 +1770,23 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       p4Ctx.fwdStall   := sq.io.fwd.rsp.stall
       p4Ctx.fwdData    := sq.io.fwd.rsp.data
     }
-    when(tToP3) {
+    when(txToP3) {
       p3Valid := True
-      p3Ctx   := tOut
+      p3Ctx   := txOut
+    }
+    when(splitReqFire) {
+      txWaitingRsp := True
+      txToken      := reqDrvToken
+    }
+    when(normalReqFire) {
+      txValid      := True
+      txCtx        := tCtx
+      txSecond     := False
+      txWaitingRsp := True
+      txToken      := reqDrvToken
     }
     when(s1ToT) {
-      tValid     := True
-      tSecond    := False
-      tProbeDone := False
+      tValid := True
       captureFrontCtx(tCtx)
     }
     when(issuePort.fire) {
@@ -1790,11 +1803,16 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     when(sqFlushSig || excActive) {
       s1Valid     := False
       tValid      := False
-      tSecond     := False
-      tProbeDone  := False
+      txValid     := False
+      txSecond    := False
+      txWaitingRsp:= False
       p3Valid     := False
       p4Valid     := False
     }
+    // Epoch is a squash generation, not an exception-active level. Toggling it on
+    // every cycle of a serializing exception would eventually alias a stale tagged
+    // response; one toggle per backend flush is sufficient to poison old work.
+    when(sqFlushSig) { xlateEpoch := !xlateEpoch }
     // ── Precise-store deferred-completion replay: ready/apply/flush (root-cause
     // fix, post-P2.5 lock-step investigation) — see the `deferCompletion` comment
     // above for the full design. Placed AFTER the fsm (elaboration-order-later, so
@@ -1897,7 +1915,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // ---- debug-only FSM-state observability (task #139 finding #1 investigation) ----
     // Zero synth impact (sim tap only, not referenced by any RTL logic).
     val dbgIsIdle    = !tValid && !p3Valid && !p4Valid; dbgIsIdle.simPublic()
-    val dbgIsXlateB  = tValid && tSecond;               dbgIsXlateB.simPublic()
+    val dbgIsXlateB  = txValid && txSecond;              dbgIsXlateB.simPublic()
     val dbgIsXlate   = p3Valid;                         dbgIsXlate.simPublic()
     val dbgIsResolve = p4Valid;                         dbgIsResolve.simPublic()
     val dbgIsWaitSQ  = p3Valid && p3IsStore && sq.io.full
@@ -1995,21 +2013,15 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       dcache.store.valid          := True
       dcache.store.payload        := excStorePayload
     }
-    // P2's context registers are now the LS request boundary. Keep the exception
-    // sequencer on the historical extra register: it is serializing and already
-    // tolerates that cycle, while the common LS path must be able to replace P2 every
-    // cycle on same-page hits. Exception ownership selects only registered fields.
-    reqReg.valid := excActive && excXlateValid
-    reqReg.vaddr := (excXlateVpn ## U(0, 12 bits)).asUInt
-    reqReg.vpn   := excXlateVpn
-    reqReg.sup   := excXlateSupervisor
-    reqReg.write := excXlateWrite
-    reqReg.robId := U(0, 6 bits)
-    xlate.req.valid      := Mux(excActive, reqReg.valid, reqDrvValid)
-    xlate.req.vpn        := Mux(excActive, reqReg.vpn, reqDrvVpn)
-    xlate.req.supervisor := Mux(excActive, reqReg.sup, reqDrvSup)
-    xlate.req.write      := Mux(excActive, reqReg.write, reqDrvWrite)
-    xlateRobIdSig        := Mux(excActive, reqReg.robId, reqDrvRobId)
+    // Exception frame/vector accesses are already physical on the cache ports and
+    // therefore must not create repeated tagged DTLB commands while excActive is
+    // held. Only the ordinary LS P2/P2T pipe owns this translation stream.
+    xlate.req.valid              := !excActive && (normalReqArm || splitReqArm)
+    xlate.req.payload.vpn        := reqDrvVpn
+    xlate.req.payload.supervisor := reqDrvSup
+    xlate.req.payload.write      := reqDrvWrite
+    xlate.req.payload.token      := reqDrvToken
+    xlateRobIdSig                := Mux(xlate.req.valid, reqDrvRobId, U(0, 6 bits))
 
     excLoadCmdReady := dcache.loadCmd.ready
   }

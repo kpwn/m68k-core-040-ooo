@@ -38,15 +38,14 @@ class ExceptionEntrySpec extends AnyFunSuite {
       val dc  = host[DcacheService]
       val xlate = host[m68k040.services.DTranslationService]
       val exc = rob.logic.exc
-      // D-side translation: the exception unit is the sole requester here.
-      xlate.req.valid      := exc.dtReq.valid
-      xlate.req.vpn        := exc.dtReq.vpn
-      xlate.req.supervisor := exc.dtReq.supervisor
-      xlate.req.write      := exc.dtReq.write
-      exc.dtRsp.ready     := xlate.rsp.ready
-      exc.dtRsp.ppn       := xlate.rsp.ppn
-      exc.dtRsp.cacheMode := xlate.rsp.cacheMode
-      exc.dtRsp.fault     := xlate.rsp.fault
+      // Exception frame/vector cache commands are explicitly physical in this
+      // slice; keep the otherwise-unused tagged DTLB service quiescent.
+      xlate.req.valid              := False
+      xlate.req.payload.vpn        := U(0, 20 bits)
+      xlate.req.payload.supervisor := False
+      xlate.req.payload.write      := False
+      xlate.req.payload.token      := U(0, 8 bits)
+      xlate.rsp.ready              := True
       dc.loadCmd.valid   := exc.dcLoadCmd.valid
       dc.loadCmd.payload := exc.dcLoadCmd.payload
       exc.dcLoadCmd.ready := dc.loadCmd.ready

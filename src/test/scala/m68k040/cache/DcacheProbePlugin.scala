@@ -38,11 +38,14 @@ class DcacheProbePlugin extends FiberPlugin {
     maintDoneOut        := ds.maintDone
     maintQuiescedOut    := ds.maintQuiesced
 
-    // drive the D-side translation request from the presented load (loads only here)
+    // Dcache consumes only resolved commands; keep the otherwise-unused identity
+    // translator quiescent in this standalone cache DUT.
     val xlate = host[DTranslationService]
-    xlate.req.valid      := loadCmdIn.valid
-    xlate.req.vpn        := loadCmdIn.payload.vaddr(31 downto 12)
-    xlate.req.supervisor := False
-    xlate.req.write      := False
+    xlate.req.valid              := False
+    xlate.req.payload.vpn        := U(0, 20 bits)
+    xlate.req.payload.supervisor := False
+    xlate.req.payload.write      := False
+    xlate.req.payload.token      := U(0, DTranslationToken.Width bits)
+    xlate.rsp.ready              := True
   }
 }

@@ -210,16 +210,11 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     gsh.gshareUpdate.payload := rob.logic.gshareUpdateFlow.payload
 
     val dc    = host[DcacheService]
-    val xlate = host[DTranslationService]
     val exc   = rob.logic.exc
     exc.dcLoadRsp.valid   := dc.loadRsp.valid
     exc.dcLoadRsp.payload := dc.loadRsp.payload
     exc.dcLoadBusy        := dc.loadBusy
     exc.dcStoreAck        := dc.storeAck
-    exc.dtRsp.ready       := xlate.rsp.ready
-    exc.dtRsp.ppn         := xlate.rsp.ppn
-    exc.dtRsp.cacheMode   := xlate.rsp.cacheMode
-    exc.dtRsp.fault       := xlate.rsp.fault
     lsEu.excActive            := excActive
     lsEu.excLoadCmdValid      := exc.dcLoadCmd.valid
     lsEu.excLoadCmdVaddr      := exc.dcLoadCmd.payload.vaddr
@@ -227,10 +222,6 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     exc.dcLoadCmd.ready       := lsEu.excLoadCmdReady
     lsEu.excStoreValid        := exc.dcStore.valid
     lsEu.excStorePayload      := exc.dcStore.payload
-    lsEu.excXlateValid        := exc.dtReq.valid
-    lsEu.excXlateVpn          := exc.dtReq.vpn
-    lsEu.excXlateWrite        := exc.dtReq.write
-    lsEu.excXlateSupervisor   := exc.dtReq.supervisor
     exc.sqDrained             := lsEu.sqEmptySig
     // Task P5.4/P5.5 parity with FullCoreSynth (this block mirrors it by hand; the
     // P5.4 `dcQuiesced` line was missing here, leaving the ExceptionUnit default of a

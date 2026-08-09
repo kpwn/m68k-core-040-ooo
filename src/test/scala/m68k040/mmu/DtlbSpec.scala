@@ -2,7 +2,7 @@ package m68k040.mmu
 
 import m68k040.{M68kParams, VerilatorTest}
 import m68k040.core.ParamPlugin
-import m68k040.cache.{CacheMode, TranslationReq, TranslationRsp}
+import m68k040.cache.{CacheMode, DTranslationToken, TranslationReq, TranslationRsp}
 import m68k040.services.DTranslationService
 import m68k040.ls.BehavioralMemAgent
 import spinal.core._
@@ -18,14 +18,22 @@ class DtlbProbePlugin extends FiberPlugin {
     val xlate = host[DTranslationService]
     val reqIn = in(TranslationReq())
     val rspOut = out(TranslationRsp())
-    xlate.req.valid      := reqIn.valid
-    xlate.req.vpn        := reqIn.vpn
-    xlate.req.supervisor := reqIn.supervisor
-    xlate.req.write      := reqIn.write
-    rspOut.ready     := xlate.rsp.ready
-    rspOut.ppn       := xlate.rsp.ppn
-    rspOut.cacheMode := xlate.rsp.cacheMode
-    rspOut.fault     := xlate.rsp.fault
+    val requestIssued = RegInit(False)
+    xlate.req.valid      := reqIn.valid && !requestIssued
+    xlate.req.payload.vpn        := reqIn.vpn
+    xlate.req.payload.supervisor := reqIn.supervisor
+    xlate.req.payload.write      := reqIn.write
+    xlate.req.payload.token      := U(0, DTranslationToken.Width bits)
+    // Compatibility shell for the older unit-test IO: hold the tagged response
+    // until the driver lowers reqIn.valid, preventing a held request from being
+    // accepted again on the response's accept-last cycle.
+    xlate.rsp.ready   := !reqIn.valid
+    rspOut.ready      := xlate.rsp.valid
+    rspOut.ppn        := xlate.rsp.payload.ppn
+    rspOut.cacheMode  := xlate.rsp.payload.cacheMode
+    rspOut.fault      := xlate.rsp.payload.fault
+    when(xlate.req.fire) { requestIssued := True }
+    when(!reqIn.valid)   { requestIssued := False }
   }
 }
 

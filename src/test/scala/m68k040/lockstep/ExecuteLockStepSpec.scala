@@ -294,20 +294,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
       // ── Exception D-cache MUX (the LS EU arbitrates: it owns the cache ports, so
       // the exception unit's requests are routed THROUGH the LS EU's mux — see
-      // LsEuPlugin.excActive/excLoad*/excStore*/excXlate*). The exc reads the cache
+      // LsEuPlugin.excActive/excLoad*/excStore*). The exc reads the cache
       // responses directly here. The exception sequencer is serializing (the LS pipe
       // is squashed), so the cache port is free while excActive. ──
       val dc    = host[DcacheService]
-      val xlate = host[DTranslationService]
       val exc   = rob.logic.exc
       exc.dcLoadRsp.valid   := dc.loadRsp.valid
       exc.dcLoadRsp.payload := dc.loadRsp.payload
       exc.dcLoadBusy        := dc.loadBusy
       exc.dcStoreAck        := dc.storeAck
-      exc.dtRsp.ready       := xlate.rsp.ready
-      exc.dtRsp.ppn         := xlate.rsp.ppn
-      exc.dtRsp.cacheMode   := xlate.rsp.cacheMode
-      exc.dtRsp.fault       := xlate.rsp.fault
       // route the exc's cache requests through the LS EU's arbiter
       lsEu.excActive            := excActive
       lsEu.excLoadCmdValid      := exc.dcLoadCmd.valid
@@ -316,10 +311,6 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       exc.dcLoadCmd.ready       := lsEu.excLoadCmdReady
       lsEu.excStoreValid        := exc.dcStore.valid
       lsEu.excStorePayload      := exc.dcStore.payload
-      lsEu.excXlateValid        := exc.dtReq.valid
-      lsEu.excXlateVpn          := exc.dtReq.vpn
-      lsEu.excXlateWrite        := exc.dtReq.write
-      lsEu.excXlateSupervisor   := exc.dtReq.supervisor
       exc.sqDrained             := lsEu.sqEmptySig
       // Task P5.4/P5.5 parity with FullCoreSynth (this block is a hand-maintained
       // mirror of it, and the P5.4 `dcQuiesced` line was missing here — leaving the

@@ -6,10 +6,12 @@ Accept-last P1/P2/P3/P4 stages, four aligned descriptors, and four early results
 let warm same-page L1 hits issue, translate/probe, enqueue, command, and complete
 at II=1. Only rare split accesses retain a serial replay FSM. A directed burst of
 eight loads proves bubble-free turnover through every one of those boundaries,
-including full-queue consume-and-replace. Seed-1 `load-stream` is now 638 cycles
-under ideal memory and 769 under `l2:5:70`, down 65.1%/62.1% from the committed C3
-checkpoint. The routed FMax/area gate is still pending because the shared Vivado
-window is occupied.
+including full-queue consume-and-replace. The pre-D2T seed-1 `load-stream`
+checkpoint was 638 cycles under ideal memory and 769 under `l2:5:70`.  The final
+tagged changed-VPN response boundary measures 667/821 cycles: 4.5%/6.8% slower
+than that checkpoint, but still 79.6%/76.0% fewer cycles than the original
+3270/3419 baseline while extending II=1 to changed resident VPNs. The routed
+FMax/area gate is still pending because the shared Vivado window is occupied.
 
 **2026-08-09 review amendment — binding corrections:**
 
@@ -22,13 +24,12 @@ window is occupied.
    `DLoadCmd{vaddr,paddr,token}`. A directed real-DTLB test proves the two
    launches coincide and that the resolved command performs no redundant RAM
    read. Thus the implemented common path is latency-hiding VIPT.
-2. The DTLB does not impose an unconditional one-translation-per-two-cycles
-   physical limit. `hrMatch` can serve a same-VPN stream every cycle after
-   warm-up. A changed VPN needs the registered hit-result gap; a walk needs
-   backpressure. D1 removed the old per-µop `reqStale` settle cycle by making P2
-   the atomic registered request/context boundary. A tagged or decoupled DTLB
-   response remains future work for changed-VPN II=1.
-3. The end-state target is II=1 for cacheable same-page L1 hits, stores, and
+2. The historical DTLB did not impose an unconditional one-translation-per-two-
+   cycles limit: `hrMatch` could serve same-VPN traffic every cycle, but a changed
+   VPN needed a registered-result retry. D2T replaces that live-value comparison
+   with tagged elastic command/response Streams.  Resident changed-VPN commands
+   now accept and respond at II=1; walks still backpressure the single walker.
+3. The end-state target is II=1 for cacheable resident L1 hits, stores, and
    forwarded loads. Slice A reached II=2; the bounded replay added with slice C
    now permits one resolved all-hit load acceptance per cycle. A younger command
    accepted on the exact cycle an older S1 detects a miss is held in one replay
@@ -68,10 +69,11 @@ window is occupied.
    probe slot with four tokenized **extracted-result** entries. A shared two-stage
    probe-result pipe registers the selected 128-bit line once, then extracts only
    32 bits into the reserved entry. This keeps probe admission at II=1 without
-   replicating 128-bit line storage per outstanding load. The probe carries a
-   resolved PA/cache-mode hint only when the DTLB response already matches; an
-   unresolved changed-VPN/miss probe is retained as an unusable result and the
-   later command safely falls back to the ordinary read path.
+   replicating 128-bit line storage per outstanding load. D2T launches every
+   aligned resident probe unresolved and later qualifies that same synchronous
+   read with `DLoadProbeResolve {token,paddr,cacheMode}` when the registered tagged
+   translation returns. A late walk/miss resolution safely makes the probe
+   unusable and the resolved command falls back to the ordinary read path.
 9. D2 closes that bubble in the directed eight-load burst: issue, DTLB/VIPT
    launch, aligned-descriptor enqueue, resolved L1 command, and completion are
    each consecutive for all eight operations, and P2/P3/P4 are simultaneously
@@ -80,7 +82,10 @@ window is occupied.
    `1829`→`638` cycles under ideal memory and `2030`→`769` under `l2:5:70`.
    Excluding `load-stream`, aggregate cycles are `8802` ideal and `12140` L2,
    respectively 20 and 60 cycles better than C3, so the gain is localized to the
-   intended hot path without a hidden regression in the rest of the suite.
+   intended hot path without a hidden regression in the rest of the suite.  The
+   later tagged D2T response boundary moves the focused seed-1 result to 667/821
+   cycles while proving the same II=1 cadence across alternating resident VPNs;
+   the full ten-kernel aggregate has not yet been rerun on that final combination.
 
 **Driving directive (user, verbatim)**: *"LS EU needs to be a pipeline, not a
 one-at-a-time FSM."*
@@ -225,9 +230,10 @@ Four things are established that the earlier spec did not have:
 - **NG5** — Any change to `src/main/scala/m68k040/frontend/` or
   `src/main/scala/m68k040/decode/`. A separate fetch-directed-BTB effort owns
   those; zero interaction.
-- **NG6** — Changing the StoreQueue's drain path, the copyback/precise-store
-  machinery, or the exception-unit cache arbitration. All three are consumers of
-  the LS EU's interfaces, not of its internal stage structure.
+- **NG6** — Changing the StoreQueue's drain path or the copyback/precise-store
+  machinery. The exception-unit cache arbiter remains serializing and unchanged;
+  its already identity-physical frame/vector accesses bypass the tagged DTLB, so
+  only the obsolete exception-translation wiring is removed.
 
 ---
 
@@ -271,11 +277,11 @@ not own. Each is characterised below with its citation and its cost to change.
 three live outside `LsEuPlugin.scala`, so a "pipelined LS EU" is a three-cluster
 project, not a one-file one.
 
-### 3.1 Gatekeeper 1 — the DTLB: same-page II=1 is possible; changing-page requests need replay today
+### 3.1 Gatekeeper 1 — historical changed-VPN bubble, removed by tagged D2T
 
-`DtlbPlugin.scala` serves a **single, combinational** request/response pair off
-one registered request. The hit path is served from a one-entry result register
-by *value comparison*:
+Before D2T, `DtlbPlugin.scala` served a **single, combinational** request/response
+pair off one registered request. The hit path was served from a one-entry result
+register by *value comparison*:
 
 ```scala
 hrValid := False
@@ -292,9 +298,9 @@ Unrolling: `hrValid(N)` reflects cycle `N-1`'s condition and `hrVpn(N)` is
 > **`hrMatch(N)` ⟺ cycle `N-1` produced a registered hit for the VPN presented
 > on cycle `N`.**
 
-A stream whose requests remain on the same VPN can therefore receive a valid
-translation every cycle after warm-up. A changing VPN does not match the prior
-registered result and currently needs a hold/retry cycle. (`permFault` is
+A stream whose requests remained on the same VPN could therefore receive a valid
+translation every cycle after warm-up. A changing VPN did not match the prior
+registered result and needed a hold/retry cycle. (`permFault` was
 additionally recomputed against the live `_req.write`/`_req.supervisor`, so
 those access-class bits must be associated with the same pipeline token.)
 
@@ -322,13 +328,63 @@ consumed by `LsEuPlugin` and cancels its early probe; only clean, registered
 `{vaddr,paddr,cacheMode,token}` reaches the cache. AXI refill errors continue to
 use `DLoadRsp.fault` and are distinct from MMU faults.
 
-**Cost to make all hit patterns II=1:** convert `hr*` into a genuine tagged
-pipeline — register `{vpn, write, supervisor, token}` alongside the lookup
-result and answer with pipeline-valid/nack rather than requiring the next live
-request to retain the same VPN. This changes the response contract, but it is
-the intended end state. The first implementation may exploit same-page II=1
-while replaying a changed-page request; it must not impose a blanket two-cycle
-occupancy counter.
+**Selected DTLB-II1 amendment (2026-08-09):** convert the D-side service into
+two elastic Streams.  `DTranslationCmd` carries
+`{vpn,write,supervisor,token}` and `DTranslationRsp` returns
+`{ppn,cacheMode,fault,token}`.  The token is eight bits:
+`{backendEpoch,splitPhase,robId[5:0]}`.  This is a D-side-only contract; the
+independent I-side translation service retains its existing interface.
+
+The DTLB classifies each accepted command at the existing banked lookup.  Its
+geometry remains deliberately shallow: 32 total entries, four ways, two banks,
+four sets per bank, and therefore only four tag comparisons in the selected
+bank.  D2T must not increase the entry/way count, duplicate the lookup, or add a
+fully associative response/context structure.  Any future depth change requires
+separate miss-rate and post-route area/timing evidence.
+
+An
+identity, transparent-translation, or resident-TLB hit writes one elastic
+response register; that response holds until consumed and may be consumed in
+the same cycle the next lookup is accepted.  A miss captures the existing one
+walker context and deasserts command ready until the walk produces the held
+response.  Command readiness depends only on registered response/walker
+capacity, never on the current CAM hit, so the deep `hitVec` cone still ends at
+flops rather than feeding LSU/cache admission.
+
+Each I/D walker also reserves capacity in its existing four-entry deferred U/M
+write queue before launch.  A full queue may hold one captured cold miss, but it
+must never overwrite an older architectural descriptor update.  Queue-full does
+not feed resident-hit readiness or the TLB tag-compare cone.  On the D side,
+`PFLUSHA` poisons an active pre-flush walk's later response, fill, and U/M
+allocation, including an exact same-cycle `walker.done` collision.
+
+The LSU adds one pruned translation-response context between today's P2 request
+owner and P3 physical-address/SQ owner.  On an ordinary hit it consumes response
+A into P3 while atomically launching P2 request B and replacing the response
+context, yielding changed-VPN II=1.  The virtual-set L1D probe fires on the exact
+accepted request cycle and retains the same ROB token.  The registered DTLB
+response also emits a tokenized `DLoadProbeResolve {token,paddr,cacheMode}` Flow
+on the aligned-load hit path.  That Flow qualifies the synchronous virtual-set
+BRAM output against the physical tag before the cache stores the selected line;
+it neither retains all raw ways nor performs a second array read.  A late resolve
+safely records an unusable probe and falls back to the ordinary resolved command.
+A miss holds only this
+response context/P2 input; already-resolved P3/P4/cache descriptors continue.
+Split accesses reuse the response context for their second translation and may
+remain serial because they are explicitly off the aligned hot path.
+
+A page-crossing split carries both halves' translation attributes independently.
+`paddrA/cacheModeA` governs slot A and `paddrB/cacheModeB` governs slot B for
+both load commands and StoreQueue drains.  A split store is precise when either
+half is inhibited.  Applying A's cache mode to B is forbidden: adjacent virtual
+pages may map to unrelated physical pages with unrelated cache attributes.
+
+Flush kills the owned LSU request/response contexts and toggles the token epoch.
+Any already-produced mismatched response is drained without side effects; a
+speculative walk may still finish and fill the TLB, but its stale tagged response
+cannot attach to a reused ROB id.  Translation faults and permission/cache-mode
+metadata are consumed only with the matching context.  This changes the response
+contract but does not add a second CAM, walker, PRF port, or cache port.
 
 ### 3.2 Gatekeeper 2 — D-cache load acceptance: original II=3, implemented all-hit II=1
 
@@ -476,7 +532,8 @@ deleted** and replaced by per-stage valid bits.
 |---|---|---|---|
 | **P0** | IQ `m2sPipe` + S0 (`:264-307`) | PRF reads (`rdBase`/`rdData`/`rdIndex`), `base0`/`data0`/`idxTerm0` mux | none (combinational, already exists) |
 | **P1** | S0→S1 reg | latch `{ctx, base, data, index}`; compute `va`; launch DTLB request **and** L1D virtual-set probe in parallel | `p1Ctx`, `p1Va`, `p1Data`, `p1Poison`, token |
-| **P2** | translated/tag-result alignment | align `xlate.rsp` with synchronous tag/data outputs; translation faults cancel upstream; changed-page or walk responses hold/retry | `p2Ctx`, `p2Va`, `p2Paddr`, `p2Cmode`, `p2Poison`, token |
+| **P2** | DTLB/VIPT request | atomically fire tagged DTLB command and L1D virtual-set probe; accept-last replacement | request context, VA/addrB, token |
+| **P2T** | tagged translation response | match held DTLB response by `{epoch,phase,robId}`; capture PA/cache mode or terminate a fault; response A may leave while request B launches | pruned execution context, token, split-A PA/cache mode |
 | **P2B** | `XLATE_B` (`:1332-1352`) | split-access second-half translate | *reuses P2's registers* — see §4.5 |
 | **P3** | `XLATE` (`:1357-1422`) | STORE: `sq.io.alloc` (+ `fastStore`/`deferCompletion`). LOAD: `sq.io.fwd` query → latch `fwd*` | `p3Ctx`, `p3Paddr/B`, `p3Cmode`, `p3StoreData`, `p3Poison` |
 | **P4** | `RESOLVE` (`:1432-1463`) | LOAD: `fwdHit` → data, else capture `llReg` | `p4Ctx`, `p4FwdHit/Data/Stall`, `p4Poison` |
@@ -522,7 +579,7 @@ Stall sources, all of which back-pressure the whole pipe in order:
 
 | stall | stage | reason | frequency |
 |---|---|---|---|
-| DTLB not ready / settle | P2 | walk in progress, or the §3.1 2-cycle floor | every µop (the floor); rare (walk) |
+| DTLB command/response backpressure | P2/P2T | page walk, response slot held, or downstream P3 unavailable | rare on resident hits; walk/miss dependent |
 | `sq.io.full` | P3 | today's `WAIT_SQ` | rare |
 | `fwdStall` re-query loop | P4 | overlap with an older uncommitted store | workload-dependent |
 | `dcache.loadCmd` not ready | P5 | `inFlight`, refill in progress, `pendingStoreMiss`, `maintBusyReg` | miss-rate-dependent |
@@ -533,11 +590,9 @@ Stall sources, all of which back-pressure the whole pipe in order:
 ### 4.3 P1 translation/cache drive at II = 1
 
 P1 launches one token per cycle. The same token drives the DTLB request and the
-virtual set index. For a same-page hit stream, the DTLB registered hit result
-and synchronous L1D outputs remain available every cycle after warm-up. A VPN
-transition that cannot match receives a retry/nack and is held or replayed;
-younger admission is governed by bounded token capacity rather than a global
-two-cycle counter. A page walk may stop translation admission, but already
+virtual set index. For a resident hit stream, tagged DTLB responses and
+synchronous L1D outputs remain available every cycle after warm-up even as the
+VPN changes. A page walk may stop translation admission, but already
 resolved cache hits and independent non-memory LS results continue wherever
 their owned resources permit.
 
@@ -709,15 +764,16 @@ depends on**. The gate must be re-derived, not transcribed. *Test*: the existing
 regression signal; the pendMem↔SQ lock-step pairing invariant must get its own
 assertion.
 
-**H8 — exception-unit cache/TLB arbitration (existing, tightened).** The
-exception sequencer overrides `dcache.loadCmd` and `reqDrv*` (`:1750-1802`)
-while `excActive`. It is serializing, so the LS pipe must be **drained** before
-it runs. Today that is implicit (single occupancy + the ROB's drain). With N
-µops resident it must be explicit: a `pipeEmpty` signal (`!p1Valid && … && !p8Valid`)
-that the exception path already effectively waits on via ROB drain, plus the
-surviving `RegNext(reqExcOverride)` stale term (§4.3). *Test*: an exception
-raised with 4+ LS µops resident, asserting the sequencer's own vector fetch gets
-the right translation.
+**H8 — exception-unit cache arbitration (existing, tightened).** The exception
+sequencer overrides `dcache.loadCmd`/store while `excActive`. Its frame and vector
+accesses are identity-physical by the existing exception design and do not enter
+the tagged DTLB. It is serializing, so the LS pipe must be **drained** before it
+runs. Today that is implicit (single occupancy + the ROB's drain). With N µops
+resident it must be explicit: a `pipeEmpty` signal (`!p1Valid && … && !p8Valid`)
+that the exception path already effectively waits on via ROB drain. The exception
+load source must remain a held Stream source so a faster cache cannot accept a
+duplicate tail command. *Test*: an exception raised with 4+ LS µops resident,
+asserting no younger LS side effects and exact vector/frame cache handshakes.
 
 **H9 — untagged `DLoadRsp` in-order contract (existing, must not break).**
 `loadRspPort` is a `Flow` with no id and no ready (`DcachePlugin.scala:60`); P8
@@ -957,7 +1013,8 @@ measured FMax reading on the exact cone at issue.
 | **C3 — implemented checkpoint** | **Aligned-load descriptor queue** | replace the aligned hot-path `BK_IDLE/LAUNCH/WAIT` single slot with a four-entry in-order command/response descriptor queue; add hit-only early-probe consume-and-replace; retain `WAIT_A/WAIT_B` only as a pipe-draining split-access replay; close split-half bus-fault handling | `LsEuPlugin`, `DcachePlugin`, LS/cache tests | focused cache/LS/RTE suite 105/105; full/backpressure/order/flush and both split-half bus faults pass; phase-local `test-fast` 133/134 with only the independently reproduced stale predecode oracle, subsequently corrected; seed-1 `load-stream` 1836→1829 ideal and 2071→2030 L2; area/FMax pending |
 | **C1 — optional** | **General hit-under-miss** | response tags + bounded miss state sufficient to keep accepting independent hits during refill | cache/service/LS files | hit-under-miss; queue-full backpressure; area/FMax |
 | **D1 — implemented, simulation-gated** | **Elastic LS front** | replace the single-resident `IDLE/XLATE_B/XLATE/RESOLVE/WAIT_SQ` control with accept-last P1 AGU, P2 registered DTLB/VIPT, P3 registered physical-address/SQ-query, and P4 registered forward/resolve stages; each cut owns a pruned context and valid bit | `LsEuPlugin`, LS tests | eight same-page aligned loads advance issue→P4 and complete at II=1; changed-page/walk and queue-full backpressure; store→load order; older precise replay priority; flush; split regressions; seed-1 IPC pair passes |
-| **D2 — implemented, simulation-gated** | **Tokenized VIPT result queue** | replace the one held RAM result with four tokenized extracted-result entries fed by one shared selected-line/extract pipeline; carry a valid resolved-PA hint on `DLoadProbe`; fall back safely when unresolved or miss | cache service, `LsEuPlugin`, `DcachePlugin`, tests | eight warm same-page hits launch probes and complete consecutively; full-queue consume-and-replace, cancel-all, unresolved/miss fallback; D-cache 49/49, focused LS 24/24, RTE 1/1; phase-local `test-fast` 133/134, followed by combined-branch 138/138 after the stale oracle corrections; area/FMax pending |
+| **D2 — implemented, simulation-gated** | **Tokenized VIPT result queue** | replace the one held RAM result with four tokenized extracted-result entries fed by one shared selected-line/extract pipeline; qualify the synchronous read with the later `DLoadProbeResolve`; fall back safely when unresolved or miss | cache service, `LsEuPlugin`, `DcachePlugin`, tests | eight warm same-page hits launch probes and complete consecutively; full-queue consume-and-replace, cancel-all, unresolved/miss fallback; D-cache 49/49, focused LS 24/24, RTE 1/1; phase-local `test-fast` 133/134, followed by combined-branch 138/138 after the stale oracle corrections; area/FMax pending |
+| **D2T — implemented, simulation-gated** | **Tagged DTLB response pipeline** | elastic D-side command/response Streams; eight-bit epoch/phase/ROB token; one pruned LSU response-context stage; same-cycle response-A/request-B turnover; retain the existing 32-entry/4-way/2-bank TLB and one walker | cache translation types, DTLB/identity plugins, `LsEuPlugin`, MMU/LS tests | eight alternating nonidentity resident VPNs prove consecutive request/response/probe/cache/early-consume/completion with exact tags/data, zero walker reads, and a tagged nonresident fault; permission/miss/split/flush regressions and `test-fast`; post-route pair pending |
 | **D3** | **Uniform completion FIFO** | extend C3's cache association ring into the uniform in-order completion FIFO of §4.4 if D1's remaining early-completion arbitration or latency-sensitive kernels justify it | `LsEuPlugin` | IPC suite; lock-step/corpus; post-route pair |
 | **E** | **Context pruning** | prove non-use, shrink carried tokens | LS/cache files | LUT/FF delta; no functional change |
 
@@ -1006,17 +1063,19 @@ provides only one younger front slot. D1/D2 now provide the measured II=1 row:
 | slice-A cache II=2 projection | **2** | ~720 | ~620 | ~420 | **~6100** = **+52%** |
 | C2 measured, seed 1 (current 10-kernel suite) | bounded front/back | **1836** | **1034** | **559** | **10658 vs 12221 baseline = −12.8% cycles** |
 | C3 measured, seed 1 (current 10-kernel suite) | four aligned descriptors | **1829** | **1034** | **559** | **10651 ideal; 14230 L2 vs C2 14271** |
-| D1/D2 measured, seed 1 | **1** | **638 ideal / 769 L2** | **1034 / 1515** | **550 / 1074** | **9440 ideal / 12909 L2** |
+| D1/D2 pre-D2T measured, seed 1 | **1, same-page** | **638 ideal / 769 L2** | **1034 / 1515** | **550 / 1074** | **9440 ideal / 12909 L2** |
+| D2T final focused pair, seed 1 | **1, changed-VPN proven** | **667 ideal / 821 L2** | not rerun | not rerun | full ten-kernel aggregate not rerun |
 
 The D-cache is no longer the common-hit acceptance bottleneck. C2 made the first
 material IPC gain by overlapping the cache tail, C3 removed the aligned
 response-slot serialization, and D1/D2 now feed and retire resident hits at the
-cache's all-hit II=1 limit. Relative to C3, seed-1 `load-stream` cycles improve
-65.1% ideal and 62.1% L2; the full aggregate improves 11.4% and 9.3%. Relative
-to the original seed-1 baseline, `load-stream` improves 80.5% and 77.6%.
+cache's all-hit II=1 limit. At the pre-D2T checkpoint, relative to C3, seed-1
+`load-stream` cycles improved 65.1% ideal and 62.1% L2 and the full aggregate
+improved 11.4% and 9.3%. The final tagged-D2T focused pair retains 63.5%/59.6%
+cycle reduction versus C3 and 79.6%/76.0% versus the original seed-1 baseline.
 Realistic-memory refill time still limits the benefit, so both memory models
-remain mandatory. General hit-under-miss and changed-VPN DTLB II=1 are distinct
-remaining levers, not prerequisites for the achieved same-page resident-hit II=1.
+remain mandatory. General hit-under-miss remains a distinct lever; resident
+changed-VPN translation and VIPT consumption are already proven at II=1.
 
 **Three honest caveats, all mandatory to carry into any report of these numbers:**
 
@@ -1170,8 +1229,8 @@ All three throughput gatekeepers are partly or wholly outside it:
 
 - the D-cache's former live `xlate.rsp` reads had to be deleted for any
   pipelining; slice B has now removed the dependency entirely;
-- the DTLB's registered `hrMatch` path supports same-VPN II=1 but needs tagged
-  replay/pipelining for changing-VPN II=1;
+- the DTLB's old registered `hrMatch` path supported same-VPN II=1; D2T now adds
+  tagged response turnover for changing-VPN II=1 without another CAM;
 - the original D-cache load port cap of **II=3 / 0.333 loads per cycle** was
   independent of the LS EU; slices A/C0 now provide all-hit acceptance II=1.
 
@@ -1211,11 +1270,13 @@ remain associated in order, and only split accesses use `WAIT_A/WAIT_B`. Directe
 simulation covers eight consecutive warm hits and coincident DTLB/VIPT launches,
 full-queue consume-and-replace, miss replay ordering, exact token association,
 unresolved-probe fallback, cancel-all, flush poisoning, and both split-half bus
-faults. The focused cache/LS/RTE suites pass 74/74. The phase-local `test-fast`
+faults. Tagged D2T coverage additionally alternates resident VPNs at II=1 and
+checks permission association, clean-miss serialization, epoch reuse, and real
+cross-page split translations. The phase-local `test-fast`
 result was 133/134 with only the independently reproduced stale
 `PredecodeRefSpec` EOR/CMPM expectation; after that oracle and the subsequently
 exposed line-0 framing drift were corrected, the combined branch passes 138/138.
 Both seed-1 IPC memory models pass and quantify the common-path gain. Remaining
-gates are broader multi-seed IPC and paired routed FMax/LUT measurements. A
-tagged/decoupled DTLB response is a separate future lever for changed-VPN II=1;
-same-page P2 replacement is already II=1.
+gates are broader multi-seed IPC and paired routed FMax/LUT measurements. General
+hit-under-miss remains a separate future lever; resident changed-VPN DTLB and
+VIPT turnover are now II=1.

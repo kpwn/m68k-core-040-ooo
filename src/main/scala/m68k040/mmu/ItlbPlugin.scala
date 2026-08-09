@@ -144,6 +144,10 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // fills the TLB; the +1 cycle to LAUNCH is latency-agnostic (lock-step is
     // instruction-level). isWrite is constant False (a fetch is never a write);
     // rootPtr is already an MmuControl flop -> driven live.
+    // A cold miss may wait here for one deferred U/M slot. This keeps the resident
+    // hit path unchanged while preventing the single walker from completing into a
+    // full queue and overwriting an older update.
+    val umQueueFull = Bool()
     val missReqReg = new Area {
       val valid = RegInit(False)
       val vpn   = Reg(UInt(20 bits))
@@ -151,7 +155,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       val robId = Reg(UInt(6 bits))
     }
     missReqReg.valid := False
-    when(needWalk && !missReqReg.valid) {
+    when(needWalk && !missReqReg.valid && !umQueueFull) {
       missReqReg.valid := True
       missReqReg.vpn   := _req.vpn
       missReqReg.sup   := _req.supervisor
@@ -213,6 +217,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // A non-faulting walk that needs to set U pushes {robId, addr, newByte}; the
     // entry drains at the fetching instruction's commit and is discarded on a flush.
     val umq = new UmWriteQueue(4)
+    umQueueFull := umq.io.full
     umq.io.alloc.valid          := walker.io.done && walker.io.rsp.umWrite.valid && !walker.io.rsp.fault
     umq.io.alloc.payload.robId  := walkRobId
     umq.io.alloc.payload.addr   := walker.io.rsp.umWrite.addr

@@ -31,6 +31,7 @@ class StoreQueueSpec extends AnyFunSuite {
     dut.io.alloc.payload.strbB #= 0
     dut.io.alloc.payload.lineDataB #= 0
     dut.io.alloc.payload.cacheMode #= cacheMode
+    dut.io.alloc.payload.cacheModeB #= cacheMode
     dut.io.alloc.payload.supervisor #= supervisor
     dut.io.alloc.payload.precise #= precise
     cd.waitSampling()
@@ -437,6 +438,7 @@ class StoreQueueSpec extends AnyFunSuite {
       a.payload.paddrB #= 0x2000; a.payload.vaddrB #= 0x22000000L
       a.payload.nbytesB #= 2; a.payload.strbB #= 0x3; a.payload.lineDataB #= 0
       a.payload.cacheMode #= m68k040.cache.CacheMode.WRITETHROUGH
+      a.payload.cacheModeB #= m68k040.cache.CacheMode.WRITETHROUGH
       a.payload.supervisor #= false
       a.payload.precise #= true
       cd.waitSampling()
@@ -485,7 +487,8 @@ class StoreQueueSpec extends AnyFunSuite {
       a.payload.validB #= true
       a.payload.paddrB #= 0x2000; a.payload.vaddrB #= 0x22000000L
       a.payload.nbytesB #= 2; a.payload.strbB #= 0x3; a.payload.lineDataB #= 0
-      a.payload.cacheMode #= m68k040.cache.CacheMode.WRITETHROUGH
+      a.payload.cacheMode #= m68k040.cache.CacheMode.COPYBACK
+      a.payload.cacheModeB #= m68k040.cache.CacheMode.INHIBITED
       a.payload.supervisor #= false
       a.payload.precise #= true
       cd.waitSampling()
@@ -496,6 +499,8 @@ class StoreQueueSpec extends AnyFunSuite {
       // slot A drains cleanly (no error) -- entry does NOT pop yet (validB -> phase B next)
       cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
       assert(dut.io.drain.payload.paddr.toLong == 0x1000, "slot A presented first")
+      assert(dut.io.drain.payload.cacheMode.toEnum == m68k040.cache.CacheMode.COPYBACK,
+        "slot A must retain its own translated cache mode")
       cd.waitSampling()   // present -> held (drainBusy now registered True)
       dut.io.drainAck #= true
       sleep(1)
@@ -506,6 +511,8 @@ class StoreQueueSpec extends AnyFunSuite {
       // slot B now presented -> ack it cleanly too
       cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
       assert(dut.io.drain.payload.paddr.toLong == 0x2000, "slot B presented next (atomic two-half drain)")
+      assert(dut.io.drain.payload.cacheMode.toEnum == m68k040.cache.CacheMode.INHIBITED,
+        "slot B must retain its own translated cache mode")
       cd.waitSampling()   // present -> held (drainBusy now registered True)
       dut.io.drainAck #= true
       sleep(1)

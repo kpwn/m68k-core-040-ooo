@@ -1,7 +1,7 @@
 package m68k040.services
 
 import m68k040.types.CommitTrace
-import m68k040.cache.{FetchCmd, FetchRsp, TranslationReq, TranslationRsp}
+import m68k040.cache.{DTranslationCmd, DTranslationRsp, FetchCmd, FetchRsp, TranslationReq, TranslationRsp}
 import m68k040.frontend.DecodePacket
 import m68k040.decode.DecodedUop
 import m68k040.rename.RenamedUop
@@ -165,12 +165,12 @@ trait TranslationService {
   def rsp: TranslationRsp
 }
 
-/** D-side translation (DTLB; identity stub this slice). A SEPARATE service from
-  * the I-side TranslationService so the I-cache and D-cache each own a distinct
-  * request port (one TranslationService can have only one driver). */
+/** Tagged, elastic D-side translation service. A SEPARATE service from the I-side
+  * TranslationService so instruction and data translation each have exactly one
+  * request producer and the LSU can associate registered results across VPNs. */
 trait DTranslationService {
-  def req: TranslationReq
-  def rsp: TranslationRsp
+  def req: Stream[DTranslationCmd]
+  def rsp: Stream[DTranslationRsp]
 }
 
 /** Produced by the fetch/align stage; consumed by the (future) decode stage.

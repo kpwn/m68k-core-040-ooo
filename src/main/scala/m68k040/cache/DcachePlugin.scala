@@ -72,6 +72,14 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     loadProbeCancelPort.payload.token := U(0, DLoadToken.Width bits)
     loadProbeCancelPort.payload.all.allowOverride
     loadProbeCancelPort.payload.all := False
+    val loadProbeResolvePort = Flow(DLoadProbeResolve())
+    loadProbeResolvePort.valid.allowOverride; loadProbeResolvePort.valid := False
+    loadProbeResolvePort.payload.token.allowOverride
+    loadProbeResolvePort.payload.token := U(0, DLoadToken.Width bits)
+    loadProbeResolvePort.payload.paddr.allowOverride
+    loadProbeResolvePort.payload.paddr := U(0, 32 bits)
+    loadProbeResolvePort.payload.cacheMode.allowOverride
+    loadProbeResolvePort.payload.cacheMode := CacheMode.INHIBITED
     val loadCmdPort = Stream(DLoadCmd())
     loadCmdPort.valid.simPublic(); loadCmdPort.ready.simPublic(); loadCmdPort.payload.simPublic()
     val loadRspPort = Flow(DLoadRsp())
@@ -151,6 +159,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val probeReadOff   = Reg(UInt(offBits bits))
     val probeReadSize  = Reg(Size())
     val probeReadUsable = RegInit(False)
+    val probeReadNeedsLine = RegInit(False)
     val probeLineValid = RegInit(False)
     val probeLineSlot  = Reg(UInt(earlyProbePtrW bits))
     val probeLineHit   = RegInit(False)
@@ -352,13 +361,27 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     ldS1Size.simPublic(); ldS1Hit.simPublic(); ldS1HitWay.simPublic()
     val ldS1Line    = rdData(ldS1HitWay)
 
-    // Finish the previous cycle's virtual-set read against the PA hint captured
-    // from the matching DTLB response. The selected line gets one shared register
-    // cut; extraction into the reserved 32-bit result entry happens a cycle later.
+    // Finish the previous cycle's virtual-set read against the matching registered
+    // DTLB response. Its token and PA qualify the synchronous BRAM output in this
+    // cycle, so the cache stores only the selected line rather than all ways' raw
+    // data. If translation arrives late, this probe records an unusable miss and
+    // the resolved command safely falls back to the ordinary array-read path.
+    val probeResolveCanceled = loadProbeCancelPort.valid &&
+      (loadProbeCancelPort.payload.all ||
+       (loadProbeCancelPort.payload.token === loadProbeResolvePort.payload.token))
+    val probeResolveMatchesRead = loadProbeResolvePort.valid && probeReadValid &&
+      earlyProbeValids(probeReadSlot) &&
+      (earlyProbeTokens(probeReadSlot) === loadProbeResolvePort.payload.token) &&
+      !probeResolveCanceled
+    val probeResolvedTag = Mux(probeResolveMatchesRead,
+      loadProbeResolvePort.payload.paddr(31 downto offBits + setBits), probeReadTag)
+    val probeResolvedUsable = probeReadUsable ||
+      (probeResolveMatchesRead && !probeReadNeedsLine &&
+       (loadProbeResolvePort.payload.cacheMode =/= CacheMode.INHIBITED))
     val probeReadHitVec = Vec(Bool(), ways)
     for (w <- 0 until ways)
-      probeReadHitVec(w) := probeReadUsable && valids(w)(probeReadSet) &&
-                            (rdTag(w) === probeReadTag)
+      probeReadHitVec(w) := probeResolvedUsable && valids(w)(probeReadSet) &&
+                            (rdTag(w) === probeResolvedTag)
     val probeReadHitWay = OHToUInt(probeReadHitVec)
     probeReadValid := False
     probeLineValid := probeReadValid
@@ -898,6 +921,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
             probeReadUsable := loadProbePort.payload.resolved &&
                                !loadProbePort.payload.needsLine &&
                                (loadProbePort.payload.cacheMode =/= CacheMode.INHIBITED)
+            probeReadNeedsLine := loadProbePort.payload.needsLine
           }
         }
 
@@ -1974,6 +1998,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
   }
 
   override def loadProbe = logic.loadProbePort
+  override def loadProbeResolve = logic.loadProbeResolvePort
   override def loadProbeCancel = logic.loadProbeCancelPort
   override def loadCmd  = logic.loadCmdPort
   override def loadRsp  = logic.loadRspPort

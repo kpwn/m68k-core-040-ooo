@@ -11,11 +11,11 @@ object DLoadToken {
 
 /** Early VIPT lookup request. `vaddr` selects the page-invariant set in parallel
   * with the DTLB lookup and `token` associates the result with the later command.
-  * On a warm matching DTLB response, `resolved` qualifies the PA/cache/size hint
-  * used to finish the physical-tag comparison in the probe-result pipe. A probe
-  * may still launch with `resolved=False` to hide as much lookup latency as
-  * possible; that entry is deliberately unusable and the later command falls back
-  * to the ordinary resolved read path. */
+  * `resolved` supports an already-known PA hint. Normally the probe launches with
+  * `resolved=False`; the following tokenized DLoadProbeResolve qualifies the same
+  * synchronous array read when the registered DTLB response arrives. If that
+  * qualification is late, the entry is deliberately unusable and the later command
+  * falls back to the ordinary resolved read path. */
 case class DLoadProbe() extends Bundle {
   val vaddr     = UInt(32 bits)
   val token     = UInt(DLoadToken.Width bits)
@@ -31,6 +31,17 @@ case class DLoadProbe() extends Bundle {
 case class DLoadProbeCancel() extends Bundle {
   val token = UInt(DLoadToken.Width bits)
   val all   = Bool()
+}
+
+/** Physical-tag qualification for the synchronous read launched by DLoadProbe.
+  * The registered DTLB result arrives alongside that read's BRAM outputs; matching
+  * by token lets the cache finish the VIPT tag compare without retaining every
+  * way's raw tag/data or performing a second array read. A late resolution may be
+  * ignored safely; the later resolved DLoadCmd then uses the ordinary path. */
+case class DLoadProbeResolve() extends Bundle {
+  val token     = UInt(DLoadToken.Width bits)
+  val paddr     = UInt(32 bits)
+  val cacheMode = CacheMode()
 }
 
 /** Resolved load request: a virtual address + access size + the PRE-TRANSLATED physical
@@ -103,6 +114,7 @@ case class CacheMaintCmd() extends Bundle {
 /** D-cache service contract (spec 4.2). */
 trait DcacheService {
   def loadProbe: spinal.lib.Stream[DLoadProbe]       // virtual-set read, before translation
+  def loadProbeResolve: spinal.lib.Flow[DLoadProbeResolve] // matching registered PA/tag
   def loadProbeCancel: spinal.lib.Flow[DLoadProbeCancel]
   def loadCmd:  spinal.lib.Stream[DLoadCmd]   // resolved VA+PA; virtual index, physical tag
   def loadRsp:  spinal.lib.Flow[DLoadRsp]     // fixed offset for a hit; valid late on a miss-refill

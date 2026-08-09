@@ -1,6 +1,6 @@
 package m68k040.mmu
 
-import m68k040.cache.{CacheMode, TranslationReq, TranslationRsp}
+import m68k040.cache.{CacheMode, DTranslationCmd, DTranslationRsp}
 import m68k040.services.{DTranslationService, MmuControlService}
 import spinal.core._
 import spinal.core.sim._
@@ -14,14 +14,11 @@ import spinal.lib.misc.plugin.FiberPlugin
   *  - `mmuEnable` (sim-pokeable AND commit-time MOVEC-writable, task #131): when LOW the plugin is a pure
   *    identity passthrough (ppn=vpn, cacheable, no fault, always ready) — every
   *    existing MMU-disabled test/lock-step is unchanged.
-  *  - When HIGH: on a translation demand (`req.valid`), look up the TLB. A HIT
-  *    returns ppn/perms/cacheMode in 1 cycle (`rsp.ready`), with a perm fault flagged
-  *    for a write to a write-protected page or a user access to a supervisor page. A
-  *    MISS drops `rsp.ready` (the consumer stalls on its existing back-pressure path)
-  *    and launches the `TableWalker`; on completion the TLB is filled (speculative
-  *    fill OK) and a subsequent lookup hits. A walk that faults (non-resident /
-  *    write-protect / supervisor) is served directly from a result latch with
-  *    `rsp.fault` (FLAGGED, no exception delivery this slice).
+  *  - When HIGH: every accepted tagged command looks up the TLB. A HIT produces a
+  *    held registered response one cycle later, with the access-class permission
+  *    fault captured alongside the same token. A MISS blocks further commands and
+  *    launches the single `TableWalker`; completion fills the TLB (speculative fill
+  *    OK) and produces the original tagged response.
   *  - The walk's deferred U/M descriptor write is exposed on `umWrite` (drained at
   *    commit by the U/M-write queue — Task 4); the DTLB does NOT write it itself.
   *
@@ -30,17 +27,17 @@ import spinal.lib.misc.plugin.FiberPlugin
 class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
                  ways: Int = Tlb.DefaultWays,
                  banks: Int = Tlb.DefaultBanks) extends FiberPlugin with DTranslationService {
-  var _req: TranslationReq = null
-  var _rsp: TranslationRsp = null
+  var _req: Stream[DTranslationCmd] = null
+  var _rsp: Stream[DTranslationRsp] = null
 
-  override def req: TranslationReq = _req
-  override def rsp: TranslationRsp = _rsp
+  override def req: Stream[DTranslationCmd] = _req
+  override def rsp: Stream[DTranslationRsp] = _rsp
 
   during setup {
     // Allocate the service ports in the plugin's own scope (deterministic — avoids
     // a cross-scope assignment when a consumer touches rsp before this plugin builds).
-    _req = TranslationReq()
-    _rsp = TranslationRsp()
+    _req = Stream(DTranslationCmd())
+    _rsp = Stream(DTranslationRsp())
     // U/M queue hooks (sibling-driven; default-idle in logic via allowOverride so a
     // standalone DUT that doesn't wire them still elaborates).
     umAccessRobId = UInt(6 bits)
@@ -63,7 +60,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
   var umCommitBValid: Bool = null   // retire slot 1 (dual-retire) — see UmWriteQueue.commitB
   var umCommitBId:    UInt = null
   var umFlush:       Bool = null
-  // PFLUSHA: flush ALL TLB entries + the walk-result latch (task #136). Mirrors umFlush's
+  // PFLUSHA: flush ALL TLB entries + the elastic result slot (task #136). Mirrors umFlush's
   // default-idle/allowOverride shape so a standalone DUT elaborates.
   var flushAll:      Bool = null
   // AXI port for the walker + U/M descriptor write drain (full Axi4). Surfaces as
@@ -107,117 +104,108 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // ALREADY pure identity below — TTRs add no observable difference there, and
     // gating this way keeps every pre-existing MMU-disabled test bit-for-bit
     // unchanged). DTT0 has priority over DTT1 when both match (checked first).
-    val vaHi8   = _req.vpn(19 downto 12)   // == va[31:24] (vpn is va[31:12])
-    val dtt0Hit = mmuEnable && TtMatch.hit(dtt0, vaHi8, _req.supervisor)
-    val dtt1Hit = mmuEnable && !dtt0Hit && TtMatch.hit(dtt1, vaHi8, _req.supervisor)
+    val vaHi8   = _req.payload.vpn(19 downto 12)   // == va[31:24] (vpn is va[31:12])
+    val dtt0Hit = mmuEnable && TtMatch.hit(dtt0, vaHi8, _req.payload.supervisor)
+    val dtt1Hit = mmuEnable && !dtt0Hit && TtMatch.hit(dtt1, vaHi8, _req.payload.supervisor)
     val ttHit   = dtt0Hit || dtt1Hit
 
     // ---- TLB lookup (combinational) ----
-    tlb.io.lookupVpn := _req.vpn
+    tlb.io.lookupVpn := _req.payload.vpn
     tlb.io.invalidateAll := flushAll
     val tlbHit   = tlb.io.hit
     val tlbEntry = tlb.io.hitEntry
 
     // ─────────────────────────────────────────────────────────────────────────
-    // FMax: REGISTER the TLB hit-path result (decouple the deep `hitVec` cone).
-    //
-    // The combinational hit lookup is `lookupVpn -> banked way-mux tag-compare
-    // (hitVec, CARRY8) -> tlb.io.hit / hitEntry -> permFault/ppn -> rsp.ready/.fault`.
-    // That arc was the SHARED root of the route-dominated full-core limiters: it fans
-    // (a) into the LS-EU FSM s1Valid next-state, (b) into the D-cache load-accept +
-    // dataMem read/store-write, and (c) into the D-cache s1Fault — every consumer
-    // starts a fresh long cone off the LIVE lookup.
-    //
-    // Capture the hit's {vpn, ppn, writeProt, supervisor, cacheMode} into a 1-entry
-    // result register (`hr*`). The hit-class response is served from this REGISTER
-    // when it holds the live req.vpn (`hrMatch`), so the deep hitVec cone now ENDS at
-    // a flop instead of fanning combinationally into all consumers. permFault is
-    // recomputed against the LIVE req.write/supervisor (a 2-LUT cone, not the deep
-    // hitVec) so the access-class semantics are unchanged.
-    //
-    // Cost: the FIRST cycle a new vpn is presented, hrMatch is False (the register
-    // doesn't yet hold this vpn) so rsp.ready is low for that one cycle — the consumer
-    // stalls exactly as it already does on a DTLB miss (single-outstanding back-
-    // pressure holds req.vpn stable), then hrMatch asserts next cycle. Lock-step is
-    // latency-agnostic, so the +1 translate cycle on a TLB hit is free. The register
-    // is updated EVERY cycle a hit is observed, so it tracks the held vpn within one
-    // cycle and self-heals after a fill (a just-filled entry hits next cycle -> hr
-    // captures it). The `latchMatch` fast-path (walk-completion / fault) is unchanged
-    // and still serves combinationally so a walk result is delivered without an extra
-    // cycle (it already cost the multi-cycle walk).
-    val hrValid = RegInit(False)
-    val hrVpn   = Reg(UInt(20 bits))
-    val hrPpn   = Reg(UInt(20 bits))
-    val hrWp    = Reg(Bool())
-    val hrSup   = Reg(Bool())
-    val hrCmode = Reg(CacheMode())
-    hrValid := False
-    when(mmuEnable && _req.valid && tlbHit) {
-      hrValid := True
-      hrVpn   := _req.vpn
-      hrPpn   := tlbEntry.ppn
-      hrWp    := tlbEntry.writeProt
-      hrSup   := tlbEntry.supervisor
-      hrCmode := tlbEntry.cacheMode
-    }
-    val hrMatch = hrValid && (hrVpn === _req.vpn)
+    // Elastic registered response.  The 32-entry ATC remains the existing shallow
+    // two-bank/four-way structure; this change adds no CAM entries or lookup copy.
+    // The deep hitVec/way-mux cone ends at rspPayload.  Command readiness depends
+    // only on registered response/walker occupancy, never on the current hit result.
+    def permFault(wp: Bool, sup: Bool, write: Bool, supervisor: Bool): Bool =
+      (write && wp) || (sup && !supervisor)
 
-    // ---- result latch (serves the cycle(s) around a walk completion + faults) ----
-    val latchValid  = RegInit(False)
-    val latchVpn    = Reg(UInt(20 bits))
-    val latchPpn    = Reg(UInt(20 bits))
-    val latchWp     = Reg(Bool())
-    val latchSup    = Reg(Bool())
-    val latchCmode  = Reg(CacheMode())
-    val latchFault  = Reg(Bool())
+    val rspValid   = RegInit(False)
+    val rspPayload = Reg(DTranslationRsp())
+    val rspVpn     = Reg(UInt(20 bits)) // sim-only precise fault observation
+    val missPending = RegInit(False)
+    val walkFlushPoison = RegInit(False)
+    val walkUmPoison = RegInit(False)
+    missPending.simPublic()
 
-    // ---- walker control ----
-    // A walk is needed when enabled + a live demand + TLB miss + the latch doesn't
-    // already hold this VPN's result + the walker is idle.
-    val latchMatch = latchValid && (latchVpn === _req.vpn)
-    // Suppress re-trigger on the `done` cycle: busy has dropped but the fill/latch
-    // (registered) have not yet taken effect, so a naive needWalk would spuriously
-    // restart the walker for the just-resolved VPN.
-    val needWalk   = mmuEnable && _req.valid && !tlbHit && !latchMatch && !ttHit &&
-                     !walker.io.busy && !walker.io.done
+    _rsp.valid   := rspValid && !flushAll
+    _rsp.payload := rspPayload
+    _req.ready   := !missPending && (!rspValid || _rsp.ready) && !flushAll
+
+    when(_rsp.fire) { rspValid := False }
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax: REGISTER the miss→walker TRIGGER (sever the Dcache valids → walker cone).
     //
-    // Driving `walker.io.req.vpn := _req.vpn` and `walker.io.start := needWalk`
+    // Driving `walker.io.req.vpn` and `walker.io.start` from a live miss result
     // LIVE put the cross-module cone `Dcache valids → LsEu → _req.vpn → tlb hitVec
     // → walker fsm CE` (WNS −1.206, the gate-failer) directly on the walker FSM's
     // clock-enable. The walker has its OWN AXI port — there is NO data coupling,
     // only this trigger chain. Capture the miss request {vpn,write,super,robId}
-    // into `missReqReg` flops on the cycle `needWalk` fires, then drive
+    // into `missReqReg` flops on the accepted miss cycle, then drive
     // walker.io.req/.start from those FLOPS one cycle later. The deep hitVec/valids
     // cone now ENDS at missReqReg; the walker is driven from registers.
     //
-    // Single-outstanding: `missReqReg.valid` is a 1-cycle pulse. `needWalk` already
-    // gates on walker-idle (!busy) + the anti-respin (!done, !latchMatch), and we
-    // additionally suppress capture while a launch is already pending
-    // (`!missReqReg.valid`) so EXACTLY ONE start pulse is emitted per miss:
-    //   N   : needWalk -> missReqReg.valid<=1 (capture)         [walker idle]
+    // Single-outstanding: `missReqReg.valid` holds one captured miss until the
+    // walker and one deferred-U/M slot are available. `missPending` prevents another
+    // command from entering until that walk resolves or is invalidated:
+    //   N   : req.fire miss -> missReqReg.valid<=1 (capture)    [walker idle]
     //   N+1 : walker.io.start = missReqReg.valid = 1 (launch)   [walker still idle;
     //         capture suppressed by !missReqReg.valid; walker latches reqReg]
-    //   N+2 : walker busy -> needWalk false (no re-launch); walk runs to fill/latch.
-    // The LS-EU holds the request valid + stalls (rsp.ready=False) until the walk
-    // fills the TLB; the +1 cycle to LAUNCH is latency-agnostic (lock-step is
-    // instruction-level). rootPtr is already an MmuControl flop -> driven live.
+    //   N+2 : walker busy; walk runs to fill the TLB and held response register.
+    // rootPtr is already an MmuControl flop -> driven live.
+    // Forward-declared credit from the U/M queue below. A full queue delays only a
+    // captured cold miss's walker launch; direct resident hits still use the same
+    // readiness and never acquire a queue-full dependency.
+    val umQueueFull = Bool()
     val missReqReg = new Area {
       val valid = RegInit(False)
       val vpn   = Reg(UInt(20 bits))
       val write = Reg(Bool())
       val sup   = Reg(Bool())
+      val token = Reg(UInt(m68k040.cache.DTranslationToken.Width bits))
       val robId = Reg(UInt(6 bits))
     }
-    missReqReg.valid := False
-    when(needWalk && !missReqReg.valid) {
-      missReqReg.valid := True
-      missReqReg.vpn   := _req.vpn
-      missReqReg.write := _req.write
-      missReqReg.sup   := _req.supervisor
-      missReqReg.robId := umAccessRobId
+    // Direct classes all produce a registered tagged response. A TLB miss instead
+    // captures the existing single walker context. Accept-last ordering lets an old
+    // response fire while the next direct hit is captured in the same cycle.
+    when(_req.fire) {
+      when(!mmuEnable) {
+        rspValid             := True
+        rspPayload.ppn       := _req.payload.vpn
+        rspPayload.cacheMode := CacheMode.WRITETHROUGH
+        rspPayload.fault     := False
+        rspPayload.token     := _req.payload.token
+        rspVpn               := _req.payload.vpn
+      } elsewhen(ttHit) {
+        rspValid             := True
+        rspPayload.ppn       := _req.payload.vpn
+        rspPayload.cacheMode := TtMatch.cacheMode(Mux(dtt0Hit, dtt0, dtt1))
+        rspPayload.fault     := False
+        rspPayload.token     := _req.payload.token
+        rspVpn               := _req.payload.vpn
+      } elsewhen(tlbHit) {
+        rspValid             := True
+        rspPayload.ppn       := tlbEntry.ppn
+        rspPayload.cacheMode := tlbEntry.cacheMode
+        rspPayload.fault     := permFault(tlbEntry.writeProt, tlbEntry.supervisor,
+                                           _req.payload.write, _req.payload.supervisor)
+        rspPayload.token     := _req.payload.token
+        rspVpn               := _req.payload.vpn
+      } otherwise {
+        missReqReg.valid := True
+        missReqReg.vpn   := _req.payload.vpn
+        missReqReg.write := _req.payload.write
+        missReqReg.sup   := _req.payload.supervisor
+        missReqReg.token := _req.payload.token
+        missReqReg.robId := umAccessRobId
+        missPending      := True
+        walkFlushPoison  := False
+        walkUmPoison     := False
+      }
     }
 
     // Real 68040 semantics: a supervisor-space access walks SRP, a user-space
@@ -229,14 +217,17 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     walker.io.req.rootPtr := Mux(missReqReg.sup, srp, urp)
     walker.io.req.isWrite := missReqReg.write
     walker.io.req.isSuper := missReqReg.sup
-    walker.io.start       := missReqReg.valid
+    walker.io.start       := missReqReg.valid && !umQueueFull && !flushAll
+    when(walker.io.start) { missReqReg.valid := False }
 
     // VPN a walk is servicing: latched at walk-LAUNCH (the registered-trigger cycle)
-    // so the fill/latch target the right VPN even if _req.vpn changes while walking.
+    // so the fill/result target the right VPN even if a later command changes it.
     val walkVpn = Reg(UInt(20 bits))
+    val walkToken = Reg(UInt(m68k040.cache.DTranslationToken.Width bits))
     val walkRobId = Reg(UInt(6 bits))   // robId of the access that triggered the walk
-    when(missReqReg.valid) {
+    when(walker.io.start) {
       walkVpn   := missReqReg.vpn
+      walkToken := missReqReg.token
       walkRobId := missReqReg.robId
     }
 
@@ -251,48 +242,37 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     tlb.io.fillVpn   := walkVpn
     tlb.io.fillEntry := fe
     when(walker.io.done) {
-      latchValid := True
-      latchVpn   := walkVpn
-      latchPpn   := walker.io.rsp.ppn
-      latchWp    := walker.io.rsp.writeProt
-      latchSup   := walker.io.rsp.supervisor
-      latchCmode := walker.io.rsp.cacheMode
-      // Task #137 fix: only latch the walker's fault verdict as STICKY when the
-      // reason is access-INDEPENDENT (NON_RESIDENT — any access to a non-resident
-      // page always faults, regardless of read/write/privilege). WRITE_PROTECT and
-      // SUPERVISOR are access-DEPENDENT (a write-protected page faults on a WRITE
-      // but not a READ; a supervisor page faults for USER but not SUPERVISOR) — for
-      // those, latchFault must NOT be sticky-true, or a later `latchMatch` hit from
-      // a DIFFERENT access (e.g. a read right after the write that triggered this
-      // walk) incorrectly inherits the ORIGINAL access's fault verdict. permFault()
-      // below already correctly RE-derives write-protect/supervisor faults live
-      // against the current request (latchWp/latchSup are captured unconditionally,
-      // regardless of fault status) — latchFault only needs to cover the case
-      // permFault can't: non-residency.
-      latchFault := walker.io.rsp.fault && (walker.io.rsp.faultReason === MmuFaultReason.NON_RESIDENT)
-      when(!walker.io.rsp.fault) {
+      missPending := False
+      when(!walkFlushPoison && !flushAll) {
+        assert(!rspValid, "walker result collided with an occupied DTLB response")
+        rspValid             := True
+        rspPayload.ppn       := walker.io.rsp.ppn
+        rspPayload.cacheMode := walker.io.rsp.cacheMode
+        rspPayload.fault     := walker.io.rsp.fault
+        rspPayload.token     := walkToken
+        rspVpn               := walkVpn
+      }
+      when(!walker.io.rsp.fault && !walkFlushPoison && !flushAll) {
         tlb.io.fillValid := True
       }
     }
-    // A faulting walk caches its FAULT in the result latch (the TLB is NOT filled on
-    // a fault). On a flush (umFlush == the commit-time doFlush squash — which fires
-    // when an access fault is DELIVERED) invalidate the latch so a re-executed access
-    // after the handler maps the page RE-WALKS (and now sees the resident descriptor)
-    // rather than re-reading the stale non-resident fault. A real 68040 handler
-    // PFLUSHes the ATC before RTE; clearing the 1-entry latch here is the equivalent
-    // for our result cache (and is harmless on a branch-mispredict flush — it just
-    // forces one re-walk). The filled TLB is left intact (it only holds resident
-    // translations, which remain valid across a flush).
-    when(umFlush) {
-      latchValid := False
-    }
-    // PFLUSHA: the TLB array itself is cleared combinationally via tlb.io.invalidateAll
-    // above; the 1-entry walk-result latch needs its own explicit clear (it bypasses the
-    // TLB array entirely on a match) or a same-VPN access right after the flush would
-    // still hit stale latched state.
+
+    // PFLUSHA clears the response slot and prevents a pre-flush in-flight walk from
+    // refilling the just-invalidated ATC. Branch/exception flush may retain a
+    // speculative resident fill; the tagged response is discarded by the LSU epoch.
     when(flushAll) {
-      latchValid := False
+      rspValid := False
+      when(missReqReg.valid) {
+        missReqReg.valid := False
+        missPending      := False
+      } elsewhen(missPending) {
+        walkFlushPoison := True
+      }
     }
+    // A speculative resident translation may still fill after a backend squash,
+    // but its architectural deferred U/M write belongs to the killed ROB entry and
+    // must never be allocated after the one-cycle flush pulse has passed.
+    when(umFlush && missPending) { walkUmPoison := True }
 
     // ---- deferred U/M descriptor-write queue (speculative; drained at commit) ----
     // A non-faulting walk that needs to set U (and M on a write) pushes {robId, addr,
@@ -300,7 +280,10 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // descriptor byte over this same AXI bus) and is discarded on a flush. NOT
     // performed speculatively.
     val umq = new UmWriteQueue(4)
-    umq.io.alloc.valid          := walker.io.done && walker.io.rsp.umWrite.valid && !walker.io.rsp.fault
+    umQueueFull := umq.io.full
+    umq.io.alloc.valid          := walker.io.done && walker.io.rsp.umWrite.valid &&
+                                  !walker.io.rsp.fault && !walkUmPoison &&
+                                  !walkFlushPoison && !flushAll
     umq.io.alloc.payload.robId  := walkRobId
     umq.io.alloc.payload.addr   := walker.io.rsp.umWrite.addr
     umq.io.alloc.payload.newByte:= walker.io.rsp.umWrite.newByte
@@ -356,49 +339,6 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // ack the queue once the write lands (b handshake). drainAck pops the entry.
     umq.io.drainAck := walkerAxi.b.valid && walkerAxi.b.ready
 
-    // ---- response mux ----
-    // hit-class perm fault: a write to a write-protected page, or a user access to
-    // a supervisor page (computed from the TLB/latch perms + the access class).
-    def permFault(wp: Bool, sup: Bool): Bool =
-      (_req.write && wp) || (sup && !_req.supervisor)
-
-    when(!mmuEnable) {
-      // identity passthrough — §5.1 USER DECISION: stays WRITETHROUGH (not COPYBACK)
-      // so MMU-off drains still write memory through unchanged.
-      _rsp.ready     := True
-      _rsp.ppn       := _req.vpn
-      _rsp.cacheMode := CacheMode.WRITETHROUGH
-      _rsp.fault     := False
-    } elsewhen(ttHit) {
-      // DTT0/DTT1 transparent-translation hit (task #194): bypasses the walker/TLB
-      // entirely, exactly like real 68040 hardware checks the TTRs before the ATC.
-      // PA=VA, never faults, no page table consulted.
-      _rsp.ready     := True
-      _rsp.ppn       := _req.vpn
-      _rsp.cacheMode := TtMatch.cacheMode(Mux(dtt0Hit, dtt0, dtt1))
-      _rsp.fault     := False
-    } elsewhen(hrMatch) {
-      // hit served from the REGISTERED result (the deep hitVec cone ended at hr*).
-      // permFault is recomputed against the live req.write/supervisor (short cone);
-      // the held entry perms (hrWp/hrSup) and ppn/cacheMode come from flops.
-      _rsp.ready     := True
-      _rsp.ppn       := hrPpn
-      _rsp.cacheMode := hrCmode
-      _rsp.fault     := permFault(hrWp, hrSup)
-    } elsewhen(latchMatch) {
-      // walk just resolved this VPN (fault, or the 1-cycle gap before the fill).
-      _rsp.ready     := True
-      _rsp.ppn       := latchPpn
-      _rsp.cacheMode := latchCmode
-      _rsp.fault     := latchFault || permFault(latchWp, latchSup)
-    } otherwise {
-      // miss: walking (rsp not ready -> consumer stalls).
-      _rsp.ready     := False
-      _rsp.ppn       := _req.vpn
-      _rsp.cacheMode := CacheMode.WRITETHROUGH   // don't-care (rsp not ready)
-      _rsp.fault     := False
-    }
-
     // Sim-only sticky fault observation: set whenever a translation resolves with a
     // fault flagged (FLAGGED only — no exception delivery this slice). The lock-step
     // harness asserts it for the non-resident-page fault test.
@@ -406,6 +346,9 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // Sim-only: the faulting access's page-base VA (vpn<<12) — the lock-step harness
     // asserts the mid-EA pointer-load fault carries the POINTER-LOAD address (precision).
     val faultVa   = Reg(UInt(32 bits)) init (0); faultVa.simPublic()
-    when(_rsp.ready && _rsp.fault) { faultSeen := True; faultVa := (_req.vpn << 12).resize(32) }
+    when(_rsp.fire && _rsp.payload.fault) {
+      faultSeen := True
+      faultVa := (rspVpn << 12).resize(32)
+    }
   }
 }

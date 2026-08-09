@@ -28,6 +28,7 @@ case class SqAlloc() extends Bundle {
   val lineDataB = Bits(128 bits)
   // ---- cache-mode / precision classification (captured at translate) ----
   val cacheMode  = CacheMode()
+  val cacheModeB = CacheMode()
   val supervisor = Bool()
   val precise    = Bool()   // !fast -- withhold ROB completion; drain at head, awaited
 }
@@ -145,6 +146,7 @@ class StoreQueue(depth: Int = 8) extends Component {
   val vaddrAs    = Vec.fill(depth)(RegInit(U(0, 32 bits)))
   val vaddrBs    = Vec.fill(depth)(RegInit(U(0, 32 bits)))
   val cacheModes = Vec.fill(depth)(RegInit(CacheMode.WRITETHROUGH))
+  val cacheModesB= Vec.fill(depth)(RegInit(CacheMode.WRITETHROUGH))
   val supervisors= Vec.fill(depth)(RegInit(False))
   val precises   = Vec.fill(depth)(RegInit(False))
 
@@ -231,7 +233,7 @@ class StoreQueue(depth: Int = 8) extends Component {
     io.drain.payload.useStrb  := True
     io.drain.payload.strb     := strbBs(head)
     io.drain.payload.lineData := lineDataBs(head)
-    io.drain.payload.cacheMode := cacheModes(head)
+    io.drain.payload.cacheMode := cacheModesB(head)
     io.drain.payload.precise  := precises(head)
   }
 
@@ -375,6 +377,7 @@ class StoreQueue(depth: Int = 8) extends Component {
     vaddrAs(tail)     := io.alloc.payload.vaddr
     vaddrBs(tail)     := io.alloc.payload.vaddrB
     cacheModes(tail)  := io.alloc.payload.cacheMode
+    cacheModesB(tail) := io.alloc.payload.cacheModeB
     supervisors(tail) := io.alloc.payload.supervisor
     precises(tail)    := io.alloc.payload.precise
     tail := tail + 1
@@ -545,7 +548,8 @@ class StoreQueue(depth: Int = 8) extends Component {
   // P2.1: per-entry precise-path storage (vaddr/cacheMode/supervisor/precise), tapped
   // so directed alloc-then-inspect tests can verify the ring stored what was allocated.
   vaddrAs.foreach(_.simPublic()); vaddrBs.foreach(_.simPublic())
-  cacheModes.foreach(_.simPublic()); supervisors.foreach(_.simPublic()); precises.foreach(_.simPublic())
+  cacheModes.foreach(_.simPublic()); cacheModesB.foreach(_.simPublic())
+  supervisors.foreach(_.simPublic()); precises.foreach(_.simPublic())
   io.drain.valid.simPublic(); io.drainAck.simPublic(); io.flush.simPublic()
   // Task #139 mechanism #2: catch the ORIGINATING alloc of any SQ entry, so a
   // later-observed stuck head can be traced back to the actual allocating PC

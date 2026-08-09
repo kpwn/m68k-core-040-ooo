@@ -2,7 +2,7 @@ package m68k040.mmu
 
 import m68k040.{M68kParams, VerilatorTest}
 import m68k040.core.ParamPlugin
-import m68k040.cache.{TranslationReq, TranslationRsp}
+import m68k040.cache.{DTranslationToken, TranslationReq, TranslationRsp}
 import m68k040.services.DTranslationService
 import m68k040.ls.BehavioralMemAgent
 import spinal.core._
@@ -24,18 +24,27 @@ class UmProbePlugin extends FiberPlugin {
     val commitValid = in Bool ()
     val commitId    = in UInt (6 bits)
     val flush       = in Bool ()
-    xlate.req.valid      := reqIn.valid
-    xlate.req.vpn        := reqIn.vpn
-    xlate.req.supervisor := reqIn.supervisor
-    xlate.req.write      := reqIn.write
-    rspOut.ready     := xlate.rsp.ready
-    rspOut.ppn       := xlate.rsp.ppn
-    rspOut.cacheMode := xlate.rsp.cacheMode
-    rspOut.fault     := xlate.rsp.fault
+    val pflusha     = in Bool ()
+    val walkDone    = out Bool ()
+    val requestIssued = RegInit(False)
+    xlate.req.valid      := reqIn.valid && !requestIssued
+    xlate.req.payload.vpn        := reqIn.vpn
+    xlate.req.payload.supervisor := reqIn.supervisor
+    xlate.req.payload.write      := reqIn.write
+    xlate.req.payload.token      := U(0, DTranslationToken.Width bits)
+    xlate.rsp.ready   := !reqIn.valid
+    rspOut.ready      := xlate.rsp.valid
+    rspOut.ppn        := xlate.rsp.payload.ppn
+    rspOut.cacheMode  := xlate.rsp.payload.cacheMode
+    rspOut.fault      := xlate.rsp.payload.fault
+    when(xlate.req.fire) { requestIssued := True }
+    when(!reqIn.valid)   { requestIssued := False }
     dtlb.umAccessRobId := accessRobId
     dtlb.umCommitValid := commitValid
     dtlb.umCommitId    := commitId
     dtlb.umFlush       := flush
+    dtlb.flushAll      := pflusha
+    walkDone           := dtlb.logic.walker.io.done
   }
 }
 
@@ -99,6 +108,7 @@ class UmWriteSpec extends AnyFunSuite {
     dut.probe.logic.accessRobId #= 0
     dut.probe.logic.commitValid #= false; dut.probe.logic.commitId #= 0
     dut.probe.logic.flush #= false
+    dut.probe.logic.pflusha #= false
     cd.waitSampling(4)
     dut.ctrl.logic.mmuEnable #= true
     dut.ctrl.logic.urp   #= ROOT
@@ -152,6 +162,231 @@ class UmWriteSpec extends AnyFunSuite {
       cd.waitSampling(); dut.probe.logic.commitValid #= false
       cd.waitSampling(20)
       assert(mem.peekByte(pageAddr + 3) == 0x01, "no drain after a discarded entry")
+    }
+  }
+
+  test("flush during an active walk poisons its late U/M allocation", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val (cd, mem) = init(dut)
+      val va = 0x01005000L
+      val pageAddr = buildTable(mem, va, ppn = 0x23450L)
+
+      dut.probe.logic.accessRobId #= 11
+      dut.probe.logic.reqIn.valid #= true
+      dut.probe.logic.reqIn.vpn #= vpnOf(va)
+      dut.probe.logic.reqIn.write #= true
+      dut.probe.logic.reqIn.supervisor #= false
+
+      // Wait until the walk is genuinely active, then squash before completion.
+      var guard = 0
+      while (!(dut.walkerAxi.ar.valid.toBoolean && dut.walkerAxi.ar.ready.toBoolean) && guard < 100) {
+        cd.waitSampling(); guard += 1
+      }
+      assert(guard < 100, "write walk never launched")
+      dut.probe.logic.flush #= true
+      cd.waitSampling()
+      dut.probe.logic.flush #= false
+
+      guard = 0
+      while (!dut.probe.logic.rspOut.ready.toBoolean && guard < 300) {
+        cd.waitSampling(); guard += 1
+      }
+      assert(dut.probe.logic.rspOut.ready.toBoolean, "poisoned walk still returns its tagged result")
+      dut.probe.logic.reqIn.valid #= false
+      cd.waitSampling(2)
+
+      // Reusing/committing the same ROB id after the old walk finishes must not
+      // resurrect its discarded descriptor update.
+      dut.probe.logic.commitValid #= true
+      dut.probe.logic.commitId #= 11
+      cd.waitSampling()
+      dut.probe.logic.commitValid #= false
+      cd.waitSampling(30)
+      assert(mem.peekByte(pageAddr + 3) == 0x01,
+        "a walk completing after flush must not allocate or drain U/M")
+    }
+  }
+
+  test("a full four-entry U/M queue stalls the fifth walker without overwrite", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val (cd, mem) = init(dut)
+      val vas = (0 until 5).map(i => 0x01402000L + i * 0x1000L)
+      val pageAddrs = vas.zipWithIndex.map { case (va, i) =>
+        buildTable(mem, va, ppn = 0x30000L + i)
+      }
+
+      var arCount = 0
+      fork { while (true) { cd.waitSampling()
+        if (dut.walkerAxi.ar.valid.toBoolean && dut.walkerAxi.ar.ready.toBoolean) arCount += 1
+      } }
+
+      // Four uncommitted write walks consume every deferred-update slot.
+      for (i <- 0 until 4) walk(dut, cd, vas(i), write = true, robId = i + 1)
+      assert(arCount >= 12, s"four cold walks should issue at least 12 ARs, got $arCount")
+      for (i <- 0 until 4)
+        assert(mem.peekByte(pageAddrs(i) + 3) == 0x01,
+          s"descriptor $i drained before commit; the full-queue setup is not live")
+      val beforeFifth = arCount
+
+      // The fifth DTLB command may be accepted into the cold miss holder, but its
+      // walker must not launch until an older slot is safely drained.
+      dut.probe.logic.accessRobId #= 5
+      dut.probe.logic.reqIn.valid #= true
+      dut.probe.logic.reqIn.vpn #= vpnOf(vas(4))
+      dut.probe.logic.reqIn.write #= true
+      dut.probe.logic.reqIn.supervisor #= false
+      cd.waitSampling(12)
+      assert(!dut.probe.logic.rspOut.ready.toBoolean, "fifth walk must wait for U/M credit")
+      assert(arCount == beforeFifth,
+        s"full queue launched a fifth walk: AR $beforeFifth -> $arCount")
+
+      // Commit/drain the oldest update. If tail had silently overwritten it, this
+      // byte would never update and the fifth walk would remain deadlocked.
+      dut.probe.logic.commitValid #= true
+      dut.probe.logic.commitId #= 1
+      cd.waitSampling()
+      dut.probe.logic.commitValid #= false
+      var guard = 0
+      while (mem.peekByte(pageAddrs.head + 3) != 0x19 && guard < 200) {
+        cd.waitSampling(); guard += 1
+      }
+      assert(mem.peekByte(pageAddrs.head + 3) == 0x19,
+        "oldest full-queue entry was preserved and drained")
+
+      guard = 0
+      while (!dut.probe.logic.rspOut.ready.toBoolean && guard < 300) {
+        cd.waitSampling(); guard += 1
+      }
+      assert(dut.probe.logic.rspOut.ready.toBoolean, "fifth walk resumes after credit returns")
+      assert(arCount >= beforeFifth + 3, s"resumed fifth walk did not perform a full walk: $arCount")
+      dut.probe.logic.reqIn.valid #= false
+      cd.waitSampling(2)
+      assert(mem.peekByte(pageAddrs(4) + 3) == 0x01,
+        "fifth update remains speculative before its own commit")
+
+      // Drain every remaining unique ROB association; no descriptor may be lost or
+      // cross-associated around the full-ring tail/head turnover.
+      for (rob <- 2 to 5) {
+        dut.probe.logic.commitValid #= true
+        dut.probe.logic.commitId #= rob
+        cd.waitSampling()
+        dut.probe.logic.commitValid #= false
+        cd.waitSampling(30)
+      }
+      for (i <- pageAddrs.indices)
+        assert(mem.peekByte(pageAddrs(i) + 3) == 0x19,
+          s"descriptor $i lost/cross-associated around U/M full turnover")
+    }
+  }
+
+  test("PFLUSHA on walker done suppresses the old fill, response, and U/M update", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val (cd, mem) = init(dut)
+      val va = 0x01807000L
+      val pageAddr = buildTable(mem, va, ppn = 0x45670L)
+
+      var arCount = 0
+      fork { while (true) { cd.waitSampling()
+        if (dut.walkerAxi.ar.valid.toBoolean && dut.walkerAxi.ar.ready.toBoolean) arCount += 1
+      } }
+
+      dut.probe.logic.accessRobId #= 12
+      dut.probe.logic.reqIn.valid #= true
+      dut.probe.logic.reqIn.vpn #= vpnOf(va)
+      dut.probe.logic.reqIn.write #= true
+      dut.probe.logic.reqIn.supervisor #= false
+
+      // Assert PFLUSHA during the exact cycle in which walker.done is presented
+      // to DtlbPlugin.  This is the collision that used to enqueue the old U/M
+      // descriptor even though the response and TLB fill were discarded.
+      var guard = 0
+      while (!dut.probe.logic.walkDone.toBoolean && guard < 300) {
+        cd.waitSampling(); sleep(1); guard += 1
+      }
+      assert(guard < 300, "walk never reached its done collision cycle")
+      assert(arCount >= 3, s"cold walk setup was vacuous: only $arCount descriptor reads")
+      dut.probe.logic.pflusha #= true
+      cd.waitSampling()
+      dut.probe.logic.pflusha #= false
+      dut.probe.logic.reqIn.valid #= false
+      cd.waitSampling(3)
+      assert(!dut.probe.logic.rspOut.ready.toBoolean,
+        "PFLUSHA/done collision leaked the pre-flush response")
+
+      dut.probe.logic.commitValid #= true
+      dut.probe.logic.commitId #= 12
+      cd.waitSampling()
+      dut.probe.logic.commitValid #= false
+      cd.waitSampling(30)
+      assert(mem.peekByte(pageAddr + 3) == 0x01,
+        "PFLUSHA/done collision leaked the pre-flush U/M update")
+
+      // The old fill must also be absent: the same VPN must perform all three
+      // descriptor reads again before returning a current result.
+      val beforeReplay = arCount
+      walk(dut, cd, va, write = true, robId = 13)
+      assert(arCount >= beforeReplay + 3,
+        s"PFLUSHA/done collision left a stale resident fill: $beforeReplay -> $arCount")
+      dut.probe.logic.commitValid #= true
+      dut.probe.logic.commitId #= 13
+      cd.waitSampling()
+      dut.probe.logic.commitValid #= false
+      guard = 0
+      while (mem.peekByte(pageAddr + 3) != 0x19 && guard < 200) {
+        cd.waitSampling(); guard += 1
+      }
+      assert(mem.peekByte(pageAddr + 3) == 0x19,
+        "post-PFLUSHA replay did not preserve the new U/M association")
+    }
+  }
+
+  test("PFLUSHA during an active walk poisons its later response, fill, and U/M update", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val (cd, mem) = init(dut)
+      val va = 0x01C09000L
+      val pageAddr = buildTable(mem, va, ppn = 0x56790L)
+
+      var arCount = 0
+      fork { while (true) { cd.waitSampling()
+        if (dut.walkerAxi.ar.valid.toBoolean && dut.walkerAxi.ar.ready.toBoolean) arCount += 1
+      } }
+
+      dut.probe.logic.accessRobId #= 20
+      dut.probe.logic.reqIn.valid #= true
+      dut.probe.logic.reqIn.vpn #= vpnOf(va)
+      dut.probe.logic.reqIn.write #= true
+      dut.probe.logic.reqIn.supervisor #= false
+      var guard = 0
+      while (arCount == 0 && guard < 100) { cd.waitSampling(); guard += 1 }
+      assert(arCount > 0, "walk never became active before PFLUSHA")
+
+      dut.probe.logic.pflusha #= true
+      cd.waitSampling()
+      dut.probe.logic.pflusha #= false
+
+      guard = 0
+      while (!dut.probe.logic.walkDone.toBoolean && guard < 300) {
+        cd.waitSampling(); sleep(1); guard += 1
+      }
+      assert(guard < 300 && arCount >= 3, "poisoned walk did not finish normally")
+      cd.waitSampling(3)
+      assert(!dut.probe.logic.rspOut.ready.toBoolean,
+        "an active pre-PFLUSHA walk leaked its later response")
+      dut.probe.logic.reqIn.valid #= false
+      cd.waitSampling(2)
+
+      dut.probe.logic.commitValid #= true
+      dut.probe.logic.commitId #= 20
+      cd.waitSampling()
+      dut.probe.logic.commitValid #= false
+      cd.waitSampling(30)
+      assert(mem.peekByte(pageAddr + 3) == 0x01,
+        "an active pre-PFLUSHA walk leaked its later U/M update")
+
+      val beforeReplay = arCount
+      walk(dut, cd, va, write = true, robId = 21)
+      assert(arCount >= beforeReplay + 3,
+        s"an active pre-PFLUSHA walk left a stale fill: $beforeReplay -> $arCount")
     }
   }
 }

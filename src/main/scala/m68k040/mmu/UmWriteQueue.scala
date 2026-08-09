@@ -41,6 +41,9 @@ class UmWriteQueue(depth: Int = 4) extends Component {
     val flush    = in Bool ()
     val drain    = master(Flow(UmWriteDrain()))
     val drainAck = in Bool ()
+    // Admission credit for the owning single walker. A full queue must never
+    // silently wrap `tail` and overwrite an older architectural U/M update.
+    val full     = out Bool ()
   }
 
   val valids    = Vec.fill(depth)(RegInit(False))
@@ -51,6 +54,7 @@ class UmWriteQueue(depth: Int = 4) extends Component {
 
   val head = RegInit(U(0, ptrW bits))
   val tail = RegInit(U(0, ptrW bits))
+  io.full := valids.asBits.andR
 
   // ---- drain: oldest valid+committed entry, held until ack ----
   val drainBusy  = RegInit(False)
@@ -79,6 +83,7 @@ class UmWriteQueue(depth: Int = 4) extends Component {
 
   // ---- alloc: push at tail (speculative) ----
   when(io.alloc.valid && !io.flush) {
+    assert(!io.full, "UmWriteQueue allocation attempted while full")
     valids(tail)    := True
     committed(tail) := False
     robIds(tail)    := io.alloc.payload.robId

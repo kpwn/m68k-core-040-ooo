@@ -115,3 +115,22 @@ case class TranslationRsp() extends Bundle {
   val cacheMode = CacheMode()
   val fault     = Bool()
 }
+
+/** Tagged D-side translation command.  Unlike the independent I-side port, the
+  * D-side is an elastic request/response pipeline: the LSU may launch a new VPN
+  * while the preceding registered response is consumed. */
+object DTranslationToken {
+  val Width = 8 // {backendEpoch, splitPhase, robId[5:0]}
+}
+case class DTranslationCmd() extends Bundle {
+  val vpn        = UInt(20 bits)
+  val supervisor = Bool()
+  val write      = Bool()
+  val token      = UInt(DTranslationToken.Width bits)
+}
+case class DTranslationRsp() extends Bundle {
+  val ppn       = UInt(20 bits)
+  val cacheMode = CacheMode()
+  val fault     = Bool()
+  val token     = UInt(DTranslationToken.Width bits)
+}
