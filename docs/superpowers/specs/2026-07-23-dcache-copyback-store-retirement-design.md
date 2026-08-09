@@ -216,11 +216,12 @@ Tradeoffs, honestly:
   arc or the IQ select cone. Dirty bits add a 512-FF vec in the already
   congested D-cache corridor (`iter_100_CongestedCLBsAndNets.txt` named
   `tagMem`/`ldS1Tag` nets); the eviction-writeback FSM adds states but no
-  deep cones; the SQ at-head compare is a 6-bit equality. The current binding
-  acceptance floor is **200 MHz**. Keep the existing 250-MHz constraint as a
-  stress/census point and for apples-to-apples history, but judge pass/fail from
-  achieved post-route FMax against 200 MHz. The floorplanned post-route check is
-  mandatory; OOC alone cannot certify either timing or pblock fit.
+  deep cones; the SQ at-head compare is a 6-bit equality. The standing
+  optimization goal is **250 MHz** and the hard deployment floor is **200 MHz**.
+  Keep the existing 4-ns constraint for closure and apples-to-apples endpoint
+  history. A 200–250 MHz result is usable but remains explicit timing debt;
+  below 200 MHz is a hard failure and pivots to recovery. The floorplanned
+  post-route check is mandatory; OOC alone cannot certify timing or pblock fit.
 - **Verification**: large but the corpus already contains the acceptance
   tests (§1 list). Musashi models no cache, so lock-step is unaffected as
   long as memory-visible semantics stay equivalent; the corpus's own
@@ -903,9 +904,12 @@ the plan-writing pass:
 Every slice ends with a full-core OOC directional check and, given the
 D-cache-corridor congestion history, at least one floorplanned post-route
 `impl_FullCore.tcl` run on an uncontended machine before physical acceptance.
-The binding floor is 200 MHz. The existing 250-MHz constraint remains useful as
-a stress/census point and preserves comparable endpoint data, but missing 250 MHz
-is not itself a failure; achieved post-route FMax below 200 MHz is.
+The standing goal is 250 MHz and the binding floor is 200 MHz. Missing 250 MHz
+does not by itself reject otherwise useful RTL, but the gap remains named timing
+debt and drives reasonable endpoint/floorplan recovery; achieved post-route FMax
+below 200 MHz is a hard failure. If the area budget or pblock fit fails, report
+the exact utilization/capture/congestion delta and reduction choices to the
+project owner before rejecting or materially reshaping the feature.
 
 ### 6.1 Cross-cutting verification requirement: cache-mode sweep — USER
 ### DECISION (2026-07-23)
