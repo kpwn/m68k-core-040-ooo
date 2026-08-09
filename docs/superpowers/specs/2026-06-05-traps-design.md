@@ -1,6 +1,7 @@
 # Trap-family exceptions (TRAP #n, TRAPV) — Design
 
-**Status:** Draft (slice A of exception-completion; approved direction)
+**Status:** Implemented. Later exception-completion slices added CHK, divide faults,
+TRAPcc, and architectural line-A/line-F emulator-vector routing.
 **Date:** 2026-06-05
 **Parent specs:** `2026-06-03-exception-subsystem-design.md` (format-$0 precise delivery + RTE — the machinery this reuses). [[exception-subsystem]].
 
@@ -19,7 +20,7 @@ Add the synchronous trap instructions that deliver via the existing format-$0 pa
 **Out (later / needs other work):**
 - **CHK** (vector 6) — needs a bound-compare datapath (reg vs upper bound, trap if out of range or negative); a follow-up once a compare-trap µop is added.
 - **DIV0** (vector 5) — needs DIVU/DIVS (not yet implemented).
-- TRAP-on-condition variants beyond TRAPV; the F-line/A-line emulation traps (vectors 10/11) beyond the existing `unimplemented`→illegal(4).
+- This slice originally deferred TRAP-on-condition variants beyond TRAPV and the line-A/line-F emulator traps. Follow-on implementations now provide TRAPcc plus architectural vector 10/11 routing for unimplemented line-A/line-F opcodes; those are governed by the exception-subsystem design rather than this trap-instruction slice.
 
 ## 3. Components & dataflow
 

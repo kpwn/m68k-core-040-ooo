@@ -78,10 +78,9 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x5268) == cp(true,2))   // ADDQ.W #1,(d16,A0) -> opword + disp16
     assert(classify(0x5298) == cp(true,1))   // ADDQ.L #1,(A0)+ -> RMW postinc (0 ext, An folded)
   }
-  test("deferred ops -> complex") {
+  test("TRAPcc is in scope") {
     // TRAPcc is now IN SCOPE: 0x50FA = TRAPT.W (cond=T, ttt=2, #data16) -> simple len2
     assert(classify(0x50FA) == cp(true,2))   // TRAPcc.W (cond=T, ttt=2): simple len2
-    assert(classify(0xE0D0) == cp(false,0))  // ASR.W (A0) (line-E memory single-bit, ss=11) -> deferred
   }
   test("TRAPcc forms are disjoint from absolute-W/L Scc encodings") {
     assert(classify(0x51FC) == cp(true,1))   // TRAPF  (cc=F, ttt=4): no-operand, 1 word
@@ -130,12 +129,31 @@ class PredecodeRefSpec extends AnyFunSuite {
         f"cond=$cond mode=$mode reg=$reg op=0x$op%04x")
     }
   }
-  test("line-E register-form shifts/rotates -> simple len1 (in scope)") {
+  test("line-E register and memory shift/rotate partitions match implemented framing") {
     assert(classify(0xE148) == cp(true,1))   // LSL.W #8,D0
     assert(classify(0xE380) == cp(true,1))   // ASL.L #1,D0
     assert(classify(0xE32A) == cp(true,1))   // LSL.B Dc,D2 (register count)
     assert(classify(0xE493) == cp(true,1))   // ROXR.L #2,D3
-    assert(classify(0xE0D8) == cp(false,0))  // ss=11 memory form -> complex
+    for {
+      family <- 0 until 4                   // AS/LS/ROX/RO
+      dir <- 0 until 2                      // right/left
+      mode <- 0 until 8
+      reg <- 0 until 8
+    } {
+      val op = 0xE0C0 | (family << 9) | (dir << 8) | (mode << 3) | reg
+      val expected = mode match {
+        case 2 | 3 | 4 => cp(true, 1)       // (An), (An)+, -(An)
+        case 5 | 6     => cp(true, 2)       // d16 / brief-indexed
+        case 7 => reg match {
+          case 0 => cp(true, 2)             // (xxx).W
+          case 1 => cp(true, 3)             // (xxx).L
+          case _ => cp(false, 0)
+        }
+        case _ => cp(false, 0)              // Dn/An direct are not memory forms
+      }
+      assert(classify(op) == expected,
+        f"family=$family dir=$dir mode=$mode reg=$reg op=0x$op%04x")
+    }
   }
   // Bit-field MEMORY forms (op[11]=1, ss=3, mode>=2): simple, len = opword + bf-ext + EA ext.
   test("line-E bit-field MEMORY forms -> simple len 2 + EA ext") {
@@ -179,6 +197,37 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x0618) == cp(true,2))   // ADDI.B #imm,(A0)+ -> RMW postinc (opword + imm, 0 ea ext)
     assert(classify(0x00C0) == cp(false,0))  // ss=11 illegal size
     assert(classify(0x0840) == cp(true,2))   // BCHG #n,D0 (static bit-op, opmode 4) — opword + bit word
+  }
+  test("alternate ALU and compare EA-source encodings admit immediate across every Dn") {
+    val families = Seq(
+      0x8 -> Seq(0, 1, 2),             // OR.B/W/L #imm,Dn
+      0x9 -> Seq(0, 1, 2, 3, 7),       // SUB.B/W/L + SUBA.W/L
+      0xB -> Seq(0, 1, 2, 3, 7),       // CMP.B/W/L + CMPA.W/L
+      0xC -> Seq(0, 1, 2),             // AND.B/W/L #imm,Dn
+      0xD -> Seq(0, 1, 2, 3, 7))       // ADD.B/W/L + ADDA.W/L
+    for {
+      (line, opmodes) <- families
+      opmode <- opmodes
+      dn <- 0 until 8
+    } {
+      val op = (line << 12) | (dn << 9) | (opmode << 6) | 0x3C
+      val expectedLen = if (opmode == 2 || opmode == 7) 3 else 2
+      assert(classify(op) == cp(true, expectedLen),
+        f"line=$line%x opmode=$opmode D$dn immediate-source op=0x$op%04x")
+    }
+  }
+  test("line-A and line-F framing exhaustively matches emulator traps and implemented carve-outs") {
+    for (op <- 0xA000 to 0xAFFF)
+      assert(classify(op) == cp(true, 1), f"line-A op=0x$op%04x")
+
+    for (op <- 0xF000 to 0xFFFF) {
+      val expectedLen =
+        if (op == 0xF27F) 4
+        else if ((op & 0xFFF8) == 0xF620) 2
+        else 1
+      assert(classify(op) == cp(true, expectedLen),
+        f"line-F op=0x$op%04x expected len=$expectedLen")
+    }
   }
   test("BTST PC-relative carve-out is exhaustive and excludes all three write bit-ops") {
     // Dynamic encoding: 0000 ddd 1 tt 111 rrr. Sweep all 8 bit-number Dn fields,

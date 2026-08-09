@@ -447,7 +447,10 @@ object PredecodeRef {
           }
         else {
           val sizeL = opmode == 2 || opmode == 7   // opmode 7 here can only be ADDA.L/SUBA.L (cls 9/D)
-          eaExt(srcMode, srcReg, sizeL, allowImm = false) match {
+          // The ordinary EA-source encodings also admit mode7/reg4 immediate on real
+          // 68k (task #140), including ADDA/SUBA. This is distinct from canonical
+          // line-0 ADDI/SUBI/ANDI/ORI encodings but must frame identically.
+          eaExt(srcMode, srcReg, sizeL, allowImm = true) match {
             case Some(e) => CP(simple = true, lenWords = 1 + e)
             case None    => COMPLEX
           }
@@ -471,7 +474,8 @@ object PredecodeRef {
         val isCmpm = isEor && srcMode == 1
         if (opmode == 0 || opmode == 1 || opmode == 2 || opmode == 3 || opmode == 7) {
           val sizeL = opmode == 2 || opmode == 7
-          eaExt(srcMode, srcReg, sizeL, allowImm = false) match {
+          // CMP/CMPA share task #140's alternate immediate-source legality.
+          eaExt(srcMode, srcReg, sizeL, allowImm = true) match {
             case Some(e) => CP(simple = true, lenWords = 1 + e)
             case None    => COMPLEX
           }
@@ -483,12 +487,11 @@ object PredecodeRef {
         }
         else COMPLEX
       // Line-E register-form shifts/rotates (1110 ccc d ss i tt rrr): single-word.
-      // ss=11 is the memory single-bit form (deferred RMW) -> COMPLEX.
+      // ss=11 with op[11]=0 is the implemented word-sized memory RMW form.
       case 0xE =>
         val ss = (op >> 6) & 3
         // Bit-field register form: op[11]=1, ss==3, mode 000 -> SIMPLE len 2
-        // (opword + the bit-field ext word). ss=11 with op[11]=0 (memory single-bit
-        // shift) or mode!=0 (memory bit-field) -> COMPLEX (deferred RMW).
+        // (opword + the bit-field ext word).
         val isBitfieldReg = (((op >> 11) & 1) == 1) && (ss == 3) && (((op >> 3) & 7) == 0)
         // Bit-field MEMORY form (BFxxx <ea>): op[11]=1, ss==3, mode>=2 (memory EA). len =
         // opword + bf-ext word + the EA's own ext words (per mode), i.e. 2 + eaExt. Predecode
@@ -498,13 +501,26 @@ object PredecodeRef {
         // Mirrors the RTL PredecodeWord isBitfieldMem arm.
         val bfMemMode = (op >> 3) & 7
         val isBitfieldMem = (((op >> 11) & 1) == 1) && (ss == 3) && (bfMemMode >= 2)
+        val isShiftMem = (((op >> 11) & 1) == 0) && (ss == 3)
         if (isBitfieldReg) CP(simple = true, lenWords = 2)
         else if (isBitfieldMem) eaExt(bfMemMode, op & 7, sizeL = false, allowImm = false) match {
           case Some(e) => CP(simple = true, lenWords = 2 + e)   // opword + bf-ext + EA ext
           case None    => COMPLEX
         }
+        else if (isShiftMem) memDestExt(bfMemMode, op & 7) match {
+          case Some(e) => CP(simple = true, lenWords = 1 + e)
+          case None    => COMPLEX
+        }
         else if (ss != 3) CP(simple = true, lenWords = 1)
         else COMPLEX
+      // The entire line-A space is a one-word emulator trap (vector 10). Line-F
+      // defaults to the corresponding one-word emulator trap (vector 11), with the
+      // two implemented multiword carve-outs matching PredecodeWord exactly.
+      case 0xA => CP(simple = true, lenWords = 1)
+      case 0xF =>
+        if (op == 0xF27F) CP(simple = true, lenWords = 4)              // FSF (xxx).L
+        else if ((op & 0xFFF8) == 0xF620) CP(simple = true, lenWords = 2) // MOVE16
+        else CP(simple = true, lenWords = 1)
       case _ => COMPLEX
     }
   }

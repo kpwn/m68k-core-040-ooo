@@ -967,8 +967,8 @@ object PredecodeWord {
       }
 
       // Line-E register-form shifts/rotates (1110 ccc d ss i tt rrr): single-word,
-      // no extension -> SIMPLE len 1. ss=11 is the MEMORY single-bit form (1110 ccc d
-      // 11 mmmrrr, shift <ea> by 1) which is the deferred RMW slice -> COMPLEX.
+      // no extension -> SIMPLE len 1. ss=11 selects either the implemented MEMORY
+      // single-bit form (1110 ccc d 11 mmmrrr, shift <ea> by 1) or a bit-field form.
       is(U(0xE, 4 bits)) {
         val ss = op(7 downto 6).asUInt
         when(ss =/= U(3, 2 bits)) {
@@ -977,8 +977,8 @@ object PredecodeWord {
         }
         // Bit-field register form (BFxxx Dn{...}): op[11:8]>=8 (op[11]=1), op[7:6]==3,
         // mode 000 (op[5:3]==0). opword + the bit-field extension word -> SIMPLE len 2.
-        // (ss=11 with op[11]=0 = the deferred memory single-bit shift, or mode!=0 = a
-        // memory bit-field, both stay COMPLEX -> the assembler's illegal path.)
+        // (ss=11 with op[11]=0 is handled by the memory-shift arm below; mode!=0 with
+        // op[11]=1 is handled by the memory bit-field arm.)
         val isBitfieldReg = op(11) && (ss === U(3, 2 bits)) && (op(5 downto 3).asUInt === U(0, 3 bits))
         when(isBitfieldReg) {
           r.simple   := True

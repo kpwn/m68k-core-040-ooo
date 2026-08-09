@@ -616,7 +616,7 @@ object OperationDecoder {
         o.readsNzvc := (opword(11 downto 8).asUInt >= 2)
       }
       // ---- Line-E register-form shifts/rotates (1110 ccc d ss i tt rrr) ----
-      // ss (bits 7:6) = .B/.W/.L (11 = the memory single-bit form -> deferred/illegal).
+      // ss (bits 7:6) = .B/.W/.L (11 selects the word-sized memory single-bit form).
       // d (bit8) = direction (1=left). i (bit5) = count source (0 immediate ccc, 1 reg
       // Dc). tt (bits 4:3) = family: 00 ASL/ASR, 01 LSL/LSR, 10 ROXL/ROXR, 11 ROL/ROR.
       // rrr (bits 2:0) = Dr (the shifted data reg). The assembler fills the fixed-field
@@ -628,7 +628,7 @@ object OperationDecoder {
         val ss = opword(7 downto 6)
         val tt = opword(4 downto 3)
         val mode = opword(5 downto 3)
-        when(ss =/= 3) {                    // ss=11 is the memory single-bit form (deferred)
+        when(ss =/= 3) {                    // ss=11 is the memory single-bit form
           o.illegal := False
           o.op := DecOp.SHIFT
           o.cluster := Cluster.INT

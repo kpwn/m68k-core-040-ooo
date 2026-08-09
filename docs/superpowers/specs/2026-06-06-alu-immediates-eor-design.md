@@ -1,6 +1,8 @@
 # ALU immediates + EOR (register/data dest) — Design
 
-**Status:** Draft (feature-completion slice 3a). User: "you pick / batch it, features first, post-route gate."
+**Status:** Implemented. Later mem-RMW and privileged-system slices supersede the
+original deferred list below; task #140 also ratified the alternate EA-source
+immediate encodings described in Scope.
 **Date:** 2026-06-06
 **Parent:** [[decode-matrix-framework]], [[isa-completion-roadmap]].
 
@@ -14,8 +16,8 @@ Fill the common ALU gaps: the line-0 **immediate** forms (ADDI/SUBI/ANDI/ORI/EOR
 - **Line-0 immediates** (`0000 ooo0 ss mmmrrr` + imm): ORI(000)/ANDI(001)/SUBI(010)/ADDI(011)/EORI(101)/CMPI(110), sizes .B/.W/.L, **data-register destination (mode 0)**. The immediate is the trailing word(s) (1 word for .B/.W, 2 for .L) — predecode length must account for it. Maps to the existing ALU ops (+ new EOR for EORI; CMP for CMPI). Flags per the op (ADDI/SUBI: NZVCX; ANDI/ORI/EORI: NZ, V=C=0; CMPI: NZVC, no write).
 - **ANDI/ORI/EORI to CCR** (`0000 ooo0 00 111100` + imm.B): the immediate byte ANDed/ORed/EORed into the CCR (NZVCX low 5 bits). NOT privileged (CCR only — does NOT touch the system byte). Routes through the committed-CCR path.
 - **EOR** (line B, opmode 4/5/6 = .B/.W/.L, `1011 rrr 1 ss mmmrrr`): `Dn ^ <ea> -> <ea>` — **data-register destination only** (mode 0; memory dest deferred to the RMW slice 3b). New DecOp `EOR` (or reuse AND/OR datapath with an xor control). Flags NZ, V=C=0.
-- **Check first (diagnosis):** does `<ea>=#imm` source already work for line-8/9/B/C/D ALU via the EaDecoder IMM klass? If so, `ADD #imm,Dn` etc. partly work via line D — but the CANONICAL assembler encoding is line 0 (ADDI), which Musashi emits, so line-0 decode is required regardless. Note whether EOR needs a genuinely new ALU op or can reuse an existing xor path in `AluDatapath`.
-- **Verification:** lock-step vs Musashi — ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,Dn (.B/.W/.L) with flag checks; ANDI/ORI/EORI #imm,CCR; EOR Dn,Dm. ALL existing UNCHANGED. POST-ROUTE gate (impl_FullCore.tcl) non-regress vs ~240.
+- **Alternate immediate-source encodings:** confirmed and implemented for the ordinary line-8/9/B/C/D EA-source bands: OR/SUB/AND/ADD/CMP .B/.W/.L and ADDA/SUBA/CMPA .W/.L accept mode-7/reg-4 `#imm`. They frame to two words for byte/word and three for long. Canonical assembler output still uses line-0 ADDI/SUBI/ANDI/ORI/CMPI, so both families remain required.
+- **Verification:** lock-step vs Musashi — ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,Dn (.B/.W/.L) with flag checks; alternate line-8/9/B/C/D immediate-source forms; ANDI/ORI/EORI #imm,CCR; EOR Dn,Dm. The reference test exhaustively sweeps every destination register in the alternate bands.
 
 **Out:** memory-destination RMW (ADDI #x,(An), EORI #x,(An), EOR Dn,(An) — slice 3b, the load-op-store crack); ANDI/ORI/EORI/MOVE to **SR** (privileged + serializing system-byte write — the MOVE-to-SR slice); ADDQ/SUBQ/Scc/DBcc (line 5 — slice 4); bit ops (line 0 opmode 100 — slice 5).
 
@@ -31,7 +33,7 @@ EOR Dn,Dm                            : decode lineB opmode4/5/6 mode0 -> Dm := D
 - **Directed:** decode each line-0 immediate (op/size/imm-length) + EOR + to-CCR; the imm word(s) consumed (predecode length correct).
 - **Lock-step (the gate), ×2:** ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,Dn (.B/.W/.L, incl. flag-affecting operands: carry, overflow, zero, negative); ANDI/ORI/EORI #imm,CCR; EOR Dn,Dm — value + NZVCX step-for-step vs Musashi. ALL existing UNCHANGED (ITLB seed flake → repro on baseline first).
 - **`make test-fast`** + targeted verilator `-z` subsets.
-- **POST-ROUTE gate** (impl_FullCore.tcl, gen first): report WNS/FMAX vs master (~240) — non-regress. OOC as a quick sanity proxy only.
+- **POST-ROUTE gate** (impl_FullCore.tcl, gen first): target 250 MHz and report WNS/FMAX; 200 MHz is the current deployment floor. OOC is a quick sanity proxy only.
 
 ## 5. Open items
 - EOR as a new DecOp vs reusing `AluDatapath` xor — implementer picks (the ALU likely already has an xor primitive for some path; check).
