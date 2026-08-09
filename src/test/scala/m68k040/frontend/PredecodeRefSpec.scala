@@ -158,6 +158,18 @@ class PredecodeRefSpec extends AnyFunSuite {
         f"static bit-op tt=$tt pcReg=$pcReg op=0x$op%04x")
     }
   }
+  test("NBCD register partition is exactly 0x4800-0x4807; memory forms stay deferred") {
+    for (dn <- 0 until 8) {
+      val op = 0x4800 | dn
+      assert(classify(op) == cp(true, 1), f"NBCD D$dn op=0x$op%04x")
+    }
+    // Mode 001 at 0x4808-0x480f is LINK.L on 020+, not NBCD. The actual NBCD
+    // memory-EA modes 2..7 are a separate unimplemented RMW/microcode slice.
+    for (mode <- 2 until 8) {
+      val op = 0x4800 | (mode << 3)
+      assert(classify(op) == cp(false, 0), f"deferred NBCD memory mode=$mode op=0x$op%04x")
+    }
+  }
   test("DIVU.W/DIVS.W (class 8 opmode 3/7) + MULU.W/MULS.W (class C) -> simple; An-direct MUL EA complex") {
     assert(classify(0x80C1) == cp(true,1))   // DIVU.W D1,D0 (reg divisor, 1 word)
     assert(classify(0x81C1) == cp(true,1))   // DIVS.W D1,D0

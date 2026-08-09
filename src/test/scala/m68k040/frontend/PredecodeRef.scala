@@ -218,7 +218,11 @@ object PredecodeRef {
         val isExtL  = is13 == 0x0918    // 0x48C0-C7
         val isExtbL = is13 == 0x0938    // 0x49C0-C7
         val isTas   = is13 == 0x0958    // 0x4AC0-C7
-        val isUnary = isUnaryArith || isSwap || isExtW || isExtL || isExtbL || isTas
+        // NBCD Dn (0x4800-07): the implemented register-only form is one word.
+        // Memory-EA NBCD remains deferred, so keep this exact 13-bit pattern rather
+        // than widening the generic unary-EA table.
+        val isNbcd  = is13 == 0x0900
+        val isUnary = isUnaryArith || isSwap || isExtW || isExtL || isExtbL || isTas || isNbcd
         // CLR/NEG/NEGX/NOT/TST <ea> mem-dest (RMW): mode != 000, ss != 11, oooo in
         // {0,2,4,6,A}, bit8=0. In-scope MEMSIMPLE dest -> opword + EA ext. SWAP/EXT/TAS
         // are Dn-only (mode 000); TAS-mem deferred.
