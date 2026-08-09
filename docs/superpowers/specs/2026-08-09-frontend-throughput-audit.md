@@ -74,7 +74,7 @@ identically false because `ftqNear` excludes negative deltas.
 
 | priority | path | classification | recommended action | principal risk |
 |---|---|---|---|---|
-| P1 | FetchAlign ring turnover | cheap, FPGA-friendly | credit a same-cycle response when the depth-three ring is full, allowing head-pop/tail-push turnover | stale/drop ownership and exact IBuf reservation on collision |
+| landed | FetchAlign ring turnover | cheap, FPGA-friendly | a non-faulting same-cycle response now credits a full depth-three ring, allowing head-pop/tail-push turnover | routed FMax remains to be measured; directed collision proof is complete |
 | P1 | L1I throughput proof | cheap, test-only | burst at least six unique warm same-line commands on consecutive cycles and require six associated responses at the specified latency with zero AXI reads | existing helper is response-serialized and cannot prove II=1 |
 | P2 | taken restart | complex, FPGA-friendly | use a four-entry recent-window replay buffer as the low-risk interim lever, or repair the tokenized FTB design | redirect/IBuf injection arbitration and invalidate coherence |
 | P3 | fetch-directed prediction | complex, FPGA-friendly | held tokenized fetch-plan loop, separately gated for application coverage, IPC, LUTs, and routed FMax | predictor-result-to-successor timing and confirmation/recovery |
@@ -131,3 +131,27 @@ I-cache cone lost 36.29 MHz before register splitting. These results favor small
 held tokens, registered lookup boundaries, shallow queues, and separate routed
 gates. They argue strongly against a combinational FTB read feeding `fetchPc` or
 restoring a live ITLB-to-cache tag path.
+
+## 7. Implemented follow-up
+
+Commit `2ad754c` implements full-ring consume-and-replace without changing the
+conservative IBuf landing reservation. The response reads the old head
+stale/drop metadata combinationally; the edge writes the replacement tail record
+and advances both pointers while occupancy stays three. Only a non-faulting
+response earns full-ring credit, so the cycle that first latches `faultHold`
+cannot admit one extra younger request. Non-full behavior is unchanged.
+
+`FetchAlignRingTurnoverSpec` is intentionally handshake- and association-based.
+It reaches `ringCount == 3`, requires response and replacement command to fire in
+the same cycle, checks both pointers and count, returns unique words in issue
+order, collides turnover with an unaligned redirect, proves the coincident old-PC
+replacement is stale, proves the target keeps its own leading-word drop, and
+checks that a fault response receives no turnover credit. Restoring the old
+`!ringFull` predicate makes the exact same-cycle-fire assertion fail.
+
+The stale complex-stall fixture exposed during this work was corrected separately
+in `612d5ee`: line-F `0xF000` is now a framed emulator trap, so the test uses the
+explicitly deferred one-word `NBCD (A0)` encoding `0x4810` and fails if it escapes
+as a simple slot-1 operation. Focused frontend verification passes 6/6; combined
+`make SBT=~/sbt/bin/sbt test-fast` passes 138/138 across 141 suites. Physical
+FMax/area confirmation remains pending on the serialized Vivado window.
