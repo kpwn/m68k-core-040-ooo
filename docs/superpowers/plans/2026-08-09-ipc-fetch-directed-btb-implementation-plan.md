@@ -1,5 +1,12 @@
 # Fetch-Directed BTB (window-indexed FTB + FTQ + confirm-or-flush) Implementation Plan
 
+> **BLOCKED — DO NOT EXECUTE THIS PLAN.** The registered `ftbResFresh` contract
+> repeated below cannot apply a prediction on an uninterrupted II=1 fetch
+> stream, removal of the slot-1 fallback violates the design's G4, and the
+> proposed stream differential is not a valid architectural oracle. See
+> `docs/superpowers/specs/2026-08-09-frontend-throughput-audit.md`. Amend the
+> design and this plan together before any RTL task is started.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Eliminate the measured 4-cycle fetch restart on a *correctly predicted* taken

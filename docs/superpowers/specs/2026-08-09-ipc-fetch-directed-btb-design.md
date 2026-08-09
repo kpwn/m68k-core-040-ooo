@@ -1,6 +1,16 @@
 # IPC push, task #126: fetch-directed BTB — window-indexed Fetch Target Buffer + Fetch Target Queue + confirm-or-flush (design)
 
-Status: **DESIGN ONLY.** No RTL written, no RTL modified, no Vivado run by this pass.
+Status: **BLOCKED — DO NOT IMPLEMENT.** The 2026-08-09 frontend throughput audit
+found that the registered-result freshness rule in section 2.4 is false on every
+cycle of an uninterrupted II=1 sequential fetch stream. It also found that
+deleting the slot-1 decode-time BTB fallback violates G4, and that the section
+9.3 differential oracle compares traces that prediction is expressly allowed to
+change. The required corrections and non-vacuous replacement tests are recorded
+in `2026-08-09-frontend-throughput-audit.md`. No FTB RTL may start until this
+document and its implementation plan are amended together.
+
+Historical status before that review: **DESIGN ONLY.** No RTL was written, no RTL
+was modified, and no Vivado run was launched by the design pass.
 Baseline HEAD: `bb4d40e` (= merge `f6265f7`, the landed I-side MSHR chain, + its docs commit).
 Initiative: IPC-push (`.superpowers/sdd/progress-ipc-push-2026-08-09.md`), under the binding
 user goal *"push ipc as high as reasonably possible without blowing up lut count or crashing
