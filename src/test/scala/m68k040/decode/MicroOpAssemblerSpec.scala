@@ -237,4 +237,66 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
       assert((dut.uop.imm.toLong & 0xF) == 0xD)   // scope=11, cacheSel=01 -> {11,01} = 1101
     }
   }
+
+  // ── Line-A / Line-F emulator-trap vector routing (vector 10 / vector 11) ──────
+  // Real 68k silicon traps the ENTIRE 0xA000-0xAFFF opcode range unconditionally to
+  // vector 10 ("Line 1010 Emulator") -- there are NO valid opcodes there at all -- and
+  // any F-line opword the CPU does not implement to vector 11 ("Line 1111 Emulator").
+  // On classic Mac OS the A-line range IS the Toolbox call ABI (every `_NewPtr`-style
+  // trap word), and vector 11 is how the ROM's FPSP gets handed unimplemented FP ops,
+  // so mis-routing either to the GENERIC vector-4 illegal-instruction path would be a
+  // total-loss correctness bug, not an edge case.
+  //
+  // The routing lives in MicroOpAssembler's `bad` fallback (the top-nibble mux on
+  // `op(15 downto 12)`: 0xA -> 10, 0xF -> 11, default -> 4) plus PredecodeWord's
+  // is(0xA)/is(0xF) arms (single-word `simple` framing, so the opword is never
+  // mis-framed as a multi-word/complex instruction). OperationDecoder deliberately has
+  // NO is(0xA) arm at all -- line A falls through to OpSpec.illegalDefault() -- and
+  // line F's arm only claims CPUSH/CINV/PFLUSH/PTEST/MOVE16/FSF, leaving everything
+  // else on the same illegal default. These two sweeps pin that end-to-end.
+  test("line-A (0xA000-0xAFFF): ALL 4096 opwords fault to vector 10, exhaustively", VerilatorTest) {
+    run { dut =>
+      val bad = scala.collection.mutable.ArrayBuffer[String]()
+      for (op <- 0xA000 to 0xAFFF) {
+        drive(dut, op); sleep(1)
+        val faulted = dut.uop.faulted.toBoolean
+        val vec     = dut.uop.faultVector.toInt
+        val unimpl  = dut.uop.unimplemented.toBoolean
+        val nextPc  = dut.uop.faultUsesNextPc.toBoolean
+        // faultUsesNextPc must be FALSE: the A-line frame stacks the address OF the
+        // trap word itself (the Toolbox dispatcher reads the trap word back from it).
+        if (!faulted || vec != 10 || !unimpl || nextPc)
+          bad += f"0x$op%04X faulted=$faulted vec=$vec unimpl=$unimpl usesNextPc=$nextPc"
+      }
+      assert(bad.isEmpty, s"${bad.size}/4096 line-A opwords mis-routed; first 10: ${bad.take(10).mkString(", ")}")
+    }
+  }
+  test("line-F (0xF000-0xFFFF): every UNIMPLEMENTED opword faults to vector 11, exhaustively", VerilatorTest) {
+    run { dut =>
+      // The F-line encodings this core DOES implement (OperationDecoder's is(0xF) arm);
+      // they are legitimately not vector-11 traps and are excluded from the sweep.
+      def implemented(op: Int): Boolean = {
+        val cpush   = (op & 0x0F00) == 0x0400                                  // 0xF4xx CPUSH/CINV
+        val pflush  = ((op & 0xFFC0) == 0xF500) && ((op >> 3) & 7) <= 3        // 0xF500-0xF51F
+        val ptest   = ((op & 0xFF00) == 0xF500) && ((op & 0x0080) == 0) &&
+                      ((op & 0x0040) != 0) && ((op & 0x0010) == 0) && ((op & 0x0008) != 0)
+        val move16  = (op & 0xFFF8) == 0xF620                                  // (Ax)+,(Ay)+ form
+        val fsf     = op == 0xF27F                                             // task #180 carve-out
+        cpush || pflush || ptest || move16 || fsf
+      }
+      val bad = scala.collection.mutable.ArrayBuffer[String]()
+      var swept = 0
+      for (op <- 0xF000 to 0xFFFF if !implemented(op)) {
+        drive(dut, op); sleep(1)
+        swept += 1
+        val faulted = dut.uop.faulted.toBoolean
+        val vec     = dut.uop.faultVector.toInt
+        val unimpl  = dut.uop.unimplemented.toBoolean
+        val nextPc  = dut.uop.faultUsesNextPc.toBoolean
+        if (!faulted || vec != 11 || !unimpl || nextPc)
+          bad += f"0x$op%04X faulted=$faulted vec=$vec unimpl=$unimpl usesNextPc=$nextPc"
+      }
+      assert(bad.isEmpty, s"${bad.size}/$swept unimplemented line-F opwords mis-routed; first 10: ${bad.take(10).mkString(", ")}")
+    }
+  }
 }
