@@ -110,10 +110,16 @@ class ExceptionEntrySpec extends AnyFunSuite {
 
   test("illegal instruction at retire stacks format-$0 frame, fetches vector, redirects") {
     M68kSim().withVerilator.compile(new Dut).doSim { dut =>
-      val cd = dut.clockDomain; cd.forkStimulus(10)
+      val cd = dut.clockDomain
       dut.wire.logic.storeAllow #= false
-      init(dut, cd)
+      // Attach the AXI responder before the first clock edge. Constructing it only
+      // after init's three samples left R/B valid and payload inputs undriven during
+      // reset release; a random B response could then become a cache storeAck with no
+      // accepted descriptor (and, if RESP happened nonzero, a bogus diagnostic fault).
+      // The test must not rely on simulator power-up values to prove exception entry.
       val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      cd.forkStimulus(10)
+      init(dut, cd)
       var acceptedStores = 0
       fork {
         while (true) {
