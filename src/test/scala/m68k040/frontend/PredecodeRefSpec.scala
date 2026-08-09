@@ -202,6 +202,35 @@ class PredecodeRefSpec extends AnyFunSuite {
         f"write unary=$unary size=$size A$an op=0x$op%04x")
     }
   }
+  test("TAS register and memory-alterable partition matches the implemented RMW framing") {
+    for (dn <- 0 until 8) {
+      val op = 0x4AC0 | dn
+      assert(classify(op) == cp(true, 1), f"TAS D$dn op=0x$op%04x")
+    }
+
+    for {
+      mode <- 2 to 6
+      reg  <- 0 until 8
+    } {
+      val op = 0x4AC0 | (mode << 3) | reg
+      val ext = if (mode == 5 || mode == 6) 1 else 0
+      assert(classify(op) == cp(true, 1 + ext),
+        f"TAS memory mode=$mode reg=$reg op=0x$op%04x")
+    }
+    assert(classify(0x4AF8) == cp(true, 2), "TAS (xxx).W")
+    assert(classify(0x4AF9) == cp(true, 3), "TAS (xxx).L")
+
+    // An-direct and every non-alterable mode-7 encoding stay rejected. In particular,
+    // PC-relative and immediate are readable EAs but cannot be TAS destinations.
+    for (reg <- 0 until 8) {
+      val op = 0x4AC8 | reg
+      assert(classify(op) == cp(false, 0), f"illegal TAS A$reg op=0x$op%04x")
+    }
+    for (reg <- 2 until 8) {
+      val op = 0x4AF8 | reg
+      assert(classify(op) == cp(false, 0), f"illegal TAS mode7 reg=$reg op=0x$op%04x")
+    }
+  }
   test("DIVU.W/DIVS.W (class 8 opmode 3/7) + MULU.W/MULS.W (class C) -> simple; An-direct MUL EA complex") {
     assert(classify(0x80C1) == cp(true,1))   // DIVU.W D1,D0 (reg divisor, 1 word)
     assert(classify(0x81C1) == cp(true,1))   // DIVS.W D1,D0
