@@ -1,6 +1,14 @@
 # IPC push: LS EU pipeline depth — decoupling the load back-half from S1 (design)
 
-**Status**: design only. No RTL in this document has been implemented.
+**Status**: IMPLEMENTED CHECKPOINT on `codex/ipc-dcache-vipt`. Slice 1's
+front/back structural split has been integrated with the tokenized VIPT cache
+interface, and Slice 2 has enabled `earlyFree`. Directed simulation proves a
+younger store issues, translates, and reaches SQ allocation while an older cold
+load is still awaiting its cache response. Focused LS/cross/exception/D-cache
+regressions pass. Seeds 1–3 cut `load-stream` cycles by 43.9% (ideal memory) and
+41.2% (`l2:5:70`); a full-suite seed-1 pair cuts aggregate cycles by 12.8% and
+8.9%. The PM-serialized routed FMax/area gate remains pending, so the final
+accept/reject decision in §8.4 is not yet made.
 **Scope**: `src/main/scala/m68k040/execute/LsEuPlugin.scala`,
 `src/main/scala/m68k040/cache/DcachePlugin.scala` (read-only contract),
 `src/main/scala/m68k040/execute/StoreQueue.scala` (read-only contract).
@@ -691,7 +699,7 @@ On the exact base commit, in an isolated worktree:
 
 ### 8.3 Slicing (each slice ends with the standing post-route gate)
 
-1. **Slice 1 — structural split, no reuse.** Two FSMs, `bkBusy`, `bkCtx`, all
+1. **Slice 1 — structural split, no reuse (implemented).** Two FSMs, `bkBusy`, `bkCtx`, all
    the correctness fixes (§3.2 d/e, §5.5), but with the front's `RESOLVE` stall
    set so conservatively that the **observable behaviour and cycle counts are
    IDENTICAL to today** (front does not free S1 early). This isolates the pure
@@ -700,11 +708,11 @@ On the exact base commit, in an isolated worktree:
    alone regresses FMax materially, the lever is dead and nothing further is
    built* — this is the early gate §6.4 demands, and it is the whole reason the
    slicing is shaped this way.
-2. **Slice 2 — enable the early free.** One-line change to the `RESOLVE` arm.
+2. **Slice 2 — enable the early free (enabled; functional gate passed).** One-line change to the `RESOLVE` arm.
    Gate: `load-stream` must improve materially (target ≥ 1.6× on cycles);
    `load/store`/`mixed`/`call-return` must not regress; lock-step + LS specs +
    ported corpus fail-lists byte-identical; post-route FMax + LUT.
-3. **Slice 3 — accept/reject decision** (§8.4) and, only on all-green,
+3. **Slice 3 — accept/reject decision (pending IPC + routed gate)** (§8.4) and, only on all-green,
    consideration of Stage 2 under §4's three gates.
 
 ### 8.4 The accept/reject decision — stated in advance
@@ -794,8 +802,8 @@ the risk of the split with none of its containment.
 - Stage 1's 9 → 4–5 cycles/load, `load-stream` 3269 → ~1700–2000, aggregate
   +16–20% (zero) / +11–14% (l2:5:70).
 - That keeping `issue.ready` textually unchanged avoids the compValid failure
-  mode. **This is the design's central bet and it is not proven** — Slice 1
-  exists precisely to test it cheaply.
+  mode. Functional reuse is now proven by a delayed-refill overlap test; the
+  design's central FMax/LUT bet is still unproven until the paired routed gate.
 
 **What is honest risk:**
 - This is a structural change adjacent to the design's most contested corridor,
@@ -809,5 +817,8 @@ the risk of the split with none of its containment.
   grounding's +15% on those kernels will be disappointed; that projection is
   superseded.
 
-**Not implemented. No RTL written. The census gate (§6.3) is a hard prerequisite
-for the implementation plan's Task 1.**
+**Implementation checkpoint:** the bounded two-entry split and early release are
+now present. The measured IPC thresholds pass on the three-seed `load-stream`
+pair and seed-1 full-suite pair. This does not claim the final elastic LS
+pipeline or same-page all-hit II=1 admission. Acceptance remains conditional on
+the routed FMax/LUT gate; synthesis is pending the serialized Vivado slot.

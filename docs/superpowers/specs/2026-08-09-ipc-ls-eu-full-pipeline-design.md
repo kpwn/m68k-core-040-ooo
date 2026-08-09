@@ -1,8 +1,13 @@
 # IPC push: a genuine LS EU pipeline — replacing the one-µop-at-a-time FSM (design)
 
 **Status**: IMPLEMENTING. D-cache slices A, B, and the bounded replay part of C
-are implemented and simulation-gated as described below. The elastic LS-stage
-rewrite is still pending. The routed FMax/area gate has not yet been run.
+are implemented and simulation-gated. The LS late split is now integrated and
+its early-free mode is enabled: a directed delayed-refill test proves a younger
+store issues, translates, and allocates before the older load responds. This is
+a two-entry front/back checkpoint, not yet the final elastic II=1 LS pipeline.
+Across seeds 1–3 it cuts `load-stream` cycles by 43.9% (ideal) and 41.2%
+(L2-faithful). A full-suite seed-1 pair improves aggregate cycles by 12.8% and
+8.9%, respectively. The routed FMax/area gate has not yet been run.
 
 **2026-08-09 review amendment — binding corrections:**
 
@@ -33,16 +38,24 @@ rewrite is still pending. The routed FMax/area gate has not yet been run.
    the early probe; only a successfully resolved physical address, cache mode,
    and association token enter `DLoadCmd`. This removes the late-split
    liveness/fault-association blocker.
-5. The late-split branch is a canary, not a prerequisite. Slice 1 exists only on
-   `feat/ls-eu-late-split` at `cc38cc8`; its FMax attempt did not finish and its
-   `earlyFree` flip is blocked. No task may execute the original one-line Task 6
-   until the live-translation hazard is removed.
+5. The late split was retained as a bounded checkpoint. Its structural Slice 1
+   (`cc38cc8`) was ported onto the tokenized VIPT interface after item 4 removed
+   the live-translation hazard; Slice 2 now sets `earlyFree = true`. The cache
+   back stage still has exactly one untagged response slot, while the front can
+   hold one younger translate/resolve operation. This does not supersede the
+   elastic-pipeline end state below.
 6. Faster consumers expose invalid producer cadence assumptions. Every Stream
    source must hold `valid` and its entire payload until `fire`; it may not rely
    on the consumer's former multi-cycle `ready` gap. D-cache II=1 exposed one
    such bug in the exception frame-load source (`RegNext(valid)` emitted a
    duplicate tail command). The exception source now uses a held command
    register, and the format-0 RTE test asserts exactly four load handshakes.
+7. C2's first paired IPC evidence is positive. `load-stream` baseline→C2 cycles
+   for seeds 1/2/3 are `3269/3275/3268`→`1836/1837/1835` under ideal memory and
+   `3426/3428/3428`→`2071/1986/1989` under `l2:5:70`. On the current ten-kernel
+   suite at seed 1, aggregate cycles move `12221`→`10658` (−12.8%) and
+   `15659`→`14271` (−8.9%). This clears the predeclared IPC thresholds on the
+   measured pair but is not final acceptance until the routed FMax/LUT gate.
 
 **Driving directive (user, verbatim)**: *"LS EU needs to be a pipeline, not a
 one-at-a-time FSM."*
@@ -62,9 +75,9 @@ reasonably possible without blowing up lut count or crashing fmax."*
 **Relationship to the earlier late-split work**: the "LS EU late split"
 (`docs/superpowers/specs/2026-08-09-ipc-ls-eu-pipeline-depth-design.md`, plan
 `docs/superpowers/plans/2026-08-09-ipc-ls-eu-late-split-implementation-plan.md`)
-was explored on branch `feat/ls-eu-late-split` (Slice 1 at `cc38cc8`). It is a
-reference/canary, not the end-state architecture. §8 is the active staging
-recommendation.
+was first explored on branch `feat/ls-eu-late-split` (Slice 1 at `cc38cc8`) and
+is now integrated with early release. It is a measured checkpoint, not the
+end-state architecture. §8 is the active staging recommendation.
 
 ---
 
@@ -78,7 +91,7 @@ recommendation.
 - [5. Hazard analysis (H1–H14)](#5)
 - [6. FMax treatment and the mandatory census gate](#6)
 - [7. Area](#7)
-- [8. Staging, and the relationship to the in-flight late split](#8)
+- [8. Staging, and the relationship to the integrated late split](#8)
 - [9. Verification plan](#9)
 - [10. Alternatives considered](#10)
 - [11. Honest risk assessment](#11)
@@ -399,7 +412,7 @@ NZVC/X ports. **This design refuses that cost** — see §4.4.
 | target | needs | II floor per LS µop |
 |---|---|---|
 | Today | — | store 4 / fwd load 6 / cache load 9 |
-| Late split canary | `LsEuPlugin` front/back split with the live-DTLB blocker fixed | store 4 / fwd load 6 / cache load ~4–5 |
+| Late split checkpoint | `LsEuPlugin` front/back split with the live-DTLB blocker fixed | store 4 / fwd load 6 / cache load ~4–5 |
 | **D-cache slice A** | overlap S1 probe with prior S2 response; root-cause the historical `183 != 202` failure | cache-hit II=2 |
 | **D-cache slice B** | DTLB + virtual-set read launched in parallel; typed token associates early and resolved requests | translation latency hidden on a usable early probe |
 | **D-cache slice C0** | one miss-shadow command register and in-order replay | all-hit accept II=1; blocking miss remains ordered |
@@ -598,15 +611,16 @@ today's `WAIT_SQ` (`:1570-1575`): the resident stores are strictly older, commit
 in ROB order, and drain hold-until-ack. *Test*: a >8-store MOVEM burst followed
 by a load, asserting forward progress.
 
-**H3 — DTLB liveness through `DcachePlugin` (NEW, MAJOR — the Slice-1 finding).**
+**H3 — DTLB liveness through `DcachePlugin` (found by Slice 1; now closed).**
 See §3.1. Without the fix: a hang (accept delayed past the translate stage's
-tenure by `pendingStoreMiss`/`maintBusyReg` ⇒ `loadCmdPort.ready` stuck low with
-the ROB head parked on that load) or a silent spurious vector-2 fault (a
-stranger's `permFault` latched into `ldS1Fault`). *Guard*: carry the resolved
-fault on `DLoadCmd`; delete both live reads. *Test*: must-fail-first — force a
-`pendingStoreMiss` to delay a load's accept by ≥ 2 cycles while a younger µop
-occupies the translate stage with a **faulting** VPN; assert the older load
-completes normally.
+tenure by `pendingStoreMiss`/`maintBusyReg`) or a silent spurious vector-2 fault
+from a younger translation. *Implemented guard*: `DcachePlugin` has no
+`DTranslationService` dependency. Faulting translations terminate in the LS
+front and cancel their tokenized probe; only clean, registered
+`{vaddr,paddr,cacheMode,token}` commands enter the cache. AXI refill faults
+remain on `DLoadRsp.fault`. *Tests*: real-DTLB parallel launch/early consume,
+SQ-forward cancellation, translation-fault/cross regressions, and a delayed
+older miss overlapped by a younger store.
 
 **H4 — `xlate.req.supervisor` staleness (NEW, already found by the late split).**
 `compFaultSup` (`:977`) and `suppressForLaterPrivCheck` (`:1523`) read the *live*
@@ -829,42 +843,37 @@ gate, and the gate comes early and often.
 ---
 
 <a name="8"></a>
-## 8. Staging, and the relationship to the in-flight late split
+## 8. Staging, and the relationship to the integrated late split
 
-### 8.1 Recommendation: **finish and land the late split first. Do not redirect it.**
+### 8.1 Current checkpoint: **late split integrated; continue toward elastic stages**
 
 Four grounded reasons, in order of weight:
 
-1. **Slice 1 already is the first structural step of this design, and it is
-   already verified.** `cc38cc8` split the LS EU into a front FSM owning
+1. **Slice 1 is the first structural step of this design and is integrated.**
+   `cc38cc8` split the LS EU into a front FSM owning
    `s1*`/`busy` and a back FSM owning `llReg`/the cache access, with
    `earlyFree = false` making it provably cycle-identical (IPC bit-identical on
    **54/54** rows — 9 kernels × 3 seeds × 2 memory models; lock-step fail list
    byte-identical). That is exactly the P5–P8 stage group of §4.1, with its
-   `bkCtx` being exactly P8's context register. Discarding it discards a
-   *verified* stage boundary.
+   `bkCtx` being exactly P8's context register.
 
-2. **The late split is the cheapest possible test of this design's central
-   unknown.** §6.2 says the region can lose 6.55 MHz and 4785 LUTs to a
+2. **Slice 2 now exercises the intended reuse.** `earlyFree = true` releases
+   S1 after a non-forwarded-load handoff. A deterministic delayed-refill test
+   proves a younger store reaches SQ allocation while the older back load is
+   still pending, then proves the older untagged response remains correctly
+   attributed. §6.2 still warns that the region can lose 6.55 MHz and 4785 LUTs to a
    one-term change with no added flops, and that no static analysis predicts it.
-   Slice 1's post-route gate — ~176 lines of RTL, `issuePort.ready` **textually
-   unchanged**, one file — is a canary for whether restructuring this cone costs
-   FMax. **That gate is still in flight.** Committing ~1000+ lines across three
-   clusters before reading it would be exactly the mistake the `compValid`
-   rejection was supposed to teach.
+   The post-route gate remains mandatory before this checkpoint is accepted.
 
-3. **The DTLB-liveness fix is a strict subset of this design's, and it is being
-   solved now.** The Slice-1 review's blocker (H3) must be fixed before
-   `earlyFree` flips; its fix (hold the registered DTLB request from the back
-   stage, with a matching `RegNext(bkXlateOverride)` term in `reqStale`) is the
-   *narrow* form of §3.1's decoupling. Landing it under the late split's
-   already-written must-fail-first test plan is strictly cheaper than
-   re-deriving it inside a larger diff.
+3. **The former DTLB-liveness blocker is closed at the interface.** The cache
+   consumes a resolved physical command and association token, never the live
+   translation response. This is stronger and simpler than keeping a back-stage
+   DTLB override alive.
 
-4. **The late split delivers the single largest marginal II win in the whole
-   roadmap.** Non-forwarded load II 9 → ~4–5 on `load-stream`, the kernel that
-   is 35% of the suite's ideal-memory cycles and ~99% LS-EU-bound. Everything
-   after it is smaller per unit of risk.
+4. **The next step remains the elastic front pipeline.** The checkpoint permits
+   two LS operations in flight but the front still admits only one resident µop,
+   and a second non-forwarded load stalls at `RESOLVE` while `bkBusy`. The final
+   target remains same-page all-hit II=1, not permanent acceptance of II≈4–5.
 
 **The honest cost of this ordering** — stated because it is real: the full
 pipeline **replaces the late split's front FSM entirely** (`IDLE`/`XLATE_B`/
@@ -883,6 +892,7 @@ measured FMax reading on the exact cone at issue.
 | **A — implemented** | **D-cache S1/S2 overlap** | `inFlight = ldS1Valid`; repair the pre-edge-valid test bug; prove two hits in flight and accept II=2 | `DcachePlugin`, `DcacheSpec` | cache suite; AXI hazard offsets; maintenance regressions; `test-fast` |
 | **B — implemented** | **Parallel VIPT probe** | launch DTLB request and virtual-set RAM read from the same registered boundary/token; remove live `xlate.rsp` reads at cache accept; cancel on forward/fault/squash | services, `LsEuPlugin`, `DcachePlugin`, DTLB tests | real-DTLB coincident launch; early-read consume; SQ-forward cancel; fault/cross regressions; post-route pair pending |
 | **C0 — implemented** | **Bounded miss-shadow replay** | accept all-hit commands at II=1; capture the one younger command accepted on older-S1 miss detection and replay it after refill | `DcachePlugin`, service token | sustained hit II=1; in-order miss replay; cache regressions; area/FMax pending |
+| **C2 — implemented checkpoint** | **LS front/back early free** | capture complete `bkCtx`/`llReg` at `RESOLVE`, keep one untagged cache back slot, release the front for one younger translate/resolve op | `LsEuPlugin`, LS test | delayed cold miss overlap; completion collision/cross/poison/RTE/cache regressions; `load-stream` −43.9%/−41.2% cycles (3 seeds ideal/L2); seed-1 aggregate −12.8%/−8.9%; area/FMax pending |
 | **C1 — optional** | **General hit-under-miss** | response tags + bounded miss state sufficient to keep accepting independent hits during refill | cache/service/LS files | hit-under-miss; queue-full backpressure; area/FMax |
 | **D** | **Elastic LS stages** | replace front/back one-at-a-time state with owned valid/context stages; uniform completion reservation | `LsEuPlugin` | IPC suite; lock-step/corpus; post-route pair |
 | **E** | **Context pruning** | prove non-use, shrink carried tokens | LS/cache files | LUT/FF delta; no functional change |
@@ -890,7 +900,8 @@ measured FMax reading on the exact cone at issue.
 Every slice ends with a hard correctness and `test-fast` gate; B–D additionally
 need paired post-route evidence when the PM-serialized implementation window is
 available. A removed a disproven blocker; B and C0 establish real common-path
-cache capacity before D opens the LS issue path. C1 is not a prerequisite for
+cache capacity, and C2 opens bounded LS overlap before D makes admission elastic.
+C1 is not a prerequisite for
 the blocking, in-order elastic LS pipeline and should be justified separately
 against area and workload miss behavior.
 
@@ -908,19 +919,22 @@ Baselines re-measured on `39f2e49` (late-split Task 2, 8 seeds, both models):
 
 `load-stream` is 360 non-forwarded loads (6 per iteration × 60) at II 9 ⇒ 3240
 predicted vs 3269 measured (0.9%). The cache-side II=3 ceiling has now been
-removed, but the LS one-at-a-time FSM still hides that capacity. Therefore the
-following remain analytical projections until slice D opens LS admission:
+removed. C2 also removes the older cache tail from the front's occupancy, but
+still provides only one younger front slot and one untagged back-load slot.
+Therefore the following remain analytical projections until C2 is benchmarked
+and slice D opens fully elastic LS admission:
 
 | | `load-stream` II | `load-stream` cyc | `load/store` | `mixed` | ideal aggregate |
 |---|---|---|---|---|---|
 | baseline | 9 | 3270 | 1045 | 560 | **9268** |
 | historical D-cache II=3 projection | **3** | ~1080 | ~650 | ~430 | **~6500** = **+43%** |
 | slice-A cache II=2 projection | **2** | ~720 | ~620 | ~420 | **~6100** = **+52%** |
+| C2 measured, seed 1 (current 10-kernel suite) | bounded front/back | **1836** | **1034** | **559** | **10658 vs 12221 baseline = −12.8% cycles** |
 | implemented cache capacity + elastic LS target | **1** | ~360 plus fill | to measure | to measure | **must be benchmarked** |
 
-The D-cache is no longer the common-hit acceptance bottleneck. Do not claim an
-IPC win from slices A–C0 alone: with the current LS FSM, requests still arrive
-far below the cache's new capacity. The gain becomes measurable only when the
+The D-cache is no longer the common-hit acceptance bottleneck. C2 should make
+the first material IPC gain by overlapping the cache tail, but it cannot feed
+the cache at its all-hit II=1 limit. That limit becomes reachable only when the
 elastic LS stages can present consecutive loads. Under the realistic memory
 model, refill time still limits the benefit, so both memory models remain
 mandatory.
@@ -1099,9 +1113,9 @@ enumerating what reads the LS EU's shared resources from outside
 five are genuinely new (H1's exposure, H3, H4, H5, H6), three are pre-existing
 gaps this design aggravates or must not inherit silently (H11, H13, H14), and
 the rest are existing invariants generalised. Two of the new ones (H4, H5) were
-already found and are already being fixed by the in-flight late split — direct
-evidence that the design-then-review discipline is finding this class before it
-lands, and an argument for keeping that work rather than restarting.
+found by the late-split review and are now implemented in C2 — direct evidence
+that the design-then-review discipline found this class before early release
+was enabled.
 
 **The IPC case is strong but suite-sensitive.** +23–28% realistic-memory
 aggregate is a large number, and 35% of the suite's ideal-memory cycles come

@@ -2,6 +2,19 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **2026-08-09 execution status:** this is now a historical/verification plan,
+> not a literal remaining-task queue. Slice 1 (`cc38cc8`) was ported onto the
+> subsequently implemented tokenized VIPT interface, which removed the plan's
+> live-DTLB blocker, and Slice 2 is enabled with `earlyFree = true`. A directed
+> delayed-refill test proves younger-store issue, translation, and SQ allocation
+> while the older load remains in the cache back stage. Focused functional gates
+> pass. Seeds 1–3 improve `load-stream` cycles by 43.9%/41.2% under ideal/L2
+> memory, and the seed-1 full-suite aggregate improves by 12.8%/8.9%. Paired
+> lock-step/corpus comparisons and the PM-serialized routed FMax/LUT gate remain
+> pending. Unchecked boxes below describe the original
+> branch-specific execution recipe and must not be interpreted as current RTL
+> status without consulting the two design specs.
+
 **Goal:** Split the LS EU FSM into a front stage (owns S1, completes stores and SQ-forwarded loads) and a back stage (owns the D-cache access), so a non-forwarded load's 5-cycle cache-access tail stops blocking the next LS µop — cutting non-forwarded load initiation interval from 9 cycles toward 4–5 without regressing post-route FMax or LUT count.
 
 **Architecture:** Two SpinalHDL `StateMachine`s inside `LsEuPlugin.logic` instead of one. The **front** FSM keeps `IDLE`/`XLATE_B`/`XLATE`/`RESOLVE`/`WAIT_SQ` and owns `s1Valid`/`s1Ctx`/`s2Paddr`/`busy`. The **back** FSM owns `BK_IDLE`/`LAUNCH`/`WAIT`/`WAIT_A`/`WAIT_B`, the already-existing 135-flop `llReg` launch register, `lineA`/`aDone`, and a new ~42-flop completion descriptor `bkCtx`. The handoff is the existing `RESOLVE` "no forward" arm, which already captures everything the cache access needs. A Scala elaboration-time flag `earlyFree` gates whether the front actually frees S1 at the handoff: **Slice 1 sets it `false`** so the split is structurally present but cycle-for-cycle identical to today (an early, cheap FMax checkpoint); **Slice 2 flips it to `true`** to realize the IPC win.

@@ -7,6 +7,7 @@ import m68k040.execute.LsEuPlugin
 import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
 import m68k040.isa.{MemOp, Size}
 import m68k040.mmu.{DtlbPlugin, MmuControlPlugin}
+import m68k040.sim.{AxiMemModel, AxiMemModelConfig, L2LatencyModel}
 import m68k040.services.CacheControlService
 import spinal.core._
 import spinal.core.sim._
@@ -134,9 +135,10 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
     cd.waitSampling(2)
   }
 
-  def initDut(dut: Dut): (ClockDomain, BehavioralMemAgent, BehavioralMemAgent) = {
+  def initDut(dut: Dut, dataMemCfg: AxiMemModelConfig = AxiMemModelConfig()):
+      (ClockDomain, AxiMemModel, BehavioralMemAgent) = {
     val cd = dut.clockDomain; cd.forkStimulus(10)
-    val mem   = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+    val mem   = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, dataMemCfg)
     val ptmem = new BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
@@ -362,6 +364,89 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
       dut.src.logic.obsIntAddr #= 21; sleep(1)
       assert(dut.src.logic.obsIntData.toBigInt == BigInt("11223344", 16),
         "real-DTLB parallel VIPT hit data")
+    }
+  }
+
+  test("LS front translates and allocates a younger store while an older cache miss is outstanding", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem, ptmem) = initDut(dut,
+        AxiMemModelConfig(latency = L2LatencyModel(enabled = true, dramCycles = 40)))
+      val loadBase  = 0x7000L
+      val storeBase = 0x8000L
+      val loadWord  = BigInt("6A7B8C9D", 16)
+
+      // Keep the D-cache enabled so the older load takes the ordinary cold-miss /
+      // line-refill path. MMU-off remains useful here: translation is deterministic
+      // identity, while the front/back overlap property is independent of a walker.
+      dut.cacheCtrl.logic.dcacheEnabled #= true
+      val lineImage = Seq(0x6A, 0x7B, 0x8C, 0x9D) ++ (4 until 16).map(i => 0x60 + i)
+      lineImage.indices.foreach(i => mem.pokeByte(loadBase + i, lineImage(i)))
+      seed(dut, cd, preg = 10, value = loadBase)
+      seed(dut, cd, preg = 11, value = storeBase)
+      seed(dut, cd, preg = 12, value = 0x11223344L)
+
+      val olderRob   = 10
+      val youngerRob = 11
+      issueLoad(dut, cd, basePreg = 10, disp = 0, pdst = 20, robId = olderRob)
+      sleep(1) // let ready reflect the just-captured S1 entry after the issue edge
+
+      // Hold the younger store at issue until the front releases. At the accepting
+      // edge the older load must still occupy the cache back stage, and must not be
+      // completing on that same edge. This is the property the old monolithic FSM
+      // could never satisfy: issue.ready stayed low through the entire miss/refill.
+      val s = dut.src.logic
+      s.iValid #= true; s.iMemOp #= MemOp.STORE; s.iSize #= Size.LONG
+      s.iPsrcA #= 11; s.iPsrcAValid #= true
+      s.iPsrcB #= 12; s.iPsrcBValid #= true
+      s.iImm #= 0
+      s.iPdstValid #= false; s.iPdst #= 0; s.iRobId #= youngerRob
+
+      var issueWait = 0
+      while (!s.iReady.toBoolean && issueWait < 200) {
+        cd.waitSampling()
+        issueWait += 1
+      }
+      assert(issueWait < 200, "younger store never reached the released LS front")
+      val acceptedWithOlderPending = dut.eu.logic.bkBusy.toBoolean &&
+                                     !dut.eu.logic.bkCompletes.toBoolean &&
+                                     !(s.cValid.toBoolean && s.cRob.toInt == olderRob)
+      cd.waitSampling() // younger issue handshake
+      s.iValid #= false
+      assert(acceptedWithOlderPending,
+        s"younger memory op must issue while the older cold load is still pending in the cache back stage " +
+        s"(wait=$issueWait busy=${dut.eu.logic.busy.toBoolean} s1=${dut.eu.logic.s1Valid.toBoolean} " +
+        s"bkBusy=${dut.eu.logic.bkBusy.toBoolean} bkCompletes=${dut.eu.logic.bkCompletes.toBoolean} " +
+        s"cValid=${s.cValid.toBoolean} cRob=${s.cRob.toInt})")
+
+      // Go beyond mere acceptance: prove the younger op completes translation and
+      // reaches its SQ terminal action before the older miss response returns.
+      var allocSeen = false
+      var allocWhileOlderPending = false
+      var oldCompleted = false
+      var n = 0
+      while (!allocSeen && n < 200) {
+        if (s.cValid.toBoolean && s.cRob.toInt == olderRob) oldCompleted = true
+        if (dut.eu.logic.sq.io.alloc.valid.toBoolean &&
+            dut.eu.logic.sq.io.alloc.payload.robId.toInt == youngerRob) {
+          allocSeen = true
+          allocWhileOlderPending = dut.eu.logic.bkBusy.toBoolean &&
+                                   !dut.eu.logic.bkCompletes.toBoolean &&
+                                   !oldCompleted
+        }
+        if (!allocSeen) cd.waitSampling()
+        n += 1
+      }
+      assert(allocSeen, "younger store never reached SQ allocation")
+      assert(allocWhileOlderPending,
+        "younger store must translate and allocate before the older cold-load response")
+
+      // The decoupling must not lose or misattribute the untagged cache response.
+      if (!oldCompleted)
+        assert(waitCompletion(dut, cd, robId = olderRob), "older load completion was lost after front-stage overlap")
+      cd.waitSampling(3)
+      s.obsIntAddr #= 20; sleep(1)
+      assert(s.obsIntData.toBigInt == loadWord,
+        f"older load data corrupted across front/back overlap: got 0x${s.obsIntData.toBigInt}%08X")
     }
   }
 

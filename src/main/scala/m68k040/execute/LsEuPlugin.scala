@@ -60,7 +60,7 @@ case class LsFault() extends Bundle {
   val atc        = Bool()
 }
 
-/** AGU + Load/Store EU (LS-1 slice): conservative single-outstanding pipe.
+/** AGU + Load/Store EU with decoupled front resolve and cache back end.
   *
   * S0  read base reg (psrcA) + store data (psrcB); va = base + disp(imm);
   *     request translation (vpn). M2S register.
@@ -71,7 +71,8 @@ case class LsFault() extends Bundle {
   *            (the dynamic wakeup) + wbObs.
   *     STORE: sq.alloc(robId, paddr, data, size); completion fires (store
   *            "executes" == SQ-allocated; it drains at commit).
-  * issue.ready deasserts while a load is in flight (busy) -> EU is occupied. */
+  * A non-forwarded load hands a complete descriptor to the one-entry cache back
+  * stage, freeing the front to translate/resolve one younger memory operation. */
 class LsEuPlugin extends FiberPlugin with LsEuService {
   // ─────────────────────────────────────────────────────────────────────────
   // LS EU LATE SPLIT (2026-08-09, spec docs/superpowers/specs/
@@ -97,7 +98,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   //
   // `issue.ready`'s EXPRESSION is deliberately unchanged in BOTH modes (GC13) —
   // only WHEN `busy` reads 0 changes. See spec §6.2.
-  private val earlyFree: Boolean = false
+  private val earlyFree: Boolean = true
 
   var issuePort: Stream[IqContext] = null
   var completionPort: Flow[UInt]   = null
@@ -305,8 +306,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // and compute the effective address `s1Va` in S1 off that flop + the shallow
     // (uop-derived, no-bypass) displacement. The ALU->base cone now ENDS at `s1Base`;
     // the AGU adder is a SEPARATE shallow stage (s1Base_reg + disp -> s1Va), not
-    // chained onto the ALU's result. (Latency-agnostic: lock-step is instruction-level
-    // and the EU is single-outstanding.)
+    // chained onto the ALU's result. (Latency-agnostic: lock-step is instruction-level,
+    // and the front context is held until its decision or cache handoff.)
     val base0 = Mux(u0.psrcAValid, rdBase.data.asUInt, U(0, 32 bits))
     // STORE DATA: `imm` (retPC) for a BSR/JSR stack-push (predecrement, srcB invalid),
     // else the (possibly bypassed) source register. A LINK push is ALSO a stkPush but
@@ -465,8 +466,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     //   s1Va_reg -> DTLB lookup -> s2Paddr_reg                 (translate stage)
     //   s2Paddr_reg -> SQ-compare -> fwd*_reg / alloc          (forward stage)
     // at the cost of ONE extra translate-latency cycle (lock-step is latency-
-    // agnostic; the EU is single-outstanding and already stalls the walker on a
-    // DTLB miss). Identity (MMU-disabled) flows through the SAME register so both
+    // agnostic; the one-resident front holds a DTLB miss while an older cache access
+    // may remain in the independent back stage). Identity flows through the SAME register so both
     // modes are pipelined uniformly. All RegInit / Reg (no uninit fanout).
     val s2Paddr  = Reg(UInt(32 bits))
     val s2PaddrB = Reg(UInt(32 bits))
@@ -526,9 +527,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // addrB,paddrB,size,twoAccess} into `llReg` flops the cycle the FSM decides to go
     // to the cache (the new LAUNCH state), and drive `loadCmd` from THOSE flops the
     // next cycle. The cache now tags on a REGISTERED address (flop -> loadCmd ->
-    // cmdSet); the AGU adder ends at the llReg flop. +1 cache-launch cycle is latency-
-    // agnostic (the EU is single-outstanding; s1* are held stable while busy). All
-    // RegInit / Reg (no uninit fanout).
+    // cmdSet); the AGU adder ends at the llReg flop. The handoff captures every source
+    // before s1* may advance, and the independent front hides this +1 launch cycle when
+    // useful. All RegInit / Reg (no uninit fanout).
     val llReg = new Area {
       val valid     = RegInit(False)
       val vaddr     = Reg(UInt(32 bits))
@@ -985,7 +986,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     //   fwd* reg -> captureCompletion -> compData_reg              (short, 1 mux)
     // at the cost of ONE extra load-latency cycle (lock-step is latency-agnostic).
     //
-    // SAFE under single-outstanding (issue.ready := !busy && !s1Valid &&
+    // SAFE with a single-resident FRONT (issue.ready := !busy && !s1Valid &&
     // !compValid): at most one LS µop is ever in the forward/resolve stages, and
     // the s1 context (hence the SQ query) is held stable across the registered
     // query and its RESOLVE use (busy holds s1Valid; no concurrent store-alloc in
@@ -1376,10 +1377,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     faultCompletionPort.payload.atc        := compFaultAtc
 
     val busy = RegInit(False); busy.simPublic(); s1Valid.simPublic()
-    // Single-outstanding: do not accept a new µop while a decision is pending
-    // (s1Valid), a load is in flight (busy), or a registered completion is occupying
-    // the writeback stage this cycle (compValid). compValid is a 1-cycle pulse, so
-    // this only stalls issue for that one extra cycle.
+    // Front-stage admission: do not accept a new µop while a front decision is pending
+    // (s1Valid/busy) or a registered completion occupies writeback (compValid). The
+    // independent cache back stage is intentionally absent: after handoff it may remain
+    // occupied while one younger operation translates/resolves in the front.
     issuePort.ready := !busy && !s1Valid && !compValid
 
     // Task #139 finding #1 mechanism #2: this core recovers branch mispredicts at
@@ -1585,8 +1586,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
             // s2Paddr next cycle (the DTLB lookup is no longer in series with the
             // SQ-compare). Only advance once translation is RESOLVED (TLB hit /
             // identity); on a DTLB miss `xlateReady` is False while the walker runs ->
-            // hold S1 (busy) and retry next cycle (the existing single-outstanding
-            // stall). `busy` alone is not enough on the stall path (the S0->S1 advance
+            // hold this front entry (busy) and retry next cycle. `busy` alone is not
+            // enough on the stall path (the S0->S1 advance
             // reads the pre-update busy and would clear s1Valid this cycle), so
             // re-assert s1Valid explicitly (later write wins).
             busy := True
@@ -1769,8 +1770,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
                 // `deferCompletion` above) when the SQ confirms the drain.
                 deferCompletion()
               }
-              // !fastStore: allocate WITHOUT completing. The LS EU's single-outstanding
-              // contract does not depend on completion -- it frees here regardless; the
+              // !fastStore: allocate WITHOUT completing. Front-stage occupancy does not
+              // depend on completion -- it frees here regardless; the
               // store's ROB completion arrives later from the SQ's at-head drain
               // (StoreQueue's sqCompletion/sqFaultCompletion Flows, Task P2.4).
               busy    := False
