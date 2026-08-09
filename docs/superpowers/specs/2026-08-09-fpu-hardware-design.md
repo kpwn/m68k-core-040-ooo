@@ -1,9 +1,9 @@
 # FPU (hardware core) — design spec
 
-**Status**: drafted from a live design conversation (this session,
-2026-08-09), grounded against real Vivado synthesis data and this
-project's existing RTL. Awaiting user review before an implementation
-plan is written.
+**Status**: DRAFT, with the fixed-latency throughput amendment below ratified by
+the later project-wide IPC direction. Grounded against real Vivado synthesis
+data and this project's existing RTL. Awaiting an implementation plan; no FPU
+RTL exists yet.
 
 ## 0. Context and goal
 
@@ -11,10 +11,18 @@ This project's integer 68040 ISA has been complete since 2026-07-12.
 The user's stated goal: **"an FPSP plan that targets not the best perf
 but an okay perf, implementing fpsp's minimum set and
 fadd/fsub/fmul/fdiv plus fsave/fmove"**, extended to include other
-cheap operations, explicitly **in-order** (no pipelining requirement),
-and **area-light / FMax-neutral**, with an explicit preference for
+cheap operations, architecturally precise and **area-light / FMax-neutral**,
+with an explicit preference for
 **DSP48E2 blocks over LUT fabric** wherever the datapath needs
 multiply/accumulate hardware.
+
+The later binding throughput direction is that an additional latency cycle is
+worth taking when it permits multiple operations in flight. Accordingly,
+"in-order" here means precise architectural retirement and no separate FPU
+reservation station; it does not permit a DSP-backed fixed-latency operation to
+be busy-gated one at a time. FADD/FSUB/FMUL and the cheap fixed-latency operations
+must be elastic II=1 pipelines. FDIV/FSQRT may remain single-context iterative
+lanes.
 
 The target platform is a macqd700 (Quadra 700 clone) SoC running
 classic Mac OS. This matters architecturally: **the Quadra 700 ROM
@@ -62,9 +70,11 @@ foundation, not an open risk.
   critical-path family the way `DcachePlugin`/`RobPlugin` families
   were this session — gated with the same real post-route discipline
   established this session (§7).
-- In-order: no FPU-specific pipelining, no new IQ/scoreboard/
-  reservation-station scheme. Reuse the existing `DivEuPlugin` pattern
-  (§3) — single shared multi-cycle datapath, busy-gated issue.
+- Throughput without new scheduler ports: reuse one existing-style issue gateway
+  and completion path, but feed separate fixed-latency and iterative lanes.
+  FADD/FSUB/FMUL and cheap operations accept every cycle when result credit is
+  available; FDIV/FSQRT retain one iterative context. Architectural precision is
+  still provided by the existing ROB.
 
 ## 2. Non-goals
 
@@ -73,36 +83,43 @@ foundation, not an open risk.
   hardware doesn't have these either; they trap to FPSP on real
   silicon and will trap to the ROM's FPSP here too).
 - No non-idle FSAVE/FRESTORE frame capture/replay (§4).
-- No pipelined/high-throughput FPU datapath. "Okay perf," explicitly
-  not best-in-class, per the user's own framing.
-- No attempt to match m68k-ooo's own FPU's pipelined FADD/FMUL
-  datapath shape — that design optimizes for throughput this project
-  explicitly does not need; porting it would cost more area for a
-  property (pipelining) this design isn't targeting.
+- No replicated or fully unrolled FDIV/FSQRT and no general multi-context
+  iterative engine. "Okay perf" does not justify that area.
+- No FPU-specific IQ, reservation station, extra PRF write port, or extra ROB
+  completion port unless later occupancy and physical evidence explicitly
+  justify one. Elastic fixed-latency pipelines should use the existing gateway
+  and internal DSP/register resources first.
 
 ## 3. Architecture: the FPU EU
 
-**Recommended base: extend the existing `DivEuPlugin` pattern**, not a
-new architectural mechanism. `DivEuPlugin.scala` already demonstrates
-every structural property this FPU EU needs:
-- Deasserts `issue.ready` while a multi-cycle op iterates (busy-gated,
-  in-order, no new reservation station).
-- Broadcasts a dynamic-completion `Flow[UInt]` (`completionPort`) into
-  the existing IQ/ROB completion-port infrastructure — no new ROB
-  port class needed architecturally, though the width/payload will
-  differ (FP result + FPCC, not an integer completion).
-- Already houses two structurally dissimilar ops in one EU slot
-  (1-cycle CHK alongside multi-cycle iterative DIV) — directly
-  analogous to housing 1-cycle FMOVE/FABS/FNEG/FCMP alongside
-  multi-cycle FADD/FSUB/FMUL/FDIV/FSQRT in one FPU EU slot.
+**Recommended base: reuse the integrated CPLX-MUL lesson, not the former
+single-outstanding `DivEuPlugin` pattern.** One logical FPU issue gateway feeds:
 
-**Open implementation-time question** (flag for the plan, not decided
-here): does the FPU EU become a NEW, additional CPLX-class EU slot, or
-does it fold into the EXISTING `DivEuPlugin` slot (a 3rd/4th op class
-sharing the same issue port, mirroring how DIV/MUL/CHK/CMP2/CHK2
-already share one)? This affects IQ port count and ROB completion-port
-count directly — needs to be resolved with real IQ-occupancy/
-port-count analysis at plan-writing time, not guessed here.
+- a cheap fixed pipe for FMOVE/FABS/FNEG/FCMP/FTST/FMOVECR;
+- elastic, fully registered FADD/FSUB and FMUL pipes, each with initiation
+  interval one; and
+- one held iterative context shared by FDIV/FSQRT.
+
+The fixed pipes carry pruned per-operation descriptors and per-stage
+valid/flush poison. FMUL must infer the DSP48E2 A/B/M/P registers; FADD/FSUB may
+add normalization boundaries as needed for the 250-MHz goal. Issue reserves
+result capacity before entering any unstallable tail. Separate fixed-result
+FIFO/hold and iterative-result hold feed one atomic arbiter; its winner drives
+FP PRF write, FPCC write, wakeup, fault/status observation, and ROB completion
+together. Collision storage must cover a fixed result meeting FDIV/FSQRT done;
+a non-backpressured completion Flow is not permission to drop either result.
+
+The existing IQ/ROB already tolerates completion out of execution order. FPU
+macro effects remain precise because the ROB retires in order. No global result,
+exception, or "flushed" latch may identify more than one in-flight operation;
+association must travel with the descriptor or be keyed by ROB identity.
+
+**Open implementation-time question** (flag for the plan, not decided here):
+whether the FPU gateway shares the existing CPLX select/physical completion
+gateway or uses a new logical cluster while still sharing physical PRF/ROB
+ports. A brand-new IQ and ROB port is not the default; the plan must first prove
+that opcode eligibility or result arbitration cannot preserve throughput with
+the existing port budget.
 
 ## 4. FSAVE/FRESTORE — idle-frame only
 
@@ -191,9 +208,11 @@ timing claim):
 | FSQRT radix-2 iteration engine | 144 LUT, 173 FF | 173 LUT, 206 FF | +29 LUT, +33 FF |
 | **Total marginal cost** | | | **+247 LUT, +137 FF, +7 DSP** |
 
-Device headroom (`xcku5p-ffvb676-2-e`, current post-Lever-F usage):
-113,377/216,960 LUT (52.3% used, 103,583 free), 47,073/433,920 FF,
-6/1,824 DSP48E2 (0.33% used, 1,818 free).
+Device headroom (`xcku5p-ffvb676-2-e`) is ample. The latest completed
+full-core checkpoint used 117,956/216,960 LUT (54.37%), 50,075/433,920 FF,
+26 BRAM, and 4/1,824 DSP48E2. The table above predates that checkpoint but its
+isolated width delta remains the relevant evidence: native extended precision
+adds little relative to the device, especially in DSP resources.
 
 **Decision: native 80-bit extended compute.** The marginal cost
 (+247 LUT / +7 DSP) is 0.22% of current design LUTs and 0.4% of
@@ -204,15 +223,15 @@ fix after the fact) to save an amount of area that isn't a real
 tradeoff here.
 
 **Caveats carried forward, explicitly, for the implementation plan**:
-- These are pre-place resource counts. The wider 80-bit align/
-  normalize shifters may need their own pipelining/register insertion
-  to stay FMax-neutral — this is an OPEN FMAX QUESTION the probe does
-  not answer, and must be gated with a real post-route measurement
-  once actual RTL exists (§7), not assumed free from this data alone.
+- These are pre-place resource counts. The wider 80-bit align/normalize
+  shifters require elastic registered boundaries selected from synthesis and
+  route evidence. Those stages may add latency but must preserve II=1. This is
+  an OPEN FMAX QUESTION the probe does not answer and must be gated with a real
+  post-route measurement once actual RTL exists (§7).
 - FDIV/FSQRT width scaling is mostly a LATENCY cost (56→67 iterations,
-  ~20% more cycles for 64-bit vs 53-bit significand), not an area
-  cost — consistent with, and already covered by, the "in-order,
-  doesn't have to be the fastest" acceptance.
+  ~20% more cycles for 64-bit vs 53-bit significand), not an area cost. That is
+  acceptable for the explicitly iterative lane and does not relax the II=1
+  requirement for the fixed-latency lanes.
 - The probe FADD core omits NaN/Inf/denormal special-casing (the
   measured delta is width-independent so it stays sound; the absolute
   counts are a floor — real RTL will add more for full IEEE-754
@@ -232,8 +251,18 @@ IPC-push initiatives:
 - TNS and failing-endpoint-count tracked alongside WNS (not WNS alone
   — the session's standing methodology correction).
 - git-worktree isolation for all A/B comparisons.
-- Current confirmed baseline to gate against: **207.17 MHz post-route,
-  113,377 LUT** (Lever F landing, commit `9752c5c`).
+- The architectural target remains **250 MHz**. **200 MHz** is the current
+  deployment floor, not the optimization target.
+- Latest completed checkpoint: **WNS -1.766 ns at a 4.000-ns constraint,
+  equivalent to 173.430 MHz**, with 117,956 LUT, 50,075 FF, 26 BRAM, and 4 DSP.
+  It is a diagnostic baseline taken before the final FTB/deep-MUL landed set,
+  not an FPU acceptance result.
+- Inspect every affected pblock's capture, CLB occupancy, and congestion as well
+  as global utilization. The current D-cache pblock is already overfull even
+  though global area is healthy.
+- If an implementation crosses an area budget, report the exact resource and
+  pblock deltas for review before rejecting or reverting it. Area pressure is a
+  design tradeoff checkpoint, not an automatic rollback.
 
 ## 8. FPCC register rename
 
@@ -262,11 +291,34 @@ needs triage at implementation-plan time to separate "this hardware
 op is genuinely missing" from "this test needs the ROM's FPSP, which
 is out of scope for a bare-core test."
 
+The implementation also requires protocol-level tests that the inherited
+instruction corpus cannot substitute for:
+
+- drive at least eight independent operations into each fixed lane on
+  consecutive cycles, require eight consecutive accepts and results at the
+  documented fixed latency, and check exact ROB/destination/FPCC association;
+- prove at least four fixed operations are simultaneously in flight, with no
+  duplicate or missing PRF write, wakeup, status observation, or completion;
+- collide a fixed-pipeline result with FDIV/FSQRT completion and prove the
+  result arbiter retains both exactly once;
+- hold a request valid while result capacity is unavailable and prove stable
+  payload plus exactly one acceptance when credit returns;
+- flush a dense fixed pipeline and an active iterative operation, immediately
+  reuse ROB and physical destinations, and prove no stale side effect survives;
+  and
+- mutation-check the dense-start, collision, and flush/reuse tests so a return
+  to a busy-gated singleton or global flush latch fails visibly.
+
+Simulation cannot prove DSP A/B/M/P register use. The physical gate must report
+the inferred FMUL DSP count and internal register properties in addition to
+functional throughput.
+
 ## 10. Open items requiring implementation-time verification (not silently assumed)
 
-1. FPU EU port topology (§3): new EU slot vs. folded into
-   `DivEuPlugin`'s existing slot — needs real IQ-port/ROB-completion-
-   port-count analysis.
+1. FPU gateway topology (§3): share the existing CPLX selection gateway or add
+   a new logical cluster while retaining the existing physical PRF/ROB ports.
+   Decide from opcode eligibility, collision, occupancy, and timing evidence;
+   a new scheduler or writeback port is not the default.
 2. Exact FMOVE/FMOVEM/FMOVECR EA-addressing-mode coverage — full
    parity with the existing integer MOVE EA-decode matrix, or a
    narrower subset matching only what the 48 target tests exercise?
@@ -288,3 +340,7 @@ is out of scope for a bare-core test."
    matches real 68040 FTST semantics (condition-code effects
    specifically) before locking it as a decode-time rewrite rather
    than a distinct micro-op.
+6. Exact fixed-operation latencies and FIFO depths: select them from inference
+   probes and collision analysis while keeping II=1 and reserving every
+   unstallable result before launch. Latency is deliberately not frozen before
+   the DSP and normalization pipelines are physically characterized.

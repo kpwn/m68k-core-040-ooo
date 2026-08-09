@@ -168,7 +168,7 @@ DSP48E2 internal registers remains open.
 | integer `MulCore` | 4 expected | 7 / 1 | integrated `DivEuPlugin` accepts and completes dense MUL at II=1, including while DIV is active | seven-stage reshape selected after physical mapping proved the four-cycle form left every MREG unused |
 | divider | 0 | about 66 / 67 | single iterative context | keep iterative unless a measured workload justifies a different algorithm |
 | MOVEM decode arithmetic | 0 after strength reduction | combinational | not a queue | the 173.430-MHz checkpoint confirms the two accidental DSPs are gone; endpoint recovery remains part of the final route |
-| FPU | not implemented | draft only | draft is explicitly busy-gated/single-outstanding | amend before implementation: fixed-latency FADD/FMUL should be elastic II=1 |
+| FPU | not implemented | draft only | fixed-latency FADD/FSUB/FMUL and cheap operations are now specified as elastic II=1; FDIV/FSQRT retain one iterative context | carry pruned descriptors, reserve result credit, and physically verify DSP A/B/M/P registers before RTL acceptance |
 
 All four DSP48s in the current physical checkpoint are accounted for by the
 integer multiplier. The two former MOVEM DSPs are gone. There are no arithmetic
@@ -228,11 +228,14 @@ MOVEM endpoint family is fully recovered remains a final-route question.
 
 ### 4.3 FPU draft
 
-`2026-08-09-fpu-hardware-design.md` currently proposes a shared busy-gated,
-non-pipelined unit while also estimating a 16-DSP FMUL. That contradicts the
-throughput direction before any RTL exists. Revise the draft so fixed-latency
-FADD/FSUB/FMUL are elastic II=1 and use internal DSP registers. FDIV/FSQRT may
-remain iterative and separately buffered.
+`2026-08-09-fpu-hardware-design.md` now ratifies the throughput amendment before
+any FPU RTL exists. Fixed-latency FADD/FSUB/FMUL and cheap operations are elastic
+II=1 pipelines with pruned per-operation descriptors, result-credit
+reservation, and per-entry flush poison. FDIV/FSQRT remain a single iterative
+context with a separate held result. One atomic arbiter retains colliding fixed
+and iterative results through the existing physical completion resources. The
+implementation gate must prove dense acceptance and DSP A/B/M/P register use;
+the earlier busy-gated singleton wording is superseded.
 
 ## 5. Test honesty requirements
 
@@ -307,7 +310,7 @@ standalone interrupt tests no longer fail elaboration and retry first.
 | MSHR proposal | correctly prioritizes D-side hit-under-miss and warns about crossbar limits | implement one parked miss before general MSHRs |
 | store-drain/race documents | binding amendment now owns the implemented Stream/S0–S3/send-vs-ack design; the old `presentPtr/inFlight` plan body is historical and non-normative | retain the implemented ordered barriers and one AXI serializer; never revive independent loose FSMs |
 | old FMax retiming documents | valid for timing changes but some explicitly preserve single-outstanding behavior | do not read a retiming non-goal as a throughput endorsement |
-| FPU draft | busy-gated fixed-latency operations conflict with the new throughput requirement | amend before RTL |
+| FPU draft | reconciled before RTL: fixed-latency operations are elastic II=1; only FDIV/FSQRT remain iterative | preserve the shared-port default and physically gate DSP mapping, FMax, and area |
 | debug/JTAG | new core had no debug controller; sibling SoC contract was the only live compatibility definition | use the new JTAG-compatible debug-controller addendum |
 
 ## 7. Ordered implementation recommendation
