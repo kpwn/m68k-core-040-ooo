@@ -56,7 +56,8 @@ import scala.util.Random
   *   BSR/JSR/RTS/RTD/RTR;
   *   JMP (fwd, abs/(An)); MOVE to/from CCR + ANDI/ORI/EORI-to-CCR;
   *   MOVE from SR (supervisor boot); MOVE USP (write-then-read);
-  *   MOVEC SFC/DFC round-trip; MOVES all sizes/dirs (supervisor);
+  *   MOVEC SFC/DFC round-trip; MOVES all sizes/dirs (supervisor); explicit
+  *   cross-line LONG load/store/load;
   *   TRAP #n / TRAPV / TRAPcc / CHK (sparingly, self-installed handler).
   *
   * ── EXCLUSION LIST (intentional generator scope and known gaps) ─────────────
@@ -75,10 +76,10 @@ import scala.util.Random
   *     hold the program image, so a PC-relative data load reads different bytes
   *     than Musashi. JMP/JSR pc-rel (pure fetch) would be fine but are covered
   *     via abs/(An) here.
-  *   - accesses CROSSING a 16-byte cache line: known PRE-EXISTING LS-EU
-  *     cross-line-store-after-load drain bug (documented at the quarantined
-  *     directed tests, ExecuteLockStepSpec ~line 1425). Excluded so the sweep
-  *     doesn't rediscover it 100 times; set FUZZ_ALLOW_CROSSLINE=1 to re-enable.
+  *   - generic random EAs remain within one 16-byte cache line by default to
+  *     keep multi-access template state bounded. The dedicated `crossline`
+  *     template always exercises the formerly-buggy load/store/load sequence;
+  *     set FUZZ_ALLOW_CROSSLINE=1 to broaden every eligible template too.
   *   - vector-table addresses 0x000-0x0FF are reserved for the trap templates'
   *     handler installs (outside the compared sandbox)
   */
@@ -384,6 +385,19 @@ object ProgGen {
       val (s1, ea1, _) = memEa(sz, wide = false)
       val (s2, ea2, _) = memEa(sz, wide = false)
       s1 ++ s2 :+ s"\tmove.$sz $ea1,$ea2"
+    }
+
+    /** Minimal regression for the former LS-EU split-slot drain bug. The
+      * address 0x401e makes a LONG span cache lines 0x4010 and 0x4020 while
+      * remaining wholly inside the seeded sandbox. */
+    private def tCrossLine(): Vector[String] = {
+      val an = a(); val srcN = dn(); val loadN = (srcN + 1 + r.nextInt(7)) % 8
+      val src = s"%d$srcN"; val loaded = s"%d$loadN"
+      Vector(s"\tmove.l #0x401e,$an",
+             s"\tmove.l ${imm32()},$src",
+             s"\tmove.l ($an),$loaded",
+             s"\tmove.l $src,($an)",
+             s"\tmove.l ($an),$loaded")
     }
 
     private def tAluMemSrc(): Vector[String] = {
@@ -979,6 +993,7 @@ object ProgGen {
       ("move-load",  8, tMoveLoad _),   ("movea-load", 3, tMoveaLoad _),
       ("move-store", 9, tMoveStore _),  ("move-imm-mem",2,tMoveImmStore _),
       ("move-mm",    2, tMoveMemMem _),
+      ("crossline",  2, tCrossLine _),
       ("alu-memsrc", 5, tAluMemSrc _),  ("alu-rmw",    5, tAluMemRmw _),
       ("imm-rmw",    3, tAluImmRmw _),  ("quick-rmw",  2, tQuickMemRmw _),
       ("unary",      4, tUnaryReg _),   ("unary-mem",  3, tUnaryMem _),
@@ -1011,7 +1026,13 @@ object ProgGen {
     )
     private val skipTags: Set[String] =
       sys.env.get("FUZZ_SKIP").map(_.split(",").map(_.trim).filter(_.nonEmpty).toSet).getOrElse(Set.empty)
-    private val templates = allTemplates.filterNot(t => skipTags.contains(t._1))
+    private val onlyTags: Set[String] =
+      sys.env.get("FUZZ_ONLY").map(_.split(",").map(_.trim).filter(_.nonEmpty).toSet).getOrElse(Set.empty)
+    private val templates = allTemplates
+      .filter(t => onlyTags.isEmpty || onlyTags.contains(t._1))
+      .filterNot(t => skipTags.contains(t._1))
+    require(templates.nonEmpty,
+      s"FUZZ_ONLY/FUZZ_SKIP selected no templates (only=${onlyTags.mkString(",")}, skip=${skipTags.mkString(",")})")
     private val totalWeight = templates.map(_._2).sum
 
     def nextBlock(): Block = {

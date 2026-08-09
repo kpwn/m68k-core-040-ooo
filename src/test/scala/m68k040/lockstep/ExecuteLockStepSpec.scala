@@ -2083,17 +2083,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "bfextu (%a0){#4:#24},%d3"
     )).mkString(" ; "), checkMem = Seq(0x3001L), checkSpan = 4)
   }
-  // KNOWN PRE-EXISTING LS-EU BUG (NOT slice 3b): a misaligned LONG store CROSSING a cache
-  // line, after a cross-line LOAD to the same address, does not write slot A through to
-  // backing memory (the dcache write-through of the split slot-A is dropped). Reproduces
-  // with PLAIN MOVE.L (zero bit-field/engine code):
+  // Regression for the former LS-EU bug: a misaligned LONG store CROSSING a cache
+  // line, after a cross-line LOAD to the same address, used to omit slot A from the
+  // backing-memory drain. It reproduced with PLAIN MOVE.L (zero bit-field/engine code):
   //   move.l #0x3FFE,%a0 ; move.l (%a0),%d1 ; move.l #X,%d2 ; move.l %d2,(%a0)  -> mem[0x3FFE] stale
-  // The bit-field RMW chain (load-then-store same addr) inherits it for cross-line byteAddrs.
-  // The slice-3b datapath/store is CORRECT (register read-backs via SQ-forward match Musashi
-  // cross-line; only the backing-memory write-through diverges). Quarantined here until the
-  // LS-EU cross-line-store-after-load drain is fixed (out of slice-3b scope). DO NOT delete:
-  // this documents the gap (the LsEuPlugin/DcachePlugin owner picks it up).
-  test("lock-step: BFSET mem misaligned LONG store crossing a cache line (PRE-EXISTING LS-EU cross-line-store bug)", VerilatorTest) {
+  // The bit-field RMW chain inherited it. Keep this active test as the end-to-end
+  // regression for both split-slot data and terminal store drain.
+  test("lock-step: BFSET mem misaligned LONG store crossing a cache line", VerilatorTest) {
     runLockStep("bfrmw-crossline", (bfMemSeedLine ++ Seq(
       "ori #0x10,%ccr",
       "bfset (%a0){#4:#24}",                             // 24-bit field, bitOff 4, store crosses 0x4000

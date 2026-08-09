@@ -1114,10 +1114,11 @@ baseline recorded 8 where an earlier run recorded 6–7; name-list comparison is
 mandatory), ported corpus via `ported-sweep-parallel.sh 4` (891 tests, 63 fails),
 `IpcBenchSpec` 8 seeds × {`zero`, `l2:5:70`}, and a post-route FMax/LUT pair.
 
-Note the pre-existing LS-spec failure
-`cross-line store after cross-line load drains BOTH slots` — the **same hazard
-family as H5**. It fails at baseline; do not read a post-change failure there as
-new without checking the baseline name list.
+The former `cross-line store after cross-line load drains BOTH slots` failure is
+fixed and is now an active regression, not a baseline exception. Any recurrence
+is a real failure in the H5 hazard family. The randomized generator also carries
+an explicit cross-line load/store/load template; do not quarantine it merely to
+make a sweep green.
 
 ### 9.2 New directed tests
 

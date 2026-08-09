@@ -24,7 +24,9 @@ import org.scalatest.funsuite.AnyFunSuite
   *   FUZZ_SEED_START (default 0), FUZZ_SEED_COUNT (default 5),
   *   FUZZ_BLOCKS (body template blocks per program, default 20),
   *   FUZZ_MINIMIZE (default 1), FUZZ_MIN_ATTEMPTS (default 80),
-  *   FUZZ_ALLOW_CROSSLINE (default 0 — see ProgGen exclusion list).
+  *   FUZZ_ONLY / FUZZ_SKIP (comma-separated template tags),
+  *   FUZZ_ALLOW_CROSSLINE (default 0; the explicit `crossline` template is
+  *   always enabled, while this knob broadens generic memory templates).
   *
   * JVM discipline: ONE Verilator compile per JVM (lazy, shared across seeds
   * and minimization reruns). Run batches singly:
