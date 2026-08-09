@@ -1,6 +1,6 @@
 # TRAPcc (020+ conditional trap) — Design
 
-**Status:** Draft — controller-driven (ISA-completion track; user: "you pick / batch it, features first").
+**Status:** Implemented.
 **Date:** 2026-06-15
 **Parent:** [[isa-completion-roadmap]] — first slice of the "bounded 020 integer ops" phase. Reuses the trap/exception machinery ([[exception-subsystem]], [[traps-trap-trapv]]) and the branch-EU condition eval.
 
@@ -11,7 +11,9 @@ TRAPcc — conditional trap (68020/030/040). Encoding (line-5): `0101 cccc 11 11
   - `100` → no operand → **1 word** (just the opword).
   - `010` → `#<data16>` → **2 words**.
   - `011` → `#<data32>` → **3 words**.
-  - any other `ttt` → ILLEGAL.
+  - `000`/`001` are not TRAPcc forms: the shared line-5 encoding denotes
+    `Scc (xxx).W/.L` there.
+  - `101`/`110`/`111` → ILLEGAL.
 
 **Behavior:** evaluate `cccc` against the current NZVC. If TRUE → take a TRAP (vector 7), stacking a **format-$2** frame exactly like TRAPV (PC = the NEXT instruction's PC, i.e. past the operand words; PPC = this instruction's own PC). If FALSE → no-op (fall through to nextPc). TRAPcc writes no register and does not change CCR.
 
@@ -23,7 +25,7 @@ TRAPcc — conditional trap (68020/030/040). Encoding (line-5): `0101 cccc 11 11
 - **Format-$2 delivery:** `ExceptionUnit.scala:377` `is2` already covers vector 7 (TRAPV). TRAPcc delivers the identical format-$2 frame. **No ExceptionUnit change.**
 
 ## 3. Decode (`OperationDecoder.scala` + `MicroOpAssembler.scala`)
-- **Carve-out (no Scc/DBcc regression):** `isTrapccOp = isLine5 && ss==3 && mode==7 && reg∈{2,3,4}` (where `ss=op[7:6]`, `mode=op[5:3]`, `reg=op[2:0]`). Scc is `mode==0`, DBcc is `mode==1` — orthogonal to `mode==7`, untouched. `mode==7 && reg∉{2,3,4}` stays in the existing illegal bucket (`sccMemBad`). The assembler builds the cond-trap µop (OperationDecoder leaves line-5 ss==3 illegal; the assembler overrides, as it already does for Scc/DBcc).
+- **Carve-out (no Scc/DBcc regression):** `isTrapccOp = isLine5 && ss==3 && mode==7 && reg∈{2,3,4}` (where `ss=op[7:6]`, `mode=op[5:3]`, `reg=op[2:0]`). DBcc is mode 1. Scc occupies mode 0, memory-alterable modes 2-6, and mode-7 reg 0/1 for absolute W/L. Only mode-7 reg 5/6/7 stays illegal. The assembler builds the cond-trap µop (OperationDecoder leaves line-5 ss==3 illegal; the assembler overrides, as it already does for Scc/DBcc).
 - **The µop (single, branch-class):** no source/dest register, no memory op. Set: `isBranch := True` (route to branch EU), `isCondTrap := True`, `cond := cccc`, `readsNzvc := True`, `writesNzvc := False`, `dstValid/srcAValid/srcBValid := False`, `faultUsesNextPc := True`, `unimplemented := False`. The `entryPpc`/PPC = the instruction PC (the µop's `pc`); nextPc = `pc + length` (1/2/3 words by `ttt`). The operand words are NOT read by any µop — they are consumed purely by predecode framing (length).
 
 ## 4. Predecode framing (`frontend/PredecodeWord.scala` + the test ref) — the #1 bug source
@@ -32,14 +34,14 @@ Extend the line-5 `ss==3` branch (`PredecodeWord.scala:379-401`): when `mode==7 
 - `reg==2` (#imm16) → `lenWords := 2`
 - `reg==3` (#imm32) → `lenWords := 3`
 - mark `simple := True`.
-`mode==7 && reg∉{2,3,4}` stays unframed (illegal). Mirror EXACTLY in the `PredecodeRef` golden so the 65536-opword `PredecodeWordSpec` parity holds. **A wrong length → nextPc=pc → wild PC (the recurring failure); test all three forms.**
+`mode==7 && reg==0/1` remains the absolute-W/L Scc framing; only reg 5/6/7 stays unframed (illegal). Mirror EXACTLY in the `PredecodeRef` golden so the 65536-opword `PredecodeWordSpec` parity holds. **A wrong length → nextPc=pc → wild PC (the recurring failure); test all three TRAPcc forms and both absolute Scc neighbors.**
 
 ## 5. Verification
 - **Lock-step vs Musashi** (the gate): TRAPcc cond-TRUE → trap → handler → RTE → resume; TRAPcc cond-FALSE → fall through to nextPc; cover all three length forms (no-operand, #imm16, #imm32) and a couple conditions (e.g. T/F/EQ/VS/MI); assert SR/PC/A7/regs step-for-step. **TRAPV must still pass** (the generalization). Confirm Musashi (CPU_TYPE 68040) decodes TRAPcc — it's standard 020+; if the oracle rejects it, STOP and report (don't fake).
-- **Directed decode:** `TrapccDecodeSpec` — the three forms decode to the cond-trap µop; `mode==7 reg∉{2,3,4}` illegal; Scc/DBcc unaffected.
+- **Directed decode:** `TrapccDecodeSpec` — the three forms decode to the cond-trap µop; mode-7 reg 0/1 decode as absolute Scc; reg 5/6/7 are illegal; DBcc is unaffected.
 - **Parity:** `PredecodeWordSpec` 65536-opword GREEN (the new framing). Also run `OperationDecoderSpec` (a new live op may flip a stale "X→illegal" assert).
 - **fastTest** green.
-- **Synth gate (controller):** honest post-route `synth/impl_FullCore.tcl` ≥200 MHz. Expect FMax-neutral (TRAPcc adds only decode + a tiny EU gate). If the `!isCondTrap` mispredict gate regresses traceably, note it.
+- **Synth gate (controller):** honest post-route `synth/impl_FullCore.tcl` targets 250 MHz; 200 MHz is the current deployment floor. Expect FMax-neutral (TRAPcc adds only decode + a tiny EU gate). If the `!isCondTrap` mispredict gate regresses traceably, note it.
 
 ## 6. Out of scope
 Nothing deferred for TRAPcc itself (all three forms are in). This is a self-contained slice; the next bounded ops (PACK/UNPK line-8, CMP2/CHK2 + MOVEP line-0) follow, fan-out where the decode regions are independent.

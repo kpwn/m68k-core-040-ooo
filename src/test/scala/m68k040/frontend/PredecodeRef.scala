@@ -366,15 +366,21 @@ object PredecodeRef {
         } else {
           if (mode == 1) CP(simple = true, lenWords = 2)               // DBcc + disp16
           else if (mode == 0) CP(simple = true, lenWords = 1)          // Scc Dn
-          else if (mode == 7) {                                        // TRAPcc (mode 7)
+          else if (mode == 7) {                                        // TRAPcc / absolute Scc
             val ttt = op & 7
             ttt match {
               case 4 => CP(simple = true, lenWords = 1)               // TRAPcc (no operand)
               case 2 => CP(simple = true, lenWords = 2)               // TRAPcc.W (#data16)
               case 3 => CP(simple = true, lenWords = 3)               // TRAPcc.L (#data32)
-              case _ => COMPLEX                                        // other ttt -> illegal
+              case _ => memDestExt(mode, ttt) match {                 // Scc (xxx).W/.L
+                case Some(e) => CP(simple = true, lenWords = 1 + e)
+                case None    => COMPLEX                                // reserved ttt 5/6/7
+              }
             }
-          } else COMPLEX                                               // mem Scc -> deferred
+          } else memDestExt(mode, op & 7) match {                      // Scc <ea> memory dest
+            case Some(e) => CP(simple = true, lenWords = 1 + e)
+            case None    => COMPLEX
+          }
         }
       case 0x7 =>
         if (((op >> 8) & 1) == 0) CP(simple = true, lenWords = 1) else COMPLEX

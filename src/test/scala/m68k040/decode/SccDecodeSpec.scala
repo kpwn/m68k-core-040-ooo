@@ -11,8 +11,13 @@ import org.scalatest.funsuite.AnyFunSuite
 class SccDecodeSpec extends AnyFunSuite {
   class Dut extends Component {
     val pkt = in(DecodePacket())
+    private val assembled = MicroOpAssembler.assemble(pkt)
     val uop = out(DecodedUop())
-    uop := MicroOpAssembler.assemble(pkt).uops(0)
+    val tail = out(DecodedUop())
+    val count = out(UInt(2 bits))
+    uop := assembled.uops(0)
+    tail := assembled.uops(1)
+    count := assembled.count
   }
   def drive(dut: Dut, op: Int): Unit = {
     dut.pkt.valid #= true; dut.pkt.pc #= 0x1000; dut.pkt.simple #= true; dut.pkt.complex #= false
@@ -54,11 +59,19 @@ class SccDecodeSpec extends AnyFunSuite {
       assert(dut.uop.isScc.toBoolean && dut.uop.cond.toInt == 0xB && dut.uop.dstReg.toInt == 7)
     }
   }
-  // Scc to memory (mode != 0, != 001) is the deferred RMW form -> illegal.
-  // SEQ (A0) = 0x57D0 (mode 010): deferred -> unimplemented.
-  test("SEQ (A0) (memory dest) -> unimplemented (deferred)", VerilatorTest) {
+  // Scc to memory is [condition -> T1][STORE.B T1 -> EA], with no leading load.
+  // SEQ (A0) = 0x57D0 (mode 010).
+  test("SEQ (A0) cracks into condition result plus byte store", VerilatorTest) {
     run { dut => drive(dut, 0x57D0); sleep(1)
-      assert(dut.uop.unimplemented.toBoolean && !dut.uop.isScc.toBoolean)
+      assert(dut.count.toInt == 2)
+      assert(dut.uop.isScc.toBoolean && !dut.uop.unimplemented.toBoolean)
+      assert(dut.uop.dstValid.toBoolean && dut.uop.dstReg.toInt == MicroOpAssembler.T1)
+      assert(!dut.uop.srcAValid.toBoolean && !dut.uop.srcBValid.toBoolean)
+      assert(dut.tail.memOp.toEnum == m68k040.isa.MemOp.STORE)
+      assert(dut.tail.size.toEnum == m68k040.isa.Size.BYTE)
+      assert(dut.tail.srcAValid.toBoolean && dut.tail.srcAReg.toInt == 8) // A0 base
+      assert(dut.tail.srcBValid.toBoolean && dut.tail.srcBReg.toInt == MicroOpAssembler.T1)
+      assert(!dut.tail.unimplemented.toBoolean)
     }
   }
 }

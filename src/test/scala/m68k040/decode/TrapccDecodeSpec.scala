@@ -10,7 +10,8 @@ import org.scalatest.funsuite.AnyFunSuite
   * - ttt=4 (100): no operand (1 word). Encoding: op[2:0]=4.
   * - ttt=2 (010): #data16 (2 words). Encoding: op[2:0]=2.
   * - ttt=3 (011): #data32 (3 words). Encoding: op[2:0]=3.
-  * - other ttt: ILLEGAL.
+  * - ttt=0/1 are the overlapping absolute-W/L Scc memory encodings, not TRAPcc.
+  * - ttt=5/6/7 are illegal.
   * The µop is a branch-class isCondTrap with cond=cccc, reads NZVC, fault vector 7
   * on taken. No register write, no CCR write. faultUsesNextPc (stacks NEXT instr PC). */
 class TrapccDecodeSpec extends AnyFunSuite {
@@ -104,24 +105,25 @@ class TrapccDecodeSpec extends AnyFunSuite {
     }
   }
 
-  // ── Illegal: ttt=0 -> ILLEGAL (unimplemented) ─────────────────────────────
-  // Encoding: 0101 1001 11 111 000 = 0x59F8. mode=7, ttt=0 (not 2/3/4).
-  test("TRAPcc ttt=0 (invalid operand form) -> unimplemented (illegal)", VerilatorTest) {
+  // ── ttt=0 overlaps Scc (xxx).W; it is not a TRAPcc encoding ───────────────
+  test("mode7 ttt=0 decodes as absolute-W Scc", VerilatorTest) {
     run { dut =>
-      drive(dut, 0x59F8, len = 1)
+      drive(dut, 0x59F8, len = 2, word1 = 0x2000)
       sleep(1)
-      assert(dut.uop.unimplemented.toBoolean, "ttt=0 is not a valid TRAPcc form -> illegal")
-      assert(!dut.uop.isCondTrap.toBoolean, "must NOT set isCondTrap for illegal form")
+      assert(dut.uop.isScc.toBoolean && !dut.uop.isCondTrap.toBoolean)
+      assert(!dut.uop.unimplemented.toBoolean && dut.uop.cond.toInt == 9)
+      assert(dut.uop.dstValid.toBoolean && dut.uop.dstReg.toInt == MicroOpAssembler.T1)
     }
   }
 
-  // ── Illegal: ttt=1 -> ILLEGAL ─────────────────────────────────────────────
-  // Encoding: 0101 1001 11 111 001 = 0x59F9.
-  test("TRAPcc ttt=1 (invalid operand form) -> unimplemented (illegal)", VerilatorTest) {
+  // ── ttt=1 overlaps Scc (xxx).L; it is not a TRAPcc encoding ───────────────
+  test("mode7 ttt=1 decodes as absolute-L Scc", VerilatorTest) {
     run { dut =>
-      drive(dut, 0x59F9, len = 1)
+      drive(dut, 0x59F9, len = 3, word1 = 0x0000, word2 = 0x2000)
       sleep(1)
-      assert(dut.uop.unimplemented.toBoolean, "ttt=1 is not a valid TRAPcc form -> illegal")
+      assert(dut.uop.isScc.toBoolean && !dut.uop.isCondTrap.toBoolean)
+      assert(!dut.uop.unimplemented.toBoolean && dut.uop.cond.toInt == 9)
+      assert(dut.uop.dstValid.toBoolean && dut.uop.dstReg.toInt == MicroOpAssembler.T1)
     }
   }
 

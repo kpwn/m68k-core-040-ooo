@@ -83,13 +83,13 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x50FA) == cp(true,2))   // TRAPcc.W (cond=T, ttt=2): simple len2
     assert(classify(0xE0D0) == cp(false,0))  // ASR.W (A0) (line-E memory single-bit, ss=11) -> deferred
   }
-  test("TRAPcc forms: ttt=4 (1w) / ttt=2 (+w16) / ttt=3 (+l32) / ttt=0 (illegal)") {
+  test("TRAPcc forms are disjoint from absolute-W/L Scc encodings") {
     assert(classify(0x51FC) == cp(true,1))   // TRAPF  (cc=F, ttt=4): no-operand, 1 word
     assert(classify(0x50FC) == cp(true,1))   // TRAPT  (cc=T, ttt=4): no-operand, 1 word
     assert(classify(0x57FA) == cp(true,2))   // TRAPEQ (cc=EQ, ttt=2): #data16, 2 words
     assert(classify(0x59FB) == cp(true,3))   // TRAPVS (cc=VS, ttt=3): #data32, 3 words
-    assert(classify(0x50F8) == cp(false,0))  // TRAPcc ttt=0 (invalid) -> COMPLEX (illegal)
-    assert(classify(0x50F9) == cp(false,0))  // TRAPcc ttt=1 (invalid) -> COMPLEX (illegal)
+    assert(classify(0x50F8) == cp(true,2))   // ST (xxx).W, not a TRAPcc form
+    assert(classify(0x50F9) == cp(true,3))   // ST (xxx).L, not a TRAPcc form
     assert(classify(0x50FD) == cp(false,0))  // TRAPcc ttt=5 (invalid) -> COMPLEX (illegal)
   }
   // LEA (A0),A0 (0x41D0) is now IN SCOPE (Track C) -> simple, len 1 (mode 2, no ext word).
@@ -104,6 +104,31 @@ class PredecodeRefSpec extends AnyFunSuite {
     assert(classify(0x57C2) == cp(true,1))   // SEQ D2 (Scc Dn)
     assert(classify(0x51C8) == cp(true,2))   // DBRA D0 + disp16 -> len2
     assert(classify(0x57CE) == cp(true,2))   // DBEQ D6 + disp16 -> len2
+  }
+  test("line-5 conditional partition frames every Scc memory EA, DBcc, and TRAPcc form") {
+    for {
+      cond <- 0 until 16
+      mode <- 0 until 8
+      reg  <- 0 until 8
+    } {
+      val op = 0x50C0 | (cond << 8) | (mode << 3) | reg
+      val expected = mode match {
+        case 0 => cp(true, 1)                 // Scc Dn
+        case 1 => cp(true, 2)                 // DBcc Dn,disp16
+        case 2 | 3 | 4 => cp(true, 1)         // Scc (An)/(An)+/-(An)
+        case 5 | 6 => cp(true, 2)             // Scc d16/brief-indexed An
+        case 7 => reg match {
+          case 0 => cp(true, 2)               // Scc (xxx).W
+          case 1 => cp(true, 3)               // Scc (xxx).L
+          case 2 => cp(true, 2)               // TRAPcc.W
+          case 3 => cp(true, 3)               // TRAPcc.L
+          case 4 => cp(true, 1)               // TRAPcc, no operand
+          case _ => cp(false, 0)              // reserved line-5 conditional forms
+        }
+      }
+      assert(classify(op) == expected,
+        f"cond=$cond mode=$mode reg=$reg op=0x$op%04x")
+    }
   }
   test("line-E register-form shifts/rotates -> simple len1 (in scope)") {
     assert(classify(0xE148) == cp(true,1))   // LSL.W #8,D0
