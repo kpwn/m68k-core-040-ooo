@@ -117,27 +117,57 @@ existing ported test target set (`fsave_frestore_basic`,
 `fpu_fsave_frestore_idle_roundtrip` — all idle-frame-shaped tests, no
 busy-frame test exists in the vendored corpus).
 
-## 5. Exception delivery: the format-$0 vs format-$2 fix
+## 5. Exception delivery: vector-11 frame format — RESOLVED, no fix needed; a different real gap found instead
 
-`ExceptionUnit.scala:685-708` currently hardcodes **format-$2** for
-EVERY vector-11 delivery. This was correct-by-coincidence until now
-(nothing previously reaching vector 11 needed to distinguish the two
-cases). Real MC68040 UM §9.6.1 requires:
+**Original concern in this spec (now resolved): NOT a bug.** A
+full vector-by-vector audit against m68k-ooo (per explicit user
+instruction — see below) confirmed `ExceptionUnit.scala:684,729-731`'s
+existing behavior is CORRECT: m68k-ooo also stacks **format-$2 for
+vector 11 unconditionally** (`rtl/core/exception.v:523,531-535`),
+confirmed across BOTH of its vector-11 delivery paths
+(`decode.v:3896` and the pseudo-vector path translated back at
+`commit.v:1432-1435`). **13 of 13 other comparable vector/format pairs
+also matched exactly** (fmt-$7 <- vec 2; fmt-$2 <- vec {3,5,6,7,9,11};
+fmt-$0 <- everything else, identical selection expression on both
+sides). No format-selection fix is needed for this work.
 
-- **format-$0** ("F-line emulator") — the opword isn't a recognized
-  FPU coprocessor instruction at all (not even a valid FPU
-  format/coprocessor-ID pattern within the 0xF200-0xF3FF general
-  group, or any other line-F opword this core doesn't claim).
-- **format-$2** ("unimplemented FP instruction") — the opword IS a
-  real, recognized FPU instruction (valid coprocessor-ID and format
-  bits), just not one this hardware implements (a transcendental,
-  packed-decimal move, or similar — routed to the ROM's FPSP).
+**The real, actionable gap the audit found instead**: what actually
+differs between m68k-ooo's two vector-11 paths is NOT the frame
+format — it's the stacked **PC field**: pre-instruction vs
+post-instruction PC (`commit.v:1454-1457`). **This project has no
+post-instruction-PC flavor of vector-11 delivery at all** —
+`MicroOpAssembler.scala:1533` unconditionally sets
+`faultUsesNextPc := False` for every F-line delivery. This matters
+directly for this FPU work: an FPSP-style handler that expects to RTE
+past the trapping F-line opword (rather than re-executing it) needs
+the post-instruction-PC variant, or it will loop on the same opword
+forever. **Required for this work**: add the post-instruction-PC
+option to vector-11 delivery, gated on whatever condition m68k-ooo
+uses to choose between its two paths (needs a closer read of
+`decode.v:3896` vs the `commit.v` pseudo-vector path before locking
+the exact trigger condition — flagged as an implementation-time item,
+not fully resolved by the audit alone).
 
-**Required fix, part of this work**: `MicroOpAssembler`'s F-line
-decode must distinguish these two cases at the SAME granularity the
-new hardware decode does (i.e., "recognized-but-unimplemented FPU op"
-vs. "not FPU at all"), and `ExceptionUnit.scala` must select the frame
-format accordingly rather than hardcoding format-$2 unconditionally.
+**Also surfaced, unrelated to vector 11 but worth carrying forward**:
+one genuine MISMATCH found — M=1 interrupt dual-frame placement
+(format-$1 throwaway + format-$0 main frame) is placed on
+OPPOSITE stacks between the two projects (m68k-ooo: throwaway on MSP,
+main on ISP; this project: the reverse). **Do not fix this to match
+m68k-ooo** — this project's own lock-step oracle, Musashi, agrees with
+THIS project's current placement, not m68k-ooo's. m68k-ooo is the
+right oracle for frame FORMAT (confirmed above), but Musashi remains
+the right oracle for frame PLACEMENT/ordering specifically for this
+one case. No action taken; noted so it isn't rediscovered as a false
+alarm later. (m68k-ooo's own `exc_msp_irq_fmt1.s` test, which would
+exercise this, is not vendored into this project's corpus.)
+
+**Verification method used, per explicit user instruction**: "vector
+frame types need to match m68k-ooo on a vector-by-vector basis" — a
+full audit cross-checked every vector this project delivers against
+m68k-ooo's own exception/trap-frame-stacking implementation (not
+re-derived from UM prose in isolation). Full per-vector table with
+file:line evidence on both sides is in
+`.superpowers/sdd/progress-ipc-push-2026-08-09.md`.
 
 ## 6. Precision: native 80-bit extended (real Vivado-grounded decision)
 
@@ -246,11 +276,14 @@ is out of scope for a bare-core test."
    both; this spec doesn't yet lock how much of FPCR's control
    semantics (vs. just FPSR's status/condition semantics) are in
    scope. Needs an explicit decision before the plan is written.
-4. §5's format-$0/format-$2 fix needs the EXACT bit-level definition
-   of "recognized FPU coprocessor-ID/format pattern" cross-checked
-   against the MC68040 UM before implementation (not assumed from this
-   spec's prose description alone) — same standing discipline this
-   project used for CPUSH/CINV's bit encoding (Task P5.1).
+4. §5's post-instruction-PC vector-11 delivery: the exact trigger
+   condition m68k-ooo uses to choose between its pre-instruction-PC
+   and post-instruction-PC vector-11 paths needs a closer read of
+   `decode.v:3896` vs. the `commit.v` pseudo-vector path (`8'h8B`,
+   `commit.v:1432-1435,1454-1457`) before locking how this project's
+   new `faultUsesNextPc` option gets gated — not yet resolved by the
+   audit alone, same bit-level-verification discipline this project
+   used for CPUSH/CINV's encoding (Task P5.1).
 5. FTST's synthesis as FCMP-vs-implicit-zero: confirm this exactly
    matches real 68040 FTST semantics (condition-code effects
    specifically) before locking it as a decode-time rewrite rather
