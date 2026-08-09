@@ -136,7 +136,13 @@ CplxEU  : DSP-inferred a*b (7-stage, II=1) -> result FIFO -> shared completion a
   push+wake and flush clearing are also covered.
 - The focused five-suite arithmetic/protocol cluster passes 15/15; full-core
   synthesis-top elaboration passes; and the mandatory combined-branch
-  `make SBT=~/sbt/bin/sbt test-fast` gate passes 138/138 across 144 suites.
+  `make SBT=~/sbt/bin/sbt test-fast` gate passes 139/139 across 151 suites.
+- Generated full-core Verilog (`0971f2cddbc0ad8dd5b8cfeb5aae5bd4`) reached
+  Vivado DSP mapping before the intentionally stopped shared synthesis slot.
+  All four inferred DSP48E2s report `AREG=2`, `BREG=2`, `MREG=1`, and `PREG=1`,
+  reproducing the isolated experiment's essential mapping result. Final
+  full-core utilization and routed timing remain pending the serialized gate;
+  this preliminary mapping evidence is not physical acceptance.
 - The iterative divider deliberately remains one-context and non-pipelined.  A
   second DIV can still occupy the registered CPLX issue slot and temporarily
   head-of-line block a younger MUL; address this only with an eligibility

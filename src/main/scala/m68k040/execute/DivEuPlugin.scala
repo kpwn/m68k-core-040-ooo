@@ -80,7 +80,7 @@ case class CplxResult() extends Bundle {
 /** CPLX execution unit: fixed-latency II=1 MUL, CHK/CMP2, and iterative DIV.
   *
   * The iterative/legacy lane remains single-outstanding, but MUL owns an independent
-  * four-stage descriptor/product pipeline and result FIFO.  It may accept every cycle
+  * seven-stage descriptor/product pipeline and result FIFO.  It may accept every cycle
   * while a divide iterates.  Both lanes retain the existing single dynamic-completion
   * wakeup and PRF/ROB result port through a lossless arbiter. CHK is single-cycle;
   * it writes no register and, when out-of-bounds, raises euFault{vec6}. DIV writes the
@@ -414,7 +414,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val ovLatch  = RegInit(False)
 
     // ─────────────────────────────────────────────────────────────────────────
-    // MUL integration: a fixed four-stage DSP datapath, pruned descriptor pipe,
+    // MUL integration: a fixed seven-stage DSP datapath, pruned descriptor pipe,
     // and credit-reserved result FIFO.  It never occupies s1/busy and therefore
     // continues to accept while DivUnit iterates.
     val mulIssueA = Bits(32 bits)
@@ -427,7 +427,10 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       mulIssueB := s0B
     }
 
-    val mulResultDepth = 8
+    // Reservation is released only when a product leaves the result FIFO. Allow
+    // the complete non-stallable pipe plus push-to-pop visibility to be resident
+    // so a continuous MUL stream never bubbles before its first retirement.
+    val mulResultDepth = MulCore.Latency + 2
     val mulResultQ = StreamFifo(CplxResult(), mulResultDepth)
     val mulHiPendingQ = StreamFifo(MulHiContext(), mulResultDepth)
     mulResultQ.io.flush := flushSig

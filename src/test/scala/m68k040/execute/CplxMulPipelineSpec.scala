@@ -484,7 +484,7 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       }
 
       // More than the FIFO depth: this proves accept-last credit turnover, not just
-      // four values resident in MulCore.  The mix exercises .W sign extension and
+      // multiple values resident in MulCore. The mix exercises .W sign extension and
       // signed/unsigned .L32 overflow flagging.
       val dense = Seq(
         Req(4, 24, 1, 0, 0, 1, 0, 0xffff, signed = false, Size.WORD),
@@ -569,8 +569,12 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       val collisionFrom = seen.size
 
       // DIV launch wrapper + 64 restoring steps puts its held result in this
-      // neighborhood; the burst is wide enough to cover minor wrapper retiming.
-      for (_ <- 0 until 58) tick()
+      // neighborhood. Keep the first product's fixed-latency arrival centered on
+      // that same absolute cycle as MulCore grows; the hard witness below still
+      // requires both arbiter sources to be valid together.
+      val collisionLaunchDelay = 62 - MulCore.Latency
+      require(collisionLaunchDelay > 0)
+      for (_ <- 0 until collisionLaunchDelay) tick()
       issueDense(collisionMuls, "MUL while DIV active")
       drainTo(collisionFrom + 1 + collisionMuls.length, 100, "DIV/MUL collision")
       assert(sawArbCollision,

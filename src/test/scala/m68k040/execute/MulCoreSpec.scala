@@ -136,7 +136,7 @@ class MulCoreSpec extends AnyFunSuite {
         cd.waitSampling()
         if (cycle < vectors.length) accepted += 1
         // Count the just-accepted entry before retiring a same-edge result. This
-        // observes all four registered stages resident on the first done edge.
+        // observes every registered stage resident on the first done edge.
         maxResidentBeforeRetire = math.max(maxResidentBeforeRetire, accepted - completed)
 
         val shouldDone = cycle >= MulCore.Latency &&

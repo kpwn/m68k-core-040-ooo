@@ -6,16 +6,16 @@ import spinal.lib._
 object MulCore {
   /** Number of registered valid/data stages from an accepted `start` through `done`.
     * Keep the descriptor pipe in DivEuPlugin exactly aligned with this constant. */
-  val Latency = 4
+  val Latency = 7
 }
 
 /** DSP48-mappable 32x32 -> 64 multiplier (signed/unsigned), validated standalone in
   * MulCoreSpec. Two 32-bit source operands only (no 3rd source — unlike DIV 64/32),
   * so it does not touch the CPLX EU's psrcC operand-delivery cone.
   *
-  * The product uses an A/B/M/P-shaped four-register pipeline so Vivado can use the
-  * DSP48E2 input, multiply, and product registers rather than leaving a 33x33
-  * combinational cone in front of one output register. To get ONE multiply datapath
+  * The product uses two operand levels, a registered multiply, and four product
+  * levels so Vivado can distribute the tiled 33x33 operation across the DSP48E2
+  * A/B/M/P registers rather than leaving fabric registers around the chain. To get ONE multiply datapath
   * that covers both MULU and MULS, the operands are sign/zero-extended to 33 bits per
   * `signed` and a single signed 33x33 multiply is registered; the low 64 bits are the
   * two's-complement product for either signedness. Vivado tiles the 33x33 across a few
@@ -45,13 +45,18 @@ class MulCore extends Component {
   val aExt = (Mux(io.signed, io.a(31), False) ## io.a).asSInt   // 33-bit signed
   val bExt = (Mux(io.signed, io.b(31), False) ## io.b).asSInt   // 33-bit signed
 
-  // A/B stage 0, second DSP input stage 1, multiply stage 2, product stage 3.
-  // Two operand stages intentionally match DSP48E2 AREG/BREG depth=2.  The
-  // multiplication and final product registers target MREG/PREG respectively.
+  // A/B stage 0, second DSP input stage 1, multiply stage 2, then four product
+  // levels. Two operand stages match AREG/BREG depth=2. The four trailing levels
+  // are required for Vivado to distribute this tiled 33x33 multiply across every
+  // DSP's MREG/PREG. Valid bits qualify the result; data deliberately shifts on
+  // invalid cycles because per-stage clock enables prevent that DSP retiming.
   val a0 = Reg(SInt(33 bits)); val b0 = Reg(SInt(33 bits))
   val a1 = Reg(SInt(33 bits)); val b1 = Reg(SInt(33 bits))
   val mul2 = Reg(SInt(66 bits))
   val prod3 = Reg(SInt(66 bits))
+  val prod4 = Reg(SInt(66 bits))
+  val prod5 = Reg(SInt(66 bits))
+  val prod6 = Reg(SInt(66 bits))
   val valid = Vec.fill(MulCore.Latency)(RegInit(False))
 
   valid(0) := io.start
@@ -60,18 +65,15 @@ class MulCore extends Component {
     b0 := bExt
   }
   for (i <- 1 until MulCore.Latency) valid(i) := valid(i - 1)
-  when(valid(0)) {
-    a1 := a0
-    b1 := b0
-  }
-  when(valid(1)) {
-    mul2 := a1 * b1
-  }
-  when(valid(2)) {
-    prod3 := mul2
-  }
+  a1 := a0
+  b1 := b0
+  mul2 := a1 * b1
+  prod3 := mul2
+  prod4 := prod3
+  prod5 := prod4
+  prod6 := prod5
 
-  val prod64 = prod3.asBits(63 downto 0)
+  val prod64 = prod6.asBits(63 downto 0)
   io.busy   := False                     // fixed pipeline never blocks a new start
   io.done   := valid.last
   io.prodLo := prod64(31 downto 0)
