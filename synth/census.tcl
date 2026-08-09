@@ -99,6 +99,18 @@ census_probe ls_busy     "*LsEuPlugin_logic_busy*"        $prefix
 census_probe iq_sel3     "*selPorts_3*"                   $prefix
 census_probe dc_tagmem   "*DcachePlugin_logic_tagMem*"    $prefix
 
+# -- COPYBACK SQ->D-cache elastic-pipe probes (2026-08-09, commit 55b5850) --
+# The implementation adds a registered S3 result/write boundary plus independent
+# StoreQueue send/ack state. These patterns deliberately tolerate synthesis name
+# pruning: a zero-cell report is evidence that the named source register did not
+# survive under that spelling, not permission to omit the broader module census.
+census_probe dc_st_s3       "*DcachePlugin_logic_stS3*"          $prefix
+census_probe dc_store_hold  "*DcachePlugin_logic_storePipeHeld*" $prefix
+census_probe dc_store_owed  "*DcachePlugin_logic_storeReadOwed*" $prefix
+census_probe dc_store_ack   "*DcachePlugin_logic_storeAck*"      $prefix
+census_probe sq_send_ptr    "*StoreQueue*sendPtr*"                $prefix
+census_probe sq_ack_count   "*StoreQueue*acceptedHalves*"        $prefix
+
 # ---- 4) G-L1: do any failing paths END at these cells? (-to, not -through) ----
 proc census_endpoint_probe {label pat} {
   set cells [get_cells -quiet -hierarchical -filter "NAME =~ $pat"]
@@ -111,6 +123,10 @@ census_endpoint_probe ls_busy    "*LsEuPlugin_logic_busy*"
 census_endpoint_probe ls_s1valid "*LsEuPlugin_logic_s1Valid*"
 census_endpoint_probe ls_compv   "*LsEuPlugin_logic_compValid*"
 census_endpoint_probe iq_sel3    "*selPorts_3*"
+census_endpoint_probe dc_st_s3   "*DcachePlugin_logic_stS3*"
+census_endpoint_probe dc_hold    "*DcachePlugin_logic_storePipeHeld*"
+census_endpoint_probe sq_send    "*StoreQueue*sendPtr*"
+census_endpoint_probe sq_accept  "*StoreQueue*acceptedHalves*"
 
 # ---- 5) G-L3: pblock occupancy headroom (pb_dcache holds every LsEuPlugin_logic* cell) ----
 catch { report_utilization -pblocks [get_pblocks] -file ${prefix}_pblock_util.rpt }
