@@ -408,10 +408,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // ---- translate-at-execute: the LS EU DRIVES the D-side translation port ----
     // It presents the access VPN (loadVaddr, which the FSM sets to s1Va for slot A
     // or s1AddrB for slot B), the access class (write?=store, supervisor?), and
-    // `valid` (a real demand). The D-cache READS the response (rsp.ppn for its load
-    // hit-tag, rsp.ready to gate load acceptance). On a DTLB miss `rsp.ready` is
-    // False while the walker runs; the LS EU stalls (does NOT alloc a store / does
-    // NOT accept the load) on its existing single-outstanding path until ready.
+    // `valid` (a real demand). In parallel, a load may launch a tokenized D-cache
+    // virtual-set probe. The LS EU alone consumes rsp, registers the resolved PA and
+    // cache mode, and later presents them in DLoadCmd; the D-cache never samples this
+    // live response. On a DTLB miss rsp.ready is False while the walker runs, so the
+    // LS EU holds the resident request and cancels any probe that cannot be consumed.
     // (req drivers are set after loadVaddr is declared, below.)
     val s1Paddr = (xlate.rsp.ppn ## s1Va(11 downto 0)).asUInt
     // Slot-B (split-access second half) translated physical address: SAME `xlate.rsp`
@@ -510,6 +511,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       val paddrB    = Reg(UInt(32 bits))
       val size      = Reg(m68k040.isa.Size())
       val cmode     = Reg(m68k040.cache.CacheMode())
+      val robId     = Reg(UInt(6 bits))
       val twoAccess = RegInit(False)
       val bDone     = RegInit(False)   // slot A launched; now presenting slot B (cross)
     }
@@ -538,6 +540,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     dcache.loadCmd.payload.paddr := loadPaddr
     dcache.loadCmd.payload.size  := llReg.size
     dcache.loadCmd.payload.cacheMode := llReg.cmode
+    dcache.loadCmd.payload.token := (False ## llReg.bDone ## llReg.robId.asBits).asUInt
 
     // ---- store split (byte-lane) for the SQ entry ----
     // Slot B's physical address is `s1PaddrB` (declared above alongside `s1Paddr`) —
@@ -647,11 +650,13 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // register stage (`reqReg`) + the final `xlate.req`/`xlateRobIdSig` drive are
     // emitted AFTER both writers so the registered interface reflects the resolved req.
     val reqDrvValid = Bool()
+    val reqDrvVaddr = UInt(32 bits)
     val reqDrvVpn   = UInt(20 bits)
     val reqDrvSup   = Bool()
     val reqDrvWrite = Bool()
     val reqDrvRobId = UInt(6 bits)
     reqDrvValid := s1Valid && (isLoad || isStore)
+    reqDrvVaddr := xlateVaddr
     reqDrvVpn   := xlateVaddr(31 downto 12)   // FMax #1's live access VPN (NOT the llReg cmd)
     reqDrvSup   := privCtrl.map(_.supervisor).getOrElse(False)
     reqDrvWrite := isStore
@@ -659,6 +664,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
 
     val reqReg = new Area {
       val valid = RegInit(False)
+      val vaddr = Reg(UInt(32 bits))
       val vpn   = Reg(UInt(20 bits))
       val sup   = Reg(Bool())
       val write = Reg(Bool())
@@ -745,6 +751,49 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val reqMatch = reqReg.valid && reqFresh
     // Directed-test probes only (LsEuCrossSpec's freshness waveform tests); zero synth impact.
     reqFresh.simPublic(); reqMatch.simPublic(); reqStale.simPublic(); xlateBArm.simPublic()
+
+    // ── Parallel VIPT launch ─────────────────────────────────────────────────
+    // `reqReg` is the registered boundary which already launches the DTLB lookup.
+    // Present the same token's full VA to the D-cache early-probe port from those
+    // flops, so the page-invariant virtual-set RAM read starts in parallel with the
+    // TLB lookup. The later resolved loadCmd carries the physical tag + same token.
+    // A forwarded/faulted/squashed load explicitly cancels the held probe.
+    val probeWanted      = RegInit(False)
+    val probeOutstanding = RegInit(False)
+    val probeTokenReg    = Reg(UInt(m68k040.cache.DLoadToken.Width bits))
+    val probeCancel      = Bool()
+    probeCancel := (sqFlushSig || excActive) &&
+                   (probeOutstanding || dcache.loadProbe.fire)
+    val reqProbeToken = (False ## False ## reqReg.robId.asBits).asUInt
+
+    dcache.loadProbe.valid         := probeWanted && reqMatch && !xlateBArm && !excActive
+    dcache.loadProbe.payload.vaddr := reqReg.vaddr
+    dcache.loadProbe.payload.token := reqProbeToken
+    dcache.loadProbeCancel.valid   := probeCancel
+    dcache.loadProbeCancel.payload.token := Mux(dcache.loadProbe.fire,
+                                                 reqProbeToken, probeTokenReg)
+    val parallelViptLaunch = dcache.loadProbe.fire && reqMatch && xlate.req.valid &&
+                             (dcache.loadProbe.payload.vaddr(31 downto 12) === xlate.req.vpn)
+    parallelViptLaunch.simPublic()
+
+    when(issuePort.fire) {
+      probeWanted := issuePort.payload.uop.memOp === MemOp.LOAD
+    }
+    when(dcache.loadProbe.fire) {
+      probeWanted      := False
+      probeOutstanding := True
+      probeTokenReg    := reqProbeToken
+    }
+    // Once translation resolves, a probe which could not obtain the cache port in
+    // time is no longer worth launching; the normal resolved-command path remains.
+    when(xlateReady && reqMatch) {
+      probeWanted := False
+    }
+    when(probeCancel || dcache.loadCmd.fire) {
+      probeOutstanding := False
+    }
+    probeWanted.simPublic(); probeOutstanding.simPublic()
+    probeCancel.simPublic()
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax: registered COMPLETION + WRITEBACK stage.
@@ -1272,6 +1321,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
                 // (vector 2) so the ROB flags the entry for precise delivery.
                 // Task #139 mechanism #2: suppress for a poisoned (squashed) access.
                 when(!poisoned) { captureFault() }
+                probeCancel := probeOutstanding || dcache.loadProbe.fire
                 busy    := False
                 s1Valid := False
                 goto(IDLE)
@@ -1337,6 +1387,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
             // resolved cleanly — that's exactly why this state exists). Report the
             // fault at addrB's own address, not slot A's.
             when(!poisoned) { captureFault(faultAddr = s1AddrB) }
+            probeCancel := probeOutstanding || dcache.loadProbe.fire
             xlateBArm := False
             busy    := False
             s1Valid := False
@@ -1435,6 +1486,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           // full-overlap forward: skip the cache (aligned only).
           // Task #139 mechanism #2: suppress for a poisoned (squashed) access.
           when(!poisoned) { captureCompletion(fwdData) }
+          probeCancel := probeOutstanding || dcache.loadProbe.fire
           busy    := False
           s1Valid := False
           goto(IDLE)
@@ -1456,6 +1508,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           llReg.paddrB    := s2PaddrB
           llReg.size      := u1.size
           llReg.cmode     := s2Cmode
+          llReg.robId     := s1Ctx.robId
           llReg.twoAccess := s1TwoAccess
           llReg.bDone     := False
           goto(LAUNCH)
@@ -1780,6 +1833,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       dcache.loadCmd.payload.cacheMode := Mux(cacheCtrl.map(_.dcacheEnabled).getOrElse(False),
                                               m68k040.cache.CacheMode.WRITETHROUGH,
                                               m68k040.cache.CacheMode.INHIBITED)
+      dcache.loadCmd.payload.token := U(0x80, m68k040.cache.DLoadToken.Width bits)
     }
     when(excActive && excStoreValid) {
       dcache.store.valid          := True
@@ -1794,6 +1848,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // behavior change. Its own dtReq is already a RegNext upstream.
     when(excActive && excXlateValid) {
       reqDrvValid := True
+      reqDrvVaddr := (excXlateVpn ## U(0, 12 bits)).asUInt
       reqDrvVpn   := excXlateVpn
       reqDrvWrite := excXlateWrite
       reqDrvSup   := excXlateSupervisor
@@ -1806,6 +1861,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // resolved `reqDrv*` (base or exc override). Emitted as the LAST drivers of
     // `xlate.req` so it is the sole writer.
     reqReg.valid := reqDrvValid
+    reqReg.vaddr := reqDrvVaddr
     reqReg.vpn   := reqDrvVpn
     reqReg.sup   := reqDrvSup
     reqReg.write := reqDrvWrite

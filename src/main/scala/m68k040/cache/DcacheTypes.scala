@@ -3,18 +3,40 @@ package m68k040.cache
 import m68k040.isa.Size
 import spinal.core._
 
-/** Load request: a virtual address + access size + the PRE-TRANSLATED physical
+object DLoadToken {
+  // [7] source (0=LS ROB, 1=serializing exception unit), [6] split half,
+  // [5:0] ROB id. Kept as a plain UInt field in all public bundles.
+  val Width = 8
+}
+
+/** Early VIPT lookup request. This carries only information available before
+  * translation: the virtual address selects page-invariant set bits while `token`
+  * associates the held RAM result with the later resolved DLoadCmd. */
+case class DLoadProbe() extends Bundle {
+  val vaddr = UInt(32 bits)
+  val token = UInt(DLoadToken.Width bits)
+}
+
+/** Cancel an early probe which completed by SQ forwarding, faulted translation,
+  * or squash and therefore will never receive a matching resolved command. */
+case class DLoadProbeCancel() extends Bundle {
+  val token = UInt(DLoadToken.Width bits)
+}
+
+/** Resolved load request: a virtual address + access size + the PRE-TRANSLATED physical
   * address. VIPT: the cache indexes with `vaddr[set]` (page-invariant low bits)
   * and tags with the physical page number carried in `paddr`. The requester (LS
-  * EU) supplies `paddr` from a REGISTERED translate stage so the DTLB lookup is
-  * NOT in series with the cache tag-compare (FMax). Under identity translation
-  * paddr == vaddr; for the exception serializing path paddr is the identity vaddr.
+  * EU) supplies `paddr` from a REGISTERED translate stage. Translation must have
+  * completed without fault before this command is presented; the D-cache never
+  * samples the live, untagged DTLB response. Under identity translation paddr ==
+  * vaddr; for the exception serializing path paddr is the identity vaddr.
   * `paddr[11:0]` must equal `vaddr[11:0]` (same page offset) by construction. */
 case class DLoadCmd() extends Bundle {
   val vaddr     = UInt(32 bits)
   val paddr     = UInt(32 bits)
   val size      = Size()
   val cacheMode = CacheMode()
+  val token     = UInt(DLoadToken.Width bits)
 }
 
 /** Load response: size-extracted (byte-lane, big-endian) data + fault. `line` is
@@ -70,7 +92,9 @@ case class CacheMaintCmd() extends Bundle {
 
 /** D-cache service contract (spec 4.2). */
 trait DcacheService {
-  def loadCmd:  spinal.lib.Stream[DLoadCmd]   // virtual; cache translates (VIPT) + reads
+  def loadProbe: spinal.lib.Stream[DLoadProbe]       // virtual-set read, before translation
+  def loadProbeCancel: spinal.lib.Flow[DLoadProbeCancel]
+  def loadCmd:  spinal.lib.Stream[DLoadCmd]   // resolved VA+PA; virtual index, physical tag
   def loadRsp:  spinal.lib.Flow[DLoadRsp]     // fixed offset for a hit; valid late on a miss-refill
   def loadBusy: Bool                          // high while a refill is in flight (back-pressures loads)
   def store:    spinal.lib.Flow[DStoreCmd]    // write-through: update line if hit + write memory

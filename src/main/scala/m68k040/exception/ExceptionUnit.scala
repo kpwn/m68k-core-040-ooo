@@ -508,11 +508,20 @@ class ExceptionUnit(
   val ldoVld   = Bool();        ldoVld := False
   val ldoVaddr = UInt(32 bits); ldoVaddr := U(0, 32 bits)
   val ldoSize  = Size();        ldoSize := Size.LONG
-  dcLoadCmd.valid         := RegNext(ldoVld) init False
-  dcLoadCmd.payload.vaddr := RegNext(ldoVaddr)
+  // This is a real Stream source, not a delayed pulse. A plain RegNext(ldoVld)
+  // leaves valid asserted for one tail cycle after the request state observes
+  // fire. The former II=3 D-cache masked that protocol violation with ready=0;
+  // an II=1 cache accepts the tail as a duplicate (RTE then consumes shifted frame
+  // words). Capture once and hold the complete payload until the actual handshake.
+  val ldoValidReg = RegInit(False)
+  val ldoVaddrReg = Reg(UInt(32 bits))
+  val ldoSizeReg  = Reg(Size())
+  val ldoCmodeReg = Reg(m68k040.cache.CacheMode())
+  dcLoadCmd.valid         := ldoValidReg
+  dcLoadCmd.payload.vaddr := ldoVaddrReg
   // exception sequencer runs MMU-off (identity, slice-1): paddr == vaddr.
-  dcLoadCmd.payload.paddr := RegNext(ldoVaddr)
-  dcLoadCmd.payload.size  := RegNext(ldoSize)
+  dcLoadCmd.payload.paddr := ldoVaddrReg
+  dcLoadCmd.payload.size  := ldoSizeReg
   // Identity-physical, same rationale (and same DE=0 fix) as dcStore.payload.cacheMode
   // above -- this is in fact the ALLOCATING half of that coherency hole.
   // NOTE: this particular field is currently INERT in every integrated DUT --
@@ -520,7 +529,17 @@ class ExceptionUnit(
   // LsEuPlugin's exception-arbitration mux REGENERATES the cache mode itself. That mux
   // carries the same DE fold (see its comment); this assignment is kept correct and in
   // sync so the field is never a trap for a future wiring that does forward it.
-  dcLoadCmd.payload.cacheMode := excCacheMode
+  dcLoadCmd.payload.cacheMode := ldoCmodeReg
+  dcLoadCmd.payload.token := U(0x80, m68k040.cache.DLoadToken.Width bits)
+  when(dcLoadCmd.fire) {
+    ldoValidReg := False
+  }
+  when(ldoVld && !ldoValidReg) {
+    ldoValidReg := True
+    ldoVaddrReg := ldoVaddr
+    ldoSizeReg  := ldoSize
+    ldoCmodeReg := excCacheMode
+  }
 
   val dtoVld = Bool();        dtoVld := False
   val dtoVpn = UInt(20 bits); dtoVpn := U(0, 20 bits)

@@ -1,7 +1,6 @@
 package m68k040.cache
 
 import m68k040.isa.Size
-import m68k040.services.DTranslationService
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -14,8 +13,9 @@ import spinal.lib.misc.plugin.FiberPlugin
   *
   * Geometry: 128 sets, 4 ways, 16-byte lines (8 KiB total). One 128-bit AXI beat
   * == one whole line (len=0).
-  *   - LOAD: VIPT 2-cycle read (S0 launch BRAM tag+data read + translate; S1
-  *     tag-compare against the REGISTERED tag-read, way-mux, byte-lane extract).
+  *   - LOAD: VIPT 3-stage read (S0 launch BRAM tag+data read from the virtual
+  *     set; S1 tag-compare against the request's PRE-TRANSLATED physical tag;
+  *     S2 registered way-mux/byte-lane response).
   *     Miss -> single-beat refill -> replay.
   *   - STORE: physical (SQ already translated). RMW the line if it hits.
   *     WRITETHROUGH/INHIBITED: ALWAYS issue an AXI write, no allocate on a miss
@@ -55,6 +55,15 @@ class DcachePlugin extends FiberPlugin with DcacheService {
   val logic = during build new Area {
 
     // ---- service ports (plain directionless Stream/Flow) ----
+    val loadProbePort = Stream(DLoadProbe())
+    loadProbePort.valid.allowOverride; loadProbePort.valid := False
+    loadProbePort.payload.vaddr.allowOverride; loadProbePort.payload.vaddr := U(0, 32 bits)
+    loadProbePort.payload.token.allowOverride; loadProbePort.payload.token := U(0, DLoadToken.Width bits)
+    loadProbePort.valid.simPublic(); loadProbePort.ready.simPublic(); loadProbePort.payload.simPublic()
+    val loadProbeCancelPort = Flow(DLoadProbeCancel())
+    loadProbeCancelPort.valid.allowOverride; loadProbeCancelPort.valid := False
+    loadProbeCancelPort.payload.token.allowOverride
+    loadProbeCancelPort.payload.token := U(0, DLoadToken.Width bits)
     val loadCmdPort = Stream(DLoadCmd())
     loadCmdPort.valid.simPublic(); loadCmdPort.ready.simPublic(); loadCmdPort.payload.simPublic()
     val loadRspPort = Flow(DLoadRsp())
@@ -68,16 +77,6 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val storeErrReg = Bool()   // Task P1.4: 1-cycle pulse, non-OKAY B alongside storeAckReg
     storeErrReg.simPublic()
     val axi         = master(Axi4(axiCfg))
-
-    // ---- translation (D-side TLB) ----
-    // The LS EU is the translate-at-execute requester: it DRIVES `xlate.req` (the
-    // access VPN, write?, supervisor?) — for both loads (presented on loadCmd) and
-    // stores (SQ-alloc paddr). The cache only READS `xlate.rsp`: it forms the load
-    // hit-tag from `rsp.ppn` (consistent because the LS EU drives req.vpn from the
-    // same vaddr it puts on loadCmd) and gates load acceptance on `rsp.ready` (a
-    // DTLB miss holds it low while the walker runs -> the load is not accepted and
-    // the LS EU stalls on its existing single-outstanding back-pressure path).
-    val xlate = host[DTranslationService]
 
     // ---- storage (sync-read BRAM: write + readSync ONLY, no readAsync) ----
     val dataMem = Seq.fill(ways)(Mem(Bits(128 bits), sets))
@@ -113,8 +112,24 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val rdEn  = Bool()
     rdSet := U(0, setBits bits)
     rdEn  := False
+    rdEn.simPublic()
     val rdData = Vec(dataMem.map(_.readSync(rdSet, rdEn)))
     val rdTag  = Vec(tagMem.map(_.readSync(rdSet, rdEn)))
+
+    // ---- early VIPT probe ownership ----
+    // A probe launches the virtual-set RAM read in parallel with the DTLB lookup.
+    // To avoid ~600 bits of tag+line holding flops, the synchronous RAM outputs
+    // themselves are retained while no later read reuses the port. `fresh` is
+    // invalidated by any intervening read; a matching resolved command then simply
+    // falls back to the ordinary read launch. Thus store/maintenance traffic is
+    // never blocked just to preserve an optimization, and correctness never relies
+    // on a stale BRAM output. One metadata slot matches the current in-order LS
+    // front; widening this is a later tagged-probe-queue slice.
+    val earlyProbeValid = RegInit(False)
+    val earlyProbeFresh = RegInit(False)
+    val earlyProbeVaddr = Reg(UInt(32 bits))
+    val earlyProbeToken = Reg(UInt(DLoadToken.Width bits))
+    earlyProbeValid.simPublic(); earlyProbeFresh.simPublic()
 
     // ---- miss-state latches ----
     val missPaddr = Reg(UInt(32 bits))   // physical addr of the missing line (AXI refill base)
@@ -151,11 +166,10 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // response for this refill come back with a non-OKAY resp (SLVERR/DECERR, e.g.
     // the test harness's BehavioralMemAgent DECERR-ing a genuinely-unmapped
     // address)? On an error the line is NOT allocated (no valid/tag/data write —
-    // there is no real data to cache) and the fault rides through REPLAY into
-    // `ldS1Fault` (a field that, before this task, was written by DcachePlugin but
-    // never actually consumed downstream — LsEuPlugin's OWN MMU-fault detection
-    // happens earlier, straight off `xlate.rsp.fault`, entirely bypassing this
-    // field). Repurposed here as the (now real) BUS-fault carrier: LsEuPlugin's
+    // there is no real data to cache) and REPLAY emits the dedicated bus-fault
+    // response. Translation faults are consumed by LsEuPlugin before loadCmd, so
+    // the cache response's fault field is exclusively a physical bus-fault carrier:
+    // LsEuPlugin's
     // aligned-load WAIT state reads it to raise a vector-2 access fault with
     // SSW.ATC=0 (a physical bus error, not an MMU/ATC-detected one) — see
     // LsEuPlugin's `captureFault(atc=false)` call site and ExceptionUnit's
@@ -226,6 +240,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val diagFaultKind1Fires = Bool(); diagFaultKind1Fires := False
 
     // ---- defaults ----
+    loadProbePort.ready := False
     loadCmdPort.ready := False
     axi.ar.valid := False
     axi.ar.payload.assignDontCare()
@@ -241,8 +256,8 @@ class DcachePlugin extends FiberPlugin with DcacheService {
 
     // ---- load index/tag from cmd vaddr + PRE-TRANSLATED paddr ----
     // FMax: the physical tag comes from the requester's REGISTERED `loadCmd.paddr`
-    // (translate-at-execute already resolved it into a register), NOT from the live
-    // DTLB lookup `xlate.rsp.ppn`. VIPT: index on the page-invariant vaddr set bits;
+    // (translate-at-execute already resolved it into a register), never from a live
+    // DTLB response. VIPT: index on the page-invariant vaddr set bits;
     // tag on the physical bits. Hit-detect itself is deferred to S1 (registered).
     val cmdVaddr = loadCmdPort.payload.vaddr
     val cmdPaddr = loadCmdPort.payload.paddr
@@ -266,9 +281,19 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // (validly) cached under a different cacheability, and must never itself
     // register a "hit" that would suppress the refill it architecturally needs.
     val ldS1Cmode = Reg(CacheMode())
-    val ldS1Fault = Reg(Bool())
     val ldS1Paddr = Reg(UInt(32 bits))   // physical addr (refill base on a miss)
     ldS1Valid := False                   // default; armed on an accept below
+
+    // Throughput slice C0: one bounded replay slot for the request accepted on the
+    // exact cycle an older S1 probe discovers a miss. That younger request has
+    // already completed the Stream handshake, but must not enter the untagged
+    // response pipe ahead of the miss. Keeping its resolved command here lets the
+    // refill finish, then re-launches it in order. One slot is sufficient because
+    // the load FSM leaves IDLE immediately after the miss decision, so there can be
+    // at most one such shadow request before ready drops structurally.
+    val loadShadowValid = RegInit(False)
+    val loadShadowCmd   = Reg(DLoadCmd())
+    loadShadowValid.simPublic()
 
     // S1 hit-detect against the REGISTERED tag-read vs the REGISTERED ppn-tag. The
     // compare's inputs are both registered (BRAM tag-read output + the latched ppn-
@@ -287,12 +312,26 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     ldS1Valid.simPublic(); ldS1Set.simPublic(); ldS1Tag.simPublic(); ldS1Off.simPublic()
     ldS1Size.simPublic(); ldS1Hit.simPublic(); ldS1HitWay.simPublic()
     val ldS1Line    = rdData(ldS1HitWay)
-    // Respond ONLY on a HIT (the fault flag rides along with the hit response,
-    // matching baseline: `s1Fault := xlate.rsp.fault` was set ONLY in the hit branch).
-    // A MISS — fault or not — falls through to REFILL below, exactly as baseline
-    // (baseline's miss branch goes to REFILL regardless of xlate.rsp.fault; the
-    // genuine non-resident-page fault is handled by the LS EU's own fault path, not
-    // by short-circuiting a garbage cache response here).
+
+    // Fast consume of a still-fresh early virtual-set read. The physical tag and
+    // cacheability arrive only on the resolved command; all compare inputs terminate
+    // at the existing S2 registers. If a prior S1 token exists, use the normal S1
+    // path instead so this shortcut can never overwrite that older S2 transfer.
+    val earlyProbeOwnsCmd = earlyProbeValid &&
+                            (earlyProbeToken === loadCmdPort.payload.token) &&
+                            (earlyProbeVaddr === cmdVaddr)
+    val earlyProbeHitVec = Vec(Bool(), ways)
+    for (w <- 0 until ways)
+      earlyProbeHitVec(w) := (loadCmdPort.payload.cacheMode =/= CacheMode.INHIBITED) &&
+                             valids(w)(cmdSet) && (rdTag(w) === cmdTag)
+    val earlyProbeHit    = earlyProbeHitVec.orR
+    val earlyProbeHitWay = OHToUInt(earlyProbeHitVec)
+    val earlyProbeLine   = rdData(earlyProbeHitWay)
+    val useEarlyProbe    = earlyProbeOwnsCmd && earlyProbeFresh && !ldS1Valid
+    useEarlyProbe.simPublic()
+    // Respond ONLY on a HIT. A MISS falls through to REFILL below. Translation
+    // faults never enter this pipe: the resolved-command contract requires the LS
+    // producer to consume them before issuing loadCmd.
     // (The actual response is built one cycle later, in the LOAD S2 block below --
     // FMax closure Slice 2. The HIT-ONLY policy described here is unchanged; only
     // the cycle the response leaves on moved.)
@@ -335,13 +374,11 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val ldS2Line  = Reg(Bits(128 bits))
     val ldS2Off   = Reg(UInt(offBits bits))
     val ldS2Size  = Reg(Size())
-    val ldS2Fault = Reg(Bool())
     ldS2Valid := ldS1Valid
     ldS2Hit   := ldS1Hit
     ldS2Line  := ldS1Line
     ldS2Off   := ldS1Off
     ldS2Size  := ldS1Size
-    ldS2Fault := ldS1Fault
     val ldS2Resp = ldS2Valid && ldS2Hit
     ldS2Valid.simPublic(); ldS2Hit.simPublic(); ldS2Resp.simPublic()
 
@@ -350,7 +387,9 @@ class DcachePlugin extends FiberPlugin with DcacheService {
                                       DcacheByteLane.extract(missLine, missOff, missSize),
                                       DcacheByteLane.extract(ldS2Line, ldS2Off, ldS2Size))
     loadRspPort.payload.line  := Mux(inhibitedResp, missLine, ldS2Line)
-    loadRspPort.payload.fault := Mux(busFaultResp, True, ldS2Fault)
+    // Translation faults are terminated upstream and never become cache commands.
+    // The D-cache response fault bit is exclusively a physical AXI refill error.
+    loadRspPort.payload.fault := busFaultResp
 
     // ---- STORE write-through (PIPELINED RMW: S0 latch / S1 read / S2 merge+write) ----
     // FMax: the store RMW (old line readAsync + 16-lane byte-merge + write) used to
@@ -509,7 +548,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       stS1Payload := s0Payload
     }
 
-    // ---- shared read-port arbitration (FMax: keep the live load-accept/DTLB cone OUT
+    // ---- shared read-port arbitration (FMax: keep the live load-accept cone OUT
     // of the high-fanout BRAM read-address net) ----
     // The store drives the read address as the BASE (off the REGISTERED stS1Payload —
     // a clean flop->BRAM-address arc). The LOAD FSM below OVERRIDES rdSet/rdEn LAST
@@ -519,7 +558,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // store base adds NO arbiter cone to that fo=high net. The "did the store actually
     // get the port?" question (loadUsesPort) feeds ONLY the low-fanout stS2Valid
     // control register, NOT the BRAM address — breaking the post-route critical path
-    // (DTLB-walker -> loadCmdPort.ready -> arbiter -> tag/dataMem read-address).
+    // (loadCmdPort.ready -> arbiter -> tag/dataMem read-address).
     when(stS1Valid) {
       rdSet := stS1Set
       rdEn  := True
@@ -715,21 +754,14 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       val REFILL   = new State
       val REPLAY   = new State
 
-      // In-flight gate: do not accept a new load while one is resolving in S1 or S2.
-      // Single-outstanding on the load side — identical to the old
-      // `s1Valid || loadRspPort.valid` accounting.
-      //
-      // FMax closure Slice 2: `|| ldS2Valid` is REQUIRED, not belt-and-braces. The
-      // hit response now leaves in S2, so a load only stops being "in flight" one
-      // cycle later than before; without this term a new load could be accepted on
-      // the very cycle the previous load's response pulses, breaking the
-      // single-outstanding contract the whole load FSM (and the LS EU's own
-      // one-load-at-a-time protocol) is built on. Deliberately CONSERVATIVE: a load
-      // now takes 3 cycles (S0 accept / S1 compare+way-select / S2 extract+respond)
-      // with no other arbitration change. Overlapping a new load's S1 with the
-      // previous load's S2 (legal in principle — S2 touches neither the shared BRAM
-      // read port nor any AXI channel) is explicitly OUT of scope here.
-      val inFlight = ldS1Valid || ldS2Valid
+      // Throughput slices A+C0: S2 is a frozen response snapshot (no RAM/AXI use),
+      // and the one-entry `loadShadowCmd` above closes the remaining S1 miss shadow.
+      // Therefore IDLE may accept a resolved load every cycle on the all-hit path:
+      // while the older request resolves in S1, the new request either launches its
+      // synchronous read (older hit) or is captured for ordered replay (older miss).
+      // The latter handshake cannot be followed by another accept because the FSM
+      // leaves IDLE on the miss edge. This is a bounded two-operation miss window,
+      // not unbounded hit-under-miss state, and needs no response tag or line buffer.
 
       // Whether the load FSM uses the shared read port THIS cycle (set in the
       // load-accept and REPLAY arms below). The store arbiter reads this to defer.
@@ -737,10 +769,10 @@ class DcachePlugin extends FiberPlugin with DcacheService {
 
       IDLE.whenIsActive {
         busy := False
-        // Accept a load only when translation is RESOLVED this cycle (TLB hit or
-        // identity). On a DTLB miss `rsp.ready` is False while the walker runs, so
-        // the load is not accepted and the LS EU stays on its existing single-
-        // outstanding back-pressure path (re-driving loadCmd.valid) until it hits.
+        // `DLoadCmd` is a resolved request: its producer already translated the
+        // address, rejected translation faults, and registered paddr/cacheMode.
+        // Never consult a live, untagged DTLB response here. That response can
+        // already belong to a younger request once the LS front end is pipelined.
         // Also held off while a store-drain miss is about to be picked up this same
         // cycle (the `elsewhen(pendingStoreMiss)` arm below): if a load were
         // accepted here too, next cycle the FSM is servicing the store in REFILL
@@ -755,8 +787,82 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         // eviction AXI pair) so the two can never contend. Bounded by construction
         // (a walk is at most sets*ways iterations), and the LS EU is architecturally
         // blocked from issuing anyway (the walk only ever runs under excActive).
-        loadCmdPort.ready := !inFlight && xlate.rsp.ready && !pendingStoreMiss && !maintBusyReg
-        when(loadCmdPort.fire) {
+        // Early virtual-set lookup admission. A resolved command has priority on a
+        // shared-port cycle; the LS producer holds probe.valid until this handshake.
+        loadProbePort.ready := !earlyProbeValid && !loadShadowValid &&
+                               !pendingStoreMiss && !maintBusyReg &&
+                               !loadCmdPort.valid && !ldS1Valid
+        when(loadProbePort.fire) {
+          val canceledAtLaunch = loadProbeCancelPort.valid &&
+                                 (loadProbeCancelPort.payload.token === loadProbePort.payload.token)
+          rdSet        := loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
+          rdEn         := True
+          loadUsesPort := True
+          earlyProbeValid := !canceledAtLaunch
+          earlyProbeFresh := !canceledAtLaunch
+          earlyProbeVaddr := loadProbePort.payload.vaddr
+          earlyProbeToken := loadProbePort.payload.token
+        }
+
+        // A command which owns a pre-existing probe is old work, so maintenance's
+        // WAIT phase must let it drain. New commands remain blocked for the entire
+        // maintenance interval. `maintWalking` is false only during that quiesce wait.
+        val resolveOldProbeDuringMaint = earlyProbeOwnsCmd && !maintWalking
+        loadCmdPort.ready := !loadShadowValid && !pendingStoreMiss &&
+                             (!maintBusyReg || resolveOldProbeDuringMaint)
+
+        // A shadow accepted behind an earlier miss has priority over a new external
+        // command once the refill returns. `maintWalking` (not maintBusyReg) is the
+        // gate: maintenance WAIT deliberately leaves walking low while pre-existing
+        // work drains, otherwise loadShadowValid would make dcIdleForMaint false and
+        // the two sides would deadlock waiting on each other.
+        when(loadShadowValid && !pendingStoreMiss && !maintWalking &&
+             !(ldS1Valid && !ldS1Hit)) {
+          rdSet        := loadShadowCmd.vaddr(offBits + setBits - 1 downto offBits)
+          rdEn         := True
+          loadUsesPort := True
+          ldS1Valid    := True
+          ldS1Set      := loadShadowCmd.vaddr(offBits + setBits - 1 downto offBits)
+          ldS1Tag      := loadShadowCmd.paddr(31 downto offBits + setBits)
+          ldS1Off      := loadShadowCmd.vaddr(offBits - 1 downto 0)
+          ldS1Size     := loadShadowCmd.size
+          ldS1Cmode    := loadShadowCmd.cacheMode
+          ldS1Paddr    := loadShadowCmd.paddr
+          loadShadowValid := False
+        } elsewhen(loadCmdPort.fire && ldS1Valid && !ldS1Hit) {
+          // The older S1 request misses this cycle. The command still FIRES — that
+          // is what permits II=1 hits — but its RAM read is deferred so no untagged
+          // younger response can pass the older refill. Replay it from the internal
+          // slot on the first safe IDLE cycle after the refill.
+          loadShadowCmd   := loadCmdPort.payload
+          loadShadowValid := True
+          earlyProbeValid := False
+          earlyProbeFresh := False
+        } elsewhen(loadCmdPort.fire && useEarlyProbe) {
+          // The virtual-set RAM result has been held since the DTLB-parallel probe.
+          // Resolve the physical tag now. A hit bypasses the otherwise-redundant S1
+          // register and terminates at S2; a miss enters S1 without re-reading so the
+          // existing, heavily-tested miss/refill machinery remains the sole owner of
+          // victim selection and AXI state.
+          loadUsesPort := True
+          when(earlyProbeHit) {
+            ldS2Valid := True
+            ldS2Hit   := True
+            ldS2Line  := earlyProbeLine
+            ldS2Off   := cmdOff
+            ldS2Size  := loadCmdPort.payload.size
+          } otherwise {
+            ldS1Valid := True
+            ldS1Set   := cmdSet
+            ldS1Tag   := cmdTag
+            ldS1Off   := cmdOff
+            ldS1Size  := loadCmdPort.payload.size
+            ldS1Cmode := loadCmdPort.payload.cacheMode
+            ldS1Paddr := cmdPaddr
+          }
+          earlyProbeValid := False
+          earlyProbeFresh := False
+        } elsewhen(loadCmdPort.fire) {
           // Launch the BRAM tag+data read for this set; resolve hit/miss in S1.
           rdSet        := cmdSet
           rdEn         := True
@@ -767,13 +873,17 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           ldS1Off      := cmdOff
           ldS1Size     := loadCmdPort.payload.size
           ldS1Cmode    := loadCmdPort.payload.cacheMode
-          ldS1Fault    := xlate.rsp.fault
+          // Translation faults are consumed before a command is emitted. The only
+          // fault generated by the cache itself is a physical AXI refill error,
+          // delivered through busFaultResp below.
           ldS1Paddr    := cmdPaddr
+          // A stale/mismatched held probe cannot accelerate this command and this
+          // ordinary read supersedes its RAM output. Drop the single metadata slot.
+          earlyProbeValid := False
+          earlyProbeFresh := False
         }
         // S1 resolution of a launched load read. A HIT drives the response
-        // one cycle later out of S2 (ldS2Resp above, fault riding along). A MISS — fault or
-        // not — starts the refill, EXACTLY as baseline (whose miss branch went to
-        // REFILL unconditionally; only the hit branch carried xlate.rsp.fault).
+        // one cycle later out of S2. A MISS starts the refill.
         when(ldS1Valid && !ldS1Hit) {
           // Miss: latch miss-state and start the refill (the +1-cycle deferral
           // relative to the old async hit-detect is latency-agnostic). A same-
@@ -1093,7 +1203,6 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           ldS1Off      := missOff
           ldS1Size     := missSize
           ldS1Cmode    := missCmode
-          ldS1Fault    := False
           ldS1Paddr    := missPaddr
           goto(IDLE)
         }
@@ -1221,7 +1330,9 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       * while a load response is still resolving, even though that response's DATA
       * cannot itself be corrupted by the walk. Costs at most one extra cycle of
       * walk-start delay on an already-rare, ROB-serialized event. */
-    val dcIdleForMaint = !busy && !ldS1Valid && !ldS2Valid && !pendingStoreMiss && !pendingWtKickoff &&
+    val dcIdleForMaint = !busy && !ldS1Valid && !ldS2Valid && !loadShadowValid &&
+                         !earlyProbeValid &&
+                         !pendingStoreMiss && !pendingWtKickoff &&
                          !storePort.valid && !s0Valid && !stS1Valid && !stS2Valid &&
                          stAwDone && stWDone && evictAwDone && evictWDone
     dcIdleForMaint.simPublic()
@@ -1584,6 +1695,21 @@ class DcachePlugin extends FiberPlugin with DcacheService {
       pendingWtKickoff := False
     }
 
+    // Any later user of the single synchronous read port supersedes the held early
+    // probe output. Keep its token metadata so the matching resolved command can
+    // identify the stale optimization and fall back to a normal read; do not block
+    // store drain or maintenance merely to preserve freshness.
+    when(earlyProbeValid && rdEn) {
+      earlyProbeFresh := False
+    }
+    // Forwarded/faulted/squashed loads never emit loadCmd. Their explicit cancel is
+    // what releases the metadata slot and, importantly, lets maintenance quiesce.
+    when(loadProbeCancelPort.valid && earlyProbeValid &&
+         loadProbeCancelPort.payload.token === earlyProbeToken) {
+      earlyProbeValid := False
+      earlyProbeFresh := False
+    }
+
     // 1-cycle-later local ack for a COPYBACK hit (design doc: "S2 or the following
     // cycle"). Combined into storeAckReg in Step 4 below.
     val cbHitAckReg = RegNext(stS2Valid && stS2Copyback && stS2HitAny, init = False)
@@ -1758,6 +1884,8 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     }
   }
 
+  override def loadProbe = logic.loadProbePort
+  override def loadProbeCancel = logic.loadProbeCancelPort
   override def loadCmd  = logic.loadCmdPort
   override def loadRsp  = logic.loadRspPort
   override def loadBusy = logic.loadBusyReg

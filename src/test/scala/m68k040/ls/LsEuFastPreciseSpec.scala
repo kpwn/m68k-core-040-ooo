@@ -161,6 +161,29 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
     s.iValid #= false
   }
 
+  def issueLoad(dut: Dut, cd: ClockDomain, basePreg: Int, disp: Long,
+                pdst: Int, robId: Int): Unit = {
+    val s = dut.src.logic
+    s.iValid #= true; s.iMemOp #= MemOp.LOAD; s.iSize #= Size.LONG
+    s.iPsrcA #= basePreg; s.iPsrcAValid #= true
+    s.iPsrcB #= 0; s.iPsrcBValid #= false
+    s.iImm #= BigInt(disp & 0xffffffffL)
+    s.iPdstValid #= true; s.iPdst #= pdst; s.iRobId #= robId
+    cd.waitSamplingWhere(s.iReady.toBoolean)
+    s.iValid #= false
+  }
+
+  def waitCompletion(dut: Dut, cd: ClockDomain, robId: Int, maxCycles: Int = 200): Boolean = {
+    var seen = false
+    var n = 0
+    while (!seen && n < maxCycles) {
+      seen = dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == robId
+      if (!seen) cd.waitSampling()
+      n += 1
+    }
+    seen
+  }
+
   /** LEA address-generate: completes deterministically (NO translate, NO cache/AXI
     * access at all -- see LsEuPlugin's `IDLE.whenIsActive` `when(u1.leaAddr)` arm) a
     * FIXED 2 cycles after issue is accepted (capture at accept+1, ready-for-next-issue
@@ -257,6 +280,88 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
       cd.waitSampling(2)
       assert(dut.eu.logic.sq.robIds(idx).toInt == 6, "sanity: allocated entry belongs to this store")
       assert(!dut.eu.logic.sq.precises(idx).toBoolean, "MMU-on WRITETHROUGH DE=1 store must classify precise=False")
+    }
+  }
+
+  test("VIPT slice B: real DTLB lookup and virtual-set read launch together; an " +
+       "SQ-forwarded load cancels its unused cache probe", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem, ptmem) = initDut(dut)
+      val base = 0x2800L
+      val vpn  = (base >> 12) & 0xfffff
+      buildResidentWritethroughPage(ptmem, base, ppn = vpn)
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp #= ROOT
+      dut.ctrl.logic.srp #= ROOT
+      dut.cacheCtrl.logic.dcacheEnabled #= true
+      seed(dut, cd, preg = 10, value = base)
+      seed(dut, cd, preg = 11, value = 0xA1B2C3D4L)
+
+      // Leave an older fast store resident and uncommitted so the younger load must
+      // complete from the SQ, not from the speculative cache probe.
+      issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11,
+                 Size.LONG, robId = 6)
+      val (idx, completed) = waitAlloc(dut, cd, robId = 6)
+      assert(idx >= 0 && completed, "mapped cacheable store must allocate/complete fast")
+      cd.waitSampling(2)
+
+      var tracking = true
+      var parallelSeen = false
+      var cancelSeen = false
+      fork {
+        while (tracking) {
+          cd.waitSampling()
+          if (dut.eu.logic.parallelViptLaunch.toBoolean) parallelSeen = true
+          if (dut.eu.logic.probeCancel.toBoolean) cancelSeen = true
+        }
+      }
+      issueLoad(dut, cd, basePreg = 10, disp = 0, pdst = 22, robId = 7)
+      assert(waitCompletion(dut, cd, robId = 7), "forwarded load must complete")
+      tracking = false
+      assert(parallelSeen,
+        "the real DTLB demand and virtual-set RAM read must launch on the same token cycle")
+      assert(cancelSeen, "SQ forwarding must cancel the probe that will never get loadCmd")
+      assert(!dut.eu.logic.probeOutstanding.toBoolean, "LS probe ownership must clear")
+      assert(!dut.dcache.logic.earlyProbeValid.toBoolean, "D-cache probe slot must clear")
+      cd.waitSampling(3)
+      dut.src.logic.obsIntAddr #= 22; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == BigInt("A1B2C3D4", 16),
+        "forwarded data must remain correct")
+
+      // Now exercise the consuming path with the SAME real, enabled DTLB: prime a
+      // different line in this mapped page, then prove the resident hit uses the
+      // RAM output launched alongside translation instead of issuing another read.
+      val hotBase = 0x2900L
+      val image = Seq(0x90, 0x91, 0x92, 0x93, 0x11, 0x22, 0x33, 0x44,
+                      0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F)
+      image.indices.foreach(i => mem.pokeByte(hotBase + i, image(i)))
+      seed(dut, cd, preg = 12, value = hotBase)
+      issueLoad(dut, cd, basePreg = 12, disp = 0, pdst = 20, robId = 8)
+      assert(waitCompletion(dut, cd, robId = 8), "priming mapped load must complete")
+      cd.waitSampling(4)
+
+      tracking = true
+      parallelSeen = false
+      var earlyConsumeSeen = false
+      fork {
+        while (tracking) {
+          cd.waitSampling()
+          if (dut.eu.logic.parallelViptLaunch.toBoolean) parallelSeen = true
+          if (dut.dcache.logic.useEarlyProbe.toBoolean &&
+              dut.dcache.logic.loadCmdPort.valid.toBoolean &&
+              dut.dcache.logic.loadCmdPort.ready.toBoolean) earlyConsumeSeen = true
+        }
+      }
+      issueLoad(dut, cd, basePreg = 12, disp = 4, pdst = 21, robId = 9)
+      assert(waitCompletion(dut, cd, robId = 9), "mapped L1 hit must complete")
+      tracking = false
+      assert(parallelSeen, "real DTLB and cache probe must launch together on the hit")
+      assert(earlyConsumeSeen,
+        "physical-tag resolve must consume the RAM result launched with the real DTLB lookup")
+      cd.waitSampling(3)
+      dut.src.logic.obsIntAddr #= 21; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == BigInt("11223344", 16),
+        "real-DTLB parallel VIPT hit data")
     }
   }
 

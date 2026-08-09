@@ -304,7 +304,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
   }
 
   test("I2 scenario sanity: the same-way collision cycle was actually hit at least " +
-       "once across the WRITETHROUGH storeCycle sweep") {
+       "once across the WRITETHROUGH storeCycle sweep", VerilatorTest) {
     assert(wtCollisionHitAny,
       "NONE of the WRITETHROUGH sweep's offsets ever produced the real array-write-port " +
       "collision cycle (axi.r.valid && stS2ArrayWrite && stS2HitVec(victimWay)) -- the " +
@@ -348,7 +348,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
   }
 
   test("I2 scenario sanity: the same-way collision cycle was actually hit at least " +
-       "once across the COPYBACK storeCycle sweep") {
+       "once across the COPYBACK storeCycle sweep", VerilatorTest) {
     assert(cbCollisionHitAny,
       "NONE of the COPYBACK sweep's offsets ever produced the real array-write-port " +
       "collision cycle (axi.r.valid && stS2ArrayWrite && stS2HitVec(victimWay)) -- the " +
@@ -498,7 +498,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
   // did, the sweep above proves nothing about `storeDrainRefillHold` at all -- every
   // assertion in it would pass on a core with the gate deleted outright.
   test("Lever F positive control scenario sanity: storeDrainRefillHold was actually " +
-       "asserted at least once across the secondCycle sweep") {
+       "asserted at least once across the secondCycle sweep", VerilatorTest) {
     assert(holdFiredAt.nonEmpty,
       "NONE of the Lever F sweep's offsets ever asserted `storeDrainRefillHold` inside " +
       "REPLAY's write-allocate arm -- the sweep above is VACUOUS: its delay-never-drop " +

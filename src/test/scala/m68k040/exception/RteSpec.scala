@@ -141,12 +141,16 @@ class RteSpec extends AnyFunSuite {
       dut.rob.logic.completion(0).valid #= false
 
       // wait for the RTE redirect to the restored PC.
-      var n = 0; var redirPc = -1L
+      var n = 0; var redirPc = -1L; var loadCmdFires = 0
       while (redirPc < 0 && n < 400) {
+        if (dut.dcache.logic.loadCmdPort.valid.toBoolean &&
+            dut.dcache.logic.loadCmdPort.ready.toBoolean) loadCmdFires += 1
         if (dut.rob.logic.doFlushReg.toBoolean) redirPc = dut.rob.logic.flushPcReg.toLong & 0xffffffffL
         n += 1; cd.waitSampling()
       }
       assert(redirPc == retPc, f"RTE redirect pc=0x$redirPc%x expected restored 0x$retPc%x")
+      assert(loadCmdFires == 4,
+        s"format-0 RTE must issue exactly four frame-word loads, observed $loadCmdFires")
       cd.waitSampling(5)
 
       // SR restored (system byte = retSr>>8 = 0x00, S=0); SSP += 8; A7 now USP.

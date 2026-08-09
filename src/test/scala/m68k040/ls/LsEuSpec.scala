@@ -108,8 +108,25 @@ class LsEuSpec extends AnyFunSuite {
       assert(waitCompletion(dut, cd, robId = 1), "first load")
       cd.waitSampling(4)
       // second load in same line (disp +8), should hit
+      var tracking = true
+      var parallelLaunchSeen = false
+      var earlyConsumeSeen = false
+      fork {
+        while (tracking) {
+          cd.waitSampling()
+          if (dut.eu.logic.parallelViptLaunch.toBoolean) parallelLaunchSeen = true
+          if (dut.dcache.logic.useEarlyProbe.toBoolean &&
+              dut.dcache.logic.loadCmdPort.valid.toBoolean &&
+              dut.dcache.logic.loadCmdPort.ready.toBoolean) earlyConsumeSeen = true
+        }
+      }
       issueLoad(dut, cd, basePreg = 10, disp = 8, Size.LONG, pdst = 21, robId = 2)
       assert(waitCompletion(dut, cd, robId = 2), "second (hit) load")
+      tracking = false
+      assert(parallelLaunchSeen,
+        "the registered LS token must launch DTLB and virtual-set RAM lookup together")
+      assert(earlyConsumeSeen,
+        "the later physical-tag command must consume that DTLB-parallel RAM result")
       cd.waitSampling(4)
       dut.src.logic.obsIntAddr #= 21; sleep(1)
       assert(dut.src.logic.obsIntData.toBigInt == expectedLong(base + 8), s"hit result ${dut.src.logic.obsIntData.toBigInt.toString(16)}")

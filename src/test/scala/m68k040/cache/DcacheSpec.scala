@@ -49,8 +49,11 @@ class DcacheSpec extends AnyFunSuite {
     dut.probe.logic.loadCmdIn.payload.paddr #= vaddr   // identity translation in this spec
     dut.probe.logic.loadCmdIn.payload.size #= size
     dut.probe.logic.loadCmdIn.payload.cacheMode #= cacheMode
+    dut.probe.logic.loadCmdIn.payload.token #= 0
     cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.ready.toBoolean && dut.probe.logic.loadCmdIn.valid.toBoolean)
     dut.probe.logic.loadCmdIn.valid #= false
+    dut.probe.logic.loadProbeIn.valid #= false
+    dut.probe.logic.loadProbeCancelIn.valid #= false
     cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
     dut.probe.logic.loadRspOut.payload.data.toBigInt
   }
@@ -117,6 +120,8 @@ class DcacheSpec extends AnyFunSuite {
     cd.forkStimulus(period = 10)
     val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
     dut.probe.logic.loadCmdIn.valid #= false
+    dut.probe.logic.loadProbeIn.valid #= false
+    dut.probe.logic.loadProbeCancelIn.valid #= false
     dut.probe.logic.storeIn.valid #= false
     // Task P5.4: pin the maintenance port idle (an un-poked testbench-driven input is
     // NOT guaranteed 0 across seeds/runs -- this project's documented sim gotcha).
@@ -737,14 +742,25 @@ class DcacheSpec extends AnyFunSuite {
         for (k <- 1L until 4L) load(dut, cd, addrA(k), Size.LONG, CacheMode.WRITETHROUGH)
 
         // Fire the young load that will trigger EVICT_WR (SET_A, way 0, dirty),
-        // then -- after `offset` cycles -- fire an UNRELATED ordinary WRITETHROUGH
-        // store to SET_B for exactly one cycle. Fire-and-forget both; we only
-        // check the end state (memory content + a clean reload), not exact timing.
+        // then -- after `offset` cycles from its ACCEPT EDGE -- fire an unrelated
+        // ordinary WRITETHROUGH store to SET_B for exactly one cycle.
+        //
+        // Stream protocol is load-bearing here: hold valid through the sampling edge
+        // on which ready is observed, then deassert it. The old driver tested ready
+        // combinationally and dropped valid BEFORE an edge. That happened to work
+        // while the D-cache's conservative S2 credit kept ready low, but under the
+        // legal S1/S2-overlap configuration ready is already high and the load simply
+        // vanished without ever firing. The resulting untouched preload byte is 183,
+        // exactly the historical `183 != 202` "corruption" report. Pin the handshake
+        // so this remains an AXI/cache hazard test rather than a ready-latency test.
         dut.probe.logic.loadCmdIn.valid #= true
         dut.probe.logic.loadCmdIn.payload.vaddr #= addrA(4)
         dut.probe.logic.loadCmdIn.payload.paddr #= addrA(4)
         dut.probe.logic.loadCmdIn.payload.size  #= Size.LONG
         dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+        cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
+                             dut.probe.logic.loadCmdIn.ready.toBoolean)
+        dut.probe.logic.loadCmdIn.valid #= false
         cd.waitSampling(offset)
         dut.probe.logic.storeIn.valid #= true
         dut.probe.logic.storeIn.payload.paddr #= baseB
@@ -753,14 +769,9 @@ class DcacheSpec extends AnyFunSuite {
         dut.probe.logic.storeIn.payload.useStrb #= false
         dut.probe.logic.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
 
-        var storePulsed = false
-        for (_ <- 0 until 40) {
-          if (dut.probe.logic.loadCmdIn.ready.toBoolean) dut.probe.logic.loadCmdIn.valid #= false
-          cd.waitSampling()
-          if (!storePulsed) { dut.probe.logic.storeIn.valid #= false; storePulsed = true }
-        }
-        dut.probe.logic.loadCmdIn.valid #= false
+        cd.waitSampling()
         dut.probe.logic.storeIn.valid   #= false
+        cd.waitSampling(39)
         // Generous settle window -- both the eviction beat and the unrelated
         // store's own beat (each a full AW/W/B handshake, possibly retried under
         // this task's retry-on-preemption design) must have long since resolved.
@@ -1761,6 +1772,168 @@ class DcacheSpec extends AnyFunSuite {
       assert(rspAt2 == 2, s"second back-to-back hit must have the same latency, got $rspAt2")
       assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == expected(base + 8, 4),
         "second hit data")
+      cd.waitSampling(4)
+    }
+  }
+
+  test("IPC slice C0: resident L1D hits accept and respond every cycle after warm-up " +
+       "(three operations in flight, accept II=1)", VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x7C00L
+      preload(mem, base, 16)
+
+      // Prime the line, then let every miss/replay pipeline register drain.
+      assert(load(dut, cd, base, Size.LONG) == expected(base, 4), "priming load data")
+      cd.waitSampling(8)
+
+      val addrs = Seq(base + 4, base + 8, base + 12)
+      val accepts = scala.collection.mutable.ArrayBuffer.empty[Int]
+      val responses = scala.collection.mutable.ArrayBuffer.empty[(Int, BigInt)]
+
+      // Hold each Stream token until its own sampling-edge handshake, then replace
+      // the payload with the next token. This is deliberately a three-token run:
+      // A can be in S2, B in S1, and C accepted into the sync-read launch together.
+      dut.probe.logic.loadCmdIn.valid #= true
+      dut.probe.logic.loadCmdIn.payload.vaddr #= addrs.head
+      dut.probe.logic.loadCmdIn.payload.paddr #= addrs.head
+      dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+      dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      var next = 1
+      var cycle = 0
+      while ((accepts.size < addrs.size || responses.size < addrs.size) && cycle < 20) {
+        cd.waitSampling()
+        cycle += 1
+        if (dut.probe.logic.loadCmdIn.valid.toBoolean &&
+            dut.probe.logic.loadCmdIn.ready.toBoolean) {
+          accepts += cycle
+          if (next < addrs.size) {
+            dut.probe.logic.loadCmdIn.payload.vaddr #= addrs(next)
+            dut.probe.logic.loadCmdIn.payload.paddr #= addrs(next)
+            next += 1
+          } else {
+            dut.probe.logic.loadCmdIn.valid #= false
+          }
+        }
+        if (dut.probe.logic.loadRspOut.valid.toBoolean)
+          responses += ((cycle, dut.probe.logic.loadRspOut.payload.data.toBigInt))
+      }
+
+      assert(accepts.size == 3, s"all three loads must be accepted, got $accepts")
+      assert(accepts.sliding(2).forall(p => p(1) - p(0) == 1),
+        s"resident-hit accepts must have II=1, got cycles $accepts")
+      assert(responses.size == 3, s"all three loads must respond, got $responses")
+      assert(responses.map(_._1).sliding(2).forall(p => p(1) - p(0) == 1),
+        s"resident-hit responses must be bubble-free, got cycles ${responses.map(_._1)}")
+      assert(responses.map(_._2) == addrs.map(a => expected(a, 4)),
+        s"responses must remain in accept order: got ${responses.map(_._2)}")
+      cd.waitSampling(4)
+    }
+  }
+
+  test("IPC slice C0: the load accepted behind an S1 miss is replayed after the " +
+       "refill and cannot respond out of order", VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val hitBase  = 0x7D00L
+      val missBase = 0x9E40L
+      preload(mem, hitBase, 16)
+      preload(mem, missBase, 16)
+
+      // Keep B resident while A remains cold.
+      assert(load(dut, cd, hitBase, Size.LONG) == expected(hitBase, 4), "prime B")
+      cd.waitSampling(8)
+
+      val addrs = Seq(missBase, hitBase + 4)
+      val accepts = scala.collection.mutable.ArrayBuffer.empty[Int]
+      val responses = scala.collection.mutable.ArrayBuffer.empty[(Int, BigInt)]
+      var shadowSeen = false
+
+      dut.probe.logic.loadCmdIn.valid #= true
+      dut.probe.logic.loadCmdIn.payload.vaddr #= addrs.head
+      dut.probe.logic.loadCmdIn.payload.paddr #= addrs.head
+      dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+      dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+
+      var next = 1
+      var cycle = 0
+      while ((accepts.size < 2 || responses.size < 2) && cycle < 100) {
+        cd.waitSampling()
+        cycle += 1
+        shadowSeen ||= dut.dcache.logic.loadShadowValid.toBoolean
+        if (dut.probe.logic.loadCmdIn.valid.toBoolean &&
+            dut.probe.logic.loadCmdIn.ready.toBoolean) {
+          accepts += cycle
+          if (next < addrs.size) {
+            dut.probe.logic.loadCmdIn.payload.vaddr #= addrs(next)
+            dut.probe.logic.loadCmdIn.payload.paddr #= addrs(next)
+            next += 1
+          } else {
+            dut.probe.logic.loadCmdIn.valid #= false
+          }
+        }
+        if (dut.probe.logic.loadRspOut.valid.toBoolean)
+          responses += ((cycle, dut.probe.logic.loadRspOut.payload.data.toBigInt))
+      }
+
+      assert(accepts.size == 2 && accepts(1) - accepts(0) == 1,
+        s"B must be accepted in A's S1 decision cycle, got accepts $accepts")
+      assert(shadowSeen, "the directed miss must exercise the bounded replay slot")
+      assert(responses.size == 2, s"both accepted loads must respond, got $responses")
+      assert(responses.map(_._2) == addrs.map(a => expected(a, 4)),
+        s"the miss response must precede the younger hit: got ${responses.map(_._2)}")
+      assert(responses(1)._1 > responses(0)._1,
+        s"the younger hit must not bypass the older refill: response cycles $responses")
+      assert(!dut.dcache.logic.loadShadowValid.toBoolean, "replay slot must drain")
+      cd.waitSampling(4)
+    }
+  }
+
+  test("VIPT slice B: an early virtual-set probe is consumed by the matching " +
+       "physical-tag command without re-reading the RAM", VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x7E00L
+      val addr = base + 8
+      val token = 0x25
+      preload(mem, base, 16)
+      assert(load(dut, cd, base, Size.LONG) == expected(base, 4), "prime line")
+      cd.waitSampling(8)
+
+      // P1: virtual index only. The synchronous RAM result becomes the held early
+      // probe one cycle later, while translation would proceed independently.
+      dut.probe.logic.loadProbeIn.valid #= true
+      dut.probe.logic.loadProbeIn.payload.vaddr #= addr
+      dut.probe.logic.loadProbeIn.payload.token #= token
+      cd.waitSamplingWhere(dut.probe.logic.loadProbeIn.valid.toBoolean &&
+                           dut.probe.logic.loadProbeIn.ready.toBoolean)
+      dut.probe.logic.loadProbeIn.valid #= false
+      cd.waitSampling(2)
+      assert(dut.dcache.logic.earlyProbeValid.toBoolean, "probe metadata must be held")
+      assert(dut.dcache.logic.earlyProbeFresh.toBoolean,
+        "no intervening read used the shared RAM port")
+
+      // P2/P5: translation metadata arrives later with the same token. Before valid
+      // is asserted, the combinational selector already proves the held result owns
+      // this command. The accept must consume it without asserting rdEn again.
+      dut.probe.logic.loadCmdIn.payload.vaddr #= addr
+      dut.probe.logic.loadCmdIn.payload.paddr #= addr
+      dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+      dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadCmdIn.payload.token #= token
+      sleep(1)
+      assert(dut.dcache.logic.useEarlyProbe.toBoolean,
+        "matching token+VA must select the DTLB-parallel RAM result")
+      assert(!dut.dcache.logic.rdEn.toBoolean,
+        "resolved consume must not launch a redundant synchronous read")
+      dut.probe.logic.loadCmdIn.valid #= true
+      cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
+                           dut.probe.logic.loadCmdIn.ready.toBoolean)
+      dut.probe.logic.loadCmdIn.valid #= false
+      cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
+      assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == expected(addr, 4),
+        "physical-tag resolve must return the held virtual-set line")
+      assert(!dut.dcache.logic.earlyProbeValid.toBoolean, "probe slot must be consumed")
       cd.waitSampling(4)
     }
   }

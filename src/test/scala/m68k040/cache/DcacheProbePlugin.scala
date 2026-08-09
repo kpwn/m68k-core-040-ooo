@@ -7,14 +7,15 @@ import spinal.lib.misc.plugin.FiberPlugin
 
 /** Test-only plugin: gives a standalone sim top-level IO to drive/observe the
   * DcacheService (load cmd/rsp/busy + store). Wiring lives in this plugin's own
-  * `during build`. Also stands in for the LS EU as the translate-at-execute
-  * requester: it drives the D-side translation request from the load cmd (the cache
-  * itself only READS the response now), so a cache-only DUT still resolves the
-  * single-driver DTranslationService.req. */
+  * `during build`. It also drives the otherwise-unused standalone D-side identity
+  * translator so the test host retains exactly one request producer; DcachePlugin
+  * itself consumes only the resolved VA+PA command and never reads that response. */
 class DcacheProbePlugin extends FiberPlugin {
   val logic = during build new Area {
     val ds = host[DcacheService]
 
+    val loadProbeIn = slave(Stream(DLoadProbe()))
+    val loadProbeCancelIn = slave(Flow(DLoadProbeCancel()))
     val loadCmdIn  = slave(Stream(DLoadCmd()))
     val loadRspOut = master(Flow(DLoadRsp()))
     val loadBusyOut = out(Bool())
@@ -26,6 +27,8 @@ class DcacheProbePlugin extends FiberPlugin {
     val maintDoneOut    = out(Bool())
     val maintQuiescedOut = out(Bool())
 
+    ds.loadProbe << loadProbeIn
+    ds.loadProbeCancel << loadProbeCancelIn
     ds.loadCmd << loadCmdIn
     loadRspOut << ds.loadRsp
     loadBusyOut := ds.loadBusy

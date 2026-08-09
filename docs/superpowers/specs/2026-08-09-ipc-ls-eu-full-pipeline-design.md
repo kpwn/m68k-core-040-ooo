@@ -1,10 +1,48 @@
 # IPC push: a genuine LS EU pipeline — replacing the one-µop-at-a-time FSM (design)
 
-**Status**: DESIGN / SCOPING ONLY. No RTL written, no RTL modified, no test
-modified, no Vivado launched by this pass. Every netlist number below is
-read-only reuse of the existing routed checkpoint `synth/fullcore_routed.dcp`
-(2026-08-09 08:05, 221.828 MHz) and the census reports produced from it
-(`synth/census_*.rpt`, `synth/lscensus_*.rpt`).
+**Status**: IMPLEMENTING. D-cache slices A, B, and the bounded replay part of C
+are implemented and simulation-gated as described below. The elastic LS-stage
+rewrite is still pending. The routed FMax/area gate has not yet been run.
+
+**2026-08-09 review amendment — binding corrections:**
+
+1. The original L1D was VIPT *by address selection* but did not hide translation
+   latency: it launched the virtual-set RAM only after `LsEuPlugin` had resolved
+   and registered the physical address. Slice B now launches a tokenized
+   `DLoadProbe{vaddr,token}` from the same registered boundary as the DTLB
+   request. `DcachePlugin` holds the synchronous virtual-set result and later
+   compares it with the physical tag from the matching resolved
+   `DLoadCmd{vaddr,paddr,token}`. A directed real-DTLB test proves the two
+   launches coincide and that the resolved command performs no redundant RAM
+   read. Thus the implemented common path is latency-hiding VIPT.
+2. The DTLB does not impose an unconditional one-translation-per-two-cycles
+   physical limit. `hrMatch` can serve a same-VPN stream every cycle after
+   warm-up. A changed VPN needs the registered hit-result gap; a walk needs
+   backpressure. The current LS `reqStale` policy nevertheless inserts a settle
+   cycle for every new resident µop. That policy must be replaced by tagged
+   pipeline validity, not elevated into an architectural floor.
+3. The end-state target is II=1 for cacheable same-page L1 hits, stores, and
+   forwarded loads. Slice A reached II=2; the bounded replay added with slice C
+   now permits one resolved all-hit load acceptance per cycle. A younger command
+   accepted on the exact cycle an older S1 detects a miss is held in one replay
+   slot and relaunched after refill, preserving untagged in-order responses.
+   General hit-under-miss remains future work. Maintenance and page walks may
+   remain serializing.
+4. `DcachePlugin` no longer consumes the live translation response at
+   cache-command acceptance. Translation faults terminate upstream and cancel
+   the early probe; only a successfully resolved physical address, cache mode,
+   and association token enter `DLoadCmd`. This removes the late-split
+   liveness/fault-association blocker.
+5. The late-split branch is a canary, not a prerequisite. Slice 1 exists only on
+   `feat/ls-eu-late-split` at `cc38cc8`; its FMax attempt did not finish and its
+   `earlyFree` flip is blocked. No task may execute the original one-line Task 6
+   until the live-translation hazard is removed.
+6. Faster consumers expose invalid producer cadence assumptions. Every Stream
+   source must hold `valid` and its entire payload until `fire`; it may not rely
+   on the consumer's former multi-cycle `ready` gap. D-cache II=1 exposed one
+   such bug in the exception frame-load source (`RegNext(valid)` emitted a
+   duplicate tail command). The exception source now uses a held command
+   register, and the format-0 RTE test asserts exactly four load handshakes.
 
 **Driving directive (user, verbatim)**: *"LS EU needs to be a pipeline, not a
 one-at-a-time FSM."*
@@ -21,13 +59,12 @@ trade is called out explicitly with its reason.
 **Binding initiative constraint (user, verbatim)**: *"push ipc as high as
 reasonably possible without blowing up lut count or crashing fmax."*
 
-**Relationship to work already in flight**: the "LS EU late split"
+**Relationship to the earlier late-split work**: the "LS EU late split"
 (`docs/superpowers/specs/2026-08-09-ipc-ls-eu-pipeline-depth-design.md`, plan
 `docs/superpowers/plans/2026-08-09-ipc-ls-eu-late-split-implementation-plan.md`)
-is being implemented **right now** on branch `feat/ls-eu-late-split`
-(worktree `…-worktrees/ls-split-work`, Slice 1 landed as `cc38cc8`). This
-document does **not** supersede it. §8 is the staging recommendation and it is
-the section to read first if you only read one.
+was explored on branch `feat/ls-eu-late-split` (Slice 1 at `cc38cc8`). It is a
+reference/canary, not the end-state architecture. §8 is the active staging
+recommendation.
 
 ---
 
@@ -92,13 +129,11 @@ Four things are established that the earlier spec did not have:
    can only *lose* FMax. Its acceptance case must rest on IPC + LUT +
    FMax-neutrality, and no task may gate success on MHz movement.
 
-5. **The D-cache load port has its own hard II = 3 ceiling, independent of
-   anything the LS EU does** (`DcachePlugin:732,758`) — 0.333 loads/cycle. Per
-   explicit user direction that ceiling is **in scope** for this effort, so
-   §3.2 grounds it, §8.2 slices it as real work (4a investigation → 4b RTL), and
-   §3.4/§8.3 carry both the with- and without- columns. Crucially, the exact
-   relaxation needed has **already been attempted once and corrupted data**
-   (`183 != 202`, a lost dirty-victim writeback) — see §3.2 and §11.
+5. **The original D-cache load port had a hard II=3 ceiling independent of the
+   LS EU.** That ceiling is removed: S1/S2 overlap first established II=2, and
+   the bounded replay slot now establishes all-hit accept II=1 without adding a
+   line buffer or multiple MSHRs. The historical `183 != 202` report was a test
+   handshake error, not dirty-victim corruption; §3.2 records the reproduction.
 
 ---
 
@@ -112,10 +147,10 @@ Four things are established that the earlier spec did not have:
   (close to) every cycle, in place of today's
   `issuePort.ready := !busy && !s1Valid && !compValid` single-occupancy contract
   (`LsEuPlugin.scala:1158`).
-- **G2** — Bring the initiation interval of **all three** LS µop classes down
-  toward the structural floor: store 4 → target 2, forwarded load 6 → 2,
-  non-forwarded L1D-hit load 9 → 2–3. (Measured baselines: LSU grounding entry,
-  ledger; per-class II re-derived in §3.)
+- **G2** — Bring the initiation interval of **all three** common LS µop classes
+  to 1: one store, forwarded load, or same-page L1D-hit load may enter each
+  cycle when no real dependency or bounded-resource stall applies. (Measured
+  baselines: LSU grounding entry, ledger; per-class II re-derived in §3.)
 - **G3** — Accept **increased per-op latency** wherever it buys II, per the
   governing principle. The target end-state pipeline is 8–10 stages deep — i.e.
   *longer* than today's 9-cycle non-forwarded load latency, possibly by 1–2
@@ -123,8 +158,9 @@ Four things are established that the earlier spec did not have:
 - **G4** — Preserve, bit-for-bit, every architectural property the current FSM
   has: store→load forwarding (currently 100% effective, 25/25 RESOLVE hits in
   the `load/store` kernel), in-order LS memory ordering, precise exception
-  delivery, wrong-path poisoning, split-access correctness, and the untagged
-  in-order `DLoadRsp` contract.
+  delivery, wrong-path poisoning, split-access correctness, and the untagged,
+  in-order `DLoadRsp` contract. Probe/command tokens are internal association
+  metadata; they do not make responses out of order.
 - **G5** — FMax-neutral (≥ 219 MHz against the 221.828 MHz baseline) and LUT
   growth ≤ +1.5% device-wide. These are the late-split spec's own §8.4
   thresholds and they carry over unchanged.
@@ -143,15 +179,11 @@ Four things are established that the earlier spec did not have:
   uniform and in-order on purpose, and that decision is what removes the need
   for a completion arbiter, a 6th ROB completion port, and a second Int/NZVC/X
   PRF write-port set.
-- **NG4** — Hit-under-miss in the D-cache, and *tagged* multi-outstanding D-side
-  loads. A miss stalls the whole LS pipe. `DLoadRsp` is untagged and the response
-  has no flow control (`DcachePlugin.scala:60`); in-order blocking is what keeps
-  that contract valid. Response tagging + demux is §10.5, deferred.
-  **This is NOT the same as relaxing `inFlight = ldS1Valid || ldS2Valid`**, which
-  *is* in scope (§3.2, slice 4b): that keeps responses untagged, in accept order,
-  one per cycle, and keeps misses blocking — it only lets a second load's S1
-  overlap the first load's S2, which is precisely the follow-on the S1a/S1b split
-  spec itself flagged.
+- **NG4** — General hit-under-miss, multiple MSHRs, or out-of-order D-side
+  responses. A miss still blocks new cache commands once detected. The one
+  younger command that can handshake on the same edge as miss detection is
+  captured in a bounded replay register and relaunched after refill. Responses
+  remain untagged and in acceptance order; response tagging/demux is deferred.
 - **NG5** — Any change to `src/main/scala/m68k040/frontend/` or
   `src/main/scala/m68k040/decode/`. A separate fetch-directed-BTB effort owns
   those; zero interaction.
@@ -201,7 +233,7 @@ not own. Each is characterised below with its citation and its cost to change.
 three live outside `LsEuPlugin.scala`, so a "pipelined LS EU" is a three-cluster
 project, not a one-file one.
 
-### 3.1 Gatekeeper 1 — the DTLB: **one translation per 2 cycles**, and it is a shared live port
+### 3.1 Gatekeeper 1 — the DTLB: same-page II=1 is possible; changing-page requests need replay today
 
 `DtlbPlugin.scala` serves a **single, combinational** request/response pair off
 one registered request. The hit path is served from a one-entry result register
@@ -219,12 +251,14 @@ val hrMatch = hrValid && (hrVpn === _req.vpn)      // ~:417
 Unrolling: `hrValid(N)` reflects cycle `N-1`'s condition and `hrVpn(N)` is
 `_req.vpn(N-1)`, so
 
-> **`hrMatch(N)` ⟺ the same VPN was presented on both cycle `N-1` and cycle `N`.**
+> **`hrMatch(N)` ⟺ cycle `N-1` produced a registered hit for the VPN presented
+> on cycle `N`.**
 
-**A changing VPN never matches.** Under MMU-on with a TLB hit, the DTLB
-therefore delivers at most **one translation per two cycles**, no matter what
-the LS EU does. (`permFault` is additionally recomputed against the *live*
-`_req.write`/`_req.supervisor`, so those must be held with the VPN too.)
+A stream whose requests remain on the same VPN can therefore receive a valid
+translation every cycle after warm-up. A changing VPN does not match the prior
+registered result and currently needs a hold/retry cycle. (`permFault` is
+additionally recomputed against the live `_req.write`/`_req.supervisor`, so
+those access-class bits must be associated with the same pipeline token.)
 
 The `!mmuEnable` identity arm (`:365-371`) and the DTT0/DTT1 transparent-
 translation arm (`:372-379`) are combinational and need no settle — but the LS
@@ -234,49 +268,35 @@ EU imposes the same 2-cycle settle in *both* modes deliberately, via
 (`LsEuPlugin.scala:736-745`), so that "the +1-cycle alignment is identical in
 both MMU modes" (`:670-672`).
 
-**Second, harder problem: the D-cache reads this same live port.** This is the
-Slice-1 review's finding, and it generalises:
+**Historical decoupling blocker, now removed:** the D-cache used to read this
+same live response at command acceptance:
 
 ```scala
 loadCmdPort.ready := !inFlight && xlate.rsp.ready && !pendingStoreMiss && !maintBusyReg  // DcachePlugin:758
 when(loadCmdPort.fire) { … ldS1Fault := xlate.rsp.fault … }                              // DcachePlugin:770
 ```
 
-Those are the **only** two live DTLB consumptions inside `DcachePlugin`
-(grep-confirmed: `xlate.` appears at `:73, :75, :157, :245, :291, :293, :758,
-:770, :776`; all but `:758`/`:770` are comments). They work today only because
-`reqDrvValid := s1Valid && (isLoad || isStore)` (`LsEuPlugin.scala:654`) and the
-front holds `s1Valid` for the *entire* lifetime of the cache access. In a
-pipeline the translate stage has moved on to a **younger** µop by the time an
-older µop's cache command is accepted, so both reads become wrong:
-`loadCmdPort.ready` gates on a stranger's `rsp.ready` (deadlock if it is low
-while a walk runs) and `ldS1Fault` latches a stranger's `permFault` (silent
-spurious vector-2 on a good load).
+Those reads were only sound while the front held one `s1Valid` resident for the
+entire cache transaction. They become cross-token hazards as soon as the
+translate stage moves on to a younger µop. Slice B therefore removed
+`DTranslationService` from `DcachePlugin` completely. A translation fault is
+consumed by `LsEuPlugin` and cancels its early probe; only clean, registered
+`{vaddr,paddr,cacheMode,token}` reaches the cache. AXI refill errors continue to
+use `DLoadRsp.fault` and are distinct from MMU faults.
 
-**Both reads are removable, and removing them is strictly a simplification.** A
-load reaching the cache-command stage has, by construction, *already* resolved
-its translation cleanly — `IDLE` only advances past translation on
-`xlateReady && reqMatch && !xlateFault` (`:1267-1310`), so `ldS1Fault` is
-provably always `False` for an LS-EU-originated load today. The fix is to carry
-the resolved fault bit on `DLoadCmd` (the paddr is already carried) and delete
-both live reads. That is a `DcachePlugin.scala` edit **inside the design's #1
-failing-endpoint family**, and it is a hard prerequisite for *any* pipelining —
-including, per the Slice-1 review, the late split's own `earlyFree = true`.
+**Cost to make all hit patterns II=1:** convert `hr*` into a genuine tagged
+pipeline — register `{vpn, write, supervisor, token}` alongside the lookup
+result and answer with pipeline-valid/nack rather than requiring the next live
+request to retain the same VPN. This changes the response contract, but it is
+the intended end state. The first implementation may exploit same-page II=1
+while replaying a changed-page request; it must not impose a blanket two-cycle
+occupancy counter.
 
-**Cost to remove the 2-cycle floor entirely** (i.e. to reach 1 translation/cycle):
-convert `hr*` from a value-compare into a genuine 2-stage pipeline — register
-`{vpn, write, supervisor, robId}` alongside the lookup result and answer with a
-pipeline-valid bit instead of `hrVpn === _req.vpn`. Structurally small (it
-*removes* a 20-bit comparator) but it changes the `rsp.ready` contract that four
-consumers read, in the MMU cluster, and the walker/miss backpressure has to be
-re-expressed per-request. **Not recommended in the first pass** — see §8.
+### 3.2 Gatekeeper 2 — D-cache load acceptance: original II=3, implemented all-hit II=1
 
-### 3.2 Gatekeeper 2 — the D-cache load port: **a hard II = 3 ceiling, and the II = 2 relaxation has already been tried and it corrupted data**
-
-**This is in scope for this effort** (explicit user direction: *"d-cache ii=3
-ceiling can be changed to accommodate for fully-pipelined goal"*). It is
-scoped here as real, intended, separately-gated work — §8.2 slice 2 — not as
-someone else's problem.
+This was explicitly brought into scope by the user. The following original
+ceiling and failed-test history are retained because they explain the replay
+guard and its regression coverage.
 
 `DcachePlugin.scala:732`: `val inFlight = ldS1Valid || ldS2Valid`, consumed by
 `:758`. Unrolled against `loadCmdPort.ready := False` (the default at `:229`,
@@ -289,10 +309,9 @@ raised **only** inside `fsm.IDLE`):
 | T+2 | 0 | 1 | 0 |
 | T+3 | 0 | 0 | 1 → accept |
 
-**II = 3, i.e. 0.333 loads/cycle sustained — a hard ceiling on the D-cache's own
-port, entirely independent of the LS EU.** No amount of LS-EU pipelining can
-exceed it. Any throughput claim in this document that ignores this is wrong, and
-§3.4/§8.3 are written against it.
+This was **II=3, or 0.333 loads/cycle sustained**, entirely independent of the
+LS EU. Slice A changed the credit to `ldS1Valid`, allowing S1 to overlap the
+prior S2 and establishing II=2.
 
 #### What the term is, and is not, protecting
 
@@ -307,20 +326,26 @@ its own words:
 > flagged as a possible follow-on for more throughput, explicitly out of scope
 > here."*
 
-**But that follow-on has since been attempted and it failed.** The independent
-review of that slice reverted the extension in an isolated worktree — i.e. ran
-exactly the `inFlight = ldS1Valid` / II = 2 configuration this design wants —
-and recorded (`.superpowers/sdd/progress-fmax-slice2-dcache.md:55-59`):
+**The follow-on was previously attempted and reported as a failure.** The
+independent review reverted the extension in an isolated worktree — i.e. ran
+exactly the `inFlight = ldS1Valid` / II=2 configuration — and recorded
+(`.superpowers/sdd/progress-fmax-slice2-dcache.md:55-59`):
 
 > *"proved it is load-bearing, not defensive: an existing regression test
 > ("AXI-hazard regression … offset=0") then fails with real data corruption
 > (`183 != 202`, a dirty victim's writeback lost)."*
 
-**Treat this as the governing fact: the exact relaxation this design needs is
-known to corrupt data today.** It is not a one-character delete and it is not a
-free follow-on.
+The 2026-08-09 reproduction found that conclusion was caused by an invalid test
+driver, not RTL corruption. The test asserted the eviction-triggering load's
+`valid`, then combinationally observed the newly-earlier `ready` and deasserted
+`valid` *before a sampling edge*. The request never fired. The reported 183 is
+exactly the untouched deterministic preload byte; 202 is `0xCA`, the dirty data
+that would only be written back if the missing load had actually caused an
+eviction. Holding Stream `valid` through the `ready && valid` sampling edge
+makes the original offset-0 case and the complete offset 0..4 sweep pass under
+II=2. The corrected test also asserts the accept edge explicitly.
 
-Two structural facts narrow where the corruption must come from:
+Two structural facts explain why the II=2 overlap is safe:
 
 1. **It is not the S2 data path.** The same review's Minor finding #1
    established that `ldS2*` is *"a frozen snapshot with no live shared-resource
@@ -328,9 +353,7 @@ Two structural facts narrow where the corruption must come from:
    invariant-hygiene, not corruption-prevention. So the term is not protecting
    the load's own registered data.
 
-2. **It is not load/miss ordering either.** That axis is safe by construction at
-   II = 2, and the argument is worth stating because it is what makes II = 2 the
-   *right* target rather than II = 1: `loadCmdPort.ready` is raised only inside
+2. **Load/miss ordering is safe at II=2.** `loadCmdPort.ready` is raised only inside
    `IDLE`; a miss is detected at S1 (cycle T+1, `:777`) while the FSM is still
    in `IDLE`, and its `goto(EVICT_WR)`/`goto(REFILL)` takes effect at T+2. With
    `inFlight = ldS1Valid`, `ready` is already low at T+1 (S1 occupied) and low at
@@ -341,38 +364,20 @@ Two structural facts narrow where the corruption must come from:
    The untagged in-order `DLoadRsp` contract survives too: two loads may be in
    S1/S2 but responses still leave in accept order, one per cycle.
 
-By elimination, the `183 != 202` corruption is a **cadence interaction with the
-shared physical AXI4 write channels and the shared BRAM read-port arbiter** —
-the region this file already needed **three** revisions to get right
-(`:386-433`: revision 1 shared AXI registers → misattributed write; revision 2
-`storeWantsAxi` alone → *"a one-directional gate on a problem that is
-symmetric"*, confirmed by a live trace; revision 3 `evictAxiPairOpen` +
-`pendingWtKickoff`). A faster load cadence changes (a) how often store-S1 loses
-the read-port arbiter to a load (`:1470-1479`, load priority via
-`loadUsesPort`), hence when store-S2's write-through AXI kickoff fires, and
-(b) when `EVICT_WR` is entered relative to a store's open aw/w pair — including
-`evictAwDone`/`evictWDone`, which are reset **only** on actually entering
-`EVICT_WR` (`:818-826`, itself a previously-found real bug).
+The shared AXI4 write channels and read-port arbitration remain high-risk and
+retain their complete regression sweep, but `ldS2Valid` was not protecting
+them.
 
-**This spec does not guess the root cause and must not.** Root-causing that
-exact regression is the **first, gated task** of slice 2 (§8.2), with an
-explicit HALT: if the term turns out to be protecting something structural
-rather than a fixable hole in the revision-3 AXI gating, the D-cache relaxation
-is dead and the system target drops to II = 3 (§3.4 carries both columns).
+#### Implemented II=1 guard
 
-#### Below II = 2
-
-II = 1 requires accepting a younger load *while an older one may still miss*,
-which reintroduces exactly the "a load MISS has no handler" hang above. Closing
-it needs either a **nack/replay** path (the LS EU's P5 already holds-and-retries
-`loadCmd` until `.fire`, but `.fire` has by then already been consumed, so a
-nack is a new protocol signal) or **response tagging** on `DLoadRsp` with a
-demux (§10.5). Both are materially larger than the II = 2 relaxation.
-
-**Convergence worth noting**: the DTLB floor (§3.1) is *also* 2. Two independent
-gatekeepers land on the same number, which is why **II = 2 is this design's
-honest system target** and why chasing II = 1 (§8.4) would require lifting both
-of them for ≈ +4–5% aggregate.
+II=1 creates exactly one new case: a younger command can handshake on the edge
+where the older S1 first discovers a miss. Slice C captures that already-
+accepted younger `DLoadCmd` in one replay register instead of launching its RAM
+read. The blocking refill completes, then the command is replayed through the
+normal path. This preserves untagged, in-order responses without a line buffer,
+response tags, or multiple MSHRs. Directed tests prove three resident hits are
+accepted and answered on consecutive cycles, and that the miss-shadow command
+cannot answer ahead of the miss. General hit-under-miss remains out of scope.
 
 ### 3.3 Gatekeeper 3 — the shared completion stage
 
@@ -394,23 +399,18 @@ NZVC/X ports. **This design refuses that cost** — see §4.4.
 | target | needs | II floor per LS µop |
 |---|---|---|
 | Today | — | store 4 / fwd load 6 / cache load 9 |
-| Late split (in flight) | `LsEuPlugin` + the §3.1 D-cache DTLB decoupling | store 4 / fwd load 6 / cache load ~4–5 |
-| **Full pipeline, phase 1a** | + `LsEuPlugin` restructure, D-cache port **unchanged** | store 2 / fwd load 2 / **cache load 3** (§3.2 ceiling) |
-| **Full pipeline, phase 1b** | + §3.2 relaxation (`inFlight = ldS1Valid`), *contingent on root-causing `183 != 202`* | **2, all classes** |
-| Full pipeline, phase 2 | + §3.1 DTLB pipelining, + §10.5 tagged `DLoadRsp`/nack | 1 |
+| Late split canary | `LsEuPlugin` front/back split with the live-DTLB blocker fixed | store 4 / fwd load 6 / cache load ~4–5 |
+| **D-cache slice A** | overlap S1 probe with prior S2 response; root-cause the historical `183 != 202` failure | cache-hit II=2 |
+| **D-cache slice B** | DTLB + virtual-set read launched in parallel; typed token associates early and resolved requests | translation latency hidden on a usable early probe |
+| **D-cache slice C0** | one miss-shadow command register and in-order replay | all-hit accept II=1; blocking miss remains ordered |
+| **Full LS pipeline** | elastic LS stages feeding slices B/C0; in-order completion ownership | **1 common-case**, stalls only on real dependencies/resources |
 
-**Phase 1a + 1b is the recommendation, staged and separately gated.**
+**Slices A–C followed by the elastic LS stages are the recommendation, staged
+and separately gated.**
 
-Note the split between 1a and 1b, which is deliberate and matters for risk:
-**phase 1a needs no D-cache load-port change at all.** Stores and forwarded
-loads go 4/6 → 2 purely from the LS-EU restructure, and non-forwarded loads go
-9 → 3 — i.e. the LS EU stops being the constraint and hands the bottleneck to
-the D-cache port. That alone is most of the win (§8.3), and it is measurable
-before touching `DcachePlugin`'s `inFlight` at all. Phase 1b then removes the
-last cycle **if and only if** the `183 != 202` root cause proves fixable.
-
-Phase 2 buys II 2 → 1 for ≈ +4–5% aggregate ideal-memory IPC across the MMU
-cluster and the D-cache response protocol; §8.4 recommends against it.
+Slice A is intentionally small and independently gateable, but II=2 is not the
+destination. Slices B/C make the cache and translation path truly pipelined;
+the LS-stage rewrite then exposes that capacity to real instruction streams.
 
 ---
 
@@ -426,13 +426,13 @@ deleted** and replaced by per-stage valid bits.
 | stage | today's equivalent | work | context it owns |
 |---|---|---|---|
 | **P0** | IQ `m2sPipe` + S0 (`:264-307`) | PRF reads (`rdBase`/`rdData`/`rdIndex`), `base0`/`data0`/`idxTerm0` mux | none (combinational, already exists) |
-| **P1** | S0→S1 reg + the `reqMatch` settle cycle (`:1199-1207`, `:1242-1266`) | latch `{ctx, base, data, index}`; compute `s1Va`, `s1AddrB`, cross-detect; **drive `reqDrv*`** | `p1Ctx`, `p1Base`, `p1Data`, `p1Index`, `p1Poison` |
-| **P2** | `IDLE`'s translate consume (`:1267-1310`) | consume `xlate.rsp`; latch `s2Paddr`/`s2Cmode`/fault; decide `twoAccess` | `p2Ctx`, `p2Va`, `p2AddrB`, `p2Paddr`, `p2Cmode`, `p2Fault`, `p2XlateSup`, `p2Poison` |
+| **P1** | S0→S1 reg | latch `{ctx, base, data, index}`; compute `va`; launch DTLB request **and** L1D virtual-set probe in parallel | `p1Ctx`, `p1Va`, `p1Data`, `p1Poison`, token |
+| **P2** | translated/tag-result alignment | align `xlate.rsp` with synchronous tag/data outputs; translation faults cancel upstream; changed-page or walk responses hold/retry | `p2Ctx`, `p2Va`, `p2Paddr`, `p2Cmode`, `p2Poison`, token |
 | **P2B** | `XLATE_B` (`:1332-1352`) | split-access second-half translate | *reuses P2's registers* — see §4.5 |
 | **P3** | `XLATE` (`:1357-1422`) | STORE: `sq.io.alloc` (+ `fastStore`/`deferCompletion`). LOAD: `sq.io.fwd` query → latch `fwd*` | `p3Ctx`, `p3Paddr/B`, `p3Cmode`, `p3StoreData`, `p3Poison` |
 | **P4** | `RESOLVE` (`:1432-1463`) | LOAD: `fwdHit` → data, else capture `llReg` | `p4Ctx`, `p4FwdHit/Data/Stall`, `p4Poison` |
-| **P5** | `LAUNCH` (`:1469-1479`) | drive `dcache.loadCmd` off `llReg`; hold until `.fire` | `llReg` (exists today, 135 flops) + `p5Ctx` |
-| **P6/P7** | D-cache `ldS1`/`ldS2` | *inside `DcachePlugin`* — no LS-EU registers | — |
+| **P5** | cache result/replay admission | accept the already-probed L1D result or occupy the bounded miss-shadow replay register | resolved command + replay state |
+| **P6/P7** | D-cache compare/extract pipeline | physically tagged way compare and registered extraction; one result per cycle | existing in-order D-cache stage registers |
 | **P8** | `WAIT`/`WAIT_A`/`WAIT_B` + `comp*` (`:1484-1568`, `:762-827`) | consume `loadRsp`; merge cross halves; drive the single `comp*` stage | `p8Ctx` (the late split's `bkCtx`), `lineA`, `aDone` |
 
 Depth from issue to completion: **9 stages**, vs. today's 9-cycle
@@ -480,15 +480,16 @@ Stall sources, all of which back-pressure the whole pipe in order:
 | `loadRsp` not arrived | P8 | hit latency / refill | every cache load |
 | split-access second pass | P2B / P8 | §4.5 | ~1 in N accesses |
 
-### 4.3 What P1's translate drive looks like at II = 2
+### 4.3 P1 translation/cache drive at II = 1
 
-At phase-1 targets the DTLB request register must hold one µop's VPN for two
-consecutive cycles (§3.1). Concretely, **P1 is a 2-cycle-occupancy stage** and
-P2 consumes on the second: `p1Sub` (a 1-bit counter) selects "drive" vs
-"consume-and-advance". Every *other* stage accepts 1/cycle. That is a genuine
-pipeline with exactly one 2-cycle stage — the shape a µop stream sees is
-II = 2, throughput-limited by a resource outside the LS EU. The alternative
-(P1 1-cycle, DTLB pipelined) is phase 2.
+P1 launches one token per cycle. The same token drives the DTLB request and the
+virtual set index. For a same-page hit stream, the DTLB registered hit result
+and synchronous L1D outputs remain available every cycle after warm-up. A VPN
+transition that cannot match receives a retry/nack and is held or replayed;
+younger admission is governed by bounded token capacity rather than a global
+two-cycle counter. A page walk may stop translation admission, but already
+resolved cache hits and independent non-memory LS results continue wherever
+their owned resources permit.
 
 `reqStale`'s three event terms (`:736-745`) collapse: with a per-stage discipline
 the "does `reqReg` correspond to what is being presented" question is answered by
@@ -563,8 +564,9 @@ A split µop occupies P2 twice (second pass with `xlateBArm`) and P5/P8 twice
   `issuePort.ready` expression at `:1158` in its current form.
 - `reqStale`/`reqFresh`/`reqMatch` as a freshness heuristic (`:736-745`),
   replaced by stage ownership; the `reqExcOverride` term survives in a new form.
-- `DcachePlugin`'s two live `xlate.rsp` reads (`:758`, `:770`), replaced by a
-  fault bit on `DLoadCmd`.
+- `DcachePlugin`'s two live `xlate.rsp` reads (historically `:758`, `:770`).
+  They are removed; translation faults terminate and cancel upstream, while a
+  clean resolved `DLoadCmd` carries registered VA/PA/cache mode plus its token.
 - `poisoned` as a single sticky bit (`:1184-1189`), replaced by a per-stage
   poison bit that travels with the µop.
 
@@ -878,29 +880,19 @@ measured FMax reading on the exact cone at issue.
 
 | # | slice | scope | files | gate |
 |---|---|---|---|---|
-| **0** | *(in flight)* late split Slices 1–2 | front/back FSM, `earlyFree`, H3/H4/H5 fixes | `LsEuPlugin`, `DcachePlugin` (H3) | its own §8.4 thresholds |
-| **1** | **Census + H11** | §6.3 read-only census on the then-current netlist; resolve the RTR/`sbX` static-trigger gap | `IssueQueuePlugin` (only if H11 is live) | G-P1..G-P4; **halt** on G-P1 |
-| **2** | **Front pipelining, structurally inert** | replace the FSM with P1–P4 stages, but keep a 1-deep occupancy interlock so cycle counts are **bit-identical**. The Slice-1 trick, applied to the front. | `LsEuPlugin` | IPC **bit-identical** (mandatory); post-route pair |
-| **3** | **Open the pipe → phase 1a (II 2 / 2 / 3)** | drop the interlock; per-stage poison (H6); H7 re-derivation; H12. **No `DcachePlugin` port change.** | `LsEuPlugin` | 8-seed × 2-model IPC; corpus; post-route pair |
-| **4a** | **D-cache port: root-cause `183 != 202`** | reproduce the AXI-hazard failure under `inFlight = ldS1Valid`; root-cause it against the revision-1/2/3 history (`:386-433`) and the `evictAwDone` reset site (`:818-826`). **Investigation only, no RTL.** | — | **HALT** if the term proves structurally load-bearing rather than a fixable AXI-gating hole |
-| **4b** | **D-cache port relaxation → phase 1b (II = 2 all classes)** | `inFlight = ldS1Valid` + the 4a fix; mirror in `dcIdleForMaint` (`:1224`); re-prove the AXI-hazard regression **and** the maintenance-vs-drain-miss deadlock regression | `DcachePlugin` | full post-route pair; corpus fail-name list; `DcacheSpec` name-identical |
-| **5** | **Context pruning** | prove non-use, shrink P2–P4 contexts | `LsEuPlugin` | LUT/FF delta; no functional change |
-| **6** | *(evaluate only)* **II = 1** | DTLB pipelining (§3.1) + tagged `DLoadRsp`/nack (§10.5) | `DtlbPlugin`, `DcachePlugin` | **do not implement without a fresh IPC re-measurement** — see §8.4 |
+| **A — implemented** | **D-cache S1/S2 overlap** | `inFlight = ldS1Valid`; repair the pre-edge-valid test bug; prove two hits in flight and accept II=2 | `DcachePlugin`, `DcacheSpec` | cache suite; AXI hazard offsets; maintenance regressions; `test-fast` |
+| **B — implemented** | **Parallel VIPT probe** | launch DTLB request and virtual-set RAM read from the same registered boundary/token; remove live `xlate.rsp` reads at cache accept; cancel on forward/fault/squash | services, `LsEuPlugin`, `DcachePlugin`, DTLB tests | real-DTLB coincident launch; early-read consume; SQ-forward cancel; fault/cross regressions; post-route pair pending |
+| **C0 — implemented** | **Bounded miss-shadow replay** | accept all-hit commands at II=1; capture the one younger command accepted on older-S1 miss detection and replay it after refill | `DcachePlugin`, service token | sustained hit II=1; in-order miss replay; cache regressions; area/FMax pending |
+| **C1 — optional** | **General hit-under-miss** | response tags + bounded miss state sufficient to keep accepting independent hits during refill | cache/service/LS files | hit-under-miss; queue-full backpressure; area/FMax |
+| **D** | **Elastic LS stages** | replace front/back one-at-a-time state with owned valid/context stages; uniform completion reservation | `LsEuPlugin` | IPC suite; lock-step/corpus; post-route pair |
+| **E** | **Context pruning** | prove non-use, shrink carried tokens | LS/cache files | LUT/FF delta; no functional change |
 
-Slices 2, 3, 4b each end with a hard GO/NO-GO. Slice 2 is the direct analogue of
-late-split Slice 1: a structural change with a *provable* zero behavioural delta,
-whose only purpose is to price the FMax/LUT cost before any IPC is chased.
-**Proof before payoff**, per this project's standing discipline.
-
-**Slice 3 before slice 4 is deliberate, not incidental.** Ordering the LS-EU
-restructure first means slice 3's IPC measurement *directly measures* how much
-of the win the D-cache ceiling is withholding: at phase 1a the LS EU is no longer
-the constraint, so the residual `load-stream` cycles are the D-cache port's
-II = 3, quantified rather than assumed. That number is the honest business case
-for slice 4 — and if slice 4a's HALT fires, slice 3 has still landed the
-majority of the win and the initiative degrades gracefully instead of failing.
-Slice 4a is an investigation gate with no RTL precisely because the region has
-already defeated two independently-designed fixes (`:386-433`).
+Every slice ends with a hard correctness and `test-fast` gate; B–D additionally
+need paired post-route evidence when the PM-serialized implementation window is
+available. A removed a disproven blocker; B and C0 establish real common-path
+cache capacity before D opens the LS issue path. C1 is not a prerequisite for
+the blocking, in-order elastic LS pipeline and should be justified separately
+against area and workload miss behavior.
 
 ### 8.3 Projected IPC
 
@@ -915,23 +907,23 @@ Baselines re-measured on `39f2e49` (late-split Task 2, 8 seeds, both models):
 | **AGGREGATE** | **9268.00** | **12692.75** |
 
 `load-stream` is 360 non-forwarded loads (6 per iteration × 60) at II 9 ⇒ 3240
-predicted vs 3269 measured (0.9%). Its projection is **gated by §3.2**, and the
-two phases must be reported separately:
+predicted vs 3269 measured (0.9%). The cache-side II=3 ceiling has now been
+removed, but the LS one-at-a-time FSM still hides that capacity. Therefore the
+following remain analytical projections until slice D opens LS admission:
 
 | | `load-stream` II | `load-stream` cyc | `load/store` | `mixed` | ideal aggregate |
 |---|---|---|---|---|---|
 | baseline | 9 | 3270 | 1045 | 560 | **9268** |
-| **phase 1a** (no D-cache change) | **3** (D-cache ceiling) | ~1080 | ~650 | ~430 | **~6500** = **+43%** |
-| **phase 1b** (`inFlight = ldS1Valid`) | **2** | ~720 | ~620 | ~420 | **~6100** = **+52%** |
+| historical D-cache II=3 projection | **3** | ~1080 | ~650 | ~430 | **~6500** = **+43%** |
+| slice-A cache II=2 projection | **2** | ~720 | ~620 | ~420 | **~6100** = **+52%** |
+| implemented cache capacity + elastic LS target | **1** | ~360 plus fill | to measure | to measure | **must be benchmarked** |
 
-So the D-cache port relaxation is worth roughly **+6 percentage points** on the
-ideal-memory aggregate on top of phase 1a — real, but **phase 1a carries ~85% of
-the total win without touching `DcachePlugin`'s load port at all.** That ratio is
-why slice 3 precedes slice 4 (§8.2) and why a slice-4a HALT is survivable.
-
-Under realistic memory `load-stream` is only 4.9% memory-model-sensitive, so the
-saving carries nearly 1:1: **12693 → ~9900 (phase 1a, +28%) → ~9500 (phase 1b,
-+34%)**.
+The D-cache is no longer the common-hit acceptance bottleneck. Do not claim an
+IPC win from slices A–C0 alone: with the current LS FSM, requests still arrive
+far below the cache's new capacity. The gain becomes measurable only when the
+elastic LS stages can present consecutive loads. Under the realistic memory
+model, refill time still limits the benefit, so both memory models remain
+mandatory.
 
 **Three honest caveats, all mandatory to carry into any report of these numbers:**
 
@@ -947,17 +939,14 @@ saving carries nearly 1:1: **12693 → ~9900 (phase 1a, +28%) → ~9500 (phase 1
   rate spends its LS time in refills, where II is irrelevant. The
   `IPC_MEM=l2:5:70` column is the honest one.
 
-### 8.4 Why slice 6 (II = 1) is probably not worth doing
+### 8.4 Why general hit-under-miss remains optional
 
-II 2 → 1 saves a further ~360 cycles on `load-stream` and ~100 elsewhere ≈
-**+4–5% ideal aggregate**. The cost is a change to the DTLB response contract
-(four consumers, MMU cluster) plus tagging `DLoadRsp` and demuxing responses
-inside the #1 failing-endpoint family — the largest correctness surface in the
-roadmap for the smallest marginal gain, on a design where the FMax relief
-available is 0.00 MHz. **Recommendation: scope slice 6 as an evaluation only.**
-It is also the only slice that literally satisfies "a new µop every cycle"; §4.3
-is honest that phase 1 delivers a pipeline with one 2-cycle stage, and that the
-2 cycles are imposed by `DtlbPlugin`, not by the LS EU.
+Common all-hit acceptance is already II=1 without response tagging. General
+hit-under-miss would add response association/demux and more miss state inside
+the #1 failing-endpoint family. Its benefit depends on real miss behavior and
+available independent work, whereas its area/FMax and correctness surface are
+unconditional. Implement it only after the elastic LS pipeline is measured and
+shows refill blocking to be the next material bottleneck.
 
 ---
 
@@ -987,7 +976,7 @@ new without checking the baseline name list.
 | `LsPipelinePoisonSpec` | H6, H7 | flush injected at each stage independently; assert zero SQ allocs / zero ROB completions for squashed µops; assert the pendMem↔SQ pairing invariant |
 | `LsPipelineSplitSpec` | H12, H5 | cross-line and cross-**page** splits with younger µops resident behind them; the `xlateBArm` freshness waveform |
 | `LsPipelineExcSpec` | H8 | exception raised with 4+ LS µops resident |
-| `DcacheLoadPortRateSpec` | H9, H10, §3.2 (slice 4b) | back-to-back L1D hits at II = 2, response-to-µop pairing in accept order; **the `AXI-hazard regression … offset=0` test that failed `183 != 202` under this exact configuration is the primary gate**, alongside the maintenance-vs-drain-miss deadlock regression (H10) |
+| D-cache rate/replay tests in `DcacheSpec` | H9, H10, §3.2 | three resident hits accepted/responded at II=1; younger command accepted on an older S1 miss is replayed after refill and cannot respond out of order; retain the complete AXI-hazard offset sweep and maintenance-vs-drain-miss regression |
 | `LsRtrXWakeupSpec` | H11 | RTR CCR-restore immediately followed by an X-reader |
 
 Every guard gets a **mutation** (deliberately reintroduce the bug in RTL,
@@ -1040,15 +1029,13 @@ set, in the #2 failing family and the known PRF-port congestion epicentre.
 store-only early-out with a strict "front yields to back" arbiter (the late
 split already built exactly that arbiter) is a bounded, pre-authorised fallback.
 
-**10.5 Tagged `DLoadRsp` / multi-outstanding D-side loads (II = 1).** Deferred,
-not rejected — and distinct from slice 4b, which only removes the `|| ldS2Valid`
-term. This is the only route *below* 2 cycles/load. The D-cache's own comment
-(`:722-731`) says the structure would tolerate an S1/S2 overlap, and the MSHR
-design's slice D2 already sketches response tagging — but that design marks D2
-"E2E? **NO** — contingent on §11.Q3" because the SoC crossbar is one outstanding
-read per master port, and §3.2 shows II = 1 additionally needs a nack/replay
-path to avoid the "a load MISS has no handler" hang. Worth ≈ +4–5% (§8.4). Not
-now.
+**10.5 Tagged `DLoadRsp` / general hit-under-miss.** Deferred, not rejected.
+All-hit acceptance already reaches II=1 through the one-entry miss-shadow replay
+described in §3.2, while responses remain untagged and in order. Tags, demux,
+and additional miss state are only required to let independent hits bypass an
+active refill. The SoC crossbar remains one outstanding read per master port,
+so this must be justified by post-elastic-pipeline workload measurements rather
+than by the common-hit initiation interval.
 
 **10.6 Crack split accesses into two µops at decode.** Rejected — §4.5. Changes
 the µop stream and the whitebox commit join for a rare case, to remove a stall
@@ -1088,33 +1075,18 @@ checkpoints, and why §9.3's reject threshold is stated before any RTL.
 **The biggest scope finding is that this is not an `LsEuPlugin.scala` project.**
 All three throughput gatekeepers are partly or wholly outside it:
 
-- the D-cache's live `xlate.rsp` reads (`DcachePlugin:758,770`) must be deleted
-  for *any* pipelining — the Slice-1 review found this and it blocks the late
-  split too;
-- the DTLB's `hrMatch` value-compare imposes a hard 1-translation-per-2-cycles
-  floor (`DtlbPlugin:405,417`) that no LS-EU change can lift;
-- the D-cache load port itself caps at **II = 3 / 0.333 loads per cycle**
-  (`DcachePlugin:732,758`), also entirely independent of the LS EU.
+- the D-cache's former live `xlate.rsp` reads had to be deleted for any
+  pipelining; slice B has now removed the dependency entirely;
+- the DTLB's registered `hrMatch` path supports same-VPN II=1 but needs tagged
+  replay/pipelining for changing-VPN II=1;
+- the original D-cache load port cap of **II=3 / 0.333 loads per cycle** was
+  independent of the LS EU; slices A/C0 now provide all-hit acceptance II=1.
 
-Phase 1 therefore delivers a genuine pipeline whose *one* 2-cycle stage is
-bottlenecked by another cluster, and phase 2 (removing that) is judged not worth
-its correctness surface (§8.4). **Anyone reading "a new µop every cycle" as the
-deliverable should read §3.1, §3.2 and §4.3 first.**
-
-**The second-biggest risk, and a genuinely nasty one, is that the D-cache
-relaxation this design needs has already been tried and it corrupted data.**
-Reverting `|| ldS2Valid` — exactly the II = 2 configuration of slice 4b — made
-the `AXI-hazard regression … offset=0` test fail with a real lost dirty-victim
-writeback (`183 != 202`,
-`.superpowers/sdd/progress-fmax-slice2-dcache.md:55-59`). §3.2 eliminates the S2
-data path and the load/miss-ordering axis as causes, leaving a cadence
-interaction with the shared AXI4 write channels and the read-port arbiter — a
-region that already defeated **two** independently-designed fixes before
-revision 3 landed (`DcachePlugin:386-433`). This spec deliberately refuses to
-guess the mechanism: slice 4a is an **investigation-only gate with an explicit
-HALT**. The mitigation is structural, not optimistic — slice 3 (phase 1a) is
-ordered first and carries ~85% of the win without touching that port at all, so
-a HALT costs ~6 aggregate percentage points rather than the initiative.
+The earlier `183 != 202` blocker is now understood: the load never handshook
+because the test dropped `valid` before an edge when `ready` became earlier.
+The corrected handshake and all five AXI-hazard offsets pass with S1/S2 overlap.
+This does not reduce the severity of the real AXI and array-port hazards already
+covered by those tests; it removes a false reason to preserve II=3.
 
 Framing this correctly matters for a second reason: it is the same failure shape
 as the DTLB-liveness finding that just bit the narrower late-split work — a
@@ -1138,14 +1110,9 @@ the aggregate with and without `load-stream`, and treat `call-return` as the
 adjudicator of whether uniform in-order completion (§4.4) needs the §10.4
 retreat.
 
-**Effort.** Realistically a multi-session effort: 8 slices, ~1000–1400 lines of
-RTL across `LsEuPlugin.scala` (the bulk), `DcachePlugin.scala` (the H3 DTLB
-decoupling + the slice-4b load-port relaxation) and — only if H11 is live —
-`IssueQueuePlugin.scala`; seven new directed specs with mutation coverage; and
-**four** paired post-route gates plus one investigation-only gate (4a). Slices
-0–3 are the near-term work and carry ~85% of the win; slice 4 closes the
-D-cache ceiling; slices 5–6 are optional.
-
-**Not implemented. No RTL written. §6.3's census is a hard prerequisite for
-slice 1, and slice 0 (the in-flight late split) must land its own FMax gate
-before slice 3 is dispatched.**
+**Implementation checkpoint.** D-cache S1/S2 overlap, all-hit II=1 acceptance,
+one-entry in-order miss-shadow replay, live-DTLB decoupling, and the parallel
+virtual-set probe are implemented. Directed simulation covers consecutive hits,
+miss replay ordering, real-DTLB coincident launch, early-result consumption,
+and probe cancellation on SQ forwarding. The remaining architectural work is
+the elastic LS-stage rewrite, followed by IPC and paired routed FMax/LUT gates.
