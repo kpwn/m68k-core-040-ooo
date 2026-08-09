@@ -1,10 +1,12 @@
 # Registered-token fetch-directed FTB implementation plan
 
-Status: **READY AFTER P0.** This plan replaces the blocked
+Status: **P0 CHARACTERIZED; OWNER-AUTHORIZED BOUNDED EXECUTION.** This plan replaces the blocked
 `2026-08-09-ipc-fetch-directed-btb-implementation-plan.md` and implements the
-binding token-pipeline amendment. Do not execute RTL tasks until P0 proves the
-current IPC branch reaches the floorplanned 200-MHz hard floor and records its
-gap to the standing 250-MHz optimization goal.
+binding token-pipeline amendment. P0 measured 173.430 MHz, below the 200-MHz
+hard floor, and recorded its gap to the standing 250-MHz optimization goal. The
+project owner explicitly chose to finish only the already-bounded multiplier
+DSP-register reshape and this FTB before one consolidated FMax/area/floorplan
+recovery pass. Do not add another broad feature phase under this exception.
 
 ## Global rules
 
@@ -34,10 +36,13 @@ gap to the standing 250-MHz optimization goal.
 3. Run the existing floorplanned implementation and census.
 4. Record achieved FMax, WNS/TNS, failing endpoint families, global utilization,
    and every pblock's capture/utilization/congestion.
-5. If achieved FMax <200 MHz, stop this plan and recover timing/floorplan first.
-   If 200–250 MHz, commit the checkpoint evidence, record the debt and recovery
-   options, then continue only after deciding whether another recovery slice is
-   cheaper than deferring the feature. At >=250 MHz, continue with full headroom.
+5. Record the completed result: WNS -1.766 ns, TNS -16123.603 ns, achieved
+   173.430 MHz, 28,234 failing endpoints, and no unrouted nets or hold failures.
+   Global area is healthy, but `pb_dcache` is physically overfull. Per the
+   project owner's explicit decision, continue only the multiplier DSP-register
+   reshape and this already-scoped FTB; then pivot immediately to consolidated
+   endpoint-driven timing and floorplan recovery. The 200-MHz floor is not
+   waived and 250 MHz remains the optimization goal.
 
 ## P1 — inert training metadata
 
@@ -79,8 +84,11 @@ gap to the standing 250-MHz optimization goal.
   for randomized PCs/GHR and consecutive changing PCs.
 - `test-fast` green.
 - Run a floorplanned route: inert storage must preserve the 250-MHz goal where
-  possible and must meet >=200 MHz plus the area budget. A sub-200 result pivots
-  immediately to endpoint-driven recovery; a 200–250 result is reported as debt.
+  possible and must be reported against the 200-MHz floor, 250-MHz goal, and
+  area budget. Under the one-time P0 owner exception, a sub-200 result does not
+  authorize more feature work: complete the remaining bounded application slice
+  only, then pivot immediately to endpoint-driven recovery. A 200–250 result is
+  still reported as debt.
   An area failure pauses for
   the explicit owner review required by the global rules before reshaping or
   connecting it to FetchAlign.

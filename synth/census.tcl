@@ -129,8 +129,14 @@ census_endpoint_probe sq_send    "*StoreQueue*sendPtr*"
 census_endpoint_probe sq_accept  "*StoreQueue*acceptedHalves*"
 
 # ---- 5) G-L3: pblock occupancy headroom (pb_dcache holds every LsEuPlugin_logic* cell) ----
-catch { report_utilization -pblocks [get_pblocks] -file ${prefix}_pblock_util.rpt }
+# Vivado 2025.2 silently rejects a multi-pblock list for `-pblocks` under the
+# surrounding catch. Emit one report per pblock so a missing file cannot masquerade
+# as a successful floorplan gate.
 foreach pb [get_pblocks -quiet] {
-  puts "CENSUS_PBLOCK $pb CELLS [llength [get_cells -quiet -of_objects $pb]]"
+  set pbCells [llength [get_cells -quiet -of_objects $pb]]
+  puts "CENSUS_PBLOCK $pb CELLS $pbCells"
+  if {[catch { report_utilization -pblocks $pb -file ${prefix}_${pb}_util.rpt } pbErr]} {
+    puts "CENSUS_PBLOCK_ERROR $pb $pbErr"
+  }
 }
 puts "########### CENSUS COMPLETE ###########"

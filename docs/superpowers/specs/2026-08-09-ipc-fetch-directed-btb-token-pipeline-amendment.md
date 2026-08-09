@@ -294,12 +294,24 @@ The two paths to inspect explicitly are:
    address; and
 2. FTQ async head → `availEff`/slot defer → existing decode/IBuf shift loop.
 
-The current branch's floorplanned route is a hard prerequisite. If it is below
-200 MHz, feature RTL stops and timing/floorplan recovery takes priority. A result
-between 200 and 250 MHz is usable but remains explicit timing debt: report the
-gap and continue endpoint/floorplan recovery where its cost is reasonable. After
-the inert table slice and after enabling application, run paired floorplanned
-routes and report WNS/TNS, failing families, LUT/FF/BRAM/DSP, and pblock health.
+The current branch's floorplanned route is a hard prerequisite. The checkpoint
+completed at 173.430 MHz (WNS -1.766 ns at the 4-ns constraint), below the
+200-MHz deployment floor, after the intentionally broad LSU/D-cache/CPLX/ALU
+throughput campaign. The project owner explicitly selected one bounded
+exception to the usual stop rule: finish only the already-scoped DSP-register
+reshape and this registered-token FTB, then perform a consolidated timing,
+area, and floorplan recovery pass. This does not waive either target: 250 MHz
+remains the optimization goal and 200 MHz remains the deployment floor. No
+additional broad feature RTL is authorized before recovery.
+
+The checkpoint also proves this is not a global-area failure: full-device use is
+54.37% LUT, 11.54% register, 5.42% BRAM, and 0.22% DSP. It is, however, a local
+floorplan failure: `pb_dcache` contains 6,394 parent-assigned CLBs despite only
+5,460 available sites, and the physical region is at 122.60% CLB occupancy once
+non-assigned occupants are included. The final recovery pass must therefore
+consider pblock rebalance as well as RTL endpoint work. After the inert table
+slice and after enabling application, run paired floorplanned routes and report
+WNS/TNS, failing families, LUT/FF/BRAM/DSP, and pblock health.
 
 ## 9. Binding verification
 
