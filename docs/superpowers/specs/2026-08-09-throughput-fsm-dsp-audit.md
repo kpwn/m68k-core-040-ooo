@@ -158,9 +158,11 @@ measured 4.094 ns, 12-level path with WNS -0.112 ns at 250 MHz. The RTL now uses
 a widened count left shift plus optional negate for the final delta, and selects
 between `step` and `step << 1` for the running update. No latency or state was
 added. Directed decode covers every offset and both ±64 final deltas for all 16
-registers; 11/11 decode and 8/8 MOVEM lock-step tests pass. `test-fast` remains
-at its 133/134 baseline with only `PredecodeRefSpec` failing. Confirmation that
-both DSPs disappear and the endpoint improves awaits the shared Vivado window.
+registers; 11/11 decode and 8/8 MOVEM lock-step tests pass. The phase-local
+`test-fast` result was 133/134 with only the stale `PredecodeRefSpec` line-B
+expectation; the combined branch passes 138/138 after the reference corrections.
+Confirmation that both DSPs disappear and the endpoint improves awaits the
+shared Vivado window.
 
 ### 4.3 FPU draft
 
@@ -203,8 +205,9 @@ Current gate evidence for the LSU change:
 - D-cache focused suite: 49/49;
 - focused LS suites: 24/24;
 - RTE regression: 1/1;
-- `test-fast`: 133/134, with only the independently reproduced
-  `PredecodeRefSpec` EOR Dn,Dm mismatch; and
+- phase-local `test-fast`: 133/134 with only the independently reproduced stale
+  line-B oracle; combined-branch `test-fast`: 138/138 after the line-B and
+  subsequently exposed line-0 oracle corrections; and
 - seed-1 IPC: `load-stream` 638 cycles ideal and 769 L2-faithful, versus C3
   1829/2030. Excluding `load-stream`, aggregate cycles improve slightly rather
   than regress.

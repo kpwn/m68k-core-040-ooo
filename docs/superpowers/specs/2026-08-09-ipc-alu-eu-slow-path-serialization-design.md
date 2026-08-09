@@ -570,9 +570,11 @@ latency-window-only:
   distinctions and an exhaustive 65,536-opword operand-routing sweep;
 - focused Musashi shift/rotate dependency checks: 3/3, and the historical
   `bfins_mem_dyn_both` wakeup-contract regression: 1/1;
-- `make SBT=~/sbt/bin/sbt test-fast`: 133/134. The sole failure is the
-  independently reproduced pre-existing `PredecodeRefSpec` EOR Dn,Dm mismatch;
-  no new ALU/IQ/decode test fails; and
+- phase-local `make SBT=~/sbt/bin/sbt test-fast`: 133/134. The sole failure was
+  the independently reproduced stale `PredecodeRefSpec` EOR/CMPM expectation;
+  no new ALU/IQ/decode test failed. After the adjacent line-B and line-0 oracle
+  corrections were integrated, the combined branch gate passed 138/138 at
+  `5d54ad9`; and
 - full ten-kernel `IpcBenchSpec`, seed 1: 4,657 macros / 7,685 cycles
   (0.606 aggregate IPC) with ideal memory and 4,658 / 11,212 (0.415) with the
   5/70-cycle hierarchy. Both runs pass, `independent-ALU` remains exactly 2.000
