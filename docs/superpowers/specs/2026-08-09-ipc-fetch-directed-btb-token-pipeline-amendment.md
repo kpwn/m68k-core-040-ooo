@@ -1,7 +1,8 @@
 # Fetch-directed FTB registered-token pipeline — binding amendment
 
-Date: 2026-08-09. Status: **DESIGN REPAIRED; RTL GATED ON THE CURRENT
-FLOORPLANNED TIMING CHECKPOINT (250-MHz GOAL, 200-MHz HARD FLOOR).**
+Date: 2026-08-09. Status: **REGISTERED-TOKEN RTL IMPLEMENTED AND SIMULATION
+GATED; COMPLETE CORPUS AND FLOORPLANNED PHYSICAL ACCEPTANCE PENDING (250-MHz
+GOAL, 200-MHz HARD FLOOR).**
 
 This document is the binding correction to
 `2026-08-09-ipc-fetch-directed-btb-design.md`. It supersedes that document's

@@ -1,6 +1,7 @@
 # Registered-token fetch-directed FTB implementation plan
 
-Status: **P0 CHARACTERIZED; OWNER-AUTHORIZED BOUNDED EXECUTION.** This plan replaces the blocked
+Status: **P1-P5 IMPLEMENTED; P6 SIMULATION/IPC GREEN; COMPLETE CORPUS AND
+PHYSICAL GATES PENDING.** This plan replaces the blocked
 `2026-08-09-ipc-fetch-directed-btb-implementation-plan.md` and implements the
 binding token-pipeline amendment. P0 measured 173.430 MHz, below the 200-MHz
 hard floor, and recorded its gap to the standing 250-MHz optimization goal. The

@@ -5,9 +5,10 @@ throughput audit correctly blocked the original registered-result freshness,
 slot-1 deletion, and speculative-trace differential. Those P0 findings are now
 resolved by `2026-08-09-ipc-fetch-directed-btb-token-pipeline-amendment.md` and
 its replacement implementation plan. The amendment is normative wherever the
-documents differ. RTL remains gated on the current branch's floorplanned
-timing checkpoint (250-MHz goal, 200-MHz hard floor); do not execute the older
-implementation plan.
+documents differ. The repaired registered-token implementation is live; its
+simulation/IPC gates are recorded in the amendment and IPC ledger, while its
+floorplanned timing/area acceptance remains pending (250-MHz goal, 200-MHz hard
+floor). Do not execute the older implementation plan.
 
 Historical status before that review: **DESIGN ONLY.** No RTL was written, no RTL
 was modified, and no Vivado run was launched by the design pass.
