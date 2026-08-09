@@ -925,7 +925,8 @@ object PredecodeWord {
                       (opmode === U(2, 3 bits)) || (opmode === U(3, 3 bits)) ||
                       (opmode === U(7, 3 bits))
         // EOR (opmode 4/5/6): EA is the DESTINATION (read+written). Register (data-reg,
-        // mode0) dest -> simple len1; An-direct (CMPM) and memory-dest (RMW) -> COMPLEX.
+        // mode0) dest -> simple len1; An-direct mode1 is CMPM; supported alterable-memory
+        // destinations are the load-op-store RMW form and are framed below with their EA ext.
         val isEor   = (opmode === U(4, 3 bits)) || (opmode === U(5, 3 bits)) ||
                       (opmode === U(6, 3 bits))
         // CMPM (Ay)+,(Ax)+ : same opmode band as EOR, but An-direct (srcMode 1) — the

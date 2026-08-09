@@ -37,8 +37,18 @@ The STORE µop's `useImm/imm` fields are already dedicated to the dest EA's ADDR
 
 ## 2. CMPM
 
+### Line-B partition invariant
+
+For opmodes 4/5/6, the EA-mode field is also the family discriminator: mode `000`
+is register-destination `EOR Dn,Dm`, mode `001` is the fixed one-word
+`CMPM (Ay)+,(Ax)+` encoding, and supported alterable-memory modes are
+`EOR Dn,<ea>` read-modify-write. In particular, an apparent `EOR Dn,An` spelling
+is not an illegal address-register EOR; its opword is CMPM and must predecode as
+simple with `lenWords=1`. Exhaustive regression coverage must keep all three
+families disjoint through predecode and operation decode.
+
 ### Encoding (confirmed via gas objdump + Musashi)
-`1011 xxx1 ss001 yyy` (line B, `Ax=op[11:9]`, `op[8]=1`, `size=op[7:6]`, `op[5:3]=001` — the same opmode band as EOR, disjoint only by `mode===1`), `Ay=op[2:0]`. Single opword, NO extension words. Already cleanly excluded from EOR (`OperationDecoder.scala:602-607`, the `opword(5 downto 3) =/= 1` guard) and from EOR's memDestExt framing (`PredecodeWord.scala`, `memDestExt` has no mode-1 case) — currently falls through to the COMPLEX/illegal path (vector 4). Not aliased to any other op.
+`1011 xxx1 ss001 yyy` (line B, `Ax=op[11:9]`, `op[8]=1`, `size=op[7:6]`, `op[5:3]=001` — the same opmode band as EOR, disjoint only by `mode===1`), `Ay=op[2:0]`. Single opword, NO extension words. The implemented decoder excludes it from EOR with the mode-1 guard and routes it to `CMPM_ENTRY`; predecode has an explicit CMPM `simple/lenWords=1` arm before memory-destination EOR framing. It is not aliased to any other operation.
 
 ### Semantics (Musashi verbatim, `m68k_in.c:4209-4245`)
 `src = read(Ay)+; Ay+=size` (read+postinc FIRST); `dst = read(Ax)+; Ax+=size` (SECOND); `res = dst - src`; set N/Z/V/C from res; **X untouched, no register/memory write** (flags-only, like register CMP).

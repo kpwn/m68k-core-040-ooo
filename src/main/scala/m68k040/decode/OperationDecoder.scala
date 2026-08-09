@@ -747,8 +747,9 @@ object OperationDecoder {
         val isRmw  = (opmode === 4 || opmode === 5 || opmode === 6)
         // EOR (line B, opmode 4/5/6 = .B/.W/.L): `Dn ^ <ea> -> <ea>`. The EA is the
         // DESTINATION operand (read AND written), Dn (bits 11:9) the source. Register
-        // destination only this slice (memory-dest RMW deferred -> the assembler gates
-        // a non-reg EA to illegal). An-direct (mode 1) is CMPM, NOT EOR -> excluded.
+        // destination mode0 is the direct register form; supported alterable-memory
+        // destinations are cracked into load-op-store by the assembler. An-direct
+        // (mode 1) is CMPM, NOT EOR -> excluded.
         // Flags: NZ, V=C=0 (no X). srcA=EA (dst operand), srcB=Dn, dst=EA.
         val isEor = (line === 0xB) && isRmw && (opword(5 downto 3) =/= 1)
         // CMPM (Ay)+,(Ax)+ (line B, opmode 4/5/6, `opword(5 downto 3)===1` — the An-direct

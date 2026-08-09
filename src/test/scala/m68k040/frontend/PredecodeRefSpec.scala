@@ -27,11 +27,15 @@ class PredecodeRefSpec extends AnyFunSuite {
   test("ADDA.L A1,A0 opmode111 -> simple len1") { assert(classify(0xD1C9) == cp(true,1)) }
   test("CMP.W (d16,A0),D0 -> simple len2") { assert(classify(0xB068) == cp(true,2)) }
   test("EOR.W D0,(A0) mem-dest (opmode5) -> simple len1 (RMW)") { assert(classify(0xB150) == cp(true,1)) }
-  test("EOR Dn,Dm register dest (opmode 4/5/6, mode0) -> simple len1") {
+  test("line-B register EOR and CMPM are distinct single-word instructions") {
     assert(classify(0xB382) == cp(true,1))   // EOR.L D1,D2
     assert(classify(0xB302) == cp(true,1))   // EOR.B D1,D2
     assert(classify(0xB342) == cp(true,1))   // EOR.W D1,D2
-    assert(classify(0xB389) == cp(false,0))  // EOR.L D1,A1 (An-direct = CMPM) -> complex
+    // Mode 001 is not an address-register EOR destination. In the line-B opmode-4/5/6
+    // band it is the legal, fixed one-word CMPM encoding: 0xB389 = CMPM.L (A1)+,(A1)+.
+    // This assertion intentionally guards the stale expectation that used to make the
+    // mandatory gate report an "EOR Dn,Dm" mismatch even though the failing word was CMPM.
+    assert(classify(0xB389) == cp(true,1))
   }
   // Brief-format indexed (d8,An,Xn)/(d8,PC,Xn) are now IN SCOPE -> simple, +1 ext word
   // (was deferred/complex). Predecode frames the brief case (1 ext word); the assembler
