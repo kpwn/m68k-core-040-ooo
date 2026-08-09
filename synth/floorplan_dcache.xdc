@@ -12,28 +12,28 @@
 # took decode->ring off the critical path, 195->~218).
 #
 # Read AFTER opt_design (see impl_FullCore.tcl) so the cell filter sees elaborated leaves.
-# Region (the measured sweet spot): same X span as pb_decode (X36..X75) but STACKED ABOVE it
-# (Y110..Y214, ~2 clock-region rows) so it does NOT collide with pb_decode's
-# SLICE_X36Y0:SLICE_X75Y104. Loose (~40 cols x ~105 rows), not snug -- the precedent showed a
-# too-tight box over-constrains the router and REGRESSES.
+# The original measured sweet spot used the same X span as pb_decode (X36..X75), stacked
+# above it at Y110..Y214. Netlist growth subsequently required right-only expansion first
+# to X81 (46 columns) and then X87 (52 columns); the current region is therefore
+# X36Y110:X87Y214. Keeping X36 fixed preserves decode/LS co-location and avoids the
+# measured regression from widening both sides.
 #
 # ITERATIONS (full-core post-route, OOC 4 ns; master baseline -0.514 / 221.5 MHz):
-#   v1  X36Y110:X75Y214 (this box)   WNS -0.317 / 231.6 MHz   <-- BEST (+10.1 MHz)
+#   v1  X36Y110:X75Y214 (original)   WNS -0.317 / 231.6 MHz   <-- BEST (+10.1 MHz)
 #   v2  X28Y110:X83Y214 (wider)      WNS -0.439 / 225.3 MHz   (looser -> less co-location)
 #   v3  X36Y70:X75Y174  (shift down) WNS -0.477 / 223.4 MHz   (collides w/ datapath/decode)
-# v1's X36..X75 width (same as decode) is the sweet spot; wider AND shifted-down both regress.
+# v1's X36..X75 width was the sweet spot for that netlist; later growth made it too tight.
 #
 # NOTE (capture): `*Plugin_logic*` UNDER-captures post-flatten (Vivado merges leaf names);
 # verify the printed pb_dcache cell count is non-trivial -- here the OR-filter over all three
 # plugins captures 7313 cells (robust, vs the decode pblock's 1284). The three plugins
 # contribute ~944 (Dcache) + 81 (Dtlb) + 352 (LsEu) unique signal names pre-synth.
 create_pblock pb_dcache
-# LOOSENED (2026-06-13) for the line-4 cell growth: LEA grew LsEuPlugin -> the pblock now
-# holds ~8467 cells (was 7313), congesting v1's 40-col box (post-route 231.6 -> 208.8). The
-# v1/v2 lesson: keep the LEFT edge co-located with pb_decode (X36) — widening BOTH sides (v2
-# X28-83) lost co-location. So widen ONLY right to X81 (46 cols), restoring ~v1 density
-# (8467/(46*105) ~ 7313/(40*105)) without spreading. Y span unchanged (avoids guessing the
-# device's top SLICE row).
+# LOOSENED twice on 2026-06-13. Line-4/LEA growth first required 40->46 columns
+# (X36..X81; 231.6->208.8->211.2 MHz). STOP/RESET growth then raised the captured
+# population from ~8467 to ~8606 cells and made 46 columns route at only 191.7 MHz;
+# widening right again to X87 (52 columns) recovered 211.7 MHz. Do not shrink back to
+# the stale X81 geometry without a paired floorplanned route.
 resize_pblock pb_dcache -add {SLICE_X36Y110:SLICE_X87Y214}
 add_cells_to_pblock pb_dcache [get_cells -hier -filter {NAME =~ *DcachePlugin_logic* || NAME =~ *DtlbPlugin_logic* || NAME =~ *LsEuPlugin_logic*}]
 # (cell-count diagnostic is printed from impl_FullCore.tcl in TCL context — `puts` is not
