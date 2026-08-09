@@ -107,9 +107,13 @@ class RteSpec extends AnyFunSuite {
 
   test("RTE pops format-$0 frame: restore SR + PC, SSP+=8, redirect; S->0 re-banks A7 to USP") {
     M68kSim().withVerilator.compile(new Dut).doSim { dut =>
-      val cd = dut.clockDomain; cd.forkStimulus(10)
-      init(dut, cd)
+      val cd = dut.clockDomain
+      // The AXI responder must own R/B inputs before reset-release clocks. Attaching
+      // it after init leaves them undefined for three samples, which can fabricate a
+      // store acknowledgement despite RTE having accepted no store descriptor.
       val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      cd.forkStimulus(10)
+      init(dut, cd)
 
       // SSP points at a preloaded format-$0 frame. The frame's SR has S=0 (return
       // to USER mode) so RTE must re-bank A7 to USP.

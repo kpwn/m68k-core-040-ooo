@@ -116,9 +116,12 @@ class InterruptEntrySpec extends AnyFunSuite {
   def runEntry(name: String, level: Int, avec: Boolean, vectorIn: Int, mask: Int,
                expVec: Int): Unit = {
     M68kSim().withVerilator.compile(new Dut).doSim { dut =>
-      val cd = dut.clockDomain; cd.forkStimulus(10)
-      init(dut, cd)
+      val cd = dut.clockDomain
+      // Attach before the first clock edge so AXI R/B cannot power up as a fake
+      // response and satisfy the cache's untagged exception-store acknowledgement.
       val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      cd.forkStimulus(10)
+      init(dut, cd)
 
       val ssp0 = 0x00100000L
       val vbr  = 0L

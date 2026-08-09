@@ -13,10 +13,10 @@ import spinal.lib.misc.plugin.FiberPlugin
   *  - `iackAvec`   RegInit 0 : True => autovector (24 + level) for the active level.
   *  - `iackVector` RegInit 0 : the vectored vector (8b) used when `!iackAvec`.
   *
-  * All three are RegInit so a standalone DUT (no external driver) elaborates with
-  * no UNASSIGNED REGISTER; sim pokes / the FullCoreSynth registered top inputs
-  * override them. RegInit 0 (ipl=0 idle) keeps every existing test unchanged — no
-  * interrupt is ever recognized unless something raises iplIn. */
+  * All three are RegInit and explicitly allow the unset-next-state shape: standalone
+  * tests poke them directly while FullCoreSynth supplies their registered top-level
+  * drivers. RegInit 0 (ipl=0 idle) keeps every existing test unchanged — no interrupt
+  * is ever recognized unless something raises iplIn. */
 class InterruptControlPlugin extends FiberPlugin with InterruptControlService {
   var _iplIn:      UInt = null
   var _iackAvec:   Bool = null
@@ -27,9 +27,9 @@ class InterruptControlPlugin extends FiberPlugin with InterruptControlService {
   override def iackVector: UInt = _iackVector
 
   val logic = during build new Area {
-    val iplIn      = RegInit(U(0, 3 bits)); iplIn.simPublic()
-    val iackAvec   = RegInit(False);        iackAvec.simPublic()
-    val iackVector = RegInit(U(0, 8 bits)); iackVector.simPublic()
+    val iplIn      = RegInit(U(0, 3 bits)); iplIn.allowUnsetRegToAvoidLatch(); iplIn.simPublic()
+    val iackAvec   = RegInit(False);        iackAvec.allowUnsetRegToAvoidLatch(); iackAvec.simPublic()
+    val iackVector = RegInit(U(0, 8 bits)); iackVector.allowUnsetRegToAvoidLatch(); iackVector.simPublic()
     _iplIn      = iplIn
     _iackAvec   = iackAvec
     _iackVector = iackVector
