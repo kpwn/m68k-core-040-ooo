@@ -605,13 +605,16 @@ and closed by Layer 2.
 - **Pipelined hit-drain (the store-throughput lever; binding P6 amendment,
   2026-08-09).** The SQ→D-cache boundary is a real `Stream[DStoreCmd]`:
   `valid` and the complete payload remain stable until `fire`, and only `fire`
-  consumes presentation credit. The existing D-cache S0/S1/S2 payload flops are
-  an elastic in-order descriptor pipe. S0 turns over only when S1 can accept;
-  S1 turns over only when its synchronous array read actually launches; a load
-  or maintenance-port conflict holds the descriptor without overwriting it.
-  On a resident COPYBACK stream, S2 merges one command per cycle and its local
-  acknowledgement is the following registered cycle, so accepts and acks are
-  both sustained at II=1 after fill.
+  consumes presentation credit. D-cache S0/S1/S2 plus a new registered S3 are an
+  elastic in-order descriptor pipe. S0 turns over only when S1 can accept; S1
+  turns over only when its synchronous array read actually launches; a load or
+  maintenance-port conflict holds the descriptor without overwriting it. S2
+  terminates the BRAM tag compare and captures `{hit,way,oldLine,descriptor}`.
+  S3 performs the byte merge, array write, dirty update, and local completion.
+  This extra cycle is deliberate: the measured tag-BRAM-to-dirty/write cone is
+  not extended by the throughput machinery. On a resident COPYBACK stream S3
+  resolves one command per cycle, so accepts and acknowledgements are both
+  sustained at II=1 after fill.
 
   The SQ separates `sendPtr/sendPhaseB` from the architectural
   `head/ackPhaseB`. An accepted-half counter records commands which have fired
@@ -632,12 +635,14 @@ and closed by Layer 2.
   walker/refill and AXI write-pair registers are never overwritten and the
   untagged ack stream cannot reorder.
 
-  Back-to-back same-line hits use one registered S2→S2 `{way,line}` bypass.
-  The younger descriptor still uses the synchronous tag read, but its byte merge
-  selects the immediately older merged line instead of relying on FPGA BRAM
+  Back-to-back same-line hits use the current S3 final line as the S2 capture
+  base. The younger descriptor still uses the synchronous tag read, but S2
+  captures the immediately older merged line instead of relying on FPGA BRAM
   read-during-write behavior. This preserves II=1 for stack/MOVEM/memset-style
-  same-line bursts at the cost of one 128-bit data register, a way id, and a
-  byte-mux input; no second tag/data RAM or store CAM is introduced.
+  same-line bursts using the already-registered S3 descriptor; no second tag/data
+  RAM or store CAM is introduced. The same forwarding (or a one-cycle hold) is
+  required when a simultaneous load/store miss snapshots the same set and victim
+  way, so dirty eviction can never capture the pre-store line.
 
   Flush never rewinds accepted work: only unsent speculative entries are
   removed. Already accepted entries are committed (or the one non-speculative
@@ -645,7 +650,11 @@ and closed by Layer 2.
   Maintenance waits for the Stream input, every store stage, accepted count,
   miss/serial barriers, and AXI pairs to quiesce. If a refill R beat is waiting,
   new drain admission stops so the shallow pipe empties and the refill cannot be
-  starved by an infinite store stream. These rules convert copyback-hit bursts
+  starved by an infinite store stream. A registered one-bit owed flag gives a
+  waiting store S1 a read slot after at most one competing fresh load/probe; replay,
+  refill, and maintenance retain absolute priority. Thus pure-load and pure-store
+  streams remain II=1 while mixed traffic makes bounded progress. These rules
+  convert copyback-hit bursts
   from B-latency-bound to cache-bandwidth-bound without adding a D-cache write
   port, AXI issuer, MSHR, response tag, or PRF/ROB port.
 

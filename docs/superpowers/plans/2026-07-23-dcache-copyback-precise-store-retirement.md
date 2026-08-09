@@ -3626,8 +3626,9 @@ No commit for this task (read-only verification / synth-only; nothing staged).
 > hold a conflicted S1 payload, learns a miss barrier after younger commands have
 > nowhere safe to wait, conflates send and ack split phases, and incorrectly rewinds
 > accepted committed work on flush. The binding implementation is now the exact
-> `Stream`, elastic S0/S1/S2, separate send/ack phase, accepted-half count,
-> same-cycle miss barrier, and S2 same-line bypass contract in
+> `Stream`, elastic S0/S1/S2/S3, separate send/ack phase, accepted-half count,
+> same-cycle miss barrier, registered S2-result/S3-write cut, and S3-final-line
+> bypass contract in
 > `2026-07-23-dcache-copyback-store-retirement-design.md` §4.3. Use that contract
 > for Tasks P6.1/P6.2 and keep the verification/physical gates below.
 
