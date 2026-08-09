@@ -105,7 +105,7 @@ class TableWalker extends Component {
       when(!arSent) {
         io.axi.ar.valid        := True
         io.axi.ar.payload.addr := (descAddr(31 downto 4) ## U(0, 4 bits)).asUInt
-        io.axi.ar.payload.id   := U(2, 4 bits)
+        io.axi.ar.payload.id   := U(m68k040.cache.AxiIds.WALK_READ, m68k040.cache.AxiIds.ID_W bits)
         io.axi.ar.payload.len  := U(0, 8 bits)
         io.axi.ar.payload.size := U(4, 3 bits)   // 16 bytes
         io.axi.ar.payload.burst := Axi4.burst.INCR

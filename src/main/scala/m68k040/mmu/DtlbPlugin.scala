@@ -340,7 +340,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     when(!drainAwDone) {
       walkerAxi.aw.valid        := True
       walkerAxi.aw.payload.addr := drainAddrReg
-      walkerAxi.aw.payload.id   := U(3, 4 bits)
+      walkerAxi.aw.payload.id   := U(m68k040.cache.AxiIds.WALK_WRITE, m68k040.cache.AxiIds.ID_W bits)
       walkerAxi.aw.payload.len  := U(0, 8 bits)
       walkerAxi.aw.payload.size := U(4, 3 bits)
       walkerAxi.aw.payload.burst := spinal.lib.bus.amba4.axi.Axi4.burst.INCR

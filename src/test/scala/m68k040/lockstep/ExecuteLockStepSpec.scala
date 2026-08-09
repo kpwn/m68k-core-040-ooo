@@ -394,6 +394,26 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       rfInt, rfNzvc, rfX, wire)) }
   }
 
+  /** Words of `BRA.S -2` written past every I-side program image. 2048 words = 4 KiB,
+    * the size validated by the sentinel-confirmation experiment. Sized generously
+    * because the guard only has to outlast the run-ahead distance the front end can
+    * reach inside a test's drain window, and unwritten `SparseMemory` bytes are the
+    * thing being displaced — there is no cost to over-covering. */
+  val RUNAHEAD_GUARD_WORDS = 2048
+  /** `BRA.S -2` — an unconditional branch to itself. See `attachProgram`'s comment for
+    * why this specific opword and not an ILLEGAL trap. */
+  val RUNAHEAD_GUARD_OPWORD = 0x60fe
+
+  /** Fill `RUNAHEAD_GUARD_WORDS` of self-branch past `endAddr`, in the same
+    * low-byte-first convention the I-cache window expects. */
+  def fillRunAheadGuard(mem: SparseMemory, endAddr: Long): Unit = {
+    val w = RUNAHEAD_GUARD_OPWORD
+    for (i <- 0 until RUNAHEAD_GUARD_WORDS) {
+      mem.write(endAddr + 2L * i,     (w & 0xff).toByte)
+      mem.write(endAddr + 2L * i + 1, ((w >> 8) & 0xff).toByte)
+    }
+  }
+
   /** Attach a behavioral AXI read-only memory backed by the assembled program.
     *
     * The assembled `image.bytes` are the m68k big-endian byte stream: instruction
@@ -404,8 +424,42 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     * address) and hands that to the aligner/decoder as the instruction opcode. So
     * to present opcode w to the decoder we must store the bytes byte-SWAPPED
     * relative to the big-endian image: low byte first. This matches the proven
-    * `IcacheSim.attachMemoryWithWords` convention. Bytes outside the image read as
-    * 0 (decode into harmless garbage; never reached in the compared prefix). */
+    * `IcacheSim.attachMemoryWithWords` convention.
+    *
+    * HARNESS HARDENING (2026-08-09, see `.superpowers/sdd/task-a3-sentinel-confirmation-report.md`):
+    * the doc-comment used to claim "bytes outside the image read as 0 (decode into
+    * harmless garbage; never reached in the compared prefix)". BOTH halves of that
+    * were wrong, and it cost two full investigations to find out:
+    *
+    *  - `SparseMemory` does NOT return 0 for an unwritten byte; it returns
+    *    PRNG-seeded fill, drawn from the SAME shared `simRandom` stream every other
+    *    part of the sim consumes. So the bytes past the program are pseudo-random
+    *    OPCODES whose value depends on the sim's PRNG STREAM POSITION.
+    *  - They ARE reached. The core runs ahead of the compared prefix: it keeps
+    *    fetching past the last program word, decodes that garbage, and speculatively
+    *    EXECUTES it. Architectural registers set up by the real program are still
+    *    live, so a garbage `move.x Dn,(An)` lands a real store on the very address
+    *    the test is about to `checkMem`. The comparison then fails for reasons that
+    *    have nothing to do with the DUT.
+    *
+    * Because the corruption is keyed to PRNG stream POSITION, any change that shifts
+    * I-side timing (a different memory model, an extra refill cycle, a prefetch)
+    * re-rolls which tests are hit — which is exactly how this was once mis-diagnosed
+    * as "a genuine timing-sensitive RTL race in the multi-access/RMW store path"
+    * (V1.6b's deferral rationale). It is not a race; it is an unguarded harness.
+    *
+    * FIX: fill a 4 KiB guard past the image with `0x60FE` = `BRA.S -2`, an
+    * unconditional branch to itself. Run-ahead fetch lands in a tight, side-effect-
+    * free loop: no store, no register write, no exception. It must NOT be an ILLEGAL
+    * opcode (`0x4AFC`) — that was tried and measurably under-delivers, because the
+    * trap itself reads `mem[VBR + vector*4]` from an unpopulated vector table and
+    * jumps to a wild PC, re-entering the same problem by a different door. Every byte
+    * alignment inside the guard still decodes to the same self-branch, so there is no
+    * sub-word framing with a different effect.
+    *
+    * Confirmed decisive: 4 independent full-suite runs + 3 targeted repro loops with
+    * ZERO occurrences of the previously-recurring extra-failure family (BF*-mem,
+    * CAS/CAS2, ABCD/SBCD-mem, MOVES, cross-line MOVE.L). */
   def attachProgram(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long, bytes: Vector[Int]): Axi4ReadOnlySlaveAgent = {
     val mem = SparseMemory()
     // Reassemble 16-bit big-endian words from the image, then store low-byte-first.
@@ -415,6 +469,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       mem.write(loadAddr + 2 * i,     (w & 0xff).toByte)
       mem.write(loadAddr + 2 * i + 1, ((w >> 8) & 0xff).toByte)
     }
+    fillRunAheadGuard(mem, loadAddr + 2L * nWords)
     new Axi4ReadOnlySlaveAgent(axi, cd) {
       override def readByte(address: BigInt, id: Int): Byte = mem.read(address.toLong)
     }
@@ -5324,6 +5379,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       mem.write(base + 2 * i,     (w & 0xff).toByte)
       mem.write(base + 2 * i + 1, ((w >> 8) & 0xff).toByte)
     }
+    // Same run-ahead guard as `attachProgram` — see its comment. The ITLB lock-step
+    // tests build their `icmem` through this helper instead, so without it they keep
+    // the un-guarded PRNG-fill behaviour.
+    fillRunAheadGuard(mem, base + 2L * nWords)
   }
   /** Wire the full whitebox commit capture (incl. the exception commit channel) used
     * by the ITLB lock-step tests. */
