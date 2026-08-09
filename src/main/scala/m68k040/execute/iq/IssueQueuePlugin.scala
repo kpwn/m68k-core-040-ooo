@@ -752,13 +752,22 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     }
 
     // ---- CPLX (DivEu) dynamic wakeup: clear cplxWait for slots reading the woken
-    // pdst (identical discipline to lsWakeMatch). ----
+    // pdst (identical discipline to lsWakeMatch). A slot may read multiple in-flight
+    // CPLX results, while cplxWait is deliberately a single registered bit to keep the
+    // cplxBusy bitmap out of the ready/select cone. Re-evaluate all sources after the
+    // matching wakeup and clear only after the last CPLX dependency has completed.
+    // `stillCplxBusy` already excludes the current wake, making this safe both for
+    // separated completions and a wake concurrent with a consumer push. ----
+    def cplxRemaining(u: RenamedUop): Bool =
+      (u.psrcAValid && stillCplxBusy(u.psrcA)) || (srcBIsReg(u) && stillCplxBusy(u.psrcB)) ||
+      (u.psrcCValid && stillCplxBusy(u.psrcC))
     val cplxWakeMatch = Vec(slots.map { s =>
       val u = s.context.uop
       cplxWakeupPort.valid && s.sel &&
         ((u.psrcAValid && (u.psrcA === cplxWakeupPort.payload)) ||
          (srcBIsReg(u) && (u.psrcB === cplxWakeupPort.payload)) ||
-         (u.psrcCValid && (u.psrcC === cplxWakeupPort.payload)))
+         (u.psrcCValid && (u.psrcC === cplxWakeupPort.payload))) &&
+        !cplxRemaining(u)
     })
     for (i <- 0 until slotCount) {
       when(cplxWakeMatch(i)) {
