@@ -59,11 +59,19 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     loadProbePort.valid.allowOverride; loadProbePort.valid := False
     loadProbePort.payload.vaddr.allowOverride; loadProbePort.payload.vaddr := U(0, 32 bits)
     loadProbePort.payload.token.allowOverride; loadProbePort.payload.token := U(0, DLoadToken.Width bits)
+    loadProbePort.payload.resolved.allowOverride; loadProbePort.payload.resolved := False
+    loadProbePort.payload.paddr.allowOverride; loadProbePort.payload.paddr := U(0, 32 bits)
+    loadProbePort.payload.size.allowOverride; loadProbePort.payload.size := Size.LONG
+    loadProbePort.payload.cacheMode.allowOverride
+    loadProbePort.payload.cacheMode := CacheMode.INHIBITED
+    loadProbePort.payload.needsLine.allowOverride; loadProbePort.payload.needsLine := False
     loadProbePort.valid.simPublic(); loadProbePort.ready.simPublic(); loadProbePort.payload.simPublic()
     val loadProbeCancelPort = Flow(DLoadProbeCancel())
     loadProbeCancelPort.valid.allowOverride; loadProbeCancelPort.valid := False
     loadProbeCancelPort.payload.token.allowOverride
     loadProbeCancelPort.payload.token := U(0, DLoadToken.Width bits)
+    loadProbeCancelPort.payload.all.allowOverride
+    loadProbeCancelPort.payload.all := False
     val loadCmdPort = Stream(DLoadCmd())
     loadCmdPort.valid.simPublic(); loadCmdPort.ready.simPublic(); loadCmdPort.payload.simPublic()
     val loadRspPort = Flow(DLoadRsp())
@@ -116,20 +124,51 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val rdData = Vec(dataMem.map(_.readSync(rdSet, rdEn)))
     val rdTag  = Vec(tagMem.map(_.readSync(rdSet, rdEn)))
 
-    // ---- early VIPT probe ownership ----
-    // A probe launches the virtual-set RAM read in parallel with the DTLB lookup.
-    // To avoid ~600 bits of tag+line holding flops, the synchronous RAM outputs
-    // themselves are retained while no later read reuses the port. `fresh` is
-    // invalidated by any intervening read; a matching resolved command then simply
-    // falls back to the ordinary read launch. Thus store/maintenance traffic is
-    // never blocked just to preserve an optimization, and correctness never relies
-    // on a stale BRAM output. One metadata slot matches the current in-order LS
-    // front; widening this is a later tagged-probe-queue slice.
-    val earlyProbeValid = RegInit(False)
-    val earlyProbeFresh = RegInit(False)
-    val earlyProbeVaddr = Reg(UInt(32 bits))
-    val earlyProbeToken = Reg(UInt(DLoadToken.Width bits))
+    // ---- tokenized early VIPT result queue ----
+    // A probe reserves one small entry and launches the virtual-set BRAM read in
+    // parallel with the DTLB lookup. One shared two-stage result pipe registers the
+    // selected 128-bit way, then stores only the extracted 32-bit value in the
+    // reserved entry. This supports a probe every cycle without replicating a full
+    // cache line per outstanding load. Four entries cover D1's fixed P2->command
+    // distance; if they fill, probe.ready drops but the resolved load path remains
+    // correct and simply uses the ordinary S1 read.
+    val earlyProbeDepth = 4
+    val earlyProbePtrW  = log2Up(earlyProbeDepth)
+    val earlyProbeValids  = Vec.fill(earlyProbeDepth)(RegInit(False))
+    val earlyProbeReadies = Vec.fill(earlyProbeDepth)(RegInit(False))
+    val earlyProbeHits    = Vec.fill(earlyProbeDepth)(RegInit(False))
+    val earlyProbeTokens  = Vec.fill(earlyProbeDepth)(Reg(UInt(DLoadToken.Width bits)))
+    val earlyProbeVaddrs  = Vec.fill(earlyProbeDepth)(Reg(UInt(32 bits)))
+    val earlyProbeData    = Vec.fill(earlyProbeDepth)(Reg(Bits(32 bits)))
+
+    // Read metadata: valid in the cycle the synchronous BRAM output belongs to the
+    // probe. Line metadata: one extra register cut keeps BRAM->way-select separate
+    // from byte extraction and the small result array write.
+    val probeReadValid = RegInit(False)
+    val probeReadSlot  = Reg(UInt(earlyProbePtrW bits))
+    val probeReadSet   = Reg(UInt(setBits bits))
+    val probeReadTag   = Reg(UInt(tagBits bits))
+    val probeReadOff   = Reg(UInt(offBits bits))
+    val probeReadSize  = Reg(Size())
+    val probeReadUsable = RegInit(False)
+    val probeLineValid = RegInit(False)
+    val probeLineSlot  = Reg(UInt(earlyProbePtrW bits))
+    val probeLineHit   = RegInit(False)
+    val probeLineLine  = Reg(Bits(128 bits))
+    val probeLineOff   = Reg(UInt(offBits bits))
+    val probeLineSize  = Reg(Size())
+
+    val earlyProbeValid = earlyProbeValids.asBits.orR
+    val earlyProbeFresh = (earlyProbeValids.asBits & earlyProbeReadies.asBits).orR
     earlyProbeValid.simPublic(); earlyProbeFresh.simPublic()
+    for (i <- 0 until earlyProbeDepth) {
+      earlyProbeValids(i).simPublic(); earlyProbeReadies(i).simPublic()
+      earlyProbeHits(i).simPublic(); earlyProbeTokens(i).simPublic()
+      earlyProbeVaddrs(i).simPublic()
+    }
+    probeReadValid.simPublic(); probeReadSlot.simPublic(); probeReadSet.simPublic()
+    probeReadTag.simPublic(); probeReadUsable.simPublic()
+    probeLineValid.simPublic(); probeLineSlot.simPublic(); probeLineHit.simPublic()
 
     // ---- miss-state latches ----
     val missPaddr = Reg(UInt(32 bits))   // physical addr of the missing line (AXI refill base)
@@ -313,22 +352,60 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     ldS1Size.simPublic(); ldS1Hit.simPublic(); ldS1HitWay.simPublic()
     val ldS1Line    = rdData(ldS1HitWay)
 
-    // Fast consume of a still-fresh early virtual-set read. The physical tag and
-    // cacheability arrive only on the resolved command; all compare inputs terminate
-    // at the existing S2 registers. If a prior S1 token exists, use the normal S1
-    // path instead so this shortcut can never overwrite that older S2 transfer.
-    val earlyProbeOwnsCmd = earlyProbeValid &&
-                            (earlyProbeToken === loadCmdPort.payload.token) &&
-                            (earlyProbeVaddr === cmdVaddr)
-    val earlyProbeHitVec = Vec(Bool(), ways)
+    // Finish the previous cycle's virtual-set read against the PA hint captured
+    // from the matching DTLB response. The selected line gets one shared register
+    // cut; extraction into the reserved 32-bit result entry happens a cycle later.
+    val probeReadHitVec = Vec(Bool(), ways)
     for (w <- 0 until ways)
-      earlyProbeHitVec(w) := (loadCmdPort.payload.cacheMode =/= CacheMode.INHIBITED) &&
-                             valids(w)(cmdSet) && (rdTag(w) === cmdTag)
-    val earlyProbeHit    = earlyProbeHitVec.orR
-    val earlyProbeHitWay = OHToUInt(earlyProbeHitVec)
-    val earlyProbeLine   = rdData(earlyProbeHitWay)
-    val useEarlyProbe    = earlyProbeOwnsCmd && earlyProbeFresh && !ldS1Valid
-    useEarlyProbe.simPublic()
+      probeReadHitVec(w) := probeReadUsable && valids(w)(probeReadSet) &&
+                            (rdTag(w) === probeReadTag)
+    val probeReadHitWay = OHToUInt(probeReadHitVec)
+    probeReadValid := False
+    probeLineValid := probeReadValid
+    when(probeReadValid) {
+      probeLineSlot := probeReadSlot
+      probeLineHit  := probeReadHitVec.asBits.orR
+      probeLineLine := rdData(probeReadHitWay)
+      probeLineOff  := probeReadOff
+      probeLineSize := probeReadSize
+    }
+    when(probeLineValid && earlyProbeValids(probeLineSlot)) {
+      earlyProbeReadies(probeLineSlot) := True
+      earlyProbeHits(probeLineSlot)    := probeLineHit
+      earlyProbeData(probeLineSlot)    := DcacheByteLane.extract(
+        probeLineLine, probeLineOff, probeLineSize)
+    }
+
+    // Match the later resolved command by both token and VA. A token-present but
+    // not-yet-ready result holds command.ready briefly rather than orphaning the
+    // entry. Miss/unusable results are consumed and fall through to the ordinary
+    // S1 read. Only a ready hit bypasses that redundant read.
+    val earlyProbePresentVec = Vec(Bool(), earlyProbeDepth)
+    val earlyProbeMatchVec   = Vec(Bool(), earlyProbeDepth)
+    for (i <- 0 until earlyProbeDepth) {
+      earlyProbePresentVec(i) := earlyProbeValids(i) &&
+                                 (earlyProbeTokens(i) === loadCmdPort.payload.token) &&
+                                 (earlyProbeVaddrs(i) === cmdVaddr)
+      earlyProbeMatchVec(i) := earlyProbePresentVec(i) && earlyProbeReadies(i)
+    }
+    val earlyProbeTokenPresent = earlyProbePresentVec.asBits.orR
+    val earlyProbeOwnsCmd      = earlyProbeMatchVec.asBits.orR
+    val earlyProbeMatchIdx     = OHToUInt(earlyProbeMatchVec.asBits)
+    val earlyProbeHit          = earlyProbeOwnsCmd && earlyProbeHits(earlyProbeMatchIdx)
+    val earlyProbeHitData      = earlyProbeData(earlyProbeMatchIdx)
+    val useEarlyProbe          = earlyProbeHit && !ldS1Valid
+    val earlyProbeFreeVec      = Vec(Bool(), earlyProbeDepth)
+    for (i <- 0 until earlyProbeDepth) earlyProbeFreeVec(i) := !earlyProbeValids(i)
+    val earlyProbeHasFree      = earlyProbeFreeVec.asBits.orR
+    val earlyProbeReusesConsume = !earlyProbeHasFree && loadCmdPort.valid && useEarlyProbe
+    val earlyProbeHasAllocSlot = earlyProbeHasFree || earlyProbeReusesConsume
+    // `OHToUInt` requires a one-hot input. The free vector is normally multi-hot;
+    // mask it first or simultaneous residents can alias the same physical entry.
+    val earlyProbeAllocIdx     = Mux(
+      earlyProbeHasFree,
+      OHToUInt(OHMasking.first(earlyProbeFreeVec.asBits)),
+      earlyProbeMatchIdx)
+    earlyProbeOwnsCmd.simPublic(); useEarlyProbe.simPublic()
     // Respond ONLY on a HIT. A MISS falls through to REFILL below. Translation
     // faults never enter this pipe: the resolved-command contract requires the LS
     // producer to consume them before issuing loadCmd.
@@ -374,18 +451,22 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val ldS2Line  = Reg(Bits(128 bits))
     val ldS2Off   = Reg(UInt(offBits bits))
     val ldS2Size  = Reg(Size())
+    val ldS2Direct = RegInit(False)
+    val ldS2DirectData = Reg(Bits(32 bits))
     ldS2Valid := ldS1Valid
     ldS2Hit   := ldS1Hit
     ldS2Line  := ldS1Line
     ldS2Off   := ldS1Off
     ldS2Size  := ldS1Size
+    ldS2Direct := False
     val ldS2Resp = ldS2Valid && ldS2Hit
     ldS2Valid.simPublic(); ldS2Hit.simPublic(); ldS2Resp.simPublic()
 
     loadRspPort.valid         := ldS2Resp || busFaultResp || inhibitedResp
     loadRspPort.payload.data  := Mux(inhibitedResp,
                                       DcacheByteLane.extract(missLine, missOff, missSize),
-                                      DcacheByteLane.extract(ldS2Line, ldS2Off, ldS2Size))
+                                      Mux(ldS2Direct, ldS2DirectData,
+                                          DcacheByteLane.extract(ldS2Line, ldS2Off, ldS2Size)))
     loadRspPort.payload.line  := Mux(inhibitedResp, missLine, ldS2Line)
     // Translation faults are terminated upstream and never become cache commands.
     // The D-cache response fault bit is exclusively a physical AXI refill error.
@@ -787,28 +868,37 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         // eviction AXI pair) so the two can never contend. Bounded by construction
         // (a walk is at most sets*ways iterations), and the LS EU is architecturally
         // blocked from issuing anyway (the walk only ever runs under excActive).
-        // Early virtual-set lookup admission. A resolved command has priority on a
-        // shared-port cycle; the LS producer holds probe.valid until this handshake.
-        // Accept-last turnover for a sustained VIPT hit stream.  When the resolved
-        // command consumes a matching fresh probe and its physical tag is already
-        // known to HIT, the current RAM output dies at this edge and the next token
-        // may start a new synchronous virtual-set read on the same edge.  Do NOT do
-        // this on an early-probe miss: that arm installs ldS1 and still needs the
-        // current set's tag output for the normal miss/victim decision next cycle.
-        val replaceEarlyProbeOnHit = loadCmdPort.valid && useEarlyProbe && earlyProbeHit
+        // Early virtual-set lookup admission. A normal resolved command owns the
+        // single BRAM read port; a command consuming a queued hit needs no read, so
+        // the next probe may launch on the same edge. The four-entry result queue
+        // absorbs the fixed probe->command distance at one launch per cycle.
         loadProbePort.ready := !loadShadowValid && !pendingStoreMiss && !maintBusyReg &&
-                               ((!earlyProbeValid && !loadCmdPort.valid && !ldS1Valid) ||
-                                replaceEarlyProbeOnHit)
+                               earlyProbeHasAllocSlot &&
+                               (!loadCmdPort.valid || useEarlyProbe) &&
+                               !(ldS1Valid && !ldS1Hit)
         when(loadProbePort.fire) {
           val canceledAtLaunch = loadProbeCancelPort.valid &&
-                                 (loadProbeCancelPort.payload.token === loadProbePort.payload.token)
+                                 (loadProbeCancelPort.payload.all ||
+                                  (loadProbeCancelPort.payload.token === loadProbePort.payload.token))
           rdSet        := loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
           rdEn         := True
           loadUsesPort := True
-          earlyProbeValid := !canceledAtLaunch
-          earlyProbeFresh := !canceledAtLaunch
-          earlyProbeVaddr := loadProbePort.payload.vaddr
-          earlyProbeToken := loadProbePort.payload.token
+          when(!canceledAtLaunch) {
+            earlyProbeValids(earlyProbeAllocIdx)  := True
+            earlyProbeReadies(earlyProbeAllocIdx) := False
+            earlyProbeHits(earlyProbeAllocIdx)    := False
+            earlyProbeTokens(earlyProbeAllocIdx)  := loadProbePort.payload.token
+            earlyProbeVaddrs(earlyProbeAllocIdx)  := loadProbePort.payload.vaddr
+            probeReadValid  := True
+            probeReadSlot   := earlyProbeAllocIdx
+            probeReadSet    := loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
+            probeReadTag    := loadProbePort.payload.paddr(31 downto offBits + setBits)
+            probeReadOff    := loadProbePort.payload.vaddr(offBits - 1 downto 0)
+            probeReadSize   := loadProbePort.payload.size
+            probeReadUsable := loadProbePort.payload.resolved &&
+                               !loadProbePort.payload.needsLine &&
+                               (loadProbePort.payload.cacheMode =/= CacheMode.INHIBITED)
+          }
         }
 
         // A command which owns a pre-existing probe is old work, so maintenance's
@@ -816,7 +906,18 @@ class DcachePlugin extends FiberPlugin with DcacheService {
         // maintenance interval. `maintWalking` is false only during that quiesce wait.
         val resolveOldProbeDuringMaint = earlyProbeOwnsCmd && !maintWalking
         loadCmdPort.ready := !loadShadowValid && !pendingStoreMiss &&
-                             (!maintBusyReg || resolveOldProbeDuringMaint)
+                             (!maintBusyReg || resolveOldProbeDuringMaint) &&
+                             (!earlyProbeTokenPresent || earlyProbeOwnsCmd)
+
+        when(loadCmdPort.fire && earlyProbeOwnsCmd) {
+          // Full-queue consume-and-replace reuses this physical entry for the new
+          // probe on the same edge; keep the launch block's replacement valid.
+          when(!(loadProbePort.fire && earlyProbeReusesConsume &&
+                 (earlyProbeAllocIdx === earlyProbeMatchIdx))) {
+            earlyProbeValids(earlyProbeMatchIdx)  := False
+            earlyProbeReadies(earlyProbeMatchIdx) := False
+          }
+        }
 
         // A shadow accepted behind an earlier miss has priority over a new external
         // command once the refill returns. `maintWalking` (not maintBusyReg) is the
@@ -843,36 +944,18 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           // slot on the first safe IDLE cycle after the refill.
           loadShadowCmd   := loadCmdPort.payload
           loadShadowValid := True
-          earlyProbeValid := False
-          earlyProbeFresh := False
         } elsewhen(loadCmdPort.fire && useEarlyProbe) {
-          // The virtual-set RAM result has been held since the DTLB-parallel probe.
-          // Resolve the physical tag now. A hit bypasses the otherwise-redundant S1
-          // register and terminates at S2; a miss enters S1 without re-reading so the
-          // existing, heavily-tested miss/refill machinery remains the sole owner of
-          // victim selection and AXI state.
+          // The queued VIPT result already contains the physical-tag-qualified,
+          // size-extracted hit data. Bypass the redundant normal S1 read and land in
+          // the existing registered S2 response stage.
           loadUsesPort := True
-          when(earlyProbeHit) {
-            ldS2Valid := True
-            ldS2Hit   := True
-            ldS2Line  := earlyProbeLine
-            ldS2Off   := cmdOff
-            ldS2Size  := loadCmdPort.payload.size
-          } otherwise {
-            ldS1Valid := True
-            ldS1Set   := cmdSet
-            ldS1Tag   := cmdTag
-            ldS1Off   := cmdOff
-            ldS1Size  := loadCmdPort.payload.size
-            ldS1Cmode := loadCmdPort.payload.cacheMode
-            ldS1Paddr := cmdPaddr
-          }
-          // A same-cycle new probe replaces the consumed slot (the launch block
-          // above captured its metadata and kicked its RAM read). Otherwise free it.
-          when(!loadProbePort.fire) {
-            earlyProbeValid := False
-            earlyProbeFresh := False
-          }
+          ldS2Valid      := True
+          ldS2Hit        := True
+          ldS2Direct     := True
+          ldS2DirectData := earlyProbeHitData
+          ldS2Line       := B(0, 128 bits)
+          ldS2Off        := cmdOff
+          ldS2Size       := loadCmdPort.payload.size
         } elsewhen(loadCmdPort.fire) {
           // Launch the BRAM tag+data read for this set; resolve hit/miss in S1.
           rdSet        := cmdSet
@@ -888,10 +971,6 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           // fault generated by the cache itself is a physical AXI refill error,
           // delivered through busFaultResp below.
           ldS1Paddr    := cmdPaddr
-          // A stale/mismatched held probe cannot accelerate this command and this
-          // ordinary read supersedes its RAM output. Drop the single metadata slot.
-          earlyProbeValid := False
-          earlyProbeFresh := False
         }
         // S1 resolution of a launched load read. A HIT drives the response
         // one cycle later out of S2. A MISS starts the refill.
@@ -1707,18 +1786,17 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     }
 
     // Any later user of the single synchronous read port supersedes the held early
-    // probe output. Keep its token metadata so the matching resolved command can
-    // identify the stale optimization and fall back to a normal read; do not block
-    // store drain or maintenance merely to preserve freshness.
-    when(earlyProbeValid && rdEn && !loadProbePort.fire) {
-      earlyProbeFresh := False
-    }
-    // Forwarded/faulted/squashed loads never emit loadCmd. Their explicit cancel is
-    // what releases the metadata slot and, importantly, lets maintenance quiesce.
-    when(loadProbeCancelPort.valid && earlyProbeValid && !loadProbePort.fire &&
-         loadProbeCancelPort.payload.token === earlyProbeToken) {
-      earlyProbeValid := False
-      earlyProbeFresh := False
+    // Forwarded/faulted/squashed loads never emit loadCmd. Their explicit cancel
+    // releases the matching tokenized entry and lets maintenance quiesce. A probe
+    // canceled on its own launch edge is suppressed in the launch block above.
+    when(loadProbeCancelPort.valid) {
+      for (i <- 0 until earlyProbeDepth) {
+        when(earlyProbeValids(i) && (loadProbeCancelPort.payload.all ||
+             (earlyProbeTokens(i) === loadProbeCancelPort.payload.token))) {
+          earlyProbeValids(i)  := False
+          earlyProbeReadies(i) := False
+        }
+      }
     }
 
     // 1-cycle-later local ack for a COPYBACK hit (design doc: "S2 or the following

@@ -107,11 +107,10 @@ class LsEuCrossSpec extends AnyFunSuite {
     buf.toSeq
   }
 
-  /** Assert the freshness-flag waveform across the slot-A -> slot-B handover:
-    * `xlateBArm` rises at some cycle T; `reqStale` must read True at T (the cycle
-    * `xlateVaddr` first presents s1AddrB while `reqReg` still holds slot A's request)
-    * and at NO other cycle of this access; `reqMatch` must therefore be False at T and
-    * True at T+1, when XLATE_B consumes slot B's genuinely re-captured translation. */
+  /** Assert the atomic-P2 waveform across the slot-A -> slot-B handover. D1 removed
+    * the old independent LS request register: P2 owns both the request and its token,
+    * and changing `tSecond` changes those fields atomically. Therefore no stale cycle
+    * is permitted and the identity translator can consume slot B immediately. */
   def assertHandoverWaveform(tr: Seq[Sample], label: String): Unit = {
     def bits(f: Sample => Boolean) = tr.map(s => if (f(s)) 1 else 0).mkString
     val wave = s"(bArm=${bits(_.bArm)}, stale=${bits(_.stale)}, match=${bits(_.mtch)})"
@@ -120,36 +119,13 @@ class LsEuCrossSpec extends AnyFunSuite {
     val fall = tr.indexWhere(!_.bArm, rise)
     assert(fall > rise, s"$label: xlateBArm never cleared -- XLATE_B livelock? $wave")
 
-    // (1) The binding property: on the cycle xlateVaddr first presents s1AddrB while
-    // reqReg still holds slot A's request, the flag MUST read stale and reqMatch False,
-    // so XLATE_B cannot consume slot A's response as slot B's.
-    assert(tr(rise).stale && !tr(rise).mtch,
-      s"$label: reqStale must be True / reqMatch False on the xlateBArm-rise cycle " +
-      s"($rise) -- otherwise XLATE_B consumes slot A's stale translation. $wave")
-
-    // (2) It must be EXACTLY one cycle: the request re-captures unconditionally, so a
-    // longer stall would be a livelock, not a settle.
-    assert(!tr(rise + 1).stale && tr(rise + 1).mtch,
-      s"$label: reqStale must clear and reqMatch re-assert exactly one cycle later " +
-      s"(${rise + 1}). $wave")
-    assert(fall == rise + 2,
-      s"$label: XLATE_B must consume at ${rise + 1} and leave at ${rise + 2}; " +
-      s"xlateBArm actually cleared at $fall. $wave")
-
-    // (3) Closure: reqStale reads True on EXACTLY the three cycles it should, and
-    // nowhere else. Cycle `rise` and `fall` come from `xlateBArmSwitched` (both edges
-    // are tracked -- the falling one is a deliberate, harmless over-approximation: the
-    // FSM has left XLATE_B by then and nothing reads reqMatch again for this access).
-    // The one remaining stale cycle is the RegNext(issuePort.fire) settle right after
-    // the issue handshake this trace starts on.
-    val staleCycles = tr.indices.filter(tr(_).stale)
-    val fireSettle  = staleCycles.filter(_ < rise)
-    assert(fireSettle.size == 1 && fireSettle.head <= 2,
-      s"$label: expected exactly one pre-handover stale cycle (the issuePort.fire " +
-      s"settle); got $fireSettle. $wave")
-    assert(staleCycles == Seq(fireSettle.head, rise, fall),
-      s"$label: reqStale must read True on exactly {fire-settle, xlateBArm rise, " +
-      s"xlateBArm fall} = ${Seq(fireSettle.head, rise, fall)}; got $staleCycles. $wave")
+    assert(!tr.exists(_.stale),
+      s"$label: atomic P2 request/context must never expose a stale request. $wave")
+    assert(tr.slice(rise, fall).forall(_.mtch),
+      s"$label: every resident slot-B cycle must match its own request. $wave")
+    assert(fall == rise + 1,
+      s"$label: the always-ready identity translator must consume slot B in one " +
+      s"resident cycle; xlateBArm cleared at $fall after rising at $rise. $wave")
   }
 
   test("aligned long load unchanged (fast path, single access)", VerilatorTest) {
@@ -257,45 +233,12 @@ class LsEuCrossSpec extends AnyFunSuite {
   }
 
   // ───────────────────────────────────────────────────────────────────────────
-  // FMax "Lever A" (2026-08-08): `reqMatch` is no longer a 20-bit VPN value
-  // compare but a 1-bit event-driven freshness flag. These tests pin the two
-  // scenarios the design spec calls out as binding.
-  //
-  // Both scenarios are split accesses, because the slot-A -> slot-B handover is
-  // the ONLY place a stale `reqReg` can be presented while the FSM is still
-  // consuming `reqMatch`: `issuePort.ready` is provably False for the whole
-  // window between "a translation becomes pending" and "it resolves", so no NEW
-  // access can supersede an in-flight one.
-  //
-  //   - CROSS-LINE (0x200E): slot A (0x200E) and slot B (0x2010) share a page,
-  //     so their VPNs COINCIDE. This is the design spec's "coincidental VPN
-  //     match" case. MEASURED, not assumed -- the pre-Lever-A commit was checked
-  //     out in a git worktree and instrumented with the same probes:
-  //
-  //                                     xlateBArm   reqMatch    XLATE_B dwell
-  //       pre-Lever-A  cross-LINE       0001000     0011111     1 cycle
-  //       pre-Lever-A  cross-PAGE       0001100     0010101     2 cycles
-  //       post-Lever-A cross-LINE       0001100     0010111     2 cycles
-  //       post-Lever-A cross-PAGE       0001100     0010111     2 cycles
-  //
-  //     i.e. the old bit-exact compare really did consume slot B ONE CYCLE
-  //     EARLIER when the VPNs coincided (reqMatch already True on the very first
-  //     XLATE_B cycle, off slot A's still-registered but numerically identical
-  //     vpn); the freshness flag always pays the settle. Where the VPNs genuinely
-  //     differ the two are identical, because the old compare stalled there too.
-  //     The new code is therefore never faster than the old -- it never consumes a
-  //     translation the old code would have rejected, only ever the reverse.
-  //   - CROSS-PAGE (0x2FFF): slot A (page 0x2) and slot B (page 0x3) have
-  //     DIFFERENT VPNs, so the old compare stalled here too. Old and new agree
-  //     cycle-for-cycle. Under identity translation ppn==vpn, so consuming slot
-  //     A's stale response for slot B would yield paddr 0x2000 instead of
-  //     0x3000 -- i.e. this test is a live regression guard against exactly the
-  //     "split-access second half not translated" bug fixed by commit d22a949.
-  //     (It is what caught the design spec's own proposed expression, which put
-  //     the `xlateBArm` term behind an extra RegNext and therefore left reqStale
-  //     False on the one cycle that matters. See the RTL comment.)
+  // D1 atomic-P2 regression: same-page and different-page slot-B requests both
+  // switch together with their resident token. The identity translator makes the
+  // expected one-cycle dwell deterministic; the end-to-end data check still catches
+  // the historic cross-page "second half used slot A's translation" failure.
 
-  test("Lever A: reqStale/reqMatch waveform across a CROSS-LINE (same-VPN) slot-A->B handover", VerilatorTest) {
+  test("D1 atomic P2 waveform across a CROSS-LINE (same-VPN) slot-A->B handover", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
       val (cd, mem) = initDut(dut)
       val addr = 0x2000L + 14
@@ -311,7 +254,7 @@ class LsEuCrossSpec extends AnyFunSuite {
     }
   }
 
-  test("Lever A: reqStale/reqMatch waveform across a CROSS-PAGE (differing-VPN) slot-A->B handover", VerilatorTest) {
+  test("D1 atomic P2 waveform across a CROSS-PAGE (differing-VPN) slot-A->B handover", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
       val (cd, mem) = initDut(dut)
       val addr = 0x2FFFL

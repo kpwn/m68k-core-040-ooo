@@ -348,13 +348,16 @@ object FuzzRunner {
               println(f"[cplxtrace] FED-VALID cyc=$trCyc%5d pc0=0x$pc0%08x pc1=0x$pc1%08x slot1Valid=$s1v slot1IsUcodeEarly=$ucode slot1IsMemIndEarly=$memInd ucPendValid=$pendV ucEnterSlot0=$enter0 w0=0x$w0%04x w1=0x$w1%04x w2=0x$w2%04x w3=0x$w3%04x w4=0x$w4%04x wc=$wc simple=$simp complex=$cplx")
             }
           }
-          val poisoned = dut.lsEu.logic.poisoned.toBoolean
+          // D1 removed the single sticky front-FSM poison bit. Report the actual
+          // poison owners: launched aligned descriptors and the cold split replay.
+          val alignedPoisoned = dut.lsEu.logic.alignedPoisoned.exists(_.toBoolean)
+          val splitPoisoned   = dut.lsEu.logic.bkPoisoned.toBoolean
           val sqFlush  = dut.lsEu.sqFlushSig.toBoolean
           val doFlush  = dut.rob.logic.doFlushReg.toBoolean
           val lsuBusy  = dut.lsEu.logic.busy.toBoolean
           val lsuS1V   = dut.lsEu.logic.s1Valid.toBoolean
           val lsuCompV = dut.lsEu.logic.compValid.toBoolean
-          val line = f"deIssueV=$deV deIssueR=$deR deBusy=$deBusy robHead=${dut.rob.logic.head.toInt} lsBusy=0x$lsBusyHex sbXBusy=0x$sbXBusyHex sbIntBusy=0x$sbIntBusyHex sbNzvcBusy=0x$sbNzvcBusyHex lsNzvcBusy=0x$lsNzvcBusyHex poisoned=$poisoned sqFlush=$sqFlush doFlush=$doFlush lsuBusy=$lsuBusy lsuS1V=$lsuS1V lsuCompV=$lsuCompV iqSlots=[$iqSlots]"
+          val line = f"deIssueV=$deV deIssueR=$deR deBusy=$deBusy robHead=${dut.rob.logic.head.toInt} lsBusy=0x$lsBusyHex sbXBusy=0x$sbXBusyHex sbIntBusy=0x$sbIntBusyHex sbNzvcBusy=0x$sbNzvcBusyHex lsNzvcBusy=0x$lsNzvcBusyHex alignedPoisoned=$alignedPoisoned splitPoisoned=$splitPoisoned sqFlush=$sqFlush doFlush=$doFlush lsuBusy=$lsuBusy lsuS1V=$lsuS1V lsuCompV=$lsuCompV iqSlots=[$iqSlots]"
           if (line != trLastLine || lsWakeV || lsNzvcWakeV || sqFlush || doFlush) {
             println(f"[cplxtrace] cyc=$trCyc%5d lsWakeV=$lsWakeV lsWakeP=$lsWakeP lsNzvcWakeV=$lsNzvcWakeV lsNzvcWakeP=$lsNzvcWakeP $line")
             trLastLine = line

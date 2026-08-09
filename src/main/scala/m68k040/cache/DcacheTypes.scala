@@ -9,18 +9,28 @@ object DLoadToken {
   val Width = 8
 }
 
-/** Early VIPT lookup request. This carries only information available before
-  * translation: the virtual address selects page-invariant set bits while `token`
-  * associates the held RAM result with the later resolved DLoadCmd. */
+/** Early VIPT lookup request. `vaddr` selects the page-invariant set in parallel
+  * with the DTLB lookup and `token` associates the result with the later command.
+  * On a warm matching DTLB response, `resolved` qualifies the PA/cache/size hint
+  * used to finish the physical-tag comparison in the probe-result pipe. A probe
+  * may still launch with `resolved=False` to hide as much lookup latency as
+  * possible; that entry is deliberately unusable and the later command falls back
+  * to the ordinary resolved read path. */
 case class DLoadProbe() extends Bundle {
-  val vaddr = UInt(32 bits)
-  val token = UInt(DLoadToken.Width bits)
+  val vaddr     = UInt(32 bits)
+  val token     = UInt(DLoadToken.Width bits)
+  val resolved  = Bool()
+  val paddr     = UInt(32 bits)
+  val size      = Size()
+  val cacheMode = CacheMode()
+  val needsLine = Bool()
 }
 
-/** Cancel an early probe which completed by SQ forwarding, faulted translation,
-  * or squash and therefore will never receive a matching resolved command. */
+/** Cancel an early probe which completed by SQ forwarding or faulted translation.
+  * `all` is the squash/exception form and invalidates every resident token. */
 case class DLoadProbeCancel() extends Bundle {
   val token = UInt(DLoadToken.Width bits)
+  val all   = Bool()
 }
 
 /** Resolved load request: a virtual address + access size + the PRE-TRANSLATED physical

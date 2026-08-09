@@ -54,6 +54,7 @@ class DcacheSpec extends AnyFunSuite {
     dut.probe.logic.loadCmdIn.valid #= false
     dut.probe.logic.loadProbeIn.valid #= false
     dut.probe.logic.loadProbeCancelIn.valid #= false
+    dut.probe.logic.loadProbeCancelIn.payload.all #= false
     cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
     dut.probe.logic.loadRspOut.payload.data.toBigInt
   }
@@ -122,6 +123,7 @@ class DcacheSpec extends AnyFunSuite {
     dut.probe.logic.loadCmdIn.valid #= false
     dut.probe.logic.loadProbeIn.valid #= false
     dut.probe.logic.loadProbeCancelIn.valid #= false
+    dut.probe.logic.loadProbeCancelIn.payload.all #= false
     dut.probe.logic.storeIn.valid #= false
     // Task P5.4: pin the maintenance port idle (an un-poked testbench-driven input is
     // NOT guaranteed 0 across seeds/runs -- this project's documented sim gotcha).
@@ -1905,13 +1907,21 @@ class DcacheSpec extends AnyFunSuite {
       dut.probe.logic.loadProbeIn.valid #= true
       dut.probe.logic.loadProbeIn.payload.vaddr #= addr
       dut.probe.logic.loadProbeIn.payload.token #= token
+      dut.probe.logic.loadProbeIn.payload.resolved #= true
+      dut.probe.logic.loadProbeIn.payload.paddr #= addr
+      dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
+      dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadProbeIn.payload.needsLine #= false
       cd.waitSamplingWhere(dut.probe.logic.loadProbeIn.valid.toBoolean &&
                            dut.probe.logic.loadProbeIn.ready.toBoolean)
       dut.probe.logic.loadProbeIn.valid #= false
-      cd.waitSampling(2)
+      var readyWait = 0
+      while (!dut.dcache.logic.earlyProbeFresh.toBoolean && readyWait < 8) {
+        cd.waitSampling(); readyWait += 1
+      }
       assert(dut.dcache.logic.earlyProbeValid.toBoolean, "probe metadata must be held")
       assert(dut.dcache.logic.earlyProbeFresh.toBoolean,
-        "no intervening read used the shared RAM port")
+        s"tokenized probe result must become ready (waited $readyWait cycles)")
 
       // P2/P5: translation metadata arrives later with the same token. Before valid
       // is asserted, the combinational selector already proves the held result owns
@@ -1952,16 +1962,25 @@ class DcacheSpec extends AnyFunSuite {
       assert(load(dut, cd, addrB, Size.LONG) == expected(addrB, 4), "prime B")
       cd.waitSampling(8)
 
-      // Hold A's virtual-set result in the one-entry early-probe slot.
+      // Hold A's virtual-set result in one probe-result queue entry.
       dut.probe.logic.loadProbeIn.valid #= true
       dut.probe.logic.loadProbeIn.payload.vaddr #= addrA
       dut.probe.logic.loadProbeIn.payload.token #= tokenA
+      dut.probe.logic.loadProbeIn.payload.resolved #= true
+      dut.probe.logic.loadProbeIn.payload.paddr #= addrA
+      dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
+      dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadProbeIn.payload.needsLine #= false
       cd.waitSamplingWhere(dut.probe.logic.loadProbeIn.valid.toBoolean &&
                            dut.probe.logic.loadProbeIn.ready.toBoolean)
       dut.probe.logic.loadProbeIn.valid #= false
-      cd.waitSampling(1)
+      var readyAWait = 0
+      while (!dut.dcache.logic.earlyProbeFresh.toBoolean && readyAWait < 8) {
+        cd.waitSampling(); readyAWait += 1
+      }
       assert(dut.dcache.logic.earlyProbeValid.toBoolean)
-      assert(dut.dcache.logic.earlyProbeFresh.toBoolean)
+      assert(dut.dcache.logic.earlyProbeFresh.toBoolean,
+        s"probe A result did not become ready within 8 cycles (waited $readyAWait)")
 
       // Resolve A while presenting B's virtual probe. Because A is a proven
       // physical-tag hit, both Streams must handshake on this same edge: A consumes
@@ -1975,6 +1994,11 @@ class DcacheSpec extends AnyFunSuite {
       dut.probe.logic.loadProbeIn.valid #= true
       dut.probe.logic.loadProbeIn.payload.vaddr #= addrB
       dut.probe.logic.loadProbeIn.payload.token #= tokenB
+      dut.probe.logic.loadProbeIn.payload.resolved #= true
+      dut.probe.logic.loadProbeIn.payload.paddr #= addrB
+      dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
+      dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadProbeIn.payload.needsLine #= false
       sleep(1)
       assert(dut.dcache.logic.useEarlyProbe.toBoolean,
         "A must consume its held VIPT result")
@@ -1986,35 +2010,158 @@ class DcacheSpec extends AnyFunSuite {
       dut.probe.logic.loadCmdIn.valid #= false
       dut.probe.logic.loadProbeIn.valid #= false
 
-      assert(dut.dcache.logic.earlyProbeValid.toBoolean,
-        "the slot must remain occupied by replacement probe B")
-      assert(dut.dcache.logic.earlyProbeFresh.toBoolean,
-        "B's just-launched RAM output must not be invalidated by A's consume")
+      val got = scala.collection.mutable.ArrayBuffer.empty[BigInt]
+      def sampleRsp(): Unit =
+        if (dut.probe.logic.loadRspOut.valid.toBoolean)
+          got += dut.probe.logic.loadRspOut.payload.data.toBigInt
+      sampleRsp() // A may respond while B's independent result pipe is still maturing
 
-      // The very next resolved command must own B's replacement result, proving
-      // that the turnover did not merely leave stale A metadata marked valid.
+      assert(dut.dcache.logic.earlyProbeValid.toBoolean,
+        "the result queue must remain occupied by probe B")
+
+      // Present B's command while its queued result matures; wait on the exact
+      // token+VA ownership predicate rather than the queue-wide "some result ready"
+      // summary (which can transiently describe a different entry).
       dut.probe.logic.loadCmdIn.payload.vaddr #= addrB
       dut.probe.logic.loadCmdIn.payload.paddr #= addrB
       dut.probe.logic.loadCmdIn.payload.token #= tokenB
+      sleep(1) // settle the token+VA CAM before sampling its ownership predicate
+      var readyBWait = 0
+      while (!dut.dcache.logic.earlyProbeOwnsCmd.toBoolean && readyBWait < 8) {
+        cd.waitSampling(); readyBWait += 1; sampleRsp()
+      }
+      assert(dut.dcache.logic.earlyProbeOwnsCmd.toBoolean,
+        s"B's matching pipelined result must become ready independently of A's consume " +
+        s"(waited $readyBWait cycles)")
+
+      // The very next resolved command must own B's newly allocated result, proving
+      // that the turnover did not merely leave stale A metadata marked valid.
       sleep(1)
       assert(dut.dcache.logic.useEarlyProbe.toBoolean,
-        "B's token+VA must own the replacement VIPT result")
+        "B's token+VA must own a HIT VIPT result; queue=" +
+        (0 until 4).map { i =>
+          s"$i:v=${dut.dcache.logic.earlyProbeValids(i).toBoolean}" +
+          s",r=${dut.dcache.logic.earlyProbeReadies(i).toBoolean}" +
+          s",h=${dut.dcache.logic.earlyProbeHits(i).toBoolean}" +
+          f",t=0x${dut.dcache.logic.earlyProbeTokens(i).toInt}%02X" +
+          f",va=0x${dut.dcache.logic.earlyProbeVaddrs(i).toBigInt}%08X"
+        }.mkString("[", "; ", "]"))
       dut.probe.logic.loadCmdIn.valid #= true
       cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
                            dut.probe.logic.loadCmdIn.ready.toBoolean)
       dut.probe.logic.loadCmdIn.valid #= false
+      sampleRsp()
 
-      val got = scala.collection.mutable.ArrayBuffer.empty[BigInt]
       var cycles = 0
       while (got.size < 2 && cycles < 10) {
-        if (dut.probe.logic.loadRspOut.valid.toBoolean)
-          got += dut.probe.logic.loadRspOut.payload.data.toBigInt
-        if (got.size < 2) cd.waitSampling()
+        cd.waitSampling()
+        sampleRsp()
         cycles += 1
       }
       assert(got == Seq(expected(addrA, 4), expected(addrB, 4)),
         s"consume-and-replace responses must remain ordered and correct, got $got")
       cd.waitSampling(4)
+    }
+  }
+
+  test("VIPT D2: four distinct probe results queue without aliasing and cancel-all releases them", VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val addrs  = Seq(0x7200L, 0x7310L, 0x7420L, 0x7530L)
+      val tokens = Seq(0x40, 0x41, 0x42, 0x43)
+
+      for (i <- addrs.indices) {
+        dut.probe.logic.loadProbeIn.valid #= true
+        dut.probe.logic.loadProbeIn.payload.vaddr #= addrs(i)
+        dut.probe.logic.loadProbeIn.payload.token #= tokens(i)
+        // Deliberately unresolved: queue allocation/cancellation must not depend on
+        // a hit, and the resulting entry must be safe to fall back later.
+        dut.probe.logic.loadProbeIn.payload.resolved #= false
+        dut.probe.logic.loadProbeIn.payload.paddr #= 0
+        dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
+        dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+        dut.probe.logic.loadProbeIn.payload.needsLine #= false
+        sleep(1)
+        assert(dut.probe.logic.loadProbeIn.ready.toBoolean,
+          s"probe $i must launch on the cycle after probe ${i - 1}")
+        cd.waitSampling()
+      }
+
+      // A fifth token proves the depth rather than merely observing four writes.
+      dut.probe.logic.loadProbeIn.payload.vaddr #= 0x7640L
+      dut.probe.logic.loadProbeIn.payload.token #= 0x44
+      sleep(1)
+      assert(!dut.probe.logic.loadProbeIn.ready.toBoolean,
+        "the four-entry probe-result queue must backpressure a fifth resident token")
+      assert(dut.dcache.logic.earlyProbeValids.count(_.toBoolean) == 4,
+        "all four queue entries must be physically resident")
+      assert(dut.dcache.logic.earlyProbeTokens.zip(dut.dcache.logic.earlyProbeValids)
+        .collect { case (t, v) if v.toBoolean => t.toInt }.toSet == tokens.toSet,
+        "free-slot selection must preserve four distinct tokens without aliasing")
+
+      dut.probe.logic.loadProbeCancelIn.valid #= true
+      dut.probe.logic.loadProbeCancelIn.payload.all #= true
+      dut.probe.logic.loadProbeCancelIn.payload.token #= 0
+      cd.waitSampling()
+      dut.probe.logic.loadProbeCancelIn.valid #= false
+      dut.probe.logic.loadProbeCancelIn.payload.all #= false
+      dut.probe.logic.loadProbeIn.valid #= false
+      sleep(1)
+      assert(!dut.dcache.logic.earlyProbeValids.exists(_.toBoolean),
+        "flush-style cancel-all must release every resident probe token in one edge")
+      assert(dut.probe.logic.loadProbeIn.ready.toBoolean,
+        "probe admission must recover immediately after cancel-all")
+    }
+  }
+
+  test("VIPT D2: an unresolved probe is consumed safely through the ordinary hit pipe", VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val addr = 0x7788L
+      val token = 0x4A
+      preload(mem, addr & ~0xFL, 16)
+      assert(load(dut, cd, addr, Size.LONG) == expected(addr, 4), "prime resident line")
+      cd.waitSampling(4)
+
+      dut.probe.logic.loadProbeIn.valid #= true
+      dut.probe.logic.loadProbeIn.payload.vaddr #= addr
+      dut.probe.logic.loadProbeIn.payload.token #= token
+      dut.probe.logic.loadProbeIn.payload.resolved #= false
+      dut.probe.logic.loadProbeIn.payload.paddr #= 0
+      dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
+      dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadProbeIn.payload.needsLine #= false
+      cd.waitSamplingWhere(dut.probe.logic.loadProbeIn.valid.toBoolean &&
+                           dut.probe.logic.loadProbeIn.ready.toBoolean)
+      dut.probe.logic.loadProbeIn.valid #= false
+
+      dut.probe.logic.loadCmdIn.payload.vaddr #= addr
+      dut.probe.logic.loadCmdIn.payload.paddr #= addr
+      dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+      dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadCmdIn.payload.token #= token
+      sleep(1)
+      var waitReady = 0
+      while (!dut.dcache.logic.earlyProbeOwnsCmd.toBoolean && waitReady < 8) {
+        cd.waitSampling(); waitReady += 1
+      }
+      assert(dut.dcache.logic.earlyProbeOwnsCmd.toBoolean,
+        "the unresolved result entry must still associate with its later command")
+      assert(!dut.dcache.logic.useEarlyProbe.toBoolean,
+        "an unresolved PA hint must never be treated as a physical-tag hit")
+
+      dut.probe.logic.loadCmdIn.valid #= true
+      sleep(1)
+      assert(dut.dcache.logic.rdEn.toBoolean,
+        "unresolved probe fallback must launch the ordinary virtual-set read")
+      cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
+                           dut.probe.logic.loadCmdIn.ready.toBoolean)
+      dut.probe.logic.loadCmdIn.valid #= false
+      cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
+      assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == expected(addr, 4),
+        "fallback hit data must remain correct")
+      assert(!dut.dcache.logic.earlyProbeValid.toBoolean,
+        "fallback command must consume its unusable queued result")
     }
   }
 

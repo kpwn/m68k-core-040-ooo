@@ -1,15 +1,15 @@
 # IPC push: a genuine LS EU pipeline — replacing the one-µop-at-a-time FSM (design)
 
-**Status**: IMPLEMENTING. D-cache slices A, B, and the bounded replay part of C
-are implemented and simulation-gated. The LS late split has early-free enabled,
-and C3 replaces its aligned-load response slot with a four-entry in-order
-descriptor queue. The aligned cache-load hot path therefore no longer occupies
-a one-at-a-time back FSM; only rare split accesses retain a serial replay FSM.
-This remains a bounded front/queue checkpoint, not yet the final elastic II=1
-LS front pipeline. Across seeds 1–3 C2 cuts `load-stream` cycles by 43.9% (ideal)
-and 41.2% (L2-faithful). C3 then improves the seed-1 `load-stream` result by a
-further 7 ideal-memory cycles and 41 L2-faithful cycles, with every other kernel
-unchanged. The routed FMax/area gate has not yet been run.
+**Status**: IMPLEMENTING. D-cache slices A/B/C, the D1 elastic LS front, and the
+D2 four-entry tokenized VIPT-result queue are implemented and simulation-gated.
+Accept-last P1/P2/P3/P4 stages, four aligned descriptors, and four early results
+let warm same-page L1 hits issue, translate/probe, enqueue, command, and complete
+at II=1. Only rare split accesses retain a serial replay FSM. A directed burst of
+eight loads proves bubble-free turnover through every one of those boundaries,
+including full-queue consume-and-replace. Seed-1 `load-stream` is now 638 cycles
+under ideal memory and 769 under `l2:5:70`, down 65.1%/62.1% from the committed C3
+checkpoint. The routed FMax/area gate is still pending because the shared Vivado
+window is occupied.
 
 **2026-08-09 review amendment — binding corrections:**
 
@@ -25,14 +25,15 @@ unchanged. The routed FMax/area gate has not yet been run.
 2. The DTLB does not impose an unconditional one-translation-per-two-cycles
    physical limit. `hrMatch` can serve a same-VPN stream every cycle after
    warm-up. A changed VPN needs the registered hit-result gap; a walk needs
-   backpressure. The current LS `reqStale` policy nevertheless inserts a settle
-   cycle for every new resident µop. That policy must be replaced by tagged
-   pipeline validity, not elevated into an architectural floor.
+   backpressure. D1 removed the old per-µop `reqStale` settle cycle by making P2
+   the atomic registered request/context boundary. A tagged or decoupled DTLB
+   response remains future work for changed-VPN II=1.
 3. The end-state target is II=1 for cacheable same-page L1 hits, stores, and
    forwarded loads. Slice A reached II=2; the bounded replay added with slice C
    now permits one resolved all-hit load acceptance per cycle. A younger command
    accepted on the exact cycle an older S1 detects a miss is held in one replay
    slot and relaunched after refill, preserving untagged in-order responses.
+   D1 now carries multiple aligned operations concurrently through P2/P3/P4.
    General hit-under-miss remains future work. Maintenance and page walks may
    remain serializing.
 4. `DcachePlugin` no longer consumes the live translation response at
@@ -45,9 +46,8 @@ unchanged. The routed FMax/area gate has not yet been run.
    the live-translation hazard; Slice 2 sets `earlyFree = true`. C3 replaces the
    single aligned-response slot with four in-order descriptors. Untagged cache
    responses retire against the oldest sent descriptor, while the split replay
-   waits for the aligned ring to drain. The front can still hold only one
-   translate/resolve operation, so this does not supersede the elastic-pipeline
-   end state below.
+   waits for the aligned ring to drain. D1 subsequently replaced the checkpoint's
+   single-resident translate/resolve front with accept-last P1/P2/P3/P4 stages.
 6. Faster consumers expose invalid producer cadence assumptions. Every Stream
    source must hold `valid` and its entire payload until `fire`; it may not rely
    on the consumer's former multi-cycle `ready` gap. D-cache II=1 exposed one
@@ -60,6 +60,27 @@ unchanged. The routed FMax/area gate has not yet been run.
    suite at seed 1, aggregate cycles move `12221`→`10658` (−12.8%) and
    `15659`→`14271` (−8.9%). This clears the predeclared IPC thresholds on the
    measured pair but is not final acceptance until the routed FMax/LUT gate.
+8. D1 burst coverage found a remaining latency-mode bubble even though issue,
+   translation, descriptor enqueue, and resolved L1 commands all run at II=1:
+   four warm same-page hits completed on cycles `7,9,10,11`. The first command
+   consumed the former one-entry early probe, while the following command fell back to
+   the one-cycle-longer normal hit pipe. D2 therefore replaces the held full-line
+   probe slot with four tokenized **extracted-result** entries. A shared two-stage
+   probe-result pipe registers the selected 128-bit line once, then extracts only
+   32 bits into the reserved entry. This keeps probe admission at II=1 without
+   replicating 128-bit line storage per outstanding load. The probe carries a
+   resolved PA/cache-mode hint only when the DTLB response already matches; an
+   unresolved changed-VPN/miss probe is retained as an unusable result and the
+   later command safely falls back to the ordinary read path.
+9. D2 closes that bubble in the directed eight-load burst: issue, DTLB/VIPT
+   launch, aligned-descriptor enqueue, resolved L1 command, and completion are
+   each consecutive for all eight operations, and P2/P3/P4 are simultaneously
+   occupied. The same test requires eight parallel VIPT launches, ordered ROB
+   completion, and correct data. The seed-1 benchmark moves C3 `load-stream`
+   `1829`→`638` cycles under ideal memory and `2030`→`769` under `l2:5:70`.
+   Excluding `load-stream`, aggregate cycles are `8802` ideal and `12140` L2,
+   respectively 20 and 60 cycles better than C3, so the gain is localized to the
+   intended hot path without a hidden regression in the rest of the suite.
 
 **Driving directive (user, verbatim)**: *"LS EU needs to be a pipeline, not a
 one-at-a-time FSM."*
@@ -396,16 +417,16 @@ response tags, or multiple MSHRs. Directed tests prove three resident hits are
 accepted and answered on consecutive cycles, and that the miss-shadow command
 cannot answer ahead of the miss. General hit-under-miss remains out of scope.
 
-The single early-probe metadata slot must also support **consume-and-replace on
-an early-probe hit**. On a cycle where the resolved command consumes a matching
-fresh probe and its physical-tag comparison is already known to hit, the shared
-RAM output is no longer needed after that edge; the next token may launch its
-virtual-set read on the same edge. This is safe only for the proven-hit arm. An
-early-probe miss still enters the normal S1 miss machinery, whose next-cycle
-tag/victim decision owns the RAM output, so probe admission remains blocked on
-that arm. Without this asymmetric accept-last rule, the cache can accept
-resolved commands at II=1 but VIPT latency hiding silently degrades to every
-other load under a sustained stream.
+The original one-entry early-probe metadata slot supported consume-and-replace,
+but D1 increased probe→resolved-command distance enough that the slot could not
+retain every consecutive result. D2 uses four tokenized result entries. A probe
+reserves an entry and launches the virtual-set BRAM read; the following shared
+stage registers the selected 128-bit way, and the next stage stores only the
+size-extracted 32-bit value plus hit/usable metadata in that entry. Matching and
+cancellation use the token. A matching proven-hit command consumes the extracted
+result without another RAM read; a miss or unresolved translation consumes the
+entry and takes the ordinary S1 path. The four-entry depth covers the fixed D1
+probe-to-command distance and supports one enqueue plus one consume per cycle.
 
 ### 3.3 Gatekeeper 3 — the shared completion stage
 
@@ -935,7 +956,9 @@ measured FMax reading on the exact cone at issue.
 | **C2 — implemented checkpoint** | **LS front/back early free** | capture complete `bkCtx`/`llReg` at `RESOLVE`, keep one untagged cache back slot, release the front for one younger translate/resolve op | `LsEuPlugin`, LS test | delayed cold miss overlap; completion collision/cross/poison/RTE/cache regressions; `load-stream` −43.9%/−41.2% cycles (3 seeds ideal/L2); seed-1 aggregate −12.8%/−8.9%; area/FMax pending |
 | **C3 — implemented checkpoint** | **Aligned-load descriptor queue** | replace the aligned hot-path `BK_IDLE/LAUNCH/WAIT` single slot with a four-entry in-order command/response descriptor queue; add hit-only early-probe consume-and-replace; retain `WAIT_A/WAIT_B` only as a pipe-draining split-access replay; close split-half bus-fault handling | `LsEuPlugin`, `DcachePlugin`, LS/cache tests | focused cache/LS/RTE suite 105/105; full/backpressure/order/flush and both split-half bus faults pass; `test-fast` 133/134 with only the independently reproduced baseline predecode failure; seed-1 `load-stream` 1836→1829 ideal and 2071→2030 L2; area/FMax pending |
 | **C1 — optional** | **General hit-under-miss** | response tags + bounded miss state sufficient to keep accepting independent hits during refill | cache/service/LS files | hit-under-miss; queue-full backpressure; area/FMax |
-| **D** | **Elastic LS stages** | replace front one-at-a-time state with owned valid/context stages; extend C3's association queue into the uniform in-order completion FIFO of §4.4 | `LsEuPlugin` | IPC suite; lock-step/corpus; post-route pair |
+| **D1 — implemented, simulation-gated** | **Elastic LS front** | replace the single-resident `IDLE/XLATE_B/XLATE/RESOLVE/WAIT_SQ` control with accept-last P1 AGU, P2 registered DTLB/VIPT, P3 registered physical-address/SQ-query, and P4 registered forward/resolve stages; each cut owns a pruned context and valid bit | `LsEuPlugin`, LS tests | eight same-page aligned loads advance issue→P4 and complete at II=1; changed-page/walk and queue-full backpressure; store→load order; older precise replay priority; flush; split regressions; seed-1 IPC pair passes |
+| **D2 — implemented, simulation-gated** | **Tokenized VIPT result queue** | replace the one held RAM result with four tokenized extracted-result entries fed by one shared selected-line/extract pipeline; carry a valid resolved-PA hint on `DLoadProbe`; fall back safely when unresolved or miss | cache service, `LsEuPlugin`, `DcachePlugin`, tests | eight warm same-page hits launch probes and complete consecutively; full-queue consume-and-replace, cancel-all, unresolved/miss fallback; D-cache 49/49, focused LS 24/24, RTE 1/1; `test-fast` 133/134 with only baseline predecode failure; area/FMax pending |
+| **D3** | **Uniform completion FIFO** | extend C3's cache association ring into the uniform in-order completion FIFO of §4.4 if D1's remaining early-completion arbitration or latency-sensitive kernels justify it | `LsEuPlugin` | IPC suite; lock-step/corpus; post-route pair |
 | **E** | **Context pruning** | prove non-use, shrink carried tokens | LS/cache files | LUT/FF delta; no functional change |
 
 Every slice ends with a hard correctness and `test-fast` gate; B–D additionally
@@ -945,6 +968,18 @@ cache capacity, and C2 opens bounded LS overlap before D makes admission elastic
 C1 is not a prerequisite for
 the bounded, in-order elastic LS pipeline and should be justified separately
 against area and workload miss behavior.
+
+For D1, P2 itself is the registered DTLB request boundary: `{valid,vaddr,vpn,
+write,supervisor,robId}` and its pruned execution context advance atomically.
+The D-cache `DLoadProbe` is driven from those same P2 flops in the same cycle as
+the DTLB lookup, retaining latency-hiding VIPT without a live AGU→TLB/cache cone.
+A different VPN may hold P2 until the DTLB's registered hit result catches up or
+the walk completes; a same-page hit stream may consume and replace P2 every
+cycle. Split accesses hold P2 only for their second translation, then continue
+through the ordinary P3/P4 cuts and serialize solely at the existing split
+replay handoff. Flush invalidates every unlaunched front stage in one edge;
+already-launched cache descriptors remain poisoned and drain as specified for
+C3.
 
 ### 8.3 Projected IPC
 
@@ -962,8 +997,7 @@ Baselines re-measured on `39f2e49` (late-split Task 2, 8 seeds, both models):
 predicted vs 3269 measured (0.9%). The cache-side II=3 ceiling has now been
 removed. C2 also removes the older cache tail from the front's occupancy. C3
 replaces the untagged back-load slot with four ordered descriptors, but still
-provides only one younger front slot. Therefore the final II=1 row remains an
-analytical projection until slice D opens fully elastic LS admission:
+provides only one younger front slot. D1/D2 now provide the measured II=1 row:
 
 | | `load-stream` II | `load-stream` cyc | `load/store` | `mixed` | ideal aggregate |
 |---|---|---|---|---|---|
@@ -972,15 +1006,17 @@ analytical projection until slice D opens fully elastic LS admission:
 | slice-A cache II=2 projection | **2** | ~720 | ~620 | ~420 | **~6100** = **+52%** |
 | C2 measured, seed 1 (current 10-kernel suite) | bounded front/back | **1836** | **1034** | **559** | **10658 vs 12221 baseline = −12.8% cycles** |
 | C3 measured, seed 1 (current 10-kernel suite) | four aligned descriptors | **1829** | **1034** | **559** | **10651 ideal; 14230 L2 vs C2 14271** |
-| implemented cache capacity + elastic LS target | **1** | ~360 plus fill | to measure | to measure | **must be benchmarked** |
+| D1/D2 measured, seed 1 | **1** | **638 ideal / 769 L2** | **1034 / 1515** | **550 / 1074** | **9440 ideal / 12909 L2** |
 
-The D-cache is no longer the common-hit acceptance bottleneck. C2 made the
-first material IPC gain by overlapping the cache tail, and C3 removes the
-aligned response-slot serialization, but the single-resident front still cannot
-feed the cache at its all-hit II=1 limit. That limit becomes reachable only when
-the elastic LS stages can present consecutive loads. Under the realistic memory
-model, refill time still limits the benefit, so both memory models remain
-mandatory.
+The D-cache is no longer the common-hit acceptance bottleneck. C2 made the first
+material IPC gain by overlapping the cache tail, C3 removed the aligned
+response-slot serialization, and D1/D2 now feed and retire resident hits at the
+cache's all-hit II=1 limit. Relative to C3, seed-1 `load-stream` cycles improve
+65.1% ideal and 62.1% L2; the full aggregate improves 11.4% and 9.3%. Relative
+to the original seed-1 baseline, `load-stream` improves 80.5% and 77.6%.
+Realistic-memory refill time still limits the benefit, so both memory models
+remain mandatory. General hit-under-miss and changed-VPN DTLB II=1 are distinct
+remaining levers, not prerequisites for the achieved same-page resident-hit II=1.
 
 **Three honest caveats, all mandatory to carry into any report of these numbers:**
 
@@ -1168,11 +1204,16 @@ adjudicator of whether uniform in-order completion (§4.4) needs the §10.4
 retreat.
 
 **Implementation checkpoint.** D-cache S1/S2 overlap, all-hit II=1 acceptance,
-one-entry in-order miss-shadow replay, live-DTLB decoupling, and the parallel
-virtual-set probe are implemented. The LS front releases cache loads into a
-four-entry aligned descriptor queue; untagged responses remain associated in
-order, and only split accesses use `WAIT_A/WAIT_B`. Directed simulation covers
-consecutive hits/probes, miss replay ordering, real-DTLB coincident launch,
-probe cancellation, queue-full consume-and-replace, flush poisoning, and both
-split-half bus faults. The remaining architectural work is the elastic LS-stage
-rewrite, followed by broader IPC and paired routed FMax/LUT gates.
+one-entry in-order miss-shadow replay, live-DTLB decoupling, and a four-entry
+tokenized parallel virtual-set result queue are implemented. The elastic LS front
+releases cache loads into a four-entry aligned descriptor queue; untagged responses
+remain associated in order, and only split accesses use `WAIT_A/WAIT_B`. Directed
+simulation covers eight consecutive warm hits and coincident DTLB/VIPT launches,
+full-queue consume-and-replace, miss replay ordering, exact token association,
+unresolved-probe fallback, cancel-all, flush poisoning, and both split-half bus
+faults. The focused cache/LS/RTE suites pass 74/74 and `test-fast` passes 133/134,
+with only the independently reproduced `PredecodeRefSpec` EOR Dn,Dm mismatch.
+Both seed-1 IPC memory models pass and quantify the common-path gain. Remaining
+gates are broader multi-seed IPC and paired routed FMax/LUT measurements. A
+tagged/decoupled DTLB response is a separate future lever for changed-VPN II=1;
+same-page P2 replacement is already II=1.

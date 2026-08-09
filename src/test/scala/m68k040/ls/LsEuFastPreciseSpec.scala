@@ -323,7 +323,6 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
       assert(parallelSeen,
         "the real DTLB demand and virtual-set RAM read must launch on the same token cycle")
       assert(cancelSeen, "SQ forwarding must cancel the probe that will never get loadCmd")
-      assert(!dut.eu.logic.probeOutstanding.toBoolean, "LS probe ownership must clear")
       assert(!dut.dcache.logic.earlyProbeValid.toBoolean, "D-cache probe slot must clear")
       cd.waitSampling(3)
       dut.src.logic.obsIntAddr #= 22; sleep(1)
@@ -390,10 +389,12 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
       issueLoad(dut, cd, basePreg = 10, disp = 0, pdst = 20, robId = olderRob)
       sleep(1) // let ready reflect the just-captured S1 entry after the issue edge
 
-      // Hold the younger store at issue until the front releases. At the accepting
-      // edge the older load must still occupy the aligned descriptor ring, and must not be
-      // completing on that same edge. This is the property the old monolithic FSM
-      // could never satisfy: issue.ready stayed low through the entire miss/refill.
+      // Hold the younger store at issue until the front accepts it. At that edge the
+      // older load may still be in any elastic front stage (the point of D1 is that
+      // acceptance no longer waits for it to reach the descriptor ring), but it must
+      // remain physically resident and must not be completing on the same edge. The
+      // old monolithic FSM could never satisfy this: issue.ready stayed low through
+      // the entire miss/refill.
       val s = dut.src.logic
       s.iValid #= true; s.iMemOp #= MemOp.STORE; s.iSize #= Size.LONG
       s.iPsrcA #= 11; s.iPsrcAValid #= true
@@ -407,13 +408,19 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
         issueWait += 1
       }
       assert(issueWait < 200, "younger store never reached the released LS front")
-      val acceptedWithOlderPending = dut.eu.logic.alignedCount.toInt != 0 &&
-                                     !dut.eu.logic.alignedRspFire.toBoolean &&
-                                     !(s.cValid.toBoolean && s.cRob.toInt == olderRob)
+      val olderInElasticFront =
+        (dut.eu.logic.s1Valid.toBoolean && dut.eu.logic.s1Ctx.robId.toInt == olderRob) ||
+        (dut.eu.logic.tValid.toBoolean && dut.eu.logic.tCtx.robId.toInt == olderRob) ||
+        (dut.eu.logic.p3Valid.toBoolean && dut.eu.logic.p3Ctx.front.robId.toInt == olderRob) ||
+        (dut.eu.logic.p4Valid.toBoolean && dut.eu.logic.p4Ctx.xlate.front.robId.toInt == olderRob)
+      val acceptedWithOlderPending =
+        (olderInElasticFront || dut.eu.logic.alignedCount.toInt != 0 || dut.eu.logic.bkBusy.toBoolean) &&
+        !dut.eu.logic.alignedRspFire.toBoolean &&
+        !(s.cValid.toBoolean && s.cRob.toInt == olderRob)
       cd.waitSampling() // younger issue handshake
       s.iValid #= false
       assert(acceptedWithOlderPending,
-        s"younger memory op must issue while the older cold load is still pending in the cache back stage " +
+        s"younger memory op must issue while the older cold load is still resident in the LS pipeline " +
         s"(wait=$issueWait busy=${dut.eu.logic.busy.toBoolean} s1=${dut.eu.logic.s1Valid.toBoolean} " +
         s"alignedCount=${dut.eu.logic.alignedCount.toInt} alignedRsp=${dut.eu.logic.alignedRspFire.toBoolean} " +
         s"cValid=${s.cValid.toBoolean} cRob=${s.cRob.toInt})")
@@ -429,7 +436,11 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
         if (dut.eu.logic.sq.io.alloc.valid.toBoolean &&
             dut.eu.logic.sq.io.alloc.payload.robId.toInt == youngerRob) {
           allocSeen = true
-          allocWhileOlderPending = dut.eu.logic.alignedCount.toInt != 0 &&
+          // The older descriptor can enter the ring on this exact edge. In that
+          // consume-and-accept case alignedEnq is the authoritative evidence;
+          // alignedCount is a Reg and still exposes its pre-edge value here.
+          allocWhileOlderPending = (dut.eu.logic.alignedCount.toInt != 0 ||
+                                    dut.eu.logic.alignedEnq.toBoolean) &&
                                    !dut.eu.logic.alignedRspFire.toBoolean &&
                                    !oldCompleted
         }
@@ -447,6 +458,106 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
       s.obsIntAddr #= 20; sleep(1)
       assert(s.obsIntData.toBigInt == loadWord,
         f"older load data corrupted across front/back overlap: got 0x${s.obsIntData.toBigInt}%08X")
+    }
+  }
+
+  test("D1 same-page resident loads issue, translate, enqueue, command, and complete at II=1", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem, ptmem) = initDut(dut)
+      val base = 0xA800L
+      val vpn  = base >>> 12
+      val image = (0 until 16).map(i => (0x20 + i * 7) & 0xff)
+      image.indices.foreach(i => mem.pokeByte(base + i, image(i)))
+      buildResidentCopybackPage(ptmem, base, ppn = vpn)
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp #= ROOT
+      dut.ctrl.logic.srp #= ROOT
+      dut.cacheCtrl.logic.dcacheEnabled #= true
+      seed(dut, cd, preg = 10, value = base)
+
+      // Warm both the real DTLB entry and the L1D line before measuring the hit
+      // stream. The burst itself then isolates resident-hit initiation interval.
+      issueLoad(dut, cd, basePreg = 10, disp = 0, pdst = 20, robId = 8)
+      assert(waitCompletion(dut, cd, robId = 8), "warm-up load must complete")
+      cd.waitSampling(4)
+
+      // Eight requests exceed both four-entry queues, so the property also proves
+      // full-queue consume-and-replace rather than only initial fill behavior.
+      val disps = Seq(0, 4, 8, 12, 0, 4, 8, 12)
+      val robs  = 16 until 24
+      val pdsts = 24 until 32
+      val issueCycles = scala.collection.mutable.ArrayBuffer.empty[Int]
+      val enqCycles   = scala.collection.mutable.ArrayBuffer.empty[Int]
+      val cmdCycles   = scala.collection.mutable.ArrayBuffer.empty[Int]
+      val compCycles  = scala.collection.mutable.ArrayBuffer.empty[Int]
+      val compRobs    = scala.collection.mutable.ArrayBuffer.empty[Int]
+      var allFrontStagesOccupied = false
+      var parallelLaunches = 0
+
+      def driveLoad(i: Int): Unit = {
+        val s = dut.src.logic
+        s.iValid #= true; s.iMemOp #= MemOp.LOAD; s.iSize #= Size.LONG
+        s.iPsrcA #= 10; s.iPsrcAValid #= true
+        s.iPsrcB #= 0; s.iPsrcBValid #= false
+        s.iImm #= disps(i)
+        s.iPdst #= pdsts(i); s.iPdstValid #= true; s.iRobId #= robs(i)
+      }
+
+      driveLoad(0)
+      var nextIssue = 0
+      var cycle = 0
+      while (compRobs.size < robs.size && cycle < 200) {
+        sleep(1)
+        val s = dut.src.logic
+        val issueFire = s.iValid.toBoolean && s.iReady.toBoolean
+        if (issueFire) issueCycles += cycle
+        if (dut.eu.logic.alignedEnq.toBoolean) enqCycles += cycle
+        if (dut.dcache.logic.loadCmdPort.valid.toBoolean &&
+            dut.dcache.logic.loadCmdPort.ready.toBoolean) cmdCycles += cycle
+        if (dut.eu.logic.parallelViptLaunch.toBoolean) parallelLaunches += 1
+        if (s.cValid.toBoolean && robs.contains(s.cRob.toInt)) {
+          compCycles += cycle
+          compRobs += s.cRob.toInt
+        }
+        if (dut.eu.logic.tValid.toBoolean && dut.eu.logic.p3Valid.toBoolean &&
+            dut.eu.logic.p4Valid.toBoolean) allFrontStagesOccupied = true
+
+        cd.waitSampling()
+        cycle += 1
+        if (issueFire) {
+          nextIssue += 1
+          if (nextIssue < robs.size) driveLoad(nextIssue)
+          else s.iValid #= false
+        }
+      }
+
+      def isConsecutive(xs: Seq[Int]): Boolean =
+        xs.size == robs.size && xs.sliding(2).forall { case Seq(a, b) => b == a + 1 }
+
+      assert(isConsecutive(issueCycles.toSeq),
+        s"resident load issue must be bubble-free, cycles=$issueCycles")
+      assert(allFrontStagesOccupied,
+        "the burst must physically occupy P2/P3/P4 concurrently (multiple in flight)")
+      assert(isConsecutive(enqCycles.toSeq),
+        s"translated aligned descriptors must enqueue at II=1, cycles=$enqCycles")
+      assert(isConsecutive(cmdCycles.toSeq),
+        s"resident load commands must reach L1D at II=1, cycles=$cmdCycles")
+      assert(isConsecutive(compCycles.toSeq),
+        s"resident L1D hits must complete at II=1, cycles=$compCycles robs=$compRobs")
+      assert(compRobs.toSeq == robs,
+        s"untagged L1D responses must remain in issue order, got=$compRobs expected=$robs")
+      assert(parallelLaunches == robs.size,
+        s"every warm same-page DTLB lookup must launch its virtual-set probe in " +
+        s"parallel (launches=$parallelLaunches loads=${robs.size})")
+
+      cd.waitSampling(3)
+      for (i <- robs.indices) {
+        dut.src.logic.obsIntAddr #= pdsts(i); sleep(1)
+        val expected = image.slice(disps(i), disps(i) + 4)
+          .foldLeft(BigInt(0))((acc, b) => (acc << 8) | BigInt(b))
+        assert(dut.src.logic.obsIntData.toBigInt == expected,
+          f"burst load $i data mismatch: got=0x${dut.src.logic.obsIntData.toBigInt}%08X expected=0x$expected%08X")
+      }
     }
   }
 
@@ -553,7 +664,7 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
     }
   }
 
-  test("flush poisons every resident aligned-load descriptor and drains without completion", VerilatorTest) {
+  test("flush poisons every resident aligned-load descriptor and broadcasts VIPT cancel-all", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
       val (cd, mem, ptmem) = initDut(dut,
         AxiMemModelConfig(latency = L2LatencyModel(enabled = true, dramCycles = 40)))
@@ -572,8 +683,14 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
       }
       assert(dut.eu.logic.alignedCount.toInt == 2, "precondition: two queued loads")
       dut.src.logic.iSqFlush #= true
+      sleep(1)
+      assert(dut.eu.logic.probeCancelAll.toBoolean,
+        "the LS flush boundary must broadcast the queue-wide VIPT cancellation form")
       cd.waitSampling()
       dut.src.logic.iSqFlush #= false
+      sleep(1)
+      assert(!dut.dcache.logic.earlyProbeValids.exists(_.toBoolean),
+        "LS cancel-all must leave no speculative VIPT token resident")
 
       var leakedCompletion = false
       n = 0
@@ -630,26 +747,26 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
   // (LsEuPlugin.scala's deferred-completion replay: `deferCompletion`/`pendMem`/
   // `pendReady`/`pendApply`/`liveCompletionFires`). If the live EU pipe's own
   // `captureCompletion`/`captureFault` and a pending replay entry BOTH want the
-  // shared `comp*` stage on the SAME cycle, the replay must yield and retry the NEXT
-  // available cycle -- never drop the entry.
+  // shared `comp*` stage on the SAME cycle, the ROB-head precise replay is older and
+  // must preempt the younger front completion. A launched cache response remains the
+  // only higher-priority producer because its Flow cannot be backpressured.
   //
   // This directed test engineers that exact collision: it drives the SQ's real
   // precise-path at-head drain (`robHeadIn`/`robHeadValidIn`, normally supplied by
   // RobPlugin -- see the `simPublic()` taps added to those pass-throughs for exactly
   // this purpose) for a full BATCH of precise stores, WHILE a continuous,
-  // fully-deterministic LEA train (LEA never translates / never touches the D-cache
-  // or AXI at all -- see `issueLea`'s doc comment: a fixed period-3 `liveCompletionFires`
-  // pulse train) runs concurrently through the same single-outstanding EU pipe. A
+  // fully-deterministic II=1 LEA train (LEA never translates / never touches the
+  // D-cache or AXI at all) runs concurrently through the elastic front. A
   // precise store's drain-confirm cycle (`sq.io.sqCompletion`) is timed by the
   // D-cache write path's randomized AXI-ready handshake (`BehavioralMemAgent`'s
   // `StreamReadyRandomizer`s) -- running a whole batch (one per SQ slot, 8 independent
   // draws) with the LEA train active throughout reliably produces at least one
   // exact-cycle collision for a FIXED sim seed. Pinning the seed makes the entire run
   // (including every AXI-ready draw) bit-for-bit reproducible, so this is
-  // deterministic on every future run, not flaky -- `collisionSeen` is asserted
+  // deterministic on every future run, not flaky -- `priorityCollisionSeen` is asserted
   // explicitly so a future change that accidentally stops exercising the collision
   // path fails loudly instead of silently passing a vacuous test.
-  test("liveCompletionFires collision: a same-cycle live capture defers (never drops) the pending SQ-drain replay", VerilatorTest) {
+  test("precise replay preempts a colliding younger completion without dropping either stream", VerilatorTest) {
     simConfig.compile(new Dut).doSim(2) { dut =>
       val (cd, mem, ptmem) = initDut(dut)
       val base = 0x5000L
@@ -693,17 +810,22 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
 
       // Observe: every precise store's sqCompletionPort pulse (must land EXACTLY
       // once each, never dropped/duplicated even across a collision), and whether a
-      // genuine liveCompletionFires collision with a wants-to-apply pending entry was
-      // observed (the interesting path this test exists to exercise).
+      // genuine younger-front / precise-replay collision was observed and resolved
+      // in favor of the older replay (the interesting path this test exercises).
       val seenCounts = scala.collection.mutable.Map[Int, Int]().withDefaultValue(0)
-      var collisionSeen = false
+      var priorityCollisionSeen = false
       var n = 0
       val maxCycles = 4000
       while (seenCounts.keySet.size < numStores && n < maxCycles) {
         val wantsApply =
           (dut.eu.logic.pendApply.toInt == dut.eu.logic.pendReady.toInt && dut.eu.logic.sq.io.sqCompletion.valid.toBoolean) ||
           (dut.eu.logic.pendApply.toInt != dut.eu.logic.pendReady.toInt)
-        if (wantsApply && dut.eu.logic.liveCompletionFires.toBoolean) collisionSeen = true
+        if (wantsApply && dut.eu.logic.preciseReplayClaimsComp.toBoolean &&
+            dut.eu.logic.frontCompHeld.toBoolean) {
+          assert(!dut.eu.logic.liveCompletionFires.toBoolean,
+            "a younger front completion fired despite the older precise replay owning the slot")
+          priorityCollisionSeen = true
+        }
         if (dut.wire.logic.oSqCompValid.toBoolean) {
           val rid = dut.wire.logic.oSqCompPayload.toInt
           seenCounts(rid) += 1
@@ -715,9 +837,9 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
       cd.waitSampling(4)
 
       assert(n < maxCycles, s"timed out waiting for all $numStores precise-store completions (only saw ${seenCounts.keySet.size})")
-      assert(collisionSeen,
-        "test failed to engineer a liveCompletionFires collision with a wants-to-apply pending entry -- " +
-        "adjust numStores/seed (this assertion is intentional: it proves the interesting retry path was " +
+      assert(priorityCollisionSeen,
+        "test failed to engineer a younger-front collision with an older precise replay -- " +
+        "adjust numStores/seed (this assertion is intentional: it proves the interesting priority path was " +
         "actually exercised, not merely inferred)")
       assert(storeRobIds.forall(seenCounts.contains),
         s"every store's robId must be observed via sqCompletionPort, got ${seenCounts.keySet}")
@@ -758,49 +880,40 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
       assert(dut.eu.logic.pendPush.toInt == dut.eu.logic.pendReady.toInt,
         "precondition: pend FIFO starts balanced")
 
-      // Sweep the flush's cycle offset relative to the store's issue handshake so one
-      // iteration provably lands the flush on the EXACT cycle the store's alloc arm
-      // fires -- the only offset that reaches the bug. (Offsets before it hit the
-      // multi-cycle `poisoned` path; offsets after it hit the multi-cycle `pendPush :=
-      // pendReadyAfterThisCycle` rollback. Both of those were already correct; it is
-      // only the coincidence cycle that the rollback structurally cannot reach.)
-      // A sweep rather than a hand-tuned constant because the LS EU's issue->alloc
-      // latency is an implementation detail that may legitimately change: the loop
-      // ASSERTS that the coincidence was actually observed, so it can never pass
-      // vacuously if that latency moves. NOTE the one-cycle sim offset: a `#=` poke
-      // issued right after `waitSampling()` becomes visible to the design on the
-      // FOLLOWING cycle, so the coincidence is checked after the poke's own
-      // `waitSampling`, not before it.
-      var coincidenceOffsets = List.empty[Int]
-      var skewOffsets        = List.empty[Int]
-      for (k <- 0 until 10) {
-        issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11, Size.LONG, robId = 5)
-        if (k > 0) cd.waitSampling(k)
-        dut.src.logic.iSqFlush #= true
+      // Wait until the real D1 P3 terminal action is combinationally poised to
+      // allocate, then raise flush before its sampling edge. This is deterministic
+      // and non-vacuous: unlike an offset sweep it observes the actual action point,
+      // and it remains valid if the issue->P3 latency changes again.
+      issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11, Size.LONG, robId = 5)
+      var waitPoised = 0
+      while (!dut.eu.logic.sq.io.alloc.valid.toBoolean && waitPoised < 100) {
         cd.waitSampling()
-        // The flush is in effect for THIS cycle. If the alloc arm is firing in the same
-        // cycle, this iteration is the engineered coincidence.
-        if (dut.eu.logic.sq.io.alloc.valid.toBoolean && dut.eu.logic.sq.io.flush.toBoolean) {
-          coincidenceOffsets ::= k
-        }
-        dut.src.logic.iSqFlush #= false
-        cd.waitSampling(10)
-        // Whatever the offset, a flush squashes this (uncommitted, precise) store --
-        // either by dropping its alloc or by squashing the entry it just made -- so no
-        // SQ entry may survive, and pendMem MUST be back in lock-step with it.
-        assert(!dut.eu.logic.sq.valids.exists(_.toBoolean),
-          s"offset k=$k: the flush must leave NO resident SQ entry")
-        if (dut.eu.logic.pendPush.toInt != dut.eu.logic.pendReady.toInt) skewOffsets ::= k
+        waitPoised += 1
       }
-      assert(coincidenceOffsets.nonEmpty,
-        "the sweep never landed a flush on the store's actual SQ-alloc cycle -- this test would " +
-        "pass vacuously; widen the offset range (the LS EU's issue->alloc latency must have moved)")
-      assert(skewOffsets.isEmpty,
-        s"P2.7 FIX: a flush coincident with a precise store's SQ alloc (observed at offsets " +
-        s"$coincidenceOffsets) dropped the SQ alloc but NOT the pendMem push, leaving pendPush " +
-        s"skewed from pendReady at offsets $skewOffsets. pendMem and the SQ ring are a lock-step " +
-        "pair; a skew here mis-attributes EVERY later precise store's completion to the wrong " +
-        "robId, permanently (ROB head parks -> HANG; stale writeback -> WRONG ANSWER)")
+      assert(waitPoised < 100,
+        "precise store never became poised for SQ allocation; coincidence test would be vacuous")
+      assert(dut.eu.logic.sq.io.alloc.payload.robId.toInt == 5,
+        "the poised allocation must belong to the store under test")
+      val pushBeforeFlush = dut.eu.logic.pendPush.toInt
+      val readyBeforeFlush = dut.eu.logic.pendReady.toInt
+
+      dut.src.logic.iSqFlush #= true
+      sleep(1) // let the same-cycle combinational flush arbitration settle
+      assert(dut.eu.logic.sq.io.flush.toBoolean,
+        "testbench flush must reach the SQ in the engineered coincidence cycle")
+      assert(!dut.eu.logic.sq.io.alloc.valid.toBoolean,
+        "D1 must suppress the poised speculative allocation combinationally on flush")
+      cd.waitSampling()
+      dut.src.logic.iSqFlush #= false
+      cd.waitSampling(10)
+
+      assert(!dut.eu.logic.sq.valids.exists(_.toBoolean),
+        "flush at the poised allocation boundary must leave no resident SQ entry")
+      assert(dut.eu.logic.pendPush.toInt == pushBeforeFlush &&
+             dut.eu.logic.pendReady.toInt == readyBeforeFlush,
+        s"flush at the poised allocation boundary must not advance either pending pointer " +
+        s"(before push/ready=$pushBeforeFlush/$readyBeforeFlush, after=" +
+        s"${dut.eu.logic.pendPush.toInt}/${dut.eu.logic.pendReady.toInt})")
 
       // End-to-end consequence check: the NEXT precise store must have its OWN robId
       // replayed out sqCompletionPort. With the skew, its drain would replay a squashed

@@ -21,11 +21,13 @@ class LsEuSpec extends AnyFunSuite {
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc   // LS EU now writes NZVC for MOVE-to-memory
     val rfX    = new RegFilePluginX     // LS EU now writes X for RTR CCR-restore
+    val cacheCtrl = new CacheControlStubPlugin
     val xlate  = new DIdentityTranslationPlugin
     val dcache = new DcachePlugin
     val eu     = new LsEuPlugin
     val src    = new LsEuSourcePlugin
-    db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, xlate, dcache, eu, src)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, cacheCtrl,
+                                           xlate, dcache, eu, src)) }
   }
 
   def simConfig = M68kSim().withVerilator
@@ -49,7 +51,13 @@ class LsEuSpec extends AnyFunSuite {
     s.iLeaAddr #= false   // MUST default: undriven -> randomized per seed -> every load
                           // takes the LEA address-generate path (dst = EA, not the data).
     s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false
+    // Make the fixture's advertised "hit" tests real: without a CacheControlService
+    // the LS EU correctly forces every access INHIBITED, so no first load can allocate.
     cd.waitSampling(80) // PRF init sweep
+    // Apply after reset/PRF initialization; poking a RegInit while reset is still
+    // asserted would be overwritten back to the architectural DE=0 reset value.
+    dut.cacheCtrl.logic.dcacheEnabled #= true
+    cd.waitSampling()
     (cd, mem)
   }
 
@@ -84,6 +92,21 @@ class LsEuSpec extends AnyFunSuite {
     saw
   }
 
+  /** Wait for the store to become a real resident SQ entry. Standalone identity-
+    * translated stores are precise, so allocation deliberately does not complete
+    * the ROB entry; completion follows commit and the acknowledged drain. */
+  def waitStoreAlloc(dut: Dut, cd: ClockDomain, robId: Int, maxCycles: Int = 60): Boolean = {
+    var resident = false
+    var n = 0
+    while (!resident && n < maxCycles) {
+      resident = dut.eu.logic.sq.valids.zip(dut.eu.logic.sq.robIds)
+        .exists { case (valid, id) => valid.toBoolean && id.toInt == robId }
+      if (!resident) cd.waitSampling()
+      n += 1
+    }
+    resident
+  }
+
   test("load miss refills then writes PRF + fires completion", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
       val (cd, mem) = initDut(dut)
@@ -111,13 +134,37 @@ class LsEuSpec extends AnyFunSuite {
       var tracking = true
       var parallelLaunchSeen = false
       var earlyConsumeSeen = false
+      val viptTrace = scala.collection.mutable.ArrayBuffer.empty[String]
       fork {
         while (tracking) {
-          cd.waitSampling()
+          // `useEarlyProbe && loadCmd.fire` is a pre-edge handshake condition.
+          // Sample in the body of the cycle; sampling only after the edge can miss
+          // the exact consume-and-replace cycle even though the transfer occurred.
+          sleep(1)
           if (dut.eu.logic.parallelViptLaunch.toBoolean) parallelLaunchSeen = true
           if (dut.dcache.logic.useEarlyProbe.toBoolean &&
               dut.dcache.logic.loadCmdPort.valid.toBoolean &&
               dut.dcache.logic.loadCmdPort.ready.toBoolean) earlyConsumeSeen = true
+          if (dut.eu.logic.parallelViptLaunch.toBoolean ||
+              dut.dcache.logic.loadCmdPort.valid.toBoolean ||
+              dut.dcache.logic.earlyProbeValid.toBoolean) {
+            viptTrace += s"launch=${dut.eu.logic.parallelViptLaunch.toBoolean}" +
+              s",de=${dut.cacheCtrl.logic.dcacheEnabled.toBoolean}" +
+              s",probeResolved=${dut.dcache.logic.loadProbePort.payload.resolved.toBoolean}" +
+              s",probeMode=${dut.dcache.logic.loadProbePort.payload.cacheMode.toEnum}" +
+              s",cmdV=${dut.dcache.logic.loadCmdPort.valid.toBoolean}" +
+              s",cmdR=${dut.dcache.logic.loadCmdPort.ready.toBoolean}" +
+              s",owns=${dut.dcache.logic.earlyProbeOwnsCmd.toBoolean}" +
+              s",use=${dut.dcache.logic.useEarlyProbe.toBoolean}" +
+              s",rdUse=${dut.dcache.logic.probeReadUsable.toBoolean}" +
+              s",lineHit=${dut.dcache.logic.probeLineHit.toBoolean}" +
+              s",q=" + dut.dcache.logic.earlyProbeValids.indices.map { i =>
+                s"${dut.dcache.logic.earlyProbeValids(i).toBoolean}/" +
+                  s"${dut.dcache.logic.earlyProbeReadies(i).toBoolean}/" +
+                  s"${dut.dcache.logic.earlyProbeHits(i).toBoolean}"
+              }.mkString("[", ";", "]")
+          }
+          cd.waitSampling()
         }
       }
       issueLoad(dut, cd, basePreg = 10, disp = 8, Size.LONG, pdst = 21, robId = 2)
@@ -126,7 +173,8 @@ class LsEuSpec extends AnyFunSuite {
       assert(parallelLaunchSeen,
         "the registered LS token must launch DTLB and virtual-set RAM lookup together")
       assert(earlyConsumeSeen,
-        "the later physical-tag command must consume that DTLB-parallel RAM result")
+        "the later physical-tag command must consume that DTLB-parallel RAM result; " +
+          viptTrace.mkString(" | "))
       cd.waitSampling(4)
       dut.src.logic.obsIntAddr #= 21; sleep(1)
       assert(dut.src.logic.obsIntData.toBigInt == expectedLong(base + 8), s"hit result ${dut.src.logic.obsIntData.toBigInt.toString(16)}")
@@ -141,15 +189,18 @@ class LsEuSpec extends AnyFunSuite {
       seed(dut, cd, preg = 10, value = base)
       seed(dut, cd, preg = 11, value = 0xDEADBEEFL)  // store data preg
       issueStore(dut, cd, basePreg = 10, disp = 4, dataPreg = 11, Size.LONG, robId = 7)
-      assert(waitCompletion(dut, cd, robId = 7), "store completion (SQ alloc)")
-      cd.waitSampling(2)
+      assert(waitStoreAlloc(dut, cd, robId = 7), "store must allocate into the SQ")
+      assert(!waitCompletion(dut, cd, robId = 7, maxCycles = 4),
+        "a precise store must not complete before its acknowledged drain")
       // not committed yet -> memory unchanged
       assert(mem.peekByte(base + 4) != 0xDE, "store must not drain before commit")
       // commit the store
       dut.src.logic.iSqCommitValid #= true; dut.src.logic.iSqCommitRob #= 7
       cd.waitSampling()
       dut.src.logic.iSqCommitValid #= false
-      cd.waitSampling(12)
+      assert(waitCompletion(dut, cd, robId = 7),
+        "committed precise store must complete after the memory ack")
+      cd.waitSampling(2)
       assert(mem.peekByte(base + 4) == 0xDE, "committed store drains to memory")
       assert(mem.peekByte(base + 7) == 0xEF, "store byte +7")
     }
@@ -164,8 +215,7 @@ class LsEuSpec extends AnyFunSuite {
       seed(dut, cd, preg = 11, value = 0xABCD1234L)
       // store (robId 3) then younger load (robId 5) same addr -> forward
       issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11, Size.LONG, robId = 3)
-      assert(waitCompletion(dut, cd, robId = 3), "store alloc")
-      cd.waitSampling(2)
+      assert(waitStoreAlloc(dut, cd, robId = 3), "store must be resident for forwarding")
       issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 22, robId = 5)
       assert(waitCompletion(dut, cd, robId = 5), "forwarded load")
       cd.waitSampling(4)
@@ -185,7 +235,7 @@ class LsEuSpec extends AnyFunSuite {
       seed(dut, cd, preg = 11, value = 0x0BADF00DL)
       // store (robId 3) then COMMIT it -> it begins draining to memory.
       issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11, Size.LONG, robId = 3)
-      assert(waitCompletion(dut, cd, robId = 3), "store alloc")
+      assert(waitStoreAlloc(dut, cd, robId = 3), "store must allocate before commit")
       dut.src.logic.iSqCommitValid #= true; dut.src.logic.iSqCommitRob #= 3
       cd.waitSampling()
       dut.src.logic.iSqCommitValid #= false
@@ -220,9 +270,10 @@ class LsEuSpec extends AnyFunSuite {
       // initial cross-line store (the seed) of 0x12345678
       seed(dut, cd, preg = 11, value = 0x12345678L)
       issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11, Size.LONG, robId = 1)
-      assert(waitCompletion(dut, cd, robId = 1), "seed store alloc")
+      assert(waitStoreAlloc(dut, cd, robId = 1), "seed store alloc")
       commit(dut, cd, robId = 1)
-      cd.waitSampling(20)
+      assert(waitCompletion(dut, cd, robId = 1), "seed store acknowledged drain")
+      cd.waitSampling(2)
       assert(mem.peekByte(0x3FFEL) == 0x12, s"seed slotA drained: ${mem.peekByte(0x3FFEL).toHexString}")
       assert(mem.peekByte(0x4000L) == 0x56, s"seed slotB drained: ${mem.peekByte(0x4000L).toHexString}")
       // cross-line LOAD to the same address
@@ -232,9 +283,10 @@ class LsEuSpec extends AnyFunSuite {
       // cross-line STORE of 0xCAFEBABE to the same address
       seed(dut, cd, preg = 12, value = 0xCAFEBABEL)
       issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 12, Size.LONG, robId = 3)
-      assert(waitCompletion(dut, cd, robId = 3), "cross-line store alloc")
+      assert(waitStoreAlloc(dut, cd, robId = 3), "cross-line store alloc")
       commit(dut, cd, robId = 3)
-      cd.waitSampling(30)
+      assert(waitCompletion(dut, cd, robId = 3), "cross-line store acknowledged drain")
+      cd.waitSampling(2)
       assert(mem.peekByte(0x3FFEL) == 0xCA, s"slotA write-through dropped: dut=0x${mem.peekByte(0x3FFEL).toHexString} exp=0xca")
       assert(mem.peekByte(0x3FFFL) == 0xFE, s"slotA byte1: dut=0x${mem.peekByte(0x3FFFL).toHexString} exp=0xfe")
       assert(mem.peekByte(0x4000L) == 0xBA, s"slotB byte0: dut=0x${mem.peekByte(0x4000L).toHexString} exp=0xba")
@@ -250,8 +302,7 @@ class LsEuSpec extends AnyFunSuite {
       seed(dut, cd, preg = 10, value = base)
       seed(dut, cd, preg = 11, value = 0x55667788L)
       issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11, Size.LONG, robId = 9)
-      assert(waitCompletion(dut, cd, robId = 9), "store alloc")
-      cd.waitSampling(2)
+      assert(waitStoreAlloc(dut, cd, robId = 9), "store alloc")
       // flush before commit -> squashed, never drains
       dut.src.logic.iSqFlush #= true
       cd.waitSampling()
