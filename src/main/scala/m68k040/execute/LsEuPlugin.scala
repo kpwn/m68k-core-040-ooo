@@ -73,6 +73,32 @@ case class LsFault() extends Bundle {
   *            "executes" == SQ-allocated; it drains at commit).
   * issue.ready deasserts while a load is in flight (busy) -> EU is occupied. */
 class LsEuPlugin extends FiberPlugin with LsEuService {
+  // ─────────────────────────────────────────────────────────────────────────
+  // LS EU LATE SPLIT (2026-08-09, spec docs/superpowers/specs/
+  // 2026-08-09-ipc-ls-eu-pipeline-depth-design.md §3).
+  //
+  // The FSM below is split into a FRONT stage (IDLE/XLATE_B/XLATE/RESOLVE/
+  // WAIT_SQ — owns s1*, s2Paddr, busy; completes every store and every
+  // SQ-forwarded load exactly as before) and a BACK stage (BK_IDLE/LAUNCH/
+  // WAIT/WAIT_A/WAIT_B — owns llReg/lineA/aDone and the D-cache access).
+  //
+  // `earlyFree` selects whether the front actually FREES S1 at the handoff:
+  //   false (Slice 1) — the front parks in WAIT_BK holding busy/s1Valid until
+  //                     the back completes. Cycle-for-cycle IDENTICAL to the
+  //                     pre-split design. Exists ONLY to measure the placement/
+  //                     area cost of the restructure in isolation, because a
+  //                     logically-redundant one-term change in this exact cone
+  //                     was measured on 2026-08-09 to cost -6.55 MHz and
+  //                     +4785 LUTs (the `!compValid` rejection — placement
+  //                     ballast, not logic).
+  //   true  (Slice 2) — the front frees S1 at RESOLVE and stalls there only
+  //                     while `bkBusy` (NG1: exactly one load in the cache,
+  //                     because `DLoadRsp` carries no id).
+  //
+  // `issue.ready`'s EXPRESSION is deliberately unchanged in BOTH modes (GC13) —
+  // only WHEN `busy` reads 0 changes. See spec §6.2.
+  private val earlyFree: Boolean = false
+
   var issuePort: Stream[IqContext] = null
   var completionPort: Flow[UInt]   = null
   var sqCommitPort: Flow[UInt]     = null
@@ -515,6 +541,69 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       val twoAccess = RegInit(False)
       val bDone     = RegInit(False)   // slot A launched; now presenting slot B (cross)
     }
+
+    // ── BACK-STAGE completion descriptor (spec §3.2(c)) ──────────────────────
+    // Everything `captureCompletion`/`captureFault` read from `u1`/`s1Ctx`/`xlate`
+    // must be captured at the RESOLVE->LAUNCH handoff, because after the handoff the
+    // FRONT stage is translating a DIFFERENT µop and every one of those live reads
+    // would silently belong to that younger µop.
+    //
+    // Restricted to what a non-forwarded LOAD can reach: the back stage is only ever
+    // entered from RESOLVE, and RESOLVE is only reachable from XLATE's `otherwise`
+    // (== !isStore) arm, so `isStore`, `isAutoStoreAn` (= isStore && ...) and
+    // `compRmwStore`/`compEaAutoDrop` (both require isStore) are provably False here.
+    // `u1.leaAddr` is likewise unreachable: IDLE completes an LEA before XLATE.
+    // `u1.stkPush` is a store-only marker for the same reason.
+    //
+    // `lineOff` (= s1Va(3 downto 0)) and `u1.size`, both read by WAIT_B's
+    // extractCross, are ALREADY carried as llReg.vaddr(3 downto 0) / llReg.size —
+    // no new state for those.
+    case class BkCtx() extends Bundle {
+      val robId           = UInt(6 bits)
+      val pdst            = UInt(6 bits)
+      val pdstValid       = Bool()
+      val wakes           = Bool()
+      val ccrRestore      = Bool()
+      val signExtW        = Bool()   // MOVEM.W load sign-extend (u1.isMovea && size==WORD)
+      val dstArch         = UInt(5 bits)
+      val writesNzvc      = Bool()
+      val pNzvcDst        = UInt(nzvcW.address.getWidth bits)
+      val writesX         = Bool()
+      val pXDst           = UInt(xW.address.getWidth bits)
+      val crackDrop       = Bool()
+      val keepCommit      = Bool()
+      val needsSupervisor = Bool()
+      // spec §3.2(d) — THE correctness fix. `WAIT` reads `xlate.req.supervisor` LIVE
+      // today (`suppressForLaterPrivCheck`, and `captureFault`'s `compFaultSup`). The
+      // registered DTLB request re-captures `reqDrvSup` (the LIVE architectural S bit)
+      // EVERY cycle, so once the back stage outlives its own S1 residency those reads
+      // report whatever the S bit is NOW, not what it was for THIS access. Capturing it
+      // here is not a refactor detail: it is a correctness requirement of the split.
+      val xlateSup        = Bool()
+    }
+    val bkCtx      = Reg(BkCtx())
+    // Back stage occupied. NG1 (single-occupancy) is a CONTRACT, not an effort budget:
+    // `DLoadRsp` carries no id (DcacheTypes.scala:24-28) and the back FSM attributes
+    // `loadRsp` purely by its own state, so a second load must never enter.
+    val bkBusy     = RegInit(False); bkBusy.simPublic()
+    // spec §3.2(e) — with two independent in-flight µops, one `poisoned` bit cannot
+    // serve both: a new `issuePort.fire` would clear the poison of the OLDER µop still
+    // draining in the back stage. Set from `poisoned` at handoff (ORed with a
+    // same-cycle `sqFlushSig`, because `poisoned` is a Reg that only reads True from
+    // the NEXT cycle) and re-set by any later flush while the back is occupied.
+    val bkPoisoned = RegInit(False); bkPoisoned.simPublic()
+    // Combinational handoff pulse: the front's RESOLVE asserts it, the back's BK_IDLE
+    // consumes it in the SAME cycle, so the back reaches LAUNCH on exactly the cycle
+    // the pre-split FSM did (a Reg-based handshake would cost one extra cycle).
+    val bkStart    = Bool(); bkStart := False; bkStart.simPublic()
+    // Observability for the arbitration tests: True the cycle a FRONT completion was
+    // suppressed and held because the BACK claimed the shared comp* stage.
+    val frontCompHeld = Bool(); frontCompHeld := False; frontCompHeld.simPublic()
+    // A later flush poisons whatever is draining in the back. Plain component statement:
+    // SpinalHDL elaborates StateMachine bodies from a pre-pop task, i.e. AFTER every
+    // plain statement, so the FRONT FSM's handoff assignment below correctly WINS on the
+    // handoff cycle (where `bkBusy` is still False anyway and this does not fire).
+    when(sqFlushSig && bkBusy) { bkPoisoned := True }
 
     // Slot-B (split-access second half) DTLB translate-request arm (mmu-split-
     // second-half fix): set for the duration of the new XLATE_B FSM state, while
@@ -1027,6 +1116,93 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compFaultAtc  := Bool(atc)
     }
 
+    // ── BACK-STAGE capture (spec §3.2(c)) ────────────────────────────────────
+    // The back-stage twin of `captureCompletion`, reading `bkCtx`/`llReg` instead of
+    // the live `u1`/`s1Ctx`/`s1Va`. Every field the load path cannot reach is
+    // hardcoded to its provable value (see BkCtx's declaration comment) rather than
+    // carried as a flop.
+    def captureCompletionBk(result: Bits): Unit = {
+      liveCompletionFires := True
+      compValid      := True
+      compRobId      := bkCtx.robId
+      compData       := Mux(bkCtx.signExtW, result(15 downto 0).asSInt.resize(32).asBits, result)
+      compPdst       := bkCtx.pdst
+      compPdstValid  := bkCtx.pdstValid
+      compIsLoad     := True
+      compWakes      := bkCtx.wakes
+      compStkPush    := False           // store-only marker; unreachable from RESOLVE
+      compCcrRestore := bkCtx.ccrRestore
+      compEaAutoDrop := False           // requires isStore
+      compRmwStore   := False           // requires isStore
+      compCrackDrop  := bkCtx.crackDrop
+      compKeepCommit := bkCtx.keepCommit
+      compDstArch    := bkCtx.dstArch
+      // RTR CCR-restore: NZVC := loaded[3:0], X := loaded[4]. A plain load leaves
+      // writesNzvc/writesX False, so these are don't-cares on that path (identical to
+      // the pre-split behaviour, where the storeNzvc Mux arm was equally a don't-care).
+      compNzvc       := result(3 downto 0)
+      compNzvcWrite  := bkCtx.writesNzvc
+      compNzvcDst    := bkCtx.pNzvcDst
+      compX          := result(4)
+      compXWrite     := bkCtx.writesX
+      compXDst       := bkCtx.pXDst
+      compIsFault    := False
+    }
+
+    // The back-stage twin of `captureFault`. Only ONE call site exists (a D-cache
+    // refill AXI bus error surfacing on `loadRsp.payload.fault`, task #189), so
+    // `atc` is always false and `faultAddr` is always slot A's address — which
+    // `llReg.vaddr` holds verbatim (RESOLVE captured it from s1Va).
+    def captureFaultBk(atc: Boolean): Unit = {
+      liveCompletionFires := True
+      compValid      := True
+      compRobId      := bkCtx.robId
+      compPdstValid  := False
+      compNzvcWrite  := False
+      compXWrite     := False
+      compIsLoad     := False
+      compWakes      := False
+      compStkPush    := False
+      compCcrRestore := False
+      compEaAutoDrop := False
+      compCrackDrop  := False
+      compKeepCommit := False
+      compIsFault    := True
+      compFaultAddr  := llReg.vaddr
+      compFaultWr    := False           // requires isStore
+      compFaultSize  := llReg.size.mux(
+        m68k040.isa.Size.BYTE -> U(0, 2 bits),
+        m68k040.isa.Size.WORD -> U(1, 2 bits),
+        m68k040.isa.Size.LONG -> U(2, 2 bits))
+      // spec §3.2(d): the CAPTURED supervisor bit, never the live one.
+      compFaultSup   := bkCtx.xlateSup
+      compFaultAtc   := Bool(atc)
+    }
+
+    // Capture the back-stage descriptor at the RESOLVE->LAUNCH handoff. Called from
+    // the FRONT FSM's RESOLVE "no forward" arm, in the SAME cycle llReg is captured,
+    // so every source is the still-resident S1 context of THIS load.
+    def captureBkCtx(): Unit = {
+      bkCtx.robId           := s1Ctx.robId
+      bkCtx.pdst            := u1.pdst
+      bkCtx.pdstValid       := u1.pdstValid && !u1.ccrRestore
+      // Carried as the FULL pre-split expression rather than the load-only subset, so
+      // this can never silently diverge if a future µop shape reaches RESOLVE.
+      bkCtx.wakes           := (isLoad && !u1.ccrRestore) || u1.stkPush || u1.leaAddr ||
+                               (isAutoStoreAn && u1.pdstValid)
+      bkCtx.ccrRestore      := u1.ccrRestore
+      bkCtx.signExtW        := u1.isMovea && isLoad && (u1.size === m68k040.isa.Size.WORD)
+      bkCtx.dstArch         := u1.dstArch
+      bkCtx.writesNzvc      := u1.writesNzvc
+      bkCtx.pNzvcDst        := u1.pNzvcDst
+      bkCtx.writesX         := u1.writesX
+      bkCtx.pXDst           := u1.pXDst
+      bkCtx.crackDrop       := u1.divIsRem
+      bkCtx.keepCommit      := u1.keepCommit
+      bkCtx.needsSupervisor := u1.needsSupervisor
+      bkCtx.xlateSup        := xlate.req.supervisor
+    }
+
     // ── Precise-store deferred-completion replay (root-cause fix, post-P2.5
     // lock-step investigation) ──────────────────────────────────────────────
     // Task P2.2 makes `captureCompletion` for a store CONDITIONAL on `fastStore`,
@@ -1266,37 +1442,143 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // the fsm closes, by the deferred-replay arbitration -- see its comment).
     liveCompletionFires := False
 
+    // ── BACK STAGE FSM: owns the D-cache access (spec §3.1) ──────────────────
+    // Declared BEFORE the front FSM so `bkFsm.isActive(...)` is available to the
+    // front's completion-collision guards. It reads `bkStart`/`bkPoisoned`/`bkCtx`/
+    // `llReg` (all declared above) and writes only back-owned state, so there is no
+    // elaboration-order dependency in the other direction.
+    val bkFsm = new StateMachine {
+      val BK_IDLE = new State with EntryPoint
+      val LAUNCH  = new State   // registered cache launch: drive loadCmd off llReg (FMax #1)
+      val WAIT    = new State   // aligned: cache load cmd accepted, awaiting loadRsp
+      val WAIT_A  = new State   // cross: slot A accepted, awaiting line A
+      val WAIT_B  = new State   // cross: slot B accepted, awaiting line B -> merge
+
+      BK_IDLE.whenIsActive {
+        // spec §5.5 — THE SECOND correctness fix. This housekeeping used to live in the
+        // FRONT's IDLE. Once the front can be in IDLE while a CROSS load is mid-flight
+        // in WAIT_A (llReg.bDone set, slot B not yet launched), clearing it from the
+        // front would re-point the back's slot-B cache command at slot A's address:
+        // the already-fixed cross-line-store-after-load hazard reappearing in a new
+        // form. It is BACK-owned now, cleared only when the back is genuinely idle.
+        llReg.bDone := False
+        when(bkStart) { goto(LAUNCH) }
+      }
+
+      LAUNCH.whenIsActive {
+        when(dcache.loadCmd.fire) {
+          // Slot A accepted -> drop loadCmd.valid (do NOT re-issue slot A while WAIT/
+          // WAIT_A awaits its response). For a cross access WAIT_A re-asserts the launch
+          // for slot B (bDone) once slot A's line lands.
+          llReg.valid := False
+          when(llReg.twoAccess) { aDone := False; goto(WAIT_A) }
+          .otherwise { goto(WAIT) }
+        }
+      }
+
+      WAIT.whenIsActive {
+        when(dcache.loadRsp.valid) {
+          when(!bkPoisoned) {
+            // spec §3.2(d): both terms come from `bkCtx`, NOT from the live `u1`/
+            // `xlate.req` — after the split those describe a DIFFERENT µop. See the
+            // pre-split comment block for the full task-#189 rationale this preserves:
+            // a user-mode `MOVE <ea>,SR` source load must NOT report a bus fault (the
+            // later sysOp's own privilege check owns the trap), but a SUPERVISOR-mode
+            // one must.
+            val suppressForLaterPrivCheck = bkCtx.needsSupervisor && !bkCtx.xlateSup
+            when(dcache.loadRsp.payload.fault && !suppressForLaterPrivCheck) { captureFaultBk(atc = false) }
+            .otherwise { captureCompletionBk(dcache.loadRsp.payload.data) }
+          }
+          bkBusy := False
+          goto(BK_IDLE)
+        }
+      }
+
+      WAIT_A.whenIsActive {
+        when(dcache.loadRsp.valid && !aDone) {
+          lineA       := dcache.loadRsp.payload.line
+          aDone       := True
+          llReg.bDone := True
+        }
+        when(aDone) {
+          llReg.valid := True
+          when(dcache.loadCmd.fire) { llReg.valid := False; goto(WAIT_B) }
+        }
+      }
+
+      WAIT_B.whenIsActive {
+        when(dcache.loadRsp.valid) {
+          // `lineOff`/`u1.size` are back-carried as llReg.vaddr(3 downto 0)/llReg.size
+          // (spec §3.2(c)) — reading the live s1Va/u1 here would be the same class of
+          // staleness bug as the supervisor read above.
+          val merged = m68k040.cache.DcacheByteLane.extractCross(
+            lineA, dcache.loadRsp.payload.line, llReg.vaddr(3 downto 0), llReg.size)
+          when(!bkPoisoned) { captureCompletionBk(merged) }
+          bkBusy := False
+          goto(BK_IDLE)
+        }
+      }
+    }
+
+    // ── Front-vs-back completion arbitration (spec §3.2(f) / §5.3) ───────────
+    // Today exactly one thing drives the shared comp* stage per cycle. After the split
+    // three writers exist: the front's live capture, the back's live capture, and the
+    // precise-store deferred replay. The replay already yields to `liveCompletionFires`.
+    // Front-vs-back is arbitrated HERE, and the BACK WINS: `dcache.loadRsp` is a
+    // 1-cycle Flow with no backpressure (DcacheTypes.scala:74), so a missed back
+    // completion LOSES the load, while the front can simply hold one cycle.
+    //
+    // Derived from `bkFsm.isActive` rather than from an assignment inside either FSM,
+    // so neither FSM's statement-emission order can affect it.
+    val bkInWait      = bkFsm.isActive(bkFsm.WAIT)
+    val bkInWaitB     = bkFsm.isActive(bkFsm.WAIT_B)
+    // The back RELEASES this cycle (poisoned or not) — the front's Slice-1 WAIT_BK
+    // uses this to free S1 on exactly the pre-split cycle.
+    val bkCompletes   = (bkInWait || bkInWaitB) && dcache.loadRsp.valid
+    bkCompletes.simPublic()
+    // The back actually WRITES comp* this cycle (a poisoned back load writes nothing,
+    // so the front is free to use the stage).
+    val backCompFires = bkCompletes && !bkPoisoned
+    backCompFires.simPublic()
+
+    // ── FRONT STAGE FSM: owns s1*/s2Paddr/busy; completes stores + forwarded loads ──
     val fsm = new StateMachine {
       val IDLE    = new State with EntryPoint
       val XLATE_B = new State  // split access ONLY: real DTLB translate of addrB (2nd half)
       val XLATE   = new State  // registered translated paddr -> SQ-fwd query / store alloc
       val RESOLVE = new State  // registered SQ-fwd result -> completion / cache launch
-      val LAUNCH  = new State  // registered cache launch: drive loadCmd off llReg (FMax #1)
-      val WAIT    = new State   // aligned: cache load cmd accepted, awaiting loadRsp
-      val WAIT_A  = new State    // cross: slot A accepted, awaiting line A
-      val WAIT_B  = new State    // cross: slot B accepted, awaiting line B -> merge
+      // Slice-1 ONLY: park here holding busy/s1Valid until the back completes, so the
+      // observable cycle counts are IDENTICAL to the pre-split design. With
+      // `earlyFree = true` this state is not elaborated at all and RESOLVE frees S1
+      // directly (Slice 2).
+      val WAIT_BK = if (earlyFree) null else new State
       val WAIT_SQ = new State    // store: SQ full, hold the alloc until an entry drains
 
       IDLE.whenIsActive {
         busy := False
-        // Clear the cross slot-B select left set by a PRIOR cross-line LOAD (WAIT_A sets
-        // llReg.bDone := True and the load completes WITHOUT clearing it). bDone gates
-        // `xlateVaddr` (s1AddrB when set), and a STORE translates in IDLE/XLATE WITHOUT
-        // ever passing through RESOLVE (where a load re-clears bDone), so a stale bDone
-        // would make the store translate the NEXT-line base (s1AddrB) instead of s1Va —
-        // corrupting slot A's paddr to the wrong line and DROPPING its write-through
-        // (PRE-EXISTING cross-line-store-after-load bug). Cleared here every IDLE cycle;
-        // re-armed only by WAIT_A for an in-flight cross load.
-        llReg.bDone := False
+        // spec §5.5: `llReg.bDone` housekeeping MOVED to the back FSM's BK_IDLE. Doing
+        // it here would clear a live cross-load's bDone mid-flight once the front can
+        // reach IDLE while the back is still in WAIT_A. RESOLVE's own explicit
+        // `llReg.bDone := False` at handoff still covers the case this line was
+        // originally written for (a store's launch never re-uses a stale slot-B select).
         when(s1Valid) {
           when(u1.leaAddr) {
             // LEA address-generate: complete immediately with the computed EA address
             // (s1Va) as the int result. NO translate, NO cache access -> never page-faults.
             // The int dst (An / T0) write + wakeup ride captureCompletion's leaAddr path.
             // Task #139 mechanism #2: suppress for a poisoned (squashed) access.
-            when(!poisoned) { captureCompletion(s1Va.asBits) }
-            busy    := False
-            s1Valid := False
+            // spec §5.3: yield the shared comp* stage to an older back-stage completion
+            // and retry next cycle (busy/s1Valid explicitly re-asserted because IDLE's
+            // pre-update `busy` may still read False on this cycle).
+            when(backCompFires) {
+              frontCompHeld := True
+              busy    := True
+              s1Valid := True
+            } otherwise {
+              when(!poisoned) { captureCompletion(s1Va.asBits) }
+              busy    := False
+              s1Valid := False
+            }
           } elsewhen(isLoad || isStore) {
             // Translate-at-execute: REGISTER the translated paddr (+perm fault) in
             // this stage so the SQ overlap-compare / store-alloc consume a REGISTERED
@@ -1320,11 +1602,20 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
                 // proceed (no SQ alloc / no cache launch); it completes as a FAULT
                 // (vector 2) so the ROB flags the entry for precise delivery.
                 // Task #139 mechanism #2: suppress for a poisoned (squashed) access.
-                when(!poisoned) { captureFault() }
-                probeCancel := probeOutstanding || dcache.loadProbe.fire
-                busy    := False
-                s1Valid := False
-                goto(IDLE)
+                // spec §5.3: hold if the back claimed comp* this cycle; `xlateReady &&
+                // reqMatch` still hold next cycle (no new issuePort.fire can occur
+                // while s1Valid is re-asserted).
+                when(backCompFires) {
+                  frontCompHeld := True
+                  busy    := True
+                  s1Valid := True
+                } otherwise {
+                  when(!poisoned) { captureFault() }
+                  probeCancel := probeOutstanding || dcache.loadProbe.fire
+                  busy    := False
+                  s1Valid := False
+                  goto(IDLE)
+                }
               } otherwise {
                 s2Paddr  := s1Paddr
                 s2Fault  := xlateFault
@@ -1362,7 +1653,13 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
               s1Valid := True
             }
           } otherwise {
-            when(!poisoned) { captureCompletion(B(0, 32 bits)) }   // non-memory (defensive)
+            when(backCompFires) {
+              frontCompHeld := True
+              busy    := True
+              s1Valid := True
+            } otherwise {
+              when(!poisoned) { captureCompletion(B(0, 32 bits)) }   // non-memory (defensive)
+            }
           }
         }
       }
@@ -1386,12 +1683,20 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
             // addrB's OWN translation faulted (independently of slot A, which already
             // resolved cleanly — that's exactly why this state exists). Report the
             // fault at addrB's own address, not slot A's.
-            when(!poisoned) { captureFault(faultAddr = s1AddrB) }
-            probeCancel := probeOutstanding || dcache.loadProbe.fire
-            xlateBArm := False
-            busy    := False
-            s1Valid := False
-            goto(IDLE)
+            // spec §5.3: hold on a comp* collision. `xlateBArm` stays True while holding,
+            // so `reqMatch`/`xlateReady` re-evaluate identically next cycle. `busy` is
+            // already True from this state's own header, and the S0->S1 advance reads the
+            // pre-update `busy` (True), so `s1Valid` holds with no explicit re-assert.
+            when(backCompFires) {
+              frontCompHeld := True
+            } otherwise {
+              when(!poisoned) { captureFault(faultAddr = s1AddrB) }
+              probeCancel := probeOutstanding || dcache.loadProbe.fire
+              xlateBArm := False
+              busy      := False
+              s1Valid   := False
+              goto(IDLE)
+            }
           } otherwise {
             // s1PaddrB (declared alongside s1Paddr, above) combines THIS response's
             // ppn with addrB's own page offset — the REAL translated physical address.
@@ -1437,28 +1742,41 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
             // (matching every other instruction's eager completes()) but NEVER
             // touch `sq.io.alloc` -- no memory write is ever queued. See
             // `storePrivBlocked`'s declaration comment for the full story.
-            captureCompletion(B(0, 32 bits))
-            busy    := False
-            s1Valid := False
-            goto(IDLE)
-          } elsewhen(!sq.io.full) {
-            sq.io.alloc.valid           := True
-            sq.io.alloc.payload.precise := !fastStore
-            when(fastStore) {
-              // exactly today's path: architectural completion the SAME cycle as alloc.
-              captureCompletion(B(0, 32 bits))
+            // spec §5.3: hold on a comp* collision.
+            when(backCompFires) {
+              frontCompHeld := True
             } otherwise {
-              // precise: latch the withheld completion for later replay (see
-              // `deferCompletion` above) when the SQ confirms the drain.
-              deferCompletion()
+              captureCompletion(B(0, 32 bits))
+              busy    := False
+              s1Valid := False
+              goto(IDLE)
             }
-            // !fastStore: allocate WITHOUT completing. The LS EU's single-outstanding
-            // contract does not depend on completion -- it frees here regardless; the
-            // store's ROB completion arrives later from the SQ's at-head drain
-            // (StoreQueue's sqCompletion/sqFaultCompletion Flows, Task P2.4).
-            busy    := False
-            s1Valid := False
-            goto(IDLE)
+          } elsewhen(!sq.io.full) {
+            // spec §5.3: a FAST store's alloc and its architectural completion happen in
+            // the SAME cycle by construction, so a comp* collision must hold BOTH — the
+            // alloc may not run without the completion. A PRECISE store's `deferCompletion`
+            // touches no comp* register at all, so it proceeds regardless.
+            when(fastStore && backCompFires) {
+              frontCompHeld := True
+            } otherwise {
+              sq.io.alloc.valid           := True
+              sq.io.alloc.payload.precise := !fastStore
+              when(fastStore) {
+                // exactly today's path: architectural completion the SAME cycle as alloc.
+                captureCompletion(B(0, 32 bits))
+              } otherwise {
+                // precise: latch the withheld completion for later replay (see
+                // `deferCompletion` above) when the SQ confirms the drain.
+                deferCompletion()
+              }
+              // !fastStore: allocate WITHOUT completing. The LS EU's single-outstanding
+              // contract does not depend on completion -- it frees here regardless; the
+              // store's ROB completion arrives later from the SQ's at-head drain
+              // (StoreQueue's sqCompletion/sqFaultCompletion Flows, Task P2.4).
+              busy    := False
+              s1Valid := False
+              goto(IDLE)
+            }
           } otherwise {
             goto(WAIT_SQ)
           }
@@ -1484,12 +1802,18 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
         busy := True
         when(fwdHit && !s1TwoAccess) {
           // full-overlap forward: skip the cache (aligned only).
-          // Task #139 mechanism #2: suppress for a poisoned (squashed) access.
-          when(!poisoned) { captureCompletion(fwdData) }
-          probeCancel := probeOutstanding || dcache.loadProbe.fire
-          busy    := False
-          s1Valid := False
-          goto(IDLE)
+          // spec §5.3: hold on a comp* collision (busy is already True from the header;
+          // s1Valid holds because the S0->S1 advance reads the pre-update busy).
+          when(backCompFires) {
+            frontCompHeld := True
+          } otherwise {
+            // Task #139 mechanism #2: suppress for a poisoned (squashed) access.
+            when(!poisoned) { captureCompletion(fwdData) }
+            probeCancel := probeOutstanding || dcache.loadProbe.fire
+            busy    := False
+            s1Valid := False
+            goto(IDLE)
+          }
         } elsewhen(fwdStall || (fwdHit && s1TwoAccess)) {
           // overlap with an older store: re-sample the SQ and retry. For a cross
           // load any overlap (hit or partial) holds until the store drains.
@@ -1497,126 +1821,64 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           fwdStall := sq.io.fwd.rsp.stall
           fwdData  := sq.io.fwd.rsp.data
         } otherwise {
+          // ── THE HANDOFF (spec §3.2(b)) ──────────────────────────────────────
           // no forward: CAPTURE the resolved access into the launch register (llReg)
           // and launch the cache off the flop next cycle (FMax #1 — severs the live
           // s1Va -> loadCmd.vaddr -> cmdTag/cmdSet AGU->tag arc). All inputs are flops/
           // shallow-stages off s1Base (s1Va/s1AddrB) or already-registered (s2Paddr/B).
-          llReg.valid     := True
-          llReg.vaddr     := s1Va
-          llReg.paddr     := s2Paddr
-          llReg.addrB     := s1AddrB
-          llReg.paddrB    := s2PaddrB
-          llReg.size      := u1.size
-          llReg.cmode     := s2Cmode
-          llReg.robId     := s1Ctx.robId
-          llReg.twoAccess := s1TwoAccess
-          llReg.bDone     := False
-          goto(LAUNCH)
-        }
-      }
-
-      // Registered cache launch (FMax #1): `loadCmd` is driven from `llReg` (the flop)
-      // by the cmd drive above — the cache tags on a REGISTERED address. Hold here
-      // (llReg.valid asserted) until the cache accepts (loadCmd.fire), then go to WAIT
-      // (aligned) / WAIT_A (cross). The +1 cache-launch cycle is latency-agnostic.
-      LAUNCH.whenIsActive {
-        busy := True
-        when(dcache.loadCmd.fire) {
-          // Slot A accepted -> drop loadCmd.valid (do NOT re-issue slot A while WAIT/
-          // WAIT_A awaits its response). For a cross access WAIT_A re-asserts the launch
-          // for slot B (bDone) once slot A's line lands.
-          llReg.valid := False
-          when(llReg.twoAccess) { aDone := False; goto(WAIT_A) }
-          .otherwise { goto(WAIT) }
-        }
-      }
-
-      // cmd accepted; the dcache delivers exactly one loadRsp (fixed for a hit,
-      // late after a refill). Do NOT re-drive loadCmd here. Route the refilled
-      // load through the SAME registered completion stage for uniformity.
-      WAIT.whenIsActive {
-        busy := True
-        when(dcache.loadRsp.valid) {
-          // Task #189: a genuine physical bus error (D-cache refill AXI resp
-          // errored — SLVERR/DECERR) rides `dcache.loadRsp.payload.fault`. This
-          // field was previously dead (DcachePlugin wrote it from a stale/always-
-          // False source; nothing downstream ever read it — MMU faults are
-          // detected earlier, straight off `xlate.rsp.fault`, never reaching the
-          // cache at all). Now repurposed as the bus-fault carrier: complete as a
-          // FAULT (vector 2, SSW.ATC=0 — atc=false) instead of a normal load.
           //
-          // EXCEPTION (code-review fix): `u1.needsSupervisor` is also (task #189,
-          // MicroOpAssembler's ldUop comment) tagged True for the generic load
-          // that feeds a memory-source privileged commit-time SYSTEM op (e.g.
-          // MOVE <ea>,SR). That load is program-order EARLIER than the sysOp µop
-          // that owns the ACTUAL privilege check (RobPlugin's Track-D
-          // sysPrivFault, at the sysOp's own commit) — a bus-fault on THIS load
-          // would otherwise squash the sysOp before its privilege check ever
-          // runs, wrongly delivering vector 2 instead of vector 8 for a user-mode
-          // access (move_ea_sr_memsrc_priv.s). Suppress the fault report for
-          // exactly this crack shape: complete normally with don't-care data (the
-          // value is never actually applied — the later sysOp's own Track-D
-          // check traps first), restoring the pre-task-189 behavior for the
-          // faulting case while leaving the bus-error mechanism fully live for
-          // every ordinary load.
-          //
-          // FURTHER EXCEPTION (2nd code-review fix): the suppression above must
-          // only apply when the access is genuinely user-mode — gating on the
-          // STATIC `u1.needsSupervisor` tag alone (regardless of the actual
-          // runtime S bit) silently swallowed a real bus error for a SUPERVISOR-
-          // mode `MOVE <ea>,SR`: the later sysOp's own privilege check would then
-          // correctly NOT trap (already supervisor), so nothing else catches the
-          // fault, and garbage/stale `loadRsp.payload.data` (meaningless on a
-          // bus-error response — no line was allocated) would silently commit
-          // into SR. Re-check the LIVE `xlate.req.supervisor` (the same signal
-          // `captureFault` itself already reads into `compFaultSup` below) so the
-          // suppression only fires for the genuine user-mode race this was built
-          // for; a supervisor-mode bus error reports normally.
-          when(!poisoned) {
-            val suppressForLaterPrivCheck = u1.needsSupervisor && !xlate.req.supervisor
-            when(dcache.loadRsp.payload.fault && !suppressForLaterPrivCheck) { captureFault(atc = false) }
-            .otherwise { captureCompletion(dcache.loadRsp.payload.data) }
+          // NG1: exactly ONE load may be in the cache at a time, because `DLoadRsp`
+          // carries no id and the back FSM attributes responses purely by state. Stall
+          // here while the back is still occupied. (Deliberately NOT `!bkBusy ||
+          // bkCompletes`: that would put `dcache.loadRsp.valid` into the front's
+          // next-state cone, which is exactly the kind of perturbation this corridor
+          // was just measured to punish. Worth at most 1 cycle of II; see spec §6.2.)
+          when(!bkBusy) {
+            llReg.valid     := True
+            llReg.vaddr     := s1Va
+            llReg.paddr     := s2Paddr
+            llReg.addrB     := s1AddrB
+            llReg.paddrB    := s2PaddrB
+            llReg.size      := u1.size
+            llReg.cmode     := s2Cmode
+            llReg.robId     := s1Ctx.robId
+            llReg.twoAccess := s1TwoAccess
+            llReg.bDone     := False
+            captureBkCtx()
+            bkBusy  := True
+            // spec §3.2(e): `poisoned` is a Reg SET by `sqFlushSig`, so it only reads
+            // True from the NEXT cycle — a handoff on the flush cycle itself must OR in
+            // the live pulse or the back µop would drain unpoisoned. (Pre-split this was
+            // covered implicitly: the flush set `poisoned` while `busy` was still True
+            // and WAIT read it a cycle later.)
+            bkPoisoned := poisoned || sqFlushSig
+            bkStart := True
+            if (earlyFree) {
+              busy    := False
+              s1Valid := False
+              goto(IDLE)
+            } else {
+              goto(WAIT_BK)
+            }
           }
-          busy    := False
-          s1Valid := False
-          goto(IDLE)
         }
       }
 
-      // CROSS slot A: capture line A (latched via aDone since loadRsp is a 1-cycle
-      // pulse), then launch slot B at s1AddrB (the cache re-translates addrB's VPN:
-      // same page for a line-cross, next page for a page-cross). Each slot can
-      // independently hit / miss-refill the L1D.
-      WAIT_A.whenIsActive {
-        busy := True
-        when(dcache.loadRsp.valid && !aDone) {
-          // Slot A's line landed: latch it and ARM slot B's launch (set bDone so the
-          // cmd drive selects llReg.addrB/paddrB) — but DO NOT assert valid yet; bDone
-          // registers next cycle, so present slot B's cmd from the following cycle when
-          // the addrB select is live (avoids a spurious slot-A re-issue this cycle).
-          lineA       := dcache.loadRsp.payload.line
-          aDone       := True
-          llReg.bDone := True
-        }
-        when(aDone) {
-          // bDone is now registered -> the cmd presents slot B (addrB/paddrB). Re-assert
-          // the launch valid and hold until the cache accepts slot B, then drop it.
-          llReg.valid := True
-          when(dcache.loadCmd.fire) { llReg.valid := False; goto(WAIT_B) }
-        }
-      }
-
-      // CROSS slot B: capture line B, merge sizeBytes spanning the boundary, done.
-      WAIT_B.whenIsActive {
-        busy := True
-        when(dcache.loadRsp.valid) {
-          val merged = m68k040.cache.DcacheByteLane.extractCross(
-            lineA, dcache.loadRsp.payload.line, lineOff, u1.size)
-          // Task #139 mechanism #2: suppress for a poisoned (squashed) access.
-          when(!poisoned) { captureCompletion(merged) }
-          busy    := False
-          s1Valid := False
-          goto(IDLE)
+      // Slice-1 conservative stall (spec §8.3 slice 1): the front holds busy/s1Valid
+      // here for exactly as long as the pre-split FSM held them in LAUNCH/WAIT/WAIT_A/
+      // WAIT_B, and releases on the SAME cycle the back captures its completion
+      // (`bkCompletes` is combinational for precisely this reason). Result: bit-identical
+      // cycle counts, so any FMax/LUT movement measured at this slice is attributable
+      // ENTIRELY to the structural restructure, not to a behaviour change.
+      if (!earlyFree) {
+        WAIT_BK.whenIsActive {
+          busy    := True
+          s1Valid := True
+          when(bkCompletes) {
+            busy    := False
+            s1Valid := False
+            goto(IDLE)
+          }
         }
       }
 
@@ -1636,12 +1898,17 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           s1Valid := False
           goto(IDLE)
         } elsewhen(!sq.io.full) {
-          sq.io.alloc.valid           := True
-          sq.io.alloc.payload.precise := !fastStore
-          when(fastStore) { captureCompletion(B(0, 32 bits)) } otherwise { deferCompletion() }
-          busy    := False
-          s1Valid := False
-          goto(IDLE)
+          // Same comp*-collision rule as XLATE's alloc arm (spec §5.3).
+          when(fastStore && backCompFires) {
+            frontCompHeld := True
+          } otherwise {
+            sq.io.alloc.valid           := True
+            sq.io.alloc.payload.precise := !fastStore
+            when(fastStore) { captureCompletion(B(0, 32 bits)) } otherwise { deferCompletion() }
+            busy    := False
+            s1Valid := False
+            goto(IDLE)
+          }
         }
       }
     }
@@ -1751,11 +2018,19 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val dbgIsXlateB  = fsm.isActive(fsm.XLATE_B); dbgIsXlateB.simPublic()
     val dbgIsXlate   = fsm.isActive(fsm.XLATE);   dbgIsXlate.simPublic()
     val dbgIsResolve = fsm.isActive(fsm.RESOLVE); dbgIsResolve.simPublic()
-    val dbgIsLaunch  = fsm.isActive(fsm.LAUNCH);  dbgIsLaunch.simPublic()
-    val dbgIsWait    = fsm.isActive(fsm.WAIT);    dbgIsWait.simPublic()
-    val dbgIsWaitA   = fsm.isActive(fsm.WAIT_A);  dbgIsWaitA.simPublic()
-    val dbgIsWaitB   = fsm.isActive(fsm.WAIT_B);  dbgIsWaitB.simPublic()
     val dbgIsWaitSQ  = fsm.isActive(fsm.WAIT_SQ); dbgIsWaitSQ.simPublic()
+    // Slice-1-only front state; a stable (always-False) tap when earlyFree is set, so
+    // no test has to know which slice is compiled.
+    val dbgIsWaitBk  = Bool()
+    dbgIsWaitBk := (if (earlyFree) False else fsm.isActive(fsm.WAIT_BK))
+    dbgIsWaitBk.simPublic()
+    // BACK-stage taps. NAMES DELIBERATELY UNCHANGED from the pre-split front states —
+    // `MiHangTraceSpec` and `P27HangTraceSpec` reference them by these exact names.
+    val dbgIsLaunch  = bkFsm.isActive(bkFsm.LAUNCH);  dbgIsLaunch.simPublic()
+    val dbgIsWait    = bkFsm.isActive(bkFsm.WAIT);    dbgIsWait.simPublic()
+    val dbgIsWaitA   = bkFsm.isActive(bkFsm.WAIT_A);  dbgIsWaitA.simPublic()
+    val dbgIsWaitB   = bkFsm.isActive(bkFsm.WAIT_B);  dbgIsWaitB.simPublic()
+    val dbgBkIdle    = bkFsm.isActive(bkFsm.BK_IDLE); dbgBkIdle.simPublic()
     sq.io.full.simPublic()
     u1.eaAuto.simPublic(); isLoad.simPublic(); isStore.simPublic()
     sq.io.fwd.query.robId.simPublic()
