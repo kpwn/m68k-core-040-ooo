@@ -1,8 +1,8 @@
 # Frontend throughput audit
 
-**Status:** REVIEW COMPLETE; no RTL change is authorized by this audit. The
-fetch-directed FTB design and implementation plan are blocked until their P0
-findings are amended in both documents.
+**Status:** REVIEW COMPLETE; P0 findings resolved by the binding registered-token
+FTB amendment and replacement plan. RTL is authorized only after the current IPC
+branch passes its floorplanned timing checkpoint (250-MHz goal, 200-MHz floor).
 
 **Scope:** fetch address generation, BTB/gshare/RAS prediction, ITLB and L1I,
 FetchAlign and its outstanding ring, instruction buffering and alignment,

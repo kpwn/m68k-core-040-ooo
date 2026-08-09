@@ -1,11 +1,13 @@
 # Fetch-Directed BTB (window-indexed FTB + FTQ + confirm-or-flush) Implementation Plan
 
-> **BLOCKED — DO NOT EXECUTE THIS PLAN.** The registered `ftbResFresh` contract
-> repeated below cannot apply a prediction on an uninterrupted II=1 fetch
-> stream, removal of the slot-1 fallback violates the design's G4, and the
-> proposed stream differential is not a valid architectural oracle. See
-> `docs/superpowers/specs/2026-08-09-frontend-throughput-audit.md`. Amend the
-> design and this plan together before any RTL task is started.
+> **SUPERSEDED — DO NOT EXECUTE THIS PLAN.** Its registered `ftbResFresh`
+> contract is dead on an uninterrupted II=1 stream, its slot-1 deletion violates
+> G4, and its feed-trace differential is not an architectural oracle. The
+> binding correction is
+> `docs/superpowers/specs/2026-08-09-ipc-fetch-directed-btb-token-pipeline-amendment.md`;
+> the executable replacement is
+> `docs/superpowers/plans/2026-08-09-ipc-fetch-directed-btb-token-pipeline-plan.md`.
+> Do not mix tasks from this historical plan into the replacement.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

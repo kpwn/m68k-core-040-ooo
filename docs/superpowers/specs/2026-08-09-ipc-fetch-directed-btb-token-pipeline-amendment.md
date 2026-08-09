@@ -1,0 +1,334 @@
+# Fetch-directed FTB registered-token pipeline — binding amendment
+
+Date: 2026-08-09. Status: **DESIGN REPAIRED; RTL GATED ON THE CURRENT
+FLOORPLANNED TIMING CHECKPOINT (250-MHz GOAL, 200-MHz HARD FLOOR).**
+
+This document is the binding correction to
+`2026-08-09-ipc-fetch-directed-btb-design.md`. It supersedes that document's
+sections 2.2, 2.4, 2.5, 2.7, 2.8, 6.1, 6.3, 9.3, and every proposal to delete
+the decode-time slot-1 BTB fallback. The old document remains the owner of the
+measured problem, FTB entry semantics, splice/confirm correctness argument,
+flush taxonomy, and rejected alternatives except where explicitly changed here.
+
+The corresponding executable plan is
+`docs/superpowers/plans/2026-08-09-ipc-fetch-directed-btb-token-pipeline-plan.md`.
+The older implementation plan remains blocked and non-normative.
+
+## 1. Corrections made by this amendment
+
+The reviewed design had three P0 faults:
+
+1. `ftbResFresh := RegNext(fetchPc) === fetchPc` rejects every result on an
+   uninterrupted II=1 stream because `fetchPc` advances by eight every command.
+2. Deleting the slot-1 decode-time BTB path removes valid fallback coverage for
+   FTB misses, collisions, second branches, and cross-window branches.
+3. Comparing enabled and disabled *fetch/feed PC traces* is not an architectural
+   oracle: a useful predictor is supposed to change the speculative trace.
+
+This amendment removes value-based freshness entirely, retains both existing
+decode-time BTB ports in phase 1, and replaces the invalid differential with
+association, framing, target-gap, mutation, and retired-trace proofs.
+
+It also corrects two undersized structures in the reviewed design:
+
+- a four-entry FTQ is not sufficient for the legal run-ahead envelope; and
+- same-cycle FTQ pop credit would add a decode-ready-to-fetch-address path.
+
+The amended FTQ is a 32-entry, one-write/async-head LUTRAM with no same-cycle
+pop dependency in the fetch application cone.
+
+## 2. Registered lookup and exact association
+
+### 2.1 Services
+
+New bundles contain only plain SpinalHDL fields.
+
+```scala
+case class FetchPlanToken() extends Bundle {
+  val ringSlot = UInt(2 bits)
+  val seq      = UInt(8 bits)
+}
+
+case class FtbLookupCmd() extends Bundle {
+  val windowPc = UInt(32 bits)
+  val token    = FetchPlanToken()
+}
+
+case class FtbLookupRsp() extends Bundle {
+  val windowPc = UInt(32 bits)
+  val token    = FetchPlanToken()
+  val hit      = Bool()
+  val brWordOff= UInt(2 bits)
+  val brLen    = UInt(4 bits)
+  val target   = UInt(32 bits)
+  val brType   = UInt(2 bits)
+}
+
+trait FtbLookupService {
+  def lookupCmd: Flow[FtbLookupCmd]
+  def lookupRsp: Flow[FtbLookupRsp]       // fixed cmd+1 result
+  def clearOne:  Flow[UInt]               // branch PC; mismatch liveness
+}
+
+case class GshareWindowRsp(idxBits: Int) extends Bundle {
+  val token   = FetchPlanToken()
+  val taken   = Vec(Bool(), 4)
+  val phtIdx  = Vec(UInt(idxBits bits), 4)
+}
+
+trait GshareWindowService {
+  def windowCmd: Flow[FtbLookupCmd]
+  def windowRsp: Flow[GshareWindowRsp]
+}
+```
+
+`FtbPlugin` is the sole provider of `FtbLookupService`; `GsharePlugin` is the
+sole provider of `GshareWindowService`; `RobPlugin` remains the sole provider of
+`BtbUpdateService`. No new `Global` key is required if the FTB/FTQ sizes are
+constructor parameters. If configuration keys are chosen instead, `ParamPlugin`
+must be documented as their one producer.
+
+`brLen` remains four bits end to end, matching `DecodePacket.lenWords` and the
+new `BtbUpdate.len`. An out-of-scope long control form must fail the widened
+in-window check; truncating it into a three-bit zero/small value could otherwise
+turn a safe decline into a false application.
+
+Both lookup commands pulse exactly on `ic.cmd.fire` and carry the same token.
+Both providers accept one command per cycle and register one result for the
+following cycle. FetchAlign asserts that their valid bits and tokens agree.
+
+### 2.2 Ring token
+
+Each outstanding-ring entry gains:
+
+- `ringKeep : UInt(3 bits)`, initialized to four on issue;
+- `ringPlanSeq : UInt(8 bits)`, written from a monotonically incrementing
+  `planSeq` on issue.
+
+The query for a fired fetch carries `{ringTail, planSeq}`. A result is live only
+when all of these hold:
+
+```text
+result.valid
+result.token.seq == ringPlanSeq(result.token.ringSlot)
+!ringStale(result.token.ringSlot)
+!any architectural/decode redirect this cycle
+```
+
+The sequence comparison prevents a recycled ring slot from accepting an old
+result; current-cycle redirect gating closes the pre-edge stale-bit window. The
+fixed one-cycle lookup completes two cycles before the resident I-cache response,
+but the token proof is retained rather than relying on that latency accident.
+
+No result is compared with the live `fetchPc`. Sequential PCs may change every
+cycle and lookup/application remains II=1.
+
+## 3. Cycle contract
+
+For a command for window `W` fired in cycle `C`:
+
+| cycle | action |
+|---|---|
+| C | allocate ring slot S with sequence Q; pulse FTB and four-way gshare lookups for `{W,S,Q}` |
+| C+1 | registered results for `{W,S,Q}` arrive; either decline or atomically apply the prediction; the command issued in this cycle is target `T` when applied, otherwise the sequential candidate |
+| C+2 | the result for the C+1 command arrives; the same turnover repeats |
+| C+3 | resident response for W consumes ring S using its already-final `ringKeep` |
+
+The target in C+1 comes from a registered FTB result through a narrow application
+predicate and one PC mux. The FTB and PHT arrays are *after* the command address
+and terminate at the next result registers. There is never a combinational
+table-output-to-table-output loop and never two RAMs in series.
+
+`cmdWindowPc` and `cmdDrop` are selected together:
+
+```text
+selectedTarget = pendingTargetValid || applyNow
+cmdWindowPc    = selectedTarget ? align8(target) : fetchPc
+cmdDrop        = selectedTarget ? target[2:1]    : pendingDrop
+```
+
+This is required because a C+1 target command may fire in the same cycle the
+prediction arrives; using only the registered `pendingDrop` would attach the
+wrong leading-word drop to the target ring record.
+
+If the I-cache cannot accept C+1, `{target,drop}` is captured in one held pending
+slot. No newer fetch fires, so no newer FTB result can overtake it. The result's
+ring truncation and FTQ push still happen once; decode may safely stall at the
+splice until the held target is fetched.
+
+## 4. Atomic application
+
+`applyNow` requires:
+
+- matching live FTB/gshare tokens;
+- FTB tag hit;
+- unconditional branch, or the selected registered PHT direction is taken;
+- `brWordOff >= ringDrop(token.slot)`;
+- the complete learned instruction lies in the window
+  (`brWordOff.resize(5) + brLen.resize(5) <= 4`);
+- no redirect, quiesce, fault hold, mismatch suppression, or pending target;
+- FTQ not full (a defensive condition; §5 proves legal run-ahead cannot fill it).
+
+One `applyNow` event performs exactly once:
+
+1. `ringKeep(slot) := (brWordOff.resize(5) + brLen.resize(5)).resized`;
+2. push `{brPc,brLen,target,phtIdx,isCond}` to the FTQ;
+3. select or hold the aligned target for the next cache command;
+4. increment an application counter used by the non-vacuity gates.
+
+It does **not** flush the IBuf, stale older ring entries, or mutate the GHR.
+Every older window precedes the predicted branch; the predicted window is
+truncated at the branch end; the next issued window is the target. Thus no
+younger fall-through window exists to invalidate.
+
+The phase-1 gshare lookup uses the current speculative GHR but does not shift it
+at fetch. A confirmed conditional shifts the GHR at decode using the applied
+taken direction. This preserves the existing decode-order update point for
+uncovered branches, avoids a fetch-vs-decode write collision, and keeps fallback
+behavior structurally intact. Younger fetch predictions may use history that is
+one or more covered branches old; that is an accuracy limitation to measure, not
+a correctness issue.
+
+## 5. FTQ sizing and representation
+
+The legal maximum number of fetched predictions ahead of decode is bounded by:
+
+- three outstanding ring windows; plus
+- at most twenty one-word windows resident in the 20-word IBuf.
+
+Therefore the phase-1 FTQ depth is 32 and elaboration requires
+`ftqDepth >= RING + BUF_WORDS + 1`. It is a one-write, async-head memory with
+head/tail/count registers; flush resets the pointers/count and does not clear the
+array. This is smaller and more robust than a wide FF Vec.
+
+No same-cycle pop credit feeds `applyNow`. The sizing invariant proves full is
+unreachable for the legal run-ahead envelope; simulation asserts it. If the
+invariant is later changed, fetch simply declines an FTB prediction while full
+and the retained decode predictor handles it.
+
+## 6. Decode confirmation and fallback
+
+The original splice clamp and confirm-or-flush argument remain binding, with
+these changes:
+
+- the FTQ is populated one cycle after fetch issue, from the associated result;
+- `slot1WouldFtq` is ORed with today's `slot1WouldPred` and
+  `slot1WouldRasPred`; it does not replace either;
+- both existing decode-time BTB lookup ports remain in phase 1;
+- a confirmed FTQ conditional shifts GHR once at decode and stamps the carried
+  PHT index; the ordinary decode-time shift for that slot is suppressed;
+- `ftqPast = ftqValid && ftqDiff(31)`, not the identically-false reviewed form;
+- mismatch recovery invalidates the one FTB entry and sets one-shot
+  `ftbSuppress` exactly as in the parent design.
+
+The clamp remains:
+
+```text
+spliceWords = wordDistance(decodePc, ftq.brPc) + ftq.brLen
+availEff    = ftqNear ? min(ibuf.avail, spliceWords) : ibuf.avail
+```
+
+`availEff` drives both the aligner and `p0LiveReg` extension-valid flags. A
+prediction at slot 1 is deferred to slot 0, then confirmed. No packet may use a
+post-splice word. On exact `{pc,len,simple}` confirmation, the slot is stamped
+predicted-taken and decode jumps to the FTQ target without flushing already
+fetched target bytes. On disagreement, only packets made exclusively from
+genuine pre-splice bytes may fire; the existing redirect/flush machinery
+recovers before any post-splice byte is decoded.
+
+### SMC fault model
+
+Phase 1 retains the existing architectural self-modifying-code contract:
+software must execute the required I-cache maintenance after changing code.
+Both ordinary and maintenance invalidation clear the FTB as well as the BTB.
+Without that maintenance, stale I-cache/predecode content is already outside the
+supported contract. This is the deliberately narrow fault model permitted by the
+frontend audit; no new opword classifier is inserted into the decode critical
+loop. Wrong targets and wrong branch kinds on otherwise maintained code are
+verified by BranchEU and recover through the existing commit redirect.
+
+## 7. Flush and priority
+
+Every path that currently flushes the IBuf or marks all ring entries stale also:
+
+- clears FTQ count/head/tail;
+- clears the held target;
+- invalidates any same-cycle lookup application through redirect gating.
+
+Priority is unchanged: commit mispredict, external redirect, and complex resume
+win over fetch-plan application. A decode-time BTB/RAS prediction for an earlier
+branch also wins and flushes the younger FTQ state. FTB application itself is not
+a redirect and does not set `ringStale`.
+
+I-cache invalidation, maintenance invalidation, reset, and debug/architectural
+frontend flush clear all FTB valids. A same-cycle update/invalidate collision is
+resolved in favor of invalidation.
+
+## 8. Area and FMax contract
+
+Phase 1 does not delete the measured slot-1 BTB cone; correctness and coverage
+take priority. Estimated new storage is:
+
+- FTB payload: about 7.8 Kib plus 128 valid bits;
+- four additional registered PHT read views: about 16 Kib of replicated LUTRAM
+  in the pessimistic inference shape;
+- FTQ: about 2.6 Kib in LUTRAM;
+- ring tokens/results/pending state: under 200 FF.
+
+No BRAM, DSP, cache port, predictor write port, or decode/ROB bandwidth is added.
+The binding area gate is no more than +1.0% full-core LUTs and +2,500 FF, with
+zero BRAM/DSP increase. The standing post-route optimization goal is 250 MHz;
+200 MHz is the hard deployment/acceptance floor. Keep the existing 4-ns
+constraint for both closure work and comparable endpoint census data.
+
+An area-budget breach is a **review checkpoint, not an automatic rejection**.
+Before deleting or materially reshaping the feature, report the exact
+LUT/LUTRAM/FF/BRAM/DSP delta, affected pblock capture/utilization/congestion,
+which structures account for the increase, measured IPC benefit, and the
+available reductions (entry count, table representation, replication, or
+staging). Pause for the project owner's direction when that tradeoff is real.
+
+The two paths to inspect explicitly are:
+
+1. registered FTB result → apply predicate/PC mux → I-cache command and next FTB
+   address; and
+2. FTQ async head → `availEff`/slot defer → existing decode/IBuf shift loop.
+
+The current branch's floorplanned route is a hard prerequisite. If it is below
+200 MHz, feature RTL stops and timing/floorplan recovery takes priority. A result
+between 200 and 250 MHz is usable but remains explicit timing debt: report the
+gap and continue endpoint/floorplan recovery where its cost is reasonable. After
+the inert table slice and after enabling application, run paired floorplanned
+routes and report WNS/TNS, failing families, LUT/FF/BRAM/DSP, and pblock health.
+
+## 9. Binding verification
+
+Tests must prove events, association, and architectural results—not merely that
+no error was observed.
+
+1. **Registered II=1 lookup.** Eight changing window PCs on consecutive cycles;
+   eight results exactly one cycle later with exact `{slot,seq,pc}`. Mutation to
+   live-PC freshness must fail.
+2. **Target cadence.** A trained window W fires in C and its target T fires in
+   C+1; W+8 never fires. Require nonzero `applyNow`, FTQ push, and ringKeep update.
+3. **Backpressure.** Result arrives while `ic.cmd.ready=0`; ringKeep/FTQ update
+   once, target/drop remain stable, and exactly one target command later fires.
+4. **Ring reuse/turnover.** Full-ring response plus replacement issue, result
+   token applied only to the replacement record; stale/wrong sequence is ignored.
+5. **Redirect collisions.** Redirect at query, result, pending-target, response,
+   and confirm phases; no stale FTQ entry, GHR shift, truncation, or target issue.
+6. **Framing guard.** Parent design's A1–A10 matrix, mutations for clamp, past,
+   length, overshoot, starvation dwell, one-entry clear, and suppression.
+7. **Fallback.** FTB miss, direct-map collision, second branch, cross-window
+   branch, FTQ defensive-full, and return all exercise the existing slot-0/slot-1
+   BTB/gshare/RAS behavior. Application-disabled cycles remain baseline-identical.
+8. **Architectural oracle.** Compare retired macro PC/op/register/memory traces,
+   not speculative feed PCs, after correct prediction and every mismatch class.
+9. **Performance.** Paired pinned-seed ideal and `l2:5:70` IPC, per kernel first;
+   require target-gap reduction and no >2% regression in any uncovered/control
+   kernel before considering aggregate gain.
+10. **Physical.** Paired floorplanned route against the 250-MHz goal and 200-MHz
+    hard floor, plus explicit timing-family, area, and pblock deltas.
+
+`make SBT=~/sbt/bin/sbt test-fast` remains mandatory before every handoff. Full
+Verilator/corpus and Vivado runs remain PM-serialized.
