@@ -3620,6 +3620,17 @@ No commit for this task (read-only verification / synth-only; nothing staged).
 
 ## Slice P6 — pipelined hit-drain + the §6.1 cross-cutting cache-mode verification sweep
 
+> **Superseded mechanism notice (2026-08-09).** The original P6.1
+> `Flow + drainAcceptReg + presentPtr/inFlight` sketch below is retained as
+> historical planning text, but it is not an implementation contract. It fails to
+> hold a conflicted S1 payload, learns a miss barrier after younger commands have
+> nowhere safe to wait, conflates send and ack split phases, and incorrectly rewinds
+> accepted committed work on flush. The binding implementation is now the exact
+> `Stream`, elastic S0/S1/S2, separate send/ack phase, accepted-half count,
+> same-cycle miss barrier, and S2 same-line bypass contract in
+> `2026-07-23-dcache-copyback-store-retirement-design.md` §4.3. Use that contract
+> for Tasks P6.1/P6.2 and keep the verification/physical gates below.
+
 Design doc refs: §4.3's "Pipelined hit-drain" bullet, §6.1 in full (a REQUIRED deliverable, not optional). Acceptance metric: MOVEM/memset-style store-burst throughput, measured via the IPC bench.
 
 **FLAGGED FOR HUMAN ATTENTION (see this plan's final report):** the design doc sketches this slice's mechanism only at a high level ("The SQ pop and forwarding-retention logic generalize from 'one in-flight drain' to a small in-flight count"). Task P6.1 below is THIS PLAN's own concrete proposal for that generalization (a `presentPtr`/`inFlight` split from the existing single `head`-driven presentation) — it is real, not a placeholder, but is a genuine design decision the source document left open, and deserves a design-review pass before an implementing session starts coding it.

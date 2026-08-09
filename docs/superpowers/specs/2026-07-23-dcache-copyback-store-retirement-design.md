@@ -602,26 +602,52 @@ and closed by Layer 2.
   path. Cache contents (including dirty lines) persist untouched across
   DE=0, exactly as on silicon; CINV/CPUSH remain the only invalidation
   paths. Consequences for the existing suites are in §5.2.
-- **Pipelined hit-drain (the store-throughput lever).** Today the SQ drain
-  is single-outstanding end-to-end because every drain terminates in an AXI
-  B round trip. Under copyback a hit-drain terminates *locally* at store-S2,
-  so there is no reason to keep the SQ at one-store-per-round-trip: let the
-  SQ present the next committed entry as soon as the previous one has passed
-  S2-with-hit (ack pipelined behind it), giving a sustained hit-drain rate
-  of ~1 store / 1–3 cycles. Two hazards to close, both small:
-  (a) back-to-back stores to the same line — store B's S1 old-line read can
-  race store A's S2 write (BRAM readSync returns pre-write data, losing A's
-  bytes in B's merge): add an S2→S1 same-set/way line bypass, or a 1-cycle
-  conflict hold (recommend the hold first — trivially correct, costs a cycle
-  only on same-line pairs); (b) a drain that turns out to be a miss (first
-  store to a cold line → the post-commit write-allocate) or a precise-path
-  entry falls back to the serialized AXI path and stalls the drain pipeline
-  behind it — an uncommon, self-limiting event (the allocate warms the line
-  for the rest of the burst). The SQ pop and
-  forwarding-retention logic generalize from "one in-flight drain"
-  (`drainBusy`) to a small in-flight count; the existing hold-until-ack
-  forwarding contract is preserved per entry. This is what actually converts
-  MOVEM/memset-style bursts from B-latency-bound to cache-bandwidth-bound.
+- **Pipelined hit-drain (the store-throughput lever; binding P6 amendment,
+  2026-08-09).** The SQ→D-cache boundary is a real `Stream[DStoreCmd]`:
+  `valid` and the complete payload remain stable until `fire`, and only `fire`
+  consumes presentation credit. The existing D-cache S0/S1/S2 payload flops are
+  an elastic in-order descriptor pipe. S0 turns over only when S1 can accept;
+  S1 turns over only when its synchronous array read actually launches; a load
+  or maintenance-port conflict holds the descriptor without overwriting it.
+  On a resident COPYBACK stream, S2 merges one command per cycle and its local
+  acknowledgement is the following registered cycle, so accepts and acks are
+  both sustained at II=1 after fill.
+
+  The SQ separates `sendPtr/sendPhaseB` from the architectural
+  `head/ackPhaseB`. An accepted-half counter records commands which have fired
+  but not yet acknowledged. `sendPtr` advances on `drain.fire`; `head` advances
+  only on the matching in-order terminal acknowledgement. Every entry remains
+  valid, forwarding-visible, and unavailable for reuse until its final-half ack.
+  A split entry is two ordered half handshakes but one architectural pop. This
+  retains untagged acknowledgements without a CAM or response-ID FIFO: the cache
+  is explicitly constrained to complete accepted halves in presentation order.
+
+  Only committed, non-precise COPYBACK halves may run ahead. A precise,
+  WRITETHROUGH, or INHIBITED half is an admission-time barrier: it may fire only
+  at the SQ head with zero older accepted halves and remains the sole accepted
+  command through its terminal ack. A COPYBACK miss is discovered later in S2;
+  `missDiscovered` blocks both a same-cycle younger S1 launch and a new input
+  fire, then holds any younger descriptors already resident in S0/S1 until the
+  singleton write-allocate produces its terminal ack. Thus the existing single
+  walker/refill and AXI write-pair registers are never overwritten and the
+  untagged ack stream cannot reorder.
+
+  Back-to-back same-line hits use one registered S2→S2 `{way,line}` bypass.
+  The younger descriptor still uses the synchronous tag read, but its byte merge
+  selects the immediately older merged line instead of relying on FPGA BRAM
+  read-during-write behavior. This preserves II=1 for stack/MOVEM/memset-style
+  same-line bursts at the cost of one 128-bit data register, a way id, and a
+  byte-mux input; no second tag/data RAM or store CAM is introduced.
+
+  Flush never rewinds accepted work: only unsent speculative entries are
+  removed. Already accepted entries are committed (or the one non-speculative
+  at-head precise entry), so their send/ack state survives until the real ack.
+  Maintenance waits for the Stream input, every store stage, accepted count,
+  miss/serial barriers, and AXI pairs to quiesce. If a refill R beat is waiting,
+  new drain admission stops so the shallow pipe empties and the refill cannot be
+  starved by an infinite store stream. These rules convert copyback-hit bursts
+  from B-latency-bound to cache-bandwidth-bound without adding a D-cache write
+  port, AXI issuer, MSHR, response tag, or PRF/ROB port.
 
 ### 4.4 Performance posture (explicit invariants for review)
 
@@ -759,14 +785,13 @@ bench + directed cycle counts) at the corresponding slice gate:
    remains conservative-correct unchanged, but this deserves a dedicated
    review pass + the existing `ls-store-drain-race` directed tests re-run,
    plus a new "dirty-hit vs refill" directed test.
-7. **One-ack-per-store contract with multiple ack sources.** `storeAck`
-   will now pulse from three places (copyback-hit S2, AXI B, and — never
-   simultaneously — the flush engine must *not* pulse it). The
-   ExceptionUnit's per-word E_STWAIT and the SQ's drainBusy both count acks;
-   an accidental double-pulse (e.g. hit-write *and* a stale B from a prior
-   store) would desynchronize them. The implementation needs a single
-   arbitrated ack source with a sim assert (`ack ⇒ exactly one outstanding
-   store`).
+7. **One-ack-per-accepted-half contract with multiple ack sources.** `storeAck`
+   may pulse from copyback-hit S2, the store's own AXI B, or drain-miss
+   write-allocate, but the barrier rules make those sources mutually exclusive
+   across variable-latency classes. The SQ accepted-half count decrements once
+   per pulse; simulation asserts `ack ⇒ count != 0`, source one-hotness, no
+   serial command alongside another accepted command, and exact split A/B pop
+   sequencing. The flush engine never manufactures an ack.
 8. **Interrupt-vs-at-head-drain race discipline** (§4.1) — the design names
    the gates, but the exact cycle-accurate priority needs to be pinned in
    the implementation plan and covered by an IRQ-storm directed test.
