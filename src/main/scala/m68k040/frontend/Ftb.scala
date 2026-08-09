@@ -88,7 +88,8 @@ class FtbPlugin(entries: Int = 128) extends FiberPlugin with FtbLookupService {
     val uIdx   = idxOf(upd.payload.pc)
     val uTag   = tagOf(upd.payload.pc)
     val uOld   = mem.readAsync(uIdx)
-    val uHit   = valids(uIdx) && (uOld.tag === uTag)
+    val uHit   = valids(uIdx) && (uOld.tag === uTag) &&
+                 (uOld.brWordOff === upd.payload.pc(2 downto 1))
     val uOff   = upd.payload.pc(2 downto 1)
     val uEnd   = uOff.resize(5) + upd.payload.len.resize(5)
     val installable = upd.payload.len =/= 0 &&

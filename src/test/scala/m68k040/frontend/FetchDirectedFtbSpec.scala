@@ -1,0 +1,456 @@
+package m68k040.frontend
+
+import m68k040.{M68kParams, VerilatorTest}
+import m68k040.cache.{FetchCmd, FetchRsp}
+import m68k040.core.ParamPlugin
+import m68k040.isa.Size
+import m68k040.services.{BtbUpdate, BtbUpdateService, FetchService, GshareUpdateService}
+import org.scalatest.funsuite.AnyFunSuite
+import spinal.core._
+import spinal.core.sim._
+import spinal.lib._
+import spinal.lib.misc.database.Database
+import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
+
+import scala.collection.mutable.ArrayBuffer
+
+/** End-to-end registered-token FTB proof at the FetchAlign boundary.
+  *
+  * The cache is controlled so command cadence and backpressure are exact rather than
+  * inferred from a memory latency window. Each advertised event is counted, and the
+  * confirmation case injects the truncated source window followed by the target window;
+  * a design which merely toggles applyNow but still issues W+8 or flushes target bytes
+  * cannot pass.
+  */
+class FetchDirectedFtbSpec extends AnyFunSuite {
+
+  class ControlledFetchPlugin extends FiberPlugin with FetchService {
+    val logic = during build new Area {
+      val cmdPort = Stream(FetchCmd())
+      val rspPort = Flow(FetchRsp())
+      val cmdOut = master(Stream(FetchCmd()))
+      val rspIn = slave(Flow(FetchRsp()))
+      cmdOut << cmdPort
+      rspPort << rspIn
+    }
+    override def cmd: Stream[FetchCmd] = logic.cmdPort
+    override def rsp: Flow[FetchRsp] = logic.rspPort
+  }
+
+  class UpdateDriver extends FiberPlugin with BtbUpdateService {
+    val logic = during build new Area {
+      val update = Flow(BtbUpdate())
+      in(update.valid)
+      update.payload.flatten.foreach(in(_))
+    }
+    override def btbUpdate: Flow[BtbUpdate] = logic.update
+  }
+
+  class GshareUpdateDriver extends FiberPlugin {
+    val logic = during build new Area {
+      val valid = in Bool()
+      val index = in UInt(11 bits)
+      val taken = in Bool()
+      val update = host[GshareUpdateService].gshareUpdate
+      update.valid := valid
+      update.payload.index := index
+      update.payload.taken := taken
+    }
+  }
+
+  class Dut extends Component {
+    val db = new Database
+    val host = db on new PluginHost
+    val fetch = new ControlledFetchPlugin
+    val update = new UpdateDriver
+    val ftb = new FtbPlugin(entries = 128)
+    val gshare = new GsharePlugin
+    val gshareUpdate = new GshareUpdateDriver
+    val fa = new FetchAlignPlugin(enableFetchDirected = true)
+    val probe = new DecodeFeedProbePlugin
+    db.on { host.asHostOf(Seq[FiberPlugin](
+      new ParamPlugin(M68kParams()), fetch, update, ftb, gshare, gshareUpdate, fa, probe)) }
+  }
+
+  private val W = 0x1000L
+  private val B = W + 2
+  private val T = 0x1040L
+
+  private def idle(dut: Dut): Unit = {
+    dut.fetch.logic.cmdOut.ready #= false
+    dut.fetch.logic.rspIn.valid #= false
+    dut.fetch.logic.rspIn.payload.pc #= 0
+    dut.fetch.logic.rspIn.payload.data #= 0
+    dut.fetch.logic.rspIn.payload.fault #= false
+    dut.fetch.logic.rspIn.payload.atc #= false
+    for (p <- dut.fetch.logic.rspIn.payload.pred) {
+      p.simple #= true
+      p.lenWords #= 1
+      p.ambiguousLine #= false
+      p.size #= Size.LONG
+    }
+    dut.update.logic.update.valid #= false
+    dut.update.logic.update.payload.pc #= 0
+    dut.update.logic.update.payload.taken #= false
+    dut.update.logic.update.payload.target #= 0
+    dut.update.logic.update.payload.brType #= 0
+    dut.update.logic.update.payload.len #= 0
+    dut.gshareUpdate.logic.valid #= false
+    dut.gshareUpdate.logic.index #= 0
+    dut.gshareUpdate.logic.taken #= false
+    dut.fa.logic.redirect.valid #= false
+    dut.fa.logic.redirect.payload #= 0
+    dut.fa.logic.resume.valid #= false
+    dut.fa.logic.resume.payload #= 0
+    dut.probe.logic.feedOut.ready #= false
+  }
+
+  private def train(dut: Dut, cd: ClockDomain, brType: Int = 1, len: Int = 1,
+                    target: Long = T): Unit = {
+    val u = dut.update.logic.update
+    u.valid #= true
+    u.payload.pc #= B
+    u.payload.taken #= true
+    u.payload.target #= target
+    u.payload.brType #= brType
+    u.payload.len #= len
+    cd.waitSampling()
+    u.valid #= false
+    cd.waitSampling(2)
+  }
+
+  private def redirect(dut: Dut, cd: ClockDomain): Unit = {
+    dut.fa.logic.redirect.valid #= true
+    dut.fa.logic.redirect.payload #= W
+    cd.waitSampling()
+    dut.fa.logic.redirect.valid #= false
+  }
+
+  private def driveRsp(dut: Dut, cd: ClockDomain, pc: Long, words: Seq[Int],
+                       lens: Seq[Int] = Seq.fill(4)(1)): Unit = {
+    require(words.length == 4)
+    require(lens.length == 4)
+    val data = words.zipWithIndex.foldLeft(BigInt(0)) { case (acc, (word, lane)) =>
+      acc | (BigInt(word & 0xffff) << (lane * 16))
+    }
+    val r = dut.fetch.logic.rspIn
+    r.valid #= true
+    r.payload.pc #= pc
+    r.payload.data #= data
+    r.payload.fault #= false
+    r.payload.atc #= false
+    for ((p, len) <- r.payload.pred.zip(lens)) {
+      p.simple #= true
+      p.lenWords #= len
+      p.ambiguousLine #= false
+      p.size #= Size.LONG
+    }
+    cd.waitSampling()
+  }
+
+  private case class Trace(cmds: ArrayBuffer[(Long, Long)], var applies: Int,
+                           var pushes: Int, var confirms: Int)
+
+  private def trace(dut: Dut, cd: ClockDomain): Trace = {
+    val tr = Trace(ArrayBuffer.empty, 0, 0, 0)
+    var cycle = 0L
+    cd.onSamplings {
+      if (dut.fetch.logic.cmdOut.valid.toBoolean && dut.fetch.logic.cmdOut.ready.toBoolean)
+        tr.cmds += cycle -> dut.fetch.logic.cmdOut.payload.pc.toLong
+      if (dut.fa.logic.applyNow.toBoolean) tr.applies += 1
+      if (dut.fa.logic.ftqPush.toBoolean) tr.pushes += 1
+      if (dut.fa.logic.ftqConfirmFire.toBoolean) tr.confirms += 1
+      cycle += 1
+    }
+    tr
+  }
+
+  private def await(cd: ClockDomain, max: Int, clue: String)(p: => Boolean): Unit = {
+    var n = 0
+    while (!p && n < max) { cd.waitSampling(); n += 1 }
+    assert(p, s"$clue after $max cycles")
+  }
+
+  private def gshareIndex(pc: Long): Int = {
+    var value = pc >>> 1
+    var folded = 0
+    while (value != 0) {
+      folded ^= (value & 0x7ffL).toInt
+      value >>>= 11
+    }
+    folded & 0x7ff
+  }
+
+  private def trainNotTaken(dut: Dut, cd: ClockDomain, pc: Long): Unit = {
+    val upd = dut.gshareUpdate.logic
+    for (_ <- 0 until 2) { // reset value 2 -> 1 -> 0
+      upd.valid #= true
+      upd.index #= gshareIndex(pc)
+      upd.taken #= false
+      cd.waitSampling()
+    }
+    upd.valid #= false
+    cd.waitSampling()
+  }
+
+  test("registered result replaces W+8 with target in the immediately following command", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      train(dut, cd)
+      val tr = trace(dut, cd)
+      dut.fetch.logic.cmdOut.ready #= true
+      redirect(dut, cd)
+      await(cd, 12, "two fetch commands") { tr.cmds.size >= 2 }
+      dut.fetch.logic.cmdOut.ready #= false
+      cd.waitSampling(2)
+
+      assert(tr.cmds.take(2).map(_._2).toSeq == Seq(W, T),
+        s"fetch path was ${tr.cmds.take(2).map(x => f"0x${x._2}%x")}")
+      assert(tr.cmds(1)._1 == tr.cmds(0)._1 + 1,
+        s"target command was not C+1: ${tr.cmds.take(2)}")
+      assert(!tr.cmds.exists(_._2 == W + 8), "sequential W+8 command escaped")
+      assert(tr.applies == 1 && tr.pushes == 1,
+        s"expected one atomic application/push, got ${tr.applies}/${tr.pushes}")
+      assert(dut.fa.logic.ringKeep(0).toInt == 2,
+        s"source window was not truncated at branch end: keep=${dut.fa.logic.ringKeep(0).toInt}")
+      assert(dut.fa.logic.ftqCount.toInt == 1, "one unconfirmed FTQ entry must remain")
+    }
+  }
+
+  test("result-time cache backpressure holds one exact target without replaying application", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      train(dut, cd)
+      val tr = trace(dut, cd)
+      dut.fetch.logic.cmdOut.ready #= true
+      redirect(dut, cd)
+      await(cd, 8, "source command") { tr.cmds.nonEmpty }
+      dut.fetch.logic.cmdOut.ready #= false
+      await(cd, 8, "held target") { dut.fa.logic.targetHoldValid.toBoolean }
+      assert(dut.fa.logic.targetHoldPc.toLong == T)
+      assert(dut.fa.logic.targetHoldDrop.toInt == 0)
+      cd.waitSampling(3)
+      assert(tr.applies == 1 && tr.pushes == 1 && tr.cmds.size == 1,
+        s"backpressure replayed an event: apply=${tr.applies} push=${tr.pushes} cmds=${tr.cmds}")
+      assert(dut.fa.logic.targetHoldPc.toLong == T, "held target changed under backpressure")
+
+      dut.fetch.logic.cmdOut.ready #= true
+      await(cd, 8, "released target command") { tr.cmds.size == 2 }
+      dut.fetch.logic.cmdOut.ready #= false
+      cd.waitSampling()
+      assert(tr.cmds.map(_._2).toSeq == Seq(W, T), s"held target fired incorrectly: ${tr.cmds}")
+      assert(!dut.fa.logic.targetHoldValid.toBoolean, "hold did not clear on its sole fire")
+      assert(tr.applies == 1 && tr.pushes == 1)
+    }
+  }
+
+  test("a redirect colliding with the registered result kills the plan atomically", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      train(dut, cd)
+      val tr = trace(dut, cd)
+      dut.fetch.logic.cmdOut.ready #= true
+      redirect(dut, cd)
+      await(cd, 8, "source command") { tr.cmds.nonEmpty }
+
+      // The W lookup result is live now. Block the cache command and redirect in that
+      // exact result cycle: no target command, truncation, or FTQ entry may survive.
+      val recovery = 0x2000L
+      dut.fetch.logic.cmdOut.ready #= false
+      dut.fa.logic.redirect.valid #= true
+      dut.fa.logic.redirect.payload #= recovery
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid #= false
+      cd.waitSampling()
+
+      assert(tr.applies == 0 && tr.pushes == 0,
+        s"redirect/result collision applied stale state: ${tr.applies}/${tr.pushes}")
+      assert(dut.fa.logic.ftqCount.toInt == 0, "redirect must leave the FTQ empty")
+      assert(!dut.fa.logic.targetHoldValid.toBoolean, "redirect must not capture a stale target")
+      assert(dut.fa.logic.ringKeep.forall(_.toInt == 4),
+        s"redirect collision truncated a ring slot: ${dut.fa.logic.ringKeep.map(_.toInt)}")
+
+      dut.fetch.logic.cmdOut.ready #= true
+      await(cd, 8, "redirect recovery command") { tr.cmds.size >= 2 }
+      dut.fetch.logic.cmdOut.ready #= false
+      assert(tr.cmds.take(2).map(_._2).toSeq == Seq(W, recovery),
+        s"redirect recovery path was ${tr.cmds.take(2)}")
+      assert(!tr.cmds.exists(_._2 == T), "killed FTB target escaped after redirect")
+    }
+  }
+
+  test("an unaligned target carries its leading-word drop on the C+1 command", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      val unalignedTarget = 0x1046L
+      train(dut, cd, target = unalignedTarget)
+      val tr = trace(dut, cd)
+      dut.fetch.logic.cmdOut.ready #= true
+      redirect(dut, cd)
+      await(cd, 12, "source and unaligned-target commands") { tr.cmds.size >= 2 }
+      dut.fetch.logic.cmdOut.ready #= false
+      cd.waitSampling()
+
+      assert(tr.cmds.take(2).map(_._2).toSeq == Seq(W, unalignedTarget & ~7L),
+        s"unaligned target command path was ${tr.cmds.take(2)}")
+      assert(tr.cmds(1)._1 == tr.cmds(0)._1 + 1,
+        s"unaligned target command was not C+1: ${tr.cmds.take(2)}")
+      assert(dut.fa.logic.ringDrop(1).toInt == 3,
+        s"same-cycle target drop was ${dut.fa.logic.ringDrop(1).toInt}, expected 3")
+      assert(tr.applies == 1 && tr.pushes == 1,
+        s"unaligned application replayed: ${tr.applies}/${tr.pushes}")
+    }
+  }
+
+  test("a redirect kills a target held under cache backpressure", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      train(dut, cd)
+      val tr = trace(dut, cd)
+      dut.fetch.logic.cmdOut.ready #= true
+      redirect(dut, cd)
+      await(cd, 8, "source command") { tr.cmds.nonEmpty }
+      dut.fetch.logic.cmdOut.ready #= false
+      await(cd, 8, "held target") { dut.fa.logic.targetHoldValid.toBoolean }
+
+      val recovery = 0x3000L
+      dut.fa.logic.redirect.valid #= true
+      dut.fa.logic.redirect.payload #= recovery
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid #= false
+      cd.waitSampling()
+      assert(!dut.fa.logic.targetHoldValid.toBoolean, "redirect left the target hold live")
+      assert(dut.fa.logic.ftqCount.toInt == 0, "redirect left a held plan in the FTQ")
+
+      dut.fetch.logic.cmdOut.ready #= true
+      await(cd, 8, "held-target redirect recovery command") { tr.cmds.size >= 2 }
+      dut.fetch.logic.cmdOut.ready #= false
+      assert(tr.cmds.take(2).map(_._2).toSeq == Seq(W, recovery),
+        s"held target survived redirect: ${tr.cmds.take(2)}")
+      assert(tr.applies == 1 && tr.pushes == 1,
+        s"held plan must have applied exactly once before it was killed: ${tr.applies}/${tr.pushes}")
+    }
+  }
+
+  test("registered not-taken direction declines without truncating or redirecting", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      train(dut, cd, brType = 0)
+      trainNotTaken(dut, cd, B)
+      val tr = trace(dut, cd)
+      dut.fetch.logic.cmdOut.ready #= true
+      redirect(dut, cd)
+      await(cd, 12, "two sequential commands after not-taken decline") { tr.cmds.size >= 2 }
+      dut.fetch.logic.cmdOut.ready #= false
+      cd.waitSampling(2)
+
+      assert(tr.cmds.take(2).map(_._2).toSeq == Seq(W, W + 8),
+        s"not-taken FTB entry redirected fetch: ${tr.cmds.take(2)}")
+      assert(tr.applies == 0 && tr.pushes == 0 && dut.fa.logic.ftqCount.toInt == 0,
+        s"declined direction mutated state: ${tr.applies}/${tr.pushes}/${dut.fa.logic.ftqCount.toInt}")
+      assert(dut.fa.logic.ringKeep(0).toInt == 4, "declined entry truncated its source window")
+    }
+  }
+
+  test("exact branch confirmation reuses buffered target bytes without a refetch flush", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      train(dut, cd)
+      val tr = trace(dut, cd)
+      dut.fetch.logic.cmdOut.ready #= true
+      redirect(dut, cd)
+      await(cd, 12, "source and target commands") { tr.cmds.size >= 2 }
+      dut.fetch.logic.cmdOut.ready #= false
+
+      // W contains MOVEQ then BRA.S to T. Words after the branch are deliberately
+      // recognizable fall-through poison; ringKeep must prevent them entering the IBuf.
+      driveRsp(dut, cd, W, Seq(0x7001, 0x601e, 0x72ee, 0x74ee))
+      driveRsp(dut, cd, T, Seq(0x7603, 0x7804, 0x7a05, 0x7c06))
+      dut.fetch.logic.rspIn.valid #= false
+      cd.waitSampling(2)
+
+      val packets = ArrayBuffer.empty[(Long, Int, Boolean, Long)]
+      cd.onSamplings {
+        if (dut.probe.logic.feedOut.valid.toBoolean && dut.probe.logic.feedOut.ready.toBoolean)
+          packets += ((dut.probe.logic.feedOut.payload(0).pc.toLong,
+            dut.probe.logic.feedOut.payload(0).words(0).toInt,
+            dut.probe.logic.feedOut.payload(0).predTaken.toBoolean,
+            dut.probe.logic.feedOut.payload(0).predTarget.toLong))
+      }
+      dut.probe.logic.feedOut.ready #= true
+      await(cd, 20, "source, branch, and target packets") { packets.size >= 3 }
+      dut.probe.logic.feedOut.ready #= false
+
+      assert(packets.take(3).map(_._1).toSeq == Seq(W, B, T),
+        s"decode did not splice directly to target: ${packets.take(3)}")
+      assert(packets(0)._2 == 0x7001 && packets(1)._2 == 0x601e && packets(2)._2 == 0x7603)
+      assert(packets(1)._3 && packets(1)._4 == T,
+        s"confirmed branch stamp wrong: ${packets(1)}")
+      assert(!packets.exists(p => p._2 == 0x72ee || p._2 == 0x74ee),
+        s"post-branch poison escaped truncation: $packets")
+      assert(tr.applies == 1 && tr.pushes == 1 && tr.confirms == 1,
+        s"event counts apply/push/confirm=${tr.applies}/${tr.pushes}/${tr.confirms}")
+      assert(dut.fa.logic.ftqCount.toInt == 0, "confirmation must pop exactly one FTQ entry")
+      assert(tr.cmds.take(2).map(_._2).toSeq == Seq(W, T) && !tr.cmds.exists(_._2 == W + 8))
+    }
+  }
+
+  test("a too-short learned branch length stalls before target bytes and recovers once", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      train(dut, cd) // learned claim is one word
+      val tr = trace(dut, cd)
+      var mismatchCount = 0
+      cd.onSamplings { if (dut.fa.logic.ftqMismatch.toBoolean) mismatchCount += 1 }
+
+      dut.fetch.logic.cmdOut.ready #= true
+      redirect(dut, cd)
+      await(cd, 12, "mismatch source and target commands") { tr.cmds.size >= 2 }
+      dut.fetch.logic.cmdOut.ready #= false
+
+      // The real instruction at B is two words, but ringKeep admits only its opword.
+      // The next buffered word is target data. Correct behavior is a dwell stall and
+      // mismatch; B must not emit from this malformed splice.
+      driveRsp(dut, cd, W, Seq(0x7001, 0x6000, 0x003c, 0x72ee), lens = Seq(1, 2, 1, 1))
+      driveRsp(dut, cd, T, Seq(0x7603, 0x7804, 0x7a05, 0x7c06))
+      dut.fetch.logic.rspIn.valid #= false
+      cd.waitSampling(2)
+
+      val emittedBeforeRecovery = ArrayBuffer.empty[Long]
+      cd.onSamplings {
+        if (dut.probe.logic.feedOut.valid.toBoolean && dut.probe.logic.feedOut.ready.toBoolean)
+          emittedBeforeRecovery += dut.probe.logic.feedOut.payload(0).pc.toLong
+      }
+      dut.probe.logic.feedOut.ready #= true
+      await(cd, 20, "framing mismatch") { mismatchCount == 1 }
+      cd.waitSampling() // observe the mismatch edge's registered flush/clear effects
+      dut.probe.logic.feedOut.ready #= false
+      assert(emittedBeforeRecovery.toSeq == Seq(W),
+        s"malformed branch/target bytes emitted before recovery: $emittedBeforeRecovery")
+      assert(dut.fa.logic.ftqCount.toInt == 0, "mismatch must flush the FTQ")
+      assert(dut.fa.logic.ftbSuppress.toBoolean, "mismatch must arm one-shot suppression")
+      val ftbIdx = ((W >> 3) & 127).toInt
+      assert(!dut.ftb.logic.valids(ftbIdx).toBoolean, "mismatch must clear the exact FTB entry")
+
+      // Refetch from B's containing window with the complete real instruction. The
+      // cleared entry/suppress bit guarantees exactly today's untruncated framing.
+      dut.fetch.logic.cmdOut.ready #= true
+      await(cd, 10, "sequential recovery fetch") { tr.cmds.size >= 3 }
+      dut.fetch.logic.cmdOut.ready #= false
+      assert(tr.cmds(2)._2 == W,
+        f"recovery command must refetch B's aligned window 0x$W%x, got 0x${tr.cmds(2)._2}%x")
+      driveRsp(dut, cd, W, Seq(0x7001, 0x6000, 0x003c, 0x72ee), lens = Seq(1, 2, 1, 1))
+      dut.fetch.logic.rspIn.valid #= false
+      dut.probe.logic.feedOut.ready #= true
+      await(cd, 20, "recovered real branch") {
+        dut.probe.logic.feedOut.valid.toBoolean &&
+          dut.probe.logic.feedOut.payload(0).pc.toLong == B
+      }
+      assert(dut.probe.logic.feedOut.payload(0).lenWords.toInt == 2,
+        "recovery did not restore the real branch framing")
+      cd.waitSampling()
+      assert(mismatchCount == 1, s"mismatch replayed $mismatchCount times")
+      assert(!dut.fa.logic.ftbSuppress.toBoolean, "normal forward progress must clear suppression")
+    }
+  }
+}

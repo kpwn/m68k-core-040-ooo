@@ -69,11 +69,12 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     faRedir.valid   := doFlush || ucComplexResume.valid
     faRedir.payload := Mux(doFlush, flushPc, ucComplexResume.payload)
 
-    // ── Fetch-time BTB wiring (slice 1) ──────────────────────────────────────────
-    // Read port: query the BTB with the fetch window PC when a fetch is issued. The
-    // registered lookup result drives FetchAlign's predictRedirect (Step 3). Update
-    // port: consumed by the BtbPlugin from the ROB's BtbUpdateService (retire). The
-    // BTB invalidates on the SAME signal that clears the I-cache — BOTH sources: the
+    // ── Decode fallback BTB + fetch-directed FTB wiring ──────────────────────────
+    // The retained BTB ports query the aligned decode packets combinationally. The FTB
+    // and gshare window lookups instead travel through their registered services from
+    // each accepted I-cache command; their update ports consume ROB retire training.
+    // Both target tables invalidate on the SAME signal that clears the I-cache — BOTH
+    // sources: the
     // external boot/reset port AND the internal CPUSH/CINV maintenance pulse. The BTB
     // needs the latter because its lookup is not gated on the slot actually being a
     // branch, so a stale entry can redirect fetch on a non-branch with nothing
@@ -86,7 +87,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     btb.logic.invalidateAll := predictorInvalidate
     ftb.logic.invalidateAll := predictorInvalidate
     // Task P5.5: the INTERNAL, CPUSH/CINV-driven I-cache invalidate. Fans out to the
-    // I-cache and the BTB (above) but deliberately NOT to the RAS/gshare below — those
+    // I-cache, BTB, and FTB (above) but deliberately NOT to the RAS/gshare below — those
     // two are independently protected (RAS gates on live predecode; gshare's direction
     // is cross-checked at resolve). See IcachePlugin's `maintInvalidateAll` declaration
     // for the recorded rationale. Pulses only AFTER the D-side maintenance walk
@@ -418,7 +419,7 @@ object GenFullCoreSynthVerilog {
           new FtbPlugin(),
           new m68k040.frontend.RasPlugin(),
           new m68k040.frontend.GsharePlugin(),
-          new FetchAlignPlugin(),
+          new FetchAlignPlugin(enableFetchDirected = true),
           new DecodeStage(),
           new RenameStage(),
           new DispatchPlugin(),

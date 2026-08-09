@@ -278,7 +278,7 @@ class IpcBenchSpec extends AnyFunSuite {
     val ftb    = new m68k040.frontend.FtbPlugin
     val ras    = new m68k040.frontend.RasPlugin
     val gsh    = new m68k040.frontend.GsharePlugin
-    val fa     = new FetchAlignPlugin
+    val fa     = new FetchAlignPlugin(enableFetchDirected = true)
     val dec    = new DecodeStage
     val ren    = new RenameStage
     val disp   = new m68k040.dispatch.DispatchPlugin
@@ -352,7 +352,13 @@ class IpcBenchSpec extends AnyFunSuite {
       retiredInstrs: Int,   // MACRO instructions (cracked-load temps dropped)
       windowCycles: Int,    // first-commit .. last-commit (steady-state window)
       activeCycles: Int,    // cycles in window with >=1 macro-commit
-      dualCycles: Int       // cycles in window retiring 2 macro-instructions
+      dualCycles: Int,      // cycles in window retiring 2 macro-instructions
+      ftbApplies: Int,      // registered fetch plans applied at the I-cache boundary
+      ftqConfirms: Int,     // applied plans confirmed by exact decode framing
+      ftqMismatches: Int,   // applied plans recovered by the mismatch path
+      ftbDirDeclines: Int,  // conditional entry predicted not taken
+      ftbFrameDeclines: Int, // unsafe length/window/drop relationship
+      ftbBusyDeclines: Int  // redirect/quiesce/fault/held-target/full collision
   ) {
     def ipc: Double = if (windowCycles == 0) 0.0 else retiredInstrs.toDouble / windowCycles
     // Dual-issue% over commit-ACTIVE cycles (how often, when retiring, we retire 2).
@@ -416,6 +422,12 @@ class IpcBenchSpec extends AnyFunSuite {
       var maxSqAccepted     = 0
       var maxSqResident     = 0
       var maxDcOutstanding  = 0
+      var ftbApplies        = 0
+      var ftqConfirms       = 0
+      var ftqMismatches     = 0
+      var ftbDirDeclines    = 0
+      var ftbFrameDeclines  = 0
+      var ftbBusyDeclines   = 0
 
       def isTempOnly(wb: WhiteboxCapture.Wb): Boolean =
         wb.intWrite && wb.dstArch >= 16 && !wb.nzvcWrite && !wb.xWrite
@@ -436,6 +448,12 @@ class IpcBenchSpec extends AnyFunSuite {
       }
 
       cd.onSamplings {
+        if (dut.fa.logic.applyNow.toBoolean) ftbApplies += 1
+        if (dut.fa.logic.ftqConfirmFire.toBoolean) ftqConfirms += 1
+        if (dut.fa.logic.ftqMismatch.toBoolean) ftqMismatches += 1
+        if (dut.fa.logic.ftbDeclineDirection.toBoolean) ftbDirDeclines += 1
+        if (dut.fa.logic.ftbDeclineFraming.toBoolean) ftbFrameDeclines += 1
+        if (dut.fa.logic.ftbDeclineBlocked.toBoolean) ftbBusyDeclines += 1
         if (k.copybackDtt) {
           if (dut.lsEu.issuePort.valid.toBoolean) lsIssueValidCyc += 1
           if (dut.lsEu.issuePort.valid.toBoolean &&
@@ -611,7 +629,9 @@ class IpcBenchSpec extends AnyFunSuite {
       val activeCycles  = windowHisto.count(_ >= 1)
       val dualCycles    = windowHisto.count(_ == 2)
 
-      result = IpcResult(k.name, windowRetired, windowCycles, activeCycles, dualCycles)
+      result = IpcResult(k.name, windowRetired, windowCycles, activeCycles, dualCycles,
+        ftbApplies, ftqConfirms, ftqMismatches,
+        ftbDirDeclines, ftbFrameDeclines, ftbBusyDeclines)
       if (k.copybackDtt) {
         println(s"[store-path] lsIssue=$lsIssueFires sqAlloc=$sqAllocFires fastAlloc=$fastSqAllocs " +
           s"sqDrainFire=$sqDrainFires dcStoreFire=$dcStoreFires ack=$dcStoreAcks " +
@@ -936,7 +956,7 @@ class IpcBenchSpec extends AnyFunSuite {
 
     // ── Print the table ───────────────────────────────────────────────────────
     println()
-    println("=" * 78)
+    println("=" * 96)
     println("  68040 OoO 2-wide superscalar — IPC microbenchmark")
     println("  steady-state window = first-commit .. last-commit (fill/drain excluded)")
     println("  IPC = retired macro-instructions / window-cycles")
@@ -945,18 +965,25 @@ class IpcBenchSpec extends AnyFunSuite {
     println("  dual%(act) = cycles retiring 2 / commit-active cycles (backend ILP)")
     println("  dual%(win) = cycles retiring 2 / all window cycles")
     println("  active%    = cycles retiring >=1 / all window cycles (backend occupancy)")
-    println("=" * 78)
-    println(f"${"kernel"}%-16s ${"retired"}%8s ${"cycles"}%7s ${"IPC"}%6s ${"dual%(act)"}%10s ${"dual%(win)"}%10s ${"active%"}%8s")
-    println("-" * 78)
+    println("=" * 96)
+    println(f"${"kernel"}%-16s ${"retired"}%8s ${"cycles"}%7s ${"IPC"}%6s ${"dual%(act)"}%10s ${"dual%(win)"}%10s ${"active%"}%8s ${"FTB app/ok/bad"}%16s")
+    println("-" * 96)
     for (r <- results) {
       println(f"${r.name}%-16s ${r.retiredInstrs}%8d ${r.windowCycles}%7d ${r.ipc}%6.3f " +
-        f"${r.dualPctActive}%9.1f%% ${r.dualPctWindow}%9.1f%% ${r.activePct}%7.1f%%")
+        f"${r.dualPctActive}%9.1f%% ${r.dualPctWindow}%9.1f%% ${r.activePct}%7.1f%% " +
+        f"${r.ftbApplies}%5d/${r.ftqConfirms}%d/${r.ftqMismatches}%-5d")
     }
-    println("-" * 78)
+    println("-" * 96)
     val totRet = results.map(_.retiredInstrs).sum
     val totCyc = results.map(_.windowCycles).sum
     println(f"${"AGGREGATE"}%-16s ${totRet}%8d ${totCyc}%7d ${totRet.toDouble / totCyc}%6.3f")
-    println("=" * 78)
+    println("=" * 96)
+    println()
+    for (r <- results) {
+      println(s"[ftb:${r.name}] apply=${r.ftbApplies} confirm=${r.ftqConfirms} " +
+        s"mismatch=${r.ftqMismatches} declineDir=${r.ftbDirDeclines} " +
+        s"declineFrame=${r.ftbFrameDeclines} declineBlocked=${r.ftbBusyDeclines}")
+    }
     println()
 
     val depO = results.find(_.name == "dependent-ALU")

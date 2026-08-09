@@ -1,7 +1,8 @@
 package m68k040.frontend
 
 import m68k040.cache.{ChunkPredecode, FetchCmd, FetchRsp}
-import m68k040.services.{DecodeFeedService, FetchService}
+import m68k040.services.{DecodeFeedService, FetchService,
+  FtbLookupCmd, FtbLookupRsp, FtbLookupService, GshareWindowRsp, GshareWindowService}
 import spinal.core._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
@@ -21,12 +22,39 @@ import spinal.lib.misc.plugin.FiberPlugin
   *    feed.valid until resume clears it. (No separate complexPending delay; the
   *    complex packet is valid for one cycle, observed by per-cycle sampling.)
   */
-class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
+case class FetchTargetQueueEntry() extends Bundle {
+  val brPc     = UInt(32 bits)
+  val brLen    = UInt(4 bits)
+  val target   = UInt(32 bits)
+  val phtIdx   = UInt(11 bits)
+  val isCond   = Bool()
+}
+
+class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
+    extends FiberPlugin with DecodeFeedService {
+
+  require(ftqDepth > 0 && (ftqDepth & (ftqDepth - 1)) == 0,
+    "FTQ depth must be a positive power of two")
 
   val logic = during build new Area {
 
     // ---- Resolve I-cache service ----
     val ic = host[FetchService]
+
+    // Production/full-core instances opt into the registered-token services. Small
+    // standalone frontend fixtures retain an inert local Flow so they do not need a
+    // predictor-training/ROB stack merely to test framing or cache handshakes.
+    val ftbCmd = if (enableFetchDirected) host[FtbLookupService].lookupCmd else Flow(FtbLookupCmd())
+    val ftbRsp = if (enableFetchDirected) host[FtbLookupService].lookupRsp else Flow(FtbLookupRsp())
+    val ftbClear = if (enableFetchDirected) host[FtbLookupService].clearOne else Flow(UInt(32 bits))
+    val gshareWindowCmd = if (enableFetchDirected) host[GshareWindowService].windowCmd else Flow(FtbLookupCmd())
+    val gshareWindowRsp = if (enableFetchDirected) host[GshareWindowService].windowRsp else Flow(GshareWindowRsp(11))
+    if (!enableFetchDirected) {
+      ftbRsp.valid := False
+      ftbRsp.payload.assignFromBits(B(0, ftbRsp.payload.getBitsWidth bits))
+      gshareWindowRsp.valid := False
+      gshareWindowRsp.payload.assignFromBits(B(0, gshareWindowRsp.payload.getBitsWidth bits))
+    }
 
     // ---- Sub-component: InstructionBuffer ----
     val ibuf = new InstructionBuffer()
@@ -181,9 +209,12 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val RING = 3
     val ringStale = Vec.fill(RING)(Reg(Bool()) init False)  // per-entry: redirect after issue -> discard rsp
     val ringDrop  = Vec.fill(RING)(Reg(UInt(2 bits)) init 0) // per-entry: leading words to drop (target[2:1])
+    val ringKeep  = Vec.fill(RING)(Reg(UInt(3 bits)) init 4) // per-entry: exclusive trailing word, 1..4
+    val ringPlanSeq = Vec.fill(RING)(Reg(UInt(8 bits)) init 0)
     val ringHead  = Reg(UInt(log2Up(RING) bits)) init 0      // oldest in-flight: the NEXT rsp belongs to it
     val ringTail  = Reg(UInt(log2Up(RING) bits)) init 0      // next slot to ISSUE into
     val ringCount = Reg(UInt(log2Up(RING + 1) bits)) init 0  // # outstanding (0..RING)
+    val planSeq   = Reg(UInt(8 bits)) init 0
     // Back-compat alias: recValid (≥1 outstanding) drives the SAME guards/markers the
     // single-outstanding code used. ringFull blocks issue when both slots are occupied.
     val recValid  = ringCount =/= 0
@@ -198,6 +229,44 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // target[2:1]; latched into the ring entry at issue, then cleared).
     val pendingDrop = Reg(UInt(2 bits)) init 0
     spinal.core.sim.SimPublic(recValid, ringCount, ringHead, ringTail, pendingDrop)
+    ringDrop.foreach(spinal.core.sim.SimPublic(_))
+    ringKeep.foreach(spinal.core.sim.SimPublic(_))
+    ringPlanSeq.foreach(spinal.core.sim.SimPublic(_))
+    spinal.core.sim.SimPublic(planSeq)
+
+    // Fetch-target queue. The 32-entry depth is the binding legal run-ahead bound:
+    // three cache requests plus at most twenty one-word windows resident in the IBuf.
+    require(ftqDepth >= RING + ibuf.BUF_WORDS + 1,
+      s"FTQ depth $ftqDepth is below the legal frontend run-ahead bound")
+    val ftqMem   = Mem(FetchTargetQueueEntry(), ftqDepth)
+    val ftqHead  = Reg(UInt(log2Up(ftqDepth) bits)) init 0
+    val ftqTail  = Reg(UInt(log2Up(ftqDepth) bits)) init 0
+    val ftqCount = Reg(UInt(log2Up(ftqDepth + 1) bits)) init 0
+    val ftqHeadE = ftqMem.readAsync(ftqHead)
+    val ftqValid = ftqCount =/= 0
+    val ftqFull  = ftqCount === ftqDepth
+    def ftqInc(idx: UInt): UInt = (idx + 1).resized
+
+    // A registered result may arrive while I-cache command acceptance is blocked.
+    // Capture the target once; no younger command can overtake the held command.
+    val targetHoldValid = Reg(Bool()) init False
+    val targetHoldPc    = Reg(UInt(32 bits)) init 0
+    val targetHoldDrop  = Reg(UInt(2 bits)) init 0
+    val ftbSuppress     = Reg(Bool()) init False
+
+    // Forward-declared controls whose decisions live after the aligner. Keeping them as
+    // explicit nets lets the fetch-side result application and ring staleness see the
+    // final same-cycle decision without reaching across plugin internals.
+    val ftqPop = Bool(); ftqPop.allowOverride; ftqPop := False
+    val ftqFlush = Bool(); ftqFlush.allowOverride; ftqFlush := False
+    val ftqMismatch = Bool(); ftqMismatch.allowOverride; ftqMismatch := False
+    val ftqMismatchPc = UInt(32 bits); ftqMismatchPc.allowOverride; ftqMismatchPc := decodePc
+    val ftqPush = Bool(); ftqPush.allowOverride; ftqPush := False
+    val applyNow = Bool(); applyNow.allowOverride; applyNow := False
+    spinal.core.sim.SimPublic(ftqHead, ftqTail, ftqCount, ftqValid, ftqFull)
+    spinal.core.sim.SimPublic(targetHoldValid, targetHoldPc, targetHoldDrop, ftbSuppress)
+    spinal.core.sim.SimPublic(ftqPop, ftqFlush, ftqMismatch, ftqPush, applyNow)
+    ftqHeadE.flatten.foreach(spinal.core.sim.SimPublic(_))
 
     // ---- Default-drive IBuf inputs ----
     ibuf.io.push.valid   := False
@@ -224,7 +293,80 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // Any fetch-redirect this cycle (external redirect, complex-resume, commit mispredict,
     // OR a fetch-time prediction). A fetch issued THIS cycle used the pre-redirect fetchPc
     // -> born stale. (mispredictRedirect/redirect/resume declared above; resume only when stalled.)
-    val redirectThisCycle = redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid || predictFire
+    val redirectThisCycle = redirect.valid || (resume.valid && stalled) ||
+                            mispredictRedirect.valid || predictFire || ftqMismatch
+
+    // Join the two registered lookup results by the exact fetch-plan token. A ring slot
+    // may be recycled while an old value is still visible, so sequence equality and the
+    // slot's live stale bit are both required; the changing live fetchPc is irrelevant.
+    val resultSlot      = ftbRsp.payload.token.ringSlot
+    val resultSlotLegal = resultSlot < U(RING, resultSlot.getWidth bits)
+    val resultTokensMatch = ftbRsp.valid && gshareWindowRsp.valid &&
+      (ftbRsp.payload.token.ringSlot === gshareWindowRsp.payload.token.ringSlot) &&
+      (ftbRsp.payload.token.seq === gshareWindowRsp.payload.token.seq)
+    val resultSeqLive = resultSlotLegal &&
+      (ringPlanSeq(resultSlot) === ftbRsp.payload.token.seq) && !ringStale(resultSlot)
+    val resultEnd = ftbRsp.payload.brWordOff.resize(5) + ftbRsp.payload.brLen.resize(5)
+    val resultDirection = (ftbRsp.payload.brType =/= 0) ||
+                          gshareWindowRsp.payload.taken(ftbRsp.payload.brWordOff)
+    val resultInWindow = (ftbRsp.payload.brLen =/= 0) && (resultEnd <= U(4, 5 bits))
+    val resultAfterDrop = ftbRsp.payload.brWordOff >= ringDrop(resultSlot)
+    val ftbCandidate = resultTokensMatch && resultSeqLive && ftbRsp.payload.hit
+    val ftbBlocked = redirectThisCycle || quiesce || stalled || faultHold ||
+                     ftbSuppress || targetHoldValid || ftqFull
+    val ftbDeclineDirection = ftbCandidate && !resultDirection
+    val ftbDeclineFraming = ftbCandidate && resultDirection &&
+                            !(resultInWindow && resultAfterDrop)
+    val ftbDeclineBlocked = ftbCandidate && resultDirection &&
+                           resultInWindow && resultAfterDrop && ftbBlocked
+    spinal.core.sim.SimPublic(ftbCandidate, ftbDeclineDirection,
+      ftbDeclineFraming, ftbDeclineBlocked)
+
+    if (enableFetchDirected) {
+      when(ftbRsp.valid || gshareWindowRsp.valid) {
+        assert(ftbRsp.valid && gshareWindowRsp.valid,
+          "FTB and gshare window responses must have identical fixed latency")
+      }
+      when(ftbRsp.valid && gshareWindowRsp.valid) {
+        assert(ftbRsp.payload.token.ringSlot === gshareWindowRsp.payload.token.ringSlot &&
+               ftbRsp.payload.token.seq === gshareWindowRsp.payload.token.seq,
+          "FTB and gshare window responses lost fetch-plan association")
+      }
+      applyNow := ftbCandidate && resultDirection && resultInWindow &&
+                  resultAfterDrop && !ftbBlocked
+      when(applyNow) {
+        assert(resultSlotLegal && resultEnd > ringDrop(resultSlot).resize(5),
+          "applied FTB plan violates its ring slot/drop framing contract")
+      }
+    }
+
+    // Every accepted cache command launches both registered lookups with the same token.
+    // The providers' ports are directionless service wires with idle defaults, matching
+    // the existing BTB/Gshare integration style.
+    ftbCmd.valid := ic.cmd.fire
+    ftbCmd.payload.windowPc := ic.cmd.payload.pc
+    ftbCmd.payload.token.ringSlot := ringTail
+    ftbCmd.payload.token.seq := planSeq
+    gshareWindowCmd.valid := ic.cmd.fire
+    gshareWindowCmd.payload := ftbCmd.payload
+    ftbClear.valid := ftqMismatch
+    ftbClear.payload := ftqHeadE.brPc
+
+    val ftqPushEntry = FetchTargetQueueEntry()
+    ftqPushEntry.brPc   := ftbRsp.payload.windowPc(31 downto 3) @@
+                           ftbRsp.payload.brWordOff @@ U(0, 1 bits)
+    ftqPushEntry.brLen  := ftbRsp.payload.brLen
+    ftqPushEntry.target := ftbRsp.payload.target
+    ftqPushEntry.phtIdx := gshareWindowRsp.payload.phtIdx(ftbRsp.payload.brWordOff)
+    ftqPushEntry.isCond := ftbRsp.payload.brType === 0
+    ftqMem.write(ftqTail, ftqPushEntry, enable = ftqPush)
+    ftqPush := applyNow
+
+    // Every redirect-like action clears speculative FTQ/held-target state. Fetch-side
+    // application is intentionally absent from this flush term: it truncates one live
+    // ring window and appends its target without invalidating any older bytes.
+    ftqFlush := redirect.valid || (resume.valid && stalled) ||
+                mispredictRedirect.valid || predictFire || ftqMismatch
 
     // ---- FetchControl: issue fetches (DEPTH-3 multi-outstanding, ANGLE D) ----
     // Issue while the ring has a free slot — up to 3 in flight. A non-fault response
@@ -257,16 +399,25 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // When the ring is not full, behavior remains exactly as before.
     val fullRingTurnover = ic.rsp.valid && !ic.rsp.payload.fault
     val ringSlotAvailable = !ringFull || fullRingTurnover
-    ic.cmd.valid      := started && ringSlotAvailable && ibufRoomForIssue && !stalled && !faultHold && !quiesce
-    ic.cmd.payload.pc := fetchPc
+    val directTargetPc = ftbRsp.payload.target(31 downto 3) @@ U(0, 3 bits)
+    val cmdWindowPc = Mux(targetHoldValid, targetHoldPc,
+                      Mux(applyNow, directTargetPc, fetchPc))
+    val cmdDrop = Mux(targetHoldValid, targetHoldDrop,
+                  Mux(applyNow, ftbRsp.payload.target(2 downto 1), pendingDrop))
+    ic.cmd.valid      := started && ringSlotAvailable && ibufRoomForIssue &&
+                         !stalled && !faultHold && !quiesce
+    ic.cmd.payload.pc := cmdWindowPc
 
     when(ic.cmd.fire) {
       // Capture this fetch's record into the TAIL ring slot. Born stale iff a redirect
       // fires THIS cycle (this fetch used the old, now-wrong fetchPc). Latch the drop
       // intent; consume it. Advance tail + count.
       ringStale(ringTail) := redirectThisCycle
-      ringDrop(ringTail)  := pendingDrop
+      ringDrop(ringTail)  := cmdDrop
+      ringKeep(ringTail)  := U(4, 3 bits)
+      ringPlanSeq(ringTail) := planSeq
       ringTail := ringInc(ringTail)
+      planSeq := planSeq + 1
       pendingDrop := 0
       // Advance the SEQUENTIAL fetch pointer at ISSUE (depth-2 needs fetchPc+8 ready for
       // the NEXT cycle's issue while this fetch is still in flight). Only for a live
@@ -274,8 +425,24 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       // (and overrides this), and a stale issue's window is discarded. Guarding on
       // !redirectThisCycle keeps fetchPc from walking past a coincident redirect target.
       when(!redirectThisCycle) {
-        fetchPc := fetchPc + 8
+        fetchPc := cmdWindowPc + 8
       }
+    }
+
+    // The registered lookup result's architectural claim is committed once, whether or
+    // not the cache accepts its target command in this cycle. Backpressure only decides
+    // whether the target needs the one-entry hold register.
+    when(applyNow) {
+      ringKeep(resultSlot) := resultEnd.resize(3)
+      ftqTail := ftqInc(ftqTail)
+      when(!ic.cmd.fire) {
+        targetHoldValid := True
+        targetHoldPc    := directTargetPc
+        targetHoldDrop  := ftbRsp.payload.target(2 downto 1)
+      }
+    }
+    when(targetHoldValid && ic.cmd.fire) {
+      targetHoldValid := False
     }
     // ringCount: +1 on a fire that is NOT consumed this cycle, -1 on a rsp consume that
     // is not re-issued; net handled below where the rsp is consumed (both can happen the
@@ -311,7 +478,12 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       when(!rspStaleHead && !ic.rsp.payload.fault) {
         // Leading-word drop carried by THIS fetch's record (the head entry's drop).
         val startWord = rspDropHead
-        val nWords    = U(4, 3 bits) - startWord.resize(3)
+        // ringKeep is an exclusive offset from word zero. A fetch-directed prediction
+        // lowers it to the learned branch end; the paired FTQ entry is written in the
+        // same application event, so target bytes can never enter as fall-through.
+        val nWords    = ringKeep(ringHead) - startWord.resize(3)
+        assert(ringKeep(ringHead) > startWord.resize(3),
+          "live fetch-ring response contains no genuine words")
         for (j <- 0 until 4) {
           when(U(j) < nWords) {
             val srcIdx = (startWord + U(j, 2 bits)).resize(2)
@@ -398,6 +570,25 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // `ibuf.io.flush`/`ibuf.io.shift` are plain nets driven further down this same Area;
     // SpinalHDL resolves them as single nets, so reading them here sees their final value.
     // No combinational loop: they only reach `p0LiveReg`'s D input (through the register).
+    // ── Decode-side FTQ view and genuine-word clamp ─────────────────────────────
+    // The head entry describes the sole splice nearest decode. Limit the aligner's
+    // visible word count to bytes proven to precede that splice. This is the framing
+    // safety mechanism: a stale/wrong learned length can only make the aligner stall or
+    // emit a packet made entirely of genuine bytes, never consume target bytes as an
+    // extension of a fall-through instruction.
+    val ftqDiff  = ftqHeadE.brPc - decodePc
+    val ftqDelta = ftqDiff(4 downto 1)
+    val ftqNear  = ftqValid && (ftqDiff(31 downto 5) === U(0, 27 bits))
+    val ftqAt0   = ftqNear && (ftqDelta === 0)
+    val spliceWords = ftqDelta.resize(5) + ftqHeadE.brLen.resize(5)
+    val availEff = UInt(4 bits)
+    when(ftqNear && (spliceWords < ibuf.io.avail.resize(5))) {
+      availEff := spliceWords.resize(4)
+    } otherwise {
+      availEff := ibuf.io.avail
+    }
+    spinal.core.sim.SimPublic(ftqDiff, ftqDelta, ftqNear, ftqAt0, spliceWords, availEff)
+
     val p0LiveReg = Reg(ChunkPredecode())
     p0LiveReg.simple        init False
     p0LiveReg.lenWords      init 0
@@ -416,17 +607,19 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // determinism only (an uninitialised Reg randomises per sim seed).
     p0LiveReg.size          init m68k040.isa.Size.BYTE
     p0LiveReg := PredecodeWord.classify(ibuf.io.head(0), ibuf.io.head(1), ibuf.io.head(2), ibuf.io.head(3),
-      extWValid  = ibuf.io.avail >= U(2, 4 bits),
-      extW2Valid = ibuf.io.avail >= U(3, 4 bits),
-      extW3Valid = ibuf.io.avail >= U(4, 4 bits))
+      extWValid  = availEff >= U(2, 4 bits),
+      extW2Valid = availEff >= U(3, 4 bits),
+      extW3Valid = availEff >= U(4, 4 bits))
+    val availEffPrev = RegNext(availEff) init 0
     val p0LiveInvalidate = ibuf.io.flush || (ibuf.io.shift =/= 0) ||
-                           (ibuf.io.push.fire && (ibuf.io.cnt < U(4, ibuf.io.cnt.getWidth bits)))
+                           (ibuf.io.push.fire && (ibuf.io.cnt < U(4, ibuf.io.cnt.getWidth bits))) ||
+                           (availEffPrev =/= availEff)
     when(p0LiveInvalidate) {
       p0LiveReg.ambiguousLine := True
     }
 
     // ---- Aligner: combinational decode of buffer head ----
-    val res = Aligner.align(decodePc, ibuf.io.head, ibuf.io.headPred, ibuf.io.avail, p0LiveReg)
+    val res = Aligner.align(decodePc, ibuf.io.head, ibuf.io.headPred, availEff, p0LiveReg)
     spinal.core.sim.SimPublic(ibuf.io.headPred(0).simple, ibuf.io.head(0))
 
     // ── Fetch-time prediction (BTB + bimodal, slice 1) ───────────────────────────
@@ -523,6 +716,15 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val s1IsReturn = res.slot1Valid && res.slot1.simple && (s1IsRts || s1IsRtr)
     val slot1WouldRasPred = s1IsReturn && rasPredValid && res.slot0Valid && !slot0IsPred && !rasPredictSlot0
 
+    // Exact decode-time confirmation of the fetch-side framing claim. A predicted branch
+    // in slot1 is deferred to slot0 just like the retained BTB/RAS fallbacks; neither
+    // fallback is removed by the FTB.
+    val ftqConfirm = ftqAt0 && res.slot0Valid && res.slot0.simple &&
+                     (res.slot0.lenWords === ftqHeadE.brLen)
+    val slot1WouldFtq = ftqNear && !ftqAt0 && res.slot0Valid && res.slot1Valid &&
+                        (ftqDelta === res.slot0.lenWords) && !ftqConfirm
+    spinal.core.sim.SimPublic(ftqConfirm, slot1WouldFtq)
+
     // ── Compose the slot0 prediction source: isReturn ? RAS : BTB (slice 2) ───────
     // A return is predicted by the RAS (top-of-stack); everything else by the BTB
     // (slice 1). Returns + BTB hits are mutually exclusive (slice 1 never learns a
@@ -531,8 +733,25 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // stamping, the effShift consume, and predictFire/redirect — so a RAS-predicted
     // return is a predicted-taken redirect identical to a BTB taken branch.
     val slot0Predicted    = slot0IsPred || rasPredictSlot0
-    val predictedThisEmit = slot0Predicted
+    val predictedThisEmit = slot0Predicted && !ftqConfirm
     val predTargetSel     = Mux(rasPredictSlot0, rasPredTarget, btbPredTarget0)
+
+    // A permanently clamped, non-emittable instruction signals a wrong learned framing
+    // claim. Dwell for three cycles because p0LiveReg intentionally reports one-cycle
+    // ambiguity whenever availEff changes. `ftqPast` is defensive and deliberately not
+    // gated by ftqNear (near already forces the sign bit low).
+    val ftqStarveRaw = ftqNear && !res.slot0Valid && (availEff < ibuf.io.avail) &&
+                       !quiesce && !stalled
+    val ftqStarveCnt = Reg(UInt(2 bits)) init 0
+    when(!ftqStarveRaw) {
+      ftqStarveCnt := 0
+    } elsewhen(ftqStarveCnt =/= U(3, 2 bits)) {
+      ftqStarveCnt := ftqStarveCnt + 1
+    }
+    val ftqStarved = ftqStarveRaw && (ftqStarveCnt === U(3, 2 bits))
+    val ftqPast = ftqValid && ftqDiff(31)
+    val ftqStarvedOrPast = ftqStarved || ftqPast
+    spinal.core.sim.SimPublic(ftqStarveRaw, ftqStarveCnt, ftqStarved, ftqPast)
 
     // ---- Feed valid logic ----
     // Emit when a packet is at head and not stalled. Complex packets emit once:
@@ -543,7 +762,7 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // Suppress slot1 when slot0 is the predicted-taken branch (slot1 is wrong-path) OR
     // when slot1 WOULD be a predicted branch (defer it to slot0 next cycle). slot0Predicted
     // folds in a RAS-predicted return (slice 2): its slot1 is equally wrong-path.
-    when(slot0Predicted || slot1WouldPred || slot1WouldRasPred) {
+    when(slot0Predicted || slot1WouldPred || slot1WouldRasPred || slot1WouldFtq || ftqConfirm) {
       slot1ValidOut := False
     }
     // Stamp the prediction onto slot0 (rides to the EU). The target is the composed
@@ -563,9 +782,17 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       feed.payload(0).phtValid := True
       feed.payload(0).phtIndex := gsPhtIndex0
     }
+    // Fetch-time confirmation wins over the decode-time fallback stamps. The carried
+    // PHT index names the exact registered window lookup, even though GHR has since moved.
+    when(ftqConfirm) {
+      feed.payload(0).predTaken  := True
+      feed.payload(0).predTarget := ftqHeadE.target
+      feed.payload(0).phtValid   := ftqHeadE.isCond
+      feed.payload(0).phtIndex   := ftqHeadE.phtIdx
+    }
     // Gate feed low while STOP-quiesced so no buffered successor word is dispatched /
     // allocated into the ROB while halted (the quiesce only ends on the wake redirect).
-    feed.valid      := res.slot0Valid && !stalled && !quiesce
+    feed.valid      := res.slot0Valid && !stalled && !quiesce && !ftqPast
     // I-fetch fault: once decode has drained everything legitimately buffered ahead
     // of the fault (no more aligned instruction available -> !res.slot0Valid), AND
     // we're not mid-complex-stall/quiesce (waiting on an earlier, unrelated resume),
@@ -576,7 +803,8 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // than the raw faultHold latch) is what lets still-buffered pre-fault instructions
     // keep draining normally instead of being squashed the instant the fault response
     // lands (up to RING windows before decode actually reaches it).
-    val emittingFaultPacket = faultHold && !res.slot0Valid && !stalled && !quiesce
+    val emittingFaultPacket = faultHold && !res.slot0Valid && !stalled && !quiesce &&
+                              !ftqStarvedOrPast
     when(emittingFaultPacket) {
       feed.valid             := !faultEmitted
       slot1ValidOut          := False
@@ -620,7 +848,8 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // branch deferred to next cycle), consume only slot0's words (lenWords); else the
     // aligner's full shift. Without this, suppressing slot1 would still CONSUME its
     // words from the IBuf — losing the deferred branch / the wrong-path successor.
-    val suppressSlot1 = slot0Predicted || slot1WouldPred || slot1WouldRasPred
+    val suppressSlot1 = slot0Predicted || slot1WouldPred || slot1WouldRasPred ||
+                        slot1WouldFtq || ftqConfirm
     val effShift = Mux(suppressSlot1, res.slot0.lenWords.resize(res.shiftWords.getWidth), res.shiftWords)
     // FMax (front-end floor): RETIME the decodePc advance so the late suppressSlot1 decision
     // (BTB/RAS prediction cones) muxes the 32-bit ADD RESULT instead of the adder's addend.
@@ -633,6 +862,20 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     val decodePcSuppress = decodePc + (res.slot0.lenWords.resize(32) |<< 1)   // slot1 suppressed
     val decodePcFull     = decodePc + (res.shiftWords.resize(32) |<< 1)       // full aligner shift
     val decodePcNext     = Mux(suppressSlot1, decodePcSuppress, decodePcFull)
+
+    // A shorter real instruction at the claimed branch PC may emit because every one of
+    // its words is still genuine; recover at its fall-through. Likewise, an instruction
+    // beginning before the claimed PC may emit only when all its words precede the splice,
+    // then recover at its fall-through before another packet is framed. Backpressure must
+    // not skip an instruction, hence both guards are fire-gated.
+    val ftqLenBad = ftqAt0 && res.slot0Valid && !ftqConfirm && feed.fire
+    val ftqOvershoot = ftqNear && !ftqAt0 && feed.fire && !emittingFaultPacket &&
+                       (effShift > ftqDelta)
+    ftqMismatch := (ftqStarved || ftqPast || ftqLenBad || ftqOvershoot) &&
+                   !quiesce && !stalled
+    ftqMismatchPc := Mux(ftqLenBad || ftqOvershoot, decodePcNext, decodePc)
+    spinal.core.sim.SimPublic(ftqLenBad, ftqOvershoot, ftqMismatchPc)
+
     when(feed.fire && !emittingFaultPacket) {
       ibuf.io.shift := effShift
       decodePc      := decodePcNext
@@ -641,6 +884,15 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
         stalled := True
       }
     }
+
+    // Exact confirmation consumes only the branch, then jumps decode to target bytes
+    // already appended by the fetch ring. It does not flush the IBuf or stale the ring.
+    val ftqConfirmFire = ftqConfirm && feed.fire && !emittingFaultPacket
+    when(ftqConfirmFire) {
+      decodePc := ftqHeadE.target
+    }
+    ftqPop := ftqConfirmFire
+    spinal.core.sim.SimPublic(ftqConfirmFire)
 
     // ── gshare GHR speculative shift (slice 3) ──────────────────────────────────
     // Shift the GHR on the emitted slot0 predicted CONDITIONAL (taken OR not — gated on
@@ -651,8 +903,10 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
     // right entry at retire, so correctness is unaffected). The lookup index used the GHR
     // BEFORE this shift; the carried phtIndex (stamped above) matches. NOT checkpointed/
     // restored on a flush (accept-corruption).
-    gsShiftValid := feed.fire && !faultHold && condBtbHit0 && res.slot0Valid
-    gsShiftDir   := slot0PredTaken
+    val ftqConfirmCond = ftqConfirmFire && ftqHeadE.isCond
+    gsShiftValid := ftqConfirmCond ||
+                    (feed.fire && !faultHold && condBtbHit0 && res.slot0Valid && !ftqConfirm)
+    gsShiftDir   := Mux(ftqConfirmCond, True, slot0PredTaken)
 
     // ── RAS push/pop bookkeeping (slice 2) ───────────────────────────────────────
     // On the cycle the emitted slot0 fires (NOT a faulted packet): a call pushes its
@@ -690,6 +944,23 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       // (and one issued THIS cycle, born stale via redirectThisCycle) is wrong-path; its
       // response must be discarded. Free slots' stale bits are don't-care (overwritten at
       // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
+      ringStale.foreach(_ := True)
+    }
+
+    // Wrong framing claim: restart sequentially at the first not-yet-emitted PC (or the
+    // just-emitted packet's fall-through), clear only this FTB entry, and suppress one
+    // refetch application so the same stale claim cannot livelock. Architectural redirects
+    // below retain their existing higher priority.
+    when(ftqMismatch) {
+      val newPc       = ftqMismatchPc
+      decodePc        := newPc
+      fetchPc         := newPc(31 downto 3) @@ U(0, 3 bits)
+      ibuf.io.flush   := True
+      stalled         := False
+      started         := True
+      pendingDrop     := newPc(2 downto 1)
+      faultHold       := False
+      faultEmitted    := False
       ringStale.foreach(_ := True)
     }
 
@@ -763,6 +1034,39 @@ class FetchAlignPlugin extends FiberPlugin with DecodeFeedService {
       // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
       ringStale.foreach(_ := True)
     }
+
+    // FTQ occupancy is updated once, with flush last so no same-cycle prediction can
+    // survive an architectural/decode redirect. Pop credit is deliberately absent from
+    // applyNow; the legal depth makes full unreachable without a decode-ready→fetch path.
+    when(ftqPop) {
+      ftqHead := ftqInc(ftqHead)
+    }
+    when(ftqPush && !ftqPop) {
+      ftqCount := (ftqCount + 1).resized
+    } elsewhen(!ftqPush && ftqPop) {
+      ftqCount := (ftqCount - 1).resized
+    }
+    when(ftqFlush) {
+      ftqHead := 0
+      ftqTail := 0
+      ftqCount := 0
+      targetHoldValid := False
+    }
+
+    // One-shot mismatch suppression priority: ordinary progress clears, mismatch sets,
+    // and a fresh architectural/decode redirect clears last.
+    when(feed.fire) {
+      ftbSuppress := False
+    }
+    when(ftqMismatch) {
+      ftbSuppress := True
+    }
+    when(redirect.valid || (resume.valid && stalled) ||
+         mispredictRedirect.valid || predictFire) {
+      ftbSuppress := False
+    }
+
+    assert(!ftqFull, "FTQ reached its defensive full state despite the run-ahead bound")
   }
 
   // ---- DecodeFeedService implementation ----

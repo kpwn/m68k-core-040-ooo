@@ -265,7 +265,7 @@ class FuzzCoreDut extends Component {
   val ftb    = new m68k040.frontend.FtbPlugin
   val ras    = new m68k040.frontend.RasPlugin
   val gsh    = new m68k040.frontend.GsharePlugin
-  val fa     = new FetchAlignPlugin
+  val fa     = new FetchAlignPlugin(enableFetchDirected = true)
   val dec    = new DecodeStage
   val ren    = new RenameStage
   val disp   = new m68k040.dispatch.DispatchPlugin
