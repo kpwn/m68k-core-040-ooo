@@ -388,6 +388,95 @@ class RobPluginSpec extends AnyFunSuite {
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
+  test("BTB training carries exact branch length through retire, wrap, flush, and non-branch suppression") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+      dut.rob.logic.branchCompletion.valid #= false
+
+      def allocBranch(pc: Long): Int = {
+        val id = dut.rob.logic.tail.toInt
+        pokeRu(dut.rsrc.logic.src.payload(0), pc = pc, dstArch = 0,
+          pdstValid = false, isBranch = true)
+        dut.rsrc.logic.src.valid #= true
+        dut.rsrc.logic.u1v #= false
+        cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+        dut.rsrc.logic.src.valid #= false
+        cd.waitSampling()
+        id
+      }
+
+      def completeBranch(id: Int, pc: Long, len: Int, learn: Boolean = true): Unit = {
+        val bc = dut.rob.logic.branchCompletion
+        bc.valid #= true
+        bc.payload.robId #= id
+        bc.payload.mispredict #= false
+        bc.payload.nextPc #= (pc + 2L * len)
+        bc.payload.isBranch #= learn
+        bc.payload.btbPc #= pc
+        bc.payload.btbTaken #= true
+        bc.payload.btbTarget #= 0x8000
+        bc.payload.brType #= 1
+        bc.payload.btbLen #= len
+        bc.payload.phtValid #= false
+        bc.payload.phtIndex #= 0
+        cd.waitSampling()
+        bc.valid #= false
+      }
+
+      def awaitUpdate(pc: Long, len: Int): Unit = {
+        var cycles = 0
+        while (!dut.rob.logic.btbUpdateFlow.valid.toBoolean) {
+          assert(cycles < 12, s"BTB update missing for pc=0x${pc.toHexString}")
+          cycles += 1
+          cd.waitSampling()
+        }
+        val upd = dut.rob.logic.btbUpdateFlow.payload
+        assert(upd.pc.toLong == pc, s"training PC association lost across retire/wrap")
+        assert(upd.len.toInt == len, s"training len=${upd.len.toInt}, expected $len")
+        cd.waitSampling()
+      }
+
+      // More than one complete ROB turn makes the 63->0 association observable.
+      val lengths = Seq(1, 2, 3, 5)
+      var updates = 0
+      for (n <- 0 until 68) {
+        val pc = 0x4000L + n * 16L
+        val len = lengths(n & 3)
+        val id = allocBranch(pc)
+        assert(id == (n & 63), s"expected ROB wrap id=${n & 63}, got $id")
+        completeBranch(id, pc, len)
+        awaitUpdate(pc, len)
+        updates += 1
+      }
+      assert(updates == 68)
+
+      // A flushed branch never reaches retire-time training.
+      val flushedPc = 0x9000L
+      allocBranch(flushedPc)
+      dut.rob.logic.flush.valid #= true
+      cd.waitSampling()
+      dut.rob.logic.flush.valid #= false
+      for (_ <- 0 until 4) {
+        assert(!dut.rob.logic.btbUpdateFlow.valid.toBoolean,
+          "flushed branch must not produce a BTB update")
+        cd.waitSampling()
+      }
+
+      // A completing control-family uop explicitly classified non-learnable also
+      // retires without producing a BTB update.
+      val nonLearnPc = 0x9100L
+      val nonLearnId = allocBranch(nonLearnPc)
+      completeBranch(nonLearnId, nonLearnPc, len = 2, learn = false)
+      for (_ <- 0 until 8) {
+        assert(!dut.rob.logic.btbUpdateFlow.valid.toBoolean,
+          "non-learnable branch must not produce a BTB update")
+        cd.waitSampling()
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
   test("CacheControlService.dcacheEnabled mirrors ss.cacr(31) combinationally") {
     M68kSim().compile(new SimpleDut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)

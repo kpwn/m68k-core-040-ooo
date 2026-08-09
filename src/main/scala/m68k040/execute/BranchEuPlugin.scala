@@ -22,6 +22,7 @@ case class BranchCompletion() extends Bundle {
   val btbTaken   = Bool()         // resolved taken (the bimodal counter direction)
   val btbTarget  = UInt(32 bits)  // resolved taken-target (the learned BTB target)
   val brType     = UInt(2 bits)   // 0=cond (Bcc/DBcc), 1=uncond (BRA/BSR/JMP/JSR)
+  val btbLen     = UInt(4 bits)   // exact (nextPc-pc)/2 architectural length
   // ── gshare PHT-update fields (slice 3) ──
   val phtValid   = Bool()         // a CONDITIONAL gshare-predicted branch (train pht[phtIndex])
   val phtIndex   = UInt(11 bits)  // the carried fetch-time folded-XOR index the lookup read
@@ -279,6 +280,7 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     completionPort.payload.btbTaken  := actualTaken
     completionPort.payload.btbTarget := target
     completionPort.payload.brType    := brType
+    completionPort.payload.btbLen    := ((u1.nextPc - u1.pc) >> 1).resize(4)
     // gshare PHT-update carry (slice 3): a conditional gshare-predicted branch (phtValid,
     // set at fetch on a condBtbHit) trains pht[phtIndex] toward actualTaken at retire. The
     // carried fetch-time index — not a retire-time recompute — is mandatory (the GHR has

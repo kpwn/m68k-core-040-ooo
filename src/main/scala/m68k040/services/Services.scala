@@ -53,6 +53,7 @@ case class BtbUpdate() extends Bundle {
   val taken  = Bool()          // resolved taken (bimodal direction)
   val target = UInt(32 bits)   // resolved taken-target (learned)
   val brType = UInt(2 bits)    // 0=cond, 1=uncond
+  val len    = UInt(4 bits)    // exact architectural instruction length in 16-bit words
 }
 
 /** ROB exposes; BtbPlugin consumes. `update.valid` pulses the cycle a BTB-eligible

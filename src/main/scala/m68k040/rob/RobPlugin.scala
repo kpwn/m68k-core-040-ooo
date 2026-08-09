@@ -92,6 +92,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val taken    = Bool()
     val target   = UInt(32 bits)
     val brType   = UInt(2 bits)
+    val len      = UInt(4 bits)
     val phtIndex = UInt(11 bits)
   }
 
@@ -161,6 +162,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     branchCompletion.payload.btbTaken.allowOverride;   branchCompletion.payload.btbTaken := False
     branchCompletion.payload.btbTarget.allowOverride;  branchCompletion.payload.btbTarget := U(0, 32 bits)
     branchCompletion.payload.brType.allowOverride;     branchCompletion.payload.brType := U(0, 2 bits)
+    branchCompletion.payload.btbLen.allowOverride;     branchCompletion.payload.btbLen := U(0, 4 bits)
     branchCompletion.payload.phtValid.allowOverride;   branchCompletion.payload.phtValid := False
     branchCompletion.payload.phtIndex.allowOverride;   branchCompletion.payload.phtIndex := U(0, 11 bits)
     branchCompletion.simPublic()
@@ -722,6 +724,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       btrainWr.taken    := branchCompletion.payload.btbTaken
       btrainWr.target   := branchCompletion.payload.btbTarget
       btrainWr.brType   := branchCompletion.payload.brType
+      btrainWr.len      := branchCompletion.payload.btbLen
       btrainWr.phtIndex := branchCompletion.payload.phtIndex
       branchTrainMem.write(branchCompletion.payload.robId, btrainWr)
     }
@@ -915,6 +918,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     btbUpdateFlow.payload.taken  := branchTrainRd.taken
     btbUpdateFlow.payload.target := branchTrainRd.target
     btbUpdateFlow.payload.brType := branchTrainRd.brType
+    btbUpdateFlow.payload.len    := branchTrainRd.len
     gshareUpdateFlow.payload.index := branchTrainRd.phtIndex
     gshareUpdateFlow.payload.taken := branchTrainRd.taken
 

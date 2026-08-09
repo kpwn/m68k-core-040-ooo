@@ -77,8 +77,10 @@ class BtbPluginSpec extends AnyFunSuite {
     dut.drv.logic.upd.payload.taken #= taken
     dut.drv.logic.upd.payload.target #= target
     dut.drv.logic.upd.payload.brType #= brType
+    dut.drv.logic.upd.payload.len #= 1
     cd.waitSampling()
     dut.drv.logic.upd.valid #= false
+    dut.drv.logic.upd.payload.len #= 0
     cd.waitSampling()                  // let the registered valids/mem write settle
   }
 

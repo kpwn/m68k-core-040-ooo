@@ -167,6 +167,7 @@ class BtbLateSelectEquivalenceSpec extends AnyFunSuite {
         dut.drv.logic.upd.payload.taken #= taken
         dut.drv.logic.upd.payload.target #= tgt
         dut.drv.logic.upd.payload.brType #= bt
+        dut.drv.logic.upd.payload.len #= 1
         cd.waitSampling()
         dut.drv.logic.upd.valid #= false
         sh.update(pc, taken, tgt, bt)
