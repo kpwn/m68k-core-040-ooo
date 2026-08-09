@@ -56,7 +56,7 @@ the much colder bound-check operations serialized.
 | landed | aligned LS/L1D hit path (`LsEuPlugin`, `DcachePlugin`) | same-page resident load II=1; multiple operations in P2/P3/P4, descriptor ring, and VIPT-result queue | hottest memory path; hard, completed in simulation | retain pruned contexts, ordered untagged responses, accept-last turnover, and tokenized early results | precise fault order, store forwarding, flush poison, completion priority; routed area/FMax still required |
 | P1 | changed-VPN DTLB turnaround (`DtlbPlugin`) | same VPN II=1; back-to-back different VPNs require the registered result to settle | memory hot-path edge; moderate | return a decoupled/tagged hit result to an LS slot; keep one TLB and one walker | younger hit versus older walk ordering, U/M identity, faults, permissions, PFLUSHA, exception arbitration |
 | P1 | D-cache demand-miss engine (`DcachePlugin`) | one `IDLE/EVICT_WR/REFILL/REPLAY` context; no demand hit-under-demand-miss | miss path; moderate for one parked miss, hard for many | implement one parked MSHR plus hit-under-miss, with same-set/claimed-way exclusion and ordered completion; do not start with general multi-MSHR | untagged responses, dirty victim ordering, shared store RMW port, fault/flush association; the current SoC crossbar cannot exploit multiple simultaneous bus misses |
-| landed | fixed-latency CPLX MUL (`MulCore`, `DivEuPlugin`) | four-stage datapath, II=1 integrated issue and completion; MUL remains live while DIV iterates | potentially hot; completed in simulation | retain pruned descriptor pipe, reserved result credits, one existing completion port, pending MULHI tails, and ROB-keyed high halves | routed DSP-register mapping, area, FMax, and issue/result endpoint timing still require the serialized physical gate |
+| landed | fixed-latency CPLX MUL (`MulCore`, `DivEuPlugin`) | seven-stage datapath, II=1 integrated issue and completion; MUL remains live while DIV iterates | potentially hot; completed in simulation at the former latency | retain pruned descriptor pipe, reserved result credits, one existing completion port, pending MULHI tails, and ROB-keyed high halves | seven-stage DSP-register reshape and routed area/FMax acceptance remain |
 | P2 | legacy CPLX/divide lane (`DivEuPlugin`) | CHK/CMP2 about II=2; one DIV context about II=67; a parked second DIV can still block a younger MUL at the registered issue port | mostly cold/iterative; moderate | keep one divider; measure before adding a pending-DIV slot or IQ eligibility forecast; consider 32-step W/L32 iteration only if DIV matters | forecast must reserve the registered issue slot; global remainder/overflow association must be replaced before allowing multiple DIV families in flight |
 | P1/P2 | SQ-to-D-cache drain (`StoreQueue`, `DcachePlugin`) | producer holds one store until local cache ack or AXI B; split stores repeat serially | store-heavy hot path; moderate for copyback hits, hard for WT/MMIO | queue COPYBACK-hit drains first using send/ack pointers; keep SQ entries forwarding-visible until ack; later use one central 2–4-entry D-side write descriptor serializer | S1 read-port conflicts, WT error/B association, split phases, precise order, and proven AW/W cross-pair corruption if independent writers are loosened |
 | landed/P2 | L1I/frontend and demand fill (`IcachePlugin`, `FetchAlignPlugin`) | resident hit path is latency 3 / II=1 and its fetch ring now turns over at full occupancy; one demand/prefetch fill engine still closes demand fetch until replay | all-hit path completed in simulation; miss path remains moderate–hard | retain the staged TLB/cache path for FMax and the full-ring consume/replace credit; only if measured, add a tiny ordered fetch request/response queue around one demand MSHR | redirect first-use remains N+5 without fetch-directed prediction; `FetchRsp` is untagged, so miss bypass needs ordering or tags |
@@ -141,7 +141,7 @@ DSP48E2 internal registers remains open.
 
 | user | DSP count | core latency / II | integrated behavior | finding |
 |---|---:|---:|---|---|
-| integer `MulCore` | 4 expected | 4 / 1 | integrated `DivEuPlugin` accepts and completes dense MUL at II=1, including while DIV is active | simulation complete; confirm A/B/M/P register mapping and post-route timing |
+| integer `MulCore` | 4 expected | 7 / 1 | integrated `DivEuPlugin` accepts and completes dense MUL at II=1, including while DIV is active | seven-stage reshape selected after physical mapping proved the four-cycle form left every MREG unused |
 | divider | 0 | about 66 / 67 | single iterative context | keep iterative unless a measured workload justifies a different algorithm |
 | MOVEM decode arithmetic | 2 before strength reduction | combinational | not a queue | shift/mux/negate replacement implemented and simulation-gated; synthesized DSP/FMax confirmation pending |
 | FPU | not implemented | draft only | draft is explicitly busy-gated/single-outstanding | amend before implementation: fixed-latency FADD/FMUL should be elastic II=1 |
@@ -156,7 +156,8 @@ the owning `2026-06-06-multiply-design.md`: logically integer MUL uses the
 existing shared CPLX operand/writeback gateway so no extra IQ, PRF, or ROB port
 is added.  The implementation now has:
 
-- a four-stage A/B/M/P-shaped `MulCore` pipeline at II=1;
+- a seven-stage `MulCore` pipeline at II=1: two operand levels, registered
+  multiply, and four post-multiply product levels;
 - a pruned per-operation descriptor pipe rather than a full `IqContext` shift;
 - flush clearing for every fixed-pipeline valid, result credit, pending tail, and
   ROB-keyed high-product entry;
@@ -175,10 +176,14 @@ with two outstanding CPLX sources remains blocked after the first wake and is
 released only by the second.  Restoring the old single-outstanding EU fails the
 integrated test on its second consecutive request.
 
-The older physical baseline remains useful: Vivado reported only one multiplier
-pipeline register, `AREG=BREG=MREG=0`, and cascade `PREG=1`.  The open acceptance
-item is to prove the new registers map into the DSPs and that the added small
-FIFOs/control do not materially regress post-route FMax or area.
+The first current-branch physical checkpoint found the source-level four-stage
+shape was still not an effective wide-DSP pipeline. All four slices had
+`AREG=BREG=2` and `MREG=0`; only the two accumulation slices had `PREG=1`.
+Vivado reported one post-multiply pipeline register and recommended four. An
+isolated seven-stage inference probe with unconditional invalid-cycle data
+shifting maps all four slices to `AREG=BREG=2`, `MREG=PREG=1`, keeps the DSP
+count at four, reduces total LUTs from 48 to 18, and adds 66 FF. The full-core
+mapping and endpoint result remain the open acceptance items.
 
 ### 4.2 MOVEM strength reduction
 
@@ -268,7 +273,7 @@ debt; suppressing or ignoring it would make the gate less trustworthy.
 
 | document family | review result | action |
 |---|---|---|
-| binding core architecture | reconciled: four-stage II=1 integer MUL uses the existing shared CPLX gateway and ports | physical mapping/FMax/area acceptance remains open |
+| binding core architecture | reconciled: seven-stage II=1 integer MUL uses the existing shared CPLX gateway and ports | full-core physical mapping/FMax/area acceptance remains open |
 | LS pipeline specs/plans | newest full-pipeline spec is correct and now carries measured D1/D2 results; older late-split documents are historical checkpoints | treat `2026-08-09-ipc-ls-eu-full-pipeline-design.md` as current |
 | ALU slow-path spec | implemented and simulation-gated at II=1 | run the paired routed FMax/LUT and IQ-endpoint census before final acceptance |
 | MSHR proposal | correctly prioritizes D-side hit-under-miss and warns about crossbar limits | implement one parked miss before general MSHRs |
@@ -285,7 +290,7 @@ debt; suppressing or ignoring it would make the gate less trustworthy.
    measured timing failure in the paired routed gate.
 3. Run the paired routed FMax/LUT and IQ-endpoint census for the landed ALU II=1
    pipeline; retain it only if the issue-select cone stays under control.
-4. Run the paired routed DSP-register/FMax/LUT/FF gate for the landed four-stage
+4. Run the paired routed DSP-register/FMax/LUT/FF gate for the landed seven-stage
    II=1 MUL pipeline and completion protocol.
 5. Measure D-cache miss occupancy, SQ-full/drain stalls, CPLX mix, and changed-VPN
    DTLB bubbles on representative workloads.

@@ -201,7 +201,7 @@ The counter is used only for MOVEM / CAS(2) / bitfield / MOVES / CHK2/CMP2 / mic
 | Shift (barrel) | 1 | |
 | EA (complex) | 1 | |
 | Branch resolve | 1 | |
-| MUL | 4 datapath stages, **fully pipelined**, II=1 | one shared DSP48 chain; completion is elastically arbitrated on the CPLX result port |
+| MUL | 7 datapath stages, **fully pipelined**, II=1 | two DSP input levels plus a registered multiply and four post-multiply levels; one shared DSP48 chain; completion is elastically arbitrated on the CPLX result port |
 | DIV | fixed cycle-count (data-independent) | iterative but always N cycles; div0/overflow via ROB |
 | Load (L1 + TLB hit) | fixed (~2–3) | optimistic; miss → replay (ch 6), no broadcast |
 | Store | addr+data at execute; write at commit | translation at execute is replayable |
