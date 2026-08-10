@@ -26,7 +26,10 @@ SYNTH_ARCHIVE="${SYNTH_ARCHIVE:-$REPO/synth/archive/6b246de_ftb_framing_retime_d
 mkdir -p "$RUNROOT"
 for SPEC in "$@"; do
   MODE="${SPEC%%@*}"
-  STRAT="default"; [ "$SPEC" != "$MODE" ] && STRAT="${SPEC#*@}"
+  # Only EXPORT IMPL_STRATEGY when the spec names one after '@'.  Exporting a
+  # hard-coded "default" here would silently override impl_FullCore.tcl's own
+  # default and make a bare `<mode>` spec measure the wrong recipe.
+  STRAT=""; [ "$SPEC" != "$MODE" ] && STRAT="${SPEC#*@}"
   TAG="${SPEC//+/_}"; TAG="${TAG//@/-}"
   D="$RUNROOT/$TAG"
   rm -rf "$D"; mkdir -p "$D/synth" "$D/generated"
@@ -38,11 +41,16 @@ for SPEC in "$@"; do
     cd "$D"
     echo "AB_START $SPEC $(date -Is)"
     echo "AB_SYNTH_DCP $SYNTH_ARCHIVE  md5=$(cat synth/fullcore_synth.md5)"
-    REUSE_SYNTH_DCP=1 FLOORPLAN_MODE="$MODE" IMPL_STRATEGY="$STRAT" \
-      vivado -mode batch -nojournal -nolog -source synth/impl_FullCore.tcl
+    if [ -n "$STRAT" ]; then
+      REUSE_SYNTH_DCP=1 FLOORPLAN_MODE="$MODE" IMPL_STRATEGY="$STRAT" \
+        vivado -mode batch -nojournal -nolog -source synth/impl_FullCore.tcl
+    else
+      REUSE_SYNTH_DCP=1 FLOORPLAN_MODE="$MODE" \
+        vivado -mode batch -nojournal -nolog -source synth/impl_FullCore.tcl
+    fi
     echo "AB_END $SPEC $(date -Is)"
   ) > "$RUNROOT/$TAG.out" 2>&1 &
-  echo "launched $SPEC (mode=$MODE strategy=$STRAT) -> $RUNROOT/$TAG.out (pid $!)"
+  echo "launched $SPEC (mode=$MODE strategy=${STRAT:-<tcl default>}) -> $RUNROOT/$TAG.out (pid $!)"
 done
 wait
 echo "AB_ALL_DONE"
