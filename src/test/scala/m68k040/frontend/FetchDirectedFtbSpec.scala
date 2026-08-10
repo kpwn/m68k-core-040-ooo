@@ -257,6 +257,50 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
     }
   }
 
+  test("a born-stale redirect command launches no fetch-plan lookup", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      val tr = trace(dut, cd)
+      var staleCmdFire = false
+      var staleLookupFire = false
+      cd.onSamplings {
+        val cmdFire = dut.fetch.logic.cmdOut.valid.toBoolean &&
+          dut.fetch.logic.cmdOut.ready.toBoolean
+        if (dut.fa.logic.redirect.valid.toBoolean && cmdFire) {
+          staleCmdFire = true
+          staleLookupFire ||= dut.fa.logic.planLookupFire.toBoolean
+        }
+      }
+
+      // Start the stream, then redirect again while the next sequential command is
+      // visibly accepted. The cache command is allowed and must drain as a stale ring
+      // record, but neither read-only plan provider may be launched for it.
+      dut.fetch.logic.cmdOut.ready #= true
+      redirect(dut, cd)
+      await(cd, 8, "first running command") { tr.cmds.nonEmpty }
+      val recovery = 0x2400L
+      dut.fa.logic.redirect.valid #= true
+      dut.fa.logic.redirect.payload #= recovery
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid #= false
+      dut.fetch.logic.cmdOut.ready #= false
+      sleep(1)
+
+      assert(staleCmdFire, s"redirect did not collide with a physical command: ${tr.cmds}")
+      assert(!staleLookupFire, "born-stale command launched a fetch-plan lookup")
+      assert(dut.fa.logic.resultExpectedIssueValid.toBoolean,
+        "born-stale command was not retained by the assertion-only issue tracker")
+      assert(dut.fa.logic.resultExpectedBornStale.toBoolean &&
+             !dut.fa.logic.resultExpectedValid.toBoolean,
+        "born-stale command incorrectly expected a live provider result")
+      assert(!dut.fa.logic.ftbRsp.valid.toBoolean &&
+             !dut.fa.logic.gshareWindowRsp.valid.toBoolean,
+        "a born-stale command produced a C+1 FTB/gshare result")
+      assert(dut.fa.logic.resultStaleProof.toBoolean,
+        "born-stale issue no longer matches its resident ring record")
+    }
+  }
+
   test("full-ring turnover applies the C+1 plan to the replacement slot", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
@@ -439,6 +483,14 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
       dut.internalRedirect.logic.payload #= recovery
       cd.waitSampling()
       dut.internalRedirect.logic.valid #= false
+      sleep(1)
+      assert(dut.fa.logic.resultExpectedIssueValid.toBoolean &&
+             dut.fa.logic.resultExpectedBornStale.toBoolean &&
+             !dut.fa.logic.resultExpectedValid.toBoolean,
+        "internal-redirect collision command launched a stale fetch-plan lookup")
+      assert(!dut.fa.logic.ftbRsp.valid.toBoolean &&
+             !dut.fa.logic.gshareWindowRsp.valid.toBoolean,
+        "internal-redirect collision produced a C+1 plan result")
       await(cd, 8, "collision target and recovery commands") { tr.cmds.size >= 3 }
       dut.fetch.logic.cmdOut.ready #= false
       assert(tr.cmds.take(3).map(_._2).toSeq == Seq(W, T, recovery),
@@ -677,6 +729,7 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
         actionCount == 1 && targetCmdCycle >= 0
       }
       dut.fetch.logic.cmdOut.ready #= false
+      sleep(1)
 
       assert(actionCycle == detectCycle + 1,
         s"fallback action was not C+1: detect=$detectCycle action=$actionCycle cmds=${tr.cmds}")
@@ -686,6 +739,13 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
       assert(actionFeedFires == 0, "wrong-path packet fired during fallback action")
       assert(tr.applies == 0 && tr.pushes == 0,
         s"declined FTB result unexpectedly applied: ${tr.applies}/${tr.pushes}")
+      assert(dut.fa.logic.resultExpectedIssueValid.toBoolean &&
+             !dut.fa.logic.resultExpectedBornStale.toBoolean &&
+             dut.fa.logic.resultExpectedValid.toBoolean,
+        "live predictFire target was incorrectly suppressed as born stale")
+      assert(dut.fa.logic.ftbRsp.valid.toBoolean &&
+             dut.fa.logic.gshareWindowRsp.valid.toBoolean,
+        "live predictFire target did not produce its fixed-C+1 plan result")
 
       // The unaligned target's new ring record must be live and carry drop=3. If the
       // blanket stale action accidentally kills it, this response never reaches feed.

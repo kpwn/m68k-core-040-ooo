@@ -312,14 +312,19 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     val redirectThisCycle = redirect.valid || (resume.valid && stalled) ||
                             mispredictRedirect.valid || predictFire || ftqMismatch
 
-    // Join the two fixed-C+1 lookup results. The exact token equality remains a hard
-    // assertion, but is deliberately not in the functional apply mux: a record allocated
-    // with the command in C cannot retire before its resident I-cache response at C+2,
-    // so it cannot be recycled before these results arrive in C+1. Keeping the proof in
-    // the target-command cone created the measured 7.614-ns ringPlanSeq -> ITLB/tag ->
-    // I-cache frontier path. The live stale bit and same-cycle redirect gates remain
-    // functional because they can legitimately change during that one-cycle interval.
-    val resultExpectedValid = RegNext(ic.cmd.fire) init False
+    // Join the two fixed-C+1 lookup results. A command which is born stale still launches
+    // the I-cache request (its response must drain), but it cannot use a read-only fetch
+    // plan. Under ic.cmd.fire the complex-stall/mismatch gates are already false, and the
+    // decode-fallback action explicitly re-marks its target live. Thus the final new ring
+    // record is stale exactly for an external or registered internal redirect.
+    // Suppressing that lookup at ISSUE removes the measured 7.117-ns ringStale -> plan ->
+    // ITLB/tag/I-cache cone without adding a cycle or changing the one-command wrong-path
+    // bound. The delayed issue/stale state below remains an assertion oracle.
+    val issueBornStale = redirect.valid || mispredictRedirect.valid
+    val planLookupFire = ic.cmd.fire && !issueBornStale
+    val resultExpectedIssueValid = RegNext(ic.cmd.fire) init False
+    val resultExpectedValid = RegNext(planLookupFire) init False
+    val resultExpectedBornStale = RegNextWhen(issueBornStale, ic.cmd.fire) init False
     val resultExpectedSlot  = Reg(UInt(ringTail.getWidth bits)) init 0
     val resultExpectedSeq   = Reg(UInt(planSeq.getWidth bits)) init 0
     when(ic.cmd.fire) {
@@ -336,16 +341,18 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       (gshareWindowRsp.payload.token.seq === resultExpectedSeq) &&
       (ringPlanSeq(resultSlot) === resultExpectedSeq) &&
       (ringCount =/= 0)
-    spinal.core.sim.SimPublic(resultTokenProof)
-    val resultSeqLive = resultSlotLegal &&
-      !ringStale(resultSlot)
+    val resultStaleProof = resultExpectedIssueValid && resultSlotLegal &&
+      (ringStale(resultSlot) === resultExpectedBornStale) &&
+      (resultExpectedValid === !resultExpectedBornStale)
+    spinal.core.sim.SimPublic(planLookupFire, resultExpectedIssueValid,
+      resultExpectedValid, resultExpectedBornStale, resultTokenProof, resultStaleProof)
     val resultEnd = ftbRsp.payload.brWordOff.resize(5) + ftbRsp.payload.brLen.resize(5)
     val resultDirection = (ftbRsp.payload.brType =/= 0) ||
                           gshareWindowRsp.payload.taken(ftbRsp.payload.brWordOff)
     val resultInWindow = (ftbRsp.payload.brLen =/= 0) && (resultEnd <= U(4, 5 bits))
     val resultAfterDrop = ftbRsp.payload.brWordOff >= ringDrop(resultSlot)
     val ftbCandidate = resultExpectedValid && resultProvidersValid &&
-                       resultSeqLive && ftbRsp.payload.hit
+                       resultSlotLegal && ftbRsp.payload.hit
     // FMax recovery: keep the live IBuf/aligner cone out of the registered-result
     // application and next-fetch command enables. `predictFire` and `ftqMismatch` are
     // now registered actions; before that retiming their decode-local decisions fed
@@ -369,9 +376,17 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       ftbDeclineFraming, ftbDeclineBlocked)
 
     if (enableFetchDirected) {
+      when(resultExpectedIssueValid) {
+        assert(resultStaleProof,
+          "delayed fetch-plan stale decision no longer matches its resident ring record")
+        assert(ftbRsp.valid === resultExpectedValid,
+          "FTB responded to a born-stale command or dropped a live lookup")
+        assert(gshareWindowRsp.valid === resultExpectedValid,
+          "gshare responded to a born-stale command or dropped a live lookup")
+      }
       when(ftbRsp.valid || gshareWindowRsp.valid || resultExpectedValid) {
         assert(ftbRsp.valid && gshareWindowRsp.valid && resultExpectedValid,
-          "FTB/gshare responses are not exactly one cycle after fetch issue")
+          "FTB/gshare responses are not exactly one cycle after live fetch-plan issue")
         assert(resultTokenProof,
           "fixed-latency fetch-plan response no longer names its resident ring record")
       }
@@ -385,14 +400,15 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       }
     }
 
-    // Every accepted cache command launches both registered lookups with the same token.
-    // The providers' ports are directionless service wires with idle defaults, matching
-    // the existing BTB/Gshare integration style.
-    ftbCmd.valid := ic.cmd.fire
+    // Every live accepted cache command launches both registered lookups with the same
+    // token. A born-stale cache command intentionally launches neither provider. The
+    // providers' ports are directionless service wires with idle defaults, matching the
+    // existing BTB/Gshare integration style.
+    ftbCmd.valid := planLookupFire
     ftbCmd.payload.windowPc := ic.cmd.payload.pc
     ftbCmd.payload.token.ringSlot := ringTail
     ftbCmd.payload.token.seq := planSeq
-    gshareWindowCmd.valid := ic.cmd.fire
+    gshareWindowCmd.valid := planLookupFire
     gshareWindowCmd.payload := ftbCmd.payload
     ftbClear.valid := ftqMismatch
     ftbClear.payload := ftqMismatchBrPcReg
