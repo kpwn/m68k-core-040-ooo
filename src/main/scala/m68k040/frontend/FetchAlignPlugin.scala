@@ -312,22 +312,40 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     val redirectThisCycle = redirect.valid || (resume.valid && stalled) ||
                             mispredictRedirect.valid || predictFire || ftqMismatch
 
-    // Join the two registered lookup results by the exact fetch-plan token. A ring slot
-    // may be recycled while an old value is still visible, so sequence equality and the
-    // slot's live stale bit are both required; the changing live fetchPc is irrelevant.
-    val resultSlot      = ftbRsp.payload.token.ringSlot
+    // Join the two fixed-C+1 lookup results. The exact token equality remains a hard
+    // assertion, but is deliberately not in the functional apply mux: a record allocated
+    // with the command in C cannot retire before its resident I-cache response at C+2,
+    // so it cannot be recycled before these results arrive in C+1. Keeping the proof in
+    // the target-command cone created the measured 7.614-ns ringPlanSeq -> ITLB/tag ->
+    // I-cache frontier path. The live stale bit and same-cycle redirect gates remain
+    // functional because they can legitimately change during that one-cycle interval.
+    val resultExpectedValid = RegNext(ic.cmd.fire) init False
+    val resultExpectedSlot  = Reg(UInt(ringTail.getWidth bits)) init 0
+    val resultExpectedSeq   = Reg(UInt(planSeq.getWidth bits)) init 0
+    when(ic.cmd.fire) {
+      resultExpectedSlot := ringTail
+      resultExpectedSeq  := planSeq
+    }
+    val resultSlot      = resultExpectedSlot
     val resultSlotLegal = resultSlot < U(RING, resultSlot.getWidth bits)
-    val resultTokensMatch = ftbRsp.valid && gshareWindowRsp.valid &&
-      (ftbRsp.payload.token.ringSlot === gshareWindowRsp.payload.token.ringSlot) &&
-      (ftbRsp.payload.token.seq === gshareWindowRsp.payload.token.seq)
+    val resultProvidersValid = ftbRsp.valid && gshareWindowRsp.valid
+    val resultTokenProof = resultExpectedValid && resultProvidersValid && resultSlotLegal &&
+      (ftbRsp.payload.token.ringSlot === resultExpectedSlot) &&
+      (gshareWindowRsp.payload.token.ringSlot === resultExpectedSlot) &&
+      (ftbRsp.payload.token.seq === resultExpectedSeq) &&
+      (gshareWindowRsp.payload.token.seq === resultExpectedSeq) &&
+      (ringPlanSeq(resultSlot) === resultExpectedSeq) &&
+      (ringCount =/= 0)
+    spinal.core.sim.SimPublic(resultTokenProof)
     val resultSeqLive = resultSlotLegal &&
-      (ringPlanSeq(resultSlot) === ftbRsp.payload.token.seq) && !ringStale(resultSlot)
+      !ringStale(resultSlot)
     val resultEnd = ftbRsp.payload.brWordOff.resize(5) + ftbRsp.payload.brLen.resize(5)
     val resultDirection = (ftbRsp.payload.brType =/= 0) ||
                           gshareWindowRsp.payload.taken(ftbRsp.payload.brWordOff)
     val resultInWindow = (ftbRsp.payload.brLen =/= 0) && (resultEnd <= U(4, 5 bits))
     val resultAfterDrop = ftbRsp.payload.brWordOff >= ringDrop(resultSlot)
-    val ftbCandidate = resultTokensMatch && resultSeqLive && ftbRsp.payload.hit
+    val ftbCandidate = resultExpectedValid && resultProvidersValid &&
+                       resultSeqLive && ftbRsp.payload.hit
     // FMax recovery: keep the live IBuf/aligner cone out of the registered-result
     // application and next-fetch command enables. `predictFire` and `ftqMismatch` are
     // now registered actions; before that retiming their decode-local decisions fed
@@ -349,20 +367,19 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       ftbDeclineFraming, ftbDeclineBlocked)
 
     if (enableFetchDirected) {
-      when(ftbRsp.valid || gshareWindowRsp.valid) {
-        assert(ftbRsp.valid && gshareWindowRsp.valid,
-          "FTB and gshare window responses must have identical fixed latency")
-      }
-      when(ftbRsp.valid && gshareWindowRsp.valid) {
-        assert(ftbRsp.payload.token.ringSlot === gshareWindowRsp.payload.token.ringSlot &&
-               ftbRsp.payload.token.seq === gshareWindowRsp.payload.token.seq,
-          "FTB and gshare window responses lost fetch-plan association")
+      when(ftbRsp.valid || gshareWindowRsp.valid || resultExpectedValid) {
+        assert(ftbRsp.valid && gshareWindowRsp.valid && resultExpectedValid,
+          "FTB/gshare responses are not exactly one cycle after fetch issue")
+        assert(resultTokenProof,
+          "fixed-latency fetch-plan response no longer names its resident ring record")
       }
       applyNow := ftbCandidate && resultDirection && resultInWindow &&
                   resultAfterDrop && !ftbBlocked
       when(applyNow) {
         assert(resultSlotLegal && resultEnd > ringDrop(resultSlot).resize(5),
           "applied FTB plan violates its ring slot/drop framing contract")
+        assert(!(ic.rsp.valid && (ringHead === resultSlot)),
+          "fetch-plan application no longer precedes its associated cache response")
       }
     }
 

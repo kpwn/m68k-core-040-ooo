@@ -106,20 +106,40 @@ Each outstanding-ring entry gains:
 - `ringPlanSeq : UInt(8 bits)`, written from a monotonically incrementing
   `planSeq` on issue.
 
-The query for a fired fetch carries `{ringTail, planSeq}`. A result is live only
-when all of these hold:
+The query for a fired fetch carries `{ringTail, planSeq}`.  FetchAlign also
+delays that issued pair locally by one cycle.  The two providers must return
+the exact same pair at fixed latency C+1.  Their returned token equality is a
+mandatory assertion, not a functional input to the application mux; the local
+C+1 issued slot names the ring record.  A result is functionally live only when
+all of these hold:
 
 ```text
-result.valid
-result.token.seq == ringPlanSeq(result.token.ringSlot)
-!ringStale(result.token.ringSlot)
+ftb.result.valid && gshare.result.valid
+local issued-result valid
+local issued slot is legal
+!ringStale(local issued slot)
 !any architectural/decode redirect this cycle
 ```
 
-The sequence comparison prevents a recycled ring slot from accepting an old
-result; current-cycle redirect gating closes the pre-edge stale-bit window. The
-fixed one-cycle lookup completes two cycles before the resident I-cache response,
-but the token proof is retained rather than relying on that latency accident.
+This is safe because it is a structural latency proof, not a freshness guess.
+The ring record is allocated with the lookup command in C.  FTB and gshare
+return in C+1, while the earliest resident I-cache response for that command is
+C+2.  The record therefore cannot retire or be recycled before its lookup
+result arrives.  A current-cycle redirect still closes the pre-edge stale-bit
+window.  The locally delayed valid must equal each provider valid, and both
+returned tokens must equal the local delayed `{slot,seq}`.  The sequence
+comparison to `ringPlanSeq(local slot)` remains active as an assertion so a
+provider latency change, duplicate response, token corruption, or future
+ring-lifetime change fails loudly; putting the equality back in the functional
+mux is not an acceptable substitute for revisiting this proof.
+
+The 2026-08-10 five-ID physical gate makes this distinction binding for FMax.
+At 250 MHz its routed limiter was
+`FetchAlign.ringPlanSeq -> applyNow -> I-cache command -> ITLB/tag hit ->
+Icache.pfNextPa`, 7.614 ns and 24 logic levels, for WNS -3.633 ns.  The
+ring-sequence equality existed only to prove an impossible C+1 recycle and
+therefore must terminate at the assertion rather than drive target selection,
+I-cache readiness, or prefetch state.
 
 No result is compared with the live `fetchPc`. Sequential PCs may change every
 cycle and lookup/application remains II=1.
@@ -161,10 +181,10 @@ splice until the held target is fetched.
 
 `applyNow` requires:
 
-- matching live FTB/gshare tokens;
+- both fixed-C+1 FTB/gshare results and a live locally delayed issued slot;
 - FTB tag hit;
 - unconditional branch, or the selected registered PHT direction is taken;
-- `brWordOff >= ringDrop(token.slot)`;
+- `brWordOff >= ringDrop(local issued slot)`;
 - the complete learned instruction lies in the window
   (`brWordOff.resize(5) + brLen.resize(5) <= 4`);
 - no architectural/commit redirect, quiesce, fault hold, mismatch suppression,
@@ -472,8 +492,12 @@ no error was observed.
    C+1; W+8 never fires. Require nonzero `applyNow`, FTQ push, and ringKeep update.
 3. **Backpressure.** Result arrives while `ic.cmd.ready=0`; ringKeep/FTQ update
    once, target/drop remain stable, and exactly one target command later fires.
-4. **Ring reuse/turnover.** Full-ring response plus replacement issue, result
-   token applied only to the replacement record; stale/wrong sequence is ignored.
+4. **Ring reuse/turnover.** Full-ring response plus replacement issue; require
+   the fixed-C+1 provider result while its named record is still resident, the
+   sequence/token assertion true, and application only to that record.  A
+   redirect or stale record is ignored.  Deliberately delaying, corrupting, or
+   mis-associating either provider must trip the assertion rather than silently
+   decline a prediction.
 5. **Redirect collisions.** Redirect at query, result, pending-target, response,
    and confirm phases; no stale FTQ entry, GHR shift, truncation, or target issue.
 6. **Framing guard.** Parent design's A1–A10 matrix, mutations for clamp, past,

@@ -178,7 +178,11 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
     cd.onSamplings {
       if (dut.fetch.logic.cmdOut.valid.toBoolean && dut.fetch.logic.cmdOut.ready.toBoolean)
         tr.cmds += cycle -> dut.fetch.logic.cmdOut.payload.pc.toLong
-      if (dut.fa.logic.applyNow.toBoolean) tr.applies += 1
+      if (dut.fa.logic.applyNow.toBoolean) {
+        assert(dut.fa.logic.resultTokenProof.toBoolean,
+          "physical FTB application escaped without the fixed-latency ring-token proof")
+        tr.applies += 1
+      }
       if (dut.fa.logic.ftqPush.toBoolean) tr.pushes += 1
       if (dut.fa.logic.ftqConfirmFire.toBoolean) tr.confirms += 1
       cycle += 1
@@ -235,6 +239,50 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
       assert(dut.fa.logic.ringKeep(0).toInt == 2,
         s"source window was not truncated at branch end: keep=${dut.fa.logic.ringKeep(0).toInt}")
       assert(dut.fa.logic.ftqCount.toInt == 1, "one unconfirmed FTQ entry must remain")
+    }
+  }
+
+  test("full-ring turnover applies the C+1 plan to the replacement slot", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      val replacement = W + 24
+      val target = 0x1800L
+      train(dut, cd, target = target, pc = replacement + 2)
+      val tr = trace(dut, cd)
+      dut.fetch.logic.cmdOut.ready #= true
+      redirect(dut, cd)
+      await(cd, 12, "three-command full ring") { tr.cmds.size >= 3 }
+      cd.waitSampling()
+      assert(tr.cmds.take(3).map(_._2).toSeq == Seq(W, W + 8, W + 16),
+        s"unexpected full-ring bootstrap: ${tr.cmds.take(3)}")
+      assert(dut.fa.logic.ringCount.toInt == 3 &&
+             dut.fa.logic.ringHead.toInt == 0 && dut.fa.logic.ringTail.toInt == 0,
+        "turnover proof did not reach the full head==tail state")
+
+      // Consume old slot 0 while full. The same edge installs the sequential
+      // replacement into slot 0 and launches its predictor lookup. Its C+1 result must
+      // update slot 0 even though ringHead has already advanced to slot 1; using the
+      // live head instead of the locally delayed issued slot makes this test fail.
+      driveRsp(dut, cd, W, Seq(0x7000, 0x7201, 0x7402, 0x7603))
+      sleep(1)
+      dut.fetch.logic.rspIn.valid #= false
+      assert(tr.cmds.size >= 4 && tr.cmds(3)._2 == replacement,
+        s"full-ring replacement was not issued exactly once: ${tr.cmds}")
+      assert(dut.fa.logic.ringCount.toInt == 3 && dut.fa.logic.ringHead.toInt == 1,
+        "consume-and-replace did not preserve occupancy/advance the old head")
+
+      cd.waitSampling()
+      sleep(1)
+      dut.fetch.logic.cmdOut.ready #= false
+      assert(tr.applies == 1 && tr.pushes == 1,
+        s"replacement plan did not apply exactly once: ${tr.applies}/${tr.pushes}")
+      assert(dut.fa.logic.ringKeep(0).toInt == 2 &&
+             dut.fa.logic.ringKeep(1).toInt == 4,
+        s"C+1 result updated the wrong ring record: keep0=${dut.fa.logic.ringKeep(0).toInt} " +
+          s"keep1=${dut.fa.logic.ringKeep(1).toInt}")
+      assert(dut.fa.logic.targetHoldValid.toBoolean &&
+             dut.fa.logic.targetHoldPc.toLong == target,
+        f"full ring did not hold the exact target 0x$target%x")
     }
   }
 

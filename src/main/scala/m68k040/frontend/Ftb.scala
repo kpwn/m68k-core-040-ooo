@@ -20,9 +20,11 @@ case class FtbEntry(tagBits: Int) extends Bundle {
 /** Registered, window-indexed fetch target buffer.
   *
   * A command is accepted as a Flow event every cycle and produces exactly one result
-  * on the following cycle. Association is entirely token-based: no response is ever
-  * compared with a changing live fetch PC. Only branches wholly contained in their
-  * eight-byte window are installed; decode-time BTB/RAS prediction remains the fallback.
+  * on the following cycle. The token is echoed for a hard protocol assertion;
+  * FetchAlign functionally associates the fixed-C+1 response with its locally delayed
+  * issued slot, never with a changing live fetch PC. Only branches wholly contained in
+  * their eight-byte window are installed; decode-time BTB/RAS prediction remains the
+  * fallback.
   */
 class FtbPlugin(entries: Int = 128) extends FiberPlugin with FtbLookupService {
   require(entries > 0 && (entries & (entries - 1)) == 0,
