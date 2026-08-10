@@ -2331,3 +2331,70 @@ a family.  It is the live-translate-to-install cone, it is the one structural
 lever this campaign has not measured, its fix is pre-authorised by a binding
 spec, and filing its measurement discharges an obligation that spec already
 imposed.**
+
+### Step 8: the implementation-strategy lever, closed on the directive axes
+
+Section 18 step 6 named "finish the implementation-strategy sweep" as lever 1,
+on the grounds that it was the only lever to have produced a positive result in
+five sessions.  It is now substantially closed, and the reason is instructive.
+
+Section 18's `exploreN` changed **three** directives at once relative to
+`postrouteN` (placer, phys-opt, router) and measured worse on WNS (-1.642) but
+much better on breadth (30,048 vs 32,409 failing endpoints).  That is a
+confound.  Two new recipes separate the two axes that matter, each holding the
+router at default:
+
+- `postrouteNt` = `postrouteN` + `place_design -directive ExtraTimingOpt` only
+- `postrouteNx` = `postrouteN` + `phys_opt_design -directive AggressiveExplore`
+  in the post-route rounds only
+
+Both from the same frozen `6b246de` netlist (MD5 `d80f6218…`), `FLOORPLAN_MODE=decode`,
+`POSTROUTE_ROUNDS=3`, run in parallel via `synth/floorplan_ab.sh`.
+Evidence: `synth/probe_strategy2/`.
+
+| Recipe | placer | post-route phys-opt | router | WNS | FMax | vs incumbent |
+|---|---|---|---|---:|---:|---:|
+| **`postrouteN` (incumbent)** | default | default | `-tns_cleanup` | **-1.472** | **182.749** | — |
+| `postrouteNt` | `ExtraTimingOpt` | default | `-tns_cleanup` | -1.839 | 171.262 | **-11.49 MHz** |
+| `postrouteNx` | default | `AggressiveExplore` | `-tns_cleanup` | -1.723 | 174.734 | **-8.02 MHz** |
+| `exploreN` (§18 row 17) | `ExtraTimingOpt` | `AggressiveExplore` | `Explore` | -1.642 | 177.242 | -5.51 MHz |
+
+Round by round:
+
+```
+postrouteN   -2.094 -> -1.623 -> -1.552 -> -1.472   (still improving at round 3; -1.463 by round 5)
+postrouteNt  -2.087 -> -1.841 -> -1.839 -> -1.839   (stalled at round 2)
+postrouteNx  -2.094 -> -1.771 -> -1.723 -> -1.723   (stalled at round 2)
+```
+
+Four things this measures:
+
+1. **Both non-default directives are individually harmful.**  Neither axis
+   explains `exploreN`'s breadth advantage as a WNS proposition; both simply
+   lose FMax.
+2. **The internal control holds.**  `postrouteNx` round 0 is -2.094, reproducing
+   `postrouteN` round 0 *exactly* — the two runs differ only in the rounds, which
+   is what the experiment intended.  `postrouteNt` round 0 is -2.087, so
+   `ExtraTimingOpt` placement is worth **+0.007 ns before any post-route work**
+   and then costs 0.367 ns across the rounds.  It is not a bad placement; it is a
+   placement that post-route phys-opt cannot improve.
+3. **The mechanism is convergence, not starting point.**  Both variants *stall by
+   round 2* while the incumbent is still gaining at round 3 and beyond.  The
+   +18.65 MHz that section 18 landed came from **iterating** plain
+   `phys_opt_design` / `route_design -tns_cleanup`, not from any directive — the
+   directives reach a local optimum faster and stop.
+4. **The axes are not additive, so do not reason one-factor-at-a-time here.**
+   `exploreN`, with *all three* non-default directives, beats **both** single-axis
+   variants (-1.642 vs -1.723 and -1.839).  The `Explore` router partially
+   compensates for what the placer and phys-opt directives cost.  A future sweep
+   must vary the router jointly rather than assume separability.
+
+**Verdict: `IMPL_STRATEGY=postrouteN` with all-default directives is the optimum
+of every recipe tried (now nine), and the directive axes are exhausted.**  The
+one genuinely untried item on this lever remains section 18 step 6's lever 4 — a
+fresh `synth_design` with the post-route pass in the loop, since every physical
+number in this document descends from one frozen synthesis checkpoint.
+
+No default was changed.  `postrouteNt` and `postrouteNx` are retained in
+`synth/impl_FullCore.tcl` as measured-negative diagnostics, in the same spirit as
+section 18's committed floorplan XDCs.
