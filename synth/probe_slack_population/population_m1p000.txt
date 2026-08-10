@@ -1,0 +1,26 @@
+threshold -1.000   endpoints 4890
+---- by ENDPOINT family ----
+    2427  IcachePlugin
+     703  DcachePlugin
+     496  RasPlugin
+     334  RobPlugin
+     329  IssueQueuePlugin
+     229  FetchAlignPlugin
+     163  LsEuPlugin
+      68  DecodeStage
+      61  FtbPlugin
+      28  OTHER
+      26  GsharePlugin
+      16  DtlbPlugin
+       5  DivEuPlugin
+       4  BranchEuPlugin
+       1  AluEuPlugin
+---- by STARTPOINT family ----
+    2628  FetchAlignPlugin
+    1370  DcachePlugin
+     679  DecodeStage
+     152  AluEuPlugin
+      34  LsEuPlugin
+      23  RobPlugin
+       2  RenameStage
+       2  IssueQueuePlugin

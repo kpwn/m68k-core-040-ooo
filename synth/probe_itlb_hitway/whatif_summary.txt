@@ -1,0 +1,6 @@
+scenario                               WNS        TNS             FEP        new worst path
+0_baseline                             WNS   -1.472  TNS     -17499.508  FEP    32408   DcachePlugin_logic_stS2Payload_paddr_reg[5]/C -> IssueQueuePlugin_logic_sbNzvc_busy_reg[8]/D
+1_itlb_hitway_alone                    WNS   -1.472  TNS     -15926.618  FEP    31497   DcachePlugin_logic_stS2Payload_paddr_reg[5]/C -> IssueQueuePlugin_logic_sbNzvc_busy_reg[8]/D
+2_itlb_plus_dcacheiq                   WNS   -1.460  TNS     -15801.374  FEP    31452   FetchAlignPlugin_logic_ftqHead_reg[0]/C -> FetchAlignPlugin_logic_p0LiveReg_lenWords_reg[0]/D
+3_itlb_plus_everything                 WNS   -1.460  TNS     -14835.954  FEP    31185   FetchAlignPlugin_logic_ftqHead_reg[0]/C -> FetchAlignPlugin_logic_p0LiveReg_lenWords_reg[0]/D
+4_deep_ladder_end                      WNS   -1.276  TNS     -15758.776  FEP    31437   _zz_DecodeStage_logic_fed_payload_packets_0_words_1_reg[5]/C -> RasPlugin_logic_ras_0_reg[5]/CE

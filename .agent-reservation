@@ -1,45 +1,50 @@
-agent=claude-dcache-iq-reprice
-task=DONE — handoff section 19: re-price section 16's D-cache/IQ fixes on the postrouteN placement
-reserved_at=2026-08-10T22:23:00+02:00
-released_at=2026-08-10T23:10:00+02:00
-head=see git log; RTL UNCHANGED throughout, 6b246de remains the head RTL checkpoint
-baseline=FLOORPLAN_MODE=decode + IMPL_STRATEGY=postrouteN (POSTROUTE_ROUNDS=3) = -1.472ns / 182.749MHz
-         TNS -17499.508, FEP 32408; archived synth/archive/6b246de_default_postrouteN3_decode/
-         netlist md5 d80f6218c5c7dcab94a33a52d64244fa
-         REUSED not re-run: HEAD differs from gate commit 2b7588d in DOCS ONLY and
-         git diff 6b246de..HEAD -- src/ is EMPTY. Reproduced EXACTLY by all THREE probe sessions.
+agent=claude-itlb-hitway
+task=DONE — handoff section 20: file the parallel-VIPT amendment's overdue named-risk
+     report and price its pre-authorised ITLB hit-way pipelining recovery.
+reserved_at=2026-08-10T23:30:00+02:00
+released_at=2026-08-11T00:05:00+02:00
+head=6b246de remains the head RTL checkpoint. NO RTL CHANGED.
+baseline=FLOORPLAN_MODE=decode + IMPL_STRATEGY=postrouteN (POSTROUTE_ROUNDS=3)
+         = -1.472ns / 182.749MHz, TNS -17499.508, FEP 32408; reproduced EXACTLY as the control.
+         archived synth/archive/6b246de_default_postrouteN3_decode/ md5 d80f6218c5c7dcab94a33a52d64244fa
 
-RESULT=BOTH SHELVED FIXES RE-PRICE AT 0.000 ns OF WNS. Section 16's verdict SURVIVES.
-  Fix A (UPPER BOUND: 42428 LS/Dcache cells -> 20133 IQ cells)  +0.000 WNS  +125.2 TNS   -45 FEP
-  Fix B (4 earlyProbeSetWriteVec nets)                          +0.000 WNS  +378.7 TNS  -234 FEP
-  Fix A + Fix B                                                 +0.000 WNS  +420.4 TNS  -279 FEP
-  Fix A + Fix B + ENTIRE frontend cone                          +0.012 WNS (-1.460 / 183.150 MHz)
-cause=path#1 (dcache/IQ) and path#2 (frontend stalled->Icache lineReg) TIED at -1.472 to 3 decimals.
-      D-cache/IQ family's own internal headroom is 0.094 ns; realisable 0.000 ns.
-      Ladder behind them: 13 families span 0.091 ns (OLD placement: 17 families / 0.481 ns).
-      postrouteN FLATTENED the slack distribution -- family cutting now worth ~1/5 per family.
+RESULT=THE SPEC OBLIGATION IS DISCHARGED; THE PRE-AUTHORISED FIX IS NOT TRIGGERED AND WAS NOT BUILT.
+  The cone is REAL and exactly as the amendment feared:
+    - ITLB internal hit-way segment = 1.082 ns, 19.7% of the 5.481 ns path #2
+    - on 4 of the 10 worst paths (#2 -1.472, #3 -1.470, #9 -1.458, #10 -1.457)
+    - 3,662 failing endpoints run through it (11.3% of 32,408) — widest cone ever priced here
+  And removing it ENTIRELY is worth:
+    ITLB hit-way alone                      WNS -1.472  +0.000   TNS +1572.9 (9.0%)  FEP -911
+    + D-cache/IQ (Fix A upper bound)        WNS -1.460  +0.012   TNS +1698.1 (9.7%)  FEP -956
+    + Fix B + ENTIRE frontend cone          WNS -1.460  +0.012   TNS +2663.6 (15.2%) FEP -1223
+  Spec precondition was "if the cone MATERIALLY REGRESSES routed FMax". It does not (0.000 ns).
+  Building it would ALSO cost fetch throughput: rsp.ready/rsp.ppn gate cmdPort.ready, so a
+  naive registered hit-way forces L1I fetch II=2. The cheap variant (registered hit-way +
+  live vpn-stability compare, VPN is constant across a 4KiB page) leaves a 20-bit compare
+  IN the cut cone, so its real recovery is STRICTLY SMALLER than the 0.000-ns-worth model.
 
-RECENSUS=the limiter is an ENDPOINT CONE, not a startpoint family. 10 of 13 ladder rungs
-      share TWO endpoints (7x Icache lineReg, 3x FetchAlign predictPending). The cone is
-      redirect -> applyNow -> predictTarget -> pfDemandLine -> ITLB tlb_io_hit (LIVE TRANSLATE)
-      -> lookupPaddr -> tag hitVec -> arHoldId -> missPA -> pfInstallIdx (fo=518, 0.472ns route)
-      -> lineReg[418]. Priced it too: lineReg cone = 1024 endpoints + 7.49% TNS for 0.000 ns WNS.
-      Install-select net + Fix B (BOTH tied arcs at their precise fix points) = +0.012 ns,
-      landing on a THIRD arc -- numerically identical to the Fix A+B+frontend row, reached by a
-      different route, so -1.460 is a real floor.
-FINAL=no cut of ANY shape (startpoint family, endpoint cone, or precise fix point, alone or
-      combined) recovers more than 0.012 ns. 200MHz needs 0.472 ns.
+DECISIVE=THE SLACK POPULATION, not any path. Endpoints below each threshold:
+    -1.400:    98      -1.200: 2,823     -1.000: 4,890 (the 200MHz floor)
+    -0.800: 7,247      -0.500:15,904     -0.250:23,445      0.000:32,408 / 171,230
+  Reaching 200MHz needs 4,890 ENDPOINTS improved, not 4 paths / 13 families. Only 98 sit
+  below -1.400 — a dense, near-continuous distribution, which is exactly why every cut in
+  this campaign priced at 0.000-0.017 ns.
+  DEEP LADDER (45 rungs, each false-pathing the worst path's WHOLE family at BOTH ends):
+    -1.472 -> -1.277 = 0.196 ns over 45 rungs (0.0044 ns/rung, DECELERATING).
+    0.472 ns would need ~110 idealised family retirements. Families cycle through every
+    major structure: Dcache/IQ, FetchAlign, Icache, Gshare, FTB, RAS, ROB, ALU EU, Decode.
 
-strategy=directive axes EXHAUSTED. postrouteNt (ExtraTimingOpt placer) -1.839/171.262 (-11.49MHz);
-      postrouteNx (AggressiveExplore physopt) -1.723/174.734 (-8.02MHz). Both regress; both STALL
-      by round 2 while the incumbent still gains at round 3+. Section 18's +18.65MHz came from
-      ITERATING plain phys_opt/route, not from any directive. Axes are NOT additive (exploreN,
-      all three non-default, beats BOTH single-axis variants) -- vary the router jointly.
+DIAGNOSIS=51.01% CLB LUTs, 11.61% FF, NO congestion window above level 5 — neither full nor
+  congested. Yet 66-68% net delay and 20-22 LOGIC LEVELS per worst path, over nets with
+  fanouts 46/67/121/143/165/166/177/518. At 4.000 ns and 21 levels the budget is 0.19 ns per
+  level; this design's cost ~0.26 ns. The deficit is the design's AVERAGE DEPTH, not a path.
 
-open=PIPELINE THE ITLB HIT-WAY RESULT. Pre-authorised by the BINDING amendment
-      docs/superpowers/specs/2026-08-10-icache-parallel-vipt-design.md, which named this exact
-      cone as its one physical risk and required it "be reported separately in the next 250-MHz
-      route gate" -- that report had never been filed; section 19 step 7 files it. Never measured.
-      Also untried: a fresh synth_design under the postroute recipe.
-gate=make SBT=~/sbt/bin/sbt test-fast (no RTL changed; result in the handoff status block)
+open=RTL point cuts are EXHAUSTED and now provably so (+0.012 ns ceiling, THREE independent
+  routes to the same -1.460 floor). Floorplan exhausted (S18), strategy axes exhausted (S19).
+  What remains is NOT a timing cut: closing 0.472 ns across 4,890 endpoints needs real
+  ARCHITECTURAL pipelining (Dcache-store->IQ-scoreboard-wakeup, FetchAlign->Icache
+  demand/install, ROB/ALU flag writeback), each costing a cycle and needing its own IPC
+  justification and spec. Cheapest unmeasured experiment left: a fresh synth_design under the
+  postroute recipe (every number here descends from one frozen 6b246de synthesis checkpoint).
+gate=make SBT=~/sbt/bin/sbt test-fast — see the handoff status block
 noRTL=NO RTL CHANGED. 200MHz GOAL NOT REACHED — 182.749 MHz, 0.472 ns short.

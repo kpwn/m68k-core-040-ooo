@@ -2483,3 +2483,324 @@ landed physical baseline at **-1.472 ns / 182.749 MHz**.
 - Also untried: a fresh `synth_design` under the post-route recipe.  Every
   physical number in this document descends from one frozen `6b246de` synthesis
   checkpoint.
+
+## 20. The parallel-VIPT amendment's named risk, finally reported: the ITLB hit-way cone is real, is 4 of the 10 worst paths, and retires 53.5 % of the 200 MHz deficit population for 0.000 ns of WNS — because the deficit is 4,890 endpoints deep, not four paths (Claude, 2026-08-10)
+
+**Grounding only.  No RTL changed, and none should be written for this cone.**
+
+This section discharges a standing, binding spec obligation.
+`docs/superpowers/specs/2026-08-10-icache-parallel-vipt-design.md` §2 named
+**"the live ITLB-to-hit-context register cone"** as the parallel-VIPT design's
+*one* physical risk, required that it "be reported separately in the next
+250-MHz route gate", and pre-authorised exactly one recovery:
+
+> If the new ITLB-to-S1 cone materially regresses routed FMax, the permitted
+> recovery is to pipeline the ITLB's internal hit-way result or improve
+> placement.  Do not restore a translation-to-BRAM-address dependency or delete
+> the response register.
+
+That report had never been filed across every route gate since, and the fix had
+never been measured.  **It is filed here, and its verdict is: the cone is
+exactly as real as the amendment feared, and removing it entirely recovers
+0.000 ns of WNS.  The spec's own precondition — "materially regresses routed
+FMax" — is therefore not met, and the pre-authorised recovery is not
+triggered.**
+
+Evidence: `synth/probe_itlb_hitway/` (script `synth/probe_itlb_hitway.tcl`) and
+`synth/probe_slack_population/` (script `synth/probe_slack_population.tcl`),
+read-only against
+`synth/archive/6b246de_default_postrouteN3_decode/fullcore_routed.dcp`, netlist
+MD5 `d80f6218c5c7dcab94a33a52d64244fa`.  Both sessions reproduced the baseline
+exactly — WNS -1.472, TNS -17,499.508, 32,408 failing endpoints, worst path
+`stS2Payload_paddr[5] -> sbNzvc_busy[8]` — before any what-if.
+
+### Step 1: what the cone actually is, read off the routed netlist
+
+The `Tlb` (`src/main/scala/m68k040/mmu/Tlb.scala`) is 32 entries / 4 ways /
+2 banks, so `setsPerBank = 4` and the lookup is a shallow per-bank 4-way tag
+compare, not a CAM.  Its "hit-way result" is `hitVec` (:100-113), reduced to
+`io.hit := hitVec.orR` and `io.hitEntry := MuxOH(hitVec, entVec)` (:114-115).
+`ItlbPlugin` consumes it combinationally (`tlbHit`/`tlbEntry`, :107-108) into the
+`_rsp.ready`/`_rsp.ppn` response mux (:294-298), and `IcachePlugin` consumes
+*that* combinationally as `lookupPaddr = xlate.rsp.ppn ## lookupPc(11:0)`
+(:185) — which is both the L1I physical tag compare **and**, via
+`cmdPort.ready := xlate.rsp.ready && !setBlocked && answerable` (:661), the
+fetch **acceptance** decision.
+
+That is the amendment's cone, and here it is as routed, path #2 of the worst 10
+(-1.472 ns, tied with the WNS path to three decimals):
+
+```
+FetchAlign stalled/C                                              0.107
+  -> ftqMem -> cmdWindowPc -> applyNow            (fo=143)        0.733
+  -> Icache pfDemandLine -> predictTargetReg      (fo=177)        1.220
+  -> pfDemandLine[31]_i_41 (fo=165, 0.376 ns route)               1.647
+  -> Tlb _zz_hitVec_2[1]                                          2.063   <-- ITLB in
+  -> LUT6 -> CARRY8 -> hitVec_20 -> LUT3 -> LUT4                  2.856
+  -> ItlbPlugin_logic_tlb_io_hit                  (fo=67)         3.145   <-- ITLB out
+  -> Icache lookupPaddr[3]                        (fo=11)         3.477
+  -> s1Way -> CARRY8 -> Icache hitVec_10                          3.981
+  -> arHoldId -> missPA                                           4.625
+  -> pfInstallIdx[0]                              (fo=518, 0.472 ns route)
+  -> IcachePlugin lineReg[418]/D                                  5.481
+```
+
+- **The ITLB's own internal hit-way segment is 2.063 -> 3.145 = 1.082 ns, 19.7 %
+  of a 5.481 ns path.**  The amendment was right to flag it.
+- **It is on 4 of the 10 worst paths** — #2 (-1.472), #3 (-1.470), #9 (-1.458),
+  #10 (-1.457), all the `FetchAlign stalled -> Icache lineReg / commitBeat`
+  family.  The other six are D-cache/IQ (5) and `ftqHead -> p0LiveReg` (1).
+- **3,662 failing endpoints run through it** — 11.3 % of the 32,408.  That is
+  the widest single cone this campaign has priced.
+
+Registering `hitVec` inside `Tlb` cuts this path at `tlb_io_hit`, splitting
+5.481 ns into 3.145 + 2.336.  Both halves clear 4.000 ns, so
+`set_false_path -through` the 106 matched `io_hit` / `io_hitEntry_*` /
+internal `hitVec` nets is not merely an upper bound — it is the *accurate*
+model of the authorised register insertion.  (Object count printed and asserted
+non-zero, per section 19 step 1's rule.)
+
+### Step 2: the measurement the spec asked for
+
+| Scenario | WNS | ΔWNS | TNS | ΔTNS | Failing endpoints | Δ | Worst path after |
+|---|---:|---:|---:|---:|---:|---:|---|
+| baseline (reproduced) | -1.472 | — | -17,499.508 | — | 32,408 | — | `stS2Payload_paddr[5] -> sbNzvc_busy[8]` |
+| **ITLB hit-way, alone** | **-1.472** | **+0.000** | -15,926.618 | **+1,572.9 (9.0 %)** | 31,497 | **-911** | `stS2Payload_paddr[5] -> sbNzvc_busy[8]` |
+| ITLB + D-cache/IQ (Fix A upper bound) | **-1.460** | +0.012 | -15,801.374 | +1,698.1 (9.7 %) | 31,452 | -956 | `ftqHead[0] -> p0LiveReg_lenWords[0]` |
+| ITLB + Fix A + Fix B + entire frontend cone | -1.460 | +0.012 | -14,835.954 | +2,663.6 (15.2 %) | 31,185 | -1,223 | `ftqHead[0] -> p0LiveReg_lenWords[0]` |
+
+**The authorised fix, applied at its most generous, is worth 0.000 ns of WNS.**
+The mechanism is section 19's tie, now confirmed from the other side: path #1
+(D-cache/IQ) and path #2 (this cone) are both -1.472, so deleting either exposes
+the other at the identical slack.  Deleting *both* lands on path #7,
+`ftqHead -> p0LiveReg_lenWords`, at -1.460 — and adding Fix B and the entire
+frontend demand cone on top of that changes nothing further.  **-1.460 is now
+the third independent route to the same floor** (section 19 reached it twice).
+
+What the cone *does* own is breadth: **9.0 % of TNS and 911 failing endpoints,
+from a single register insertion.**  That is the largest TNS-per-cut this
+campaign has measured — four times Fix B, more than the entire frontend demand
+cone.  It is still not FMax, and FMax is what the 200 MHz goal gates on.
+
+### Step 3: the honest IPC cost, had it been built
+
+It matters that this is *not* a free retime, because the throughput-over-latency
+principle that justified `ringDrop` and `ftbFraming` does **not** transfer here.
+
+`xlate.rsp.ready` and `xlate.rsp.ppn` are consumed by the fetch **acceptance**
+gate, not only by a downstream capture.  Registering the hit-way makes the
+translation answer one cycle stale, so a naive insertion forces the L1I to
+accept at most one command every two cycles — **fetch II=2, halving frontend
+bandwidth.**  For a core whose binding goal is "200 MHz *with good IPC*", that
+trades the entire IPC budget for 0.000 ns.
+
+There *is* a cheaper variant, and it is worth recording because it is the only
+version anyone should ever revisit: the ITLB lookup key is the VPN
+`pc[31:12]`, which is **constant across a whole 4 KiB page** — 64 L1I lines of
+sequential fetch.  So a registered hit-way plus a live
+`lookupVpnReg === _req.vpn` stability comparator would be correct with a bubble
+only when the VPN actually changes (page cross, or a cross-page redirect), which
+is rare.  But that variant leaves a live 20-bit equality compare in the very cone
+being cut, so its real recovery is **strictly smaller than the 1.082 ns
+modelled above** — and the modelled version is already worth 0.000 ns.  A
+smaller cut of a path whose full removal buys nothing buys nothing.
+
+**Verdict: do not build it now.**  The obligation is discharged by this report,
+not by the fix; the spec conditioned the recovery on a material routed-FMax
+regression, and the measurement shows there is none to recover.  Step 4b
+qualifies this in the fix's favour — it is the largest single component of the
+deficit by endpoint count — but not enough to reverse it on its own.
+
+### Step 4: the measurement that explains the whole campaign — the slack *population*
+
+Every ladder in sections 15, 16, 17, 19 and step 2 above asks *"which path is
+worst"*.  That is the wrong question, and this is the number that proves it — a
+census of how many **endpoints** sit below each slack threshold:
+
+| slack better than... | endpoints | share of 171,230 |
+|---|---:|---:|
+| -1.400 | **98** | 0.06 % |
+| -1.200 | 2,823 | 1.6 % |
+| **-1.000 (the 200 MHz floor)** | **4,890** | **2.9 %** |
+| -0.800 | 7,247 | 4.2 % |
+| -0.500 | 15,904 | 9.3 % |
+| -0.250 | 23,445 | 13.7 % |
+| 0.000 | 32,408 | 18.9 % |
+
+**Reaching 200 MHz does not require fixing four paths, or thirteen families.  It
+requires improving 4,890 endpoints.**  Only 98 endpoints — 2 % of that
+population — lie below -1.400, which is precisely why every family retirement
+this campaign has attempted recovered 0.000 to 0.017 ns: each one removes a
+handful of endpoints from the top of a dense, nearly continuous distribution and
+immediately exposes the next.
+
+That population is, by breadth, strikingly **concentrated** — which is what
+makes the zero WNS result counter-intuitive enough to be worth stating plainly:
+
+| sub-(-1.000) endpoints by START family | | by END family | |
+|---|---:|---|---:|
+| FetchAlignPlugin | **2,628** | IcachePlugin | **2,427** |
+| DcachePlugin | 1,370 | DcachePlugin | 703 |
+| DecodeStage | 679 | RasPlugin | 496 |
+| AluEuPlugin | 152 | RobPlugin | 334 |
+| LsEuPlugin | 34 | IssueQueuePlugin | 329 |
+| RobPlugin | 23 | FetchAlignPlugin | 229 |
+| (4 others) | 4 | (9 others) | 372 |
+
+**One arc — `FetchAlign -> IcachePlugin` — owns more than half of the endpoints
+that must move to reach 200 MHz, and 2,620 of the 4,890 (53.6 %) have their
+worst path running through the ITLB hit-way cone specifically.**  The deficit
+*is* concentrated.  It simply cannot be *cut*, because every one of those
+endpoints is also reachable by a second, third and fourth path of nearly
+identical delay, so severing the worst one just promotes the next.  That is the
+single most important thing this campaign has learned, and it took a population
+census rather than a path census to see it.
+
+And the population's shape says where the delay actually lives:
+
+```
+logic levels  9-11 :   452 endpoints        mean over the 4,890 sub-(-1.000) endpoints:
+logic levels 12-15 :   464                    logic delay 1.579 ns
+logic levels 16-17 :   708                    net   delay 3.546 ns
+logic levels 18-20 : 3,195   <-- 65.3 %       net share   69.2 %
+logic levels 21-22 :    59
+```
+
+**Two-thirds of the endpoints that must move sit at 18-20 logic levels, and
+69.2 % of their delay is routing, not logic.**
+
+### Step 4b: the fairest possible test of the authorised fix — and it passes, while still not reaching 200 MHz
+
+Judging the ITLB fix by WNS alone is not quite fair to it, because a dense
+distribution makes WNS almost incapable of moving.  The fair question is: **how
+many of the 4,890 does each cut actually retire?**  An endpoint is only retired
+if it has no *other* remaining path below -1.000 — which is exactly what the
+step-4 concentration finding puts in doubt.  Measured directly
+(`synth/probe_population_after_cuts/`):
+
+| cumulative cut | endpoints still below -1.000 | retired | WNS |
+|---|---:|---:|---:|
+| baseline | 4,890 | — | -1.472 |
+| **+ ITLB hit-way** | **2,272** | **-2,618 (53.5 %)** | -1.472 |
+| + D-cache/IQ (Fix A upper bound) | 2,136 | -136 | -1.460 |
+| + Fix B + entire frontend demand cone | **2,017** | -119 | -1.460 |
+
+**A single register insertion inside `Tlb.scala` retires 2,618 of the 4,890
+endpoints standing between this core and 200 MHz — 53.5 % of the entire deficit
+population, and twenty times what every other candidate on file achieves
+combined.**  This is by a wide margin the largest object anyone in this campaign
+has found.
+
+And it still does not get to 200 MHz, because **after applying every candidate at
+once, 2,017 endpoints remain below -1.000 ns** and WNS is pinned at -1.460.
+Those two facts together are the campaign's conclusion: the ITLB hit-way cone is
+genuinely the biggest single component of the FMax deficit, *and* removing it
+completely still leaves 41 % of the deficit population untouched, spread across
+the D-cache/IQ, RAS, ROB and DecodeStage structures with no comparable
+concentration left to attack.
+
+**This does not change the recommendation not to build it now** — 0.000 ns of
+WNS today, against a real fetch-throughput cost, is a bad trade for a core whose
+goal is "200 MHz *with good IPC*".  It does change what the fix *is*: not a
+failed lever, but **the natural first slice of the architectural-pipelining
+design described in step 6**, where its one-cycle cost is justified alongside the
+other stage splits rather than paid alone for nothing.
+
+### Step 5: the deep ladder — 45 consecutive family retirements are worth 0.196 ns
+
+Sections 15/16/17/19 each walked 13-17 rungs and stopped at a plateau.  This one
+was run to 45, each rung false-pathing the worst path's **entire** family at both
+ends (startpoint cell *and* endpoint cell) — an idealisation far stronger than
+any RTL change can achieve:
+
+```
+rung  0  -1.472    rung 10  -1.428    rung 20  -1.383    rung 30  -1.325    rung 40  -1.288
+rung  1  -1.472    rung 11  -1.418    rung 21  -1.378    rung 31  -1.323    rung 41  -1.282
+rung  2  -1.460    rung 12  -1.417    rung 22  -1.373    rung 32  -1.323    rung 42  -1.282
+rung  3  -1.451    rung 13  -1.413    rung 23  -1.372    rung 33  -1.318    rung 43  -1.279
+rung  4  -1.451    rung 14  -1.408    rung 24  -1.369    rung 34  -1.318    rung 44  -1.277
+```
+
+Full table: `synth/probe_itlb_hitway/deep_ladder.txt`.
+
+**Forty-five family retirements move WNS from -1.472 to -1.277: 0.196 ns, a mean
+of 0.0044 ns per rung.**  The 200 MHz floor needs 0.472 ns.  Linear
+extrapolation puts that at roughly **110 consecutive family retirements** — and
+the rate is decelerating, not accelerating, as the distribution densifies.  The
+families cycle through every major structure in the core: D-cache/IQ, FetchAlign,
+I-cache, Gshare, FTB, RAS, ROB, ALU EU, DecodeStage.  There is no concentration
+left to attack.
+
+### Step 6: what this means — the category of work required has changed
+
+The routed design is **51.01 % CLB LUTs (110,679 / 216,960), 11.61 % registers,
+with no congestion window above level 5**.  It is neither full nor congested.
+Yet net delay is **69.2 % of the mean sub-(-1.000) endpoint's datapath**, and
+those endpoints sit at a modal **18-20 logic levels**, traversing five or more
+nets with fanouts of 46, 67, 121, 143, 165, 166, 177, and 518.
+
+That is the whole diagnosis in one line: **at a 4.000 ns target, 19 logic levels
+leaves ~0.21 ns per level, and this design's levels cost ~0.27 ns because
+two-thirds of each is high-fanout routing.**  The deficit is not located in any
+path; it is the average depth of the design.
+
+Note what that rules out.  A 51 %-utilised, uncongested device with 69 % net
+delay is not short of *area* — so area-reduction work would not help, and the
+standing "area growth is a review point, not a rejection" rule remains safe.  It
+is short of *stages*.
+
+Consequently:
+
+- **RTL point cuts are exhausted, and now provably so.**  Family cutting,
+  endpoint-cone cutting, precise fix points, the D-cache/IQ pair, the entire
+  frontend demand cone, and the ITLB hit-way cone — alone and in every
+  combination — top out at **+0.012 ns** against a 0.472 ns requirement.  Three
+  independent routes reach the identical -1.460 floor.
+- **Placement and implementation strategy are exhausted.**  Every floorplan
+  variant regressed (section 18); both directive axes regressed (section 19).
+  The one strategy win, iterated post-route phys-opt (+18.95 MHz), is already
+  landed and is what produced the flat distribution being measured here.
+- **What is left is not a timing cut.**  Closing 0.472 ns across 4,890 endpoints
+  requires reducing *average logic depth*, which means real architectural
+  pipelining — splitting deep combinational stages across the
+  FetchAlign -> I-cache demand/install arc (2,628 startpoints / 2,427 endpoints,
+  of which the ITLB hit-way register insertion alone is worth 2,618 retired
+  endpoints), the D-cache store pipe -> IQ scoreboard wakeup arc (1,370 / 1,032),
+  and the DecodeStage -> RAS/ROB arc (679 / 830) — counts are per-family
+  startpoint and endpoint populations from the step-4 census, not matched pairs.
+  Each costs a cycle of latency and must be justified on its own IPC terms, not
+  as a timing patch.
+  That is a design cycle with its own spec, not a lever this campaign can pull.
+  Step 4b gives that future design its ordering and its expected yield: even all
+  three arcs together leave 2,017 endpoints below -1.000, so a fourth pass would
+  be needed, and 250 MHz is not in reach at this depth at all.
+- The cheapest remaining *unmeasured* experiment is still a fresh `synth_design`
+  under the post-route recipe: every physical number in this document descends
+  from one frozen `6b246de` synthesis checkpoint, and a re-synthesis is the one
+  variable never varied.  It is a lottery ticket, not a plan.
+
+### Step 7: status
+
+**No RTL changed.**  `6b246de` remains the head RTL checkpoint;
+`FLOORPLAN_MODE=decode` + `IMPL_STRATEGY=postrouteN` (3 rounds) remains the
+landed physical baseline at **-1.472 ns / 182.749 MHz**.  Repository gate
+`make SBT=~/sbt/bin/sbt test-fast` re-run and green: **149/149 tests, 157 suites
+completed, 0 failed, 0 aborted** — the section-19 baseline exactly.
+
+- The parallel-VIPT amendment's §2 reporting obligation is **discharged**.  Its
+  pre-authorised recovery is **not triggered** and should **not be built now**:
+  the cone is 19.7 % of its path and 11.3 % of all failing endpoints, but
+  removing it entirely is worth **0.000 ns of WNS**, and building it would cost
+  fetch throughput.  It is, however, worth **2,618 retired sub-(-1.000)
+  endpoints — 53.5 % of the 200 MHz deficit population** — which makes it the
+  designated first slice of any future architectural-pipelining spec.
+- **Distance to the 200 MHz deployment floor: 0.472 ns.  The goal is NOT met, at
+  182.749 MHz.**
+- The blocker is now characterised rather than merely observed: **4,890 endpoints
+  below -1.000 ns (2,017 surviving every candidate cut applied at once), 45
+  idealised family retirements worth 0.196 ns, a modal 18-20 logic levels at
+  69.2 % net delay in a 51 %-utilised, uncongested device.**
+- **This closes the FMax-recovery campaign as a cut-based effort.**  Sections 13
+  and 14 landed real cuts; sections 15, 16, 17, 19 and 20 measured the remaining
+  candidates to exhaustion; section 18 landed the one implementation-strategy
+  win.  Everything after this needs a different category of work.

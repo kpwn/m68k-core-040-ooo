@@ -1,0 +1,4 @@
+baseline                        sub(-1.000) endpoints: 4890
++ itlb hit-way                  sub(-1.000) endpoints: 2272
++ dcache/IQ (Fix A upper)       sub(-1.000) endpoints: 2136
++ Fix B + entire frontend cone  sub(-1.000) endpoints: 2017
