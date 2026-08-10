@@ -1,19 +1,45 @@
 agent=claude-dcache-iq-reprice
-task=IN PROGRESS — handoff section 19: re-price section 16's D-cache/IQ fixes on the postrouteN placement
+task=DONE — handoff section 19: re-price section 16's D-cache/IQ fixes on the postrouteN placement
 reserved_at=2026-08-10T22:23:00+02:00
-head=a2ed18b at start (RTL unchanged since 6b246de)
+released_at=2026-08-10T23:10:00+02:00
+head=see git log; RTL UNCHANGED throughout, 6b246de remains the head RTL checkpoint
 baseline=FLOORPLAN_MODE=decode + IMPL_STRATEGY=postrouteN (POSTROUTE_ROUNDS=3) = -1.472ns / 182.749MHz
          TNS -17499.508, FEP 32408; archived synth/archive/6b246de_default_postrouteN3_decode/
-         REPRODUCED EXACTLY by both probe sessions before any what-if (method control)
+         netlist md5 d80f6218c5c7dcab94a33a52d64244fa
+         REUSED not re-run: HEAD differs from gate commit 2b7588d in DOCS ONLY and
+         git diff 6b246de..HEAD -- src/ is EMPTY. Reproduced EXACTLY by all THREE probe sessions.
+
 RESULT=BOTH SHELVED FIXES RE-PRICE AT 0.000 ns OF WNS. Section 16's verdict SURVIVES.
-       Fix A (upper bound, 42428 LS/Dcache cells -> 20133 IQ cells): +0.000 WNS, +125.2 TNS, -45 FEP
-       Fix B (4 earlyProbeSetWriteVec nets):                          +0.000 WNS, +378.7 TNS, -234 FEP
-       Fix A + Fix B:                                                 +0.000 WNS, +420.4 TNS, -279 FEP
-       Fix A + Fix B + ENTIRE frontend cone:                          +0.012 WNS (-1.460 / 183.150 MHz)
-cause=path #1 (dcache/IQ) and path #2 (frontend stalled->Icache lineReg) are TIED at -1.472 to 3 decimals.
-      Behind them: a 13-family plateau spanning 0.091 ns (old placement: 17 families / 0.481 ns).
-      The postrouteN pass FLATTENED the slack distribution; family cutting is now worth ~1/5 per family.
-noRTL=NO RTL CHANGED. 200MHz needs 0.472 ns; every candidate on file combined delivers 0.012 ns.
-running=synth/probe_strategy2 -- 2x2 strategy sweep (decode@postrouteNt, decode@postrouteNx) isolating
-        the placer vs phys-opt directive axes that exploreN confounded. Results pending.
-note=sibling-project Vivado full_impl live (macqd700-soc) — keep concurrency low
+  Fix A (UPPER BOUND: 42428 LS/Dcache cells -> 20133 IQ cells)  +0.000 WNS  +125.2 TNS   -45 FEP
+  Fix B (4 earlyProbeSetWriteVec nets)                          +0.000 WNS  +378.7 TNS  -234 FEP
+  Fix A + Fix B                                                 +0.000 WNS  +420.4 TNS  -279 FEP
+  Fix A + Fix B + ENTIRE frontend cone                          +0.012 WNS (-1.460 / 183.150 MHz)
+cause=path#1 (dcache/IQ) and path#2 (frontend stalled->Icache lineReg) TIED at -1.472 to 3 decimals.
+      D-cache/IQ family's own internal headroom is 0.094 ns; realisable 0.000 ns.
+      Ladder behind them: 13 families span 0.091 ns (OLD placement: 17 families / 0.481 ns).
+      postrouteN FLATTENED the slack distribution -- family cutting now worth ~1/5 per family.
+
+RECENSUS=the limiter is an ENDPOINT CONE, not a startpoint family. 10 of 13 ladder rungs
+      share TWO endpoints (7x Icache lineReg, 3x FetchAlign predictPending). The cone is
+      redirect -> applyNow -> predictTarget -> pfDemandLine -> ITLB tlb_io_hit (LIVE TRANSLATE)
+      -> lookupPaddr -> tag hitVec -> arHoldId -> missPA -> pfInstallIdx (fo=518, 0.472ns route)
+      -> lineReg[418]. Priced it too: lineReg cone = 1024 endpoints + 7.49% TNS for 0.000 ns WNS.
+      Install-select net + Fix B (BOTH tied arcs at their precise fix points) = +0.012 ns,
+      landing on a THIRD arc -- numerically identical to the Fix A+B+frontend row, reached by a
+      different route, so -1.460 is a real floor.
+FINAL=no cut of ANY shape (startpoint family, endpoint cone, or precise fix point, alone or
+      combined) recovers more than 0.012 ns. 200MHz needs 0.472 ns.
+
+strategy=directive axes EXHAUSTED. postrouteNt (ExtraTimingOpt placer) -1.839/171.262 (-11.49MHz);
+      postrouteNx (AggressiveExplore physopt) -1.723/174.734 (-8.02MHz). Both regress; both STALL
+      by round 2 while the incumbent still gains at round 3+. Section 18's +18.65MHz came from
+      ITERATING plain phys_opt/route, not from any directive. Axes are NOT additive (exploreN,
+      all three non-default, beats BOTH single-axis variants) -- vary the router jointly.
+
+open=PIPELINE THE ITLB HIT-WAY RESULT. Pre-authorised by the BINDING amendment
+      docs/superpowers/specs/2026-08-10-icache-parallel-vipt-design.md, which named this exact
+      cone as its one physical risk and required it "be reported separately in the next 250-MHz
+      route gate" -- that report had never been filed; section 19 step 7 files it. Never measured.
+      Also untried: a fresh synth_design under the postroute recipe.
+gate=make SBT=~/sbt/bin/sbt test-fast (no RTL changed; result in the handoff status block)
+noRTL=NO RTL CHANGED. 200MHz GOAL NOT REACHED — 182.749 MHz, 0.472 ns short.

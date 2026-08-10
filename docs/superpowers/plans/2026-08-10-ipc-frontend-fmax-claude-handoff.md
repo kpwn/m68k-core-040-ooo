@@ -2398,3 +2398,88 @@ number in this document descends from one frozen synthesis checkpoint.
 No default was changed.  `postrouteNt` and `postrouteNx` are retained in
 `synth/impl_FullCore.tcl` as measured-negative diagnostics, in the same spirit as
 section 18's committed floorplan XDCs.
+
+### Step 9: the endpoint cones, priced — the reframing is right and it still buys nothing
+
+Step 7 argued the ladder should be read by endpoint.  `synth/probe_endpoint_cones.tcl`
+prices those cones directly, against the same routed checkpoint, with every cut
+asserting on its object count.  The baseline reproduced exactly for a third
+independent time.
+
+| Scenario | WNS | ΔWNS | TNS | ΔTNS | Failing endpoints | Δ |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline | -1.472 | — | -17,499.508 | — | 32,408 | — |
+| `lineReg` endpoint cone (512 cells) | -1.472 | **+0.000** | -16,189.253 | +1,310.3 (7.49 %) | 31,384 | **-1,024** |
+| `predictPending` endpoint cone (3 cells) | -1.472 | +0.000 | -17,498.057 | +1.5 (0.01 %) | 32,407 | -1 |
+| both cones | -1.472 | +0.000 | -16,187.802 | +1,311.7 (7.50 %) | 31,383 | -1,025 |
+| the fanout-518 install-select net (13 nets, incl. 9 phys-opt replicas) | -1.472 | +0.000 | -16,529.416 | +970.1 (5.54 %) | 31,641 | -767 |
+| **install-select net + Fix B** (both tied arcs, each at its own fix point) | **-1.460** | **+0.012** | -16,150.751 | +1,348.8 (7.71 %) | 31,407 | -1,001 |
+
+Three conclusions, and the third is the one that closes the section.
+
+**The reframing was correct as a description and useless as a lever.**  The
+`lineReg` cone is by a wide margin the largest single object this campaign has
+measured — **1,024 failing endpoints and 7.49 % of TNS from one `set_false_path`** —
+and it is worth **0.000 ns of WNS**, because the D-cache/IQ arc is tied behind it.
+Step 7's diagnosis of *why* the startpoint ladder crawls is right; it simply does
+not follow that the cone is worth anything.
+
+**Rung count is not worth, again.**  `predictPending` supplied three of the
+thirteen ladder rungs in step 3 and is worth **1.5 ns of TNS and one endpoint**.
+Three cells.  Any future census must price what it names.
+
+**Cutting both tied arcs at their precise fix points still yields 0.012 ns.**
+Scenario 5 is the experiment step 7 was built for: sever the fanout-518 install
+select (all thirteen nets, including the nine replicas `phys_opt_design` created)
+*and* Fix B, i.e. remove the frontend arc and the D-cache/IQ arc simultaneously
+at exactly the places an RTL fix would.  WNS moves -1.472 -> -1.460, and the new
+limiter is a **third** arc, `FetchAlign ftqHead[0] -> p0LiveReg_lenWords[0]`.
+That is numerically identical to step 2's Fix A + Fix B + whole-frontend-cone row
+(-1.460), reached by a completely different route — which is itself the
+confirmation that -1.460 is a real floor and not an artefact of one cut model.
+
+The endpoint ladder past both cones agrees: six further endpoint-cone
+retirements move -1.472 to -1.451, **0.021 ns**, and five of the six are the
+D-cache `stS2Payload_paddr` startpoint arriving at yet another IQ endpoint.
+
+**Final statement of the negative result.  On this placement, no cut of any
+shape — startpoint family, endpoint cone, or precise fix point, alone or in any
+combination measured — recovers more than 0.012 ns of WNS.  The 200 MHz floor
+needs 0.472 ns.  Every remaining path is within 6 % of the worst one, and the
+design is uniformly limited by placement and routing rather than by any
+identifiable piece of logic.**
+
+### Functional gates
+
+`make SBT=~/sbt/bin/sbt test-fast` — **149/149 tests, 157 suites, 0 failed**, on
+the worktree with all of this section's changes present.  **No RTL
+changed in this section**; the only tracked non-documentation changes are
+`synth/*.tcl` (three new read-only probes plus two measured-negative
+`IMPL_STRATEGY` recipes) and the reservation file.
+
+### Status after this section
+
+**No RTL changed.**  `6b246de` remains the head RTL checkpoint and
+`FLOORPLAN_MODE=decode` + `IMPL_STRATEGY=postrouteN` (3 rounds) remains the
+landed physical baseline at **-1.472 ns / 182.749 MHz**.
+
+- **Section 16's verdict survives re-measurement.**  Fix A (2-deep skid on the
+  IQ -> LS-EU issue-port ready) and Fix B (retime `earlyProbeSetWriteVec`) are
+  each worth **0.000 ns of WNS** on the new placement, as is the pair.  Neither
+  was implemented, and neither should be.
+- **What changed is only their breadth value**: Fix B is now worth 2.16 % of TNS
+  and 234 endpoints, about eight times section 16's figure.  Its one-cycle
+  write-versus-consume correctness hole was re-verified against the routed
+  netlist and is real, so it remains a throughput candidate only.
+- **Distance to the 200 MHz deployment floor: 0.472 ns, unchanged.**  The goal is
+  **not** met.
+- Levers closed by this section: family cutting (0.012 ns ceiling), endpoint-cone
+  cutting (same 0.012 ns ceiling, reached independently), and the
+  implementation-strategy directive axes (both regress).
+- Lever left standing and never measured: **pipelining the ITLB hit-way result**,
+  which `2026-08-10-icache-parallel-vipt-design.md` already pre-authorises as the
+  named recovery for the cone it also named as its one physical risk — and whose
+  required separate route-gate report this section is the first to file.
+- Also untried: a fresh `synth_design` under the post-route recipe.  Every
+  physical number in this document descends from one frozen `6b246de` synthesis
+  checkpoint.
