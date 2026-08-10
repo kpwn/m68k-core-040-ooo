@@ -183,7 +183,7 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
         s"one VPN must require exactly one three-level ITLB walk, got " +
           s"${walkArs.map(a => f"0x$a%x")}")
 
-      // Phase A: clean resident restart. The first useful packet is N+5, then eight
+      // Phase A: clean resident restart. The first useful packet is N+4, then eight
       // two-wide, two-word groups must fire on eight consecutive cycles. This consumes
       // all four fetched words per cycle, so a response bubble cannot hide in the IBuf.
       dut.probe.logic.feedOut.ready #= false
@@ -197,8 +197,8 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
       await(cd, 80, "eight useful resident groups") { groups.size >= 8 }
 
       val aGroups = groups.take(8)
-      assert(aGroups.head.cycle - phaseAStart == 5,
-        s"resident restart first-use latency=${aGroups.head.cycle - phaseAStart}, expected 5")
+      assert(aGroups.head.cycle - phaseAStart == 4,
+        s"resident restart first-use latency=${aGroups.head.cycle - phaseAStart}, expected 4")
       assert(aGroups.map(_.cycle).sliding(2).forall(w => w(1) == w(0) + 1),
         s"useful resident feed bubbled: ${aGroups.map(_.cycle)}")
       for ((g, i) <- aGroups.zipWithIndex) {
@@ -217,7 +217,7 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
         s"resident phase A re-walked a hot ITLB entry: $walkArBeforeA -> $walkArCount")
 
       // The first three target commands/responses are the unthrottled pipeline fill.
-      // They must be II=1 and associated in order at fixed latency three.
+      // They must be II=1 and associated in order at fixed latency two.
       val aCmd = commands.filter(e => e.pc >= VirtPage && e.pc < VirtPage + 64).take(3)
       val aRsp = responses.filter(e => e.pc >= VirtPage && e.pc < VirtPage + 64).take(3)
       assert(aCmd.map(_.cycle).sliding(2).forall(w => w(1) == w(0) + 1),
@@ -227,15 +227,17 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
       assert(aCmd.size == 3 && aRsp.size == 3,
         s"expected three command/response timing samples, got cmd=$aCmd rsp=$aRsp")
       for ((cmd, rsp) <- aCmd.zip(aRsp)) {
-        assert(rsp.pc == cmd.pc && rsp.cycle - cmd.cycle == 3,
+        assert(rsp.pc == cmd.pc && rsp.cycle - cmd.cycle == 2,
           s"resident association/latency mismatch: cmd=$cmd rsp=$rsp")
       }
 
-      // Phase B: find a real full-ring consume/replace cycle, then collide an external
-      // redirect with it. The command accepted on the redirect edge is old-path and born
+      // Phase B: collide a redirect with a real resident response/replacement cycle.
+      // At latency two, the depth-three ring intentionally stays at occupancy two on a
+      // bubble-free stream; the standalone ring-turnover suite still proves the full
+      // occupancy-three collision. The redirect-edge command here is old-path and born
       // stale. After the flush, only the warm target's exact sequence may reach decode.
-      await(cd, 80, "full-ring turnover opportunity before redirect") {
-        dut.fa.logic.ringCount.toInt == 3 &&
+      await(cd, 80, "resident turnover opportunity before redirect") {
+        dut.fa.logic.ringCount.toInt == 2 &&
           dut.obs.logic.rspValid.toBoolean &&
           dut.obs.logic.cmdValid.toBoolean && dut.obs.logic.cmdReady.toBoolean
       }
@@ -243,10 +245,10 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
       dut.fa.logic.redirect.valid #= true
       dut.fa.logic.redirect.payload #= target
       sleep(1)
-      assert(dut.fa.logic.ringCount.toInt == 3 &&
+      assert(dut.fa.logic.ringCount.toInt == 2 &&
         dut.obs.logic.rspValid.toBoolean &&
         dut.obs.logic.cmdValid.toBoolean && dut.obs.logic.cmdReady.toBoolean,
-        "redirect must collide with a real full-ring response/replacement")
+        "redirect must collide with a real resident response/replacement")
       val bornStalePc = dut.obs.logic.cmdPc.toLong
       cd.waitSampling()
       val redirectCycle = cycle
@@ -260,8 +262,8 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
         groups.size >= groupMarker + 8
       }
       val bGroups = groups.slice(groupMarker, groupMarker + 8)
-      assert(bGroups.head.cycle - redirectCycle == 5,
-        s"full-ring redirect restart=${bGroups.head.cycle - redirectCycle} cycles, expected 5")
+      assert(bGroups.head.cycle - redirectCycle == 4,
+        s"resident redirect restart=${bGroups.head.cycle - redirectCycle} cycles, expected 4")
       assert(bGroups.map(_.cycle).sliding(2).forall(w => w(1) == w(0) + 1),
         s"target feed bubbled after refill: ${bGroups.map(_.cycle)}")
       for ((g, i) <- bGroups.zipWithIndex) {

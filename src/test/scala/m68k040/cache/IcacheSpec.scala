@@ -380,12 +380,11 @@ class IcacheSpec extends AnyFunSuite {
     }
   }
 
-  // -------- Latency: a warm hit responds exactly 3 cycles after accept --------
-  // The accept now lands in the registered ITLB-translate (T) stage; the hit-detect
-  // + BRAM read run off the REGISTERED physical paddr the NEXT cycle (FMax: the live
-  // ITLB way-mux is out of the hit cone). So a warm hit is: accept -> (+1) T-consume
-  // arms the BRAM read -> (+2) S1 muxes the beat -> (+3) rsp register drives the Flow.
-  test("warm hit responds exactly three cycles after cmd accept", VerilatorTest) {
+  // -------- Latency: a warm hit responds exactly 2 cycles after accept --------
+  // The parallel-VIPT path arms BRAM from virtual set/beat in the acceptance cycle
+  // while the live translation qualifies the tag into S1. Registered S1 control then
+  // selects the BRAM output into the response register on +1; FetchRsp is visible +2.
+  test("warm hit responds exactly two cycles after cmd accept", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
@@ -419,31 +418,27 @@ class IcacheSpec extends AnyFunSuite {
       cd.waitSamplingWhere(
         dut.probe.logic.cmdIn.ready.toBoolean && dut.probe.logic.cmdIn.valid.toBoolean)
       dut.probe.logic.cmdIn.valid #= false
-      // +1 cycle: T-stage just registered the translation; hit-detect/BRAM read not
-      // yet launched — no response.
+      // +1 cycle: BRAM output and registered hit context are being selected into the
+      // response register — no externally visible response yet.
       cd.waitSampling()
       assert(!dut.probe.logic.rspOut.valid.toBoolean,
-        "rsp must NOT be valid 1 cycle after accept (translation just registered)")
-      // +2 cycles: BRAM read in flight (armed off the registered paddr), no response yet
-      cd.waitSampling()
-      assert(!dut.probe.logic.rspOut.valid.toBoolean,
-        "rsp must NOT be valid 2 cycles after accept (BRAM read in flight)")
-      // +3 cycles: response arrives
+        "rsp must NOT be valid 1 cycle after accept (response register not visible)")
+      // +2 cycles: registered response arrives.
       cd.waitSampling()
       assert(dut.probe.logic.rspOut.valid.toBoolean,
-        "rsp must be valid exactly 3 cycles after accept")
+        "rsp must be valid exactly 2 cycles after accept")
       assert(dut.probe.logic.rspOut.payload.data.toBigInt == IcacheSim.window64(base),
-        "3-cycle hit data mismatch")
+        "2-cycle hit data mismatch")
       cd.waitSampling(4)
     }
   }
 
-  // -------- Throughput: the three-cycle resident pipe has initiation interval one --------
+  // -------- Throughput: the two-cycle resident pipe has initiation interval one --------
   // A serialized `fetch()` loop cannot prove this: it waits for each response before
   // presenting the next command. Drive six unique same-line windows back-to-back and
   // require both the accepts and their associated responses to be consecutive. The
   // zero-AXI assertion proves the measured cadence is the resident path, not refills.
-  test("warm resident hits accept and respond every cycle at fixed three-cycle latency", VerilatorTest) {
+  test("warm resident hits accept and respond every cycle at fixed two-cycle latency", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
@@ -500,8 +495,8 @@ class IcacheSpec extends AnyFunSuite {
         s"resident responses must be bubble-free: ${responses.map(_._1)}")
       for (((acceptCycle, acceptPc), (responseCycle, responsePc, data)) <-
            accepts.zip(responses)) {
-        assert(responseCycle - acceptCycle == 3,
-          s"pc=0x${acceptPc.toHexString} latency=${responseCycle - acceptCycle}, expected 3")
+        assert(responseCycle - acceptCycle == 2,
+          s"pc=0x${acceptPc.toHexString} latency=${responseCycle - acceptCycle}, expected 2")
         assert(responsePc == acceptPc,
           f"response order mismatch: accepted 0x$acceptPc%x, returned 0x$responsePc%x")
         assert(data == IcacheSim.window64(acceptPc),

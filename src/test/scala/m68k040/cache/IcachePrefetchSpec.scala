@@ -242,7 +242,7 @@ class IcachePrefetchSpec extends AnyFunSuite {
       // Do NOT settle. Immediately fetch the already-resident 0x4000 -- if the fetch
       // port were closed for the whole prefetch fill this would block until it landed.
       // (`fetch` itself would simply take longer, so the discriminating assertion is
-      // the CYCLE COUNT, measured against the known ~3-cycle hit latency.)
+      // the CYCLE COUNT, measured against the known two-cycle resident latency.)
       val t0 = simTime()
       val got = fetch(dut, cd, 0x4000L)
       val t1 = simTime()
@@ -270,11 +270,23 @@ class IcachePrefetchSpec extends AnyFunSuite {
 
       fetch(dut, cd, 0x6000L)         // demand 0x6000 -> prefetch 0x6040 starts
       val before = ar.total
-      // Immediately demand 0x6040 while its prefetch is still in flight. The T-stage is
-      // HELD and re-looks-up (plan I1.2 / I3.2's sanctioned merge implementation), so
-      // this must produce NO additional AR of any ID.
+      // Immediately demand 0x6040 while its prefetch is still in flight. The offered
+      // Stream command must be backpressured with a stable payload, then re-look up
+      // after install (plan I1.2 / I3.2's sanctioned merge implementation). This must
+      // produce NO additional AR of any ID and exactly one eventual command fire.
+      var heldCycles = 0
+      var demandFires = 0
+      cd.onSamplings {
+        if (dut.probe.logic.cmdIn.valid.toBoolean) {
+          assert(dut.probe.logic.cmdIn.payload.pc.toLong == 0x6040L,
+            f"held demotion payload changed to 0x${dut.probe.logic.cmdIn.payload.pc.toLong}%x")
+          if (dut.probe.logic.cmdIn.ready.toBoolean) demandFires += 1 else heldCycles += 1
+        }
+      }
       val got = fetch(dut, cd, 0x6040L)
       assert(got == IcacheSim.window64(0x6040L), "demoted demand fetch must get correct data")
+      assert(heldCycles > 0, "demotion setup never exercised Stream backpressure")
+      assert(demandFires == 1, s"demoted command must fire exactly once, got $demandFires")
       settle(cd)
       // Settling may legitimately add ONE more prefetch (0x6080) triggered by the hit.
       assert(ar.byId(AxiIds.I_DEMAND) == 1,

@@ -1,8 +1,8 @@
 # Frontend throughput audit
 
 **Status:** REVIEW COMPLETE; P0 findings resolved by the binding registered-token
-FTB amendment and replacement plan. RTL is authorized only after the current IPC
-branch passes its floorplanned timing checkpoint (250-MHz goal, 200-MHz floor).
+FTB amendment and replacement plan. The 2026-08-10 parallel-VIPT amendment
+supersedes this audit's recommendation to retain the L1I translation T-stage.
 
 **Scope:** fetch address generation, BTB/gshare/RAS prediction, ITLB and L1I,
 FetchAlign and its outstanding ring, instruction buffering and alignment,
@@ -83,25 +83,23 @@ identically false because `ftqNear` excludes negative deltas.
 | P5 | rename admission | cheap/moderate | request zero, one, or two credits independently from each freelist rather than requiring two in all three classes | keep count/commit-return logic out of a long ready loop |
 | P6 | L1I hit-under-miss | complex, FPGA-friendly if measured | one parked demand MSHR plus tagged or ordered hit responses | current `FetchRsp` is untagged and assigned to the ring head |
 | P7 | complex-instruction resume | complex, profile first | preserve already-buffered contiguous fall-through when the resume PC proves it is reusable | framing and raw-word/resume-PC correctness |
-| avoid | collapse ITLB and L1I stages | complex, FPGA-unfriendly | retain the registered T stage | recreates the route-dominated live-translation/tag-compare cone for little steady-state gain |
+| authorized | registered parallel-VIPT L1I | complex, FPGA-risk-gated | arm BRAM from virtual set in parallel with ITLB/tag lookup; register hit context; retain the response register | live ITLB-to-hit-context cone requires a fresh 250-MHz route gate |
 | avoid | wider cracked/microcode engines | complex, FPGA-unfriendly | retain current sequencing until measured hot | wide queue writes and namespaced dependent temporaries cost area/routing |
 
 ## 4. VIPT and resident-hit behavior
 
 L1I is VIPT by geometry: 64 sets times 64-byte lines fit within the 4 KiB page
 offset, the virtual PC selects the set, and the physical page number supplies the
-tag. Its resident path can accept one command per cycle, but the implementation
-does **not** launch ITLB and cache-array lookup in parallel. It registers
-`{ppn, pc}` in a translation T stage and performs the physical tag lookup/data
-BRAM arm from those registered values on the following cycle. This three-cycle
-hit pipeline is intentionally favorable to FMax and normally hidden by fetch
-run-ahead.
+tag. At the time of this audit, the implementation registered `{ppn, pc}` before
+the cache lookup and returned a resident hit in three cycles at II=1.
 
-That live behavior conflicts with the original I-cache slice document's
-parallel-lookup description. The canonical architecture must explicitly ratify
-the later registered implementation or require a new FPGA-safe parallel design.
-The audit recommends ratifying the pipeline because it is II=1 and the old live
-translation cone was a measured timing problem.
+That timing recommendation is superseded by
+`2026-08-10-icache-parallel-vipt-design.md`. The authorized two-cycle shape arms
+the synchronous BRAM from the virtual set/beat in parallel with the live
+ITLB/tag lookup, then registers only the hit context. The wide data/prediction
+mux and response register remain in the next stage. This restores canonical IF1
+parallelism without putting translation on the BRAM address or wide-data cone;
+fresh routed evidence is mandatory.
 
 The D side is different: the landed LSU launches DTLB lookup and the virtual-set
 D-cache probe from the same registered P2 token, then joins the physical tag and

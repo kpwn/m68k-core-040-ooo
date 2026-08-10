@@ -1,7 +1,7 @@
 # I-Cache Slice — Design
 
-**Status:** Historical baseline; the 2026-08-09 resident-hit pipeline addendum
-below is binding
+**Status:** Historical baseline; §13 is superseded by the binding 2026-08-10
+parallel-VIPT amendment
 **Date:** 2026-05-31
 **Parent spec:** `docs/superpowers/specs/2026-05-31-m68k-040-ooo-architecture-design.md` (ch 1 Frontend, ch 7 LSU/MMU geometry, ch 9 Caches/Bus, invariants #2 FMax / #3 plugin boundaries)
 **Slice position:** First slice of the frontend (chapter #1). Builds the L1 instruction cache datapath in isolation; the ITLB/MMU, fetch/align + instruction buffer, branch prediction, and SoC bus plumbing are later slices.
@@ -185,6 +185,12 @@ correct address/len/size). No CPU or lock-step needed — this is a self-contain
 - Single outstanding miss (no hit-under-miss) — a later IPC optimization.
 
 ## 13. Binding resident-hit pipeline addendum (2026-08-09)
+
+> **Superseded 2026-08-10:** the registered translation T-stage timing below is
+> historical. `2026-08-10-icache-parallel-vipt-design.md` now binds a two-cycle
+> resident path with parallel virtual-set BRAM read and ITLB/tag lookup. The
+> geometry, handshake, refill, and safety rationale elsewhere in this document
+> remain binding.
 
 The geometry and VIPT safety argument above remain binding: virtual
 `pc[11:6]` selects one of 64 sets, while the translated physical page number is

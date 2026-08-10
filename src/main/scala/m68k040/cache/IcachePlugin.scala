@@ -121,14 +121,15 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // wired defaults to False (user), exactly the prior hardcoded behavior — unchanged
     // for every existing non-full-core test.
     val privCtrl = host.get[PrivilegeService]
-    val activePc = UInt(32 bits)
-    // A translation is demanded only for a real offered fetch. Keeping this high
-    // while FetchAlign is idle lets an enabled ITLB launch a table walk for the
-    // unowned/irrelevant cmd payload (commonly reset PC 0), wasting walker bandwidth
-    // and potentially delaying the first architectural fetch. `cmd.ready` still reads
-    // the combinational response in the same cycle that cmd.valid is asserted.
-    xlate.req.valid      := cmdPort.valid
-    xlate.req.vpn        := activePc(31 downto 12)
+    // A translation is demanded only while the cache is actively looking at a real
+    // offered fetch. In particular, a cmd held upstream during a demand refill must
+    // not start an unowned younger walk merely because its Stream valid stays high.
+    // `lookupTick` opens this gate in IDLE and during the answerable portion of a
+    // prefetch fill; all other states keep it closed.
+    val lookupActive = Bool()
+    lookupActive := False
+    xlate.req.valid      := lookupActive && cmdPort.valid
+    xlate.req.vpn        := cmdPort.payload.pc(31 downto 12)
     xlate.req.supervisor := privCtrl.map(_.supervisor).getOrElse(False)
     xlate.req.write      := False
 
@@ -178,36 +179,15 @@ class IcachePlugin extends FiberPlugin with FetchService {
       for (w <- 0 until ways; s <- 0 until sets) pfFilled(w)(s) := False
     }
 
-    // ---- T-stage: REGISTERED ITLB translation (FMax pipeline split) ----
-    // The cmd is accepted into this stage once the ITLB has RESOLVED the translation
-    // (xlate.rsp.ready). We REGISTER the translated physical address ({ppn, pc[11:0]})
-    // + fault here, so the I-cache hit-detect below tags on the REGISTERED physical
-    // paddr (tPaddr) instead of the LIVE `xlate.rsp.ppn`. This removes the ITLB `Tlb`
-    // way-mux / walk-latch mux from the VIPT hit cone (tag-compare -> hit ->
-    // dataMem ENARDEN / s1Pred), which was the post-ITLB route-dominated limiter.
-    // VIPT: index on the page-invariant pc[11:6] set bits; tag on the registered
-    // physical bits. MMU-off (identity, ppn==pc[31:12]) flows through the SAME
-    // register so both modes are pipelined uniformly. Costs ONE translate-latency
-    // cycle on a fetch (the frontend is single-outstanding + latency-agnostic).
-    val tValid = RegInit(False)
-    val tPc    = Reg(UInt(32 bits))
-    val tPaddr = Reg(UInt(32 bits))   // {ppn, pc[11:0]} captured at translate time
-    val tFault = RegInit(False)
-    // Cache-mode attribute (MMU page CM bits / DTT-ITT window), captured alongside
-    // tPaddr/tFault at the SAME translate-time register point. An INHIBITED I-fetch
-    // must never allocate into the I-cache (device/MMIO instruction space, or a
-    // deliberately non-cacheable region — self-modifying-code / debug scenarios rely
-    // on every fetch seeing fresh memory) and must never be satisfied by a stale
-    // resident line left over from before the mapping's cache-mode attribute changed.
-    // Mirrors DcachePlugin's ldS1Cmode/missCmode (task P1.4).
-    val tCmode = Reg(CacheMode())
-
-    // Derived off the REGISTERED tCmode (same register the hit-detect cone already
-    // reads tPaddr from) — an INHIBITED fetch forces every way's hit bit low below,
-    // so a stale resident alias is bypassed rather than served, and it always falls
-    // through to the miss/REFILL path (which itself refuses to allocate — see the
-    // PREDECODE `doAllocate` gate below).
-    val tCacheable = tCmode =/= CacheMode.INHIBITED
+    // ---- live parallel-VIPT lookup context (binding amendment 2026-08-10) ----
+    // Virtual set/beat arms the synchronous BRAM in the same cycle as the ITLB lookup.
+    // Translation only qualifies the physical tag and the small S1 control context;
+    // it is deliberately NOT on the BRAM address/enable or the wide data mux.
+    val lookupPc        = cmdPort.payload.pc
+    val lookupPaddr     = (xlate.rsp.ppn ## lookupPc(11 downto 0)).asUInt
+    val lookupFault     = xlate.rsp.fault
+    val lookupCmode     = xlate.rsp.cacheMode
+    val lookupCacheable = lookupCmode =/= CacheMode.INHIBITED
 
     // ---- miss-state latches ----
     val missPC    = Reg(UInt(32 bits))
@@ -299,8 +279,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val s1Way   = Reg(UInt(wayBits bits))
     val s1Pc    = Reg(UInt(32 bits))
     val s1Fault = Reg(Bool())
-    // Task #211: which cause armed s1Fault — True = ITLB/MMU translation fault
-    // (tFault below), False = a physical AXI bus error caught in REFILL (new FAULT
+    // Task #211: which cause armed s1Fault — True = ITLB/MMU translation fault,
+    // False = a physical AXI bus error caught in REFILL (new FAULT
     // state below). Only meaningful when s1Fault is set; rides to rsp.payload.atc.
     val s1Atc   = Reg(Bool())
     val s1Lane  = Reg(UInt(2 bits))
@@ -436,36 +416,23 @@ class IcachePlugin extends FiberPlugin with FetchService {
     axi.ar.valid  := False
     axi.ar.payload.assignDontCare()
     axi.r.ready   := False
-    activePc      := cmdPort.payload.pc
 
-    // ---- hit detection (combinational, from the REGISTERED T-stage paddr) ----
-    // VIPT: index with the page-invariant pc[11:6] set bits (from the registered tPc);
-    // tag with the REGISTERED physical page number tPaddr[31:12]. The live ITLB
-    // way-mux is NOT in this cone (it was already resolved into tPaddr the prior
-    // cycle), so the tag-compare -> hit -> dataMem ENARDEN arc is route-clean.
-    val idlePc    = tPc
-    val idleSet   = idlePc(11 downto 6)
-    val idleTag   = tPaddr(31 downto 12)
+    // ---- parallel VIPT hit detection ----
+    // The page-invariant virtual set/beat independently arms the data BRAM. The live
+    // ITLB PPN participates only in the tag compare and terminates at the S1 control
+    // registers; it cannot reach the BRAM address/enable or the 256-bit data mux.
+    val lookupSet = lookupPc(11 downto 6)
+    val lookupTag = lookupPaddr(31 downto 12)
     val hitVec = Vec(Bool(), ways)
     for (w <- 0 until ways)
-      hitVec(w) := tCacheable && valids(w)(idleSet) && (tagMem(w).readAsync(idleSet) === idleTag)
+      hitVec(w) := lookupCacheable && valids(w)(lookupSet) &&
+                   (tagMem(w).readAsync(lookupSet) === lookupTag)
     val isHit       = hitVec.orR
     val hitWayIdx   = OHToUInt(hitVec)
-    val idleBeatSel = idlePc(5)
-    val idleLaneIdx = idlePc(4 downto 3)
-    val idleReadAddr  = (idleSet ## idleBeatSel).asUInt
-    val idlePredEntry = Vec(predMem.map(_.readAsync(idleSet)))
-
-    // Depth-2 pipelined accept (VARIANT 1): the cache is a flow-through 3-stage pipe
-    // (T-stage -> S1 -> rsp), each a single register that ADVANCES every cycle. The
-    // T-stage is consumed (freed) every IDLE cycle it is valid, so a NEW cmd may be
-    // accepted INTO the T-stage the SAME cycle the prior translation is consumed into
-    // S1 — i.e. ≥2 fetches in flight (T + S1 + rsp). The downstream S1/rsp never
-    // back-pressure (flow-through), so the only accept block is the FSM not being in
-    // IDLE (a refill in progress). The single-outstanding `inFlight` gate is REMOVED;
-    // accept gates ONLY on the ITLB resolve (xlate.rsp.ready) inside IDLE. The consume
-    // `tValid := False` is reordered to NOT clobber a same-cycle cmdPort.fire (see the
-    // tAccept/tConsume split below) so the back-to-back accept is not dropped.
+    val lookupBeatSel   = lookupPc(5)
+    val lookupLaneIdx   = lookupPc(4 downto 3)
+    val lookupReadAddr  = (lookupSet ## lookupBeatSel).asUInt
+    val lookupPredEntry = Vec(predMem.map(_.readAsync(lookupSet)))
 
     // DEBUG (Task P5.5 regression test, mirrors the existing simPublic DEBUG hooks
     // above): high for exactly the ONE cycle on which PREDECODE performs the
@@ -539,7 +506,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // The first version of this computed the candidate combinationally from whichever
     // address the trigger site had, and it cost 36.29 MHz post-route (207.17 -> 170.88).
     // The measured critical path was, end to end in ONE cycle:
-    //     tPaddr/tPc -> source mux -> 26-bit "+1" incrementer (CARRY8 x3)
+    //     translated source -> source mux -> 26-bit "+1" incrementer (CARRY8 x3)
     //                -> tagMem.readAsync(pfSet) (RAMD64E x2) -> 20-bit tag compare
     //                -> pfResident -> prefetchArmed -> missPC/missPA/victimWay CE + FSM goto
     // 18 logic levels, 67% route, WNS -1.852ns.
@@ -547,7 +514,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // Split into two register-to-register hops instead. The incrementer runs in the
     // cycle the SOURCE is latched (parallel to the existing hit cone, feeding only
     // registers), and the array probe + decision run off those registers later:
-    //     hop 1: idlePc(reg) -> +1 -> pfCand{Set,Tag,Pa,Ok} (registers)
+    //     hop 1: accepted lookup -> +1 -> pfCand{Set,Tag,Pa,Ok} (registers)
     //     hop 2: pfCandSet(reg) -> tagMem.readAsync -> compare -> prefetchArmed -> FSM
     // Both triggers are naturally >= 1 cycle apart from their own use anyway: the
     // demand-miss trigger latches at miss time and is consumed at REPLAY (many cycles
@@ -560,18 +527,19 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val pfCandOk     = RegInit(False)
     val pfReqPending = RegInit(False)
 
-    /** Hop 1 — latch the next-line candidate from the (registered) T-stage address.
+    /** Hop 1 — latch the next-line candidate from an accepted translated lookup.
       * Called from the demand-miss arm and the useful-prefetch-hit arm of `lookupTick`,
-      * both of which have a resolved translation in `tPaddr` for `idlePc`.
+      * both of which have a resolved translation for `lookupPc`.
       *
       * `pfCandOk` folds in P4 (same page as the source, so no page cross on a guess)
       * and P1's cacheability (same page => same descriptor => same CM bits). */
     def latchPfCand(): Unit = {
-      val nextVa = ((idlePc(31 downto 6) + 1) @@ U(0, 6 bits)).resize(32)
+      val nextVa = ((lookupPc(31 downto 6) + 1) @@ U(0, 6 bits)).resize(32)
       pfCandSet := nextVa(11 downto 6)
-      pfCandTag := tPaddr(31 downto 12)
-      pfCandPa  := tPaddr(31 downto 12) @@ nextVa(11 downto 0)
-      pfCandOk  := (nextVa(31 downto 12) === idlePc(31 downto 12)) && tCacheable && !tFault
+      pfCandTag := lookupPaddr(31 downto 12)
+      pfCandPa  := lookupPaddr(31 downto 12) @@ nextVa(11 downto 0)
+      pfCandOk  := (nextVa(31 downto 12) === lookupPc(31 downto 12)) &&
+                   lookupCacheable && !lookupFault
     }
 
     // Hop 2 — suppression + arming, entirely off registers. Never prefetch a line that
@@ -629,20 +597,11 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // DcachePlugin's REPLAY/busFaultResp handling (task #189).
       val FAULT     = new State
 
-      // ----- IDLE: T-accept (translate) + consume the REGISTERED T-stage -----
-      // Two decoupled, flow-through actions (depth-2: accept may overlap consume):
-      //
-      // (1) T-ACCEPT: present `cmdPort.pc` to the ITLB; once it has RESOLVED the
-      //     translation (xlate.rsp.ready), REGISTER {ppn,pc[11:0]} + fault into the
-      //     T-stage. MMU-off identity is always ready, so MMU-disabled fetch is
-      //     unchanged. On an ITLB MISS rsp.ready is LOW (the walker is running): we do
-      //     not accept (stall) until it resolves.
-      // (2) CONSUME: when a translated fetch is registered (tValid), tag-compare off
-      //     the REGISTERED tPaddr (the live ITLB way-mux is OUT of this cone) and
-      //     either emit a fault placeholder, arm the S1 hit read, or start a refill
-      //     from the registered physical line base. A resolved translation that FAULTS
-      //     (non-resident / supervisor I-page) is consumed as a fault placeholder
-      //     (s1Fault) WITHOUT a refill — the rsp carries fault -> DecodePacket.fault.
+      // ----- IDLE / PF lookup: parallel virtual-set BRAM + live ITLB/tag -----
+      // A resolved command is classified and accepted in one cycle. Virtual set/beat
+      // arms the BRAM independently; the live physical tag/fault/cache mode terminates
+      // only at the S1 context. A cold ITLB request or a prefetch-time cache miss is
+      // held at the Stream boundary and retried without an internal T-stage.
       //
       // ── SLICE I1: WHY THE FETCH PORT IS OPEN DURING A *PREFETCH* FILL AND NOT
       //    DURING A *DEMAND* FILL. Read this before changing `canStartFill`. ──
@@ -673,9 +632,9 @@ class IcachePlugin extends FiberPlugin with FetchService {
       //
       // The plan's I1.2 "same-line duplicate-miss suppression" and I3.2 "demotion"
       // (a demand fetch attaching to an in-flight prefetch) are both delivered by the
-      // SAME cheap mechanism the plan itself sanctions: **hold the T-stage and
-      // re-look-up.** A demand miss during a prefetch fill is not consumed and not
-      // allocated; it simply retries every cycle, and once the fill lands it HITS.
+      // SAME cheap mechanism the plan itself sanctions: **backpressure the offered
+      // Stream command and re-look-up.** A demand miss during a prefetch fill is not
+      // accepted or allocated; it remains stable and, once the fill lands, HITS.
       // Observable requirement met: N same-line fetches produce exactly ONE AR. It also
       // satisfies rules M1/M2/P2/P3 with no extra logic -- an errored fill allocates
       // nothing, so the held fetch re-looks-up, misses, and issues its OWN real
@@ -692,120 +651,69 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // tag against the OLD valid bit and could report a spurious HIT on a line whose
       // data beat is being written that same cycle. Held instead, and retried.
       def lookupTick(canStartFill: Boolean): Unit = {
-        activePc      := cmdPort.payload.pc
-        // Depth-2 accept: gate ONLY on the ITLB resolve (no single-outstanding block).
-        // The T-stage is freed every cycle it is consumed (below), so a new cmd may
-        // enter it the same cycle. NOTE: a MISS this cycle leaves IDLE (goto REFILL);
-        // the accept is still permitted (cmdPort.ready is combinational and we are
-        // still in IDLE), and the same-cycle-accepted translation is held in the
-        // T-stage and re-consumed after the refill returns to IDLE — so it is NOT lost.
-        cmdPort.ready := xlate.rsp.ready
+        lookupActive := True
 
-        // (2) Consume the registered translation FIRST (so its `tValid := False` is
-        // OVERRIDDEN by a same-cycle (1) T-accept's `tValid := True` below — the
-        // depth-2 back-to-back accept must not be dropped). The consume reads the
-        // REGISTERED tPc/tPaddr (old values), unaffected by the new accept's writes.
-        when(tValid) {
-          // FMax: arm the data-BRAM read whenever a translated fetch is present —
-          // INDEPENDENT of the hit/fault decision. The result is only CONSUMED when
-          // s1Valid is set (a real hit below), so a redundant read on a miss/fault
-          // cycle is harmless (power only). Off the registered tPaddr, so the tag-
-          // compare is no longer in the data-BRAM `ENARDEN` critical path.
-          dataReadAddr := idleReadAddr
-          dataReadEn   := True
-          // D3-SET-I (see above): under a prefetch fill, a lookup into the fill's own
-          // set is not answerable this cycle.
-          val setBlocked = if (canStartFill) False else (fillArrayWrActive && (idleSet === missSet))
-          when(!setBlocked) { tValid := False }   // consumed (a same-cycle accept re-sets it)
+        // Arm the BRAM solely from virtual page-offset bits, in parallel with the ITLB
+        // and tag lookup. Never gate this enable with hitVec/isHit: doing so would put
+        // translation and tag comparison back on the BRAM ENARDEN path. Reads for a
+        // miss/fault/held command are harmless because no S1 context consumes them.
+        val setBlocked = if (canStartFill) False
+                         else (fillArrayWrActive && (lookupSet === missSet))
+        dataReadAddr := lookupReadAddr
+        dataReadEn   := cmdPort.valid && xlate.rsp.ready && !setBlocked
 
-          // Register the RAW per-way predMem entries (way-mux + window-decode deferred
-          // to S1 keyed off s1Way). On a fault placeholder the entries are zeroed
-          // (windowPred(0) == the old getZero placeholder).
-          when(setBlocked) {
-            // HOLD: neither consume nor accept. Retried next cycle.
-            cmdPort.ready := False
-          } elsewhen(tFault) {
+        // IDLE may accept any resolved command, including the demand miss it captures.
+        // During a prefetch fill, only an answerable hit/fault may fire; a miss remains
+        // held at the Stream boundary until the shared fill engine becomes free.
+        val answerable = if (canStartFill) True else (lookupFault || isHit)
+        cmdPort.ready := xlate.rsp.ready && !setBlocked && answerable
+
+        when(cmdPort.fire) {
+          when(lookupFault) {
             // Translation fault: emit a fault response (no data, no refill).
             s1Valid := True
             s1Way   := U(0, wayBits bits)
-            s1Pc    := idlePc
+            s1Pc    := lookupPc
             s1Fault := True
-            s1Atc   := True   // ITLB/MMU-detected (task #211)
-            s1Lane  := idleLaneIdx
+            s1Atc   := True
+            s1Lane  := lookupLaneIdx
             s1PredEntries := Vec.fill(ways)(B(0, PRED_BITS_PER_LINE bits))
             s1FromMiss := False
           } elsewhen(isHit) {
-            // Hit: the data BRAM read is already armed above; latch the S1 control.
             s1Valid := True
             s1Way   := hitWayIdx
-            s1Pc    := idlePc
+            s1Pc    := lookupPc
             s1Fault := False
             s1Atc   := False
-            s1Lane  := idleLaneIdx
-            s1PredEntries := idlePredEntry
+            s1Lane  := lookupLaneIdx
+            s1PredEntries := lookupPredEntry
             s1FromMiss := False
-            // Slice I3, second trigger (design doc §6.2): the FIRST demand hit in a
-            // line that was itself prefetched is the cheap "that prefetch was useful,
-            // keep going" heuristic. Consume the bit so it fires once per prefetched
-            // line, and request the next line. `pfHitUseful` is a pure wire (no
-            // register, no synthesis cost) that a testbench counts to derive the
-            // design doc §8.3 "prefetch useful" statistic.
-            when(pfFilled(hitWayIdx)(idleSet)) {
-              pfFilled(hitWayIdx)(idleSet) := False
+
+            // The first demand hit in a prefetched line keeps the stream moving.
+            when(pfFilled(hitWayIdx)(lookupSet)) {
+              pfFilled(hitWayIdx)(lookupSet) := False
               pfHitUseful := True
               if (canStartFill) {
-                // Hop 1: latch the candidate off THIS hit's already-resolved translation
-                // (rule P1 needs a resident translation; the T-stage has one for exactly
-                // this address) and defer the start by one cycle -- see the FMax note on
-                // `pfCandSet`.
                 latchPfCand()
                 pfReqPending := True
               }
             }
           } otherwise {
-            if (canStartFill) {
-              missPC    := idlePc
-              missSet   := idleSet
-              missTag   := idleTag
-              // PHYSICAL line base for the refill: the registered translated PA =
-              // {ppn, pc[11:0]} (MMU-off identity: ppn == pc[31:12], == the VA).
-              missPA    := tPaddr
-              missCacheable := tCacheable
-              victimWay := victim(idleSet)
-              beatCnt   := U(0, 1 bits)
-              arSent    := False
-              missBusFault := False   // task #211: reset per-refill
-              missPoison   := False    // slice I1: fresh fill, not yet invalidated
-              // Hop 1 for the demand-miss trigger: the candidate is the line AFTER the
-              // one about to be filled. Consumed at REPLAY, many cycles later.
-              latchPfCand()
-              demandFillStart := True
-              goto(REFILL)
-            } else {
-              // MERGE / DEMOTION (plan I1.2 + I3.2): a demand miss arriving while a
-              // prefetch fill is in flight is HELD, not allocated and not dropped.
-              // Dropping it would lose a fetch and wedge FetchAlign's ring accounting.
-              // If it is the line being prefetched, the retry HITS once the fill lands
-              // (that is the demotion case, and it is where the prefetch pays off
-              // partially). If it is a different line, the retry allocates a normal
-              // demand fill once the prefetch completes.
-              tValid := True
-              cmdPort.ready := False
-            }
+            // Reachable only in IDLE because answerable excludes a prefetch-time miss.
+            missPC    := lookupPc
+            missSet   := lookupSet
+            missTag   := lookupTag
+            missPA    := lookupPaddr
+            missCacheable := lookupCacheable
+            victimWay := victim(lookupSet)
+            beatCnt   := U(0, 1 bits)
+            arSent    := False
+            missBusFault := False
+            missPoison   := False
+            latchPfCand()
+            demandFillStart := True
+            goto(REFILL)
           }
-        }
-
-        // (1) T-accept: register the resolved translation. Placed LAST so its
-        // `tValid := True` wins over the consume's `tValid := False` on a back-to-back
-        // accept cycle (depth-2). On a miss cycle this same-cycle accept is preserved
-        // across the refill (tValid stays True through REFILL/PREDECODE/REPLAY and is
-        // consumed on the IDLE return).
-        when(cmdPort.fire) {
-          tValid := True
-          tPc    := cmdPort.payload.pc
-          tPaddr := (xlate.rsp.ppn ## cmdPort.payload.pc(11 downto 0)).asUInt
-          tFault := xlate.rsp.fault
-          tCmode := xlate.rsp.cacheMode
         }
       }
 
@@ -839,7 +747,6 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // nothing end-to-end today anyway. Prefetch wins by starting a line's fill EARLY
       // in TIME, not by overlapping it with another transaction (§6.2).
       REFILL.whenIsActive {
-        activePc     := missPC
         refillActive := True
         when(refillDone) {
           when(refillErr) { goto(FAULT) } otherwise { goto(PREDECODE) }
@@ -875,7 +782,6 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // NOT advanced (this way was never actually filled). A PREFETCH burst error never
       // comes here (rule P2, above): it has no waiting fetch to fault.
       FAULT.whenIsActive {
-        activePc := missPC
         s1Valid := True
         s1Way   := U(0, wayBits bits)
         s1Pc    := missPC
@@ -893,7 +799,6 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // site each -- see the icache-burst-fault-fix comment there for why a SECOND call
       // site is not merely untidy but breaks SpinalHDL's MultiPortWritesSymplifier).
       PREDECODE.whenIsActive {
-        activePc  := missPC
         predActive := True
         when(commitBeat === U(1, 1 bits)) { goto(REPLAY) }
       }
@@ -913,7 +818,6 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
       // ----- REPLAY: arm S1 read for the just-filled line, then IDLE -----
       REPLAY.whenIsActive {
-        activePc := missPC
         val replayBeatSel  = missPC(5)
         val replayReadAddr = (missSet ## replayBeatSel).asUInt
         val replayPredEntry = Vec(predMem.map(_.readAsync(missSet)))
@@ -923,7 +827,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
         s1Valid := True
         s1Way   := victimWay
         s1Pc    := missPC
-        // A refill only happens for a NON-faulting translation (the T-stage fault
+        // A refill only happens for a NON-faulting translation (the live fault
         // path emits a placeholder without refilling), so the replayed line is fault-
         // free by construction — off the live ITLB rsp entirely. A bus-erroring
         // refill never reaches REPLAY (it routes to FAULT instead, task #211).
