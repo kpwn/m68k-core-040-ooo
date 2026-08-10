@@ -1,6 +1,6 @@
 package m68k040.rob
 
-import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate, GshareUpdateService, GshareUpdate, PrivilegeService, CacheControlService}
+import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate, GshareUpdateService, GshareUpdate, PrivilegeService, CacheControlService, FrontendQuiesceService}
 import m68k040.rename.RenamedUop
 import m68k040.types.CommitTrace
 import spinal.core._
@@ -19,7 +19,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   *
   * retireAlone entries (branches, for now) retire 1-wide.
   */
-class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService {
+class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService {
 
   // PrivilegeService: the wire is allocated in `setup` (BEFORE any plugin's `build`
   // runs) and driven inside `logic` (build) below, mirroring TranslationService's
@@ -38,9 +38,19 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   // cycle). Mirrors ss.cacr(31) combinationally; INERT in P1 (no consumer yet).
   private var _dcacheEnabled: Bool = null
   override def dcacheEnabled: Bool = _dcacheEnabled
+  // FrontendQuiesceService: setup-allocated for the same Fiber-cycle reason as
+  // PrivilegeService. FetchAlign consumes `next` while ROB build itself depends on
+  // rename -> decode -> FetchAlign, so exposing a build-local signal would deadlock
+  // elaboration. ROB remains the sole halt-state owner.
+  private var _frontendQuiesceActive: Bool = null
+  private var _frontendQuiesceNext: Bool = null
+  override def active: Bool = _frontendQuiesceActive
+  override def next: Bool = _frontendQuiesceNext
   during setup {
-    _supervisor    = Bool()
-    _dcacheEnabled = Bool()
+    _supervisor             = Bool()
+    _dcacheEnabled          = Bool()
+    _frontendQuiesceActive  = Bool()
+    _frontendQuiesceNext    = Bool()
   }
 
   /** One ROB entry's commit/free + trace payload. */
@@ -1213,11 +1223,25 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // STOP halts the core after its serializing retire (supervisor only; S=0 -> vector-8
     // via sysPrivFault). The interrupt entry RESUMES it: clear `stopped` when an interrupt
     // is recognized. (sysTriggerSig / interruptPending are both built above.)
-    when(sysTriggerSig && (p0.sysKind === m68k040.decode.SysKind.STOP)) {
+    val stopEnter = sysTriggerSig && (p0.sysKind === m68k040.decode.SysKind.STOP)
+    stopEnter.simPublic()
+    when(stopEnter) {
       stopped   := True
       stoppedPc := p0.predNextPc      // STOP's nextPc = the resume point (IRQ stacks this)
     }
     when(interruptPending) { stopped := False }
+
+    // Cycle-exact frontend localization. These expressions mirror the registers'
+    // actual last-assignment priorities above: interrupt clear wins over STOP set,
+    // while fatal halt is sticky. FetchAlign registers `next` on this same edge, so
+    // its local quiesce bit equals `active` after every edge without putting the
+    // remote ROB registers into the live fetch command cone.
+    val stoppedNext = (stopped || stopEnter) && !interruptPending
+    val coreHaltedNext = coreHalted || coreHaltedIn
+    _frontendQuiesceActive := stopped || coreHalted
+    _frontendQuiesceNext := stoppedNext || coreHaltedNext
+    _frontendQuiesceActive.simPublic()
+    _frontendQuiesceNext.simPublic()
 
     // ── Drive trace-exception (T0/T1) recognition (task #193) ───────────────────
     // T1/T0 are bits 7/6 of the SR SYSTEM byte (srSys(7)=T1, srSys(6)=T0 — see

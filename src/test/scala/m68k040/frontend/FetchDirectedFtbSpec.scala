@@ -4,7 +4,8 @@ import m68k040.{M68kParams, VerilatorTest}
 import m68k040.cache.{FetchCmd, FetchRsp}
 import m68k040.core.ParamPlugin
 import m68k040.isa.Size
-import m68k040.services.{BtbUpdate, BtbUpdateService, FetchService, GshareUpdateService}
+import m68k040.services.{BtbUpdate, BtbUpdateService, FetchService,
+  FrontendQuiesceService, GshareUpdateService}
 import org.scalatest.funsuite.AnyFunSuite
 import spinal.core._
 import spinal.core.sim._
@@ -58,6 +59,21 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
     }
   }
 
+  /** Test-side architectural halt owner. `activeReg` and FetchAlign's local
+    * register both capture `nextIn` on the same edge, exactly like the ROB-owned
+    * FrontendQuiesceService contract. A delayed-active frontend mutation therefore
+    * diverges for one cycle and leaks the colliding plan/command.
+    */
+  class QuiesceDriver extends FiberPlugin with FrontendQuiesceService {
+    val logic = during build new Area {
+      val nextIn = in Bool()
+      val activeReg = RegNext(nextIn) init False
+      activeReg.simPublic()
+    }
+    override def active: Bool = logic.activeReg
+    override def next: Bool = logic.nextIn
+  }
+
   /** Test-side equivalent of BackendWiringPlugin's registered internal redirect. */
   class InternalRedirectDriver extends FiberPlugin {
     val logic = during build new Area {
@@ -96,12 +112,13 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
     val ftb = new FtbPlugin(entries = 128)
     val gshare = new GsharePlugin
     val gshareUpdate = new GshareUpdateDriver
+    val quiesce = new QuiesceDriver
     val fa = new FetchAlignPlugin(enableFetchDirected = true)
     val internalRedirect = new InternalRedirectDriver
     val btbWire = new DecodeBtbWire
     val probe = new DecodeFeedProbePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](
-      new ParamPlugin(M68kParams()), fetch, update, btb, ftb, gshare, gshareUpdate,
+      new ParamPlugin(M68kParams()), fetch, update, btb, ftb, gshare, gshareUpdate, quiesce,
       fa, internalRedirect, btbWire, probe)) }
   }
 
@@ -131,6 +148,7 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
     dut.gshareUpdate.logic.valid #= false
     dut.gshareUpdate.logic.index #= 0
     dut.gshareUpdate.logic.taken #= false
+    dut.quiesce.logic.nextIn #= false
     dut.fa.logic.redirect.valid #= false
     dut.fa.logic.redirect.payload #= 0
     dut.fa.logic.resume.valid #= false
@@ -298,6 +316,108 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
         "a born-stale command produced a C+1 FTB/gshare result")
       assert(dut.fa.logic.resultStaleProof.toBoolean,
         "born-stale issue no longer matches its resident ring record")
+    }
+  }
+
+  test("first visible halt cycle blocks a live plan and accepted responses still drain", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      train(dut, cd)
+      val haltedPlanTarget = 0x1c00L
+      train(dut, cd, target = haltedPlanTarget, pc = T + 2)
+      val tr = trace(dut, cd)
+      val feeds = ArrayBuffer.empty[Long]
+      var haltedCmdFires = 0
+      var haltedFeedFires = 0
+      var haltedApplies = 0
+      var haltedPushes = 0
+      var measureHalted = false
+      cd.onSamplings {
+        if (measureHalted) {
+          if (dut.fetch.logic.cmdOut.valid.toBoolean && dut.fetch.logic.cmdOut.ready.toBoolean)
+            haltedCmdFires += 1
+          if (dut.probe.logic.feedOut.valid.toBoolean && dut.probe.logic.feedOut.ready.toBoolean)
+            haltedFeedFires += 1
+          if (dut.fa.logic.applyNow.toBoolean) haltedApplies += 1
+          if (dut.fa.logic.ftqPush.toBoolean) haltedPushes += 1
+        }
+        if (dut.probe.logic.feedOut.valid.toBoolean && dut.probe.logic.feedOut.ready.toBoolean)
+          feeds += dut.probe.logic.feedOut.payload(0).pc.toLong
+      }
+
+      dut.fetch.logic.cmdOut.ready #= true
+      dut.probe.logic.feedOut.ready #= true
+      redirect(dut, cd)
+      await(cd, 8, "source command before halt") { tr.cmds.nonEmpty }
+      assert(tr.cmds.head._2 == W, s"unexpected source stream before halt: ${tr.cmds}")
+
+      // W's registered plan selects T on the next edge. That transition-edge
+      // handshake uses the pre-edge (not-yet-halted) state and is intentionally
+      // allowed by the existing synchronous contract. It launches T's own trained
+      // plan. After the edge, architectural and local active must be equal; T's C+1
+      // result is then the live plan blocked in the first FULL halted cycle.
+      dut.quiesce.logic.nextIn #= true
+      cd.waitSampling()
+      sleep(1)
+      assert(dut.quiesce.logic.activeReg.toBoolean && dut.fa.logic.quiesce.toBoolean,
+        "architectural and frontend-local quiesce did not assert on the same edge")
+      assert(tr.cmds.map(_._2).toSeq == Seq(W, T),
+        s"halt transition did not preserve exactly the pre-halt W/T handshakes: ${tr.cmds}")
+      assert(dut.fa.logic.ftbRsp.valid.toBoolean && dut.fa.logic.gshareWindowRsp.valid.toBoolean,
+        "first full halted cycle did not contain T's live C+1 plan result")
+      assert(!dut.fa.logic.applyNow.toBoolean && !dut.fa.logic.ftqPush.toBoolean,
+        "first full halted cycle physically applied or queued T's live fetch plan")
+      assert(!dut.fetch.logic.cmdOut.valid.toBoolean,
+        "first full halted cycle left an I-cache command valid")
+      assert(!dut.probe.logic.feedOut.valid.toBoolean,
+        "first full halted cycle left decode feed valid")
+
+      measureHalted = true
+      cd.waitSampling(2)
+      measureHalted = false
+      assert(haltedCmdFires == 0 && haltedFeedFires == 0 &&
+             haltedApplies == 0 && haltedPushes == 0,
+        s"halt leaked cmd/feed/apply/push = $haltedCmdFires/$haltedFeedFires/" +
+          s"$haltedApplies/$haltedPushes")
+      assert(tr.cmds.map(_._2).toSeq == Seq(W, T),
+        s"halt leaked a command after the allowed transition-edge target: ${tr.cmds}")
+
+      // Both pre-halt I-cache requests are still owned transactions. Return them in
+      // order while halted and require both ring records to retire without feeding
+      // bytes or a fault.
+      assert(dut.fa.logic.ringCount.toInt == 2,
+        s"halt/drain setup expected two accepted records, got ${dut.fa.logic.ringCount.toInt}")
+      driveRsp(dut, cd, W, Seq(0x7001, 0x7202, 0x7403, 0x7604))
+      dut.fetch.logic.rspIn.valid #= false
+      cd.waitSampling(2)
+      assert(dut.fa.logic.ringCount.toInt == 1,
+        "first accepted pre-halt response did not retire its ring record")
+      driveRsp(dut, cd, T, Seq(0x7005, 0x7206, 0x7407, 0x7600))
+      dut.fetch.logic.rspIn.valid #= false
+      cd.waitSampling(2)
+      assert(dut.fa.logic.ringCount.toInt == 0,
+        "second accepted pre-halt response did not retire its ring record")
+      assert(feeds.isEmpty, s"pre-halt response reached decode while quiesced: $feeds")
+
+      // Wake and redirect on the same edge. The local bit clears with architectural
+      // active; the established redirect flushes any buffered pre-halt bytes. Because
+      // valid was hard-vetoed before the edge, recovery is the first later command.
+      val recovery = 0x2c00L
+      dut.quiesce.logic.nextIn #= false
+      dut.fa.logic.redirect.valid #= true
+      dut.fa.logic.redirect.payload #= recovery
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid #= false
+      sleep(1)
+      assert(!dut.quiesce.logic.activeReg.toBoolean && !dut.fa.logic.quiesce.toBoolean,
+        "architectural and frontend-local quiesce did not clear on the same edge")
+      await(cd, 8, "first post-wake recovery command") { tr.cmds.size >= 3 }
+      dut.fetch.logic.cmdOut.ready #= false
+      assert(tr.cmds(2)._2 == recovery,
+        f"first post-wake command was 0x${tr.cmds(2)._2}%x, expected 0x$recovery%x")
+      assert(!tr.cmds.exists(_._2 == haltedPlanTarget),
+        s"halted T-window FTB target escaped after wake: ${tr.cmds}")
+      assert(feeds.isEmpty, s"buffered pre-halt bytes survived the wake redirect: $feeds")
     }
   }
 

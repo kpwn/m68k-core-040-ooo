@@ -1,9 +1,10 @@
 package m68k040.frontend
 
 import m68k040.cache.{ChunkPredecode, FetchCmd, FetchRsp}
-import m68k040.services.{DecodeFeedService, FetchService,
+import m68k040.services.{DecodeFeedService, FetchService, FrontendQuiesceService,
   FtbLookupCmd, FtbLookupRsp, FtbLookupService, GshareWindowRsp, GshareWindowService}
 import spinal.core._
+import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
 
@@ -79,14 +80,34 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     mispredictRedirect.valid.allowOverride;   mispredictRedirect.valid   := False
     mispredictRedirect.payload.allowOverride; mispredictRedirect.payload := U(0, 32 bits)
 
-    // ── STOP-halt quiesce (full core): the ROB drives this high while the core is in the
-    // STOP `stopped` state. It suppresses fetch + feed (the front-end holds at the STOP
-    // successor PC the post-STOP redirect set) until the wake redirect (the IRQ-entry
-    // vector) clears it — exactly like faultHold, but it emits NO packet. Directionless,
-    // idle-defaulted with a concrete zero (allowOverride) so a DUT that does NOT wire it
-    // still elaborates (the wiring layer overrides it). ──────────────────────────────
-    val quiesce = Bool()
-    quiesce.allowOverride; quiesce := False
+    // ── STOP/fatal-halt quiesce ─────────────────────────────────────────────────
+    // The ROB remains the sole state owner. It publishes the exact combinational
+    // NEXT state through a setup-allocated service; registering that truth locally
+    // makes this bit change on the same edge as `stopped || coreHalted` while cutting
+    // the measured remote ROB -> predictor/ITLB/I-cache cone. A standalone FetchAlign
+    // fixture without a ROB service remains unquiesced.
+    val quiesceService = host.get[FrontendQuiesceService]
+    val quiesceNext = Bool()
+    val quiesceActive = Bool()
+    quiesceService match {
+      case Some(q) =>
+        quiesceNext   := q.next
+        quiesceActive := q.active
+      case None =>
+        quiesceNext   := False
+        quiesceActive := False
+    }
+    val quiesce = RegNext(quiesceNext) init False
+    quiesce.simPublic()
+    quiesceNext.simPublic()
+    quiesceActive.simPublic()
+    GenerationFlags.simulation {
+      when(!ClockDomain.current.isResetActive) {
+        assert(quiesce === quiesceActive,
+          "FetchAlign local quiesce diverged from ROB architectural halt state",
+          FAILURE)
+      }
+    }
 
     // ── Fetch-time BTB prediction interface (slice 1) ────────────────────────────
     // FetchAlign DRIVES the two per-instruction query PCs (slot0/slot1 of the aligner

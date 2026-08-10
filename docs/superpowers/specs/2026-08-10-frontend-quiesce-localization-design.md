@@ -135,15 +135,19 @@ visibility, but it is no longer a sibling-driven input and must not use
 The implementation is not accepted by static equality alone.  Tests must expose
 real command/feed handshakes and cover:
 
-1. **STOP entry:** on the first edge that makes `stopped` visible, local quiesce
-   is also true and neither `ic.cmd.fire` nor `feed.fire` occurs.
+1. **STOP entry:** local quiesce becomes visible on the same edge as `stopped`.
+   A command handshaking on that transition edge is a pre-halt transaction under
+   the existing synchronous contract and remains allowed; throughout the full
+   active cycle after the edge, no later `ic.cmd.fire` or `feed.fire` may occur.
 2. **Interrupt wake:** local quiesce clears on the same edge as `stopped`; the
    interrupt redirect target is the first later accepted fetch.
 3. **Fatal entry:** a one-cycle `coreHaltedIn` pulse makes `coreHalted` and local
    quiesce true together; neither later interrupt activity nor input deassertion
    clears either.
-4. **Live plan collision:** a valid fixed-C+1 FTB/gshare result on the halt edge
-   produces no application, FTQ push, target hold, cache command, or feed.
+4. **Live plan collision:** let the transition-edge command launch a fetch-plan
+   lookup. Its fixed-C+1 FTB/gshare result is visible during the first full halted
+   cycle and produces no application, FTQ push, target hold, later cache command,
+   or feed.
 5. **Drain while halted:** an I-cache response accepted before halt still retires
    its ring slot; no deadlock, duplicate, bytes, or synthetic fault escapes.
 6. **Backpressure:** exercise both ready-high and ready-low command postures.
@@ -151,8 +155,9 @@ real command/feed handshakes and cover:
    cycle.
 
 At least one test must fail under the deliberate mutation
-`fetchQuiesced := RegNext(service.active)` by observing the first-cycle leaked
-command/feed.  Merely testing eventual quiescence is vacuous.
+`fetchQuiesced := RegNext(service.active)` by observing the command/feed or plan
+application leaked on the edge after halt is already visible.  Merely testing
+eventual quiescence is vacuous.
 
 The focused frontend/STOP tests and mandatory
 `make SBT=~/sbt/bin/sbt test-fast` must pass before physical measurement.

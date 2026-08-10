@@ -148,11 +148,10 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     gsh.logic.shiftDir      := fa.logic.gsShiftDir
     gsh.gshareUpdate.valid   := rob.logic.gshareUpdateFlow.valid
     gsh.gshareUpdate.payload := rob.logic.gshareUpdateFlow.payload
-    // STOP-halt: while the ROB is in the `stopped` state, quiesce the front-end (hold
-    // fetch + feed at the STOP successor PC). The IRQ-entry vector redirect clears it.
-    // CORE HALT (Task P4.5): a sticky, non-interrupt-clearable variant driven from the
-    // D-cache's async diagnostic-fault channel -- ORed in here so it quiesces fetch too.
-    host[FetchAlignPlugin].logic.quiesce := rob.logic.stopped || rob.logic.coreHalted
+    // STOP/fatal frontend quiesce is now carried by the ROB-owned
+    // FrontendQuiesceService and captured at the FetchAlign boundary. There is no
+    // sibling-driven active-level wire here: all full-core/test compositions inherit
+    // the same cycle-exact contract automatically.
     eu0.issue << iq.issue(0)
     eu1.issue << iq.issue(1)
     iq.aluFastAcceptNext(0) := eu0.fastAcceptNext

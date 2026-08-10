@@ -1,6 +1,7 @@
 package m68k040.rob
 
-import m68k040.services.{RenameUopService, RenameCommitService, RobAllocService, CacheControlService}
+import m68k040.services.{RenameUopService, RenameCommitService, RobAllocService,
+  CacheControlService, FrontendQuiesceService}
 import m68k040.rename.RenamedUop
 import spinal.core._
 import spinal.core.sim._
@@ -68,5 +69,19 @@ class CacheControlSinkPlugin extends FiberPlugin {
     val cc = host[CacheControlService]
     val dcacheEnabledOut = out(Bool())
     dcacheEnabledOut := cc.dcacheEnabled
+  }
+}
+
+/** Test-only: consumes the actual ROB-owned FrontendQuiesceService and exposes
+  * both phases as named top-level outputs. This verifies the setup-allocated
+  * service boundary itself rather than reaching into the provider's private wire.
+  */
+class FrontendQuiesceSinkPlugin extends FiberPlugin {
+  val logic = during build new Area {
+    val q = host[FrontendQuiesceService]
+    val activeOut = out(Bool())
+    val nextOut = out(Bool())
+    activeOut := q.active
+    nextOut := q.next
   }
 }

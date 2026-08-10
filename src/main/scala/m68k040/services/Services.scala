@@ -38,6 +38,19 @@ trait RedirectService {
   def flushPc: UInt
 }
 
+/** ROB-owned STOP/fatal-halt state localized at the frontend boundary.
+  *
+  * `active` is the current architectural state (`stopped || coreHalted`) and is
+  * observation/assertion-only at the frontend. `next` is the exact ROB next-state
+  * truth captured by FetchAlign so its local quiesce register changes on the SAME
+  * edge as the ROB state, without the remote active bit entering the live fetch
+  * command cone. RobPlugin is the sole producer.
+  */
+trait FrontendQuiesceService {
+  def active: Bool
+  def next: Bool
+}
+
 /** Produced by the I-cache; consumed by the fetch/align stage (later). */
 trait FetchService {
   def cmd: Stream[FetchCmd]

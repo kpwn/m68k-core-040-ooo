@@ -827,8 +827,9 @@ class RobPluginSpec extends AnyFunSuite {
     val rob  = new RobPlugin
     val csink = new RenameCommitSinkPlugin
     val tsink = new CommitTraceSinkPlugin
+    val qsink = new FrontendQuiesceSinkPlugin
     db.on { host.asHostOf(Seq[FiberPlugin](
-      new ParamPlugin(M68kParams()), intCtrl, rsrc, drv, rob, csink, tsink)) }
+      new ParamPlugin(M68kParams()), intCtrl, rsrc, drv, rob, csink, tsink, qsink)) }
   }
 
   /** Mirrors RobInterruptSpec's pokeRu -- explicitly sets every field that
@@ -1165,11 +1166,18 @@ class RobPluginSpec extends AnyFunSuite {
       setGateMask(dut, cd, 0)   // mask=0 -- any ipl>0 is normally interrupt-eligible
 
       // A 1-cycle coreHaltedIn pulse must latch coreHalted permanently.
+      assert(!dut.qsink.logic.activeOut.toBoolean && !dut.qsink.logic.nextOut.toBoolean,
+        "frontend-quiesce service was not idle before fatal halt")
       dut.rob.logic.coreHaltedIn #= true
+      sleep(1)
+      assert(!dut.qsink.logic.activeOut.toBoolean && dut.qsink.logic.nextOut.toBoolean,
+        "fatal input did not appear in service.next before the latching edge")
       cd.waitSampling()
       dut.rob.logic.coreHaltedIn #= false
       cd.waitSampling()
       assert(dut.rob.logic.coreHalted.toBoolean, "coreHalted must latch after a 1-cycle coreHaltedIn pulse")
+      assert(dut.qsink.logic.activeOut.toBoolean && dut.qsink.logic.nextOut.toBoolean,
+        "frontend-quiesce service did not become/stay active with sticky fatal halt")
 
       // Alloc + complete one instruction (robId 0) -- retire-eligible in every OTHER
       // respect (same shape the sibling GateDut tests DO see retire via fireOut(0)).
@@ -1196,6 +1204,36 @@ class RobPluginSpec extends AnyFunSuite {
         assert(dut.rob.logic.coreHalted.toBoolean, "coreHalted must remain latched (not interrupt-clearable)")
         cd.waitSampling()
       }
+    }
+  }
+
+  test("frontend-quiesce service predicts STOP interrupt wake on the exact edge") {
+    M68kSim().compile(new GateDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initGate(dut, cd)
+      setGateMask(dut, cd, 0)
+
+      // Directly seed the architectural STOP state; existing lock-step coverage
+      // independently reaches it through a real STOP sysOp. This test isolates the
+      // service's current/next truth and the actual interrupt-clear priority.
+      dut.rob.logic.stopped #= true
+      cd.waitSampling()
+      assert(dut.rob.logic.stopped.toBoolean && dut.qsink.logic.activeOut.toBoolean &&
+             dut.qsink.logic.nextOut.toBoolean,
+        "seeded STOP state was not visible through both service phases")
+
+      dut.intCtrl.logic.iplIn #= 5
+      dut.intCtrl.logic.iackAvec #= true
+      sleep(1)
+      assert(dut.rob.logic.interruptPending.toBoolean,
+        "STOP wake setup did not produce a real interruptPending")
+      assert(dut.qsink.logic.activeOut.toBoolean && !dut.qsink.logic.nextOut.toBoolean,
+        "service.next did not predict interrupt-clear while active remained visible")
+
+      cd.waitSampling()
+      sleep(1)
+      assert(!dut.rob.logic.stopped.toBoolean && !dut.qsink.logic.activeOut.toBoolean,
+        "STOP and frontend-quiesce active did not clear on the predicted edge")
     }
   }
 
