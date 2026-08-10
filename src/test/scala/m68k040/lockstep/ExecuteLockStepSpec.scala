@@ -439,9 +439,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     *
     * `LockStepRunAheadGuardWords` contributes 2048 words = 4 KiB, sized generously
     * to outlast the front-end run-ahead distance inside the drain window. The latest
-    * centralized-model suite completed 390/394 with exactly the four known baseline
-    * failures; its six newly exposed LSU failures were real regressions and were fixed,
-    * rather than weakened or hidden in this harness. */
+    * centralized-model suite completed 394/394. Its six newly exposed LSU failures
+    * were real regressions and were fixed, rather than weakened or hidden in this
+    * harness; the prior four-case STOP/ITLB exception list was separately eliminated
+    * by making each bespoke test seed architectural A7 as the shared harness does. */
   def attachProgram(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long,
                     bytes: Vector[Int]): m68k040.sim.AxiMemModel =
     m68k040.sim.AxiMemModel.attachProgramIFetch(
@@ -3509,6 +3510,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.rob.logic.exc.ss.isp #= 0x00100000L
       dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       dut.rob.logic.exc.ss.srSys #= (initialSr >> 8) & 0xff
+      // This bespoke harness must obey the same boot contract as runLockStep:
+      // architectural A7 lives in the integer PRF, while ss.isp is its committed
+      // supervisor-bank shadow.  Seeding only ss.isp lets the live A7 feedback
+      // overwrite it with the reset PRF value (zero) before STOP/IRQ entry.
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
+      cd.waitSampling()
       cd.waitSampling()
       dut.fa.logic.redirect.valid   #= true
       dut.fa.logic.redirect.payload #= loadAddr
@@ -5435,6 +5446,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.ctrl.logic.srp   #= MMU_ROOT
       dut.rob.logic.exc.ss.isp #= 0x00100000L
       dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
+      // Mirror runLockStep's boot-A7 seed.  ss.isp alone is not the source of
+      // architectural A7; the committed RAT still names identity phys-15 here.
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
       cd.waitSampling()
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling(); dut.fa.logic.redirect.valid #= false
@@ -5556,6 +5574,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.ctrl.logic.srp   #= 0x80000L
       dut.rob.logic.exc.ss.isp #= 0x00100000L
       dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
       cd.waitSampling()
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling(); dut.fa.logic.redirect.valid #= false
@@ -5676,6 +5699,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.ctrl.logic.srp   #= 0x80000L
       dut.rob.logic.exc.ss.isp #= 0x00100000L
       dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
       cd.waitSampling()
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling(); dut.fa.logic.redirect.valid #= false
