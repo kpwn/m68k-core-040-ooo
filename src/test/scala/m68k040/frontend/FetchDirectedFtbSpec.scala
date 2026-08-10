@@ -58,18 +58,39 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
     }
   }
 
+  /** Production-equivalent retained decode-BTB wiring for the collision proof. */
+  class DecodeBtbWire extends FiberPlugin {
+    val logic = during build new Area {
+      val fa = host[FetchAlignPlugin]
+      val btb = host[BtbPlugin]
+      btb.logic.queryPc := fa.logic.btbQueryPc0
+      btb.logic.queryValid := fa.logic.btbQueryValid0
+      btb.logic.query2BasePc := fa.logic.btbQueryBasePc1
+      btb.logic.query2Sel := fa.logic.btbQuerySel1
+      btb.logic.query2Valid := fa.logic.btbQueryValid1
+      btb.logic.invalidateAll := False
+      fa.logic.btbPredTaken0 := btb.logic.predTakenComb
+      fa.logic.btbPredTarget0 := btb.logic.predTargetComb
+      fa.logic.btbPredTaken1 := btb.logic.predTaken2Comb
+      fa.logic.btbPredTarget1 := btb.logic.predTarget2Comb
+    }
+  }
+
   class Dut extends Component {
     val db = new Database
     val host = db on new PluginHost
     val fetch = new ControlledFetchPlugin
     val update = new UpdateDriver
+    val btb = new BtbPlugin
     val ftb = new FtbPlugin(entries = 128)
     val gshare = new GsharePlugin
     val gshareUpdate = new GshareUpdateDriver
     val fa = new FetchAlignPlugin(enableFetchDirected = true)
+    val btbWire = new DecodeBtbWire
     val probe = new DecodeFeedProbePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](
-      new ParamPlugin(M68kParams()), fetch, update, ftb, gshare, gshareUpdate, fa, probe)) }
+      new ParamPlugin(M68kParams()), fetch, update, btb, ftb, gshare, gshareUpdate,
+      fa, btbWire, probe)) }
   }
 
   private val W = 0x1000L
@@ -106,10 +127,10 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
   }
 
   private def train(dut: Dut, cd: ClockDomain, brType: Int = 1, len: Int = 1,
-                    target: Long = T): Unit = {
+                    target: Long = T, pc: Long = B): Unit = {
     val u = dut.update.logic.update
     u.valid #= true
-    u.payload.pc #= B
+    u.payload.pc #= pc
     u.payload.taken #= true
     u.payload.target #= target
     u.payload.brType #= brType
@@ -329,6 +350,83 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
         s"held target survived redirect: ${tr.cmds.take(2)}")
       assert(tr.applies == 1 && tr.pushes == 1,
         s"held plan must have applied exactly once before it was killed: ${tr.applies}/${tr.pushes}")
+    }
+  }
+
+  test("an older decode prediction kills a coincident physical FTB application", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      val olderWindow = 0x4000L
+      val youngerWindow = olderWindow + 8
+      val olderTarget = 0x5000L
+      val youngerTarget = 0x6000L
+
+      // Keep the older branch in the per-instruction BTB, but replace its window-level
+      // FTB entry with a not-taken conditional in word 1. The older-window registered
+      // FTB lookup therefore declines while decode still predicts word 0 taken. The
+      // next sequential window has the live FTB plan whose result we collide with it.
+      train(dut, cd, target = olderTarget, pc = olderWindow)
+      train(dut, cd, brType = 0, target = olderWindow + 0x100, pc = olderWindow + 2)
+      trainNotTaken(dut, cd, olderWindow + 2)
+      train(dut, cd, target = youngerTarget, pc = youngerWindow)
+
+      val tr = trace(dut, cd)
+      var collisions = 0
+      var localCycle = 0
+      val collisionTrace = ArrayBuffer.empty[String]
+      cd.onSamplings {
+        val apply = dut.fa.logic.applyNow.toBoolean
+        val predict = dut.fa.logic.predictFire.toBoolean
+        val cmdFire = dut.fetch.logic.cmdOut.valid.toBoolean && dut.fetch.logic.cmdOut.ready.toBoolean
+        val feedFire = dut.probe.logic.feedOut.valid.toBoolean && dut.probe.logic.feedOut.ready.toBoolean
+        if (apply || predict || cmdFire || feedFire)
+          collisionTrace += s"c=$localCycle apply=$apply predict=$predict " +
+            s"cmd=${if (cmdFire) f"0x${dut.fetch.logic.cmdOut.payload.pc.toLong}%x" else "-"} " +
+            s"feed=${if (feedFire) f"0x${dut.probe.logic.feedOut.payload(0).pc.toLong}%x" else "-"}"
+        if (apply && predict)
+          collisions += 1
+        localCycle += 1
+      }
+      dut.probe.logic.feedOut.ready #= true
+      dut.fetch.logic.cmdOut.ready #= true
+      dut.fa.logic.redirect.valid #= true
+      dut.fa.logic.redirect.payload #= olderWindow
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid #= false
+      await(cd, 8, "older-window command") { tr.cmds.nonEmpty }
+
+      // Land the older window and turn the freed ring slot directly into the younger
+      // command. The push invalidates p0Live at this edge; its cmd+1 result then
+      // coincides with the older branch's decode-time predictFire one cycle later.
+      dut.fetch.logic.cmdOut.ready #= true
+      driveRsp(dut, cd, olderWindow, Seq(0x6006, 0x7001, 0x7202, 0x7403))
+      dut.fetch.logic.rspIn.valid #= false
+      assert(tr.cmds.size >= 2 && tr.cmds(1)._2 == youngerWindow,
+        s"younger lookup was not launched on response turnover: ${tr.cmds}")
+      dut.fetch.logic.cmdOut.ready #= false
+
+      var collisionWait = 0
+      while (collisions != 1 && collisionWait < 8) {
+        cd.waitSampling()
+        collisionWait += 1
+      }
+      assert(collisions == 1,
+        s"decode-local FTB collision absent after 8 cycles: ${collisionTrace.mkString("; ")}")
+      cd.waitSampling()
+      assert(tr.applies == 1 && tr.pushes == 1,
+        s"the physical application was not exercised exactly once: ${tr.applies}/${tr.pushes}")
+      assert(dut.fa.logic.ftqCount.toInt == 0,
+        "decode-local redirect did not kill the coincident FTQ push")
+      assert(!dut.fa.logic.targetHoldValid.toBoolean,
+        "decode-local redirect left the coincident target hold live")
+
+      dut.fetch.logic.cmdOut.ready #= true
+      await(cd, 8, "older prediction recovery command") { tr.cmds.size >= 3 }
+      dut.fetch.logic.cmdOut.ready #= false
+      assert(tr.cmds(2)._2 == olderTarget,
+        f"younger FTB target survived: expected older target 0x$olderTarget%x, got 0x${tr.cmds(2)._2}%x")
+      assert(!tr.cmds.exists(_._2 == youngerTarget),
+        s"killed younger target escaped as a live command: ${tr.cmds}")
     }
   }
 

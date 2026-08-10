@@ -2,6 +2,16 @@ read_verilog generated/M68kFullCoreSynth.v
 read_xdc synth/clk.xdc
 synth_design -top M68kFullCoreSynth -part xcku5p-ffvb676-2-e -mode out_of_context
 opt_design
+# Preserve the optimized post-synthesis checkpoint separately from placement/routing.
+# This makes it possible to distinguish RTL depth from floorplan/route loss on every
+# physical gate instead of relying on transient messages in the Vivado console log.
+report_timing_summary -max_paths 10 -file synth/fullcore_synth_timing.rpt
+report_utilization -file synth/fullcore_synth_util.rpt
+set synth_paths [get_timing_paths -max_paths 1 -nworst 1 -setup]
+if {[llength $synth_paths] > 0} {
+  set synth_wns [get_property SLACK $synth_paths]
+  puts "POSTSYNTH_FULLCORE_WNS_NS $synth_wns"
+}
 # Front-end floorplan: co-locate DecodeStage so the decode->ring nets stay local (read after
 # opt so the cell filter sees elaborated leaves). Part of the front-end FMax stack (195->~218).
 read_xdc synth/floorplan_decode.xdc

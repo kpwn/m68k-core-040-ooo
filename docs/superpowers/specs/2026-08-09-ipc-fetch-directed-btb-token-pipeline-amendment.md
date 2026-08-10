@@ -167,8 +167,32 @@ splice until the held target is fetched.
 - `brWordOff >= ringDrop(token.slot)`;
 - the complete learned instruction lies in the window
   (`brWordOff.resize(5) + brLen.resize(5) <= 4`);
-- no redirect, quiesce, fault hold, mismatch suppression, or pending target;
+- no architectural/commit redirect, quiesce, fault hold, mismatch suppression,
+  or pending target;
 - FTQ not full (a defensive condition; §5 proves legal run-ahead cannot fill it).
+
+Decode-local redirects (`predictFire` from the retained BTB/RAS fallback and
+`ftqMismatch` from FTQ confirmation) deliberately do **not** enter the
+combinational application predicate. Both are formed after the aligner from the
+live IBuf head. Feeding either back into `applyNow`, and then through the next
+I-cache command/FTB lookup enable, creates a same-cycle decode-to-fetch control
+loop with no throughput benefit.
+
+A registered FTB result may therefore physically apply in the same cycle as one
+of those older decode-local redirects. This is a kill-after-apply collision, not
+an architectural application:
+
+- the redirect/FTQ-flush priority clears head, tail, count, and held-target state
+  at the edge;
+- every pre-redirect ring entry is marked stale;
+- any cache command accepted in the collision cycle is born stale and its
+  lookup token cannot become live;
+- the redirect PC wins the fetch/decode PC updates.
+
+At most one disposable cache command is spent on this rare collision. Correct
+prediction cadence and mismatch recovery latency are unchanged. External,
+resume, and commit redirects remain in the narrow application block predicate;
+their result-time collision contract remains "no physical application".
 
 One `applyNow` event performs exactly once:
 
@@ -258,8 +282,11 @@ Every path that currently flushes the IBuf or marks all ring entries stale also:
 
 Priority is unchanged: commit mispredict, external redirect, and complex resume
 win over fetch-plan application. A decode-time BTB/RAS prediction for an earlier
-branch also wins and flushes the younger FTQ state. FTB application itself is not
-a redirect and does not set `ringStale`.
+branch, or a decode-time FTQ mismatch, also wins at the state-update edge and
+flushes the younger FTQ state. The latter two need not suppress the physical
+`applyNow` pulse because their kill priority makes that pulse unobservable; this
+is the registered timing cut defined in §4. FTB application itself is not a
+redirect and does not set `ringStale`.
 
 I-cache invalidation, maintenance invalidation, reset, and debug/architectural
 frontend flush clear all FTB valids. A same-cycle update/invalidate collision is
@@ -294,6 +321,29 @@ The two paths to inspect explicitly are:
 1. registered FTB result → apply predicate/PC mux → I-cache command and next FTB
    address; and
 2. FTQ async head → `availEff`/slot defer → existing decode/IBuf shift loop.
+
+The live IBuf head / aligner / decode-local redirect cone must terminate in the
+redirect state flops. It must not feed `applyNow`, `ic.cmd.fire`, the FTB/gshare
+lookup enables, or fetch-ring metadata write enables in the same cycle.
+
+The first recovery route removed that live decode-to-application feedback and
+moved the limiting family to FTQ mismatch recovery. At the same 4-ns constraint,
+the exact final result improved from WNS -4.303 ns / 120.438 MHz to WNS
+-2.880 ns / 145.349 MHz. TNS is -38,062.918 ns across 49,340 failing setup
+endpoints; hold is clean at WHS +0.014 ns. The new worst path is the asynchronous
+FTQ head through mismatch classification into `fetchPc` (6.861-ns data delay,
+29 logic levels, 69% routing), with sibling endpoints in FTB valid clears. This
+is evidence for a second registered mismatch-recovery boundary, not for putting
+the decode-local application feedback back.
+
+Area remains a healthy review result rather than a rejection trigger: 111,786
+CLB LUTs (51.52%; 102,889 logic and 8,897 LUTRAM), 50,396 registers (11.61%),
+26 BRAM tiles (5.42%), and four DSP48E2s (0.22%). Compared with the immediately
+preceding final-functional route, this cut is +2,228 logic LUTs, unchanged
+LUTRAM, -104 registers, unchanged BRAM, and unchanged DSP. The implementation
+flow now emits an explicit optimized post-synthesis timing/utilization report
+before applying either pblock so the next pass can separate RTL depth from
+floorplan/route loss.
 
 The current branch's floorplanned route is a hard prerequisite. The checkpoint
 completed at 173.430 MHz (WNS -1.766 ns at the 4-ns constraint), below the

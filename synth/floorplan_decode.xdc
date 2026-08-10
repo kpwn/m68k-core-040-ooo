@@ -27,4 +27,3 @@
 create_pblock pb_decode
 resize_pblock pb_decode -add {SLICE_X36Y0:SLICE_X87Y104}
 add_cells_to_pblock pb_decode [get_cells -hier -filter {NAME =~ *DecodeStage_logic*}]
-puts "FLOORPLAN pb_decode cells: [llength [get_cells -of_objects [get_pblocks pb_decode]]]"

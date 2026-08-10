@@ -289,6 +289,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     val predictFire = Bool()
     predictFire.allowOverride
     predictFire := False   // default; overridden below (driven after the aligner/BTB lookup)
+    spinal.core.sim.SimPublic(predictFire)
 
     // Any fetch-redirect this cycle (external redirect, complex-resume, commit mispredict,
     // OR a fetch-time prediction). A fetch issued THIS cycle used the pre-redirect fetchPc
@@ -312,7 +313,17 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     val resultInWindow = (ftbRsp.payload.brLen =/= 0) && (resultEnd <= U(4, 5 bits))
     val resultAfterDrop = ftbRsp.payload.brWordOff >= ringDrop(resultSlot)
     val ftbCandidate = resultTokensMatch && resultSeqLive && ftbRsp.payload.hit
-    val ftbBlocked = redirectThisCycle || quiesce || stalled || faultHold ||
+    // FMax recovery: keep the live IBuf/aligner cone out of the registered-result
+    // application and next-fetch command enables. `predictFire` and `ftqMismatch` are
+    // decode-local, late decisions; feeding them through ftbBlocked -> applyNow ->
+    // ic.cmd.fire created a 28-level 8.2 ns path from head predecode state into the
+    // fetch ring, I-cache, FTB, gshare, and ITLB register enables. A coincident physical
+    // application is harmless: both late decisions drive ftqFlush with last assignment
+    // priority, mark every old ring entry stale, and make a same-cycle command born
+    // stale. External/resume/commit redirects remain here because they are shallow and
+    // retain the stronger no-physical-application collision contract.
+    val ftbBlocked = redirect.valid || (resume.valid && stalled) ||
+                     mispredictRedirect.valid || quiesce || stalled || faultHold ||
                      ftbSuppress || targetHoldValid || ftqFull
     val ftbDeclineDirection = ftbCandidate && !resultDirection
     val ftbDeclineFraming = ftbCandidate && resultDirection &&
@@ -367,6 +378,11 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // ring window and appends its target without invalidating any older bytes.
     ftqFlush := redirect.valid || (resume.valid && stalled) ||
                 mispredictRedirect.valid || predictFire || ftqMismatch
+
+    when(applyNow && (predictFire || ftqMismatch)) {
+      assert(ftqFlush && redirectThisCycle,
+        "decode-local FTB collision must be killed by redirect/FTQ-flush priority")
+    }
 
     // ---- FetchControl: issue fetches (DEPTH-3 multi-outstanding, ANGLE D) ----
     // Issue while the ring has a free slot — up to 3 in flight. A non-fault response
