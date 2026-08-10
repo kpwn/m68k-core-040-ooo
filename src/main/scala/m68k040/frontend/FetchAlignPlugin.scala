@@ -291,20 +291,24 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     ibuf.io.shift        := 0
     ibuf.io.flush        := False
 
-    // A predicted-taken BTB redirect fires this cycle (forward-declared; driven below
-    // after the aligner + BTB lookup). Like the architectural redirects, a fetch issued
-    // the SAME cycle used the pre-redirect fetchPc and MUST be born stale — otherwise it
-    // fetches the (now wrong-path) sequential window and enqueues garbage that is NEVER
-    // squashed (a correctly-predicted branch does NOT flush the downstream). This was the
-    // staleness bug: predictFire was missing from redirectThisCycle.
-    val predictFire = Bool()
-    predictFire.allowOverride
-    predictFire := False   // default; overridden below (driven after the aligner/BTB lookup)
-    spinal.core.sim.SimPublic(predictFire)
+    // The live decode-time BTB/RAS decision terminates here. `predictDetect` is driven
+    // after the aligner; it may only capture the target. The registered one-cycle
+    // `predictFire` action owns fetch/ring/FTQ controls, cutting the measured
+    // DecodeStage -> fallback -> ITLB CAM -> I-cache-enable timing family without
+    // delaying the target command: a detect in C may issue the captured target in C+1.
+    val predictDetect = Bool()
+    predictDetect.allowOverride
+    predictDetect := False
+    val predictTargetReg = Reg(UInt(32 bits)) init 0
+    val predictPending = Reg(Bool()) init False
+    predictPending := False
+    val predictFire = predictPending
+    spinal.core.sim.SimPublic(predictDetect, predictPending, predictTargetReg, predictFire)
 
-    // Any fetch-redirect this cycle (external redirect, complex-resume, commit mispredict,
-    // OR a fetch-time prediction). A fetch issued THIS cycle used the pre-redirect fetchPc
-    // -> born stale. (mispredictRedirect/redirect/resume declared above; resume only when stalled.)
+    // Any redirect-like ACTION this cycle. Architectural redirects still issue the old
+    // sequential command and make it born stale. The registered fallback action instead
+    // selects its captured target at the command mux; its ring entry is re-marked live
+    // after the common born-stale assignment below.
     val redirectThisCycle = redirect.valid || (resume.valid && stalled) ||
                             mispredictRedirect.valid || predictFire || ftqMismatch
 
@@ -326,13 +330,13 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     val ftbCandidate = resultTokensMatch && resultSeqLive && ftbRsp.payload.hit
     // FMax recovery: keep the live IBuf/aligner cone out of the registered-result
     // application and next-fetch command enables. `predictFire` and `ftqMismatch` are
-    // decode-local, late decisions; feeding them through ftbBlocked -> applyNow ->
-    // ic.cmd.fire created a 28-level 8.2 ns path from head predecode state into the
-    // fetch ring, I-cache, FTB, gshare, and ITLB register enables. A coincident physical
-    // application is harmless: both late decisions drive ftqFlush with last assignment
-    // priority, mark every old ring entry stale, and make a same-cycle command born
-    // stale. External/resume/commit redirects remain here because they are shallow and
-    // retain the stronger no-physical-application collision contract.
+    // now registered actions; before that retiming their decode-local decisions fed
+    // ftbBlocked -> applyNow -> ic.cmd.fire and created a 28-level 8.2 ns path from head
+    // predecode state into the fetch ring, I-cache, FTB, gshare, and ITLB enables. A
+    // coincident physical application is harmless: either registered action drives
+    // ftqFlush with last-assignment priority and invalidates the older plan. External,
+    // resume, and commit redirects remain here because they are shallow and retain the
+    // stronger no-physical-application collision contract.
     val ftbBlocked = redirect.valid || (resume.valid && stalled) ||
                      mispredictRedirect.valid || quiesce || stalled || faultHold ||
                      ftbSuppress || targetHoldValid || ftqFull
@@ -427,11 +431,17 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     val fullRingTurnover = ic.rsp.valid && !ic.rsp.payload.fault
     val ringSlotAvailable = !ringFull || fullRingTurnover
     val directTargetPc = ftbRsp.payload.target(31 downto 3) @@ U(0, 3 bits)
-    val cmdWindowPc = Mux(targetHoldValid, targetHoldPc,
-                      Mux(applyNow, directTargetPc, fetchPc))
-    val cmdDrop = Mux(targetHoldValid, targetHoldDrop,
-                  Mux(applyNow, ftbRsp.payload.target(2 downto 1), pendingDrop))
-    ic.cmd.valid      := started && ringSlotAvailable && ibufRoomForIssue &&
+    val predictWindowPc = predictTargetReg(31 downto 3) @@ U(0, 3 bits)
+    val cmdWindowPc = Mux(predictFire, predictWindowPc,
+                      Mux(targetHoldValid, targetHoldPc,
+                      Mux(applyNow, directTargetPc, fetchPc)))
+    val cmdDrop = Mux(predictFire, predictTargetReg(2 downto 1),
+                  Mux(targetHoldValid, targetHoldDrop,
+                  Mux(applyNow, ftbRsp.payload.target(2 downto 1), pendingDrop)))
+    // The action flushes the old IBuf on this edge, so its old occupancy must not block
+    // the C+1 target command. Ring capacity remains physical and is never bypassed.
+    val ibufRoomForCmd = ibufRoomForIssue || predictFire
+    ic.cmd.valid      := started && ringSlotAvailable && ibufRoomForCmd &&
                          !stalled && !faultHold && !quiesce && !ftqMismatch
     ic.cmd.payload.pc := cmdWindowPc
 
@@ -482,7 +492,10 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
 
     // The response belongs to the HEAD ring entry (in-order pipeline). Its OWN
     // stale/drop govern discard + leading-word drop.
-    val rspStaleHead = ringStale(ringHead)
+    // A response consumed in the registered fallback action cycle still observes the
+    // pre-edge stale bit. Kill it explicitly; the newly issued target cannot return for
+    // three cycles and is re-marked live below.
+    val rspStaleHead = ringStale(ringHead) || predictFire
     val rspDropHead  = ringDrop(ringHead)
 
     // A fault response (not stale): latch the fault + the faulting fetch PC and stop
@@ -656,8 +669,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     //   (a) stamp predTaken/predTarget on that slot's DecodePacket (rides to the EU),
     //   (b) SUPPRESS everything after it in the window (slot1 after a predicted slot0 is
     //       wrong-path),
-    //   (c) on feed.fire redirect fetch to predTarget (predictFire, below) — reusing the
-    //       redirect machinery, at priority BELOW commit/external/resume.
+    //   (c) on feed.fire capture predTarget, then run the registered fallback action in
+    //       C+1 at priority BELOW commit/external/resume.
     // Architectural correctness does NOT depend on the prediction being right: the
     // branch EU verifies predicted-vs-actual + the commit-time redirect recovers a
     // mispredict. A correct prediction simply avoids the squash.
@@ -757,8 +770,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // (slice 1). Returns + BTB hits are mutually exclusive (slice 1 never learns a
     // return), so this is a clean either/or. The composed predicted-taken + target
     // drive the SAME slice-1 machinery: slot1 suppression, predTaken/predTarget
-    // stamping, the effShift consume, and predictFire/redirect — so a RAS-predicted
-    // return is a predicted-taken redirect identical to a BTB taken branch.
+    // stamping, the effShift consume, and the registered fallback action — so a
+    // RAS-predicted return redirects identically to a BTB taken branch.
     val slot0Predicted    = slot0IsPred || rasPredictSlot0
     val predictedThisEmit = slot0Predicted && !ftqConfirm
     val predTargetSel     = Mux(rasPredictSlot0, rasPredTarget, btbPredTarget0)
@@ -819,7 +832,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     }
     // Gate feed low while STOP-quiesced so no buffered successor word is dispatched /
     // allocated into the ROB while halted (the quiesce only ends on the wake redirect).
-    feed.valid      := res.slot0Valid && !stalled && !quiesce && !ftqPast && !ftqMismatch
+    feed.valid      := res.slot0Valid && !stalled && !quiesce && !ftqPast &&
+                       !ftqMismatch && !predictFire
     // I-fetch fault: once decode has drained everything legitimately buffered ahead
     // of the fault (no more aligned instruction available -> !res.slot0Valid), AND
     // we're not mid-complex-stall/quiesce (waiting on an earlier, unrelated resume),
@@ -831,7 +845,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // keep draining normally instead of being squashed the instant the fault response
     // lands (up to RING windows before decode actually reaches it).
     val emittingFaultPacket = faultHold && !res.slot0Valid && !stalled && !quiesce &&
-                              !ftqStarvedOrPast && !ftqMismatch
+                              !ftqStarvedOrPast && !ftqMismatch && !predictFire
     when(emittingFaultPacket) {
       feed.valid             := !faultEmitted
       slot1ValidOut          := False
@@ -906,9 +920,32 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       ftqMismatchPcReg := ftqMismatchDetectPc
       ftqMismatchBrPcReg := ftqHeadE.brPc
     }
+    // A live fallback may only fill the action register. Architectural redirects and
+    // a malformed FTB claim on this detector edge cancel it; those actions already
+    // discard or replace the speculative stream.
+    predictDetect := feed.fire && !faultHold && predictedThisEmit
+    when(predictDetect) {
+      predictPending := True
+      predictTargetReg := predTargetSel
+    }
+    val predictDetectBlocked = redirect.valid || (resume.valid && stalled) ||
+                               mispredictRedirect.valid || ftqMismatchDetect
+    when(predictDetectBlocked) {
+      predictPending := False
+    }
+    val predictDetectKept = predictDetect && !predictDetectBlocked
+    val predictDetectKeptD = RegNext(predictDetectKept) init False
+    when(predictFire) {
+      assert(predictDetectKeptD,
+        "registered fallback action lost its exact detector association")
+    }
+    when(predictDetectKeptD) {
+      assert(predictFire,
+        "accepted fallback detector did not produce its C+1 action")
+    }
     // An architectural redirect on the detector edge already discards the malformed
-    // plan, so it cancels the pending action. A fallback predictFire deliberately does
-    // not: the offending FTB entry still has to be cleared on the next cycle.
+    // plan, so it cancels the pending action. A same-cycle fallback detector is itself
+    // canceled above: the registered mismatch action owns the next cycle.
     when(redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid) {
       ftqMismatchPending := False
     }
@@ -947,7 +984,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
 
     // ── gshare GHR speculative shift (slice 3) ──────────────────────────────────
     // Shift the GHR on the emitted slot0 predicted CONDITIONAL (taken OR not — gated on
-    // condBtbHit0, NOT predictFire which is taken-only), with the predicted direction bit.
+    // condBtbHit0, not the taken-only fallback detector/action), with the predicted bit.
     // We shift for slot0 only: a slot1-predicted-TAKEN conditional is deferred to slot0
     // next cycle (slot1WouldPred); a slot1 not-taken conditional that co-emits with slot0
     // simply loses its GHR bit (accept-corruption — its carried phtIndex still trains the
@@ -962,40 +999,38 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // ── RAS push/pop bookkeeping (slice 2) ───────────────────────────────────────
     // On the cycle the emitted slot0 fires (NOT a faulted packet): a call pushes its
     // return PC; a (predicted) return pops. push XOR pop (a call XOR a return). The
-    // pop only fires when the RAS predicted (count>0); an empty-RAS return does not
-    // pop (it stays unpredicted, exactly as today). A predicted return ALSO drives the
-    // fetch redirect (predictFire below), so it is folded into redirectThisCycle — a
-    // same-cycle in-flight fetch is born stale (the slice-1 staleness-bug class). The
-    // EU always verifies the real return target, so a wrong RAS guess recovers via the
-    // existing commit-time redirect (a corrupt RAS is only a perf loss).
+    // pop only fires when the RAS predicted (count>0); an empty-RAS return does not pop.
+    // A predicted return also fills the fallback target register on this edge; the C+1
+    // action invalidates every old in-flight window while issuing the captured target.
+    // The EU always verifies the real return target, so a wrong RAS guess recovers via
+    // the existing commit-time redirect (a corrupt RAS is only a perf loss).
     rasPushValid := feed.fire && !faultHold && s0IsCall
     rasPushRetPc := s0RetPc
     rasPopValid  := feed.fire && !faultHold && rasPredictSlot0
 
-    // ── predict redirect (BTB hit, slice 1) — BELOW commit/external/resume ────────
-    // When a predicted-taken branch was emitted this cycle (feed.fire), redirect fetch
-    // to the predicted target — exactly like an external redirect (decodePc/fetchPc/
-    // pendingDrop/recStale). Placed AFTER the normal decodePc advance (so it overrides
-    // it) but BEFORE the external/resume/mispredict redirects (so an architectural
-    // redirect coincident with a prediction always wins). When slot0 is the predicted
-    // branch, slot1 was suppressed above (slot1Valid:=False); when slot1 is the
-    // predicted branch, both slots emitted and we redirect after slot1.
-    predictFire := feed.fire && !faultHold && predictedThisEmit
+    // ── registered fallback action (BTB/RAS hit) — below architectural redirects ──
+    // `predictDetect` captured the target when the branch fired in C. In C+1 this
+    // registered action blocks decode, flushes old bytes/state, and may issue the target
+    // command immediately. Thus the cache command remains C+1 while no live decode term
+    // reaches the ITLB/cache/ring enables.
     when(predictFire) {
-      val newPc   = predTargetSel
+      val newPc   = predictTargetReg
+      val newBase = predictWindowPc
+      val actionWins = !(redirect.valid || (resume.valid && stalled) ||
+                         mispredictRedirect.valid || ftqMismatch)
       decodePc    := newPc
-      fetchPc     := newPc(31 downto 3) @@ U(0, 3 bits)
+      fetchPc     := Mux(ic.cmd.fire && actionWins, newBase + 8, newBase)
       ibuf.io.flush  := True
       stalled        := False
       started        := True
-      pendingDrop    := newPc(2 downto 1)
-      // Mark the in-flight fetch (if any) stale — the speculative target window
-      // supersedes it (the same recStale discipline the architectural redirects use).
-      // Depth-2: mark ALL ring entries stale — every fetch issued before this redirect
-      // (and one issued THIS cycle, born stale via redirectThisCycle) is wrong-path; its
-      // response must be discarded. Free slots' stale bits are don't-care (overwritten at
-      // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
+      pendingDrop    := Mux(ic.cmd.fire && actionWins, U(0, 2 bits), newPc(2 downto 1))
+      // Every pre-action request is wrong-path. The target command issued in this action
+      // cycle used the captured PC, so make its newly allocated tail record live after
+      // the blanket stale assignment. A higher-priority redirect leaves it stale.
       ringStale.foreach(_ := True)
+      when(ic.cmd.fire && actionWins) {
+        ringStale(ringTail) := False
+      }
     }
 
     // Wrong framing claim: restart sequentially at the first not-yet-emitted PC (or the

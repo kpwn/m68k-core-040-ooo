@@ -1,8 +1,8 @@
 # Fetch-directed FTB registered-token pipeline — binding amendment
 
-Date: 2026-08-09. Status: **REGISTERED-TOKEN RTL IMPLEMENTED AND SIMULATION
-GATED; COMPLETE CORPUS AND FLOORPLANNED PHYSICAL ACCEPTANCE PENDING (250-MHz
-GOAL, 200-MHz HARD FLOOR).**
+Date: 2026-08-09. Status: **REGISTERED-TOKEN AND REGISTERED-FALLBACK RTL
+IMPLEMENTED AND SIMULATION GATED; COMPLETE CORPUS AND FLOORPLANNED PHYSICAL
+ACCEPTANCE PENDING (250-MHz GOAL, 200-MHz HARD FLOOR).**
 
 This document is the binding correction to
 `2026-08-09-ipc-fetch-directed-btb-design.md`. It supersedes that document's
@@ -288,6 +288,50 @@ target fetch issued in the intervening cycle. Higher-priority architectural
 redirects coincident with the registered action still win the final PC and clear
 one-shot suppression.
 
+### Registered decode-fallback action
+
+Physical checkpoints 2 and X103 prove that the remaining live
+`DecodeStage.ucPendValid -> fallback prediction -> ITLB CAM -> issFire` family
+must terminate at a register. This boundary changes control timing, not target
+command timing. For a fallback BTB/RAS prediction detected while the branch
+packet fires in cycle C:
+
+- cycle C captures only `{target,drop}` and a one-cycle pending bit. GHR/RAS
+  bookkeeping remains associated with the branch's real `feed.fire` in C;
+- cycle C may issue its ordinary sequential I-cache command. It is recorded in
+  the ring normally, then made stale by the registered action before its
+  three-cycle cache response can be consumed;
+- cycle C+1 blocks decode feed, flushes the old IBuf and FTQ, marks every
+  pre-action ring entry stale, and selects the captured target directly as the
+  I-cache command candidate;
+- the target command is therefore still permitted to fire in C+1, exactly the
+  same command cycle as the old immediate state-update implementation. The
+  action supplies registered IBuf-room credit because the IBuf is flushed on
+  that edge; it does not invent ring credit or bypass a full outstanding ring;
+- if the command fires, the newly allocated target ring entry is explicitly
+  marked live after the blanket stale operation, `fetchPc` advances to
+  `alignedTarget + 8`, and `pendingDrop` clears. If it cannot fire, `fetchPc`
+  remains `alignedTarget` and the captured drop is retained for the later
+  command. No second target-hold structure is required;
+- an I-cache response observed in the action cycle is killed explicitly even
+  though its ring stale bit changes only at the edge. This is mandatory for an
+  older fault response as well as ordinary data.
+
+The pending action is not installed when an external/resume/commit redirect or
+registered FTQ-mismatch detector wins cycle C. If one of those higher-priority
+actions arrives in C+1, the fallback target command may be physically issued
+but is born stale; it must not be re-marked live, and the higher-priority PC,
+flush, and suppression state win. A coincident registered FTB `applyNow` is
+allowed to pulse but is killed by the fallback FTQ flush, and the C+1 command
+multiplexer prioritizes the captured fallback target over that younger physical
+result.
+
+This design removes all live decode/predecode terms from I-cache valid/address,
+ITLB lookup, FTB/gshare lookup, and ring write enables. Only the small registered
+pending bit and captured target/drop reach those controls. It adds roughly 35
+FFs and shallow selection/gating; it adds no predictor RAM, CAM, cache port, or
+latency to the fetch-directed II=1 path.
+
 ### SMC fault model
 
 Phase 1 retains the existing architectural self-modifying-code contract:
@@ -309,11 +353,13 @@ Every path that currently flushes the IBuf or marks all ring entries stale also:
 
 Priority is unchanged: commit mispredict, external redirect, and complex resume
 win over fetch-plan application. A decode-time BTB/RAS prediction for an earlier
-branch wins at its state-update edge. An FTQ mismatch detector first captures a
-recovery token; its registered action wins on the following edge and flushes the
-younger FTQ state. Neither decode-local action must suppress the physical
-`applyNow` pulse because its kill priority makes that pulse unobservable. FTB
-application itself is not a redirect and does not set `ringStale`.
+branch captures a registered action; that action wins at C+1 unless one of those
+architectural actions or a registered FTQ-mismatch recovery is active. An FTQ
+mismatch detector first captures a recovery token; its registered action wins on
+the following edge and flushes the younger FTQ state. Neither decode-local
+action must suppress the physical `applyNow` pulse because its kill priority
+makes that pulse unobservable. FTB application itself is not a redirect and
+does not set `ringStale`.
 
 I-cache invalidation, maintenance invalidation, reset, and debug/architectural
 frontend flush clear all FTB valids. A same-cycle update/invalidate collision is
@@ -386,11 +432,14 @@ The mismatch family is gone from the top census. The new worst path is
 21 levels, and 67% route. It crosses the right edge of `pb_decode` (X87) and
 lands around X99--X103. The routed region is 96.78% occupied (5,284/5,460 CLBs).
 `pb_dcache` remains structurally over-subscribed: 5,910 parent-assigned CLBs for
-5,460 sites and 6,422 in-region CLBs (117.62%). The next controlled experiment
-must therefore expand/rebalance both right edges on this exact netlist before
-charging another architectural latency cycle. If floorplan relief is
-insufficient, the measured fallback-prediction action is the next registered
-boundary; the II=1 fetch-directed path remains unchanged.
+5,460 sites and 6,422 in-region CLBs (117.62%). A paired exact-netlist expansion
+of both right edges to X103 reduced decode occupancy to 93.60% and D-cache
+occupancy to 102.30%, but regressed route WNS to -2.558 ns / 152.486 MHz. The
+worst path remained the same 21-level family and grew to 6.456 ns with 70.3%
+route. X103 is therefore rejected. A saved-checkpoint no-floorplan control is
+the remaining placement diagnostic; regardless of that geometry result, the
+measured fallback-prediction action above is now the selected RTL boundary. The
+II=1 fetch-directed path and its C+1 target command remain unchanged.
 
 The current branch's floorplanned route is a hard prerequisite. The checkpoint
 completed at 173.430 MHz (WNS -1.766 ns at the 4-ns constraint), below the
@@ -433,7 +482,13 @@ no error was observed.
    C+1 and with the captured recovery/clear PCs unchanged by the live FTQ head.
 7. **Fallback.** FTB miss, direct-map collision, second branch, cross-window
    branch, FTQ defensive-full, and return all exercise the existing slot-0/slot-1
-   BTB/gshare/RAS behavior. Application-disabled cycles remain baseline-identical.
+   BTB/gshare/RAS behavior. For every taken fallback, require branch feed/detect
+   in C, exactly one registered action in C+1, no decode feed in C+1, and target
+   command fire in C+1 when ring/cache ready. Prove the C sequential command and
+   any C+1 old response are stale, while the C+1 target slot is live and returns
+   exactly once. Hold ring/cache backpressure and prove the captured target/drop
+   remain exact with no duplicate command. Application-disabled cycles remain
+   baseline-identical.
 8. **Architectural oracle.** Compare retired macro PC/op/register/memory traces,
    not speculative feed PCs, after correct prediction and every mismatch class.
 9. **Performance.** Paired pinned-seed ideal and `l2:5:70` IPC, per kernel first;
@@ -444,3 +499,20 @@ no error was observed.
 
 `make SBT=~/sbt/bin/sbt test-fast` remains mandatory before every handoff. Full
 Verilator/corpus and Vivado runs remain PM-serialized.
+
+Implementation evidence for the registered fallback boundary:
+
+- `FetchDirectedFtbSpec`: 11/11, including exact detector C/action C+1,
+  action-cycle target command, unaligned drop, coincident physical application,
+  old-response kill, live target response, and stable exact target/drop through
+  cache-command backpressure;
+- mutation-sensitive collision bookkeeping checks the registered FTQ state only
+  after the action edge rather than weakening the flush requirement; and
+- mandatory `make SBT=~/sbt/bin/sbt test-fast`: 147/147 tests across 154 suites.
+- pinned seed-1 `branchy`, `hot-loop`, and `call-return` are cycle-, event-, and
+  IPC-identical to the pre-retime final checkpoint under both ideal and
+  `l2:5:70` memory.
+
+The fresh generated-netlist synthesis and floorplanned route remain the physical
+acceptance gate; the saved-checkpoint X87/X103/no-floorplan comparison describes
+the pre-fallback placement baseline only.

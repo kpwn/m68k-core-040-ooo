@@ -327,11 +327,15 @@ standalone interrupt tests no longer fail elaboration and retry first.
    `pb_dcache` has 5,910 assigned CLBs for 5,460 sites (117.62% physical
    occupancy). An area breach remains a review checkpoint, not an automatic
    rollback.
-3. Continue the active endpoint/floorplan recovery. First pair a right-edge
-   pblock expansion on the identical netlist; if insufficient, register the
-   measured decode fallback-prediction action without delaying its C+1 target
-   command. The optimization goal remains 250 MHz and the deployment floor
-   remains 200 MHz.
+3. Continue the active endpoint/floorplan recovery. The paired X103 right-edge
+   expansion is rejected: it reduced regional pressure but regressed WNS to
+   -2.558 ns / 152.486 MHz on the identical netlist. Route the saved checkpoint
+   once without either soft pblock, then select X87/no-floorplan/split geometry
+   from measured timing. The measured decode fallback-prediction action is now
+   registered without delaying its C+1 target command; its focused suite is
+   11/11 and the mandatory gate is 147/147 across 154 suites. Generate and route
+   that fresh netlist after the placement control. The optimization goal remains
+   250 MHz and the deployment floor remains 200 MHz.
 4. Measure D-cache miss occupancy and legacy CPLX/divide mix on representative
    workloads. The changed-VPN and COPYBACK-hit counters should now confirm their
    landed II=1 behavior rather than select whether to implement it.

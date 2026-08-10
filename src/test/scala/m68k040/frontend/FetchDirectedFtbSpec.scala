@@ -372,19 +372,29 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
 
       val tr = trace(dut, cd)
       var collisions = 0
+      var detectCycle = -1
+      var actionCycle = -1
+      var actionFeedFires = 0
       var localCycle = 0
       val collisionTrace = ArrayBuffer.empty[String]
       cd.onSamplings {
         val apply = dut.fa.logic.applyNow.toBoolean
-        val predict = dut.fa.logic.predictFire.toBoolean
+        val detect = dut.fa.logic.predictDetect.toBoolean
+        val action = dut.fa.logic.predictFire.toBoolean
         val cmdFire = dut.fetch.logic.cmdOut.valid.toBoolean && dut.fetch.logic.cmdOut.ready.toBoolean
         val feedFire = dut.probe.logic.feedOut.valid.toBoolean && dut.probe.logic.feedOut.ready.toBoolean
-        if (apply || predict || cmdFire || feedFire)
-          collisionTrace += s"c=$localCycle apply=$apply predict=$predict " +
+        if (apply || detect || action || cmdFire || feedFire)
+          collisionTrace += s"c=$localCycle apply=$apply detect=$detect action=$action " +
             s"cmd=${if (cmdFire) f"0x${dut.fetch.logic.cmdOut.payload.pc.toLong}%x" else "-"} " +
             s"feed=${if (feedFire) f"0x${dut.probe.logic.feedOut.payload(0).pc.toLong}%x" else "-"}"
-        if (apply && predict)
+        if (apply && detect) {
           collisions += 1
+          detectCycle = localCycle
+        }
+        if (action) {
+          actionCycle = localCycle
+          if (feedFire) actionFeedFires += 1
+        }
         localCycle += 1
       }
       dut.probe.logic.feedOut.ready #= true
@@ -397,7 +407,8 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
 
       // Land the older window and turn the freed ring slot directly into the younger
       // command. The push invalidates p0Live at this edge; its cmd+1 result then
-      // coincides with the older branch's decode-time predictFire one cycle later.
+      // coincides with the older branch's decode-time detector one cycle later. The
+      // registered action must kill that physical application at C+1.
       dut.fetch.logic.cmdOut.ready #= true
       driveRsp(dut, cd, olderWindow, Seq(0x6006, 0x7001, 0x7202, 0x7403))
       dut.fetch.logic.rspIn.valid #= false
@@ -413,8 +424,15 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
       assert(collisions == 1,
         s"decode-local FTB collision absent after 8 cycles: ${collisionTrace.mkString("; ")}")
       cd.waitSampling()
+      assert(actionCycle == detectCycle + 1,
+        s"fallback detector/action was not exactly C/C+1: ${collisionTrace.mkString("; ")}")
+      assert(actionFeedFires == 0,
+        s"wrong-path feed escaped in fallback action: ${collisionTrace.mkString("; ")}")
       assert(tr.applies == 1 && tr.pushes == 1,
         s"the physical application was not exercised exactly once: ${tr.applies}/${tr.pushes}")
+      // The action is observed before its active edge by the sampling callback. Cross
+      // that edge before checking the registered FTQ/hold state it clears.
+      cd.waitSampling()
       assert(dut.fa.logic.ftqCount.toInt == 0,
         "decode-local redirect did not kill the coincident FTQ push")
       assert(!dut.fa.logic.targetHoldValid.toBoolean,
@@ -427,6 +445,163 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
         f"younger FTB target survived: expected older target 0x$olderTarget%x, got 0x${tr.cmds(2)._2}%x")
       assert(!tr.cmds.exists(_._2 == youngerTarget),
         s"killed younger target escaped as a live command: ${tr.cmds}")
+    }
+  }
+
+  test("registered decode fallback keeps its target command at C+1", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      val source = 0x7000L
+      val target = 0x7046L
+      val targetBase = target & ~7L
+
+      // Retain a taken word-0 entry in the instruction BTB while replacing the
+      // window-level FTB claim with a declined word-1 conditional. This forces the
+      // real decode fallback without disabling the fetch-directed machinery.
+      train(dut, cd, target = target, pc = source)
+      train(dut, cd, brType = 0, target = source + 0x100, pc = source + 2)
+      trainNotTaken(dut, cd, source + 2)
+
+      val tr = trace(dut, cd)
+      val feeds = ArrayBuffer.empty[(Long, Long)]
+      var localCycle = 0L
+      var detectCycle = -1L
+      var actionCycle = -1L
+      var targetCmdCycle = -1L
+      var actionCount = 0
+      var actionFeedFires = 0
+      cd.onSamplings {
+        val detect = dut.fa.logic.predictDetect.toBoolean
+        val action = dut.fa.logic.predictFire.toBoolean
+        val cmdFire = dut.fetch.logic.cmdOut.valid.toBoolean && dut.fetch.logic.cmdOut.ready.toBoolean
+        val feedFire = dut.probe.logic.feedOut.valid.toBoolean && dut.probe.logic.feedOut.ready.toBoolean
+        if (detect && detectCycle < 0) detectCycle = localCycle
+        if (action) {
+          actionCycle = localCycle
+          actionCount += 1
+          if (feedFire) actionFeedFires += 1
+        }
+        if (cmdFire && dut.fetch.logic.cmdOut.payload.pc.toLong == targetBase)
+          targetCmdCycle = localCycle
+        if (feedFire)
+          feeds += localCycle -> dut.probe.logic.feedOut.payload(0).pc.toLong
+        localCycle += 1
+      }
+
+      dut.probe.logic.feedOut.ready #= true
+      dut.fetch.logic.cmdOut.ready #= true
+      dut.fa.logic.redirect.valid #= true
+      dut.fa.logic.redirect.payload #= source
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid #= false
+      await(cd, 8, "fallback source command") { tr.cmds.exists(_._2 == source) }
+      dut.fetch.logic.cmdOut.ready #= false
+
+      // BRA.S is learned taken by the instruction BTB. The word-1 FTB conditional is
+      // trained not-taken, so no fetch-directed target is applied.
+      driveRsp(dut, cd, source, Seq(0x6006, 0x7001, 0x7202, 0x7403))
+      dut.fetch.logic.rspIn.valid #= false
+      await(cd, 10, "live decode fallback detector") { detectCycle >= 0 }
+
+      // The registered action is next cycle. Ready is raised before its edge so the
+      // target command must fire in that same C+1 action, not a cycle later.
+      dut.fetch.logic.cmdOut.ready #= true
+      await(cd, 4, "registered fallback action and target command") {
+        actionCount == 1 && targetCmdCycle >= 0
+      }
+      dut.fetch.logic.cmdOut.ready #= false
+
+      assert(actionCycle == detectCycle + 1,
+        s"fallback action was not C+1: detect=$detectCycle action=$actionCycle cmds=${tr.cmds}")
+      assert(targetCmdCycle == actionCycle,
+        s"fallback target command missed the action cycle: target=$targetCmdCycle action=$actionCycle")
+      assert(actionCount == 1, s"fallback action replayed $actionCount times")
+      assert(actionFeedFires == 0, "wrong-path packet fired during fallback action")
+      assert(tr.applies == 0 && tr.pushes == 0,
+        s"declined FTB result unexpectedly applied: ${tr.applies}/${tr.pushes}")
+
+      // The unaligned target's new ring record must be live and carry drop=3. If the
+      // blanket stale action accidentally kills it, this response never reaches feed.
+      cd.waitSampling(2)
+      driveRsp(dut, cd, targetBase, Seq(0x70ee, 0x72ee, 0x74ee, 0x7603))
+      dut.fetch.logic.rspIn.valid #= false
+      await(cd, 10, "live fallback target feed") { feeds.exists(_._2 == target) }
+      assert(!feeds.exists { case (c, _) => c == actionCycle },
+        s"action-cycle feed was not blocked: $feeds")
+    }
+  }
+
+  test("registered decode fallback holds one exact target through cache backpressure", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      val source = 0x7800L
+      val target = 0x7846L
+      val targetBase = target & ~7L
+
+      train(dut, cd, target = target, pc = source)
+      train(dut, cd, brType = 0, target = source + 0x100, pc = source + 2)
+      trainNotTaken(dut, cd, source + 2)
+
+      val tr = trace(dut, cd)
+      val feeds = ArrayBuffer.empty[Long]
+      val heldTargets = ArrayBuffer.empty[Long]
+      var actionCount = 0
+      var actionFeedFires = 0
+      var targetFires = 0
+      cd.onSamplings {
+        val action = dut.fa.logic.predictFire.toBoolean
+        val cmdValid = dut.fetch.logic.cmdOut.valid.toBoolean
+        val cmdReady = dut.fetch.logic.cmdOut.ready.toBoolean
+        val cmdPc = dut.fetch.logic.cmdOut.payload.pc.toLong
+        val feedFire = dut.probe.logic.feedOut.valid.toBoolean && dut.probe.logic.feedOut.ready.toBoolean
+        if (action) {
+          actionCount += 1
+          if (feedFire) actionFeedFires += 1
+        }
+        if (cmdValid && !cmdReady && cmdPc == targetBase)
+          heldTargets += cmdPc
+        if (cmdValid && cmdReady && cmdPc == targetBase)
+          targetFires += 1
+        if (feedFire)
+          feeds += dut.probe.logic.feedOut.payload(0).pc.toLong
+      }
+
+      dut.probe.logic.feedOut.ready #= true
+      dut.fetch.logic.cmdOut.ready #= true
+      dut.fa.logic.redirect.valid #= true
+      dut.fa.logic.redirect.payload #= source
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid #= false
+      await(cd, 8, "backpressured fallback source command") { tr.cmds.exists(_._2 == source) }
+
+      // Hold the cache command boundary closed before the branch can be decoded. The
+      // action itself and several following cycles must present the same aligned target.
+      dut.fetch.logic.cmdOut.ready #= false
+      driveRsp(dut, cd, source, Seq(0x6006, 0x7001, 0x7202, 0x7403))
+      dut.fetch.logic.rspIn.valid #= false
+      await(cd, 10, "backpressured fallback action") { actionCount == 1 }
+      cd.waitSampling(3)
+      assert(actionFeedFires == 0, "wrong-path feed escaped during fallback action")
+      assert(heldTargets.size >= 3 && heldTargets.forall(_ == targetBase),
+        s"fallback target was not held stable under backpressure: $heldTargets")
+      assert(targetFires == 0, s"backpressured fallback target fired early $targetFires times")
+
+      dut.fetch.logic.cmdOut.ready #= true
+      await(cd, 4, "released fallback target command") { targetFires == 1 }
+      dut.fetch.logic.cmdOut.ready #= false
+      cd.waitSampling(2)
+      assert(actionCount == 1, s"fallback action replayed $actionCount times")
+      assert(targetFires == 1, s"fallback target fired $targetFires times")
+      assert(tr.cmds.count(_._2 == targetBase) == 1,
+        s"fallback target command duplicated: ${tr.cmds}")
+
+      // Response consumption proves the retained drop=3 travelled with the eventual
+      // command; a lost drop would emit one of the three 0x??ee words before 0x7846.
+      driveRsp(dut, cd, targetBase, Seq(0x70ee, 0x72ee, 0x74ee, 0x7603))
+      dut.fetch.logic.rspIn.valid #= false
+      await(cd, 10, "backpressured fallback target feed") { feeds.contains(target) }
+      assert(!feeds.exists(pc => pc >= targetBase && pc < target),
+        s"fallback leading-word drop was lost: $feeds")
     }
   }
 
