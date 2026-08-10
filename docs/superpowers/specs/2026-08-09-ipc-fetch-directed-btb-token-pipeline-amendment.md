@@ -106,18 +106,32 @@ Each outstanding-ring entry gains:
 - `ringPlanSeq : UInt(8 bits)`, written from a monotonically incrementing
   `planSeq` on issue.
 
-The query for a fired fetch carries `{ringTail, planSeq}`.  FetchAlign also
-delays that issued pair locally by one cycle.  The two providers must return
-the exact same pair at fixed latency C+1.  Their returned token equality is a
-mandatory assertion, not a functional input to the application mux; the local
-C+1 issued slot names the ring record.  A result is functionally live only when
-all of these hold:
+Only a fetch whose newly allocated ring record is live launches a plan lookup.
+For an actual `ic.cmd.fire`, the command-valid gates prove that STOP/complex
+stall, fault hold, and mismatch are absent.  The registered decode-fallback
+action deliberately re-marks its winning target command live.  Therefore the
+final new record is born stale exactly when an external/test redirect or the
+registered internal commit redirect is present.  Define:
+
+```text
+planLookupFire = ic.cmd.fire && !redirect.valid && !mispredictRedirect.valid
+```
+
+A born-stale cache command still allocates its ring record and its cache
+response still drains through the normal stale-discard path, but it launches
+neither the read-only FTB nor gshare lookup.  This suppresses work that cannot
+become architectural without changing the one-command wrong-path bound.
+
+The live query carries `{ringTail, planSeq}`.  FetchAlign delays that issued
+pair locally by one cycle.  The two providers must return the exact same pair
+at fixed latency C+1.  Their returned token equality is a mandatory assertion,
+not a functional input to the application mux; the local C+1 issued slot names
+the ring record.  A result is functionally live only when all of these hold:
 
 ```text
 ftb.result.valid && gshare.result.valid
-local issued-result valid
+local plan-lookup-result valid
 local issued slot is legal
-!ringStale(local issued slot)
 !any architectural/decode redirect this cycle
 ```
 
@@ -125,13 +139,17 @@ This is safe because it is a structural latency proof, not a freshness guess.
 The ring record is allocated with the lookup command in C.  FTB and gshare
 return in C+1, while the earliest resident I-cache response for that command is
 C+2.  The record therefore cannot retire or be recycled before its lookup
-result arrives.  A current-cycle redirect still closes the pre-edge stale-bit
-window.  The locally delayed valid must equal each provider valid, and both
-returned tokens must equal the local delayed `{slot,seq}`.  The sequence
-comparison to `ringPlanSeq(local slot)` remains active as an assertion so a
-provider latency change, duplicate response, token corruption, or future
-ring-lifetime change fails loudly; putting the equality back in the functional
-mux is not an acceptable substitute for revisiting this proof.
+result arrives.  Independently delay every cache-command issue and its exact
+final stale decision for assertions.  At C+1 the resident ring stale bit must
+equal that decision, provider valids must equal delayed `planLookupFire`, and a
+born-stale issue must have no provider result.  A current-cycle redirect still
+closes the result-cycle window through the existing veto or kill-after-apply
+priority.  Both returned tokens must equal the local delayed `{slot,seq}`.  The
+sequence comparison to `ringPlanSeq(local slot)` remains active as an assertion
+so a provider latency change, duplicate response, token corruption, or future
+ring-lifetime or redirect-priority change fails loudly.  Putting either the
+sequence equality or a dynamic `ringStale(local slot)` read back in the
+functional mux is not an acceptable substitute for revisiting this proof.
 
 The 2026-08-10 five-ID physical gate makes this distinction binding for FMax.
 At 250 MHz its routed limiter was
@@ -140,6 +158,17 @@ Icache.pfNextPa`, 7.614 ns and 24 logic levels, for WNS -3.633 ns.  The
 ring-sequence equality existed only to prove an impossible C+1 recycle and
 therefore must terminate at the assertion rather than drive target selection,
 I-cache readiness, or prefetch state.
+
+The cumulative 2026-08-10 internal-redirect cut removed the ROB
+flush/exception family but exposed the same avoidable association pattern at
+the next boundary: all 100 routed worst paths started at
+`FetchAlign.ringStale[1]` and ended in I-cache predecode/fill control, with a
+7.117-ns, 22-level worst path.  A live C+1 plan result is already guaranteed by
+`planLookupFire`; dynamically rereading the three-entry stale vector is
+redundant for exactly the same reason as the sequence comparison.  Provider
+valid is therefore the functional liveness input.  The resident ring bit
+remains the cache-response discard owner and the assertion oracle, but must not
+feed target selection, I-cache readiness, or prefetch state.
 
 No result is compared with the live `fetchPc`. Sequential PCs may change every
 cycle and lookup/application remains II=1.
