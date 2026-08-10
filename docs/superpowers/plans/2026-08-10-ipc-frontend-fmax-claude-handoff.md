@@ -6,7 +6,7 @@
 
 **Branch:** `codex/ipc-dcache-vipt`
 
-**Frozen RTL checkpoint:** `cc22cd0` (`frontend: skip plans for stale fetch issues`)
+**Frozen RTL checkpoint:** `9101c5a` (`frontend: localize cycle-exact quiesce`)
 
 This is the continuation point after the IPC/cache pipeline push and its first
 cumulative frontend FMax recovery passes.  The design is functionally healthy,
@@ -25,7 +25,7 @@ git rev-parse HEAD
 ```
 
 Expected tracked state is clean at the documentation handoff commit immediately
-above `cc22cd0`.  The following are local evidence or reservation files and must
+above `9101c5a`.  The following are local evidence or reservation files and must
 not be committed:
 
 - `.agent-reservation`
@@ -38,12 +38,15 @@ The last functional gate is green:
 
 ```text
 make SBT=~/sbt/bin/sbt test-fast
-147 passed / 147 total, 156 suites
+148 passed / 148 total, 156 suites
 ```
 
-The last focused frontend gate is `FetchDirectedFtbSpec` 15/15.  A deliberate
-negative mutation that restored predictor lookup for born-stale commands failed
-at the intended `staleLookupFire` assertion, then the restored RTL passed.
+The last focused frontend gate is `FetchDirectedFtbSpec` 16/16.  The real
+STOP -> IRQ -> handler -> RTE -> resume lockstep test also passes.  A deliberate
+negative mutation changed the local capture from the exact next state to
+`RegNext(service.active)`; the new halt-collision test failed because the ROB
+state was already active while the frontend-local bit was still false.  The
+restored exact-next implementation passed.
 
 ## 2. Non-negotiable rules and goals
 
@@ -101,6 +104,8 @@ pipeline these without preserving ordering, fault, and flush semantics.
   L1I stream prefetcher.
 - `3c4e1f8`, `dc16fc1`, `cc22cd0` are the three cumulative frontend timing cuts
   described in section 5.
+- `e421e6b`, `9101c5a` specify and implement the cycle-exact ROB-owned frontend
+  quiesce service, removing the remote `coreHalted` family.
 
 ## 4. Pinned IPC results
 
@@ -134,11 +139,17 @@ All figures use the 4.000 ns constraint.  A negative WNS therefore gives
 | `3c4e1f8` token cut | decode only | **-2.720 ns / 148.810 MHz** | -38,486.906 / 51,523 | 114,741 LUT | Removes functional sequence association; result reproduced bit-for-bit from same DCP |
 | `dc16fc1` redirect cut | decode only | -3.135 ns / 140.154 MHz | -40,968.956 / 47,952 | 111,555 LUT, 50,366 FF | Removes ROB doFlush/exception family and about 3k LUT; exposes `ringStale` |
 | `cc22cd0` stale-plan cut | decode only | **-3.326 ns / 136.500 MHz** | **-43,658.238 / 46,278** | **113,642 LUT, 50,416 FF, 26 BRAM, 4 DSP** | Removes all `ringStale` paths; exposes remote ROB `coreHalted` quiesce family |
+| `9101c5a` local quiesce | decode only | **-3.534 ns / 132.732 MHz** | **-45,594.648 / 53,953** | **113,569 LUT, 50,385 FF, 26 BRAM, 4 DSP** | Removes all remote halt paths; exposes defensive FTQ-full through live VIPT/L1I control |
 
-The current synthesis result is WNS -2.659 ns.  Route is clean, with no hold or
-pulse-width failures.  Current utilization is only 52.38% of device LUTs, 5.42%
-of BRAM tiles, and 0.22% of DSPs.  The cumulative route remains 1,099 LUTs below
-the reproducible token-cut route.  Area is not a problem.
+The current synthesis result is WNS **-2.440 ns**, a real 0.219-ns improvement
+over `cc22cd0`'s -2.659 ns.  The final route regressed by 0.208 ns because a new
+70.36%-routing family became dominant; keep the cut because its intended family
+is gone and its mapped depth/area both improved.  Route is clean, with no hold
+or pulse-width failures and no congestion windows above level 5.  Current
+utilization is only 52.35% of device LUTs, 11.61% of FFs, 5.42% of BRAM tiles,
+and 0.22% of DSPs.  Versus `cc22cd0`, routed LUTs fall by 73 and FFs by 31.
+Area is not a problem.  The mapper did redistribute covers toward MUXF7/F8, so
+do not infer placement quality from total LUT count alone.
 
 ### Floorplan result
 
@@ -160,32 +171,32 @@ A/B.  FetchAlign/Icache are not actually members of the decode pblock, so do not
 attribute an unplaced frontend cone improvement to that pblock without route
 coordinates.
 
+On `9101c5a`, the decode region uses 32,805 / 43,680 LUT sites (75.10%), down
+from 34,173 / 43,680 (78.23%) at `cc22cd0`.  The same known split-carry warning
+remains at the FetchAlign/Decode flattened-name boundary.  Preserve the current
+geometry for baseline comparability; make capture-filter cleanup a separate
+same-DCP A/B rather than mixing it into an RTL cut.
+
 ### Archived evidence
 
 - `synth/archive/dc16fc1_internal_redirect_decode/`
 - `synth/archive/cc22cd0_stale_plan_decode/`
+- `synth/archive/9101c5a_frontend_quiesce_decode/`
 
 The current archive contains the exact generated Verilog, synthesized and
 routed DCPs, MD5, Vivado log, timing/utilization/slack/congestion/fanout/path and
 pblock reports.  Current generated-netlist MD5:
-`9ceebf788ec66393a3458eecafb4d255`.
+`909dfa3941f47171a1fa77b5a8b8712b`.
 
-## 6. Exact next FMax cut
+## 6. Completed FMax cut: cycle-exact local quiesce
 
-Every one of the current routed top-100 paths begins at
-`RobPlugin_logic_coreHalted_reg/C` and ends in FetchAlign/Icache control.  The
-worst ends at `IcachePlugin_logic_lineReg[152]/CE`, is 7.220 ns / 23 levels, and
-is 70.25% routing.  The next cut should terminate this remote halt state at a
-frontend register without adding a cycle or allowing one last fetch.
+The previous routed top-100 all began at `RobPlugin_logic_coreHalted_reg/C`.
+`9101c5a` removes that entire family.  `RobPlugin` now solely produces
+`FrontendQuiesceService { active, next }`; FetchAlign captures `next` locally
+and asserts that the local register equals architectural `active` after every
+edge.  No `Global` key or sibling-plugin internal reach was added.
 
-### 6.1 Amend the frontend/STOP contract first
-
-Update the binding frontend/architecture documentation to define an exact
-ROB-owned frontend-quiesce service.  The service should expose the current
-active state for observation and the exact next state for local capture.  Do not
-add a `Global` key.  The sole producer is `RobPlugin`.
-
-The state equations to mirror are:
+The exact equations are:
 
 ```text
 stopEnter = sysTriggerSig && p0.sysKind == STOP
@@ -194,76 +205,46 @@ fatalNext = coreHalted || coreHaltedIn
 frontendQuiesceNext = stoppedNext || fatalNext
 ```
 
-The interrupt-clear priority must match ROB exactly.  Recheck the live code
-before copying these expressions; if ROB state priority changes, update both the
-spec and service equation rather than relying on this handoff text.
-
-### 6.2 Implement through a service, not plugin internals
-
-1. Add a plain directionless `FrontendQuiesceService` in `services/Services.scala`.
-2. Make `RobPlugin` its sole producer.
-3. In FetchAlign, capture
-   `fetchQuiesced := RegNext(frontendQuiesceNext) init(False)`.
-4. Replace every existing functional `quiesce` use with the local registered
-   copy.  Keep response/ring draining alive while halted.
-5. Add a simulation assertion that the local value equals ROB's visible
-   `(stopped || coreHalted)` after reset.  This is an induction proof: both are
-   loaded from the same next-state expression on the same edge.
-6. Remove the direct top-level assignment
-   `fetchAlign.quiesce := rob.stopped || rob.coreHalted` only after every harness
-   and synth integration is updated.
-
 A plain `RegNext(stopped || coreHalted)` is incorrect.  It would leave
 `ic.cmd.fire` and/or `feed.fire` possible for one cycle after the ROB-visible
-halt state asserts.  If exact next-state capture cannot be cleanly expressed,
-the safe fallback is assert-exact and clear-late, accepting one wake bubble;
-never assert-late.
+halt state asserts.  The negative mutation proves this is not a stylistic
+difference.  Directed coverage also proves a transition-edge command remains a
+legal pre-halt transaction, its C+1 plan is blocked in the first full halted
+cycle, both accepted responses drain without feed, interrupt wake is exact, and
+fatal halt remains sticky.
 
-### 6.3 Non-vacuous tests
+## 7. Exact next FMax cut from the `9101c5a` recensus
 
-- STOP entry: no fetch command or decode feed on the first cycle `stopped` is
-  visible.
-- STOP interrupt wake: local quiesce clears on the exact ROB wake edge and the
-  redirect target is the first subsequent fetch.
-- Fatal diagnostic halt: asserts on the exact visible edge and never clears.
-- Hold a live C+1 FTB result over halt entry: no apply, FTQ push, target hold,
-  cache command, or feed escapes.
-- Outstanding I-cache responses continue to drain/discard while quiesced; no
-  ring deadlock.
-- Backpressure both `ic.cmd.ready` postures and expose/count real fires.
-- Mutate to delayed-active and require the first-cycle test to fail.
-- Assert the local/frontend and ROB-visible halt bits remain cycle-identical.
+Every routed top-100 path now starts at
+`FetchAlignPlugin_logic_ftqCount_reg[0]/C` and ends at an I-cache `lineReg`
+data/enable.  The worst is 7.430 ns / 23 levels, with 2.202 ns logic and 5.228 ns
+route (70.36%).  It traverses `ftqFull -> ftbBlocked -> applyNow`, the selected
+fetch PC, live ITLB CAM/permission, L1I tag/way qualification, and speculative
+installer control.  There are no `coreHalted` paths in the top 100.
 
-Run the focused tests, the mandatory fast gate, then regenerate and route before
-claiming an FMax improvement.  Keep the cut even if it exposes the next family,
-provided its semantics, mutation proof, and area are sound.
+The narrow first candidate is the defensive FTQ-full veto.  The binding token
+amendment already says legal run-ahead cannot fill the 32-entry FTQ, and RTL
+already asserts `!ftqFull` every simulation cycle.  Yet `ftqFull` remains a
+functional input to `ftbBlocked` and is now the measured critical source.  Do
+this spec-first:
 
-## 7. Likely following cut, only after recensus
+1. Amend the binding FTB token spec so defensive-full is an asserted invariant,
+   not a functional application veto, for the fixed 32-entry depth.
+2. Prove the legal maximum run-ahead bound in a directed stress test with decode
+   blocked, maximum fetch-ring/IBuf occupancy, prediction turnover, redirects,
+   and target holds; record peak FTQ occupancy and require it below 32.
+3. Remove only `ftqFull` from `ftbBlocked`; retain the hard `assert(!ftqFull)`.
+4. Mutation-reduce FTQ depth or disable the bound and require the stress test or
+   assertion to fail, so the proof cannot be vacuous.
+5. Regenerate and route before deciding the following cut.  If `ftqCount`
+   remains through another function, recensus rather than broadening by guess.
 
-Before the current route, synthesis exposed a related 25-level
-`FetchAlign.stalled -> Icache.lineReg` family.  If it becomes the routed limiter
-after local quiesce, split unobserved command payload selection from the late
-hard valid/fire veto:
+Do not simply remove FTQ capacity protection at arbitrary parameter values.  If
+the FTQ becomes configurable below the proven envelope, either reject that
+configuration elaboration-time or restore a separately pipelined capacity
+mechanism.
 
-```text
-H = stalled || fetchQuiesced || faultHold
-E = FTB plan eligibility without H
-applyNow = E && !H                    // architectural state remains exact
-C = started && ringSlotAvailable && ibufRoomForCmd
-M = H || ftqMismatch
-acceptNoVeto = C && ic.cmd.ready
-issFire = acceptNoVeto && !M
-```
-
-Drive command-only PC/drop payload muxes from `E`, but keep FTQ/ring/target
-architectural mutations on `applyNow` and every observed issue side effect on
-`issFire`.  Assert `issFire == ic.cmd.fire`.  This is safe only because the
-I-cache/ITLB `ready` contract is independent of `cmd.valid`; preserve and assert
-that assumption.  Under a veto the payload is unobserved, but valid/fire must
-stay low.  Do not implement this speculatively if the post-quiesce route points
-elsewhere.
-
-## 8. Why the three current frontend cuts stay
+## 8. Why the four current frontend cuts stay
 
 - `3c4e1f8` replaced live dynamic sequence equality with a local fixed-C+1
   association and assertion-only provider tokens.  It improved the first
@@ -274,6 +255,10 @@ elsewhere.
 - `cc22cd0` suppresses FTB/gshare lookup for cache commands already known to be
   born stale.  It removed the entire `ringStale` top-100 family.  Its isolated
   WNS is worse only because the next remote halt cone is now exposed.
+- `9101c5a` localizes exact halt next-state at FetchAlign.  It improves
+  post-synth WNS by 0.219 ns, removes every remote-halt top-100 path, and slightly
+  reduces LUT/FF area.  Its route regression is the newly exposed defensive
+  FTQ-full/VIPT family, not failure of the cut.
 
 Reverting any of these restores a previously measured limiter.  Continue
 cutting the newly exposed registered control cones instead.
@@ -355,16 +340,18 @@ new concurrency.
 - The present FMax is far below both 200 and 250 MHz.  This is expected after the
   large IPC changes, but it is now the principal core task.
 
-## 12. Definition of the next successful handoff
+## 12. Handoff completion state
 
-The next phase is successful when it has:
+This handoff phase has:
 
 1. a spec-first, service-clean, cycle-exact local frontend-quiesce cut;
 2. directed mutation-proven halt/wake/drain tests;
-3. the mandatory fast gate green;
-4. an exact generated-netlist MD5 and archived synthesis/route evidence;
+3. the mandatory 148-test gate green;
+4. exact generated-netlist MD5 and archived synthesis/route evidence;
 5. a top-path recensus showing the `coreHalted` family gone;
-6. honest WNS/TNS/failing-endpoint and area deltas, even if 250 MHz is not yet
-   closed; and
-7. a decision based on the newly exposed family, not a reflexive rollback of
-   cumulative, verified cuts.
+6. honest WNS/TNS/failing-endpoint and area deltas; and
+7. a measurement-selected next cut at defensive FTQ-full, not a rollback.
+
+Codex stopped here at the user's request.  Claude should begin with the
+spec/test proof in section 7 and must not treat the 132.7-MHz route as grounds to
+discard the cumulative IPC or timing work.
