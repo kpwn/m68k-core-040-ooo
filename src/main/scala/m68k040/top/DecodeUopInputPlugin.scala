@@ -13,13 +13,16 @@ import spinal.lib.misc.plugin.FiberPlugin
 class DecodeUopInputPlugin extends FiberPlugin with DecodeUopService {
   var uopsPort: Stream[Vec[DecodedUop]] = null
   var uop1ValidReg: Bool = null
+  var flushTie: Bool = null
 
   override def uops: Stream[Vec[DecodedUop]] = uopsPort
   override def uop1Valid: Bool = uop1ValidReg
+  override def pipeFlush: Bool = flushTie
 
   during setup {
     uopsPort = Stream(Vec(DecodedUop(), 2))
     uop1ValidReg = Bool()
+    flushTie = False
   }
 
   val logic = during build new Area {

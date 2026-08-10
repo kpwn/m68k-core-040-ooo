@@ -146,7 +146,7 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     val flushPc = host[RedirectService].flushPc
     val excActive = rob.logic.excActive
     iq.flushPort := doFlush || excActive
-    host[DecodeStage].logic.pipeFlush := doFlush || excActive
+    host[m68k040.services.DecodeUopService].pipeFlush := doFlush || excActive
     host[RenameStage].logic.pipeFlush := doFlush || excActive
     // Front-end complex-packet resume (task #178, ported-tests cluster 11): a genuinely-
     // `complex` predecode packet permanently stalls FetchAlignPlugin until its `resume`

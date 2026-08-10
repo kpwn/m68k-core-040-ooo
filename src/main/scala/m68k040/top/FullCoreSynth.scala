@@ -13,7 +13,7 @@ import m68k040.rob.RobPlugin
 import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin, DivEuPlugin}
 import m68k040.execute.iq.{IssueQueuePlugin, IssueQueueService}
 import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
-import m68k040.services.{CommitTraceService, RedirectService}
+import m68k040.services.{CommitTraceService, DecodeUopService, RedirectService}
 import spinal.core._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
@@ -53,7 +53,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // IQ/skid flush held high while the commit-side exception sequencer runs
     // (serializing) so wrong-path uops fetched during the sequence are squashed.
     iq.flushPort := doFlush || excActive                      // IQ clear
-    host[DecodeStage].logic.pipeFlush := doFlush || excActive // FE skid (decode->rename)
+    host[DecodeUopService].pipeFlush := doFlush || excActive // FE skid (decode->rename)
     host[RenameStage].logic.pipeFlush := doFlush || excActive // FE skid (rename->dispatch)
     // RAT-rollback (rename.flushPort) already driven by the ROB (rc.flushPort).
     // Front-end complex-packet resume (task #178, ported-tests cluster 11): a genuinely-

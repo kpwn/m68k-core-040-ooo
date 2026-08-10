@@ -225,10 +225,13 @@ trait DecodeFeedService {
 }
 
 /** Produced by the decode stage; consumed by the (future) rename stage.
-  * Two µops/cycle. Plain Stream (directionless) per the service convention. */
+  * Two µops/cycle. Plain Stream (directionless) per the service convention.
+  * `pipeFlush` is the directionless squash input driven by backend wiring; exposing it
+  * here avoids sibling plugins reaching into DecodeStage's implementation Area. */
 trait DecodeUopService {
   def uops: Stream[Vec[DecodedUop]]   // Vec length 2
   def uop1Valid: Bool
+  def pipeFlush: Bool
 }
 
 /** Produced by rename; consumed by the (future) dispatch/ROB. Plain Stream. */

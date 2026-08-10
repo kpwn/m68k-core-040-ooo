@@ -232,7 +232,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // IQ/skid flush held high while the exception FSM runs (serializing) so
       // wrong-path uops fetched during the multi-cycle sequence are squashed.
       iq.flushPort := doFlush || excActive                     // IQ clear
-      host[DecodeStage].logic.pipeFlush := doFlush || excActive
+      host[m68k040.services.DecodeUopService].pipeFlush := doFlush || excActive
       host[RenameStage].logic.pipeFlush := doFlush || excActive
       // RAT-rollback flush (rename.flushPort) is already driven by the ROB
       // (rc.flushPort := flushing). Fetch redirect to the resolved target:

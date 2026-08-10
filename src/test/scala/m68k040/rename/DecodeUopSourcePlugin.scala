@@ -21,8 +21,10 @@ class DecodeUopSourcePlugin extends FiberPlugin with DecodeUopService {
     src.payload.foreach(in(_))
     src.ready.simPublic()
     val s1v = in Bool ()
+    val flush = False
   }
 
   override def uops: Stream[Vec[DecodedUop]] = logic.src
   override def uop1Valid: Bool               = logic.s1v
+  override def pipeFlush: Bool               = logic.flush
 }

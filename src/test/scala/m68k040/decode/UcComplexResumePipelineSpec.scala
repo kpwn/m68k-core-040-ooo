@@ -5,6 +5,7 @@ import m68k040.cache.{IcachePlugin, IcacheSim}
 import m68k040.core.ParamPlugin
 import m68k040.frontend.FetchAlignPlugin
 import m68k040.mmu.IdentityTranslationPlugin
+import m68k040.services.DecodeUopService
 import org.scalatest.funsuite.AnyFunSuite
 import spinal.core._
 import spinal.core.sim._
@@ -19,11 +20,10 @@ import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
   * cycle, a missing C+1 action, a changed target, or a duplicate pulse all fail.
   */
 class UcComplexResumePipelineSpec extends AnyFunSuite {
-  /** Test-only owner for DecodeStage's intentionally overrideable flush wire. */
-  class FlushDriverPlugin(dec: DecodeStage) extends FiberPlugin {
+  class FlushDriverPlugin extends FiberPlugin {
     val logic = during build new Area {
       val flush = in(Bool())
-      dec.logic.pipeFlush := flush
+      host[DecodeUopService].pipeFlush := flush
     }
   }
 
@@ -34,7 +34,7 @@ class UcComplexResumePipelineSpec extends AnyFunSuite {
     val fa   = new FetchAlignPlugin
     val dec  = new DecodeStage
     val sink = new UopSinkPlugin
-    val flushDrv = new FlushDriverPlugin(dec)
+    val flushDrv = new FlushDriverPlugin
     db.on {
       host.asHostOf(Seq[FiberPlugin](
         new ParamPlugin(M68kParams()), new IdentityTranslationPlugin,

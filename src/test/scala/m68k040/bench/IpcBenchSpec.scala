@@ -168,7 +168,7 @@ class IpcBenchSpec extends AnyFunSuite {
       val flushPc = host[RedirectService].flushPc
       val excActive = rob.logic.excActive
       iq.flushPort := doFlush || excActive
-      host[DecodeStage].logic.pipeFlush := doFlush || excActive
+      host[m68k040.services.DecodeUopService].pipeFlush := doFlush || excActive
       host[RenameStage].logic.pipeFlush := doFlush || excActive
       // Front-end complex-packet resume (task #178, ported-tests cluster 11) -- see
       // DecodeStage.scala's `ucComplexResume` comment / FullCoreSynth.scala's mirror.
