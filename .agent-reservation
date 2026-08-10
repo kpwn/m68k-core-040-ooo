@@ -1,0 +1,26 @@
+agent=claude-floorplan-ab
+task=IN PROGRESS — exact-DCP floorplan A/B (handoff section 18)
+reserved_at=2026-08-10T19:35:00+02:00
+head=3b99172
+baseline=6b246de RTL, FLOORPLAN_MODE decode, -2.094ns / 164.096MHz, netlist_md5 d80f6218c5c7dcab94a33a52d64244fa
+method=REUSE_SYNTH_DCP=1 from synth/archive/6b246de_ftb_framing_retime_decode/fullcore_synth.dcp; synth/floorplan_ab.sh isolates each run
+finding1=ALL 300 worst unique endpoints are ONE arc: FetchAlign stalled_reg (X26Y99) -> Icache s1PredEntries_*/CE
+        5.990ns = 2.019 logic (34%) + 3.971 route (66%), 20 levels, PBlocks crossed = 0, terminal net fanout = 931
+        -> the WNS limiter is a high-fanout broadcast in the UNFLOORPLANNED left strip, not a pblock-boundary crossing
+finding2=pb_dcache over-capture root-caused: LsEuPlugin_logic_sq is the StoreQueue SUBMODULE instance and Vivado
+        absorbed 7033 RobPlugin (incl. branchTrainMem CARRY8) + 2096 IssueQueuePlugin leaves into it. 32298 -> 23545 LUT
+        when repaired. IS_PRIMITIVE is required in the filter or the hierarchical parent re-drags them in.
+runs=batch1 (in flight): decode+frontend, decode+backend, decode_fe  [all reproduce POSTSYNTH -1.827 = netlist control]
+batch1(dirty capture)=decode+backend -2.328/158.028 | decode+frontend -2.472/154.512 | decode_fe -2.757/147.995  ALL REGRESS
+batch2(clean IS_PRIMITIVE)=decode+backend -2.595/151.630 | decode+frontend -2.149/162.628 | decode@fanout -2.389/156.519  ALL REGRESS
+key=AggressiveFanoutOpt DID retire the 931-load `stalled` family (WNS startpoint moved to FtbPlugin rspPayload_brWordOff,
+    exactly ladder rung 1) and FMax still FELL -- the fanout hypothesis is tested and is not a lever either.
+key2=the REPAIRED backend capture is WORSE than the contaminated one, so over-capture was NOT why pb_dcache hurt.
+batch3(in flight)=decode@postroute, decode@explore, frontend(alone)
+tests=make test-fast GREEN 149/149, 157 suites
+batch3=frontend(alone) -2.292/158.932 | decode@postroute -1.623/177.841 (+13.75MHz!) | decode@explore -1.642/177.242
+batch4=none@postroute -2.010/166.389 (decode floorplan RE-VALIDATED, edge GREW 2.47 -> 11.45 MHz)
+       decode@postroute REPEAT -1.623 (bit-identical, deterministic)
+       decode@postroute2 -1.552/180.115 (+16.02 MHz)
+LANDING=IMPL_STRATEGY post-route phys_opt is the lever. 7/7 floorplan variants regressed; NO floorplan change lands.
+batch5(in flight)=decode@postrouteN and decode@exploreN with POSTROUTE_ROUNDS=6 (convergence curve)

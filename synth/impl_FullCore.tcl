@@ -51,30 +51,126 @@ if {[info exists ::env(SKIP_FLOORPLAN)] && $::env(SKIP_FLOORPLAN) eq "1"} {
 if {[info exists ::env(FLOORPLAN_MODE)]} {
   set floorplan_mode $::env(FLOORPLAN_MODE)
 }
-if {[lsearch -exact {none decode dcache both} $floorplan_mode] < 0} {
-  error "FLOORPLAN_MODE must be one of: none, decode, dcache, both"
+# FLOORPLAN_MODE is a `+`-separated set of pblock tokens, so the section-18 A/B can
+# combine boxes without inventing a new keyword per combination. `both` is kept as a
+# historical alias for `decode+dcache`.
+#   decode    synth/floorplan_decode.xdc     DecodeStage box, X36Y0:X87Y104        (default)
+#   decode_fe synth/floorplan_decode_fe.xdc  same box, capture += FetchAlign + Ras (excl. decode)
+#   dcache    synth/floorplan_dcache.xdc     legacy LS box, KNOWN-HARMFUL control
+#   backend   synth/floorplan_backend.xdc    repaired LS box, X14Y132:X72Y239
+#   frontend  synth/floorplan_frontend.xdc   fetch/predict box, X0Y20:X35Y135
+if {$floorplan_mode eq "both"} { set floorplan_mode "decode+dcache" }
+set floorplan_tokens [split $floorplan_mode "+"]
+array set floorplan_xdc {
+  decode    synth/floorplan_decode.xdc
+  decode_fe synth/floorplan_decode_fe.xdc
+  dcache    synth/floorplan_dcache.xdc
+  backend   synth/floorplan_backend.xdc
+  frontend  synth/floorplan_frontend.xdc
+}
+foreach tok $floorplan_tokens {
+  if {$tok ne "none" && ![info exists floorplan_xdc($tok)]} {
+    error "FLOORPLAN_MODE tokens must be from: none decode decode_fe dcache backend frontend (got '$tok')"
+  }
+}
+if {[lsearch -exact $floorplan_tokens "decode"] >= 0 && [lsearch -exact $floorplan_tokens "decode_fe"] >= 0} {
+  error "FLOORPLAN_MODE: decode and decode_fe both create pb_decode; pick one"
+}
+if {[lsearch -exact $floorplan_tokens "dcache"] >= 0 && [lsearch -exact $floorplan_tokens "backend"] >= 0} {
+  error "FLOORPLAN_MODE: dcache and backend are the same region; pick one"
 }
 puts "FLOORPLAN_MODE $floorplan_mode"
-
-if {$floorplan_mode eq "decode" || $floorplan_mode eq "both"} {
-  # Front-end floorplan: co-locate DecodeStage so the decode->ring nets stay local (read after
-  # opt so the cell filter sees elaborated leaves). Part of the front-end FMax stack (195->~218).
-  read_xdc synth/floorplan_decode.xdc
-} else {
-  file delete -force synth/fullcore_pb_decode_util.rpt
+foreach tok $floorplan_tokens {
+  if {$tok eq "none"} { continue }
+  read_xdc $floorplan_xdc($tok)
 }
-if {$floorplan_mode eq "dcache" || $floorplan_mode eq "both"} {
-  # LS-cluster floorplan: co-locate D-cache + DTLB + LS-EU so the valids->hrPpn cross-module
-  # load/translate nets stay local (read after opt so the cell filter sees elaborated leaves).
-  # Attacks the post-route limiter DcachePlugin valids/C -> DtlbPlugin hrPpn/CE (73% route).
-  read_xdc synth/floorplan_dcache.xdc
-  puts "FLOORPLAN pb_dcache cells: [llength [get_cells -of_objects [get_pblocks pb_dcache]]]"
-} else {
-  file delete -force synth/fullcore_pb_dcache_util.rpt
+# Report the captured population of every pblock that actually got created, so a
+# capture-filter regression shows up in the log rather than silently in the route.
+foreach pb [get_pblocks -quiet] {
+  puts "FLOORPLAN [get_property NAME $pb] grid=[get_property GRID_RANGES $pb] cells=[llength [get_cells -quiet -of_objects $pb]]"
 }
-place_design
-phys_opt_design
-route_design
+# Stale per-pblock reports would otherwise survive a mode change and be misread.
+foreach stale {pb_decode pb_dcache pb_backend pb_frontend} {
+  if {[llength [get_pblocks -quiet $stale]] == 0} {
+    file delete -force synth/fullcore_${stale}_util.rpt
+  }
+}
+# IMPL_STRATEGY selects the placer/phys-opt/router recipe.  `default` is the
+# historical flow and stays the default so every previously published number in the
+# handoff remains reproducible verbatim.  The alternatives exist because the
+# 2026-08-10 census showed the limiter is a 931-fan-out capture-enable broadcast
+# (`FetchAlignPlugin stalled -> IcachePlugin s1PredEntries_*/CE`, 66% route, 0
+# pblock crossings), which is a replication/placement problem rather than a
+# floorplan or logic-cone problem.  See handoff section 18.
+set impl_strategy "default"
+if {[info exists ::env(IMPL_STRATEGY)]} { set impl_strategy $::env(IMPL_STRATEGY) }
+puts "IMPL_STRATEGY $impl_strategy"
+# (if/elseif rather than `switch`: "default" is a reserved final pattern in Tcl's
+#  switch, so using it as an ordinary strategy name there would silently misfire.)
+if {$impl_strategy eq "default"} {
+  place_design
+  phys_opt_design
+  route_design
+} elseif {$impl_strategy eq "fanout"} {
+  # Targeted high-fan-out replication before the ordinary phys-opt pass.
+  place_design
+  phys_opt_design -directive AggressiveFanoutOpt
+  phys_opt_design
+  route_design
+} elseif {$impl_strategy eq "postroute"} {
+  # Cheapest addition: today's flow plus one post-route phys-opt + reroute.
+  place_design
+  phys_opt_design
+  route_design
+  phys_opt_design
+  route_design -tns_cleanup
+} elseif {$impl_strategy eq "postroute2"} {
+  # Does a SECOND post-route phys-opt/reroute round buy anything beyond the first?
+  place_design
+  phys_opt_design
+  route_design
+  phys_opt_design
+  route_design -tns_cleanup
+  phys_opt_design
+  route_design -tns_cleanup
+} elseif {$impl_strategy eq "postrouteN" || $impl_strategy eq "exploreN"} {
+  # Iterated post-route physical optimisation, with the WNS after EVERY round
+  # printed so one run yields the whole convergence curve instead of one point.
+  # POSTROUTE_ROUNDS (default 4) sets the number of post-route rounds.
+  set rounds 4
+  if {[info exists ::env(POSTROUTE_ROUNDS)]} { set rounds $::env(POSTROUTE_ROUNDS) }
+  if {$impl_strategy eq "exploreN"} {
+    place_design -directive ExtraTimingOpt
+    phys_opt_design -directive AggressiveExplore
+    route_design -directive Explore
+  } else {
+    place_design
+    phys_opt_design
+    route_design
+  }
+  set rp [get_timing_paths -max_paths 1 -nworst 1 -setup]
+  puts "POSTROUTE_ROUND 0 WNS [get_property SLACK $rp]"
+  for {set r 1} {$r <= $rounds} {incr r} {
+    if {$impl_strategy eq "exploreN"} {
+      phys_opt_design -directive AggressiveExplore
+      route_design -directive Explore -tns_cleanup
+    } else {
+      phys_opt_design
+      route_design -tns_cleanup
+    }
+    set rp [get_timing_paths -max_paths 1 -nworst 1 -setup]
+    puts "POSTROUTE_ROUND $r WNS [get_property SLACK $rp]"
+  }
+} elseif {$impl_strategy eq "explore"} {
+  # Full tool-effort recipe, including a post-route phys-opt + incremental reroute.
+  place_design -directive ExtraTimingOpt
+  phys_opt_design -directive AggressiveExplore
+  route_design -directive Explore
+  phys_opt_design -directive AggressiveExplore
+  route_design -directive Explore -tns_cleanup
+} else {
+  error "IMPL_STRATEGY must be one of: default fanout postroute postroute2 postrouteN exploreN explore"
+}
 report_timing_summary -max_paths 10 -file synth/fullcore_route_timing.rpt
 report_utilization -file synth/fullcore_route_util.rpt
 # ── congestion + attribution reports (always-on; routing congestion is a first-class
@@ -90,8 +186,10 @@ catch { report_design_analysis -timing -max_paths 10 -file synth/fullcore_path_a
 catch { report_high_fanout_nets -max_nets 10 -file synth/fullcore_fanout.rpt }
 # 3) per-pblock utilization (floorplan capture + regional spill sanity). Vivado
 # rejects a list of pblocks for this report, so emit the two reports separately.
-catch { report_utilization -pblocks pb_decode -file synth/fullcore_pb_decode_util.rpt }
-catch { report_utilization -pblocks pb_dcache -file synth/fullcore_pb_dcache_util.rpt }
+foreach pb [get_pblocks -quiet] {
+  set pbn [get_property NAME $pb]
+  catch { report_utilization -pblocks $pbn -file synth/fullcore_${pbn}_util.rpt }
+}
 # 4) module-pair slack matrix: which plugin PAIR limits (top-100 worst endpoints)
 catch {
   set fp [open synth/fullcore_slack_matrix.rpt w]
