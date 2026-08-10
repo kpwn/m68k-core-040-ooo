@@ -139,17 +139,25 @@ All figures use the 4.000 ns constraint.  A negative WNS therefore gives
 | `3c4e1f8` token cut | decode only | **-2.720 ns / 148.810 MHz** | -38,486.906 / 51,523 | 114,741 LUT | Removes functional sequence association; result reproduced bit-for-bit from same DCP |
 | `dc16fc1` redirect cut | decode only | -3.135 ns / 140.154 MHz | -40,968.956 / 47,952 | 111,555 LUT, 50,366 FF | Removes ROB doFlush/exception family and about 3k LUT; exposes `ringStale` |
 | `cc22cd0` stale-plan cut | decode only | **-3.326 ns / 136.500 MHz** | **-43,658.238 / 46,278** | **113,642 LUT, 50,416 FF, 26 BRAM, 4 DSP** | Removes all `ringStale` paths; exposes remote ROB `coreHalted` quiesce family |
-| `9101c5a` local quiesce | decode only | **-3.534 ns / 132.732 MHz** | **-45,594.648 / 53,953** | **113,569 LUT, 50,385 FF, 26 BRAM, 4 DSP** | Removes all remote halt paths; exposes defensive FTQ-full through live VIPT/L1I control |
+| `9101c5a` local quiesce | decode only | -3.534 ns / 132.732 MHz | -45,594.648 / 53,953 | 113,569 LUT, 50,385 FF, 26 BRAM, 4 DSP | Removes all remote halt paths; exposes defensive FTQ-full through live VIPT/L1I control |
+| `28ec738` FTQ-full cut | decode only | **-2.587 ns / 151.814 MHz** | **-30,937.422 / 45,597** | **113,487 LUT, 50,328 FF, 26 BRAM, 4 DSP** | Removes the defensive capacity veto; `ftqCount` drops to 0 paths; exposes `ringDrop`-to-prefetch fanout. Best result of the campaign; improved synth *and* route together |
 
-The current synthesis result is WNS **-2.440 ns**, a real 0.219-ns improvement
-over `cc22cd0`'s -2.659 ns.  The final route regressed by 0.208 ns because a new
-70.36%-routing family became dominant; keep the cut because its intended family
-is gone and its mapped depth/area both improved.  Route is clean, with no hold
-or pulse-width failures and no congestion windows above level 5.  Current
-utilization is only 52.35% of device LUTs, 11.61% of FFs, 5.42% of BRAM tiles,
-and 0.22% of DSPs.  Versus `cc22cd0`, routed LUTs fall by 73 and FFs by 31.
-Area is not a problem.  The mapper did redistribute covers toward MUXF7/F8, so
-do not infer placement quality from total LUT count alone.
+The head of the table is now `28ec738` at WNS **-2.587 ns / 151.814 MHz**.  It
+is the only cut so far that improved post-synthesis WNS, post-route WNS, TNS,
+failing endpoints, and area all at once, and it is the campaign's largest single
+gain (+19.082 MHz, +14.4%).  Route is clean, with no hold or pulse-width
+failures and no congestion windows above level 5.  Utilization is 52.31% of
+device LUTs, 11.60% of FFs, 5.42% of BRAM tiles, and 0.22% of DSPs.  Area is not
+a problem.  The mapper redistributes covers toward MUXF7/F8, so do not infer
+placement quality from total LUT count alone.
+
+For history: at `9101c5a` the synthesis result was WNS -2.440 ns, a real
+0.219-ns improvement over `cc22cd0`'s -2.659 ns, but its final route regressed
+by 0.208 ns because a new 70.36%-routing family became dominant.  That cut was
+kept because its intended family was gone and its mapped depth/area both
+improved — a judgement the `28ec738` result retroactively vindicates, since
+removing the newly-exposed family recovered far more than the interim
+regression cost.
 
 ### Floorplan result
 
@@ -171,8 +179,9 @@ A/B.  FetchAlign/Icache are not actually members of the decode pblock, so do not
 attribute an unplaced frontend cone improvement to that pblock without route
 coordinates.
 
-On `9101c5a`, the decode region uses 32,805 / 43,680 LUT sites (75.10%), down
-from 34,173 / 43,680 (78.23%) at `cc22cd0`.  The same known split-carry warning
+On `28ec738`, the decode region uses 30,288 / 43,680 LUT sites (69.34%), down
+from 32,805 / 43,680 (75.10%) at `9101c5a` and 34,173 / 43,680 (78.23%) at
+`cc22cd0` — a steady three-cut decline.  The same known split-carry warning
 remains at the FetchAlign/Decode flattened-name boundary.  Preserve the current
 geometry for baseline comparability; make capture-filter cleanup a separate
 same-DCP A/B rather than mixing it into an RTL cut.
@@ -182,6 +191,7 @@ same-DCP A/B rather than mixing it into an RTL cut.
 - `synth/archive/dc16fc1_internal_redirect_decode/`
 - `synth/archive/cc22cd0_stale_plan_decode/`
 - `synth/archive/9101c5a_frontend_quiesce_decode/`
+- `synth/archive/28ec738_ftq_capacity_cut_decode/`
 
 The current archive contains the exact generated Verilog, synthesized and
 routed DCPs, MD5, Vivado log, timing/utilization/slack/congestion/fanout/path and
@@ -213,7 +223,14 @@ legal pre-halt transaction, its C+1 plan is blocked in the first full halted
 cycle, both accepted responses drain without feed, interrupt wake is exact, and
 fatal halt remains sticky.
 
-## 7. Exact next FMax cut from the `9101c5a` recensus
+## 7. FMax cut from the `9101c5a` recensus — DONE at `28ec738`
+
+> **Status: completed 2026-08-10.**  All five steps below were executed; see
+> section 13 for the full record.  The measured result was **132.732 ->
+> 151.814 MHz** with `ftqCount` falling to zero routed paths.  Step 5's
+> instruction to recensus rather than guess was followed: the new target family
+> is `FetchAlignPlugin_logic_ringDrop_1` fanning into I-cache prefetch state.
+> Kept verbatim below as the worked template for the next cut.
 
 Every routed top-100 path now starts at
 `FetchAlignPlugin_logic_ftqCount_reg[0]/C` and ends at an I-cache `lineReg`
@@ -355,3 +372,160 @@ This handoff phase has:
 Codex stopped here at the user's request.  Claude should begin with the
 spec/test proof in section 7 and must not treat the 132.7-MHz route as grounds to
 discard the cumulative IPC or timing work.
+
+**Claude executed section 7 in full on 2026-08-10; see section 13.**  The
+132.7-MHz route was indeed not grounds for a rollback: the very next cut took it
+to 151.8 MHz.  The frontier is now the `ringDrop`-to-prefetch fanout family, and
+the same five-step spec-first discipline should be applied to it.
+
+## 13. Completed FMax cut: FTQ-full capacity veto (Claude, 2026-08-10)
+
+Executed section 7's five-step plan.  Step 1 (spec amendment) was already landed
+as `36b4866`; steps 2-5 are below.
+
+**Commits**
+
+- `1a7a0f3` `frontend: measure maximum legal FTQ run-ahead` — the directed
+  capacity proof plus a simulation-only `SimPublic` on `ibuf.io.cnt`/`avail`.
+- `28ec738` `frontend: cut the FTQ-full fetch veto` — removes `ftqFull` from
+  `ftbBlocked`, retains the hard `assert(!ftqFull)`.
+
+### Step 2: the measured run-ahead bound
+
+`src/test/scala/m68k040/frontend/FtqCapacitySpec.scala` builds the densest legal
+FTQ producer the frontend can express: a chain of eight-byte windows whose first
+word is a learned one-word unconditional branch to the next window.  Every
+accepted cache command therefore yields exactly one applied prediction, exactly
+one FTQ push, and exactly one genuine IBuf word — and the RTL already asserts
+`resultEnd > ringDrop(resultSlot)` on application, so no legal stimulus can push
+an FTQ entry without also consuming a ring slot or at least one IBuf word.  That
+is the structural reason the bound is `RING + BUF_WORDS`.
+
+The run holds decode for the entire run-ahead phase, withdraws the cache command
+port on a 4-of-7 duty cycle to force applications into the one-entry target hold,
+drives the ring to full occupancy, redirects at maximum occupancy, rebuilds
+run-ahead, and finally releases decode so confirmations pop real entries.
+
+Every push, pop, and flush is counted as a real event and an independent mirror
+of occupancy is rebuilt from those counts and compared with the hardware
+`ftqCount` register on every cycle; any divergence fails immediately.  Measured
+census over 456 cycles:
+
+| Quantity | Measured | Bound |
+|---|---:|---:|
+| Peak FTQ occupancy | **17** | 32 configured |
+| `ftqFull` pulses | **0** | must be 0 |
+| Peak fetch-ring occupancy | 3 | `RING` = 3 |
+| Peak IBuf occupancy | 17 words | `BUF_WORDS` = 20 |
+| Real FTQ pushes | 57 | — |
+| Real FTQ pops (decode confirmations) | 40 | — |
+| Flushes / flushes discarding live entries | 2 / 1 | — |
+| Target-hold cycles | 128 | — |
+
+Peak run-ahead is limited by the existing IBuf landing reservation
+`cnt + (ringCount+1)*4 <= BUF_WORDS`, not by the FTQ: once 17 one-word windows
+are resident, no further command may issue.  The elaboration bound
+`ftqDepth >= RING + BUF_WORDS + 1` = 24 is the conservative structural argument;
+17 is the reachable maximum under this reservation.
+
+A companion elaboration test requires depth 32 to build and depth 16 to fail the
+constructor bound with its exact message.
+
+### Step 3: the cut
+
+`ftqFull` is removed from `ftbBlocked`, which was its sole functional consumer.
+`applyNow`, the fetch-PC mux, I-cache readiness, and prefetch/install state never
+referenced it, matching the amendment's explicit prohibition list.  The hard
+`assert(!ftqFull)` stays; SpinalHDL emits it inside `` `ifndef SYNTHESIS ``, and
+the regenerated netlist confirms `FetchAlignPlugin_logic_ftqFull` is now read
+only inside that block.
+
+The generated Verilog differs from `9101c5a`'s archived netlist in exactly one
+functional line — the `ftbBlocked` assign — plus the git-hash comment and
+line-number-derived signal renaming.  This is a single-variable A/B.
+
+### Step 4: mutation proof
+
+Temporarily disabling the constructor bound (`require(true || ...)`) and
+elaborating the same stress DUT at `ftqDepth = 16` makes the step-2 test trip the
+retained tripwire: `FAILURE FTQ reached its defensive full state despite the
+run-ahead bound` at t=1070, `spinal.sim.SimFailure: HDL assertion failure`.  Both
+mutations were reverted; the working tree at `28ec738` contains neither.
+
+This proves three things at once: the assertion is a live net rather than dead
+text, the depth-32 choice is load-bearing because the next lower power of two
+genuinely overflows, and the stress test is non-vacuous because it drives
+occupancy past 16.
+
+Independently, the step-2 census is **bit-identical before and after the cut** —
+456 cycles, peak 17, 57 pushes, 40 pops, 2 flushes, 128 target-hold cycles, 0
+full pulses.  The veto was never functionally engaged, only physically expensive.
+
+### Functional gates
+
+- `make SBT=~/sbt/bin/sbt test-fast`: **149 passed / 149 total, 157 suites**.
+  The count moves from the documented 148 because the new elaboration-bound test
+  is a pure-elaboration test and therefore untagged; the stress test itself is
+  `VerilatorTest` and stays outside the fast gate.
+- `FetchDirectedFtbSpec` 16/16 and `FtqCapacitySpec` 2/2.
+
+### Step 5: physical result
+
+**This is the largest single-cut FMax gain of the campaign, and the first cut
+that improved both synthesis and route.**
+
+| Metric | `9101c5a` baseline | `28ec738` FTQ cut | Delta |
+|---|---:|---:|---:|
+| Post-synth WNS | -2.440 ns | **-2.316 ns** | **+0.124 ns** |
+| Post-route WNS | -3.534 ns | **-2.587 ns** | **+0.947 ns** |
+| FMax | 132.732 MHz | **151.814 MHz** | **+19.082 MHz (+14.4%)** |
+| TNS | -45,594.648 | **-30,937.422** | **+14,657.226 (-32.1%)** |
+| Failing endpoints | 53,953 | **45,597** | **-8,356** |
+| Routed LUT | 113,569 | 113,487 | -82 |
+| Routed FF | 50,385 | 50,328 | -57 |
+| BRAM / DSP | 26 / 4 | 26 / 4 | unchanged |
+| Decode pblock | 32,805 / 43,680 (75.10%) | **30,288 / 43,680 (69.34%)** | -2,517 sites |
+
+Route is clean: WHS +0.031 ns, THS 0.000, WPWS +1.458 ns, zero hold and zero
+pulse-width failures, and no congestion windows above level 5.  Device use is
+52.31% LUT, 11.60% FF, 5.42% BRAM, 0.22% DSP.  `FLOORPLAN_MODE decode`,
+`SOURCE_MD5 = NETLIST_MD5 = 065275a9ef34e5abb30d4361c249bc40`, Vivado exit 0.
+
+Unlike the previous three cuts, this one did **not** trade route for synthesis.
+`dc16fc1`, `cc22cd0`, and `9101c5a` each removed their target family but lost
+post-route WNS to a newly dominant family; this cut improved every timing metric
+simultaneously and shrank both total and in-pblock area.
+
+**Recensus — the target family is gone.**  `ftqCount` appears **0 times** in the
+routed slack matrix and **0 times** in the whole post-route timing report, versus
+100/100 of the top 100 startpoints at `9101c5a`.  The eliminated startpoint is
+100% displaced; the new top 100 are unanimously:
+
+```
+100  FetchAlignPlugin_logic_ringDrop_1_reg[0]/C   (startpoint, all 100)
+```
+
+fanning into I-cache prefetch and line state:
+
+| Endpoint family | Paths in top 100 |
+|---|---:|
+| `IcachePlugin_logic_lineReg` | 33 |
+| `IcachePlugin_logic_pfNextPa` | 29 |
+| `IcachePlugin_logic_pfTag_0` | 9 |
+| `IcachePlugin_logic_arHoldAddr` | 9 |
+| `IcachePlugin_logic_pfSet_0` | 3 |
+| `IcachePlugin_logic_s1PredEntries_{0,1,2}` | 6 |
+| other `IcachePlugin` prefetch state | 11 |
+
+Worst path is `ringDrop_1_reg[0]/C -> IcachePlugin_logic_pfComplete_0_reg/D` at
+-2.587 ns.  The critical path has therefore left the FTQ occupancy counter
+entirely and now sits on the **ring-drop-to-prefetch** arc: a single `ringDrop`
+bit broadcasting into the live VIPT/L1I prefetch address, tag, set, and line
+registers.  That is the next cut's target family, and it is a genuinely
+different structure from the four already removed — a fanout/broadcast problem
+rather than a functional-association or capacity-veto problem.  Note the
+startpoint is one bit driving all 100 paths, so the promising direction is
+reducing what `ringDrop` gates or registering it closer to the I-cache, not
+another association cut.
+
+Archived at `synth/archive/28ec738_ftq_capacity_cut_decode/`.
