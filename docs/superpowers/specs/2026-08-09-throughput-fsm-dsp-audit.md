@@ -3,10 +3,12 @@
 **Status:** REVIEW COMPLETE; the aligned LSU/VIPT, tagged changed-VPN DTLB,
 slow-ALU, MOVEM arithmetic, fetch-ring turnover, COPYBACK store-drain, fixed-
 latency CPLX MUL, and registered-token FTB recommendations have landed and
-passed their simulation gates. The broad pre-FTB/pre-deep-MUL physical
-checkpoint reached 173.430 MHz with healthy device-wide area but an overfull
-D-cache pblock. Final shared post-route FMax/area/floorplan acceptance is still
-pending. This document records findings and priorities; it does not amend the
+passed their simulation gates. The first final-feature physical route was
+120.438 MHz; two bounded frontend cuts have recovered it to 155.111 MHz with
+healthy device-wide area, fully registered multiplier DSPs, and an overfull
+D-cache pblock. Endpoint/floorplan recovery is active; the 200-MHz deployment
+floor and 250-MHz optimization goal are not yet met. This document records
+findings and priorities; it does not amend the
 fixed architecture by itself. Any item marked "spec update required" must be
 reconciled in the owning architecture document before RTL is changed.
 
@@ -60,7 +62,7 @@ inhibited, and discovered-miss cases deliberately remain ordered barriers.
 | landed | aligned LS/L1D hit path (`LsEuPlugin`, `DcachePlugin`) | resident load II=1 across same or alternating VPNs; multiple operations in P2/P3/P4, descriptor ring, and VIPT-result queue | hottest memory path; hard, completed in simulation | retain pruned contexts, ordered untagged cache responses, accept-last turnover, and tokenized early results | precise fault order, store forwarding, flush poison, completion priority; routed area/FMax still required |
 | landed | changed-VPN DTLB turnaround (`DtlbPlugin`) | tagged command/result pipe is II=1 on resident hits, with one registered lookup cycle | memory hot-path edge; completed in simulation | retain one shallow TLB, one walker, ordered miss blocking, U/M credit reservation, and epoch/token cancellation | routed tag-result-to-D-cache resolve path remains a physical gate |
 | P1 | D-cache demand-miss engine (`DcachePlugin`) | one `IDLE/EVICT_WR/REFILL/REPLAY` context; no demand hit-under-demand-miss | miss path; moderate for one parked miss, hard for many | implement one parked MSHR plus hit-under-miss, with same-set/claimed-way exclusion and ordered completion; do not start with general multi-MSHR | untagged responses, dirty victim ordering, shared store RMW port, fault/flush association; the current SoC crossbar cannot exploit multiple simultaneous bus misses |
-| landed | fixed-latency CPLX MUL (`MulCore`, `DivEuPlugin`) | seven-stage datapath, II=1 integrated issue and completion; MUL remains live while DIV iterates | potentially hot; completed in simulation at the former latency | retain pruned descriptor pipe, reserved result credits, one existing completion port, pending MULHI tails, and ROB-keyed high halves | seven-stage DSP-register reshape and routed area/FMax acceptance remain |
+| landed | fixed-latency CPLX MUL (`MulCore`, `DivEuPlugin`) | seven-stage datapath, II=1 integrated issue and completion; MUL remains live while DIV iterates | potentially hot; completed in simulation and physically mapped | retain pruned descriptor pipe, reserved result credits, one existing completion port, pending MULHI tails, and ROB-keyed high halves | all four DSPs use A/B/M/P internal registers; overall-core FMax recovery remains |
 | P2 | legacy CPLX/divide lane (`DivEuPlugin`) | CHK/CMP2 about II=2; one DIV context about II=67; a parked second DIV can still block a younger MUL at the registered issue port | mostly cold/iterative; moderate | keep one divider; measure before adding a pending-DIV slot or IQ eligibility forecast; consider 32-step W/L32 iteration only if DIV matters | forecast must reserve the registered issue slot; global remainder/overflow association must be replaced before allowing multiple DIV families in flight |
 | landed | SQ-to-D-cache drain (`StoreQueue`, `DcachePlugin`) | committed non-precise COPYBACK hits traverse elastic S0–S3 and acknowledge at II=1; send and ack cursors are independent | store-heavy hot path; completed in simulation | retain forwarding visibility through terminal ack, S3 same-line/victim bypass, and hard barriers for precise/WT/inhibited/miss traffic | S1 read-port fairness and StoreQueue↔D-cache ready corridor remain physical gates; never loosen independent AXI AW/W writers |
 | landed/P2 | L1I/frontend and demand fill (`IcachePlugin`, `FetchAlignPlugin`) | resident hit path is latency 3 / II=1, full-ring turnover hides it, and the registered-token FTB redirects predicted fetch before decode; one demand/prefetch fill engine still closes demand fetch until replay | all-hit path and prediction completed in simulation; miss path remains moderate–hard | retain the staged TLB/cache path, exact `{ringSlot,seq}` association, FTQ splice clamp, and decode-time fallback; only if measured, add a tiny ordered queue around one demand MSHR | `FetchRsp` is untagged, so miss bypass needs ordering or tags; FTB/floorplan physical acceptance remains open |
@@ -159,13 +161,12 @@ acceptance of the new FTB/FTQ storage and routing remains pending.
 
 ## 4. DSP-backed users
 
-The integer DSP user is now pipelined at the execution-system boundary in RTL
-and directed simulation.  Physical confirmation that Vivado uses the intended
-DSP48E2 internal registers remains open.
+The integer DSP user is pipelined at the execution-system boundary and physically
+confirmed in the final-feature full core.
 
 | user | DSP count | core latency / II | integrated behavior | finding |
 |---|---:|---:|---|---|
-| integer `MulCore` | 4 expected | 7 / 1 | integrated `DivEuPlugin` accepts and completes dense MUL at II=1, including while DIV is active | seven-stage reshape selected after physical mapping proved the four-cycle form left every MREG unused |
+| integer `MulCore` | 4 confirmed | 7 / 1 | integrated `DivEuPlugin` accepts and completes dense MUL at II=1, including while DIV is active | all four DSP48E2s have `AREG=2`, `BREG=2`, `MREG=1`, and `PREG=1`; Vivado reports no remaining DSP-register candidate |
 | divider | 0 | about 66 / 67 | single iterative context | keep iterative unless a measured workload justifies a different algorithm |
 | MOVEM decode arithmetic | 0 after strength reduction | combinational | not a queue | the 173.430-MHz checkpoint confirms the two accidental DSPs are gone; endpoint recovery remains part of the final route |
 | FPU | not implemented | draft only | fixed-latency FADD/FSUB/FMUL and cheap operations are now specified as elastic II=1; FDIV/FSQRT retain one iterative context | carry pruned descriptors, reserve result credit, and physically verify DSP A/B/M/P registers before RTL acceptance |
@@ -208,7 +209,10 @@ Vivado reported one post-multiply pipeline register and recommended four. An
 isolated seven-stage inference probe with unconditional invalid-cycle data
 shifting maps all four slices to `AREG=BREG=2`, `MREG=PREG=1`, keeps the DSP
 count at four, reduces total LUTs from 48 to 18, and adds 66 FF. The full-core
-mapping and endpoint result remain the open acceptance items.
+gate now confirms that exact A/B/M/P mapping on all four slices and reports no
+DSP-register optimization candidate. Current global area is 109,217 LUTs,
+50,507 FF, 26 BRAM tiles, and four DSPs; the routed limiter is a frontend
+decode-fallback/ITLB path, not the multiplier.
 
 ### 4.2 MOVEM strength reduction
 
@@ -304,7 +308,7 @@ standalone interrupt tests no longer fail elaboration and retry first.
 
 | document family | review result | action |
 |---|---|---|
-| binding core architecture | reconciled: seven-stage II=1 integer MUL uses the existing shared CPLX gateway and ports | full-core physical mapping/FMax/area acceptance remains open |
+| binding core architecture | reconciled: seven-stage II=1 integer MUL uses the existing shared CPLX gateway and ports | DSP mapping and area are physically accepted; whole-core FMax recovery remains open |
 | LS pipeline specs/plans | newest full-pipeline spec is correct and now carries aligned-load, tagged changed-VPN, U/M-credit, and split-page results; older late-split documents are historical checkpoints | treat `2026-08-09-ipc-ls-eu-full-pipeline-design.md` as current |
 | ALU slow-path spec | implemented and simulation-gated at II=1 | run the paired routed FMax/LUT and IQ-endpoint census before final acceptance |
 | MSHR proposal | correctly prioritizes D-side hit-under-miss and warns about crossbar limits | implement one parked miss before general MSHRs |
@@ -315,16 +319,19 @@ standalone interrupt tests no longer fail elaboration and retry first.
 
 ## 7. Ordered implementation recommendation
 
-1. When the serialized Vivado window is free, route the final landed set
-   (LSU/VIPT/DTLB, store S0–S3, ALU II=1, seven-stage MUL, and registered-token
-   FTB) at the standing 4-ns constraint. Do not infer closure from simulation.
-2. Report WNS/TNS/failing families, exact LUT/LUTRAM/FF/BRAM/DSP deltas, DSP
-   A/B/M/P properties, and every affected pblock's capture, occupancy, and
-   congestion. An area breach is a review checkpoint for the owner, not an
-   automatic rollback.
-3. Pivot to endpoint-driven timing and floorplan recovery immediately after that
-   characterization. The optimization goal remains 250 MHz and the deployment
-   floor remains 200 MHz; the earlier 173.430-MHz checkpoint is not acceptance.
+1. The final landed set has been routed at the standing 4-ns constraint. The
+   current recovery checkpoint is WNS -2.447 ns / 155.111 MHz, TNS -31,052.055
+   ns, 48,965 failing setup endpoints, and clean hold.
+2. Device area is healthy and all multiplier DSP stages are physically proven.
+   The floorplan is not: `pb_decode` is 96.78% physically occupied and
+   `pb_dcache` has 5,910 assigned CLBs for 5,460 sites (117.62% physical
+   occupancy). An area breach remains a review checkpoint, not an automatic
+   rollback.
+3. Continue the active endpoint/floorplan recovery. First pair a right-edge
+   pblock expansion on the identical netlist; if insufficient, register the
+   measured decode fallback-prediction action without delaying its C+1 target
+   command. The optimization goal remains 250 MHz and the deployment floor
+   remains 200 MHz.
 4. Measure D-cache miss occupancy and legacy CPLX/divide mix on representative
    workloads. The changed-VPN and COPYBACK-hit counters should now confirm their
    landed II=1 behavior rather than select whether to implement it.
