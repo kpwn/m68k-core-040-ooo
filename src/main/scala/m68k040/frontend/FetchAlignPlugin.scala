@@ -717,6 +717,10 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // ---- Aligner: combinational decode of buffer head ----
     val res = Aligner.align(decodePc, ibuf.io.head, ibuf.io.headPred, availEff, p0LiveReg)
     spinal.core.sim.SimPublic(ibuf.io.headPred(0).simple, ibuf.io.head(0))
+    // The FTQ capacity proof measures real buffer occupancy, not an inferred one: the
+    // legal run-ahead bound is `RING + BUF_WORDS`, so a stress test must show which of
+    // the two terms it actually saturated. Simulation-only annotation.
+    spinal.core.sim.SimPublic(ibuf.io.cnt, ibuf.io.avail)
 
     // ── Fetch-time prediction (BTB + bimodal, slice 1) ───────────────────────────
     // Query the BTB combinationally with the aligner's slot0/slot1 instruction PCs;
