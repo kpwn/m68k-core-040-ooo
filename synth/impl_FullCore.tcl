@@ -39,7 +39,12 @@ if {[llength $synth_paths] > 0} {
   set synth_wns [get_property SLACK $synth_paths]
   puts "POSTSYNTH_FULLCORE_WNS_NS $synth_wns"
 }
-set floorplan_mode "both"
+# The 2026-08-10 five-ID/token-cut exact-DCP 2x2 shows that the legacy broad
+# D-cache pblock is now harmful: decode-only is reproducibly -2.720 ns versus
+# -2.804 ns for both and -3.648 ns for D-cache-only. Keep every mode available
+# as a diagnostic override, but make the measured current-netlist winner the
+# default rather than silently applying the obsolete LS-cluster constraint.
+set floorplan_mode "decode"
 if {[info exists ::env(SKIP_FLOORPLAN)] && $::env(SKIP_FLOORPLAN) eq "1"} {
   set floorplan_mode "none"
 }
