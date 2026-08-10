@@ -14,9 +14,10 @@
 # Read AFTER opt_design (see impl_FullCore.tcl) so the cell filter sees elaborated leaves.
 # The original measured sweet spot used the same X span as pb_decode (X36..X75), stacked
 # above it at Y110..Y214. Netlist growth subsequently required right-only expansion first
-# to X81 (46 columns) and then X87 (52 columns); the current region is therefore
-# X36Y110:X87Y214. Keeping X36 fixed preserves decode/LS co-location and avoids the
-# measured regression from widening both sides.
+# to X81 (46 columns) and then X87 (52 columns). The checkpoint-2 netlist assigns 5,910
+# parent CLBs to only 5,460 X87-box sites and physically occupies 117.62% of the region.
+# A paired exact-netlist X103 experiment reduced this to 102.30% but regressed global
+# route WNS -2.447 -> -2.558 ns. Keep X87 pending the no-floorplan/split controls.
 #
 # ITERATIONS (full-core post-route, OOC 4 ns; master baseline -0.514 / 221.5 MHz):
 #   v1  X36Y110:X75Y214 (original)   WNS -0.317 / 231.6 MHz   <-- BEST (+10.1 MHz)

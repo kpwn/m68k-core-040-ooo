@@ -11,8 +11,14 @@
 # A robust full capture (hierarchical cell / keep_hierarchy on DecodeStage) is a floorplan
 # refinement to fold into the broader floorplan track (alongside the D-cache pblock).
 #
+# FMax recovery checkpoint 2 (2026-08-10): the X87 box reached 96.78% physical
+# occupancy and the routed limiter left its right edge for FetchAlign/ITLB endpoints
+# around X99..X103. A paired exact-netlist X87 -> X103 expansion reduced regional
+# occupancy to 93.60% but regressed route WNS -2.447 -> -2.558 ns (155.111 ->
+# 152.486 MHz). Keep X87; extra territory lengthened the decode-to-ITLB route.
+#
 # FMax closure round 3/4 (2026-08-08): widened X75 -> X87 (40 -> 52 columns, left edge
-# anchored at X36, unchanged). An earlier attempt at exactly this resize (docs/superpowers/
+# anchored at X36, unchanged). An earlier attempt at exactly that resize (docs/superpowers/
 # specs/2026-08-08-fmax-levere-pbdecode-floorplan-design.md) REGRESSED FMax (-6.84MHz) because
 # the annexed territory was occupied by RobPlugin (8751 cells)/IcachePlugin, not spare --
 # widening evicted them and the eviction cascaded into worse problems elsewhere. "LS/ROB Lever
