@@ -2234,3 +2234,100 @@ except that lever 2 is now closed:
    the last untried *cheap* structural change.
 5. Banked TNS/endpoint-breadth cuts, judged against `explore`'s 28,795 failing
    endpoints rather than against 32,408.
+
+### Step 7: the recensus — the limiter is not a startpoint family, it is the parallel-VIPT amendment's own named risk cone
+
+Task item 4 asks what the recensus shows as the next-most-binding family if the
+two shelved fixes price out.  The answer is that **the question is mis-framed,
+and this section's own ladder is the evidence.**
+
+Every what-if ladder this campaign has run (sections 15, 16, 17 and step 3
+above) retires **startpoint** families, because a top-N census is naturally read
+that way.  Re-read step 3's ladder by *endpoint* instead:
+
+```
+rungs 0, 4, 5, 6, 7, 8, 11  ->  IcachePlugin_logic_lineReg_reg[418]/D      (7 of 13)
+rungs 2, 9, 12              ->  FetchAlignPlugin_logic_predictPending_reg/D (3 of 13)
+rungs 3, 10                 ->  DcachePlugin tag/valid arcs                (2 of 13)
+rung  1                     ->  FetchAlign p0LiveReg_lenWords[0]/D         (1 of 13)
+```
+
+**Ten of the thirteen rungs share two endpoints.**  Retiring startpoints one at
+a time does not remove a cone; it rotates through the *fan-in* of the same cone,
+which is precisely why the ladder crawls at ~0.007 ns per rung.  Sections 15 and
+16 both diagnosed "backfill" and both attributed it to the startpoint families
+being adjacent in slack.  The endpoint reading says something stronger and more
+actionable: they are adjacent because they are **the same path, entered from
+different doors.**
+
+#### What that cone actually is
+
+Reading the archived routed trail of the frontend arc end to end — rather than
+inferring it — gives the mechanism:
+
+```text
+FetchAlignPlugin stalled_reg/C
+  -> FetchAlignPlugin applyNow                       fo=143
+  -> FetchAlignPlugin predictTargetReg[13]           fo=177
+  -> IcachePlugin pfDemandLine[31] logic             fo=165
+  -> ItlbPlugin  tlb_io_hit                          fo=67    <-- LIVE TRANSLATE
+  -> IcachePlugin lookupPaddr[3]                              <-- ppn ## pc[11:0]  (:185)
+  -> IcachePlugin hitVec_1 / s1Way                            <-- PHYSICAL TAG COMPARE
+  -> IcachePlugin arHoldId -> missPA[29]
+  -> IcachePlugin pfInstallIdx[0]                    fo=518   <-- 0.472 ns OF ROUTE, ONE NET
+  -> IcachePlugin lineReg0_in[418] -> lineReg[418]/D
+```
+
+A redirect, a **live ITLB translation**, a **physical tag compare**, and the
+**prefetch-install decision** all resolve in one cycle, and the install select
+fans out to 518 loads at the end of it.  `lookupPaddr` is literally
+`(xlate.rsp.ppn ## lookupPc(11 downto 0))` (`IcachePlugin.scala`:185) — the
+translation result concatenated combinationally into the address that then
+drives the tag compare.
+
+One net on that chain, `pfInstallIdx[0]` at fanout 518, carries **0.358-0.491 ns
+of pure route delay** across the top paths (0.472 ns on the reported WNS path).
+For scale: the distance to the 200 MHz floor is 0.472 ns.  That is a coincidence
+of magnitude, not a claim that deleting the net buys the floor — the D-cache/IQ
+arc is tied at the same slack and would backfill — but it does identify where
+the time physically is.
+
+A caution for whoever picks this up, recorded because this pass nearly published
+it wrong: the obvious reading of that net's name is that it is `pfInstallSel`
+(`IcachePlugin.scala`:544), and **that reading is incorrect.**  `pfInstallSel`
+is `OHToUInt(OHMasking.first(pfInstallVec))` over `pfValid && pfComplete &&
+!pfErr && !pfPoison` — four *registers*, so its own fan-in is about three levels
+deep and it cannot be what a 20-level path arrives through.  The net carries the
+synthesised name of the register it feeds while being driven by the *install
+condition* at the end of the demand chain.  Name a net from the routed trail,
+not from the RTL identifier it resembles.
+
+#### This is a spec-anticipated risk, and its reporting obligation is now overdue
+
+`docs/superpowers/specs/2026-08-10-icache-parallel-vipt-design.md` is a **binding
+amendment** that authorised exactly this structure — "a single accepted fetch
+launches the ITLB lookup, async tag/prediction lookup, and synchronous data-BRAM
+read in parallel from the same virtual address" — and it named this precise cone
+as its one physical risk, in its own words:
+
+> the only physical risk is the live ITLB-to-hit-context register cone.  That
+> cone **must be reported separately in the next 250-MHz route gate**.
+
+and it pre-authorised the recovery:
+
+> If the new ITLB-to-S1 cone materially regresses routed FMax, the permitted
+> recovery is to **pipeline the ITLB's internal hit-way result** or improve
+> placement.  Do not restore a translation-to-BRAM-address dependency or delete
+> the response register.
+
+`ItlbPlugin_logic_tlb_io_hit` appears on **four of the ten** worst reported paths
+in the landed gate.  The cone did materialise, the separate report the amendment
+required has not been filed by any section of this handoff, and the recovery it
+permits — pipelining the ITLB hit-way result — is **already architecturally
+authorised**, so it needs no new spec decision, only a design and a proof.
+
+**That is the honest answer to "what is the next-most-binding family": it is not
+a family.  It is the live-translate-to-install cone, it is the one structural
+lever this campaign has not measured, its fix is pre-authorised by a binding
+spec, and filing its measurement discharges an obligation that spec already
+imposed.**
