@@ -57,13 +57,14 @@ when prefetch is disabled.
 | ID | owner | architectural response |
 |---:|---|---|
 | 0 | reserved demand slot | exactly one `FetchRsp` |
-| 1..4 | silent speculative slots | none, unless promoted |
+| 1..4 | silent speculative slots | none |
 
-A speculative slot may be promoted when the held demand address matches its
-line.  Promotion attaches the sole demand waiter to that existing slot and
-must not issue another AR.  While a demand waiter exists, later cache commands
-are backpressured.  This deliberately keeps one demand response outstanding
-and preserves the current untagged FetchRsp contract.
+When a held demand address matches a speculative slot, the command remains
+stable under backpressure and re-looks up after that slot installs.  It must not
+issue another AR.  If the speculative fill fails, it is discarded and the held
+demand then allocates ID 0 as a new architectural transaction.  This retains
+the already-proven singleton-prefetch retry contract and avoids turning a
+silent request into a faulting request halfway through an AXI burst.
 
 Slot state is registered and minimal:
 
@@ -72,9 +73,10 @@ FREE -> AR_PENDING -> FILL -> COMPLETE -> INSTALL -> FREE
 ```
 
 Each live slot carries line VA/PA, set, physical tag, reserved victim way,
-expected beat, accumulated error, poison, and optional demand PC.  Slot index
-is the AXI ID; no response CAM is added in the core.  A response with no live
-matching slot is a fatal simulation error.
+expected beat, accumulated error, and poison.  Slot index is the AXI ID; no
+response CAM is added in the core.  ID 0 retains the existing demand miss PC,
+cache-mode, line, and fault context.  A response with no live matching slot is
+a fatal simulation error.
 
 ID 0 remains available for a new redirect-target demand even while IDs 1..4
 carry wrong-path speculative fills.  Outstanding speculation is poisoned or
@@ -111,14 +113,16 @@ P1-P4 are unchanged:
 ## 5. Fill storage and shared install pipe
 
 Do not replicate the 512-bit `lineReg` five times and do not replicate the
-predecoder.  Use two shallow, ID-indexed memories, each five entries by 256
-bits, for low and high AXI beats.  One R beat is accepted per cycle and written
-to the memory selected by RID and the slot's registered beat phase.
+predecoder.  ID 0 retains the existing demand `lineReg`.  Use two shallow,
+ID-indexed memories, each four entries by 256 bits, for the low and high beats
+of speculative IDs 1..4.  One R beat is accepted per cycle and written to the
+destination selected by RID and the slot's registered beat phase.
 
-These shallow stores are expected to map to LUTRAM, not BRAM.  A completed slot
-is selected with demand priority and both halves are read into one registered
-512-bit shared install buffer.  The existing 16-word `classifyBeat` hardware is
-reused over two registered commit cycles:
+These shallow stores are expected to map to LUTRAM, not BRAM.  A completed
+speculative slot is selected only when the demand FSM does not need the shared
+installer; both halves are read into the existing registered 512-bit
+`lineReg`.  The existing 16-word `classifyBeat` hardware is reused over two
+registered commit cycles:
 
 1. install low data beat and its prediction half using the high beat for the
    three-word lookahead;
@@ -134,14 +138,15 @@ The victim line stays valid until installation starts.  An errored or poisoned
 fill therefore need not destroy it.  A successful fill changes visibility
 atomically at the final install edge.
 
-For a poisoned but otherwise successful demand, the shared install buffer and
+For a poisoned but otherwise successful demand, its `lineReg` and
 classified prediction carry the response through the existing miss bypass,
 but no array/tag/valid update occurs.  A speculative poisoned fill is simply
 freed after its beats drain.
 
-Expected incremental storage is roughly 2,560 fill bits in shallow LUTRAM plus
-five narrow contexts and one existing-size shared install register.  There is
-no new cache port, data BRAM, classifier copy, TLB entry, DSP, or ROB/IQ port.
+Expected incremental storage is roughly 2,048 fill bits in shallow LUTRAM plus
+four narrow speculative contexts; the demand context and shared install
+register already exist.  There is no new cache port, data BRAM, classifier
+copy, TLB entry, DSP, or ROB/IQ port.
 
 ## 6. AXI protocol
 
@@ -173,8 +178,8 @@ green.
   pass it.
 - A speculative error never raises an architectural or diagnostic fault and
   never writes cache state.
-- A promoted speculative error becomes the attached demand's precise physical
-  bus fault; no duplicate demand AR is issued after promotion.
+- A speculative error is discarded.  A held real demand then issues one new
+  ID-0 transaction whose own response determines its precise result.
 - `invalidateAll` clears resident valids and poisons every live slot.  Late
   completion cannot repopulate the cache.  An already accepted demand still
   receives one response so FetchAlign can retire its stale ring entry.
@@ -195,14 +200,14 @@ The implementation gate must include:
    model.  After bootstrap, require no demand refill after the first, bounded
    line-boundary bubbles, and a measured peak of five live ARIDs.  Mutation to
    one live ID or the singleton FSM must fail both concurrency and cadence.
-4. Promote an in-flight speculative line to demand.  Require no duplicate AR,
-   exact eventual response, and stable held command semantics.
+4. Hold a demand on an in-flight speculative line.  Require no duplicate AR,
+   stable command payload until install, and one exact eventual hit response.
 5. Fill IDs 1..4 with wrong-path traffic, redirect to an unrelated cold line,
    and prove reserved ID 0 issues and completes without waiting for those
    slots to become free.
-6. Inject an error into a silent fill, then demand that line and prove a new
-   architectural transaction.  Separately inject an error after promotion and
-   require one precise fault and no allocation.
+6. Inject an error into a silent fill while a matching demand is held.  Require
+   the silent request to allocate nothing, followed by exactly one new ID-0
+   architectural transaction whose response determines success or fault.
 7. Exercise real nonidentity ITLB mappings, page-end suppression, inhibited
    mode, resident suppression, same-set exclusion, and mapping association.
 8. Pulse invalidation at AR_PENDING, each R beat, COMPLETE, and both install
