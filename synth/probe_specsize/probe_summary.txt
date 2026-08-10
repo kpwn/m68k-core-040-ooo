@@ -1,0 +1,58 @@
+PROBE BASELINE WNS -2.094  FetchAlignPlugin_logic_stalled_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE SPECSIZE_CELLS 7
+PROBE   cell _zz_DecodeStage_logic_fed_payload_specs_0_spec_size_reg[0]
+PROBE   cell _zz_DecodeStage_logic_fed_payload_specs_0_spec_size_reg[1]
+PROBE   cell _zz_DecodeStage_logic_fed_payload_specs_0_spec_size_reg[1]_i_8
+PROBE   cell _zz_DecodeStage_logic_fed_payload_specs_1_spec_size_reg[0]
+PROBE   cell _zz_DecodeStage_logic_fed_payload_specs_1_spec_size_reg[1]
+PROBE   cell _zz_DecodeStage_logic_fed_payload_specs_1_spec_size_reg[1]_i_2
+PROBE   cell _zz_DecodeStage_logic_fed_payload_specs_1_spec_size_reg[1]_i_3
+PROBE SPECSIZE_PATHS 4000
+PROBE SPECSIZE_WORST -1.776  _zz_DecodeStage_logic_fed_payload_specs_0_spec_size_reg[0]/C -> FetchAlignPlugin_logic_predictPending_reg/D
+PROBE ENDPOINT predictPending (3 cells) worst -1.776  from _zz_DecodeStage_logic_fed_payload_specs_0_spec_size_reg[0]/C
+PROBE ENDPOINT predictTarget (96 cells) worst -1.441  from _zz_DecodeStage_logic_fed_payload_specs_0_spec_size_reg[0]/C
+PROBE ENDPOINT ras_all (576 cells) worst -1.727  from _zz_DecodeStage_logic_fed_payload_specs_0_spec_size_reg[0]/C
+PROBE WHATIF_A specsize-free WNS -2.094  FetchAlignPlugin_logic_stalled_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE RELOADED
+PROBE LADDER    0   -2.094  +0.000   FetchAlignPlugin_logic_stalled_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER    1   -2.074  +0.020   FtbPlugin_logic_rspPayload_brWordOff_reg[0]/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER    2   -2.050  +0.024   FetchAlignPlugin_logic_quiesce_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER    3   -2.024  +0.026   GsharePlugin_logic_pht_spinal_port4_reg[1]/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER    4   -2.002  +0.022   FetchAlignPlugin_logic_targetHoldValid_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER    5   -2.001  +0.001   FtbPlugin_logic_rspPayload_brType_reg[0]/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER    6   -1.960  +0.041   GsharePlugin_logic_pht_spinal_port3_reg[1]/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER    7   -1.959  +0.001   FetchAlignPlugin_logic_faultHold_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER    8   -1.959  +0.000   GsharePlugin_logic_pht_spinal_port2_reg[1]/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER    9   -1.932  +0.027   GsharePlugin_logic_pht_spinal_port5_reg[1]/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER   10   -1.848  +0.084   FetchAlignPlugin_logic_ftbSuppress_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER   11   -1.823  +0.025   DcachePlugin_logic_stS1Payload_paddr_reg[6]/C -> IssueQueuePlugin_logic_sbInt_busy_reg[34]/D
+PROBE LADDER   12   -1.800  +0.023   DcachePlugin_logic_missSet_reg[4]/C -> IssueQueuePlugin_logic_sbInt_busy_reg[34]/D
+PROBE LADDER   13   -1.778  +0.022   FtbPlugin_logic_rspPayload_target_reg[12]/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER   14   -1.776  +0.002   _zz_DecodeStage_logic_fed_payload_specs_0_spec_size_reg[0]/C -> FetchAlignPlugin_logic_predictPending_reg/D
+PROBE LADDER spec_size BECAME BINDING at rung 14, WNS -1.776
+PROBE LADDER   15   -1.770  +0.006   _zz_DecodeStage_logic_fed_payload_packets_0_words_0_reg[4]/C -> FetchAlignPlugin_logic_predictPending_reg/D
+PROBE LADDER   16   -1.745  +0.025   FetchAlignPlugin_logic_targetHoldPc_reg[13]/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER   17   -1.744  +0.001   DcachePlugin_logic_stS2Payload_paddr_reg[8]/C -> IssueQueuePlugin_logic_sbInt_busy_reg[34]/D
+PROBE LADDER   18   -1.741  +0.003   FetchAlignPlugin_logic_fetchPc_reg[14]/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER   19   -1.735  +0.006   FtbPlugin_logic_rspValid_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER   20   -1.720  +0.015   DcachePlugin_logic_missCmode_reg[1]/C -> IssueQueuePlugin_logic_sbInt_busy_reg[34]/D
+PROBE LADDER   21   -1.716  +0.004   RobPlugin_logic_doFlushReg_reg/C -> IssueQueuePlugin_logic_sbInt_busy_reg[14]/D
+PROBE LADDER   22   -1.716  +0.000   FetchAlignPlugin_logic_ftqHead_reg[0]/C -> FetchAlignPlugin_logic_p0LiveReg_lenWords_reg[2]/D
+PROBE LADDER   23   -1.689  +0.027   FtbPlugin_logic_rspPayload_framedOk_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER   24   -1.678  +0.011   FetchAlignPlugin_logic_resultExpectedSlot_reg[0]/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER   25   -1.664  +0.014   DcachePlugin_logic_tagMem_2_reg/CLKARDCLK -> DcachePlugin_logic_valids_0_30_reg/D
+PROBE LADDER   26   -1.644  +0.020   _zz_DecodeStage_logic_fed_payload_packets_0_words_1_reg[0]/C -> FetchAlignPlugin_logic_predictPending_reg/D
+PROBE LADDER   27   -1.632  +0.012   DcachePlugin_logic_tagMem_3_reg/CLKARDCLK -> DcachePlugin_logic_valids_0_30_reg/D
+PROBE LADDER   28   -1.625  +0.007   FetchAlignPlugin_logic_ibuf/headPtr_reg[0]_rep/C -> FetchAlignPlugin_logic_predictPending_reg/D
+PROBE LADDER   29   -1.613  +0.012   FetchAlignPlugin_logic_ibuf/headPtr_reg[1]_rep__0/C -> FetchAlignPlugin_logic_predictPending_reg/D
+PROBE LADDER   30   -1.602  +0.011   DecodeStage_logic_ucPendPkt_words_0_reg[1]/C -> DecodeStage_logic_ucRomMem_spinal_port0_reg[44]/D
+PROBE LADDER   31   -1.596  +0.006   FetchAlignPlugin_logic_predictPending_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE LADDER   32   -1.591  +0.005   DcachePlugin_logic_stS3Payload_cacheMode_reg[0]/C -> IssueQueuePlugin_logic_sbInt_busy_reg[34]/D
+PROBE LADDER   33   -1.590  +0.001   DcachePlugin_logic_tagMem_0_reg/CLKARDCLK -> DcachePlugin_logic_valids_0_30_reg/D
+PROBE LADDER   34   -1.588  +0.002   DcachePlugin_logic_stS3Hit_reg/C -> IssueQueuePlugin_logic_sbInt_busy_reg[34]/D
+PROBE LADDER   35   -1.581  +0.007   RobPlugin_logic_exc_fsm_stateReg_reg[4]_rep__0/C -> IssueQueuePlugin_logic_sbInt_busy_reg[14]/D
+PROBE LADDER   36   -1.579  +0.002   LsEuPlugin_logic_p3Ctx_paddr_reg[6]/C -> LsEuPlugin_logic_p4Ctx_fwdStall_reg/D
+PROBE LADDER   37   -1.572  +0.007   DcachePlugin_logic_tagMem_1_reg/CLKARDCLK -> IssueQueuePlugin_logic_sbInt_busy_reg[34]/D
+PROBE LADDER   38   -1.566  +0.006   _zz_DecodeStage_logic_fed_payload_specs_0_srcEa_base_reg[0]/C -> FetchAlignPlugin_logic_predictPending_reg/D
+PROBE LADDER   39   -1.562  +0.004   DcachePlugin_logic_valids_3_75_reg/C -> IssueQueuePlugin_logic_sbInt_busy_reg[34]/D
+PROBE DONE

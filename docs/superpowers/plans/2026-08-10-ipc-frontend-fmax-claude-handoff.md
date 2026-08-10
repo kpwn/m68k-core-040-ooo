@@ -954,6 +954,12 @@ single-term control cuts have stopped paying.
    `IssueQueuePlugin` integer/NZVC scoreboard busy**, plus the decode
    `spec_size` -> RAS/predict family.  Both are new subsystems for this
    campaign and both need their own grounding pass.
+   > **Both grounding passes are done and both came back negative.**  The
+   > D-cache/IQ family is worth 0.000 ns (section 16); the decode
+   > `spec_size` -> `predictPending`/RAS family is worth +0.006 ns, and its whole
+   > endpoint group +0.004 ns (section 17).  Section 17 step 6 also measures the
+   > 200-rung ladder: retiring *two hundred* families still lands at 189.7 MHz.
+   > Do not pick a fourth family — go to placement/implementation strategy.
 4. Because the plateau is route-dominated, **re-validate the floorplan**: the
    four-mode comparison in section 5 was measured at `3c4e1f8`, five RTL cuts
    ago, when the decode pblock was 78.23% full; it is now 67.91% full and the
@@ -1286,3 +1292,226 @@ No RTL changed.  `6b246de` remains the head RTL checkpoint at **-2.094 ns /
 164.096 MHz**, `FLOORPLAN_MODE decode`.  New committed tool:
 `synth/probe_dcache_iq.tcl` (adds TNS / failing-endpoint deltas and an
 arbitrary-family what-if to the section-15 ladder, which only reported WNS).
+
+## 17. Measured negative result: `spec_size -> predictPending / RAS` is a decode-backpressure cone worth +0.006 ns (Claude, 2026-08-10)
+
+**Grounding only.  No RTL changed, and none should be written for this family.**
+Section 15 step 5 named `DecodeStage fed_payload_specs_0_spec_size ->
+FetchAlign predictPending` / `RasPlugin ras_*` (418 of the worst 4,000 paths,
+5.757 ns / 17 levels / **77.9 % route**) as the second of two new campaign
+targets.  Section 16 measured the first one (D-cache/IQ) at 0.000 ns.  This is
+the second, and the result is the same in kind: **retiring the `spec_size`
+startpoint family outright is worth +0.006 ns, and retiring the entire
+`predictPending` + `predictTargetReg` + `RasPlugin` *endpoint* group — 675
+cells, far more than any real cut could reach — is worth +0.004 ns measured
+across a 200-rung ladder.**
+
+Evidence: `synth/probe_specsize/` (scripts `synth/probe_specsize.tcl`,
+`synth/probe_specsize2.tcl`, `synth/probe_specsize3.tcl`), all read-only against
+`synth/archive/6b246de_ftb_framing_retime_decode/fullcore_routed.dcp`, netlist
+MD5 `d80f6218c5c7dcab94a33a52d64244fa`.  Every probe reproduced the archived
+WNS (-2.094), TNS (-21,068.689), failing-endpoint count (32,729), startpoint and
+endpoint exactly before any what-if, which validates the method.
+
+### Step 1: what the architectural connection actually is
+
+The dispatch hypothesis was that a decoded µop's SIZE field feeds fetch
+prediction because instruction length is needed to compute a next-fetch target.
+**That is wrong.**  `spec_size` does not reach the predictor as *data* at all.
+It reaches it as *backpressure*, through the decode stage's elastic `ready`
+chain.  The real arc, read off the live RTL:
+
+```text
+DecodeStage.scala:135    fedIn.payload.specs(i) := MicroOpAssembler.computeOffload(raw.payload.packets(i))
+DecodeStage.scala:146    val fed = PipeStage(fedIn, pipeFlush)          <- spec_size register lives here
+DecodeStage.scala:159    a0 = MicroOpAssembler.assemble(fed.packets(0), fed.specs(0))
+DecodeStage.scala:2004   fed.ready := (!stashValid && !movemHoldsFed && !slot0IsMovem && !ucHoldsFed &&
+                                       !movepHoldsFed && !slot0IsMovep && pushProduced.ready)
+                                      || movemEnterSlot0 || ucEnterSlot0 || movepEnterSlot0
+DecodeStage.scala:137    raw.ready   := fedIn.ready                     <- = !fedValid || fed.ready   (PipeStage.scala:16-18)
+DecodeStage.scala:111    df.feed.ready := rawIn.ready                   <- = !rawValid || raw.ready
+FetchAlignPlugin:1045    predictDetect := feed.fire && !faultHold && predictedThisEmit   -> predictPending
+FetchAlignPlugin:1126-28 rasPushValid  := feed.fire && !faultHold && s0IsCall
+                         rasPopValid   := feed.fire && !faultHold && rasPredictSlot0
+```
+
+So: `spec.size` is an input to `assemble`, whose output drives the decode-stage
+ownership/serialization predicates (`slot0IsMovem`, `slot0IsMovep`,
+`slot0OwnedByUc`, `deferSlot1`, `pushProduced.ready`) that form `fed.ready`.
+`fed.ready` then propagates **backwards, combinationally, through two 1-deep
+`PipeStage`s** — each of which has `in.ready := !valid || out.ready`
+(`PipeStage.scala:16-18`) — to `df.feed.ready`, and FetchAlign gates *all* of its
+prediction bookkeeping on `feed.fire = feed.valid && feed.ready`.  Prediction and
+RAS are downstream of decode's acceptance decision, not of any length field.
+
+The routed path confirms this exactly.  Its penultimate stretch is the net
+`FetchAlignPlugin_logic_ibuf/when_PipeStage_l17` at fanout 462 — that is
+`PipeStage.scala:17`'s `when(slotFree)`, i.e. the `raw` stage's
+`!valid || out.ready` — feeding `predictTargetReg[31]_i_3 ->
+predictPending_i_9 -> _i_3 -> _i_1 -> predictPending_reg/D`.  The prefix
+(0.000 -> 4.316 ns of the 5.757 ns) is the decode-side `fed.ready` cone; only the
+last 1.47 ns is FetchAlign consuming it.
+
+Note also the *physical* asymmetry that makes this path 77.9 % route: the
+startpoint `_zz_..._spec_size_reg[0]` is placed at `SLICE_X57Y20` inside
+`pb_decode`, and `predictPending_reg` at `SLICE_X24Y99` outside it — 4.487 ns of
+routing across that span.  This is the decode-pblock boundary that section 5
+already flags.
+
+### Step 2: the measurement — WNS
+
+| What-if (from the pristine routed checkpoint) | WNS | Worst path |
+|---|---:|---|
+| baseline (reproduced) | -2.094 | `stalled -> s1PredEntries_3[18]/CE` |
+| false-path **all 7** `fed_payload_specs_*_spec_size` regs | **-2.094** | **unchanged** |
+
+The family is 0.318 ns *behind* the WNS.  Its own worst path is **-1.776 ns**,
+i.e. it imposes a floor of 173.13 MHz — but it costs **0.000 ns today**.
+
+Worst slack into each endpoint sub-family, from any startpoint:
+
+| Endpoint group | Cells | Worst slack | Worst source |
+|---|---:|---:|---|
+| `FetchAlignPlugin predictPending` | 3 | **-1.776** | `spec_size[0]` |
+| `RasPlugin ras_*` (whole plugin) | 576 | -1.727 | `spec_size[0]` |
+| `FetchAlignPlugin predictTargetReg` | 96 | -1.441 | `spec_size[0]` |
+
+### Step 3: the ladder — where the family lands, and what it is worth
+
+A 200-rung ladder from the pristine checkpoint (`synth/probe_specsize/ladder_ref200.txt`):
+
+```
+rung   WNS      delta   worst startpoint -> endpoint
+  12  -1.800   +0.023   DcachePlugin missSet[4] -> IssueQueue sbInt_busy[34]
+  13  -1.778   +0.022   FtbPlugin rspPayload_target[12] -> s1PredEntries_3[18]/CE
+  14  -1.776   +0.002   DecodeStage fed_payload_specs_0_spec_size[0] -> predictPending/D
+  15  -1.770   +0.006   DecodeStage fed_payload_packets_0_words_0[4] -> predictPending/D
+  16  -1.745   +0.025   FetchAlign targetHoldPc[13] -> s1PredEntries_3[18]/CE
+```
+
+`spec_size` becomes binding only at rung 14, after thirteen other families are
+retired, and **retiring it is worth +0.006 ns (rung 15's delta)** — after which
+the *same endpoint* is immediately re-limited by the next `fed` payload register.
+This is section 15's shared-cone artifact reproducing for a third time: 19 of the
+200 rungs end at `predictPending_reg/D`, sourced by
+`fed_payload_specs_0_spec_size`, `fed_payload_packets_0_words_0`,
+`fed_payload_packets_0_words_1`, `ibuf/headPtr[0..3]`,
+`fed_payload_specs_0_srcEa_base`, `ibuf/entries_*_pred_lenWords`,
+`ibuf/entries_*_pred_ambiguousLine`, `decodePc`, `ibuf/count` — i.e. essentially
+**every register that can reach `feed.valid` or `feed.ready`**.  There is no
+"`spec_size` family"; there is one `feed.fire` cone with dozens of
+near-simultaneous inputs.
+
+### Step 4: the decisive control — retire the whole endpoint group
+
+To bound the *maximal* version of any conceivable fix, the same 200-rung ladder
+was re-run with all 675 `predictPending` + `predictTargetReg` + `RasPlugin_logic_*`
+cells false-pathed as **endpoints** from rung 0
+(`synth/probe_specsize/ladder_nopredict200.txt`):
+
+| Rung | Reference ladder WNS | Endpoint-group-free ladder WNS | Divergence |
+|---:|---:|---:|---:|
+| 0 | -2.094 | -2.094 | 0.000 |
+| 5 | -2.001 | -2.001 | 0.000 |
+| 10 | -1.848 | -1.848 | 0.000 |
+| 20 | -1.720 | -1.716 | 0.004 |
+| 50 | -1.502 | -1.498 | 0.004 |
+| 100 | -1.389 | -1.383 | 0.006 |
+| 150 | -1.324 | -1.322 | 0.002 |
+| **199** | **-1.271** | **-1.267** | **0.004** |
+
+**Deleting every path into the entire prediction/RAS state of the design — a
+strictly stronger intervention than any real RTL cut — is worth 0.004 ns.**
+
+TNS and failing endpoints (`synth/probe_specsize/probe3.out`), which section 15
+step 9 established as the metric worth banking even at unchanged WNS:
+
+| What-if | WNS | TNS | Failing endpoints |
+|---|---:|---:|---:|
+| baseline (reproduced exactly) | -2.094 | -21,068.689 | 32,729 |
+| `spec_size` startpoints free (7 cells) | -2.094 | -21,045.141 | 32,723 |
+| + whole `predictPending`/`predictTargetReg`/RAS endpoint group free (675 cells) | -2.094 | **-20,263.918** | **32,137** |
+
+So the *startpoint* family is worth 23.5 ns of TNS (0.11 %) and six endpoints;
+the whole endpoint group is worth 804.8 ns (3.8 %) and 592 endpoints.  That
+breadth is real but is only about half the I-cache miss/prefetch licence already
+scouted in section 15 step 9 (~1,280 endpoints), and unlike that one it is on the
+resident II=1 decode-accept path, so it is strictly the worse of the two banks.
+
+### Step 5: the fix that exists, and why it should not be built now
+
+There *is* a clean, textbook fix, and it is worth recording so nobody re-derives
+it: **sever the reverse `ready` path** by making `rawIn.ready` a function of
+local occupancy registers only — replace the `raw` `PipeStage` with a 2-entry
+skid buffer (`s2mPipe`-style), so `df.feed.ready` no longer depends
+combinationally on `fed.ready` and therefore not on `assemble`/`spec_size` at
+all.  Throughput is preserved by construction; the cost is one extra `RawPacket`
+of storage (2 × `DecodePacket` ≈ 540 FF, about +1.1 % of the design's flops) plus
+the obligation to extend `pipeFlush` to squash *both* held entries and to
+re-prove the `feed.fire`-gated bookkeeping (`predictDetect`, `rasPush/PopValid`,
+`gsShiftValid`, `ftqConfirmFire`, `ftqMismatchDetect`) under the changed
+acceptance cadence — that last item is a genuine cycle-behaviour change to the
+frontend, not a retiming, so it would need the full §9-item-8a-grade mutation
+proof the last two cuts received.
+
+**Measured value: +0.006 ns (+0.2 MHz).**  That is a real elasticity change to
+the frontend/decode contract, with a real IPC exposure surface, for a quarter of
+what the already-rejected `stalled` cut was worth.  Do not build it.
+
+### Step 6: the ladder's own verdict on 200 MHz
+
+The 200-rung reference ladder is the most useful thing produced by this pass, and
+it should retire the "find the next family" strategy outright:
+
+| Families retired | WNS | FMax |
+|---:|---:|---:|
+| 0 | -2.094 | 164.10 MHz |
+| 10 | -1.848 | 170.94 MHz |
+| 20 | -1.720 | 174.83 MHz |
+| 50 | -1.502 | 181.75 MHz |
+| 100 | -1.389 | 185.60 MHz |
+| 200 | **-1.271** | **189.72 MHz** |
+
+**Retiring two hundred distinct startpoint register families outright recovers
+0.823 ns and still lands 10 MHz short of 200 MHz** (which needs WNS >= -1.000,
+i.e. +1.094 ns).  The tail is flat: rungs 100-200 average +0.0012 ns each.  Three
+independent grounding passes (sections 15, 16 and 17) have now each concluded
+that the named family is worth ~0.00 ns, on three different subsystems, and this
+ladder explains why: at -2.094 ns the design has no removable spike left, only a
+broad route-dominated plateau at 17-22 logic levels and 63-78 % route.
+
+The remaining levers are therefore **not RTL family cuts**.  In descending order
+of expected value:
+
+1. **Placement/congestion, not logic.**  Every limiting path in every one of the
+   three grounded families is 63-78 % route at moderate logic depth.  Section 16's
+   "next" list already proposes a floorplan aimed at `DcachePlugin` +
+   `LsEuPlugin` + `IssueQueuePlugin`; this section adds a second, independent
+   datapoint for the *decode/FetchAlign* boundary — `spec_size` at `X57Y20`
+   inside `pb_decode` driving `predictPending` at `X24Y99` outside it, 4.487 ns
+   of pure route.  A same-DCP A/B that either widens the capture filter to pull
+   `FetchAlignPlugin`/`IcachePlugin` into the decode box, or splits the box, is
+   cheap and is measuring the thing that is actually binding.  (Section 5's
+   warning stands: a prior X103 widening regressed, so this must be an exact-DCP
+   A/B, not a guess.)
+2. **Implementation-strategy sweep** — Vivado `-directive`
+   (`ExplorePostRoutePhysOpt`, `AggressiveExplore`), `phys_opt_design` passes,
+   higher placer effort.  A route-dominated plateau is exactly the regime where
+   these pay, and none has been tried in this campaign.
+3. **A real pipeline stage**, justified by an IPC measurement rather than by a
+   census — the elastic `ready` chains (this section's `feed.ready`, section 16's
+   IQ scoreboard) are the natural cut points, but each costs a cycle somewhere
+   and must be paid for with an IPC number.
+4. The banked breadth cuts (section 15 step 9's I-cache miss/prefetch pipelining,
+   ~1,280 endpoints) as TNS/endpoint relief that may convert into placement gain,
+   accepting that neither predicts an FMax number on its own.
+
+### Status after this section
+
+No RTL changed.  `6b246de` remains the head RTL checkpoint at **-2.094 ns /
+164.096 MHz**, `FLOORPLAN_MODE decode`, netlist MD5
+`d80f6218c5c7dcab94a33a52d64244fa`.  New committed probes:
+`synth/probe_specsize.tcl` (family scope, per-endpoint worst slack, isolated
+what-if, ladder-to-family), `synth/probe_specsize2.tcl` (200-rung reference
+ladder plus the endpoint-group-free control ladder), `synth/probe_specsize3.tcl`
+(TNS / failing-endpoint deltas).

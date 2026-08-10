@@ -1,0 +1,4 @@
+PROBE3 baseline WNS -2.094 TNS -21068.689 FEP 32729  FetchAlignPlugin_logic_stalled_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE3 specsize_from_free(7cells) WNS -2.094 TNS -21045.141 FEP 32723  FetchAlignPlugin_logic_stalled_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE3 plus_predict_ras_to_free(675cells) WNS -2.094 TNS -20263.918 FEP 32137  FetchAlignPlugin_logic_stalled_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+PROBE3 DONE
