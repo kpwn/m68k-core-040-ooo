@@ -33,6 +33,25 @@ Resident commands and responses remain II=1. The clean redirect target command
 still issues at redirect N+1, so the first useful target group moves from N+5 to
 N+4.
 
+### 1.1 Amendment A1 (2026-08-10) — three-cycle, II = 1
+
+Superseded by `2026-08-10-ipc-fetchalign-icache-pipeline-design.md` §4 when
+`IcachePlugin(icacheVerdictStage = true)`. The resident L1I hit path becomes a
+**three-cycle, initiation-interval-one** pipeline:
+
+- Cycle N — **F1**: `cmd.fire` accepts the command into F1 and launches the
+  ITLB from the registered PC.
+- Cycle N+1 — **F2**: the *registered* translation qualifies the async tags for
+  the *registered virtual* set, arms the data BRAM, captures the S1 context,
+  and captures the miss context.
+- Cycle N+2 — **S1**: registered way/lane control selects the BRAM output.
+- Cycle N+3 — `FetchRsp.valid`.
+
+The clean-redirect first-useful-group figure moves from **N+4 to N+5**.
+Resident commands and responses remain **II = 1**; the cost is latency, not
+throughput. With `icacheVerdictStage = false` the original two-cycle contract
+above holds unchanged.
+
 ## 2. Timing boundary and physical rationale
 
 The rejected historical shape placed live translation, tag selection, BRAM
@@ -56,6 +75,23 @@ recovery is to pipeline the ITLB's internal hit-way result or improve placement.
 Do not restore a translation-to-BRAM-address dependency or delete the response
 register.
 
+### 2.1 Amendment A2 (2026-08-10) — the pre-authorised recovery is exercised
+
+The permitted recovery ("pipeline the ITLB's internal hit-way result") is taken,
+with two clarifications this section did not specify:
+
+1. The register lives at the **fetch pipe's F1/F2 boundary inside
+   `IcachePlugin`**, not inside `Tlb.scala` or `ItlbPlugin.scala`. The `Tlb`
+   class is shared with the DTLB; a registered output there would put the D-side
+   load path at risk for no I-side benefit. Both files remain untouched.
+2. **Acceptance moves into a pipeline stage** so that II = 1 is preserved. A
+   naive registered hit-way with a single-cycle accept would force fetch II = 2;
+   that shape is explicitly rejected.
+
+Both prohibitions of §2 are retained in full: **no translation-to-BRAM-address
+dependency is restored** — the BRAM address remains `f2Pc(11 downto 6)`, purely
+virtual and registered — and **the response register is not deleted**.
+
 ## 3. Handshake and ordering
 
 ### 3.1 Resident hit and translation fault
@@ -72,7 +108,22 @@ A resolved demand miss is accepted and atomically captures the existing miss
 context before the FSM closes the fetch port. Unlike the old T-stage pipeline,
 the cache does not accept one extra younger command behind the newly discovered
 miss. This is intentional: `FetchRsp` is untagged and must remain in acceptance
-order. Refill, bus-fault, inhibited delivery, poison, predecode, and replay
+order.
+
+### 3.2.1 Amendment A3 (2026-08-10) — the rule constrains *answering*, not *accepting*
+
+Under `icacheVerdictStage = true` the sentence above is amended to: **the cache
+does not *answer* one extra younger command behind a newly discovered miss.** It
+may *hold* one in F2 and one in F1. The untagged in-acceptance-order guarantee is
+unchanged and is now enforced **structurally** by the in-order F1/F2 stage
+discipline rather than by refusing acceptance: F2 holds while it cannot dispatch,
+F1 holds behind it, and `REPLAY` answers the missing command before F2 dispatches
+the command behind it.
+
+The wrong-path speculation bound grows by exactly one fetch window, which
+`FetchAlignPlugin`'s `RING = 4` covers and which `FtqCapacitySpec` re-measures.
+
+Refill, bus-fault, inhibited delivery, poison, predecode, and replay
 semantics are unchanged.
 
 ### 3.3 Prefetch fill
