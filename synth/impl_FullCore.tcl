@@ -27,6 +27,8 @@ set skip_floorplan 0
 if {[info exists ::env(SKIP_FLOORPLAN)] && $::env(SKIP_FLOORPLAN) eq "1"} {
   set skip_floorplan 1
   puts "SKIP_FLOORPLAN 1"
+  file delete -force synth/fullcore_pb_decode_util.rpt
+  file delete -force synth/fullcore_pb_dcache_util.rpt
 } else {
   # Front-end floorplan: co-locate DecodeStage so the decode->ring nets stay local (read after
   # opt so the cell filter sees elaborated leaves). Part of the front-end FMax stack (195->~218).
