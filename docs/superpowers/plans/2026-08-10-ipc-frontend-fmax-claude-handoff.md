@@ -138,6 +138,15 @@ finite-buffer behavior rather than an ALU issue bottleneck.
 All figures use the 4.000 ns constraint.  A negative WNS therefore gives
 `FMax = 1000 / (4.000 - WNS)` MHz.
 
+> **Read this table as `IMPL_STRATEGY=default`.**  Section 18 changed
+> `synth/impl_FullCore.tcl`'s default implementation recipe to `postrouteN`
+> (iterated post-route `phys_opt_design` + `route_design -tns_cleanup`), which is
+> worth +18.95 MHz on the *same* netlist.  The current physical baseline is
+> therefore **`6b246de` + `FLOORPLAN_MODE=decode` + `IMPL_STRATEGY=postrouteN` =
+> -1.472 ns / 182.549 MHz at 3 rounds (-1.463 / 183.050 at the 6-round plateau)**,
+> not the -2.094 / 164.096 row below.  Every row here still regenerates exactly
+> under `IMPL_STRATEGY=default`; use that to compare against any of them.
+
 | Checkpoint | Default route | WNS / FMax | TNS / failing endpoints | Routed area | What it proved |
 |---|---|---:|---:|---:|---|
 | `2c7c544` five-ID base | both pblocks | -3.633 ns / 131.010 MHz | -61,194.376 / 59,598 | 113,298 LUT, 50,508 FF | First functional prefetch checkpoint; top 100 were `ringPlanSeq` |
@@ -185,7 +194,13 @@ Keep all four controls for diagnosis.
 
 **Re-measured on the `6b246de` netlist (section 15 step 7): `decode` still wins
 (-2.094) over `none` (-2.187), `dcache` (-2.665) and `both` (-2.669), but the
-decode advantage over `none` has shrunk from 0.442 ns to 0.093 ns.**  Use the
+decode advantage over `none` has shrunk from 0.442 ns to 0.093 ns.**
+**Section 18 re-measured it again under the new `postrouteN` recipe and the
+shrinkage REVERSED: `decode` -1.623 vs `none` -2.010, i.e. the pblock's edge grew
+back to 0.387 ns / 11.45 MHz.  Section 18 also adds four more losing floorplan
+variants (a repaired LS box, a fetch/predict box, that box alone, and a
+FetchAlign-annexing decode box) — seven negative floorplan results in total.
+Do not attempt another pblock geometry without reading section 18 step 2 first.**  Use the
 newer table; this `3c4e1f8` one is kept for history.  Do not widen the X87 decode box: a prior
 X103 experiment regressed.  Capture-filter cleanup should be its own exact-DCP
 A/B.  FetchAlign/Icache are not actually members of the decode pblock, so do not
@@ -306,7 +321,14 @@ vivado -mode batch -nojournal \
 ```
 
 `synth/impl_FullCore.tcl` enforces the 4.000 ns target and accepts
-`FLOORPLAN_MODE={none,decode,dcache,both}`.  Default is `decode`.  Before a new
+`FLOORPLAN_MODE` as a `+`-separated set of pblock tokens
+(`none`, `decode`, `decode_fe`, `dcache`, `backend`, `frontend`; `both` is an
+alias for `decode+dcache`), default `decode`; and `IMPL_STRATEGY`
+(`default`, `fanout`, `postroute`, `postroute2`, `postrouteN`, `exploreN`,
+`explore`), default `postrouteN` with `POSTROUTE_ROUNDS=3` since section 18.
+`IMPL_STRATEGY=default` reproduces the pre-section-18 flow verbatim.
+For a parallel same-DCP A/B use `synth/floorplan_ab.sh <runroot> <spec>...` and
+report it with `synth/floorplan_ab_report.sh`.  Before a new
 run, pin the exact HEAD and generated-Verilog MD5 in the ledger.  Archive both
 DCPs, generated Verilog, log, and reports before regenerating.  Report WNS,
 TNS, failing endpoints, hold/PW status, LUT/FF/BRAM/DSP, top-path family, logic
@@ -1515,3 +1537,402 @@ No RTL changed.  `6b246de` remains the head RTL checkpoint at **-2.094 ns /
 what-if, ladder-to-family), `synth/probe_specsize2.tcl` (200-rung reference
 ladder plus the endpoint-group-free control ladder), `synth/probe_specsize3.tcl`
 (TNS / failing-endpoint deltas).
+
+## 18. Floorplan A/B: every floorplan variant regressed — but post-route physical optimisation is worth +18.95 MHz (Claude, 2026-08-10)
+
+**Fourteen full post-route runs from the identical `6b246de` post-synthesis
+checkpoint.  Result in one line: no floorplan change lands — all seven floorplan
+variants regressed, including both of the two boundaries this pass was dispatched
+to attack — but iterated post-route physical optimisation takes the branch from
+-2.094 ns / 164.096 MHz to -1.463 ns / 183.050 MHz, with better TNS, fewer failing
+endpoints, identical flop count and +19 LUTs.  That is +18.95 MHz (+11.5 %) for
+zero RTL and effectively zero area, and it is the largest single gain of this
+entire campaign, larger than `28ec738`'s +19.08 MHz only in percentage terms but
+free of any behavioural risk.  `IMPL_STRATEGY` is now a first-class knob on
+`synth/impl_FullCore.tcl` and its default has changed accordingly.**
+
+Sections 15-17 each retired one *logic* family.  This section retires the
+*floorplan* and lands the *tool recipe*.
+
+### Step 0: method and controls
+
+All fourteen routes re-place and re-route the identical post-synthesis checkpoint
+`synth/archive/6b246de_ftb_framing_retime_decode/fullcore_synth.dcp`
+(`REUSE_SYNTH_DCP=1`, generated-netlist MD5
+`d80f6218c5c7dcab94a33a52d64244fa`).  **Every run reported the same
+post-synthesis WNS `-1.827`** — the control proving the netlist was identical
+across the whole comparison, so only the constraint or the recipe differed.  Runs
+are isolated in their own directories so three can proceed in parallel without
+fighting over `synth/fullcore_*.rpt`.
+
+Three tools are committed with this section:
+
+- `synth/floorplan_ab.sh <runroot> <spec>...` — each `<spec>` is
+  `<FLOORPLAN_MODE>[@<IMPL_STRATEGY>]`, launched in parallel from one fixed DCP.
+  Roughly 6 GB RSS and 20-30 min each; three at a time is the machine limit.
+- `synth/floorplan_ab_report.sh <dir>...` — emits the full gate report shape
+  (WNS/FMax, TNS, failing endpoints, WHS/WPWS, area, per-pblock occupancy,
+  congestion, top-path source/destination and logic-vs-route split) from either an
+  A/B run directory or a `synth/archive/` checkpoint.  It reproduces the pinned
+  section-5 baseline row exactly, which is its own validation.
+- `synth/probe_floorplan_census.tcl`, `synth/probe_floorplan_geo.tcl`,
+  `synth/probe_floorplan_filters.tcl` — read-only placement census, worst-path
+  geography, and capture-filter sizing.
+
+`synth/impl_FullCore.tcl` now takes `FLOORPLAN_MODE` as a `+`-separated *set* of
+pblock tokens (`decode`, `decode_fe`, `dcache`, `backend`, `frontend`; `both`
+remains an alias for `decode+dcache`) and a new `IMPL_STRATEGY`
+(`default` | `fanout` | `postroute` | `postroute2` | `postrouteN` | `exploreN` | `explore`).
+
+### Step 1: the placement census — where everything actually is
+
+`synth/probe_floorplan_census.tcl` reports the placed bounding box and centroid of
+every plugin.  This is the data a floorplan proposal has to be built from, and it
+had not been collected before:
+
+| Plugin | cells | placed bbox | centroid |
+|---|---:|---|---|
+| IcachePlugin | 17,264 | X1..X50, Y1..Y136 | X17.1 Y61.8 |
+| FtbPlugin | 1,076 | X1..X34, Y57..Y135 | X16.4 Y102.0 |
+| RasPlugin | 576 | X10..X59, Y51..Y82 | X21.2 Y61.6 |
+| GsharePlugin | 830 | X10..X32, Y75..Y103 | X24.0 Y91.7 |
+| FetchAlignPlugin | 5,982 | X10..X65, Y20..Y105 | X41.1 Y70.9 |
+| DecodeStage | 33,006 | X32..X89, Y0..Y186 | X61.7 Y48.4 |
+| RenameStage | 7,427 | X32..X89, Y3..Y159 | X67.0 Y79.6 |
+| IssueQueuePlugin | 20,132 | X30..X112, Y6..Y181 | X81.8 Y106.9 |
+| RobPlugin | 34,621 | X4..X111, Y0..Y225 | X53.0 Y138.9 |
+| LsEuPlugin | 22,198 | X4..X95, Y55..Y237 | X35.5 Y163.3 |
+| DcachePlugin | 22,640 | X4..X84, Y139..Y239 | X42.3 Y210.0 |
+| DtlbPlugin | 3,109 | X49..X109, Y136..Y237 | X81.5 Y197.7 |
+| AluEuPlugin | 12,209 | X29..X112, Y62..Y238 | X103.3 Y147.3 |
+| DivEuPlugin | 5,373 | X51..X112, Y59..Y232 | X96.0 Y160.0 |
+
+Device is `SLICE_X0..X112, Y0..Y239` (27,120 slices).  The layout the placer finds
+on its own is already coherent: fetch/predict bottom-left, decode/rename/IQ
+bottom-right, ROB across the middle, LS cluster top-left, ALU/DIV top-right.
+Section 17's boundary datapoint is confirmed —
+`_zz_..._fed_payload_specs_0_spec_size_reg[0]` at `SLICE_X57Y20` inside
+`pb_decode`, `predictPending_reg` at `X24..X36, Y85..Y99` mostly outside it.
+
+### Step 2: the decisive measurement — the WNS family crosses no pblock at all
+
+`synth/probe_floorplan_geo.tcl` reports, for the worst N unique endpoints, the
+placed coordinates of both ends and the plugin pair.  Over the worst **300**
+unique endpoints on `6b246de`:
+
+```
+PAIR count=300  avg_manhattan=34.5  worst_slack=-2.094  FetchAlignPlugin -> IcachePlugin
+```
+
+**All three hundred are the same arc**, and all three hundred share one
+startpoint register:
+
+```
+FetchAlignPlugin_logic_stalled_reg   SLICE_X26Y99
+   -> IcachePlugin_logic_s1PredEntries_{0..3}_reg[*]/CE   X18..X26, Y56..Y96
+   Manhattan span 24..48 CLBs
+```
+
+`report_design_analysis -timing`, path #1:
+
+```
+Path delay 5.990 ns = logic 2.019 (33.7%) + route 3.971 (66.3%)
+Logic levels 20, routes 19,  PBlocks crossed: 0,  High Fanout: 931
+  FDCE/C -(46)- LUT2 -(4)- LUT6 -(1)- LUT6 -(143)- LUT6 -(1)- LUT3 -(176)-
+  LUT2 -(164)- LUT6 -(1)- LUT6 -(1)- LUT6 -(1)- CARRY8 -(1)- LUT5 -(2)-
+  LUT2 -(23)- LUT6 -(3)- LUT6 -(11)- LUT6 -(1)- CARRY8 -(1)- LUT2 -(2)-
+  LUT6 -(8)- LUT5 -(113)- LUT6 -(931)- FDRE/CE
+```
+
+Three facts follow, and together they are why this pass came back negative on
+floorplanning:
+
+1. **`PBlocks crossed: 0`.**  The path lives entirely in the unfloorplanned left
+   strip; `pb_decode` starts at X36 and the path never leaves X18..X26.  No
+   adjustment of any pblock boundary can recover it.  Section 17's `spec_size` ->
+   `predictPending` crossing is real and does cost 4.487 ns of route — but that
+   path is at **-1.776 ns**, 0.318 ns *behind* WNS, and section 17 already
+   measured retiring its whole endpoint group at +0.004 ns.  The dispatch premise
+   ("4.487 ns of pure route crosses this single pblock boundary") is true and
+   simultaneously not the limiter.
+2. **The span is short and the delay is still 66 % route.**  24-48 CLBs of
+   Manhattan distance is a quarter of the die, not a die-length haul.  The route
+   delay here is *load*, not distance.
+3. **The terminal net drives 931 flip-flops**, with four more nets at fan-out
+   113-176 upstream.  The ~930 `s1PredEntries_{0..3}` flops sit at about
+   2.3 FF/slice over X18..X26 x Y56..Y96 — sparse because they are BRAM-read
+   capture registers interleaved with the rest of the fetch datapath.  One LUT6
+   output reaching all of them is the last stretch of the path.
+
+This is section 15 step 6 item 2 seen physically: the S1 capture *enable* is
+`cmd.fire`-gated (hence behind the ITLB and tag compare) while the S1 *data* is a
+raw all-ways BRAM read with no hit dependency.  The 931-load enable broadcast is
+that gating.
+
+### Step 3: `pb_dcache`'s over-capture, root-caused — and the `IS_PRIMITIVE` trap
+
+Section 5 recorded that the legacy D-cache pblock "captured an unrelated ROB carry
+chain through flattened-name matching".  The exact mechanism, from
+`synth/probe_floorplan_filters.tcl`:
+
+```
+LsEuPlugin_logic_sq/RobPlugin_logic_branchTrainMem_reg_0_63_35_41_i_1   CARRY8
+LsEuPlugin_logic_sq/RobPlugin_logic_branchTakenStore_60_i_3             LUT6
+LsEuPlugin_logic_sq/IssueQueuePlugin_logic_aluSlowIntBusy[15]_i_5       LUT6
+```
+
+It is **not flattening — it is a submodule instance path prefix**.
+`LsEuPlugin_logic_sq` is the StoreQueue instance; Vivado absorbed ROB
+branch-train and IQ scoreboard logic into it, so `NAME =~ *LsEuPlugin_logic*`
+matches those cells on the *instance* segment of the path.  Measured on the exact
+`6b246de` netlist:
+
+| Filter | cells | LUT | LUT occupancy at X36Y110:X87Y214 |
+|---|---:|---:|---:|
+| legacy 3-way OR (`pb_dcache`) | 45,561 | 32,298 | 74.3 % |
+| foreign leaf names excluded | 36,431 | 23,545 | 54.3 % |
+
+**27 % of the legacy box's LUT demand was foreign**, including a ROB carry chain
+that a pblock will happily tear away from the rest of its chain.
+
+The repair has a trap worth recording, because the obvious fix silently does not
+work.  Excluding the foreign *leaf* names is not enough: `get_cells -hier` also
+returns the **hierarchical instances themselves** (`LsEuPlugin_logic_sq`,
+`DtlbPlugin_logic_{tlb,umq,walker}`, and on the frontend side
+`FetchAlignPlugin_logic_ibuf`), whose own names carry no foreign substring — and
+adding one hierarchical object re-constrains every leaf beneath it regardless of
+that leaf's name:
+
+| Filter | pblock members reported |
+|---|---:|
+| foreign names excluded, no `IS_PRIMITIVE` | 24,214 (~9.4k leaves fold into 4 parents, and come along) |
+| foreign names excluded, `+ IS_PRIMITIVE` | 33,613 |
+
+The LS-owned leaves inside those instances are still captured either way — they
+are named `LsEuPlugin_logic_sq/<...>`, so they match the prefix and are
+primitives.  Only the absorbed foreign leaves are dropped.  Both new XDCs carry
+the exclusions *and* `IS_PRIMITIVE`, and the first A/B round was re-run after this
+was found.
+
+**The repair did not help.**  See row 8 below: the *clean* backend capture routes
+at -2.595 ns, **worse** than the contaminated one at -2.328 ns.  So the
+over-capture was a real defect but it was **not** why `pb_dcache` hurt; the region
+itself is harmful.  Section 5's explanation for the `dcache` mode should be
+corrected accordingly.
+
+### Step 4: the A/B table
+
+All from the same `6b246de` synthesis checkpoint, 4.000 ns constraint.  Every run
+is hold-clean and pulse-width-clean (WHS +0.019 to +0.036 ns, WPWS +1.458 ns,
+zero THS/TPWS failures) and shows no congestion window above level 5.
+
+| # | Variant | WNS / FMax | TNS | Failing endpoints | Routed LUT / FF | vs. incumbent |
+|---|---|---:|---:|---:|---:|---:|
+| 0 | **`decode` incumbent (§15 step 7)** | **-2.094 / 164.096** | -21,068.689 | 32,729 | 110,662 / 50,389 | — |
+| 1 | `none` (§15 step 7) | -2.187 / 161.629 | -29,536.104 | 43,701 | 110,774 / 50,384 | -2.47 MHz |
+| 2 | `dcache` (§15 step 7) | -2.665 / 150.038 | -43,360.996 | 61,293 | 110,771 / 50,401 | -14.06 MHz |
+| 3 | `both` (§15 step 7) | -2.669 / 149.948 | -38,648.195 | 47,702 | 110,693 / 50,436 | -14.15 MHz |
+| 4 | `decode_fe` (boundary 1, literal) | -2.757 / 147.995 | -33,963.488 | 42,483 | 110,678 / 50,389 | **-16.10 MHz** |
+| 5 | `decode+frontend` v1 (no `IS_PRIMITIVE`) | -2.472 / 154.512 | -33,089.121 | 49,778 | 110,620 / 50,416 | -9.58 MHz |
+| 6 | `decode+backend` v1 (no `IS_PRIMITIVE`) | -2.328 / 158.028 | -26,649.537 | 38,588 | 110,611 / 50,421 | -6.07 MHz |
+| 7 | `decode+frontend` v2 (repaired capture) | -2.149 / 162.628 | -31,428.354 | 48,595 | 110,667 / 50,373 | -1.47 MHz |
+| 8 | `decode+backend` v2 (repaired capture) | -2.595 / 151.630 | -29,185.477 | 43,932 | 110,612 / 50,419 | -12.47 MHz |
+| 9 | `frontend` alone (no `pb_decode`) | -2.292 / 158.932 | -29,825.727 | 41,833 | 110,729 / 50,389 | -5.16 MHz |
+| 10 | `decode` @ `fanout` | -2.389 / 156.519 | -23,251.814 | 33,055 | 110,662 / 50,391 | -7.58 MHz |
+| 11 | **`decode` @ `postroute`** | **-1.623 / 177.841** | **-17,909.066** | **32,254** | **110,663 / 50,389** | **+13.75 MHz** |
+| 12 | `decode` @ `explore` | -1.642 / 177.242 | **-15,082.161** | **28,795** | 110,810 / 50,422 | +13.15 MHz |
+| 13 | `none` @ `postroute` | -2.010 / 166.389 | -29,241.080 | 43,717 | 110,782 / 50,384 | +2.29 MHz |
+| 14 | `decode` @ `postroute2` | -1.552 / 180.115 | -17,916.010 | 32,425 | 110,675 / 50,389 | +16.02 MHz |
+| 15 | `decode` @ `postroute` (repeat) | -1.623 / 177.841 | -17,909.066 | 32,254 | 110,663 / 50,389 | +13.75 MHz |
+| 16 | **`decode` @ `postrouteN`, 6 rounds** | **-1.463 / 183.050** | **-17,472.854** | 32,409 | **110,681 / 50,389** | **+18.95 MHz** |
+| 17 | `decode` @ `exploreN`, 6 rounds | -1.642 / 177.242 | -15,516.527 | **30,048** | 110,814 / 50,422 | +13.15 MHz |
+
+Rows 4-9 are the assigned floorplan experiments.  Rows 10-15 are the
+implementation-strategy sweep that the step-2 measurement redirected the pass
+into.
+
+#### What each floorplan variant taught
+
+- **Row 4, `decode_fe` — the literal boundary-1 fix is the *worst* variant tried
+  (-16.10 MHz).**  Annexing `FetchAlignPlugin` + `RasPlugin` into `pb_decode`
+  does close the `spec_size` -> `predictPending` crossing, and it costs 16 MHz,
+  because it drags FetchAlign right into X36..X87 and away from `IcachePlugin`
+  (centroid X17Y62), which owns every one of the worst 300 endpoints.  The trade
+  was predicted in the XDC's own comment before the run and is now measured.
+- **Rows 5/7, the frontend box.**  A loose region (X0Y20:X35Y135, 64-69 % LUT
+  occupancy — comparable to `pb_decode`'s 67.91 %) enclosing exactly the cluster
+  that owns the WNS family still loses.  Repairing the capture recovers most of
+  the v1 loss (-2.472 -> -2.149) and it is the *closest* floorplan variant to the
+  incumbent, but its TNS is 49 % worse (-31,428 vs -21,069) with 48,595 failing
+  endpoints vs 32,729.  The WNS *family changed* under it — from
+  `stalled -> s1PredEntries` to `GsharePlugin pht_port2 -> Icache lineReg` —
+  i.e. the box moved the peak without lowering the plateau.
+- **Row 9, `frontend` alone.**  Dropping `pb_decode` and keeping only the new
+  frontend box is worse than either.  `pb_decode`'s remaining value is real even
+  though section 15 measured its WNS edge over `none` at only 0.093 ns; its
+  TNS/endpoint edge is what is left of it.
+- **Rows 6/8, the backend box.**  The repaired capture is *worse* than the
+  contaminated one.  Two independent geometries (legacy X36Y110:X87Y214 and the
+  population-centred X14Y132:X72Y239) and two capture filters all land between
+  -2.328 and -2.665.  The LS-cluster region is simply a bad place to put a
+  constraint on this netlist, and section 16 already explained why it cannot pay:
+  the D-cache/IQ family is worth 0.000 ns.
+
+**Combined verdict on floorplanning: seven variants, seven regressions, spanning
+both dispatched boundaries, two geometries per region, and two capture filters.
+`FLOORPLAN_MODE=decode` remains correct and unchanged.**  The pblock lever is
+exhausted on this netlist in the same sense that the family-cut lever is.
+
+#### What the implementation-strategy sweep taught
+
+- **Row 10, `fanout` — the 931-load hypothesis, tested and refuted as a lever.**
+  `phys_opt_design -directive AggressiveFanoutOpt` *did* do its job: the WNS
+  startpoint moved off `FetchAlignPlugin_logic_stalled_reg` to
+  `FtbPlugin_logic_rspPayload_brWordOff_reg[1]` — which is **exactly rung 1 of
+  section 15's what-if ladder**, the family the ladder predicted would be next.
+  And FMax still fell 7.58 MHz.  That is the ladder's prediction confirmed from
+  the opposite direction: retiring the `stalled` broadcast is worth ~0.02 ns and
+  the replication cost more elsewhere than it bought.  The 931-load net is the
+  *mechanism* of the top path, not a *lever*.
+- **Rows 11/12 — post-route physical optimisation is the lever.**  Both recipes
+  that add a `phys_opt_design` pass **after** `route_design` gain ~13.5 MHz.
+  `postroute` (today's flow + one post-route phys-opt + `route_design
+  -tns_cleanup`) has the better WNS; `explore` (`place_design -directive
+  ExtraTimingOpt`, `phys_opt_design -directive AggressiveExplore`,
+  `route_design -directive Explore`, then a post-route round of both) has the
+  better TNS (-15,082) and the fewest failing endpoints (28,795) at a cost of
+  +148 LUT.  `postroute` is also the cheaper of the two in wall time.
+  Both keep the WNS family in the frontend (`Gshare pht_port3 -> Icache lineReg`
+  and `Ftb rspPayload_brWordOff -> Icache lineReg`), still at 66-70 % route.
+
+`decode@postroute` is **strictly dominant** over the incumbent: better WNS
+(-1.623 vs -2.094), better TNS (-17,909 vs -21,069), fewer failing endpoints
+(32,254 vs 32,729), identical LUT/FF (110,663/50,389 vs 110,662/50,389),
+identical pblock occupancy (67.91 %), identical BRAM/DSP, hold- and
+pulse-width-clean, no congestion window above level 5.  There is no column on
+which it loses.
+
+#### The convergence curve, and what landed
+
+Row 16 is one run that prints WNS after every post-route round, so the whole curve
+comes from a single controlled experiment:
+
+| Post-route rounds | WNS | FMax | delta |
+|---:|---:|---:|---:|
+| 0 (= the historical `default` flow) | -2.094 | 164.096 MHz | — |
+| 1 | -1.623 | 177.841 MHz | +0.471 ns |
+| 2 | -1.552 | 180.115 MHz | +0.071 ns |
+| 3 | **-1.472** | **182.549 MHz** | +0.080 ns |
+| 4 | -1.464 | 182.816 MHz | +0.008 ns |
+| 5 | -1.463 | 182.850 MHz | +0.001 ns |
+| 6 | -1.463 | 182.850 MHz | +0.000 ns |
+
+Round 0 reproduced `-2.094` exactly, and `postroute` was independently reproduced
+at `-1.623` three separate times (rows 11, 15, and round 1 of row 16), and
+`postroute2` at `-1.552` twice (row 14, and round 2 of row 16).  The recipe is
+deterministic.
+
+The `exploreN` curve is worse and flatter: -1.769 at round 0 (so the
+`ExtraTimingOpt` / `AggressiveExplore` / `route -directive Explore` combination is
+worth +12.45 MHz on its own, before any post-route pass), then -1.642 at round 1
+and no further improvement through round 6.  It buys the best TNS/endpoint counts
+in the table (-15,517 / 30,048) but loses 5.8 MHz of WNS to plain iterated
+`postroute`, and costs +133 LUT.
+
+**Landed: `synth/impl_FullCore.tcl`'s `IMPL_STRATEGY` now defaults to
+`postrouteN` with `POSTROUTE_ROUNDS=3`, i.e. -1.472 ns / 182.549 MHz** — 0.622 ns
+of the 0.631 ns the plateau offers, at roughly half its wall time (the 6-round run
+took 45 minutes against about 20 for the old flow).  `POSTROUTE_ROUNDS=1` is the
+fast-gate option and still carries +13.75 MHz.  **`IMPL_STRATEGY=default`
+reproduces the historical flow verbatim**, so every physical number published in
+this document before this section regenerates unchanged; any comparison against a
+pre-section-18 row must use it.
+
+`FLOORPLAN_MODE` keeps its `decode` default, and row 13 is why: under the new
+recipe, `none` gives -2.010 against `decode`'s -1.623.  **The decode pblock's edge
+did not merely survive the recipe change, it grew from 0.093 ns / 2.47 MHz to
+0.387 ns / 11.45 MHz.**  Section 15 step 7's warning that the pblock was becoming
+marginal is therefore withdrawn: post-route physical optimisation has more to work
+with when the placement is floorplanned.
+
+Row 16's archived evidence is at `synth/archive/6b246de_postrouteN6_decode/`
+(routed DCP, MD5 sidecar, Vivado log, timing/utilization/slack-matrix, congestion,
+fan-out, path-analysis and pblock reports).  Its top path is still
+`stalled -> IcachePlugin lineReg[418]/D` at 5.445 ns / 68.7 % route, but the
+**second**-worst is now `DcachePlugin stS2Payload_paddr[5] -> IssueQueuePlugin
+lines_7_ways_0_triggers[9]` — the D-cache/IQ family from section 16 has surfaced
+again at the new slack level, which is a live pointer for the next pass.
+
+### Step 5: what this means for 200 MHz
+
+Section 17 step 6 put the ceiling of family-cutting at 189.72 MHz after retiring
+*two hundred* startpoint families.  This section adds two facts to that picture:
+
+- **The floorplan lever is spent** (seven regressions), and
+- **the tool-recipe lever was worth +13.7 MHz on its own** and had never been
+  tried.
+
+At -1.472 ns (the landed 3-round default) the branch is **182.549 MHz** and needs
++0.472 ns more to reach the 200 MHz deployment floor; the 6-round plateau is
+-1.463 ns / 183.050 MHz.  For calibration, the section-17 ladder applied to the
+*old* placement said 200 families were worth 0.823 ns; that ladder must now be
+re-run against the `postroute` checkpoint, because a static what-if ladder is
+computed on a fixed placement and this placement is different.  **Re-running
+`synth/probe_slack_ladder.tcl` against the new routed DCP is the first thing the
+next session should do** — it is 40 seconds and it re-scopes every remaining
+candidate.
+
+Remaining levers, in descending expected value:
+
+1. **Finish the implementation-strategy sweep.**  Only three recipes have been
+   tried.  Untried and cheap: `-directive ExplorePostRoutePhysOpt`,
+   `route_design -directive AggressiveExplore`, `phys_opt_design
+   -directive ExploreWithAggressiveHoldFix`, multiple `-tns_cleanup` rounds
+   (row 14 is the first probe of that), and non-default `place_design`
+   directives paired with the winning post-route pass.  This lever has produced
+   the only positive result in three consecutive sessions.
+2. **A real pipeline stage**, justified by an IPC measurement rather than a
+   census — section 16 step 5 fix 1 (register the IQ -> LS-EU issue-port ready)
+   and section 17 step 5 (2-entry skid on the decode `raw` stage) are both
+   specified and both cost a cycle somewhere.  The static ladder cannot price
+   them, because it cannot model the placement freedom a genuine cone deletion
+   creates; both of this campaign's best RTL cuts beat their static prediction
+   for exactly that reason.
+3. **Re-synthesis under the new recipe.**  Every number in this document comes
+   from one frozen `6b246de` synthesis checkpoint.  A fresh `synth_design` with
+   the post-route pass in the loop has never been measured.
+4. Banked TNS/endpoint-breadth cuts (section 15 step 9), now with a concrete
+   target: `explore` shows that 28,795 failing endpoints is reachable by tooling
+   alone, so RTL breadth cuts should be judged against that, not against 32,729.
+
+**What should *not* be tried again**: a new pblock geometry or capture filter.
+Seven variants across both evidenced boundaries, two geometries per region and
+two capture filters all regressed, and the WNS path crosses zero pblock
+boundaries.
+
+### Functional gates
+
+`make SBT=~/sbt/bin/sbt test-fast` — **149/149 tests, 157 suites, 0 failed**, on
+the worktree with all of this section's changes present.  No RTL changed in this
+section; the only tracked non-documentation changes are `synth/*.xdc`,
+`synth/*.tcl`, `synth/*.sh` and the reservation file.
+
+### Status after this section
+
+**No RTL changed.**  `6b246de` remains the head RTL checkpoint.  What changed is
+the physical-implementation recipe:
+
+- **New physical baseline: `6b246de` + `FLOORPLAN_MODE=decode` +
+  `IMPL_STRATEGY=postrouteN` (`POSTROUTE_ROUNDS=3`) = -1.472 ns / 182.549 MHz**,
+  from the same netlist MD5 `d80f6218c5c7dcab94a33a52d64244fa`.  The 6-round
+  plateau is -1.463 ns / 183.050 MHz and is the archived checkpoint.
+- The old -2.094 ns / 164.096 MHz row is still correct **for
+  `IMPL_STRATEGY=default`**, and section 5's table should be read that way from
+  now on.
+- `FLOORPLAN_MODE=decode` unchanged and re-validated on today's netlist under both
+  recipes.  No pblock geometry or capture filter changed on the default path;
+  `floorplan_frontend.xdc`, `floorplan_backend.xdc` and `floorplan_decode_fe.xdc`
+  are committed as measured-negative diagnostics with their evidence in-file.
+- `make SBT=~/sbt/bin/sbt test-fast`: 149/149, 157 suites, 0 failed.
+- Distance to the 200 MHz deployment floor: **0.472 ns** (was 1.094 ns at the
+  start of this section).

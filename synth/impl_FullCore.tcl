@@ -95,14 +95,35 @@ foreach stale {pb_decode pb_dcache pb_backend pb_frontend} {
     file delete -force synth/fullcore_${stale}_util.rpt
   }
 }
-# IMPL_STRATEGY selects the placer/phys-opt/router recipe.  `default` is the
-# historical flow and stays the default so every previously published number in the
-# handoff remains reproducible verbatim.  The alternatives exist because the
-# 2026-08-10 census showed the limiter is a 931-fan-out capture-enable broadcast
-# (`FetchAlignPlugin stalled -> IcachePlugin s1PredEntries_*/CE`, 66% route, 0
-# pblock crossings), which is a replication/placement problem rather than a
-# floorplan or logic-cone problem.  See handoff section 18.
-set impl_strategy "default"
+# IMPL_STRATEGY selects the placer/phys-opt/router recipe.
+#
+# The default changed on 2026-08-10 from `default` (place / phys_opt / route, one
+# pass each) to `postrouteN`, because a same-DCP sweep over the exact `6b246de`
+# netlist measured post-route physical optimisation as worth far more than any
+# floorplan.  Convergence curve, all from one run, `decode` floorplan:
+#
+#   round 0 (= the old `default` flow)   WNS -2.094   164.096 MHz
+#   round 1                              WNS -1.623   177.841 MHz   (+13.75)
+#   round 2                              WNS -1.552   180.115 MHz
+#   round 3                              WNS -1.472   182.549 MHz
+#   round 4                              WNS -1.464   182.816 MHz
+#   round 5                              WNS -1.463   182.850 MHz
+#   round 6                              WNS -1.463   182.850 MHz   (plateau)
+#
+# POSTROUTE_ROUNDS defaults to 3: that is 0.622 ns of the 0.631 ns the plateau
+# offers, for roughly half its wall time.  Set POSTROUTE_ROUNDS=1 for a fast gate
+# (still +13.75 MHz) or 6 to sit exactly on the plateau.
+#
+# `default` is retained verbatim so every physical number published in the handoff
+# before section 18 regenerates unchanged -- use IMPL_STRATEGY=default to compare
+# against any pre-section-18 row.
+#
+# Why this and not a floorplan: the 2026-08-10 census found all 300 worst unique
+# endpoints to be one arc, `FetchAlignPlugin stalled -> IcachePlugin
+# s1PredEntries_*/CE`, at 66% route, 20 logic levels, **0 pblock crossings**, with
+# a 931-load terminal net.  Seven pblock variants across both evidenced boundaries
+# all regressed.  See handoff section 18.
+set impl_strategy "postrouteN"
 if {[info exists ::env(IMPL_STRATEGY)]} { set impl_strategy $::env(IMPL_STRATEGY) }
 puts "IMPL_STRATEGY $impl_strategy"
 # (if/elseif rather than `switch`: "default" is a reserved final pattern in Tcl's
@@ -136,8 +157,9 @@ if {$impl_strategy eq "default"} {
 } elseif {$impl_strategy eq "postrouteN" || $impl_strategy eq "exploreN"} {
   # Iterated post-route physical optimisation, with the WNS after EVERY round
   # printed so one run yields the whole convergence curve instead of one point.
-  # POSTROUTE_ROUNDS (default 4) sets the number of post-route rounds.
-  set rounds 4
+  # POSTROUTE_ROUNDS (default 3) sets the number of post-route rounds; see the
+  # measured curve in the IMPL_STRATEGY comment above.
+  set rounds 3
   if {[info exists ::env(POSTROUTE_ROUNDS)]} { set rounds $::env(POSTROUTE_ROUNDS) }
   if {$impl_strategy eq "exploreN"} {
     place_design -directive ExtraTimingOpt
