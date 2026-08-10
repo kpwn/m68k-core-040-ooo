@@ -1313,10 +1313,51 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val movemPcIdxLenKnown   = U(3, 5 bits) <= movemEntryPkt.wordCount.resize(5)
     val movemPcIdxResumeFire = movemBegin && eIsPcIdxMovem && movemPcIdxLenKnown
     val movemPcIdxRealNextPc = (ePc + U(6, 32 bits)).resize(32)   // opword+mask+ext = 3 words
+    // The real-length calculation used to drive FetchAlign's redirect action
+    // combinationally. Fresh current-RTL routing measured that path from ucPendPkt through
+    // this decode, fetch control, the live ITLB CAM and I-cache ready into fetchPc at
+    // 6.694 ns / 27 levels. The frontend is already stalled for these rare complex packets,
+    // so register the action here: one extra complex-resume cycle, no steady-state cadence
+    // cost, and no decode-to-ITLB/cache combinational path. Binding behavior and physical
+    // evidence: 2026-08-10-fmax-registered-complex-resume-design.md.
+    val ucComplexResumeDetect =
+      (ucBegin && ucEntryPkt.complex && ucIsMove && ucMoveLenKnown) || movemPcIdxResumeFire
+    val ucComplexResumeTarget =
+      Mux(movemPcIdxResumeFire, movemPcIdxRealNextPc, ucMoveRealNextPc)
+    val ucComplexResumeValidReg = Reg(Bool()) init False
+    val ucComplexResumeTargetReg = Reg(UInt(32 bits)) init 0
+    when(pipeFlush) {
+      ucComplexResumeValidReg := False
+    } otherwise {
+      ucComplexResumeValidReg := ucComplexResumeDetect
+      when(ucComplexResumeDetect) {
+        ucComplexResumeTargetReg := ucComplexResumeTarget
+      }
+    }
     val ucComplexResume = Flow(UInt(32 bits))
-    ucComplexResume.valid   := (ucBegin && ucEntryPkt.complex && ucIsMove && ucMoveLenKnown) ||
-                                movemPcIdxResumeFire
-    ucComplexResume.payload := Mux(movemPcIdxResumeFire, movemPcIdxRealNextPc, ucMoveRealNextPc)
+    ucComplexResume.valid   := ucComplexResumeValidReg && !pipeFlush
+    ucComplexResume.payload := ucComplexResumeTargetReg
+    spinal.core.sim.SimPublic(ucComplexResumeDetect, ucComplexResumeTarget,
+      ucComplexResumeValidReg, ucComplexResumeTargetReg,
+      ucComplexResume.valid, ucComplexResume.payload)
+
+    val ucComplexResumeDetectKept = ucComplexResumeDetect && !pipeFlush
+    val ucComplexResumeDetectKeptD = RegNext(ucComplexResumeDetectKept) init False
+    when(ucComplexResume.valid) {
+      assert(ucComplexResumeDetectKeptD,
+        "registered complex resume lost its exact detector association")
+    }
+    when(ucComplexResumeDetectKeptD && !pipeFlush) {
+      assert(ucComplexResume.valid,
+        "accepted complex-resume detector did not produce its C+1 action")
+    }
+    when(pipeFlush) {
+      assert(!ucComplexResume.valid,
+        "pipeFlush must suppress a pending complex-resume action")
+    }
+    assert(!((ucBegin && ucEntryPkt.complex && ucIsMove && ucMoveLenKnown) &&
+             movemPcIdxResumeFire),
+      "complex MOVE and MOVEM resume detectors must be mutually exclusive")
     // task #119 (deep-audit follow-up): a mem-indirect MOVE whose OTHER side is NOT a
     // register (newly reachable once F2's predecode fix let a 7+-word dual-full-EA MOVE
     // frame correctly at all — previously it just livelocked before execution got this
