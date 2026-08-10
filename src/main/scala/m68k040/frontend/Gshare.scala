@@ -106,6 +106,9 @@ class GsharePlugin extends FiberPlugin with GshareUpdateService with GshareWindo
     val winCmd = Flow(FtbLookupCmd())
     winCmd.valid.allowOverride; winCmd.valid := False
     winCmd.payload.windowPc.allowOverride; winCmd.payload.windowPc := U(0, 32 bits)
+    // Shared `FtbLookupCmd` bundle; gshare ignores `drop` (amendment §2.1.1) but must
+    // still default-drive it so the Flow is complete when no consumer is elaborated.
+    winCmd.payload.drop.allowOverride; winCmd.payload.drop := U(0, 2 bits)
     winCmd.payload.token.ringSlot.allowOverride; winCmd.payload.token.ringSlot := U(0, 2 bits)
     winCmd.payload.token.seq.allowOverride; winCmd.payload.token.seq := U(0, 8 bits)
     windowCmdFlow = winCmd

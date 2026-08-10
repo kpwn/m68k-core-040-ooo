@@ -367,11 +367,32 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       (resultExpectedValid === !resultExpectedBornStale)
     spinal.core.sim.SimPublic(planLookupFire, resultExpectedIssueValid,
       resultExpectedValid, resultExpectedBornStale, resultTokenProof, resultStaleProof)
+    // `resultEnd` is still needed at result time: `ringKeep(resultSlot)` is written from
+    // it on application. It is a two-register add that terminates at a register write,
+    // not an input to the fetch-PC mux.
     val resultEnd = ftbRsp.payload.brWordOff.resize(5) + ftbRsp.payload.brLen.resize(5)
     val resultDirection = (ftbRsp.payload.brType =/= 0) ||
                           gshareWindowRsp.payload.taken(ftbRsp.payload.brWordOff)
+    // FMax recovery (framing-verdict retime, amendment §2.1.1). `resultInWindow` and
+    // `resultAfterDrop` below are the LIVE oracle/telemetry forms ONLY. The functional
+    // application input is the provider's registered `framedOk`, which is the same
+    // conjunction evaluated one cycle earlier from the identical values:
+    //   * `ringDrop(resultSlot)` at C+1 is bit-identical to the `cmdDrop` that this
+    //     window's command carried at C — `ringDrop` has one writer, gated on
+    //     `ic.cmd.fire`, writing `ringTail`, and `resultExpectedSlot` latches that same
+    //     `ringTail` at the same edge, with the three-deep ring advancing one slot per
+    //     fire so no second write can reach the slot in one cycle; and
+    //   * `hit`/`brWordOff`/`brLen` are the provider's own asynchronous entry read.
+    // The routed `28ec738` checkpoint measured every top-100 path starting at
+    // `ringDrop_1_reg[0]/C`: six levels and 1.536 ns of drop compare, in-window sum and
+    // application AND-tree sat AHEAD of the ITLB CAM, the L1I tag qualification and the
+    // prefetch window seed, all in one cycle. Only the first six levels are removable
+    // without changing behaviour, and this is that removal. The equivalence is asserted
+    // live below on every result cycle, so a divergence fails loudly instead of
+    // silently mis-applying a prediction.
     val resultInWindow = (ftbRsp.payload.brLen =/= 0) && (resultEnd <= U(4, 5 bits))
     val resultAfterDrop = ftbRsp.payload.brWordOff >= ringDrop(resultSlot)
+    val resultFramedOk = ftbRsp.payload.framedOk
     val ftbCandidate = resultExpectedValid && resultProvidersValid &&
                        resultSlotLegal && ftbRsp.payload.hit
     // FMax recovery: keep the live IBuf/aligner cone out of the registered-result
@@ -407,7 +428,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     val ftbDeclineBlocked = ftbCandidate && resultDirection &&
                            resultInWindow && resultAfterDrop && ftbBlocked
     spinal.core.sim.SimPublic(ftbCandidate, ftbDeclineDirection,
-      ftbDeclineFraming, ftbDeclineBlocked)
+      ftbDeclineFraming, ftbDeclineBlocked, resultFramedOk, resultInWindow,
+      resultAfterDrop)
 
     if (enableFetchDirected) {
       when(resultExpectedIssueValid) {
@@ -423,9 +445,21 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
           "FTB/gshare responses are not exactly one cycle after live fetch-plan issue")
         assert(resultTokenProof,
           "fixed-latency fetch-plan response no longer names its resident ring record")
+        // Amendment §9 item 8a: the registered framing verdict must equal the live
+        // ring-drop oracle on every result cycle. This is the differential proof that
+        // the retime below is a pure restructuring; it runs in every existing
+        // fetch-directed simulation, not only in a dedicated test.
+        when(resultSlotLegal) {
+          assert(resultFramedOk === (ftbRsp.payload.hit && resultInWindow && resultAfterDrop),
+            "registered FTB framing verdict diverged from its live ring-drop oracle")
+        }
       }
-      applyNow := ftbCandidate && resultDirection && resultInWindow &&
-                  resultAfterDrop && !ftbBlocked
+      // Functionally identical to `ftbCandidate && resultInWindow && resultAfterDrop &&
+      // resultDirection && !ftbBlocked` — `resultFramedOk` already carries the provider's
+      // tag hit, so the only change is WHERE the hit/in-window/after-drop conjunction is
+      // evaluated. Every remaining term is a register or a one-level select of one.
+      applyNow := resultExpectedValid && resultProvidersValid && resultSlotLegal &&
+                  resultFramedOk && resultDirection && !ftbBlocked
       when(applyNow) {
         assert(resultSlotLegal && resultEnd > ringDrop(resultSlot).resize(5),
           "applied FTB plan violates its ring slot/drop framing contract")
@@ -442,6 +476,12 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     ftbCmd.payload.windowPc := ic.cmd.payload.pc
     ftbCmd.payload.token.ringSlot := ringTail
     ftbCmd.payload.token.seq := planSeq
+    // Amendment §2.1.1: the command also carries this window's leading-word drop, so the
+    // provider can register the whole framing verdict. `cmdDrop` is defined with the
+    // paired `cmdWindowPc` further down (§3 requires them selected together); the
+    // assignment is placed there so the pairing stays impossible to break by editing one
+    // of the two. `gshareWindowCmd.payload := ftbCmd.payload` below is a net connection,
+    // so it carries whatever `ftbCmd.payload.drop` finally resolves to.
     gshareWindowCmd.valid := planLookupFire
     gshareWindowCmd.payload := ftbCmd.payload
     ftbClear.valid := ftqMismatch
@@ -507,6 +547,12 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     val cmdDrop = Mux(predictFire, predictTargetReg(2 downto 1),
                   Mux(targetHoldValid, targetHoldDrop,
                   Mux(applyNow, ftbRsp.payload.target(2 downto 1), pendingDrop)))
+    // Amendment §2.1.1 — the SAME value that `ic.cmd.fire` writes into
+    // `ringDrop(ringTail)` below is what the provider framing verdict must be computed
+    // against. Driving it from this exact expression (rather than re-deriving it at the
+    // command assignment) is what makes the equivalence structural: there is one
+    // `cmdDrop`, and the ring record and the lookup command both consume it.
+    ftbCmd.payload.drop := cmdDrop
     // The action flushes the old IBuf on this edge, so its old occupancy must not block
     // the C+1 target command. Ring capacity remains physical and is never bypassed.
     val ibufRoomForCmd = ibufRoomForIssue || predictFire

@@ -662,6 +662,72 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
     }
   }
 
+  /** Amendment §2.1.1 / §9 item 8a, integrated half.
+    *
+    * The provider-level matrix in `FtbSpec` proves `framedOk` is the right conjunction.
+    * This proves the OTHER half of the equivalence: that the drop the command carries is
+    * the drop the fetch ring records for that very window, in the real frontend, on the
+    * one cycle where the two could disagree — the C+1 target command of an unaligned
+    * application.
+    *
+    * `W` branches to an unaligned target inside window `T2`, so `T2` is fetched with
+    * drop=3 and only its last word is genuine. `T2` itself has a learned branch at word
+    * offset zero, i.e. inside the three words that were dropped. That prediction must be
+    * declined: those bytes are not delivered to decode, so applying it would splice a
+    * target the machine never fetched a branch for.
+    *
+    * Sending anything other than the paired `cmdDrop` on the lookup (for example the
+    * registered `pendingDrop`) makes the provider report `framedOk` for a branch that is
+    * not in the window, which both trips the live oracle assertion in `FetchAlignPlugin`
+    * and shows up architecturally as a second application and a wrong third command.
+    */
+  test("a learned branch inside the dropped leading words is declined end to end",
+       VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      val unalignedTarget = 0x1046L        // window 0x1040, leading-word drop = 3
+      val t2 = unalignedTarget & ~7L
+      val t2Branch = t2                    // word offset 0: strictly inside the drop
+      val t2Target = 0x2000L
+      train(dut, cd, target = unalignedTarget)
+      train(dut, cd, brType = 1, len = 1, target = t2Target, pc = t2Branch)
+
+      var framingDeclines = 0
+      var afterDropFalse = 0
+      cd.onSamplings {
+        if (dut.fa.logic.ftbDeclineFraming.toBoolean) {
+          framingDeclines += 1
+          assert(!dut.fa.logic.resultFramedOk.toBoolean,
+            "provider reported framedOk on a cycle the live oracle declined framing")
+          if (!dut.fa.logic.resultAfterDrop.toBoolean) {
+            afterDropFalse += 1
+            assert(dut.fa.logic.resultInWindow.toBoolean,
+              "the drop-only decline case must not be masked by an in-window failure")
+          }
+        }
+      }
+
+      val tr = trace(dut, cd)
+      dut.fetch.logic.cmdOut.ready #= true
+      redirect(dut, cd)
+      await(cd, 16, "source, target and post-target commands") { tr.cmds.size >= 3 }
+      dut.fetch.logic.cmdOut.ready #= false
+      cd.waitSampling()
+
+      assert(tr.cmds.take(3).map(_._2).toSeq == Seq(W, t2, t2 + 8),
+        s"declined drop-shadowed prediction changed the command stream: ${tr.cmds.take(3)}")
+      assert(dut.fa.logic.ringDrop(1).toInt == 3,
+        s"target ring record drop was ${dut.fa.logic.ringDrop(1).toInt}, expected 3")
+      assert(tr.applies == 1 && tr.pushes == 1,
+        s"the drop-shadowed branch was applied: ${tr.applies} applies / ${tr.pushes} pushes")
+      assert(dut.fa.logic.ftqCount.toInt == 1,
+        s"FTQ holds ${dut.fa.logic.ftqCount.toInt} entries, expected only W's")
+      assert(afterDropFalse >= 1,
+        s"no drop-only framing decline was observed ($framingDeclines framing declines " +
+        "total); the test would not detect an unpaired lookup drop")
+    }
+  }
+
   test("a redirect kills a target held under cache backpressure", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)

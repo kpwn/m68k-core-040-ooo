@@ -53,6 +53,7 @@ class FtbPlugin(entries: Int = 128) extends FiberPlugin with FtbLookupService {
     val cmd = Flow(FtbLookupCmd())
     cmd.valid.allowOverride; cmd.valid := False
     cmd.payload.windowPc.allowOverride; cmd.payload.windowPc := U(0, 32 bits)
+    cmd.payload.drop.allowOverride; cmd.payload.drop := U(0, 2 bits)
     cmd.payload.token.ringSlot.allowOverride; cmd.payload.token.ringSlot := U(0, 2 bits)
     cmd.payload.token.seq.allowOverride; cmd.payload.token.seq := U(0, 8 bits)
     cmdPort = cmd
@@ -69,12 +70,27 @@ class FtbPlugin(entries: Int = 128) extends FiberPlugin with FtbLookupService {
     val qEntry = mem.readAsync(qIdx)
     val qHit   = valids(qIdx) && (qEntry.tag === tagOf(cmd.payload.windowPc))
 
+    // Amendment §2.1.1: the complete framing verdict is registered HERE, at command
+    // time, alongside the tag hit it already had to compute. `cmd.payload.drop` is the
+    // same value the issuing cycle writes into `ringDrop(ringTail)`, and the fetch ring
+    // has exactly one writer advancing one slot per fire, so the drop this command
+    // carries IS the drop the C+1 application would have read back out of the ring.
+    // Doing the compare here instead of there removes the measured
+    // `ringDrop -> resultAfterDrop -> applyNow -> fetch-PC mux` head of the routed
+    // critical path (six levels / 1.536 ns ahead of the ITLB CAM at `28ec738`).
+    // The in-window sum is the identical `resultEnd <= 4` test FetchAlign used to run
+    // one cycle later; `brLen` stays four bits end to end per §2.1.
+    val qEnd     = qEntry.brWordOff.resize(5) + qEntry.brLen.resize(5)
+    val qFramed  = qHit && (qEntry.brLen =/= 0) && (qEnd <= U(4, 5 bits)) &&
+                   (qEntry.brWordOff >= cmd.payload.drop)
+
     val rspValid = RegNext(cmd.valid) init False
     val rspPayload = Reg(FtbLookupRsp())
     when(cmd.valid) {
       rspPayload.windowPc  := cmd.payload.windowPc
       rspPayload.token     := cmd.payload.token
       rspPayload.hit       := qHit
+      rspPayload.framedOk  := qFramed
       rspPayload.brWordOff := qEntry.brWordOff
       rspPayload.brLen     := qEntry.brLen
       rspPayload.target    := qEntry.target

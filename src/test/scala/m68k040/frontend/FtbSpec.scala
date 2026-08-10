@@ -30,8 +30,10 @@ class FtbSpec extends AnyFunSuite {
       val qPc = in UInt(32 bits)
       val qSlot = in UInt(2 bits)
       val qSeq = in UInt(8 bits)
+      val qDrop = in UInt(2 bits)
       svc.lookupCmd.valid := qValid
       svc.lookupCmd.payload.windowPc := qPc
+      svc.lookupCmd.payload.drop := qDrop
       svc.lookupCmd.payload.token.ringSlot := qSlot
       svc.lookupCmd.payload.token.seq := qSeq
 
@@ -51,6 +53,7 @@ class FtbSpec extends AnyFunSuite {
       val rspLen = out UInt(4 bits); rspLen := svc.lookupRsp.payload.brLen
       val rspTarget = out UInt(32 bits); rspTarget := svc.lookupRsp.payload.target
       val rspType = out UInt(2 bits); rspType := svc.lookupRsp.payload.brType
+      val rspFramed = out Bool(); rspFramed := svc.lookupRsp.payload.framedOk
     }
   }
 
@@ -72,6 +75,7 @@ class FtbSpec extends AnyFunSuite {
     dut.wire.logic.qPc #= 0
     dut.wire.logic.qSlot #= 0
     dut.wire.logic.qSeq #= 0
+    dut.wire.logic.qDrop #= 0
     dut.wire.logic.clearValid #= false
     dut.wire.logic.clearPc #= 0
     dut.wire.logic.invalidate #= false
@@ -182,6 +186,77 @@ class FtbSpec extends AnyFunSuite {
       // Same-cycle retire update cannot resurrect an architecturally invalidated FTB.
       update(dut, cd, 0x2800, len = 1, target = 0x3800, invalidate = true)
       assert(!lookup(dut, cd, 0x2800).hit, "invalidate must win update collision")
+    }
+  }
+
+  /** Amendment §2.1.1 / §9 item 8a. The registered `framedOk` must equal
+    * `hit && brLen != 0 && brWordOff + brLen <= 4 && brWordOff >= drop` for the drop the
+    * COMMAND carried, over the full offset/length/drop matrix. The FMax cut in
+    * `FetchAlignPlugin` consumes this single bit instead of re-deriving the same
+    * conjunction from the fetch ring one cycle later, so a wrong verdict here would
+    * silently apply or silently decline a prediction. */
+  test("framedOk is the exact hit/in-window/at-or-after-drop verdict for the command drop",
+       VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
+      val w = dut.wire.logic
+
+      // Distinct windows so no two learned entries share a direct-map index: the index
+      // is pc[9:3], so stepping the window base by 0x8 gives each case its own entry.
+      // Only in-window branches are installable at all (that bound is the parent
+      // contract), so the length axis is covered by the installable set plus a
+      // deliberate non-installable overshoot which must read back as a miss.
+      case class Case(base: Long, off: Int, len: Int, installs: Boolean)
+      val cases = Seq(
+        Case(0x4000, 0, 1, installs = true),
+        Case(0x4008, 1, 1, installs = true),
+        Case(0x4010, 2, 1, installs = true),
+        Case(0x4018, 3, 1, installs = true),
+        Case(0x4020, 0, 4, installs = true),   // exactly fills the window
+        Case(0x4028, 1, 3, installs = true),   // ends exactly at the window end
+        Case(0x4030, 2, 3, installs = false),  // overshoots: 2+3 > 4, never installed
+        Case(0x4038, 3, 2, installs = false))  // overshoots: 3+2 > 4, never installed
+
+      for (c <- cases) update(dut, cd, c.base + c.off * 2L, len = c.len, target = 0x9000)
+
+      var trueVerdicts = 0
+      var falseVerdicts = 0
+      var checked = 0
+      for (c <- cases; drop <- 0 to 3) {
+        w.qValid #= true; w.qPc #= c.base; w.qSlot #= 0; w.qSeq #= 0; w.qDrop #= drop
+        cd.waitSampling(); sleep(1)
+        assert(w.rspValid.toBoolean, "one lookup command must yield one cmd+1 result")
+        val hit = w.rspHit.toBoolean
+        assert(hit == c.installs,
+          s"window 0x${c.base.toHexString} off=${c.off} len=${c.len}: hit=$hit, " +
+          s"expected ${c.installs}")
+        val expected = c.installs && c.len != 0 && (c.off + c.len) <= 4 && c.off >= drop
+        val got = w.rspFramed.toBoolean
+        assert(got == expected,
+          s"window 0x${c.base.toHexString} off=${c.off} len=${c.len} drop=$drop: " +
+          s"framedOk=$got, expected $expected")
+        // The payload the application cycle would have used must still be intact: the
+        // cut removes the recomputation, not the fields.
+        if (hit) {
+          assert(w.rspOff.toInt == c.off && w.rspLen.toInt == c.len,
+            "framing verdict must not disturb the returned offset/length")
+        }
+        if (got) trueVerdicts += 1 else falseVerdicts += 1
+        checked += 1
+        w.qValid #= false
+        cd.waitSampling()
+      }
+
+      assert(checked == cases.size * 4, s"expected ${cases.size * 4} verdicts, got $checked")
+      // Non-vacuity: the matrix must genuinely exercise both verdicts, and specifically
+      // must contain at least one case that is a real FTB hit, wholly in its window, and
+      // still declined purely because the leading-word drop skipped past the branch.
+      assert(trueVerdicts > 0 && falseVerdicts > 0,
+        s"framing matrix is vacuous: $trueVerdicts true / $falseVerdicts false")
+      val dropOnlyDeclines = cases.filter(_.installs).flatMap(c =>
+        (0 to 3).map(d => (c, d))).count { case (c, d) => c.off < d }
+      assert(dropOnlyDeclines > 0,
+        "matrix contains no drop-only decline; the drop axis would be untested")
     }
   }
 }

@@ -82,15 +82,25 @@ case class FetchPlanToken() extends Bundle {
   val seq      = UInt(8 bits)
 }
 
+/** `drop` is the leading-word drop attached to the very window this command names —
+  * the same `cmdDrop` the issuing cycle writes into `ringDrop(ringTail)`. Carrying it
+  * here lets the provider register the complete framing verdict (amendment §2.1.1) so
+  * the application cycle never re-derives it from the fetch ring. */
 case class FtbLookupCmd() extends Bundle {
   val windowPc = UInt(32 bits)
+  val drop     = UInt(2 bits)
   val token    = FetchPlanToken()
 }
 
+/** `framedOk` is the registered conjunction `hit && brLen =/= 0 &&
+  * brWordOff + brLen <= 4 && brWordOff >= cmd.drop`, computed at command time.
+  * FetchAlign consumes it as one bit; the live equivalent is retained there only as a
+  * simulation oracle and decline telemetry (amendment §2.1.1, §4). */
 case class FtbLookupRsp() extends Bundle {
   val windowPc  = UInt(32 bits)
   val token     = FetchPlanToken()
   val hit       = Bool()
+  val framedOk  = Bool()
   val brWordOff = UInt(2 bits)
   val brLen     = UInt(4 bits)
   val target    = UInt(32 bits)
