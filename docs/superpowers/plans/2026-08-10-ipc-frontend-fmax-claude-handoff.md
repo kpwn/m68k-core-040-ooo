@@ -6,7 +6,7 @@
 
 **Branch:** `codex/ipc-dcache-vipt`
 
-**Frozen RTL checkpoint:** `9101c5a` (`frontend: localize cycle-exact quiesce`)
+**Frozen RTL checkpoint:** `6b246de` (`frontend: retime the FTB framing verdict off the fetch-PC cone`)
 
 This is the continuation point after the IPC/cache pipeline push and its first
 cumulative frontend FMax recovery passes.  The design is functionally healthy,
@@ -25,7 +25,7 @@ git rev-parse HEAD
 ```
 
 Expected tracked state is clean at the documentation handoff commit immediately
-above `9101c5a`.  The following are local evidence or reservation files and must
+above `6b246de` (section 14).  The following are local evidence or reservation files and must
 not be committed:
 
 - `.agent-reservation`
@@ -38,10 +38,11 @@ The last functional gate is green:
 
 ```text
 make SBT=~/sbt/bin/sbt test-fast
-148 passed / 148 total, 156 suites
+149 passed / 149 total, 157 suites
 ```
 
-The last focused frontend gate is `FetchDirectedFtbSpec` 16/16.  The real
+The last focused frontend gate is `FetchDirectedFtbSpec` 17/17, with `FtbSpec`
+3/3, `GshareSpec` 5/5 and `FtqCapacitySpec` 2/2.  The real
 STOP -> IRQ -> handler -> RTE -> resume lockstep test also passes.  A deliberate
 negative mutation changed the local capture from the exact next state to
 `RegNext(service.active)`; the new halt-collision test failed because the ROB
@@ -106,6 +107,10 @@ pipeline these without preserving ordering, fault, and flush semantics.
   described in section 5.
 - `e421e6b`, `9101c5a` specify and implement the cycle-exact ROB-owned frontend
   quiesce service, removing the remote `coreHalted` family.
+- `36b4866`, `1a7a0f3`, `28ec738` terminate FTQ capacity at the elaboration bound
+  plus an assertion and remove the defensive full veto (section 13).
+- `5f6de59`, `6b246de` register the FTB framing verdict at command time and take
+  it off the application/fetch-PC cone (section 14).
 
 ## 4. Pinned IPC results
 
@@ -140,15 +145,18 @@ All figures use the 4.000 ns constraint.  A negative WNS therefore gives
 | `dc16fc1` redirect cut | decode only | -3.135 ns / 140.154 MHz | -40,968.956 / 47,952 | 111,555 LUT, 50,366 FF | Removes ROB doFlush/exception family and about 3k LUT; exposes `ringStale` |
 | `cc22cd0` stale-plan cut | decode only | **-3.326 ns / 136.500 MHz** | **-43,658.238 / 46,278** | **113,642 LUT, 50,416 FF, 26 BRAM, 4 DSP** | Removes all `ringStale` paths; exposes remote ROB `coreHalted` quiesce family |
 | `9101c5a` local quiesce | decode only | -3.534 ns / 132.732 MHz | -45,594.648 / 53,953 | 113,569 LUT, 50,385 FF, 26 BRAM, 4 DSP | Removes all remote halt paths; exposes defensive FTQ-full through live VIPT/L1I control |
-| `28ec738` FTQ-full cut | decode only | **-2.587 ns / 151.814 MHz** | **-30,937.422 / 45,597** | **113,487 LUT, 50,328 FF, 26 BRAM, 4 DSP** | Removes the defensive capacity veto; `ftqCount` drops to 0 paths; exposes `ringDrop`-to-prefetch fanout. Best result of the campaign; improved synth *and* route together |
+| `28ec738` FTQ-full cut | decode only | **-2.587 ns / 151.814 MHz** | **-30,937.422 / 45,597** | **113,487 LUT, 50,328 FF, 26 BRAM, 4 DSP** | Removes the defensive capacity veto; `ftqCount` drops to 0 paths; exposes the `ringDrop`-startpoint cone. Improved synth *and* route together |
+| `6b246de` FTB framing retime | decode only | **-2.094 ns / 164.096 MHz** | **-21,068.689 / 32,729** | **110,662 LUT, 50,389 FF, 26 BRAM, 4 DSP** | Registers the hit/in-window/after-drop conjunction in the provider; `ringDrop` drops to 0 paths; exposes `stalled -> ftbBlocked -> applyNow`. Improved every timing metric, total LUTs and pblock occupancy at once |
 
-The head of the table is now `28ec738` at WNS **-2.587 ns / 151.814 MHz**.  It
-is the only cut so far that improved post-synthesis WNS, post-route WNS, TNS,
-failing endpoints, and area all at once, and it is the campaign's largest single
-gain (+19.082 MHz, +14.4%).  Route is clean, with no hold or pulse-width
-failures and no congestion windows above level 5.  Utilization is 52.31% of
-device LUTs, 11.60% of FFs, 5.42% of BRAM tiles, and 0.22% of DSPs.  Area is not
-a problem.  The mapper redistributes covers toward MUXF7/F8, so do not infer
+The head of the table is now `6b246de` at WNS **-2.094 ns / 164.096 MHz**.
+`28ec738` and `6b246de` are the two cuts that improved post-synthesis WNS,
+post-route WNS, TNS, failing endpoints, and area all at once; `28ec738` remains
+the campaign's largest single gain (+19.082 MHz, +14.4%), with `6b246de` second
+(+12.282 MHz, +8.1%).  Together they take the branch from 132.732 to
+164.096 MHz, +23.6%.  Both routes are clean, with no hold or pulse-width
+failures and no congestion windows above level 5.  Current utilization is 51.01%
+of device LUTs, 11.61% of FFs, 5.42% of BRAM tiles, and 0.22% of DSPs.  Area is
+not a problem.  The mapper redistributes covers toward MUXF7/F8, so do not infer
 placement quality from total LUT count alone.
 
 For history: at `9101c5a` the synthesis result was WNS -2.440 ns, a real
@@ -179,9 +187,9 @@ A/B.  FetchAlign/Icache are not actually members of the decode pblock, so do not
 attribute an unplaced frontend cone improvement to that pblock without route
 coordinates.
 
-On `28ec738`, the decode region uses 30,288 / 43,680 LUT sites (69.34%), down
-from 32,805 / 43,680 (75.10%) at `9101c5a` and 34,173 / 43,680 (78.23%) at
-`cc22cd0` — a steady three-cut decline.  The same known split-carry warning
+On `6b246de`, the decode region uses 29,662 / 43,680 LUT sites (67.91%), down
+from 30,288 (69.34%) at `28ec738`, 32,805 (75.10%) at `9101c5a` and 34,173
+(78.23%) at `cc22cd0` — a steady four-cut decline.  The same known split-carry warning
 remains at the FetchAlign/Decode flattened-name boundary.  Preserve the current
 geometry for baseline comparability; make capture-filter cleanup a separate
 same-DCP A/B rather than mixing it into an RTL cut.
@@ -192,11 +200,12 @@ same-DCP A/B rather than mixing it into an RTL cut.
 - `synth/archive/cc22cd0_stale_plan_decode/`
 - `synth/archive/9101c5a_frontend_quiesce_decode/`
 - `synth/archive/28ec738_ftq_capacity_cut_decode/`
+- `synth/archive/6b246de_ftb_framing_retime_decode/`
 
 The current archive contains the exact generated Verilog, synthesized and
 routed DCPs, MD5, Vivado log, timing/utilization/slack/congestion/fanout/path and
 pblock reports.  Current generated-netlist MD5:
-`909dfa3941f47171a1fa77b5a8b8712b`.
+`d80f6218c5c7dcab94a33a52d64244fa`.
 
 ## 6. Completed FMax cut: cycle-exact local quiesce
 
@@ -354,8 +363,10 @@ new concurrency.
   miss-barrier, and output-collision tests whenever a queue becomes multi-flight.
 - Do not deepen either TLB as a throughput shortcut.  Measure CAM cost and prove
   need first.
-- The present FMax is far below both 200 and 250 MHz.  This is expected after the
-  large IPC changes, but it is now the principal core task.
+- The present FMax (164.096 MHz at `6b246de`) is still below both 200 and
+  250 MHz.  This is expected after the large IPC changes, but it is now the
+  principal core task.  Section 14 names the next two measured cuts and the
+  ~3.0 ns parallel-VIPT floor that remains behind them.
 
 ## 12. Handoff completion state
 
@@ -529,3 +540,222 @@ reducing what `ringDrop` gates or registering it closer to the I-cache, not
 another association cut.
 
 Archived at `synth/archive/28ec738_ftq_capacity_cut_decode/`.
+
+**Superseded by section 14**: the "single `ringDrop` bit broadcasting" reading in
+the paragraph above is wrong, and section 14 corrects it from the routed
+checkpoint.  `ringDrop_1_reg[0]` has `fo=2`.  It was the *latest-arriving input*
+to a long shared cone, not a broadcast source.  The fix shape suggested there —
+reduce fanout or add a pipeline register toward the I-cache — was therefore also
+wrong; the correct fix was a retiming across a register that already existed.
+
+## 14. Completed FMax cut: FTB framing-verdict retime (Claude, 2026-08-10)
+
+Executed section 13's recensus target.  **Result: 151.814 -> 164.096 MHz
+(+12.282 MHz, +8.1%)**, with the `ringDrop` family eliminated to zero routed
+paths and every timing metric improved again.
+
+**Commits**
+
+- `5f6de59` `docs(frontend): register the FTB framing verdict at command time` —
+  binding amendment §2.1.1, corrected §4 predicate, new §9 item 8a.
+- `6b246de` `frontend: retime the FTB framing verdict off the fetch-PC cone` —
+  the RTL, both mutation-proved tests.
+
+### Step 1: grounding corrected section 13's diagnosis
+
+Section 13 concluded from the top-100 startpoint census that this was a
+fanout/broadcast problem.  Querying the routed checkpoint directly disproves
+that.  `report_design_analysis` gives the worst path a `High Fanout` column
+value of 170, but the fanout-170 and fanout-166 nets are *five and six levels
+downstream* of the startpoint; the startpoint net itself is:
+
+```text
+net (fo=2, routed)  0.153  0.262  ...ringDrop_1_reg[0] -> LUT5
+```
+
+`ringDrop` is a two-bit-per-slot register array with exactly three functional
+readers: `resultAfterDrop`, `rspDropHead`, and two simulation assertions.  All
+100 paths shared that startpoint because it was the **latest-arriving input to a
+single long shared cone**, not because it drove 100 loads.  Neither of the two
+directions section 13 proposed would have helped: there was no fanout to reduce,
+and a pipeline register toward the I-cache would have inserted a real cycle into
+the II=1 fetch cadence to fix a segment that was only 1.9 ns of the 6.6 ns path.
+
+Decomposing that path by arrival time gives the real structure:
+
+| Segment | Levels | Arrival | Delay | What it is |
+|---|---:|---|---:|---|
+| A framing + application | 6 | 0.000 -> 1.938 | 1.938 ns | `ringDrop -> resultAfterDrop -> applyNow -> fetch-PC mux` |
+| B ITLB CAM | 7 | 1.938 -> 3.997 | 2.059 ns | CAM compare + two CARRY8 chains -> `tlb_io_hitEntry_ppn` |
+| C address + L1I tag | 3 | 3.997 -> 4.937 | 0.940 ns | `lookupPaddr` -> L1I `hitVec` tag/valid qualification |
+| D fire -> prefetch seed | 7 | 4.937 -> 6.596 | 1.659 ns | `isHit -> answerable -> cmdPort.fire -> seedPfWindow` |
+
+Segment A is the only part that is predictor *framing arithmetic over values
+that were already final one cycle earlier*.  B and C are the irreducible
+parallel-VIPT core.  D is a speculative prefetch hint with no same-cycle
+architectural requirement.  So the cut is A, and the next cut is D.
+
+### Step 2: the amendment
+
+`FtbLookupCmd` gains the window's leading-word `drop`; `FtbLookupRsp` gains a
+registered `framedOk = hit && brLen != 0 && brWordOff + brLen <= 4 &&
+brWordOff >= drop`, computed in the provider at command time from the same
+asynchronous entry read that already produced the tag hit.
+
+The equivalence is **structural, not incidental**.  `ringTail` has exactly one
+writer, `ringInc(ringTail)` under `ic.cmd.fire`, and no redirect resets it.
+`ringDrop` has exactly one writer, `ringDrop(ringTail) := cmdDrop`, under the
+same condition.  `resultExpectedSlot` latches that same `ringTail` at that same
+edge, and `ringInc(x) != x` for `RING=3`.  Therefore `ringDrop(resultSlot)` read
+at C+1 is bit-identical to the `cmdDrop` the command carried at C, on every
+cycle the value is consumed.  Zero cycles are added; no application rule
+changes.
+
+The amendment also prohibits `ringDrop` from the application, fetch-PC,
+lookup-enable and I-cache readiness/prefetch cones for the future.  Its only
+remaining functional consumer is response-time `rspDropHead`.
+
+### Step 3: the cut
+
+`applyNow` becomes `resultExpectedValid && resultProvidersValid &&
+resultSlotLegal && framedOk && resultDirection && !ftbBlocked`.  `framedOk`
+already carries the tag hit, so this is exactly the previous conjunction with
+the hit/in-window/after-drop terms moved one cycle earlier.
+
+The live `hit && resultInWindow && resultAfterDrop` form is retained as decline
+telemetry and as an oracle asserted on every live-result cycle.  Those nets have
+no synthesizable sink and are dead-code-eliminated; the retained assertion sits
+inside `` `ifndef SYNTHESIS ``.
+
+The generated Verilog differs from `28ec738`'s archived netlist in exactly the
+new command/response fields, the provider's `qFramed` assign, the rewritten
+`applyNow` assign, the new assertion, and line-number-derived renaming.  A true
+single-variable A/B.
+
+### Step 4: mutation proofs
+
+Both required by amendment §9 item 8a, and both trip:
+
+1. **Provider ignores the carried drop** (`brWordOff >= 0`).  The new `FtbSpec`
+   matrix fails at window `0x4000 off=0 drop=1`: `framedOk=true, expected
+   false`.  Note the existing integrated suite does *not* catch this mutation,
+   which is why the provider-level matrix is mandatory rather than optional.
+2. **Lookup carries `pendingDrop` instead of the paired `cmdDrop`.**  The new
+   integrated `FetchDirectedFtbSpec` case fails; with its test-side check
+   removed, the RTL itself fires `FAILURE registered FTB framing verdict
+   diverged from its live ring-drop oracle`, followed by the pre-existing
+   `applied FTB plan violates its ring slot/drop framing contract`.  This proves
+   the oracle is a live net and that the `cmdDrop` pairing is load-bearing.
+
+The integrated case is new coverage in its own right: `W` branches to an
+unaligned target so its target window is fetched with drop=3, and that target
+window has its own learned branch at word offset 0 — inside the dropped words.
+It must be declined, and the command stream must stay `W / T2 / T2+8` with one
+apply, one push, one FTQ entry.  Nothing previously exercised a drop-shadowed
+prediction end to end.
+
+### Functional gates
+
+- `make SBT=~/sbt/bin/sbt test-fast`: **149 passed / 149 total, 157 suites** —
+  unchanged, because both new tests are `VerilatorTest` and sit outside the fast
+  gate.
+- `FetchDirectedFtbSpec` 17/17, `FtbSpec` 3/3, `GshareSpec` 5/5,
+  `FtqCapacitySpec` 2/2.
+
+No IPC re-measurement was run.  This is deliberate: the cut is a proven pure
+retiming with a live in-RTL equality oracle running in every fetch-directed
+simulation, and the 17 directed frontend tests count applications, pushes,
+confirmations and exact command streams — a stronger cycle-behaviour proof than
+an aggregate IPC number would be.
+
+### Step 5: physical result
+
+| Metric | `28ec738` baseline | `6b246de` framing retime | Delta |
+|---|---:|---:|---:|
+| Post-synth WNS | -2.316 ns | **-1.827 ns** | **+0.489 ns** |
+| Post-synth TNS / endpoints | — | -9,071.870 / 12,559 | — |
+| Post-route WNS | -2.587 ns | **-2.094 ns** | **+0.493 ns** |
+| FMax | 151.814 MHz | **164.096 MHz** | **+12.282 MHz (+8.1%)** |
+| TNS | -30,937.422 | **-21,068.689** | **+9,868.733 (-31.9%)** |
+| Failing endpoints | 45,597 | **32,729** | **-12,868 (-28.2%)** |
+| Routed LUT | 113,487 | **110,662** | **-2,825** |
+| LUT as logic / memory | — | 101,469 / 9,193 | — |
+| Routed FF | 50,328 | 50,389 | +61 |
+| BRAM / DSP | 26 / 4 | 26 / 4 | unchanged |
+| Decode pblock | 30,288 / 43,680 (69.34%) | **29,662 / 43,680 (67.91%)** | -626 sites |
+| Worst path delay / levels | 6.568 ns / 24 | **5.990 ns / 20** | -0.578 ns / -4 levels |
+
+Route is clean: WHS +0.020 ns, THS 0.000, WPWS +1.458 ns, zero hold and zero
+pulse-width failures, and no congestion windows above level 5 at either placer
+or router stage.  Device use is 51.01% LUT, 11.61% FF, 5.42% BRAM, 0.22% DSP.
+`FLOORPLAN_MODE decode`, `SOURCE_MD5 = NETLIST_MD5 =
+d80f6218c5c7dcab94a33a52d64244fa`, Vivado exit 0.
+
+Like `28ec738`, and unlike the three cuts before it, this one improved
+post-synthesis WNS, post-route WNS, TNS, failing endpoints, total LUTs and
+in-pblock occupancy simultaneously.  The +61 FF is the provider's new `drop`
+command register and `framedOk` result bit; the -2,825 LUT is the deleted live
+framing/mux cone plus its dead-code-eliminated oracle nets.
+
+Two cuts have now taken the branch from 132.732 MHz to 164.096 MHz (+23.6%).
+
+**Recensus — the target family is gone.**  `ringDrop` appears **0 times** in the
+routed slack matrix and **0 times** in the entire post-route timing report,
+versus 100/100 of the top-100 startpoints at `28ec738`.  `ftqCount` remains at
+0.  The new top 100 are again unanimous:
+
+```
+100  FetchAlignPlugin_logic_stalled_reg/C   (startpoint, all 100)
+```
+
+ending in I-cache S1 predecode and line state:
+
+| Endpoint family | Paths in top 100 |
+|---|---:|
+| `IcachePlugin_logic_s1PredEntries_{0,1,2,3}` | 79 |
+| `IcachePlugin_logic_lineReg` | 21 |
+
+Worst path is `stalled_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE`
+at -2.094 ns, 5.990 ns over 20 levels, 66% route.  Segment A collapsed exactly
+as intended: `applyNow` is now reached at **0.836 ns and four levels** from the
+new startpoint, against 1.938 ns and six levels from `ringDrop` before.
+
+### The next cut, and why it is *not* another PC-mux cut
+
+`stalled` reaches `applyNow` through `ftbBlocked`:
+
+```text
+ftbBlocked = redirect.valid || (resume.valid && stalled) || quiesce
+          || stalled || faultHold || ftbSuppress || targetHoldValid
+```
+
+This is the same **association/veto** shape as the four cuts of section 8, and
+the same spec-first five-step discipline applies.  The specific question to
+answer from the architecture, not from the netlist, is: `ic.cmd.valid` already
+carries its own independent `!stalled`, so no command can fire while stalled.
+For the fetch-PC-mux consequence of `applyNow`, the `stalled` term in
+`ftbBlocked` is therefore redundant.  It is **not** obviously redundant for
+`applyNow`'s other three effects — the `ringKeep` truncation, the FTQ push, and
+the `targetHold` capture — and §4's "one `applyNow` event performs exactly once"
+rule is what must be re-proved before removing it.  Do not remove `stalled` from
+`ftbBlocked` wholesale; establish first whether the architecturally required
+gate is on the *application bookkeeping* or only on the *PC selection*, and if
+it is the former, split the term rather than delete it.
+
+Behind that, the measured remaining structure is segment D of the step-1 table:
+`isHit -> answerable -> cmdPort.ready -> cmdPort.fire -> seedPfWindow`, 7 levels
+and 1.659 ns of prefetch-window seeding charged to the demand cycle.  The
+prefetch stream window is a speculative hint — `pfNextPa`, `pfDemandLine`,
+`pfLimitPa`, `pfSeqValid` — with no same-cycle architectural requirement, so
+seeding it from a registered demand context costs a prefetch one cycle of
+earliness and nothing else.  That is an `IcachePlugin` prefetch-spec amendment
+(`2026-08-10-icache-five-id-stream-prefetch-design.md`, rules P1/P4 and the AR
+ordering argument), not a FetchAlign one.
+
+Segments B+C together are about 3.0 ns: a 32-entry fully-associative ITLB CAM
+plus L1I tag/valid qualification.  Against 3.965 ns of usable period they fit,
+but only once A and D are both gone.  **Do not deepen either TLB** and do not
+attack B or C before D — the handoff's standing rule holds, and B/C are the
+parallel-VIPT contract the IPC campaign was built on.
+
+Archived at `synth/archive/6b246de_ftb_framing_retime_decode/`.
