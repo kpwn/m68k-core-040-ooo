@@ -1,9 +1,22 @@
+set source_md5 "UNKNOWN"
+catch { set source_md5 [lindex [exec md5sum generated/M68kFullCoreSynth.v] 0] }
+set checkpoint_md5_file synth/fullcore_synth.md5
+set gate_netlist_md5 $source_md5
 set reuse_synth 0
 if {[info exists ::env(REUSE_SYNTH_DCP)] && $::env(REUSE_SYNTH_DCP) eq "1" &&
     [file exists synth/fullcore_synth.dcp]} {
   set reuse_synth 1
   open_checkpoint synth/fullcore_synth.dcp
   puts "REUSE_SYNTH_DCP synth/fullcore_synth.dcp"
+  if {[file exists $checkpoint_md5_file]} {
+    set fp [open $checkpoint_md5_file r]
+    set gate_netlist_md5 [string trim [read $fp]]
+    close $fp
+  } else {
+    # Never label a reused checkpoint with the current source file's digest. Older
+    # checkpoints predate the sidecar and have to remain explicitly unpinned.
+    set gate_netlist_md5 "UNKNOWN_REUSED_DCP"
+  }
 } else {
   read_verilog generated/M68kFullCoreSynth.v
   read_xdc synth/clk.xdc
@@ -17,6 +30,9 @@ report_timing_summary -max_paths 10 -file synth/fullcore_synth_timing.rpt
 report_utilization -file synth/fullcore_synth_util.rpt
 if {!$reuse_synth} {
   write_checkpoint -force synth/fullcore_synth.dcp
+  set fp [open $checkpoint_md5_file w]
+  puts $fp $source_md5
+  close $fp
 }
 set synth_paths [get_timing_paths -max_paths 1 -nworst 1 -setup]
 if {[llength $synth_paths] > 0} {
@@ -46,8 +62,10 @@ report_timing_summary -max_paths 10 -file synth/fullcore_route_timing.rpt
 report_utilization -file synth/fullcore_route_util.rpt
 # ── congestion + attribution reports (always-on; routing congestion is a first-class
 # gate metric alongside FMax — the recurring limiters are 58-82% ROUTE-dominated) ──
-# 0) netlist provenance: which _zz_ regen ordering was gated (regen is bistable)
-catch { puts "NETLIST_MD5 [lindex [exec md5sum generated/M68kFullCoreSynth.v] 0]" }
+# 0) netlist provenance: distinguish the source currently on disk from the netlist
+# actually opened. They intentionally differ during checkpoint-reuse floorplan controls.
+puts "SOURCE_MD5 $source_md5"
+puts "NETLIST_MD5 $gate_netlist_md5"
 # 1) router congestion windows + per-path logic-vs-route attribution
 catch { report_design_analysis -congestion -file synth/fullcore_congestion.rpt }
 catch { report_design_analysis -timing -max_paths 10 -file synth/fullcore_path_analysis.rpt }

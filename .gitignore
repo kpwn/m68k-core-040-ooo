@@ -19,6 +19,7 @@ synth/*.rpt
 synth/*.log
 synth/*.jou
 synth/*.dcp
+synth/fullcore_synth.md5
 clockInfo.txt
 .Xil/
 vivado*.log
