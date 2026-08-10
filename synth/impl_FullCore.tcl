@@ -154,17 +154,31 @@ if {$impl_strategy eq "default"} {
   route_design -tns_cleanup
   phys_opt_design
   route_design -tns_cleanup
-} elseif {$impl_strategy eq "postrouteN" || $impl_strategy eq "exploreN"} {
+} elseif {$impl_strategy eq "postrouteN" || $impl_strategy eq "exploreN" ||
+          $impl_strategy eq "postrouteNt" || $impl_strategy eq "postrouteNx"} {
   # Iterated post-route physical optimisation, with the WNS after EVERY round
   # printed so one run yields the whole convergence curve instead of one point.
   # POSTROUTE_ROUNDS (default 3) sets the number of post-route rounds; see the
   # measured curve in the IMPL_STRATEGY comment above.
   set rounds 3
   if {[info exists ::env(POSTROUTE_ROUNDS)]} { set rounds $::env(POSTROUTE_ROUNDS) }
+  # `exploreN` changes THREE things at once relative to `postrouteN` (placer
+  # directive, phys-opt directive, router directive) and measured WORSE on WNS
+  # (-1.642 vs -1.463) but far BETTER on breadth (30,048 vs 32,409 failing
+  # endpoints).  That confound is what `postrouteNt` and `postrouteNx` separate:
+  #   postrouteNt = postrouteN + ExtraTimingOpt PLACEMENT only (rounds stay plain)
+  #   postrouteNx = postrouteN + AggressiveExplore PHYS-OPT only (placement and
+  #                 router stay plain)
+  # Together with the two incumbents these four runs form a clean 2x2 over the
+  # placer and phys-opt axes at a fixed router.  See handoff section 19.
   if {$impl_strategy eq "exploreN"} {
     place_design -directive ExtraTimingOpt
     phys_opt_design -directive AggressiveExplore
     route_design -directive Explore
+  } elseif {$impl_strategy eq "postrouteNt"} {
+    place_design -directive ExtraTimingOpt
+    phys_opt_design
+    route_design
   } else {
     place_design
     phys_opt_design
@@ -176,6 +190,9 @@ if {$impl_strategy eq "default"} {
     if {$impl_strategy eq "exploreN"} {
       phys_opt_design -directive AggressiveExplore
       route_design -directive Explore -tns_cleanup
+    } elseif {$impl_strategy eq "postrouteNx"} {
+      phys_opt_design -directive AggressiveExplore
+      route_design -tns_cleanup
     } else {
       phys_opt_design
       route_design -tns_cleanup
@@ -191,7 +208,7 @@ if {$impl_strategy eq "default"} {
   phys_opt_design -directive AggressiveExplore
   route_design -directive Explore -tns_cleanup
 } else {
-  error "IMPL_STRATEGY must be one of: default fanout postroute postroute2 postrouteN exploreN explore"
+  error "IMPL_STRATEGY must be one of: default fanout postroute postroute2 postrouteN postrouteNt postrouteNx exploreN explore"
 }
 report_timing_summary -max_paths 10 -file synth/fullcore_route_timing.rpt
 report_utilization -file synth/fullcore_route_util.rpt

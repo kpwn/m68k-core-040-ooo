@@ -1,25 +1,19 @@
-agent=claude-floorplan-ab
-task=DONE — exact-DCP floorplan A/B (handoff section 18)
-reserved_at=2026-08-10T19:35:00+02:00
-released_at=2026-08-10T21:40:00+02:00
-head=see git log; landed default = FLOORPLAN_MODE decode + IMPL_STRATEGY postrouteN (POSTROUTE_ROUNDS 3)
-rtl=UNCHANGED, 6b246de remains the head RTL checkpoint
-netlist_md5=d80f6218c5c7dcab94a33a52d64244fa
-NEW_BASELINE=FLOORPLAN_MODE=decode + IMPL_STRATEGY=postrouteN (POSTROUTE_ROUNDS=3) = -1.472ns / 182.749MHz
-             6-round plateau -1.463 / 183.050; archived at synth/archive/6b246de_postrouteN6_decode/
-OLD_BASELINE=-2.094 / 164.096 is still exact under IMPL_STRATEGY=default
-result=NO floorplan change landed. 7 floorplan variants, 7 regressions, across BOTH dispatched boundaries.
-decisive=all 300 worst unique endpoints are ONE arc (FetchAlign stalled -> Icache s1PredEntries/CE),
-         66% route, 20 levels, PBlocks crossed = 0, terminal net fanout 931. Not a boundary problem.
-pb_dcache=over-capture root-caused (StoreQueue SUBMODULE instance LsEuPlugin_logic_sq absorbed 7033 Rob +
-          2096 IQ leaves; IS_PRIMITIVE is required to repair). Repair did NOT help -- clean capture routes WORSE.
-tests=make test-fast GREEN 149/149, 157 suites
-next=re-run synth/probe_slack_ladder.tcl against the NEW routed DCP (different placement => re-price everything);
-     finish the IMPL_STRATEGY sweep; do NOT try another pblock geometry.
-gate=landed default re-run end-to-end with NO env overrides: -1.472 / 182.749 MHz, TNS -17499.508,
-     32408 failing endpoints, WHS +0.020, WPWS +1.458, 110679 LUT / 50389 FF / 26 BRAM / 4 DSP,
-     pb_decode 67.91% (identical to baseline), no congestion above level 5.
-     Archived synth/archive/6b246de_default_postrouteN3_decode/
-control=IMPL_STRATEGY=default on the same script reproduces -2.094 EXACTLY (history regenerates unchanged)
-forward=the landed gate's WNS path is now DcachePlugin stS2Payload_paddr[5] -> IssueQueuePlugin sbNzvc_busy[8],
-        i.e. SECTION 16's D-cache/IQ family is now BINDING. Its "worth 0.000 ns" verdict is stale -- re-measure.
+agent=claude-dcache-iq-reprice
+task=IN PROGRESS — handoff section 19: re-price section 16's D-cache/IQ fixes on the postrouteN placement
+reserved_at=2026-08-10T22:23:00+02:00
+head=a2ed18b at start (RTL unchanged since 6b246de)
+baseline=FLOORPLAN_MODE=decode + IMPL_STRATEGY=postrouteN (POSTROUTE_ROUNDS=3) = -1.472ns / 182.749MHz
+         TNS -17499.508, FEP 32408; archived synth/archive/6b246de_default_postrouteN3_decode/
+         REPRODUCED EXACTLY by both probe sessions before any what-if (method control)
+RESULT=BOTH SHELVED FIXES RE-PRICE AT 0.000 ns OF WNS. Section 16's verdict SURVIVES.
+       Fix A (upper bound, 42428 LS/Dcache cells -> 20133 IQ cells): +0.000 WNS, +125.2 TNS, -45 FEP
+       Fix B (4 earlyProbeSetWriteVec nets):                          +0.000 WNS, +378.7 TNS, -234 FEP
+       Fix A + Fix B:                                                 +0.000 WNS, +420.4 TNS, -279 FEP
+       Fix A + Fix B + ENTIRE frontend cone:                          +0.012 WNS (-1.460 / 183.150 MHz)
+cause=path #1 (dcache/IQ) and path #2 (frontend stalled->Icache lineReg) are TIED at -1.472 to 3 decimals.
+      Behind them: a 13-family plateau spanning 0.091 ns (old placement: 17 families / 0.481 ns).
+      The postrouteN pass FLATTENED the slack distribution; family cutting is now worth ~1/5 per family.
+noRTL=NO RTL CHANGED. 200MHz needs 0.472 ns; every candidate on file combined delivers 0.012 ns.
+running=synth/probe_strategy2 -- 2x2 strategy sweep (decode@postrouteNt, decode@postrouteNx) isolating
+        the placer vs phys-opt directive axes that exploreN confounded. Results pending.
+note=sibling-project Vivado full_impl live (macqd700-soc) — keep concurrency low
