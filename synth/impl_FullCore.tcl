@@ -7,6 +7,7 @@ opt_design
 # physical gate instead of relying on transient messages in the Vivado console log.
 report_timing_summary -max_paths 10 -file synth/fullcore_synth_timing.rpt
 report_utilization -file synth/fullcore_synth_util.rpt
+write_checkpoint -force synth/fullcore_synth.dcp
 set synth_paths [get_timing_paths -max_paths 1 -nworst 1 -setup]
 if {[llength $synth_paths] > 0} {
   set synth_wns [get_property SLACK $synth_paths]
@@ -34,8 +35,10 @@ catch { report_design_analysis -congestion -file synth/fullcore_congestion.rpt }
 catch { report_design_analysis -timing -max_paths 10 -file synth/fullcore_path_analysis.rpt }
 # 2) top fanout nets (catches un-replicated control broadcasts)
 catch { report_high_fanout_nets -max_nets 10 -file synth/fullcore_fanout.rpt }
-# 3) per-pblock utilization (floorplan capture sanity)
-catch { report_utilization -pblocks [get_pblocks] -file synth/fullcore_pblock_util.rpt }
+# 3) per-pblock utilization (floorplan capture + regional spill sanity). Vivado
+# rejects a list of pblocks for this report, so emit the two reports separately.
+catch { report_utilization -pblocks pb_decode -file synth/fullcore_pb_decode_util.rpt }
+catch { report_utilization -pblocks pb_dcache -file synth/fullcore_pb_dcache_util.rpt }
 # 4) module-pair slack matrix: which plugin PAIR limits (top-100 worst endpoints)
 catch {
   set fp [open synth/fullcore_slack_matrix.rpt w]

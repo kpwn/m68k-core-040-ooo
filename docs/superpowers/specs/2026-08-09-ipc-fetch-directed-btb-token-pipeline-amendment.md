@@ -372,6 +372,26 @@ flow now emits an explicit optimized post-synthesis timing/utilization report
 before applying either pblock so the next pass can separate RTL depth from
 floorplan/route loss.
 
+The registered-mismatch recovery route uses generated-Verilog MD5
+`35c9bc31a14ba1a6aff9e65b7c4dfb89`. It improves the same 4-ns floorplanned
+checkpoint again to WNS -2.447 ns / 155.111 MHz, TNS -31,052.055 ns across
+48,965 failing endpoints, with hold clean at +0.020 ns. This is +0.433 ns over
+the immediately preceding -2.880-ns route. Area also improves to 109,217 CLB
+LUTs (50.34%; 100,320 logic and 8,897 LUTRAM), 50,507 registers, 26 BRAM tiles,
+and four DSP48E2s. Thus neither global area nor the DSP reshape is the limiter.
+
+The mismatch family is gone from the top census. The new worst path is
+`DecodeStage.ucPendValid` through the live decode/IBuf fallback-prediction cone,
+`applyNow`, the ITLB CAM, and `issFire` to fetch-ring/I-cache enables: 6.342 ns,
+21 levels, and 67% route. It crosses the right edge of `pb_decode` (X87) and
+lands around X99--X103. The routed region is 96.78% occupied (5,284/5,460 CLBs).
+`pb_dcache` remains structurally over-subscribed: 5,910 parent-assigned CLBs for
+5,460 sites and 6,422 in-region CLBs (117.62%). The next controlled experiment
+must therefore expand/rebalance both right edges on this exact netlist before
+charging another architectural latency cycle. If floorplan relief is
+insufficient, the measured fallback-prediction action is the next registered
+boundary; the II=1 fetch-directed path remains unchanged.
+
 The current branch's floorplanned route is a hard prerequisite. The checkpoint
 completed at 173.430 MHz (WNS -1.766 ns at the 4-ns constraint), below the
 200-MHz deployment floor, after the intentionally broad LSU/D-cache/CPLX/ALU
