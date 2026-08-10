@@ -187,20 +187,25 @@ splice until the held target is fetched.
 - `brWordOff >= ringDrop(local issued slot)`;
 - the complete learned instruction lies in the window
   (`brWordOff.resize(5) + brLen.resize(5) <= 4`);
-- no architectural/commit redirect, quiesce, fault hold, mismatch suppression,
+- no external/test-resume redirect, quiesce, fault hold, mismatch suppression,
   or pending target;
 - FTQ not full (a defensive condition; §5 proves legal run-ahead cannot fill it).
 
 Decode-local redirects (`predictFire` from the retained BTB/RAS fallback and
-`ftqMismatch` from FTQ confirmation) deliberately do **not** enter the
-combinational application predicate. Both are formed after the aligner from the
-live IBuf head. Feeding either back into `applyNow`, and then through the next
-I-cache command/FTB lookup enable, creates a same-cycle decode-to-fetch control
-loop with no throughput benefit.
+`ftqMismatch` from FTQ confirmation), plus the registered internal
+`mispredictRedirect` action used by commit recovery and registered complex
+resume, deliberately do **not** enter the combinational application predicate.
+The decode-local actions are formed after the aligner from the live IBuf head.
+The internal action is registered, but the 2026-08-10 five-ID route proved that
+using it as an application veto still formed a 24-level
+`ROB doFlush/exception state -> FTB result -> ITLB/I-cache -> target hold` cone.
+Feeding any of these actions back into `applyNow`, and then through the next
+I-cache command/FTB lookup enable, creates a same-cycle control loop with no
+throughput or correctness benefit.
 
 A registered FTB result may therefore physically apply in the same cycle as one
-of those older decode-local redirects. This is a kill-after-apply collision, not
-an architectural application:
+of those older decode-local redirects or the registered internal redirect. This
+is a kill-after-apply collision, not an architectural application:
 
 - the redirect/FTQ-flush priority clears head, tail, count, and held-target state
   at the edge;
@@ -209,9 +214,12 @@ an architectural application:
   lookup token cannot become live;
 - the redirect PC wins the fetch/decode PC updates.
 
-At most one disposable cache command is spent on this rare collision. Correct
-prediction cadence is unchanged. Mismatch recovery pays the one registered
-cycle defined in §6. External, resume, and commit redirects remain in the narrow
+At most one disposable cache command is spent on this rare collision. The
+internal redirect already permits one old-path command in its action cycle and
+marks it born stale; selecting the physical FTB target instead does not widen
+that bound. Correct prediction cadence and redirect latency are unchanged.
+Mismatch recovery pays the one registered cycle defined in §6. The external
+boot/test redirect and the standalone test-resume input remain in the narrow
 application block predicate; their result-time collision contract remains "no
 physical application".
 
@@ -369,17 +377,22 @@ Every path that currently flushes the IBuf or marks all ring entries stale also:
 
 - clears FTQ count/head/tail;
 - clears the held target;
-- invalidates any same-cycle lookup application through redirect gating.
+- makes any same-cycle physical lookup application architecturally unobservable
+  through final flush/stale priority.
 
 Priority is unchanged: commit mispredict, external redirect, and complex resume
-win over fetch-plan application. A decode-time BTB/RAS prediction for an earlier
-branch captures a registered action; that action wins at C+1 unless one of those
-architectural actions or a registered FTQ-mismatch recovery is active. An FTQ
+win over the architectural effects of fetch-plan application. A decode-time
+BTB/RAS prediction for an earlier branch captures a registered action; that
+action wins at C+1 unless one of those architectural actions or a registered
+FTQ-mismatch recovery is active. An FTQ
 mismatch detector first captures a recovery token; its registered action wins on
 the following edge and flushes the younger FTQ state. Neither decode-local
 action must suppress the physical `applyNow` pulse because its kill priority
-makes that pulse unobservable. FTB application itself is not a redirect and
-does not set `ringStale`.
+makes that pulse unobservable. The same is true for the registered internal
+commit/complex-resume redirect: its final PC, IBuf flush, ring-wide stale writes,
+FTQ reset, and held-target clear all retain later-assignment priority. External
+and standalone resume inputs retain the stronger physical veto. FTB application
+itself is not a redirect and does not set `ringStale`.
 
 I-cache invalidation, maintenance invalidation, reset, and debug/architectural
 frontend flush clear all FTB valids. A same-cycle update/invalidate collision is
@@ -500,6 +513,11 @@ no error was observed.
    decline a prediction.
 5. **Redirect collisions.** Redirect at query, result, pending-target, response,
    and confirm phases; no stale FTQ entry, GHR shift, truncation, or target issue.
+   An external/test redirect at result time must physically veto application.
+   A registered internal redirect at result time must instead exercise
+   `applyNow && ftqPush && ftqFlush`: with cache ready low its temporary hold is
+   cleared at the edge; with ready high its one accepted target command and the
+   older source record are both stale, and only the recovery response may feed.
 6. **Framing guard.** Parent design's A1–A10 matrix, mutations for clamp, past,
    length, overshoot, starvation dwell, one-entry clear, and suppression. Require
    detector C → registered action C+1 exactly, with no feed or I-cache command in

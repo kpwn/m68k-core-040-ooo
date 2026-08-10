@@ -352,12 +352,14 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // ftbBlocked -> applyNow -> ic.cmd.fire and created a 28-level 8.2 ns path from head
     // predecode state into the fetch ring, I-cache, FTB, gshare, and ITLB enables. A
     // coincident physical application is harmless: either registered action drives
-    // ftqFlush with last-assignment priority and invalidates the older plan. External,
-    // resume, and commit redirects remain here because they are shallow and retain the
-    // stronger no-physical-application collision contract.
+    // ftqFlush with last-assignment priority and invalidates the older plan. The same
+    // kill-after-apply rule is required for the registered internal redirect: retaining
+    // it here created the measured 24-level ROB-flush/exception -> ITLB/I-cache ->
+    // target-hold path. External and standalone resume inputs retain the stronger
+    // no-physical-application collision contract.
     val ftbBlocked = redirect.valid || (resume.valid && stalled) ||
-                     mispredictRedirect.valid || quiesce || stalled || faultHold ||
-                     ftbSuppress || targetHoldValid || ftqFull
+                     quiesce || stalled || faultHold || ftbSuppress ||
+                     targetHoldValid || ftqFull
     val ftbDeclineDirection = ftbCandidate && !resultDirection
     val ftbDeclineFraming = ftbCandidate && resultDirection &&
                             !(resultInWindow && resultAfterDrop)
@@ -411,9 +413,9 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     ftqFlush := redirect.valid || (resume.valid && stalled) ||
                 mispredictRedirect.valid || predictFire || ftqMismatch
 
-    when(applyNow && (predictFire || ftqMismatch)) {
+    when(applyNow && (predictFire || ftqMismatch || mispredictRedirect.valid)) {
       assert(ftqFlush && redirectThisCycle,
-        "decode-local FTB collision must be killed by redirect/FTQ-flush priority")
+        "registered FTB collision must be killed by redirect/FTQ-flush priority")
     }
 
     // ---- FetchControl: issue fetches (DEPTH-3 multi-outstanding, ANGLE D) ----

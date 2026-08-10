@@ -58,6 +58,17 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
     }
   }
 
+  /** Test-side equivalent of BackendWiringPlugin's registered internal redirect. */
+  class InternalRedirectDriver extends FiberPlugin {
+    val logic = during build new Area {
+      val valid = in Bool()
+      val payload = in UInt(32 bits)
+      val redirect = host[FetchAlignPlugin].logic.mispredictRedirect
+      redirect.valid := valid
+      redirect.payload := payload
+    }
+  }
+
   /** Production-equivalent retained decode-BTB wiring for the collision proof. */
   class DecodeBtbWire extends FiberPlugin {
     val logic = during build new Area {
@@ -86,11 +97,12 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
     val gshare = new GsharePlugin
     val gshareUpdate = new GshareUpdateDriver
     val fa = new FetchAlignPlugin(enableFetchDirected = true)
+    val internalRedirect = new InternalRedirectDriver
     val btbWire = new DecodeBtbWire
     val probe = new DecodeFeedProbePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()), fetch, update, btb, ftb, gshare, gshareUpdate,
-      fa, btbWire, probe)) }
+      fa, internalRedirect, btbWire, probe)) }
   }
 
   private val W = 0x1000L
@@ -123,6 +135,8 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
     dut.fa.logic.redirect.payload #= 0
     dut.fa.logic.resume.valid #= false
     dut.fa.logic.resume.payload #= 0
+    dut.internalRedirect.logic.valid #= false
+    dut.internalRedirect.logic.payload #= 0
     dut.probe.logic.feedOut.ready #= false
   }
 
@@ -148,7 +162,8 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
   }
 
   private def driveRsp(dut: Dut, cd: ClockDomain, pc: Long, words: Seq[Int],
-                       lens: Seq[Int] = Seq.fill(4)(1)): Unit = {
+                       lens: Seq[Int] = Seq.fill(4)(1), fault: Boolean = false,
+                       atc: Boolean = false): Unit = {
     require(words.length == 4)
     require(lens.length == 4)
     val data = words.zipWithIndex.foldLeft(BigInt(0)) { case (acc, (word, lane)) =>
@@ -158,8 +173,8 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
     r.valid #= true
     r.payload.pc #= pc
     r.payload.data #= data
-    r.payload.fault #= false
-    r.payload.atc #= false
+    r.payload.fault #= fault
+    r.payload.atc #= atc
     for ((p, len) <- r.payload.pred.zip(lens)) {
       p.simple #= true
       p.lenWords #= len
@@ -345,6 +360,110 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
       assert(tr.cmds.take(2).map(_._2).toSeq == Seq(W, recovery),
         s"redirect recovery path was ${tr.cmds.take(2)}")
       assert(!tr.cmds.exists(_._2 == T), "killed FTB target escaped after redirect")
+    }
+  }
+
+  test("registered internal redirect kills a physically applied held target", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      train(dut, cd)
+      val tr = trace(dut, cd)
+      dut.fetch.logic.cmdOut.ready #= true
+      redirect(dut, cd)
+      await(cd, 8, "source command") { tr.cmds.nonEmpty }
+
+      // Unlike the external/test redirect above, the production commit/complex-resume
+      // action is registered. It is deliberately kill-after-apply: require the physical
+      // plan event while cache backpressure forces its target into the hold path, then
+      // require the redirect's later-priority FTQ/hold clear to make it unobservable.
+      val recovery = 0x2800L
+      var collisionApply = false
+      var collisionPush = false
+      var collisionFlush = false
+      cd.onSamplings {
+        if (dut.internalRedirect.logic.valid.toBoolean) {
+          collisionApply = collisionApply || dut.fa.logic.applyNow.toBoolean
+          collisionPush = collisionPush || dut.fa.logic.ftqPush.toBoolean
+          collisionFlush = collisionFlush || dut.fa.logic.ftqFlush.toBoolean
+        }
+      }
+      dut.fetch.logic.cmdOut.ready #= false
+      dut.internalRedirect.logic.valid #= true
+      dut.internalRedirect.logic.payload #= recovery
+      cd.waitSampling()
+      dut.internalRedirect.logic.valid #= false
+      cd.waitSampling()
+
+      assert(collisionApply && collisionPush && collisionFlush,
+        s"internal redirect did not exercise kill-after-apply: " +
+          s"apply=$collisionApply push=$collisionPush flush=$collisionFlush")
+      assert(tr.applies == 1 && tr.pushes == 1,
+        s"physical collision event was lost or duplicated: ${tr.applies}/${tr.pushes}")
+      assert(dut.fa.logic.ftqCount.toInt == 0,
+        "internal redirect left the physically pushed FTQ entry live")
+      assert(!dut.fa.logic.targetHoldValid.toBoolean,
+        "internal redirect left the physically captured target live")
+
+      dut.fetch.logic.cmdOut.ready #= true
+      await(cd, 8, "internal-redirect recovery command") { tr.cmds.size >= 2 }
+      dut.fetch.logic.cmdOut.ready #= false
+      assert(tr.cmds.take(2).map(_._2).toSeq == Seq(W, recovery),
+        s"held collision target escaped before recovery: ${tr.cmds.take(2)}")
+      assert(!tr.cmds.exists(_._2 == T),
+        s"physically applied target became an architectural command: ${tr.cmds}")
+    }
+  }
+
+  test("registered internal redirect stales both old and collision-cycle fetches", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); idle(dut); cd.waitSampling(3)
+      train(dut, cd)
+      val tr = trace(dut, cd)
+      val feeds = ArrayBuffer.empty[Long]
+      cd.onSamplings {
+        if (dut.probe.logic.feedOut.valid.toBoolean && dut.probe.logic.feedOut.ready.toBoolean)
+          feeds += dut.probe.logic.feedOut.payload(0).pc.toLong
+      }
+      dut.probe.logic.feedOut.ready #= true
+      dut.fetch.logic.cmdOut.ready #= true
+      redirect(dut, cd)
+      await(cd, 8, "source command") { tr.cmds.nonEmpty }
+
+      // Ready-high makes the physically selected FTB target T a real AXI command in the
+      // redirect cycle. The old W record needs the redirect's blanket stale write; the
+      // newborn T record is also born stale. The following recovery command is the only
+      // live record. Unique responses below prove both closures rather than merely
+      // observing that the FTQ was reset.
+      val recovery = 0x3800L
+      dut.internalRedirect.logic.valid #= true
+      dut.internalRedirect.logic.payload #= recovery
+      cd.waitSampling()
+      dut.internalRedirect.logic.valid #= false
+      await(cd, 8, "collision target and recovery commands") { tr.cmds.size >= 3 }
+      dut.fetch.logic.cmdOut.ready #= false
+      assert(tr.cmds.take(3).map(_._2).toSeq == Seq(W, T, recovery),
+        s"ready-high collision did not issue W/T/recovery exactly: ${tr.cmds.take(3)}")
+      assert(tr.applies == 1 && tr.pushes == 1 && dut.fa.logic.ftqCount.toInt == 0,
+        s"internal collision bookkeeping leaked: ${tr.applies}/${tr.pushes}, " +
+          s"ftq=${dut.fa.logic.ftqCount.toInt}")
+
+      // Make the old W response a fault: stale handling must suppress both its bytes and
+      // the synthetic fault packet. T carries different normal bytes. Neither may feed.
+      driveRsp(dut, cd, W, Seq(0x4afc, 0x4afc, 0x4afc, 0x4afc), fault = true, atc = true)
+      dut.fetch.logic.rspIn.valid #= false
+      cd.waitSampling(2)
+      driveRsp(dut, cd, T, Seq(0x7001, 0x7202, 0x7403, 0x7604))
+      dut.fetch.logic.rspIn.valid #= false
+      cd.waitSampling(2)
+      assert(feeds.isEmpty, s"stale W/T response reached decode: $feeds")
+
+      driveRsp(dut, cd, recovery, Seq(0x7005, 0x7206, 0x7407, 0x7600))
+      dut.fetch.logic.rspIn.valid #= false
+      await(cd, 8, "live recovery feed") { feeds.nonEmpty }
+      assert(feeds.head == recovery,
+        f"first live feed was 0x${feeds.head}%x, expected recovery 0x$recovery%x")
+      assert(!feeds.exists(pc => pc == W || pc == T),
+        s"wrong-path W/T bytes survived the internal redirect: $feeds")
     }
   }
 
