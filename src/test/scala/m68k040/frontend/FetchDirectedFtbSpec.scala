@@ -499,7 +499,24 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
       train(dut, cd) // learned claim is one word
       val tr = trace(dut, cd)
       var mismatchCount = 0
-      cd.onSamplings { if (dut.fa.logic.ftqMismatch.toBoolean) mismatchCount += 1 }
+      var sampleCycle = 0
+      val mismatchDetectCycles = ArrayBuffer.empty[Int]
+      val mismatchActionCycles = ArrayBuffer.empty[Int]
+      val feedFireCycles = ArrayBuffer.empty[Int]
+      val cmdFireCycles = ArrayBuffer.empty[Int]
+      cd.onSamplings {
+        if (dut.fa.logic.ftqMismatchDetect.toBoolean)
+          mismatchDetectCycles += sampleCycle
+        if (dut.fa.logic.ftqMismatch.toBoolean) {
+          mismatchCount += 1
+          mismatchActionCycles += sampleCycle
+        }
+        if (dut.probe.logic.feedOut.valid.toBoolean && dut.probe.logic.feedOut.ready.toBoolean)
+          feedFireCycles += sampleCycle
+        if (dut.fetch.logic.cmdOut.valid.toBoolean && dut.fetch.logic.cmdOut.ready.toBoolean)
+          cmdFireCycles += sampleCycle
+        sampleCycle += 1
+      }
 
       dut.fetch.logic.cmdOut.ready #= true
       redirect(dut, cd)
@@ -527,6 +544,16 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
         s"malformed branch/target bytes emitted before recovery: $emittedBeforeRecovery")
       assert(dut.fa.logic.ftqCount.toInt == 0, "mismatch must flush the FTQ")
       assert(dut.fa.logic.ftbSuppress.toBoolean, "mismatch must arm one-shot suppression")
+      assert(mismatchDetectCycles.size == 1 && mismatchActionCycles.size == 1,
+        s"mismatch detector/action did not each pulse exactly once: " +
+          s"detect=$mismatchDetectCycles action=$mismatchActionCycles")
+      assert(mismatchActionCycles.head == mismatchDetectCycles.head + 1,
+        s"mismatch recovery was not registered C->C+1: " +
+          s"detect=$mismatchDetectCycles action=$mismatchActionCycles")
+      assert(!feedFireCycles.contains(mismatchActionCycles.head),
+        s"decode feed escaped on mismatch action cycle ${mismatchActionCycles.head}")
+      assert(!cmdFireCycles.contains(mismatchActionCycles.head),
+        s"I-cache command escaped on mismatch action cycle ${mismatchActionCycles.head}")
       val ftbIdx = ((W >> 3) & 127).toInt
       assert(!dut.ftb.logic.valids(ftbIdx).toBoolean, "mismatch must clear the exact FTB entry")
 

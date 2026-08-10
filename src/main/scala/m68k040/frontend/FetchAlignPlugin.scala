@@ -254,18 +254,29 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     val targetHoldDrop  = Reg(UInt(2 bits)) init 0
     val ftbSuppress     = Reg(Bool()) init False
 
-    // Forward-declared controls whose decisions live after the aligner. Keeping them as
-    // explicit nets lets the fetch-side result application and ring staleness see the
-    // final same-cycle decision without reaching across plugin internals.
+    // Forward-declared controls whose decisions live after the aligner. The live mismatch
+    // detector terminates here in a small recovery register; only that registered action
+    // reaches fetchPc, FTB clear, ring staleness, and fetch command control. This cuts the
+    // routed async-FTQ-head -> 29-level mismatch -> fetchPc/FTB-valid family while charging
+    // one cycle only to a malformed fetch-plan claim.
     val ftqPop = Bool(); ftqPop.allowOverride; ftqPop := False
     val ftqFlush = Bool(); ftqFlush.allowOverride; ftqFlush := False
-    val ftqMismatch = Bool(); ftqMismatch.allowOverride; ftqMismatch := False
-    val ftqMismatchPc = UInt(32 bits); ftqMismatchPc.allowOverride; ftqMismatchPc := decodePc
+    val ftqMismatchPending = Reg(Bool()) init False
+    val ftqMismatchPcReg = Reg(UInt(32 bits)) init 0
+    val ftqMismatchBrPcReg = Reg(UInt(32 bits)) init 0
+    ftqMismatchPending := False
+    val ftqMismatchDetect = Bool(); ftqMismatchDetect.allowOverride; ftqMismatchDetect := False
+    val ftqMismatchDetectPc = UInt(32 bits)
+    ftqMismatchDetectPc.allowOverride
+    ftqMismatchDetectPc := decodePc
+    val ftqMismatch = Bool(); ftqMismatch := ftqMismatchPending
+    val ftqMismatchPc = UInt(32 bits); ftqMismatchPc := ftqMismatchPcReg
     val ftqPush = Bool(); ftqPush.allowOverride; ftqPush := False
     val applyNow = Bool(); applyNow.allowOverride; applyNow := False
     spinal.core.sim.SimPublic(ftqHead, ftqTail, ftqCount, ftqValid, ftqFull)
     spinal.core.sim.SimPublic(targetHoldValid, targetHoldPc, targetHoldDrop, ftbSuppress)
-    spinal.core.sim.SimPublic(ftqPop, ftqFlush, ftqMismatch, ftqPush, applyNow)
+    spinal.core.sim.SimPublic(ftqPop, ftqFlush, ftqMismatchDetect, ftqMismatchPending,
+      ftqMismatchPcReg, ftqMismatchBrPcReg, ftqMismatch, ftqPush, applyNow)
     ftqHeadE.flatten.foreach(spinal.core.sim.SimPublic(_))
 
     // ---- Default-drive IBuf inputs ----
@@ -361,7 +372,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     gshareWindowCmd.valid := ic.cmd.fire
     gshareWindowCmd.payload := ftbCmd.payload
     ftbClear.valid := ftqMismatch
-    ftbClear.payload := ftqHeadE.brPc
+    ftbClear.payload := ftqMismatchBrPcReg
 
     val ftqPushEntry = FetchTargetQueueEntry()
     ftqPushEntry.brPc   := ftbRsp.payload.windowPc(31 downto 3) @@
@@ -421,7 +432,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     val cmdDrop = Mux(targetHoldValid, targetHoldDrop,
                   Mux(applyNow, ftbRsp.payload.target(2 downto 1), pendingDrop))
     ic.cmd.valid      := started && ringSlotAvailable && ibufRoomForIssue &&
-                         !stalled && !faultHold && !quiesce
+                         !stalled && !faultHold && !quiesce && !ftqMismatch
     ic.cmd.payload.pc := cmdWindowPc
 
     when(ic.cmd.fire) {
@@ -808,7 +819,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     }
     // Gate feed low while STOP-quiesced so no buffered successor word is dispatched /
     // allocated into the ROB while halted (the quiesce only ends on the wake redirect).
-    feed.valid      := res.slot0Valid && !stalled && !quiesce && !ftqPast
+    feed.valid      := res.slot0Valid && !stalled && !quiesce && !ftqPast && !ftqMismatch
     // I-fetch fault: once decode has drained everything legitimately buffered ahead
     // of the fault (no more aligned instruction available -> !res.slot0Valid), AND
     // we're not mid-complex-stall/quiesce (waiting on an earlier, unrelated resume),
@@ -820,7 +831,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // keep draining normally instead of being squashed the instant the fault response
     // lands (up to RING windows before decode actually reaches it).
     val emittingFaultPacket = faultHold && !res.slot0Valid && !stalled && !quiesce &&
-                              !ftqStarvedOrPast
+                              !ftqStarvedOrPast && !ftqMismatch
     when(emittingFaultPacket) {
       feed.valid             := !faultEmitted
       slot1ValidOut          := False
@@ -887,10 +898,34 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     val ftqLenBad = ftqAt0 && res.slot0Valid && !ftqConfirm && feed.fire
     val ftqOvershoot = ftqNear && !ftqAt0 && feed.fire && !emittingFaultPacket &&
                        (effShift > ftqDelta)
-    ftqMismatch := (ftqStarved || ftqPast || ftqLenBad || ftqOvershoot) &&
-                   !quiesce && !stalled
-    ftqMismatchPc := Mux(ftqLenBad || ftqOvershoot, decodePcNext, decodePc)
-    spinal.core.sim.SimPublic(ftqLenBad, ftqOvershoot, ftqMismatchPc)
+    ftqMismatchDetect := (ftqStarved || ftqPast || ftqLenBad || ftqOvershoot) &&
+                         !quiesce && !stalled && !ftqMismatchPending
+    ftqMismatchDetectPc := Mux(ftqLenBad || ftqOvershoot, decodePcNext, decodePc)
+    when(ftqMismatchDetect) {
+      ftqMismatchPending := True
+      ftqMismatchPcReg := ftqMismatchDetectPc
+      ftqMismatchBrPcReg := ftqHeadE.brPc
+    }
+    // An architectural redirect on the detector edge already discards the malformed
+    // plan, so it cancels the pending action. A fallback predictFire deliberately does
+    // not: the offending FTB entry still has to be cleared on the next cycle.
+    when(redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid) {
+      ftqMismatchPending := False
+    }
+    val ftqMismatchDetectKept = ftqMismatchDetect &&
+      !(redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid)
+    val ftqMismatchDetectKeptD = RegNext(ftqMismatchDetectKept) init False
+    when(ftqMismatch) {
+      assert(ftqMismatchDetectKeptD,
+        "registered FTQ mismatch action lost its exact detector association")
+      assert(!feed.fire && !ic.cmd.fire,
+        "registered FTQ mismatch recovery must block decode and fetch for its action cycle")
+    }
+    when(ftqMismatchDetectKeptD) {
+      assert(ftqMismatch,
+        "accepted FTQ mismatch detector did not produce its C+1 recovery action")
+    }
+    spinal.core.sim.SimPublic(ftqLenBad, ftqOvershoot, ftqMismatchDetectPc, ftqMismatchPc)
 
     when(feed.fire && !emittingFaultPacket) {
       ibuf.io.shift := effShift

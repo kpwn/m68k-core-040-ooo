@@ -190,9 +190,10 @@ an architectural application:
 - the redirect PC wins the fetch/decode PC updates.
 
 At most one disposable cache command is spent on this rare collision. Correct
-prediction cadence and mismatch recovery latency are unchanged. External,
-resume, and commit redirects remain in the narrow application block predicate;
-their result-time collision contract remains "no physical application".
+prediction cadence is unchanged. Mismatch recovery pays the one registered
+cycle defined in §6. External, resume, and commit redirects remain in the narrow
+application block predicate; their result-time collision contract remains "no
+physical application".
 
 One `applyNow` event performs exactly once:
 
@@ -261,6 +262,32 @@ fetched target bytes. On disagreement, only packets made exclusively from
 genuine pre-splice bytes may fire; the existing redirect/flush machinery
 recovers before any post-splice byte is decoded.
 
+### Registered mismatch recovery
+
+Mismatch detection terminates at a dedicated register boundary. The live FTQ
+head and aligner may form only `mismatchDetect` and capture
+`{restartPc,offendingBranchPc}`; they do not directly drive `fetchPc`, FTB clear,
+ring staleness, lookup enables, or flush-state clock enables.
+
+For a detector event in cycle C:
+
+- a too-short/overshooting real packet that fired in C is the last permitted
+  packet and `restartPc` is its fall-through;
+- starvation/past-head cases fire no packet and capture the current `decodePc`;
+- cycle C+1 blocks both decode feed and new I-cache commands, pulses the
+  registered mismatch action, clears the captured FTB entry, flushes FTQ/IBuf
+  and stale ring state, and restarts at the captured PC;
+- a correct FTQ confirmation never enters this path and retains its existing
+  II=1 cadence.
+
+An external, resume, or commit redirect coincident with detection cancels the
+pending recovery because that higher-priority action already discards the FTQ.
+A decode-time fallback prediction does not cancel it: the malformed FTB entry
+must still be cleared, and the registered mismatch action stales any speculative
+target fetch issued in the intervening cycle. Higher-priority architectural
+redirects coincident with the registered action still win the final PC and clear
+one-shot suppression.
+
 ### SMC fault model
 
 Phase 1 retains the existing architectural self-modifying-code contract:
@@ -282,11 +309,11 @@ Every path that currently flushes the IBuf or marks all ring entries stale also:
 
 Priority is unchanged: commit mispredict, external redirect, and complex resume
 win over fetch-plan application. A decode-time BTB/RAS prediction for an earlier
-branch, or a decode-time FTQ mismatch, also wins at the state-update edge and
-flushes the younger FTQ state. The latter two need not suppress the physical
-`applyNow` pulse because their kill priority makes that pulse unobservable; this
-is the registered timing cut defined in §4. FTB application itself is not a
-redirect and does not set `ringStale`.
+branch wins at its state-update edge. An FTQ mismatch detector first captures a
+recovery token; its registered action wins on the following edge and flushes the
+younger FTQ state. Neither decode-local action must suppress the physical
+`applyNow` pulse because its kill priority makes that pulse unobservable. FTB
+application itself is not a redirect and does not set `ringStale`.
 
 I-cache invalidation, maintenance invalidation, reset, and debug/architectural
 frontend flush clear all FTB valids. A same-cycle update/invalidate collision is
@@ -381,7 +408,9 @@ no error was observed.
 5. **Redirect collisions.** Redirect at query, result, pending-target, response,
    and confirm phases; no stale FTQ entry, GHR shift, truncation, or target issue.
 6. **Framing guard.** Parent design's A1–A10 matrix, mutations for clamp, past,
-   length, overshoot, starvation dwell, one-entry clear, and suppression.
+   length, overshoot, starvation dwell, one-entry clear, and suppression. Require
+   detector C → registered action C+1 exactly, with no feed or I-cache command in
+   C+1 and with the captured recovery/clear PCs unchanged by the live FTQ head.
 7. **Fallback.** FTB miss, direct-map collision, second branch, cross-window
    branch, FTQ defensive-full, and return all exercise the existing slot-0/slot-1
    BTB/gshare/RAS behavior. Application-disabled cycles remain baseline-identical.
