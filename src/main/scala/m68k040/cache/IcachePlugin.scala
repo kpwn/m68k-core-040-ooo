@@ -610,9 +610,24 @@ class IcachePlugin extends FiberPlugin with FetchService {
         "H9 bounded-wait violated: a demand miss was deferred behind installs for too long")
     }
 
+    // ── Slice 1b (design spec section 3 boundary B3, hazard H10): the prefetch
+    // window is seeded from a REGISTERED accepted-demand context, not from the live
+    // `lookupPaddr` (which is literally `xlate.rsp.ppn ## pc(11:0)`). The window is a
+    // speculative hint: nothing architectural reads it in the cycle the demand is
+    // accepted, so one cycle of prefetch lateness is free (handoff section 15 step 9).
+    //
+    // The page-crossing restart rule inside seedPfWindow is ORDER-sensitive, not
+    // TIMING-sensitive: it compares this line against the previously recorded
+    // `pfDemandLine`. Feeding it a one-cycle-late but correctly ORDERED stream of
+    // accepted demands preserves it exactly.
+    val seedValidReg     = RegInit(False)
+    val seedPaddrReg     = Reg(UInt(32 bits))
+    val seedCacheableReg = RegInit(False)
+    seedValidReg.simPublic(); seedCacheableReg.simPublic()
+
     def seedPfWindow(): Unit = {
-      val line = lookupPaddr & ~U(63, 32 bits)
-      val pageEnd = (lookupPaddr(31 downto 12) ## U(0xfff, 12 bits)).asUInt & ~U(63, 32 bits)
+      val line = seedPaddrReg & ~U(63, 32 bits)
+      val pageEnd = (seedPaddrReg(31 downto 12) ## U(0xfff, 12 bits)).asUInt & ~U(63, 32 bits)
       val wantedLimit = line + U(5 * 64, 32 bits)
       val clampedLimit = Mux(wantedLimit(31 downto 12) === line(31 downto 12),
                              wantedLimit, pageEnd)
@@ -728,18 +743,11 @@ class IcachePlugin extends FiberPlugin with FetchService {
         cmdPort.ready := xlate.rsp.ready && !setBlocked && answerable
 
         when(cmdPort.fire) {
-          when(!lookupFault && lookupCacheable) {
-            val line = lookupPaddr & ~U(63, 32 bits)
-            val sequential = pfSeqValid &&
-                             (line(31 downto 12) === pfDemandLine(31 downto 12)) &&
-                             (line === (pfDemandLine + U(64, 32 bits)))
-            pfWindowUpdate := !pfSeqValid ||
-                              ((line =/= pfDemandLine) && !sequential)
-            seedPfWindow()
-          } otherwise {
-            pfWindowUpdate := True
-            pfSeqValid := False
-          }
+          // Slice 1b: capture only. The window itself is evaluated one cycle later,
+          // outside the accept cone, from `seedValidReg`/`seedPaddrReg`.
+          seedValidReg     := True
+          seedPaddrReg     := lookupPaddr
+          seedCacheableReg := !lookupFault && lookupCacheable
           when(lookupFault) {
             // Translation fault: emit a fault response (no data, no refill).
             s1Valid := True
@@ -893,6 +901,24 @@ class IcachePlugin extends FiberPlugin with FetchService {
         s1FromMiss := !missCacheable || missPoison
 
         goto(IDLE)
+      }
+    }
+
+    // Slice 1b: the deferred window update. `seedValidReg` is a one-shot; the
+    // decision rules below are byte-for-byte the ones that used to run inside
+    // `when(cmdPort.fire)`, only their operands are registered.
+    seedValidReg := False   // default: one-shot, overridden by the capture above
+    when(seedValidReg) {
+      when(seedCacheableReg) {
+        val line = seedPaddrReg & ~U(63, 32 bits)
+        val sequential = pfSeqValid &&
+                         (line(31 downto 12) === pfDemandLine(31 downto 12)) &&
+                         (line === (pfDemandLine + U(64, 32 bits)))
+        pfWindowUpdate := !pfSeqValid || ((line =/= pfDemandLine) && !sequential)
+        seedPfWindow()
+      } otherwise {
+        pfWindowUpdate := True
+        pfSeqValid := False
       }
     }
 
