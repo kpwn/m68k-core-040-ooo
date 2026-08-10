@@ -2804,3 +2804,85 @@ completed, 0 failed, 0 aborted** — the section-19 baseline exactly.
   and 14 landed real cuts; sections 15, 16, 17, 19 and 20 measured the remaining
   candidates to exhaustion; section 18 landed the one implementation-strategy
   win.  Everything after this needs a different category of work.
+
+## 21. Closed at zero cost: the "elaboration lottery ticket" is void — re-elaboration at HEAD is bit-exact, so there is no free re-roll (Claude, 2026-08-10)
+
+Section 20 flagged one cheap unmeasured experiment before committing to the
+multi-session architectural-pipelining effort: *every number in this campaign
+descends from one frozen generated-Verilog checkpoint*
+(`generated/M68kFullCoreSynth.v`, md5 `d80f6218c5c7dcab94a33a52d64244fa`,
+archived at `synth/archive/6b246de_default_postrouteN3_decode/`).  The sibling
+branch `feat/rob-predictor-mem` independently discovered a real SpinalHDL
+elaboration non-determinism bug whose two draws implemented **12.7-17.8 MHz
+apart** — larger than any single RTL lever here.  If this branch still had it, a
+fresh `GenFullCoreSynthVerilog` could land a materially better netlist by luck
+alone, for the price of one synth run.
+
+**It does not.  The experiment is closed as a negative, and no synth was run.**
+
+### The fix is already on this branch
+
+`3e57fe6 fix(regfile): pin physical write-port slot order — closes the SpinalHDL
+elaboration "netlist lottery"` is an **ancestor of HEAD** (`a9f14ff`).
+`src/main/scala/m68k040/execute/regfile/RegFilePlugin.scala` groups write
+requests through a `scala.collection.mutable.LinkedHashMap` keyed on
+first-appearance order, not `groupBy` (whose immutable-`HashMap` iteration order
+is a function of the `new Object` sharing keys' **JVM identity hashes**, and
+therefore a per-run lottery).  A sweep for other instances of the same hazard
+found **none**: `groupBy` now appears in `src/main/scala/` only inside that
+file's own do-not-reintroduce comment, and there are no `.toSet` iterations or
+other identity-hash-keyed collections driving structure.
+
+### Grounded, not assumed: two cold-JVM re-elaborations are byte-identical
+
+The fix's presence was not taken on trust.  Two independent
+`~/sbt/bin/sbt 'runMain m68k040.top.GenFullCoreSynthVerilog'` runs, each from a
+cold JVM with the output deleted first:
+
+| artifact | md5 | comment-stripped md5 |
+|---|---|---|
+| archived campaign baseline | `d80f6218c5c7dcab94a33a52d64244fa` | `3531a01b346df92e2e14c389ef47289b` |
+| fresh re-elaboration #1 | `d79df4c8d7ba87cb9f499ca878fb6dbd` | `3531a01b346df92e2e14c389ef47289b` |
+| fresh re-elaboration #2 | `d79df4c8d7ba87cb9f499ca878fb6dbd` | `3531a01b346df92e2e14c389ef47289b` |
+
+The two fresh rolls are **byte-identical to each other**, and the entire diff
+against the archived baseline is **one line**, a comment:
+
+```
+3c3
+< // Git hash  : 9a013ae1344c69d03cd2632b3e2a048e3d3e3c4c
+---
+> // Git hash  : a9f14ffcc1373b11d118a1313c4626e14b85d7e7
+```
+
+Vivado ignores it.  **Re-synthesising would consume a full post-route gate to
+reproduce `-1.472 ns / 182.749 MHz` exactly.**  Nothing was synthesised.
+
+### Byproduct: the baseline's `Git hash` header is stale, and the netlist is *not*
+
+The archived header names `9a013ae`, which **predates** the section-14 FTB
+framing-verdict retime (landed in `9a013ae..6b246de`).  That looked like the
+campaign might have been synthesising a pre-cut netlist.  It was not — the retime's
+own new signals are present in the archived baseline and in the fresh rolls in
+identical counts (`qFramed` ×3, `qEnd` ×7).  The RTL content is current and
+correct; only SpinalHDL's emitted `// Git hash` comment lagged.  Independently,
+`git diff 6b246de..HEAD -- src/main/scala` is **empty** — every commit since the
+archived checkpoint is docs/synth-only.
+
+**Use the comment-stripped hash `3531a01b346df92e2e14c389ef47289b` as the durable
+netlist identity.**  The full-file md5 changes with every commit, because the
+header comment carries the git HEAD, so it is worthless as a "did the RTL change?"
+check.  On-disk `generated/M68kFullCoreSynth.v` was restored bit-for-bit to
+`d80f6218...` so the md5 cited throughout sections 13-20 keeps resolving.
+
+### Status
+
+- **No RTL changed, no synth run, nothing committed** beyond this section and the
+  progress-file pointer.  `git status --porcelain -- src/` is empty.
+- The `-1.472 ns / 182.749 MHz` baseline stands unchanged and is now known to be
+  **reproducible from source**, not an artifact of one lucky or unlucky draw.
+- That is the real value here: it removes an outstanding doubt about *every*
+  A/B measurement in sections 13-20.  Those gates compared netlists that differ
+  only by their intended RTL edit, with no lottery noise underneath.
+- **Section 20's conclusion is unchanged and now has no cheap alternative left in
+  front of it.**  The next work is genuine architectural pipelining.
