@@ -28,6 +28,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
   private val beatsPerLine = geo.lineBytes / 32   // 256-bit (32 B) beats
   private val setBits      = geo.indexBits
   private val wayBits      = log2Up(ways)
+  private val pfSlots      = AxiIds.I_SPEC_SLOTS
+  private val pfIdxBits    = log2Up(pfSlots)
 
   // idWidth widened 2 -> 4 (ratified slice V2a.1): socket-conformant (AXI_IW = 4)
   // and, more immediately, the I side needs two DISTINCT ids the moment slice I3's
@@ -155,14 +157,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val valids  = Vec.fill(ways)(Vec.fill(sets)(RegInit(False)))
     // Round-robin victim pointer per set
     val victim  = Vec.fill(sets)(RegInit(U(0, wayBits bits)))
-    // Slice I3: per-(way,set) "this line was installed by a PREFETCH and has not been
-    // demand-hit yet". 4 x 64 = 256 flops. It is LOAD-BEARING, not just telemetry: the
-    // trigger "first demand HIT in a line that was itself prefetched -> prefetch the
-    // next line" is what keeps the prefetch stream running once prefetching has caught
-    // up with the demand stream. Without it a prefetch can only be triggered by a
-    // demand MISS, which leaves the stream alternating miss/hit (half the available
-    // win) instead of fully covered. Cleared on a demand fill of the same way/set, on
-    // the first demand hit, and by invalidateAll.
+    // Per-(way,set) "installed silently and not demand-hit yet" telemetry. The moving
+    // window is extended by every accepted cacheable demand; it does not depend on
+    // this bit. Cleared on a demand fill of the same way/set, on the first demand hit,
+    // and by invalidateAll.
     val pfFilled = Vec.fill(ways)(Vec.fill(sets)(RegInit(False)))
 
     // DEBUG (icache-corruption-fix task, temporary — mirrors DcachePlugin's
@@ -263,11 +261,47 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // FetchAlign change, not an IcachePlugin one.
     val missPoison = RegInit(False)
 
+    // ---- five-ID stream-prefetch pool (IDs 1..4; ID 0 remains demand) ----
+    // Each speculative slot carries only control. The two 256-bit beats live in
+    // shallow ID-indexed memories and are copied into the existing shared `lineReg`
+    // only when that completed slot wins the installer. This avoids four additional
+    // 512-bit register copies and keeps the 16-instance predecoder single-copy.
+    val pfValid    = Vec.fill(pfSlots)(RegInit(False))
+    val pfArSent   = Vec.fill(pfSlots)(RegInit(False))
+    val pfComplete = Vec.fill(pfSlots)(RegInit(False))
+    val pfBeat     = Vec.fill(pfSlots)(RegInit(False))
+    val pfErr      = Vec.fill(pfSlots)(RegInit(False))
+    val pfPoison   = Vec.fill(pfSlots)(RegInit(False))
+    val pfPa       = Vec.fill(pfSlots)(Reg(UInt(32 bits)))
+    val pfSet      = Vec.fill(pfSlots)(Reg(UInt(setBits bits)))
+    val pfTag      = Vec.fill(pfSlots)(Reg(UInt(tagBits bits)))
+    val pfWay      = Vec.fill(pfSlots)(Reg(UInt(wayBits bits)))
+    val pfLineLo   = Mem(Bits(256 bits), pfSlots)
+    val pfLineHi   = Mem(Bits(256 bits), pfSlots)
+    val pfInstallIdx = Reg(UInt(pfIdxBits bits))
+
+    // Registered sequential frontier. It is seeded only by an accepted, resolved,
+    // cacheable demand and is capped at five same-page lines ahead. Installed lines
+    // free speculative slots before demand reaches them, allowing four physical
+    // speculative slots to maintain the five-line logical lookahead.
+    val pfSeqValid   = RegInit(False)
+    val pfDemandLine = Reg(UInt(32 bits))
+    val pfNextPa     = Reg(UInt(32 bits))
+    val pfLimitPa    = Reg(UInt(32 bits))
+
+    pfValid.simPublic()
+    pfArSent.simPublic()
+    pfComplete.simPublic()
+
     // ---- shared data-array read port (synchronous; BRAM) ----
     // Address+enable are driven by the FSM (IDLE hit accept, or REPLAY). The
     // result `dataBeat` is the registered BRAM output, valid the NEXT cycle.
     val dataReadAddr = UInt((setBits + 1) bits)
     val dataReadEn   = Bool()
+    dataReadEn.simPublic()
+    val xlateReadyDbg = Bool()
+    xlateReadyDbg := xlate.rsp.ready
+    xlateReadyDbg.simPublic()
     dataReadAddr := U(0, (setBits + 1) bits)
     dataReadEn   := False
     val dataBeat = Vec(dataMem.map(_.readSync(dataReadAddr, dataReadEn)))
@@ -413,9 +447,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
     // ---- default output assignments ----
     cmdPort.ready := False
-    axi.ar.valid  := False
     axi.ar.payload.assignDontCare()
-    axi.r.ready   := False
 
     // ---- parallel VIPT hit detection ----
     // The page-invariant virtual set/beat independently arms the data BRAM. The live
@@ -433,6 +465,11 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val lookupLaneIdx   = lookupPc(4 downto 3)
     val lookupReadAddr  = (lookupSet ## lookupBeatSel).asUInt
     val lookupPredEntry = Vec(predMem.map(_.readAsync(lookupSet)))
+    // An architectural miss can remain visibly held while a speculative owner or
+    // the shared installer drains.  Freeze old-window allocation and let the AR
+    // arbiter launch only the same-set owner needed to unblock it.
+    val heldDemandMiss = lookupActive && cmdPort.valid && xlate.rsp.ready &&
+                         !lookupFault && !isHit
 
     // DEBUG (Task P5.5 regression test, mirrors the existing simPublic DEBUG hooks
     // above): high for exactly the ONE cycle on which PREDECODE performs the
@@ -459,11 +496,11 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // ══ Slice I1/I3 control nets — driven by the FSM, consumed by the hoisted
     //    fill datapath below it (see that block for why the datapath is hoisted). ══
     val refillActive      = Bool(); refillActive      := False
-    val refillIsPf        = Bool(); refillIsPf        := False
     val refillDone        = Bool()   // driven by the datapath, read by the FSM
     val refillErr         = Bool()
     val predActive        = Bool(); predActive        := False
     val predIsPf          = Bool(); predIsPf          := False
+    predActive.simPublic(); predIsPf.simPublic(); commitBeat.simPublic()
     val fillArrayWrActive = Bool(); fillArrayWrActive := False
     // Slice I3 telemetry: pure wires (zero flops, zero synthesis cost) that a
     // testbench counts to derive design doc §8.3's "prefetch issued / useful /
@@ -471,102 +508,67 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // measurement-only registers.
     val pfHitUseful     = Bool(); pfHitUseful     := False; pfHitUseful.simPublic()
     val demandFillStart = Bool(); demandFillStart := False
+    // A lookup that RESETS/KILLS the frontier owns the allocator cycle. Same-line
+    // and same-page sequential hits do not: a bubble-free hit stream must still let
+    // freed speculative IDs advance the fifth/farther candidate.
+    val pfWindowUpdate  = Bool(); pfWindowUpdate  := False
 
-    // ── Slice I3: the next-line prefetch candidate (rules P1–P4, design doc §4.1(ii)) ──
-    //
-    // *** THESE RULES ARE BINDING. They are the standing no-SoC-address-map rule
-    //     (GC1) applied to speculation: the core may only prefetch where it has
-    //     class-(a) evidence -- a translation it ALREADY resolved -- and must never
-    //     record a verdict about an address it merely guessed at. ***
-    //
-    //   P1 — a prefetch is issued ONLY for a next line whose translation is ALREADY
-    //        RESIDENT in the ITLB and whose page is software-configured cacheable. A
-    //        prefetch must NEVER trigger a table walk and must never be issued for an
-    //        INHIBITED page.
-    //   P2 — a prefetch that receives a non-OKAY response is SILENTLY DISCARDED: no
-    //        allocation, no architectural fault, no sticky diagnostic record, no core
-    //        halt. Mandatory precisely BECAUSE the core cannot know whether the address
-    //        is backed; the prefetch never asserted that it was.
-    //   P3 — because P2 allocates nothing, a later DEMAND fetch of that line issues a
-    //        NEW REAL transaction and gets its own contemporaneous response, with the
-    //        existing task-#211 `r.resp` check delivering the fault precisely. No
-    //        cached verdict, in either direction.
-    //   P4 — a prefetch must never cross a page boundary on a GUESS.
-    //
-    // P1 and P4 are satisfied BY CONSTRUCTION here, with no ITLB probe at all and
-    // therefore no way to accidentally arm the walker: the prefetch line is
-    // `source + 64`, and it is issued ONLY when that address lies in the SAME 4 KiB
-    // page as the access whose translation is ALREADY resolved (`pfSrcPa`). A page
-    // holds 64 lines, so this covers 63 of every 64 next-lines; the 64th (a
-    // page-crossing next-line) is simply DROPPED, which is exactly what P4 requires.
-    // Same page also means the same page descriptor, hence the same CM bits -- so the
-    // cacheability of the source access carries over, satisfying P1's INHIBITED rule
-    // (the two trigger sites each additionally require their source to be cacheable).
-    // *** FMAX-CRITICAL STRUCTURE — DO NOT COLLAPSE THIS BACK INTO ONE CYCLE. ***
-    // The first version of this computed the candidate combinationally from whichever
-    // address the trigger site had, and it cost 36.29 MHz post-route (207.17 -> 170.88).
-    // The measured critical path was, end to end in ONE cycle:
-    //     translated source -> source mux -> 26-bit "+1" incrementer (CARRY8 x3)
-    //                -> tagMem.readAsync(pfSet) (RAMD64E x2) -> 20-bit tag compare
-    //                -> pfResident -> prefetchArmed -> missPC/missPA/victimWay CE + FSM goto
-    // 18 logic levels, 67% route, WNS -1.852ns.
-    //
-    // Split into two register-to-register hops instead. The incrementer runs in the
-    // cycle the SOURCE is latched (parallel to the existing hit cone, feeding only
-    // registers), and the array probe + decision run off those registers later:
-    //     hop 1: accepted lookup -> +1 -> pfCand{Set,Tag,Pa,Ok} (registers)
-    //     hop 2: pfCandSet(reg) -> tagMem.readAsync -> compare -> prefetchArmed -> FSM
-    // Both triggers are naturally >= 1 cycle apart from their own use anyway: the
-    // demand-miss trigger latches at miss time and is consumed at REPLAY (many cycles
-    // later), and the useful-hit trigger now sets `pfReqPending` and starts the prefetch
-    // on the FOLLOWING IDLE cycle, which costs nothing (a prefetch has no consumer
-    // waiting on it).
-    val pfCandSet    = Reg(UInt(setBits bits))
-    val pfCandTag    = Reg(UInt(tagBits bits))
-    val pfCandPa     = Reg(UInt(32 bits))
-    val pfCandOk     = RegInit(False)
-    val pfReqPending = RegInit(False)
+    // ── Five-line registered stream window (binding design 2026-08-10) ────────
+    // The frontier and candidate are registers, preserving the earlier FMax lesson:
+    // never put live translation + increment + async tag lookup + allocation enables
+    // in one cone. Candidates use the already-resolved same-page PPN, never an ITLB
+    // request, and stop at the 4-KiB boundary (rules P1/P4).
+    val pfCandSet = pfNextPa(11 downto 6)
+    val pfCandTag = pfNextPa(31 downto 12)
+    val pfCandResident = Vec((0 until ways).map(w =>
+      valids(w)(pfCandSet) && (tagMem(w).readAsync(pfCandSet) === pfCandTag))).orR
+    val pfCandLive = Vec((0 until pfSlots).map(i =>
+      pfValid(i) && ((pfPa(i) & ~U(63, 32 bits)) === pfNextPa))).orR
+    val pfCandSetBusy = Vec((0 until pfSlots).map(i =>
+      pfValid(i) && (pfSet(i) === pfCandSet))).orR
+    val pfFreeVec = Vec((0 until pfSlots).map(i => !pfValid(i)))
+    val pfHasFree = pfFreeVec.orR
+    val pfFreeIdx = OHToUInt(OHMasking.first(pfFreeVec.asBits))
+    val pfWindowHasCandidate = pfSeqValid && prefetchEnable &&
+      (pfNextPa <= pfLimitPa) && (pfNextPa(31 downto 12) === pfDemandLine(31 downto 12))
 
-    /** Hop 1 — latch the next-line candidate from an accepted translated lookup.
-      * Called from the demand-miss arm and the useful-prefetch-hit arm of `lookupTick`,
-      * both of which have a resolved translation for `lookupPc`.
-      *
-      * `pfCandOk` folds in P4 (same page as the source, so no page cross on a guess)
-      * and P1's cacheability (same page => same descriptor => same CM bits). */
-    def latchPfCand(): Unit = {
-      val nextVa = ((lookupPc(31 downto 6) + 1) @@ U(0, 6 bits)).resize(32)
-      pfCandSet := nextVa(11 downto 6)
-      pfCandTag := lookupPaddr(31 downto 12)
-      pfCandPa  := lookupPaddr(31 downto 12) @@ nextVa(11 downto 0)
-      pfCandOk  := (nextVa(31 downto 12) === lookupPc(31 downto 12)) &&
-                   lookupCacheable && !lookupFault
+    // A held demand matching any live speculative line must re-look-up after install;
+    // a same-set/different-line demand waits as well, preserving one fill owner per set.
+    val lookupLineBase = lookupPaddr & ~U(63, 32 bits)
+    val pfLookupSetBusy = Vec((0 until pfSlots).map(i =>
+      pfValid(i) && (pfSet(i) === lookupSet))).orR
+
+    val pfInstallVec = Vec((0 until pfSlots).map(i =>
+      pfValid(i) && pfComplete(i) && !pfErr(i) && !pfPoison(i)))
+    val pfInstallAny = pfInstallVec.orR
+    val pfInstallSel = OHToUInt(OHMasking.first(pfInstallVec.asBits))
+
+    def seedPfWindow(): Unit = {
+      val line = lookupPaddr & ~U(63, 32 bits)
+      val pageEnd = (lookupPaddr(31 downto 12) ## U(0xfff, 12 bits)).asUInt & ~U(63, 32 bits)
+      val wantedLimit = line + U(5 * 64, 32 bits)
+      val clampedLimit = Mux(wantedLimit(31 downto 12) === line(31 downto 12),
+                             wantedLimit, pageEnd)
+      when(!pfSeqValid || (line =/= pfDemandLine)) {
+        // A virtual page crossing must always restart from line+64, even when the
+        // two physical pages happen to be contiguous.  The old page's clamp can
+        // otherwise leave pfNextPa pointing at the new demand line itself.
+        val sequential = pfSeqValid &&
+                         (line(31 downto 12) === pfDemandLine(31 downto 12)) &&
+                         (line === (pfDemandLine + U(64, 32 bits)))
+        when(!sequential) { pfNextPa := line + U(64, 32 bits) }
+        pfDemandLine := line
+        pfLimitPa    := clampedLimit
+      }
+      pfSeqValid := True
     }
 
-    // Hop 2 — suppression + arming, entirely off registers. Never prefetch a line that
-    // is already resident. (A line already in an MSHR, or in the same set as an active
-    // MSHR -- the D3-SET-I exclusion -- cannot arise: the fill engine is shared, so a
-    // prefetch is only ever started when it is free, and the prefetched set is always
-    // sourceSet + 1.)
-    val pfResident = Vec((0 until ways).map(w =>
-                       valids(w)(pfCandSet) && (tagMem(w).readAsync(pfCandSet) === pfCandTag))).orR
-    val prefetchArmed = prefetchEnable && pfCandOk && !pfResident
-
-    /** Re-point the shared fill engine at the prefetch candidate. Every source is a
-      * register, so this adds no combinational depth of its own. Costs no new state:
-      * a prefetch is never in flight at the same time as a demand fill. */
-    def startPrefetch(): Unit = {
-      missPC        := pfCandPa  // unused (a prefetch produces no response); kept defined
-      missSet       := pfCandSet
-      missTag       := pfCandTag
-      missPA        := pfCandPa
-      missCacheable := True      // P1: same page as a cacheable source => same CM bits
-      victimWay     := victim(pfCandSet)
-      beatCnt       := U(0, 1 bits)
-      arSent        := False
-      missBusFault  := False
-      missPoison    := False
-      commitBeat    := U(0, 1 bits)
-    }
+    // Stable registered AR holding point. It intentionally allows one arbitration
+    // bubble after each fire; five requests still launch far inside the 70-cycle
+    // memory window, while payload stability is structural under arbitrary ready.
+    val arHoldValid = RegInit(False)
+    val arHoldId    = Reg(UInt(AxiIds.ID_W bits))
+    val arHoldAddr  = Reg(UInt(32 bits))
 
     // ---- FSM ----
     val fsm = new StateMachine {
@@ -574,21 +576,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
       val REFILL    = new State
       val PREDECODE = new State
       val REPLAY    = new State
-      // ── Slice I3: the next-line PREFETCH fill ────────────────────────────────
-      // A prefetch reuses the SAME fill machinery as a demand refill (missPA/missSet/
-      // missTag/victimWay/beatCnt/arSent/lineReg/commitBeat and the single 16-instance
-      // classify group), which is why it costs no new line buffer, no second dataMem
-      // write port and no second predecode group. What makes that safe is design doc
-      // §6.2's key simplification: **a prefetch has NO waiting consumer.** It never
-      // produces a `FetchRsp`, never occupies a FetchAlign ring entry, never needs a
-      // tag and cannot produce a fault. It is a pure allocate -- so `FetchAlignPlugin`
-      // needs no change whatsoever and the `ibufRoomForIssue` reservation is untouched.
-      //
-      // These two states differ from REFILL/PREDECODE in exactly one way that matters:
-      // they keep the FETCH PORT OPEN and keep answering HITS (`lookupTick(false)`).
-      // That is the whole of the "non-blocking accept" this design can safely have --
-      // see the big ordering note on `lookupTick`.
-      val PF_REFILL = new State
+      // Silent fills collect independently by RID. A completed speculative line is
+      // copied into the shared lineReg in IDLE, then uses this single installer state.
       val PF_PRED   = new State
       // Task #211: a REFILL whose AXI read response(s) came back non-OKAY
       // (SLVERR/DECERR — genuinely unmapped or erroring physical memory). No line
@@ -660,15 +649,30 @@ class IcachePlugin extends FiberPlugin with FetchService {
         val setBlocked = if (canStartFill) False
                          else (fillArrayWrActive && (lookupSet === missSet))
         dataReadAddr := lookupReadAddr
-        dataReadEn   := cmdPort.valid && xlate.rsp.ready && !setBlocked
+        dataReadEn   := cmdPort.valid && !setBlocked
 
         // IDLE may accept any resolved command, including the demand miss it captures.
         // During a prefetch fill, only an answerable hit/fault may fire; a miss remains
         // held at the Stream boundary until the shared fill engine becomes free.
-        val answerable = if (canStartFill) True else (lookupFault || isHit)
+        val answerable = if (canStartFill)
+          (lookupFault || isHit || !pfLookupSetBusy)
+        else
+          (lookupFault || isHit)
         cmdPort.ready := xlate.rsp.ready && !setBlocked && answerable
 
         when(cmdPort.fire) {
+          when(!lookupFault && lookupCacheable) {
+            val line = lookupPaddr & ~U(63, 32 bits)
+            val sequential = pfSeqValid &&
+                             (line(31 downto 12) === pfDemandLine(31 downto 12)) &&
+                             (line === (pfDemandLine + U(64, 32 bits)))
+            pfWindowUpdate := !pfSeqValid ||
+                              ((line =/= pfDemandLine) && !sequential)
+            seedPfWindow()
+          } otherwise {
+            pfWindowUpdate := True
+            pfSeqValid := False
+          }
           when(lookupFault) {
             // Translation fault: emit a fault response (no data, no refill).
             s1Valid := True
@@ -693,10 +697,6 @@ class IcachePlugin extends FiberPlugin with FetchService {
             when(pfFilled(hitWayIdx)(lookupSet)) {
               pfFilled(hitWayIdx)(lookupSet) := False
               pfHitUseful := True
-              if (canStartFill) {
-                latchPfCand()
-                pfReqPending := True
-              }
             }
           } otherwise {
             // Reachable only in IDLE because answerable excludes a prefetch-time miss.
@@ -710,7 +710,6 @@ class IcachePlugin extends FiberPlugin with FetchService {
             arSent    := False
             missBusFault := False
             missPoison   := False
-            latchPfCand()
             demandFillStart := True
             goto(REFILL)
           }
@@ -719,59 +718,27 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
       IDLE.whenIsActive {
         lookupTick(canStartFill = true)
-        // A prefetch requested by the "useful prefetch => keep going" hit trigger can
-        // only start from IDLE (the fill engine is shared). Placed AFTER lookupTick so
-        // a demand miss in the same cycle wins the engine -- demand always has
-        // priority over prefetch.
-        // A prefetch requested by the useful-prefetch hit trigger starts on the cycle
-        // AFTER the hit (hop 2). `demandFillStart` gives DEMAND absolute priority for
-        // the shared fill engine: this `when` elaborates after the miss arm's
-        // `goto(REFILL)`, so without the guard it would override it. Losing the request
-        // to a demand miss is harmless -- that fill triggers its own prefetch at REPLAY.
-        when(pfReqPending) {
-          pfReqPending := False
-          when(prefetchArmed && !demandFillStart) {
-            startPrefetch()
-            goto(PF_REFILL)
-          }
+        // Demand allocation wins. Otherwise a completed silent line is registered
+        // into the shared installer; the wide LUTRAM read terminates at `lineReg`.
+        when(pfInstallAny && !demandFillStart) {
+          pfInstallIdx := pfInstallSel
+          lineReg := pfLineHi.readAsync(pfInstallSel) ## pfLineLo.readAsync(pfInstallSel)
+          missPC        := pfPa(pfInstallSel)
+          missPA        := pfPa(pfInstallSel)
+          missSet       := pfSet(pfInstallSel)
+          missTag       := pfTag(pfInstallSel)
+          missCacheable := True
+          victimWay     := pfWay(pfInstallSel)
+          missPoison    := pfPoison(pfInstallSel) || anyInvalidate
+          commitBeat    := U(0, 1 bits)
+          goto(PF_PRED)
         }
       }
-      // ----- REFILL / PF_REFILL: issue AXI AR; collect the 2 R beats -----
-      // Both states share ONE hoisted fill datapath (`refillActive`, below the FSM).
-      // The demand and prefetch fills are NOT allowed to run concurrently: they share
-      // `lineReg`/`beatCnt`/`missPA`/`missSet`/`missTag`/`victimWay`/`commitBeat` and
-      // the single 16-instance classify group, which is exactly why slice I3 costs no
-      // second line buffer, no second dataMem write port and no second predecode group.
-      // This is also honest about the SoC: the crossbar is ONE outstanding read per
-      // master port (design doc §3.2), so a second concurrent I-side fill would buy
-      // nothing end-to-end today anyway. Prefetch wins by starting a line's fill EARLY
-      // in TIME, not by overlapping it with another transaction (§6.2).
+      // ----- Demand refill; speculative R traffic is handled independently by RID -----
       REFILL.whenIsActive {
         refillActive := True
         when(refillDone) {
           when(refillErr) { goto(FAULT) } otherwise { goto(PREDECODE) }
-        }
-      }
-
-      PF_REFILL.whenIsActive {
-        refillActive := True
-        refillIsPf   := True
-        // THE point of slice I1: the fetch port stays OPEN and hits keep being served
-        // for the whole prefetch fill. See `lookupTick`'s ordering note.
-        lookupTick(canStartFill = false)
-        when(refillDone) {
-          // P2 -- a prefetch that receives a non-OKAY response is SILENTLY DISCARDED:
-          // no allocation, no architectural fault, no sticky diagnostic record, no core
-          // halt. Mandatory precisely BECAUSE the core cannot know whether the address
-          // is backed; the prefetch never asserted that it was (design doc §4.1(ii) P2,
-          // and the standing no-SoC-address-map rule GC1). Note there is nothing to
-          // "deliver" either way -- a prefetch has no waiting consumer.
-          //
-          // P3 follows from P2: because nothing was allocated, a later DEMAND fetch of
-          // that line issues a NEW REAL transaction and gets its own contemporaneous
-          // response, with the task-#211 r.resp check below delivering the fault
-          // precisely through the FAULT state. No cached verdict, in either direction.
-          when(refillErr) { goto(IDLE) } otherwise { goto(PF_PRED) }
         }
       }
 
@@ -813,7 +780,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // retried instead.
         fillArrayWrActive := True
         lookupTick(canStartFill = false)
-        when(commitBeat === U(1, 1 bits)) { goto(IDLE) }
+        when(commitBeat === U(1, 1 bits)) {
+          pfValid(pfInstallIdx)    := False
+          pfArSent(pfInstallIdx)   := False
+          pfComplete(pfInstallIdx) := False
+          goto(IDLE)
+        }
       }
 
       // ----- REPLAY: arm S1 read for the just-filled line, then IDLE -----
@@ -851,72 +823,127 @@ class IcachePlugin extends FiberPlugin with FetchService {
         s1PredEntries := replayPredEntry
         s1FromMiss := !missCacheable || missPoison
 
-        // ── Slice I3 trigger #1: a demand fill just allocated line L -> prefetch L+64.
-        // Placed here rather than in PREDECODE so the demand's own response is already
-        // armed off the ARRAYS (stable) before the prefetch starts overwriting
-        // `lineReg`; the earliest a prefetch beat can land is two cycles after this, so
-        // the demand's S1->rsp read of `lineReg`/`missPred` (the INHIBITED/poison bypass
-        // path) is never raced.
-        when(prefetchArmed && missCacheable && !missPoison) {
-          startPrefetch()
-          goto(PF_REFILL)
-        } otherwise {
-          goto(IDLE)
-        }
+        goto(IDLE)
       }
     }
 
-    // ══ Hoisted fill datapath — shared by the DEMAND and PREFETCH fills ═══════════
-    // Single call site per Mem write port, which is a hard requirement, not style:
-    // an earlier version of the icache-burst-fault fix split the two beats across two
-    // FSM states each with its own `.write()` call site, and that DID synthesize a real
-    // second write port -- SpinalHDL's `MultiPortWritesSymplifier` then failed to
-    // blackbox it during simulation elaboration. One call site, muxed by a register.
-
-    // ---- refill: AR + beat accumulation into lineReg ----
+    // ══ Five-ID fill pool + single shared installer ═══════════════════════════════
     refillDone := False
     refillErr  := False
-    when(refillActive) {
-      // Refill from the PHYSICAL line base (missPA, the translated PA); identity
-      // when the MMU is off (missPA == missPC).
-      val lineBase = missPA & ~U(63, 32 bits)
-      when(!arSent) {
-        axi.ar.valid         := True
-        axi.ar.payload.addr  := lineBase
-        // Routed by ID (design doc §1.2/§7.1): a prefetch's beats and a demand's beats
-        // must never be confusable. They cannot be outstanding together in this design,
-        // but the ID is still distinct so the SoC L2's `id_busy_c` front door does not
-        // serialise a prefetch behind an unrelated demand of the same ID, and so a bus
-        // monitor can attribute traffic.
-        axi.ar.payload.id    := Mux(refillIsPf,
-                                    U(AxiIds.I_PREFETCH, AxiIds.ID_W bits),
-                                    U(AxiIds.I_DEMAND,   AxiIds.ID_W bits))
-        axi.ar.payload.len   := U(1, 8 bits)
-        axi.ar.payload.size  := U(5, 3 bits)
-        axi.ar.payload.burst := Axi4.burst.INCR
-        when(axi.ar.ready) { arSent := True }
-      }
 
-      axi.r.ready := True
-      when(axi.r.valid) {
-        // Task #211: a non-OKAY response (SLVERR/DECERR — genuinely unmapped or
-        // erroring physical memory) on EITHER beat of this 2-beat line burst means
-        // there is no real data to cache. Still absorb the beat into `lineReg`
-        // (UNCONDITIONAL — a register, not a shared array, so it is safe), but latch
-        // the error so the FSM routes to FAULT (demand) or silently discards
-        // (prefetch, rule P2) once the burst completes.
-        //
-        // dataMem is NOT written here, per-beat, at all (icache-burst-fault-fix): a
-        // legal AXI ordering returns beat 0 OKAY and only then beat 1 SLVERR, so at
-        // beat-0-write time nothing yet knows the burst will fault, and beat 0's real
-        // data would already have been spliced into `dataMem(victimWay)` -- corrupting
-        // whatever OTHER address that round-robin-selected way is still validly
-        // resident for. The ACTUAL array commit is therefore deferred to the predecode
-        // dwell below, reached only when the ENTIRE burst is confirmed OKAY.
-        val respErr = axi.r.payload.resp =/= Axi4.resp.OKAY
+    // Allocate at most one registered same-page candidate per cycle. Resident/live
+    // candidates advance the frontier without consuming a slot; same-set conflicts
+    // wait, enforcing one fill owner per set.
+    val demandSetOwned = (fsm.isActive(fsm.REFILL) || fsm.isActive(fsm.PREDECODE) ||
+                          fsm.isActive(fsm.REPLAY) || fsm.isActive(fsm.FAULT)) &&
+                         (missSet === pfCandSet)
+    when(pfWindowHasCandidate && !anyInvalidate && !demandFillStart &&
+         !pfWindowUpdate && !heldDemandMiss) {
+      when(pfCandLive) {
+        pfNextPa := pfNextPa + U(64, 32 bits)
+      } elsewhen(pfCandSetBusy || demandSetOwned) {
+        // Wait. A resident candidate may be the victim that the current same-set
+        // owner is about to evict, so resident suppression is only legal once the
+        // set becomes owner-free.
+      } elsewhen(pfCandResident) {
+        pfNextPa := pfNextPa + U(64, 32 bits)
+      } elsewhen(pfHasFree) {
+        pfValid(pfFreeIdx)    := True
+        pfArSent(pfFreeIdx)   := False
+        pfComplete(pfFreeIdx) := False
+        pfBeat(pfFreeIdx)     := False
+        pfErr(pfFreeIdx)      := False
+        pfPoison(pfFreeIdx)   := False
+        pfPa(pfFreeIdx)       := pfNextPa
+        pfSet(pfFreeIdx)      := pfCandSet
+        pfTag(pfFreeIdx)      := pfCandTag
+        pfWay(pfFreeIdx)      := victim(pfCandSet)
+        pfNextPa              := pfNextPa + U(64, 32 bits)
+      }
+    }
+
+    // Completed errors and poisoned silent fills allocate nothing and free locally.
+    for (i <- 0 until pfSlots) {
+      when(pfValid(i) && pfComplete(i) && (pfErr(i) || pfPoison(i))) {
+        pfValid(i)    := False
+        pfArSent(i)   := False
+        pfComplete(i) := False
+      }
+      when(anyInvalidate && pfValid(i)) { pfPoison(i) := True }
+    }
+    when(anyInvalidate) { pfSeqValid := False }
+
+    // Registered AR holding point: demand always wins an empty arbiter, then the
+    // lowest speculative slot. Payload cannot change under backpressure.
+    val pfArWant = Vec((0 until pfSlots).map(i => pfValid(i) && !pfArSent(i) && !pfComplete(i)))
+    val pfAnyArWant = pfArWant.orR
+    val pfArSel = OHToUInt(OHMasking.first(pfArWant.asBits))
+    // Do not create a new speculative AR hold in front of an architectural miss
+    // already visible at the command boundary. An AR that was presented earlier
+    // remains stable until fire, as AXI requires; this guard handles the empty-holder
+    // arbitration case and the matching-fill error/retry boundary.
+    val pfBlockingArWant = Vec((0 until pfSlots).map(i =>
+      pfArWant(i) && (pfSet(i) === lookupSet)))
+    val pfBlockingArAny = pfBlockingArWant.orR
+    val pfBlockingArSel = OHToUInt(OHMasking.first(pfBlockingArWant.asBits))
+    val pfChosenArSel = Mux(heldDemandMiss, pfBlockingArSel, pfArSel)
+    when(!arHoldValid) {
+      when(refillActive && !arSent) {
+        arHoldValid := True
+        arHoldId    := U(AxiIds.I_DEMAND, AxiIds.ID_W bits)
+        arHoldAddr  := missPA & ~U(63, 32 bits)
+      } elsewhen(pfAnyArWant && !demandFillStart &&
+                 (!heldDemandMiss || pfBlockingArAny)) {
+        arHoldValid := True
+        arHoldId    := (pfChosenArSel.resize(AxiIds.ID_W) +
+                        U(AxiIds.I_SPEC_BASE, AxiIds.ID_W bits)).resized
+        arHoldAddr  := pfPa(pfChosenArSel) & ~U(63, 32 bits)
+      }
+    }
+
+    axi.ar.valid         := arHoldValid
+    axi.ar.payload.addr  := arHoldAddr
+    axi.ar.payload.id    := arHoldId
+    axi.ar.payload.len   := U(1, 8 bits)
+    axi.ar.payload.size  := U(5, 3 bits)
+    axi.ar.payload.burst := Axi4.burst.INCR
+    when(axi.ar.fire) {
+      arHoldValid := False
+      when(arHoldId === U(AxiIds.I_DEMAND, AxiIds.ID_W bits)) {
+        arSent := True
+      } otherwise {
+        val sentIdx = (arHoldId - U(AxiIds.I_SPEC_BASE, AxiIds.ID_W bits)).resize(pfIdxBits)
+        pfArSent(sentIdx) := True
+      }
+    }
+
+    // Route every R beat solely by RID. ID 0 feeds the existing precise demand
+    // context; IDs 1..4 feed one shallow speculative line store.
+    val ridIsDemand = axi.r.payload.id === U(AxiIds.I_DEMAND, AxiIds.ID_W bits)
+    val ridIsPf = (axi.r.payload.id >= U(AxiIds.I_SPEC_BASE, AxiIds.ID_W bits)) &&
+                  (axi.r.payload.id <= U(AxiIds.I_SPEC_LAST, AxiIds.ID_W bits))
+    val pfRspIdx = (axi.r.payload.id -
+                    U(AxiIds.I_SPEC_BASE, AxiIds.ID_W bits)).resize(pfIdxBits)
+    val demandRspMatch = ridIsDemand && refillActive && arSent
+    val pfRspMatch = ridIsPf && pfValid(pfRspIdx) && pfArSent(pfRspIdx) && !pfComplete(pfRspIdx)
+    axi.r.ready := demandRspMatch || pfRspMatch
+
+    when(axi.r.valid) {
+      assert(demandRspMatch || pfRspMatch, "I-cache R beat has no live RID owner")
+    }
+
+    val pfRspFire = axi.r.fire && pfRspMatch
+    pfLineLo.write(pfRspIdx, axi.r.payload.data, enable = pfRspFire && !pfBeat(pfRspIdx))
+    pfLineHi.write(pfRspIdx, axi.r.payload.data, enable = pfRspFire && pfBeat(pfRspIdx))
+
+    when(axi.r.fire) {
+      val respErr = axi.r.payload.resp =/= Axi4.resp.OKAY
+      when(demandRspMatch) {
+        assert(axi.r.payload.last === beatCnt.asBool,
+          "demand I-cache refill must be exactly two beats")
         when(respErr) { missBusFault := True }
         when(beatCnt === U(0, 1 bits)) {
-          lineReg(255 downto 0)   := axi.r.payload.data
+          lineReg(255 downto 0) := axi.r.payload.data
         } otherwise {
           lineReg(511 downto 256) := axi.r.payload.data
         }
@@ -924,6 +951,15 @@ class IcachePlugin extends FiberPlugin with FetchService {
         when(axi.r.payload.last) {
           refillDone := True
           refillErr  := missBusFault || respErr
+        }
+      } otherwise {
+        assert(axi.r.payload.last === pfBeat(pfRspIdx),
+          "speculative I-cache refill must be exactly two beats")
+        when(respErr) { pfErr(pfRspIdx) := True }
+        pfBeat(pfRspIdx) := !pfBeat(pfRspIdx)
+        when(axi.r.payload.last) {
+          pfComplete(pfRspIdx) := True
+          pfErr(pfRspIdx) := pfErr(pfRspIdx) || respErr
         }
       }
     }
@@ -991,10 +1027,9 @@ class IcachePlugin extends FiberPlugin with FetchService {
               when(!anyInvalidate) {
                 valids(w)(missSet) := True
               }
-              // Slice I3: remember whether this line arrived by prefetch. Set for a
-              // prefetch fill, CLEARED for a demand fill of the same way/set (so a
-              // demand-filled line never spuriously re-triggers the "useful prefetch"
-              // heuristic).
+              // Telemetry only: record whether the installed line arrived through a
+              // silent speculative ID. Demand installation clears the marker; window
+              // allocation does not depend on it.
               pfFilled(w)(missSet) := predIsPf && !anyInvalidate
             }
           }

@@ -81,8 +81,14 @@ Slot state is registered and minimal:
 FREE -> AR_PENDING -> FILL -> COMPLETE -> INSTALL -> FREE
 ```
 
-Each live slot carries line VA/PA, set, physical tag, reserved victim way,
-expected beat, accumulated error, and poison.  Slot index is the AXI ID; no
+Each live slot carries line PA, its page-invariant VIPT set, physical tag,
+reserved victim way, expected beat, accumulated error, and poison.  A separate
+line VA is intentionally omitted: within a 4-KiB page its set/offset are already
+identical to the captured PA, while demand association uses the resolved PA.
+Likewise, cache mode is represented by the slot-valid invariant rather than a
+stored enum: a speculative slot can only be allocated from a resolved cacheable
+demand, and same-page candidates inherit that descriptor.  This removes 128
+redundant VA bits plus four redundant mode fields.  Slot index is the AXI ID; no
 response CAM is added in the core.  ID 0 retains the existing demand miss PC,
 cache-mode, line, and fault context.  A response with no live matching slot is
 a fatal simulation error.
@@ -192,9 +198,10 @@ green.
 - `invalidateAll` clears resident valids and poisons every live slot.  Late
   completion cannot repopulate the cache.  An already accepted demand still
   receives one response so FetchAlign can retire its stale ring entry.
-- Cache mode and physical tag are captured from the exact demand translation
-  that seeds the same-page window.  A mapping change cannot relabel a live
-  entry.
+- Physical tag is captured from the exact demand translation that seeds the
+  same-page window.  Cacheability is captured by the slot-valid invariant: only
+  a cacheable resolved demand can create a same-page slot.  A mapping change
+  cannot relabel a live entry.
 
 ## 8. Non-vacuous verification
 
@@ -209,6 +216,8 @@ The implementation gate must include:
    model.  After bootstrap, require no demand refill after the first, bounded
    line-boundary bubbles, and a measured peak of five live ARIDs.  Mutation to
    one live ID or the singleton FSM must fail both concurrency and cadence.
+   The model must reserve at least ten pending 256-bit R beats so its legacy
+   eight-beat capacity does not silently cap five two-beat lines at four IDs.
 4. Hold a demand on an in-flight speculative line.  Require no duplicate AR,
    stable command payload until install, and one exact eventual hit response.
 5. Fill IDs 1..4 with wrong-path traffic, redirect to an unrelated cold line,
@@ -230,7 +239,7 @@ The implementation gate must include:
 
 Tests count handshakes and check payload stability.  They must not infer
 success from elapsed time, a `valid` pulse without `ready`, or final memory
-contents alone.
+contents alone.  D-side capacity is not loosened as part of this I-side proof.
 
 ## 9. Physical acceptance
 

@@ -3,7 +3,7 @@ package m68k040.bench
 import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
 import m68k040.mmu.{ItlbPlugin, DtlbPlugin, MmuControlPlugin}
-import m68k040.cache.{IcachePlugin, DcachePlugin, DcacheService}
+import m68k040.cache.{AxiIds, IcachePlugin, DcachePlugin, DcacheService}
 import m68k040.frontend.{FetchAlignPlugin, BtbPlugin, ComplexResumeActionPipe}
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
@@ -323,12 +323,17 @@ class IpcBenchSpec extends AnyFunSuite {
       val dram = if (parts.length > 2) parts(2).toInt else 70
       AxiMemModelConfig(latency = L2LatencyModel(enabled = true, hitCycles = hit, dramCycles = dram))
   }
+  // Five live 64-byte I-cache lines occupy ten beats on the core's 256-bit AXI.
+  // Keep the legacy D-side capacity unchanged, but do not let the shared model's
+  // old eight-beat default silently turn the I-side five-ID contract into four.
+  val iMemCfg: AxiMemModelConfig = memCfg.copy(
+    maxPendingBeats = scala.math.max(memCfg.maxPendingBeats, 2 * (1 + AxiIds.I_SPEC_SLOTS)))
   def memLabel: String =
     if (!memCfg.latency.enabled) "zero-latency (ideal memory)"
     else s"L2-faithful: L2 hit=${memCfg.latency.hitCycles}cyc, DDR=${memCfg.latency.dramCycles}cyc, 64B line"
 
   def attachProgram(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long, bytes: Vector[Int]): Unit = {
-    AxiMemModel.attachProgramIFetch(axi, cd, loadAddr, bytes, cfg = memCfg)
+    AxiMemModel.attachProgramIFetch(axi, cd, loadAddr, bytes, cfg = iMemCfg)
   }
 
   // ── per-kernel measurement result ───────────────────────────────────────────

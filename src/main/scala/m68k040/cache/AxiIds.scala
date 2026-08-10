@@ -46,13 +46,21 @@ object AxiIds {
   val D_EVICT = 4
 
   // -- I master (`IcachePlugin_logic_axi`) ------------------------------------
-  /** I-cache DEMAND refill MSHR. */
-  val I_DEMAND = 0
-  /** I-cache PREFETCH MSHR (slice I3). MUST differ from `I_DEMAND`: with both
-    * outstanding, R beats are demultiplexed by `r.id` and nothing else (design doc
-    * §1.2 -- `r.ready` is state-gated, so a beat routed by FSM state instead of by ID
-    * is silently dropped). */
-  val I_PREFETCH = 1
+  /** I-cache refill slot `k`: slot 0 is reserved for demand, slots 1..4 are the
+    * five-ID stream-prefetch window. Responses are routed solely by this ID. */
+  def iRefill(k: Int): Int = {
+    require(k >= 0 && k < 5, s"I refill slot $k out of 0..4")
+    k
+  }
+  /** I-cache DEMAND refill slot. */
+  val I_DEMAND = iRefill(0)
+  /** Inclusive silent-refill ID range and its compile-time slot count. */
+  val I_SPEC_BASE  = iRefill(1)
+  val I_SPEC_LAST  = iRefill(4)
+  val I_SPEC_SLOTS = I_SPEC_LAST - I_SPEC_BASE + 1
+  /** Compatibility name for the first silent speculative slot. New code that
+    * selects a particular slot must use `iRefill(k)` instead. */
+  val I_PREFETCH = I_SPEC_BASE
 
   // -- table walkers (their own masters today; folded in V2c) ------------------
   /** Table-walker descriptor read. */

@@ -78,6 +78,66 @@ class IcacheParallelViptSpec extends AnyFunSuite {
       "supervisor warm fetch unexpectedly faulted")
   }
 
+  private def fetchData(dut: Dut, cd: ClockDomain, pc: Long): BigInt = {
+    dut.probe.logic.cmdIn.valid #= true
+    dut.probe.logic.cmdIn.payload.pc #= pc
+    cd.waitSamplingWhere(dut.probe.logic.cmdIn.valid.toBoolean &&
+      dut.probe.logic.cmdIn.ready.toBoolean)
+    dut.probe.logic.cmdIn.valid #= false
+    cd.waitSamplingWhere(dut.probe.logic.rspOut.valid.toBoolean)
+    assert(!dut.probe.logic.rspOut.payload.fault.toBoolean)
+    dut.probe.logic.rspOut.payload.data.toBigInt
+  }
+
+  test("nonidentity mapping seeds physical same-page silent lines without another walk",
+       VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val walkerMem = new BehavioralMemAgent(dut.walkerAxi, cd)
+      installSupervisorMapping(walkerMem)
+      IcacheSim.attachMemory(dut.ic.logic.axi, cd, PhysPage, 0x1000)
+
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.ic.logic.invalidateAll #= false
+      dut.priv.logic.supervisorIn #= true
+      val arTrace = scala.collection.mutable.ArrayBuffer[(Int, Long)]()
+      var walkArCount = 0
+      cd.onSamplings {
+        if (dut.ic.logic.axi.ar.valid.toBoolean && dut.ic.logic.axi.ar.ready.toBoolean)
+          arTrace += ((dut.ic.logic.axi.ar.payload.id.toInt,
+            dut.ic.logic.axi.ar.payload.addr.toLong))
+        if (dut.walkerAxi.ar.valid.toBoolean && dut.walkerAxi.ar.ready.toBoolean)
+          walkArCount += 1
+      }
+
+      cd.waitSampling(5)
+      dut.ic.logic.prefetchEnable #= true
+      dut.ctrl.logic.urp #= Root
+      dut.ctrl.logic.srp #= Root
+      dut.ctrl.logic.mmuEnable #= true
+      cd.waitSampling(2)
+
+      assert(fetchData(dut, cd, VirtPage) == IcacheSim.window64(PhysPage),
+        "nonidentity demand data did not use the translated physical line")
+      cd.waitSampling(60)
+      assert(arTrace.contains((AxiIds.I_DEMAND, PhysPage)), s"missing physical demand AR: $arTrace")
+      (AxiIds.I_SPEC_BASE to AxiIds.I_SPEC_LAST).foreach { id =>
+        val expected = PhysPage + id * 64L
+        assert(arTrace.contains((id, expected)),
+          f"silent ID$id did not inherit translated PPN: expected 0x$expected%x trace=$arTrace")
+      }
+      assert(walkArCount == 3,
+        s"same-page speculation triggered an extra ITLB walk: $walkArCount descriptor reads")
+
+      val demandBefore = arTrace.count(_._1 == AxiIds.I_DEMAND)
+      assert(fetchData(dut, cd, VirtPage + 0x40L) == IcacheSim.window64(PhysPage + 0x40L))
+      assert(arTrace.count(_._1 == AxiIds.I_DEMAND) == demandBefore,
+        s"translated silent line failed to hit: $arTrace")
+    }
+  }
+
   test("resident supervisor permission fault stays associated at two-cycle latency",
        VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
@@ -98,6 +158,7 @@ class IcacheParallelViptSpec extends AnyFunSuite {
       var iArCount = 0
       var walkArCount = 0
       var rspCount = 0
+      var coldUnresolvedCycles = 0
       cd.onSamplings {
         cycle += 1
         if (dut.ic.logic.axi.ar.valid.toBoolean && dut.ic.logic.axi.ar.ready.toBoolean)
@@ -105,6 +166,11 @@ class IcacheParallelViptSpec extends AnyFunSuite {
         if (dut.walkerAxi.ar.valid.toBoolean && dut.walkerAxi.ar.ready.toBoolean)
           walkArCount += 1
         if (dut.probe.logic.rspOut.valid.toBoolean) rspCount += 1
+        if (dut.probe.logic.cmdIn.valid.toBoolean && !dut.ic.logic.xlateReadyDbg.toBoolean) {
+          coldUnresolvedCycles += 1
+          assert(dut.ic.logic.dataReadEn.toBoolean,
+            "VIPT data-array read was gated by unresolved ITLB response")
+        }
       }
 
       cd.waitSampling(5)
@@ -122,6 +188,8 @@ class IcacheParallelViptSpec extends AnyFunSuite {
       val rspBefore = rspCount
       assert(iArBefore == 1, s"warm setup expected one demand refill, got $iArBefore")
       assert(walkArBefore == 3, s"warm setup expected one three-level walk, got $walkArBefore")
+      assert(coldUnresolvedCycles > 0,
+        "setup never observed a live ITLB miss, so the parallel VIPT check was vacuous")
 
       dut.priv.logic.supervisorIn #= false
       dut.probe.logic.cmdIn.valid #= true
