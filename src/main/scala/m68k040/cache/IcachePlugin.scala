@@ -543,6 +543,73 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val pfInstallAny = pfInstallVec.orR
     val pfInstallSel = OHToUInt(OHMasking.first(pfInstallVec.asBits))
 
+    // ── Slice 1a (design spec section 3 boundary B3): the install decision must not
+    // be a function of the LIVE demand verdict. Today `lineReg`'s 512-bit capture
+    // enable and the fanout-518 `pfInstallIdx` select are reached from
+    // `cmdPort.fire` through `demandFillStart`, which is what puts the whole
+    // `applyNow -> ITLB -> tag -> accept -> install` chain into one cycle.
+    //
+    // The inversion: arm the install from a REGISTER, and make the demand-miss
+    // capture yield to it instead. Nothing architectural depends on an install
+    // happening in any particular cycle - a completed speculative line is
+    // speculative by construction (handoff section 15 step 9's standing licence).
+    //
+    // H9 anti-starvation: a visible held demand miss may be deferred behind at most
+    // `installDeferMax` cycles of install activity; past that, arming stops until the
+    // demand is admitted. Without this a back-to-back chain of five completed
+    // speculative slots could defer a demand miss for ~15 cycles.
+    val installDeferMax = 4
+    val installDeferCnt = Reg(UInt(3 bits)) init 0
+    installDeferCnt.simPublic()
+    val installStarves  = installDeferCnt >= U(installDeferMax, 3 bits)
+    // `&& !predActive` (implementation correction over the literal design-spec
+    // snippet, same file, same interface): `pfInstallVec`/`pfInstallAny` read
+    // `pfValid`/`pfComplete`, which only clear at the FSM edge that ends PF_PRED
+    // (`commitBeat === 1`). A bare `RegNext(pfInstallAny && !installStarves)` samples
+    // `pfInstallAny` COMBINATIONALLY on that very same last PF_PRED cycle -- one
+    // cycle BEFORE the clear takes effect -- so it latches "true" one cycle too late
+    // and re-arms IDLE for a phantom second install of an already-freed slot the
+    // instant control returns to IDLE (proven live: `installDeferCnt` free-runs
+    // through TWO back-to-back PF_PRED dwells for a single completed slot and trips
+    // this very oracle at count 6, see task-4-report.md evidence trace). Gating the
+    // register's input with `!predActive` (true for both PREDECODE and PF_PRED)
+    // stops it from latching off that stale, about-to-be-cleared reading; the
+    // earliest a fresh arm can now form is the FIRST genuinely idle cycle after
+    // control returns to IDLE, which is exactly the 1-cycle RegNext latency the
+    // interface contract (`pfInstallArm` = "a register") already implies.
+    val pfInstallArm    = RegNext(pfInstallAny && !installStarves && !predActive) init False
+    pfInstallArm.simPublic()
+
+    // H9 counter update (implementation correction over the literal design-spec
+    // snippet, same file, same interface): gating purely on `heldDemandMiss` over-
+    // counts. `heldDemandMiss` is also true for the PRE-EXISTING, unrelated,
+    // legitimately-unbounded hold documented at its own definition above ("An
+    // architectural miss can remain visibly held while a speculative owner or the
+    // shared installer drains") -- e.g. waiting on a same-set fill that is still
+    // AR_PENDING/R0/R1 (`pfLookupSetBusy`, no install anywhere near armed yet), which
+    // can legitimately run for the line's full AXI service time. Counting THAT
+    // toward H9's bound trips the oracle below on pre-existing, correct traffic
+    // (proven live: `IcachePrefetchSpec`'s "AR-pending demotion" and "silent refill
+    // error" tests, which deliberately hold a demand behind a still-in-flight
+    // silent fill for far longer than `installDeferMax`, both trip it). H9 is
+    // specifically about yielding to an ARMED (or actively installing) slot, so the
+    // counter must count only that: `pfInstallArm` covers the IDLE arm-decision
+    // cycle, `predActive` covers the two PF_PRED cycles that follow it (during which
+    // `pfInstallArm` itself is masked low by the `!predActive` guard above).
+    when(heldDemandMiss && (pfInstallArm || predActive)) {
+      when(installDeferCnt =/= U(7, 3 bits)) { installDeferCnt := installDeferCnt + 1 }
+    } otherwise {
+      installDeferCnt := 0
+    }
+
+    // Design spec section 12.1 oracle 4: a demand miss held by an armed install must
+    // be admitted within the bounded wait. Simulation-only; `GenerationFlags.simulation`
+    // is the house pattern for keeping an assert out of the synthesised netlist.
+    GenerationFlags.simulation {
+      assert(installDeferCnt <= U(installDeferMax + 1, 3 bits),
+        "H9 bounded-wait violated: a demand miss was deferred behind installs for too long")
+    }
+
     def seedPfWindow(): Unit = {
       val line = lookupPaddr & ~U(63, 32 bits)
       val pageEnd = (lookupPaddr(31 downto 12) ## U(0xfff, 12 bits)).asUInt & ~U(63, 32 bits)
@@ -655,7 +722,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // During a prefetch fill, only an answerable hit/fault may fire; a miss remains
         // held at the Stream boundary until the shared fill engine becomes free.
         val answerable = if (canStartFill)
-          (lookupFault || isHit || !pfLookupSetBusy)
+          (lookupFault || isHit || (!pfInstallArm && !pfLookupSetBusy))
         else
           (lookupFault || isHit)
         cmdPort.ready := xlate.rsp.ready && !setBlocked && answerable
@@ -718,9 +785,11 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
       IDLE.whenIsActive {
         lookupTick(canStartFill = true)
-        // Demand allocation wins. Otherwise a completed silent line is registered
-        // into the shared installer; the wide LUTRAM read terminates at `lineReg`.
-        when(pfInstallAny && !demandFillStart) {
+        // Slice 1a: `pfInstallArm` is a register, so `lineReg`'s capture enable and
+        // `pfInstallIdx`'s 518-fanout select are reached from a flop. `answerable`
+        // above guarantees no demand miss can be captured in the same cycle, so the
+        // old `&& !demandFillStart` live veto is not merely redundant - it is gone.
+        when(pfInstallArm) {
           pfInstallIdx := pfInstallSel
           lineReg := pfLineHi.readAsync(pfInstallSel) ## pfLineLo.readAsync(pfInstallSel)
           missPC        := pfPa(pfInstallSel)
