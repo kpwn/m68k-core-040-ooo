@@ -1540,7 +1540,7 @@ ladder plus the endpoint-group-free control ladder), `synth/probe_specsize3.tcl`
 
 ## 18. Floorplan A/B: every floorplan variant regressed — but post-route physical optimisation is worth +18.95 MHz (Claude, 2026-08-10)
 
-**Fourteen full post-route runs from the identical `6b246de` post-synthesis
+**Sixteen full post-route runs from the identical `6b246de` post-synthesis
 checkpoint.  Result in one line: no floorplan change lands — all seven floorplan
 variants regressed, including both of the two boundaries this pass was dispatched
 to attack — but iterated post-route physical optimisation takes the branch from
@@ -1556,7 +1556,7 @@ Sections 15-17 each retired one *logic* family.  This section retires the
 
 ### Step 0: method and controls
 
-All fourteen routes re-place and re-route the identical post-synthesis checkpoint
+All sixteen routes re-place and re-route the identical post-synthesis checkpoint
 `synth/archive/6b246de_ftb_framing_retime_decode/fullcore_synth.dcp`
 (`REUSE_SYNTH_DCP=1`, generated-netlist MD5
 `d80f6218c5c7dcab94a33a52d64244fa`).  **Every run reported the same
