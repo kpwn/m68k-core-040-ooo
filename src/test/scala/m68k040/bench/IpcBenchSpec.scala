@@ -19,7 +19,6 @@ import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.bus.amba4.axi.Axi4ReadOnly
-import spinal.lib.bus.amba4.axi.sim.{Axi4ReadOnlySlaveAgent, SparseMemory}
 import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
 import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
@@ -307,8 +306,7 @@ class IpcBenchSpec extends AnyFunSuite {
     * mirrors ExecuteLockStepSpec.attachProgram). */
   // -- Memory-system model (env-selectable) ------------------------------------
   // IPC_MEM unset (or "zero"): zero-latency memory -- the historical default, and
-  //   byte-for-byte the previous behaviour (BehavioralMemAgent IS attachFull with a
-  //   default AxiMemModelConfig, and the I-side keeps the stock agent).
+  //   both I-side and D-side use the shared AxiMemModel with its default config.
   // IPC_MEM=l2 : the L2-faithful two-tier model (m68k040.sim.AxiMemModel), 5-cycle
   //   L2 hit / 70-cycle DDR by default; IPC_MEM=l2:<hit>:<dram> overrides. Applied
   //   to BOTH the D-side and the I-side (an I-fetch refill is the dominant memory
@@ -328,22 +326,7 @@ class IpcBenchSpec extends AnyFunSuite {
     else s"L2-faithful: L2 hit=${memCfg.latency.hitCycles}cyc, DDR=${memCfg.latency.dramCycles}cyc, 64B line"
 
   def attachProgram(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long, bytes: Vector[Int]): Unit = {
-    if (memCfg.latency.enabled) {
-      val lm = spinal.lib.sim.SparseMemory()
-      AxiMemModel.loadProgramIFetch(lm, loadAddr, bytes)
-      AxiMemModel.attachReadOnly(axi, cd, memCfg, lm)
-      return
-    }
-    val mem = SparseMemory()
-    val nWords = bytes.length / 2
-    for (i <- 0 until nWords) {
-      val w = ((bytes(2 * i) & 0xff) << 8) | (bytes(2 * i + 1) & 0xff)
-      mem.write(loadAddr + 2 * i,     (w & 0xff).toByte)
-      mem.write(loadAddr + 2 * i + 1, ((w >> 8) & 0xff).toByte)
-    }
-    new Axi4ReadOnlySlaveAgent(axi, cd) {
-      override def readByte(address: BigInt, id: Int): Byte = mem.read(address.toLong)
-    }
+    AxiMemModel.attachProgramIFetch(axi, cd, loadAddr, bytes, cfg = memCfg)
   }
 
   // ── per-kernel measurement result ───────────────────────────────────────────

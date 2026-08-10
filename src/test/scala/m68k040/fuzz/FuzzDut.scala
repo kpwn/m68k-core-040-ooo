@@ -16,18 +16,16 @@ import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.bus.amba4.axi.Axi4ReadOnly
-import spinal.lib.bus.amba4.axi.sim.{Axi4ReadOnlySlaveAgent, SparseMemory}
 import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
 import spinal.lib.misc.database.Database
 
 /** Full-core DUT + backend wiring for the FUZZ lock-step harness.
   *
-  * DELIBERATE DUPLICATION of `lockstep.ExecuteLockStepSpec.{BackendWiringPlugin,
-  * FullCoreDut, attachProgram}`: the shared file is under active edit in a
-  * parallel worktree and a refactor there guarantees a merge conflict. The copy
-  * is verbatim (see the original for the full commentary). CONSOLIDATION TODO:
-  * once the parallel work lands, hoist ONE wiring plugin + DUT into a shared
-  * test-support file and point both specs at it. */
+  * The DUT/wiring shape deliberately mirrors
+  * `lockstep.ExecuteLockStepSpec.{BackendWiringPlugin, FullCoreDut}`. The program
+  * memory is not duplicated: both harnesses route through
+  * `AxiMemModel.attachProgramIFetch`. A later DUT-fixture refactor can hoist the
+  * remaining wiring without changing the AXI model. */
 class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin,
                        lsEu: LsEuPlugin, divEu: DivEuPlugin) extends FiberPlugin {
   var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
@@ -291,42 +289,23 @@ class FuzzCoreDut extends Component {
 }
 
 object FuzzDut {
-  /** Behavioral AXI read-only memory holding the program image (byte-swap
-    * convention duplicated from ExecuteLockStepSpec.attachProgram). */
-  def attachProgram(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long, bytes: Vector[Int]): Axi4ReadOnlySlaveAgent = {
-    val mem = SparseMemory()
-    val nWords = bytes.length / 2
-    for (i <- 0 until nWords) {
-      val w = ((bytes(2 * i) & 0xff) << 8) | (bytes(2 * i + 1) & 0xff)
-      mem.write(loadAddr + 2 * i,     (w & 0xff).toByte)
-      mem.write(loadAddr + 2 * i + 1, ((w >> 8) & 0xff).toByte)
-    }
-    new Axi4ReadOnlySlaveAgent(axi, cd) {
-      override def readByte(address: BigInt, id: Int): Byte = mem.read(address.toLong)
-    }
-  }
+  /** Behavioral AXI read-only memory holding the program image. The centralized
+    * helper owns the I-side byte-swap convention. */
+  def attachProgram(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long,
+                    bytes: Vector[Int]): m68k040.sim.AxiMemModel =
+    m68k040.sim.AxiMemModel.attachProgramIFetch(axi, cd, loadAddr, bytes)
 
   /** Task #211: like `attachProgram`, but the read agent injects a genuine AXI
     * DECERR (task #189's `BehavioralMem.decoded`/`injectBusErrors` model) for an
     * address outside the decoded range, instead of silently serving a zero-filled
     * OKAY read. Needed so an instruction fetch to genuinely-unmapped space (e.g.
     * exc_ifetch_bus_error.s's 0xAAAA0000 target) can exercise IcachePlugin's
-    * REFILL resp-check at all — the stock `Axi4ReadOnlySlaveAgent` used by
-    * `attachProgram` has no per-access response-code hook (see
-    * `BehavioralMemAgent`'s doc comment), so this uses the new
-    * `Axi4ReadOnlyBehavioralAgent` instead. The memory-population convention
-    * (per-16-bit-word byte order) is BYTE-IDENTICAL to `attachProgram`'s above —
-    * every existing passing fetch test is unaffected; only the resp field changes
-    * for a genuinely undecoded address. */
+    * REFILL resp-check at all. The memory-population convention is shared with
+    * `attachProgram`; only the response code changes for a genuinely undecoded
+    * address. */
   def attachProgramWithBusErrors(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long,
-                                  bytes: Vector[Int]): m68k040.ls.Axi4ReadOnlyBehavioralAgent = {
-    val agent = new m68k040.ls.Axi4ReadOnlyBehavioralAgent(axi, cd, injectBusErrors = true)
-    val nWords = bytes.length / 2
-    for (i <- 0 until nWords) {
-      val w = ((bytes(2 * i) & 0xff) << 8) | (bytes(2 * i + 1) & 0xff)
-      agent.mem.write(loadAddr + 2 * i,     (w & 0xff).toByte)
-      agent.mem.write(loadAddr + 2 * i + 1, ((w >> 8) & 0xff).toByte)
-    }
-    agent
-  }
+                                  bytes: Vector[Int]): m68k040.sim.AxiMemModel =
+    m68k040.sim.AxiMemModel.attachProgramIFetch(
+      axi, cd, loadAddr, bytes,
+      cfg = m68k040.sim.AxiMemModelConfig(injectBusErrors = true))
 }

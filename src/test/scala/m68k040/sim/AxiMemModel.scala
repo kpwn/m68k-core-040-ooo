@@ -668,10 +668,9 @@ object AxiMemModel {
   // the one it uses. Documented at `PortedTestRunner.scala:109-115`.
   //
   //  - I-SIDE (instruction fetch): each 16-bit big-endian opword is stored
-  //    LOW-BYTE-FIRST, i.e. BYTE-SWAPPED per word relative to the raw image. Every
-  //    existing `attachProgram` clone (`ExecuteLockStepSpec.scala:379-395`,
-  //    `FuzzDut.scala:283-294`, `IpcBenchSpec.scala:289-300`) and
-  //    `IcacheSim.attachMemoryWithWords` uses this.
+  //    LOW-BYTE-FIRST, i.e. BYTE-SWAPPED per word relative to the raw image.
+  //    `attachProgramIFetch` is the single full-core loader;
+  //    `IcacheSim.attachMemoryWithWords` uses the same convention for raw words.
   //  - D-SIDE (data): PLAIN byte-at-address, no swap. `BehavioralMemAgent` and every
   //    store/load ported test use this.
   //
@@ -682,12 +681,44 @@ object AxiMemModel {
 
   /** I-side convention: byte-swapped per 16-bit word. */
   def loadProgramIFetch(mem: SparseMemory, loadAddr: Long, bytes: Vector[Int]): Unit = {
+    require((bytes.length & 1) == 0,
+      s"instruction image must contain whole 16-bit words (got ${bytes.length} bytes)")
     val nWords = bytes.length / 2
     for (i <- 0 until nWords) {
       val w = ((bytes(2 * i) & 0xff) << 8) | (bytes(2 * i + 1) & 0xff)   // big-endian word
       mem.write(loadAddr + 2 * i,     (w & 0xff).toByte)
       mem.write(loadAddr + 2 * i + 1, ((w >> 8) & 0xff).toByte)
     }
+  }
+
+  /** `BRA.S -2`, used as a side-effect-free fence after finite lock-step images.
+    * SparseMemory's unwritten bytes are PRNG-filled, so allowing the front end to
+    * run past a compared program can otherwise execute random stores. */
+  val RunAheadGuardOpword = 0x60fe
+  val LockStepRunAheadGuardWords = 2048
+
+  /** Append `words` of the run-ahead fence using the I-side byte convention. */
+  def fillIFetchRunAheadGuard(mem: SparseMemory, endAddr: Long, words: Int): Unit = {
+    require(words >= 0, s"run-ahead guard length must be non-negative (got $words)")
+    for (i <- 0 until words) {
+      mem.write(endAddr + 2L * i,     (RunAheadGuardOpword & 0xff).toByte)
+      mem.write(endAddr + 2L * i + 1, ((RunAheadGuardOpword >> 8) & 0xff).toByte)
+    }
+  }
+
+  /** Attach one instruction-fetch memory model and populate its image through the
+    * single I-side loader. `runAheadGuardWords` is explicit because finite lock-step
+    * programs need the guard, while open-ended fuzz/ported images deliberately keep
+    * their existing beyond-image memory behavior. */
+  def attachProgramIFetch(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long,
+                          bytes: Vector[Int],
+                          cfg: AxiMemModelConfig = AxiMemModelConfig(),
+                          sharedMem: SparseMemory = null,
+                          runAheadGuardWords: Int = 0): AxiMemModel = {
+    val mem = if (sharedMem != null) sharedMem else SparseMemory()
+    loadProgramIFetch(mem, loadAddr, bytes)
+    fillIFetchRunAheadGuard(mem, loadAddr + bytes.length, runAheadGuardWords)
+    attachReadOnly(axi, cd, cfg, mem)
   }
 
   /** D-side convention: plain byte-at-address, no swap. */

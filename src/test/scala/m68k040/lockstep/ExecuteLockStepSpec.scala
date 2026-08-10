@@ -17,7 +17,7 @@ import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.bus.amba4.axi.Axi4ReadOnly
-import spinal.lib.bus.amba4.axi.sim.{Axi4ReadOnlySlaveAgent, SparseMemory}
+import spinal.lib.sim.SparseMemory
 import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
 import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
@@ -394,26 +394,6 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       rfInt, rfNzvc, rfX, wire)) }
   }
 
-  /** Words of `BRA.S -2` written past every I-side program image. 2048 words = 4 KiB,
-    * the size validated by the sentinel-confirmation experiment. Sized generously
-    * because the guard only has to outlast the run-ahead distance the front end can
-    * reach inside a test's drain window, and unwritten `SparseMemory` bytes are the
-    * thing being displaced — there is no cost to over-covering. */
-  val RUNAHEAD_GUARD_WORDS = 2048
-  /** `BRA.S -2` — an unconditional branch to itself. See `attachProgram`'s comment for
-    * why this specific opword and not an ILLEGAL trap. */
-  val RUNAHEAD_GUARD_OPWORD = 0x60fe
-
-  /** Fill `RUNAHEAD_GUARD_WORDS` of self-branch past `endAddr`, in the same
-    * low-byte-first convention the I-cache window expects. */
-  def fillRunAheadGuard(mem: SparseMemory, endAddr: Long): Unit = {
-    val w = RUNAHEAD_GUARD_OPWORD
-    for (i <- 0 until RUNAHEAD_GUARD_WORDS) {
-      mem.write(endAddr + 2L * i,     (w & 0xff).toByte)
-      mem.write(endAddr + 2L * i + 1, ((w >> 8) & 0xff).toByte)
-    }
-  }
-
   /** Attach a behavioral AXI read-only memory backed by the assembled program.
     *
     * The assembled `image.bytes` are the m68k big-endian byte stream: instruction
@@ -457,23 +437,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     * alignment inside the guard still decodes to the same self-branch, so there is no
     * sub-word framing with a different effect.
     *
-    * Confirmed decisive: 4 independent full-suite runs + 3 targeted repro loops with
-    * ZERO occurrences of the previously-recurring extra-failure family (BF*-mem,
-    * CAS/CAS2, ABCD/SBCD-mem, MOVES, cross-line MOVE.L). */
-  def attachProgram(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long, bytes: Vector[Int]): Axi4ReadOnlySlaveAgent = {
-    val mem = SparseMemory()
-    // Reassemble 16-bit big-endian words from the image, then store low-byte-first.
-    val nWords = bytes.length / 2
-    for (i <- 0 until nWords) {
-      val w = ((bytes(2 * i) & 0xff) << 8) | (bytes(2 * i + 1) & 0xff) // big-endian word
-      mem.write(loadAddr + 2 * i,     (w & 0xff).toByte)
-      mem.write(loadAddr + 2 * i + 1, ((w >> 8) & 0xff).toByte)
-    }
-    fillRunAheadGuard(mem, loadAddr + 2L * nWords)
-    new Axi4ReadOnlySlaveAgent(axi, cd) {
-      override def readByte(address: BigInt, id: Int): Byte = mem.read(address.toLong)
-    }
-  }
+    * `LockStepRunAheadGuardWords` contributes 2048 words = 4 KiB, sized generously
+    * to outlast the front-end run-ahead distance inside the drain window. The latest
+    * centralized-model suite completed 390/394 with exactly the four known baseline
+    * failures; its six newly exposed LSU failures were real regressions and were fixed,
+    * rather than weakened or hidden in this harness. */
+  def attachProgram(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long,
+                    bytes: Vector[Int]): m68k040.sim.AxiMemModel =
+    m68k040.sim.AxiMemModel.attachProgramIFetch(
+      axi, cd, loadAddr, bytes,
+      runAheadGuardWords = m68k040.sim.AxiMemModel.LockStepRunAheadGuardWords)
 
   /** Run one program through the full core and lock-step it.
     *
@@ -5369,16 +5342,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   /** Place a code image at an ARBITRARY base in an I-cache SparseMemory (low-byte
     * first, matching the I-cache window convention — same swap as attachProgram). */
   private def writeCodeAt(mem: SparseMemory, base: Long, bytes: Vector[Int]): Unit = {
-    val nWords = bytes.length / 2
-    for (i <- 0 until nWords) {
-      val w = ((bytes(2 * i) & 0xff) << 8) | (bytes(2 * i + 1) & 0xff)
-      mem.write(base + 2 * i,     (w & 0xff).toByte)
-      mem.write(base + 2 * i + 1, ((w >> 8) & 0xff).toByte)
-    }
+    m68k040.sim.AxiMemModel.loadProgramIFetch(mem, base, bytes)
     // Same run-ahead guard as `attachProgram` — see its comment. The ITLB lock-step
     // tests build their `icmem` through this helper instead, so without it they keep
     // the un-guarded PRNG-fill behaviour.
-    fillRunAheadGuard(mem, base + 2L * nWords)
+    m68k040.sim.AxiMemModel.fillIFetchRunAheadGuard(
+      mem, base + bytes.length, m68k040.sim.AxiMemModel.LockStepRunAheadGuardWords)
   }
   /** Wire the full whitebox commit capture (incl. the exception commit channel) used
     * by the ITLB lock-step tests. */
@@ -5441,9 +5410,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // I-cache memory: code lives at the PA (0x50000000), NOT the VA.
       val icmem = SparseMemory()
       writeCodeAt(icmem, codePA, image.bytes)
-      new Axi4ReadOnlySlaveAgent(dut.icache.logic.axi, cd) {
-        override def readByte(address: BigInt, id: Int): Byte = icmem.read(address.toLong)
-      }
+      m68k040.sim.AxiMemModel.attachReadOnly(
+        dut.icache.logic.axi, cd, sharedMem = icmem)
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
       // Page table (in both walker memories): map VA loadAddr -> PPN 0x50000 (resident).
       val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
@@ -5549,9 +5517,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // pages; the far page is at PA loadAddr+0x2000 once mapped identity).
       val icmem = SparseMemory()
       writeCodeAt(icmem, loadAddr, image.bytes)
-      new Axi4ReadOnlySlaveAgent(dut.icache.logic.axi, cd) {
-        override def readByte(address: BigInt, id: Int): Byte = icmem.read(address.toLong)
-      }
+      m68k040.sim.AxiMemModel.attachReadOnly(
+        dut.icache.logic.axi, cd, sharedMem = icmem)
       // D-cache + walker memories share one backing store (the handler's PT write must
       // be visible to the ITLB re-walk).
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
@@ -5676,9 +5643,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
       val icmem = SparseMemory()
       writeCodeAt(icmem, loadAddr, image.bytes)
-      new Axi4ReadOnlySlaveAgent(dut.icache.logic.axi, cd) {
-        override def readByte(address: BigInt, id: Int): Byte = icmem.read(address.toLong)
-      }
+      m68k040.sim.AxiMemModel.attachReadOnly(
+        dut.icache.logic.axi, cd, sharedMem = icmem)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
       val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
       val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)

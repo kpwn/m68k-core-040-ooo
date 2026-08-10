@@ -280,30 +280,28 @@ trait `DcacheTypes.scala:49-60` exposes only `loadCmd/loadRsp/loadBusy/store/sto
 
 ### 1.6 The simulation memory model
 
-`src/test/scala/m68k040/ls/BehavioralMem.scala` (307 lines), `DATA_BITS = 128`:
+**As-built update (2026-08-10): V1.6 is consolidated.** The general-purpose model is
+`src/test/scala/m68k040/sim/AxiMemModel.scala`, with one `AxiReadEngine`, one
+`AxiWriteEngine`, the always-on protocol checker, selectable legal/chaos response ordering,
+and the zero/L2/crossbar latency and capacity controls specified later in this document.
+`BehavioralMemAgent` and `Axi4ReadOnlyBehavioralAgent` are constructor-compatible shims over
+that model; they contain no second AXI implementation.
 
-- **Read path: a single, global, in-order response FIFO** — `rQueue` declared at `:97` (and a
-  duplicate at `:275` in `Axi4ReadOnlyBehavioralAgent`). The rationale comment at `:86-88` is
-  explicit: "…into **a single in-order queue** (this DUT's cache/walker masters are
-  single-outstanding in practice; **no per-id reordering is needed**)". `arMonitor` (`:99-120`)
-  expands each accepted AR eagerly into `len+1` closures; `rDriver` (`:122-124`) dequeues
-  strictly FIFO, i.e. **global order across all IDs**. `resp` and `last` are frozen at AR-accept
-  time (`:116-117`); only the data is read lazily at drive time (`:115`).
-- **Write path is already per-ID**: `bQueue = Array.fill(1 << idWidth)(Queue)` (`:155-156`),
-  and `bDriver` (`:222-229`) already picks a **random non-empty per-ID queue** each time
-  (`:225`) — i.e. cross-ID B reordering is already modelled and is a no-op today only because
-  every write uses one ID. Write bytes are applied to memory strictly before B is driven
-  (`:127-148`, `:181-203`) — a deliberate invariant that a deferred-apply model would break.
-- **There is no latency model whatsoever.** No cycle counter exists in the file. Jitter comes
-  only from `StreamDriver`/`StreamReadyRandomizer`. The only capacity knobs are
-  `rQueue.size < 8` (`:125`, `:303`) and `qPending < bQueueDepth = 4` (`:158`, `:233-234`).
-- **Three distinct memory-model implementations across six files**, plus three inline agents:
-  `BehavioralMemAgent` (`:72`, ~60 instantiation sites), `Axi4ReadOnlyBehavioralAgent` (`:260`,
-  an acknowledged copy per `:250-259`), and the stock `Axi4ReadOnlySlaveAgent` used by **four
-  duplicated `attachProgram` clones** — `ExecuteLockStepSpec.scala:379-395` (+ inline agents at
-  `:5348`, `:5455`, `:5581`), `FuzzDut.scala:283-294` (flagged as deliberate duplication at
-  `:23-30`), `IpcBenchSpec.scala:289-300`, `IcacheSim.scala:20-56`. The stock agent has no
-  per-access response hook (always OKAY), which is why the custom read-only agent exists.
+All full-core instruction images use `AxiMemModel.attachProgramIFetch`; focused I-cache
+fixtures use the same read engine with an explicit `SparseMemory`. The loader is the sole
+owner of the I-side low-byte-first-per-opword convention. The D side deliberately remains
+plain byte-at-address: these are two architectural views of the same big-endian program
+image, not interchangeable layouts. Finite lock-step images request a 4 KiB `BRA.S -2`
+run-ahead guard so speculative fetch cannot execute `SparseMemory`'s PRNG-filled bytes;
+open-ended fuzz/ported images retain their explicitly selected beyond-image behavior.
+The consolidated model deliberately exposed six deterministic LSU failures (memory-source
+ADDA/SUBA/CMPA and dynamic-memory bit-field cases); the snapshot-coherency and MOVE-flag
+RTL bugs were fixed, and the full lock-step result returned to the exact four-failure
+historical baseline. No response-ordering exception was added to make the test pass.
+
+Purpose-built fault responders may still exist where a test needs a response shape the
+general address-based error model cannot express (for example one bad beat inside an I-cache
+line burst). They are narrow fault injectors, not alternate general memory models.
 
 ### 1.7 There is no benchmark that measures a cache miss
 

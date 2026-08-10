@@ -186,7 +186,7 @@ object PortedTestRunner {
       // Also seed the D-SIDE view of the program image (ported-tests triage, cluster 2
       // / PC-relative indexed): `FuzzDut.attachProgram` above writes the I-cache's own
       // private SparseMemory with a per-16-bit-word BYTE-SWAPPED layout (its own
-      // established, Axi4ReadOnlySlaveAgent-specific convention -- NOT a plain
+      // established instruction-fetch convention -- NOT a plain
       // byte-at-address mapping; do not "fix" it, every existing instruction-fetch test
       // depends on it exactly as-is). The D-cache's `BehavioralMemAgent` (`dmem`) is a
       // SEPARATE SparseMemory (0xFF-filled, see above) using the ordinary plain

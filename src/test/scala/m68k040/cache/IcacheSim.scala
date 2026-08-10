@@ -3,7 +3,8 @@ package m68k040.cache
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib.bus.amba4.axi.Axi4ReadOnly
-import spinal.lib.bus.amba4.axi.sim.{Axi4ReadOnlySlaveAgent, SparseMemory}
+import spinal.lib.sim.SparseMemory
+import m68k040.sim.{AxiMemModel, AxiMemModelConfig}
 
 object IcacheSim {
   /** Deterministic byte at a given address: byte = (addr * 7 + 0x11) & 0xff.
@@ -17,30 +18,24 @@ object IcacheSim {
       acc | (BigInt(memByte(base + i)) << (8 * i))
     }
 
-  /** Attach an Axi4ReadOnlySlaveAgent backed by a SparseMemory preloaded so
-    * reads return memByte(addr).  Returns the started agent.
+  /** Attach the shared AXI memory model backed by a SparseMemory preloaded so
+    * reads return memByte(addr). Returns the started model.
     * Preloads `size` bytes from `base`.
     *
-    * Note: AxiMemorySim (1.14.1) requires a full Axi4 (read+write) bus and
-    * cannot be constructed directly from an Axi4ReadOnly port.
-    * Axi4ReadOnlySlaveAgent accepts Axi4ReadOnly directly and exposes a
-    * readByte override point, which we use to serve from the preloaded
-    * SparseMemory image.
+    * The shared model accepts Axi4ReadOnly directly and uses the same protocol
+    * checker and response discipline as the full-core harnesses.
     */
   def attachMemory(
       axi: Axi4ReadOnly,
       cd: ClockDomain,
       base: Long,
       size: Int
-  ): Axi4ReadOnlySlaveAgent = {
+  ): AxiMemModel = {
     val mem = SparseMemory()
     val img = Array.tabulate(size)(i => memByte(base + i).toByte)
-    mem.writeArray(base, img)
+    img.indices.foreach(i => mem.write(base + i, img(i)))
 
-    new Axi4ReadOnlySlaveAgent(axi, cd) {
-      override def readByte(address: BigInt, id: Int): Byte =
-        mem.read(address.toLong)
-    }
+    AxiMemModel.attachReadOnly(axi, cd, AxiMemModelConfig(), sharedMem = mem)
   }
 
   /** Same as `attachMemory`, but also returns the backing `SparseMemory` so a test
@@ -54,27 +49,23 @@ object IcacheSim {
       cd: ClockDomain,
       base: Long,
       size: Int
-  ): (Axi4ReadOnlySlaveAgent, SparseMemory) = {
+  ): (AxiMemModel, SparseMemory) = {
     val mem = SparseMemory()
     val img = Array.tabulate(size)(i => memByte(base + i).toByte)
-    mem.writeArray(base, img)
+    img.indices.foreach(i => mem.write(base + i, img(i)))
 
-    val agent = new Axi4ReadOnlySlaveAgent(axi, cd) {
-      override def readByte(address: BigInt, id: Int): Byte =
-        mem.read(address.toLong)
-    }
+    val agent = AxiMemModel.attachReadOnly(axi, cd, AxiMemModelConfig(), sharedMem = mem)
     (agent, mem)
   }
 
-  def attachMemoryWithWords(axi: Axi4ReadOnly, cd: ClockDomain, base: Long, words: Seq[Int]): Axi4ReadOnlySlaveAgent = {
+  def attachMemoryWithWords(axi: Axi4ReadOnly, cd: ClockDomain, base: Long,
+                            words: Seq[Int]): AxiMemModel = {
     val mem = SparseMemory()
     words.zipWithIndex.foreach { case (w, i) =>
       mem.write(base + 2*i,     (w & 0xff).toByte)
       mem.write(base + 2*i + 1, ((w >> 8) & 0xff).toByte)
     }
-    new Axi4ReadOnlySlaveAgent(axi, cd) {
-      override def readByte(address: BigInt, id: Int): Byte = mem.read(address.toLong)
-    }
+    AxiMemModel.attachReadOnly(axi, cd, AxiMemModelConfig(), sharedMem = mem)
   }
 }
 
@@ -82,9 +73,8 @@ object IcacheSim {
   * fault an EXPLICIT beat index of an EXPLICIT upcoming line-refill, independent of
   * address. Neither existing memory model can do this:
   *
-  *  - `attachMemory`/`attachMemoryMutable` (`Axi4ReadOnlySlaveAgent`, above) has no
-  *    resp-injection hook at all (`readByte` only supplies data; the resp is always
-  *    OKAY).
+  *  - `attachMemory`/`attachMemoryMutable` (`AxiMemModel`, above) has no explicit
+  *    per-beat response-injection hook; its normal mapped reads are always OKAY.
   *  - `AxiMemModel`'s `injectBusErrors` decides bad-vs-good purely from
   *    `AxiMemModel.decoded(addr)`. Every decode boundary in that map is 64 KiB or
   *    256 MiB, and BOTH are exact multiples of the 64-byte I-cache line size — so a
