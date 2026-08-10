@@ -2886,3 +2886,72 @@ check.  On-disk `generated/M68kFullCoreSynth.v` was restored bit-for-bit to
   only by their intended RTL edit, with no lottery noise underneath.
 - **Section 20's conclusion is unchanged and now has no cheap alternative left in
   front of it.**  The next work is genuine architectural pipelining.
+
+## 22. The first architectural-pipelining design is written: FetchAlign -> I-cache, one new stage, II=1 preserved (Claude, 2026-08-10)
+
+**Design only.  No RTL, no synth.**  Section 20 step 6 closed the cut-based
+campaign and named three arcs that need real pipelining, in measured priority
+order.  Arc 1 -- `FetchAlign -> IcachePlugin`, 2,628 sub-(-1.000 ns) startpoints
+and 2,427 endpoints, including the ITLB hit-way cone that alone retires 53.5 % of
+the 4,890-endpoint deficit population -- now has a full design:
+
+**`docs/superpowers/specs/2026-08-10-ipc-fetchalign-icache-pipeline-design.md`**
+
+Grounded in live RTL reads (`FetchAlignPlugin.scala`, `IcachePlugin.scala`,
+`Tlb.scala`, `ItlbPlugin.scala`, `ExceptionUnit.scala`) plus the archived
+`6b246de_default_postrouteN3_decode` routed evidence in sections 19-21.
+
+**What it proposes.**  Exactly one new architectural stage in the I-cache demand
+path, placed at the *measured* midpoint of the worst frontend path -- the ITLB
+output, which section 20 step 1 showed splits 5.481 ns into 3.145 + 2.336.  The
+cache becomes `F1 (accept + translate) -> F2 (verdict + dispatch) -> S1 -> rsp`.
+F2 is today's accept cycle relocated onto a registered translation context; S1
+and rsp are untouched.  Plus a *free* slice that decouples the speculative
+prefetch/install state (`lineReg`, the fanout-518 install select, the prefetch
+window, the AR arbiter) from the live demand verdict under section 15 step 9's
+standing miss-path licence.  `RING` 3 -> 4 in FetchAlign; the FTB/gshare token
+pipeline needs **no** change (`token.ringSlot` is already 2 bits and
+`log2Up(3) == log2Up(4)`).
+
+**The II=2 risk is real and the design does not pay it.**  Section 20 step 3's
+warning is correct *for a single-cycle-accept cache*: `xlate.rsp.{ready,ppn}`
+gate `cmdPort.ready`, so a registered hit-way with today's structure forces
+fetch II=2.  The design deletes that premise -- acceptance moves to F1 and the
+verdict becomes a pipeline stage rather than a handshake term.  **II stays 1;
+the cost is +1 cycle of fetch latency** (clean-redirect first-useful-group N+4 ->
+N+5).  The VPN-stability-compare variant is evaluated and rejected as *strictly
+dominated*, and hit-way speculate-then-confirm is rejected on correctness: the
+fetch-directed BTB may speculate only because `BranchEuPlugin` independently
+verifies it, and **there is no verifier for a cache hit-way** -- a wrong way
+delivers wrong instruction bytes with no detector.
+
+**The projection is deliberately unflattering.**  The exact modelled cut is
+already measured at **+0.000 ns WNS** (section 20 step 2), because this arc is
+tied at -1.472 ns with the D-cache/IQ arc to three decimals.  Projected
+post-route for slices 1+2 alone: **-1.472 to -1.350 ns, 182.7-186.9 MHz, most
+likely ~183-185 MHz.  200 MHz is not reached by this arc.**  What it does move is
+the population metric section 20 step 4b introduced: **4,890 -> ~2,150 endpoints
+below -1.000 ns**, and ~15 % of TNS.  The spec states in advance that this metric
+has **never been validated against a real route**, and that slice 2's post-route
+gate is the first test of it -- a result worth having either way.
+
+**Acceptance is on IPC x FMax, with a break-even table.**  At the 182.749 MHz /
+0.6739-ideal-IPC baseline, slice 2 must deliver **+0.055 ns (184.60 MHz) to break
+even against a 1.0 % IPC loss**.  The projected band straddles that.  An explicit
+falsifier is written into the spec: if post-route measures < +0.050 ns *and* IPC
+costs > 1.0 %, slice 2 is reverted (or left disabled behind its elaboration
+flag), slice 1 stays because it is free, and the program re-scopes to attack the
+D-cache/IQ arc first.
+
+**The strategic point, stated plainly in the spec:** because the two arcs are
+tied, **neither alone can move WNS -- the program only pays if at least two of
+the three arcs land.**  Slice 2 is therefore specified behind an elaboration flag
+(`icacheVerdictStage`, following `enableFetchDirected`/`earlyFree`) so arc 1 and
+arc 2 can be measured *together* without a revert cycle.
+
+Six slices, three binding amendments to
+`2026-08-10-icache-parallel-vipt-design.md` (§1 cycle contract, §2 recovery taken
+in a bandwidth-preserving form, §3.2 accept-behind-a-miss reworded to
+*answer*-behind-a-miss), 13 hazards, four required in-RTL oracles and five
+mutation proofs.  ~1,100-1,300 lines across ~7 files.  **Awaiting explicit
+go-ahead before any implementation.**
