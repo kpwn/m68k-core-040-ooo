@@ -2,10 +2,10 @@ agent=claude-floorplan-ab
 task=DONE — exact-DCP floorplan A/B (handoff section 18)
 reserved_at=2026-08-10T19:35:00+02:00
 released_at=2026-08-10T21:40:00+02:00
-head=3afb3a7 (+ the default flip + section 18 commit)
+head=see git log; landed default = FLOORPLAN_MODE decode + IMPL_STRATEGY postrouteN (POSTROUTE_ROUNDS 3)
 rtl=UNCHANGED, 6b246de remains the head RTL checkpoint
 netlist_md5=d80f6218c5c7dcab94a33a52d64244fa
-NEW_BASELINE=FLOORPLAN_MODE=decode + IMPL_STRATEGY=postrouteN (POSTROUTE_ROUNDS=3) = -1.472ns / 182.549MHz
+NEW_BASELINE=FLOORPLAN_MODE=decode + IMPL_STRATEGY=postrouteN (POSTROUTE_ROUNDS=3) = -1.472ns / 182.749MHz
              6-round plateau -1.463 / 183.050; archived at synth/archive/6b246de_postrouteN6_decode/
 OLD_BASELINE=-2.094 / 164.096 is still exact under IMPL_STRATEGY=default
 result=NO floorplan change landed. 7 floorplan variants, 7 regressions, across BOTH dispatched boundaries.
@@ -16,3 +16,10 @@ pb_dcache=over-capture root-caused (StoreQueue SUBMODULE instance LsEuPlugin_log
 tests=make test-fast GREEN 149/149, 157 suites
 next=re-run synth/probe_slack_ladder.tcl against the NEW routed DCP (different placement => re-price everything);
      finish the IMPL_STRATEGY sweep; do NOT try another pblock geometry.
+gate=landed default re-run end-to-end with NO env overrides: -1.472 / 182.749 MHz, TNS -17499.508,
+     32408 failing endpoints, WHS +0.020, WPWS +1.458, 110679 LUT / 50389 FF / 26 BRAM / 4 DSP,
+     pb_decode 67.91% (identical to baseline), no congestion above level 5.
+     Archived synth/archive/6b246de_default_postrouteN3_decode/
+control=IMPL_STRATEGY=default on the same script reproduces -2.094 EXACTLY (history regenerates unchanged)
+forward=the landed gate's WNS path is now DcachePlugin stS2Payload_paddr[5] -> IssueQueuePlugin sbNzvc_busy[8],
+        i.e. SECTION 16's D-cache/IQ family is now BINDING. Its "worth 0.000 ns" verdict is stale -- re-measure.

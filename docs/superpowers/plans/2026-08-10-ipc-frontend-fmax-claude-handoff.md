@@ -143,7 +143,7 @@ All figures use the 4.000 ns constraint.  A negative WNS therefore gives
 > (iterated post-route `phys_opt_design` + `route_design -tns_cleanup`), which is
 > worth +18.95 MHz on the *same* netlist.  The current physical baseline is
 > therefore **`6b246de` + `FLOORPLAN_MODE=decode` + `IMPL_STRATEGY=postrouteN` =
-> -1.472 ns / 182.549 MHz at 3 rounds (-1.463 / 183.050 at the 6-round plateau)**,
+> -1.472 ns / 182.749 MHz at 3 rounds (-1.463 / 183.050 at the 6-round plateau)**,
 > not the -2.094 / 164.096 row below.  Every row here still regenerates exactly
 > under `IMPL_STRATEGY=default`; use that to compare against any of them.
 
@@ -1822,25 +1822,25 @@ comes from a single controlled experiment:
 | 0 (= the historical `default` flow) | -2.094 | 164.096 MHz | — |
 | 1 | -1.623 | 177.841 MHz | +0.471 ns |
 | 2 | -1.552 | 180.115 MHz | +0.071 ns |
-| 3 | **-1.472** | **182.549 MHz** | +0.080 ns |
-| 4 | -1.464 | 182.816 MHz | +0.008 ns |
-| 5 | -1.463 | 182.850 MHz | +0.001 ns |
-| 6 | -1.463 | 182.850 MHz | +0.000 ns |
+| 3 | **-1.472** | **182.749 MHz** | +0.080 ns |
+| 4 | -1.464 | 183.016 MHz | +0.008 ns |
+| 5 | -1.463 | 183.050 MHz | +0.001 ns |
+| 6 | -1.463 | 183.050 MHz | +0.000 ns |
 
 Round 0 reproduced `-2.094` exactly, and `postroute` was independently reproduced
 at `-1.623` three separate times (rows 11, 15, and round 1 of row 16), and
 `postroute2` at `-1.552` twice (row 14, and round 2 of row 16).  The recipe is
 deterministic.
 
-The `exploreN` curve is worse and flatter: -1.769 at round 0 (so the
+The `exploreN` curve is worse and flatter: -1.769 / 173.340 MHz at round 0 (so the
 `ExtraTimingOpt` / `AggressiveExplore` / `route -directive Explore` combination is
-worth +12.45 MHz on its own, before any post-route pass), then -1.642 at round 1
+worth +9.24 MHz on its own, before any post-route pass), then -1.642 at round 1
 and no further improvement through round 6.  It buys the best TNS/endpoint counts
 in the table (-15,517 / 30,048) but loses 5.8 MHz of WNS to plain iterated
 `postroute`, and costs +133 LUT.
 
 **Landed: `synth/impl_FullCore.tcl`'s `IMPL_STRATEGY` now defaults to
-`postrouteN` with `POSTROUTE_ROUNDS=3`, i.e. -1.472 ns / 182.549 MHz** — 0.622 ns
+`postrouteN` with `POSTROUTE_ROUNDS=3`, i.e. -1.472 ns / 182.749 MHz** — 0.622 ns
 of the 0.631 ns the plateau offers, at roughly half its wall time (the 6-round run
 took 45 minutes against about 20 for the old flow).  `POSTROUTE_ROUNDS=1` is the
 fast-gate option and still carries +13.75 MHz.  **`IMPL_STRATEGY=default`
@@ -1863,16 +1863,75 @@ fan-out, path-analysis and pblock reports).  Its top path is still
 lines_7_ways_0_triggers[9]` — the D-cache/IQ family from section 16 has surfaced
 again at the new slack level, which is a live pointer for the next pass.
 
-### Step 5: what this means for 200 MHz
+### Step 5: the landed configuration, gated end to end
+
+The default flip was then run as a real gate with **no environment overrides at
+all**, so what is measured is literally what `synth/impl_FullCore.tcl` now does:
+
+```
+FLOORPLAN_MODE decode
+IMPL_STRATEGY postrouteN            (POSTROUTE_ROUNDS defaults to 3)
+POSTROUTE_ROUND 0 WNS -2.094
+POSTROUTE_ROUND 1 WNS -1.623
+POSTROUTE_ROUND 2 WNS -1.552
+POSTROUTE_ROUND 3 WNS -1.472
+POSTROUTE_FULLCORE_WNS_NS -1.472    ACHIEVED_FMAX_MHZ 182.749
+```
+
+| Metric | incumbent (`default`) | **landed (`postrouteN`, 3 rounds)** |
+|---|---:|---:|
+| WNS / FMax | -2.094 / 164.096 MHz | **-1.472 / 182.749 MHz** |
+| TNS | -21,068.689 | **-17,499.508** |
+| TNS failing endpoints | 32,729 / 171,230 | **32,408 / 171,230** |
+| WHS / THS failing | +0.020 / 0 | +0.020 / 0 |
+| WPWS / TPWS failing | +1.458 / 0 | +1.458 / 0 |
+| CLB LUTs | 110,662 (51.01 %) | 110,679 (51.01 %) |
+| CLB Registers | 50,389 (11.61 %) | 50,389 (11.61 %) |
+| CARRY8 / BRAM / DSP | 632 / 26 / 4 | 632 / 26 / 4 |
+| `pb_decode` LUT occupancy | 29,662 / 43,680 (67.91 %) | 29,662 / 43,680 (67.91 %) |
+| Congestion | none above level 5 | none above level 5 |
+
+**+17 LUTs, zero flops, zero BRAM/DSP, identical pblock occupancy, +18.653 MHz.**
+Archived at `synth/archive/6b246de_default_postrouteN3_decode/`.  A paired control
+run with `IMPL_STRATEGY=default` on the same script reproduced **-2.094 exactly**,
+confirming that every pre-section-18 number regenerates unchanged.
+
+Two things about this gate are worth carrying forward.
+
+**The WNS family has moved off the frontend.**  The worst path is now
+
+```
+DcachePlugin_logic_stS2Payload_paddr_reg[5]/C
+   -> IssueQueuePlugin_logic_sbNzvc_busy_reg[8]/D
+   5.454 ns = logic 1.733 (31.8%) + route 3.721 (68.2%)
+```
+
+with the frontend `stalled -> IcachePlugin lineReg[418]/D` arc now *second*.  That
+is **section 16's D-cache/IQ family**, which section 16 measured at **0.000 ns** —
+but it measured it at the old slack level, on the old placement.  It is now the
+binding family.  Section 16's two specified fixes (register the IQ -> LS-EU
+issue-port ready as a 2-deep skid; retime `earlyProbeSetWriteVec` out of
+`earlyProbeHit`) were shelved as "worth 0.000 ns"; **that verdict is now stale and
+must be re-measured before either is dismissed again.**
+
+**A harness trap, fixed.**  `synth/floorplan_ab.sh` originally exported a
+hard-coded `IMPL_STRATEGY=default` for any spec without an `@<strategy>` suffix,
+which silently overrode the script's own default.  The first confirmation run
+printed `IMPL_STRATEGY default` when it should have printed `postrouteN`, which is
+how it was caught.  The runner now exports the variable only when the spec names a
+strategy.  Any future harness that wraps `impl_FullCore.tcl` must not pre-set
+`IMPL_STRATEGY` or `FLOORPLAN_MODE` to a literal default.
+
+### Step 6: what this means for 200 MHz
 
 Section 17 step 6 put the ceiling of family-cutting at 189.72 MHz after retiring
 *two hundred* startpoint families.  This section adds two facts to that picture:
 
 - **The floorplan lever is spent** (seven regressions), and
-- **the tool-recipe lever was worth +13.7 MHz on its own** and had never been
-  tried.
+- **the tool-recipe lever was worth +18.65 MHz on its own** (+18.95 at the
+  plateau) and had never been tried.
 
-At -1.472 ns (the landed 3-round default) the branch is **182.549 MHz** and needs
+At -1.472 ns (the landed 3-round default) the branch is **182.749 MHz** and needs
 +0.472 ns more to reach the 200 MHz deployment floor; the 6-round plateau is
 -1.463 ns / 183.050 MHz.  For calibration, the section-17 ladder applied to the
 *old* placement said 200 families were worth 0.823 ns; that ladder must now be
@@ -1888,20 +1947,26 @@ Remaining levers, in descending expected value:
    tried.  Untried and cheap: `-directive ExplorePostRoutePhysOpt`,
    `route_design -directive AggressiveExplore`, `phys_opt_design
    -directive ExploreWithAggressiveHoldFix`, multiple `-tns_cleanup` rounds
-   (row 14 is the first probe of that), and non-default `place_design`
-   directives paired with the winning post-route pass.  This lever has produced
-   the only positive result in three consecutive sessions.
-2. **A real pipeline stage**, justified by an IPC measurement rather than a
+   (rows 14 and 16 probe that axis and it plateaus at 3-4 rounds), and non-default
+   `place_design` directives paired with the winning post-route pass.  This lever
+   has produced the only positive result in four consecutive sessions.
+2. **Re-price section 16's D-cache/IQ fixes, which are no longer 0.000 ns.**  The
+   landed gate's WNS path is `DcachePlugin stS2Payload_paddr[5] -> IssueQueuePlugin
+   sbNzvc_busy[8]` — that family is now *binding*, where section 16 measured it as
+   0.000 ns behind a frontend limiter on the old placement.  Section 16 step 5's
+   two specified fixes should be re-measured against the new checkpoint before
+   being dismissed again.
+3. **A real pipeline stage**, justified by an IPC measurement rather than a
    census — section 16 step 5 fix 1 (register the IQ -> LS-EU issue-port ready)
    and section 17 step 5 (2-entry skid on the decode `raw` stage) are both
    specified and both cost a cycle somewhere.  The static ladder cannot price
    them, because it cannot model the placement freedom a genuine cone deletion
    creates; both of this campaign's best RTL cuts beat their static prediction
    for exactly that reason.
-3. **Re-synthesis under the new recipe.**  Every number in this document comes
+4. **Re-synthesis under the new recipe.**  Every number in this document comes
    from one frozen `6b246de` synthesis checkpoint.  A fresh `synth_design` with
    the post-route pass in the loop has never been measured.
-4. Banked TNS/endpoint-breadth cuts (section 15 step 9), now with a concrete
+5. Banked TNS/endpoint-breadth cuts (section 15 step 9), now with a concrete
    target: `explore` shows that 28,795 failing endpoints is reachable by tooling
    alone, so RTL breadth cuts should be judged against that, not against 32,729.
 
@@ -1923,7 +1988,7 @@ section; the only tracked non-documentation changes are `synth/*.xdc`,
 the physical-implementation recipe:
 
 - **New physical baseline: `6b246de` + `FLOORPLAN_MODE=decode` +
-  `IMPL_STRATEGY=postrouteN` (`POSTROUTE_ROUNDS=3`) = -1.472 ns / 182.549 MHz**,
+  `IMPL_STRATEGY=postrouteN` (`POSTROUTE_ROUNDS=3`) = -1.472 ns / 182.749 MHz**,
   from the same netlist MD5 `d80f6218c5c7dcab94a33a52d64244fa`.  The 6-round
   plateau is -1.463 ns / 183.050 MHz and is the archived checkpoint.
 - The old -2.094 ns / 164.096 MHz row is still correct **for

@@ -105,10 +105,10 @@ foreach stale {pb_decode pb_dcache pb_backend pb_frontend} {
 #   round 0 (= the old `default` flow)   WNS -2.094   164.096 MHz
 #   round 1                              WNS -1.623   177.841 MHz   (+13.75)
 #   round 2                              WNS -1.552   180.115 MHz
-#   round 3                              WNS -1.472   182.549 MHz
-#   round 4                              WNS -1.464   182.816 MHz
-#   round 5                              WNS -1.463   182.850 MHz
-#   round 6                              WNS -1.463   182.850 MHz   (plateau)
+#   round 3                              WNS -1.472   182.749 MHz
+#   round 4                              WNS -1.464   183.016 MHz
+#   round 5                              WNS -1.463   183.050 MHz
+#   round 6                              WNS -1.463   183.050 MHz   (plateau)
 #
 # POSTROUTE_ROUNDS defaults to 3: that is 0.622 ns of the 0.631 ns the plateau
 # offers, for roughly half its wall time.  Set POSTROUTE_ROUNDS=1 for a fast gate
