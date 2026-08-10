@@ -917,7 +917,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // Macro-commit KEEP marker (PEA's push): force the whitebox to keep this commit.
     val compKeepCommit = RegInit(False)
     val compDstArch   = Reg(UInt(5 bits))
-    // NZVC writeback for a MOVE-to-memory store (N/Z of the moved value, V=C=0).
+    // NZVC writeback for a memory MOVE (N/Z of the moved value, V=C=0).
     val compNzvc      = Reg(Bits(4 bits))
     compNzvc.simPublic() // debug-only, task #144
     val compNzvcWrite = RegInit(False)
@@ -980,15 +980,18 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // the size's bytes), V = 0, C = 0. The store data (s1Data) holds the source
     // register; only the low `size` bytes are written / observed. Computed off the
     // already-registered s1Data (no new long arc).
-    val stN = u1.size.mux(
-      m68k040.isa.Size.BYTE -> s1Data(7),
-      m68k040.isa.Size.WORD -> s1Data(15),
-      m68k040.isa.Size.LONG -> s1Data(31))
-    val stZ = u1.size.mux(
-      m68k040.isa.Size.BYTE -> (s1Data(7 downto 0)  === 0),
-      m68k040.isa.Size.WORD -> (s1Data(15 downto 0) === 0),
-      m68k040.isa.Size.LONG -> (s1Data === 0))
-    val storeNzvc = stN ## stZ ## False ## False   // N Z V(0) C(0)
+    def moveNzvc(value: Bits, size: m68k040.isa.Size.C): Bits = {
+      val n = size.mux(
+        m68k040.isa.Size.BYTE -> value(7),
+        m68k040.isa.Size.WORD -> value(15),
+        m68k040.isa.Size.LONG -> value(31))
+      val z = size.mux(
+        m68k040.isa.Size.BYTE -> (value(7 downto 0)  === 0),
+        m68k040.isa.Size.WORD -> (value(15 downto 0) === 0),
+        m68k040.isa.Size.LONG -> (value === 0))
+      n ## z ## False ## False
+    }
+    val storeNzvc = moveNzvc(s1Data, u1.size)
 
     def captureFrontCtx(dst: FrontPipeCtx): Unit = {
       dst.robId           := s1Ctx.robId
@@ -1067,9 +1070,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compKeepCommit := ctx.keepCommit
       compDstArch   := ctx.dstArch
       // CCR-restore (RTR): NZVC := loaded[3:0], X := loaded[4] (CCR bit layout
-      // X=4,N=3,Z=2,V=1,C=0). Otherwise a MOVE-to-mem store's NZVC = N/Z of the stored
-      // value (V=C=0). A plain load writes neither (u1.writesNzvc/X are False).
-      compNzvc      := Mux(ctx.ccrRestore, result(3 downto 0), ctx.storeNzvc)
+      // X=4,N=3,Z=2,V=1,C=0). Otherwise a memory MOVE's NZVC = N/Z of the value
+      // actually transferred (V=C=0); non-MOVE accesses leave writesNzvc False.
+      compNzvc      := Mux(ctx.ccrRestore, result(3 downto 0),
+                           Mux(ctx.memOp === MemOp.LOAD,
+                               moveNzvc(result, ctx.size), ctx.storeNzvc))
       compNzvcWrite := ctx.writesNzvc
       compNzvcDst   := ctx.pNzvcDst
       compX         := result(4)
@@ -1121,7 +1126,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // the live `u1`/`s1Ctx`/`s1Va`. Every field the load path cannot reach is
     // hardcoded to its provable value (see BkCtx's declaration comment) rather than
     // carried as a flop.
-    def captureCompletionDesc(ctx: BkCtx, result: Bits): Unit = {
+    def captureCompletionDesc(ctx: BkCtx, result: Bits,
+                              size: m68k040.isa.Size.C): Unit = {
       liveCompletionFires := True
       compValid      := True
       compRobId      := ctx.robId
@@ -1137,10 +1143,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compCrackDrop  := ctx.crackDrop
       compKeepCommit := ctx.keepCommit
       compDstArch    := ctx.dstArch
-      // RTR CCR-restore: NZVC := loaded[3:0], X := loaded[4]. A plain load leaves
-      // writesNzvc/writesX False, so these are don't-cares on that path (identical to
-      // the pre-split behaviour, where the storeNzvc Mux arm was equally a don't-care).
-      compNzvc       := result(3 downto 0)
+      // RTR restores the low CCR bits verbatim. A normal memory-to-register MOVE
+      // derives N/Z from the sized returned value; using result(3:0) here silently
+      // turned arbitrary data bits into flags once aligned loads entered the ring.
+      compNzvc       := Mux(ctx.ccrRestore, result(3 downto 0), moveNzvc(result, size))
       compNzvcWrite  := ctx.writesNzvc
       compNzvcDst    := ctx.pNzvcDst
       compX          := result(4)
@@ -1148,7 +1154,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       compXDst       := ctx.pXDst
       compIsFault    := False
     }
-    def captureCompletionBk(result: Bits): Unit = captureCompletionDesc(bkCtx, result)
+    def captureCompletionBk(result: Bits): Unit =
+      captureCompletionDesc(bkCtx, result, llReg.size)
 
     // Descriptor form of `captureFault`: aligned entries and both split halves pass
     // their own captured context/address, so an untagged refill bus error remains
@@ -1377,7 +1384,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     intByp.valid   := compValid && compPdstValid && !compIsFault
     intByp.address := compPdst
     intByp.data    := compData
-    // NZVC writeback + bypass for a MOVE-to-memory store (mirrors the int path; the
+    // NZVC writeback + bypass for a memory MOVE (mirrors the int path; the
     // bypass forwards to a dependent flag-reader issuing the same cycle, exactly as
     // the ALU EU's NZVC bypass).
     nzvcW.valid     := compValid && compNzvcWrite && !compIsFault
@@ -1397,7 +1404,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // int physreg) broadcasts; a plain store completes too but writes no register.
     wakeupPort.valid   := compValid && compWakes && compPdstValid && !compIsFault
     wakeupPort.payload := compPdst
-    // Dynamic NZVC-wakeup: a completing NZVC-writing LS op (a MOVE-to-memory store or an
+    // Dynamic NZVC-wakeup: a completing NZVC-writing LS op (a memory MOVE or an
     // RTR CCR-restore) broadcasts its pNzvcDst the cycle its NZVC lands in the PRF. The IQ
     // holds a flag-reader of that NZVC until this fires (the static scoreboard cannot —
     // an LS op generates no static ALU/branch wakeup event).
@@ -1444,7 +1451,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
         captureFaultDesc(alignedRspEntry.bk, alignedRspEntry.vaddr,
                          alignedRspEntry.size, atc = false)
       } otherwise {
-        captureCompletionDesc(alignedRspEntry.bk, dcache.loadRsp.payload.data)
+        captureCompletionDesc(alignedRspEntry.bk, dcache.loadRsp.payload.data,
+                              alignedRspEntry.size)
       }
     }
 
@@ -1960,8 +1968,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     wbObs.dstArch   := compDstArch
     wbObs.result    := compData
     wbObs.intWrite  := compPdstValid
-    wbObs.nzvc      := compNzvc          // MOVE-to-mem store flags OR RTR CCR-restore NZVC
-    wbObs.nzvcWrite := compNzvcWrite     // store NZVC or RTR CCR-restore
+    wbObs.nzvc      := compNzvc          // memory-MOVE flags OR RTR CCR-restore NZVC
+    wbObs.nzvcWrite := compNzvcWrite     // memory-MOVE NZVC or RTR CCR-restore
     wbObs.x         := compX             // RTR CCR-restore X (loaded[4])
     wbObs.xWrite    := compXWrite
     // Reuse `divRem` as the generic "crack µop — DROP this commit record" marker: a

@@ -1910,6 +1910,80 @@ class DcacheSpec extends AnyFunSuite {
     }
   }
 
+  test("VIPT D2: a same-set store write stales a held snapshot and forces updated fallback",
+       VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base  = 0x7D00L
+      val addr  = base + 4
+      val token = 0x2D
+      val replacement = BigInt("CAFEBABE", 16)
+      preload(mem, base, 16)
+      assert(load(dut, cd, base, Size.LONG) == expected(base, 4), "prime resident line")
+      cd.waitSampling(4)
+
+      // Capture the old line into a tokenized VIPT result, but deliberately hold
+      // the matching resolved command until an older store mutates this same set.
+      dut.probe.logic.loadProbeIn.valid #= true
+      dut.probe.logic.loadProbeIn.payload.vaddr #= addr
+      dut.probe.logic.loadProbeIn.payload.token #= token
+      dut.probe.logic.loadProbeIn.payload.resolved #= true
+      dut.probe.logic.loadProbeIn.payload.paddr #= addr
+      dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
+      dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadProbeIn.payload.needsLine #= false
+      cd.waitSamplingWhere(dut.probe.logic.loadProbeIn.valid.toBoolean &&
+                           dut.probe.logic.loadProbeIn.ready.toBoolean)
+      dut.probe.logic.loadProbeIn.valid #= false
+
+      dut.probe.logic.loadCmdIn.payload.vaddr #= addr
+      dut.probe.logic.loadCmdIn.payload.paddr #= addr
+      dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+      dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadCmdIn.payload.token #= token
+      var readyWait = 0
+      while (!dut.dcache.logic.earlyProbeOwnsCmd.toBoolean && readyWait < 8) {
+        cd.waitSampling(); readyWait += 1
+      }
+      assert(dut.dcache.logic.useEarlyProbe.toBoolean,
+        "setup must hold a usable pre-store snapshot before the mutation")
+
+      var sawSameSetWrite = false
+      var trackWrite = true
+      fork {
+        while (trackWrite) {
+          cd.waitSampling()
+          if (dut.dcache.logic.stS3ArrayWrite.toBoolean &&
+              dut.dcache.logic.stS3Set.toLong == ((addr >> 4) & 0x7fL)) {
+            sawSameSetWrite = true
+          }
+        }
+      }
+      fireStore(dut, cd, addr, replacement, Size.LONG, CacheMode.WRITETHROUGH)
+      cd.waitSamplingWhere(dut.dcache.logic.storeAckReg.toBoolean)
+      trackWrite = false
+      cd.waitSampling()
+
+      assert(sawSameSetWrite, "the directed store must really mutate the probed set")
+      assert(dut.dcache.logic.earlyProbeOwnsCmd.toBoolean,
+        "the stale result must retain its token so the later command can consume it")
+      assert(!dut.dcache.logic.useEarlyProbe.toBoolean,
+        "an intervening same-set array write must make the old snapshot unusable")
+
+      dut.probe.logic.loadCmdIn.valid #= true
+      sleep(1)
+      assert(dut.dcache.logic.rdEn.toBoolean,
+        "the stale snapshot must fall back to a fresh synchronous array read")
+      cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
+                           dut.probe.logic.loadCmdIn.ready.toBoolean)
+      dut.probe.logic.loadCmdIn.valid #= false
+      cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
+      assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == replacement,
+        f"fallback must observe the post-store line: got 0x${dut.probe.logic.loadRspOut.payload.data.toBigInt}%08x")
+      cd.waitSampling(4)
+    }
+  }
+
   test("VIPT slice C3: a proven-hit probe is consumed while the next virtual-set " +
        "probe launches on the same edge", VerilatorTest) {
     sharedCompiled.doSim { dut =>

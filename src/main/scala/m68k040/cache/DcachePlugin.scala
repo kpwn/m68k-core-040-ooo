@@ -405,16 +405,26 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     // S1 read. Only a ready hit bypasses that redundant read.
     val earlyProbePresentVec = Vec(Bool(), earlyProbeDepth)
     val earlyProbeMatchVec   = Vec(Bool(), earlyProbeDepth)
+    val earlyProbeSetWriteVec = Vec(Bool(), earlyProbeDepth)
     for (i <- 0 until earlyProbeDepth) {
       earlyProbePresentVec(i) := earlyProbeValids(i) &&
                                  (earlyProbeTokens(i) === loadCmdPort.payload.token) &&
                                  (earlyProbeVaddrs(i) === cmdVaddr)
       earlyProbeMatchVec(i) := earlyProbePresentVec(i) && earlyProbeReadies(i)
+      // A held result is a snapshot of the array read. Any intervening real write
+      // to its virtual set can stale it before the tagged command arrives. Compare
+      // only the four bounded entries against the four physical write ports; this
+      // preserves unrelated-set load/store overlap without adding cache storage.
+      earlyProbeSetWriteVec(i) := (0 until ways).map { w =>
+        wrEn(w) && (wrSet(w) ===
+          earlyProbeVaddrs(i)(offBits + setBits - 1 downto offBits))
+      }.orR
     }
     val earlyProbeTokenPresent = earlyProbePresentVec.asBits.orR
     val earlyProbeOwnsCmd      = earlyProbeMatchVec.asBits.orR
     val earlyProbeMatchIdx     = OHToUInt(earlyProbeMatchVec.asBits)
-    val earlyProbeHit          = earlyProbeOwnsCmd && earlyProbeHits(earlyProbeMatchIdx)
+    val earlyProbeHit          = earlyProbeOwnsCmd && earlyProbeHits(earlyProbeMatchIdx) &&
+                                 !earlyProbeSetWriteVec(earlyProbeMatchIdx)
     val earlyProbeHitData      = earlyProbeData(earlyProbeMatchIdx)
     val useEarlyProbe          = earlyProbeHit && !ldS1Valid
     val earlyProbeFreeVec      = Vec(Bool(), earlyProbeDepth)
@@ -669,7 +679,7 @@ class DcachePlugin extends FiberPlugin with DcacheService {
     val stS3ArrayWrite = stS3Valid && stS3Hit && !stS3Inhibited
 
     stS3Valid.simPublic(); stS3Payload.simPublic(); stS3Hit.simPublic()
-    stS3Way.simPublic(); stS3ArrayWrite.simPublic()
+    stS3Set.simPublic(); stS3Way.simPublic(); stS3ArrayWrite.simPublic()
     // DEBUG (task #189 investigation, temporary): sim-only visibility into the
     // store RMW hit/miss decision. simPublic is a no-op for synthesis.
     stS2Valid.simPublic(); stS2Payload.simPublic()
@@ -1872,6 +1882,17 @@ class DcachePlugin extends FiberPlugin with DcacheService {
           earlyProbeValids(i)  := False
           earlyProbeReadies(i) := False
         }
+      }
+    }
+
+    // Keep the association token alive but turn a stale snapshot into an explicit
+    // ready miss. The later command then consumes the entry and performs the normal
+    // synchronous read, after the array mutation. This block is intentionally after
+    // probe-result capture so the invalidation wins on a same-cycle write/read race.
+    for (i <- 0 until earlyProbeDepth) {
+      when(earlyProbeValids(i) && earlyProbeSetWriteVec(i)) {
+        earlyProbeReadies(i) := True
+        earlyProbeHits(i)    := False
       }
     }
 

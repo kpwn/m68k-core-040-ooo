@@ -167,9 +167,11 @@ class LsBackendInjectSpec extends AnyFunSuite {
 
       // capture LS EU writeback (the forwarded load result) by robId
       val lsWb = scala.collection.mutable.Map[Int, Long]()
+      val lsNzvc = scala.collection.mutable.Map[Int, Int]()
       cd.onSamplings {
         val w = dut.lsEu.logic.wbObs
         if (w.valid.toBoolean && w.intWrite.toBoolean) lsWb(w.robId.toInt) = w.result.toLong & 0xffffffffL
+        if (w.valid.toBoolean && w.nzvcWrite.toBoolean) lsNzvc(w.robId.toInt) = w.nzvc.toInt
       }
       // capture ALU EU writebacks too
       val aluWb = scala.collection.mutable.Map[Int, Long]()
@@ -213,7 +215,8 @@ class LsBackendInjectSpec extends AnyFunSuite {
       // I4: LOAD mem[p10+0] -> p20 (D4). Forwards from the uncommitted store.
       push1(u => pokeUop(u, pc = 0x108, cluster = Cluster.LS, memOp = MemOp.LOAD,
         useImm = true, imm = 0, psrcA = 10, psrcAValid = true,
-        pdst = 20, pdstValid = true, pdstOld = 4, dstArch = 4))
+        pdst = 20, pdstValid = true, pdstOld = 4, dstArch = 4,
+        writesNzvc = true, pNzvcDst = 4))
       cd.waitSampling(10)
 
       // I5: ADD p20, p13 -> p21 (D5) = loadResult + 0x10. Consumes the load via
@@ -227,10 +230,32 @@ class LsBackendInjectSpec extends AnyFunSuite {
       val loadRobId = 4
       assert(lsWb.contains(loadRobId), s"LS load must write back; saw ${lsWb.keys.toSeq.sorted}")
       assert(lsWb(loadRobId) == 0xCAFE0001L, s"forwarded load = 0x${lsWb(loadRobId).toHexString} expected CAFE0001")
+      assert(lsNzvc.get(loadRobId).contains(0x8),
+        s"forwarded MOVE.L flags must be N=1,ZVC=0; saw ${lsNzvc.get(loadRobId)}")
       // The ALU consumer (robId 5) = 0xCAFE0001 + 0x10 = 0xCAFE0011.
       val addRobId = 5
       assert(aluWb.contains(addRobId), s"ALU consumer must write back; saw ${aluWb.keys.toSeq.sorted}")
       assert(aluWb(addRobId) == 0xCAFE0011L, s"ALU consumer = 0x${aluWb(addRobId).toHexString} expected CAFE0011")
+
+      // Let the store drain/pop, then load the same negative value through the
+      // ordinary cache descriptor path. This distinguishes the aligned-ring flag
+      // calculation from the forwarded completion above.
+      var drainWait = 0
+      while (!dut.lsEu.logic.sq.io.empty.toBoolean && drainWait < 80) {
+        cd.waitSampling(); drainWait += 1
+      }
+      assert(dut.lsEu.logic.sq.io.empty.toBoolean,
+        "store must drain before descriptor-load check")
+      push1(u => pokeUop(u, pc = 0x10C, cluster = Cluster.LS, memOp = MemOp.LOAD,
+        useImm = true, imm = 0, psrcA = 10, psrcAValid = true,
+        pdst = 22, pdstValid = true, pdstOld = 6, dstArch = 6,
+        writesNzvc = true, pNzvcDst = 6))
+      cd.waitSampling(30)
+      val ringLoadRobId = 6
+      assert(lsWb.get(ringLoadRobId).contains(0xCAFE0001L),
+        s"aligned descriptor load must return CAFE0001; saw ${lsWb.get(ringLoadRobId).map(_.toHexString)}")
+      assert(lsNzvc.get(ringLoadRobId).contains(0x8),
+        s"aligned descriptor MOVE.L flags must be N=1,ZVC=0; saw ${lsNzvc.get(ringLoadRobId)}")
       cd.waitSampling(4)
     }
   }

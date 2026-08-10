@@ -86,6 +86,21 @@ FMax/area gate is still pending because the shared Vivado window is occupied.
    later tagged D2T response boundary moves the focused seed-1 result to 667/821
    cycles while proving the same II=1 cadence across alternating resident VPNs;
    the full ten-kernel aggregate has not yet been rerun on that final combination.
+10. A queued VIPT result is a data snapshot, not a coherence reservation. Any
+   intervening D-cache array write to the same virtual set can make that snapshot
+   stale before its resolved command arrives. Each of the four result entries is
+   therefore marked ready-but-unusable when any real way write targets its set;
+   same-cycle early consumption is gated by the same comparison. The token stays
+   resident so the resolved command consumes it and falls back to the ordinary
+   synchronous read without loss or reordering. This is a bounded four-entry by
+   four-way set comparison, not another TLB/CAM or cache port, and unrelated-set
+   stores do not disturb load cadence.
+11. A completed memory-to-register MOVE derives NZVC from the returned value at
+   the architectural access size: N is the sized sign bit, Z is the sized zero
+   reduction, and V/C are zero. RTR remains the explicit exception and restores
+   `result(3:0)`. Both forwarded completions and aligned/split descriptors use
+   this rule; a descriptor must never substitute the result low nibble or a stale
+   store-data-derived flag value.
 
 **Driving directive (user, verbatim)**: *"LS EU needs to be a pipeline, not a
 one-at-a-time FSM."*
@@ -1124,7 +1139,7 @@ make a sweep green.
 
 | test | covers | form |
 |---|---|---|
-| `LsPipelineOrderSpec` | H1 | store→load same address at every pipeline distance 1..8; assert forward hit at each; collect-then-assert |
+| `LsPipelineOrderSpec` | H1 | store→load same address at every pipeline distance 1..8; assert forward hit at each; hold a same-set VIPT snapshot across a store array write and require ordinary-read fallback to updated data; collect-then-assert |
 | `LsPipelineXlateSpec` | H3, H4 | must-fail-first: delayed accept via `pendingStoreMiss`/`maintBusyReg` with a *faulting* younger VPN resident; and `compFaultSup` correctness |
 | `LsPipelinePoisonSpec` | H6, H7 | flush injected at each stage independently; assert zero SQ allocs / zero ROB completions for squashed µops; assert the pendMem↔SQ pairing invariant |
 | `LsPipelineSplitSpec` | H12, H5 | cross-line and cross-**page** splits with younger µops resident behind them; the `xlateBArm` freshness waveform |
@@ -1273,7 +1288,9 @@ full-queue consume-and-replace, miss replay ordering, exact token association,
 unresolved-probe fallback, cancel-all, flush poisoning, and both split-half bus
 faults. Tagged D2T coverage additionally alternates resident VPNs at II=1 and
 checks permission association, clean-miss serialization, epoch reuse, and real
-cross-page split translations. The phase-local `test-fast`
+cross-page split translations. Post-integration coverage also requires a queued
+probe crossing an older same-line store to fall back, and requires
+memory-to-register MOVE flags to come from the sized returned value. The phase-local `test-fast`
 result was 133/134 with only the independently reproduced stale
 `PredecodeRefSpec` EOR/CMPM expectation; after that oracle and the subsequently
 exposed line-0 framing drift were corrected, the combined branch passes 138/138.
