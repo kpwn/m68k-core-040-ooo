@@ -181,7 +181,12 @@ The four same-DCP `3c4e1f8` routes were:
 `decode` is now the default and reproduced exactly.  The broad D-cache pblock is
 disabled by default because it is locally overfull, captured an unrelated ROB
 carry chain through flattened-name matching, and was worse than no floorplan.
-Keep all four controls for diagnosis.  Do not widen the X87 decode box: a prior
+Keep all four controls for diagnosis.
+
+**Re-measured on the `6b246de` netlist (section 15 step 7): `decode` still wins
+(-2.094) over `none` (-2.187), `dcache` (-2.665) and `both` (-2.669), but the
+decode advantage over `none` has shrunk from 0.442 ns to 0.093 ns.**  Use the
+newer table; this `3c4e1f8` one is kept for history.  Do not widen the X87 decode box: a prior
 X103 experiment regressed.  Capture-filter cleanup should be its own exact-DCP
 A/B.  FetchAlign/Icache are not actually members of the decode pblock, so do not
 attribute an unplaced frontend cone improvement to that pblock without route
@@ -365,8 +370,10 @@ new concurrency.
   need first.
 - The present FMax (164.096 MHz at `6b246de`) is still below both 200 and
   250 MHz.  This is expected after the large IPC changes, but it is now the
-  principal core task.  Section 14 names the next two measured cuts and the
-  ~3.0 ns parallel-VIPT floor that remains behind them.
+  principal core task.  **Section 15 supersedes section 14's "next two cuts"
+  ordering**: the whole frontend demand cone is measured at 0.271 ns and the
+  top four families together at 0.294 ns, so the frontend ladder is finished
+  and the remaining work is the D-cache/IssueQueue plateau at -1.800 ns.
 
 ## 12. Handoff completion state
 
@@ -742,6 +749,12 @@ rule is what must be re-proved before removing it.  Do not remove `stalled` from
 gate is on the *application bookkeeping* or only on the *PC selection*, and if
 it is the former, split the term rather than delete it.
 
+> **Superseded by section 15.**  The redundancy question above was answered —
+> `stalled` *is* fully redundant, for all four of `applyNow`'s consequences —
+> but the cut is worth **0.020 ns** and was therefore not landed.  See
+> section 15 for the proof, the what-if ladder, and why the top-100 startpoint
+> census stopped identifying removable families at this checkpoint.
+
 Behind that, the measured remaining structure is segment D of the step-1 table:
 `isHit -> answerable -> cmdPort.ready -> cmdPort.fire -> seedPfWindow`, 7 levels
 and 1.659 ns of prefetch-window seeding charged to the demand cycle.  The
@@ -759,3 +772,309 @@ attack B or C before D — the handoff's standing rule holds, and B/C are the
 parallel-VIPT contract the IPC campaign was built on.
 
 Archived at `synth/archive/6b246de_ftb_framing_retime_decode/`.
+
+## 15. Measured negative result: the frontend cut ladder is exhausted (Claude, 2026-08-10)
+
+**The dispatch hypothesis was overturned.**  Section 14 named
+`stalled -> ftbBlocked -> applyNow` as the next cut and asked whether the
+`stalled` term could be removed or split.  It can — the redundancy proof holds
+in full, for every one of `applyNow`'s consequences, not merely the fetch-PC
+mux.  But interrogating the routed checkpoint shows the cut is worth
+**0.020 ns (+0.5 MHz)**, and that even the *maximal* version of it — deleting
+`applyNow` from the design entirely — is worth **0.271 ns (+7.7 MHz)**.  No RTL
+was landed.  The measured conclusion is that the "census the top-100
+startpoints, remove that family" method that produced the previous five cuts
+has stopped working at this checkpoint, and the reason is structural rather
+than incidental.
+
+All figures below come from read-only interrogation of the archived `6b246de`
+routed checkpoint (`synth/archive/6b246de_ftb_framing_retime_decode/fullcore_routed.dcp`,
+netlist MD5 `d80f6218c5c7dcab94a33a52d64244fa`).  The probe reproduced the
+archived WNS, startpoint and endpoint exactly before any what-if was applied,
+which validates the method.  Evidence is in `synth/probe_stalled/`.
+
+### Step 1: what `stalled` is, and every consequence of `applyNow`
+
+`stalled` is the complex-instruction emit-once latch.  It is set at exactly one
+site — the edge after `feed.fire && !emittingFaultPacket && res.complex` — and
+cleared at exactly five sites: the `predictFire`, `ftqMismatch`, `redirect`,
+`resume && stalled` and `mispredictRedirect` blocks.  Those five conditions are
+*textually identical to `ftqFlush`*, and all five also assert
+`ibuf.io.flush := True` and `ringStale.foreach(_ := True)`.
+
+`applyNow` has four consequences, not one:
+
+| # | Consequence | Site |
+|---|---|---|
+| E1 | `ringKeep(resultSlot) := resultEnd` — truncates the in-flight window | `when(applyNow)` |
+| E2 | FTQ push: `ftqMem.write`, `ftqTail++`, `ftqCount++` | `ftqPush := applyNow` |
+| E3 | `targetHoldValid/Pc/Drop` capture, when `!ic.cmd.fire` | `when(applyNow)` |
+| E4 | fetch-PC/drop mux selects `directTargetPc` | `cmdWindowPc`/`cmdDrop` |
+
+### Step 2: the redundancy proof — it holds, for all four consequences
+
+The dispatch asked for the "one `applyNow` event performs exactly once"
+invariant to be re-proved before removing `stalled`.  It survives:
+
+1. **While `stalled` is true, `ic.cmd.valid` is false** (`!stalled` is a direct
+   term of it).  Therefore no command fires, E4 is unobservable, `ftbCmd.valid`
+   (`= ic.cmd.fire && ...`) is low so no lookup launches, and E3 always takes
+   its `!ic.cmd.fire` arm.
+2. **At most one application can occur per stall.**  `resultExpectedValid` is
+   `RegNext(ic.cmd.fire && !issueBornStale)`, so it can only be true in the
+   *first* stalled cycle (from the command that fired on the complex packet's
+   own fire cycle).  E3 then latches `targetHoldValid`, which is itself a
+   `ftbBlocked` term, so a second application is doubly impossible.
+3. **Every stall exit erases E1/E2/E3.**  The five `stalled := False` sites are
+   exactly the `ftqFlush` terms; `ftqFlush` (assigned last, so it wins) zeroes
+   `ftqHead/ftqTail/ftqCount` and clears `targetHoldValid`.  All five also
+   flush the IBuf and stale every ring entry, so a truncated `ringKeep` window
+   is discarded either in flight or after landing, and `ringKeep` is rewritten
+   to 4 at the next issue.
+4. **During the stall the residue is inert.**  `feed.valid` is false, so
+   `ftqConfirmFire`, `predictDetect`, the RAS push/pop and the GHR shift cannot
+   fire; `ftqMismatchDetect` and `ftqStarveRaw` carry explicit `!stalled`
+   terms.  The only live readers of a newly non-empty FTQ are `availEff` (which
+   can only make `p0LiveReg` report ambiguity, a conservative stall, and is
+   flushed at exit) and `slot1ValidOut`, which every consumer qualifies with
+   `fed.valid`.  A non-empty FTQ during a stall is in any case already
+   reachable today from applications made *before* the complex packet fired.
+5. The capacity bound is unchanged: applications remain 1:1-bounded by live
+   cache commands, and a stalled application still consumes a ring slot, so
+   `RING + BUF_WORDS` still holds.
+
+Note this argument is *deferred*, not same-cycle: the design's existing
+tolerance for `predictFire`/`ftqMismatch`/`mispredictRedirect` colliding with
+`applyNow` rests on same-cycle `ftqFlush` priority, whereas `stalled` is a
+level and the erasure happens at the stall's exit.  That is why the dispatch
+was right to demand the proof — it is a genuinely different argument.  It is
+recorded here so a future implementer does not have to redo it, but it was
+**not simulation-proved**, because the measurement below made the cut
+pointless.
+
+### Step 3: the measured ceiling — a `set_false_path` what-if ladder
+
+Static what-if on the routed checkpoint is a fair predictor *for this cut*
+specifically, because unlike `28ec738` (which deleted a 6-bit comparator and
+its fanout) and `6b246de` (which deleted 2,825 LUTs of live framing cone),
+removing `stalled` from `ftbBlocked` deletes essentially no logic: `ftbBlocked`
+goes from a 7-leaf to a 5-leaf OR and `applyNow` from 12 to 10 inputs, both of
+which map to the same LUT depth.  There is no cone shrink for the placer to
+exploit.
+
+| What-if | WNS | New worst path |
+|---|---:|---|
+| baseline (reproduced) | -2.094 | `stalled -> s1PredEntries_3[18]/CE` |
+| false-path `stalled -> applyNow` only | **-2.074** | `FtbPlugin rspPayload_brWordOff[0] -> same endpoint` |
+| false-path **every** `stalled` path | **-2.074** | identical — `applyNow` is `stalled`'s only critical route |
+| false-path the whole `applyNow` net | **-1.823** | `DcachePlugin stS1Payload_paddr[6] -> IssueQueuePlugin sbInt_busy[34]` |
+| + take the ITLB result off the demand path | -1.823 | unchanged — the limit has left the frontend |
+| + false-path `stS1Payload_paddr` | -1.800 | `DcachePlugin missSet[4] -> IssueQueuePlugin sbInt_busy[34]` |
+| + false-path decode `spec_size` | -1.800 | unchanged |
+| + false-path `RobPlugin doFlushReg` | **-1.800** | unchanged |
+
+So: **removing the top four families outright moves WNS from -2.094 to -1.800,
+a total of 0.294 ns (164.096 -> 172.414 MHz).**  200 MHz needs WNS >= -1.000,
+i.e. 1.094 ns.  There is no family-cutting route to it from this checkpoint.
+
+### Step 4: why the top-100 startpoint census stopped being a family detector
+
+`stalled` really is the startpoint of **2,673 of the worst 4,000 unique-endpoint
+paths**.  It is also worth 0.020 ns.  Both are true because it is the
+*latest-arriving input to a very large shared cone*, and the inputs immediately
+behind it (`FtbPlugin rspPayload_brWordOff`, `quiesce`, `rspPayload_brType`,
+`targetHoldValid`, and then the mux data input `rspPayload_target`) are 0.020,
+0.023 and 0.271 ns behind respectively.  Cutting one merely rotates the census
+to the next.
+
+This is the same class of error section 14 recorded for the `High Fanout`
+column, one level up.  **Reusable lesson: a startpoint census counts which
+register happens to arrive last into a shared cone; it does not measure what
+that register costs.  Pair every census with a `set_false_path` what-if ladder
+on the routed checkpoint before designing a cut.**  The ladder above takes
+about 40 seconds of Vivado time against 20+ minutes for a route, and it would
+have correctly predicted this result before any RTL was written.
+
+The slack distribution confirms the plateau.  Over the worst 4,000 unique
+endpoints:
+
+| Slack bucket (ns) | Endpoints |
+|---|---:|
+| -2.1 .. -2.0 | 144 |
+| -2.0 .. -1.9 | 738 |
+| -1.9 .. -1.8 | 460 |
+| -1.8 .. -1.7 | 358 |
+| -1.7 .. -1.6 | 606 |
+| -1.6 .. -1.5 | 843 |
+| -1.5 .. -1.4 | 685 |
+| -1.4 .. -1.3 | 166 |
+
+Only 144 endpoints are worse than -2.0.  There is no tall spike left to remove.
+
+### Step 5: the real families, by count rather than by top-100
+
+Worst-4,000 unique-endpoint paths, grouped:
+
+| Startpoint register | Paths | | Endpoint register | Paths |
+|---|---:|---|---|---:|
+| `FetchAlignPlugin stalled` | 2,673 | | `IcachePlugin lineReg` | 1,024 |
+| `DcachePlugin stS1Payload_paddr` | 752 | | `IcachePlugin s1PredEntries_{0..3}` | 920 |
+| `DecodeStage fed_payload_specs_0_spec_size` | 418 | | `DcachePlugin s0Payload_lineData` | 241 |
+| `DcachePlugin tagMem_2` | 47 | | `FetchAlignPlugin fetchPc` | 58 |
+| `AluEuPlugin s1Ctx_uop_op` | 29 | | `IcachePlugin arHoldAddr` | 52 |
+| `LsEuPlugin p3Ctx_paddr` | 20 | | `IssueQueuePlugin sbInt_busy` | 50 |
+
+The three post-frontend families, with their real shape:
+
+- `DcachePlugin stS1Payload_paddr[6] -> IssueQueuePlugin sbInt_busy[34]`:
+  5.805 ns, 22 levels, **70.5% route**.
+- `DecodeStage fed_payload_specs_0_spec_size[0] -> FetchAlign predictPending`
+  (and `RasPlugin ras_*`): 5.757 ns, 17 levels, **77.9% route**.
+- `stalled -> IcachePlugin lineReg[60]/CE`: 5.930 ns, 21 levels, 63.6% route.
+
+Every one of them is route-dominated at 17-22 levels.  That is the signature of
+a placement/congestion-bound design, not a logic-depth-bound one, and it is why
+single-term control cuts have stopped paying.
+
+### Step 6: what to do instead
+
+1. **Do not spend a route on the `stalled` term.**  It is +0.5 MHz for a
+   weakened external-input collision contract.
+2. The frontend demand cone (`applyNow` -> fetch-PC mux -> ITLB CAM -> L1I tag
+   -> `cmd.ready` -> `cmd.fire` -> S1/`lineReg` capture enable) is worth
+   0.271 ns in total and cannot be improved further without breaking the
+   parallel-VIPT contract.  Section 14's "attack segment D next" is still the
+   best frontend idea — the S1 capture *enable* is `cmd.fire`-gated and
+   therefore sits behind the ITLB and tag compare, while the S1 *data*
+   (`s1PredEntries`) is a raw all-ways BRAM read with no hit dependency, so the
+   enable could be `cmd.valid`-gated with `s1Valid` carrying the qualification —
+   but the ladder caps the whole frontend at +7.7 MHz, so it is no longer the
+   priority.
+3. The next campaign target is **`DcachePlugin` store-S1 physical address ->
+   `IssueQueuePlugin` integer/NZVC scoreboard busy**, plus the decode
+   `spec_size` -> RAS/predict family.  Both are new subsystems for this
+   campaign and both need their own grounding pass.
+4. Because the plateau is route-dominated, **re-validate the floorplan**: the
+   four-mode comparison in section 5 was measured at `3c4e1f8`, five RTL cuts
+   ago, when the decode pblock was 78.23% full; it is now 67.91% full and the
+   limiting families have moved from the frontend to the D-cache/IQ.  Step 7
+   below is that experiment.
+
+### Step 7: exact-DCP floorplan re-validation — `decode` still wins
+
+Four modes, all placed and routed from the **identical** `6b246de`
+post-synthesis checkpoint (`REUSE_SYNTH_DCP=1`; all four reported the same
+post-synth WNS -1.827, which is the control that proves the netlist was
+identical).
+
+| Mode | WNS / FMax | TNS | Failing endpoints | Routed LUT / FF |
+|---|---:|---:|---:|---:|
+| **decode** (default) | **-2.094 ns / 164.096 MHz** | **-21,068.689** | **32,729** | 110,662 / 50,389 |
+| none | -2.187 ns / 161.629 MHz | -29,536.104 | 43,701 | 110,774 / 50,384 |
+| dcache | -2.665 ns / 150.038 MHz | -43,360.996 | 61,293 | 110,771 / 50,401 |
+| both | -2.669 ns / 149.948 MHz | -38,648.195 | 47,702 | 110,693 / 50,436 |
+
+All four routes are clean: zero hold failures, zero pulse-width failures,
+WHS +0.023 to +0.030 ns, WPWS +1.458 ns, no congestion window above level 5.
+Archived at `synth/archive/6b246de_floorplan_{none,dcache,both}/`.
+
+Two things worth carrying forward:
+
+- **`decode` remains correct as the default**, so section 5's guidance is
+  re-confirmed on the current netlist rather than inherited from `3c4e1f8`.
+  The broad D-cache pblock is still clearly harmful, and `both` is now the
+  *worst* mode, not the second best — so it is not merely inert.
+- **The decode pblock's WNS advantage has collapsed from 0.442 ns to
+  0.093 ns** (`none` was -3.162 vs -2.720 at `3c4e1f8`; it is -2.187 vs -2.094
+  now).  Five RTL cuts removed most of what the pblock was buying.  Its TNS and
+  failing-endpoint advantage is still large (-21.1k/32.7k versus -29.5k/43.7k),
+  so keep it, but do not expect a *new* floorplan to be the lever that reaches
+  200 MHz.  A floorplan aimed at the *current* limiters would have to enclose
+  `DcachePlugin` store-S1 plus `IssueQueuePlugin`'s scoreboard, which the
+  existing `pb_dcache` box does not do (and `pb_dcache` already
+  over-captures through flattened-name matching, per section 5).
+
+### Step 8: new reusable tool — `synth/probe_slack_ladder.tcl`
+
+Committed with this section.  It opens a routed checkpoint read-only, emits a
+slack histogram and a startpoint/endpoint family census over the worst N unique
+endpoints, then repeatedly `set_false_path`s the *current* worst startpoint
+register and re-reports WNS — so the delta between rungs is what retiring that
+family is actually worth.  It costs about 40 seconds against 11-21 minutes for
+a route.
+
+Its output on `6b246de` is the whole argument of this section in one table:
+
+```
+rung   WNS      delta   worst startpoint
+   0  -2.094   +0.000   FetchAlignPlugin_logic_stalled_reg
+   1  -2.074   +0.020   FtbPlugin_logic_rspPayload_brWordOff_reg[0]
+   2  -2.050   +0.024   FetchAlignPlugin_logic_quiesce_reg
+   3  -2.024   +0.026   GsharePlugin_logic_pht_spinal_port4_reg[1]
+   4  -2.002   +0.022   FetchAlignPlugin_logic_targetHoldValid_reg
+   5  -2.001   +0.001   FtbPlugin_logic_rspPayload_brType_reg[0]
+   6  -1.960   +0.041   GsharePlugin_logic_pht_spinal_port3_reg[1]
+   7  -1.959   +0.001   FetchAlignPlugin_logic_faultHold_reg
+   8  -1.959   +0.000   GsharePlugin_logic_pht_spinal_port2_reg[1]
+   9  -1.932   +0.027   GsharePlugin_logic_pht_spinal_port5_reg[1]
+  10  -1.848   +0.084   FetchAlignPlugin_logic_ftbSuppress_reg
+```
+
+Every rung has the same endpoint, `IcachePlugin_logic_s1PredEntries_3_reg[18]/CE`.
+Eleven consecutive register families — `applyNow`'s AND-term inputs, its
+`ftbBlocked` OR-term inputs, and the gshare PHT read ports behind
+`resultDirection` — are worth **0.246 ns between them**.  That is what a
+shared cone looks like from the outside, and it is exactly the shape a
+startpoint census cannot distinguish from a removable family.
+
+Run it before designing the next cut:
+
+```bash
+DCP=synth/archive/<ckpt>/fullcore_routed.dcp LADDER_STEPS=10 \
+  vivado -mode batch -nojournal -source synth/probe_slack_ladder.tcl
+```
+
+### Step 9: the miss/predecode-path pipelining licence, measured
+
+**Standing architectural licence (from the user, 2026-08-10):** predecode runs
+on a cache-line *miss*, and that latency is such that a deeper pipeline there is
+essentially free.  For any signal that lives on the miss-fill / prefetch-install
+path rather than the resident-hit path, inserting a pipeline register costs
+nothing measurable in real IPC — it hides behind tens of cycles of L2/DDR line
+service.  This does **not** extend to the resident-hit II=1 cadence, where every
+added cycle is a real throughput cost.  Record this when scoping any I-cache
+cut: it materially lowers the burden of proof on the miss/prefetch side, and it
+makes the already-scouted prefetch-window-seed cut (section 14, segment D) a
+low-risk pipeline insertion rather than something needing resident-hit-grade
+scrutiny.
+
+It also has a measurable consequence, and the measurement is worth having before
+anyone spends a route on it.  Freeing **every** I-cache miss/prefetch-state
+endpoint (`lineReg`, `pf*`, `miss*`, `arHold*`, both CE and D) on the `6b246de`
+routed checkpoint:
+
+| What-if | WNS | New worst path |
+|---|---:|---|
+| baseline | -2.094 | `stalled -> s1PredEntries_3[18]/CE` |
+| all miss/prefetch-state endpoints free | **-2.094** | **unchanged** |
+| + resident-hit `s1*` capture also free | -1.991 | `stalled -> IcachePlugin commitBeat[0]/D` |
+
+So the licence is real and useful but **buys 0.000 ns of WNS at this
+checkpoint**: the binding endpoints are the resident-hit S1 predecode capture
+(`s1PredEntries`, 920 of the worst 4,000), not the miss/prefetch state.  Where
+it does pay is breadth — `lineReg` alone is 1,024 of the worst 4,000 endpoints,
+plus about 260 more across `arHoldAddr`/`missPA`/`pfNextPa`/`pfPa_*`/`pfLimitPa`/
+`pfDemandLine`, so pipelining them is worth roughly 1,280 failing endpoints and
+a large slice of TNS even at unchanged WNS.  This campaign has twice seen TNS
+and endpoint-count reductions convert into real placement gains (`28ec738`,
+`6b246de`), so it is a legitimate cut to bank — just not one to expect an FMax
+number from on its own.
+
+### Status after this section
+
+No RTL changed; `6b246de` remains the head RTL checkpoint at **-2.094 ns /
+164.096 MHz**, `FLOORPLAN_MODE decode`, netlist MD5
+`d80f6218c5c7dcab94a33a52d64244fa`.  All six landed timing cuts are preserved.
+The frontend recovery ladder that took the branch from 131.010 to 164.096 MHz
+is finished; the next work is the D-cache/IQ plateau, and it should begin with
+a ladder run, not a census.
