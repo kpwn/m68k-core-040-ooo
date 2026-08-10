@@ -225,8 +225,8 @@ between `step` and `step << 1` for the running update. No latency or state was
 added. Directed decode covers every offset and both ±64 final deltas for all 16
 registers; 11/11 decode and 8/8 MOVEM lock-step tests pass. The phase-local
 `test-fast` result was 133/134 with only the stale `PredecodeRefSpec` line-B
-expectation; the current combined branch passes 145/145 after the exhaustive
-reference corrections. The physical checkpoint confirms total DSP use fell
+expectation; the current combined branch passes 147/147 after the exhaustive
+reference corrections and later frontend correctness gates. The physical checkpoint confirms total DSP use fell
 from six to four, so both decode multipliers disappeared. Whether the former
 MOVEM endpoint family is fully recovered remains a final-route question.
 
@@ -283,7 +283,7 @@ Current gate evidence for the LSU change:
 - focused LS suites: 24/24;
 - RTE regression: 1/1;
 - phase-local `test-fast`: 133/134 with only the independently reproduced stale
-  line-B oracle; current combined-branch `test-fast`: 145/145 after the line-B,
+  line-B oracle; current combined-branch `test-fast`: 147/147 after the line-B,
   line-0, and subsequently exposed full-opcode oracle corrections; and
 - seed-1 IPC: `load-stream` 638 cycles ideal and 769 L2-faithful, versus C3
   1829/2030. Excluding `load-stream`, aggregate cycles improve slightly rather
@@ -295,7 +295,7 @@ Current integrated MUL landing evidence:
 - the integrated test's legacy single-outstanding negative control fails on the
   second consecutive MUL request;
 - full-core synthesis-top elaboration passes; and
-- mandatory combined-branch `test-fast`: 145/145 across 153 suites.
+- mandatory combined-branch `test-fast`: 147/147 across 154 suites.
 
 The gate also exposed and repaired undefined fixture inputs rather than
 tolerating them. Exception-entry, interrupt-entry, and RTE tests now attach the
