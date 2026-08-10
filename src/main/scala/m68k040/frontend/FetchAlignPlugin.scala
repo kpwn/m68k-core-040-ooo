@@ -385,9 +385,22 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // it here created the measured 24-level ROB-flush/exception -> ITLB/I-cache ->
     // target-hold path. External and standalone resume inputs retain the stronger
     // no-physical-application collision contract.
+    // FMax recovery (FTQ capacity cut): `ftqFull` is deliberately ABSENT from this term.
+    // The binding token amendment's section 5 terminates FTQ capacity at the elaboration
+    // bound (`ftqDepth >= RING + BUF_WORDS + 1`) plus the simulation assertion below, not
+    // at a live functional veto: every applied prediction consumes either a ring slot or
+    // at least one genuine IBuf word, so legal run-ahead cannot exceed RING + BUF_WORDS.
+    // `FtqCapacitySpec` measures a peak of 17 of 32 under maximum run-ahead with decode
+    // held, full ring turnover, backpressure/target holds, redirects, and refill. Keeping
+    // the defensive `ftqCount === 32` comparator here made the FTQ counter the source of
+    // every routed top-100 path: ftqFull -> ftbBlocked -> applyNow -> fetch-PC mux ->
+    // live ITLB CAM/permission -> L1I tag/way qualification -> speculative installer
+    // control, 7.430 ns over 23 levels. Per that amendment, restoring the combinational
+    // count equality is NOT an acceptable fallback; an undersized configuration must be
+    // rejected at elaboration or given a separately pipelined reservation mechanism.
     val ftbBlocked = redirect.valid || (resume.valid && stalled) ||
                      quiesce || stalled || faultHold || ftbSuppress ||
-                     targetHoldValid || ftqFull
+                     targetHoldValid
     val ftbDeclineDirection = ftbCandidate && !resultDirection
     val ftbDeclineFraming = ftbCandidate && resultDirection &&
                             !(resultInWindow && resultAfterDrop)
@@ -1212,6 +1225,10 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       ftbSuppress := False
     }
 
+    // Hard simulation-only tripwire for the capacity proof. This is the sole remaining
+    // consumer of `ftqFull`; it is emitted inside `ifndef SYNTHESIS` and drives no
+    // netlist, so the elaboration bound plus this assertion carry capacity correctness
+    // while the fetch/VIPT cone stays free of the occupancy comparator.
     assert(!ftqFull, "FTQ reached its defensive full state despite the run-ahead bound")
   }
 
