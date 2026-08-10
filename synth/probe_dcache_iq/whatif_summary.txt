@@ -1,0 +1,5 @@
+tag                          WNS        TNS             FEP        new worst path
+0_baseline                   WNS   -2.094  TNS     -21068.689  FEP    32729   FetchAlignPlugin_logic_stalled_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+1_falsepath_from_stS1paddr   WNS   -2.094  TNS     -21011.314  FEP    32723   FetchAlignPlugin_logic_stalled_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+2_plus_falsepath_to_sbInt    WNS   -2.094  TNS     -20934.162  FEP    32673   FetchAlignPlugin_logic_stalled_reg/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE
+3_plus_frontend_free         WNS   -1.778  TNS     -19772.711  FEP    32640   FtbPlugin_logic_rspPayload_target_reg[12]/C -> IcachePlugin_logic_s1PredEntries_3_reg[18]/CE

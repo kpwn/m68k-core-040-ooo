@@ -1078,3 +1078,211 @@ No RTL changed; `6b246de` remains the head RTL checkpoint at **-2.094 ns /
 The frontend recovery ladder that took the branch from 131.010 to 164.096 MHz
 is finished; the next work is the D-cache/IQ plateau, and it should begin with
 a ladder run, not a census.
+
+## 16. Measured negative result: the D-cache/IQ family is worth 0.000 ns (Claude, 2026-08-10)
+
+**Grounding only.  No RTL changed, and none should be written for this family.**
+Section 15 step 5 named `DcachePlugin stS1Payload_paddr -> IssueQueuePlugin
+sbInt_busy` (752 of the worst 4,000 paths, 5.805 ns / 22 levels / 70.5 % route)
+as the next campaign target.  Running `synth/probe_slack_ladder.tcl`'s
+methodology against it first — exactly as section 15 step 8 instructs — shows
+the family is worth **0.000 ns of WNS, 0.27 % of TNS and six failing
+endpoints**.  Section 15's lesson reproduces on a second, independent subsystem,
+and in a more extreme form: 752 census paths, zero recoverable slack.
+
+Evidence: `synth/probe_dcache_iq/` (script `synth/probe_dcache_iq.tcl`),
+read-only against `synth/archive/6b246de_ftb_framing_retime_decode/fullcore_routed.dcp`,
+netlist MD5 `d80f6218c5c7dcab94a33a52d64244fa`.  The probe reproduced the
+archived WNS (-2.094), TNS (-21,068.689), failing-endpoint count (32,729) and
+worst path exactly before any what-if, which validates the method.
+
+### Step 1: the measurement
+
+| What-if | WNS | TNS | Failing endpoints | Worst path |
+|---|---:|---:|---:|---|
+| baseline (reproduced) | -2.094 | -21,068.689 | 32,729 | `stalled -> s1PredEntries_3[18]/CE` |
+| false-path **all 32** `stS1Payload_paddr` regs | **-2.094** | -21,011.314 | 32,723 | unchanged |
+| + false-path **all 50** `sbInt_busy` regs | **-2.094** | -20,934.162 | 32,673 | unchanged |
+| + free the whole frontend (`applyNow` nets + `stalled`) | -1.778 | -19,772.711 | 32,640 | `FtbPlugin rspPayload_target[12] -> s1PredEntries_3[18]/CE` |
+
+Deleting the entire startpoint family recovers **0.000 ns of WNS**, 57.4 ns of
+TNS (0.27 %) and **six** failing endpoints.  Deleting the entire *endpoint*
+family on top of it — every bit of `sbInt_busy`, which no real cut could ever
+achieve — recovers 134.5 ns of TNS (0.64 %) and 56 endpoints, still at
+0.000 ns of WNS.
+
+The reason is arithmetic, and it is the reason the census misleads.  The
+family's own best slack is **-1.823 ns**, which is **0.271 ns better than the
+design's WNS**.  It is not the critical path and never was.  The 5.805 ns
+figure quoted in section 15 step 5 is *data-path delay*, not slack; by slack
+this family is third, behind `stalled -> s1PredEntries` (-2.094) and the
+frontend cone generally.  Delay and criticality are different quantities and
+this campaign should stop quoting the former.  Separately, the 752 census paths
+map to only six *exclusively* affected endpoints: each of the other 746
+endpoints keeps a near-identical violating path from a different startpoint into
+the same cone, so retiring one startpoint merely rotates the census.
+
+### Step 2: the ladder past it — the whole region is a backfilled plateau
+
+With the frontend and this family both freed, fourteen further rungs:
+
+```
+rung   WNS      delta   worst startpoint -> endpoint
+   0  -1.778   +0.000   FtbPlugin rspPayload_target[12] -> s1PredEntries_3[18]/CE
+   1  -1.776   +0.002   DecodeStage spec_size[0]        -> FetchAlign predictPending/D
+   2  -1.770   +0.006   DecodeStage packets_0_words_0[4]-> FetchAlign predictPending/D
+   3  -1.752   +0.018   DcachePlugin missSet[4]         -> IssueQueuePlugin sbNzvc_busy[9]/D
+   4  -1.745   +0.007   FetchAlign targetHoldPc[13]     -> s1PredEntries_3[18]/CE
+   5  -1.741   +0.004   FetchAlign fetchPc[14]          -> s1PredEntries_3[18]/CE
+   6  -1.716   +0.025   FetchAlign ftqHead[0]           -> FetchAlign p0LiveReg_lenWords[2]/D
+   7  -1.696   +0.020   DcachePlugin stS2Payload_paddr[8] -> IssueQueuePlugin sbNzvc_busy[9]/D
+   8  -1.691   +0.005   FetchAlign targetHoldValid      -> s1PredEntries_3[18]/CE
+   9  -1.672   +0.019   DcachePlugin missCmode[1]       -> IssueQueuePlugin sbNzvc_busy[9]/D
+  10  -1.664   +0.008   DcachePlugin tagMem_2/CLKARDCLK -> DcachePlugin valids_0_30/D
+  11  -1.644   +0.020   DecodeStage packets_0_words_1[0]-> FetchAlign predictPending/D
+  12  -1.632   +0.012   DcachePlugin tagMem_3/CLKARDCLK -> DcachePlugin valids_0_30/D
+  13  -1.625   +0.007   FetchAlign ibuf/headPtr[0]      -> FetchAlign predictPending/D
+  14  -1.613   +0.012   FetchAlign ibuf/headPtr[1]      -> FetchAlign predictPending/D
+```
+
+Rungs 3, 7 and 9 are the *same* D-cache-to-IQ-scoreboard cone reappearing with
+three different D-cache startpoints (`missSet`, `stS2Payload_paddr`,
+`missCmode`) into `sbNzvc_busy` instead of `sbInt_busy` — 0.057 ns between
+them.  That is the definitive backfill signature: the cone, not the register,
+is the object, and the cone has at least half a dozen registers arriving within
+0.06 ns of each other.
+
+**Aggregate ceiling: retiring seventeen consecutive register families —
+the whole frontend demand cone plus the whole D-cache/IQ ready cone plus the
+decode `spec_size` family plus the D-cache tag/valid arcs — moves WNS from
+-2.094 to -1.613, i.e. 0.481 ns, 164.096 -> 176.601 MHz.**  200 MHz needs
+1.094 ns.  Family cutting, even taken to an unreachable limit, reaches 44 % of
+the required gain.  The method is finished, not merely tired.
+
+### Step 3: what the D-cache-to-IQ connection actually is
+
+It is not a data dependency.  It is the **elastic accept-last ready chain**,
+combinational and unbroken from the D-cache's admission decision back through
+four LS-EU stages into the issue queue's scoreboard bookkeeping:
+
+```text
+stS1Payload.paddr  (registered store descriptor, store-drain S1)
+  -> stS1Set = paddr(offBits+setBits-1 downto offBits)                    DcachePlugin:635
+  -> refillWriteHold = (stS1Valid && !barriers && stS1Set === missSet) || ...   :802
+  -> refill / store array write enables  wrEn(w), wrSet(w)
+  -> earlyProbeSetWriteVec(i) = OR_w( wrEn(w) && wrSet(w) === probeVaddr(i).set ) :418
+  -> earlyProbeHit  = earlyProbeOwnsCmd && earlyProbeHits(idx)
+                      && !earlyProbeSetWriteVec(idx)                      :426
+  -> useEarlyProbe  = earlyProbeHit && !ldS1Valid                         :429
+  -> loadProbePort.ready / loadCmdPort.ready                              :929 / :965
+  -> LsEu normalReqArm = tValid && tIsMem && txReady && ...
+                         && (!tIsLoad || dcache.loadProbe.ready)          LsEuPlugin:1749
+  -> tCanLeave -> tReady -> s1ToT -> s1Ready
+  -> issuePort.ready = s1Ready && !sqFlushSig && !excActive               LsEuPlugin:1780
+  -> IssueQueuePlugin selPorts(3).ready -> selPorts(3).fire
+  -> when(selPorts(k).fire){ when(pdstValid){ sbInt.busy(pdst) := False } } IQ:948-953
+```
+
+The last hop is what makes it wide rather than merely long: the scoreboard
+clear is a *decoded* write over a 50-bit bitmap, so one `fire` bit fans into 50
+independent write-enable cones, each ANDed with a 6-bit `pdst` comparator.  That
+is the 50-endpoint `sbInt_busy` family, and 46 of its 50 worst paths start at
+`stS1Payload_paddr` (the other 4 at `RobPlugin doFlushReg`).
+
+The semantic question the arc answers is legitimate and cheap to state: *"may
+this load consume its held early-probe snapshot, or did a concurrent store /
+refill array write to the same virtual set stale it?"*  The store-S1 physical
+set index is one of the four write-port sets being compared.  Nothing here is
+accidental or vestigial — it is the price of the `useEarlyProbe` VIPT fast path
+that the IPC campaign was built on (section 3: "the hard test requires
+`useEarlyProbe` for every hit").
+
+It is also *physically* long: the routed path runs SLICE_X48Y203 (D-cache
+store-drain) -> X50-54Y192-206 (D-cache probe/write control) -> X52Y181 (LS EU
+tx) -> X61Y135 -> X73Y131 (IQ scoreboard).  About 72 CLB rows and 25 columns,
+which is where the 70.5 % route comes from.  Section 15 step 7 already noted
+that no existing pblock encloses both ends.
+
+### Step 4: the cross-referenced `fe3de1c` pattern does not transfer — it is already here
+
+`fe3de1c` `iq: delete provably-redundant !slowFire term from the scoreboard
+busy-clear gate (FMax)` is **already in this branch's history** for
+`src/main/scala/m68k040/execute/iq/IssueQueuePlugin.scala`, three commits below
+`61ce032`.  The clear loop at IQ:948-953 is the post-fix form —
+`when(selPorts(k).fire)` with no `!slowFire` — and the long comment above it
+records that grounding (it measured the family at -1.699 ns and the `op`-field
+MuxOH as the mechanism).  So the pattern is not a new opportunity here; it was
+the *previous* cut on this exact endpoint family, and what remains is the
+irreducible `fire && pdstValid && pdst==k` decode.  Notably that earlier cut
+took this family from WNS-holder (-1.699) to non-critical (-1.823 today, third
+place) — it worked, and it used up the available slack in this cone.
+
+### Step 5: fix shapes considered, and why none is justified
+
+Two clean, spec-shaped cuts exist.  Both are worth 0.000 ns and neither should
+be built for timing reasons:
+
+1. **Register the IQ -> LS-EU issue-port ready (2-deep skid).**  This severs the
+   whole chain above at its widest point.  It is the textbook fix for a long
+   combinational ready chain, it is architecturally clean, and it costs a real
+   `IqContext`-width buffer plus a re-proof of the LS ordering/flush contract.
+   Measured worth: 0.000 ns WNS.
+2. **Retime `earlyProbeSetWriteVec` out of `earlyProbeHit` into a registered
+   stale-invalidate of `earlyProbeReadies(i)`** — the same class of cut as
+   `6b246de` (register the verdict when the information becomes final).  This
+   would take every write-port set comparison, and therefore `stS1Set`,
+   `stS2Set`, `stS3Set` and `missSet`, entirely off `loadCmdPort.ready` /
+   `loadProbePort.ready`.  It is *not* a pure retime: the same-cycle
+   write-versus-consume case would have to be re-proved or conservatively
+   blocked, because a snapshot consumed in the same cycle as the write that
+   stales it is exactly the case the live compare exists to catch.  Measured
+   worth: 0.000 ns WNS, and it would put a genuine correctness invariant at
+   risk for 0.27 % of TNS.
+
+Recommendation: do neither now.  Keep (2) on file as a candidate *if* the
+design ever becomes IPC-limited by `loadProbe.ready` back-pressure, where it
+would be justified on throughput grounds rather than timing.
+
+### Step 6: what this means for the 200 MHz goal
+
+The remaining 1.094 ns is not in any register family.  Three independent
+measurements now say the same thing:
+
+- section 15: the frontend ladder caps at 0.294 ns and eleven consecutive
+  families share 0.246 ns of it;
+- section 15 step 9: freeing every I-cache miss/prefetch endpoint buys
+  0.000 ns;
+- this section: freeing the top two post-frontend families buys 0.000 ns, and
+  seventeen families together buy 0.481 ns.
+
+Every limiting path is 17-22 levels at 63-78 % route on a device that is 51 %
+full.  That is a **placement/congestion-bound** design.  The levers that remain
+are structural, and they should be evaluated in this order:
+
+1. **A floorplan aimed at the current limiters**, not the historical ones.  The
+   `pb_decode` box's advantage has already collapsed from 0.442 ns to 0.093 ns
+   (section 15 step 7) and `pb_dcache` is actively harmful.  The measured spans
+   here — D-cache store-drain at Y~203, LS EU at Y~181-194, IQ scoreboard at
+   Y~131-135 — argue for a *backend* region enclosing `DcachePlugin` +
+   `LsEuPlugin` + `IssueQueuePlugin`, and for repairing `pb_dcache`'s
+   flattened-name over-capture first.  This is a same-DCP experiment, cheap.
+2. **A real pipeline stage in the two long elastic chains** — the frontend
+   demand cone (section 14 segment D) and the LS accept chain (step 5 fix 1
+   above) — accepted as a *cycle* cost and justified by IPC measurement, not by
+   the what-if ladder, since a static ladder cannot model the placement freedom
+   a genuine cone deletion creates.  Both of this campaign's two best cuts beat
+   their static prediction for exactly that reason.
+3. **Retiming/replication passes in the tool** (`-directive` sweep,
+   `phys_opt_design` iterations) before any further RTL.  Untried on this
+   branch and cheap relative to an RTL cut.
+
+The ladder tool should still be run before each of these, but its role changes:
+it is now an *exclusion* test (does this cut have any WNS to recover at all?)
+rather than a target selector.
+
+### Status after this section
+
+No RTL changed.  `6b246de` remains the head RTL checkpoint at **-2.094 ns /
+164.096 MHz**, `FLOORPLAN_MODE decode`.  New committed tool:
+`synth/probe_dcache_iq.tcl` (adds TNS / failing-endpoint deltas and an
+arbitrary-family what-if to the section-15 ladder, which only reported WNS).

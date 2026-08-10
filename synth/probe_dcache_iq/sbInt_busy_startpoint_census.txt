@@ -1,0 +1,3 @@
+startpoints reaching IssueQueuePlugin_logic_sbInt_busy (worst 50 unique endpoints)
+     4  RobPlugin_logic_doFlushReg_reg
+    46  DcachePlugin_logic_stS1Payload_paddr_reg
