@@ -23,14 +23,20 @@ if {[llength $synth_paths] > 0} {
   set synth_wns [get_property SLACK $synth_paths]
   puts "POSTSYNTH_FULLCORE_WNS_NS $synth_wns"
 }
-# Front-end floorplan: co-locate DecodeStage so the decode->ring nets stay local (read after
-# opt so the cell filter sees elaborated leaves). Part of the front-end FMax stack (195->~218).
-read_xdc synth/floorplan_decode.xdc
-# LS-cluster floorplan: co-locate D-cache + DTLB + LS-EU so the valids->hrPpn cross-module
-# load/translate nets stay local (read after opt so the cell filter sees elaborated leaves).
-# Attacks the post-route limiter DcachePlugin valids/C -> DtlbPlugin hrPpn/CE (73% route).
-read_xdc synth/floorplan_dcache.xdc
-puts "FLOORPLAN pb_dcache cells: [llength [get_cells -of_objects [get_pblocks pb_dcache]]]"
+set skip_floorplan 0
+if {[info exists ::env(SKIP_FLOORPLAN)] && $::env(SKIP_FLOORPLAN) eq "1"} {
+  set skip_floorplan 1
+  puts "SKIP_FLOORPLAN 1"
+} else {
+  # Front-end floorplan: co-locate DecodeStage so the decode->ring nets stay local (read after
+  # opt so the cell filter sees elaborated leaves). Part of the front-end FMax stack (195->~218).
+  read_xdc synth/floorplan_decode.xdc
+  # LS-cluster floorplan: co-locate D-cache + DTLB + LS-EU so the valids->hrPpn cross-module
+  # load/translate nets stay local (read after opt so the cell filter sees elaborated leaves).
+  # Attacks the post-route limiter DcachePlugin valids/C -> DtlbPlugin hrPpn/CE (73% route).
+  read_xdc synth/floorplan_dcache.xdc
+  puts "FLOORPLAN pb_dcache cells: [llength [get_cells -of_objects [get_pblocks pb_dcache]]]"
+}
 place_design
 phys_opt_design
 route_design
