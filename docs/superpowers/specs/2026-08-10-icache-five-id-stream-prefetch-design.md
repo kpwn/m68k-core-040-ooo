@@ -1,7 +1,7 @@
 # Five-ID I-cache stream-prefetch design
 
 **Date:** 2026-08-10  
-**Status:** Draft; RTL is blocked until the SoC CPU-IF five-ID contract passes  
+**Status:** Binding; SoC CPU-IF five-ID dependency passed
 **Parent:** `2026-08-10-icache-parallel-vipt-design.md`  
 **Supersedes on activation:** the parent's Phase-B four-entry sketch and
 `2026-07-30-mshr-multi-outstanding-design-proposal.md`'s two-entry I-side
@@ -35,7 +35,9 @@ resident register cut cannot hide serialized 70-cycle fills.
 
 ## 2. External dependency
 
-No RTL under this document may land until the sibling SoC proves all of:
+The sibling SoC dependency is satisfied by spec-first commits `bf6c859`,
+`afcc0cb`, `4a9d608` and RTL commit `4079649`.  Its non-vacuous gate proves all
+of:
 
 - CPU instruction master M2 accepts five distinct original ARIDs and presents
   five downstream S0/L2 AR handshakes before any response;
@@ -49,6 +51,13 @@ No RTL under this document may land until the sibling SoC proves all of:
 The SoC table must be a compile-time parameter supporting at least 4..8 and
 defaulting to five.  The core remains a legal single-outstanding AXI master
 when prefetch is disabled.
+
+The exact platform run accepted five distinct ARLEN=3 64-byte lines at both M2
+and the S0/L2 boundary before any R, blocked the sixth and duplicate live IDs,
+then completed IDs out of order while checking every beat, RID, RRESP and
+RLAST.  `tb-axi-xbar` passed 422 checks; L2, L2-chain, VRAM-DDR-chain and all
+eight lint configurations also passed.  No physical gate has yet measured the
+new platform CAM/context table.
 
 ## 3. Slot and ID ownership
 
