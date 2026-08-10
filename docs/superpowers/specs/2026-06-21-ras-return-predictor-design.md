@@ -1,5 +1,13 @@
 # Slice 2 — Return-address stack (RAS) for RTS/RTR prediction (design)
 
+**Timing amendment (2026-08-10):** RAS semantics, push/pop timing, and EU
+verification below remain binding. Statements that `predictFire` mutates fetch
+state on the same `feed.fire` cycle are superseded by
+`2026-08-09-ipc-fetch-directed-btb-token-pipeline-amendment.md`. A taken BTB/RAS
+fallback now captures its target on `feed.fire` C and performs the fetch/ring
+action from registered state in C+1, while retaining the same C+1 target-command
+timing.
+
 **Goal:** Predict the target of returns (RTS/RTR) at fetch so a return costs ZERO pipeline
 squash, the way slice 1 did for branches. Today RTS/RTR are deliberately UNPREDICTED (the
 BTB excludes them) → every return pays the ~5–6-cycle commit-time squash. Call/return-heavy
@@ -64,11 +72,10 @@ unchanged — BSR is PC-relative, JSR is BTB-learned-indirect).
 When the emitted slot is `isReturn` AND `count > 0`:
 - `predTarget = rasTop`; stamp `feed.payload(slot).predTaken := True` and `.predTarget :=
   predTarget` (exactly like slice 1's BTB `slot0IsPred` stamping).
-- Drive the fetch redirect to `predTarget` (reuse slice 1's `predictFire` / the
-  decodePc/fetchPc/pendingDrop/recStale machinery — a RAS-predicted return is a predicted-taken
-  redirect identical to a BTB taken branch, so it MUST be included in `redirectThisCycle` the
-  same way `predictFire` is, to keep the same-cycle in-flight fetch born-stale — the slice-1
-  staleness fix).
+- Capture `predTarget` into the common registered fallback action. A
+  RAS-predicted return is otherwise identical to a BTB taken branch: action C+1
+  drives decodePc/fetchPc/pendingDrop and makes every pre-action ring entry
+  stale while preserving a target command issued in C+1 as live.
 - `rasSp := rasSp - 1 ; count := count - 1`.
 
 When `count == 0` on a return: no prediction (no `predTaken`, no redirect) — the return falls
@@ -138,7 +145,7 @@ OUT (deferred): sp checkpoint/repair (§6); any BTB change; the gshare/GHR upgra
   `BtbPlugin` wiring style.
 - `frontend/FetchAlignPlugin.scala` — drive the RAS push (on `isCall` of the emitted slot) and
   pop/predict (on `isReturn`); compose the predict source (`isReturn ? RAS : BTB`); include the
-  RAS-predicted-return in `predictFire`/`redirectThisCycle` (the staleness rail). Needs the
+  RAS-predicted return in the common registered fallback detector/action. Needs the
   emitted slot's `isCall`/`isReturn`/`lenWords` from predecode (already in `PredecodeMeta` per
   the explore).
 - `types/PredecodeMeta.scala` / `frontend/PredecodeWord.scala` — CONFIRM `isCall`/`isReturn`/
@@ -186,8 +193,9 @@ the limiter, register the pop-predict read or shrink the path; re-gate.
 - **Same-cycle push/pop discipline** — confirm at most one push OR one pop per cycle (§4); a slot
   that is both isn't possible (an instruction is a call XOR a return). The aligner emits one
   predicted-redirecting slot/cycle, so the RAS is single-ported.
-- **Staleness** — a RAS-predicted return is a predicted redirect; it MUST be folded into
-  `predictFire`/`redirectThisCycle` exactly like the BTB prediction (the slice-1 staleness-bug
-  class). The interleaved-mispredict lock-step test guards this.
+- **Staleness** — a RAS-predicted return MUST use the same registered fallback
+  action as a BTB prediction. Action C+1 kills old responses/ring entries and
+  preserves only its captured target record. The interleaved-mispredict
+  lock-step test guards architectural recovery.
 - **Cold-call / empty-RAS** — first call pushes but its return may still be unpredicted if fetch
   went wrong-path; expected, amortized once warm. Underflow predicts nothing (safe).

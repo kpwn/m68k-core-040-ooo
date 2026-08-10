@@ -1,5 +1,12 @@
 # Slice 3 — gshare/GHR direction predictor (design)
 
+**Timing amendment (2026-08-10):** Gshare indexing, direction, GHR shift, and
+retire training below remain binding. The taken fallback's fetch-state action is
+now registered as specified by
+`2026-08-09-ipc-fetch-directed-btb-token-pipeline-amendment.md`: `feed.fire` C
+captures the target and action C+1 performs the redirect while retaining the
+same C+1 target-command timing.
+
 **Goal:** Predict the DIRECTION of correlated / data-dependent conditional branches that the
 slice-1 per-PC bimodal misses. The `branchy` IPC kernel is stuck at 0.236 because its inner
 `beq` alternates taken/not-taken (a deterministic 1-0-1-0 driven by the prior iteration) — a
@@ -62,7 +69,8 @@ predDirCond = phtTaken                            // gshare's direction for it (
 
 So the only change to the slice-1/2 slot prediction is: for a conditional BTB hit, the
 predicted-taken bit is sourced from the PHT instead of the BTB counter. Everything downstream
-(stamp, suppress, predictFire redirect) is the slice-1 path, keyed on this new predicted-taken.
+(stamp, suppress, registered fallback detector/action) is the slice-1 path, keyed on this
+new predicted-taken.
 
 The BTB's own bimodal counter stays maintained at retire (slice 1) but is IGNORED for
 conditionals (gshare supplies their direction). Leaving it maintained keeps the BTB self-
@@ -74,9 +82,9 @@ contained; no BTB change.
 
 The branchy `beq` must be predicted right on BOTH its taken and not-taken iterations:
 
-- **Predicted TAKEN conditional** (`condBtbHit && phtTaken`): stamp `predTaken=True`,
-  `predTarget=btbTarget`, suppress post-branch words, redirect fetch (the slice-1 `predictFire`
-  path), and shift `GHR<<1 | 1`.
+- **Predicted TAKEN conditional** (`condBtbHit && phtTaken`): stamp
+  `predTaken=True`, `predTarget=btbTarget`, suppress post-branch words, capture
+  the registered fallback action, and shift `GHR<<1 | 1`.
 - **Predicted NOT-TAKEN conditional** (`condBtbHit && !phtTaken`): leave `predTaken=False` (the
   default — NO redirect, fall through, slot1 stays valid), and shift `GHR<<1 | 0`.
 
@@ -102,7 +110,7 @@ trains the right entry.
 
 Note: at most one predicted-redirecting slot/cycle (slice-1 discipline), but a predicted-NOT-taken
 conditional does NOT redirect yet still updates the GHR — so the GHR shift is gated on
-`condBtbHit` (a conditional was emitted), NOT on `predictFire` (taken-only). A predicted-not-taken
+`condBtbHit` (a conditional was emitted), NOT on the taken-only fallback detector/action. A predicted-not-taken
 conditional in slot0 lets slot1 proceed (fall-through); ensure the GHR shifts exactly once for the
 emitted conditional (gate on the slot actually consumed by `feed.fire`).
 

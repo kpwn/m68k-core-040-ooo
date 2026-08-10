@@ -1,5 +1,11 @@
 # FMax closure, "Frontend Lever C": split the Aligner→offload cone with a pipeline register (design)
 
+**Historical timing note (2026-08-10):** this document predates the registered
+BTB/RAS fallback action in
+`2026-08-09-ipc-fetch-directed-btb-token-pipeline-amendment.md`. References
+below to a same-cycle `predictFire` redirect describe the then-current baseline,
+not the live frontend contract.
+
 ## Context
 
 Part of FMax-closure round 3 (full history:
