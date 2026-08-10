@@ -49,8 +49,8 @@ foundation, not an open risk.
 
 ## 1. Goals
 
-- Real hardware datapath for: FMOVE, FABS, FNEG, FCMP, FTST (synthetic
-  FCMP-vs-implicit-zero, no dedicated datapath), FADD, FSUB, FMUL,
+- Real hardware datapath for: FMOVE, FABS, FNEG, FCMP, FTST (direct
+  source classification, no arithmetic datapath), FADD, FSUB, FMUL,
   FDIV, FSQRT, FMOVECR (ROM constant table), FMOVEM (both data-register
   -list and control-register-list forms), FSAVE/FRESTORE (idle-frame
   only — see §4).
@@ -114,6 +114,13 @@ macro effects remain precise because the ROB retires in order. No global result,
 exception, or "flushed" latch may identify more than one in-flight operation;
 association must travel with the descriptor or be keyed by ROB identity.
 
+FTST is a distinct cheap classifier, not a decode rewrite into FCMP against
+zero. Musashi's `m68kfpu.c` opmode `0x3a` passes the source directly to
+`SET_CONDITION_CODES`; in particular, FTST of infinity sets FPSR.I, whereas
+FCMP's difference-result rules deliberately leave I clear. The implementation
+may share the generic result-to-FPCC classifier used after arithmetic, but must
+not enter the subtract/compare datapath.
+
 **Open implementation-time question** (flag for the plan, not decided here):
 whether the FPU gateway shares the existing CPLX select/physical completion
 gateway or uses a new logical cluster while still sharing physical PRF/ROB
@@ -151,19 +158,26 @@ sides). No format-selection fix is needed for this work.
 **The real, actionable gap the audit found instead**: what actually
 differs between m68k-ooo's two vector-11 paths is NOT the frame
 format — it's the stacked **PC field**: pre-instruction vs
-post-instruction PC (`commit.v:1454-1457`). **This project has no
+post-instruction PC (`commit.v:1443-1477`). **This project has no
 post-instruction-PC flavor of vector-11 delivery at all** —
-`MicroOpAssembler.scala:1533` unconditionally sets
-`faultUsesNextPc := False` for every F-line delivery. This matters
-directly for this FPU work: an FPSP-style handler that expects to RTE
-past the trapping F-line opword (rather than re-executing it) needs
-the post-instruction-PC variant, or it will loop on the same opword
-forever. **Required for this work**: add the post-instruction-PC
-option to vector-11 delivery, gated on whatever condition m68k-ooo
-uses to choose between its two paths (needs a closer read of
-`decode.v:3896` vs the `commit.v` pseudo-vector path before locking
-the exact trigger condition — flagged as an implementation-time item,
-not fully resolved by the audit alone).
+`MicroOpAssembler.scala`'s generic line-F fallback leaves
+`faultUsesNextPc := False`. This matters directly for this FPU work:
+an FPSP-style handler that expects to RTE past a recognized but
+software-completed FPU instruction needs the post-instruction-PC
+variant, or it will loop on the same opword forever.
+
+The trigger is now resolved from the sibling RTL rather than left as
+an implementation-time guess. Its packed-source capture crack knows
+the complete instruction length and raises pseudo-vector `0x8B`
+(`decode/decode_1111.vh:486-493`); commit translates that back to
+architectural vector 11 while selecting the fall-through PC. The
+plain top-nibble line-F fallback has unknown/untrusted length and keeps
+ordinary vector 11 with the faulting PC. **Required here:** any
+recognized FPU instruction deliberately handed to FPSP after its full
+length and required source state have been captured sets
+`faultUsesNextPc := True`; an unrecognized line-F encoding keeps it
+False. The architectural vector remains 11 in both cases—do not expose
+`0x8B` outside an internal control encoding.
 
 **Also surfaced, unrelated to vector 11 but worth carrying forward**:
 one genuine MISMATCH found — M=1 interrupt dual-frame placement
@@ -328,18 +342,15 @@ functional throughput.
    both; this spec doesn't yet lock how much of FPCR's control
    semantics (vs. just FPSR's status/condition semantics) are in
    scope. Needs an explicit decision before the plan is written.
-4. §5's post-instruction-PC vector-11 delivery: the exact trigger
-   condition m68k-ooo uses to choose between its pre-instruction-PC
-   and post-instruction-PC vector-11 paths needs a closer read of
-   `decode.v:3896` vs. the `commit.v` pseudo-vector path (`8'h8B`,
-   `commit.v:1432-1435,1454-1457`) before locking how this project's
-   new `faultUsesNextPc` option gets gated — not yet resolved by the
-   audit alone, same bit-level-verification discipline this project
-   used for CPUSH/CINV's encoding (Task P5.1).
-5. FTST's synthesis as FCMP-vs-implicit-zero: confirm this exactly
-   matches real 68040 FTST semantics (condition-code effects
-   specifically) before locking it as a decode-time rewrite rather
-   than a distinct micro-op.
+4. §5's post-instruction-PC vector-11 delivery trigger is resolved:
+   recognized, fully framed FPU software-completion uses `nextPc`;
+   an unknown line-F fallback uses the faulting `pc`. The implementation
+   plan must still specify and test the required FPSP command/source-state
+   capture before enabling the recognized path; `faultUsesNextPc` alone
+   is necessary but not sufficient for a usable ROM FPSP hand-off.
+5. FTST semantics are resolved: keep it as a distinct cheap micro-op that
+   classifies its source directly. Directed tests must include finite values,
+   signed zero, infinity, and NaN so an FCMP-vs-zero rewrite fails visibly.
 6. Exact fixed-operation latencies and FIFO depths: select them from inference
    probes and collision analysis while keeping II=1 and reserving every
    unstallable result before launch. Latency is deliberately not frozen before
