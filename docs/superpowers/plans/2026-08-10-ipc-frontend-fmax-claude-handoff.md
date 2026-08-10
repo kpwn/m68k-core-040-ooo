@@ -2955,3 +2955,81 @@ in a bandwidth-preserving form, §3.2 accept-behind-a-miss reworded to
 *answer*-behind-a-miss), 13 hazards, four required in-RTL oracles and five
 mutation proofs.  ~1,100-1,300 lines across ~7 files.  **Awaiting explicit
 go-ahead before any implementation.**
+
+## 22.1 The combined two-arc implementation plan is written (Claude, 2026-08-10)
+
+**Plan only.  No RTL, no synth.**  Section 22's design covers arc 1 alone, and
+its own section 9.4 states why that is not enough: *"this arc and the D-cache/IQ
+arc are tied.  Neither alone moves WNS.  The program only pays if at least two of
+the three arcs land."*  The implementation plan therefore covers **two** arcs:
+
+**`docs/superpowers/plans/2026-08-10-ipc-fetchalign-icache-combined-implementation-plan.md`**
+(commit `2bea2c1`, 2,594 lines, 4 slices, **24 tasks**, 124 TDD steps).
+
+**What it adds beyond section 22's design.**  The design's six slices are expanded
+into task-by-task detail — exact files, exact SpinalHDL, exact test commands,
+exact Vivado invocations — and one of the two shelved D-cache/IQ fixes from
+sections 16/19 is folded in as a new slice, so the tie can actually be broken.
+
+**Which fix, and why — the plan grounds the choice rather than defaulting.**  It
+builds **Fix A** (the IQ -> LS-EU registered-ready skid), not Fix B:
+
+1. **Section 19 step 6's refutation of Fix A is explicitly conditional** — "its
+   over-cut upper bound is 0.000 ns, which a placement argument cannot rescue,
+   *because the tie is with a different subsystem entirely*."  Landing arc 1
+   removes exactly that condition.
+2. Fix A **is** a stage split of the arc section 20 step 6 named ("the D-cache
+   store pipe -> IQ scoreboard wakeup arc, 1,370 / 1,032"), the only category
+   that section says is left.  Fix B is a retime, from the category section 19
+   step 4 measured at +0.012 ns for every candidate on file applied at once.
+3. **Section 19 step 5 re-verified Fix B's risk against the routed netlist and it
+   did not improve**: `wrEn` / `wrTagEn` are combinational defaults driven in the
+   cycle of the write, so the same-cycle write-versus-consume hole is real,
+   exactly one cycle wide, and a silent-corruption class.  Both section 16 step 5
+   and section 19 step 5 require a *throughput* justification for it; none has
+   been shown.
+4. The honest counter-argument is recorded rather than buried: Fix B measured
+   **2.16 % of TNS / 234 endpoints** against Fix A's over-cut **0.72 % / 45**,
+   roughly 5x the breadth on the population metric.  So Fix B is **not deleted** —
+   task 24 step 3 records a mechanical two-part condition under which it re-opens.
+
+**The measurement is a matrix, not a number.**  Four real post-route runs under
+`FLOORPLAN_MODE=decode` + `IMPL_STRATEGY=postrouteN` + `POSTROUTE_ROUNDS=3`:
+`M0` (slice 1 only), `M1` (+ `icacheVerdictStage`), `M2` (+ `lsIssueReadySkid`),
+`M3` (both).  The verdict-bearing quantity is the **superadditivity**
+`(M3-M0) - ((M1-M0) + (M2-M0))`, whose sign is the direct test of the tie
+hypothesis and has never been measurable before.  A global constraint forbids any
+task before that matrix from recording a go/no-go verdict on FMax, precisely
+because sections 15-20 established that solo results here are always +0.000 ns.
+
+**The falsifier is executable.**  Section 22's written kill criterion is
+implemented as a task that evaluates `dWNS < +0.050 ns AND dIPC_ideal < -1.0 %`
+as a literal two-term conjunction, both solo and combined, and applies all four
+parts of the design's stated consequence.  The plan spells out that it is a
+conjunction: a gain with no IPC cost is kept, and an IPC cost with a real gain is
+kept; only both together revert.
+
+**Slice map.**  0 (tasks 1-3): baseline pin, the three binding parallel-VIPT
+amendments A1/A2/A3 landed as their own documentation commit *before* any RTL,
+and `synth/probe_combined_arcs.tcl` modelling B2+B3+FixA individually and in
+combination with an erroring object-count guard on every cut (section 19 step 1's
+rule).  1 (4-7): B3, free and unflagged.  2 (8-16): B2 behind
+`icacheVerdictStage`, with the flag proven inert by a bit-exact generated-Verilog
+MD5 before anything hangs off it, `RING` 3->4 guarded by an elaboration `require`,
+three in-RTL differential oracles, nine directed cases, mutations M1-M4.
+3 (17-20): Fix A behind `lsIssueReadySkid` — a **two-deep** skid implemented
+entirely inside `LsEuPlugin` (`IssueQueuePlugin` and `DcachePlugin` stay read-only
+contracts), with the ordering/flush re-proof section 16 step 5 demanded.  Notably
+the plan grounds the scoreboard-timing question rather than assuming it:
+`IssueQueuePlugin.scala:900-905` records that LS int/NZVC producers never enter
+`sbInt`/`sbNzvc` at all (they use the dynamic `lsBusy`/`lsNzvcBusy` bitmaps
+cleared by a real `lsWakeup`), so the skid's one-cycle-earlier clear is a
+confirmed no-op for them; the residual `sbX` case is answered in writing and
+locked with a permanent elaboration guard.  4 (21-24): the matrix, the
+IPC x FMax delivered check against the design's break-even table, the falsifier,
+and the arc-3 (`DecodeStage -> RAS/ROB`) recensus that seeds the next design.
+
+**Status: awaiting execution.**  Nothing in `src/` has changed.  Execution is by
+subagent-driven-development, task by task, beginning with task 1's baseline
+re-verification (`make SBT=~/sbt/bin/sbt test-fast` must be confirmed on the
+actual HEAD in use, not assumed at 149/149).
