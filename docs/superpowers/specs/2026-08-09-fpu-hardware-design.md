@@ -121,12 +121,32 @@ FCMP's difference-result rules deliberately leave I clear. The implementation
 may share the generic result-to-FPCC classifier used after arithmetic, but must
 not enter the subtract/compare datapath.
 
-**Open implementation-time question** (flag for the plan, not decided here):
-whether the FPU gateway shares the existing CPLX select/physical completion
-gateway or uses a new logical cluster while still sharing physical PRF/ROB
-ports. A brand-new IQ and ROB port is not the default; the plan must first prove
-that opcode eligibility or result arbitration cannot preserve throughput with
-the existing port budget.
+**Gateway topology is resolved:** FPU uops use the existing registered CPLX IQ
+issue gateway and existing ROB completion lane. They carry an explicit FPU-kind
+marker while retaining `Cluster.CPLX`; do not widen the `Cluster` enum, add a
+sixth IQ select port, or add a ROB completion port. The registered port is
+demultiplexed after its M2S boundary into integer-CPLX and FPU lanes.
+
+Sharing selection does not mean sharing operand datapaths. FP source/destination
+physical IDs, busy state, wakeup, and FPCC dependencies are separate from the
+integer and NZVC classes. The FPU reads its own 80-bit PRF after the registered
+issue boundary; no 80-bit value is added to `IqContext`, the integer PRF, or the
+DivEu operand mux. Memory-format inputs may continue to use the existing integer
+temporary sources for their 32-bit pieces.
+
+The IQ candidate mask must be opcode/lane-credit aware. A busy FDIV/FSQRT (or
+integer DIV) is ineligible while its iterative context is occupied, but must not
+park in the one registered issue slot and block a younger fixed FMUL/FADD or
+integer MUL. The next-cycle eligibility promise accounts for the operation
+currently firing from that registered slot, so consecutive selection cannot
+overbook an iterative context or elastic fixed-pipe entry.
+
+Integer-CPLX and FPU result tails each remain held until a small fair grant
+arbiter selects one for the existing ROB completion lane. Each EU gates its own
+PRF write, bypass, wakeup, status/fault observation, and completion atomically on
+that grant. A Flow producer may not emit speculatively and hope the top-level mux
+keeps it. This topology adds only narrow selection/grant metadata; a separate
+FPU IQ/ROB port is a later evidence-driven option, not part of the base design.
 
 ## 4. FSAVE/FRESTORE — idle-frame only
 
@@ -278,14 +298,27 @@ IPC-push initiatives:
   pblock deltas for review before rejecting or reverting it. Area pressure is a
   design tradeoff checkpoint, not an automatic rollback.
 
-## 8. FPCC register rename
+## 8. FP and FPCC register rename
 
-A 4th `RegFilePlugin(RegfileSpec.Fpcc)` instantiation, structurally
-identical to the existing `RegFilePluginNzvc`/`RegFilePluginX` — same
-rename/freelist/bypass machinery, already proven correct and
-FMax-characterized this session. Exact FPCC bit layout (which
-condition bits: N/Z/I/NaN at minimum, matching real 68040 FPSR.FPCC)
-is an implementation-time detail, not a design-level open question.
+Add two independent register-file classes using the existing proven
+rename/freelist/bypass machinery:
+
+- `RegfileSpec.Fp`: 32 physical entries x 80 bits for eight architectural
+  FP0-FP7 registers. Two async reads feed the registered FPU input boundary;
+  the result arbiter provides one physical write/bypass lane. The 24 rename
+  entries beyond architectural state keep the fixed pipelines from exhausting
+  rename capacity before their first results retire.
+- `RegfileSpec.Fpcc`: 16 physical entries x 4 bits for the single architectural
+  FPSR condition-code group, matching the existing NZVC/X shape.
+
+Both RATs have two rename/commit ports and rollback with the integer RATs. FP
+data and FPCC carry distinct source/destination/old physical IDs in the renamed
+uop and ROB commit metadata; no global current-result latch is permitted.
+
+The internal FPCC layout is fixed as `[3:0] = {NaN, I, Z, N}`. Architectural
+FPSR bits `[27:24] = {N, Z, I, NaN}` are therefore the reversed presentation of
+that group. FTST and every result-producing arithmetic/move operation write the
+renamed FPCC result; FCMP writes FPCC without an FP-data destination.
 
 ## 9. Test target
 
@@ -329,10 +362,11 @@ functional throughput.
 
 ## 10. Open items requiring implementation-time verification (not silently assumed)
 
-1. FPU gateway topology (§3): share the existing CPLX selection gateway or add
-   a new logical cluster while retaining the existing physical PRF/ROB ports.
-   Decide from opcode eligibility, collision, occupancy, and timing evidence;
-   a new scheduler or writeback port is not the default.
+1. FPU gateway topology (§3) is resolved: share the registered CPLX selection
+   gateway and ROB completion lane, keep separate FP/FPCC PRFs and dependency
+   tracking, mask candidates with next-cycle lane credits, and grant held result
+   tails atomically. The implementation plan must include the no-head-of-line and
+   simultaneous-result tests described in §9.
 2. Exact FMOVE/FMOVEM/FMOVECR EA-addressing-mode coverage — full
    parity with the existing integer MOVE EA-decode matrix, or a
    narrower subset matching only what the 48 target tests exercise?
