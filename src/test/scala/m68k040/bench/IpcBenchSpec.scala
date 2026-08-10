@@ -4,7 +4,7 @@ import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
 import m68k040.mmu.{ItlbPlugin, DtlbPlugin, MmuControlPlugin}
 import m68k040.cache.{IcachePlugin, DcachePlugin, DcacheService}
-import m68k040.frontend.{FetchAlignPlugin, BtbPlugin}
+import m68k040.frontend.{FetchAlignPlugin, BtbPlugin, ComplexResumeActionPipe}
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
 import m68k040.rob.RobPlugin
@@ -167,15 +167,17 @@ class IpcBenchSpec extends AnyFunSuite {
       val doFlush = host[RedirectService].doFlush
       val flushPc = host[RedirectService].flushPc
       val excActive = rob.logic.excActive
-      iq.flushPort := doFlush || excActive
-      host[m68k040.services.DecodeUopService].pipeFlush := doFlush || excActive
+      val pipeFlush = doFlush || excActive
+      val decodeUop = host[m68k040.services.DecodeUopService]
+      iq.flushPort := pipeFlush
+      decodeUop.pipeFlush := pipeFlush
       host[RenameStage].logic.pipeFlush := doFlush || excActive
       // Front-end complex-packet resume (task #178, ported-tests cluster 11) -- see
       // DecodeStage.scala's `ucComplexResume` comment / FullCoreSynth.scala's mirror.
-      val ucComplexResume = host[DecodeStage].logic.ucComplexResume
+      val frontendResume = ComplexResumeActionPipe(decodeUop.complexResume, pipeFlush)
       val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
-      faRedir.valid   := doFlush || ucComplexResume.valid
-      faRedir.payload := Mux(doFlush, flushPc, ucComplexResume.payload)
+      faRedir.valid   := doFlush || frontendResume.valid
+      faRedir.payload := Mux(doFlush, flushPc, frontendResume.payload)
 
       // Fetch-time BTB wiring (slice 1): read off the fetch PC, invalidate off the
       // I-cache, feed the registered prediction into FetchAlign's predict input.

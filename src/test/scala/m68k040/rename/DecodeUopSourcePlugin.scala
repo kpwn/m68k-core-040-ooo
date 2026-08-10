@@ -22,9 +22,13 @@ class DecodeUopSourcePlugin extends FiberPlugin with DecodeUopService {
     src.ready.simPublic()
     val s1v = in Bool ()
     val flush = False
+    val resume = Flow(UInt(32 bits))
+    resume.valid   := False
+    resume.payload := 0
   }
 
   override def uops: Stream[Vec[DecodedUop]] = logic.src
   override def uop1Valid: Bool               = logic.s1v
   override def pipeFlush: Bool               = logic.flush
+  override def complexResume: Flow[UInt]     = logic.resume
 }

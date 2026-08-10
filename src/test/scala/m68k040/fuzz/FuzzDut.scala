@@ -4,7 +4,7 @@ import m68k040.M68kParams
 import m68k040.core.ParamPlugin
 import m68k040.mmu.{ItlbPlugin, DtlbPlugin, MmuControlPlugin}
 import m68k040.cache.{IcachePlugin, DcachePlugin, DcacheService}
-import m68k040.frontend.FetchAlignPlugin
+import m68k040.frontend.{FetchAlignPlugin, ComplexResumeActionPipe}
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
 import m68k040.rob.RobPlugin
@@ -145,8 +145,10 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     val doFlush = host[RedirectService].doFlush
     val flushPc = host[RedirectService].flushPc
     val excActive = rob.logic.excActive
-    iq.flushPort := doFlush || excActive
-    host[m68k040.services.DecodeUopService].pipeFlush := doFlush || excActive
+    val pipeFlush = doFlush || excActive
+    val decodeUop = host[m68k040.services.DecodeUopService]
+    iq.flushPort := pipeFlush
+    decodeUop.pipeFlush := pipeFlush
     host[RenameStage].logic.pipeFlush := doFlush || excActive
     // Front-end complex-packet resume (task #178, ported-tests cluster 11): a genuinely-
     // `complex` predecode packet permanently stalls FetchAlignPlugin until its `resume`
@@ -159,10 +161,10 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     // correctly keeps running -- only the front-end fetch pointer is unstuck. Priority:
     // a real doFlush (branch mispredict / exception) wins over a same-cycle resume (should
     // never coincide in practice; doFlush is the architecturally "real" redirect).
-    val ucComplexResume = host[DecodeStage].logic.ucComplexResume
+    val frontendResume = ComplexResumeActionPipe(decodeUop.complexResume, pipeFlush)
     val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
-    faRedir.valid   := doFlush || ucComplexResume.valid
-    faRedir.payload := Mux(doFlush, flushPc, ucComplexResume.payload)
+    faRedir.valid   := doFlush || frontendResume.valid
+    faRedir.payload := Mux(doFlush, flushPc, frontendResume.payload)
 
     val faBtb = host[FetchAlignPlugin]
     val btb   = host[m68k040.frontend.BtbPlugin]

@@ -14,15 +14,18 @@ class DecodeUopInputPlugin extends FiberPlugin with DecodeUopService {
   var uopsPort: Stream[Vec[DecodedUop]] = null
   var uop1ValidReg: Bool = null
   var flushTie: Bool = null
+  var complexResumeTie: Flow[UInt] = null
 
   override def uops: Stream[Vec[DecodedUop]] = uopsPort
   override def uop1Valid: Bool = uop1ValidReg
   override def pipeFlush: Bool = flushTie
+  override def complexResume: Flow[UInt] = complexResumeTie
 
   during setup {
     uopsPort = Stream(Vec(DecodedUop(), 2))
     uop1ValidReg = Bool()
     flushTie = False
+    complexResumeTie = Flow(UInt(32 bits))
   }
 
   val logic = during build new Area {
@@ -35,5 +38,7 @@ class DecodeUopInputPlugin extends FiberPlugin with DecodeUopService {
     uopsPort.payload := RegNext(uopsInPayload)
     uop1ValidReg     := RegNext(uop1ValidIn)   init False
     uopsOutReady     := RegNext(uopsPort.ready) init False
+    complexResumeTie.valid   := False
+    complexResumeTie.payload := 0
   }
 }

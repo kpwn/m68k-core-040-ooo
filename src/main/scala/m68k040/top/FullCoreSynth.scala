@@ -5,7 +5,7 @@ import m68k040.M68kSpinalConfig
 import m68k040.core.{M68kCore, ParamPlugin}
 import m68k040.cache.{IcachePlugin, DcachePlugin}
 import m68k040.mmu.{ItlbPlugin, DtlbPlugin, MmuControlPlugin}
-import m68k040.frontend.{FetchAlignPlugin, BtbPlugin, FtbPlugin}
+import m68k040.frontend.{FetchAlignPlugin, BtbPlugin, FtbPlugin, ComplexResumeActionPipe}
 import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
 import m68k040.dispatch.DispatchPlugin
@@ -52,8 +52,10 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     val excActive = rob.logic.excActive
     // IQ/skid flush held high while the commit-side exception sequencer runs
     // (serializing) so wrong-path uops fetched during the sequence are squashed.
-    iq.flushPort := doFlush || excActive                      // IQ clear
-    host[DecodeUopService].pipeFlush := doFlush || excActive // FE skid (decode->rename)
+    val pipeFlush = doFlush || excActive
+    val decodeUop = host[DecodeUopService]
+    iq.flushPort := pipeFlush                  // IQ clear
+    decodeUop.pipeFlush := pipeFlush           // FE skid (decode->rename)
     host[RenameStage].logic.pipeFlush := doFlush || excActive // FE skid (rename->dispatch)
     // RAT-rollback (rename.flushPort) already driven by the ROB (rc.flushPort).
     // Front-end complex-packet resume (task #178, ported-tests cluster 11): a genuinely-
@@ -62,12 +64,14 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // is the established INTERNAL wiring point instead (its handler already does exactly
     // what a `resume` would: ibuf flush + stalled:=False + decodePc:=newPc, WITHOUT
     // touching `pipeFlush`, so an in-flight µcode engine keeps running -- only the
-    // front-end fetch pointer is unstuck). See DecodeStage.scala's `ucComplexResume`
-    // comment for the full story. Priority: a real doFlush wins over a same-cycle resume.
-    val ucComplexResume = host[DecodeStage].logic.ucComplexResume
+    // front-end fetch pointer is unstuck). The service action is registered once more
+    // beside the frontend: this cuts the measured decode-pblock -> ITLB/cache/ring route
+    // at the cost of one additional cold-path cycle. Priority: a real doFlush wins over
+    // a same-cycle resume.
+    val frontendResume = ComplexResumeActionPipe(decodeUop.complexResume, pipeFlush)
     val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
-    faRedir.valid   := doFlush || ucComplexResume.valid
-    faRedir.payload := Mux(doFlush, flushPc, ucComplexResume.payload)
+    faRedir.valid   := doFlush || frontendResume.valid
+    faRedir.payload := Mux(doFlush, flushPc, frontendResume.payload)
 
     // ── Decode fallback BTB + fetch-directed FTB wiring ──────────────────────────
     // The retained BTB ports query the aligned decode packets combinationally. The FTB

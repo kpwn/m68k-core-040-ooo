@@ -3,7 +3,7 @@ package m68k040.decode
 import m68k040.{M68kParams, VerilatorTest}
 import m68k040.cache.{IcachePlugin, IcacheSim}
 import m68k040.core.ParamPlugin
-import m68k040.frontend.FetchAlignPlugin
+import m68k040.frontend.{FetchAlignPlugin, ComplexResumeActionPipe}
 import m68k040.mmu.IdentityTranslationPlugin
 import m68k040.services.DecodeUopService
 import org.scalatest.funsuite.AnyFunSuite
@@ -16,14 +16,21 @@ import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
   *
   * The real frontend presents a brief PC-indexed MOVEM, the exact supported detector arm
   * whose old combinational Flow formed the fresh route's ten worst setup paths. The test
-  * observes the local detector and the public action independently: an action in the same
-  * cycle, a missing C+1 action, a changed target, or a duplicate pulse all fail.
+  * observes the local detector, Decode service, and frontend action independently: an
+  * early action, a missing C+1/C+2 boundary, a changed target, or a duplicate pulse fails.
   */
 class UcComplexResumePipelineSpec extends AnyFunSuite {
-  class FlushDriverPlugin extends FiberPlugin {
+  class ResumeWiringPlugin extends FiberPlugin {
     val logic = during build new Area {
       val flush = in(Bool())
-      host[DecodeUopService].pipeFlush := flush
+      val decodeUop = host[DecodeUopService]
+      decodeUop.pipeFlush := flush
+      val frontendResume = ComplexResumeActionPipe(decodeUop.complexResume, flush)
+      val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
+      faRedir.valid   := frontendResume.valid
+      faRedir.payload := frontendResume.payload
+      spinal.core.sim.SimPublic(frontendResume.valid, frontendResume.payload,
+        faRedir.valid, faRedir.payload)
     }
   }
 
@@ -34,11 +41,11 @@ class UcComplexResumePipelineSpec extends AnyFunSuite {
     val fa   = new FetchAlignPlugin
     val dec  = new DecodeStage
     val sink = new UopSinkPlugin
-    val flushDrv = new FlushDriverPlugin
+    val resumeWiring = new ResumeWiringPlugin
     db.on {
       host.asHostOf(Seq[FiberPlugin](
         new ParamPlugin(M68kParams()), new IdentityTranslationPlugin,
-        ic, fa, dec, sink, flushDrv))
+        ic, fa, dec, sink, resumeWiring))
     }
   }
 
@@ -49,12 +56,13 @@ class UcComplexResumePipelineSpec extends AnyFunSuite {
       val base = 0x8000L
       val detectorFlushPc = base + 0x100
       val pendingFlushPc = base + 0x200
+      val frontendFlushPc = base + 0x300
 
       // MOVEM.L (d8,PC,D6.L*2),D2/D3/D7/A0:
       //   opword, register mask, brief index extension. Decode's supported resume contract
       //   is instruction fall-through = PC + 6, independent of the data-side EA.
-      val words = Array.fill(384)(0x4e71)
-      for (wordOff <- Seq(0, 0x80, 0x100)) {
+      val words = Array.fill(512)(0x4e71)
+      for (wordOff <- Seq(0, 0x80, 0x100, 0x180)) {
         words(wordOff + 0) = 0x4cfb
         words(wordOff + 1) = 0x018c
         words(wordOff + 2) = 0x6a00
@@ -63,7 +71,7 @@ class UcComplexResumePipelineSpec extends AnyFunSuite {
       dut.sink.logic.uopsOut.ready #= true
       dut.fa.logic.resume.valid #= false
       dut.fa.logic.redirect.valid #= false
-      dut.flushDrv.logic.flush #= false
+      dut.resumeWiring.logic.flush #= false
       cd.waitSampling(5)
 
       def redirect(pc: Long): Unit = {
@@ -93,7 +101,7 @@ class UcComplexResumePipelineSpec extends AnyFunSuite {
         target
       }
 
-      // Normal association: detector at C, exactly one target-preserving action at C+1.
+      // Normal association: detector C, Decode service C+1, frontend-local action C+2.
       redirect(base)
       val target = waitForDetector(base)
       cd.waitSampling()
@@ -101,38 +109,75 @@ class UcComplexResumePipelineSpec extends AnyFunSuite {
         "accepted detector did not produce its C+1 action")
       assert((dut.dec.logic.ucComplexResume.payload.toLong & 0xffffffffL) == target,
         "registered complex-resume target changed")
+      assert(!dut.resumeWiring.logic.frontendResume.valid.toBoolean,
+        "frontend complex resume acted before C+2")
       cd.waitSampling()
       assert(!dut.dec.logic.ucComplexResume.valid.toBoolean,
         "complex-resume action was wider than one cycle")
+      assert(dut.resumeWiring.logic.frontendResume.valid.toBoolean,
+        "Decode service action did not produce its C+2 frontend action")
+      assert((dut.resumeWiring.logic.frontendResume.payload.toLong & 0xffffffffL) == target,
+        "frontend-local complex-resume target changed")
+      assert(dut.resumeWiring.logic.faRedir.valid.toBoolean,
+        "C+2 action did not reach the real FetchAlign redirect input")
+      assert((dut.resumeWiring.logic.faRedir.payload.toLong & 0xffffffffL) == target,
+        "FetchAlign redirect observed the wrong C+2 target")
+      cd.waitSampling()
+      assert(!dut.resumeWiring.logic.frontendResume.valid.toBoolean,
+        "frontend complex-resume action was wider than one cycle")
 
       // Flush coincident with the detector must prevent capture and any later action.
       redirect(detectorFlushPc)
       waitForDetector(detectorFlushPc)
-      dut.flushDrv.logic.flush #= true
+      dut.resumeWiring.logic.flush #= true
       cd.waitSampling()
       assert(!dut.dec.logic.ucComplexResume.valid.toBoolean,
         "detector-cycle flush did not suppress complex-resume capture")
-      dut.flushDrv.logic.flush #= false
+      assert(!dut.resumeWiring.logic.frontendResume.valid.toBoolean,
+        "detector-cycle flush leaked into the frontend action stage")
+      dut.resumeWiring.logic.flush #= false
       for (_ <- 0 until 4) {
         cd.waitSampling()
         assert(!dut.dec.logic.ucComplexResume.valid.toBoolean,
           "flushed detector produced a delayed stale resume")
       }
 
-      // Once the target register is pending, a flush arriving before the consumer edge
-      // must combinationally hide the Flow and clear it on the next edge.
+      // Once Decode's target register is pending, a flush must hide the service action,
+      // prevent capture into the frontend stage, and clear both boundaries.
       redirect(pendingFlushPc)
       waitForDetector(pendingFlushPc)
       cd.waitSampling()
       assert(dut.dec.logic.ucComplexResumeValidReg.toBoolean,
         "pending-action phase never armed the resume register")
-      dut.flushDrv.logic.flush #= true
+      dut.resumeWiring.logic.flush #= true
       sleep(1)
       assert(!dut.dec.logic.ucComplexResume.valid.toBoolean,
         "pending-action flush did not suppress the live resume Flow")
+      assert(!dut.resumeWiring.logic.frontendResume.valid.toBoolean,
+        "pending Decode action leaked through the frontend stage")
       cd.waitSampling()
       assert(!dut.dec.logic.ucComplexResumeValidReg.toBoolean,
         "pending-action flush did not clear the resume register")
+      dut.resumeWiring.logic.flush #= false
+
+      // Arm the frontend-local register, then cancel it before FetchAlign's consuming
+      // edge. The output is combinationally suppressed and the register clears at once.
+      redirect(frontendFlushPc)
+      waitForDetector(frontendFlushPc)
+      cd.waitSampling() // C+1 Decode service pulse
+      cd.waitSampling() // C+2 frontend action becomes live
+      assert(dut.resumeWiring.logic.frontendResume.valid.toBoolean,
+        "frontend-action phase never armed the local register")
+      dut.resumeWiring.logic.flush #= true
+      sleep(1)
+      assert(!dut.resumeWiring.logic.frontendResume.valid.toBoolean,
+        "frontend-pending flush did not suppress the live action")
+      assert(!dut.resumeWiring.logic.faRedir.valid.toBoolean,
+        "cancelled frontend action still reached FetchAlign")
+      cd.waitSampling()
+      dut.resumeWiring.logic.flush #= false
+      assert(!dut.resumeWiring.logic.frontendResume.valid.toBoolean,
+        "frontend-pending flush did not clear the local register")
     }
   }
 }

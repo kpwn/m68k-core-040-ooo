@@ -232,6 +232,10 @@ trait DecodeUopService {
   def uops: Stream[Vec[DecodedUop]]   // Vec length 2
   def uop1Valid: Bool
   def pipeFlush: Bool
+  /** DecodeStage is the sole real-core producer. Rare complex packets pulse their exact
+    * architectural fall-through target here; frontend wiring adds the consumer-local
+    * register required by the 250 MHz FMax contract. */
+  def complexResume: Flow[UInt]
 }
 
 /** Produced by rename; consumed by the (future) dispatch/ROB. Plain Stream. */

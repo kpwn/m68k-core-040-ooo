@@ -2299,4 +2299,5 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
   override def uops: Stream[Vec[DecodedUop]] = logic.uopsOut
   override def uop1Valid: Bool               = logic.uop1Sig
   override def pipeFlush: Bool               = logic.pipeFlush
+  override def complexResume: Flow[UInt]     = logic.ucComplexResume
 }
