@@ -99,6 +99,81 @@ Both lookup commands pulse exactly on `ic.cmd.fire` and carry the same token.
 Both providers accept one command per cycle and register one result for the
 following cycle. FetchAlign asserts that their valid bits and tokens agree.
 
+### 2.1.1 Framing verdict carried by the command (binding, 2026-08-10)
+
+The command additionally carries the leading-word drop of the window it names,
+and the response carries the *precomputed framing verdict* for that window:
+
+```scala
+case class FtbLookupCmd() extends Bundle {
+  val windowPc = UInt(32 bits)
+  val drop     = UInt(2 bits)     // leading words dropped from this window
+  val token    = FetchPlanToken()
+}
+
+case class FtbLookupRsp() extends Bundle {
+  val windowPc  = UInt(32 bits)
+  val token     = FetchPlanToken()
+  val hit       = Bool()
+  val framedOk  = Bool()          // hit && in-window && at-or-after the drop
+  val brWordOff = UInt(2 bits)
+  val brLen     = UInt(4 bits)
+  val target    = UInt(32 bits)
+  val brType    = UInt(2 bits)
+}
+```
+
+`drop` is the same value the issuing cycle writes into `ringDrop(ringTail)`;
+it is the `cmdDrop` of §3's paired `{cmdWindowPc, cmdDrop}` selection, not a
+separately derived quantity. `framedOk` is registered in the provider at the
+issuing cycle from its own asynchronous entry read:
+
+```text
+framedOk = hit
+        && brLen != 0
+        && brWordOff.resize(5) + brLen.resize(5) <= 4
+        && brWordOff >= drop
+```
+
+**Why this is the same predicate.** `ringDrop` has exactly one writer,
+`when(ic.cmd.fire) { ringDrop(ringTail) := cmdDrop }`, and `resultExpectedSlot`
+is loaded with `ringTail` at that same edge. A provider result exists at C+1
+only under `planLookupFire = ic.cmd.fire && !issueBornStale`. The ring is three
+deep and advances one slot per fire, so no second write can reach that slot in
+one cycle. Therefore `ringDrop(resultSlot)` observed at C+1 is, whenever it is
+consumed, bit-identical to `cmdDrop` observed at C. The move is a retiming of an
+already-existing comparison across an already-existing pipeline register, not a
+new architectural rule and not a latency change.
+
+**Why it is required.** The `28ec738` default-decode route measured all 100
+top paths starting at `FetchAlignPlugin_logic_ringDrop_1_reg[0]/C`. The measured
+worst path is 6.568 ns over 24 levels, 66% route, and its first 1.536 ns and six
+levels are `ringDrop -> resultAfterDrop -> applyNow -> fetch-PC mux` — the drop
+comparison, the in-window sum/compare, and the application AND-tree, all charged
+in the same cycle as the ITLB CAM, the L1I tag qualification, and the prefetch
+window seed that follow it. Those first six levels are pure predictor framing
+arithmetic over values that were already final one cycle earlier. Section 8's
+inspection item 1 (`registered FTB result -> apply predicate/PC mux -> I-cache
+command`) is therefore terminated at the provider's result register.
+
+**Binding consequences.**
+
+- `ringDrop` must not be a functional input to `applyNow`, `ftbBlocked`,
+  `cmdWindowPc`, `cmdDrop`, the FTB/gshare lookup enables, or any I-cache
+  readiness/prefetch/install state. Its only remaining functional consumer is
+  `rspDropHead = ringDrop(ringHead)`, the leading-word drop applied to an
+  arriving response's IBuf push.
+- `applyNow` reads `framedOk` as a single registered bit. The live
+  `hit && resultInWindow && resultAfterDrop` expression is retained **only** as
+  a simulation oracle and as the existing decline telemetry, and simulation must
+  assert the two agree on every cycle a live result is present. Removing that
+  oracle, or letting it diverge, is a specification violation.
+- `GsharePlugin` continues to ignore `drop`; it is a command field of the shared
+  `FtbLookupCmd` bundle and both providers keep receiving the identical payload.
+- A provider that cannot compute `framedOk` at command time may not be
+  substituted without amending this section. Recomputing the framing predicate
+  at result time restores the measured cone.
+
 ### 2.2 Ring token
 
 Each outstanding-ring entry gains:
@@ -212,13 +287,19 @@ splice until the held target is fetched.
 `applyNow` requires:
 
 - both fixed-C+1 FTB/gshare results and a live locally delayed issued slot;
-- FTB tag hit;
+- the registered framing verdict `framedOk` of §2.1.1, which is exactly the
+  conjunction of the FTB tag hit, `brWordOff >= drop` for the drop that the
+  issuing cycle attached to this window's ring record, and the complete learned
+  instruction lying in the window
+  (`brLen != 0 && brWordOff.resize(5) + brLen.resize(5) <= 4`);
 - unconditional branch, or the selected registered PHT direction is taken;
-- `brWordOff >= ringDrop(local issued slot)`;
-- the complete learned instruction lies in the window
-  (`brWordOff.resize(5) + brLen.resize(5) <= 4`);
 - no external/test-resume redirect, quiesce, fault hold, mismatch suppression,
   or pending target.
+
+The hit, drop, and in-window terms are a single registered bit at result time.
+They must not be recomputed from `ringDrop` or from the response payload in the
+application cycle; see §2.1.1 for the equivalence argument and for why the live
+form was the measured limiter.
 
 FTQ full is deliberately **not** a functional application input. Section 5
 proves it unreachable for every elaboratable configuration, and simulation
@@ -582,6 +663,14 @@ no error was observed.
    exactly once. Hold ring/cache backpressure and prove the captured target/drop
    remain exact with no duplicate command. Application-disabled cycles remain
    baseline-identical.
+8a. **Framing verdict equivalence (§2.1.1).** The provider must return
+   `framedOk` for a matrix of installed entries covering hit/miss, `brLen` zero,
+   in-window and overshooting lengths, and every `brWordOff`/`drop` pair, with
+   the drop supplied on the command. In the integrated frontend, simulation must
+   assert on every live-result cycle that `framedOk` equals the live
+   `hit && resultInWindow && (brWordOff >= ringDrop(resultSlot))` oracle, and a
+   mutation that forces the precomputed bit (or drops the `drop` field from the
+   command) must trip that assertion rather than silently mis-apply.
 9. **Architectural oracle.** Compare retired macro PC/op/register/memory traces,
    not speculative feed PCs, after correct prediction and every mismatch class.
 10. **Performance.** Paired pinned-seed ideal and `l2:5:70` IPC, per kernel first;
