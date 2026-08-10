@@ -1,13 +1,23 @@
-read_verilog generated/M68kFullCoreSynth.v
-read_xdc synth/clk.xdc
-synth_design -top M68kFullCoreSynth -part xcku5p-ffvb676-2-e -mode out_of_context
-opt_design
+set reuse_synth 0
+if {[info exists ::env(REUSE_SYNTH_DCP)] && $::env(REUSE_SYNTH_DCP) eq "1" &&
+    [file exists synth/fullcore_synth.dcp]} {
+  set reuse_synth 1
+  open_checkpoint synth/fullcore_synth.dcp
+  puts "REUSE_SYNTH_DCP synth/fullcore_synth.dcp"
+} else {
+  read_verilog generated/M68kFullCoreSynth.v
+  read_xdc synth/clk.xdc
+  synth_design -top M68kFullCoreSynth -part xcku5p-ffvb676-2-e -mode out_of_context
+  opt_design
+}
 # Preserve the optimized post-synthesis checkpoint separately from placement/routing.
 # This makes it possible to distinguish RTL depth from floorplan/route loss on every
 # physical gate instead of relying on transient messages in the Vivado console log.
 report_timing_summary -max_paths 10 -file synth/fullcore_synth_timing.rpt
 report_utilization -file synth/fullcore_synth_util.rpt
-write_checkpoint -force synth/fullcore_synth.dcp
+if {!$reuse_synth} {
+  write_checkpoint -force synth/fullcore_synth.dcp
+}
 set synth_paths [get_timing_paths -max_paths 1 -nworst 1 -setup]
 if {[llength $synth_paths] > 0} {
   set synth_wns [get_property SLACK $synth_paths]
