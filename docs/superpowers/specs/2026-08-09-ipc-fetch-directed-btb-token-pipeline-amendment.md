@@ -1,8 +1,9 @@
 # Fetch-directed FTB registered-token pipeline — binding amendment
 
 Date: 2026-08-09. Status: **REGISTERED-TOKEN AND REGISTERED-FALLBACK RTL
-IMPLEMENTED AND SIMULATION GATED; COMPLETE CORPUS AND FLOORPLANNED PHYSICAL
-ACCEPTANCE PENDING (250-MHz GOAL, 200-MHz HARD FLOOR).**
+IMPLEMENTED AND SIMULATION GATED; FOUR CUMULATIVE FRONTEND TIMING CUTS ROUTED;
+FTQ CAPACITY-VETO REMOVAL BINDING BELOW; 250-MHz GOAL AND 200-MHz HARD FLOOR
+NOT YET MET.**
 
 This document is the binding correction to
 `2026-08-09-ipc-fetch-directed-btb-design.md`. It supersedes that document's
@@ -217,8 +218,16 @@ splice until the held target is fetched.
 - the complete learned instruction lies in the window
   (`brWordOff.resize(5) + brLen.resize(5) <= 4`);
 - no external/test-resume redirect, quiesce, fault hold, mismatch suppression,
-  or pending target;
-- FTQ not full (a defensive condition; §5 proves legal run-ahead cannot fill it).
+  or pending target.
+
+FTQ full is deliberately **not** a functional application input. Section 5
+proves it unreachable for every elaboratable configuration, and simulation
+asserts that invariant. Keeping the equality in `ftbBlocked` is not harmless
+defense: the `9101c5a` default-decode route measured every top-100 path from
+`ftqCount/ftqFull` through `applyNow`, live ITLB/L1I qualification, and installer
+control. The worst is 7.430 ns / 23 levels, 70.36% routing. Capacity correctness
+therefore terminates at elaboration and assertion boundaries rather than the
+live fetch-PC mux.
 
 Decode-local redirects (`predictFire` from the retained BTB/RAS fallback and
 `ftqMismatch` from FTQ confirmation), plus the registered internal
@@ -285,9 +294,16 @@ head/tail/count registers; flush resets the pointers/count and does not clear th
 array. This is smaller and more robust than a wide FF Vec.
 
 No same-cycle pop credit feeds `applyNow`. The sizing invariant proves full is
-unreachable for the legal run-ahead envelope; simulation asserts it. If the
-invariant is later changed, fetch simply declines an FTB prediction while full
-and the retained decode predictor handles it.
+unreachable for the legal run-ahead envelope; simulation asserts it, and a
+directed maximum-run-ahead test must record a peak below the configured depth.
+`ftqFull` must not feed `ftbBlocked`, `applyNow`, the selected fetch PC, I-cache
+readiness, or prefetch/install state.
+
+If the invariant is later changed, this document must be amended before RTL.
+Either reject an undersized configuration at elaboration, or add a registered
+capacity-reservation mechanism whose state terminates before the live fetch-PC
+and VIPT cones. Restoring the combinational count equality as a defensive veto
+is not an acceptable fallback.
 
 ## 6. Decode confirmation and fallback
 
@@ -551,8 +567,14 @@ no error was observed.
    length, overshoot, starvation dwell, one-entry clear, and suppression. Require
    detector C → registered action C+1 exactly, with no feed or I-cache command in
    C+1 and with the captured recovery/clear PCs unchanged by the live FTQ head.
-7. **Fallback.** FTB miss, direct-map collision, second branch, cross-window
-   branch, FTQ defensive-full, and return all exercise the existing slot-0/slot-1
+7. **FTQ capacity proof.** With decode held, exercise the maximum legal mixture
+   of one-word predicted windows resident in the IBuf plus outstanding ring
+   windows. Count every real FTQ push/pop, record peak occupancy, require the
+   peak below 32, and require no full pulse. An elaboration attempt at the next
+   lower power-of-two depth must fail the constructor bound. Mutation-removing
+   the issue reservation or capacity bound must make the test/assertion fail.
+8. **Fallback.** FTB miss, direct-map collision, second branch, cross-window
+   branch, and return all exercise the existing slot-0/slot-1
    BTB/gshare/RAS behavior. For every taken fallback, require branch feed/detect
    in C, exactly one registered action in C+1, no decode feed in C+1, and target
    command fire in C+1 when ring/cache ready. Prove the C sequential command and
@@ -560,12 +582,12 @@ no error was observed.
    exactly once. Hold ring/cache backpressure and prove the captured target/drop
    remain exact with no duplicate command. Application-disabled cycles remain
    baseline-identical.
-8. **Architectural oracle.** Compare retired macro PC/op/register/memory traces,
+9. **Architectural oracle.** Compare retired macro PC/op/register/memory traces,
    not speculative feed PCs, after correct prediction and every mismatch class.
-9. **Performance.** Paired pinned-seed ideal and `l2:5:70` IPC, per kernel first;
+10. **Performance.** Paired pinned-seed ideal and `l2:5:70` IPC, per kernel first;
    require target-gap reduction and no >2% regression in any uncovered/control
    kernel before considering aggregate gain.
-10. **Physical.** Paired floorplanned route against the 250-MHz goal and 200-MHz
+11. **Physical.** Paired floorplanned route against the 250-MHz goal and 200-MHz
     hard floor, plus explicit timing-family, area, and pblock deltas.
 
 `make SBT=~/sbt/bin/sbt test-fast` remains mandatory before every handoff. Full
