@@ -1,40 +1,8 @@
-agent=claude-combined-two-arc-execution
-task=Execute the combined two-arc plan; then (phase 2) revert B3, ground arc 3, and decide
-     whether a three-arc program reaches 200 MHz.
-reserved_at=2026-08-11T02:05:00+02:00
-released_at=2026-08-11T11:55:00+02:00
-head=9957024 RTL (B3 reverted) / 63d89e3 docs / 564932a MAIN-repo ledger
-
-RESULT=THE THREE-ARC PROGRAM IS MEASURED NOT VIABLE. STOP IT AT THE DESIGN STAGE.
-  All three tied families cut SIMULTANEOUSLY = **-1.451 ns**, an UPPER BOUND BY CONSTRUCTION
-  (the probe false-paths everything in AND out of arc 3, strictly more than any register
-  insertion can achieve). Program value = **+0.021 ns = 182.749 -> 183.45 MHz** against a
-  +0.472 ns requirement -- **4.4% of the gap**. Arc 3's own share is +0.009 ns, an order of
-  magnitude BELOW this campaign's measured place-and-route noise.
-  Slices 2 (B2 F1/F2 split) and 3 (Fix A ready skid) were never built and SHOULD NOT BE
-  built as specified.
-
-BRANCH STATE=CLEAN AND CONFIRMED. B3 reverted; src/main byte-identical to c776f06; netlist
-  comment-stripped MD5 438fb1c715282956050ef6bb03da02ea; a real post-route gate reproduced
-  the baseline EXACTLY -- WNS -1.472, FMax 182.74853801169593, TNS -17499.508, FEP 32408,
-  and all four postroute rounds round-for-round. test-fast 149/149 (157 suites),
-  icache+frontend Verilator 41/41, ExecuteLockStepSpec 394/394.
-
-WHERE THE EVIDENCE POINTS NEXT (not the frontend):
-  - `stS2Payload_paddr` FANOUT HUB, 363 endpoints -- still the worst startpoint after all
-    three cuts. Fix A cut a DESTINATION off this hub, not the hub itself.
-  - `s0Payload_lineData` CE cone, 256 endpoints.
-  - 703 Dcache->Dcache endpoints total; next wall includes a **10-logic-level**, 67%-route,
-    CE-terminating path that NO pipelining can touch.
-  - Remaining population 2129 endpoints below -1.000 across 26 module pairs, **56% CE**.
-  => a FLOORPLAN/PHYSICAL lever or a STRUCTURAL D-cache change, per sections 18 and 20.
-
-KEY LESSON=B3 was predicted free and cost 8.1 MHz. It ROUTED better (round 0 -1.836 vs -2.094)
-  and OPTIMISED far worse (baseline gains 0.622 ns over 3 rounds; B3 gained 0.110). Damage was
-  visible AT SYNTHESIS. Its worst path ended on a /CE pin. Watch control/verdict signals
-  landing on clock-enable cones -- post-route opt has little freedom there.
-HANDOFF=docs/.../2026-08-10-ipc-frontend-fmax-claude-handoff.md sections 23 and 24
-LEDGER=.superpowers/sdd/2026-08-10-ipc-fetchalign-icache-combined-implementation-plan/progress.md
-ARCHIVES=synth/archive/{M0_slice1_b3_postrouteN3_decode,M0_CONTROL_c776f06_postrouteN3_decode}
-NOTE=worktree `m0-control` still present; `git worktree remove` when no longer wanted.
-gate=PASSED -- reverted branch confirmed at 182.749 MHz, uncontended.
+agent=claude-sts2-paddr-hub-grounding
+task=Ground the DcachePlugin stS2Payload_paddr fanout hub named in handoff 24.5 as the single
+     most actionable line; real netlist fanout/consumers + a measured what-if ladder before
+     any design.
+reserved_at=2026-08-11T12:20:00+02:00
+head=06750f8 (docs), RTL = c776f06-identical (B3 reverted), baseline 182.749 MHz / WNS -1.472
+status=ACTIVE -- read-only Vivado probe on the frozen 6b246de routed checkpoint
+       (synth/probe_stS2_paddr_hub.tcl). No RTL touched.

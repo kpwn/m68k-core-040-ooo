@@ -3500,3 +3500,183 @@ netlist, which is what licenses every A/B in this campaign.
 
 `Distance to the 200 MHz deployment floor: 0.472 ns.  The goal is NOT met, at
 182.749 MHz.`
+
+## 25. The `stS2Payload_paddr` hub is measured worth +0.000 ns — and so is the ENTIRE D-cache/LS-EU cluster (Claude, 2026-08-11)
+
+**Section 24.5 named `DcachePlugin stS2Payload_paddr[5] -> dataMem_3/ADDRARDADDR[12]`
+"the single most actionable line in this section".  It was grounded, and it is a
+dead end.  Cutting every path launched by the hub is worth +0.000 ns.  Cutting
+every path from every one of the 42,428 D-cache/LS-EU cells to every one of them,
+on top of the whole three-arc frontend program, is ALSO worth +0.000 ns.  The
+upper bound on {three frontend families} ∪ {everything internal to the LSU
+cluster} is +0.021 ns — the same +0.021 ns section 24 already measured for the
+frontend alone.**
+
+Probe: `synth/probe_stS2_paddr_hub.tcl`, read-only, on the same frozen
+`6b246de` routed checkpoint every other what-if in this campaign used.  Twelve
+scenarios, each on a fresh `open_checkpoint`, every cut asserting on its matched
+object count (section 19 step 1).  Machine verifiably uncontended (27 GB
+available, zero competing `impl_FullCore.tcl`).  Runtime ~8 minutes.
+
+### 25.1 What the hub actually is — the fanout picture, re-derived from the netlist
+
+The section-15 lesson (the "High Fanout" column names the worst net *anywhere* on
+the path, not the startpoint's own fanout) applies here too, and the real numbers
+differ from what the name suggests:
+
+| | |
+|---|---|
+| flops in the family | **34** — the 32 `paddr` bits plus phys-opt replicas of bits `[4]` and `[5]` |
+| direct loads, whole family | **832** |
+| direct loads, bit `[5]` alone | **68** |
+| bit `[5]` transitive endpoint reach | **5,673** |
+| sub-(-1.000 ns) endpoints the family launches | **686 of 4,890 (14.0 %)** |
+
+So the "363 endpoints tied to this hub" figure in 24.5 was the count *after* the
+three frontend arcs were cut; on the untouched baseline the family owns **686**.
+
+**The timing-relevant hub is not `paddr` — it is the 7-bit set slice `stS2Set`
+= `paddr[10:4]`.**  Per-bit worst slack splits the register cleanly in two:
+
+| bits | role | reach | worst slack |
+|---|---|---:|---:|
+| `[3:0]` | `stS2Off` (byte offset) | ~147 | +0.97 … +0.08 |
+| **`[10:4]`** | **`stS2Set` (cache index)** | **~5,673** | **-1.472 … -1.269** |
+| `[31:11]` | `stS2Tag` | ~1,642 | -0.41 … -0.10 |
+
+Bit `[5]`'s 68 direct loads are ~60 `pendingVictimWay`/`pendingVictimDirty`/
+`pendingVictimLine` LUTs (the `victim(stS2Set)` and `dirtys(pVw)(stS2Set)`
+register-array reads at `DcachePlugin.scala:1809-1817`), plus
+`pendingStorePaddr[5]/D`, `stS3Payload_paddr[5]/D` and one shared LUT.  Those
+victim-select paths are **not** in the failing population — the damage is done
+by the *transitive* cone, not by the direct loads.
+
+Where the family's 686 failing endpoints land:
+
+| by module | | by endpoint pin kind | |
+|---|---:|---|---:|
+| IssueQueuePlugin | 323 | `/D` | 220 |
+| DcachePlugin | 251 | `/R` | 191 |
+| LsEuPlugin | 111 | `/CE` | 186 |
+| RobPlugin | 1 | BRAM `ADDR*` | 79 |
+
+The single largest end family is `DcachePlugin s0Payload_lineData` at **128** —
+i.e. the hub also feeds the `/CE` cone that 24.5 listed as a *separate* finding.
+
+### 25.2 The real mechanism, traced end to end in the RTL
+
+The 18-level path is a **serial chain, not a fanout problem**, and it lives
+entirely inside `DcachePlugin` (every "LsEu"-prefixed LUT on the routed path is a
+D-cache cell that `opt_design` renamed and relocated under
+`LsEuPlugin_logic_sq/`).  Every step is named in the routed report:
+
+```
+stS2Payload.paddr[10:4]  =  stS2Set                                  (:647)
+  -> (stS2Set === missSet)                       7-bit compare
+  -> refillWriteHold                             4-term OR           (:802-814)
+  -> axi.r.ready := !refillWriteHold                                 (:1258)
+  -> axi.r.fire -> doAllocate
+  -> wrEn(w) / wrTagEn(w) / wrSet(w)              per-way allocate    (:1275-1285)
+  -> earlyProbeSetWriteVec(i)                     4 entries x 4 ways  (:418-421)
+  -> earlyProbeHit -> useEarlyProbe                                   (:426-429)
+  -> earlyProbeReusesConsume -> earlyProbeHasAllocSlot                (:433-434)
+  -> loadProbePort.ready                                              (:930)
+  -> loadProbePort.fire  ->  rdSet                                    (:938-939)
+  -> dataMem_*/tagMem_* ADDRARDADDR   (the shared BRAM read address)
+```
+
+Named plainly: **the store pipeline's set index gates the refill's AXI R-channel
+backpressure, which gates the array write ports, which the parallel-VIPT early
+probe watches for staleness, which gates the probe port's ready, which selects
+the shared BRAM read address.**  It is the parallel-VIPT amendment's own
+structure (section 20 flagged the same family from the ITLB side), plus the P4.4
+drain-vs-refill interlock, composed into one cycle.
+
+That mechanism is *correct* — the interlock is what stops a refill silently
+dropping a store's array write (a COPYBACK silent-memory-corruption channel, see
+the 55-line comment at `:757-800`) — and it is worth recording, because it is not
+guessable from the signal names.  It is simply not worth **any** time.
+
+### 25.3 THE MEASUREMENT
+
+| scenario | what is false-pathed | WNS | ΔWNS | TNS | sub(-1.000) |
+|---|---|---:|---:|---:|---:|
+| **baseline** | — | **-1.472** | — | -17499.5 | 4890 |
+| `refillhold` | `refillWriteHold` + `refillNeedsStoreDrain` (2 nets) | -1.472 | **0.000** | -17218.5 | 4753 |
+| `storeready` | `storePort.ready` / `sq.io.drain.ready` | -1.472 | **0.000** | -17499.5 | 4890 |
+| `storepipe` | + `storePipeHeld`/`storeMissDiscovered`/`s0Ready`/`stS1Advance` | -1.472 | **0.000** | -17107.5 | 4732 |
+| `hub_from` | **everything launched by all 34 hub flops** | -1.472 | **0.000** | -17469.9 | 4878 |
+| `roundtrip` | every D-cache flop -> every `dataMem`/`tagMem` cell | -1.472 | **0.000** | -17479.7 | 4858 |
+| `cluster` | **all 42,428 D-cache/LS-EU cells -> all 42,428** | -1.472 | **0.000** | -16064.5 | 4452 |
+| `a3` | b2 + b3 + fixA + arc3 (reproduces section 24) | **-1.451** | +0.021 | -14941.4 | 2129 |
+| `a3_refillhold` | `a3` + `refillhold` | -1.451 | **+0.000** | -14721.7 | 2038 |
+| `a3_storepipe` | `a3` + `storepipe` | -1.451 | **+0.000** | -14549.4 | 1971 |
+| `a3_hub_from` | `a3` + the whole hub | -1.451 | **+0.000** | -14917.3 | 2117 |
+| **`a3_cluster`** | **`a3` + the whole LSU cluster** | **-1.451** | **+0.000** | -13506.4 | 1691 |
+
+The `baseline` row reproduces the pinned checkpoint exactly (-1.472 / -17499.508
+/ 32408 / 4890) and the `a3` row reproduces section 24's decision number exactly
+(-1.451 / 2129, worst path `stS2Payload_paddr[5] -> dataMem_3/ADDRARDADDR[12]`),
+so the ladder is calibrated against two independently published results before
+any new claim is made.
+
+**`a3_cluster` is the number that matters.**  It grants, for free, every
+restructuring anyone could ever perform inside the D-cache and the LS EU — every
+retime, every pipeline stage, every fanout replication, every interlock
+reformulation, simultaneously — on top of the entire three-arc frontend program.
+It measures **-1.451 ns**, identical to `a3`.  **The whole LSU cluster is worth
++0.000 ns.**
+
+### 25.4 Why: at this placement the residual path's ROUTE ALONE misses the period
+
+The path left standing at `a3_cluster` is
+`_zz_DecodeStage_logic_fed_payload_packets_0_words_0[4] -> FetchAlignPlugin
+predictPending/D`: 17 logic levels, data path **5.432 ns = logic 1.369 ns
+(25.2 %) + route 4.063 ns (74.8 %)**, required 4.010 ns.
+
+**The route delay alone (4.063 ns) exceeds the entire required time (4.010 ns).**
+Deleting *every logic level on the path* would still leave it violating.  Its
+biggest single contributors are two nets — `ibuf/when_PipeStage_l17` at fo=462
+(0.540 ns) and `DecodeStage_logic_queue/p_1542_in` at fo=875 (0.409 ns) — plus a
+0.460 ns fo=1 hop that is pure distance.  And **1,691 endpoints remain below
+-1.000 ns** in that maximally-cut scenario.
+
+This is the same conclusion sections 18, 19 and 20 reached from three other
+directions, now stated in its strongest form: **the residual 0.472 ns is a
+physical/placement quantity, not a logic-depth quantity, and no RTL change
+anywhere in the LSU can reach it.**
+
+### 25.5 Verdict
+
+- **The `stS2Payload_paddr` hub is NOT a viable lever.**  It is worth +0.000 ns
+  on the baseline and +0.000 ns after the three frontend families are removed.
+  Every narrower formulation inside it (the `refillWriteHold` compare, the
+  store-port backpressure, the store-pipe advance logic, the D-cache -> BRAM
+  round trip) is likewise +0.000 ns.  Section 24.5's "single most actionable
+  line" is retracted on measured evidence.
+- **No fanout-splitting or hub-registering fix was designed, deliberately.**  The
+  hub is a *serial* 18-level chain, not a fanout bottleneck; and since the
+  maximally-generous cut of the entire cluster containing it measures +0.000 ns,
+  designing any narrower fix would be designing against a number already proven
+  to be zero.  This is grounding stopping a design, which is what grounding is
+  for.
+- **The population/TNS proxy moves and the WNS does not — again.**  `a3_cluster`
+  improves TNS by 9.6 % and drops the sub-threshold population 2129 -> 1691 for
+  +0.000 ns of WNS.  Section 23.5 already recorded that this proxy failed its one
+  validation against a real route, in the optimistic direction.  It should not be
+  used to justify RTL work.
+- **What is left.**  On this evidence the only remaining levers are physical:
+  floorplanning (section 18 measured post-route physical optimisation alone at
+  **+18.95 MHz**, the largest single win this campaign has recorded), a device or
+  speed-grade change, or accepting 182.749 MHz.  The two nets named in 25.4
+  (fo=462 and fo=875, both in the DecodeStage/FetchAlign `ibuf` region) are the
+  concrete place a floorplan attempt should aim, and neither is in the LSU.
+
+### 25.6 State
+
+No RTL was touched (`git status src/` clean at `06750f8`).  The branch remains at
+the confirmed baseline: **WNS -1.472 / 182.749 MHz / TNS -17499.508 / 32408
+failing endpoints**.
+
+`Distance to the 200 MHz deployment floor: 0.472 ns.  The goal is NOT met, at
+182.749 MHz.`
