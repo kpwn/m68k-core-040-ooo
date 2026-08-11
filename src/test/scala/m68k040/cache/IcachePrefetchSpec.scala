@@ -163,6 +163,36 @@ class IcachePrefetchSpec extends AnyFunSuite {
     }
   }
 
+  /** Bounded replacements for the hand-driven AXI helpers' unbounded blocking waits,
+    * so a regression that stops the R or AR channel fails with a diagnosable message
+    * instead of wedging the JVM. 4000 cycles is ~50x a single line's service time
+    * through these harnesses. */
+  private val waitCapCycles = 4000
+
+  /** `cd.waitSamplingWhere` semantics (sample first, THEN test), with a cap. */
+  def waitSamplingWhereBounded(cd: ClockDomain, what: String)(cond: => Boolean): Unit = {
+    var waited = 0
+    var done = false
+    while (!done) {
+      cd.waitSampling()
+      waited += 1
+      done = cond
+      assert(done || waited < waitCapCycles,
+        s"bounded sim wait expired after $waitCapCycles cycles waiting for: $what")
+    }
+  }
+
+  /** Poll-first wait, with a cap. */
+  def waitUntilBounded(cd: ClockDomain, what: String)(cond: => Boolean): Unit = {
+    var waited = 0
+    while (!cond) {
+      assert(waited < waitCapCycles,
+        s"bounded sim wait expired after $waitCapCycles cycles waiting for: $what")
+      cd.waitSampling()
+      waited += 1
+    }
+  }
+
   def fetch(dut: Dut, cd: ClockDomain, pc: Long): BigInt = {
     dut.probe.logic.cmdIn.valid #= true
     dut.probe.logic.cmdIn.payload.pc #= pc
@@ -640,6 +670,18 @@ class IcachePrefetchSpec extends AnyFunSuite {
       assert(fetch(dut, cd, 0x2000L) == IcacheSim.window64(0x2000L))
       cd.waitSamplingWhere((AxiIds.I_SPEC_BASE to AxiIds.I_SPEC_LAST).forall(id =>
         arTrace.exists(_._1 == id)))
+      // `arTrace` is appended from `cd.onSamplings` on the sampling the AR FIRES, but
+      // `pfArSent(idx) := True` is a register write on that same edge, so it only reads
+      // back True from the FOLLOWING sampling. Whether the `waitSamplingWhere` predicate
+      // above observes the fourth AR's trace entry before or after that edge is decided
+      // by sim-thread/callback scheduling, which is not stable under host CPU contention
+      // -- observed live: this assert failed once with `slot3(v=true,ar=false,c=false)`
+      // and its own AR already present in `arTrace`, while the AR cadence (fires at
+      // cycles 9/11/13/15/17, check at 18) is byte-identical either way, i.e. the flake
+      // is this sampling boundary and not an RTL timing shift. One extra sampling
+      // removes the ambiguity without weakening the check: all four slots must still be
+      // simultaneously valid, AR-sent and incomplete.
+      cd.waitSampling()
       assert((0 until AxiIds.I_SPEC_SLOTS).forall(i =>
         dut.icache.logic.pfValid(i).toBoolean && dut.icache.logic.pfArSent(i).toBoolean &&
           !dut.icache.logic.pfComplete(i).toBoolean),
@@ -850,6 +892,137 @@ class IcachePrefetchSpec extends AnyFunSuite {
       assert(ar.byId(AxiIds.I_DEMAND) == 1,
         s"the demand fetch of an in-flight prefetched line must NOT issue a second demand AR; " +
           s"demand ARs = ${ar.byId(AxiIds.I_DEMAND)} (total ${before} -> ${ar.total})")
+    }
+  }
+
+  /** The AR arbiter's demand-priority Mux
+    * (`pfChosenArSel = Mux(heldDemandMiss, pfBlockingArSel, pfArSel)`) was UNPROVEN by
+    * this suite: mutating it to a bare `pfArSel` failed nothing. The reason is a
+    * coincidence in the pre-existing "AR-pending demotion" test above -- there the
+    * blocking owner is also the LOWEST-numbered slot still wanting an AR, which is
+    * exactly what the unconditional `pfArSel` picks, so the Mux is invisible to it.
+    *
+    * This test removes the coincidence: the held demand's blocking owner is the
+    * HIGHEST-numbered slot (index 3, the farthest of the five-line window) while
+    * slots 1 and 2 are still AR_PENDING and therefore rank ahead of it under
+    * `pfArSel`. Only the Mux launches the AR that can actually unblock the demand.
+    * Confirmed by mutation: with `pfChosenArSel = pfArSel` this test fails on the
+    * "blocking owner" assert with slot 1's line instead.
+    *
+    * `heldDemandMiss` itself is not `simPublic`, and the RTL is deliberately kept
+    * byte-identical to its pre-prefetch-decoupling state, so the held-demand
+    * precondition is asserted the same way the pre-existing demotion test asserts it:
+    * a valid demand that is not `ready`.
+    */
+  test("a held demand's blocking owner outranks lower-numbered slots in the AR arbiter", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      val axi = dut.icache.logic.axi
+      val arTrace = scala.collection.mutable.ArrayBuffer[(Int, Long)]()
+
+      axi.ar.ready #= true
+      axi.r.valid #= false
+      axi.r.payload.data #= 0
+      axi.r.payload.id #= 0
+      axi.r.payload.last #= false
+      axi.r.payload.resp #= 0
+      cd.onSamplings {
+        if (axi.ar.valid.toBoolean && axi.ar.ready.toBoolean)
+          arTrace += ((axi.ar.payload.id.toInt, axi.ar.payload.addr.toLong))
+      }
+
+      def beat(address: Long, phase: Int): BigInt =
+        (0 until 32).foldLeft(BigInt(0)) { (acc, i) =>
+          acc | (BigInt(IcacheSim.memByte(address + phase * 32L + i)) << (8 * i))
+        }
+      def sendLine(id: Int, address: Long): Unit = {
+        for (phase <- 0 to 1) {
+          axi.r.valid #= true
+          axi.r.payload.id #= id
+          axi.r.payload.data #= beat(address, phase)
+          axi.r.payload.resp #= 0
+          axi.r.payload.last #= (phase == 1)
+          waitSamplingWhereBounded(cd, f"R ready for id $id line 0x$address%x phase $phase")(
+            axi.r.ready.toBoolean)
+          axi.r.valid #= false
+          cd.waitSampling()
+        }
+      }
+
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(4)
+      dut.icache.logic.prefetchEnable #= true
+      cd.waitSampling(2)
+
+      val base      = 0x7000L
+      val blockLine = base + 0x100L   // the FOURTH speculative candidate -> slot index 3
+
+      // Bootstrap: let ONLY the demand's own AR through, then close the AR channel.
+      // Allocation does not need the AR channel, so all four speculative slots reach
+      // AR_PENDING with nothing sent, and slot 0's AR parks in the holding register.
+      dut.probe.logic.cmdIn.valid #= true
+      dut.probe.logic.cmdIn.payload.pc #= base
+      waitSamplingWhereBounded(cd, "demand accept")(
+        dut.probe.logic.cmdIn.ready.toBoolean && dut.probe.logic.cmdIn.valid.toBoolean)
+      dut.probe.logic.cmdIn.valid #= false
+      waitSamplingWhereBounded(cd, f"demand AR at 0x$base%x")(
+        axi.ar.valid.toBoolean && axi.ar.ready.toBoolean &&
+        axi.ar.payload.id.toInt == AxiIds.I_DEMAND)
+      axi.ar.ready #= false
+      sendLine(AxiIds.I_DEMAND, base)
+
+      waitUntilBounded(cd, "all four speculative slots AR_PENDING")(
+        (0 until AxiIds.I_SPEC_SLOTS).forall(i =>
+          dut.icache.logic.pfValid(i).toBoolean && !dut.icache.logic.pfArSent(i).toBoolean))
+      assert(axi.ar.valid.toBoolean, "setup: no speculative AR is being offered")
+      assert(axi.ar.payload.addr.toLong == base + 0x40L,
+        f"setup: the holder should carry the LOWEST-numbered slot's line 0x${base + 0x40L}%x, " +
+          f"got 0x${axi.ar.payload.addr.toLong}%x")
+      assert(arTrace.count(_._1 != AxiIds.I_DEMAND) == 0,
+        s"setup: no speculative AR may have fired yet, trace=$arTrace")
+
+      // Offer the demand for the line owned by the HIGHEST-numbered slot. It is held
+      // (`pfLookupSetBusy`), so `heldDemandMiss` is high, and slots 1 and 2 outrank
+      // slot 3 under the plain `pfArSel` order.
+      dut.probe.logic.cmdIn.valid #= true
+      dut.probe.logic.cmdIn.payload.pc #= blockLine
+      cd.waitSampling(4)
+      assert(!dut.probe.logic.cmdIn.ready.toBoolean,
+        "setup did not hold the demand behind its AR-pending owner")
+
+      // Re-open the AR channel: the already-latched slot-0 AR fires (its payload was
+      // committed before the demand was even offered and AXI forbids changing it),
+      // and the VERY NEXT grant is the arbiter decision under test.
+      val before = arTrace.size
+      axi.ar.ready #= true
+      waitUntilBounded(cd, "two more ARs")(arTrace.size >= before + 2)
+      axi.ar.ready #= false
+      assert(arTrace(before)._2 == base + 0x40L,
+        f"the parked AR should have fired first: got 0x${arTrace(before)._2}%x")
+      val granted = arTrace(before + 1)
+      assert(granted._1 >= AxiIds.I_SPEC_BASE && granted._1 <= AxiIds.I_SPEC_LAST,
+        s"expected a speculative AR, got $granted")
+      assert(granted._2 == blockLine,
+        f"the AR arbiter did not prioritise the held demand's BLOCKING owner: it launched " +
+          f"0x${granted._2}%x (id ${granted._1}) instead of 0x$blockLine%x. `pfChosenArSel` must " +
+          f"be Mux(heldDemandMiss, pfBlockingArSel, pfArSel) -- a plain `pfArSel` picks the " +
+          f"lowest-numbered pending slot, which cannot unblock the demand. trace=$arTrace")
+
+      // Architectural close-out: answering exactly those two lines must install the
+      // blocking owner and let the held demand through as a HIT, with no second AR
+      // for its own line.
+      sendLine(arTrace(before)._1, arTrace(before)._2)
+      sendLine(granted._1, granted._2)
+      waitSamplingWhereBounded(cd, "held demand admitted")(dut.probe.logic.cmdIn.ready.toBoolean)
+      dut.probe.logic.cmdIn.valid #= false
+      waitSamplingWhereBounded(cd, "held demand response")(dut.probe.logic.rspOut.valid.toBoolean)
+      assert(dut.probe.logic.rspOut.payload.data.toBigInt == IcacheSim.window64(blockLine),
+        "the unblocked demand returned incorrect data")
+      assert(arTrace.count { case (id, address) => id == AxiIds.I_DEMAND && address == blockLine } == 0,
+        s"the demand must have been served by the speculative install, not a second AR: $arTrace")
     }
   }
 }
