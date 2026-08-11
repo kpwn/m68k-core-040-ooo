@@ -3348,3 +3348,147 @@ section 11 ("slice 1 is free and removes the largest single endpoint object, so 
 goes first regardless") needs rewriting, because the largest endpoint object is not
 the same thing as the binding path, and removing it moved a different
 `FetchAlign -> Icache` path below the old floor.
+
+## 24. The three-arc program is measured NOT VIABLE: all three tied families closed together are worth +0.021 ns, 4.4 % of the 200 MHz gap (Claude, 2026-08-11)
+
+**Arc 3 grounded on the routed checkpoint, and the decisive number taken: cutting
+all three tied families simultaneously leaves WNS at −1.451 ns.  That is an upper
+bound *by construction*.  B3 reverted; the branch is back at the confirmed
+182.749 MHz baseline.**
+
+### 24.1 Why arc 3 was grounded at all
+
+Section 23.2 measured the tie in both directions and found that breaking the two
+arcs this campaign had designed for exposes a **third** family at −1.460 ns —
+`FetchAlignPlugin ftqHead → FetchAlignPlugin p0LiveReg_lenWords` — which neither
+design attacks.  Since the superadditivity thesis says the program only pays when
+the tied families go together, the open question was whether **three** was enough.
+It is not, and the number is now measured rather than argued.
+
+### 24.2 The true path (a controller hypothesis was wrong, and the correction matters)
+
+The initial reading — that `ftqHead` reaches the predecode cone through the IBuf
+shift/head mux — is **wrong**.  `ibuf.io.head(0..3)` is a separate parallel input
+off its own registers.  `ftqHead` reaches `p0LiveReg` through exactly one channel,
+the **availability clamp**:
+
+```
+ftqHead (:263) -> async LUTRAM read (:266) -> ftqDiff 32-bit subtract (:734)
+  -> ftqNear / spliceWords (:736,:738) -> availEff mux (:739-744)
+  -> extWValid/extW2Valid/extW3Valid (:765-767)
+  -> classify's extWKnown/extW2Known/extW3Known (PredecodeWord.scala:45-47, 32 use sites)
+  -> lenWords
+```
+
+Architecturally: the late-arriving input to the predecode cone is a **3-bit
+extension-word-availability control**, buried as guards deep inside a large
+`when/elsewhen` decoder — so roughly 2.7 ns of decoder sits *downstream* of a
+signal that is not valid until 2.809 ns.  The `:727` "no combinational loop" claim
+holds: the cycle `p0LiveReg[Q] → Aligner → effShift → shift (:1087) →
+p0LiveInvalidate (:769) → p0LiveReg[D]` closes only through the register.
+
+### 24.3 Decomposition
+
+5.441 ns data path, **22 logic levels**, **logic 2.020 ns (37.1 %) / route
+3.421 ns (62.9 %)**, required 4.011, slack **−1.460**.
+
+| node | arrival | meaning |
+|---|---:|---|
+| `ftqHead/Q` | 0.108 | |
+| `ftqHeadE_brPc[0]` | 0.861 | FTQ read done (0.313 ns on the fo=89 address net) |
+| after 3x CARRY8 | 1.457 | `ftqDiff`/`spliceWords` arithmetic done |
+| `availEff[2]` | **2.809** | clamp resolved — the measured midpoint (51.6 / 48.4) |
+| `extW*Known` | 3.263 | |
+| `lenWords_reg[0]/D` | 5.471 | 10 LUTs + MUXF7 of the classify body |
+
+Arc 3 is a **pure data cone** — measured, not assumed: 100 % `/D` endpoints across
+the 200 worst arc-3 paths, the 500 worst from `ftqHead`, the 500 worst into
+`p0LiveReg`, and the design's worst 200.  So the section-23 clock-enable lesson
+does **not** condemn arc 3 itself.  It describes the wall *behind* it (24.5).
+
+### 24.4 THE DECISION NUMBER
+
+The probe first reproduced the published `b2+b3+fixA` cell **exactly** (−1.460,
+arc 3 worst), which validates the section-23.2 matrix.  Then, with **all three**
+families cut:
+
+> **WNS = −1.451 ns.**
+
+This is an **upper bound by construction**: the scenario false-paths every path
+*out of* `ftqHead` **and** every path *into* `p0LiveReg` simultaneously — strictly
+more than any register insertion could achieve — and still measures −1.451.
+
+| | ΔWNS | FMax |
+|---|---:|---:|
+| arc 3 alone, on top of the other two | **+0.009 ns** | — |
+| **the whole three-arc program** | **+0.021 ns** | **182.749 → 183.45 MHz** |
+| required for 200 MHz | +0.472 ns | 200.0 |
+
+**The three-arc program delivers 4.4 % of the gap.**  And +0.009 ns for arc 3 is an
+order of magnitude below this campaign's own measured place-and-route noise, so a
+*successful* arc-3 implementation could not be distinguished from noise.
+
+Arc 3 does have a clean, cheap, IPC-neutral fix (feed `classify`'s `extW*Valid`
+from the already-existing `availEffPrev` register at `:768` instead of live
+`availEff`, leaving the Aligner's live path untouched; `p0LiveInvalidate` already
+contains `(availEffPrev =/= availEff)` and already forces `ambiguousLine := True`,
+and `Aligner:95` already consults `p0LiveReg` only via
+`Mux(preds(0).ambiguousLine, …)`).  Projected slack on the arc ≈ +1.1 ns.  **It is
+still not worth building**, because the arc is not what is binding.
+
+### 24.5 What is actually behind the wall
+
+With all three cut, the next paths are:
+
+- **−1.451**, 18 levels, 71.4 % route: `Dcache stS2Payload_paddr[5] → Dcache
+  dataMem_3/ADDRARDADDR[12]` — the **same startpoint hub as the baseline worst
+  path**.  Fix A cut a *destination*, not the hub.  That is the single most
+  actionable line in this section.
+- **−1.451**, 17 levels, 74.8 % route: `DecodeStage … → FetchAlign predictPending/D`
+- **−1.447**, **10 levels**, 67 % route, terminating on a **`/CE`**:
+  `Dcache tagMem_3/CLKARDCLK → Dcache s0Payload_lineData[103]/CE`
+
+That last one matters disproportionately: **10 logic levels**.  No amount of
+pipelining helps a path that is already shallow and 67 % route — and it ends on a
+clock-enable, which section 23.5 showed post-route optimisation has little freedom
+to repair.
+
+The remaining population is **2,129 endpoints below −1.000 ns across 26 module
+pairs**, and it is **CE-dominated: 1,192 CE (56 %), 584 `/D`, 232 `/R`**.  Arc 3
+itself owns **5 of the 4,890** baseline sub-threshold endpoints (0.10 %); the whole
+`FetchAlign → FetchAlign` pair owns 126.
+
+### 24.6 Verdict, and where the evidence points instead
+
+**The three-arc program is NOT VIABLE as a route to 200 MHz and should stop at the
+design stage.**  Slices 2 (B2) and 3 (Fix A) were never built; on this evidence
+they should not be built as specified, because their combined ceiling — now
+measured with the third family included — is +0.021 ns.
+
+The evidence points the remaining 0.472 ns at the **D-cache/LSU cluster and at
+global route delay**, not at the frontend:
+
+- the `stS2Payload_paddr` **fanout hub** (363 endpoints) — attacking the hub is a
+  different change from Fix A, which cut one destination off it;
+- the `s0Payload_lineData` **CE cone** (256 endpoints);
+- 703 `Dcache → Dcache` endpoints in total;
+- 60–75 % route delay design-wide, on a device that is 50.6 % LUT-utilised.
+
+That is consistent with this campaign's own standing conclusion (section 18,
+section 20 step 6) that crossing the next band needs a **floorplan/physical**
+lever or a **structural change in the D-cache**, not another frontend retime and
+not another frontend pipeline stage.
+
+### 24.7 State of the branch
+
+B3 is **reverted** (`6a7ae80`); `src/main/` is byte-identical to `c776f06` and the
+generated netlist is back to comment-stripped MD5
+`438fb1c715282956050ef6bb03da02ea`.  Two test assets from the reverted work were
+**kept** (`9957024`) because they cover *pre-existing* RTL: a discriminating
+AR-arbiter demand-priority test — the mutation `pfChosenArSel = pfArSel` is caught
+by it and by nothing else in the suite — and bounded sampling helpers replacing
+unbounded blocking waits.  Gates at the reverted head: `test-fast` 149/149 (157
+suites), icache+frontend Verilator 41/41, `ExecuteLockStepSpec` 394/394.
+
+`Distance to the 200 MHz deployment floor: 0.472 ns.  The goal is NOT met, at
+182.749 MHz.`
