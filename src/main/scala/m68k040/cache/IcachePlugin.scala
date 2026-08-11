@@ -577,7 +577,33 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // earliest a fresh arm can now form is the FIRST genuinely idle cycle after
     // control returns to IDLE, which is exactly the 1-cycle RegNext latency the
     // interface contract (`pfInstallArm` = "a register") already implies.
-    val pfInstallArm    = RegNext(pfInstallAny && !installStarves && !predActive) init False
+    //
+    // `&& !anyInvalidate` (second implementation correction, review round 1
+    // finding 1): `!predActive` closes the CONSUME path (`pfValid`/`pfComplete`
+    // clearing at PF_PRED's own commit) but not the POISON path. `anyInvalidate`
+    // can be a single-cycle pulse, and `when(anyInvalidate && pfValid(i)) {
+    // pfPoison(i) := True }` (below) drops every slot out of `pfInstallVec`
+    // (`pfInstallVec` excludes `pfPoison`) only on the cycle AFTER the pulse --
+    // one cycle later than `pfInstallArm`'s own register would otherwise reflect
+    // it, since `pfInstallArm` samples `pfInstallAny` BEFORE the poison write
+    // lands. Without this term: cycle N a slot is complete-and-clean (armable)
+    // and `anyInvalidate` pulses; `pfInstallArm` latches true for N+1 regardless.
+    // At N+1 `pfInstallAny` is correctly now 0 (poisoned), but IDLE still sees
+    // `pfInstallArm == 1` and fires a full install using `pfInstallSel =
+    // OHToUInt(OHMasking.first(all-zero)) = 0` -- a PHANTOM install of slot 0
+    // regardless of whether slot 0 was ever the armed one. If slot 0 happens to
+    // be free-and-clean, that phantom install re-validates a stale tag/line one
+    // cycle after the very invalidateAll meant to invalidate it (missPoison :=
+    // pfPoison(0) || anyInvalidate reads False -- pfPoison(0) hasn't been set
+    // for THIS slot, and the anyInvalidate pulse has already passed). If slot 0
+    // is live with an outstanding AR instead, the phantom PF_PRED clears
+    // `pfValid(0)`/`pfArSent(0)` out from under it, so its real R beats later
+    // fail `pfRspMatch` and wedge the R channel against the
+    // "I-cache R beat has no live RID owner" assert. An invalidate arriving
+    // DURING the already-armed cycle is unaffected and stays safe on its own
+    // (`missPoison := pfPoison(sel) || anyInvalidate` is live that cycle); this
+    // term only closes the ONE-CYCLE-STALE-ARM-VS-FRESH-POISON gap.
+    val pfInstallArm    = RegNext(pfInstallAny && !installStarves && !predActive && !anyInvalidate) init False
     pfInstallArm.simPublic()
 
     // H9 counter update (implementation correction over the literal design-spec
@@ -596,8 +622,23 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // counter must count only that: `pfInstallArm` covers the IDLE arm-decision
     // cycle, `predActive` covers the two PF_PRED cycles that follow it (during which
     // `pfInstallArm` itself is masked low by the `!predActive` guard above).
-    when(heldDemandMiss && (pfInstallArm || predActive)) {
-      when(installDeferCnt =/= U(7, 3 bits)) { installDeferCnt := installDeferCnt + 1 }
+    //
+    // The RESET, however, stays keyed on `!heldDemandMiss` alone (review round 1
+    // finding 2), not on the same `(pfInstallArm || predActive)` term as the
+    // increment: the maximum contiguous `(pfInstallArm || predActive)` window is
+    // 3 cycles (1 arm + 2 PF_PRED dwell), after which the `!predActive` guard on
+    // `pfInstallArm` forces one genuinely-idle gap cycle before the NEXT slot (if
+    // any) can arm -- resetting on that gap cycle would zero the counter every
+    // single episode, making `installStarves` (`cnt >= installDeferMax`)
+    // permanently unreachable and degrading H9 from a CUMULATIVE-defer detector
+    // (the chained "install, gap, install, ..." scenario the design rationale
+    // above names, "~15 cycles") to a per-episode one that can never actually
+    // starve. Resetting only when the demand is no longer held (fired, or never
+    // was) lets the count carry across gap cycles within one continuous hold.
+    when(heldDemandMiss) {
+      when(pfInstallArm || predActive) {
+        when(installDeferCnt =/= U(7, 3 bits)) { installDeferCnt := installDeferCnt + 1 }
+      }
     } otherwise {
       installDeferCnt := 0
     }

@@ -584,6 +584,184 @@ class IcachePrefetchSpec extends AnyFunSuite {
     }
   }
 
+  // Review round 1 (Task 4, slice 1a) finding 1: `pfInstallArm` is a register, one
+  // cycle stale by construction. Task 4's own `&& !predActive` correction closes
+  // the CONSUME path (`pfValid`/`pfComplete` clearing at PF_PRED's own commit) but
+  // not the POISON path: `anyInvalidate` can be a single-cycle pulse, and
+  // `pfPoison(i) := True` (driven by `when(anyInvalidate && pfValid(i))`) only
+  // takes effect the cycle AFTER the pulse -- one cycle later than `pfInstallArm`
+  // otherwise reflects it, since `pfInstallArm` samples `pfInstallAny` BEFORE the
+  // poison write lands. Without the `&& !anyInvalidate` fix, an invalidate that
+  // pulses in the EXACT SAME cycle a slot becomes armable (complete-and-clean,
+  // FSM genuinely idle) still lets `pfInstallArm` latch true for the following
+  // cycle, firing a phantom install of `pfInstallSel = OHToUInt(OHMasking.first(
+  // all-zero)) = 0` regardless of whether slot 0 was ever the one that raced --
+  // silently re-validating a just-invalidated slot 0 if it happens to be free and
+  // clean, or clearing `pfValid`/`pfArSent` out from under a still-live slot 0 and
+  // wedging its later R beats against "I-cache R beat has no live RID owner" if
+  // slot 0 happens to have its own outstanding AR.
+  test("invalidateAll pulsing on the EXACT arm-vs-poison race cycle suppresses the phantom install " +
+       "(review round 1 finding 1)", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      val axi = dut.icache.logic.axi
+      val arTrace = scala.collection.mutable.ArrayBuffer[(Int, Long)]()
+
+      axi.ar.ready #= true
+      axi.r.valid #= false
+      axi.r.payload.data #= 0
+      axi.r.payload.id #= 0
+      axi.r.payload.last #= false
+      axi.r.payload.resp #= 0
+      cd.onSamplings {
+        if (axi.ar.valid.toBoolean && axi.ar.ready.toBoolean)
+          arTrace += ((axi.ar.payload.id.toInt, axi.ar.payload.addr.toLong))
+      }
+
+      def beat(address: Long, phase: Int): BigInt =
+        (0 until 32).foldLeft(BigInt(0)) { (acc, i) =>
+          acc | (BigInt(IcacheSim.memByte(address + phase * 32L + i)) << (8 * i))
+        }
+      def sendBeat(id: Int, address: Long, phase: Int): Unit = {
+        axi.r.valid #= true
+        axi.r.payload.id #= id
+        axi.r.payload.data #= beat(address, phase)
+        axi.r.payload.resp #= 0
+        axi.r.payload.last #= (phase == 1)
+        cd.waitSamplingWhere(axi.r.ready.toBoolean)
+        axi.r.valid #= false
+      }
+      def sendLine(id: Int, address: Long): Unit = {
+        sendBeat(id, address, 0)
+        cd.waitSampling()
+        sendBeat(id, address, 1)
+        cd.waitSampling()
+      }
+      def waitReq(id: Int, address: Long): Unit =
+        while (!arTrace.contains((id, address))) cd.waitSampling()
+      val responded = scala.collection.mutable.Set[Int]()
+
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(4)
+      dut.icache.logic.prefetchEnable #= true
+      cd.waitSampling(2)
+
+      // Bootstrap: demand-fetch 0x2000 (a genuine miss), which opens the standard
+      // speculative window; hold every speculative AR so the FIRST one
+      // (I_SPEC_BASE, the 0x2040 candidate) can be delivered on our own schedule.
+      fork {
+        waitReq(AxiIds.I_DEMAND, 0x2000L)
+        axi.ar.ready #= false
+        sendLine(AxiIds.I_DEMAND, 0x2000L)
+      }
+      val got0 = fetch(dut, cd, 0x2000L)
+      assert(got0 == IcacheSim.window64(0x2000L), "bootstrap demand response data mismatch")
+      responded += AxiIds.I_DEMAND
+
+      axi.ar.ready #= true
+      waitReq(AxiIds.I_SPEC_BASE, 0x2040L)
+      axi.ar.ready #= false
+
+      // Complete the first speculative line, then land the invalidate pulse in the
+      // SAME cycle `pfComplete(0)` first reads true -- the post-RLAST/pre-install
+      // window the "COMPLETE" stage above also targets, confirmed here explicitly
+      // by requiring `pfInstallArm` to still read false (this completion's own arm
+      // decision has not yet latched) immediately before pulsing.
+      sendBeat(AxiIds.I_SPEC_BASE, 0x2040L, 0)
+      cd.waitSampling()
+      sendBeat(AxiIds.I_SPEC_BASE, 0x2040L, 1)
+      responded += AxiIds.I_SPEC_BASE
+      sleep(1)
+      assert(dut.icache.logic.pfComplete(0).toBoolean,
+        "test setup bug: pfComplete(0) not observed true in the post-RLAST window")
+      assert(!dut.icache.logic.pfInstallArm.toBoolean,
+        "test setup bug: pfInstallArm was already latched before the race window -- the " +
+          "invalidate pulse below would land one cycle too late to exercise finding 1")
+
+      // Passive, clock-synchronous monitor (NOT a direct main-thread read
+      // immediately after `cd.waitSampling()`, which was tried first and found
+      // unreliable in this harness: a register updated BY the very edge
+      // `waitSampling()` just advanced past is not guaranteed visible to an
+      // immediate subsequent read on the SAME simulated thread without another
+      // full sampling tick, even though a SEPARATE `onSamplings` callback DOES
+      // see the settled post-edge value at that same instant -- confirmed by
+      // instrumenting both side by side). `phantomArmSeen` latches true if
+      // `pfInstallArm` is EVER observed true from here until the poisoned slots
+      // are fully drained below -- with every live slot poisoned by the pulse
+      // about to land, none may ever legitimately arm again for the rest of this
+      // window, so any true reading is exactly the phantom install this test
+      // exists to catch.
+      var phantomArmSeen = false
+      val armMonitor = fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.icache.logic.pfInstallArm.toBoolean) phantomArmSeen = true
+        }
+      }
+
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling()
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(4)   // let the race play out fully before checking
+
+      // THE ASSERTION (signal level): the fix's `&& !anyInvalidate` term must have
+      // suppressed the arm for this now-poisoned slot -- `pfInstallArm` must NEVER
+      // have been observed true anywhere in this window.
+      assert(!phantomArmSeen,
+        "pfInstallArm latched true despite anyInvalidate pulsing on the exact arm-decision " +
+          "cycle -- the arm-vs-poison race (review round 1 finding 1) is not suppressed")
+      armMonitor.terminate()
+
+      // Drain every poisoned live speculative ID so no stable AXI request can
+      // obscure the architectural retry, mirroring the existing "invalidation
+      // poisons a silent fill" family immediately above: slots 1..3 were
+      // allocated during bootstrap (the window fills all `pfSlots` candidates as
+      // soon as they are free, independent of their AR actually firing) with
+      // their ARs held back (`axi.ar.ready` was false), so they are still
+      // AR_PENDING/live and must be ACTIVELY answered here -- a slot only frees
+      // itself (`pfComplete(i) && (pfErr(i) || pfPoison(i))`) once its own burst
+      // actually completes, poisoned or not; passively waiting without
+      // delivering their data would hang forever.
+      axi.ar.ready #= true
+      while ((0 until AxiIds.I_SPEC_SLOTS).exists(i => dut.icache.logic.pfValid(i).toBoolean)) {
+        val pending = arTrace.collectFirst {
+          case (id, address) if id >= AxiIds.I_SPEC_BASE && id <= AxiIds.I_SPEC_LAST &&
+            !responded(id) => (id, address)
+        }
+        pending match {
+          case Some((id, address)) =>
+            axi.ar.ready #= false
+            sendLine(id, address)
+            responded += id
+            axi.ar.ready #= true
+          case None => cd.waitSampling()
+        }
+      }
+
+      // THE ASSERTION (architectural level): no line was installed for the
+      // poisoned slot -- a real demand re-fetch of 0x2040 must still issue a
+      // fresh AR and get correct data (proving no stale re-validation happened),
+      // and the AXI R channel must not be wedged (proving `pfValid`/`pfArSent`
+      // were not phantom-cleared out from under a still-live owner either).
+      dut.icache.logic.prefetchEnable #= false
+      cd.waitSampling(4)
+      val demandArsBefore = arTrace.count(_._1 == AxiIds.I_DEMAND)
+      fork {
+        waitReq(AxiIds.I_DEMAND, 0x2040L)
+        sendLine(AxiIds.I_DEMAND, 0x2040L)
+      }
+      val got1 = fetch(dut, cd, 0x2040L)
+      assert(got1 == IcacheSim.window64(0x2040L),
+        "poisoned-then-armed line must still deliver correct data on a fresh demand refill")
+      assert(arTrace.count(_._1 == AxiIds.I_DEMAND) == demandArsBefore + 1,
+        s"the poisoned slot must not have been silently installed -- exactly one new " +
+          s"demand AR for 0x2040 was expected: $arTrace")
+    }
+  }
+
   test("four wrong-path silent IDs cannot block an unrelated redirect demand on ID0", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
