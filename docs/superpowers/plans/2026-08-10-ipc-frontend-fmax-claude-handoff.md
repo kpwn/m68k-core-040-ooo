@@ -3490,5 +3490,13 @@ by it and by nothing else in the suite — and bounded sampling helpers replacin
 unbounded blocking waits.  Gates at the reverted head: `test-fast` 149/149 (157
 suites), icache+frontend Verilator 41/41, `ExecuteLockStepSpec` 394/394.
 
+**The revert is confirmed by a real post-route gate**, run uncontended on the
+reverted head with fresh synthesis: post-synthesis WNS **-1.827**, rounds
+**-2.094 -> -1.623 -> -1.552 -> -1.472** (round for round identical to the control
+arm), final **WNS -1.472 / FMax 182.74853801169593 / TNS -17499.508 / 32408 failing
+endpoints** -- all four headline metrics reproduced exactly.  That is also the third
+independent demonstration this session that the flow is deterministic for a given
+netlist, which is what licenses every A/B in this campaign.
+
 `Distance to the 200 MHz deployment floor: 0.472 ns.  The goal is NOT met, at
 182.749 MHz.`
