@@ -288,13 +288,6 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val pfDemandLine = Reg(UInt(32 bits))
     val pfNextPa     = Reg(UInt(32 bits))
     val pfLimitPa    = Reg(UInt(32 bits))
-    // Test visibility only (zero synthesis cost -- these are already real registers):
-    // the window-clobber regression test (`IcachePrefetchSpec`, "a non-sequential
-    // demand that HITS ...") asserts the EXACT frontier triple cycle-by-cycle, which
-    // is the only way to distinguish "the seed survived" from "the allocator's stale
-    // advance overwrote it" -- the two differ solely in this register's value.
-    pfSeqValid.simPublic(); pfDemandLine.simPublic()
-    pfNextPa.simPublic(); pfLimitPa.simPublic()
 
     pfValid.simPublic()
     pfArSent.simPublic()
@@ -519,19 +512,6 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // and same-page sequential hits do not: a bubble-free hit stream must still let
     // freed speculative IDs advance the fifth/farther candidate.
     val pfWindowUpdate  = Bool(); pfWindowUpdate  := False
-    // Slice 1c review round 1 (FIX 2): non-fatal telemetry replacing two sim-fatal
-    // asserts on conditions the RTL deliberately permits (see the Slice 1c block
-    // further down for the full benign-outcome analysis of each). Same zero-cost
-    // idiom as `pfHitUseful` above: pure wires, no flops, no synthesis footprint.
-    //   - `pfAllocSetCollide`: the allocator granted a speculative slot for the exact
-    //     set a demand miss is claiming on this very cycle. Outcome: one wasted
-    //     self-evicting fill (both owners latch the same `victim(S)`, installs are
-    //     FSM-serialised).
-    //   - `pfArDemandRace`: a speculative want claimed `arHoldValid` on the exact
-    //     cycle a demand fill started. Outcome: the demand's AR is delayed by one AR
-    //     handshake (`arHoldValid` clears at `axi.ar.fire`).
-    val pfAllocSetCollide = Bool(); pfAllocSetCollide := False; pfAllocSetCollide.simPublic()
-    val pfArDemandRace    = Bool(); pfArDemandRace    := False; pfArDemandRace.simPublic()
 
     // ── Five-line registered stream window (binding design 2026-08-10) ────────
     // The frontier and candidate are registers, preserving the earlier FMax lesson:
@@ -563,253 +543,9 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val pfInstallAny = pfInstallVec.orR
     val pfInstallSel = OHToUInt(OHMasking.first(pfInstallVec.asBits))
 
-    // ── Slice 1a (design spec section 3 boundary B3): the install decision must not
-    // be a function of the LIVE demand verdict. Today `lineReg`'s 512-bit capture
-    // enable and the fanout-518 `pfInstallIdx` select are reached from
-    // `cmdPort.fire` through `demandFillStart`, which is what puts the whole
-    // `applyNow -> ITLB -> tag -> accept -> install` chain into one cycle.
-    //
-    // The inversion: arm the install from a REGISTER, and make the demand-miss
-    // capture yield to it instead. Nothing architectural depends on an install
-    // happening in any particular cycle - a completed speculative line is
-    // speculative by construction (handoff section 15 step 9's standing licence).
-    //
-    // H9 anti-starvation. `installStarves` is DIAGNOSTIC ONLY -- it does NOT gate
-    // arming, and must not be made to again (see below). The property it used to
-    // enforce is instead structural, and strictly stronger:
-    //
-    //   the allocation site (`!heldDemandMissReg`, in the Slice 1c gate further
-    //   down) freezes ALL new speculative allocation for the entire duration any
-    //   demand is held. So while a demand stays held, the speculative pool can only
-    //   ever drain -- at most `pfSlots` slots exist and each installs exactly once,
-    //   bounding the held demand's wait to `pfSlots` install episodes.
-    //
-    // Gating the ARM on `installStarves` (as this code used to do) is not merely
-    // redundant against that bound -- it is a live deadlock, because installing an
-    // already-COMPLETE slot is precisely what RELIEVES a demand's hold:
-    //   1. demand B is held because `pfLookupSetBusy` matches a speculative slot S
-    //      (`:538-539` tests `pfValid(i)` only -- a complete-but-uninstalled slot
-    //      still asserts it);
-    //   2. other slots install while B waits, driving `installDeferCnt` to the
-    //      threshold and latching `installStarves`;
-    //   3. S then completes. With `!installStarves` on the arm, S can never install,
-    //      so `pfValid(S)` never clears, so `pfLookupSetBusy` never clears, so B is
-    //      never admitted, so `heldDemandMiss` never falls -- and the counter neither
-    //      resets (needs `!heldDemandMiss`) nor increments (needs
-    //      `pfInstallArm || predActive`, both now permanently false), so
-    //      `installStarves` stays latched forever. Closed loop, no internal escape:
-    //      the AR-demotion path acts only on slots that have not yet sent their AR
-    //      (a complete slot has none left to demote), and the only `pfValid` clear
-    //      independent of the arm is the poison/error cleanup, which needs an
-    //      EXTERNAL trigger (`anyInvalidate` pulse or a bus error).
-    // Letting every complete slot take its install turn is therefore the fix, not the
-    // hazard. `installDeferMax` is retained purely as the telemetry threshold below.
-    val installDeferMax = 4
-    // Worst case for one CONTINUOUS hold: every slot in the pool installs before the
-    // held demand's own turn, and each install episode contributes exactly 3 counted
-    // cycles (1 `pfInstallArm` arm-decision cycle in IDLE + the 2 `PF_PRED` dwell
-    // cycles, during which `pfInstallArm` is itself masked low by `!predActive`).
-    // `heldDemandMiss` requires `lookupActive`, which is raised ONLY by `lookupTick`
-    // in IDLE and PF_PRED -- REFILL/PREDECODE/REPLAY/FAULT do not call it -- so a
-    // demand-side PREDECODE can never contribute counts (it drives the counter's
-    // `!heldDemandMiss` reset instead). Derived from `pfSlots` rather than written as
-    // a literal so it cannot silently drift if the pool is ever resized.
-    val installDeferBound = pfSlots * 3
-    val installDeferCntW  = log2Up(installDeferBound + 2)
-    val installDeferCnt = Reg(UInt(installDeferCntW bits)) init 0
-    installDeferCnt.simPublic()
-    val installStarves  = installDeferCnt >= U(installDeferMax, installDeferCntW bits)
-    installStarves.simPublic()
-    // `&& !predActive` (implementation correction over the literal design-spec
-    // snippet, same file, same interface): `pfInstallVec`/`pfInstallAny` read
-    // `pfValid`/`pfComplete`, which only clear at the FSM edge that ends PF_PRED
-    // (`commitBeat === 1`). A bare `RegNext(pfInstallAny && !installStarves)` samples
-    // `pfInstallAny` COMBINATIONALLY on that very same last PF_PRED cycle -- one
-    // cycle BEFORE the clear takes effect -- so it latches "true" one cycle too late
-    // and re-arms IDLE for a phantom second install of an already-freed slot the
-    // instant control returns to IDLE (proven live: `installDeferCnt` free-runs
-    // through TWO back-to-back PF_PRED dwells for a single completed slot and trips
-    // this very oracle at count 6, see task-4-report.md evidence trace). Gating the
-    // register's input with `!predActive` (true for both PREDECODE and PF_PRED)
-    // stops it from latching off that stale, about-to-be-cleared reading; the
-    // earliest a fresh arm can now form is the FIRST genuinely idle cycle after
-    // control returns to IDLE, which is exactly the 1-cycle RegNext latency the
-    // interface contract (`pfInstallArm` = "a register") already implies.
-    //
-    // `&& !anyInvalidate` (second implementation correction, review round 1
-    // finding 1): `!predActive` closes the CONSUME path (`pfValid`/`pfComplete`
-    // clearing at PF_PRED's own commit) but not the POISON path. `anyInvalidate`
-    // can be a single-cycle pulse, and `when(anyInvalidate && pfValid(i)) {
-    // pfPoison(i) := True }` (below) drops every slot out of `pfInstallVec`
-    // (`pfInstallVec` excludes `pfPoison`) only on the cycle AFTER the pulse --
-    // one cycle later than `pfInstallArm`'s own register would otherwise reflect
-    // it, since `pfInstallArm` samples `pfInstallAny` BEFORE the poison write
-    // lands. Without this term: cycle N a slot is complete-and-clean (armable)
-    // and `anyInvalidate` pulses; `pfInstallArm` latches true for N+1 regardless.
-    // At N+1 `pfInstallAny` is correctly now 0 (poisoned), but IDLE still sees
-    // `pfInstallArm == 1` and fires a full install using `pfInstallSel =
-    // OHToUInt(OHMasking.first(all-zero)) = 0` -- a PHANTOM install of slot 0
-    // regardless of whether slot 0 was ever the armed one. If slot 0 happens to
-    // be free-and-clean, that phantom install re-validates a stale tag/line one
-    // cycle after the very invalidateAll meant to invalidate it (missPoison :=
-    // pfPoison(0) || anyInvalidate reads False -- pfPoison(0) hasn't been set
-    // for THIS slot, and the anyInvalidate pulse has already passed). If slot 0
-    // is live with an outstanding AR instead, the phantom PF_PRED clears
-    // `pfValid(0)`/`pfArSent(0)` out from under it, so its real R beats later
-    // fail `pfRspMatch` and wedge the R channel against the
-    // "I-cache R beat has no live RID owner" assert. An invalidate arriving
-    // DURING the already-armed cycle is unaffected and stays safe on its own
-    // (`missPoison := pfPoison(sel) || anyInvalidate` is live that cycle); this
-    // term only closes the ONE-CYCLE-STALE-ARM-VS-FRESH-POISON gap.
-    val pfInstallArm    = RegNext(pfInstallAny && !predActive && !anyInvalidate) init False
-    pfInstallArm.simPublic()
-
-    // H9 counter update (implementation correction over the literal design-spec
-    // snippet, same file, same interface): gating purely on `heldDemandMiss` over-
-    // counts. `heldDemandMiss` is also true for the PRE-EXISTING, unrelated,
-    // legitimately-unbounded hold documented at its own definition above ("An
-    // architectural miss can remain visibly held while a speculative owner or the
-    // shared installer drains") -- e.g. waiting on a same-set fill that is still
-    // AR_PENDING/R0/R1 (`pfLookupSetBusy`, no install anywhere near armed yet), which
-    // can legitimately run for the line's full AXI service time. Counting THAT
-    // toward H9's bound trips the oracle below on pre-existing, correct traffic
-    // (proven live: `IcachePrefetchSpec`'s "AR-pending demotion" and "silent refill
-    // error" tests, which deliberately hold a demand behind a still-in-flight
-    // silent fill for far longer than `installDeferMax`, both trip it). H9 is
-    // specifically about yielding to an ARMED (or actively installing) slot, so the
-    // counter must count only that: `pfInstallArm` covers the IDLE arm-decision
-    // cycle, `predActive` covers the two PF_PRED cycles that follow it (during which
-    // `pfInstallArm` itself is masked low by the `!predActive` guard above).
-    //
-    // The RESET, however, stays keyed on `!heldDemandMiss` alone (review round 1
-    // finding 2), not on the same `(pfInstallArm || predActive)` term as the
-    // increment: the maximum contiguous `(pfInstallArm || predActive)` window is
-    // 3 cycles (1 arm + 2 PF_PRED dwell), after which the `!predActive` guard on
-    // `pfInstallArm` forces one genuinely-idle gap cycle before the NEXT slot (if
-    // any) can arm -- resetting on that gap cycle would zero the counter every
-    // single episode, making `installStarves` (`cnt >= installDeferMax`)
-    // permanently unreachable and degrading H9 from a CUMULATIVE-defer detector
-    // (the chained "install, gap, install, ..." scenario the design rationale
-    // above names, "~15 cycles") to a per-episode one that can never actually
-    // starve. Resetting only when the demand is no longer held (fired, or never
-    // was) lets the count carry across gap cycles within one continuous hold.
-    when(heldDemandMiss) {
-      when(pfInstallArm || predActive) {
-        when(installDeferCnt =/= installDeferCnt.maxValue) { installDeferCnt := installDeferCnt + 1 }
-      }
-    } otherwise {
-      installDeferCnt := 0
-    }
-
-    // Design spec section 12.1 oracle 4: a demand miss held by an armed install must
-    // be admitted within the bounded wait. Simulation-only; `GenerationFlags.simulation`
-    // is the house pattern for keeping an assert out of the synthesised netlist.
-    // The bound is `pfSlots` install episodes x 3 counted cycles each, NOT the old
-    // `installDeferMax + 1`: that literal only held while `installStarves` hard-gated
-    // arming (which capped the count at the threshold by construction, and deadlocked
-    // -- see `installDeferMax` above). With the gate gone the counter legitimately
-    // runs to the full drain of the frozen pool, so asserting 5 here would convert the
-    // removed deadlock into a spurious failure. The counter saturates one short of
-    // `maxValue` above `installDeferBound`, so this assert stays live rather than
-    // being masked by wraparound.
-    //
-    // The bound is EXACTLY tight and that is INTENTIONAL (review round 1 minor): the
-    // maximum reachable count is `pfSlots * 3` = 12, which is precisely
-    // `installDeferBound`, and the comparison is `<=`, so a legal full-pool drain
-    // passes with zero margin and ANY thirteenth counted cycle fails. Padding it
-    // would only buy slack against a mechanism that does not exist -- there is no
-    // source of a 13th cycle other than a genuine H9 violation, because the count
-    // is gated on `pfInstallArm || predActive` (1 arm + 2 PF_PRED per episode) and
-    // `pfSlots` is the hard ceiling on episodes within one continuous hold.
-    GenerationFlags.simulation {
-      assert(installDeferCnt <= U(installDeferBound, installDeferCntW bits),
-        "H9 bounded-wait violated: a demand miss was deferred behind installs for too long")
-    }
-
-    // ── Slice 1c (design spec section 3 boundary B3): the speculative allocator and
-    // the AR arbiter are the last two consumers of the LIVE demand verdict. Both are
-    // pure speculation control - a slot allocated or an AR launched one cycle late
-    // costs at most one cycle of prefetch earliness against a ~70-78 cycle line
-    // service, and neither can change an architectural outcome (the demand refill's
-    // own AR is launched from `refillActive && !arSent`, which is registered FSM
-    // state and is NOT touched here).
-    val heldDemandMissReg  = RegNext(heldDemandMiss)  init False
-    heldDemandMissReg.simPublic()
-
-    // ── Slice 1c, review round 1 (FIX 1, Critical): `pfWindowUpdate` is NOT
-    // registered, and `demandFillStart` is not mirrored at all. Both mirrors were
-    // written in the first pass and both were wrong, for two DIFFERENT reasons:
-    //
-    //   `pfWindowUpdateReg` (removed -- it was actively CORRUPTING the window).
-    //   `pfWindowUpdate`'s declaration states the invariant: a lookup that
-    //   RESETS/KILLS the frontier OWNS the allocator cycle. Slice 1b made the
-    //   window rewrite happen one cycle after the accept (`seedValidReg`), so the
-    //   owning cycle is the `seedPfWindow()` cycle -- exactly the cycle on which
-    //   `pfWindowUpdate` is live-high. Gating the allocator on the REGISTERED
-    //   mirror blocks the cycle AFTER the rewrite (where nothing needs blocking)
-    //   and leaves the rewrite cycle itself wide open: `seedPfWindow()` writes
-    //   `pfNextPa := line + 64` and the allocator, elaborated LATER in this same
-    //   file, writes `pfNextPa := pfNextPa + 64` -- last assignment wins, so the
-    //   stale advance silently overwrote the fresh seed. `pfDemandLine`/`pfLimitPa`
-    //   move to the new stream while `pfNextPa` keeps the abandoned frontier: the
-    //   prefetcher then either fetches lines of the abandoned stream (waste plus
-    //   evictions) or, in the common cross-page redirect, goes permanently dead
-    //   (`pfWindowHasCandidate` requires `pfNextPa`'s page to equal
-    //   `pfDemandLine`'s) until the next non-sequential demand happens to reseed
-    //   it. A demand MISS is accidentally protected (`demandFillStartReg` was true
-    //   at accept+1) and so is an INHIBITED accept (`pfSeqValid := False`), but an
-    //   ordinary taken branch into ALREADY-CACHED code -- a non-sequential demand
-    //   that HITS -- is fully exposed. Covered by `IcachePrefetchSpec`'s "a
-    //   non-sequential demand that HITS re-seeds the prefetch frontier" test,
-    //   which asserts the exact frontier triple at accept+2.
-    //   And the registration bought ZERO timing: after slice 1b `pfWindowUpdate` is
-    //   derived purely from registers (`seedValidReg`, `seedCacheableReg`,
-    //   `seedPaddrReg`, `pfSeqValid`, `pfDemandLine`) and was never in the live
-    //   `xlate.rsp`/`isHit` verdict cone this slice exists to cut. Pure loss.
-    //
-    //   `demandFillStartReg` (removed -- it was a no-op guard). At accept+1 the FSM
-    //   is unconditionally in REFILL (`demandFillStart` and `goto(REFILL)` are the
-    //   same statement), so:
-    //     - AR arbiter: `refillActive` is true and `arSent` was just cleared at
-    //       capture, so the `refillActive && !arSent` branch ABOVE the speculative
-    //       `elsewhen` always wins; the term was unreachable.
-    //     - allocator: `demandSetOwned` (REFILL/PREDECODE/REPLAY/FAULT with
-    //       `missSet === pfCandSet`) already blocks the only set that matters, so
-    //       the term only cost one cycle of prefetch earliness for candidates that
-    //       could never have conflicted.
-    //
-    // What the two mirrors were nominally protecting against is real but BENIGN,
-    // and is now recorded as non-fatal telemetry (`pfAllocSetCollide` /
-    // `pfArDemandRace` below) rather than as sim-fatal asserts on conditions this
-    // RTL deliberately permits:
-    //   (a) allocator, on the ACCEPT cycle itself (neither mirror ever covered it):
-    //       a candidate that VIPT-aliases onto the exact set the demand is claiming
-    //       can be granted a slot. Both owners latch the same `victim(S)` and the
-    //       installs are FSM-serialised, so the outcome is one wasted self-evicting
-    //       fill -- no corruption, no lost line.
-    //   (b) AR arbiter, on the accept cycle: a fresh speculative want can claim
-    //       `arHoldValid` before `refillActive` turns true. `arHoldValid` clears at
-    //       `axi.ar.fire`, so the demand's own AR is delayed by ONE AR handshake --
-    //       not by the speculative transaction's round trip.
-
-    // ── Slice 1b (design spec section 3 boundary B3, hazard H10): the prefetch
-    // window is seeded from a REGISTERED accepted-demand context, not from the live
-    // `lookupPaddr` (which is literally `xlate.rsp.ppn ## pc(11:0)`). The window is a
-    // speculative hint: nothing architectural reads it in the cycle the demand is
-    // accepted, so one cycle of prefetch lateness is free (handoff section 15 step 9).
-    //
-    // The page-crossing restart rule inside seedPfWindow is ORDER-sensitive, not
-    // TIMING-sensitive: it compares this line against the previously recorded
-    // `pfDemandLine`. Feeding it a one-cycle-late but correctly ORDERED stream of
-    // accepted demands preserves it exactly.
-    val seedValidReg     = RegInit(False)
-    val seedPaddrReg     = Reg(UInt(32 bits))
-    val seedCacheableReg = RegInit(False)
-    seedValidReg.simPublic(); seedCacheableReg.simPublic()
-
     def seedPfWindow(): Unit = {
-      val line = seedPaddrReg & ~U(63, 32 bits)
-      val pageEnd = (seedPaddrReg(31 downto 12) ## U(0xfff, 12 bits)).asUInt & ~U(63, 32 bits)
+      val line = lookupPaddr & ~U(63, 32 bits)
+      val pageEnd = (lookupPaddr(31 downto 12) ## U(0xfff, 12 bits)).asUInt & ~U(63, 32 bits)
       val wantedLimit = line + U(5 * 64, 32 bits)
       val clampedLimit = Mux(wantedLimit(31 downto 12) === line(31 downto 12),
                              wantedLimit, pageEnd)
@@ -919,17 +655,24 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // During a prefetch fill, only an answerable hit/fault may fire; a miss remains
         // held at the Stream boundary until the shared fill engine becomes free.
         val answerable = if (canStartFill)
-          (lookupFault || isHit || (!pfInstallArm && !pfLookupSetBusy))
+          (lookupFault || isHit || !pfLookupSetBusy)
         else
           (lookupFault || isHit)
         cmdPort.ready := xlate.rsp.ready && !setBlocked && answerable
 
         when(cmdPort.fire) {
-          // Slice 1b: capture only. The window itself is evaluated one cycle later,
-          // outside the accept cone, from `seedValidReg`/`seedPaddrReg`.
-          seedValidReg     := True
-          seedPaddrReg     := lookupPaddr
-          seedCacheableReg := !lookupFault && lookupCacheable
+          when(!lookupFault && lookupCacheable) {
+            val line = lookupPaddr & ~U(63, 32 bits)
+            val sequential = pfSeqValid &&
+                             (line(31 downto 12) === pfDemandLine(31 downto 12)) &&
+                             (line === (pfDemandLine + U(64, 32 bits)))
+            pfWindowUpdate := !pfSeqValid ||
+                              ((line =/= pfDemandLine) && !sequential)
+            seedPfWindow()
+          } otherwise {
+            pfWindowUpdate := True
+            pfSeqValid := False
+          }
           when(lookupFault) {
             // Translation fault: emit a fault response (no data, no refill).
             s1Valid := True
@@ -975,11 +718,9 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
       IDLE.whenIsActive {
         lookupTick(canStartFill = true)
-        // Slice 1a: `pfInstallArm` is a register, so `lineReg`'s capture enable and
-        // `pfInstallIdx`'s 518-fanout select are reached from a flop. `answerable`
-        // above guarantees no demand miss can be captured in the same cycle, so the
-        // old `&& !demandFillStart` live veto is not merely redundant - it is gone.
-        when(pfInstallArm) {
+        // Demand allocation wins. Otherwise a completed silent line is registered
+        // into the shared installer; the wide LUTRAM read terminates at `lineReg`.
+        when(pfInstallAny && !demandFillStart) {
           pfInstallIdx := pfInstallSel
           lineReg := pfLineHi.readAsync(pfInstallSel) ## pfLineLo.readAsync(pfInstallSel)
           missPC        := pfPa(pfInstallSel)
@@ -1086,24 +827,6 @@ class IcachePlugin extends FiberPlugin with FetchService {
       }
     }
 
-    // Slice 1b: the deferred window update. `seedValidReg` is a one-shot; the
-    // decision rules below are byte-for-byte the ones that used to run inside
-    // `when(cmdPort.fire)`, only their operands are registered.
-    seedValidReg := False   // default: one-shot, overridden by the capture above
-    when(seedValidReg) {
-      when(seedCacheableReg) {
-        val line = seedPaddrReg & ~U(63, 32 bits)
-        val sequential = pfSeqValid &&
-                         (line(31 downto 12) === pfDemandLine(31 downto 12)) &&
-                         (line === (pfDemandLine + U(64, 32 bits)))
-        pfWindowUpdate := !pfSeqValid || ((line =/= pfDemandLine) && !sequential)
-        seedPfWindow()
-      } otherwise {
-        pfWindowUpdate := True
-        pfSeqValid := False
-      }
-    }
-
     // ══ Five-ID fill pool + single shared installer ═══════════════════════════════
     refillDone := False
     refillErr  := False
@@ -1114,14 +837,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val demandSetOwned = (fsm.isActive(fsm.REFILL) || fsm.isActive(fsm.PREDECODE) ||
                           fsm.isActive(fsm.REPLAY) || fsm.isActive(fsm.FAULT)) &&
                          (missSet === pfCandSet)
-    // `pfWindowUpdate` is read LIVE (review round 1 FIX 1): the cycle that REWRITES
-    // the frontier is the cycle the allocator must yield, because `seedPfWindow()`
-    // and the `pfNextPa := pfNextPa + 64` advances below are last-assignment-wins
-    // writes to the same register and the allocator is elaborated later. It is a
-    // register-only expression (see the Slice 1c block above), so reading it live
-    // costs this slice nothing.
-    when(pfWindowHasCandidate && !anyInvalidate &&
-         !pfWindowUpdate && !heldDemandMissReg) {
+    when(pfWindowHasCandidate && !anyInvalidate && !demandFillStart &&
+         !pfWindowUpdate && !heldDemandMiss) {
       when(pfCandLive) {
         pfNextPa := pfNextPa + U(64, 32 bits)
       } elsewhen(pfCandSetBusy || demandSetOwned) {
@@ -1131,13 +848,6 @@ class IcachePlugin extends FiberPlugin with FetchService {
       } elsewhen(pfCandResident) {
         pfNextPa := pfNextPa + U(64, 32 bits)
       } elsewhen(pfHasFree) {
-        // Slice 1c telemetry, direction (a) (review round 1 FIX 2 -- this was a
-        // sim-fatal assert and must not be, because the RTL permits it and the
-        // outcome is benign): a demand miss captured THIS cycle plus a candidate
-        // that VIPT-aliases onto the exact set the demand is about to own. Both
-        // owners latch the same `victim(S)` and the installs are FSM-serialised, so
-        // it costs one wasted self-evicting fill and nothing else.
-        pfAllocSetCollide := demandFillStart && (pfCandSet === lookupSet)
         pfValid(pfFreeIdx)    := True
         pfArSent(pfFreeIdx)   := False
         pfComplete(pfFreeIdx) := False
@@ -1172,52 +882,18 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // already visible at the command boundary. An AR that was presented earlier
     // remains stable until fire, as AXI requires; this guard handles the empty-holder
     // arbitration case and the matching-fill error/retry boundary.
-    //
-    // DEVIATION FROM THE BRIEF (proven by a live hang, not by style preference): the
-    // brief's Step 3 snippet compares against `missSet` here, on the claim that
-    // "missSet ... is latched at miss-capture time and is exactly the set the held
-    // demand needs unblocked." That is false for a demand that is HELD *BEFORE ever
-    // being captured* -- exactly the case `heldDemandMiss`'s own declaration-site
-    // comment names ("An architectural miss can remain visibly held while a
-    // speculative owner or the shared installer drains") and exactly what
-    // `IcachePrefetchSpec`'s "AR-pending demotion launches the blocking silent owner
-    // without deadlock" test exercises: `cmdIn.ready` is asserted False on purpose
-    // (`pfLookupSetBusy` blocks `answerable`), so `cmdPort.fire` never happens, so
-    // `demandFillStart` never fires, so `missSet` is NEVER written to this demand's
-    // set -- it keeps whatever value the PREVIOUS accepted demand left behind. With
-    // `missSet` here, `pfBlockingArWant`/`pfBlockingArAny` therefore stay False for
-    // the entire hold, `(!heldDemandMissReg || pfBlockingArAny)` is permanently
-    // False, no further speculative AR is ever granted, the blocking slot's own AR
-    // never launches, `pfLookupSetBusy` never clears, and the demand is held
-    // forever. CONFIRMED LIVE: running the brief's snippet verbatim hung the
-    // Verilator suite for 44+ minutes at 100% CPU, stuck inside exactly that test
-    // with no further progress (see task-6-report.md for the run transcript and the
-    // kill/diagnose trace). `lookupSet` is kept LIVE here instead (as the
-    // pre-existing code already did): it is cheap address bits off
-    // `cmdPort.payload.pc` (via `lookupPc`), not part of the translation-latency
-    // verdict cone (`xlate.rsp.ready`/`lookupFault`/`isHit`) this slice registers --
-    // `heldDemandMissReg` (the actual verdict, used both in the Mux select below and
-    // in the gating term) is what makes this registered state; the address compare
-    // does not need to be, and moving it to `missSet` is not a "strict improvement in
-    // precision," it is a correctness regression for the not-yet-captured case.
     val pfBlockingArWant = Vec((0 until pfSlots).map(i =>
       pfArWant(i) && (pfSet(i) === lookupSet)))
     val pfBlockingArAny = pfBlockingArWant.orR
     val pfBlockingArSel = OHToUInt(OHMasking.first(pfBlockingArWant.asBits))
-    val pfChosenArSel = Mux(heldDemandMissReg, pfBlockingArSel, pfArSel)
+    val pfChosenArSel = Mux(heldDemandMiss, pfBlockingArSel, pfArSel)
     when(!arHoldValid) {
       when(refillActive && !arSent) {
         arHoldValid := True
         arHoldId    := U(AxiIds.I_DEMAND, AxiIds.ID_W bits)
         arHoldAddr  := missPA & ~U(63, 32 bits)
-      } elsewhen(pfAnyArWant && (!heldDemandMissReg || pfBlockingArAny)) {
-        // Slice 1c telemetry, direction (b) (review round 1 FIX 2 -- was a sim-fatal
-        // assert; same reasoning as direction (a)): a fresh speculative want claimed
-        // `arHoldValid` on the exact cycle a demand fill started, before
-        // `refillActive` turned true. The demand's own `refillActive && !arSent`
-        // branch above needs `!arHoldValid`, so it waits -- but only until
-        // `axi.ar.fire` clears the holder, i.e. ONE AR handshake, not a round trip.
-        pfArDemandRace := demandFillStart
+      } elsewhen(pfAnyArWant && !demandFillStart &&
+                 (!heldDemandMiss || pfBlockingArAny)) {
         arHoldValid := True
         arHoldId    := (pfChosenArSel.resize(AxiIds.ID_W) +
                         U(AxiIds.I_SPEC_BASE, AxiIds.ID_W bits)).resized
