@@ -1,8 +1,23 @@
 agent=claude-sts2-paddr-hub-grounding
-task=Ground the DcachePlugin stS2Payload_paddr fanout hub named in handoff 24.5 as the single
-     most actionable line; real netlist fanout/consumers + a measured what-if ladder before
-     any design.
+task=Ground the DcachePlugin stS2Payload_paddr fanout hub named in handoff 24.5 as
+     "the single most actionable line".
 reserved_at=2026-08-11T12:20:00+02:00
-head=06750f8 (docs), RTL = c776f06-identical (B3 reverted), baseline 182.749 MHz / WNS -1.472
-status=ACTIVE -- read-only Vivado probe on the frozen 6b246de routed checkpoint
-       (synth/probe_stS2_paddr_hub.tcl). No RTL touched.
+released_at=2026-08-11T12:25:00+02:00
+head=71a3065 (docs) / RTL untouched, byte-identical to c776f06
+
+RESULT=DEAD END, with a much larger negative result underneath it.
+  The hub is worth +0.000 ns on the baseline AND on top of the three-arc frontend
+  program.  So is every narrower formulation inside it (refillWriteHold, storePort.ready,
+  the store-pipe advance logic, the D-cache -> BRAM round trip).
+  DECISIVE ROW: false-pathing all 42,428 D-cache/LS-EU cells to all 42,428 of them,
+  on top of b2+b3+fixA+arc3, still measures WNS -1.451 -- identical to the frontend
+  program alone.  THE ENTIRE LSU CLUSTER, RESTRUCTURED TO PERFECTION, IS WORTH +0.000 ns.
+  Combined ceiling for {3 frontend families} u {everything in the LSU} = +0.021 ns
+  against the +0.472 ns needed.
+  WHY: the surviving path's ROUTE ALONE (4.063 ns) exceeds its required time (4.010 ns),
+  with 1,691 endpoints still below -1.000 ns.  Only physical/floorplan levers remain.
+NO FIX DESIGNED, deliberately -- designing inside a cluster whose maximally-generous
+  cut measures a proven zero would be designing against that zero.
+BRANCH STATE=CLEAN.  No RTL touched.  test-fast 149/149 (157 suites); explicit
+  VerilatorTest testOnly runs 512/512 and 75/75.
+WRITEUP=handoff section 25; probe synth/probe_stS2_paddr_hub.tcl + synth/probe_sts2hub/.
