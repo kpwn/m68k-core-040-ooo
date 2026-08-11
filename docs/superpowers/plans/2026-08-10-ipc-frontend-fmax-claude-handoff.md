@@ -4401,3 +4401,163 @@ what-if, baseline-reproduction control). Evidence: `synth/probe_pinkind/`.
 `Distance to the 200 MHz deployment floor: 0.472 ns. The goal is NOT met, at
 182.749 MHz. The design above is projected to close 17-42 % of it, not all of
 it, and says so in advance.`
+
+## 28. P2 canary measured and REJECTED — the CE-vs-D hypothesis fails its first real test; -20.5 MHz regression (Claude, 2026-08-11)
+
+**Execution of §27's design's P2 canary slice
+(`2026-08-11-ipc-frontend-genuine-repipeline-design.md` §4.1/§10.2), on an
+isolated worktree/branch. The result is REJECTED per the design's own numeric
+gates. `codex/ipc-dcache-vipt` (this worktree) was never touched — it remains
+clean at `da2a1d7`, still the confirmed `-1.472 ns / 182.749 MHz` baseline.**
+
+### 28.1 Task 0 — the true worst path, re-derived live, not inherited
+
+Per §0.1's standing rule (three prior occurrences of exactly this error class:
+§24.5, §25.4/§26, and the dispatch that produced this design), the worst path
+was re-derived from a live `report_timing` on the archived
+`6b246de_default_postrouteN3_decode/fullcore_routed.dcp` — whose RTL is
+byte-identical to `da2a1d7`'s (`git diff --stat 6b246de..da2a1d7 -- src/`
+shows only a test-only file addition, confirmed before trusting the archive):
+
+```
+WNS      -1.472 ns   (reproduced exactly, matches the 6x-reproduced baseline)
+START    DcachePlugin_logic_stS2Payload_paddr_reg[5]/C
+END      IssueQueuePlugin_logic_sbNzvc_busy_reg[8]/D    <- a /D pin, not /CE
+LEVELS   21   LOGIC 1.733 ns (31.775%)   NET 3.721 ns (68.225%)
+DATA PATH DELAY 5.454 ns
+```
+
+This time the number checks out: it matches §0.1's own correction and §27.1's
+control exactly, to three decimals. No discrepancy found — this is a genuine
+independent confirmation, not a repeat of the inheritance error. The path is
+D-cache/IssueQueue, out of scope for P2 by §2.2, consistent with §7.2's own
+statement that a perfect frontend re-pipelining leaves WNS at -1.472 ns on a
+static reading — P2 was never expected to move final WNS directly; its real
+test is the per-round iterated-post-route trajectory (§7.2's thesis, §10.2's
+protocol).
+
+### 28.2 What was built
+
+Per §4.1, exactly one file: `frontend/PipeStage.scala`, rewritten from a
+1-deep register (`in.ready := !valid || out.ready`, chaining `out.ready`
+backwards through every downstream consumer) to a 2-entry skid
+(`mainValid/mainData` + `skidValid/skidData`, `in.ready := !skidValid` —
+purely local, one register read). Flush clears both banks as the textually
+last assignment (H3's last-wins property, preserved for both banks). Applies
+uniformly to all 4 `PipeStage` instances (`DecodeStage.scala:113 raw`,
+`:146 fed`, `:1954 pushReg`, `RenameStage.scala:316 uopsStaged`) with zero
+call-site changes — every call site was grepped and confirmed to touch only
+`.valid`/`.payload`/`.ready`/`.simPublic()`, so the swap is a true black-box
+replacement. 87 insertions / 13 deletions, one file.
+
+Worktree `/home/qwertyoruiop/m68k-core-040-ooo-worktrees/p2-canary`, branch
+`codex/ipc-p2-skid-canary` off `da2a1d7`, commit `7eec7b3`.
+
+### 28.3 Correctness: fully green, exceeds baseline
+
+| suite | result |
+|---|---|
+| `make test-fast` | **149/149, 157 suites** — bit-identical to baseline |
+| explicit `VerilatorTest` (`FetchAlign*`, `Icache*`, `Ftb`/`Gshare`/`Ras`, `MicroOpQueue`/`DecodeCrackPipe`/`DecodeContracts`, `Aligner`) | **91/91, 16 suites** |
+| `ExecuteLockStepSpec` | **394/394** |
+| `EndToEndLockStepSpec` | **2/2** (396/396 combined, 2 suites) |
+
+Meets/exceeds the ~390/394 baseline target from every angle. No IPC
+re-measurement: zero-cycle by construction, and moot given §28.4.
+
+### 28.4 The real post-route gate: REJECTED, decisively
+
+`IMPL_STRATEGY=postrouteN POSTROUTE_ROUNDS=3`, `FLOORPLAN_MODE=decode`, fresh
+synthesis, verified uncontended before and after (0 competing
+`impl_FullCore.tcl`, 21-27 GB available across the run; the sibling
+`macqd700-soc` job that was running at dispatch time completed partway
+through and did not recur). Archived at
+`synth/archive/p2_canary_skid_postrouteN3_decode/` in the `p2-canary`
+worktree. `SOURCE_MD5 = NETLIST_MD5 = 8d349f76502c2374b229aab40f957140`.
+
+| metric | baseline (6x-reproduced) | P2 canary | delta |
+|---|---:|---:|---:|
+| post-**synthesis** WNS | -1.827 | **-1.996** | **-0.169 WORSE** (RTL-attributable, pre-placement — §23.5's rule) |
+| round 0 | -2.094 | **-2.352** | -0.258 worse |
+| round 1 | -1.623 | **-2.165** | — |
+| round 2 | -1.552 | -2.165 (unchanged) | — |
+| round 3 (final) | -1.472 | **-2.165** | **-0.693 WORSE** |
+| round-0-to-plateau gain | **+0.622**, still gaining at r3 | **+0.187**, dead after round 1 | far below the 0.37 ns hard-stop floor |
+| FMax | 182.749 MHz | **162.206 MHz** | **-20.543 MHz** |
+| TNS | -17,499.508 | **-31,714.936** | +81.2% worse |
+| failing endpoints | 32,408 | **43,289** | +33.6% worse |
+| CLB LUTs | 110,679 (51.01%) | **117,702 (54.25%)** | **+6.35%**, exceeds §7.4's +3% budget |
+| CLB Registers | 50,389 (11.61%) | 53,207 (12.26%) | +5.59%, within +6% budget |
+
+**Verdict against §10.2's own gates: RESISTANT — HARD STOP.** Round-0-to-
+plateau gain (+0.187 ns) is below the 0.37 ns floor — "the best result any of
+the seven [prior] failures achieved" — and the protocol is explicit that this
+is dispositive "regardless of round-0 WNS and regardless of final WNS."
+Independently, §7.4's REJECT criterion (`ΔWNS < +0.000 ns`) trips outright:
+ΔWNS = **-0.693 ns**. Neither gate is ambiguous; both trip cleanly.
+
+**The new limiting path is a third, previously-unseen family:**
+
+```
+GsharePlugin_logic_pht_spinal_port4_reg[1]/C -> IcachePlugin_logic_lineReg_reg[*]/D
+19 levels, 30% logic / 70% route, fanout 390, ~40 of the top-100 slack-matrix rows
+```
+
+P2 touches neither `GsharePlugin` nor `IcachePlugin`'s `lineReg` — this is a
+**placement-equilibrium** side effect of restructuring the frontend's register
+topology, exactly the failure mode §9.2 already named as a standing risk
+("a provably logically redundant one-line change measured -6.55 MHz from
+placement equilibrium alone, LS-EU corridor"). `lineReg` is the same endpoint
+family B3 regressed onto (§23.5), though reached via a completely different,
+previously-unimplicated startpoint (`GsharePlugin`'s PHT, not
+`FetchAlignPlugin_predictTargetReg`).
+
+### 28.5 The concerning part, stated as plainly as the rest of this campaign
+
+**The canary worked exactly as designed** — it caught a B3-shaped failure at
+the cost of one file and one gate, before P1 or P3 (400+ lines) were
+attempted. That is the mechanism's whole justification, and it paid for
+itself here.
+
+But the result is bigger than a routine rejection. §10.2 named P2's
+`RasPlugin` family (100% CE, 496 endpoints) as **"the purest possible test"**
+of §3's central CE-vs-D hypothesis, with the explicit logic *"if converting a
+deep-CE cone to a shallow one does not help there, it will not help
+anywhere."* It did not help. Combined with B3 — the other "provably zero
+cost" frontend restructuring this campaign has built — **two of two such
+restructurings have now regressed real post-route FMax by double-digit MHz**
+(B3: -8.1 MHz; P2: -20.5 MHz, worse), despite both passing every correctness
+gate and both satisfying their own stated design rule at the RTL level.
+
+One nuance keeps this from being a clean refutation of §3: P2's new critical
+path terminates on `IcachePlugin_logic_lineReg_reg[*]/D` — a **`/D`** pin, not
+the `/CE` cone the design targeted. So the regression is not obviously a
+counter-example to "wide bank, shallow CE" as stated; it may be pure
+placement-equilibrium noise from moving ~2,000-2,400 flops' worth of skid
+state (§12's own budget) into a differently-shaped netlist, independent of
+the CE-vs-D question. **That distinction has not been investigated and is
+the most useful next question**, not because it would excuse the regression
+(the regression is real, measured, and dispositive for this slice) but
+because it determines whether P1/P3 — built on the same §3 principle — carry
+the same risk or a different one.
+
+**Recommendation, not yet acted on: do not proceed to P1 or P3 on the
+strength of this design's static reasoning alone.** The static evidence in
+§7.1 was already "silent" per §9.1's own honest framing; it is now backed by
+two real, expensive, negative results. If the programme continues, the
+priority is understanding the placement mechanism behind this regression —
+why severing the reverse-ready chain moves `GsharePlugin` and
+`IcachePlugin_lineReg` (neither touched by the change) onto a new worst
+path — before spending another ~35-minute gate on P1.
+
+### 28.6 Status
+
+**Nothing merged.** `codex/ipc-dcache-vipt` (this worktree) is untouched;
+`da2a1d7` / **-1.472 ns / 182.749 MHz** remains the standing baseline. The P2
+canary lives only on the isolated `codex/ipc-p2-skid-canary` branch (commit
+`7eec7b3`, worktree `p2-canary`) as a negative result for the record — it
+should **not** be carried forward as-is, and P1/P3 should not be dispatched
+against this design without first addressing §28.5's open question.
+
+`Distance to the 200 MHz deployment floor: 0.472 ns, unchanged. The goal is
+NOT met, at 182.749 MHz.`
