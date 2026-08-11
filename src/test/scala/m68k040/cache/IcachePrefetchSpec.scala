@@ -818,6 +818,18 @@ class IcachePrefetchSpec extends AnyFunSuite {
       assert(fetch(dut, cd, 0x2000L) == IcacheSim.window64(0x2000L))
       cd.waitSamplingWhere((AxiIds.I_SPEC_BASE to AxiIds.I_SPEC_LAST).forall(id =>
         arTrace.exists(_._1 == id)))
+      // `arTrace` is appended from `cd.onSamplings` on the sampling the AR FIRES, but
+      // `pfArSent(idx) := True` is a register write on that same edge, so it only reads
+      // back True from the FOLLOWING sampling. Whether the `waitSamplingWhere` predicate
+      // above observes the fourth AR's trace entry before or after that edge is decided
+      // by sim-thread/callback scheduling, which is not stable under host CPU contention
+      // -- observed live: this assert failed once with `slot3(v=true,ar=false,c=false)`
+      // and its own AR already present in `arTrace`, while the AR cadence (fires at
+      // cycles 9/11/13/15/17, check at 18) is byte-identical before and after the Slice
+      // 1c registration change, i.e. the flake is this sampling boundary and not an RTL
+      // timing shift. One extra sampling removes the ambiguity without weakening the
+      // check: all four slots must still be simultaneously valid, AR-sent and incomplete.
+      cd.waitSampling()
       assert((0 until AxiIds.I_SPEC_SLOTS).forall(i =>
         dut.icache.logic.pfValid(i).toBoolean && dut.icache.logic.pfArSent(i).toBoolean &&
           !dut.icache.logic.pfComplete(i).toBoolean),

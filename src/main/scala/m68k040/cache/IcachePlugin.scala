@@ -651,6 +651,52 @@ class IcachePlugin extends FiberPlugin with FetchService {
         "H9 bounded-wait violated: a demand miss was deferred behind installs for too long")
     }
 
+    // ── Slice 1c (design spec section 3 boundary B3): the speculative allocator and
+    // the AR arbiter are the last two consumers of the LIVE demand verdict. Both are
+    // pure speculation control - a slot allocated or an AR launched one cycle late
+    // costs at most one cycle of prefetch earliness against a ~70-78 cycle line
+    // service, and neither can change an architectural outcome (the demand refill's
+    // own AR is launched from `refillActive && !arSent`, which is registered FSM
+    // state and is NOT touched here).
+    val heldDemandMissReg  = RegNext(heldDemandMiss)  init False
+    val pfWindowUpdateReg  = RegNext(pfWindowUpdate)  init False
+    val demandFillStartReg = RegNext(demandFillStart) init False
+    heldDemandMissReg.simPublic()
+
+    // ── Slice 1c (implementation correction over the literal design-spec snippet,
+    // same file, same interface): the demand-miss ACCEPT cycle is the first cycle
+    // `heldDemandMiss`/`demandFillStart` are true, so on that exact cycle the
+    // registered mirrors above still read last cycle's (False) value - a one-cycle
+    // lag that is invisible for a LEVEL signal held across multiple cycles, but is a
+    // real gap for the first-rising-edge cycle of what is functionally a pulse here
+    // (both `heldDemandMiss` and `demandFillStart` are true for exactly one cycle in
+    // the common "immediate accept, no contention" case). Two consumers read these
+    // mirrors combinationally in a way that a stale-False reading on that exact
+    // cycle can corrupt:
+    //   (a) the allocator could grant a NEW speculative slot for the very set the
+    //       demand is capturing into `missSet` this same cycle (VIPT set aliasing
+    //       across pages makes `pfCandSet === lookupSet` reachable even though the
+    //       two lines are unrelated) - two live owners of one set, the invariant
+    //       `IcachePrefetchSpec` checks by construction (five distinct owner IDs,
+    //       no starved demand).
+    //   (b) the AR arbiter could let a fresh speculative want claim `arHoldValid`
+    //       on the accept cycle, before `refillActive` turns true (that only happens
+    //       the FOLLOWING cycle, once the FSM is actually in REFILL) - stealing the
+    //       holding register out from under the demand's own `refillActive &&
+    //       !arSent` branch next cycle, since that branch is itself gated by
+    //       `!arHoldValid`. That is a real priority inversion, not a cosmetic delay:
+    //       the demand's AR would now wait behind the speculative transaction's own
+    //       full round trip instead of launching immediately.
+    // These two asserts are the direct, mechanistic form of that reasoning - each
+    // sits exactly where the corresponding write is about to happen (inside the
+    // `pfHasFree` allocation branch and inside the speculative-grant `elsewhen`
+    // below, respectively), and each reads the LIVE `demandFillState`/`lookupSet`
+    // (never re-registered) so the assert itself cannot suffer the same lag it is
+    // checking for. Verified never to fire across the full Icache*/FetchAlign*
+    // Verilator suite, AND shown capable of firing at all by a guard-removal canary
+    // run (temporarily dropping the registered-mirror term so the hazard is forced)
+    // -- see task-6-report.md for both run logs.
+
     // ── Slice 1b (design spec section 3 boundary B3, hazard H10): the prefetch
     // window is seeded from a REGISTERED accepted-demand context, not from the live
     // `lookupPaddr` (which is literally `xlate.rsp.ppn ## pc(11:0)`). The window is a
@@ -973,8 +1019,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val demandSetOwned = (fsm.isActive(fsm.REFILL) || fsm.isActive(fsm.PREDECODE) ||
                           fsm.isActive(fsm.REPLAY) || fsm.isActive(fsm.FAULT)) &&
                          (missSet === pfCandSet)
-    when(pfWindowHasCandidate && !anyInvalidate && !demandFillStart &&
-         !pfWindowUpdate && !heldDemandMiss) {
+    when(pfWindowHasCandidate && !anyInvalidate && !demandFillStartReg &&
+         !pfWindowUpdateReg && !heldDemandMissReg) {
       when(pfCandLive) {
         pfNextPa := pfNextPa + U(64, 32 bits)
       } elsewhen(pfCandSetBusy || demandSetOwned) {
@@ -984,6 +1030,18 @@ class IcachePlugin extends FiberPlugin with FetchService {
       } elsewhen(pfCandResident) {
         pfNextPa := pfNextPa + U(64, 32 bits)
       } elsewhen(pfHasFree) {
+        // Slice 1c canary (direction (a), see the block above `demandFillStartReg`'s
+        // declaration): `demandFillStart`/`heldDemandMiss` are read live here on
+        // purpose, NOT via their registered mirrors -- this is the one spot the
+        // one-cycle registration lag could actually bite (a demand miss captured
+        // THIS cycle and a same-cycle candidate that VIPT-aliases onto the exact
+        // set the demand is about to own). Never observed to fire across the full
+        // Icache*/FetchAlign* suite; see task-6-report.md for the guard-removal
+        // canary-validation run that proves this assert is reachable in principle.
+        GenerationFlags.simulation {
+          assert(!(demandFillStart && (pfCandSet === lookupSet)),
+            "B3 1c: allocator granted a new speculative slot for the exact set a demand miss just claimed")
+        }
         pfValid(pfFreeIdx)    := True
         pfArSent(pfFreeIdx)   := False
         pfComplete(pfFreeIdx) := False
@@ -1018,18 +1076,58 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // already visible at the command boundary. An AR that was presented earlier
     // remains stable until fire, as AXI requires; this guard handles the empty-holder
     // arbitration case and the matching-fill error/retry boundary.
+    //
+    // DEVIATION FROM THE BRIEF (proven by a live hang, not by style preference): the
+    // brief's Step 3 snippet compares against `missSet` here, on the claim that
+    // "missSet ... is latched at miss-capture time and is exactly the set the held
+    // demand needs unblocked." That is false for a demand that is HELD *BEFORE ever
+    // being captured* -- exactly the case `heldDemandMiss`'s own declaration-site
+    // comment names ("An architectural miss can remain visibly held while a
+    // speculative owner or the shared installer drains") and exactly what
+    // `IcachePrefetchSpec`'s "AR-pending demotion launches the blocking silent owner
+    // without deadlock" test exercises: `cmdIn.ready` is asserted False on purpose
+    // (`pfLookupSetBusy` blocks `answerable`), so `cmdPort.fire` never happens, so
+    // `demandFillStart` never fires, so `missSet` is NEVER written to this demand's
+    // set -- it keeps whatever value the PREVIOUS accepted demand left behind. With
+    // `missSet` here, `pfBlockingArWant`/`pfBlockingArAny` therefore stay False for
+    // the entire hold, `(!heldDemandMissReg || pfBlockingArAny)` is permanently
+    // False, no further speculative AR is ever granted, the blocking slot's own AR
+    // never launches, `pfLookupSetBusy` never clears, and the demand is held
+    // forever. CONFIRMED LIVE: running the brief's snippet verbatim hung the
+    // Verilator suite for 44+ minutes at 100% CPU, stuck inside exactly that test
+    // with no further progress (see task-6-report.md for the run transcript and the
+    // kill/diagnose trace). `lookupSet` is kept LIVE here instead (as the
+    // pre-existing code already did): it is cheap address bits off
+    // `cmdPort.payload.pc` (via `lookupPc`), not part of the translation-latency
+    // verdict cone (`xlate.rsp.ready`/`lookupFault`/`isHit`) this slice registers --
+    // `heldDemandMissReg` (the actual verdict, used both in the Mux select below and
+    // in the gating term) is what makes this registered state; the address compare
+    // does not need to be, and moving it to `missSet` is not a "strict improvement in
+    // precision," it is a correctness regression for the not-yet-captured case.
     val pfBlockingArWant = Vec((0 until pfSlots).map(i =>
       pfArWant(i) && (pfSet(i) === lookupSet)))
     val pfBlockingArAny = pfBlockingArWant.orR
     val pfBlockingArSel = OHToUInt(OHMasking.first(pfBlockingArWant.asBits))
-    val pfChosenArSel = Mux(heldDemandMiss, pfBlockingArSel, pfArSel)
+    val pfChosenArSel = Mux(heldDemandMissReg, pfBlockingArSel, pfArSel)
     when(!arHoldValid) {
       when(refillActive && !arSent) {
         arHoldValid := True
         arHoldId    := U(AxiIds.I_DEMAND, AxiIds.ID_W bits)
         arHoldAddr  := missPA & ~U(63, 32 bits)
-      } elsewhen(pfAnyArWant && !demandFillStart &&
-                 (!heldDemandMiss || pfBlockingArAny)) {
+      } elsewhen(pfAnyArWant && !demandFillStartReg &&
+                 (!heldDemandMissReg || pfBlockingArAny)) {
+        // Slice 1c canary (direction (b), mirrors the allocator canary above): a
+        // fresh speculative want must never claim `arHoldValid` on the exact cycle a
+        // demand fill starts (`demandFillStart`, read LIVE here on purpose) --
+        // `refillActive` only turns true the FOLLOWING cycle (once the FSM is
+        // actually in REFILL), so a grant on the accept cycle itself would steal
+        // this register out from under the demand's own `refillActive && !arSent`
+        // branch above, which requires `!arHoldValid`. Never observed to fire; see
+        // task-6-report.md for the guard-removal canary-validation run.
+        GenerationFlags.simulation {
+          assert(!demandFillStart,
+            "B3 1c: AR arbiter granted a new speculative hold on the exact cycle a demand fill started")
+        }
         arHoldValid := True
         arHoldId    := (pfChosenArSel.resize(AxiIds.ID_W) +
                         U(AxiIds.I_SPEC_BASE, AxiIds.ID_W bits)).resized
