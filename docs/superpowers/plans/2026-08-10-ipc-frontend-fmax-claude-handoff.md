@@ -3199,6 +3199,7 @@ archived in `synth/archive/M0_slice1_b3_postrouteN3_decode/M0_contention_evidenc
 | metric | BASE (`6b246de`) | `M0` (Slice 1, `aebe0ae`) | delta |
 |---|---:|---:|---:|
 | **post-SYNTH WNS (control)** | **-1.827** | **-1.908** | **-0.081 WORSE** |
+| sub(-1.000 ns) population | 4890 | **6966** | **+42 % WORSE** |
 | post-route WNS | -1.472 | **-1.726** | **-0.254 WORSE** |
 | FMax | 182.749 | **174.642** | **-8.107 MHz** |
 | TNS | -17499.508 | **-23313.951** | **-33 % WORSE** |
@@ -3211,6 +3212,40 @@ path is `FetchAlignPlugin predictTargetReg[14]/C -> IcachePlugin
 s1PredEntries_0[122]/CE` -- **neither** the D-cache/IQ arc nor the `lineReg` arc.
 Slice 1 *did* achieve its stated objective (`lineReg` is no longer the worst
 endpoint), but a different `FetchAlign -> Icache` path now sits below the old floor.
+
+**A same-session control run settles attribution completely.**  Immediately after
+`M0`, an isolated worktree (`m0-control`, `git worktree add` per GC8) was created at
+`c776f06` -- the plan's pinned pre-Slice-1 `BASE_SHA` -- and run through the
+*identical* flow, back-to-back, under the same mutex.  It reproduced the pinned
+baseline **exactly**, on all four headline metrics:
+
+| | control arm (this session) | pinned baseline |
+|---|---:|---:|
+| post-route WNS | **-1.472** | -1.472 |
+| FMax | **182.74853801** | 182.749 |
+| TNS | **-17499.508** | -17499.508 |
+| failing endpoints | **32408** | 32408 |
+| post-SYNTH WNS | **-1.827** | -1.827 (section 18 control) |
+
+Its round-0 figure (-2.094) also reproduces section 18's documented
+pre-optimisation number.  **Every confound is therefore excluded by construction** --
+tool version, machine state, flow drift, placement variance and contention are all
+common-mode between the two arms, and only the RTL differs.  The A/B is airtight
+and the -0.254 ns is Slice 1's.
+
+**A nuance that matters more than the headline, for whoever picks this up.**
+Slice 1's post-route *round 0* is **better** than the baseline's (-1.836 vs -2.094).
+Slice 1 routes better initially and then **optimises far worse**: across the three
+`postrouteN` rounds the baseline gains **0.622 ns** while Slice 1 gains only
+**0.110 ns**.  So B3 genuinely does remove route pressure -- consistent with its
+-785 LUTs and with `lineReg` vacating the worst-endpoint position, exactly as
+designed -- but it simultaneously produces a netlist the post-route optimiser
+cannot improve.  "B3 is bad" is the wrong lesson; "B3 creates an
+optimisation-resistant structure" is the right one, and the first suspect is the new
+worst path itself: `predictTargetReg[14]/C -> s1PredEntries_0[122]/CE` is a
+**clock-enable** cone, which post-route optimisation has far less freedom to fix
+than a data path.  A redesign that keeps the decoupling but avoids pushing the
+verdict into a CE cone is the obvious next experiment.
 
 **Why this is not noise, stated so it can be checked:**
 
