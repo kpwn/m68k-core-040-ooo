@@ -17,14 +17,18 @@ import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
   * -- a function of the LIVE `cmdPort.fire` verdict -- so a same-cycle demand miss
   * always won outright and no bounded-wait counter existed at all (no register lag,
   * ever). After slice 1a the install is armed from a register (`pfInstallArm`) and a
-  * held demand yields to it, bounded by `installDeferMax` cycles (hazard H9,
-  * `installDeferCnt`/`installStarves`) -- which, because `pfInstallArm` is always one
-  * cycle behind the live `pfInstallAny` it mirrors, makes the demand ride out one
-  * extra register-latency cycle beyond the pre-slice-1a scheduler's same-cycle tie
-  * break every single time it is genuinely raced against an armed install. That
-  * mechanistic, register-vs-combinational difference -- not "how many installs chain"
-  * (hazard H9's own bound is tight enough to exhaust itself on the very first queued
-  * install regardless of how much more is behind it) -- is what this test measures.
+  * held demand yields to it, bounded by `installDeferBound` = `pfSlots * 3` = 12
+  * counted cycles (hazard H9, `installDeferCnt`; `installStarves`/`installDeferMax`
+  * survive only as a telemetry threshold and gate nothing -- the arming gate they
+  * used to drive was removed in commit e596c9b because it could deadlock the very
+  * case it guarded). Because `pfInstallArm` is always one cycle behind the live
+  * `pfInstallAny` it mirrors, the demand rides out one extra register-latency cycle
+  * beyond the pre-slice-1a scheduler's same-cycle tie break every single time it is
+  * genuinely raced against an armed install. That mechanistic,
+  * register-vs-combinational difference is what this test measures. It is NOT a
+  * measurement of "how many installs chain": the bound now covers a full drain of
+  * the pool (every slot installing ahead of the held demand, 3 counted cycles each),
+  * so a chain of queued installs is legal traffic under it, not a violation.
   *
   * The AXI side is driven by hand (`sendLine`/`waitReq`, mirroring the
   * `IcachePrefetchSpec` "AR-pending demotion"/"invalidation poisons" tests) rather
@@ -41,6 +45,38 @@ class IcachePrefetchInstallPrioritySpec extends AnyFunSuite {
     val icache = new IcachePlugin
     val probe  = new FetchProbePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, icache, probe)) }
+  }
+
+  /** Review round 1 minor: the hand-driven AXI helpers below used unbounded blocking
+    * waits. They sit AFTER this file's own bounded-wait detector, so the H9 deadlock
+    * they exist to catch still fails cleanly -- but any OTHER regression that stopped
+    * the R channel or the AR stream would wedge the JVM instead of failing. These two
+    * caps make every wait in this file terminate with a diagnosable assertion.
+    * 4000 cycles is ~50x a single line's service time through this harness. */
+  private val waitCapCycles = 4000
+
+  /** `cd.waitSamplingWhere` semantics (sample first, THEN test), with a cap. */
+  def waitSamplingWhereBounded(cd: ClockDomain, what: String)(cond: => Boolean): Unit = {
+    var waited = 0
+    var done = false
+    while (!done) {
+      cd.waitSampling()
+      waited += 1
+      done = cond
+      assert(done || waited < waitCapCycles,
+        s"bounded sim wait expired after $waitCapCycles cycles waiting for: $what")
+    }
+  }
+
+  /** Poll-first wait, with a cap. */
+  def waitUntilBounded(cd: ClockDomain, what: String)(cond: => Boolean): Unit = {
+    var waited = 0
+    while (!cond) {
+      assert(waited < waitCapCycles,
+        s"bounded sim wait expired after $waitCapCycles cycles waiting for: $what")
+      cd.waitSampling()
+      waited += 1
+    }
   }
 
   test("a completed install and a same-cycle demand miss both complete, install first, within the bounded wait",
@@ -82,13 +118,14 @@ class IcachePrefetchInstallPrioritySpec extends AnyFunSuite {
           axi.r.payload.data #= beat(address, phase)
           axi.r.payload.resp #= 0
           axi.r.payload.last #= (phase == 1)
-          cd.waitSamplingWhere(axi.r.ready.toBoolean)
+          waitSamplingWhereBounded(cd, f"R ready for id $id line 0x$address%x phase $phase")(
+            axi.r.ready.toBoolean)
           axi.r.valid #= false
           cd.waitSampling()
         }
       }
       def waitReq(id: Int, address: Long): Unit =
-        while (!arTrace.contains((id, address))) cd.waitSampling()
+        waitUntilBounded(cd, f"AR id $id at 0x$address%x")(arTrace.contains((id, address)))
 
       dut.probe.logic.cmdIn.valid #= false
       dut.probe.logic.cmdIn.payload.pc #= 0
@@ -255,13 +292,14 @@ class IcachePrefetchInstallPrioritySpec extends AnyFunSuite {
           axi.r.payload.data #= beat(address, phase)
           axi.r.payload.resp #= 0
           axi.r.payload.last #= (phase == 1)
-          cd.waitSamplingWhere(axi.r.ready.toBoolean)
+          waitSamplingWhereBounded(cd, f"R ready for id $id line 0x$address%x phase $phase")(
+            axi.r.ready.toBoolean)
           axi.r.valid #= false
           cd.waitSampling()
         }
       }
       def waitReq(id: Int, address: Long): Unit =
-        while (!arTrace.contains((id, address))) cd.waitSampling()
+        waitUntilBounded(cd, f"AR id $id at 0x$address%x")(arTrace.contains((id, address)))
 
       dut.probe.logic.cmdIn.valid #= false
       dut.probe.logic.cmdIn.payload.pc #= 0
