@@ -1,31 +1,35 @@
-agent=claude-elab-lottery
-task=Cheap experiment: does a fresh GenFullCoreSynthVerilog re-elaboration land a DIFFERENT
-     netlist than the frozen checkpoint every campaign number descends from?
-reserved_at=2026-08-11T00:10:00+02:00
-released_at=2026-08-11T00:35:00+02:00
-head=a9f14ff. NO RTL CHANGED. NO SYNTH RUN.
+agent=claude-combined-two-arc-execution
+task=EXECUTE docs/superpowers/plans/2026-08-10-ipc-fetchalign-icache-combined-implementation-plan.md
+reserved_at=2026-08-11T02:05:00+02:00
+released_at=2026-08-11T06:35:00+02:00
+head=aebe0ae (RTL) / 0ccb316 (MAIN-repo ledger)
 
-RESULT=THE LOTTERY TICKET IS VOID. ELABORATION IS DETERMINISTIC ON THIS BRANCH.
-  `3e57fe6 fix(regfile): pin physical write-port slot order` IS an ancestor of HEAD
-  (LinkedHashMap first-appearance grouping, not `groupBy` over identity-hash keys).
-  Swept for other instances of the hazard: NONE (`groupBy` survives in src/ only
-  inside that file's own do-not-reintroduce comment).
-  GROUNDED, not assumed -- two cold-JVM re-elaborations:
-    archived baseline  d80f6218c5c7dcab94a33a52d64244fa
-    fresh roll #1      d79df4c8d7ba87cb9f499ca878fb6dbd
-    fresh roll #2      d79df4c8d7ba87cb9f499ca878fb6dbd  (identical to #1)
-    comment-stripped, ALL THREE = 3531a01b346df92e2e14c389ef47289b
-  Entire diff vs baseline = ONE COMMENT LINE (`// Git hash`), which Vivado ignores.
-  Re-synthesising would burn a post-route gate to reproduce -1.472ns/182.749MHz exactly.
+RESULT=TASKS 1-7 of 24 COMPLETE. SLICES 2/3/4 NOT STARTED. NO 200 MHz.
+  *** SLICE 1 (B3), WHICH THE DESIGN CALLED "FREE", COSTS 8.1 MHz. ***
+  Confirmed by a same-session, back-to-back, worktree-isolated A/B whose control arm
+  reproduced the pinned baseline EXACTLY (WNS -1.472, FMax 182.74853801, TNS -17499.508,
+  FEP 32408, post-synth -1.827 -- all four to full precision):
+     post-synth WNS   -1.827 -> -1.908   (-0.081, i.e. an RTL effect, pre-placement)
+     post-route WNS   -1.472 -> -1.726   (-0.254)
+     FMax            182.749 -> 174.642  (-8.107 MHz)
+     TNS  -33% worse | FEP +33% worse | sub(-1.000) population 4890 -> 6966 (+42% worse)
+     LUTs -785 (better) | IPC NEUTRAL (+0.10% ideal, 3 seeds x 2 models)
+  DIAGNOSIS (more useful than the verdict): Slice 1 ROUTES better (round 0 -1.836 vs -2.094)
+  and OPTIMISES far worse (baseline gains 0.622 ns over 3 postroute rounds; Slice 1 gains
+  0.110). It creates an OPTIMISATION-RESISTANT netlist. First suspect: the new worst path
+  `predictTargetReg[14]/C -> s1PredEntries_0[122]/CE` is a CLOCK-ENABLE cone.
+  RECOMMENDATION: revert or re-scope B3 before any further work on this plan. NOT reverted
+  unilaterally -- it is a plan-level decision and the RTL carries 4 genuine bug fixes.
 
-BYPRODUCT=the archived netlist's `// Git hash` header (9a013ae) is STALE -- it predates the
-  section-14 FTB retime -- but the NETLIST IS NOT: the retime's signals are present in the
-  archived baseline and the fresh rolls in identical counts (qFramed x3, qEnd x7). Use the
-  COMMENT-STRIPPED hash 3531a01b346df92e2e14c389ef47289b as the durable netlist identity;
-  the full-file md5 changes every commit via that header and is worthless as a change check.
-  generated/M68kFullCoreSynth.v restored bit-for-bit to d80f6218 so sections 13-20 resolve.
+BYPRODUCT=5 real defects found in ~90 lines of RTL the plan specified VERBATIM, incl. a
+  silent re-validation of an invalidated line, an AXI R-channel wedge, and TWO reachable
+  deadlocks (one empirically reproduced as a 44-minute simulator hang). Also: `make test-fast`
+  cannot execute ANY VerilatorTest-tagged spec (120 of 157) and there is NO CI.
 
-VALUE=removes an outstanding doubt about EVERY A/B in sections 13-20 -- those gates compared
-  netlists differing only by their intended RTL edit, with no lottery noise underneath.
-  Section 20's conclusion is unchanged and has NO cheap alternative left in front of it.
-gate=none needed (no RTL changed, baseline file restored byte-for-byte)
+ARCHIVES=synth/archive/M0_slice1_b3_postrouteN3_decode/ and
+         synth/archive/M0_CONTROL_c776f06_postrouteN3_decode/
+LEDGER=.superpowers/sdd/2026-08-10-ipc-fetchalign-icache-combined-implementation-plan/progress.md
+HANDOFF=docs/superpowers/plans/2026-08-10-ipc-frontend-fmax-claude-handoff.md section 23
+NOTE=worktree `m0-control` left in place deliberately -- it holds the control arm and lets a
+  future session re-run the A/B cheaply. `git worktree remove` it when done.
+gate=M0 + control both taken UNCONTENDED, evidence archived.
