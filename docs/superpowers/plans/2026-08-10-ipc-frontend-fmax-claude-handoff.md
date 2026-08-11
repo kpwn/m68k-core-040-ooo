@@ -3162,7 +3162,32 @@ mechanisms from the RTL rather than accept the report's prose.  Both reviewers
 that did so found things the implementers had missed; the value came from the
 loop, not from either half of it.
 
-### 23.4 What is NOT known, and why
+### 23.4 Slice 1 is measured FREE -- the one real measurement this session produced
+
+Task 7's functional and IPC phase completed on `aebe0ae` (its post-route phase did
+not -- see 23.5).  On three pinned seeds x both memory models:
+
+| metric | baseline | Slice 1 (`aebe0ae`) | delta |
+|---|---:|---:|---:|
+| aggregate IPC, ideal (`zero`) -- **the gating model** | 0.6739 | **0.6746** | **+0.10 %** |
+| aggregate IPC, `l2:5:70` (non-gating) | 0.5465 | 0.5454 | -0.20 % |
+
+Both are inside run-to-run noise.  The acceptance rule written into the plan was
+that Slice 1 costs zero resident-hit cycles *by construction*, so anything worse
+than **-0.3 %** on the ideal model would be a **bug, not a design cost**; the
+measured +0.10 % clears that comfortably.  **Slice 1's "free" claim is now
+measured rather than argued.**  Functional gates at the same commit: `test-fast`
+149/149 (158 suites), `ExecuteLockStepSpec` 394/394, the 6-suite I-cache/frontend
+Verilator gate 44/44.
+
+`M0`'s netlist is generated, pinned and archived at
+`synth/archive/M0_slice1_netlist.v`, comment-stripped MD5
+**`ef311f342317af491e44cc8fd2e78760`** (it differs from the pre-Slice-1 baseline
+`3531a01b346df92e2e14c389ef47289b`, which correctly confirms Slice 1 changes the
+netlist).  The Vivado run is therefore decoupled from any later RTL edit: a
+future session can measure `M0` from that archived file without re-deriving it.
+
+### 23.5 What is NOT known, and why
 
 **No cell of the `M0`/`M1`/`M2`/`M3` matrix was measured.**  Task 7's post-route
 run is blocked on sustained contention from a peer session running its own
@@ -3184,7 +3209,7 @@ Consequently **Slices 2 (B2, the F1/F2 split), 3 (Fix A) and 4 (the matrix) are
 untouched**, and the superadditivity test `(M3-M0) - ((M1-M0)+(M2-M0))` -- the
 plan's actual deliverable -- remains open.
 
-### 23.5 A standing verification gap this session uncovered
+### 23.6 A standing verification gap this session uncovered
 
 `build.sbt:21-22` defines the repository's own gate as
 `fastTest := (Test/testOnly).toTask(" * -- -l m68k040.SlowTest -l m68k040.VerilatorTest -l m68k040.BoardTest")`.
@@ -3197,7 +3222,7 @@ change.  Every dispatch in this session was amended to require an explicit
 `testOnly` Verilator run alongside, compared by fail-name-list; that requirement
 should become standing.
 
-### 23.6 Two artefacts for the next session
+### 23.7 Two artefacts for the next session
 
 - **`synth/probe_combined_arcs.tcl`** (`e850ee6`) reproduces the whole 23.2 table
   from the archived routed DCP in ~10 minutes, with erroring object-count guards.
@@ -3218,7 +3243,7 @@ assumed.  That experiment's baseline arm also independently reproduced
 **182.749 MHz**, which is a useful cross-check of the number this plan's whole
 matrix is measured against.
 
-### 23.7 Distance to the goal
+### 23.8 Distance to the goal
 
 `Distance to the 200 MHz deployment floor: 0.472 ns.  The goal is NOT met, at
 182.749 MHz` -- unchanged, because no post-route run was taken this session and
