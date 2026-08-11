@@ -31,7 +31,15 @@ if {[info exists ::env(REUSE_SYNTH_DCP)] && $::env(REUSE_SYNTH_DCP) eq "1" &&
   # Defaults reproduce the historical flow verbatim: leaving all three unset emits
   # exactly `synth_design -top ... -mode out_of_context`, so every pre-section-26
   # row regenerates unchanged.
-  set synth_args [list -top M68kFullCoreSynth -part xcku5p-ffvb676-2-e -mode out_of_context]
+  # PART is a MEASUREMENT knob only -- the shipping target is and remains the -2
+  # speed grade.  Handoff section 26.7 names a speed-grade change as the highest
+  # expected-value remaining lever and records that it had never been priced;
+  # `xcku5p-ffvb676-3-e` is the same package one grade up, so it is a pure device
+  # question with no RTL, floorplan or recipe change.  Do not change the default.
+  set part "xcku5p-ffvb676-2-e"
+  if {[info exists ::env(PART)]} { set part $::env(PART) }
+  puts "TARGET_PART $part"
+  set synth_args [list -top M68kFullCoreSynth -part $part -mode out_of_context]
   if {[info exists ::env(SYNTH_DIRECTIVE)] && $::env(SYNTH_DIRECTIVE) ne "default"} {
     lappend synth_args -directive $::env(SYNTH_DIRECTIVE)
   }

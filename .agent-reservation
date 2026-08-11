@@ -1,38 +1,47 @@
 agent=claude-physical-placement-lever
 task=Ground the two nets handoff 25.4 named as the concrete place a floorplan
-     attempt should aim, at the PHYSICAL level; find or refute a targeted
-     placement / MAX_FANOUT / relative-placement intervention.
+     attempt should aim; find or refute a targeted placement / MAX_FANOUT /
+     relative-placement intervention.
 reserved_at=2026-08-11T12:35:00+02:00
-status=ACTIVE
-head=acbc619 (docs+reservation only) / RTL untouched
+released_at=2026-08-11T14:20:00+02:00
+head=RTL untouched, byte-identical to c776f06 (netlist body md5 266a1874...)
 
-INTERIM RESULT = the named target is REFUTED, on three independent grounds.
-  1. NAMING.  `ibuf/when_PipeStage_l17` and `queue/p_1542_in` are not two nets and
-     neither is in the instruction buffer.  `when_PipeStage_l17` is PipeStage.scala:17
-     `slotFree` for the DecodeStage `raw` stage (= rawIn.ready, section 17's reverse
-     READY chain); the `FetchAlignPlugin_logic_ibuf/` prefix is the section-18-step-3
-     instance-path artefact.  The same net also resolves as
-     `DecodeStage_logic_queue/when_PipeStage_l17`.  `p_1542_in` is a synth-created
-     name in the same cone (0 matches in the generated Verilog).
-  2. SLACK.  Worst path THROUGH either is -1.451 -- 0.021 ns BEHIND the -1.472 WNS.
-     False-pathing them, and all 7 PipeStage slotFree enables in the design, is
-     +0.000 ns.  Baseline reproduced exactly first.
-  3. GEOMETRY.  Max driver-to-load Manhattan is 28 and 48 CLB -- the same
-     "quarter of the die, not a die-length haul" section 18 step 2 already
-     classified as a LOAD problem, not a distance problem.  The dispatch's
-     "placed far apart" hypothesis is refuted by coordinates.
-  BONUS: the placer inserted the design's ONLY BUFG on `when_PipeStage_l17_2`
-     (fanout 1057, pre-BUFG span 101 CLB).  Grounded and cleared -- that net's
-     worst path is -0.815, 0.657 ns of margin.  Not a lever either.
-  POPULATION: 4890 endpoints below -1.000 (the 200 MHz bar); 98 below -1.400;
-     16 below -1.450.  200 MHz is a ~5k-endpoint distribution problem.
-IN FLIGHT = the campaign's one named untried PHYSICAL lever (section 18 step 6
-     lever 4 / section 19 step 8): a fresh synth_design under non-default recipes
-     (PerformanceOptimized, AlternateRoutability, -retiming) with the landed
-     decode+postrouteN3 flow.  synth/synth_directive_ab.sh, synth/probe_synthdir/.
-NOTE 2026-08-11T13:5x: three concurrent FULL syntheses exhausted RAM (40.6 GB RSS,
-  20 GB swap) -- synth_design spawns ~9 worker processes per run, unlike the
-  impl-only REUSE_SYNTH_DCP runs section 18 sized at "three at a time".  The
-  `retime` variant was killed to recover; PerformanceOptimized and
-  AlternateRoutability continue.  BUDGET RULE FOR FUTURE DISPATCHES: at most TWO
-  concurrent fresh-synthesis runs on this machine.
+RESULT = THE TARGETED-PLACEMENT LEVER IS REFUTED, three ways, plus two more
+  levers closed underneath it.
+  1. NAMING.  The two nets are ONE net and it is not in the ibuf.
+     `when_PipeStage_l17` is PipeStage.scala:17 `slotFree` for the DecodeStage
+     `raw` stage (= rawIn.ready, section 17's reverse-READY chain, already priced
+     at +0.006 ns).  The `FetchAlignPlugin_logic_ibuf/` prefix is section 18 step
+     3's instance-path trap.  `p_1542_in` has ZERO matches in the generated
+     Verilog and shares the identical worst path.
+  2. SLACK.  Worst path through either is -1.451 vs the -1.472 WNS -- 0.021 ns
+     BEHIND.  False-pathing them and all 7 PipeStage slotFree enables is
+     +0.000 ns.  Baseline reproduced exactly; confirmed from the endpoint side.
+  3. GEOMETRY.  p_1542_in's driver is at SLICE_X47Y38; its 875 leaf loads have
+     centroid X47.3 Y34.5 -- ALREADY on its own load centroid.  Max Manhattan
+     28/60 CLB.  No placement error exists for a pblock/MAX_FANOUT/LOC to fix.
+  ROOT CAUSE OF THE MIS-DISPATCH: 25.4's path was the residual of the a3_cluster
+     WHAT-IF, inherited as a fact.  Second occurrence (24.5 was the first).
+  BONUS CLOSED: the design's only BUFG (placer-inserted, fo 1057, pre-BUFG span
+     101 CLB) -- correct call, that net has 0.657 ns of margin.
+  SYNTHESIS AXIS CLOSED: PerformanceOptimized -36.27 MHz, AlternateRoutability
+     -15.64 MHz.  All four tool axes now closed.
+  SPEED GRADE CLOSED: xcku5p-ffvb676-3-e measures -1.620 / 177.936 MHz, i.e.
+     4.81 MHz SLOWER than the -2 part.  Raw silicon advantage on this
+     route-dominated netlist is only ~0.100 ns (1.8%), not the 10-15% rule of
+     thumb -- it caps the lever at ~21% of the gap even before the stall.
+  THE GENERAL FINDING (six-for-six): every intervention that hands the iterated
+     post-route loop an EASIER problem -- faster part, stronger directive, better
+     initial placement -- converges to a WORSE final number.  The +18.65 MHz is a
+     property of the ITERATION, not of effort.
+  POPULATION: 4890 endpoints / 29 startpoint families below -1.000; only 4
+     families in the top 0.022 ns.  200 MHz is a distribution problem.
+NOTHING IMPLEMENTED -- the measurement said there was nothing to implement.
+BRANCH STATE=CLEAN, still -1.472 / 182.749 MHz.  test-fast 149/149 (157 suites);
+  testOnly 460/460 with 7 requested / 7 completed.
+MACHINE RULE LEARNED: run fresh syntheses ONE at a time (synth_design spawns ~9
+  workers; two already thrash).  `-retiming` was launched and not completed.
+WRITEUP=handoff section 26 (26.1-26.9); probes synth/probe_net_geometry{,2}.tcl,
+  synth/probe_net_lever.tcl, synth/synth_directive_ab.sh; evidence
+  synth/probe_netgeo{,2}/, synth/probe_netlever/, synth/probe_synthdir{,2}/,
+  synth/probe_part3/.

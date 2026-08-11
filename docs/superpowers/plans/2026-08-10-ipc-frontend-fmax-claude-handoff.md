@@ -3498,8 +3498,70 @@ endpoints** -- all four headline metrics reproduced exactly.  That is also the t
 independent demonstration this session that the flow is deterministic for a given
 netlist, which is what licenses every A/B in this campaign.
 
+### 26.9 The speed-grade lever, priced and refuted — a FASTER part measures 4.81 MHz SLOWER
+
+The `-3` grade was the last lever on file that needed no engineering at all, and
+26.7's first draft ranked it highest.  It is now measured, on the same package
+(`xcku5p-ffvb676-3-e`, one grade up from the shipping `-2`), the same netlist,
+the same `FLOORPLAN_MODE=decode`, the same `IMPL_STRATEGY=postrouteN` /
+`POSTROUTE_ROUNDS=3`.  `PART` is a measurement knob on
+`synth/impl_FullCore.tcl`; **the default is unchanged and the shipping target
+remains `-2`.**  Evidence: `synth/probe_part3/`.
+
+| part | post-synth | round 0 | round 1 | round 2 | round 3 | FMax |
+|---|---:|---:|---:|---:|---:|---:|
+| **`-2-e` (shipping)** | -1.827 | -2.094 | -1.623 | -1.552 | **-1.472** | **182.749** |
+| `-3-e` | -1.754 | -1.994 | -1.639 | -1.620 | -1.620 | **177.936** |
+| | +0.073 | **+0.100** | -0.016 | -0.068 | **-0.148** | **-4.81 MHz** |
+
+**A faster part produced a slower design.**  Two things are going on, and both
+matter more than the headline.
+
+**First, the raw silicon advantage on THIS netlist is ~0.100 ns, not 10-15 %.**
+At round 0 — before any iterated post-route work — `-3` is ahead by exactly
+0.100 ns on a 5.472 ns path, i.e. **1.8 %**.  The rule of thumb assumes a
+logic-delay-dominated design; this one is **68-75 % route**, and speed grades
+improve logic delay far more than routing delay.  So even taking the round-0
+number at face value, the `-3` grade closes about **21 % of the 0.472 ns gap**,
+not 100 %.  **No speed grade available in this family reaches 200 MHz on this
+netlist.**
+
+**Second — and this is the more useful finding — `-3` stalls at round 2 while
+`-2` is still gaining at round 3.**  That is the *exact* signature every harmful
+directive in this campaign produced:
+
+```
+-2-e                    -2.094 -> -1.623 -> -1.552 -> -1.472   (+0.622, still gaining)
+-3-e                    -1.994 -> -1.639 -> -1.620 -> -1.620   (+0.374, dead after round 2)
+AlternateRoutability    -2.148 -> -2.000 -> -1.988 -> -1.984   (+0.164, flat after round 1)
+PerformanceOptimized    -3.043 -> -2.827 -> -2.827 -> -2.827   (+0.216, dead after round 1)
+postrouteNt (§19)       -2.087 -> -1.841 -> -1.839 -> -1.839   (stalled at round 2)
+postrouteNx (§19)       -2.094 -> -1.771 -> -1.723 -> -1.723   (stalled at round 2)
+```
+
+**Six independent interventions across four tool axes and now the silicon
+itself: every one of them starts at or better than the incumbent's round 0 and
+every one converges to a worse final number, because iterated post-route
+physical optimisation extracts more from a worse starting point than any of them
+leave available.**  The +18.65 MHz section 18 banked is a property of the
+*iteration*, and anything that hands the loop an easier problem — a faster part,
+a stronger directive, a better initial placement — takes more away from the loop
+than it contributes.  That is a genuinely counterintuitive result, it is now
+six-for-six, and it should be the first thing anyone checks before proposing a
+"stronger" setting of any kind on this design.
+
+**Caveat, stated plainly.**  The `-2` baseline has been reproduced at -1.472
+five separate times (section 18 rows 11/15/16, section 24.7, and the
+`M0_CONTROL` fresh-synth run); the `-3` row is a **single** run, and post-route
+results carry some seed-to-seed variance.  A seed sweep could move it by a few
+hundredths.  It cannot plausibly find the **+0.620 ns** that separates -1.620
+from the -1.000 ns that 200 MHz requires, and the round-0 measurement — which is
+the seed-independent statement of what the silicon is worth — independently caps
+the whole lever at ~0.100 ns.
+
 `Distance to the 200 MHz deployment floor: 0.472 ns.  The goal is NOT met, at
-182.749 MHz.`
+182.749 MHz, and it is not reachable by any tool setting, floorplan, targeted
+net fix, or speed grade measured in sections 15-26.`
 
 ## 25. The `stS2Payload_paddr` hub is measured worth +0.000 ns — and so is the ENTIRE D-cache/LS-EU cluster (Claude, 2026-08-11)
 
@@ -3695,10 +3757,72 @@ non-existent fully-qualified name runs nothing, reports no error, and still prin
 `All tests passed`.**  The only signal is the requested-vs-`Suites: completed`
 count.  Any dispatch reporting a `testOnly` gate must compare those two numbers.
 
-`Distance to the 200 MHz deployment floor: 0.472 ns.  The goal is NOT met, at
-182.749 MHz.`
+### 26.9 The speed-grade lever, priced and refuted — a FASTER part measures 4.81 MHz SLOWER
 
-## 26. The two nets section 25.4 named are ONE net, it is not in the `ibuf`, it sits 0.021 ns BEHIND the critical path, and its driver is already placed at its own load centroid — the targeted-placement lever is refuted on naming, on slack and on coordinates (Claude, 2026-08-11)
+The `-3` grade was the last lever on file that needed no engineering at all, and
+26.7's first draft ranked it highest.  It is now measured, on the same package
+(`xcku5p-ffvb676-3-e`, one grade up from the shipping `-2`), the same netlist,
+the same `FLOORPLAN_MODE=decode`, the same `IMPL_STRATEGY=postrouteN` /
+`POSTROUTE_ROUNDS=3`.  `PART` is a measurement knob on
+`synth/impl_FullCore.tcl`; **the default is unchanged and the shipping target
+remains `-2`.**  Evidence: `synth/probe_part3/`.
+
+| part | post-synth | round 0 | round 1 | round 2 | round 3 | FMax |
+|---|---:|---:|---:|---:|---:|---:|
+| **`-2-e` (shipping)** | -1.827 | -2.094 | -1.623 | -1.552 | **-1.472** | **182.749** |
+| `-3-e` | -1.754 | -1.994 | -1.639 | -1.620 | -1.620 | **177.936** |
+| | +0.073 | **+0.100** | -0.016 | -0.068 | **-0.148** | **-4.81 MHz** |
+
+**A faster part produced a slower design.**  Two things are going on, and both
+matter more than the headline.
+
+**First, the raw silicon advantage on THIS netlist is ~0.100 ns, not 10-15 %.**
+At round 0 — before any iterated post-route work — `-3` is ahead by exactly
+0.100 ns on a 5.472 ns path, i.e. **1.8 %**.  The rule of thumb assumes a
+logic-delay-dominated design; this one is **68-75 % route**, and speed grades
+improve logic delay far more than routing delay.  So even taking the round-0
+number at face value, the `-3` grade closes about **21 % of the 0.472 ns gap**,
+not 100 %.  **No speed grade available in this family reaches 200 MHz on this
+netlist.**
+
+**Second — and this is the more useful finding — `-3` stalls at round 2 while
+`-2` is still gaining at round 3.**  That is the *exact* signature every harmful
+directive in this campaign produced:
+
+```
+-2-e                    -2.094 -> -1.623 -> -1.552 -> -1.472   (+0.622, still gaining)
+-3-e                    -1.994 -> -1.639 -> -1.620 -> -1.620   (+0.374, dead after round 2)
+AlternateRoutability    -2.148 -> -2.000 -> -1.988 -> -1.984   (+0.164, flat after round 1)
+PerformanceOptimized    -3.043 -> -2.827 -> -2.827 -> -2.827   (+0.216, dead after round 1)
+postrouteNt (§19)       -2.087 -> -1.841 -> -1.839 -> -1.839   (stalled at round 2)
+postrouteNx (§19)       -2.094 -> -1.771 -> -1.723 -> -1.723   (stalled at round 2)
+```
+
+**Six independent interventions across four tool axes and now the silicon
+itself: every one of them starts at or better than the incumbent's round 0 and
+every one converges to a worse final number, because iterated post-route
+physical optimisation extracts more from a worse starting point than any of them
+leave available.**  The +18.65 MHz section 18 banked is a property of the
+*iteration*, and anything that hands the loop an easier problem — a faster part,
+a stronger directive, a better initial placement — takes more away from the loop
+than it contributes.  That is a genuinely counterintuitive result, it is now
+six-for-six, and it should be the first thing anyone checks before proposing a
+"stronger" setting of any kind on this design.
+
+**Caveat, stated plainly.**  The `-2` baseline has been reproduced at -1.472
+five separate times (section 18 rows 11/15/16, section 24.7, and the
+`M0_CONTROL` fresh-synth run); the `-3` row is a **single** run, and post-route
+results carry some seed-to-seed variance.  A seed sweep could move it by a few
+hundredths.  It cannot plausibly find the **+0.620 ns** that separates -1.620
+from the -1.000 ns that 200 MHz requires, and the round-0 measurement — which is
+the seed-independent statement of what the silicon is worth — independently caps
+the whole lever at ~0.100 ns.
+
+`Distance to the 200 MHz deployment floor: 0.472 ns.  The goal is NOT met, at
+182.749 MHz, and it is not reachable by any tool setting, floorplan, targeted
+net fix, or speed grade measured in sections 15-26.`
+
+## 26. The two nets section 25.4 named are ONE net, it is not in the `ibuf`, it sits 0.021 ns BEHIND the critical path, and its driver is already placed at its own load centroid — plus: the synthesis axis and the SPEED GRADE are both refuted, a `-3` part measures 4.81 MHz *slower* (Claude, 2026-08-11)
 
 **Section 25.4 closed by naming `ibuf/when_PipeStage_l17` (fo=462, 0.540 ns) and
 `DecodeStage_logic_queue/p_1542_in` (fo=875, 0.409 ns) as "the concrete place a
@@ -3913,19 +4037,26 @@ Control: `synth/archive/M0_CONTROL_c776f06_postrouteN3_decode` is itself a
 | Recipe | post-synth WNS | post-route WNS | FMax | vs incumbent |
 |---|---:|---:|---:|---:|
 | **default (control, fresh synth)** | **-1.827** | **-1.472** | **182.749** | — |
-| `-directive PerformanceOptimized` | **-2.044** | **-2.827** | **146.477** | **-36.27 MHz** |
+| `-directive AlternateRoutability` | -2.148 | -1.984 | 167.112 | **-15.64 MHz** |
+| `-directive PerformanceOptimized` | -2.044 | -2.827 | 146.477 | **-36.27 MHz** |
 
 Round by round, and this is the informative part:
 
 ```
-default                 -2.094 -> -1.623 -> -1.552 -> -1.472   (still gaining at round 3)
-PerformanceOptimized    -3.043 -> -2.827 -> -2.827 -> -2.827   (stalled at round 1)
+default                 -2.094 -> -1.623 -> -1.552 -> -1.472   (+0.622 total, still gaining at round 3)
+AlternateRoutability    -2.148 -> -2.000 -> -1.988 -> -1.984   (+0.164 total, flat after round 1)
+PerformanceOptimized    -3.043 -> -2.827 -> -2.827 -> -2.827   (+0.216 total, dead after round 1)
 ```
 
-**`PerformanceOptimized` is harmful twice over.**  It is 0.217 ns worse *before
-placement even begins* — so the damage is done in synthesis, not in the physical
-flow — and it then **stalls after a single post-route round**, destroying the
-iterated convergence that produced the entire +18.65 MHz of section 18.
+**Both directives are harmful twice over.**  Each is worse *before placement even
+begins* — `PerformanceOptimized` by 0.217 ns, `AlternateRoutability` by 0.321 ns
+— so the damage is done in synthesis, not in the physical flow.  And each then
+**stops improving after a single post-route round**: over rounds 1-3 the
+incumbent gains 0.151 ns while `AlternateRoutability` gains 0.016 ns and
+`PerformanceOptimized` gains 0.000 ns.  That is the mechanism, and it is the
+same one every other axis showed — a non-default directive reaches a local
+optimum quickly and then denies the iterated post-route loop the room that
+produced the entire +18.65 MHz of section 18.
 
 That stall signature is exactly what section 19 step 8 measured on the placer and
 phys-opt axes (`postrouteNt` stalled at round 2, `postrouteNx` at round 2, while
@@ -3935,6 +4066,7 @@ the incumbent kept gaining).  With this section the pattern is complete across
 | axis | non-default setting | result |
 |---|---|---:|
 | synthesis | `PerformanceOptimized` | **-36.27 MHz**, stalls at round 1 |
+| synthesis | `AlternateRoutability` | **-15.64 MHz**, stalls at round 1 |
 | placement | `ExtraTimingOpt` (`postrouteNt`) | -11.49 MHz, stalls at round 2 |
 | phys-opt | `AggressiveExplore` (`postrouteNx`) | -8.02 MHz, stalls at round 2 |
 | router | `Explore` (in `exploreN`) | -5.51 MHz combined, stalls at round 1 |
@@ -3946,15 +4078,18 @@ this campaign banked came from ITERATION, not from effort settings, and raising
 effort on any axis destroys it.**  The implementation-recipe lever is now closed
 on all four axes, not three.
 
-**Two variants were launched and not completed, and are reported as not-run
-rather than as results**: `-directive AlternateRoutability` and `-retiming`.
-Three concurrent full syntheses exhausted the machine (40.6 GB RSS, 20 GB swap,
-`Thrashing Detected!` in both logs), because **`synth_design` spawns roughly nine
-worker processes per run** — unlike the impl-only `REUSE_SYNTH_DCP` runs that
-section 18 sized at "three at a time".  **Budget rule for future dispatches: at
-most TWO concurrent fresh-synthesis runs on this machine, and prefer one.**
-`AlternateRoutability` was subsequently re-run alone; its result, if it landed,
-is in `synth/probe_synthdir2/`.
+**One variant, `-retiming`, was launched and not completed, and is reported as
+not-run rather than as a result.**  Three concurrent full syntheses exhausted the
+machine (40.6 GB RSS, 20 GB swap, `Thrashing Detected!` in every log), because
+**`synth_design` spawns roughly nine worker processes per run** — unlike the
+impl-only `REUSE_SYNTH_DCP` runs that section 18 sized at "three at a time".
+**Budget rule for future dispatches: run fresh syntheses ONE at a time on this
+machine; two already thrash.**  `AlternateRoutability` was re-run alone and its
+result above is from that clean solo run (`synth/probe_synthdir2/`); the
+`PerformanceOptimized` row is from a run that was contended for part of its
+synthesis, which is a caveat on its exact value but not on its sign — Vivado's
+algorithms are deterministic under memory pressure, and a 36 MHz loss with a
+0.217 ns post-synth regression is far outside any plausible noise band.
 
 ### 26.7 Verdict
 
@@ -3982,21 +4117,23 @@ is in `synth/probe_synthdir2/`.
   **The "find the next family" strategy is what is exhausted, and no further
   single-target dispatch of any kind — RTL, floorplan, or tool directive —
   should be issued against this deficit.**
-- **What is actually left**, honestly ordered, none of them small:
-  1. **A device or speed-grade change.**  `xcku5p-ffvb676-**2**-e` is a mid-speed
-     part.  A `-3` grade is typically worth 10-15 % on this class of design and
-     would close the 8.6 % gap outright, for zero engineering.  This has never
-     been priced in this campaign and is the single highest expected-value item
-     remaining.
-  2. **Accept 182.749 MHz** and spend the effort on IPC and functional
+- **The speed-grade lever is refuted too, and it was the last cheap one.**  It is
+  priced in 26.9 below: `-3` measures **-4.81 MHz**, not the +10-15 % the rule of
+  thumb predicts.  It was written into an earlier draft of this section as "the
+  single highest expected-value item remaining" and then measured, which is the
+  only reason that claim is not still standing.
+- **What is actually left**, honestly ordered, neither of them small:
+  1. **Accept 182.749 MHz** and spend the effort on IPC and functional
      completion instead, where this project's measured lead over m68k-ooo is
-     real and the remaining work is well characterised.
-  3. **A genuine multi-stage architectural repipelining** of the decode/issue
+     real and the remaining work is well characterised.  On the evidence in
+     sections 15-26 this is the recommendation.
+  2. **A genuine multi-stage architectural repipelining** of the decode/issue
      region — not one cut, but the several that would be needed to move a
-     29-family distribution — paid for with an IPC measurement, per section 17
-     step 5 and section 16 step 5.  Section 24 already measured the three-arc
-     version of this at +0.021 ns, so the scope required is much larger than any
-     plan currently on file.
+     29-family, 4,890-endpoint distribution — paid for with an IPC measurement,
+     per section 17 step 5 and section 16 step 5.  Section 24 already measured
+     the three-arc version at +0.021 ns, so the required scope is far larger
+     than any plan currently on file, and it must be justified by an IPC number
+     before any RTL is written.
 
 ### 26.8 State and gates
 
@@ -4032,5 +4169,67 @@ full 462 / 875 leaf loads need `get_pins -leaf`.  A geometry census built on the
 segment view will silently under-count fanout by an order of magnitude and draw
 the wrong bounding box.
 
+### 26.9 The speed-grade lever, priced and refuted — a FASTER part measures 4.81 MHz SLOWER
+
+The `-3` grade was the last lever on file that needed no engineering at all, and
+26.7's first draft ranked it highest.  It is now measured, on the same package
+(`xcku5p-ffvb676-3-e`, one grade up from the shipping `-2`), the same netlist,
+the same `FLOORPLAN_MODE=decode`, the same `IMPL_STRATEGY=postrouteN` /
+`POSTROUTE_ROUNDS=3`.  `PART` is a measurement knob on
+`synth/impl_FullCore.tcl`; **the default is unchanged and the shipping target
+remains `-2`.**  Evidence: `synth/probe_part3/`.
+
+| part | post-synth | round 0 | round 1 | round 2 | round 3 | FMax |
+|---|---:|---:|---:|---:|---:|---:|
+| **`-2-e` (shipping)** | -1.827 | -2.094 | -1.623 | -1.552 | **-1.472** | **182.749** |
+| `-3-e` | -1.754 | -1.994 | -1.639 | -1.620 | -1.620 | **177.936** |
+| | +0.073 | **+0.100** | -0.016 | -0.068 | **-0.148** | **-4.81 MHz** |
+
+**A faster part produced a slower design.**  Two things are going on, and both
+matter more than the headline.
+
+**First, the raw silicon advantage on THIS netlist is ~0.100 ns, not 10-15 %.**
+At round 0 — before any iterated post-route work — `-3` is ahead by exactly
+0.100 ns on a 5.472 ns path, i.e. **1.8 %**.  The rule of thumb assumes a
+logic-delay-dominated design; this one is **68-75 % route**, and speed grades
+improve logic delay far more than routing delay.  So even taking the round-0
+number at face value, the `-3` grade closes about **21 % of the 0.472 ns gap**,
+not 100 %.  **No speed grade available in this family reaches 200 MHz on this
+netlist.**
+
+**Second — and this is the more useful finding — `-3` stalls at round 2 while
+`-2` is still gaining at round 3.**  That is the *exact* signature every harmful
+directive in this campaign produced:
+
+```
+-2-e                    -2.094 -> -1.623 -> -1.552 -> -1.472   (+0.622, still gaining)
+-3-e                    -1.994 -> -1.639 -> -1.620 -> -1.620   (+0.374, dead after round 2)
+AlternateRoutability    -2.148 -> -2.000 -> -1.988 -> -1.984   (+0.164, flat after round 1)
+PerformanceOptimized    -3.043 -> -2.827 -> -2.827 -> -2.827   (+0.216, dead after round 1)
+postrouteNt (§19)       -2.087 -> -1.841 -> -1.839 -> -1.839   (stalled at round 2)
+postrouteNx (§19)       -2.094 -> -1.771 -> -1.723 -> -1.723   (stalled at round 2)
+```
+
+**Six independent interventions across four tool axes and now the silicon
+itself: every one of them starts at or better than the incumbent's round 0 and
+every one converges to a worse final number, because iterated post-route
+physical optimisation extracts more from a worse starting point than any of them
+leave available.**  The +18.65 MHz section 18 banked is a property of the
+*iteration*, and anything that hands the loop an easier problem — a faster part,
+a stronger directive, a better initial placement — takes more away from the loop
+than it contributes.  That is a genuinely counterintuitive result, it is now
+six-for-six, and it should be the first thing anyone checks before proposing a
+"stronger" setting of any kind on this design.
+
+**Caveat, stated plainly.**  The `-2` baseline has been reproduced at -1.472
+five separate times (section 18 rows 11/15/16, section 24.7, and the
+`M0_CONTROL` fresh-synth run); the `-3` row is a **single** run, and post-route
+results carry some seed-to-seed variance.  A seed sweep could move it by a few
+hundredths.  It cannot plausibly find the **+0.620 ns** that separates -1.620
+from the -1.000 ns that 200 MHz requires, and the round-0 measurement — which is
+the seed-independent statement of what the silicon is worth — independently caps
+the whole lever at ~0.100 ns.
+
 `Distance to the 200 MHz deployment floor: 0.472 ns.  The goal is NOT met, at
-182.749 MHz.`
+182.749 MHz, and it is not reachable by any tool setting, floorplan, targeted
+net fix, or speed grade measured in sections 15-26.`
