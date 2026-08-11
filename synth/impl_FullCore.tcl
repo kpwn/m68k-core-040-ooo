@@ -20,7 +20,29 @@ if {[info exists ::env(REUSE_SYNTH_DCP)] && $::env(REUSE_SYNTH_DCP) eq "1" &&
 } else {
   read_verilog generated/M68kFullCoreSynth.v
   read_xdc synth/clk.xdc
-  synth_design -top M68kFullCoreSynth -part xcku5p-ffvb676-2-e -mode out_of_context
+  # SYNTH_DIRECTIVE / SYNTH_FLATTEN / SYNTH_RETIMING are the SYNTHESIS axis of the
+  # implementation-recipe lever.  Handoff section 18 step 6 lever 4 and section 19
+  # step 8 both name a fresh `synth_design` under a non-default recipe as the ONE
+  # genuinely untried item on the only lever that has ever produced a positive
+  # result in this campaign (post-route physical optimisation, +18.65 MHz).  Every
+  # physical number published before section 26 descends from a single frozen
+  # default-directive synthesis checkpoint, so this axis had never been varied.
+  #
+  # Defaults reproduce the historical flow verbatim: leaving all three unset emits
+  # exactly `synth_design -top ... -mode out_of_context`, so every pre-section-26
+  # row regenerates unchanged.
+  set synth_args [list -top M68kFullCoreSynth -part xcku5p-ffvb676-2-e -mode out_of_context]
+  if {[info exists ::env(SYNTH_DIRECTIVE)] && $::env(SYNTH_DIRECTIVE) ne "default"} {
+    lappend synth_args -directive $::env(SYNTH_DIRECTIVE)
+  }
+  if {[info exists ::env(SYNTH_FLATTEN)]} {
+    lappend synth_args -flatten_hierarchy $::env(SYNTH_FLATTEN)
+  }
+  if {[info exists ::env(SYNTH_RETIMING)] && $::env(SYNTH_RETIMING) eq "1"} {
+    lappend synth_args -retiming
+  }
+  puts "SYNTH_ARGS $synth_args"
+  synth_design {*}$synth_args
   opt_design
 }
 # Preserve the optimized post-synthesis checkpoint separately from placement/routing.
