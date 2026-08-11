@@ -4233,3 +4233,171 @@ the whole lever at ~0.100 ns.
 `Distance to the 200 MHz deployment floor: 0.472 ns.  The goal is NOT met, at
 182.749 MHz, and it is not reachable by any tool setting, floorplan, targeted
 net fix, or speed grade measured in sections 15-26.`
+
+## 27. The genuine frontend re-pipelining design is written — and the deficit turns out to be 64 % clock-enable (Claude, 2026-08-11)
+
+**Design only. No RTL, no synthesis beyond one read-only census on the pinned
+routed checkpoint. `git status src/` clean; the branch remains at the confirmed
+baseline WNS -1.472 / 182.749 MHz.**
+
+Section 26.7 closed the campaign with two options: accept 182.749 MHz, or attempt
+a genuine multi-stage architectural re-pipelining. The user chose the second,
+explicitly. The design is:
+
+**`docs/superpowers/specs/2026-08-11-ipc-frontend-genuine-repipeline-design.md`**
+
+### 27.1 The one new measurement, and it reframes the campaign
+
+`synth/probe_pinkind_population.tcl` (new, committed) censuses the **4,890
+baseline endpoints below -1.000 ns by capture-pin kind**, cross-tabbed by arc
+with per-arc logic depth and route share. Section 24.5 reported a pin-kind split
+but only over the 2,129-endpoint `a3_cluster` *hypothetical*; nobody had taken it
+on the real population. Control reproduced exactly (-1.472,
+`stS2Payload_paddr[5] -> sbNzvc_busy[8]`, 21 levels, logic 1.733 / net 3.721).
+
+| capture pin kind | endpoints | share |
+|---|---:|---:|
+| **`/CE`** | **3,130** | **64.0 %** |
+| `/D` | 1,400 | 28.6 % |
+| `/R` | 239 | 4.9 % |
+| BRAM `ADDR*` / other | 121 | 2.5 % |
+
+By family: `IcachePlugin` 2,427 (**1,751 CE**), `DcachePlugin` 703, **`RasPlugin`
+496 at 100 % CE**, `RobPlugin` 334 (218 CE), `IssueQueuePlugin` 329,
+`FetchAlignPlugin` 229 (169 CE), `FtbPlugin` 61 (98 % CE), `GsharePlugin` 26
+(100 % CE). Top arcs: `FetchAlign->Icache` 2,427 at 19.0 levels / 66.8 % route;
+`Decode->Ras` 496 at 16.0 levels / **75.4 % route** with only 1.247 ns of logic.
+
+**Put that next to section 23.5** — B3 regressed because its verdict landed on a
+`/CE` cone, which the iterated post-route loop has far less freedom to improve
+(baseline gains +0.622 ns over three rounds; B3 gained +0.110) — **and the shape
+of the whole campaign falls out. The deficit is 64 % clock-enable, i.e. 64 %
+made of the endpoints the tool is least able to help with.** That is why iterated
+post-route work banked +18.65 MHz and stopped, and why seven consecutive
+grounding passes each priced their target at ~0.00 ns.
+
+An RTL sweep then resolves all 3,130 CE endpoints onto **exactly two**
+combinational enable cones: **`ic.cmd.fire`** (= FetchAlign issue gates AND
+`xlate.rsp.ready` AND `isHit||fault` — the ITLB way-mux and the L1I physical tag
+compare are *inside a clock enable*, driving ~1,040 S1 flops, the `miss*` and
+prefetch state, the ring records, and the FTB/gshare response registers) and
+**`feed.fire`** (= the aligner cone AND the three-deep `PipeStage` reverse-`ready`
+chain — driving the whole 576-flop `RasPlugin`, the gshare `ghr`,
+`predictTargetReg`, `decodePc`, `stalled` and the four `PipeStage` payload banks).
+
+### 27.2 What is proposed
+
+Four boundaries, all built on one rule — **a wide register bank must never take
+its clock enable from a deep combinational verdict; the verdict is captured into
+a narrow `/D` register and the bank's enable becomes shallow** — which is the
+precise inverse of what B3 did.
+
+| # | boundary | owns | cycles | pin kind of new state |
+|---|---|---:|---|---|
+| **P2** | 2-entry skid replacing `PipeStage` (`in.ready` from local occupancy only) | cone B, ~600-700 endpoints incl. `Ras` 496 @ 100 % CE and the -1.451 ns residual | **0** | `/D` payload + 1-2 level `/CE`; the deep cone now ends on **one 1-bit `/D`** per stage |
+| **P1** | S1 capture enable moves from `cmdPort.fire` to the BRAM's own shallow `cmdPort.valid && !setBlocked`; verdict stays in the narrow `s1Valid/s1Way/...` regs | 1,024-flop `s1PredEntries` + the 931-load enable broadcast | **0** | wide bank shallow `/CE`; verdict ~10 narrow `/D` |
+| **P3** | the F1/F2 translate split (= B2, carried forward) | `FetchAlign->Icache` 19-level depth; §20 measured 2,618 endpoints retired | **+1 fetch latency**, II=1 | ~89 flops, **all `/D`** |
+| P4 | *conditional* `availEffPrev` clamp (§24.4's already-designed fix) | 126 endpoints | 0 | re-sources an existing read |
+
+Three corrections to received wisdom fell out and are recorded in the spec:
+**there are exactly FOUR `PipeStage` instances in `src/main`, not seven**
+(§26.2's "7 slotFree enables" counted Vivado net aliases — §18 step 3's
+instance-path trap, again); **`predictPending` is a `/D` endpoint, not `/CE`**;
+and **`RING` 3->4 is not free** — the reservation
+`cnt + (ringCount+1)*4 <= BUF_WORDS=20` makes the fourth slot reachable only at
+`cnt == 0`, which B2's §4.6 under-stated (hazard H7).
+
+### 27.3 The ordering rationale of the combined plan is reversed
+
+That plan ordered B3 first because it was "free and removes the largest single
+endpoint object". Section 23.8 already flagged that rationale as needing a
+rewrite. The corrected rule: **order by pin-kind safety and cycle cost, not by
+endpoint count** — endpoint count is a breadth proxy that failed its one
+validation against a real route, in the optimistic direction. **B3 is not
+rebuilt** (it violates the rule, it is measured at -0.254 ns with an airtight
+same-session control, and `lineReg` is a ~70-cycle accumulator, not a pipeline
+register). **B2 is carried forward substantially unchanged** as P3 — it is the
+`/D`-shaped half of that design and it was never built.
+
+### 27.4 The projection is deliberately unflattering, and 200 MHz is not claimed
+
+Frontend arcs total **3,239 of 4,890 endpoints (66.2 %)**; the remaining 1,651
+are `Dcache->*` (1,370), `AluEu->Rob`, `DecodeStage->DecodeStage`, `LsEu->LsEu` —
+all out of scope — **and the current WNS path is among them**. So on a static
+reading a perfect frontend re-pipelining delivers +0.000 ns. The one mechanism
+that could do better is named rather than hoped for: **the iterated post-route
+loop's yield varies by 5.7x with netlist structure (+0.622 ns baseline vs
++0.110 ns on B3), and 0.622 - 0.110 = 0.512 ns is itself larger than the 0.472 ns
+deficit.** Floor +0.000; central **+0.080 to +0.200 ns (184.5-187.9 MHz)**;
+optimistic +0.300 ns; **200 MHz NOT PROJECTED** — it needs the out-of-scope
+D-cache endpoints too, and §25 showed those cannot be reached by *cutting*
+either, so a companion D-cache re-pipelining would be required.
+
+ACCEPT at **>= +0.120 ns (>= 186.0 MHz) with <= 1.0 % ideal-IPC loss** (~2x the
+break-even at the 1 % row, set above the placement-equilibrium band that cost a
+*logically redundant* one-line change -6.55 MHz in the sibling corridor).
+MARGINAL keeps the zero-cycle boundaries and reverts P3.
+
+### 27.5 The early canary, and the diagnostic that catches a B3-style failure
+
+**P2 is the canary**, not P1 or P3: smallest diff (one 20-line generic file),
+**provably zero cycle cost** so a regression is unambiguously structural with no
+behavioural confound, and its dominant endpoint family (`RasPlugin`) is **100 %
+CE over 496 endpoints** with the design's highest route-per-level ratio — the
+purest possible test of the hypothesis. Its risk (the `feed.fire` acceptance
+cadence, §17 step 5's six bookkeeping triggers) is on the table deliberately.
+
+**The verdict is the per-round trajectory, not the final WNS** — this is the
+methodology finding of sections 23.5 / 19 step 8 / 26.6 / 26.9 made executable.
+`POSTROUTE_ROUNDS=5`, fresh synthesis, uncontended with archived evidence, plus a
+same-session `git worktree` control arm:
+
+| verdict | condition | action |
+|---|---|---|
+| HEALTHY | round-0->plateau gain **>= 0.55 ns** and still gaining at round 3 | continue |
+| AMBIGUOUS | gain 0.37-0.55 ns | re-run once with a fresh control; still ambiguous -> RESISTANT |
+| **RESISTANT — HARD STOP** | gain **<= 0.37 ns**, *regardless of round-0 and regardless of final WNS* | stop the programme and reassess |
+
+0.37 ns is the best any of the **seven** measured failures achieved (`-3-e`,
++0.374); every one of the seven started at or better than the incumbent's round 0
+and finished worse, so **a good round 0 is a warning sign, not a success.**
+Reported alongside: `delta(iteration gain)` vs baseline's +0.622 ns, which is the
+direct test of §27.4's thesis and has never been measured.
+
+### 27.6 The unavoidable risk, stated plainly
+
+Every fast probe this campaign owns operates on a **fixed existing placement**.
+A `set_false_path` deletes timing arcs; it does not delete cells, free routing
+resources, or model *depth halving* — it models path removal, after which the
+next path is promoted at its own unchanged delay. Genuine pipelining halves every
+path in a region simultaneously and nothing in the toolchain predicts that. The
+measured error runs both ways: `28ec738` predicted +0.124 ns and delivered
++0.947 ns (7.6x optimistic *for* the design); **B3 predicted -7.5 % TNS and
+4,890->3,870 endpoints and the real route did the opposite, delivering
+-0.254 ns.** **So the static evidence (+0.000 to +0.021 ns for every boundary
+here) neither refutes nor licenses this design — it is silent.** Only a real
+iterated post-route gate on real RTL answers the question, at ~35 min per
+uncontended run. That is the unavoidable cost of this strategic direction.
+
+### 27.7 One correction to the dispatch premise, and a third occurrence of a known error
+
+The dispatch named `DecodeStage fed_payload_packets_0_words_0[4] -> FetchAlign
+predictPending/D` as "the current worst path". **It is not** — it is §25.4's
+`a3_cluster` residual, measures **-1.451 ns** on the untouched baseline (0.021 ns
+*behind* WNS), and §26.2 already retracted it. This is the **third** time such a
+residual has been carried into a dispatch as fact (§26.7 records the first two).
+§0.1 of the new spec restates §26.7's rule — *a target must be re-measured on the
+untouched baseline before it is dispatched* — as a standing global constraint on
+every task derived from it. The path stays in scope (P2 attacks it structurally),
+but the projection changes: the frontend does not own the current WNS path.
+
+### 27.8 State and gates
+
+**No RTL touched.** `git status src/` clean. New committed artefacts:
+`docs/superpowers/specs/2026-08-11-ipc-frontend-genuine-repipeline-design.md`
+(~1,260 lines) and `synth/probe_pinkind_population.tcl` (read-only census, no
+what-if, baseline-reproduction control). Evidence: `synth/probe_pinkind/`.
+
+`Distance to the 200 MHz deployment floor: 0.472 ns. The goal is NOT met, at
+182.749 MHz. The design above is projected to close 17-42 % of it, not all of
+it, and says so in advance.`

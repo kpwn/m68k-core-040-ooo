@@ -1,47 +1,55 @@
-agent=claude-physical-placement-lever
-task=Ground the two nets handoff 25.4 named as the concrete place a floorplan
-     attempt should aim; find or refute a targeted placement / MAX_FANOUT /
-     relative-placement intervention.
-reserved_at=2026-08-11T12:35:00+02:00
-released_at=2026-08-11T14:20:00+02:00
-head=RTL untouched, byte-identical to c776f06 (netlist body md5 266a1874...)
+agent=claude-frontend-genuine-repipeline-design
+task=DESIGN ONLY (no RTL). Genuine architectural re-pipelining of the
+     DecodeStage/FetchAlign/Icache frontend to close the last 0.472 ns to
+     200 MHz, after every point-cut/floorplan/constraint/tool/speed-grade
+     lever was measured and closed (handoff sections 15-26).
+     Deliverable: docs/superpowers/specs/2026-08-11-ipc-frontend-genuine-repipeline-design.md
+reserved_at=2026-08-11T14:45:00+02:00
+released_at=2026-08-11T16:40:00+02:00
+head=RTL UNTOUCHED. Branch at 0ed273c, -1.472 ns / 182.749 MHz baseline.
+     This agent writes DOCS ONLY -- no .scala file will be modified.
+     Read-only netlist queries on the existing routed checkpoint only;
+     no new synthesis runs launched for grounding.
+0ed273c6e9b2b1d75272318c7e20e58ecc847619
 
-RESULT = THE TARGETED-PLACEMENT LEVER IS REFUTED, three ways, plus two more
-  levers closed underneath it.
-  1. NAMING.  The two nets are ONE net and it is not in the ibuf.
-     `when_PipeStage_l17` is PipeStage.scala:17 `slotFree` for the DecodeStage
-     `raw` stage (= rawIn.ready, section 17's reverse-READY chain, already priced
-     at +0.006 ns).  The `FetchAlignPlugin_logic_ibuf/` prefix is section 18 step
-     3's instance-path trap.  `p_1542_in` has ZERO matches in the generated
-     Verilog and shares the identical worst path.
-  2. SLACK.  Worst path through either is -1.451 vs the -1.472 WNS -- 0.021 ns
-     BEHIND.  False-pathing them and all 7 PipeStage slotFree enables is
-     +0.000 ns.  Baseline reproduced exactly; confirmed from the endpoint side.
-  3. GEOMETRY.  p_1542_in's driver is at SLICE_X47Y38; its 875 leaf loads have
-     centroid X47.3 Y34.5 -- ALREADY on its own load centroid.  Max Manhattan
-     28/60 CLB.  No placement error exists for a pblock/MAX_FANOUT/LOC to fix.
-  ROOT CAUSE OF THE MIS-DISPATCH: 25.4's path was the residual of the a3_cluster
-     WHAT-IF, inherited as a fact.  Second occurrence (24.5 was the first).
-  BONUS CLOSED: the design's only BUFG (placer-inserted, fo 1057, pre-BUFG span
-     101 CLB) -- correct call, that net has 0.657 ns of margin.
-  SYNTHESIS AXIS CLOSED: PerformanceOptimized -36.27 MHz, AlternateRoutability
-     -15.64 MHz.  All four tool axes now closed.
-  SPEED GRADE CLOSED: xcku5p-ffvb676-3-e measures -1.620 / 177.936 MHz, i.e.
-     4.81 MHz SLOWER than the -2 part.  Raw silicon advantage on this
-     route-dominated netlist is only ~0.100 ns (1.8%), not the 10-15% rule of
-     thumb -- it caps the lever at ~21% of the gap even before the stall.
-  THE GENERAL FINDING (six-for-six): every intervention that hands the iterated
-     post-route loop an EASIER problem -- faster part, stronger directive, better
-     initial placement -- converges to a WORSE final number.  The +18.65 MHz is a
-     property of the ITERATION, not of effort.
-  POPULATION: 4890 endpoints / 29 startpoint families below -1.000; only 4
-     families in the top 0.022 ns.  200 MHz is a distribution problem.
-NOTHING IMPLEMENTED -- the measurement said there was nothing to implement.
-BRANCH STATE=CLEAN, still -1.472 / 182.749 MHz.  test-fast 149/149 (157 suites);
-  testOnly 460/460 with 7 requested / 7 completed.
-MACHINE RULE LEARNED: run fresh syntheses ONE at a time (synth_design spawns ~9
-  workers; two already thrash).  `-retiming` was launched and not completed.
-WRITEUP=handoff section 26 (26.1-26.9); probes synth/probe_net_geometry{,2}.tcl,
-  synth/probe_net_lever.tcl, synth/synth_directive_ab.sh; evidence
-  synth/probe_netgeo{,2}/, synth/probe_netlever/, synth/probe_synthdir{,2}/,
-  synth/probe_part3/.
+RESULT = DESIGN WRITTEN, plus ONE NEW MEASUREMENT that reframes the campaign.
+  THE MEASUREMENT: the 4,890-endpoint 200 MHz deficit is **64.0 % clock-enable**
+    (3,130 CE / 1,400 D / 239 R).  Nobody had censused pin kind on the real
+    baseline -- section 24.5 did it only on the a3_cluster HYPOTHETICAL.
+    IcachePlugin 2427 (1751 CE), RasPlugin 496 (100 % CE), FtbPlugin 61 (98 %),
+    GsharePlugin 26 (100 %).  Section 23.5 established CE cones are exactly what
+    the iterated post-route loop CANNOT improve -- so the deficit is 64 % made
+    of the endpoints the tool is least able to help with.  That explains why
+    seven grounding passes each priced their target at ~0.00 ns.
+  All 3,130 CE endpoints resolve onto exactly TWO enable cones: `ic.cmd.fire`
+    (ITLB way-mux + L1I tag compare inside a clock enable, ~1,040 S1 flops +
+    miss/prefetch/ring/FTB/gshare) and `feed.fire` (aligner + the 3-deep
+    PipeStage reverse-ready chain, the whole 576-flop RAS + ghr + 4 payload
+    banks).
+  DESIGN = 4 boundaries on one rule: a wide bank never takes its CE from a deep
+    verdict; the verdict goes into a narrow /D reg and the bank's enable goes
+    shallow.  Precise inverse of B3.  P2 skid (0 cycles, CANARY), P1 shallow-CE
+    S1 capture (0 cycles), P3 = B2's F1/F2 split carried forward (+1 fetch
+    latency, all-/D captured state), P4 conditional.
+  B3 IS NOT REBUILT and the combined plan's ordering rationale is REVERSED:
+    order by pin-kind safety and cycle cost, not endpoint count.
+  PROJECTION: floor +0.000; central +0.080..+0.200 ns (184.5-187.9 MHz);
+    200 MHz NOT PROJECTED (frontend owns only 3,239 of 4,890; the WNS path is in
+    the out-of-scope 1,651).  ACCEPT >= +0.120 ns / 186.0 MHz at <= 1.0 % IPC.
+  CANARY DIAGNOSTIC: the per-round trajectory, not the final WNS.  HARD STOP if
+    round-0->plateau gain <= 0.37 ns (the best of SEVEN measured failures);
+    HEALTHY needs >= 0.55 ns (baseline is +0.622).  POSTROUTE_ROUNDS=5, fresh
+    synth, same-session worktree control arm.
+  CORRECTIONS FOUND: (1) the dispatch's "current worst path" is section 25.4's
+    a3_cluster residual at -1.451, 0.021 BEHIND WNS -- third occurrence of that
+    error class; (2) there are FOUR PipeStage instances in src/main, not seven
+    (section 26.2 counted Vivado net aliases); (3) predictPending is /D, not
+    /CE; (4) RING 3->4 is NOT free -- cnt + (ringCount+1)*4 <= 20 makes the 4th
+    slot reachable only at cnt == 0 (new hazard H7).
+  HONEST RISK STATED IN THE SPEC: no static probe can model depth-halving.
+    28ec738 predicted +0.124 and delivered +0.947; B3 predicted a gain and
+    delivered -0.254.  The static evidence is SILENT, not supportive.
+NOTHING IMPLEMENTED.  src/ byte-identical; git status src/ clean.
+WRITEUP = docs/superpowers/specs/2026-08-11-ipc-frontend-genuine-repipeline-design.md
+  + handoff section 27; probe synth/probe_pinkind_population.tcl;
+  evidence synth/probe_pinkind/.
