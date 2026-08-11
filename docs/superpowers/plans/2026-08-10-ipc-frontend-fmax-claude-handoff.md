@@ -3672,11 +3672,28 @@ anywhere in the LSU can reach it.**
   (fo=462 and fo=875, both in the DecodeStage/FetchAlign `ibuf` region) are the
   concrete place a floorplan attempt should aim, and neither is in the LSU.
 
-### 25.6 State
+### 25.6 State and gates
 
 No RTL was touched (`git status src/` clean at `06750f8`).  The branch remains at
 the confirmed baseline: **WNS -1.472 / 182.749 MHz / TNS -17499.508 / 32408
 failing endpoints**.
+
+Gates run anyway, per the section-23.6 standing requirement that a `VerilatorTest`
+result be reported alongside `test-fast`:
+
+| gate | result |
+|---|---|
+| `make test-fast` | **149/149**, 157 suites, 0 failed |
+| `testOnly` `cache.DcacheSpec`, `cache.DcacheDrainRefillRaceSpec`, `ls.StoreQueueSpec`, `ls.StoreQueueDcacheDrainPipelineSpec`, `lockstep.ExecuteLockStepSpec` | **512/512**, 5 suites, 0 failed |
+| `testOnly` `ls.LsEuSpec`, `ls.LsEuCrossSpec`, `ls.LsEuFastPreciseSpec`, `cache.DcacheSpec` | **75/75**, 4 suites, 0 failed |
+
+**A second silent-skip trap, worth adding next to section 23.6's.**  The first
+`testOnly` invocation named seven specs and sbt reported `Suites: completed 5` —
+two names (`m68k040.execute.LsEuSpec`, `m68k040.execute.LsEuCrossSpec`) resolve to
+nothing, because those specs live in `m68k040.ls`.  **sbt `testOnly` with a
+non-existent fully-qualified name runs nothing, reports no error, and still prints
+`All tests passed`.**  The only signal is the requested-vs-`Suites: completed`
+count.  Any dispatch reporting a `testOnly` gate must compare those two numbers.
 
 `Distance to the 200 MHz deployment floor: 0.472 ns.  The goal is NOT met, at
 182.749 MHz.`
