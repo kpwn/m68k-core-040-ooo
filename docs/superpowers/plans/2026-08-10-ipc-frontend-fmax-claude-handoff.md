@@ -3033,3 +3033,196 @@ and the arc-3 (`DecodeStage -> RAS/ROB`) recensus that seeds the next design.
 subagent-driven-development, task by task, beginning with task 1's baseline
 re-verification (`make SBT=~/sbt/bin/sbt test-fast` must be confirmed on the
 actual HEAD in use, not assumed at 149/149).
+
+## 23. Slice 1 (B3) landed and reviewed clean; the tie is now confirmed in BOTH directions; the matrix is blocked on machine contention (Claude, 2026-08-11)
+
+**Execution of `2026-08-10-ipc-fetchalign-icache-combined-implementation-plan.md`
+(24 tasks) by subagent-driven-development.  Tasks 1-6 are COMPLETE and reviewed
+clean.  Task 7 (matrix cell `M0`) is blocked on sustained peer Vivado contention.
+Tasks 8-24 are NOT started.  No FMax verdict is recorded, because none can be:
+GC1 forbids judging a slice solo and the four-cell matrix was never taken.**
+
+### 23.1 What landed
+
+Slice 1 -- boundary **B3**, the *free* half of the design -- is committed at
+`aebe0ae` in six commits on `codex/ipc-dcache-vipt`:
+
+| commit | what |
+|---|---|
+| `c6bdb2a` | 1a: arm the speculative install from a register, not the live demand verdict |
+| `36cbbc7` | 1b: seed the prefetch window from a registered accepted-demand context |
+| `4760422` | 1a fix: `anyInvalidate` arm-vs-poison race + restore the counter reset |
+| `3b94627` | 1c: register `heldDemandMiss`/`pfWindowUpdate` for the allocator and AR arbiter |
+| `e596c9b` | 1a: drop the `installStarves` arm gate -- a confirmed reachable deadlock |
+| `aebe0ae` | 1c fix: stop the allocator clobbering the freshly seeded window (+3 more) |
+
+`pfInstallArm` is now a `Reg` and the **sole** enable for the `lineReg` capture
+and the fanout-518 `pfInstallIdx` select -- i.e. the 512-bit capture enable and
+the widest install net are off the live hit/miss verdict, which is what B3 set
+out to do.  Verified free: `FetchAlignResidentCadenceSpec` (II = 1 resident-hit
+cadence) unchanged.  Gates at landing: **`test-fast` 149/149**, the 7-suite
+I-cache/frontend Verilator gate **45/45**, **`ExecuteLockStepSpec` 394/394**, and
+**`EndToEndLockStepSpec` 2/2**.
+
+### 23.2 The Slice 0 probe: the tie is now demonstrated in BOTH directions, and a THIRD family sits underneath
+
+`synth/probe_combined_arcs.tcl` (`e850ee6`) models B2, B3 and Fix A individually
+and in combination on the frozen `6b246de` routed checkpoint, with a hard error
+on any zero-match cut (section 19 step 1's rule).  All cuts matched real objects
+(B2 106 nets; B3 42 nets / 512 `lineReg` cells; Fix A 42,428 x 20,133 cells --
+the deliberate **over-cut**, an upper bound, not a model of the real skid):
+
+| scenario | WNS | TNS | FEP | sub(-1.000) EP | new worst path |
+|---|---:|---:|---:|---:|---|
+| baseline | -1.472 | -17499.508 | 32408 | 4890 | `Dcache stS2Payload_paddr -> IQ sbNzvc_busy` |
+| b3 | -1.472 | -16186.307 | 31382 | 3870 | *(unchanged)* |
+| b2 | -1.472 | -15926.618 | 31497 | 2272 | *(unchanged)* |
+| b2+b3 | -1.472 | -15088.746 | 30471 | 2270 | *(unchanged)* |
+| fixa | -1.472 | -17374.262 | 32363 | 4754 | `FetchAlign stalled -> Icache lineReg` |
+| **b2+b3+fixa** | **-1.460** | -14963.500 | 30426 | **2134** | `FetchAlign ftqHead -> FetchAlign p0LiveReg_lenWords` |
+
+Two results, and the second is the important one:
+
+1. **The tie is confirmed in both directions in a single controlled experiment.**
+   Cutting only the frontend arcs leaves WNS at exactly -1.472 with the
+   D-cache/IQ path still worst; cutting only Fix A leaves WNS at exactly -1.472
+   with the FetchAlign->`lineReg` path now worst.  Each arc holds the other's
+   floor.  This is the direct demonstration section 22.1 said had never been
+   available.
+2. **But the static payoff of breaking the tie is only +0.012 ns, because a
+   THIRD family is waiting at -1.460** -- `FetchAlignPlugin ftqHead ->
+   FetchAlignPlugin p0LiveReg_lenWords`, which **neither arc in this plan
+   attacks**.  This reproduces section 20's "+0.012 ns for everything on file
+   applied at once" and identifies, for the first time, *which* path becomes
+   binding once both planned arcs are gone.
+
+The population metric moves almost exactly as section 9.2 of the design spec
+predicted (**4890 -> 2134**, -56.4 %, against a predicted ~2150).  Whether that
+predicts the routed outcome is still **unvalidated** -- that was Task 21's job.
+
+**Honest expectation, recorded BEFORE any post-route run so it cannot be
+re-narrated afterwards:** on this evidence the combined `M3` most likely lands
+around 183-186 MHz, not 200 MHz, leaving a ~0.46 ns deficit.  The design spec's
+own section 9.3 is the reason to measure anyway: the static `set_false_path`
+model cannot be trusted here, and this campaign's `28ec738` predicted +0.124 ns
+and delivered **+0.947 ns** at route (7.6x), because deleting a live cone gives
+the placer freedom a false path cannot model.  B2 and B3 delete real cones.
+
+### 23.3 Five real defects, in ~90 lines of RTL the plan said to write verbatim
+
+This is the most transferable result of the session and it is a process finding,
+not a timing one.  Every one of these was found by the per-task review loop, and
+**three are silent-corruption or hang class**:
+
+1. **Plan snippet defect** -- `RegNext(pfInstallAny && !installStarves)` phantom-
+   installs on *every* completed slot: `PF_PRED` dwells 2 cycles and
+   `pfInstallAny` is still 1 on its final cycle, so the flop latches 1 into the
+   first IDLE cycle where it has already fallen, making
+   `pfInstallSel = OHToUInt(OHMasking.first(0000)) = 0` -- a full install of slot
+   0's **stale metadata and stale line data**.
+2. **Plan snippet defect** -- the H9 bounded-wait counter, gated on bare
+   `heldDemandMiss`, fires on *ordinary correct traffic* (a demand held behind an
+   unrelated same-set fill in `AR_PENDING`/`R0`/`R1` reaches the bound in ~6
+   cycles, against a ~70-78-cycle line service).
+3. **Introduced by the register-arming mechanism itself** -- an `anyInvalidate`
+   arm-vs-poison race.  `anyInvalidate` poisons every slot one cycle after a
+   single-cycle pulse while `pfInstallArm` is already latched, so IDLE installs
+   slot 0 with a stale tag: either a **silent re-validation of an invalidated
+   line** (`missPoison` reads False, `missCacheable` is hardcoded True), or an
+   **AXI R-channel wedge** if slot 0 had an outstanding AR.
+4. **Reachable deadlock, from the plan's own anti-starvation gate.**  If a demand
+   is held *because* `pfLookupSetBusy` is asserted by slot S, and what clears the
+   hold is S completing and installing, then once `installStarves` latched:
+   arming blocked -> S never installs -> hold never clears -> the counter never
+   resets (needs `!heldDemandMiss`) and never increments (needs
+   `pfInstallArm || predActive`) -> `installStarves` stuck true.  Closed loop.
+   Confirmed reachable with file:line evidence (`pfLookupSetBusy` at `:538-539`
+   checks only `pfValid(i)`, with no `!pfComplete(i)` term, so a complete-but-
+   uninstalled slot does assert it; the AR demotion path excludes complete slots;
+   the only `pfValid` clear independent of the gate needs an *external* trigger).
+   Fixed by dropping the gate entirely -- anti-starvation is already provided by
+   the pre-existing freeze on new speculative *allocation* while a demand is held,
+   which bounds the wait at `pfSlots x 3 = 12` cycles.
+5. **Plan snippet defect (a second deadlock)** -- the brief's `pfBlockingArWant`
+   snippet used `missSet`, which is written only inside `when(cmdPort.fire)`, so a
+   demand held *before* ever being captured retains a stale set, `pfBlockingArAny`
+   is permanently False and the hold never releases.  The implementer's deviation
+   to live `lookupSet` was independently confirmed correct.
+
+Plus two verification defects worth recording: the AR arbiter's demand-priority
+`Mux` was **unproven load-bearing** -- deleting it failed *nothing*, because the
+existing test's blocking owner happened to also be the lowest-numbered pending
+slot; and **no full-core simulation had ever been run** against the slice, because
+`build.sbt:21-22` strips every `VerilatorTest` from `test-fast` (see 23.5).
+
+**Conclusion for future sessions: "transcribe the plan's RTL verbatim" is not a
+safe execution model for this codebase.**  Every task must independently verify
+the behaviour its snippet claims, and the per-task review must re-derive
+mechanisms from the RTL rather than accept the report's prose.  Both reviewers
+that did so found things the implementers had missed; the value came from the
+loop, not from either half of it.
+
+### 23.4 What is NOT known, and why
+
+**No cell of the `M0`/`M1`/`M2`/`M3` matrix was measured.**  Task 7's post-route
+run is blocked on sustained contention from a peer session running its own
+`impl_FullCore.tcl` experiments in `agent-200mhz-constraint` and
+`agent-floorplan-refit` -- observed at up to **10 concurrent** processes at
+~240 % CPU each, with available memory down to 5 GB.  GC7 is explicit that a
+contended FMax number is not a measurement, and this project has measured
+**214.3 vs 163.9 MHz for an identical commit** under contention.  Since `M0` is
+the reference every other cell is differenced against, a contended `M0` would not
+merely be one bad number -- it would silently corrupt the entire matrix.  The
+correct action was to not take it, and that is what was done.
+
+The contention is already perturbing *simulation*, not only synthesis: a test
+failure during Slice 1c was root-caused to a sampling-boundary race that flips
+under host CPU load from exactly these jobs (AR cadence proved byte-identical
+across the change; 24 pinned seeds and the exact failing seed all green).
+
+Consequently **Slices 2 (B2, the F1/F2 split), 3 (Fix A) and 4 (the matrix) are
+untouched**, and the superadditivity test `(M3-M0) - ((M1-M0)+(M2-M0))` -- the
+plan's actual deliverable -- remains open.
+
+### 23.5 A standing verification gap this session uncovered
+
+`build.sbt:21-22` defines the repository's own gate as
+`fastTest := (Test/testOnly).toTask(" * -- -l m68k040.SlowTest -l m68k040.VerilatorTest -l m68k040.BoardTest")`.
+`-l` is ScalaTest's **exclude**-tag flag, and **120 of the 157 spec files carry
+`VerilatorTest`**.  So `make test-fast`'s 149 tests cover only the ~37
+non-simulation specs: the entire I-cache, FetchAlign, LS and lock-step surface
+runs **only** when invoked explicitly.  There is also **no CI** (`.github/workflows`
+does not exist).  A task reporting "test-fast green" has not tested its own RTL
+change.  Every dispatch in this session was amended to require an explicit
+`testOnly` Verilator run alongside, compared by fail-name-list; that requirement
+should become standing.
+
+### 23.6 Two artefacts for the next session
+
+- **`synth/probe_combined_arcs.tcl`** (`e850ee6`) reproduces the whole 23.2 table
+  from the archived routed DCP in ~10 minutes, with erroring object-count guards.
+  It is the cheapest way to re-ground the tie before committing to more RTL.
+- **A latent reporting trap:** `synth/impl_FullCore.tcl:249` and
+  `synth/floorplan_ab_report.sh:18` **hardcode** `1000/(4.000 - WNS)` regardless
+  of the constraint actually used, so any future experiment that changes
+  `synth/clk.xdc` will silently print a wrong FMax.  Deliberately not fixed
+  mid-campaign (touching the reporting path while a measurement matrix is in
+  flight risks perturbing the comparisons it reports).  Fix by deriving the
+  period from `get_clocks -period` rather than a literal.
+
+Separately, a proposal to relax the constraint from 4.000 ns to 5.000 ns was
+raised and **retracted** during this session after an isolated experiment
+measured it *worse* (152.346 MHz whole-flow, 180.148 MHz impl-only, against the
+182.749 MHz baseline).  `synth/clk.xdc` was never modified -- verified, not
+assumed.  That experiment's baseline arm also independently reproduced
+**182.749 MHz**, which is a useful cross-check of the number this plan's whole
+matrix is measured against.
+
+### 23.7 Distance to the goal
+
+`Distance to the 200 MHz deployment floor: 0.472 ns.  The goal is NOT met, at
+182.749 MHz` -- unchanged, because no post-route run was taken this session and
+Slice 1's own modelled value is +0.000 ns WNS by construction (its value is
+TNS/population breadth: -7.5 % TNS, 4890 -> 3870 endpoints in the static model).
+The next session should re-attempt Task 7 on an **uncontended** machine before
+anything else; everything after it in the plan depends on `M0` existing.
