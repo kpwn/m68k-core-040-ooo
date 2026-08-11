@@ -160,9 +160,12 @@ class IcachePrefetchInstallPrioritySpec extends AnyFunSuite {
       assert(demandRspPc == demandPa, s"demand miss lost or mis-attributed: 0x${demandRspPc.toHexString}")
       assert(demandRspData == IcacheSim.window64(demandPa), "demand miss response data mismatch")
       // The RTL's own H9 oracle (in-RTL `assert`) already proves `installDeferCnt`
-      // never exceeds `installDeferMax+1`=5 -- it would have aborted the whole
-      // simulation otherwise -- so the upper bound here is a belt-and-braces
-      // restatement of the same guarantee from the testbench side.
+      // never exceeds `installDeferBound` = `pfSlots * 3` -- it would have aborted the
+      // whole simulation otherwise -- so the upper bound here is a belt-and-braces
+      // restatement of the same guarantee from the testbench side. (That bound was
+      // `installDeferMax + 1` = 5 while `installStarves` still hard-gated the install
+      // arm, which capped the counter at the threshold by construction; that gate was
+      // a deadlock and is gone -- see the B3 1a regression test below.)
       //
       // THE mutation-discriminating assertion: `pfInstallArm` arms the IDLE decision
       // cycle, and the H9 counter also counts the two PF_PRED cycles that follow it
@@ -182,6 +185,198 @@ class IcachePrefetchInstallPrioritySpec extends AnyFunSuite {
           s"same-cycle-tie-break `pfInstallAny && !demandFillStart` scheduler) produces: " +
           s"the demand wins the tie and is admitted DURING the install's PF_PRED window " +
           s"instead of yielding until after it.")
+    }
+  }
+
+  /** Slice 1a deadlock regression (B3): `pfInstallArm` must NOT be gated by
+    * `installStarves`.
+    *
+    * The loop that gate creates: a demand held by `pfLookupSetBusy` against
+    * speculative slot S is released only by S INSTALLING (`pfLookupSetBusy` tests
+    * `pfValid(i)` alone -- a complete-but-uninstalled slot still asserts it). Once
+    * `installStarves` latches while that demand is still held, arming stops, so S
+    * never installs, so the hold never clears, so `heldDemandMiss` never falls -- and
+    * the counter then neither resets (needs `!heldDemandMiss`) nor increments (needs
+    * `pfInstallArm || predActive`, both false), so `installStarves` never clears
+    * either. There is no internal escape: the AR-demotion path only accelerates slots
+    * that have not yet sent an AR, and the only `pfValid` clear independent of the arm
+    * is poison/error cleanup, which requires an EXTERNAL `anyInvalidate` or bus error.
+    *
+    * This test drives exactly that state -- `installStarves` genuinely latched (the
+    * threshold is reached by two real install episodes, asserted, not assumed) while a
+    * third, still-incomplete slot holds a demand -- then completes the blocking slot
+    * and requires the demand to be admitted inside an explicit cycle budget. The
+    * budget is a bounded polling loop rather than a blocking `waitSamplingWhere` on
+    * purpose: still-deadlocked RTL must FAIL with a diagnosis, not wedge the test JVM.
+    */
+  test("a complete slot still installs after installStarves latches, so a demand held behind it is not deadlocked (B3 1a)",
+       VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd  = dut.clockDomain
+      val axi = dut.icache.logic.axi
+      cd.forkStimulus(10)
+
+      val streamBase = 0x0000_2000L
+      // The window's slot 0 covers streamBase+0x40. `blockedPa` deliberately ALIASES
+      // onto that same VIPT set with a different tag, so it is a genuine cold miss
+      // whose ONLY obstacle is slot 0 still being live -- the exact `pfLookupSetBusy`
+      // hold the deadlock needs. Slots 1..3 sit in other sets and never block it.
+      val blockedPa  = 0x0000_3040L
+      def setOf(pa: Long): Long = (pa >> 6) & 0x3f
+      def tagOf(pa: Long): Long = pa >> 12
+      require(setOf(blockedPa) == setOf(streamBase + 0x40L),
+        "test setup bug: blockedPa must alias onto slot 0's cache set")
+      require(tagOf(blockedPa) != tagOf(streamBase + 0x40L),
+        "test setup bug: blockedPa must be a DIFFERENT line, not the same one slot 0 is fetching")
+      require(Seq(0x80L, 0xC0L, 0x100L).forall(o => setOf(streamBase + o) != setOf(blockedPa)),
+        "test setup bug: slots 1..3 must not also block the demand, or the test proves nothing about slot 0")
+
+      axi.ar.ready #= true
+      axi.r.valid #= false
+      axi.r.payload.data #= 0
+      axi.r.payload.id #= 0
+      axi.r.payload.last #= false
+      axi.r.payload.resp #= 0
+
+      val arTrace = scala.collection.mutable.ArrayBuffer[(Int, Long)]()
+      cd.onSamplings {
+        if (axi.ar.valid.toBoolean && axi.ar.ready.toBoolean)
+          arTrace += ((axi.ar.payload.id.toInt, axi.ar.payload.addr.toLong))
+      }
+
+      def beat(address: Long, phase: Int): BigInt =
+        (0 until 32).foldLeft(BigInt(0)) { (acc, i) =>
+          acc | (BigInt(IcacheSim.memByte(address + phase * 32L + i)) << (8 * i))
+        }
+      def sendLine(id: Int, address: Long): Unit = {
+        for (phase <- 0 to 1) {
+          axi.r.valid #= true
+          axi.r.payload.id #= id
+          axi.r.payload.data #= beat(address, phase)
+          axi.r.payload.resp #= 0
+          axi.r.payload.last #= (phase == 1)
+          cd.waitSamplingWhere(axi.r.ready.toBoolean)
+          axi.r.valid #= false
+          cd.waitSampling()
+        }
+      }
+      def waitReq(id: Int, address: Long): Unit =
+        while (!arTrace.contains((id, address))) cd.waitSampling()
+
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(4)
+      dut.icache.logic.prefetchEnable #= true
+      cd.waitSampling(2)
+
+      // Single free-running passive observer (same rationale as the test above: never
+      // sample combinationally from the poking thread in the same simulated instant).
+      var maxDefer    = 0
+      var starvesSeen = false
+      var installSeen = 0
+      val obs = fork {
+        while (true) {
+          cd.waitSampling()
+          val d = dut.icache.logic.installDeferCnt.toInt
+          if (d > maxDefer) maxDefer = d
+          if (dut.icache.logic.installStarves.toBoolean) starvesSeen = true
+          if (dut.icache.logic.predIsPf.toBoolean) installSeen += 1
+        }
+      }
+
+      // Phase 1 -- open the five-line window and retire the demand's own line.
+      dut.probe.logic.cmdIn.valid #= true
+      dut.probe.logic.cmdIn.payload.pc #= streamBase
+      cd.waitSamplingWhere(dut.probe.logic.cmdIn.ready.toBoolean && dut.probe.logic.cmdIn.valid.toBoolean)
+      dut.probe.logic.cmdIn.valid #= false
+      waitReq(AxiIds.I_DEMAND, streamBase)
+      sendLine(AxiIds.I_DEMAND, streamBase)
+      cd.waitSamplingWhere(dut.probe.logic.rspOut.valid.toBoolean)
+      for (k <- 0 to 3) waitReq(AxiIds.I_SPEC_BASE + k, streamBase + 0x40L * (k + 1))
+      assert((0 until AxiIds.I_SPEC_SLOTS).forall(i => dut.icache.logic.pfValid(i).toBoolean),
+        "setup: all four speculative slots must be live before the demand is presented")
+
+      // Phase 2 -- present the aliasing demand and HOLD it (valid stays asserted).
+      dut.probe.logic.cmdIn.valid #= true
+      dut.probe.logic.cmdIn.payload.pc #= blockedPa
+      // It must genuinely be blocked, not merely slow: no accept for 10 cycles while
+      // slot 0 (its set owner) is still outstanding.
+      for (c <- 0 until 10) {
+        cd.waitSampling()
+        assert(!dut.probe.logic.cmdIn.ready.toBoolean,
+          s"demand at 0x${blockedPa.toHexString} was admitted at hold cycle $c, but slot 0 still owns " +
+            s"its set -- the pfLookupSetBusy hold this test depends on did not happen")
+      }
+
+      // Phase 3 -- two REAL install episodes (slots 1 and 2) run while the demand
+      // stays held. These are what drive installDeferCnt past installDeferMax.
+      sendLine(AxiIds.I_SPEC_BASE + 1, streamBase + 0x80L)
+      sendLine(AxiIds.I_SPEC_BASE + 2, streamBase + 0xC0L)
+      var w = 0
+      while (!starvesSeen && w < 100) { cd.waitSampling(); w += 1 }
+      assert(starvesSeen,
+        s"precondition not reached: installStarves never latched after two install episodes " +
+          s"(maxDefer=$maxDefer, installDeferMax=4). This test is vacuous unless the starve " +
+          s"threshold is genuinely crossed while the demand is held.")
+      assert(dut.icache.logic.pfValid(0).toBoolean && !dut.icache.logic.pfComplete(0).toBoolean,
+        "slot 0 must still be live-and-incomplete at the moment installStarves latches")
+      assert(!dut.probe.logic.cmdIn.ready.toBoolean,
+        "the demand must still be held at the moment installStarves latches")
+
+      // Phase 4 -- the blocking slot completes. THIS is the deadlock trigger: with
+      // `!installStarves` on the arm, slot 0 can now never install and the demand can
+      // never be admitted.
+      sendLine(AxiIds.I_SPEC_BASE, streamBase + 0x40L)
+
+      // Phase 5 -- bounded liveness check. Budget is ~16x the fix's guaranteed worst
+      // case (pfSlots install episodes x 3 cycles = 12), so a pass is never marginal
+      // and a failure is unambiguous.
+      val budget = 200
+      var admittedAt = -1
+      var c = 0
+      while (admittedAt < 0 && c < budget) {
+        cd.waitSampling()
+        c += 1
+        if (dut.probe.logic.cmdIn.ready.toBoolean && dut.probe.logic.cmdIn.valid.toBoolean) admittedAt = c
+      }
+      if (admittedAt < 0)
+        fail(s"DEADLOCK: the demand at 0x${blockedPa.toHexString} was never admitted within $budget " +
+          s"cycles of its blocking slot completing. State: pfValid(0)=${dut.icache.logic.pfValid(0).toBoolean} " +
+          s"pfComplete(0)=${dut.icache.logic.pfComplete(0).toBoolean} " +
+          s"pfInstallArm=${dut.icache.logic.pfInstallArm.toBoolean} " +
+          s"installDeferCnt=${dut.icache.logic.installDeferCnt.toInt} " +
+          s"installStarves=${dut.icache.logic.installStarves.toBoolean} maxDefer=$maxDefer. " +
+          s"A complete-but-uninstalled slot keeps pfLookupSetBusy asserted, so gating the install " +
+          s"arm on installStarves blocks the very install that would release this demand.")
+      dut.probe.logic.cmdIn.valid #= false
+
+      // Phase 6 -- the demand must then be a real, correct refill.
+      waitReq(AxiIds.I_DEMAND, blockedPa)
+      sendLine(AxiIds.I_DEMAND, blockedPa)
+      cd.waitSamplingWhere(dut.probe.logic.rspOut.valid.toBoolean)
+      val rspPc   = dut.probe.logic.rspOut.payload.pc.toLong
+      val rspData = dut.probe.logic.rspOut.payload.data.toBigInt
+
+      sendLine(AxiIds.I_SPEC_BASE + 3, streamBase + 0x100L)
+      cd.waitSampling(20)
+      obs.terminate()
+
+      assert(rspPc == blockedPa,
+        s"released demand mis-attributed: got 0x${rspPc.toHexString}, expected 0x${blockedPa.toHexString}")
+      assert(rspData == IcacheSim.window64(blockedPa), "released demand response data mismatch")
+      // Non-vacuity: slot 0 really did install (it is what released the hold), and the
+      // admission happened inside the structural bound, not merely inside the budget.
+      assert(admittedAt <= dut.icache.logic.installDeferBound,
+        s"the demand was admitted at cycle $admittedAt after its blocking slot completed, beyond the " +
+          s"${dut.icache.logic.installDeferBound}-cycle structural worst case (pfSlots install episodes " +
+          s"x 3 cycles each)")
+      assert(installSeen == 8,
+        s"expected exactly 4 slots x 2-cycle PF_PRED dwell = 8 predIsPf-high samples, got $installSeen")
+      assert(maxDefer >= 4 && maxDefer <= dut.icache.logic.installDeferBound,
+        s"installDeferCnt peaked at $maxDefer: must reach installDeferMax=4 (else installStarves was " +
+          s"never genuinely latched and this test is vacuous) and must stay within the " +
+          s"${dut.icache.logic.installDeferBound}-cycle H9 bound")
     }
   }
 }

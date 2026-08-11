@@ -554,14 +554,52 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // happening in any particular cycle - a completed speculative line is
     // speculative by construction (handoff section 15 step 9's standing licence).
     //
-    // H9 anti-starvation: a visible held demand miss may be deferred behind at most
-    // `installDeferMax` cycles of install activity; past that, arming stops until the
-    // demand is admitted. Without this a back-to-back chain of five completed
-    // speculative slots could defer a demand miss for ~15 cycles.
+    // H9 anti-starvation. `installStarves` is DIAGNOSTIC ONLY -- it does NOT gate
+    // arming, and must not be made to again (see below). The property it used to
+    // enforce is instead structural, and strictly stronger:
+    //
+    //   the allocation site (`!heldDemandMissReg`, in the Slice 1c gate further
+    //   down) freezes ALL new speculative allocation for the entire duration any
+    //   demand is held. So while a demand stays held, the speculative pool can only
+    //   ever drain -- at most `pfSlots` slots exist and each installs exactly once,
+    //   bounding the held demand's wait to `pfSlots` install episodes.
+    //
+    // Gating the ARM on `installStarves` (as this code used to do) is not merely
+    // redundant against that bound -- it is a live deadlock, because installing an
+    // already-COMPLETE slot is precisely what RELIEVES a demand's hold:
+    //   1. demand B is held because `pfLookupSetBusy` matches a speculative slot S
+    //      (`:538-539` tests `pfValid(i)` only -- a complete-but-uninstalled slot
+    //      still asserts it);
+    //   2. other slots install while B waits, driving `installDeferCnt` to the
+    //      threshold and latching `installStarves`;
+    //   3. S then completes. With `!installStarves` on the arm, S can never install,
+    //      so `pfValid(S)` never clears, so `pfLookupSetBusy` never clears, so B is
+    //      never admitted, so `heldDemandMiss` never falls -- and the counter neither
+    //      resets (needs `!heldDemandMiss`) nor increments (needs
+    //      `pfInstallArm || predActive`, both now permanently false), so
+    //      `installStarves` stays latched forever. Closed loop, no internal escape:
+    //      the AR-demotion path acts only on slots that have not yet sent their AR
+    //      (a complete slot has none left to demote), and the only `pfValid` clear
+    //      independent of the arm is the poison/error cleanup, which needs an
+    //      EXTERNAL trigger (`anyInvalidate` pulse or a bus error).
+    // Letting every complete slot take its install turn is therefore the fix, not the
+    // hazard. `installDeferMax` is retained purely as the telemetry threshold below.
     val installDeferMax = 4
-    val installDeferCnt = Reg(UInt(3 bits)) init 0
+    // Worst case for one CONTINUOUS hold: every slot in the pool installs before the
+    // held demand's own turn, and each install episode contributes exactly 3 counted
+    // cycles (1 `pfInstallArm` arm-decision cycle in IDLE + the 2 `PF_PRED` dwell
+    // cycles, during which `pfInstallArm` is itself masked low by `!predActive`).
+    // `heldDemandMiss` requires `lookupActive`, which is raised ONLY by `lookupTick`
+    // in IDLE and PF_PRED -- REFILL/PREDECODE/REPLAY/FAULT do not call it -- so a
+    // demand-side PREDECODE can never contribute counts (it drives the counter's
+    // `!heldDemandMiss` reset instead). Derived from `pfSlots` rather than written as
+    // a literal so it cannot silently drift if the pool is ever resized.
+    val installDeferBound = pfSlots * 3
+    val installDeferCntW  = log2Up(installDeferBound + 2)
+    val installDeferCnt = Reg(UInt(installDeferCntW bits)) init 0
     installDeferCnt.simPublic()
-    val installStarves  = installDeferCnt >= U(installDeferMax, 3 bits)
+    val installStarves  = installDeferCnt >= U(installDeferMax, installDeferCntW bits)
+    installStarves.simPublic()
     // `&& !predActive` (implementation correction over the literal design-spec
     // snippet, same file, same interface): `pfInstallVec`/`pfInstallAny` read
     // `pfValid`/`pfComplete`, which only clear at the FSM edge that ends PF_PRED
@@ -603,7 +641,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // DURING the already-armed cycle is unaffected and stays safe on its own
     // (`missPoison := pfPoison(sel) || anyInvalidate` is live that cycle); this
     // term only closes the ONE-CYCLE-STALE-ARM-VS-FRESH-POISON gap.
-    val pfInstallArm    = RegNext(pfInstallAny && !installStarves && !predActive && !anyInvalidate) init False
+    val pfInstallArm    = RegNext(pfInstallAny && !predActive && !anyInvalidate) init False
     pfInstallArm.simPublic()
 
     // H9 counter update (implementation correction over the literal design-spec
@@ -637,7 +675,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // was) lets the count carry across gap cycles within one continuous hold.
     when(heldDemandMiss) {
       when(pfInstallArm || predActive) {
-        when(installDeferCnt =/= U(7, 3 bits)) { installDeferCnt := installDeferCnt + 1 }
+        when(installDeferCnt =/= installDeferCnt.maxValue) { installDeferCnt := installDeferCnt + 1 }
       }
     } otherwise {
       installDeferCnt := 0
@@ -646,8 +684,16 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // Design spec section 12.1 oracle 4: a demand miss held by an armed install must
     // be admitted within the bounded wait. Simulation-only; `GenerationFlags.simulation`
     // is the house pattern for keeping an assert out of the synthesised netlist.
+    // The bound is `pfSlots` install episodes x 3 counted cycles each, NOT the old
+    // `installDeferMax + 1`: that literal only held while `installStarves` hard-gated
+    // arming (which capped the count at the threshold by construction, and deadlocked
+    // -- see `installDeferMax` above). With the gate gone the counter legitimately
+    // runs to the full drain of the frozen pool, so asserting 5 here would convert the
+    // removed deadlock into a spurious failure. The counter saturates one short of
+    // `maxValue` above `installDeferBound`, so this assert stays live rather than
+    // being masked by wraparound.
     GenerationFlags.simulation {
-      assert(installDeferCnt <= U(installDeferMax + 1, 3 bits),
+      assert(installDeferCnt <= U(installDeferBound, installDeferCntW bits),
         "H9 bounded-wait violated: a demand miss was deferred behind installs for too long")
     }
 
