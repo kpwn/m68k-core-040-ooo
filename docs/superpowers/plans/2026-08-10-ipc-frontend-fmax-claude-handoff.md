@@ -3187,27 +3187,82 @@ Verilator gate 44/44.
 netlist).  The Vivado run is therefore decoupled from any later RTL edit: a
 future session can measure `M0` from that archived file without re-deriving it.
 
-### 23.5 What is NOT known, and why
+### 23.5 Matrix cell `M0` IS measured -- and Slice 1 is a real post-route REGRESSION
 
-**No cell of the `M0`/`M1`/`M2`/`M3` matrix was measured.**  Task 7's post-route
-run is blocked on sustained contention from a peer session running its own
-`impl_FullCore.tcl` experiments in `agent-200mhz-constraint` and
-`agent-floorplan-refit` -- observed at up to **10 concurrent** processes at
-~240 % CPU each, with available memory down to 5 GB.  GC7 is explicit that a
-contended FMax number is not a measurement, and this project has measured
-**214.3 vs 163.9 MHz for an identical commit** under contention.  Since `M0` is
-the reference every other cell is differenced against, a contended `M0` would not
-merely be one bad number -- it would silently corrupt the entire matrix.  The
-correct action was to not take it, and that is what was done.
+A clear window opened at 05:11 (peer `impl_FullCore.tcl` count 9 -> 0, available
+memory 14 -> 27 GB) and `M0` was taken: `FLOORPLAN_MODE=decode`,
+`IMPL_STRATEGY=postrouteN`, `POSTROUTE_ROUNDS=3`, fresh synthesis
+(`REUSE_SYNTH_DCP` deliberately unset).  **Verifiably uncontended at both ends** --
+0 competing `impl_FullCore.tcl` and 27 GB available before *and* after, evidence
+archived in `synth/archive/M0_slice1_b3_postrouteN3_decode/M0_contention_evidence.txt`.
 
-The contention is already perturbing *simulation*, not only synthesis: a test
-failure during Slice 1c was root-caused to a sampling-boundary race that flips
-under host CPU load from exactly these jobs (AR cadence proved byte-identical
-across the change; 24 pinned seeds and the exact failing seed all green).
+| metric | BASE (`6b246de`) | `M0` (Slice 1, `aebe0ae`) | delta |
+|---|---:|---:|---:|
+| **post-SYNTH WNS (control)** | **-1.827** | **-1.908** | **-0.081 WORSE** |
+| post-route WNS | -1.472 | **-1.726** | **-0.254 WORSE** |
+| FMax | 182.749 | **174.642** | **-8.107 MHz** |
+| TNS | -17499.508 | **-23313.951** | **-33 % WORSE** |
+| failing endpoints | 32408 | **43049** | **+33 % WORSE** |
+| CLB LUTs | 110662 | 109877 | -785 (better, as designed) |
+| CLB Registers | 50389 | 50379 | -10 |
 
-Consequently **Slices 2 (B2, the F1/F2 split), 3 (Fix A) and 4 (the matrix) are
-untouched**, and the superadditivity test `(M3-M0) - ((M1-M0)+(M2-M0))` -- the
-plan's actual deliverable -- remains open.
+Post-route rounds converged: -1.836 -> -1.740 -> -1.726 -> -1.726.  The new worst
+path is `FetchAlignPlugin predictTargetReg[14]/C -> IcachePlugin
+s1PredEntries_0[122]/CE` -- **neither** the D-cache/IQ arc nor the `lineReg` arc.
+Slice 1 *did* achieve its stated objective (`lineReg` is no longer the worst
+endpoint), but a different `FetchAlign -> Icache` path now sits below the old floor.
+
+**Why this is not noise, stated so it can be checked:**
+
+1. **The degradation is already present at synthesis.**  Section 18 established
+   **-1.827** as the reproducible post-synthesis control for the baseline netlist
+   across all sixteen archived runs.  Slice 1's netlist synthesises to **-1.908**.
+   That 0.081 ns is attributable to the RTL alone, *before* any placement or
+   routing decision -- placement variance cannot produce a synthesis delta.
+2. TNS +33 % and failing endpoints +33 % are far outside any run-to-run variance
+   this campaign has recorded.
+3. `postrouteN` converged (rounds 2 and 3 identical), so it is not under-optimised.
+4. The run was verifiably uncontended, with archived evidence.
+
+**What this contradicts.**  Design spec section 9.2 predicted Slice 1 would
+*improve* TNS by ~7.5 % and cut the sub-(-1.000 ns) population 4890 -> 3870, and
+the static probe in 23.2 agreed (-7.5 % TNS, 4890 -> 3870).  The real route did the
+**opposite** on both.  This is the third time this campaign a static
+`set_false_path` model has failed to predict a real route -- and the **first time
+it has been wrong in the optimistic direction**, predicting a gain and delivering a
+loss.  That is a calibration result worth as much as the number itself: the
+population/TNS proxy this three-arc program is prioritised by has now been
+validated against a real route **once**, and it failed.
+
+**What is still true:** Slice 1 is genuinely **free on cycles** -- IPC ideal
++0.10 %, `l2:5:70` -0.20 %, three seeds x two models (23.4).  "Free" was always a
+*cycle* claim and that claim holds.  It is **not** free on timing, which nobody had
+measured until now.
+
+**Consequence for the plan, stated plainly.**  The plan mandates that Slice 1
+"lands unconditionally... because it is free" (GC1, design spec section 11).  **That
+premise is now measured false on the timing axis.**  GC1's protection -- "a
++0.000 ns solo result is expected and is NOT grounds to revert" -- does not cover
+this: -0.254 ns is not +0.000 ns, and it is more than half the entire 0.472 ns
+deficit the whole program is fighting for, spent in the wrong direction.  This was
+**not** reverted unilaterally: one run, however well controlled, is thin for a
+decision this consequential.  **The required next step is a confirming re-run of
+`M0`, plus a decision by the plan's owner on whether B3 survives.**
+
+### 23.6 What is still NOT known
+
+`M1`, `M2` and `M3` were never measured -- Slices 2 (B2, the F1/F2 split) and 3
+(Fix A) are untouched, so the superadditivity test
+`(M3-M0) - ((M1-M0) + (M2-M0))` -- this plan's actual deliverable -- **remains
+open**.  Given 23.5, the more urgent question is now upstream of it: whether B3,
+the change the design called free and ordered first *because* it was free, should
+be in the tree at all.
+
+Sustained contention from sibling sessions' own `impl_FullCore.tcl` experiments
+(up to **10 concurrent**, memory down to 5 GB) blocked measurement for most of the
+session; `M0` was only possible because a window happened to open.  Any future
+attempt at the four-cell matrix needs the machine to itself -- four runs at
+~35 minutes each, all of which must be uncontended or the comparison is void.
 
 ### 23.6 A standing verification gap this session uncovered
 
@@ -3245,9 +3300,16 @@ matrix is measured against.
 
 ### 23.8 Distance to the goal
 
-`Distance to the 200 MHz deployment floor: 0.472 ns.  The goal is NOT met, at
-182.749 MHz` -- unchanged, because no post-route run was taken this session and
-Slice 1's own modelled value is +0.000 ns WNS by construction (its value is
-TNS/population breadth: -7.5 % TNS, 4890 -> 3870 endpoints in the static model).
-The next session should re-attempt Task 7 on an **uncontended** machine before
-anything else; everything after it in the plan depends on `M0` existing.
+**`Distance to the 200 MHz deployment floor: 0.726 ns.  The goal is NOT met, at
+174.642 MHz.`**  That is measured at Slice 1's HEAD (`aebe0ae`).  Against the
+pinned pre-Slice-1 baseline the figure is unchanged at `0.472 ns / 182.749 MHz` --
+**so this session moved the core AWAY from 200 MHz, not toward it**, and the honest
+headline is that the first of the two arcs cost 8.1 MHz rather than being free.
+
+The next session's first action should be a **confirming re-run of `M0`** on an
+uncontended machine.  If it reproduces, B3 should be reverted or re-scoped before
+any further work on this plan -- and the ordering rationale in design spec
+section 11 ("slice 1 is free and removes the largest single endpoint object, so it
+goes first regardless") needs rewriting, because the largest endpoint object is not
+the same thing as the binding path, and removing it moved a different
+`FetchAlign -> Icache` path below the old floor.
