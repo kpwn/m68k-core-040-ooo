@@ -10,32 +10,40 @@ import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
 import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
 
-/** Design spec §12.1 oracle 4: the Unified Fetch Array's inline predecode field is
-  * bit-identical to what the (still-present, shadow) `predMem` array holds for the same
-  * (way, set, beat).
+/** Directed gate for the Unified Fetch Array's READ path (implementation plan Task 6,
+  * M1b) plus the surviving half of design spec §12.1 oracle 4.
   *
-  * This is the STRONG form of the oracle: rather than re-implementing
-  * `PredecodeWord.classify` in the testbench and comparing against that, it compares the
-  * new array against the array it replaces, on the real fill path. Any disagreement is
-  * an M1 bug by construction, because `predMem`'s content is the pre-restructure
-  * behaviour the whole suite already pins.
+  * ── WHAT USED TO BE HERE, AND WHY IT IS GONE ────────────────────────────────────
+  * Task 5 (M1a) wrote the unified array in parallel with the pre-existing whole-line
+  * predecode array and proved bit-for-bit equivalence two ways: an IN-RTL per-cycle
+  * read-back monitor (`dbgUfaPredMatch`) and a POST-HOC array sweep comparing
+  * `IcacheArrayProbe.wayPred` against that shadow array. Task 6 deletes the shadow
+  * array outright, so BOTH of those checks are consumed with it -- nothing else in the
+  * design independently produces the "shadow" value any more, and a comparison written
+  * against the surviving array would be comparing the array with ITSELF. The plan says
+  * this in as many words ("Do not leave a test that compares the array against itself"),
+  * and it offers `PerBeatPredecodeEquivSpec`'s reference classifier as a replacement
+  * shadow if one is exposed. It is NOT: that spec is a pure-Scala model of the
+  * (word-index, validity-flag) TUPLES presented to `classify`, not a classifier; and the
+  * one real Scala classifier in the tree, `PredecodeRef`, deliberately always assumes a
+  * BRIEF extension word, so it legitimately disagrees with the RTL wherever the fetched
+  * image happens to encode a full-format EA -- it cannot serve as an array-content
+  * oracle over arbitrary memory. So the plan's stated fallback is taken: the
+  * shadow-comparison test is deleted rather than rewritten.
   *
-  * TWO INDEPENDENT HALVES, deliberately:
+  * ── WHAT STILL COVERS THE DELETED CHECK'S GROUND ────────────────────────────────
+  * The deleted sweep's real value was proving each predecode write landed at the RIGHT
+  * ADDRESS, including for lines nothing has read back. That value is retained in full by
+  * oracle 4b below, because as of M1 the predecode and the data are ONE write, of ONE
+  * concatenated entry, at ONE address: `lineMem(w).write(missSet ## commitBeat,
+  * beatPred ## beatSrc)`. A wrong write address, a swapped beat half, or a mis-ordered
+  * concatenation therefore corrupts the DATA half too, and 4b re-derives every resident
+  * beat's 256 data bits from the backing-memory image -- a genuinely independent oracle
+  * that no restructure of the array can make tautological.
   *
-  *  1. IN-RTL, every cycle: `dbgUfaPredMatch` (IcachePlugin.scala, S1 stage) compares
-  *     what the unified array READS BACK for the beat S1 is delivering against the beat
-  *     slice of the shadow `predMem` entry captured for the same way/set. This runs on
-  *     every hit and every post-fill REPLAY, across this and every other suite that
-  *     instantiates IcachePlugin -- it is the evidence Task 6 (M1b) leans on when it
-  *     deletes `predMem`.
-  *  2. POST-HOC array sweep: for every VALID (way, set, beat), `IcacheArrayProbe.wayPred`
-  *     (which reads the UNIFIED array as of M1a) must equal the corresponding slice of
-  *     `predMem`'s whole-line entry. This is the check that a write reached the right
-  *     address at all, including for lines nothing has read back yet.
-  *
-  * Task 6 deletes `predMem` and `dbgUfaPredMatch`; both halves of this oracle are
-  * consumed with it (they cannot outlive the shadow they compare against), which is why
-  * Task 6 replaces this file's content with read-path tests rather than editing it.
+  * What 4b cannot see is the S1->rsp READ path, which is exactly what M1b changed
+  * (way-mux + a one-bit-narrower window select, plus a new explicit fault mask). The two
+  * M1b tests below pin that, and the fault test is written so it CANNOT pass vacuously.
   */
 class IcacheUnifiedArraySpec extends AnyFunSuite {
 
@@ -60,79 +68,100 @@ class IcacheUnifiedArraySpec extends AnyFunSuite {
   // (simWorkspace/.cache) means the second compile of identical RTL is nearly free.
   private def compiled = SimConfig.withVerilator.compile(new Dut())
 
-  test("oracle 4: the unified array's inline predecode matches predMem for every filled beat",
+  test("M1b: a hit's response predecode comes from the unified array and matches the array content",
        VerilatorTest) {
-    compiled.doSim("oracle4-ufa-equiv") { dut =>
+    compiled.doSim("m1b-read-path") { dut =>
       dut.clockDomain.forkStimulus(10)
-      IcacheSim.attachMemory(dut.icache.logic.axi, dut.clockDomain, 0x1000, 0x8000)
-      // `runOrderedStream`'s documented caller precondition (IcacheOrderOracleSpec):
-      // cmdIn.valid/.pc and invalidateAll are undriven top-level IO and are X/random
-      // per seed until poked, with no intervening waitSampling before this point.
+      IcacheSim.attachMemory(dut.icache.logic.axi, dut.clockDomain, 0x1000, 0x2000)
       dut.probe.logic.cmdIn.valid      #= false
       dut.probe.logic.cmdIn.payload.pc #= 0
       dut.icache.logic.invalidateAll   #= false
       dut.clockDomain.waitSampling(5)
 
-      // Continuously monitor the in-RTL shadow-equivalence signal. It is self-qualifying
-      // (True on every cycle that has nothing to compare), so it must be high on EVERY
-      // cycle, unconditionally.
-      var mismatches = 0
-      fork {
-        while (true) {
-          dut.clockDomain.waitSampling()
-          if (!dut.icache.logic.dbgUfaPredMatch.toBoolean) {
-            mismatches += 1
-            simFailure("ORACLE 4 VIOLATED (in-RTL): on an S1 delivery cycle the unified " +
-                       "array's inline predecode field read back different content from " +
-                       "the shadow predMem entry for the same (way, set, beat)")
-          }
+      // Fill line 0x1000, then RE-fetch every 8-byte window in it as a HIT and check the
+      // response's 4 predecode chunks against the array content for that window. This is
+      // the whole S1->rsp read path M1b rewrote: the registered way-mux, the beat that
+      // pc(5) already selected when the array was addressed, and the pc(4:3) window
+      // select that replaced the old whole-line pc(5:3).
+      val base = 0x1000L
+      IcacheFetchDriver.fetchAndWait(dut.icache, dut.probe, dut.clockDomain, base)
+      dut.clockDomain.waitSampling(10)
+
+      val set = ((base >> 6) & 63).toInt
+      val way = (0 until 4).find(w => IcacheArrayProbe.wayValid(dut.icache, w, set))
+        .getOrElse(fail(f"line 0x$base%x did not become resident in set $set"))
+      val chunkBits = dut.icache.logic.PRED_BITS_PER_WORD
+      val chunkMask = (BigInt(1) << chunkBits) - 1
+
+      var nonZero = 0
+      for (win <- 0 until 8) {
+        val pc   = base + win * 8
+        val beat = win / 4          // pc(5): windows 0-3 in beat 0, 4-7 in beat 1
+        val lane = win % 4          // pc(4:3)
+        val rsp  = IcacheFetchDriver.fetchAndWait(dut.icache, dut.probe, dut.clockDomain, pc)
+
+        assert(!rsp.fault, f"pc=0x$pc%x faulted unexpectedly: ${rsp.describe}")
+        assert(rsp.pc == BigInt(pc), f"pc=0x$pc%x got a response for 0x${rsp.pc.toString(16)}")
+        val beatPred = IcacheArrayProbe.wayPred(dut.icache, way, set, beat)
+        for (k <- 0 until 4) {
+          val expect = (beatPred >> (chunkBits * (lane * 4 + k))) & chunkMask
+          val got    = rsp.pred(k)
+          assert(got == expect,
+            f"pc=0x$pc%x chunk $k: rsp predecode 0x${got.toString(16)} != unified array " +
+            f"0x${expect.toString(16)} (way=$way set=$set beat=$beat lane=$lane)")
+          if (expect != 0) nonZero += 1
         }
       }
+      // Guard against the degenerate pass in which every comparison was 0 == 0 (which a
+      // read path stuck at zero would also satisfy).
+      assert(nonZero >= 16,
+        s"only $nonZero of 32 compared predecode chunks were non-zero -- an all-zero " +
+        s"comparison proves nothing about the read path")
+    }
+  }
 
-      // 256 distinct lines across all 64 sets, cycling every way several times over.
-      // Fix 2 (Task 5 review): hit BOTH beats of every line, not just the low one. Each
-      // 64-byte line's low beat is at offset 0 (s1Pc(5)==0) and high beat at offset +32
-      // (s1Pc(5)==1); a purely 64-byte-aligned stimulus (the original form of this list)
-      // never sets s1Pc(5), so the in-RTL `dbgUfaPredMatch` monitor above only ever
-      // compared the low beat -- the high-beat read-back path went completely unproven
-      // (confirmed by a reviewer mutation that corrupted only the high beat's predecode
-      // at the write site: the in-RTL monitor fired 0 times, only the post-hoc array
-      // sweep below caught it). Interleaving the +32 address right after each line's base
-      // address exercises the high beat too, immediately after the low beat has already
-      // populated the line (so it should still resolve as a fast hit, not a fresh miss).
-      val lines = (0 until 256).flatMap(i => Seq(0x1000L + i * 64, 0x1000L + i * 64 + 32))
-      IcacheOrderOracle.runOrderedStream(
-        cmdValid = dut.probe.logic.cmdIn.valid, cmdReady = dut.probe.logic.cmdIn.ready,
-        cmdPc    = dut.probe.logic.cmdIn.payload.pc,
-        rspValid = dut.probe.logic.rspOut.valid, rspPc = dut.probe.logic.rspOut.payload.pc,
-        cd = dut.clockDomain, addrs = lines, timeoutCycles = 240000)
-      dut.clockDomain.waitSampling(200)
-      assert(mismatches == 0, s"$mismatches in-RTL unified-array predecode mismatches")
+  test("M1b: a translation fault delivers ZEROED predecode (the old capture bank's placeholder)",
+       VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut(new ICacheModeTranslationPlugin))
+      .doSim("m1b-fault-mask") { dut =>
+      val xlate = dut.xlate.asInstanceOf[ICacheModeTranslationPlugin]
+      dut.clockDomain.forkStimulus(10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, dut.clockDomain, 0x1000, 0x2000)
+      dut.probe.logic.cmdIn.valid      #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll   #= false
+      xlate.logic.forceFault           #= false
+      dut.clockDomain.waitSampling(5)
 
-      // Post-hoc array sweep: for every VALID (way, set), the unified array's inline
-      // predecode field must equal the shadow predMem's corresponding beat slice.
-      val predBits = dut.icache.logic.PRED_BITS_PER_BEAT
-      val mask     = (BigInt(1) << predBits) - 1
-      var checked  = 0
-      var nonZero  = 0
-      for (w <- 0 until 4; s <- 0 until 64 if IcacheArrayProbe.wayValid(dut.icache, w, s)) {
-        for (b <- 0 until 2) {
-          val fromUnified = IcacheArrayProbe.wayPred(dut.icache, w, s, b)
-          val fromShadow  = (dut.icache.logic.predMem(w).getBigInt(s) >> (predBits * b)) & mask
-          assert(fromUnified == fromShadow,
-            f"ORACLE 4 VIOLATED (array sweep): way=$w set=$s beat=$b unified=0x" +
-            f"${fromUnified.toString(16)} shadow=0x${fromShadow.toString(16)}")
-          checked += 1
-          if (fromUnified != 0) nonZero += 1
-        }
-      }
-      assert(checked >= 64,
-        s"only $checked (way,set,beat) triples were valid -- the stimulus did not " +
-        s"actually populate the cache, so this oracle proved nothing")
-      // Guard against the degenerate pass in which every entry compared is 0 == 0.
-      assert(nonZero >= checked / 2,
-        s"only $nonZero of $checked compared predecode entries were non-zero -- an " +
-        s"all-zero comparison proves nothing about the unified array's write path")
+      // Make line 0x1000 RESIDENT with real (non-zero) predecode first...
+      val base = 0x1000L
+      val set  = ((base >> 6) & 63).toInt
+      IcacheFetchDriver.fetchAndWait(dut.icache, dut.probe, dut.clockDomain, base)
+      dut.clockDomain.waitSampling(10)
+      assert(IcacheArrayProbe.wayValid(dut.icache, 0, set),
+        f"line 0x$base%x did not land in WAY 0 of set $set; the fault path forces " +
+        s"s1Way := 0, so a resident line in any other way would let this test pass " +
+        s"vacuously (way 0 would simply be empty and read back as zero)")
+      assert(IcacheArrayProbe.wayPred(dut.icache, 0, set, 0) != 0,
+        "the resident line's predecode is all-zero, so this test cannot distinguish " +
+        "'fault masked it' from 'it was already zero'")
+
+      // ...then fault the SAME address, and require zeroed predecode anyway. Before M1b
+      // this came from the S1 capture bank being written all-zero on the fault path; now
+      // it must come from the explicit S1 fault mask (spec §5.1, 'Fault placeholder').
+      // Without that mask the speculatively-armed array read -- which is issued from
+      // page-invariant virtual bits and so still targets set 0 / beat 0 -- would deliver
+      // way 0's real, non-zero predecode straight out to the response.
+      xlate.logic.forceFault #= true
+      dut.clockDomain.waitSampling(2)
+      val rsp = IcacheFetchDriver.fetchAndWait(dut.icache, dut.probe, dut.clockDomain, base)
+      xlate.logic.forceFault #= false
+      assert(rsp.fault, s"the fetch did not fault: ${rsp.describe}")
+      for (k <- 0 until 4)
+        assert(rsp.pred(k) == 0,
+          s"faulting fetch delivered NON-ZERO predecode chunk $k = 0x${rsp.pred(k).toString(16)}; " +
+          s"the zeroed-predecode placeholder was lost when the S1 capture bank was deleted " +
+          s"(${rsp.describe})")
     }
   }
 
@@ -150,10 +179,12 @@ class IcacheUnifiedArraySpec extends AnyFunSuite {
       // sweep below re-derives every resident line's 64 bytes from the unified array's
       // low 256 bits per beat and compares against the backing-memory image, so a
       // mis-ordered `beatPred ## beatSrc` concatenation or an off-by-one write address
-      // shows up as a data mismatch rather than only as a predecode one.
-      // Fix 2 (Task 5 review): hit both beats of every line here too, for the same reason
-      // as oracle 4 above -- otherwise this sweep's own stimulus never exercises the
-      // high-beat data path either.
+      // shows up as a data mismatch. Because predecode and data are a SINGLE write of a
+      // SINGLE entry at a SINGLE address, this also carries the write-addressing half of
+      // the (now deleted) shadow oracle 4 -- see this file's header.
+      // Fix 2 (Task 5 review): hit both beats of every line. Each 64-byte line's low beat
+      // is at offset 0 and its high beat at +32; a purely 64-byte-aligned stimulus never
+      // sets s1Pc(5), leaving the high-beat path unexercised.
       val lines = (0 until 64).flatMap(i => Seq(0x1000L + i * 64, 0x1000L + i * 64 + 32))
       IcacheOrderOracle.runOrderedStream(
         cmdValid = dut.probe.logic.cmdIn.valid, cmdReady = dut.probe.logic.cmdIn.ready,

@@ -83,7 +83,7 @@ class FedSpecsPacketPairingSpec extends AnyFunSuite {
       // directly, while the `specs(i)` it is compared against were produced by the
       // PRODUCTION path, which consumed the plumbed `packets(i).size`. So any disagreement
       // between the precomputed size and the true size of the word it ships alongside —
-      // i.e. any break in the Lever B plumbing chain (I-cache predMem -> push preds ->
+      // i.e. any break in the Lever B plumbing chain (I-cache predecode array -> push preds ->
       // IBuf entries -> headPred -> Aligner slot0/slot1 -> raw -> fed) — falsifies the
       // comparison. Had this stayed `computeOffload`, both sides would read the same
       // carried `size` and a mis-plumbed value would cancel out unobserved.
@@ -209,7 +209,7 @@ class FedSpecsPacketPairingSpec extends AnyFunSuite {
           assert(!dut.probe.logic.sizeMismatch0.toBoolean,
             s"[$name] slot0: fed.payload.packets(0).size DISAGREES with " +
               "OperationDecoder.decode(packets(0).words(0)).size — FMax Lever B's precomputed " +
-              "size is MIS-PLUMBED (I-cache predMem -> push preds -> IBuf -> headPred -> " +
+              "size is MIS-PLUMBED (I-cache predecode array -> push preds -> IBuf -> headPred -> " +
               "Aligner -> raw -> fed): it does not describe the word it ships alongside")
           assert(!dut.probe.logic.sizeMismatch1.toBoolean,
             s"[$name] slot1: fed.payload.packets(1).size DISAGREES with " +

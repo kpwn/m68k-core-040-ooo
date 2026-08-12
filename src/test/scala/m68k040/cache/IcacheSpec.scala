@@ -724,7 +724,7 @@ class IcacheSpec extends AnyFunSuite {
   // (I-i) CRITICAL regression (review of 69a867c, "icache: wire xlate.rsp.cacheMode
   // into IcachePlugin"): that commit correctly gated tagMem/valids/victim-advance
   // under doAllocate for an INHIBITED-mode miss, but left the ACTUAL dataMem write
-  // (REFILL) and predMem write (PREDECODE) unconditional. The round-robin `victim`
+  // (REFILL) and predecode write (PREDECODE) unconditional. The round-robin `victim`
   // pointer is the SAME pointer used by cacheable and INHIBITED misses alike: once a
   // set has taken >=4 real allocations it wraps back onto a way that is CURRENTLY
   // VALID/resident for some OTHER address. An unconditional write there silently
@@ -736,7 +736,7 @@ class IcacheSpec extends AnyFunSuite {
   // cacheable lines (the round-robin victim pointer wraps back to way 0 after the
   // 4th fill), then trigger an INHIBITED-mode miss at a DIFFERENT address that maps
   // to the SAME set index (aliasing onto victimWay=0, way 0's resident way). Way 0's
-  // raw dataMem/predMem/tagMem/valid content must be byte-for-byte UNCHANGED
+  // raw data/predecode/tag/valid content must be byte-for-byte UNCHANGED
   // afterward -- not just that the inhibited fetch itself returned the right data,
   // but that the OTHER, unrelated way was left completely alone -- and a plain
   // re-fetch of the original way-0 address must still HIT (no new AR) with correct
@@ -767,7 +767,7 @@ class IcacheSpec extends AnyFunSuite {
       // the rest of addr mod 256 alongside the offset -- are, by construction,
       // identical between any two same-set addresses). So EVERY line-aligned
       // address in the same set reads back byte-IDENTICAL content under the
-      // default pattern, which would make a raw dataMem/predMem content
+      // default pattern, which would make a raw data/predecode content
       // comparison unable to distinguish "way 0 kept its original content" from
       // "way 0 was silently overwritten with a byte-identical INHIBITED line" --
       // masking the exact corruption this test exists to catch. Override each
@@ -835,7 +835,7 @@ class IcacheSpec extends AnyFunSuite {
     }
   }
 
-  // (I-j) CRITICAL regression (review of 156cf6b, "icache: gate dataMem/predMem
+  // (I-j) CRITICAL regression (review of 156cf6b, "icache: gate dataMem/predecode
   // writes under doAllocate, fix silent corruption"): 156cf6b's `refillAllocate`
   // gate is evaluated PER-BEAT, using `missBusFault`/`respErr` AS OF THAT BEAT. This
   // correctly suppresses the dataMem write for a beat that itself errors, and for
@@ -858,7 +858,7 @@ class IcacheSpec extends AnyFunSuite {
   // resp-injection hook at all) nor `AxiMemModel`'s `injectBusErrors` (address-decode
   // boundaries are all multiples of the 64-byte line size, so a decode-based
   // bad/good split can never fall strictly between one line's beat 0 and beat 1) can
-  // produce this specific per-beat pattern. Way 0's raw dataMem/tagMem/predMem/valid
+  // produce this specific per-beat pattern. Way 0's raw data/tag/predecode/valid
   // content must be byte-for-byte UNCHANGED afterward. FAILS against the pre-fix
   // (156cf6b) code (way 0's beat-0 dataMem half is corrupted); PASSES after the fix.
   test("beat-0-OK-then-beat-1-error mid-burst refill must not corrupt the aliased resident way", VerilatorTest) {
@@ -983,16 +983,22 @@ class IcacheSpec extends AnyFunSuite {
         .getOrElse(fail("no way became valid after a demand fill of set 0"))
 
       // Raw reads. M1a (Task 5): the data half now lives in the Unified Fetch Array's
-      // low 256 bits (`lineMem` replaced `dataMem`); `predMem` survives this commit as
-      // the shadow, so the predecode assertions below are a genuine CROSS-ARRAY
-      // equivalence check (unified inline field vs the array it replaces), not a
-      // self-comparison.
+      // low 256 bits (`lineMem` replaced `dataMem`). M1b (Task 6) deleted the separate
+      // predecode array, so the predecode half is read raw from the SAME entry's high
+      // bits. This test's job is unchanged and still meaningful: it pins the ADDRESSING
+      // AND SLICING inside `IcacheArrayProbe` (set*2+beat, and the 256-bit split point)
+      // against reads written out longhand at the call site. It is deliberately NOT a
+      // content oracle -- that was the shadow-array comparison, which cannot outlive the
+      // shadow (see IcacheUnifiedArraySpec's header for where its coverage went).
       val dataMask = (BigInt(1) << 256) - 1
-      val rawData0 = dut.icache.logic.lineMem(way).getBigInt(0) & dataMask
-      val rawData1 = dut.icache.logic.lineMem(way).getBigInt(1) & dataMask
+      val rawEntry0 = dut.icache.logic.lineMem(way).getBigInt(0)
+      val rawEntry1 = dut.icache.logic.lineMem(way).getBigInt(1)
+      val rawData0 = rawEntry0 & dataMask
+      val rawData1 = rawEntry1 & dataMask
       val rawTag   = dut.icache.logic.tagMem(way).getBigInt(0)
-      val rawPred  = dut.icache.logic.predMem(way).getBigInt(0)
       val predBits = dut.icache.logic.PRED_BITS_PER_BEAT
+      val rawPred0 = rawEntry0 >> 256
+      val rawPred1 = rawEntry1 >> 256
 
       assert(IcacheArrayProbe.wayData(dut.icache, way, 0, 0) == rawData0,
         s"wayData(beat 0) disagrees with lineMem($way).getBigInt(0)[255:0]")
@@ -1003,17 +1009,20 @@ class IcacheSpec extends AnyFunSuite {
       assert(IcacheArrayProbe.wayValid(dut.icache, way, 0),
         "wayValid disagrees with valids")
 
-      val mask = (BigInt(1) << predBits) - 1
-      assert(IcacheArrayProbe.wayPred(dut.icache, way, 0, 0) == (rawPred & mask),
-        "M1a: the unified array's beat-0 inline predecode is not the low half of the " +
-        "shadow predMem's line-granular entry")
-      assert(IcacheArrayProbe.wayPred(dut.icache, way, 0, 1) == ((rawPred >> predBits) & mask),
-        "M1a: the unified array's beat-1 inline predecode is not the high half of the " +
-        "shadow predMem's line-granular entry")
+      assert(rawPred0.bitLength <= predBits && rawPred1.bitLength <= predBits,
+        s"a unified-array entry is wider than 256 + PRED_BITS_PER_BEAT ($predBits) bits: " +
+        s"beat0 pred is ${rawPred0.bitLength} bits, beat1 pred is ${rawPred1.bitLength}")
+      assert(rawPred0 != 0 || rawPred1 != 0,
+        "both beats' inline predecode read back all-zero on a freshly filled line, so " +
+        "the assertions below cannot distinguish a correct slice from a dead one")
+      assert(IcacheArrayProbe.wayPred(dut.icache, way, 0, 0) == rawPred0,
+        s"wayPred(beat 0) disagrees with lineMem($way).getBigInt(0)[255+:$predBits]")
+      assert(IcacheArrayProbe.wayPred(dut.icache, way, 0, 1) == rawPred1,
+        s"wayPred(beat 1) disagrees with lineMem($way).getBigInt(1)[255+:$predBits]")
 
       val snap = IcacheArrayProbe.snapshotWay(dut.icache, way, 0)
       assert(snap.data == Seq(rawData0, rawData1), "snapshotWay.data disagrees")
-      assert(snap.pred == Seq(rawPred & mask, (rawPred >> predBits) & mask), "snapshotWay.pred disagrees")
+      assert(snap.pred == Seq(rawPred0, rawPred1), "snapshotWay.pred disagrees")
       assert(snap.tag == rawTag, "snapshotWay.tag disagrees")
       assert(snap.valid, "snapshotWay.valid disagrees")
 

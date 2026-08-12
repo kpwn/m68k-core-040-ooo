@@ -18,7 +18,7 @@ class ChunkPredecodeSpec extends AnyFunSuite {
       // Widened 6->8 bits (FMax "Lever B", 2026-08-08): added `size`, the 2-bit
       // `OperationDecoder.decode(op).size` baked at REFILL time so DecodeStage need not
       // re-derive it in series with the destination-EA decode. This width is what drives
-      // `IcachePlugin`'s `predMem` from 192 to 256 bits per line/way (the plugin itself
+      // `IcachePlugin`'s per-line predecode storage from 192 to 256 bits per way (the plugin itself
       // needs no edit — every width there derives from `ChunkPredecode().getBitsWidth`).
       assert(c.size.getBitsWidth == 2)
       assert(c.asBits.getWidth == 8)

@@ -28,11 +28,24 @@ class ICacheModeTranslationPlugin extends FiberPlugin with TranslationService {
     val cmodeVpn = Reg(UInt(20 bits)) init 0; cmodeVpn.simPublic(); cmodeVpn := cmodeVpn
     val cmodeSel = Reg(CacheMode()) init CacheMode.INHIBITED
     cmodeSel.simPublic(); cmodeSel := cmodeSel
+    // M1b (Task 6): SIM-POKEABLE TRANSLATION-FAULT injection. The plan's Task 6 Step 1
+    // called for a `forceFault` field on this stub; there was none -- this plugin had no
+    // fault path at all (`_rsp.fault := False` unconditionally) and no other I-side test
+    // translation stub exists. Added here rather than as a fourth translation plugin,
+    // mirroring the cmode knobs' exact shape. Defaults False, so every existing user of
+    // this stub is bit-identical to before.
+    //
+    // Deliberately NOT VPN-qualified (unlike `cmodeEn`): its consumer needs to fault an
+    // address that is ALREADY RESIDENT with non-zero predecode, so the interesting case
+    // is "the same VPN that was just filled cleanly", i.e. a global toggle is both
+    // simpler and exactly what is wanted.
+    val forceFault = RegInit(False); forceFault.simPublic(); forceFault := forceFault
+
     val hit = cmodeEn && (_req.vpn === cmodeVpn)
 
     _rsp.ready     := True
     _rsp.ppn       := _req.vpn
     _rsp.cacheMode := Mux(hit, cmodeSel, CacheMode.WRITETHROUGH)
-    _rsp.fault     := False
+    _rsp.fault     := forceFault
   }
 }
