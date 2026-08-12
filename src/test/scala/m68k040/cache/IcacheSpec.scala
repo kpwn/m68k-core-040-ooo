@@ -324,7 +324,7 @@ class IcacheSpec extends AnyFunSuite {
         s"racing refill must still deliver correct data: got 0x${got.toString(16)} expected 0x${IcacheSim.window64(pc).toString(16)}")
 
       // THE ASSERTION: the line must NOT be left resident. Pre-fix this read True.
-      assert(!dut.icache.logic.valids(way)(set).toBoolean,
+      assert(!IcacheArrayProbe.wayValid(dut.icache, way, set),
         s"invalidateAll fired on the refill's own commit cycle but valids($way)($set) is still set -- " +
           "the refill's write won over the priority clear (elaboration-order race)")
 
@@ -335,7 +335,7 @@ class IcacheSpec extends AnyFunSuite {
       cd.waitSampling(4)
       assert(got2 == IcacheSim.window64(pc),
         s"post-race refetch data mismatch: got 0x${got2.toString(16)} expected 0x${IcacheSim.window64(pc).toString(16)}")
-      assert((0 until 4).exists(w => dut.icache.logic.valids(w)(set).toBoolean),
+      assert((0 until 4).exists(w => IcacheArrayProbe.wayValid(dut.icache, w, set)),
         s"positive control: an unraced refill of 0x${pc.toHexString} must leave set $set resident in some way")
     }
   }
@@ -804,14 +804,9 @@ class IcacheSpec extends AnyFunSuite {
       val arAfterWarm = arCount
       assert(arAfterWarm == 4, s"4 distinct-tag warm fetches must each refill once: $arAfterWarm")
 
-      // Snapshot way 0's raw array content BEFORE the INHIBITED miss. Set index 0:
-      // dataMem address = set*beatsPerLine + beat (0 and 1); tagMem/predMem address
-      // = set (0).
-      val way0DataBefore  = Seq(0, 1).map(b => dut.icache.logic.dataMem(0).getBigInt(b))
-      val way0TagBefore   = dut.icache.logic.tagMem(0).getBigInt(0)
-      val way0PredBefore  = dut.icache.logic.predMem(0).getBigInt(0)
-      val way0ValidBefore = dut.icache.logic.valids(0)(0).toBoolean
-      assert(way0ValidBefore, "way 0 must be resident/valid after the warm fetches")
+      // Snapshot way 0's raw array content BEFORE the INHIBITED miss (set index 0).
+      val way0Before = IcacheArrayProbe.snapshotWay(dut.icache, 0, 0)
+      assert(way0Before.valid, "way 0 must be resident/valid after the warm fetches")
 
       // Trigger an INHIBITED-mode miss to a DIFFERENT address that maps to the SAME
       // set (low 12 bits still 0 -> set index 0), aliasing onto victimWay=0.
@@ -823,18 +818,8 @@ class IcacheSpec extends AnyFunSuite {
       assert(arAfterInhibited == arAfterWarm + 1, s"inhibited fetch must refill once: $arAfterWarm -> $arAfterInhibited")
 
       // THE regression check: way 0's raw array content must be COMPLETELY UNCHANGED.
-      val way0DataAfter  = Seq(0, 1).map(b => dut.icache.logic.dataMem(0).getBigInt(b))
-      val way0TagAfter   = dut.icache.logic.tagMem(0).getBigInt(0)
-      val way0PredAfter  = dut.icache.logic.predMem(0).getBigInt(0)
-      val way0ValidAfter = dut.icache.logic.valids(0)(0).toBoolean
-
-      assert(way0DataAfter == way0DataBefore,
-        s"way 0 dataMem CORRUPTED by an unrelated INHIBITED miss: before=$way0DataBefore after=$way0DataAfter")
-      assert(way0TagAfter == way0TagBefore,
-        s"way 0 tagMem changed: before=0x${way0TagBefore.toString(16)} after=0x${way0TagAfter.toString(16)}")
-      assert(way0PredAfter == way0PredBefore,
-        s"way 0 predMem CORRUPTED by an unrelated INHIBITED miss: before=0x${way0PredBefore.toString(16)} after=0x${way0PredAfter.toString(16)}")
-      assert(way0ValidAfter == way0ValidBefore, "way 0 valid bit must be unaffected by the INHIBITED miss")
+      val way0After = IcacheArrayProbe.snapshotWay(dut.icache, 0, 0)
+      IcacheArrayProbe.assertUnchanged(way0Before, way0After, "way 0 after an unrelated INHIBITED miss")
 
       // Extra correctness check: a plain re-fetch of the ORIGINAL way-0 address must
       // still HIT (no new AR) and return the correct, unpoisoned data.
@@ -928,14 +913,9 @@ class IcacheSpec extends AnyFunSuite {
       val arAfterWarm = arCount
       assert(arAfterWarm == 4, s"4 distinct-tag warm fetches must each refill once: $arAfterWarm")
 
-      // Snapshot way 0's raw array content BEFORE the faulting refill. Set index 0:
-      // dataMem address = set*beatsPerLine + beat (0 and 1); tagMem/predMem address =
-      // set (0).
-      val way0DataBefore  = Seq(0, 1).map(b => dut.icache.logic.dataMem(0).getBigInt(b))
-      val way0TagBefore   = dut.icache.logic.tagMem(0).getBigInt(0)
-      val way0PredBefore  = dut.icache.logic.predMem(0).getBigInt(0)
-      val way0ValidBefore = dut.icache.logic.valids(0)(0).toBoolean
-      assert(way0ValidBefore, "way 0 must be resident/valid after the warm fetches")
+      // Snapshot way 0's raw array content BEFORE the faulting refill (set index 0).
+      val way0Before = IcacheArrayProbe.snapshotWay(dut.icache, 0, 0)
+      assert(way0Before.valid, "way 0 must be resident/valid after the warm fetches")
 
       // Arm beat 1 (the LAST beat) of the upcoming refill at faultBase to DECERR;
       // beat 0 returns OKAY with the real 0x77 data.
@@ -956,18 +936,9 @@ class IcacheSpec extends AnyFunSuite {
       // THE regression check: way 0's raw array content must be COMPLETELY
       // UNCHANGED, in particular its beat-0 half (the one 156cf6b's per-beat gate
       // does NOT protect against this ordering).
-      val way0DataAfter  = Seq(0, 1).map(b => dut.icache.logic.dataMem(0).getBigInt(b))
-      val way0TagAfter   = dut.icache.logic.tagMem(0).getBigInt(0)
-      val way0PredAfter  = dut.icache.logic.predMem(0).getBigInt(0)
-      val way0ValidAfter = dut.icache.logic.valids(0)(0).toBoolean
-
-      assert(way0DataAfter == way0DataBefore,
-        s"way 0 dataMem CORRUPTED by a mid-burst (beat-0-OK, beat-1-error) refill: before=$way0DataBefore after=$way0DataAfter")
-      assert(way0TagAfter == way0TagBefore,
-        s"way 0 tagMem changed: before=0x${way0TagBefore.toString(16)} after=0x${way0TagAfter.toString(16)}")
-      assert(way0PredAfter == way0PredBefore,
-        s"way 0 predMem CORRUPTED by a mid-burst error refill: before=0x${way0PredBefore.toString(16)} after=0x${way0PredAfter.toString(16)}")
-      assert(way0ValidAfter == way0ValidBefore, "way 0 valid bit must be unaffected by the mid-burst error refill")
+      val way0After = IcacheArrayProbe.snapshotWay(dut.icache, 0, 0)
+      IcacheArrayProbe.assertUnchanged(way0Before, way0After,
+        "way 0 after a mid-burst (beat-0-OK, beat-1-error) refill")
 
       // Extra correctness check: a plain re-fetch of the ORIGINAL way-0 address must
       // still HIT (no new AR) and return the correct, unpoisoned data.
@@ -977,6 +948,67 @@ class IcacheSpec extends AnyFunSuite {
         s"way-0 address must still return correct (unpoisoned) data after the mid-burst-error alias: got 0x${got0.toString(16)}")
       assert(arCount == arBeforeRefetch,
         s"way-0 address must still HIT (no new AR): $arBeforeRefetch -> $arCount")
+
+      cd.waitSampling(4)
+    }
+  }
+
+  // Task 3 (plan R5 mitigation): pins IcacheArrayProbe against the OLD RTL, so the
+  // helper is proven equivalent to the raw reads it replaces BEFORE M1/M2 change the
+  // array shapes underneath it. If this test and the raw reads ever disagree, the
+  // helper is wrong and every corruption assertion built on it is worthless.
+  test("IcacheArrayProbe agrees with raw array reads on a freshly filled line", VerilatorTest) {
+    simConfig.compile(new Dut).doSim("array-probe-selftest") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      // Keep prefetch out of the way -- see the identical fork in every other test in
+      // this file for why this must be a non-blocking re-poke, not a single early one.
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
+
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      pulseInvalidateAll(dut, cd)
+
+      // Fetch address 0x1000 -> set 0, both beats installed by the refill.
+      val pc = 0x1000L
+      val got = fetch(dut, cd, pc)
+      assert(got == IcacheSim.window64(pc), "sanity: the fetch itself must return correct data")
+      cd.waitSampling(5)
+
+      val way = (0 until 4).find(w => dut.icache.logic.valids(w)(0).toBoolean)
+        .getOrElse(fail("no way became valid after a demand fill of set 0"))
+
+      // Raw reads, exactly as the pre-Task-3 tests did them.
+      val rawData0 = dut.icache.logic.dataMem(way).getBigInt(0)
+      val rawData1 = dut.icache.logic.dataMem(way).getBigInt(1)
+      val rawTag   = dut.icache.logic.tagMem(way).getBigInt(0)
+      val rawPred  = dut.icache.logic.predMem(way).getBigInt(0)
+      val predBits = dut.icache.logic.PRED_BITS_PER_BEAT
+
+      assert(IcacheArrayProbe.wayData(dut.icache, way, 0, 0) == rawData0,
+        s"wayData(beat 0) disagrees with dataMem($way).getBigInt(0)")
+      assert(IcacheArrayProbe.wayData(dut.icache, way, 0, 1) == rawData1,
+        s"wayData(beat 1) disagrees with dataMem($way).getBigInt(1)")
+      assert(IcacheArrayProbe.wayTag(dut.icache, way, 0) == rawTag,
+        s"wayTag disagrees with tagMem($way).getBigInt(0)")
+      assert(IcacheArrayProbe.wayValid(dut.icache, way, 0),
+        "wayValid disagrees with valids")
+
+      val mask = (BigInt(1) << predBits) - 1
+      assert(IcacheArrayProbe.wayPred(dut.icache, way, 0, 0) == (rawPred & mask),
+        "wayPred(beat 0) is not the low half of the line-granular predMem entry")
+      assert(IcacheArrayProbe.wayPred(dut.icache, way, 0, 1) == ((rawPred >> predBits) & mask),
+        "wayPred(beat 1) is not the high half of the line-granular predMem entry")
+
+      val snap = IcacheArrayProbe.snapshotWay(dut.icache, way, 0)
+      assert(snap.data == Seq(rawData0, rawData1), "snapshotWay.data disagrees")
+      assert(snap.pred == Seq(rawPred & mask, (rawPred >> predBits) & mask), "snapshotWay.pred disagrees")
+      assert(snap.tag == rawTag, "snapshotWay.tag disagrees")
+      assert(snap.valid, "snapshotWay.valid disagrees")
 
       cd.waitSampling(4)
     }
