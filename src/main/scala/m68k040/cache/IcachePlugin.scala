@@ -150,9 +150,29 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // line, so the single classify group is 16 wide and is used TWICE per refill.
     val WORDS_PER_BEAT     = 16
     val PRED_BITS_PER_BEAT = PRED_BITS_PER_WORD * WORDS_PER_BEAT
+    // M1a (Task 5) TRANSITIONAL SHADOW. `predMem` is kept alive, written exactly as
+    // before, purely so the Unified Fetch Array below can be proven bit-for-bit
+    // equivalent to the array it replaces, on the real fill/read path, over the whole
+    // test suite (design spec §12.1 oracle 4, in its strong form). M1b (Task 6) deletes
+    // it together with `s1PredEntries`/`predAccumLo`/`dbgUfaPredMatch`.
     val predMem = Seq.fill(ways)(Mem(Bits(PRED_BITS_PER_LINE bits), sets))
-    // Data: synchronous-read BRAM. 2 beats x 64 sets = 128 entries per way.
-    val dataMem = Seq.fill(ways)(Mem(Bits(256 bits), sets * beatsPerLine))
+
+    // ---- M1: the Unified Fetch Array ----------------------------------------
+    // ONE synchronous array per way carries a beat's 256 instruction bits AND that
+    // beat's PRED_BITS_PER_BEAT bits of per-word predecode. Replaces the old
+    // {dataMem (sync BRAM), predMem (async LUTRAM, whole-line, 2 read ports)} pair.
+    //
+    // WHY (design spec §5.1). predMem's line-granular async read forced all four ways'
+    // whole PRED_BITS_PER_LINE-bit entries to be captured into `s1PredEntries` --
+    // 4 x 256 = 1,024 flops, whose clock enable was `cmdPort.fire` (ITLB mux -> async
+    // LUTRAM read -> 20-bit compare -> answerable). synth/floorplan_frontend.xdc records
+    // that arc as EVERY ONE of the worst 300 unique failing endpoints on the pinned
+    // routed checkpoint. Beat-granular storage makes the predecode address ALREADY the
+    // address the data array uses, so the capture bank has no reason to exist.
+    //
+    // 2 beats x 64 sets = 128 entries per way, synchronous read (BRAM).
+    val UFA_W   = 256 + PRED_BITS_PER_BEAT
+    val lineMem = Seq.fill(ways)(Mem(Bits(UFA_W bits), sets * beatsPerLine))
     // Valid bits: register array, cleared by invalidateAll
     val valids  = Vec.fill(ways)(Vec.fill(sets)(RegInit(False)))
     // Round-robin victim pointer per set
@@ -167,7 +187,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // ldS1Valid/stS2Valid.simPublic() DEBUG hooks): exposes the raw shared arrays
     // for a directed test to assert an UNRELATED way's tag/data/pred content is
     // byte-for-byte unchanged by a same-set INHIBITED miss. No-op for synthesis.
-    for (w <- 0 until ways) { tagMem(w).simPublic(); predMem(w).simPublic(); dataMem(w).simPublic() }
+    for (w <- 0 until ways) { tagMem(w).simPublic(); predMem(w).simPublic(); lineMem(w).simPublic() }
     valids.simPublic()
 
     // ---- invalidateAll: priority clear of all valid bits ----
@@ -200,8 +220,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val beatCnt   = Reg(UInt(1 bits)) init U(0, 1 bits)
     val arSent    = Reg(Bool()) init False
     val lineReg   = Reg(Bits(512 bits))
-    // Task icache-burst-fault-fix: PREDECODE's dataMem commit-beat phase — which
-    // half of `lineReg` (and which dataMem address) the SINGLE write-port commit is
+    // Task icache-burst-fault-fix: PREDECODE's lineMem commit-beat phase — which
+    // half of `lineReg` (and which lineMem address) the SINGLE write-port commit is
     // targeting THIS cycle of PREDECODE's 2-cycle dwell. See PREDECODE below for why
     // this must stay a single write-port/single-call-site design (SpinalHDL's
     // multi-write-Mem blackboxing broke on a two-call-site version of this fix).
@@ -215,7 +235,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val missBusFault = Reg(Bool()) init False
     // Task icache-corruption-fix (review of 69a867c, "icache: wire xlate.rsp.cacheMode
     // into IcachePlugin"): that commit correctly gated tagMem/valids/victim-advance
-    // under doAllocate for an INHIBITED-mode miss, but left the ACTUAL dataMem/predMem
+    // under doAllocate for an INHIBITED-mode miss, but left the ACTUAL lineMem/predMem
     // writes to the shared per-way arrays unconditional. The round-robin `victim`
     // pointer is the SAME pointer used by cacheable and INHIBITED misses alike — once
     // a set has taken >=4 real allocations it cycles back onto a way that is still
@@ -224,7 +244,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // untouched (still claiming the OLD address is validly resident) -> the next
     // ordinary fetch to that address silently returns the WRONG bytes. Fix mirrors
     // DcachePlugin's `missLine`/`inhibitedResp` direct-delivery pattern exactly:
-    // dataMem's write is now gated (REFILL, below) and `lineReg` (already latched
+    // lineMem's write is now gated (REFILL, below) and `lineReg` (already latched
     // UNCONDITIONALLY every REFILL beat) doubles as the data-side direct-delivery
     // source; `missPred` is the NEW predecode-side counterpart, latched UNCONDITIONALLY
     // in PREDECODE below so REPLAY can deliver an INHIBITED line's predecode straight
@@ -293,21 +313,39 @@ class IcachePlugin extends FiberPlugin with FetchService {
     pfArSent.simPublic()
     pfComplete.simPublic()
 
-    // ---- shared data-array read port (synchronous; BRAM) ----
-    // Address+enable are driven by the FSM (IDLE hit accept, or REPLAY). The
-    // result `dataBeat` is the registered BRAM output, valid the NEXT cycle.
-    val dataReadAddr = UInt((setBits + 1) bits)
-    val dataReadEn   = Bool()
-    dataReadEn.simPublic()
+    // ---- shared unified-array read port (synchronous; BRAM) ----
+    // Address+enable are driven by the FSM (IDLE hit accept, or REPLAY), from
+    // PAGE-INVARIANT virtual bits only. The result `ufaBeat` is the registered memory
+    // output, valid the NEXT cycle.
+    val ufaReadAddr = UInt((setBits + 1) bits)
+    val ufaReadEn   = Bool()
+    ufaReadEn.simPublic()
     val xlateReadyDbg = Bool()
     xlateReadyDbg := xlate.rsp.ready
     xlateReadyDbg.simPublic()
-    dataReadAddr := U(0, (setBits + 1) bits)
-    dataReadEn   := False
-    val dataBeat = Vec(dataMem.map(_.readSync(dataReadAddr, dataReadEn)))
+    ufaReadAddr := U(0, (setBits + 1) bits)
+    ufaReadEn   := False
+    val ufaBeat = Vec(lineMem.map(_.readSync(ufaReadAddr, ufaReadEn)))
+    // Spec §4.3 N-3 / GC-7: the RAM output register IS the pipeline register.
+    // KeepAttribute stops synthesis replicating it or absorbing it back into fabric --
+    // if it does, M1 delivers nothing and lineReg/s1PredEntries have been re-created
+    // under different names. VERIFIED in the emitted netlist: each `ufaBeat_w` carries
+    // `(* keep, syn_keep *)`. Note it lands on the WIRE that aliases the inferred RAM's
+    // output register (`lineMem_w_spinal_port0`), not on that register's declaration --
+    // enough to stop the net being optimised through, but the actual "did the output
+    // register stay inside the BRAM" question is only answerable at the Task 16 synth
+    // gate, which GC-1 defers.
+    ufaBeat.foreach(b => KeepAttribute(b))
+    def ufaData(w: Int): Bits = ufaBeat(w)(255 downto 0)
+    def ufaPred(w: Int): Bits = ufaBeat(w)(UFA_W - 1 downto 256)
+    // Task 5 transitional: `s1Way` is still a registered UInt here (M3/Task 11 replaces
+    // it with a one-hot). Vec-index the per-way slices so the existing S1 mux keeps its
+    // exact shape.
+    val ufaDataVec = Vec((0 until ways).map(w => ufaData(w)))
+    val ufaPredVec = Vec((0 until ways).map(w => ufaPred(w)))
 
     // ---- S1 (response-build) pipeline registers ----
-    // The cycle after a read is launched, dataBeat is ready: mux by the latched
+    // The cycle after a read is launched, ufaBeat is ready: mux by the latched
     // hit-way, lane-select, and register into the rsp output stage below.
     val s1Valid = Reg(Bool()) init False
     val s1Way   = Reg(UInt(wayBits bits))
@@ -321,14 +359,14 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // FMax: register the RAW per-way predMem entries (the readAsync results, indexed
     // by the page-invariant set bits — NOT a hit-way select), and defer the way-mux +
     // window-decode to the S1->rsp stage keyed off the REGISTERED s1Way. This mirrors
-    // the data path (s1Beat = dataBeat(s1Way)) and keeps the hitWayIdx/predMem way-mux
+    // the data path (s1Beat = ufaDataVec(s1Way)) and keeps the hitWayIdx/predMem way-mux
     // + windowPred OUT of the IDLE consume cone (which was the route-dominated arc into
     // s1Pred). A fault placeholder registers all-zero entries (windowPred of zero = a
     // zeroed predecode, matching the old getZero placeholder).
     val s1PredEntries = Reg(Vec(Bits(PRED_BITS_PER_LINE bits), ways))
     // Task icache-corruption-fix: True only for a REPLAY of a non-allocated
     // (INHIBITED-mode) miss — routes the S1->rsp mux below to deliver straight from
-    // the `lineReg`/`missPred` bypass registers instead of `dataBeat`/`s1PredEntries`
+    // the `lineReg`/`missPred` bypass registers instead of `ufaBeat`/`s1PredEntries`
     // (the shared arrays, which were never written for that case). Explicitly set at
     // EVERY s1Valid-arming site (mirrors s1Fault/s1Atc), never left to a stale value.
     val s1FromMiss = Reg(Bool())
@@ -361,7 +399,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
       * NOW: ONE 16-instance group, elaborated once and USED TWICE — on PREDECODE's
       * commitBeat==0 cycle for the low beat and on its commitBeat==1 cycle for the
       * high beat. PREDECODE already dwelt exactly 2 cycles (the single-write-port
-      * dataMem commit, see below), so this is a **2x instance cut at exactly today's
+      * lineMem commit, see below), so this is a **2x instance cut at exactly today's
       * latency** — no extra cycle anywhere.
       *
       * DEVIATION FROM THE PLAN, RECORDED DELIBERATELY: the ratified plan's I2 section
@@ -372,7 +410,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
       * under, so the recomputed figures for today's 256-bit / 2-beat geometry are:
       * **32 -> 16 instances (2x, the design doc's original I-b number)** and `lineReg`
       * RETAINED. `lineReg` cannot be deleted at 2 beats/line: the icache-burst-fault
-      * fix requires the dataMem commit to be DEFERRED until the whole burst's pass/fail
+      * fix requires the lineMem commit to be DEFERRED until the whole burst's pass/fail
       * is known, so both beats must still be held somewhere, and it doubles as the
       * INHIBITED direct-delivery source (`missDataBeat`). The only added state is
       * `predAccumLo` (one beat's worth of predecode, held one cycle).
@@ -427,9 +465,48 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // the same half REPLAY's array-based `replayBeatSel` would have (s1Pc(5), s1Pc
     // already holds missPC here).
     val missDataBeat = Mux(s1Pc(5), lineReg(511 downto 256), lineReg(255 downto 0))
-    val s1Beat   = Mux(s1FromMiss, missDataBeat, dataBeat(s1Way))
+    val s1Beat   = Mux(s1FromMiss, missDataBeat, ufaDataVec(s1Way))
     val s1Window = s1Beat.subdivideIn(64 bits)(s1Lane)
     val s1PredW  = Mux(s1FromMiss, windowPred(missPred, s1Pc), windowPred(s1PredEntries(s1Way), s1Pc))
+
+    // ---- Task 5 (M1a) TRANSITIONAL: unified-array vs shadow-predMem equivalence ----
+    // Design spec §12.1 oracle 4, in its STRONG form: rather than re-deriving
+    // PredecodeWord.classify in a testbench, compare the predecode the NEW array
+    // actually STORED against the predecode the OLD array actually STORED, for the same
+    // (way, set, beat), read back through the two arrays' own (physically different,
+    // sync-BRAM vs async-LUTRAM) read paths, on every real S1 delivery.
+    //
+    // WHY HERE AND NOT AT THE WRITE SITE. The plan's literal text places this check
+    // beside `packedPred`, comparing `packedPred`'s halves against `beatPred` /
+    // `predAccumLo`. But `packedPred` is *assigned from* exactly those two signals a
+    // few lines above, so that comparison is a tautology -- precisely the "decoration"
+    // the plan itself warns against. Any write-site comparison is structurally
+    // tautological here, because both arrays are fed by the same combinational
+    // expression in the same block. Only a READ-BACK comparison is capable of failing,
+    // so that is what this is: `ufaPredVec(s1Way)` is the unified array's inline field
+    // for the beat S1 is delivering, and `s1PredEntries(s1Way)` is the shadow predMem's
+    // whole-line entry captured for the same way/set -- sliced here by the same beat
+    // selector, s1Pc(5), that addressed the unified array. It catches a wrong write
+    // address, a wrong beat half, a mis-ordered concatenation, a dropped write, and a
+    // stale/torn entry -- none of which a write-site equality could see.
+    //
+    // Exempt cases (nothing to compare, by construction):
+    //   !s1Valid                       -- no delivery this cycle
+    //   s1Fault                        -- s1PredEntries is forced all-zero, the arrays
+    //                                     were not read for content
+    //   s1FromMiss                     -- INHIBITED/poisoned miss: NEITHER array was
+    //                                     written for this line; the response comes
+    //                                     from the `missPred`/`lineReg` bypass
+    // Combinational, drives only a simPublic wire (synthesis trims it); deleted
+    // together with `predMem` and `s1PredEntries` in M1b (Task 6).
+    val dbgShadowPredBeat = Mux(s1Pc(5),
+      s1PredEntries(s1Way)(PRED_BITS_PER_LINE - 1 downto PRED_BITS_PER_BEAT),
+      s1PredEntries(s1Way)(PRED_BITS_PER_BEAT - 1 downto 0))
+    val dbgUfaPredMatch = Bool()
+    dbgUfaPredMatch := !(s1Valid && !s1Fault && !s1FromMiss) ||
+                       (ufaPredVec(s1Way) === dbgShadowPredBeat)
+    dbgUfaPredMatch.simPublic()
+
     rspValidReg := s1Valid
     rspPcReg    := s1Pc
     rspDataReg  := s1Window
@@ -648,8 +725,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // miss/fault/held command are harmless because no S1 context consumes them.
         val setBlocked = if (canStartFill) False
                          else (fillArrayWrActive && (lookupSet === missSet))
-        dataReadAddr := lookupReadAddr
-        dataReadEn   := cmdPort.valid && !setBlocked
+        ufaReadAddr := lookupReadAddr
+        ufaReadEn   := cmdPort.valid && !setBlocked
 
         // IDLE may accept any resolved command, including the demand miss it captures.
         // During a prefetch fill, only an answerable hit/fault may fire; a miss remains
@@ -744,7 +821,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
       // ----- FAULT: deliver a one-shot bus-error fault response; no allocation -----
       // Task #211: reached only via REFILL's non-OKAY AXI response. PREDECODE (the
-      // tag/pred/valid/dataMem writes) is skipped entirely — no line is allocated,
+      // tag/valid/lineMem writes) is skipped entirely — no line is allocated,
       // matching the D-side no-allocate-on-error policy — and the victim pointer is
       // NOT advanced (this way was never actually filled). A PREFETCH burst error never
       // comes here (rule P2, above): it has no waiting fetch to fault.
@@ -762,7 +839,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
       // ----- PREDECODE / PF_PRED: classify the line, write predMem + tag/valid -----
       // Body hoisted to the shared `predActive` datapath below the FSM (single
-      // `dataMem(w).write(...)` / `predMem(w).write(...)` / `tagMem(w).write(...)` call
+      // `lineMem(w).write(...)` / `predMem(w).write(...)` / `tagMem(w).write(...)` call
       // site each -- see the icache-burst-fault-fix comment there for why a SECOND call
       // site is not merely untidy but breaks SpinalHDL's MultiPortWritesSymplifier).
       PREDECODE.whenIsActive {
@@ -794,8 +871,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
         val replayReadAddr = (missSet ## replayBeatSel).asUInt
         val replayPredEntry = Vec(predMem.map(_.readAsync(missSet)))
 
-        dataReadAddr := replayReadAddr
-        dataReadEn   := True
+        ufaReadAddr := replayReadAddr
+        ufaReadEn   := True
         s1Valid := True
         s1Way   := victimWay
         s1Pc    := missPC
@@ -806,8 +883,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
         s1Fault := False
         s1Atc   := False
         s1Lane  := missPC(4 downto 3)
-        // Task icache-corruption-fix: `replayPredEntry`/`dataBeat` (armed via
-        // dataReadAddr/dataReadEn above) only hold meaningful content when the line
+        // Task icache-corruption-fix: `replayPredEntry`/`ufaBeat` (armed via
+        // ufaReadAddr/ufaReadEn above) only hold meaningful content when the line
         // was actually allocated (missCacheable) — for a non-allocated (INHIBITED)
         // miss neither array was written THIS refill and may still hold stale,
         // unrelated content left by a prior allocation to this same way/set.
@@ -1041,8 +1118,14 @@ class IcachePlugin extends FiberPlugin with FetchService {
       when(doAllocate) {
         for (w <- 0 until ways) {
           when(victimWay === U(w, wayBits bits)) {
-            dataMem(w).write((missSet ## commitBeat).asUInt,
-              Mux(isLoBeat, lineReg(255 downto 0), lineReg(511 downto 256)))
+            // M1: ONE write, ONE call site (a SECOND Mem.write call site breaks
+            // SpinalHDL's MultiPortWritesSymplifier -- a real previously-shipped
+            // breakage in this file, see the icache-burst-fault-fix note above). The
+            // entry is {beat predecode, beat data}, at exactly the address and on
+            // exactly the cycle the old data-only write used. `beatSrc` is literally
+            // the expression the old write inlined, so the data half is unchanged by
+            // construction.
+            lineMem(w).write((missSet ## commitBeat).asUInt, beatPred ## beatSrc)
           }
         }
       }

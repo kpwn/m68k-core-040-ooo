@@ -168,7 +168,7 @@ class IcacheParallelViptSpec extends AnyFunSuite {
         if (dut.probe.logic.rspOut.valid.toBoolean) rspCount += 1
         if (dut.probe.logic.cmdIn.valid.toBoolean && !dut.ic.logic.xlateReadyDbg.toBoolean) {
           coldUnresolvedCycles += 1
-          assert(dut.ic.logic.dataReadEn.toBoolean,
+          assert(dut.ic.logic.ufaReadEn.toBoolean,
             "VIPT data-array read was gated by unresolved ITLB response")
         }
       }

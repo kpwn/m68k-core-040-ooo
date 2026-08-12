@@ -982,17 +982,22 @@ class IcacheSpec extends AnyFunSuite {
       val way = (0 until 4).find(w => dut.icache.logic.valids(w)(0).toBoolean)
         .getOrElse(fail("no way became valid after a demand fill of set 0"))
 
-      // Raw reads, exactly as the pre-Task-3 tests did them.
-      val rawData0 = dut.icache.logic.dataMem(way).getBigInt(0)
-      val rawData1 = dut.icache.logic.dataMem(way).getBigInt(1)
+      // Raw reads. M1a (Task 5): the data half now lives in the Unified Fetch Array's
+      // low 256 bits (`lineMem` replaced `dataMem`); `predMem` survives this commit as
+      // the shadow, so the predecode assertions below are a genuine CROSS-ARRAY
+      // equivalence check (unified inline field vs the array it replaces), not a
+      // self-comparison.
+      val dataMask = (BigInt(1) << 256) - 1
+      val rawData0 = dut.icache.logic.lineMem(way).getBigInt(0) & dataMask
+      val rawData1 = dut.icache.logic.lineMem(way).getBigInt(1) & dataMask
       val rawTag   = dut.icache.logic.tagMem(way).getBigInt(0)
       val rawPred  = dut.icache.logic.predMem(way).getBigInt(0)
       val predBits = dut.icache.logic.PRED_BITS_PER_BEAT
 
       assert(IcacheArrayProbe.wayData(dut.icache, way, 0, 0) == rawData0,
-        s"wayData(beat 0) disagrees with dataMem($way).getBigInt(0)")
+        s"wayData(beat 0) disagrees with lineMem($way).getBigInt(0)[255:0]")
       assert(IcacheArrayProbe.wayData(dut.icache, way, 0, 1) == rawData1,
-        s"wayData(beat 1) disagrees with dataMem($way).getBigInt(1)")
+        s"wayData(beat 1) disagrees with lineMem($way).getBigInt(1)[255:0]")
       assert(IcacheArrayProbe.wayTag(dut.icache, way, 0) == rawTag,
         s"wayTag disagrees with tagMem($way).getBigInt(0)")
       assert(IcacheArrayProbe.wayValid(dut.icache, way, 0),
@@ -1000,9 +1005,11 @@ class IcacheSpec extends AnyFunSuite {
 
       val mask = (BigInt(1) << predBits) - 1
       assert(IcacheArrayProbe.wayPred(dut.icache, way, 0, 0) == (rawPred & mask),
-        "wayPred(beat 0) is not the low half of the line-granular predMem entry")
+        "M1a: the unified array's beat-0 inline predecode is not the low half of the " +
+        "shadow predMem's line-granular entry")
       assert(IcacheArrayProbe.wayPred(dut.icache, way, 0, 1) == ((rawPred >> predBits) & mask),
-        "wayPred(beat 1) is not the high half of the line-granular predMem entry")
+        "M1a: the unified array's beat-1 inline predecode is not the high half of the " +
+        "shadow predMem's line-granular entry")
 
       val snap = IcacheArrayProbe.snapshotWay(dut.icache, way, 0)
       assert(snap.data == Seq(rawData0, rawData1), "snapshotWay.data disagrees")

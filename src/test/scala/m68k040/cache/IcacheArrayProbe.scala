@@ -28,18 +28,31 @@ object IcacheArrayProbe {
       s"tag=0x${tag.toString(16)} valid=$valid"
   }
 
-  /** 256-bit instruction-byte content of one beat of one (way, set). */
+  /** 256-bit instruction-byte content of one beat of one (way, set).
+    * M1a: reads the Unified Fetch Array's low 256 bits (`lineMem` replaced `dataMem`). */
   def wayData(ic: IcachePlugin, way: Int, set: Int, beat: Int): BigInt = {
     require(beat == 0 || beat == 1, s"beat must be 0 or 1, got $beat")
-    ic.logic.dataMem(way).getBigInt(set * 2 + beat)
+    val entry = ic.logic.lineMem(way).getBigInt(set * 2 + beat)
+    entry & ((BigInt(1) << 256) - 1)
   }
 
-  /** PRED_BITS_PER_BEAT-bit predecode content of one beat of one (way, set). */
+  /** PRED_BITS_PER_BEAT-bit predecode content of one beat of one (way, set).
+    *
+    * M1a: reads the Unified Fetch Array's INLINE predecode field, NOT the (still
+    * present, shadow) `predMem`. Deviation from the plan's Task 5 Step 7 note, which
+    * said this accessor keeps reading `predMem` until Task 6 -- it cannot, because
+    * `IcacheUnifiedArraySpec`'s array-sweep half compares this accessor against
+    * `predMem` and would then be comparing `predMem` with itself. Task 5 Step 1's own
+    * text ("that half is written against IcacheArrayProbe ... rather than against
+    * predMem directly") only makes sense with the accessor already switched, and the
+    * plan is explicit elsewhere that a tautological oracle is worthless. Switching it
+    * here also makes IcacheSpec/IcachePrefetchSpec's corruption tests exercise the new
+    * array immediately, which is strictly more coverage. Task 6's Step 4 is therefore
+    * already satisfied when it is reached. The signature is unchanged -- that was the
+    * whole point of making this helper beat-granular in Task 3. */
   def wayPred(ic: IcachePlugin, way: Int, set: Int, beat: Int): BigInt = {
     require(beat == 0 || beat == 1, s"beat must be 0 or 1, got $beat")
-    val bits = ic.logic.PRED_BITS_PER_BEAT
-    val line = ic.logic.predMem(way).getBigInt(set)
-    (line >> (bits * beat)) & ((BigInt(1) << bits) - 1)
+    ic.logic.lineMem(way).getBigInt(set * 2 + beat) >> 256
   }
 
   def wayTag(ic: IcachePlugin, way: Int, set: Int): BigInt =
@@ -60,7 +73,7 @@ object IcacheArrayProbe {
     * corruption test. */
   def assertUnchanged(before: WaySnapshot, after: WaySnapshot, what: String): Unit = {
     assert(before.data == after.data,
-      s"$what: dataMem CORRUPTED -- before ${before.describe} after ${after.describe}")
+      s"$what: lineMem data CORRUPTED -- before ${before.describe} after ${after.describe}")
     assert(before.pred == after.pred,
       s"$what: predecode CORRUPTED -- before ${before.describe} after ${after.describe}")
     assert(before.tag == after.tag,
