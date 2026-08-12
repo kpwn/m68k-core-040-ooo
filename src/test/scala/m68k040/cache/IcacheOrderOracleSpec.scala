@@ -32,7 +32,19 @@ object IcacheOrderOracle {
     *
     * The stamp is maintained in the TESTBENCH, not in RTL: the invariant is
     * "the k-th response corresponds to the k-th accepted command", and the
-    * testbench knows the accept order because it is the one driving cmdPort. */
+    * testbench knows the accept order because it is the one driving cmdPort.
+    *
+    * CALLER PRECONDITION (found the hard way during Task 4 — a caller that skips
+    * this produced a spurious garbage-pc response that looked exactly like a real
+    * RTL ordering violation): `cmdPc` and any other `in` IO this driver does not
+    * itself own (e.g. `invalidateAll`) MUST already be poked to a defined value
+    * before calling this function. `runOrderedStream` only self-resets `cmdValid`
+    * (line below) — it does NOT drive `cmdPc` to a safe default before the driver
+    * fork first samples it, and it has no knowledge of `invalidateAll` at all. All
+    * three call sites in this file poke `cmdIn.valid/.pc` and `invalidateAll`
+    * immediately after `attachMemory`, with no intervening `waitSampling`, mirroring
+    * `IcacheSpec.scala`'s established reset-poke pattern (`IcacheSpec.scala:68-91`)
+    * — any future caller (e.g. Task 13's mutation proofs) must do the same. */
   def runOrderedStream(
       cmdValid: Bool, cmdReady: Bool, cmdPc: UInt,
       rspValid: Bool, rspPc: UInt,
