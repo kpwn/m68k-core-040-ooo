@@ -5,7 +5,8 @@ import spinal.core.sim._
 /** Raw cache-array read helpers, shared by IcacheSpec / IcachePrefetchSpec.
   *
   * WHY THIS EXISTS (implementation plan Task 3, spec risk R5). The corruption tests
-  * in those two files read `dataMem`/`predMem`/`tagMem`/`valids` raw and assert an
+  * in those two files read `lineMem`/`predMem`/`tagMem`/`valids` raw (`lineMem` was
+  * `dataMem` before Task 5 renamed it) and assert an
   * UNRELATED way's content is byte-for-byte unchanged. They are the tests that caught
   * the real `victim`-pointer corruption bug (IcachePlugin.scala:216-232), so they must
   * survive the Unified Fetch Array restructure intact -- but that restructure changes
@@ -47,9 +48,15 @@ object IcacheArrayProbe {
     * predMem directly") only makes sense with the accessor already switched, and the
     * plan is explicit elsewhere that a tautological oracle is worthless. Switching it
     * here also makes IcacheSpec/IcachePrefetchSpec's corruption tests exercise the new
-    * array immediately, which is strictly more coverage. Task 6's Step 4 is therefore
-    * already satisfied when it is reached. The signature is unchanged -- that was the
-    * whole point of making this helper beat-granular in Task 3. */
+    * array immediately, which is strictly more coverage. This is only the accessor
+    * half of Task 6 Step 4, and it is done early -- NOT the whole of Step 4. The
+    * plan's Step 4 also requires deleting, once `predMem` itself goes away in Task 6:
+    * the in-RTL `dbgUfaPredMatch` monitor (IcachePlugin.scala) and the
+    * shadow-comparison half of oracle 4 in `IcacheUnifiedArraySpec` (the array-sweep
+    * loop that reads `predMem` directly). Neither of those is done by this file's
+    * early switch; a future Task 6 implementer must still do that deletion work. The
+    * signature here is unchanged -- that was the whole point of making this helper
+    * beat-granular in Task 3. */
   def wayPred(ic: IcachePlugin, way: Int, set: Int, beat: Int): BigInt = {
     require(beat == 0 || beat == 1, s"beat must be 0 or 1, got $beat")
     ic.logic.lineMem(way).getBigInt(set * 2 + beat) >> 256

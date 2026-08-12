@@ -90,12 +90,22 @@ class IcacheUnifiedArraySpec extends AnyFunSuite {
       }
 
       // 256 distinct lines across all 64 sets, cycling every way several times over.
-      val lines = (0 until 256).map(i => 0x1000L + i * 64)
+      // Fix 2 (Task 5 review): hit BOTH beats of every line, not just the low one. Each
+      // 64-byte line's low beat is at offset 0 (s1Pc(5)==0) and high beat at offset +32
+      // (s1Pc(5)==1); a purely 64-byte-aligned stimulus (the original form of this list)
+      // never sets s1Pc(5), so the in-RTL `dbgUfaPredMatch` monitor above only ever
+      // compared the low beat -- the high-beat read-back path went completely unproven
+      // (confirmed by a reviewer mutation that corrupted only the high beat's predecode
+      // at the write site: the in-RTL monitor fired 0 times, only the post-hoc array
+      // sweep below caught it). Interleaving the +32 address right after each line's base
+      // address exercises the high beat too, immediately after the low beat has already
+      // populated the line (so it should still resolve as a fast hit, not a fresh miss).
+      val lines = (0 until 256).flatMap(i => Seq(0x1000L + i * 64, 0x1000L + i * 64 + 32))
       IcacheOrderOracle.runOrderedStream(
         cmdValid = dut.probe.logic.cmdIn.valid, cmdReady = dut.probe.logic.cmdIn.ready,
         cmdPc    = dut.probe.logic.cmdIn.payload.pc,
         rspValid = dut.probe.logic.rspOut.valid, rspPc = dut.probe.logic.rspOut.payload.pc,
-        cd = dut.clockDomain, addrs = lines, timeoutCycles = 120000)
+        cd = dut.clockDomain, addrs = lines, timeoutCycles = 240000)
       dut.clockDomain.waitSampling(200)
       assert(mismatches == 0, s"$mismatches in-RTL unified-array predecode mismatches")
 
@@ -141,12 +151,15 @@ class IcacheUnifiedArraySpec extends AnyFunSuite {
       // low 256 bits per beat and compares against the backing-memory image, so a
       // mis-ordered `beatPred ## beatSrc` concatenation or an off-by-one write address
       // shows up as a data mismatch rather than only as a predecode one.
-      val lines = (0 until 64).map(i => 0x1000L + i * 64)
+      // Fix 2 (Task 5 review): hit both beats of every line here too, for the same reason
+      // as oracle 4 above -- otherwise this sweep's own stimulus never exercises the
+      // high-beat data path either.
+      val lines = (0 until 64).flatMap(i => Seq(0x1000L + i * 64, 0x1000L + i * 64 + 32))
       IcacheOrderOracle.runOrderedStream(
         cmdValid = dut.probe.logic.cmdIn.valid, cmdReady = dut.probe.logic.cmdIn.ready,
         cmdPc    = dut.probe.logic.cmdIn.payload.pc,
         rspValid = dut.probe.logic.rspOut.valid, rspPc = dut.probe.logic.rspOut.payload.pc,
-        cd = dut.clockDomain, addrs = lines, timeoutCycles = 60000)
+        cd = dut.clockDomain, addrs = lines, timeoutCycles = 120000)
       dut.clockDomain.waitSampling(200)
 
       var checked = 0

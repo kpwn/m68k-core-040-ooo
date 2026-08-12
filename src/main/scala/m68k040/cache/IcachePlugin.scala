@@ -333,8 +333,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // `(* keep, syn_keep *)`. Note it lands on the WIRE that aliases the inferred RAM's
     // output register (`lineMem_w_spinal_port0`), not on that register's declaration --
     // enough to stop the net being optimised through, but the actual "did the output
-    // register stay inside the BRAM" question is only answerable at the Task 16 synth
-    // gate, which GC-1 defers.
+    // register stay inside the BRAM" question is only answerable at the Task 6 Step 8
+    // synth-only gate (risk R1, memory inference), which GC-1 defers.
     ufaBeat.foreach(b => KeepAttribute(b))
     def ufaData(w: Int): Bits = ufaBeat(w)(255 downto 0)
     def ufaPred(w: Int): Bits = ufaBeat(w)(UFA_W - 1 downto 256)
@@ -506,6 +506,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     dbgUfaPredMatch := !(s1Valid && !s1Fault && !s1FromMiss) ||
                        (ufaPredVec(s1Way) === dbgShadowPredBeat)
     dbgUfaPredMatch.simPublic()
+    assert(dbgUfaPredMatch, "M1a: unified array's inline predecode disagrees with shadow predMem")
 
     rspValidReg := s1Valid
     rspPcReg    := s1Pc
