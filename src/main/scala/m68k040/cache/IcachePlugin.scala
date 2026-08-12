@@ -145,6 +145,9 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // (deep-audit F1/F2/F3, 2026-07-11: ChunkPredecode widened 4->5 bits, so this grows to
     // 160) so a future width change can't silently desync this packing from the real size.
     val PRED_BITS_PER_WORD = ChunkPredecode().getBitsWidth
+    // M2a (Task 7): no longer used by any RTL expression -- the last whole-line packed
+    // predecode value (`missPred`) is gone. Retained as the derived documentation of the
+    // line-granular width the comments above and below still reason in.
     val PRED_BITS_PER_LINE = PRED_BITS_PER_WORD * 32
     // Slice I2 (per-beat predecode): one AXI beat is 32 bytes = 16 words of a 32-word
     // line, so the single classify group is 16 wide and is used TWICE per refill.
@@ -243,18 +246,38 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // DcachePlugin's `missLine`/`inhibitedResp` direct-delivery pattern exactly:
     // lineMem's write is now gated (REFILL, below) and `lineReg` (already latched
     // UNCONDITIONALLY every REFILL beat) doubles as the data-side direct-delivery
-    // source; `missPred` is the predecode-side counterpart, latched UNCONDITIONALLY
+    // source; `bypPred` is the predecode-side counterpart, latched UNCONDITIONALLY
     // in PREDECODE below so REPLAY can deliver an INHIBITED line's predecode straight
     // from this register, entirely bypassing the (for that case, never-written)
     // Unified Fetch Array.
     //
-    // M1b: still WHOLE-LINE, and still selected by the whole-line `windowPredLine`
-    // (pc(5:3)) -- its two halves are now written directly, one per PREDECODE dwell
-    // cycle, by the `isLoBeat` split below. The low-beat staging register that used to
-    // hold one beat's predecode for a cycle purely so a whole-line packed value could be
-    // assembled combinationally is gone; the split write does the same job with zero
-    // extra state. `missPred` itself dies in M2a (Task 7).
-    val missPred = Reg(Bits(PRED_BITS_PER_LINE bits))
+    // M2a (Task 7): NARROWED, PRED_BITS_PER_LINE (256) flops -> 4*PRED_BITS_PER_WORD
+    // (32); confirmed as `reg [31:0] IcachePlugin_logic_bypPred` in the generated
+    // netlist, with `missPred` absent from it entirely. This used to be `missPred`, a
+    // whole-PRED_BITS_PER_LINE-bit register selected by a whole-line
+    // pc(5:3) window helper, purely because REPLAY was written to reuse the same
+    // whole-line selector the array path used. Only ONE window is ever consumed:
+    // REPLAY answers exactly ONE fetch, at `missPC`, and a FetchRsp is one 64-bit
+    // window = 4 words of predecode. So capture exactly that window, on whichever
+    // dwell cycle classifies the beat `missPC(5)` names.
+    //
+    // EQUIVALENCE, spelled out because this is the whole review surface of M2a. The
+    // old read was `windowPredLine(missPred, s1Pc)` = word-group `s1Pc(5 downto 3)` of
+    // the packed line, and REPLAY sets `s1Pc := missPC`, so it was word-group
+    // missPC(5:3) = {beat missPC(5), lane missPC(4:3)}. The new capture takes
+    // `beatPred`'s lane `missPC(4:3)` on the cycle `commitBeat === missPC(5)` -- and
+    // `beatPred` on that cycle is exactly the classification of beat `commitBeat`
+    // (`beatSrc = Mux(isLoBeat, lineReg(255:0), lineReg(511:256))`). Same 4 chunks,
+    // same order (`subdivideIn` index 0 = LSB = lowest address throughout this file).
+    //
+    // WRITE/READ ORDERING, unchanged from the M1b split-write argument: this register
+    // is read ONLY on the `s1FromMiss` bypass, armed in REPLAY, which is entered the
+    // cycle AFTER commitBeat==1 -- so the capture (on commitBeat 0 or 1) has settled
+    // before any read. PF_PRED writes it too (it always did, whole-line) and never
+    // arms `s1FromMiss`; PREDECODE->REPLAY->IDLE is back-to-back and PF_PRED can only
+    // be entered from IDLE, so no PF_PRED dwell can interleave between the capture and
+    // the S1->rsp latch that consumes it.
+    val bypPred = Reg(Bits(4 * PRED_BITS_PER_WORD bits))
 
     // ── Slice I1, closure (2) of the `invalidateAll` hazard (design doc §6.5) ────
     // An `invalidateAll` that lands while a fill is in flight must not be undone by
@@ -366,7 +389,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     //
     // Task icache-corruption-fix: True only for a REPLAY of a non-allocated
     // (INHIBITED-mode) miss — routes the S1->rsp mux below to deliver straight from
-    // the `lineReg`/`missPred` bypass registers instead of the Unified Fetch Array
+    // the `lineReg`/`bypPred` bypass registers instead of the Unified Fetch Array
     // (which was never written for that case). Explicitly set at
     // EVERY s1Valid-arming site (mirrors s1Fault/s1Atc), never left to a stale value.
     val s1FromMiss = Reg(Bool())
@@ -414,8 +437,9 @@ class IcachePlugin extends FiberPlugin with FetchService {
       * is known, so both beats must still be held somewhere, and it doubles as the
       * INHIBITED direct-delivery source (`missDataBeat`). Slice I2 originally added one
       * beat's worth of predecode held for one cycle so a whole-line packed value could
-      * be assembled combinationally; M1b deleted that staging register by writing
-      * `missPred`'s two halves directly, one per dwell cycle. NET NEW STATE: zero.
+      * be assembled combinationally; M1b deleted that staging register by writing the
+      * bypass register's two halves directly, one per dwell cycle, and M2a narrowed
+      * that register to a single window (`bypPred`). NET NEW STATE: zero.
       *
       * `beat`      : the beat being classified (a half of `lineReg`).
       * `nextLo`    : the NEXT beat's low 3 words, supplying the lookahead for this
@@ -466,14 +490,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
       Vec(nibs.map(b => b.as(ChunkPredecode())))
     }
 
-    /** LEGACY line-granular form, retained ONLY for the `missPred` INHIBITED/poisoned
-      * bypass register, which is still whole-line at this commit. Deleted together
-      * with `missPred` in M2a (Task 7). */
-    def windowPredLine(entry: Bits, pc: UInt): Vec[ChunkPredecode] = {
-      val win  = entry.subdivideIn(4 * PRED_BITS_PER_WORD bits)(pc(5 downto 3))
-      val nibs = win.subdivideIn(PRED_BITS_PER_WORD bits)
-      Vec(nibs.map(b => b.as(ChunkPredecode())))
-    }
+    // M2a (Task 7): the LEGACY whole-line form (`windowPredLine`, a pc(5:3) select over
+    // a PRED_BITS_PER_LINE-bit packed line) is DELETED with its only caller. The
+    // INHIBITED/poisoned bypass now holds a pre-selected single window (`bypPred`), so
+    // nothing in the design selects a window out of a whole packed line any more.
 
     // ---- S1 -> rsp output register (runs every cycle; meaningful when s1Valid) ----
     // Way-mux the registered raw beats/pred by s1Way, then window-decode — all off
@@ -503,7 +523,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
     //
     // s1Fault and s1FromMiss are never both set (REPLAY forces s1Fault := False), so the
     // mask cannot disturb the INHIBITED/poisoned bypass.
-    val s1PredBits = Mux(s1FromMiss, windowPredLine(missPred, s1Pc).asBits,
+    //
+    // M2a: BOTH arms are now ONE window wide (4 * PRED_BITS_PER_WORD). The bypass arm
+    // needs no window select at all -- `bypPred` was captured pre-selected at
+    // missPC(5:3) during the predecode dwell, which is exactly the window
+    // `windowPredLine(missPred, s1Pc)` used to extract here (REPLAY sets s1Pc := missPC).
+    val s1PredBits = Mux(s1FromMiss, bypPred,
                                      windowPredBeat(ufaPredVec(s1Way), s1Pc).asBits)
     val s1PredW    = Vec(Mux(s1Fault, B(0, s1PredBits.getWidth bits), s1PredBits)
                            .subdivideIn(PRED_BITS_PER_WORD bits)
@@ -883,13 +908,13 @@ class IcachePlugin extends FiberPlugin with FetchService {
         s1Fault := False
         s1Atc   := False
         s1Lane  := missPC(4 downto 3)
-        // Task icache-corruption-fix: `replayPredEntry`/`ufaBeat` (armed via
-        // ufaReadAddr/ufaReadEn above) only hold meaningful content when the line
+        // Task icache-corruption-fix: `ufaBeat` (armed via
+        // ufaReadAddr/ufaReadEn above) only holds meaningful content when the line
         // was actually allocated (missCacheable) — for a non-allocated (INHIBITED)
-        // miss neither array was written THIS refill and may still hold stale,
+        // miss the array was not written THIS refill and may still hold stale,
         // unrelated content left by a prior allocation to this same way/set.
-        // `s1FromMiss` routes the S1->rsp mux to the `lineReg`/`missPred` bypass
-        // registers instead for that case, so latching these array reads regardless
+        // `s1FromMiss` routes the S1->rsp mux to the `lineReg`/`bypPred` bypass
+        // registers instead for that case, so latching this array read regardless
         // is harmless (simply unused).
         //
         // Slice I1: `missPoison` (an invalidateAll that landed mid-fill) suppresses the
@@ -1068,16 +1093,16 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // its line one cycle later. (Closure (1), the same-cycle guard on the `valids`
       // write, is still present below and covers the exactly-simultaneous case.)
       val doAllocate = missCacheable && !missPoison
-      // M1b: `missPred` is assembled IN PLACE, one half per dwell cycle, replacing the
-      // deleted low-beat staging register plus the combinational whole-line packed
-      // value it fed. Strictly equivalent for every consumer: `missPred` is read ONLY on
-      // the `s1FromMiss` bypass, which is armed in REPLAY -- entered the cycle AFTER
-      // commitBeat==1 -- so both halves are settled before any read, exactly as when the
-      // whole line was written in one go on commitBeat==1. PF_PRED writes it too (it
-      // always did), and never arms `s1FromMiss`; PREDECODE->REPLAY->IDLE is back-to-back
-      // so no PF_PRED dwell can interleave and clobber a half between write and read.
+      // M2a: capture ONLY the window this refill's own fetch will consume. `missPC(5)`
+      // picks the beat, `missPC(4:3)` picks the window inside it. Written on whichever
+      // dwell cycle classifies that beat, so it is stable by the time REPLAY runs.
+      // Deliberately OUTSIDE the `doAllocate` gate -- the whole point of the bypass is
+      // that it carries the response for lines that are NOT allocated. See `bypPred`'s
+      // declaration for the full equivalence and write/read-ordering argument.
+      when(commitBeat === missPC(5).asUInt) {
+        bypPred := beatPred.subdivideIn(4 * PRED_BITS_PER_WORD bits)(missPC(4 downto 3))
+      }
       when(isLoBeat) {
-        missPred(PRED_BITS_PER_BEAT - 1 downto 0) := beatPred
         // DEBUG only: the cycle immediately BEFORE the allocation write. Its one
         // consumer, IcacheSpec's invalidate-race test, self-checks the pairing by
         // re-reading `dbgAllocCommitCycle` on the next sampling point.
@@ -1085,7 +1110,6 @@ class IcachePlugin extends FiberPlugin with FetchService {
       } otherwise {
         // The tag/valid commit still happens on commitBeat==1 only. Nothing downstream
         // shifts: REPLAY is entered the cycle AFTER commitBeat==1 either way.
-        missPred(PRED_BITS_PER_LINE - 1 downto PRED_BITS_PER_BEAT) := beatPred
         dbgAllocCommitCycle := doAllocate
         for (w <- 0 until ways) {
           when(victimWay === U(w, wayBits bits)) {

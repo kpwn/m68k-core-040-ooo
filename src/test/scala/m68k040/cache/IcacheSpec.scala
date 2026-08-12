@@ -835,6 +835,174 @@ class IcacheSpec extends AnyFunSuite {
     }
   }
 
+  // Task 7 (M2a): the INHIBITED/poisoned bypass is narrowed from a whole 256-bit line
+  // predecode register (`missPred`, PRED_BITS_PER_LINE = 256 flops) to a single 32-bit
+  // window register (`bypPred`, 4 * PRED_BITS_PER_WORD). A narrowing that captured the
+  // WRONG window -- wrong beat (missPC(5)) or wrong lane (missPC(4:3)) -- would still
+  // pass every pre-existing INHIBITED test in this file, because they only ever fetch
+  // offset 0 of a line, where beat 0 / lane 0 is the right answer by coincidence. This
+  // one sweeps ALL EIGHT windows of both beats.
+  //
+  // It is also the test that closes the coverage gap Task 6's review flagged: no test
+  // asserted the bypass's PREDECODE content at all (the INHIBITED tests check data
+  // only). Every assertion below is on predecode, and the reference is read out of the
+  // Unified Fetch Array while the SAME line is resident and cacheable -- an independent
+  // source, since on the bypass path the array is deliberately never written.
+  //
+  // NAME DRIFT FROM THE PLAN'S SNIPPET, RESOLVED AGAINST THE REAL SOURCE: the driver is
+  // `IcacheFetchDriver.fetchAndWait(ic, probe, cd, pc)` (IcacheArrayProbe.scala), the
+  // invalidate helper is `pulseInvalidateAll(dut, cd)`, and the cache-mode stub has no
+  // `forceInhibited` field -- INHIBITED is selected per-VPN via `setInhibited`.
+  test("INHIBITED replay delivers the correct predecode WINDOW, not window 0", VerilatorTest) {
+    simConfig.compile(new Dut(new ICacheModeTranslationPlugin)).doSim("inhibited-window-sweep") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+
+      dut.probe.logic.cmdIn.valid      #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll   #= false
+      clearCmodeOverride(dut)
+      cd.waitSampling(2)
+      pulseInvalidateAll(dut, cd)
+
+      val base      = 0x1000L
+      val set       = ((base >> 6) & 63).toInt
+      val chunkBits = dut.icache.logic.PRED_BITS_PER_WORD
+      val chunkMask = (BigInt(1) << chunkBits) - 1
+
+      // (1) Fetch the line CACHEABLE so it becomes resident, and read the array's
+      // per-window predecode as the reference.
+      IcacheFetchDriver.fetchAndWait(dut.icache, dut.probe, cd, base)
+      cd.waitSampling(10)
+      val way = (0 until 4).find(w => IcacheArrayProbe.wayValid(dut.icache, w, set))
+        .getOrElse(fail(f"line 0x$base%x did not become resident in set $set"))
+      val reference = (0 until 8).map { win =>
+        val beat = win / 4          // pc(5)
+        val lane = win % 4          // pc(4:3)
+        val bp   = IcacheArrayProbe.wayPred(dut.icache, way, set, beat)
+        (0 until 4).map(k => (bp >> (chunkBits * (lane * 4 + k))) & chunkMask)
+      }
+      assert(reference.flatten.exists(_ != 0),
+        "the reference predecode is all-zero; this test cannot distinguish a correct " +
+        "window from a wrong one")
+      assert(reference.map(_.mkString(",")).distinct.length > 1,
+        "every window's predecode is identical, so a window-select bug would be " +
+        "invisible -- pick a different line or a different memory pattern")
+      // Stronger still: no window may be confusable with the one a wrong-BEAT capture
+      // would deliver (win ^ 4) or a wrong-LANE capture would deliver (lane 0 of the
+      // same beat). Without this the sweep could pass a broken narrowing by luck.
+      for (win <- 0 until 8) {
+        assert(reference(win) != reference(win ^ 4),
+          s"window $win and window ${win ^ 4} have identical predecode, so a wrong-BEAT " +
+          s"capture would be invisible at this address")
+        val lane0 = (win / 4) * 4
+        if (win != lane0)
+          assert(reference(win) != reference(lane0),
+            s"window $win and window $lane0 have identical predecode, so a wrong-LANE " +
+            s"capture would be invisible at this address")
+      }
+
+      // (2) Drop the line, switch the page to INHIBITED, and re-fetch every window.
+      // Each response must carry THAT window's predecode, delivered through the bypass
+      // (the arrays are deliberately not written for a non-allocated miss).
+      pulseInvalidateAll(dut, cd)
+      setInhibited(dut, base >> 12)
+      cd.waitSampling(5)
+      for (win <- 0 until 8) {
+        val pc  = base + win * 8
+        val rsp = IcacheFetchDriver.fetchAndWait(dut.icache, dut.probe, cd, pc)
+        assert(!rsp.fault, f"INHIBITED replay at pc=0x$pc%x faulted unexpectedly: ${rsp.describe}")
+        assert(rsp.pc == BigInt(pc), f"pc=0x$pc%x got a response for 0x${rsp.pc.toString(16)}")
+        assert(rsp.data == IcacheSim.window64(pc),
+          f"INHIBITED replay at pc=0x$pc%x data mismatch: got 0x${rsp.data.toString(16)} " +
+          f"expected 0x${IcacheSim.window64(pc).toString(16)}")
+        for (k <- 0 until 4)
+          assert(rsp.pred(k) == reference(win)(k),
+            f"INHIBITED replay at pc=0x$pc%x (window $win) delivered predecode chunk $k = " +
+            f"0x${rsp.pred(k).toString(16)}, expected 0x${reference(win)(k).toString(16)}. " +
+            f"The narrowed bypPred captured the wrong window.")
+      }
+      clearCmodeOverride(dut)
+      cd.waitSampling(4)
+    }
+  }
+
+  // Task 7 (M2a), second bypass arm: `s1FromMiss` is armed by `!missCacheable ||
+  // missPoison`. The sweep above covers only the `!missCacheable` arm. This one covers
+  // `missPoison` -- an `invalidateAll` that lands mid-fill of a perfectly CACHEABLE
+  // line, which suppresses the allocation but must still deliver a correct response
+  // (see `missPoison`'s declaration for why the response cannot simply be cancelled).
+  // Predecode, not just data, because that is the half the narrowing changes.
+  test("poisoned (invalidate-mid-fill) replay delivers the correct predecode window", VerilatorTest) {
+    simConfig.compile(new Dut()).doSim("poisoned-window-pred") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+
+      dut.probe.logic.cmdIn.valid      #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll   #= false
+      cd.waitSampling(2)
+      pulseInvalidateAll(dut, cd)
+
+      val base      = 0x2000L
+      val set       = ((base >> 6) & 63).toInt
+      val chunkBits = dut.icache.logic.PRED_BITS_PER_WORD
+      val chunkMask = (BigInt(1) << chunkBits) - 1
+
+      // Reference: fill the line cleanly first and read the array.
+      IcacheFetchDriver.fetchAndWait(dut.icache, dut.probe, cd, base)
+      cd.waitSampling(10)
+      val way = (0 until 4).find(w => IcacheArrayProbe.wayValid(dut.icache, w, set))
+        .getOrElse(fail(f"line 0x$base%x did not become resident in set $set"))
+      val reference = (0 until 8).map { win =>
+        val bp = IcacheArrayProbe.wayPred(dut.icache, way, set, win / 4)
+        (0 until 4).map(k => (bp >> (chunkBits * ((win % 4) * 4 + k))) & chunkMask)
+      }
+      assert(reference.flatten.exists(_ != 0), "reference predecode is all-zero")
+
+      // Now for a few windows: start a fresh fill of the same line and pulse
+      // invalidateAll while the fill is in flight (the FSM is out of IDLE), poisoning
+      // it. The response still comes back, through the bypass.
+      for (win <- Seq(1, 3, 5, 7)) {
+        pulseInvalidateAll(dut, cd)
+        cd.waitSampling(3)
+        val pc = base + win * 8
+        dut.probe.logic.cmdIn.valid      #= true
+        dut.probe.logic.cmdIn.payload.pc #= pc
+        cd.waitSamplingWhere(dut.probe.logic.cmdIn.ready.toBoolean &&
+                             dut.probe.logic.cmdIn.valid.toBoolean)
+        dut.probe.logic.cmdIn.valid #= false
+        // Poison the in-flight fill: the FSM has left IDLE by now (the miss was taken
+        // on the accept cycle), so this sets missPoison.
+        cd.waitSampling(1)
+        dut.icache.logic.invalidateAll #= true
+        cd.waitSampling()
+        dut.icache.logic.invalidateAll #= false
+
+        cd.waitSamplingWhere(dut.probe.logic.rspOut.valid.toBoolean)
+        val gotData = dut.probe.logic.rspOut.payload.data.toBigInt
+        val predBits = dut.probe.logic.rspPredBits.toBigInt
+        assert(!dut.probe.logic.rspOut.payload.fault.toBoolean,
+          f"poisoned replay at pc=0x$pc%x faulted unexpectedly")
+        assert(gotData == IcacheSim.window64(pc),
+          f"poisoned replay at pc=0x$pc%x data mismatch: got 0x${gotData.toString(16)}")
+        for (k <- 0 until 4) {
+          val got = (predBits >> (chunkBits * k)) & chunkMask
+          assert(got == reference(win)(k),
+            f"poisoned replay at pc=0x$pc%x (window $win) predecode chunk $k = " +
+            f"0x${got.toString(16)}, expected 0x${reference(win)(k).toString(16)}")
+        }
+        // The poisoned fill must not have allocated.
+        assert(!(0 until 4).exists(w => IcacheArrayProbe.wayValid(dut.icache, w, set)),
+          s"a poisoned fill allocated into set $set")
+      }
+      cd.waitSampling(4)
+    }
+  }
+
   // (I-j) CRITICAL regression (review of 156cf6b, "icache: gate dataMem/predecode
   // writes under doAllocate, fix silent corruption"): 156cf6b's `refillAllocate`
   // gate is evaluated PER-BEAT, using `missBusFault`/`respErr` AS OF THAT BEAT. This
