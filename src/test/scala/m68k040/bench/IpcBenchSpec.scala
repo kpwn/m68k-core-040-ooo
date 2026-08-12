@@ -380,6 +380,16 @@ class IpcBenchSpec extends AnyFunSuite {
     // an unpinned run has ~1%% aggregate run-to-run jitter. IPC_SEED pins it.
     compiled.doSim(k.name, IpcBenchSpec.simSeed) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
+      // S-pre (2026-08-12 large-scale-frontend-restructure-design, §14 Q5 / D4):
+      // IPC_PREFETCH=off disables IcachePlugin's next-line prefetch engine for the
+      // WHOLE run, to measure its real aggregate/per-kernel IPC contribution.
+      // `prefetchEnable` is a self-assigned RegInit(True) (see IcachePlugin.scala's
+      // comment at its declaration) -- a single poke is overwritten by the reset
+      // value on the next edge while `forkStimulus` still holds reset, so re-poke
+      // from a non-blocking fork across the reset window (mirrors IcacheSpec.scala).
+      if (sys.env.get("IPC_PREFETCH").contains("off")) {
+        fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
+      }
       val handle = new WhiteboxCapture.Handle
 
       // Per-cycle MACRO-commit histogram, trimmed to [first-commit, last-commit]
