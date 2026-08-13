@@ -1988,10 +1988,16 @@ class IcachePlugin extends FiberPlugin with FetchService {
     //     residual is therefore the tail of a property this design cannot hold
     //     absolutely in either the parent or M4 form. Rejected on cost/benefit.
     //
-    // Not reachable by the current corpus: every lock-step and cache suite runs
-    // `IdentityTranslationPlugin`, which never faults and never reports INHIBITED, so
-    // no test can distinguish T from T+1 today. Recorded for Task 13's mutation-proof
-    // record, which is where this class of safety property is formally tracked.
+    // Unproven by the current corpus -- but NOT because no harness can reach it.
+    // `ICacheModeTranslationPlugin` (used by 4 cache suites) already provides a live
+    // sim-poked fault/INHIBITED transition, and `IcacheUnifiedArraySpec`'s M1b test
+    // already produces this exact scenario's shape (warms 0x1000 with prefetch left
+    // enabled, then flips `forceFault` live) -- it just never asserts on AR traffic
+    // while doing so. What's actually missing is an assertion on an existing
+    // transition, not a new fault-capable harness. Recorded for Task 13's
+    // mutation-proof record, which is where this class of safety property is
+    // formally tracked; Task 13 should add the AR-traffic assertion to (or alongside)
+    // that existing scenario rather than building a new translation-faulting harness.
     val s0KillsWindowQ = s0Valid && !s0Replay && (s0Fault || !s0Cacheable)
     when(pfWindowHasCandidate && !anyInvalidate && !demandFillStart &&
          !pfWindowUpdate && !demandStuckQ && !s0KillsWindowQ) {
