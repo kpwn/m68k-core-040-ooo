@@ -121,10 +121,22 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
         // contexts (whose `tagQ`/`validsQ`/`s0Ppn` are the LAST accepted command's and
         // whose verdict is deliberately not consulted by the RTL either). Under M3b
         // `s0Valid` is HELD while an accepted miss waits for the fill engine, so one
-        // command can be observed on more than one cycle -- harmless here (the values
-        // are frozen for exactly that duration, so every re-check checks the same thing)
-        // and it only inflates the `checked`/`misses` counters, which are used as
-        // lower-bound non-vacuity floors.
+        // command can be observed on more than one cycle. Harmless -- the values are
+        // frozen for exactly that duration, so every re-check checks the same thing.
+        //
+        // TASK 11 REVIEW FIX I3: the ORIGINAL version of this note claimed the
+        // double-counting "only inflates the `checked`/`misses` counters, which are used
+        // as lower-bound non-vacuity floors", i.e. that it can only LOOSEN the
+        // non-vacuity checks. That is true of `checked >= addrs.length`, `hits > 0` and
+        // `misses > 0`, but it is BACKWARDS for the fourth one: `st.modelChecks >=
+        // st.checked / 2` uses `checked` as a DENOMINATOR, so inflating it makes that
+        // threshold STRICTER, not looser. And the inflation is biased against the
+        // numerator: a hold happens precisely across a fill/install dwell, which is when
+        // `dbgAllocCommitCycle` fires, so held cycles are disproportionately likely to be
+        // counted in `modelSkips` rather than `modelChecks`. The direction is still
+        // harmless (a stricter check that passes is evidence, not a hazard) -- but the
+        // stated argument was wrong, and a future edit that lengthened the hold would be
+        // reasoning from it.
         if (ic.logic.s0Valid.toBoolean && !ic.logic.s0Replay.toBoolean) {
           st.checked += 1
           val verdict = ic.logic.s1Hit.toBoolean
