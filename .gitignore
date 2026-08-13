@@ -19,6 +19,10 @@ synth/*.rpt
 synth/*.log
 synth/*.jou
 synth/*.dcp
+# Archived gate evidence keeps its .rpt/.out files (they are the durable record) but
+# never its checkpoints: a synth+routed DCP pair is ~85 MB per arm, is regenerable from
+# the pinned netlist md5 recorded alongside it, and no .dcp has ever been tracked here.
+synth/archive/**/*.dcp
 synth/fullcore_synth.md5
 clockInfo.txt
 .Xil/
