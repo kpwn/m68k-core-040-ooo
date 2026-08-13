@@ -55,6 +55,31 @@ object IcacheArrayProbe {
     ic.logic.lineMem(way).getBigInt(set * 2 + beat) >> 256
   }
 
+  /** MSHR CONTROL-file accessors (Task 9 / M2c). Entry 0 is the demand MSHR
+    * (`AxiIds.I_DEMAND`); entries `I_SPEC_BASE .. I_SPEC_LAST` are the speculative
+    * slots. `IcachePlugin.MSHR_N` is `1 + AxiIds.I_SPEC_SLOTS` -- note that is FIVE on
+    * the current `AxiIds`, not the six the plan's prose assumes (I_SPEC_SLOTS == 4);
+    * `mshrEntries` is the single place that arithmetic lives.
+    *
+    * `mshrValid(0)` means "the demand MSHR is live and owns `mshrSet(0)`" -- it spans
+    * REFILL, the demand install dwell, REPLAY and FAULT. `mshrComplete(0)` is never
+    * written by the RTL (the demand path's completion is the FSM's `refillDone`), so do
+    * not build a liveness predicate on it. */
+  def mshrEntries: Int = 1 + AxiIds.I_SPEC_SLOTS
+
+  def mshrValid(ic: IcachePlugin, idx: Int): Boolean    = ic.logic.mshrValid(idx).toBoolean
+  def mshrSet(ic: IcachePlugin, idx: Int): Int          = ic.logic.mshrSet(idx).toInt
+  def mshrArSent(ic: IcachePlugin, idx: Int): Boolean   = ic.logic.mshrArSent(idx).toBoolean
+  def mshrComplete(ic: IcachePlugin, idx: Int): Boolean = ic.logic.mshrComplete(idx).toBoolean
+
+  /** Speculative-slot views, so `IcachePrefetchSpec`'s existing per-slot assertions
+    * survive the demand/speculative unification with one rename in one place. `i` is a
+    * SLOT index (0 .. I_SPEC_SLOTS-1), not an MSHR index. */
+  def pfSlotValid(ic: IcachePlugin, i: Int): Boolean    = mshrValid(ic, i + AxiIds.I_SPEC_BASE)
+  def pfSlotArSent(ic: IcachePlugin, i: Int): Boolean   = mshrArSent(ic, i + AxiIds.I_SPEC_BASE)
+  def pfSlotComplete(ic: IcachePlugin, i: Int): Boolean = mshrComplete(ic, i + AxiIds.I_SPEC_BASE)
+  def pfSlotSet(ic: IcachePlugin, i: Int): Int          = mshrSet(ic, i + AxiIds.I_SPEC_BASE)
+
   def wayTag(ic: IcachePlugin, way: Int, set: Int): BigInt =
     ic.logic.tagMem(way).getBigInt(set)
 

@@ -371,8 +371,8 @@ class IcachePrefetchSpec extends AnyFunSuite {
       cd.waitSampling(2)
 
       assert(fetch(dut, cd, 0x6000L) == IcacheSim.window64(0x6000L))
-      cd.waitSamplingWhere(dut.icache.logic.pfValid(1).toBoolean &&
-                           !dut.icache.logic.pfArSent(1).toBoolean)
+      cd.waitSamplingWhere(IcacheArrayProbe.pfSlotValid(dut.icache, 1) &&
+                           !IcacheArrayProbe.pfSlotArSent(dut.icache, 1))
 
       dut.probe.logic.cmdIn.valid #= true
       dut.probe.logic.cmdIn.payload.pc #= 0x6080L
@@ -541,8 +541,8 @@ class IcachePrefetchSpec extends AnyFunSuite {
         cd.waitSampling(2)
         assert(fetch(dut, cd, 0x2000L) == IcacheSim.window64(0x2000L))
         responded += AxiIds.I_DEMAND
-        cd.waitSamplingWhere(dut.icache.logic.pfValid(0).toBoolean &&
-                             !dut.icache.logic.pfArSent(0).toBoolean)
+        cd.waitSamplingWhere(IcacheArrayProbe.pfSlotValid(dut.icache, 0) &&
+                             !IcacheArrayProbe.pfSlotArSent(dut.icache, 0))
 
         if (stage == "AR_PENDING") pulseInvalidate()
 
@@ -572,7 +572,7 @@ class IcachePrefetchSpec extends AnyFunSuite {
             sendBeat(AxiIds.I_SPEC_BASE, 0x2040L, 1)
             responded += AxiIds.I_SPEC_BASE
             sleep(1)
-            assert(dut.icache.logic.pfComplete(0).toBoolean,
+            assert(IcacheArrayProbe.pfSlotComplete(dut.icache, 0),
               "COMPLETE setup missed the post-RLAST/pre-install window")
             pulseInvalidate()
           case "INSTALL0" | "INSTALL1" =>
@@ -586,7 +586,7 @@ class IcachePrefetchSpec extends AnyFunSuite {
         // Drain every poisoned live ID so no stable AXI request can obscure the
         // architectural retry. None may install after the invalidation.
         axi.ar.ready #= true
-        while ((0 until AxiIds.I_SPEC_SLOTS).exists(i => dut.icache.logic.pfValid(i).toBoolean)) {
+        while ((0 until AxiIds.I_SPEC_SLOTS).exists(i => IcacheArrayProbe.pfSlotValid(dut.icache, i))) {
           val pending = arTrace.collectFirst {
             case (id, address) if id >= AxiIds.I_SPEC_BASE && id <= AxiIds.I_SPEC_LAST &&
               !responded(id) => (id, address)
@@ -683,8 +683,8 @@ class IcachePrefetchSpec extends AnyFunSuite {
       // simultaneously valid, AR-sent and incomplete.
       cd.waitSampling()
       assert((0 until AxiIds.I_SPEC_SLOTS).forall(i =>
-        dut.icache.logic.pfValid(i).toBoolean && dut.icache.logic.pfArSent(i).toBoolean &&
-          !dut.icache.logic.pfComplete(i).toBoolean),
+        IcacheArrayProbe.pfSlotValid(dut.icache, i) && IcacheArrayProbe.pfSlotArSent(dut.icache, i) &&
+          !IcacheArrayProbe.pfSlotComplete(dut.icache, i)),
         "setup failed to hold all four wrong-path slots in FILL")
 
       val got = fetch(dut, cd, 0x8000L)
@@ -693,7 +693,7 @@ class IcachePrefetchSpec extends AnyFunSuite {
       assert(arTrace.count(_ == ((AxiIds.I_DEMAND, 0x8000L))) == 1,
         s"redirect target did not get its one reserved ID0 transaction: $arTrace")
       assert((0 until AxiIds.I_SPEC_SLOTS).forall(i =>
-        dut.icache.logic.pfValid(i).toBoolean && !dut.icache.logic.pfComplete(i).toBoolean),
+        IcacheArrayProbe.pfSlotValid(dut.icache, i) && !IcacheArrayProbe.pfSlotComplete(dut.icache, i)),
         "redirect target incorrectly waited for or consumed a wrong-path response")
     }
   }
@@ -976,7 +976,7 @@ class IcachePrefetchSpec extends AnyFunSuite {
 
       waitUntilBounded(cd, "all four speculative slots AR_PENDING")(
         (0 until AxiIds.I_SPEC_SLOTS).forall(i =>
-          dut.icache.logic.pfValid(i).toBoolean && !dut.icache.logic.pfArSent(i).toBoolean))
+          IcacheArrayProbe.pfSlotValid(dut.icache, i) && !IcacheArrayProbe.pfSlotArSent(dut.icache, i)))
       assert(axi.ar.valid.toBoolean, "setup: no speculative AR is being offered")
       assert(axi.ar.payload.addr.toLong == base + 0x40L,
         f"setup: the holder should carry the LOWEST-numbered slot's line 0x${base + 0x40L}%x, " +

@@ -246,7 +246,8 @@ class IcacheSpec extends AnyFunSuite {
   // -------- Test 5b (Task P5.5): an invalidate landing on the EXACT refill-commit
   // cycle must WIN over the refill's own valid-bit write --------
   //
-  // The bug this pins down: `valids(w)(missSet) := True` (PREDECODE) elaborates LATER
+  // The bug this pins down: `valids(w)(installSet) := True` (PREDECODE; `missSet` before
+  // Task 9 renamed it) elaborates LATER
   // in IcachePlugin.scala than the `when(invalidateAll || maintInvalidateAll) { valids
   // := False }` priority clear, so under last-assignment-wins the refill silently won
   // any cycle both fired -- re-validating a line the invalidate was supposed to clear,

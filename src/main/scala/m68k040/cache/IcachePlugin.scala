@@ -29,7 +29,9 @@ class IcachePlugin extends FiberPlugin with FetchService {
   private val setBits      = geo.indexBits
   private val wayBits      = log2Up(ways)
   private val pfSlots      = AxiIds.I_SPEC_SLOTS
-  private val pfIdxBits    = log2Up(pfSlots)
+  // M2c: `pfIdxBits` is DELETED. Every index in the fill machinery is an MSHR index
+  // (`mshrIdxBits`) now; the slot-relative width existed only to size the demand/
+  // speculative translation this task removes.
 
   // idWidth widened 2 -> 4 (ratified slice V2a.1): socket-conformant (AXI_IW = 4)
   // and, more immediately, the I side needs two DISTINCT ids the moment slice I3's
@@ -207,18 +209,37 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val lookupCmode     = xlate.rsp.cacheMode
     val lookupCacheable = lookupCmode =/= CacheMode.INHIBITED
 
-    // ---- miss-state latches ----
+    // ---- install-context latches (M2c: NOT part of the MSHR control file) ----
+    // M2c splits what used to be one undifferentiated `miss*` pile into two things
+    // with genuinely different lifetimes:
+    //
+    //   - the MSHR CONTROL FILE (`mshr*`, declared below): "a fill I have requested and
+    //     am tracking on the bus". One uniform entry per AXI ID, demand at index 0.
+    //   - the INSTALL CONTEXT (`installIdx`/`installSet`/`installWay` + the two
+    //     registers here): "the fill I am currently committing into the arrays". There
+    //     is exactly ONE installer, shared by both kinds of fill, so this context is a
+    //     set of scalars, loaded on whichever arm enters INSTALL_ARM.
+    //
+    // `missPC` and `missCacheable` are the two install-context fields with no
+    // per-entry counterpart in spec section 5.2's list, so they stay scalars.
+    // CORRECTION to the plan's stated reason for keeping them ("demand-only ... a
+    // speculative fill has no PC to replay and is cacheable by construction"): they are
+    // NOT demand-only. IDLE's speculative-install arm writes BOTH of them today
+    // (`missPC := pfPa(sel)`, `missCacheable := True`) and the dwell reads both, so
+    // they are install context, not demand state. The conclusion (keep them as
+    // scalars) is unchanged; only the reason is.
+    //   - `missPC` selects the bypass capture window (`missPC(5)`/`missPC(4:3)`) and
+    //     supplies REPLAY's `s1Pc`/`s1Lane`. For a speculative install its value is
+    //     consumed by nothing (`s1FromMiss` is never armed), but it must still be
+    //     written, because the capture happens unconditionally.
+    //   - `missCacheable` gates `doAllocate`.
     val missPC    = Reg(UInt(32 bits))
-    val missPA    = Reg(UInt(32 bits))   // translated physical line address (refill AXI)
-    val missSet   = Reg(UInt(setBits bits))
-    val missTag   = Reg(UInt(tagBits bits))
     // Cacheability of the access that caused this miss, latched at miss-detect time
-    // (same instant missPA/missSet/missTag are latched) so REFILL/PREDECODE's
-    // allocate gate sees the SAME cache-mode the missing fetch actually had.
+    // (the same instant mshrPa/mshrSet/mshrTag(DEMAND_IDX) are latched) so
+    // REFILL/PREDECODE's allocate gate sees the SAME cache-mode the missing fetch
+    // actually had. A speculative install forces it True (rule P1: an INHIBITED page
+    // is never prefetched).
     val missCacheable = Reg(Bool())
-    val victimWay = Reg(UInt(wayBits bits))
-    val beatCnt   = Reg(UInt(1 bits)) init U(0, 1 bits)
-    val arSent    = Reg(Bool()) init False
     // ---- M2: the Unified MSHR line file --------------------------------------
     // ONE line-data structure for demand AND speculative fills, indexed by AXI ID.
     // Entry 0 is the demand MSHR (AxiIds.I_DEMAND == 0); entries 1..pfSlots are the
@@ -258,7 +279,9 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // line is NOT allocated (PREDECODE's tag/pred/valid writes are skipped entirely
     // — see the REFILL->FAULT transition below) and the fault is delivered via the
     // new FAULT state, mirroring DcachePlugin's missFault/busFaultResp (task #189).
-    val missBusFault = Reg(Bool()) init False
+    // M2c: this was `missBusFault`, a demand-only scalar; it is now `mshrErr(0)`, the
+    // demand entry's lane of the uniform error field (the speculative slots' `pfErr`
+    // was always the same bit under a different name).
     // Task icache-corruption-fix (review of 69a867c, "icache: wire xlate.rsp.cacheMode
     // into IcachePlugin"): that commit correctly gated tagMem/valids/victim-advance
     // under doAllocate for an INHIBITED-mode miss, but left the ACTUAL data/predecode
@@ -352,39 +375,92 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // needs the in-flight fetch discarded, the correct mechanism is FetchAlign's
     // EXISTING `ringStale` bit (consumed-and-discarded, ring still retires) -- a
     // FetchAlign change, not an IcachePlugin one.
-    val missPoison = RegInit(False)
+    // M2c: this was `missPoison`, a demand-only scalar; it is now `mshrPoison(0)`, the
+    // demand entry's lane of the uniform poison field, and the "poison every live fill
+    // on an invalidate" rule is ONE loop over the whole file instead of one loop over
+    // the speculative slots plus a separate `when(anyInvalidate && !IDLE)` line.
 
-    // ---- five-ID stream-prefetch pool (IDs 1..4; ID 0 remains demand) ----
-    // Each speculative slot carries only control. M2b: its line DATA no longer lives in
-    // a private `pfLineLo`/`pfLineHi` pair that had to be COPIED into a shared register
-    // to be installed -- it lives in the unified `fillLo`/`fillHi` MSHR line file at
-    // index `I_SPEC_BASE + slot`, written by exactly the same R-channel statement that
-    // writes the demand entry, and read out by the same synchronous `installIdx` port.
-    val pfValid    = Vec.fill(pfSlots)(RegInit(False))
-    val pfArSent   = Vec.fill(pfSlots)(RegInit(False))
-    val pfComplete = Vec.fill(pfSlots)(RegInit(False))
-    val pfBeat     = Vec.fill(pfSlots)(RegInit(False))
-    val pfErr      = Vec.fill(pfSlots)(RegInit(False))
-    val pfPoison   = Vec.fill(pfSlots)(RegInit(False))
-    val pfPa       = Vec.fill(pfSlots)(Reg(UInt(32 bits)))
-    val pfSet      = Vec.fill(pfSlots)(Reg(UInt(setBits bits)))
-    val pfTag      = Vec.fill(pfSlots)(Reg(UInt(tagBits bits)))
-    val pfWay      = Vec.fill(pfSlots)(Reg(UInt(wayBits bits)))
-    val pfInstallIdx = Reg(UInt(pfIdxBits bits))
+    // ---- M2c: the unified MSHR CONTROL file ----------------------------------
+    // Entry 0 = the demand MSHR (AxiIds.I_DEMAND). Entries 1..pfSlots = the speculative
+    // slots (AxiIds.I_SPEC_BASE..I_SPEC_LAST). Every field that used to exist twice --
+    // once as a scalar `miss*`/`beatCnt`/`arSent` for demand and once as a pfSlots-wide
+    // Vec for speculation -- is ONE Vec now, and the AXI RID is the index into it.
+    // Together with M2b's `fillLo`/`fillHi` line file (indexed the same way) that makes
+    // the whole MSHR -- data AND control -- uniform.
+    //
+    // HONEST ACCOUNTING (spec section 5.2). This is flop-NEUTRAL to within 2 bits, and
+    // that figure is MEASURED, not estimated: counting sequentially-assigned `reg` bits
+    // whose names begin `IcachePlugin_` in `generated/M68kFullCoreSynth.v` gives
+    // 5,548 bits before this commit and 5,550 after, i.e. **+2**. Entry 0 adds 66 FF of
+    // control state; the demand scalars it replaces are 62 FF (missPA 32 + missSet 6 +
+    // missTag 20 + beatCnt 1 + arSent 1 + missBusFault 1 + missPoison 1 -- victimWay's 2
+    // are a rename to installWay, not a deletion) and pfInstallIdx's 2 go with them.
+    // `mshrComplete(DEMAND_IDX)` is still EMITTED as a reg (it has a reset), and is
+    // included in the +2; it is never set True, so synthesis should constant-fold it --
+    // but that is an expectation, NOT a measurement, because GC-1 defers synth here.
+    // The value of this change is in spec section 9.5's fallback column -- deleting the
+    // demand/speculative asymmetry from the file the ledger has repeatedly found
+    // hardest to reason about -- not in a flop count. GC-1 forbids measuring its FMax
+    // effect here, deliberately.
+    //
+    // BEHAVIOUR-NEUTRALITY, likewise measured rather than argued: the full (cycle, AXI
+    // id, address) AR trace for a fixed 108-command stimulus (oracle 1's hostile mix
+    // followed by a 96-line sequential stream) is byte-identical across this commit --
+    // 101 AR fires, same cycles, same ids, same addresses. No state was added to or
+    // removed from the FSM, so there is no latency change in either direction.
+    //
+    // ENTRY 0's SEMANTICS, spelled out because M2c is exactly where getting them wrong
+    // is silent:
+    //   - `mshrValid(0)` means "the demand MSHR is live and OWNS `mshrSet(0)`". It is
+    //     set on the IDLE miss-detect that starts a refill and cleared on the way back
+    //     to IDLE (REPLAY / FAULT), so it is True across REFILL, INSTALL_ARM(demand),
+    //     PREDECODE(demand), REPLAY and FAULT -- exactly the state list `demandSetOwned`
+    //     used to enumerate by hand.
+    //     DELIBERATE DEVIATION from the plan's Step 5 note ("an mshrValid(0) would be a
+    //     second, redundant source of truth"): it is not redundant, it REPLACES the
+    //     hand-written state list, and without it this task's load-bearing deliverable
+    //     -- oracle 3 covering entry 0 -- would be vacuous (an always-False
+    //     `mshrValid(0)` can never appear in the oracle's `live` set). The R-channel
+    //     demand match deliberately does NOT read it (it stays on `refillActive`), so
+    //     there is no second source of truth for the bus-side liveness either.
+    //   - `mshrComplete(0)` is never written: the demand path's completion is the FSM's
+    //     `refillDone`, and a second copy of it would be the redundancy the plan warns
+    //     about. It constant-folds away in synthesis.
+    //   - every other entry-0 field carries exactly what its old `miss*` scalar did.
+    val DEMAND_IDX   = AxiIds.I_DEMAND      // 0
+    val mshrValid    = Vec.fill(MSHR_N)(RegInit(False))
+    val mshrArSent   = Vec.fill(MSHR_N)(RegInit(False))
+    val mshrComplete = Vec.fill(MSHR_N)(RegInit(False))
+    val mshrBeat     = Vec.fill(MSHR_N)(RegInit(False))
+    val mshrErr      = Vec.fill(MSHR_N)(RegInit(False))
+    val mshrPoison   = Vec.fill(MSHR_N)(RegInit(False))
+    val mshrPa       = Vec.fill(MSHR_N)(Reg(UInt(32 bits)))
+    val mshrSet      = Vec.fill(MSHR_N)(Reg(UInt(setBits bits)))
+    val mshrTag      = Vec.fill(MSHR_N)(Reg(UInt(tagBits bits)))
+    val mshrWay      = Vec.fill(MSHR_N)(Reg(UInt(wayBits bits)))
 
     // The install target, registered one cycle AHEAD of the dwell so the file read is
     // synchronous. Set in INSTALL_ARM's two entry arms (REFILL's clean completion and
     // IDLE's speculative install); stable for the whole PREDECODE dwell.
     val installIdx = Reg(UInt(mshrIdxBits bits)) init U(0, mshrIdxBits bits)
-    // SG-3 (plan): a dedicated register rather than mshrSet(installIdx). The D3-SET-I
-    // guard `fillArrayWrActive && (lookupSet === installSet)` sits in the ACCEPT cone;
-    // sourcing it from a Vec index would put a 5:1 mux in front of that comparator, in
-    // exactly the cone this whole design exists to shorten. One register instead.
-    // Written here in Task 8 (M2b); Task 9 (M2c) is the task that switches the guard
-    // itself over to it, once the whole control file is uniform. Until then it is
-    // maintained in lock-step with `missSet` -- both install arms assign the two the
-    // same value on the same cycle -- so the switch is a no-op by construction.
+    // SG-3 (plan, exception 2): a dedicated register rather than mshrSet(installIdx).
+    // The D3-SET-I guard `fillArrayWrActive && (lookupSet === installSet)` sits in the
+    // ACCEPT cone; sourcing it from a Vec index would put a 5:1 mux in front of that
+    // comparator, in exactly the cone this whole design exists to shorten. One register
+    // instead -- and the same register also supplies ALL FIVE array-write ADDRESS paths
+    // in the dwell (`lineMem` / `tagMem` / `valids` / `pfFilled` / `victim`), which is
+    // strictly correct because it was loaded from exactly the entry being installed.
+    // Introduced in Task 8 (M2b) and maintained in lock-step with the now-deleted
+    // `missSet`; M2c switches every one of those consumers over to it, so the switch is
+    // a no-op by construction.
     val installSet = Reg(UInt(setBits bits))
+    // SG-3 (plan, exception 3): likewise a dedicated register rather than
+    // mshrWay(installIdx) -- it feeds a 4-way decoded `when(installWay === U(w))` on
+    // EVERY array-write path, so a 5:1 mux in front of it would be replicated four
+    // times. This is the old `victimWay` renamed: `mshrWay` still records the victim at
+    // ALLOCATE time (that is the field spec section 5.2 lists), and `installWay` is
+    // loaded from it once, on the arm into INSTALL_ARM.
+    val installWay = Reg(UInt(wayBits bits))
     // The synchronous read of the line being installed. KeepAttribute per GC-7: if
     // these become fabric flops, lineReg has been re-created under a different name.
     val fillLoQ = fillLo.readSync(installIdx)
@@ -406,9 +482,16 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val pfNextPa     = Reg(UInt(32 bits))
     val pfLimitPa    = Reg(UInt(32 bits))
 
-    pfValid.simPublic()
-    pfArSent.simPublic()
-    pfComplete.simPublic()
+    // M2c: `mshrSet` joins the sim-public set. Oracle 3 previously had to RECONSTRUCT
+    // each speculative slot's set from the address of the last AR issued under that
+    // slot's AXI id, purely because `pfSet` was not public (see the deviation note in
+    // IcacheOrderOracleSpec). It now reads the register directly -- and that is what
+    // lets it cover entry 0, whose set never appears on the bus at a time the old
+    // reconstruction could attribute it.
+    mshrValid.simPublic()
+    mshrArSent.simPublic()
+    mshrComplete.simPublic()
+    mshrSet.simPublic()
 
     // ---- shared unified-array read port (synchronous; BRAM) ----
     // Address+enable are driven by the FSM (IDLE hit accept, or REPLAY), from
@@ -721,26 +804,47 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val pfCandTag = pfNextPa(31 downto 12)
     val pfCandResident = Vec((0 until ways).map(w =>
       valids(w)(pfCandSet) && (tagMem(w).readAsync(pfCandSet) === pfCandTag))).orR
+    // SPECULATIVE-ONLY reductions (index `i + I_SPEC_BASE`). Entry 0 is deliberately
+    // NOT included in `pfCandLive`: a candidate that matches the in-flight DEMAND line
+    // must WAIT (the `pfCandSetBusy` arm below), not advance the frontier past it --
+    // including it here would turn a wait into a skip and change allocator behaviour.
     val pfCandLive = Vec((0 until pfSlots).map(i =>
-      pfValid(i) && ((pfPa(i) & ~U(63, 32 bits)) === pfNextPa))).orR
-    val pfCandSetBusy = Vec((0 until pfSlots).map(i =>
-      pfValid(i) && (pfSet(i) === pfCandSet))).orR
-    val pfFreeVec = Vec((0 until pfSlots).map(i => !pfValid(i)))
+      mshrValid(i + AxiIds.I_SPEC_BASE) &&
+        ((mshrPa(i + AxiIds.I_SPEC_BASE) & ~U(63, 32 bits)) === pfNextPa))).orR
+    // ...whereas "does ANY live fill already own this set?" IS uniform over the whole
+    // file. This subsumes the hand-written `demandSetOwned` state list (see its
+    // declaration below the FSM, which survives as the named i == DEMAND_IDX lane).
+    val pfCandSetBusy = Vec((0 until MSHR_N).map(i =>
+      mshrValid(i) && (mshrSet(i) === pfCandSet))).orR
+    // The prefetcher may only allocate SPECULATIVE entries; entry 0 is the FSM's.
+    val pfFreeVec = Vec((0 until pfSlots).map(i => !mshrValid(i + AxiIds.I_SPEC_BASE)))
     val pfHasFree = pfFreeVec.orR
     val pfFreeIdx = OHToUInt(OHMasking.first(pfFreeVec.asBits))
+    val pfFreeMshr = (pfFreeIdx.resize(mshrIdxBits) +
+                      U(AxiIds.I_SPEC_BASE, mshrIdxBits bits)).resize(mshrIdxBits)
     val pfWindowHasCandidate = pfSeqValid && prefetchEnable &&
       (pfNextPa <= pfLimitPa) && (pfNextPa(31 downto 12) === pfDemandLine(31 downto 12))
 
     // A held demand matching any live speculative line must re-look-up after install;
     // a same-set/different-line demand waits as well, preserving one fill owner per set.
     val lookupLineBase = lookupPaddr & ~U(63, 32 bits)
+    // Speculative-only, and it must stay that way: its ONLY consumer is `answerable`
+    // inside `lookupTick(canStartFill = true)`, which is reached only from IDLE, and in
+    // IDLE `mshrValid(DEMAND_IDX)` is False by construction -- so widening it to the
+    // whole file would be a literal no-op, and a misleading one.
     val pfLookupSetBusy = Vec((0 until pfSlots).map(i =>
-      pfValid(i) && (pfSet(i) === lookupSet))).orR
+      mshrValid(i + AxiIds.I_SPEC_BASE) &&
+        (mshrSet(i + AxiIds.I_SPEC_BASE) === lookupSet))).orR
 
+    // Speculative-only: entry 0's install is driven by the FSM's own REFILL->INSTALL_ARM
+    // transition, not by this arbiter (and `mshrComplete(DEMAND_IDX)` is never set).
     val pfInstallVec = Vec((0 until pfSlots).map(i =>
-      pfValid(i) && pfComplete(i) && !pfErr(i) && !pfPoison(i)))
+      mshrValid(i + AxiIds.I_SPEC_BASE) && mshrComplete(i + AxiIds.I_SPEC_BASE) &&
+        !mshrErr(i + AxiIds.I_SPEC_BASE) && !mshrPoison(i + AxiIds.I_SPEC_BASE)))
     val pfInstallAny = pfInstallVec.orR
     val pfInstallSel = OHToUInt(OHMasking.first(pfInstallVec.asBits))
+    val pfInstallMshr = (pfInstallSel.resize(mshrIdxBits) +
+                         U(AxiIds.I_SPEC_BASE, mshrIdxBits bits)).resize(mshrIdxBits)
 
     def seedPfWindow(): Unit = {
       val line = lookupPaddr & ~U(63, 32 bits)
@@ -853,8 +957,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // and tag lookup. Never gate this enable with hitVec/isHit: doing so would put
         // translation and tag comparison back on the BRAM ENARDEN path. Reads for a
         // miss/fault/held command are harmless because no S1 context consumes them.
+        // M2c (SG-3 exception 1): reads `installSet`, the dedicated dwell register, not
+        // `mshrSet(installIdx)` -- this comparator is in the ACCEPT cone and must not
+        // grow a 5:1 Vec mux in front of it. `installSet` was maintained in lock-step
+        // with the now-deleted `missSet` since Task 8, so this switch is a no-op.
         val setBlocked = if (canStartFill) False
-                         else (fillArrayWrActive && (lookupSet === missSet))
+                         else (fillArrayWrActive && (lookupSet === installSet))
         ufaReadAddr := lookupReadAddr
         ufaReadEn   := cmdPort.valid && !setBlocked
 
@@ -907,16 +1015,21 @@ class IcachePlugin extends FiberPlugin with FetchService {
             }
           } otherwise {
             // Reachable only in IDLE because answerable excludes a prefetch-time miss.
-            missPC    := lookupPc
-            missSet   := lookupSet
-            missTag   := lookupTag
-            missPA    := lookupPaddr
+            // M2c: this is now an ordinary MSHR ALLOCATION -- the same ten fields the
+            // speculative allocator writes, at index 0. `mshrValid(DEMAND_IDX) := True`
+            // is what makes entry 0 own `lookupSet` for the whole fill, replacing the
+            // hand-written `demandSetOwned` state list.
+            mshrValid(DEMAND_IDX)    := True
+            mshrArSent(DEMAND_IDX)   := False
+            mshrBeat(DEMAND_IDX)     := False
+            mshrErr(DEMAND_IDX)      := False
+            mshrPoison(DEMAND_IDX)   := False
+            mshrPa(DEMAND_IDX)       := lookupPaddr
+            mshrSet(DEMAND_IDX)      := lookupSet
+            mshrTag(DEMAND_IDX)      := lookupTag
+            mshrWay(DEMAND_IDX)      := victim(lookupSet)
+            missPC        := lookupPc
             missCacheable := lookupCacheable
-            victimWay := victim(lookupSet)
-            beatCnt   := U(0, 1 bits)
-            arSent    := False
-            missBusFault := False
-            missPoison   := False
             demandFillStart := True
             goto(REFILL)
           }
@@ -930,17 +1043,21 @@ class IcachePlugin extends FiberPlugin with FetchService {
         //
         // M2b: no 512-bit LUTRAM->register copy. Just name the entry and arm the file
         // read; PREDECODE reads it out synchronously next-next cycle.
+        // M2c: this arm now loads the INSTALL CONTEXT only. It no longer copies the
+        // installing slot's pa/tag/poison into the demand scalars (`missPA`/`missTag`/
+        // `missPoison`) the way it had to when those were the shared staging registers:
+        //   - `missPA` was pure dead code here (its only reader is `arHoldAddr`, under
+        //     `refillActive`, i.e. only in REFILL) and is DELETED with the write;
+        //   - the tag and the poison bit are read straight out of the MSHR entry being
+        //     installed (`mshrTag(installIdx)` / `mshrPoison(installIdx)`) in the dwell,
+        //     so entry 0 is never clobbered and `mshrValid(0)`/`mshrSet(0)` stay
+        //     truthful -- which is exactly what lets oracle 3 trust entry 0.
         when(pfInstallAny && !demandFillStart) {
-          installIdx    := (pfInstallSel + U(AxiIds.I_SPEC_BASE, mshrIdxBits bits)).resized
-          pfInstallIdx  := pfInstallSel
-          installSet    := pfSet(pfInstallSel)
-          missPC        := pfPa(pfInstallSel)
-          missPA        := pfPa(pfInstallSel)
-          missSet       := pfSet(pfInstallSel)
-          missTag       := pfTag(pfInstallSel)
+          installIdx    := pfInstallMshr
+          installSet    := mshrSet(pfInstallMshr)
+          installWay    := mshrWay(pfInstallMshr)
+          missPC        := mshrPa(pfInstallMshr)
           missCacheable := True
-          victimWay     := pfWay(pfInstallSel)
-          missPoison    := pfPoison(pfInstallSel) || anyInvalidate
           commitBeat    := U(0, 1 bits)
           predIsPfReg   := True
           goto(INSTALL_ARM)
@@ -952,7 +1069,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
         when(refillDone) {
           when(refillErr) { goto(FAULT) } otherwise {
             installIdx  := U(AxiIds.I_DEMAND, mshrIdxBits bits)
-            installSet  := missSet
+            installSet  := mshrSet(DEMAND_IDX)
+            installWay  := mshrWay(DEMAND_IDX)
             predIsPfReg := False
             goto(INSTALL_ARM)
           }
@@ -985,6 +1103,9 @@ class IcachePlugin extends FiberPlugin with FetchService {
         s1Lane  := missPC(4 downto 3)
         // M1b: predecode is masked to all-zero off `s1Fault` on the S1->rsp path.
         s1FromMiss := False
+        // M2c: the demand MSHR's ownership of its set ends here. Exactly the cycle the
+        // old hand-written `demandSetOwned` state list stopped including FAULT.
+        mshrValid(DEMAND_IDX) := False
         goto(IDLE)
       }
 
@@ -1012,9 +1133,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
         }
         when(commitBeat === U(1, 1 bits)) {
           when(predIsPfReg) {
-            pfValid(pfInstallIdx)    := False
-            pfArSent(pfInstallIdx)   := False
-            pfComplete(pfInstallIdx) := False
+            // M2c: freed by MSHR index. `pfInstallIdx` (a second, slot-relative copy of
+            // the same number `installIdx` already holds) is deleted. Guarded by
+            // `predIsPfReg`, so this decoder can never reach entry 0.
+            mshrValid(installIdx)    := False
+            mshrArSent(installIdx)   := False
+            mshrComplete(installIdx) := False
             goto(IDLE)
           } otherwise {
             goto(REPLAY)
@@ -1024,13 +1148,18 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
       // ----- REPLAY: arm S1 read for the just-filled line, then IDLE -----
       REPLAY.whenIsActive {
+        // M2c: `installSet`/`installWay` rather than `mshrSet(0)`/`mshrWay(0)`. REPLAY is
+        // demand-only (it is reached only from a PREDECODE dwell with predIsPfReg false,
+        // where INSTALL_ARM loaded both registers from entry 0), so the two are equal
+        // here by construction -- and reading back the line through the SAME registers
+        // that addressed the write is the property this state actually depends on.
         val replayBeatSel  = missPC(5)
-        val replayReadAddr = (missSet ## replayBeatSel).asUInt
+        val replayReadAddr = (installSet ## replayBeatSel).asUInt
 
         ufaReadAddr := replayReadAddr
         ufaReadEn   := True
         s1Valid := True
-        s1Way   := victimWay
+        s1Way   := installWay
         s1Pc    := missPC
         // A refill only happens for a NON-faulting translation (the live fault
         // path emits a placeholder without refilling), so the replayed line is fault-
@@ -1048,12 +1177,15 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // registers instead for that case, so latching this array read regardless
         // is harmless (simply unused).
         //
-        // Slice I1: `missPoison` (an invalidateAll that landed mid-fill) suppresses the
+        // Slice I1: poison (an invalidateAll that landed mid-fill) suppresses the
         // allocation too, so the same bypass must carry the response for that case --
         // the arrays were deliberately NOT written, and the in-flight fetch must still
-        // be answered or FetchAlign's ring never retires its entry (see `missPoison`'s
-        // declaration for the full front-end-wedge analysis).
-        s1FromMiss := !missCacheable || missPoison
+        // be answered or FetchAlign's ring never retires its entry (see the poison
+        // note above `mshrPoison`'s declaration for the full front-end-wedge analysis).
+        s1FromMiss := !missCacheable || mshrPoison(DEMAND_IDX)
+        // M2c: the demand MSHR's ownership of its set ends here, one cycle before the
+        // machine is back in IDLE -- exactly where the old state list stopped.
+        mshrValid(DEMAND_IDX) := False
 
         goto(IDLE)
       }
@@ -1106,26 +1238,30 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // Allocate at most one registered same-page candidate per cycle. Resident/live
     // candidates advance the frontier without consuming a slot; same-set conflicts
     // wait, enforcing one fill owner per set.
-    // M2b, DEVIATION FROM THE PLAN'S LITERAL TEXT (deliberate, and conservative):
-    // `INSTALL_ARM` is added to this state list. Before M2b the demand fill went
-    // REFILL -> PREDECODE -> REPLAY with no gap, so `missSet` was continuously "owned"
-    // from the first AR to the response. INSTALL_ARM inserts a cycle between REFILL and
-    // PREDECODE; leaving it out of this list would open a ONE-CYCLE hole in which the
-    // background allocator could hand a speculative slot the very set the demand fill
-    // is about to commit into (and, worse, hand it `victim(missSet)` -- the same way,
-    // read before PREDECODE advances the pointer). That is precisely the "one fill
-    // owner per set" property oracle 3 exists to protect, so the new state joins the
-    // list rather than being argued unreachable.
     //
-    // The converse direction needs no change: `PREDECODE` now also covers a SPECULATIVE
-    // install (where `missSet` is the installing slot's set), but that adds nothing,
-    // because `pfValid(pfInstallIdx)` is still set for the whole dwell -- it is cleared
-    // on the commitBeat==1 cycle, taking effect only as the machine leaves -- so
-    // `pfCandSetBusy` already covers that set on every one of those cycles.
-    val demandSetOwned = (fsm.isActive(fsm.REFILL) || fsm.isActive(fsm.INSTALL_ARM) ||
-                          fsm.isActive(fsm.PREDECODE) ||
-                          fsm.isActive(fsm.REPLAY) || fsm.isActive(fsm.FAULT)) &&
-                         (missSet === pfCandSet)
+    // ── M2c: "one fill owner per set" is now ONE uniform reduction ─────────────────
+    // `pfCandSetBusy` (declared above the FSM) reduces `mshrValid(i) && mshrSet(i) ===
+    // pfCandSet` over ALL MSHR_N entries, entry 0 included. `demandSetOwned` survives
+    // only as the NAMED i == DEMAND_IDX lane of that same reduction -- it is what the
+    // ledger, the M2b review and oracle 3's failure message all refer to by name, and
+    // keeping it visible is what makes the mutation proof legible. It is redundant with
+    // `pfCandSetBusy` by construction; the `||` below folds away.
+    //
+    // WHAT REPLACED WHAT, because this is a behavioural claim and not a cosmetic one.
+    // Before M2c: `demandSetOwned` was a hand-written five-state list AND-ed with
+    // `missSet === pfCandSet`, where `missSet` was a SHARED staging register that a
+    // speculative install overwrote with the installing slot's set. So on a speculative
+    // dwell the term guarded the SPECULATIVE set. After M2c: `mshrValid(DEMAND_IDX)` is
+    // True on exactly the five states that list enumerated MINUS the speculative-install
+    // dwell (INSTALL_ARM/PREDECODE with predIsPfReg), and `mshrSet(DEMAND_IDX)` is the
+    // demand set and nothing else. The dropped coverage is EXACTLY the speculative
+    // dwell, which M2b's own note already established is fully covered by the
+    // installing entry's own `mshrValid`/`mshrSet` lane: it is cleared on the
+    // commitBeat==1 cycle, taking effect only as the machine leaves, so every cycle of
+    // the dwell still has that entry live and owning that set. Net allocator behaviour
+    // is unchanged, and the M2b INSTALL_ARM hole stays closed -- structurally now,
+    // rather than by remembering to name a state.
+    val demandSetOwned = mshrValid(DEMAND_IDX) && (mshrSet(DEMAND_IDX) === pfCandSet)
     when(pfWindowHasCandidate && !anyInvalidate && !demandFillStart &&
          !pfWindowUpdate && !heldDemandMiss) {
       when(pfCandLive) {
@@ -1137,34 +1273,60 @@ class IcachePlugin extends FiberPlugin with FetchService {
       } elsewhen(pfCandResident) {
         pfNextPa := pfNextPa + U(64, 32 bits)
       } elsewhen(pfHasFree) {
-        pfValid(pfFreeIdx)    := True
-        pfArSent(pfFreeIdx)   := False
-        pfComplete(pfFreeIdx) := False
-        pfBeat(pfFreeIdx)     := False
-        pfErr(pfFreeIdx)      := False
-        pfPoison(pfFreeIdx)   := False
-        pfPa(pfFreeIdx)       := pfNextPa
-        pfSet(pfFreeIdx)      := pfCandSet
-        pfTag(pfFreeIdx)      := pfCandTag
-        pfWay(pfFreeIdx)      := victim(pfCandSet)
-        pfNextPa              := pfNextPa + U(64, 32 bits)
+        // The same ten fields the demand miss-detect arm writes at index 0.
+        mshrValid(pfFreeMshr)    := True
+        mshrArSent(pfFreeMshr)   := False
+        mshrComplete(pfFreeMshr) := False
+        mshrBeat(pfFreeMshr)     := False
+        mshrErr(pfFreeMshr)      := False
+        mshrPoison(pfFreeMshr)   := False
+        mshrPa(pfFreeMshr)       := pfNextPa
+        mshrSet(pfFreeMshr)      := pfCandSet
+        mshrTag(pfFreeMshr)      := pfCandTag
+        mshrWay(pfFreeMshr)      := victim(pfCandSet)
+        pfNextPa                 := pfNextPa + U(64, 32 bits)
       }
     }
 
     // Completed errors and poisoned silent fills allocate nothing and free locally.
+    // SPECULATIVE ONLY: entry 0 never sets `mshrComplete`, so including it here would be
+    // inert, and its "free" is the FSM's return to IDLE (REPLAY/FAULT), not this loop.
     for (i <- 0 until pfSlots) {
-      when(pfValid(i) && pfComplete(i) && (pfErr(i) || pfPoison(i))) {
-        pfValid(i)    := False
-        pfArSent(i)   := False
-        pfComplete(i) := False
+      val e = i + AxiIds.I_SPEC_BASE
+      when(mshrValid(e) && mshrComplete(e) && (mshrErr(e) || mshrPoison(e))) {
+        mshrValid(e)    := False
+        mshrArSent(e)   := False
+        mshrComplete(e) := False
       }
-      when(anyInvalidate && pfValid(i)) { pfPoison(i) := True }
+    }
+    // ...whereas "an invalidate poisons every live fill" IS uniform over the whole file.
+    // M2c: this ONE loop replaces the old speculative-only
+    // `when(anyInvalidate && pfValid(i)) pfPoison(i) := True` PLUS the separate
+    // `when(anyInvalidate && !fsm.isActive(IDLE)) { missPoison := True }` line that used
+    // to sit at the very bottom of this file. EQUIVALENCE for entry 0: `mshrValid(0)`
+    // is True on exactly REFILL/INSTALL_ARM(demand)/PREDECODE(demand)/REPLAY/FAULT,
+    // i.e. every non-IDLE state in which a demand fill exists; the only non-IDLE cycles
+    // it is False on are a SPECULATIVE dwell, where the old line poisoned the shared
+    // `missPoison` staging register -- and that is now covered by the installing entry's
+    // own lane, which is live for the whole dwell. Position matters: this loop
+    // elaborates AFTER the allocator above, so on a cycle that both allocates and
+    // invalidates the poison would win -- except the allocator is itself gated on
+    // `!anyInvalidate`, so the two can never fire together. It elaborates AFTER the FSM
+    // too, so it likewise wins over the miss-detect arm's `mshrPoison(0) := False` --
+    // and there it is a no-op, because `mshrValid(0)` is still False on the cycle the
+    // demand fill is being allocated (exactly the `!IDLE` gate the old line carried).
+    for (i <- 0 until MSHR_N) {
+      when(anyInvalidate && mshrValid(i)) { mshrPoison(i) := True }
     }
     when(anyInvalidate) { pfSeqValid := False }
 
     // Registered AR holding point: demand always wins an empty arbiter, then the
     // lowest speculative slot. Payload cannot change under backpressure.
-    val pfArWant = Vec((0 until pfSlots).map(i => pfValid(i) && !pfArSent(i) && !pfComplete(i)))
+    // Speculative-only: entry 0's AR is launched by the `refillActive` arm below.
+    val pfArWant = Vec((0 until pfSlots).map { i =>
+      val e = i + AxiIds.I_SPEC_BASE
+      mshrValid(e) && !mshrArSent(e) && !mshrComplete(e)
+    })
     val pfAnyArWant = pfArWant.orR
     val pfArSel = OHToUInt(OHMasking.first(pfArWant.asBits))
     // Do not create a new speculative AR hold in front of an architectural miss
@@ -1172,21 +1334,23 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // remains stable until fire, as AXI requires; this guard handles the empty-holder
     // arbitration case and the matching-fill error/retry boundary.
     val pfBlockingArWant = Vec((0 until pfSlots).map(i =>
-      pfArWant(i) && (pfSet(i) === lookupSet)))
+      pfArWant(i) && (mshrSet(i + AxiIds.I_SPEC_BASE) === lookupSet)))
     val pfBlockingArAny = pfBlockingArWant.orR
     val pfBlockingArSel = OHToUInt(OHMasking.first(pfBlockingArWant.asBits))
     val pfChosenArSel = Mux(heldDemandMiss, pfBlockingArSel, pfArSel)
+    val pfChosenArMshr = (pfChosenArSel.resize(mshrIdxBits) +
+                          U(AxiIds.I_SPEC_BASE, mshrIdxBits bits)).resize(mshrIdxBits)
     when(!arHoldValid) {
-      when(refillActive && !arSent) {
+      when(refillActive && !mshrArSent(DEMAND_IDX)) {
         arHoldValid := True
         arHoldId    := U(AxiIds.I_DEMAND, AxiIds.ID_W bits)
-        arHoldAddr  := missPA & ~U(63, 32 bits)
+        arHoldAddr  := mshrPa(DEMAND_IDX) & ~U(63, 32 bits)
       } elsewhen(pfAnyArWant && !demandFillStart &&
                  (!heldDemandMiss || pfBlockingArAny)) {
         arHoldValid := True
         arHoldId    := (pfChosenArSel.resize(AxiIds.ID_W) +
                         U(AxiIds.I_SPEC_BASE, AxiIds.ID_W bits)).resized
-        arHoldAddr  := pfPa(pfChosenArSel) & ~U(63, 32 bits)
+        arHoldAddr  := mshrPa(pfChosenArMshr) & ~U(63, 32 bits)
       }
     }
 
@@ -1196,25 +1360,25 @@ class IcachePlugin extends FiberPlugin with FetchService {
     axi.ar.payload.len   := U(1, 8 bits)
     axi.ar.payload.size  := U(5, 3 bits)
     axi.ar.payload.burst := Axi4.burst.INCR
+    // M2c: the AR id IS the MSHR index, so the demand/speculative branch is gone.
     when(axi.ar.fire) {
       arHoldValid := False
-      when(arHoldId === U(AxiIds.I_DEMAND, AxiIds.ID_W bits)) {
-        arSent := True
-      } otherwise {
-        val sentIdx = (arHoldId - U(AxiIds.I_SPEC_BASE, AxiIds.ID_W bits)).resize(pfIdxBits)
-        pfArSent(sentIdx) := True
-      }
+      mshrArSent(arHoldId.resize(mshrIdxBits)) := True
     }
 
-    // Route every R beat solely by RID. ID 0 feeds the existing precise demand
-    // context; IDs 1..4 feed one shallow speculative line store.
+    // Route every R beat solely by RID -- and after M2c the RID IS the MSHR index, so
+    // there is no per-path index arithmetic left at all.
+    val rIdx = axi.r.payload.id.resize(mshrIdxBits)
     val ridIsDemand = axi.r.payload.id === U(AxiIds.I_DEMAND, AxiIds.ID_W bits)
     val ridIsPf = (axi.r.payload.id >= U(AxiIds.I_SPEC_BASE, AxiIds.ID_W bits)) &&
                   (axi.r.payload.id <= U(AxiIds.I_SPEC_LAST, AxiIds.ID_W bits))
-    val pfRspIdx = (axi.r.payload.id -
-                    U(AxiIds.I_SPEC_BASE, AxiIds.ID_W bits)).resize(pfIdxBits)
-    val demandRspMatch = ridIsDemand && refillActive && arSent
-    val pfRspMatch = ridIsPf && pfValid(pfRspIdx) && pfArSent(pfRspIdx) && !pfComplete(pfRspIdx)
+    // Entry 0's "live on the bus" condition stays the FSM's `refillActive`, NOT
+    // `mshrValid(DEMAND_IDX)`: `mshrValid(0)` spans the whole fill INCLUDING the install
+    // dwell and REPLAY, whereas an R beat is only legal in REFILL. Reading mshrValid
+    // here would widen the accept window by four states and silence the assertion below
+    // for exactly the beats it exists to catch.
+    val demandRspMatch = ridIsDemand && refillActive && mshrArSent(DEMAND_IDX)
+    val pfRspMatch = ridIsPf && mshrValid(rIdx) && mshrArSent(rIdx) && !mshrComplete(rIdx)
     axi.r.ready := demandRspMatch || pfRspMatch
 
     when(axi.r.valid) {
@@ -1235,40 +1399,37 @@ class IcachePlugin extends FiberPlugin with FetchService {
     //     i.e. only in REFILL. `installIdx` is only READ FOR REAL from PREDECODE, and
     //     the final beat's write lands the cycle BEFORE INSTALL_ARM, so the address is
     //     re-sampled after the write has settled.
-    //   - a speculative entry is written only while `!pfComplete(i)`, and an entry can
-    //     only win the installer once `pfComplete(i)` is set, so no write can reach the
+    //   - a speculative entry is written only while `!mshrComplete(i)`, and an entry can
+    //     only win the installer once `mshrComplete(i)` is set, so no write can reach the
     //     entry being installed.
     //   - a stale `installIdx` left pointing at an entry that is being refilled DOES
     //     collide, and the `dontCare` output that produces is consumed by nothing:
     //     `beatSrc`/`beatNext3` are only sampled under `predActive`.
-    val rIdx      = axi.r.payload.id.resize(mshrIdxBits)
+    //
+    // ---- M2c: ONE R-channel handler. No demand/speculative branch at all. ----
+    // The beat counter, the error latch and the two-beat assertion were duplicated per
+    // path; each is now a single `mshr*(rIdx)` statement. The ONLY thing that still
+    // distinguishes the two is what "the burst finished" MEANS: the demand path hands
+    // `refillDone`/`refillErr` to the FSM (which owes a response), the speculative path
+    // just sets `mshrComplete` and lets the background installer pick it up.
     val rOwned    = demandRspMatch || pfRspMatch
     val rFire     = axi.r.fire && rOwned
-    // Which beat this entry is expecting. Demand uses beatCnt (entry 0), speculative
-    // uses pfBeat (entries 1..N). Task 9 unifies these into mshrBeat(rIdx).
-    val rBeatIsHi = Mux(demandRspMatch, beatCnt.asBool, pfBeat(pfRspIdx))
-    fillLo.write(rIdx, axi.r.payload.data, enable = rFire && !rBeatIsHi)
-    fillHi.write(rIdx, axi.r.payload.data, enable = rFire &&  rBeatIsHi)
+    fillLo.write(rIdx, axi.r.payload.data, enable = rFire && !mshrBeat(rIdx))
+    fillHi.write(rIdx, axi.r.payload.data, enable = rFire &&  mshrBeat(rIdx))
 
-    when(axi.r.fire) {
+    when(rFire) {
       val respErr = axi.r.payload.resp =/= Axi4.resp.OKAY
-      when(demandRspMatch) {
-        assert(axi.r.payload.last === beatCnt.asBool,
-          "demand I-cache refill must be exactly two beats")
-        when(respErr) { missBusFault := True }
-        beatCnt := beatCnt + 1
-        when(axi.r.payload.last) {
+      // Generalised from the two identical per-path assertions M2b carried.
+      assert(axi.r.payload.last === mshrBeat(rIdx),
+        "I-cache refill must be exactly two beats")
+      when(respErr) { mshrErr(rIdx) := True }
+      mshrBeat(rIdx) := !mshrBeat(rIdx)
+      when(axi.r.payload.last) {
+        when(ridIsDemand) {
           refillDone := True
-          refillErr  := missBusFault || respErr
-        }
-      } otherwise {
-        assert(axi.r.payload.last === pfBeat(pfRspIdx),
-          "speculative I-cache refill must be exactly two beats")
-        when(respErr) { pfErr(pfRspIdx) := True }
-        pfBeat(pfRspIdx) := !pfBeat(pfRspIdx)
-        when(axi.r.payload.last) {
-          pfComplete(pfRspIdx) := True
-          pfErr(pfRspIdx) := pfErr(pfRspIdx) || respErr
+          refillErr  := mshrErr(DEMAND_IDX) || respErr
+        } otherwise {
+          mshrComplete(rIdx) := True
         }
       }
     }
@@ -1300,12 +1461,18 @@ class IcachePlugin extends FiberPlugin with FetchService {
     when(predActive) {
       // An INHIBITED-mode fetch never allocates a line — no tag/valid write, no
       // victim-pointer advance (that way is not consumed; the same victim way is tried
-      // again on the NEXT real allocation to this set). Slice I1 adds `missPoison`: an
+      // again on the NEXT real allocation to this set). Slice I1 adds the poison bit: an
       // `invalidateAll` that landed mid-fill also suppresses the allocation, so a fill
       // in flight when the cache was told to drop everything cannot quietly re-install
       // its line one cycle later. (Closure (1), the same-cycle guard on the `valids`
       // write, is still present below and covers the exactly-simultaneous case.)
-      val doAllocate = missCacheable && !missPoison
+      //
+      // M2c: the poison is read from the ENTRY BEING INSTALLED rather than from a
+      // shared `missPoison` staging register that IDLE's speculative-install arm had to
+      // load. Same value, one fewer copy, and entry 0 stays untouched by a speculative
+      // install -- which is what lets `mshrValid(0)`/`mshrSet(0)` mean what oracle 3
+      // now assumes they mean.
+      val doAllocate = missCacheable && !mshrPoison(installIdx)
       // M2a/M2b: capture ONLY the window this refill's own fetch will consume, in BOTH
       // data and predecode. `missPC(5)` picks the beat, `missPC(4:3)` picks the window
       // inside it. Written on whichever dwell cycle classifies that beat, so it is
@@ -1329,9 +1496,13 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // shifts: REPLAY is entered the cycle AFTER commitBeat==1 either way.
         dbgAllocCommitCycle := doAllocate
         for (w <- 0 until ways) {
-          when(victimWay === U(w, wayBits bits)) {
+          when(installWay === U(w, wayBits bits)) {
             when(doAllocate) {
-              tagMem(w).write(missSet, missTag)
+              // M2c: the write ADDRESS comes from `installSet` (SG-3 exception 2) and the
+              // way decode from `installWay` (exception 3); only the tag DATA is read
+              // out of the file at `installIdx`, where a 5:1 mux is harmless (it is
+              // write data, not an accept-cone comparator and not an array address).
+              tagMem(w).write(installSet, mshrTag(installIdx))
               // The `valids` write MUST yield to a same-cycle invalidate-all. The
               // declaration site above calls itself a "priority clear of all valid
               // bits", and that WAS the intent — but the clear elaborates EARLIER in
@@ -1343,22 +1514,22 @@ class IcachePlugin extends FiberPlugin with FetchService {
               // commit-time CPUSH/CINV dispatch pulses `maintInvalidateAll` -- and with
               // slice I3 a PREFETCH fill widens that window further.
               when(!anyInvalidate) {
-                valids(w)(missSet) := True
+                valids(w)(installSet) := True
               }
               // Telemetry only: record whether the installed line arrived through a
               // silent speculative ID. Demand installation clears the marker; window
               // allocation does not depend on it.
-              pfFilled(w)(missSet) := predIsPf && !anyInvalidate
+              pfFilled(w)(installSet) := predIsPf && !anyInvalidate
             }
           }
         }
         when(doAllocate) {
-          victim(missSet) := victim(missSet) + 1
+          victim(installSet) := victim(installSet) + 1
         }
       }
       when(doAllocate) {
         for (w <- 0 until ways) {
-          when(victimWay === U(w, wayBits bits)) {
+          when(installWay === U(w, wayBits bits)) {
             // M1: ONE write, ONE call site (a SECOND Mem.write call site breaks
             // SpinalHDL's MultiPortWritesSymplifier -- a real previously-shipped
             // breakage in this file, see the icache-burst-fault-fix note above). The
@@ -1366,7 +1537,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
             // exactly the cycle the old data-only write used. `beatSrc` is literally
             // the expression the old write inlined, so the data half is unchanged by
             // construction.
-            lineMem(w).write((missSet ## commitBeat).asUInt, beatPred ## beatSrc)
+            lineMem(w).write((installSet ## commitBeat).asUInt, beatPred ## beatSrc)
           }
         }
       }
@@ -1377,9 +1548,13 @@ class IcachePlugin extends FiberPlugin with FetchService {
     }
 
     // ---- slice I1 closure (2): poison an in-flight fill on invalidateAll ----
-    // See `missPoison`'s declaration for why the response is still delivered and why
-    // §6.5's "invalidate the s1*/rsp* stages" bullet is deliberately NOT adopted.
-    when(anyInvalidate && !fsm.isActive(fsm.IDLE)) { missPoison := True }
+    // M2c: DELETED from here. It is now the `when(anyInvalidate && mshrValid(i))` lane
+    // of the ONE uniform poison loop above, which covers the demand entry and the
+    // speculative slots with the same statement. See that loop for the cycle-by-cycle
+    // equivalence argument against the old `!fsm.isActive(IDLE)` gate, and the poison
+    // note above `mshrPoison`'s declaration for why the response is still delivered and
+    // why section 6.5's "invalidate the s1*/rsp* stages" bullet is deliberately NOT
+    // adopted.
 
     // FetchService accessors
     def cmd: Stream[FetchCmd] = cmdPort

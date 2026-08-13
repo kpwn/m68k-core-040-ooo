@@ -35,7 +35,7 @@ import org.scalatest.funsuite.AnyFunSuite
   * The deleted sweep's real value was proving each predecode write landed at the RIGHT
   * ADDRESS, including for lines nothing has read back. That value is retained in full by
   * oracle 4b below, because as of M1 the predecode and the data are ONE write, of ONE
-  * concatenated entry, at ONE address: `lineMem(w).write(missSet ## commitBeat,
+  * concatenated entry, at ONE address: `lineMem(w).write(installSet ## commitBeat,
   * beatPred ## beatSrc)`. A wrong write address, a swapped beat half, or a mis-ordered
   * concatenation therefore corrupts the DATA half too, and 4b re-derives every resident
   * beat's 256 data bits from the backing-memory image -- a genuinely independent oracle
