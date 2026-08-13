@@ -857,19 +857,31 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // ITLB response puts on them is captured identically by both. Exempting faults would
     // silently drop coverage of every faulting accept, and the M3a directed fault test
     // below confirms empirically that the un-exempted form holds.
+    // TASK 10 REVIEW FIX I1: compare the FULL ONE-HOT VECTOR, not just its OR-reduction.
+    // The original check (`s1Hit === dbgLiveHitQ`) was proven by mutation to be INVISIBLE
+    // to a consistent way-permutation of the capture (`validsQ(w) := lookupValids(ways-1-w)`
+    // together with the matching `tagQ` permutation): the OR-reduced verdict still says
+    // "hit", while the registered path identifies the WRONG WAY. Task 11 turns `s1WayOh`
+    // straight into the S1 data/predecode select, so a permuted way is exactly risk R3's
+    // silent mis-paired-instruction-bytes failure -- no crash, wrong bytes. The 4
+    // additional transitional flops (`dbgLiveHitVecQ`, one per way) are deleted in Task 11
+    // together with the rest of the shadow scaffolding, same lifecycle as `dbgLiveHitQ`.
     val dbgS0Fresh      = RegNext(cmdPort.fire) init False
     val dbgLiveHitQ     = RegNextWhen(isHit, cmdPort.fire) init False
+    val dbgLiveHitVecQ  = RegNextWhen(hitVec.asBits, cmdPort.fire) init B(0, ways bits)
     val dbgVerdictMatch = Bool()
-    dbgVerdictMatch := !dbgS0Fresh || (s1Hit === dbgLiveHitQ)
+    dbgVerdictMatch := !dbgS0Fresh || (s1HitVec.asBits === dbgLiveHitVecQ)
     dbgS0Fresh.simPublic(); dbgLiveHitQ.simPublic(); dbgVerdictMatch.simPublic()
+    dbgLiveHitVecQ.simPublic()
     // In-RTL, synthesis-inert, and therefore running under EVERY test in the tree --
     // lock-step, the fuzz campaign and the ported corpus included -- not only under the
     // directed shadow suite. Same style as the `missPC` immutability assertion (M2b) and
     // the `refillActive => mshrValid(DEMAND_IDX)` assertion (Task 9 review fix M3).
     assert(dbgVerdictMatch,
-      "M3a SHADOW VIOLATED: the S1 verdict computed from the REGISTERED S0 context " +
-      "(tagQ/validsQ/s0Ppn/s0Cacheable) disagrees with the LIVE accept-cycle isHit, " +
-      "delayed one cycle. M3 cannot flip until these are identical -- risk R3's failure " +
+      "M3a SHADOW VIOLATED: the S1 per-way hit VECTOR computed from the REGISTERED S0 " +
+      "context (tagQ/validsQ/s0Ppn/s0Cacheable) disagrees with the LIVE accept-cycle " +
+      "hitVec, delayed one cycle -- either the hit/miss verdict or the SELECTED WAY " +
+      "differs. M3 cannot flip until these are identical -- risk R3's failure " +
       "mode is silent instruction-byte mis-pairing, not a crash.")
     // An architectural miss can remain visibly held while a speculative owner or
     // the shared installer drains.  Freeze old-window allocation and let the AR

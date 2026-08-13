@@ -118,14 +118,51 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
           val ppn    = ic.logic.s0Ppn.toBigInt
           val cache  = ic.logic.s0Cacheable.toBoolean
           val flt    = ic.logic.s0Fault.toBoolean
-          if (!ic.logic.dbgVerdictMatch.toBoolean || live != shadow)
+
+          // ── TASK 10 REVIEW FIX I2: independently validate the S0 ADDRESS CAPTURE ──
+          // `s0Set`/`s0Beat`/`s0Lane` were captured but validated by NEITHER leg of the
+          // equivalence check: the in-RTL assertion never reads them (no RTL consumer at
+          // this task), and the independent model BELOW *consumes* `s0Set` for its own
+          // array indexing -- so a mis-captured set is read consistently by the model and
+          // silently "agrees". Proven by mutation (`s0Set := lookupSet(4 downto 0).resized`).
+          // Task 11 uses `s0Set` in the extended `demandSetOwned` check and Task 12 uses
+          // it to re-address the arrays, so it is safety-relevant, not decorative.
+          // NOT CIRCULAR: the expectation is derived from `s0Pc`, which is independently
+          // end-to-end validated via `rspPcReg` and the order oracle, and the field
+          // positions are the ISA/geometry constants (64B line, 64 sets, 8B lane).
+          if (set != ((pc >> 6) & 63).toInt)
+            simFailure(
+              f"M3a S0 SET CAPTURE WRONG at pc=0x$pc%x: s0Set=$set but pc(11:6)=" +
+              f"${((pc >> 6) & 63).toInt}. The registered set index does not address the " +
+              f"line the accepted command asked for -- Task 11's `demandSetOwned` and " +
+              f"Task 12's array re-address both read this.")
+          if (ic.logic.s0Beat.toBoolean != (((pc >> 5) & 1) == 1))
+            simFailure(
+              f"M3a S0 BEAT CAPTURE WRONG at pc=0x$pc%x: s0Beat=" +
+              f"${ic.logic.s0Beat.toBoolean} but pc(5)=${((pc >> 5) & 1) == 1}. The " +
+              f"registered beat select would deliver the WRONG HALF-LINE.")
+          if (ic.logic.s0Lane.toInt != ((pc >> 3) & 3).toInt)
+            simFailure(
+              f"M3a S0 LANE CAPTURE WRONG at pc=0x$pc%x: s0Lane=${ic.logic.s0Lane.toInt} " +
+              f"but pc(4:3)=${((pc >> 3) & 3).toInt}. The registered lane index would " +
+              f"deliver the WRONG 8-BYTE WINDOW -- risk R3's silent mis-paired bytes.")
+
+          if (!ic.logic.dbgVerdictMatch.toBoolean || live != shadow) {
+            // Review fix I1: report the FULL per-way vectors, because the mismatch can
+            // now be a WAY disagreement with both OR-reduced verdicts reading "hit".
+            val liveVec   = ic.logic.dbgLiveHitVecQ.toInt
+            val shadowVec = (0 until 4).map(w =>
+              if (ic.logic.s1HitVec(w).toBoolean) 1 << w else 0).sum
             simFailure(
               f"M3a SHADOW VIOLATED at pc=0x$pc%x (set=$set ppn=0x${ppn.toString(16)} " +
               f"cacheable=$cache fault=$flt): the S1 verdict computed from registered " +
-              f"inputs (tagQ/validsQ/s0Ppn/s0Cacheable) says hit=$shadow but the live " +
-              f"accept-cycle isHit said hit=$live. M3 cannot flip until these are " +
-              f"identical -- risk R3's failure mode is silent instruction-byte " +
-              f"mis-pairing, not a crash.")
+              f"inputs (tagQ/validsQ/s0Ppn/s0Cacheable) says hit=$shadow " +
+              f"hitVec=0b${shadowVec.toBinaryString} but the live accept-cycle said " +
+              f"hit=$live hitVec=0b${liveVec.toBinaryString}. M3 cannot flip until these " +
+              f"are identical -- a WAY-ONLY disagreement (same hit/miss, different way) " +
+              f"is exactly risk R3's failure mode: silent instruction-byte mis-pairing, " +
+              f"not a crash.")
+          }
           if (live) {
             st.hits += 1
             for (w <- 0 until 4) if (ic.logic.s1HitVec(w).toBoolean) st.wayHits(w) += 1
