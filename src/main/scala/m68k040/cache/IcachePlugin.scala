@@ -698,10 +698,29 @@ class IcachePlugin extends FiberPlugin with FetchService {
     //
     // `!s0Replay` mirrors `s1Unresolved`'s own qualifier: REPLAY and FAULT inject a
     // synthetic S0 context whose `s0Ppn`/`s0Cacheable`/`tagQ`/`validsQ` are the LAST
-    // ACCEPTED command's leftovers (see `s0Replay`'s declaration). Letting one of those
-    // through would re-seed the frontier off a stale PPN, and -- worse -- would make
-    // `heldDemandMissQ` below fire for a REPLAY, freezing the allocator on a synthetic
-    // "miss" that has already been filled.
+    // ACCEPTED command's leftovers (see `s0Replay`'s declaration), so admitting one
+    // here would seed the frontier and compute `heldDemandMissQ` from state that does
+    // not belong to it.
+    //
+    // HONEST SEVERITY (Task 12 review M2 -- an earlier revision of this comment implied
+    // a correctness claim, and that is not what the evidence supports). MUTATION-TESTED:
+    // with `!s0Replay` deleted the full I-cache suite still passes 57/57. What the term
+    // actually buys, in both directions:
+    //   - `heldDemandMissQ` (= `s1Disp.valid && !hit && !fault`) would go high for ONE
+    //     cycle on each REPLAY, since the stale `s1HitVec` for a just-installed line is
+    //     typically all-zero. That freezes the allocator for that one cycle. A
+    //     PERFORMANCE nit, not a correctness bug -- nothing downstream mistakes it for a
+    //     second fill, because the demand MSHR dispatch is driven by `s1Unresolved`,
+    //     which carries its own `!s0Replay`.
+    //   - The stale-context SEED is a no-op today rather than a wrong seed: REPLAY
+    //     leaves `s0Set`/`s0Ppn` at the values of the very command that missed, so
+    //     `s1Line == pfDemandLine`, the inner `when` is skipped and `pfWindowUpdate`
+    //     stays low. The bus-error FAULT context would take the kill arm and clear
+    //     `pfSeqValid`, which is conservative in the safe direction.
+    // The term is kept because both of those are accidents of how REPLAY/FAULT happen
+    // to arm S0 rather than properties anything enforces, and because it costs nothing.
+    // No directed test is added for it: a one-cycle allocator freeze is below the
+    // resolution of any assertion in this suite that would not itself be brittle.
     val s1Disp = new Bundle {
       val valid     = RegInit(False)
       val hit       = Reg(Bool())
@@ -1891,8 +1910,91 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // "can a speculative slot be allocated to the set an accepted demand is about to
     // claim", is answered by `demandSetOwned`'s three lanes and `pfCandSetBusy` above,
     // all of which stay live/exact.
+    //
+    // ══ TASK 12 REVIEW FIX I1: THE WINDOW-KILL IS 2 CYCLES LATE. CLOSE T+1. ═══════
+    // The window kill (`pfWindowUpdate := True; pfSeqValid := False` in the fault /
+    // uncacheable arm of the frontier seed above) now runs off `s1Disp`, which is
+    // `RegNext(s0Valid && !s0Replay)`. Naming the accept cycle T:
+    //
+    //   T    a command is accepted whose LIVE translation verdict is FAULT or
+    //        INHIBITED. Nothing registered reflects it yet.
+    //   T+1  `s0Fault`/`s0Cacheable` now carry the verdict, but the only freeze that
+    //        reads them is `demandFillStart`, and only for the INHIBITED-in-IDLE
+    //        dispatch; a FAULT never reaches the fill engine at all (`s1Unresolved`
+    //        is False for it), so under Task 12 as committed a FAULT got NO freeze
+    //        on this cycle.
+    //   T+2  `s1Disp` fires, `pfWindowUpdate` goes high, `pfSeqValid` clears. Frozen
+    //        from here on, permanently -- `pfWindowHasCandidate` needs `pfSeqValid`.
+    //
+    // The parent RTL killed the window ON cycle T (the seed read `lookupFault`/
+    // `lookupCacheable` inside `when(cmdPort.fire)`), i.e. zero cycles of exposure.
+    // Cycles T and T+1 are therefore a REGRESSION, and what they expose is a rule-P1
+    // violation and not merely a lost prefetch: a speculative slot can be allocated
+    // from -- and its AR launched against -- a window whose page the core has, on the
+    // very cycle in question, been told is unmapped or cache-inhibited. Rule P1
+    // forbids exactly that: no speculative bus transaction may rest on a stale
+    // cacheability/backing assumption.
+    //
+    // This term closes T+1, for BOTH causes, off flop outputs only (`s0Valid`,
+    // `s0Replay`, `s0Fault`, `s0Cacheable` are all Task-10/11 S0-capture registers),
+    // so M4's "no live translation verdict in the frontier cone" property is intact.
+    // `!s0Replay` matches `s1Unresolved`'s and `s1Disp.valid`'s own qualifier: the
+    // synthetic REPLAY / bus-error-FAULT contexts leave `s0Cacheable` at the LAST
+    // ACCEPTED command's value, so reading it there would freeze the allocator off a
+    // stale bit (and neither of those contexts kills the window at T+2 either --
+    // `s1Disp.valid` excludes them -- so freezing for them would not even be
+    // conservative in the same direction).
+    //
+    // Purely conservative, zero legitimate prefetch lost: every cycle this term is
+    // high is a cycle on which the window is already condemned and will be dead one
+    // cycle later, so any allocation it suppresses was going to be the LAST one made
+    // from a window that no longer describes a page the core may speculate into. A
+    // plain cacheable miss (`s0Fault` low, `s0Cacheable` high) never asserts it, so
+    // the bubble-free hit/miss stream the frontier exists for is untouched.
+    //
+    // ── ACCEPTED RESIDUAL: CYCLE T, BOUNDED TO ONE CYCLE ────────────────────────
+    // Cycle T is NOT closed, deliberately. Scope, exactly:
+    //   * requires an accepted command whose live verdict is FAULT or INHIBITED,
+    //   * ON that one cycle only (T+1 onward is now covered by this term, T+2 onward
+    //     by the kill itself),
+    //   * with `pfSeqValid` high and a candidate in range, and
+    //   * to be a genuine stale-cacheability violation rather than a merely wasted
+    //     prefetch, that command must be to the SAME 4-KiB page as the window
+    //     (`pfWindowHasCandidate` pins every candidate to `pfDemandLine`'s page), i.e.
+    //     it takes a live same-page mapping/cacheability TRANSITION under an open
+    //     prefetch window -- an ATC flush or descriptor rewrite landing between the
+    //     seed and this fetch.
+    //   * Consequence when it does hit: at most ONE speculative line of that page is
+    //     allocated and read over AXI.
+    //
+    // Why it is not closed: nothing registered on cycle T carries the verdict -- the
+    // ITLB produces it combinationally that cycle. The closures that exist all fail:
+    //   * `!(cmdPort.fire && (lookupFault || !lookupCacheable))` -- puts the live
+    //     translation verdict back into the allocator's enable cone, which is the one
+    //     arc M4 exists to delete (spec §5.4). Rejected on design intent.
+    //   * `!cmdPort.fire`, or `!cmdPort.fire`-narrowed-to-same-page -- verdict-free
+    //     and all-flop except the handshake, but a bubble-free same-page hit stream
+    //     fires every cycle, so the frontier would never advance. It converts a
+    //     1-cycle residual into a permanently dead prefetcher, and is caught by
+    //     "bubble-free resident demand stream does not starve speculative
+    //     allocation". Rejected on cost.
+    //   * Allocate at T, then RETRACT the slot at T+2 (clear `mshrValid` for
+    //     speculative entries with `!mshrArSent` when the kill lands) -- would work
+    //     only with the AR-hold write ALSO suppressed at T+1 and T+2, i.e. a new MSHR
+    //     lifecycle transition (and its deadlock surface) added for one cycle of
+    //     coverage. It also would not change the exposure CLASS: a slot allocated at
+    //     T-1 whose AR has already gone out is equally reading a page whose mapping
+    //     has just changed, and no retraction can recall an AXI transaction. The
+    //     residual is therefore the tail of a property this design cannot hold
+    //     absolutely in either the parent or M4 form. Rejected on cost/benefit.
+    //
+    // Not reachable by the current corpus: every lock-step and cache suite runs
+    // `IdentityTranslationPlugin`, which never faults and never reports INHIBITED, so
+    // no test can distinguish T from T+1 today. Recorded for Task 13's mutation-proof
+    // record, which is where this class of safety property is formally tracked.
+    val s0KillsWindowQ = s0Valid && !s0Replay && (s0Fault || !s0Cacheable)
     when(pfWindowHasCandidate && !anyInvalidate && !demandFillStart &&
-         !pfWindowUpdate && !demandStuckQ) {
+         !pfWindowUpdate && !demandStuckQ && !s0KillsWindowQ) {
       when(pfCandLive) {
         pfNextPa := pfNextPa + U(64, 32 bits)
       } elsewhen(pfCandSetBusy || demandSetOwned) {
@@ -2025,10 +2127,13 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // outranks lower-numbered slots in the AR arbiter" FAILS, launching slot 1's line
     // instead of the blocking slot 3's. (Verified, not reasoned about -- Task 12 report.)
     //
-    // Why (a) has no blocking owner to steer to: under `heldDemandMissQ` the miss was
-    // ACCEPTED, which SG-1's `pfAcceptOk := !pfLookupSetBusy` only permits when no
-    // speculative slot owns its set. So a `pfBlockingArWant` for an accepted miss is
-    // all-zero by construction; there is nothing for the Mux to pick.
+    // Why case (a) needs no blocking-owner steering (Task 12 review M1 -- the earlier
+    // wording here argued from `pfAcceptOk`, which describes the pre-M4 code and is not
+    // what holds post-M4): neither reader of `pfBlockingArWant` is enabled under (a)
+    // [`heldDemandMissQ`], because both are qualified by `heldOnSetBusyQ` -- the
+    // priority Mux immediately below, and the AR-hold escape hatch further down
+    // (`heldOnSetBusyQ && pfBlockingArAny`). Under (a) alone the vector is computed but
+    // never consulted.
     val pfChosenArSel = Mux(heldOnSetBusyQ, pfBlockingArSel, pfArSel)
     val pfChosenArMshr = (pfChosenArSel.resize(mshrIdxBits) +
                           U(AxiIds.I_SPEC_BASE, mshrIdxBits bits)).resize(mshrIdxBits)

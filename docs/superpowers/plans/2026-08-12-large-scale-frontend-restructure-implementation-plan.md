@@ -3088,6 +3088,24 @@ Spec §12.2: "Each of these must make a *named* test fail; if one does not, the 
 - Consumes: all oracles and directed tests from Tasks 4–12.
 - Produces: `IcacheMutationProofSpec` — a documentation-of-coverage suite, one `test` per mutation, each **asserting the covering test exists and is tagged**, plus a scaladoc block recording the observed failure. Not a mutation *runner* (SpinalHDL RTL mutation cannot be driven from ScalaTest); the running is manual and its result is the deliverable.
 
+- [ ] **Step 0 (ADDED by the Task 12 review follow-up, finding I1): record the ACCEPTED RESIDUAL on the window kill**
+
+Task 12's review found, and the Task 12 follow-up commit partly closed, a real behavioural regression against the parent RTL: the speculative prefetch window is killed **2 cycles after** the fault/INHIBITED translation that must kill it, where the parent killed it on the accept cycle itself. Naming the accept cycle T:
+
+| cycle | state | covered? |
+|---|---|---|
+| T | live `lookupFault`/`lookupCacheable` only; nothing registered reflects the verdict | **NO — accepted residual** |
+| T+1 | `s0Fault`/`s0Cacheable` carry the verdict | **YES** — closed by the follow-up's `!s0KillsWindowQ` term on the allocator gate (`s0Valid && !s0Replay && (s0Fault \|\| !s0Cacheable)`, all flop outputs). Before that term, T+1 was covered only for INHIBITED-in-IDLE via `demandFillStart`, and **not at all** for a FAULT. |
+| T+2 onward | `s1Disp` fires, `pfWindowUpdate` high, `pfSeqValid` cleared | YES, permanently |
+
+**Exact scope of the residual**, to be recorded verbatim in `IcacheMutationProofSpec`'s scaladoc alongside the five mutations: one cycle (T only); requires an accepted command whose live verdict is FAULT or INHIBITED, with `pfSeqValid` high and a candidate in range; and to be a genuine rule-P1 stale-cacheability violation rather than a merely wasted prefetch, that command must be to the **same 4-KiB page** as the window (every candidate is pinned to `pfDemandLine`'s page by `pfWindowHasCandidate`) — i.e. it takes a live same-page mapping/cacheability **transition** landing between the window's seed and this fetch. Consequence when hit: at most **one** speculative line of that page is allocated and read over AXI.
+
+**Not closable without violating M4's design intent**, and the three candidate closures are recorded as rejected at the site in `IcachePlugin.scala` (live verdict in the allocator cone → rejected on intent; `!cmdPort.fire` → permanently dead prefetcher, caught by "bubble-free resident demand stream does not starve speculative allocation" → rejected on cost; allocate-then-retract → a new MSHR lifecycle transition plus its deadlock surface, and it does not change the exposure class, since a slot allocated at T−1 with its AR already out is equally exposed and no retraction can recall an AXI transaction → rejected on cost/benefit).
+
+**Not reachable by the current corpus**: every lock-step and cache suite runs `IdentityTranslationPlugin`, which never faults and never reports INHIBITED, so no existing test can distinguish T from T+1. Task 12's review confirmed the window is real in the RTL via 4 temporary in-RTL probe assertions.
+
+**Required action here:** no mutation run (there is no test to fail). Copy the scope statement above into `IcacheMutationProofSpec`'s scaladoc as a sixth, explicitly **UNCOVERED** entry, so the gap is recorded as a known-and-bounded property rather than an unexamined one. Optionally add a directed test using `ICacheModeTranslationPlugin` (already used by `IcacheUnifiedArraySpec`) driving an INHIBITED transition on a live window; if added, it should pin the T+1 closure (which is testable) rather than attempt to assert on T.
+
 - [ ] **Step 1: Run mutation 1 — force `s1Unresolved := False`**
 ```bash
 cd /home/qwertyoruiop/m68k-core-040-ooo-worktrees/frontend-restructure
