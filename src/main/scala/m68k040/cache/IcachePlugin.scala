@@ -1988,16 +1988,21 @@ class IcachePlugin extends FiberPlugin with FetchService {
     //     residual is therefore the tail of a property this design cannot hold
     //     absolutely in either the parent or M4 form. Rejected on cost/benefit.
     //
-    // Unproven by the current corpus -- but NOT because no harness can reach it.
-    // `ICacheModeTranslationPlugin` (used by 4 cache suites) already provides a live
-    // sim-poked fault/INHIBITED transition, and `IcacheUnifiedArraySpec`'s M1b test
-    // already produces this exact scenario's shape (warms 0x1000 with prefetch left
-    // enabled, then flips `forceFault` live) -- it just never asserts on AR traffic
-    // while doing so. What's actually missing is an assertion on an existing
-    // transition, not a new fault-capable harness. Recorded for Task 13's
-    // mutation-proof record, which is where this class of safety property is
-    // formally tracked; Task 13 should add the AR-traffic assertion to (or alongside)
-    // that existing scenario rather than building a new translation-faulting harness.
+    // NOW PROVEN AND PINNED (Task 13). It is no longer "accepted and unobserved": the
+    // residual is REACHED and its bound MEASURED by `IcachePrefetchSpec`'s "P1 residual
+    // (cycle T): a fetch whose LIVE verdict is FAULT allocates AT MOST ONE speculative
+    // line, in its own page". That test seeds a real five-line window with the allocator
+    // shut off, then opens the allocator and offers the faulting command in the SAME
+    // simulation delta -- so the first cycle `pfWindowHasCandidate` can be true IS the
+    // accept cycle, with nothing to calibrate -- and asserts BOTH directions: at most
+    // one speculative AR (the safety bound) and exactly one (non-vacuity: a zero would
+    // mean either the residual was not reached or it was closed, and in the latter case
+    // THIS COMMENT is the thing that is now wrong). It also pins the containment claim
+    // by asserting the AR's address is inside `pfDemandLine`'s own 4 KiB page.
+    // Mutation-verified, not merely written: deleting `!s0KillsWindowQ` below re-opens
+    // T+1 and the test fails with "RULE-P1 BOUND VIOLATED: 2 speculative ARs".
+    // If you change the timing of the window kill, that test is the one that will tell
+    // you; the record lives in `IcacheMutationProofSpec` under M6.
     val s0KillsWindowQ = s0Valid && !s0Replay && (s0Fault || !s0Cacheable)
     when(pfWindowHasCandidate && !anyInvalidate && !demandFillStart &&
          !pfWindowUpdate && !demandStuckQ && !s0KillsWindowQ) {

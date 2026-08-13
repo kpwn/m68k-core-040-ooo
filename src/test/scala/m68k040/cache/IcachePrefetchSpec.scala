@@ -859,6 +859,237 @@ class IcachePrefetchSpec extends AnyFunSuite {
     }
   }
 
+  /** The M4 "cycle T" residual, made OBSERVABLE (implementation plan Task 13).
+    *
+    * `IcachePlugin.scala`'s `s0KillsWindowQ` comment block documents a deliberately
+    * accepted, one-cycle rule-P1 residual: on the ACCEPT cycle T of a command whose
+    * LIVE translation verdict is FAULT (or INHIBITED), nothing registered carries that
+    * verdict yet, so the speculative allocator can still make ONE allocation -- and
+    * launch its AR -- out of a window the core is being told, on that very cycle, no
+    * longer describes a page it may speculate into. `s0KillsWindowQ` closes T+1 and the
+    * window kill itself closes T+2 onward; cycle T is the tail the design does not hold.
+    *
+    * Until this test that residual was documented in a comment and exercised by
+    * nothing. The rule it bends is a SAFETY rule, so "bounded to one line of the same
+    * page" has to be a measured fact, not a paragraph. This test measures it:
+    *
+    *   - it seeds a real five-line window at 0x2000 with the allocator SHUT OFF
+    *     (`prefetchEnable = false` still seeds `pfSeqValid`/`pfNextPa`/`pfLimitPa` --
+    *     the seed runs off `s1Disp`, and `prefetchEnable` appears only inside
+    *     `pfWindowHasCandidate`, i.e. it gates ALLOCATION, not the frontier), so the
+    *     speculative AR count going in is provably zero;
+    *   - it then opens the allocator and offers the faulting command IN THE SAME
+    *     SIMULATION DELTA, so the first cycle `prefetchEnable` is visible IS the accept
+    *     cycle T, by construction and with no cycle counting;
+    *   - and it asserts the residual's exact documented shape: at most ONE speculative
+    *     line, in the SAME 4 KiB page.
+    *
+    * Both directions matter. `<= 1` is the safety bound -- it is what fails if the
+    * window kill regresses (deleting `!s0KillsWindowQ` re-opens T+1 and makes it two;
+    * mutation-verified, Task 13). `== 1` is the non-vacuity check: a zero would mean
+    * the residual is not being reached and the test proves nothing -- or that the
+    * residual was closed, in which case `IcachePlugin.scala`'s comment is now wrong and
+    * must be updated together with this test. Neither is allowed to pass silently.
+    */
+  test("P1 residual (cycle T): a fetch whose LIVE verdict is FAULT allocates AT MOST ONE " +
+       "speculative line, in its own page", VerilatorTest) {
+    simConfig.compile(new Dut(new ICacheModeTranslationPlugin)).doSim("pf-cycle-t-residual") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+      val ar    = new ArCounter(dut, cd)
+      val xlate = dut.xlate.asInstanceOf[ICacheModeTranslationPlugin]
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      xlate.logic.forceFault #= false
+      cd.waitSampling(4)
+      // AFTER the reset window, not before: `prefetchEnable` is a RegInit(True), so a
+      // poke issued while forkStimulus still holds reset is simply re-initialised away
+      // (this suite's other prefetchEnable tests all poke here for the same reason).
+      dut.icache.logic.prefetchEnable #= false
+      cd.waitSampling(2)
+
+      fetch(dut, cd, 0x2000L)
+      settle(cd)
+      assert(ar.demand == 1, s"the seeding demand refill did not happen: AR trace=${ar.fires}")
+      assert(ar.prefetch == 0,
+        s"prefetchEnable=false must issue ZERO speculative ARs; AR trace=${ar.fires}")
+      // Window state going in: pfSeqValid, pfDemandLine=0x2000, pfNextPa=0x2040,
+      // pfLimitPa=0x2140 -- four in-page candidates and four free slots.
+
+      // Make the page's LIVE verdict a fault. Nothing is in flight, so this changes no
+      // registered state; it is visible only to the next accept's combinational verdict.
+      xlate.logic.forceFault #= true
+      cd.waitSampling(2)
+      assert(ar.prefetch == 0, s"the allocator is still shut off; AR trace=${ar.fires}")
+
+      // THE CYCLE-T SETUP. Both pokes land in one delta, so the first cycle on which
+      // `pfWindowHasCandidate` can be true is the same cycle `cmdPort.fire` is true and
+      // the ITLB is reporting FAULT -- cycle T exactly, with nothing to calibrate.
+      dut.icache.logic.prefetchEnable  #= true
+      dut.probe.logic.cmdIn.valid      #= true
+      dut.probe.logic.cmdIn.payload.pc #= 0x2000L
+      waitSamplingWhereBounded(cd, "the faulting command to be accepted")(
+        dut.probe.logic.cmdIn.ready.toBoolean && dut.probe.logic.cmdIn.valid.toBoolean)
+      dut.probe.logic.cmdIn.valid #= false
+      waitSamplingWhereBounded(cd, "the faulting command's response")(
+        dut.probe.logic.rspOut.valid.toBoolean)
+      assert(dut.probe.logic.rspOut.payload.fault.toBoolean,
+        "the second fetch of 0x2000 did NOT fault -- forceFault never reached the accept, " +
+        "so cycle T was never entered and this test proves nothing")
+      settle(cd, 200)
+      dut.icache.logic.prefetchEnable #= false
+      xlate.logic.forceFault #= false
+
+      val spec = ar.fires.filter { case (id, _) =>
+        id >= AxiIds.I_SPEC_BASE && id <= AxiIds.I_SPEC_LAST }
+      assert(spec.size <= 1,
+        s"RULE-P1 BOUND VIOLATED: ${spec.size} speculative ARs were launched out of a " +
+        s"window condemned on cycle T; IcachePlugin.scala's s0KillsWindowQ comment bounds " +
+        s"this residual at ONE line. The T+1 window-kill term is the usual regression " +
+        s"here. Speculative trace=$spec, full AR trace=${ar.fires}")
+      assert(spec.size == 1,
+        s"NON-VACUITY: expected the documented one-line cycle-T residual, saw none. Either " +
+        s"the window/frontier setup stopped reaching the residual (this test then proves " +
+        s"nothing and must be repaired) or the residual was CLOSED, in which case " +
+        s"IcachePlugin.scala's 'ACCEPTED RESIDUAL: CYCLE T' comment is now wrong. Full AR " +
+        s"trace=${ar.fires}")
+      val (_, addr) = spec.head
+      assert((addr & ~0xfffL) == 0x2000L,
+        f"the cycle-T residual escaped its own page: a speculative AR to 0x$addr%x is not in " +
+        f"the 4 KiB page of 0x2000. The residual's whole containment argument is that " +
+        f"pfWindowHasCandidate pins every candidate to pfDemandLine's page.")
+      assert(addr == 0x2040L,
+        f"expected the frontier's own next line 0x2040, got 0x$addr%x (AR trace=${ar.fires})")
+    }
+  }
+
+  /** D3-SET-I, the `setBlocked` guard's directed test (implementation plan Task 13,
+    * spec section 12.2 mutation 4).
+    *
+    * A lookup that indexes the SET an in-flight fill is committing into must not be
+    * answered on the array-write cycle: `tagMem` is a write-first async-read LUTRAM
+    * while `valids` is a register array, so on that cycle `tagQ` captures the NEW tag
+    * against the OLD valid bit -- a verdict computed from two sources that disagree by
+    * exactly one cycle. Because the victim way is cold, `validsQ` says INVALID while
+    * `tagQ` already says the line is there, so the lookup is answered as a MISS for a
+    * line that becomes resident on this very cycle: a duplicate AR for an address the
+    * cache already owns, and a SECOND way of the same set allocated to the SAME tag,
+    * which is a 2-hot `s1HitVec` on every later lookup of it. Spec risk R3's class --
+    * a silently mis-attributed line, not a crash.
+    *
+    * WHY THIS TEST EXISTS AT ALL, and read this before "simplifying" the guard away:
+    * the plan's mutation 4 (`setBlocked := False`) kills NOTHING on its own -- the full
+    * IcacheSpec (17/17) and IcachePrefetchSpec both stay green. That is not evidence the
+    * hazard is imaginary; it is evidence the guard is REDUNDANT today, exactly like its
+    * sibling `pfInstallSetConflict` (see that signal's own "HONEST STATUS" comment).
+    * `fillArrayWrActive` is asserted only from the PREDECODE dwell of a SPECULATIVE
+    * install, and that entry's `mshrValid` is not cleared until the end of the dwell, so
+    * `pfLookupSetBusy` -- and therefore SG-1's `pfAcceptOk` -- already holds the accept
+    * gate shut for exactly `lookupSet === installSet`. The two guards overlap perfectly.
+    *
+    * So the honest proof is a MATRIX, and this test is its bottom row (Task 13, all four
+    * rows re-run):
+    *   setBlocked removed only ............... PASSES (redundant with pfAcceptOk).
+    *   pfAcceptOk opened on the write cycle .. PASSES (setBlocked still shuts the gate).
+    *   BOTH ................................. THIS TEST FAILS.
+    * A future relaxation of `pfAcceptOk` (SG-1 is explicitly flagged as conservative and
+    * is re-measured by the IPC gate) makes `setBlocked` the only thing left holding this.
+    *
+    * A NEGATIVE RESULT WORTH KEEPING, because it is the obvious way to write this test
+    * and it does not work: the "victim way ALREADY VALID under a different tag" variant
+    * -- pre-fill all four ways so the spurious HIT lands on a line being overwritten --
+    * does NOT corrupt the delivered data, and was measured not to (it passes under the
+    * full double mutation). By the tag/valid write cycle the incoming line's LOW beat is
+    * already written and its HIGH beat is written by that same cycle's `lineMem` write,
+    * which the read port sees write-first, so both windows read back correct. The cold
+    * way above is the variant that actually discriminates.
+    */
+  test("D3-SET-I: a lookup into the installing SET on the array-write cycle must not be " +
+       "answered from a tag/valid pair that is one cycle apart", VerilatorTest) {
+    simConfig.compile(new Dut).doSim("d3-set-i-write-cycle") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+      val ar = new ArCounter(dut, cd)
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(4)
+      // AFTER the reset window (see the cycle-T test above for why).
+      dut.icache.logic.prefetchEnable #= false
+      cd.waitSampling(2)
+
+      // 1. Seed a window with EXACTLY ONE in-page candidate, so the next allocation
+      //    commit is unambiguous: 0x5FC0 is the LAST line of page 5, so `seedPfWindow`'s
+      //    page clamp pins pfLimitPa at it and rule P4 stops the frontier there. The
+      //    demand line 0x5F80 is set 62, so set 63 stays COLD and victim(63) stays 0.
+      fetch(dut, cd, 0x5F80L)
+      settle(cd)
+      for (w <- 0 until 4)
+        assert(!IcacheArrayProbe.wayValid(dut.icache, w, 63),
+          s"set 63 way $w is already valid -- the cold-victim precondition this test " +
+          s"needs (validsQ False while tagQ already carries the incoming tag) is gone")
+
+      // 2. Open the allocator: exactly one speculative fill, of 0x5FC0, into set 63,
+      //    way victim(63) == 0.
+      dut.icache.logic.prefetchEnable #= true
+      waitSamplingWhereBounded(cd, "the speculative install's allocation-commit cycle")(
+        dut.icache.logic.dbgAllocCommitPending.toBoolean)
+
+      // 3. Offer a fetch of that same line so that it is visible during the tag/valid
+      //    write cycle ITSELF. A testbench samples just BEFORE the edge that latches what
+      //    it observed, so a poke issued at the `dbgAllocCommitPending` sampling point
+      //    first takes effect on the NEXT cycle -- which is the write cycle. This is the
+      //    identical one-cycle-early trigger IcacheSpec's invalidate-race test uses, for
+      //    the identical reason; aiming at `dbgAllocCommitCycle` directly lands one cycle
+      //    late, where the test passes whether or not the guard exists.
+      dut.probe.logic.cmdIn.valid      #= true
+      dut.probe.logic.cmdIn.payload.pc #= 0x5FC0L
+      cd.waitSampling()
+      // Self-check the alignment instead of assuming it: this sampling point observes the
+      // cycle the offer was high for, and it must be the array-write cycle.
+      assert(dut.icache.logic.dbgAllocCommitCycle.toBoolean,
+        "test alignment lost: the probe fetch was not offered during the PREDECODE " +
+        "allocation-write cycle, so the D3-SET-I window was never actually entered")
+      // Was it taken ON that cycle? On correct RTL, no -- SG-1's `pfAcceptOk` and
+      // `setBlocked` each independently hold the gate shut. Recorded for the diagnostic
+      // message rather than asserted: the properties under test are architectural.
+      val takenOnWriteCycle = dut.probe.logic.cmdIn.ready.toBoolean
+      if (!takenOnWriteCycle)
+        waitSamplingWhereBounded(cd, "the probe fetch to be accepted")(
+          dut.probe.logic.cmdIn.ready.toBoolean)
+      dut.probe.logic.cmdIn.valid #= false
+      waitSamplingWhereBounded(cd, "the probe fetch's response")(
+        dut.probe.logic.rspOut.valid.toBoolean)
+      val got = dut.probe.logic.rspOut.payload.data.toBigInt
+      settle(cd, 200)
+
+      val ctx = f" (probe accepted ON the array-write cycle: $takenOnWriteCycle; " +
+                f"AR trace=${ar.fires})"
+      assert(got == IcacheSim.window64(0x5FC0L),
+        f"the fetch of 0x5FC0 was answered with 0x${got.toString(16)}, expected " +
+        f"0x${IcacheSim.window64(0x5FC0L).toString(16)}$ctx")
+      // THE ASSERTIONS. A lookup answered off the split tag/valid pair reports a MISS for
+      // a line that is becoming resident on that cycle, so it re-fetches it...
+      assert(ar.at(0x5FC0L) == 1,
+        s"D3-SET-I VIOLATED: line 0x5FC0 was fetched over AXI ${ar.at(0x5FC0L)} times. A " +
+        s"lookup answered on the array-write cycle read the NEW tag against the OLD " +
+        s"(cold) valid bit, reported a miss for a line the cache was installing that very " +
+        s"cycle, and issued a duplicate transaction for it$ctx")
+      // ...and installs it a SECOND time, into a second way of the same set, which makes
+      // every later lookup of it a 2-hot way select.
+      val tagged = (0 until 4).count(w =>
+        IcacheArrayProbe.wayValid(dut.icache, w, 63) &&
+        IcacheArrayProbe.wayTag(dut.icache, w, 63) == BigInt(0x5))
+      assert(tagged == 1,
+        s"D3-SET-I VIOLATED: $tagged ways of set 63 are valid with tag 0x5. One line is " +
+        s"resident twice in the same set -- a 2-hot s1HitVec on every later lookup of " +
+        s"it, which is the design's own hard invariant$ctx")
+    }
+  }
+
   test("suppression: a next line that is ALREADY RESIDENT is not prefetched again", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
