@@ -10,38 +10,43 @@ import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
 import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
 
-/** M3a (implementation plan Task 10) shadow check: the S1 verdict computed from the
-  * REGISTERED S0 context (`tagQ`, `validsQ`, `s0Ppn`, `s0Cacheable`) must equal the LIVE
-  * accept-cycle verdict (`isHit`), delayed one cycle, on every accepted command.
+/** The I-cache's S1 hit/miss VERDICT, validated against an independent model of the
+  * raw arrays.
   *
-  * ── WHY A SHADOW ────────────────────────────────────────────────────────────────
-  * Spec risk R3: M3 restructures the accept/verdict boundary that guarantees the
-  * in-order response contract, and a violation is SILENT -- `FetchRsp` carries no tag
-  * and `FetchAlignPlugin` attributes every response to its outstanding ring's HEAD, so
-  * a wrong verdict shows up as mis-paired instruction bytes, not as a crash. Building
-  * the registered path in parallel and asserting equivalence BEFORE any consumer
-  * depends on it turns "did I get the registered verdict right?" into a question the
-  * existing 396-test lock-step suite answers, instead of a question a post-flip
-  * debugging session answers.
+  * ── HISTORY, because the file name still says "shadow" ──────────────────────────
+  * Built for Task 10 (M3a) as a SHADOW check: the verdict computed from the registered
+  * S0 context (`tagQ`, `validsQ`, `s0Ppn`, `s0Cacheable`) had to equal the LIVE
+  * accept-cycle comparator (`isHit`), delayed one cycle, on every accepted command --
+  * a per-way equality, not merely an OR-reduced one (review fix I1). Task 11 (M3b)
+  * FLIPPED every consumer onto the registered verdict and DELETED the live comparator,
+  * so there is no second verdict left to compare against and the shadow leg
+  * (`dbgVerdictMatch`, `dbgS0Fresh`, `dbgLiveHitQ`, `dbgLiveHitVecQ`) is gone with it.
   *
-  * ── WHY THIS IS NOT A TAUTOLOGY ─────────────────────────────────────────────────
-  * Task 5's review found the design spec's own literal suggested check would have been
-  * one (a signal compared against the expression it is assigned from). This check has
-  * THREE independent legs, and only the first is an RTL-internal comparison:
+  * ── WHAT SURVIVES, AND WHY IT IS NOT SHADOW SCAFFOLDING ─────────────────────────
+  * The shadow was only ONE of three legs. The other two never referenced the live path
+  * and are now the primary external evidence that the plugin's single surviving verdict
+  * is RIGHT rather than merely self-consistent:
   *
-  *  1. `dbgVerdictMatch` (in RTL, and additionally re-checked here): 1 bit latched
-  *     BEFORE the compare tree vs. 105 bits latched and the compare tree re-evaluated
-  *     AFTER. Different storage, different evaluation order.
-  *  2. A pure-Scala INDEPENDENT MODEL below re-derives the verdict from the raw arrays
-  *     (`IcacheArrayProbe.wayValid`/`wayTag`) and the registered S0 context, and checks
-  *     BOTH the shadow AND the live verdict against it. Neither RTL path participates.
-  *  3. Coverage counters that make each of the above non-vacuous: both verdict
-  *     polarities, all four ways, both beats, all four lanes, the INHIBITED
-  *     (`s0Cacheable == false`) case and the translation-fault case must all be
-  *     observed, or the test fails as "barely exercised".
+  *  1. An INDEPENDENT Scala MODEL re-derives the verdict from raw array content
+  *     (`IcacheArrayProbe.wayValid`/`wayTag`) plus the registered S0 context, and
+  *     checks the RTL verdict against it. No RTL verdict expression participates.
+  *  2. Coverage counters that make leg 1 non-vacuous: both verdict polarities, all four
+  *     ways, both beats, all four lanes, the INHIBITED (`s0Cacheable == false`) case and
+  *     the translation-fault case must all be observed, or the test fails as "barely
+  *     exercised". Plus the S0 ADDRESS-CAPTURE checks (review fix I2): `s0Set`/`s0Beat`/
+  *     `s0Lane` re-derived from `s0Pc` and the geometry constants.
+  *  3. NEW at M3b: `s1HitVec` must be exactly ONE-HOT on every hit. Post-flip it IS the
+  *     response's data/predecode select (`s1WayOh`), so a 2-hot vector silently
+  *     delivers the bitwise OR of two ways -- and it is the direct observable for the
+  *     "one fill owner per set" invariant that SG-1's accept gate protects.
   *
-  * Deleted in Task 11 (M3b) together with `dbgVerdictMatch`/`dbgS0Fresh`/`dbgLiveHitQ`
-  * and the live comparator.
+  * Spec risk R3 is why all of this exists: `FetchRsp` carries no tag and
+  * `FetchAlignPlugin` attributes every response to its outstanding ring's HEAD, so a
+  * wrong verdict or a wrong WAY shows up as mis-paired instruction bytes, not as a
+  * crash.
+  *
+  * The file also carries M3b's two directed flip regressions (sustained II=1 on hits;
+  * no younger command accepted behind an unresolved miss) at the bottom.
   */
 class IcacheVerdictShadowSpec extends AnyFunSuite {
 
@@ -61,7 +66,7 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
   private def compiled      = SimConfig.withVerilator.compile(new Dut())
   private def compiledCmode = SimConfig.withVerilator.compile(new Dut(new ICacheModeTranslationPlugin))
 
-  // ── Shadow monitor ────────────────────────────────────────────────────────────
+  // ── Verdict monitor ───────────────────────────────────────────────────────────
   final class ShadowStats {
     var checked     = 0     // accepted commands whose verdict was compared
     var hits        = 0
@@ -85,16 +90,17 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
       s"beats=${beatSeen.mkString(",")} lanes=${laneSeen.mkString(",")}"
   }
 
-  /** Fork the per-cycle shadow monitor.
+  /** Fork the per-cycle verdict monitor.
     *
     * TIMING DISCIPLINE, which is the whole reason this is written the way it is.
     * SpinalSim resumes a thread at the SAMPLING POINT, i.e. just before the clock edge
     * that latches the registers (`IcachePlugin.scala`'s `dbgAllocCommitPending` comment
     * states this explicitly). So `cmdIn.valid`/`cmdIn.ready` read at a sampling point
     * race the command driver's own poke for the NEXT cycle. This monitor therefore
-    * never reads a driven input to decide anything: it triggers on `dbgS0Fresh`, a
-    * REGISTER that is high exactly on the cycle after `cmdPort.fire`, and reads only
-    * registers and array content.
+    * never reads a driven input to decide anything: it triggers on `s0Valid`, a
+    * REGISTER that is high on the cycle after `cmdPort.fire` (and stays high while an
+    * accepted miss waits for the fill engine), and reads only registers and array
+    * content.
     *
     * The independent model needs the arrays as they were during the ACCEPT cycle, but
     * can only read them one cycle later. The only writers of `valids`/`tagMem` are the
@@ -109,10 +115,19 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
       var prevArrayWrite = false
       while (true) {
         dut.clockDomain.waitSampling()
-        if (ic.logic.dbgS0Fresh.toBoolean) {
+        // M3b (Task 11): the trigger was `dbgS0Fresh`, a transitional register deleted
+        // with the live comparator. Its replacement is the production S0 valid bit
+        // itself, qualified with `!s0Replay` to exclude REPLAY/FAULT's synthetic
+        // contexts (whose `tagQ`/`validsQ`/`s0Ppn` are the LAST accepted command's and
+        // whose verdict is deliberately not consulted by the RTL either). Under M3b
+        // `s0Valid` is HELD while an accepted miss waits for the fill engine, so one
+        // command can be observed on more than one cycle -- harmless here (the values
+        // are frozen for exactly that duration, so every re-check checks the same thing)
+        // and it only inflates the `checked`/`misses` counters, which are used as
+        // lower-bound non-vacuity floors.
+        if (ic.logic.s0Valid.toBoolean && !ic.logic.s0Replay.toBoolean) {
           st.checked += 1
-          val live   = ic.logic.dbgLiveHitQ.toBoolean
-          val shadow = ic.logic.s1Hit.toBoolean
+          val verdict = ic.logic.s1Hit.toBoolean
           val pc     = ic.logic.s0Pc.toLong
           val set    = ic.logic.s0Set.toInt
           val ppn    = ic.logic.s0Ppn.toBigInt
@@ -147,24 +162,28 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
               f"but pc(4:3)=${((pc >> 3) & 3).toInt}. The registered lane index would " +
               f"deliver the WRONG 8-BYTE WINDOW -- risk R3's silent mis-paired bytes.")
 
-          if (!ic.logic.dbgVerdictMatch.toBoolean || live != shadow) {
-            // Review fix I1: report the FULL per-way vectors, because the mismatch can
-            // now be a WAY disagreement with both OR-reduced verdicts reading "hit".
-            val liveVec   = ic.logic.dbgLiveHitVecQ.toInt
-            val shadowVec = (0 until 4).map(w =>
-              if (ic.logic.s1HitVec(w).toBoolean) 1 << w else 0).sum
-            simFailure(
-              f"M3a SHADOW VIOLATED at pc=0x$pc%x (set=$set ppn=0x${ppn.toString(16)} " +
-              f"cacheable=$cache fault=$flt): the S1 verdict computed from registered " +
-              f"inputs (tagQ/validsQ/s0Ppn/s0Cacheable) says hit=$shadow " +
-              f"hitVec=0b${shadowVec.toBinaryString} but the live accept-cycle said " +
-              f"hit=$live hitVec=0b${liveVec.toBinaryString}. M3 cannot flip until these " +
-              f"are identical -- a WAY-ONLY disagreement (same hit/miss, different way) " +
-              f"is exactly risk R3's failure mode: silent instruction-byte mis-pairing, " +
-              f"not a crash.")
-          }
-          if (live) {
+          // M3b: the shadow-vs-live comparison stood here and is deleted with the live
+          // comparator it compared against -- there is only ONE verdict now. What is
+          // NOT deleted is the leg that was never a comparison of RTL against RTL: the
+          // independent Scala array model below, which re-derives the verdict from raw
+          // `tagMem`/`valids` content and is now the only external check that the sole
+          // surviving verdict is RIGHT (rather than merely equal to something).
+          //
+          // WAY COVERAGE also survives, and it matters MORE post-flip than it did
+          // pre-flip: `s1HitVec` is now the literal one-hot select for the response's
+          // data and predecode (`s1WayOh`), so `requireAllWays` is a direct check that
+          // every way can be selected and deliver a correct response end to end -- the
+          // property Task 10's review fix I1 added the per-way comparison for.
+          if (verdict) {
             st.hits += 1
+            val oneHot = (0 until 4).count(w => ic.logic.s1HitVec(w).toBoolean)
+            if (oneHot != 1)
+              simFailure(
+                f"M3b: s1HitVec is $oneHot-hot at pc=0x$pc%x (set=$set) on a HIT. It is " +
+                f"the one-hot select for the response's data AND predecode, so a 2-hot " +
+                f"vector delivers the bitwise OR of two ways -- silent wrong " +
+                f"instruction bytes (risk R3), and a direct sign that two valid ways in " +
+                f"one set carry the same tag.")
             for (w <- 0 until 4) if (ic.logic.s1HitVec(w).toBoolean) st.wayHits(w) += 1
           } else st.misses += 1
           if (flt) st.faults += 1
@@ -175,8 +194,8 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
           if (model) {
             if (prevArrayWrite) st.modelSkips += 1
             else {
-              // INDEPENDENT MODEL: neither the live comparator nor the shadow one is
-              // consulted -- the verdict is re-derived from the raw arrays.
+              // INDEPENDENT MODEL: the RTL verdict is not consulted at all -- the
+              // expectation is re-derived from the raw arrays.
               val exp = cache && (0 until 4).exists(w =>
                 IcacheArrayProbe.wayValid(ic, w, set) &&
                 IcacheArrayProbe.wayTag(ic, w, set) == ppn)
@@ -184,16 +203,13 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
                   (0 until 4).exists(w => IcacheArrayProbe.wayTag(ic, w, set) == ppn))
                 st.validDecidedMiss += 1
               st.modelChecks += 1
-              if (exp != shadow)
+              if (exp != verdict)
                 simFailure(
-                  f"M3a MODEL DISAGREES WITH THE SHADOW at pc=0x$pc%x: array content " +
+                  f"MODEL DISAGREES WITH THE S1 VERDICT at pc=0x$pc%x: array content " +
                   f"for set=$set says hit=$exp, the registered S1 verdict says " +
-                  f"hit=$shadow (ppn=0x${ppn.toString(16)} cacheable=$cache)")
-              if (exp != live)
-                simFailure(
-                  f"M3a MODEL DISAGREES WITH THE LIVE VERDICT at pc=0x$pc%x: array " +
-                  f"content for set=$set says hit=$exp, the live accept-cycle isHit " +
-                  f"said hit=$live -- the model itself is wrong, or the live path is")
+                  f"hit=$verdict (ppn=0x${ppn.toString(16)} cacheable=$cache). This is " +
+                  f"now the ONLY verdict in the plugin: it gates cmdPort.ready, selects " +
+                  f"the response way and decides whether a fill is dispatched.")
             }
           }
         }
@@ -204,7 +220,7 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
     st
   }
 
-  /** Drive `addrs` through the ordered-stream driver with the shadow monitor running. */
+  /** Drive `addrs` through the ordered-stream driver with the verdict monitor running. */
   private def sweep(name: String, addrs: Seq[Long], prefetch: Boolean,
                     requireHits: Boolean = true, requireMisses: Boolean = true,
                     requireAllWays: Boolean = false): ShadowStats = {
@@ -232,20 +248,20 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
       // ---- non-vacuity ---------------------------------------------------------
       assert(st.checked >= addrs.length,
         s"only ${st.checked} accepted commands had their verdict compared for " +
-        s"${addrs.length} commands issued -- the shadow was barely exercised, so it " +
+        s"${addrs.length} commands issued -- the verdict was barely exercised, so it " +
         s"proved nothing (${st.describe})")
       if (requireHits) assert(st.hits > 0,
-        s"no HIT verdict was ever observed: a shadow stuck at 'miss' would pass " +
+        s"no HIT verdict was ever observed: a verdict stuck at 'miss' would pass " +
         s"vacuously (${st.describe})")
       if (requireMisses) assert(st.misses > 0,
-        s"no MISS verdict was ever observed: a shadow stuck at 'hit' would pass " +
+        s"no MISS verdict was ever observed: a verdict stuck at 'hit' would pass " +
         s"vacuously (${st.describe})")
       assert(st.modelChecks >= st.checked / 2,
         s"the independent array model ran on only ${st.modelChecks} of ${st.checked} " +
         s"checked commands (${st.modelSkips} skipped for a concurrent array write) " +
         s"-- too few to be meaningful (${st.describe})")
       if (requireAllWays) assert(st.wayHits.forall(_ > 0),
-        s"not every way produced a shadow HIT (${st.wayHits.mkString(",")}) -- a " +
+        s"not every way produced a HIT (${st.wayHits.mkString(",")}) -- a " +
         s"per-way capture bug (e.g. tagQ(w) sourced from the wrong way) could hide " +
         s"in an unexercised way (${st.describe})")
       info(name + ": " + st.describe)
@@ -256,7 +272,7 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
 
   // ── The sweeps ────────────────────────────────────────────────────────────────
 
-  test("M3a shadow: sequential misses and hits, prefetch on", VerilatorTest) {
+  test("verdict: sequential misses and hits, prefetch on", VerilatorTest) {
     // DELIBERATE DEVIATION from the plan's literal `0x1000 + i*64` stimulus. Every one
     // of those addresses is 64-BYTE ALIGNED, so pc(5) and pc(4:3) are constant zero and
     // the whole sweep would exercise beat 0 / lane 0 only -- exactly the
@@ -267,7 +283,7 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
           prefetch = true)
   }
 
-  test("M3a shadow: same-set thrash forcing evictions, prefetch off", VerilatorTest) {
+  test("verdict: same-set thrash forcing evictions, prefetch off", VerilatorTest) {
     // 0x1000, 0x2000, 0x3000, 0x4000, 0x5000 all map to set 0 (set = pc(11:6)).
     //
     // MEASURED CORRECTION to the plan's literal stimulus, which cycles all FIVE tags
@@ -287,7 +303,7 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
       s"the thrash sweep did not cover both beats and all four lanes: ${st.describe}")
   }
 
-  test("M3a shadow: repeated hits in one line (the II=1 case)", VerilatorTest) {
+  test("verdict: repeated hits in one line (the II=1 case)", VerilatorTest) {
     sweep("shadow-hits", (0 until 200).map(i => 0x1000L + (i % 8) * 8), prefetch = false)
   }
 
@@ -308,7 +324,7 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
   // phase then builds the one state in which the VALID bit alone decides the verdict --
   // an invalidated set whose `tagMem` entry still matches -- because without that a
   // `validsQ` capture bug is equally invisible (the tag compare would reject anyway).
-  test("M3a shadow: alternating set AND tag on every command, plus a valid-bit-decided " +
+  test("verdict: alternating set AND tag on every command, plus a valid-bit-decided " +
        "miss over a stale matching tag", VerilatorTest) {
     compiled.doSim("shadow-cross-set") { dut =>
       dut.clockDomain.forkStimulus(10)
@@ -375,8 +391,8 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
   // translation-fault path, which is the ONE case the plan's own text proposed to
   // EXEMPT from the equivalence check; this test is the evidence that no exemption is
   // needed (see the "NO FAULT EXEMPTION" note in IcachePlugin.scala).
-  test("M3a shadow: an INHIBITED page over a RESIDENT line, and a translation fault, " +
-       "both keep the shadow identical to the live verdict", VerilatorTest) {
+  test("verdict: an INHIBITED page over a RESIDENT line, and a translation fault, " +
+       "both agree with the independent array model", VerilatorTest) {
     compiledCmode.doSim("shadow-inhibited-and-fault") { dut =>
       val xlate = dut.xlate.asInstanceOf[ICacheModeTranslationPlugin]
       dut.clockDomain.forkStimulus(10)
@@ -457,8 +473,8 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
       dut.clockDomain.waitSampling(2)
 
       // The model leg is disabled here: it reads the arrays one cycle late on purpose,
-      // and this test's entire point is to clobber them in exactly that window. The RTL
-      // shadow-equivalence leg (`dbgVerdictMatch`) is unaffected and still checked.
+      // and this test's entire point is to clobber them in exactly that window. The
+      // verdict is checked directly below instead.
       val st = startMonitor(dut, model = false)
 
       IcacheFetchDriver.fetchAndWait(dut.icache, dut.probe, dut.clockDomain, 0x1000L)
@@ -483,30 +499,234 @@ class IcacheVerdictShadowSpec extends AnyFunSuite {
       dut.clockDomain.waitSampling()
       dut.icache.logic.invalidateAll #= false
 
-      assert(dut.icache.logic.dbgVerdictMatch.toBoolean,
-        "SG-4: the registered verdict diverged from the live one across an " +
-        "invalidateAll landing between S0 and S1")
-      // NON-VACUITY: the accepted fetch must have been a HIT, i.e. the invalidate really
-      // did land on a verdict that had already been decided. If it had been a miss this
-      // test would prove nothing about the window at all.
+      // M3b: the `dbgVerdictMatch` assertion that stood here compared two verdicts;
+      // there is only one now. The property it was standing in for is unchanged and is
+      // checked DIRECTLY: the accepted fetch's verdict must still be HIT, i.e. the
+      // invalidate that landed one cycle after acceptance did NOT retroactively turn an
+      // already-decided hit into a miss. `valids` is a register array (a clear issued in
+      // cycle N takes effect for N+1) and `validsQ` was captured in cycle N, so the
+      // observable window is byte-for-byte the pre-M3 one -- M3 neither opens nor
+      // closes one. This doubles as the NON-VACUITY check: had it been a miss, the test
+      // would prove nothing about the window at all.
       assert(dut.icache.logic.s1Hit.toBoolean,
-        "SG-4 is vacuous: the fetch accepted immediately before the invalidateAll did " +
-        "not produce a HIT verdict, so nothing was clobbered between S0 and S1")
+        "SG-4: the fetch accepted immediately before the invalidateAll did not produce " +
+        "a HIT verdict at S1. Either nothing was clobbered between S0 and S1 (the test " +
+        "is vacuous) or -- worse -- the invalidate retroactively changed a verdict that " +
+        "had already been decided for an accepted command, which would turn an " +
+        "answerable fetch into a fill.")
 
       // And the response must still arrive -- a dropped response wedges FetchAlign's
       // ring permanently (ringCount never decrements).
       var sawRsp = false
+      var rspPc  = -1L
       for (_ <- 0 until 200 if !sawRsp) {
         dut.clockDomain.waitSampling()
-        if (dut.probe.logic.rspOut.valid.toBoolean) sawRsp = true
+        if (dut.probe.logic.rspOut.valid.toBoolean) {
+          sawRsp = true
+          rspPc  = dut.probe.logic.rspOut.payload.pc.toLong
+        }
       }
       assert(sawRsp, "the accepted fetch never got a response after a mid-flight invalidateAll")
+      // ...and it must be THAT fetch's response, carrying the pre-invalidate data path
+      // (a hit answered from the array, not a refill of a line the invalidate dropped).
+      assert(rspPc == 0x1000L,
+        f"the response after the mid-flight invalidateAll carried pc=0x$rspPc%x, not " +
+        f"the accepted fetch's 0x1000")
       assert(st.hits > hitsBefore, s"SG-4 observed no hit verdict at all: ${st.describe}")
       // The invalidate must actually have taken effect, or the "window" never existed.
       val set = 0x1000 >> 6 & 63
       assert(!(0 until 4).exists(w => IcacheArrayProbe.wayValid(dut.icache, w, set)),
         "SG-4: invalidateAll did not clear the valid bits, so no S0/S1 window was opened")
       info("sg4: " + st.describe)
+    }
+  }
+
+  // ── M3b (Task 11): the two properties the FLIP must preserve ──────────────────
+  // `cmdPort.ready` is now gated by `s1Unresolved` instead of by a live translation-
+  // fed comparator. Two properties must survive that, and they pull in OPPOSITE
+  // directions -- which is why both are tested, and why both are written to fail
+  // loudly rather than to be re-derived by inspection:
+  //
+  //   - the gate must be LOW on a hit, or every straight-line fetch loses an issue
+  //     slot (spec goal G2, sustained II=1);
+  //   - the gate must be HIGH from the cycle a miss is DISCOVERED (S1) until the fill
+  //     resolves, or a younger command is accepted behind an older unresolved miss --
+  //     and `FetchRsp` carries no tag while `FetchAlignPlugin` attributes responses by
+  //     ring head, so that is silent instruction-byte mis-pairing (risk R3).
+  //
+  // Both PASS on the pre-flip RTL too (today's `answerable` already refuses to admit a
+  // younger command behind a miss, and today's hit path is already II=1): they are
+  // REGRESSION DETECTORS for the flip, not new-behaviour tests.
+  test("M3b: sustained II=1 on hits (ready never drops in a hit stream)", VerilatorTest) {
+    compiled.doSim("m3b-ii1") { dut =>
+      dut.clockDomain.forkStimulus(10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, dut.clockDomain, 0x1000, 0x2000)
+      dut.probe.logic.cmdIn.valid      #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll   #= false
+      dut.clockDomain.waitSampling(5)
+      dut.icache.logic.prefetchEnable  #= false
+      dut.clockDomain.waitSampling(2)
+
+      IcacheFetchDriver.fetchAndWait(dut.icache, dut.probe, dut.clockDomain, 0x1000L)
+      dut.clockDomain.waitSampling(20)
+
+      // Hold cmd.valid high on a RESIDENT line for 100 cycles and count accepts.
+      dut.probe.logic.cmdIn.payload.pc #= 0x1000L
+      dut.probe.logic.cmdIn.valid      #= true
+      var accepts = 0
+      for (_ <- 0 until 100) {
+        dut.clockDomain.waitSampling()
+        if (dut.probe.logic.cmdIn.ready.toBoolean) accepts += 1
+      }
+      dut.probe.logic.cmdIn.valid #= false
+      assert(accepts >= 95,
+        s"only $accepts of 100 cycles accepted a command on a RESIDENT line. M3's " +
+        s"s1Unresolved gate must be low on hits -- sustained II=1 is spec goal G2 and " +
+        s"a regression here is a direct IPC loss on every straight-line fetch.")
+      info(s"m3b-ii1: $accepts/100 cycles accepted")
+    }
+  }
+
+  // ── M3b: the ACCEPT-CYCLE hole that `s1Unresolved` alone does not cover ──────────
+  // The deleted live `heldDemandMiss` was TRUE ON THE ACCEPT CYCLE of a miss, and one
+  // of its jobs was to freeze the prefetch allocator for exactly that cycle.
+  // `s1Unresolved` is its successor but is one cycle LATER, so the accept cycle itself
+  // is uncovered -- and on that cycle the allocator can still allocate a speculative
+  // slot to `pfCandSet`. When the frontier has stalled with `pfNextPa` sitting exactly
+  // ON the line the demand is now accepting (prefetch disabled, or no free slot, so it
+  // never advanced), `pfCandSet == lookupSet` and the two fills end up owning the SAME
+  // SET -- for the same LINE, in fact, which installs two valid ways with one tag and
+  // makes `s1HitVec` 2-hot. `IcachePlugin.scala`'s `demandSetOwned` carries a third
+  // lane, `cmdPort.fire && (lookupSet === pfCandSet)`, for precisely this cycle;
+  // MUTATION-PROVEN: `&& False`-ing that lane makes this test report violations.
+  test("M3b: a demand accepted on the very cycle the frontier points AT its own line " +
+       "must not allocate a second owner of that set", VerilatorTest) {
+    compiled.doSim("m3b-accept-cycle-frontier") { dut =>
+      val ic = dut.icache
+      dut.clockDomain.forkStimulus(10)
+      IcacheSim.attachMemory(ic.logic.axi, dut.clockDomain, 0x1000, 0x8000)
+      dut.probe.logic.cmdIn.valid      #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      ic.logic.invalidateAll           #= false
+      dut.clockDomain.waitSampling(5)
+      // Prefetch OFF: `seedPfWindow` still runs on every accepted cacheable command, so
+      // the frontier is SEEDED at 0x2040 but `pfWindowHasCandidate` is false and it
+      // never advances off that line.
+      ic.logic.prefetchEnable #= false
+      dut.clockDomain.waitSampling(2)
+      IcacheFetchDriver.fetchAndWait(ic, dut.probe, dut.clockDomain, 0x2000L)
+      dut.clockDomain.waitSampling(20)
+
+      var violations = 0
+      var firstDup   = ""
+      fork {
+        while (true) {
+          dut.clockDomain.waitSampling()
+          val live = (0 until IcacheArrayProbe.mshrEntries)
+            .filter(i => IcacheArrayProbe.mshrValid(ic, i))
+          val sets = live.map(i => IcacheArrayProbe.mshrSet(ic, i))
+          if (sets.distinct.length != sets.length) {
+            violations += 1
+            if (firstDup.isEmpty)
+              firstDup = live.map(i => s"entry$i:set${IcacheArrayProbe.mshrSet(ic, i)}").mkString(" ")
+          }
+        }
+      }
+
+      // Both pokes land on the same edge, so the FIRST cycle in which the allocator
+      // sees a candidate is also the cycle the demand for that same line is accepted.
+      dut.probe.logic.cmdIn.payload.pc #= 0x2040L
+      ic.logic.prefetchEnable          #= true
+      dut.probe.logic.cmdIn.valid      #= true
+      dut.clockDomain.waitSamplingWhere(dut.probe.logic.cmdIn.ready.toBoolean)
+      dut.probe.logic.cmdIn.valid #= false
+      dut.clockDomain.waitSampling(400)
+
+      assert(violations == 0,
+        s"two live MSHR entries owned the same set on $violations cycles ($firstDup). " +
+        s"A speculative slot was allocated to the set of a demand that was accepted on " +
+        s"the SAME cycle -- both then fill it, and if they are the same line the set " +
+        s"ends up with two valid ways carrying one tag, i.e. a 2-hot s1HitVec feeding " +
+        s"the response's one-hot data/predecode select.")
+    }
+  }
+
+  test("M3b: no younger command is accepted behind an unresolved miss", VerilatorTest) {
+    compiled.doSim("m3b-no-overtake") { dut =>
+      dut.clockDomain.forkStimulus(10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, dut.clockDomain, 0x1000, 0x8000)
+      dut.probe.logic.cmdIn.valid      #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll   #= false
+      dut.clockDomain.waitSampling(5)
+      dut.icache.logic.prefetchEnable  #= false
+      dut.clockDomain.waitSampling(2)
+
+      // Command A misses (cold line). Immediately offer command B to a DIFFERENT,
+      // ALREADY-RESIDENT line. B must not be accepted until A's fill has resolved,
+      // or its response would be attributed to A's ring entry.
+      IcacheFetchDriver.fetchAndWait(dut.icache, dut.probe, dut.clockDomain, 0x2000L)
+      dut.clockDomain.waitSampling(20)
+
+      dut.probe.logic.cmdIn.payload.pc #= 0x5000L      // cold
+      dut.probe.logic.cmdIn.valid      #= true
+      dut.clockDomain.waitSamplingWhere(dut.probe.logic.cmdIn.ready.toBoolean)  // A accepted
+      dut.probe.logic.cmdIn.payload.pc #= 0x2000L      // resident -- would HIT
+
+      // ── DEVIATION FROM THE PLAN'S LITERAL TEST, and it is a REAL off-by-one in the
+      // plan's text, not a concession. The plan's window runs "until `rspOut.valid`".
+      // But `rspValidReg` is an OUTPUT REGISTER: REPLAY arms `s0Valid` in cycle M, the
+      // machine is back in IDLE in cycle M+1 -- where it legitimately accepts B -- and
+      // A's response only becomes VISIBLE on `rspOut.valid` in cycle M+2. So there is
+      // exactly ONE cycle in which B is accepted while A's response is already
+      // committed to the output register but not yet observable, and the plan's literal
+      // window counts it as a violation. It is not one: A's response is emitted BEFORE
+      // B's by construction, which is the actual in-order contract.
+      //
+      // The window is therefore cut at `dbgAllocCommitCycle` -- the cycle PREDECODE
+      // commits the refilled line -- which is the last cycle of the miss proper and is
+      // strictly BEFORE REPLAY/IDLE. Between it and the accept of B the fetch port is
+      // structurally closed (neither PREDECODE-for-a-demand-install nor REPLAY calls
+      // `lookupTick`), so nothing is exempted that could actually overtake. The
+      // response's PC is additionally checked, so the in-order claim is observed and
+      // not merely inferred.
+      var acceptedDuringMiss = 0
+      var sawRsp   = false
+      var resolved = false
+      var rspPc    = -1L
+      // TIMING, verified empirically rather than assumed (an earlier draft of this test
+      // got it wrong and reported a false violation): `waitSamplingWhere` resumes at the
+      // SAMPLING POINT, i.e. BEFORE the edge that accepts A, and a poke issued there
+      // applies only AFTER that edge (this is exactly why `IcacheFetchDriver.fetchAndWait`
+      // can deassert `valid` on the line right after its own `waitSamplingWhere` without
+      // un-accepting the command). So a read taken here would still return cycle N's
+      // values, and the loop's FIRST iteration is cycle N+1 -- the cycle A's miss is
+      // discovered at S1, and the single most important cycle in this test.
+      for (_ <- 0 until 400 if !sawRsp) {
+        dut.clockDomain.waitSampling()
+        if (dut.probe.logic.rspOut.valid.toBoolean) {
+          sawRsp = true
+          rspPc  = dut.probe.logic.rspOut.payload.pc.toLong
+        } else {
+          if (!resolved && dut.probe.logic.cmdIn.ready.toBoolean) acceptedDuringMiss += 1
+          if (dut.icache.logic.dbgAllocCommitCycle.toBoolean) resolved = true
+        }
+      }
+      dut.probe.logic.cmdIn.valid #= false
+      assert(sawRsp, "command A never got a response")
+      assert(resolved, "the refill never committed a line -- the test never reached its " +
+        "own window boundary, so it proved nothing")
+      assert(rspPc == 0x5000L,
+        f"the FIRST response after the miss carried pc=0x$rspPc%x, not command A's " +
+        f"0x5000 -- a younger command's response overtook an older one. FetchRsp " +
+        f"carries no tag and FetchAlignPlugin attributes by ring head, so this is " +
+        f"silent instruction-byte mis-pairing (risk R3).")
+      assert(acceptedDuringMiss == 0,
+        s"$acceptedDuringMiss younger commands were accepted while an older miss was " +
+        s"unresolved. FetchRsp carries no tag and FetchAlignPlugin attributes by ring " +
+        s"head (FetchAlignPlugin.scala:263,283), so this is silent instruction-byte " +
+        s"mis-pairing -- risk R3, the most expensive failure mode in this file.")
     }
   }
 }

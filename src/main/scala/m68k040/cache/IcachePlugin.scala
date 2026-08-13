@@ -128,8 +128,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // A translation is demanded only while the cache is actively looking at a real
     // offered fetch. In particular, a cmd held upstream during a demand refill must
     // not start an unowned younger walk merely because its Stream valid stays high.
-    // `lookupTick` opens this gate in IDLE and during the answerable portion of a
-    // prefetch fill; all other states keep it closed.
+    // `lookupTick` opens this gate in IDLE and during a prefetch fill's install dwell;
+    // all other states keep it closed.
     val lookupActive = Bool()
     lookupActive := False
     xlate.req.valid      := lookupActive && cmdPort.valid
@@ -166,7 +166,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // WHY (design spec §5.1). The old predecode array's line-granular ASYNC read forced
     // all four ways' whole PRED_BITS_PER_LINE-bit entries to be captured into a
     // registered bank -- 4 x 256 = 1,024 flops, whose clock enable was `cmdPort.fire`
-    // (ITLB mux -> async LUTRAM read -> 20-bit compare -> answerable).
+    // (ITLB mux -> async LUTRAM read -> 20-bit compare -> answerable). M3b (Task 11)
+    // deleted that arc outright: `cmdPort.fire` is now off registered state only.
     // synth/floorplan_frontend.xdc records that arc as EVERY ONE of the worst 300 unique
     // failing endpoints on the pinned routed checkpoint. Beat-granular storage makes the
     // predecode address ALREADY the address the data array uses, so the capture bank has
@@ -336,18 +337,19 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // M2a's review and re-verified for M2b). The capture selects its window with
     // `missPC(5)` / `missPC(4:3)` on one dwell cycle and REPLAY re-reads `missPC` on a
     // later cycle, so `missPC` must not change during the dwell. It cannot:
-    // `missPC` has exactly TWO writers, and after M2b both are still confined to IDLE.
-    //   (1) `lookupTick`'s miss arm. `lookupTick` is called from IDLE
-    //       (canStartFill = true) and -- new in M2b -- from PREDECODE when
-    //       `predIsPfReg` (canStartFill = false, inherited verbatim from PF_PRED).
-    //       With canStartFill = false, `answerable = lookupFault || isHit`, and the
-    //       miss arm is the `otherwise` of `when(lookupFault) ... elsewhen(isHit)`, so
-    //       it requires `!lookupFault && !isHit` -- which makes `answerable` false,
-    //       hence `cmdPort.ready` false, hence `cmdPort.fire` false. The arm is
-    //       structurally unreachable outside IDLE.
+    // `missPC` has exactly TWO writers, and after M3b both are STILL confined to IDLE --
+    // by a different, and stronger, argument than M2b's:
+    //   (1) The S1 DEMAND MISS DISPATCH (M3b; this used to be `lookupTick`'s miss arm).
+    //       It is explicitly gated on `fsm.isActive(fsm.IDLE)`, so it is IDLE-confined
+    //       by construction rather than by an argument about `answerable`. Note this is
+    //       a REAL CHANGE of shape that happens to preserve the invariant: the write now
+    //       lands one cycle after the accept, but still on an IDLE cycle -- specifically
+    //       the IDLE->REFILL edge, which is the same edge the old write landed on.
     //   (2) IDLE's speculative-install arm, textually inside `IDLE.whenIsActive`.
-    // INSTALL_ARM and REPLAY call neither. So `missPC` is frozen from the cycle the
-    // dwell is armed until the machine returns to IDLE. Pinned by IcacheSpec's
+    // INSTALL_ARM, PREDECODE, REPLAY and FAULT write it not at all. So `missPC` is
+    // frozen from the cycle the dwell is armed until the machine returns to IDLE, and
+    // the enforcement assertion below still has a non-empty coverage window (pinned by
+    // `dbgMissPcLocked`). Pinned by IcacheSpec's
     // "M2a: the narrowed predecode bypass delivers the correct WINDOW" and
     // "M2b: missPC is immutable across the whole PREDECODE dwell" tests.
     val bypPred = Reg(Bits(4 * PRED_BITS_PER_WORD bits))
@@ -530,29 +532,47 @@ class IcachePlugin extends FiberPlugin with FetchService {
     ufaBeat.foreach(b => KeepAttribute(b))
     def ufaData(w: Int): Bits = ufaBeat(w)(255 downto 0)
     def ufaPred(w: Int): Bits = ufaBeat(w)(UFA_W - 1 downto 256)
-    // Task 5 transitional: `s1Way` is still a registered UInt here (M3/Task 11 replaces
-    // it with a one-hot). Vec-index the per-way slices so the existing S1 mux keeps its
-    // exact shape.
-    val ufaDataVec = Vec((0 until ways).map(w => ufaData(w)))
-    val ufaPredVec = Vec((0 until ways).map(w => ufaPred(w)))
+    // M3b (Task 11): Task 5's transitional `ufaDataVec`/`ufaPredVec` Vec-index helpers
+    // are DELETED with the registered `s1Way` they existed to index. The S1 stage below
+    // pre-selects each way's LANE first and then one-hot AND-ORs the four narrow
+    // results, so there is no Vec-index (i.e. no binary way mux) left to build.
 
     // ---- S0: the accept-cycle capture stage (M3a, Task 10) --------------------
     // NAMING, and it is load-bearing (spec §5.3.3). This is the SAME physical
     // register set that was called `s1*` up to Task 9: it is written IN the accept
     // cycle and read the NEXT cycle, so "s1" only ever described it from the
-    // consumer's point of view. Task 11 adds a genuinely new S1 COMBINATIONAL stage
-    // (the verdict, the one-hot way mux); renaming now is what stops two different
-    // things both being called "s1". The `s1Way` register below is deliberately NOT
-    // renamed -- it is the one member of the old set that M3 DELETES rather than
-    // moves (Task 11 computes the way at S1 instead of carrying it), so it keeps its
-    // old name for exactly as long as it survives.
+    // consumer's point of view. Task 11 adds the genuinely new S1 COMBINATIONAL stage
+    // (the verdict, the one-hot way mux); the rename is what stops two different things
+    // both being called "s1". `s1Way`, the one member of the old set M3 DELETES rather
+    // than moves, is gone as of this task -- the way is COMPUTED at S1 now.
+    //
+    // ══ M3b (Task 11): `s0Valid` MEANS "A COMMAND WAS ACCEPTED LAST CYCLE" ═════════
+    // It no longer means "a response is owed this cycle", and that widening is the
+    // single most consequential line of this task. Up to Task 10 it was armed only on
+    // the FAULT and HIT arms of the live comparator -- a demand MISS left it False,
+    // because a miss produced no response. `s1Unresolved` is a MISS signal, so it can
+    // only be built on a valid bit that is TRUE on a miss; hence the arming is now
+    // UNCONDITIONAL on `cmdPort.fire`.
+    //
+    // The consequence, and it is a real one that the plan's literal `rspValidReg :=
+    // s0Valid` would have got wrong: the RESPONSE must now be gated separately, by
+    // `s0Valid && !s1Unresolved`. Leaving it as a bare `s0Valid` would emit a
+    // response on the S1 cycle of every demand MISS -- one extra, data-less response
+    // per miss, which FetchAlignPlugin attributes to the ring head and which would
+    // then be followed by the REPLAY response for the same ring entry. That is a
+    // double-retire of one ring slot: exactly risk R3's silent instruction-byte
+    // mis-pairing. See `rspValidReg`'s assignment below.
+    //
+    // `s0Valid` is also HELD (see the S1 miss dispatch below the FSM) for as long as an
+    // accepted miss has not been dispatched to a fill, so the S0 context stays alive
+    // across the (bounded, <= 3 cycle) wait for the fill engine.
     //
     // THE ITLB RESULT STOPS AT `s0Ppn`/`s0Fault`/`s0Cacheable`. That is the whole
     // content of design principle P3 and the reason the census's clock-enable
     // endpoints in this plugin can stop being fed by a translation-fed comparator.
-    // At THIS task nothing downstream consumes the registered verdict yet -- the live
-    // `isHit` still drives `cmdPort.ready`, the response path, the MSHR writes and the
-    // prefetch/AR paths, exactly as before. Task 11 (M3b) flips the consumers over.
+    // As of THIS task that is realised: the live comparator is deleted and every
+    // consumer -- `cmdPort.ready`, the response path, the MSHR write, the prefetch
+    // frontier gate and the AR arbiter -- reads the registered verdict.
     //
     // MEASURED COST (`generated/M68kFullCoreSynth.v`, both commits regenerated and the
     // `IcachePlugin_*` register declarations diffed): **+114 bits**, and that is the
@@ -563,9 +583,19 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // `tagMem` port count is UNCHANGED at 2 async reads + 1 write per way -- the reason
     // `lookupTags` is hoisted below rather than a second `readAsync` being elaborated.
     val s0Valid = Reg(Bool()) init False
-    // Transitional (deleted in Task 11): the registered hit way, still driving the
-    // S1->rsp mux below.
-    val s1Way   = Reg(UInt(wayBits bits))
+    // M3b: which KIND of S0 context this is. False = an accepted fetch command (the
+    // verdict is `s1HitVec`); True = a synthetic context injected by REPLAY or FAULT,
+    // whose way is `installWay` and whose `tagQ`/`validsQ`/`s0Ppn`/`s0Cacheable` are
+    // stale leftovers from the last accept and must NOT be consulted.
+    //
+    // SAFETY-CRITICAL, and the reason `s1Unresolved` carries a `!s0Replay` term that
+    // the plan's literal `s0Valid && !s0Fault && !s1Hit` does not: REPLAY arms
+    // `s0Valid` with `s0Fault := False`, and its stale `s1HitVec` is very likely
+    // all-zero (the tags captured for the LAST accepted command need not match the
+    // replayed line's PPN). Without `!s0Replay`, every REPLAY would look like a fresh
+    // unresolved miss and dispatch a SECOND demand fill for a line that was just
+    // installed -- an infinite refill loop on the first miss the core ever takes.
+    val s0Replay = Reg(Bool()) init False
     val s0Pc    = Reg(UInt(32 bits))
     // HONEST ACCOUNTING, netlist-verified rather than assumed: `s0Set` and `s0Beat`
     // have NO RTL reader at this task -- their consumers (the S1 array re-address and
@@ -608,11 +638,62 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // exactly the case Task 11's `s1Unresolved` needs them for.
     val tagQ    = Reg(Vec(UInt(tagBits bits), ways))
     val validsQ = Reg(Vec(Bool(), ways))
-    s0Valid := False   // default each cycle; armed in IDLE-hit / REPLAY below
+    // M3b: the "installed silently, not demand-hit yet" telemetry bit for each way of
+    // the accessed set, captured on the SAME unconditional enable as `tagQ`/`validsQ`.
+    // The clear used to run at S0 off `pfFilled(hitWayIdx)(lookupSet)` -- a live
+    // async-tag-compare-derived INDEX into a 64-entry register array, i.e. exactly the
+    // shape this task exists to remove from the accept cone. Capturing the four bits
+    // and clearing at S1 off `s1HitVec` costs 4 flops and no accept-cone logic.
+    val pfFilledQ = Reg(Vec(Bool(), ways))
+    s0Valid := False   // default each cycle; armed on cmdPort.fire / REPLAY / FAULT,
+                       // and HELD by the S1 miss dispatch below the FSM
     // Sim-only visibility for `IcacheVerdictShadowSpec` (and, from Task 11, for the
     // consumers' own directed tests). No synthesised logic.
     s0Valid.simPublic(); s0Pc.simPublic(); s0Set.simPublic(); s0Beat.simPublic()
     s0Lane.simPublic(); s0Ppn.simPublic(); s0Cacheable.simPublic(); s0Fault.simPublic()
+    s0Replay.simPublic()
+
+    // ══ M3b (Task 11): THE S1 VERDICT. The only hit/miss computation in the plugin. ══
+    // Moved UP from its Task 10 position (it used to sit next to the live comparator it
+    // shadowed) so that it precedes its consumers: the S1 output mux immediately below,
+    // and `cmdPort.ready` inside the FSM.
+    //
+    // A tagBits-wide equality against a REGISTERED ppn, a 4-way OR, and an AND with
+    // `s0Valid`. ~3 LUT levels off flop outputs -- versus the deleted LIVE path's
+    // ITLB mux -> async LUTRAM read -> compare -> OR -> `answerable` -> `cmdPort.ready`,
+    // which is the 20-level, 66 %-route arc that `synth/floorplan_frontend.xdc` names as
+    // all 300 worst failing endpoints on the pinned routed checkpoint.
+    //
+    // PROVEN EQUIVALENT to the deleted live comparator, per-way and not merely
+    // OR-reduced, by Task 10's in-RTL `dbgVerdictMatch` assertion running under the
+    // whole 396-test lock-step suite plus `IcacheVerdictShadowSpec`'s independent
+    // array-content model. That proof covered exactly these four expressions; this task
+    // adds NO new term to them.
+    val s1HitVec = Vec((0 until ways).map(w =>
+      s0Cacheable && validsQ(w) && (tagQ(w) === s0Ppn)))
+    val s1Hit    = s1HitVec.orR
+    // Held high while an ACCEPTED command's miss has not yet been dispatched to a fill.
+    // This is the signal that gates `cmdPort.ready`, dispatches the demand MSHR write,
+    // freezes the prefetch frontier and steers the AR arbiter.
+    //
+    // `!s0Replay` is a DELIBERATE ADDITION to the plan's literal
+    // `s0Valid && !s0Fault && !s1Hit` -- see `s0Replay`'s declaration for why omitting
+    // it is an infinite refill loop rather than a subtlety. (`FAULT`'s synthetic
+    // context is already excluded twice over: it sets both `s0Fault` and `s0Replay`.)
+    val s1Unresolved = s0Valid && !s0Replay && !s0Fault && !s1Hit
+    s1Hit.simPublic(); s1Unresolved.simPublic(); s1HitVec.foreach(_.simPublic())
+
+    // Slice I3 telemetry, moved from S0 to S1 with the verdict. `pfHitUseful` is a pure
+    // wire (declared with the other FSM control nets below) that a testbench counts;
+    // the `pfFilled` clear is real state. `!s0Replay` excludes the synthetic REPLAY/
+    // FAULT contexts, whose `s1HitVec`/`pfFilledQ`/`s0Set` are stale.
+    val pfHitUsefulS1 = Bool(); pfHitUsefulS1 := False
+    when(s0Valid && !s0Replay && !s0Fault) {
+      for (w <- 0 until ways) when(s1HitVec(w) && pfFilledQ(w)) {
+        pfFilled(w)(s0Set) := False
+        pfHitUsefulS1      := True
+      }
+    }
 
     // ---- rsp output register stage ----
     val rspValidReg = Reg(Bool()) init False
@@ -719,14 +800,57 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // INHIBITED/poisoned bypass now holds a pre-selected single window (`bypPred`), so
     // nothing in the design selects a window out of a whole packed line any more.
 
-    // ---- S1 -> rsp output register (runs every cycle; meaningful when s0Valid) ----
-    // Way-mux the registered raw beats/pred by s1Way, then window-decode — all off
-    // REGISTERED state (s1Way/s0Lane/s0Pc), so neither the data nor the pred select
-    // is in the IDLE hit cone.
+    // ---- S1 -> rsp output register (M3b, Task 11) ------------------------------
+    // Per-way LANE PRE-SELECT runs IN PARALLEL with the tag compare (spec §5.3.2
+    // device 1, NaxRiscv's BANKS_MUXES at §4.3 N-2): `s0Lane` is REGISTERED and
+    // page-invariant, so it does not wait on the verdict. The one-hot AND-OR is then
+    // over 64 + 32 bits instead of 256 + 128 -- one fewer OR-tree level and a quarter
+    // of the LUTs. This replaces the old `ufaDataVec(s1Way)` binary way mux, which
+    // selected 256 bits first and then windowed.
+    val wayWindow = (0 until ways).map(w => ufaData(w).subdivideIn(64 bits)(s0Lane))
+    // `windowPredBeat` takes a full PC and selects on pc(4:3); `s0Lane` IS s0Pc(4:3)
+    // (both are captured from `lookupLaneIdx`/`lookupPc` at S0), so these two lines
+    // select the same window. Passing `s0Pc` here rather than `s0Lane` keeps
+    // `windowPredBeat`'s one signature shared with the bypass path -- do not "unify"
+    // them by changing the helper.
+    val wayPred   = (0 until ways).map(w => windowPredBeat(ufaPred(w), s0Pc).asBits)
+
+    // ══ SG-2 (plan resolution; spec §5.3 sketches only the hit path) ═══════════════
+    // REPLAY and FAULT deliver from a KNOWN way, not from a computed `s1HitVec`. One
+    // 4-bit 2:1 mux off registered state -- it does not re-enter the accept cone.
+    //
+    // WAY-SELECTION CORRECTNESS, spelled out because this is the one genuinely NEW
+    // signal M3b derives and Task 10's equivalence proof does NOT cover it for free:
+    //   - The `!s0Replay` arm is `s1HitVec` VERBATIM -- the exact Vec Task 10's
+    //     `dbgVerdictMatch` compared, PER WAY (review fix I1), against the live
+    //     `hitVec` this task deletes. The old path fed `s1Way := hitWayIdx =
+    //     OHToUInt(hitVec)` into a binary mux; `UIntToOh(OHToUInt(v)) === v` for any
+    //     one-hot-or-zero `v`, and `hitVec` is one-hot-or-zero by the cache's own
+    //     one-line-per-set invariant. So this arm selects the SAME way as before by
+    //     construction, with the encode/decode round trip removed rather than trusted.
+    //   - The `s0Replay` arm is `UIntToOh(installWay)`, and the old path set
+    //     `s1Way := installWay` in REPLAY. Identical.
+    //   - The ONE behavioural difference is FAULT, which used to force `s1Way := 0` and
+    //     now selects `installWay`. Both deliver ARBITRARY array content: a fault
+    //     response's `data` is DISCARDED by the only consumer
+    //     (`FetchAlignPlugin.scala`'s word enqueue is gated on
+    //     `!ic.rsp.payload.fault`), and `pred` is masked to all-zero by `s0Fault`
+    //     below in both the old and the new form. Deliberate, and cheaper than
+    //     carrying a third mux arm to reproduce a don't-care value.
+    val s1WayOh = (0 until ways).map(w =>
+      Mux(s0Replay, installWay === U(w, wayBits bits), s1HitVec(w)))
+
+    /** One-hot AND-OR (spec §5.3.2 device 2) rather than `OHToUInt` + a binary mux: the
+      * one-hot vector is already available, and encoding then re-decoding it is two
+      * avoidable levels. `andMask` emits a plain replicated-AND, so the emitted Verilog
+      * for this cone contains no encoder -- verified by reading `generated/`. */
+    def ohOr(sel: Seq[Bool], data: Seq[Bits]): Bits =
+      data.zip(sel).map { case (d, s) => d.andMask(s) }.reduceBalancedTree(_ | _)
+
     // Task icache-corruption-fix: bypass mux — for a REPLAY of a non-allocated
-    // (INHIBITED) miss (s0FromMiss), deliver directly from the miss-latch registers
-    // (mirrors DcachePlugin's inhibitedResp/missLine) instead of the shared arrays,
-    // which were never written for that line.
+    // (INHIBITED) or poisoned miss (`s0FromMiss`), deliver directly from the
+    // `bypWindow`/`bypPred` registers (mirrors DcachePlugin's inhibitedResp/missLine)
+    // instead of the shared arrays, which were never written for that line.
     //
     // M2b: `missDataBeat`'s 512-bit half-select is gone with `lineReg`; the bypass is
     // already the exact 64-bit window REPLAY will deliver. EQUIVALENCE: the old form
@@ -734,35 +858,40 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // REPLAY sets `s0Pc := missPC` and `s0Lane := missPC(4 downto 3)`, so the delivered
     // window was {beat missPC(5), lane missPC(4:3)} -- exactly the window the dwell
     // captures into `bypWindow` on the cycle `commitBeat === missPC(5)`.
-    val s1Window = Mux(s0FromMiss, bypWindow,
-                                   ufaDataVec(s1Way).subdivideIn(64 bits)(s0Lane))
-    // M1b: predecode now rides out of the SAME synchronous array as the data, selected
-    // by the same registered way (`s1Way`) and a one-bit-narrower window index. The old
-    // path (4 x PRED_BITS_PER_LINE async-LUTRAM reads captured into 1,024 flops) is gone.
+    val s1Window = Mux(s0FromMiss, bypWindow, ohOr(s1WayOh, wayWindow))
+    // M1b: predecode rides out of the SAME synchronous array as the data, selected by
+    // the same one-hot way and a one-bit-narrower window index. The old path
+    // (4 x PRED_BITS_PER_LINE async-LUTRAM reads captured into 1,024 flops) is gone.
     //
     // Fault placeholder (spec §5.1): the deleted S1 capture bank was written
     // all-zero on a translation fault (and in the task-#211 FAULT state), so the
-    // window select of it delivered a zeroed predecode. With no such register -- and with
-    // `ufaBeat` carrying whatever the speculatively-armed array read returned for the
-    // faulting address's set/beat, under a FORCED s1Way of 0 -- S1 must mask explicitly.
-    // One 2:1 mux on the S1->rsp path (one LUT level), preserving the exact
-    // zeroed-predecode behaviour Aligner/DecodeStage already rely on. Pinned by
-    // IcacheUnifiedArraySpec's "M1b: a translation fault delivers ZEROED predecode".
+    // window select of it delivered a zeroed predecode. With no such register -- and
+    // with `ufaBeat` carrying whatever the speculatively-armed array read returned for
+    // the faulting address's set/beat -- S1 must mask explicitly. One 2:1 mux on the
+    // S1->rsp path (one LUT level), preserving the exact zeroed-predecode behaviour
+    // Aligner/DecodeStage already rely on. Pinned by IcacheUnifiedArraySpec's
+    // "M1b: a translation fault delivers ZEROED predecode".
     //
     // s0Fault and s0FromMiss are never both set (REPLAY forces s0Fault := False), so the
     // mask cannot disturb the INHIBITED/poisoned bypass.
     //
-    // M2a: BOTH arms are now ONE window wide (4 * PRED_BITS_PER_WORD). The bypass arm
-    // needs no window select at all -- `bypPred` was captured pre-selected at
-    // missPC(5:3) during the predecode dwell, which is exactly the window
-    // `windowPredLine(missPred, s0Pc)` used to extract here (REPLAY sets s0Pc := missPC).
-    val s1PredBits = Mux(s0FromMiss, bypPred,
-                                     windowPredBeat(ufaPredVec(s1Way), s0Pc).asBits)
+    // M2a: BOTH arms are ONE window wide (4 * PRED_BITS_PER_WORD). The bypass arm needs
+    // no window select at all -- `bypPred` was captured pre-selected at missPC(5:3)
+    // during the predecode dwell.
+    val s1PredBits = Mux(s0FromMiss, bypPred, ohOr(s1WayOh, wayPred))
     val s1PredW    = Vec(Mux(s0Fault, B(0, s1PredBits.getWidth bits), s1PredBits)
                            .subdivideIn(PRED_BITS_PER_WORD bits)
                            .map(b => b.as(ChunkPredecode())))
 
-    rspValidReg := s0Valid
+    // ══ M3b: THE RESPONSE GATE. `s0Valid` alone is NOT the response condition. ═════
+    // `s0Valid` now means "a command was accepted last cycle" and is therefore TRUE on
+    // the S1 cycle of a demand MISS, which owes no response yet (its response is the
+    // later REPLAY/FAULT one). See `s0Valid`'s declaration: a bare `rspValidReg :=
+    // s0Valid` -- the plan's literal text -- emits one extra data-less response per
+    // miss, double-retiring a FetchAlign ring slot. `s1Unresolved` is exactly "accepted
+    // and not answerable", so its complement is exactly the response condition:
+    //   s0Valid && !s1Unresolved  ==  s0Valid && (s0Replay || s0Fault || s1Hit)
+    rspValidReg := s0Valid && !s1Unresolved
     rspPcReg    := s0Pc
     rspDataReg  := s1Window
     rspFaultReg := s0Fault
@@ -788,106 +917,39 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val lookupSet = lookupPc(11 downto 6)
     val lookupTag = lookupPaddr(31 downto 12)
     // M3a: the async tag read is HOISTED to a named signal. It used to be inlined in
-    // `hitVec` below; the S0 capture (`tagQ`) needs the SAME value, and a second
-    // `tagMem(w).readAsync(lookupSet)` call would elaborate a SECOND async read port on
-    // each way's distributed RAM -- i.e. duplicate the LUTRAM. One port, two readers.
-    // Naming it also makes the capture provably the same net the live comparator uses,
-    // which is what the equivalence assertion below is comparing storage forms of.
+    // the (now deleted) live `hitVec`; the S0 capture (`tagQ`) needs the SAME value, and
+    // a second `tagMem(w).readAsync(lookupSet)` call would elaborate a SECOND async read
+    // port on each way's distributed RAM -- i.e. duplicate the LUTRAM. M3b leaves ONE
+    // port with ONE reader: the S0 capture.
     val lookupTags   = Vec((0 until ways).map(w => tagMem(w).readAsync(lookupSet)))
     val lookupValids = Vec((0 until ways).map(w => valids(w)(lookupSet)))
-    val hitVec = Vec(Bool(), ways)
-    for (w <- 0 until ways)
-      hitVec(w) := lookupCacheable && lookupValids(w) && (lookupTags(w) === lookupTag)
-    val isHit       = hitVec.orR
-    val hitWayIdx   = OHToUInt(hitVec)
     val lookupBeatSel   = lookupPc(5)
     val lookupLaneIdx   = lookupPc(4 downto 3)
     val lookupReadAddr  = (lookupSet ## lookupBeatSel).asUInt
 
-    // ══ M3a (Task 10): the S1 verdict, computed from REGISTERED inputs only ═══════
-    // A tagBits-wide equality against a registered PPN, a 4-way OR, and an AND with
-    // `s0Valid`. ~3 LUT levels off flop outputs -- versus the LIVE path's
-    // ITLB mux -> async LUTRAM read -> compare -> OR -> `answerable` -> `cmdPort.ready`,
-    // which is the 20-level, 66 %-route arc that `synth/floorplan_frontend.xdc` names as
-    // all 300 worst failing endpoints on the pinned routed checkpoint.
+    // ══ M3b (Task 11): THE LIVE ACCEPT-CONE COMPARATOR IS DELETED. ════════════════
+    // `hitVec` / `isHit` / `hitWayIdx` / `answerable` / `heldDemandMiss` and Task 10's
+    // whole shadow-equivalence apparatus (`dbgS0Fresh`, `dbgLiveHitQ`,
+    // `dbgLiveHitVecQ`, `dbgVerdictMatch` and its in-RTL assertion) stood HERE and are
+    // gone. What they proved is now load-bearing rather than observational: the single
+    // surviving verdict is `s1HitVec`/`s1Hit`/`s1Unresolved`, computed near the S0
+    // register set above from REGISTERED inputs only.
     //
-    // NOTHING CONSUMES THESE YET. This task is behaviour-neutral by construction: the
-    // live `isHit` still drives `cmdPort.ready`, `s1Way`, the S1 arming, the MSHR
-    // allocation and `heldDemandMiss`. Task 11 (M3b) flips the consumers and deletes the
-    // live comparator. The names below are the exact ones Tasks 11/12 use.
-    val s1HitVec = Vec((0 until ways).map(w =>
-      s0Cacheable && validsQ(w) && (tagQ(w) === s0Ppn)))
-    val s1Hit    = s1HitVec.orR
-    // Held high while an accepted command's miss has not yet been dispatched to a fill.
-    // Task 11 makes this gate `cmdPort.ready`; this task only computes it.
-    val s1Unresolved = s0Valid && !s0Fault && !s1Hit
-    s1Hit.simPublic(); s1Unresolved.simPublic(); s1HitVec.foreach(_.simPublic())
-
-    // ---- Task 10 (M3a) TRANSITIONAL shadow-equivalence check --------------------
-    // Deleted in Task 11 together with the live comparator.
+    // `lookupTags`/`lookupValids` above SURVIVE, and their remaining reader is the S0
+    // capture (`tagQ`/`validsQ`) alone -- they are latched, not compared, in this
+    // cycle. That is precisely design principle P3: the ITLB result terminates at
+    // `s0Ppn`/`s0Fault`/`s0Cacheable` and the async LUTRAM read terminates at `tagQ`.
+    // Nothing derived from `xlate.rsp` reaches `cmdPort.ready` any more except
+    // `xlate.rsp.ready` itself, which is a translation-SERVICE handshake (a cold ITLB
+    // walk must still hold the command), not a translation-fed verdict.
     //
-    // WHY THIS IS NOT A TAUTOLOGY, spelled out because Task 5's review caught the design
-    // spec's own suggested check being one. The two sides are DIFFERENT STORAGE of the
-    // same instant, not two spellings of one expression:
-    //   - LIVE side: the 1-bit result of the live comparator, latched at the accept edge
-    //     (`dbgLiveHitQ`). Four 20-bit compares and a 4-way OR happen BEFORE the flop.
-    //   - REGISTERED side: 4 x tagBits + 4 valid bits + tagBits of PPN + 1 cacheable bit
-    //     are latched at that same edge (105 flops), and the four compares and the OR are
-    //     re-evaluated AFTER the flops, from those registers.
-    // A capture written under the wrong ENABLE (inside a fault/hit/miss arm rather than
-    // unconditionally on `cmdPort.fire`), at the wrong INDEX (`s0Set` instead of
-    // `lookupSet`, i.e. one command stale), with the wrong BIT RANGE on the PPN, or with
-    // a dropped term (`s0Cacheable`) all make the two disagree -- and all four are
-    // mutation-proven in `IcacheVerdictShadowSpec`. What it deliberately does NOT claim
-    // to prove is that the LIVE verdict is itself correct; that is oracle 1/2's and the
-    // lock-step suite's job, and neither side of this check is changed by this task.
-    //
-    // GATE: `dbgS0Fresh`, i.e. "the previous cycle was an accepted command", NOT the
-    // plan's literal `s0Valid`. DELIBERATE AND STRICTLY STRONGER. `s0Valid` is armed
-    // only on the FAULT and HIT arms -- a demand MISS leaves it False -- so an `s0Valid`
-    // gate would never check the verdict on the one case the registered path exists to
-    // handle (Task 11's `s1Unresolved` is a MISS signal). With `dbgS0Fresh` every
-    // accepted command is checked, hit, miss and fault alike.
-    //
-    // NO FAULT EXEMPTION, also deliberate, also strictly stronger than the plan's text.
-    // The plan exempts `dbgLiveFaultQ` on the grounds that a faulting translation makes
-    // `isHit` meaningless. It does make it meaningless, but it does not make it
-    // DIFFERENT: both sides sample the very same `lookupCacheable`/`lookupValids`/
-    // `lookupTags`/`lookupTag` nets on the very same edge, so whatever garbage a faulting
-    // ITLB response puts on them is captured identically by both. Exempting faults would
-    // silently drop coverage of every faulting accept, and the M3a directed fault test
-    // below confirms empirically that the un-exempted form holds.
-    // TASK 10 REVIEW FIX I1: compare the FULL ONE-HOT VECTOR, not just its OR-reduction.
-    // The original check (`s1Hit === dbgLiveHitQ`) was proven by mutation to be INVISIBLE
-    // to a consistent way-permutation of the capture (`validsQ(w) := lookupValids(ways-1-w)`
-    // together with the matching `tagQ` permutation): the OR-reduced verdict still says
-    // "hit", while the registered path identifies the WRONG WAY. Task 11 turns `s1WayOh`
-    // straight into the S1 data/predecode select, so a permuted way is exactly risk R3's
-    // silent mis-paired-instruction-bytes failure -- no crash, wrong bytes. The 4
-    // additional transitional flops (`dbgLiveHitVecQ`, one per way) are deleted in Task 11
-    // together with the rest of the shadow scaffolding, same lifecycle as `dbgLiveHitQ`.
-    val dbgS0Fresh      = RegNext(cmdPort.fire) init False
-    val dbgLiveHitQ     = RegNextWhen(isHit, cmdPort.fire) init False
-    val dbgLiveHitVecQ  = RegNextWhen(hitVec.asBits, cmdPort.fire) init B(0, ways bits)
-    val dbgVerdictMatch = Bool()
-    dbgVerdictMatch := !dbgS0Fresh || (s1HitVec.asBits === dbgLiveHitVecQ)
-    dbgS0Fresh.simPublic(); dbgLiveHitQ.simPublic(); dbgVerdictMatch.simPublic()
-    dbgLiveHitVecQ.simPublic()
-    // In-RTL, synthesis-inert, and therefore running under EVERY test in the tree --
-    // lock-step, the fuzz campaign and the ported corpus included -- not only under the
-    // directed shadow suite. Same style as the `missPC` immutability assertion (M2b) and
-    // the `refillActive => mshrValid(DEMAND_IDX)` assertion (Task 9 review fix M3).
-    assert(dbgVerdictMatch,
-      "M3a SHADOW VIOLATED: the S1 per-way hit VECTOR computed from the REGISTERED S0 " +
-      "context (tagQ/validsQ/s0Ppn/s0Cacheable) disagrees with the LIVE accept-cycle " +
-      "hitVec, delayed one cycle -- either the hit/miss verdict or the SELECTED WAY " +
-      "differs. M3 cannot flip until these are identical -- risk R3's failure " +
-      "mode is silent instruction-byte mis-pairing, not a crash.")
-    // An architectural miss can remain visibly held while a speculative owner or
-    // the shared installer drains.  Freeze old-window allocation and let the AR
-    // arbiter launch only the same-set owner needed to unblock it.
-    val heldDemandMiss = lookupActive && cmdPort.valid && xlate.rsp.ready &&
-                         !lookupFault && !isHit
+    // The two consumers of the deleted `heldDemandMiss` -- the prefetch frontier's
+    // allocation freeze and the AR arbiter's blocking-slot priority -- read
+    // `s1Unresolved` instead (see below the FSM). The two notions differ in WHERE the
+    // stuck demand sits: `heldDemandMiss` meant "a miss is visible at the Stream
+    // boundary and was refused"; `s1Unresolved` means "a miss was ACCEPTED and has not
+    // been dispatched". Under M3 the second is the one that matters, because a miss is
+    // now always accepted first and resolved afterwards.
 
     // DEBUG (Task P5.5 regression test, mirrors the existing simPublic DEBUG hooks
     // above): high for exactly the ONE cycle on which PREDECODE performs the
@@ -937,8 +999,48 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // testbench counts to derive design doc §8.3's "prefetch issued / useful /
     // wasted". Deliberately NOT synthesised counters -- the core must not carry
     // measurement-only registers.
-    val pfHitUseful     = Bool(); pfHitUseful     := False; pfHitUseful.simPublic()
+    // M3b: driven from the S1 telemetry block near the verdict (it needs `s1HitVec`,
+    // which is computed there). Kept as a wire under this name so every testbench that
+    // counts it is untouched.
+    val pfHitUseful     = Bool(); pfHitUseful     := pfHitUsefulS1; pfHitUseful.simPublic()
     val demandFillStart = Bool(); demandFillStart := False
+    // M3b: the demand fill is dispatched from S1, textually BELOW the FSM. This is the
+    // request wire the plan's implementer note prefers over `fsm.forceGoto` -- it keeps
+    // every `goto` inside the FSM, which is this file's convention.
+    val startDemandFill = Bool(); startDemandFill := False
+    // ── SG-1 (plan resolution; spec §5.3 does not cover this) ────────────────────
+    // Today's accept gate USES the hit/fault verdict to decide acceptance while a
+    // speculative slot owns the looked-up set:
+    //     answerable = lookupFault || isHit || !pfLookupSetBusy       (IDLE)
+    //     answerable = lookupFault || isHit                           (during a fill install)
+    // Under M3 that verdict does not exist until S1, one cycle after acceptance.
+    // Dropping the verdict disjuncts leaves exactly one term, `!pfLookupSetBusy`, which
+    // is computed from `lookupSet` (VIRTUAL, page-invariant) against REGISTERED MSHR
+    // state -- no translation, no tag compare -- i.e. exactly the kind of term design
+    // principle P3 permits in the accept cone.
+    //
+    // DEVIATION FROM THE PLAN'S LITERAL TEXT, and it is a correction, not a
+    // relaxation. The plan attributes the `|| !pfLookupSetBusy` disjunct to the
+    // canStartFill = false (fill-install) arm and applies its resolution only there,
+    // leaving IDLE with `pfAcceptOk := True` ("IDLE imposes no such restriction"). The
+    // two arms are the other way round in the RTL: it is IDLE that carries the
+    // disjunct. Applying the plan's own rule to the arm that actually has the term
+    // means gating IDLE too -- and it MUST be gated, because IDLE is the one arm that
+    // can dispatch a demand fill. Without it, a demand miss to a set a live speculative
+    // fill already owns would be accepted and would dispatch a SECOND fill into that
+    // set; if it is the same LINE, both install and the set ends up with two valid ways
+    // carrying the same tag, which makes `s1HitVec` 2-hot and the one-hot AND-OR below
+    // deliver the bitwise OR of two ways. That is the "one fill owner per set"
+    // invariant the whole allocator is built around.
+    //
+    // COST: strictly more conservative than today. A HIT to a set that a speculative
+    // slot happens to own is now held for the install dwell instead of answered.
+    // Bounded (the slot is freed at the end of its 3-cycle dwell) and measured, not
+    // assumed, by the Task 14 IPC gate. NO DEADLOCK: with nothing accepted,
+    // `s1Unresolved` is low, so the AR arbiter is free to launch the blocking slot's
+    // own read and drain it.
+    val pfAcceptOk = Bool()
+    pfAcceptOk := True     // only meaningful where `lookupTick` overrides it
     // A lookup that RESETS/KILLS the frontier owns the allocator cycle. Same-line
     // and same-page sequential hits do not: a bubble-free hit stream must still let
     // freed speculative IDs advance the fifth/farther candidate.
@@ -977,13 +1079,42 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // A held demand matching any live speculative line must re-look-up after install;
     // a same-set/different-line demand waits as well, preserving one fill owner per set.
     val lookupLineBase = lookupPaddr & ~U(63, 32 bits)
-    // Speculative-only, and it must stay that way: its ONLY consumer is `answerable`
-    // inside `lookupTick(canStartFill = true)`, which is reached only from IDLE, and in
-    // IDLE `mshrValid(DEMAND_IDX)` is False by construction -- so widening it to the
-    // whole file would be a literal no-op, and a misleading one.
+    // Speculative-only, and it must stay that way: its ONLY consumers are SG-1's
+    // `pfAcceptOk` inside `lookupTick` and `heldOnSetBusy` just below, both of which are
+    // reached only while the machine can accept a command -- and in those states
+    // `mshrValid(DEMAND_IDX)` is False by construction, so widening it to the whole file
+    // would be a literal no-op, and a misleading one.
     val pfLookupSetBusy = Vec((0 until pfSlots).map(i =>
       mshrValid(i + AxiIds.I_SPEC_BASE) &&
         (mshrSet(i + AxiIds.I_SPEC_BASE) === lookupSet))).orR
+
+    // ══ M3b: the SECOND half of what `heldDemandMiss` used to mean ════════════════
+    // The deleted `heldDemandMiss` conflated two situations that M3 separates:
+    //   (a) a demand that was ACCEPTED and whose miss is not yet dispatched -> that is
+    //       `s1Unresolved`, a purely registered-input signal;
+    //   (b) a demand that is OFFERED at the Stream boundary and REFUSED because a live
+    //       speculative fill already owns its set -> that is this signal.
+    // (b) does not disappear under M3 -- SG-1's accept gate is what creates it -- and it
+    // is the one the AR arbiter's blocking-owner priority is about: the demand cannot
+    // make progress until that specific slot's fill lands, so its AR must outrank the
+    // lower-numbered slots' (`IcachePrefetchSpec`'s "a held demand's blocking owner
+    // outranks lower-numbered slots in the AR arbiter", which is a real anti-starvation
+    // property, not a tie-break preference).
+    //
+    // NO VERDICT IS INVOLVED, which is why this is not a re-creation of what this task
+    // deleted: there is no tag compare and no ITLB PPN here. `pfLookupSetBusy` is
+    // registered MSHR state against the VIRTUAL `lookupSet`, and `xlate.rsp.ready` is
+    // the translation-SERVICE handshake (kept for parity with the deleted expression: a
+    // command whose walk has not completed is not yet a demand worth reprioritising
+    // for). It feeds ONLY the allocator freeze and the AR arbiter -- never
+    // `cmdPort.ready`, whose `pfAcceptOk` term already carries `pfLookupSetBusy`
+    // directly -- so it adds nothing to the accept cone.
+    //
+    // Task 12 (M4) owns making this disposition fully registered.
+    val heldOnSetBusy = lookupActive && cmdPort.valid && xlate.rsp.ready && pfLookupSetBusy
+    // "A demand fill is imminent or blocked" -- the union of (a) and (b), i.e. the exact
+    // condition the deleted `heldDemandMiss` served at its two consumers.
+    val demandStuck = s1Unresolved || heldOnSetBusy
 
     // Speculative-only: entry 0's install is driven by the FSM's own REFILL->INSTALL_ARM
     // transition, not by this arbiter. (Task 9 review fix I1: `mshrComplete(DEMAND_IDX)`
@@ -1085,8 +1216,14 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // The plan's I1.2 "same-line duplicate-miss suppression" and I3.2 "demotion"
       // (a demand fetch attaching to an in-flight prefetch) are both delivered by the
       // SAME cheap mechanism the plan itself sanctions: **backpressure the offered
-      // Stream command and re-look-up.** A demand miss during a prefetch fill is not
-      // accepted or allocated; it remains stable and, once the fill lands, HITS.
+      // Stream command and re-look-up.** A demand miss to the SET a speculative fill
+      // owns is not accepted or allocated; it remains stable and, once the fill lands,
+      // HITS. M3b (Task 11) is what makes that statement rest on SG-1's
+      // `pfAcceptOk = !pfLookupSetBusy` -- a page-invariant, registered-state term --
+      // rather than on the deleted `answerable`'s live hit/fault verdict. A miss to some
+      // OTHER set MAY now be accepted mid-dwell; it is simply held at S1 (`s1Unresolved`
+      // keeps `s0Valid` alive and the port shut) until the machine reaches IDLE and
+      // dispatches it, which is at most the remainder of the 3-cycle dwell away.
       // Observable requirement met: N same-line fetches produce exactly ONE AR. It also
       // satisfies rules M1/M2/P2/P3 with no extra logic -- an errored fill allocates
       // nothing, so the held fetch re-looks-up, misses, and issues its OWN real
@@ -1106,9 +1243,11 @@ class IcachePlugin extends FiberPlugin with FetchService {
         lookupActive := True
 
         // Arm the BRAM solely from virtual page-offset bits, in parallel with the ITLB
-        // and tag lookup. Never gate this enable with hitVec/isHit: doing so would put
-        // translation and tag comparison back on the BRAM ENARDEN path. Reads for a
-        // miss/fault/held command are harmless because no S1 context consumes them.
+        // and tag lookup. Never gate this enable with a hit/miss VERDICT: doing so would
+        // put translation and tag comparison back on the BRAM ENARDEN path (and under
+        // M3b the verdict does not exist in this cycle at all). Reads for a miss/fault/
+        // held command are harmless: a miss's response comes from REPLAY, which re-arms
+        // this port itself, so the clobbered `ufaBeat` is never consumed.
         // M2c (SG-3 exception 1): reads `installSet`, the dedicated dwell register, not
         // `mshrSet(installIdx)` -- this comparator is in the ACCEPT cone and must not
         // grow a 5:1 Vec mux in front of it. `installSet` was maintained in lock-step
@@ -1118,14 +1257,29 @@ class IcachePlugin extends FiberPlugin with FetchService {
         ufaReadAddr := lookupReadAddr
         ufaReadEn   := cmdPort.valid && !setBlocked
 
-        // IDLE may accept any resolved command, including the demand miss it captures.
-        // During a prefetch fill, only an answerable hit/fault may fire; a miss remains
-        // held at the Stream boundary until the shared fill engine becomes free.
-        val answerable = if (canStartFill)
-          (lookupFault || isHit || !pfLookupSetBusy)
-        else
-          (lookupFault || isHit)
-        cmdPort.ready := xlate.rsp.ready && !setBlocked && answerable
+        // ══ M3b: `cmdPort.ready` FROM REGISTERED STATE ONLY. ═════════════════════
+        // No ITLB mux, no async LUTRAM read, no 20-bit comparator and no 4-way OR
+        // upstream of a Stream ready that leaves the plugin -- nor of any clock enable
+        // in it. The three surviving terms are:
+        //   `xlate.rsp.ready`  a translation-SERVICE handshake (a cold ITLB walk must
+        //                      still hold the command); NOT a verdict.
+        //   `!setBlocked`      the D3-SET-I guard: virtual `lookupSet` vs the registered
+        //                      `installSet`. Unchanged.
+        //   `!s1Unresolved`    a tagBits equality against a REGISTERED ppn, a 4-way OR
+        //                      and an AND -- ~3 LUT levels off flop outputs.
+        //   `pfAcceptOk`       SG-1's page-invariant, registered-state prefetch-fill
+        //                      accept gate (see its declaration above the FSM).
+        //
+        // `!s1Unresolved` is what makes the accepted-then-resolved shape safe: from the
+        // cycle a miss is DISCOVERED until it is dispatched to a fill, no younger
+        // command may be accepted. `FetchRsp` carries no tag and `FetchAlignPlugin`
+        // attributes responses by ring head, so admitting one would be silent
+        // instruction-byte mis-pairing (risk R3). Pinned by IcacheVerdictShadowSpec's
+        // "M3b: no younger command is accepted behind an unresolved miss", and its
+        // opposite direction (the gate must be LOW on a hit, or every straight-line
+        // fetch loses an issue slot) by "M3b: sustained II=1 on hits".
+        pfAcceptOk := !pfLookupSetBusy
+        cmdPort.ready := xlate.rsp.ready && !setBlocked && !s1Unresolved && pfAcceptOk
 
         when(cmdPort.fire) {
           // ══ M3a S0 CAPTURE ═════════════════════════════════════════════════════
@@ -1135,13 +1289,20 @@ class IcachePlugin extends FiberPlugin with FetchService {
           // fault/hit/miss chain below would be a real bug: the MISS arm is precisely
           // the case Task 11's `s1Unresolved` needs a valid registered context for.
           //
-          // BEHAVIOUR NEUTRALITY of the two writes that were previously arm-local
-          // (`s0Pc`, `s0Lane`, which the fault and hit arms each set to these exact
-          // values and the miss arm did not set at all): on the miss arm both are now
-          // written where they previously held their prior value. Nothing observes
-          // that. `s0Valid` is False on the miss cycle, so the S1->rsp path's use of
-          // them is gated off (`rspValidReg := s0Valid`), REFILL reads neither, and
-          // REPLAY overwrites both from `missPC` before it re-arms `s0Valid`.
+          // M3b: `s0Valid`/`s0Replay`/`s0Atc`/`s0FromMiss` join the unconditional
+          // capture. The fault/hit/miss `when` chain that used to follow is DELETED
+          // whole -- it existed only to consume the live verdict, and every one of its
+          // three arms' effects now happens at S1 (the response gate), at the S1 miss
+          // dispatch (the MSHR write), or in the S1 telemetry block (the `pfFilled`
+          // clear). What remains here is a flat capture under one shallow enable.
+          //   `s0Atc  := lookupFault`  -- the old fault arm set True, the old hit arm
+          //     set False, i.e. exactly `lookupFault`. (It is a response-payload
+          //     attribute, not part of the verdict; FAULT sets the opposite value.)
+          //   `s0FromMiss := False`    -- all three old arms set False here.
+          s0Valid     := True
+          s0Replay    := False
+          s0Atc       := lookupFault
+          s0FromMiss  := False
           s0Pc        := lookupPc
           s0Set       := lookupSet
           s0Beat      := lookupBeatSel
@@ -1151,19 +1312,16 @@ class IcachePlugin extends FiberPlugin with FetchService {
           // DEVIATION from the plan's Step 4 list, which leaves `s0Fault` arm-local:
           // it is captured here instead, because the plan's OWN "Produces" interface
           // calls it part of "the registered translation verdict" and because
-          // `s1Unresolved` reads it. EXACTLY EQUIVALENT: the fault arm below is
-          // `when(lookupFault)` and set it True, the hit arm is reached only when
+          // `s1Unresolved` reads it. EXACTLY EQUIVALENT: the (now deleted) fault arm was
+          // `when(lookupFault)` and set it True, the hit arm was reached only when
           // `!lookupFault` and set it False -- i.e. both set precisely `lookupFault`.
-          // The miss arm left it STALE; it is now False there, which nothing observes
-          // (`s0Valid` is False on a miss cycle, so `rspFaultReg`'s copy is gated off,
-          // REFILL reads it not at all, and REPLAY/FAULT rewrite it before re-arming
-          // `s0Valid`). `s0Atc` is deliberately NOT hoisted: it is a response-payload
-          // attribute distinguishing an ATC fault from a bus-error fault, not part of
-          // the translation verdict, and FAULT sets it to the opposite value.
           s0Fault     := lookupFault
           for (w <- 0 until ways) {
-            tagQ(w)    := lookupTags(w)
-            validsQ(w) := lookupValids(w)
+            tagQ(w)      := lookupTags(w)
+            validsQ(w)   := lookupValids(w)
+            // M3b: same enable, same index (`lookupSet`) as the tag/valid capture, so
+            // the four bits belong to the same set the verdict is computed for.
+            pfFilledQ(w) := pfFilled(w)(lookupSet)
           }
           when(!lookupFault && lookupCacheable) {
             val line = lookupPaddr & ~U(63, 32 bits)
@@ -1177,49 +1335,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
             pfWindowUpdate := True
             pfSeqValid := False
           }
-          // M3a: `s0Pc`/`s0Lane`/`s0Fault` are NOT restated in these arms -- the
-          // unconditional capture above already wrote them with these exact values, and
-          // a restatement would silently shadow any future change to it.
-          when(lookupFault) {
-            // Translation fault: emit a fault response (no data, no refill).
-            s0Valid := True
-            s1Way   := U(0, wayBits bits)
-            s0Atc   := True
-            // M1b: no S1 predecode capture bank to zero -- the S1->rsp path masks
-            // predecode to all-zero directly off `s0Fault` (see `s1PredW` above).
-            s0FromMiss := False
-          } elsewhen(isHit) {
-            s0Valid := True
-            s1Way   := hitWayIdx
-            s0Atc   := False
-            s0FromMiss := False
-
-            // The first demand hit in a prefetched line keeps the stream moving.
-            when(pfFilled(hitWayIdx)(lookupSet)) {
-              pfFilled(hitWayIdx)(lookupSet) := False
-              pfHitUseful := True
-            }
-          } otherwise {
-            // Reachable only in IDLE because answerable excludes a prefetch-time miss.
-            // M2c: this is now an ordinary MSHR ALLOCATION -- the same ten fields the
-            // speculative allocator writes, at index 0. `mshrValid(DEMAND_IDX) := True`
-            // is what makes entry 0 own `lookupSet` for the whole fill, replacing the
-            // hand-written `demandSetOwned` state list.
-            mshrValid(DEMAND_IDX)    := True
-            mshrArSent(DEMAND_IDX)   := False
-            mshrComplete(DEMAND_IDX) := False
-            mshrBeat(DEMAND_IDX)     := False
-            mshrErr(DEMAND_IDX)      := False
-            mshrPoison(DEMAND_IDX)   := False
-            mshrPa(DEMAND_IDX)       := lookupPaddr
-            mshrSet(DEMAND_IDX)      := lookupSet
-            mshrTag(DEMAND_IDX)      := lookupTag
-            mshrWay(DEMAND_IDX)      := victim(lookupSet)
-            missPC        := lookupPc
-            missCacheable := lookupCacheable
-            demandFillStart := True
-            goto(REFILL)
-          }
+          // M3b: the fault/hit/miss verdict chain that stood HERE is deleted whole.
+          // See the S1 miss dispatch below the FSM for where the MSHR allocation it
+          // performed now lives, and why moving it there also deletes the separate
+          // ~93-flop miss context the plan's spec §5.3.3 describes: `missPC`/`missPA`/
+          // `missSet`/`missTag`/`victimWay` were a SECOND copy of values the `s0*`
+          // registers already hold.
         }
       }
 
@@ -1239,7 +1360,31 @@ class IcachePlugin extends FiberPlugin with FetchService {
         //     installed (`mshrTag(installIdx)` / `mshrPoison(installIdx)`) in the dwell,
         //     so entry 0 is never clobbered and `mshrValid(0)`/`mshrSet(0)` stay
         //     truthful -- which is exactly what lets oracle 3 trust entry 0.
-        when(pfInstallAny && !demandFillStart) {
+        //
+        // ── M3b/SG-1 COMPANION: do not start a speculative install into the set of a
+        // command accepted THIS cycle. Under M3 the demand miss is dispatched one cycle
+        // after acceptance, so IDLE can no longer rely on `demandFillStart` to keep the
+        // installer out of the way: on the accept cycle the verdict does not exist yet,
+        // and if the installer wins, the accepted command's S1 dispatch is deferred for
+        // the whole 3-cycle dwell (INSTALL_ARM + 2 x PREDECODE) while `tagQ`/`validsQ`
+        // stay FROZEN at their accept-cycle values. Freezing them is what makes the held
+        // miss correct -- but only if nothing installs into that set meanwhile, or the
+        // frozen "miss" would allocate a SECOND way for a line that has become resident
+        // (a 2-hot `s1HitVec`).
+        //
+        // HONEST STATUS: **redundant today, and deliberately kept.** SG-1's accept gate
+        // already implies it -- `pfInstallAny` requires `mshrValid` on the installing
+        // entry, so if that entry's set equalled `lookupSet` then `pfLookupSetBusy` would
+        // be high, `pfAcceptOk` low, and `cmdPort.fire` low; the term is therefore
+        // provably never True as the file stands, and no test can distinguish its
+        // presence (confirmed: mutating it out changes nothing). It is kept because the
+        // hold's correctness DEPENDS on that implication, SG-1 is explicitly flagged as
+        // conservative and re-measured by Task 14's IPC gate, and a future relaxation of
+        // `pfAcceptOk` would silently re-open this window with no local warning. Cost is
+        // a 6-bit compare in an FSM transition condition -- `cmdPort.fire` is a FANOUT of
+        // the accept cone, not an input to it, so `cmdPort.ready` is not lengthened.
+        val pfInstallSetConflict = cmdPort.fire && (mshrSet(pfInstallMshr) === lookupSet)
+        when(pfInstallAny && !demandFillStart && !pfInstallSetConflict) {
           installIdx    := pfInstallMshr
           installSet    := mshrSet(pfInstallMshr)
           installWay    := mshrWay(pfInstallMshr)
@@ -1249,6 +1394,11 @@ class IcachePlugin extends FiberPlugin with FetchService {
           predIsPfReg   := True
           goto(INSTALL_ARM)
         }
+        // M3b: the demand fill's transition. LAST, so it wins over the speculative
+        // install arm above on the cycle both are offered -- the same priority the old
+        // in-line `goto(REFILL)` had via `demandFillStart` (which is still asserted, so
+        // the arm above is doubly excluded).
+        when(startDemandFill) { goto(REFILL) }
       }
       // ----- Demand refill; speculative R traffic is handled independently by RID -----
       REFILL.whenIsActive {
@@ -1300,8 +1450,14 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // NOT advanced (this way was never actually filled). A PREFETCH burst error never
       // comes here (rule P2, above): it has no waiting fetch to fault.
       FAULT.whenIsActive {
-        s0Valid := True
-        s1Way   := U(0, wayBits bits)
+        s0Valid  := True
+        // M3b: FAULT delivers from a KNOWN way (SG-2). The old form forced `s1Way := 0`
+        // and got way 0's ARBITRARY array content; the new form gets `installWay`'s,
+        // equally arbitrary. A fault response's `data` is DISCARDED by its only consumer
+        // (FetchAlignPlugin enqueues words only under `!ic.rsp.payload.fault`) and its
+        // `pred` is masked to all-zero off `s0Fault`. `s0Replay` also excludes this
+        // synthetic context from `s1Unresolved` -- doubly, since `s0Fault` is set too.
+        s0Replay := True
         s0Pc    := missPC
         s0Fault := True
         s0Atc   := False   // physical bus error, not ATC/MMU-detected
@@ -1363,8 +1519,17 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
         ufaReadAddr := replayReadAddr
         ufaReadEn   := True
-        s0Valid := True
-        s1Way   := installWay
+        s0Valid  := True
+        // M3b (SG-2): REPLAY delivers the just-installed line from `installWay`, which
+        // `s1WayOh` selects directly. This is bit-identical to the deleted
+        // `s1Way := installWay` + binary mux.
+        //
+        // `s0Replay` is what keeps this synthetic context out of `s1Unresolved`. REPLAY
+        // leaves `tagQ`/`validsQ`/`s0Ppn`/`s0Cacheable` at the LAST ACCEPTED command's
+        // values, so `s1HitVec` here is meaningless and very likely all-zero -- without
+        // the guard every REPLAY would read as a fresh unresolved miss and dispatch a
+        // second fill for the line it has just installed, forever.
+        s0Replay := True
         s0Pc    := missPC
         // A refill only happens for a NON-faulting translation (the live fault
         // path emits a placeholder without refilling), so the replayed line is fault-
@@ -1396,6 +1561,62 @@ class IcachePlugin extends FiberPlugin with FetchService {
       }
     }
 
+    // ══ M3b (Task 11): THE DEMAND MISS DISPATCH, FROM S1 ══════════════════════════
+    // Spec §5.3.3: the separate miss-context capture (missPC/missPA/missSet/missTag/
+    // missCacheable/victimWay, ~93 flops, enable `cmdPort.fire && !fault && !hit`)
+    // disappears -- the `s0*` registers ALREADY hold every one of those values, and the
+    // enable is now the shallow `s1Unresolved && IDLE`. Placed outside the FSM, next to
+    // the other hoisted datapath; the state change is requested via `startDemandFill`
+    // (the plan's preferred form) so every `goto` stays inside the FSM.
+    //
+    // ── WHY THE `otherwise` HOLD EXISTS, and why it is safe ─────────────────────────
+    // `s0Valid` defaults to False every cycle, so without a hold an accepted miss that
+    // cannot be dispatched THIS cycle would simply evaporate: no fill, no response, and
+    // FetchAlign's ring entry never retires -- a hard front-end wedge. The hold keeps
+    // the whole S0 context (and therefore `s1Unresolved`, and therefore the closed
+    // accept gate) alive until the fill engine is free.
+    //
+    // The hold is BOUNDED and its verdict cannot go stale while it lasts:
+    //   - It can only occur while the FSM is NOT in IDLE, i.e. only across a
+    //     SPECULATIVE install (INSTALL_ARM + 2 x PREDECODE, <= 3 cycles) -- IDLE
+    //     dispatches unconditionally, and no other non-IDLE state calls `lookupTick`.
+    //   - `tagQ`/`validsQ` are frozen (their only enable is `cmdPort.fire`, which the
+    //     closed gate forbids). That is EXACT rather than merely stable, because
+    //     nothing can install into `s0Set` during the hold: the running install is
+    //     excluded by `setBlocked` if it started after the accept and by IDLE's
+    //     `pfInstallSetConflict` guard if it started on the accept cycle, and any other
+    //     speculative slot is excluded by SG-1's `!pfLookupSetBusy` at accept time plus
+    //     the allocator's `!s1Unresolved` freeze during the hold.
+    //   - `victim(s0Set)` likewise cannot advance (it advances only for `installSet`).
+    // An `invalidateAll` during the hold can only turn MORE ways invalid, which leaves
+    // the frozen verdict conservative (still a miss) and is handled downstream by the
+    // MSHR poison bit exactly as before.
+    when(s1Unresolved) {
+      // `!fillArrayWrActive` is redundant with `isActive(IDLE)` (only PREDECODE asserts
+      // it) and is kept as the plan writes it: it states the D3-SET-I intent locally.
+      when(fsm.isActive(fsm.IDLE) && !fillArrayWrActive) {
+        missPC                   := s0Pc
+        missCacheable            := s0Cacheable
+        mshrValid(DEMAND_IDX)    := True
+        mshrArSent(DEMAND_IDX)   := False
+        mshrComplete(DEMAND_IDX) := False
+        mshrBeat(DEMAND_IDX)     := False
+        mshrErr(DEMAND_IDX)      := False
+        mshrPoison(DEMAND_IDX)   := False
+        // Identical to the deleted `lookupPaddr` capture: `s0Ppn` IS `lookupPaddr(31:12)`
+        // and `s0Pc(11:0)` IS `lookupPc(11:0)` = `lookupPaddr(11:0)` (VIPT: the page
+        // offset is untranslated).
+        mshrPa(DEMAND_IDX)       := (s0Ppn ## s0Pc(11 downto 0)).asUInt
+        mshrSet(DEMAND_IDX)      := s0Set
+        mshrTag(DEMAND_IDX)      := s0Ppn
+        mshrWay(DEMAND_IDX)      := victim(s0Set)
+        demandFillStart          := True
+        startDemandFill          := True
+      } otherwise {
+        s0Valid := True   // HOLD (see above)
+      }
+    }
+
     // ══ M2b: MISS-PC IMMUTABILITY, ENFORCED RATHER THAN ARGUED ═══════════════════
     // `bypPred` (M2a) and `bypWindow` (M2b) are captured on ONE dwell cycle, selected
     // by `missPC(5)` / `missPC(4:3)`, and consumed later by REPLAY, which re-reads
@@ -1408,8 +1629,9 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // part of the line.
     //
     // So it stops being an argument. `missPC` may only change on a cycle whose FSM
-    // state is IDLE (the two writers -- `lookupTick`'s miss arm and IDLE's speculative
-    // install arm -- are both IDLE-confined). Equivalently: on any cycle where the fill
+    // state is IDLE (the two writers -- M3b's S1 demand-miss dispatch, which is gated on
+    // `fsm.isActive(fsm.IDLE)`, and IDLE's speculative install arm -- are both
+    // IDLE-confined). Equivalently: on any cycle where the fill
     // machine was already engaged on the PREVIOUS cycle too, `missPC` must equal its
     // own previous value. Requiring the previous cycle to be engaged as well is what
     // excludes the legitimate arming write, which lands on the IDLE->dwell edge; a
@@ -1466,9 +1688,34 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // the dwell still has that entry live and owning that set. Net allocator behaviour
     // is unchanged, and the M2b INSTALL_ARM hole stays closed -- structurally now,
     // rather than by remembering to name a state.
-    val demandSetOwned = mshrValid(DEMAND_IDX) && (mshrSet(DEMAND_IDX) === pfCandSet)
+    //
+    // ── M3b: TWO MORE LANES, both for the same reason ────────────────────────────
+    // `mshrValid(DEMAND_IDX)` only becomes True on the cycle the demand fill is
+    // DISPATCHED, which under M3 is one cycle after the command was accepted. Two
+    // earlier moments must therefore be covered explicitly, or a speculative slot can
+    // be allocated to the set an accepted demand miss is about to claim -- two fills
+    // owning one set, which is the invariant the whole allocator rests on. If they
+    // targeted the same LINE the set would end up with two valid ways carrying the same
+    // tag, i.e. a 2-hot `s1HitVec` feeding the one-hot AND-OR.
+    //   - `s1Unresolved && s0Set === pfCandSet` (the plan's Step 3 extension) covers the
+    //     accepted-but-not-yet-dispatched window. It is redundant with the outer
+    //     `!s1Unresolved` gate below and kept because the plan asks for it by name and
+    //     because it survives a future reorganisation of that gate.
+    //   - `cmdPort.fire && lookupSet === pfCandSet` covers the ACCEPT CYCLE itself,
+    //     which the plan's text does not. It is not hypothetical: when the frontier has
+    //     stalled (no free slot, or prefetch disabled) `pfNextPa` can still be sitting
+    //     exactly at the line the demand is now accepting, so `pfCandSet === lookupSet`.
+    //     The deleted live `heldDemandMiss` covered this instant -- it was True on the
+    //     accept cycle of a miss -- and `s1Unresolved`, being one cycle later, does not.
+    val demandSetOwned = (mshrValid(DEMAND_IDX) && (mshrSet(DEMAND_IDX) === pfCandSet)) ||
+                         (s1Unresolved && (s0Set === pfCandSet)) ||
+                         (cmdPort.fire && (lookupSet === pfCandSet))
+    // M3b: `!heldDemandMiss` -> `!demandStuck`, i.e. the union of "accepted miss not yet
+    // dispatched" and "offered demand refused because a speculative slot owns its set".
+    // Same purpose as before: freeze old-window allocation while a demand fill is
+    // imminent or blocked, and let the AR arbiter launch only the owner that unblocks it.
     when(pfWindowHasCandidate && !anyInvalidate && !demandFillStart &&
-         !pfWindowUpdate && !heldDemandMiss) {
+         !pfWindowUpdate && !demandStuck) {
       when(pfCandLive) {
         pfNextPa := pfNextPa + U(64, 32 bits)
       } elsewhen(pfCandSetBusy || demandSetOwned) {
@@ -1548,7 +1795,18 @@ class IcachePlugin extends FiberPlugin with FetchService {
       pfArWant(i) && (mshrSet(i + AxiIds.I_SPEC_BASE) === lookupSet)))
     val pfBlockingArAny = pfBlockingArWant.orR
     val pfBlockingArSel = OHToUInt(OHMasking.first(pfBlockingArWant.asBits))
-    val pfChosenArSel = Mux(heldDemandMiss, pfBlockingArSel, pfArSel)
+    // M3b: `heldDemandMiss` -> `heldOnSetBusy` for the blocking-owner PRIORITY, and
+    // `demandStuck` for the hold gate below.
+    //
+    // The priority selector deliberately uses `heldOnSetBusy` ALONE, not `demandStuck`.
+    // `pfBlockingArWant` is keyed on the LIVE `lookupSet`, so it only names the right
+    // slot for the demand that is at the Stream boundary RIGHT NOW -- which is exactly
+    // case (b). Under case (a) (`s1Unresolved`) the boundary holds a DIFFERENT, younger
+    // command, and no speculative slot can own the unresolved miss's set anyway (SG-1's
+    // accept gate forbade accepting it if one did), so steering by `lookupSet` there
+    // would be meaningless. The hold gate below still takes the union, because "do not
+    // park a NEW speculative AR in front of an imminent demand fill" applies to both.
+    val pfChosenArSel = Mux(heldOnSetBusy, pfBlockingArSel, pfArSel)
     val pfChosenArMshr = (pfChosenArSel.resize(mshrIdxBits) +
                           U(AxiIds.I_SPEC_BASE, mshrIdxBits bits)).resize(mshrIdxBits)
     when(!arHoldValid) {
@@ -1557,7 +1815,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
         arHoldId    := U(AxiIds.I_DEMAND, AxiIds.ID_W bits)
         arHoldAddr  := mshrPa(DEMAND_IDX) & ~U(63, 32 bits)
       } elsewhen(pfAnyArWant && !demandFillStart &&
-                 (!heldDemandMiss || pfBlockingArAny)) {
+                 (!demandStuck || pfBlockingArAny)) {
         arHoldValid := True
         arHoldId    := (pfChosenArSel.resize(AxiIds.ID_W) +
                         U(AxiIds.I_SPEC_BASE, AxiIds.ID_W bits)).resized
