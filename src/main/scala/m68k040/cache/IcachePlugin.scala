@@ -614,7 +614,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val s0Lane  = Reg(UInt(2 bits))
     // M1b: the 4 x PRED_BITS_PER_LINE S1 predecode CAPTURE BANK is GONE. Predecode
     // now rides out of the SAME synchronous array as the data (`ufaBeat`), so the
-    // way-mux + window-decode already run off REGISTERED state (s1Way/s0Pc) with no
+    // way-mux + window-decode already run off REGISTERED state (s1WayOh/s0Pc) with no
     // capture register of their own, and the arc that owned every one of the worst 300
     // failing endpoints on the pinned routed checkpoint no longer has an endpoint.
     // The bank's all-zero-on-fault placeholder becomes an explicit S1 mask below.

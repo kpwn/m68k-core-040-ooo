@@ -69,12 +69,14 @@ if {[llength $synth_paths] > 0} {
   set synth_wns [get_property SLACK $synth_paths]
   puts "POSTSYNTH_FULLCORE_WNS_NS $synth_wns"
 }
-# The 2026-08-10 five-ID/token-cut exact-DCP 2x2 shows that the legacy broad
-# D-cache pblock is now harmful: decode-only is reproducibly -2.720 ns versus
-# -2.804 ns for both and -3.648 ns for D-cache-only. Keep every mode available
-# as a diagnostic override, but make the measured current-netlist winner the
-# default rather than silently applying the obsolete LS-cluster constraint.
-set floorplan_mode "decode"
+# SUPERSEDED by the UFA/VTL restructure's own gate (ledger §37, 2026-08-13):
+# gated on THIS netlist, `decode` measured -1.958 ns / 167.842 MHz -- 14.9 MHz
+# WORSE than the pre-restructure baseline -- while `decode+fetch` measured
+# -1.117 ns / 195.427 MHz, the accepted result. `decode` is kept as the
+# like-for-like reference arm for future re-gates (spec R8), not as a
+# recommended default. Keep every mode available as a diagnostic override,
+# but default to the measured current-netlist winner.
+set floorplan_mode "decode+fetch"
 if {[info exists ::env(SKIP_FLOORPLAN)] && $::env(SKIP_FLOORPLAN) eq "1"} {
   set floorplan_mode "none"
 }
@@ -84,12 +86,12 @@ if {[info exists ::env(FLOORPLAN_MODE)]} {
 # FLOORPLAN_MODE is a `+`-separated set of pblock tokens, so the section-18 A/B can
 # combine boxes without inventing a new keyword per combination. `both` is kept as a
 # historical alias for `decode+dcache`.
-#   decode    synth/floorplan_decode.xdc     DecodeStage box, X36Y0:X87Y104        (default)
+#   decode    synth/floorplan_decode.xdc     DecodeStage box, X36Y0:X87Y104        (like-for-like reference arm, ledger §37)
 #   decode_fe synth/floorplan_decode_fe.xdc  same box, capture += FetchAlign + Ras (excl. decode)
 #   dcache    synth/floorplan_dcache.xdc     legacy LS box, KNOWN-HARMFUL control
 #   backend   synth/floorplan_backend.xdc    repaired LS box, X14Y132:X72Y239
 #   frontend  synth/floorplan_frontend.xdc   fetch/predict box, X0Y20:X35Y135
-#   fetch     synth/floorplan_fetch.xdc      Unified-Fetch-Array cluster box + BRAM sites
+#   fetch     synth/floorplan_fetch.xdc      Unified-Fetch-Array cluster box + BRAM sites (part of the default combo, decode+fetch)
 if {$floorplan_mode eq "both"} { set floorplan_mode "decode+dcache" }
 set floorplan_tokens [split $floorplan_mode "+"]
 array set floorplan_xdc {
@@ -166,11 +168,15 @@ foreach stale {pb_decode pb_dcache pb_backend pb_frontend pb_fetch} {
 # before section 18 regenerates unchanged -- use IMPL_STRATEGY=default to compare
 # against any pre-section-18 row.
 #
-# Why this and not a floorplan: the 2026-08-10 census found all 300 worst unique
-# endpoints to be one arc, `FetchAlignPlugin stalled -> IcachePlugin
-# s1PredEntries_*/CE`, at 66% route, 20 logic levels, **0 pblock crossings**, with
-# a 931-load terminal net.  Seven pblock variants across both evidenced boundaries
-# all regressed.  See handoff section 18.
+# Why postrouteN and not `default`: unchanged from the 2026-08-10 census (below).
+#
+# SUPERSEDED, floorplan half only: the 2026-08-10 census's "no floorplan helps"
+# finding was specific to that netlist's limiter, `FetchAlignPlugin stalled ->
+# IcachePlugin s1PredEntries_*/CE`. The UFA/VTL restructure (M1-M4) deleted
+# `s1PredEntries` outright and consolidated the frontend into a boxable cluster;
+# `pb_fetch` (M5, ledger §37) is now worth +27.585 MHz on THIS netlist, and is
+# the default floorplan combination above. See handoff section 18 for the
+# original (now historical) census, and ledger §37 for the current one.
 set impl_strategy "postrouteN"
 if {[info exists ::env(IMPL_STRATEGY)]} { set impl_strategy $::env(IMPL_STRATEGY) }
 puts "IMPL_STRATEGY $impl_strategy"
