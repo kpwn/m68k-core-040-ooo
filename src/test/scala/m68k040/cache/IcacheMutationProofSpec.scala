@@ -142,6 +142,23 @@ import org.scalatest.funsuite.AnyFunSuite
   *        RULE-P1 BOUND VIOLATED: 2 speculative ARs were launched out of a window
   *        condemned on cycle T; IcachePlugin.scala's s0KillsWindowQ comment bounds this
   *        residual at ONE line.
+  *
+  * ══ SPOT-CHECKS OF EARLIER TASKS' MUTATION CLAIMS ═════════════════════════════════
+  * The six records above are the ones spec section 12.2 requires. Tasks 5-12 also made
+  * mutation claims in their own commit messages, and a record is only worth what its
+  * weakest entry is, so two of those were re-run from scratch here rather than restated.
+  * Both reproduce EXACTLY as claimed:
+  *
+  *   - Task 12 (`ca793c1`): drop `demandSetOwned`'s `s1Unresolved && (s0Set ===
+  *     pfCandSet)` lane -> `IcacheOrderOracleSpec`, "oracle 3 (directed): no speculative
+  *     allocation into the set of an ACCEPTED but not yet dispatched demand miss" FAILS
+  *     with "ORACLE 3 VIOLATED: live MSHR entries Vector(0, 2) own sets Vector(1, 1)".
+  *     The commit claimed "entries 0 and 2 both owning set 1". Matches.
+  *
+  *   - Task 11 (`78b1a21`, deviation 1): `rspValidReg := s0Valid` (dropping
+  *     `&& !s1Unresolved`) -> oracles 1, 2 AND 3 fail, oracle 1 with "response #1 has
+  *     pc=0x1000 but the #1 ACCEPTED command was pc=0x1008". The commit claimed "fails
+  *     oracles 1, 2 and 3". Matches.
   */
 class IcacheMutationProofSpec extends AnyFunSuite {
 
