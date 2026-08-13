@@ -126,6 +126,22 @@ import org.scalatest.funsuite.AnyFunSuite
   *      The arrays were never written for a non-allocated line, so the response carries
   *      stale content from a prior allocation to the same way/set.
   *
+  * ══ PLAN DEFECT: Step 6's template pin substrings ═══════════════════════════════════
+  * The plan's own Step 6 template asserts against the substrings "same-set" and
+  * "unified array". This was first recorded (f69aecc's commit message) as "no test in
+  * the tree has ever had" either substring -- that claim is only half right, and the
+  * wrong half matters. "same-set" is genuine: no test NAME in the tree contains it
+  * (it appears only inside `DcacheSpec` and `IcacheVerdictShadowSpec` comments, never a
+  * `test(...)` name). "unified array" is NOT genuine -- at parent `55b97bd`,
+  * `IcacheUnifiedArraySpec` already has TWO test names containing it (the M1b
+  * read-path test and oracle 4b itself). The plan's literal pin would therefore have
+  * matched at elaboration time, just AMBIGUOUSLY: `declares(...)` only proves a
+  * matching name exists, not which one, so a pin on "unified array" alone cannot
+  * distinguish the wrong catcher (M1b read-path, which the M3 finding above proves
+  * PASSES under the mutation) from the real one (oracle 4b, which FAILS). That
+  * ambiguity is the actual defect, not nonexistence. The tighter substring "oracle 4b"
+  * used above is the correct fix, for the correct reason.
+  *
   * ══ M6  The M4 "cycle T" residual -- spec section 12.2's SIXTH entry ═══════════════
   * Not in spec section 12.2's original list: it was opened by Task 12's review fix for
   * finding I1 and explicitly handed to this task. `s0KillsWindowQ` closes the T+1 half
