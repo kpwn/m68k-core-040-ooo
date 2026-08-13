@@ -219,9 +219,35 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val victimWay = Reg(UInt(wayBits bits))
     val beatCnt   = Reg(UInt(1 bits)) init U(0, 1 bits)
     val arSent    = Reg(Bool()) init False
-    val lineReg   = Reg(Bits(512 bits))
+    // ---- M2: the Unified MSHR line file --------------------------------------
+    // ONE line-data structure for demand AND speculative fills, indexed by AXI ID.
+    // Entry 0 is the demand MSHR (AxiIds.I_DEMAND == 0); entries 1..pfSlots are the
+    // speculative slots (AxiIds.I_SPEC_BASE == 1), so the AXI RID IS the index -- no
+    // decode, no asymmetry, no copy.
+    //
+    // WHY (design spec section 5.2). `lineReg` was a 512-flop bank whose D-input was a
+    // 512-bit mux between an AXI beat and a 512-bit ASYNC READ of a 4-entry LUTRAM
+    // (a 512 x 4:1 mux), and whose IDLE clock enable was
+    // `pfInstallAny && !demandFillStart` -- a four-way reduction over four slot-state
+    // vectors, AND-ed with a function of cmdPort.fire. Exactly the shape design
+    // principle P2/P3 forbids. It is also the checkpoint-forensics diagnostic's named
+    // landing zone for BOTH the B3 and P2 regressions, and the baseline's tied
+    // runner-up worst path (FetchAlignPlugin_stalled_reg/C -> lineReg_reg[418]/D,
+    // -1.472 ns, tying nominal WNS to three decimals).
+    //
+    // DRIFT NOTE (Task 8, verified against AxiIds.scala): the plan's text parenthesises
+    // MSHR_N as "(6)" on the assumption pfSlots == 5. `AxiIds.I_SPEC_SLOTS` is
+    // I_SPEC_LAST(4) - I_SPEC_BASE(1) + 1 == **4** (four physical speculative slots
+    // maintaining a five-LINE logical lookahead -- see the frontier comment below), so
+    // the real MSHR_N is 5 and mshrIdxBits is 3. The FORMULA `1 + pfSlots` is the plan's
+    // and is used verbatim; only the parenthesised constant was stale.
+    val MSHR_N = 1 + pfSlots                              // 5 = 1 demand + 4 speculative
+    val mshrIdxBits = log2Up(MSHR_N)
+    val fillLo = Mem(Bits(256 bits), MSHR_N)              // beat 0
+    val fillHi = Mem(Bits(256 bits), MSHR_N)              // beat 1
     // Task icache-burst-fault-fix: PREDECODE's lineMem commit-beat phase — which
-    // half of `lineReg` (and which lineMem address) the SINGLE write-port commit is
+    // beat of the MSHR line-file entry (and which lineMem address) the SINGLE
+    // write-port commit is
     // targeting THIS cycle of PREDECODE's 2-cycle dwell. See PREDECODE below for why
     // this must stay a single write-port/single-call-site design (SpinalHDL's
     // multi-write-Mem blackboxing broke on a two-call-site version of this fix).
@@ -244,11 +270,13 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // untouched (still claiming the OLD address is validly resident) -> the next
     // ordinary fetch to that address silently returns the WRONG bytes. Fix mirrors
     // DcachePlugin's `missLine`/`inhibitedResp` direct-delivery pattern exactly:
-    // lineMem's write is now gated (REFILL, below) and `lineReg` (already latched
-    // UNCONDITIONALLY every REFILL beat) doubles as the data-side direct-delivery
-    // source; `bypPred` is the predecode-side counterpart, latched UNCONDITIONALLY
-    // in PREDECODE below so REPLAY can deliver an INHIBITED line's predecode straight
-    // from this register, entirely bypassing the (for that case, never-written)
+    // lineMem's write is now gated (REFILL, below) and a bypass register pair carries
+    // the response instead. M2b (Task 8) narrowed the DATA half of that bypass the same
+    // way M2a narrowed the predecode half: `bypWindow` (64 flops, declared with
+    // `installIdx` below) replaces `lineReg`'s 512, latched UNCONDITIONALLY in
+    // PREDECODE; `bypPred` is the predecode-side counterpart, latched on the same
+    // cycle, so REPLAY can deliver an INHIBITED line's data AND predecode straight
+    // from these two registers, entirely bypassing the (for that case, never-written)
     // Unified Fetch Array.
     //
     // M2a (Task 7): NARROWED, PRED_BITS_PER_LINE (256) flops -> 4*PRED_BITS_PER_WORD
@@ -267,16 +295,38 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // missPC(5:3) = {beat missPC(5), lane missPC(4:3)}. The new capture takes
     // `beatPred`'s lane `missPC(4:3)` on the cycle `commitBeat === missPC(5)` -- and
     // `beatPred` on that cycle is exactly the classification of beat `commitBeat`
-    // (`beatSrc = Mux(isLoBeat, lineReg(255:0), lineReg(511:256))`). Same 4 chunks,
+    // (`beatSrc = Mux(isLoBeat, fillLoQ, fillHiQ)`). Same 4 chunks,
     // same order (`subdivideIn` index 0 = LSB = lowest address throughout this file).
     //
-    // WRITE/READ ORDERING, unchanged from the M1b split-write argument: this register
-    // is read ONLY on the `s1FromMiss` bypass, armed in REPLAY, which is entered the
-    // cycle AFTER commitBeat==1 -- so the capture (on commitBeat 0 or 1) has settled
-    // before any read. PF_PRED writes it too (it always did, whole-line) and never
-    // arms `s1FromMiss`; PREDECODE->REPLAY->IDLE is back-to-back and PF_PRED can only
-    // be entered from IDLE, so no PF_PRED dwell can interleave between the capture and
-    // the S1->rsp latch that consumes it.
+    // WRITE/READ ORDERING, unchanged from the M1b split-write argument and RE-VERIFIED
+    // for M2b's PF_PRED->PREDECODE merge: this register is read ONLY on the
+    // `s1FromMiss` bypass, armed in REPLAY. `s1FromMiss` is a Reg, so the S1->rsp mux
+    // that consumes `bypPred`/`bypWindow` evaluates on the cycle AFTER REPLAY -- the
+    // IDLE cycle. A SPECULATIVE install writes both registers too (PF_PRED always did)
+    // and never arms `s1FromMiss`, and it can only be armed from IDLE; under M2b it
+    // then spends a whole INSTALL_ARM cycle before its PREDECODE dwell writes them, so
+    // the earliest speculative overwrite is TWO cycles after the IDLE cycle that
+    // consumes them (one cycle under the old PF_PRED shape). The margin got WIDER, not
+    // narrower.
+    //
+    // MISS-PC IMMUTABILITY (the invariant this capture rests on, carried forward from
+    // M2a's review and re-verified for M2b). The capture selects its window with
+    // `missPC(5)` / `missPC(4:3)` on one dwell cycle and REPLAY re-reads `missPC` on a
+    // later cycle, so `missPC` must not change during the dwell. It cannot:
+    // `missPC` has exactly TWO writers, and after M2b both are still confined to IDLE.
+    //   (1) `lookupTick`'s miss arm. `lookupTick` is called from IDLE
+    //       (canStartFill = true) and -- new in M2b -- from PREDECODE when
+    //       `predIsPfReg` (canStartFill = false, inherited verbatim from PF_PRED).
+    //       With canStartFill = false, `answerable = lookupFault || isHit`, and the
+    //       miss arm is the `otherwise` of `when(lookupFault) ... elsewhen(isHit)`, so
+    //       it requires `!lookupFault && !isHit` -- which makes `answerable` false,
+    //       hence `cmdPort.ready` false, hence `cmdPort.fire` false. The arm is
+    //       structurally unreachable outside IDLE.
+    //   (2) IDLE's speculative-install arm, textually inside `IDLE.whenIsActive`.
+    // INSTALL_ARM and REPLAY call neither. So `missPC` is frozen from the cycle the
+    // dwell is armed until the machine returns to IDLE. Pinned by IcacheSpec's
+    // "M2a: the narrowed predecode bypass delivers the correct WINDOW" and
+    // "M2b: missPC is immutable across the whole PREDECODE dwell" tests.
     val bypPred = Reg(Bits(4 * PRED_BITS_PER_WORD bits))
 
     // ── Slice I1, closure (2) of the `invalidateAll` hazard (design doc §6.5) ────
@@ -305,10 +355,11 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val missPoison = RegInit(False)
 
     // ---- five-ID stream-prefetch pool (IDs 1..4; ID 0 remains demand) ----
-    // Each speculative slot carries only control. The two 256-bit beats live in
-    // shallow ID-indexed memories and are copied into the existing shared `lineReg`
-    // only when that completed slot wins the installer. This avoids four additional
-    // 512-bit register copies and keeps the 16-instance predecoder single-copy.
+    // Each speculative slot carries only control. M2b: its line DATA no longer lives in
+    // a private `pfLineLo`/`pfLineHi` pair that had to be COPIED into a shared register
+    // to be installed -- it lives in the unified `fillLo`/`fillHi` MSHR line file at
+    // index `I_SPEC_BASE + slot`, written by exactly the same R-channel statement that
+    // writes the demand entry, and read out by the same synchronous `installIdx` port.
     val pfValid    = Vec.fill(pfSlots)(RegInit(False))
     val pfArSent   = Vec.fill(pfSlots)(RegInit(False))
     val pfComplete = Vec.fill(pfSlots)(RegInit(False))
@@ -319,9 +370,32 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val pfSet      = Vec.fill(pfSlots)(Reg(UInt(setBits bits)))
     val pfTag      = Vec.fill(pfSlots)(Reg(UInt(tagBits bits)))
     val pfWay      = Vec.fill(pfSlots)(Reg(UInt(wayBits bits)))
-    val pfLineLo   = Mem(Bits(256 bits), pfSlots)
-    val pfLineHi   = Mem(Bits(256 bits), pfSlots)
     val pfInstallIdx = Reg(UInt(pfIdxBits bits))
+
+    // The install target, registered one cycle AHEAD of the dwell so the file read is
+    // synchronous. Set in INSTALL_ARM's two entry arms (REFILL's clean completion and
+    // IDLE's speculative install); stable for the whole PREDECODE dwell.
+    val installIdx = Reg(UInt(mshrIdxBits bits)) init U(0, mshrIdxBits bits)
+    // SG-3 (plan): a dedicated register rather than mshrSet(installIdx). The D3-SET-I
+    // guard `fillArrayWrActive && (lookupSet === installSet)` sits in the ACCEPT cone;
+    // sourcing it from a Vec index would put a 5:1 mux in front of that comparator, in
+    // exactly the cone this whole design exists to shorten. One register instead.
+    // Written here in Task 8 (M2b); Task 9 (M2c) is the task that switches the guard
+    // itself over to it, once the whole control file is uniform. Until then it is
+    // maintained in lock-step with `missSet` -- both install arms assign the two the
+    // same value on the same cycle -- so the switch is a no-op by construction.
+    val installSet = Reg(UInt(setBits bits))
+    // The synchronous read of the line being installed. KeepAttribute per GC-7: if
+    // these become fabric flops, lineReg has been re-created under a different name.
+    val fillLoQ = fillLo.readSync(installIdx)
+    val fillHiQ = fillHi.readSync(installIdx)
+    KeepAttribute(fillLoQ)
+    KeepAttribute(fillHiQ)
+    // M2b: the DATA half of the narrowed bypass (the predecode half is Task 7's
+    // `bypPred`). 64 flops replace `lineReg`'s 512 for the INHIBITED/poisoned replay.
+    // See `bypPred`'s declaration above for the shared capture-window equivalence and
+    // the write/read-ordering + missPC-immutability arguments that cover both.
+    val bypWindow = Reg(Bits(64 bits))
 
     // Registered sequential frontier. It is seeded only by an accepted, resolved,
     // cacheable demand and is capped at five same-page lines ahead. Installed lines
@@ -389,7 +463,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
     //
     // Task icache-corruption-fix: True only for a REPLAY of a non-allocated
     // (INHIBITED-mode) miss — routes the S1->rsp mux below to deliver straight from
-    // the `lineReg`/`bypPred` bypass registers instead of the Unified Fetch Array
+    // the `bypWindow`/`bypPred` bypass registers instead of the Unified Fetch Array
     // (which was never written for that case). Explicitly set at
     // EVERY s1Valid-arming site (mirrors s1Fault/s1Atc), never left to a stale value.
     val s1FromMiss = Reg(Bool())
@@ -432,16 +506,21 @@ class IcachePlugin extends FiberPlugin with FetchService {
       * conformance work and is OUT OF SCOPE for the IPC-push initiative this landed
       * under, so the recomputed figures for today's 256-bit / 2-beat geometry are:
       * **32 -> 16 instances (2x, the design doc's original I-b number)** and `lineReg`
-      * RETAINED. `lineReg` cannot be deleted at 2 beats/line: the icache-burst-fault
-      * fix requires the lineMem commit to be DEFERRED until the whole burst's pass/fail
-      * is known, so both beats must still be held somewhere, and it doubles as the
-      * INHIBITED direct-delivery source (`missDataBeat`). Slice I2 originally added one
+      * RETAINED. That retention argument -- both beats must be held somewhere because
+      * the icache-burst-fault fix DEFERS the lineMem commit until the whole burst's
+      * pass/fail is known, and the same storage doubles as the INHIBITED
+      * direct-delivery source -- was correct, but it only ever justified holding the
+      * line, not holding it in a 512-flop register. M2b (Task 8) supplies both jobs from
+      * the `fillLo`/`fillHi` MSHR line file instead: the file holds both beats until the
+      * dwell reads them, and the INHIBITED/poisoned direct delivery is the pre-selected
+      * 64-bit `bypWindow` captured out of that read. `lineReg` is DELETED.
+      * Slice I2 originally added one
       * beat's worth of predecode held for one cycle so a whole-line packed value could
       * be assembled combinationally; M1b deleted that staging register by writing the
       * bypass register's two halves directly, one per dwell cycle, and M2a narrowed
       * that register to a single window (`bypPred`). NET NEW STATE: zero.
       *
-      * `beat`      : the beat being classified (a half of `lineReg`).
+      * `beat`      : the beat being classified (one entry-half of the MSHR line file).
       * `nextLo`    : the NEXT beat's low 3 words, supplying the lookahead for this
       *               beat's last 3 words.
       * `nextValid` : whether `nextLo` is real data. False for the LAST beat of a line,
@@ -480,7 +559,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
       * already selected by pc(5) when the array was addressed.
       *
       * `subdivideIn` yields index 0 = LOWEST bits (the same convention `classifyBeat`'s
-      * `beat.subdivideIn(16 bits)` and the data path's `s1Beat.subdivideIn(64 bits)`
+      * `beat.subdivideIn(16 bits)` and the data path's `s1Window` beat subdivision
       * already rely on), so window `pc(4:3)` here is the same 4 words the old
       * whole-line form selected with pc(5:3) once pc(5) has picked the beat, and the
       * 4 per-word chunks keep their ascending-address order. */
@@ -502,12 +581,16 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // Task icache-corruption-fix: bypass mux — for a REPLAY of a non-allocated
     // (INHIBITED) miss (s1FromMiss), deliver directly from the miss-latch registers
     // (mirrors DcachePlugin's inhibitedResp/missLine) instead of the shared arrays,
-    // which were never written for that line. `lineReg` is 2 beats (512b); select
-    // the same half REPLAY's array-based `replayBeatSel` would have (s1Pc(5), s1Pc
-    // already holds missPC here).
-    val missDataBeat = Mux(s1Pc(5), lineReg(511 downto 256), lineReg(255 downto 0))
-    val s1Beat   = Mux(s1FromMiss, missDataBeat, ufaDataVec(s1Way))
-    val s1Window = s1Beat.subdivideIn(64 bits)(s1Lane)
+    // which were never written for that line.
+    //
+    // M2b: `missDataBeat`'s 512-bit half-select is gone with `lineReg`; the bypass is
+    // already the exact 64-bit window REPLAY will deliver. EQUIVALENCE: the old form
+    // selected beat `s1Pc(5)` of the 512-bit `lineReg` and then lane `s1Lane` of it;
+    // REPLAY sets `s1Pc := missPC` and `s1Lane := missPC(4 downto 3)`, so the delivered
+    // window was {beat missPC(5), lane missPC(4:3)} -- exactly the window the dwell
+    // captures into `bypWindow` on the cycle `commitBeat === missPC(5)`.
+    val s1Window = Mux(s1FromMiss, bypWindow,
+                                   ufaDataVec(s1Way).subdivideIn(64 bits)(s1Lane))
     // M1b: predecode now rides out of the SAME synchronous array as the data, selected
     // by the same registered way (`s1Way`) and a one-bit-narrower window index. The old
     // path (4 x PRED_BITS_PER_LINE async-LUTRAM reads captured into 1,024 flops) is gone.
@@ -602,7 +685,20 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val refillDone        = Bool()   // driven by the datapath, read by the FSM
     val refillErr         = Bool()
     val predActive        = Bool(); predActive        := False
-    val predIsPf          = Bool(); predIsPf          := False
+    // M2b: `PF_PRED` is merged into `PREDECODE`, so "which kind of install is this
+    // dwell?" can no longer be a state identity -- it becomes a REGISTER, written by
+    // whichever arm entered INSTALL_ARM and stable for the whole dwell. `predIsPf` is
+    // kept as a wire aliasing it so the existing `simPublic` and every testbench that
+    // reads it (IcachePrefetchSpec.scala's INSTALL0/INSTALL1 invalidate-race stages)
+    // are completely unaffected.
+    //
+    // It is written on BOTH arms into INSTALL_ARM (True from IDLE's speculative
+    // install, False from REFILL's clean completion) and read ONLY under `predActive`,
+    // i.e. only in PREDECODE -- which is reachable only through INSTALL_ARM. Its value
+    // BETWEEN dwells is therefore don't-care, and the one testbench that samples the
+    // alias already qualifies it with `predActive`.
+    val predIsPfReg       = RegInit(False)
+    val predIsPf          = Bool(); predIsPf          := predIsPfReg
     predActive.simPublic(); predIsPf.simPublic(); commitBeat.simPublic()
     val fillArrayWrActive = Bool(); fillArrayWrActive := False
     // Slice I3 telemetry: pure wires (zero flops, zero synthesis cost) that a
@@ -677,11 +773,19 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val fsm = new StateMachine {
       val IDLE      = new State with EntryPoint
       val REFILL    = new State
+      // M2b: the arm cycle. installIdx/installSet are registered here so the MSHR line
+      // file read that feeds the dwell is SYNCHRONOUS. Costs the demand refill +1
+      // cycle on a ~78-cycle DDR-bound event (1.3%) and replaces the speculative
+      // install path's IDLE 512-bit LUTRAM->register copy with a one-cycle synchronous
+      // file read. Spec section 5.6. Deliberately does NOTHING else -- giving it another
+      // job would put logic back on the path M2 exists to clear.
+      val INSTALL_ARM = new State
+      // M2b: ONE install/classify dwell for BOTH demand and speculative fills; the old
+      // separate `PF_PRED` state is deleted and its two extra behaviours (hold the
+      // lookup port open with canStartFill = false, and free the speculative slot on
+      // completion) are parameterised by the registered `predIsPfReg`.
       val PREDECODE = new State
       val REPLAY    = new State
-      // Silent fills collect independently by RID. A completed speculative line is
-      // copied into the shared lineReg in IDLE, then uses this single installer state.
-      val PF_PRED   = new State
       // Task #211: a REFILL whose AXI read response(s) came back non-OKAY
       // (SLVERR/DECERR — genuinely unmapped or erroring physical memory). No line
       // is allocated (PREDECODE, which does the tag/pred/valid writes, is skipped
@@ -822,10 +926,14 @@ class IcachePlugin extends FiberPlugin with FetchService {
       IDLE.whenIsActive {
         lookupTick(canStartFill = true)
         // Demand allocation wins. Otherwise a completed silent line is registered
-        // into the shared installer; the wide LUTRAM read terminates at `lineReg`.
+        // into the shared installer.
+        //
+        // M2b: no 512-bit LUTRAM->register copy. Just name the entry and arm the file
+        // read; PREDECODE reads it out synchronously next-next cycle.
         when(pfInstallAny && !demandFillStart) {
-          pfInstallIdx := pfInstallSel
-          lineReg := pfLineHi.readAsync(pfInstallSel) ## pfLineLo.readAsync(pfInstallSel)
+          installIdx    := (pfInstallSel + U(AxiIds.I_SPEC_BASE, mshrIdxBits bits)).resized
+          pfInstallIdx  := pfInstallSel
+          installSet    := pfSet(pfInstallSel)
           missPC        := pfPa(pfInstallSel)
           missPA        := pfPa(pfInstallSel)
           missSet       := pfSet(pfInstallSel)
@@ -834,16 +942,33 @@ class IcachePlugin extends FiberPlugin with FetchService {
           victimWay     := pfWay(pfInstallSel)
           missPoison    := pfPoison(pfInstallSel) || anyInvalidate
           commitBeat    := U(0, 1 bits)
-          goto(PF_PRED)
+          predIsPfReg   := True
+          goto(INSTALL_ARM)
         }
       }
       // ----- Demand refill; speculative R traffic is handled independently by RID -----
       REFILL.whenIsActive {
         refillActive := True
         when(refillDone) {
-          when(refillErr) { goto(FAULT) } otherwise { goto(PREDECODE) }
+          when(refillErr) { goto(FAULT) } otherwise {
+            installIdx  := U(AxiIds.I_DEMAND, mshrIdxBits bits)
+            installSet  := missSet
+            predIsPfReg := False
+            goto(INSTALL_ARM)
+          }
         }
       }
+
+      // M2b: one cycle. installIdx/installSet were registered by whoever entered here;
+      // fillLoQ/fillHiQ present the line on the FIRST PREDECODE cycle. Nothing else
+      // happens -- deliberately: this state exists to make the file read synchronous,
+      // and giving it any other job would put logic back on the path M2 is clearing.
+      //
+      // The fetch port is CLOSED here (no `lookupTick`), which is the conservative
+      // choice in both directions: for a demand install it is mandatory (the demand's
+      // own REPLAY response is still owed, and FetchRsp carries no tag), and for a
+      // speculative install it costs one held cycle that the retry loop absorbs.
+      INSTALL_ARM.whenIsActive { goto(PREDECODE) }
 
       // ----- FAULT: deliver a one-shot bus-error fault response; no allocation -----
       // Task #211: reached only via REFILL's non-OKAY AXI response. PREDECODE (the
@@ -863,31 +988,37 @@ class IcachePlugin extends FiberPlugin with FetchService {
         goto(IDLE)
       }
 
-      // ----- PREDECODE / PF_PRED: classify the line, write lineMem + tag/valid -----
+      // ----- PREDECODE: classify the line, write lineMem + tag/valid -----
       // Body hoisted to the shared `predActive` datapath below the FSM (single
       // `lineMem(w).write(...)` / `tagMem(w).write(...)` call
       // site each -- see the icache-burst-fault-fix comment there for why a SECOND call
       // site is not merely untidy but breaks SpinalHDL's MultiPortWritesSymplifier).
       PREDECODE.whenIsActive {
         predActive := True
-        when(commitBeat === U(1, 1 bits)) { goto(REPLAY) }
-      }
-
-      PF_PRED.whenIsActive {
-        predActive := True
-        predIsPf   := True
-        // Slice I1 / D3-SET-I: the array-write cycle is the one cycle a concurrent
-        // lookup into the SAME set must not be answered (write-first async tagMem vs a
-        // register `valids` array -> a same-set lookup could read the NEW tag against
-        // the OLD valid bit and report a spurious hit on a half-written line). Held and
-        // retried instead.
-        fillArrayWrActive := True
-        lookupTick(canStartFill = false)
+        // M2b: PF_PRED merged in. A SPECULATIVE install produces no response, so the
+        // fetch port may stay open and serve hits (see the slice-I1 ordering comment on
+        // `lookupTick` above). A DEMAND install must keep it closed -- its own REPLAY
+        // response is still owed and FetchRsp carries no tag, so a younger hit answered
+        // here would be attributed to the older ring entry (silent instruction-byte
+        // mis-pairing).
+        when(predIsPfReg) {
+          // Slice I1 / D3-SET-I: the array-write cycle is the one cycle a concurrent
+          // lookup into the SAME set must not be answered (write-first async tagMem vs
+          // a register `valids` array -> a same-set lookup could read the NEW tag
+          // against the OLD valid bit and report a spurious hit on a half-written
+          // line). Held and retried instead.
+          fillArrayWrActive := True
+          lookupTick(canStartFill = false)
+        }
         when(commitBeat === U(1, 1 bits)) {
-          pfValid(pfInstallIdx)    := False
-          pfArSent(pfInstallIdx)   := False
-          pfComplete(pfInstallIdx) := False
-          goto(IDLE)
+          when(predIsPfReg) {
+            pfValid(pfInstallIdx)    := False
+            pfArSent(pfInstallIdx)   := False
+            pfComplete(pfInstallIdx) := False
+            goto(IDLE)
+          } otherwise {
+            goto(REPLAY)
+          }
         }
       }
 
@@ -913,7 +1044,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // was actually allocated (missCacheable) — for a non-allocated (INHIBITED)
         // miss the array was not written THIS refill and may still hold stale,
         // unrelated content left by a prior allocation to this same way/set.
-        // `s1FromMiss` routes the S1->rsp mux to the `lineReg`/`bypPred` bypass
+        // `s1FromMiss` routes the S1->rsp mux to the `bypWindow`/`bypPred` bypass
         // registers instead for that case, so latching this array read regardless
         // is harmless (simply unused).
         //
@@ -928,6 +1059,46 @@ class IcachePlugin extends FiberPlugin with FetchService {
       }
     }
 
+    // ══ M2b: MISS-PC IMMUTABILITY, ENFORCED RATHER THAN ARGUED ═══════════════════
+    // `bypPred` (M2a) and `bypWindow` (M2b) are captured on ONE dwell cycle, selected
+    // by `missPC(5)` / `missPC(4:3)`, and consumed later by REPLAY, which re-reads
+    // `missPC` for `s1Pc`/`s1Lane`. The whole narrowing is only correct because
+    // `missPC` cannot change between those two points. That has been true twice over
+    // (M2a's review verified it; M2b's PF_PRED->PREDECODE merge preserved it -- see the
+    // full writers-enumeration argument at `bypPred`'s declaration), and BOTH times it
+    // was an undocumented, untested property that a future edit could break silently:
+    // nothing would fail loudly, the response would just carry a window from the wrong
+    // part of the line.
+    //
+    // So it stops being an argument. `missPC` may only change on a cycle whose FSM
+    // state is IDLE (the two writers -- `lookupTick`'s miss arm and IDLE's speculative
+    // install arm -- are both IDLE-confined). Equivalently: on any cycle where the fill
+    // machine was already engaged on the PREVIOUS cycle too, `missPC` must equal its
+    // own previous value. Requiring the previous cycle to be engaged as well is what
+    // excludes the legitimate arming write, which lands on the IDLE->dwell edge; a
+    // write anywhere INSIDE the dwell still shows up one cycle later and trips this.
+    //
+    // This is a simulation assertion in the same style as the two-beat refill asserts
+    // below; it costs nothing in synthesis and it runs under EVERY test in the suite,
+    // including lock-step and the fuzz campaign.
+    val dwellActive = fsm.isActive(fsm.REFILL) || fsm.isActive(fsm.INSTALL_ARM) ||
+                      fsm.isActive(fsm.PREDECODE) || fsm.isActive(fsm.REPLAY) ||
+                      fsm.isActive(fsm.FAULT)
+    val prevDwell   = RegNext(dwellActive) init False
+    val missPCPrev  = RegNext(missPC)
+    when(prevDwell && dwellActive) {
+      assert(missPC === missPCPrev,
+        "missPC changed during a fill dwell -- the bypPred/bypWindow capture window " +
+        "(missPC(5), missPC(4:3)) is no longer the window REPLAY will deliver")
+    }
+    // DEBUG (mirrors the existing dbgAllocCommit* hooks): high on exactly the cycles
+    // the assertion above is ACTIVE, so a directed test can prove its coverage window
+    // is non-empty instead of passing vacuously. No-op for synthesis (drives nothing).
+    val dbgMissPcLocked = Bool()
+    dbgMissPcLocked := prevDwell && dwellActive
+    dbgMissPcLocked.simPublic()
+    missPC.simPublic()
+
     // ══ Five-ID fill pool + single shared installer ═══════════════════════════════
     refillDone := False
     refillErr  := False
@@ -935,7 +1106,24 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // Allocate at most one registered same-page candidate per cycle. Resident/live
     // candidates advance the frontier without consuming a slot; same-set conflicts
     // wait, enforcing one fill owner per set.
-    val demandSetOwned = (fsm.isActive(fsm.REFILL) || fsm.isActive(fsm.PREDECODE) ||
+    // M2b, DEVIATION FROM THE PLAN'S LITERAL TEXT (deliberate, and conservative):
+    // `INSTALL_ARM` is added to this state list. Before M2b the demand fill went
+    // REFILL -> PREDECODE -> REPLAY with no gap, so `missSet` was continuously "owned"
+    // from the first AR to the response. INSTALL_ARM inserts a cycle between REFILL and
+    // PREDECODE; leaving it out of this list would open a ONE-CYCLE hole in which the
+    // background allocator could hand a speculative slot the very set the demand fill
+    // is about to commit into (and, worse, hand it `victim(missSet)` -- the same way,
+    // read before PREDECODE advances the pointer). That is precisely the "one fill
+    // owner per set" property oracle 3 exists to protect, so the new state joins the
+    // list rather than being argued unreachable.
+    //
+    // The converse direction needs no change: `PREDECODE` now also covers a SPECULATIVE
+    // install (where `missSet` is the installing slot's set), but that adds nothing,
+    // because `pfValid(pfInstallIdx)` is still set for the whole dwell -- it is cleared
+    // on the commitBeat==1 cycle, taking effect only as the machine leaves -- so
+    // `pfCandSetBusy` already covers that set on every one of those cycles.
+    val demandSetOwned = (fsm.isActive(fsm.REFILL) || fsm.isActive(fsm.INSTALL_ARM) ||
+                          fsm.isActive(fsm.PREDECODE) ||
                           fsm.isActive(fsm.REPLAY) || fsm.isActive(fsm.FAULT)) &&
                          (missSet === pfCandSet)
     when(pfWindowHasCandidate && !anyInvalidate && !demandFillStart &&
@@ -1033,9 +1221,34 @@ class IcachePlugin extends FiberPlugin with FetchService {
       assert(demandRspMatch || pfRspMatch, "I-cache R beat has no live RID owner")
     }
 
-    val pfRspFire = axi.r.fire && pfRspMatch
-    pfLineLo.write(pfRspIdx, axi.r.payload.data, enable = pfRspFire && !pfBeat(pfRspIdx))
-    pfLineHi.write(pfRspIdx, axi.r.payload.data, enable = pfRspFire && pfBeat(pfRspIdx))
+    // ---- M2b: uniform R-channel write. NO demand/speculative asymmetry. ----
+    // The AXI RID IS the MSHR index (I_DEMAND == 0, I_SPEC_BASE == 1), so entry 0 is
+    // the demand line and entries 1..pfSlots are the speculative ones with no decode
+    // and no copy. Exactly ONE `.write` call site per memory (GC-6): a second breaks
+    // SpinalHDL's MultiPortWritesSymplifier -- a real previously-shipped breakage in
+    // this file, see the icache-burst-fault-fix note on the lineMem commit below.
+    //
+    // READ/WRITE COLLISION, checked rather than assumed (these Mems have a `readSync`
+    // port at `installIdx` running unconditionally, and SpinalHDL's default
+    // read-under-write policy for a synchronous read is `dontCare`):
+    //   - entry 0 is written only while `demandRspMatch`, which needs `refillActive`,
+    //     i.e. only in REFILL. `installIdx` is only READ FOR REAL from PREDECODE, and
+    //     the final beat's write lands the cycle BEFORE INSTALL_ARM, so the address is
+    //     re-sampled after the write has settled.
+    //   - a speculative entry is written only while `!pfComplete(i)`, and an entry can
+    //     only win the installer once `pfComplete(i)` is set, so no write can reach the
+    //     entry being installed.
+    //   - a stale `installIdx` left pointing at an entry that is being refilled DOES
+    //     collide, and the `dontCare` output that produces is consumed by nothing:
+    //     `beatSrc`/`beatNext3` are only sampled under `predActive`.
+    val rIdx      = axi.r.payload.id.resize(mshrIdxBits)
+    val rOwned    = demandRspMatch || pfRspMatch
+    val rFire     = axi.r.fire && rOwned
+    // Which beat this entry is expecting. Demand uses beatCnt (entry 0), speculative
+    // uses pfBeat (entries 1..N). Task 9 unifies these into mshrBeat(rIdx).
+    val rBeatIsHi = Mux(demandRspMatch, beatCnt.asBool, pfBeat(pfRspIdx))
+    fillLo.write(rIdx, axi.r.payload.data, enable = rFire && !rBeatIsHi)
+    fillHi.write(rIdx, axi.r.payload.data, enable = rFire &&  rBeatIsHi)
 
     when(axi.r.fire) {
       val respErr = axi.r.payload.resp =/= Axi4.resp.OKAY
@@ -1043,11 +1256,6 @@ class IcachePlugin extends FiberPlugin with FetchService {
         assert(axi.r.payload.last === beatCnt.asBool,
           "demand I-cache refill must be exactly two beats")
         when(respErr) { missBusFault := True }
-        when(beatCnt === U(0, 1 bits)) {
-          lineReg(255 downto 0) := axi.r.payload.data
-        } otherwise {
-          lineReg(511 downto 256) := axi.r.payload.data
-        }
         beatCnt := beatCnt + 1
         when(axi.r.payload.last) {
           refillDone := True
@@ -1070,18 +1278,23 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // (commitBeat 0 = low beat, commitBeat 1 = high beat). See `classifyBeat` above for
     // the full rationale and the equivalence argument.
     //
+    // M2b: the dwell classifies out of the MSHR line file, not out of `lineReg`. The
+    // file is split Lo/Hi precisely so classifyBeat's cross-beat lookahead (the low
+    // beat's last 3 words need words 16/17/18) is still a single-cycle read: both
+    // halves are presented simultaneously by the two readSync ports at `installIdx`.
+    //
     // The lookahead for the LOW beat's last 3 words (line words 13/14/15 need 16/17/18)
-    // is taken straight out of `lineReg`'s high half, which is already resident this
+    // is taken straight out of `fillHiQ`, which is already resident this
     // cycle — so the beat-lag the design doc describes is not even needed here; the
-    // whole line is in a register by the time the dwell runs. For the HIGH beat the
+    // whole line is presented by the file read by the time the dwell runs. For the HIGH beat the
     // lookahead runs past the line end, which is the pre-existing `extWValid = false`
     // boundary case (the F5 fix): `classify` refuses to guess brief-vs-full for
     // anything needing that word's content and rejects as COMPLEX instead of silently
     // mis-framing, `ambiguousLine` marks it, and `Aligner.scala:63-65` re-classifies
     // live from the instruction buffer's own already-fetched words.
     val isLoBeat  = commitBeat === U(0, 1 bits)
-    val beatSrc   = Mux(isLoBeat, lineReg(255 downto 0), lineReg(511 downto 256))
-    val beatNext3 = Mux(isLoBeat, lineReg(303 downto 256), B(0, 48 bits))
+    val beatSrc   = Mux(isLoBeat, fillLoQ, fillHiQ)
+    val beatNext3 = Mux(isLoBeat, fillHiQ(47 downto 0), B(0, 48 bits))
     val beatPred  = classifyBeat(beatSrc, beatNext3, isLoBeat)
 
     when(predActive) {
@@ -1093,14 +1306,18 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // its line one cycle later. (Closure (1), the same-cycle guard on the `valids`
       // write, is still present below and covers the exactly-simultaneous case.)
       val doAllocate = missCacheable && !missPoison
-      // M2a: capture ONLY the window this refill's own fetch will consume. `missPC(5)`
-      // picks the beat, `missPC(4:3)` picks the window inside it. Written on whichever
-      // dwell cycle classifies that beat, so it is stable by the time REPLAY runs.
+      // M2a/M2b: capture ONLY the window this refill's own fetch will consume, in BOTH
+      // data and predecode. `missPC(5)` picks the beat, `missPC(4:3)` picks the window
+      // inside it. Written on whichever dwell cycle classifies that beat, so it is
+      // stable by the time REPLAY runs.
       // Deliberately OUTSIDE the `doAllocate` gate -- the whole point of the bypass is
       // that it carries the response for lines that are NOT allocated. See `bypPred`'s
-      // declaration for the full equivalence and write/read-ordering argument.
+      // declaration for the full equivalence, write/read-ordering and missPC-
+      // immutability arguments (they cover `bypWindow` identically -- same predicate,
+      // same lane index, same cycle).
       when(commitBeat === missPC(5).asUInt) {
-        bypPred := beatPred.subdivideIn(4 * PRED_BITS_PER_WORD bits)(missPC(4 downto 3))
+        bypWindow := beatSrc.subdivideIn(64 bits)(missPC(4 downto 3))
+        bypPred   := beatPred.subdivideIn(4 * PRED_BITS_PER_WORD bits)(missPC(4 downto 3))
       }
       when(isLoBeat) {
         // DEBUG only: the cycle immediately BEFORE the allocation write. Its one

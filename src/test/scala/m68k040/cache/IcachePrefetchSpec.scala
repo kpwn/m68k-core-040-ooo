@@ -1025,4 +1025,168 @@ class IcachePrefetchSpec extends AnyFunSuite {
         s"the demand must have been served by the speculative install, not a second AR: $arTrace")
     }
   }
+
+  // Task 8 (M2b): demand and speculative fills now share ONE MSHR line file, written
+  // uniformly from the AXI R channel by RID. The old asymmetry -- demand into a
+  // 512-flop lineReg, speculative into a 4-entry memory pair then COPIED into lineReg
+  // in IDLE -- is deleted. This test pins the property that copy path existed to
+  // provide: a line installed speculatively must be bit-identical to the same line
+  // installed by demand, in data AND predecode.
+  //
+  // DEVIATION from the plan's literal listing, recorded deliberately: the plan's code
+  // block calls a `compiled` val and a `fetchAndWait` helper, neither of which exists
+  // in this suite (every test here compiles its own DUT and uses `fetch(dut, cd, pc)`;
+  // `IcacheSim.attachMemory` is called with base = 0 / size = 0x10000 throughout).
+  // Rewritten against the real helpers. The comparison is also made STRICTLY STRONGER
+  // than the plan's: pass A's snapshot is restricted to the sets pass A never issued a
+  // DEMAND fetch into, so every compared entry is one the prefetch engine installed on
+  // its own. Comparing a demand-touched set would have compared demand against demand
+  // and passed vacuously.
+  test("a speculatively installed line is byte-identical to a demand-installed one",
+       VerilatorTest) {
+    val compiled = simConfig.compile(new Dut)
+
+    // Page 0x2000..0x2fff is one 4 KiB page and exactly 64 lines, so it covers each of
+    // the 64 sets exactly once -- at most one way per set is ever valid, which is what
+    // lets the two passes be compared by (set, beat) alone.
+    val pageBase   = 0x2000L
+    val demandStep = 256                         // touch every 4th line by DEMAND
+    val demandSets = (0 until 16).map(i => ((pageBase + i * demandStep) >> 6).toInt & 63).toSet
+
+    // Pass A: prefetch ON. A long strided run installs the 3 lines between each
+    // demand-touched line via the prefetch engine ONLY.
+    val speculative = scala.collection.mutable.Map[(Int, Int), (BigInt, BigInt)]()
+    compiled.doSim("mshr-spec-install") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(4)
+      dut.icache.logic.prefetchEnable #= true
+      cd.waitSampling(2)
+
+      for (i <- 0 until 16) {
+        val pc = pageBase + i * demandStep
+        assert(fetch(dut, cd, pc) == IcacheSim.window64(pc), f"pass A demand data at 0x$pc%x")
+      }
+      settle(cd, 500)
+
+      for (w <- 0 until 4; s <- 0 until 64
+           if !demandSets.contains(s) && IcacheArrayProbe.wayValid(dut.icache, w, s);
+           b <- 0 until 2) {
+        speculative((s, b)) = (IcacheArrayProbe.wayData(dut.icache, w, s, b),
+                               IcacheArrayProbe.wayPred(dut.icache, w, s, b))
+      }
+    }
+    assert(speculative.nonEmpty, "no prefetch-only line became resident in the prefetch pass")
+
+    // Pass B: prefetch OFF. Every line is installed by demand.
+    compiled.doSim("mshr-demand-install") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(4)
+      dut.icache.logic.prefetchEnable #= false
+      cd.waitSampling(2)
+
+      for (i <- 0 until 64) {
+        val pc = pageBase + i * 64
+        assert(fetch(dut, cd, pc) == IcacheSim.window64(pc), f"pass B demand data at 0x$pc%x")
+      }
+      settle(cd, 200)
+
+      var compared = 0
+      for (w <- 0 until 4; s <- 0 until 64 if IcacheArrayProbe.wayValid(dut.icache, w, s);
+           b <- 0 until 2) {
+        val demandPair = (IcacheArrayProbe.wayData(dut.icache, w, s, b),
+                          IcacheArrayProbe.wayPred(dut.icache, w, s, b))
+        speculative.get((s, b)).foreach { specPair =>
+          assert(specPair == demandPair,
+            f"set=$s beat=$b: speculatively installed content differs from demand-installed. " +
+            f"spec data=0x${specPair._1.toString(16)} pred=0x${specPair._2.toString(16)}; " +
+            f"demand data=0x${demandPair._1.toString(16)} pred=0x${demandPair._2.toString(16)}")
+          compared += 1
+        }
+      }
+      assert(compared >= 16,
+        s"only $compared (set,beat) pairs overlapped between the two passes -- the " +
+        s"comparison is too thin to prove anything")
+    }
+  }
+
+  // Task 8 (M2b): the missPC-immutability invariant, made non-vacuous.
+  //
+  // `IcachePlugin.scala` now carries an RTL assertion that `missPC` cannot change on
+  // any cycle where the fill machine was already engaged on the previous cycle -- the
+  // property `bypPred` (M2a) and `bypWindow` (M2b) both rest on, since they capture a
+  // window selected by missPC(5)/missPC(4:3) on one dwell cycle and REPLAY re-reads
+  // missPC to build s1Pc/s1Lane on a later one. That assertion runs under every test
+  // in the suite, but an assertion whose guard is never true passes for free. This
+  // test pins the guard: it drives a workload that puts the machine through demand
+  // refills AND speculative installs while the fetch port is being offered commands
+  // continuously, and requires the covered-cycle count to be substantial. It also
+  // mirrors the check in the testbench, so the property is asserted from two
+  // independent places (RTL `assert` and Scala), not one.
+  test("M2b: missPC is immutable across the whole PREDECODE dwell", VerilatorTest) {
+    simConfig.compile(new Dut).doSim("m2b-misspc-immutable") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(4)
+      dut.icache.logic.prefetchEnable #= true
+      cd.waitSampling(2)
+
+      var lockedCycles = 0
+      var prevMissPc   = BigInt(-1)
+      var prevLocked   = false
+      cd.onSamplings {
+        val locked = dut.icache.logic.dbgMissPcLocked.toBoolean
+        val pc     = dut.icache.logic.missPC.toBigInt
+        if (locked) {
+          lockedCycles += 1
+          if (prevLocked)
+            assert(pc == prevMissPc,
+              f"missPC changed mid-dwell: 0x${prevMissPc.toString(16)} -> 0x${pc.toString(16)}. " +
+              f"The bypPred/bypWindow capture window is selected by missPC(5)/missPC(4:3) on " +
+              f"ONE dwell cycle and re-read by REPLAY on a later one, so a mid-dwell change " +
+              f"silently delivers a window from the wrong part of the line.")
+        }
+        prevMissPc = pc
+        prevLocked = locked
+      }
+
+      // Sequential misses (demand refills, each opening a speculative window whose
+      // installs are the merged PREDECODE's other arm) interleaved with same-line hits,
+      // then a same-set thrash that forces repeated eviction and re-fill. The fetch
+      // port is offered a command on essentially every cycle, which is the only way the
+      // merged PREDECODE's `lookupTick(canStartFill = false)` arm is ever exercised.
+      for (i <- 0 until 24) {
+        val pc = 0x3000L + i * 64
+        assert(fetch(dut, cd, pc) == IcacheSim.window64(pc), f"data at 0x$pc%x")
+        assert(fetch(dut, cd, pc + 8) == IcacheSim.window64(pc + 8), f"data at 0x${pc + 8}%x")
+      }
+      for (i <- 0 until 8) {
+        // 0x3000 / 0x4000 / 0x5000 all share set 0 but differ in tag.
+        val pc = 0x3000L + (i % 3) * 0x1000L
+        assert(fetch(dut, cd, pc) == IcacheSim.window64(pc), f"thrash data at 0x$pc%x")
+      }
+      settle(cd, 300)
+
+      // Non-vacuity. A demand refill alone spends REFILL + INSTALL_ARM + PREDECODE x2 +
+      // REPLAY in the covered window, and there are 24+ of them here, so a count in the
+      // low hundreds is expected; 100 is a deliberately loose floor that still fails
+      // loudly if the guard collapses to never-true.
+      assert(lockedCycles >= 100,
+        s"the missPC-immutability assertion covered only $lockedCycles cycles -- its " +
+        s"guard has collapsed and it is now passing vacuously")
+    }
+  }
 }
