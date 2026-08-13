@@ -89,6 +89,7 @@ if {[info exists ::env(FLOORPLAN_MODE)]} {
 #   dcache    synth/floorplan_dcache.xdc     legacy LS box, KNOWN-HARMFUL control
 #   backend   synth/floorplan_backend.xdc    repaired LS box, X14Y132:X72Y239
 #   frontend  synth/floorplan_frontend.xdc   fetch/predict box, X0Y20:X35Y135
+#   fetch     synth/floorplan_fetch.xdc      Unified-Fetch-Array cluster box + BRAM sites
 if {$floorplan_mode eq "both"} { set floorplan_mode "decode+dcache" }
 set floorplan_tokens [split $floorplan_mode "+"]
 array set floorplan_xdc {
@@ -97,10 +98,11 @@ array set floorplan_xdc {
   dcache    synth/floorplan_dcache.xdc
   backend   synth/floorplan_backend.xdc
   frontend  synth/floorplan_frontend.xdc
+  fetch     synth/floorplan_fetch.xdc
 }
 foreach tok $floorplan_tokens {
   if {$tok ne "none" && ![info exists floorplan_xdc($tok)]} {
-    error "FLOORPLAN_MODE tokens must be from: none decode decode_fe dcache backend frontend (got '$tok')"
+    error "FLOORPLAN_MODE tokens must be from: none decode decode_fe dcache backend frontend fetch (got '$tok')"
   }
 }
 if {[lsearch -exact $floorplan_tokens "decode"] >= 0 && [lsearch -exact $floorplan_tokens "decode_fe"] >= 0} {
@@ -108,6 +110,15 @@ if {[lsearch -exact $floorplan_tokens "decode"] >= 0 && [lsearch -exact $floorpl
 }
 if {[lsearch -exact $floorplan_tokens "dcache"] >= 0 && [lsearch -exact $floorplan_tokens "backend"] >= 0} {
   error "FLOORPLAN_MODE: dcache and backend are the same region; pick one"
+}
+if {[lsearch -exact $floorplan_tokens "frontend"] >= 0 && [lsearch -exact $floorplan_tokens "fetch"] >= 0} {
+  error "FLOORPLAN_MODE: frontend and fetch box the same cluster; pick one"
+}
+# decode_fe annexes FetchAlign + Ras into pb_decode, which pb_fetch also claims. Two
+# pblocks may not both own a cell, so Vivado would take the second assignment and the
+# combination would silently mean something other than either box on its own.
+if {[lsearch -exact $floorplan_tokens "decode_fe"] >= 0 && [lsearch -exact $floorplan_tokens "fetch"] >= 0} {
+  error "FLOORPLAN_MODE: decode_fe and fetch both claim FetchAlign/Ras cells; pick one"
 }
 puts "FLOORPLAN_MODE $floorplan_mode"
 foreach tok $floorplan_tokens {
@@ -120,7 +131,7 @@ foreach pb [get_pblocks -quiet] {
   puts "FLOORPLAN [get_property NAME $pb] grid=[get_property GRID_RANGES $pb] cells=[llength [get_cells -quiet -of_objects $pb]]"
 }
 # Stale per-pblock reports would otherwise survive a mode change and be misread.
-foreach stale {pb_decode pb_dcache pb_backend pb_frontend} {
+foreach stale {pb_decode pb_dcache pb_backend pb_frontend pb_fetch} {
   if {[llength [get_pblocks -quiet $stale]] == 0} {
     file delete -force synth/fullcore_${stale}_util.rpt
   }
