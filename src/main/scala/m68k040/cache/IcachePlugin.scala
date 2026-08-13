@@ -683,6 +683,36 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val s1Unresolved = s0Valid && !s0Replay && !s0Fault && !s1Hit
     s1Hit.simPublic(); s1Unresolved.simPublic(); s1HitVec.foreach(_.simPublic())
 
+    // ══ TASK 11 REVIEW FIX I1: THE 2-HOT WAY-SELECT NET, REPO-WIDE ════════════════
+    // This task DELETED Task 10's in-RTL `dbgVerdictMatch` assertion (the live-vs-
+    // registered comparator cross-check), and with it the only always-on, every-
+    // simulation guard that stood over the way-select vector. Its replacement --
+    // `IcacheVerdictShadowSpec`'s testbench-side one-hot check -- runs in FOUR tests of
+    // ONE suite. That is a strictly narrower net than what was removed, at exactly the
+    // moment the live comparator stopped watching, and it guards spec risk R3's worst
+    // failure mode: `s1HitVec` feeds a one-hot AND-OR (`s1SelOh`/`s1DataW`/`s1PredW`
+    // below), so a 2-hot vector does not fail loudly -- it silently ORs two ways'
+    // instruction bytes together into ONE FetchRsp. FetchRsp carries no tag and
+    // FetchAlignPlugin attributes by ring head, so the corruption is invisible until it
+    // executes as the wrong opcode.
+    //
+    // A 2-hot vector means two ways of one set are simultaneously valid carrying the
+    // same PPN, which is an ALLOCATOR invariant violation (one fill owner per set --
+    // `pfCandSetBusy`/`demandSetOwned`, oracle 3), reached HERE at the consumer. Both
+    // ends are now watched, and this end runs under every simulation in the repo: the
+    // 396-test lock-step suites, `make test-fast`, and the fuzz campaign.
+    //
+    // Gated exactly like `s1Unresolved`'s own qualifier: REPLAY/FAULT inject a synthetic
+    // S0 context whose `tagQ`/`validsQ`/`s0Ppn` are stale (see `s0Replay`'s
+    // declaration), so `s1HitVec` is meaningless -- and unread -- on those cycles; the
+    // output mux takes its `s0Replay` arm instead. Simulation-only, no synthesised
+    // logic (same style as the `missPC` immutability, `mshrValid(DEMAND_IDX)` and
+    // two-beat refill asserts elsewhere in this file, and as DcachePlugin's own
+    // `CountOne(stS2HitVec) <= 1` store-hit assertion).
+    assert(!(s0Valid && !s0Replay && !s0Fault) || CountOne(s1HitVec.asBits) <= U(1),
+      "M3b: s1HitVec must be one-hot-or-zero on every non-replay non-fault response -- " +
+      "a 2-hot vector silently ORs two cache ways into response data/predecode")
+
     // Slice I3 telemetry, moved from S0 to S1 with the verdict. `pfHitUseful` is a pure
     // wire (declared with the other FSM control nets below) that a testbench counts;
     // the `pfFilled` clear is real state. `!s0Replay` excludes the synthetic REPLAY/
