@@ -443,6 +443,22 @@ class IcacheOrderOracleSpec extends AnyFunSuite {
         guard += 1
       }
       assert(violations == 0, s"$violations demand-vs-speculative set-exclusivity violations")
+      // Task 9 review fix M1: `demandVsSpec` was declared and incremented but never
+      // read. The reviewer's point stands and was empirically confirmed (unmodified
+      // RTL: demandVsSpec == 0, demandLiveCycles == 48 -- non-vacuous): this specific
+      // stimulus (a demand refill held open with the frontier seeded exactly at the
+      // demand's own line, then the allocator opened on top of it) never produces a
+      // co-live demand+speculative pair under correct behaviour, because the
+      // allocator's `demandSetOwned`/`pfCandLive` guards keep the frontier from
+      // allocating a speculative entry until it has advanced clear of the demand's own
+      // set. So this assertion is STRICTLY STRONGER than the same-set-only oracle
+      // above: it fires on ANY co-live speculative entry, not only a same-set one, and
+      // would still catch the fault-injection mutation the review used to validate
+      // oracle 3's sensitivity.
+      assert(demandVsSpec == 0,
+        s"$demandVsSpec cycles saw the demand MSHR entry co-live with a speculative " +
+        "entry -- the allocator is not supposed to allocate speculatively while the " +
+        "demand entry is live under this stimulus")
     }
   }
 }

@@ -396,8 +396,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // missTag 20 + beatCnt 1 + arSent 1 + missBusFault 1 + missPoison 1 -- victimWay's 2
     // are a rename to installWay, not a deletion) and pfInstallIdx's 2 go with them.
     // `mshrComplete(DEMAND_IDX)` is still EMITTED as a reg (it has a reset), and is
-    // included in the +2; it is never set True, so synthesis should constant-fold it --
-    // but that is an expectation, NOT a measurement, because GC-1 defers synth here.
+    // included in the +2. Task 9 review fix I1 (post-landing hardening, before Task 10):
+    // it IS now driven True on entry 0's own last R beat, same as every other entry --
+    // see the R-channel handler below -- so it no longer relies on constant-folding an
+    // always-False signal; it is a genuinely uniform field. GC-1 still defers synth
+    // measurement here, so the FF-count claim above (measured pre-I1) is otherwise
+    // unchanged: I1 redirects an existing write enable, it adds no new register.
     // The value of this change is in spec section 9.5's fallback column -- deleting the
     // demand/speculative asymmetry from the file the ledger has repeatedly found
     // hardest to reason about -- not in a flop count. GC-1 forbids measuring its FMax
@@ -423,9 +427,16 @@ class IcachePlugin extends FiberPlugin with FetchService {
     //     `mshrValid(0)` can never appear in the oracle's `live` set). The R-channel
     //     demand match deliberately does NOT read it (it stays on `refillActive`), so
     //     there is no second source of truth for the bus-side liveness either.
-    //   - `mshrComplete(0)` is never written: the demand path's completion is the FSM's
-    //     `refillDone`, and a second copy of it would be the redundancy the plan warns
-    //     about. It constant-folds away in synthesis.
+    //   - `mshrComplete(0)`: UPDATED by Task 9 review fix I1. It is now written True on
+    //     entry 0's own R-channel last beat, exactly like every other entry -- the demand
+    //     path's completion is STILL primarily the FSM's `refillDone` (that
+    //     `refillDone`/`refillErr` handoff is not a redundant copy of `mshrComplete`; it
+    //     is what tells the FSM the response is owed), but `mshrComplete(DEMAND_IDX)` is
+    //     no longer left permanently False. It is reset False on every new demand
+    //     allocation (the IDLE miss-detect arm, alongside `mshrArSent`/`mshrBeat`/
+    //     `mshrErr`/`mshrPoison`) and is only ever read paired with `mshrValid` by every
+    //     current and (intended) future consumer, so a stale True surviving after REPLAY/
+    //     FAULT until the next allocation is inert.
     //   - every other entry-0 field carries exactly what its old `miss*` scalar did.
     val DEMAND_IDX   = AxiIds.I_DEMAND      // 0
     val mshrValid    = Vec.fill(MSHR_N)(RegInit(False))
@@ -837,7 +848,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
         (mshrSet(i + AxiIds.I_SPEC_BASE) === lookupSet))).orR
 
     // Speculative-only: entry 0's install is driven by the FSM's own REFILL->INSTALL_ARM
-    // transition, not by this arbiter (and `mshrComplete(DEMAND_IDX)` is never set).
+    // transition, not by this arbiter. (Task 9 review fix I1: `mshrComplete(DEMAND_IDX)`
+    // IS now set, same as every other entry -- see the R-channel handler -- but this
+    // arbiter still deliberately excludes entry 0, because its install path is the FSM
+    // transition above, not a background installer pick-up.)
     val pfInstallVec = Vec((0 until pfSlots).map(i =>
       mshrValid(i + AxiIds.I_SPEC_BASE) && mshrComplete(i + AxiIds.I_SPEC_BASE) &&
         !mshrErr(i + AxiIds.I_SPEC_BASE) && !mshrPoison(i + AxiIds.I_SPEC_BASE)))
@@ -1021,6 +1035,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
             // hand-written `demandSetOwned` state list.
             mshrValid(DEMAND_IDX)    := True
             mshrArSent(DEMAND_IDX)   := False
+            mshrComplete(DEMAND_IDX) := False
             mshrBeat(DEMAND_IDX)     := False
             mshrErr(DEMAND_IDX)      := False
             mshrPoison(DEMAND_IDX)   := False
@@ -1066,6 +1081,24 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // ----- Demand refill; speculative R traffic is handled independently by RID -----
       REFILL.whenIsActive {
         refillActive := True
+        // Task 9 review fix M3 (reviewer-flagged "free" hardening, directly aimed at
+        // preventing a repeat of the M2b `INSTALL_ARM`/`demandSetOwned` bug class):
+        // `refillActive` and `mshrValid(DEMAND_IDX)` are two liveness notions for the
+        // SAME thing -- the demand MSHR entry owning `mshrSet(DEMAND_IDX)` during its
+        // own fill -- maintained by construction rather than by a single shared flag
+        // (see the ENTRY 0's SEMANTICS note above `mshrValid`'s declaration for why
+        // `refillActive` is deliberately not read off `mshrValid(DEMAND_IDX)` on the
+        // R-channel match). `mshrValid(DEMAND_IDX)` is set on the IDLE miss-detect that
+        // starts a refill and only cleared in REPLAY/FAULT, both reached strictly AFTER
+        // REFILL, so this invariant should hold on every cycle of REFILL by
+        // construction; a future edit (M3's restructuring is the very next task) that
+        // drifts the two apart is exactly the class of bug the M2b fix already had to
+        // catch once. Simulation-only, no synthesised logic (same style as the
+        // `missPC` immutability assert above and the two-beat refill asserts below).
+        assert(mshrValid(DEMAND_IDX),
+          "I-cache REFILL active but mshrValid(DEMAND_IDX) is False -- the demand MSHR " +
+          "entry's liveness has drifted out of sync with the FSM's own refillActive " +
+          "state")
         when(refillDone) {
           when(refillErr) { goto(FAULT) } otherwise {
             installIdx  := U(AxiIds.I_DEMAND, mshrIdxBits bits)
@@ -1289,8 +1322,14 @@ class IcachePlugin extends FiberPlugin with FetchService {
     }
 
     // Completed errors and poisoned silent fills allocate nothing and free locally.
-    // SPECULATIVE ONLY: entry 0 never sets `mshrComplete`, so including it here would be
-    // inert, and its "free" is the FSM's return to IDLE (REPLAY/FAULT), not this loop.
+    // SPECULATIVE ONLY, and this restriction is now load-bearing rather than merely
+    // inert (Task 9 review fix I1 made `mshrComplete(DEMAND_IDX)` a real, driven bit):
+    // entry 0's error/poison handling is owned entirely by the FSM (`refillErr` ->
+    // FAULT, or `mshrPoison(DEMAND_IDX)` read by REPLAY's `s1FromMiss`), and its "free"
+    // is the FSM's own return to IDLE (REPLAY/FAULT). Widening this loop to `0 until
+    // MSHR_N` would race that FSM-owned teardown -- clearing `mshrValid(DEMAND_IDX)` a
+    // cycle out of step with the state machine that is supposed to own it -- so it must
+    // stay pfSlots-only even though entry 0's `mshrComplete` is no longer always False.
     for (i <- 0 until pfSlots) {
       val e = i + AxiIds.I_SPEC_BASE
       when(mshrValid(e) && mshrComplete(e) && (mshrErr(e) || mshrPoison(e))) {
@@ -1409,9 +1448,31 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // ---- M2c: ONE R-channel handler. No demand/speculative branch at all. ----
     // The beat counter, the error latch and the two-beat assertion were duplicated per
     // path; each is now a single `mshr*(rIdx)` statement. The ONLY thing that still
-    // distinguishes the two is what "the burst finished" MEANS: the demand path hands
-    // `refillDone`/`refillErr` to the FSM (which owes a response), the speculative path
-    // just sets `mshrComplete` and lets the background installer pick it up.
+    // distinguishes the two is what happens ON TOP of "the burst finished": the demand
+    // path additionally hands `refillDone`/`refillErr` to the FSM (which owes a
+    // response), whereas the speculative path relies solely on `mshrComplete` for the
+    // background installer to pick it up.
+    //
+    // Task 9 review fix I1: `mshrComplete(rIdx) := True` on the last beat is now
+    // UNCONDITIONAL -- entry 0 sets it exactly like every other entry, instead of the
+    // demand branch setting only `refillDone`/`refillErr` and leaving
+    // `mshrComplete(DEMAND_IDX)` permanently False. This makes the whole Vec genuinely
+    // uniform (matching the plan's advertised "Produces, for Tasks 11/12" interface),
+    // so a FUTURE unqualified reduction over `mshrComplete` (a map, a count, a
+    // generalised installer) reads a real value for the demand entry instead of a
+    // silent False. It costs no new flop: the register was already emitted (see the
+    // M2c honest-accounting note above `mshrComplete`'s declaration) and was expected
+    // to constant-fold away specifically because it was never driven True -- now it
+    // is driven, for exactly the one flop that was already there.
+    //
+    // No existing consumer's value changes: every current READER of `mshrComplete`
+    // indexes it either via `i + AxiIds.I_SPEC_BASE` (the speculative-only reductions)
+    // or via `rIdx` under an `ridIsPf` guard (`pfRspMatch`) -- both are structurally
+    // confined to the speculative range and can never observe index `DEMAND_IDX`. The
+    // demand entry's own liveness window is bounded by `mshrValid(DEMAND_IDX)` /
+    // `refillActive`, reset False on every new demand allocation below, so a stale
+    // `True` left over from a prior fill is inert wherever a future reduction pairs it
+    // with `mshrValid` (exactly how every current speculative reduction is written).
     val rOwned    = demandRspMatch || pfRspMatch
     val rFire     = axi.r.fire && rOwned
     fillLo.write(rIdx, axi.r.payload.data, enable = rFire && !mshrBeat(rIdx))
@@ -1425,11 +1486,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
       when(respErr) { mshrErr(rIdx) := True }
       mshrBeat(rIdx) := !mshrBeat(rIdx)
       when(axi.r.payload.last) {
+        mshrComplete(rIdx) := True
         when(ridIsDemand) {
           refillDone := True
           refillErr  := mshrErr(DEMAND_IDX) || respErr
-        } otherwise {
-          mshrComplete(rIdx) := True
         }
       }
     }
