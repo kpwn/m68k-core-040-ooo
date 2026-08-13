@@ -120,6 +120,13 @@ if {[lsearch -exact $floorplan_tokens "frontend"] >= 0 && [lsearch -exact $floor
 if {[lsearch -exact $floorplan_tokens "decode_fe"] >= 0 && [lsearch -exact $floorplan_tokens "fetch"] >= 0} {
   error "FLOORPLAN_MODE: decode_fe and fetch both claim FetchAlign/Ras cells; pick one"
 }
+# Same double-claim, same reason: decode_fe's FetchAlign/Ras annexation collides with
+# pb_frontend's own (wider) claim on the identical cells. Task 15's review found this
+# guard was added for decode_fe+fetch but the pre-existing decode_fe+frontend pair was
+# left open with the identical failure mode -- closing it here.
+if {[lsearch -exact $floorplan_tokens "decode_fe"] >= 0 && [lsearch -exact $floorplan_tokens "frontend"] >= 0} {
+  error "FLOORPLAN_MODE: decode_fe and frontend both claim FetchAlign/Ras cells; pick one"
+}
 puts "FLOORPLAN_MODE $floorplan_mode"
 foreach tok $floorplan_tokens {
   if {$tok eq "none"} { continue }
