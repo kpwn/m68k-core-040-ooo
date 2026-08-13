@@ -1189,4 +1189,76 @@ class IcachePrefetchSpec extends AnyFunSuite {
         s"guard has collapsed and it is now passing vacuously")
     }
   }
+
+  // ══ Task 12 (M4): the frontier and the AR arbiter now read REGISTERED state ═══
+  // Both effects are architecturally invisible (prefetch is a pure performance hint,
+  // rules P1-P4): the frontier advances one cycle later, and on the specific cycle a
+  // demand miss is also arbitrating the speculative AR is presented one cycle later.
+  // But a frontier that NEVER advances is also "architecturally invisible", in exactly
+  // the way that silently deletes the feature -- so it is measured, not reasoned about.
+  //
+  // DEVIATION from the plan's literal test code, recorded deliberately (the same
+  // deviation Task 8 recorded for its own snippet): this suite has no `compiled` val
+  // and no `fetchAndWait` helper -- every test compiles its own DUT and uses
+  // `fetch(dut, cd, pc)`, and `IcacheSim.attachMemory` takes base/size. Rewritten
+  // against the real helpers; the assertions are unchanged in substance.
+  test("M4: the frontier still advances and speculative fills still land", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(4)
+      dut.icache.logic.prefetchEnable #= true
+      cd.waitSampling(2)
+
+      // Touch ONLY line 0x1000. The frontier should pull in up to five lines ahead.
+      assert(fetch(dut, cd, 0x1000L) == IcacheSim.window64(0x1000L), "demand line data")
+      cd.waitSampling(2000)
+
+      val ahead = (1 to 5).count { i =>
+        val a   = 0x1000L + i * 64L
+        val set = ((a >> 6) & 0x3f).toInt
+        (0 until 4).exists(w => IcacheArrayProbe.wayValid(dut.icache, w, set) &&
+          IcacheArrayProbe.wayTag(dut.icache, w, set) == BigInt(a >> 12))
+      }
+      assert(ahead >= 3,
+        s"only $ahead of the 5 lines ahead of a single demand fetch became resident. " +
+        s"M4 moved the frontier behind a registered disposition; a frontier that never " +
+        s"advances is 'architecturally invisible' in exactly the way that silently " +
+        s"deletes the feature.")
+    }
+  }
+
+  test("M4: pfHitUseful telemetry still fires on a prefetched line's first demand hit",
+       VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(4)
+      dut.icache.logic.prefetchEnable #= true
+      cd.waitSampling(2)
+
+      var useful = 0
+      cd.onSamplings { if (dut.icache.logic.pfHitUseful.toBoolean) useful += 1 }
+
+      assert(fetch(dut, cd, 0x1000L) == IcacheSim.window64(0x1000L), "demand line data")
+      cd.waitSampling(2000)
+      for (i <- 1 to 5) {
+        val a = 0x1000L + i * 64L
+        assert(fetch(dut, cd, a) == IcacheSim.window64(a), f"prefetched line data at 0x$a%x")
+      }
+      cd.waitSampling(50)
+      assert(useful >= 3,
+        s"pfHitUseful fired only $useful times across 5 demand hits into prefetched " +
+        s"lines. M4 moved the pfFilled clear to S1 (Task 11 Step 6); the telemetry " +
+        s"design doc section 8.3 depends on is measured, not asserted.")
+    }
+  }
 }

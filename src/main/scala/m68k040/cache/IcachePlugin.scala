@@ -683,6 +683,42 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val s1Unresolved = s0Valid && !s0Replay && !s0Fault && !s1Hit
     s1Hit.simPublic(); s1Unresolved.simPublic(); s1HitVec.foreach(_.simPublic())
 
+    // ══ M4 (Task 12): THE REGISTERED S1 DISPOSITION ═══════════════════════════════
+    // FOUR BITS and a line base are the entire interface between the lookup pipeline
+    // and the speculation machinery. Nothing else crosses (design principle P4:
+    // "the prefetch frontier and AR arbitration read ONLY registered state; a prefetch
+    // decision one cycle later is architecturally invisible").
+    //
+    // These are S2 registers -- written at S1, read at S2 -- and `s1Line` HAS to be a
+    // register of its own even though `s0Ppn`/`s0Set` are already flops: a HIT at S1
+    // reopens `cmdPort.ready`, so a new `cmdPort.fire` can overwrite `s0Ppn`/`s0Set`
+    // on the very cycle the S2 consumer runs. Re-deriving the line base from the live
+    // `s0*` at S2 would seed the frontier from the WRONG command in exactly the
+    // bubble-free hit stream the frontier exists for.
+    //
+    // `!s0Replay` mirrors `s1Unresolved`'s own qualifier: REPLAY and FAULT inject a
+    // synthetic S0 context whose `s0Ppn`/`s0Cacheable`/`tagQ`/`validsQ` are the LAST
+    // ACCEPTED command's leftovers (see `s0Replay`'s declaration). Letting one of those
+    // through would re-seed the frontier off a stale PPN, and -- worse -- would make
+    // `heldDemandMissQ` below fire for a REPLAY, freezing the allocator on a synthetic
+    // "miss" that has already been filled.
+    val s1Disp = new Bundle {
+      val valid     = RegInit(False)
+      val hit       = Reg(Bool())
+      val fault     = Reg(Bool())
+      val cacheable = Reg(Bool())
+    }
+    val s1Line = Reg(UInt(32 bits))
+    s1Disp.valid     := s0Valid && !s0Replay
+    s1Disp.hit       := s1Hit
+    s1Disp.fault     := s0Fault
+    s1Disp.cacheable := s0Cacheable
+    // VIPT: the page offset is untranslated, so `s0Ppn ## s0Set ## 0` IS the physical
+    // line base -- bit-identical to the deleted `lookupPaddr & ~63` one cycle earlier.
+    s1Line           := (s0Ppn ## s0Set ## U(0, 6 bits)).asUInt
+    s1Disp.valid.simPublic(); s1Disp.hit.simPublic(); s1Disp.fault.simPublic()
+    s1Disp.cacheable.simPublic(); s1Line.simPublic()
+
     // ══ TASK 11 REVIEW FIX I1: THE 2-HOT WAY-SELECT NET, REPO-WIDE ════════════════
     // This task DELETED Task 10's in-RTL `dbgVerdictMatch` assertion (the live-vs-
     // registered comparator cross-check), and with it the only always-on, every-
@@ -1108,7 +1144,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
     // A held demand matching any live speculative line must re-look-up after install;
     // a same-set/different-line demand waits as well, preserving one fill owner per set.
-    val lookupLineBase = lookupPaddr & ~U(63, 32 bits)
+    //
+    // M4: `lookupLineBase` (`lookupPaddr & ~63`) stood here and was DEAD -- its last
+    // reader went away with an earlier slice. Deleted with the rest of this task's
+    // live-`lookupPaddr` clean-out so the Step-7 grep means what it says.
     // Speculative-only, and it must stay that way: its ONLY consumers are SG-1's
     // `pfAcceptOk` inside `lookupTick` and `heldOnSetBusy` just below, both of which are
     // reached only while the machine can accept a command -- and in those states
@@ -1140,11 +1179,67 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // `cmdPort.ready`, whose `pfAcceptOk` term already carries `pfLookupSetBusy`
     // directly -- so it adds nothing to the accept cone.
     //
-    // Task 12 (M4) owns making this disposition fully registered.
+    // M4 (Task 12) makes this disposition fully registered -- see `heldOnSetBusyQ`
+    // immediately below. `heldOnSetBusy` itself survives as the REGISTER INPUT only; it
+    // no longer reaches any clock enable or payload mux.
     val heldOnSetBusy = lookupActive && cmdPort.valid && xlate.rsp.ready && pfLookupSetBusy
+
+    // ══ M4: BOTH HALVES OF `demandStuck`, REGISTERED ══════════════════════════════
+    // (a), registered. Because `s1Disp.valid`/`hit`/`fault` are all written from the
+    // SAME cycle's `s0Valid && !s0Replay` / `s1Hit` / `s0Fault`, this expression is
+    // EXACTLY `RegNext(s1Unresolved)` -- `Reg(x) && !Reg(y) && !Reg(z)` is
+    // `Reg(x && !y && !z)`. Named the way the plan names it because it is the
+    // "an architectural miss is visibly held" term, not a generic delay line.
+    val heldDemandMissQ = s1Disp.valid && !s1Disp.hit && !s1Disp.fault
+
+    // ── (b), registered, AND the AR arbiter's set key ────────────────────────────
+    // TASK 11 LEFT THIS HALF-MIGRATED and named Task 12 as its owner: `pfBlockingArWant`
+    // still keyed on the LIVE `lookupSet`, and the AR hold gate's `pfBlockingArAny`
+    // escape hatch was taken under BOTH (a) and (b) even though the key only names the
+    // right slot under (b). Under (a) the Stream boundary holds a DIFFERENT, younger
+    // command, so `pfBlockingArAny` there was a term about an unrelated command opening
+    // a gate held for the unresolved miss -- bounded and not a deadlock (it only ever
+    // let ONE more speculative AR park), but meaningless. Both are fixed here:
+    //   - the key is `heldSetQ`, the registered set of the demand that is actually
+    //     being refused;
+    //   - the escape hatch is qualified by `heldOnSetBusyQ`, so it is only taken in the
+    //     case where a blocking owner can exist at all.
+    //
+    // `heldSetQ` IS EXACT, not merely stable: its enable is `heldOnSetBusy`, and its
+    // only reader is qualified by `heldOnSetBusyQ = RegNext(heldOnSetBusy)`. So every
+    // cycle it is read, it was written on the immediately preceding cycle, from the
+    // `lookupSet` of the very demand that was refused. It therefore needs no init and
+    // can never be consulted stale. (A reset value would be dead logic; SpinalHDL is
+    // happy with an uninitialised `Reg` whose every read is qualified this way, and the
+    // rest of the S0 context -- `s0Pc`, `s0Set`, `tagQ` ... -- is uninitialised for the
+    // same reason.)
+    //
+    // WHY A ONE-CYCLE-LATE (b) IS SAFE, traced rather than asserted:
+    //   - LIVENESS. The escape hatch exists to prevent a REAL deadlock: while a demand
+    //     is refused because a speculative slot owns its set, the ONLY thing that can
+    //     unblock it is that slot's own fill, so the arbiter must be allowed to launch
+    //     an AR even though a demand is stuck. `heldOnSetBusy` is a LEVEL: it holds for
+    //     as long as the demand is refused (Stream contract keeps `cmdPort.valid` high
+    //     until `ready`, and `lookupActive` is asserted by both IDLE and the install
+    //     dwell -- the states in which a refusal can occur). So the hatch opens one
+    //     cycle later, never "not at all".
+    //   - SAFETY. The one-fill-owner-per-set invariant is NOT carried by the outer
+    //     `!demandStuck` freeze; it is carried by `pfCandSetBusy` (a live reduction over
+    //     ALL MSHR entries) and `demandSetOwned`. Under (b), `pfCandSetBusy` is True for
+    //     the refused demand's set BY DEFINITION -- a speculative slot owns it -- so the
+    //     one uncovered cycle cannot allocate into that set.
+    //   - Under (a), the uncovered cycle is the S1 cycle itself, and it is covered
+    //     set-specifically by `demandSetOwned`'s `s1Unresolved && s0Set === pfCandSet`
+    //     lane. SEE THAT LANE'S COMMENT: it was documented as "redundant with the outer
+    //     `!s1Unresolved` gate ... kept because it survives a future reorganisation of
+    //     that gate". M4 IS that reorganisation, and the lane is now LOAD-BEARING.
+    //     It is deliberately NOT migrated to the registered form.
+    val heldOnSetBusyQ = RegNext(heldOnSetBusy) init False
+    val heldSetQ       = RegNextWhen(lookupSet, heldOnSetBusy)
     // "A demand fill is imminent or blocked" -- the union of (a) and (b), i.e. the exact
-    // condition the deleted `heldDemandMiss` served at its two consumers.
-    val demandStuck = s1Unresolved || heldOnSetBusy
+    // condition the deleted `heldDemandMiss` served at its two consumers, now entirely
+    // out of flops.
+    val demandStuckQ = heldDemandMissQ || heldOnSetBusyQ
 
     // Speculative-only: entry 0's install is driven by the FSM's own REFILL->INSTALL_ARM
     // transition, not by this arbiter. (Task 9 review fix I1: `mshrComplete(DEMAND_IDX)`
@@ -1159,9 +1254,15 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val pfInstallMshr = (pfInstallSel.resize(mshrIdxBits) +
                          U(AxiIds.I_SPEC_BASE, mshrIdxBits bits)).resize(mshrIdxBits)
 
-    def seedPfWindow(): Unit = {
-      val line = lookupPaddr & ~U(63, 32 bits)
-      val pageEnd = (lookupPaddr(31 downto 12) ## U(0xfff, 12 bits)).asUInt & ~U(63, 32 bits)
+    // M4: takes the line base as a PARAMETER, registered, instead of computing it from
+    // the live `lookupPaddr`. The 32-bit add, the page-boundary clamp and the whole
+    // comparison chain now run off flop outputs, one stage later. The BODY is otherwise
+    // byte-identical to its pre-M4 form; `line` is simply bound to the argument instead
+    // of to `lookupPaddr & ~63`, and `pageEnd` to `line(31:12)` instead of
+    // `lookupPaddr(31:12)` -- the same 20 bits, since masking off bits 5:0 cannot change
+    // bits 31:12.
+    def seedPfWindow(line: UInt): Unit = {
+      val pageEnd = (line(31 downto 12) ## U(0xfff, 12 bits)).asUInt & ~U(63, 32 bits)
       val wantedLimit = line + U(5 * 64, 32 bits)
       val clampedLimit = Mux(wantedLimit(31 downto 12) === line(31 downto 12),
                              wantedLimit, pageEnd)
@@ -1177,6 +1278,41 @@ class IcachePlugin extends FiberPlugin with FetchService {
         pfLimitPa    := clampedLimit
       }
       pfSeqValid := True
+    }
+
+    // ══ M4: THE FRONTIER IS SEEDED FROM THE REGISTERED DISPOSITION ════════════════
+    // Enabled by `s1Disp` ALONE -- no `cmdPort.fire`, no live translation, no live
+    // `lookupPaddr`. This block is what used to sit inside `when(cmdPort.fire)` in
+    // `lookupTick`; it is moved here verbatim with `lookupPaddr & ~63` replaced by
+    // `s1Line` and the enable replaced by `s1Disp.valid`.
+    //
+    // TEXTUAL POSITION IS LOAD-BEARING, twice, and it is preserved from the deleted
+    // form (which elaborated inside the FSM, i.e. ABOVE both of these):
+    //   - it must precede the allocator below, so that on a cycle where BOTH could
+    //     write `pfNextPa` the allocator wins, exactly as before. (They are in fact
+    //     mutually exclusive -- `pfWindowUpdate` covers every case in which
+    //     `seedPfWindow` writes `pfNextPa` -- but the ordering is what makes that a
+    //     belt-and-braces claim rather than the only thing holding it up.)
+    //   - it must precede `when(anyInvalidate) { pfSeqValid := False }` below, so an
+    //     invalidate still wins over a same-cycle seed.
+    //
+    // IDEMPOTENT UNDER THE S1 HOLD, which is new and required: `s0Valid` is HELD while
+    // an accepted miss waits for the fill engine, so `s1Disp.valid` is True for the
+    // whole hold rather than for one cycle. Re-running the seed is a no-op after the
+    // first cycle -- `pfDemandLine` now equals `s1Line`, so the inner `when` is skipped
+    // and `pfWindowUpdate` is False -- and the fault/uncacheable arm is likewise
+    // idempotent (`pfSeqValid := False` twice is `pfSeqValid := False`).
+    when(s1Disp.valid) {
+      when(!s1Disp.fault && s1Disp.cacheable) {
+        val sequential = pfSeqValid &&
+                         (s1Line(31 downto 12) === pfDemandLine(31 downto 12)) &&
+                         (s1Line === (pfDemandLine + U(64, 32 bits)))
+        pfWindowUpdate := !pfSeqValid || ((s1Line =/= pfDemandLine) && !sequential)
+        seedPfWindow(s1Line)
+      } otherwise {
+        pfWindowUpdate := True
+        pfSeqValid     := False
+      }
     }
 
     // Stable registered AR holding point. It intentionally allows one arbitration
@@ -1353,18 +1489,13 @@ class IcachePlugin extends FiberPlugin with FetchService {
             // the four bits belong to the same set the verdict is computed for.
             pfFilledQ(w) := pfFilled(w)(lookupSet)
           }
-          when(!lookupFault && lookupCacheable) {
-            val line = lookupPaddr & ~U(63, 32 bits)
-            val sequential = pfSeqValid &&
-                             (line(31 downto 12) === pfDemandLine(31 downto 12)) &&
-                             (line === (pfDemandLine + U(64, 32 bits)))
-            pfWindowUpdate := !pfSeqValid ||
-                              ((line =/= pfDemandLine) && !sequential)
-            seedPfWindow()
-          } otherwise {
-            pfWindowUpdate := True
-            pfSeqValid := False
-          }
+          // M4 (Task 12): the frontier seed / window-kill that stood HERE is deleted.
+          // It was the LAST live-translation consumer outside the S0 capture: it read
+          // `lookupFault`, `lookupCacheable` AND `lookupPaddr`, and it drove the clock
+          // enables of `pfNextPa`/`pfDemandLine`/`pfLimitPa`/`pfSeqValid` (96 flops) as
+          // well as `pfWindowUpdate`, which gates the whole allocator. Its replacement
+          // runs off `s1Disp`/`s1Line` -- see "THE FRONTIER IS SEEDED FROM THE
+          // REGISTERED DISPOSITION" above the FSM.
           // M3b: the fault/hit/miss verdict chain that stood HERE is deleted whole.
           // See the S1 miss dispatch below the FSM for where the MSHR allocation it
           // performed now lives, and why moving it there also deletes the separate
@@ -1728,9 +1859,19 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // targeted the same LINE the set would end up with two valid ways carrying the same
     // tag, i.e. a 2-hot `s1HitVec` feeding the one-hot AND-OR.
     //   - `s1Unresolved && s0Set === pfCandSet` (the plan's Step 3 extension) covers the
-    //     accepted-but-not-yet-dispatched window. It is redundant with the outer
-    //     `!s1Unresolved` gate below and kept because the plan asks for it by name and
-    //     because it survives a future reorganisation of that gate.
+    //     accepted-but-not-yet-dispatched window. Under Task 11 it was redundant with the
+    //     outer `!s1Unresolved` gate below and kept "because it survives a future
+    //     reorganisation of that gate".
+    //     ══ M4 (Task 12) IS THAT REORGANISATION, AND THIS LANE IS NOW LOAD-BEARING ══
+    //     The outer gate is now `!demandStuckQ`, a REGISTERED disposition that is one
+    //     cycle late, so it does NOT cover the S1 cycle of an accepted-but-held miss.
+    //     This lane does, exactly and set-specifically. It is DELIBERATELY LEFT LIVE
+    //     (`s1Unresolved`, `s0Set`) rather than migrated with the rest of Task 12: it is
+    //     an allocator-input term, not a clock enable on the frontier registers, and
+    //     migrating it would re-open precisely the two-fill-owners-per-set window that
+    //     ends in a 2-hot `s1HitVec`. Mutation-proved in the Task 12 report: with this
+    //     lane removed AND the outer gate registered, a same-set speculative allocation
+    //     races an accepted demand miss.
     //   - `cmdPort.fire && lookupSet === pfCandSet` covers the ACCEPT CYCLE itself,
     //     which the plan's text does not. It is not hypothetical: when the frontier has
     //     stalled (no free slot, or prefetch disabled) `pfNextPa` can still be sitting
@@ -1744,8 +1885,14 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // dispatched" and "offered demand refused because a speculative slot owns its set".
     // Same purpose as before: freeze old-window allocation while a demand fill is
     // imminent or blocked, and let the AR arbiter launch only the owner that unblocks it.
+    // M4: `!demandStuck` -> `!demandStuckQ`, i.e. this 96-flop frontier's clock enable
+    // is now off flops end to end. It is a HEURISTIC freeze and one cycle of lateness in
+    // it is a performance question, not a correctness one -- the correctness question,
+    // "can a speculative slot be allocated to the set an accepted demand is about to
+    // claim", is answered by `demandSetOwned`'s three lanes and `pfCandSetBusy` above,
+    // all of which stay live/exact.
     when(pfWindowHasCandidate && !anyInvalidate && !demandFillStart &&
-         !pfWindowUpdate && !demandStuck) {
+         !pfWindowUpdate && !demandStuckQ) {
       when(pfCandLive) {
         pfNextPa := pfNextPa + U(64, 32 bits)
       } elsewhen(pfCandSetBusy || demandSetOwned) {
@@ -1768,6 +1915,38 @@ class IcachePlugin extends FiberPlugin with FetchService {
         mshrWay(pfFreeMshr)      := victim(pfCandSet)
         pfNextPa                 := pfNextPa + U(64, 32 bits)
       }
+    }
+
+    // ══ M4 (Task 12) SAFETY NET: ONE FILL OWNER PER SET, AT THE PRODUCER ══════════
+    // Task 12 moves the allocator's outer freeze (`!demandStuck` -> `!demandStuckQ`)
+    // behind a register, which means the freeze no longer covers the S1 cycle of an
+    // accepted-but-held demand miss. The claim that this is safe rests entirely on the
+    // SET-SPECIFIC guards (`pfCandSetBusy` and `demandSetOwned`'s three lanes) still
+    // being exact -- an argument, four cycles long, about signals none of which is
+    // observable from a testbench. So it stops being an argument.
+    //
+    // This is the PRODUCER end of exactly the invariant Task 11's review fix watches at
+    // the CONSUMER end (`CountOne(s1HitVec) <= 1`, above): two fill owners for one set
+    // is how two ways of one set end up simultaneously valid carrying the same tag, and
+    // the consumer assertion only fires once the second install has actually landed AND
+    // a lookup has hit it. This one fires the cycle the allocator makes the mistake,
+    // which is the difference between a diagnosable failure and a puzzle.
+    //
+    // REPO-WIDE, deliberately, and for the same reason the 2-hot net was restored to
+    // being repo-wide: it runs under the 396-test lock-step suites, `make test-fast`,
+    // the whole GC-4 list and the fuzz campaign -- not in one directed suite. Costs
+    // nothing in synthesis (SpinalHDL `assert` is simulation-only here, same style as
+    // the two-beat refill asserts and the `missPC` immutability check).
+    //
+    // NON-VACUITY: proved by mutation in the Task 12 report -- removing
+    // `demandSetOwned`'s `cmdPort.fire` lane makes this assertion fire, and it fires
+    // BEFORE the 2-hot consumer assertion does.
+    for (i <- 0 until MSHR_N; j <- i + 1 until MSHR_N) {
+      assert(!(mshrValid(i) && mshrValid(j) && (mshrSet(i) === mshrSet(j))),
+        s"I-cache MSHR entries $i and $j are both live and own the SAME set -- " +
+        s"'one fill owner per set' is violated. Two fills into one set can install two " +
+        s"valid ways carrying the same tag, which makes s1HitVec 2-hot and silently ORs " +
+        s"two ways' instruction bytes into one FetchRsp (spec risk R3).")
     }
 
     // Completed errors and poisoned silent fills allocate nothing and free locally.
@@ -1821,22 +2000,36 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // already visible at the command boundary. An AR that was presented earlier
     // remains stable until fire, as AXI requires; this guard handles the empty-holder
     // arbitration case and the matching-fill error/retry boundary.
+    //
+    // M4: keyed on `heldSetQ`, the REGISTERED set of the refused demand, not on the live
+    // `lookupSet`. This vector feeds `pfChosenArSel`, i.e. the AR PAYLOAD select mux and
+    // the 37-flop AR hold's clock enable -- spec §5.4 names both as places live lookup
+    // state must not reach. `heldSetQ` is exact wherever it is read (see its
+    // declaration): it always carries the `lookupSet` of the demand that was refused on
+    // the immediately preceding cycle.
     val pfBlockingArWant = Vec((0 until pfSlots).map(i =>
-      pfArWant(i) && (mshrSet(i + AxiIds.I_SPEC_BASE) === lookupSet)))
+      pfArWant(i) && (mshrSet(i + AxiIds.I_SPEC_BASE) === heldSetQ)))
     val pfBlockingArAny = pfBlockingArWant.orR
     val pfBlockingArSel = OHToUInt(OHMasking.first(pfBlockingArWant.asBits))
     // M3b: `heldDemandMiss` -> `heldOnSetBusy` for the blocking-owner PRIORITY, and
-    // `demandStuck` for the hold gate below.
+    // `demandStuck` for the hold gate below. M4: both, registered.
     //
-    // The priority selector deliberately uses `heldOnSetBusy` ALONE, not `demandStuck`.
-    // `pfBlockingArWant` is keyed on the LIVE `lookupSet`, so it only names the right
-    // slot for the demand that is at the Stream boundary RIGHT NOW -- which is exactly
-    // case (b). Under case (a) (`s1Unresolved`) the boundary holds a DIFFERENT, younger
-    // command, and no speculative slot can own the unresolved miss's set anyway (SG-1's
-    // accept gate forbade accepting it if one did), so steering by `lookupSet` there
-    // would be meaningless. The hold gate below still takes the union, because "do not
-    // park a NEW speculative AR in front of an imminent demand fill" applies to both.
-    val pfChosenArSel = Mux(heldOnSetBusy, pfBlockingArSel, pfArSel)
+    // The priority selector deliberately uses `heldOnSetBusyQ` ALONE, not `demandStuckQ`,
+    // and this is a DEVIATION from the plan's literal Step 5, which writes
+    // `Mux(heldDemandMissQ, pfBlockingArSel, pfArSel)`. The plan was written against the
+    // pre-Task-11 file, where ONE `heldDemandMiss` signal covered both cases; Task 11
+    // split it, and substituting the (a)-only `heldDemandMissQ` here DELETES the
+    // blocking-owner priority outright. It is not a tie-break preference but a named
+    // anti-starvation property with its own directed test, and the mutation is caught:
+    // with `Mux(heldDemandMissQ, ...)` the suite's "a held demand's blocking owner
+    // outranks lower-numbered slots in the AR arbiter" FAILS, launching slot 1's line
+    // instead of the blocking slot 3's. (Verified, not reasoned about -- Task 12 report.)
+    //
+    // Why (a) has no blocking owner to steer to: under `heldDemandMissQ` the miss was
+    // ACCEPTED, which SG-1's `pfAcceptOk := !pfLookupSetBusy` only permits when no
+    // speculative slot owns its set. So a `pfBlockingArWant` for an accepted miss is
+    // all-zero by construction; there is nothing for the Mux to pick.
+    val pfChosenArSel = Mux(heldOnSetBusyQ, pfBlockingArSel, pfArSel)
     val pfChosenArMshr = (pfChosenArSel.resize(mshrIdxBits) +
                           U(AxiIds.I_SPEC_BASE, mshrIdxBits bits)).resize(mshrIdxBits)
     when(!arHoldValid) {
@@ -1844,8 +2037,16 @@ class IcachePlugin extends FiberPlugin with FetchService {
         arHoldValid := True
         arHoldId    := U(AxiIds.I_DEMAND, AxiIds.ID_W bits)
         arHoldAddr  := mshrPa(DEMAND_IDX) & ~U(63, 32 bits)
+      // M4: `demandStuck` -> `demandStuckQ`, and the `pfBlockingArAny` escape hatch is
+      // now QUALIFIED by `heldOnSetBusyQ`. Task 11 left it unqualified, so under case (a)
+      // the hatch could be opened by a blocking-owner match computed against a younger,
+      // unrelated command at the Stream boundary. Narrowing it is strictly more
+      // conservative and cannot deadlock: under (a) the demand fill is dispatched from
+      // S1 as soon as the FSM reaches IDLE (a bounded <= 3-cycle speculative install
+      // dwell, which needs no AR of its own), and the demand's OWN AR is launched by the
+      // higher-priority `refillActive` arm above, not by this one.
       } elsewhen(pfAnyArWant && !demandFillStart &&
-                 (!demandStuck || pfBlockingArAny)) {
+                 (!demandStuckQ || (heldOnSetBusyQ && pfBlockingArAny))) {
         arHoldValid := True
         arHoldId    := (pfChosenArSel.resize(AxiIds.ID_W) +
                         U(AxiIds.I_SPEC_BASE, AxiIds.ID_W bits)).resized
