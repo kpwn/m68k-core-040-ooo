@@ -322,3 +322,27 @@ puts "POSTROUTE_FULLCORE_WNS_NS $wns"
 set achieved [expr {1000.0/(4.000 - $wns)}]
 if {$wns < 0} { puts "POSTROUTE_FULLCORE_RESULT FAILED_AT_250  ACHIEVED_FMAX_MHZ $achieved" } else { puts "POSTROUTE_FULLCORE_RESULT MET_250  FMAX_MHZ $achieved" }
 puts "######################################################################"
+
+# SIGN-OFF CHECK against the real target (200 MHz / 5.000 ns), on the SAME
+# already-placed-and-routed implementation -- no re-place, no re-route, no
+# re-optimization. The 4.000 ns constraint above is an OPTIMIZATION PROBE:
+# targeting it directly makes phys_opt/route try harder and converges to a
+# BETTER result than targeting 5.000 ns directly does (confirmed 2026-08-14,
+# ledger sec 39 -- a matched-round-count 200MHz-target build plateaus
+# immediately and never catches up). This block answers the separate,
+# simpler question "does the design we actually built meet the real spec",
+# by re-checking timing on the fixed physical implementation against the
+# real target period. Setup slack scales exactly with period on a fixed
+# implementation (required_time = period - const), so this is a legitimate
+# sign-off re-check, not a second optimization pass -- do not read a WNS
+# from here as if the tool had tried to hit 200 MHz; it didn't need to.
+catch {
+  create_clock -name clk -period 5.000 [get_ports clk]
+  set p200 [get_timing_paths -max_paths 1 -nworst 1 -setup]
+  set wns200 [get_property SLACK $p200]
+  puts "########### SIGN-OFF @ 200MHz (real target, same routed netlist) ###########"
+  puts "SIGNOFF_200MHZ_WNS_NS $wns200"
+  if {$wns200 >= 0} { puts "SIGNOFF_200MHZ_RESULT MET_200" } else { puts "SIGNOFF_200MHZ_RESULT FAILED_AT_200" }
+  puts "##############################################################################"
+  create_clock -name clk -period 4.000 [get_ports clk]
+}
