@@ -1,0 +1,248 @@
+# FPU/FPSP Design
+
+**Status:** Design complete, approved, ready for `writing-plans`.
+
+**Goal:** Reverse this project's long-standing "FPU is permanently out of scope" convention.
+Implement a minimal hardware FPU sufficient to (a) let a real Motorola/Apple FPSP
+(trap-and-emulate software layer) run correctly, so real Mac System 7/68040 ROM software
+that depends on it is reachable, and (b) accelerate the hot/common FP operations in hardware
+rather than paying full trap-and-emulate cost for everything.
+
+**Architecture:** An 11-op hardware-native FPU folded into the existing CPLX execute cluster
+(shared with DIV/MUL/CHK/CMP2/CHK2), with a renamed FPCC extending the existing NZVC/X
+rename machinery, everything outside the 11-op baseline routed to a real FPSP kernel via
+genuine 68040 F-line/unimplemented-FP-instruction exception semantics.
+
+**Tech Stack:** SpinalHDL, existing rename/scoreboard/freelist infrastructure, existing CPLX
+EU/IQ-port/ROB-port, existing `PortedTestRunner`/`ProgramAssembler` test infrastructure.
+
+---
+
+## Background
+
+This design reverses the project's own `isa-completion-roadmap` convention that FPU/line-F
+was permanently out of scope. Motivation (2026-08-01, user-stated): real Mac ROM software
+depends on FPSP being reachable, and hardware acceleration of hot FP ops matters. This
+document consolidates a brainstorming session that ran across two sittings (2026-08-01,
+paused for the integer-feature-completeness push, and resumed 2026-08-14) into one coherent,
+approved design.
+
+Primary research inputs: ~2,500 lines of `m68k-ooo`'s real FPU RTL
+(`/home/qwertyoruiop/m68k-ooo/rtl/core/execute/fpu/`), Musashi's real FPU emulation core
+(`tools/musashi/musashi/m68kfpu.c`), and the real **MC68040 User's Manual** (Motorola, 1989,
+verified directly from `http://www.bitsavers.org/components/motorola/68000/68040/MC68040_Users_Manual_1989.pdf`
+— chosen deliberately over trusting a reference implementation's numbers, per this project's
+established practice of catching spec-conformance bugs by going to primary sources).
+
+## Locked Decisions
+
+### 1. Internal precision: 80-bit extended (REVERSED from the original 2026-08-01 decision)
+
+The 2026-08-01 session originally locked IEEE-754 double, explicitly rejecting 80-bit
+extended, accepting a weaker ±1-ULP/round-both-to-double Musashi comparison scheme as the
+cost. **This is reversed as of 2026-08-14**: internal FP register file and arithmetic are
+80-bit extended precision, matching real 68881/68882/68040 hardware.
+
+Rationale for the reversal, established this session:
+- **Musashi's actual internal representation is `floatx80`** (a portable SoftFloat 80-bit
+  extended type — not a platform-dependent `long double`), used natively for every FP
+  register, every arithmetic op, and every EA read/write (`tools/musashi/musashi/m68kfpu.c`,
+  `READ_EA_FPE`/`WRITE_EA_FPE`). This means **bit-exact lock-step on the 11 HW-native ops'
+  arithmetic results is achievable**, not merely a ±1-ULP approximation — a real upgrade over
+  the original plan's accepted verification compromise. (This does NOT extend to the FPSP
+  trap-boundary itself — see Decision 3's Musashi-gap list, unaffected by this choice.)
+- **FSAVE state frame fields are natively extended-precision** (ETS/ETE/ETM, FPTS/FPTE/FPTM
+  per the real MC68040 UM, Figure 9-7 — see Decision 7). With an 80-bit internal register
+  file, populating these frames is a direct copy; with a 64-bit double register file it would
+  require a genuine double-to-extended conversion on every FSAVE — exactly the class of bug
+  already flagged as a known m68k-ooo weakness (their EA-source conversion bit-reinterprets
+  rather than converts).
+- **Genuinely cheap, not just tolerable**: extended precision uses an *explicit* leading
+  mantissa bit (no implicit-bit packing/unpacking IEEE double requires), so arithmetic
+  hardware complexity doesn't scale linearly with the wider format. Register file grows
+  ~25% (80×16 vs 64×16 bits), execution datapath ~23% (64-bit vs 52-bit mantissa).
+- More faithful to real 68040 hardware generally: real silicon computes in extended
+  precision internally even for single/double-precision FMOVE operations to/from memory.
+
+### 2. Hardware op scope: match m68k-ooo's 11-op baseline
+
+FADD/FSUB/FMUL/FDIV/FSQRT/FABS/FNEG/FMOV/FCMP/FINT/FINTRZ implemented in hardware. Everything
+else (transcendentals, packed decimal, rounded-precision variants, FScc/FDBcc/FTRAPcc,
+double-precision memory source) traps to a real Motorola/Apple FPSP kernel, embedded
+byte-for-byte from an actual Quadra 700 ROM copy, per m68k-ooo's validated approach. Extend
+later based on real profiling once FPSP is running, not upfront guesswork. FScc/FDBcc/FTRAPcc
+hardware acceleration (an acknowledged m68k-ooo gap) explicitly deferred, not ruled out.
+
+### 3. Musashi oracle gaps: fix the cheap bridge gaps, work around the rest
+
+Extend `tools/musashi/m68k_ref.h` with FP register accessors (`get_fp`/`get_fpcr`/`get_fpsr`/
+`get_fpiar` reaching into `m68ki_cpu` directly, mirroring the existing int-register pattern at
+`m68k_ref.h:101-116`) to enable real FP-data-register lock-step, now bit-exact-capable per
+Decision 1. Do NOT attempt full parity: Musashi raises zero FP exceptions, has no
+unimplemented-instruction/data-type trap, wrong FSAVE frame shape (Musashi's own frame is
+28 bytes/format $1f, not the real 68040's 4/44/100-byte null/idle/unimplemented frames — see
+Decision 7), and has buggy multi-register FMOVEM EA handling. Use directed ROM-kernel tests
+for that surface instead (Decision 8).
+
+### 4. FPCC renaming: yes, extend the existing NZVC/X machinery
+
+FPCC (N/Z/I/NAN) is renamed, extending the existing NZVC/X rename/scoreboard/freelist
+machinery. This is the deliberate fix for m68k-ooo's single worst known defect: non-renamed
+FPCC forces a full ROB drain on every FBcc/FP-to-int move, measured IPC as low as 0.065-0.24
+on their FPU tests.
+
+### 5. FPCR/FPSR-exception-bits/FPIAR: non-renamed, single-copy state
+
+FPCR (rounding/exception-enable control), FPSR's non-FPCC bytes (exception-status/accrued/
+quotient), and FPIAR (last-FP-exception PC) are simple non-renamed architectural registers,
+written in-order — contrast with Decision 4's FPCC. None of these three sit on the
+speculative hot path FPCC does: FPCR changes rarely (explicit FMOVE-to-FPCR) and is read for
+rounding mode, not branched on; FPSR's exception-status bits are architecturally an
+in-order/precise-exception concept, updated at commit like this project's existing
+exception-frame capture pattern (e.g. `faultPc`); FPIAR is write-once-per-exception, read
+only by handlers. A single physical copy each with a simple interlock on the rare write is
+cheaper and simpler to get precise-exception-correct than extending rename to registers that
+gain nothing from speculative read-ahead.
+
+### 6. FP register file: 16 physical registers
+
+8 architectural FP0-FP7, each 80 bits (Decision 1), backed by 16 physical registers — matching
+this project's existing flag-RAT scale (`nzvcRat`/`xRat` both use 16 physical slots, 4-bit
+tags: `src/main/scala/m68k040/rename/RenameStage.scala:31-32`), not the larger ~2.5x
+int-PRF ratio (`intFree = Freelist(physCount = 50, archCount = 20, ...)`,
+`RenameStage.scala:34`). Justified because FP ops route through the shared CPLX cluster
+(Decision 9), which is inherently low-throughput/serialized — realistic in-flight FP writes
+at any moment will be far below ROB depth (64, `RobPlugin.scala:126`) regardless of PRF depth,
+so 16 gives 2x headroom over the architectural count without over-provisioning an 80-bit-wide
+register file for a constraint (rename depth) that isn't actually binding.
+
+### 7. Exception vector routing: real 68040 F-line/unimplemented-FP-instruction semantics
+
+Unsupported FP ops trap via vector 11 (unimplemented instruction — "Line 1111 Emulator") for
+the unimplemented-instruction path, and vectors 48-55 for the numeric-exception family — NOT
+a bespoke/novel trap type. User's own framing: "FPSP just lives off F-Line; so all we gotta do
+is implement a subset and leave the rest as F-line." The FPSP handler's own prologue
+instructions must decode as ordinary/HW-native so they don't self-trap (see Decision 8's
+self-recursion test).
+
+**Vector table, verified directly against the MC68040 User's Manual (1989), Chapter 9 exception
+vector assignment table — NOT copied from m68k-ooo, which has at least one confirmed-wrong
+vector:**
+
+| Vector | Offset | Assignment |
+|---|---|---|
+| 11 | $02C | Line 1111 Emulator (Unimplemented F-Line Opcode) |
+| 48 | $0C0 | FP Branch or Set on Unordered Condition (BSUN) |
+| 49 | $0C4 | FP Inexact Result (INEX2) |
+| 50 | $0C8 | FP Divide by Zero (DZ) |
+| 51 | $0CC | FP Underflow (UNFL) |
+| 52 | $0D0 | FP Operand Error (OPERR) |
+| 53 | $0D4 | FP Overflow (OVFL) |
+| 54 | $0D8 | FP Signaling NAN (SNAN) |
+| 55 | $0DC | FP Unimplemented Data Type |
+
+**Confirmed bug in m68k-ooo**: they use vector 49 for FDIV-by-zero; the real assignment is
+vector 50 (49 is Inexact Result). Do not port this mistake.
+
+Note: vector *number* assignment order above is NOT the same as exception *priority* order
+(which determines which exception wins when multiple are pending simultaneously). Per the
+manual, priority order is: BSUN, SNAN, OPERR, OVFL, UNFL, DZ, INEX2. Do not conflate the two
+orderings when implementing exception detection/dispatch logic.
+
+### 8. FPSP verification fixture: test fixture only, never shipped in RTL
+
+The CPU hardware's only job is the trap protocol; whatever FPSP a booted OS provides (e.g.
+real Mac ROM's own copy) is what actually runs in production. Reuse m68k-ooo's real extracted
+FPSP copy as the directed-test kernel (proven — caught 4 real deadlocks in m68k-ooo's own
+history) rather than writing a custom test-only handler.
+
+**No new test harness is needed.** This project already vendored m68k-ooo's entire directed
+test corpus (`tools/fuzz/vendor-ported-tests.sh` → `src/test/resources/m68kooo-ported-tests/asm/`,
+923 files), including **35 `fpu_*`/`fpsp_*` `.s` tests**, already wired through
+`PortedM68kOooSpec.scala` → `PortedTestRunner.scala` → `ProgramAssembler.assemble` (real GNU
+`m68k-linux-gnu-as`/`ld`/`objcopy` pipeline) → `AxiMemModel.attachProgramIFetch`. All 35 are
+currently expected failures (FPU out of scope until this design), tracked as such in this
+project's own triage history — they become the acceptance corpus as FPU work lands, watched
+to flip from FAIL to PASS.
+
+Two tests specifically validate the deepest parts of this design and require no new
+infrastructure:
+- **`fpu_fpsp_selfrecursion_repro.s`** — the self-recursion-guard test for the exact
+  "handler's own prologue re-traps into itself" deadlock class m68k-ooo hit 4 times on real
+  hardware. Installs a real vector-11 handler whose first instruction is the ROM's own
+  prologue opword (`FMOVEM.L FPIAR/FPSR/FPCR,-(A7)`, encoding `F227 BC00`), triggers a genuine
+  trap, and fails fast (sentinel `0xDEAD3001`) if re-entered before the first entry completes,
+  rather than spinning to a timeout.
+- **`fpsp_packed_kernel_e2e.s`** — embeds the actual Q700 ROM FPSP kernel bytes verbatim
+  (`.byte` directives, real ROM bytes at `[0x8D000..0x95000)`), executed at its native address,
+  triggered by a real `FMOVE.P` (packed decimal) trap through vector 11. Validates SP/A0
+  integrity across the trap, correct FSAVE frame size, and exactly-one kernel re-entry.
+
+### 9. EU integration: fold into the existing CPLX cluster
+
+FP ops fold into the existing CPLX cluster (DIV/MUL/CHK/CMP2/CHK2's shared multi-cycle EU +
+IQ port), the same pattern MUL used when added — NOT a dedicated new EU/IQ-port/ROB-port.
+Chosen given this project's LUT-bloat sensitivity, at the cost of FP ops contending with
+integer DIV/MUL/CHK for the same slot.
+
+## FSAVE/FRESTORE State Frames
+
+Verified directly against the MC68040 User's Manual, §9.7 and Figure 9-7 — this **corrects**
+the original session's recollection of "4/44/52/100 bytes, versions 0x40/0x41" (there is no
+52-byte frame; null and idle are both 4 bytes; the byte at offset $01 of the header is a
+**length-in-hex indicator**, not a format-type enum with values $40/$41 — those numbers in
+the busy-frame diagram are the FPU's internal *version number*, a silicon revision ID).
+
+Four state frame types the manual defines, of which this design implements three in full and
+scopes the fourth down:
+
+| Frame | Size | Header ($00) | Implemented |
+|---|---|---|---|
+| Null | 4 bytes | Version forced to `$00` (identifies null, not a length code); byte 1 undefined | **Yes, in full** |
+| Idle | 4 bytes | Real version number; byte 1 = `$00` (0 extra bytes) | **Yes, in full** |
+| Unimplemented FP instruction | 44 bytes (22 words) | Version; byte 1 = `$28` (40 extra bytes) | **Yes, in full** — this is the actual "route to FPSP" path |
+| Busy (numeric exceptions) | 100 bytes (50 words) | Version; byte 1 = `$60` (96 extra bytes) | **Deferred — see below** |
+
+**Unimplemented-instruction frame fields** (the one that matters for the FPSP-routing path):
+STAG/DTAG (3-bit source/dest operand-type tags), CMDREG1B (instruction command word), E1
+(unsupported-data-type flag), FPTS/FPTE/FPTM (destination operand, extended precision —
+direct copy from the 80-bit register file per Decision 1, no conversion needed), ETS/ETE/ETM
+(source operand, extended precision, same).
+
+**Busy frame — numeric-exception software-correction path DEFERRED.** This frame is packed
+with real-68040-microarchitecture fields this OoO design has no natural analog for:
+CU_SAVEPC (conversion-unit micro-PC, for mid-pipeline resumption), WBTS/WBTE/WBTM
+(writeback-buffer contents), CMDREG3B. It exists specifically so a real 68881/68882-compatible
+software-correction handler can bring the 68040's hardware-generated default result (for
+numeric exceptions like OVFL/UNFL/INEX2 that are enabled but don't stop execution) into
+bit-exact agreement with what a 68881/68882 would have produced. For the 11 HW-native ops,
+this design ships a correct default IEEE result on these exceptions without the
+software-correction step. Revisit only if real ROM software is found to depend on it —
+matches Decision 2's "extend later based on real profiling, not upfront guesswork" philosophy.
+
+**Version number**: real hardware's own busy-frame diagram example uses `$40`. This design
+does not need to match a specific real silicon stepping; `$40` is a reasonable default choice,
+finalized at implementation time (not a design blocker).
+
+## Verification Strategy
+
+Two independent surfaces, deliberately not conflated:
+
+1. **Arithmetic correctness of the 11 HW-native ops**: lock-step against Musashi, now
+   bit-exact-capable per Decision 1 (both sides use 80-bit extended `floatx80`/equivalent
+   internally). Extend `tools/musashi/m68k_ref.h` per Decision 3.
+2. **FPSP trap-boundary behavior** (exception delivery, FSAVE frame contents, self-recursion
+   safety, FPSP kernel execution): directed ROM-kernel tests, NOT lock-step (Musashi cannot
+   referee this surface regardless of internal precision — it has no real exception model,
+   wrong FSAVE frame shape, no unimplemented-instruction trap). Already-vendored 35
+   `fpu_*`/`fpsp_*` tests are the acceptance corpus (Decision 8) — no new harness needed.
+
+## Explicitly Out of Scope / Deferred
+
+- FScc/FDBcc/FTRAPcc hardware acceleration (Decision 2) — deferred, not ruled out.
+- Busy-frame numeric-exception software-correction path (FSAVE/FRESTORE section above) —
+  deferred, default IEEE result shipped instead for now.
+- Full Musashi FP-exception/FSAVE-frame parity (Decision 3) — Musashi's own emulation-core
+  limitations, worked around via directed tests instead.
+- FPSP itself is never shipped in this project's RTL (Decision 8) — a booted OS's own copy
+  runs; the CPU's only job is the trap protocol.
