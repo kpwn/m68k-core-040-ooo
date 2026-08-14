@@ -150,7 +150,8 @@ foreach stale {pb_decode pb_dcache pb_backend pb_frontend pb_fetch} {
 # The default changed on 2026-08-10 from `default` (place / phys_opt / route, one
 # pass each) to `postrouteN`, because a same-DCP sweep over the exact `6b246de`
 # netlist measured post-route physical optimisation as worth far more than any
-# floorplan.  Convergence curve, all from one run, `decode` floorplan:
+# floorplan.  Convergence curve, all from one run, `decode` floorplan (STALE netlist,
+# retained for the historical `default`-vs-`postrouteN` comparison only):
 #
 #   round 0 (= the old `default` flow)   WNS -2.094   164.096 MHz
 #   round 1                              WNS -1.623   177.841 MHz   (+13.75)
@@ -160,9 +161,27 @@ foreach stale {pb_decode pb_dcache pb_backend pb_frontend pb_fetch} {
 #   round 5                              WNS -1.463   183.050 MHz
 #   round 6                              WNS -1.463   183.050 MHz   (plateau)
 #
-# POSTROUTE_ROUNDS defaults to 3: that is 0.622 ns of the 0.631 ns the plateau
-# offers, for roughly half its wall time.  Set POSTROUTE_ROUNDS=1 for a fast gate
-# (still +13.75 MHz) or 6 to sit exactly on the plateau.
+# SUPERSEDED (2026-08-14, ledger, `bed9aad`, `decode+fetch` floorplan, current
+# netlist): the plateau above does NOT generalise -- on the post-UFA/VTL netlist
+# the convergence tail is much longer and the early "half the wall time for
+# 98.6% of the gain" trade this section used to justify round=3 is false here:
+#
+#   round 0    WNS -1.278   ~192.8 MHz         round 7   WNS -0.986   200.56 MHz
+#   round 1    WNS -1.157   ~195.6 MHz         round 8   WNS -0.969   200.97 MHz
+#   round 2    WNS -1.135   ~196.1 MHz         round 9   WNS -0.964   201.45 MHz  (plateau)
+#   round 3    WNS -1.117   195.427 MHz        round 10  WNS -0.964   201.45 MHz
+#   round 4    WNS -1.099   ~196.5 MHz         round 11  WNS -0.964   201.45 MHz
+#   round 5    WNS -1.114   ~196.1 MHz         round 12  WNS -0.964   201.45 MHz
+#   round 6    WNS -1.028   ~198.6 MHz
+#
+# Non-monotonic (round 5 regresses from round 4, then round 6-9 jump well past
+# both) -- this is NOT a smooth convergence, more rounds can still be worth
+# trying on a future netlist even after an apparent local plateau. round=3 was
+# stopping at 195.427 MHz, 6 MHz short of where round=9 actually plateaus
+# (201.450 MHz, confirmed identical across 4 consecutive rounds, 0 errors, hold
+# met, same CLB LUT/FF/BRAM as round 3). POSTROUTE_ROUNDS now defaults to 9.
+# Re-derive this curve after any RTL or floorplan change that touches the
+# frontend/D-cache/IssueQueue clusters -- do not assume it transfers.
 #
 # `default` is retained verbatim so every physical number published in the handoff
 # before section 18 regenerates unchanged -- use IMPL_STRATEGY=default to compare
@@ -214,7 +233,7 @@ if {$impl_strategy eq "default"} {
   # printed so one run yields the whole convergence curve instead of one point.
   # POSTROUTE_ROUNDS (default 3) sets the number of post-route rounds; see the
   # measured curve in the IMPL_STRATEGY comment above.
-  set rounds 3
+  set rounds 9
   if {[info exists ::env(POSTROUTE_ROUNDS)]} { set rounds $::env(POSTROUTE_ROUNDS) }
   # `exploreN` changes THREE things at once relative to `postrouteN` (placer
   # directive, phys-opt directive, router directive) and measured WORSE on WNS
