@@ -36,7 +36,8 @@ case class BranchCompletion() extends Bundle {
   * entry faulted + the carried vector. The stacked PC (= nextPc for the group-2
   * traps, = the transfer instruction's OWN pc for address error — see
   * MicroOpAssembler's ibrUop.faultUsesNextPc=False) is already captured per-entry
-  * at alloc (faultPcStore / pcStore), so normally only {robId, vector} would be
+  * at alloc (payload.pc/predNextPc + the faultUsesNextPc selector), so normally
+  * only {robId, vector} would be
   * needed here (cf. lsFaultCompletion, which must also carry the execute-computed
   * EA). Address error is the one exception: its format-$2 frame's extra "ADDRESS"
   * word (SP+8) must carry the faulting ODD TARGET, which is only known at execute
@@ -314,7 +315,7 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     // control transfer to an odd target; it delivers vector 3, ALSO a format-$2 frame,
     // but with the frame's extra "ADDRESS" word (SP+8) carrying the faulting target
     // (`faultAddr`) rather than the instruction's own PC (which the PPC/PC fields
-    // already get for free via faultPcStore's alloc-time capture — see ibrUop's
+    // already get for free via the ROB payload's alloc-time capture — see ibrUop's
     // faultUsesNextPc=False in MicroOpAssembler). The two fault sources are mutually
     // exclusive: isCondTrap ops force rawRedirect (hence addrErr) False above.
     trapvFaultPort.valid             := s1Valid && ((u1.isCondTrap && taken) || addrErr)

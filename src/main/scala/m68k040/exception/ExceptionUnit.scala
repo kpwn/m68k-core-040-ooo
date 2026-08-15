@@ -756,8 +756,9 @@ class ExceptionUnit(
         // instruction's OWN pc (retry-after-fix semantics — the test corpus's
         // handlers patch the frame and RTE back to re-attempt the same transfer).
         // That already falls out for free: ibrUop/relative-branch µops all default
-        // faultUsesNextPc=False, so faultPcStore already holds the instruction's own
-        // pc at alloc (see RobPlugin's faultPcStore comment) -> entryPc IS that pc.
+        // faultUsesNextPc=False, so the ROB's fault-PC mux already yields the
+        // instruction's own pc (payload capture at alloc, see RobPlugin's
+        // exceptionPc comment) -> entryPc IS that pc.
         // Vector 9 (TRACE, task #193) is ALSO a format-$2, 12-byte frame — confirmed
         // against BOTH Musashi (m68ki_exception_trace -> m68ki_stack_frame_0010 for
         // any CPU_TYPE above 68010) and the ported test corpus itself
