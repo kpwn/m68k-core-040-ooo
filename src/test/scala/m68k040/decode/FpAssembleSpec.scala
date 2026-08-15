@@ -60,4 +60,253 @@ class FpAssembleSpec extends AnyFunSuite {
       assert(dut.uop.faultVector.toInt == 4 && !dut.uop.faultUsesNextPc.toBoolean, "generic illegal vector 4, faulting PC")
     }
   }
+
+  // ── Step 6: FP-emission directed tests ──────────────────────────────────────
+
+  test("FADD FP1,FP0 emits one CPLX FP uop: dyadic reads FPn, source FPm, writes FPn+FPCC", VerilatorTest) {
+    run { dut =>
+      drive(dut, op = 0xF200, ext = 0x0422, len = 2); sleep(1)   // opclass 000, src FP1, dst FP0, opmode 0x22
+      assert(!dut.uop.faulted.toBoolean, "FADD is hardware-native -- it must not trap")
+      assert(dut.uop.op.toEnum == DecOp.FPU && dut.uop.cluster.toEnum == Cluster.CPLX)
+      assert(dut.uop.fpuOp.toInt == 0x22, s"fpuOp must be the raw opmode 0x22, got 0x${dut.uop.fpuOp.toInt.toHexString}")
+      assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.FPREG)
+      assert(dut.uop.usesFpSrcA.toBoolean && dut.uop.fpSrcAReg.toInt == 0,
+        "a DYADIC op reads its destination FP0 as an operand")
+      assert(dut.uop.usesFpSrcB.toBoolean && dut.uop.fpSrcBReg.toInt == 1, "source is FP1")
+      assert(dut.uop.writesFp.toBoolean && dut.uop.fpDstReg.toInt == 0, "destination is FP0")
+      assert(dut.uop.writesFpcc.toBoolean, "every FP op writes FPCC")
+      assert(!dut.uop.readsFpcc.toBoolean, "nothing reads FPCC yet (FBcc/FScc deferred)")
+      assert(!dut.uop.dstValid.toBoolean && !dut.uop.srcAValid.toBoolean && !dut.uop.srcBValid.toBoolean,
+        "an FP register-form uop touches NO integer registers")
+      assert(!dut.uop.writesNzvc.toBoolean && !dut.uop.writesX.toBoolean, "FP ops never touch the integer CCR")
+      assert(dut.uop.firstOfInstr.toBoolean, "single uop -- it is the macro boundary")
+    }
+  }
+
+  test("monadic FP ops do NOT read their destination (no false RAW dependency)", VerilatorTest) {
+    run { dut =>
+      // FABS FP2,FP3 : opclass 000, src FP2, dst FP3, opmode 0x18 -> ext = 0x09 98
+      drive(dut, op = 0xF200, ext = 0x0998, len = 2); sleep(1)
+      assert(!dut.uop.faulted.toBoolean && dut.uop.fpuOp.toInt == 0x18)
+      assert(!dut.uop.usesFpSrcA.toBoolean, "FABS is monadic -- it must not claim its destination as a source")
+      assert(dut.uop.usesFpSrcB.toBoolean && dut.uop.fpSrcBReg.toInt == 2)
+      assert(dut.uop.writesFp.toBoolean && dut.uop.fpDstReg.toInt == 3)
+    }
+  }
+
+  test("FCMP and FTST write ONLY the condition codes", VerilatorTest) {
+    run { dut =>
+      drive(dut, op = 0xF200, ext = 0x04B8, len = 2); sleep(1)   // FCMP FP1,FP1: opmode 0x38, src FP1, dst FP1
+      assert(!dut.uop.faulted.toBoolean && dut.uop.fpuOp.toInt == 0x38)
+      assert(!dut.uop.writesFp.toBoolean, "FCMP writes no FP register")
+      assert(dut.uop.writesFpcc.toBoolean, "FCMP writes FPCC")
+      assert(dut.uop.usesFpSrcA.toBoolean, "FCMP is dyadic -- it reads the destination operand")
+      drive(dut, op = 0xF200, ext = 0x003A, len = 2); sleep(1)   // FTST FP0
+      assert(!dut.uop.faulted.toBoolean && dut.uop.fpuOp.toInt == 0x3A)
+      assert(!dut.uop.writesFp.toBoolean && dut.uop.writesFpcc.toBoolean)
+      assert(!dut.uop.usesFpSrcA.toBoolean, "FTST is monadic (a classifier, not a compare against zero)")
+    }
+  }
+
+  test("FMOVE.L D3,FP0 sources an INTEGER register on the ordinary int rename path", VerilatorTest) {
+    run { dut =>
+      // opclass 010, source specifier 000 (long int), <ea> = mode 0 reg 3, opmode 0x00
+      drive(dut, op = 0xF203, ext = 0x4000, len = 2); sleep(1)
+      assert(!dut.uop.faulted.toBoolean)
+      assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.INTREG)
+      assert(dut.uop.srcAValid.toBoolean && dut.uop.srcAReg.toInt == 3, "int source is D3 via srcA")
+      assert(!dut.uop.usesFpSrcB.toBoolean, "no FP register source in the int-source form")
+      assert(!dut.uop.usesFpSrcA.toBoolean, "FMOVE is monadic")
+      assert(dut.uop.writesFp.toBoolean && dut.uop.fpDstReg.toInt == 0)
+      assert(dut.uop.size.toEnum == Size.LONG)
+      assert(dut.uop.fpSrcFmt.toInt == 0, "fpSrcFmt carries ext[12:10] verbatim (000 = Long)")
+    }
+  }
+
+  test("FMOVE.S D3,FP0 sets fpSrcFmt=Single (distinguishes int-register Long vs Single)", VerilatorTest) {
+    run { dut =>
+      // opclass 010, source specifier 001 (single), <ea> = mode 0 reg 3, opmode 0x00
+      drive(dut, op = 0xF203, ext = 0x4400, len = 2); sleep(1)
+      assert(!dut.uop.faulted.toBoolean)
+      assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.INTREG, "still an int-register READ -- the bit pattern rides Dn")
+      assert(dut.uop.fpSrcFmt.toInt == 1, "fpSrcFmt=001 (Single) -- this is what tells Task 8 NOT to convert as an integer")
+      assert(dut.uop.size.toEnum == Size.LONG, "size alone cannot distinguish Long vs Single -- both read a full 32-bit Dn")
+    }
+  }
+
+  test("FMOVECR #$0F,FP0 sources the constant ROM via imm, no register source", VerilatorTest) {
+    run { dut =>
+      drive(dut, op = 0xF200, ext = 0x5C0F, len = 2); sleep(1)   // Musashi's own documented literal
+      assert(!dut.uop.faulted.toBoolean)
+      assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.ROMCONST)
+      assert(dut.uop.useImm.toBoolean && dut.uop.imm.toInt == 0x0F, "the ROM offset rides imm")
+      assert(!dut.uop.usesFpSrcA.toBoolean && !dut.uop.usesFpSrcB.toBoolean && !dut.uop.srcAValid.toBoolean)
+      assert(dut.uop.writesFp.toBoolean && dut.uop.fpDstReg.toInt == 0 && dut.uop.writesFpcc.toBoolean)
+    }
+  }
+
+  // ── Immediate-source forms (this deliverable's extended scope) ───────────────
+  // <ea> = mode 7 / reg 4 (#imm) for every case below: op = 0xF200 | (7<<3) | 4 = 0xF23C.
+  // opmode 0x22 = FADD (dyadic, hardware-native) in every case, so any observed fault
+  // would prove a real bug, not an expected native-opmode exclusion.
+  val immOp = 0xF23C
+
+  test("FADD.L #$12345678,FP0 : 32-bit int immediate, INTIMM, no sign-extension needed", VerilatorTest) {
+    run { dut =>
+      // ext: opclass 010, src spec 000 (Long), dst FP0, opmode 0x22 -> 0x4022
+      drive(dut, op = immOp, ext = 0x4022, ext2 = 0x1234, len = 4)
+      dut.pkt.words(3) #= 0x5678
+      sleep(1)
+      assert(!dut.uop.faulted.toBoolean, "FADD.L #imm is hardware-native -- must not trap")
+      assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.INTIMM)
+      assert(dut.uop.fpSrcFmt.toInt == 0, "fpSrcFmt=000 (Long)")
+      assert(!dut.uop.useImm.toBoolean, "imm/useImm stay reserved for FMOVECR -- these ride fpWideImm")
+      assert(dut.uop.fpWideImm.toBigInt == BigInt("0000000012345678", 16),
+        f"fpWideImm must be the 32-bit value zero-extended to 80 bits, got 0x${dut.uop.fpWideImm.toBigInt.toString(16)}")
+      assert(dut.uop.usesFpSrcB.toBoolean == false && dut.uop.srcAValid.toBoolean == false,
+        "no register source of any kind for an immediate form")
+      assert(dut.uop.usesFpSrcA.toBoolean, "FADD is dyadic -- it still reads its destination FP0")
+    }
+  }
+
+  test("FADD.W #$8000,FP0 : 16-bit int immediate SIGN-EXTENDS a negative value to 32 bits", VerilatorTest) {
+    run { dut =>
+      // ext: opclass 010, src spec 100 (Word), dst FP0, opmode 0x22 -> 0x5022
+      drive(dut, op = immOp, ext = 0x5022, ext2 = 0x8000, len = 3); sleep(1)
+      assert(!dut.uop.faulted.toBoolean)
+      assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.INTIMM)
+      assert(dut.uop.fpSrcFmt.toInt == 4, "fpSrcFmt=100 (Word)")
+      val lo32 = dut.uop.fpWideImm.toBigInt & BigInt("FFFFFFFF", 16)
+      assert(lo32 == BigInt("FFFF8000", 16),
+        f"word 0x8000 (-32768) must sign-extend to 0xFFFF8000, got 0x${lo32.toString(16)}")
+      assert((dut.uop.fpWideImm.toBigInt >> 32) == 0, "upper 48 bits must be zero-padded")
+    }
+  }
+
+  test("FADD.B #$80,FP0 : 8-bit int immediate SIGN-EXTENDS a negative value to 32 bits", VerilatorTest) {
+    run { dut =>
+      // ext: opclass 010, src spec 110 (Byte), dst FP0, opmode 0x22 -> 0x5822
+      drive(dut, op = immOp, ext = 0x5822, ext2 = 0x0080, len = 3); sleep(1)
+      assert(!dut.uop.faulted.toBoolean)
+      assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.INTIMM)
+      assert(dut.uop.fpSrcFmt.toInt == 6, "fpSrcFmt=110 (Byte)")
+      val lo32 = dut.uop.fpWideImm.toBigInt & BigInt("FFFFFFFF", 16)
+      assert(lo32 == BigInt("FFFFFF80", 16),
+        f"byte 0x80 (-128) must sign-extend to 0xFFFFFF80, got 0x${lo32.toString(16)}")
+      assert((dut.uop.fpWideImm.toBigInt >> 32) == 0, "upper 48 bits must be zero-padded")
+    }
+  }
+
+  test("FADD.S #$3F800000,FP0 vs FADD.L #$3F800000,FP0 : the SAME bit pattern must be tagged differently " +
+       "(Single bit-pattern vs Long integer) -- fpSrcKind/fpSrcFmt are the discriminator, not size", VerilatorTest) {
+    run { dut =>
+      // Single: ext opclass 010, src spec 001, dst FP0, opmode 0x22 -> 0x4422
+      drive(dut, op = immOp, ext = 0x4422, ext2 = 0x3F80, len = 4); sleep(1)
+      assert(!dut.uop.faulted.toBoolean)
+      assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.SINGLEIMM,
+        "0x3F800000 with a Single source specifier must be tagged SINGLEIMM, never converted as an integer " +
+        "(misrouting it through INTREG/INTIMM would silently mean 1065353216 instead of 1.0f)")
+      assert(dut.uop.fpSrcFmt.toInt == 1, "fpSrcFmt=001 (Single)")
+      assert((dut.uop.fpWideImm.toBigInt & BigInt("FFFFFFFF", 16)) == BigInt("3F800000", 16),
+        "the bit pattern rides through VERBATIM, unconverted")
+
+      // Long, same raw bits: ext opclass 010, src spec 000, dst FP0, opmode 0x22 -> 0x4022
+      drive(dut, op = immOp, ext = 0x4022, ext2 = 0x3F80, len = 4); sleep(1)
+      assert(!dut.uop.faulted.toBoolean)
+      assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.INTIMM,
+        "the IDENTICAL bit pattern 0x3F800000 with a Long source specifier must be tagged INTIMM -- " +
+        "Task 8 converts this as the INTEGER 1065353216, not the float 1.0")
+      assert(dut.uop.fpSrcFmt.toInt == 0, "fpSrcFmt=000 (Long)")
+      assert((dut.uop.fpWideImm.toBigInt & BigInt("FFFFFFFF", 16)) == BigInt("3F800000", 16),
+        "the raw bits are identical -- only fpSrcKind/fpSrcFmt tell Long and Single apart")
+    }
+  }
+
+  test("FADD.D #imm,FP0 : 64-bit double bit-pattern immediate rides fpWideImm verbatim", VerilatorTest) {
+    run { dut =>
+      // pi in IEEE-754 double: 0x400921FB54442D18
+      // ext: opclass 010, src spec 101 (Double), dst FP0, opmode 0x22 -> 0x5422
+      // drive() only pokes words(0..4); word(5) is poked directly below.
+      drive(dut, op = immOp, ext = 0x5422, ext2 = 0x4009, len = 6)
+      dut.pkt.words(3) #= 0x21FB; dut.pkt.words(4) #= 0x5444; dut.pkt.words(5) #= 0x2D18
+      sleep(1)
+      assert(!dut.uop.faulted.toBoolean)
+      assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.DOUBLEIMM)
+      assert(dut.uop.fpSrcFmt.toInt == 5, "fpSrcFmt=101 (Double)")
+      val got = dut.uop.fpWideImm.toBigInt
+      val want = BigInt("400921FB54442D18", 16)
+      assert(got == want,
+        f"fpWideImm must be the 64-bit bit pattern zero-extended to 80 bits, want 0x${want.toString(16)}, got 0x${got.toString(16)}")
+    }
+  }
+
+  test("FADD.X #imm,FP0 : 80-bit extended immediate skips the RESERVED word (Musashi READ_EA_FPE case 4)", VerilatorTest) {
+    run { dut =>
+      // ext: opclass 010, src spec 010 (Extended), dst FP0, opmode 0x22 -> 0x4822
+      // Layout: word2=sign+exp (0x3FFF, i.e. 1.0x's biased exponent), word3=RESERVED
+      // (poisoned with 0xDEAD to prove it is skipped, not folded in), words4-7=mantissa.
+      dut.pkt.valid #= true; dut.pkt.pc #= 0x2000; dut.pkt.simple #= true; dut.pkt.complex #= false
+      dut.pkt.lenWords #= 8; dut.pkt.wordCount #= 8; dut.pkt.fault #= false
+      dut.pkt.words(0) #= immOp; dut.pkt.words(1) #= 0x4822
+      dut.pkt.words(2) #= 0x3FFF; dut.pkt.words(3) #= 0xDEAD
+      dut.pkt.words(4) #= 0x8000; dut.pkt.words(5) #= 0x0000
+      dut.pkt.words(6) #= 0x0000; dut.pkt.words(7) #= 0x0000
+      sleep(1)
+      assert(!dut.uop.faulted.toBoolean)
+      assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.EXTIMM)
+      assert(dut.uop.fpSrcFmt.toInt == 2, "fpSrcFmt=010 (Extended)")
+      val got = dut.uop.fpWideImm.toBigInt
+      // word2(16)##word4(16)##word5(16)##word6(16)##word7(16) = 3FFF|8000|0000|0000|0000
+      val want = BigInt("3FFF8000000000000000", 16)
+      assert(got == want,
+        f"fpWideImm must be word2##word4##word5##word6##word7 = 0x${want.toString(16)}, " +
+        f"got 0x${got.toString(16)} -- if the RESERVED word (0xDEAD) leaked in, this proves it was NOT skipped")
+    }
+  }
+
+  test("FADD.P #imm,FP0 : packed decimal immediate is EXCLUDED regardless of opmode (Decision 2)", VerilatorTest) {
+    run { dut =>
+      // ext: opclass 010, src spec 011 (Packed), dst FP0, opmode 0x22 (FADD, hardware-native)
+      // -> 0x4C22. Packed immediates consume 6 words (Task 5's fpImmWords table) -> len=8.
+      drive(dut, op = immOp, ext = 0x4C22, len = 8); sleep(1)
+      assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 11,
+        "packed decimal must trap to vector 11 even though FADD is a native opmode")
+      assert(dut.uop.faultUsesNextPc.toBoolean, "framed (len=8), so FPSP must be able to RTE past it")
+      assert(!dut.uop.writesFp.toBoolean && !dut.uop.writesFpcc.toBoolean,
+        "no FP side effect on the trapping uop")
+      assert(dut.uop.nextPc.toLong == 0x2010L, "nextPc = pc + 2*8 = 0x2010")
+    }
+  }
+
+  test("out-of-scope cpGEN forms still trap to vector 11 -- with the post-instruction PC", VerilatorTest) {
+    run { dut =>
+      def trapsWithNextPc(op: Int, ext: Int, len: Int, name: String): Unit = {
+        drive(dut, op = op, ext = ext, len = len); sleep(1)
+        assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 11, s"$name must trap to vector 11")
+        assert(dut.uop.faultUsesNextPc.toBoolean, s"$name is framed, so FPSP must be able to RTE past it")
+        assert(!dut.uop.writesFp.toBoolean && !dut.uop.writesFpcc.toBoolean,
+          s"$name must leave no FP side effect on the trapping uop")
+      }
+      trapsWithNextPc(0xF200, 0x000E, 2, "FSIN (transcendental -> FPSP)")
+      trapsWithNextPc(0xF200, 0x0462, 2, "FSADD (rounded-precision variant, opmode bit6 -> FPSP)")
+      trapsWithNextPc(0xF210, 0x4022, 2, "FADD.L (A0),FP0 (memory source -> Task 6b)")
+      trapsWithNextPc(0xF210, 0x5822, 2, "FADD.P (A0),FP0 (packed decimal -> FPSP)")
+      trapsWithNextPc(0xF210, 0x6800, 2, "FMOVE.X FP0,(A0) (opclass 011, store direction -> unowned)")
+      trapsWithNextPc(0xF210, 0xD0FF, 2, "FMOVEM.X (A0),FP0-FP7 (opclass 110 -> unowned)")
+      trapsWithNextPc(0xF210, 0x9000, 2, "FMOVE.L (A0),FPCR (opclass 100, memory-EA -> unowned; Task 9 covers only register-direct <ea>, and Task 9b's optional popcount==1-with-memory-EA extension is not guaranteed landed by default)")
+    }
+  }
+
+  test("an FP uop never escapes with an inconsistent framing view", VerilatorTest) {
+    run { dut =>
+      // A cpGEN opword that predecode did NOT frame (len 1) must never emit an FP uop:
+      // emitting one would compute nextPc = pc+2 for a >=2-word instruction (wild PC).
+      drive(dut, op = 0xF200, ext = 0x0422, len = 1); sleep(1)
+      assert(dut.uop.faulted.toBoolean, "an unframed cpGEN packet must trap, not emit")
+      assert(!dut.uop.writesFp.toBoolean && dut.uop.op.toEnum != DecOp.FPU)
+      // Likewise for a COMPLEX packet.
+      drive(dut, op = 0xF200, ext = 0x0422, len = 2, simple = false); sleep(1)
+      assert(dut.uop.faulted.toBoolean, "a complex packet must trap, not emit")
+    }
+  }
 }

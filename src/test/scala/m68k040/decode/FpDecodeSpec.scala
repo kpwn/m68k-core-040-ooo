@@ -11,9 +11,14 @@ import org.scalatest.funsuite.AnyFunSuite
   *
   * Two independent things are proven here: (1) OperationDecoder recognizes exactly the
   * `1111 001 000 mmmrrr` band and nothing else -- in particular it does NOT swallow the
-  * existing CPUSH/CINV/PFLUSH/PTEST/MOVE16/FSF line-F carve-outs; and (2) the assembler
-  * still delivers the ordinary vector-11 F-line trap for every cpGEN encoding, i.e. this
-  * task is behavior-neutral until Task 6.
+  * existing CPUSH/CINV/PFLUSH/PTEST/MOVE16/FSF line-F carve-outs; and (2) [UPDATED for
+  * Task 6] the assembler now emits a real DecOp.FPU uop for the hardware-native,
+  * single-uop cpGEN forms (Task 6's scope) instead of trapping -- this file's own second
+  * test used to assert "still traps, behavior-neutral until Task 6"; now that Task 6 has
+  * landed, that assertion is checked against the OPPOSITE, correct outcome below. The
+  * full emission behavior (operand routing, monadic/dyadic RAW rules, immediate-source
+  * forms, out-of-scope forms still trapping) is exercised in depth by FpAssembleSpec --
+  * this file stays scoped to the narrow classification claim its docstring describes.
   */
 class FpDecodeSpec extends AnyFunSuite {
   class SpecDut extends Component {
@@ -75,7 +80,11 @@ class FpDecodeSpec extends AnyFunSuite {
     }
   }
 
-  test("until Task 6, every cpGEN encoding still takes the vector-11 F-line trap", VerilatorTest) {
+  // Was "until Task 6, every cpGEN encoding still takes the vector-11 F-line trap" --
+  // Task 6 now emits real hardware-native cpGEN forms, so this asserts the OPPOSITE of
+  // what it used to (see the file's updated docstring). FpAssembleSpec.scala carries the
+  // full directed coverage of Task 6's emission behavior; this stays a single smoke case.
+  test("Task 6: a hardware-native cpGEN encoding (FADD FPm,FPn) now EMITS instead of trapping", VerilatorTest) {
     SimConfig.withVerilator.compile(new AsmDut).doSim { dut =>
       // FADD FP1,FP0 = F200 0422 (opclass 000, src FP1, dst FP0, opmode 0x22).
       dut.pkt.valid #= true; dut.pkt.pc #= 0x1000; dut.pkt.simple #= true; dut.pkt.complex #= false
@@ -83,7 +92,25 @@ class FpDecodeSpec extends AnyFunSuite {
       dut.pkt.words(0) #= 0xF200; dut.pkt.words(1) #= 0x0422
       dut.pkt.words(2) #= 0; dut.pkt.words(3) #= 0; dut.pkt.words(4) #= 0
       sleep(1)
-      assert(dut.uop.faulted.toBoolean, "cpGEN must still fault before Task 6")
+      assert(!dut.uop.faulted.toBoolean, "FADD FPm,FPn is hardware-native -- Task 6 emits it, it must not fault")
+      assert(dut.uop.op.toEnum == DecOp.FPU && dut.uop.cluster.toEnum == Cluster.CPLX)
+      assert(dut.uop.writesFp.toBoolean && dut.uop.writesFpcc.toBoolean,
+        "the emitted uop DOES have FP side effects now -- that is the whole point of Task 6")
+    }
+  }
+
+  // A cpGEN encoding OUTSIDE Task 6's scope (a transcendental opmode, FSIN) must still
+  // take the ordinary vector-11 F-line trap -- this is what the OLD test's claim
+  // actually remains true for, narrowed to the non-emitted subset.
+  test("a cpGEN encoding outside Task 6's scope (FSIN) still takes the vector-11 F-line trap", VerilatorTest) {
+    SimConfig.withVerilator.compile(new AsmDut).doSim { dut =>
+      // FSIN FP0,FP0 = F200 000E (opclass 000, src FP0, dst FP0, opmode 0x0E -- not native).
+      dut.pkt.valid #= true; dut.pkt.pc #= 0x1000; dut.pkt.simple #= true; dut.pkt.complex #= false
+      dut.pkt.lenWords #= 2; dut.pkt.wordCount #= 2; dut.pkt.fault #= false
+      dut.pkt.words(0) #= 0xF200; dut.pkt.words(1) #= 0x000E
+      dut.pkt.words(2) #= 0; dut.pkt.words(3) #= 0; dut.pkt.words(4) #= 0
+      sleep(1)
+      assert(dut.uop.faulted.toBoolean, "FSIN is outside Task 6's scope -- it must still fault")
       assert(dut.uop.faultVector.toInt == 11, s"F-line vector 11, got ${dut.uop.faultVector.toInt}")
       assert(dut.uop.unimplemented.toBoolean, "the trap uop is the generic unimplemented one")
       assert(!dut.uop.writesFp.toBoolean && !dut.uop.writesFpcc.toBoolean,

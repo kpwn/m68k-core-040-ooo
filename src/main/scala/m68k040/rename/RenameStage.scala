@@ -130,26 +130,6 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     val fire = du.uops.fire
     val uop1Sig = du.uops.valid && du.uop1Valid
 
-    // ── FP data / FPCC decode-field stubs ───────────────────────────────────────
-    // Task 6 has not yet landed DecodedUop's FP fields (fpSrcAReg/fpSrcBReg/
-    // fpDstReg/usesFpSrcA/usesFpSrcB/writesFp/readsFpcc/writesFpcc) -- this task
-    // (Task 2) is pure rename-stage plumbing, sequenced before Task 6. Stub every
-    // one of them to inert (0/False) constants so the FP/FPCC RAT+freelist wiring
-    // below elaborates and exercises real hardware for everything except the
-    // not-yet-existing decode source. No fpRat/fpccRat write or freelist pop can
-    // ever fire while these stubs are in place (writesFp/writesFpcc are hard
-    // False), so this cannot corrupt any downstream consumer.
-    // TODO(Task 6): delete this stub block and wire the real dec.fp* fields once
-    // DecodedUop grows them.
-    val fpStubSrcAReg   = U(0, 3 bits)
-    val fpStubSrcBReg   = U(0, 3 bits)
-    val fpStubDstReg    = U(0, 3 bits)
-    val fpStubUsesSrcA  = False
-    val fpStubUsesSrcB  = False
-    val fpStubWritesFp  = False
-    val fpStubReadsFpcc = False
-    val fpStubWritesFpcc = False
-
     // ── Per-slot rename ────────────────────────────────────────────────────────
     // Build raw (pre-bypass) renamed uops, then apply intra-group bypass for slot1.
     val raw = Vec(RenamedUop(), 2)
@@ -177,9 +157,9 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       // FP data RAT: 2 src reads + 1 dst-old read per slot (read-port-budget note
       // above). FPCC RAT: single architectural entry, addr hardwired to 0 (the
       // nzvcRat/xRat pattern).
-      fpRat.io.reads(2 * s).addr     := fpStubSrcAReg
-      fpRat.io.reads(2 * s + 1).addr := fpStubSrcBReg
-      fpRat.io.reads(4 + s).addr     := fpStubDstReg
+      fpRat.io.reads(2 * s).addr     := dec.fpSrcAReg
+      fpRat.io.reads(2 * s + 1).addr := dec.fpSrcBReg
+      fpRat.io.reads(4 + s).addr     := dec.fpDstReg
       fpccRat.io.reads(s).addr := 0
 
       // copy decoded fields
@@ -244,6 +224,10 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.phtValid     := dec.phtValid
       r.phtIndex     := dec.phtIndex
       r.casForm      := dec.casForm
+      r.fpuOp        := dec.fpuOp
+      r.fpSrcKind    := dec.fpSrcKind
+      r.fpSrcFmt     := dec.fpSrcFmt
+      r.fpWideImm    := dec.fpWideImm
 
       // architectural int dst reg (threaded for commit RAT update + CommitTrace)
       r.dstArch    := dec.dstReg
@@ -291,27 +275,29 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       xRat.io.writes(s).addr  := 0
       xRat.io.writes(s).data  := xFree.io.pop(s).id
 
-      // FP data src + dst (stubbed decode source, see note above -- Task 6)
+      // FP data src + dst (Task 6 lands the real decode source: MicroOpAssembler's
+      // fpEmit arm drives dec.fpSrcAReg/fpSrcBReg/fpDstReg/usesFpSrcA/usesFpSrcB/
+      // writesFp; every non-FP construction site keeps them inert via fpInert()).
       r.pFpSrcA      := fpRat.io.reads(2 * s).data
-      r.psrcAFpValid := fpStubUsesSrcA
+      r.psrcAFpValid := dec.usesFpSrcA
       r.pFpSrcB      := fpRat.io.reads(2 * s + 1).data
-      r.psrcBFpValid := fpStubUsesSrcB
+      r.psrcBFpValid := dec.usesFpSrcB
       r.pFpOld       := fpRat.io.reads(4 + s).data
-      fpFree.io.pop(s).take := slotEn && fpStubWritesFp
+      fpFree.io.pop(s).take := slotEn && dec.writesFp
       r.pFpDst       := fpFree.io.pop(s).id
-      r.pFpDstValid  := fpStubWritesFp
-      fpRat.io.writes(s).valid := slotEn && fpStubWritesFp
-      fpRat.io.writes(s).addr  := fpStubDstReg
+      r.pFpDstValid  := dec.writesFp
+      fpRat.io.writes(s).valid := slotEn && dec.writesFp
+      fpRat.io.writes(s).addr  := dec.fpDstReg
       fpRat.io.writes(s).data  := fpFree.io.pop(s).id
 
       // FPCC src + dst
       r.pFpccSrc  := fpccRat.io.reads(s).data
-      r.readsFpcc := fpStubReadsFpcc
-      fpccFree.io.pop(s).take := slotEn && fpStubWritesFpcc
+      r.readsFpcc := dec.readsFpcc
+      fpccFree.io.pop(s).take := slotEn && dec.writesFpcc
       r.pFpccDst   := fpccFree.io.pop(s).id
-      r.writesFpcc := fpStubWritesFpcc
+      r.writesFpcc := dec.writesFpcc
       r.pFpccOld   := fpccRat.io.reads(s).data
-      fpccRat.io.writes(s).valid := slotEn && fpStubWritesFpcc
+      fpccRat.io.writes(s).valid := slotEn && dec.writesFpcc
       fpccRat.io.writes(s).addr  := 0
       fpccRat.io.writes(s).data  := fpccFree.io.pop(s).id
     }
@@ -331,15 +317,14 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     // flag RAW (single arch entry)
     when(dec0.writesNzvc) { slot1.pNzvcSrc := slot0.pNzvcDst; slot1.pNzvcOld := slot0.pNzvcDst }
     when(dec0.writesX)    { slot1.pXSrc := slot0.pXDst;       slot1.pXOld := slot0.pXDst }
-    // FP data RAW/WAW + FPCC RAW (stubbed decode source, see note above -- Task 6;
-    // fpStubWritesFp/fpStubWritesFpcc are hard False so these branches are inert
-    // until Task 6 lands the real dec0/dec1 FP fields).
-    when(fpStubWritesFp) {
-      when(fpStubDstReg === fpStubSrcAReg) { slot1.pFpSrcA := slot0.pFpDst }
-      when(fpStubDstReg === fpStubSrcBReg) { slot1.pFpSrcB := slot0.pFpDst }
-      when(fpStubDstReg === fpStubDstReg)  { slot1.pFpOld  := slot0.pFpDst }
+    // FP data RAW/WAW + FPCC RAW (mirrors the int RAW/WAW pattern above; Task 6
+    // lands the real dec0/dec1 FP fields).
+    when(dec0.writesFp) {
+      when(dec0.fpDstReg === dec1.fpSrcAReg) { slot1.pFpSrcA := slot0.pFpDst }
+      when(dec0.fpDstReg === dec1.fpSrcBReg) { slot1.pFpSrcB := slot0.pFpDst }
+      when(dec0.fpDstReg === dec1.fpDstReg)  { slot1.pFpOld  := slot0.pFpDst }
     }
-    when(fpStubWritesFpcc) {
+    when(dec0.writesFpcc) {
       slot1.pFpccSrc := slot0.pFpccDst
       slot1.pFpccOld := slot0.pFpccDst
     }

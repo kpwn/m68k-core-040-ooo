@@ -275,6 +275,13 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
     run { dut =>
       // The F-line encodings this core DOES implement (OperationDecoder's is(0xF) arm);
       // they are legitimately not vector-11 traps and are excluded from the sweep.
+      // Extended to also recognize the cpGEN band (0xF200-0xF23F) so it is excluded from
+      // this base "faults, usesNextPc always false" baseline sweep -- Task 6 gives cpGEN
+      // its own dedicated, length-aware coverage below (this base sweep always drives
+      // len=1, which is TRUE for every cpGEN opword too -- an unframed cpGEN packet still
+      // traps with usesNextPc=False -- but the len=1 default means this sweep can never
+      // exercise the len>=2 framed case at all, so cpGEN gets its own sweep instead of
+      // silently relying on this one to cover it).
       def implemented(op: Int): Boolean = {
         val cpush   = (op & 0x0F00) == 0x0400                                  // 0xF4xx CPUSH/CINV
         val pflush  = ((op & 0xFFC0) == 0xF500) && ((op >> 3) & 7) <= 3        // 0xF500-0xF51F
@@ -282,7 +289,8 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
                       ((op & 0x0040) != 0) && ((op & 0x0010) == 0) && ((op & 0x0008) != 0)
         val move16  = (op & 0xFFF8) == 0xF620                                  // (Ax)+,(Ay)+ form
         val fsf     = op == 0xF27F                                             // task #180 carve-out
-        cpush || pflush || ptest || move16 || fsf
+        val cpgen   = ((op >> 9) & 0x7) == 1 && ((op >> 6) & 0x7) == 0         // 0xF200-0xF23F
+        cpush || pflush || ptest || move16 || fsf || cpgen
       }
       val bad = scala.collection.mutable.ArrayBuffer[String]()
       var swept = 0
@@ -297,6 +305,31 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
           bad += f"0x$op%04X faulted=$faulted vec=$vec unimpl=$unimpl usesNextPc=$nextPc"
       }
       assert(bad.isEmpty, s"${bad.size}/$swept unimplemented line-F opwords mis-routed; first 10: ${bad.take(10).mkString(", ")}")
+    }
+  }
+
+  // ── Task 6: the cpGEN band's OWN length-aware coverage (see the comment above --
+  // the base sweep now excludes cpGEN entirely, since its always-len=1 drive can never
+  // exercise fpLenKnown's real (len>=2) behavior). This sweep drives every cpGEN opword
+  // at len=2 with a NON-NATIVE opmode (0x0E, FSIN) so fpEmit never fires and every one
+  // of them exercises the TRAPPING path -- pinning down that a FRAMED cpGEN trap stacks
+  // the POST-instruction PC, which is exactly the behavior the base sweep was blind to. */
+  test("line-F cpGEN band: framed-but-non-emittable opwords stack the POST-instruction PC", VerilatorTest) {
+    run { dut =>
+      val bad = scala.collection.mutable.ArrayBuffer[String]()
+      for (low <- 0 until 64) {   // full cpGEN band, opword = 0xF200 | low
+        val op = 0xF200 | low
+        // Drive at len=2 (the register-form framing) with a NON-NATIVE opmode (0x0E, FSIN)
+        // so fpEmit never fires and this always exercises the TRAPPING path.
+        drive(dut, op, w1 = 0x000E, len = 2); sleep(1)
+        val faulted = dut.uop.faulted.toBoolean
+        val vec     = dut.uop.faultVector.toInt
+        val nextPc  = dut.uop.faultUsesNextPc.toBoolean
+        if (!faulted || vec != 11 || !nextPc)
+          bad += f"0x$op%04X faulted=$faulted vec=$vec usesNextPc=$nextPc (want true)"
+      }
+      assert(bad.isEmpty, s"${bad.size}/64 cpGEN opwords: faultUsesNextPc not set when framed; " +
+        bad.take(10).mkString("\n"))
     }
   }
 }

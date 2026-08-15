@@ -1,7 +1,7 @@
 package m68k040.rename
 
 import m68k040.isa.{Cluster, Size, MemOp}
-import m68k040.decode.DecOp
+import m68k040.decode.{DecOp, FpSrcKind}
 import spinal.core._
 
 /** Rename -> dispatch/ROB contract: DecodedUop fields + physical operands.
@@ -169,4 +169,14 @@ case class RenamedUop() extends Bundle {
   // exactly: archDepth=1, a single architectural condition-code group).
   val pFpccSrc = UInt(fpW bits); val readsFpcc  = Bool()
   val pFpccDst = UInt(fpW bits); val writesFpcc = Bool(); val pFpccOld = UInt(fpW bits)
+  // The raw extension-word opmode (DecodedUop.fpuOp) + the source-routing selector
+  // (DecodedUop.fpSrcKind) -- Task 4 added both to DecodedUop AFTER Task 2 (this
+  // rename plumbing) had already landed, so they were never threaded through here.
+  // Task 6 closes that gap: without them, Task 8's EU would have real FP register
+  // renaming but no way to learn WHICH operation to perform or WHERE its source
+  // comes from. fpSrcFmt/fpWideImm are the NEW fields this task's own scope adds.
+  val fpuOp     = Bits(7 bits)
+  val fpSrcKind = FpSrcKind()
+  val fpSrcFmt  = Bits(3 bits)
+  val fpWideImm = Bits(80 bits)
 }

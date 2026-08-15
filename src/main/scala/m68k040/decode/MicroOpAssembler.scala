@@ -1480,13 +1480,99 @@ object MicroOpAssembler {
     // are now LEGAL (slice 2/3) — emitted as a 2-µop crack ([BFRESOLVE -> T0] [BITFIELD
     // bfDynamic]) below. There are no truly-illegal register-form Do/Dw combos. The
     // memory-operand forms (mode!=0) stay illegal via OperationDecoder (spec.illegal).
-    // F-line FP-generic: OperationDecoder now classifies the cpGEN family as non-illegal
-    // (Task 4) so that Task 6 can emit real FP uops for it. Until Task 6 lands, EVERY
-    // cpGEN encoding must still take the ordinary vector-11 F-line trap -- otherwise a
-    // spec.illegal=False + pkt.simple=True packet would fall through `bad` and emit a
-    // DecOp.FPU uop with entirely undriven operands. Task 6 NARROWS this term to
-    // "recognized-and-emittable" and leaves the rest here.
-    val fpGenBad = spec.fpGeneric
+    // ── F-line FP-generic (cpGEN) extension-word decode ─────────────────────────
+    // The opword names the FAMILY (OperationDecoder, Task 4); everything that matters
+    // lives in words(1). Field positions confirmed against the in-tree vendored
+    // tools/musashi/musashi/m68kfpu.c (fpgen_rm_reg: rm=(w2>>14)&1, src=(w2>>10)&7,
+    // dst=(w2>>7)&7, opmode=w2&0x7f; m68040_fpu_op0's sub-switch on (w2>>13)&7).
+    val fpExt      = pkt.words(1)
+    val fpOpClass  = fpExt(15 downto 13)      // 000/010 arith, 011 FMOVE->ea, 100/101 ctrl, 110/111 FMOVEM
+    val fpSrcSpec  = fpExt(12 downto 10)      // FPm (R/M=0) or the source data FORMAT (R/M=1)
+    val fpDstFp    = fpExt(9 downto 7).asUInt // destination FPn
+    val fpOpmode   = fpExt(6 downto 0)        // the operation (or, for FMOVECR, the ROM offset)
+    val fpEaMode   = op(5 downto 3).asUInt
+    val fpEaReg    = op(2 downto 0).asUInt
+
+    // The hardware-native opmode whitelist (plan Global Constraints; every value
+    // confirmed against m68kfpu.c's fpgen_rm_reg opmode switch). Anything else --
+    // transcendentals, FMOD/FREM/FSCALE/FGETEXP, FSINCOS, and the 68040 rounded-precision
+    // FSxxx/FDxxx variants (opmode bit 6 set) -- routes to FPSP via vector 11.
+    val fpNative =
+      (fpOpmode === B"7'h00") || (fpOpmode === B"7'h01") || (fpOpmode === B"7'h03") ||
+      (fpOpmode === B"7'h04") || (fpOpmode === B"7'h18") || (fpOpmode === B"7'h1A") ||
+      (fpOpmode === B"7'h20") || (fpOpmode === B"7'h22") || (fpOpmode === B"7'h23") ||
+      (fpOpmode === B"7'h28") || (fpOpmode === B"7'h38") || (fpOpmode === B"7'h3A")
+    // DYADIC ops compute `FPn <op> source`, so they READ the destination FPn as an
+    // operand. The monadic ops (FMOVE/FABS/FNEG/FSQRT/FINT/FINTRZ/FTST) do not -- their
+    // result is a function of the source alone, and claiming a false RAW dependency on
+    // FPn would needlessly serialize independent FP work in the IQ.
+    val fpDyadic =
+      (fpOpmode === B"7'h20") || (fpOpmode === B"7'h22") || (fpOpmode === B"7'h23") ||
+      (fpOpmode === B"7'h28") || (fpOpmode === B"7'h38")
+    // FCMP (0x38) and FTST (0x3A) write ONLY the condition codes -- no FP destination.
+    val fpNoFpDst = (fpOpmode === B"7'h38") || (fpOpmode === B"7'h3A")
+
+    // Emittable forms (this task's scope -- see the plan's scope table). All of these are
+    // single-uop and touch no memory:
+    //   (a) opclass 000  : F<op> FPm,FPn
+    //   (b) opclass 010 with an INT/single source specifier and <ea> = Dn (mode 0):
+    //       F<op>.L/.W/.B/.S Dn,FPn -- a plain 32-bit int register read on the EXISTING
+    //       int rename path (no 80-bit value ever enters IqContext, per the 2026-08-09
+    //       design's gateway topology).
+    //   (c) opclass 010 with source specifier 111 : FMOVECR #ccc,FPn (constant ROM).
+    //   (d) opclass 010 with <ea> = mode7/reg4 (#imm), every non-Packed source format:
+    //       F<op>.L/.W/.B/.S/.D/.X #imm,FPn -- see Step 4a/Step 5 below.
+    // Real memory sources (<ea> >= mode 2) are DEFERRED to Task 6b -- they need a genuine
+    // LS-EU load crack, and the X/D/P formats are 96/64/96 bits (multi-access), not a
+    // single load or a decode-resident immediate. FMOVE-to-<ea> remains unowned by any
+    // task in this plan. The FPCR/FPSR/FPIAR moves are Task 9's own encoding band.
+    val fpFormIsReg    = (fpOpClass === B"3'b000")
+    val fpFormIsMovecr = (fpOpClass === B"3'b010") && (fpSrcSpec === B"3'b111")
+    val fpIntFmt       = (fpSrcSpec === B"3'b000") || (fpSrcSpec === B"3'b100") ||
+                         (fpSrcSpec === B"3'b110") || (fpSrcSpec === B"3'b001")  // L / W / B / S
+    val fpFormIsIntReg = (fpOpClass === B"3'b010") && fpIntFmt && (fpEaMode === U(0, 3 bits))
+
+    // ── Immediate-source forms (this deliverable) ──────────────────────────────
+    // `<ea>` = mode 7 / reg 4 is `#imm` for EVERY opclass, but only opclass 010 can pair
+    // with it (a destination cannot be immediate, and opclass 000/registers-only forms
+    // never consult the opword's <ea> field at all -- see Task 5's own note: "only a
+    // SOURCE (opclass 010) can be immediate; an immediate destination is not encodable").
+    val fpFormIsImm    = (fpOpClass === B"3'b010") &&
+                         (fpEaMode === U(7, 3 bits)) && (fpEaReg === U(4, 3 bits))
+    // Packed decimal (#imm, source spec 011) is explicitly OUT of hardware scope --
+    // Decision 2 traps packed decimal to FPSP unconditionally, regardless of opmode. This
+    // is a FORMAT exclusion, computed independently of `fpNative`'s opmode whitelist, so
+    // "FADD.P #imm,FPn" (a native opmode paired with a non-native format) is excluded too.
+    val fpImmIsPacked  = fpSrcSpec === B"3'b011"
+
+    val fpEmit = spec.fpGeneric && pkt.simple && (pkt.lenWords >= U(2)) &&
+                 (fpFormIsMovecr ||
+                  ((fpFormIsReg || fpFormIsIntReg) && fpNative) ||
+                  (fpFormIsImm && !fpImmIsPacked && fpNative))
+    // Narrowed from Task 4's blanket `spec.fpGeneric`: everything cpGEN that this task
+    // does NOT emit still takes the ordinary vector-11 F-line trap -- now with
+    // faultUsesNextPc=True whenever predecode framed it (Step 2), which is what makes it
+    // FPSP-completable instead of an infinite loop.
+    val fpGenBad = spec.fpGeneric && !fpEmit
+
+    // ── Immediate word extraction ────────────────────────────────────────────────
+    // The immediate data ALWAYS starts at pkt.words(2) (right after opword + FP ext
+    // word); only its WIDTH varies by format, matching Task 5's own fpImmWords table
+    // exactly (Long/Single=2w, Word/Byte=1w, Double=4w, Extended=6w). Cross-checked here:
+    // every width below consumes precisely the words Task 5 already frames for it, so
+    // predecode's lenWords and this task's word indexing can never disagree.
+    val fpImmLongVal   = pkt.words(2) ## pkt.words(3)                         // Long: 32 bits, no extension
+    val fpImmWordVal   = pkt.words(2).asSInt.resize(32).asBits                // Word: sign-extend 16->32
+    val fpImmByteVal   = pkt.words(2)(7 downto 0).asSInt.resize(32).asBits    // Byte: low byte, sign-extend 8->32
+    val fpImmSingleVal = pkt.words(2) ## pkt.words(3)                         // Single: 32-bit BIT PATTERN verbatim
+    val fpImmDoubleVal = pkt.words(2) ## pkt.words(3) ## pkt.words(4) ## pkt.words(5)  // Double: 64-bit BIT PATTERN
+    // Extended: word2=sign+exp, word3=RESERVED (SKIPPED -- never read, matching Musashi's
+    // load_extended_float80/READ_EA_FPE case 4 "immediate": d3=read_16(ea) [sign+exp],
+    // d1=read_32(ea+4) [mantissa hi32], d2=read_32(ea+8) [mantissa lo32]; ea+2, the
+    // reserved word, is never touched -- re-verified directly against
+    // tools/musashi/musashi/m68kfpu.c:64-77,684-711 in this session), words4-7=64-bit
+    // mantissa. This IS the internal Fp80 layout (Decision 1) -- zero conversion needed.
+    val fpImmExtVal    = pkt.words(2) ## pkt.words(4) ## pkt.words(5) ## pkt.words(6) ## pkt.words(7)
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isTrapccOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isLinkLOp && !isUnlkOp && !isExgOp &&
               !isLeaOp && !isPeaOp && !isMoveFromSrOp && !isMoveFromCcrOp && !isMoveToCcrOp &&
@@ -1573,6 +1659,129 @@ object MicroOpAssembler {
     when(bad && fpLenKnown) {
       opUop.faultUsesNextPc := True
     }
+
+    // ── F-line FP-generic uop assembly (DecOp.FPU, CPLX cluster) ────────────────
+    when(fpEmit) {
+      opUop.op       := DecOp.FPU
+      opUop.cluster  := Cluster.CPLX      // spec Decision 9 -- shared CPLX cluster/IQ port/ROB port
+      opUop.memOp    := MemOp.NONE
+      opUop.unimplemented := False
+      opUop.faulted  := False; opUop.faultVector := 0; opUop.faultUsesNextPc := False
+      opUop.isBranch := False
+      opUop.firstOfInstr := True          // a single uop: it IS the macro boundary
+      opUop.fpuOp    := fpOpmode
+      // The integer CCR is untouched by every FP op (FPCC is a separate rename class).
+      opUop.readsNzvc := False; opUop.writesNzvc := False
+      opUop.readsX    := False; opUop.writesX    := False
+      // No INT destination: the 80-bit result goes to the FP PRF via Task 8's separate
+      // writeback lane (the existing 32-bit CplxResult.data lane cannot carry it).
+      opUop.dstValid := False
+      // Destination FPn + FPCC. EVERY hardware-native FP op writes FPCC (Musashi calls
+      // SET_CONDITION_CODES on every arm, including FMOVE-to-FPn and FMOVECR); FCMP and
+      // FTST write ONLY FPCC. Nothing READS FPCC yet -- FBcc/FScc/FDBcc and
+      // FMOVE-from-FPSR are deferred -- so readsFpcc stays False here; the rename class
+      // and its IQ scoreboard (Task 3) exist so that lands as a pure addition.
+      opUop.fpDstReg  := fpDstFp
+      opUop.writesFp  := !fpNoFpDst
+      opUop.writesFpcc := True
+      opUop.readsFpcc  := False
+      // srcA = the DESTINATION FPn read back, ONLY for the dyadic ops.
+      opUop.fpSrcAReg := fpDstFp
+      opUop.usesFpSrcA := fpDyadic
+      // `fpSrcFmt` is meaningful whenever fpSrcKind indicates an opclass-010 form
+      // (INTREG/INTIMM/SINGLEIMM/DOUBLEIMM/EXTIMM below); it is verbatim ext[12:10] --
+      // for FPREG/ROMCONST it happens to be driven from whatever fpSrcSpec computes to
+      // for THIS extension word's bit layout (harmless: fpSrcKind tells the EU never to
+      // read it in those cases). Driven once here, outside the branch chain, so every
+      // branch gets it for free instead of repeating it.
+      opUop.fpSrcFmt := fpSrcSpec
+
+      // Source routing.
+      when(fpFormIsMovecr) {
+        // FMOVECR: no register source at all; the constant's ROM offset rides `imm`.
+        // useImm=True is safe here -- this uop has no integer srcB, and the IQ's
+        // srcBIsReg() only consults useImm to decide whether to track psrcB, which is
+        // invalid on this uop anyway.
+        opUop.fpSrcKind := FpSrcKind.ROMCONST
+        opUop.usesFpSrcB := False
+        opUop.fpSrcBReg  := 0
+        opUop.usesFpSrcA := False        // FMOVECR overwrites FPn; it never reads it
+        opUop.srcAValid  := False; opUop.srcBValid := False
+        opUop.useImm     := True
+        opUop.imm        := fpOpmode.resize(32)
+        opUop.fpWideImm  := B(0, 80 bits)
+        opUop.size       := Size.LONG
+      } .elsewhen(fpFormIsReg) {
+        // F<op> FPm,FPn: the source is FP register FPm (ext[12:10]).
+        opUop.fpSrcKind  := FpSrcKind.FPREG
+        opUop.fpSrcBReg  := fpSrcSpec.asUInt
+        opUop.usesFpSrcB := True
+        opUop.srcAValid  := False; opUop.srcBValid := False
+        opUop.useImm     := False
+        opUop.fpWideImm  := B(0, 80 bits)
+        opUop.size       := Size.LONG
+      } .elsewhen(fpFormIsImm) {
+        // F<op>.<fmt> #imm,FPn (THIS DELIVERABLE): no register source at all. The value
+        // rides the NEW `fpWideImm` field (80 bits, carried through the IQ exactly like
+        // `imm` already is -- IqContext embeds the WHOLE RenamedUop). `imm`/`useImm` stay
+        // reserved for FMOVECR's ROM offset and are NOT reused here, so Task 8 has exactly
+        // ONE dispatch: fpSrcKind selects the ROUTE (register / imm / fpWideImm),
+        // fpSrcFmt selects the FORMAT within a fpWideImm-routed value.
+        //
+        // Gated identically to the register-form/INTREG cases: fpNative excludes every
+        // transcendental/rounded-precision opmode regardless of source format (an
+        // "FSIN.L #imm,FPn" still traps to FPSP, exactly like "FSIN FP1,FP0" already does);
+        // Packed (fpImmIsPacked) is excluded independently of opmode by fpEmit's gate
+        // above, so it is unreachable here.
+        // (SpinalHDL's `.mux` type-inference doesn't resolve a Bits-key -> SpinalEnum-
+        // value mapping cleanly, so this is a `when`/`elsewhen` chain instead of a mux
+        // literal -- semantically identical to the brief's mux table.)
+        opUop.fpSrcKind := FpSrcKind.INTIMM   // default: 000/100/110 = Long/Word/Byte;
+                                               // 011/111 unreachable here (Packed excluded
+                                               // by fpEmit's gate; FMOVECR claimed earlier)
+        when(fpSrcSpec === B"3'b001") {
+          opUop.fpSrcKind := FpSrcKind.SINGLEIMM  // Single
+        } .elsewhen(fpSrcSpec === B"3'b010") {
+          opUop.fpSrcKind := FpSrcKind.EXTIMM     // Extended
+        } .elsewhen(fpSrcSpec === B"3'b101") {
+          opUop.fpSrcKind := FpSrcKind.DOUBLEIMM  // Double
+        }
+        opUop.usesFpSrcB := False; opUop.fpSrcBReg := 0   // no FP register source
+        opUop.srcAValid  := False; opUop.srcBValid := False   // no INT register source either
+        opUop.useImm     := False    // `imm` is NOT used for these -- fpWideImm is, see above
+        opUop.fpWideImm  := fpSrcSpec.mux(
+          B"3'b000" -> (B(0, 48 bits) ## fpImmLongVal),
+          B"3'b001" -> (B(0, 48 bits) ## fpImmSingleVal),
+          B"3'b010" -> fpImmExtVal,
+          B"3'b100" -> (B(0, 48 bits) ## fpImmWordVal),
+          B"3'b101" -> (B(0, 16 bits) ## fpImmDoubleVal),
+          B"3'b110" -> (B(0, 48 bits) ## fpImmByteVal),
+          default   -> B(0, 80 bits)
+        )
+        opUop.size       := Size.LONG   // inert for these -- fpSrcFmt is the load-bearing width selector
+      } .otherwise {
+        // F<op>.L/.W/.B/.S Dn,FPn: a 32-bit INTEGER register read on the ORDINARY int
+        // rename/scoreboard path (srcA/psrcA), converted to extended precision inside the
+        // EU. This deliberately keeps every 80-bit value out of IqContext and the integer
+        // operand mux, per the 2026-08-09 design's gateway topology.
+        opUop.fpSrcKind  := FpSrcKind.INTREG
+        opUop.usesFpSrcB := False
+        opUop.fpSrcBReg  := 0
+        opUop.srcAReg    := fpEaReg.resize(5)   // Dn (<ea> mode 0), i.e. arch reg 0..7
+        opUop.srcAValid  := True
+        opUop.srcBValid  := False
+        opUop.useImm     := False
+        opUop.fpWideImm  := B(0, 80 bits)
+        // `size` distinguishes Word/Byte from the default 32-bit read (Long AND Single
+        // both read a full 32-bit Dn -- Single's BIT-PATTERN-vs-INTEGER distinction is
+        // now carried by `fpSrcFmt` above, not by `size`; this RESOLVES the open item this
+        // task previously flagged for Task 8 -- see the updated note below).
+        when(fpSrcSpec === B"3'b100") { opUop.size := Size.WORD }
+          .elsewhen(fpSrcSpec === B"3'b110") { opUop.size := Size.BYTE }
+          .otherwise { opUop.size := Size.LONG }
+      }
+    }
+
     // ── ANDI/ORI/EORI #imm,CCR: a CCR read-modify-write op µop (ALU cluster) ─────
     // The base opUop already carries op = AND/OR/EOR + useImm/imm = the imm byte (via
     // the IMMEXT srcB). Override the operand/flag masks: NO int operands / dst; READS

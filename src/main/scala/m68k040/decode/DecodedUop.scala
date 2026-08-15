@@ -127,11 +127,27 @@ object DecOp extends SpinalEnum {
   *              srcA/psrcA rename path (no 80-bit value ever enters IqContext).
   *   ROMCONST : opclass 010 / source specifier 111 -- FMOVECR; the source is the FPU's
   *              internal constant ROM, indexed by `imm[6:0]` (the raw offset).
-  * Memory-sourced forms (a real <ea> load) are NOT in this enum yet -- they are added by
-  * Task 6b (MEMPAIR/MEMEXT), immediately after Task 6. FMOVEM and the FMOVE-to-<ea>
-  * direction remain unowned by any task in this plan. */
+  *   ── Immediate-source forms (this deliverable) ──────────────────────────
+  *   INTIMM   : a 32-bit SIGN-EXTENDED integer immediate (Long/Word/Byte source
+  *              specifiers all normalize to this -- MicroOpAssembler already did the
+  *              sign-extension at decode time). Converts like INTREG, sourced from
+  *              fpWideImm(31 downto 0) instead of a register read.
+  *   SINGLEIMM: a 32-bit single-precision BIT PATTERN immediate (NOT an integer --
+  *              converting it as one would turn 0x3F800000 (1.0f) into 1065353216.0,
+  *              a completely wrong result). fpWideImm(31 downto 0).
+  *   DOUBLEIMM: a 64-bit double-precision BIT PATTERN immediate. fpWideImm(63 downto 0).
+  *   EXTIMM   : an 80-bit extended-precision immediate -- the SAME internal layout as
+  *              an FP register (Decision 1), so this is the simplest case: route
+  *              fpWideImm(79 downto 0) directly as the extended-precision source, no
+  *              format conversion at the EU at all.
+  *   Task 6b (memory-source loads) reuses INTREG unmodified for its 1-chunk formats
+  *   (Byte/Word/Long/Single via a temp register) and adds two SEPARATE kinds of its
+  *   own, MEMPAIR/MEMEXT, for the 2/3-chunk Double/Extended memory loads -- all sharing
+  *   this SAME fpSrcFmt-based format-disambiguation mechanism, not a parallel one.
+  * FMOVEM and the FMOVE-to-<ea> direction remain unowned by any task in this plan. */
 object FpSrcKind extends SpinalEnum {
-  val FPREG, INTREG, ROMCONST = newElement()
+  val FPREG, INTREG, ROMCONST,
+      INTIMM, SINGLEIMM, DOUBLEIMM, EXTIMM = newElement()
 }
 
 /** Commit-time privileged-system-op kind (DecodedUop.sysOp / .sysKind). Selects how
@@ -520,6 +536,20 @@ case class DecodedUop() extends Bundle {
   // (the ROM offset rides `imm` instead) -- gate on fpSrcKind === ROMCONST first.
   val fpuOp       = Bits(7 bits)
   val fpSrcKind   = FpSrcKind()
+  // The raw extension-word source SPECIFIER (ext[12:10]), verbatim. Meaningful whenever
+  // fpSrcKind is one of {INTREG, INTIMM, SINGLEIMM, DOUBLEIMM, EXTIMM} (every opclass-010
+  // form); ignored by the EU for FPREG/ROMCONST. This is the field that RESOLVES the
+  // Long-vs-Single ambiguity this task previously left open for Task 8 (see that section's
+  // updated note): `size` alone cannot distinguish a 32-bit INTEGER from a 32-bit BIT
+  // PATTERN, but fpSrcFmt (000 vs 001) can.
+  val fpSrcFmt  = Bits(3 bits)
+  // The immediate VALUE for every fpWideImm-routed fpSrcKind above, right-justified /
+  // zero-padded to 80 bits regardless of the real format width (32/64/80 bits meaningful,
+  // per fpSrcFmt). Carried through rename/IQ exactly like `imm` already is -- IqContext
+  // embeds the WHOLE RenamedUop, so this costs nothing beyond its own bit-width, the same
+  // class of cost as `imm`/`fpuCmdWord`. Deliberately NOT reusing `imm` (32 bits, and
+  // already committed to FMOVECR's ROM offset) -- see this task's routing-contract note.
+  val fpWideImm = Bits(80 bits)
 
   /** Drive every FP field to its inert (non-FP-uop) default. Called by every
     * DecodedUop construction site that is not building an FP uop -- SpinalHDL requires
@@ -531,6 +561,7 @@ case class DecodedUop() extends Bundle {
     fpDstReg  := 0; writesFp   := False
     readsFpcc := False; writesFpcc := False
     fpuOp     := 0; fpSrcKind := FpSrcKind.FPREG
+    fpSrcFmt  := 0; fpWideImm := B(0, 80 bits)
   }
 }
 
