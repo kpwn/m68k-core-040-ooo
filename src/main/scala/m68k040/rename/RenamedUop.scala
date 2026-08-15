@@ -9,6 +9,7 @@ import spinal.core._
 case class RenamedUop() extends Bundle {
   val intW  = 6   // log2Up(PHYS_INT_REGS=48)
   val flagW = 4   // log2Up(PHYS_NZVC_REGS=16) = log2Up(PHYS_X_REGS=16)
+  val fpW   = 4   // log2Up(16) -- FP data and FPCC both have 16 physical entries
   val valid        = Bool()
   val pc           = UInt(32 bits)
   val nextPc       = UInt(32 bits)   // POST-instruction PC (pc + length); used for commit pc
@@ -157,4 +158,15 @@ case class RenamedUop() extends Bundle {
   val pNzvcDst = UInt(flagW bits); val writesNzvc = Bool(); val pNzvcOld = UInt(flagW bits)
   val pXSrc    = UInt(flagW bits); val readsX     = Bool()
   val pXDst    = UInt(flagW bits); val writesX    = Bool(); val pXOld   = UInt(flagW bits)
+  // FP data rename (Decision 6: 8 arch FP0-FP7, 16 physical, 4-bit tags). FMOVE
+  // <ea>,FPn / FPn,<ea> only ever populate srcA (never srcB); srcB is reserved for
+  // the dyadic FADD/FSUB/FMUL/FDIV FPn,FPn/FPm forms. No decode path drives these
+  // yet (Task 6 adds the DecodedUop FP fields); pure rename-stage plumbing for now.
+  val pFpSrcA = UInt(fpW bits); val psrcAFpValid = Bool()
+  val pFpSrcB = UInt(fpW bits); val psrcBFpValid = Bool()
+  val pFpDst  = UInt(fpW bits); val pFpDstValid  = Bool(); val pFpOld = UInt(fpW bits)
+  // FPCC rename (Decision 4: N/Z/I/NAN, 16 physical, 4-bit tags -- mirrors NZVC/X
+  // exactly: archDepth=1, a single architectural condition-code group).
+  val pFpccSrc = UInt(fpW bits); val readsFpcc  = Bool()
+  val pFpccDst = UInt(fpW bits); val writesFpcc = Bool(); val pFpccOld = UInt(fpW bits)
 }

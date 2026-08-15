@@ -30,11 +30,26 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     val intRat  = RatTable(physIdWidth = 6, archDepth = m68k040.isa.Isa.ARCH_INT_REGS, writePorts = 2, commitPorts = 2, readPorts = 8)
     val nzvcRat = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = 2, readPorts = 2)
     val xRat    = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = 2, readPorts = 2)
+    // FP data RAT (8 arch FP0-FP7, 16 physical). Read-port budget (6): FP macro-ops
+    // need at most 2 sources (dyadic FADD/FSUB/FMUL/FDIV) + 1 dst-old read (freelist
+    // WAW bookkeeping) per slot -- 2 slots x (2 src + 1 dst-old) = 6, provisioned even
+    // though the CPLX cluster can only ISSUE one FP op/cycle (decode/rename still
+    // processes 2 macro-ops/cycle and both could be FP-sourced this cycle).
+    val fpRat   = RatTable(physIdWidth = 4, archDepth = 8, writePorts = 2, commitPorts = 2, readPorts = 6)
+    // FPCC RAT (N/Z/I/NAN, archDepth=1 -- mirrors nzvcRat/xRat exactly).
+    val fpccRat = RatTable(physIdWidth = 4, archDepth = 1, writePorts = 2, commitPorts = 2, readPorts = 2)
+    // sim-only debug visibility (directed rename-only test, RenameStageFpSpec):
+    // committedPhys has no other consumer in this task (no ExceptionUnit-style
+    // reader exists yet for FP/FPCC), so it would otherwise be pruned from the
+    // isolated-RenameStage sim build.
+    spinal.core.sim.SimPublic(fpRat.io.committedPhys, fpccRat.io.committedPhys)
 
     // ── Freelists ────────────────────────────────────────────────────────────
     val intFree  = Freelist(physCount = 50, archCount = m68k040.isa.Isa.ARCH_INT_REGS, popPorts = 2, pushPorts = 2)
     val nzvcFree = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = 2)
     val xFree    = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = 2)
+    val fpFree   = Freelist(physCount = 16, archCount = 8, popPorts = 2, pushPorts = 2)
+    val fpccFree = Freelist(physCount = 16, archCount = 1, popPorts = 2, pushPorts = 2)
 
     // ── flush / commit ports ──────────────────────────────────────────────────
     // Plain directionless service wires (RenameCommitService): ROB (a sibling
@@ -67,6 +82,10 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       nzvcRat.io.commits(w).payload.assignDontCare()
       xRat.io.commits(w).valid    := False
       xRat.io.commits(w).payload.assignDontCare()
+      fpRat.io.commits(w).valid   := False
+      fpRat.io.commits(w).payload.assignDontCare()
+      fpccRat.io.commits(w).valid := False
+      fpccRat.io.commits(w).payload.assignDontCare()
     }
     // Close the freelist loop: free old pdsts of retired instructions.
     for (k <- 0 until 2) {
@@ -76,15 +95,23 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       nzvcFree.io.push(k).payload := commitPorts(k).nzvcOld
       xFree.io.push(k).valid   := commitPorts(k).valid && commitPorts(k).xWrite
       xFree.io.push(k).payload := commitPorts(k).xOld
+      fpFree.io.push(k).valid   := commitPorts(k).valid && commitPorts(k).fpWrite
+      fpFree.io.push(k).payload := commitPorts(k).fpOld
+      fpccFree.io.push(k).valid   := commitPorts(k).valid && commitPorts(k).fpccWrite
+      fpccFree.io.push(k).payload := commitPorts(k).fpccOld
     }
 
     // ── Rollback / flush wiring ────────────────────────────────────────────────
     intRat.io.rollback  := flush
     nzvcRat.io.rollback := flush
     xRat.io.rollback    := flush
+    fpRat.io.rollback    := flush
+    fpccRat.io.rollback  := flush
     intFree.io.flush  := flush
     nzvcFree.io.flush := flush
     xFree.io.flush    := flush
+    fpFree.io.flush   := flush
+    fpccFree.io.flush := flush
 
     // ── Output stream ──────────────────────────────────────────────────────────
     val uopsPort = Stream(Vec(RenamedUop(), 2))
@@ -102,6 +129,26 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     du.uops.ready  := initDone && uopsPort.ready && freeReady
     val fire = du.uops.fire
     val uop1Sig = du.uops.valid && du.uop1Valid
+
+    // ── FP data / FPCC decode-field stubs ───────────────────────────────────────
+    // Task 6 has not yet landed DecodedUop's FP fields (fpSrcAReg/fpSrcBReg/
+    // fpDstReg/usesFpSrcA/usesFpSrcB/writesFp/readsFpcc/writesFpcc) -- this task
+    // (Task 2) is pure rename-stage plumbing, sequenced before Task 6. Stub every
+    // one of them to inert (0/False) constants so the FP/FPCC RAT+freelist wiring
+    // below elaborates and exercises real hardware for everything except the
+    // not-yet-existing decode source. No fpRat/fpccRat write or freelist pop can
+    // ever fire while these stubs are in place (writesFp/writesFpcc are hard
+    // False), so this cannot corrupt any downstream consumer.
+    // TODO(Task 6): delete this stub block and wire the real dec.fp* fields once
+    // DecodedUop grows them.
+    val fpStubSrcAReg   = U(0, 3 bits)
+    val fpStubSrcBReg   = U(0, 3 bits)
+    val fpStubDstReg    = U(0, 3 bits)
+    val fpStubUsesSrcA  = False
+    val fpStubUsesSrcB  = False
+    val fpStubWritesFp  = False
+    val fpStubReadsFpcc = False
+    val fpStubWritesFpcc = False
 
     // ── Per-slot rename ────────────────────────────────────────────────────────
     // Build raw (pre-bypass) renamed uops, then apply intra-group bypass for slot1.
@@ -127,6 +174,13 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       // flag src reads (single arch entry, addr 0)
       nzvcRat.io.reads(s).addr := 0
       xRat.io.reads(s).addr    := 0
+      // FP data RAT: 2 src reads + 1 dst-old read per slot (read-port-budget note
+      // above). FPCC RAT: single architectural entry, addr hardwired to 0 (the
+      // nzvcRat/xRat pattern).
+      fpRat.io.reads(2 * s).addr     := fpStubSrcAReg
+      fpRat.io.reads(2 * s + 1).addr := fpStubSrcBReg
+      fpRat.io.reads(4 + s).addr     := fpStubDstReg
+      fpccRat.io.reads(s).addr := 0
 
       // copy decoded fields
       r.valid        := dec.valid
@@ -236,6 +290,30 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       xRat.io.writes(s).valid := slotEn && dec.writesX
       xRat.io.writes(s).addr  := 0
       xRat.io.writes(s).data  := xFree.io.pop(s).id
+
+      // FP data src + dst (stubbed decode source, see note above -- Task 6)
+      r.pFpSrcA      := fpRat.io.reads(2 * s).data
+      r.psrcAFpValid := fpStubUsesSrcA
+      r.pFpSrcB      := fpRat.io.reads(2 * s + 1).data
+      r.psrcBFpValid := fpStubUsesSrcB
+      r.pFpOld       := fpRat.io.reads(4 + s).data
+      fpFree.io.pop(s).take := slotEn && fpStubWritesFp
+      r.pFpDst       := fpFree.io.pop(s).id
+      r.pFpDstValid  := fpStubWritesFp
+      fpRat.io.writes(s).valid := slotEn && fpStubWritesFp
+      fpRat.io.writes(s).addr  := fpStubDstReg
+      fpRat.io.writes(s).data  := fpFree.io.pop(s).id
+
+      // FPCC src + dst
+      r.pFpccSrc  := fpccRat.io.reads(s).data
+      r.readsFpcc := fpStubReadsFpcc
+      fpccFree.io.pop(s).take := slotEn && fpStubWritesFpcc
+      r.pFpccDst   := fpccFree.io.pop(s).id
+      r.writesFpcc := fpStubWritesFpcc
+      r.pFpccOld   := fpccRat.io.reads(s).data
+      fpccRat.io.writes(s).valid := slotEn && fpStubWritesFpcc
+      fpccRat.io.writes(s).addr  := 0
+      fpccRat.io.writes(s).data  := fpccFree.io.pop(s).id
     }
 
     // ── Intra-group hazards (slot1 reads slot0's writes) ───────────────────────
@@ -253,6 +331,18 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     // flag RAW (single arch entry)
     when(dec0.writesNzvc) { slot1.pNzvcSrc := slot0.pNzvcDst; slot1.pNzvcOld := slot0.pNzvcDst }
     when(dec0.writesX)    { slot1.pXSrc := slot0.pXDst;       slot1.pXOld := slot0.pXDst }
+    // FP data RAW/WAW + FPCC RAW (stubbed decode source, see note above -- Task 6;
+    // fpStubWritesFp/fpStubWritesFpcc are hard False so these branches are inert
+    // until Task 6 lands the real dec0/dec1 FP fields).
+    when(fpStubWritesFp) {
+      when(fpStubDstReg === fpStubSrcAReg) { slot1.pFpSrcA := slot0.pFpDst }
+      when(fpStubDstReg === fpStubSrcBReg) { slot1.pFpSrcB := slot0.pFpDst }
+      when(fpStubDstReg === fpStubDstReg)  { slot1.pFpOld  := slot0.pFpDst }
+    }
+    when(fpStubWritesFpcc) {
+      slot1.pFpccSrc := slot0.pFpccDst
+      slot1.pFpccOld := slot0.pFpccDst
+    }
 
     uopsPort.payload(0) := slot0
     uopsPort.payload(1) := slot1
@@ -271,7 +361,17 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       intRat.io.commits(0).valid := True
       intRat.io.commits(0).addr  := initCounter.resized
       intRat.io.commits(0).data  := initCounter.resized
-      // flag RATs: seed arch 0 -> phys 0 on the first init cycle
+      // FP data RAT: identity-seed FP0-FP7 -> phys 0-7 during the FIRST 8 ticks of
+      // the SAME initCounter (which already counts 0..19 for the int RAT) --
+      // archDepth=8 only needs 0..7, no separate counter required (see task-2 brief
+      // §Step 9). Gated additionally so it stops driving once past tick 7.
+      when(initCounter < U(8)) {
+        fpRat.io.commits(0).valid := True
+        fpRat.io.commits(0).addr  := initCounter.resize(3)
+        fpRat.io.commits(0).data  := initCounter.resize(4)
+      }
+      // flag RATs (+ FPCC, archDepth=1 like nzvc/x): seed arch 0 -> phys 0 on the
+      // first init cycle.
       when(initCounter === U(0)) {
         nzvcRat.io.commits(0).valid := True
         nzvcRat.io.commits(0).addr  := 0
@@ -279,19 +379,36 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
         xRat.io.commits(0).valid    := True
         xRat.io.commits(0).addr     := 0
         xRat.io.commits(0).data     := 0
+        fpccRat.io.commits(0).valid := True
+        fpccRat.io.commits(0).addr  := 0
+        fpccRat.io.commits(0).data  := 0
       }
     } otherwise {
       // normal: commits(0) driven by the commit ports (int RAT only on slot 0
-      // because commits(0) is the init-muxed port; nzvc/x committed on both slots).
+      // because commits(0) is the init-muxed port; nzvc/x/fpcc committed on both
+      // slots via the k-loop below). fpRat mirrors intRat exactly here (both are
+      // the archDepth>1 RATs, so both need a real commits(0) normal-op path --
+      // deviates from the task-2 brief's Step 10 pseudocode, which only wired
+      // fpRat.commits(1): an FP dest committing in SLOT 0 would otherwise never
+      // update the FP RAT's committed mapping, a WAW-freelist-recycling gap that
+      // is inert for this task [no decode path drives writesFp yet] but would be a
+      // real correctness bug once Task 8 lands real FP writeback).
       intRat.io.commits(0).valid := commitPorts(0).valid && commitPorts(0).intWrite
       intRat.io.commits(0).addr  := commitPorts(0).intArch
       intRat.io.commits(0).data  := commitPorts(0).intNew
+      fpRat.io.commits(0).valid := commitPorts(0).valid && commitPorts(0).fpWrite
+      fpRat.io.commits(0).addr  := commitPorts(0).fpArchDst
+      fpRat.io.commits(0).data  := commitPorts(0).fpNew
     }
-    // commits(1) for int and both slots for the flag RATs are not init-muxed.
+    // commits(1) for int/fp and both slots for the flag (+ FPCC) RATs are not
+    // init-muxed.
     when(initDone) {
       intRat.io.commits(1).valid := commitPorts(1).valid && commitPorts(1).intWrite
       intRat.io.commits(1).addr  := commitPorts(1).intArch
       intRat.io.commits(1).data  := commitPorts(1).intNew
+      fpRat.io.commits(1).valid := commitPorts(1).valid && commitPorts(1).fpWrite
+      fpRat.io.commits(1).addr  := commitPorts(1).fpArchDst
+      fpRat.io.commits(1).data  := commitPorts(1).fpNew
     }
     for (k <- 0 until 2) {
       // commits(0) is init-muxed (only drivable once init is done); commits(1) is free.
@@ -303,6 +420,9 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
         xRat.io.commits(k).valid := commitPorts(k).valid && commitPorts(k).xWrite
         xRat.io.commits(k).addr  := 0
         xRat.io.commits(k).data  := commitPorts(k).xNew
+        fpccRat.io.commits(k).valid := commitPorts(k).valid && commitPorts(k).fpccWrite
+        fpccRat.io.commits(k).addr  := 0
+        fpccRat.io.commits(k).data  := commitPorts(k).fpccNew
       }
     }
 
