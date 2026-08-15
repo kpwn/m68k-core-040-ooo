@@ -7,24 +7,71 @@
 2026-08-15) — an 11(+2)-op hardware-native FPU folded into the existing CPLX cluster, a
 renamed FPCC, hardware-native OVFL/UNFL substitution, real vector-11 F-line trap delivery
 with correctly-populated FSAVE state frames, and bit-exact-capable Musashi lock-step
-verification — so a real, unmodified Motorola/Apple FPSP kernel can run on this core exactly
-as it would on real 68040 silicon.
+verification, so that the real Motorola/Apple FPSP ROM kernel's own installed vector-11
+handler — including its genuine prologue (`FMOVEM.L FPIAR/FPSR/FPCR,-(A7)`, `F227 BC00`,
+Task 9b) — installs and runs without re-trapping on its own first instruction, and so that
+hardware-native arithmetic (register-to-register, immediate-source including 80-bit extended
+immediates, and genuine memory-source `F<op> <mem>,FPn` loads across every addressing mode,
+Task 6/6b) executes without ever reaching software at all.
+
+**Honest scope qualification (revised during an integration pass that added Tasks 6b and
+9b to the original 16-task plan — do NOT read this plan as delivering unqualified drop-in
+FPSP-kernel compatibility):** this is real, substantial coverage, not the same claim as "a
+real, unmodified FPSP kernel can run on this core exactly as it would on real 68040
+silicon" — several concrete, named gaps remain even after all 18 tasks:
+- **`FMOVE FPn,<ea>`** (the store direction, opclass `011`) and the **FMOVEM
+  FP-*data*-register-list form** (`FP0-FP7`, a structurally separate encoding from Task 9b's
+  control-register list) are unowned by any task in this plan. Both still trap to vector 11
+  with a correctly-framed length (Task 5) and a correct post-instruction PC (Task 6), so FPSP
+  is not architecturally prevented from software-completing them — but no task here makes
+  that fast, and no task here populates their FSAVE unimplemented-instruction frame with
+  correct operand-capture fields either (next point).
+- **Task 10's `fpuSoftwareComplete`/`fpuCmdWord` FSAVE-frame trigger is DELIBERATELY narrower
+  than Task 6's own `faultUsesNextPc` gate — register-to-register form ONLY.** This is a real,
+  load-bearing correctness constraint (Task 11's FSAVE frame capture reads `fpuCmdWord`'s
+  `ext[12:10]`/`ext[9:7]` bits as FP register numbers, which is only a valid interpretation for
+  that one form), not an oversight — but it means every OTHER trapped form (memory-source,
+  immediate-source, the opclass-011 store direction) still traps correctly but does NOT get a
+  fully-populated 44-byte unimplemented-instruction FSAVE frame from this plan. A real FPSP
+  handler's software-completion path for those forms is therefore not proven to work end to
+  end by anything in this plan.
+- **Task 9b's own `-(An)` register-order rule (FPIAR/FPSR/FPCR reversed vs. the normal
+  FPCR/FPSR/FPIAR order) is corroborated by an independent secondary source (WinUAE's
+  FPU-accuracy documentation) and a round-trip-consistency derivation, but NOT yet confirmed
+  against a primary-source MC68881/MC68882 UM page citation** — Task 9b's own Step 1b is a
+  blocking, not-yet-executed verification gate for exactly this fact, and it governs the real
+  ROM prologue/epilogue pair's correctness.
+- **Packed decimal (BCD) is permanently excluded from hardware, by design (Decision 2)** —
+  this matches real 68881/68040 silicon (packed decimal always traps to FPSP there too), so it
+  is not a compatibility gap relative to real hardware, but it does mean this plan's own
+  lock-step/whitebox coverage never exercises FPSP's packed-decimal conversion routines.
+- **`FMOVE.L <ea>,FPCR`-style memory-EA single-register control moves** remain unowned (Task 9
+  covers only register-direct `<ea>`; Task 9b's own optional `popcount==1`-with-memory-EA
+  extension is explicitly left as "the integrator's call," not guaranteed landed by default).
 
 **Architecture:** New 80-bit-wide FP register file (16 physical entries) and FPCC rename
 class (16 physical entries, 4-bit tags) added alongside the existing int/NZVC/X rename
 machinery, following those exact idioms. New F-line decode entries recognize the
 hardware-native op set and tag them `Cluster.CPLX`; everything else falls through the
-existing generic `bad`/`faultVector` mechanism to vector 11 for free. A new `FpuCore`
-standalone arithmetic Component (mirroring `MulCore.scala`'s shape) is integrated into
-`DivEuPlugin.scala` via a new parallel FP writeback lane (the existing `compData`/
-`CplxResult.data` writeback bus is hardcoded 32-bit and cannot carry an 80-bit result — this
-is NOT a MULHI-style chunk, it is architecturally a new lane, confirmed by direct code
-inspection during planning). FSAVE/FRESTORE become new microcoded system ops emitting/
-consuming the real null/idle/unimplemented-instruction state frames (busy frame narrowed per
-Decision 10). Musashi's `m68k_ref.h`/`musashi_run.cpp` gain FP register accessors reaching
-`m68ki_cpu.fpr[]`/`.fpcr`/`.fpsr`/`.fpiar` directly (Musashi's public `m68k_get_reg` API has
-no FP surface at all — confirmed, this is genuinely new plumbing, not an extension of an
-existing pattern).
+existing generic `bad`/`faultVector` mechanism to vector 11 for free. Genuine memory-source
+`F<op> <mem>,FPn` loads (all six data formats, every EA mode) and immediate-source `#imm`
+loads (Long/Word/Byte/Single/Double/Extended) are both emitted as real hardware, the former
+via a new microcoded crack reusing the CPLX cluster's existing 3rd-int-source (`srcC`/`psrcC`)
+machinery, the latter via a new 80-bit `fpWideImm` decode-time field — neither routes through
+software. A new `FpuCore` standalone arithmetic Component (mirroring `MulCore.scala`'s shape)
+is integrated into `DivEuPlugin.scala` via a new parallel FP writeback lane (the existing
+`compData`/`CplxResult.data` writeback bus is hardcoded 32-bit and cannot carry an 80-bit
+result — this is NOT a MULHI-style chunk, it is architecturally a new lane, confirmed by
+direct code inspection during planning). The FMOVEM control-register LIST form (`FPCR`/
+`FPSR`/`FPIAR`, multi-register masks including the real FPSP ROM prologue `F227 BC00`) is a
+second new microcoded crack, compile-time-generated as a bounded family of static programs
+(2 directions × 3 addressing-mode classes × 4 nonzero masks) reusing `FpuControlPlugin`'s
+existing single-register machinery unmodified. FSAVE/FRESTORE become new microcoded system
+ops emitting/consuming the real null/idle/unimplemented-instruction state frames (busy frame
+narrowed per Decision 10). Musashi's `m68k_ref.h`/`musashi_run.cpp` gain FP register
+accessors reaching `m68ki_cpu.fpr[]`/`.fpcr`/`.fpsr`/`.fpiar` directly (Musashi's public
+`m68k_get_reg` API has no FP surface at all — confirmed, this is genuinely new plumbing, not
+an extension of an existing pattern).
 
 **Tech Stack:** SpinalHDL, existing rename/scoreboard/freelist/regfile-plugin infrastructure,
 existing CPLX EU (`DivEuPlugin.scala`)/IQ-port/ROB-port, existing `PortedTestRunner`/
@@ -92,8 +139,12 @@ existing CPLX EU (`DivEuPlugin.scala`)/IQ-port/ROB-port, existing `PortedTestRun
 New files:
 - `src/main/scala/m68k040/execute/fpu/FpuCore.scala` — standalone 80-bit arithmetic datapath
   (Task 7).
-- `src/main/scala/m68k040/execute/fpu/FpuTypes.scala` — shared bundles (`Extended80`,
-  `FpuOp`, rounding-mode enum) used across `FpuCore.scala`, `DivEuPlugin.scala`, and decode.
+- `src/main/scala/m68k040/execute/fpu/FpTypes.scala` — shared bundles (`FpOp`, `FpUnpacked`,
+  `FpExcFlags`, `FpResult`, `FpRoundReq`, the `Fp80` helper object) used across
+  `FpuCore.scala`, `DivEuPlugin.scala`, and decode. (Corrected from the stale
+  `FpuTypes.scala`/`FpuOp`/`Extended80` names this line previously carried — Task A's own
+  Files: block and Step 1 header both independently confirm `FpTypes.scala`/`FpOp` are the
+  real, landed names.)
 - `src/main/scala/m68k040/execute/regfile/RegFilePluginFp.scala` — new 80-bit×16 physical
   register file plugin instance (Task 1), following `RegFilePlugin.scala`'s existing generic
   `RegfileSpec`-parametrized pattern.
@@ -125,6 +176,14 @@ New files:
   AEXC-fold tests (Task 9).
 - `src/test/scala/m68k040/exception/FsaveFrestoreSpec.scala` — FSAVE/FRESTORE frame-emission
   and privilege tests (Task 11).
+- `src/test/scala/m68k040/decode/FpMemLoadSpec.scala` — dispatch-boundary tests for the
+  genuine memory-source `F<op> <mem>,FPn` load family (Task 6b).
+- `src/test/scala/m68k040/decode/MicrocodeFmovemCtrlSpec.scala` — row-generator unit tests for
+  the FMOVEM control-register LIST form (Task 9b).
+- `src/test/scala/m68k040/lockstep/FmovemCtrlListSpec.scala` — whitebox round-trip + register-
+  order tests for the FMOVEM control-list form's `-(An)` and non-`-(An)` cases (Task 9b; may
+  instead land inside `FpuControlPluginSpec.scala`, the task's own text leaves the exact file
+  as an implementer's call).
 
 Modified files (all existing, precedents verified during research):
 - `src/main/scala/m68k040/rename/RenameStage.scala` — new `fpccRat`/`fpccFree` (Task 2).
@@ -136,18 +195,25 @@ Modified files (all existing, precedents verified during research):
 - `src/main/scala/m68k040/execute/iq/IqContext.scala` — `cplxFpWakeup`/`cplxFpccWakeup:
   Flow[UInt]` service ports (Task 3).
 - `src/main/scala/m68k040/decode/DecodedUop.scala` — new `DecOp.FPU` element, `FpSrcKind`
-  enum, FP src/dst/FPCC decode fields + `fpInert()` helper, `fpuSoftwareComplete`/
+  enum (widened again by Task 6b for `MEMPAIR`/`MEMEXT`), `fpSrcFmt`/`fpWideImm` fields
+  (Task 6), FP src/dst/FPCC decode fields + `fpInert()` helper, `fpuSoftwareComplete`/
   `fpuCmdWord` (Task 4, Task 10), new `SysKind.FMOVE_FPCTRL`/`FSAVE`/`FRESTORE` (Task 9,
   Task 11).
 - `src/main/scala/m68k040/decode/DecodeContracts.scala` — new `OpSpec.fpGeneric` field
   (Task 4).
 - `src/main/scala/m68k040/decode/OperationDecoder.scala` — new `is(0xF)` arm sub-cases for the
-  HW-native FP ops, the FMOVE-to-control-register form, and FSAVE/FRESTORE (Task 4, Task 9,
-  Task 11).
+  HW-native FP ops, the memory-mode-`<ea>` cpGEN dispatch arm (Task 6b), the
+  FMOVE-to-control-register form and its LIST-mask extension (Task 9, Task 9b), and
+  FSAVE/FRESTORE (Task 4, Task 6b, Task 9, Task 9b, Task 11).
 - `src/main/scala/m68k040/frontend/PredecodeWord.scala` — F-line length framing for the new FP
-  opcodes (Task 5).
+  opcodes (Task 5), extended for the FMOVEM control-list form (Task 9b).
 - `src/main/scala/m68k040/decode/MicroOpAssembler.scala` — FP µop assembly, `faultUsesNextPc`
   fix (Task 6, Task 10).
+- `src/main/scala/m68k040/decode/Microcode.scala` — new `Sel`/`UOp` elements and ROM entry
+  groups for the memory-source FP load crack (Task 6b) and the FMOVEM control-list crack
+  (Task 9b, a compile-time-generated 24-program family).
+- `src/main/scala/m68k040/decode/DecodeStage.scala` — `ucBegin` ctx population + `ucEntry`
+  override/reject logic for both new microcoded families (Task 6b, Task 9b).
 - `src/main/scala/m68k040/execute/DivEuPlugin.scala` — new FP writeback lane, FPU EU
   integration, OVFL/UNFL substitution wiring (Task 8).
 - `src/main/scala/m68k040/exception/ExceptionUnit.scala` — vector 48-53 format-selection
@@ -170,8 +236,12 @@ Modified files (all existing, precedents verified during research):
   (Task 13, in addition to Task 2's `fpccRat`/`fpFree` additions).
 - `src/test/scala/m68k040/lockstep/ExecuteLockStepSpec.scala` — `FullCoreDut` gains
   `RegFilePluginFp`/`FpuControlPlugin`; `runLockStep` gains an optional `afterRun` callback
-  (Task 13); directed FMOVE-to-FPcr/FSAVE-privilege/`faultUsesNextPc` whitebox tests (Task 9,
-  Task 10).
+  (Task 13); directed FMOVE-to-FPcr/FSAVE-privilege whitebox tests (Task 9). (The
+  `faultUsesNextPc` behavior is verified at the decode level instead — `FpAssembleSpec`'s
+  directed tests plus `MicroOpAssemblerSpec`'s exhaustive cpGEN sweep, both Task 6 — since
+  Task 6's own directed coverage already exercises the same fact an end-to-end lock-step
+  handler test would, without the extra sim-harness machinery.) Task 9b adds a `-(An)`
+  register-order round-trip whitebox test to this file too.
 
 ---
 
@@ -609,7 +679,7 @@ Expected: both PASS.
 ```bash
 sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
 ```
-Expected: 396/396 PASS (unchanged from the pre-Task-2 baseline).
+Expected: 394/394 PASS (unchanged from the pre-Task-2 baseline).
 
 - [ ] **Step 14: Commit**
 
@@ -719,7 +789,8 @@ the design are CPLX, and **no µop reads FPCC at all** (FBcc/FScc/FDBcc and FMOV
 deferred). So `sbFp`/`sbFpcc` are provably no-op today and `readsFpcc` is constant-False until a
 later task. They are still added here, for the same reason `sbNzvc` coexists with `lsNzvcBusy` and
 `cplxNzvcBusy`: the push-side `when(isCplxFp) {...} .otherwise { sbFp ... }` chain must be **total**,
-so that Task 11's FRESTORE FP-PRF writer and Task 10's FMOVEM (an LS-cluster FP producer) cannot
+so that Task 11's FRESTORE FP-PRF writer and any future non-CPLX FP producer (e.g. an
+FMOVEM FP-data-register-list implementation, still unowned by any task in this plan) cannot
 land in a hole and have their dependency silently dropped. Do not "simplify" them away.
 
 - [ ] **Step 1: Declare the two new service ports**
@@ -805,7 +876,8 @@ than asserting it is free.
     // NOTE (see this task's scope note): today EVERY FP producer is CPLX and therefore
     // routes to the dynamic cplxFp*/cplxFpcc* bitmaps below, so these two are no-ops --
     // they exist so the push-side routing chain is TOTAL for the non-CPLX FP producers
-    // Task 10/11 add (FMOVEM on the LS port, FRESTORE's FP-PRF write).
+    // Task 11 adds (FRESTORE's FP-PRF write) and any future non-CPLX FP producer (e.g. an
+    // FMOVEM FP-data-register-list implementation -- still unowned by any task in this plan).
     val sbFp   = new Scoreboard(16)
     val sbFpcc = new Scoreboard(16)
     sbFp.busy.simPublic(); sbFpcc.busy.simPublic()  // debug-only
@@ -1240,7 +1312,7 @@ Expected: `IqFpSpec` PASSes; `IssueQueueSpec`/`IqLsSpec`/`IqCplxSpec`/`IqAluSlow
 ```bash
 sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
 ```
-Expected: 396/396 PASS (unchanged — no decode path can set `pFpDstValid`/`writesFpcc` until Task 6).
+Expected: 394/394 PASS (unchanged — no decode path can set `pFpDstValid`/`writesFpcc` until Task 6).
 
 - [ ] **Step 16: IQ OOC synth probe (the ready cone gained two terms — measure, do not assume)**
 
@@ -1285,8 +1357,10 @@ source), mirroring cplxNzvcWakeup.
 Two static Scoreboards (sbFp/sbFpcc) plus their trigInit dep() calls are
 added alongside. They are provably no-ops today -- every current FP
 producer is CPLX and routes to the dynamic bitmaps -- and exist so the
-push-side routing chain is TOTAL for the non-CPLX FP producers Task 10
-(FMOVEM on the LS port) and Task 11 (FRESTORE's FP-PRF write) add. No
+push-side routing chain is TOTAL for the non-CPLX FP producers Task 11
+(FRESTORE's FP-PRF write) adds, and for any future non-CPLX FP producer
+(e.g. an FMOVEM FP-data-register-list implementation, still unowned by
+any task in this plan). No
 uop reads FPCC yet either (FBcc/FScc/FMOVE-from-FPSR are deferred); the
 directed test drives the class synthetically at the IQ boundary.
 
@@ -1429,8 +1503,9 @@ disagrees with the provisional list above, **fix the code and this plan text**, 
   *              srcA/psrcA rename path (no 80-bit value ever enters IqContext).
   *   ROMCONST : opclass 010 / source specifier 111 -- FMOVECR; the source is the FPU's
   *              internal constant ROM, indexed by `imm[6:0]` (the raw offset).
-  * Memory-sourced forms (a real <ea> load) are NOT in this enum yet -- they are deferred
-  * to Task 10 along with FMOVEM and the FMOVE-to-<ea> direction. */
+  * Memory-sourced forms (a real <ea> load) are NOT in this enum yet -- they are added by
+  * Task 6b (MEMPAIR/MEMEXT), immediately after Task 6. FMOVEM and the FMOVE-to-<ea>
+  * direction remain unowned by any task in this plan. */
 object FpSrcKind extends SpinalEnum {
   val FPREG, INTREG, ROMCONST = newElement()
 }
@@ -1698,7 +1773,7 @@ assumption — they must be green.
 ```bash
 sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
 ```
-Expected: 396/396 PASS. `fpGenBad` makes every cpGEN encoding trap exactly as it did before, so any
+Expected: 394/394 PASS. `fpGenBad` makes every cpGEN encoding trap exactly as it did before, so any
 delta here is a real regression, not expected churn.
 
 - [ ] **Step 9: Commit**
@@ -2007,8 +2082,9 @@ class PredecodeFpLenSpec extends AnyFunSuite {
       // FADD.L (d8,A0,Xn),FP0: EA mode 6, BRIEF format (extW2 bit8 = 0) -> 1 ext
       chk(0xF230, 0x4022, 0x1000, 3, "FADD.L (d8,A0,Xn),FP0 brief")
       // FMOVE.X FP0,(A0)  : opclass 011 (FMOVE FPn -> <ea>), EA mode 2 -> 0 ext.
-      // Emission is deferred to Task 10; the LENGTH is framed now so the vector-11 trap
-      // carries a known length and FPSP can RTE past it.
+      // Emission is deferred (this store direction remains unowned by any task in this
+      // plan); the LENGTH is framed now so the vector-11 trap carries a known length and
+      // FPSP can RTE past it.
       chk(0xF210, 0x6800, 0x0000, 2, "FMOVE.X FP0,(A0) [framed, emission deferred]")
       // FMOVEM.X (A0),FP0-FP7 : opclass 110, EA mode 2 -> 0 ext (same reasoning)
       chk(0xF210, 0xD0FF, 0x0000, 2, "FMOVEM.X (A0),FP0-FP7 [framed, emission deferred]")
@@ -2084,7 +2160,7 @@ sbt "testOnly m68k040.frontend.*"
 sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
 ```
 Expected: frontend suite green (`AlignerSpec`/`FetchAlign*`/`InstructionBufferSpec` are the ones
-that would notice a new `ambiguousLine` producer); `ExecuteLockStepSpec` 396/396. Nothing executes
+that would notice a new `ambiguousLine` producer); `ExecuteLockStepSpec` 394/394. Nothing executes
 differently yet — every cpGEN encoding still traps via Task 4's `fpGenBad`; only the *stacked PC*
 would change, and that arrives in Task 6.
 
@@ -2151,6 +2227,11 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `src/main/scala/m68k040/decode/MicroOpAssembler.scala`
+- Modify: `src/main/scala/m68k040/decode/DecodedUop.scala` (widen `FpSrcKind`; add
+  `fpSrcFmt`/`fpWideImm` fields + their `fpInert()` defaults)
+- Modify: `src/main/scala/m68k040/rename/RenamedUop.scala` (mirror `fpSrcFmt`/`fpWideImm`)
+- Modify: `src/main/scala/m68k040/rename/RenameStage.scala` (copy-through, alongside the
+  existing FP field copies)
 - Test: `src/test/scala/m68k040/decode/FpAssembleSpec.scala`
 
 **Interfaces:**
@@ -2193,21 +2274,37 @@ genuinely testable at that point, because Task 5 already frames cpGEN lengths wh
 the RTL with no FP execution anywhere near it. Do not reorder these steps.
 
 **Scope split inside this plan (state it in review, do not silently widen):** this task emits real
-µops for the **single-µop** forms only —
+µops for the **single-µop, no-<ea>-memory-access** forms only —
 
-| Form | ext[15:13] | Emitted here? |
-|---|---|---|
-| `F<op> FPm,FPn` (register to register) | `000` | **Yes** |
-| `F<op>.<int/single> Dn,FPn` (data-register source) | `010`, `<ea>` = mode 0 | **Yes** |
-| `FMOVECR #ccc,FPn` | `010`, src spec `111` | **Yes** |
-| `F<op> <mem>,FPn` (real memory source) | `010`, `<ea>` ≥ mode 2 | No — Task 10 (needs a load crack; the X/D/P formats are 96/64/96-bit, i.e. multi-load) |
-| `FMOVE FPn,<ea>` | `011` | No — Task 10 |
-| `FMOVE(M) <ea>,FPCR/FPSR/FPIAR` | `100`/`101` | No — Task 10 |
-| `FMOVEM <ea>,list` / `list,<ea>` | `110`/`111` | No — Task 10 (a MOVEM-style DecodeStage sequencer, not an assembler crack) |
+| Form | ext[15:13] | src spec | Emitted here? |
+|---|---|---|---|---|
+| `F<op> FPm,FPn` (register to register) | `000` | n/a | **Yes** |
+| `F<op>.L/.W/.B/.S Dn,FPn` (data-register source) | `010` | `000/100/110/001`, `<ea>` = mode 0 | **Yes** |
+| `FMOVECR #ccc,FPn` | `010` | src spec `111` | **Yes** |
+| `F<op>.L #imm,FPn` (32-bit int immediate) | `010` | `000`, `<ea>` = mode7/reg4 | **Yes (this deliverable)** |
+| `F<op>.W #imm,FPn` (16-bit int immediate, sign-extended) | `010` | `100`, `<ea>` = mode7/reg4 | **Yes (this deliverable)** |
+| `F<op>.B #imm,FPn` (8-bit int immediate, sign-extended) | `010` | `110`, `<ea>` = mode7/reg4 | **Yes (this deliverable)** |
+| `F<op>.S #imm,FPn` (32-bit single bit-pattern immediate) | `010` | `001`, `<ea>` = mode7/reg4 | **Yes (this deliverable)** |
+| `F<op>.D #imm,FPn` (64-bit double bit-pattern immediate) | `010` | `101`, `<ea>` = mode7/reg4 | **Yes (this deliverable)** |
+| `F<op>.X #imm,FPn` (80-bit extended-precision immediate) | `010` | `010`, `<ea>` = mode7/reg4 | **Yes (this deliverable)** |
+| `F<op>.P #imm,FPn` (packed BCD immediate) | `010` | `011`, `<ea>` = mode7/reg4 | **No — permanently.** Decision 2: packed decimal always traps to FPSP, unconditionally, in hardware or immediate form alike. This is a FORMAT exclusion (gated on the source specifier, not on `fpNative`'s opmode whitelist), so it holds regardless of which opmode pairs with it. Do not "complete" this later. |
+| `F<op> <mem>,FPn` (real memory source: `<ea>` = register-indirect/displacement/indexed/PC-relative) | `010`, `<ea>` ≥ mode 2 | any | No — Task 6b (needs a genuine LS-EU load crack; the X/D/P formats are 96/64/96-bit, i.e. multi-access). |
+| `FMOVE FPn,<ea>` (store direction) | `011` | any | No — remains an unowned open gap; explicitly out of scope for both this task and Task 6b (Task 6b's own scope statement flags it, and no later task claims it either) |
+| `FMOVE(M) <ea>,FPCR/FPSR/FPIAR` | `100`/`101` | n/a | No — **Task 9**, which is already fully scoped for exactly this encoding band (verified: Task 9's own "Encoding" section derives `1111 001 000 mmmrrr` + ext `ddd`=`100`/`101` from three independent corpus/spec sources, and its own Files: list already modifies `MicroOpAssembler.scala`). Task 9b extends Task 9 to the multi-register-list mask population of the same band. |
+| `FMOVEM <ea>,list` / `list,<ea>` (multiple FP DATA registers) | `110`/`111` | n/a | No — unowned (a MOVEM-style DecodeStage sequencer, not an assembler crack); Task 6b explicitly excludes it too |
 
 Everything in the "No" rows keeps taking vector 11 — but now, thanks to Task 5 + Step 2, with
 `faultUsesNextPc = True`, which is precisely what makes them FPSP-completable rather than infinite
 loops.
+
+**Handoff.** Register-indirect / displacement / indexed / PC-relative memory-source FMOVE
+(the `F<op> <mem>,FPn` load direction) is implemented by **Task 6b**, immediately following
+this task. The `FMOVE FPn,<ea>` store direction and packed-decimal memory sources remain
+explicitly unowned by any task in this plan — say so, don't silently assume covered. This
+task's only obligation to Task 6b is to leave `fpGenBad`/vector-11 routing for the memory-source
+forms completely unchanged (still trapping, still with `faultUsesNextPc=True` thanks to Task 5's
+general length framing) so Task 6b only has to narrow `fpGenBad` further, exactly the relationship
+this task already has with Task 9 for the control-register forms.
 
 ---
 
@@ -2339,7 +2436,7 @@ class FpAssembleSpec extends AnyFunSuite {
 sbt "testOnly m68k040.decode.FpAssembleSpec"
 sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
 ```
-Expected: the three tests above PASS and `ExecuteLockStepSpec` is 396/396. The lock-step run is the
+Expected: the three tests above PASS and `ExecuteLockStepSpec` is 394/394. The lock-step run is the
 real proof that Step 2 is a no-op on the existing ISA: `fpLenKnown` requires `spec.fpGeneric`, which
 no pre-FPU encoding sets.
 
@@ -2373,7 +2470,7 @@ lenWords>=2 means 'full length known'.
 
 Behavior-neutral on the current ISA -- the new term requires
 spec.fpGeneric, which no pre-FPU encoding sets -- and ExecuteLockStepSpec
-is unchanged at 396/396.
+is unchanged at 394/394.
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
@@ -2417,7 +2514,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
     // FCMP (0x38) and FTST (0x3A) write ONLY the condition codes -- no FP destination.
     val fpNoFpDst = (fpOpmode === B"7'h38") || (fpOpmode === B"7'h3A")
 
-    // Emittable forms (this task's scope -- see the plan's scope table). All THREE are
+    // Emittable forms (this task's scope -- see the plan's scope table). All of these are
     // single-uop and touch no memory:
     //   (a) opclass 000  : F<op> FPm,FPn
     //   (b) opclass 010 with an INT/single source specifier and <ea> = Dn (mode 0):
@@ -2425,21 +2522,129 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
     //       int rename path (no 80-bit value ever enters IqContext, per the 2026-08-09
     //       design's gateway topology).
     //   (c) opclass 010 with source specifier 111 : FMOVECR #ccc,FPn (constant ROM).
-    // Real memory sources, FMOVE->ea, the FPCR/FPSR/FPIAR moves and FMOVEM are DEFERRED
-    // to Task 10 -- they need a load/store crack or a MOVEM-style sequencer, and the
-    // X/D/P formats are 96/64/96 bits (multi-access), not a single load.
+    //   (d) opclass 010 with <ea> = mode7/reg4 (#imm), every non-Packed source format:
+    //       F<op>.L/.W/.B/.S/.D/.X #imm,FPn -- see Step 4a/Step 5 below.
+    // Real memory sources (<ea> >= mode 2) are DEFERRED to Task 6b -- they need a genuine
+    // LS-EU load crack, and the X/D/P formats are 96/64/96 bits (multi-access), not a
+    // single load or a decode-resident immediate. FMOVE-to-<ea> remains unowned by any
+    // task in this plan. The FPCR/FPSR/FPIAR moves are Task 9's own encoding band.
     val fpFormIsReg    = (fpOpClass === B"3'b000")
     val fpFormIsMovecr = (fpOpClass === B"3'b010") && (fpSrcSpec === B"3'b111")
     val fpIntFmt       = (fpSrcSpec === B"3'b000") || (fpSrcSpec === B"3'b100") ||
                          (fpSrcSpec === B"3'b110") || (fpSrcSpec === B"3'b001")  // L / W / B / S
     val fpFormIsIntReg = (fpOpClass === B"3'b010") && fpIntFmt && (fpEaMode === U(0, 3 bits))
+
+    // ── Immediate-source forms (this deliverable) ──────────────────────────────
+    // `<ea>` = mode 7 / reg 4 is `#imm` for EVERY opclass, but only opclass 010 can pair
+    // with it (a destination cannot be immediate, and opclass 000/registers-only forms
+    // never consult the opword's <ea> field at all -- see Task 5's own note: "only a
+    // SOURCE (opclass 010) can be immediate; an immediate destination is not encodable").
+    val fpFormIsImm    = (fpOpClass === B"3'b010") &&
+                         (fpEaMode === U(7, 3 bits)) && (fpEaReg === U(4, 3 bits))
+    // Packed decimal (#imm, source spec 011) is explicitly OUT of hardware scope --
+    // Decision 2 traps packed decimal to FPSP unconditionally, regardless of opmode. This
+    // is a FORMAT exclusion, computed independently of `fpNative`'s opmode whitelist, so
+    // "FADD.P #imm,FPn" (a native opmode paired with a non-native format) is excluded too.
+    val fpImmIsPacked  = fpSrcSpec === B"3'b011"
+
     val fpEmit = spec.fpGeneric && pkt.simple && (pkt.lenWords >= U(2)) &&
-                 (fpFormIsMovecr || ((fpFormIsReg || fpFormIsIntReg) && fpNative))
+                 (fpFormIsMovecr ||
+                  ((fpFormIsReg || fpFormIsIntReg) && fpNative) ||
+                  (fpFormIsImm && !fpImmIsPacked && fpNative))
     // Narrowed from Task 4's blanket `spec.fpGeneric`: everything cpGEN that this task
     // does NOT emit still takes the ordinary vector-11 F-line trap -- now with
     // faultUsesNextPc=True whenever predecode framed it (Step 2), which is what makes it
     // FPSP-completable instead of an infinite loop.
     val fpGenBad = spec.fpGeneric && !fpEmit
+
+    // ── Immediate word extraction ────────────────────────────────────────────────
+    // The immediate data ALWAYS starts at pkt.words(2) (right after opword + FP ext
+    // word); only its WIDTH varies by format, matching Task 5's own fpImmWords table
+    // exactly (Long/Single=2w, Word/Byte=1w, Double=4w, Extended=6w). Cross-checked here:
+    // every width below consumes precisely the words Task 5 already frames for it, so
+    // predecode's lenWords and this task's word indexing can never disagree.
+    val fpImmLongVal   = pkt.words(2) ## pkt.words(3)                         // Long: 32 bits, no extension
+    val fpImmWordVal   = pkt.words(2).asSInt.resize(32).asBits                // Word: sign-extend 16->32
+    val fpImmByteVal   = pkt.words(2)(7 downto 0).asSInt.resize(32).asBits    // Byte: low byte, sign-extend 8->32
+    val fpImmSingleVal = pkt.words(2) ## pkt.words(3)                         // Single: 32-bit BIT PATTERN verbatim
+    val fpImmDoubleVal = pkt.words(2) ## pkt.words(3) ## pkt.words(4) ## pkt.words(5)  // Double: 64-bit BIT PATTERN
+    // Extended: word2=sign+exp, word3=RESERVED (SKIPPED -- never read, matching Musashi's
+    // load_extended_float80/READ_EA_FPE case 4 "immediate": d3=read_16(ea) [sign+exp],
+    // d1=read_32(ea+4) [mantissa hi32], d2=read_32(ea+8) [mantissa lo32]; ea+2, the
+    // reserved word, is never touched -- re-verified directly against
+    // tools/musashi/musashi/m68kfpu.c:64-77,684-711 in this session), words4-7=64-bit
+    // mantissa. This IS the internal Fp80 layout (Decision 1) -- zero conversion needed.
+    val fpImmExtVal    = pkt.words(2) ## pkt.words(4) ## pkt.words(5) ## pkt.words(6) ## pkt.words(7)
+```
+
+- [ ] **Step 4a: Widen `FpSrcKind` and add `fpSrcFmt`/`fpWideImm`**
+
+Four new source kinds and two new fields, added directly to the bundles Task 4 declared (the
+established per-task field-accretion convention — Task 10 does the same for
+`fpuSoftwareComplete`/`fpuCmdWord`).
+
+```scala
+// src/main/scala/m68k040/decode/DecodedUop.scala
+// (a) widen FpSrcKind -- append after ROMCONST, preserving existing ordinals:
+object FpSrcKind extends SpinalEnum {
+  val FPREG, INTREG, ROMCONST,
+      // ── Immediate-source forms (this deliverable) ──────────────────────────
+      // INTIMM   : a 32-bit SIGN-EXTENDED integer immediate (Long/Word/Byte source
+      //            specifiers all normalize to this -- MicroOpAssembler already did the
+      //            sign-extension at decode time). Converts like INTREG, sourced from
+      //            fpWideImm(31 downto 0) instead of a register read.
+      // SINGLEIMM: a 32-bit single-precision BIT PATTERN immediate (NOT an integer --
+      //            converting it as one would turn 0x3F800000 (1.0f) into 1065353216.0,
+      //            a completely wrong result). fpWideImm(31 downto 0).
+      // DOUBLEIMM: a 64-bit double-precision BIT PATTERN immediate. fpWideImm(63 downto 0).
+      // EXTIMM   : an 80-bit extended-precision immediate -- the SAME internal layout as
+      //            an FP register (Decision 1), so this is the simplest case: route
+      //            fpWideImm(79 downto 0) directly as the extended-precision source, no
+      //            format conversion at the EU at all.
+      // Task 6b (memory-source loads) reuses INTREG unmodified for its 1-chunk formats
+      // (Byte/Word/Long/Single via a temp register) and adds two SEPARATE kinds of its
+      // own, MEMPAIR/MEMEXT, for the 2/3-chunk Double/Extended memory loads -- all sharing
+      // this SAME fpSrcFmt-based format-disambiguation mechanism, not a parallel one.
+      INTIMM, SINGLEIMM, DOUBLEIMM, EXTIMM = newElement()
+}
+
+// (b) add to `case class DecodedUop()`, immediately after `val fpSrcKind = FpSrcKind()`:
+  // The raw extension-word source SPECIFIER (ext[12:10]), verbatim. Meaningful whenever
+  // fpSrcKind is one of {INTREG, INTIMM, SINGLEIMM, DOUBLEIMM, EXTIMM} (every opclass-010
+  // form); ignored by the EU for FPREG/ROMCONST. This is the field that RESOLVES the
+  // Long-vs-Single ambiguity this task previously left open for Task 8 (see that section's
+  // updated note): `size` alone cannot distinguish a 32-bit INTEGER from a 32-bit BIT
+  // PATTERN, but fpSrcFmt (000 vs 001) can.
+  val fpSrcFmt  = Bits(3 bits)
+  // The immediate VALUE for every fpWideImm-routed fpSrcKind above, right-justified /
+  // zero-padded to 80 bits regardless of the real format width (32/64/80 bits meaningful,
+  // per fpSrcFmt). Carried through rename/IQ exactly like `imm` already is -- IqContext
+  // embeds the WHOLE RenamedUop, so this costs nothing beyond its own bit-width, the same
+  // class of cost as `imm`/`fpuCmdWord`. Deliberately NOT reusing `imm` (32 bits, and
+  // already committed to FMOVECR's ROM offset) -- see this task's routing-contract note.
+  val fpWideImm = Bits(80 bits)
+
+// (c) extend `fpInert()`:
+  def fpInert(): Unit = {
+    fpSrcAReg := 0; usesFpSrcA := False
+    fpSrcBReg := 0; usesFpSrcB := False
+    fpDstReg  := 0; writesFp   := False
+    readsFpcc := False; writesFpcc := False
+    fpuOp     := 0; fpSrcKind := FpSrcKind.FPREG
+    fpSrcFmt  := 0; fpWideImm := B(0, 80 bits)
+  }
+```
+
+```scala
+// src/main/scala/m68k040/rename/RenamedUop.scala -- add alongside the existing FP fields
+// Task 2 already placed there:
+  val fpSrcFmt  = Bits(3 bits)
+  val fpWideImm = Bits(80 bits)
+
+// src/main/scala/m68k040/rename/RenameStage.scala -- add alongside the existing FP field
+// copy-through:
+      r.fpSrcFmt  := dec.fpSrcFmt
+      r.fpWideImm := dec.fpWideImm
 ```
 
 `fpEmit` requires `pkt.simple && lenWords >= 2` for a real reason, not belt-and-braces: if predecode
@@ -2483,6 +2688,14 @@ instruction — a wild-PC class bug. Gating emission on the *same* framing fact 
       // srcA = the DESTINATION FPn read back, ONLY for the dyadic ops.
       opUop.fpSrcAReg := fpDstFp
       opUop.usesFpSrcA := fpDyadic
+      // `fpSrcFmt` is meaningful whenever fpSrcKind indicates an opclass-010 form
+      // (INTREG/INTIMM/SINGLEIMM/DOUBLEIMM/EXTIMM below); it is verbatim ext[12:10] --
+      // for FPREG/ROMCONST it happens to be driven from whatever fpSrcSpec computes to
+      // for THIS extension word's bit layout (harmless: fpSrcKind tells the EU never to
+      // read it in those cases). Driven once here, outside the branch chain, so every
+      // branch gets it for free instead of repeating it.
+      opUop.fpSrcFmt := fpSrcSpec
+
       // Source routing.
       when(fpFormIsMovecr) {
         // FMOVECR: no register source at all; the constant's ROM offset rides `imm`.
@@ -2496,6 +2709,7 @@ instruction — a wild-PC class bug. Gating emission on the *same* framing fact 
         opUop.srcAValid  := False; opUop.srcBValid := False
         opUop.useImm     := True
         opUop.imm        := fpOpmode.resize(32)
+        opUop.fpWideImm  := B(0, 80 bits)
         opUop.size       := Size.LONG
       } .elsewhen(fpFormIsReg) {
         // F<op> FPm,FPn: the source is FP register FPm (ext[12:10]).
@@ -2504,7 +2718,43 @@ instruction — a wild-PC class bug. Gating emission on the *same* framing fact 
         opUop.usesFpSrcB := True
         opUop.srcAValid  := False; opUop.srcBValid := False
         opUop.useImm     := False
+        opUop.fpWideImm  := B(0, 80 bits)
         opUop.size       := Size.LONG
+      } .elsewhen(fpFormIsImm) {
+        // F<op>.<fmt> #imm,FPn (THIS DELIVERABLE): no register source at all. The value
+        // rides the NEW `fpWideImm` field (80 bits, carried through the IQ exactly like
+        // `imm` already is -- IqContext embeds the WHOLE RenamedUop). `imm`/`useImm` stay
+        // reserved for FMOVECR's ROM offset and are NOT reused here, so Task 8 has exactly
+        // ONE dispatch: fpSrcKind selects the ROUTE (register / imm / fpWideImm),
+        // fpSrcFmt selects the FORMAT within a fpWideImm-routed value.
+        //
+        // Gated identically to the register-form/INTREG cases: fpNative excludes every
+        // transcendental/rounded-precision opmode regardless of source format (an
+        // "FSIN.L #imm,FPn" still traps to FPSP, exactly like "FSIN FP1,FP0" already does);
+        // Packed (fpImmIsPacked) is excluded independently of opmode by fpEmit's gate
+        // above, so it is unreachable here.
+        opUop.fpSrcKind := fpSrcSpec.mux(
+          B"3'b000" -> FpSrcKind.INTIMM,     // Long
+          B"3'b001" -> FpSrcKind.SINGLEIMM,  // Single
+          B"3'b010" -> FpSrcKind.EXTIMM,     // Extended
+          B"3'b100" -> FpSrcKind.INTIMM,     // Word
+          B"3'b101" -> FpSrcKind.DOUBLEIMM,  // Double
+          B"3'b110" -> FpSrcKind.INTIMM,     // Byte
+          default   -> FpSrcKind.INTIMM      // unreachable: 011=Packed excluded by fpEmit; 111=FMOVECR claimed earlier
+        )
+        opUop.usesFpSrcB := False; opUop.fpSrcBReg := 0   // no FP register source
+        opUop.srcAValid  := False; opUop.srcBValid := False   // no INT register source either
+        opUop.useImm     := False    // `imm` is NOT used for these -- fpWideImm is, see above
+        opUop.fpWideImm  := fpSrcSpec.mux(
+          B"3'b000" -> (B(0, 48 bits) ## fpImmLongVal),
+          B"3'b001" -> (B(0, 48 bits) ## fpImmSingleVal),
+          B"3'b010" -> fpImmExtVal,
+          B"3'b100" -> (B(0, 48 bits) ## fpImmWordVal),
+          B"3'b101" -> (B(0, 16 bits) ## fpImmDoubleVal),
+          B"3'b110" -> (B(0, 48 bits) ## fpImmByteVal),
+          default   -> B(0, 80 bits)
+        )
+        opUop.size       := Size.LONG   // inert for these -- fpSrcFmt is the load-bearing width selector
       } .otherwise {
         // F<op>.L/.W/.B/.S Dn,FPn: a 32-bit INTEGER register read on the ORDINARY int
         // rename/scoreboard path (srcA/psrcA), converted to extended precision inside the
@@ -2517,11 +2767,11 @@ instruction — a wild-PC class bug. Gating emission on the *same* framing fact 
         opUop.srcAValid  := True
         opUop.srcBValid  := False
         opUop.useImm     := False
-        // `size` tells the EU how wide the integer source is. The single-precision case
-        // (specifier 001) is a 32-bit BIT PATTERN, not an integer, and is distinguished by
-        // fpSrcSpec-derived state in the EU, not by `size` -- LONG is the correct width
-        // for both. (Task 8 owns the conversion; it re-reads the specifier from `fpuOp`'s
-        // sibling state, so do NOT try to encode the format in `size`.)
+        opUop.fpWideImm  := B(0, 80 bits)
+        // `size` distinguishes Word/Byte from the default 32-bit read (Long AND Single
+        // both read a full 32-bit Dn -- Single's BIT-PATTERN-vs-INTEGER distinction is
+        // now carried by `fpSrcFmt` above, not by `size`; this RESOLVES the open item this
+        // task previously flagged for Task 8 -- see the updated note below).
         when(fpSrcSpec === B"3'b100") { opUop.size := Size.WORD }
           .elsewhen(fpSrcSpec === B"3'b110") { opUop.size := Size.BYTE }
           .otherwise { opUop.size := Size.LONG }
@@ -2529,12 +2779,20 @@ instruction — a wild-PC class bug. Gating emission on the *same* framing fact 
     }
 ```
 
-**Open item for Task 8, flagged rather than fudged:** the INTREG form needs the *source specifier*
-(L vs W vs B vs S) in the EU, and the snippet above carries only `size`, which cannot distinguish
-Long from Single. Either (a) widen `fpuOp` to carry `{fpSrcSpec, opmode}` (10 bits), or (b) add a
-3-bit `fpSrcFmt` field to `DecodedUop`. Decide this at the top of Task 8 and update this step's code
-accordingly — **do not leave the Single case silently decoding as Long**, which would produce a
-plausible-looking but completely wrong result for `FMOVE.S D0,FP0`.
+**Open item RESOLVED by this deliverable (was previously flagged for Task 8 to decide):** Step 4a
+adds a 3-bit `fpSrcFmt` field carrying ext[12:10] verbatim on every opclass-010 form (option (b)
+from the original flag). Task 8's contract is now fully specified: `fpSrcKind` selects the ROUTE
+(FPREG -> `fpRdB`/register read; INTREG -> `srcA`/int register read, converted; ROMCONST -> `imm`,
+indexes the constant ROM; INTIMM/SINGLEIMM/DOUBLEIMM/EXTIMM -> `fpWideImm`, converted per format);
+`fpSrcFmt` selects the conversion WITHIN the INTREG/INTIMM/SINGLEIMM/DOUBLEIMM/EXTIMM routes
+(000=Long int, 001=Single bit-pattern, 010=Extended [pass-through, no conversion], 100=Word int,
+101=Double bit-pattern, 110=Byte int; 011=Packed and 111=FMOVECR never reach the EU via this field
+at all). Task 8 must NOT re-derive this from `size` — `size` is set for INTREG/INTIMM only, to
+distinguish Word/Byte truncation width from the default 32-bit read, and is redundant with (not a
+substitute for) `fpSrcFmt` for the Long-vs-Single question. See Task 8's Step 5 for the
+corresponding operand-routing code. Task 6b (memory-source loads, immediately following this
+task) reuses this exact `fpSrcFmt` mechanism for its own MEMPAIR/MEMEXT source kinds — one shared
+format-disambiguation field for both the immediate-source and memory-source cases, not two.
 
 - [ ] **Step 6: Extend `FpAssembleSpec` with the FP-emission cases**
 
@@ -2622,11 +2880,11 @@ plausible-looking but completely wrong result for `FMOVE.S D0,FP0`.
       }
       trapsWithNextPc(0xF200, 0x000E, 2, "FSIN (transcendental -> FPSP)")
       trapsWithNextPc(0xF200, 0x0462, 2, "FSADD (rounded-precision variant, opmode bit6 -> FPSP)")
-      trapsWithNextPc(0xF210, 0x4022, 2, "FADD.L (A0),FP0 (memory source -> Task 10)")
+      trapsWithNextPc(0xF210, 0x4022, 2, "FADD.L (A0),FP0 (memory source -> Task 6b)")
       trapsWithNextPc(0xF210, 0x5822, 2, "FADD.P (A0),FP0 (packed decimal -> FPSP)")
-      trapsWithNextPc(0xF210, 0x6800, 2, "FMOVE.X FP0,(A0) (opclass 011 -> Task 10)")
-      trapsWithNextPc(0xF210, 0xD0FF, 2, "FMOVEM.X (A0),FP0-FP7 (opclass 110 -> Task 10)")
-      trapsWithNextPc(0xF210, 0x9000, 2, "FMOVE.L <ea>,FPCR (opclass 100 -> Task 10)")
+      trapsWithNextPc(0xF210, 0x6800, 2, "FMOVE.X FP0,(A0) (opclass 011, store direction -> unowned)")
+      trapsWithNextPc(0xF210, 0xD0FF, 2, "FMOVEM.X (A0),FP0-FP7 (opclass 110 -> unowned)")
+      trapsWithNextPc(0xF210, 0x9000, 2, "FMOVE.L (A0),FPCR (opclass 100, memory-EA -> unowned; Task 9 covers only register-direct <ea>, and Task 9b's optional popcount==1-with-memory-EA extension is not guaranteed landed by default)")
     }
   }
 
@@ -2659,7 +2917,7 @@ are fed by something other than a test harness.
 ```bash
 sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
 ```
-Expected: 396/396 PASS. No lock-step program contains an FP opcode, so a delta here means an FP arm
+Expected: 394/394 PASS. No lock-step program contains an FP opcode, so a delta here means an FP arm
 leaked into a non-FP encoding — most likely `fpEmit`/`fpGenBad` not being properly gated on
 `spec.fpGeneric`, or a `when` arm placed before `when(bad)` instead of after it.
 
@@ -2698,15 +2956,36 @@ ORDINARY int rename/scoreboard path, so no 80-bit value ever enters
 IqContext or the integer operand mux (the 2026-08-09 design's gateway
 topology).
 
+ALSO emits every immediate-source form (Long/Word/Byte int, Single/Double
+bit-pattern, Extended pass-through) via a NEW `fpWideImm` field (80 bits,
+DecodedUop/RenamedUop) -- deliberately NOT the existing 32-bit `imm`
+field, which stays reserved for FMOVECR's ROM offset. Long/Word/Byte
+sign-extend to 32 bits at decode time (Word/Byte tested with a NEGATIVE
+value specifically, to catch a missing-sign-extend bug); Single/Double
+carry their IEEE-754-shaped bit pattern VERBATIM, never converted as an
+integer (FADD.S's directed test uses 0x40490FDB specifically because
+misrouting it through the integer path would silently produce 1078530011
+instead of ~3.14159); Extended is the internal Fp80 layout already
+(Decision 1) and needs no conversion at the EU at all -- its directed
+test deliberately puts a non-zero value in the reserved word to prove it
+is skipped, not folded in (cross-checked against Musashi's
+load_extended_float80/READ_EA_FPE, m68kfpu.c:64-77,684-711, in-session).
+Packed-decimal immediates are excluded by a FORMAT check independent of
+the opmode whitelist, so they trap regardless of which opmode they pair
+with, permanently (Decision 2) -- a directed test pins this down too.
+
 Everything else cpGEN -- transcendentals, FMOD/FREM/FSCALE/FGETEXP,
-FSINCOS, the rounded-precision FSxxx/FDxxx variants, packed decimal, real
-memory sources, FMOVE-to-<ea>, the FPCR/FPSR/FPIAR moves, and FMOVEM --
+FSINCOS, the rounded-precision FSxxx/FDxxx variants, packed decimal
+(both register-source and immediate-source), FMOVE-to-<ea>, and FMOVEM --
 keeps taking vector 11, now with faultUsesNextPc set because Task 5
 framed its length, which is exactly what makes those encodings
-FPSP-completable rather than infinite loops. The memory/FMOVEM families
-are deferred to Task 10 (they need a load/store crack or a MOVEM-style
-sequencer; the X/D/P formats are 96/64/96 bits, i.e. multi-access, not a
-single load).
+FPSP-completable rather than infinite loops. Real memory sources
+(`F<op> <mem>,FPn`) are Task 6b's, immediately following this task (they
+need a genuine LS-EU load crack; the X/D/P formats are 96/64/96 bits,
+i.e. multi-access, not a single load or a decode-resident immediate).
+`FMOVE FPn,<ea>` (the store direction) remains an unowned open gap. The
+FPCR/FPSR/FPIAR control-register moves are Task 9's, which already owns
+that encoding band independently.
 
 Emission is gated on the SAME framing fact that gates the trap PC flavor
 (pkt.simple && lenWords >= 2), so decode and predecode can never hold
@@ -2716,32 +2995,873 @@ wild-PC class bug. A directed test pins that down explicitly.
 
 Opmode values, field positions and the FMOVECR encoding were confirmed
 against the in-tree vendored tools/musashi/musashi/m68kfpu.c (including
-its own literal 'fmovecr #\$f, fp0  f200 5c0f' example). One open item is
-flagged in the code for Task 8 rather than fudged: the int-source form
-must carry the source SPECIFIER (Long vs Single is not expressible in
-\`size\`) so FMOVE.S does not silently decode as FMOVE.L.
+its own literal 'fmovecr #\$f, fp0  f200 5c0f' example). This task also
+RESOLVES the open item it previously flagged for Task 8: the int-source
+form's Long-vs-Single ambiguity (not expressible in \`size\` alone) is
+now carried explicitly by the new \`fpSrcFmt\` field, driven for every
+opclass-010 form.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
+```
+
+- [ ] **Step 11: Update `MicroOpAssemblerSpec`'s exhaustive line-F sweep — it is currently
+  BLIND to this task's `faultUsesNextPc` behavior (false-negative, not a real pass)**
+
+`MicroOpAssemblerSpec`'s pre-existing "line-F: every UNIMPLEMENTED opword faults to vector
+11, exhaustively" test drives every swept opword via `drive(dut, op)`, whose default `len=1`
+(`MicroOpAssemblerSpec.scala:17`). Since this task's `fpLenKnown` requires
+`pkt.lenWords >= U(2)`, and the sweep hardcodes `len=1` for every opword including the whole
+cpGEN band, `fpLenKnown` is trivially False throughout the ENTIRE existing sweep — the sweep
+currently asserts `usesNextPc == false` for every opword and would keep passing even if this
+task's `faultUsesNextPc` fix were completely reverted, because it never drives a `len` that
+could make the new code path fire at all.
+
+```scala
+// src/test/scala/m68k040/decode/MicroOpAssemblerSpec.scala
+// Extend `implemented(op)` to also recognize the cpGEN band so it is excluded from the
+// "every opword faults, and usesNextPc is always false" baseline sweep, and add a SEPARATE
+// length-aware sweep specifically for it:
+      def implemented(op: Int): Boolean = {
+        val cpush   = (op & 0x0F00) == 0x0400
+        val pflush  = ((op & 0xFFC0) == 0xF500) && ((op >> 3) & 7) <= 3
+        val ptest   = ((op & 0xFF00) == 0xF500) && ((op & 0x0080) == 0) &&
+                      ((op & 0x0040) != 0) && ((op & 0x0010) == 0) && ((op & 0x0008) != 0)
+        val move16  = (op & 0xFFF8) == 0xF620
+        val fsf     = op == 0xF27F
+        val cpgen   = ((op >> 9) & 0x7) == 1 && ((op >> 6) & 0x7) == 0   // 0xF200-0xF23F
+        cpush || pflush || ptest || move16 || fsf || cpgen
+      }
+
+  test("line-F cpGEN band: framed-but-non-emittable opwords stack the POST-instruction PC", VerilatorTest) {
+    run { dut =>
+      val bad = scala.collection.mutable.ArrayBuffer[String]()
+      for (low <- 0 until 64) {   // full cpGEN band, opword = 0xF200 | low
+        val op = 0xF200 | low
+        // Drive at len=2 (the register-form framing) with a NON-NATIVE opmode (0x0E, FSIN)
+        // so fpEmit never fires and this always exercises the TRAPPING path.
+        drive(dut, op, ext = 0x000E, len = 2); sleep(1)
+        val faulted = dut.uop.faulted.toBoolean
+        val vec     = dut.uop.faultVector.toInt
+        val nextPc  = dut.uop.faultUsesNextPc.toBoolean
+        if (!faulted || vec != 11 || !nextPc)
+          bad += f"0x$op%04X faulted=$faulted vec=$vec usesNextPc=$nextPc (want true)"
+      }
+      assert(bad.isEmpty, s"${bad.size}/64 cpGEN opwords: faultUsesNextPc not set when framed; " +
+        bad.take(10).mkString("\n"))
+    }
+  }
+```
+
+```bash
+sbt "testOnly m68k040.decode.MicroOpAssemblerSpec"
+```
+Expected: PASS, including the pre-existing exhaustive sweep (now correctly excluding the
+cpGEN band, which has its own dedicated, length-aware coverage above) and the new test.
+
+---
+
+**Handoffs this task creates, for whoever writes Task 6b onward:**
+
+- **Task 8** must drive `iq.cplxFpWakeup`/`iq.cplxFpccWakeup` from `DivEuPlugin` with the same
+  `compLive && <write> && !compFault` gating as `wakeup`/`wakeupNzvc`, and wire them in
+  `FullCoreSynth.scala` next to the existing `iq.cplxNzvcWakeup` lines. Its operand-routing
+  contract is now fully specified: dispatch on `fpSrcKind` (FPREG/INTREG/ROMCONST/INTIMM/
+  SINGLEIMM/DOUBLEIMM/EXTIMM/MEMPAIR/MEMEXT — the last two added by Task 6b) for the ROUTE,
+  `fpSrcFmt` for the FORMAT within a register/fpWideImm-routed value — see Task 8's own Step 5
+  for concrete code, including the int-to-extended/single-to-extended/double-to-extended
+  conversion helpers this now genuinely requires (previously entirely unaddressed even for the
+  pre-existing INTREG case).
+- **Task 6b (immediately following this task)** owns the remaining deferred cpGEN load form:
+  real memory sources (needs a genuine LS-EU load crack; X/D/P are multi-access), reusing this
+  task's `fpSrcFmt` field for its own MEMPAIR/MEMEXT source kinds. `FMOVE FPn,<ea>` (the store
+  direction) and FMOVEM (a MOVEM-style DecodeStage sequencer, not an assembler crack) remain
+  unowned by any task in this plan — say so explicitly, do not assume covered. Task 6b's
+  lengths are already framed by Task 5, so it changes only emission, and can narrow `fpGenBad`
+  further without touching predecode.
+- **Task 9** owns the FPCR/FPSR/FPIAR control-register moves (ext[15:13]=100/101) — already
+  fully scoped there independently; this task's `fpEmit` deliberately never claims that band.
+- **Tasks 9/11** own FSAVE/FRESTORE. Their opwords are in the `1111 001 1xx` band that Task 4's arm
+  deliberately does **not** claim, and their length framing is **not** added by Task 5 — both are
+  explicit to-dos there, and their opword encodings are on this plan's unverified list.
+- **Task 10 (reduced scope)** owns `fpuSoftwareComplete`/`fpuCmdWord`, needed by Task 11's
+  FSAVE unimplemented-instruction frame capture — narrower than this task's own
+  `faultUsesNextPc` gate (register-to-register form ONLY; see Task 10's own text for why it
+  must stay narrower even though this task's `fpLenKnown` covers more forms).
+- **Task 3's `readsFpcc` has no producer of readers yet.** The first is FBcc/FScc/FDBcc or
+  `FMOVE from FPSR`; whichever task adds one gets the whole dependency mechanism for free, but should
+  re-run `IqFpSpec` to confirm the FPCC wait bit clears on the real path.
+
+---
+
+### Task 6b: F-line FP-generic genuine memory-source loads (`F<op> <mem>,FPn`)
+
+**Sequencing.** Inserted immediately after Task 6 (after Task 6's "Handoffs this task
+creates" block) and before Task 7's introductory comment, without renumbering Tasks 7-16.
+This mirrors Task 6's own Handoff, which names this task explicitly as the owner of the
+memory-source load form. It reuses Task 6's `FpSrcKind`/`fpSrcFmt`/`fpuOp` machinery
+(sequenced after Task 6, which adds them) and is a prerequisite for Task 8's operand-routing
+dispatch (Task 8's Step 5 switches on the `FpSrcKind.{MEMPAIR,MEMEXT}` values this task
+adds) — see the "Relationship to Task 8" note below for how the two tasks' shared file edit
+is sequenced.
+
+---
+
+## Scope statement (read first)
+
+This task implements **`F<op> <mem>,FPn`** — an FP-generic instruction whose SOURCE operand is a
+genuine memory load via a real `<ea>` — for the 5 hardware-supportable data formats (Byte, Word,
+Long, Single, Double, Extended) across every addressing mode Task 5's `eaExt()`-based framing
+already computes a length for: register-indirect `(An)`, postincrement `(An)+`, predecrement
+`-(An)`, displacement `(d16,An)`, indexed `(d8,An,Xn)` (brief and full extension formats),
+absolute `(xxx).W`/`(xxx).L`, and PC-relative `(d16,PC)`/`(d8,PC,Xn)`.
+
+**Explicitly NOT this task's job** (say so, don't silently absorb or silently ignore):
+- **Packed (BCD) memory sources** — Decision 2 locks packed decimal as always-trap-to-FPSP. This
+  task's dispatch logic below explicitly excludes `fpSrcSpec === 011` from emission; a
+  `F<op>.P <mem>,FPn` keeps taking the vector-11 trap exactly as it does today (with
+  `faultUsesNextPc = True` once Task 5's framing + Task 6's fix are both in — Task 5's
+  length framing does not care about format, so Packed's length is already known).
+- **`FMOVE FPn,<ea>`** (the store direction — opclass `011`) — a substantively different crack
+  (format-narrowing writes instead of format-widening reads, and the destination side effect
+  ordering for `-(An)`/`(An)+` mirrors STORE not LOAD semantics). This remains an unowned gap
+  in this plan; flagged explicitly rather than assumed covered by this task or any other.
+- **`FMOVE(M) <ea>,FPCR`/`FPSR`/`FPIAR`** (opclass `100`/`101`) — Task 9's territory (register-direct
+  forms only per Task 9's own stated scope; the **memory-EA** forms of those moves are explicitly
+  out of scope there too, per Task 9's own text: *"memory-EA forms
+  (`fpu_fmove_mem_ea_fpcr_fpsr_no_fline.s` stays failing)"*, and Task 9b's own optional
+  `popcount==1`-with-memory-EA extension is not guaranteed landed by default either). Not this
+  task's job either — flagged as a real gap: nobody currently owns `FMOVE.L (An),FPCR`.
+- **`FMOVEM <ea>,list` / `list,<ea>`** (opclass `110`/`111`) — the FP DATA-register-list form
+  (`FP0-FP7`), a structurally different opcode encoding from Task 9b's control-register list
+  (`FPCR`/`FPSR`/`FPIAR`, `ext[15:13] ∈ {100,101}`, per Musashi's dispatch table
+  `m68kfpu.c:1853-1858` vs `1846-1851`). Not duplicated or covered here.
+
+---
+
+## Research findings (grounding — read before the Steps; every claim below is a real file:line
+citation, not an assumption)
+
+### Finding 1 — this crack's SHAPE is MOVE16-like (format is decode-time-static), but its
+**DISPATCH** is a genuinely new problem MOVE16 never had to solve
+
+The task brief's own hypothesis — "static format known at decode time, so this is MOVE16-shaped not
+MOVEM-shaped" — is correct for the crack's *content* (no runtime register-mask scanning is ever
+needed, unlike MOVEM's `movemActive`/`movemMask`/`movemEmitted` FSM state,
+`DecodeStage.scala:329-370`). But there is a real, different problem MOVE16 did not have to solve,
+confirmed by direct read:
+
+- `OperationDecoder.decode(opword: Bits)` takes **the opword alone** — this is a hard, verified
+  invariant (Task 4's own grounding: `PredecodeWord.scala:64` calls `OperationDecoder.decode(op)`
+  at I-cache **refill** time, before any extension word is resident, and
+  `UcPendSpecStashEquivalenceSpec` asserts `decode(w) === MicroOpAssembler...spec` word-for-word —
+  breaking decode-purity breaks a real, already-passing test).
+- MOVE16's routing (`OperationDecoder.scala:1028-1043`) works entirely from the **opword**
+  (`0xF620 | Ax`) — its whole crack shape is invariant, so a single static `ucEntry` selection at
+  the opword-decode stage is correct and sufficient.
+- **cpGEN cannot do this.** `F<op> <mem>,FPn` (opclass `010`, this task's scope), `FMOVE FPn,<mem>`
+  (opclass `011`), `FMOVE(M) <ea>,FPCR/FPSR/FPIAR` (opclass `100`/`101`), and `FMOVEM <ea>,list`/
+  `list,<ea>` (opclass `110`/`111`) **all share the identical opword shape** `0xF200 | <ea>` — the
+  opclass field that disambiguates them lives entirely in `ext[15:13]` (`pkt.words(1)`), which
+  `OperationDecoder` cannot see under this invariant. Worse, even the **EA `<ea>` field itself is
+  ambiguous**: a memory-mode `<ea>` (opword bits `[5:3] >= 2`) is used by opclass `010` (this
+  task), `011` (store, out of scope), *and* `110`/`111` (FMOVEM, out of scope) — so "opword has a
+  memory-mode `<ea>`" is **not** a safe proxy for "this is this task's instruction."
+- **Confirmed real precedent for resolving exactly this class of problem: `ucEntry` is not
+  always final at `OperationDecoder` time.** `OperationDecoder.scala:733`:
+  `o.ucEntry := U(Microcode.BF_RMW_4B_ENTRY, ...) // overridden by ucBegin (needHi)` — i.e. the
+  bit-field family already establishes the pattern of "OperationDecoder picks a *placeholder*
+  `ucEntry`; `DecodeStage`'s `ucBegin` stage (which DOES read the real extension word — confirmed:
+  `ucEntryCtx.move16Ay := (U(8,5 bits) + ucEntryPkt.words(1)(14 downto 12).asUInt)`,
+  `DecodeStage.scala:1153`, and the bit-field `s1bfExt`/`s0bfExt` reads at
+  `DecodeStage.scala:277-293`) **overrides `ucEntry` with the real, extension-word-resolved
+  value**." This task uses exactly that pattern, generalized one step further: `OperationDecoder`
+  routes the **whole** "cpGEN with a memory-mode `<ea>`" band (opclass-agnostic, since it cannot
+  tell them apart) to `microcoded := True` with one shared placeholder entry
+  (`Microcode.FP_MEM_DISPATCH_ENTRY`), and `ucBegin` — now ext-word-aware — does the REAL
+  three-way job: (a) reject opclass `011`/`100`/`101`/`110`/`111` back to the ordinary vector-11
+  path (see Step 5's `fpMemBad` below — this is the one genuinely new piece beyond the bit-field
+  precedent, since bit-field's `ucEntry`-override never needed to *un-commit* from microcoded
+  routing), (b) reject `fpSrcSpec === 011` (Packed) the same way, (c) for everything else, select
+  one of 12 real per-format/per-EA-bucket entries (Finding 3 below) and populate their per-instance
+  ctx fields.
+
+**A real, unresolved tension with Task 9b's own draft — flagged, not silently picked one way.**
+Task 9's own "Step 5: `OperationDecoder.scala` recognition arm" reads `words(1)` (the extension
+word) directly inside `OperationDecoder`'s `is(0xF)` arm, and its own text says explicitly:
+*"`words(1)` is already in scope in this function — the FSF carve-out and MOVE16 arm both read
+the packet's extension words the same way."* This **appears to contradict** the opword-only
+characterization this task's whole `ucBegin`-override design rests on (Finding 1 above) — either
+`OperationDecoder.decode` genuinely does have access to the full packet in the current codebase
+(in which case Finding 1's premise needs re-examining before implementation) or Task 9's text is
+itself imprecise about what `decode()` sees at refill-time vs. at a later re-decode. **This
+reconciliation pass does not resolve this tension** — it requires a direct read of the actual
+`OperationDecoder.scala`/`PredecodeWord.scala` call sites at implementation time, not a
+plan-text judgment call. Confirm which model is actually true before writing Step 5's RTL, and
+if `OperationDecoder` genuinely can see `words(1)` safely, this task's `ucBegin`-override
+machinery may be more elaborate than strictly necessary (though still correct) — a possible
+simplification opportunity to revisit once the tension is resolved, not a blocking one.
+
+### Finding 2 — the 3-uop direct-emission cap rules out the "just build it inline in
+`MicroOpAssembler` like CMP2/CHK2" shortcut for anything but the smallest cases
+
+`MicroOpAssembler.AssembledUops` is hard-capped: `val uops = Vec(DecodedUop(), 3); val count =
+UInt(2 bits) // 1, 2, or 3 µops valid` (`MicroOpAssembler.scala:35-36`). CMP2/CHK2's inline
+"`[load.size EA]->T0, [load.size EA+size]->T1, [compare]`" crack (`MicroOpAssembler.scala:2955-2968`,
+`c2Load0`/`c2Load1`/`c2Cmp`) is the closest ext-word-aware direct-emission precedent for a
+2-load-then-compute shape, and it fits **exactly** at the 3-uop ceiling. This task's minimum shapes
+are:
+- Byte/Word/Long/Single, no `<ea>` side effect: `[load]` + `[FP-issue]` = **2 uops** — would fit
+  the direct-emission cap.
+- Byte/Word/Long/Single with `(An)+`/`-(An)`: `[decrement-or-nothing]` + `[load]` + `[FP-issue]` +
+  `[increment-or-nothing]` — up to **3-4 uops** depending on how the delta write-back is folded.
+- Double: `[load hi]` + `[load lo]` + `[FP-issue]` = **3 uops** plain, **4** with an auto-inc
+  write-back.
+- Extended: `[load 0]` + `[load 4]` + `[load 8]` + `[FP-issue]` = **4 uops** plain, **5** with
+  auto-inc.
+
+Every shape past the 2-uop floor **exceeds** the 3-uop direct-emission cap. Rather than widen
+`AssembledUops` (a mechanical but broad change touching every existing `out.count`/`out.uops(N)`
+call site in the file — real, but out of proportion for this task alone), **this task routes
+everything through the `spec.microcoded` / Microcode.scala ROM-walker path uniformly**, even the
+2-uop cases, for one shared, simple dispatch rule (`ucBegin` always resolves a real `ucEntry`
+into the ROM-walker) rather than a two-tier "sometimes inline, sometimes ROM" split that would
+need its own justification for where the line falls. This is a deliberate, flagged simplification
+— reviewable, and reversible if profiling later shows the ROM-walker's extra decode-time overhead
+matters for the common 2-uop case.
+
+### Finding 3 — the microcode ROM's `Desc` already supports a genuine 3rd source register
+(`srcC`), and it is **already fully wired end-to-end**, including into the CPLX cluster
+
+This is the single most consequential finding, because it eliminates what looked, before verifying,
+like the highest-risk part of this task (a novel 3-source EU port).
+
+- `Desc(uop, mem, auto, srcA, srcB, srcC = SNone, dst, ...)` — `Microcode.scala:202-234` — `srcC`
+  is a **real, already-existing** Desc parameter ("3rd operand: BFINS insert source (Dn2)"), with a
+  hardware mirror in `DescBits` (`Microcode.scala:332-338`).
+- `RenamedUop.psrcC`/`psrcCValid` (`RenamedUop.scala:155`) is a real, already-renamed 3rd physical
+  int source — **already used by CPLX-cluster ops today**: `DivEuPlugin.scala:142`:
+  `rdH.addr := u0.psrcC // DIV.L 64/32 dividend HIGH word (Dr) via the 3rd source`. `DivEuPlugin`
+  already acquires a 3rd int regfile read port and already reads `psrcC` at issue time for
+  DIVL/CMP2/CHK2.
+- `IssueQueuePlugin`'s scoreboard/wakeup logic **already tracks `psrcC`/`srcCValid` uniformly
+  across every cluster**, including CPLX: `dep(sbInt.busy, ..., uop.psrcC, uop.psrcCValid)`
+  (`:507`), `stillCplxBusy(uop.psrcC)` (`:582`), CPLX wakeup-port matching on `psrcC`
+  (`:767-769`), CPLX producer-forwarding checks (`:588-590`). **This task needs zero new IQ/rename
+  infrastructure for a 3rd source** — it is real, landed, and CPLX-aware today.
+
+Conclusion: Extended's 3-chunk load (needing 3 simultaneous raw values at the terminal FP-issue
+step) is implemented as a **direct reuse** of `srcA`/`srcB`/`srcC` → `psrcA`/`psrcB`/`psrcC`,
+exactly the shape DIVL/CMP2/CHK2 already use. No new port, no new scoreboard bit, no new wakeup
+path.
+
+### Finding 4 — why an FP-domain scratch register was considered and rejected (ruling out the
+alternative 2-pass "assemble in a temp FP register" design)
+
+Before Finding 3 was confirmed, the natural-seeming alternative was: load the raw chunks into int
+temp registers, then do 1-2 passes THROUGH the FPU (writing a scratch FP physical register, then a
+second pass merging the remaining chunk in) so the terminal arithmetic op only ever needs the
+ordinary 2-source (`FPn dest` + `FPm source`) shape. This is explicitly rejected, for a concrete,
+confirmed reason: **the FP register-number encoding has zero spare room for a temp.**
+`DecodedUop.fpDstReg`/`fpSrcAReg`/`fpSrcBReg` are `UInt(3 bits)` (`DecodedUop.scala`, Task 4 Step 2)
+— 0-7, and all 8 values are already claimed by architectural FP0-FP7. Unlike the integer side,
+where `T0`-`T3` fit because the int register field is 5 bits (32-value space, only 16 architectural
+registers used, real headroom), the FP RAT is **already real, landed RTL**:
+`RenameStage.scala:38`: `val fpRat = RatTable(physIdWidth = 4, archDepth = 8, ...)`. Widening
+`archDepth` to squeeze in an "FPT0" scratch register would mean reworking already-merged Task 1/2
+RTL (freelist archCount, RAT depth, every 3-bit FP-register-number field project-wide) — a strictly
+higher-risk, higher-blast-radius change than the (now-confirmed-free, per Finding 3) 3rd int
+source. The int-domain design is used throughout this task.
+
+### Finding 5 — the INTREG format-conversion dispatch this task needs to reuse for the
+1-chunk formats is Task 8's own job, not this task's
+
+Task 6's own text flags the int-source form's Long-vs-Single ambiguity and RESOLVES it via the
+new `fpSrcFmt` field (see Task 6's "Open item RESOLVED by this deliverable" note) — but the
+actual EU-side conversion circuits (`intToExtended`/`singleToExtended`/`doubleToExtended`) and the
+`fpSrcKind` dispatch switch that calls them live in `DivEuPlugin.scala`, which is squarely Task
+8's file. Task 8's own Step 5 (see that task) is where this dispatch is actually implemented, and
+it already includes this task's `MEMPAIR`/`MEMEXT` cases alongside the pre-existing
+`FPREG`/`INTREG`/`ROMCONST`/`INTIMM`/`SINGLEIMM`/`DOUBLEIMM`/`EXTIMM` ones — **this task does not
+duplicate that switch statement** (see Step 7 below, which is a short requirements handoff, not
+an independent implementation). This is a deliberate sequencing choice: `DivEuPlugin`'s FP
+pipeline (the `fpu` `FpuCore` instance, `fpRdA`/`fpRdB`/`intRdA`/`intRdB` ports, `fpFixedCtx`
+shift register, etc.) does not exist until Task 8 — this task, sequenced right after Task 6 and
+before Task 7 (`FpuCore` itself), cannot stand up that pipeline itself.
+
+Follows Task 7's real, authoritative interface (`io.dst`/`io.src`/`io.op`/`io.rmode`/`io.cromSel`,
+`io.doneFixed`/`io.resFixed`/`io.busyIter`/`io.doneIter`/`io.resIter`) throughout, since Task 8's
+own Step 5 (already reconciled against Task 7's real interface) is this task's reference point.
+
+### Finding 6 — displacement/offset selectors: reuse two different, both-confirmed-real
+precedents, split by EA-mode class
+
+- **For the side-effect-free EA modes** — `(d16,An)`, `(d8,An,Xn)` brief/full, `(xxx).W`/`.L`,
+  `(d16,PC)`/`(d8,PC,Xn)`, and plain `(An)` — reuse `SEaBase`/`SEaDispLo`
+  (`Microcode.scala:56,58`, used by the bit-field-memory crack exactly this way,
+  `Microcode.scala:541,548`: *"straight-line. The address = SEaBase + SEaDispLo|SEaDispHi (+ Ctx
+  index)"*), plus **two genuinely new** selectors mirroring the confirmed-real precedent
+  `eaDispHi = eaDispLo + 4` (`Microcode.scala:1732`, consumed at `:1900,2309`): `SFpDispMid` (=
+  `eaDispLo + 4`, for chunk 1) and `SFpDispHi` (= `eaDispLo + 8`, for chunk 2, Extended only).
+- **For the two auto-increment EA modes** — `(An)+`, `-(An)` — do **not** use `SEaBase` at all.
+  Follow MOVE16's own explicit, stated precedent instead (`Microcode.scala:1583-1589`: *"Address
+  computation deliberately does NOT use the eaAuto/predec-postinc machinery ... those compute
+  addr=An THEN bump An by a size-dependent delta ... reuse ... a plain register base + a
+  useImm/imm literal displacement ... and the two write-backs are plain UAddDrop rows"*): read the
+  live `SAy` register directly for chunk 0, `SAy + SImm4`/`SAy + SImm8` (the **already-existing**
+  task #207 constants, `Microcode.scala:117-118`) for chunks 1/2, and apply the address-register
+  side effect as one flat, unconditional `UAddDrop` — **before** the loads for `-(An)` (mirroring
+  `PACK_MEM_ENTRY`'s "load Ay/predec" ordering, `Microcode.scala:1673`) and **after** the loads for
+  `(An)+` (mirroring `CMPM_ENTRY`'s e0/e1 postinc-then-writeback ordering,
+  `Microcode.scala:941-943`), with the delta sized per-format (1/2/4/4/8/12 bytes for
+  Byte/Word/Long/Single/Double/Extended — **flag**: the Byte-format delta needs independent
+  verification against the MC68040 UM; unlike A7's well-known byte-access word-alignment quirk,
+  ordinary `An` registers are assumed to increment by exactly the operand's true byte count, but
+  this is not yet independently confirmed for the FP byte-integer format specifically).
+
+**This is why this task needs 12, not 6, ROM entry groups**: one per format × 2 EA-mode buckets
+(side-effect-free vs auto-increment). Step 4 writes 3 representative entries in full and gives a
+parametrized table for the rest — writing all 12 out in full `Desc`-row notation would be pure
+repetition of the same two templates.
+
+### Finding 7 — memory byte layout per format (needed to write the loads' `sz` and the EU's
+raw-bit assembly correctly)
+
+| Format (`fpSrcSpec`) | Bytes in memory | Chunks (32-bit loads) | Layout |
+|---|---|---|---|
+| Byte (`110`) | 1 | 1 | sign-extend to 32 bits on load (mirrors ordinary `MOVE.B (ea),Dn` sign-extension — **flag**: verify this matches the 68881/68040 Byte Integer format's own sign-extension rule, not just assumed identical) |
+| Word (`100`) | 2 | 1 | sign-extend to 32 bits on load |
+| Long (`000`) | 4 | 1 | plain 32-bit two's-complement integer, no extension needed |
+| Single (`001`) | 4 | 1 | plain 32-bit IEEE-754 single bit pattern, **not** sign-extended (it is a bit pattern, not a two's-complement value) |
+| Double (`101`) | 8 | 2 | chunk0 (mem+0) = `{sign(1),exp(11),mantissa_hi(20)}`; chunk1 (mem+4) = `mantissa_lo(32)` — standard IEEE-754 double, big-endian word order (68k is big-endian) |
+| Extended (`010`) | 12 (80 bits significant, 16 reserved) | 3 | chunk0 (mem+0) = `{sign(1),exponent(15)}` in bits `[31:16]`, bits `[15:0]` reserved/ignored on read; chunk1 (mem+4) = `mantissa[63:32]`; chunk2 (mem+8) = `mantissa[31:0]` — **this is already the internal 80-bit extended layout**, so assembly is pure bit placement (`{chunk0[31:16], chunk1, chunk2}`), no numeric conversion |
+| Packed (`011`) | 12 | — | **out of scope** — always traps (Decision 2) |
+
+The Double and Extended rows are corroborated by the design spec's own statement that 80-bit
+extended is native/no-conversion (Decision 1) and that Musashi's `floatx80`/`WRITE_EA_FPE` pattern
+is the oracle (spec Background) — but the exact byte-level table above was assembled from general
+IEEE-754/68881 knowledge during this planning pass, **not independently re-derived from the MC68040
+UM's own FP data format figure in this session**. Per the plan's own Global Constraint ("where a
+task references an exact bit-level fact that has NOT been independently verified ... the task says
+so explicitly and makes that verification an explicit step") — **Step 1 below makes this an
+explicit, executed verification action.**
+
+---
+
+## Files
+
+- Modify: `src/main/scala/m68k040/decode/DecodedUop.scala` (extend `FpSrcKind` with `MEMPAIR`,
+  `MEMEXT` — `fpSrcFmt` itself is ALREADY added by Task 6, this task adds no new field, only new
+  enum values)
+- Modify: `src/main/scala/m68k040/decode/DecodeContracts.scala` (no new `OpSpec` fields needed —
+  reuses `microcoded`/`ucEntry`, already present)
+- Modify: `src/main/scala/m68k040/decode/OperationDecoder.scala` (the new shared
+  memory-mode-`<ea>` cpGEN dispatch arm)
+- Modify: `src/main/scala/m68k040/decode/Microcode.scala` (new `Sel`/`Auto`/`UOp` elements, new
+  `Desc` rows — 12 entry groups)
+- Modify: `src/main/scala/m68k040/decode/DecodeStage.scala` (`ucBegin` ctx population + the
+  `ucEntry`-override + `fpMemBad` reject-back-to-vector-11 logic)
+- Test: `src/test/scala/m68k040/decode/FpMemLoadSpec.scala`
+
+**Relationship to Task 8.** This task does NOT itself edit `DivEuPlugin.scala` — Task 8's own
+Step 5 already includes this task's `FpSrcKind.{MEMPAIR,MEMEXT}` dispatch (see Finding 5). Since
+Task 8 is sequenced after Task 7 (`FpuCore`), and this task is sequenced right after Task 6
+(before Task 7), the EU-side wiring cannot land as part of this task regardless — Step 7 below is
+a short requirements note for whoever implements Task 8, not a code deliverable of this task.
+
+## Interfaces
+
+- Consumes: `OpSpec.fpGeneric`/`DecOp.FPU`/`Cluster.CPLX` (Task 4), the cpGEN length invariant
+  (Task 5: `lenWords >= 2` iff framed), `FpSrcKind.{FPREG,INTREG,ROMCONST}`, the `fpuOp` field,
+  and `fpSrcFmt` (all Task 6), `Desc.srcC`/`RenamedUop.psrcC` (pre-existing, Finding 3).
+- Produces: `FpSrcKind.{MEMPAIR,MEMEXT}` (consumed by Task 8's EU dispatch, already written
+  against these two values — see Task 8's Step 5), 12 new `Microcode.scala` ROM entry groups
+  (`FP_MEM_*_ENTRY` constants), the `ucBegin`-level `fpMemBad` reject path (a reusable precedent
+  for any future FMOVEM-data-list task facing the same opclass-disambiguation problem, per
+  Finding 1's reconciliation note).
+
+---
+
+## Steps
+
+- [ ] **Step 1: Explicit verification actions (execute before writing any RTL)**
+
+Three facts this task's design depends on were not independently re-derived from a primary source
+during this planning pass (Findings 6 and 7 above flag them inline; consolidated here as concrete
+actions):
+
+```bash
+# (a) Confirm SEaBase/SEaDispLo's generality across every EA mode Task 5's eaExt() framing
+#     covers for cpGEN specifically -- not just the bit-field-memory arm's own subset. Read the
+#     ctx-population site(s) that drive `ucEntryCtx.eaBase`/`eaBaseValid`/`eaDispLo` (grep for
+#     `eaBaseValid :=` in DecodeStage.scala) and confirm plain (An), (d16,An), (d8,An,Xn) brief
+#     and full, (xxx).W/.L, and (d16,PC)/(d8,PC,Xn) ALL resolve through it uniformly -- i.e. that
+#     it is genuinely general EA-resolution infrastructure and not bit-field-specific despite its
+#     doc comment's "the bit-field EA base An" wording.
+grep -n "eaBaseValid :=\|eaBase :=\|eaDispLo :=" src/main/scala/m68k040/decode/DecodeStage.scala
+
+# (b) Confirm the real MC68040 FP data format memory byte layout against the manual (Finding 7's
+#     table), specifically: Byte/Word sign-extension on load, and the Extended format's exact
+#     reserved-bit-field position (assumed [15:0] of the first word here).
+#     Source: MC68040 User's Manual, floating-point data format chapter (same primary-source
+#     policy this plan already applies elsewhere -- see the design spec's Background section).
+
+# (c) Confirm the per-format An auto-increment/decrement delta (1/2/4/4/8/12 bytes) against the
+#     manual -- in particular whether Byte format really increments An by exactly 1 (not 2, unlike
+#     the well-known A7-specific byte-access word-alignment quirk, which does not apply to a
+#     general An).
+
+# (d) Confirm the OperationDecoder/decode-purity tension flagged in Finding 1 (Task 9's own
+#     Step 5 reads words(1) directly, apparently contradicting the opword-only invariant this
+#     task's ucBegin-override design rests on) before writing Step 5 below -- read the real
+#     current OperationDecoder.scala/PredecodeWord.scala call sites, do not assume either
+#     characterization is correct from plan text alone.
+```
+
+If any of (a)-(d) disagrees with this task's assumed values, **fix this task's code and its own
+plan text before continuing** — every later step's `Desc` rows key off them.
+
+- [ ] **Step 2: Extend `FpSrcKind`**
+
+```scala
+// src/main/scala/m68k040/decode/DecodedUop.scala
+// Extend Task 4/6's FpSrcKind enum (append after EXTIMM, preserving existing ordinals):
+object FpSrcKind extends SpinalEnum {
+  val FPREG, INTREG, ROMCONST, INTIMM, SINGLEIMM, DOUBLEIMM, EXTIMM,
+      // Genuine memory-source forms (Task 6b). Both reuse the SAME srcA/srcB/srcC ->
+      // psrcA/psrcB/psrcC int-register-read machinery every other CPLX op already uses
+      // (Finding 3) -- there is no new EU port, only new dispatch logic in DivEuPlugin
+      // (Task 8's Step 5, which already switches on these two values).
+      //   MEMPAIR : Double-format memory load. srcA=T_hi(mem+0), srcB=T_lo(mem+4).
+      //             The EU concatenates {srcA,srcB} into a 64-bit IEEE double bit
+      //             pattern and converts it to extended via the SAME doubleToExtended
+      //             helper Task 8's DOUBLEIMM case already needs.
+      //   MEMEXT  : Extended-format memory load. srcA=T0(mem+0, sign+exp in [31:16]),
+      //             srcB=T1(mem+4, mantissa hi), srcC=T2(mem+8, mantissa lo). NO
+      //             numeric conversion -- pure bit placement, {srcA[31:16],srcB,srcC}
+      //             IS the 80-bit extended value (Finding 7).
+      // Byte/Word/Long/Single memory loads do NOT get a new FpSrcKind: after the crack's
+      // load micro-op lands the value in a temp register, the terminal FP-issue uop is
+      // INDISTINGUISHABLE from the existing register-source INTREG case (Task 6) except
+      // that srcAReg points at a temp (T0) instead of Dn -- the EU-side conversion is
+      // identical either way (dispatched by `fpSrcFmt`, Task 6's field, unmodified by
+      // this task), so INTREG is reused verbatim (see Step 4's Template A).
+      MEMPAIR, MEMEXT = newElement()
+}
+```
+
+`fpSrcFmt` itself needs no change — it already carries ext[12:10] verbatim for every
+opclass-010 form (Task 6's Step 4a), which is exactly what this task's memory-Single case
+needs to disambiguate from memory-Long, the identical need Task 6's INTREG case already has.
+
+- [ ] **Step 3: New `Microcode.scala` `Sel`/`Auto`/`UOp` elements**
+
+```scala
+// src/main/scala/m68k040/decode/Microcode.scala
+
+// ── Task 6b: FP-generic genuine memory-source loads ─────────────────────────────
+// New displacement selectors, mirroring the CONFIRMED-REAL eaDispHi=eaDispLo+4 precedent
+// (this file, ctx field `eaDispHi`, "= eaDispLo + 4 (byteAddr+4, the spill byte)") one
+// step further for the 3-chunk Extended case.
+case object SFpDispMid extends Sel   // = ctx.eaDispLo + 4  (Double lo / Extended mantissa-hi)
+case object SFpDispHi  extends Sel   // = ctx.eaDispLo + 8  (Extended mantissa-lo)
+// Flat An delta for the auto-increment EA-mode bucket (Finding 6), sized per FORMAT
+// (1/2/4/4/8/12 bytes for Byte/Word/Long/Single/Double/Extended -- Step 1(c) verifies),
+// signed (negative for predecrement). Computed once at ucBegin from the static per-entry
+// format, mirrors SDeltaAy/SDeltaAx/SNegDeltaAy/SNegDeltaAx's existing shape exactly, just
+// parametrized by FP format instead of integer op size.
+case object SFpAutoDelta extends Sel
+// Packed FP-issue command word: fpuOp[6:0] | fpDstFp[2:0]<<7 | fpSrcFmt[2:0]<<10, mirroring
+// BFRESOLVE's existing bfResImm packing idiom (MicroOpAssembler.scala, "imm carries:
+// imm[4:0]=static offset ... imm[9:5]=static raw-width ...") -- same technique, applied to
+// microcode ctx instead of the direct-emission path.
+case object SFpCmd extends Sel
+
+// New UOp: the terminal FP-generic issue row. Resolves to DecOp.FPU / Cluster.CPLX, exactly
+// like Task 6's directly-emitted register-form uop, EXCEPT srcA/srcB/srcC are temp
+// registers (T0/T1/T2, populated by the crack's own preceding LOAD rows) instead of
+// Dn/FPm, and fpSrcKind comes from this Desc row's own static `fpSrcKindSel` tag (0=INTREG,
+// 1=MEMPAIR, 2=MEMEXT) rather than being derived from the opword/ext-word at assembly time
+// (there is no assembly-time decode happening here at all -- SFpCmd was already packed by
+// ucBegin from the real ext word, read once, before the ROM walk began).
+case object UFpIssue extends UOp
+
+// Desc gains one new Int tag, mirroring bfStoreForm's existing "compile-time enum baked per
+// ROM row" idiom (Microcode.scala:218, "UBfMem: 0=RES,1=LO4,2=LO5,...(funnel form)"):
+//   fpSrcKindSel: Int = 0   // 0=INTREG (1 chunk), 1=MEMPAIR (2 chunks), 2=MEMEXT (3 chunks)
+// Add this as a new Desc/DescBits parameter (and its resolveFromBits/descToBits mirror --
+// VERIFY the exact hardware-mirror wiring against Task A1's LUT-reduction machinery,
+// Microcode.scala's own comment block above `case class DescBits()`, at implementation
+// time; this plan pass did not re-derive descToBits's full transform).
+
+// New Auto elements are NOT needed -- Finding 6 established that the auto-increment EA-mode
+// bucket reuses SAy + a flat UAddDrop delta (MOVE16/CMPM's own precedent), never the `Auto`
+// enum's APredecAy/APostincAy tags, which MOVE16 itself deliberately avoids for the same
+// reason this task does (multiple same-base accesses at different fixed offsets don't fit
+// an auto-tag's single-access-with-side-effect semantics).
+```
+
+- [ ] **Step 4: New `Desc` rows — 3 representative entry groups written in full, remaining 9
+  parametrized**
+
+**Template A — side-effect-free EA bucket, 1-chunk format (Long shown; Word/Single/Byte are the
+same shape with `sz`/format changed per the table after).**
+
+```scala
+// FP_MEM_L_ENTRY: F<op>.L <ea>,FPn  --  (An)/(d16,An)/(d8,An,Xn)/(xxx).W/.L/(d16,PC)/(d8,PC,Xn)
+//   f0 LOAD.L  (SEaBase+SEaDispLo) -> T0                                    (isFirst)
+//   f1 UFpIssue srcA=T0, imm=SFpCmd -> DecOp.FPU/CPLX, fpSrcKindSel=INTREG  (isLast)
+Desc(UMove, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+     sz = SzLong, isFirst = true),
+Desc(UFpIssue, srcA = ST0, useImm = true, imm = SFpCmd, fpSrcKindSel = 0, isLast = true),
+```
+
+**Template B — auto-increment EA bucket, 1-chunk format (Long shown; postincrement case; the
+predecrement case moves the `UAddDrop` row to `isFirst` and negates the delta, mirroring
+`PACK_MEM_ENTRY`'s decrement-before-load ordering).**
+
+```scala
+// FP_MEM_L_AUTO_ENTRY (postinc): F<op>.L (Ay)+,FPn
+//   f0 LOAD.L (Ay) -> T0                                                    (isFirst)
+//   f1 UFpIssue srcA=T0, imm=SFpCmd -> DecOp.FPU/CPLX, fpSrcKindSel=INTREG
+//   f2 ADD.L Ay + SFpAutoDelta(+4) -> Ay   (dropped crack µop)              (isLast)
+Desc(UMove, mem = MLoad, srcA = SAy, dst = ST0, sz = SzLong, isFirst = true),
+Desc(UFpIssue, srcA = ST0, useImm = true, imm = SFpCmd, fpSrcKindSel = 0),
+Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SFpAutoDelta, isLast = true),
+```
+
+**Template C — side-effect-free EA bucket, 3-chunk format (Extended — the largest crack this
+task builds; Double is the same shape with 2 chunks and `fpSrcKindSel=1`/`MEMPAIR` instead of 3
+and `fpSrcKindSel=2`/`MEMEXT`, and `srcC` simply omitted).**
+
+```scala
+// FP_MEM_X_ENTRY: F<op>.X <ea>,FPn  --  side-effect-free EA bucket
+//   f0 LOAD.L (SEaBase+SEaDispLo)  -> T0   (sign+exp,  mem+0)                (isFirst)
+//   f1 LOAD.L (SEaBase+SFpDispMid) -> T1   (mantissa hi, mem+4)
+//   f2 LOAD.L (SEaBase+SFpDispHi)  -> T2   (mantissa lo, mem+8)
+//   f3 UFpIssue srcA=T0,srcB=T1,srcC=T2, imm=SFpCmd, fpSrcKindSel=MEMEXT     (isLast)
+Desc(UMove, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
+     sz = SzLong, isFirst = true),
+Desc(UMove, mem = MLoad, srcA = SEaBase, dst = ST1, useImm = true, imm = SFpDispMid,
+     sz = SzLong),
+Desc(UMove, mem = MLoad, srcA = SEaBase, dst = ST2, useImm = true, imm = SFpDispHi,
+     sz = SzLong),
+Desc(UFpIssue, srcA = ST0, srcB = ST1, srcC = ST2, useImm = true, imm = SFpCmd,
+     fpSrcKindSel = 2, isLast = true),
+```
+
+**Parametrized table for the remaining 9 entry groups** (each following Template A/B/C's exact
+shape, varying only chunk count / `sz` / delta / `fpSrcKindSel`):
+
+| Entry | Bucket | Chunks | `sz` per load | `fpSrcKindSel` | Auto delta |
+|---|---|---|---|---|---|
+| `FP_MEM_B_ENTRY` / `_AUTO` | both | 1 | `SzByte` | 0 (INTREG) | 1 |
+| `FP_MEM_W_ENTRY` / `_AUTO` | both | 1 | `SzWord` | 0 (INTREG) | 2 |
+| `FP_MEM_L_ENTRY` / `_AUTO` | both | 1 | `SzLong` | 0 (INTREG) | 4 |
+| `FP_MEM_S_ENTRY` / `_AUTO` | both | 1 | `SzLong` | 0 (INTREG) | 4 |
+| `FP_MEM_D_ENTRY` / `_AUTO` | both | 2 | `SzLong`×2 | 1 (MEMPAIR) | 8 |
+| `FP_MEM_X_ENTRY` / `_AUTO` | both | 3 | `SzLong`×3 | 2 (MEMEXT) | 12 |
+
+(Single uses the same `SzLong`/1-chunk shape as Long — the difference between them is entirely in
+`fpSrcFmt` (Task 6's field, read by Task 8's EU dispatch), not in the load itself.)
+
+Register these as new `val FP_MEM_*_ENTRY = N // rows N..M` constants in `Microcode.scala`'s entry
+list (alongside `MOVE16_ENTRY` etc.), and append the 12 groups' rows to `romP8()` (or a new
+`romP9()`, whichever keeps the file's existing per-part row budget from being exceeded — check the
+current `romPN` split points before choosing).
+
+- [ ] **Step 5: `OperationDecoder` shared dispatch arm + `DecodeStage` `ucBegin` override/reject**
+
+**Before writing this step, resolve Step 1(d)'s flagged tension** (Finding 1's reconciliation
+note: Task 9's own arm reads `words(1)` directly inside `OperationDecoder`, which may mean the
+opword-only characterization below is more conservative than strictly necessary in this
+codebase's actual current state). The code below is written against the CONSERVATIVE
+(opword-only) model; if Step 1(d)'s check shows `OperationDecoder` genuinely can safely read
+`words(1)`, this may simplify, but the version below is correct either way (it is never wrong to
+defer opclass disambiguation to `ucBegin`, only possibly more machinery than needed).
+
+```scala
+// src/main/scala/m68k040/decode/OperationDecoder.scala
+// Inside the is(0xF) arm, immediately AFTER Task 4's cpGEN classification block (which sets
+// o.fpGeneric/o.op/o.cluster) and BEFORE the FSF carve-out. Gated on: cpGEN family (Task 4's
+// isFpGeneric) AND the opword's <ea> mode indicates memory (mode != 0 Dn, != 1 An -- Dn is
+// Task 6's INTREG register-source path, An is never a valid FP source). This intentionally
+// ALSO matches opclass 011/100/101/110/111's memory forms (Finding 1) -- ucBegin resolves
+// the ambiguity for real once it can see ext[15:13].
+        val fpMemEaMode = opword(5 downto 3).asUInt
+        val fpMemIsMemEa = isFpGeneric && (fpMemEaMode =/= U(0, 3 bits)) && (fpMemEaMode =/= U(1, 3 bits))
+        when(fpMemIsMemEa) {
+          o.microcoded := True
+          // Placeholder -- ucBegin ALWAYS overrides this once it reads the real ext word
+          // (mirrors BF_RMW_4B_ENTRY's "overridden by ucBegin (needHi)" precedent exactly).
+          o.ucEntry := U(Microcode.FP_MEM_DISPATCH_ENTRY, o.ucEntry.getWidth bits)
+        }
+```
+
+```scala
+// src/main/scala/m68k040/decode/DecodeStage.scala
+// In ucBegin's existing ctx-population block (alongside the bit-field s1bfExt/ move16Ay
+// reads), add the FP-memory-load resolution. `ucEntryPkt.words(1)` is the real ext word,
+// resident by ucBegin time (same guarantee move16Ay already relies on).
+    val ucFpExt      = ucEntryPkt.words(1)
+    val ucFpOpClass  = ucFpExt(15 downto 13)
+    val ucFpSrcSpec  = ucFpExt(12 downto 10)
+    val ucFpDstFp    = ucFpExt(9 downto 7).asUInt
+    val ucFpOpmode   = ucFpExt(6 downto 0)
+    val ucFpEaMode   = ucEntryPkt.words(0)(5 downto 3).asUInt
+    val ucFpEaReg    = ucEntryPkt.words(0)(2 downto 0).asUInt
+    // Only opclass 010 (F<op> <mem>,FPn) is this task's job; 011/100/101/110/111 are other
+    // tasks' (Finding 1) -- reject back to the ordinary vector-11 trap rather than execute
+    // a wrong crack. Packed (fpSrcSpec 011) is out of scope regardless of opclass (Decision 2).
+    val ucFpMemBad = (ucFpOpClass =/= B"3'b010") || (ucFpSrcSpec === B"3'b011")
+    val ucFpIsAuto = (ucFpEaMode === U(3, 3 bits)) || (ucFpEaMode === U(4, 3 bits))  // (An)+/-(An)
+    // ucEntry override: one of the 12 FP_MEM_*_ENTRY groups, or fall through to the
+    // ordinary illegal/vector-11 path if ucFpMemBad. VERIFY the exact mechanism this
+    // codebase uses to un-commit an already-`microcoded`-routed instruction back to the
+    // illegal/bad path at ucBegin time (this plan pass did not independently confirm one;
+    // the bit-field family's own `bfmBad`-style forced-illegal precedent is the closest
+    // analogue but operates at MicroOpAssembler's direct-emission layer, not ucBegin's
+    // ROM-entry-override layer -- these may not be the same mechanism. If no existing
+    // "ucBegin rejects back to illegal" precedent is found, the safe fallback is: route
+    // ucFpMemBad cases to a NEW single-row `FP_MEM_TRAP_ENTRY` whose one Desc row directly
+    // produces the vector-11/faultUsesNextPc=True uop Task 6 already establishes
+    // for framed-but-unimplemented cpGEN encodings, rather than trying to un-set
+    // `microcoded` after the fact.)
+    ucEntryCtx.ucEntryOverride := ucFpMemBad ? U(Microcode.FP_MEM_TRAP_ENTRY, ...) :
+      /* one of 12 FP_MEM_*_ENTRY constants selected by (ucFpSrcSpec, ucFpIsAuto) */
+    // Per-instance ctx for the selected entry's rows to consume:
+    ucEntryCtx.fpDispMid   := ucEntryCtx.eaDispLo + 4
+    ucEntryCtx.fpDispHi    := ucEntryCtx.eaDispLo + 8
+    ucEntryCtx.fpAutoDelta := /* signed, per format-size table x (predec ? -1 : +1), 0 if !ucFpIsAuto */
+    ucEntryCtx.fpCmd       := ucFpOpmode ## ucFpDstFp ## ucFpSrcSpec  // SFpCmd's packed value
+```
+
+- [ ] **Step 6: Directed decode/microcode-dispatch test**
+
+```scala
+// src/test/scala/m68k040/decode/FpMemLoadSpec.scala
+package m68k040.decode
+
+import m68k040.VerilatorTest
+import m68k040.frontend.DecodePacket
+import spinal.core._
+import spinal.core.sim._
+import org.scalatest.funsuite.AnyFunSuite
+
+/** Task 6b: F-line FP-generic genuine memory-source loads. Proves the DISPATCH decision
+  * (Finding 1) -- opclass 010 with a memory <ea> routes into this task's crack; every
+  * other opclass sharing the same opword band, plus Packed, still traps to vector 11. */
+class FpMemLoadSpec extends AnyFunSuite {
+  class Dut extends Component {
+    val pkt = in(DecodePacket())
+    val uop = out(DecodedUop())
+    uop := MicroOpAssembler.assemble(pkt).uops(0)
+  }
+  def drive(dut: Dut, op: Int, ext: Int, len: Int): Unit = {
+    dut.pkt.valid #= true; dut.pkt.pc #= 0x3000; dut.pkt.simple #= true; dut.pkt.complex #= false
+    dut.pkt.lenWords #= len; dut.pkt.wordCount #= len; dut.pkt.fault #= false
+    dut.pkt.words(0) #= op; dut.pkt.words(1) #= ext
+    dut.pkt.words(2) #= 0; dut.pkt.words(3) #= 0; dut.pkt.words(4) #= 0
+  }
+
+  test("FADD.L (A0),FP0 is classified microcoded, not a bad/illegal trap", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      // opclass 010, src spec 000 (Long), <ea> mode 2 reg 0 = (A0), opmode 0x22 (FADD).
+      drive(dut, op = 0xF210, ext = 0x4022, len = 2); sleep(1)
+      assert(!dut.uop.faulted.toBoolean, "FADD.L (A0),FP0 must not fault -- it is this task's job")
+    }
+  }
+
+  test("FMOVE FPn,(A0) (opclass 011, store direction) still traps -- NOT this task's job", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      drive(dut, op = 0xF210, ext = 0x6800, len = 2); sleep(1)
+      assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 11,
+        "opclass 011 shares the opword band but is out of this task's scope -- must still trap")
+      assert(dut.uop.faultUsesNextPc.toBoolean, "length is known (Task 5), so the trap must be RTE-able")
+    }
+  }
+
+  test("F<op>.P (A0),FPn (Packed) traps regardless of opclass -- Decision 2", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      // opclass 010, src spec 011 (Packed), <ea> mode 2 reg 0.
+      drive(dut, op = 0xF210, ext = 0x4C22, len = 2); sleep(1)
+      assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 11, "Packed must always trap")
+    }
+  }
+
+  test("FMOVEM.X (A0),FP0-FP7 (opclass 110) still traps -- an unowned form, not this task's job", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      drive(dut, op = 0xF210, ext = 0xD0FF, len = 2); sleep(1)
+      assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 11)
+    }
+  }
+
+  test("FADD.L D1,FP0 (register-direct, Task 6's job) is UNCHANGED by this task's new dispatch arm", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      // <ea> mode 0 (Dn) must NOT be captured by this task's memory-mode gate.
+      drive(dut, op = 0xF201, ext = 0x4022, len = 2); sleep(1)
+      assert(!dut.uop.faulted.toBoolean)
+      assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.INTREG, "mode-0 Dn source stays Task 6's direct-emission path")
+    }
+  }
+}
+```
+
+**This test file deliberately stops at the dispatch boundary** (proving the RIGHT instructions
+route into vs. out of this task's crack) rather than asserting the crack's internal `Desc` rows or
+end-to-end arithmetic correctness — that needs a running `Microcode.rom`/`DecodeStage` sequencer
+simulation and, for arithmetic, `FpuCore` (Task 7) + `DivEuPlugin`'s FP lane (Task 8) both landed.
+Task 13 ("Directed bit-exact lock-step tests for the HW-native FP op set") is the right place for
+`FADD.L (A0),FP0`-style end-to-end lock-step vectors once those land; this task's own commit should
+add a `pending`-free placeholder note there rather than silently claim end-to-end coverage it does
+not have — mirror Task 8's own explicit "knowingly incomplete" framing (its Step 9 note) rather
+than glossing over it.
+
+- [ ] **Step 7: Requirements handoff to Task 8 (no code in this task)**
+
+Task 8's own Step 5 already implements `DivEuPlugin.scala`'s `fpSrcKind` dispatch switch,
+including this task's `MEMPAIR`/`MEMEXT` cases (Finding 5) — the switch reads `srcA`/`srcB` off
+the ordinary int PRF ports (`intRdA`/`intRdB`, the same ports the pre-existing `INTREG` case
+reads) for `MEMPAIR`, and additionally needs a THIRD int regfile read port for `MEMEXT`'s `srcC`
+(`Desc.srcC`/`RenamedUop.psrcC`, Finding 3 — confirm at implementation time whether this can share
+`DivEuPlugin`'s existing `rdH` port, already acquired for DIVL's 64-bit dividend high word, since
+DIVL and an Extended-format FP memory load never issue in the same cycle through the single CPLX
+issue port, or whether a dedicated port is cleaner). Whichever of Task 6b/Task 8 is actually
+implemented second should re-read the other's real landed diff before touching
+`DivEuPlugin.scala` — both tasks touch the same file's issue-time operand-read region.
+
+- [ ] **Step 8: Run the tests**
+
+```bash
+sbt "testOnly m68k040.decode.FpMemLoadSpec"
+sbt "testOnly m68k040.decode.* m68k040.frontend.*"
+```
+Expected: `FpMemLoadSpec` PASSes; the full decode/frontend suite is green (in particular
+`PredecodeWordSpec`/`PredecodeFpLenSpec`/`UcPendSpecStashEquivalenceSpec` must be unaffected — this
+task changes `OperationDecoder`'s `is(0xF)` arm and `DecodeStage`'s `ucBegin`, both of which those
+specs exercise).
+
+- [ ] **Step 9: Lock-step regression**
+
+```bash
+sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
+```
+Expected: unchanged from whatever count Task 6 left the suite at. No lock-step program contains
+an FP memory-source opcode yet, so a delta here means this task's new `OperationDecoder`/
+`DecodeStage` changes leaked into non-FP decode paths — most likely the new `fpMemIsMemEa` gate
+not being properly scoped to `isFpGeneric`, or the `ucBegin` override touching a `ucEntryCtx`
+field some other microcoded family also reads.
+
+- [ ] **Step 10: Confirm full-core elaboration**
+
+```bash
+sbt "runMain m68k040.top.GenFullCoreSynthVerilog"
+```
+Expected: succeeds with no `PhaseCheck_noLatchNoOverride` error — the concrete check that the new
+`Desc`/`DescBits` `fpSrcKindSel` parameter is driven on every ROM row (not just the 12 new ones).
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add src/main/scala/m68k040/decode/DecodedUop.scala \
+        src/main/scala/m68k040/decode/OperationDecoder.scala \
+        src/main/scala/m68k040/decode/Microcode.scala \
+        src/main/scala/m68k040/decode/DecodeStage.scala \
+        src/test/scala/m68k040/decode/FpMemLoadSpec.scala
+git commit -m "feat(fpu): F-line FP-generic genuine memory-source loads (F<op> <mem>,FPn)
+
+Implements the 6-format (Byte/Word/Long/Single/Double/Extended) memory-
+source crack for F<op> <mem>,FPn across every EA mode Task 5's eaExt()
+framing covers. Packed stays out of scope (Decision 2, always traps);
+FMOVE FPn,<mem> (store direction), the FPCR/FPSR/FPIAR memory-EA forms,
+and the FMOVEM data-register-list form are explicitly NOT covered here
+(unowned gaps in this plan, not silently assumed covered).
+
+DISPATCH is the genuinely new problem this family poses, not present in
+any prior microcoded family: F<op> <mem>,FPn / FMOVE FPn,<mem> /
+FMOVE(M) <ea>,FPCR/FPSR/FPIAR / FMOVEM <ea>,list all share ONE opword
+shape (0xF200|<ea>), differing only in the extension word's opclass
+field, which OperationDecoder cannot see under this project's opword-
+only decode-purity invariant (PredecodeWord.scala:64's refill-time
+decode(), UcPendSpecStashEquivalenceSpec's decode-purity assertion).
+OperationDecoder therefore routes the whole memory-mode-<ea> cpGEN band
+(opclass-agnostic) to one shared placeholder ucEntry, and DecodeStage's
+ucBegin -- which DOES see the real ext word, the same precedent
+bit-field's BF_RMW_4B_ENTRY already establishes (OperationDecoder.scala:
+733, 'overridden by ucBegin') -- does the real opclass/format dispatch,
+rejecting opclass 011/100/101/110/111 and Packed back to the ordinary
+vector-11 trap. (A real, unresolved tension with Task 9's own
+OperationDecoder arm, which reads words(1) directly, is flagged in
+Finding 1 rather than silently resolved -- confirmed via direct read at
+implementation time, not guessed.)
+
+The crack shape is closer to MOVE16 (a fixed, decode-time-static
+transfer count per format) than MOVEM (runtime-variable), confirmed by
+reading both real precedents rather than assumed. 12 new Microcode.scala
+ROM entry groups (6 formats x 2 EA-mode buckets: side-effect-free EA
+reusing the bit-field-memory arm's SEaBase/SEaDispLo pattern, vs.
+(An)+/-(An) reusing MOVE16's own explicitly-stated 'plain register base
++ flat useImm displacement + separate dropped UAddDrop write-back'
+pattern, deliberately NOT eaAuto, mirroring MOVE16's own header comment).
+
+The Extended format's 3-chunk assembly reuses Desc.srcC/RenamedUop.psrcC
+-- a genuine 3rd renamed int source ALREADY fully wired end-to-end
+through IssueQueuePlugin's CPLX-cluster scoreboard/wakeup logic and
+already read by DivEuPlugin today (DivEuPlugin.scala:142, DIVL's 64-bit
+dividend high word). This eliminated what looked, before verifying, like
+the highest-risk part of this task (a novel 3-source EU port) -- no new
+IQ/rename infrastructure was needed. An FP-domain scratch-register
+alternative was considered and rejected: DecodedUop's FP register-number
+fields are 3 bits (0-7, fully saturated by FP0-FP7, RenameStage.scala:38
+fpRat archDepth=8 is already-landed RTL), unlike the int side's 5-bit
+field with real T0-T3 headroom.
+
+Reuses Task 6's fpSrcFmt field verbatim (no new field) and adds two new
+FpSrcKind values, MEMPAIR/MEMEXT, that Task 8's own Step 5 already
+dispatches on -- this task does NOT itself touch DivEuPlugin.scala, since
+that plugin's FP pipeline does not exist until Task 8 (sequenced after
+Task 7); Step 7 is a requirements handoff, not a code deliverable.
+
+Flagged for implementation-time verification (not resolved here): the
+Desc/DescBits hardware-mirror wiring for the new fpSrcKindSel parameter;
+the exact mechanism for un-committing an already-'microcoded'-routed
+instruction back to the illegal path at ucBegin time; Byte-format
+sign-extension and the exact per-format An auto-increment delta against
+the MC68040 UM; and the OperationDecoder decode-purity tension with
+Task 9's own arm (Finding 1).
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
 
 ---
 
-**Handoffs these four tasks create, for whoever writes Tasks 7-15:**
+## Handoffs / open items for whoever integrates this task
 
-- **Task 8** must drive `iq.cplxFpWakeup`/`iq.cplxFpccWakeup` from `DivEuPlugin` with the same
-  `compLive && <write> && !compFault` gating as `wakeup`/`wakeupNzvc`, and wire them in
-  `FullCoreSynth.scala` next to the existing `iq.cplxNzvcWakeup` lines. It must also resolve the
-  flagged source-format open item (Long vs Single) before implementing the INTREG conversion.
-- **Task 10** owns the deferred cpGEN forms: real memory sources (load crack; X/D/P are
-  multi-access), `FMOVE FPn,<ea>`, the FPCR/FPSR/FPIAR moves, and FMOVEM (a MOVEM-style DecodeStage
-  sequencer, not an assembler crack). Their lengths are already framed by Task 5, so Task 10 changes
-  only emission, and can narrow `fpGenBad` further without touching predecode.
-- **Tasks 9/11** own FSAVE/FRESTORE. Their opwords are in the `1111 001 1xx` band that Task 4's arm
-  deliberately does **not** claim, and their length framing is **not** added by Task 5 — both are
-  explicit to-dos there, and their opword encodings are on this plan's unverified list.
-- **Task 3's `readsFpcc` has no producer of readers yet.** The first is FBcc/FScc/FDBcc or
-  `FMOVE from FPSR`; whichever task adds one gets the whole dependency mechanism for free, but should
-  re-run `IqFpSpec` to confirm the FPCC wait bit clears on the real path.
+- **Task 9's `OperationDecoder` arm reads `pkt.words(1)` directly**, apparently violating the
+  same opword-only decode-purity invariant this task's whole dispatch design (Finding 1) exists
+  to respect. Not fixed here (Task 9 is out of this task's scope) but flagged for whoever lands
+  both — the `ucBegin`-override pattern this task uses is a directly reusable fix if Task 9
+  genuinely needs one, though it is equally possible Task 9's characterization of what
+  `OperationDecoder` can see is simply correct and this task's own machinery is more
+  conservative than strictly required (see Step 1(d)).
+- **`FMOVE FPn,<ea>`** (store direction), **`FMOVE(M) <ea>,FPCR/FPSR/FPIAR`** (memory-EA forms),
+  and the **FMOVEM FP-data-register-list form** remain unowned by any task in this plan — Task 9
+  explicitly excludes the control-register memory-EA forms, Task 9b's own optional
+  `popcount==1`-with-memory-EA extension is not guaranteed landed, and no task currently claims
+  the store direction or the data-register-list form. All should be named as real, open gaps
+  rather than silently assumed covered by this task or any other.
+- **The `Desc`/`DescBits` hardware-mirror wiring for the new `fpSrcKindSel` parameter** (Task A1's
+  LUT-reduction `descToBits`/`resolveFromBits` machinery) was not independently re-derived in this
+  planning pass — Step 3 flags this as needing verification against the real current mechanism at
+  implementation time.
+- **The "un-commit an already-microcoded instruction back to illegal at ucBegin time" mechanism**
+  (Step 5) was not found as an existing precedent during this research pass — the task proposes a
+  concrete fallback (a dedicated `FP_MEM_TRAP_ENTRY` single-row Desc that itself produces the
+  vector-11 uop) but flags that a cleaner existing mechanism may already exist and should be
+  checked for first.
+- **Byte-format sign-extension and the exact per-format `An` auto-increment delta** (Step 1(b)/(c))
+  were assembled from general 68881/IEEE-754 knowledge, not independently re-verified against the
+  MC68040 UM during this planning pass — both are made explicit verification steps rather than
+  silently trusted.
 
 ---
 
@@ -5398,11 +6518,21 @@ git worktree remove /home/qwertyoruiop/wt-fpucore
 - Test: `src/test/scala/m68k040/execute/FpuEuIntegrationSpec.scala`
 
 **Interfaces:**
-- Consumes: `FpuCore` (Task 7 — `start`/`busy`/`done`/operand-in/result-out I/O, exact shape
-  per Task 7's own Interfaces block; treat as a black-box `Component` the way `MulCore` is
-  consumed today), `FpRegFileService` (Task 1), the FP data + FPCC rename fields on
-  `RenamedUop` (Task 2), `cplxFpccWakeup`/`cplxFpWakeup` ports (Task 3), `FpuControlPlugin`
-  (Task 9 — FPCR rounding-mode read, FPSR exception-status write).
+- Consumes: `FpuCore` (Task 7's F6 Interfaces block, `FpTypes.scala`/`FpuCore.scala` —
+  `io.start`/`io.op(FpOp)`/`io.dst`/`io.src`/`io.rmode`/`io.cromSel`/`io.iterAck` in;
+  `io.ready`/`io.doneFixed`/`io.resFixed`/`io.busyIter`/`io.doneIter`/`io.resIter`/
+  `io.srcUnnormal`/`io.dstUnnormal`/`io.srcDenorm`/`io.dstDenorm` out; treat as a black-box
+  `Component` the way `MulCore` is consumed today, but note it has TWO done signals with
+  different timing shapes, not one), `FpRegFileService` (Task 1), the FP data + FPCC rename
+  fields on `RenamedUop` (Task 2), `cplxFpccWakeup`/`cplxFpWakeup` ports (Task 3),
+  `FpuControlPlugin` (Task 9 — FPCR rounding-mode read via `io.rmode`, FPSR exception-status
+  write from `FpResult.exc.*`), `fpSrcKind`/`fpSrcFmt`/`fpWideImm` fields on `RenamedUop`
+  (Task 6) for the immediate/int-register source-conversion cases this task must now also
+  implement (previously entirely unaddressed, including for the pre-existing INTREG case —
+  see Step 5's code below), and `fpSrcKind.{MEMPAIR,MEMEXT}` (Task 6b) for the memory-source
+  cases — Task 6b's own Step 7 is the first real implementation of the `fpSrcKind` dispatch
+  this task should treat as its baseline, not duplicate; land whichever of the two tasks is
+  implemented second as an additive edit on top of the other's actual landed diff.
 - Produces: nothing new externally — this task is where everything upstream gets consumed
   and turned into real execution. Task 15's protocol tests exercise this task's result.
 
@@ -5432,24 +6562,36 @@ its own regfile write port), not MULHI's chunking.
 // ports below, not carried in this descriptor -- mirrors MulPipeContext's shape, which
 // also does NOT carry operand values, only routing metadata, since MulCore's own a/b
 // inputs are driven combinationally from the same-cycle regfile read at issue time).
+// NOTE: this bundle is ALSO named FpResult in Task 7's own FpTypes.scala (F6's "FpResult
+// fields" table -- value/writeFp/fpcc/exc.*). To avoid a same-name collision, this
+// DivEuPlugin-local completion bundle is renamed FpEuResult -- it is a DIFFERENT shape
+// (adds robId/pdst/pFpccDst/fault/faultVec routing metadata Task 7's FpuCore knows
+// nothing about; Task 7's FpResult is the arithmetic core's raw per-op result only).
 case class FpPipeContext() extends Bundle {
   val robId    = UInt(6 bits)
   val pdst     = UInt(4 bits)   // FP data physical dest (Task 2's pFpDst width)
   val pdstValid= Bool()
   val pFpccDst = UInt(4 bits)
   val fpccWrite= Bool()
-  val op       = Bits(4 bits)   // FpuOp selector, Task 7's FpuTypes.FpuOp encoding
-  val roundingMode = Bits(2 bits)
+  val op       = m68k040.execute.fpu.FpOp()   // Task 7's FpTypes.FpOp (13 elements) -- the
+                                                // ARITHMETIC selector, mapped from u0.fpuOp
+                                                // (the raw ISA opmode) at issue, NOT from
+                                                // u0.op (always DecOp.FPU -- see Step 5)
+  val rmode    = Bits(2 bits)                  // FPCR[5:4] verbatim, matches FpuCore.io.rmode
 }
 
-// FP result: what a completed FpuCore op hands back to the arbiter.
-case class FpResult() extends Bundle {
+// FP result: what a completed FpuCore op hands back to the arbiter. Distinct from Task 7's
+// own FpResult (FpTypes.scala) -- this ADDS ROB routing metadata and the derived
+// enabled-trap escalation bit; it does not replace or shadow Task 7's bundle.
+case class FpEuResult() extends Bundle {
   val robId     = UInt(6 bits)
   val pdst      = UInt(4 bits); val pdstValid = Bool()
-  val data      = Bits(80 bits)
+  val data      = Bits(80 bits)         // == FpuCore's FpResult.value
   val pFpccDst  = UInt(4 bits); val fpccWrite = Bool()
-  val fpcc      = Bits(4 bits)   // N/Z/I/NAN, per spec's internal [3:0]={NaN,I,Z,N} layout
-  val fault     = Bool()          // set only for the narrow enabled-trap OVFL/UNFL escalation (Task 9/11)
+  val fpcc      = Bits(4 bits)          // == FpuCore's FpResult.fpcc, {NaN,I,Z,N}=bit3..0
+  val fault     = Bool()                // set only for the narrow enabled-trap OVFL/UNFL escalation (Task 9/11),
+                                          // derived HERE from FpuCore's FpResult.exc.{ovfl,unfl,...} + FpuControlPlugin's
+                                          // enable bits -- FpuCore itself has NO fault/faultVec output
   val faultVec  = UInt(8 bits)
 }
 ```
@@ -5460,14 +6602,20 @@ case class FpResult() extends Bundle {
 
 ```scala
   val fpu = new m68k040.execute.fpu.FpuCore()
-  // FpuCore is fixed-II=1 for FADD/FSUB/FMUL/FABS/FNEG/FCMP/FINT/FINTRZ/FMOVECR/FTST
-  // (Task 7's FpuTypes.FpuCore.FixedLatency) and iterative single-context for FDIV/FSQRT
-  // (Task 7's FpuTypes.FpuCore.IterativeLatencyMax, a WORST-CASE bound for descriptor
-  // shift-register sizing -- the iterative lane's actual completion time is data-dependent
-  // and signalled by `fpu.io.done`, exactly like DivCore/DivUnit's existing iterative
-  // completion signalling, NOT the fixed shift-register drain the elastic lanes use).
+  // FpuCore is fixed-II=1, FixedLatency=13 cycles (Task 7's F6 Interfaces block --
+  // `FpuCore.FixedLatency`, THIS ONE constant name was already correct) for
+  // FADD/FSUB/FMUL/FABS/FNEG/FCMP/FINT/FINTRZ/FMOVECR/FTST/FMOVE, driving io.doneFixed/
+  // io.resFixed. FDIV/FSQRT are iterative and single-context (`FpDivSqrtCore.
+  // WorstCaseLatency = 71` is DOCUMENTATION ONLY per F6 -- "the iterative lane is a
+  // handshake, not a constant-latency pipe" -- it must NOT be used to size a shift
+  // register; the iterative lane's actual completion is signalled by io.doneIter, a LEVEL
+  // held until io.iterAck, exactly like DivCore/DivUnit's existing iterative completion
+  // signalling).
   val fpFixedCtx      = Vec.fill(m68k040.execute.fpu.FpuCore.FixedLatency)(Reg(FpPipeContext()))
   val fpFixedCtxValid = Vec.fill(m68k040.execute.fpu.FpuCore.FixedLatency)(RegInit(False))
+  // The iterative lane holds exactly ONE context for its entire (data-dependent) duration
+  // -- NOT a shift register -- set at issue, read at io.doneIter:
+  val fpIterCtx       = Reg(FpPipeContext())
 ```
 
 - [ ] **Step 3: Acquire FP regfile + FPCC/FP wakeup ports in `setup`** (mirrors the existing
@@ -5499,12 +6647,31 @@ case class FpResult() extends Bundle {
   add a 4th arm)
 
 ```scala
-  val issueIsFp = u0.cluster === Cluster.CPLX && m68k040.execute.fpu.FpuTypes.isFpOp(u0.op)
+  // NOTE: isFpOp/isIterative dispatch on u0.op, which is DecOp (Task 4: exactly ONE
+  // element, DecOp.FPU, for the whole FP family) -- these two helpers only need to ask
+  // "is this uop an FP uop at all" and, if so, "is its SPECIFIC operation iterative", which
+  // means isIterative must actually consult u0.fpuOp (the raw ISA opmode: 0x20=FDIV,
+  // 0x04=FSQRT are the only two iterative opmodes), NOT u0.op. Signature corrected below.
+  val issueIsFp = u0.cluster === Cluster.CPLX && u0.op === DecOp.FPU
   val fpFixedCanAccept = !fpFixedCtxValid(0)  // head slot of the fixed shift-register free
   val fpIterativeBusy  = Reg(Bool()) init False
-  val issueIsFpIterative = issueIsFp && m68k040.execute.fpu.FpuTypes.isIterative(u0.op)
-  val issueIsFpFixed     = issueIsFp && !m68k040.execute.fpu.FpuTypes.isIterative(u0.op)
+  val issueIsFpIterative = issueIsFp && m68k040.execute.fpu.FpTypes.isIterativeOpmode(u0.fpuOp)
+  val issueIsFpFixed     = issueIsFp && !m68k040.execute.fpu.FpTypes.isIterativeOpmode(u0.fpuOp)
+```
+```scala
+// src/main/scala/m68k040/execute/fpu/FpTypes.scala -- Task 7 should add this small helper
+// (flagged here since Task 8 is its first real consumer):
+object FpTypes {
+  // ...existing FpOp/FpResult/etc...
+  /** True for the two ISA opmodes (raw ext[6:0]) that FpuCore executes on the iterative
+    * single-context lane. Dispatches on the RAW OPMODE, not on FpOp, so DivEuPlugin can
+    * call it before it has even computed the opmode->FpOp mapping (Step 5). */
+  def isIterativeOpmode(opmode: Bits): Bool =
+    (opmode === B"7'h20") || (opmode === B"7'h04")   // FDIV, FSQRT
+}
+```
 
+```scala
   issuePort.ready := !flushSig && (!issuePort.valid || Mux(issueIsMul,
     mulCanAccept,
     Mux(issueIsMulHi, mulHiAvailable,
@@ -5517,20 +6684,100 @@ case class FpResult() extends Bundle {
   `rdA.addr := u0.psrcA` block at `DivEuPlugin.scala:138-147`)
 
 ```scala
-  fpRdA.addr  := u0.pFpSrcA
-  fpRdB.addr  := u0.pFpSrcB
-  fpccRd.addr := u0.pFpccSrc
+  fpRdA.addr  := u0.pFpSrcA   // FPn (the destination, read back for dyadic ops -- Task 6)
+  fpRdB.addr  := u0.pFpSrcB   // FPm, valid only when u0.fpSrcKind === FpSrcKind.FPREG
 
   val fpAccept = issuePort.fire && issueIsFp
-  fpu.io.start       := fpAccept
-  fpu.io.a           := fpRdA.data
-  fpu.io.b           := fpRdB.data
-  fpu.io.op          := u0.op.asBits.resized  // FpuTypes.FpuOp encoding, Task 7
-  fpu.io.roundingMode:= fpuControl.io.roundingMode  // Task 9's FpuControlPlugin FPCR read
-  fpu.io.srcFpcc     := fpccRd.data            // FTST/some FCMP paths may need the prior FPCC; confirm against Task 7's actual FTST semantics before wiring blind
 
-  when(fpAccept && issueIsFpIterative) { fpIterativeBusy := True }
-  when(fpu.io.done && fpIterativeBusy) { fpIterativeBusy := False }
+  // ── Opmode -> FpOp mapping (NEW -- did not exist in any prior draft of this task).
+  // u0.op is ALWAYS DecOp.FPU (Task 4: one DecOp for the whole family); the real
+  // per-operation selector is u0.fpuOp, the raw 7-bit ISA extension-word opmode. This maps
+  // it onto Task 7's FpOp enum. FMOVECR is a special case: it does not have a distinct
+  // opmode of its own (fpSrcKind === ROMCONST identifies it instead of an opmode value),
+  // so it is checked FIRST.
+  val fpOpSel = Mux(u0.fpSrcKind === FpSrcKind.ROMCONST, m68k040.execute.fpu.FpOp.FMOVECR,
+    u0.fpuOp.mux(
+      B"7'h00" -> m68k040.execute.fpu.FpOp.FMOVE,
+      B"7'h01" -> m68k040.execute.fpu.FpOp.FINT,
+      B"7'h03" -> m68k040.execute.fpu.FpOp.FINTRZ,
+      B"7'h04" -> m68k040.execute.fpu.FpOp.FSQRT,
+      B"7'h18" -> m68k040.execute.fpu.FpOp.FABS,
+      B"7'h1A" -> m68k040.execute.fpu.FpOp.FNEG,
+      B"7'h20" -> m68k040.execute.fpu.FpOp.FDIV,
+      B"7'h22" -> m68k040.execute.fpu.FpOp.FADD,
+      B"7'h23" -> m68k040.execute.fpu.FpOp.FMUL,
+      B"7'h28" -> m68k040.execute.fpu.FpOp.FSUB,
+      B"7'h38" -> m68k040.execute.fpu.FpOp.FCMP,
+      B"7'h3A" -> m68k040.execute.fpu.FpOp.FTST,
+      default  -> m68k040.execute.fpu.FpOp.FMOVE   // unreachable: fpNative already excluded every other opmode at decode (Task 6)
+    ))
+
+  // ── Source operand select (NEW -- no prior draft of this task handled this even for
+  // the ORIGINAL fpSrcKind values; it unconditionally read fpRdB regardless of kind).
+  // FPREG: fpRdB.data IS the extended-precision value already, no conversion.
+  // INTREG/INTIMM: a 32-bit signed integer (srcA register data for INTREG, u0.fpWideImm(31
+  //   downto 0) for INTIMM, both already sign-extended to 32 bits at decode) -> convert
+  //   int32-to-extended. VERIFY at implementation time against SoftFloat's
+  //   int32_to_floatx80 (Musashi links the real SoftFloat; this project's own FpRoundPack
+  //   (Task A) is the packing back end this conversion should reuse, not a bespoke circuit).
+  // SINGLEIMM: u0.fpWideImm(31 downto 0) is a 32-bit IEEE-754-single BIT PATTERN -> convert
+  //   float32-to-extended (SoftFloat's float32_to_floatx80 is the reference; Musashi's own
+  //   `double_to_fx80` helper, m68kfpu.c:55-62, is the same idea one precision up -- follow
+  //   that shape, do not invent a new one).
+  // DOUBLEIMM: u0.fpWideImm(63 downto 0), float64-to-extended (float64_to_floatx80 /
+  //   Musashi's own double_to_fx80 -- this one has a DIRECT existing precedent to mirror).
+  // EXTIMM: u0.fpWideImm(79 downto 0) IS the internal Fp80 layout already (Decision 1) --
+  //   route directly, zero conversion, per Task 6's own note that this is the simplest case.
+  // MEMPAIR (Task 6b): srcA=hi32/srcB=lo32 via the ordinary int rdA/rdB ports (the SAME
+  //   ports INTREG already uses) -- {rdA.data,rdB.data} IS the 64-bit IEEE double bit
+  //   pattern, so this reuses doubleToExtended verbatim.
+  // MEMEXT (Task 6b): srcA=T0/srcB=T1 via rdA/rdB, srcC=T2 via a THIRD int regfile read
+  //   port (Task 6b's Finding 3: Desc.srcC/RenamedUop.psrcC is ALREADY fully wired through
+  //   the CPLX cluster's scoreboard/wakeup logic and already read by this EU today, DIVL's
+  //   64-bit dividend high word via `rdH` -- confirm at implementation time whether `rdH`
+  //   can be shared with this purpose, since DIVL and an Extended-format FP memory load
+  //   never issue in the same cycle through the single CPLX issue port, or whether a
+  //   dedicated port is cleaner). Pure bit placement, NO numeric conversion (Task 6b's
+  //   Finding 7): {intRdA.data(31 downto 16), intRdB.data, intRdHOrEquivalent.data} IS the
+  //   80-bit extended value directly.
+  // ROMCONST: no io.src needed at all -- io.cromSel carries the ROM offset instead.
+  def intToExtended(v: Bits): Bits    /* NEW: int32 -> Fp80, mirror SoftFloat's int32_to_floatx80 */
+  def singleToExtended(v: Bits): Bits /* NEW: float32 bit pattern -> Fp80, mirror Musashi's double_to_fx80 one precision down */
+  def doubleToExtended(v: Bits): Bits /* NEW: float64 bit pattern -> Fp80, DIRECT precedent: Musashi's double_to_fx80, m68kfpu.c:55-62 */
+
+  val fpSrcVal = u0.fpSrcKind.mux(
+    FpSrcKind.FPREG     -> fpRdB.data,
+    FpSrcKind.INTREG    -> intToExtended(intRdA.data),   // intRdA: the EXISTING int PRF read port this EU already has for srcA
+    FpSrcKind.INTIMM    -> intToExtended(u0.fpWideImm(31 downto 0)),
+    FpSrcKind.SINGLEIMM -> singleToExtended(u0.fpWideImm(31 downto 0)),
+    FpSrcKind.DOUBLEIMM -> doubleToExtended(u0.fpWideImm(63 downto 0)),
+    FpSrcKind.EXTIMM    -> u0.fpWideImm,
+    FpSrcKind.MEMPAIR   -> doubleToExtended(intRdA.data ## intRdB.data),
+    FpSrcKind.MEMEXT    -> (intRdA.data(31 downto 16) ## intRdB.data ## intRdHOrEquivalent.data),
+    FpSrcKind.ROMCONST  -> B(0, 80 bits)   // unused when ROMCONST; io.cromSel carries the real payload
+  )
+
+  fpu.io.start   := fpAccept
+  fpu.io.op      := fpOpSel
+  fpu.io.dst     := fpRdA.data       // the destination FPn, read back for dyadic ops
+  fpu.io.src     := fpSrcVal
+  fpu.io.rmode   := fpuControl.io.rmode        // Task 9's FpuControlPlugin FPCR read
+  fpu.io.cromSel := u0.fpuOp.resize(7)         // valid (and only meaningful) when fpSrcKind === ROMCONST;
+                                                 // fpuOp carries the ROM offset verbatim in that case (Task 6)
+
+  // Iterative lane holds exactly ONE context (Step 2's fpIterCtx), set once at accept and
+  // read back whole at io.doneIter -- there is no shift register to push into.
+  when(fpAccept && issueIsFpIterative) {
+    fpIterativeBusy      := True
+    fpIterCtx.robId      := u0.robId
+    fpIterCtx.pdst       := renUop.pFpDst
+    fpIterCtx.pdstValid  := renUop.pFpDstValid
+    fpIterCtx.pFpccDst   := renUop.pFpccDst
+    fpIterCtx.fpccWrite  := renUop.writesFpcc
+    fpIterCtx.op         := fpOpSel
+    fpIterCtx.rmode      := fpuControl.io.rmode
+  }
+  when(fpu.io.doneIter && fpIterativeBusy) { fpIterativeBusy := False }
 
   // Push the descriptor into the fixed shift-register on a fixed-lane accept (mirrors
   // mulCtx's own shift-register push at DivEuPlugin.scala:464-482 -- shift every cycle,
@@ -5541,46 +6788,49 @@ case class FpResult() extends Bundle {
     fpFixedCtx(m68k040.execute.fpu.FpuCore.FixedLatency - 1).pdstValid := renUop.pFpDstValid
     fpFixedCtx(m68k040.execute.fpu.FpuCore.FixedLatency - 1).pFpccDst  := renUop.pFpccDst
     fpFixedCtx(m68k040.execute.fpu.FpuCore.FixedLatency - 1).fpccWrite := renUop.writesFpcc
-    fpFixedCtx(m68k040.execute.fpu.FpuCore.FixedLatency - 1).op        := u0.op.asBits.resized
+    fpFixedCtx(m68k040.execute.fpu.FpuCore.FixedLatency - 1).op        := fpOpSel
+    fpFixedCtx(m68k040.execute.fpu.FpuCore.FixedLatency - 1).rmode     := fpuControl.io.rmode
     fpFixedCtxValid(m68k040.execute.fpu.FpuCore.FixedLatency - 1)      := True
   }
   for (i <- 0 until m68k040.execute.fpu.FpuCore.FixedLatency - 1) {
     fpFixedCtx(i)      := fpFixedCtx(i + 1)
     fpFixedCtxValid(i) := fpFixedCtxValid(i + 1)
   }
-  // Head (index 0) is consumed the cycle FpuCore.io.done fires for the fixed lane -- see
-  // Step 6's result-FIFO push, which reads fpFixedCtx(0) the cycle it retires.
+  // Head (index 0) is consumed the cycle FpuCore.io.doneFixed fires for the fixed lane --
+  // see Step 6's result-FIFO push, which reads fpFixedCtx(0) the cycle it retires.
 ```
 
-**Open question this step deliberately surfaces rather than silently resolves**: whether
-`FpuCore`'s single `io.done` pulse needs to distinguish "a fixed-lane op finished" from "the
-iterative lane finished" (two different consumers above read it: `fpIterativeBusy` clear, and
-implicitly the fixed-lane shift-register's head-retirement in Step 6). If Task 7's `FpuCore`
-interface only exposes one `done`, add a second output (`doneFixed`/`doneIterative`, or a
-`doneKind` selector) — reconcile this exactly against Task 7's actual delivered interface
-before merging Step 5/6; do not guess past it.
+**Open question this step used to surface — now RESOLVED by Task 7's real, delivered
+interface**: `FpuCore` exposes TWO independent completion signals, not one — `io.doneFixed`
+(a 1-cycle pulse, exactly `FixedLatency` cycles after an accepted fixed-lane start, in issue
+order) and `io.doneIter` (a LEVEL held until `io.iterAck`). No `doneKind` selector is needed;
+the two signals are already separate. See Step 6's code for how each is consumed.
+
+Flagged explicitly, not silently resolved: `intToExtended`/`singleToExtended`/
+`doubleToExtended` are real conversion circuits (not one-liners) that no prior draft of this
+task addressed at all, including for the pre-existing INTREG case. They should reuse Task
+A's `FpRoundPack`/`Fp80` helpers (`FpTypes.scala`) rather than being built from scratch —
+confirm the exact reusable entry points when Task 7 is actually implemented. `doubleToExtended`
+has the most direct existing precedent to mirror: Musashi's own `double_to_fx80`
+(`m68kfpu.c:55-62`, `float64_to_floatx80` under the hood) — same shape, different width for
+`singleToExtended`. `intRdA`/`intRdB`/`intRdHOrEquivalent` above are the ordinary int PRF
+read ports this EU already holds for its non-FP operands (`rdA`/`rdB`/`rdH`, the same ports
+DIVL/CMP2/CHK2 already use) — confirm at implementation time whether the MEMEXT case's third
+read can share `rdH` or needs a dedicated port (Task 6b's Finding 3).
 
 - [ ] **Step 6: Result capture + FP writeback arbiter — the load-bearing new logic. Extend
   the existing 3-way `captureArb()` selector (legacy / MULHI / MUL) to 4-way, adding FP**
   (mirrors `DivEuPlugin.scala:607-661` exactly in structure, adds one arm)
 
 ```scala
-  // fpFixedCtx(0) is valid the cycle FpuCore.io.done fires for a fixed-lane op (by
-  // construction of the shift-register's fixed depth == FpuCore.FixedLatency). Iterative
-  // completion is signalled independently via fpu.io.done while fpIterativeBusy was set
-  // by an iterative accept -- both funnel into one fpResultValid/fpResultCtx pair this
-  // cycle, mutually exclusive by construction (fpFixedCtxValid(0) and fpIterativeBusy
-  // cannot both source a `done` pulse on the same op, since issuePort.ready already
-  // serializes iterative issue against a single held context).
-  val fpResultValid = (fpu.io.done && fpFixedCtxValid(0)) || (fpu.io.done && fpIterativeBusy)
-  val fpResultCtx    = fpFixedCtx(0)   // for the iterative case this is stale/unused --
-                                         // Task 8 Step 5's open question above must resolve
-                                         // how the iterative op's OWN descriptor (issued once,
-                                         // held for the iteration's duration) is threaded to
-                                         // this point; a single held Reg(FpPipeContext()) for
-                                         // the iterative lane, set at issue and read here, is
-                                         // the straightforward fix once Step 5's question is
-                                         // answered -- flagged, not silently papered over.
+  // TWO independent completion events now, matching FpuCore's real interface (F6):
+  // io.doneFixed is a 1-cycle PULSE, exactly FixedLatency cycles after an accepted
+  // fixed-lane start, in issue order -- fpFixedCtx(0) is valid on exactly that cycle by
+  // construction. io.doneIter is a LEVEL, held until io.iterAck -- fpIterCtx (Step 2) is
+  // the single held context for the iterative lane's entire duration.
+  val fpFixedResultValid = fpu.io.doneFixed && fpFixedCtxValid(0)
+  val fpIterResultValid  = fpu.io.doneIter && fpIterativeBusy
+  fpu.io.iterAck := fpIterResultValid   // acknowledge the SAME cycle this plugin captures it
 
   when(!flushSig) {
     when(legacyValid) {
@@ -5597,12 +6847,14 @@ before merging Step 5/6; do not guess past it.
         mulHiMem.write(tailRobId, mulResultQ.io.pop.payload.mulHigh)
         mulHiValid(tailRobId) := True
       }
-    } elsewhen(fpResultValid) {
+    } elsewhen(fpFixedResultValid) {
       // NEW: FP completion, lowest priority in this arbiter -- legacy/MUL/MULHI keep
       // their existing relative priority unchanged; FP is strictly additive. Revisit this
       // priority ordering only with real collision-rate evidence from Task 15's protocol
       // tests, not speculatively.
-      fpWriteback(fpResultCtx, fpu.io.result, fpu.io.fpcc, fpu.io.fault, fpu.io.faultVec)
+      fpWriteback(fpFixedCtx(0), fpu.io.resFixed)
+    } elsewhen(fpIterResultValid) {
+      fpWriteback(fpIterCtx, fpu.io.resIter)
     }
   }
 ```
@@ -5623,14 +6875,26 @@ widened old one" architecture):
   val fpCompFpcc     = Reg(Bits(4 bits))
   val fpCompFault    = Reg(Bool()); val fpCompFaultVec = Reg(UInt(8 bits))
 
-  def fpWriteback(ctx: FpPipeContext, data: Bits, fpcc: Bits, fault: Bool, faultVec: UInt): Unit = {
+  // FpuCore's FpResult (Task 7, FpTypes.scala) has NO fault/faultVec field at all -- only
+  // exc.{snan,operr,ovfl,unfl,dz,inex2}. The narrow enabled-trap escalation (Task 9/11) is
+  // derived HERE, from those flags AND FpuControlPlugin's FPCR enable bits -- confirm the
+  // exact enable-bit names against Task 9's actual FpuControlService before wiring this.
+  def fpWriteback(ctx: FpPipeContext, res: m68k040.execute.fpu.FpResult): Unit = {
     fpCompValid    := True
     fpCompRobId    := ctx.robId
     fpCompPdst     := ctx.pdst; fpCompPdstValid := ctx.pdstValid
-    fpCompData     := data
+    fpCompData     := res.value
     fpCompFpccDst  := ctx.pFpccDst; fpCompFpccWrite := ctx.fpccWrite
-    fpCompFpcc     := fpcc
-    fpCompFault    := fault; fpCompFaultVec := faultVec
+    fpCompFpcc     := res.fpcc
+    // Placeholder escalation logic -- Task 9/11 must confirm the real enable-bit names and
+    // finalize this before this task's Step 10 commit; do not ship it unresolved.
+    val escalate = (res.exc.ovfl && fpuControl.io.ovflEnabled) ||
+                   (res.exc.unfl && fpuControl.io.unflEnabled) ||
+                   (res.exc.operr && fpuControl.io.operrEnabled) ||
+                   (res.exc.dz && fpuControl.io.dzEnabled) ||
+                   (res.exc.snan && fpuControl.io.snanEnabled)
+    fpCompFault    := escalate
+    fpCompFaultVec := Mux(escalate, U(/* real vector per Task 9/11 -- 49-55 band */ 49, 8 bits), U(0, 8 bits))
   }
 ```
 
@@ -5676,15 +6940,16 @@ widened old one" architecture):
   cplxFpccWakeupPort.payload := fpCompFpccDst
 
   // Hardware-native OVFL/UNFL substitution (spec Decision 10) already happened INSIDE
-  // FpuCore (Task 7) -- fpu.io.result already IS the substituted value (infinity/
-  // largest-finite/denormalized/zero as appropriate) for the baseline case. fpCompFault
-  // here is reserved SOLELY for the narrow Task 9/11 enabled-trap escalation path (a user
-  // program explicitly enabled the FPCR OVFL/UNFL trap and wants the busy-frame/ETEMP
+  // FpuCore (Task 7) -- fpu.io.resFixed/resIter's `.value` already IS the substituted value
+  // (infinity/largest-finite/denormalized/zero as appropriate) for the baseline case.
+  // fpCompFault here is reserved SOLELY for the narrow Task 9/11 enabled-trap escalation path
+  // (a user program explicitly enabled the FPCR OVFL/UNFL trap and wants the busy-frame/ETEMP
   // inspection route) -- it must NOT fire for the ordinary substituted-result case, or
   // every overflow would incorrectly re-introduce the trap-every-time cost this whole
-  // design exists to eliminate. Confirm Task 7's fpu.io.fault output genuinely only pulses
-  // for the enabled-trap case (reading FpuControlPlugin's FPCR enable bits, Task 9) and
-  // never for the baseline substituted-result case, before wiring this blind.
+  // design exists to eliminate. `fpWriteback`'s own `escalate` derivation (Step 6) is where
+  // this is actually computed, from `FpResult.exc.*` + FpuControlPlugin's enable bits (Task
+  // 9) -- FpuCore itself has no fault output at all (see Step 6's own note); confirm the
+  // real enable-bit names before wiring this blind.
   fpFaultPort.valid            := fpCompLive && fpCompFault
   fpFaultPort.payload.robId    := fpCompRobId
   fpFaultPort.payload.vector   := fpCompFaultVec
@@ -5704,10 +6969,13 @@ widened old one" architecture):
     // which is itself gated !flushSig at the top-level issuePort.ready -- confirm FpuCore's
     // OWN internal iterative-lane state (Task 7) has a flush/abort input, or the iterative
     // divider/sqrt engine could be left mid-computation with fpIterativeBusy cleared here
-    // but the engine itself still running and eventually asserting a stale fpu.io.done that
-    // this plugin no longer expects. This is the FP-lane equivalent of DivCore's own
-    // flush-handling (check DivCore/DivUnit's existing flush input as the precedent) --
-    // reconcile against Task 7's actual FpuCore flush/abort interface before finalizing.
+    // but the engine itself still running and eventually asserting a stale fpu.io.doneIter
+    // that this plugin no longer expects (and never acknowledges via io.iterAck, since
+    // fpIterResultValid depends on the now-cleared fpIterativeBusy -- confirm FpuCore's
+    // iterative lane does not wedge waiting for an ack that will never come). This is the
+    // FP-lane equivalent of DivCore's own flush-handling (check DivCore/DivUnit's existing
+    // flush input as the precedent) -- reconcile against Task 7's actual FpuCore flush/abort
+    // interface before finalizing.
   }
 ```
 
@@ -5758,7 +7026,7 @@ commit message rather than silently shipping a `pending` test.
 sbt "testOnly m68k040.execute.FpuEuIntegrationSpec"
 sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
 ```
-Expected: the new test passes for real (not `pending`, per Step 9's note); 396/396 lock-step
+Expected: the new test passes for real (not `pending`, per Step 9's note); 394/394 lock-step
 unchanged.
 
 ```bash
@@ -5849,8 +7117,8 @@ Corroborated three independent ways before writing this task:
 **Residual uncertainty, flagged:** only the *unused* low ext bits (`ext[9:0]`) are unverified — real hardware requires them zero and this task ignores them entirely (does not gate on them), which is the safe direction. Step 1 makes an independent toolchain confirmation an explicit, executed step rather than trusting the three sources above transitively.
 
 **Scope, explicit.** This task decodes the **single-register** forms only (`RRR` popcount == 1) with a **register-direct or immediate** `<ea>`: mode 000 (`Dn`), mode 001 (`An` — architecturally legal for FPIAR only), and mode 111/reg 100 (`#imm`, write direction only). This exactly mirrors the existing MOVE-to-SR scope decision (`MicroOpAssembler.scala:1645-1647`: "reg-source/reg-dest forms only — a MEMORY-source MOVE-to-SR (load `<ea>` -> SR) is a fast-follow crack"). Deliberately **out of scope here**, all keeping today's vector-11 fall-through unchanged:
-- memory-EA forms (`fpu_fmove_mem_ea_fpcr_fpsr_no_fline.s` stays failing),
-- multi-register masks / the FMOVEM-control list (`fpu_fmovem_ctrl_*.s`, and the FPSP prologue `F227 BC00`, all stay failing — `fpu_fpsp_selfrecursion_repro.s` therefore cannot pass until that lands).
+- memory-EA forms (`fpu_fmove_mem_ea_fpcr_fpsr_no_fline.s` stays failing — Task 9b's own optional `popcount==1`-with-memory-EA extension could close this, but is not guaranteed landed by default),
+- multi-register masks / the FMOVEM-control list (`fpu_fmovem_ctrl_*.s`, and the FPSP prologue `F227 BC00`, all stay failing — Task 9b, immediately following this task, closes this gap; `fpu_fpsp_selfrecursion_repro.s` cannot pass until it lands).
 
 These are named here so the acceptance-corpus triage after this task is a lookup, not a re-investigation.
 
@@ -6176,7 +7444,7 @@ Add inside the existing `when(isSysOp)` block (`MicroOpAssembler.scala:1654-1763
       }
 ```
 
-**Honest flag on `casForm`:** the immediate form needs both a 32-bit value *and* the 3-bit mask, and `imm` can only carry one of them. Reusing `casForm` (an existing 2-bit uop field, inert for every non-CAS op) is a real, minimal reuse — but it is a second side-channel and it collapses the 3-bit one-hot mask into 2 bits, which only works because the immediate form is restricted to a single mask bit. **Before implementing, confirm `casForm` is actually threaded through rename → `RobPayload` and readable at commit** (`grep -n "casForm" src/main/scala/m68k040/{rename,rob}/*.scala`). If it is *not* ROB-visible, do **not** invent a new thread for it in this task — instead drop the immediate form from Task 9's scope entirely (keep it on the vector-11 fall-through, note it in the commit message alongside the memory-EA and multi-register deferrals) and re-add it with the FMOVEM-control work, which needs a proper multi-word side-channel anyway.
+**Honest flag on `casForm`:** the immediate form needs both a 32-bit value *and* the 3-bit mask, and `imm` can only carry one of them. Reusing `casForm` (an existing 2-bit uop field, inert for every non-CAS op) is a real, minimal reuse — but it is a second side-channel and it collapses the 3-bit one-hot mask into 2 bits, which only works because the immediate form is restricted to a single mask bit. **Before implementing, confirm `casForm` is actually threaded through rename → `RobPayload` and readable at commit** (`grep -n "casForm" src/main/scala/m68k040/{rename,rob}/*.scala`). If it is *not* ROB-visible, do **not** invent a new thread for it in this task — instead drop the immediate form from Task 9's scope entirely (keep it on the vector-11 fall-through, note it in the commit message alongside the memory-EA and multi-register deferrals) and re-add it with Task 9b's FMOVEM-control work, which needs a proper multi-word side-channel anyway.
 
 - [ ] **Step 7: `PredecodeWord.scala` length framing**
 
@@ -6546,7 +7814,7 @@ The only unverified bit-level fact this task introduces. Open the MC68040 User's
 ```bash
 sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
 ```
-Expected: 396/396 PASS **plus** the one new test from Step 10 (397). No previously-passing test may flip — in particular the "line-F opcode -> vector 11 -> handler via VBR+0x2c -> RTE" test at `ExecuteLockStepSpec.scala:3660` uses opword `0xFD00` (cpID=110), which this task's `op(11 downto 9) === 001` gate cannot claim.
+Expected: 394/394 PASS **plus** the one new test from Step 10 (395). No previously-passing test may flip — in particular the "line-F opcode -> vector 11 -> handler via VBR+0x2c -> RTE" test at `ExecuteLockStepSpec.scala:3660` uses opword `0xFD00` (cpID=110), which this task's `op(11 downto 9) === 001` gate cannot claim.
 
 - [ ] **Step 14: Commit**
 
@@ -6608,45 +7876,701 @@ scope. Multi-register masks (the FMOVEM control-list form, including
 the FPSP prologue's own F227 BC00) and memory <ea>s keep today's
 vector-11 fall-through unchanged; fpu_fmove_mem_ea_fpcr_fpsr_no_fline,
 fpu_fmovem_ctrl_*, and fpu_fpsp_selfrecursion_repro therefore stay
-failing after this task, by design and not by oversight.
+failing after this task, by design and not by oversight -- Task 9b,
+immediately following this task, closes the multi-register-mask gap.
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 10: Fix the `faultUsesNextPc` gap for recognized FPU instructions
+### Task 9b: FMOVEM control-register LIST form (multi-register FPCR/FPSR/FPIAR)
+
+**Placement.** Inserted immediately after Task 9 and before Task 10 (the reduced-scope `fpuSoftwareComplete`/`fpuCmdWord` task), without renumbering. Rationale: this task is a direct, mechanical extension of `FpuControlPlugin`/`SysKind.FMOVE_FPCTRL`/`ExceptionUnit`'s S_APPLY arm, all of which Task 9 creates — it adds zero new committed state and zero new ExceptionUnit/RobPlugin logic, reusing Task 9's plumbing verbatim (see "What this task reuses unmodified" below). It has no dependency on Task 10 (the `faultUsesNextPc`-trigger-field task) or Task 11 (FSAVE/FRESTORE) in either direction.
+
+**Why this task exists (audit finding, restated for the record).** The real Motorola/Apple FPSP ROM kernel's own installed vector-11 handler begins with `FMOVEM.L FPIAR/FPSR/FPCR,-(A7)` (opword `F227`, ext word `BC00` — design spec Decision 8). Task 9 explicitly scoped this out (`popcount(RRR) == 1` only; Task 9's own scope text: *"multi-register masks / the FMOVEM-control list ... all stay failing"*), which means the flagship `fpu_fpsp_selfrecursion_repro.s` validation test cannot pass without this task. This is a hardware-privilege/correctness item, not a nice-to-have: without it, no real ROM FPSP kernel image can be booted through vector 11 at all — it re-traps on its own first instruction.
+
+---
+
+## Files
+
+- Modify: `src/main/scala/m68k040/decode/OperationDecoder.scala` (extend the Task 9 `is(0xF)` arm)
+- Modify: `src/main/scala/m68k040/frontend/PredecodeWord.scala` (extend the Task 9 length-framing branch)
+- Modify: `src/main/scala/m68k040/decode/Microcode.scala` (new `Sel` constants, new `USysCtrlMove` UOp, `DescBits`/`resolve`/`resolveFromBits`/`descToBits` extensions, new ROM row-generator + entry table)
+- Modify: `src/main/scala/m68k040/decode/DecodeStage.scala` (`ucEntry`/`ucEntryCtx` dispatch for the new entry family, mirroring the existing MOVE16 dispatch)
+- Test: `src/test/scala/m68k040/decode/MicrocodeFmovemCtrlSpec.scala` (new — row-generator unit tests, mirrors `MicrocodeResolveEquivalenceSpec`'s role)
+- Test (modify): `src/test/scala/m68k040/decode/OperationDecoderSpec.scala`, `src/test/scala/m68k040/frontend/PredecodeWordSpec.scala`
+- Test (modify): `src/test/scala/m68k040/execute/FpuControlPluginSpec.scala` or a new `src/test/scala/m68k040/lockstep/FmovemCtrlListSpec.scala` — whitebox round-trip + order tests (see Step 9; the plan's own convention is loose here, either landing spot is acceptable, but put the whitebox order test in the lock-step-adjacent file since it needs the same full-core DUT machinery Task 9's Step 10 whitebox test uses)
+
+**No changes needed to:** `Services.scala`, `FpuControlPlugin.scala`, `DecodedUop.scala` (`SysKind`), `ExceptionUnit.scala`, `RobPlugin.scala`, `FullCoreSynth.scala`. See "What this task reuses unmodified" below for why each is untouched — this is a real, load-bearing design property of this task, not an oversight, and is what keeps its risk bounded despite the added addressing-mode complexity.
+
+## Interfaces
+
+- Produces: nothing new at the service level. This task is pure decode/microcode-engine surface area sitting *in front of* Task 9's existing `FpuControlService`.
+- Consumes: `FpuControlPlugin`'s `setFpcr`/`setFpsr`/`setFpiar`/`fpcr`/`fpsr`/`fpiar` — indirectly, through `SysKind.FMOVE_FPCTRL`'s existing `ExceptionUnit` S_APPLY arm (Task 9 Step 8), completely unmodified.
+- Consumed by: nothing yet in this plan (Task 11's FSAVE/FRESTORE frames don't touch FMOVEM; the acceptance corpus does, via Task 14's triage sweep — `fpu_fmovem_ctrl_reg.s`, `fpu_fpsp_selfrecursion_repro.s`, and (optionally, see Scope) `fpu_fmove_mem_ea_fpcr_fpsr_no_fline.s`).
+
+---
+
+## What this task reuses unmodified (read this before the steps below)
+
+This is the single most important design property of this task, worth stating up front because it is what makes a genuinely harder addressing-mode problem (arbitrary `<ea>`, variable transfer count, mode-dependent order, memory-alterable restriction) tractable without inventing new hardware surface:
+
+1. **`SysKind.FMOVE_FPCTRL` itself.** Not a new `SysKind` — every register transfer in a multi-register list is decomposed (Step 6) into a pair of micro-ops that individually look *exactly* like a Task 9 single-register `FMOVE.L Dn,FPcr` / `FMOVE.L FPcr,Dn`, except `Dn` is replaced by one of the microcode engine's existing scratch temps (`T0`/`T1`/`T2`, physical register IDs 16/17/18 — `Microcode.scala:29-31`). `ExceptionUnit`'s S_APPLY arm for `FMOVE_FPCTRL` (Task 9 Step 8, `ExceptionUnit.scala` new code at line ~6250-6280) and `RobPlugin`'s `sysPrivFault` exclusion (Task 9 Step 8, keyed on `p0.sysKind =/= SysKind.FMOVE_FPCTRL`) both already treat every occurrence of this `sysKind` identically regardless of which physical register carries the value — so both apply to this task's micro-ops with **zero additional code**, not "the same shape ported over."
+
+2. **The generic EA-decode machinery, already wired for every microcode customer.** `DecodeStage.scala:1112`: `ucCasEaDec = EaDecoder.decode(ucEntryPkt.words(0)(5 downto 0), ucEntrySpec.size, ...)` runs unconditionally for *every* microcoded instruction, decoding whatever `<ea>` that instruction's own opword encodes (bits 5:0) and populating `ucEntryCtx.eaBase`/`eaBaseValid`/`eaDispLo`/`eaIndexReg`/`eaIndexValid`/`casAutoMode`/`casAutoDelta` (`DecodeStage.scala:1127-1128, 1728-1731`) from it. This is misleadingly named after its first customer (CAS) but is already reused, unchanged, by MOVES (`Microcode.scala:1873`'s `SMovesAn` reads `ctx.casAutoMode`). Once this task's opword routes through a `ucEntry` (Step 7), `ctx.eaBase`/`eaDispLo`/`casAutoMode`/`casAutoDelta` are populated **for free**, correctly, for whatever `<ea>` mode FMOVEM-control's own opword encodes — this task adds **no new EA-decode logic**, only new ROM rows that *reference* these already-populated fields via the existing `SEaBase`/`SEaDispLo` selectors (`Microcode.scala:268`) and the existing `AEaCasLoad`/`AEaCasStore` auto-mode kinds (`Microcode.scala:180-181`).
+
+3. **`fpCtrlOpBase`/`fpCtrlDir`/`fpCtrlMask` from Task 9's `OperationDecoder.scala` arm** (Task 9's own "Step 5: `OperationDecoder.scala` recognition arm") — this task's decode gate is a sibling `when` inside the same `is(0xF)` arm, reusing the identical opword/ext-word field extraction, only changing the mask-popcount and `<ea>`-mode tests (Step 3).
+
+4. **`eaExt`, `PredecodeWord.scala:144`** — the existing generic `<ea>` extension-word-length helper, already used by every ordinary `<ea>`-bearing instruction in this file (line-0 immediates, MOVE, etc). This task's length framing (Step 4) calls it exactly the way the line-0-immediate arm already does (`PredecodeWord.scala:241-243`'s `immDstEaW`/`immDstEaKnown` pattern) — no new length-computation logic, only a new call site.
+
+5. **The LUT-reduction dual-path discipline** (`Microcode.scala:236-258`) — `resolve()` (compile-time reference oracle) and `resolveFromBits()` (the real hardware path reading `DescBits` out of `DecodeStage`'s BRAM `ucRomMem`) must both be extended identically, exactly as every existing `UOp` case already is. This is not new to this task, but is flagged because it is the easiest piece to half-implement (edit `resolve()`, forget `resolveFromBits()`, and get a test suite that passes against the Scala oracle but is wrong in synthesized hardware — `MicrocodeResolveEquivalenceSpec` exists specifically to catch this class of mistake and MUST be re-run, see Step 8).
+
+---
+
+## Encoding, register order, and memory footprint — VERIFIED, not invented
+
+### Encoding (confirms/extends Task 9's own table)
+
+Task 9 already independently confirmed (three ways: direct `m68k-linux-gnu-as -m68040 -m68881` assembly, the vendored corpus's own toolchain-verified header comments, and the design spec's Decision 8 quote):
+
+```
+opword : 1111 001 000 mmmrrr        =  0xF200 | <ea>       (line-F, cpID=001, opclass 000)
+ext    : ddd RRR 0000000 000
+         ddd = ext[15:13] : 100 = <ea>  ->  control register(s)   (sysReadDir = False)
+                            101 = control register(s) -> <ea>    (sysReadDir = True)
+         RRR = ext[12:10] : register-select MASK {FPCR, FPSR, FPIAR}, MSB-first
+```
+
+Task 9 handled `popcount(RRR) == 1`. This task handles `popcount(RRR) == 2` or `3` (i.e. `RRR ∈ {110, 101, 011, 111}`) — `RRR == 000` stays illegal (falls through unchanged; there is no evidence a real 68040 treats an empty list as a legal no-op, and treating it as one is a needless risk for zero benefit).
+
+Two confirmed real encodings anchor this task, both already cited by Task 9:
+- `F228 BC00` = `FMOVEM.L FPIAR/FPSR/FPCR,(0,A0)` — `ddd=101` (read: control→`<ea>`), `RRR=111`, `<ea>` mode 101 (`(d16,An)`, reg=000=A0). **Flag:** Task 9's own citation of this abbreviates the actual disassembly to 2 words (`F228 BC00`); mode 101 (`(d16,An)`) requires a *third* word (the 16-bit displacement, here presumably `0000`). Step 1 below re-confirms the true word count via the toolchain rather than trusting the abbreviated citation transitively — this is exactly the kind of "corroborated but not independently re-run" gap Task 9's own Step 1 discipline exists to close.
+- `F227 BC00` = the real Q700 ROM FPSP prologue, `FMOVEM.L FPIAR/FPSR/FPCR,-(A7)` — `ddd=101`, `RRR=111`, `<ea>` mode 100 (`-(An)`, reg=111=A7). Mode 100 needs **zero** extra `<ea>` extension words (predecrement never carries a displacement) — this one genuinely is exactly 2 words, matching the design spec's own quote.
+
+### Per-register transfer width and instruction length (resolving the plan-author's framing ambiguity)
+
+**FPCR/FPSR/FPIAR are each 32 bits** (confirmed: Task 9's own `FpuControlService` interface, `fpcr`/`fpsr`/`fpiar: UInt` all 32 bits; Musashi's `fmove_fpcr`, `tools/musashi/musashi/m68kfpu.c:1641-1656`, uses `WRITE_EA_32`/`READ_EA_32` for all three unconditionally). So each selected register costs exactly one 32-bit memory transfer — **`popcount(mask) × 4` bytes total**, matching real hardware and matching Musashi's own dispatch (`m68kfpu.c:1846-1851`, cases `0x4`/`0x5` both route to the identical `fmove_fpcr(w2)` regardless of `RRR` population — there is no separate "list" opcode, only a mask with more bits set).
+
+**Critically, this does NOT lengthen the fetched instruction.** `popcount(mask)` changes how many *memory transfers* the instruction performs at execute time (and therefore how many microcode rows it expands into, Step 6) — it does **not** add extra 16-bit words to the instruction stream at fetch time. The instruction's fetched length is governed purely by the `<ea>`'s own addressing mode, exactly like any other `<ea>`-bearing instruction (a `MOVE.L (d16,An),D0` is 2 words regardless of what value ends up transferred; `FMOVEM.L ...,(d16,An)` is `2 + (ea's own extension words)`, regardless of `popcount(mask)`). This resolves the ambiguity in this task's assignment prompt directly: the "confirm the real per-register transfer width" question has a clean, boring answer (32-bit, matching the architectural register width) and does *not* imply any extra-ext-word-per-register scheme — Step 1 below intentionally re-verifies this by disassembling a mask=111 instruction against a non-trivial `<ea>` (`(d16,An)`) and checking the total word count matches "opword + command-ext + ea's own extension words", not "opword + command-ext + 3×something".
+
+### Register order — the real finding, and why Musashi cannot be trusted as an oracle for it
+
+This is the one genuinely new architectural fact this task introduces, and it is exactly the kind of thing task #199/#211-class history in this project says must be checked, not assumed (per this session's own standing instruction — the integer MOVEM predecrement/order asymmetry was flagged explicitly as a thing to verify against, not copy blindly).
+
+**Derivation (round-trip consistency, worked by hand).** Musashi's `fmove_fpcr` (`m68kfpu.c:1635-1660`) processes the three register bits in a **fixed** order — `if (reg & 4)` (FPCR) always first, then `reg & 2` (FPSR), then `reg & 1` (FPIAR) — **regardless of addressing mode or direction**. `WRITE_EA_32`/`READ_EA_32` (`m68kfpu.c:918-989`, `495-563`) re-evaluate `EA_AY_PD_32()`/`EA_AY_PI_32()` **fresh on every call**, so for `mode=4` (`-(An)`) each of the (up to three) calls independently decrements `An` by 4 before writing.
+
+Tracing `FMOVEM.L FPIAR/FPSR/FPCR,-(A7)` (`F227 BC00`, mask=111) through Musashi's actual fixed FPCR-first order: call 1 (FPCR) decrements A7 to `S-4`, writes FPCR there; call 2 (FPSR) decrements to `S-8`, writes FPSR; call 3 (FPIAR) decrements to `S-12`, writes FPIAR. Final memory image (ascending address from the new SP): `S-12`=**FPIAR**, `S-8`=FPSR, `S-4`=**FPCR**.
+
+Now trace the *matching restore*, `FMOVEM.L (A7)+,FPIAR/FPSR/FPCR` (same mask, postincrement, Musashi's *same* fixed FPCR-first order): call 1 (FPCR) reads current A7 (`S-12`) — which the store above put **FPIAR** into — and assigns it to `REG_FPCR`. **This is wrong: it silently swaps FPCR and FPIAR.** Musashi's fixed processing order is round-trip-*inconsistent* for `-(An)`; the *only* way a predecrement-store followed by a postincrement-load (with the same register-list mnemonic, the single most common real-world usage pattern — exactly what the FPSP ROM prologue/epilogue pair does) round-trips correctly is if the **store** direction processes the *reversed* order (FPIAR, FPSR, FPCR — LSB-first) specifically for `-(An)`, while every other mode (and the postincrement reload) keeps the normal MSB-first (FPCR, FPSR, FPIAR) order. Reworking the trace with that reversal: predecrement store now writes FPCR at `S-12` (final SP), FPSR at `S-8`, FPIAR at `S-4`; the postincrement reload (normal order) reads FPCR from `S-12`, FPSR from `S-8`, FPIAR from `S-4` — an exact round trip.
+
+**This is precisely the same asymmetry the integer MOVEM instruction has** (predecrement reverses the scan/register-bit-mapping direction relative to every other addressing mode, specifically so a `-(An)` push and a matching `(An)+` pop round-trip correctly) — a fact this project's own history has already had to get right once for the integer instruction.
+
+**Independent corroboration (since I could not obtain a directly quotable primary-source PRM paragraph — see the flag below).** The WinUAE project's FPU-emulation-accuracy documentation (Toni Wilen's cycle/bit-exact 68881/68040/68060 reverse-engineering effort, widely regarded as one of the most rigorously-validated 68k FPU emulations that exists, itself independent of Musashi) states directly: *"6888x FPUs with FMOVEM using MODE field=predecrement have inverted register list order, even if actual EA is not predecrement. However, 68040+ only use inverted register order if EA is predecrement."* (source: WinUAE 4.4.0 beta-series changelog thread, `forum.system-cfg.com/viewtopic.php?t=10886`). This independently confirms, for the **exact CPU this project targets (68040)**, exactly the rule the round-trip derivation above requires: inverted order **if and only if** the effective addressing mode is predecrement. Two independent search queries against different indexes returned this same specific, consistently-worded finding.
+
+**CONCLUSION — the rule this task implements:**
+- `<ea>` mode is `-(An)` (predecrement): register processing order is **FPIAR, FPSR, FPCR** (LSB-to-MSB of the `RRR` mask).
+- Every other `<ea>` mode (control, `(An)+`, `(d16,An)`, indexed, absolute, PC-relative): register processing order is **FPCR, FPSR, FPIAR** (MSB-to-LSB), matching Task 9's own single-register-form comment and matching Musashi unconditionally.
+- Direction (load vs. store) does **not** change the order — only which of `WRITE_EA_32`/`READ_EA_32` (real hardware: which of the store-data / load-writeback path) is used per transfer.
+
+**Residual, explicitly flagged (mirrors Task 9 Step 12's own "flagged for primary-source verification" idiom for the AEXC fold — this project does not silently guess, it flags and gates):** repeated attempts to fetch the actual MC68881/MC68882 User's Manual or M68000 Family PRM text (`nxp.com/docs/en/reference-manual/MC68881UM.pdf`, `M68000PRM.pdf`, the bitsavers/archive.org scanned-text mirror) either 404'd or were too large for a single-pass fetch to locate the exact FMOVEM-control paragraph. The WinUAE corroboration above is strong (an independent, CPU-generation-specific, cycle-accuracy-focused source agreeing exactly with the round-trip-derived rule) but is **not** a page-and-section citation from the primary manual. **Before this task's -(An) code path is trusted in production, pin the exact MC68881/MC68882 UM section down** — the manual's own table of contents places this in the FMOVEM instruction description (Section 4, "Move Multiple Registers"/"Move Multiple FPn" — cf. Section 1.4.2 and Section 7.5.1.5 per the manual's structure) — and record the page number in the commit message, exactly as Task 9 Step 12 requires for the AEXC fold. **Do not mark this step done by re-reading this document or the code.**
+
+---
+
+## EA-mode restriction for multi-register masks
+
+A multi-bit mask requires a **memory-alterable** `<ea>` — `Dn` (mode 000) and `An` (mode 001) are excluded, and an immediate `<ea>` (mode 111/reg 100) is meaningless for a *destination* list and excluded for both directions. This is not a stylistic restriction; it is forced by the mechanism itself: Musashi's `WRITE_EA_32`/`READ_EA_32` (`m68kfpu.c:918-989`, `495-563`) are called once per selected register with the **identical** `ea` (mode+reg) each time — for mode 0 (`Dn`) or mode 1 (`An`), every call would read/write the **same** single register, silently clobbering all but the last-processed value. No real CPU could implement a multi-register list this way; the standard 68k pattern for every other "register list" instruction (integer MOVEM, and FMOVEM's own FP-data-register-list form) is to restrict multi-element list moves to genuinely memory-addressing modes. This is corroborated directly (not merely inferred) by Musashi's own `fmovem()` function (the FP0-FP7 data-register-list sibling, `m68kfpu.c:1662-1750`) which implements **only** control-addressing and postincrement/predecrement modes (`mode 2` and `mode 0` in its own local `mode` variable, i.e. control and predecrement — `default: fatalerror(...)` for everything else) — i.e. Musashi's own author already encoded "list moves reject register-direct modes" as the accepted convention for the sibling instruction; this task's decode gate applies the identical restriction to the control-register list.
+
+**Decode-time gate (Step 3):** `<ea>` mode ∈ {010 (`(An)`), 011 (`(An)+`), 100 (`-(An)`), 101 (`(d16,An)`), 110 (`(d8,An,Xn)` brief or full), 111/000 (`(xxx).W`), 111/001 (`(xxx).L)`}. `111/010` (`(d16,PC)`) and `111/011` ((`d8,PC,Xn`)) are PC-relative — read-only in real hardware for every other memory-alterable-gated instruction in this codebase (`PredecodeWord.scala:127-129`'s `memDestExt` explicitly documents PC-relative as "NOT alterable... Left rejected") — so this task rejects them for **both** directions too, conservatively, rather than allowing an asymmetric "load-only" carve-out. This can be revisited as a fast-follow if a real corpus test needs it; nothing in the vendored corpus's header comments (`fpu_fmovem_ctrl_reg.s`) asks for it.
+
+---
+
+## Scope, explicit
+
+**In scope:** `<ea>` = any memory-alterable mode (the set above), `popcount(mask) ∈ {2, 3}`.
+
+**Recommended, but the integrator's call:** extend the *same* mechanism to also cover `popcount(mask) == 1` with a memory `<ea>` — this is the one piece of Task 9's own deferred scope (`fpu_fmove_mem_ea_fpcr_fpsr_no_fline.s`) that this task's machinery closes for free: the row-generator (Step 6) is already parametrized on `mask` generically, and `popcount==1` is simply one more (cheaper, 2-row) input to the same generator with no new code path. Including it costs one relaxed inequality in the Step 3 decode gate (`popcount >= 1` instead of `popcount >= 2`) and a few more generated ROM entries. **This document keeps the Step 3 code as `popcount ∈ {2,3}`** (the minimal set needed to unblock the self-recursion test, per this task's assignment) and flags the `popcount==1` extension as a one-line, low-risk, separately-reviewable addition — the integrator can fold it in or leave it for a fast-follow.
+
+**Deliberately still out of scope** (unaffected by this task, matches Task 9's own list): the FMOVEM *data*-register list form (`FMOVEM FP0-FP7,...`, a structurally different opcode encoding, `ext[15:13] ∈ {0x6,0x7}` per Musashi's dispatch table `m68kfpu.c:1853-1858`, not `0x4`/`0x5`) — completely separate future work, not touched by anything in this task.
+
+---
+
+## Steps
+
+- [ ] **Step 1: Independently confirm the mask=111 encoding, word count, and (if possible) the order rule**
+
+```bash
+cd /tmp && cat > fmovemctrl.s <<'EOF'
+    .text
+    fmovem.l %fpiar/%fpsr/%fpcr,-(%sp)
+    fmovem.l (%sp)+,%fpiar/%fpsr/%fpcr
+    fmovem.l %fpiar/%fpsr/%fpcr,(0,%a0)
+    fmovem.l %fpcr/%fpsr,-(%sp)
+EOF
+m68k-linux-gnu-as -m68040 -m68881 fmovemctrl.s -o fmovemctrl.o && m68k-linux-gnu-objdump -d fmovemctrl.o
+```
+Expected (record actual output in the commit message): line 1 = `F227 BC00` (2 words, matches the design spec's ROM prologue quote exactly); line 2 = `F21F BC00` (`(An)+` = mode 011, `sysReadDir`=True, same `BC00` mask ext word); line 3 = `F228 BC00 0000` (**3** words — confirms the "abbreviated citation" flag above); line 4 = `F227 8C00` (mask=110, FPCR|FPSR only, no FPIAR — confirms `RRR` bit assignment for the 2-register case independently of the 3-register case). **If any line disagrees, STOP and fix the encoding table before writing any RTL.**
+
+If `m68k-linux-gnu-as`/GNU `as`'s assembler happens to accept a raw byte sequence you can single-step through a reference disassembler or a real MC68040 (neither is assumed available), do so to additionally pin the register-order question directly rather than relying on the WinUAE corroboration alone; if not available, proceed on the WinUAE-corroborated rule and complete the flagged Step 1b below before trusting it in production.
+
+- [ ] **Step 1b (gate, not skippable): pin the MC68881/MC68882 UM section for the order rule**
+
+Per the "Residual, explicitly flagged" note above. Locate the FMOVEM control-register-list description in the primary manual (Section 4 instruction description, cf. TOC pointers Section 1.4.2 / 7.5.1.5), quote the exact order-vs-addressing-mode text, and record the section/page number in `FmovemCtrlOrder`'s doc comment (Step 6) and the commit message. If the manual's wording differs from this document's derived rule in any way, STOP and fix Step 6's generator before proceeding — do not paper over a disagreement.
+
+- [ ] **Step 2: Confirm `ctx.eaBase`/`casAutoMode`/`casAutoDelta` really are generic (not CAS-specific) before relying on them**
+
+```bash
+grep -n "ucCasEaDec\s*=\|ucEntryCtx\.eaBase\s*:=\|ucEntryCtx\.casAutoMode\s*:=\|ucEntryCtx\.casAutoDelta\s*:=" src/main/scala/m68k040/decode/DecodeStage.scala
+```
+Confirm the call site (`DecodeStage.scala:1112`) decodes `ucEntryPkt.words(0)(5 downto 0)` — i.e. the **current** microcoded instruction's own opword mode/reg field, via the same project-wide `EaDecoder.decode` every other decode path uses — unconditionally, not gated on `ucEntrySpec` being a CAS/MOVES-specific kind. This is asserted as fact in this document (see "What this task reuses unmodified" #2) from a direct read; this step just requires the implementer to re-confirm it against their actual working copy before depending on it, in case it has moved since this document was written.
+
+- [ ] **Step 3: `OperationDecoder.scala` decode gate**
+
+Add immediately after Task 9's single-register `fpCtrlOk` arm (Task 9's own Step 5), inside the same `is(0xF)` block, reusing `fpCtrlOpBase`/`fpCtrlDir`/`fpCtrlIsTo`/`fpCtrlIsFrom`/`fpCtrlMask` from that arm (do not redeclare them):
+
+```scala
+        // ── FMOVEM.L <ea>,FPIAR/FPSR/FPCR list form (Task 9b) ──────────────────────
+        // Same opword/ext-word shape as Task 9's single-register arm; popcount(mask)
+        // in {2,3} instead of exactly 1, and <ea> restricted to memory-alterable modes
+        // (a multi-bit mask against Dn/An/#imm is architecturally meaningless -- see
+        // this task's "EA-mode restriction" note; Musashi's own sibling FP-data-list
+        // fmovem() rejects register-direct modes the identical way, m68kfpu.c:1662-
+        // 1750). NOT privileged, exactly like Task 9's single-register form (same
+        // opcode family, same Musashi dispatch function fmove_fpcr for every mask
+        // population, m68kfpu.c:1846-1851 -- no separate privilege gate exists for a
+        // populated-mask case).
+        val fpCtrlPopcount = fpCtrlMask.asBools.map(b => U(b.asUInt)).reduce(_ +^ _)
+        val fpCtrlIsList    = fpCtrlPopcount === U(2, 2 bits) || fpCtrlPopcount === U(3, 2 bits)
+        val fpCtrlListMode  = opword(5 downto 3)
+        val fpCtrlListReg   = opword(2 downto 0)
+        // memory-alterable: (An), (An)+, -(An), (d16,An), (d8,An,Xn), (xxx).W, (xxx).L.
+        // Excludes Dn(000)/An(001)/#imm(111,100)/PC-relative(111,010 and 111,011) -- see
+        // "EA-mode restriction" (this task's write-up) for why both directions reject
+        // PC-relative rather than allowing an asymmetric load-only carve-out.
+        val fpCtrlListEaMem =
+          (fpCtrlListMode === B"3'b010") || (fpCtrlListMode === B"3'b011") ||
+          (fpCtrlListMode === B"3'b100") || (fpCtrlListMode === B"3'b101") ||
+          (fpCtrlListMode === B"3'b110") ||
+          ((fpCtrlListMode === B"3'b111") &&
+           (fpCtrlListReg === B"3'b000" || fpCtrlListReg === B"3'b001"))
+        val fpCtrlListOk = fpCtrlOpBase && fpCtrlIsList && (fpCtrlIsTo || fpCtrlIsFrom) &&
+                           fpCtrlListEaMem
+        when(fpCtrlListOk) {
+          o.illegal    := False
+          o.op         := DecOp.MOVE
+          o.size       := Size.LONG
+          o.sysOp      := True
+          o.sysKind    := SysKind.FMOVE_FPCTRL
+          o.sysReadDir := fpCtrlIsFrom
+          o.dst.setNone(); o.dstWrites := False
+          // Route through the microcode engine (Step 6/7) -- this is NOT a fast-crack
+          // op like Task 9's single-register form. ucEntry/ucEntryCtx population is
+          // DecodeStage's job (Step 7); OperationDecoder only needs to mark this a
+          // microcoded op, mirroring MOVE16's o.ucEntry assignment
+          // (OperationDecoder.scala:1043) except the entry is DATA-DEPENDENT here (on
+          // mask+dir+mode), so it is computed in DecodeStage where ucCasEaDec's
+          // decoded mode is already available, not baked in here as a constant.
+          o.ucOp       := True
+        }
+```
+
+**Honest flag:** the exact mechanism for handing a *data-dependent* `ucEntry` (as opposed to MOVE16's single constant) from `OperationDecoder` through to `DecodeStage`'s microcode dispatch needs to be confirmed against how the codebase already threads `o.ucOp`/`o.ucEntry` today (`grep -n "ucOp\|ucEntry" src/main/scala/m68k040/decode/OperationDecoder.scala src/main/scala/m68k040/decode/DecodedUop.scala`) before writing Step 7 for real — this document assumes (consistent with the "microcode entries are resolved combinationally at ucBegin from the already-decoded opword/ext-word, not baked into `OperationDecoder`'s static `o.ucEntry` field" pattern that MI_* entries already use for their own data-dependent dispatch, e.g. `MI_JMP_ENTRY` vs `MI_JSR_ENTRY` selection) that `OperationDecoder` only needs to flag "this is a microcoded op", and the *which entry* computation happens at `DecodeStage.ucBegin` (Step 7), not here. Confirm this pattern via a direct read of how an existing *data-dependent*-entry microcode customer (not MOVE16, which is entry-constant) resolves its entry before implementing.
+
+- [ ] **Step 4: `PredecodeWord.scala` length framing**
+
+Add inside the same `is(U(0xF, 4 bits))` arm, alongside Task 9's own "Step 7: `PredecodeWord.scala` length framing" branch, reusing the existing generic `eaExt` helper (`PredecodeWord.scala:144`) exactly the way the line-0-immediate arm already does (`PredecodeWord.scala:241-243`):
+
+```scala
+        // FMOVEM.L <ea>,FPIAR/FPSR/FPCR list form (Task 9b): opword 0xF200|<ea> + a
+        // command ext word (the multi-bit-mask sibling of Task 9's single-register
+        // arm) + the <ea>'s OWN extension words (0-5, mode-dependent -- reuses the
+        // SAME generic eaExt() helper every other <ea>-bearing instruction in this
+        // file uses). Total length = 2 (opword + command ext) + eaExt's own count.
+        // The mask's popcount affects EXECUTE-time transfer count (Step 6), NOT the
+        // fetched instruction length -- see this task's write-up, "Per-register
+        // transfer width and instruction length".
+        val fpCtrlListBase   = (op(11 downto 9) === B"3'b001") && (op(8 downto 6) === B"3'b000")
+        val fpCtrlListDirOk  = (extW(15 downto 13) === B"3'b100") || (extW(15 downto 13) === B"3'b101")
+        val fpCtrlListPop    = extW(12 downto 10).asBools.map(b => U(b.asUInt)).reduce(_ +^ _)
+        val fpCtrlListIsList = fpCtrlListPop === U(2, 2 bits) || fpCtrlListPop === U(3, 2 bits)
+        val fpCtrlListEaMode = op(5 downto 3).asUInt
+        val fpCtrlListEaReg  = op(2 downto 0).asUInt
+        // The EA's own first ext word is op+2 (it follows the command ext word, which
+        // is op+1) -- pass extW2/extW2Known, mirroring the line-0-immediate arm's
+        // immDstEaW/immDstEaKnown pattern (PredecodeWord.scala:241-242) exactly.
+        val (fpCtrlListEaOk, fpCtrlListEaExt, fpCtrlListAmb) =
+          eaExt(fpCtrlListEaMode, fpCtrlListEaReg, sizeL = True, allowImm = false,
+                eaW = extW2, eaWKnown = extW2Known)
+        when(fpCtrlListBase && fpCtrlListDirOk && fpCtrlListIsList && fpCtrlListEaOk) {
+          r.simple := True
+          r.lenWords := (U(2, 3 bits) +^ fpCtrlListEaExt).resized
+          r.ambiguousLine := fpCtrlListAmb
+        } .elsewhen(fpCtrlBase && fpCtrlDirOk && fpCtrlMaskOne && (fpCtrlEaReg || fpCtrlEaImm)) {
+          // Task 9's existing single-register arm, unchanged.
+          ...
+```
+
+`allowImm = false` is deliberate: an immediate `<ea>` is excluded for the list form (see "EA-mode restriction"); passing `false` makes `eaExt`'s own mode-7/reg-4 branch correctly return `ok=False` for that case, so `fpCtrlListEaOk` naturally excludes it without a separate check.
+
+- [ ] **Step 5: `Microcode.scala` — new `Sel` constants and the `USysCtrlMove` UOp**
+
+**5a. Three new negative-offset constants** (siblings of the existing `SImm4`/`SImm8`/`SImm12`, `Microcode.scala:269`, reused unmodified for the postincrement/writeback case and the non-predecrement +0/+4/+8 transfer offsets):
+
+```scala
+  // ── FMOVEM-control list selectors (Task 9b) ─────────────────────────────────
+  // Negative counterparts of the existing SImm4/SImm8/SImm12 (task #207/MOVE16),
+  // needed for the PREDECREMENT case's per-transfer offset from the ORIGINAL base
+  // (see this task's "register order" derivation: for -(An), the correctly-ordered
+  // transfer i (0-indexed, in PROCESSING order FPIAR/FPSR/FPCR) lands at
+  // base - 4*(i+1) -- a fixed, compile-time-known negative offset from the ORIGINAL
+  // An, exactly mirroring how MOVE16 already treats its own postincrement-like
+  // addressing as "fixed offsets from the original base + one final writeback"
+  // rather than per-transfer auto-stepping (Microcode.scala:1587-1591's own
+  // rationale for why MOVE16 avoids the eaAuto machinery).
+  case object SImmNeg4  extends Sel
+  case object SImmNeg8  extends Sel
+  case object SImmNeg12 extends Sel
+  // The non-auto (control/displacement/abs/indexed) EA classes have no per-mode
+  // auto-stepping at all -- the SAME base+displacement must be used for every
+  // transfer, offset by +4/+8 for the 2nd/3rd register. ctx.eaDispLo (already
+  // populated generically for every microcode customer's <ea>, per this task's
+  // "what this task reuses unmodified" #2) supplies the REAL decoded displacement;
+  // these two constants add the transfer's own offset on top of it.
+  case object SEaDispLoPlus4 extends Sel
+  case object SEaDispLoPlus8 extends Sel
+```
+
+Add to `SelHw`'s element list (`Microcode.scala:262-273`), `selImm`'s match (near `SImm4`/`SImm8`/`SImm12`, `Microcode.scala:1917-1920`):
+
+```scala
+    case SImmNeg4        => U(-4,  32 bits).asBits
+    case SImmNeg8        => U(-8,  32 bits).asBits
+    case SImmNeg12       => U(-12, 32 bits).asBits
+    case SEaDispLoPlus4  => (ctx.eaDispLo.asUInt + 4).asBits
+    case SEaDispLoPlus8  => (ctx.eaDispLo.asUInt + 8).asBits
+```
+and its hardware-`is(...)` mirror (near `Microcode.scala:2326-2329`) with the identical five bodies. `U(-4, 32 bits)` relies on SpinalHDL's standard negative-`Int`-to-two's-complement literal behavior — confirm this compiles as expected in a throwaway `sbt console` snippet before trusting it (this project has been burned before by SpinalHDL width/sign gotchas — see the `movemEmitted.asSInt` warning at `DecodeStage.scala:435`).
+
+**5b. `USysCtrlMove` — the new UOp kind that emits a `SysKind.FMOVE_FPCTRL` micro-op from a microcode row.**
+
+Mirrors `UCasOp`'s existing payload-carrying-case-class pattern (`Microcode.scala:155-156`) exactly:
+
+```scala
+  // Emits a Task 9 FMOVE_FPCTRL sysOp targeting exactly ONE of {FPCR,FPSR,FPIAR},
+  // reading from or writing to a microcode scratch temp (T0/T1/T2) instead of an
+  // architectural Dn/An. readDir mirrors Task 9's o.sysReadDir (True = FPcr->Tn,
+  // False = Tn->FPcr); rc is the SAME one-hot mask bit Task 9's imm[2:0]/sysRc
+  // side-channel already carries (4=FPCR, 2=FPSR, 1=FPIAR) -- ExceptionUnit's
+  // S_APPLY arm for FMOVE_FPCTRL (Task 9 Step 8) is reused COMPLETELY UNCHANGED;
+  // it cannot tell a microcode-emitted occurrence from a Task-9-emitted one, by
+  // design (see "what this task reuses unmodified" #1).
+  case class USysCtrlMove(readDir: Boolean, rc: Int) extends UOp
+```
+
+`resolve()` (`Microcode.scala:1953-1969` area) needs a new case **before** the generic `u.sysOp := False` default that currently applies unconditionally (`Microcode.scala:2200`) — restructure that default to be overridable, or add the `USysCtrlMove` handling as its own `match` arm that runs after the default and overrides it (whichever keeps the diff smallest against the actual current structure — inspect the real code around line 2200 before choosing, since this document's line numbers may drift slightly as Tasks 1-9 land):
+
+```scala
+      case USysCtrlMove(readDir, rc) =>
+        u.op         := DecOp.MOVE
+        u.sysOp      := True
+        u.sysKind    := m68k040.decode.SysKind.FMOVE_FPCTRL
+        u.sysReadDir := Bool(readDir)
+        u.imm        := U(rc, 32 bits).asBits   // sysRc side-channel, Task 9's exact convention
+```
+
+with `dst`/`srcB` wiring left to the EXISTING generic `srcA`/`srcB`/`dst` selector resolution in `resolve()` (i.e. the `Desc` row itself sets `dst = ST0/ST1/ST2` when `readDir=true` or `srcB = ST0/ST1/ST2` when `readDir=false`, exactly like every other row — `USysCtrlMove` only needs to own the sys-specific fields, not reinvent register routing).
+
+`resolveFromBits()` (the hardware path, `Microcode.scala:2340`+) needs the identical case, `is(UOpHw.USysCtrlMove) { ... }`, reading the two new sibling `DescBits` fields below.
+
+`DescBits` (`Microcode.scala:332`+) needs two new sibling fields, following the `UCasOp` precedent (`casForm`/`casWritesNzvc`/etc., valid only when `uop === UOpHw.UCasOp`) exactly:
+
+```scala
+    val sysCtrlReadDir: Bool           // valid only when uop === UOpHw.USysCtrlMove
+    val sysCtrlRc:      UInt(3 bits)   // valid only when uop === UOpHw.USysCtrlMove
+```
+
+`descToBits` (`Microcode.scala:375`+) needs the mechanical encode:
+```scala
+      case USysCtrlMove(readDir, rc) =>
+        bits.sysCtrlReadDir := Bool(readDir)
+        bits.sysCtrlRc      := U(rc, 3 bits)
+```
+(alongside whatever default/don't-care assignment every other non-`UCasOp` row already gives those two fields — mirror the existing `casForm`-default pattern verbatim).
+
+`UOpHw` (`Microcode.scala:286-291`) needs one new element, `USysCtrlMove`, appended (append, do not insert — same ordinal-stability discipline `SysKind` uses, per Task 9 Step 4's own comment).
+
+- [ ] **Step 6: `Microcode.scala` — the row-generator function + entry table**
+
+This is the actual multi-register-list logic. Written as a compile-time Scala generator (producing `Vector[Desc]` programmatically) rather than ~40 hand-duplicated blocks — both because 40 near-identical blocks is a maintenance and review liability, and because `Microcode.scala` is already "a compile-time Scala table" by its own header doc comment (`Microcode.scala:5-19`), so a generator function is squarely within its existing idiom, not a new one.
+
+```scala
+  // ═══════════════════════════════════════════════════════════════════════════
+  // FMOVEM-control LIST form (Task 9b). Each selected register costs a 2-row
+  // pair: [sysOp read FPcr->Tn] + [store Tn->mem]  (write direction, control->mem)
+  //    or  [load mem->Tn] + [sysOp write Tn->FPcr]  (read direction, mem->control),
+  // PLUS one trailing An write-back row IFF the <ea> is -(An)/(An)+ (mirrors
+  // MOVE16's own "fixed offsets from the original base + one final writeback"
+  // shape, Microcode.scala:1587-1617 -- NOT the eaAuto/AEaCasLoad per-row
+  // auto-stepping machinery, which would double-apply across sequential
+  // transfers with no way to get the ORDER right at the same time; see the
+  // order derivation above for why "fixed compile-time offset from the ORIGINAL
+  // base" is required regardless of addressing mode).
+  //
+  // Register PROCESSING order is fixed at Scala-generation time (Step 1b's
+  // pinned rule): PREDECREMENT = FPIAR,FPSR,FPCR (LSB-first); every other mode
+  // = FPCR,FPSR,FPIAR (MSB-first). This determines BOTH which physical control
+  // register each row-pair targets AND that row-pair's compile-time address
+  // offset (predec: -4,-8,-12 for processing order 0,1,2; postinc/non-auto:
+  // 0,+4,+8 for processing order 0,1,2).
+  sealed trait FmovemCtrlAddr
+  case object FcaPredec  extends FmovemCtrlAddr   // -(An): SImmNeg4/8/12 offsets, final An -= 4*popcount
+  case object FcaPostinc extends FmovemCtrlAddr   // (An)+: SImm4/8/12 offsets,    final An += 4*popcount
+  case object FcaNonAuto extends FmovemCtrlAddr   // control/disp/abs/indexed: SEaDispLo(+4/+8), no writeback
+
+  // rc bit -> (readDir Tn selector, storeDir Tn selector) is irrelevant; T0/T1/T2
+  // are just used positionally (row-pair i uses T_i). offsetSel(i) picks this
+  // addressing class's compile-time offset constant for processing-order index i
+  // (0,1,2). NONE (SNone/useImm=false) means "no offset" (predec/postinc's FIRST
+  // transfer, i=0, needs -4/+0 respectively -- predec's i=0 offset is SImmNeg4,
+  // NOT none, because the FIRST -(An) decrement already happened; postinc's i=0
+  // offset is genuinely none, the untouched original An).
+  private def offsetSel(addr: FmovemCtrlAddr, i: Int): (Boolean, Sel) = (addr, i) match {
+    case (FcaPredec,  0) => (true, SImmNeg4)
+    case (FcaPredec,  1) => (true, SImmNeg8)
+    case (FcaPredec,  2) => (true, SImmNeg12)
+    case (FcaPostinc, 0) => (false, SNone)
+    case (FcaPostinc, 1) => (true, SImm4)
+    case (FcaPostinc, 2) => (true, SImm8)
+    case (FcaNonAuto, 0) => (false, SNone)          // plain SEaBase (+ ctx.eaDispLo via a separate row flag, see below)
+    case (FcaNonAuto, 1) => (true, SEaDispLoPlus4)
+    case (FcaNonAuto, 2) => (true, SEaDispLoPlus8)
+  }
+  // NonAuto's i=0 case is special: it must add ctx.eaDispLo (the REAL decoded
+  // displacement) even though no PER-TRANSFER offset is needed -- reuse the
+  // EXISTING SEaDispLo selector (not SNone) so a nonzero real displacement
+  // (e.g. F228 BC00's "(0,A0)", or a nonzero real one) is honored. Fix:
+  private def offsetSelFixed(addr: FmovemCtrlAddr, i: Int): (Boolean, Sel) =
+    if (addr == FcaNonAuto && i == 0) (true, SEaDispLo) else offsetSel(addr, i)
+
+  // Register-select bits in PROCESSING order for this addressing class + mask.
+  // rcBits: MSB-first {4,2,1} for non-predec, LSB-first {1,2,4} for predec --
+  // filtered down to whichever of the up-to-3 are actually SET in `mask`.
+  private def processingOrder(addr: FmovemCtrlAddr, mask: Int): Seq[Int] = {
+    val msbFirst = Seq(4, 2, 1).filter(rc => (mask & rc) != 0)
+    if (addr == FcaPredec) msbFirst.reverse else msbFirst
+  }
+
+  private def fmovemCtrlProgram(dir: Boolean /* true = read: mem->ctrl */,
+                                 addr: FmovemCtrlAddr, mask: Int): Vector[Desc] = {
+    val order = processingOrder(addr, mask)
+    val rows = order.zipWithIndex.flatMap { case (rc, i) =>
+      val tSel: Sel = Seq(ST0, ST1, ST2)(i)
+      val (useOff, offSel) = offsetSelFixed(addr, i)
+      if (dir) {
+        // mem -> ctrl: LOAD (base[+offset]) -> Tn, then sysOp write Tn -> FPcr.
+        Seq(
+          Desc(UMove, mem = MLoad, srcA = SEaBase, dst = tSel,
+               useImm = useOff, imm = offSel, sz = SzLong),
+          Desc(USysCtrlMove(readDir = false, rc = rc), srcB = tSel)
+        )
+      } else {
+        // ctrl -> mem: sysOp read FPcr -> Tn, then STORE Tn -> base[+offset].
+        Seq(
+          Desc(USysCtrlMove(readDir = true, rc = rc), dst = tSel),
+          Desc(UMove, mem = MStore, srcA = SEaBase, srcB = tSel,
+               useImm = useOff, imm = offSel, sz = SzLong)
+        )
+      }
+    }
+    val writeback: Vector[Desc] = addr match {
+      case FcaNonAuto => Vector.empty
+      case FcaPredec  =>
+        val delta = Seq(SNone, SImmNeg4, SImmNeg8, SImmNeg12)(order.size)  // -4/-8/-12 by popcount
+        Vector(Desc(UAddDrop, srcA = SEaBase, dst = SEaBase, useImm = true, imm = delta))
+      case FcaPostinc =>
+        val delta = Seq(SNone, SImm4, SImm8, SImm12)(order.size)          // +4/+8/+12 by popcount
+        Vector(Desc(UAddDrop, srcA = SEaBase, dst = SEaBase, useImm = true, imm = delta))
+    }
+    val all = rows.toVector ++ writeback
+    all.zipWithIndex.map { case (d, i) =>
+      d.copy(isFirst = i == 0, isLast = i == all.size - 1)
+    }
+  }
+
+  // Build every (dir, addr, mask) combination -- mask popcount in {2,3} per this
+  // task's Step 3 scope (the popcount==1 memory-EA extension noted as optional
+  // in "Scope" just needs `1 to 3` here instead of `2 to 3`, with NO other
+  // change). 2 dirs x 3 addr classes x 6 masks (popcount 2: {6,5,3}; popcount 3:
+  // {7}) = wait: popcount-2 masks are {110=6, 101=5, 011=3} (3 masks), popcount-3
+  // is {111=7} (1 mask) -- 4 masks total, not 6. 2 x 3 x 4 = 24 programs.
+  private val fmovemCtrlMasks: Seq[Int] = Seq(6, 5, 3, 7)   // popcount 2 (x3) + popcount 3 (x1)
+  private val fmovemCtrlAddrs: Seq[FmovemCtrlAddr] = Seq(FcaPredec, FcaPostinc, FcaNonAuto)
+
+  val FMOVEM_CTRL_ENTRY: Int = romP8().size + <running total of prior romPN sizes up to
+    the actual insertion point -- see integration note below>
+  // Populated by walking (dir, addr, mask) in a FIXED, documented order and
+  // recording each program's starting row index -- avoids hand-counting rows
+  // across 24 variable-length programs, the same class of error the LUT-
+  // reduction Desc/DescBits split was built to make impossible for hand-written
+  // rows (this generator makes it impossible for GENERATED rows too, by
+  // construction: the map IS the source of truth, nothing downstream re-derives
+  // an index by counting).
+  val fmovemCtrlEntries: Map[(Boolean, FmovemCtrlAddr, Int), Int] = {
+    var idx = FMOVEM_CTRL_ENTRY
+    val b = scala.collection.mutable.Map.empty[(Boolean, FmovemCtrlAddr, Int), Int]
+    for (dir <- Seq(false, true); addr <- fmovemCtrlAddrs; mask <- fmovemCtrlMasks) {
+      b((dir, addr, mask)) = idx
+      idx += fmovemCtrlProgram(dir, addr, mask).size
+    }
+    b.toMap
+  }
+  val fmovemCtrlRom: Vector[Desc] =
+    (for (dir <- Seq(false, true); addr <- fmovemCtrlAddrs; mask <- fmovemCtrlMasks)
+      yield fmovemCtrlProgram(dir, addr, mask)).toVector.flatten
+```
+
+**Integration note (real, not hand-waved):** `val rom: Vector[Desc] = romP1() ++ ... ++ romP8()` (`Microcode.scala:1636`) needs `++ fmovemCtrlRom` appended, and `FMOVEM_CTRL_ENTRY` must equal the running row count *at that point* — i.e. `romP1().size + romP2().size + ... + romP8().size` (**not** a guess; compute it from the real `romPN().size` values in the working copy, or better, define it as `Microcode.romP1().size + ... + Microcode.romP8().size` directly in code so it can never drift out of sync with the actual partition sizes, rather than a hand-copied literal like `MOVE16_ENTRY = 242`'s existing style). Task 6b (sequenced earlier in this plan, right after Task 6) also appends new rows to `romP8()`/`romP9()` for its own 12 `FP_MEM_*_ENTRY` groups — since both tasks compute their entry index dynamically from the real `romPN().size` values rather than a hand-copied literal, this composes correctly regardless of which lands first in the working copy; just make sure `FMOVEM_CTRL_ENTRY` is computed AFTER Task 6b's own rows are appended if Task 6b has already landed, not before. This task's generated block adds **24 programs** ranging 4-7 rows each (2×popcount + up to 1 writeback row) — worst case (mask=7, predec or postinc) is `2×3+1=7` rows, best case (mask∈{3,5,6}, non-auto) is `2×2+0=4` rows; total added rows ≈ 24 × ~5.5 avg ≈ **130 rows**, roughly a 50% increase over the current ROM's ~252-row scale (`MOVE16_ENTRY = 242` plus its own 10 rows). Flag this scale explicitly for the mandatory synth gate (Step 10) — the LUT-reduction BRAM-backed `ucRomMem` (Task A1-A5) exists specifically to keep ROM growth cheap in **LUTs** (it becomes BRAM growth instead), but this should be **confirmed**, not assumed, by the actual gate.
+
+- [ ] **Step 7: `DecodeStage.scala` — `ucEntry` dispatch**
+
+At `ucBegin` (mirroring the MOVE16 dispatch pattern at `DecodeStage.scala:1149-1153`, but data-dependent on `dir`/`<ea>` mode/mask instead of a single constant), after `ucCasEaDec` has resolved the current instruction's `<ea>` (Step 2's confirmed reuse point):
+
+```scala
+    // FMOVEM-control list (Task 9b): pick the (dir, addr-class, mask) entry.
+    // addr-class comes from the ALREADY-DECODED <ea> mode bits (ucEntryPkt's own
+    // opword bits 5:3), NOT from ucCasEaDec.autoMode -- this task's rows do their
+    // OWN fixed-offset addressing (see Step 6's rationale for why the generic
+    // eaAuto per-row auto-stepping machinery is deliberately NOT reused here),
+    // so autoMode is only consulted to CLASSIFY predec/postinc/other, never wired
+    // into a row's own eaAuto field.
+    val fpCtrlListDir  = ucEntryPkt.words(1)(15 downto 13) === B"3'b101"   // True = read (mem->ctrl)
+    val fpCtrlListMask = ucEntryPkt.words(1)(12 downto 10).asUInt
+    val fpCtrlListEaM  = ucEntryPkt.words(0)(5 downto 3)
+    val fpCtrlListAddr = fpCtrlListEaM.mux(
+      B"3'b100" -> U(0, 2 bits),   // FcaPredec
+      B"3'b011" -> U(1, 2 bits),   // FcaPostinc
+      default   -> U(2, 2 bits)    // FcaNonAuto (control/disp/abs/indexed)
+    )
+```
+
+**Honest flag (concrete, not hand-waved-away):** the `fmovemCtrlEntries` map (Step 6) is a Scala compile-time `Map`, but this dispatch needs a **hardware** mux from `(fpCtrlListDir, fpCtrlListAddr, fpCtrlListMask)` to a `ucEntry` constant — i.e. the 24 entries of that map need to be materialized as a hardware lookup (a `switch`/nested-`Mux` tree, or a small `Mem`/ROM keyed on a packed `(dir##addr##mask)` index, mirroring how `MI_JMP_ENTRY` vs `MI_JSR_ENTRY` selection already works for a *smaller* data-dependent case — find that precedent (`grep -n "MI_JMP_ENTRY\|MI_JSR_ENTRY" src/main/scala/m68k040/decode/DecodeStage.scala`) and follow its exact shape, scaled up to 24 cases via a Scala `for` loop emitting the `is(...)` arms from the SAME `fmovemCtrlEntries` map (so the hardware dispatch table and the ROM's own row layout can never drift apart — generate the `switch` cases from the map, do not hand-transcribe 24 `is(...)` lines).
+
+- [ ] **Step 8: Re-run the LUT-reduction equivalence spec**
+
+```bash
+sbt "testOnly m68k040.decode.MicrocodeResolveEquivalenceSpec"
+```
+Per "What this task reuses unmodified" #5 — this is the existing spec that proves `resolve()` (the Scala oracle) and `resolveFromBits()` (the real hardware path reading `DescBits`/`ucRomMem`) agree, row for row, for the ENTIRE `rom` (now including this task's 24 generated programs). If this fails, the bug is almost certainly a `resolveFromBits()`/`descToBits` edit that didn't mirror `resolve()`'s (Step 5b) exactly — do not chase it as an FPU-specific bug before checking that.
+
+- [ ] **Step 9: Tests**
+
+```scala
+// src/test/scala/m68k040/decode/MicrocodeFmovemCtrlSpec.scala
+package m68k040.decode
+
+import org.scalatest.funsuite.AnyFunSuite
+
+class MicrocodeFmovemCtrlSpec extends AnyFunSuite {
+  test("mask=111 (F227 BC00 -(A7)) predecrement program: 6 rows, FPIAR/FPSR/FPCR processing order") {
+    val prog = Microcode.fmovemCtrlProgram(dir = false, Microcode.FcaPredec, mask = 7)
+    assert(prog.size == 7, "3 register pairs (6 rows) + 1 writeback row")
+    // rows 0,2,4 are the sysOp-read half; confirm rc order is FPIAR(1),FPSR(2),FPCR(4) --
+    // the REVERSED order, per the pinned rule (Step 1b).
+    val rcOrder = Seq(prog(0), prog(2), prog(4)).map {
+      case Microcode.Desc(Microcode.USysCtrlMove(true, rc), _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) => rc
+      case _ => fail("expected USysCtrlMove(readDir=true, ...)")
+    }
+    assert(rcOrder == Seq(1, 2, 4), s"predecrement must process FPIAR,FPSR,FPCR (reversed); got $rcOrder")
+  }
+  test("mask=111 postincrement program: normal FPCR/FPSR/FPIAR processing order") {
+    val prog = Microcode.fmovemCtrlProgram(dir = false, Microcode.FcaPostinc, mask = 7)
+    val rcOrder = Seq(prog(0), prog(2), prog(4)).collect {
+      case d if d.uop.isInstanceOf[Microcode.USysCtrlMove] => d.uop.asInstanceOf[Microcode.USysCtrlMove].rc
+    }
+    assert(rcOrder == Seq(4, 2, 1), s"postincrement must process FPCR,FPSR,FPIAR (normal); got $rcOrder")
+  }
+  test("every generated program's LAST row has isLast=true and exactly one isFirst=true") {
+    for (dir <- Seq(false, true); addr <- Seq(Microcode.FcaPredec, Microcode.FcaPostinc, Microcode.FcaNonAuto);
+         mask <- Seq(6, 5, 3, 7)) {
+      val prog = Microcode.fmovemCtrlProgram(dir, addr, mask)
+      assert(prog.last.isLast, s"dir=$dir addr=$addr mask=$mask: last row must release fed")
+      assert(prog.count(_.isFirst) == 1, s"dir=$dir addr=$addr mask=$mask: exactly one firstOfInstr")
+    }
+  }
+}
+```
+
+Decode-side assertions in `OperationDecoderSpec.scala` (alongside Task 9's own cases):
+```scala
+  test("FMOVEM.L FPIAR/FPSR/FPCR,-(A7) (F227 BC00): sysOp/FMOVE_FPCTRL, ucOp routed", VerilatorTest) {
+    run { dut => drive(dut, 0xF227, 0xBC00); sleep(1)
+      assert(!dut.o.illegal.toBoolean, "the real FPSP ROM prologue must not be illegal")
+      assert(dut.o.sysOp.toBoolean && dut.o.sysKind.toEnum == SysKind.FMOVE_FPCTRL)
+      assert(dut.o.ucOp.toBoolean, "the list form is microcoded (Step 6/7), not a fast crack")
+    }
+  }
+  test("FMOVEM.L D0,FPCR (mask=100, single bit) is UNCHANGED by this task -- still Task 9's fast-crack path", VerilatorTest) {
+    run { dut => drive(dut, 0xF200, 0x9000); sleep(1)
+      assert(!dut.o.ucOp.toBoolean, "single-register form must stay Task 9's non-microcoded arm")
+    }
+  }
+  test("FMOVEM.L D0,FPIAR/FPSR/FPCR (mask=111, Dn EA -- Dn is NOT memory-alterable) stays ILLEGAL", VerilatorTest) {
+    run { dut => drive(dut, 0xF200, 0xBC00); sleep(1)   // opword mode=000 (Dn), reg=000
+      assert(dut.o.illegal.toBoolean, "a multi-register mask against a register-direct <ea> is architecturally meaningless (see EA-mode restriction)")
+    }
+  }
+```
+
+Whitebox round-trip + order tests, modeled on Task 9's own whitebox test (Task 9's own Step 10). **Explicitly two variants are required, not one** — per the "register order" finding, Musashi is a sound oracle for the non-predecrement case but is confirmed WRONG for predecrement, so:
+
+- `-(An)` case: **whitebox only**, asserting the REAL (WinUAE-corroborated, Step 1b-pinned) order directly against `FpuControlPlugin`'s `simPublic` regs and the memory contents written, exactly like this: seed FPCR/FPSR/FPIAR to distinct known values, execute `FMOVEM.L FPIAR/FPSR/FPCR,-(A7)` via the same full-core sim harness pattern Task 9's Step 10 whitebox test uses (`attachProgram`/`BehavioralMemAgent`/etc.), then directly inspect the 3 written memory words and confirm `mem[SP]==FPCR_val, mem[SP+4]==FPSR_val, mem[SP+8]==FPIAR_val` (the CORRECT, round-trip-consistent order — NOT what Musashi would produce). Follow with `FMOVEM.L (A7)+,FPIAR/FPSR/FPCR` (postincrement reload, same mask) and confirm the reload recovers the exact original FPCR/FPSR/FPIAR values — the actual round-trip proof.
+- non-`-(An)` case (e.g. `(0,A0)`, matching `F228 BC00`): **lock-step is sound here** (Musashi's fixed order matches real hardware for every non-predecrement mode, per the derivation) — extend `ExecuteLockStepSpec` with a real lock-stepped test using this encoding, gated the same way Task 9's other lock-step-eligible ops are, rather than defaulting to whitebox out of caution. Confirm this by first checking Musashi's oracle actually decodes the FP coprocessor opword range without hitting the "coprocessor stubs claim this opword range" oracle gap Task 9's own Step 10 flags (`ExecuteLockStepSpec.scala:3620-3634`) — if that gap still applies to this exact opword/mask combination, fall back to whitebox for this case too and say so explicitly, do not force a lock-step test that can't actually run against a real oracle response.
+
+- [ ] **Step 10: Run the tests + mandatory OOC synth gate**
+
+```bash
+sbt "testOnly m68k040.decode.MicrocodeFmovemCtrlSpec"
+sbt "testOnly m68k040.decode.OperationDecoderSpec m68k040.frontend.PredecodeWordSpec"
+sbt "testOnly m68k040.decode.MicrocodeResolveEquivalenceSpec"
+sbt "testOnly m68k040.execute.FpuControlPluginSpec"
+sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
+```
+Expected baseline for the lock-step suite going into this task: **394/394 PASS** (per this session's current confirmed baseline — NOT the stale 396/397 figures some earlier drafts in this plan used; if Task 9 has landed by the time this task starts, re-confirm the actual then-current count before writing "N/N" into the commit message). Expected after this task: 394 (or Task 9's landed count) + however many new lock-step-eligible tests Step 9 actually adds (at minimum the one non-predecrement case, if the oracle-gap check passes) — record the real number, do not guess it up front.
+
+Per this project's standing rule ("every implementation slice / dispatched agent ends with the mandatory full-core OOC synth gate, ≥250 MHz, reported"), run the OOC gate and report the actual FMax:
+
+```bash
+# Follow this project's existing OOC synth-gate script/flow (see synth/ for the
+# established pattern this branch already uses for prior slices' gates -- do not
+# invent a new invocation).
+```
+Report the real number. Given Step 6's ~130-row ROM growth estimate, treat a measurable LUT/FMax regression as a real possible finding, not a surprise to explain away — if the OOC gate shows one, that is exactly the kind of result this standing rule exists to catch before merge, not after.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add src/main/scala/m68k040/decode/OperationDecoder.scala \
+        src/main/scala/m68k040/frontend/PredecodeWord.scala \
+        src/main/scala/m68k040/decode/Microcode.scala \
+        src/main/scala/m68k040/decode/DecodeStage.scala \
+        src/test/scala/m68k040/decode/MicrocodeFmovemCtrlSpec.scala \
+        src/test/scala/m68k040/decode/OperationDecoderSpec.scala \
+        src/test/scala/m68k040/frontend/PredecodeWordSpec.scala \
+        src/test/scala/m68k040/execute/FpuControlPluginSpec.scala \
+        src/test/scala/m68k040/lockstep/ExecuteLockStepSpec.scala
+git commit -m "feat(fpu): FMOVEM control-register LIST form (multi-register FPCR/FPSR/FPIAR)
+
+Extends Task 9's single-register FMOVE-to/from-FPcr family to the
+multi-register list form (popcount(RRR) in {2,3}), specifically to
+unblock the real Motorola/Apple FPSP ROM kernel's own vector-11
+prologue: FMOVEM.L FPIAR/FPSR/FPCR,-(A7) (F227 BC00, design spec
+Decision 8). Without this, no real ROM FPSP handler can be installed
+at all -- it re-traps on its own first instruction, exactly the
+infinite-recursion class fpu_fpsp_selfrecursion_repro.s exists to
+catch.
+
+Reuses Task 9's FpuControlPlugin/SysKind.FMOVE_FPCTRL/ExceptionUnit
+S_APPLY arm/RobPlugin privilege-exclusion COMPLETELY UNCHANGED: each
+selected register's transfer decomposes into a 2-row microcode pair
+(a Task-9-shaped sysOp move against a scratch temp T0/T1/T2, paired
+with an ordinary LOAD/STORE through that temp) -- ExceptionUnit cannot
+distinguish a microcode-emitted FMOVE_FPCTRL occurrence from a
+directly-decoded one, by design. Routed through the existing
+straight-line microcode engine (Microcode.scala) rather than a new
+runtime sequencer: with at most 3 registers and a 3-bit mask fully
+known at decode time, a bounded compile-time-generated family of 24
+static programs (2 directions x 3 addressing classes x 4 nonzero
+2-3-bit masks) is simpler and lower-risk than a MOVEM-style variable
+runtime bitmask FSM, which this instruction's fixed 3-element universe
+does not need.
+
+Real-hardware finding, not assumed: the register PROCESSING ORDER
+reverses (FPIAR,FPSR,FPCR instead of FPCR,FPSR,FPIAR) specifically for
+-(An) predecrement addressing, mirroring the integer MOVEM
+instruction's own well-known predecrement asymmetry. Derived by
+round-trip-consistency (a predecrement store followed by a matching
+postincrement reload must recover the original values) and
+independently corroborated against WinUAE's FPU-emulation-accuracy
+documentation, which confirms this exact CPU-generation-specific rule
+for the 68040. Musashi's own fmove_fpcr does NOT implement this
+reversal (confirmed by direct trace) -- a genuine, newly-identified
+Musashi FP limitation, additive to the design spec's Decision 3
+catalog. Consequently the -(An) case is verified via a whitebox
+round-trip sim test, not lock-step; the non-predecrement case (where
+Musashi's fixed order does match real hardware) is lock-step-verified.
+
+<<INTEGRATOR: replace with the real page/section number from Step 1b's
+required MC68881/MC68882 UM primary-source verification before this
+commit lands -- do not merge with this placeholder still present.>>
+
+<<INTEGRATOR: replace with the real N/N lock-step count and the real
+OOC synth-gate FMax from Step 10 -- do not merge with these
+placeholders still present.>>
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
+```
+
+---
+
+## Summary of what remains genuinely open after this task
+
+- Step 1b's primary-source page citation (flagged, gating, not yet done — this document provides strong secondary corroboration but not a page number).
+- The `popcount==1`-with-memory-EA extension (`fpu_fmove_mem_ea_fpcr_fpsr_no_fline.s`), recommended but left as the integrator's call (see "Scope").
+- The FMOVEM *data*-register-list form (`FP0-FP7`) — a structurally separate opcode family, untouched by this task, not in scope for FPSP-prologue support.
+- Step 3's honest flag on exactly how a *data-dependent* `ucEntry` gets threaded from `OperationDecoder` to `DecodeStage` — needs a direct-read confirmation against the codebase's actual current MI_* dispatch precedent before Step 7 is implemented for real.
+- The synth-gate scale risk flagged in Step 6/10 (~130 new ROM rows, ~50% growth) — a real number, not yet measured.
+
+---
+
+### Task 10: FSAVE unimplemented-instruction-frame trigger fields (`fpuSoftwareComplete`, `fpuCmdWord`)
 
 **Files:**
 - Modify: `src/main/scala/m68k040/decode/DecodedUop.scala` (new `fpuSoftwareComplete` + `fpuCmdWord` fields)
 - Modify: `src/main/scala/m68k040/rename/RenamedUop.scala` (same two fields)
 - Modify: `src/main/scala/m68k040/rename/RenameStage.scala` (copy them through)
-- Modify: `src/main/scala/m68k040/decode/MicroOpAssembler.scala` (the actual fix)
-- Modify: `src/main/scala/m68k040/frontend/PredecodeWord.scala` (2-word framing for the recognized class)
-- Test (modify): `src/test/scala/m68k040/decode/MicroOpAssemblerSpec.scala` (the exhaustive line-F sweep)
-- Test: `src/test/scala/m68k040/lockstep/ExecuteLockStepSpec.scala` (directed + mutation-proof)
+- Modify: `src/main/scala/m68k040/decode/MicroOpAssembler.scala` (the assignment)
+- Test (modify): `src/test/scala/m68k040/decode/FpAssembleSpec.scala` (directed decode-level test)
 
 **Interfaces:**
-- Produces: `DecodedUop.fpuSoftwareComplete` (Bool) — "this F-line opword is a RECOGNIZED FPU instruction whose full length and required source state are captured; deliver vector 11 with the POST-instruction PC". Consumed here (drives `faultUsesNextPc`) and by Task 11 (the unimplemented-instruction FSAVE-frame capture trigger). `DecodedUop.fpuCmdWord` (Bits 16) — the FPU command extension word, consumed by Task 11 as CMDREG1B.
-- Consumes: nothing new.
+- Produces: `DecodedUop.fpuSoftwareComplete` (Bool) — "this F-line opword is the
+  RECOGNIZED register-to-register FPU instruction form, routed to FPSP, whose CMDREG1B and
+  operand registers Task 11's FSAVE unimplemented-instruction frame needs to capture."
+  `DecodedUop.fpuCmdWord` (Bits 16) — the FPU command extension word, consumed by Task 11
+  as CMDREG1B and as the FP-register-number source for its operand capture (`ext[12:10]` =
+  source FPm, `ext[9:7]` = destination FPn — **valid ONLY for this narrow population**, see
+  below).
+- Consumes: Task 6's `fpFormIsReg`/`fpExt` locals (this task is a small, scoped addendum to
+  Task 6's own extension-word decode, not a re-derivation of it).
 
-**This is a real, already-diagnosed, independently-scoped bug.** `docs/superpowers/specs/2026-08-09-fpu-hardware-design.md` §5 states it precisely, after a full vector-by-vector audit against m68k-ooo:
+**This task's scope was reduced during integration, reconciled against Task 6's own
+`faultUsesNextPc` gate — read this before touching anything.** An earlier draft of this task
+independently derived its own `faultUsesNextPc` fix and its own `PredecodeWord` framing arm
+for the register-to-register form. Both are now redundant: `faultUsesNextPc` is set by Task 6
+(its `fpLenKnown` gate is a strict superset of what this task's own predicate used to compute),
+and `PredecodeWord` is not touched by this task at all — Task 5's own
+`.elsewhen(fpIsGen && (fpIsRegForm || fpIsMovecr))` arm already frames the register-to-register
+form as exactly 2 words, including the not-yet-resident/`ambiguousLine` case. **What genuinely
+does not exist anywhere else** — and is this task's entire remaining job — is the two fields
+Task 11's FSAVE frame capture reads: `fpuSoftwareComplete` (a trigger bit) and `fpuCmdWord` (the
+raw command word, doubling as CMDREG1B and as the FP-register-number source for the frame's
+operand capture).
 
-> **This project has no post-instruction-PC flavor of vector-11 delivery at all** — `MicroOpAssembler.scala`'s generic line-F fallback leaves `faultUsesNextPc := False`. This matters directly for this FPU work: an FPSP-style handler that expects to RTE past a recognized but software-completed FPU instruction needs the post-instruction-PC variant, or it will loop on the same opword forever.
+**Why this task's trigger population MUST stay narrower than Task 6's `fpLenKnown`, even
+though `fpLenKnown` is otherwise the "more correct, more general" gate.** Confirmed by direct
+read of Task 11's actual operand-capture code (`ExceptionUnit.scala`): it addresses the FP
+RAT using `entryFpuCmd(12 downto 10)` as the SOURCE FP register number and
+`entryFpuCmd(9 downto 7)` as the DESTINATION FP register number. That bit-position
+interpretation — "`ext[12:10]` names an FP register" — is only true for the
+register-to-register form (`ext[15:13]=000`, R/M=0). For every other cpGEN form (memory
+source — Task 6b, immediate source — Task 6, FMOVE-to-`<ea>`, FMOVEM), `ext[12:10]` means
+something else (a source-data FORMAT specifier, or is unused/reserved), and reading it as a
+register number would silently address the wrong physical FP register — a real
+corruption-class bug, not a style issue. **Do not broaden this task's predicate to match Task
+6's `fpLenKnown` population without ALSO fixing Task 11's operand-capture logic to handle the
+broader cases correctly** (which is out of this task's scope).
 
-and resolves the trigger from the sibling RTL rather than leaving it as a guess:
-
-> **Required here:** any recognized FPU instruction deliberately handed to FPSP after its full length and required source state have been captured sets `faultUsesNextPc := True`; an unrecognized line-F encoding keeps it False. The architectural vector remains 11 in both cases—do not expose `0x8B` outside an internal control encoding.
-
-**Confirmed by direct read of the current code (not assumed):**
-- `faultUsesNextPc` is a real, live, *fully-wired* field, not a dead one. `DecodedUop` declares it, `RenamedUop.scala:46` carries it, `RenameStage.scala:154` copies it (`r.faultUsesNextPc := dec.faultUsesNextPc`), and `RobPlugin.scala:861,886` consumes it at alloc: `faultPcStore(tail) := Mux(allocUopVec(0).faultUsesNextPc, allocUopVec(0).nextPc, allocUopVec(0).pc)`. Nothing needs adding to that chain.
-- The default is set once at `MicroOpAssembler.scala:706`: `opUop.faultUsesNextPc := False  // default: stack the faulting instr PC (pc); TRAP/TRAPV -> nextPc`.
-- The line-F fallback that must be fixed is the `when(bad)` block at `MicroOpAssembler.scala:1517-1536`, which picks the vector via a top-nibble mux (`U(0xF, 4 bits) -> U(11, 8 bits)`) and never touches `faultUsesNextPc`.
-- Established precedent for setting it at decode for a *conditionally* faulting op, from the same file (lines 731-737): CHK/DIV "are group-2 traps ... The fault is conditional (set at execute), but faultPc is captured at ALLOC, so faultUsesNextPc must be set NOW".
-
-**DO NOT touch the format selection.** `ExceptionUnit.scala:769-771`'s `is2` term already includes `entryVector === 11`, so vector 11 already stacks a 6-word format-$2 frame. The 2026-08-09 audit confirms this is correct and matches m68k-ooo across both of its vector-11 delivery paths (13 of 13 other vector/format pairs matched too). This task changes **only** which PC lands in the frame's PC field. `ExceptionUnit.scala:730-749`'s long comment records that format-$2-for-vector-11 is a *disputed but deliberately-chosen* position (corpus over Musashi); leave it exactly as it is.
-
-**The recognized set, chosen so this task is genuinely standalone.** `faultUsesNextPc := True` is only *safe* when the instruction's length is genuinely known — a wrong length makes the handler resume mid-instruction. The set used here is therefore the one F-line class whose length is unambiguous with no dependence on Task 4/5's decode work:
+**The recognized set (identical set as before, just no longer separately re-derived —
+it now reuses Task 6's own locals):**
 
 ```
 op[15:12] = 1111, op[11:9] = 001, op[8:6] = 000     (line-F, cpID = 001, opclass 000)
@@ -6655,9 +8579,12 @@ ext[15:13] = 000                                     (R/M = 0: source is a FLOAT
   => the instruction is EXACTLY 2 words, unconditionally, regardless of the <ea> field.
 ```
 
-This is the register-to-register FPU-general form — every transcendental (`FSIN FP1,FP0`, `FETOX`, `FLOGN`, …), every rounded-precision variant, and every other non-hardware-native op in its register-source form. All of them must go to FPSP, all of them have their complete source state already in the FP register file (which Task 11's unimplemented-instruction frame captures), and all of them are exactly 2 words. That makes this the correct, provably-safe initial member set, and Task 4/5 widen it later by extending one predicate in one place.
-
-Deliberately **excluded** (keep `faultUsesNextPc := False`, i.e. today's behavior): every other line-F encoding, including `ext[15:13] = 010/011` (memory source/destination — length depends on the `<ea>` and on the operand format field, which is Task 5's work), the control-register forms (Task 9 handles those as sysOps, they never reach `bad`), FMOVEM, FBcc/FScc/FDBcc/FTRAPcc, and every cpID ≠ 001 opword.
+This is `fpFormIsReg` from Task 6's Step 4 — the SAME local, not a re-derivation. Every
+transcendental, every rounded-precision variant, and every other non-hardware-native op in
+its register-source form matches this predicate. All of them go to FPSP (Task 6's
+`fpGenBad`/`bad` already ensures this — `fpNative` excludes them from `fpEmit`), all of them
+have their complete source state already sitting in the FP register file (which Task 11's
+frame captures via the FP RAT), and all of them are exactly 2 words.
 
 - [ ] **Step 1: Add the two decode fields**
 
@@ -6666,348 +8593,170 @@ Deliberately **excluded** (keep `faultUsesNextPc := False`, i.e. today's behavio
 // Add to `case class DecodedUop()`, immediately after the existing `faultUsesNextPc` /
 // fault-family fields:
 
-  // ── Recognized-FPU-instruction software completion (vector 11, POST-instruction PC) ──
-  // True for an F-line opword this core RECOGNIZES as an FPU instruction and DELIBERATELY
-  // hands to FPSP with its full length and required source state captured. Drives
-  // faultUsesNextPc (below) so the vector-11 format-$2 frame carries the POST-instruction
-  // PC -- an FPSP handler that software-completes the instruction then RTEs lands on the
-  // NEXT instruction instead of re-trapping on the same opword forever. An UNRECOGNIZED
-  // line-F encoding (unknown length) keeps this False and keeps the faulting PC, which is
-  // the pre-existing behavior for every line-F opword and stays correct for them.
-  //
-  // The architectural vector is 11 in BOTH cases; this is purely the PC-field selector.
-  // (m68k-ooo raises an internal pseudo-vector 0x8B for its equivalent path and translates
-  // it back to 11 at commit -- see the 2026-08-09 design spec section 5. Do NOT replicate
-  // the pseudo-vector: it is an internal control encoding there, and this project has a
-  // simpler, already-wired mechanism in faultUsesNextPc.)
+  // ── Recognized-FPU-instruction software completion (Task 11's FSAVE trigger) ──
+  // True for an F-line opword this core RECOGNIZES as the register-to-register FPU
+  // general form (Task 6's fpFormIsReg) that is NOT hardware-native (so it is routed to
+  // FPSP via Task 6's own faultUsesNextPc mechanism). A subsequent FSAVE, if this bit was
+  // the most recent trap, emits the 44-byte unimplemented-instruction frame instead of the
+  // 4-byte idle frame. DELIBERATELY NARROWER than Task 6's own faultUsesNextPc gate
+  // (fpLenKnown, which covers every cpGEN form including memory-source, Task 6b): Task 11's
+  // operand capture reads fpuCmdWord's ext[12:10]/ext[9:7] AS FP REGISTER NUMBERS, which is
+  // only a valid interpretation for the register-to-register form. Broadening this bit's
+  // population without also fixing Task 11's operand capture would silently address the
+  // wrong physical FP register for memory/immediate-source traps. See the note at the top
+  // of this task's text for the full argument.
   val fpuSoftwareComplete = Bool()
-  // The FPU COMMAND extension word (words(1)) of a recognized FPU instruction. Zero for
-  // everything else. Task 11 stacks this as the unimplemented-instruction state frame's
-  // CMDREG1B field; it is captured HERE, at decode, because by the time the frame is
-  // emitted (a later FSAVE) the instruction words are long gone.
+  // The FPU COMMAND extension word (words(1)) of a recognized FPU instruction matching the
+  // predicate above. Zero for everything else. Task 11 stacks this as the unimplemented-
+  // instruction state frame's CMDREG1B field, and ALSO reads ext[12:10]/ext[9:7] out of it
+  // to address the FP RAT for the frame's operand fields -- captured HERE, at decode,
+  // because by the time the frame is emitted (a later FSAVE) the instruction words are
+  // long gone.
   val fpuCmdWord = Bits(16 bits)
 ```
 
-Then set both to their inert defaults at **every** `DecodedUop` construction site in `MicroOpAssembler.scala`. Those sites are already enumerated by the existing `faultUsesNextPc` initializations — lines 82, 133, 184, 239, 706, 1084, 1151, 1199, 1964, 2033, 2110, 2194, 2254, 2357, 2398, 2494, 2533, 2594, 2651, 2874 (and the microcode `UOpFromCtx` builder). Mechanically:
+Then set both to their inert defaults at **every** `DecodedUop` construction site in
+`MicroOpAssembler.scala` (the existing `faultUsesNextPc` initializations, already enumerated
+in the plan's earlier sessions):
 
 ```bash
 grep -n "faultUsesNextPc := False\|faultUsesNextPc := True" src/main/scala/m68k040/decode/MicroOpAssembler.scala
 ```
-and add `u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)` (or `opUop.`/`ldUop.`/… as appropriate) next to each. If any site is missed, SpinalHDL fails elaboration with an UNASSIGNED signal error — a loud failure, not a silent one.
+and add `u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)` (or `opUop.`/`ldUop.`/…
+as appropriate) next to each. If any site is missed, SpinalHDL fails elaboration with an
+UNASSIGNED signal error — a loud failure, not a silent one.
 
 - [ ] **Step 2: Thread them through rename**
 
 ```scala
-// src/main/scala/m68k040/rename/RenamedUop.scala -- add alongside line 46's faultUsesNextPc:
+// src/main/scala/m68k040/rename/RenamedUop.scala -- add alongside the existing FP fields:
   val fpuSoftwareComplete = Bool()
   val fpuCmdWord          = Bits(16 bits)
 
-// src/main/scala/m68k040/rename/RenameStage.scala -- add alongside line 154:
+// src/main/scala/m68k040/rename/RenameStage.scala -- add alongside the existing FP field
+// copy-through:
       r.fpuSoftwareComplete := dec.fpuSoftwareComplete
       r.fpuCmdWord          := dec.fpuCmdWord
 ```
 
-Task 11 consumes them from there; this task only needs them to exist and be carried (nothing downstream reads them yet, which is fine — a carried-but-unread renamed field is the same shape as several already in that bundle).
+Task 11 consumes them from there; this task only needs them to exist and be carried (nothing
+downstream reads them until Task 11).
 
-- [ ] **Step 3: The fix itself in `MicroOpAssembler.scala`**
+- [ ] **Step 3: The assignment itself in `MicroOpAssembler.scala`**
 
-Add immediately after the existing `when(bad) { ... }` block (which ends at line 1536), so it is a *refinement* of the fault the `bad` block just raised, not a competing writer:
+Add immediately AFTER Task 6 Step 5's `when(fpEmit) { ... }` block (a sibling `when`, not
+nested inside it — this fires on the TRAPPING path, `bad`, which `fpEmit`'s cases never
+reach):
 
 ```scala
-    // ── Recognized-FPU-instruction software completion: vector 11, POST-instruction PC ──
-    // The 2026-08-09 FPU hardware design spec, section 5, records this as a real,
-    // already-diagnosed gap: this core had NO post-instruction-PC flavor of vector-11
-    // delivery at all, so an FPSP-style handler that software-completes a recognized FPU
-    // instruction and RTEs would land back ON the same opword and re-trap forever. The
-    // audit that found it also resolved the trigger from the sibling m68k-ooo RTL rather
-    // than leaving it an implementation-time guess: a recognized FPU instruction whose
-    // full length and required source state are captured uses the fall-through PC; a plain
-    // top-nibble line-F fallback with unknown/untrusted length keeps the faulting PC.
-    //
-    // THE RECOGNIZED SET (deliberately the ONE class whose length is unambiguous without
-    // any of the FPU decode work in Tasks 4/5, so this fix is independently landable and
-    // independently testable):
-    //     op[15:12]=1111, op[11:9]=001 (cpID), op[8:6]=000 (opclass: FPU general)
-    //     ext[15:13]=000  -> R/M=0: the SOURCE is a floating-point REGISTER, so the <ea>
-    //                        field is IGNORED and the instruction is EXACTLY 2 words,
-    //                        unconditionally, whatever the <ea> bits happen to say.
-    // That is the register-to-register form of every transcendental / rounded-precision /
-    // otherwise-non-hardware-native FPU op -- precisely the population that must reach
-    // FPSP, with its complete source state already sitting in the FP register file.
-    //
-    // GATED ON `pkt.lenWords === 2`, not merely on the bit pattern. PredecodeWord frames
-    // this class as 2 words only when the extension word was actually resident in the
-    // cache line being predecoded (see its `extWKnown` guard); if it was not, predecode
-    // falls back to 1-word framing and marks the line ambiguous, and this gate then
-    // correctly declines to promise a fall-through PC we cannot compute. Length
-    // correctness is the whole safety argument for faultUsesNextPc -- do not weaken it to
-    // a pure opword/ext match.
-    //
-    // The vector stays 11 (set by the `bad` block above) and the FRAME FORMAT stays
-    // format-$2 (ExceptionUnit.scala:769-771 already includes vector 11 in its `is2`
-    // term, confirmed correct against m68k-ooo by the same 2026-08-09 audit). This block
-    // changes ONLY which PC lands in the frame's PC field.
-    val fpuGenReg = (op(15 downto 12) === B"4'hF") &&
-                    (op(11 downto 9)  === B"3'b001") &&
-                    (op(8 downto 6)   === B"3'b000") &&
-                    (pkt.words(1)(15 downto 13) === B"3'b000") &&
-                    (pkt.lenWords === U(2, pkt.lenWords.getWidth bits))
-    when(bad && fpuGenReg) {
+    // ── FSAVE unimplemented-instruction-frame trigger (Task 10, reduced scope) ──────
+    // Reuses Task 6's own `fpFormIsReg`/`fpExt` locals -- NOT a re-derivation. Gated on
+    // `bad` (this fires only on the trapping path) and on lenWords===2 exactly (not >=2):
+    // the register-to-register form is ALWAYS exactly 2 words when its extension word was
+    // actually resident at predecode time (Task 5's fpIsRegForm arm); if it was not
+    // resident, predecode falls back to 1-word framing + ambiguousLine (Task 5's
+    // `!extWKnown` arm), and this gate correctly declines rather than promising a frame
+    // trigger built from words that were never really there.
+    val fpuGenRegUnimpl = bad && spec.fpGeneric && fpFormIsReg && pkt.simple &&
+                          (pkt.lenWords === U(2, pkt.lenWords.getWidth bits))
+    when(fpuGenRegUnimpl) {
       opUop.fpuSoftwareComplete := True
-      opUop.fpuCmdWord          := pkt.words(1)
-      // nextPc is already `pkt.pc + (pkt.lenWords << 1)` (line 682) = pc + 4 here, and the
-      // ROB captures Mux(faultUsesNextPc, nextPc, pc) into faultPcStore at ALLOC
-      // (RobPlugin.scala:861/886) -- the same alloc-time capture CHK/DIV0 rely on.
-      opUop.faultUsesNextPc     := True
+      opUop.fpuCmdWord          := fpExt   // == pkt.words(1)
     }
 ```
 
-- [ ] **Step 4: `PredecodeWord.scala` — 2-word framing for the recognized class**
+(`bad && spec.fpGeneric` is not redundant belt-and-braces: `bad` alone can be True for
+totally unrelated non-FP illegal encodings, whose `pkt.words(1)` bits could coincidentally
+match `fpFormIsReg`'s pattern by chance. The explicit `spec.fpGeneric` guard is required —
+this is the same discipline Task 6's own `fpLenKnown` already applies.)
 
-Add to the `is(U(0xF, 4 bits))` arm, *after* Task 9's FMOVE-control branch (whose `ext[15:13]` is 100/101 and therefore cannot collide with this one's 000) and before the `0xF27F` FSF case:
-
-```scala
-        // Recognized register-to-register FPU general instruction (Task 10): cpID=001,
-        // opclass 000, ext[15:13]=000 (R/M=0, source is FPm) -> the <ea> field is IGNORED
-        // and the length is EXACTLY 2 words. Framing this correctly is the precondition
-        // for MicroOpAssembler's faultUsesNextPc promise: it gates on lenWords===2, so if
-        // the extension word is not resident here we fall back to the pre-existing 1-word
-        // framing + ambiguousLine, and the assembler correctly declines the promise.
-        } .elsewhen((op(11 downto 9) === B"3'b001") && (op(8 downto 6) === B"3'b000") &&
-                    (extW(15 downto 13) === B"3'b000")) {
-          when(extWKnown) { r.simple := True; r.lenWords := U(2, 4 bits) }
-          .otherwise      { r.simple := True; r.lenWords := U(1, 4 bits); r.ambiguousLine := True }
-```
-
-- [ ] **Step 5: Update the exhaustive line-F sweep (it will otherwise fail — by design)**
-
-`MicroOpAssemblerSpec`'s "line-F: every UNIMPLEMENTED opword faults to vector 11, exhaustively" test currently asserts `usesNextPc == false` for every swept opword, and its `drive(dut, op)` helper leaves `words(1) = 0` (so `ext[15:13] = 000`) and `lenWords = 1`. With Step 4 landed, the *sweep's own driving* still uses `len = 1`, so the `pkt.lenWords === 2` gate declines and the sweep still sees `usesNextPc == false` for the whole range. **That is a false negative, not a pass** — the sweep would silently stop covering the new behavior. Fix it by driving the recognized class at its real length and asserting the real expectation:
+- [ ] **Step 4: Directed decode-level test**
 
 ```scala
-// src/test/scala/m68k040/decode/MicroOpAssemblerSpec.scala
-// Replace the body of the line-F sweep's loop with a length-aware drive:
-      for (op <- 0xF000 to 0xFFFF if !implemented(op)) {
-        // The recognized register-to-register FPU class (cpID=001, opclass 000, ext=0 ->
-        // ext[15:13]=000) is 2 words; everything else in line F is framed as 1 word by
-        // PredecodeWord. Drive each at its REAL framed length, or the lenWords gate in
-        // MicroOpAssembler silently masks the very behavior this sweep exists to pin.
-        val fpuGenReg = ((op & 0xFE00) == 0xF200) && ((op & 0x01C0) == 0x0000)
-        drive(dut, op, len = if (fpuGenReg) 2 else 1); sleep(1)
-        swept += 1
-        val faulted = dut.uop.faulted.toBoolean
-        val vec     = dut.uop.faultVector.toInt
-        val unimpl  = dut.uop.unimplemented.toBoolean
-        val nextPc  = dut.uop.faultUsesNextPc.toBoolean
-        // Task 10: a RECOGNIZED FPU instruction still faults to vector 11 (architectural
-        // vector unchanged) but stacks the POST-instruction PC so an FPSP handler can RTE
-        // past it. Every OTHER line-F opword keeps the faulting PC.
-        val wantNextPc = fpuGenReg
-        if (!faulted || vec != 11 || !unimpl || nextPc != wantNextPc)
-          bad += f"0x$op%04X faulted=$faulted vec=$vec unimpl=$unimpl usesNextPc=$nextPc want=$wantNextPc"
-      }
-```
+// src/test/scala/m68k040/decode/FpAssembleSpec.scala -- append inside the class:
 
-The line-A sweep is untouched: line A must keep `faultUsesNextPc == false` (its own comment explains why — the Toolbox dispatcher reads the trap word back from the stacked address), and this task's gate cannot match it.
-
-- [ ] **Step 6: Directed regression test — an FPSP-style handler RTEs past a software-completed instruction**
-
-Whitebox, not lock-step: Musashi has no unimplemented-instruction trap for this class at all (spec Decision 3), and its CPU_TYPE_68040 coprocessor stubs claim this opword range outright — the same oracle gap `ExecuteLockStepSpec.scala:3620-3634` already documents for line F. The test drives the real `FullCoreDut` through the real decode/commit/exception path and asserts on architectural memory, exactly like `runCpushPriv` (`ExecuteLockStepSpec.scala:3695-3742`).
-
-```scala
-// src/test/scala/m68k040/lockstep/ExecuteLockStepSpec.scala
-
-  /** Task 10: a recognized FPU instruction (register-to-register FPU general, cpID=001,
-    * opclass 000, ext[15:13]=000) delivered to a vector-11 handler must stack the
-    * POST-instruction PC, so an FPSP-style handler that software-completes the op and
-    * plainly RTEs resumes on the NEXT instruction.
-    *
-    * `0xF200,0x0018` = FMOVE.X FP0,FP0 in the register-to-register encoding shape used
-    * here purely as a RECOGNIZED-but-not-hardware-native stand-in; what matters for this
-    * test is only that it matches the recognized class and is 4 bytes long. The handler is
-    * a MINIMAL FPSP: it does NOT patch the stacked PC (the whole point -- if the frame
-    * carried the faulting PC the plain RTE would loop forever), it just marks that it ran
-    * and returns.
-    *
-    * The format-$2 frame for vector 11 is UNCHANGED by this task and deliberately so
-    * (ExceptionUnit.scala:769-771; confirmed correct against m68k-ooo by the 2026-08-09
-    * audit). The frame's PC field is at offset +2, so the handler reads 2(%a7) to observe
-    * which PC was stacked -- that read is the actual assertion.
-    */
-  private def runFpuNextPcHandoff(mutationProof: Boolean): (Long, Long, Int) = {
-    val loadAddr = ProgramAssembler.DefaultLoadAddress
-    // d5 counts handler entries; d6 receives the stacked PC; d7 is set ONLY if execution
-    // reaches the instruction AFTER the trapping one.
-    val src =
-      "move.l #0x3000,%d0 ; movec %d0,%vbr ; move.l #handler,%d1 ; move.l %d1,0x302c ; " +
-      "moveq #0,%d5 ; moveq #0,%d7 ; " +
-      "trapping: .short 0xF200,0x0018 ; " +
-      "moveq #1,%d7 ; " +
-      "loop: bra loop ; " +
-      "handler: addq.l #1,%d5 ; move.l 2(%a7),%d6 ; rte"
-    val image = ProgramAssembler.assemble(src, loadAddr) match {
-      case Right(i) => i
-      case Left(e)  => fail(s"assemble failed: ${e.reason}")
+  test("Task 10: a recognized-but-non-native register-form FP op captures fpuSoftwareComplete/fpuCmdWord", VerilatorTest) {
+    run { dut =>
+      // FSIN FP1,FP0 (opmode 0x0E, non-native, register form) -- ext = 0x0000|... let's
+      // use the SAME literal Task 6's own directed test already uses: ext=0x000E, dst=FP0.
+      drive(dut, op = 0xF200, ext = 0x000E, len = 2); sleep(1)
+      assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 11)
+      assert(dut.uop.faultUsesNextPc.toBoolean, "set by Task 6's fpLenKnown, not this task")
+      assert(dut.uop.fpuSoftwareComplete.toBoolean,
+        "the register-to-register form must ALSO set this task's own trigger bit")
+      assert(dut.uop.fpuCmdWord.toInt == 0x000E, "fpuCmdWord must carry the raw ext word verbatim")
     }
-    var stackedPc = 0L; var reachedAfter = 0L; var entries = 0
-    compiledDut.doSim(freshSimName(if (mutationProof) "fpu-nextpc-mut" else "fpu-nextpc")) { dut =>
-      val cd = dut.clockDomain
-      cd.forkStimulus(10)
-      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
-      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
-      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
-      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
-      dut.wire.logic.seedValid #= false
-      cd.waitSampling(2)
-      dut.icache.logic.invalidateAll #= true; cd.waitSampling(); dut.icache.logic.invalidateAll #= false
-      cd.waitSampling(80)
-      dut.rob.logic.exc.ss.isp #= 0x00100000L
-      dut.rob.logic.exc.ss.cacr #= 0x80008000L
-      dut.rob.logic.exc.ss.srSys #= 0x27
-      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15
-      dut.wire.logic.seedData #= BigInt(0x00100000L)
-      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
-      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
-      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
-      // Bounded run: an infinite re-trap loop (the pre-fix behavior) burns the budget and
-      // leaves d7 == 0 with d5 climbing -- which is exactly what the mutation-proof test
-      // asserts, so the budget MUST be generous enough that the correct path finishes.
-      cd.waitSampling(3000)
-      stackedPc    = dut.wire.logic.dbgArchReg(6).toLong
-      reachedAfter = dut.wire.logic.dbgArchReg(7).toLong
-      entries      = dut.wire.logic.dbgArchReg(5).toInt
+  }
+
+  test("Task 10: an immediate-source or memory-source trap does NOT set fpuSoftwareComplete", VerilatorTest) {
+    run { dut =>
+      // FADD.L #imm,FP0, non-native opmode -- wait, use a genuinely non-native immediate
+      // form: reuse Task 6's FADD.P (packed) trap, which is opclass 010, NOT
+      // fpFormIsReg, so fpuGenRegUnimpl must NOT fire even though faultUsesNextPc does.
+      drive(dut, op = 0xF23C, ext = 0x4C22, ext2 = 0x0000, len = 8)
+      sleep(1)
+      assert(dut.uop.faulted.toBoolean && dut.uop.faultUsesNextPc.toBoolean,
+        "Task 6's broader gate still fires (this is exactly WHY fpuSoftwareComplete must stay narrower)")
+      assert(!dut.uop.fpuSoftwareComplete.toBoolean,
+        "an opclass-010 trap must NOT set fpuSoftwareComplete -- Task 11 would misread ext[12:10] as an FP register number")
+      assert(dut.uop.fpuCmdWord.toInt == 0, "fpuCmdWord stays zero for anything outside the narrow trigger population")
     }
-    (stackedPc, reachedAfter, entries)
-  }
-
-  test("Task 10: recognized FPU instr stacks the POST-instruction PC; handler RTEs past it", VerilatorTest) {
-    val (stackedPc, reachedAfter, entries) = runFpuNextPcHandoff(mutationProof = false)
-    val trappingPc = /* address of the `trapping:` label -- recompute from the assembled
-                        image's symbol table, do not hardcode */ ProgramAssembler
-      .assemble("", 0).fold(_ => 0L, _ => 0L)
-    assert(entries == 1,
-      s"the handler must be entered EXACTLY ONCE; got $entries entries (>1 means it re-trapped on the same opword)")
-    assert(reachedAfter == 1,
-      "execution must reach the instruction AFTER the trapping one -- a plain RTE past a software-completed op")
-    assert(stackedPc == trappingPc + 4,
-      f"the format-$2 frame's PC field must be the POST-instruction PC (trapping+4); got 0x$stackedPc%08X")
   }
 ```
 
-(Replace the `trappingPc` placeholder with the real symbol lookup this spec already uses for its other label-relative assertions — `grep -n "image.symbols\|labelAddr" src/test/scala/m68k040/lockstep/ExecuteLockStepSpec.scala` and reuse whatever accessor exists. Do **not** hardcode an address; `ProgramAssembler.DefaultLoadAddress` plus a hand-counted byte offset is exactly the kind of brittle constant this suite has been bitten by before.)
-
-- [ ] **Step 7: Mutation-proof test — prove the OLD behavior infinite-loops**
-
-```scala
-  /** MUTATION PROOF for Step 6. If the Task 10 fix is reverted (faultUsesNextPc left False
-    * for the recognized class), the format-$2 frame carries the FAULTING PC, the handler's
-    * plain RTE lands back ON the same opword, and the trap re-fires forever. This test
-    * pins that failure mode DIRECTLY rather than trusting Step 6's positive assertion to
-    * notice: it asserts the handler is entered exactly once and that execution escapes.
-    * Both assertions fail loudly (many entries, never escaped) under the reverted code.
-    *
-    * HOW TO VERIFY THIS TEST ACTUALLY BITES (do this once, by hand, and record the numbers
-    * in the commit message -- a mutation-proof test that was never mutated proves nothing):
-    *   1. Comment out the `opUop.faultUsesNextPc := True` line in MicroOpAssembler's
-    *      `when(bad && fpuGenReg)` block.
-    *   2. Re-run this test. It MUST fail, with entries >> 1 and reachedAfter == 0.
-    *   3. Restore the line; the test passes again.
-    */
-  test("Task 10 mutation proof: with faultUsesNextPc=False the handler would re-trap forever", VerilatorTest) {
-    val (_, reachedAfter, entries) = runFpuNextPcHandoff(mutationProof = true)
-    assert(entries == 1,
-      s"MUTATION SENTINEL: entries=$entries. >1 means the frame carried the FAULTING PC and " +
-      "the handler re-entered on the same opword -- i.e. the Task 10 fix is absent or reverted.")
-    assert(reachedAfter == 1,
-      "MUTATION SENTINEL: execution never escaped the trapping instruction -- the classic " +
-      "FPSP re-trap livelock the 2026-08-09 design spec section 5 predicted.")
-  }
-```
-
-- [ ] **Step 8: Run the tests**
+- [ ] **Step 5: Run the tests**
 
 ```bash
-sbt "testOnly m68k040.decode.MicroOpAssemblerSpec"
-```
-Expected: PASS, including both exhaustive sweeps (line A unchanged; line F now asserting `usesNextPc == true` for exactly the 512-opword recognized class and `false` for everything else).
-
-```bash
-sbt "testOnly m68k040.frontend.PredecodeWordSpec"
-```
-Expected: PASS. **Caveat, recorded in this project's own memory:** `PredecodeWordSpec`'s "exhaustive 65536-opword" test aborts at the first mismatch, so a green result is *not* proof of exhaustive coverage — do not report it as such.
-
-- [ ] **Step 9: Confirm the existing lock-step suite is unaffected**
-
-```bash
+sbt "testOnly m68k040.decode.FpAssembleSpec"
 sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
 ```
-Expected: 397/397 from Task 9, plus the two new tests from Steps 6-7 (399). Watch specifically that "lock-step: line-F opcode -> vector 11 -> handler via VBR+0x2c -> RTE" (`ExecuteLockStepSpec.scala:3660`) still passes — its opword `0xFD00` has cpID=110 and is outside the recognized class, so its handler's explicit `addq.l #2` PC patch must keep working exactly as before. If that test flips, the recognized-set predicate is too wide.
+Expected: PASS; lock-step suite unchanged (see Task 6 Step 11 for the exhaustive-sweep
+coverage of the broader `faultUsesNextPc` behavior — this task's own tests are decode-level
+only, since there is nothing observable end-to-end until Task 11's FSAVE exists to read
+`fpuSoftwareComplete` back out).
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/main/scala/m68k040/decode/DecodedUop.scala \
         src/main/scala/m68k040/decode/MicroOpAssembler.scala \
-        src/main/scala/m68k040/frontend/PredecodeWord.scala \
         src/main/scala/m68k040/rename/RenamedUop.scala \
         src/main/scala/m68k040/rename/RenameStage.scala \
-        src/test/scala/m68k040/decode/MicroOpAssemblerSpec.scala \
-        src/test/scala/m68k040/lockstep/ExecuteLockStepSpec.scala
-git commit -m "fix(exception): post-instruction-PC vector-11 delivery for recognized FPU ops
+        src/test/scala/m68k040/decode/FpAssembleSpec.scala
+git commit -m "feat(fpu): FSAVE unimplemented-instruction-frame trigger fields
 
-Closes a real, already-diagnosed gap recorded in the 2026-08-09 FPU
-hardware design spec, section 5: this core had NO post-instruction-PC
-flavor of vector-11 delivery at all. MicroOpAssembler's generic line-F
-fallback raises vector 11 and leaves faultUsesNextPc at its False
-default, so the format-\$2 frame always carried the FAULTING PC. An
-FPSP-style handler that software-completes a recognized FPU instruction
-and then plainly RTEs therefore lands back ON the same opword and
-re-traps forever -- the exact livelock class m68k-ooo hit four times on
-real hardware.
+Adds fpuSoftwareComplete/fpuCmdWord, needed by Task 11's FSAVE
+unimplemented-instruction frame capture. REDUCED SCOPE vs an earlier
+draft of this task: the faultUsesNextPc fix and the register-to-register-
+form PredecodeWord framing this task used to duplicate are now owned
+entirely by Task 6 (whose fpLenKnown gate is a strict superset) and
+Task 5 (whose general cpGEN framing already covers the register form)
+respectively. This task now does exactly one thing: capture the two
+fields Task 11 reads.
 
-The trigger is not an implementation-time guess: the same vector-by-
-vector audit that found the gap resolved it from the sibling RTL. A
-recognized FPU instruction whose full length and required source state
-are captured uses the fall-through PC; a plain top-nibble line-F
-fallback with unknown length keeps the faulting PC. The architectural
-vector stays 11 in both cases -- m68k-ooo's internal 0x8B pseudo-vector
-is deliberately NOT replicated, since faultUsesNextPc is already a
-fully-wired mechanism here (RenamedUop -> RenameStage:154 ->
-RobPlugin:861/886's alloc-time faultPcStore capture, the same path CHK
-and DIV0 already depend on).
-
-The recognized set is deliberately narrow and self-contained: line-F,
-cpID=001, opclass 000, ext[15:13]=000 -- the register-to-register FPU
-general form, where R/M=0 means the <ea> field is IGNORED and the
-instruction is EXACTLY 2 words regardless of what those bits say. That
-is every transcendental / rounded-precision / non-hardware-native op in
-its register-source form, i.e. precisely the population that must reach
-FPSP, with complete source state already in the FP register file. The
-promise is gated on pkt.lenWords===2, not on the bit pattern alone:
-PredecodeWord only frames 2 words when the extension word was actually
-resident in the line being predecoded, so a not-yet-resident ext word
-correctly declines the fall-through PC instead of promising one we
-cannot compute. Length correctness IS the safety argument here.
-
-Frame FORMAT is untouched. ExceptionUnit's `is2` term already includes
-vector 11, confirmed correct against m68k-ooo across both of its
-vector-11 paths by the same audit (13 of 13 other vector/format pairs
-matched too). This change selects the PC field's value and nothing else.
-
-Verified by a directed test that installs a minimal FPSP-shaped handler
-which does NOT patch the stacked PC and returns via a plain RTE, plus a
-mutation-proof sibling that pins the reverted behavior (many handler
-entries, execution never escapes). The mutation was actually performed
-by hand, not merely asserted -- numbers in the review notes. The
-exhaustive line-F opword sweep in MicroOpAssemblerSpec was updated to
-drive each opword at its REAL framed length, since the old fixed
-len=1 drive would have silently masked the new behavior behind the
-lenWords gate.
+The trigger population is DELIBERATELY NARROWER than Task 6's own
+faultUsesNextPc gate, and this is safety-load-bearing, not incidental:
+Task 11's operand capture reads fpuCmdWord's ext[12:10]/ext[9:7] bits AS
+FP REGISTER NUMBERS to address the FP RAT, which is only a valid
+interpretation for the register-to-register cpGEN form (R/M=0). Every
+other cpGEN form uses those same bit positions for something else (a
+source-data format specifier, or unused/reserved bits), so broadening
+this trigger to match Task 6's fuller population without also fixing
+Task 11's operand-capture logic would silently address the wrong
+physical FP register for memory/immediate-source FPU traps -- confirmed
+by direct read of Task 11's ExceptionUnit.scala code before making this
+call, not assumed.
 
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 ```
+
+### New Task 6 Step 11 (the exhaustive-sweep coverage gap for `faultUsesNextPc`)
+
+Task 6's own Step 11 (see that task) covers the exhaustive line-F sweep for the broader
+`faultUsesNextPc` gate this task builds on — an earlier draft of *this* task had its own
+narrower sweep fix for its own narrower predicate; that job now belongs entirely to Task 6,
+since its `fpLenKnown` gate is the one the sweep actually needs to exercise. This task keeps
+no sweep test of its own.
 
 ---
 
@@ -7722,7 +9471,12 @@ Expected: all PASS.
 ```bash
 sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
 ```
-Expected: 399/399 from Task 10, unchanged. Nothing here touches a lock-steppable path.
+Expected: unchanged from whatever count Task 9b (FMOVEM control-list) landed at. Nothing
+here touches a lock-steppable path. (Not a hardcoded number: with Task 10 reduced to a
+decode-only scope it no longer adds any lock-step tests, and Task 9b's own landed count is
+itself data-dependent on how many lock-step-eligible tests its Step 9 actually adds — see
+that task's own honest flag. Confirm the actual current count before writing it into this
+task's commit message; do not copy a number from this text.)
 
 Then re-run the FSAVE family of the acceptance corpus and record the outcome against the classification made at the top of this task:
 
@@ -8326,7 +10080,10 @@ Expected: `OracleFpTraceSpec` both tests PASS; existing oracle tests unchanged.
 ```bash
 sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
 ```
-Expected: 396/396 PASS, unchanged from the pre-Task-12 baseline.
+Expected: unchanged from whatever count Task 11 left the suite at (NOT a hardcoded "394" —
+that figure is only correct before Tasks 9/9b/11 land any lock-step tests of their own; by
+Task 12 the real baseline has moved. Confirm the actual current count, do not copy a stale
+number forward.)
 
 - [ ] **Step 12: Commit**
 
@@ -8401,11 +10158,15 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 Scope, stated plainly: this task covers the **register-to-register** forms of FADD,
 FSUB, FMUL, FDIV, FSQRT, FABS, FNEG, FCMP, FINT, FINTRZ, FTST, FMOVECR, plus the
-`FMOVE.L #imm,FPn` and `FMOVE.X <ea>,FPn` loads needed to establish operands at all.
-**Memory-source forms beyond those two loads, and FMOVEM, are an explicitly smaller
-follow-up subset and are NOT covered here** — Musashi is separately known to have
-buggy multi-register FMOVEM EA handling (Decision 3), so FMOVEM is not
-lock-steppable regardless.
+`FMOVE.L #imm,FPn` and `FMOVE.X #imm,FPn` (Extended-immediate) loads needed to
+establish operands at all — including exotic bit patterns (±Infinity, QNaN, a
+fractional value) that cannot be expressed as an integer `#imm` and, as this task
+verified live during plan-writing, cannot be reliably expressed via GAS's decimal
+floating-point literal syntax either (see the immX() helper's doc comment).
+**Memory-source forms (register-indirect/displacement/indexed/PC-relative `<ea>`
+loads — Task 6b's job), and FMOVEM, are an explicitly smaller follow-up subset and
+are NOT covered here** — Musashi is separately known to have buggy multi-register
+FMOVEM EA handling (Decision 3), so FMOVEM is not lock-steppable regardless.
 
 The following was all confirmed by direct experiment during plan-writing: gas
 `-m68040` assembles every mnemonic above (e.g. `fadd.x %fp1,%fp0` -> `F200 0422`,
@@ -8413,7 +10174,13 @@ The following was all confirmed by direct experiment during plan-writing: gas
 %fpsr,%d2` -> `F202 A800`); Musashi executes all of them for `M68K_CPU_TYPE_68040`
 without a `fatalerror` or a line-F trap; and the `;`-joined single-line program form
 assembles and traces correctly through the existing `ProgramAssembler`/
-`Musashi.assembleAndTrace` path.
+`Musashi.assembleAndTrace` path. Also confirmed live: GAS's `fmove.x #0r<value>,%fpN`
+decimal-literal syntax assembles WITHOUT error but omits the mandatory explicit
+integer bit (bit 63) from the resulting extended-precision pattern -- e.g.
+`#0r1.0` assembles to mantissa `0x0000000000000000` where real 68881/68040 hardware
+and Musashi's own floatx80 both require `0x8000000000000000`. This is why every
+exotic-constant load in this file uses raw `.short`-encoded words (`immX()`, via
+Task 6's Extended-immediate FMOVE hardware path) instead of a GAS floating literal.
 
 - [ ] **Step 1: Add the sim-only FP PRF shadow — the committed FP value is NOT
   readable any other way**
@@ -8539,20 +10306,50 @@ class FpuLockStepSpec extends AnyFunSuite {
       FpCompare.assertFpEqual(dutFp(dut, r), last.fp(r), s"[$name] FP$r")
   }
 
-  private def ext(label: String, high: Int, low: BigInt): String = {
+  /** Loads an 80-bit extended-precision constant DIRECTLY into FPn via the
+    * Extended-immediate FMOVE form Task 6 added: `FMOVE.X #<80-bit-lit>,FPn`
+    * -- opclass 010, source specifier 010 (Extended), <ea> = mode 7 / reg 4 (#imm). Opword
+    * is always 0xF23C; ext = 0x4800 | (dst<<7) (opclass=010<<13=0x4000, srcSpec=Extended=
+    * 010<<10=0x0800, dst<<7, opmode=0x00 FMOVE) -- cross-checked against GAS's own real
+    * assembler output for `fmove.l #5,%fp0` (ext=0x4000) and `fmove.x #0r1.5,%fp2`
+    * (ext=0x4900 = 0x4000|0x0800|(2<<7)), both confirmed live in this session. Followed by
+    * the SAME 6-word raw layout Musashi's load_extended_float80/READ_EA_FPE case 4 uses:
+    * word0 = sign+exponent, word1 = reserved (always zero here), words2-3 = mantissa
+    * high 32 bits, words4-5 = mantissa low 32 bits (m68kfpu.c:64-77,684-711 -- re-verified
+    * in-session against the vendored source).
+    *
+    * WHY RAW WORDS, NOT A GAS FLOATING LITERAL (`fmove.x #0r<value>,%fpN`): verified live
+    * in this session that GAS's own `#0r<value>` extended-immediate encoder does NOT set
+    * the explicit integer bit (bit 63) that real 68881/68040 hardware and Musashi's
+    * floatx80 both require for every normalized/infinite/NaN value -- e.g.
+    * `fmove.x #0r1.0,%fp0` assembles to mantissa 0x0000000000000000, not the required
+    * 0x8000000000000000 (checked against #0r2.0, #0r0.5, #0r3.0, #0r1.5 too -- consistent,
+    * reproducible, not a one-off). Since several of these constants (QNaN/SNaN/Infinity)
+    * need an EXACT, independently-verifiable bit pattern, and GAS's decimal path cannot
+    * even express NaN/Inf with a guaranteed encoding, raw words are the only safe choice
+    * -- exactly the fallback this task's own text anticipated. */
+  private def immX(dst: Int, high: Int, low: BigInt): String = {
+    require(dst >= 0 && dst < 8, s"FP dst must be 0..7, got $dst")
+    val extWord = 0x4800 | (dst << 7)
     val hi32 = ((low >> 32) & 0xffffffffL).toLong
     val lo32 = (low & 0xffffffffL).toLong
-    f"$label: .short 0x$high%04X ; .short 0 ; .long 0x$hi32%08X ; .long 0x$lo32%08X"
+    f".short 0xF23C ; .short 0x$extWord%04X ; .short 0x$high%04X ; .short 0 ; .long 0x$hi32%08X ; .long 0x$lo32%08X"
   }
 
-  private val PosInf = ("c_pinf", 0x7FFF, BigInt("8000000000000000", 16))
-  private val NegInf = ("c_ninf", 0xFFFF, BigInt("8000000000000000", 16))
-  private val QNan   = ("c_qnan", 0x7FFF, BigInt("C0000000DEADBEEF", 16))
-  private val Frac   = ("c_frac", 0xC000, BigInt("B400000000000000", 16))
+  private val PosInf = (0x7FFF, BigInt("8000000000000000", 16))
+  private val NegInf = (0xFFFF, BigInt("8000000000000000", 16))
+  private val QNan   = (0x7FFF, BigInt("C0000000DEADBEEF", 16))
+  private val Frac   = (0xC000, BigInt("B400000000000000", 16))
 
-  private def prog(instrs: Seq[String], consts: Seq[(String, Int, BigInt)] = Seq.empty): String =
-    (instrs ++ Seq("spin: bra.s spin", ".align 2") ++
-      consts.map { case (l, h, lo) => ext(l, h, lo) }).mkString(" ; ")
+  private def prog(instrs: Seq[String]): String =
+    (instrs :+ "spin: bra.s spin").mkString(" ; ")
+
+  // NOTE: `prog`'s old `consts` parameter is dropped -- nothing in this file needs a
+  // labeled PC-relative memory constant any more (every constant load below is now a
+  // self-contained immediate instruction via `immX()`, no trailing data block needed). If
+  // a future test in this file genuinely needs a real memory-resident FP constant (e.g. to
+  // test Task 6b's memory-source FMOVE once it lands), re-add a `consts`/`ext()`-shaped
+  // helper then -- don't carry dead machinery now.
 
   // ── Normal-value round trip, one per op ──────────────────────────────────
 
@@ -8602,11 +10399,11 @@ class FpuLockStepSpec extends AnyFunSuite {
 
   test("lock-step FP: FABS.X / FNEG.X (sign-only, mantissa untouched)", VerilatorTest) {
     val instrs = Seq(
-      s"fmove.x ${Frac._1}(%pc),%fp4",
+      immX(4, Frac._1, Frac._2),
       "fabs.x %fp4,%fp5",
       "fneg.x %fp4,%fp6",
       "fneg.x %fp5,%fp7")
-    h.runLockStep("fp-fabs-fneg", prog(instrs, Seq(Frac)), nInstr = instrs.size,
+    h.runLockStep("fp-fabs-fneg", prog(instrs), nInstr = instrs.size,
       afterRun = { (dut, oracle) =>
         expectFp("fp-fabs-fneg", 4, 5, 6, 7)(dut, oracle)
         FpCompare.assertFpBits(dutFp(dut, 5), "4000b400000000000000", "fp-fabs FP5 = +2.8125")
@@ -8617,10 +10414,10 @@ class FpuLockStepSpec extends AnyFunSuite {
 
   test("lock-step FP: FINT vs FINTRZ disagree on -2.8125 (-3.0 vs -2.0)", VerilatorTest) {
     val instrs = Seq(
-      s"fmove.x ${Frac._1}(%pc),%fp0",
+      immX(0, Frac._1, Frac._2),
       "fint.x %fp0,%fp1",
       "fintrz.x %fp0,%fp2")
-    h.runLockStep("fp-fint", prog(instrs, Seq(Frac)), nInstr = instrs.size,
+    h.runLockStep("fp-fint", prog(instrs), nInstr = instrs.size,
       afterRun = { (dut, oracle) =>
         expectFp("fp-fint", 0, 1, 2)(dut, oracle)
         FpCompare.assertFpBits(dutFp(dut, 1), "c000c000000000000000", "fp-fint FP1 = -3.0 (RN)")
@@ -8646,12 +10443,12 @@ class FpuLockStepSpec extends AnyFunSuite {
 
   test("lock-step FP: NaN propagates bit-for-bit through FADD/FMUL/FSUB", VerilatorTest) {
     val instrs = Seq(
-      s"fmove.x ${QNan._1}(%pc),%fp0",
+      immX(0, QNan._1, QNan._2),
       "fmove.l #7,%fp1",
       "fmove.x %fp0,%fp2", "fadd.x %fp1,%fp2",
       "fmove.x %fp0,%fp3", "fmul.x %fp1,%fp3",
       "fmove.x %fp0,%fp4", "fsub.x %fp1,%fp4")
-    h.runLockStep("fp-nan", prog(instrs, Seq(QNan)), nInstr = instrs.size,
+    h.runLockStep("fp-nan", prog(instrs), nInstr = instrs.size,
       afterRun = { (dut, oracle) =>
         expectFp("fp-nan", 0, 1, 2, 3, 4)(dut, oracle)
         for (r <- Seq(2, 3, 4))
@@ -8670,15 +10467,15 @@ class FpuLockStepSpec extends AnyFunSuite {
 
   test("lock-step FP: infinity arithmetic (inf+finite, inf-inf, inf*0, inf/inf)", VerilatorTest) {
     val instrs = Seq(
-      s"fmove.x ${PosInf._1}(%pc),%fp0",
-      s"fmove.x ${NegInf._1}(%pc),%fp1",
+      immX(0, PosInf._1, PosInf._2),
+      immX(1, NegInf._1, NegInf._2),
       "fmove.l #7,%fp2",
       "fmove.l #0,%fp3",
       "fmove.x %fp0,%fp4", "fadd.x %fp2,%fp4",
       "fmove.x %fp0,%fp5", "fadd.x %fp1,%fp5",
       "fmove.x %fp0,%fp6", "fmul.x %fp3,%fp6",
       "fmove.x %fp0,%fp7", "fdiv.x %fp0,%fp7")
-    h.runLockStep("fp-inf", prog(instrs, Seq(PosInf, NegInf)), nInstr = instrs.size,
+    h.runLockStep("fp-inf", prog(instrs), nInstr = instrs.size,
       afterRun = { (dut, oracle) =>
         expectFp("fp-inf", 0, 1, 2, 3, 4, 5, 6, 7)(dut, oracle)
         FpCompare.assertFpBits(dutFp(dut, 4), "7fff8000000000000000",
@@ -8702,18 +10499,18 @@ class FpuLockStepSpec extends AnyFunSuite {
     // N/Z, never I) and empirically on the real oracle (FPSR 0x02000000 after FTST of
     // +inf, 0x04000000 after FCMP +inf,+inf).
     val instrs = Seq(
-      s"fmove.x ${PosInf._1}(%pc),%fp0",
-      s"fmove.x ${PosInf._1}(%pc),%fp1",
+      immX(0, PosInf._1, PosInf._2),
+      immX(1, PosInf._1, PosInf._2),
       "ftst.x %fp0",
       "fmove.l %fpsr,%d0",
       "fcmp.x %fp1,%fp0",
       "fmove.l %fpsr,%d1",
-      s"fmove.x ${NegInf._1}(%pc),%fp2",
+      immX(2, NegInf._1, NegInf._2),
       "ftst.x %fp2",
       "fmove.l %fpsr,%d2",
       "fcmp.x %fp2,%fp0",
       "fmove.l %fpsr,%d3")
-    h.runLockStep("fp-ftst-vs-fcmp", prog(instrs, Seq(PosInf, NegInf)),
+    h.runLockStep("fp-ftst-vs-fcmp", prog(instrs),
       nInstr = instrs.size,
       afterRun = { (dut, oracle) =>
         val last = oracle.last
@@ -8759,9 +10556,11 @@ weaken the tests to make them pass early.
 sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
 sbt "runMain m68k040.top.GenFullCoreSynthVerilog"
 ```
-Expected: 396/396 PASS unchanged, and Verilog generation succeeds (this specifically
-guards the `GenerationFlags.simulation` guards — `shadow` is `null` in a synth build,
-so any unguarded reference is an immediate NPE, not a silent area cost).
+Expected: unchanged from whatever count Task 12 left the suite at (not a hardcoded "394" —
+that figure only holds before Tasks 9/9b/11 land their own lock-step tests; confirm the
+actual current count), and Verilog generation succeeds (this specifically guards the
+`GenerationFlags.simulation` guards — `shadow` is `null` in a synth build, so any unguarded
+reference is an immediate NPE, not a silent area cost).
 
 - [ ] **Step 6: Commit**
 
@@ -9331,12 +11130,15 @@ archive directory together.
 
 - [ ] **Step 9: Escalation path (ONLY if Step 6 routed here — `FAILED_AT_200`)**
 
-**Do not silently accept this result. Do not silently revert Tasks 1-15. Stop and report to
-the user for an explicit decision.** Still archive the failing run (Step 7 unchanged), then
-report: the measured shortfall, the full utilization + per-pblock congestion tables (the CPLX
-cluster, where the FPU folds in, is the a priori suspect for new congestion per Decision 9),
-and the concrete options (accept + open a dedicated follow-up FMax-closure task targeting the
-FP writeback lane/arbiter; revert or narrow part of Tasks 1-15; retarget a floorplan pblock) —
+**Do not silently accept this result. Do not silently revert any prior task (1-15, plus 6b
+and 9b). Stop and report to the user for an explicit decision.** Still archive the failing
+run (Step 7 unchanged), then report: the measured shortfall, the full utilization + per-pblock
+congestion tables (the CPLX cluster, where the FPU folds in, is the a priori suspect for new
+congestion per Decision 9 — now with two additional microcoded ROM families, Task 6b's memory
+loads and Task 9b's FMOVEM control-list, both flagged for real ROM-growth scale in their own
+text), and the concrete options (accept + open a dedicated follow-up FMax-closure task
+targeting the FP writeback lane/arbiter; revert or narrow part of any prior task; retarget a
+floorplan pblock) —
 without choosing one unilaterally. Do NOT append a ledger §41 entry claiming completion in
 this branch — only once a real verdict (PASS or an explicitly-accepted-and-recorded
 regression) exists.
