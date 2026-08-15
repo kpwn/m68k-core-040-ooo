@@ -54,6 +54,7 @@ object MicroOpAssembler {
                    isLoad: Bool, first: Bool, drop: Bool, valid: Bool, pc: UInt, nextPc: UInt,
                    idxReg: UInt, idxValid: Bool, idxLong: Bool, idxScale: UInt): DecodedUop = {
     val u = DecodedUop()
+    u.fpInert()
     u.valid       := valid
     u.pc          := pc
     u.nextPc      := nextPc
@@ -113,6 +114,7 @@ object MicroOpAssembler {
     * for predec). It carries the nextPc so the ROB advances PC correctly at commit. */
   def movemAnUpdUop(an: UInt, signedDelta: SInt, valid: Bool, pc: UInt, nextPc: UInt): DecodedUop = {
     val u = DecodedUop()
+    u.fpInert()
     u.valid       := valid
     u.pc          := pc
     u.nextPc      := nextPc
@@ -164,6 +166,7 @@ object MicroOpAssembler {
     * macro's first emitted µop when present (the interrupt/firstOfInstr boundary). */
   def movemSnapUop(dst: UInt, src: UInt, valid: Bool, pc: UInt, nextPc: UInt): DecodedUop = {
     val u = DecodedUop()
+    u.fpInert()
     u.valid       := valid
     u.pc          := pc
     u.nextPc      := nextPc
@@ -215,6 +218,7 @@ object MicroOpAssembler {
     * pc/nextPc threaded for the macro commit. Mutated by the specific builders. */
   private def movepBase(pc: UInt, nextPc: UInt): DecodedUop = {
     val u = DecodedUop()
+    u.fpInert()
     // The specific builders below override a few fields (op/size/srcs/dst/flags) after
     // these defaults; allowOverride makes that last-wins (the defaults provide the inert
     // value for every field NOT touched by the builder, so no field is left UNASSIGNED).
@@ -683,6 +687,7 @@ object MicroOpAssembler {
 
     // ── opUop = the operation (EASRC operand routed to T0 when cracked) ────────
     val opUop = DecodedUop()
+    opUop.fpInert()
     opUop.valid         := pkt.valid
     opUop.pc            := pkt.pc
     opUop.nextPc        := nextPc
@@ -997,6 +1002,7 @@ object MicroOpAssembler {
     // Address = base An (psrcA) + disp(imm); for (d16,PC) the PC is folded into the
     // absolute disp (base=0). dst = T0.
     val ldUop = DecodedUop()
+    ldUop.fpInert()
     ldUop.valid         := pkt.valid
     ldUop.pc            := pkt.pc
     ldUop.nextPc        := nextPc
@@ -1112,6 +1118,7 @@ object MicroOpAssembler {
     // and writes the NZVC PRF (+ bypass) at completion. (MOVEA — to an address reg —
     // never reaches here: an address-reg dst is not memSimple.)
     val stUop = DecodedUop()
+    stUop.fpInert()
     stUop.valid         := pkt.valid
     stUop.pc            := pkt.pc
     stUop.nextPc        := nextPc
@@ -1162,6 +1169,7 @@ object MicroOpAssembler {
     // side effect, so base+disp recompute identically). data = T1 (the op result). NO
     // int dst, NO flags (the op µop owns NZVCX). firstOfInstr=False (a trailing µop).
     val rmwStUop = DecodedUop()
+    rmwStUop.fpInert()
     rmwStUop.valid         := pkt.valid
     rmwStUop.pc            := pkt.pc
     rmwStUop.nextPc        := nextPc
@@ -1472,12 +1480,19 @@ object MicroOpAssembler {
     // are now LEGAL (slice 2/3) — emitted as a 2-µop crack ([BFRESOLVE -> T0] [BITFIELD
     // bfDynamic]) below. There are no truly-illegal register-form Do/Dw combos. The
     // memory-operand forms (mode!=0) stay illegal via OperationDecoder (spec.illegal).
+    // F-line FP-generic: OperationDecoder now classifies the cpGEN family as non-illegal
+    // (Task 4) so that Task 6 can emit real FP uops for it. Until Task 6 lands, EVERY
+    // cpGEN encoding must still take the ordinary vector-11 F-line trap -- otherwise a
+    // spec.illegal=False + pkt.simple=True packet would fall through `bad` and emit a
+    // DecOp.FPU uop with entirely undriven operands. Task 6 NARROWS this term to
+    // "recognized-and-emittable" and leaves the rest here.
+    val fpGenBad = spec.fpGeneric
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isTrapccOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
               !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isLinkLOp && !isUnlkOp && !isExgOp &&
               !isLeaOp && !isPeaOp && !isMoveFromSrOp && !isMoveFromCcrOp && !isMoveToCcrOp &&
               !isSysOp && !isRtdBad && !isCmp2Chk2Enc && !isBfMemSpec &&
               (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || limmFullFmtDstBad || addqMemBad || sccMemBad ||
-               line4UnaryMemBad || aluRmwMemBad || bitOpMemBad || eaDstPcRelBad ||
+               line4UnaryMemBad || aluRmwMemBad || bitOpMemBad || eaDstPcRelBad || fpGenBad ||
                (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     // A JMP/JSR with a non-control EA is illegal (vector 4).
     val jmpBad = isJmpOp && !ctrlEaOk
@@ -1941,6 +1956,7 @@ object MicroOpAssembler {
     // convention — identical shape to CMP2/CHK2/the bit-field memory crack below.
     def divMulLoadUop(ea: EaSpec): DecodedUop = {
       val u = DecodedUop()
+      u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
       u.nextPc      := nextPc
@@ -2005,6 +2021,7 @@ object MicroOpAssembler {
 
     // DIV (quotient) µop.
     val divlUop = DecodedUop()
+    divlUop.fpInert()
     divlUop.valid         := pkt.valid
     divlUop.pc            := pkt.pc
     divlUop.nextPc        := nextPc
@@ -2062,6 +2079,7 @@ object MicroOpAssembler {
     // comes from the DivEu's internal latch, not this register read -- srcA exists
     // SOLELY to carry the old value through on the overflow path.
     val divremUop = DecodedUop()
+    divremUop.fpInert()
     divremUop.valid         := pkt.valid
     divremUop.pc            := pkt.pc
     divremUop.nextPc        := nextPc
@@ -2165,6 +2183,7 @@ object MicroOpAssembler {
 
     // MUL (low-product) µop. Writes Dl. Sets N/Z (+ V for the .L32 form).
     val mullUop = DecodedUop()
+    mullUop.fpInert()
     mullUop.valid         := pkt.valid
     mullUop.pc            := pkt.pc
     mullUop.nextPc        := nextPc
@@ -2233,6 +2252,7 @@ object MicroOpAssembler {
     // new memSimple-multiplier path, which has no prior working behavior to regress).
     // Writes Dh; sets no flags (the MUL set N/Z; V=0).
     val mulhiUop = DecodedUop()
+    mulhiUop.fpInert()
     mulhiUop.valid         := pkt.valid
     mulhiUop.pc            := pkt.pc
     mulhiUop.nextPc        := nextPc
@@ -2335,6 +2355,7 @@ object MicroOpAssembler {
                   bfmWidthRaw.asBits.resize(5) ## B(0, 5 bits)).resize(32)
     def bfmLoadUop(disp: Bits, dst: Int, size: Size.C, first: Bool): DecodedUop = {
       val u = DecodedUop()
+      u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
       u.nextPc      := nextPc
@@ -2375,6 +2396,7 @@ object MicroOpAssembler {
     val bfmIsTst    = (bfmBfOp === 0)
     val bfmCompute = {
       val u = DecodedUop()
+      u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
       u.nextPc      := nextPc
@@ -2472,6 +2494,7 @@ object MicroOpAssembler {
     // Common load builder (every field once): addr = base + disp + index, -> dst.
     def c2LoadUop(disp: Bits, dst: Int, first: Bool): DecodedUop = {
       val u = DecodedUop()
+      u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
       u.nextPc      := nextPc
@@ -2511,6 +2534,7 @@ object MicroOpAssembler {
     // on out-of-bounds C. reads+writes NZVC (preserve N/V); no int dst.
     val c2Cmp = {
       val u = DecodedUop()
+      u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
       u.nextPc      := nextPc
@@ -2568,6 +2592,7 @@ object MicroOpAssembler {
     // pc into the imm (base=0), exactly like the load crack's pcRelAddr.
     val ctrlPcRelAddr = (pkt.pc + U(2, 32 bits) + srcEa.disp.asUInt).asBits
     val ibrUop = DecodedUop()
+    ibrUop.fpInert()
     ibrUop.valid         := pkt.valid
     ibrUop.pc            := pkt.pc
     ibrUop.nextPc        := nextPc
@@ -2635,6 +2660,7 @@ object MicroOpAssembler {
               eaAuto: EaAuto.C = EaAuto.NONE, eaDelta: UInt = U(0, 3 bits),
               keepCommit: Bool = False): DecodedUop = {
       val u = DecodedUop()
+      u.fpInert()
       u.valid := pkt.valid; u.pc := pkt.pc; u.nextPc := nextPc
       u.op := op; u.cluster := cluster; u.size := size; u.memOp := memOp
       u.srcAReg := srcAReg; u.srcAValid := srcAValid
@@ -2853,6 +2879,7 @@ object MicroOpAssembler {
     val ctrlEaPcRel = (pkt.pc + U(2, 32 bits) + srcEa.disp.asUInt).asBits
     def leaGenUop(leaDst: UInt, leaFirst: Bool): DecodedUop = {
       val u = DecodedUop()
+      u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
       u.nextPc      := nextPc

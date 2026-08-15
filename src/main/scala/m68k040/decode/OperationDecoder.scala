@@ -1103,6 +1103,45 @@ object OperationDecoder {
           o.srcB := anField   // placeholder; MicroOpAssembler overrides with the real op[2:0] An
           o.dst.setNone(); o.dstWrites := False
         }
+        // ── F-line FP-GENERIC (cpGEN): `1111 001 000 mmmrrr` ────────────────────
+        // Coprocessor ID 001 (the FPU) + type field 000 (the general FP instruction,
+        // as opposed to 001=FScc/FDBcc/FTRAPcc, 010=FBcc.W, 011=FBcc.L, and the
+        // FSAVE/FRESTORE encodings above bit 8). Verified against Musashi's own
+        // dispatcher (tools/musashi/musashi/m68kfpu.c, m68040_fpu_op0: the cpGEN case
+        // is `(REG_IR >> 6) & 3 == 0`, then a sub-switch on extension-word bits
+        // [15:13]) -- see Task 4's encoding table for the full evidence list.
+        //
+        // NON-OVERLAP with the existing line-F carve-outs, checked bit-by-bit:
+        //   CPUSH/CINV 0xF4xx  -> opword[11:9] = 010
+        //   PFLUSH/PTEST 0xF5xx-> opword[11:9] = 010
+        //   MOVE16 0xF620      -> opword[11:9] = 011
+        //   FSF 0xF27F         -> opword[11:9] = 001 BUT opword[8:6] = 001 (FScc)
+        // Only cpGEN is (001, 000), so this arm claims 0xF200-0xF23F and nothing else.
+        // In particular it must NOT match any opword with bit 8 set -- that band holds
+        // FSAVE/FRESTORE, owned by Task 9/11.
+        //
+        // WHAT THIS ARM CANNOT DECIDE: the operation, the FP registers, and whether an
+        // <ea> is even used are all extension-word fields, and decode() sees the opword
+        // only (PredecodeWord.scala:64 calls it at I-cache refill time). So this arm
+        // classifies the FAMILY -- non-illegal, DecOp.FPU, Cluster.CPLX -- and
+        // MicroOpAssembler refines it from pkt.words(1) or routes it to the vector-11
+        // F-line trap. Until Task 6 lands, MicroOpAssembler's `fpGenBad` term faults
+        // ALL of it, so this arm is behavior-neutral on its own.
+        val isFpGeneric = (opword(11 downto 9) === B"3'b001") && (opword(8 downto 6) === B"3'b000")
+        when(isFpGeneric) {
+          o.illegal   := False
+          o.fpGeneric := True
+          o.op        := DecOp.FPU
+          o.cluster   := Cluster.CPLX     // spec Decision 9: shared CPLX cluster, no new Cluster value
+          o.size      := Size.LONG        // inert; the FP operand format lives in the ext word
+          // No operand slots are named here: the EA (opword[5:0]) is meaningful ONLY for
+          // the R/M=1 (extension-word bit 14) forms, and this decoder cannot see that bit.
+          // The assembler routes both srcA (the int source of an FMOVE.L Dn,FPn) and the
+          // FP register fields itself.
+          o.srcA.setNone(); o.srcB.setNone(); o.dst.setNone(); o.dstWrites := False
+          o.readsNzvc := False; o.writesNzvc := False   // FP ops touch FPCC, never the integer CCR
+          o.readsX    := False; o.writesX    := False
+        }
         // FSF (xxx).L — task #180 (ported-tests triage, cluster13/exc_fsf_xxx_l_no_fline):
         // opword 0xF27F, ext1 0x0000 (the FScc "false" predicate — condition field is
         // OPER_I_16()&0x3f per Musashi's fscc(), 0 selects always-false), then a 2-word

@@ -107,7 +107,31 @@ object DecOp extends SpinalEnum {
       // ext-word dr bit in DecodeStage.ucBegin). The access is FLAT (Musashi `(void)fc`),
       // so the data movement is byte-identical to a normal sized MOVE + the An side effect.
       // Privileged: the first µop carries needsSupervisor (ROB vector-8 if committed S==0).
-      MOVES = newElement()
+      MOVES,
+      // F-line FP-generic (cpGEN) family: ONE DecOp for the whole hardware-native FP op
+      // set, with the concrete operation carried in `fpuOp` (the raw 7-bit extension-word
+      // opmode, ext[6:0]) -- the same family+sub-kind idiom SHIFT/shiftOp, BITOP/bitOp,
+      // BITFIELD/bfOp and CASOP/casForm already use. Deliberately NOT 12-14 separate
+      // DecOp elements: IssueQueuePlugin.scala:914-924 documents a MEASURED post-route
+      // case where the `op` field's MuxOH leaking into a second cone became the design's
+      // WNS holder, so the enum stays narrow. Routed to Cluster.CPLX (spec Decision 9:
+      // fold into the existing CPLX cluster, no new Cluster value, no new IQ/ROB port).
+      FPU
+      = newElement()
+}
+
+/** Where an FP-generic uop's SOURCE operand comes from (DecodedUop.fpSrcKind).
+  *   FPREG    : extension-word opclass 000 -- the source is FP register FPm (fpSrcBReg).
+  *   INTREG   : opclass 010 with an integer/single source specifier and a Dn <ea> --
+  *              the source is a 32-bit INT register read, riding the ordinary int
+  *              srcA/psrcA rename path (no 80-bit value ever enters IqContext).
+  *   ROMCONST : opclass 010 / source specifier 111 -- FMOVECR; the source is the FPU's
+  *              internal constant ROM, indexed by `imm[6:0]` (the raw offset).
+  * Memory-sourced forms (a real <ea> load) are NOT in this enum yet -- they are added by
+  * Task 6b (MEMPAIR/MEMEXT), immediately after Task 6. FMOVEM and the FMOVE-to-<ea>
+  * direction remain unowned by any task in this plan. */
+object FpSrcKind extends SpinalEnum {
+  val FPREG, INTREG, ROMCONST = newElement()
 }
 
 /** Commit-time privileged-system-op kind (DecodedUop.sysOp / .sysKind). Selects how
@@ -465,6 +489,49 @@ case class DecodedUop() extends Bundle {
   // imm[0] carries the Rn D/A bit (BIT_1F/BIT_F) for the CAS2.W Dc sign-extend rule.
   // Default 0 (a non-CAS µop never reads casForm — gated by op === CASOP).
   val casForm      = Bits(3 bits)
+  // ── F-line FP-generic operand routing (DecOp.FPU) ───────────────────────────
+  // Architectural FP register numbers (FP0-FP7, 3 bits) -- rename maps them to the
+  // 4-bit physical FP tags in RenameStage (Task 2's fpRat). Split exactly like the
+  // integer srcA/srcB/dst convention this decoder already uses:
+  //   fpSrcAReg / usesFpSrcA : the DESTINATION FPn read back as an operand. Set ONLY
+  //     for the DYADIC ops (FADD/FSUB/FMUL/FDIV/FCMP), which compute FPn <op> src.
+  //     The monadic ops (FMOVE/FABS/FNEG/FSQRT/FINT/FINTRZ/FTST/FMOVECR) do NOT read
+  //     their destination -- their result is a function of the source alone -- so
+  //     usesFpSrcA stays False for them (an unnecessary source would create a false
+  //     RAW dependency and serialize independent FP work for nothing).
+  //   fpSrcBReg / usesFpSrcB : the SOURCE FPm, valid only for the register-to-register
+  //     form (fpSrcKind === FPREG). For INTREG the source rides srcAReg/psrcA (int
+  //     rename); for ROMCONST there is no register source at all.
+  //   fpDstReg / writesFp    : the destination FPn. False for FCMP and FTST, which
+  //     write ONLY the condition codes.
+  val fpSrcAReg   = UInt(3 bits); val usesFpSrcA = Bool()
+  val fpSrcBReg   = UInt(3 bits); val usesFpSrcB = Bool()
+  val fpDstReg    = UInt(3 bits); val writesFp   = Bool()
+  // Renamed FPCC {N,Z,I,NAN} (spec Decision 4). EVERY hardware-native FP op writes it
+  // (Musashi calls SET_CONDITION_CODES on every arm, including FMOVE-to-FPn and
+  // FMOVECR). NOTHING reads it yet -- the first readers are FBcc/FScc/FDBcc and
+  // FMOVE-from-FPSR, all deferred -- but the field and its IQ scoreboard (Task 3)
+  // exist now so that path is a pure addition later.
+  val readsFpcc   = Bool(); val writesFpcc = Bool()
+  // The raw extension-word opmode, ext[6:0], verbatim (0x00 FMOVE, 0x01 FINT, 0x03
+  // FINTRZ, 0x04 FSQRT, 0x18 FABS, 0x1A FNEG, 0x20 FDIV, 0x22 FADD, 0x23 FMUL,
+  // 0x28 FSUB, 0x38 FCMP, 0x3A FTST -- confirmed against tools/musashi/musashi/
+  // m68kfpu.c's fpgen_rm_reg opmode switch). For FMOVECR this field is NOT an opmode
+  // (the ROM offset rides `imm` instead) -- gate on fpSrcKind === ROMCONST first.
+  val fpuOp       = Bits(7 bits)
+  val fpSrcKind   = FpSrcKind()
+
+  /** Drive every FP field to its inert (non-FP-uop) default. Called by every
+    * DecodedUop construction site that is not building an FP uop -- SpinalHDL requires
+    * every bundle field to be driven (PhaseCheck_noLatchNoOverride), and there are
+    * multiple such sites across MicroOpAssembler/Microcode/MicroOpQueue/DecodeStage. */
+  def fpInert(): Unit = {
+    fpSrcAReg := 0; usesFpSrcA := False
+    fpSrcBReg := 0; usesFpSrcB := False
+    fpDstReg  := 0; writesFp   := False
+    readsFpcc := False; writesFpcc := False
+    fpuOp     := 0; fpSrcKind := FpSrcKind.FPREG
+  }
 }
 
 /** CAS/CAS2 compute sub-form codes (DecodedUop.casForm). */

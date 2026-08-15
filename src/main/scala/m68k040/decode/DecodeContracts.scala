@@ -173,6 +173,16 @@ case class OpSpec() extends Bundle {
   val sysOp         = Bool()
   val sysKind       = SysKind()
   val sysReadDir    = Bool()
+  // ── F-line FP-generic (cpGEN) family marker ─────────────────────────────────
+  // True for `1111 001 000 mmmrrr` -- the ONE thing about an FP instruction that is a
+  // function of the OPWORD alone. Which operation it is (FADD vs FMUL), which FP
+  // registers it touches, and whether it writes an FP register all live in the
+  // EXTENSION word, which this decoder does not (and must not) see: decode() is called
+  // at I-cache REFILL time by PredecodeWord.scala:64 to bake ChunkPredecode.size, where
+  // no extension word exists. MicroOpAssembler owns that half, reading pkt.words(1) --
+  // the same split CMP2/CHK2 already uses. `op`/`cluster` are set to FPU/CPLX here so
+  // the family is classified; the assembler refines or faults it.
+  val fpGeneric     = Bool()
 }
 object OpSpec {
   def illegalDefault(): OpSpec = {
@@ -195,6 +205,7 @@ object OpSpec {
     o.movep := False; o.movepDir := False; o.movepSizeLong := False
     o.microcoded := False; o.ucEntry := 0
     o.sysOp := False; o.sysKind := SysKind.NONE; o.sysReadDir := False
+    o.fpGeneric := False
     o
   }
 }

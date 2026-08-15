@@ -1926,6 +1926,7 @@ object Microcode {
     * shape). `valid` is driven by the caller. */
   def resolve(d: Desc, ctx: Ctx, valid: Bool): DecodedUop = {
     val u = DecodedUop()
+    u.fpInert()
     val (srcAReg, srcAV) = selReg(d.srcA, ctx)
     val (srcBReg, srcBV) = selReg(d.srcB, ctx)
     val (dstReg,  dstV)  = selReg(d.dst,  ctx)
@@ -2339,6 +2340,7 @@ object Microcode {
     * is driven by the caller. */
   def resolveFromBits(d: DescBits, ctx: Ctx, valid: Bool): DecodedUop = {
     val u = DecodedUop()
+    u.fpInert()
     val (srcAReg, srcAV) = selRegHw(d.srcA, ctx)
     val (srcBReg, srcBV) = selRegHw(d.srcB, ctx)
     val (dstReg,  dstV)  = selRegHw(d.dst,  ctx)
