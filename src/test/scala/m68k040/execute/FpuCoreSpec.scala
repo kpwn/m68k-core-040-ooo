@@ -693,6 +693,40 @@ class FpuCoreSpec extends AnyFunSuite {
         }
       }
       assert(iterChecked > 45, s"sweep only exercised $iterChecked iterative ops")
+
+      // The cheap lane's FINT/FINTRZ carries real logic (the lastBit/roundBits mask, the
+      // rounding add, the mask-to-zero carry fix-up) that the directed vectors only sample at
+      // a handful of exponents. Sweep it across the whole range against
+      // floatx80_round_to_int, together with FABS/FNEG/FMOVE/FTST/FCMP.
+      var cheapChecked = 0
+      for (_ <- 0 until 200) {
+        val rm = rnd.nextInt(4)
+        val v  = operand()
+        if (usable(v)) {
+          val gi = runFixed(d0, cd, FpOp.FINT, 0, v, rm)
+          assert(gi.value == FpRefModel.roundToInt(v, rm),
+            f"FINT rm=$rm $v%020x -> ${gi.value}%020x, ref ${FpRefModel.roundToInt(v, rm)}%020x")
+          assert(gi.inex == FpRefModel.roundToIntInexact(v, rm), f"FINT rm=$rm $v%020x INEX2")
+          val gz = runFixed(d0, cd, FpOp.FINTRZ, 0, v, rm)
+          assert(gz.value == FpRefModel.roundToInt(v, 1),
+            f"FINTRZ rm=$rm $v%020x -> ${gz.value}%020x (must ignore FPCR)")
+          assert(runFixed(d0, cd, FpOp.FABS,  0, v, rm).value == (v & ((BigInt(1) << 79) - 1)))
+          assert(runFixed(d0, cd, FpOp.FNEG,  0, v, rm).value == (v ^ (BigInt(1) << 79)))
+          val gm = runFixed(d0, cd, FpOp.FMOVE, 0, v, rm)
+          assert(gm.value == v && gm.fpcc == FpRefModel.fpcc(v), f"FMOVE $v%020x")
+          val gt = runFixed(d0, cd, FpOp.FTST, 0, v, rm)
+          assert(gt.fpcc == FpRefModel.fpcc(v) && !gt.writeFp, f"FTST $v%020x")
+          cheapChecked += 1
+        }
+        val a = operand(); val b = operand()
+        if (usable(a) && usable(b)) {
+          val gc = runFixed(d0, cd, FpOp.FCMP, a, b, rm)
+          assert(gc.fpcc == FpRefModel.fcmp(a, b, rm),
+            f"FCMP rm=$rm $a%020x,$b%020x -> ${gc.fpcc}, ref ${FpRefModel.fcmp(a, b, rm)}")
+          assert(!gc.writeFp, "FCMP must not write an FP destination")
+        }
+      }
+      assert(cheapChecked > 100, s"sweep only exercised $cheapChecked cheap ops")
     }
   }
 

@@ -47,13 +47,18 @@ puts "FMAX_MHZ $fmax"
 if {$wns < 0} { puts "RESULT FAILED_AT_250 ACHIEVED_FMAX_MHZ $fmax" } else { puts "RESULT MET_250 HEADROOM_FMAX_MHZ $fmax" }
 
 # Resource totals, parsed straight out of the routed netlist rather than the report text.
-puts "CELLS_LUT   [llength [get_cells -quiet -hierarchical -filter {PRIMITIVE_GROUP == LUT}]]"
-puts "CELLS_FF    [llength [get_cells -quiet -hierarchical -filter {PRIMITIVE_GROUP == FLOP_LATCH}]]"
-puts "CELLS_CARRY [llength [get_cells -quiet -hierarchical -filter {REF_NAME == CARRY8}]]"
-set dsps [get_cells -quiet -hierarchical -filter {PRIMITIVE_GROUP == ARITHMETIC}]
+# PRIMITIVE_LEVEL != INTERNAL is REQUIRED: a placed DSP48E2 carries eight INTERNAL child
+# instances (DSP_A_B_DATA_INST, DSP_MULTIPLIER_INST, DSP_ALU_INST, ...), so a naive
+# get_cells -hierarchical reports 9x the real DSP count.
+proc leafcount {filt} {
+  return [llength [get_cells -quiet -hierarchical -filter "($filt) && PRIMITIVE_LEVEL != INTERNAL"]]
+}
+puts "CELLS_LUT   [leafcount {PRIMITIVE_TYPE =~ CLB.LUT.*}]"
+puts "CELLS_FF    [leafcount {PRIMITIVE_TYPE =~ REGISTER.*}]"
+puts "CELLS_CARRY [leafcount {REF_NAME == CARRY8}]"
+set dsps [get_cells -quiet -hierarchical -filter {REF_NAME == DSP48E2 && PRIMITIVE_LEVEL != INTERNAL}]
 puts "CELLS_DSP   [llength $dsps]"
-set bram [get_cells -quiet -hierarchical -filter {PRIMITIVE_GROUP == BLOCKRAM}]
-puts "CELLS_BRAM  [llength $bram]"
+puts "CELLS_BRAM  [leafcount {PRIMITIVE_TYPE =~ BLOCKRAM.*}]"
 
 # ── DSP48E2 inference attribution + internal-register check (mandatory deliverable) ──
 set mulDsp 0
@@ -71,13 +76,11 @@ if {[llength $dsps] == 0} {
 
 # ── per-submodule census, same shape as synth/census.tcl ──
 proc fpu_census {label pat} {
-  set cells [get_cells -quiet -hierarchical -filter "NAME =~ $pat"]
-  set lut 0; set ff 0; set dsp 0
-  foreach c $cells {
-    set g [get_property -quiet PRIMITIVE_GROUP $c]
-    if {$g eq "LUT"} { incr lut } elseif {$g eq "FLOP_LATCH"} { incr ff } elseif {$g eq "ARITHMETIC"} { incr dsp }
-  }
-  puts "FPU_CENSUS $label LUT $lut FF $ff DSP $dsp"
+  set lut  [llength [get_cells -quiet -hierarchical -filter "NAME =~ $pat && PRIMITIVE_TYPE =~ CLB.LUT.* && PRIMITIVE_LEVEL != INTERNAL"]]
+  set ff   [llength [get_cells -quiet -hierarchical -filter "NAME =~ $pat && PRIMITIVE_TYPE =~ REGISTER.* && PRIMITIVE_LEVEL != INTERNAL"]]
+  set carr [llength [get_cells -quiet -hierarchical -filter "NAME =~ $pat && REF_NAME == CARRY8"]]
+  set dsp  [llength [get_cells -quiet -hierarchical -filter "NAME =~ $pat && REF_NAME == DSP48E2 && PRIMITIVE_LEVEL != INTERNAL"]]
+  puts "FPU_CENSUS $label LUT $lut FF $ff CARRY8 $carr DSP $dsp"
 }
 fpu_census add   "*addPipe*"
 fpu_census mul   "*mulPipe*"
