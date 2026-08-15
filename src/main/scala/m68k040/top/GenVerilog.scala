@@ -101,3 +101,15 @@ object GenPrfSynthVerilog {
     println("Generated generated/M68kPrfSynth.v")
   }
 }
+
+/** OOC synth/impl gate for the standalone 80-bit FPU arithmetic core (FpuCore, the FPU
+  * plan's Task 7). FpuCore is not yet wired into the core -- the EU-integration task does
+  * that -- so it is gated on its own, exactly the way M68kIqSynth/M68kPrfSynth gate their
+  * slices, against the same 4.000 ns (250 MHz) clock constraint and the same part. */
+object GenFpuCoreSynthVerilog {
+  def main(args: Array[String]): Unit = {
+    M68kSpinalConfig(targetDirectory = "generated")
+      .generateVerilog(new m68k040.execute.fpu.FpuCore().setDefinitionName("M68kFpuCoreSynth"))
+    println("Generated generated/M68kFpuCoreSynth.v")
+  }
+}

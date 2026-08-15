@@ -384,6 +384,18 @@ resolves `inf` operands from an explicit table and never calls `floatx80_sub`, s
 operation is raised. `FpAddPipe` therefore suppresses its `inf − inf` OPERR when the op is
 FCMP and the explicit table applies. (FADD/FSUB of `inf − inf` still raise OPERR.)
 
+**D7 — FABS/FNEG/FMOVE do not quiet a signalling-NaN source.** Musashi implements them as
+pure bit twiddles (`m68kfpu.c:1409-1424`: FABS is `high &= 0x7fff`, FNEG is `high ^= 0x8000`,
+FMOVE is a plain copy) with no `propagateFloatx80NaN` call, so an SNaN source is written to
+the destination still signalling. `FpuCore` matches Musashi bit-for-bit and *does* raise
+`exc.snan`, but does not quiet the value. Real 68040 behaviour with the SNAN trap disabled is
+to write the QUIETED NaN. This is a one-bit difference in the destination register, visible
+only when an SNaN is moved/negated/absolute-valued with traps off.
+=> Deliberately left matching Musashi so lock-step stays clean. If the FPSR/exception task
+later implements the real "quiet on untrapped SNAN" destination rule, it belongs in the EU's
+result-writeback path (one OR of 0xC000000000000000 gated on `exc.snan && !writeFp_is_cmp`),
+not in this datapath, and this entry must be revisited at that point.
+
 ### VERIFY-AT-IMPLEMENTATION
 
 - **VERIFY-1 — the FMOVECR constant ROM words for offsets $0B and $38..$3F.**

@@ -139,4 +139,13 @@ foreach pb [get_pblocks -quiet] {
     puts "CENSUS_PBLOCK_ERROR $pb $pbErr"
   }
 }
+# -- FPU arithmetic-core probes (2026-08-15 FpuCore plan, Task H). These stay silent
+# (CELLS 0) until the EU-integration task instantiates FpuCore inside the full core;
+# the standalone gate lives in synth/ooc_fpucore.tcl.
+census_probe fpu_add    "*FpAddPipe*"      $prefix
+census_probe fpu_mul    "*FpMulPipe*"      $prefix
+census_probe fpu_round  "*FpRoundPack*"    $prefix
+census_probe fpu_iter   "*FpDivSqrtCore*"  $prefix
+census_probe fpu_cheap  "*FpCheapPipe*"    $prefix
+
 puts "########### CENSUS COMPLETE ###########"
