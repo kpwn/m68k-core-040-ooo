@@ -325,3 +325,91 @@ Two independent surfaces, deliberately not conflated:
   limitations, worked around via directed tests instead.
 - FPSP itself is never shipped in this project's RTL (Decision 8) — a booted OS's own copy
   runs; the CPU's only job is the trap protocol.
+
+## FpuCore ↔ Musashi Divergence Register (2026-08-15, from the arithmetic-core plan)
+
+Decision 1 promises "bit-exact lock-step on the 11 HW-native ops' arithmetic results."
+That promise holds, **with these documented exceptions**, each of which must be
+excluded from the Musashi-refereed corpus and covered by a directed test instead.
+
+**D1 — FINT/FINTRZ: Musashi clamps to a 32-bit integer; real 68040/FPSP does not.**
+`tools/musashi/musashi/m68kfpu.c` opmode `0x01` (Fsint) and `0x03` (FsintRZ) are implemented
+as `int32_to_floatx80(floatx80_to_int32(source))`. For `|x| >= 2^31` this destroys the value.
+Real FINT semantics are `floatx80_round_to_int` (which Musashi's own SoftFloat *provides* at
+`softfloat.c:3082` but `m68kfpu.c` never calls). `FpuCore` implements the real semantics.
+=> Lock-step FINT/FINTRZ only for `|x| < 2^31`. Larger magnitudes: directed test only.
+=> Candidate Decision-3-class Musashi-bridge fix; do NOT "fix" our hardware to match.
+
+**D2 — FMOVECR $38..$3F (10^32 … 10^4096): Musashi's table is double-derived, not the ROM.**
+`m68kfpu.c` builds `10^32`..`10^256` with `double_to_fx80(1e32)`-style calls (10^32 is the
+first power of ten not exactly representable in an IEEE double), and `10^512`..`10^4096` by
+repeatedly squaring an already-rounded `1e256`. Independently computing the correctly-rounded
+64-bit-significand value of each 10^k (exact rational arithmetic) reproduces the well-known
+real-68881-ROM values and **disagrees with Musashi in the low mantissa bits for all eight
+entries $38..$3F**. `FpuCore` implements the correctly-rounded/real-ROM values.
+=> Exclude FMOVECR offsets $38..$3F from Musashi lock-step; directed test vs. the UM table.
+=> **VERIFY-1 RESOLVED (2026-08-16)**: an exact rational recomputation of every 10^k and an
+independent second implementation (QEMU `target/m68k` `fpu_rom[]`) both agree bit-for-bit
+with the table `FpCheapPipe.cromWords` carries. D2 stands as written.
+
+**D3 — FMOVECR $0B (log10(2)): Musashi stores 1 ULP below correctly-rounded.**
+Musashi: `0x3FFD 9A209A84FBCFF798`. Correctly-rounded-to-nearest: `...F799`.
+=> **VERIFY-1 RESOLVED (2026-08-16), in Musashi's favour.** Three independent lines of
+evidence: (a) QEMU's `fpu_rom[]` independently carries `...F798`; (b) rounding the exact
+value to 67 bits and *then* to 64 (the 68881's documented constant-ROM double-rounding, the
+ROM storing a few guard bits past extended) yields exactly `...F798`; (c) log10(2) is the
+**only** one of the seven transcendental ROM constants for which that 67-bit intermediate
+rounding changes the 64-bit answer — pi, e, log2(e), log10(e), ln(2), ln(10) all give the
+correctly-rounded word either way, which is precisely why $0B is the lone anomaly. `FpuCore`
+therefore keeps `...F798`: it is the genuine 68881 FMOVECR-under-RN result, not a Musashi bug.
+
+**D4 — Every FPSR exception-status output is directed-test-only.** Decision 3 already
+records that Musashi raises zero FP exceptions. `FpuCore.io.res*.exc` (SNAN/OPERR/OVFL/UNFL/
+DZ/INEX2) therefore has no oracle and is never lock-stepped, only directed-tested.
+
+**D5 — pseudo-denormal (exp = 0, explicit integer bit set) exact cancellation.** `FpAddPipe`
+declares an exact cancellation whenever the two operands have equal *effective* exponents
+(`exp == 0` reading as 1) and equal significands, and returns SoftFloat's
+`packFloatx80(rmode == RM, 0, 0)`. SoftFloat orders operands by the *raw* exponent, so for
+`{exp=0, sig=S}` vs `{exp=1, sig=S}` it instead takes its `bExpBigger`/`aExpBigger` arm and
+returns a zero whose sign is the flipped operand sign rather than the rounding-mode sign.
+The two disagree **only** when exactly one operand is a pseudo-denormal, because a genuine
+subnormal always has `sig < 2^63` while a normal always has `sig >= 2^63`, so equal
+significands with unequal raw exponents is otherwise impossible. `FpuCore` (and
+`FpRefModel`) implement the value-correct answer; SoftFloat's is the outlier.
+=> Pseudo-denormal operands are excluded from Musashi lock-step for FADD/FSUB.
+
+**D6 — FCMP against an infinity does not raise OPERR.** Musashi's FCMP (`m68kfpu.c:1517-1545`)
+resolves `inf` operands from an explicit table and never calls `floatx80_sub`, so no invalid
+operation is raised. `FpAddPipe` therefore suppresses its `inf − inf` OPERR when the op is
+FCMP and the explicit table applies. (FADD/FSUB of `inf − inf` still raise OPERR.)
+
+### VERIFY-AT-IMPLEMENTATION
+
+- **VERIFY-1 — the FMOVECR constant ROM words for offsets $0B and $38..$3F.**
+  **RESOLVED 2026-08-16** — see D2 and D3 above. The table in `FpCheapPipe.cromWords` is
+  confirmed by two independent implementations plus an exact recomputation, and the $0B
+  anomaly now has a mechanistic explanation (68881 constant-ROM double rounding). The
+  MC68881/MC68882 UM's own ROM table was **not** read directly; the evidence above is
+  circumstantial-but-convergent rather than primary. Re-open only if the UM contradicts it.
+- **VERIFY-2 — whether FPSR.I is *unconditionally* cleared by FCMP. STILL OPEN.** Musashi
+  clears it only via the explicit infinity-comparison table (`m68kfpu.c:1517-1545`); an
+  *overflowing finite* difference (e.g. `LARGEST − (−LARGEST)` under RN) still runs through
+  `SET_CONDITION_CODES(res)` and would set I. `FpuCore` matches Musashi. Check the M68000
+  Family PRM's FCMP page; if it says I is always cleared, that is a further divergence, not a
+  bug in our hardware.
+- **VERIFY-3 — FMOVECR and FINT/FINTRZ are NOT hardware ops on a real MC68040. CONFIRMED
+  2026-08-16.** The Motorola 68040 FPSP's unimplemented-instruction dispatch table
+  (`arch/m68k/fpsp040/tbldo.S` in Linux, verbatim Motorola source) carries real emulation
+  routines for extension-word opcode `$00` (FMOVECR → `smovcr`), `$01` (FINT → `sint`) and
+  `$03` (FINTRZ → `sintrz`); a hardware-implemented instruction would never reach that table.
+  All three therefore take the F-line unimplemented trap on real silicon. Decision 2 and the
+  2026-08-09 spec §1 nevertheless put them in the hardware set: that is a deliberate,
+  now-recorded **superset** of real silicon (same posture as Decision 10's OVFL/UNFL
+  substitution), observationally equivalent to a correct FPSP. **The EU-integration and
+  decode tasks must NOT route FMOVECR/FINT/FINTRZ to the F-line trap.**
+- **VERIFY-4 — "unnormal" (exp≠0, integer bit = 0) source operands. OPEN BY DESIGN.** Real
+  68040 raises the unimplemented-data-type exception (vector 55); SoftFloat/Musashi silently
+  computes with them. `FpuCore` **classifies** them (`io.srcUnnormal`/`io.dstUnnormal`,
+  combinational) but applies no policy — the trap-or-compute decision belongs to the
+  EU-integration task.
