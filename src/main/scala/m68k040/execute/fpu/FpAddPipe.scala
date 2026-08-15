@@ -128,7 +128,7 @@ class FpAddPipe extends Component {
 
     val req = FpRoundReq().overridable()
     req.sign := resSign
-    req.exp  := bigE.asSInt.resize(18)
+    req.exp  := bigE.resize(18).asSInt
     req.sig  := bigSig                            // A2..A7 recompute sig/round/sticky
     req.round := False
     req.sticky := False
@@ -220,7 +220,7 @@ class FpAddPipe extends Component {
     // exp = bigExp + carryAdjust - clz. A fully cancelled effective SUBTRACT cannot reach
     // here (A1's `exactZero` bypasses it), but 0 + 0 can, so force the exponent to 0 rather
     // than letting bigExp+adj leak into FpRoundPack's overflow compare.
-    req.exp    := a6.rReq.exp + a6.rExpAdj - a6.rClz.asSInt.resize(18)
+    req.exp    := a6.rReq.exp + a6.rExpAdj - a6.rClz.resize(18).asSInt
     when(isZero) { req.sig := 0; req.round := False; req.sticky := False; req.exp := 0 }
     val vld  = RegNext(a6.vld) init False
     val rReq = RegNext(req)

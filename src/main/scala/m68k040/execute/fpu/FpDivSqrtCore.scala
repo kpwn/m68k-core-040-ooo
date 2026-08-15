@@ -13,11 +13,12 @@ object FpDivSqrtCore {
     * 1 (accept/latch) + 1 (S_CLZ classify+LZC) + 1 (S_NORM pre-normalise) + 1 (S_SETUP)
     * + 65 (S_ITER) + 1 (S_ROUND hand-off) + FpRoundPack.Latency (3) + 1 (capture into
     * `resReg`/`doneR`) = 73. Documentation only -- this lane is a busy/done handshake, not a
-    * constant-latency pipe, and `FpuCoreSpec` measures the real number rather than assuming
-    * it. Special cases (NaN / Inf / zero / divide-by-zero / sqrt-of-negative) short-circuit
-    * S_NORM..S_ITER entirely and finish in `SpecialLatency` cycles. */
+    * constant-latency pipe. Both numbers below are MEASURED by FpuCoreSpec's
+    * "iterative-lane latency" test, not assumed. Special cases (NaN / Inf / zero /
+    * divide-by-zero / sqrt-of-negative) short-circuit S_NORM..S_ITER entirely:
+    * 1 + 1 (S_CLZ) + 1 (S_ROUND) + 3 (FpRoundPack) = 6. */
   val WorstCaseLatency = 73
-  val SpecialLatency   = 7
+  val SpecialLatency   = 6
 }
 
 /** One held iterative context shared by FDIV and FSQRT (2026-08-09 spec §3: "one held
@@ -157,7 +158,7 @@ class FpDivSqrtCore extends Component {
 
       bypReq := r; bypass := takeBypass; zSign := sgn
       aSig := Fp80.sig(a); bSig := Fp80.sig(b)
-      aExp := Fp80.exp(a).asSInt.resize(18); bExp := Fp80.exp(b).asSInt.resize(18)
+      aExp := Fp80.exp(a).resize(18).asSInt; bExp := Fp80.exp(b).resize(18).asSInt
       aSubR := Fp80.exp(a) === 0; bSubR := Fp80.exp(b) === 0
       aClz := Fp80.clz(a(63 downto 0)).resize(7)
       bClz := Fp80.clz(b(63 downto 0)).resize(7)
@@ -166,9 +167,9 @@ class FpDivSqrtCore extends Component {
 
     // -- S_NORM: pre-normalise subnormal operands (normalizeFloatx80Subnormal) --
     is(U(S_NORM, 3 bits)) {
-      when(aSubR) { aSig := aSig |<< aClz; aExp := S(1, 18 bits) - aClz.asSInt.resize(18) }
+      when(aSubR) { aSig := aSig |<< aClz; aExp := S(1, 18 bits) - aClz.resize(18).asSInt }
       when(bSubR && !sqrtR) {
-        bSig := bSig |<< bClz; bExp := S(1, 18 bits) - bClz.asSInt.resize(18)
+        bSig := bSig |<< bClz; bExp := S(1, 18 bits) - bClz.resize(18).asSInt
       }
       state := U(S_SETUP, 3 bits)
     }

@@ -55,10 +55,10 @@ class FpMulPipe extends Component {
   val m1 = new Area {
     val dSig = Mux(m0.dSub, Fp80.sig(m0.dst) |<< m0.dClz.resize(7), Fp80.sig(m0.dst))
     val sSig = Mux(m0.sSub, Fp80.sig(m0.src) |<< m0.sClz.resize(7), Fp80.sig(m0.src))
-    val dExp = Mux(m0.dSub, S(1, 18 bits) - m0.dClz.asSInt.resize(18),
-                            Fp80.exp(m0.dst).asSInt.resize(18))
-    val sExp = Mux(m0.sSub, S(1, 18 bits) - m0.sClz.asSInt.resize(18),
-                            Fp80.exp(m0.src).asSInt.resize(18))
+    val dExp = Mux(m0.dSub, S(1, 18 bits) - m0.dClz.resize(18).asSInt,
+                            Fp80.exp(m0.dst).resize(18).asSInt)
+    val sExp = Mux(m0.sSub, S(1, 18 bits) - m0.sClz.resize(18).asSInt,
+                            Fp80.exp(m0.src).resize(18).asSInt)
     val zSign = Fp80.sign(m0.dst) ^ Fp80.sign(m0.src)
     val zExp  = dExp + sExp - S(0x3FFE, 18 bits)
 
