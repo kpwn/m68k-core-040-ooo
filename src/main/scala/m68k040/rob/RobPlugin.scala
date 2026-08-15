@@ -221,7 +221,23 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // Reset per-alloc below (mirrors `completes`), with alloc-priority on a reused index.
     val mispredictStore = Vec.fill(depth)(RegInit(False))
     mispredictStore.foreach(_.simPublic()) // debug-only observability, task #139 investigation; zero synth impact
-    val nextPcStore     = Vec.fill(depth)(Reg(UInt(32 bits)))
+    // ── LUT-reduction ROB-fold Slice B (2026-08-08 area spec §5) ────────────────
+    // WAS `Vec.fill(depth)(Reg(UInt(32 bits)))` (2048 FF + a 64:1 read mux per bit at
+    // TWO read addresses). Exactly ONE writer (branchCompletion, below) — the same
+    // single-writer shape as branchTrainMem — so this folds to a plain 1W async-read
+    // Mem with no MultiPortWritesSymplifier XOR-LVT involvement (no same-cycle
+    // same-address collision hazard by construction). Staleness safety is unchanged
+    // and never depended on the storage kind: the old Reg-Vec was equally
+    // uninitialised (no RegInit, no alloc reset); every read is gated by
+    // p0/p1.retireAlone (alloc-written payload) or mispredictStore(h0) (alloc-reset
+    // Reg-Vec), and both gates only go True via the SAME branchCompletion that
+    // freshens this row — completion strictly precedes retire, so the earliest read
+    // of a row is the cycle after its write (readAsync returns the OLD word during a
+    // same-cycle write, identical to a Reg's Q, and that case is unreachable anyway).
+    // `ram_style`=distributed (NOT block): the reads must be asynchronous, which BRAM
+    // cannot serve — mirrors DcachePlugin's explicit-attribute idiom.
+    val nextPcMem       = Mem(UInt(32 bits), depth)
+    nextPcMem.addAttribute("ram_style", "distributed")
     // Task #193 (trace exception T0): the branch EU's RESOLVED taken/redirect decision
     // (BranchCompletion.btbTaken == `actualTaken`, driven UNCONDITIONALLY for every
     // completing branch-family µop regardless of BTB eligibility — see BranchEuPlugin's
@@ -699,8 +715,13 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // Branch trace nextPc: a branch's commit pc is its RESOLVED nextPc (not the
     // predicted predNextPc). Branches are retireAlone, so retire1 can never be a
     // branch -> the slot-1 Mux is harmless.
-    val commitPc0 = Mux(p0.retireAlone, nextPcStore(h0), p0.predNextPc)
-    val commitPc1 = Mux(p1.retireAlone, nextPcStore(h1), p1.predNextPc)
+    // ROB-fold Slice B: exactly TWO hoisted readAsync ports (each call allocates a
+    // physical port) — nextPcRd0 serves BOTH commitPc0 and flushPcReg (same h0
+    // address, same mux the old Reg-Vec read shared), nextPcRd1 serves commitPc1.
+    val nextPcRd0 = nextPcMem.readAsync(h0)
+    val nextPcRd1 = nextPcMem.readAsync(h1)
+    val commitPc0 = Mux(p0.retireAlone, nextPcRd0, p0.predNextPc)
+    val commitPc1 = Mux(p1.retireAlone, nextPcRd1, p1.predNextPc)
     // Sim-only taps (root-cause fix, post-Task-P2.5 lock-step investigation): the
     // IRQ lock-step harness's reactive interrupt-line poke needs to react to the
     // RAW retire event (not `commitObs`, which is ANOTHER RegNext cycle behind --
@@ -747,7 +768,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     when(branchCompletion.valid) {
       completes(branchCompletion.payload.robId)       := True
       mispredictStore(branchCompletion.payload.robId) := branchCompletion.payload.mispredict
-      nextPcStore(branchCompletion.payload.robId)     := branchCompletion.payload.nextPc
+      // Single write port into nextPcMem (ROB-fold Slice B) — the ONLY writer, like
+      // branchTrainMem below.
+      nextPcMem.write(branchCompletion.payload.robId, branchCompletion.payload.nextPc)
       // Task #193: capture the resolved taken/redirect decision (trace-T0 gate).
       branchTakenStore(branchCompletion.payload.robId) := branchCompletion.payload.btbTaken
       // BTB-update capture (read at retire to drive the BTB write port).
@@ -1341,7 +1364,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // sequence with the target (vector / restored PC). doFlushReg is the registered
     // fan-out pulse; it drives the IQ/skid/fetch redirect for both cases.
     doFlushReg := branchRedirect || exc.redirectValid
-    when(branchRedirect)    { flushPcReg := nextPcStore(h0) }
+    when(branchRedirect)    { flushPcReg := nextPcRd0 }   // Slice B: shared h0 read port
     when(exc.redirectValid) { flushPcReg := exc.redirectPc }
 
     // ── Flush (squash all in-flight) — pointer-only, driven by the registered ─────
