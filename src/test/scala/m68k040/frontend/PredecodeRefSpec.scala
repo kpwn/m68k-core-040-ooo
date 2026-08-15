@@ -221,9 +221,16 @@ class PredecodeRefSpec extends AnyFunSuite {
       assert(classify(op) == cp(true, 1), f"line-A op=0x$op%04x")
 
     for (op <- 0xF000 to 0xFFFF) {
+      // Task 5: cpGEN (`1111 001 000 mmmrrr`, cpID 001 type 000) is now framed as the
+      // opword-only reference model's 2-word register form (extW is unknowable here,
+      // and PredecodeRef.classify's own cpGEN case always answers as if extW=0 -- see
+      // that case's comment). Every other line-F opword (including the two literal
+      // carve-outs, both OUTSIDE the cpGEN bit pattern) is unaffected.
+      val isCpGen = ((op >> 9) & 0x7) == 1 && ((op >> 6) & 0x7) == 0
       val expectedLen =
         if (op == 0xF27F) 4
         else if ((op & 0xFFF8) == 0xF620) 2
+        else if (isCpGen) 2
         else 1
       assert(classify(op) == cp(true, expectedLen),
         f"line-F op=0x$op%04x expected len=$expectedLen")

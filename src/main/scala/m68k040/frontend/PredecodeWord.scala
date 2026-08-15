@@ -1049,20 +1049,106 @@ object PredecodeWord {
       is(U(0xA, 4 bits)) { r.simple := True; r.lenWords := U(1, 4 bits) }
       is(U(0xF, 4 bits)) {
         // FSF (xxx).L narrow carve-out (task #180, exc_fsf_xxx_l_no_fline): opword
-        // 0xF27F + ext1 (discarded) + a 2-word abs.L address = 4 words total, unlike
-        // every other line-F op admitted so far (all single-word). See
+        // 0xF27F + ext1 (discarded) + a 2-word abs.L address = 4 words total. See
         // OperationDecoder.scala for the full derivation/rationale.
         // MOVE16 (Ax)+,(Ay)+ (task #207): opword 0xF620|Ax + 1 ext word carrying Ay
-        // (ext[14:12]) = 2 words total. Only THIS exact form (op & 0xFFF8 == 0xF620) is
-        // framed as 2 words — the other 3 absolute-addressing MOVE16 forms (F600/F608/
-        // F610/F618) are out of scope and stay on the existing 1-word `otherwise` arm
-        // (matching real F-line-trap behavior: vector 11, no further decode).
+        // (ext[14:12]) = 2 words total. The other 3 absolute-addressing MOVE16 forms
+        // stay on the 1-word `otherwise` arm.
+        //
+        // ── F-line FP-GENERIC (cpGEN) framing ───────────────────────────────────
+        // `1111 001 000 mmmrrr` (cpID 001, type 000) is ALWAYS opword + 1 mandatory
+        // extension word, plus (for the R/M=1 forms) that extension word's own <ea>
+        // extension words. This is the FIRST line-F family whose length depends on a
+        // word other than the opword, which is exactly why `extW`/`extWKnown` are
+        // plumbed into this function.
+        //
+        // WHY FRAME THE WHOLE cpGEN FAMILY, not just the hardware-native subset:
+        // length is independent of the OPMODE (ext[6:0]) -- an FSIN is framed exactly
+        // like an FADD -- and a known length is what lets MicroOpAssembler set
+        // faultUsesNextPc=True on the vector-11 trap, so a real FPSP kernel can RTE PAST
+        // a software-completed instruction instead of looping on the same opword
+        // forever (the gap diagnosed in docs/superpowers/specs/2026-08-09-fpu-hardware-
+        // design.md section 5). Framing only the HW-native subset would leave every
+        // FPSP-routed instruction with an unknown length -- i.e. would leave the actual
+        // point of this feature unimplemented.
+        //
+        // ESTABLISHED INVARIANT (Task 6 depends on it): a cpGEN instruction is never
+        // genuinely 1 word, so lenWords===1 on a cpGEN opword means "not framed".
+        val fpIsGen   = (op(11 downto 9) === B"3'b001") && (op(8 downto 6) === B"3'b000")
+        val fpClass   = extW(15 downto 13)          // 000/010 arith, 011 FMOVE->ea,
+                                                    // 100/101 FMOVE(M) ctrl regs, 110/111 FMOVEM
+        val fpSrcSpec = extW(12 downto 10).asUInt   // R/M=1: source data FORMAT (see Task 4 Step 1)
+        val fpEaMode  = op(5 downto 3).asUInt
+        val fpEaReg   = op(2 downto 0).asUInt
+        val fpIsImmEa = (fpEaMode === U(7, 3 bits)) && (fpEaReg === U(4, 3 bits))
+        // #imm source length is keyed off the FP source SPECIFIER, not the op size, so it
+        // cannot go through eaExt (whose `sizeL` has no such notion): Long 4B=2w,
+        // Single 4B=2w, Extended 12B=6w, Packed 12B=6w, Word 2B=1w, Double 8B=4w,
+        // Byte (word-aligned) =1w. Format 111 (packed, DYNAMIC k-factor from a Dn) has
+        // no immediate-source encoding on real hardware (the k-factor names a data
+        // register, which an immediate operand cannot itself supply) -- treated as
+        // contributing 0 extra words, matching the opclass-010-only #imm arm below,
+        // which still frames the mandatory opword+ext-word pair even for this case
+        // rather than declining to frame at all. (NOTE: this SpinalHDL version, 1.14.1,
+        // has no `muxListDc` on UInt/Bits -- a `switch` is used instead, encoding the
+        // identical table.)
+        val fpImmWords = UInt(3 bits)
+        switch(fpSrcSpec) {
+          is(U(0, 3 bits)) { fpImmWords := U(2, 3 bits) }   // Long
+          is(U(1, 3 bits)) { fpImmWords := U(2, 3 bits) }   // Single
+          is(U(2, 3 bits)) { fpImmWords := U(6, 3 bits) }   // Extended
+          is(U(3, 3 bits)) { fpImmWords := U(6, 3 bits) }   // Packed (static k)
+          is(U(4, 3 bits)) { fpImmWords := U(1, 3 bits) }   // Word
+          is(U(5, 3 bits)) { fpImmWords := U(4, 3 bits) }   // Double
+          is(U(6, 3 bits)) { fpImmWords := U(1, 3 bits) }   // Byte
+          default          { fpImmWords := U(0, 3 bits) }   // 7: packed dynamic-k, no #imm encoding
+        }
+        // FMOVECR (opclass 010 + source specifier 111) has NO <ea> at all -- the opword's
+        // EA field is unused and the constant's ROM offset rides ext[6:0]. 2 words flat.
+        val fpIsMovecr = (fpClass === B"3'b010") && (fpSrcSpec === U(7, 3 bits))
+        // opclass 000 is the register-to-register form: the <ea> field is unused. 2 words.
+        val fpIsRegForm = (fpClass === B"3'b000")
+        // Every other opclass uses the opword's <ea>. Their EA extension length depends on
+        // the ADDRESSING MODE alone (format only matters for #imm, handled above), so one
+        // eaExt call covers opclass 010/011/100/101/110/111 uniformly.
+        // The EA's own first extension word sits at op+2 (the FP extension word occupies
+        // op+1), which is why `extW2`/`extW2Known` are passed here -- the same shift the
+        // bit-field-memory arm handles above, including its task #197 lesson about passing
+        // the REAL word rather than a hardcoded zero.
+        val (fpEaOk, fpEaExt, fpEaAmb) =
+          eaExt(fpEaMode, fpEaReg, sizeL = False, allowImm = false, eaW = extW2, eaWKnown = extW2Known)
+
         when(op === B"16'hF27F") {
           r.simple   := True
           r.lenWords := U(4, 4 bits)
         } .elsewhen(op(15 downto 3) === U(0xF620 >> 3, 13 bits).asBits) {
           r.simple   := True
           r.lenWords := U(2, 4 bits)
+        } .elsewhen(fpIsGen && !extWKnown) {
+          // The extension word straddles the I-cache line / lookahead window, so the real
+          // opclass is unknown. Guess the most common shape (the 2-word register form) and
+          // FLAG IT -- the Aligner's live re-classify re-resolves an ambiguousLine slot
+          // against real words, and stalls if it still cannot resolve
+          // (Aligner.scala:95 `val p0 = Mux(preds(0).ambiguousLine, p0LiveReg, preds(0))`
+          // + the `.elsewhen(p0.ambiguousLine)` stall arm at :106, and slot1 packing is
+          // refused outright by `slot1Ok`'s `!p1.ambiguousLine` at :267). So the guess
+          // NEVER reaches decode -- this is the same contract mode-6's "assume brief"
+          // fallback already relies on, not a new one.
+          r.simple        := True
+          r.lenWords      := U(2, 4 bits)
+          r.ambiguousLine := True
+        } .elsewhen(fpIsGen && (fpIsRegForm || fpIsMovecr)) {
+          r.simple   := True
+          r.lenWords := U(2, 4 bits)           // opword + the FP extension word; no <ea>
+        } .elsewhen(fpIsGen && fpIsImmEa && (fpClass === B"3'b010")) {
+          // `#imm,FPn` -- only a SOURCE (opclass 010) can be immediate; an immediate
+          // destination is not encodable, so no other opclass reaches here.
+          r.simple   := True
+          r.lenWords := (U(2, 4 bits) + fpImmWords).resized
+        } .elsewhen(fpIsGen && fpEaOk) {
+          r.simple        := True
+          r.lenWords      := (U(2, 4 bits) + fpEaExt).resized   // opword + FP ext + EA ext
+          r.ambiguousLine := fpEaAmb
         } .otherwise {
           r.simple := True; r.lenWords := U(1, 4 bits)
         }

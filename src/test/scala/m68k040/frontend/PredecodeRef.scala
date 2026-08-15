@@ -518,8 +518,17 @@ object PredecodeRef {
       // two implemented multiword carve-outs matching PredecodeWord exactly.
       case 0xA => CP(simple = true, lenWords = 1)
       case 0xF =>
-        if (op == 0xF27F) CP(simple = true, lenWords = 4)              // FSF (xxx).L
+        if (op == 0xF27F) CP(simple = true, lenWords = 4)                 // FSF (xxx).L
         else if ((op & 0xFFF8) == 0xF620) CP(simple = true, lenWords = 2) // MOVE16
+        // F-line FP-generic (cpGEN, `1111 001 000 mmmrrr`). This model is opword-only,
+        // and the RTL's length here genuinely depends on the EXTENSION word -- so this
+        // case encodes the RTL's behavior under the exhaustive sweep's own input, which
+        // drives the 1-arg PredecodeWord.classify(op) overload (extW = 0, extWValid =
+        // true). extW = 0 => opclass 000 => the 2-word register-to-register form. The
+        // ext-word-DEPENDENT arms (memory <ea>, #imm, FMOVECR) are outside what this
+        // model can express and are covered by PredecodeFpLenSpec's directed vectors
+        // instead -- see that file.
+        else if (((op >> 9) & 0x7) == 1 && ((op >> 6) & 0x7) == 0) CP(simple = true, lenWords = 2)
         else CP(simple = true, lenWords = 1)
       case _ => COMPLEX
     }
