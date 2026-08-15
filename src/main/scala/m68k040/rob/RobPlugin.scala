@@ -90,6 +90,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val sysKind    = m68k040.decode.SysKind()
     val sysReadDir = Bool()
     val sysRc      = UInt(12 bits)
+    // ── LUT-reduction ROB-fold Slice A (2026-08-08 area spec §4) ───────────────
+    // Replaces the deleted 64x32 `faultPcStore` Reg-Vec: that array only ever held
+    // Mux(faultUsesNextPc, nextPc, pc) captured at alloc — BOTH operands of which
+    // are ALREADY stored here (`predNextPc` == u.nextPc, `pc` == u.pc). Storing
+    // the 1-bit selector instead and re-deriving the mux at the single read site
+    // (`exceptionPc`) is bit-identical: same sources, same alloc write, same
+    // headReady/count>0 read gating as every other B1 field (see SAFETY above).
+    val faultUsesNextPc = Bool()
   }
 
   /** BTB/gshare retire-time training payload (task #129, area). Written ONLY by
@@ -270,7 +278,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // cycle the value lands); sysRetire gates on it so the write triggers only AFTER the
     // value is captured. RegInit(False), reset per-alloc (mirrors faultedStore).
     val sysValRdyStore  = Vec.fill(depth)(RegInit(False))
-    val faultPcStore  = Vec.fill(depth)(RegInit(U(0, 32 bits)))
+    // (faultPcStore — a 64x32 Reg-Vec holding Mux(faultUsesNextPc, nextPc, pc) captured
+    //  at alloc — deleted by ROB-fold Slice A: it was a redundant mux of two values the
+    //  `payload` Mem already stores; the 1-bit selector now rides in payload.faultUsesNextPc
+    //  and the mux is re-derived at the single read site, `exceptionPc` below.)
     // needsSupervisor per-entry (set at alloc from the µop): a PRIVILEGED op (MOVE-from-
     // SR). When such a head retires while the committed S bit is 0, the ROB converts it
     // to a faulted vector-8 (privilege violation, format-$0) entry — precise, like a
@@ -439,6 +450,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       p.sysKind    := u.sysKind
       p.sysReadDir := u.sysReadDir
       p.sysRc      := u.imm(11 downto 0).asUInt
+      // ROB-fold Slice A: the 1-bit fault-PC selector (replaces faultPcStore).
+      p.faultUsesNextPc := u.faultUsesNextPc
       p
     }
 
@@ -480,8 +493,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // NOT commit its result (precise). Only meaningful when the head is otherwise ready.
     val privViolation = headReady && p0.needsSup && !committedS && excIdle; privViolation.simPublic()
     // The head triggers an exception when it is a STATICALLY faulted head OR a privilege
-    // violation. Both route through the same entry FSM (faultPcStore / faultVecStore are
-    // overridden below for the privilege case).
+    // violation. Both route through the same entry FSM (the fault PC mux / faultVecStore
+    // are overridden below for the privilege case).
     val faultRetire = headReady && (faultedStore(h0) || privViolation) && excIdle; faultRetire.simPublic()
     // An RTE head that ALSO needs supervisor (Track C: payload.needsSup set at decode) and
     // is retiring in USER mode is a privViolation, not a real RTE — exclude it here so it
@@ -771,7 +784,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     }
     // LS MMU access-fault completion: mark the entry FAULTED (vector 2) + record the
     // faulting VA + SSW attrs. The faulting instruction's PC is already captured per
-    // entry at alloc (faultPcStore), so the $7 frame's PC field is available. Placed
+    // entry at alloc (payload.pc/predNextPc + the faultUsesNextPc selector — Slice A),
+    // so the $7 frame's PC field is available. Placed
     // with the other completion marks (BEFORE the alloc-reset) so alloc wins on a
     // re-used index. completes is set by the LS EU's normal completion port too (the
     // faulted access still completes so the entry can retire + trigger the exception).
@@ -845,8 +859,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     }
     // Execute-time conditional fault (TRAPV / CHK / DIV0 / address-error task #189):
     // flip the entry FAULTED + the CARRIED vector. faultPc is already the µop's own
-    // pc or nextPc (captured at alloc into faultPcStore via faultUsesNextPc, per-op —
-    // see MicroOpAssembler), so the format-$2 frame stacks the right PC; the PPC/
+    // pc or nextPc (selected at the exceptionPc read site via payload.faultUsesNextPc,
+    // captured at alloc, per-op — see MicroOpAssembler), so the format-$2 frame stacks
+    // the right PC; the PPC/
     // ADDRESS field is payload.pc for the PPC-style traps (TRAPV/CHK/DIV0) OR the
     // execute-time faultAddr (odd target) for address error — see faultAddrStore
     // below + ExceptionUnit's `entryVector === 3` mux. The entry also completes via
@@ -861,7 +876,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // entryFaultAddr for the is2 frame when entryVector===3. Harmless (unused) 0
       // for TRAPV/CHK/DIV0.
       faultAddrStore(euFaultCompletion.payload.robId)  := euFaultCompletion.payload.faultAddr
-      // faultPcStore is already the µop's own pc/nextPc (captured at alloc) — no write.
+      // The fault PC is already the µop's own pc/nextPc (payload capture at alloc +
+      // the faultUsesNextPc read-site mux, Slice A) — no write.
     }
 
     when(alloc0) {
@@ -873,7 +889,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       phtValidStore(tail)   := False
       faultedStore(tail)  := allocUopVec(0).faulted
       faultVecStore(tail) := allocUopVec(0).faultVector
-      faultPcStore(tail)  := Mux(allocUopVec(0).faultUsesNextPc, allocUopVec(0).nextPc, allocUopVec(0).pc)
+      // (fault PC: payload.faultUsesNextPc selects pc/nextPc at the read site — Slice A.)
       faultWrStore(tail)  := False; faultSupStore(tail) := False
       // Instruction-fetch fault: capture the fetch PC as the EA + the SSW-instr bit.
       faultAddrStore(tail)  := allocUopVec(0).faultAddr
@@ -898,7 +914,6 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       phtValidStore(tail + 1)   := False
       faultedStore(tail + 1)  := allocUopVec(1).faulted
       faultVecStore(tail + 1) := allocUopVec(1).faultVector
-      faultPcStore(tail + 1)  := Mux(allocUopVec(1).faultUsesNextPc, allocUopVec(1).nextPc, allocUopVec(1).pc)
       faultWrStore(tail + 1)  := False; faultSupStore(tail + 1) := False
       faultAddrStore(tail + 1)  := allocUopVec(1).faultAddr
       faultInstrStore(tail + 1) := allocUopVec(1).sswInstr
@@ -984,7 +999,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val privVec8 = privOnly || sysPrivFault
     val exceptionPending = Bool();    exceptionPending := faultRetire || sysPrivFault || privOnly; exceptionPending.simPublic()
     val exceptionVector  = UInt(8 bits);  exceptionVector := Mux(privVec8, U(8, 8 bits),  faultVecStore(h0)); exceptionVector.simPublic()
-    val exceptionPc      = UInt(32 bits); exceptionPc     := Mux(privVec8, p0.pc,    faultPcStore(h0));  exceptionPc.simPublic()
+    // Fault PC (ROB-fold Slice A): re-derive the old faultPcStore content from the
+    // payload Mem — Mux(faultUsesNextPc, predNextPc, pc), the exact expression the
+    // deleted array captured at alloc (same sources, same cycle, same address).
+    val exceptionPc      = UInt(32 bits); exceptionPc     := Mux(privVec8, p0.pc,    Mux(p0.faultUsesNextPc, p0.predNextPc, p0.pc));  exceptionPc.simPublic()
     // Access-fault (vector 2) extras for the format-$7 frame: the faulting VA + the
     // SSW access attrs {write, sizeBits, supervisor}. Meaningful only when the head's
     // vector is 2; the exception FSM selects the $7 path on the vector.
