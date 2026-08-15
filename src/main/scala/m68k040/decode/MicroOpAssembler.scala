@@ -1549,6 +1549,30 @@ object MicroOpAssembler {
         default        -> U(4, 8 bits)
       )
     }
+    // ── Line-F trap PC flavor: pre-instruction vs post-instruction ───────────────
+    // A vector-11 F-line trap comes in two flavors, and this project previously had only
+    // one. The generic top-nibble fallback has an UNKNOWN instruction length, so it must
+    // stack the FAULTING pc (restartable, faultUsesNextPc=False) -- the handler cannot
+    // know how far to advance. But an F-line encoding whose FULL length predecode DID
+    // frame is a different case: a real FPSP kernel emulates the instruction and RTEs,
+    // and if the frame carries the faulting PC it re-executes the same opword forever.
+    // Diagnosed in docs/superpowers/specs/2026-08-09-fpu-hardware-design.md section 5,
+    // cross-checked against m68k-ooo's two vector-11 delivery paths (its packed-source
+    // capture crack, which knows the length, raises an internal pseudo-vector that commit
+    // translates back to architectural vector 11 while selecting the fall-through PC;
+    // its plain top-nibble fallback keeps the faulting PC). The ARCHITECTURAL VECTOR IS
+    // 11 IN BOTH CASES -- there is no second vector and no pseudo-vector exposed here,
+    // only the PC-field selection the ROB already implements for TRAP/TRAPV/CHK/DIV0.
+    //
+    // The discriminator needs no new DecodePacket field, because Task 5 established the
+    // invariant: a cpGEN instruction is NEVER genuinely one word (its extension word is
+    // mandatory), so on a cpGEN opword lenWords===1 means "predecode declined to frame
+    // it" and lenWords>=2 means "full length known". `pkt.simple` is required too: a
+    // COMPLEX packet's lenWords is meaningless (0).
+    val fpLenKnown = spec.fpGeneric && pkt.simple && (pkt.lenWords >= U(2))
+    when(bad && fpLenKnown) {
+      opUop.faultUsesNextPc := True
+    }
     // ── ANDI/ORI/EORI #imm,CCR: a CCR read-modify-write op µop (ALU cluster) ─────
     // The base opUop already carries op = AND/OR/EOR + useImm/imm = the imm byte (via
     // the IMMEXT srcB). Override the operand/flag masks: NO int operands / dst; READS
