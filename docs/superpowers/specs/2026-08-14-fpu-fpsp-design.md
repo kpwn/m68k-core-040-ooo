@@ -185,6 +185,53 @@ IQ port), the same pattern MUL used when added — NOT a dedicated new EU/IQ-por
 Chosen given this project's LUT-bloat sensitivity, at the cost of FP ops contending with
 integer DIV/MUL/CHK for the same slot.
 
+### 10. Overflow/Underflow: hardware-native substitution, NOT deferred to software
+
+**REVISION 2026-08-15**, replacing the original blanket busy-frame deferral for OVFL/UNFL
+(see the narrowed FSAVE/FRESTORE section below). Verified directly against the MC68040 UM,
+§9.8.6 (Overflow) and §9.8.7 (Underflow) — a materially different picture than initially
+assumed:
+
+**Real 68040 hardware does not write anything to a floating-point-register destination on
+overflow or underflow — ever, regardless of whether the user enabled the FPCR trap bit.**
+Quoted directly: "Trap Disabled Results: If the destination is a floating-point data
+register, then the register is not affected, and ... an exception is reported ... Trap
+Enabled Results: Results are identical to the trap disabled case." This is not an optional
+compatibility refinement — every real 68040 unconditionally traps to software to complete
+these two conditions for register destinations. The completion algorithm itself is fully
+specified and simple:
+
+**Overflow** — substitute a value keyed on rounding mode and sign only:
+
+| Mode | Result |
+|---|---|
+| RN | Infinity, sign of the intermediate result |
+| RZ | Largest-magnitude number, same sign |
+| RM | +overflow → largest positive; −overflow → infinity |
+| RP | +overflow → infinity; −overflow → largest negative |
+
+**Underflow** — denormalize: shift the mantissa right while incrementing the exponent until
+it reaches the destination format's denormalized exponent value, then round; if the shift
+empties the mantissa entirely, fall back to a sign/rounding-mode table structurally identical
+in shape to overflow's (zero vs. smallest-denormal).
+
+**Decision: implement both substitutions directly in hardware, in the CPLX-cluster FP EU,
+rather than trapping to software at all for the baseline case.** Neither needs CU_SAVEPC, the
+writeback buffer, or any busy-frame-specific state — overflow is a 4-way combinational lookup
+on inputs the EU already has; underflow is a right-shift-until-normalized, which real 1990
+silicon likely punted to software specifically because a variable-length shift doesn't fit a
+fixed-latency in-order pipeline stage — a constraint this design does not share (the CPLX EU
+is already multi-cycle for FDIV). This is a genuine improvement over "68881-compatible", not
+merely equivalent to it: since real hardware traps unconditionally for this case, implementing
+the substitution ourselves means we never trap at all for the common case, where every real
+68040 pays a full exception round-trip.
+
+**What this does NOT cover**: the separate, narrower case of a user program that explicitly
+enables the FPCR trap bit for OVFL/UNFL and wants a custom handler to inspect the true
+pre-overflow value via the $6000-exponent-biased "exceptional operand" (ETEMP) the manual
+also specifies for that path. That case still needs the busy frame's fuller field set —
+see the FSAVE/FRESTORE section below for the now-narrowed scope of what remains deferred.
+
 ## FSAVE/FRESTORE State Frames
 
 Verified directly against the MC68040 User's Manual, §9.7 and Figure 9-7 — this **corrects**
@@ -201,7 +248,7 @@ scopes the fourth down:
 | Null | 4 bytes | Version forced to `$00` (identifies null, not a length code); byte 1 undefined | **Yes, in full** |
 | Idle | 4 bytes | Real version number; byte 1 = `$00` (0 extra bytes) | **Yes, in full** |
 | Unimplemented FP instruction | 44 bytes (22 words) | Version; byte 1 = `$28` (40 extra bytes) | **Yes, in full** — this is the actual "route to FPSP" path |
-| Busy (numeric exceptions) | 100 bytes (50 words) | Version; byte 1 = `$60` (96 extra bytes) | **Deferred — see below** |
+| Busy (numeric exceptions) | 100 bytes (50 words) | Version; byte 1 = `$60` (96 extra bytes) | **Narrowed — see below** |
 
 **Unimplemented-instruction frame fields** (the one that matters for the FPSP-routing path):
 STAG/DTAG (3-bit source/dest operand-type tags), CMDREG1B (instruction command word), E1
@@ -209,16 +256,45 @@ STAG/DTAG (3-bit source/dest operand-type tags), CMDREG1B (instruction command w
 direct copy from the 80-bit register file per Decision 1, no conversion needed), ETS/ETE/ETM
 (source operand, extended precision, same).
 
-**Busy frame — numeric-exception software-correction path DEFERRED.** This frame is packed
-with real-68040-microarchitecture fields this OoO design has no natural analog for:
-CU_SAVEPC (conversion-unit micro-PC, for mid-pipeline resumption), WBTS/WBTE/WBTM
-(writeback-buffer contents), CMDREG3B. It exists specifically so a real 68881/68882-compatible
-software-correction handler can bring the 68040's hardware-generated default result (for
-numeric exceptions like OVFL/UNFL/INEX2 that are enabled but don't stop execution) into
-bit-exact agreement with what a 68881/68882 would have produced. For the 11 HW-native ops,
-this design ships a correct default IEEE result on these exceptions without the
-software-correction step. Revisit only if real ROM software is found to depend on it —
-matches Decision 2's "extend later based on real profiling, not upfront guesswork" philosophy.
+**Busy frame scope, REVISED 2026-08-15 — narrower than the original blanket deferral, and
+verified against both the manual and the real ROM FPSP kernel's disassembly:**
+
+Per Decision 10, OVFL/UNFL substitution is now implemented directly in hardware, so the busy
+frame is no longer needed at all for the baseline/common case of those two exceptions. What
+remains genuinely deferred is only the case of a user-enabled FPCR trap wanting the true
+pre-overflow "exceptional operand" (the $6000-exponent-biased ETEMP) via a custom handler —
+a narrow, advanced use case, not baseline correctness.
+
+Disassembly of the real Q700 ROM FPSP kernel (`420dbff3.rom`, base `0x40800000`) confirms
+this split cleanly maps onto which numeric-exception vectors the kernel actually installs.
+**Only 6 of the 8 numeric-exception vectors are wired by this ROM at all**: BSUN (48),
+Underflow (51), Operand Error (52), Overflow (53), Signaling NaN (54), Unimplemented Data
+Type (55) — installed at `0x4088D252`/`0x4088D856`/`0x4088D28C`/`0x4088D544`/`0x4088D68E`/
+`0x4088DAB0` respectively. Vectors 49 (Inexact) and 50 (Divide-by-Zero) have no handler
+installed anywhere in the ROM — consistent with real 68040 hardware always computing those
+two exactly, with no discrepancy vs. a 68881/68882 ever possible, hence nothing to correct.
+
+Of the 6 installed handlers, disassembly shows a clean split matching the manual's own E1/E3
+distinction:
+- **BSUN, Operand Error, Signaling NaN, Unimplemented Data Type** (4 of 6) never reference
+  busy-frame-only offsets at all — they read only fields the smaller 44-byte
+  unimplemented-instruction frame already carries (an opclass/CMDREG1B-class field at what
+  resolves to offset $08 of that frame). These already work correctly once the
+  unimplemented-instruction frame (above) is implemented — no additional work needed.
+- **Overflow, Underflow** (2 of 6) genuinely and unconditionally read CU_SAVEPC (busy-frame
+  offset $08) and WBTS (offset $18) on the mainline path, gating real conditional branches —
+  confirmed empirically, not a corner case. But the actual instructions doing this
+  (`moveb %fp@(-284),%d0; andib #-2,%d0; beqw ...`) are a software bit-test-and-branch on a
+  byte value, not a jump to a hardware micro-PC address — meaning CU_SAVEPC most likely
+  encodes a status/discriminant byte the handler reads as data, not a literal
+  pipeline-resumption mechanism we'd need to fake. WBTS/WBTE/WBTM is simply our EU's
+  already-computed (but exception-flagged) tentative result, which we currently discard —
+  capturing it into the frame is plumbing, not a new capability. Since Decision 10 already
+  eliminates the trap for the baseline OVFL/UNFL case, this handler code path is now ONLY
+  reached when a user program has explicitly enabled the FPCR trap for these two exceptions —
+  genuinely rare. **Still deferred**: pin down CU_SAVEPC's exact bit encoding (not yet
+  confirmed against primary source) before attempting this narrow path; not a blocker for
+  anything else in this design.
 
 **Version number**: real hardware's own busy-frame diagram example uses `$40`. This design
 does not need to match a specific real silicon stepping; `$40` is a reasonable default choice,
@@ -240,8 +316,11 @@ Two independent surfaces, deliberately not conflated:
 ## Explicitly Out of Scope / Deferred
 
 - FScc/FDBcc/FTRAPcc hardware acceleration (Decision 2) — deferred, not ruled out.
-- Busy-frame numeric-exception software-correction path (FSAVE/FRESTORE section above) —
-  deferred, default IEEE result shipped instead for now.
+- **Only** the user-enabled-FPCR-trap-with-custom-handler path for OVFL/UNFL exceptional-
+  operand inspection (FSAVE/FRESTORE section, Decision 10) — the baseline OVFL/UNFL
+  completion is now hardware-native and NOT deferred; only the narrow $6000-biased-ETEMP/
+  CU_SAVEPC path for advanced user handlers remains open, and even that only needs
+  CU_SAVEPC's exact bit encoding pinned down, not new architecture.
 - Full Musashi FP-exception/FSAVE-frame parity (Decision 3) — Musashi's own emulation-core
   limitations, worked around via directed tests instead.
 - FPSP itself is never shipped in this project's RTL (Decision 8) — a booted OS's own copy
