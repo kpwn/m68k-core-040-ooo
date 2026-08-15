@@ -1084,14 +1084,18 @@ object PredecodeWord {
         // #imm source length is keyed off the FP source SPECIFIER, not the op size, so it
         // cannot go through eaExt (whose `sizeL` has no such notion): Long 4B=2w,
         // Single 4B=2w, Extended 12B=6w, Packed 12B=6w, Word 2B=1w, Double 8B=4w,
-        // Byte (word-aligned) =1w. Format 111 (packed, DYNAMIC k-factor from a Dn) has
-        // no immediate-source encoding on real hardware (the k-factor names a data
-        // register, which an immediate operand cannot itself supply) -- treated as
-        // contributing 0 extra words, matching the opclass-010-only #imm arm below,
-        // which still frames the mandatory opword+ext-word pair even for this case
-        // rather than declining to frame at all. (NOTE: this SpinalHDL version, 1.14.1,
-        // has no `muxListDc` on UInt/Bits -- a `switch` is used instead, encoding the
-        // identical table.)
+        // Byte (word-aligned) =1w. Source specifier 111 is NOT a data format at all --
+        // per Task 4's own landed decode (DecodedUop.scala's FpSrcKind.ROMCONST comment:
+        // "opclass 010 / source specifier 111 -- FMOVECR; the source is the FPU's
+        // internal constant ROM, indexed by `imm[6:0]`"), fpSrcSpec===7 identifies
+        // FMOVECR, and `fpIsMovecr` below (opclass 010 + specifier 111) is checked in
+        // the `.elsewhen` chain BEFORE the #imm arm that consumes `fpImmWords`, so it
+        // always intercepts first -- the switch's `default` arm for index 7 is provably
+        // dead code, never reached by any opword. It exists only because SpinalHDL's
+        // `switch` on a 3-bit UInt requires an exhaustive match; the `U(0, 3 bits)`
+        // value it assigns has no architectural meaning. (NOTE: this SpinalHDL version,
+        // 1.14.1, has no `muxListDc` on UInt/Bits -- a `switch` is used instead, encoding
+        // the identical table.)
         val fpImmWords = UInt(3 bits)
         switch(fpSrcSpec) {
           is(U(0, 3 bits)) { fpImmWords := U(2, 3 bits) }   // Long
@@ -1101,7 +1105,7 @@ object PredecodeWord {
           is(U(4, 3 bits)) { fpImmWords := U(1, 3 bits) }   // Word
           is(U(5, 3 bits)) { fpImmWords := U(4, 3 bits) }   // Double
           is(U(6, 3 bits)) { fpImmWords := U(1, 3 bits) }   // Byte
-          default          { fpImmWords := U(0, 3 bits) }   // 7: packed dynamic-k, no #imm encoding
+          default          { fpImmWords := U(0, 3 bits) }   // 7: FMOVECR, unreachable dead arm (see above)
         }
         // FMOVECR (opclass 010 + source specifier 111) has NO <ea> at all -- the opword's
         // EA field is unused and the constant's ROM offset rides ext[6:0]. 2 words flat.
