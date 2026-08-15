@@ -78,6 +78,22 @@ class IqSourcePlugin extends FiberPlugin {
       u.pFpccSrc := io.pFpccSrc; u.readsFpcc  := io.readsFpcc
       u.pFpccDst := io.pFpccDst; u.writesFpcc := io.writesFpcc
       u.pFpOld   := 0; u.pFpccOld := 0    // rename bookkeeping only; the IQ never reads them
+      // FP-generic op-identity fields (Task 4/6, `DecodedUop.fpuOp`/`fpSrcKind`/
+      // `fpSrcFmt`/`fpWideImm`, carried VERBATIM through rename -- unlike `fpSrcAReg`/
+      // `fpDstReg`/`usesFpSrcA`/`usesFpSrcB`, which rename replaces with the physical FP
+      // tags above, these four are opcode/format IDENTITY, not register references, so
+      // rename passes them through unchanged). PRE-EXISTING GAP found 2026-08-15 while
+      // investigating a Task 6b regression: these were NEVER added here when Task 4/6
+      // landed them on `RenamedUop` (same "fields added after this stub was first
+      // written" gap this file's own header already anticipates) -- left genuinely
+      // undriven, which happened to stay harmless while `FpSrcKind` was 3 bits wide, but
+      // is exactly the "every bundle field needs a driver" hazard this file's comments
+      // warn about. Confirmed via a clean-baseline bisection (`git stash`): once Task 6b
+      // widens `FpSrcKind` 3->4 bits (2 new elements, MEMPAIR/MEMEXT), the previously-
+      // dormant undriven fields perturbed `IqCplxSpec`/`IqAluSlowSpec` (unrelated
+      // arbitration-timing tests, not exercising anything FP-specific) -- fixed here by
+      // finally giving them the same safe-default treatment as every other post-hoc field.
+      u.fpuOp := 0; u.fpSrcKind := m68k040.decode.FpSrcKind.FPREG; u.fpSrcFmt := 0; u.fpWideImm := 0
       // Third source (DIV.L 64/32) + CPLX/div control + precise-fault fields: safe
       // defaults (these IQ tests don't exercise DIV/CHK/faults).
       u.psrcC        := 0; u.psrcCValid := False

@@ -44,11 +44,29 @@ class FpAssembleSpec extends AnyFunSuite {
       assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 11)
       assert(!dut.uop.faultUsesNextPc.toBoolean,
         "an unknown-length line-F trap MUST stay restartable (faulting PC) -- the handler cannot know the length")
-      // And a cpGEN opword that predecode declined to frame (reserved <ea>) behaves the same.
-      drive(dut, op = 0xF23D, ext = 0x4022, len = 1); sleep(1)
-      assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 11)
-      assert(!dut.uop.faultUsesNextPc.toBoolean,
-        "lenWords===1 on a cpGEN opword means 'not framed' -- it must NOT claim a known length")
+    }
+  }
+
+  // Task 6b UPDATE: a cpGEN opword with a RESERVED <ea> (mode 7/reg 5..7, e.g. 0xF23D) is
+  // NOT Dn(0)/An(1)/#imm(7,4) -- it now falls into Task 6b's memory-mode-<ea> µcode gate
+  // (OperationDecoder cannot distinguish "reserved" from "genuine memory" without the ext
+  // word either, exactly like every other opclass sharing this opword band -- Finding 1).
+  // The trap decision for THIS shape has moved from THIS assembler-only layer to
+  // `DecodeStage.ucBegin`'s `EaClass =/= MEMSIMPLE` rejection (verified end-to-end by
+  // `FpMemLoadSpec`, which exercises the real µcode-ROM walk this `Dut` cannot). At
+  // THIS layer, the only observable is that the opword got routed to the µcode engine
+  // at all (not silently left as an ordinary "bad"/illegal instruction).
+  test("a cpGEN opword with a RESERVED <ea> routes to the µcode engine (Task 6b) instead of trapping here", VerilatorTest) {
+    class DecDut extends Component {
+      val opword = in Bits (16 bits)
+      val o      = out(OpSpec())
+      o := OperationDecoder.decode(opword)
+    }
+    SimConfig.withVerilator.compile(new DecDut).doSim { dut =>
+      dut.opword #= 0xF23D; sleep(1)   // mode 7 / reg 5 -- reserved, not Dn/An/#imm
+      assert(!dut.o.illegal.toBoolean, "cpGEN family stays non-illegal (the µcode engine owns emission)")
+      assert(dut.o.microcoded.toBoolean, "routed to the µcode engine -- ucBegin resolves accept/reject for real")
+      assert(dut.o.op.toEnum == DecOp.FPU)
     }
   }
 
@@ -278,7 +296,7 @@ class FpAssembleSpec extends AnyFunSuite {
     }
   }
 
-  test("out-of-scope cpGEN forms still trap to vector 11 -- with the post-instruction PC", VerilatorTest) {
+  test("out-of-scope cpGEN forms (register/immediate <ea>) still trap to vector 11 -- with the post-instruction PC", VerilatorTest) {
     run { dut =>
       def trapsWithNextPc(op: Int, ext: Int, len: Int, name: String): Unit = {
         drive(dut, op = op, ext = ext, len = len); sleep(1)
@@ -287,14 +305,44 @@ class FpAssembleSpec extends AnyFunSuite {
         assert(!dut.uop.writesFp.toBoolean && !dut.uop.writesFpcc.toBoolean,
           s"$name must leave no FP side effect on the trapping uop")
       }
+      // <ea> = mode 0 (Dn direct) -- Task 6's own scope, unaffected by Task 6b's new
+      // memory-mode-<ea> µcode gate (mode 0 is explicitly excluded from it).
       trapsWithNextPc(0xF200, 0x000E, 2, "FSIN (transcendental -> FPSP)")
       trapsWithNextPc(0xF200, 0x0462, 2, "FSADD (rounded-precision variant, opmode bit6 -> FPSP)")
-      trapsWithNextPc(0xF210, 0x4022, 2, "FADD.L (A0),FP0 (memory source -> Task 6b)")
-      trapsWithNextPc(0xF210, 0x5822, 2, "FADD.P (A0),FP0 (packed decimal -> FPSP)")
-      trapsWithNextPc(0xF210, 0x6800, 2, "FMOVE.X FP0,(A0) (opclass 011, store direction -> unowned)")
-      trapsWithNextPc(0xF210, 0xD0FF, 2, "FMOVEM.X (A0),FP0-FP7 (opclass 110 -> unowned)")
-      trapsWithNextPc(0xF210, 0x9000, 2, "FMOVE.L (A0),FPCR (opclass 100, memory-EA -> unowned; Task 9 covers only register-direct <ea>, and Task 9b's optional popcount==1-with-memory-EA extension is not guaranteed landed by default)")
     }
+  }
+
+  // Task 6b UPDATE: every case below has a GENUINE memory <ea> (mode 2, (A0)) -- these are
+  // now CORRECTLY routed to Task 6b's µcode engine (`spec.microcoded := True`) instead of
+  // trapping directly at THIS assembler-only layer; the accept/reject decision moved to
+  // `DecodeStage.ucBegin`, which this `Dut` (MicroOpAssembler-only) cannot exercise. The
+  // real end-to-end trap for every one of these forms is verified by `FpMemLoadSpec`
+  // (Packed memory source, opclass 011 store, opclass 110 FMOVEM all directly covered
+  // there; the FPCR/FPSR/FPIAR memory-EA form (opclass 100) is the SAME "wrong opclass"
+  // rejection path, not independently re-tested here to avoid duplicating that coverage).
+  // At THIS layer, the only observable is that each opword got routed to the µcode
+  // engine at all (not silently misclassified as an ordinary "bad"/illegal instruction).
+  test("out-of-scope cpGEN forms (genuine memory <ea>) route to the µcode engine (Task 6b), not trap here", VerilatorTest) {
+    class DecDut extends Component {
+      val opword = in Bits (16 bits)
+      val o      = out(OpSpec())
+      o := OperationDecoder.decode(opword)
+    }
+    def routesToUcode(op: Int, name: String): Unit = {
+      SimConfig.withVerilator.compile(new DecDut).doSim { dut =>
+        dut.opword #= op; sleep(1)
+        assert(!dut.o.illegal.toBoolean, s"$name: cpGEN family stays non-illegal")
+        assert(dut.o.microcoded.toBoolean, s"$name: routed to the µcode engine -- ucBegin decides accept/reject")
+        assert(dut.o.op.toEnum == DecOp.FPU, s"$name: still classified DecOp.FPU")
+      }
+    }
+    // ext word is irrelevant to OperationDecoder (opword-only) -- only the opword's <ea>
+    // mode (mode 2 = (A0) here) matters for THIS classification decision.
+    routesToUcode(0xF210, "FADD.L (A0),FP0 (memory source -> Task 6b)")
+    routesToUcode(0xF210, "FADD.P (A0),FP0 (packed decimal -> FPSP, via ucBegin)")
+    routesToUcode(0xF210, "FMOVE.X FP0,(A0) (opclass 011, store direction -> unowned)")
+    routesToUcode(0xF210, "FMOVEM.X (A0),FP0-FP7 (opclass 110 -> unowned)")
+    routesToUcode(0xF210, "FMOVE.L (A0),FPCR (opclass 100, memory-EA -> unowned)")
   }
 
   test("an FP uop never escapes with an inconsistent framing view", VerilatorTest) {

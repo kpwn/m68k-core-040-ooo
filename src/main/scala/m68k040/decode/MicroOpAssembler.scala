@@ -1553,7 +1553,18 @@ object MicroOpAssembler {
     // does NOT emit still takes the ordinary vector-11 F-line trap -- now with
     // faultUsesNextPc=True whenever predecode framed it (Step 2), which is what makes it
     // FPSP-completable instead of an infinite loop.
-    val fpGenBad = spec.fpGeneric && !fpEmit
+    // Task 6b: `&& !spec.microcoded` excludes the genuine memory-mode-<ea> cpGEN band --
+    // OperationDecoder routes that whole band (opclass-agnostic) to the µcode ROM
+    // (`spec.microcoded := True`), mirroring every other microcoded family's "kept
+    // NON-illegal, the sequencer owns emission" contract (DecodeContracts.scala's
+    // `microcoded` doc). Without this exclusion, `fpEmit` would correctly stay False for
+    // a memory-mode source (none of fpFormIsReg/fpFormIsIntReg/fpFormIsMovecr/fpFormIsImm
+    // ever match a memory <ea>), so `fpGenBad` would ALSO fire here and race the ROM
+    // engine's own real accept/reject decision at `ucBegin` (which correctly rejects
+    // Packed and every non-opclass-010 form back to a genuine vector-11 trap via
+    // `FP_MEM_TRAP_ENTRY` -- the ROM, not this assembler-level gate, now owns that
+    // decision for the whole memory-mode band).
+    val fpGenBad = spec.fpGeneric && !fpEmit && !spec.microcoded
 
     // ── Immediate word extraction ────────────────────────────────────────────────
     // The immediate data ALWAYS starts at pkt.words(2) (right after opword + FP ext

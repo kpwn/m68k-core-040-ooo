@@ -40,7 +40,14 @@ class BitfieldDecodeSpec extends AnyFunSuite {
     // an earlier microcode-ROM-growth slice (DecodeContracts.scala), but this test DUT was
     // never updated, so every `runSpec` test here was failing elaboration with a width
     // mismatch — unrelated to the F-series bugs, fixed here for the same reason.
-    val ucEntry    = out(UInt(7 bits)); ucEntry := s.ucEntry
+    // RE-FOUND stale 2026-08-15 (Task 6b's ucEntry-width audit): `OpSpec.ucEntry` had
+    // ALREADY silently grown 7->8 bits in a later slice (task #197's MI_BF_* family) with
+    // this DUT never updated again — confirmed via a clean-baseline test run showing all 33
+    // `runSpec`-based tests failing with the SAME `WIDTH MISMATCH (7 bits <- 8 bits)`
+    // elaboration error, pre-existing and unrelated to Task 6b. Fixed to the CURRENT width
+    // (9 bits, widened again by Task 6b's own FP-generic memory-source ROM growth) while
+    // auditing every `ucEntry`-width call site for this task's own +58-row bump.
+    val ucEntry    = out(UInt(9 bits)); ucEntry := s.ucEntry
     val illegal    = out(Bool());      illegal := s.illegal
     val bfOp       = out(Bits(3 bits)); bfOp := s.bfOp
     val op         = out(DecOp());      op := s.op

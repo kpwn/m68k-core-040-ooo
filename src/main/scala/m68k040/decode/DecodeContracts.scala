@@ -164,8 +164,10 @@ case class OpSpec() extends Bundle {
   // + CAS2 10), so 5 bits (0..31) overflowed. slice 3c dynamic-mem bit-field pushes romSize
   // past 64 (entries up to 86), so 7 bits (0..127). task #197's MI_BF_* family (memory-
   // indirect bit-field) pushes romSize past 128 (entries up to 165), so 8 bits (0..255).
-  // FMax-neutral (cold decode field).
-  val ucEntry       = UInt(8 bits)
+  // Task 6b's FP-generic memory-source load family (18 format x EA-bucket entry groups +
+  // 1 trap entry, 58 new rows) pushes romSize from 252 to 310, overflowing 8 bits (0..255)
+  // -> widened to 9 bits (0..511). FMax-neutral (cold decode field).
+  val ucEntry       = UInt(9 bits)
   // ── Commit-time PRIVILEGED SYSTEM ops (MOVE-to-SR / MOVE-USP / MOVEC) ─────────
   // Classification only (the assembler builds the op µop carrying these): `sysOp`
   // marks a serializing commit-time system op, `sysKind` selects which, `sysReadDir`

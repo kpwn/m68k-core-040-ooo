@@ -1142,6 +1142,49 @@ object OperationDecoder {
           o.readsNzvc := False; o.writesNzvc := False   // FP ops touch FPCC, never the integer CCR
           o.readsX    := False; o.writesX    := False
         }
+        // ── Task 6b: F-line FP-generic MEMORY-mode <ea> -> the µcode ROM ────────
+        // `F<op> <mem>,FPn` (opclass 010, this task), `FMOVE FPn,<mem>` (011, store,
+        // NOT this task), `FMOVE(M) <ea>,FPCR/FPSR/FPIAR` (100/101, Task 9's territory),
+        // and `FMOVEM <ea>,list`/`list,<ea>` (110/111, unowned) all share this SAME
+        // opword shape `0xF200|<ea>` -- the opclass field that disambiguates them lives
+        // entirely in ext[15:13] (words(1)), which this decoder cannot see (Task 4's own
+        // grounding: decode() runs opword-only at I-cache refill time). So this arm
+        // routes the whole memory-mode-<ea> cpGEN band (opclass-agnostic) to the µcode
+        // ROM with ONE shared placeholder entry; `DecodeStage`'s `ucBegin` -- which DOES
+        // see the real ext word (mirrors the bit-field family's own
+        // `BF_RMW_4B_ENTRY "overridden by ucBegin"` precedent above) -- does the REAL
+        // opclass/format/EA-mode dispatch, rejecting every non-opclass-010 form and
+        // Packed (fpSrcSpec 011) back to a genuine vector-11 trap (`FP_MEM_TRAP_ENTRY`,
+        // faultUsesNextPc=True since Task 5 already frames cpGEN length).
+        //
+        // Gated on: cpGEN family (isFpGeneric) AND the opword's <ea> mode indicates
+        // memory (mode != 0 Dn — Task 6's direct-emit INTREG path owns that; mode != 1
+        // An — never a valid FP source; NOT mode 7/reg 4 #imm — Task 6's direct-emit
+        // IMMEDIATE path owns that too, INCLUDING its own Packed-immediate exclusion
+        // (`fpImmIsPacked`, MicroOpAssembler.scala) — routing #imm through this gate
+        // would silently bypass Task 6's own already-correct immediate-form handling,
+        // a real regression caught live by `FpAssembleSpec`'s existing Packed-immediate
+        // and out-of-scope-forms tests). This intentionally ALSO matches the
+        // opclass-011/100/101/110/111 memory forms and Packed MEMORY sources
+        // (Finding 1) — ucBegin resolves the ambiguity for real once it can see
+        // ext[15:13]/ext[12:10]. Reserved <ea> encodings (mode 7/reg 5..7) are NOT
+        // excluded here (this decoder cannot distinguish "reserved" from "genuine
+        // memory" without the ext word either) — they route through the µcode engine
+        // too and are correctly rejected by `ucBegin`'s own `EaClass =/= MEMSIMPLE`
+        // check (mirrors how a reserved bit-field EA is handled).
+        val fpMemEaMode  = opword(5 downto 3).asUInt
+        val fpMemEaReg   = opword(2 downto 0).asUInt
+        val fpMemIsImmEa = (fpMemEaMode === U(7, 3 bits)) && (fpMemEaReg === U(4, 3 bits))
+        val fpMemIsMemEa = isFpGeneric && (fpMemEaMode =/= U(0, 3 bits)) && (fpMemEaMode =/= U(1, 3 bits)) &&
+                           !fpMemIsImmEa
+        when(fpMemIsMemEa) {
+          o.microcoded := True
+          // Placeholder -- ucBegin ALWAYS overrides this once it reads the real ext
+          // word (never actually reaches the sequencer at this value; set to the trap
+          // entry itself as a safe, self-documenting default in case that invariant is
+          // ever violated).
+          o.ucEntry := U(Microcode.FP_MEM_TRAP_ENTRY, o.ucEntry.getWidth bits)
+        }
         // FSF (xxx).L — task #180 (ported-tests triage, cluster13/exc_fsf_xxx_l_no_fline):
         // opword 0xF27F, ext1 0x0000 (the FScc "false" predicate — condition field is
         // OPER_I_16()&0x3f per Musashi's fscc(), 0 selects always-false), then a 2-word

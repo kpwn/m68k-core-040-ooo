@@ -147,7 +147,28 @@ object DecOp extends SpinalEnum {
   * FMOVEM and the FMOVE-to-<ea> direction remain unowned by any task in this plan. */
 object FpSrcKind extends SpinalEnum {
   val FPREG, INTREG, ROMCONST,
-      INTIMM, SINGLEIMM, DOUBLEIMM, EXTIMM = newElement()
+      INTIMM, SINGLEIMM, DOUBLEIMM, EXTIMM,
+      // ── Task 6b: genuine memory-source loads (F<op> <mem>,FPn) ─────────────────
+      // Both reuse the SAME srcA/srcB/srcC -> psrcA/psrcB/psrcC int-register-read
+      // machinery every other CPLX op already uses (Desc.srcC/RenamedUop.psrcC,
+      // already fully wired end-to-end through IssueQueuePlugin's CPLX scoreboard/
+      // wakeup logic and already read by DivEuPlugin for DIVL's dividend-high word)
+      // -- no new EU port, only new dispatch logic in DivEuPlugin (Task 8's Step 5,
+      // which switches on these two values).
+      //   MEMPAIR : Double-format memory load. srcA=T0(mem+0, hi), srcB=T1(mem+4, lo).
+      //             The EU concatenates {srcA,srcB} into a 64-bit IEEE double bit
+      //             pattern and converts it to extended via the SAME doubleToExtended
+      //             helper the DOUBLEIMM case already needs.
+      //   MEMEXT  : Extended-format memory load. srcA=T0(mem+0, sign+exp in [31:16]),
+      //             srcB=T1(mem+4, mantissa hi), srcC=T2(mem+8, mantissa lo). NO
+      //             numeric conversion -- pure bit placement, {srcA[31:16],srcB,srcC}
+      //             IS the 80-bit extended value.
+      // Byte/Word/Long/Single memory loads do NOT get a new FpSrcKind: after the
+      // crack's load micro-op lands the value in a temp register, the terminal
+      // FP-issue uop is INDISTINGUISHABLE from the existing register-source INTREG
+      // case (srcAReg points at a temp T0 instead of Dn; the EU-side conversion,
+      // dispatched by fpSrcFmt, is identical either way) -- INTREG is reused verbatim.
+      MEMPAIR, MEMEXT = newElement()
 }
 
 /** Commit-time privileged-system-op kind (DecodedUop.sysOp / .sysKind). Selects how

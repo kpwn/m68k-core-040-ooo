@@ -931,8 +931,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // caught live via PORTED_TRACE_DLOAD's ucstate trace showing ucPc jump 127 -> 0 -> 1 -> 2
     // instead of 127 -> 128 -> 129, silently re-executing BCD_MEM_ENTRY's rows instead of the
     // new entry's materialize+store. Widened to 8 bits (plenty of headroom to romSize's
-    // current 130).
-    val ucPc     = Reg(UInt(8 bits))
+    // current 130). Task 6b's FP-generic memory-source load family pushes romSize from
+    // 252 to 310, overflowing 8 bits (0..255) the same way -- widened to 9 bits (0..511),
+    // mirroring `OpSpec.ucEntry`'s identical widening (DecodeContracts.scala).
+    val ucPc     = Reg(UInt(9 bits))
     ucPc.simPublic()
     val ucCtx    = Reg(Microcode.Ctx())
     ucCtx.miOther.simPublic(); ucCtx.miOtherValid.simPublic()  // debug-only (task #144)
@@ -1151,6 +1153,93 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // (mirrors ucMovesRn's own ext-word extraction, one nibble down) — harmless/unread for
     // every other microcode customer.
     ucEntryCtx.move16Ay := (U(8, 5 bits) + ucEntryPkt.words(1)(14 downto 12).asUInt).resize(5)
+    // ── Task 6b: F-line FP-generic genuine memory-source loads Ctx population ──────────
+    // `OperationDecoder`'s new memory-mode-<ea> arm routes the WHOLE opword-ambiguous
+    // cpGEN memory band (opclass 010/011/100/101/110/111 all share `0xF200|<ea>`) to this
+    // engine with one shared placeholder entry; HERE (ucBegin, which DOES see the real ext
+    // word) is where the real opclass/format/EA-mode dispatch happens, exactly mirroring
+    // the bit-field family's own `ucEntry`-override precedent.
+    val ucFpExt      = ucEntryPkt.words(1)
+    val ucFpOpClass  = ucFpExt(15 downto 13)
+    val ucFpSrcSpec  = ucFpExt(12 downto 10)
+    val ucFpDstFp    = ucFpExt(9 downto 7).asUInt
+    val ucFpOpmode   = ucFpExt(6 downto 0)
+    val ucFpEaMode   = ucEntryPkt.words(0)(5 downto 3).asUInt
+    val ucFpEaReg    = ucEntryPkt.words(0)(2 downto 0).asUInt
+    val ucIsFpMem    = ucEntrySpec.microcoded && (ucEntrySpec.op === DecOp.FPU)
+    // Step 1(a) CONFIRMED (grep `eaBaseValid :=` / read of the ctx-population sites
+    // above): `ucBfEaDec`/`ucBfEaWords` (bit-field family's own EA re-decode, already
+    // computed UNCONDITIONALLY every cycle from `ucEntryPkt.words(0)(5:0)` + a vector that
+    // shifts past `words(1)` -- the SAME "opword + one opcode-specific ext word + the <ea>'s
+    // OWN ext words starting at word 2" layout `PredecodeWord.scala`'s cpGEN framing
+    // documents verbatim: "The EA's own first extension word sits at op+2 (the FP extension
+    // word occupies op+1)") is genuinely general EA-resolution infrastructure, not
+    // bit-field-specific despite its doc comment's wording -- directly reusable here with
+    // ZERO new EA-decode hardware. `ucBfEaDec.base/.baseValid/.indexReg/.indexValid/
+    // .indexLong/.indexScale` are ALREADY the correct FP-memory EA fields (the unconditional
+    // default assignment above already latches them into `ucEntryCtx.eaBase`/etc). Only
+    // `.disp` needs re-deriving here: the bit-field family's own DEFAULT `eaDispLo`
+    // additionally folds a bit-field-specific `origOffset>>3` byte-delta (read from
+    // `ucBfExt` AS IF it were a bit-field ext word) that would silently misinterpret the FP
+    // ext word's opclass/srcSpec/dstFp/opmode bits as bogus offset/width fields -- so
+    // `eaDispLo` is overridden below to the CLEAN `ucBfEaDec.disp` for this family only.
+    // PC-relative EA modes need pc+4 folded in too (mirrors `ucBfPcRelConst`'s own "the
+    // address of the EA's own extension word = pc+4" precedent, task #199) since
+    // `ucBfEaDec.disp` for a PC-rel mode is the RAW displacement only (`EaDecoder.scala`'s
+    // own "assembler folds pc" comment) -- folding it into `eaDispLo` itself makes a
+    // PC-relative FP-memory load behave EXACTLY like the already-working absolute-EA case
+    // at the LOAD rows (`SEaBase` invalid -> address = disp alone).
+    val ucFpDispLoClean = Mux(ucBfEaDec.pcRel,
+      (ucBfPcRelConst.asUInt + ucBfEaDec.disp.asUInt).asBits,
+      ucBfEaDec.disp)
+    when(ucIsFpMem) {
+      ucEntryCtx.eaDispLo := ucFpDispLoClean
+    }
+    // Step 1(d) CONFIRMED: `OperationDecoder.decode(opword)` genuinely is opword-only
+    // (Task 4's own grounding, re-verified by direct read here) -- Task 9's own arm (not
+    // yet landed as of this task) reading `words(1)` directly would be the one that needs
+    // reconciling, not this task's `ucBegin`-override design. See this task's report for
+    // the full note.
+    //
+    // Step 1(b)/(c): the hardware-native opmode whitelist mirrors MicroOpAssembler's
+    // `fpNative` verbatim (Task 6) -- a memory-source FSIN/FMOD/etc. must still trap to
+    // FPSP, not silently try to "execute" through this family's INTREG/MEMPAIR/MEMEXT
+    // dispatch. The per-format An auto-increment/decrement delta (1/2/4/4/8/12 bytes) and
+    // the Byte format's A7 word-alignment quirk are carried over UNVERIFIED against the
+    // MC68040 UM's own FP data format chapter (this session had no primary-source access) --
+    // flagged exactly as Finding 6/7 required, not silently assumed correct.
+    val ucFpNative =
+      (ucFpOpmode === B"7'h00") || (ucFpOpmode === B"7'h01") || (ucFpOpmode === B"7'h03") ||
+      (ucFpOpmode === B"7'h04") || (ucFpOpmode === B"7'h18") || (ucFpOpmode === B"7'h1A") ||
+      (ucFpOpmode === B"7'h20") || (ucFpOpmode === B"7'h22") || (ucFpOpmode === B"7'h23") ||
+      (ucFpOpmode === B"7'h28") || (ucFpOpmode === B"7'h38") || (ucFpOpmode === B"7'h3A")
+    // MEMINDIRECT-klass EAs ([bd,An],od / ([bd,An,Xn],od) / PC-rel memory-indirect
+    // brackets) are OUT of this task's scope (not listed among Task 5's covered modes) --
+    // `EaClass.MEMSIMPLE` excludes them (mirrors the bit-field-memory family's own
+    // MEMSIMPLE-vs-MEMINDIRECT routing split).
+    val ucFpMemBad =
+      (ucFpOpClass =/= B"3'b010") || (ucFpSrcSpec === B"3'b011") ||
+      !ucFpNative || (ucBfEaDec.klass =/= EaClass.MEMSIMPLE)
+    // Signed per-format An auto-increment/decrement delta (SFpAutoDelta). Byte gets the
+    // A7 word-alignment quirk (mirrors `deltaBytesU`'s existing special-case); every other
+    // format is >=2 bytes so the quirk (byte-access-only, per general 68k semantics) never
+    // applies to it.
+    val ucFpAnIsA7   = ucFpEaReg === U(7, 3 bits)
+    val ucFpDeltaMag = ucFpSrcSpec.mux(
+      B"3'b000" -> U(4, 5 bits),    // Long
+      B"3'b001" -> U(4, 5 bits),    // Single
+      B"3'b010" -> U(12, 5 bits),   // Extended
+      B"3'b100" -> U(2, 5 bits),    // Word
+      B"3'b101" -> U(8, 5 bits),    // Double
+      B"3'b110" -> Mux(ucFpAnIsA7, U(2, 5 bits), U(1, 5 bits)),  // Byte (A7 quirk)
+      default   -> U(4, 5 bits)     // 011/111: inert (Packed always ucFpMemBad; 111 n/a)
+    )
+    val ucFpPredec = ucFpEaMode === U(4, 3 bits)
+    ucEntryCtx.fpAutoDelta := Mux(ucFpPredec,
+      (-(ucFpDeltaMag.resize(32).asSInt)).asBits,
+      ucFpDeltaMag.resize(32).asBits)
+    // Packed FP-issue command word (SFpCmd): opmode[6:0] | dstFp[2:0]<<7 | srcSpec[2:0]<<10.
+    ucEntryCtx.fpCmd := (B(0, 19 bits) ## ucFpSrcSpec ## ucFpDstFp.asBits ## ucFpOpmode).resize(32)
     // ── FULL-format MEMORY-INDIRECT host-op Ctx population (spec §5) ──────────────
     // A general EA-taking op (MOVE/ALU/imm/single-EA) whose EA is a full-format memory-
     // indirect mode routes through the engine: [LOAD.L pointer -> T0] then the host op at
@@ -1847,7 +1936,29 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
                            U(Microcode.MI_BF_RMW_DO1_ENTRY, ew bits)),
       Mux(ucBfRmwOp === 7, U(Microcode.MI_BF_INS_DO0_V2_ENTRY, ew bits),
                            U(Microcode.MI_BF_RMW_DO0_ENTRY, ew bits)))
-    val ucRealEntry = Mux(ucIsBfMemindRmw, ucBfMemindRmwEntry,
+    // Task 6b: F-line FP-generic genuine memory-source loads -- the REAL entry (one of 18
+    // format x EA-bucket groups) or the reject-to-trap entry, picked from the real ext
+    // word (`ucFpOpClass`/`ucFpSrcSpec`/`ucFpEaMode`, populated above at the early
+    // ctx-population point, alongside `ucFpMemBad`). `ew` (this file's own `ucEntry.
+    // getWidth`) is only in scope from here on, mirroring every other `ucXxxEntry` helper
+    // in this section (`ucMovesEntry`/`ucBfDynRdEntry`/etc, all likewise computed here
+    // rather than at the early population point).
+    def ucFpEntryForFmt(base: Int, autoPost: Int, autoPre: Int): UInt =
+      Mux(ucFpEaMode === U(3, 3 bits), U(autoPost, ew bits),
+      Mux(ucFpEaMode === U(4, 3 bits), U(autoPre, ew bits),
+                                        U(base, ew bits)))
+    val ucFpRealEntryOk = ucFpSrcSpec.mux(
+      B"3'b000" -> ucFpEntryForFmt(Microcode.FP_MEM_L_ENTRY, Microcode.FP_MEM_L_AUTO_POST_ENTRY, Microcode.FP_MEM_L_AUTO_PRE_ENTRY),
+      B"3'b001" -> ucFpEntryForFmt(Microcode.FP_MEM_S_ENTRY, Microcode.FP_MEM_S_AUTO_POST_ENTRY, Microcode.FP_MEM_S_AUTO_PRE_ENTRY),
+      B"3'b010" -> ucFpEntryForFmt(Microcode.FP_MEM_X_ENTRY, Microcode.FP_MEM_X_AUTO_POST_ENTRY, Microcode.FP_MEM_X_AUTO_PRE_ENTRY),
+      B"3'b100" -> ucFpEntryForFmt(Microcode.FP_MEM_W_ENTRY, Microcode.FP_MEM_W_AUTO_POST_ENTRY, Microcode.FP_MEM_W_AUTO_PRE_ENTRY),
+      B"3'b101" -> ucFpEntryForFmt(Microcode.FP_MEM_D_ENTRY, Microcode.FP_MEM_D_AUTO_POST_ENTRY, Microcode.FP_MEM_D_AUTO_PRE_ENTRY),
+      B"3'b110" -> ucFpEntryForFmt(Microcode.FP_MEM_B_ENTRY, Microcode.FP_MEM_B_AUTO_POST_ENTRY, Microcode.FP_MEM_B_AUTO_PRE_ENTRY),
+      default   -> U(Microcode.FP_MEM_TRAP_ENTRY, ew bits)   // 011 Packed / 111 n/a -- ucFpMemBad already rejects 011
+    )
+    val ucFpRealEntry = Mux(ucFpMemBad, U(Microcode.FP_MEM_TRAP_ENTRY, ew bits), ucFpRealEntryOk)
+    val ucRealEntry = Mux(ucIsFpMem, ucFpRealEntry,
+      Mux(ucIsBfMemindRmw, ucBfMemindRmwEntry,
       Mux(ucIsBfMemindRd, ucBfMemindRdEntry,
       Mux(ucIsMemInd, ucMiEntry,
       Mux(ucIsBfDynRd, ucBfDynRdEntry,
@@ -1856,7 +1967,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         Mux(ucBfNeedHi, U(Microcode.BF_RMW_5B_ENTRY, ew bits),
                         U(Microcode.BF_RMW_4B_ENTRY, ew bits)),
       Mux(ucIsMoves, ucMovesEntry,
-        ucEntrySpec.ucEntry)))))))
+        ucEntrySpec.ucEntry))))))))
     ucRealEntry.simPublic()  // debug-only (task #144)
 
     // LUT-reduction Task A2: the real `Mem(DescBits(), romSize)` (built from
@@ -1910,7 +2021,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     //   ucCurLast -> ucNextPc` crosses the Mem's output register.
     // `ucCtx` needs NO such adjustment: it is a Reg latched on ucBegin and constant for the
     // whole chain, so reading it live (as before) is correct — the old code read the same Reg.
-    val ucNextPc  = UInt(8 bits)
+    val ucNextPc  = UInt(9 bits)   // task 6b: widened 8->9 bits alongside ucPc/OpSpec.ucEntry
     val ucRowBits = ucReadRow(ucNextPc.resize(log2Up(Microcode.romSize)))
     val ucCurUop  = Microcode.resolveFromBits(ucRowBits, ucCtx, True)
     val ucCurLast = ucRowBits.isLast
@@ -2161,7 +2272,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // are mutually exclusive anyway.
     ucNextPc := ucPc                                              // (c) hold
     when(ucBegin) {
-      ucNextPc := ucRealEntry.resize(8)                           // (a) entry
+      ucNextPc := ucRealEntry.resize(9)                           // (a) entry
     } elsewhen(ucActive) {
       when(pushProduced.ready && !ucCurLast) { ucNextPc := ucPc + 1 }   // (b) advance
     }
@@ -2179,7 +2290,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // `ucBegin || ucActive` because `ucPc` has no reset value — while the engine is idle it
     // holds an arbitrary (in sim, randomized) value that is never used as a live row.
     GenerationFlags.simulation {
-      assert(!((ucBegin || ucActive) && ucNextPc >= U(Microcode.romSize, 8 bits)),
+      assert(!((ucBegin || ucActive) && ucNextPc >= U(Microcode.romSize, 9 bits)),
         s"DecodeStage: the microcode µPC left the ROM (ucNextPc >= romSize=${Microcode.romSize}) while the µcode engine was entering or running -- either a ucEntry constant is stale/out of range, or a ROM chain ran past its last row without an isLast descriptor. The Mem rows at/above romSize are UNINITIALIZED, so continuing would execute undefined microcode.",
         FAILURE)
     }

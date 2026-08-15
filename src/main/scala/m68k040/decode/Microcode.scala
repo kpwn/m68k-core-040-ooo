@@ -117,6 +117,29 @@ object Microcode {
   case object SImm8  extends Sel     // selImm: constant 8  (MOVE16 transfer offset)
   case object SImm12 extends Sel     // selImm: constant 12 (MOVE16 transfer offset)
   case object SImm16 extends Sel     // selImm: constant 16 (MOVE16 Ax/Ay += 16 write-back)
+  // ── Task 6b: FP-generic genuine memory-source loads ─────────────────────────────
+  // New displacement selectors for the side-effect-free EA bucket, mirroring the
+  // CONFIRMED-REAL `eaDispHi = eaDispLo + 4` precedent (SEaDispHi above) one step
+  // further for the 3-chunk Extended case. `ctx.eaDispLo` is already the CLEAN raw EA
+  // displacement for an FP-generic memory source (DecodeStage's ucBegin overrides it
+  // away from the bit-field family's own byteOff-folded default specifically for this
+  // family) — folding pc+4 in for a PC-relative EA too, so these selectors work
+  // uniformly across every side-effect-free addressing mode Task 5 frames.
+  case object SFpDispMid extends Sel   // selImm: ctx.eaDispLo + 4  (Double lo / Extended mantissa-hi)
+  case object SFpDispHi  extends Sel   // selImm: ctx.eaDispLo + 8  (Extended mantissa-lo)
+  // Signed per-format An auto-increment/decrement delta (1/2/4/4/8/12 bytes for
+  // Byte/Word/Long/Single/Double/Extended, negative for -(An)), computed once at
+  // ucBegin from the real ext word's source-format field + the opword's EA mode (and
+  // the A7 byte-access word-alignment quirk for the Byte format, mirroring
+  // `deltaBytesU`'s existing A7 special-case). Used by the auto-increment EA-mode
+  // bucket's trailing/leading `UAddDrop` write-back row.
+  case object SFpAutoDelta extends Sel   // selImm: ctx.fpAutoDelta
+  // Packed FP-issue command word: opmode[6:0] | dstFp[2:0]<<7 | srcSpec[2:0]<<10,
+  // mirroring BFRESOLVE's existing bfResImm packing idiom -- same technique, applied to
+  // microcode ctx instead of the direct-emission path. Read once at ucBegin from the
+  // real ext word (before the ROM walk even begins), so the terminal `UFpIssue` row
+  // never needs to see the raw ext word itself.
+  case object SFpCmd extends Sel   // selImm: ctx.fpCmd
 
   /** The op kind of a descriptor's template. */
   sealed trait UOp
@@ -158,6 +181,14 @@ object Microcode {
   // path, extended to .B). Dn (ext15=0): size-merge.sz(Dn, T0) (read Rn as srcA = the merge
   // source). The An-vs-Dn choice + isMovea is resolved from ctx.movesRnIsA. NO CCR write.
   case object UMovesRead extends UOp
+  // ── Task 6b: FP-generic genuine memory-source loads ─────────────────────────────
+  // The terminal FP-issue row: DecOp.FPU/Cluster.CPLX, exactly like Task 6's directly-
+  // emitted register-form uop, EXCEPT srcA/srcB/srcC are temp registers (T0/T1/T2,
+  // populated by the crack's own preceding LOAD rows) instead of Dn/FPm, and fpSrcKind
+  // comes from this Desc row's own static `fpSrcKindSel` tag rather than being derived
+  // from the opword/ext-word at assembly time (SFpCmd was already packed by ucBegin from
+  // the real ext word, read once, before the ROM walk began).
+  case object UFpIssue extends UOp
 
   /** Memory role. */
   sealed trait Mem
@@ -223,6 +254,19 @@ object Microcode {
                                      // land+fold) — the BFFFO Do=1 funnel writes the index+flags to a temp; the
                                      // trailing ADD is the single committed step carrying Dn2 + the funnel's flags
       bfIllegal:   Boolean = false,  // deliver an ILLEGAL (vector-4) µop — BFINS mem-dynamic is DEFERRED (gated)
+      // Task 6b: deliver a vector-11 F-line trap µop (the `ucFpMemBad` reject path --
+      // wrong opclass / Packed source / non-hardware-native opmode / an unsupported EA
+      // klass sharing the same opword band). Unlike `bfIllegal`, faultUsesNextPc=True:
+      // Task 5's predecode already frames cpGEN length regardless of format, so the
+      // fault is RTE-able (a real FPSP kernel can complete it and return), not a
+      // restart-forever loop.
+      fpMemTrap:   Boolean = false,
+      // Task 6b: UFpIssue's static source-kind tag -- 0=INTREG (1 int-register chunk,
+      // reused verbatim from Task 6's register-form path), 1=MEMPAIR (2 chunks, Double),
+      // 2=MEMEXT (3 chunks, Extended). Baked per-ROM-row at Desc-authoring time (which
+      // format this entry group serves is always statically known), NOT derived from any
+      // runtime ext-word field.
+      fpSrcKindSel: Int = 0,
       miPtrIndex:  Boolean = false,  // UMiPtrLoad: add the PRE-index (eaIndex) to the pointer addr
       miHostIndex: Boolean = false,  // UMiHostMove LS row: add the POST-index (eaIndex) to (T0+od)
       miMoveFlags: Boolean = false,  // UMiHostMove: this IS the host MOVE (sets NZVC per ctx.miWNzvc)
@@ -258,7 +302,7 @@ object Microcode {
   // ═══════════════════════════════════════════════════════════════════════════════
 
   /** Hardware encoding of `Sel` (the operand-selector vocabulary) — one element per
-    * `Sel` case object (54), same names. */
+    * `Sel` case object (58, incl. Task 6b's SFpDispMid/SFpDispHi/SFpAutoDelta/SFpCmd). */
   object SelHw extends SpinalEnum {
     val
         SA7, SAx, SAy, SBfDeltaImm, SBfDn2, SBfImm,
@@ -266,6 +310,7 @@ object Microcode {
         SBfResImm, SBfWdDyn, SCas2Da1, SCas2Da2, SCas2Dc1, SCas2Dc2,
         SCas2Du1, SCas2Du2, SCas2Rn1, SCas2Rn2, SCasDc, SCasDu,
         SDeltaAx, SDeltaAy, SDn2, SEaBase, SEaDispHi, SEaDispLo,
+        SFpAutoDelta, SFpCmd, SFpDispHi, SFpDispMid,
         SImm12, SImm16, SImm4, SImm8, SMiImm, SMiOd,
         SMiOther, SMiOtherEaBase, SMiOtherEaDispLo, SMiOtherOd, SMove16Ay, SMovesAn,
         SMovesDelta, SMovesRn, SNegDeltaAx, SNegDeltaAy, SNone, SPackAdj,
@@ -273,21 +318,21 @@ object Microcode {
   }
 
   /** Hardware encoding of `UOp` (the µop-template vocabulary) — one element per
-    * `UOp` case object (16), plus `UCasOp` as a single TAG element: unlike every
-    * other `UOp` case, the real `UCasOp` is a Scala CASE CLASS carrying its own
-    * sub-payload (`form: Int, writesNzvc/readsNzvc/dropCommit: Boolean`) — a
-    * SpinalEnum element cannot itself carry a payload, so `DescBits` below adds 4
-    * sibling fields (`casForm`/`casWritesNzvc`/`casReadsNzvc`/`casDropCommit`),
-    * valid only when `uop === UOpHw.UCasOp`. This mirrors the existing `Desc` idiom
-    * of siblings-to-`uop` payload fields for other per-kind extra data (e.g.
-    * `bfStoreForm` for `UBfMem`, `miPtrIndex` for `UMiPtrLoad`) — UCasOp's payload
-    * just happens to already be bundled into the Scala case class instead of being
-    * separate `Desc` fields. */
+    * `UOp` case object (17, incl. Task 6b's UFpIssue), plus `UCasOp` as a single TAG
+    * element: unlike every other `UOp` case, the real `UCasOp` is a Scala CASE CLASS
+    * carrying its own sub-payload (`form: Int, writesNzvc/readsNzvc/dropCommit:
+    * Boolean`) — a SpinalEnum element cannot itself carry a payload, so `DescBits`
+    * below adds 4 sibling fields (`casForm`/`casWritesNzvc`/`casReadsNzvc`/
+    * `casDropCommit`), valid only when `uop === UOpHw.UCasOp`. This mirrors the
+    * existing `Desc` idiom of siblings-to-`uop` payload fields for other per-kind
+    * extra data (e.g. `bfStoreForm` for `UBfMem`, `miPtrIndex` for `UMiPtrLoad`) —
+    * UCasOp's payload just happens to already be bundled into the Scala case class
+    * instead of being separate `Desc` fields. */
   object UOpHw extends SpinalEnum {
     val
         UMove, UAddDrop, UOpFromCtx, UBfMem, UBfResolve, UBfShiftOff,
         UBfAdd, UBfReg, UMiPtrLoad, UMiHostMove, UMiHostOp, UMiLeaFinal,
-        UMiPushFinal, UMiBranchFinal, UShiftR8, UMovesRead, UCasOp = newElement()
+        UMiPushFinal, UMiBranchFinal, UShiftR8, UMovesRead, UFpIssue, UCasOp = newElement()
   }
 
   /** Hardware encoding of `Mem` (memory role) — one element per case object (3). */
@@ -352,6 +397,8 @@ object Microcode {
     val bfDrop      = Bool()  // divIsRem: DROP this µop's oracle-step observation (its reg/NZVC writes
                                // still land+fold)
     val bfIllegal   = Bool()  // deliver an ILLEGAL (vector-4) µop — BFINS mem-dynamic is DEFERRED (gated)
+    val fpMemTrap   = Bool()  // Task 6b: deliver a vector-11 F-line trap µop (faultUsesNextPc=True)
+    val fpSrcKindSel = UInt(2 bits)  // Task 6b: UFpIssue's static source-kind tag (0/1/2)
     val miPtrIndex  = Bool()  // UMiPtrLoad: add the PRE-index (eaIndex) to the pointer addr
     val miHostIndex = Bool()  // UMiHostMove LS row: add the POST-index (eaIndex) to (T0+od)
     val miMoveFlags = Bool()  // UMiHostMove: this IS the host MOVE (sets NZVC per ctx.miWNzvc)
@@ -393,6 +440,7 @@ object Microcode {
         case UMiBranchFinal => (UOpHw.UMiBranchFinal, 0, false, false, false)
         case UShiftR8       => (UOpHw.UShiftR8, 0, false, false, false)
         case UMovesRead     => (UOpHw.UMovesRead, 0, false, false, false)
+        case UFpIssue       => (UOpHw.UFpIssue, 0, false, false, false)
         case co: UCasOp     => (UOpHw.UCasOp, co.form, co.writesNzvc, co.readsNzvc, co.dropCommit)
       }
     b.uop           := uopHw
@@ -450,6 +498,10 @@ object Microcode {
       case SEaBase => SelHw.SEaBase
       case SEaDispHi => SelHw.SEaDispHi
       case SEaDispLo => SelHw.SEaDispLo
+      case SFpAutoDelta => SelHw.SFpAutoDelta
+      case SFpCmd => SelHw.SFpCmd
+      case SFpDispHi => SelHw.SFpDispHi
+      case SFpDispMid => SelHw.SFpDispMid
       case SImm12 => SelHw.SImm12
       case SImm16 => SelHw.SImm16
       case SImm4 => SelHw.SImm4
@@ -500,6 +552,8 @@ object Microcode {
     b.bfTstForm           := Bool(d.bfTstForm)
     b.bfDrop              := Bool(d.bfDrop)
     b.bfIllegal           := Bool(d.bfIllegal)
+    b.fpMemTrap           := Bool(d.fpMemTrap)
+    b.fpSrcKindSel        := U(d.fpSrcKindSel, 2 bits)
     b.miPtrIndex          := Bool(d.miPtrIndex)
     b.miHostIndex         := Bool(d.miHostIndex)
     b.miMoveFlags         := Bool(d.miMoveFlags)
@@ -1633,7 +1687,151 @@ object Microcode {
     Desc(UAddDrop, srcA = SMove16Ay, dst = SMove16Ay, useImm = true, imm = SImm16,
          isLast = true),                                                                  // µPC251 (m9)
   )
-  val rom: Vector[Desc] = romP1() ++ romP2() ++ romP3() ++ romP4() ++ romP5() ++ romP6() ++ romP7() ++ romP8()
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // Task 6b: F-line FP-generic genuine memory-source loads (`F<op> <mem>,FPn`).
+  //
+  // 6 hardware-supportable data formats (Byte/Word/Long/Single/Double/Extended -- Packed
+  // stays out of scope, Decision 2, always traps) x 3 EA-mode buckets:
+  //   BASE      : every side-effect-free EA mode Task 5's eaExt() framing covers --
+  //               (An), (d16,An), (d8,An,Xn) brief/full, (xxx).W/.L, (d16,PC)/(d8,PC,Xn).
+  //               Reuses the bit-field-memory arm's SEaBase/SEaDispLo pattern (address =
+  //               SEaBase + SEaDispLo, indexFromEa=true for the (d8,An,Xn) index).
+  //   AUTO_POST : `(Ay)+`.  Reuses MOVE16's own explicit precedent instead (plain register
+  //               base + a flat useImm/imm literal displacement per chunk, NOT the
+  //               eaAuto/predec-postinc machinery -- multiple same-base accesses at
+  //               different fixed offsets don't fit an auto-tag's single-access-with-
+  //               side-effect semantics, same reason MOVE16 avoids it). Loads first
+  //               (unmodified Ay), then the terminal FP-issue row, then a single flat
+  //               `UAddDrop` write-back LAST (dropped crack µop).
+  //   AUTO_PRE  : `-(Ay)`. Same MOVE16-style flat-literal addressing, but the `UAddDrop`
+  //               write-back runs FIRST (isFirst) so the load rows' `SAy` reads already
+  //               see the decremented value via the ordinary in-order-decode RAW
+  //               dependency (mirrors MOVE16's own Ax==Ay same-cycle-RAW resolution, and
+  //               `PACK_MEM_ENTRY`'s "load Ay/predec" leading-decrement ordering).
+  //
+  // AUTO_POST and AUTO_PRE are genuinely DIFFERENT straight-line row ORDERS (the v1 engine
+  // is straight-line only -- no data-dependent branch/reorder, this file's own header
+  // comment), so each format needs 3 separate physical ROM entry groups, not 2: this is
+  // 18 physical groups, not the "12" a flatter (format x bucket) count would suggest --
+  // recorded explicitly here since Finding 6 of the task brief undercounts this by not
+  // distinguishing the two AUTO orderings.
+  //
+  // Every group's terminal row is `UFpIssue` (fpSrcKindSel 0=INTREG reused verbatim for
+  // the 1-chunk formats per Task 6's own field, 1=MEMPAIR for Double, 2=MEMEXT for
+  // Extended -- Finding 3's confirmed-real srcA/srcB/srcC -> psrcA/psrcB/psrcC 3-source
+  // reuse, already fully wired through IssueQueuePlugin's CPLX scoreboard/wakeup logic).
+  private case class FpMemFmt(tag: String, chunks: Int, loadSz: Sz)
+  // srcSpec-keyed (ext[12:10]): 000 Long, 001 Single, 010 Extended, 100 Word, 101 Double,
+  // 110 Byte (011 Packed excluded -- Decision 2; 111 is FMOVECR, unreachable here).
+  private val fpMemFormats: Vector[FpMemFmt] = Vector(
+    FpMemFmt("B", 1, SzByte),
+    FpMemFmt("W", 1, SzWord),
+    FpMemFmt("L", 1, SzLong),
+    FpMemFmt("S", 1, SzLong),
+    FpMemFmt("D", 2, SzLong),
+    FpMemFmt("X", 3, SzLong),
+  )
+  private def fpMemKindSel(fmt: FpMemFmt): Int = fmt.chunks match { case 2 => 1; case 3 => 2; case _ => 0 }
+  private def fpMemChunkTemp(i: Int): Sel = i match { case 0 => ST0; case 1 => ST1; case _ => ST2 }
+  private def fpMemChunkDispSel(i: Int): Sel = i match { case 0 => SEaDispLo; case 1 => SFpDispMid; case _ => SFpDispHi }
+  // Auto-bucket per-chunk literal offset from the (unmodified, in AUTO_POST; already-
+  // decremented, in AUTO_PRE) Ay: chunk 0 needs no imm at all (plain SAy), chunks 1/2
+  // reuse MOVE16's existing SImm4/SImm8 constants verbatim.
+  private def fpMemChunkAutoImm(i: Int): Option[Sel] = i match { case 0 => None; case 1 => Some(SImm4); case _ => Some(SImm8) }
+
+  private def fpMemIssueRow(fmt: FpMemFmt, isLast: Boolean): Desc = {
+    val srcB = if (fmt.chunks >= 2) fpMemChunkTemp(1) else SNone
+    val srcC = if (fmt.chunks >= 3) fpMemChunkTemp(2) else SNone
+    Desc(UFpIssue, srcA = ST0, srcB = srcB, srcC = srcC, useImm = true, imm = SFpCmd,
+         fpSrcKindSel = fpMemKindSel(fmt), isLast = isLast)
+  }
+
+  // BASE (side-effect-free EA bucket): [LOAD x chunks] + [UFpIssue].
+  private def fpMemBaseGroup(fmt: FpMemFmt): Vector[Desc] = {
+    val loads = (0 until fmt.chunks).map { i =>
+      Desc(UMove, mem = MLoad, srcA = SEaBase, dst = fpMemChunkTemp(i),
+           useImm = true, imm = fpMemChunkDispSel(i), sz = fmt.loadSz,
+           indexFromEa = true, isFirst = (i == 0))
+    }.toVector
+    loads :+ fpMemIssueRow(fmt, isLast = true)
+  }
+
+  // AUTO_POST `(Ay)+`: [LOAD x chunks] + [UFpIssue] + [UAddDrop Ay+=delta] (isLast).
+  private def fpMemAutoPostGroup(fmt: FpMemFmt): Vector[Desc] = {
+    val loads = (0 until fmt.chunks).map { i =>
+      fpMemChunkAutoImm(i) match {
+        case Some(sel) => Desc(UMove, mem = MLoad, srcA = SAy, dst = fpMemChunkTemp(i),
+                                useImm = true, imm = sel, sz = fmt.loadSz, isFirst = (i == 0))
+        case None      => Desc(UMove, mem = MLoad, srcA = SAy, dst = fpMemChunkTemp(i),
+                                sz = fmt.loadSz, isFirst = (i == 0))
+      }
+    }.toVector
+    loads :+ fpMemIssueRow(fmt, isLast = false) :+
+      Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SFpAutoDelta, isLast = true)
+  }
+
+  // AUTO_PRE `-(Ay)`: [UAddDrop Ay-=delta] (isFirst) + [LOAD x chunks] + [UFpIssue] (isLast).
+  private def fpMemAutoPreGroup(fmt: FpMemFmt): Vector[Desc] = {
+    val decRow = Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SFpAutoDelta, isFirst = true)
+    val loads = (0 until fmt.chunks).map { i =>
+      fpMemChunkAutoImm(i) match {
+        case Some(sel) => Desc(UMove, mem = MLoad, srcA = SAy, dst = fpMemChunkTemp(i), useImm = true, imm = sel, sz = fmt.loadSz)
+        case None      => Desc(UMove, mem = MLoad, srcA = SAy, dst = fpMemChunkTemp(i), sz = fmt.loadSz)
+      }
+    }.toVector
+    decRow +: (loads :+ fpMemIssueRow(fmt, isLast = true))
+  }
+
+  private def romP9(): Vector[Desc] =
+    fpMemFormats.flatMap(fpMemBaseGroup) ++
+    fpMemFormats.flatMap(fpMemAutoPostGroup) ++
+    fpMemFormats.flatMap(fpMemAutoPreGroup) ++
+    // FP_MEM_TRAP_ENTRY: the `ucFpMemBad` reject path -- one row, a vector-11 F-line
+    // trap (faultUsesNextPc=True), mirroring `BF_DYN_ILLEGAL_ENTRY`'s single-row
+    // vector-4 precedent exactly, just a different vector/PC-flavor (fpMemTrap, not
+    // bfIllegal).
+    Vector(Desc(UMove, fpMemTrap = true, isFirst = true, isLast = true))
+
+  val rom: Vector[Desc] = romP1() ++ romP2() ++ romP3() ++ romP4() ++ romP5() ++ romP6() ++ romP7() ++ romP8() ++ romP9()
+
+  // Task 6b entry constants: SELF-COMPUTED from each group's own real row count (via
+  // `scanLeft`), not hand-counted literals -- eliminates arithmetic-drift risk across 18
+  // entry groups. `fpMemRomStart` independently re-derives romP1..romP8's combined size
+  // (252 as of this task) rather than hardcoding it. Final layout: rows 252..309 (58 new
+  // rows: 15 BASE + 21 AUTO_POST + 21 AUTO_PRE + 1 TRAP), romSize 252 -> 310.
+  private val fpMemRomStart: Int =
+    (romP1() ++ romP2() ++ romP3() ++ romP4() ++ romP5() ++ romP6() ++ romP7() ++ romP8()).size
+  private val fpMemBaseOffsets: Vector[Int] =
+    fpMemFormats.scanLeft(fpMemRomStart) { (acc, fmt) => acc + fpMemBaseGroup(fmt).size }
+  private val fpMemAutoPostOffsets: Vector[Int] =
+    fpMemFormats.scanLeft(fpMemBaseOffsets.last) { (acc, fmt) => acc + fpMemAutoPostGroup(fmt).size }
+  private val fpMemAutoPreOffsets: Vector[Int] =
+    fpMemFormats.scanLeft(fpMemAutoPostOffsets.last) { (acc, fmt) => acc + fpMemAutoPreGroup(fmt).size }
+
+  val FP_MEM_B_ENTRY = fpMemBaseOffsets(0)   // rows fpMemBaseOffsets(0)..(1)-1 (2 rows)
+  val FP_MEM_W_ENTRY = fpMemBaseOffsets(1)   // 2 rows
+  val FP_MEM_L_ENTRY = fpMemBaseOffsets(2)   // 2 rows
+  val FP_MEM_S_ENTRY = fpMemBaseOffsets(3)   // 2 rows
+  val FP_MEM_D_ENTRY = fpMemBaseOffsets(4)   // 3 rows
+  val FP_MEM_X_ENTRY = fpMemBaseOffsets(5)   // 4 rows
+
+  val FP_MEM_B_AUTO_POST_ENTRY = fpMemAutoPostOffsets(0)   // 3 rows
+  val FP_MEM_W_AUTO_POST_ENTRY = fpMemAutoPostOffsets(1)   // 3 rows
+  val FP_MEM_L_AUTO_POST_ENTRY = fpMemAutoPostOffsets(2)   // 3 rows
+  val FP_MEM_S_AUTO_POST_ENTRY = fpMemAutoPostOffsets(3)   // 3 rows
+  val FP_MEM_D_AUTO_POST_ENTRY = fpMemAutoPostOffsets(4)   // 4 rows
+  val FP_MEM_X_AUTO_POST_ENTRY = fpMemAutoPostOffsets(5)   // 5 rows
+
+  val FP_MEM_B_AUTO_PRE_ENTRY = fpMemAutoPreOffsets(0)   // 3 rows
+  val FP_MEM_W_AUTO_PRE_ENTRY = fpMemAutoPreOffsets(1)   // 3 rows
+  val FP_MEM_L_AUTO_PRE_ENTRY = fpMemAutoPreOffsets(2)   // 3 rows
+  val FP_MEM_S_AUTO_PRE_ENTRY = fpMemAutoPreOffsets(3)   // 3 rows
+  val FP_MEM_D_AUTO_PRE_ENTRY = fpMemAutoPreOffsets(4)   // 4 rows
+  val FP_MEM_X_AUTO_PRE_ENTRY = fpMemAutoPreOffsets(5)   // 5 rows
+
+  val FP_MEM_TRAP_ENTRY = fpMemAutoPreOffsets.last   // 1 row (the last row in the ROM)
+
   val BF_DYN_RD_PCREL_DO1_ENTRY  = 178   // rows 178..183
   val BF_DYN_FFO_PCREL_DO1_ENTRY = 184   // rows 184..190
   val MI_BF_RD_DO0_ENTRY  = 130
@@ -1836,6 +2034,18 @@ object Microcode {
     // convention). Populated at ucBegin from ucEntryPkt.words(1), mirrors ctx.movesRn's
     // own ext-word extraction. Harmless (unread) for every other microcode customer.
     val move16Ay = UInt(5 bits)
+    // ── Task 6b: FP-generic genuine memory-source loads ────────────────────────────────
+    // Signed per-format An auto-increment/decrement delta (see SFpAutoDelta above);
+    // populated at ucBegin from the real ext word's source-format field + the opword's EA
+    // mode. Harmless (unread) for every other microcode customer. NOTE: `eaDispLo` doubles
+    // as the FP memory crack's own clean base displacement (ucBegin overrides it away from
+    // the bit-field family's byteOff-folded default specifically when the current
+    // instruction is this family) -- SFpDispMid/SFpDispHi read it directly rather than via
+    // a dedicated ctx field, mirroring SEaDispHi's own "= eaDispLo + 4" precedent.
+    val fpAutoDelta = Bits(32 bits)
+    // Packed FP-issue command word (see SFpCmd above): opmode[6:0] | dstFp[2:0]<<7 |
+    // srcSpec[2:0]<<10. Harmless (unread) for every other microcode customer.
+    val fpCmd = Bits(32 bits)
   }
 
   // ── selector → (regId, valid) ──────────────────────────────────────────────
@@ -1918,6 +2128,11 @@ object Microcode {
     case SImm8       => U(8, 32 bits).asBits              // task #207: MOVE16 transfer offset
     case SImm12      => U(12, 32 bits).asBits             // task #207: MOVE16 transfer offset
     case SImm16      => U(16, 32 bits).asBits             // task #207: MOVE16 An += 16 write-back
+    // Task 6b: FP-generic genuine memory-source loads.
+    case SFpDispMid  => (ctx.eaDispLo.asUInt + U(4, 32 bits)).asBits   // Double lo / Extended mantissa-hi
+    case SFpDispHi   => (ctx.eaDispLo.asUInt + U(8, 32 bits)).asBits   // Extended mantissa-lo
+    case SFpAutoDelta => ctx.fpAutoDelta                                // signed per-format An delta
+    case SFpCmd      => ctx.fpCmd                                       // packed FP-issue command word
     case _           => B(0, 32 bits)
   }
 
@@ -1967,6 +2182,7 @@ object Microcode {
       case UMiPushFinal   => u.op := DecOp.MOVE     // stack-push store (mirrors pushUop/peaPush)
       case UMiBranchFinal => u.op := DecOp.BRANCH   // indirect branch (mirrors ibrUop)
       case UMovesRead  => u.op := DecOp.MOVE   // MOVE T0 -> Rn (sign-ext An / merge Dn in EU)
+      case UFpIssue    => u.op := DecOp.FPU    // task 6b: the terminal FP-generic issue row
       case _: UCasOp   => u.op := DecOp.CASOP
     }
     u.cluster := (d.uop match {
@@ -1985,6 +2201,10 @@ object Microcode {
       // own `Cluster.INT`) both already resolve correctly via the `_` default below.
       case UMiLeaFinal => Cluster.LS
       case UMovesRead => Cluster.INT         // the MOVES read writeback runs on the ALU pipe
+      // task 6b: the terminal FP-issue row runs on the shared CPLX cluster (spec Decision
+      // 9, same as Task 6's directly-emitted register-form uop) -- an explicit override
+      // since d.mem=MNone would otherwise default to Cluster.INT via the `_` arm below.
+      case UFpIssue => Cluster.CPLX
       case _: UCasOp => Cluster.INT          // CAS/CAS2 compute runs on the ALU pipe
       case _         => (d.mem match { case MNone => Cluster.INT; case _ => Cluster.LS })
     })
@@ -2083,8 +2303,15 @@ object Microcode {
     u.cond := 0; u.branchDisp := 0
     // bfIllegal: deliver a vector-4 ILLEGAL (the out-of-scope Do=1-at-abs-EA dynamic
     // RMW/INS forms route here — trap, NOT silent-wrong).
-    u.unimplemented := Bool(d.bfIllegal)
-    u.faulted := Bool(d.bfIllegal); u.faultVector := (if (d.bfIllegal) U(4, 8 bits) else U(0, 8 bits)); u.faultUsesNextPc := False
+    // fpMemTrap (task 6b): deliver a vector-11 F-line trap (the `ucFpMemBad` reject
+    // path — wrong opclass / Packed / non-native opmode / unsupported EA klass sharing
+    // this task's opword band). faultUsesNextPc=True (unlike bfIllegal): Task 5's
+    // predecode already frames cpGEN length regardless of format, so a real FPSP kernel
+    // can RTE past it instead of looping on the same opword forever.
+    u.unimplemented := Bool(d.bfIllegal) || Bool(d.fpMemTrap)
+    u.faulted := Bool(d.bfIllegal) || Bool(d.fpMemTrap)
+    u.faultVector := (if (d.bfIllegal) U(4, 8 bits) else if (d.fpMemTrap) U(11, 8 bits) else U(0, 8 bits))
+    u.faultUsesNextPc := Bool(d.fpMemTrap)
     u.faultAddr := ctx.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     u.divSigned := False; u.div64 := False
     // The two An write-back ADDs are DROPPED crack µops (divIsRem): the commit
@@ -2176,6 +2403,51 @@ object Microcode {
         u.bfMem       := False
         u.bfOp        := 0
         u.bfStoreForm := 0
+    }
+    // ── Task 6b: the terminal FP-generic issue row's FP-domain fields ──────────────
+    // `u.fpInert()` (top of this function) already defaulted every fp* field. UFpIssue
+    // is the ONLY microcode customer that ever overrides them -- every other ROM
+    // customer leaves this whole block dead, matching `u.bfMem`/`u.bfOp` above's shape.
+    // `ctx.fpCmd` was packed once at ucBegin from the REAL ext word (SFpCmd's own doc),
+    // so this is a pure unpack, mirroring the direct-emission INTREG/ROMCONST/immediate
+    // cases in MicroOpAssembler.scala (Task 6) field-for-field, EXCEPT the source is a
+    // temp register (srcA/srcB/srcC, already resolved above) instead of Dn/FPm/#imm.
+    // A genuine hardware `when(Bool(...))` (NOT a bare Scala `if`) -- a bare `if` would
+    // generate a SECOND unconditional full-width assignment to `fpInert()`'s already-
+    // unconditionally-assigned fp* fields for a UFpIssue row, which
+    // `PhaseCheck_noLatchNoOverride` correctly flags as a suspicious complete overlap
+    // (caught live by `MicrocodeResolveEquivalenceSpec`, Task A4's mandatory gate) --
+    // `resolveFromBits`'s own `when(d.uop === UOpHw.UFpIssue)` twin never hit this
+    // because its condition is a genuine runtime signal, not a Scala-level compile-time
+    // one; wrapping the (compile-time-constant-folding) condition in `when` here makes
+    // this Scala oracle emit the SAME conditional-override shape.
+    when(Bool(d.uop == UFpIssue)) {
+      val cmdOpmode  = ctx.fpCmd(6 downto 0)
+      val cmdDstFp   = ctx.fpCmd(9 downto 7).asUInt
+      val cmdSrcSpec = ctx.fpCmd(12 downto 10)
+      // Mirrors MicroOpAssembler's fpDyadic/fpNoFpDst whitelists verbatim (Task 6).
+      val fpNoFpDstC = (cmdOpmode === B"7'h38") || (cmdOpmode === B"7'h3A")   // FCMP / FTST
+      val fpDyadicC  = (cmdOpmode === B"7'h20") || (cmdOpmode === B"7'h22") || (cmdOpmode === B"7'h23") ||
+                       (cmdOpmode === B"7'h28") || (cmdOpmode === B"7'h38")
+      u.fpuOp      := cmdOpmode
+      u.fpDstReg   := cmdDstFp
+      u.writesFp   := !fpNoFpDstC
+      u.fpSrcFmt   := cmdSrcSpec
+      // srcA = the DESTINATION FPn read back, ONLY for the dyadic ops (mirrors Task 6's
+      // register-form uop exactly -- FPn IS the dyadic op's other operand).
+      u.fpSrcAReg  := cmdDstFp
+      u.usesFpSrcA := fpDyadicC
+      // No FP register source at all -- the source is the memory-loaded int temp(s),
+      // already riding the ordinary srcA/srcB/srcC int-rename fields (set above).
+      u.usesFpSrcB := False
+      u.fpSrcBReg  := 0
+      u.writesFpcc := True    // every hardware-native FP op writes FPCC (Musashi: SET_CONDITION_CODES)
+      u.readsFpcc  := False
+      u.fpSrcKind := (d.fpSrcKindSel match {
+        case 1 => FpSrcKind.MEMPAIR
+        case 2 => FpSrcKind.MEMEXT
+        case _ => FpSrcKind.INTREG
+      })
     }
     u.isScc := False; u.isDbcc := False
     // Indexed-EA descriptor fields. The bit-field chain and the full-format mem-indirect
@@ -2328,6 +2600,11 @@ object Microcode {
       is(SelHw.SImm8)       { imm := U(8, 32 bits).asBits }            // task #207: MOVE16 transfer offset
       is(SelHw.SImm12)      { imm := U(12, 32 bits).asBits }           // task #207: MOVE16 transfer offset
       is(SelHw.SImm16)      { imm := U(16, 32 bits).asBits }           // task #207: MOVE16 An += 16 write-back
+      // Task 6b: FP-generic genuine memory-source loads.
+      is(SelHw.SFpDispMid)  { imm := (ctx.eaDispLo.asUInt + U(4, 32 bits)).asBits }   // Double lo / Extended mantissa-hi
+      is(SelHw.SFpDispHi)   { imm := (ctx.eaDispLo.asUInt + U(8, 32 bits)).asBits }   // Extended mantissa-lo
+      is(SelHw.SFpAutoDelta) { imm := ctx.fpAutoDelta }                               // signed per-format An delta
+      is(SelHw.SFpCmd)      { imm := ctx.fpCmd }                                      // packed FP-issue command word
     }
     imm
   }
@@ -2384,6 +2661,7 @@ object Microcode {
       is(UOpHw.UMiPushFinal)   { u.op := DecOp.MOVE }     // stack-push store (mirrors pushUop/peaPush)
       is(UOpHw.UMiBranchFinal) { u.op := DecOp.BRANCH }   // indirect branch (mirrors ibrUop)
       is(UOpHw.UMovesRead)  { u.op := DecOp.MOVE }   // MOVE T0 -> Rn (sign-ext An / merge Dn in EU)
+      is(UOpHw.UFpIssue)    { u.op := DecOp.FPU }    // task 6b: the terminal FP-generic issue row
       is(UOpHw.UCasOp)      { u.op := DecOp.CASOP }
     }
     // The original's `case _ => (d.mem match { case MNone => INT; case _ => LS })` default
@@ -2406,6 +2684,10 @@ object Microcode {
       // own `Cluster.INT`) both already resolve correctly via the pre-switch default above.
       is(UOpHw.UMiLeaFinal) { u.cluster := Cluster.LS }
       is(UOpHw.UMovesRead)  { u.cluster := Cluster.INT }  // the MOVES read writeback runs on the ALU pipe
+      // task 6b: the terminal FP-issue row runs on the shared CPLX cluster (spec Decision
+      // 9) -- an explicit override since d.mem=MNone would otherwise default to Cluster.INT
+      // via the pre-switch default above.
+      is(UOpHw.UFpIssue)    { u.cluster := Cluster.CPLX }
       is(UOpHw.UCasOp)      { u.cluster := Cluster.INT }  // CAS/CAS2 compute runs on the ALU pipe
     }
     // The An write-back ADD is LONG; the BCD chain uses ctx.size; the bit-field chain rows
@@ -2513,8 +2795,13 @@ object Microcode {
     u.cond := 0; u.branchDisp := 0
     // bfIllegal: deliver a vector-4 ILLEGAL (the out-of-scope Do=1-at-abs-EA dynamic
     // RMW/INS forms route here — trap, NOT silent-wrong).
-    u.unimplemented := d.bfIllegal
-    u.faulted := d.bfIllegal; u.faultVector := Mux(d.bfIllegal, U(4, 8 bits), U(0, 8 bits)); u.faultUsesNextPc := False
+    // fpMemTrap (task 6b): deliver a vector-11 F-line trap (the `ucFpMemBad` reject
+    // path). faultUsesNextPc=True (unlike bfIllegal): Task 5's predecode already frames
+    // cpGEN length regardless of format, so a real FPSP kernel can RTE past it.
+    u.unimplemented := d.bfIllegal || d.fpMemTrap
+    u.faulted := d.bfIllegal || d.fpMemTrap
+    u.faultVector := Mux(d.bfIllegal, U(4, 8 bits), Mux(d.fpMemTrap, U(11, 8 bits), U(0, 8 bits)))
+    u.faultUsesNextPc := d.fpMemTrap
     u.faultAddr := ctx.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     u.divSigned := False; u.div64 := False
     // The two An write-back ADDs are DROPPED crack µops (divIsRem): the commit
@@ -2606,6 +2893,35 @@ object Microcode {
         u.bfMem       := False           // register form: dy = srcA = field32; offset = packed[4:0] = 0
         u.bfOp        := ctx.bfOp        // BFINS = 7 (the only UBfReg customer, slice 3c)
         u.bfStoreForm := U(0, 3 bits)
+      }
+    }
+    // ── Task 6b: the terminal FP-generic issue row's FP-domain fields ──────────────
+    // Identical transform of the `resolve()` twin above: `u.fpInert()` (top of this
+    // function) already defaulted every fp* field; UFpIssue is the only microcode
+    // customer that overrides them. `ctx.fpCmd` was packed once at ucBegin from the
+    // REAL ext word (SFpCmd's own doc), so this is a pure unpack.
+    when(d.uop === UOpHw.UFpIssue) {
+      val cmdOpmode  = ctx.fpCmd(6 downto 0)
+      val cmdDstFp   = ctx.fpCmd(9 downto 7).asUInt
+      val cmdSrcSpec = ctx.fpCmd(12 downto 10)
+      // Mirrors MicroOpAssembler's fpDyadic/fpNoFpDst whitelists verbatim (Task 6).
+      val fpNoFpDstC = (cmdOpmode === B"7'h38") || (cmdOpmode === B"7'h3A")   // FCMP / FTST
+      val fpDyadicC  = (cmdOpmode === B"7'h20") || (cmdOpmode === B"7'h22") || (cmdOpmode === B"7'h23") ||
+                       (cmdOpmode === B"7'h28") || (cmdOpmode === B"7'h38")
+      u.fpuOp      := cmdOpmode
+      u.fpDstReg   := cmdDstFp
+      u.writesFp   := !fpNoFpDstC
+      u.fpSrcFmt   := cmdSrcSpec
+      u.fpSrcAReg  := cmdDstFp
+      u.usesFpSrcA := fpDyadicC
+      u.usesFpSrcB := False
+      u.fpSrcBReg  := 0
+      u.writesFpcc := True
+      u.readsFpcc  := False
+      u.fpSrcKind := FpSrcKind.INTREG   // pre-switch default (dead unless fpSrcKindSel===0)
+      switch(d.fpSrcKindSel) {
+        is(U(1, 2 bits)) { u.fpSrcKind := FpSrcKind.MEMPAIR }
+        is(U(2, 2 bits)) { u.fpSrcKind := FpSrcKind.MEMEXT }
       }
     }
     u.isScc := False; u.isDbcc := False

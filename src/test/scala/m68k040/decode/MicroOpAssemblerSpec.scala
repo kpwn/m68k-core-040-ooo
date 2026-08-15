@@ -313,22 +313,66 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
   // exercise fpLenKnown's real (len>=2) behavior). This sweep drives every cpGEN opword
   // at len=2 with a NON-NATIVE opmode (0x0E, FSIN) so fpEmit never fires and every one
   // of them exercises the TRAPPING path -- pinning down that a FRAMED cpGEN trap stacks
-  // the POST-instruction PC, which is exactly the behavior the base sweep was blind to. */
-  test("line-F cpGEN band: framed-but-non-emittable opwords stack the POST-instruction PC", VerilatorTest) {
+  // the POST-instruction PC, which is exactly the behavior the base sweep was blind to.
+  //
+  // Task 6b UPDATE: this sweep covered the FULL cpGEN <ea> band (mode/reg = 0..63) back
+  // when EVERY non-emittable cpGEN opword trapped at THIS (MicroOpAssembler-only) layer.
+  // That is no longer true for GENUINE MEMORY <ea> modes (mode != 0 Dn, != 1 An, != 7/reg4
+  // #imm) -- Task 6b routes that whole band to the µcode engine instead
+  // (`spec.microcoded := True`, OperationDecoder.scala), and the real accept/reject
+  // decision (including the identical "non-native opmode -> trap" rule this sweep drives)
+  // now lives in `DecodeStage.ucBegin`, which THIS `Dut` cannot exercise -- verified
+  // end-to-end instead by `FpMemLoadSpec`'s own "FSIN.L (A0),FP0 ... traps vector 11" case.
+  // The sweep below is narrowed to the <ea> values THIS layer still directly owns (Task
+  // 6's register-direct/immediate paths), plus a companion sweep confirming every
+  // EXCLUDED (memory-mode) <ea> value is correctly deferred to the µcode engine rather
+  // than silently falling through un-routed. */
+  test("line-F cpGEN band (register/immediate <ea>): framed-but-non-emittable opwords stack the POST-instruction PC", VerilatorTest) {
     run { dut =>
       val bad = scala.collection.mutable.ArrayBuffer[String]()
       for (low <- 0 until 64) {   // full cpGEN band, opword = 0xF200 | low
-        val op = 0xF200 | low
-        // Drive at len=2 (the register-form framing) with a NON-NATIVE opmode (0x0E, FSIN)
-        // so fpEmit never fires and this always exercises the TRAPPING path.
-        drive(dut, op, w1 = 0x000E, len = 2); sleep(1)
-        val faulted = dut.uop.faulted.toBoolean
-        val vec     = dut.uop.faultVector.toInt
-        val nextPc  = dut.uop.faultUsesNextPc.toBoolean
-        if (!faulted || vec != 11 || !nextPc)
-          bad += f"0x$op%04X faulted=$faulted vec=$vec usesNextPc=$nextPc (want true)"
+        val mode = (low >> 3) & 7; val reg = low & 7
+        // Task 6b's own territory (Dn/An/#imm) -- everything else now defers to the
+        // µcode engine, checked separately below.
+        val isMemMode = (mode != 0) && (mode != 1) && !(mode == 7 && reg == 4)
+        if (!isMemMode) {
+          val op = 0xF200 | low
+          // Drive at len=2 (the register-form framing) with a NON-NATIVE opmode (0x0E,
+          // FSIN) so fpEmit never fires and this always exercises the TRAPPING path.
+          drive(dut, op, w1 = 0x000E, len = 2); sleep(1)
+          val faulted = dut.uop.faulted.toBoolean
+          val vec     = dut.uop.faultVector.toInt
+          val nextPc  = dut.uop.faultUsesNextPc.toBoolean
+          if (!faulted || vec != 11 || !nextPc)
+            bad += f"0x$op%04X faulted=$faulted vec=$vec usesNextPc=$nextPc (want true)"
+        }
       }
-      assert(bad.isEmpty, s"${bad.size}/64 cpGEN opwords: faultUsesNextPc not set when framed; " +
+      assert(bad.isEmpty, s"${bad.size} cpGEN register/immediate opwords: faultUsesNextPc not set when framed; " +
+        bad.take(10).mkString("\n"))
+    }
+  }
+
+  test("line-F cpGEN band (genuine memory <ea>): every opword defers to the µcode engine (Task 6b)", VerilatorTest) {
+    class DecDut extends Component {
+      val opword = in Bits (16 bits)
+      val o      = out(OpSpec())
+      o := OperationDecoder.decode(opword)
+    }
+    SimConfig.withVerilator.compile(new DecDut).doSim { dut =>
+      val bad = scala.collection.mutable.ArrayBuffer[String]()
+      for (low <- 0 until 64) {
+        val mode = (low >> 3) & 7; val reg = low & 7
+        val isMemMode = (mode != 0) && (mode != 1) && !(mode == 7 && reg == 4)
+        if (isMemMode) {
+          val op = 0xF200 | low
+          dut.opword #= op; sleep(1)
+          val illegal    = dut.o.illegal.toBoolean
+          val microcoded = dut.o.microcoded.toBoolean
+          if (illegal || !microcoded)
+            bad += f"0x$op%04X illegal=$illegal microcoded=$microcoded (want illegal=false microcoded=true)"
+        }
+      }
+      assert(bad.isEmpty, s"${bad.size} cpGEN memory-<ea> opwords not routed to the µcode engine; " +
         bad.take(10).mkString("\n"))
     }
   }
