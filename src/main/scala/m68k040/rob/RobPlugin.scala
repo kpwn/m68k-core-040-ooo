@@ -635,6 +635,21 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     for (k <- 0 until 2) {
       rc.commitPorts(k).valid := False
       rc.commitPorts(k).payload.assignDontCare()
+      // FP/FPCC commit fields have no producer yet (Task 6/8, ROB FP payload not
+      // landed) -- assignDontCare above leaves them 'bx in the netlist, but
+      // RenameStage's fpFree/fpRat consumers gate only on commitPorts(k).valid &&
+      // ...fpWrite, and commitPorts(k).valid is True on essentially every commit,
+      // not just FP ones. Tie these specific fields to concrete inert defaults
+      // (mirrors branchCompletion's payload-field convention above) so the
+      // currently-always-false fpWrite/fpccWrite gates are genuinely false in the
+      // synthesizable netlist, not merely false-by-2-state-simulator-luck.
+      rc.commitPorts(k).fpArchDst := U(0, 3 bits)
+      rc.commitPorts(k).fpNew     := U(0, 4 bits)
+      rc.commitPorts(k).fpOld     := U(0, 4 bits)
+      rc.commitPorts(k).fpWrite   := False
+      rc.commitPorts(k).fpccNew   := U(0, 4 bits)
+      rc.commitPorts(k).fpccOld   := U(0, 4 bits)
+      rc.commitPorts(k).fpccWrite := False
       traceFireVec(k) := False
       traceVec(k).assignDontCare()
     }
