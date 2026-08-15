@@ -17,6 +17,7 @@ object RegfileSpec {
   val Int  = RegfileSpec("int",  32, 50)
   val Nzvc = RegfileSpec("nzvc", 4,  16)
   val X    = RegfileSpec("x",    1,  16)
+  val Fp   = RegfileSpec("fp",   80, 16)
 }
 
 case class RegFileReadPort(addressWidth: Int, dataWidth: Int) extends Bundle {
@@ -54,3 +55,4 @@ trait RegfileService {
 trait IntRegFileService  extends RegfileService
 trait NzvcRegFileService extends RegfileService
 trait XRegFileService    extends RegfileService
+trait FpRegFileService   extends RegfileService
