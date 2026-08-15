@@ -1873,6 +1873,16 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // elaboration-time Scala function, so with no production caller it costs zero LUTs.
     val ucRomMem = Mem(Microcode.DescBits(), Microcode.romSize) init
       Vector.tabulate(Microcode.romSize)(i => Microcode.descToBits(Microcode.rom(i)))
+    // Force block-RAM mapping. Without this, Vivado's Cross Boundary Optimization
+    // constant-propagates through the readSync output register BEFORE RAM mapping and
+    // dissolves the intended-BRAM 252-row array into LUT6/MUXF7/F8 trees (observed:
+    // "The Block RAM ... will be mapped to LUTs" in the FullCore synth log). Same
+    // explicit-attribute idiom as every other successfully-mapped Mem in the design
+    // (cf. DcachePlugin's tagMem "ram_style"="block"). Deliberately NOT adding an
+    // extra output register (DO_REG beyond the existing readSync): the
+    // ucCurLast -> ucNextPc sequencer loop below needs the row visible the cycle
+    // after the address, i.e. exactly the one readSync latency already absorbed.
+    ucRomMem.addAttribute("rom_style", "block")
     def ucReadRow(addr: UInt): Microcode.DescBits = ucRomMem.readSync(addr)
 
     // ── LUT-reduction Task A5: the LIVE microcode ROM read ────────────────────────
