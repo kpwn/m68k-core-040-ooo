@@ -31,6 +31,13 @@ class IqSourcePlugin extends FiberPlugin {
       val pXSrc      = in UInt (4 bits); val pXDst = in UInt (4 bits)
       // True => this uop is a line-E SHIFT (the slow-ALU S3 producer); else MOVE.
       val isShift    = in Bool ()
+      // FP-data and FPCC push fields (Task 3): mirrors psrcA/pdst/pNzvc shapes, 4-bit
+      // FP tags (16 physical FP-data / FPCC entries).
+      val pFpSrcA    = in UInt (4 bits); val psrcAFpValid = in Bool ()
+      val pFpSrcB    = in UInt (4 bits); val psrcBFpValid = in Bool ()
+      val pFpDst     = in UInt (4 bits); val pFpDstValid  = in Bool ()
+      val pFpccSrc   = in UInt (4 bits); val readsFpcc    = in Bool ()
+      val pFpccDst   = in UInt (4 bits); val writesFpcc   = in Bool ()
     }
     val s0 = SlotIo()
     val s1 = SlotIo()
@@ -65,6 +72,12 @@ class IqSourcePlugin extends FiberPlugin {
       u.pNzvcSrc     := io.pNzvcSrc;   u.pNzvcDst   := io.pNzvcDst
       u.readsX       := io.readsX;     u.writesX    := io.writesX
       u.pXSrc        := io.pXSrc;      u.pXDst      := io.pXDst
+      u.pFpSrcA := io.pFpSrcA; u.psrcAFpValid := io.psrcAFpValid
+      u.pFpSrcB := io.pFpSrcB; u.psrcBFpValid := io.psrcBFpValid
+      u.pFpDst  := io.pFpDst;  u.pFpDstValid  := io.pFpDstValid
+      u.pFpccSrc := io.pFpccSrc; u.readsFpcc  := io.readsFpcc
+      u.pFpccDst := io.pFpccDst; u.writesFpcc := io.writesFpcc
+      u.pFpOld   := 0; u.pFpccOld := 0    // rename bookkeeping only; the IQ never reads them
       // Third source (DIV.L 64/32) + CPLX/div control + precise-fault fields: safe
       // defaults (these IQ tests don't exercise DIV/CHK/faults).
       u.psrcC        := 0; u.psrcCValid := False
@@ -132,5 +145,13 @@ class IqSourcePlugin extends FiberPlugin {
     iq.aluSlowWakeup(0).payload.nzvcValid:= aluSlowWakeupNzvcV
     iq.aluSlowWakeup(0).payload.pXDst    := aluSlowWakeupX
     iq.aluSlowWakeup(0).payload.xValid   := aluSlowWakeupXV
+
+    // Dynamic CPLX FP-DATA / FPCC wakeup (sim-driven; overrides the IQ's idle default).
+    val cplxFpWakeupValid = in Bool (); val cplxFpWakeupTag = in UInt (4 bits)
+    iq.cplxFpWakeup.valid   := cplxFpWakeupValid
+    iq.cplxFpWakeup.payload := cplxFpWakeupTag
+    val cplxFpccWakeupValid = in Bool (); val cplxFpccWakeupTag = in UInt (4 bits)
+    iq.cplxFpccWakeup.valid   := cplxFpccWakeupValid
+    iq.cplxFpccWakeup.payload := cplxFpccWakeupTag
   }
 }

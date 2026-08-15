@@ -64,4 +64,20 @@ trait IssueQueueService {
     * a dependent wakes from actual completion, not a static latency. ONE port per ALU EU (both can
     * complete a distinct shift the same cycle). */
   def aluSlowWakeup: Vec[Flow[AluSlowWakeup]]
+  /** Dynamic-completion FP-DATA wakeup for the CPLX cluster: a completing FP op
+    * (FADD/FSUB/FMUL/FDIV/FSQRT/FABS/FNEG/FMOVE/FINT/FINTRZ/FMOVECR) broadcasts the
+    * 4-bit pFpDst of its just-written 80-bit FP physreg; a slot reading that FP physreg
+    * becomes ready. SEPARATE Flow from `cplxWakeup` (int pdst): an FP op writes NO int
+    * register at all, and the int and FP physreg id spaces are unrelated (6-bit int tags
+    * vs 4-bit FP tags), so sharing one port would alias two different registers.
+    * FP ops are variable-latency (FDIV/FSQRT iterate) and must NOT use the static
+    * latency-1 scoreboard, whose busy bit is force-cleared at ISSUE time -- the exact
+    * defect task #167 fixed for CPLX NZVC. FCMP/FTST drive no FP wakeup (no FP dst). */
+  def cplxFpWakeup: Flow[UInt]
+  /** Dynamic-completion FPCC wakeup for the CPLX cluster: broadcasts the pFpccDst of a
+    * just-completed FP op that wrote the renamed FPCC {N,Z,I,NAN}. EVERY hardware-native
+    * FP op writes FPCC (including FCMP/FTST, which write ONLY FPCC), so this port fires
+    * for strictly more ops than `cplxFpWakeup`. Mirrors `cplxNzvcWakeup` exactly, on the
+    * FPCC rename class instead of NZVC. */
+  def cplxFpccWakeup: Flow[UInt]
 }
