@@ -8472,76 +8472,171 @@ no sweep test of its own.
 
 ### Task 11: FSAVE / FRESTORE — null, idle, and unimplemented-instruction state frames
 
-**Files:**
-- Modify: `src/main/scala/m68k040/decode/DecodedUop.scala` (`SysKind.FSAVE`, `SysKind.FRESTORE`)
-- Modify: `src/main/scala/m68k040/decode/OperationDecoder.scala` (recognition arm)
-- Modify: `src/main/scala/m68k040/decode/MicroOpAssembler.scala` (operand routing)
-- Modify: `src/main/scala/m68k040/execute/FpuControlPlugin.scala` (sticky `fpuEverExecuted` + the latched unimplemented-instruction capture group)
-- Modify: `src/main/scala/m68k040/exception/ExceptionUnit.scala` (frame emit/consume FSM + the trap-time capture)
-- Modify: `src/main/scala/m68k040/rob/RobPlugin.scala` (per-entry `fpuUnimpStore`/`fpuCmdStore`; drive `setEverExecuted` from FP commit)
-- Modify: `src/main/scala/m68k040/top/FullCoreSynth.scala` (committed FP operand readbacks)
-- Test: `src/test/scala/m68k040/exception/FsaveFrestoreSpec.scala`
-- Test (modify): `src/test/scala/m68k040/decode/MicroOpAssemblerSpec.scala` (line-F sweep exclusions)
+**REVISED 2026-08-16.** This task's original draft proposed routing FSAVE/FRESTORE's frame
+transfers through `ExceptionUnit`'s identity-physical, hardwired-supervisor, fault-free frame
+machinery — the same class of flaw Task 9b's blocked attempt independently found and fixed for
+its own (different) mechanism. FSAVE/FRESTORE genuinely cannot reuse Task 9b's fix (all memory
+movement via ordinary microcode LS rows), because their frame length is runtime-dynamic in a
+way FMOVEM-control's register mask never was — see the binding design addendum below for the
+full argument. **This is not a from-scratch redesign**: the frame-layout research, the version
+byte decision, the decode gate, the operand routing, and the vector-11 capture work below are
+carried forward from the original draft largely unchanged (they were correct) — only the
+memory-transfer mechanism (the old Steps 6-7) is replaced.
 
-**Interfaces:**
-- Consumes: `DecodedUop.fpuSoftwareComplete` / `.fpuCmdWord` (Task 10), `FpuControlService` (Task 9), `CommitSlot.fpWrite` (Task 2), the FP register file (Task 1).
-- Produces: `FpuControlService.everExecuted` / `setEverExecuted` / `unimpValid` / `setUnimpFrame` / `clearFpuState`, and the `ExceptionUnit` FSAVE/FRESTORE arms.
+**Read this first — it is the binding architectural design, already brainstormed and
+committed:** `docs/superpowers/specs/2026-08-16-fp-control-multiword-transfer-design.md`,
+specifically the **"Addendum (2026-08-16, post-Task-9b): FSAVE/FRESTORE need a genuinely
+different substrate"** section. Decisions 1-3 (earlier in that document) are Task 9b's already-
+implemented mechanism and do NOT apply to this task directly — the Addendum is what you
+implement. Do not deviate from the Addendum's four numbered points without flagging why.
 
-**Encoding — VERIFIED against the vendored corpus, and the task prompt's stated pattern is WRONG.** The prompt gives `1111 001 000 EA` (= `0xF200`), which is the FPU **general** opclass, not FSAVE. The real encoding is:
+**Placement.** After Task 10 (whose `fpuSoftwareComplete`/`fpuCmdWord` fields this task
+consumes directly), independent of Task 9b/9's own ordering.
 
-```
-FSAVE    <ea> : 1111 001 100 mmmrrr  = 0xF300 | <ea>     (opclass 100)
-FRESTORE <ea> : 1111 001 101 mmmrrr  = 0xF340 | <ea>     (opclass 101)
-```
+---
 
-Confirmed directly from the vendored corpus, which encodes these as raw literals precisely because they are load-bearing: `fpu_fsave_idle_format_byte.s` and `fpu_fsave_null_frame.s` both use `.short 0xF327` commented `| FSAVE -(A7)` (mode 100, reg 111 = `-(A7)` → `0x27`), and `.short 0xF35F` commented `FRESTORE (A7)+` (mode 011, reg 111 = `0x1F`). `fsave_frestore_basic.s` uses the real `fsave`/`frestore` mnemonics through the toolchain across five EA modes. `0xF300 | 0x27 = 0xF327` and `0xF340 | 0x1F = 0xF35F` — both check out. Step 1 still re-confirms via the assembler, because the corpus is a secondary source.
+## The mechanism (summary — the design spec Addendum is authoritative, this is the task-scoped restatement)
 
-**Both are PRIVILEGED** (real 68040). Unlike Task 9's FMOVE-to-FPcr, these need **no** exclusion from `RobPlugin`'s `sysPrivFault` — the default `sysOp` behavior (any `sysOp` head retiring at committed S == 0 takes vector 8) is exactly right, and Step 12 tests it.
+FSAVE/FRESTORE remain commit-time system ops (privileged, unlike Task 9's FMOVE-to-FPcr — the
+default `sysOp`-is-privileged behavior in `RobPlugin` is exactly right, no exclusion needed),
+using `ExceptionUnit`'s existing per-word `REQ`/`WAIT` frame-loop idiom (already instantiated
+6+ times: `E_STORE`/`E_STWAIT`, `R_SRREQ`/`R_SRWAIT`, `R_PCREQ`/`R_PCWAIT`, `R_PCREQ2`/
+`R_PCWAIT2`, `R_FMTREQ`/`R_FMTWAIT`, `E_VECREQ`/`E_VECWAIT` — all the same two-state shape).
+What's new:
 
-**Architectural mechanism: these are commit-time system ops, not microcode.** The prompt suggests following `Microcode.MOVE16_ENTRY`. Having read that pattern directly (`Microcode.scala:1578-1651`, rows 242-251, quoted below), it is the **wrong** precedent here and I am flagging the deviation rather than forcing it:
+1. **A real, correctly-typed D-side DTLB acquisition** — `ExceptionUnit`'s existing `dtReq`/
+   `dtRsp` fields are the WRONG bundle family (the I-side `TranslationReq`/`TranslationRsp`,
+   combinational, untagged — confirmed by direct comparison against `DTranslationService`'s
+   real `Stream[DTranslationCmd]`/`Stream[DTranslationRsp]` + 8-bit-token contract). Build the
+   real acquisition; do not try to "wire up" the existing dead stub, which is shaped wrong.
+2. **Time-multiplexed onto the single DTLB port via the already-proven `excActive` MUX
+   pattern** — `LsEuPlugin` already fully idles its own DTLB request/response claim for the
+   entire duration `excActive` is held (confirmed: `xlate.req.valid := !excActive && ...`), the
+   exact same pattern already used to hand the D-cache load/store command ports themselves to
+   `ExceptionUnit` during an active episode. Extend that MUX to the DTLB port.
+3. **Translate-on-VPN-change, not blind per-word retranslation.** A 44-byte frame crosses at
+   most one page boundary. Compare each step's VPN against the last-translated VPN; re-request
+   only on change.
+4. **A translation fault escalates to the existing sticky `RobPlugin.coreHaltedIn` mechanism**
+   — the same escalation `DcachePlugin`'s diagnostic-fault channel already uses. This is an
+   explicit, deliberate, documented divergence from real hardware (which would take a precise
+   access fault); do not attempt to build nested/re-entrant precise-fault delivery here — this
+   project has no unwind machinery for already-committed partial frame writes, and the one
+   existing "ExceptionUnit re-enters itself mid-episode" precedent (RTE's vector-3/14
+   self-synthesized entry) only works because RTE's own path up to that point is read-only.
 
-```scala
-    //   m0 LOAD.L  (Ax+0)  -> T0                                              (isFirst)
-    //   ...
-    //   m8 ADD.L Ax + 16 -> Ax   (dropped crack µop)
-    //   m9 ADD.L Ay + 16 -> Ay   (dropped crack µop)                          (isLast)
-    Desc(UMove, mem = MLoad, srcA = SAy, dst = ST0, sz = SzLong, isFirst = true),          // µPC242 (m0)
-    Desc(UMove, mem = MStore, srcA = SMove16Ay, srcB = ST0, sz = SzLong),                 // µPC244 (m2)
-```
+FRESTORE needs only ONE translated memory access regardless of the real frame's size — the
+header word — because non-null frame *bodies* are deliberately never applied (unchanged from
+the original scope decision: real 68040 FSAVE saves no control registers, which is exactly why
+the ROM FPSP prologue separately does `FMOVEM.L FPIAR/FPSR/FPCR,-(A7)`).
 
-Microcode rows are **static**: MOVE16 works there because it is always exactly four transfers. FSAVE's length is **runtime-selected** (4 vs 44 bytes, decided from live FPU state), which the `Desc` vocabulary cannot express — the closest existing runtime-variable-length mechanism is MOVEM's dedicated `DecodeStage` FSM (`DecodeStage.scala:329-425`, `movemActive`/`movemMask`/`movemEmitted`/…), which is a genuine option but a large, speculative-path sequencer.
+---
 
-The far better fit — and the one this task uses — is `ExceptionUnit`'s **own** frame machinery, which already *is* "write N words to memory where N is a runtime-selected frame size, then optionally read a frame back and dispatch on its format byte":
+## Files
 
-- `E_STORE`/`E_STWAIT` (`ExceptionUnit.scala:928-978`) push one frame word at a time through `driveStoreNoXlate`, driven by `stStep`/`lastStep` where `lastStep = Mux(curIs7, U(29), Mux(curIs2, U(5), U(3)))` (line 628) — a runtime-selected frame length, with cross-cache-line word splitting already handled (`stSplitLow`, the task #163 fix, lines 606-624).
-- `frameWordAddr(step)` / `frameWordData(step)` (lines 631-659) are a `switch(step)` word emitter — exactly the shape a 22-word FSAVE frame needs.
-- `R_FMTREQ`/`R_FMTWAIT` (lines 1080-1108) already implement "read a frame's format word from memory and select the pop size from it", which is *literally* FRESTORE's semantics.
-- FSAVE/FRESTORE are privileged and serializing, which is what `sysOp` retirement already gives for free.
+- Modify: `src/main/scala/m68k040/decode/DecodedUop.scala` (`SysKind.FSAVE`, `SysKind.FRESTORE`
+  — unchanged from the original draft's Step 4).
+- Modify: `src/main/scala/m68k040/decode/OperationDecoder.scala` (recognition arm — unchanged
+  from the original draft's Step 4).
+- Modify: `src/main/scala/m68k040/decode/MicroOpAssembler.scala` (operand routing — unchanged
+  from the original draft's Step 5).
+- Modify: `src/main/scala/m68k040/services/Services.scala` /
+  `src/main/scala/m68k040/execute/FpuControlPlugin.scala` (sticky `everExecuted` + the latched
+  unimplemented-instruction capture group — unchanged from the original draft's Step 3).
+- Modify: `src/main/scala/m68k040/rob/RobPlugin.scala` — per-entry `fpuUnimpStore`/
+  `fpuCmdStore` (unchanged from the original draft's Step 8), **plus the new**
+  `coreHaltedIn`-adjacent wiring for the translation-fault escalation (new, per the Addendum's
+  point 4 — confirm the real current `coreHaltedIn` signal shape and drive it correctly, it
+  already exists per `RobPlugin.scala:370-376` and is already wired from `DcachePlugin`'s
+  `diagFault` at `FullCoreSynth.scala:357` — this task adds a second producer, mirroring that
+  existing wiring pattern).
+- Modify: `src/main/scala/m68k040/exception/ExceptionUnit.scala` — the frame emit/consume FSM
+  (rebuilt per the Addendum, NOT the original draft's `F_STORE`/`F_STWAIT`/`F_HDRREQ`/
+  `F_HDRWAIT`/`F_RDONE` states verbatim — those states' *shape* is still right, but they must
+  now (a) request a real DTLB translation before each store/load whose VPN has changed, (b)
+  hold correctly across the translation wait exactly like the existing `E_VECREQ`/`E_VECWAIT`
+  wait-for-response idiom, and (c) escalate to `coreHaltedIn` on `dtRsp.fault` instead of
+  proceeding as if the access succeeded) plus the trap-time capture (unchanged from the
+  original draft's Step 8's ExceptionUnit-side half).
+- Modify: `src/main/scala/m68k040/execute/LsEuPlugin.scala` — extend the existing `excActive`
+  MUX pattern (the D-cache load/store command port hand-off already there) to also cover the
+  DTLB request/response port, per the Addendum's point 2. Confirm the exact real current shape
+  of the `excActive`-gated D-cache MUX (`LsEuPlugin.scala`, search for `excActive &&
+  excLoadCmdValid`/`excStoreValid`) and mirror it structurally for `xlate.req`/`xlate.rsp`.
+- Modify: `src/main/scala/m68k040/top/FullCoreSynth.scala` — committed FP operand readbacks
+  (unchanged from the original draft's Step 8 ExceptionUnit-wiring half), plus wiring
+  `ExceptionUnit`'s new DTLB request/response ports into the same `DtlbPlugin`/`DTranslationService`
+  acquisition `LsEuPlugin` already uses (a second `host[DTranslationService]`-style consumer, or
+  whatever the real acquisition mechanism turns out to require — confirm at implementation time,
+  the design's own investigation found no existing multi-consumer API for this service, so this
+  may need a small, well-scoped addition to how the service is exposed; do not invent a large
+  new arbitration subsystem, the `excActive` MUX at the LS EU's own D-cache ports is the entire
+  precedent to mirror).
+- Test: `src/test/scala/m68k040/exception/FsaveFrestoreSpec.scala` (unchanged in spirit from the
+  original draft's Steps 10-12, PLUS new directed tests for the translation-fault escalation
+  path — see Step 13 below).
+- Test (modify): `src/test/scala/m68k040/decode/MicroOpAssemblerSpec.scala` (line-F sweep
+  exclusions — unchanged from the original draft's Step 9).
 
-So: two new `SysKind` values, two new `S_APPLY` arms, and a small set of new FSM states reusing the existing store/load helpers. This is reuse of proven machinery, not a new subsystem.
+**No changes needed to:** the microcode ROM (`Microcode.scala`) at all — this task's mechanism
+lives entirely in `ExceptionUnit`/`LsEuPlugin`'s translation hand-off, not the microcode engine.
 
-**Frame layouts — from the approved spec, with the one genuinely-unpinned part called out.** Per `2026-08-14-fpu-fpsp-design.md`'s FSAVE/FRESTORE section (which explicitly *corrects* an earlier recollection: there is **no** 52-byte frame; null and idle are both 4 bytes; the byte at offset `$01` is a **length-in-hex indicator**, not a format enum):
+---
 
-| Frame | Size | `$00` | `$01` | Implemented |
-|---|---|---|---|---|
-| Null | 4 B | version forced to `$00` | undefined | **Yes, in full** |
-| Idle | 4 B | real version | `$00` (0 extra bytes) | **Yes, in full** |
-| Unimplemented FP instruction | 44 B (22 words) | version | `$28` (40 extra bytes) | **Yes, in full** |
-| Busy | 100 B | version | `$60` | Out of scope (spec-narrowed) |
+## Interfaces
 
-**Version byte decision, made here as the spec directs.** The spec says "`$40` is a reasonable default choice, finalized at implementation time (not a design blocker)". **Choose `$41`**, for two concrete reasons: (a) `fpu_fsave_idle_format_byte.s` asserts the format byte is exactly `0x41` and passes for free; (b) the Q700 FPSP's documented optimization `if ((frame[0] & 0xf) == 0) skip_restore;` needs a **non-zero low nibble** on a non-null frame, and `$40` would make every idle frame look null to it. The null frame's `$00` (version *forced* to zero per the spec, not the real version) keeps that optimization correct in the other direction.
+- Consumes: `DecodedUop.fpuSoftwareComplete` / `.fpuCmdWord` (Task 10, already landed),
+  `FpuControlService` (Task 9, already landed), `CommitSlot.fpWrite` (Task 2, already landed),
+  the FP register file (Task 1, already landed), `DTranslationService` (the real D-side
+  translation service `LsEuPlugin` already uses — this task acquires a second consumer of it,
+  time-multiplexed via `excActive`), `RobPlugin.coreHaltedIn` (already exists, already wired
+  from `DcachePlugin.diagFault` — this task adds a second producer).
+- Produces: `FpuControlService.everExecuted` / `setEverExecuted` / `uiValid` / `setUnimpFrame` /
+  `clearUnimp`, and the `ExceptionUnit` FSAVE/FRESTORE arms (now translation-aware).
 
-**The unimplemented-instruction frame's field OFFSETS are NOT pinned by the spec** — the spec verifies the *size* (44 B), the *header bytes* (`$00` version, `$01` = `$28`), and the *field list* (STAG, DTAG, CMDREG1B, E1, FPTS/FPTE/FPTM, ETS/ETE/ETM per MC68040 UM Figure 9-7), but not each field's byte offset. One offset **is** anchored: the spec's ROM-disassembly analysis states the four non-busy handlers read "an opclass/CMDREG1B-class field at what resolves to **offset `$08`** of that frame". Step 2 makes pinning the rest an explicit, blocking step.
+---
 
-**Acceptance-corpus reality check, done up front so it is not rediscovered as a surprise.** Reading the four vendored FSAVE tests reveals they encode **m68k-ooo's own non-conformant frame shapes**, which contradict the manual-verified spec and each other:
-- `fpu_fsave_idle_format_byte.s` expects a **4-byte** frame with format byte `0x41` → **will PASS** with this task's idle frame + version `$41`.
-- `fpu_fsave_null_frame.s` (despite its name) expects a **52-byte** frame with header long `0x41300000` (size byte `$30`) → **will stay FAILING**. There is no 52-byte frame in the MC68040 UM; the spec says so explicitly. Its own header comment admits it was rewritten twice in place to chase m68k-ooo's behavior.
-- `fsave_frestore_basic.s` expects the same 52-byte frame across five EA modes, plus a FRESTORE pop-size matrix → **partially failing** (its `(An)+` pop-size matrix for NULL/`$28`/`$60` headers is architecturally correct and *should* pass; its `0x41300000` sub-tests will not).
-- `fpu_fsave_frestore_idle_roundtrip.s` expects FRESTORE to **restore FPCR/FPSR** → **will stay FAILING**, and correctly so: real 68040 FSAVE saves *no* control registers, which is exactly why the ROM FPSP prologue does a separate `FMOVEM.L FPIAR/FPSR/FPCR,-(A7)` (the `F227 BC00` the spec quotes). The test encodes m68k-ooo's side-channel behavior, not architecture.
+## Encoding, frame layouts, version byte, acceptance-corpus classification — CARRIED FORWARD UNCHANGED
 
-**Do not chase the 52-byte frame.** Step 14 records this classification in the commit message so the post-task triage is a lookup.
+All of the following, from the original draft, remain correct and are not affected by the
+substrate redesign. Read them from the original draft text (preserved in
+`.superpowers/sdd/2026-08-15-fpu-fpsp-implementation-plan/task-11-original-draft.md`, extracted
+before this revision) or re-derive independently if that file is unavailable — do not
+re-research from scratch, this work was already done carefully:
 
-- [ ] **Step 1: Confirm the FSAVE/FRESTORE encodings against the toolchain**
+- **Encoding**: `FSAVE <ea> = 0xF300|<ea>` (opclass 100), `FRESTORE <ea> = 0xF340|<ea>`
+  (opclass 101) — confirmed from the vendored corpus's own raw literals (`0xF327` = `FSAVE
+  -(A7)`, `0xF35F` = `FRESTORE (A7)+`) and re-confirmable via `m68k-linux-gnu-as -m68040`
+  (Step 1 below re-runs this).
+- **Both privileged** — no `sysPrivFault` exclusion, the default behavior is correct.
+- **Scope**: register-indirect EA modes only — FSAVE: `-(An)`/`(An)`; FRESTORE: `(An)+`/`(An)`.
+  Displacement/absolute forms stay on the vector-11 fall-through (out of scope; the original
+  draft's stated reason — "the commit-time sysOp path has no AGU" — is still accurate for THIS
+  task's mechanism, since it's still not microcode-routed).
+- **Frame layouts**: null (4B, version forced `$00`), idle (4B, version `$41` + `$00` length),
+  unimplemented-instruction (44B/22 words, version `$41` + `$28` length) — busy (100B) out of
+  scope. Byte `$01` is a length-in-hex indicator, not a format enum.
+- **Version byte**: `$41` (matches `fpu_fsave_idle_format_byte.s`'s own assertion, keeps the
+  FPSP's `(frame[0] & 0xf) == 0` skip-restore optimization correct in both directions).
+- **The unimplemented-instruction frame's field offsets**: only the 44-byte total, the two
+  header bytes, and CMDREG1B's offset `$08` are spec-anchored — pinning
+  STAG/DTAG/E1/ETS/ETE/ETM/FPTS/FPTE/FPTM against MC68040 UM Figure 9-7 is a **blocking step**
+  (Step 2 below), unchanged from the original draft.
+- **Acceptance-corpus reality check**: three of the four vendored FSAVE tests encode
+  m68k-ooo's own non-conformant 52-byte frame shape and are **expected to stay failing by
+  design** (`fpu_fsave_null_frame.s`, `fsave_frestore_basic.s`'s header sub-tests,
+  `fpu_fsave_frestore_idle_roundtrip.s`) — the real MC68040 UM has no 52-byte frame, and real
+  FSAVE never saves FPCR/FPSR. `fpu_fsave_idle_format_byte.s` and `fsave_frestore_basic.s`'s
+  pop-size-matrix sub-test are expected to PASS. Do not chase the 52-byte frame. **If any of the
+  three "expected FAIL" tests instead passes, STOP** — it means the implementation drifted
+  toward m68k-ooo's non-conformant behavior.
+
+---
+
+## Steps
+
+- [ ] **Step 1: Re-confirm the FSAVE/FRESTORE encodings against the toolchain** (mirrors every
+  prior task's own Step 1 discipline).
 
 ```bash
 cd /tmp && cat > fsv.s <<'EOF'
@@ -8553,735 +8648,197 @@ cd /tmp && cat > fsv.s <<'EOF'
 EOF
 m68k-linux-gnu-as -m68040 -m68881 fsv.s -o fsv.o && m68k-linux-gnu-objdump -d fsv.o
 ```
-Expected: `F327`, `F310`, `F35F`, `F350`. Record the actual output. If any differs from `0xF300|<ea>` / `0xF340|<ea>`, fix the decode arm before proceeding.
+Expected: `F327`, `F310`, `F35F`, `F350`. If any differs, STOP and fix the decode arm before
+proceeding.
 
 - [ ] **Step 2: Pin the 44-byte unimplemented-instruction frame's field offsets (BLOCKING)**
 
-Open the MC68040 User's Manual §9.7 / **Figure 9-7** (the same bitsavers copy the design spec used) and write down the exact byte offset of each of: CMDREG1B, STAG, DTAG, E1, ETS/ETE, ETM, FPTS/FPTE, FPTM. Then **replace** the provisional table in Step 6's `fsFrameWordData` with the real one and record the figure/page in the code comment and the commit message.
-
-The provisional layout Step 6 ships (anchored on the spec's confirmed `$08` CMDREG1B and the confirmed 44-byte total; **everything else is a placement guess and is labelled as such in the code**):
-
-```
-$00      version byte ($41)
-$01      frame-size indicator ($28 = 40 body bytes)
-$02..$07 reserved / zero
-$08..$09 CMDREG1B (the FPU command extension word)     <- ANCHORED by the spec
-$0A      STAG (bits 2:0)
-$0B      DTAG (bits 2:0)
-$0C      E1   (bit 7)
-$0D..$0F reserved / zero
-$10..$11 ETS (bit15) | ETE (bits 14:0)   -- SOURCE operand sign+exponent, extended
-$12..$13 reserved / zero
-$14..$1B ETM  -- SOURCE operand 64-bit mantissa, big-endian
-$1C..$1D FPTS (bit15) | FPTE (bits 14:0) -- DEST operand sign+exponent, extended
-$1E..$1F reserved / zero
-$20..$27 FPTM -- DEST operand 64-bit mantissa, big-endian
-$28..$2B reserved / zero
-                                          (44 bytes = 22 words total)
-```
-
-**This step is not done until the manual has been read.** Every other step in this task can be implemented against the provisional table; only Step 13 (the frame-content assertions) depends on the final one.
+Open the MC68040 User's Manual §9.7 / Figure 9-7 and write down the exact byte offset of each
+of: CMDREG1B, STAG, DTAG, E1, ETS/ETE, ETM, FPTS/FPTE, FPTM. Replace the provisional table
+(preserved from the original draft — CMDREG1B at `$08` is spec-anchored, everything else is a
+placement guess labeled as such) with the real one. Record the figure/page in the code comment
+and the commit message. **This step is not done until the manual has been read** — do not mark
+it done by re-reading the provisional table.
 
 - [ ] **Step 3: Extend `FpuControlPlugin` with the sticky bit + the fault-capture group**
 
-```scala
-// src/main/scala/m68k040/services/Services.scala -- extend `trait FpuControlService`:
-
-  /** Sticky "an FP operation has executed since reset or since the last null-frame
-    * FRESTORE". Selects NULL (False) vs IDLE (True) at FSAVE time. Set by the first
-    * committed FP-writing uop; cleared ONLY by a null-frame FRESTORE ("all FPU operations
-    * are aborted, and the FPU enters the reset state" -- the one FRESTORE behavior real
-    * hardware unconditionally requires). */
-  def everExecuted:    Bool
-  def setEverExecuted: Flow[Bool]
-
-  /** Latched unimplemented-instruction state, captured when a RECOGNIZED-but-unsupported
-    * FP op is delivered to vector 11 (Task 10's fpuSoftwareComplete path). A subsequent
-    * FSAVE emits the 44-byte unimplemented-instruction frame from it instead of the
-    * 4-byte idle frame; the FSAVE consumes it (uiValid clears). */
-  def uiValid:       Bool
-  def uiCmdReg1B:    Bits    // 16
-  def uiSrcOperand:  Bits    // 80 (extended: ETS/ETE/ETM)
-  def uiDstOperand:  Bits    // 80 (extended: FPTS/FPTE/FPTM)
-  def setUnimpFrame: Flow[Bits]   // 176 = 16 + 80 + 80, packed {cmd, src, dst}
-  def clearUnimp:    Flow[Bool]
-```
-
-```scala
-// src/main/scala/m68k040/execute/FpuControlPlugin.scala -- add to `logic`:
-
-    // ── FSAVE null-vs-idle discriminator (Task 11) ────────────────────────────────
-    // RegInit(False): power-on is NULL ("no FP op ever executed"), which is what real
-    // hardware reports and what lets an OS skip a pointless FRESTORE.
-    val everExecuted = RegInit(False); everExecuted.simPublic()
-    val setEverExecuted = Flow(Bool())
-    setEverExecuted.valid.allowOverride;   setEverExecuted.valid := False
-    setEverExecuted.payload.allowOverride; setEverExecuted.payload := False
-    when(setEverExecuted.valid) { everExecuted := setEverExecuted.payload }
-
-    // ── Latched unimplemented-instruction state (Task 11) ──────────────────────────
-    // Written at vector-11 delivery for a RECOGNIZED FP op (Task 10's
-    // fpuSoftwareComplete), read back by a later FSAVE, cleared when that FSAVE consumes
-    // it. This is the "route to FPSP" hand-off: the trap tells the handler THAT something
-    // unsupported happened; the frame tells it WHAT.
-    val uiValid      = RegInit(False); uiValid.simPublic()
-    val uiCmdReg1B   = Reg(Bits(16 bits)) init 0; uiCmdReg1B.simPublic()
-    val uiSrcOperand = Reg(Bits(80 bits)) init 0; uiSrcOperand.simPublic()
-    val uiDstOperand = Reg(Bits(80 bits)) init 0; uiDstOperand.simPublic()
-    val setUnimpFrame = Flow(Bits(176 bits))
-    val clearUnimp    = Flow(Bool())
-    setUnimpFrame.valid.allowOverride;   setUnimpFrame.valid := False
-    setUnimpFrame.payload.allowOverride; setUnimpFrame.payload := B(0, 176 bits)
-    clearUnimp.valid.allowOverride;      clearUnimp.valid := False
-    clearUnimp.payload.allowOverride;    clearUnimp.payload := False
-    when(setUnimpFrame.valid) {
-      uiValid      := True
-      uiCmdReg1B   := setUnimpFrame.payload(175 downto 160)
-      uiSrcOperand := setUnimpFrame.payload(159 downto 80)
-      uiDstOperand := setUnimpFrame.payload(79 downto 0)
-    }
-    // Later `when` wins in SpinalHDL: a same-cycle clear beats a set. That ordering can
-    // only matter if an FSAVE retires in the same cycle a vector-11 entry is delivered,
-    // which the serializing sysOp/exception FSM makes impossible -- defence in depth.
-    when(clearUnimp.valid) { uiValid := False }
-```
-
-Plus the matching `_field`/`override def` plumbing at the top of the class, following the existing pattern for `_fpcr`/`_setFpcr`.
-
-**And drive the sticky bit from FP commit:**
-
-```scala
-// src/main/scala/m68k040/rob/RobPlugin.scala -- in the commit block, alongside the existing
-// commitPorts fan-out. `fpWrite` is CommitSlot's FP-destination-written bit (Task 2).
-    when((commitPorts(0).valid && commitPorts(0).fpWrite) ||
-         (commitPorts(1).valid && commitPorts(1).fpWrite)) {
-      fpuCtrl.setEverExecuted.valid   := True
-      fpuCtrl.setEverExecuted.payload := True
-    }
-```
+Unchanged from the original draft's Step 3 — the `everExecuted`/`setEverExecuted`/`uiValid`/
+`uiCmdReg1B`/`uiSrcOperand`/`uiDstOperand`/`setUnimpFrame`/`clearUnimp` additions to
+`FpuControlService`/`FpuControlPlugin`, and driving `setEverExecuted` from FP commit in
+`RobPlugin.scala` (`commitPorts(k).fpWrite`). Confirm the real current `CommitSlot.fpWrite`
+field name and the real current `RobPlugin` commit-block structure before writing this (Task 2
+landed weeks before this task in real time; re-confirm rather than trust the original draft's
+exact line numbers).
 
 - [ ] **Step 4: `SysKind.FSAVE` / `SysKind.FRESTORE` + the decode arm**
 
-```scala
-// src/main/scala/m68k040/decode/DecodedUop.scala -- append after FMOVE_FPCTRL:
-      // FSAVE <ea> (0xF300|<ea>) / FRESTORE <ea> (0xF340|<ea>): line-F, cpID=001,
-      // opclass 100 / 101. PRIVILEGED (unlike FMOVE-to-FPcr) -- the default sysOp
-      // vector-8 behavior via RobPlugin's sysPrivFault is exactly right, no exclusion.
-      // Encoding confirmed from the vendored corpus's own raw literals (0xF327 =
-      // FSAVE -(A7), 0xF35F = FRESTORE (A7)+, both commented as such in
-      // fpu_fsave_idle_format_byte.s / fpu_fsave_null_frame.s) and re-confirmed against
-      // m68k-linux-gnu-as -m68040.
-      //
-      // COMMIT-TIME SYSTEM ops, deliberately NOT microcoded: the frame length is
-      // RUNTIME-selected (4 vs 44 bytes, from live FPU state), which the static
-      // Microcode.Desc row vocabulary (see Microcode.MOVE16_ENTRY's fixed 4-transfer
-      // chain, rows 242-251) cannot express. ExceptionUnit's own frame machinery ALREADY
-      // is "emit N words where N is runtime-selected, then read a frame back and dispatch
-      // on its format byte" (E_STORE/E_STWAIT's stStep/lastStep and R_FMTREQ/R_FMTWAIT),
-      // so these reuse it directly.
-      FSAVE,
-      FRESTORE
-      = newElement()
-```
-
-```scala
-// src/main/scala/m68k040/decode/OperationDecoder.scala -- inside the is(0xF) arm.
-        // ── FSAVE / FRESTORE ──────────────────────────────────────────────────────────
-        // SCOPE: the register-indirect EA modes only --
-        //   FSAVE    : mode 100 (-(An))  and mode 010 ((An))   [predecrement + control]
-        //   FRESTORE : mode 011 ((An)+)  and mode 010 ((An))   [postincrement + control]
-        // matching the architectural alterable/control restrictions on each. The
-        // displacement/absolute forms that fsave_frestore_basic.s sub-tests 3-5 exercise
-        // are OUT of scope here (they need a real EA computation, which the commit-time
-        // sysOp path has no AGU for) and stay on the line-F vector-11 fall-through.
-        val fsvBase   = (opword(15 downto 12) === B"4'hF") && (opword(11 downto 9) === B"3'b001")
-        val fsvMode   = opword(5 downto 3)
-        val isFsave    = fsvBase && (opword(8 downto 6) === B"3'b100") &&
-                         ((fsvMode === B"3'b100") || (fsvMode === B"3'b010"))
-        val isFrestore = fsvBase && (opword(8 downto 6) === B"3'b101") &&
-                         ((fsvMode === B"3'b011") || (fsvMode === B"3'b010"))
-        when(isFsave || isFrestore) {
-          o.illegal    := False
-          o.op         := DecOp.MOVE
-          o.size       := Size.LONG
-          o.sysOp      := True
-          o.sysKind    := Mux(isFsave, SysKind.FSAVE, SysKind.FRESTORE)
-          o.sysReadDir := False        // both take An as a SOURCE value (PTEST's precedent)
-          o.dst.setNone(); o.dstWrites := False
-        }
-```
-
-No `PredecodeWord` change is needed: all four admitted forms are single-word, and the existing line-F `otherwise` arm (`PredecodeWord.scala:1066-1067`) already yields `simple = True, lenWords = 1`. Verified by reading that arm; do not add a redundant branch.
+Unchanged from the original draft's Step 4 — append the two new `SysKind` elements (confirm
+the real current element count stays within whatever width `ExceptionUnit.sysKind`/
+`RobPlugin`'s `.resize(N)` currently uses; widen both together if the elaboration-time
+`require` fires, per every prior task's own established discipline for this), and the
+`OperationDecoder.scala` recognition arm gating on opclass 100/101 with the register-indirect
+EA restriction. No `PredecodeWord` change needed (single-word forms, already correctly framed
+by the existing line-F `otherwise` arm).
 
 - [ ] **Step 5: `MicroOpAssembler` operand routing**
 
-Add inside `when(isSysOp)`, after Task 9's arm. This is PTEST's arm (`MicroOpAssembler.scala:1756-1762`) plus a renamed destination for the auto-update modes, which is MOVE_USP's read-direction pattern (line 1704-1706).
+Unchanged from the original draft's Step 5 — An rides `srcB` (giving `S_APPLY` the frame base
+address via `sysCapVal`), auto-update modes (`FSAVE -(An)`, `FRESTORE (An)+`) get a renamed
+`dstReg`/`dstValid` write-back through the existing `sysRegWrite*` port (MOVEC's/MOVE_USP's
+read-direction precedent), and the EA mode + isRestore marker ride the `imm[3:0]` →
+`RobPlugin.scala`'s `sysRc` side-channel (MOVEC's Rc id / CPUSH's `{scope,cacheSel}` precedent).
 
-```scala
-      // FSAVE / FRESTORE: the An is op[2:0] (the standard <ea> reg field, NOT op[11:9]) --
-      // same override precedent as MOVE_USP/PTEST/CPUSH. An's VALUE rides srcB so the ALU
-      // EU's plain MOVE writeback lands it in sysValStore -> sysCapVal, giving S_APPLY the
-      // frame base address.
-      //
-      // For the AUTO-UPDATE modes (FSAVE -(An), FRESTORE (An)+) the An must also be
-      // WRITTEN BACK. dstReg=An with dstValid=True makes rename allocate a pdst that the
-      // ROB commits at the serializing retire, and the FSM writes the updated value into
-      // PRF[pdst] through the existing sysRegWrite* port -- byte-for-byte MOVEC's and
-      // MOVE_USP's read-direction mechanism. The EU's own writeback into that pdst (which
-      // for op=MOVE is just An's old value) is overwritten by the FSM at commit; that
-      // EU-writes-then-FSM-overwrites shape is exactly what MOVE_USP's read arm already
-      // relies on.
-      //
-      // imm[3:0] carries the EA mode (imm[3:1]) and an isRestore marker (imm[0]) through
-      // the SAME imm -> RobPlugin.scala:441 (`p.sysRc := u.imm(11 downto 0)`) -> sysCapRc
-      // side-channel that MOVEC's Rc id and CPUSH's {scope,cacheSel} nibble already use.
-      when(spec.sysKind === SysKind.FSAVE || spec.sysKind === SysKind.FRESTORE) {
-        val fsvAn      = (U(8, 5 bits) + op(2 downto 0).asUInt).resize(5)
-        val fsvIsRest  = spec.sysKind === SysKind.FRESTORE
-        val fsvAuto    = (op(5 downto 3) === B"3'b100") || (op(5 downto 3) === B"3'b011")
-        opUop.srcBReg   := fsvAn; opUop.srcBValid := True
-        opUop.srcAValid := False
-        opUop.useImm    := False
-        opUop.imm       := (op(5 downto 3) ## fsvIsRest.asBits).resize(32)
-        opUop.dstReg    := fsvAn
-        opUop.dstValid  := fsvAuto      // only -(An)/(An)+ write An back; plain (An) does not
-        opUop.isMovea   := True         // An destination: full-32 write, no partial merge
-      }
-```
+- [ ] **Step 6: `LsEuPlugin` — extend the `excActive` D-cache-port MUX to the DTLB port**
 
-- [ ] **Step 6: `ExceptionUnit` — the FSAVE emit path**
+Read the real, current `excActive`-gated D-cache load/store command hand-off in
+`LsEuPlugin.scala` (search for `excActive` — the earlier design investigation found this
+pattern at multiple sites, e.g. `when(excActive && excLoadCmdValid) { dcache.loadCmd := ... }`
+and its store-side sibling, plus `xlate.req.valid := !excActive && ...` already fully idling the
+DTLB claim during an active episode). Mirror that exact shape for the DTLB request/response:
+when `excActive`, `LsEuPlugin` must not drive `xlate.req` at all (confirm this is already true —
+the design investigation found it IS already true, so this step may be pure confirmation, not
+new code) and must hand the actual port to a new pass-through from `ExceptionUnit`, exactly like
+the D-cache command ports already are. Add whatever new pass-through vars this needs (mirroring
+the existing `excLoadCmdValid`-shaped declarations).
 
-New captured state and the frame emitter, added alongside the existing entry-frame equivalents (`stStep`/`lastStep`/`frameWordAddr`/`frameWordData`, lines 606-659):
+- [ ] **Step 7: `ExceptionUnit` — build the real D-side DTLB acquisition**
 
-```scala
-// src/main/scala/m68k040/exception/ExceptionUnit.scala
+Replace the dead `dtReq`/`dtRsp` I-side-shaped stub with a real `Stream[DTranslationCmd]`/
+`Stream[DTranslationRsp]` pair, including the 8-bit token field `DTranslationService` requires
+to match responses in its elastic pipeline (confirm the exact real token composition —
+`DTranslationToken` per the earlier investigation's citation, `{backendEpoch, splitPhase,
+robId[5:0]}` — and what a reasonable value is for an `ExceptionUnit`-originated request, which
+has no natural `robId`; this is a real implementation-time decision to make and document, not
+something to guess past). Acquire it via whatever mechanism `FullCoreSynth.scala` ends up using
+for the second consumer (Step 6's `Files` note above — this is genuinely novel plumbing, since
+no existing multi-consumer pattern for `DTranslationService` exists; keep it as small and
+close to the existing `excActive`-MUX precedent as possible, do not build a general arbitration
+service unless you find real evidence it's unavoidable).
 
-  // ── FSAVE / FRESTORE captured state (Task 11) ────────────────────────────────
-  // The FPU state-frame VERSION byte. Finalized at implementation time per the design
-  // spec ("$40 is a reasonable default choice ... not a design blocker"): $41 is chosen
-  // because (a) the vendored fpu_fsave_idle_format_byte.s asserts exactly 0x41, and (b)
-  // the Q700 FPSP's `if ((frame[0] & 0xf) == 0) skip_restore` optimization needs a
-  // NON-ZERO low nibble on a non-null frame -- $40 would make every idle frame look null
-  // to it. The NULL frame still forces byte $00 to $00 (per the spec's table: "Version
-  // forced to $00 (identifies null, not a length code)"), which keeps that same
-  // optimization correct in the other direction.
-  val FPU_FRAME_VERSION = 0x41
+- [ ] **Step 8: `ExceptionUnit` — the FSAVE emit path, translation-aware**
 
-  val fsFrameBase = Reg(UInt(32 bits))       // LOW address of the frame
-  val fsSize      = Reg(UInt(8 bits))        // total frame size in BYTES (4 or 44)
-  val fsIsNull    = RegInit(False)
-  val fsIsUnimp   = RegInit(False)
-  val fsStep      = Reg(UInt(5 bits)) init 0; fsStep.simPublic()   // WORD index, 0..21
-  val fsSplitLow  = Reg(Bool()) init 0
-  val fsAnUpdate  = Reg(UInt(32 bits))       // the value written back into An
-  val fsAnWrite   = RegInit(False)           // does this op write An back at all?
+Build on the original draft's `fsFrameBase`/`fsSize`/`fsIsNull`/`fsIsUnimp`/`fsStep`/
+`fsSplitLow`/`fsAnUpdate`/`fsAnWrite`/`fsFrameWordAddr`/`fsFrameWordData`/`fpTag`/`fsLastStep`
+state and the `S_APPLY` arm for `SysKind.FSAVE` (frame-type selection from live
+`fpuCtrl.everExecuted`/`.uiValid`, base address computation for `-(An)`/`(An)`, An write-back
+through `sysRegWrite*`, consuming the pending unimplemented state via `clearUnimp`) — this part
+is genuinely unchanged, since FSAVE's case-selection needs no memory read at all (confirmed by
+the design addendum's own investigation). What's new is the `F_STORE`/`F_STWAIT` loop itself:
 
-  // FSAVE frame words. 22 words max ($2C bytes). PROVISIONAL FIELD PLACEMENT -- only the
-  // 44-byte total, the two header bytes, and CMDREG1B's offset $08 are spec-verified; the
-  // rest MUST be confirmed against MC68040 UM Figure 9-7 (this task's Step 2) before the
-  // frame-content assertions in FsaveFrestoreSpec are trusted. Record the figure/page here
-  // once confirmed:  [ PIN ME -- MC68040 UM Fig 9-7, page ___ ]
-  def fsFrameWordAddr(step: UInt): UInt = (fsFrameBase + (step << 1)).resized
-  def fsFrameWordData(step: UInt): Bits = {
-    val out = Bits(16 bits); out := B(0, 16 bits)
-    // Header word: [15:8] = version, [7:0] = length-in-hex indicator.
-    //   null : $00 $00   (version FORCED to $00 -- identifies null, not a length code)
-    //   idle : $41 $00   (0 extra bytes)
-    //   unimp: $41 $28   (40 extra bytes)
-    val hdr = Mux(fsIsNull, U(0x0000, 16 bits),
-              Mux(fsIsUnimp, U((FPU_FRAME_VERSION << 8) | 0x28, 16 bits),
-                             U((FPU_FRAME_VERSION << 8) | 0x00, 16 bits)))
-    val src = fpuCtrl.uiSrcOperand    // 80 bits: [79] sign, [78:64] exponent, [63:0] mantissa
-    val dst = fpuCtrl.uiDstOperand
-    switch(step) {
-      is(U(0,  5 bits)) { out := hdr.asBits }
-      is(U(4,  5 bits)) { out := fpuCtrl.uiCmdReg1B }                       // $08 CMDREG1B
-      is(U(5,  5 bits)) { out := (fpTag(src) ## B(0, 5 bits) ##
-                                  fpTag(dst) ## B(0, 5 bits)) }             // $0A STAG, $0B DTAG
-      is(U(6,  5 bits)) { out := B"16'h8000" }                              // $0C E1 (bit 7 of byte $0C)
-      is(U(8,  5 bits)) { out := src(79 downto 64) }                        // $10 ETS|ETE
-      is(U(10, 5 bits)) { out := src(63 downto 48) }                        // $14..$1B ETM
-      is(U(11, 5 bits)) { out := src(47 downto 32) }
-      is(U(12, 5 bits)) { out := src(31 downto 16) }
-      is(U(13, 5 bits)) { out := src(15 downto 0) }
-      is(U(14, 5 bits)) { out := dst(79 downto 64) }                        // $1C FPTS|FPTE
-      is(U(16, 5 bits)) { out := dst(63 downto 48) }                        // $20..$27 FPTM
-      is(U(17, 5 bits)) { out := dst(47 downto 32) }
-      is(U(18, 5 bits)) { out := dst(31 downto 16) }
-      is(U(19, 5 bits)) { out := dst(15 downto 0) }
-      // every other word is reserved -> 0 (the default above)
-    }
-    out
-  }
-  /** 3-bit operand-type tag (STAG/DTAG) from an 80-bit extended value: exponent all-ones
-    * with a zero mantissa = infinity (010), all-ones with non-zero = NaN (011), exponent
-    * zero with zero mantissa = zero (001), exponent zero with non-zero mantissa =
-    * denormalized (100), otherwise normalized (000). ALSO PROVISIONAL -- confirm the
-    * encoding alongside the offsets in Step 2. */
-  def fpTag(v: Bits): Bits = {
-    val exp  = v(78 downto 64)
-    val man  = v(63 downto 0)
-    val expAllOnes = exp.andR
-    val expZero    = !exp.orR
-    val manZero    = !man.orR
-    Mux(expAllOnes, Mux(manZero, B"3'b010", B"3'b011"),
-    Mux(expZero,    Mux(manZero, B"3'b001", B"3'b100"), B"3'b000"))
-  }
-  val fsLastStep = Mux(fsIsUnimp, U(21, 5 bits), U(1, 5 bits))   // 22 words vs 2 words
-```
+- Add a VPN-tracking register (e.g. `fsLastVpn: Reg(UInt(20 bits))` + a validity bit) and a
+  translated-physical-address register the current step's store actually targets.
+- Before each word store, compute the step's VPN from `fsFrameWordAddr(fsStep)`. If it differs
+  from `fsLastVpn` (or no translation has happened yet this episode), request a translation
+  (mirroring the `E_VECREQ`/`E_VECWAIT` REQ/WAIT shape) before proceeding to the store; if it
+  matches, reuse the already-translated physical address.
+- On `dtRsp.fault`, do NOT proceed with the store — drive `coreHaltedIn` (via whatever real
+  signal path Step 9 below establishes) and stop advancing `fsStep` (the episode is now
+  terminally halted, not resumable — confirm this matches `coreHalted`'s real existing
+  semantics, e.g. `headReady` forced False, frontend quiesced, per the design investigation's
+  own citations, rather than assuming).
+- Preserve the existing task-#163 cross-cache-line word-split logic (`fsSplitLow`) verbatim —
+  it's a separate, already-proven-necessary bug class, unrelated to translation.
 
-The `S_APPLY` arm and the store loop:
+- [ ] **Step 9: `RobPlugin` — wire the translation-fault escalation to `coreHaltedIn`**
 
-```scala
-        is(skOrd(m68k040.decode.SysKind.FSAVE)) {
-          // Frame-type selection from LIVE FPU state (spec's FSAVE/FRESTORE section):
-          //   unimplemented-instruction : a recognized-but-unsupported FP op is pending
-          //                               software completion (Task 10's vector-11 path
-          //                               latched it) -- this is the "route to FPSP" frame
-          //   null                      : no FP op has executed since reset / null restore
-          //   idle                      : otherwise
-          val isNull  = !fpuCtrl.everExecuted && !fpuCtrl.uiValid
-          val isUnimp = fpuCtrl.uiValid
-          val size    = Mux(isUnimp, U(44, 8 bits), U(4, 8 bits))
-          fsIsNull  := isNull
-          fsIsUnimp := isUnimp
-          fsSize    := size
-          // sysCapRc[3:1] = the EA mode, sysCapRc[0] = isRestore (0 here).
-          // -(An): the frame occupies [An-size, An), and An := An-size.
-          // (An)  : the frame occupies [An, An+size), An unchanged.
-          val isPredec = sysCapRc(3 downto 1) === U(4, 3 bits)
-          val base     = Mux(isPredec, sysCapVal.asUInt - size.resize(32), sysCapVal.asUInt)
-          fsFrameBase := base
-          fsAnWrite   := isPredec
-          fsAnUpdate  := base
-          fsStep      := 0
-          fsSplitLow  := False
-          // An write-back, through the SAME port MOVEC's read direction uses. Driven here
-          // (not after the stores) because the value is already known combinationally --
-          // exactly MOVEC's shape. FRESTORE cannot do this (its size comes from memory),
-          // hence its separate F_RDONE state below.
-          when(isPredec) {
-            sysRegWriteValid := True
-            sysRegWritePhys  := sysCapDstPhys
-            sysRegWriteData  := base
-          }
-          // Emitting the frame CONSUMES the pending unimplemented state.
-          when(isUnimp) { fpuCtrl.clearUnimp.valid := True; fpuCtrl.clearUnimp.payload := True }
-          goto(F_STORE)
-        }
-```
+Confirm `RobPlugin.coreHaltedIn`'s real current shape (`allowOverride`, single `Bool`,
+currently driven only from `DcachePlugin.diagFault` at `FullCoreSynth.scala`) and add
+`ExceptionUnit`'s new translation-fault signal as a second producer — the existing pattern is
+almost certainly `coreHaltedIn := dc.diagFault || exc.fsaveTranslationFault` (or whatever the
+real signal ends up named) at the `FullCoreSynth.scala` wiring site, mirroring exactly how a
+single sticky signal already ORs in from one source; confirm whether `coreHaltedIn` already
+supports multiple producers cleanly or needs a small extension (a plain OR of two `Bool`
+sources at the top-level wiring site should suffice — do not build a priority/first-wins
+encoding unless you find real evidence `coreHalted`'s existing consumer needs to distinguish
+which producer fired, which the design investigation's citations suggest it does not).
 
-```scala
-    // ── FSAVE: write the state frame one word at a time ────────────────────────────
-    // Structurally identical to E_STORE/E_STWAIT (lines 928-978), including the task-#163
-    // line-crossing word split: driveStoreNoXlate's plain {paddr,size} store path has no
-    // cross-cache-line handling and silently DROPS the second byte of a word landing at
-    // line-relative offset 15, so a crossing word is split into two single-byte pushes.
-    // That bug was found the hard way once (exc_aline_odd_sp_mmu_dcache); do not omit the
-    // split here just because FSAVE frame bases are "usually" aligned -- fsave -(An) with
-    // an odd An is perfectly legal.
-    F_STORE.whenIsActive {
-      val addr    = fsFrameWordAddr(fsStep)
-      val data    = fsFrameWordData(fsStep)
-      val crosses = addr(3 downto 0) === U(15, 4 bits)
-      when(fsSplitLow)      { driveStoreNoXlate(addr + U(1, 32 bits), Size.BYTE, data(7 downto 0)) }
-      .elsewhen(crosses)    { driveStoreNoXlate(addr, Size.BYTE, data(15 downto 8)) }
-      .otherwise            { driveStoreNoXlate(addr, Size.WORD, data) }
-      goto(F_STWAIT)
-    }
-    F_STWAIT.whenIsActive {
-      when(dcStoreAck) {
-        val addr    = fsFrameWordAddr(fsStep)
-        val crosses = addr(3 downto 0) === U(15, 4 bits)
-        when(crosses && !fsSplitLow) { fsSplitLow := True; goto(F_STORE) }
-        .otherwise {
-          fsSplitLow := False
-          when(fsStep === fsLastStep) { goto(S_REDIR) }
-          .otherwise                  { fsStep := fsStep + 1; goto(F_STORE) }
-        }
-      }
-    }
-```
+- [ ] **Step 10: `ExceptionUnit` — the FRESTORE consume path, translation-aware, header-word-only**
 
-- [ ] **Step 7: `ExceptionUnit` — the FRESTORE consume path**
+Build on the original draft's `F_HDRREQ`/`F_HDRWAIT`/`F_RDONE` shape (read one WORD, dispatch on
+version/length-byte, apply the null-frame FPU-reset behavior, An write-back for `(An)+`) — this
+is structurally simpler than FSAVE's case since it's exactly ONE translated access (the header
+word), so the VPN-tracking machinery from Step 8 degenerates to "translate once, use once" here
+— confirm this and don't over-build a loop that never iterates more than once for this path.
+On `dtRsp.fault` for the header read, same escalation as Step 8 (`coreHaltedIn`).
 
-```scala
-        is(skOrd(m68k040.decode.SysKind.FRESTORE)) {
-          // The frame base is An for BOTH admitted modes ((An)+ and (An)); only the
-          // write-back differs. Size is unknown until the header word is read.
-          fsFrameBase := sysCapVal.asUInt
-          fsAnWrite   := sysCapRc(3 downto 1) === U(3, 3 bits)   // (An)+ postincrement
-          goto(F_HDRREQ)
-        }
-```
+Register whatever new FSM states this needs (an `X_REQ`/`X_WAIT`-shaped pair for the
+translation itself, on top of the existing `F_STORE`/`F_STWAIT`/`F_HDRREQ`/`F_HDRWAIT`/
+`F_RDONE` states) alongside the existing state declarations.
 
-```scala
-    // ── FRESTORE: read the header word, dispatch on it ─────────────────────────────
-    // Structurally R_FMTREQ/R_FMTWAIT (lines 1080-1108): a single WORD read whose value
-    // selects what happens next. WORD granularity, not LONG, for the same reason task #189
-    // split RTE's PC read -- DcacheByteLane.extract has no cross-line awareness.
-    F_HDRREQ.whenIsActive {
-      dtoVld := True; dtoVpn := fsFrameBase(31 downto 12)
-      ldoVld := True; ldoVaddr := fsFrameBase; ldoSize := Size.WORD
-      when(dcLoadCmd.fire) { goto(F_HDRWAIT) }
-    }
-    F_HDRWAIT.whenIsActive {
-      dtoVld := True; dtoVpn := fsFrameBase(31 downto 12)
-      when(dcLoadRsp.valid) {
-        val hdr     = dcLoadRsp.payload.data(15 downto 0)
-        val version = hdr(15 downto 8)
-        val lenByte = hdr(7 downto 0).asUInt
-        // Pop size = 4 + the length-in-hex indicator, for EVERY frame flavour. This is the
-        // one FRESTORE rule that is architecturally universal and it is what
-        // fsave_frestore_basic.s's sub-test 6 pop-size matrix actually checks (NULL->4,
-        // $28->44, $60->100, and the FPSP's manufactured version-$41/size-$00 pseudo-null
-        // ->4). It costs nothing to get right for frame shapes we never EMIT.
-        fsSize := (U(4, 9 bits) + lenByte.resize(9)).resize(8)
-        // A NULL frame (version byte $00) aborts all FPU operations and puts the FPU in
-        // the RESET state -- per the design spec, the only FRESTORE behavior real hardware
-        // unconditionally requires, and the only one implemented here. A non-null frame's
-        // BODY fields are deliberately NOT applied (out of scope, spec-narrowed): real
-        // 68040 FSAVE saves no control registers at all, which is exactly why the ROM
-        // FPSP prologue separately does FMOVEM.L FPIAR/FPSR/FPCR,-(A7).
-        when(version === U(0, 8 bits)) {
-          fpuCtrl.setEverExecuted.valid := True; fpuCtrl.setEverExecuted.payload := False
-          fpuCtrl.clearUnimp.valid      := True; fpuCtrl.clearUnimp.payload      := True
-          fpuCtrl.setFpcr.valid  := True; fpuCtrl.setFpcr.payload  := U(0, 32 bits)
-          fpuCtrl.setFpsr.valid  := True; fpuCtrl.setFpsr.payload  := U(0, 32 bits)
-          fpuCtrl.setFpiar.valid := True; fpuCtrl.setFpiar.payload := U(0, 32 bits)
-          fpccWriteValid := True; fpccWriteData := B(0, 4 bits)
-        } otherwise {
-          // A non-null frame means "the FPU had state" -> idle, not null, on a later FSAVE.
-          fpuCtrl.setEverExecuted.valid := True; fpuCtrl.setEverExecuted.payload := True
-        }
-        goto(F_RDONE)
-      }
-    }
-    // The An write-back for FRESTORE (An)+ has to happen HERE, not in S_APPLY: the pop
-    // size is only known once the header has been read out of memory.
-    F_RDONE.whenIsActive {
-      when(fsAnWrite) {
-        sysRegWriteValid := True
-        sysRegWritePhys  := sysCapDstPhys
-        sysRegWriteData  := fsFrameBase + fsSize.resize(32)
-      }
-      goto(S_REDIR)
-    }
-```
+`S_REDIR` needs no change — confirm it still applies uniformly for every `sysKind`.
 
-Register the six new states alongside the existing ones (`ExceptionUnit.scala:661-718`):
+- [ ] **Step 11: Capture the unimplemented state at vector-11 delivery**
 
-```scala
-    val F_STORE   = new State   // FSAVE: issue one frame word
-    val F_STWAIT  = new State   // FSAVE: await its write-through ACK; advance
-    val F_HDRREQ  = new State   // FRESTORE: load the header word
-    val F_HDRWAIT = new State   // FRESTORE: dispatch on version/length
-    val F_RDONE   = new State   // FRESTORE: An += popSize, then redirect
-```
+Unchanged from the original draft's Step 8 (the `RobPlugin`-side half: `fpuUnimpStore`/
+`fpuCmdStore` per-ROB-entry, written at alloc from Task 10's `fpuSoftwareComplete`/
+`fpuCmdWord`, passed into `ExceptionUnit` as `entryFpuUnimp`/`entryFpuCmd`; the
+`ExceptionUnit`-side committed-FP-operand readback via `committedFpSrcIn`/`committedFpDstIn`,
+`committedA7In`'s optional-input pattern; the capture itself at `entryVector === 11 &&
+entryFpuUnimp`, setting `setUnimpFrame` and `setFpiar` to the faulting instruction's own PC).
+If Task 1's FP regfile has no committed-mapping read port wired at this site yet, leave both
+inputs at their zero defaults for this task only and say so explicitly in the commit message —
+this degrades gracefully (correct header/CMDREG1B, zeroed operands) rather than blocking.
 
-`S_REDIR` (line 1475-1506) needs **no** change: it already pulses the obs, re-banks A7, and redirects to `sysCapNextPc` for every `sysKind`, and its `obsSetCcr5` fan-out is gated on MOVE_TO_SR/STOP only.
+- [ ] **Step 12: Update the line-F exhaustive sweep exclusions**
 
-- [ ] **Step 8: Capture the unimplemented state at vector-11 delivery**
+Unchanged from the original draft's Step 9 — extend `MicroOpAssemblerSpec`'s `implemented(op)`
+helper for the FSAVE/FRESTORE opword/EA-mode combinations this task admits.
 
-```scala
-// src/main/scala/m68k040/rob/RobPlugin.scala
-// Two new per-entry stores, alongside the existing faultAddrStore/faultWrStore/... family
-// (which are written ONLY at alloc, per that family's own doc comment at line 67):
-    val fpuUnimpStore = Vec.fill(RobDepth)(Reg(Bool()))
-    val fpuCmdStore   = Vec.fill(RobDepth)(Reg(Bits(16 bits)))
-    // written at alloc from Task 10's decode fields, exactly like faultPcStore:
-      fpuUnimpStore(tail)     := allocUopVec(0).fpuSoftwareComplete
-      fpuCmdStore(tail)       := allocUopVec(0).fpuCmdWord
-      fpuUnimpStore(tail + 1) := allocUopVec(1).fpuSoftwareComplete
-      fpuCmdStore(tail + 1)   := allocUopVec(1).fpuCmdWord
+- [ ] **Step 13: Directed tests — frame emission (all 3 types), FRESTORE pop-size matrix,
+  privilege, AND the new translation-fault escalation path**
 
-// ... and passed into the ExceptionUnit constructor alongside entryFaultAddr:
-      entryFpuUnimp = fpuUnimpStore(h0),
-      entryFpuCmd   = fpuCmdStore(h0),
-```
+Carry forward the original draft's `FsaveFrestoreSpec.scala` test shapes (Steps 10-12 there):
+null/idle/unimplemented frame emission with the correct header bytes and CMDREG1B at `$08`;
+consuming the pending unimplemented state on emission; the FRESTORE pop-size matrix
+(NULL→4, `$28`→44, `$60`→100, the FPSP's manufactured pseudo-null→4); a null-frame FRESTORE
+resetting the FPU (FPCR clears, next FSAVE emits NULL again); privilege (user-mode FSAVE traps
+vector 8, supervisor mode does not).
 
-```scala
-// src/main/scala/m68k040/exception/ExceptionUnit.scala
-// (a) constructor params, following entryFaultAddr's optional-with-safe-default shape:
-    entryFpuUnimp: Bool = False,
-    entryFpuCmd:   Bits = B(0, 16 bits),
+**New, for the translation-aware mechanism**: at minimum one directed test proving a real,
+injected DTLB fault during an FSAVE frame store correctly drives `coreHalted` (rather than
+silently proceeding as if the store succeeded, which is exactly the failure mode this whole
+redesign exists to close) — and one confirming an FSAVE/FRESTORE whose frame does NOT cross a
+page boundary needs only one translation request (a cheap regression guard against accidentally
+reverting to blind per-word retranslation). A genuine page-crossing test (an `An` chosen so the
+frame straddles a 4KB boundary) is valuable but may need real DTLB/page-table test-harness
+support beyond what a directed whitebox test can easily construct — if building one is
+disproportionately expensive given the harness available, it is acceptable to defer it with an
+explicit flag in the report (do not silently skip it without saying so).
 
-// (b) committed FP operand readbacks -- committedA7In's pattern exactly. The full-core
-//     wiring reads the FP PRF at the committed arch->phys mapping for the SOURCE FPm
-//     (command word bits [12:10]) and DESTINATION FPn (bits [9:7]); a DUT that does not
-//     wire them leaves the frame's operand fields zero, which is the same graceful
-//     degradation every other optional input in this file provides.
-  val committedFpSrcIn = Bits(80 bits); committedFpSrcIn.allowOverride; committedFpSrcIn := B(0, 80 bits)
-  val committedFpDstIn = Bits(80 bits); committedFpDstIn.allowOverride; committedFpDstIn := B(0, 80 bits)
-  // Exposed so the wiring can address the FP RAT with them.
-  val fpuSrcArch = entryFpuCmd(12 downto 10).asUInt; fpuSrcArch.simPublic()
-  val fpuDstArch = entryFpuCmd(9 downto 7).asUInt;   fpuDstArch.simPublic()
-
-// (c) the capture itself, in IDLE's entryTrigger arm (alongside `curVec := entryVector`,
-//     line 781) -- non-speculative, since exception delivery is at commit:
-        when(entryVector === 11 && entryFpuUnimp) {
-          // A RECOGNIZED-but-unsupported FP op is being handed to FPSP. Latch what a
-          // subsequent FSAVE needs to build the 44-byte unimplemented-instruction frame:
-          // the command word (CMDREG1B) plus both operands, from which STAG/DTAG and the
-          // ETS/ETE/ETM + FPTS/FPTE/FPTM fields are derived at emit time.
-          fpuCtrl.setUnimpFrame.valid   := True
-          fpuCtrl.setUnimpFrame.payload := entryFpuCmd ## committedFpSrcIn ## committedFpDstIn
-          // FPIAR := the faulting instruction's own PC (its architectural definition:
-          // "last FP exception PC"). entryPc is the POST-instruction PC here (Task 10 set
-          // faultUsesNextPc for this class), so the instruction's own PC is entryPpc.
-          fpuCtrl.setFpiar.valid   := True
-          fpuCtrl.setFpiar.payload := (if (entryPpc != null) entryPpc else (entryPc - 2).resized)
-        }
-```
-
-```scala
-// src/main/scala/m68k040/top/FullCoreSynth.scala -- alongside the committedA7In wiring:
-        exc.committedFpSrcIn := fpRegFile.read(rename.logic.fpRat.committedPhys(exc.fpuSrcArch))
-        exc.committedFpDstIn := fpRegFile.read(rename.logic.fpRat.committedPhys(exc.fpuDstArch))
-```
-
-If Task 1's FP regfile has no committed-mapping read port wired at this site yet, leave both inputs at their `B(0, 80 bits)` defaults **for this task only** and say so in the commit message — the frame then carries a correct header, correct CMDREG1B, and zeroed operands, which is strictly better than no frame at all and degrades exactly where the missing dependency is.
-
-- [ ] **Step 9: Update the line-F exhaustive sweep exclusions**
-
-```scala
-// src/test/scala/m68k040/decode/MicroOpAssemblerSpec.scala -- extend `implemented(op)`:
-        val fsave    = ((op & 0xFFC0) == 0xF300) &&
-                       (((op >> 3) & 7) == 4 || ((op >> 3) & 7) == 2)
-        val frestore = ((op & 0xFFC0) == 0xF340) &&
-                       (((op >> 3) & 7) == 3 || ((op >> 3) & 7) == 2)
-        cpush || pflush || ptest || move16 || fsf || fsave || frestore
-```
-
-- [ ] **Step 10: Directed test — frame emission, all three types**
-
-```scala
-// src/test/scala/m68k040/exception/FsaveFrestoreSpec.scala
-package m68k040.exception
-
-import m68k040.VerilatorTest
-import m68k040.oracle.ProgramAssembler
-import spinal.core.sim._
-import org.scalatest.funsuite.AnyFunSuite
-
-/** FSAVE/FRESTORE state frames. Whitebox, NOT lock-step, and deliberately so: the design
-  * spec's Decision 3 records that Musashi has the WRONG FSAVE frame shape entirely (a
-  * 28-byte format-$1f frame, not the real 68040's 4/44/100-byte null/idle/unimplemented
-  * frames) and no unimplemented-instruction trap at all. There is nothing for a lock-step
-  * oracle to referee here; the MC68040 UM is the reference and memory contents are the
-  * assertion. */
-class FsaveFrestoreSpec extends AnyFunSuite {
-  // Reuse ExecuteLockStepSpec's FullCoreDut harness shape (see `runCpushPriv`,
-  // ExecuteLockStepSpec.scala:3695-3742) -- same DUT, same attachProgram /
-  // BehavioralMemAgent / seed / redirect boot sequence. Factored into a local helper here
-  // rather than duplicated per test.
-  private def runFsave(prologue: String, everExecuted: Boolean, unimpPending: Boolean): Array[Int] = {
-    val loadAddr = ProgramAssembler.DefaultLoadAddress
-    val src = s"lea 0x00010000,%a7 ; $prologue .short 0xF327 ; done: bra.s done"
-    ...  // boot exactly as runCpushPriv does, in SUPERVISOR mode (srSys = 0x27)
-    ...  // poke dut.fpuCtrl.logic.everExecuted #= everExecuted
-    ...  // poke dut.fpuCtrl.logic.uiValid      #= unimpPending
-    ...  // if (unimpPending) poke uiCmdReg1B / uiSrcOperand / uiDstOperand with sentinels
-    ...  // run to quiescence, then read back 64 bytes below 0x00010000 from the mem agent
-  }
-
-  test("FSAVE -(A7) with no FP op ever executed emits the 4-byte NULL frame", VerilatorTest) {
-    val m = runFsave("", everExecuted = false, unimpPending = false)
-    // Null: version FORCED to $00 (identifies null, not a length code), byte 1 undefined
-    // (we emit $00), 4 bytes total -> A7 -= 4.
-    assert(m(0) == 0x00, f"null frame version byte must be $00, got 0x${m(0)}%02X")
-    assert(m(1) == 0x00, "null frame length indicator")
-  }
-
-  test("FSAVE -(A7) after an FP op emits the 4-byte IDLE frame, version $41", VerilatorTest) {
-    val m = runFsave("", everExecuted = true, unimpPending = false)
-    assert(m(0) == 0x41,
-      f"idle frame version byte -- $41 is this implementation's finalized version " +
-      f"(see ExceptionUnit.FPU_FRAME_VERSION); got 0x${m(0)}%02X")
-    assert(m(1) == 0x00, "idle frame carries 0 extra bytes")
-  }
-
-  test("FSAVE -(A7) with a pending unimplemented-instruction emits the 44-byte frame", VerilatorTest) {
-    val m = runFsave("", everExecuted = true, unimpPending = true)
-    assert(m(0) == 0x41, "unimplemented frame version byte")
-    assert(m(1) == 0x28, f"unimplemented frame length indicator must be $28 (40 extra bytes = 44 total); got 0x${m(1)}%02X")
-    // CMDREG1B at offset $08 -- the ONE field offset the design spec independently
-    // anchors (via its ROM FPSP disassembly analysis). Sentinel poked in as 0xBEEF.
-    assert(((m(8) << 8) | m(9)) == 0xBEEF,
-      f"CMDREG1B at offset $08; got 0x${(m(8) << 8) | m(9)}%04X")
-    // The remaining field offsets are Step 2's pin-down; assert them here ONLY after the
-    // MC68040 UM Figure 9-7 check is recorded. Until then this test intentionally asserts
-    // just the header + the anchored field, rather than baking in a guess as a gate.
-  }
-
-  test("FSAVE consumes the pending unimplemented state (a second FSAVE emits IDLE)", VerilatorTest) {
-    val m = runFsave(".short 0xF327 ; ", everExecuted = true, unimpPending = true)
-    // The SECOND FSAVE's frame (the one at the lower address) must be idle, not another
-    // unimplemented frame -- emitting the frame is what hands the state to FPSP.
-    assert(m(0) == 0x41 && m(1) == 0x00,
-      "the second FSAVE must emit an IDLE frame -- the first one consumed the pending state")
-  }
-}
-```
-
-- [ ] **Step 11: Directed test — FRESTORE size-aware pop and the null-frame reset**
-
-```scala
-  test("FRESTORE (A7)+ pops 4 + the in-memory length byte, for every frame flavour", VerilatorTest) {
-    // Exactly fsave_frestore_basic.s's sub-test 6 matrix, which is architecturally correct
-    // (unlike that test's 0x41300000 sub-tests) and therefore worth pinning independently:
-    //   0x00000000 (null)          -> pop 4
-    //   0x41000000 (FPSP pseudo-null, version $41 size $00) -> pop 4
-    //   0x40280000 (unimplemented) -> pop 44
-    //   0x40600000 (busy)          -> pop 100
-    for ((header, expectPop) <- Seq(0x00000000L -> 4, 0x41000000L -> 4,
-                                    0x40280000L -> 44, 0x40600000L -> 100)) {
-      val a0After = runFrestorePostinc(header)
-      assert(a0After == 0x00021000L + expectPop,
-        f"FRESTORE (A0)+ on header 0x$header%08X must advance A0 by $expectPop; got +${a0After - 0x00021000L}")
-    }
-  }
-
-  test("FRESTORE of a NULL frame resets the FPU (a following FSAVE emits NULL again)", VerilatorTest) {
-    // "FRESTORE of a null state frame ... all FPU operations are aborted, and the FPU
-    // enters the reset state" -- per the design spec, the ONLY FRESTORE behavior real
-    // hardware unconditionally requires, and the only one implemented. Prove it via the
-    // observable consequence: everExecuted is cleared, so the next FSAVE emits NULL.
-    val (fpcrAfter, frameByte0) = runNullRestoreThenFsave()
-    assert(fpcrAfter == 0, "a null-frame FRESTORE must clear FPCR (FPU reset state)")
-    assert(frameByte0 == 0x00,
-      "after a null-frame FRESTORE the FPU is 'never used' again -> the next FSAVE emits NULL")
-  }
-```
-
-- [ ] **Step 12: Directed test — privilege**
-
-```scala
-  test("FSAVE in USER mode raises a vector-8 privilege violation", VerilatorTest) {
-    val (saw, vec) = runFsavePriv(userMode = true)
-    assert(saw, "user-mode FSAVE must raise a precise exception")
-    assert(vec == 8, s"privilege violation must be vector 8, got $vec")
-  }
-  test("FSAVE in SUPERVISOR mode raises NO exception", VerilatorTest) {
-    val (saw, _) = runFsavePriv(userMode = false)
-    assert(!saw, "supervisor FSAVE must not trap")
-  }
-```
-
-(`runFsavePriv` is `runCpushPriv` with `"fsave -(%sp) ; handler: bra.s handler"` as its source — copy that method verbatim and change the one string. Unlike Task 9's FMOVE-to-FPcr, **no** `sysPrivFault` exclusion is added for these two, so the existing default path is what is being tested.)
-
-- [ ] **Step 13: Run the tests**
+- [ ] **Step 14: Run the tests**
 
 ```bash
 sbt "testOnly m68k040.exception.FsaveFrestoreSpec"
 sbt "testOnly m68k040.decode.MicroOpAssemblerSpec m68k040.decode.OperationDecoderSpec"
-```
-Expected: all PASS.
-
-```bash
 sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
+sbt fastTest
 ```
-Expected: unchanged from whatever count Task 9b (FMOVEM control-list) landed at. Nothing
-here touches a lock-steppable path. (Not a hardcoded number: with Task 10 reduced to a
-decode-only scope it no longer adds any lock-step tests, and Task 9b's own landed count is
-itself data-dependent on how many lock-step-eligible tests its Step 9 actually adds — see
-that task's own honest flag. Confirm the actual current count before writing it into this
-task's commit message; do not copy a number from this text.)
+Confirm the real current lock-step baseline directly before this task (do not trust any number
+cited in this document or its predecessors). Expected: unchanged (FSAVE/FRESTORE are whitebox-
+only, Musashi has the wrong frame shape entirely per this project's Divergence catalog, so
+nothing here is lock-step-eligible).
 
-Then re-run the FSAVE family of the acceptance corpus and record the outcome against the classification made at the top of this task:
-
+Then re-run the FSAVE family of the acceptance corpus and record the outcome against the
+classification above:
 ```bash
 sbt "testOnly m68k040.fuzz.PortedM68kOooSpec -- -z fsave -z frestore"
 ```
-Expected, and to be recorded verbatim in the commit message:
-`fpu_fsave_idle_format_byte` **PASS** (new); `fpu_fsave_null_frame` **FAIL** (asserts a 52-byte frame that does not exist in the MC68040 UM); `fsave_frestore_basic` **FAIL** (same 52-byte expectation; its pop-size matrix sub-test is nonetheless satisfied by this implementation); `fpu_fsave_frestore_idle_roundtrip` **FAIL** (asserts FRESTORE restores FPCR/FPSR, which real FSAVE never saves). **If any of these three "expected FAIL" tests instead passes, stop** — it means the implementation drifted toward m68k-ooo's non-conformant behavior rather than the manual's.
 
-- [ ] **Step 14: Commit**
+- [ ] **Step 15: Commit**
 
-```bash
-git add src/main/scala/m68k040/decode/DecodedUop.scala \
-        src/main/scala/m68k040/decode/OperationDecoder.scala \
-        src/main/scala/m68k040/decode/MicroOpAssembler.scala \
-        src/main/scala/m68k040/execute/FpuControlPlugin.scala \
-        src/main/scala/m68k040/services/Services.scala \
-        src/main/scala/m68k040/exception/ExceptionUnit.scala \
-        src/main/scala/m68k040/rob/RobPlugin.scala \
-        src/main/scala/m68k040/top/FullCoreSynth.scala \
-        src/test/scala/m68k040/exception/FsaveFrestoreSpec.scala \
-        src/test/scala/m68k040/decode/MicroOpAssemblerSpec.scala \
-        src/test/scala/m68k040/decode/OperationDecoderSpec.scala
-git commit -m "feat(fpu): FSAVE/FRESTORE null, idle and unimplemented-instruction frames
+Reference this design's spec addendum in the commit message, along with the real Step 1
+toolchain output, the real Step 2 manual page/figure citation, and the real Step 14 test
+results (including the acceptance-corpus pass/fail split, matched against the predicted
+classification — STOP if any "expected FAIL" test instead passes).
 
-The core route-to-FPSP mechanism. FSAVE emits one of three real MC68040
-state frames selected from LIVE FPU state -- null (4 bytes, version
-forced to \$00) when no FP op has executed since reset or the last
-null-frame restore; idle (4 bytes, version + \$00 length indicator) when
-one has and nothing is pending; unimplemented-instruction (44 bytes /
-22 words, version + \$28) when a recognized-but-unsupported FP op is
-awaiting software completion. FRESTORE reads the header word, pops
-4 + the in-memory length byte for every frame flavour (including the
-100-byte busy frame and the FPSP's manufactured version-\$41/size-\$00
-pseudo-null, neither of which we ever emit), and resets the FPU on a
-null frame -- the one FRESTORE behavior real hardware unconditionally
-requires. Non-null frame BODIES are deliberately not applied: real
-68040 FSAVE saves no control registers at all, which is precisely why
-the ROM FPSP prologue separately does FMOVEM.L FPIAR/FPSR/FPCR,-(A7).
+This task does not need its own dedicated synth gate beyond what's already standard — but given
+it touches `LsEuPlugin.scala` (a genuinely shared, FMax-sensitive file) and adds new
+`ExceptionUnit` FSM states, a sanity elaboration/`GenVerilog` check before committing is
+warranted even without a full OOC gate; use judgment, and if you have reason to suspect a real
+structural risk (not just "it's FPU work, always gate"), run a real gate and report honestly,
+mirroring how Task 9b's own brief scoped its gate requirement to a specific, named risk rather
+than a blanket rule.
 
-Implemented as COMMIT-TIME SYSTEM ops (two new SysKind values), NOT via
-the microcode ROM. The MOVE16 precedent was evaluated directly and
-rejected on a real constraint: Microcode.Desc rows are static, and
-MOVE16 works there only because it is always exactly four transfers,
-whereas FSAVE's length is runtime-selected. ExceptionUnit's own frame
-machinery already IS 'emit N words where N is runtime-selected, then
-read a frame back and dispatch on its format byte' -- E_STORE/E_STWAIT
-driven by stStep/lastStep (which already mux 4/6/30-word frames) and
-R_FMTREQ/R_FMTWAIT, which is literally FRESTORE's semantics. The new
-states reuse driveStoreNoXlate and the registered load path verbatim,
-including the task-#163 cross-cache-line word split (fsave -(An) with
-an odd An is legal, and that split's absence silently drops a byte).
-
-Encodings (0xF300|<ea> FSAVE, 0xF340|<ea> FRESTORE) were confirmed via
-m68k-linux-gnu-as -m68040 and independently corroborated by the vendored
-corpus's own raw literals (0xF327 / 0xF35F, commented as FSAVE -(A7) /
-FRESTORE (A7)+). Both are PRIVILEGED, unlike Task 9's FMOVE-to-FPcr, so
-they take RobPlugin's default sysPrivFault path with no exclusion --
-tested in both directions.
-
-Version byte finalized as \$41, as the design spec directs
-('\$40 is a reasonable default ... finalized at implementation time').
-\$41 makes fpu_fsave_idle_format_byte pass and keeps the Q700 FPSP's
-'if ((frame[0] & 0xf) == 0) skip_restore' optimization meaningful --
-\$40 would make every idle frame look null to it -- while the null
-frame's forced \$00 keeps that same optimization correct in the other
-direction.
-
-ACCEPTANCE-CORPUS CLASSIFICATION, recorded so it is not rediscovered:
-three of the four vendored FSAVE tests encode m68k-ooo's own
-non-conformant frame shapes and stay FAILING BY DESIGN.
-fpu_fsave_null_frame and fsave_frestore_basic both assert a 52-byte
-header-0x41300000 frame; the MC68040 UM has no 52-byte frame at all and
-the approved design spec says so explicitly while correcting that exact
-recollection. fpu_fsave_frestore_idle_roundtrip asserts FRESTORE
-restores FPCR/FPSR, which real FSAVE never saves. Do not chase these.
-fpu_fsave_idle_format_byte flips to PASS.
-
-The unimplemented-instruction frame's 44-byte size, its two header
-bytes, its field list and CMDREG1B's offset \$08 are spec-verified; the
-REMAINING field offsets (STAG/DTAG/E1/ETS-ETE-ETM/FPTS-FPTE-FPTM) were
-pinned against MC68040 UM Figure 9-7 during implementation -- figure and
-page recorded in ExceptionUnit's fsFrameWordData comment.
-
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
-```
-
----
-
-**Notes on what I could not pin down, surfaced rather than assumed** (each is an explicit step above, not a silent guess):
-1. The task prompt's stated FSAVE/FRESTORE opword `1111 001 000 EA` (`0xF200`) is the FPU *general* opclass, not FSAVE — the real encodings are `0xF300`/`0xF340`, confirmed from the vendored corpus's own `0xF327`/`0xF35F` literals plus a toolchain re-check (Task 11 Step 1).
-2. The 44-byte frame's per-field byte offsets are **not** in the spec (only the size, header bytes, field list, and CMDREG1B's `$08` anchor) — Task 11 Step 2 is a blocking manual read.
-3. The FPSR EXC→AEXC accrual fold is not covered by any of the encoding sources — Task 9 Step 12 is a blocking manual read.
-4. Task 9's immediate-source form depends on `casForm` actually being ROB-visible; if it is not, the step says to drop that form from scope rather than invent a new side-channel.
-5. The vendored FSAVE corpus contradicts the approved spec (and itself); the expected pass/fail split is written into Task 11 Step 13 as a gate in *both* directions.
 ### Task 12: Musashi oracle FP register accessors
 
 **Files:**
