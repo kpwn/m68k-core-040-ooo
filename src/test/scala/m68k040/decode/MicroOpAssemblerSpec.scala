@@ -420,6 +420,13 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
       assert(dut.uop.dstValid.toBoolean && dut.uop.dstReg.toInt == 0, "Rn=D0 is the renamed dst")
       assert(!dut.uop.srcBValid.toBoolean && !dut.uop.srcAValid.toBoolean)
       assert(dut.uop.imm.toLong == 0x2, "FPSR mask = 010")
+      // Same FP-rename-exclusivity check as the WRITE-direction case above, and it matters
+      // MORE here: this is the direction that actually takes a rename destination, so it is
+      // the one that reaches RobPlugin's sysOp-read commit block and its force-clear of
+      // fpWrite/fpccWrite (RobPlugin.scala:1297-1298). If decode ever started claiming an
+      // FP/FPCC destination for this form, that force-clear would silently leak a physical
+      // register instead of faulting loudly.
+      assert(!dut.uop.writesFp.toBoolean && !dut.uop.writesFpcc.toBoolean && !dut.uop.readsFpcc.toBoolean)
     }
   }
   test("FMOVE.L A0,FPIAR (F208 8400): <ea> mode 001 maps An -> arch id 8..15", VerilatorTest) {
@@ -449,6 +456,14 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
       //     the 32-bit immediate cannot BOTH ride `imm`, and `casForm` -- the brief's
       //     proposed second side-channel -- was checked and is NOT ROB-visible (decode ->
       //     RenamedUop -> AluEuPlugin only, never RobPayload). Returns with Task 9b.
+      //     CAVEAT for a future reader: the `len = 4` packet below is what a CORRECTLY
+      //     framed #imm form would look like, but it is NOT what the real frontend
+      //     produces today. PredecodeWord's fpIsGen/eaExt arm frames 0xF23C as ONE word,
+      //     because the opclass-010 immediate arm does not match FMOVE_FPCTRL's opclass
+      //     100/101, so in the real pipeline this traps vector 11 with nextPc = pc + 2,
+      //     not pc + 8. That mis-framing is PRE-EXISTING and untouched by Task 9 (the form
+      //     F-line trapped before it too); it is called out here only so nobody assumes
+      //     the deferred path is already length-correct. Task 9b owns fixing it.
       drive(dut, 0xF23C, w1 = 0x8800, w2 = 0x0000, len = 4); sleep(1)
       assert(!dut.uop.sysOp.toBoolean, "the #imm form is explicitly out of Task 9's scope")
       assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 11)

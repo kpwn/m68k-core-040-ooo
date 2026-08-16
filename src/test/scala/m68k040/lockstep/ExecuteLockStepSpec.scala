@@ -3878,6 +3878,122 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     assert(d4Seen == 0xABL, f"FMOVE.L FPIAR,D3 read-back (via D4) should be 0xAB; got 0x$d4Seen%08X")
   }
 
+  // ── Task 9 (review fix): the FPSR / committed-FPCC path, end to end ───────────────
+  // The test above deliberately never writes FPSR (it asserts fpsr == 0), so before this
+  // one NOTHING in the repo drove `ExceptionUnit.fpccWriteValid`, exercised the `fpccWr`
+  // port into the FPCC PRF, or read `fpsrArch`. That is the one genuinely new mechanism
+  // Task 9 built, and it is the same mechanism class (a DIRECT committed-mapping write
+  // bypassing rename) that already produced a confirmed silent-corruption regression here
+  // once -- see `ExceptionUnit.rteNzvcWriteValid`'s doc comment. So it gets a live test.
+  //
+  // THREE independent properties, each with its own assertion:
+  //
+  //  (1) MASKED COPY. FpuControlPlugin must store the architectural value with [27:24]
+  //      structurally forced to 0, so no stale second condition-code source can exist.
+  //      FpuControlPluginSpec proves the plugin masks; this proves the mask is actually
+  //      reached through the real decode -> rename -> IQ -> ROB -> S_APPLY path.
+  //
+  //  (2) ARCH -> INTERNAL REVERSAL, OBSERVED DIRECTLY. The FPCC PRF's internal layout is
+  //      [3:0] = {NaN, I, Z, N} (RegfileSpec.Fpcc) while architectural FPSR[27:24] is
+  //      {N, Z, I, NaN} -- the reversed presentation. `exc.fpccWriteData` is snooped on
+  //      the cycle `exc.fpccWriteValid` fires and compared against the REVERSED nibble.
+  //      This assertion is what makes the round-trip below non-vacuous: fpccToArch and
+  //      fpccFromArch are the SAME involution, so a bug that degraded BOTH of them to the
+  //      identity would round-trip perfectly and pass (3) alone. Checking the value
+  //      actually handed to the PRF pins the orientation down on its own.
+  //
+  //  (3) ROUND TRIP. Reading FPSR back must splice the live committed FPCC out of the PRF
+  //      and reverse it into arch order, reconstituting the ORIGINAL nibble.
+  //
+  // TEST VECTOR: FPSR = 0x0800A5C3, i.e. FPCC nibble = 0b1000 ({N=1, Z=0, I=0, NaN=0}),
+  // whose internal-layout image is 0b0001. 0b1000 was chosen deliberately as a genuine
+  // discriminator: it is NOT reversal-invariant (unlike 0b0000/0b1111/0b0110/0b1001, any
+  // of which would pass even with the reversal deleted), and its reversal 0b0001 also
+  // differs from its nibble-half-swap 0b0010, so a half-swap bug cannot alias into a
+  // pass either. The surrounding bytes (quotient 0x00, EXC 0xA5, AEXC 0xC3) are non-zero
+  // so that assertion (1) discriminates a real masked store from a register still sitting
+  // at its reset value.
+  //
+  // Whitebox for the SAME reason as the test above: Musashi exposes no FP register
+  // surface (spec Decision 3), so there is no lock-step oracle for any of this.
+  test("FMOVE.L D0,FPSR / FPSR,Dn round-trips the committed FPCC nibble through the FPCC PRF", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val ArchFpsr = 0x0800A5C3L   // FPCC nibble [27:24] = 0b1000
+    val Masked   = 0x0000A5C3L   // what FpuControlPlugin must store (mask 0xF0FFFFFF)
+    val Internal = 0x1           // 0b1000 reversed into {NaN,I,Z,N}
+    val src =
+      "move.l #0x0800A5C3,%d0 ; " +
+      ".short 0xF200,0x8800 ; " +   // fmove.l %d0,%fpsr
+      ".short 0xF206,0xA800 ; " +   // fmove.l %fpsr,%d6
+      "move.l %d6,%d7 ; " +         // expose the FPSR read-back in a normal EU writeback
+      "done: bra.s done"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i
+      case Left(e)  => fail(s"assemble failed: ${e.reason}")
+    }
+    var fpsrSeen      = BigInt(-1)
+    var d7Seen        = -1L
+    var fpccWrSeen    = -1
+    var fpccWrCount   = 0
+    var sawExc        = false
+    var excVec        = -1
+    compiledDut.doSim(freshSimName("fmove-fpsr-fpcc")) { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)          // past the reset/init sweep, as above
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.usp #= 0x00200000L
+      dut.rob.logic.exc.ss.srSys #= 0x00           // USER mode
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15
+      dut.wire.logic.seedData #= BigInt(0x00200000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      def snoop(w: m68k040.execute.WbObs): Unit =
+        if (w.valid.toBoolean && w.intWrite.toBoolean && w.dstArch.toInt == 7)
+          d7Seen = w.result.toLong & 0xffffffffL
+      var guard = 0
+      while (guard < 900) {
+        if (dut.rob.logic.exceptionPending.toBoolean && !sawExc) {
+          sawExc = true; excVec = dut.rob.logic.exceptionVector.toInt
+        }
+        // The DIRECT committed-mapping FPCC write, caught on the cycle it fires.
+        if (dut.rob.logic.exc.fpccWriteValid.toBoolean) {
+          fpccWrSeen = dut.rob.logic.exc.fpccWriteData.toInt; fpccWrCount += 1
+        }
+        snoop(dut.eu0.logic.wbObs); snoop(dut.eu1.logic.wbObs)
+        cd.waitSampling(); guard += 1
+      }
+      fpsrSeen = dut.fpuCtl.logic.fpsr.toBigInt
+    }
+    assert(!sawExc,
+      s"FMOVE to/from FPSR is a USER instruction -- it must not trap; got vector $excVec")
+    // (2) the direct committed-mapping FPCC write actually happened, with the nibble
+    //     reversed into the PRF's internal {NaN,I,Z,N} layout.
+    assert(fpccWrCount > 0,
+      "FMOVE.L D0,FPSR must drive ExceptionUnit.fpccWriteValid (the direct committed-FPCC write)")
+    assert(fpccWrSeen == Internal,
+      f"FPCC PRF write data must be the arch nibble 0b1000 REVERSED into {NaN,I,Z,N} = 0x$Internal%X; " +
+      f"got 0x$fpccWrSeen%X (0x8 would mean the arch->internal reversal was skipped)")
+    // (1) masked copy
+    assert(fpsrSeen == Masked,
+      f"FpuControlPlugin must store FPSR with [27:24] masked off: expected 0x$Masked%08X, got 0x${fpsrSeen.toString(16)}")
+    // (3) round trip: masked bytes plus the reconstituted arch FPCC nibble
+    assert(d7Seen == ArchFpsr,
+      f"FMOVE.L FPSR,D6 read-back (via D7) must reconstitute the FPCC nibble: expected 0x$ArchFpsr%08X, got 0x$d7Seen%08X")
+  }
+
   test("CPUSHA in USER mode raises a vector-8 privilege violation", VerilatorTest) {
     val (saw, vec) = runCpushPriv(userMode = true)
     assert(saw, "user-mode CPUSHA must raise a precise exception")
