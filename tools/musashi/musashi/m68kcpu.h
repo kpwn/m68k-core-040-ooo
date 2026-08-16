@@ -1031,6 +1031,10 @@ extern uint           m68ki_aerr_address;
 extern uint           m68ki_aerr_write_mode;
 extern uint           m68ki_aerr_fc;
 extern int            m68ki_bus_error_step_break;
+/* Project patch: when set, m68k_execute() runs at most ONE instruction regardless of
+ * its cycle cost. Set/cleared by MusashiRef::step_one(). See m68kcpu.c for the full
+ * rationale (zero-cycle FINT/FINTRZ collapsing two instructions into one trace step). */
+extern int            m68ki_one_instr_per_execute;
 /* Set by the opcode-prefetch path to mark an INSTRUCTION fetch for the grafted
  * oracle MMU (program space). Defined in m68k_ref.cpp. */
 extern volatile unsigned int g_mmu_instr_fetch;

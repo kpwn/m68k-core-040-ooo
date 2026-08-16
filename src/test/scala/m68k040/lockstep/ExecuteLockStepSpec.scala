@@ -171,6 +171,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // uop would otherwise never complete and would wedge the ROB head.
       rob.logic.completion(5).valid   := divEu.fpCompletion.valid
       rob.logic.completion(5).payload := divEu.fpCompletion.payload
+      // Sim-only tap, deliberately HERE (test side) and not in DivEuPlugin: an FP uop
+      // completes ONLY on this port -- never on divEu.completion, and it drives no
+      // `wbObs` pulse at all (it writes the FP and FPCC files, no int/NZVC/X register) --
+      // so runLockStep's per-cycle sampler has to read it directly to synthesize a
+      // placeholder Wb record, exactly as it already does for lsEu.sqCompletionPort.
+      // Marking it simPublic in DivEuPlugin.scala itself would have worked too, but it
+      // perturbs the SYNTH netlist (the port stops being inlined into
+      // rob.logic.completion(5), and the added source lines renumber every
+      // `when_DivEuPlugin_lNNN` signal below them) -- and this task is test-only.
+      divEu.fpCompletion.simPublic()
       iq.cplxFpWakeup.valid     := divEu.fpWakeup.valid
       iq.cplxFpWakeup.payload   := divEu.fpWakeup.payload
       iq.cplxFpccWakeup.valid   := divEu.fpccWakeup.valid
@@ -570,7 +580,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   def runLockStep(name: String, src: String, nInstr: Int = -1, checkMem: Seq[Long] = Seq.empty,
                   checkSpan: Int = 4, mmuMap: Option[(Long, Long)] = None,
                   initialSr: Option[Int] = None, usp: Long = 0x00200000L,
-                  initialMsp: Option[Long] = None, pcOnly: Boolean = false): Unit = {
+                  initialMsp: Option[Long] = None, pcOnly: Boolean = false,
+                  // Post-run whitebox hook, default no-op => every existing call site is
+                  // unchanged. Used by FpuLockStepSpec to assert 80-bit FP registers,
+                  // which cannot go through LockStep.compare (Long-based end to end).
+                  // Runs as the LAST statement of the doSim body, i.e. only after the
+                  // integer/PC/SR lock-step comparison above has already passed.
+                  afterRun: (FullCoreDut, Vector[OracleStep]) => Unit = (_, _) => ()): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
 
     // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel. `initialSr` (when set)
@@ -672,6 +688,21 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           if (sc.valid.toBoolean) {
             wbCount += 1
             handle.onWb(sc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+          }
+        }
+        // FP-lane completion (Task 8's parallel FP writeback lane in the CPLX cluster):
+        // an FP uop completes on divEu.fpCompletion / rob.logic.completion(5), NEVER on
+        // divEu.completion, and drives no `wbObs` pulse at all -- it writes the FP PRF
+        // and the FPCC PRF, no integer/NZVC/X register. Synthesize a no-op Wb, exactly
+        // like the branch-EU and precise-store cases above, or onCommit for this robId
+        // throws "commit robId=N with no writeback observed". The FP VALUE itself is
+        // compared separately, out of band, by runLockStep's `afterRun` hook (see
+        // FpuLockStepSpec) -- WhiteboxCapture.Wb is Long-based and cannot carry 80 bits.
+        {
+          val fc = dut.divEu.fpCompletion
+          if (fc.valid.toBoolean) {
+            wbCount += 1
+            handle.onWb(fc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
           }
         }
         for (k <- 0 until 2) {
@@ -924,6 +955,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         }
       }
       }
+
+      // Post-run whitebox hook (default no-op, so every existing call site is
+      // behaviourally unchanged). Deliberately the LAST statement of the doSim body:
+      // a caller-supplied assertion can never mask a plain lock-step divergence or a
+      // memory mismatch, both of which have already been asserted above.
+      afterRun(dut, oracle)
     }
   }
 

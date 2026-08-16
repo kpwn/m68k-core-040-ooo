@@ -112,6 +112,39 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
       }
     }
 
+    // ── SIM-ONLY whitebox shadow of `ram` ────────────────────────────────────
+    // `ram` is NOT readable from a simulation: every full-core build routes through
+    // M68kSpinalConfig, which installs m68k040.hw.MultiPortWritesSymplifier, and that
+    // rewrites a multi-write Mem out of the netlist entirely into XOR/LVT banks -- so
+    // there is no `ram` handle left for `getBigInt` to reach. RobPlugin.scala hit the
+    // identical wall for its `payload` Mem and solved it the same way.
+    //
+    // This mirrors the ram.write loop above STATEMENT FOR STATEMENT (same enables, same
+    // address/data muxes, same last-writer-wins ordering), so the shadow and the real
+    // Mem cannot drift: any future change to the write structure that is not mirrored
+    // here shows up as a lock-step FP divergence, not as a silently stale shadow.
+    //
+    // Elaborated ONLY when the `simulation` generation flag is set (M68kSim sets it);
+    // `shadow` is null in every synth / GenVerilog build => zero synthesis cost. Any
+    // unguarded reference from RTL would therefore be an immediate NPE at elaboration,
+    // not a silent area cost -- which is exactly what the GenFullCoreSynthVerilog gate
+    // checks for.
+    val shadow = GenerationFlags.simulation {
+      val v = Vec.fill(spec.depth)(Reg(Bits(spec.dataWidth bits)) init 0)
+      for ((w, i) <- phys.zipWithIndex) {
+        if (i == 0) {
+          when(!initDone || w.valid) {
+            v(Mux(initDone, w.address, initCounter.resize(spec.addressWidth))) :=
+              Mux(initDone, w.data, B(0, spec.dataWidth bits))
+          }
+        } else {
+          when(w.valid && initDone) { v(w.address) := w.data }
+        }
+      }
+      spinal.core.sim.SimPublic(v)
+      v
+    }
+
     for ((r, noByp) <- reads) {
       val rfData = ram.readAsync(r.addr)
       if (noByp || bypasses.isEmpty) {

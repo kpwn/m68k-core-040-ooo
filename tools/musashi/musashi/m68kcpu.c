@@ -102,6 +102,29 @@ jmp_buf m68ki_bus_error_jmp_buf;
  * never fault are byte-for-byte unchanged. */
 int m68ki_bus_error_step_break = 0;
 
+/* PROJECT PATCH (m68k-core-040-ooo), same family as m68ki_bus_error_step_break above.
+ *
+ * When set, m68k_execute() runs AT MOST ONE instruction, regardless of how many clock
+ * cycles that instruction charges. MusashiRef::step_one() sets it for the duration of
+ * its own m68k_execute(1) call and clears it afterwards, so the non-trace bulk-run path
+ * (assembleAndRun) is byte-for-byte unchanged.
+ *
+ * WHY: m68k_execute()'s loop condition is `GET_CYCLES() > 0`, so an instruction that
+ * charges ZERO cycles does not end the timeslice and the loop silently executes the NEXT
+ * instruction too -- collapsing two architectural instructions into one trace step and
+ * making the lock-step PC sequence skip an instruction boundary. That is not
+ * hypothetical: in the vendored m68kfpu.c's fpgen_rm_reg switch, `case 0x01` (Fsint =
+ * FINT) and `case 0x03` (FsintRZ = FINTRZ) are the ONLY two handlers that omit
+ * USE_CYCLES -- every one of their ~20 siblings has it -- and CYC_INSTRUCTION[] charges
+ * nothing for the cpGEN F-line opwords, so `fint.x` + `fintrz.x` traced as a single
+ * step (found by FpuLockStepSpec's FINT-vs-FINTRZ test, 2026-08-16).
+ *
+ * Fixed here rather than by inventing a USE_CYCLES value for those two handlers: the
+ * step-granularity guarantee is what every trace caller already assumes, this makes it
+ * true for ANY zero-cycle handler (present or future, including after a re-vendor), and
+ * it does not require guessing at 68040 FINT timing. */
+int m68ki_one_instr_per_execute = 0;
+
 /* Used by shift & rotate instructions */
 const uint8 m68ki_shift_8_table[65] =
 {
@@ -990,9 +1013,14 @@ int m68k_execute(int num_cycles)
 		m68ki_check_bus_error_trap();
 
 		/* Main loop.  Keep going until we run out of clock cycles */
+		int m68ki_instrs_run = 0;
 		do
 		{
 			int i;
+			/* Single-step mode (see m68ki_one_instr_per_execute): stop after exactly
+			 * one instruction even if it charged zero cycles. Checked BEFORE the
+			 * instruction is read, so the second instruction is never executed. */
+			if (m68ki_one_instr_per_execute && m68ki_instrs_run >= 1) break;
 			/* A 68040 access fault (bus error) just delivered via longjmp -> end
 			 * this execute call now, with PC = the handler entry, so the fault is a
 			 * DISCRETE trace step (do NOT run the handler's first instruction in the
@@ -1019,6 +1047,7 @@ int m68k_execute(int num_cycles)
 			REG_IR = m68ki_read_imm_16();
 			m68ki_instruction_jump_table[REG_IR]();
 			USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
+			m68ki_instrs_run++;
 
 			/* Trace m68k_exception, if necessary */
 			m68ki_exception_if_trace(); /* auto-disable (see m68kcpu.h) */

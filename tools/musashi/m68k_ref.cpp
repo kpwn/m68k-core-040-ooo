@@ -372,8 +372,23 @@ int MusashiRef::run_until_sentinel_or_pc_with_irq_events(uint32_t sentinel_addr,
     return executed;
 }
 
+/* Musashi's own `m68ki_one_instr_per_execute` (project patch, m68kcpu.c). Declared here
+ * rather than by including m68kcpu.h: that header's REG_* macros collide hard with
+ * MusashiRef::Reg's enumerators (see m68k_ref_fp.cpp's header comment for the same
+ * problem and the same reason it lives in its own translation unit). */
+extern "C" int m68ki_one_instr_per_execute;
+
 int MusashiRef::step_one() {
-    return m68k_execute(1);
+    // ONE architectural instruction, not "one cycle's worth". Without the flag,
+    // m68k_execute()'s `while (GET_CYCLES() > 0)` silently runs a SECOND instruction
+    // after any handler that charges zero cycles -- which the vendored m68kfpu.c's FINT
+    // (`case 0x01`) and FINTRZ (`case 0x03`) both do, they are the only two of ~20
+    // fpgen handlers missing USE_CYCLES. That collapsed `fint.x ; fintrz.x` into a
+    // single trace step and showed up as a phantom PC divergence in FpuLockStepSpec.
+    m68ki_one_instr_per_execute = 1;
+    int cycles = m68k_execute(1);
+    m68ki_one_instr_per_execute = 0;
+    return cycles;
 }
 
 void MusashiRef::begin_trace(uint32_t sentinel_addr) {
