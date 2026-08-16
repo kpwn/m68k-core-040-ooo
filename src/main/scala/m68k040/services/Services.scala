@@ -232,15 +232,48 @@ trait FpuControlService {
     * Figure 9-5 layout of FPSR[15:8]. ORs into FPSR[15:8] and folds the derived AEXC
     * bits into FPSR[7:0] per the UM's Section 9.2.3.4 equations.
     *
-    * NOTE (Task 9): no producer is wired yet — Task 8's `DivEuPlugin` FP lane predates
-    * this service and does not yet drive it. The port exists (and is unit-tested) so
-    * that wiring lands as a pure addition; until then FPSR's EXC/AEXC bytes only ever
-    * change via an architectural FMOVE-to-FPSR. */
+    * PRODUCER (Task 14c): `DivEuPlugin.fpExcAccrualPort`, wired by
+    * `DivEuPlugin.wireFpControl`. It fires from the FP lane's COMPLETION register, i.e.
+    * at execute time, not at retirement — so an FP op that completes on a wrong path
+    * before an older branch resolves still accrues, and the sticky AEXC bits it sets are
+    * never undone. That is a known, reported limitation, not an oversight; the
+    * architecturally correct fix is a retire-time fold (carry the EXC byte per-robId in
+    * the ROB exactly as `faultVecStore` carries the fault vector, and OR it in from the
+    * commit-port hook that already drives `setEverExecuted`), which is a real ROB
+    * retire-path change and belongs in its own gated slice. */
   def orFpsrExc: Flow[Bits]
 
   /** FPCR field accessors, for the FP EU. Rounding mode is FPCR[5:4]
     * (00=RN, 01=RZ, 10=RM, 11=RP); precision FPCR[7:6]; exception-enable byte FPCR[15:8],
-    * laid out identically to the EXC field above. */
+    * laid out identically to the EXC field above.
+    *
+    * `roundingMode` and `excEnable` are consumed by `DivEuPlugin.wireFpControl` (Task 14c).
+    *
+    * `precision` HAS NO CONSUMER, AND THAT IS A KNOWN GAP, NOT A DESIGN CHOICE. Task 14c
+    * checked the real M68040 User's Manual specifically to find out whether the 68040
+    * implements FPCR's precision-control field, on the theory that a uniformly
+    * extended-precision datapath (design Decision 1) might make it legacy/non-functional.
+    * IT DOES NOT: the manual is explicit and repeated that PREC is functional silicon.
+    *   - 9.2.2.2 (p.9-3): "Single-precision results are rounded to a 24-bit boundary;
+    *     double-precision results are rounded to a 53-bit boundary; and extended-precision
+    *     results are rounded to a 64-bit boundary." Table 9-1 gives PREC a real encoding
+    *     (00 Extend / 01 Single / 10 Double / 11 Undefined).
+    *   - 9.4.1 (p.9-12): the FPU keeps a 67-bit intermediate mantissa and rounds it "to 64
+    *     bits (or less, depending on the selected rounding precision)"; "All mantissa bits
+    *     beyond the selected precision are zero." Memory destinations ignore PREC.
+    *   - 9.4.2 (p.9-13) / 9.7.4 (p.9-31): PREC also drives RANGE CONTROL — OVFL/UNFL are
+    *     detected against the SELECTED precision's exponent range, not the extended range.
+    *   - 10.7 (p.10-28): "Instructions with an S or D (e.g., FSADD) have the same effect as
+    *     setting the rounding precision to S or D", and FSADD/FDADD/FSMUL/FDMUL are absent
+    *     from Table 9-10's unimplemented list, i.e. they are hardware instructions.
+    * `FpuCore` has no `precision` input anywhere and `FpRoundPack` is a port of SoftFloat's
+    * precision80 path only, so this core always rounds and range-checks at extended
+    * precision regardless of PREC. Musashi ignores PREC too (`m68kfpu.c`'s `fmove_fpcr`
+    * sets only `float_rounding_mode`), so lock-step CANNOT catch this — it needs a directed
+    * test against the UM. Closing it is a real arithmetic-core change (thread a latched
+    * `precision` through `FpRoundReq` as `rmode` already is, then precision-dependent
+    * rounding boundaries and OVFL/UNFL limits in `FpRoundPack`), deliberately NOT attempted
+    * as part of Task 14c's wiring scope. */
   def roundingMode: Bits
   def precision:    Bits
   def excEnable:    Bits

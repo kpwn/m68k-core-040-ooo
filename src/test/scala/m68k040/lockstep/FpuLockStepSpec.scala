@@ -259,4 +259,55 @@ class FpuLockStepSpec extends AnyFunSuite {
           "fp-ftst-vs-fcmp FP0 must be UNMODIFIED by FTST/FCMP")
       })
   }
+
+  // ── FPCR rounding mode, end to end (Task 14c) ────────────────────────────
+  //
+  // Task 7's FpuCoreSpec already proves the ARITHMETIC honours `io.rmode`. What these
+  // tests prove is the thing that was genuinely broken until Task 14c: that a real
+  // architectural FPCR write reaches that input at all. Until this task, `fpRmodeIn` was
+  // default-driven RN and nothing anywhere assigned it, so every one of the four programs
+  // below produced the identical (RN) answer.
+  //
+  // WHY `move.l #imm,%d0 ; fmove.l %d0,%fpcr` AND NOT `fmove.l #imm,%fpcr`: the immediate
+  // <ea> form of FMOVE-to-control-register is deliberately NOT implemented (see
+  // MicroOpAssembler.scala's `fpCtrlEaReg`, which admits mode 000/001 only, and the
+  // recorded reasoning immediately above it -- `imm` cannot carry both a 32-bit value and
+  // the 3-bit register mask through the ROB's single `sysRc` side-channel). The
+  // register-direct form is the real, supported architectural write.
+  //
+  // WHY THIS IS LOCK-STEPPABLE: Musashi honours FPCR's rounding mode -- `fmove_fpcr`
+  // (m68kfpu.c:1651-1653) sets SoftFloat's `float_rounding_mode` from `(REG_FPCR >> 4) & 3`
+  // on every write to FPCR -- so the oracle's FP results are genuinely rounding-mode
+  // dependent too. (Musashi's FPSR EXC/AEXC bytes are NOT modelled at all -- Divergence
+  // Register D4 -- so these programs deliberately never read FPSR.)
+  //
+  // THE VECTOR: 1/3 is the canonical repeating quotient. Its exact 64-bit-significand
+  // expansion is 0xAAAA_AAAA_AAAA_AAAA with a round bit of 1 and an infinite sticky tail,
+  // i.e. ~0.67 ULP above the truncated value -- so RN rounds up, RZ truncates. Doing it
+  // for BOTH +1/3 and -1/3 separates all four modes: RM and RP each truncate for one sign
+  // and round away for the other, which no single-sign vector can distinguish.
+  private val OneThirdDn = "aaaaaaaaaaaaaaaa"   // truncated toward zero
+  private val OneThirdUp = "aaaaaaaaaaaaaaab"   // rounded away from zero
+
+  private def roundingTest(tag: String, fpcr: Int, posLow: String, negLow: String): Unit =
+    test(s"lock-step FP: FPCR rounding mode $tag reaches the FP EU (1/3 and -1/3)", VerilatorTest) {
+      val instrs = Seq(
+        f"move.l #0x$fpcr%02X,%%d0",
+        "fmove.l %d0,%fpcr",
+        "fmove.l #1,%fp0", "fmove.l #3,%fp1", "fdiv.x %fp1,%fp0",
+        "fmove.l #-1,%fp2", "fmove.l #3,%fp3", "fdiv.x %fp3,%fp2")
+      h.runLockStep(s"fp-round-$tag", prog(instrs), nInstr = instrs.size,
+        afterRun = { (dut, oracle) =>
+          expectFp(s"fp-round-$tag", 0, 2)(dut, oracle)
+          FpCompare.assertFpBits(dutFp(dut, 0), "3ffd" + posLow,
+            s"fp-round-$tag: +1/3 under $tag")
+          FpCompare.assertFpBits(dutFp(dut, 2), "bffd" + negLow,
+            s"fp-round-$tag: -1/3 under $tag")
+        })
+    }
+
+  roundingTest("RN", 0x00, OneThirdUp, OneThirdUp)
+  roundingTest("RZ", 0x10, OneThirdDn, OneThirdDn)
+  roundingTest("RM", 0x20, OneThirdDn, OneThirdUp)   // toward -inf
+  roundingTest("RP", 0x30, OneThirdUp, OneThirdDn)   // toward +inf
 }

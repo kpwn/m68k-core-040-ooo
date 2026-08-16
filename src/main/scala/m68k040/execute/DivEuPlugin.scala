@@ -124,6 +124,45 @@ object FpVector {
   val Snan   = 54
 }
 
+object DivEuPlugin {
+  /** Task 14c: connect the CPLX EU's FP lane to the live FP control state.
+    *
+    * Factored out because FOUR different top levels build the same DivEu + FpuControlPlugin
+    * pair (`top.BackendWiringPlugin`, `lockstep.ExecuteLockStepSpec`, `fuzz.FuzzDut`,
+    * `bench.IpcBenchSpec`) and a divergence between them would silently give the lock-step
+    * and fuzz DUTs different FP semantics from the synthesized core -- exactly the class of
+    * drift this task exists to close.
+    *
+    * Must be called from a context where `svc`'s own `logic` Area has already elaborated
+    * (i.e. the same seam that already carries `fpCtrlFpcrIn`), because every accessor below
+    * dereferences the plugin's committed `Reg`s.
+    *
+    * BIT ORDER (the one non-obvious part). `svc.excEnable` is `FPCR(15 downto 8)`, so
+    * within that 8-bit slice index i means FPCR[8+i]. The MC68040 UM's Figure 9-2 gives the
+    * ENABLE byte as 15 BSUN, 14 SNAN, 13 OPERR, 12 OVFL, 11 UNFL, 10 DZ, 9 INEX2, 8 INEX1
+    * -- so 6=SNAN, 5=OPERR, 4=OVFL, 3=UNFL, 2=DZ, 1=INEX2. `FpExcFlags` is a plain
+    * declaration-ordered SpinalHDL Bundle whose flattened layout carries no architectural
+    * meaning, so this is written out field by field rather than as a slice assignment.
+    * BSUN (bit 7) and INEX1 (bit 0) have no `FpExcFlags` counterpart on purpose: BSUN is a
+    * branch-side condition and INEX1 is packed-decimal-only, so neither can ever be raised
+    * by this lane and enabling them cannot change what it does. */
+  def wireFpControl(divEu: DivEuPlugin, svc: m68k040.services.FpuControlService): Unit = {
+    divEu.fpCtrlFpcrIn  := svc.fpcr
+    divEu.fpCtrlFpsrIn  := svc.fpsr
+    divEu.fpCtrlFpiarIn := svc.fpiar
+    divEu.fpRmodeIn     := svc.roundingMode
+    val en = svc.excEnable
+    divEu.fpExcEnableIn.snan  := en(6)
+    divEu.fpExcEnableIn.operr := en(5)
+    divEu.fpExcEnableIn.ovfl  := en(4)
+    divEu.fpExcEnableIn.unfl  := en(3)
+    divEu.fpExcEnableIn.dz    := en(2)
+    divEu.fpExcEnableIn.inex2 := en(1)
+    svc.orFpsrExc.valid   := divEu.fpExcAccrualPort.valid
+    svc.orFpsrExc.payload := divEu.fpExcAccrualPort.payload
+  }
+}
+
 /** CPLX execution unit: fixed-latency II=1 MUL, CHK/CMP2, and iterative DIV.
   *
   * The iterative/legacy lane remains single-outstanding, but MUL owns an independent
@@ -169,17 +208,28 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
   var fpCtrlFpiarIn: UInt = null
   /** FPCR[5:4] rounding mode (0=RN 1=RZ 2=RM 3=RP), sampled at ISSUE and carried with the
     * request inside FpuCore, so an FPCR write landing mid-flight cannot re-mux an
-    * already-issued result. Default-driven RN (allowOverride) — which is not a placeholder
-    * but the architecturally correct value today: FPCR resets to 0 and no decode path can
-    * write it until the FPCR/FPSR control task lands. THIS IS THAT TASK'S INTEGRATION
-    * POINT: drive it from FpuControlPlugin's live FPCR and nothing else here changes. */
+    * already-issued result. Default-driven RN (allowOverride) so a standalone EU DUT that
+    * instantiates no `FpuControlPlugin` still elaborates; in the real core (Task 14c) the
+    * wiring plugin drives it from `FpuControlService.roundingMode`, i.e. the live FPCR.
+    * The default is also the architecturally correct value for an unwired DUT: FPCR
+    * resets to 0. */
   var fpRmodeIn: Bits = null
-  /** FPCR[15:8] exception-ENABLE byte, in FpExcFlags field order. Same contract as
-    * `fpRmodeIn`: default all-clear (the FPCR reset value, and unwritable until the
-    * FPCR/FPSR task), overridden by FpuControlPlugin. Gates `fpFault` escalation ONLY —
-    * the ordinary substituted OVFL/UNFL result is produced inside FpuCore and must NOT
-    * trap, or every overflow re-introduces the per-op trap cost this design removes. */
+  /** Per-class exception-ENABLE bits, i.e. FPCR[15:8] re-mapped field by field into
+    * `FpExcFlags` (the re-map lives in `DivEuPlugin.wireFpControl`). Same contract as
+    * `fpRmodeIn`: default all-clear for a standalone DUT, driven from
+    * `FpuControlService.excEnable` in the real core (Task 14c). Gates `fpFault` escalation
+    * ONLY — the ordinary substituted OVFL/UNFL result is produced inside FpuCore and must
+    * NOT trap, or every overflow re-introduces the per-op trap cost this design removes. */
   var fpExcEnableIn: FpExcFlags = null
+  /** Task 14c: the FPSR exception-status byte this lane raised for the operation whose
+    * result is being delivered this cycle, in the ARCHITECTURAL FPSR[15:8] bit order
+    * (7 BSUN, 6 SNAN, 5 OPERR, 4 OVFL, 3 UNFL, 2 DZ, 1 INEX2, 0 INEX1 — MC68040 UM
+    * Figure 9-5). BSUN and INEX1 are always 0 here: BSUN is a branch-side condition and
+    * INEX1 is packed-decimal-only, so neither can originate in this lane (the same reason
+    * `FpExcFlags` has no field for either). Consumed by `FpuControlPlugin.orFpsrExc`,
+    * which does the EXC -> AEXC fold. Valid only for a non-flushed delivery, and only
+    * when the byte is non-zero (an all-clear byte would OR in nothing). */
+  var fpExcAccrualPort: Flow[Bits] = null
 
   override def issue: Stream[IqContext] = issuePort
   override def completion: Flow[UInt]   = completionPort
@@ -219,6 +269,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     fpExcEnableIn = FpExcFlags()
     fpExcEnableIn.flatten.foreach(_.allowOverride)
     fpExcEnableIn.clearExc()
+    fpExcAccrualPort = Flow(Bits(8 bits)); fpExcAccrualPort.simPublic()
     val fprf = host[FpRegFileService]
     // NO bypass port on either FP file, deliberately. The int/NZVC files need one because a
     // STATIC latency-1 scoreboard wakeup can put a consumer's regfile read in the very cycle
@@ -837,6 +888,9 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val fpCompFpcc      = Reg(Bits(4 bits))
     val fpCompFault     = RegInit(False)
     val fpCompFaultVec  = Reg(UInt(8 bits))
+    // Task 14c: the architectural FPSR EXC byte for the delivered op (see
+    // `fpExcAccrualPort`'s doc for the bit order and why BSUN/INEX1 are structurally 0).
+    val fpCompExc       = Reg(Bits(8 bits)) init 0
     fpCompValid := False
     fpCompFault := False
 
@@ -868,7 +922,16 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val fpEscFixed = fpEscalation(fpu.io.resFixed)
     val fpEscIter  = fpEscalation(fpu.io.resIter)
 
+    /** FpExcFlags -> architectural FPSR[15:8] EXC byte (MC68040 UM Figure 9-5:
+      * 15 BSUN, 14 SNAN, 13 OPERR, 12 OVFL, 11 UNFL, 10 DZ, 9 INEX2, 8 INEX1). This is a
+      * genuine RE-ORDER, not a reinterpretation of the bundle's own bit packing --
+      * `FpExcFlags` is a plain declaration-ordered Bundle with no architectural meaning
+      * attached to its flattened layout, so the mapping is written out field by field. */
+    def fpsrExcByte(e: FpExcFlags): Bits =
+      False ## e.snan ## e.operr ## e.ovfl ## e.unfl ## e.dz ## e.inex2 ## False
+
     def fpWriteback(ctx: FpPipeContext, res: FpResult, esc: FpEscalation): Unit = {
+      fpCompExc       := fpsrExcByte(res.exc)
       fpCompValid     := True
       fpCompRobId     := ctx.robId
       fpCompPdst      := ctx.pdst
@@ -913,12 +976,19 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     fpFaultPort.payload.robId     := fpCompRobId
     fpFaultPort.payload.vector    := fpCompFaultVec
     fpFaultPort.payload.faultAddr := U(0, 32 bits)
+    // Task 14c: FPSR exception-status accrual. Deliberately NOT gated on `!fpCompFault`:
+    // when a trap IS enabled the handler must still find the EXC bit that caused it (the
+    // FPSP reads FPSR.EXC to dispatch), so an escalating op accrues exactly like a
+    // substituting one -- the enable byte selects whether a VECTOR is also taken, not
+    // whether the status bit is recorded.
+    fpExcAccrualPort.valid   := fpCompLive && fpCompExc =/= 0
+    fpExcAccrualPort.payload := fpCompExc
 
     // ---- sim-only whitebox for the FP lane (zero synth impact) ----
     fpCompValid.simPublic(); fpCompRobId.simPublic(); fpCompData.simPublic()
     fpCompPdst.simPublic(); fpCompPdstValid.simPublic()
     fpCompFpcc.simPublic(); fpCompFpccDst.simPublic(); fpCompFpccWrite.simPublic()
-    fpCompFault.simPublic(); fpCompFaultVec.simPublic()
+    fpCompFault.simPublic(); fpCompFaultVec.simPublic(); fpCompExc.simPublic()
     fpIterBusy.simPublic(); fpIterFlushed.simPublic(); fpIterTake.simPublic()
     fpu.io.busyIter.simPublic(); fpu.io.doneIter.simPublic()
     fpSrcVal.simPublic()   // the source-operand gateway's converted 80-bit output

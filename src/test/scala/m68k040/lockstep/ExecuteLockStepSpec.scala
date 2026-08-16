@@ -395,10 +395,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // those registers from inside its OWN `during build` Area -- a consumer plugin whose
   // `logic` elaborates first would read null. Same order-proof seam as
   // `exc.committedFpccIn` / `exc.committedA7In` just above.
+  //
+  // Task 14c added the rest of the FP-control seam on the SAME wire (rounding mode,
+  // exception-enable byte, and the EU's FPSR exception-status accrual back-channel);
+  // `DivEuPlugin.wireFpControl` is the single shared definition of all of it, so this
+  // DUT cannot drift away from the synthesized core's FP semantics.
   val fpCtlSvc = host[m68k040.services.FpuControlService]
-  divEu.fpCtrlFpcrIn  := fpCtlSvc.fpcr
-  divEu.fpCtrlFpsrIn  := fpCtlSvc.fpsr
-  divEu.fpCtrlFpiarIn := fpCtlSvc.fpiar
+  m68k040.execute.DivEuPlugin.wireFpControl(divEu, fpCtlSvc)
   fpccWr.valid   := exc.fpccWriteValid
   fpccWr.address := host[RenameStage].committedPhysFpcc.resize(fpccWr.address.getWidth)
   fpccWr.data    := exc.fpccWriteData
