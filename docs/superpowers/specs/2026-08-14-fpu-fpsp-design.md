@@ -429,6 +429,81 @@ from the Musashi-refereed corpus with this entry as the documented reason, or sp
 them in the oracle glue (post-step A7 fixup of ∓1); a directed whitebox test then owns the
 ±2 behaviour, exactly as D1/D2/D5 are handled.
 
+**D9 — `FMOVEM.L <list>,-(An)` (control-register list, popcount ≥ 2): Musashi writes the
+register images in the wrong ADDRESS order.** Found during Task 9b. **This entry is
+primary-source-closed** — unlike most of this register, it does not rest on a derivation.
+
+Primary source, quoted verbatim from a non-OCR `pdftotext -layout` extraction of the actual
+PDF — **M68000 Family Programmer's Reference Manual** (Motorola, 1992, M68000PRM), Section 5
+"Floating-Point Instructions", instruction page *"FMOVEM — Move Multiple Floating-Point
+Control Registers (MC6888X, MC68040)"*, **page 5-91** (note the page header explicitly scopes
+the description to the MC68040, so it is directly authoritative for this core):
+
+> "Moves one or more 32-bit values into or out of the specified system control registers. Any
+> combination of the three system control registers may be specified. The registers are always
+> moved in the same order, regardless of the addressing mode used; the floating-point control
+> register is moved first, followed by the floating-point status register, and the
+> floating-point instruction address register is moved last. If a register is not selected for
+> the transfer, the relative order of the transfer of the other registers is the same. The
+> first register is transferred between the floating-point unit and the specified address, with
+> successive registers located up through higher addresses."
+
+> "When more than one register is moved, the memory or memory-alterable addressing modes can be
+> used as shown in the addressing mode tables. If the addressing mode is predecrement, the
+> address register is first decremented by the total size of the register images to be moved
+> (i.e., four times the number of registers), and then the registers are transferred starting at
+> the resultant address. For the postincrement addressing mode, the selected registers are
+> transferred to or from the specified address, and then the address register is incremented by
+> the total size of the register images transferred."
+
+Obtained at `https://ia801904.us.archive.org/10/items/M68000PRM/M68000PRM.pdf` (item
+`https://archive.org/details/M68000PRM`; searchable OCR twin `.../M68000PRM_djvu.txt` agrees
+verbatim). Independently corroborated by the **MC68881/MC68882 Floating-Point Coprocessor
+User's Manual** (Motorola, MC68881UM/AD Rev 1, 1st ed. 1987), Section 4.6, instruction page
+*"FMOVEM — Move Multiple Control Registers"*, **page 4-76**, whose wording is substantively
+identical (`https://archive.org/details/bitsavers_motorola68882FloatingPointCoprocessorUsersManual1e_23895950`).
+
+**The architectural rule, therefore:** the memory image is **always** FPCR at the lowest
+address, then FPSR, then FPIAR at the highest — for **every** addressing mode. `-(An)` is
+implemented as a single up-front `An -= 4 × popcount(mask)` followed by ascending transfers;
+the per-register *processing* order is never reversed.
+
+**Musashi's divergence.** `tools/musashi/musashi/m68kfpu.c:1635-1660` (`fmove_fpcr`) processes
+`reg & 4` (FPCR), then `reg & 2` (FPSR), then `reg & 1` (FPIAR) and calls `WRITE_EA_32` /
+`READ_EA_32` once per selected register. Those helpers re-evaluate `EA_AY_PD_32()` freshly on
+every call, so for `-(An)` each call independently decrements `An` by 4 *before* writing.
+Result for `FMOVEM.L FPIAR/FPSR/FPCR,-(A7)` (`F227 BC00`): Musashi leaves FPIAR at the lowest
+address and FPCR at the highest — **the exact reverse of the architectural image**. It is
+also self-inconsistent: Musashi's own matching `FMOVEM.L (A7)+,FPIAR/FPSR/FPCR` reload (same
+fixed order, postincrement) reads that image back and swaps FPCR with FPIAR, so a
+push/pop pair does not round-trip. Only `popcount(mask) == 1` and non-predecrement modes are
+unaffected. Independently corroborated by WinUAE's `fpp.cpp` control-register path, which
+implements the Motorola mechanism exactly (sum the sizes, `ad -= incr`, then ascend).
+=> **Musashi is wrong here; do NOT implement the core to match it.** Exclude
+`FMOVEM.L <list>,-(An)` with `popcount ≥ 2` from any Musashi-refereed corpus; a directed
+whitebox round-trip test owns it, exactly as D1/D2/D5/D8 are handled. Non-predecrement modes
+remain lock-step-eligible against Musashi.
+
+**D9a — corrections to two claims that circulated in the Task 9b brief before this citation
+existed** (recorded so they are not re-derived or re-propagated):
+1. The brief derived a *"predecrement reverses the register processing order (FPIAR, FPSR,
+   FPCR)"* rule. That produces the **correct memory image** but is **not** the mechanism
+   Motorola documents, and the two are distinguishable: they differ in the temporal order of
+   the bus writes, which is observable on a partially-faulted access (which write faults
+   first) and in any bus-accurate trace comparison. Implement the documented mechanism
+   (decrement by the total, then ascend), not the reversal.
+2. The brief's supporting WinUAE quote (*"6888x … predecrement have inverted register list
+   order … 68040+ only use inverted register order if EA is predecrement"*) is real but was
+   **misattributed**: in WinUAE it governs the FMOVEM **data**-register form (FP0–FP7,
+   opclass 110/111), keyed on the 2-bit MODE field in ext[12:11], which has **no analogue in
+   the control-register encoding**. It is not evidence about the control-register form.
+
+**D9b — register-select mask `RRR == 000`.** WinUAE's control-register FMOVEM path treats an
+all-zero mask as *FPIAR selected* (`extra |= 0x0400`) for both directions. This is **not**
+confirmed against either manual and is recorded as an open, unverified question, not as a
+rule to implement. The conservative behaviour (leave `RRR == 000` undecoded → vector-11 F-line
+trap) is what this core does today and is safe with respect to it.
+
 ### VERIFY-AT-IMPLEMENTATION
 
 - **VERIFY-1 — the FMOVECR constant ROM words for offsets $0B and $38..$3F.**
