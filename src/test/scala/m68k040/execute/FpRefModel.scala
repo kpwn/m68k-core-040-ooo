@@ -9,7 +9,14 @@ package m68k040.execute
   * construction from the RTL's (which mirrors SoftFloat's shift/subtract structure), so
   * agreement between them is real evidence rather than a shared-bug tautology. Only
   * `roundPack` -- the final round/pack/substitute step -- is a transcription, because that
-  * step IS the specification. */
+  * step IS the specification.
+  *
+  * `sqrt` is included in that claim as of 2026-08-16: it used to replicate the RTL's own
+  * formulation (clz pre-normalise, `E = ee - 0x3FFF` parity split, `sig << (65 or 66)`,
+  * `zExp = floor(E/2) + 0x3FFF`) and differ only in how the integer square root was computed,
+  * which made the randomised FSQRT sweep a tautology for exactly the exponent/pre-normalise
+  * logic it looked like it was covering. It is now a fixed-window rational scaling; see the
+  * comment on `sqrt` itself. */
 object FpRefModel {
   val M64 = (BigInt(1) << 64) - 1
   val M63 = (BigInt(1) << 63) - 1
@@ -160,20 +167,43 @@ object FpRefModel {
     if (sign(a) == 1 && isTrueZero(a)) return (a, false, false, false)
     if (sign(a) == 1) return (DefaultNan, false, false, false)
     if (isTrueZero(a)) return (pack(0, 0, 0), false, false, false)
-    // Pre-normalise exactly as normalizeFloatx80Subnormal does, then take an exact integer
-    // square root of sig << (65 or 66) -- the same formulation the RTL uses, but computed
-    // with a binary search over BigInt rather than 65 restoring steps.
-    val (m, ee) =
-      if (exp(a) == 0) { val c = 64 - sig(a).bitLength; (sig(a) << c, 1 - c) }
-      else (sig(a), exp(a))
-    val E = ee - 0x3FFF
-    val even = ((E % 2) + 2) % 2 == 0
-    val A = m << (if (even) 65 else 66)
-    var lo = BigInt(1) << 63; var hi = BigInt(1) << 66
-    while (lo < hi) { val mid = (lo + hi + 1) >> 1; if (mid * mid <= A) lo = mid else hi = mid - 1 }
-    val q = lo
-    val zExp = (if (E >= 0) E >> 1 else -(((-E) + 1) >> 1)) + 0x3FFF
-    roundPack(0, zExp, q >> 1, (q & 1) == 1, (A - q * q) != 0, rm)
+
+    // Exact value of the operand, V = M * 2^E, from the same raw extraction `rat` uses: the
+    // stored significand is taken AS IT SITS (no clz pre-normalise, no normalised
+    // significand/exponent pair reconstructed), and a subnormal is simply an operand whose
+    // biased exponent reads as 1.
+    val M = sig(a)
+    val E = (if (exp(a) == 0) 1 else exp(a)) - 16383 - 63
+
+    // Scale V into the FIXED window [2^130, 2^132) by a power of FOUR -- the direct analogue
+    // of `roundRational` scaling into [2^63, 2^64) by a power of two:
+    //     V == W * 4^g,   W = M << s an exact integer,   2^130 <= W < 2^132.
+    // `s` puts M's top bit at bit 131 and then backs off by one iff that would leave an odd
+    // residual power of two (only a power of FOUR has an exact square root, 4^g -> 2^g). The
+    // adjustment is a property of the chosen window, not a case split on the operand's
+    // exponent, and it applies identically to normals and subnormals. M < 2^64 guarantees
+    // s >= 67, so the shift is always LEFT and W is exact -- nothing is ever discarded.
+    var s = 132 - M.bitLength
+    if ((((E - s) % 2) + 2) % 2 != 0) s -= 1
+    val W = M << s
+    val g = (E - s) / 2
+    require(W >= (BigInt(1) << 130) && W < (BigInt(1) << 132), s"sqrt window escape: $W")
+
+    // floor(sqrt(W)) is 66 bits wide for EVERY W in the window, unconditionally, so there are
+    // always exactly two bits below the 64-bit significand and the exact remainder says
+    // whether anything at all lies below those. The integer square root is delegated to
+    // java.math.BigInteger.sqrt so that not even the inner loop is hand-written here.
+    val Q   = BigInt(W.bigInteger.sqrt())
+    val rem = W - Q * Q
+    val extra = Q.bitLength - 64
+    val m   = Q >> extra
+    val rnd = ((Q >> (extra - 1)) & 1) == 1
+    val stk = (Q & ((BigInt(1) << (extra - 1)) - 1)) != 0 || rem != 0
+
+    // sqrt(V) = sqrt(W) * 2^g = (Q + f) * 2^g with 0 <= f < 1, so the result is
+    // m * 2^(g + extra): the exponent falls out of the SCALING plus where Q's bits landed,
+    // never out of a parity branch on the operand exponent.
+    roundPack(0, g + extra + 16383 + 63, m, rnd, stk, rm)
   }
 
   /** SoftFloat floatx80_round_to_int (softfloat.c:3082-3145) -- the REAL FINT semantics.

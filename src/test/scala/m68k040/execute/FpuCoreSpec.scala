@@ -37,6 +37,17 @@ class FpuCoreSpec extends AnyFunSuite {
   val Three   = (BigInt(0x4000) << 64) | BigInt("C000000000000000", 16)
   val Nine    = (BigInt(0x4002) << 64) | BigInt("9000000000000000", 16)
 
+  // ── FSQRT exponent-path extremes ──────────────────────────────────────────────
+  // FSQRT is the one op whose reference used to share the RTL's own formulation, so the
+  // exponent path needs DIRECTED cover at both ends. Genuine denormalised operands (biased
+  // exponent 0, integer bit clear -- value = sig * 2^-16445), and operands parked at the top
+  // of the exponent range.
+  val SubTwo   = BigInt(2)                                   // 2^-16444, an exact square
+  val SubHiBit = BigInt(1) << 62                             // 2^-16383, clz = 1
+  val SubMax   = (BigInt(1) << 63) - 1                       // largest subnormal
+  val P16382   = (BigInt(0x7FFD) << 64) | (BigInt(1) << 63)  // 2^16382, an exact square
+  val P16381   = (BigInt(0x7FFC) << 64) | (BigInt(1) << 63)  // 2^16381, odd exponent
+
   case class Got(value: BigInt, writeFp: Boolean, fpcc: Int,
                  snan: Boolean, operr: Boolean, ovfl: Boolean,
                  unfl: Boolean, dz: Boolean, inex: Boolean)
@@ -130,6 +141,29 @@ class FpuCoreSpec extends AnyFunSuite {
     assert(FpRefModel.sqrt(Nine, 0)._1 == Three)
     assert(FpRefModel.sqrt(Two, 0)._1 == ((BigInt(0x3FFF) << 64) | BigInt("B504F333F9DE6484", 16)),
       "sqrt(2) correctly rounded")
+    // FSQRT exponent extremes, hand-computed. sqrt halves the binary exponent, so a
+    // subnormal (value = sig * 2^-16445) still lands mid-range: sqrt(2^-16445) =
+    // sqrt(2) * 2^-8223, whose biased exponent is 16383 - 8223 = 8160 = $1FE0 and whose
+    // significand is sqrt(2)'s. A wrong parity split or a wrong pre-normalise moves the
+    // exponent, so these literals -- not the model -- are what pins it down.
+    for ((v, e, inexact) <- Seq(
+           (MinSub,   BigInt("1FE0B504F333F9DE6484", 16), true),   // 2^-16445
+           (SubTwo,   BigInt("1FE18000000000000000", 16), false),  // 2^-16444, exact
+           (SubHiBit, BigInt("1FFFB504F333F9DE6484", 16), true),   // 2^-16383
+           (SubMax,   BigInt("1FFFFFFFFFFFFFFFFFFF", 16), true),
+           (P16382,   BigInt("5FFE8000000000000000", 16), false),  // 2^16382, exact
+           (P16381,   BigInt("5FFDB504F333F9DE6484", 16), true),   // 2^16381
+           (MaxFin,   BigInt("5FFEFFFFFFFFFFFFFFFF", 16), true))) {
+      val r = FpRefModel.sqrt(v, 0)
+      assert(r._1 == e, f"ref sqrt($v%020x) -> ${r._1}%020x, expected $e%020x")
+      assert(r._4 == inexact, f"ref sqrt($v%020x) INEX2 ${r._4}, expected $inexact")
+      // sqrt maps the whole floatx80 range [2^-16445, 2^16384) into [2^-8223, 2^8192), so
+      // FSQRT can neither overflow nor underflow -- for ANY operand, in ANY rounding mode.
+      for (rm <- 0 to 3) {
+        val q = FpRefModel.sqrt(v, rm)
+        assert(!q._2 && !q._3, f"sqrt($v%020x) rm=$rm must raise neither OVFL nor UNFL")
+      }
+    }
     assert(FpRefModel.div(One, Three, 0)._1 == ((BigInt(0x3FFD) << 64) | BigInt("AAAAAAAAAAAAAAAB", 16)),
       "1/3 RN")
     assert(FpRefModel.div(One, Three, 1)._1 == ((BigInt(0x3FFD) << 64) | BigInt("AAAAAAAAAAAAAAAA", 16)),
@@ -215,6 +249,19 @@ class FpuCoreSpec extends AnyFunSuite {
       (FpOp.FSQRT, 0,    NegZero, 0, NegZero),               // -0 passes through
       // sqrt(2), inexact, correctly rounded
       (FpOp.FSQRT, 0,    Two,  0, (BigInt(0x3FFF) << 64) | BigInt("B504F333F9DE6484", 16)),
+      // ── the FSQRT exponent path at both ends ──
+      // Genuine DENORMALISED operands (biased exponent 0, integer bit clear). These are the
+      // vectors a wrong pre-normalise or a wrong exponent parity split cannot survive: the
+      // randomised sweep used to "cover" them only against a model that shared the RTL's own
+      // construction. sqrt(sig * 2^-16445) for sig = 1, 2, 2^62 and 2^63-1.
+      (FpOp.FSQRT, 0,    MinSub,   0, BigInt("1FE0B504F333F9DE6484", 16)),
+      (FpOp.FSQRT, 0,    SubTwo,   0, BigInt("1FE18000000000000000", 16)),   // exact square
+      (FpOp.FSQRT, 0,    SubHiBit, 0, BigInt("1FFFB504F333F9DE6484", 16)),
+      (FpOp.FSQRT, 0,    SubMax,   0, BigInt("1FFFFFFFFFFFFFFFFFFF", 16)),
+      // ... and the top of the exponent range, even and odd, plus the largest finite.
+      (FpOp.FSQRT, 0,    P16382,   0, BigInt("5FFE8000000000000000", 16)),   // exact square
+      (FpOp.FSQRT, 0,    P16381,   0, BigInt("5FFDB504F333F9DE6484", 16)),
+      (FpOp.FSQRT, 0,    MaxFin,   0, BigInt("5FFEFFFFFFFFFFFFFFFF", 16)),
       // 1/3, inexact, correctly rounded under RN then RZ
       (FpOp.FDIV,  One,  Three, 0, (BigInt(0x3FFD) << 64) | BigInt("AAAAAAAAAAAAAAAB", 16)),
       (FpOp.FDIV,  One,  Three, 1, (BigInt(0x3FFD) << 64) | BigInt("AAAAAAAAAAAAAAAA", 16)))
@@ -226,6 +273,22 @@ class FpuCoreSpec extends AnyFunSuite {
         assert(g.value == exp, f"$op d=$d%020x s=$s%020x -> ${g.value}%020x, expected $exp%020x")
         val ref = if (op == FpOp.FDIV) FpRefModel.div(d, s, rm) else FpRefModel.sqrt(s, rm)
         assert(g.value == ref._1, f"$op disagrees with FpRefModel: ${g.value}%020x vs ${ref._1}%020x")
+        assert(g.ovfl == ref._2 && g.unfl == ref._3 && g.inex == ref._4,
+          f"$op d=$d%020x s=$s%020x flags ovfl=${g.ovfl}/${ref._2} " +
+          f"unfl=${g.unfl}/${ref._3} inex=${g.inex}/${ref._4}")
+      }
+      // FSQRT halves the binary exponent, so the whole floatx80 range [2^-16445, 2^16384)
+      // maps into [2^-8223, 2^8192): a correct FSQRT can NEVER overflow or underflow, for any
+      // operand in any rounding mode. That makes an "underflowing FSQRT" vector impossible to
+      // write; the equivalent evidence is the smallest and largest possible RESULTS (sqrt of
+      // the smallest subnormal, sqrt of the largest finite) landing on their exact literals
+      // above with both flags clear -- which is exactly what a broken exponent path breaks.
+      for (s <- Seq(MinSub, SubTwo, SubHiBit, SubMax, P16382, P16381, MaxFin, MinNorm); rm <- 0 to 3) {
+        val g = runIter(d0, cd, FpOp.FSQRT, 0, s, rm)
+        val r = FpRefModel.sqrt(s, rm)
+        assert(g.value == r._1, f"FSQRT rm=$rm $s%020x -> ${g.value}%020x, ref ${r._1}%020x")
+        assert(!g.ovfl && !g.unfl, f"FSQRT rm=$rm $s%020x raised ovfl=${g.ovfl} unfl=${g.unfl}")
+        assert(g.inex == r._4, f"FSQRT rm=$rm $s%020x INEX2 ${g.inex}, ref ${r._4}")
       }
     }
   }
