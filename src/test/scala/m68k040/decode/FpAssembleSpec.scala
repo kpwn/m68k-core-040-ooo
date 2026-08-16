@@ -163,6 +163,37 @@ class FpAssembleSpec extends AnyFunSuite {
     }
   }
 
+  // ── ROM-offset/opmode aliasing regression ─────────────────────────────────────
+  // $38 and $3A are REAL, defined FMOVECR ROM offsets (10^32 and 10^128 -- cromWords
+  // indices 14/16, see FpCheapPipe.scala's cromIndexOf/cromWords) that numerically alias
+  // fpNoFpDst's FCMP ($38) and FTST ($3A) opmodes. `writesFp := !fpNoFpDst` (the plain
+  // FCMP/FTST default, driven unconditionally before the fpFormIsMovecr branch) must be
+  // overridden back to True inside the FMOVECR branch -- FMOVECR always writes FPn,
+  // unlike genuine FCMP/FTST. Without the override this silently decodes with
+  // writesFp=False, so rename allocates no FP destination and the EU's result is
+  // discarded (wrong answer, no fault, no hang).
+  test("FMOVECR #$38,FP0 (10^32) still writes FPn despite aliasing FCMP's opmode", VerilatorTest) {
+    run { dut =>
+      drive(dut, op = 0xF200, ext = 0x5C38, len = 2); sleep(1)
+      assert(!dut.uop.faulted.toBoolean)
+      assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.ROMCONST)
+      assert(dut.uop.useImm.toBoolean && dut.uop.imm.toInt == 0x38, "the ROM offset rides imm")
+      assert(dut.uop.writesFp.toBoolean, "FMOVECR #$38 must write FP0 -- $38 is a ROM offset here, not FCMP's opmode")
+      assert(dut.uop.fpDstReg.toInt == 0 && dut.uop.writesFpcc.toBoolean)
+    }
+  }
+
+  test("FMOVECR #$3A,FP0 (10^128) still writes FPn despite aliasing FTST's opmode", VerilatorTest) {
+    run { dut =>
+      drive(dut, op = 0xF200, ext = 0x5C3A, len = 2); sleep(1)
+      assert(!dut.uop.faulted.toBoolean)
+      assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.ROMCONST)
+      assert(dut.uop.useImm.toBoolean && dut.uop.imm.toInt == 0x3A, "the ROM offset rides imm")
+      assert(dut.uop.writesFp.toBoolean, "FMOVECR #$3A must write FP0 -- $3A is a ROM offset here, not FTST's opmode")
+      assert(dut.uop.fpDstReg.toInt == 0 && dut.uop.writesFpcc.toBoolean)
+    }
+  }
+
   // ── Immediate-source forms (this deliverable's extended scope) ───────────────
   // <ea> = mode 7 / reg 4 (#imm) for every case below: op = 0xF200 | (7<<3) | 4 = 0xF23C.
   // opmode 0x22 = FADD (dyadic, hardware-native) in every case, so any observed fault

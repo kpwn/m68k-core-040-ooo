@@ -1717,6 +1717,12 @@ object MicroOpAssembler {
         opUop.usesFpSrcB := False
         opUop.fpSrcBReg  := 0
         opUop.usesFpSrcA := False        // FMOVECR overwrites FPn; it never reads it
+        // Override the `!fpNoFpDst` default above: for FMOVECR, `fpOpmode` is NOT an
+        // opmode at all -- it's the ROM constant offset, and $38 (10^32, cromWords index
+        // 14) / $3A (10^128, cromWords index 16) are real, defined offsets that happen to
+        // numerically alias FCMP/FTST's opmodes. Every FMOVECR form writes its destination
+        // FPn unconditionally; there is no FMOVECR variant that only sets FPCC.
+        opUop.writesFp   := True
         opUop.srcAValid  := False; opUop.srcBValid := False
         opUop.useImm     := True
         opUop.imm        := fpOpmode.resize(32)
