@@ -28,6 +28,14 @@
 
 #include "m68k_bus.h"
 
+// 80-bit IEEE-754 extended value, split exactly the way Musashi/SoftFloat stores it
+// (`floatx80` = { bits16 high; bits64 low; }, softfloat/softfloat.h:49-52):
+//   high[15]   = sign
+//   high[14:0] = 15-bit biased exponent
+//   low[63:0]  = significand INCLUDING the explicit integer bit (extended precision
+//                has no implicit bit)
+struct Fp80 { uint16_t high; uint64_t low; };
+
 class MusashiRef {
 public:
     enum CpuType {
@@ -124,6 +132,17 @@ public:
 
     uint32_t get_reg(Reg r) const;
     void     set_reg(Reg r, uint32_t v);
+
+    // -- FP state (68040 FPU) --------------------------------------------
+    // Musashi's PUBLIC m68k_get_reg()/m68k_set_reg() API has NO floating-point
+    // surface whatsoever (m68k.h:111-152 -- verified, M68K_REG_FP* does not
+    // exist), so unlike get_reg() above these do NOT forward to it: they read
+    // m68ki_cpu.fpr[]/.fpcr/.fpsr/.fpiar (m68kcpu.h:953-956) directly.  Defined
+    // in the SEPARATE translation unit m68k_ref_fp.cpp.
+    Fp80     get_fp(int i) const;
+    uint32_t get_fpcr() const;
+    uint32_t get_fpsr() const;
+    uint32_t get_fpiar() const;
 
     // Execute until one of:
     //   - a 32-bit (or 16-bit or 8-bit) write lands at `sentinel_addr`

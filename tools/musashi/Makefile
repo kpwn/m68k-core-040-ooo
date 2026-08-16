@@ -49,7 +49,7 @@ MUSASHI_SRCS := \
 
 MUSASHI_OBJS := $(MUSASHI_SRCS:.c=.o)
 
-REF_OBJS := $(HERE)m68k_ref.o
+REF_OBJS := $(HERE)m68k_ref.o $(HERE)m68k_ref_fp.o
 
 # ── m68kmake — generates m68kops.c/h from the m68k_in.c template ────
 $(MUSASHI_DIR)/m68kmake: $(MUSASHI_DIR)/m68kmake.c
@@ -63,6 +63,10 @@ $(GEN_SRCS) $(GEN_HDRS): $(MUSASHI_DIR)/m68kmake $(MUSASHI_DIR)/m68k_in.c
 
 # ── libmusashi_ref.a — Musashi core + m68k_ref wrapper ───────────────
 $(HERE)m68k_ref.o: $(HERE)m68k_ref.cpp $(HERE)m68k_ref.h $(GEN_HDRS)
+	$(CXX) $(CXXFLAGS) $(INCS) -c -o $@ $<
+
+$(HERE)m68k_ref_fp.o: $(HERE)m68k_ref_fp.cpp $(HERE)m68k_ref.h \
+                      $(MUSASHI_DIR)/m68kcpu.h $(GEN_HDRS)
 	$(CXX) $(CXXFLAGS) $(INCS) -c -o $@ $<
 
 $(HERE)libmusashi_ref.a: $(REF_OBJS) $(MUSASHI_OBJS)

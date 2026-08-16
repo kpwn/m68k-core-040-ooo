@@ -211,13 +211,28 @@ int main(int argc, char** argv) {
             // Emit post-instruction state
             uint32_t pc = ref.get_reg(MusashiRef::REG_PC);
             uint32_t sr = ref.get_reg(MusashiRef::REG_SR) & 0xFFFFu;
+            // FP state (68040 FPU).  Each FP register is emitted as two fields:
+            // fpNh = floatx80.high (sign + 15-bit biased exponent), fpNl =
+            // floatx80.low (64-bit significand WITH the explicit integer bit).
+            // The consumer recombines them as (fpNh << 64) | fpNl.  Emitted
+            // unconditionally: OracleStep.scala is the sole consumer and is
+            // key/value based, so unknown keys are ignored; for a non-FP program
+            // every field is 0.  Cost measured during plan-writing: 283 -> 620
+            // bytes per step line (2.19x).
+            Fp80 fp[8];
+            for (int i = 0; i < 8; i++) fp[i] = ref.get_fp(i);
             std::fprintf(tf,
                 "step pc=0x%08x sr=0x%04x"
                 " d0=0x%08x d1=0x%08x d2=0x%08x d3=0x%08x"
                 " d4=0x%08x d5=0x%08x d6=0x%08x d7=0x%08x"
                 " a0=0x%08x a1=0x%08x a2=0x%08x a3=0x%08x"
                 " a4=0x%08x a5=0x%08x a6=0x%08x a7=0x%08x"
-                " msp=0x%08x isp=0x%08x\n",
+                " msp=0x%08x isp=0x%08x"
+                " fp0h=0x%04x fp0l=0x%016llx fp1h=0x%04x fp1l=0x%016llx"
+                " fp2h=0x%04x fp2l=0x%016llx fp3h=0x%04x fp3l=0x%016llx"
+                " fp4h=0x%04x fp4l=0x%016llx fp5h=0x%04x fp5l=0x%016llx"
+                " fp6h=0x%04x fp6l=0x%016llx fp7h=0x%04x fp7l=0x%016llx"
+                " fpcr=0x%08x fpsr=0x%08x fpiar=0x%08x\n",
                 pc, sr,
                 ref.get_reg(MusashiRef::REG_D0), ref.get_reg(MusashiRef::REG_D1),
                 ref.get_reg(MusashiRef::REG_D2), ref.get_reg(MusashiRef::REG_D3),
@@ -227,7 +242,16 @@ int main(int argc, char** argv) {
                 ref.get_reg(MusashiRef::REG_A2), ref.get_reg(MusashiRef::REG_A3),
                 ref.get_reg(MusashiRef::REG_A4), ref.get_reg(MusashiRef::REG_A5),
                 ref.get_reg(MusashiRef::REG_A6), ref.get_reg(MusashiRef::REG_A7),
-                ref.get_reg(MusashiRef::REG_MSP), ref.get_reg(MusashiRef::REG_ISP));
+                ref.get_reg(MusashiRef::REG_MSP), ref.get_reg(MusashiRef::REG_ISP),
+                fp[0].high, (unsigned long long)fp[0].low,
+                fp[1].high, (unsigned long long)fp[1].low,
+                fp[2].high, (unsigned long long)fp[2].low,
+                fp[3].high, (unsigned long long)fp[3].low,
+                fp[4].high, (unsigned long long)fp[4].low,
+                fp[5].high, (unsigned long long)fp[5].low,
+                fp[6].high, (unsigned long long)fp[6].low,
+                fp[7].high, (unsigned long long)fp[7].low,
+                ref.get_fpcr(), ref.get_fpsr(), ref.get_fpiar());
         }
         std::fclose(tf);
     } else {
@@ -281,6 +305,18 @@ int main(int argc, char** argv) {
         uint32_t v = ref.get_reg((MusashiRef::Reg)(MusashiRef::REG_A0 + i));
         std::fprintf(f, "a%d=0x%08x\n", i, v);
     }
+    // FP state.  Same two-field-per-register encoding as the --trace records.
+    // Appended AFTER the a0..a7 block and BEFORE mem_writes= so the existing key
+    // order Musashi.scala's parseOutput reads is untouched -- that parser is
+    // key/value based and ignores keys it does not ask for.
+    for (int i = 0; i < 8; i++) {
+        Fp80 v = ref.get_fp(i);
+        std::fprintf(f, "fp%dh=0x%04x\n", i, v.high);
+        std::fprintf(f, "fp%dl=0x%016llx\n", i, (unsigned long long)v.low);
+    }
+    std::fprintf(f, "fpcr=0x%08x\n",  ref.get_fpcr());
+    std::fprintf(f, "fpsr=0x%08x\n",  ref.get_fpsr());
+    std::fprintf(f, "fpiar=0x%08x\n", ref.get_fpiar());
     auto writes = ref.final_mem_writes();
     std::fprintf(f, "mem_writes=%zu\n", writes.size());
     for (const auto& w : writes) {
