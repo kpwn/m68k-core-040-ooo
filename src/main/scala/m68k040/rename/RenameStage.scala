@@ -455,6 +455,19 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
   def committedPhysNzvc: UInt = logic.nzvcRat.committedPhys(0)
   def committedPhysX:    UInt = logic.xRat.committedPhys(0)
 
+  /** COMMITTED phys mapping of the singleton FPCC {NaN,I,Z,N} group (archDepth=1, always
+    * arch index 0) — the FP analogue of committedPhysNzvc, and used for exactly the same
+    * two jobs by exactly the same mechanism (Task 9's architectural FMOVE to/from FPSR):
+    *  - READ: the backend wiring reads the FPCC PRF at this phys every cycle and feeds it
+    *    to `ExceptionUnit.committedFpccIn`, so an architectural FPSR read can splice the
+    *    live FPCC into FPSR[27:24] (FpuControlPlugin deliberately stores 0 there).
+    *  - WRITE: an architectural FPSR write pushes the frame's FPCC nibble DIRECTLY into
+    *    this physical register (`ExceptionUnit.fpccWriteValid/Data`) instead of
+    *    rename-allocating a fresh pFpccDst — see rteNzvcWriteValid's doc comment for the
+    *    confirmed silent-corruption regression that rules the rename-allocation approach
+    *    out for a serializing-FSM writer. */
+  def committedPhysFpcc: UInt = logic.fpccRat.committedPhys(0)
+
   override def commitPorts: Vec[Flow[CommitSlot]] = logic.commitPorts
   override def flushPort:   Bool                  = logic.flush
 }

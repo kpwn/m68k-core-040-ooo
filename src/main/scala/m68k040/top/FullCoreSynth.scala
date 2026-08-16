@@ -36,11 +36,19 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
   // rteNzvcWriteValid doc comment for why this replaced a rename-allocation approach.
   var nzvcWr: m68k040.execute.regfile.RegFileWritePort = null
   var xWr:    m68k040.execute.regfile.RegFileWritePort = null
+  // FPCC PRF read/write ports for the architectural FMOVE to/from FPSR (Task 9). Exact
+  // NZVC analogue of nzvcWr + a7Rd: read the committed mapping every cycle to splice the
+  // live FPCC into an FPSR read, and write that same committed mapping directly on an
+  // FPSR write. See RenameStage.committedPhysFpcc's doc comment.
+  var fpccRd: m68k040.execute.regfile.RegFileReadPort  = null
+  var fpccWr: m68k040.execute.regfile.RegFileWritePort = null
   during setup {
     a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
     a7Rd = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
     nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
     xWr    = host[m68k040.execute.regfile.XRegFileService].newWrite(latency = 1, sharingKey = "rteX")
+    fpccRd = host[m68k040.execute.regfile.FpccRegFileService].newRead(forceNoBypass = true)
+    fpccWr = host[m68k040.execute.regfile.FpccRegFileService].newWrite(latency = 1, sharingKey = "excFpcc")
   }
   val logic = during build new Area {
     val iq  = host[IssueQueueService]
@@ -396,6 +404,17 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     xWr.valid      := exc.rteXWriteValid
     xWr.address    := host[RenameStage].committedPhysX.resize(xWr.address.getWidth)
     xWr.data       := exc.rteXWriteData.asBits
+    // Architectural FMOVE to/from FPSR (Task 9): the FPCC nibble of FPSR is RENAMED
+    // (spec Decision 4) and therefore lives in the FPCC PRF, not in FpuControlPlugin.
+    // Read it back at the committed mapping every cycle for the FPSR READ splice, and
+    // write that same committed physical register directly on an FPSR WRITE -- the exact
+    // nzvcWr/a7Rd pattern above, safe for the same reason (it fires only inside the
+    // serializing S_APPLY, with retire0/retire1 blocked and the EUs flushed).
+    fpccRd.addr    := host[RenameStage].committedPhysFpcc.resize(fpccRd.addr.getWidth)
+    exc.committedFpccIn := fpccRd.data
+    fpccWr.valid   := exc.fpccWriteValid
+    fpccWr.address := host[RenameStage].committedPhysFpcc.resize(fpccWr.address.getWidth)
+    fpccWr.data    := exc.fpccWriteData
 
     // Synth anchors (registered top outputs) so synthesis can't trim the core.
     val eu0Res = out(RegNext(eu0.intW.data))   // EU0 int result -> anchors datapath+PRF
@@ -427,6 +446,12 @@ object GenFullCoreSynthVerilog {
         new M68kCore(Seq[FiberPlugin](
           new ParamPlugin(p),
           new MmuControlPlugin(),
+          // Non-renamed FP control state (FPCR / FPSR non-FPCC bytes / FPIAR), Task 9.
+          // MUST be listed BEFORE RobPlugin, exactly like MmuControlPlugin: RobPlugin's
+          // `during build` constructs the ExceptionUnit, which reads `fpuCtrl.fpsr`/`.fpcr`
+          // EAGERLY (the FPSR-read FPCC splice is a plain `val`), so this plugin's own
+          // `logic` Area has to have elaborated by then or those accessors are still null.
+          new m68k040.execute.FpuControlPlugin(),
           new m68k040.exception.InterruptControlPlugin(),
           new ItlbPlugin(),
           new DtlbPlugin(),

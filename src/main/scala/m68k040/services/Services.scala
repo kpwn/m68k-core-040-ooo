@@ -208,6 +208,44 @@ trait MmuControlService {
   def setMmusr: Flow[UInt]
 }
 
+/** The single owner of the NON-RENAMED floating-point control state (spec Decision 5):
+  * FPCR (rounding/precision/exception-enable), FPSR's NON-FPCC bytes (exception status,
+  * accrued exception, quotient), and FPIAR. Contrast with FPCC (N/Z/I/NAN), which IS
+  * renamed and lives in the FPCC RAT/PRF (Task 2/3) — this service deliberately does not
+  * hold it, and `fpsr` below reads 0 in bits [27:24]; ExceptionUnit splices the live
+  * committed FPCC in on an architectural FPSR read and routes it back to the FPCC PRF on
+  * an architectural FPSR write.
+  *
+  * Shape follows MmuControlService exactly: plain accessors for the committed values +
+  * one default-idle commit-time write Flow each. */
+trait FpuControlService {
+  def fpcr:  UInt          // 32 bits
+  def fpsr:  UInt          // 32 bits, bits [27:24] always 0 (FPCC is renamed elsewhere)
+  def fpiar: UInt          // 32 bits
+
+  def setFpcr:  Flow[UInt]
+  def setFpsr:  Flow[UInt]   // bits [27:24] of the payload are IGNORED (masked at the writer)
+  def setFpiar: Flow[UInt]
+
+  /** The FP EU's exception-status OR-in port. Payload is the 8-bit EXC field
+    * {BSUN,SNAN,OPERR,OVFL,UNFL,DZ,INEX2,INEX1} (MSB = BSUN), matching the MC68040 UM's
+    * Figure 9-5 layout of FPSR[15:8]. ORs into FPSR[15:8] and folds the derived AEXC
+    * bits into FPSR[7:0] per the UM's Section 9.2.3.4 equations.
+    *
+    * NOTE (Task 9): no producer is wired yet — Task 8's `DivEuPlugin` FP lane predates
+    * this service and does not yet drive it. The port exists (and is unit-tested) so
+    * that wiring lands as a pure addition; until then FPSR's EXC/AEXC bytes only ever
+    * change via an architectural FMOVE-to-FPSR. */
+  def orFpsrExc: Flow[Bits]
+
+  /** FPCR field accessors, for the FP EU. Rounding mode is FPCR[5:4]
+    * (00=RN, 01=RZ, 10=RM, 11=RP); precision FPCR[7:6]; exception-enable byte FPCR[15:8],
+    * laid out identically to the EXC field above. */
+  def roundingMode: Bits
+  def precision:    Bits
+  def excEnable:    Bits
+}
+
 /** The external interrupt inputs (simple protocol): a 3-bit IPL plus the SoC's
   * per-level autovector/vectored selection. One owner drives the regs (synth top
   * input / sim poke / future SoC); the ROB recognition logic reads them.

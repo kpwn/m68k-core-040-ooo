@@ -227,7 +227,37 @@ object SysKind extends SpinalEnum {
       // SysKind element" when it first bumped the field from 3 to 4 bits; see
       // ExceptionUnit.scala's `sysKind`/`sysCapKind` + RobPlugin's `.resize(...)` call,
       // all updated together. Still fits comfortably in 4 bits with 10 elements total.)
-      PTEST
+      PTEST,
+      // FMOVE to/from a floating-point CONTROL register (FPCR / FPSR / FPIAR).
+      // Opword 0xF200|<ea> (line-F, cpID=001 in op[11:9], opclass 000 in op[8:6]) + a
+      // command extension word whose ext[15:13] selects the direction (100 = <ea>->ctrl,
+      // 101 = ctrl-><ea>) and ext[12:10] is the one-hot register-select mask
+      // {FPCR, FPSR, FPIAR}. NOT a MOVEC variant -- a real dedicated 68881/68040
+      // instruction; encoding independently confirmed via `m68k-linux-gnu-as -m68040
+      // -m68881` (Task 9 Step 1: F200 9000 / F200 8800 / F200 8400 / F200 B000 /
+      // F200 A800 / F200 A400 / F23C 8800 00000000 / F208 8400) and corroborated by the
+      // vendored corpus's own documented opwords (fpu_fsave_frestore_idle_roundtrip.s,
+      // fpu_fmovem_ctrl_reg.s) and by the real Q700 ROM FPSP prologue pair `F227 BC00`
+      // quoted in the design spec.
+      //
+      // A COMMIT-TIME SYSTEM op, exactly like MOVEC: the FPCR/FPSR/FPIAR copies are
+      // non-renamed single-copy state (spec Decision 5), so the read/write happens at the
+      // serializing retire in ExceptionUnit's S_APPLY. Unlike EVERY other SysKind it is
+      // NOT privileged -- real 68040 FMOVE-to/from-FPcr is a user instruction (only
+      // FSAVE/FRESTORE are privileged in this band), so RobPlugin's `sysPrivFault` carries
+      // an explicit exclusion for it and `sysTriggerSig` fires regardless of committed S.
+      //
+      // UNLIKE every other SysKind, this one is NOT produced by `OperationDecoder`:
+      // `decode()` sees the OPWORD ONLY (it runs at I-cache refill time, PredecodeWord.
+      // scala), and the direction/mask live entirely in the extension word. It is
+      // produced by `MicroOpAssembler` instead, which does see `pkt.words(1)` -- the same
+      // established precedent ANDI/ORI/EORI #imm,SR already uses (`isToSr` sets sysOp/
+      // sysKind directly, with `spec.sysOp` False).
+      //
+      // Scope: single-register masks with a register-direct <ea> (mode 000 Dn / 001 An)
+      // only. Multi-register masks (the FMOVEM control-list form), memory <ea>s, and the
+      // `#imm` form all keep the existing vector-11 fall-through.
+      FMOVE_FPCTRL
       = newElement()
 }
 

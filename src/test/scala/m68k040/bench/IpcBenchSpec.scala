@@ -68,10 +68,17 @@ class IpcBenchSpec extends AnyFunSuite {
     // ExceptionUnit.scala's rteNzvcWriteValid doc comment.
     var nzvcWr: m68k040.execute.regfile.RegFileWritePort = null
     var xWr:    m68k040.execute.regfile.RegFileWritePort = null
+  // FPCC PRF read/write ports for the architectural FMOVE to/from FPSR (Task 9):
+  // exact NZVC analogue of nzvcWr -- read the committed mapping to splice the live
+  // FPCC into an FPSR read, write that same committed mapping on an FPSR write.
+  var fpccRd: m68k040.execute.regfile.RegFileReadPort  = null
+  var fpccWr: m68k040.execute.regfile.RegFileWritePort = null
     during setup {
       a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
       nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
       xWr    = host[m68k040.execute.regfile.XRegFileService].newWrite(latency = 1, sharingKey = "rteX")
+  fpccRd = host[m68k040.execute.regfile.FpccRegFileService].newRead(forceNoBypass = true)
+  fpccWr = host[m68k040.execute.regfile.FpccRegFileService].newWrite(latency = 1, sharingKey = "excFpcc")
     }
     val logic = during build new Area {
       val iq  = host[IssueQueueService]
@@ -276,6 +283,15 @@ class IpcBenchSpec extends AnyFunSuite {
       xWr.valid      := exc.rteXWriteValid
       xWr.address    := host[RenameStage].committedPhysX.resize(xWr.address.getWidth)
       xWr.data       := exc.rteXWriteData.asBits
+  // Architectural FMOVE to/from FPSR (Task 9): FPSR's FPCC nibble is RENAMED and lives
+  // in the FPCC PRF, not in FpuControlPlugin -- read it back at the committed mapping
+  // for the FPSR READ splice, write it directly there on an FPSR WRITE. Same pattern,
+  // and same safety argument, as the nzvcWr direct write just above.
+  fpccRd.addr    := host[RenameStage].committedPhysFpcc.resize(fpccRd.addr.getWidth)
+  exc.committedFpccIn := fpccRd.data
+  fpccWr.valid   := exc.fpccWriteValid
+  fpccWr.address := host[RenameStage].committedPhysFpcc.resize(fpccWr.address.getWidth)
+  fpccWr.data    := exc.fpccWriteData
     }
   }
 
@@ -283,6 +299,13 @@ class IpcBenchSpec extends AnyFunSuite {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
+    // Non-renamed FP control state (FPCR / FPSR non-FPCC bytes / FPIAR), Task 9.
+    // Declared HERE, next to MmuControlPlugin, and not further down with the register
+    // files: Fiber `during build` tasks run in plugin-INSTANCE-CREATION order, and
+    // RobPlugin's build constructs the ExceptionUnit, which reads fpuCtrl.fpsr/.fpcr
+    // EAGERLY. Creating it after `rob` leaves those accessors null (guarded by an
+    // explicit `require` in ExceptionUnit).
+    val fpuCtl = new m68k040.execute.FpuControlPlugin
     val intCtrl = new m68k040.exception.InterruptControlPlugin
     val itlb   = new ItlbPlugin
     val dtlb   = new DtlbPlugin
@@ -312,6 +335,10 @@ class IpcBenchSpec extends AnyFunSuite {
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
       ctrl,
+      // Non-renamed FP control state (Task 9). MUST precede `rob` in this Seq, exactly
+      // like `ctrl`: RobPlugin's build constructs the ExceptionUnit, which reads
+      // fpuCtrl.fpsr/.fpcr eagerly.
+      fpuCtl,
       intCtrl,
       itlb,
       dtlb,

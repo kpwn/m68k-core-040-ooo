@@ -86,12 +86,19 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // ExceptionUnit.scala's rteNzvcWriteValid doc comment.
     var nzvcWr: m68k040.execute.regfile.RegFileWritePort = null
     var xWr:    m68k040.execute.regfile.RegFileWritePort = null
+  // FPCC PRF read/write ports for the architectural FMOVE to/from FPSR (Task 9):
+  // exact NZVC analogue of nzvcWr -- read the committed mapping to splice the live
+  // FPCC into an FPSR read, write that same committed mapping on an FPSR write.
+  var fpccRd: m68k040.execute.regfile.RegFileReadPort  = null
+  var fpccWr: m68k040.execute.regfile.RegFileWritePort = null
     during setup {
       a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
       seedWr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7", priority = 1)
       a7Rd   = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
       nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
       xWr    = host[m68k040.execute.regfile.XRegFileService].newWrite(latency = 1, sharingKey = "rteX")
+  fpccRd = host[m68k040.execute.regfile.FpccRegFileService].newRead(forceNoBypass = true)
+  fpccWr = host[m68k040.execute.regfile.FpccRegFileService].newWrite(latency = 1, sharingKey = "excFpcc")
     }
     val logic = during build new Area {
       val seedValid = in Bool (); val seedAddr = in UInt (6 bits); val seedData = in Bits (32 bits)
@@ -366,6 +373,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       xWr.valid      := exc.rteXWriteValid
       xWr.address    := host[RenameStage].committedPhysX.resize(xWr.address.getWidth)
       xWr.data       := exc.rteXWriteData.asBits
+  // Architectural FMOVE to/from FPSR (Task 9): FPSR's FPCC nibble is RENAMED and lives
+  // in the FPCC PRF, not in FpuControlPlugin -- read it back at the committed mapping
+  // for the FPSR READ splice, write it directly there on an FPSR WRITE. Same pattern,
+  // and same safety argument, as the nzvcWr direct write just above.
+  fpccRd.addr    := host[RenameStage].committedPhysFpcc.resize(fpccRd.addr.getWidth)
+  exc.committedFpccIn := fpccRd.data
+  fpccWr.valid   := exc.fpccWriteValid
+  fpccWr.address := host[RenameStage].committedPhysFpcc.resize(fpccWr.address.getWidth)
+  fpccWr.data    := exc.fpccWriteData
     }
   }
 
@@ -375,6 +391,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
+    // Non-renamed FP control state (FPCR / FPSR non-FPCC bytes / FPIAR), Task 9.
+    // Declared HERE, next to MmuControlPlugin, and not further down with the register
+    // files: Fiber `during build` tasks run in plugin-INSTANCE-CREATION order, and
+    // RobPlugin's build constructs the ExceptionUnit, which reads fpuCtrl.fpsr/.fpcr
+    // EAGERLY. Creating it after `rob` leaves those accessors null (guarded by an
+    // explicit `require` in ExceptionUnit).
+    val fpuCtl = new m68k040.execute.FpuControlPlugin
     val intCtrl = new m68k040.exception.InterruptControlPlugin
     val itlb   = new ItlbPlugin
     val dtlb   = new DtlbPlugin
@@ -404,6 +427,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
       ctrl,
+      // Non-renamed FP control state (Task 9). MUST precede `rob` in this Seq, exactly
+      // like `ctrl`: RobPlugin's build constructs the ExceptionUnit, which reads
+      // fpuCtrl.fpsr/.fpcr eagerly.
+      fpuCtl,
       intCtrl,
       itlb,
       dtlb,
@@ -3752,6 +3779,103 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
     }
     (sawPriv, vec)
+  }
+
+  // ── Task 9: FMOVE.L Dn,FPcr / FPcr,Dn end-to-end, in USER mode ────────────────
+  // Proves three things the decode-level specs cannot: (a) the whole path really works
+  // (decode -> rename -> IQ -> ALU EU -> ROB -> the serializing S_APPLY -> FpuControlPlugin
+  // and back out through the int PRF), (b) FPCR and FPIAR are genuinely INDEPENDENT
+  // registers selected by the ext[12:10] mask (not one aliased copy), and (c) it is NOT
+  // privileged -- the whole program runs at committed S == 0 and must never raise vector 8,
+  // which is the one behavioral difference between this SysKind and every other one.
+  //
+  // NOT LOCK-STEP-VERIFIABLE, for the SAME two independently-confirmed oracle gaps already
+  // documented for CPUSH/line-F just above: Musashi exposes no FP register surface at all
+  // via m68k_get_reg (spec Decision 3), and its CPU_TYPE_68040 coprocessor stubs claim
+  // this whole opword range without raising anything. So it is a whitebox test: the WRITE
+  // direction is observed directly on FpuControlPlugin's simPublic committed Regs, and the
+  // READ direction through a downstream `move.l %d1,%d2` -- the SAME "a bare sys-path read
+  // commits a PRF value the whitebox does not see, so a downstream consumer is required"
+  // technique the MOVEC SFC/DFC round-trip tests above already use.
+  //
+  // Opwords are the LITERAL output of `m68k-linux-gnu-as -m68040 -m68881` (Task 9 Step 1);
+  // they are emitted as `.short` here because ProgramAssembler invokes `as` without
+  // -m68881, exactly like the `.word 0xFD00` line-F test above.
+  test("FMOVE.L D0,FPCR/FPIAR then FPcr,Dn round-trips in USER mode (not privileged)", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val src =
+      "move.l #0x00000030,%d0 ; " +
+      ".short 0xF200,0x9000 ; " +   // fmove.l %d0,%fpcr
+      ".short 0xF201,0xB000 ; " +   // fmove.l %fpcr,%d1
+      "move.l %d1,%d2 ; " +         // expose the FPCR read-back in a normal EU writeback
+      "move.l #0x000000AB,%d5 ; " +
+      ".short 0xF205,0x8400 ; " +   // fmove.l %d5,%fpiar
+      ".short 0xF203,0xA400 ; " +   // fmove.l %fpiar,%d3
+      "move.l %d3,%d4 ; " +         // expose the FPIAR read-back
+      "done: bra.s done"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i
+      case Left(e)  => fail(s"assemble failed: ${e.reason}")
+    }
+    var fpcrSeen  = BigInt(-1)
+    var fpiarSeen = BigInt(-1)
+    var fpsrSeen  = BigInt(-1)
+    var d2Seen    = -1L
+    var d4Seen    = -1L
+    var sawExc    = false
+    var excVec    = -1
+    compiledDut.doSim(freshSimName("fmove-fpctrl")) { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      // Past the DUT's ~82-cycle reset/init sweep before poking committed state (the
+      // MmuControlPlugin lesson recorded above: an earlier poke is just reset-clobbered).
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.usp #= 0x00200000L
+      dut.rob.logic.exc.ss.srSys #= 0x00           // USER mode -- the point of the test
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15
+      dut.wire.logic.seedData #= BigInt(0x00200000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      // Watch the ALU EUs for the two downstream exposing moves (D2 = FPCR read-back,
+      // D4 = FPIAR read-back).
+      def snoop(w: m68k040.execute.WbObs): Unit =
+        if (w.valid.toBoolean && w.intWrite.toBoolean) {
+          val a = w.dstArch.toInt
+          if (a == 2) d2Seen = w.result.toLong & 0xffffffffL
+          if (a == 4) d4Seen = w.result.toLong & 0xffffffffL
+        }
+      var guard = 0
+      while (guard < 900) {
+        if (dut.rob.logic.exceptionPending.toBoolean && !sawExc) {
+          sawExc = true; excVec = dut.rob.logic.exceptionVector.toInt
+        }
+        snoop(dut.eu0.logic.wbObs); snoop(dut.eu1.logic.wbObs)
+        cd.waitSampling(); guard += 1
+      }
+      fpcrSeen  = dut.fpuCtl.logic.fpcr.toBigInt
+      fpiarSeen = dut.fpuCtl.logic.fpiar.toBigInt
+      fpsrSeen  = dut.fpuCtl.logic.fpsr.toBigInt
+    }
+    assert(!sawExc,
+      s"FMOVE to/from an FP CONTROL register is a USER instruction -- it must not trap; got vector $excVec")
+    assert(fpcrSeen == 0x30, s"FPCR should hold 0x30 after FMOVE.L D0,FPCR; got 0x${fpcrSeen.toString(16)}")
+    assert(fpiarSeen == 0xAB, s"FPIAR should hold 0xAB after FMOVE.L D5,FPIAR; got 0x${fpiarSeen.toString(16)}")
+    assert(fpsrSeen == 0, s"FPSR was never written and must still be 0; got 0x${fpsrSeen.toString(16)}")
+    assert(d2Seen == 0x30L, f"FMOVE.L FPCR,D1 read-back (via D2) should be 0x30; got 0x$d2Seen%08X")
+    assert(d4Seen == 0xABL, f"FMOVE.L FPIAR,D3 read-back (via D4) should be 0xAB; got 0x$d4Seen%08X")
   }
 
   test("CPUSHA in USER mode raises a vector-8 privilege violation", VerilatorTest) {

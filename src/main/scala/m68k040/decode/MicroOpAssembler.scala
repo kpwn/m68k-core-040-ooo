@@ -1545,6 +1545,42 @@ object MicroOpAssembler {
     // "FADD.P #imm,FPn" (a native opmode paired with a non-native format) is excluded too.
     val fpImmIsPacked  = fpSrcSpec === B"3'b011"
 
+    // ── Task 9: FMOVE.L <ea>,FPcr / FPcr,<ea>  (FPCR / FPSR / FPIAR) ────────────
+    // opclass (ext[15:13]) 100 = <ea> -> control register(s), 101 = control register(s)
+    // -> <ea>; ext[12:10] -- the SAME field `fpSrcSpec` names for the arithmetic forms --
+    // is a one-hot register-select MASK {FPCR, FPSR, FPIAR}, MSB first. Encoding verified
+    // by direct toolchain assembly (see SysKind.FMOVE_FPCTRL's comment for the full
+    // table). This is a COMMIT-TIME SYSTEM op, not an FP-EU op: FPCR/FPSR/FPIAR are
+    // non-renamed single-copy state (spec Decision 5), so ExceptionUnit's S_APPLY owns
+    // the access, exactly like MOVEC.
+    //
+    // SCOPE (deliberate, mirrors MOVE-to-SR's own long-standing reg-only scope at the
+    // `isSysOp` block below): exactly ONE mask bit set, and a register-direct <ea> only --
+    // mode 000 (Dn) or mode 001 (An, architecturally legal for FPIAR only; we do not
+    // police that, matching Musashi's permissiveness). Every other <ea> and every
+    // multi-bit mask falls through UNCHANGED to the line-F illegal default -> vector 11.
+    // That is the correct conservative behavior, not a gap being papered over: those
+    // forms genuinely are not implemented yet.
+    //
+    // THE `#imm` FORM IS EXPLICITLY OUT OF SCOPE, and this is an evidence-based scope
+    // NARROWING, not an oversight. `FMOVE.L #imm,FPSR` (F23C 8800 xxxxxxxx) needs BOTH a
+    // 32-bit immediate value AND the 3-bit mask to reach commit, and `imm` can carry only
+    // one of them (RobPlugin stores `u.imm(11 downto 0)` into `p.sysRc`, the only sysOp
+    // side-channel that exists). The task brief proposed folding the mask into `casForm`
+    // -- but `casForm` was checked and is NOT ROB-visible: it is threaded decode ->
+    // `RenamedUop.casForm` -> `AluEuPlugin` only, and never enters `RobPayload`. Per the
+    // brief's own instruction, the immediate form is therefore dropped here rather than
+    // having a new ROB thread invented for it; it returns with Task 9b's FMOVEM-control
+    // work, which needs a genuine multi-field side-channel regardless.
+    val fpCtrlIsTo   = fpOpClass === B"3'b100"      // <ea> -> control register
+    val fpCtrlIsFrom = fpOpClass === B"3'b101"      // control register -> <ea>
+    val fpCtrlOneReg = (fpSrcSpec === B"3'b100") || (fpSrcSpec === B"3'b010") ||
+                       (fpSrcSpec === B"3'b001")   // one-hot {FPCR, FPSR, FPIAR}
+    val fpCtrlEaReg  = (fpEaMode === U(0, 3 bits)) || (fpEaMode === U(1, 3 bits))
+    val fpCtrlEmit   = spec.fpGeneric && pkt.simple && (pkt.lenWords >= U(2)) &&
+                       !spec.microcoded &&
+                       (fpCtrlIsTo || fpCtrlIsFrom) && fpCtrlOneReg && fpCtrlEaReg
+
     val fpEmit = spec.fpGeneric && pkt.simple && (pkt.lenWords >= U(2)) &&
                  (fpFormIsMovecr ||
                   ((fpFormIsReg || fpFormIsIntReg) && fpNative) ||
@@ -1564,7 +1600,11 @@ object MicroOpAssembler {
     // Packed and every non-opclass-010 form back to a genuine vector-11 trap via
     // `FP_MEM_TRAP_ENTRY` -- the ROM, not this assembler-level gate, now owns that
     // decision for the whole memory-mode band).
-    val fpGenBad = spec.fpGeneric && !fpEmit && !spec.microcoded
+    // Task 9: `&& !fpCtrlEmit` excludes the FMOVE-to/from-control-register band this
+    // assembler now emits as a commit-time sysOp (it is cpGEN-shaped, so `spec.fpGeneric`
+    // is set and `fpEmit` is False -- without this term it would take a spurious vector-11
+    // trap instead of the sysOp it now is).
+    val fpGenBad = spec.fpGeneric && !fpEmit && !fpCtrlEmit && !spec.microcoded
 
     // ── Immediate word extraction ────────────────────────────────────────────────
     // The immediate data ALWAYS starts at pkt.words(2) (right after opword + FP ext
@@ -1796,6 +1836,62 @@ object MicroOpAssembler {
         when(fpSrcSpec === B"3'b100") { opUop.size := Size.WORD }
           .elsewhen(fpSrcSpec === B"3'b110") { opUop.size := Size.BYTE }
           .otherwise { opUop.size := Size.LONG }
+      }
+    }
+
+    // ── FMOVE.L <ea>,FPcr / FPcr,<ea> : a COMMIT-TIME SYSTEM op (Task 9) ────────
+    // Structurally identical to MOVEC's arm in the `isSysOp` block below -- same op
+    // (MOVE), same cluster (INT), same operand routing, same `imm` side-channel -- but
+    // driven from HERE rather than from `spec.sysKind`, because `OperationDecoder.decode`
+    // sees the opword only and the direction/mask live in the extension word. That is an
+    // established precedent, not a new mechanism: `isToSr` (ANDI/ORI/EORI #imm,SR, just
+    // below) sets sysOp/sysKind exactly this way with `spec.sysOp` False.
+    //
+    // The register-select mask (ext[12:10]) rides `imm[2:0]` -- the SAME side-channel
+    // MOVEC's 12-bit Rc id uses (RobPlugin stores `u.imm(11 downto 0)` into `p.sysRc`,
+    // which ExceptionUnit latches as `sysCapRc`). `useImm` STAYS FALSE so the IQ treats
+    // srcB as a REGISTER source and wakes the Rn dependency (`srcBIsReg` gates on
+    // !useImm) -- the exact constraint MOVEC's own comment calls out.
+    when(fpCtrlEmit) {
+      opUop.op            := DecOp.MOVE     // result = the source value (write direction)
+      opUop.cluster       := Cluster.INT    // NOT CPLX: no FP datapath is involved at all
+      opUop.memOp         := MemOp.NONE
+      opUop.size          := Size.LONG      // all three control registers are 32-bit
+      opUop.unimplemented := False
+      opUop.isBranch      := False
+      opUop.faulted := False; opUop.faultVector := 0; opUop.faultUsesNextPc := False
+      opUop.readsNzvc  := False; opUop.writesNzvc := False
+      opUop.readsX     := False; opUop.writesX    := False
+      // Explicitly NOT an FP-rename producer/consumer: the FPCR/FPSR/FPIAR halves are
+      // non-renamed (owned by FpuControlPlugin), and the FPSR write's FPCC nibble goes
+      // DIRECTLY into the FPCC PRF's committed physical register from ExceptionUnit
+      // (rteNzvcWriteValid's already-proven-safe pattern) rather than through a rename
+      // allocation. Keeping all four False is what makes this uop provably unable to
+      // collide with RobPlugin's sysOp-read commit block, which force-clears
+      // fpWrite/fpccWrite on `rc.commitPorts(0)`.
+      opUop.writesFp := False; opUop.writesFpcc := False
+      opUop.readsFpcc := False; opUop.fpDstReg := 0
+      opUop.sysOp      := True
+      opUop.sysKind    := SysKind.FMOVE_FPCTRL
+      opUop.sysReadDir := fpCtrlIsFrom      // True = FPcr -> Rn
+      opUop.firstOfInstr := True            // a single uop: it IS the macro boundary
+      opUop.imm    := fpSrcSpec.resize(32)  // one-hot mask in imm[2:0] (NOT useImm)
+      opUop.useImm := False
+      opUop.srcAValid := False; opUop.srcBValid := False
+      // <ea> mode 000 = Dn (arch id 0..7), mode 001 = An (arch id 8..15).
+      val fpCtrlRnId = Mux(fpEaMode === U(1, 3 bits),
+                           (U(8, 5 bits) + fpEaReg.resize(5)).resize(5),
+                           fpEaReg.resize(5))
+      when(fpCtrlIsFrom) {                  // FPcr -> Rn : a REAL renamed int dst
+        // Same treatment as MOVEC's read direction: rename allocates a pdst, the ROB
+        // commits the arch->pdst mapping at the serializing retire, and S_APPLY writes
+        // the control-register VALUE into PRF[pdst] via sysRegWrite*.
+        opUop.dstReg := fpCtrlRnId; opUop.dstValid := True
+      } otherwise {                         // Rn -> FPcr
+        // op is MOVE (result = srcB), so the ALU EU's writeback = Rn's value; the ROB
+        // captures it (sysValStore) for the commit-time FpuControlPlugin write.
+        opUop.srcBReg := fpCtrlRnId; opUop.srcBValid := True
+        opUop.dstValid := False
       }
     }
 

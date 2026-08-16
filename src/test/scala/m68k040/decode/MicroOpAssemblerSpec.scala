@@ -376,4 +376,82 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
         bad.take(10).mkString("\n"))
     }
   }
+
+  // ── Task 9: FMOVE.L <ea>,FPcr / FPcr,<ea> (FPCR / FPSR / FPIAR) ──────────────
+  // Opword/extension encodings below are the LITERAL output of
+  //   m68k-linux-gnu-as -m68040 -m68881   (Task 9 Step 1, re-run for this task):
+  //   f200 9000  fmovel %d0,%fpcr      f200 b000  fmovel %fpcr,%d0
+  //   f200 8800  fmovel %d0,%fpsr      f200 a800  fmovel %fpsr,%d0
+  //   f200 8400  fmovel %d0,%fpiar     f200 a400  fmovel %fpiar,%d0
+  //   f208 8400  fmovel %a0,%fpiar     f210 bc00  fmovel %fpiar/%fpsr/%fpcr,%a0@
+  //   f23c 8800 0000 0000  fmovel #0,%fpsr
+  // NOTE these are recognized in MicroOpAssembler, NOT OperationDecoder: `decode()` sees
+  // the opword only (it runs at I-cache refill time), and both the direction (ext[15:13])
+  // and the register mask (ext[12:10]) live in the extension word.
+  test("FMOVE.L D0,FPCR (F200 9000): sysOp/FMOVE_FPCTRL, WRITE direction, mask rides imm", VerilatorTest) {
+    run { dut => drive(dut, 0xF200, w1 = 0x9000, len = 2); sleep(1)
+      assert(!dut.uop.faulted.toBoolean, "FMOVE.L Dn,FPCR must not fault (it F-line trapped before Task 9)")
+      assert(dut.uop.sysOp.toBoolean && dut.uop.sysKind.toEnum == SysKind.FMOVE_FPCTRL)
+      assert(!dut.uop.sysReadDir.toBoolean, "ext[15:13]=100 is <ea> -> control register")
+      assert(dut.uop.imm.toLong == 0x4, "mask ext[12:10]=100 (FPCR) rides imm[2:0]")
+      assert(!dut.uop.useImm.toBoolean, "useImm MUST stay False so the IQ wakes the Rn dependency")
+      assert(dut.uop.srcBValid.toBoolean && dut.uop.srcBReg.toInt == 0, "Rn=D0 rides srcB")
+      assert(!dut.uop.dstValid.toBoolean, "a WRITE to a control register has no rename destination")
+      assert(dut.uop.op.toEnum == DecOp.MOVE, "result = srcB, captured into sysValStore by the ROB")
+      // The FP rename classes must stay untouched -- FPCR/FPSR/FPIAR are non-renamed, and
+      // the FPSR write's FPCC nibble goes DIRECTLY to the committed FPCC phys from
+      // ExceptionUnit. This is what makes the uop provably unable to collide with
+      // RobPlugin's sysOp-read commit block (which force-clears fpWrite/fpccWrite).
+      assert(!dut.uop.writesFp.toBoolean && !dut.uop.writesFpcc.toBoolean && !dut.uop.readsFpcc.toBoolean)
+    }
+  }
+  test("FMOVE.L D0,FPSR (F200 8800) / D0,FPIAR (F200 8400): mask selects the right register", VerilatorTest) {
+    run { dut =>
+      drive(dut, 0xF200, w1 = 0x8800, len = 2); sleep(1)
+      assert(dut.uop.sysOp.toBoolean && !dut.uop.sysReadDir.toBoolean && dut.uop.imm.toLong == 0x2, "FPSR mask = 010")
+      drive(dut, 0xF200, w1 = 0x8400, len = 2); sleep(1)
+      assert(dut.uop.sysOp.toBoolean && !dut.uop.sysReadDir.toBoolean && dut.uop.imm.toLong == 0x1, "FPIAR mask = 001")
+    }
+  }
+  test("FMOVE.L FPSR,D0 (F200 A800): READ direction takes a real renamed int dst", VerilatorTest) {
+    run { dut => drive(dut, 0xF200, w1 = 0xA800, len = 2); sleep(1)
+      assert(dut.uop.sysOp.toBoolean && dut.uop.sysKind.toEnum == SysKind.FMOVE_FPCTRL)
+      assert(dut.uop.sysReadDir.toBoolean, "ext[15:13]=101 is control register -> <ea>")
+      assert(dut.uop.dstValid.toBoolean && dut.uop.dstReg.toInt == 0, "Rn=D0 is the renamed dst")
+      assert(!dut.uop.srcBValid.toBoolean && !dut.uop.srcAValid.toBoolean)
+      assert(dut.uop.imm.toLong == 0x2, "FPSR mask = 010")
+    }
+  }
+  test("FMOVE.L A0,FPIAR (F208 8400): <ea> mode 001 maps An -> arch id 8..15", VerilatorTest) {
+    run { dut => drive(dut, 0xF208, w1 = 0x8400, len = 2); sleep(1)
+      assert(dut.uop.sysOp.toBoolean && !dut.uop.sysReadDir.toBoolean)
+      assert(dut.uop.srcBValid.toBoolean && dut.uop.srcBReg.toInt == 8, "A0 = arch reg 8")
+    }
+  }
+  test("FMOVE-control arm is EXT-WORD gated: 0xF200 with ext=0 still faults to vector 11", VerilatorTest) {
+    run { dut =>
+      // ext[15:13]=000 is the register-to-register ARITHMETIC form (opmode 0 = FMOVE
+      // FPm,FPn), NOT a control-register move. It must NOT be claimed as a sysOp.
+      drive(dut, 0xF200, w1 = 0x0000, len = 2); sleep(1)
+      assert(!dut.uop.sysOp.toBoolean, "opclass 000 is arithmetic, not a control-register move")
+    }
+  }
+  test("Task 9 out-of-scope FMOVE-control forms keep the vector-11 fall-through", VerilatorTest) {
+    run { dut =>
+      // (a) MULTI-register mask (the FMOVEM control-list form): F210 BC00 is the real
+      //     toolchain encoding of `fmovem.l %fpiar/%fpsr/%fpcr,(%a0)` -- mask 111.
+      //     Deferred to Task 9b. Here it is a memory <ea> too, so it defers to the µcode
+      //     engine rather than trapping at this layer; the mask-only case is F200 BC00.
+      drive(dut, 0xF200, w1 = 0xBC00, len = 2); sleep(1)
+      assert(!dut.uop.sysOp.toBoolean, "multi-register control masks are OUT of Task 9's scope")
+      assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 11)
+      // (b) The #imm form (F23C 8800 xxxx xxxx). Dropped from Task 9 because the mask and
+      //     the 32-bit immediate cannot BOTH ride `imm`, and `casForm` -- the brief's
+      //     proposed second side-channel -- was checked and is NOT ROB-visible (decode ->
+      //     RenamedUop -> AluEuPlugin only, never RobPayload). Returns with Task 9b.
+      drive(dut, 0xF23C, w1 = 0x8800, w2 = 0x0000, len = 4); sleep(1)
+      assert(!dut.uop.sysOp.toBoolean, "the #imm form is explicitly out of Task 9's scope")
+      assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 11)
+    }
+  }
 }

@@ -1193,9 +1193,16 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
         override def setDtt1   = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
         override def setMmusr  = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
       })
+    // FP control state (Task 9): the exception FSM's SysKind.FMOVE_FPCTRL arm reads and
+    // writes FPCR/FPSR/FPIAR here. OPTIONAL for exactly the same reason mmuCtrl is:
+    // standalone ROB unit DUTs (RobPluginSpec/RobFaultSpec/...) do not instantiate an
+    // FpuControlPlugin. `null` selects ExceptionUnit's own local idle null object.
+    val fpuCtrl: m68k040.services.FpuControlService =
+      host.get[m68k040.services.FpuControlService].getOrElse(null)
     val exc = new m68k040.exception.ExceptionUnit(
       ss = new m68k040.exception.SystemState,
       mmuCtrl = mmuCtrl,
+      fpuCtrlOpt = fpuCtrl,
       entryTrigger = excEntryTrigger, entryVector = excEntryVector, entryPc = excEntryPc,
       // PPC for a format-$2 group-2 trap (TRAPV/CHK/DIV0) = the trapping INSTRUCTION's
       // PC. p0.pc holds the instruction PC (variable-length safe; entryPc-2 only
@@ -1252,8 +1259,16 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     _dcacheEnabled := exc.ss.cacr(31)
     // The commit-time system op's S=1 vs S=0 split (needs exc.ss.s): S=1 supervisor ->
     // drive the S_APPLY FSM (sysTrigger); S=0 user -> a vector-8 privilege fault.
-    sysTriggerSig := sysRetire && exc.ss.s
-    sysPrivFault  := sysRetire && !exc.ss.s
+    // EXCEPTION to the "every sysOp is privileged" rule (Task 9): FMOVE to/from a
+    // floating-point CONTROL register (FPCR/FPSR/FPIAR) is a real 68040 USER instruction
+    // -- in line-F only FSAVE/FRESTORE and the MMU/cache maintenance ops are privileged,
+    // and the MC68040 UM's own FPSP prologue runs these from user code. It is a sysOp
+    // purely because FPCR/FPSR/FPIAR are non-renamed single-copy state that must be
+    // touched at a serializing retire (spec Decision 5), NOT because of privilege. So it
+    // drives the S_APPLY FSM regardless of committed S, and never raises vector 8.
+    val sysUserOk = p0.sysKind === m68k040.decode.SysKind.FMOVE_FPCTRL
+    sysTriggerSig := sysRetire && (exc.ss.s || sysUserOk)
+    sysPrivFault  := sysRetire && !exc.ss.s && !sysUserOk
     // MOVE-to-SR writes the FULL CCR (sysVal[4:0]) as an absolute value: override the
     // committed CCR when the system-op FSM applies it (so a LATER exception's stacked SR
     // low byte is correct). The FSM surfaces obsSetCcr5 on S_REDIR; apply it last-wins

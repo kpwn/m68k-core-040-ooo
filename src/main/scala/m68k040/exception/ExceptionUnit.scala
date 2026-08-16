@@ -42,6 +42,13 @@ class ExceptionUnit(
     // REVERTED — see MmuControlPlugin's doc comment for the confirmed regression
     // it caused. Those Rc values fall through to the default RAZ/WI case on write.
     mmuCtrl: m68k040.services.MmuControlService,
+    // The ONE owner of the non-renamed FP control state (FPCR / FPSR's non-FPCC bytes /
+    // FPIAR — spec Decision 5). Read AND written by the SysKind.FMOVE_FPCTRL arm of
+    // S_APPLY below, exactly like mmuCtrl is by the MOVEC arm. OPTIONAL (defaults to
+    // null -> a local idle null-object built below): the standalone `SysOpApplySpec` DUT
+    // hand-rolls its MMU mock and has no FpuControlPlugin, and must keep elaborating
+    // unchanged. RobPlugin resolves the real one via `host.get[FpuControlService]`.
+    fpuCtrlOpt: m68k040.services.FpuControlService = null,
     entryTrigger: Bool, entryVector: UInt, entryPc: UInt,
     // Format-$2 group-2 trap PPC = the trapping INSTRUCTION's PC (TRAPV/CHK/DIV0). For
     // TRAPV this equals entryPc-2 (a 2-byte op), but CHK/DIV0 are variable-length, so
@@ -167,6 +174,72 @@ class ExceptionUnit(
   // don't wire the PRF readback are NOT stomped to 0; allowOverride lets the full-core
   // wiring override it with the real committed-A7 readback.
   val committedA7In = UInt(32 bits); committedA7In.allowOverride; committedA7In := ss.a7
+
+  // ── FP control state (Task 9) ────────────────────────────────────────────────
+  // The real service if the host supplied one, else a local all-idle null object so the
+  // standalone unit DUTs keep elaborating (same OPTIONAL-service pattern RobPlugin uses
+  // for mmuCtrl/intCtrl).
+  val fpuCtrl: m68k040.services.FpuControlService =
+    if (fpuCtrlOpt != null) fpuCtrlOpt else new m68k040.services.FpuControlService {
+      override def fpcr  = U(0, 32 bits)
+      override def fpsr  = U(0, 32 bits)
+      override def fpiar = U(0, 32 bits)
+      override def setFpcr   = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
+      override def setFpsr   = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
+      override def setFpiar  = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
+      override def orFpsrExc = { val f = Flow(Bits(8 bits)); f.valid := False; f.payload := B(0, 8 bits); f }
+      override def roundingMode = B(0, 2 bits)
+      override def precision    = B(0, 2 bits)
+      override def excEnable    = B(0, 8 bits)
+    }
+  // ORDERING GUARD (loud, elaboration-time). Everything below reads `fpuCtrl.fpcr/.fpsr/
+  // .fpiar` EAGERLY (the FPSR-read splice `fpsrArch` is a plain `val`, and the S_APPLY mux
+  // is built during this constructor), so FpuControlPlugin's own `logic` Area must ALREADY
+  // have elaborated -- i.e. it must be listed BEFORE RobPlugin in the plugin Seq, exactly
+  // like MmuControlPlugin is. Getting that wrong otherwise surfaces as a bare
+  // NullPointerException from deep inside a Fiber callback, which is genuinely hard to
+  // read; fail with the actual instruction instead.
+  require(fpuCtrl.fpcr != null && fpuCtrl.fpsr != null && fpuCtrl.fpiar != null,
+    "FpuControlService resolved but its `logic` Area has not elaborated yet — list " +
+      "FpuControlPlugin BEFORE RobPlugin in the plugin Seq (same constraint MmuControlPlugin has)")
+  // A null object builds a FRESH Flow on every `setFpcr` call, so the S_APPLY arm below
+  // must bind each port ONCE and drive that binding (otherwise its `.valid := True` would
+  // land on a throwaway Flow and the surviving one would keep its idle default -- silent,
+  // and invisible in the real-service case where it happens to work). Binding here also
+  // makes the real-service case a plain reference, unchanged.
+  private val setFpcrPort  = fpuCtrl.setFpcr
+  private val setFpsrPort  = fpuCtrl.setFpsr
+  private val setFpiarPort = fpuCtrl.setFpiar
+
+  // Live COMMITTED FPCC, read back from the FPCC PRF at its committed arch->phys mapping
+  // by the full-core wiring -- byte-for-byte the `committedA7In` pattern above (an
+  // optional, allowOverride input whose default keeps every unit DUT elaborating). FPCC
+  // is RENAMED (spec Decision 4), so it is NOT in FpuControlPlugin; an architectural FPSR
+  // READ has to splice it in. Internal layout is [3:0] = {NaN, I, Z, N}
+  // (RegfileSpec.Fpcc's own doc); architectural FPSR[27:24] = {N, Z, I, NaN} is the
+  // REVERSED presentation of that group.
+  val committedFpccIn = Bits(4 bits); committedFpccIn.allowOverride; committedFpccIn := B(0, 4 bits)
+  // Architectural FPSR WRITE -> the renamed FPCC's committed physical register. Mirrors
+  // rteNzvcWriteValid/rteNzvcWriteData EXACTLY (see its doc comment below for the full
+  // argument for why a DIRECT committed-mapping write is required and a rename allocation
+  // is not): the FMOVE-to-FPSR uop keeps writesFpcc FALSE, takes no freelist pop, and the
+  // wiring writes whatever physical register fpccRat's committed mapping currently names.
+  // Safe for the same reason A7's direct write is safe: this fires only inside the
+  // SERIALIZING S_APPLY, where retire0/retire1 are blocked and the EUs are flushed, so no
+  // same-cycle multi-writer collision on that physical register is possible.
+  val fpccWriteValid = Bool();       fpccWriteValid := False;       fpccWriteValid.simPublic()
+  val fpccWriteData  = Bits(4 bits); fpccWriteData  := B(0, 4 bits); fpccWriteData.simPublic()
+
+  // FPCC internal {NaN(3), I(2), Z(1), N(0)} <-> architectural FPSR[27:24] {N,Z,I,NaN}.
+  // Both directions are the same 4-bit reversal (an involution), written out twice only
+  // so each call site reads in its own direction.
+  private def fpccToArch(internal: Bits): Bits =
+    internal(0) ## internal(1) ## internal(2) ## internal(3)   // -> {N,Z,I,NaN}
+  private def fpccFromArch(arch: Bits): Bits =
+    arch(0) ## arch(1) ## arch(2) ## arch(3)                   // -> {NaN,I,Z,N}
+  // Architectural FPSR read = the non-FPCC bytes from FpuControlPlugin (which stores 0 in
+  // [27:24] structurally) OR the live committed FPCC, reversed into arch bit order.
+  val fpsrArch = fpuCtrl.fpsr | (fpccToArch(committedFpccIn).asUInt.resize(32) |<< 24)
 
   // The store queue is drained (no committed store still heading to memory). The
   // entry FSM waits for this before stacking its frame so it never steals the
@@ -1416,6 +1489,41 @@ class ExceptionUnit(
           // like MOVE_USP's An->USP arm — see MicroOpAssembler's PTEST case).
           mmuCtrl.setMmusr.valid   := True
           mmuCtrl.setMmusr.payload := (sysCapVal.asUInt & U(0xFFFFF000L, 32 bits)) | U(1, 32 bits)
+        }
+        is(skOrd(m68k040.decode.SysKind.FMOVE_FPCTRL)) { // FMOVE <ea> <-> FPCR/FPSR/FPIAR
+          // sysCapRc[2:0] is the one-hot register-select mask {FPCR, FPSR, FPIAR}
+          // (ext[12:10], routed through the imm side-channel by MicroOpAssembler -- the
+          // same route MOVEC's 12-bit Rc id takes). Exactly one bit is set; the multi-bit
+          // (FMOVEM-control) case is not decoded at all and never reaches here.
+          //
+          // NOT PRIVILEGED, unlike every other arm in this switch: real 68040
+          // FMOVE-to/from-FPcr is a USER instruction. RobPlugin's sysTriggerSig/
+          // sysPrivFault carry the matching exclusion, so this arm can be reached with
+          // committed S == 0.
+          when(sysCapReadDir) {                   // FPcr -> Rn : write the int PRF[pdst]
+            sysRegWriteValid := True
+            sysRegWritePhys  := sysCapDstPhys
+            sysRegWriteData  := Mux(sysCapRc(2), fpuCtrl.fpcr,
+                                Mux(sysCapRc(1), fpsrArch, fpuCtrl.fpiar))
+          } otherwise {                           // Rn -> FPcr : write the committed reg
+            when(sysCapRc(2)) {
+              setFpcrPort.valid   := True
+              setFpcrPort.payload := sysCapVal.asUInt
+            }
+            when(sysCapRc(1)) {
+              // The non-FPCC bytes land in FpuControlPlugin (which masks [27:24] off
+              // itself); the FPCC nibble is reversed back to the internal layout and
+              // written DIRECTLY into the FPCC PRF's committed physical register.
+              setFpsrPort.valid   := True
+              setFpsrPort.payload := sysCapVal.asUInt
+              fpccWriteValid      := True
+              fpccWriteData       := fpccFromArch(sysCapVal(27 downto 24))
+            }
+            when(sysCapRc(0)) {
+              setFpiarPort.valid   := True
+              setFpiarPort.payload := sysCapVal.asUInt
+            }
+          }
         }
       }
       // Task P5.5: CPUSH/CINV just pulsed a maintenance command whose walk runs for
