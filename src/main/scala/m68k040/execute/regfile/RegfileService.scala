@@ -18,6 +18,13 @@ object RegfileSpec {
   val Nzvc = RegfileSpec("nzvc", 4,  16)
   val X    = RegfileSpec("x",    1,  16)
   val Fp   = RegfileSpec("fp",   80, 16)
+  // FPCC {NaN,I,Z,N} value storage for the FPCC rename class (RenameStage's
+  // fpccRat/fpccFree: 16 physical entries, 4-bit tags). Shape and role are the exact
+  // NZVC analogue: `Nzvc` above is the physical value store behind nzvcRat/nzvcFree, and
+  // this is the same thing one condition-code group over. The internal bit layout is
+  // FpResult.fpcc's {NaN(3), I(2), Z(1), N(0)}; the architectural FPSR[27:24] = {N,Z,I,NaN}
+  // presentation reversal belongs to the FPSR task, not to this storage.
+  val Fpcc = RegfileSpec("fpcc", 4,  16)
 }
 
 case class RegFileReadPort(addressWidth: Int, dataWidth: Int) extends Bundle {
@@ -56,3 +63,4 @@ trait IntRegFileService  extends RegfileService
 trait NzvcRegFileService extends RegfileService
 trait XRegFileService    extends RegfileService
 trait FpRegFileService   extends RegfileService
+trait FpccRegFileService extends RegfileService

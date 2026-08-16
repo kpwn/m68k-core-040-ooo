@@ -148,9 +148,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // completion(k).valid/payload; this ROB consumes them. Standalone tests poke
     // them in sim (simPublic). Mirrors the RenameCommitService.commitPorts wiring
     // convention (sibling-driven, directionless).
-    // 5 completion ports: ALU0, ALU1, LS EU, CPLX EU (DivEu), SQ precise-path drain
-    // (sibling-driven).
-    val completion = Vec.fill(5)(Flow(UInt(robIdW bits)))
+    // 6 completion ports: ALU0, ALU1, LS EU, CPLX EU (DivEu int/NZVC lane), SQ precise-path
+    // drain, CPLX EU FP lane (sibling-driven).
+    // Port 5 is a SEPARATE port rather than an arbitration onto port 3 because the CPLX EU's
+    // int/NZVC lane and its 80-bit FP writeback lane are structurally independent pipelines
+    // sharing only the issue port: a DIV/MUL/CHK result and an FP result can complete in the
+    // same cycle, and a completion Flow has no backpressure with which to recover a dropped
+    // one. Same reasoning that already gives the SQ drain its own port 4.
+    val completion = Vec.fill(6)(Flow(UInt(robIdW bits)))
     // Default-drive (idle) so the ROB elaborates standalone; a sibling EU-wiring
     // plugin OVERRIDES these via allowOverride, and standalone tests poke them in
     // sim (simPublic).
@@ -417,6 +422,21 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     euFaultCompletion.payload.vector.allowOverride; euFaultCompletion.payload.vector := U(0, 8 bits)
     euFaultCompletion.payload.faultAddr.allowOverride; euFaultCompletion.payload.faultAddr := U(0, 32 bits)
     euFaultCompletion.simPublic()
+    // FP enabled-trap escalation (vectors 49-54), driven by the CPLX EU's FP writeback lane.
+    // A SECOND euFault-shaped port rather than a share of the one above, for the same reason
+    // completion port 5 is separate from port 3: the int/NZVC lane and the FP lane are
+    // independent pipelines that can both fault in the same cycle, and a Flow cannot recover
+    // a dropped one. (Identical precedent: sqFaultCompletion vs lsFaultCompletion.)
+    // Inert until the FPCR/FPSR control task drives the EU's exception-ENABLE input: FPCR
+    // resets to 0 and no decode path can write it yet, so no escalation is reachable — the
+    // same "real driver, currently-constant source" state mmuEnable/iplIn were in before
+    // their own producers landed.
+    val fpFaultCompletion = Flow(m68k040.execute.EuFault())
+    fpFaultCompletion.valid.allowOverride;          fpFaultCompletion.valid := False
+    fpFaultCompletion.payload.robId.allowOverride;  fpFaultCompletion.payload.robId := U(0, robIdW bits)
+    fpFaultCompletion.payload.vector.allowOverride; fpFaultCompletion.payload.vector := U(0, 8 bits)
+    fpFaultCompletion.payload.faultAddr.allowOverride; fpFaultCompletion.payload.faultAddr := U(0, 32 bits)
+    fpFaultCompletion.simPublic()
     // Per-entry committed-CCR VALUE capture (set at completion from the EU writeback
     // values via ccrCompletion). Folded into committedCcr at retire (for the stacked
     // exception frame). RegInit False so an unwired entry contributes nothing.
@@ -901,6 +921,16 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultAddrStore(euFaultCompletion.payload.robId)  := euFaultCompletion.payload.faultAddr
       // The fault PC is already the µop's own pc/nextPc (payload capture at alloc +
       // the faultUsesNextPc read-site mux, Slice A) — no write.
+    }
+    // FP enabled-trap escalation (vectors 49-54): identical treatment to euFaultCompletion
+    // above, on its own port. Also placed BEFORE alloc-reset so alloc wins on a re-used
+    // index. faultAddr is unused for these (the vector-3 address-error case is the only
+    // entryFaultAddr reader) and the EU drives 0.
+    when(fpFaultCompletion.valid) {
+      faultedStore(fpFaultCompletion.payload.robId)    := True
+      faultVecStore(fpFaultCompletion.payload.robId)   := fpFaultCompletion.payload.vector
+      faultInstrStore(fpFaultCompletion.payload.robId) := False
+      faultAddrStore(fpFaultCompletion.payload.robId)  := fpFaultCompletion.payload.faultAddr
     }
 
     when(alloc0) {

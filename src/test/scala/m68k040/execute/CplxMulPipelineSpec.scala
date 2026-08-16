@@ -188,6 +188,16 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       uop.pXDst := 0
       uop.writesX := False
       uop.pXOld := 0
+      // FP-domain fields: the CPLX EU now also carries the FP writeback lane and reads these
+      // on every issued uop, so they must be DRIVEN (not left floating) even though no uop in
+      // this spec is an FP uop. Inert values -- op is never DecOp.FPU here.
+      uop.pFpSrcA := 0; uop.psrcAFpValid := False
+      uop.pFpSrcB := 0; uop.psrcBFpValid := False
+      uop.pFpDst := 0; uop.pFpDstValid := False; uop.pFpOld := 0
+      uop.pFpccSrc := 0; uop.readsFpcc := False
+      uop.pFpccDst := 0; uop.writesFpcc := False; uop.pFpccOld := 0
+      uop.fpuOp := 0; uop.fpSrcKind := m68k040.decode.FpSrcKind.FPREG
+      uop.fpSrcFmt := 0; uop.fpWideImm := B(0, 80 bits)
 
       ctx.robId := iRob
       eu.issue.valid := iValid
@@ -269,7 +279,11 @@ class CplxMulPipelineSpec extends AnyFunSuite {
     val rfNzvc = new RegFilePluginNzvc
     val eu = new DivEuPlugin
     val src = new Src
-    db.on { host.asHostOf(Seq[FiberPlugin](rfInt, rfNzvc, eu, src)) }
+    // The CPLX EU now also carries the FP writeback lane, so its FP-data/FPCC physical
+    // files must be present for it to elaborate. Unused by this spec.
+    val rfFp   = new m68k040.execute.regfile.RegFilePluginFp
+    val rfFpcc = new m68k040.execute.regfile.RegFilePluginFpcc
+    db.on { host.asHostOf(Seq[FiberPlugin](rfInt, rfNzvc, rfFp, rfFpcc, eu, src)) }
   }
 
   private def signedValue(value: BigInt, bits: Int): BigInt = {

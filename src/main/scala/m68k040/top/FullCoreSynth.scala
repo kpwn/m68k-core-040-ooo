@@ -12,7 +12,8 @@ import m68k040.dispatch.DispatchPlugin
 import m68k040.rob.RobPlugin
 import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin, DivEuPlugin}
 import m68k040.execute.iq.{IssueQueuePlugin, IssueQueueService}
-import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
+import m68k040.execute.regfile.{RegFilePluginFp, RegFilePluginFpcc, RegFilePluginInt,
+  RegFilePluginNzvc, RegFilePluginX}
 import m68k040.services.{CommitTraceService, DecodeUopService, RedirectService}
 import spinal.core._
 import spinal.lib._
@@ -232,6 +233,19 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // CMP2/CHK2) wakes a flag-reader of its NZVC. Mirrors lsNzvcWakeup below.
     iq.cplxNzvcWakeup.valid   := divEu.wakeupNzvc.valid
     iq.cplxNzvcWakeup.payload := divEu.wakeupNzvc.payload
+    // ── CPLX FP writeback lane ──
+    // A structurally independent second lane out of the SAME EU: its own ROB completion
+    // port (5), its own FP-data/FPCC dynamic wakeups, and its own enabled-trap fault port.
+    // It shares only the CPLX issue port with DIV/MUL/CHK/CMP2/CHK2, so none of the wiring
+    // above changes. (The 80-bit result cannot ride the existing 32-bit completion lane.)
+    rob.logic.completion(5).valid   := divEu.fpCompletion.valid
+    rob.logic.completion(5).payload := divEu.fpCompletion.payload
+    iq.cplxFpWakeup.valid     := divEu.fpWakeup.valid
+    iq.cplxFpWakeup.payload   := divEu.fpWakeup.payload
+    iq.cplxFpccWakeup.valid   := divEu.fpccWakeup.valid
+    iq.cplxFpccWakeup.payload := divEu.fpccWakeup.payload
+    rob.logic.fpFaultCompletion.valid   := divEu.fpFault.valid
+    rob.logic.fpFaultCompletion.payload := divEu.fpFault.payload
     // DivEu euFault shares the generalized ROB euFaultCompletion with the branch EU's
     // TRAPV. They are mutually exclusive in practice (different EUs, single-outstanding),
     // but to be safe the branch EU's fault takes priority via last-driver: drive the
@@ -432,6 +446,11 @@ object GenFullCoreSynthVerilog {
           new RegFilePluginInt(),
           new RegFilePluginNzvc(),
           new RegFilePluginX(),
+          // FP data (80x16) + FPCC (4x16) physical files. Deferred from the FP-regfile
+          // task, which had no writer yet (RegFilePlugin asserts on a file with zero write
+          // ports); the CPLX EU's FP writeback lane is that writer.
+          new RegFilePluginFp(),
+          new RegFilePluginFpcc(),
           new BackendWiringPlugin(eu0, eu1, branchEu, lsEu, divEu)
         )).setDefinitionName("M68kFullCoreSynth")
       }

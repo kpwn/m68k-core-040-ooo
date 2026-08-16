@@ -10,7 +10,8 @@ import m68k040.rename.RenameStage
 import m68k040.rob.RobPlugin
 import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin, DivEuPlugin}
 import m68k040.execute.iq.{IssueQueuePlugin, IssueQueueService}
-import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
+import m68k040.execute.regfile.{RegFilePluginFp, RegFilePluginFpcc, RegFilePluginInt,
+  RegFilePluginNzvc, RegFilePluginX}
 import m68k040.services.{RedirectService, DTranslationService}
 import spinal.core._
 import spinal.core.sim._
@@ -95,6 +96,18 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     // (this class is a DELIBERATE DUPLICATION, per the class-doc comment above).
     iq.cplxNzvcWakeup.valid   := divEu.wakeupNzvc.valid
     iq.cplxNzvcWakeup.payload := divEu.wakeupNzvc.payload
+    // CPLX FP writeback lane (mirrors top/FullCoreSynth): its own ROB completion port,
+    // FP-data/FPCC dynamic wakeups, and enabled-trap fault port. Required even for a DUT
+    // that runs no FP code today -- an F-line encoding that decode now emits as a real FP
+    // uop would otherwise never complete and would wedge the ROB head.
+    rob.logic.completion(5).valid   := divEu.fpCompletion.valid
+    rob.logic.completion(5).payload := divEu.fpCompletion.payload
+    iq.cplxFpWakeup.valid     := divEu.fpWakeup.valid
+    iq.cplxFpWakeup.payload   := divEu.fpWakeup.payload
+    iq.cplxFpccWakeup.valid   := divEu.fpccWakeup.valid
+    iq.cplxFpccWakeup.payload := divEu.fpccWakeup.payload
+    rob.logic.fpFaultCompletion.valid   := divEu.fpFault.valid
+    rob.logic.fpFaultCompletion.payload := divEu.fpFault.payload
     when(divEu.euFault.valid) {
       rob.logic.euFaultCompletion.valid   := True
       rob.logic.euFaultCompletion.payload := divEu.euFault.payload
@@ -279,6 +292,8 @@ class FuzzCoreDut extends Component {
   val rfInt  = new RegFilePluginInt
   val rfNzvc = new RegFilePluginNzvc
   val rfX    = new RegFilePluginX
+  val rfFp   = new RegFilePluginFp
+  val rfFpcc = new RegFilePluginFpcc
   val wire   = new FuzzWiringPlugin(eu0, eu1, branchEu, lsEu, divEu)
   db.on { host.asHostOf(Seq[FiberPlugin](
     new ParamPlugin(M68kParams()),
@@ -287,7 +302,7 @@ class FuzzCoreDut extends Component {
     itlb,
     dtlb,
     icache, dcache, btb, ftb, ras, gsh, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
-    rfInt, rfNzvc, rfX, wire)) }
+    rfInt, rfNzvc, rfX, rfFp, rfFpcc, wire)) }
 }
 
 object FuzzDut {

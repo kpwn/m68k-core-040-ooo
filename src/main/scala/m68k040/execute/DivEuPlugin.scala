@@ -1,9 +1,10 @@
 package m68k040.execute
 
-import m68k040.decode.DecOp
+import m68k040.decode.{DecOp, FpSrcKind}
+import m68k040.execute.fpu.{FpExcFlags, FpResult, FpSource, FpuCore}
 import m68k040.execute.iq.IqContext
-import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService,
-  RegFileReadPort, RegFileWritePort, RegFileBypassPort}
+import m68k040.execute.regfile.{FpccRegFileService, FpRegFileService, IntRegFileService,
+  NzvcRegFileService, RegFileReadPort, RegFileWritePort, RegFileBypassPort}
 import m68k040.isa.Size
 import spinal.core._
 import spinal.core.sim._
@@ -26,6 +27,27 @@ trait DivEuService {
   /** Execute-time conditional fault (CHK -> vector 6, DIV0 -> vector 5). The ROB
     * consumes it like the branch EU's trapvFault (generalized euFault). */
   def euFault: Flow[EuFault]
+  // ── FP writeback lane (structurally independent of everything above) ──────────
+  // The existing `completion`/`wakeup`/`euFault` trio is the 32-bit int/NZVC lane and is
+  // UNCHANGED. An 80-bit FP result cannot ride it (`CplxResult.data` and the `compData`
+  // completion register are hardcoded 32-bit, and unlike MULHI's 2x32 crack there is no
+  // 32-bit destination file to crack INTO -- FP's destination is a new 80-bit regfile with
+  // its own natural width), so the FP result gets its own descriptor pipe, its own
+  // completion register, its own ROB completion port and its own regfile write ports,
+  // sharing only the single CPLX issue port. The structural precedent is the MUL lane's
+  // independence, not MULHI's chunking.
+  /** robId of a completing FP op (its own ROB completion port -- a same-cycle int and FP
+    * completion is possible and neither may be dropped on a non-backpressured Flow). */
+  def fpCompletion: Flow[UInt]
+  /** pFpDst of a completing FP op (IQ `cplxFpWakeup`; 4-bit FP tag space). */
+  def fpWakeup: Flow[UInt]
+  /** pFpccDst of a completing FP op (IQ `cplxFpccWakeup`). SEPARATE from `fpWakeup`:
+    * FCMP/FTST write FPCC with no FP destination at all. */
+  def fpccWakeup: Flow[UInt]
+  /** Enabled-trap escalation for an FP arithmetic exception (vectors 49-54). Distinct from
+    * `euFault` so an FP escalation and a same-cycle CHK/DIV0 fault cannot collide on one
+    * non-backpressured Flow. */
+  def fpFault: Flow[EuFault]
   /** Mispredict/exception squash (the RedirectService doFlush pulse). A MULTI-CYCLE
     * op (DIV/MUL) in flight when a flush hits is WRONG-PATH: its late completion
     * would land after the ROB reuses its robId. The fixed pipeline and result queues
@@ -77,6 +99,31 @@ case class CplxResult() extends Bundle {
   val mul64       = Bool()
 }
 
+/** Pruned descriptor that follows an in-flight FP operation, mirroring MulPipeContext's
+  * role exactly: result ROUTING metadata only, no operand values (FpuCore holds those) and
+  * no operation selector (the op is already inside FpuCore's own pipe, and the rounding mode
+  * travels with the request inside `FpRoundReq.rmode`). */
+case class FpPipeContext() extends Bundle {
+  val robId     = UInt(6 bits)
+  val pdst      = UInt(4 bits)   // FP data physical dest (RenamedUop.pFpDst)
+  val pdstValid = Bool()         // False for FCMP/FTST (FPCC-only ops)
+  val pFpccDst  = UInt(4 bits)
+  val fpccWrite = Bool()
+}
+
+/** MC68040 FP arithmetic exception vectors (UM Table 8-1 / exception vector assignments).
+  * Only reachable via the FPCR enable byte, i.e. only when a program explicitly asked for
+  * the trap; the hardware-native OVFL/UNFL substitution (design Decision 10) already
+  * produced a usable result inside FpuCore for the ordinary, non-enabled case. */
+object FpVector {
+  val Inex   = 49
+  val Dz     = 50
+  val Unfl   = 51
+  val Operr  = 52
+  val Ovfl   = 53
+  val Snan   = 54
+}
+
 /** CPLX execution unit: fixed-latency II=1 MUL, CHK/CMP2, and iterative DIV.
   *
   * The iterative/legacy lane remains single-outstanding, but MUL owns an independent
@@ -106,12 +153,37 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
   var nzvcW: RegFileWritePort = null; var nzvcByp: RegFileBypassPort = null
   var nzvcRd: RegFileReadPort = null  // CMP2/CHK2 old-NZVC read (preserve N/V in the RMW)
   var flushSig: Bool = null
+  // ---- FP lane ports ----
+  var fpCompletionPort: Flow[UInt] = null
+  var fpWakeupPort: Flow[UInt]     = null
+  var fpccWakeupPort: Flow[UInt]   = null
+  var fpFaultPort: Flow[EuFault]   = null
+  var fpRdA, fpRdB: RegFileReadPort = null
+  var fpW: RegFileWritePort   = null
+  var fpccW: RegFileWritePort = null
+  /** FPCR[5:4] rounding mode (0=RN 1=RZ 2=RM 3=RP), sampled at ISSUE and carried with the
+    * request inside FpuCore, so an FPCR write landing mid-flight cannot re-mux an
+    * already-issued result. Default-driven RN (allowOverride) — which is not a placeholder
+    * but the architecturally correct value today: FPCR resets to 0 and no decode path can
+    * write it until the FPCR/FPSR control task lands. THIS IS THAT TASK'S INTEGRATION
+    * POINT: drive it from FpuControlPlugin's live FPCR and nothing else here changes. */
+  var fpRmodeIn: Bits = null
+  /** FPCR[15:8] exception-ENABLE byte, in FpExcFlags field order. Same contract as
+    * `fpRmodeIn`: default all-clear (the FPCR reset value, and unwritable until the
+    * FPCR/FPSR task), overridden by FpuControlPlugin. Gates `fpFault` escalation ONLY —
+    * the ordinary substituted OVFL/UNFL result is produced inside FpuCore and must NOT
+    * trap, or every overflow re-introduces the per-op trap cost this design removes. */
+  var fpExcEnableIn: FpExcFlags = null
 
   override def issue: Stream[IqContext] = issuePort
   override def completion: Flow[UInt]   = completionPort
   override def wakeup: Flow[UInt]       = wakeupPort
   override def wakeupNzvc: Flow[UInt]   = wakeupNzvcPort
   override def euFault: Flow[EuFault]   = euFaultPort
+  override def fpCompletion: Flow[UInt] = fpCompletionPort
+  override def fpWakeup: Flow[UInt]     = fpWakeupPort
+  override def fpccWakeup: Flow[UInt]   = fpccWakeupPort
+  override def fpFault: Flow[EuFault]   = fpFaultPort
   override def cplxFlush: Bool          = flushSig
 
   during setup {
@@ -132,6 +204,29 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val nz = host[NzvcRegFileService]
     nzvcW = nz.newWrite(latency = 1); nzvcByp = nz.newBypass()
     nzvcRd = nz.newRead(forceNoBypass = false)   // CMP2/CHK2 reads old N/V to preserve them
+    // ---- FP lane ----
+    fpCompletionPort = Flow(UInt(6 bits))
+    fpWakeupPort     = Flow(UInt(4 bits))
+    fpccWakeupPort   = Flow(UInt(4 bits))
+    fpFaultPort      = Flow(EuFault()); fpFaultPort.simPublic()
+    fpRmodeIn = Bits(2 bits); fpRmodeIn.allowOverride; fpRmodeIn := B"2'b00"
+    fpExcEnableIn = FpExcFlags()
+    fpExcEnableIn.flatten.foreach(_.allowOverride)
+    fpExcEnableIn.clearExc()
+    val fprf = host[FpRegFileService]
+    // NO bypass port on either FP file, deliberately. The int/NZVC files need one because a
+    // STATIC latency-1 scoreboard wakeup can put a consumer's regfile read in the very cycle
+    // of the producer's write. Every FP consumer instead waits on a DYNAMIC completion
+    // wakeup (`cplxFpWakeup`/`cplxFpccWakeup`, IssueQueuePlugin's cplxFpWait/cplxFpccWait):
+    // the wakeup clears a REGISTERED wait bit, the woken slot can be selected no earlier
+    // than the next cycle, and the CPLX issue Stream is itself registered -- so the earliest
+    // possible dependent read is two cycles after the write port fires, by which time the
+    // synchronous Mem write has landed. An 80-bit bypass comparator/mux on every FP read
+    // would be pure area for an unreachable case.
+    fpRdA = fprf.newRead(forceNoBypass = true)   // FPn (the destination, read back for dyadic ops)
+    fpRdB = fprf.newRead(forceNoBypass = true)   // FPm (fpSrcKind === FPREG only)
+    fpW   = fprf.newWrite(latency = 1)
+    fpccW = host[FpccRegFileService].newWrite(latency = 1)
   }
 
   val logic = during build new Area {
@@ -152,14 +247,31 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val s1Valid = RegInit(False)
     val issueIsMul   = u0.op === DecOp.MUL
     val issueIsMulHi = u0.op === DecOp.MULHI
+    // FP: exactly one DecOp for the whole F-line family, so the SPECIFIC operation (and
+    // therefore which of FpuCore's two lanes it lands on) comes from the raw ISA opmode.
+    val issueIsFp      = u0.op === DecOp.FPU
+    val fpOpIsIter     = FpSource.isIterativeOpmode(u0.fpuOp)
+    val issueIsFpIter  = issueIsFp && fpOpIsIter        // FDIV / FSQRT -> single-context lane
+    val issueIsFpFixed = issueIsFp && !fpOpIsIter       // everything else -> II=1 fixed pipe
+    val fpIterBusy     = RegInit(False)
     val mulCanAccept = Bool(); mulCanAccept.allowOverride; mulCanAccept := False
     val mulHiAvailable = Bool(); mulHiAvailable.allowOverride; mulHiAvailable := False
     // The IQ connection is a non-collapsing registered Stream.  When its current
     // valid is low, stale payload bits must not hold ready low or the IQ cannot load
     // a new lane-eligible candidate behind an active divider.
+    //
+    // The FP fixed lane accepts UNCONDITIONALLY (no credit gate, unlike MUL's result FIFO):
+    // its result lands in a dedicated 1-cycle completion register that is re-armed every
+    // cycle, so a back-to-back II=1 FP stream never needs one. The FP ITERATIVE lane is
+    // single-context, exactly like DivUnit, and `fpIterBusy` also stays set across a
+    // FLUSHED iterative op until FpDivSqrtCore is genuinely free again (see the iterAck
+    // contract below) -- which is precisely what makes the gate correct rather than
+    // optimistic.
     issuePort.ready := !flushSig && (!issuePort.valid || Mux(issueIsMul,
       mulCanAccept,
-      Mux(issueIsMulHi, mulHiAvailable, !busy && !s1Valid)))
+      Mux(issueIsMulHi, mulHiAvailable,
+      Mux(issueIsFpFixed, True,
+      Mux(issueIsFpIter, !fpIterBusy, !busy && !s1Valid)))))
 
     // ---- debug-only observability (task #139 CMP2/CHK2 hang investigation) ----
     // Zero synth impact (sim tap only, not referenced by any RTL logic).
@@ -175,9 +287,11 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val s1Nzvc  = Reg(Bits(4 bits))    // old {N,Z,V,C} for the CMP2/CHK2 RMW
     val u1 = s1Ctx.uop
 
-    // Main MUL and MULHI have independent pipelines/queues below.  Every other
+    // Main MUL, MULHI and FP have independent pipelines/queues below.  Every other
     // operation captures the legacy lane context and clears it explicitly on use.
-    when(issuePort.fire && !issueIsMul && !issueIsMulHi) {
+    // (An FP uop MUST be excluded here: the legacy FSM's defensive `otherwise` arm would
+    // otherwise complete it a second time, on the int lane, with its robId.)
+    when(issuePort.fire && !issueIsMul && !issueIsMulHi && !issueIsFp) {
       s1Valid := True
       s1Ctx   := issuePort.payload
       s1A     := s0A
@@ -518,6 +632,226 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val mulHiHead = mulHiPendingQ.io.pop.payload
     val mulHiHeadReady = mulHiPendingQ.io.pop.valid && mulHiValid(mulHiHead.robId)
     val mulHiData = mulHiMem.readAsync(mulHiHead.robId)
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // FP LANE. A second, fully parallel writeback lane: its own descriptor pipe, its
+    // own completion register, its own ROB completion / regfile write / wakeup / fault
+    // ports. It shares ONLY the single CPLX issue port with DIV/MUL/CHK/CMP2/CHK2, so
+    // nothing above this point changes behaviour for a non-FP uop.
+    // ═════════════════════════════════════════════════════════════════════════
+    val fpu = new FpuCore()
+
+    // ---- S0: source-operand gateway ----------------------------------------
+    // FPn (the destination read back, dyadic ops only) and FPm (fpSrcKind === FPREG).
+    fpRdA.addr := u0.pFpSrcA
+    fpRdB.addr := u0.pFpSrcB
+
+    // The INT-register-borne source kinds all read the ORDINARY int PRF ports this EU
+    // already holds. `rdH`'s address is `u0.psrcC` UNCONDITIONALLY (line above, shared with
+    // DIVL's 64-bit dividend high word and CMP2/CHK2's compared Rn), so MEMEXT's third
+    // chunk needs no new port and no mutual-exclusion argument at all: there is exactly one
+    // port, its address expression is the same in every case, and only the DOWNSTREAM
+    // consumer differs. Same for rdA/rdB. Note `rdB.data` is used RAW rather than `s0B`:
+    // the microcode-emitted FP rows set useImm=True to carry the packed FP command word,
+    // which would otherwise mux the int immediate over the real T1 chunk.
+    // Byte/Word integer sources are SIGNED (Musashi m68kfpu.c:1221-1222,1234-1235 reads
+    // them as sint16/sint8 before int32_to_floatx80); the width selector is `fpSrcFmt`,
+    // NOT `size`, because the microcode memory path leaves `size` at its ROM-row default.
+    val fpFmt = u0.fpSrcFmt
+    val fpIntFromReg = fpFmt.mux(
+      B"3'b100" -> rdA.data(15 downto 0).asSInt.resize(32).asBits,   // Word, sign-extended
+      B"3'b110" -> rdA.data( 7 downto 0).asSInt.resize(32).asBits,   // Byte, sign-extended
+      default   -> rdA.data)                                          // Long (000) / unused
+    // One converter instance per FORMAT, with the register-vs-immediate choice muxed on the
+    // INPUT side -- three conversion cones, not six.
+    val fpIntIn = Mux(u0.fpSrcKind === FpSrcKind.INTIMM, u0.fpWideImm(31 downto 0), fpIntFromReg)
+    val fpSglIn = Mux(u0.fpSrcKind === FpSrcKind.SINGLEIMM, u0.fpWideImm(31 downto 0), rdA.data)
+    val fpDblIn = Mux(u0.fpSrcKind === FpSrcKind.DOUBLEIMM, u0.fpWideImm(63 downto 0),
+                                                            rdA.data ## rdB.data)
+    val fpFromInt = FpSource.intToExtended(fpIntIn)
+    val fpFromSgl = FpSource.singleToExtended(fpSglIn)
+    val fpFromDbl = FpSource.doubleToExtended(fpDblIn)
+    val fpSrcVal = u0.fpSrcKind.mux(
+      FpSrcKind.FPREG     -> fpRdB.data,
+      // INTREG covers BOTH `F<op>.<fmt> Dn,FPn` and the 1-chunk memory formats (the crack's
+      // load already parked the value in a temp int reg, making the two indistinguishable).
+      // Single (fmt 001) is a 32-bit BIT PATTERN, not an integer.
+      FpSrcKind.INTREG    -> Mux(fpFmt === B"3'b001", fpFromSgl, fpFromInt),
+      FpSrcKind.INTIMM    -> fpFromInt,
+      FpSrcKind.SINGLEIMM -> fpFromSgl,
+      FpSrcKind.DOUBLEIMM -> fpFromDbl,
+      // Extended immediate / Extended memory load: the internal Fp80 layout already.
+      // MEMEXT is pure bit placement -- {T0[31:16], T1, T2} IS the 80-bit value.
+      FpSrcKind.EXTIMM    -> u0.fpWideImm,
+      FpSrcKind.MEMPAIR   -> fpFromDbl,
+      FpSrcKind.MEMEXT    -> (rdA.data(31 downto 16) ## rdB.data ## rdH.data),
+      // ROMCONST (FMOVECR): no source operand at all -- io.cromSel carries the ROM offset.
+      FpSrcKind.ROMCONST  -> B(0, 80 bits))
+
+    val fpAccept     = issuePort.fire && issueIsFp
+    val fpFixedStart = fpAccept && issueIsFpFixed
+    val fpIterStart  = fpAccept && issueIsFpIter
+
+    fpu.io.start   := fpAccept
+    fpu.io.op      := FpSource.opmodeToFpOp(u0.fpuOp, u0.fpSrcKind === FpSrcKind.ROMCONST)
+    fpu.io.dst     := fpRdA.data
+    fpu.io.src     := fpSrcVal
+    fpu.io.rmode   := fpRmodeIn
+    fpu.io.cromSel := u0.fpuOp        // meaningful only when fpSrcKind === ROMCONST
+
+    def loadFpCtx(c: FpPipeContext): Unit = {
+      c.robId     := issuePort.payload.robId
+      c.pdst      := u0.pFpDst
+      c.pdstValid := u0.pFpDstValid
+      c.pFpccDst  := u0.pFpccDst
+      c.fpccWrite := u0.writesFpcc
+    }
+
+    // ---- fixed lane: a descriptor shadow pipe, sized from FpuCore.FixedLatency ----
+    // Identical construction to mulCtx/mulCtxValid above (load index 0 at start, shift up,
+    // read `.last` on done); FpuCore.io.doneFixed is an unconditional 1-cycle pulse exactly
+    // FixedLatency cycles after an accepted start, in issue order, so `.last` is the
+    // matching descriptor by construction.
+    val fpFixedCtx      = Vec.fill(FpuCore.FixedLatency)(Reg(FpPipeContext()))
+    val fpFixedCtxValid = Vec.fill(FpuCore.FixedLatency)(RegInit(False))
+    fpFixedCtxValid(0) := fpFixedStart
+    when(fpFixedStart) { loadFpCtx(fpFixedCtx(0)) }
+    for (i <- 1 until FpuCore.FixedLatency) {
+      fpFixedCtxValid(i) := fpFixedCtxValid(i - 1)
+      when(fpFixedCtxValid(i - 1)) { fpFixedCtx(i) := fpFixedCtx(i - 1) }
+    }
+    when(flushSig) { fpFixedCtxValid.foreach(_ := False) }
+
+    // ---- iterative lane: ONE held context for its whole data-dependent duration ----
+    val fpIterCtx = Reg(FpPipeContext())
+    // FpDivSqrtCore has NO flush/abort input, by design (it is deliberately ROB-unaware).
+    // Its `done` is a LEVEL held until `ack`, and `busy` stays high across that hold, so a
+    // flushed FDIV/FSQRT MUST STILL BE ACKNOWLEDGED when its real `doneIter` eventually
+    // arrives or the iterative engine wedges for the rest of the program. Therefore a flush
+    // does NOT clear `fpIterBusy` (which would make `fpIterDone` -- and with it `iterAck` --
+    // unreachable forever); it sets this sticky POISON bit instead, which suppresses only
+    // the architectural side effects. `fpIterBusy` then clears on the real completion, at
+    // which point the lane is genuinely reusable.
+    val fpIterFlushed = RegInit(False)
+    when(fpIterStart) {
+      fpIterBusy := True
+      fpIterFlushed := False
+      loadFpCtx(fpIterCtx)
+    }
+    when(flushSig && fpIterBusy) { fpIterFlushed := True }
+
+    // ---- completion arbitration, FP-internal only ----
+    // The fixed lane cannot be back-pressured (its `doneFixed` is an unconditional pulse) so
+    // it wins; the iterative lane CAN wait (its `done` is a held level) so it retries next
+    // cycle. Starvation is bounded rather than merely unlikely: an FP op younger than the
+    // in-flight FDIV cannot retire ahead of it, so a continuous fixed-FP stream fills the
+    // 64-entry ROB, dispatch stalls, `doneFixed` goes quiet, and the iterative result lands.
+    val fpFixedDone = fpu.io.doneFixed && fpFixedCtxValid.last
+    val fpIterDone  = fpu.io.doneIter && fpIterBusy
+    // Acknowledge exactly when the result is CONSUMED: written back, or discarded because it
+    // is wrong-path. Never on a cycle when the fixed lane took the writeback register and the
+    // iterative result still has to be delivered -- that would silently drop it.
+    val fpIterTake  = fpIterDone && (fpIterFlushed || flushSig || !fpFixedDone)
+    fpu.io.iterAck := fpIterTake
+    when(fpIterTake) { fpIterBusy := False; fpIterFlushed := False }
+
+    // A second, independent completion register. compValid/compData/... above remain
+    // exclusively the int/NZVC 32-bit path and are untouched by this lane.
+    val fpCompValid     = RegInit(False)
+    val fpCompRobId     = Reg(UInt(6 bits))
+    val fpCompPdst      = Reg(UInt(4 bits))
+    val fpCompPdstValid = RegInit(False)
+    val fpCompData      = Reg(Bits(80 bits))
+    val fpCompFpccDst   = Reg(UInt(4 bits))
+    val fpCompFpccWrite = RegInit(False)
+    val fpCompFpcc      = Reg(Bits(4 bits))
+    val fpCompFault     = RegInit(False)
+    val fpCompFaultVec  = Reg(UInt(8 bits))
+    fpCompValid := False
+    fpCompFault := False
+
+    // Enabled-trap escalation. FpuCore has no fault output at all: the OVFL/UNFL
+    // SUBSTITUTION (design Decision 10) already happened inside it and `res.value` is the
+    // substituted result, which is the whole point -- the baseline path must never trap, or
+    // every overflow re-introduces the per-op trap cost this design exists to remove. Only a
+    // program that explicitly set the matching FPCR enable bit gets vectored here.
+    // Priority is the MC68040's simultaneous-exception order (SNAN, OPERR, OVFL, UNFL, DZ,
+    // INEX); BSUN is a branch-side condition and INEX1 is packed-decimal-only, so neither
+    // can originate in this lane and neither is present in FpExcFlags.
+    // Evaluated unconditionally (once per FpuCore result port) rather than inside the
+    // capture branch, so `vec` is a plain fully-driven combinational signal.
+    case class FpEscalation() extends Bundle { val esc = Bool(); val vec = UInt(8 bits) }
+    def fpEscalation(res: FpResult): FpEscalation = {
+      val en = fpExcEnableIn
+      val r  = FpEscalation()
+      r.esc := (res.exc.snan  && en.snan)  || (res.exc.operr && en.operr) ||
+               (res.exc.ovfl  && en.ovfl)  || (res.exc.unfl  && en.unfl)  ||
+               (res.exc.dz    && en.dz)    || (res.exc.inex2 && en.inex2)
+      when(res.exc.snan && en.snan)          { r.vec := U(FpVector.Snan,  8 bits) }
+        .elsewhen(res.exc.operr && en.operr) { r.vec := U(FpVector.Operr, 8 bits) }
+        .elsewhen(res.exc.ovfl  && en.ovfl)  { r.vec := U(FpVector.Ovfl,  8 bits) }
+        .elsewhen(res.exc.unfl  && en.unfl)  { r.vec := U(FpVector.Unfl,  8 bits) }
+        .elsewhen(res.exc.dz    && en.dz)    { r.vec := U(FpVector.Dz,    8 bits) }
+        .otherwise                           { r.vec := U(FpVector.Inex,  8 bits) }
+      r
+    }
+    val fpEscFixed = fpEscalation(fpu.io.resFixed)
+    val fpEscIter  = fpEscalation(fpu.io.resIter)
+
+    def fpWriteback(ctx: FpPipeContext, res: FpResult, esc: FpEscalation): Unit = {
+      fpCompValid     := True
+      fpCompRobId     := ctx.robId
+      fpCompPdst      := ctx.pdst
+      fpCompPdstValid := ctx.pdstValid
+      fpCompData      := res.value
+      fpCompFpccDst   := ctx.pFpccDst
+      fpCompFpccWrite := ctx.fpccWrite
+      fpCompFpcc      := res.fpcc
+      fpCompFault     := esc.esc
+      fpCompFaultVec  := Mux(esc.esc, esc.vec, U(0, 8 bits))
+    }
+
+    when(!flushSig) {
+      when(fpFixedDone) {
+        fpWriteback(fpFixedCtx.last, fpu.io.resFixed, fpEscFixed)
+      } elsewhen(fpIterDone && !fpIterFlushed) {
+        fpWriteback(fpIterCtx, fpu.io.resIter, fpEscIter)
+      }
+    }
+    when(flushSig) { fpCompValid := False }
+
+    // ---- drive the FP lane's external ports ----
+    // No per-descriptor `flushed` latch is needed here (unlike the int lane's compFlushed):
+    // every FP capture happens in a `!flushSig` cycle from a source whose own valid the same
+    // flush clears, so a wrong-path result can never reach this register in the first place.
+    val fpCompLive = fpCompValid && !flushSig
+    fpCompletionPort.valid   := fpCompLive
+    fpCompletionPort.payload := fpCompRobId
+    // `!fpCompFault` mirrors the int lane exactly: a faulting uop's rename rolls back at the
+    // exception, so its pdst is never live for a surviving consumer.
+    fpW.valid   := fpCompLive && fpCompPdstValid && !fpCompFault
+    fpW.address := fpCompPdst
+    fpW.data    := fpCompData
+    fpccW.valid   := fpCompLive && fpCompFpccWrite && !fpCompFault
+    fpccW.address := fpCompFpccDst
+    fpccW.data    := fpCompFpcc
+    fpWakeupPort.valid     := fpW.valid
+    fpWakeupPort.payload   := fpCompPdst
+    fpccWakeupPort.valid   := fpccW.valid
+    fpccWakeupPort.payload := fpCompFpccDst
+    fpFaultPort.valid             := fpCompLive && fpCompFault
+    fpFaultPort.payload.robId     := fpCompRobId
+    fpFaultPort.payload.vector    := fpCompFaultVec
+    fpFaultPort.payload.faultAddr := U(0, 32 bits)
+
+    // ---- sim-only whitebox for the FP lane (zero synth impact) ----
+    fpCompValid.simPublic(); fpCompRobId.simPublic(); fpCompData.simPublic()
+    fpCompPdst.simPublic(); fpCompPdstValid.simPublic()
+    fpCompFpcc.simPublic(); fpCompFpccDst.simPublic(); fpCompFpccWrite.simPublic()
+    fpCompFault.simPublic(); fpCompFaultVec.simPublic()
+    fpIterBusy.simPublic(); fpIterFlushed.simPublic(); fpIterTake.simPublic()
+    fpu.io.busyIter.simPublic(); fpu.io.doneIter.simPublic()
+    fpSrcVal.simPublic()   // the source-operand gateway's converted 80-bit output
 
     // ---- FSM ----
     val fsm = new StateMachine {
