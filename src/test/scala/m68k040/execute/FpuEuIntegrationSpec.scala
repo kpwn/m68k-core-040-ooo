@@ -112,6 +112,9 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       val iPNzvcDst  = in UInt (4 bits)
       val iWritesNzvc= in Bool ()
       val iSize      = in(Size())
+      // Task 14b fix pass: `DecOp.FPSTORECVT` carries its 32-bit-chunk index in imm[1:0]
+      // (`SFpStIdx0/1/2`), so the imm can no longer be hardwired to 0 here.
+      val iImm       = in Bits (32 bits)
 
       val ctx = IqContext()
       val uop = ctx.uop
@@ -123,7 +126,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       uop.cluster := Cluster.CPLX
       uop.size := iSize
       uop.memOp := MemOp.NONE
-      uop.useImm := False; uop.imm := 0
+      uop.useImm := False; uop.imm := iImm
       uop.isBranch := False; uop.cond := 0; uop.branchDisp := 0
       uop.ibranch := False; uop.anInc := 0; uop.stkPush := False
       uop.eaAuto := EaAuto.NONE; uop.eaDelta := 0
@@ -207,6 +210,15 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       val intCRob   = out UInt (6 bits); intCRob := eu.completion.payload
       val intWakeV  = out Bool (); intWakeV := eu.wakeup.valid
       val euFaultV  = out Bool (); euFaultV := eu.euFault.valid
+      // ---- int-lane FLUSH-STATE whitebox (Task 14b fix pass, Critical #1) ----
+      // The two registers whose post-flush state IS the bug: `fpCvtWait` is the two-cycle
+      // converter's own hold bit, and `flushed` is the legacy lane's wrong-path latch that
+      // is consumed only by a capture. Both MUST be clear once a flush has settled, or the
+      // lane is either wedged (a correct-path op inherits `flushed`) or will read a STALE
+      // converter output on its next conversion.
+      val cvtWaitO  = out Bool (); cvtWaitO := divEu.logic.fpCvtWait
+      val cvtFlushedO = out Bool (); cvtFlushedO := divEu.logic.flushed
+      val s1ValidO  = out Bool (); s1ValidO := divEu.logic.s1Valid
     }
   }
 
@@ -246,7 +258,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       s.iPFpSrcA #= 0; s.iPFpSrcB #= 0; s.iPFpDst #= 0; s.iWritesFp #= true; s.iPFpccDst #= 0
       s.iPsrcA #= 0; s.iPsrcB #= 0; s.iPsrcC #= 0
       s.iPdst #= 0; s.iPdstValid #= false; s.iPNzvcDst #= 0; s.iWritesNzvc #= false
-      s.iSize #= Size.LONG
+      s.iSize #= Size.LONG; s.iImm #= BigInt(0)
       s.preIntValid #= false; s.preIntAddr #= 0; s.preIntData #= 0
       s.preFpValid #= false; s.preFpAddr #= 0; s.preFpData #= BigInt(0)
       s.rdFpAddr #= 0; s.rdFpccAddr #= 0; s.rdIntAddr #= 0
@@ -282,6 +294,44 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
     }
     def readFp(addr: Int): BigInt = { s.rdFpAddr #= addr; sleep(1); s.rdFpData.toBigInt }
     def readFpcc(addr: Int): Int  = { s.rdFpccAddr #= addr; sleep(1); s.rdFpccData.toInt }
+    def readInt(addr: Int): BigInt = { s.rdIntAddr #= addr; sleep(1); s.rdIntData.toBigInt }
+
+    /** Present one INT-lane uop (any `DecOp` other than `FPU`) and wait for the accepting
+      * edge. The `issue` helper above is FP-lane shaped (it hardwires `DecOp.FPU` and an
+      * FP destination); the int lane needs the integer operand/destination fields and, for
+      * `FPSTORECVT`, both the FP source address and the imm-borne chunk index. Restores the
+      * idle FP-lane defaults on the way out so it composes with `issue`. */
+    def issueInt(rob: Int, op: SpinalEnumElement[DecOp.type],
+                 size: SpinalEnumElement[Size.type] = Size.LONG,
+                 psrcA: Int = 0, psrcB: Int = 0, pdst: Int = 0, pdstValid: Boolean = false,
+                 pNzvcDst: Int = 0, writesNzvc: Boolean = false,
+                 pFpSrcA: Int = 0, imm: BigInt = BigInt(0), fmt: Int = 0,
+                 label: String = "int issue"): Unit = {
+      s.iOp #= op
+      s.iRob #= rob; s.iSize #= size
+      s.iPsrcA #= psrcA; s.iPsrcB #= psrcB; s.iPsrcC #= 0
+      s.iPdst #= pdst; s.iPdstValid #= pdstValid
+      s.iPNzvcDst #= pNzvcDst; s.iWritesNzvc #= writesNzvc
+      s.iPFpSrcA #= pFpSrcA; s.iPFpSrcB #= 0; s.iPFpDst #= 0; s.iWritesFp #= false
+      s.iPFpccDst #= 0; s.iImm #= imm; s.iFpSrcFmt #= fmt
+      s.iValid #= true
+      sleep(1)
+      var guard = 0
+      while (!(s.iReady.toBoolean && s.iFire.toBoolean) && guard < 200) { tick(); sleep(1); guard += 1 }
+      assert(s.iReady.toBoolean && s.iFire.toBoolean, s"$label was never accepted")
+      tick()
+      s.iValid #= false
+      s.iOp #= DecOp.FPU; s.iPdstValid #= false; s.iWritesNzvc #= false
+      s.iSize #= Size.LONG; s.iImm #= BigInt(0); s.iWritesFp #= true
+    }
+
+    /** Wait for `n` more int-lane completions (the CPLX legacy lane's shared port). */
+    def drainIntTo(n: Int, budget: Int, label: String): Unit = {
+      var guard = 0
+      while (intSeen.size < n && guard < budget) { tick(); guard += 1 }
+      assert(intSeen.size == n,
+        s"$label observed ${intSeen.size}/$n int-lane completions after $guard cycles")
+    }
 
     /** Present one uop and wait for the accepting edge. */
     def issue(rob: Int, opmode: Int, kind: SpinalEnumElement[FpSrcKind.type],
@@ -830,6 +880,135 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       }
       tick(6)
       assert(fpSeen.size == start + 6, "a killed pre-flush FADD completed after ROB-id reuse")
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════════════
+  // Task 14b's INT-lane narrowing converter (`DecOp.FPSTORECVT`, the `FMOVE FPn,<ea>`
+  // store direction). These sit here rather than in `FpuLockStepSpec` because neither is
+  // refereeable by Musashi: the flush contract is a microarchitectural property with no
+  // architectural trace at all, and the register-direct `.W`/`.B` partial-register merge
+  // is a CONFIRMED oracle divergence (Divergence Register D11 -- Musashi's
+  // `WRITE_EA_16`/`WRITE_EA_8` zero-extend over the whole register).
+  // ════════════════════════════════════════════════════════════════════════════════════
+
+  /** -1234.0 as 80-bit extended: 1234 = 0b100_1101_0010 (11 bits) => significand
+    * 1234 << 53 = 0x9A40000000000000, exponent 10 => biased 0x3FFF + 10 = 0x4009.
+    * `floatx80_to_int32` of it is -1234 = 0xFFFFFB2E, whose low word is 0xFB2E and low
+    * byte 0x2E -- three distinct nibbles patterns, so a wrong-width merge cannot alias. */
+  private val Minus1234 = ext(true, 0x4009, BigInt("9A40000000000000", 16))
+
+  test("int lane FPSTORECVT: a flush on ANY cycle of the two-cycle conversion leaves the lane " +
+       "clean -- no leaked `flushed`, no stuck `fpCvtWait`, no stale converter read",
+       VerilatorTest) {
+    dut.doSim { d =>
+      val h = new Harness(d); import h._
+      boot()
+
+      // ── THE HAZARD (Task 14b review, Critical #1) ────────────────────────────────────
+      // `FpNarrowPack` carries one registered stage, so an `FPSTORECVT` occupies S1 for TWO
+      // cycles and is the FIRST S1 arm in this EU with a "continue, don't capture" state.
+      // Every other arm (CHK / CMP2 / FPCTRLRD / DIVREM / ...) captures unconditionally
+      // whenever `s1Valid` is set -- including on a flushed cycle, where the capture is a
+      // deliberate DISCARD that also consumes the `flushed` latch. A conversion that simply
+      // fell through to its continuation arm on a flushed cycle would:
+      //   1. leave `flushed` set with no owner. The NEXT legacy-lane op -- a correct-path
+      //      one -- inherits it via `legacyResult.flushed`, so `compFlushed` suppresses its
+      //      completion/writeback/wakeup and its ROB entry never retires: a real deadlock,
+      //      reachable from an ordinary branch mispredict.
+      //   2. leave `fpCvtWait` stuck at 1 (the FSM's `:= True` is a LATER assignment in the
+      //      same clocked block than the flush-clear, so it wins). The next conversion then
+      //      takes the "read the result" branch on its FIRST S1 cycle and samples the
+      //      converter's output register, which was clocked from the PREVIOUS cycle's
+      //      source -- a STALE value, on its way to memory.
+      // The sweep below lands the flush on every cycle of the conversion (delay 0 is the
+      // first S1 cycle, delay 1 the second), and asserts all three consequences directly:
+      // the whitebox latch state, a following CHK actually retiring, and a following
+      // conversion producing ITS OWN value rather than the previous one's.
+      preloadFp(1, One)       // 1.0 -> Long 1  (the flushed conversion's source)
+      preloadFp(2, Five)      // 5.0 -> Long 5  (the post-flush conversion's source)
+      preloadInt(30, BigInt(3))     // CHK.W Dn    = 3
+      preloadInt(31, BigInt(10))    // CHK.W bound = 10 -> in bounds, completes, no fault
+
+      for (delay <- 0 to 4) {
+        val before = intSeen.size
+        issueInt(rob = 20, op = DecOp.FPSTORECVT, pFpSrcA = 1, pdst = 40, pdstValid = true,
+          label = s"flushed FPSTORECVT (delay=$delay)")
+        if (delay > 0) tick(delay)
+        s.iFlush #= true
+        tick()
+        s.iFlush #= false
+        tick(8)
+
+        assert(!s.cvtWaitO.toBoolean,
+          s"delay=$delay: `fpCvtWait` is STILL SET after the flush -- the next conversion " +
+          "would read the converter's stale output register on its first S1 cycle")
+        assert(!s.cvtFlushedO.toBoolean,
+          s"delay=$delay: the legacy lane's `flushed` latch LEAKED past the flush -- the " +
+          "next correct-path CPLX op will have its completion suppressed (ROB deadlock)")
+        assert(!s.s1ValidO.toBoolean, s"delay=$delay: s1Valid still set after the flush")
+        assert(intSeen.size - before <= 1,
+          s"delay=$delay: the flushed conversion completed more than once")
+
+        // (1) DEADLOCK CHECK: an ordinary legacy-lane op issued after the flush must retire.
+        val chkBefore = intSeen.size
+        issueInt(rob = 21, op = DecOp.CHK, size = Size.WORD, psrcA = 30, psrcB = 31,
+          pNzvcDst = 5, writesNzvc = true, label = s"post-flush CHK (delay=$delay)")
+        drainIntTo(chkBefore + 1, 40,
+          s"delay=$delay: the CHK issued after a flushed FPSTORECVT")
+        assert(intSeen.last._2 == 21,
+          s"delay=$delay: post-flush CHK completed with robId ${intSeen.last._2}, expected 21")
+        assert(!s.euFaultV.toBoolean, s"delay=$delay: in-bounds CHK raised a fault")
+
+        // (2) STALE-READ CHECK: a fresh conversion must convert ITS OWN source (FP2 = 5.0),
+        //     not the flushed one's (FP1 = 1.0) or the CHK's unused FP0 (= 0).
+        val cvtBefore = intSeen.size
+        issueInt(rob = 22, op = DecOp.FPSTORECVT, pFpSrcA = 2, pdst = 41, pdstValid = true,
+          label = s"post-flush FPSTORECVT (delay=$delay)")
+        drainIntTo(cvtBefore + 1, 40,
+          s"delay=$delay: the FPSTORECVT issued after a flushed FPSTORECVT")
+        assert(intSeen.last._2 == 22,
+          s"delay=$delay: post-flush FPSTORECVT completed with robId ${intSeen.last._2}")
+        tick(2)
+        assert(readInt(41) == BigInt(5),
+          f"delay=$delay: post-flush conversion wrote 0x${readInt(41)}%08X, expected 5 " +
+          "(a 1 or 0 here is the STALE converter-register read)")
+      }
+    }
+  }
+
+  test("int lane FPSTORECVT: register-direct .W/.B write the converted low bits and PRESERVE " +
+       "the rest of Dn (partial-register merge, Divergence D11)", VerilatorTest) {
+    dut.doSim { d =>
+      val h = new Harness(d); import h._
+      boot()
+
+      // `FMOVE.W FPn,Dn` / `FMOVE.B FPn,Dn` are ordinary 68k partial-register writes: only
+      // the low word/byte of Dn changes. Musashi's `WRITE_EA_16`/`WRITE_EA_8` assign
+      // `REG_D[reg] = data` from a uint16/uint8 and therefore ZERO-EXTEND over the whole
+      // register, so this behaviour is deliberately excluded from `FpuLockStepSpec` (D11)
+      // and has to be proven here instead. The merge source is the destination register's
+      // own old value, read through `psrcA`. Memory rows are `Size.LONG` by construction
+      // (their own `MStore` row carries the real access size), so the merge is unreachable
+      // for them -- the LONG case below pins that.
+      preloadFp(3, Minus1234)                     // -1234.0 -> int32 0xFFFFFB2E
+      preloadInt(32, BigInt("AAAA5555", 16))      // the old Dn every merge preserves
+
+      case class Merge(size: SpinalEnumElement[Size.type], pdst: Int, want: BigInt, label: String)
+      val cases = Seq(
+        Merge(Size.LONG, 33, BigInt("FFFFFB2E", 16), "FMOVE.L FP3,Dn -- full 32-bit write"),
+        Merge(Size.WORD, 34, BigInt("AAAAFB2E", 16), "FMOVE.W FP3,Dn -- low word merged"),
+        Merge(Size.BYTE, 35, BigInt("AAAA552E", 16), "FMOVE.B FP3,Dn -- low byte merged"))
+
+      for (c <- cases) {
+        val before = intSeen.size
+        issueInt(rob = 30, op = DecOp.FPSTORECVT, size = c.size, psrcA = 32, pFpSrcA = 3,
+          pdst = c.pdst, pdstValid = true, label = c.label)
+        drainIntTo(before + 1, 40, c.label)
+        tick(2)
+        val got = readInt(c.pdst)
+        assert(got == c.want, f"${c.label}: int PRF[${c.pdst}] = 0x$got%08X, expected 0x${c.want}%08X")
+      }
     }
   }
 }

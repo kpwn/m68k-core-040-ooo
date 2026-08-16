@@ -693,6 +693,31 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // per conversion row, invisible next to the store rows that follow it.
     val fpCvtWait = RegInit(False)
     when(flushSig) { fpCvtWait := False }
+    // FLUSH CONTRACT for the two-cycle conversion (Task 14b review, Critical #1).
+    //
+    // The clear above is NOT self-sufficient: it sits EARLIER in the same clocked block
+    // than the FSM arm below, so a later `fpCvtWait := True` in the FSM wins (SpinalHDL /
+    // Verilog last-write-wins within one `always`). The FSM's continuation arm must
+    // therefore never run on a flushed cycle -- if it did, two real failures followed from
+    // an ordinary branch mispredict:
+    //   1. `flushed` LEAKS. `flushed` is set by `when(flushSig && (busy || s1Valid))` above
+    //      and is consumed ONLY by `captureComplete`/`captureFault`. Every other S1 arm
+    //      (CHK / CMP2 / FPCTRLRD / DIVREM / ...) captures unconditionally whenever
+    //      `s1Valid` is set, INCLUDING on a flushed cycle -- the capture is stamped
+    //      `legacyResult.flushed := flushed || flushSig` so it is discarded downstream, and
+    //      the latch is cleared. A continuation arm that captures nothing leaves the latch
+    //      set with no owner, and the NEXT legacy-lane op -- a correct-path one -- inherits
+    //      it, so ITS completion/writeback/wakeup are all suppressed by `compFlushed` and
+    //      its ROB entry never retires: a hard deadlock.
+    //   2. `fpCvtWait` STICKS at 1, so the next `FPSTORECVT` takes the "read the result"
+    //      branch on its FIRST S1 cycle and samples `FpNarrowPack`'s output register, which
+    //      was clocked from the PREVIOUS cycle's `s1FpSrc` -- a stale value, stored to
+    //      memory.
+    // The fix is to take the same capture-and-DISCARD path every sibling arm already takes:
+    // `fpCvtFlushing` forces the completion branch on a flushed cycle, which stamps the
+    // result flushed (nothing is delivered), clears `flushed`, clears `fpCvtWait`, and drops
+    // `s1Valid` -- leaving the lane in exactly the state a flush must leave it in.
+    val fpCvtFlushing = flushed || flushSig
 
     val isDivRem = u1.divIsRem
     val remLatch = Reg(Bits(32 bits))
@@ -1113,13 +1138,20 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
             // trap DISABLED the substituted/saturated value is stored and only the FPSR
             // EXC accrual below records what happened, mirroring the FP lane's own
             // Decision-10 posture.
-            when(fpCvtWait) {
-              when(fpStoreEsc.esc) {
+            //
+            // `fpCvtFlushing` (see its declaration for the full rationale) forces the
+            // completion branch on a FLUSHED cycle even when the converter has not run yet:
+            // the capture is a pure DISCARD -- `captureComplete` stamps
+            // `legacyResult.flushed` so no port is driven, and clears the `flushed` latch
+            // that would otherwise leak onto the next, correct-path legacy op. Never take
+            // the escalation branch on such a cycle: its inputs are a half-run conversion.
+            when(fpCvtWait || fpCvtFlushing) {
+              when(fpStoreEsc.esc && !fpCvtFlushing) {
                 captureFault(fpStoreEsc.vec, B(0, 4 bits), False)
               } otherwise {
                 captureComplete(fpStoreValue, B(0, 4 bits), False, True)
               }
-              when(!(flushed || flushSig)) {
+              when(!fpCvtFlushing) {
                 fpStoreExcVld := True
                 fpStoreExcReg := fpStoreExcNow
               }
