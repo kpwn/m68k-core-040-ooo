@@ -257,6 +257,116 @@ how sysOps retire, squash, or redirect changes.
 
 ---
 
+## Addendum (2026-08-16, post-Task-9b): FSAVE/FRESTORE need a genuinely different substrate
+
+Task 9b (FMOVEM control-register list) was implemented against Decisions 1-3 above and is
+complete. Grounding Task 11's re-brief surfaced a real asymmetry this document did not
+originally distinguish: **Decisions 1-3's "all memory movement rides ordinary microcode LS
+rows" mechanism does not generalize to FSAVE/FRESTORE**, because their frame length is
+runtime-dynamic in a way FMOVEM-control's register mask (known at decode time) never was.
+This addendum is the binding mechanism for Task 11; it does not revise Decisions 1-3, which
+remain correct and implemented for Task 9b.
+
+### Why the LS-EU-microcode substrate doesn't apply here
+
+Straight-line microcode (`Microcode.scala`'s `Desc`-row engine, confirmed no conditional
+branching within a program) needs a transfer count fixed at program-construction time.
+FMOVEM-control's mask is decode-time-resident, so it fit. FSAVE/FRESTORE do not:
+
+- **FSAVE**'s frame type (null/idle/unimplemented → 4 or 44 bytes) is selected from live
+  `FpuControlPlugin` state (`everExecuted`/`uiValid`) at *execute* time — not decode time, but
+  also genuinely **not** a memory-value-dependent branch (both flops are already resident, no
+  load is needed to decide). This sits in a middle band neither the microcode engine nor the
+  `DecodeStage` MOVEM FSM (whose runtime-variable count is itself decode-time-derived from the
+  instruction's own extension word, `movemMask`) currently expresses.
+- **FRESTORE**'s pop size is discovered from the actual header/length **byte value read out of
+  memory** at runtime (`fsave_frestore_basic.s`'s own pop-size matrix: NULL→4, `$28`→44,
+  `$60`→100). No decode-time or execute-time-only mechanism can express this — it is an
+  unavoidable data-dependent branch, and straight-line microcode fundamentally cannot express
+  it regardless of substrate choice.
+
+**Real simplification that narrows FRESTORE's actual surface**: because Task 11's own
+established scope (carried forward unchanged) deliberately does NOT apply a non-null frame's
+*body* content (real 68040 FSAVE saves no control registers; the ROM FPSP prologue restores
+them separately via `FMOVEM.L`), FRESTORE only ever needs to **read one word** — the header —
+regardless of the frame's real size. The pop size is derived from that one word; the remaining
+body bytes are skipped over (an address computation), never loaded.
+
+### The mechanism: extend `ExceptionUnit`'s own frame machinery with a real, arbitrated DTLB port
+
+FSAVE/FRESTORE stay commit-time system ops using `ExceptionUnit`'s existing frame-word-loop
+shape (`E_STORE`/`E_STWAIT`-style per-word `REQ`/`WAIT` state pairs — already instantiated 6+
+times in this FSM, and `S_APPLY` already branches into a genuinely multi-cycle sub-sequence for
+CPUSH/CINV via `S_MAINTWAIT`, so this is not a new FSM shape). What changes is that the frame
+stores/loads gain **real MMU translation**, closing the gap Task 9b's own investigation first
+flagged for this task:
+
+1. **Rebuild, don't wire, the translation port.** `ExceptionUnit`'s existing `dtReq`/`dtRsp`
+   stub is the *wrong* bundle family entirely (the I-side `TranslationReq`/`TranslationRsp`,
+   combinational, untagged) — the real D-side contract (`DTranslationService`, `Stream` on both
+   directions, an 8-bit token to match responses in an elastic pipeline) is structurally
+   different and has zero existing consumers outside `LsEuPlugin`. This task builds a real
+   `Stream[DTranslationCmd]`/`Stream[DTranslationRsp]` acquisition, not a wiring fix.
+2. **Time-multiplex the single DTLB port via the already-proven `excActive` MUX pattern.**
+   `DTranslationService` is deliberately single-producer by design (its own doc comment: "the
+   LSU can associate registered results across VPNs"). But `LsEuPlugin` **already fully idles
+   and relinquishes** its own DTLB request and response claim for the entire duration
+   `excActive` is held (`xlate.req.valid := !excActive && ...`, `xlate.rsp.ready := ... ||
+   excActive || ...`) — the exact same pattern already used, in production, to hand the D-cache
+   load/store command ports themselves to `ExceptionUnit` during an active episode
+   (`when(excActive && excLoadCmdValid) { dcache.loadCmd := ... }` and its store-side sibling).
+   Extend that same MUX to the DTLB port: `ExceptionUnit` drives `dtReq`/reads `dtRsp` only
+   during its own active episode, when the port is provably idle. No new arbitration primitive,
+   no risk to the ordinary LS pipeline outside an exception episode.
+3. **Translate per word, with a translate-on-VPN-change rule, not blind per-word retranslation
+   and not a full two-pass cross-page split.** FSAVE's existing per-step address computation
+   (`frameWordAddr(step)`) is already a flat combinational add with zero page-crossing
+   awareness (only a 16-byte cache-line split exists, for a different, already-fixed bug class
+   — task #163). A full replica of `LsEuPlugin`'s two-pass cross-page split machinery is real
+   but disproportionate: FSAVE's frame is at most 44 bytes, so it can cross **at most one** page
+   boundary in its entire length. Compare each step's VPN against the last-translated VPN;
+   re-issue the translation request only when it changes. This is correct (every word gets a
+   real, current translation) and cheap (at most 2 translation requests per frame, not up to
+   22), without inventing dual-in-flight-translation machinery this unit has no other use for.
+   FRESTORE needs exactly one translation (its one header-word read), so this rule is trivially
+   satisfied there.
+4. **A translation fault escalates to the existing sticky `coreHalted` mechanism — an explicit,
+   flagged limitation, not silently ignored and not a new nested-exception subsystem.**
+   `ExceptionUnit` cannot cleanly re-enter itself mid-episode the way ordinary faults retire
+   (`RobPlugin`'s `faultRetire` is gated on `excIdle`, unconditionally false for the whole
+   episode) — and unlike the RTE self-synthesized-entry precedent for a malformed frame format
+   (vector 3/14, `E_DRAIN` re-entry), that precedent only works because RTE's own path up to
+   that point is read-only; a partially-stacked FSAVE frame has already committed writes, and
+   this project has no unwind machinery for that. Building genuine nested/precise-fault
+   re-entry here would be new, unproven, safety-critical machinery this project doesn't have
+   anywhere else. Instead: on `dtRsp.fault` during an FSAVE/FRESTORE-driven translation, drive
+   `RobPlugin.coreHaltedIn` — the same sticky, first-error-wins, already-wired escalation this
+   project already uses for the structurally analogous problem (`DcachePlugin`'s diagnostic
+   fault channel, four existing kinds: WT-beat drain, refill, eviction writeback, CPUSH
+   writeback). This is a genuine, deliberate divergence from real 68040 behavior (which would
+   take a precise access-fault exception here, not halt) — record it plainly in the task's
+   commit message and in a code comment at the escalation site, the same way this project
+   records every other known implementation-limitation gap, rather than leaving it
+   undocumented.
+   **Scoping note, so this isn't mistaken for solving more than it does**: this closes the gap
+   for FSAVE/FRESTORE's *own new* translated accesses only. The pre-existing, already-documented
+   fact that ordinary entry/RTE-frame stores mark `precise := True` specifically so a bus error
+   there never reaches the diagnostic channel at all (`ExceptionUnit.scala`'s own comment: "the
+   exception-store path has no fault-reporting mechanism at all") is a **separate, pre-existing
+   gap**, not introduced by Task 11 and not closed by it — a real future-task candidate, not
+   this one's job.
+
+### What this means for the acceptance corpus and for Task 9b's own design
+
+Nothing here revises Task 9b's implementation (already landed, reviewed, approved) — FMOVEM-
+control's mechanism is correct as shipped. This addendum only fixes an asymmetry this document
+originally failed to call out: not every "multi-word FP-control transfer" is expressible by
+the same substrate, and the deciding factor is whether the transfer's shape is knowable without
+a runtime memory read (FMOVEM-control and FSAVE: yes, by different means — decode-time mask vs.
+execute-time flops) or genuinely requires branching on one (FRESTORE: yes, unavoidably).
+
+---
+
 ## Open items (explicitly not resolved here — flag, don't guess)
 
 - **§4's `orFpsrExc` caveat** — not this design's job to close, must be re-examined by whoever
@@ -267,3 +377,10 @@ how sysOps retire, squash, or redirect changes.
 - **Whether Task 9b and Task 11 share one `SysKind` or mint two** — both are structurally the
   same "batch commit-time apply" shape; sharing reduces `ExceptionUnit.S_APPLY` surface area
   but couples the two tasks' review cycles. Left as an implementation-time call.
+- **The pre-existing "exception-frame stores mark `precise:=True` and swallow their own bus
+  errors" gap** (entry frames, RTE) — confirmed real and already acknowledged in-code, NOT
+  closed by the addendum's translation-fault escalation (scoped to FSAVE/FRESTORE's own new
+  accesses only). A real future-task candidate.
+- **Exact translate-on-VPN-change bookkeeping** (which register holds "last translated VPN",
+  exactly where the compare sits in the `F_STORE`/`F_STWAIT` loop) — left to Task 11's
+  implementer, following the addendum's rule, not this document's job to pre-write the RTL.
