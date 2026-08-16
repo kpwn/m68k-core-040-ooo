@@ -10034,6 +10034,293 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 ---
 
+### Task 14b: FMOVE FPn,<ea> store direction (NEW, post-Task-14)
+
+**Why this task exists.** Task 14's ported-test-corpus triage found the store direction of
+FMOVE (`FPn` → `<ea>`, opclass `011`) has no hardware support at all — only the load direction
+(`<ea>`/`#imm` → `FPn`, Task 6/6b) and the control-register directions (Task 9/9b) exist today.
+5 corpus tests exercise it directly (one currently HANGS, not just fails) and 8 more use it as
+their result-verification idiom, so it is silently blocking correctness signal on other,
+already-landed work. A dedicated read-only investigation (see
+`docs/superpowers/sdd/2026-08-15-fpu-fpsp-implementation-plan/task-14b-investigation.md` if
+archived, or the ledger entry citing it) grounded the real encoding, the real Musashi reference
+algorithm, and the real architectural options against this repo's landed precedents. This brief
+resolves the investigation's open architectural questions directly (per the controller's
+standing "whatever's architecturally cleanest" mandate) rather than re-escalating routine
+engineering judgment calls.
+
+**Placement.** After Task 14, before Task 14c — Task 14c's FPCR-exception-enable wiring lands
+first; this task's own new OPERR-on-narrow-conversion escalation should plug into Task 14c's
+`fpEscalation`/`FpVector.Operr` gate rather than duplicate it. Confirm Task 14c is actually
+merged into the branch you start from before beginning.
+
+---
+
+## Real encoding (confirmed from `tools/musashi/musashi/m68kfpu.c:1570-1632`, `fmove_reg_mem`)
+
+Opword band: cpGEN, `ext[15:13] = 011`. Field layout — **note the role-flip vs. the load
+direction, same bit positions**:
+- `ext[12:10]` = destination **format** (this repo's existing `fpSrcSpec`/`ucFpSrcSpec`
+  extraction point, reinterpreted).
+- `ext[9:7]` = source **FPn** (same bit position as the load direction's destination FPn).
+- `ext[6:0]` = k-factor, **Packed only** (static if `ext[12:10]=011`, dynamic — read from
+  `Dn`, `n=ext[6:4]` — if `ext[12:10]=111`). Ignored for every other format.
+
+Full destination-format table, width, and Musashi's real conversion call:
+
+| `ext[12:10]` | Format | Width | Musashi call |
+|---|---|---|---|
+| `000` | Long integer | 4 B (1 chunk) | `floatx80_to_int32` |
+| `001` | Single real | 4 B (1 chunk) | `floatx80_to_float32` |
+| `010` | Extended real | 12 B (3 chunks) | `store_extended_float80` (pure bit placement, no rounding) |
+| `011` | Packed, static k | 12 B | **OUT OF SCOPE — Decision 2** |
+| `100` | Word integer | 2 B (1 chunk, sign-extended-then-truncated) | `(sint16)floatx80_to_int32` |
+| `101` | Double real | 8 B (2 chunks) | `floatx80_to_float64` |
+| `110` | Byte integer | 1 B (1 chunk, sign-extended-then-truncated) | `(sint8)floatx80_to_int32` |
+| `111` | Packed, dynamic k | 12 B | **OUT OF SCOPE — Decision 2** |
+
+**Both `011` and `111` must be excluded** (unlike the load direction, where only `011` needs
+exclusion since `111` there is FMOVECR) — both route to the existing `Microcode.FP_MEM_TRAP_ENTRY`
+(`Microcode.scala:1845-1849`), exactly as the load direction's Packed case already does
+(`DecodeStage.scala:1220-1223`, `ucFpMemBad`). Reuse that entry; do not invent a new one.
+
+## Resolved architectural decisions (read before writing any code — these are load-bearing)
+
+**D1. New CPLX row type, in the INT lane, as a purpose-built module — not a `FpuCore` output.**
+`FpuCore.scala`'s interface stays 80-bit-only (unchanged). Build a new, focused combinational
+module (suggest `FpNarrowPack.scala`, alongside `FpRoundPack.scala`) implementing the
+shift-jam + round + pack primitive for Long/Word/Byte/Single/Double, reusing `Fp80`'s existing
+`shiftRightJamCoarse`/`shiftRightJamFine` helpers and the same 4-way RN/RZ/RM/RP rounding
+decision shape `FpRoundPack.scala:68-70` already uses (cite `softfloat.c`'s
+`roundAndPackInt32`/`roundAndPackFloat32`/`roundAndPackFloat64` per the investigation's
+citations — same algorithm family, new focused instance, not a reuse of `FpRoundPack` itself,
+whose interface is bound to `FpuCore`'s `FixedLatency` pipeline). Instantiate it inside
+`DivEuPlugin`'s int lane, fed by the existing unconditionally-addressed `fpRdA` port
+(`DivEuPlugin.scala:716-724`), exactly mirroring how `UFpCtrlRead` reuses that same port
+(`DivEuPlugin.scala:575-596`). **Why this placement, not the FP lane's 13-cycle pipeline:** a
+width-reduction shift-jam-round is a shallow combinational cone (the same shape `FpRoundPack`
+already is, and that module is not itself 13 cycles deep — the FP lane's overall depth comes
+from full arithmetic, not from `FpRoundPack`), so it fits the int lane's existing shallow
+`s1Ctx`/`s1Valid` shape (`DivEuPlugin.scala:328-345`) without inventing a new FP-lane output
+port or growing `FpuCore`'s interface. New op name: `DecOp.FPSTORECVT`; new uop:
+`UFpStoreCvt` (mirrors `UFpCtrlRead`'s naming, `Microcode.scala:214-223`).
+
+**D2. Multi-chunk formats (Double=2, Extended=3) re-run the SAME conversion per row, tapping a
+different 32-bit slice each time — no new multi-destination uop.** The conversion is a pure
+function of the FP source register (no cross-row state), so re-running it per row is cheap
+(combinational, deterministic — the investigation confirms `fpRdA` is already addressed
+unconditionally every cycle regardless of consumer) and avoids inventing a uop with more than
+one destination (no existing uop has that shape). Add a static 2-bit "chunk index" field to
+`UFpStoreCvt` (0/1/2), baked in at the same microcode-row-generation point Task 6b's
+`fpMemChunkDispSel`/`fpMemChunkAutoImm` already bake in per-chunk EA deltas
+(`Microcode.scala:1792`, `:1796`). **Exception escalation (see D4) fires only from chunk-index
+0's row** — do not re-raise OPERR/INEX once per chunk.
+
+**D3. Routing: memory destinations reuse Task 6b's 18-group microcode structure verbatim,
+`MLoad`→`MStore`, with `[UFpStoreCvt × chunkCount]` prepended instead of `UFpIssue` appended.**
+Mirror `fpMemBaseGroup`/`fpMemAutoPostGroup`/`fpMemAutoPreGroup` (`Microcode.scala:1806-1839`)
+and the format table (`:1782-1789`, same B/W/L/S/D/X chunk counts — this repo already has this
+table, do not redefine it, only add the store-direction group variants alongside it). New
+entry constants: `FP_STORE_{B,W,L,S,D,X}_ENTRY` / `_AUTO_POST_ENTRY` / `_AUTO_PRE_ENTRY`,
+dispatched from a new `ucBegin` arm gated exactly like Task 9b's `ucFpCtrlOk`
+(`DecodeStage.scala:1286-1289`):
+```scala
+val ucFpStoreOk = ucFpOpClass === B"3'b011" &&
+                  ucFpDstFormat =/= B"3'b011" && ucFpDstFormat =/= B"3'b111" &&  // Packed excluded
+                  ucBfEaDec.klass === EaClass.MEMSIMPLE && !ucBfEaDec.pcRel
+```
+(confirm the real field name Task 6b/9b used for the format extract — the investigation calls
+it `ucFpSrcSpec` reused with a role-flip; use whatever the real current decode-stage signal is
+named, do not invent a parallel one if `ucFpSrcSpec` already exists and is reachable here).
+**`!pcRel` is a deliberate, intentional divergence from Musashi**, which permissively (and per
+real 68040 alterable-EA rules, incorrectly) allows PC-relative FMOVE destinations
+(`m68kfpu.c:832` et al. call `EA_PCDI_*` then write). Add a Divergence Register entry (next
+free letter, e.g. D10) documenting this explicitly — this repo correctly rejects it, Musashi
+incorrectly allows it; note that no corpus test currently exercises this so lock-step is not
+expected to hit it, but a future fuzz seed could.
+
+**D4. Register-direct destinations (`fmove.l %fp0,%d1` etc.) never reach `ucBegin`** (mode 0 is
+excluded by `fpMemIsMemEa`, `OperationDecoder.scala:1207-1209`) — emit a single `UFpStoreCvt`
+row (chunk index 0, destination = the decoded `Dn`, not a store-temp) directly from
+`MicroOpAssembler`, mirroring Task 6's `fpFormIsIntReg` gate (`MicroOpAssembler.scala:1541`).
+Per the investigation's EA table, only B/W/L/S have a register-direct arm at all (Double/
+Extended/Packed have none — Musashi's own writers agree, `WRITE_EA_64`/`WRITE_EA_FPE` both
+`fatalerror` on mode 0). Gate register-direct to those 4 formats only; anything else with mode
+0 falls through to the existing bad-EA/illegal path.
+
+**D5. `An`-direct (mode 1) destinations: accept, matching Musashi's permissiveness, for
+consistency with this project's own existing FPCR-control-register precedent
+(`MicroOpAssembler.scala:1583-1584`, `fpCtrlEaReg` already accepts modes 0 and 1 "matching
+Musashi's permissiveness").** Only the Long format has a real `An`-direct arm
+(`WRITE_EA_32` is the only writer that accepts mode 1). This is a deliberate consistency choice
+across the FP subsystem, not a re-derivation from the manual — record it as such in the commit
+message.
+
+**D6. `d8(An,Xn)` with Extended format, and `(xxx).W` with any format: do NOT mirror Musashi's
+gaps blindly — Musashi is a confirmed-incomplete oracle for this direction (see below).**
+Musashi's `WRITE_EA_FPE` has no mode-6 arm (`fatalerror`) and no writer implements mode 7/0 at
+all, yet `fpu_fmove_fp_to_ea_matrix.s` exercises both (`d8(A?,X?) .D`, `(xxx).W .B`) and expects
+them to work. This repo's ordinary (non-FP) MOVE instructions already support both EA forms via
+the general `EaDecoder`/LS substrate — trust that existing, already-correct machinery over
+Musashi's narrower writer set. Confirm against the real MC68040 UM whether Extended-format
+`d8(An,Xn)` destinations are architecturally valid (the FMOVE instruction's own EA-mode
+restriction table) before deciding whether to gate it out; do not assume Musashi's `fatalerror`
+reflects real hardware restriction versus emulator laziness.
+
+**D7. OPERR-on-narrow-conversion escalation plugs into Task 14c's landed
+`fpEscalation`/`FpVector.Operr` gate** (Task 14c lands first per Placement above). If Task
+14c's landed shape doesn't cleanly support a second raising site (the narrow converter, distinct
+from `FpuCore`'s own arithmetic-result exceptions), do not force it — characterize the gap
+precisely and hand it off as a follow-up finding rather than blocking this task, exactly like
+this project's established bucket-(c) practice. **Musashi is NOT an oracle for this exception
+behavior** — confirmed from source, `fmove_reg_mem` never calls `float_raise` or
+`SET_CONDITION_CODES` (`m68kfpu.c:1570-1632`, verified zero hits). Use it only for the stored
+VALUE, never for FPSR/exception side effects on this instruction.
+
+## Real corpus test scope (13 tests, from the corrected triage doc)
+
+Store-direction-is-the-subject (must pass or be precisely re-characterized):
+`fpu_fmove_fp_to_ea_matrix.s`, `fpu_fmove_dn_fpn_roundtrip.s`, `fpu_fmove_fpn_mem_nonzero_reg.s`,
+`fpu_fmove_x_fp0_d16_a6_repro.s`, `fpu_x2s_stash_back_to_back.s` (currently a HANG — no vector-11
+handler installed, so getting F-line delivery right on any accidentally-still-bad encoding in
+this test will change a HANG into either a PASS or a clean sentinel FAIL, both progress).
+
+**Known, already-anticipated partial-fail: `fpu_fmove_fp_to_ea_matrix.s` ends with a Packed
+destination (`fmove.p %fp0, ABSL:l{#0}`) and is a single sequential program** — if the Packed
+exclusion (D3) is implemented correctly, this ONE test will still FAIL overall (hits vector 11
+on its last instruction), even though every EA form earlier in the same test is correct. This
+is bucket (b), already anticipated by Task 14's own triage doc (`:92-96`) and by the design
+spec's Decision 2 — **do not treat this as a regression or try to make the Packed case pass**;
+report the specific instruction offset where it (correctly) traps so a future FPSP-kernel task
+can confirm the rest of the matrix stays green underneath it.
+
+Store-direction-used-as-verification-idiom (should start passing as a side effect, confirm, do
+not need dedicated new coverage): `fpu_fadd_exact_single.s`, `fpu_fdiv_flush_survive.s`,
+`fpu_fint_basic.s`, `fpu_fintrz_basic.s`, `fpu_fsqrt_basic.s`, `fpu_fsqrt_flush_survive.s`,
+`fpu_fsqrt_neg.s`, `fpu_fsqrt_zero.s`.
+
+---
+
+## Files
+
+- Create: `src/main/scala/m68k040/execute/fpu/FpNarrowPack.scala` (new narrowing
+  shift-jam-round-pack module, per D1).
+- Modify: `src/main/scala/m68k040/execute/DivEuPlugin.scala` (new `UFpStoreCvt` int-lane
+  datapath, mirroring `UFpCtrlRead`'s existing shape at lines ~575-596; new
+  `DecOp.FPSTORECVT`).
+- Modify: `src/main/scala/m68k040/execute/Microcode.scala` (new `UFpStoreCvt` uop def, new
+  `FP_STORE_*_ENTRY` groups mirroring the existing `FP_MEM_*_ENTRY` load-direction groups).
+- Modify: `src/main/scala/m68k040/decode/DecodeStage.scala` (new `ucFpStoreOk` gate per D3,
+  new `ucBegin` dispatch arm).
+- Modify: `src/main/scala/m68k040/decode/MicroOpAssembler.scala` (register-direct emit path
+  per D4/D5, mirroring `fpFormIsIntReg`).
+- Modify (only if D7's escalation plug-in is clean): wherever Task 14c lands
+  `fpEscalation`'s producer-selection logic.
+- Test (create): `src/test/scala/m68k040/decode/FpMemStoreSpec.scala` (decode-level, mirrors
+  `FpMemLoadSpec.scala` — EA-gating, Packed-exclusion, PC-relative-exclusion, chunk-count
+  cases).
+- Test (modify): `src/test/scala/m68k040/lockstep/FpuLockStepSpec.scala` — add bit-exact
+  store-direction cases per format (confirm real current file content before editing).
+- Update: `docs/superpowers/specs/2026-08-14-fpu-fpsp-design.md` (Divergence Register — new
+  entry per D3's PC-relative-rejection divergence).
+
+## Interfaces
+
+- Consumes: `Fp80.shiftRightJamCoarse`/`shiftRightJamFine` (Task 7, landed); `fpRdA` port
+  (`DivEuPlugin.scala:716-724`, landed, unconditionally addressed); `EaClass.MEMSIMPLE`/`pcRel`
+  (landed, `EaDecoder`); Task 14c's `fpEscalation`/`FpVector.Operr` gate (lands first, confirm
+  its real shape before wiring D7).
+- Produces: `DecOp.FPSTORECVT`, `UFpStoreCvt` uop, `FP_STORE_*_ENTRY` microcode groups — no
+  other task in this plan currently depends on these names, but record them for Task 15's
+  protocol tests to reference if it chooses to exercise this path.
+
+---
+
+## Steps
+
+- [ ] **Step 1: `FpNarrowPack.scala` — the conversion primitive, TDD against real SoftFloat
+  vectors**
+
+Write failing tests first in a new `FpNarrowPackSpec.scala` covering, per format, at minimum:
+an exact round-trip value, a value requiring RN round-up, a value requiring RN round-to-even,
+an out-of-range-for-Long value (confirm `0x7FFFFFFF`/`0x80000000` saturation per
+`softfloat.c:95-98`), and one negative-zero / signed-zero case per format. Derive expected
+values from the real SoftFloat reference algorithm (cite `softfloat.c:2845-2859` for the
+int32 path, `:2998`/`:3026` for float32/float64), not from guessing — reuse
+`FpRefModel`'s existing SoftFloat-linkage if it already exposes a narrowing conversion, or add
+one there first if it doesn't (confirm before assuming). Implement `FpNarrowPack` to pass.
+
+- [ ] **Step 2: `DivEuPlugin` — `UFpStoreCvt` int-lane datapath**
+
+Wire per D1/D2. Confirm the real current `s1Fpcc`/`isFpCtrlRd` shape (`DivEuPlugin.scala:279`,
+`:334`, `:575-596`) before adding the sibling `isFpStoreCvt` path — do not invent a divergent
+shape without first checking whether the existing one can be extended cleanly (e.g. a shared
+"latch FP-lane read result at S1" helper) versus needing its own.
+
+- [ ] **Step 3: `Microcode.scala`/`DecodeStage.scala`/`MicroOpAssembler.scala` — routing per
+  D3/D4/D5/D6**
+
+Implement the memory-destination groups and register/An-direct emit paths. Confirm the real
+current `ucFpSrcSpec`/format-extraction signal name before reusing it for the destination-format
+role (the investigation flags this as a role-flip of an existing signal, not a new one — verify
+that claim against the real current `DecodeStage.scala` before trusting it).
+
+- [ ] **Step 4: Directed decode-level tests — `FpMemStoreSpec.scala`**
+
+Cover: every non-Packed format's EA-gating accept/reject set from the investigation's EA table
+(§1d), the dual-Packed-value exclusion (`011` and `111` both reach `FP_MEM_TRAP_ENTRY`),
+PC-relative rejection (D3's divergence), register-direct emit for B/W/L/S only (D4), An-direct
+accept for Long only (D5).
+
+- [ ] **Step 5: Bit-exact lock-step coverage — `FpuLockStepSpec.scala`**
+
+Add directed cases per format proving the stored VALUE matches Musashi's `fmove_reg_mem`
+byte-for-byte (valid oracle use, per D7's caveat — value only, not exceptions). Include at
+least one multi-chunk case (Double, Extended) confirming both/all three chunks land correctly
+and in the right byte order (cross-check `store_extended_float80`'s exact 16/16/32/32 field
+layout, `m68kfpu.c:80-85`, against whatever this repo's existing `MEMEXT` assembly convention
+is — Task 6b's load-direction `DivEuPlugin.scala:757` is the mirror to check against).
+
+- [ ] **Step 6: Run the targeted ported-corpus subset and the full regression suite**
+
+```bash
+sbt "testOnly m68k040.fuzz.PortedM68kOooSpec -- \
+  -z fpu_fmove_fp_to_ea_matrix -z fpu_fmove_dn_fpn_roundtrip \
+  -z fpu_fmove_fpn_mem_nonzero_reg -z fpu_fmove_x_fp0_d16_a6_repro \
+  -z fpu_x2s_stash_back_to_back -z fpu_fadd_exact_single -z fpu_fdiv_flush_survive \
+  -z fpu_fint_basic -z fpu_fintrz_basic -z fpu_fsqrt_basic -z fpu_fsqrt_flush_survive \
+  -z fpu_fsqrt_neg -z fpu_fsqrt_zero"
+sbt "testOnly m68k040.lockstep.FpuLockStepSpec"
+sbt "testOnly m68k040.decode.FpMemStoreSpec"
+sbt "testOnly m68k040.decode.FpMemLoadSpec"   # confirm no regression on the sibling direction
+sbt "testOnly m68k040.exception.FsaveFrestoreSpec"
+sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
+sbt fastTest
+```
+
+Report `fpu_fmove_fp_to_ea_matrix.s`'s real result explicitly (expected: still FAIL, but on the
+Packed instruction specifically — confirm the sentinel/PC and report it, do not treat this as
+an unexplained failure). Report `fpu_x2s_stash_back_to_back.s`'s real result explicitly
+(expected: HANG → real sentinel, PASS or FAIL either being progress — report which).
+
+Given this task changes real FP-EU-adjacent RTL (new datapath, new microcode groups), run a
+real OOC synth gate — check machine load first per the standing rule — and report the real
+number.
+
+- [ ] **Step 7: Commit**
+
+Reference Task 14's triage doc and the Task 14b investigation report. Record D1-D7 explicitly
+in the commit message (these are load-bearing architectural decisions for anyone touching FP
+store direction later). Add the Divergence Register entry (D3's PC-relative rejection) to
+`docs/superpowers/specs/2026-08-14-fpu-fpsp-design.md` in the same commit or a clearly-linked
+follow-up commit.
+
+```
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+```
+
+---
+
 ### Task 14c: Wire FPCR rounding-mode/exception-enable into the FP EU (NEW, post-Task-14)
 
 **Why this task exists.** Task 14's ported-test-corpus triage (corrected, see
