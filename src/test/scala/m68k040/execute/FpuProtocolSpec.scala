@@ -76,11 +76,13 @@ class FpuProtocolSpec extends AnyFunSuite {
   private val Seven    = ext(false, 0x4001, BigInt("E000000000000000", 16))
   private val MinusOne = ext(true,  0x3FFF, Msb)
   private val MinusTwo = ext(true,  0x4000, Msb)
+  private val PosInf   = ext(false, 0x7FFF, Msb)
 
   // FPCC internal layout (2026-08-09 spec section 8): bit0=N, bit1=Z, bit2=I, bit3=NaN.
   private val CcNone = 0
   private val CcN    = 1
   private val CcZ    = 2
+  private val CcI    = 4
 
   // FP opmodes (raw extension-word [6:0]).
   private val OpFSQRT = 0x04
@@ -90,6 +92,9 @@ class FpuProtocolSpec extends AnyFunSuite {
   /** Physical FP source registers preloaded once per test by `preloadOperands`. */
   private val POne = 1; private val PTwo = 2; private val PFour = 3
   private val PMinusOne = 4; private val PHalf = 5; private val PThree = 6
+  /** +0.0, preloaded separately (not by `preloadOperands`) only by the tests that need a
+    * genuine divide-by-zero divisor (F1 fix, Task 15 review). */
+  private val PZero = 7
 
   /** One FP operation under test: which two physregs it reads and what it must produce. */
   private case class Op(rob: Int, opmode: Int, a: Int, b: Int, pdst: Int, pcc: Int,
@@ -578,6 +583,99 @@ class FpuProtocolSpec extends AnyFunSuite {
       tick(FpuCore.FixedLatency + 10)
       assert(comps.size == settled, "an extra completion arrived after the 4 in-flight ops drained")
       readBackAll(ops, "4-in-flight")
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════════════════
+  // Requirement 2 (raising-op half). Review finding F1 (Task 15 review, 2026-08-15): the
+  // 4-in-flight test above only proves "no duplicate or missing status observation" for
+  // EXACT operations -- an accrual list that stays empty the whole time is unfalsifiable
+  // against a lane that never wires the accrual port at all. This test supplies the
+  // missing positive case: a genuinely-raising FDIV (1.0/0.0, architecturally DZ) issued
+  // concurrently with 3 exact fixed-lane ops, proving the accrual fires EXACTLY once, with
+  // the correct bit, and does not leak onto the exact ops' silence. Kept as its own test
+  // (not folded into the 4-in-flight test above) because the two lanes complete at very
+  // different latencies -- mixing them breaks that test's issue-order-equals-completion-
+  // order assumption (`checkExactlyOnce`), which is exactly the assumption Requirement 3's
+  // collision test below also has to route around with per-robId, not per-index, checks.
+  // ══════════════════════════════════════════════════════════════════════════════════════
+
+  test("FP status observation: a genuinely-raising FDIV (1.0/0.0) accrues exactly one FPSR " +
+       "exception status with DZ set, concurrently with 3 exact fixed-lane ops that still " +
+       "accrue nothing", VerilatorTest) {
+    dut.doSim { d =>
+      val h = new Harness(d); import h._
+      boot()
+      preloadOperands()
+      preloadFp(PZero, Zero)
+      clearLog()
+
+      // 3 exact fixed-lane ops (unchanged negative-case shape, reused from `eightOps`) plus
+      // one genuinely-raising FDIV on the iterative lane, presented back to back so the
+      // FDIV is actually in flight while the 3 fixed ops are still resident -- the same
+      // concurrency the 4-in-flight test above establishes, extended with a raising op.
+      val exactOps = eightOps(robBase = 50, pdstBase = 9).take(3)
+      val divOp    = Op(53, OpFDIV, POne, PZero, 12, 12, PosInf, CcI, "FDIV 1.0/0.0 (DZ)")
+      val ops      = exactOps :+ divOp
+      for (o <- ops) { present(o); acceptNow(s"raising-op batch ${o.label} (rob=${o.rob})") }
+      s.iValid #= false
+
+      drainTo(ops.size, FpDivSqrtCore.WorstCaseLatency + FpuCore.FixedLatency + 60,
+        "raising-op batch")
+
+      // Per-op association: exact value/FPCC/wakeup routing for all 4, checked by robId
+      // rather than by completion index (the two lanes finish in different orders).
+      for (o <- ops) {
+        assert(comps.count(_.rob == o.rob) == 1,
+          s"${o.label}: ${comps.count(_.rob == o.rob)} completions for rob=${o.rob}")
+        val ws = fpWrites.filter(_.addr == o.pdst)
+        assert(ws.size == 1,
+          s"${o.label}: ${ws.size} FP PRF write(s) to physreg ${o.pdst} (duplicate or missing)")
+        assert(ws.head.data == o.want,
+          f"${o.label}: wrote 0x${ws.head.data}%020X to FP[${o.pdst}], expected 0x${o.want}%020X")
+        val cs = fpccWrites.filter(_.addr == o.pcc)
+        assert(cs.size == 1, s"${o.label}: ${cs.size} FPCC write(s) to ${o.pcc}")
+        assert(cs.head.data == BigInt(o.cc),
+          s"${o.label}: FPCC[${o.pcc}] = ${cs.head.data}, expected ${o.cc}")
+        assert(wakeups.count(_._2 == o.pdst) == 1, s"${o.label}: FP wakeup count for ${o.pdst}")
+        assert(fpccWakes.count(_._2 == o.pcc) == 1, s"${o.label}: FPCC wakeup count for ${o.pcc}")
+      }
+
+      // THE POSITIVE CASE. Correlate accrual events to completions by cycle: the arbiter
+      // delivers at most one FP result per cycle absent an engineered collision (Req 3), so
+      // a cycle-keyed join is sound here and lets this test tell "the FDIV accrued" apart
+      // from "one of the exact ops accrued" without relying on completion order.
+      val compByCycle = comps.map(c => c.cycle -> c.rob).toMap
+      assert(compByCycle.size == comps.size,
+        "two completions shared a cycle -- the cycle-keyed accrual correlation below is unsound")
+      val accrualByCycle = accruals.toMap
+      assert(accrualByCycle.size == accruals.size, "two accruals shared a cycle")
+
+      assert(accruals.size == 1,
+        s"expected exactly one FPSR exception accrual (the raising FDIV), saw " +
+        s"${accruals.size}: " + accruals.map { case (c, v) => f"cycle $c = 0x$v%02X" }.mkString(", "))
+      val (accCycle, accByte) = accruals.head
+      assert(compByCycle.get(accCycle).contains(divOp.rob),
+        s"the sole accrual at cycle $accCycle does not line up with the FDIV's completion " +
+        s"(rob completing that cycle: ${compByCycle.get(accCycle)}, expected ${divOp.rob})")
+      assert((accByte & 0x04) != 0,
+        f"the FDIV 1.0/0.0 accrual byte 0x$accByte%02X does not have DZ (bit 2) set")
+
+      // THE NEGATIVE CASE, kept intact and re-proven under real concurrent traffic: none of
+      // the 3 exact ops produced an accrual of their own.
+      for (o <- exactOps) {
+        val c = comps.find(_.rob == o.rob).get.cycle
+        assert(!accrualByCycle.contains(c),
+          s"${o.label} (an exact fixed-lane op) accrued FPSR status " +
+          f"0x${accrualByCycle.getOrElse(c, 0)}%02X at its own completion cycle $c -- exact " +
+          "ops must never touch FPSR")
+      }
+
+      val settled = comps.size
+      tick(FpDivSqrtCore.WorstCaseLatency + 10)
+      assert(comps.size == settled, "an extra completion arrived after the raising-op batch drained")
+      assert(accruals.size == 1, "an extra FPSR accrual arrived after the raising-op batch drained")
+      readBackAll(ops, "raising-op batch")
     }
   }
 
