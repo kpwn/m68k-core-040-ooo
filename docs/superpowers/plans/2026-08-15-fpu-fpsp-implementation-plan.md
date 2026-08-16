@@ -7886,641 +7886,351 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 ### Task 9b: FMOVEM control-register LIST form (multi-register FPCR/FPSR/FPIAR)
 
-**Placement.** Inserted immediately after Task 9 and before Task 10 (the reduced-scope `fpuSoftwareComplete`/`fpuCmdWord` task), without renumbering. Rationale: this task is a direct, mechanical extension of `FpuControlPlugin`/`SysKind.FMOVE_FPCTRL`/`ExceptionUnit`'s S_APPLY arm, all of which Task 9 creates — it adds zero new committed state and zero new ExceptionUnit/RobPlugin logic, reusing Task 9's plumbing verbatim (see "What this task reuses unmodified" below). It has no dependency on Task 10 (the `faultUsesNextPc`-trigger-field task) or Task 11 (FSAVE/FRESTORE) in either direction.
+**REVISED 2026-08-16.** The original version of this task was dispatched and correctly
+reported `STATUS: BLOCKED` — its design assumed a multi-register transfer could be built from
+several separate `SysKind.FMOVE_FPCTRL` sysOp instances interleaved with ordinary loads/stores.
+That is architecturally impossible: a `sysOp` retiring at the ROB head is a serializing
+pipeline boundary (`RobPlugin.scala`'s `excActive`-driven squash + `ExceptionUnit.scala`'s
+`S_REDIR`, which redirects to the **macro** instruction's next-PC) — at most one sysOp can
+take effect per macro-instruction, and it must be the truly last µop. The blocked attempt's
+full analysis (real RTL citations, an independently-verified impossibility proof, and a real
+primary-source resolution of the register-order question) is preserved at
+`.superpowers/sdd/2026-08-15-fpu-fpsp-implementation-plan/task-9b-report.md` — read it for the
+full derivation; it is not repeated here.
 
-**Why this task exists (audit finding, restated for the record).** The real Motorola/Apple FPSP ROM kernel's own installed vector-11 handler begins with `FMOVEM.L FPIAR/FPSR/FPCR,-(A7)` (opword `F227`, ext word `BC00` — design spec Decision 8). Task 9 explicitly scoped this out (`popcount(RRR) == 1` only; Task 9's own scope text: *"multi-register masks / the FMOVEM-control list ... all stay failing"*), which means the flagship `fpu_fpsp_selfrecursion_repro.s` validation test cannot pass without this task. This is a hardware-privilege/correctness item, not a nice-to-have: without it, no real ROM FPSP kernel image can be booted through vector 11 at all — it re-traps on its own first instruction.
+**Read this first — it is this task's binding design, already brainstormed, reviewed, and
+approved:** `docs/superpowers/specs/2026-08-16-fp-control-multiword-transfer-design.md`.
+That document's Decisions 1-3 are the mechanism this task implements; do not deviate from them
+without flagging why. Its Decision 4 (the `orFpsrExc` caveat) and Decision 5 (what stays
+untouched) apply to this task directly — do not touch `RobPlugin.scala`'s `excActive`/
+`excSquash`/`flushing` or `ExceptionUnit.scala`'s `S_REDIR`/`S_DRAIN` FSM shape; this task's
+entire point is that none of that needs to change.
+
+**Placement.** Immediately after Task 9, before Task 10. Depends on Task 9's `FpuControlPlugin`/
+`SysKind.FMOVE_FPCTRL`/`ExceptionUnit` `S_APPLY` arm (extends them; does not replace them). No
+dependency on Task 10 or Task 11 in either direction — but this task's design is also what
+unblocks Task 11 (FSAVE/FRESTORE), which should be re-briefed against the same design spec
+before it is dispatched (separately, after this task lands and is reviewed).
+
+---
+
+## The mechanism (summary — the design spec is authoritative, this is the task-scoped restatement)
+
+**Load direction (`mem → FPIAR/FPSR/FPCR`):**
+```
+[ordinary microcode: MLoad × popcount(mask)]   mem -> T0..T(popcount-1)
+[ONE terminal sysOp, NEW]                       T0..T(popcount-1) -> {selected registers}
+```
+The terminal sysOp is a straightforward generalization of Task 9's existing `FMOVE_FPCTRL`
+`S_APPLY` arm: instead of a one-hot `sysCapRc` gating a mutually-exclusive `elsewhen` chain
+(exactly one of `setFpcr`/`setFpsr`+FPCC-write/`setFpiar`), the generalized arm pulses **any
+subset** of them in the same single cycle — three independent, non-exclusive `when(mask(k))`
+terms. This is not a new FSM state.
+
+**Store direction (`FPIAR/FPSR/FPCR → mem`):**
+```
+[NEW: plain combinational reads]   fpuCtrl.fpcr/.fpsr/.fpiar -> Ti   (no sysOp, no scoreboard —
+                                                                       see design spec Decision 3)
+[EXISTING mechanism, reused]       ordinary readsFpcc consumer -> Tj  (dynamic-wakeup-protected,
+                                                                       same as Fbcc/FScc)
+[ordinary microcode: MStore × popcount(mask)]   T0..T(popcount-1) -> mem
+```
+**No sysOp is used in the store direction at all.** The plain reads of `fpcr`/`fpsr`/`fpiar`
+are safe for the same reason `MmuControlService`'s live reads already are: their only writer
+is always a serializing sysOp, whose own retirement unconditionally squashes and re-fetches
+everything younger, so a stale speculative read can never retire. FPCC is read via the
+**existing** renamed-register/dynamic-wakeup machinery — decode the reading microcode row as
+an ordinary `readsFpcc` consumer with a real `pFpccSrc` tag, exactly like any other
+FPCC-consuming instruction; do not bypass this or invent a new path for it.
 
 ---
 
 ## Files
 
-- Modify: `src/main/scala/m68k040/decode/OperationDecoder.scala` (extend the Task 9 `is(0xF)` arm)
-- Modify: `src/main/scala/m68k040/frontend/PredecodeWord.scala` (extend the Task 9 length-framing branch)
-- Modify: `src/main/scala/m68k040/decode/Microcode.scala` (new `Sel` constants, new `USysCtrlMove` UOp, `DescBits`/`resolve`/`resolveFromBits`/`descToBits` extensions, new ROM row-generator + entry table)
-- Modify: `src/main/scala/m68k040/decode/DecodeStage.scala` (`ucEntry`/`ucEntryCtx` dispatch for the new entry family, mirroring the existing MOVE16 dispatch)
-- Test: `src/test/scala/m68k040/decode/MicrocodeFmovemCtrlSpec.scala` (new — row-generator unit tests, mirrors `MicrocodeResolveEquivalenceSpec`'s role)
-- Test (modify): `src/test/scala/m68k040/decode/OperationDecoderSpec.scala`, `src/test/scala/m68k040/frontend/PredecodeWordSpec.scala`
-- Test (modify): `src/test/scala/m68k040/execute/FpuControlPluginSpec.scala` or a new `src/test/scala/m68k040/lockstep/FmovemCtrlListSpec.scala` — whitebox round-trip + order tests (see Step 9; the plan's own convention is loose here, either landing spot is acceptable, but put the whitebox order test in the lock-step-adjacent file since it needs the same full-core DUT machinery Task 9's Step 10 whitebox test uses)
+- Modify: `src/main/scala/m68k040/decode/OperationDecoder.scala` — extend Task 9's `fpCtrlOpBase`
+  decode gate (`is(0xF)` arm) to also admit `popcount(mask) ∈ {1,2,3}` with a memory-alterable
+  `<ea>` (register-direct `<ea>` for `popcount==1` stays on Task 9's existing fast-crack path,
+  unchanged — this task's arm is specifically for the microcoded, `<ea>`-bearing forms).
+- Modify: `src/main/scala/m68k040/frontend/PredecodeWord.scala` — length framing for the new
+  arm (opword + command ext + the `<ea>`'s own extension words, per the confirmed word-count
+  model: length is independent of `popcount`).
+- Modify: `src/main/scala/m68k040/decode/Microcode.scala` — new `Sel` selectors for the plain
+  `fpuCtrl.fpcr`/`.fpsr`/`.fpiar` reads (mirroring the existing `SEaBase`/`SEaDispLo` selector
+  shape — a `Sel` case object per register, resolved in both `resolve()` and `resolveFromBits()`
+  by reading the real `FpuControlService` accessors, exactly the same dual-path discipline every
+  other selector already follows); a generalized `USysCtrlMoveBatch` (or extend the existing
+  single-register `USysCtrlMove`-shaped case, integrator's call which is cleaner given the real
+  current file) `UOp` for the terminal load-direction sysOp, carrying a 3-bit mask instead of a
+  single `rc`; the row-generator functions for both directions' programs (mirrors the original
+  blocked attempt's `fmovemCtrlProgram`-shaped generator — same idea, different row content per
+  direction per this task's mechanism above); `DescBits`/`resolve`/`resolveFromBits`/
+  `descToBits` extensions for both the new `Sel`s and the new/generalized `UOp`.
+- Modify: `src/main/scala/m68k040/exception/ExceptionUnit.scala` — generalize the existing
+  `FMOVE_FPCTRL` `S_APPLY` arm from one-hot-exclusive to any-subset (Decision 2). **This is the
+  only `ExceptionUnit.scala` change this task makes** — no new FSM states, no touch to
+  `S_REDIR`/`S_DRAIN`/`excActive`/anything squash-related.
+- Modify: `src/main/scala/m68k040/decode/DecodeStage.scala` — `ucEntry`/`ucEntryCtx` dispatch
+  for the new entry family, data-dependent on `(direction, addressing-class, mask)` exactly like
+  the blocked attempt's Step 7 described — Task 6b's `ucFpRealEntryOk`/`ucFpEntryForFmt`
+  (`DecodeStage.scala`, the 18-way FP-memory-load dispatch) is the concrete precedent to mirror,
+  not the smaller `MI_JMP_ENTRY`/`MI_JSR_ENTRY` pair.
+- Test: `src/test/scala/m68k040/decode/MicrocodeFmovemCtrlSpec.scala` (new) — row-generator unit
+  tests for both directions.
+- Test (modify): `src/test/scala/m68k040/decode/OperationDecoderSpec.scala`,
+  `src/test/scala/m68k040/frontend/PredecodeWordSpec.scala`, `src/test/scala/m68k040/execute/
+  FpuControlPluginSpec.scala` (the generalized `S_APPLY` arm needs its own directed multi-register
+  test, alongside Task 9's existing single-register ones).
+- Test (modify or new): a lock-step-adjacent whitebox file for the register-order round-trip
+  proof (see Step 8) — the blocked attempt's own plan for this (two variants, whitebox for
+  `-(An)`, lock-step for non-predecrement) still applies and is unaffected by this redesign.
 
-**No changes needed to:** `Services.scala`, `FpuControlPlugin.scala`, `DecodedUop.scala` (`SysKind`), `ExceptionUnit.scala`, `RobPlugin.scala`, `FullCoreSynth.scala`. See "What this task reuses unmodified" below for why each is untouched — this is a real, load-bearing design property of this task, not an oversight, and is what keeps its risk bounded despite the added addressing-mode complexity.
+**No changes needed to:** `Services.scala`, `RobPlugin.scala`'s `excActive`/`excSquash`/
+`sysPrivFault` (the new `SysKind` — whatever you name it — is non-privileged exactly like
+Task 9's `FMOVE_FPCTRL`, and gets that for free via the same `sysUserOk` mechanism, extended by
+one more `SysKind` equality term or an `isInstanceOf`-style set check, integrator's call),
+`DecodedUop.scala`'s `SysKind` enum beyond appending the one new element the generalized design
+needs (confirm whether Task 9's existing `FMOVE_FPCTRL` can be reused directly for the batch
+case — since `sysCapRc` is already a multi-bit field carrying a mask, it may not even need a
+*new* `SysKind* at all, just the generalized `S_APPLY` arm treating an already-multi-bit
+`sysCapRc` as "any subset" instead of assuming a caller-enforced one-hot value; check this
+before minting a new enum element — it may be pure reuse), `FullCoreSynth.scala` (no new
+top-level wiring — this task's new machinery lives entirely inside `ExceptionUnit`, `Microcode`,
+and decode).
+
+---
 
 ## Interfaces
 
-- Produces: nothing new at the service level. This task is pure decode/microcode-engine surface area sitting *in front of* Task 9's existing `FpuControlService`.
-- Consumes: `FpuControlPlugin`'s `setFpcr`/`setFpsr`/`setFpiar`/`fpcr`/`fpsr`/`fpiar` — indirectly, through `SysKind.FMOVE_FPCTRL`'s existing `ExceptionUnit` S_APPLY arm (Task 9 Step 8), completely unmodified.
-- Consumed by: nothing yet in this plan (Task 11's FSAVE/FRESTORE frames don't touch FMOVEM; the acceptance corpus does, via Task 14's triage sweep — `fpu_fmovem_ctrl_reg.s`, `fpu_fpsp_selfrecursion_repro.s`, and (optionally, see Scope) `fpu_fmove_mem_ea_fpcr_fpsr_no_fline.s`).
+- Consumes: Task 9's `FpuControlService` (`setFpcr`/`setFpsr`/`setFpiar`/`fpcr`/`fpsr`/`fpiar`),
+  unchanged surface, read directly (new) for the store direction and written via the
+  generalized `S_APPLY` arm (extended) for the load direction. `RenameStage.committedPhysFpcc`
+  + the existing FPCC regfile read port (Task 9's `fpccRd`-shaped acquisition) for the load
+  direction's FPCC write; the **existing** `readsFpcc`/`pFpccSrc`/dynamic-wakeup path
+  (Task 2/3/Task 9b's own new microcode row, decoded as an ordinary FPCC consumer) for the store
+  direction's FPCC read — do not build a second FPCC read mechanism.
+- Consumes: the generic EA-decode machinery (`ucCasEaDec`/`EaDecoder.decode`), unconditional for
+  every microcoded instruction — populates `<ea>` addressing for the ordinary `MLoad`/`MStore`
+  rows exactly like every other microcode customer.
+- Produces: nothing new at the service level — this task is decode/microcode/one-generalized-
+  `S_APPLY`-arm surface area sitting in front of Task 9's existing `FpuControlService`.
 
 ---
 
-## What this task reuses unmodified (read this before the steps below)
+## Encoding, register order — carried forward from the blocked attempt, already verified
 
-This is the single most important design property of this task, worth stating up front because it is what makes a genuinely harder addressing-mode problem (arbitrary `<ea>`, variable transfer count, mode-dependent order, memory-alterable restriction) tractable without inventing new hardware surface:
-
-1. **`SysKind.FMOVE_FPCTRL` itself.** Not a new `SysKind` — every register transfer in a multi-register list is decomposed (Step 6) into a pair of micro-ops that individually look *exactly* like a Task 9 single-register `FMOVE.L Dn,FPcr` / `FMOVE.L FPcr,Dn`, except `Dn` is replaced by one of the microcode engine's existing scratch temps (`T0`/`T1`/`T2`, physical register IDs 16/17/18 — `Microcode.scala:29-31`). `ExceptionUnit`'s S_APPLY arm for `FMOVE_FPCTRL` (Task 9 Step 8, `ExceptionUnit.scala` new code at line ~6250-6280) and `RobPlugin`'s `sysPrivFault` exclusion (Task 9 Step 8, keyed on `p0.sysKind =/= SysKind.FMOVE_FPCTRL`) both already treat every occurrence of this `sysKind` identically regardless of which physical register carries the value — so both apply to this task's micro-ops with **zero additional code**, not "the same shape ported over."
-
-2. **The generic EA-decode machinery, already wired for every microcode customer.** `DecodeStage.scala:1112`: `ucCasEaDec = EaDecoder.decode(ucEntryPkt.words(0)(5 downto 0), ucEntrySpec.size, ...)` runs unconditionally for *every* microcoded instruction, decoding whatever `<ea>` that instruction's own opword encodes (bits 5:0) and populating `ucEntryCtx.eaBase`/`eaBaseValid`/`eaDispLo`/`eaIndexReg`/`eaIndexValid`/`casAutoMode`/`casAutoDelta` (`DecodeStage.scala:1127-1128, 1728-1731`) from it. This is misleadingly named after its first customer (CAS) but is already reused, unchanged, by MOVES (`Microcode.scala:1873`'s `SMovesAn` reads `ctx.casAutoMode`). Once this task's opword routes through a `ucEntry` (Step 7), `ctx.eaBase`/`eaDispLo`/`casAutoMode`/`casAutoDelta` are populated **for free**, correctly, for whatever `<ea>` mode FMOVEM-control's own opword encodes — this task adds **no new EA-decode logic**, only new ROM rows that *reference* these already-populated fields via the existing `SEaBase`/`SEaDispLo` selectors (`Microcode.scala:268`) and the existing `AEaCasLoad`/`AEaCasStore` auto-mode kinds (`Microcode.scala:180-181`).
-
-3. **`fpCtrlOpBase`/`fpCtrlDir`/`fpCtrlMask` from Task 9's `OperationDecoder.scala` arm** (Task 9's own "Step 5: `OperationDecoder.scala` recognition arm") — this task's decode gate is a sibling `when` inside the same `is(0xF)` arm, reusing the identical opword/ext-word field extraction, only changing the mask-popcount and `<ea>`-mode tests (Step 3).
-
-4. **`eaExt`, `PredecodeWord.scala:144`** — the existing generic `<ea>` extension-word-length helper, already used by every ordinary `<ea>`-bearing instruction in this file (line-0 immediates, MOVE, etc). This task's length framing (Step 4) calls it exactly the way the line-0-immediate arm already does (`PredecodeWord.scala:241-243`'s `immDstEaW`/`immDstEaKnown` pattern) — no new length-computation logic, only a new call site.
-
-5. **The LUT-reduction dual-path discipline** (`Microcode.scala:236-258`) — `resolve()` (compile-time reference oracle) and `resolveFromBits()` (the real hardware path reading `DescBits` out of `DecodeStage`'s BRAM `ucRomMem`) must both be extended identically, exactly as every existing `UOp` case already is. This is not new to this task, but is flagged because it is the easiest piece to half-implement (edit `resolve()`, forget `resolveFromBits()`, and get a test suite that passes against the Scala oracle but is wrong in synthesized hardware — `MicrocodeResolveEquivalenceSpec` exists specifically to catch this class of mistake and MUST be re-run, see Step 8).
-
----
-
-## Encoding, register order, and memory footprint — VERIFIED, not invented
-
-### Encoding (confirms/extends Task 9's own table)
-
-Task 9 already independently confirmed (three ways: direct `m68k-linux-gnu-as -m68040 -m68881` assembly, the vendored corpus's own toolchain-verified header comments, and the design spec's Decision 8 quote):
+**Real, toolchain-confirmed encoding** (`m68k-linux-gnu-as -m68040 -m68881`, full output in
+`.superpowers/sdd/2026-08-15-fpu-fpsp-implementation-plan/task-9b-report.md` §2 — re-run it
+yourself as this task's own Step 1, don't just trust the citation, but expect it to reproduce
+exactly):
 
 ```
 opword : 1111 001 000 mmmrrr        =  0xF200 | <ea>       (line-F, cpID=001, opclass 000)
 ext    : ddd RRR 0000000 000
          ddd = ext[15:13] : 100 = <ea>  ->  control register(s)   (sysReadDir = False)
                             101 = control register(s) -> <ea>    (sysReadDir = True)
-         RRR = ext[12:10] : register-select MASK {FPCR, FPSR, FPIAR}, MSB-first
+         RRR = ext[12:10] : bit12=FPCR, bit11=FPSR, bit10=FPIAR (MSB-first)
 ```
+`F227 BC00` = `FMOVEM.L FPIAR/FPSR/FPCR,-(A7)` (the real Q700 ROM FPSP prologue, mask=111).
+`F21F 9C00` = `FMOVEM.L (A7)+,FPIAR/FPSR/FPCR` (load direction, mask=111 — **note**: the blocked
+attempt found the plan's original draft had this wrong as `BC00`; `9C00` is correct, confirmed
+by live toolchain re-run).
+`F227 B800` = `FMOVEM.L FPCR/FPSR,-(A7)` (mask=110, 2-register case — likewise corrects an
+original draft error, `8C00` was wrong).
 
-Task 9 handled `popcount(RRR) == 1`. This task handles `popcount(RRR) == 2` or `3` (i.e. `RRR ∈ {110, 101, 011, 111}`) — `RRR == 000` stays illegal (falls through unchanged; there is no evidence a real 68040 treats an empty list as a legal no-op, and treating it as one is a needless risk for zero benefit).
+Word-count model, confirmed: length = 2 (opword + command ext) + the `<ea>`'s own extension
+words, **independent of `popcount`**. `PredecodeWord`'s framing (Step 2 below) must reflect
+this — the mask's popcount affects execute-time transfer count and microcode-program length,
+never the fetched instruction's own length.
 
-Two confirmed real encodings anchor this task, both already cited by Task 9:
-- `F228 BC00` = `FMOVEM.L FPIAR/FPSR/FPCR,(0,A0)` — `ddd=101` (read: control→`<ea>`), `RRR=111`, `<ea>` mode 101 (`(d16,An)`, reg=000=A0). **Flag:** Task 9's own citation of this abbreviates the actual disassembly to 2 words (`F228 BC00`); mode 101 (`(d16,An)`) requires a *third* word (the 16-bit displacement, here presumably `0000`). Step 1 below re-confirms the true word count via the toolchain rather than trusting the abbreviated citation transitively — this is exactly the kind of "corroborated but not independently re-run" gap Task 9's own Step 1 discipline exists to close.
-- `F227 BC00` = the real Q700 ROM FPSP prologue, `FMOVEM.L FPIAR/FPSR/FPCR,-(A7)` — `ddd=101`, `RRR=111`, `<ea>` mode 100 (`-(An)`, reg=111=A7). Mode 100 needs **zero** extra `<ea>` extension words (predecrement never carries a displacement) — this one genuinely is exactly 2 words, matching the design spec's own quote.
-
-### Per-register transfer width and instruction length (resolving the plan-author's framing ambiguity)
-
-**FPCR/FPSR/FPIAR are each 32 bits** (confirmed: Task 9's own `FpuControlService` interface, `fpcr`/`fpsr`/`fpiar: UInt` all 32 bits; Musashi's `fmove_fpcr`, `tools/musashi/musashi/m68kfpu.c:1641-1656`, uses `WRITE_EA_32`/`READ_EA_32` for all three unconditionally). So each selected register costs exactly one 32-bit memory transfer — **`popcount(mask) × 4` bytes total**, matching real hardware and matching Musashi's own dispatch (`m68kfpu.c:1846-1851`, cases `0x4`/`0x5` both route to the identical `fmove_fpcr(w2)` regardless of `RRR` population — there is no separate "list" opcode, only a mask with more bits set).
-
-**Critically, this does NOT lengthen the fetched instruction.** `popcount(mask)` changes how many *memory transfers* the instruction performs at execute time (and therefore how many microcode rows it expands into, Step 6) — it does **not** add extra 16-bit words to the instruction stream at fetch time. The instruction's fetched length is governed purely by the `<ea>`'s own addressing mode, exactly like any other `<ea>`-bearing instruction (a `MOVE.L (d16,An),D0` is 2 words regardless of what value ends up transferred; `FMOVEM.L ...,(d16,An)` is `2 + (ea's own extension words)`, regardless of `popcount(mask)`). This resolves the ambiguity in this task's assignment prompt directly: the "confirm the real per-register transfer width" question has a clean, boring answer (32-bit, matching the architectural register width) and does *not* imply any extra-ext-word-per-register scheme — Step 1 below intentionally re-verifies this by disassembling a mask=111 instruction against a non-trivial `<ea>` (`(d16,An)`) and checking the total word count matches "opword + command-ext + ea's own extension words", not "opword + command-ext + 3×something".
-
-### Register order — the real finding, and why Musashi cannot be trusted as an oracle for it
-
-This is the one genuinely new architectural fact this task introduces, and it is exactly the kind of thing task #199/#211-class history in this project says must be checked, not assumed (per this session's own standing instruction — the integer MOVEM predecrement/order asymmetry was flagged explicitly as a thing to verify against, not copy blindly).
-
-**Derivation (round-trip consistency, worked by hand).** Musashi's `fmove_fpcr` (`m68kfpu.c:1635-1660`) processes the three register bits in a **fixed** order — `if (reg & 4)` (FPCR) always first, then `reg & 2` (FPSR), then `reg & 1` (FPIAR) — **regardless of addressing mode or direction**. `WRITE_EA_32`/`READ_EA_32` (`m68kfpu.c:918-989`, `495-563`) re-evaluate `EA_AY_PD_32()`/`EA_AY_PI_32()` **fresh on every call**, so for `mode=4` (`-(An)`) each of the (up to three) calls independently decrements `An` by 4 before writing.
-
-Tracing `FMOVEM.L FPIAR/FPSR/FPCR,-(A7)` (`F227 BC00`, mask=111) through Musashi's actual fixed FPCR-first order: call 1 (FPCR) decrements A7 to `S-4`, writes FPCR there; call 2 (FPSR) decrements to `S-8`, writes FPSR; call 3 (FPIAR) decrements to `S-12`, writes FPIAR. Final memory image (ascending address from the new SP): `S-12`=**FPIAR**, `S-8`=FPSR, `S-4`=**FPCR**.
-
-Now trace the *matching restore*, `FMOVEM.L (A7)+,FPIAR/FPSR/FPCR` (same mask, postincrement, Musashi's *same* fixed FPCR-first order): call 1 (FPCR) reads current A7 (`S-12`) — which the store above put **FPIAR** into — and assigns it to `REG_FPCR`. **This is wrong: it silently swaps FPCR and FPIAR.** Musashi's fixed processing order is round-trip-*inconsistent* for `-(An)`; the *only* way a predecrement-store followed by a postincrement-load (with the same register-list mnemonic, the single most common real-world usage pattern — exactly what the FPSP ROM prologue/epilogue pair does) round-trips correctly is if the **store** direction processes the *reversed* order (FPIAR, FPSR, FPCR — LSB-first) specifically for `-(An)`, while every other mode (and the postincrement reload) keeps the normal MSB-first (FPCR, FPSR, FPIAR) order. Reworking the trace with that reversal: predecrement store now writes FPCR at `S-12` (final SP), FPSR at `S-8`, FPIAR at `S-4`; the postincrement reload (normal order) reads FPCR from `S-12`, FPSR from `S-8`, FPIAR from `S-4` — an exact round trip.
-
-**This is precisely the same asymmetry the integer MOVEM instruction has** (predecrement reverses the scan/register-bit-mapping direction relative to every other addressing mode, specifically so a `-(An)` push and a matching `(An)+` pop round-trip correctly) — a fact this project's own history has already had to get right once for the integer instruction.
-
-**Independent corroboration (since I could not obtain a directly quotable primary-source PRM paragraph — see the flag below).** The WinUAE project's FPU-emulation-accuracy documentation (Toni Wilen's cycle/bit-exact 68881/68040/68060 reverse-engineering effort, widely regarded as one of the most rigorously-validated 68k FPU emulations that exists, itself independent of Musashi) states directly: *"6888x FPUs with FMOVEM using MODE field=predecrement have inverted register list order, even if actual EA is not predecrement. However, 68040+ only use inverted register order if EA is predecrement."* (source: WinUAE 4.4.0 beta-series changelog thread, `forum.system-cfg.com/viewtopic.php?t=10886`). This independently confirms, for the **exact CPU this project targets (68040)**, exactly the rule the round-trip derivation above requires: inverted order **if and only if** the effective addressing mode is predecrement. Two independent search queries against different indexes returned this same specific, consistently-worded finding.
-
-**CONCLUSION — the rule this task implements:**
-- `<ea>` mode is `-(An)` (predecrement): register processing order is **FPIAR, FPSR, FPCR** (LSB-to-MSB of the `RRR` mask).
-- Every other `<ea>` mode (control, `(An)+`, `(d16,An)`, indexed, absolute, PC-relative): register processing order is **FPCR, FPSR, FPIAR** (MSB-to-LSB), matching Task 9's own single-register-form comment and matching Musashi unconditionally.
-- Direction (load vs. store) does **not** change the order — only which of `WRITE_EA_32`/`READ_EA_32` (real hardware: which of the store-data / load-writeback path) is used per transfer.
-
-**Residual, explicitly flagged (mirrors Task 9 Step 12's own "flagged for primary-source verification" idiom for the AEXC fold — this project does not silently guess, it flags and gates):** repeated attempts to fetch the actual MC68881/MC68882 User's Manual or M68000 Family PRM text (`nxp.com/docs/en/reference-manual/MC68881UM.pdf`, `M68000PRM.pdf`, the bitsavers/archive.org scanned-text mirror) either 404'd or were too large for a single-pass fetch to locate the exact FMOVEM-control paragraph. The WinUAE corroboration above is strong (an independent, CPU-generation-specific, cycle-accuracy-focused source agreeing exactly with the round-trip-derived rule) but is **not** a page-and-section citation from the primary manual. **Before this task's -(An) code path is trusted in production, pin the exact MC68881/MC68882 UM section down** — the manual's own table of contents places this in the FMOVEM instruction description (Section 4, "Move Multiple Registers"/"Move Multiple FPn" — cf. Section 1.4.2 and Section 7.5.1.5 per the manual's structure) — and record the page number in the commit message, exactly as Task 9 Step 12 requires for the AEXC fold. **Do not mark this step done by re-reading this document or the code.**
+**Register order — CLOSED with a real primary-source citation** (Divergence Register entries
+D9/D9a/D9b, `docs/superpowers/specs/2026-08-14-fpu-fpsp-design.md`, both independently
+re-verified against the downloaded PDFs during the blocked attempt's investigation, not just
+asserted):
+- Registers always move in a fixed order: **FPCR first, FPSR second, FPIAR last** — regardless
+  of addressing mode. (M68000 Family PRM, 1992, p. 5-91; corroborated MC68881/MC68882 UM,
+  p. 4-76.)
+- If the addressing mode is `-(An)` predecrement: the address register is decremented **once**,
+  up front, by `4 × popcount(mask)`; registers then transfer starting at the resultant address,
+  ascending, in the same fixed FPCR/FPSR/FPIAR order as every other mode. **There is no
+  per-transfer reversal** — this corrects the original blocked attempt's own derived rule
+  (which produced the identical final memory image via a different, WRONG bus-access order —
+  see D9a for the full correction, including why the attempt's WinUAE corroboration was
+  misattributed to the FP data-register form, not this one).
+- Consequence for the row generator (Step 6): the `-(An)` case's address computation is now
+  just an ordinary predecrement `<ea>` — one up-front `An -= 4×popcount` (an ordinary
+  `UAddDrop`-shaped row, or fold it into the `<ea>` decode if `casAutoMode`/`casAutoDelta`
+  already expresses it for a multi-transfer count; confirm against the real current
+  `EaDecoder`/`ucCasEaDec` behavior for a predecrement `<ea>` with a `popcount`-scaled delta
+  before assuming either shape). The three (or fewer) register rows themselves are generated in
+  the SAME order (FPCR, FPSR, FPIAR, skipping unselected ones) regardless of addressing mode —
+  no direction-dependent order logic anywhere in the generator.
+- Musashi's own `fmove_fpcr` (`m68kfpu.c:1635-1660`) is confirmed wrong for `-(An)` with
+  `popcount ≥ 2` (it re-decrements per transfer in a fixed FPCR-first order, producing the
+  reverse memory layout and a non-round-tripping reload). This core's hardware-correct
+  behavior will genuinely diverge from the Musashi oracle for this narrow case — see Step 8's
+  test-strategy split (whitebox for `-(An)`, lock-step everywhere else) for how this is handled,
+  not "fixed."
 
 ---
 
-## EA-mode restriction for multi-register masks
+## EA-mode restriction, scope — narrower question than the blocked attempt's, since Decision 1 removed the asymmetry
 
-A multi-bit mask requires a **memory-alterable** `<ea>` — `Dn` (mode 000) and `An` (mode 001) are excluded, and an immediate `<ea>` (mode 111/reg 100) is meaningless for a *destination* list and excluded for both directions. This is not a stylistic restriction; it is forced by the mechanism itself: Musashi's `WRITE_EA_32`/`READ_EA_32` (`m68kfpu.c:918-989`, `495-563`) are called once per selected register with the **identical** `ea` (mode+reg) each time — for mode 0 (`Dn`) or mode 1 (`An`), every call would read/write the **same** single register, silently clobbering all but the last-processed value. No real CPU could implement a multi-register list this way; the standard 68k pattern for every other "register list" instruction (integer MOVEM, and FMOVEM's own FP-data-register-list form) is to restrict multi-element list moves to genuinely memory-addressing modes. This is corroborated directly (not merely inferred) by Musashi's own `fmovem()` function (the FP0-FP7 data-register-list sibling, `m68kfpu.c:1662-1750`) which implements **only** control-addressing and postincrement/predecrement modes (`mode 2` and `mode 0` in its own local `mode` variable, i.e. control and predecrement — `default: fatalerror(...)` for everything else) — i.e. Musashi's own author already encoded "list moves reject register-direct modes" as the accepted convention for the sibling instruction; this task's decode gate applies the identical restriction to the control-register list.
+A multi-bit mask requires a memory-alterable `<ea>` (excludes `Dn`/`An`/`#imm` — a multi-bit
+mask against a register-direct `<ea>` is architecturally meaningless, since each selected
+register would read/write the identical single location; Musashi's own sibling FP-data-list
+`fmovem()` enforces the identical restriction, `m68kfpu.c:1662-1750`). This is unchanged from
+the blocked attempt's own EA-mode gate (`fpCtrlListEaMem`, memory-alterable modes only,
+PC-relative rejected for both directions conservatively — carry that gate forward verbatim,
+it was correct).
 
-**Decode-time gate (Step 3):** `<ea>` mode ∈ {010 (`(An)`), 011 (`(An)+`), 100 (`-(An)`), 101 (`(d16,An)`), 110 (`(d8,An,Xn)` brief or full), 111/000 (`(xxx).W`), 111/001 (`(xxx).L)`}. `111/010` (`(d16,PC)`) and `111/011` ((`d8,PC,Xn`)) are PC-relative — read-only in real hardware for every other memory-alterable-gated instruction in this codebase (`PredecodeWord.scala:127-129`'s `memDestExt` explicitly documents PC-relative as "NOT alterable... Left rejected") — so this task rejects them for **both** directions too, conservatively, rather than allowing an asymmetric "load-only" carve-out. This can be revisited as a fast-follow if a real corpus test needs it; nothing in the vendored corpus's header comments (`fpu_fmovem_ctrl_reg.s`) asks for it.
-
----
-
-## Scope, explicit
-
-**In scope:** `<ea>` = any memory-alterable mode (the set above), `popcount(mask) ∈ {2, 3}`.
-
-**Recommended, but the integrator's call:** extend the *same* mechanism to also cover `popcount(mask) == 1` with a memory `<ea>` — this is the one piece of Task 9's own deferred scope (`fpu_fmove_mem_ea_fpcr_fpsr_no_fline.s`) that this task's machinery closes for free: the row-generator (Step 6) is already parametrized on `mask` generically, and `popcount==1` is simply one more (cheaper, 2-row) input to the same generator with no new code path. Including it costs one relaxed inequality in the Step 3 decode gate (`popcount >= 1` instead of `popcount >= 2`) and a few more generated ROM entries. **This document keeps the Step 3 code as `popcount ∈ {2,3}`** (the minimal set needed to unblock the self-recursion test, per this task's assignment) and flags the `popcount==1` extension as a one-line, low-risk, separately-reviewable addition — the integrator can fold it in or leave it for a fast-follow.
-
-**Deliberately still out of scope** (unaffected by this task, matches Task 9's own list): the FMOVEM *data*-register list form (`FMOVEM FP0-FP7,...`, a structurally different opcode encoding, `ext[15:13] ∈ {0x6,0x7}` per Musashi's dispatch table `m68kfpu.c:1853-1858`, not `0x4`/`0x5`) — completely separate future work, not touched by anything in this task.
+**What DOES change under this design: `popcount == 1` with a memory `<ea>` is no longer
+asymmetric and should be folded in.** The blocked attempt's own analysis (report §5) correctly
+found that under the OLD (broken) mechanism, `popcount == 1`'s load direction was
+implementable but its store direction silently dropped the write — and correctly deferred the
+whole case rather than ship something half-working. Under THIS design, both directions of
+`popcount == 1` use the exact same mechanism as `popcount ∈ {2,3}` (one or more ordinary LS
+rows, plus either a 1-register terminal sysOp batch or a 1-register plain read) — there is no
+asymmetry left to avoid. **Fold `popcount == 1` with a memory `<ea>` into this task's scope**
+(the row-generator is already parametrized on `mask` generically; this is a `popcount ∈
+{1,2,3}` inequality instead of `{2,3}`, not new code). This closes
+`fpu_fmove_mem_ea_fpcr_fpsr_no_fline.s`, which the blocked attempt and Task 9 both left failing.
 
 ---
 
 ## Steps
 
-- [ ] **Step 1: Independently confirm the mask=111 encoding, word count, and (if possible) the order rule**
-
-```bash
-cd /tmp && cat > fmovemctrl.s <<'EOF'
-    .text
-    fmovem.l %fpiar/%fpsr/%fpcr,-(%sp)
-    fmovem.l (%sp)+,%fpiar/%fpsr/%fpcr
-    fmovem.l %fpiar/%fpsr/%fpcr,(0,%a0)
-    fmovem.l %fpcr/%fpsr,-(%sp)
-EOF
-m68k-linux-gnu-as -m68040 -m68881 fmovemctrl.s -o fmovemctrl.o && m68k-linux-gnu-objdump -d fmovemctrl.o
-```
-Expected (record actual output in the commit message): line 1 = `F227 BC00` (2 words, matches the design spec's ROM prologue quote exactly); line 2 = `F21F BC00` (`(An)+` = mode 011, `sysReadDir`=True, same `BC00` mask ext word); line 3 = `F228 BC00 0000` (**3** words — confirms the "abbreviated citation" flag above); line 4 = `F227 8C00` (mask=110, FPCR|FPSR only, no FPIAR — confirms `RRR` bit assignment for the 2-register case independently of the 3-register case). **If any line disagrees, STOP and fix the encoding table before writing any RTL.**
-
-If `m68k-linux-gnu-as`/GNU `as`'s assembler happens to accept a raw byte sequence you can single-step through a reference disassembler or a real MC68040 (neither is assumed available), do so to additionally pin the register-order question directly rather than relying on the WinUAE corroboration alone; if not available, proceed on the WinUAE-corroborated rule and complete the flagged Step 1b below before trusting it in production.
-
-- [ ] **Step 1b (gate, not skippable): pin the MC68881/MC68882 UM section for the order rule**
-
-Per the "Residual, explicitly flagged" note above. Locate the FMOVEM control-register-list description in the primary manual (Section 4 instruction description, cf. TOC pointers Section 1.4.2 / 7.5.1.5), quote the exact order-vs-addressing-mode text, and record the section/page number in `FmovemCtrlOrder`'s doc comment (Step 6) and the commit message. If the manual's wording differs from this document's derived rule in any way, STOP and fix Step 6's generator before proceeding — do not paper over a disagreement.
-
-- [ ] **Step 2: Confirm `ctx.eaBase`/`casAutoMode`/`casAutoDelta` really are generic (not CAS-specific) before relying on them**
-
-```bash
-grep -n "ucCasEaDec\s*=\|ucEntryCtx\.eaBase\s*:=\|ucEntryCtx\.casAutoMode\s*:=\|ucEntryCtx\.casAutoDelta\s*:=" src/main/scala/m68k040/decode/DecodeStage.scala
-```
-Confirm the call site (`DecodeStage.scala:1112`) decodes `ucEntryPkt.words(0)(5 downto 0)` — i.e. the **current** microcoded instruction's own opword mode/reg field, via the same project-wide `EaDecoder.decode` every other decode path uses — unconditionally, not gated on `ucEntrySpec` being a CAS/MOVES-specific kind. This is asserted as fact in this document (see "What this task reuses unmodified" #2) from a direct read; this step just requires the implementer to re-confirm it against their actual working copy before depending on it, in case it has moved since this document was written.
-
-- [ ] **Step 3: `OperationDecoder.scala` decode gate**
-
-Add immediately after Task 9's single-register `fpCtrlOk` arm (Task 9's own Step 5), inside the same `is(0xF)` block, reusing `fpCtrlOpBase`/`fpCtrlDir`/`fpCtrlIsTo`/`fpCtrlIsFrom`/`fpCtrlMask` from that arm (do not redeclare them):
-
-```scala
-        // ── FMOVEM.L <ea>,FPIAR/FPSR/FPCR list form (Task 9b) ──────────────────────
-        // Same opword/ext-word shape as Task 9's single-register arm; popcount(mask)
-        // in {2,3} instead of exactly 1, and <ea> restricted to memory-alterable modes
-        // (a multi-bit mask against Dn/An/#imm is architecturally meaningless -- see
-        // this task's "EA-mode restriction" note; Musashi's own sibling FP-data-list
-        // fmovem() rejects register-direct modes the identical way, m68kfpu.c:1662-
-        // 1750). NOT privileged, exactly like Task 9's single-register form (same
-        // opcode family, same Musashi dispatch function fmove_fpcr for every mask
-        // population, m68kfpu.c:1846-1851 -- no separate privilege gate exists for a
-        // populated-mask case).
-        val fpCtrlPopcount = fpCtrlMask.asBools.map(b => U(b.asUInt)).reduce(_ +^ _)
-        val fpCtrlIsList    = fpCtrlPopcount === U(2, 2 bits) || fpCtrlPopcount === U(3, 2 bits)
-        val fpCtrlListMode  = opword(5 downto 3)
-        val fpCtrlListReg   = opword(2 downto 0)
-        // memory-alterable: (An), (An)+, -(An), (d16,An), (d8,An,Xn), (xxx).W, (xxx).L.
-        // Excludes Dn(000)/An(001)/#imm(111,100)/PC-relative(111,010 and 111,011) -- see
-        // "EA-mode restriction" (this task's write-up) for why both directions reject
-        // PC-relative rather than allowing an asymmetric load-only carve-out.
-        val fpCtrlListEaMem =
-          (fpCtrlListMode === B"3'b010") || (fpCtrlListMode === B"3'b011") ||
-          (fpCtrlListMode === B"3'b100") || (fpCtrlListMode === B"3'b101") ||
-          (fpCtrlListMode === B"3'b110") ||
-          ((fpCtrlListMode === B"3'b111") &&
-           (fpCtrlListReg === B"3'b000" || fpCtrlListReg === B"3'b001"))
-        val fpCtrlListOk = fpCtrlOpBase && fpCtrlIsList && (fpCtrlIsTo || fpCtrlIsFrom) &&
-                           fpCtrlListEaMem
-        when(fpCtrlListOk) {
-          o.illegal    := False
-          o.op         := DecOp.MOVE
-          o.size       := Size.LONG
-          o.sysOp      := True
-          o.sysKind    := SysKind.FMOVE_FPCTRL
-          o.sysReadDir := fpCtrlIsFrom
-          o.dst.setNone(); o.dstWrites := False
-          // Route through the microcode engine (Step 6/7) -- this is NOT a fast-crack
-          // op like Task 9's single-register form. ucEntry/ucEntryCtx population is
-          // DecodeStage's job (Step 7); OperationDecoder only needs to mark this a
-          // microcoded op, mirroring MOVE16's o.ucEntry assignment
-          // (OperationDecoder.scala:1043) except the entry is DATA-DEPENDENT here (on
-          // mask+dir+mode), so it is computed in DecodeStage where ucCasEaDec's
-          // decoded mode is already available, not baked in here as a constant.
-          o.ucOp       := True
-        }
-```
-
-**Honest flag:** the exact mechanism for handing a *data-dependent* `ucEntry` (as opposed to MOVE16's single constant) from `OperationDecoder` through to `DecodeStage`'s microcode dispatch needs to be confirmed against how the codebase already threads `o.ucOp`/`o.ucEntry` today (`grep -n "ucOp\|ucEntry" src/main/scala/m68k040/decode/OperationDecoder.scala src/main/scala/m68k040/decode/DecodedUop.scala`) before writing Step 7 for real — this document assumes (consistent with the "microcode entries are resolved combinationally at ucBegin from the already-decoded opword/ext-word, not baked into `OperationDecoder`'s static `o.ucEntry` field" pattern that MI_* entries already use for their own data-dependent dispatch, e.g. `MI_JMP_ENTRY` vs `MI_JSR_ENTRY` selection) that `OperationDecoder` only needs to flag "this is a microcoded op", and the *which entry* computation happens at `DecodeStage.ucBegin` (Step 7), not here. Confirm this pattern via a direct read of how an existing *data-dependent*-entry microcode customer (not MOVE16, which is entry-constant) resolves its entry before implementing.
-
-- [ ] **Step 4: `PredecodeWord.scala` length framing**
-
-Add inside the same `is(U(0xF, 4 bits))` arm, alongside Task 9's own "Step 7: `PredecodeWord.scala` length framing" branch, reusing the existing generic `eaExt` helper (`PredecodeWord.scala:144`) exactly the way the line-0-immediate arm already does (`PredecodeWord.scala:241-243`):
-
-```scala
-        // FMOVEM.L <ea>,FPIAR/FPSR/FPCR list form (Task 9b): opword 0xF200|<ea> + a
-        // command ext word (the multi-bit-mask sibling of Task 9's single-register
-        // arm) + the <ea>'s OWN extension words (0-5, mode-dependent -- reuses the
-        // SAME generic eaExt() helper every other <ea>-bearing instruction in this
-        // file uses). Total length = 2 (opword + command ext) + eaExt's own count.
-        // The mask's popcount affects EXECUTE-time transfer count (Step 6), NOT the
-        // fetched instruction length -- see this task's write-up, "Per-register
-        // transfer width and instruction length".
-        val fpCtrlListBase   = (op(11 downto 9) === B"3'b001") && (op(8 downto 6) === B"3'b000")
-        val fpCtrlListDirOk  = (extW(15 downto 13) === B"3'b100") || (extW(15 downto 13) === B"3'b101")
-        val fpCtrlListPop    = extW(12 downto 10).asBools.map(b => U(b.asUInt)).reduce(_ +^ _)
-        val fpCtrlListIsList = fpCtrlListPop === U(2, 2 bits) || fpCtrlListPop === U(3, 2 bits)
-        val fpCtrlListEaMode = op(5 downto 3).asUInt
-        val fpCtrlListEaReg  = op(2 downto 0).asUInt
-        // The EA's own first ext word is op+2 (it follows the command ext word, which
-        // is op+1) -- pass extW2/extW2Known, mirroring the line-0-immediate arm's
-        // immDstEaW/immDstEaKnown pattern (PredecodeWord.scala:241-242) exactly.
-        val (fpCtrlListEaOk, fpCtrlListEaExt, fpCtrlListAmb) =
-          eaExt(fpCtrlListEaMode, fpCtrlListEaReg, sizeL = True, allowImm = false,
-                eaW = extW2, eaWKnown = extW2Known)
-        when(fpCtrlListBase && fpCtrlListDirOk && fpCtrlListIsList && fpCtrlListEaOk) {
-          r.simple := True
-          r.lenWords := (U(2, 3 bits) +^ fpCtrlListEaExt).resized
-          r.ambiguousLine := fpCtrlListAmb
-        } .elsewhen(fpCtrlBase && fpCtrlDirOk && fpCtrlMaskOne && (fpCtrlEaReg || fpCtrlEaImm)) {
-          // Task 9's existing single-register arm, unchanged.
-          ...
-```
-
-`allowImm = false` is deliberate: an immediate `<ea>` is excluded for the list form (see "EA-mode restriction"); passing `false` makes `eaExt`'s own mode-7/reg-4 branch correctly return `ok=False` for that case, so `fpCtrlListEaOk` naturally excludes it without a separate check.
-
-- [ ] **Step 5: `Microcode.scala` — new `Sel` constants and the `USysCtrlMove` UOp**
-
-**5a. Three new negative-offset constants** (siblings of the existing `SImm4`/`SImm8`/`SImm12`, `Microcode.scala:269`, reused unmodified for the postincrement/writeback case and the non-predecrement +0/+4/+8 transfer offsets):
-
-```scala
-  // ── FMOVEM-control list selectors (Task 9b) ─────────────────────────────────
-  // Negative counterparts of the existing SImm4/SImm8/SImm12 (task #207/MOVE16),
-  // needed for the PREDECREMENT case's per-transfer offset from the ORIGINAL base
-  // (see this task's "register order" derivation: for -(An), the correctly-ordered
-  // transfer i (0-indexed, in PROCESSING order FPIAR/FPSR/FPCR) lands at
-  // base - 4*(i+1) -- a fixed, compile-time-known negative offset from the ORIGINAL
-  // An, exactly mirroring how MOVE16 already treats its own postincrement-like
-  // addressing as "fixed offsets from the original base + one final writeback"
-  // rather than per-transfer auto-stepping (Microcode.scala:1587-1591's own
-  // rationale for why MOVE16 avoids the eaAuto machinery).
-  case object SImmNeg4  extends Sel
-  case object SImmNeg8  extends Sel
-  case object SImmNeg12 extends Sel
-  // The non-auto (control/displacement/abs/indexed) EA classes have no per-mode
-  // auto-stepping at all -- the SAME base+displacement must be used for every
-  // transfer, offset by +4/+8 for the 2nd/3rd register. ctx.eaDispLo (already
-  // populated generically for every microcode customer's <ea>, per this task's
-  // "what this task reuses unmodified" #2) supplies the REAL decoded displacement;
-  // these two constants add the transfer's own offset on top of it.
-  case object SEaDispLoPlus4 extends Sel
-  case object SEaDispLoPlus8 extends Sel
-```
-
-Add to `SelHw`'s element list (`Microcode.scala:262-273`), `selImm`'s match (near `SImm4`/`SImm8`/`SImm12`, `Microcode.scala:1917-1920`):
-
-```scala
-    case SImmNeg4        => U(-4,  32 bits).asBits
-    case SImmNeg8        => U(-8,  32 bits).asBits
-    case SImmNeg12       => U(-12, 32 bits).asBits
-    case SEaDispLoPlus4  => (ctx.eaDispLo.asUInt + 4).asBits
-    case SEaDispLoPlus8  => (ctx.eaDispLo.asUInt + 8).asBits
-```
-and its hardware-`is(...)` mirror (near `Microcode.scala:2326-2329`) with the identical five bodies. `U(-4, 32 bits)` relies on SpinalHDL's standard negative-`Int`-to-two's-complement literal behavior — confirm this compiles as expected in a throwaway `sbt console` snippet before trusting it (this project has been burned before by SpinalHDL width/sign gotchas — see the `movemEmitted.asSInt` warning at `DecodeStage.scala:435`).
-
-**5b. `USysCtrlMove` — the new UOp kind that emits a `SysKind.FMOVE_FPCTRL` micro-op from a microcode row.**
-
-Mirrors `UCasOp`'s existing payload-carrying-case-class pattern (`Microcode.scala:155-156`) exactly:
-
-```scala
-  // Emits a Task 9 FMOVE_FPCTRL sysOp targeting exactly ONE of {FPCR,FPSR,FPIAR},
-  // reading from or writing to a microcode scratch temp (T0/T1/T2) instead of an
-  // architectural Dn/An. readDir mirrors Task 9's o.sysReadDir (True = FPcr->Tn,
-  // False = Tn->FPcr); rc is the SAME one-hot mask bit Task 9's imm[2:0]/sysRc
-  // side-channel already carries (4=FPCR, 2=FPSR, 1=FPIAR) -- ExceptionUnit's
-  // S_APPLY arm for FMOVE_FPCTRL (Task 9 Step 8) is reused COMPLETELY UNCHANGED;
-  // it cannot tell a microcode-emitted occurrence from a Task-9-emitted one, by
-  // design (see "what this task reuses unmodified" #1).
-  case class USysCtrlMove(readDir: Boolean, rc: Int) extends UOp
-```
-
-`resolve()` (`Microcode.scala:1953-1969` area) needs a new case **before** the generic `u.sysOp := False` default that currently applies unconditionally (`Microcode.scala:2200`) — restructure that default to be overridable, or add the `USysCtrlMove` handling as its own `match` arm that runs after the default and overrides it (whichever keeps the diff smallest against the actual current structure — inspect the real code around line 2200 before choosing, since this document's line numbers may drift slightly as Tasks 1-9 land):
-
-```scala
-      case USysCtrlMove(readDir, rc) =>
-        u.op         := DecOp.MOVE
-        u.sysOp      := True
-        u.sysKind    := m68k040.decode.SysKind.FMOVE_FPCTRL
-        u.sysReadDir := Bool(readDir)
-        u.imm        := U(rc, 32 bits).asBits   // sysRc side-channel, Task 9's exact convention
-```
-
-with `dst`/`srcB` wiring left to the EXISTING generic `srcA`/`srcB`/`dst` selector resolution in `resolve()` (i.e. the `Desc` row itself sets `dst = ST0/ST1/ST2` when `readDir=true` or `srcB = ST0/ST1/ST2` when `readDir=false`, exactly like every other row — `USysCtrlMove` only needs to own the sys-specific fields, not reinvent register routing).
-
-`resolveFromBits()` (the hardware path, `Microcode.scala:2340`+) needs the identical case, `is(UOpHw.USysCtrlMove) { ... }`, reading the two new sibling `DescBits` fields below.
-
-`DescBits` (`Microcode.scala:332`+) needs two new sibling fields, following the `UCasOp` precedent (`casForm`/`casWritesNzvc`/etc., valid only when `uop === UOpHw.UCasOp`) exactly:
-
-```scala
-    val sysCtrlReadDir: Bool           // valid only when uop === UOpHw.USysCtrlMove
-    val sysCtrlRc:      UInt(3 bits)   // valid only when uop === UOpHw.USysCtrlMove
-```
-
-`descToBits` (`Microcode.scala:375`+) needs the mechanical encode:
-```scala
-      case USysCtrlMove(readDir, rc) =>
-        bits.sysCtrlReadDir := Bool(readDir)
-        bits.sysCtrlRc      := U(rc, 3 bits)
-```
-(alongside whatever default/don't-care assignment every other non-`UCasOp` row already gives those two fields — mirror the existing `casForm`-default pattern verbatim).
-
-`UOpHw` (`Microcode.scala:286-291`) needs one new element, `USysCtrlMove`, appended (append, do not insert — same ordinal-stability discipline `SysKind` uses, per Task 9 Step 4's own comment).
-
-- [ ] **Step 6: `Microcode.scala` — the row-generator function + entry table**
-
-This is the actual multi-register-list logic. Written as a compile-time Scala generator (producing `Vector[Desc]` programmatically) rather than ~40 hand-duplicated blocks — both because 40 near-identical blocks is a maintenance and review liability, and because `Microcode.scala` is already "a compile-time Scala table" by its own header doc comment (`Microcode.scala:5-19`), so a generator function is squarely within its existing idiom, not a new one.
-
-```scala
-  // ═══════════════════════════════════════════════════════════════════════════
-  // FMOVEM-control LIST form (Task 9b). Each selected register costs a 2-row
-  // pair: [sysOp read FPcr->Tn] + [store Tn->mem]  (write direction, control->mem)
-  //    or  [load mem->Tn] + [sysOp write Tn->FPcr]  (read direction, mem->control),
-  // PLUS one trailing An write-back row IFF the <ea> is -(An)/(An)+ (mirrors
-  // MOVE16's own "fixed offsets from the original base + one final writeback"
-  // shape, Microcode.scala:1587-1617 -- NOT the eaAuto/AEaCasLoad per-row
-  // auto-stepping machinery, which would double-apply across sequential
-  // transfers with no way to get the ORDER right at the same time; see the
-  // order derivation above for why "fixed compile-time offset from the ORIGINAL
-  // base" is required regardless of addressing mode).
-  //
-  // Register PROCESSING order is fixed at Scala-generation time (Step 1b's
-  // pinned rule): PREDECREMENT = FPIAR,FPSR,FPCR (LSB-first); every other mode
-  // = FPCR,FPSR,FPIAR (MSB-first). This determines BOTH which physical control
-  // register each row-pair targets AND that row-pair's compile-time address
-  // offset (predec: -4,-8,-12 for processing order 0,1,2; postinc/non-auto:
-  // 0,+4,+8 for processing order 0,1,2).
-  sealed trait FmovemCtrlAddr
-  case object FcaPredec  extends FmovemCtrlAddr   // -(An): SImmNeg4/8/12 offsets, final An -= 4*popcount
-  case object FcaPostinc extends FmovemCtrlAddr   // (An)+: SImm4/8/12 offsets,    final An += 4*popcount
-  case object FcaNonAuto extends FmovemCtrlAddr   // control/disp/abs/indexed: SEaDispLo(+4/+8), no writeback
-
-  // rc bit -> (readDir Tn selector, storeDir Tn selector) is irrelevant; T0/T1/T2
-  // are just used positionally (row-pair i uses T_i). offsetSel(i) picks this
-  // addressing class's compile-time offset constant for processing-order index i
-  // (0,1,2). NONE (SNone/useImm=false) means "no offset" (predec/postinc's FIRST
-  // transfer, i=0, needs -4/+0 respectively -- predec's i=0 offset is SImmNeg4,
-  // NOT none, because the FIRST -(An) decrement already happened; postinc's i=0
-  // offset is genuinely none, the untouched original An).
-  private def offsetSel(addr: FmovemCtrlAddr, i: Int): (Boolean, Sel) = (addr, i) match {
-    case (FcaPredec,  0) => (true, SImmNeg4)
-    case (FcaPredec,  1) => (true, SImmNeg8)
-    case (FcaPredec,  2) => (true, SImmNeg12)
-    case (FcaPostinc, 0) => (false, SNone)
-    case (FcaPostinc, 1) => (true, SImm4)
-    case (FcaPostinc, 2) => (true, SImm8)
-    case (FcaNonAuto, 0) => (false, SNone)          // plain SEaBase (+ ctx.eaDispLo via a separate row flag, see below)
-    case (FcaNonAuto, 1) => (true, SEaDispLoPlus4)
-    case (FcaNonAuto, 2) => (true, SEaDispLoPlus8)
-  }
-  // NonAuto's i=0 case is special: it must add ctx.eaDispLo (the REAL decoded
-  // displacement) even though no PER-TRANSFER offset is needed -- reuse the
-  // EXISTING SEaDispLo selector (not SNone) so a nonzero real displacement
-  // (e.g. F228 BC00's "(0,A0)", or a nonzero real one) is honored. Fix:
-  private def offsetSelFixed(addr: FmovemCtrlAddr, i: Int): (Boolean, Sel) =
-    if (addr == FcaNonAuto && i == 0) (true, SEaDispLo) else offsetSel(addr, i)
-
-  // Register-select bits in PROCESSING order for this addressing class + mask.
-  // rcBits: MSB-first {4,2,1} for non-predec, LSB-first {1,2,4} for predec --
-  // filtered down to whichever of the up-to-3 are actually SET in `mask`.
-  private def processingOrder(addr: FmovemCtrlAddr, mask: Int): Seq[Int] = {
-    val msbFirst = Seq(4, 2, 1).filter(rc => (mask & rc) != 0)
-    if (addr == FcaPredec) msbFirst.reverse else msbFirst
-  }
-
-  private def fmovemCtrlProgram(dir: Boolean /* true = read: mem->ctrl */,
-                                 addr: FmovemCtrlAddr, mask: Int): Vector[Desc] = {
-    val order = processingOrder(addr, mask)
-    val rows = order.zipWithIndex.flatMap { case (rc, i) =>
-      val tSel: Sel = Seq(ST0, ST1, ST2)(i)
-      val (useOff, offSel) = offsetSelFixed(addr, i)
-      if (dir) {
-        // mem -> ctrl: LOAD (base[+offset]) -> Tn, then sysOp write Tn -> FPcr.
-        Seq(
-          Desc(UMove, mem = MLoad, srcA = SEaBase, dst = tSel,
-               useImm = useOff, imm = offSel, sz = SzLong),
-          Desc(USysCtrlMove(readDir = false, rc = rc), srcB = tSel)
-        )
-      } else {
-        // ctrl -> mem: sysOp read FPcr -> Tn, then STORE Tn -> base[+offset].
-        Seq(
-          Desc(USysCtrlMove(readDir = true, rc = rc), dst = tSel),
-          Desc(UMove, mem = MStore, srcA = SEaBase, srcB = tSel,
-               useImm = useOff, imm = offSel, sz = SzLong)
-        )
-      }
-    }
-    val writeback: Vector[Desc] = addr match {
-      case FcaNonAuto => Vector.empty
-      case FcaPredec  =>
-        val delta = Seq(SNone, SImmNeg4, SImmNeg8, SImmNeg12)(order.size)  // -4/-8/-12 by popcount
-        Vector(Desc(UAddDrop, srcA = SEaBase, dst = SEaBase, useImm = true, imm = delta))
-      case FcaPostinc =>
-        val delta = Seq(SNone, SImm4, SImm8, SImm12)(order.size)          // +4/+8/+12 by popcount
-        Vector(Desc(UAddDrop, srcA = SEaBase, dst = SEaBase, useImm = true, imm = delta))
-    }
-    val all = rows.toVector ++ writeback
-    all.zipWithIndex.map { case (d, i) =>
-      d.copy(isFirst = i == 0, isLast = i == all.size - 1)
-    }
-  }
-
-  // Build every (dir, addr, mask) combination -- mask popcount in {2,3} per this
-  // task's Step 3 scope (the popcount==1 memory-EA extension noted as optional
-  // in "Scope" just needs `1 to 3` here instead of `2 to 3`, with NO other
-  // change). 2 dirs x 3 addr classes x 6 masks (popcount 2: {6,5,3}; popcount 3:
-  // {7}) = wait: popcount-2 masks are {110=6, 101=5, 011=3} (3 masks), popcount-3
-  // is {111=7} (1 mask) -- 4 masks total, not 6. 2 x 3 x 4 = 24 programs.
-  private val fmovemCtrlMasks: Seq[Int] = Seq(6, 5, 3, 7)   // popcount 2 (x3) + popcount 3 (x1)
-  private val fmovemCtrlAddrs: Seq[FmovemCtrlAddr] = Seq(FcaPredec, FcaPostinc, FcaNonAuto)
-
-  val FMOVEM_CTRL_ENTRY: Int = romP8().size + <running total of prior romPN sizes up to
-    the actual insertion point -- see integration note below>
-  // Populated by walking (dir, addr, mask) in a FIXED, documented order and
-  // recording each program's starting row index -- avoids hand-counting rows
-  // across 24 variable-length programs, the same class of error the LUT-
-  // reduction Desc/DescBits split was built to make impossible for hand-written
-  // rows (this generator makes it impossible for GENERATED rows too, by
-  // construction: the map IS the source of truth, nothing downstream re-derives
-  // an index by counting).
-  val fmovemCtrlEntries: Map[(Boolean, FmovemCtrlAddr, Int), Int] = {
-    var idx = FMOVEM_CTRL_ENTRY
-    val b = scala.collection.mutable.Map.empty[(Boolean, FmovemCtrlAddr, Int), Int]
-    for (dir <- Seq(false, true); addr <- fmovemCtrlAddrs; mask <- fmovemCtrlMasks) {
-      b((dir, addr, mask)) = idx
-      idx += fmovemCtrlProgram(dir, addr, mask).size
-    }
-    b.toMap
-  }
-  val fmovemCtrlRom: Vector[Desc] =
-    (for (dir <- Seq(false, true); addr <- fmovemCtrlAddrs; mask <- fmovemCtrlMasks)
-      yield fmovemCtrlProgram(dir, addr, mask)).toVector.flatten
-```
-
-**Integration note (real, not hand-waved):** `val rom: Vector[Desc] = romP1() ++ ... ++ romP8()` (`Microcode.scala:1636`) needs `++ fmovemCtrlRom` appended, and `FMOVEM_CTRL_ENTRY` must equal the running row count *at that point* — i.e. `romP1().size + romP2().size + ... + romP8().size` (**not** a guess; compute it from the real `romPN().size` values in the working copy, or better, define it as `Microcode.romP1().size + ... + Microcode.romP8().size` directly in code so it can never drift out of sync with the actual partition sizes, rather than a hand-copied literal like `MOVE16_ENTRY = 242`'s existing style). Task 6b (sequenced earlier in this plan, right after Task 6) also appends new rows to `romP8()`/`romP9()` for its own 12 `FP_MEM_*_ENTRY` groups — since both tasks compute their entry index dynamically from the real `romPN().size` values rather than a hand-copied literal, this composes correctly regardless of which lands first in the working copy; just make sure `FMOVEM_CTRL_ENTRY` is computed AFTER Task 6b's own rows are appended if Task 6b has already landed, not before. This task's generated block adds **24 programs** ranging 4-7 rows each (2×popcount + up to 1 writeback row) — worst case (mask=7, predec or postinc) is `2×3+1=7` rows, best case (mask∈{3,5,6}, non-auto) is `2×2+0=4` rows; total added rows ≈ 24 × ~5.5 avg ≈ **130 rows**, roughly a 50% increase over the current ROM's ~252-row scale (`MOVE16_ENTRY = 242` plus its own 10 rows). Flag this scale explicitly for the mandatory synth gate (Step 10) — the LUT-reduction BRAM-backed `ucRomMem` (Task A1-A5) exists specifically to keep ROM growth cheap in **LUTs** (it becomes BRAM growth instead), but this should be **confirmed**, not assumed, by the actual gate.
-
-- [ ] **Step 7: `DecodeStage.scala` — `ucEntry` dispatch**
-
-At `ucBegin` (mirroring the MOVE16 dispatch pattern at `DecodeStage.scala:1149-1153`, but data-dependent on `dir`/`<ea>` mode/mask instead of a single constant), after `ucCasEaDec` has resolved the current instruction's `<ea>` (Step 2's confirmed reuse point):
-
-```scala
-    // FMOVEM-control list (Task 9b): pick the (dir, addr-class, mask) entry.
-    // addr-class comes from the ALREADY-DECODED <ea> mode bits (ucEntryPkt's own
-    // opword bits 5:3), NOT from ucCasEaDec.autoMode -- this task's rows do their
-    // OWN fixed-offset addressing (see Step 6's rationale for why the generic
-    // eaAuto per-row auto-stepping machinery is deliberately NOT reused here),
-    // so autoMode is only consulted to CLASSIFY predec/postinc/other, never wired
-    // into a row's own eaAuto field.
-    val fpCtrlListDir  = ucEntryPkt.words(1)(15 downto 13) === B"3'b101"   // True = read (mem->ctrl)
-    val fpCtrlListMask = ucEntryPkt.words(1)(12 downto 10).asUInt
-    val fpCtrlListEaM  = ucEntryPkt.words(0)(5 downto 3)
-    val fpCtrlListAddr = fpCtrlListEaM.mux(
-      B"3'b100" -> U(0, 2 bits),   // FcaPredec
-      B"3'b011" -> U(1, 2 bits),   // FcaPostinc
-      default   -> U(2, 2 bits)    // FcaNonAuto (control/disp/abs/indexed)
-    )
-```
-
-**Honest flag (concrete, not hand-waved-away):** the `fmovemCtrlEntries` map (Step 6) is a Scala compile-time `Map`, but this dispatch needs a **hardware** mux from `(fpCtrlListDir, fpCtrlListAddr, fpCtrlListMask)` to a `ucEntry` constant — i.e. the 24 entries of that map need to be materialized as a hardware lookup (a `switch`/nested-`Mux` tree, or a small `Mem`/ROM keyed on a packed `(dir##addr##mask)` index, mirroring how `MI_JMP_ENTRY` vs `MI_JSR_ENTRY` selection already works for a *smaller* data-dependent case — find that precedent (`grep -n "MI_JMP_ENTRY\|MI_JSR_ENTRY" src/main/scala/m68k040/decode/DecodeStage.scala`) and follow its exact shape, scaled up to 24 cases via a Scala `for` loop emitting the `is(...)` arms from the SAME `fmovemCtrlEntries` map (so the hardware dispatch table and the ROM's own row layout can never drift apart — generate the `switch` cases from the map, do not hand-transcribe 24 `is(...)` lines).
-
-- [ ] **Step 8: Re-run the LUT-reduction equivalence spec**
-
-```bash
-sbt "testOnly m68k040.decode.MicrocodeResolveEquivalenceSpec"
-```
-Per "What this task reuses unmodified" #5 — this is the existing spec that proves `resolve()` (the Scala oracle) and `resolveFromBits()` (the real hardware path reading `DescBits`/`ucRomMem`) agree, row for row, for the ENTIRE `rom` (now including this task's 24 generated programs). If this fails, the bug is almost certainly a `resolveFromBits()`/`descToBits` edit that didn't mirror `resolve()`'s (Step 5b) exactly — do not chase it as an FPU-specific bug before checking that.
-
-- [ ] **Step 9: Tests**
-
-```scala
-// src/test/scala/m68k040/decode/MicrocodeFmovemCtrlSpec.scala
-package m68k040.decode
-
-import org.scalatest.funsuite.AnyFunSuite
-
-class MicrocodeFmovemCtrlSpec extends AnyFunSuite {
-  test("mask=111 (F227 BC00 -(A7)) predecrement program: 6 rows, FPIAR/FPSR/FPCR processing order") {
-    val prog = Microcode.fmovemCtrlProgram(dir = false, Microcode.FcaPredec, mask = 7)
-    assert(prog.size == 7, "3 register pairs (6 rows) + 1 writeback row")
-    // rows 0,2,4 are the sysOp-read half; confirm rc order is FPIAR(1),FPSR(2),FPCR(4) --
-    // the REVERSED order, per the pinned rule (Step 1b).
-    val rcOrder = Seq(prog(0), prog(2), prog(4)).map {
-      case Microcode.Desc(Microcode.USysCtrlMove(true, rc), _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) => rc
-      case _ => fail("expected USysCtrlMove(readDir=true, ...)")
-    }
-    assert(rcOrder == Seq(1, 2, 4), s"predecrement must process FPIAR,FPSR,FPCR (reversed); got $rcOrder")
-  }
-  test("mask=111 postincrement program: normal FPCR/FPSR/FPIAR processing order") {
-    val prog = Microcode.fmovemCtrlProgram(dir = false, Microcode.FcaPostinc, mask = 7)
-    val rcOrder = Seq(prog(0), prog(2), prog(4)).collect {
-      case d if d.uop.isInstanceOf[Microcode.USysCtrlMove] => d.uop.asInstanceOf[Microcode.USysCtrlMove].rc
-    }
-    assert(rcOrder == Seq(4, 2, 1), s"postincrement must process FPCR,FPSR,FPIAR (normal); got $rcOrder")
-  }
-  test("every generated program's LAST row has isLast=true and exactly one isFirst=true") {
-    for (dir <- Seq(false, true); addr <- Seq(Microcode.FcaPredec, Microcode.FcaPostinc, Microcode.FcaNonAuto);
-         mask <- Seq(6, 5, 3, 7)) {
-      val prog = Microcode.fmovemCtrlProgram(dir, addr, mask)
-      assert(prog.last.isLast, s"dir=$dir addr=$addr mask=$mask: last row must release fed")
-      assert(prog.count(_.isFirst) == 1, s"dir=$dir addr=$addr mask=$mask: exactly one firstOfInstr")
-    }
-  }
-}
-```
-
-Decode-side assertions in `OperationDecoderSpec.scala` (alongside Task 9's own cases):
-```scala
-  test("FMOVEM.L FPIAR/FPSR/FPCR,-(A7) (F227 BC00): sysOp/FMOVE_FPCTRL, ucOp routed", VerilatorTest) {
-    run { dut => drive(dut, 0xF227, 0xBC00); sleep(1)
-      assert(!dut.o.illegal.toBoolean, "the real FPSP ROM prologue must not be illegal")
-      assert(dut.o.sysOp.toBoolean && dut.o.sysKind.toEnum == SysKind.FMOVE_FPCTRL)
-      assert(dut.o.ucOp.toBoolean, "the list form is microcoded (Step 6/7), not a fast crack")
-    }
-  }
-  test("FMOVEM.L D0,FPCR (mask=100, single bit) is UNCHANGED by this task -- still Task 9's fast-crack path", VerilatorTest) {
-    run { dut => drive(dut, 0xF200, 0x9000); sleep(1)
-      assert(!dut.o.ucOp.toBoolean, "single-register form must stay Task 9's non-microcoded arm")
-    }
-  }
-  test("FMOVEM.L D0,FPIAR/FPSR/FPCR (mask=111, Dn EA -- Dn is NOT memory-alterable) stays ILLEGAL", VerilatorTest) {
-    run { dut => drive(dut, 0xF200, 0xBC00); sleep(1)   // opword mode=000 (Dn), reg=000
-      assert(dut.o.illegal.toBoolean, "a multi-register mask against a register-direct <ea> is architecturally meaningless (see EA-mode restriction)")
-    }
-  }
-```
-
-Whitebox round-trip + order tests, modeled on Task 9's own whitebox test (Task 9's own Step 10). **Explicitly two variants are required, not one** — per the "register order" finding, Musashi is a sound oracle for the non-predecrement case but is confirmed WRONG for predecrement, so:
-
-- `-(An)` case: **whitebox only**, asserting the REAL (WinUAE-corroborated, Step 1b-pinned) order directly against `FpuControlPlugin`'s `simPublic` regs and the memory contents written, exactly like this: seed FPCR/FPSR/FPIAR to distinct known values, execute `FMOVEM.L FPIAR/FPSR/FPCR,-(A7)` via the same full-core sim harness pattern Task 9's Step 10 whitebox test uses (`attachProgram`/`BehavioralMemAgent`/etc.), then directly inspect the 3 written memory words and confirm `mem[SP]==FPCR_val, mem[SP+4]==FPSR_val, mem[SP+8]==FPIAR_val` (the CORRECT, round-trip-consistent order — NOT what Musashi would produce). Follow with `FMOVEM.L (A7)+,FPIAR/FPSR/FPCR` (postincrement reload, same mask) and confirm the reload recovers the exact original FPCR/FPSR/FPIAR values — the actual round-trip proof.
-- non-`-(An)` case (e.g. `(0,A0)`, matching `F228 BC00`): **lock-step is sound here** (Musashi's fixed order matches real hardware for every non-predecrement mode, per the derivation) — extend `ExecuteLockStepSpec` with a real lock-stepped test using this encoding, gated the same way Task 9's other lock-step-eligible ops are, rather than defaulting to whitebox out of caution. Confirm this by first checking Musashi's oracle actually decodes the FP coprocessor opword range without hitting the "coprocessor stubs claim this opword range" oracle gap Task 9's own Step 10 flags (`ExecuteLockStepSpec.scala:3620-3634`) — if that gap still applies to this exact opword/mask combination, fall back to whitebox for this case too and say so explicitly, do not force a lock-step test that can't actually run against a real oracle response.
-
-- [ ] **Step 10: Run the tests + mandatory OOC synth gate**
-
-```bash
-sbt "testOnly m68k040.decode.MicrocodeFmovemCtrlSpec"
-sbt "testOnly m68k040.decode.OperationDecoderSpec m68k040.frontend.PredecodeWordSpec"
-sbt "testOnly m68k040.decode.MicrocodeResolveEquivalenceSpec"
-sbt "testOnly m68k040.execute.FpuControlPluginSpec"
-sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
-```
-Expected baseline for the lock-step suite going into this task: **394/394 PASS** (per this session's current confirmed baseline — NOT the stale 396/397 figures some earlier drafts in this plan used; if Task 9 has landed by the time this task starts, re-confirm the actual then-current count before writing "N/N" into the commit message). Expected after this task: 394 (or Task 9's landed count) + however many new lock-step-eligible tests Step 9 actually adds (at minimum the one non-predecrement case, if the oracle-gap check passes) — record the real number, do not guess it up front.
-
-Per this project's standing rule ("every implementation slice / dispatched agent ends with the mandatory full-core OOC synth gate, ≥250 MHz, reported"), run the OOC gate and report the actual FMax:
-
-```bash
-# Follow this project's existing OOC synth-gate script/flow (see synth/ for the
-# established pattern this branch already uses for prior slices' gates -- do not
-# invent a new invocation).
-```
-Report the real number. Given Step 6's ~130-row ROM growth estimate, treat a measurable LUT/FMax regression as a real possible finding, not a surprise to explain away — if the OOC gate shows one, that is exactly the kind of result this standing rule exists to catch before merge, not after.
-
-- [ ] **Step 11: Commit**
-
-```bash
-git add src/main/scala/m68k040/decode/OperationDecoder.scala \
-        src/main/scala/m68k040/frontend/PredecodeWord.scala \
-        src/main/scala/m68k040/decode/Microcode.scala \
-        src/main/scala/m68k040/decode/DecodeStage.scala \
-        src/test/scala/m68k040/decode/MicrocodeFmovemCtrlSpec.scala \
-        src/test/scala/m68k040/decode/OperationDecoderSpec.scala \
-        src/test/scala/m68k040/frontend/PredecodeWordSpec.scala \
-        src/test/scala/m68k040/execute/FpuControlPluginSpec.scala \
-        src/test/scala/m68k040/lockstep/ExecuteLockStepSpec.scala
-git commit -m "feat(fpu): FMOVEM control-register LIST form (multi-register FPCR/FPSR/FPIAR)
-
-Extends Task 9's single-register FMOVE-to/from-FPcr family to the
-multi-register list form (popcount(RRR) in {2,3}), specifically to
-unblock the real Motorola/Apple FPSP ROM kernel's own vector-11
-prologue: FMOVEM.L FPIAR/FPSR/FPCR,-(A7) (F227 BC00, design spec
-Decision 8). Without this, no real ROM FPSP handler can be installed
-at all -- it re-traps on its own first instruction, exactly the
-infinite-recursion class fpu_fpsp_selfrecursion_repro.s exists to
-catch.
-
-Reuses Task 9's FpuControlPlugin/SysKind.FMOVE_FPCTRL/ExceptionUnit
-S_APPLY arm/RobPlugin privilege-exclusion COMPLETELY UNCHANGED: each
-selected register's transfer decomposes into a 2-row microcode pair
-(a Task-9-shaped sysOp move against a scratch temp T0/T1/T2, paired
-with an ordinary LOAD/STORE through that temp) -- ExceptionUnit cannot
-distinguish a microcode-emitted FMOVE_FPCTRL occurrence from a
-directly-decoded one, by design. Routed through the existing
-straight-line microcode engine (Microcode.scala) rather than a new
-runtime sequencer: with at most 3 registers and a 3-bit mask fully
-known at decode time, a bounded compile-time-generated family of 24
-static programs (2 directions x 3 addressing classes x 4 nonzero
-2-3-bit masks) is simpler and lower-risk than a MOVEM-style variable
-runtime bitmask FSM, which this instruction's fixed 3-element universe
-does not need.
-
-Real-hardware finding, not assumed: the register PROCESSING ORDER
-reverses (FPIAR,FPSR,FPCR instead of FPCR,FPSR,FPIAR) specifically for
--(An) predecrement addressing, mirroring the integer MOVEM
-instruction's own well-known predecrement asymmetry. Derived by
-round-trip-consistency (a predecrement store followed by a matching
-postincrement reload must recover the original values) and
-independently corroborated against WinUAE's FPU-emulation-accuracy
-documentation, which confirms this exact CPU-generation-specific rule
-for the 68040. Musashi's own fmove_fpcr does NOT implement this
-reversal (confirmed by direct trace) -- a genuine, newly-identified
-Musashi FP limitation, additive to the design spec's Decision 3
-catalog. Consequently the -(An) case is verified via a whitebox
-round-trip sim test, not lock-step; the non-predecrement case (where
-Musashi's fixed order does match real hardware) is lock-step-verified.
-
-<<INTEGRATOR: replace with the real page/section number from Step 1b's
-required MC68881/MC68882 UM primary-source verification before this
-commit lands -- do not merge with this placeholder still present.>>
-
-<<INTEGRATOR: replace with the real N/N lock-step count and the real
-OOC synth-gate FMax from Step 10 -- do not merge with these
-placeholders still present.>>
-
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
-```
+- [ ] **Step 1: Re-confirm the encoding via toolchain** (mirrors Task 9's own Step 1 discipline
+  — this is a mandatory, non-skippable gate per this project's established practice for every
+  primary-source-adjacent fact). Reproduce the assembly from
+  `.superpowers/sdd/2026-08-15-fpu-fpsp-implementation-plan/task-9b-report.md` §2 yourself; it
+  should match exactly (it was independently reproduced twice already — by the blocked
+  attempt and by its verifier). If anything disagrees, STOP and reconcile before writing RTL.
+
+- [ ] **Step 2: `OperationDecoder.scala` / `PredecodeWord.scala`** — extend Task 9's existing
+  `fpCtrlOpBase`/`fpCtrlDir`/`fpCtrlMask` decode gate to admit `popcount(mask) ∈ {1,2,3}` with
+  a memory-alterable `<ea>` (reuse the blocked attempt's `fpCtrlListEaMem` gate verbatim — it
+  was correct and unaffected by this redesign), routing to the microcode engine
+  (`o.ucOp`/`o.microcoded` — **confirm the real current field name**, the blocked attempt's own
+  investigation found Task 9's actual field differs from an earlier draft's assumption; also
+  confirm whether Task 6b's own `fpMemIsMemEa`/`FP_MEM_TRAP_ENTRY` arm already claims part of
+  this opword range before adding a second, possibly-conflicting gate — the blocked attempt's
+  report flagged this exact overlap for the memory-`<ea>` FMOVECR/FMOVE-generic band; verify
+  this task's new gate and Task 6b's existing one don't double-claim the same opword/ext-word
+  combination). Predecode length framing: `2 + <ea>'s own extension words`, independent of
+  `popcount`, reusing the generic `eaExt` helper exactly like every other `<ea>`-bearing
+  instruction in the file.
+
+- [ ] **Step 3: `Microcode.scala` — new `Sel` selectors for plain FPCR/FPSR/FPIAR reads**
+  (Decision 3's load-bearing new primitive). Three new `Sel` case objects (e.g. `SFpuCtrlFpcr`/
+  `SFpuCtrlFpsr`/`SFpuCtrlFpiar`), resolved in BOTH `resolve()` (the Scala oracle) and
+  `resolveFromBits()` (the real hardware path) by reading `FpuControlService.fpcr`/`.fpsr`/
+  `.fpiar` directly — confirm how the microcode resolution functions currently get access to
+  service handles for other cross-cutting reads (if none currently do, this may need a new
+  `ctx` field threading the service handle through — check this concretely, don't assume it's
+  free) and follow the established `resolve()`/`resolveFromBits()` dual-path discipline exactly
+  (this is precisely the class of mistake `MicrocodeResolveEquivalenceSpec`, Step 9, exists to
+  catch).
+
+- [ ] **Step 4: `Microcode.scala` — the FPCC-read row.** The store direction's FPCC value needs
+  a microcode row that decodes as an ordinary `readsFpcc` consumer (real `pFpccSrc` tag, real
+  dynamic-wakeup gating) — confirm how an EXISTING microcode row already does this (if any do;
+  if none currently read FPCC from microcode, this is new plumbing threading `readsFpcc`/
+  `pFpccSrc` through the microcode `Desc`/`DescBits` shape, following the SAME dual-path
+  discipline as Step 3) and reuse that shape. **Do not build a second, parallel FPCC-read
+  mechanism** — if microcode genuinely cannot express an ordinary renamed-register read today,
+  flag this concretely (what's missing, what the minimal addition is) rather than routing
+  around it via `ExceptionUnit`/a sysOp, which would silently reintroduce Decision 3's
+  supposedly-solved problem.
+
+- [ ] **Step 5: `ExceptionUnit.scala` — generalize the `FMOVE_FPCTRL` `S_APPLY` arm**
+  (Decision 2). Read the real current arm (`grep -n "FMOVE_FPCTRL" ExceptionUnit.scala`) and
+  change its one-hot-`elsewhen`-chain shape to three independent `when(sysCapRc(k)) { ... }`
+  terms, so any subset of `{FPCR, FPSR, FPIAR}` can be applied in one retirement instead of
+  exactly one. Confirm this doesn't break Task 9's own existing single-register tests (a
+  single-bit `sysCapRc` through the generalized arm must produce byte-identical behavior to the
+  original one-hot arm — this should be provable by construction, but verify it with a
+  regression run of `FpuControlPluginSpec`'s existing tests, unmodified). Add a new directed
+  test for the genuinely multi-register case (e.g. mask=111 into 3 populated scratch temps,
+  confirm all three writes land in the same cycle/retirement).
+
+- [ ] **Step 6: `Microcode.scala` — the row-generator functions.** Two generators (or one
+  parametrized on direction), producing the load-direction program
+  (`[MLoad × popcount] + [terminal batch sysOp]`, `-(An)`'s writeback folded in per the
+  addressing-class handling below) and the store-direction program
+  (`[plain-read rows for any of FPCR/FPIAR/FPSR-non-FPCC selected] + [readsFpcc row IFF FPSR
+  selected] + [MStore × popcount]`, `-(An)`'s address-decrement handled as the FIRST row since
+  the store direction has no terminal-sysOp ordering constraint to respect). Cover
+  `popcount ∈ {1,2,3}` × 3 addressing classes (predecrement / postincrement / non-auto,
+  reusing the blocked attempt's own `FcaPredec`/`FcaPostinc`/`FcaNonAuto` classification, which
+  was correct and unaffected) × 2 directions. Mirror the blocked attempt's own
+  `fmovemCtrlEntries`-map discipline for entry-index bookkeeping (compute from real `romPN().
+  size` values, never a hand-copied literal — confirm composition with whatever else has landed
+  in the ROM since, the same caveat the blocked attempt itself flagged for Task 6b's own
+  appended rows applies here too).
+
+- [ ] **Step 7: `DecodeStage.scala` — `ucEntry` dispatch.** Data-dependent hardware mux from
+  `(direction, addressing-class, mask)` to the right generated program's entry index, following
+  Task 6b's `ucFpRealEntryOk`/`ucFpEntryForFmt` 18-way dispatch precedent (the blocked attempt's
+  own investigation found this is the better model than the smaller `MI_JMP_ENTRY`/
+  `MI_JSR_ENTRY` pair the original draft pointed at) — generate the hardware `switch`/mux cases
+  FROM the same Scala map Step 6 builds, so the hardware dispatch table and the ROM's row
+  layout can never drift apart.
+
+- [ ] **Step 8: Tests.** Row-generator unit tests (`MicrocodeFmovemCtrlSpec`, mirroring the
+  blocked attempt's own planned test shapes for row counts/`isFirst`/`isLast` and register
+  order per addressing class). Decode-level directed tests (`OperationDecoderSpec`,
+  `PredecodeWordSpec`) including the popcount==1-with-memory-EA case newly in scope, and a
+  negative test confirming a register-direct `<ea>` with a multi-bit mask stays illegal.
+  **Explicitly two whitebox/lock-step test strategies, per the register-order finding**:
+  - `-(An)` case: whitebox only (Musashi is confirmed wrong here — no oracle to lock-step
+    against). Seed FPCR/FPSR/FPIAR to distinct known values, execute the store, directly inspect
+    the memory words for the CORRECT ascending FPCR/FPSR/FPIAR order at the decremented address
+    (not what Musashi would produce), then execute the matching postincrement reload and confirm
+    a genuine round-trip recovers the original values.
+  - Every other addressing mode: real lock-step tests are sound here (Musashi's fixed order
+    matches real hardware for every non-predecrement mode) — use them, don't default to
+    whitebox out of excess caution. First confirm Musashi's own oracle build actually decodes
+    this opword/mask combination without hitting the "coprocessor stubs claim this range" gap
+    Task 9's Step 10 already documents (`ExecuteLockStepSpec.scala`, search for the citation) —
+    if it does hit that gap for this specific combination, fall back to whitebox and say so
+    explicitly, don't force a test that can't run against a real oracle response.
+
+- [ ] **Step 9: Re-run `MicrocodeResolveEquivalenceSpec`.** Mandatory — proves `resolve()` and
+  `resolveFromBits()` agree row-for-row across the entire ROM including this task's newly
+  generated programs. If it fails, the bug is almost certainly a `resolveFromBits()`/
+  `descToBits` edit that didn't mirror `resolve()` (Steps 3/5/6) exactly.
+
+- [ ] **Step 10: Full regression + mandatory OOC synth gate.** Same rationale as the blocked
+  attempt's own Step 10 — this task's own brief mandates its own real synth gate (does not defer
+  to Task 16), since it's adding real new ROM rows and a real `S_APPLY` arm change; check machine
+  load (`free -g`) before running, per the standing machine-resource-budget rule.
+  ```
+  sbt "testOnly m68k040.decode.MicrocodeFmovemCtrlSpec"
+  sbt "testOnly m68k040.decode.OperationDecoderSpec m68k040.frontend.PredecodeWordSpec"
+  sbt "testOnly m68k040.decode.MicrocodeResolveEquivalenceSpec"
+  sbt "testOnly m68k040.execute.FpuControlPluginSpec"
+  sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
+  sbt fastTest
+  ```
+  Confirm the REAL current lock-step baseline directly before this task (do not trust any
+  number cited anywhere in this document or its predecessors) and report the real delta.
+
+- [ ] **Step 11: Commit.** Reference this task's real design spec
+  (`docs/superpowers/specs/2026-08-16-fp-control-multiword-transfer-design.md`) and the blocked
+  attempt's report in the commit message. Record the real Step 1 toolchain output, the real
+  Step 10 synth number, and the real post-task lock-step count — do not merge with any
+  placeholder still present.
 
 ---
 
 ## Summary of what remains genuinely open after this task
 
-- Step 1b's primary-source page citation (flagged, gating, not yet done — this document provides strong secondary corroboration but not a page number).
-- The `popcount==1`-with-memory-EA extension (`fpu_fmove_mem_ea_fpcr_fpsr_no_fline.s`), recommended but left as the integrator's call (see "Scope").
-- The FMOVEM *data*-register-list form (`FP0-FP7`) — a structurally separate opcode family, untouched by this task, not in scope for FPSP-prologue support.
-- Step 3's honest flag on exactly how a *data-dependent* `ucEntry` gets threaded from `OperationDecoder` to `DecodeStage` — needs a direct-read confirmation against the codebase's actual current MI_* dispatch precedent before Step 7 is implemented for real.
-- The synth-gate scale risk flagged in Step 6/10 (~130 new ROM rows, ~50% growth) — a real number, not yet measured.
-
----
+- Whether the load-direction terminal apply needs a wholly new `SysKind` or can reuse
+  `FMOVE_FPCTRL` directly with a generalized `S_APPLY` arm (Step 5's own open question) —
+  resolve at implementation time by reading the real current field shapes, don't guess up front.
+- Task 11 (FSAVE/FRESTORE) should be re-briefed against
+  `docs/superpowers/specs/2026-08-16-fp-control-multiword-transfer-design.md` before it is
+  dispatched — separately, not part of this task.
 
 ### Task 10: FSAVE unimplemented-instruction-frame trigger fields (`fpuSoftwareComplete`, `fpuCmdWord`)
 
