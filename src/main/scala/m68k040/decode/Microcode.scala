@@ -141,6 +141,28 @@ object Microcode {
   // never needs to see the raw ext word itself.
   case object SFpCmd extends Sel   // selImm: ctx.fpCmd
 
+  // ── Task 9b: FMOVEM control-register LIST form (FPCR/FPSR/FPIAR <-> <ea>) ────────
+  // `ctx.fpCtrlRc` is the packed control word this family threads to BOTH its terminal
+  // commit-time apply and its execute-time register reads:
+  //     bits [2:0] = the register-select MASK, ext[12:10], MSB-first {FPCR,FPSR,FPIAR}
+  //     bit  [3]   = the BATCH marker (always 1 for this microcoded family) -- what
+  //                  tells ExceptionUnit's S_APPLY arm to take its values from
+  //                  RobPlugin's `sysAux` slots instead of the single-register
+  //                  fast-crack path's `sysVal`.
+  // The terminal sysOp row carries it verbatim (RobPlugin latches `imm[11:0]` into
+  // `sysRc`). The store direction's register-read rows carry it with a 2-bit POSITION
+  // in [5:4], selecting which of the mask's selected registers that row reads.
+  case object SFpCtrlRc    extends Sel   // selImm: ctx.fpCtrlRc                  (position 0)
+  case object SFpCtrlSel1  extends Sel   // selImm: ctx.fpCtrlRc | (1 << 4)       (position 1)
+  case object SFpCtrlSel2  extends Sel   // selImm: ctx.fpCtrlRc | (2 << 4)       (position 2)
+  // Signed An write-back delta for the auto-addressing buckets: +4*popcount(mask) for
+  // `(An)+`, -4*popcount(mask) for `-(An)`, 0 otherwise. Computed once at ucBegin from
+  // the real ext word's mask (mirrors SFpAutoDelta's own per-format precedent). The
+  // `-(An)` case is the WHOLE of D9's predecrement rule: decrement ONCE by the total,
+  // up front, then transfer ASCENDING in the fixed FPCR/FPSR/FPIAR order -- there is no
+  // per-transfer reversal anywhere in this family.
+  case object SFpCtrlDelta extends Sel   // selImm: ctx.fpCtrlDelta
+
   /** The op kind of a descriptor's template. */
   sealed trait UOp
   case object UMove      extends UOp    // plain move / load / store data move (DecOp.MOVE)
@@ -189,6 +211,16 @@ object Microcode {
   // from the opword/ext-word at assembly time (SFpCmd was already packed by ucBegin from
   // the real ext word, read once, before the ROM walk began).
   case object UFpIssue extends UOp
+  // ── Task 9b: FMOVEM control-register LIST form, STORE direction ─────────────────
+  // DecOp.FPCTRLRD / Cluster.CPLX. Reads the `fpCtrlPos`-th SELECTED control register
+  // (FPCR/FPSR/FPIAR order) into an integer temp. `useImm`/`imm` carry the packed
+  // {position, batch, mask} word (SFpCtrlRc / SFpCtrlSel1 / SFpCtrlSel2). ALWAYS
+  // declares `readsFpcc` -- the position-to-register choice is a runtime mux, so the row
+  // cannot know statically whether it is the FPSR one, and a spurious FPCC dependency is
+  // merely a (correct, harmless) extra wakeup wait. This is the ONLY microcode row
+  // family that reads FPCC, and it does so as an ORDINARY renamed consumer through the
+  // existing `readsFpcc`/`pFpccSrc`/`cplxFpccWakeupPort` dynamic-wakeup path.
+  case object UFpCtrlRead extends UOp
 
   /** Memory role. */
   sealed trait Mem
@@ -267,6 +299,18 @@ object Microcode {
       // format this entry group serves is always statically known), NOT derived from any
       // runtime ext-word field.
       fpSrcKindSel: Int = 0,
+      // ── Task 9b: FMOVEM control-register LIST form ──────────────────────────────
+      // `fpCtrlCap` — mark this (ordinary, non-sysOp) `MLoad` row as a load-direction
+      // VALUE CAPTURE: emits `sysKind = FPCTRL_CAP` with `sysOp` still False, which makes
+      // RobPlugin copy the row's own completion value into `sysAux(dstTemp - T0)` at its
+      // in-order retirement. See SysKind.FPCTRL_CAP's doc for why this is safe.
+      fpCtrlCap:   Boolean = false,
+      // `fpCtrlApply` — THE one terminal commit-time sysOp of a load-direction program:
+      // `sysOp = True`, `sysKind = FMOVE_FPCTRL`, `sysReadDir = False`, `sysRc` from the
+      // row's own imm (SFpCtrlRc). This is the ONLY place the microcode ROM emits a real
+      // sysOp, and by construction it is always a program's LAST row -- the invariant
+      // `RobPlugin`'s excSquash + `ExceptionUnit`'s S_REDIR impose on every sysOp.
+      fpCtrlApply: Boolean = false,
       miPtrIndex:  Boolean = false,  // UMiPtrLoad: add the PRE-index (eaIndex) to the pointer addr
       miHostIndex: Boolean = false,  // UMiHostMove LS row: add the POST-index (eaIndex) to (T0+od)
       miMoveFlags: Boolean = false,  // UMiHostMove: this IS the host MOVE (sets NZVC per ctx.miWNzvc)
@@ -310,7 +354,8 @@ object Microcode {
         SBfResImm, SBfWdDyn, SCas2Da1, SCas2Da2, SCas2Dc1, SCas2Dc2,
         SCas2Du1, SCas2Du2, SCas2Rn1, SCas2Rn2, SCasDc, SCasDu,
         SDeltaAx, SDeltaAy, SDn2, SEaBase, SEaDispHi, SEaDispLo,
-        SFpAutoDelta, SFpCmd, SFpDispHi, SFpDispMid,
+        SFpAutoDelta, SFpCmd, SFpCtrlDelta, SFpCtrlRc, SFpCtrlSel1, SFpCtrlSel2,
+        SFpDispHi, SFpDispMid,
         SImm12, SImm16, SImm4, SImm8, SMiImm, SMiOd,
         SMiOther, SMiOtherEaBase, SMiOtherEaDispLo, SMiOtherOd, SMove16Ay, SMovesAn,
         SMovesDelta, SMovesRn, SNegDeltaAx, SNegDeltaAy, SNone, SPackAdj,
@@ -332,7 +377,8 @@ object Microcode {
     val
         UMove, UAddDrop, UOpFromCtx, UBfMem, UBfResolve, UBfShiftOff,
         UBfAdd, UBfReg, UMiPtrLoad, UMiHostMove, UMiHostOp, UMiLeaFinal,
-        UMiPushFinal, UMiBranchFinal, UShiftR8, UMovesRead, UFpIssue, UCasOp = newElement()
+        UMiPushFinal, UMiBranchFinal, UShiftR8, UMovesRead, UFpIssue, UFpCtrlRead,
+        UCasOp = newElement()
   }
 
   /** Hardware encoding of `Mem` (memory role) — one element per case object (3). */
@@ -399,6 +445,8 @@ object Microcode {
     val bfIllegal   = Bool()  // deliver an ILLEGAL (vector-4) µop — BFINS mem-dynamic is DEFERRED (gated)
     val fpMemTrap   = Bool()  // Task 6b: deliver a vector-11 F-line trap µop (faultUsesNextPc=True)
     val fpSrcKindSel = UInt(2 bits)  // Task 6b: UFpIssue's static source-kind tag (0/1/2)
+    val fpCtrlCap   = Bool()  // Task 9b: mark this MLoad row as a load-direction value capture
+    val fpCtrlApply = Bool()  // Task 9b: THE terminal commit-time FMOVE_FPCTRL sysOp row
     val miPtrIndex  = Bool()  // UMiPtrLoad: add the PRE-index (eaIndex) to the pointer addr
     val miHostIndex = Bool()  // UMiHostMove LS row: add the POST-index (eaIndex) to (T0+od)
     val miMoveFlags = Bool()  // UMiHostMove: this IS the host MOVE (sets NZVC per ctx.miWNzvc)
@@ -441,6 +489,7 @@ object Microcode {
         case UShiftR8       => (UOpHw.UShiftR8, 0, false, false, false)
         case UMovesRead     => (UOpHw.UMovesRead, 0, false, false, false)
         case UFpIssue       => (UOpHw.UFpIssue, 0, false, false, false)
+        case UFpCtrlRead    => (UOpHw.UFpCtrlRead, 0, false, false, false)
         case co: UCasOp     => (UOpHw.UCasOp, co.form, co.writesNzvc, co.readsNzvc, co.dropCommit)
       }
     b.uop           := uopHw
@@ -500,6 +549,10 @@ object Microcode {
       case SEaDispLo => SelHw.SEaDispLo
       case SFpAutoDelta => SelHw.SFpAutoDelta
       case SFpCmd => SelHw.SFpCmd
+      case SFpCtrlRc => SelHw.SFpCtrlRc
+      case SFpCtrlSel1 => SelHw.SFpCtrlSel1
+      case SFpCtrlSel2 => SelHw.SFpCtrlSel2
+      case SFpCtrlDelta => SelHw.SFpCtrlDelta
       case SFpDispHi => SelHw.SFpDispHi
       case SFpDispMid => SelHw.SFpDispMid
       case SImm12 => SelHw.SImm12
@@ -554,6 +607,8 @@ object Microcode {
     b.bfIllegal           := Bool(d.bfIllegal)
     b.fpMemTrap           := Bool(d.fpMemTrap)
     b.fpSrcKindSel        := U(d.fpSrcKindSel, 2 bits)
+    b.fpCtrlCap           := Bool(d.fpCtrlCap)
+    b.fpCtrlApply         := Bool(d.fpCtrlApply)
     b.miPtrIndex          := Bool(d.miPtrIndex)
     b.miHostIndex         := Bool(d.miHostIndex)
     b.miMoveFlags         := Bool(d.miMoveFlags)
@@ -1793,7 +1848,142 @@ object Microcode {
     // bfIllegal).
     Vector(Desc(UMove, fpMemTrap = true, isFirst = true, isLast = true))
 
-  val rom: Vector[Desc] = romP1() ++ romP2() ++ romP3() ++ romP4() ++ romP5() ++ romP6() ++ romP7() ++ romP8() ++ romP9()
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // Task 9b — FMOVEM control-register LIST form: `FMOVEM.L <ea>,{FPCR/FPSR/FPIAR}`
+  // and `FMOVEM.L {FPCR/FPSR/FPIAR},<ea>`  (opword 0xF200|<ea>, ext ddd=100/101,
+  // RRR=ext[12:10] = {FPCR,FPSR,FPIAR} MSB-first).
+  //
+  // Design: docs/superpowers/specs/2026-08-16-fp-control-multiword-transfer-design.md.
+  // ALL memory movement rides ordinary `MLoad`/`MStore` rows (Decision 1) -- real DTLB
+  // translation, real privilege checking, real precise fault delivery, for free.
+  //
+  //   LOAD  (<ea> -> control): [MLoad x popcount, each a `fpCtrlCap` value capture]
+  //                            [An write-back, if an auto mode]
+  //                            [ONE terminal `fpCtrlApply` sysOp]   <- ALWAYS LAST
+  //   STORE (control -> <ea>): [UFpCtrlRead x popcount]  (execute-time plain reads +
+  //                                                       the renamed FPCC read)
+  //                            [MStore x popcount]
+  //                            [An write-back, if an auto mode]
+  //                            NO sysOp at all (Decision 3).
+  //
+  // REGISTER ORDER (Divergence Register D9/D9a, M68000PRM 1992 p. 5-91, corroborated
+  // MC68881/MC68882 UM p. 4-76): the registers ALWAYS move FPCR first, FPSR second,
+  // FPIAR last, ASCENDING through memory, regardless of addressing mode. For `-(An)`
+  // the address register is decremented ONCE, up front, by 4*popcount, and the
+  // transfers then ascend from there -- there is NO per-transfer reversal. That is why
+  // the `AUTO_PRE` bucket below is "one leading `UAddDrop`, then the ordinary ascending
+  // rows", identical in shape to every other bucket. (Musashi's own `fmove_fpcr`
+  // re-decrements per transfer and is confirmed WRONG for `-(An)` with popcount >= 2;
+  // this core deliberately diverges -- see the task report's test-strategy split.)
+  //
+  // ROM ECONOMY: the programs are keyed on POPCOUNT (1/2/3), not on the 7 distinct
+  // masks, because no row needs to know WHICH register it is moving:
+  //   - the load rows just fill T0/T1/T2 in position order, and the ONE terminal sysOp
+  //     receives the whole mask through its imm (SFpCtrlRc -> RobPlugin `sysRc`);
+  //   - the store rows' `UFpCtrlRead` resolves "the `fpCtrlPos`-th selected register"
+  //     against the same runtime mask inside the EU.
+  // 2 directions x 3 buckets x 3 popcounts = 18 entry groups -- exactly the shape of
+  // Task 6b's own 18-way `ucFpEntryForFmt` dispatch, which DecodeStage mirrors.
+  private def fpCtrlTemp(i: Int): Sel = i match { case 0 => ST0; case 1 => ST1; case _ => ST2 }
+  // Non-auto (side-effect-free) EA bucket: base + the EA's own displacement, +4, +8.
+  private def fpCtrlBaseDisp(i: Int): Sel = i match { case 0 => SEaDispLo; case 1 => SFpDispMid; case _ => SFpDispHi }
+  // Auto buckets: a flat literal offset from the (unmodified `(An)+` / already-
+  // decremented `-(An)`) An, exactly like Task 6b's own `fpMemChunkAutoImm`.
+  private def fpCtrlAutoImm(i: Int): Option[Sel] = i match { case 0 => None; case 1 => Some(SImm4); case _ => Some(SImm8) }
+  private def fpCtrlPosImm(i: Int): Sel = i match { case 0 => SFpCtrlRc; case 1 => SFpCtrlSel1; case _ => SFpCtrlSel2 }
+
+  /** The ONE terminal commit-time apply row of a load-direction program. `srcA = ST0`
+    * is deliberate on two counts: it gives the row a real completion value (RobPlugin's
+    * `sysRetire` gates on `sysValRdyStore`, set by ANY completing µop), and its RAW
+    * dependency on the first load makes the sysOp issue after the loads have landed. */
+  private def fpCtrlApplyRow(): Desc =
+    Desc(UMove, srcA = ST0, useImm = true, imm = SFpCtrlRc, sz = SzLong,
+         fpCtrlApply = true, isLast = true)
+
+  private def fpCtrlAnWriteBack(isFirst: Boolean = false, isLast: Boolean = false): Desc =
+    Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SFpCtrlDelta,
+         isFirst = isFirst, isLast = isLast)
+
+  // LOAD, non-auto EA: [MLoad(cap) x n] + [apply].
+  private def fpCtrlLoadBaseGroup(n: Int): Vector[Desc] =
+    (0 until n).map { i =>
+      Desc(UMove, mem = MLoad, srcA = SEaBase, dst = fpCtrlTemp(i), useImm = true,
+           imm = fpCtrlBaseDisp(i), sz = SzLong, indexFromEa = true,
+           fpCtrlCap = true, isFirst = (i == 0))
+    }.toVector :+ fpCtrlApplyRow()
+
+  // LOAD, `(An)+`: [MLoad(cap) x n @ An+0/4/8] + [An += 4n] + [apply].
+  // The write-back sits BEFORE the terminal sysOp (not after, as Task 6b's own
+  // AUTO_POST bucket does) because the sysOp's retirement squashes every younger µop --
+  // "one sysOp, and it must be last" is a hard invariant, so the An update has to have
+  // already retired. The loads still read the UNMODIFIED An: they are decoded before the
+  // write-back, so rename gives them the pre-update mapping.
+  private def fpCtrlLoadPostGroup(n: Int): Vector[Desc] =
+    (0 until n).map { i =>
+      fpCtrlAutoImm(i) match {
+        case Some(sel) => Desc(UMove, mem = MLoad, srcA = SAy, dst = fpCtrlTemp(i), useImm = true,
+                               imm = sel, sz = SzLong, fpCtrlCap = true, isFirst = (i == 0))
+        case None      => Desc(UMove, mem = MLoad, srcA = SAy, dst = fpCtrlTemp(i),
+                               sz = SzLong, fpCtrlCap = true, isFirst = (i == 0))
+      }
+    }.toVector :+ fpCtrlAnWriteBack() :+ fpCtrlApplyRow()
+
+  // LOAD, `-(An)`: [An -= 4n] + [MLoad(cap) x n @ An+0/4/8] + [apply].  ← D9 verbatim.
+  private def fpCtrlLoadPreGroup(n: Int): Vector[Desc] =
+    fpCtrlAnWriteBack(isFirst = true) +: ((0 until n).map { i =>
+      fpCtrlAutoImm(i) match {
+        case Some(sel) => Desc(UMove, mem = MLoad, srcA = SAy, dst = fpCtrlTemp(i), useImm = true,
+                               imm = sel, sz = SzLong, fpCtrlCap = true)
+        case None      => Desc(UMove, mem = MLoad, srcA = SAy, dst = fpCtrlTemp(i),
+                               sz = SzLong, fpCtrlCap = true)
+      }
+    }.toVector :+ fpCtrlApplyRow())
+
+  private def fpCtrlReadRows(n: Int, firstIsFirst: Boolean): Vector[Desc] =
+    (0 until n).map { i =>
+      Desc(UFpCtrlRead, dst = fpCtrlTemp(i), useImm = true, imm = fpCtrlPosImm(i),
+           sz = SzLong, isFirst = firstIsFirst && (i == 0))
+    }.toVector
+
+  // STORE, non-auto EA: [read x n] + [MStore x n].
+  private def fpCtrlStoreBaseGroup(n: Int): Vector[Desc] =
+    fpCtrlReadRows(n, firstIsFirst = true) ++ (0 until n).map { i =>
+      Desc(UMove, mem = MStore, srcA = SEaBase, srcB = fpCtrlTemp(i), useImm = true,
+           imm = fpCtrlBaseDisp(i), sz = SzLong, indexFromEa = true,
+           isLast = (i == n - 1))
+    }.toVector
+
+  // STORE, `(An)+`: [read x n] + [MStore x n @ An+0/4/8] + [An += 4n].
+  private def fpCtrlStorePostGroup(n: Int): Vector[Desc] =
+    fpCtrlReadRows(n, firstIsFirst = true) ++ (0 until n).map { i =>
+      fpCtrlAutoImm(i) match {
+        case Some(sel) => Desc(UMove, mem = MStore, srcA = SAy, srcB = fpCtrlTemp(i),
+                               useImm = true, imm = sel, sz = SzLong)
+        case None      => Desc(UMove, mem = MStore, srcA = SAy, srcB = fpCtrlTemp(i),
+                               sz = SzLong)
+      }
+    }.toVector :+ fpCtrlAnWriteBack(isLast = true)
+
+  // STORE, `-(An)`: [An -= 4n] + [read x n] + [MStore x n @ An+0/4/8].  ← D9 verbatim.
+  private def fpCtrlStorePreGroup(n: Int): Vector[Desc] =
+    (fpCtrlAnWriteBack(isFirst = true) +: fpCtrlReadRows(n, firstIsFirst = false)) ++
+    (0 until n).map { i =>
+      fpCtrlAutoImm(i) match {
+        case Some(sel) => Desc(UMove, mem = MStore, srcA = SAy, srcB = fpCtrlTemp(i),
+                               useImm = true, imm = sel, sz = SzLong,
+                               isLast = (i == n - 1))
+        case None      => Desc(UMove, mem = MStore, srcA = SAy, srcB = fpCtrlTemp(i),
+                               sz = SzLong, isLast = (i == n - 1))
+      }
+    }.toVector
+
+  private val fpCtrlCounts: Vector[Int] = Vector(1, 2, 3)
+  private def romP10(): Vector[Desc] =
+    fpCtrlCounts.flatMap(fpCtrlLoadBaseGroup)  ++ fpCtrlCounts.flatMap(fpCtrlLoadPostGroup)  ++
+    fpCtrlCounts.flatMap(fpCtrlLoadPreGroup)   ++ fpCtrlCounts.flatMap(fpCtrlStoreBaseGroup) ++
+    fpCtrlCounts.flatMap(fpCtrlStorePostGroup) ++ fpCtrlCounts.flatMap(fpCtrlStorePreGroup)
+
+  val rom: Vector[Desc] = romP1() ++ romP2() ++ romP3() ++ romP4() ++ romP5() ++ romP6() ++ romP7() ++ romP8() ++ romP9() ++ romP10()
 
   // Task 6b entry constants: SELF-COMPUTED from each group's own real row count (via
   // `scanLeft`), not hand-counted literals -- eliminates arithmetic-drift risk across 18
@@ -1830,7 +2020,32 @@ object Microcode {
   val FP_MEM_D_AUTO_PRE_ENTRY = fpMemAutoPreOffsets(4)   // 4 rows
   val FP_MEM_X_AUTO_PRE_ENTRY = fpMemAutoPreOffsets(5)   // 5 rows
 
-  val FP_MEM_TRAP_ENTRY = fpMemAutoPreOffsets.last   // 1 row (the last row in the ROM)
+  val FP_MEM_TRAP_ENTRY = fpMemAutoPreOffsets.last   // 1 row
+
+  // Task 9b entry constants — SELF-COMPUTED from each group's own real row count via
+  // `scanLeft`, exactly like Task 6b's above (never a hand-counted literal, and never a
+  // hardcoded romP1..romP9 total: `fpCtrlRomStart` re-derives it). 18 groups, one per
+  // (direction x EA bucket x popcount).
+  private val fpCtrlRomStart: Int = FP_MEM_TRAP_ENTRY + 1
+  private def fpCtrlOffsets(start: Int, gen: Int => Vector[Desc]): Vector[Int] =
+    fpCtrlCounts.scanLeft(start) { (acc, n) => acc + gen(n).size }
+  private val fpCtrlLdBaseOffsets  = fpCtrlOffsets(fpCtrlRomStart,             fpCtrlLoadBaseGroup)
+  private val fpCtrlLdPostOffsets  = fpCtrlOffsets(fpCtrlLdBaseOffsets.last,   fpCtrlLoadPostGroup)
+  private val fpCtrlLdPreOffsets   = fpCtrlOffsets(fpCtrlLdPostOffsets.last,   fpCtrlLoadPreGroup)
+  private val fpCtrlStBaseOffsets  = fpCtrlOffsets(fpCtrlLdPreOffsets.last,    fpCtrlStoreBaseGroup)
+  private val fpCtrlStPostOffsets  = fpCtrlOffsets(fpCtrlStBaseOffsets.last,   fpCtrlStorePostGroup)
+  private val fpCtrlStPreOffsets   = fpCtrlOffsets(fpCtrlStPostOffsets.last,   fpCtrlStorePreGroup)
+
+  /** Entry point for a control-register-list program. `load` = `<ea>` -> control
+    * registers (ext ddd=100); `bucket` 0 = non-auto EA, 1 = `(An)+`, 2 = `-(An)`;
+    * `popcount` 1..3. Indexed by popcount-1, so the hardware dispatch mux in
+    * `DecodeStage` is generated straight from this table and can never drift from the
+    * ROM layout the same `scanLeft` produced. */
+  def fpCtrlEntry(load: Boolean, bucket: Int, popcount: Int): Int = {
+    val offs = (if (load) Vector(fpCtrlLdBaseOffsets, fpCtrlLdPostOffsets, fpCtrlLdPreOffsets)
+                else      Vector(fpCtrlStBaseOffsets, fpCtrlStPostOffsets, fpCtrlStPreOffsets))(bucket)
+    offs(popcount - 1)
+  }
 
   val BF_DYN_RD_PCREL_DO1_ENTRY  = 178   // rows 178..183
   val BF_DYN_FFO_PCREL_DO1_ENTRY = 184   // rows 184..190
@@ -2046,6 +2261,12 @@ object Microcode {
     // Packed FP-issue command word (see SFpCmd above): opmode[6:0] | dstFp[2:0]<<7 |
     // srcSpec[2:0]<<10. Harmless (unread) for every other microcode customer.
     val fpCmd = Bits(32 bits)
+    // ── Task 9b: FMOVEM control-register LIST form ──────────────────────────────
+    // `fpCtrlRc` = {batch(bit3)=1, mask(bits[2:0]) = ext[12:10] {FPCR,FPSR,FPIAR}}.
+    // `fpCtrlDelta` = the SIGNED An write-back for the auto buckets,
+    // +/-4*popcount(mask) (0 for non-auto). See SFpCtrlRc / SFpCtrlDelta.
+    val fpCtrlRc    = Bits(32 bits)
+    val fpCtrlDelta = Bits(32 bits)
   }
 
   // ── selector → (regId, valid) ──────────────────────────────────────────────
@@ -2133,6 +2354,12 @@ object Microcode {
     case SFpDispHi   => (ctx.eaDispLo.asUInt + U(8, 32 bits)).asBits   // Extended mantissa-lo
     case SFpAutoDelta => ctx.fpAutoDelta                                // signed per-format An delta
     case SFpCmd      => ctx.fpCmd                                       // packed FP-issue command word
+    // Task 9b: the packed {position, batch, mask} control word; positions 1/2 OR the
+    // 2-bit position into imm[5:4] (position 0 is `fpCtrlRc` itself, imm[5:4] == 0).
+    case SFpCtrlRc    => ctx.fpCtrlRc
+    case SFpCtrlSel1  => (ctx.fpCtrlRc.asUInt | U(1 << 4, 32 bits)).asBits
+    case SFpCtrlSel2  => (ctx.fpCtrlRc.asUInt | U(2 << 4, 32 bits)).asBits
+    case SFpCtrlDelta => ctx.fpCtrlDelta                                // signed +/-4*popcount An delta
     case _           => B(0, 32 bits)
   }
 
@@ -2183,6 +2410,7 @@ object Microcode {
       case UMiBranchFinal => u.op := DecOp.BRANCH   // indirect branch (mirrors ibrUop)
       case UMovesRead  => u.op := DecOp.MOVE   // MOVE T0 -> Rn (sign-ext An / merge Dn in EU)
       case UFpIssue    => u.op := DecOp.FPU    // task 6b: the terminal FP-generic issue row
+      case UFpCtrlRead => u.op := DecOp.FPCTRLRD  // task 9b: FPCR/FPSR/FPIAR -> int temp
       case _: UCasOp   => u.op := DecOp.CASOP
     }
     u.cluster := (d.uop match {
@@ -2205,6 +2433,10 @@ object Microcode {
       // 9, same as Task 6's directly-emitted register-form uop) -- an explicit override
       // since d.mem=MNone would otherwise default to Cluster.INT via the `_` arm below.
       case UFpIssue => Cluster.CPLX
+      // task 9b: the control-register read runs on the CPLX cluster too -- it is the
+      // only cluster with access to the FPCC physical register file, which FPSR's
+      // condition-code nibble comes from. Explicit override (d.mem = MNone).
+      case UFpCtrlRead => Cluster.CPLX
       case _: UCasOp => Cluster.INT          // CAS/CAS2 compute runs on the ALU pipe
       case _         => (d.mem match { case MNone => Cluster.INT; case _ => Cluster.LS })
     })
@@ -2449,6 +2681,17 @@ object Microcode {
         case _ => FpSrcKind.INTREG
       })
     }
+    // Task 9b: the control-register read row is the design's FIRST and ONLY `readsFpcc`
+    // consumer. It declares the dependency unconditionally (the position-to-register
+    // choice is a runtime mux inside the EU, so the row cannot know statically whether it
+    // is the FPSR one); rename then hands it a real `pFpccSrc` and the CPLX dynamic-
+    // wakeup scoreboard (`cplxFpccBusy`/`cplxFpccWait`/`cplxFpccWakeupPort`) gates issue
+    // exactly as it already does for any FPCC producer's consumer. Same `when(Bool(...))`
+    // conditional-override shape as the UFpIssue block above, for the same
+    // `PhaseCheck_noLatchNoOverride` reason.
+    when(Bool(d.uop == UFpCtrlRead)) {
+      u.readsFpcc := True
+    }
     u.isScc := False; u.isDbcc := False
     // Indexed-EA descriptor fields. The bit-field chain and the full-format mem-indirect
     // pointer/host LS rows carry the EA index (srcC) -> drive its size/scale from Ctx; all
@@ -2468,9 +2711,27 @@ object Microcode {
     u.leaAddr := Bool(d.uop == UMiLeaFinal); u.fromCcr := False; u.fromSr := False
     u.needsSupervisor := ctx.needsSup && Bool(d.isFirst)
     u.keepCommit := Bool(d.keepCommit)
-    // µcode µops are never commit-time system ops (the system ops ride the fast
-    // op-µop builder + the ROB serializing path, not the ROM). Default inert.
-    u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+    // µcode µops are, with ONE deliberate exception, never commit-time system ops
+    // (the system ops ride the fast op-µop builder + the ROB serializing path, not the
+    // ROM). Default inert.
+    //
+    // Task 9b's exception: a load-direction FMOVEM-control program's LAST row carries
+    // `fpCtrlApply` -> a real `SysKind.FMOVE_FPCTRL` sysOp. That is safe precisely
+    // BECAUSE it is last: a sysOp retiring at the ROB head is a serializing boundary
+    // (`RobPlugin`'s excSquash empties the ROB, `ExceptionUnit`'s S_REDIR re-fetches from
+    // the MACRO instruction's nextPc), so anything younger in the same program would be
+    // silently discarded. The row generators enforce "apply row == isLast" by
+    // construction (`fpCtrlApplyRow()` always sets both) and `MicrocodeFmovemCtrlSpec`
+    // asserts it over the whole ROM.
+    //
+    // `fpCtrlCap` rows are NOT sysOps (`sysOp` stays False) -- they only carry the
+    // `FPCTRL_CAP` kind as a retire-time value-capture marker for RobPlugin. See
+    // SysKind.FPCTRL_CAP.
+    u.sysOp := Bool(d.fpCtrlApply)
+    u.sysKind := (if (d.fpCtrlApply) SysKind.FMOVE_FPCTRL
+                  else if (d.fpCtrlCap) SysKind.FPCTRL_CAP
+                  else SysKind.NONE)
+    u.sysReadDir := False
     u.predTaken := False; u.predTarget := U(0, 32 bits)
     u.phtValid := False; u.phtIndex := U(0, 11 bits)
     // CAS/CAS2 compute sub-form (DecOp.CASOP); 0 for every other µop.
@@ -2605,6 +2866,11 @@ object Microcode {
       is(SelHw.SFpDispHi)   { imm := (ctx.eaDispLo.asUInt + U(8, 32 bits)).asBits }   // Extended mantissa-lo
       is(SelHw.SFpAutoDelta) { imm := ctx.fpAutoDelta }                               // signed per-format An delta
       is(SelHw.SFpCmd)      { imm := ctx.fpCmd }                                      // packed FP-issue command word
+      // Task 9b: packed {position, batch, mask} control word + the signed An delta.
+      is(SelHw.SFpCtrlRc)    { imm := ctx.fpCtrlRc }
+      is(SelHw.SFpCtrlSel1)  { imm := (ctx.fpCtrlRc.asUInt | U(1 << 4, 32 bits)).asBits }
+      is(SelHw.SFpCtrlSel2)  { imm := (ctx.fpCtrlRc.asUInt | U(2 << 4, 32 bits)).asBits }
+      is(SelHw.SFpCtrlDelta) { imm := ctx.fpCtrlDelta }
     }
     imm
   }
@@ -2662,6 +2928,7 @@ object Microcode {
       is(UOpHw.UMiBranchFinal) { u.op := DecOp.BRANCH }   // indirect branch (mirrors ibrUop)
       is(UOpHw.UMovesRead)  { u.op := DecOp.MOVE }   // MOVE T0 -> Rn (sign-ext An / merge Dn in EU)
       is(UOpHw.UFpIssue)    { u.op := DecOp.FPU }    // task 6b: the terminal FP-generic issue row
+      is(UOpHw.UFpCtrlRead) { u.op := DecOp.FPCTRLRD }  // task 9b: FPCR/FPSR/FPIAR -> int temp
       is(UOpHw.UCasOp)      { u.op := DecOp.CASOP }
     }
     // The original's `case _ => (d.mem match { case MNone => INT; case _ => LS })` default
@@ -2688,6 +2955,9 @@ object Microcode {
       // 9) -- an explicit override since d.mem=MNone would otherwise default to Cluster.INT
       // via the pre-switch default above.
       is(UOpHw.UFpIssue)    { u.cluster := Cluster.CPLX }
+      // task 9b: the control-register read runs on the CPLX cluster too -- the only
+      // cluster with access to the FPCC physical register file (FPSR needs it).
+      is(UOpHw.UFpCtrlRead) { u.cluster := Cluster.CPLX }
       is(UOpHw.UCasOp)      { u.cluster := Cluster.INT }  // CAS/CAS2 compute runs on the ALU pipe
     }
     // The An write-back ADD is LONG; the BCD chain uses ctx.size; the bit-field chain rows
@@ -2924,6 +3194,11 @@ object Microcode {
         is(U(2, 2 bits)) { u.fpSrcKind := FpSrcKind.MEMEXT }
       }
     }
+    // Task 9b: the control-register read row is the design's FIRST and ONLY `readsFpcc`
+    // consumer -- see resolve()'s twin for the full rationale.
+    when(d.uop === UOpHw.UFpCtrlRead) {
+      u.readsFpcc := True
+    }
     u.isScc := False; u.isDbcc := False
     // Indexed-EA descriptor fields. The bit-field chain and the full-format mem-indirect
     // pointer/host LS rows carry the EA index (srcC) -> drive its size/scale from Ctx; all
@@ -2943,9 +3218,16 @@ object Microcode {
     u.leaAddr := d.uop === UOpHw.UMiLeaFinal; u.fromCcr := False; u.fromSr := False
     u.needsSupervisor := ctx.needsSup && d.isFirst
     u.keepCommit := d.keepCommit
-    // µcode µops are never commit-time system ops (the system ops ride the fast
-    // op-µop builder + the ROB serializing path, not the ROM). Default inert.
-    u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+    // µcode µops are, with ONE deliberate exception, never commit-time system ops.
+    // Task 9b: `fpCtrlApply` (always the program's LAST row, by construction) emits the
+    // real terminal `SysKind.FMOVE_FPCTRL` sysOp; `fpCtrlCap` emits the NON-sysOp
+    // `FPCTRL_CAP` retire-time capture marker. Exact twin of resolve()'s block -- see
+    // there for the full rationale.
+    u.sysOp := d.fpCtrlApply
+    u.sysKind := SysKind.NONE
+    when(d.fpCtrlApply)    { u.sysKind := SysKind.FMOVE_FPCTRL }
+      .elsewhen(d.fpCtrlCap) { u.sysKind := SysKind.FPCTRL_CAP }
+    u.sysReadDir := False
     u.predTaken := False; u.predTarget := U(0, 32 bits)
     u.phtValid := False; u.phtIndex := U(0, 11 bits)
     // CAS/CAS2 compute sub-form (DecOp.CASOP); 0 for every other µop.

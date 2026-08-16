@@ -56,6 +56,43 @@ class PredecodeFpLenSpec extends AnyFunSuite {
     }
   }
 
+  // ── Task 9b: FMOVEM control-register LIST form ──────────────────────────────────
+  // Length is `2 + the <ea>'s own extension words` and is INDEPENDENT of the register
+  // mask's popcount — the mask only affects the execute-time transfer count and the
+  // microcode program length, never the fetched instruction's own length. Every literal
+  // below is real `m68k-linux-gnu-as -m68040 -m68881` output (this task's report §1).
+  test("FMOVEM control-register list: length is 2 + EA ext, independent of popcount", VerilatorTest) {
+    run { (_, chk) =>
+      // Store direction (ddd = 101). -(A7) / (A0) / (A0)+ : no EA extension word.
+      chk(0xF227, 0xBC00, 0x0000, 2, "FMOVEM.L FPIAR/FPSR/FPCR,-(A7)  [the FPSP prologue]")
+      chk(0xF227, 0xB800, 0x0000, 2, "FMOVEM.L FPCR/FPSR,-(A7)        [popcount 2]")
+      chk(0xF210, 0xB000, 0x0000, 2, "FMOVE.L  FPCR,(A0)              [popcount 1]")
+      chk(0xF210, 0xAC00, 0x0000, 2, "FMOVEM.L FPIAR/FPSR,(A0)")
+      chk(0xF218, 0xBC00, 0x0000, 2, "FMOVEM.L FPIAR/FPSR/FPCR,(A0)+")
+      // Load direction (ddd = 100) frames identically.
+      chk(0xF21F, 0x9C00, 0x0000, 2, "FMOVEM.L (A7)+,FPIAR/FPSR/FPCR")
+      chk(0xF210, 0x9800, 0x0000, 2, "FMOVEM.L (A0),FPCR/FPSR")
+      chk(0xF210, 0x9000, 0x0000, 2, "FMOVE.L  (A0),FPCR              [popcount 1]")
+      // (d16,An) = 3 words; abs.W = 3; abs.L = 4; brief-indexed = 3. Same for BOTH
+      // directions and every popcount — the mask never moves the length.
+      chk(0xF228, 0xBC00, 0x0008, 3, "FMOVEM.L FPIAR/FPSR/FPCR,(8,A0)")
+      chk(0xF228, 0x9C00, 0x0008, 3, "FMOVEM.L (8,A0),FPIAR/FPSR/FPCR")
+      chk(0xF228, 0x9000, 0x0008, 3, "FMOVE.L  (8,A0),FPCR            [popcount 1, same length]")
+      chk(0xF238, 0xBC00, 0x1234, 3, "FMOVEM.L FPIAR/FPSR/FPCR,(0x1234).W")
+      chk(0xF239, 0xBC00, 0x1234, 4, "FMOVEM.L FPIAR/FPSR/FPCR,(0x12345678).L")
+      chk(0xF230, 0xBC00, 0x1004, 3, "FMOVEM.L FPIAR/FPSR/FPCR,(4,A0,D1.W)")
+      // PC-relative: framed here (predecode is direction- and legality-agnostic); the
+      // ACCEPT gate that rejects it lives in DecodeStage, not in framing.
+      chk(0xF23A, 0x9C00, 0x000A, 3, "FMOVEM.L (10,PC),FPIAR/FPSR/FPCR")
+      chk(0xF23B, 0x9C00, 0x0804, 3, "FMOVEM.L (4,PC,D0.L),FPIAR/FPSR/FPCR")
+      // A mask of 000, and a reserved non-zero ext[9:0] tail, are rejected at DECODE (a
+      // vector-11 trap) but must still be FRAMED here -- an unframed length would make
+      // that trap un-RTE-able and so un-completable by a real FPSP kernel.
+      chk(0xF210, 0x8000, 0x0000, 2, "mask 000 (trapped at decode, still framed)")
+      chk(0xF210, 0x9C01, 0x0000, 2, "reserved ext tail (trapped at decode, still framed)")
+    }
+  }
+
   test("cpGEN <ea>-source forms add the EA's own extension words", VerilatorTest) {
     run { (_, chk) =>
       // FADD.L D1,FP0     : opclass 010, src spec 000 (long int), EA mode 0 reg 1 -> 0 ext

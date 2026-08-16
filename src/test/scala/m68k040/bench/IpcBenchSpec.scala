@@ -289,6 +289,16 @@ class IpcBenchSpec extends AnyFunSuite {
   // and same safety argument, as the nzvcWr direct write just above.
   fpccRd.addr    := host[RenameStage].committedPhysFpcc.resize(fpccRd.addr.getWidth)
   exc.committedFpccIn := fpccRd.data
+  // Task 9b: the CPLX EU's live FPCR/FPSR/FPIAR reads (DecOp.FPCTRLRD, the FMOVEM
+  // control-register LIST form's store direction). Driven from here rather than read
+  // directly out of the service inside DivEuPlugin, because FpuControlPlugin publishes
+  // those registers from inside its OWN `during build` Area -- a consumer plugin whose
+  // `logic` elaborates first would read null. Same order-proof seam as
+  // `exc.committedFpccIn` / `exc.committedA7In` just above.
+  val fpCtlSvc = host[m68k040.services.FpuControlService]
+  divEu.fpCtrlFpcrIn  := fpCtlSvc.fpcr
+  divEu.fpCtrlFpsrIn  := fpCtlSvc.fpsr
+  divEu.fpCtrlFpiarIn := fpCtlSvc.fpiar
   fpccWr.valid   := exc.fpccWriteValid
   fpccWr.address := host[RenameStage].committedPhysFpcc.resize(fpccWr.address.getWidth)
   fpccWr.data    := exc.fpccWriteData

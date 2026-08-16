@@ -161,6 +161,12 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
   var fpRdA, fpRdB: RegFileReadPort = null
   var fpW: RegFileWritePort   = null
   var fpccW: RegFileWritePort = null
+  var fpccRd: RegFileReadPort = null                                // Task 9b: FPCC reader
+  // Task 9b: live FPCR/FPSR/FPIAR, driven by the wiring plugin (see `setup` for why these
+  // are input wires and not a direct `host[FpuControlService]` read).
+  var fpCtrlFpcrIn:  UInt = null
+  var fpCtrlFpsrIn:  UInt = null
+  var fpCtrlFpiarIn: UInt = null
   /** FPCR[5:4] rounding mode (0=RN 1=RZ 2=RM 3=RP), sampled at ISSUE and carried with the
     * request inside FpuCore, so an FPCR write landing mid-flight cannot re-mux an
     * already-issued result. Default-driven RN (allowOverride) — which is not a placeholder
@@ -227,6 +233,40 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     fpRdB = fprf.newRead(forceNoBypass = true)   // FPm (fpSrcKind === FPREG only)
     fpW   = fprf.newWrite(latency = 1)
     fpccW = host[FpccRegFileService].newWrite(latency = 1)
+    // ---- Task 9b: FMOVEM control-register LIST form, STORE direction ----
+    // The design's FIRST FPCC *reader*. Deliberately `forceNoBypass = true`, for exactly
+    // the reason the two FP-file reads above give: `DecOp.FPCTRLRD` declares a real
+    // `readsFpcc`, so IssueQueuePlugin's DYNAMIC `cplxFpccWait` holds it until at least
+    // two cycles after the producing write port fired -- a bypass comparator on a 16x4
+    // file would be pure area for an unreachable case. (16 entries x 4 bits: one 4-bit
+    // 16:1 mux, negligible next to the int file's 50x32.)
+    fpccRd = host[FpccRegFileService].newRead(forceNoBypass = true)
+    // FPCR / FPSR (non-FPCC bytes) / FPIAR, read LIVE for `DecOp.FPCTRLRD`.
+    //
+    // Deliberately plain `allowOverride` INPUT WIRES driven by a sibling wiring plugin,
+    // NOT a `host[FpuControlService]` lookup. Reading the service directly from this
+    // plugin's `logic` is a real, reproducible Fiber build-order hazard:
+    // `FpuControlPlugin` publishes its registers through `var _fpcr/_fpsr/_fpiar` that
+    // are only assigned inside its own `during build` Area, so a consumer whose `logic`
+    // happens to elaborate first gets `null` and dies with a bare NullPointerException.
+    // That is exactly what happened here (caught by this task's own synth gate, not by
+    // any simulation DUT -- the plugin ORDER differs between FullCoreSynth and the
+    // lock-step DUT, so it reproduced only in Verilog generation), and it is the same
+    // hazard `ExceptionUnit`'s `require(fpuCtrl.fpcr != null, ...)` guard documents.
+    //
+    // The `allowOverride`-input + wiring-plugin seam is this codebase's established,
+    // ORDER-PROOF answer to it -- byte-for-byte the pattern `ExceptionUnit.committedA7In`
+    // / `.committedFpccIn` and `DecodeStage.pipeFlush` already use. The idle default also
+    // keeps every standalone DivEu DUT elaborating without wiring anything.
+    //
+    // Reading these live and unsynchronised is safe (design spec Decision 3): their only
+    // writer is ExceptionUnit's S_APPLY, always behind a serializing sysOp whose
+    // retirement unconditionally squashes and re-fetches everything younger, so a stale
+    // speculative read can never retire. Structurally identical to MmuControlService's
+    // already-live urp/srp/dtt0/dtt1 reads in DtlbPlugin/LsEuPlugin/ItlbPlugin.
+    fpCtrlFpcrIn  = UInt(32 bits); fpCtrlFpcrIn.allowOverride;  fpCtrlFpcrIn  := U(0, 32 bits)
+    fpCtrlFpsrIn  = UInt(32 bits); fpCtrlFpsrIn.allowOverride;  fpCtrlFpsrIn  := U(0, 32 bits)
+    fpCtrlFpiarIn = UInt(32 bits); fpCtrlFpiarIn.allowOverride; fpCtrlFpiarIn := U(0, 32 bits)
   }
 
   val logic = during build new Area {
@@ -236,6 +276,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     rdB.addr := u0.psrcB
     rdH.addr := u0.psrcC     // DIV.L 64/32 dividend HIGH word (Dr) via the 3rd source
     nzvcRd.addr := u0.pNzvcSrc                  // CMP2/CHK2 old NZVC (preserve N/V)
+    fpccRd.addr := u0.pFpccSrc                  // Task 9b: DecOp.FPCTRLRD's FPCC source
     val s0A = rdA.data
     val s0B = Mux(u0.useImm, u0.imm, rdB.data)
     val s0H = rdH.data
@@ -290,6 +331,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val s1B     = Reg(Bits(32 bits))
     val s1H     = Reg(Bits(32 bits))
     val s1Nzvc  = Reg(Bits(4 bits))    // old {N,Z,V,C} for the CMP2/CHK2 RMW
+    val s1Fpcc  = Reg(Bits(4 bits))    // Task 9b: the renamed FPCC nibble (DecOp.FPCTRLRD)
     val u1 = s1Ctx.uop
 
     // Main MUL, MULHI and FP have independent pipelines/queues below.  Every other
@@ -303,6 +345,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       s1B     := s0B
       s1H     := s0H
       s1Nzvc  := s0Nzvc
+      s1Fpcc  := fpccRd.data           // Task 9b
     }
 
     // Mispredict/exception squash: a 1-cycle doFlush pulse. Latch it so the eventual
@@ -528,6 +571,28 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // (and whether it overflowed) so the trailing DIVREM µop writes Dr. The DIVREM is
     // the next CPLX µop in age order (single-outstanding), so the latch is valid. On a
     // DIV overflow NEITHER dest is written -> the DIVREM must also skip its write.
+    // ── Task 9b: FMOVEM control-register LIST form, STORE direction ─────────────────
+    // `DecOp.FPCTRLRD`: read the `pos`-th SELECTED control register into an int temp.
+    // See the FSM arm below for the full rationale; this is just the datapath.
+    val isFpCtrlRd = u1.op === DecOp.FPCTRLRD
+    // Idle null object for a standalone DivEu DUT with no FpuControlPlugin (mirrors
+    // ExceptionUnit's own `fpuCtrlOpt` fallback).
+    val fpCtrlMask = u1.imm(2 downto 0)                 // {FPCR, FPSR, FPIAR}, MSB-first
+    val fpCtrlPos  = u1.imm(5 downto 4).asUInt          // this row's transfer position
+    // Architectural transfer order: FPCR first, FPSR second, FPIAR last (D9). A selected
+    // register's position == how many selected registers precede it.
+    val fpCtrlPosFpcr  = U(0, 2 bits)
+    val fpCtrlPosFpsr  = fpCtrlMask(2).asUInt.resize(2)
+    val fpCtrlPosFpiar = (fpCtrlMask(2).asUInt +^ fpCtrlMask(1).asUInt).resize(2)
+    // FPSR read-back: the non-FPCC bytes from FpuControlPlugin (it masks [27:24] off
+    // itself) OR the renamed FPCC nibble, reversed {NaN,I,Z,N} -> {N,Z,I,NaN} exactly as
+    // ExceptionUnit's `fpsrArch` does. `s1Fpcc` was read at S0 from `pFpccSrc`.
+    val fpCtrlFpccArch = s1Fpcc(0) ## s1Fpcc(1) ## s1Fpcc(2) ## s1Fpcc(3)
+    val fpCtrlFpsrArch = fpCtrlFpsrIn | (fpCtrlFpccArch.asUInt.resize(32) |<< 24)
+    val fpCtrlRdValue = Mux(fpCtrlMask(2) && (fpCtrlPos === fpCtrlPosFpcr),  fpCtrlFpcrIn,
+                        Mux(fpCtrlMask(1) && (fpCtrlPos === fpCtrlPosFpsr),  fpCtrlFpsrArch,
+                        Mux(fpCtrlMask(0) && (fpCtrlPos === fpCtrlPosFpiar), fpCtrlFpiarIn,
+                                                                             U(0, 32 bits)))).asBits
     val isDivRem = u1.divIsRem
     val remLatch = Reg(Bits(32 bits))
     val ovLatch  = RegInit(False)
@@ -878,6 +943,25 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
             // the CCR so the stacked frame's flags match Musashi); CMP2 always completes.
             when(c2Trap) { captureFault(U(6, 8 bits), c2Nzvc, True) }
               .otherwise { captureComplete(B(0, 32 bits), c2Nzvc, True, False) }
+            s1Valid := False
+          } elsewhen(isFpCtrlRd) {
+            // ── Task 9b: FMOVEM control-register LIST form, STORE direction ──────────
+            // Single-cycle read of the `pos`-th SELECTED control register into an int
+            // temp. Both operands ride the imm: `mask` = ext[12:10] {FPCR,FPSR,FPIAR}
+            // MSB-first, `pos` = this row's transfer POSITION in the list.
+            //
+            // Position -> register uses the architectural order (M68000PRM p. 5-91,
+            // Divergence Register D9): FPCR is always transferred first, FPSR second,
+            // FPIAR last, so a selected register's position is simply the number of
+            // selected registers ahead of it. That one runtime mux is what lets all seven
+            // masks share three popcount-keyed microcode programs.
+            //
+            // FPSR's condition-code nibble is NOT part of `fpuCtrl.fpsr` (that register
+            // masks [27:24] off itself) -- FPCC is renamed, so it comes from the FPCC PRF
+            // read this µop declared a real `readsFpcc` dependency on, reversed back to
+            // the architectural {N,Z,I,NaN} bit order exactly as ExceptionUnit's own
+            // `fpsrArch` does for the single-register read direction.
+            captureComplete(fpCtrlRdValue, B(0, 4 bits), False, True)
             s1Valid := False
           } elsewhen(isDivRem) {
             // Trailing remainder-move: write the latched remainder to Dr. Task #168

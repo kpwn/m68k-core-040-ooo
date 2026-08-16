@@ -104,6 +104,13 @@ class ExceptionUnit(
     sysKind:      UInt = U(0, 4 bits),
     sysReadDir:   Bool = False,
     sysVal:       Bits = B(0, 32 bits),
+    // Task 9b: the FMOVEM control-register LIST form's per-POSITION transfer values,
+    // captured by RobPlugin at each marked load's in-order retirement (see
+    // `RobPlugin.sysAux`). Read only by the `FMOVE_FPCTRL` S_APPLY arm, and only when
+    // `sysRc`'s BATCH bit (bit 3) is set; the single-register fast-crack form leaves that
+    // bit clear and keeps using `sysVal` exactly as before. Defaulted so the standalone
+    // unit-test DUTs (`SysOpApplySpec`) need no change.
+    sysAux:       Vec[Bits] = null,
     sysRc:        UInt = U(0, 12 bits),
     // The PHYSICAL dst reg for a READ (the rename-allocated pdst of the read µop). The
     // ROB commits the arch->pdst mapping at the serializing retire; the FSM writes the
@@ -1490,38 +1497,63 @@ class ExceptionUnit(
           mmuCtrl.setMmusr.valid   := True
           mmuCtrl.setMmusr.payload := (sysCapVal.asUInt & U(0xFFFFF000L, 32 bits)) | U(1, 32 bits)
         }
-        is(skOrd(m68k040.decode.SysKind.FMOVE_FPCTRL)) { // FMOVE <ea> <-> FPCR/FPSR/FPIAR
-          // sysCapRc[2:0] is the one-hot register-select mask {FPCR, FPSR, FPIAR}
-          // (ext[12:10], routed through the imm side-channel by MicroOpAssembler -- the
-          // same route MOVEC's 12-bit Rc id takes). Exactly one bit is set; the multi-bit
-          // (FMOVEM-control) case is not decoded at all and never reaches here.
+        is(skOrd(m68k040.decode.SysKind.FMOVE_FPCTRL)) { // FMOVE(M) <ea> <-> FPCR/FPSR/FPIAR
+          // sysCapRc[2:0] is the register-select mask {FPCR, FPSR, FPIAR} (ext[12:10],
+          // routed through the imm side-channel -- the same route MOVEC's 12-bit Rc id
+          // takes). sysCapRc[3] is the Task 9b BATCH marker:
+          //
+          //   batch = 0 : Task 9's single-register fast crack (`FMOVE.L Dn,FPcr` /
+          //               `FMOVE.L FPcr,Dn`). Exactly one mask bit set; the one value
+          //               rides `sysCapVal`, as it always has.
+          //   batch = 1 : Task 9b's microcoded FMOVEM control-register LIST form, write
+          //               direction only. ANY subset of the three registers may be set,
+          //               and each one's value comes from the `sysAux` slot named by its
+          //               POSITION in the list -- the values the program's own ordinary,
+          //               fully-translated, fault-capable `MLoad` rows already fetched.
+          //
+          // The write arm below was ALREADY three independent, non-exclusive `when`s
+          // rather than a one-hot `elsewhen` chain, so generalizing it to "any subset"
+          // needed no restructuring at all -- only the per-register value source became
+          // mask-dependent. The READ arm stays exactly as Task 9 left it: the store
+          // direction of the list form uses no sysOp whatsoever (design spec Decision 3),
+          // so a batch read can never reach here.
           //
           // NOT PRIVILEGED, unlike every other arm in this switch: real 68040
           // FMOVE-to/from-FPcr is a USER instruction. RobPlugin's sysTriggerSig/
           // sysPrivFault carry the matching exclusion, so this arm can be reached with
           // committed S == 0.
+          // Per-register value source. `batch` selects the `sysAux` slot named by the
+          // register's POSITION in the list: FPCR is always transferred first, FPSR
+          // second, FPIAR last (M68000PRM p. 5-91, Divergence Register D9), so a selected
+          // register's position is simply the count of selected registers ahead of it.
+          val fpCtrlBatch = sysCapRc(3)
+          val fpCtrlAux   = if (sysAux != null) sysAux else Vec.fill(3)(B(0, 32 bits))
+          val fpCtrlPosFpsr  = sysCapRc(2).asUInt.resize(2)
+          val fpCtrlPosFpiar = (sysCapRc(2).asUInt +^ sysCapRc(1).asUInt).resize(2)
+          def fpCtrlValue(pos: UInt): Bits = Mux(fpCtrlBatch, fpCtrlAux(pos), sysCapVal)
           when(sysCapReadDir) {                   // FPcr -> Rn : write the int PRF[pdst]
             sysRegWriteValid := True
             sysRegWritePhys  := sysCapDstPhys
             sysRegWriteData  := Mux(sysCapRc(2), fpuCtrl.fpcr,
                                 Mux(sysCapRc(1), fpsrArch, fpuCtrl.fpiar))
-          } otherwise {                           // Rn -> FPcr : write the committed reg
+          } otherwise {                           // {Rn, mem} -> FPcr : write the committed reg
             when(sysCapRc(2)) {
               setFpcrPort.valid   := True
-              setFpcrPort.payload := sysCapVal.asUInt
+              setFpcrPort.payload := fpCtrlValue(U(0, 2 bits)).asUInt
             }
             when(sysCapRc(1)) {
               // The non-FPCC bytes land in FpuControlPlugin (which masks [27:24] off
               // itself); the FPCC nibble is reversed back to the internal layout and
               // written DIRECTLY into the FPCC PRF's committed physical register.
+              val fpsrVal = fpCtrlValue(fpCtrlPosFpsr)
               setFpsrPort.valid   := True
-              setFpsrPort.payload := sysCapVal.asUInt
+              setFpsrPort.payload := fpsrVal.asUInt
               fpccWriteValid      := True
-              fpccWriteData       := fpccFromArch(sysCapVal(27 downto 24))
+              fpccWriteData       := fpccFromArch(fpsrVal(27 downto 24))
             }
             when(sysCapRc(0)) {
               setFpiarPort.valid   := True
-              setFpiarPort.payload := sysCapVal.asUInt
+              setFpiarPort.payload := fpCtrlValue(fpCtrlPosFpiar).asUInt
             }
           }
         }

@@ -116,7 +116,30 @@ object DecOp extends SpinalEnum {
       // case where the `op` field's MuxOH leaking into a second cone became the design's
       // WNS holder, so the enum stays narrow. Routed to Cluster.CPLX (spec Decision 9:
       // fold into the existing CPLX cluster, no new Cluster value, no new IQ/ROB port).
-      FPU
+      FPU,
+      // ── Task 9b: FMOVEM control-register LIST form, STORE direction ────────────
+      // Reads ONE of {FPCR, FPSR, FPIAR} into an integer temp, at EXECUTE time, in the
+      // CPLX EU (DivEuPlugin) -- the EU that already owns the FPCC physical register
+      // file, which FPSR's condition-code nibble must come from.
+      //
+      // WHICH register is read is NOT baked into the op: the µop's immediate carries
+      // {position[5:4], batch(3), mask[2:0]} and the EU picks the `position`-th SELECTED
+      // register out of the mask in the architectural FPCR->FPSR->FPIAR order (M68000PRM
+      // p. 5-91, Divergence Register D9). That one runtime mux is what lets all seven
+      // register-list masks share three popcount-keyed microcode programs instead of
+      // seven mask-keyed ones.
+      //
+      // Safety of the FPCR/FPSR/FPIAR read itself (design spec
+      // docs/superpowers/specs/2026-08-16-fp-control-multiword-transfer-design.md,
+      // Decision 3): those three are plain non-renamed Regs whose ONLY writer is
+      // ExceptionUnit's S_APPLY, always via a serializing sysOp whose retirement
+      // unconditionally squashes + re-fetches everything younger -- so a speculative
+      // read of a stale value can never retire. This is structurally the SAME property
+      // MmuControlService's urp/srp/dtt0/dtt1 live reads already rely on today
+      // (DtlbPlugin/LsEuPlugin/ItlbPlugin). FPCC is the exception and is NOT read that
+      // way: it is renamed, so this op declares a REAL `readsFpcc` dependency and is
+      // gated by the existing CPLX dynamic-wakeup scoreboard.
+      FPCTRLRD
       = newElement()
 }
 
@@ -257,7 +280,28 @@ object SysKind extends SpinalEnum {
       // Scope: single-register masks with a register-direct <ea> (mode 000 Dn / 001 An)
       // only. Multi-register masks (the FMOVEM control-list form), memory <ea>s, and the
       // `#imm` form all keep the existing vector-11 fall-through.
-      FMOVE_FPCTRL
+      FMOVE_FPCTRL,
+      // ── Task 9b: FMOVEM control-register LIST form, LOAD direction value capture ──
+      // NOT a sysOp. A µop carrying this kind has `sysOp = False`, so it never reaches
+      // `sysRetire`/`sysTriggerSig`/`sysPrivFault`/ExceptionUnit at all -- the kind is a
+      // pure RETIRE-TIME MARKER on the microcode program's ordinary `MLoad` rows.
+      //
+      // Why it exists: the load direction's terminal sysOp must apply up to THREE 32-bit
+      // values (one per selected control register) in one retirement, but the sysOp
+      // side-channel carries exactly one (`RobPlugin.sysValStore(h0)` -> `sysVal`). A
+      // marked load's own already-captured `sysValStore` entry is copied, AT ITS
+      // IN-ORDER RETIREMENT, into one of RobPlugin's three `sysAux` registers, indexed by
+      // the load's destination temp (T0/T1/T2 = arch 16/17/18 -> slot 0/1/2 = the
+      // transfer's POSITION in the list). Retirement is strictly in-order and the
+      // terminal sysOp is the youngest µop of the same program, so every slot it reads
+      // was written by its OWN program's loads and by nothing younger -- the capture
+      // cannot be clobbered by an overlapping second FMOVEM.
+      //
+      // Deliberately a `sysKind` (an existing, already-allocated RobPayload field)
+      // rather than a new payload bit: `sysKind` is only ever CONSUMED behind
+      // `p0.sysOp` (via `sysRetire`), so an entry carrying it with `sysOp = False` is
+      // invisible to every existing consumer.
+      FPCTRL_CAP
       = newElement()
 }
 

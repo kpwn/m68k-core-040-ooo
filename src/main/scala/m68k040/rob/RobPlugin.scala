@@ -314,6 +314,35 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // cycle the value lands); sysRetire gates on it so the write triggers only AFTER the
     // value is captured. RegInit(False), reset per-alloc (mirrors faultedStore).
     val sysValRdyStore  = Vec.fill(depth)(RegInit(False))
+    // ── Task 9b: FMOVEM control-register LIST form — commit-time value capture ──────
+    // Three 32-bit side registers holding the load direction's transfer values, one per
+    // POSITION in the register list. `ExceptionUnit`'s single-value `sysVal` side channel
+    // cannot carry a 2- or 3-register batch, and the sysOp that applies them must be the
+    // program's LAST µop (a sysOp at the ROB head squashes everything younger), so the
+    // values have to be delivered by the µops that ALREADY ran — the loads themselves.
+    //
+    // A microcode `MLoad` row tagged `Microcode.Desc(fpCtrlCap = true)` carries
+    // `SysKind.FPCTRL_CAP` with `sysOp = False` (so it is an entirely ordinary,
+    // non-serializing load in every other respect, and invisible to `sysRetire`/
+    // `sysTriggerSig`/`sysPrivFault`, all of which gate on `p.sysOp`). At its IN-ORDER
+    // RETIREMENT its own already-captured `sysValStore` entry is copied here, into the
+    // slot named by its destination temp (T0/T1/T2 = arch 16/17/18 -> slot 0/1/2).
+    //
+    // Why in-order retirement and not completion: completion is out-of-order, so a
+    // YOUNGER FMOVEM program's load could complete before an OLDER one's terminal sysOp
+    // reached the head and clobber a slot it was about to read. Retirement cannot — the
+    // terminal sysOp is the youngest µop of its own program, and every µop that retires
+    // before it is older. Nothing younger can have written these slots.
+    //
+    // A flush needs no handling: a squashed program's µops never retire, so they never
+    // write a slot, and a re-executed program re-writes every slot it reads before its own
+    // terminal sysOp can trigger.
+    // `init 0` is not needed for correctness (every slot the terminal sysOp reads was
+    // written by its own program's loads first — it only ever indexes positions below the
+    // mask's popcount, and exactly that many loads preceded it), but an uninitialised Reg
+    // randomises per simulation seed in this project's harnesses, which has historically
+    // produced seed-dependent lock-step flakiness. Determinism is free here.
+    val sysAux = Vec.fill(3)(RegInit(B(0, 32 bits))); sysAux.foreach(_.simPublic())
     // (faultPcStore — a 64x32 Reg-Vec holding Mux(faultUsesNextPc, nextPc, pc) captured
     //  at alloc — deleted by ROB-fold Slice A: it was a redundant mux of two values the
     //  `payload` Mem already stores; the 1-bit selector now rides in payload.faultUsesNextPc
@@ -647,8 +676,23 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // sysOp (D) head from slot-1 (both serializing), AND a trace-armed h0 (so h1 never
     // retires in the same cycle as the instruction that just armed a pending trace —
     // it must wait for the trace exception to be taken first).
+    // Task 9b: a value-capture-marked µop must not retire before its EU writeback has
+    // landed in `sysValStore` — otherwise `sysAux` would latch the PREVIOUS occupant of
+    // that ROB index. Textually the same guard `sysRetire` already applies to a
+    // write-direction sysOp's own source value, for the identical reason (the EU's
+    // `completion` port fires one cycle before its `ccrCompletion` value on some EUs).
+    // In practice never stalls — these rows are LS loads, whose `ccrObs` is a plain alias
+    // of the same registered completion — but the guard makes that a property of the ROB
+    // rather than of LsEuPlugin's internal timing.
+    // NB: deliberately a `def`, not a `val` — binding a SpinalEnum ELEMENT to a named
+    // hardware-scope val makes SpinalHDL's reflective auto-naming rename the element
+    // itself, which then leaks out through `.toEnum.toString` anywhere in the design.
+    def sysAuxCapKind = m68k040.decode.SysKind.FPCTRL_CAP
+    val sysAuxRdy0 = (p0.sysKind =/= sysAuxCapKind) || sysValRdyStore(h0)
+    val sysAuxRdy1 = (p1.sysKind =/= sysAuxCapKind) || sysValRdyStore(h1)
     val retire0 = headReady && !faultedStore(h0) && !p0.isRte && !p0.sysOp &&
-                  !interruptPending && !privViolation && !stopped && !tracePendingFire
+                  !interruptPending && !privViolation && !stopped && !tracePendingFire &&
+                  sysAuxRdy0
     // Root-cause fix (post-Task-P2.5 lock-step investigation): completion port 4
     // (the SQ precise-path at-head drain) fires ASYNCHRONOUSLY, many cycles after
     // its store's issue -- unlike every other completion source, which settles
@@ -699,7 +743,19 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     }
     val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone &&
                   !faultedStore(h1) && !p1.isRte && !p1.needsSup && !p1.sysOp &&
-                  !h0TraceArmed && !h0PreciseCompletedSticky
+                  !h0TraceArmed && !h0PreciseCompletedSticky && sysAuxRdy1
+
+    // Task 9b: the capture itself. Slot = destination temp - T0 (the transfer's position
+    // in the register list). Both retire slots are handled, and the two writes can never
+    // target the same slot:
+    //   - within one program the capture rows carry distinct temps (T0/T1/T2), and
+    //   - two DIFFERENT programs' capture rows can never be h0/h1 in the same cycle,
+    //     because the older program's terminal sysOp sits between them and a sysOp head
+    //     retires through `sysRetire` alone (both `retire0` and `retire1` exclude
+    //     `p.sysOp`), so it can never be paired away.
+    def sysAuxSlotOf(arch: UInt): UInt = (arch - U(m68k040.decode.MicroOpAssembler.T0, 5 bits)).resize(2)
+    when(retire0 && (p0.sysKind === sysAuxCapKind)) { sysAux(sysAuxSlotOf(p0.archRegId)) := sysValStore(h0) }
+    when(retire1 && (p1.sysKind === sysAuxCapKind)) { sysAux(sysAuxSlotOf(p1.archRegId)) := sysValStore(h1) }
 
     val traceVec     = Vec(CommitTrace(), 2)
     val traceFireVec = Vec(Bool(), 2)
@@ -1248,6 +1304,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
                                                                 // specific element's numeric value)
       sysReadDir = p0.sysReadDir,
       sysVal     = sysValStore(h0),
+      sysAux     = sysAux,          // Task 9b: the load direction's per-position values
       sysRc      = p0.sysRc,
       sysDstPhys = p0.intNew,        // the read µop's rename-allocated pdst (FSM writes it)
       sysPc      = p0.pc,

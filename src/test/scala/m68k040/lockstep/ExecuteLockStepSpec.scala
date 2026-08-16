@@ -379,6 +379,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // and same safety argument, as the nzvcWr direct write just above.
   fpccRd.addr    := host[RenameStage].committedPhysFpcc.resize(fpccRd.addr.getWidth)
   exc.committedFpccIn := fpccRd.data
+  // Task 9b: the CPLX EU's live FPCR/FPSR/FPIAR reads (DecOp.FPCTRLRD, the FMOVEM
+  // control-register LIST form's store direction). Driven from here rather than read
+  // directly out of the service inside DivEuPlugin, because FpuControlPlugin publishes
+  // those registers from inside its OWN `during build` Area -- a consumer plugin whose
+  // `logic` elaborates first would read null. Same order-proof seam as
+  // `exc.committedFpccIn` / `exc.committedA7In` just above.
+  val fpCtlSvc = host[m68k040.services.FpuControlService]
+  divEu.fpCtrlFpcrIn  := fpCtlSvc.fpcr
+  divEu.fpCtrlFpsrIn  := fpCtlSvc.fpsr
+  divEu.fpCtrlFpiarIn := fpCtlSvc.fpiar
   fpccWr.valid   := exc.fpccWriteValid
   fpccWr.address := host[RenameStage].committedPhysFpcc.resize(fpccWr.address.getWidth)
   fpccWr.data    := exc.fpccWriteData
@@ -3992,6 +4002,147 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // (3) round trip: masked bytes plus the reconstituted arch FPCC nibble
     assert(d7Seen == ArchFpsr,
       f"FMOVE.L FPSR,D6 read-back (via D7) must reconstitute the FPCC nibble: expected 0x$ArchFpsr%08X, got 0x$d7Seen%08X")
+  }
+
+  // ── Task 9b: FMOVEM control-register LIST form, end-to-end round trip ─────────────
+  //
+  // The single most load-bearing test in this task. It exercises BOTH directions of the
+  // real FPSP prologue/epilogue shape through the whole machine -- decode -> the microcode
+  // ROM walk -> rename -> IQ -> the CPLX EU's control-register reads (including the RENAMED
+  // FPCC read) -> the LS EU's real translated stores/loads -> the ROB -> the serializing
+  // S_APPLY batch write -> FpuControlPlugin and the FPCC PRF -- and pins the ONE thing no
+  // decode-level test can: the resulting MEMORY IMAGE's register ORDER.
+  //
+  // WHITEBOX, NOT LOCK-STEP, and the reason is a PRE-EXISTING oracle gap, not a choice
+  // made to dodge a failure: Musashi exposes no FP register surface at all via
+  // m68k_get_reg (spec Decision 3), which is exactly why Task 9's own two FMOVE tests
+  // just above are whitebox too. That gap applies to EVERY addressing mode here, so the
+  // re-brief's "lock-step for the non-predecrement modes" split is not available -- there
+  // is no oracle to step against for any of them. (Independently, Musashi's `fmove_fpcr`
+  // is confirmed WRONG for `-(An)` with popcount >= 2: it re-decrements per transfer,
+  // producing the reverse memory image and a reload that does not round-trip. Divergence
+  // Register D9/D9a. So even a hypothetical FP-visible oracle could not be stepped
+  // against for the predecrement case.)
+  //
+  // WHAT THE ORDER ASSERTION PROVES. Per M68000PRM p. 5-91 the registers always move
+  // FPCR -> FPSR -> FPIAR ascending, and `-(An)` decrements ONCE by 4*popcount up front.
+  // So after `fmovem.l %fpiar/%fpsr/%fpcr,-(%a0)` from A0 = 0x3010:
+  //     0x3004 = FPCR      0x3008 = FPSR      0x300C = FPIAR
+  // Musashi's per-transfer-decrement bug would lay these down in the exact REVERSE order
+  // (FPIAR lowest), so reading the three longwords back discriminates the two decisively.
+  // The FPSR longword additionally carries the FPCC nibble spliced in from the RENAMED
+  // FPCC PRF -- the only test in the suite that exercises `readsFpcc` end to end, since
+  // this task's `DecOp.FPCTRLRD` is the design's first and only FPCC reader.
+  //
+  // The reload half then proves a genuine round trip: the three registers are wiped to 0,
+  // reloaded through the postincrement form, and must come back byte-identical -- which
+  // simultaneously proves the terminal batch sysOp applied ALL THREE in one retirement
+  // (a partial apply would leave a wiped register at 0) and that A0 returned to 0x3010.
+  //
+  // Opwords are literal `m68k-linux-gnu-as -m68040 -m68881` output (this task's Step 1);
+  // `.short` because ProgramAssembler invokes `as` without -m68881, as above.
+  test("FMOVEM.L control-register list round-trips -(A0)/(A0)+ in FPCR/FPSR/FPIAR order", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val Fpcr     = 0x00000030L   // RND = RP
+    val ArchFpsr = 0x0800A5C3L   // FPCC nibble [27:24] = 0b1000; EXC 0xA5, AEXC 0xC3
+    val MaskFpsr = 0x0000A5C3L   // what FpuControlPlugin itself stores (FPCC masked off)
+    val Fpiar    = 0x0000ABCDL
+    val BufTop   = 0x00003010L
+    val src =
+      "move.l #0x00000030,%d0 ; " +
+      ".short 0xF200,0x9000 ; " +   // fmove.l %d0,%fpcr
+      "move.l #0x0800A5C3,%d0 ; " +
+      ".short 0xF200,0x8800 ; " +   // fmove.l %d0,%fpsr   (also writes the committed FPCC)
+      "move.l #0x0000ABCD,%d0 ; " +
+      ".short 0xF200,0x8400 ; " +   // fmove.l %d0,%fpiar
+      "move.l #0x00003010,%a0 ; " +
+      ".short 0xF220,0xBC00 ; " +   // fmovem.l %fpiar/%fpsr/%fpcr,-(%a0)   -> A0 = 0x3004
+      "move.l (%a0),%d1 ; " +       // lowest  address must hold FPCR
+      "move.l (4,%a0),%d2 ; " +     // middle  address must hold FPSR (FPCC spliced in)
+      "move.l (8,%a0),%d3 ; " +     // highest address must hold FPIAR
+      "move.l %d1,%d5 ; " +         // expose the three through ordinary ALU writebacks
+      "move.l %d2,%d6 ; " +
+      "move.l %d3,%d7 ; " +
+      "move.l #0,%d0 ; " +
+      ".short 0xF200,0x9000 ; " +   // wipe FPCR
+      ".short 0xF200,0x8800 ; " +   // wipe FPSR (and the committed FPCC)
+      ".short 0xF200,0x8400 ; " +   // wipe FPIAR
+      ".short 0xF218,0x9C00 ; " +   // fmovem.l (%a0)+,%fpiar/%fpsr/%fpcr   -> A0 = 0x3010
+      "move.l %a0,%d4 ; " +         // expose the restored A0
+      "done: bra.s done"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i
+      case Left(e)  => fail(s"assemble failed: ${e.reason}")
+    }
+    var fpcrSeen = BigInt(-1); var fpsrSeen = BigInt(-1); var fpiarSeen = BigInt(-1)
+    val d = scala.collection.mutable.Map[Int, Long]()
+    var sawExc = false; var excVec = -1
+    compiledDut.doSim(freshSimName("fmovem-fpctrl-list")) { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.usp #= 0x00200000L
+      dut.rob.logic.exc.ss.srSys #= 0x00           // USER mode: none of this is privileged
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15
+      dut.wire.logic.seedData #= BigInt(0x00200000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      def snoop(w: m68k040.execute.WbObs): Unit =
+        if (w.valid.toBoolean && w.intWrite.toBoolean) {
+          val a = w.dstArch.toInt
+          if (a >= 4 && a <= 7) d(a) = w.result.toLong & 0xffffffffL
+        }
+      var guard = 0
+      while (guard < 1600) {
+        if (dut.rob.logic.exceptionPending.toBoolean && !sawExc) {
+          sawExc = true; excVec = dut.rob.logic.exceptionVector.toInt
+        }
+        snoop(dut.eu0.logic.wbObs); snoop(dut.eu1.logic.wbObs)
+        cd.waitSampling(); guard += 1
+      }
+      fpcrSeen  = dut.fpuCtl.logic.fpcr.toBigInt
+      fpsrSeen  = dut.fpuCtl.logic.fpsr.toBigInt
+      fpiarSeen = dut.fpuCtl.logic.fpiar.toBigInt
+    }
+    assert(!sawExc,
+      s"FMOVEM to/from the FP control registers is a USER instruction and every <ea> here " +
+      s"is legal -- it must not trap; got vector $excVec")
+    // ── the memory image's register ORDER (D9) ──
+    assert(d.get(5).contains(Fpcr),
+      f"the LOWEST stored longword must be FPCR (0x$Fpcr%08X); got 0x${d.getOrElse(5, -1L)}%08X " +
+      "-- if this is FPIAR, the -(An) form is laying the registers down in Musashi's " +
+      "confirmed-wrong reverse order (D9/D9a)")
+    assert(d.get(6).contains(ArchFpsr),
+      f"the MIDDLE stored longword must be the FULL architectural FPSR (0x$ArchFpsr%08X) with " +
+      f"the RENAMED FPCC nibble spliced in; got 0x${d.getOrElse(6, -1L)}%08X " +
+      f"(0x$MaskFpsr%08X would mean the FPCC read never happened)")
+    assert(d.get(7).contains(Fpiar),
+      f"the HIGHEST stored longword must be FPIAR (0x$Fpiar%08X); got 0x${d.getOrElse(7, -1L)}%08X")
+    // ── the reload half: one terminal sysOp applied ALL THREE ──
+    assert(fpcrSeen == Fpcr,
+      f"FPCR did not survive the (A0)+ reload: expected 0x$Fpcr%08X, got 0x${fpcrSeen.toString(16)}")
+    assert(fpsrSeen == MaskFpsr,
+      f"FPSR did not survive the (A0)+ reload: expected 0x$MaskFpsr%08X (FpuControlPlugin masks " +
+      f"[27:24] off itself), got 0x${fpsrSeen.toString(16)}")
+    assert(fpiarSeen == Fpiar,
+      f"FPIAR did not survive the (A0)+ reload: expected 0x$Fpiar%08X, got 0x${fpiarSeen.toString(16)}")
+    // ── the address register came back exactly where it started ──
+    assert(d.get(4).contains(BufTop),
+      f"A0 must return to 0x$BufTop%08X (-(A0) decrements once by 12, (A0)+ increments once " +
+      f"by 12); got 0x${d.getOrElse(4, -1L)}%08X")
   }
 
   test("CPUSHA in USER mode raises a vector-8 privilege violation", VerilatorTest) {

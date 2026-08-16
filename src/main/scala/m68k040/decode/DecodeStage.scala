@@ -1240,6 +1240,53 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       ucFpDeltaMag.resize(32).asBits)
     // Packed FP-issue command word (SFpCmd): opmode[6:0] | dstFp[2:0]<<7 | srcSpec[2:0]<<10.
     ucEntryCtx.fpCmd := (B(0, 19 bits) ## ucFpSrcSpec ## ucFpDstFp.asBits ## ucFpOpmode).resize(32)
+    // ── Task 9b: FMOVEM control-register LIST form Ctx population ────────────────────
+    // The SAME ext-word field `ucFpSrcSpec` names for the arithmetic forms (ext[12:10]) is,
+    // for opclass 100/101, the register-select MASK {FPCR, FPSR, FPIAR} MSB-first
+    // (toolchain-confirmed; see this task's report §1). `fpCtrlRc` packs it with the BATCH
+    // marker at bit 3 -- what tells ExceptionUnit's S_APPLY arm to take its values from
+    // RobPlugin's `sysAux` slots rather than the single-register fast-crack `sysVal`.
+    // It reaches the ROB as `sysRc` via the terminal apply row's `imm[11:0]`.
+    val ucFpCtrlMask     = ucFpSrcSpec
+    val ucFpCtrlPopcount = (U(0, 2 bits) + ucFpCtrlMask(2).asUInt + ucFpCtrlMask(1).asUInt +
+                            ucFpCtrlMask(0).asUInt).resize(2)
+    ucEntryCtx.fpCtrlRc := (B(0, 28 bits) ## B"1" ## ucFpCtrlMask).resize(32)
+    // Signed An write-back delta: +4*popcount for `(An)+`, -4*popcount for `-(An)`.
+    // Only the two auto buckets' programs contain a write-back row at all, so the 0 for a
+    // non-auto EA is just a safe inert default. `-(An)`'s single up-front decrement by the
+    // TOTAL size is D9's predecrement rule in full; there is no per-transfer reversal.
+    val ucFpCtrlMag = (ucFpCtrlPopcount << 2).resize(5)     // 4 * popcount
+    val ucFpCtrlPostinc = ucFpEaMode === U(3, 3 bits)
+    ucEntryCtx.fpCtrlDelta := Mux(ucFpPredec,  (-(ucFpCtrlMag.resize(32).asSInt)).asBits,
+                              Mux(ucFpCtrlPostinc, ucFpCtrlMag.resize(32).asBits,
+                                                   B(0, 32 bits)))
+    // The control-list ACCEPT gate. opclass 100 = `<ea>` -> control register(s) (the LOAD
+    // direction), 101 = control register(s) -> `<ea>` (the STORE direction); every other
+    // opclass keeps Task 6b's existing routing untouched.
+    //
+    //  - ext[9:0] must be zero: the real encoding defines them as zero (every toolchain
+    //    literal in this task's report §1 has them clear), so a non-zero tail is a
+    //    reserved/unknown form and takes the ordinary vector-11 F-line trap rather than
+    //    being silently executed as if it were a control-list transfer.
+    //  - mask == 000 selects NO register. WinUAE treats it as "FPIAR selected", but
+    //    neither Motorola manual confirms that (Divergence Register D9b, logged OPEN), so
+    //    the conservative vector-11 trap stands rather than guessing.
+    //  - EA: memory-alterable, MEMSIMPLE only. Register-direct (modes 000/001) and `#imm`
+    //    never reach this engine at all (OperationDecoder's `fpMemIsMemEa` excludes them),
+    //    which is exactly right -- a multi-bit mask against a register-direct <ea> is
+    //    architecturally meaningless and Task 9's own fast-crack path owns the
+    //    single-register register-direct forms. PC-relative is rejected for BOTH
+    //    directions: it is not alterable (so the store direction is illegal outright), and
+    //    although the toolchain does assemble a PC-relative LOAD direction, this core
+    //    deliberately keeps the blocked attempt's conservative scope rather than shipping
+    //    a half-covered mode. Both reject to the SAME clean vector-11 trap this band
+    //    already produces today, so nothing regresses.
+    val ucFpCtrlIsLoad  = ucFpOpClass === B"3'b100"
+    val ucFpCtrlIsStore = ucFpOpClass === B"3'b101"
+    val ucFpCtrlOk = (ucFpCtrlIsLoad || ucFpCtrlIsStore) &&
+                     (ucFpExt(9 downto 0) === B(0, 10 bits)) &&
+                     (ucFpCtrlMask =/= B"3'b000") &&
+                     (ucBfEaDec.klass === EaClass.MEMSIMPLE) && !ucBfEaDec.pcRel
     // ── FULL-format MEMORY-INDIRECT host-op Ctx population (spec §5) ──────────────
     // A general EA-taking op (MOVE/ALU/imm/single-EA) whose EA is a full-format memory-
     // indirect mode routes through the engine: [LOAD.L pointer -> T0] then the host op at
@@ -1956,7 +2003,19 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       B"3'b110" -> ucFpEntryForFmt(Microcode.FP_MEM_B_ENTRY, Microcode.FP_MEM_B_AUTO_POST_ENTRY, Microcode.FP_MEM_B_AUTO_PRE_ENTRY),
       default   -> U(Microcode.FP_MEM_TRAP_ENTRY, ew bits)   // 011 Packed / 111 n/a -- ucFpMemBad already rejects 011
     )
-    val ucFpRealEntry = Mux(ucFpMemBad, U(Microcode.FP_MEM_TRAP_ENTRY, ew bits), ucFpRealEntryOk)
+    // Task 9b: the FMOVEM control-register LIST family's own 18-way dispatch
+    // (direction x EA bucket x popcount), generated straight from the SAME Scala table
+    // (`Microcode.fpCtrlEntry`) that the `scanLeft` over the row generators produced -- so
+    // this mux and the ROM's row layout cannot drift apart.
+    def ucFpCtrlEntryFor(load: Boolean): UInt = {
+      def e(bucket: Int, n: Int) = U(Microcode.fpCtrlEntry(load, bucket, n), ew bits)
+      def byPop(n: Int) = Mux(ucFpCtrlPostinc, e(1, n), Mux(ucFpPredec, e(2, n), e(0, n)))
+      Mux(ucFpCtrlPopcount === U(3, 2 bits), byPop(3),
+      Mux(ucFpCtrlPopcount === U(2, 2 bits), byPop(2), byPop(1)))
+    }
+    val ucFpCtrlEntryMux = Mux(ucFpCtrlIsLoad, ucFpCtrlEntryFor(true), ucFpCtrlEntryFor(false))
+    val ucFpRealEntry = Mux(ucFpCtrlOk, ucFpCtrlEntryMux,
+      Mux(ucFpMemBad, U(Microcode.FP_MEM_TRAP_ENTRY, ew bits), ucFpRealEntryOk))
     val ucRealEntry = Mux(ucIsFpMem, ucFpRealEntry,
       Mux(ucIsBfMemindRmw, ucBfMemindRmwEntry,
       Mux(ucIsBfMemindRd, ucBfMemindRdEntry,
