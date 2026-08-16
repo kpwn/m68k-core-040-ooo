@@ -310,4 +310,163 @@ class FpuLockStepSpec extends AnyFunSuite {
   roundingTest("RZ", 0x10, OneThirdDn, OneThirdDn)
   roundingTest("RM", 0x20, OneThirdDn, OneThirdUp)   // toward -inf
   roundingTest("RP", 0x30, OneThirdUp, OneThirdDn)   // toward +inf
+
+  // ══ FMOVE FPn,<ea> -- the STORE direction (Task 14b) ═════════════════════════════
+  //
+  // These are BIT-EXACT memory comparisons against Musashi's `fmove_reg_mem`
+  // (m68kfpu.c:1570-1632), which is a VALID oracle for the stored VALUE: it calls the
+  // very SoftFloat routines (`floatx80_to_int32`, `floatx80_to_float32`,
+  // `floatx80_to_float64`, `store_extended_float80`) that `FpNarrowPack` transcribes.
+  // `runLockStep`'s existing `checkMem`/`checkSpan` machinery does the comparison against
+  // the oracle's own memory image, byte for byte, so nothing new is needed here.
+  //
+  // Musashi is NOT an oracle for this instruction's EXCEPTIONS -- `fmove_reg_mem` calls
+  // neither `float_raise` nor `SET_CONDITION_CODES` (verified by direct search), so these
+  // programs deliberately never read FPSR and never enable an FPCR trap. The converter's
+  // own exception behaviour is proven at the unit level in `FpNarrowPackSpec`.
+  //
+  // NOT COVERED HERE, DELIBERATELY: `.W`/`.B` into a DATA REGISTER. That is a partial-
+  // register merge on real hardware, and Musashi's `WRITE_EA_16`/`WRITE_EA_8` assign
+  // `REG_D[reg] = data` from a `uint16`/`uint8`, zero-extending over the whole register --
+  // a confirmed-wrong oracle for that one case (Divergence Register D11). The memory forms
+  // of `.W`/`.B` below have no such problem and ARE lock-stepped.
+  private val Scr = 0x3000L
+
+  test("lock-step FP store: FMOVE.L FPn,(An) -- integer conversion into memory", VerilatorTest) {
+    val instrs = Seq("movea.l #0x3000,%a0", "fmove.l #12345,%fp0", "fmove.l %fp0,(%a0)")
+    h.runLockStep("fp-st-l", prog(instrs), nInstr = instrs.size,
+      checkMem = Seq(Scr), checkSpan = 4)
+  }
+
+  test("lock-step FP store: FMOVE.S FPn,(An) -- exact single round trip (+3.0f)", VerilatorTest) {
+    val instrs = Seq("movea.l #0x3000,%a0", "fmove.l #3,%fp0", "fmove.s %fp0,(%a0)",
+                     "move.l (%a0),%d1")
+    h.runLockStep("fp-st-s", prog(instrs), nInstr = instrs.size,
+      checkMem = Seq(Scr), checkSpan = 4)
+  }
+
+  test("lock-step FP store: FMOVE.S with a value that must ROUND (1/3 -> single)", VerilatorTest) {
+    // 1/3 has an infinite binary expansion, so the extended->single narrowing genuinely
+    // exercises roundAndPackFloat32's increment/tie path rather than a bit-copy.
+    val instrs = Seq("movea.l #0x3000,%a0",
+                     "fmove.l #1,%fp0", "fmove.l #3,%fp1", "fdiv.x %fp1,%fp0",
+                     "fmove.s %fp0,(%a0)", "move.l (%a0),%d1")
+    h.runLockStep("fp-st-s-round", prog(instrs), nInstr = instrs.size,
+      checkMem = Seq(Scr), checkSpan = 4)
+  }
+
+  test("lock-step FP store: FMOVE.D FPn,(An) -- BOTH chunks, correct word order", VerilatorTest) {
+    // WRITE_EA_64 writes the HIGH 32 bits at ea+0 and the low at ea+4; a swapped pair
+    // would show up immediately in the 8-byte comparison.
+    val instrs = Seq("movea.l #0x3000,%a0",
+                     "fmove.l #1,%fp0", "fmove.l #3,%fp1", "fdiv.x %fp1,%fp0",
+                     "fmove.d %fp0,(%a0)", "move.l (%a0),%d1", "move.l 4(%a0),%d2")
+    h.runLockStep("fp-st-d", prog(instrs), nInstr = instrs.size,
+      checkMem = Seq(Scr, Scr + 4), checkSpan = 4)
+  }
+
+  test("lock-step FP store: FMOVE.X FPn,(An) -- all THREE chunks + the zero reserved word", VerilatorTest) {
+    // `store_extended_float80` writes {sign+exp} at +0, a literal ZERO at +2, mantissa
+    // hi32 at +4, mantissa lo32 at +8. The 12-byte comparison covers every one of those,
+    // including the reserved word the LOAD direction deliberately skips.
+    val instrs = Seq("movea.l #0x3000,%a0",
+                     immX(0, QNan._1, QNan._2),
+                     "fmove.x %fp0,(%a0)",
+                     "move.l (%a0),%d1", "move.l 4(%a0),%d2", "move.l 8(%a0),%d3")
+    h.runLockStep("fp-st-x", prog(instrs), nInstr = instrs.size,
+      checkMem = Seq(Scr, Scr + 4, Scr + 8), checkSpan = 4)
+  }
+
+  test("lock-step FP store: FMOVE.W / FMOVE.B into memory (truncating access sizes)", VerilatorTest) {
+    // The two `clr.l`s are load-bearing, not decoration: `checkMem` compares a 4-byte span
+    // and the DUT's backing memory model does NOT zero-fill a page the program never wrote,
+    // so the bytes BESIDE a partial (.W/.B) store would be compared as garbage-vs-oracle-0.
+    // Clearing both longs first makes the whole span defined in the DUT and the oracle
+    // alike, which is exactly what makes "only the low word/byte changed" a real assertion.
+    val instrs = Seq("movea.l #0x3000,%a0",
+                     "clr.l (%a0)", "clr.l 4(%a0)",
+                     "fmove.l #-1234,%fp0",
+                     "fmove.w %fp0,(%a0)", "fmove.b %fp0,4(%a0)",
+                     "move.w (%a0),%d1", "move.b 4(%a0),%d2")
+    h.runLockStep("fp-st-wb", prog(instrs), nInstr = instrs.size,
+      checkMem = Seq(Scr, Scr + 4), checkSpan = 4)
+  }
+
+  test("lock-step FP store: auto-increment (An)+ .S and auto-decrement -(An) .X", VerilatorTest) {
+    // The An write-backs are compared by the ORDINARY per-step integer lock-step (+4 for
+    // Single, -12 for Extended), and the stored bytes by checkMem.
+    val instrs = Seq("movea.l #0x3000,%a0", "movea.l #0x3020,%a1",
+                     "fmove.l #7,%fp0",
+                     "fmove.s %fp0,(%a0)+",
+                     "fmove.x %fp0,-(%a1)")
+    h.runLockStep("fp-st-auto", prog(instrs), nInstr = instrs.size,
+      checkMem = Seq(Scr, 0x3014L, 0x3018L, 0x301CL), checkSpan = 4)
+  }
+
+  test("lock-step FP store: displacement, brief-indexed and absolute-LONG destinations", VerilatorTest) {
+    // ABSOLUTE-SHORT is deliberately absent: Musashi cannot referee it at all. Its FP write
+    // helpers have no mode-7/reg-0 arm and `fatalerror` out of the whole emulator
+    // ("M68kFPU: WRITE_EA_32: unhandled mode 7, reg 0"), so an abs.W destination kills the
+    // ORACLE, not the DUT. This core supports it (D6) and `FpMemStoreSpec` covers it at
+    // decode level; the ported corpus test `fpu_fmove_fp_to_ea_matrix.s` covers it
+    // end-to-end without an oracle.
+    val instrs = Seq("movea.l #0x3000,%a0", "moveq #8,%d6",
+                     "fmove.l #99,%fp0",
+                     "fmove.l %fp0,16(%a0)",
+                     "fmove.d %fp0,(32,%a0,%d6.w)",
+                     "fmove.s %fp0,0x3050:l")
+    h.runLockStep("fp-st-ea", prog(instrs), nInstr = instrs.size,
+      checkMem = Seq(0x3010L, 0x3028L, 0x302CL, 0x3050L), checkSpan = 4)
+  }
+
+  test("lock-step FP store: register-direct FMOVE.L/.S FPn,Dn and FMOVE.L FPn,An", VerilatorTest) {
+    // Full-width destinations only -- see the D11 note above for why `.W`/`.B` into Dn is
+    // excluded. The integer/An results are compared by the ordinary per-step lock-step.
+    //
+    // The An form is hand-encoded because GNU as REFUSES `fmove.l %fp0,%a3` ("operands
+    // mismatch"), even though Musashi's `WRITE_EA_32` implements mode 1 and this core
+    // accepts it (D5, matching the existing FPCR-control-register precedent). opword
+    // 0xF200|(1<<3)|3 = 0xF20B; ext = opclass 011 << 13 | Long fmt 000 << 10 | FP0 << 7.
+    val instrs = Seq("fmove.l #-5,%fp0",
+                     "fmove.l %fp0,%d1",
+                     "fmove.s %fp0,%d2",
+                     ".short 0xF20B ; .short 0x6000")
+    h.runLockStep("fp-st-reg", prog(instrs), nInstr = instrs.size)
+  }
+
+  test("lock-step FP store: the ported corpus's OWN fpu_fsqrt_basic encoding, refereed by Musashi", VerilatorTest) {
+    // `fpu_fsqrt_basic.s` (and five sibling corpus tests) build their FPn seed with the
+    // formula `ext = 0x4000 | (Dn<<10) | (FPn<<7)`, which puts the DATA REGISTER NUMBER in
+    // ext[12:10] -- the source FORMAT field -- instead of the constant 001 that `.S` needs.
+    // With Dn=0 that is format 000 = LONG, so `.short 0xF200,0x4000` is `FMOVE.L D0,FP0`
+    // and FP0 receives the INTEGER 0x40800000 (1082130432.0), not 4.0f. The verify side
+    // then stores with format 001 (Single), so the test can never match its own expected
+    // 0x40000000 on ANY correct 68k. This test replays that EXACT instruction sequence and
+    // refereeing it against Musashi: agreement proves the divergence is the corpus test's
+    // encoding, not this core's store direction.
+    val instrs = Seq("movea.l #0x3000,%a0",
+                     "move.l #0x40800000,%d0",
+                     ".short 0xF200 ; .short 0x4000",   // FMOVE.L D0,FP0  (the corpus's own bytes)
+                     ".short 0xF200 ; .short 0x0084",   // FSQRT.X FP0,FP1
+                     ".short 0xF210 ; .short 0x6480",   // FMOVE.S FP1,(A0)
+                     "move.l (%a0),%d1")
+    h.runLockStep("fp-st-corpus-fsqrt", prog(instrs), nInstr = instrs.size,
+      checkMem = Seq(Scr), checkSpan = 4)
+  }
+
+  test("lock-step FP store: back-to-back stores of DIFFERENT FPn must not cross-feed", VerilatorTest) {
+    // The exact hazard `fpu_x2s_stash_back_to_back.s` was written for in the sibling core:
+    // two FMOVE.S FPn,(An) close together sharing one conversion latch. This core has no
+    // such latch (the conversion is a per-uop combinational cone off `fpRdA`), and the
+    // 4-way distinct values here would expose any sharing immediately.
+    val instrs = Seq("movea.l #0x3000,%a0",
+                     "fmove.l #11,%fp0", "fmove.l #22,%fp1",
+                     "fmove.l #33,%fp2", "fmove.l #44,%fp3",
+                     "fmove.s %fp0,(%a0)", "fmove.s %fp1,4(%a0)",
+                     "fmove.s %fp2,8(%a0)", "fmove.s %fp3,12(%a0)",
+                     "move.l (%a0),%d1", "move.l 4(%a0),%d2",
+                     "move.l 8(%a0),%d3", "move.l 12(%a0),%d4")
+    h.runLockStep("fp-st-b2b", prog(instrs), nInstr = instrs.size,
+      checkMem = Seq(Scr, Scr + 4, Scr + 8, Scr + 12), checkSpan = 4)
+  }
 }

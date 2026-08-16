@@ -249,15 +249,19 @@ class FpMemLoadSpec extends AnyFunSuite {
       s"Packed source must always trap (Decision 2), RTE-able: ${us(0)}")
   }
 
-  // ── FMOVE FPn,(mem) (opclass 011, store direction) shares this opword band but is NOT
-  //    this task's job -- must still trap, not silently mishandled as a load. ──────────
-  test("FMOVE.L FP0,(A0) (opclass 011, store): shares the opword band, still traps -- unowned gap", VerilatorTest) {
+  // ── FMOVE FPn,(mem) (opclass 011, store direction) shares this opword band. Task 14b
+  //    LANDED it, so it is no longer a trap -- what this test now guards is that the two
+  //    directions stay DISTINCT (the store program must not be mishandled as a load, and
+  //    vice versa). Full store-direction coverage lives in `FpMemStoreSpec`. ────────────
+  test("FMOVE.L FP0,(A0) (opclass 011, store): now a real store program, NOT a load crack", VerilatorTest) {
     val op  = fpOp(2, 0)
-    val ext = fpExt(3, 0, 0, 0x00)                   // opclass 011 (store), NOT this task's job
-    val us = collect(Seq(op, ext) ++ filler, 0x40800000L, 1)
-    assert(us.length == 1, s"expected 1 uop (the trap row): $us")
-    assert(us(0).faulted && us(0).faultVector == 11 && us(0).faultUsesNextPc,
-      s"opclass 011 (store direction) must still trap -- explicitly unowned by this task: ${us(0)}")
+    val ext = fpExt(3, 0, 0, 0x00)                   // opclass 011 (store) -- Task 14b
+    val us = collect(Seq(op, ext) ++ filler, 0x40800000L, 2)
+    assert(us.length == 2, s"expected 2 uops (Task 14b's [CVT, STORE] crack): $us")
+    assert(us(0).op.startsWith("FPSTORECVT") && !us(0).faulted && us(0).usesFpSrcA,
+      s"opclass 011 must reach the store direction's conversion uop: ${us(0)}")
+    assert(us(1).memOp.startsWith("STORE") && !us(1).faulted,
+      s"opclass 011 must emit a STORE, never a LOAD: ${us(1)}")
   }
 
   // ── FMOVEM <ea>,list (opclass 110) shares this opword band but is NOT this task's job ──

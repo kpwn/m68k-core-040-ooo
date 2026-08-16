@@ -163,6 +163,17 @@ object Microcode {
   // per-transfer reversal anywhere in this family.
   case object SFpCtrlDelta extends Sel   // selImm: ctx.fpCtrlDelta
 
+  // ── Task 14b: FMOVE FPn,<ea> (opclass 011) STORE direction ──────────────────────
+  // The 32-bit CHUNK INDEX a `UFpStoreCvt` row converts and hands to its `MStore`
+  // partner: 0 for every 1-word format, 0/1 for Double, 0/1/2 for Extended. A plain
+  // ROM-row-static constant in `imm[1:0]`, baked in at exactly the point Task 6b's own
+  // `fpMemChunkDispSel`/`fpMemChunkAutoImm` bake in that same row's per-chunk EA delta,
+  // and read back by the EU as `u.imm(1 downto 0)`. Same "the POSITION rides the imm"
+  // technique `SFpCtrlSel1`/`SFpCtrlSel2` above already use for the control-list reads.
+  case object SFpStIdx0 extends Sel   // selImm: 0
+  case object SFpStIdx1 extends Sel   // selImm: 1
+  case object SFpStIdx2 extends Sel   // selImm: 2
+
   /** The op kind of a descriptor's template. */
   sealed trait UOp
   case object UMove      extends UOp    // plain move / load / store data move (DecOp.MOVE)
@@ -221,6 +232,15 @@ object Microcode {
   // family that reads FPCC, and it does so as an ORDINARY renamed consumer through the
   // existing `readsFpcc`/`pFpccSrc`/`cplxFpccWakeupPort` dynamic-wakeup path.
   case object UFpCtrlRead extends UOp
+  // ── Task 14b: FMOVE FPn,<ea> (cpGEN opclass 011), the STORE direction ────────────
+  // DecOp.FPSTORECVT / Cluster.CPLX. Converts the source FPn (ext[9:7], carried in
+  // ctx.fpCmd) to the DESTINATION format (ext[12:10], same ctx word -- the role-flip of
+  // the load direction's source-format field) and writes ONE 32-bit chunk of the result
+  // into an integer temp, which the following `MStore` row then writes to memory.
+  // `useImm`/`imm` carry the static chunk index (SFpStIdx0/1/2). Declares a real
+  // `usesFpSrcA` so the FP rename + CPLX dynamic-wakeup scoreboard order it behind
+  // whatever produced FPn; declares NO FP/FPCC destination at all.
+  case object UFpStoreCvt extends UOp
 
   /** Memory role. */
   sealed trait Mem
@@ -355,7 +375,7 @@ object Microcode {
         SCas2Du1, SCas2Du2, SCas2Rn1, SCas2Rn2, SCasDc, SCasDu,
         SDeltaAx, SDeltaAy, SDn2, SEaBase, SEaDispHi, SEaDispLo,
         SFpAutoDelta, SFpCmd, SFpCtrlDelta, SFpCtrlRc, SFpCtrlSel1, SFpCtrlSel2,
-        SFpDispHi, SFpDispMid,
+        SFpDispHi, SFpDispMid, SFpStIdx0, SFpStIdx1, SFpStIdx2,
         SImm12, SImm16, SImm4, SImm8, SMiImm, SMiOd,
         SMiOther, SMiOtherEaBase, SMiOtherEaDispLo, SMiOtherOd, SMove16Ay, SMovesAn,
         SMovesDelta, SMovesRn, SNegDeltaAx, SNegDeltaAy, SNone, SPackAdj,
@@ -378,7 +398,7 @@ object Microcode {
         UMove, UAddDrop, UOpFromCtx, UBfMem, UBfResolve, UBfShiftOff,
         UBfAdd, UBfReg, UMiPtrLoad, UMiHostMove, UMiHostOp, UMiLeaFinal,
         UMiPushFinal, UMiBranchFinal, UShiftR8, UMovesRead, UFpIssue, UFpCtrlRead,
-        UCasOp = newElement()
+        UFpStoreCvt, UCasOp = newElement()
   }
 
   /** Hardware encoding of `Mem` (memory role) — one element per case object (3). */
@@ -490,6 +510,7 @@ object Microcode {
         case UMovesRead     => (UOpHw.UMovesRead, 0, false, false, false)
         case UFpIssue       => (UOpHw.UFpIssue, 0, false, false, false)
         case UFpCtrlRead    => (UOpHw.UFpCtrlRead, 0, false, false, false)
+        case UFpStoreCvt    => (UOpHw.UFpStoreCvt, 0, false, false, false)
         case co: UCasOp     => (UOpHw.UCasOp, co.form, co.writesNzvc, co.readsNzvc, co.dropCommit)
       }
     b.uop           := uopHw
@@ -552,6 +573,9 @@ object Microcode {
       case SFpCtrlRc => SelHw.SFpCtrlRc
       case SFpCtrlSel1 => SelHw.SFpCtrlSel1
       case SFpCtrlSel2 => SelHw.SFpCtrlSel2
+      case SFpStIdx0 => SelHw.SFpStIdx0
+      case SFpStIdx1 => SelHw.SFpStIdx1
+      case SFpStIdx2 => SelHw.SFpStIdx2
       case SFpCtrlDelta => SelHw.SFpCtrlDelta
       case SFpDispHi => SelHw.SFpDispHi
       case SFpDispMid => SelHw.SFpDispMid
@@ -1838,6 +1862,85 @@ object Microcode {
     decRow +: (loads :+ fpMemIssueRow(fmt, isLast = true))
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // Task 14b — FMOVE `FPn,<ea>` (cpGEN opclass 011), the STORE direction.
+  //
+  // Structurally the MIRROR of Task 6b's load-direction groups above (decision D3): the
+  // SAME 18 (format x EA-bucket) shape, the SAME `fpMemFormats` table (chunk counts and
+  // access sizes are identical in both directions -- a Double is 2 longs either way), the
+  // SAME per-chunk displacement/auto-immediate selectors, and the SAME `ctx.fpAutoDelta`
+  // (computed at ucBegin from `ucFpSrcSpec`, which for opclass 011 is the DESTINATION
+  // format field at the same bit positions, so the 1/2/4/4/8/12-byte table needs no
+  // change at all). Only two things flip:
+  //   - `MLoad` -> `MStore`, with the temp as the store's DATA source (srcB) instead of
+  //     its destination;
+  //   - the FP uop moves from the END of the program to the FRONT, and there are `chunks`
+  //     of them instead of one: `[UFpStoreCvt x chunks] + [MStore x chunks]`, because
+  //     every store row needs its own already-converted 32-bit word. Per D2 the converter
+  //     is re-run per chunk (a pure function of FPn, so re-running is exact and needs no
+  //     multi-destination uop, of which this design has none).
+  // Row order within the auto buckets follows Task 9b's store-direction precedent exactly:
+  // `(An)+` puts the An write-back LAST, `-(An)` puts it FIRST (so the store rows' `SAy`
+  // reads already see the decremented value through the ordinary in-order-decode RAW).
+  private def fpStoreChunkImm(i: Int): Sel = i match {
+    case 0 => SFpStIdx0; case 1 => SFpStIdx1; case _ => SFpStIdx2
+  }
+  private def fpStoreCvtRows(fmt: FpMemFmt, firstIsFirst: Boolean): Vector[Desc] =
+    (0 until fmt.chunks).map { i =>
+      // sz = SzLong deliberately on EVERY memory-direction conversion row: `u.size` is the
+      // EU's partial-register MERGE selector (register-direct `.W`/`.B` only) and the real
+      // memory access size lives on the `MStore` row below.
+      Desc(UFpStoreCvt, dst = fpMemChunkTemp(i), useImm = true, imm = fpStoreChunkImm(i),
+           sz = SzLong, isFirst = firstIsFirst && (i == 0))
+    }.toVector
+
+  // LOCK-STEP MACRO COMMIT (`keepCommit`). Every row of a store program would otherwise be
+  // DROPPED from the whitebox commit stream, so the whole instruction would vanish from the
+  // lock-step trace and silently shift every following step: the conversion rows write only
+  // temps (`isTempOnly`), and a plain `MStore` with no int destination and no NZVC write is
+  // the whitebox's `rmwStore` drop (`LsEuPlugin.scala`'s `e.rmwStore`). Exactly ONE row per
+  // program therefore carries `keepCommit`, and it is always the program's LAST row, so the
+  // kept record is the one whose writeback is the macro's real architectural effect (the An
+  // update for `(An)+`, nothing for the others -- matching Musashi's `fmove_reg_mem`, which
+  // is one oracle step). This is precisely the situation `DecodedUop.keepCommit` was
+  // introduced for (PEA's push, the mem-dest MOVE-from-CCR/SR op row).
+
+  // BASE (side-effect-free EA bucket): [CVT x chunks] + [STORE x chunks].
+  private def fpStoreBaseGroup(fmt: FpMemFmt): Vector[Desc] =
+    fpStoreCvtRows(fmt, firstIsFirst = true) ++ (0 until fmt.chunks).map { i =>
+      val last = i == fmt.chunks - 1
+      Desc(UMove, mem = MStore, srcA = SEaBase, srcB = fpMemChunkTemp(i),
+           useImm = true, imm = fpMemChunkDispSel(i), sz = fmt.loadSz,
+           indexFromEa = true, keepCommit = last, isLast = last)
+    }.toVector
+
+  // AUTO_POST `(Ay)+`: [CVT x chunks] + [STORE x chunks @ Ay+0/4/8] + [Ay += delta].
+  private def fpStoreAutoPostGroup(fmt: FpMemFmt): Vector[Desc] =
+    fpStoreCvtRows(fmt, firstIsFirst = true) ++ (0 until fmt.chunks).map { i =>
+      fpMemChunkAutoImm(i) match {
+        case Some(sel) => Desc(UMove, mem = MStore, srcA = SAy, srcB = fpMemChunkTemp(i),
+                               useImm = true, imm = sel, sz = fmt.loadSz)
+        case None      => Desc(UMove, mem = MStore, srcA = SAy, srcB = fpMemChunkTemp(i),
+                               sz = fmt.loadSz)
+      }
+    }.toVector :+
+      Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SFpAutoDelta,
+           keepCommit = true, isLast = true)
+
+  // AUTO_PRE `-(Ay)`: [Ay -= delta] + [CVT x chunks] + [STORE x chunks @ Ay+0/4/8].
+  private def fpStoreAutoPreGroup(fmt: FpMemFmt): Vector[Desc] =
+    (Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SFpAutoDelta, isFirst = true) +:
+     fpStoreCvtRows(fmt, firstIsFirst = false)) ++ (0 until fmt.chunks).map { i =>
+      val last = i == fmt.chunks - 1
+      fpMemChunkAutoImm(i) match {
+        case Some(sel) => Desc(UMove, mem = MStore, srcA = SAy, srcB = fpMemChunkTemp(i),
+                               useImm = true, imm = sel, sz = fmt.loadSz,
+                               keepCommit = last, isLast = last)
+        case None      => Desc(UMove, mem = MStore, srcA = SAy, srcB = fpMemChunkTemp(i),
+                               sz = fmt.loadSz, keepCommit = last, isLast = last)
+      }
+    }.toVector
+
   private def romP9(): Vector[Desc] =
     fpMemFormats.flatMap(fpMemBaseGroup) ++
     fpMemFormats.flatMap(fpMemAutoPostGroup) ++
@@ -1983,7 +2086,15 @@ object Microcode {
     fpCtrlCounts.flatMap(fpCtrlLoadPreGroup)   ++ fpCtrlCounts.flatMap(fpCtrlStoreBaseGroup) ++
     fpCtrlCounts.flatMap(fpCtrlStorePostGroup) ++ fpCtrlCounts.flatMap(fpCtrlStorePreGroup)
 
-  val rom: Vector[Desc] = romP1() ++ romP2() ++ romP3() ++ romP4() ++ romP5() ++ romP6() ++ romP7() ++ romP8() ++ romP9() ++ romP10()
+  /** Task 14b's 18 store-direction groups. Appended as a NEW ROM partition (rather than
+    * folded into romP9) so every already-landed entry offset in romP1..romP10 is unchanged
+    * by this task. */
+  private def romP11(): Vector[Desc] =
+    fpMemFormats.flatMap(fpStoreBaseGroup) ++
+    fpMemFormats.flatMap(fpStoreAutoPostGroup) ++
+    fpMemFormats.flatMap(fpStoreAutoPreGroup)
+
+  val rom: Vector[Desc] = romP1() ++ romP2() ++ romP3() ++ romP4() ++ romP5() ++ romP6() ++ romP7() ++ romP8() ++ romP9() ++ romP10() ++ romP11()
 
   // Task 6b entry constants: SELF-COMPUTED from each group's own real row count (via
   // `scanLeft`), not hand-counted literals -- eliminates arithmetic-drift risk across 18
@@ -2045,6 +2156,38 @@ object Microcode {
     val offs = (if (load) Vector(fpCtrlLdBaseOffsets, fpCtrlLdPostOffsets, fpCtrlLdPreOffsets)
                 else      Vector(fpCtrlStBaseOffsets, fpCtrlStPostOffsets, fpCtrlStPreOffsets))(bucket)
     offs(popcount - 1)
+  }
+
+  // Task 14b entry constants -- SELF-COMPUTED from each group's own real row count via
+  // `scanLeft`, exactly like Task 6b's and Task 9b's above. 18 groups (6 formats x 3 EA
+  // buckets); row counts are 2*chunks (BASE) and 2*chunks+1 (both AUTO buckets), i.e.
+  // 2/2/2/2/4/6 + 3/3/3/3/5/7 + 3/3/3/3/5/7 = 66 new rows.
+  private val fpStoreRomStart: Int = fpCtrlStPreOffsets.last
+  private val fpStoreBaseOffsets: Vector[Int] =
+    fpMemFormats.scanLeft(fpStoreRomStart)     { (acc, fmt) => acc + fpStoreBaseGroup(fmt).size }
+  private val fpStorePostOffsets: Vector[Int] =
+    fpMemFormats.scanLeft(fpStoreBaseOffsets.last) { (acc, fmt) => acc + fpStoreAutoPostGroup(fmt).size }
+  private val fpStorePreOffsets: Vector[Int] =
+    fpMemFormats.scanLeft(fpStorePostOffsets.last) { (acc, fmt) => acc + fpStoreAutoPreGroup(fmt).size }
+
+  /** Entry point for an `FMOVE FPn,<ea>` program. `bucket` 0 = non-auto EA, 1 = `(An)+`,
+    * 2 = `-(An)`; `fmtIdx` indexes `fpMemFormats` (0=B, 1=W, 2=L, 3=S, 4=D, 5=X), i.e. the
+    * SAME table Task 6b's load groups are generated from. `DecodeStage`'s dispatch mux is
+    * generated straight from this function, so it cannot drift from the ROM layout the
+    * same `scanLeft` produced. */
+  def fpStoreEntry(bucket: Int, fmtIdx: Int): Int =
+    Vector(fpStoreBaseOffsets, fpStorePostOffsets, fpStorePreOffsets)(bucket)(fmtIdx)
+
+  /** `fpMemFormats` index for an ext[12:10] format code, or -1 for the two Packed codes
+    * (011 static-k / 111 dynamic-k), which are out of hardware scope entirely. */
+  def fpStoreFmtIdx(code: Int): Int = code match {
+    case 0 => 2   // Long
+    case 1 => 3   // Single
+    case 2 => 5   // Extended
+    case 4 => 1   // Word
+    case 5 => 4   // Double
+    case 6 => 0   // Byte
+    case _ => -1  // 011 / 111 Packed
   }
 
   val BF_DYN_RD_PCREL_DO1_ENTRY  = 178   // rows 178..183
@@ -2359,6 +2502,9 @@ object Microcode {
     case SFpCtrlRc    => ctx.fpCtrlRc
     case SFpCtrlSel1  => (ctx.fpCtrlRc.asUInt | U(1 << 4, 32 bits)).asBits
     case SFpCtrlSel2  => (ctx.fpCtrlRc.asUInt | U(2 << 4, 32 bits)).asBits
+    case SFpStIdx0    => B(0, 32 bits)
+    case SFpStIdx1    => B(1, 32 bits)
+    case SFpStIdx2    => B(2, 32 bits)
     case SFpCtrlDelta => ctx.fpCtrlDelta                                // signed +/-4*popcount An delta
     case _           => B(0, 32 bits)
   }
@@ -2411,6 +2557,7 @@ object Microcode {
       case UMovesRead  => u.op := DecOp.MOVE   // MOVE T0 -> Rn (sign-ext An / merge Dn in EU)
       case UFpIssue    => u.op := DecOp.FPU    // task 6b: the terminal FP-generic issue row
       case UFpCtrlRead => u.op := DecOp.FPCTRLRD  // task 9b: FPCR/FPSR/FPIAR -> int temp
+      case UFpStoreCvt => u.op := DecOp.FPSTORECVT  // task 14b: FPn -> one narrowed chunk
       case _: UCasOp   => u.op := DecOp.CASOP
     }
     u.cluster := (d.uop match {
@@ -2437,6 +2584,9 @@ object Microcode {
       // only cluster with access to the FPCC physical register file, which FPSR's
       // condition-code nibble comes from. Explicit override (d.mem = MNone).
       case UFpCtrlRead => Cluster.CPLX
+      // task 14b: the narrowing conversion runs on the CPLX cluster too -- it is the only
+      // cluster with a read port on the FP register file. Explicit override (d.mem = MNone).
+      case UFpStoreCvt => Cluster.CPLX
       case _: UCasOp => Cluster.INT          // CAS/CAS2 compute runs on the ALU pipe
       case _         => (d.mem match { case MNone => Cluster.INT; case _ => Cluster.LS })
     })
@@ -2696,6 +2846,19 @@ object Microcode {
     when(Bool(d.uop == UFpCtrlRead)) {
       u.readsFpcc := True
     }
+    // ── Task 14b: FMOVE FPn,<ea> -- the narrowing-conversion row's FP-domain fields ──
+    // `ctx.fpCmd` was packed once at ucBegin from the REAL extension word as
+    // {srcSpec[12:10], dstFp[9:7], opmode[6:0]}. For opclass 011 those SAME bit positions
+    // mean {destination FORMAT, source FPn, k-factor} -- the role-flip -- so this is a
+    // pure re-read of the already-packed word, not a second extraction. Everything else
+    // (writesFp / writesFpcc / readsFpcc / usesFpSrcB) stays at `fpInert()`'s default:
+    // this uop's only destination is an INTEGER one. Same `when(Bool(...))` shape as the
+    // UFpIssue block above, for the same PhaseCheck_noLatchNoOverride reason.
+    when(Bool(d.uop == UFpStoreCvt)) {
+      u.fpSrcFmt   := ctx.fpCmd(12 downto 10)
+      u.fpSrcAReg  := ctx.fpCmd(9 downto 7).asUInt
+      u.usesFpSrcA := True
+    }
     u.isScc := False; u.isDbcc := False
     // Indexed-EA descriptor fields. The bit-field chain and the full-format mem-indirect
     // pointer/host LS rows carry the EA index (srcC) -> drive its size/scale from Ctx; all
@@ -2874,6 +3037,9 @@ object Microcode {
       is(SelHw.SFpCtrlRc)    { imm := ctx.fpCtrlRc }
       is(SelHw.SFpCtrlSel1)  { imm := (ctx.fpCtrlRc.asUInt | U(1 << 4, 32 bits)).asBits }
       is(SelHw.SFpCtrlSel2)  { imm := (ctx.fpCtrlRc.asUInt | U(2 << 4, 32 bits)).asBits }
+      is(SelHw.SFpStIdx0)    { imm := B(0, 32 bits) }
+      is(SelHw.SFpStIdx1)    { imm := B(1, 32 bits) }
+      is(SelHw.SFpStIdx2)    { imm := B(2, 32 bits) }
       is(SelHw.SFpCtrlDelta) { imm := ctx.fpCtrlDelta }
     }
     imm
@@ -2933,6 +3099,7 @@ object Microcode {
       is(UOpHw.UMovesRead)  { u.op := DecOp.MOVE }   // MOVE T0 -> Rn (sign-ext An / merge Dn in EU)
       is(UOpHw.UFpIssue)    { u.op := DecOp.FPU }    // task 6b: the terminal FP-generic issue row
       is(UOpHw.UFpCtrlRead) { u.op := DecOp.FPCTRLRD }  // task 9b: FPCR/FPSR/FPIAR -> int temp
+      is(UOpHw.UFpStoreCvt) { u.op := DecOp.FPSTORECVT } // task 14b: FPn -> narrowed chunk
       is(UOpHw.UCasOp)      { u.op := DecOp.CASOP }
     }
     // The original's `case _ => (d.mem match { case MNone => INT; case _ => LS })` default
@@ -2962,6 +3129,7 @@ object Microcode {
       // task 9b: the control-register read runs on the CPLX cluster too -- the only
       // cluster with access to the FPCC physical register file (FPSR needs it).
       is(UOpHw.UFpCtrlRead) { u.cluster := Cluster.CPLX }
+      is(UOpHw.UFpStoreCvt) { u.cluster := Cluster.CPLX }
       is(UOpHw.UCasOp)      { u.cluster := Cluster.INT }  // CAS/CAS2 compute runs on the ALU pipe
     }
     // The An write-back ADD is LONG; the BCD chain uses ctx.size; the bit-field chain rows
@@ -3206,6 +3374,19 @@ object Microcode {
     // consumer -- see resolve()'s twin for the full rationale.
     when(d.uop === UOpHw.UFpCtrlRead) {
       u.readsFpcc := True
+    }
+    // ── Task 14b: FMOVE FPn,<ea> -- the narrowing-conversion row's FP-domain fields ──
+    // `ctx.fpCmd` was packed once at ucBegin from the REAL extension word as
+    // {srcSpec[12:10], dstFp[9:7], opmode[6:0]}. For opclass 011 those SAME bit positions
+    // mean {destination FORMAT, source FPn, k-factor} -- the role-flip -- so this is a
+    // pure re-read of the already-packed word, not a second extraction. Everything else
+    // (writesFp / writesFpcc / readsFpcc / usesFpSrcB) stays at `fpInert()`'s default:
+    // this uop's only destination is an INTEGER one. Same `when(Bool(...))` shape as the
+    // UFpIssue block above, for the same PhaseCheck_noLatchNoOverride reason.
+    when(d.uop === UOpHw.UFpStoreCvt) {
+      u.fpSrcFmt   := ctx.fpCmd(12 downto 10)
+      u.fpSrcAReg  := ctx.fpCmd(9 downto 7).asUInt
+      u.usesFpSrcA := True
     }
     u.isScc := False; u.isDbcc := False
     // Indexed-EA descriptor fields. The bit-field chain and the full-format mem-indirect

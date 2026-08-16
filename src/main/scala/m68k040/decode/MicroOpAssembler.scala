@@ -1589,6 +1589,33 @@ object MicroOpAssembler {
                        !spec.microcoded &&
                        (fpCtrlIsTo || fpCtrlIsFrom) && fpCtrlOneReg && fpCtrlEaReg
 
+    // ── Task 14b: FMOVE FPn,<ea> (opclass 011) with a REGISTER-DIRECT destination ───
+    // Modes 000 (Dn) and 001 (An) never reach the microcode engine at all
+    // (OperationDecoder's `fpMemIsMemEa` excludes them), so -- exactly like Task 6's own
+    // `fpFormIsIntReg` arm for the load direction -- this assembler emits them directly,
+    // as a single `DecOp.FPSTORECVT` uop (chunk 0; every register-direct format is 1 word).
+    //
+    // WHICH formats have a register-direct arm at all is decided by Musashi's own writer
+    // set, which matches the M68000PRM's <ea> restriction table here: `WRITE_EA_8/16/32`
+    // have a mode-0 (Dn) arm, so Byte/Word/Long/Single are legal; `WRITE_EA_64` and
+    // `WRITE_EA_FPE` do not (they `fatalerror`), so Double/Extended/Packed have none and
+    // fall through UNCHANGED to the existing vector-11 F-line default. Only `WRITE_EA_32`
+    // has a mode-1 (An) arm, so `An` is accepted for the Long format ONLY -- a deliberate
+    // consistency choice with this project's own existing FP control-register precedent
+    // (`fpCtrlEaReg` above already accepts modes 0 and 1 "matching Musashi's
+    // permissiveness"), not a re-derivation from the manual.
+    val fpStoreIsFrom  = fpOpClass === B"3'b011"
+    val fpStoreRegFmt  = (fpSrcSpec === B"3'b000") || (fpSrcSpec === B"3'b001") ||
+                         (fpSrcSpec === B"3'b100") || (fpSrcSpec === B"3'b110")  // L / S / W / B
+    val fpStoreRegEmit = spec.fpGeneric && pkt.simple && (pkt.lenWords >= U(2)) &&
+                         !spec.microcoded && fpStoreIsFrom &&
+                         ((fpStoreRegFmt && (fpEaMode === U(0, 3 bits))) ||
+                          ((fpSrcSpec === B"3'b000") && (fpEaMode === U(1, 3 bits))))
+    // `.W`/`.B` into a data register is a PARTIAL-register write (the 68k data-register
+    // rule); the EU merges over the old Dn, which it reads through srcA. `.L`/`.S` write
+    // all 32 bits and need no source at all.
+    val fpStoreRegMerge = (fpSrcSpec === B"3'b100") || (fpSrcSpec === B"3'b110")
+
     val fpEmit = spec.fpGeneric && pkt.simple && (pkt.lenWords >= U(2)) &&
                  (fpFormIsMovecr ||
                   ((fpFormIsReg || fpFormIsIntReg) && fpNative) ||
@@ -1612,7 +1639,11 @@ object MicroOpAssembler {
     // assembler now emits as a commit-time sysOp (it is cpGEN-shaped, so `spec.fpGeneric`
     // is set and `fpEmit` is False -- without this term it would take a spurious vector-11
     // trap instead of the sysOp it now is).
-    val fpGenBad = spec.fpGeneric && !fpEmit && !fpCtrlEmit && !spec.microcoded
+    // Task 14b: `&& !fpStoreRegEmit` for the same reason Task 9's `!fpCtrlEmit` term
+    // exists -- the register-direct store forms are cpGEN-shaped (so `spec.fpGeneric` is
+    // set and `fpEmit` is False), and without this term they would take a spurious
+    // vector-11 trap instead of the uop they now are.
+    val fpGenBad = spec.fpGeneric && !fpEmit && !fpCtrlEmit && !fpStoreRegEmit && !spec.microcoded
 
     // ── Immediate word extraction ────────────────────────────────────────────────
     // The immediate data ALWAYS starts at pkt.words(2) (right after opword + FP ext
@@ -1845,6 +1876,48 @@ object MicroOpAssembler {
           .elsewhen(fpSrcSpec === B"3'b110") { opUop.size := Size.BYTE }
           .otherwise { opUop.size := Size.LONG }
       }
+    }
+
+    // ── Task 14b: FMOVE FPn,Dn / FPn,An -- the register-direct STORE uop ────────────
+    when(fpStoreRegEmit) {
+      opUop.op            := DecOp.FPSTORECVT
+      opUop.cluster       := Cluster.CPLX   // the only cluster with an FP-file read port
+      opUop.memOp         := MemOp.NONE
+      opUop.unimplemented := False
+      opUop.faulted := False; opUop.faultVector := 0; opUop.faultUsesNextPc := False
+      opUop.isBranch     := False
+      opUop.firstOfInstr := True            // a single uop: it IS the macro boundary
+      // The integer CCR is untouched by every FP op, and this one writes no FP state
+      // either -- FPn is a pure SOURCE and the destination is an ordinary integer
+      // register, so FPCC is NOT updated (Musashi's `fmove_reg_mem` calls neither
+      // `SET_CONDITION_CODES` nor `float_raise`, confirmed by direct search).
+      opUop.readsNzvc := False; opUop.writesNzvc := False
+      opUop.readsX    := False; opUop.writesX    := False
+      opUop.writesFp  := False; opUop.writesFpcc := False
+      opUop.readsFpcc := False; opUop.fpDstReg   := 0
+      // ext[9:7] is the SOURCE FPn (the role-flip of the load direction, where the same
+      // field is the DESTINATION FPn -- see fpu_fmove_fpn_mem_nonzero_reg.s, the ported
+      // regression that exists precisely because a sibling core read ext[12:10] here).
+      opUop.fpSrcAReg  := fpDstFp
+      opUop.usesFpSrcA := True
+      opUop.usesFpSrcB := False; opUop.fpSrcBReg := 0
+      opUop.fpSrcKind  := FpSrcKind.FPREG   // inert: this op has no FpuCore source gateway
+      opUop.fpSrcFmt   := fpSrcSpec         // ext[12:10] = the DESTINATION format
+      opUop.fpWideImm  := B(0, 80 bits)
+      // The chunk index rides imm[1:0]; every register-direct format is a single chunk.
+      opUop.useImm := True; opUop.imm := U(0, 32 bits).asBits
+      // `.W`/`.B` read the old Dn back as the partial-write merge source.
+      opUop.srcAReg   := fpEaReg.resize(5)
+      opUop.srcAValid := fpStoreRegMerge
+      opUop.srcBValid := False
+      when(fpSrcSpec === B"3'b100") { opUop.size := Size.WORD }
+        .elsewhen(fpSrcSpec === B"3'b110") { opUop.size := Size.BYTE }
+        .otherwise { opUop.size := Size.LONG }
+      // <ea> mode 000 = Dn (arch id 0..7), mode 001 = An (arch id 8..15, Long only).
+      opUop.dstReg := Mux(fpEaMode === U(1, 3 bits),
+                          (U(8, 5 bits) + fpEaReg.resize(5)).resize(5),
+                          fpEaReg.resize(5))
+      opUop.dstValid := True
     }
 
     // ── FSAVE unimplemented-instruction-frame trigger (Task 10, reduced scope) ──────

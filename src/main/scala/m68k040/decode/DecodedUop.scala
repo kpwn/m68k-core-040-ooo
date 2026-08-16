@@ -139,7 +139,27 @@ object DecOp extends SpinalEnum {
       // (DtlbPlugin/LsEuPlugin/ItlbPlugin). FPCC is the exception and is NOT read that
       // way: it is renamed, so this op declares a REAL `readsFpcc` dependency and is
       // gated by the existing CPLX dynamic-wakeup scoreboard.
-      FPCTRLRD
+      FPCTRLRD,
+      // ── Task 14b: FMOVE FPn,<ea> (cpGEN opclass 011), the STORE direction ──────
+      // Converts the source FPn to the destination FORMAT (ext[12:10] -- the role-flip
+      // of the load direction's source-format field) and delivers ONE 32-bit chunk of
+      // the result into an INTEGER destination: a microcode temp that the following
+      // `MStore` row writes to memory, or (for the register-direct forms, which never
+      // reach the microcode engine) the decoded Dn/An itself.
+      //
+      // Runs in the CPLX EU's INTEGER lane, not the FP lane: the conversion is
+      // `FpNarrowPack`, a shallow combinational shift-jam-round cone, and its result is
+      // a 32-bit integer-lane value. It reads FPn through the SAME unconditionally
+      // addressed `fpRdA` port the FP lane already holds (declaring a real
+      // `usesFpSrcA`, so the ordinary FP rename + CPLX dynamic-wakeup scoreboard gates
+      // it exactly like any other FP consumer).
+      //
+      // The uop carries: `fpSrcFmt` = the destination format; `imm[1:0]` (with
+      // `useImm`) = which 32-bit CHUNK of a multi-word format this row stores (0/1/2 --
+      // Double is 2 chunks, Extended 3, everything else 1); `size` = LONG for every
+      // memory row (the STORE row owns the real access size) and WORD/BYTE only for the
+      // register-direct `.W`/`.B` forms, where it selects the partial-register MERGE.
+      FPSTORECVT
       = newElement()
 }
 

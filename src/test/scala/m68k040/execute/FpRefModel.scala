@@ -239,6 +239,172 @@ object FpRefModel {
     else sig(roundToInt(a, rm)) != sig(a)
   }
 
+  // ══════════════════════════════════════════════════════════════════════════════
+  // Task 14b: the NARROWING conversions FMOVE FPn,<ea> needs (extended -> Long/Word/
+  // Byte integer, Single, Double). Unlike the arithmetic above, these ARE direct
+  // transcriptions of SoftFloat -- `floatx80_to_int32` / `floatx80_to_float32` /
+  // `floatx80_to_float64` plus their `roundAndPackInt32` / `roundAndPackFloat32` /
+  // `roundAndPackFloat64` tails ARE the specification (Musashi's `fmove_reg_mem` calls
+  // exactly these, so they are also the lock-step oracle for the stored VALUE).
+  // Citations: softfloat.c:67-101 (roundAndPackInt32), :245-294 (roundAndPackFloat32),
+  // :403-452 (roundAndPackFloat64), :2845-2859 / :2998 / :3026 (the three floatx80_to_*
+  // entry points), softfloat-macros shift64RightJamming, softfloat-specialize:249-337
+  // (commonNaNToFloat32/64).
+  // ══════════════════════════════════════════════════════════════════════════════
+
+  /** softfloat-macros `shift64RightJamming`. */
+  def shr64Jam(a: BigInt, count: Int): BigInt = {
+    require(count >= 0)
+    if (count == 0) a & M64
+    else if (count < 64) ((a & M64) >> count) | (if (((a & M64) & ((BigInt(1) << count) - 1)) != 0) BigInt(1) else BigInt(0))
+    else if ((a & M64) != 0) BigInt(1) else BigInt(0)
+  }
+
+  /** softfloat-macros `shift32RightJamming`. */
+  def shr32Jam(a: BigInt, count: Int): BigInt = {
+    val m32 = (BigInt(1) << 32) - 1
+    require(count >= 0)
+    if (count == 0) a & m32
+    else if (count < 32) ((a & m32) >> count) | (if (((a & m32) & ((BigInt(1) << count) - 1)) != 0) BigInt(1) else BigInt(0))
+    else if ((a & m32) != 0) BigInt(1) else BigInt(0)
+  }
+
+  /** The SoftFloat `roundIncrement` selection shared by roundAndPackInt32/Float32/Float64:
+    * RN -> half; RZ -> 0; RM/RP -> all-ones when rounding AWAY from zero for this sign,
+    * 0 when rounding toward zero. `half` is 0x40 / 0x40 / 0x200 and `allOnes` 0x7F / 0x7F /
+    * 0x3FF for int32 / float32 / float64 respectively. */
+  private def roundIncrement(zSign: Int, rm: Int, half: Int, allOnes: Int): Int = rm match {
+    case 0 => half
+    case 1 => 0
+    case 2 => if (zSign == 1) allOnes else 0    // RM (down): away from zero only when negative
+    case _ => if (zSign == 1) 0 else allOnes    // RP (up)  : away from zero only when positive
+  }
+
+  /** softfloat.c:67-101 `roundAndPackInt32`. Returns (the 32-bit result PATTERN, invalid,
+    * inexact). On invalid the saturated value is returned and inexact is NOT set (SoftFloat
+    * returns before reaching the inexact test). */
+  def roundAndPackInt32(zSign: Int, absZ0: BigInt, rm: Int): (BigInt, Boolean, Boolean) = {
+    val M32 = (BigInt(1) << 32) - 1
+    val incr = roundIncrement(zSign, rm, 0x40, 0x7F)
+    val roundBits = (absZ0 & 0x7F).toInt
+    var absZ = (absZ0 + incr) >> 7
+    if (((roundBits ^ 0x40) == 0) && rm == 0) absZ = absZ & ~BigInt(1)
+    val overflow =
+      (absZ >> 32) != 0 ||
+      (if (zSign == 1) (absZ & M32) > (BigInt(1) << 31) else (absZ & M32) > ((BigInt(1) << 31) - 1))
+    if (overflow) return (if (zSign == 1) BigInt(1) << 31 else (BigInt(1) << 31) - 1, true, false)
+    val z = if (zSign == 1) (-(absZ & M32)) & M32 else absZ & M32
+    (z, false, roundBits != 0)
+  }
+
+  /** softfloat.c `floatx80_to_int32`. Returns (32-bit pattern, invalid, inexact). */
+  def toInt32(a: BigInt, rm: Int): (BigInt, Boolean, Boolean) = {
+    val aExp = exp(a)
+    val aSig = sig(a)
+    // A NaN is forced POSITIVE before rounding, so it saturates to 0x7FFFFFFF.
+    val zSign = if (aExp == 0x7FFF && (aSig & M63) != 0) 0 else sign(a)
+    var sc = 0x4037 - aExp
+    if (sc <= 0) sc = 1
+    roundAndPackInt32(zSign, shr64Jam(aSig, sc), rm)
+  }
+
+  /** softfloat.c:245-294 `roundAndPackFloat32`. Returns (32-bit pattern, ovfl, unfl, inex).
+    * `float_detect_tininess` is `after_rounding` for this build (softfloat-specialize:43,
+    * the same constant `FpRoundPack` already relies on). */
+  def roundAndPackFloat32(zSign: Int, zExp0: Int, zSig0: BigInt, rm: Int)
+      : (BigInt, Boolean, Boolean, Boolean) = {
+    val incr = roundIncrement(zSign, rm, 0x40, 0x7F)
+    var zExp = zExp0
+    var zSig = zSig0
+    var roundBits = (zSig & 0x7F).toInt
+    var ovfl = false; var unfl = false
+    if (zExp > 0xFD || (zExp == 0xFD && ((zSig + incr) & (BigInt(1) << 31)) != 0)) {
+      val inf = (BigInt(zSign) << 31) | (BigInt(0xFF) << 23)
+      return (if (incr == 0) inf - 1 else inf, true, false, true)
+    }
+    if (zExp < 0) {
+      val isTiny = zExp < -1 || (zSig + incr) < (BigInt(1) << 31)
+      zSig = shr32Jam(zSig, -zExp)
+      zExp = 0
+      roundBits = (zSig & 0x7F).toInt
+      if (isTiny && roundBits != 0) unfl = true
+    }
+    val inex = roundBits != 0
+    var z = (zSig + incr) >> 7
+    if (((roundBits ^ 0x40) == 0) && rm == 0) z = z & ~BigInt(1)
+    if (z == 0) zExp = 0
+    ((BigInt(zSign) << 31) + (BigInt(zExp) << 23) + z, ovfl, unfl, inex)
+  }
+
+  /** softfloat.c:403-452 `roundAndPackFloat64`. Returns (64-bit pattern, ovfl, unfl, inex). */
+  def roundAndPackFloat64(zSign: Int, zExp0: Int, zSig0: BigInt, rm: Int)
+      : (BigInt, Boolean, Boolean, Boolean) = {
+    val incr = roundIncrement(zSign, rm, 0x200, 0x3FF)
+    var zExp = zExp0
+    var zSig = zSig0
+    var roundBits = (zSig & 0x3FF).toInt
+    var unfl = false
+    if (zExp > 0x7FD || (zExp == 0x7FD && ((zSig + incr) & (BigInt(1) << 63)) != 0)) {
+      val inf = (BigInt(zSign) << 63) | (BigInt(0x7FF) << 52)
+      return (if (incr == 0) inf - 1 else inf, true, false, true)
+    }
+    if (zExp < 0) {
+      val isTiny = zExp < -1 || (zSig + incr) < (BigInt(1) << 63)
+      zSig = shr64Jam(zSig, -zExp)
+      zExp = 0
+      roundBits = (zSig & 0x3FF).toInt
+      if (isTiny && roundBits != 0) unfl = true
+    }
+    val inex = roundBits != 0
+    var z = (zSig + incr) >> 10
+    if (((roundBits ^ 0x200) == 0) && rm == 0) z = z & ~BigInt(1)
+    if (z == 0) zExp = 0
+    ((BigInt(zSign) << 63) + (BigInt(zExp) << 52) + z, false, unfl, inex)
+  }
+
+  /** softfloat.c `floatx80_to_float32`. Returns (32-bit pattern, snan, ovfl, unfl, inex). */
+  def toFloat32(a: BigInt, rm: Int): (BigInt, Boolean, Boolean, Boolean, Boolean) = {
+    val aSign = sign(a); val aExp = exp(a); val aSig = sig(a)
+    if (aExp == 0x7FFF) {
+      if ((aSig & M63) != 0) {
+        // commonNaNToFloat32 (softfloat-specialize): sign<<31 | 0x7FC00000 | ((aSig<<1)>>41)
+        val hi = (aSig << 1) & M64
+        return ((BigInt(aSign) << 31) | BigInt(0x7FC00000L) | (hi >> 41), isSNan(a), false, false, false)
+      }
+      return ((BigInt(aSign) << 31) | (BigInt(0xFF) << 23), false, false, false, false)
+    }
+    val zSig = shr64Jam(aSig, 33)
+    val zExp = if (aExp != 0 || zSig != 0) aExp - 0x3F81 else aExp
+    val (v, o, u, i) = roundAndPackFloat32(aSign, zExp, zSig, rm)
+    (v, false, o, u, i)
+  }
+
+  /** softfloat.c `floatx80_to_float64`. Returns (64-bit pattern, snan, ovfl, unfl, inex). */
+  def toFloat64(a: BigInt, rm: Int): (BigInt, Boolean, Boolean, Boolean, Boolean) = {
+    val aSign = sign(a); val aExp = exp(a); val aSig = sig(a)
+    if (aExp == 0x7FFF) {
+      if ((aSig & M63) != 0) {
+        // commonNaNToFloat64: sign<<63 | 0x7FF8000000000000 | ((aSig<<1)>>12)
+        val hi = (aSig << 1) & M64
+        return ((BigInt(aSign) << 63) | BigInt("7FF8000000000000", 16) | (hi >> 12),
+                isSNan(a), false, false, false)
+      }
+      return ((BigInt(aSign) << 63) | (BigInt(0x7FF) << 52), false, false, false, false)
+    }
+    val zSig = shr64Jam(aSig, 1)
+    val zExp = if (aExp != 0 || aSig != 0) aExp - 0x3C01 else aExp
+    val (v, o, u, i) = roundAndPackFloat64(aSign, zExp, zSig, rm)
+    (v, false, o, u, i)
+  }
+
+  /** `store_extended_float80` (m68kfpu.c:80-85) as three 32-bit chunks at ea+0/+4/+8:
+    * {sign+exp, 0x0000}, mantissa[63:32], mantissa[31:0]. The reserved word at ea+2 is
+    * written as ZERO (it is SKIPPED on the load side, load_extended_float80). */
+  def extChunks(a: BigInt): Vector[BigInt] = Vector(
+    ((a >> 64) & 0xFFFF) << 16,
+    (a >> 32) & ((BigInt(1) << 32) - 1),
+    a & ((BigInt(1) << 32) - 1))
+
   /** Musashi SET_CONDITION_CODES in the internal {NaN,I,Z,N} bit order. */
   def fpcc(v: BigInt): Int = {
     val low63nz = (sig(v) & M63) != 0

@@ -504,6 +504,49 @@ confirmed against either manual and is recorded as an open, unverified question,
 rule to implement. The conservative behaviour (leave `RRR == 000` undecoded → vector-11 F-line
 trap) is what this core does today and is safe with respect to it.
 
+**D10 — `FMOVE FPn,(d16,PC)` / `FMOVE FPn,(d8,PC,Xn)`: Musashi WRITES through a PC-relative
+destination; this core rejects it.** Found during Task 14b (the `FMOVE FPn,<ea>` store
+direction). Every one of Musashi's FP write helpers carries a PC-relative arm and uses it as
+a *destination*: `WRITE_EA_8` (`m68kfpu.c:832`), `WRITE_EA_16`, `WRITE_EA_32` and
+`WRITE_EA_64` all have a `case 2: // (d16, PC)` under mode 7 that computes `EA_PCDI_*()` and
+then calls `m68ki_write_*` to it. PC-relative modes are **not alterable** on any 68k, so an
+`FMOVE FPn,(d16,PC)` is an illegal encoding, not a store. This core's `ucFpStoreOk`
+(`src/main/scala/m68k040/decode/DecodeStage.scala`) requires `!ucBfEaDec.pcRel` and routes the
+attempt to the same clean vector-11 F-line trap the rest of the band already produces.
+=> **Musashi is wrong here and our hardware is right; do NOT "fix" the core to match.**
+=> No corpus test currently exercises it, so lock-step is not expected to hit this; a future
+fuzz seed could. `FpMemStoreSpec` owns it as a directed decode-level test.
+
+**D11 — `FMOVE.W FPn,Dn` / `FMOVE.B FPn,Dn`: Musashi ZERO-EXTENDS over the whole data
+register; real hardware writes only the low word/byte.** Also from Task 14b.
+`WRITE_EA_16`/`WRITE_EA_8` (`m68kfpu.c`) take their data parameter as `uint16`/`uint8` and
+their mode-0 arm is a bare `REG_D[reg] = data;`, so the upper 16/24 bits of Dn are cleared.
+That contradicts the universal 68k data-register rule (a `.W`/`.B` destination is a partial
+write; the rest of Dn is untouched), which this core implements by reading the old Dn back as
+a merge source on the `DecOp.FPSTORECVT` uop. Note Musashi's *own* integer `MOVE.W`/`MOVE.B`
+into a data register do the partial write correctly — this is a gap in its FPU EA path only,
+exactly like D8.
+=> **Musashi is wrong here and our hardware is right.** Exclude `FMOVE.W/.B FPn,Dn` from the
+Musashi-refereed corpus; `FpMemStoreSpec` asserts the merge shape at decode level, and the
+memory forms of `.W`/`.B` (which have no such divergence) ARE lock-stepped in
+`FpuLockStepSpec`. The ported corpus test `fpu_fmove_fp_to_ea_matrix.s` deliberately does not
+assert this case either ("Numeric exactness for .W/.B register merge is not asserted here").
+
+**D12 — `FMOVE FPn,<ea>` raises no exception at all in Musashi.** `fmove_reg_mem`
+(`m68kfpu.c:1570-1632`) calls neither `float_raise` nor `SET_CONDITION_CODES` on any of its
+eight arms — verified by direct search of the function body. The underlying SoftFloat
+routines it calls *do* set `float_exception_flags` (`roundAndPackInt32` raises invalid on
+saturation; `roundAndPackFloat32/64` raise overflow/underflow/inexact), but Musashi never
+reads that back into FPSR. This core raises the architecturally correct OPERR/OVFL/UNFL/
+INEX2/SNAN from `FpNarrowPack`, accrues them into FPSR.EXC, and vectors only when the
+matching FPCR enable bit is set (Task 14c's gate). Additionally, the Word and Byte
+destination formats raise OPERR when the converted int32 does not fit the narrower
+destination — Musashi merely truncates via a `(sint16)`/`(sint8)` cast, and the *stored
+value* matches it exactly; only the exception is extra.
+=> An extension of D4 ("every FPSR exception-status output is directed-test-only") to the
+store direction. `FpNarrowPackSpec` owns the exception coverage; the lock-stepped store
+programs never enable an FPCR trap and never read FPSR.
+
 ### VERIFY-AT-IMPLEMENTATION
 
 - **VERIFY-1 — the FMOVECR constant ROM words for offsets $0B and $38..$3F.**

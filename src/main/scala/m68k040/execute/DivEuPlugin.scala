@@ -1,7 +1,7 @@
 package m68k040.execute
 
 import m68k040.decode.{DecOp, FpSrcKind}
-import m68k040.execute.fpu.{FpExcFlags, FpResult, FpSource, FpuCore}
+import m68k040.execute.fpu.{FpExcFlags, FpNarrowPack, FpResult, FpSource, FpuCore}
 import m68k040.execute.iq.IqContext
 import m68k040.execute.regfile.{FpccRegFileService, FpRegFileService, IntRegFileService,
   NzvcRegFileService, RegFileReadPort, RegFileWritePort, RegFileBypassPort}
@@ -383,6 +383,12 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val s1H     = Reg(Bits(32 bits))
     val s1Nzvc  = Reg(Bits(4 bits))    // old {N,Z,V,C} for the CMP2/CHK2 RMW
     val s1Fpcc  = Reg(Bits(4 bits))    // Task 9b: the renamed FPCC nibble (DecOp.FPCTRLRD)
+    // Task 14b: the 80-bit FPn source of a `DecOp.FPSTORECVT`, captured from the SAME
+    // unconditionally-addressed `fpRdA` port the FP lane reads (`fpRdA.addr := u0.pFpSrcA`
+    // below) -- byte-for-byte the shape `s1Fpcc` already uses for the FPCC file. Latching
+    // the RAW source (rather than a converted result) keeps the whole `FpNarrowPack` cone
+    // inside S1, out of series with the FP register-file read.
+    val s1FpSrc = Reg(Bits(80 bits))
     val u1 = s1Ctx.uop
 
     // Main MUL, MULHI and FP have independent pipelines/queues below.  Every other
@@ -397,6 +403,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       s1H     := s0H
       s1Nzvc  := s0Nzvc
       s1Fpcc  := fpccRd.data           // Task 9b
+      s1FpSrc := fpRdA.data            // Task 14b
     }
 
     // Mispredict/exception squash: a 1-cycle doFlush pulse. Latch it so the eventual
@@ -644,6 +651,49 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
                         Mux(fpCtrlMask(1) && (fpCtrlPos === fpCtrlPosFpsr),  fpCtrlFpsrArch,
                         Mux(fpCtrlMask(0) && (fpCtrlPos === fpCtrlPosFpiar), fpCtrlFpiarIn,
                                                                              U(0, 32 bits)))).asBits
+    // ── Task 14b: FMOVE FPn,<ea> (opclass 011) -- the narrowing conversion ───────────
+    // `DecOp.FPSTORECVT`: convert the 80-bit FPn latched at S0 into ONE 32-bit chunk of
+    // the destination format and complete it as an ordinary int-lane result. This is a
+    // deliberate SIBLING of `isFpCtrlRd` above, not a divergent shape: same lane, same
+    // single-cycle S1 arm, same `captureComplete`. The one structural difference is that
+    // it reads the FP data file instead of the FPCC file, which needs no new port --
+    // `fpRdA.addr` is already `u0.pFpSrcA` unconditionally (see the FP lane below), and
+    // this uop declares a real `usesFpSrcA`, so rename hands it a genuine `pFpSrcA` and
+    // the CPLX dynamic-wakeup scoreboard gates issue exactly as for any FP consumer.
+    val isFpStoreCvt = u1.op === DecOp.FPSTORECVT
+    val fpNarrow = new FpNarrowPack
+    fpNarrow.io.src   := s1FpSrc
+    fpNarrow.io.fmt   := u1.fpSrcFmt          // opclass 011: the DESTINATION format
+    fpNarrow.io.chunk := u1.imm(1 downto 0).asUInt
+    fpNarrow.io.rmode := fpRmodeIn
+    // Register-direct `.W`/`.B` destinations are a PARTIAL-register write (only the low
+    // word/byte of Dn changes) -- the ordinary 68k data-register rule, and the one place
+    // this core deliberately diverges from Musashi, whose `WRITE_EA_16`/`WRITE_EA_8`
+    // assign `REG_D[reg] = data` from a uint16/uint8 and therefore ZERO-EXTEND over the
+    // whole register (Divergence Register D11). Every MEMORY row is `Size.LONG` here (its
+    // own `MStore` row carries the real access size and does the truncation), so the merge
+    // is unreachable for them by construction.
+    val fpCvtRaw = fpNarrow.io.word
+    val fpStoreValue = u1.size.mux(
+      Size.WORD -> (s1A(31 downto 16) ## fpCvtRaw(15 downto 0)),
+      Size.BYTE -> (s1A(31 downto  8) ## fpCvtRaw( 7 downto 0)),
+      default   -> fpCvtRaw)
+    // FPSR EXC accrual for this lane, in the architectural FPSR[15:8] order. Registered
+    // one cycle so it lines up with the ordinary completion delivery; merged (OR-ed, which
+    // is lossless because `FpuControlService.orFpsrExc` IS an OR-accumulate) with the FP
+    // lane's own accrual at the port drive below.
+    val fpStoreExcVld = RegInit(False)
+    val fpStoreExcReg = Reg(Bits(8 bits)) init 0
+    fpStoreExcVld := False
+    // `FpNarrowPack` carries ONE registered stage (see its header for the synth evidence
+    // that forced the split), so an `FPSTORECVT` occupies S1 for two cycles: the first
+    // feeds the converter's stage register from the already-stable `s1FpSrc`, the second
+    // completes. `s1Valid` is held across both, which is what blocks a new CPLX issue --
+    // the same single-outstanding contract the legacy lane already has. Cost is one cycle
+    // per conversion row, invisible next to the store rows that follow it.
+    val fpCvtWait = RegInit(False)
+    when(flushSig) { fpCvtWait := False }
+
     val isDivRem = u1.divIsRem
     val remLatch = Reg(Bits(32 bits))
     val ovLatch  = RegInit(False)
@@ -905,22 +955,31 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // Evaluated unconditionally (once per FpuCore result port) rather than inside the
     // capture branch, so `vec` is a plain fully-driven combinational signal.
     case class FpEscalation() extends Bundle { val esc = Bool(); val vec = UInt(8 bits) }
-    def fpEscalation(res: FpResult): FpEscalation = {
+    /** Task 14b factored this out of `fpEscalation(res)` so a SECOND raising site (the int
+      * lane's narrowing converter, which produces an `FpExcFlags` but no `FpResult`) shares
+      * the identical enable gate and priority order instead of growing a parallel one. */
+    def fpEscalationOf(exc: FpExcFlags): FpEscalation = {
       val en = fpExcEnableIn
       val r  = FpEscalation()
-      r.esc := (res.exc.snan  && en.snan)  || (res.exc.operr && en.operr) ||
-               (res.exc.ovfl  && en.ovfl)  || (res.exc.unfl  && en.unfl)  ||
-               (res.exc.dz    && en.dz)    || (res.exc.inex2 && en.inex2)
-      when(res.exc.snan && en.snan)          { r.vec := U(FpVector.Snan,  8 bits) }
-        .elsewhen(res.exc.operr && en.operr) { r.vec := U(FpVector.Operr, 8 bits) }
-        .elsewhen(res.exc.ovfl  && en.ovfl)  { r.vec := U(FpVector.Ovfl,  8 bits) }
-        .elsewhen(res.exc.unfl  && en.unfl)  { r.vec := U(FpVector.Unfl,  8 bits) }
-        .elsewhen(res.exc.dz    && en.dz)    { r.vec := U(FpVector.Dz,    8 bits) }
-        .otherwise                           { r.vec := U(FpVector.Inex,  8 bits) }
+      r.esc := (exc.snan  && en.snan)  || (exc.operr && en.operr) ||
+               (exc.ovfl  && en.ovfl)  || (exc.unfl  && en.unfl)  ||
+               (exc.dz    && en.dz)    || (exc.inex2 && en.inex2)
+      when(exc.snan && en.snan)          { r.vec := U(FpVector.Snan,  8 bits) }
+        .elsewhen(exc.operr && en.operr) { r.vec := U(FpVector.Operr, 8 bits) }
+        .elsewhen(exc.ovfl  && en.ovfl)  { r.vec := U(FpVector.Ovfl,  8 bits) }
+        .elsewhen(exc.unfl  && en.unfl)  { r.vec := U(FpVector.Unfl,  8 bits) }
+        .elsewhen(exc.dz    && en.dz)    { r.vec := U(FpVector.Dz,    8 bits) }
+        .otherwise                       { r.vec := U(FpVector.Inex,  8 bits) }
       r
     }
+    def fpEscalation(res: FpResult): FpEscalation = fpEscalationOf(res.exc)
     val fpEscFixed = fpEscalation(fpu.io.resFixed)
     val fpEscIter  = fpEscalation(fpu.io.resIter)
+    // Task 14b: the same gate applied to the narrowing converter's own flags. An enabled
+    // OPERR/OVFL/UNFL/INEX on an `FMOVE FPn,<ea>` vectors from the CONVERSION uop, which
+    // is strictly OLDER than the `MStore` row(s) that would have written memory -- so the
+    // ROB's excSquash kills the store and the trap is precise (nothing was written).
+    val fpStoreEsc = fpEscalationOf(fpNarrow.io.exc)
 
     /** FpExcFlags -> architectural FPSR[15:8] EXC byte (MC68040 UM Figure 9-5:
       * 15 BSUN, 14 SNAN, 13 OPERR, 12 OVFL, 11 UNFL, 10 DZ, 9 INEX2, 8 INEX1). This is a
@@ -929,6 +988,8 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       * attached to its flattened layout, so the mapping is written out field by field. */
     def fpsrExcByte(e: FpExcFlags): Bits =
       False ## e.snan ## e.operr ## e.ovfl ## e.unfl ## e.dz ## e.inex2 ## False
+    /** Task 14b: the narrowing converter's own EXC byte, in the same architectural order. */
+    val fpStoreExcNow = fpsrExcByte(fpNarrow.io.exc)
 
     def fpWriteback(ctx: FpPipeContext, res: FpResult, esc: FpEscalation): Unit = {
       fpCompExc       := fpsrExcByte(res.exc)
@@ -981,8 +1042,18 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // FPSP reads FPSR.EXC to dispatch), so an escalating op accrues exactly like a
     // substituting one -- the enable byte selects whether a VECTOR is also taken, not
     // whether the status bit is recorded.
-    fpExcAccrualPort.valid   := fpCompLive && fpCompExc =/= 0
-    fpExcAccrualPort.payload := fpCompExc
+    //
+    // Task 14b: the int lane's narrowing converter is a SECOND raising site on this same
+    // port. Merging them is lossless rather than an arbitration problem, because the sink
+    // (`FpuControlService.orFpsrExc`) is an OR-ACCUMULATE into FPSR.EXC -- so a same-cycle
+    // collision between an FP-lane result and an `FMOVE FPn,<ea>` conversion is resolved by
+    // OR-ing the two bytes, which is exactly what two separate sequential accruals would
+    // have produced. Each side contributes 0 when it is not delivering.
+    val fpStoreAccrualLive = fpStoreExcVld && !flushSig && (fpStoreExcReg =/= 0)
+    val fpLaneAccrualLive  = fpCompLive && (fpCompExc =/= 0)
+    fpExcAccrualPort.valid   := fpLaneAccrualLive || fpStoreAccrualLive
+    fpExcAccrualPort.payload := Mux(fpLaneAccrualLive,  fpCompExc,     B(0, 8 bits)) |
+                                Mux(fpStoreAccrualLive, fpStoreExcReg, B(0, 8 bits))
 
     // ---- sim-only whitebox for the FP lane (zero synth impact) ----
     fpCompValid.simPublic(); fpCompRobId.simPublic(); fpCompData.simPublic()
@@ -1033,6 +1104,30 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
             // `fpsrArch` does for the single-register read direction.
             captureComplete(fpCtrlRdValue, B(0, 4 bits), False, True)
             s1Valid := False
+          } elsewhen(isFpStoreCvt) {
+            // ── Task 14b: FMOVE FPn,<ea> -- one 32-bit chunk of the narrowed value ────
+            // Single-cycle, exactly like the `isFpCtrlRd` sibling above. On an ENABLED
+            // exception the uop takes an EU fault instead of completing: its `pdst` write
+            // is suppressed and every younger uop (including this program's own `MStore`
+            // rows) is squashed, so the trap is precise -- memory is untouched. With the
+            // trap DISABLED the substituted/saturated value is stored and only the FPSR
+            // EXC accrual below records what happened, mirroring the FP lane's own
+            // Decision-10 posture.
+            when(fpCvtWait) {
+              when(fpStoreEsc.esc) {
+                captureFault(fpStoreEsc.vec, B(0, 4 bits), False)
+              } otherwise {
+                captureComplete(fpStoreValue, B(0, 4 bits), False, True)
+              }
+              when(!(flushed || flushSig)) {
+                fpStoreExcVld := True
+                fpStoreExcReg := fpStoreExcNow
+              }
+              fpCvtWait := False
+              s1Valid   := False
+            } otherwise {
+              fpCvtWait := True     // converter stage 0 -> its register this cycle
+            }
           } elsewhen(isDivRem) {
             // Trailing remainder-move: write the latched remainder to Dr. Task #168
             // (ported-tests triage, divl_sz1_overflow HANG) closes the residual gap

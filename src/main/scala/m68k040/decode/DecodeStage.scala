@@ -1287,6 +1287,32 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
                      (ucFpExt(9 downto 0) === B(0, 10 bits)) &&
                      (ucFpCtrlMask =/= B"3'b000") &&
                      (ucBfEaDec.klass === EaClass.MEMSIMPLE) && !ucBfEaDec.pcRel
+    // ── Task 14b: FMOVE FPn,<ea> (opclass 011) -- the STORE direction ACCEPT gate ────
+    // `ucFpSrcSpec` (ext[12:10]) is REUSED verbatim, with a role-flip: for opclass 011 it
+    // names the DESTINATION FORMAT, not the source format. Every downstream consumer this
+    // family shares with the load direction is correct under that flip WITHOUT change:
+    // `ucFpDeltaMag`'s 1/2/4/4/8/12-byte auto delta table is keyed on the same field and
+    // means the same byte counts, and `ucEntryCtx.fpCmd` already packs {srcSpec, dstFp,
+    // opmode} = {format, source FPn, k-factor} for this opclass.
+    //
+    // BOTH Packed codes are excluded (Decision 2): 011 is Packed static-k and 111 is
+    // Packed dynamic-k. This is a WIDER exclusion than the load direction needs, where 111
+    // is FMOVECR and never reaches this engine at all. Both fall through to the existing
+    // `FP_MEM_TRAP_ENTRY` vector-11 F-line trap.
+    //
+    // `!pcRel` is a DELIBERATE divergence from Musashi (Divergence Register D10): Musashi's
+    // WRITE_EA_* helpers each carry an `EA_PCDI_*` arm and will happily WRITE through a
+    // PC-relative destination, which is not an alterable addressing mode on real hardware.
+    // This core rejects it to the same clean vector-11 trap the band already produces.
+    // MEMINDIRECT EAs are excluded for the same reason as every other member of this
+    // family (out of the microcode engine's scope), also to the same trap.
+    //
+    // There is NO opmode whitelist here, and that is correct rather than an omission: for
+    // opclass 011 ext[6:0] is not an opmode at all -- it is the Packed k-factor, and Packed
+    // is already excluded.
+    val ucFpStoreOk = (ucFpOpClass === B"3'b011") &&
+                      (ucFpSrcSpec =/= B"3'b011") && (ucFpSrcSpec =/= B"3'b111") &&
+                      (ucBfEaDec.klass === EaClass.MEMSIMPLE) && !ucBfEaDec.pcRel
     // ── FULL-format MEMORY-INDIRECT host-op Ctx population (spec §5) ──────────────
     // A general EA-taking op (MOVE/ALU/imm/single-EA) whose EA is a full-format memory-
     // indirect mode routes through the engine: [LOAD.L pointer -> T0] then the host op at
@@ -2014,8 +2040,33 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       Mux(ucFpCtrlPopcount === U(2, 2 bits), byPop(2), byPop(1)))
     }
     val ucFpCtrlEntryMux = Mux(ucFpCtrlIsLoad, ucFpCtrlEntryFor(true), ucFpCtrlEntryFor(false))
+    // Task 14b: the store direction's own 18-way dispatch (format x EA bucket), generated
+    // straight from the SAME Scala table (`Microcode.fpStoreEntry`) the `scanLeft` over the
+    // row generators produced -- so this mux and the ROM's row layout cannot drift apart,
+    // exactly as Task 9b's `ucFpCtrlEntryFor` already does.
+    val ucFpStoreEntry = {
+      def e(bucket: Int, code: Int) =
+        U(Microcode.fpStoreEntry(bucket, Microcode.fpStoreFmtIdx(code)), ew bits)
+      def byBucket(code: Int) = Mux(ucFpCtrlPostinc, e(1, code),
+                                Mux(ucFpPredec,     e(2, code), e(0, code)))
+      ucFpSrcSpec.mux(
+        B"3'b000" -> byBucket(0),   // Long
+        B"3'b001" -> byBucket(1),   // Single
+        B"3'b010" -> byBucket(2),   // Extended
+        B"3'b100" -> byBucket(4),   // Word
+        B"3'b101" -> byBucket(5),   // Double
+        B"3'b110" -> byBucket(6),   // Byte
+        default   -> U(Microcode.FP_MEM_TRAP_ENTRY, ew bits))   // 011/111 Packed
+    }
+    // Ordering: the control-list gate wins first (opclass 100/101), then the store gate
+    // (opclass 011), then Task 6b's existing load routing. The three opclass tests are
+    // mutually exclusive, so this is a priority chain only for readability -- and
+    // `ucFpStoreOk` deliberately sits AHEAD of `ucFpMemBad` (which is True for every
+    // non-010 opclass, including 011) so an accepted store form reaches its real program
+    // while every rejected one still lands on the same vector-11 trap.
     val ucFpRealEntry = Mux(ucFpCtrlOk, ucFpCtrlEntryMux,
-      Mux(ucFpMemBad, U(Microcode.FP_MEM_TRAP_ENTRY, ew bits), ucFpRealEntryOk))
+      Mux(ucFpStoreOk, ucFpStoreEntry,
+      Mux(ucFpMemBad, U(Microcode.FP_MEM_TRAP_ENTRY, ew bits), ucFpRealEntryOk)))
     val ucRealEntry = Mux(ucIsFpMem, ucFpRealEntry,
       Mux(ucIsBfMemindRmw, ucBfMemindRmwEntry,
       Mux(ucIsBfMemindRd, ucBfMemindRdEntry,
