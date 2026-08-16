@@ -77,7 +77,7 @@ class IqSourcePlugin extends FiberPlugin {
       u.pFpDst  := io.pFpDst;  u.pFpDstValid  := io.pFpDstValid
       u.pFpccSrc := io.pFpccSrc; u.readsFpcc  := io.readsFpcc
       u.pFpccDst := io.pFpccDst; u.writesFpcc := io.writesFpcc
-      u.pFpOld   := 0; u.pFpccOld := 0    // rename bookkeeping only; the IQ never reads them
+      u.pFpOld   := 0; u.pFpccOld := 0; u.fpDstArch := 0    // rename bookkeeping only; the IQ never reads them
       // FP-generic op-identity fields (Task 4/6, `DecodedUop.fpuOp`/`fpSrcKind`/
       // `fpSrcFmt`/`fpWideImm`, carried VERBATIM through rename -- unlike `fpSrcAReg`/
       // `fpDstReg`/`usesFpSrcA`/`usesFpSrcB`, which rename replaces with the physical FP

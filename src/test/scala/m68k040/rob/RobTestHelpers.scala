@@ -50,10 +50,27 @@ class RenameCommitSinkPlugin extends FiberPlugin with RenameCommitService {
     val commitValidOut = out(Vec(Bool(), 2))
     val commitArchOut  = out(Vec(UInt(5 bits), 2))
     val commitOldOut   = out(Vec(UInt(6 bits), 2))
+    // FP data + FPCC commit fields (2026-08-16 FP-commit-path fix): the ROB is the
+    // ONLY producer of these, so a directed test needs them observable to prove the
+    // rename identity really threads RobPayload -> CommitSlot.
+    val commitFpArchOut  = out(Vec(UInt(3 bits), 2))
+    val commitFpNewOut   = out(Vec(UInt(4 bits), 2))
+    val commitFpOldOut   = out(Vec(UInt(4 bits), 2))
+    val commitFpWrOut    = out(Vec(Bool(), 2))
+    val commitFpccNewOut = out(Vec(UInt(4 bits), 2))
+    val commitFpccOldOut = out(Vec(UInt(4 bits), 2))
+    val commitFpccWrOut  = out(Vec(Bool(), 2))
     for (k <- 0 until 2) {
       commitValidOut(k) := commits(k).valid
       commitArchOut(k)  := commits(k).intArch
       commitOldOut(k)   := commits(k).intOld
+      commitFpArchOut(k)  := commits(k).fpArchDst
+      commitFpNewOut(k)   := commits(k).fpNew
+      commitFpOldOut(k)   := commits(k).fpOld
+      commitFpWrOut(k)    := commits(k).fpWrite
+      commitFpccNewOut(k) := commits(k).fpccNew
+      commitFpccOldOut(k) := commits(k).fpccOld
+      commitFpccWrOut(k)  := commits(k).fpccWrite
     }
     val flushOut = out(Bool())
     flushOut := flushP

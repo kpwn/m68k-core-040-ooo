@@ -165,6 +165,13 @@ case class RenamedUop() extends Bundle {
   val pFpSrcA = UInt(fpW bits); val psrcAFpValid = Bool()
   val pFpSrcB = UInt(fpW bits); val psrcBFpValid = Bool()
   val pFpDst  = UInt(fpW bits); val pFpDstValid  = Bool(); val pFpOld = UInt(fpW bits)
+  // Architectural FP dst reg 0..7 (from DecodedUop.fpDstReg) -- the EXACT FP analog of
+  // `dstArch` above, and needed for the same reason: the fpRat COMMIT port is addressed
+  // by the ARCHITECTURAL register, so the ROB must carry it from rename to retire.
+  // (Without it the ROB could thread fpNew/fpOld to commit but had no address to commit
+  // them AT -- the FP RAT's committed mapping would never advance past the reset
+  // identity seed, and every flush would silently revert all architectural FP state.)
+  val fpDstArch = UInt(3 bits)
   // FPCC rename (Decision 4: N/Z/I/NAN, 16 physical, 4-bit tags -- mirrors NZVC/X
   // exactly: archDepth=1, a single architectural condition-code group).
   val pFpccSrc = UInt(fpW bits); val readsFpcc  = Bool()

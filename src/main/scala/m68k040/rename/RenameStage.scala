@@ -117,7 +117,16 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     val uopsPort = Stream(Vec(RenamedUop(), 2))
 
     // Stream handshake / init gating
-    val freeReady = intFree.io.popReady && nzvcFree.io.popReady && xFree.io.popReady
+    // EVERY freelist rename can pop from this cycle must be in this gate. Omitting one
+    // is a SILENT-CORRUPTION bug, not a throughput bug: Freelist.io.pop(k).id is a bare
+    // `ram.readAsync(head + ...)` with no internal underflow guard, so an un-gated pop
+    // from an exhausted pool hands out an id that is STILL LIVE (and underflows `count`),
+    // putting two in-flight uops on the same physical register. fpFree/fpccFree were
+    // missing here when Task 2 landed them; fpFree starts with only 8 free physical FP
+    // registers (physCount=16, archCount=8), so any sustained FP-using program hit it
+    // almost immediately once Task 8 gave writesFp a real producer.
+    val freeReady = intFree.io.popReady && nzvcFree.io.popReady && xFree.io.popReady &&
+                    fpFree.io.popReady && fpccFree.io.popReady
     // freeReady must gate the OUTPUT valid as well as the input ready. Otherwise a
     // downstream consumer (DispatchPlugin) that does not itself observe freeReady
     // could fire on uopsPort while du.uops does NOT fire (freeReady low) — the
@@ -283,6 +292,9 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.pFpSrcB      := fpRat.io.reads(2 * s + 1).data
       r.psrcBFpValid := dec.usesFpSrcB
       r.pFpOld       := fpRat.io.reads(4 + s).data
+      // architectural FP dst reg (threaded for the commit-time fpRat commit ADDRESS --
+      // the FP analog of `r.dstArch := dec.dstReg` above)
+      r.fpDstArch    := dec.fpDstReg
       fpFree.io.pop(s).take := slotEn && dec.writesFp
       r.pFpDst       := fpFree.io.pop(s).id
       r.pFpDstValid  := dec.writesFp
@@ -338,6 +350,11 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     uopsPort.payload.foreach { p =>
       spinal.core.sim.SimPublic(p.pc, p.dstArch, p.pdst, p.pdstOld, p.pdstValid,
                                 p.psrcA, p.psrcB, p.psrcC)
+      // FP/FPCC rename identity (same zero-synth-cost debug convention as the int
+      // fields above): the FP-commit-path regression tests read the tag rename
+      // ACTUALLY allocated this cycle to prove distinctness / commit round-tripping.
+      spinal.core.sim.SimPublic(p.pFpDst, p.pFpDstValid, p.pFpOld, p.fpDstArch,
+                                p.pFpccDst, p.writesFpcc, p.pFpccOld, p.pFpSrcA, p.pFpccSrc)
     }
 
     // ── Commit + init mux on intRat.commits(0) ─────────────────────────────────

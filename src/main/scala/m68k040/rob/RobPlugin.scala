@@ -60,6 +60,21 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val intNew     = UInt(6 bits); val intOld = UInt(6 bits); val intWrite = Bool()
     val nzvcNew    = UInt(4 bits); val nzvcOld = UInt(4 bits); val nzvcWrite = Bool()
     val xNew       = UInt(4 bits); val xOld = UInt(4 bits); val xWrite = Bool()
+    // FP data + FPCC commit/free info -- the EXACT analog of the int (archRegId/intNew/
+    // intOld/intWrite) and NZVC/X (nzvcNew/nzvcOld/nzvcWrite) groups above, and required
+    // for the same reason: `CommitSlot` carries these to RenameStage's fpRat commit port
+    // and fpFree push port, and the ROB is the only thing that knows the rename identity
+    // at RETIRE time. They were missing until 2026-08-16 (Task 2 added the CommitSlot
+    // fields but the ROB drove them to inert False/0 defaults "no producer yet"), which
+    // meant an FP writer's new phys tag NEVER entered the committed FP RAT and its old
+    // phys tag NEVER returned to fpFree -- so fpRat.io.rollback (asserted on every branch
+    // mispredict / exception) silently reverted all architectural FP state to the reset
+    // identity mapping, and the 8-deep fpFree pool drained permanently.
+    // fpArchDst mirrors archRegId (the fpRat commit ADDRESS); FPCC needs no address field
+    // (archDepth=1, address hardwired to 0 -- same as nzvc/x).
+    val fpArchDst  = UInt(3 bits)
+    val fpNew      = UInt(4 bits); val fpOld = UInt(4 bits); val fpWrite = Bool()
+    val fpccNew    = UInt(4 bits); val fpccOld = UInt(4 bits); val fpccWrite = Bool()
     val retireAlone = Bool()
     // ── LUT-reduction B1: alloc-only per-entry state folded in ─────────────────
     // These 8 fields used to be standalone `Vec.fill(depth)(RegInit(...))` arrays
@@ -469,6 +484,15 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       p.intNew     := u.pdst;     p.intOld := u.pdstOld;   p.intWrite  := u.pdstValid
       p.nzvcNew    := u.pNzvcDst; p.nzvcOld := u.pNzvcOld;  p.nzvcWrite := u.writesNzvc
       p.xNew       := u.pXDst;    p.xOld := u.pXOld;        p.xWrite    := u.writesX
+      // FP data + FPCC: thread the ALREADY-DECIDED rename identity through to retire.
+      // The ROB is NOT a second source of truth here -- it never re-derives a tag; the
+      // FP PRF write itself happens at COMPLETION (DivEuPlugin's FP writeback lane, which
+      // writes RegFilePluginFp at this same u.pFpDst), and these fields only drive the
+      // commit-time fpRat/fpccRat committed-mapping update + the fpFree/fpccFree push of
+      // the OLD tag. Exactly the int/NZVC/X split above.
+      p.fpArchDst  := u.fpDstArch
+      p.fpNew      := u.pFpDst;   p.fpOld := u.pFpOld;      p.fpWrite   := u.pFpDstValid
+      p.fpccNew    := u.pFpccDst; p.fpccOld := u.pFpccOld;  p.fpccWrite := u.writesFpcc
       // A faulted µop AND an RTE retire ALONE (precise / serializing): they must be
       // the head and the only retirer this cycle. (`faulted` still lives in a RegInit
       // per-entry Vec — faultedStore — reset per-alloc like mispredictStore. `isRte`
@@ -684,13 +708,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     for (k <- 0 until 2) {
       rc.commitPorts(k).valid := False
       rc.commitPorts(k).payload.assignDontCare()
-      // FP/FPCC commit fields have no producer yet (Task 6/8, ROB FP payload not
-      // landed) -- assignDontCare above leaves them 'bx in the netlist, but
-      // RenameStage's fpFree/fpRat consumers gate only on commitPorts(k).valid &&
-      // ...fpWrite, and commitPorts(k).valid is True on essentially every commit,
-      // not just FP ones. Tie these specific fields to concrete inert defaults
-      // (mirrors branchCompletion's payload-field convention above) so the
-      // currently-always-false fpWrite/fpccWrite gates are genuinely false in the
+      // FP/FPCC commit-field IDLE defaults. `driveCommit` below overrides them with the
+      // retiring entry's real values; these defaults matter because assignDontCare above
+      // leaves them 'bx in the netlist, while RenameStage's fpFree/fpRat consumers gate
+      // only on commitPorts(k).valid && ...fpWrite -- and commitPorts(k).valid is True on
+      // essentially every commit, not just FP ones. Concrete inert defaults keep the
+      // non-FP commit paths (and the sysRead commit below) genuinely false in the
       // synthesizable netlist, not merely false-by-2-state-simulator-luck.
       rc.commitPorts(k).fpArchDst := U(0, 3 bits)
       rc.commitPorts(k).fpNew     := U(0, 4 bits)
@@ -715,6 +738,13 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       rc.commitPorts(k).xNew      := p.xNew
       rc.commitPorts(k).xOld      := p.xOld
       rc.commitPorts(k).xWrite    := p.xWrite
+      rc.commitPorts(k).fpArchDst := p.fpArchDst
+      rc.commitPorts(k).fpNew     := p.fpNew
+      rc.commitPorts(k).fpOld     := p.fpOld
+      rc.commitPorts(k).fpWrite   := p.fpWrite
+      rc.commitPorts(k).fpccNew   := p.fpccNew
+      rc.commitPorts(k).fpccOld   := p.fpccOld
+      rc.commitPorts(k).fpccWrite := p.fpccWrite
 
       traceFireVec(k)          := True
       traceVec(k).fire         := True
@@ -1245,6 +1275,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       rc.commitPorts(0).intWrite  := p0.intWrite
       rc.commitPorts(0).nzvcWrite := False
       rc.commitPorts(0).xWrite    := False
+      // A sysOp (MOVE-USP / MOVEC) never writes FP or FPCC; state it EXPLICITLY here for
+      // the same reason nzvcWrite/xWrite are stated -- this block last-wins over
+      // driveCommit, so an FP-writing entry that somehow reached this path must not leak
+      // a spurious fpFree push / fpRat commit.
+      rc.commitPorts(0).fpWrite   := False
+      rc.commitPorts(0).fpccWrite := False
     }
 
     // ── RTE CCR restore -> REAL flags PRF: NOT handled here (task #176-regression) ──

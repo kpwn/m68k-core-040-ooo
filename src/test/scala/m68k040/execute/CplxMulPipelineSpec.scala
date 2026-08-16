@@ -193,7 +193,7 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       // this spec is an FP uop. Inert values -- op is never DecOp.FPU here.
       uop.pFpSrcA := 0; uop.psrcAFpValid := False
       uop.pFpSrcB := 0; uop.psrcBFpValid := False
-      uop.pFpDst := 0; uop.pFpDstValid := False; uop.pFpOld := 0
+      uop.pFpDst := 0; uop.pFpDstValid := False; uop.pFpOld := 0; uop.fpDstArch := 0
       uop.pFpccSrc := 0; uop.readsFpcc := False
       uop.pFpccDst := 0; uop.writesFpcc := False; uop.pFpccOld := 0
       uop.fpuOp := 0; uop.fpSrcKind := m68k040.decode.FpSrcKind.FPREG

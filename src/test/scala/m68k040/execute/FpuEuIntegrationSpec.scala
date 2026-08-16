@@ -158,7 +158,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       uop.pXDst := 0; uop.writesX := False; uop.pXOld := 0
       uop.pFpSrcA := iPFpSrcA; uop.psrcAFpValid := True
       uop.pFpSrcB := iPFpSrcB; uop.psrcBFpValid := True
-      uop.pFpDst := iPFpDst; uop.pFpDstValid := iWritesFp; uop.pFpOld := 0
+      uop.pFpDst := iPFpDst; uop.pFpDstValid := iWritesFp; uop.pFpOld := 0; uop.fpDstArch := 0
       uop.pFpccSrc := 0; uop.readsFpcc := False
       uop.pFpccDst := iPFpccDst; uop.writesFpcc := True; uop.pFpccOld := 0
       uop.fpuOp := iFpuOp
