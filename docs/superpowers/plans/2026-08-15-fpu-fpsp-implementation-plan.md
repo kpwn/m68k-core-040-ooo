@@ -10034,6 +10034,176 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 ---
 
+### Task 14c: Wire FPCR rounding-mode/exception-enable into the FP EU (NEW, post-Task-14)
+
+**Why this task exists.** Task 14's ported-test-corpus triage (corrected, see
+`docs/superpowers/sdd/2026-08-15-fpu-ported-test-triage.md`) confirmed a real, previously-
+flagged gap: `DivEuPlugin.scala`'s `fpRmodeIn`/`fpExcEnableIn` ports are declared, defaulted
+(`RN`, all-traps-clear), and explicitly commented as "THIS IS THAT TASK'S INTEGRATION POINT" —
+but nothing drives them. `FpuControlPlugin` (Task 9) already exposes exactly the values needed
+(`roundingMode`/`excEnable`, live reads of `FPCR[5:4]`/`FPCR[15:8]`) and has had zero consumers
+since Task 9 landed (confirmed by that task's own review). Every FP op today computes as if
+FPCR were permanently reset — round-to-nearest, every exception trap disabled — regardless of
+what the user actually programs into FPCR. This task closes that gap. Task 9's own report
+explicitly recommended scheduling this "before the FPSP integration tasks."
+
+A sibling, smaller gap in the same area: `FpuControlPlugin.orFpsrExc` (the FP EU's exception-
+status accrual OR-in port) also has zero producer. This task closes that too, since it's the
+same integration point and the same EU.
+
+**Placement.** After Task 14, before Task 15 (protocol tests) — Task 15's own protocol tests
+should exercise a genuinely rounding-mode-aware, trap-capable FP EU, not the current
+hardcoded-RN/no-traps stand-in.
+
+---
+
+## Files
+
+- Modify: `src/main/scala/m68k040/top/FullCoreSynth.scala` (the actual wiring — this is a
+  top-level connection task, not new logic).
+- Modify (if the investigation in Step 1 finds it's needed): `src/main/scala/m68k040/execute/fpu/FpuCore.scala` — see Step 1's flagged open question about FPCR's precision field.
+- Test (modify): `src/test/scala/m68k040/execute/FpuEuIntegrationSpec.scala` (or wherever
+  Task 8's own directed EU-integration tests for `fpRmodeIn`/`fpExcEnableIn` currently live —
+  confirm the real file).
+- Test (modify): `src/test/scala/m68k040/lockstep/FpuLockStepSpec.scala` — Task 13's own suite
+  already contains at least one test (`FCMP inf,inf` sign-of-zero case) whose expected FPSR
+  behavior depends on a non-default rounding mode; confirm whether any existing test needs a
+  rounding-mode POKE added, or whether new directed tests are needed for RZ/RM/RP specifically.
+
+## Interfaces
+
+- Consumes: `FpuControlService.roundingMode`/`.excEnable`/`.orFpsrExc` (Task 9, already
+  landed, zero consumers until this task); `DivEuPlugin.fpRmodeIn`/`.fpExcEnableIn` (Task 8,
+  already landed, zero drivers until this task).
+- Produces: nothing new at the service level — pure top-level wiring (plus, conditionally, a
+  real `FpuCore` hardware capability if Step 1's investigation finds `precision` genuinely
+  needs one).
+
+---
+
+## Steps
+
+- [ ] **Step 1: Confirm the real wiring shape, and resolve the FPCR-precision open question
+  before writing any code**
+
+Read the real current `DivEuPlugin.scala` (`fpRmodeIn`/`fpExcEnableIn`'s declarations and the
+comment naming this exact integration point — confirm line numbers directly, do not trust any
+number cited in this brief) and `FullCoreSynth.scala`'s existing wiring block for `divEu`
+(alongside wherever `mmuCtrl`/other `host[...Service]`-sourced signals are already wired into
+EU inputs — mirror that established pattern).
+
+**Real, open question this task must resolve, not guess past**: `FpuCore.scala`'s only FPCR-
+derived input is `io.rmode` (2 bits, `FPCR[5:4]`) — there is **no** `precision` input anywhere
+in `FpuCore`'s real current interface. `FpuControlService.precision` (`FPCR[7:6]`, the
+68881/68882-heritage "force single/double intermediate rounding precision" field) is declared
+and read-accessible but has no hardware consumer AT ALL, not even a stub — this is different in
+kind from `rmode`/`excEnable`, which have real, ready, currently-unwired hardware hooks.
+**Before implementing, determine**: does the real MC68040 FPU actually implement FPCR's
+precision-control field with functional effect on internally-extended-precision hardware (the
+68040, unlike the 68881/68882, computes everything in the same internal extended-precision
+datapath the design's own Decision 1 already commits to — confirm from the real MC68040 User's
+Manual whether the precision field on THIS specific CPU generation is genuinely functional, or
+whether it's RAZ/WI / a legacy field with no effect since the internal format doesn't change)?
+- If the manual confirms the 68040 does NOT functionally implement precision-forcing (likely,
+  given Decision 1's own architecture), **this task's scope is `rmode`/`excEnable`/`orFpsrExc`
+  only** — wire `FpuControlService.precision` nowhere (it stays a dead, unused accessor,
+  exactly matching real silicon), and record this finding explicitly (with the real manual
+  citation) rather than silently doing nothing without explanation.
+- If the manual says otherwise, that is a real, separate, larger finding (a genuine `FpuCore`
+  hardware gap, not a wiring gap) — do NOT attempt to add precision-forcing hardware inside
+  this task's scope; stop, characterize the gap precisely (what real behavior is missing, which
+  ops it would affect), and hand it off as its own follow-up finding, exactly like this
+  project's established practice for any bucket-(c)-class discovery mid-task.
+
+- [ ] **Step 2: Wire `fpRmodeIn`/`fpExcEnableIn` in `FullCoreSynth.scala`**
+
+```scala
+// src/main/scala/m68k040/top/FullCoreSynth.scala
+// Alongside the existing divEu wiring block:
+        divEu.fpRmodeIn     := fpuCtrl.logic.roundingMode
+        divEu.fpExcEnableIn := ??? // confirm FpExcFlags' real field layout against
+                                   // FpuControlService.excEnable's real bit-order comment
+                                   // ("FPCR[15:8], in FpExcFlags field order") before wiring —
+                                   // this is a real Bits->Bundle conversion, not a raw
+                                   // assignment; get the real field mapping from FpExcFlags'
+                                   // own definition (grep it) rather than assuming a naive
+                                   // bit-position match.
+```
+(Placeholder shown deliberately incomplete — the real `FpExcFlags` bundle's field order and
+whether it needs an explicit per-bit assignment or has an existing `Bits`-to-bundle helper is
+something to confirm against the real current type definition, not invent.)
+
+- [ ] **Step 3: Wire `orFpsrExc`**
+
+`FpuControlPlugin.orFpsrExc` (`Flow[Bits(8 bits)]`, the FP EU's exception-status accrual OR-in
+port) needs a real producer from `DivEuPlugin`'s own FP completion path — confirm what signal
+inside `DivEuPlugin` already carries the per-op `FpResult.exc.*` flags (Task 7's `FpuCore`
+output, already threaded through `DivEuPlugin`'s FP completion register per Task 8's own
+landed work) and wire it, valid on the same cycle an FP op's result is captured. This is the
+fold Task 9's `FpuControlPlugin.aexcOf` already implements (EXC → AEXC, confirmed correct
+against the MC68040 UM in Task 9's own Step 12) — this task only needs to supply the EXC byte
+itself, not touch the fold logic.
+
+- [ ] **Step 4: Directed tests — rounding mode actually changes results**
+
+Add at least one directed test per non-default rounding mode (RZ, RM, RP) proving the FP EU's
+output genuinely differs from the RN default for an inexact result — e.g. a value whose
+correctly-rounded RN result differs from its RZ/RM/RP result by one ULP (Task 7's own
+`FpuCoreSpec`/`FpRefModel` already has vectors of exactly this shape for the arithmetic core in
+isolation; this task's job is proving the SAME rounding-mode-dependent behavior is reachable
+end-to-end through a real `FMOVE.L #imm,FPCR` write followed by a real FP op, not re-deriving
+the arithmetic). Confirm `fpu_fcmp_fpcc_sign_of_zero` (the Task 14 bucket-(c) finding whose
+root cause is exactly this gap) now passes, or if it still fails for a different reason,
+report that clearly.
+
+- [ ] **Step 5: Directed test — exception-enable actually gates escalation**
+
+Confirm an FP op that would substitute (not trap) with the enable bit clear genuinely DOES
+escalate to a real fault (the existing `fpFault`/`fpFaultCompletion` path, already wired by
+Task 8/9/11's landed work) once the corresponding `FPCR` enable bit is set. Reuse Task 8's own
+already-established `fpEscalation`/`FpVector` machinery (`FpVector.Dz=50`/`Unfl=51`/`Operr=52`/
+`Ovfl=53`/`Snan=54` — confirm these are the real current values) — this task is wiring the
+GATE, not building new escalation logic. Confirm `fpu_divbyzero_exception` still correctly
+fails on its own separately-documented issue (the test's own expectation of vector 49, which
+this project's Decision 7 already confirms is m68k-ooo's own bug — real vector is 50) even
+after this task's fix closes the wiring gap — i.e. this task should make the FDIV-by-zero
+genuinely TRAP now (where before it silently substituted), but the vendored test's own wrong
+expected-vector assertion means it stays a documented non-conformant test, not a new pass.
+Record this explicitly rather than being surprised by it.
+
+- [ ] **Step 6: Run the full regression suite**
+
+```bash
+sbt "testOnly m68k040.lockstep.FpuLockStepSpec"
+sbt "testOnly m68k040.exception.FsaveFrestoreSpec"
+sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
+sbt fastTest
+sbt "testOnly m68k040.fuzz.PortedM68kOooSpec -- -z fpu_divbyzero -z fpu_fcmp_fpcc_sign_of_zero"
+```
+Confirm the real current lock-step baseline directly before this task. This task changes real
+FP-EU computation behavior (rounding mode is no longer always RN) — run the FULL
+`FpuLockStepSpec` suite, not just the two directly-targeted tests, since a previously-passing
+test that happened to only exercise RN-equivalent cases must still pass, and any that
+implicitly relied on the old hardcoded-RN behavior (there should be none, since Task 13's own
+suite is bit-exact against Musashi which always used the real rounding mode) would be a real
+regression to report, not paper over.
+
+Given this task changes real FP-EU RTL behavior (not just wiring metadata), run a real OOC
+synth gate — check machine load first per the standing rule — and report the real number,
+following this project's standing per-slice gate discipline.
+
+- [ ] **Step 7: Commit**
+
+Reference Task 14's triage doc and Task 9's own report (which first flagged this gap) in the
+commit message. Record the real Step 1 finding (precision field in/out of scope, with citation)
+prominently — this is a real, load-bearing architectural fact for anyone touching FPCR later.
+
+```
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+```
+
+---
+
 ### Task 15: Protocol-level EU tests (`FpuProtocolSpec.scala`)
 
 **Why:** the ported instruction corpus (Task 14) cannot substitute for protocol-level
