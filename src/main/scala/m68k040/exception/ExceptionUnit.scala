@@ -117,7 +117,14 @@ class ExceptionUnit(
     // system VALUE into PRF[pdst]. (An arbitrary Rn is renamed, unlike the identity A7.)
     sysDstPhys:   UInt = U(0, 6 bits),
     sysPc:        UInt = U(0, 32 bits),
-    sysNextPc:    UInt = U(0, 32 bits)) extends Area {
+    sysNextPc:    UInt = U(0, 32 bits),
+    // Task 11: the ROB head's per-entry "this is a RECOGNIZED-but-unsupported FP op
+    // awaiting software completion" bit + its command word (Task 10's
+    // `fpuSoftwareComplete` / `fpuCmdWord`, stored at alloc). Read ONLY at vector-11
+    // delivery, to latch the state a later FSAVE turns into the unimplemented-instruction
+    // frame. Defaulted so every standalone unit DUT needs no change.
+    entryFpuUnimp: Bool = False,
+    entryFpuCmd:   Bits = B(0, 16 bits)) extends Area {
 
   // ── exposed D-cache request ports (wiring MUXes them onto the real cache) ────
   val dcLoadCmd  = Stream(DLoadCmd())
@@ -161,12 +168,94 @@ class ExceptionUnit(
   val icMaintPulse = Bool(); icMaintPulse := False
 
   // ── exposed D-side translation request (wiring MUXes it onto DTranslationService) ─
+  // LEGACY, I-SIDE-SHAPED, AND UNCONSUMED. `dtReq`/`dtRsp` are `TranslationReq`/
+  // `TranslationRsp` -- the COMBINATIONAL, UNTAGGED I-side bundle family. No DUT in this
+  // project has ever wired them (confirmed: zero references outside this file), and they
+  // are structurally incapable of talking to the real D-side `DTranslationService`, whose
+  // contract is `Stream[DTranslationCmd]`/`Stream[DTranslationRsp]` plus an 8-bit token
+  // to match responses across an elastic pipeline. They are kept only because the
+  // existing frame/vector states drive `dtoVld`/`dtoVpn` into them; the REAL D-side
+  // acquisition Task 11 added for FSAVE/FRESTORE is `dxReq*`/`dxRsp*` below.
   val dtReq = TranslationReq()
   val dtRsp = TranslationRsp()
   dtRsp.ready.allowOverride;     dtRsp.ready := True
   dtRsp.ppn.allowOverride;       dtRsp.ppn := U(0, 20 bits)
   dtRsp.cacheMode.allowOverride; dtRsp.cacheMode.assignDontCare()
   dtRsp.fault.allowOverride;     dtRsp.fault := False
+
+  // ── REAL D-side DTLB acquisition (Task 11) ───────────────────────────────────
+  // FSAVE's frame stores and FRESTORE's header load are the FIRST exception-sequencer
+  // memory accesses that are genuinely VIRTUAL: every pre-existing one (entry frames,
+  // RTE pops, vector fetches) is identity-physical by construction. So this unit needs a
+  // real translation, and gets one by TIME-MULTIPLEXING the single `DTranslationService`
+  // port -- which is deliberately single-producer by design -- via the already-proven
+  // `excActive` MUX. `LsEuPlugin` already fully idles its own claim for the entire
+  // duration `excActive` is held (`xlate.req.valid := !excActive && ...`, and
+  // `xlate.rsp.ready := ... || excActive || ...`), exactly like it already hands the
+  // D-cache load/store command ports themselves over; the wiring extends that same MUX.
+  //
+  // Flattened into plain signals rather than a `Stream`, matching how `excLoadCmd*`/
+  // `excStore*` already cross into `LsEuPlugin` as loose `var`s.
+  val dxReqValid = Bool();        dxReqValid := False;         dxReqValid.simPublic()
+  val dxReqVpn   = UInt(20 bits); dxReqVpn   := U(0, 20 bits); dxReqVpn.simPublic()
+  val dxReqWrite = Bool();        dxReqWrite := False
+  /** Back-pressure from `DTranslationService.req.ready`, routed through the LS EU's MUX.
+    * Defaults True -- the "no consumer wired, don't block" convention this file already
+    * uses for `maintDoneIn`/`sqDrained`/`dcQuiesced` -- so a standalone DUT with no DTLB
+    * never hangs in a translation-request state. */
+  val dxReqReady = Bool(); dxReqReady.allowOverride; dxReqReady := True; dxReqReady.simPublic()
+
+  /** Registered, tagged translation response, wired STRAIGHT from
+    * `DTranslationService.rsp` (not through the LS EU) -- byte-for-byte how `dcLoadRsp`
+    * is already wired straight from `DcacheService.loadRsp` while only the COMMAND side
+    * goes through the LS EU's MUX.
+    *
+    * Defaults implement an IDENTITY translation that resolves in the very next cycle:
+    * `valid` True, `ppn` echoing the VPN this unit last requested, `fault` False. That is
+    * the same graceful degradation `maintDoneIn := True` provides, and it makes a
+    * standalone ExceptionUnit DUT behave exactly like the MMU-off identity case. */
+  val dxRspValid = Bool();        dxRspValid.allowOverride
+  val dxRspPpn   = UInt(20 bits); dxRspPpn.allowOverride
+  val dxRspFault = Bool();        dxRspFault.allowOverride
+  val dxRspToken = UInt(m68k040.cache.DTranslationToken.Width bits); dxRspToken.allowOverride
+
+  /** The token this unit stamps on every translation request it issues.
+    *
+    * `DTranslationToken`'s documented composition is `{backendEpoch, splitPhase,
+    * robId[5:0]}`, and an ExceptionUnit-originated request has no natural `robId`. This
+    * mirrors the ALREADY-ESTABLISHED sibling convention on the D-cache side, where
+    * `DLoadToken`'s own doc comment reserves "[7] source (0 = LS ROB, 1 = serializing
+    * exception unit)" and this unit stamps `U(0x80)` on `dcLoadCmd.payload.token`. So:
+    * bit[7] = 1 (source = exception unit), bits[6:0] = 0.
+    *
+    * The token is NOT what makes response matching correct, and this is deliberate --
+    * `LsEuPlugin` can in principle produce the same 8-bit value, since all 64 robIds and
+    * both epoch/split bits are reachable. The REAL guarantee is structural, and holds
+    * without any token at all:
+    *   (a) `xlate.req.valid := !excActive && ...` -- the LS pipe issues NO translation
+    *       request for the entire duration of an episode, so nothing new can be launched
+    *       alongside ours;
+    *   (b) `DtlbPlugin` is strictly SINGLE-OUTSTANDING -- `_req.ready := !missPending &&
+    *       (!rspValid || _rsp.ready) && !flushAll` -- so it cannot accept our request
+    *       while a walk is in flight;
+    *   (c) `xlate.rsp.ready` is forced True while `excActive`, so any pre-episode
+    *       straggler response is RETIRED in (at the latest) the same cycle our request
+    *       fires, under DtlbPlugin's own documented accept-last ordering.
+    * Therefore the first response observed AFTER `dxReqValid && dxReqReady` is ours. The
+    * token match below is defence in depth against that argument being invalidated by a
+    * future multi-outstanding DTLB, and the constant gives such a change an obvious hook.
+    */
+  val ExcDtlbToken = 0x80
+
+  /** VPN of the translation request currently outstanding (latched on request fire).
+    * Also the source of the unwired-DUT identity default just below. */
+  val dxPendVpn = Reg(UInt(20 bits)) init 0
+  dxRspValid := True
+  dxRspPpn   := dxPendVpn
+  dxRspFault := False
+  dxRspToken := U(ExcDtlbToken, m68k040.cache.DTranslationToken.Width bits)
+  /** True on the cycle the outstanding request's OWN response is on the bus. */
+  val dxRspMine = dxRspValid && (dxRspToken === U(ExcDtlbToken, m68k040.cache.DTranslationToken.Width bits))
 
   // `active` is high whenever the FSM is mid-sequence; the wiring gates the MUX on it.
   val active = Bool()
@@ -198,6 +287,17 @@ class ExceptionUnit(
       override def roundingMode = B(0, 2 bits)
       override def precision    = B(0, 2 bits)
       override def excEnable    = B(0, 8 bits)
+      // Task 11. A standalone DUT with no FpuControlPlugin reports "no FP op has ever
+      // executed and nothing is pending", so an FSAVE there emits the NULL frame — the
+      // same all-idle degradation every other member of this null object provides.
+      override def everExecuted    = False
+      override def setEverExecuted = { val f = Flow(Bool()); f.valid := False; f.payload := False; f }
+      override def uiValid         = False
+      override def uiCmdReg1B      = B(0, 16 bits)
+      override def uiSrcOperand    = B(0, 80 bits)
+      override def uiDstOperand    = B(0, 80 bits)
+      override def setUnimpFrame   = { val f = Flow(Bits(176 bits)); f.valid := False; f.payload := B(0, 176 bits); f }
+      override def clearUnimp      = { val f = Flow(Bool()); f.valid := False; f.payload := False; f }
     }
   // ORDERING GUARD (loud, elaboration-time). Everything below reads `fpuCtrl.fpcr/.fpsr/
   // .fpiar` EAGERLY (the FPSR-read splice `fpsrArch` is a plain `val`, and the S_APPLY mux
@@ -217,6 +317,10 @@ class ExceptionUnit(
   private val setFpcrPort  = fpuCtrl.setFpcr
   private val setFpsrPort  = fpuCtrl.setFpsr
   private val setFpiarPort = fpuCtrl.setFpiar
+  // Task 11: same bind-once discipline, same reason.
+  private val setEverExecutedPort = fpuCtrl.setEverExecuted
+  private val setUnimpFramePort   = fpuCtrl.setUnimpFrame
+  private val clearUnimpPort      = fpuCtrl.clearUnimp
 
   // Live COMMITTED FPCC, read back from the FPCC PRF at its committed arch->phys mapping
   // by the full-core wiring -- byte-for-byte the `committedA7In` pattern above (an
@@ -226,6 +330,26 @@ class ExceptionUnit(
   // (RegfileSpec.Fpcc's own doc); architectural FPSR[27:24] = {N, Z, I, NaN} is the
   // REVERSED presentation of that group.
   val committedFpccIn = Bits(4 bits); committedFpccIn.allowOverride; committedFpccIn := B(0, 4 bits)
+
+  // ── Task 11: committed FP operand readbacks for the unimplemented-instruction frame ──
+  // Same optional-input pattern as `committedA7In`/`committedFpccIn`: a full-core wiring
+  // may read the FP PRF at the committed arch->phys mapping for the SOURCE FPm and
+  // DESTINATION FPn named by the captured command word, and drive them here. A DUT that
+  // does not wire them leaves the frame's operand fields zero, which degrades exactly
+  // where the missing dependency is -- the frame still carries a correct header, a correct
+  // length code and a correct CMDREG1B, which is what actually routes the FPSP.
+  //
+  // NOT WIRED IN ANY DUT AS OF THIS TASK, deliberately and explicitly: Task 1's FP regfile
+  // has no committed-mapping read port exposed at this site yet. Both inputs therefore sit
+  // at their zero defaults, STAG/DTAG read as "Zero" (001) and the ETEMP/FPTEMP fields are
+  // zero. Wiring them is a pure addition when that read port lands.
+  val committedFpSrcIn = Bits(80 bits); committedFpSrcIn.allowOverride; committedFpSrcIn := B(0, 80 bits)
+  val committedFpDstIn = Bits(80 bits); committedFpDstIn.allowOverride; committedFpDstIn := B(0, 80 bits)
+  /** The FP register numbers the captured command word names, exposed so a future wiring
+    * can address the FP RAT with them. CMDREG1B layout (MC68040 UM Figure 9-8, 1989 1st
+    * ed. p.9-33): [15:13] OPCLASS, [12:10] SRC (Rx), [9:7] DST (Ay), [6:0] OPMODE. */
+  val fpuSrcArch = entryFpuCmd(12 downto 10).asUInt; fpuSrcArch.simPublic()
+  val fpuDstArch = entryFpuCmd(9 downto 7).asUInt;   fpuDstArch.simPublic()
   // Architectural FPSR WRITE -> the renamed FPCC's committed physical register. Mirrors
   // rteNzvcWriteValid/rteNzvcWriteData EXACTLY (see its doc comment below for the full
   // argument for why a DIRECT committed-mapping write is required and a rename allocation
@@ -611,6 +735,11 @@ class ExceptionUnit(
   val ldoVld   = Bool();        ldoVld := False
   val ldoVaddr = UInt(32 bits); ldoVaddr := U(0, 32 bits)
   val ldoSize  = Size();        ldoSize := Size.LONG
+  // Task 11: the PHYSICAL address of the load. Every pre-existing exception-sequencer
+  // load is identity-physical, so this defaults to `ldoVaddr` and those states are
+  // byte-for-byte unchanged; only FRESTORE's header read (whose address is genuinely
+  // virtual) overrides it with a real DTLB-translated PA.
+  val ldoPaddr = UInt(32 bits); ldoPaddr := ldoVaddr
   // This is a real Stream source, not a delayed pulse. A plain RegNext(ldoVld)
   // leaves valid asserted for one tail cycle after the request state observes
   // fire. The former II=3 D-cache masked that protocol violation with ready=0;
@@ -618,12 +747,15 @@ class ExceptionUnit(
   // words). Capture once and hold the complete payload until the actual handshake.
   val ldoValidReg = RegInit(False)
   val ldoVaddrReg = Reg(UInt(32 bits))
+  val ldoPaddrReg = Reg(UInt(32 bits))
   val ldoSizeReg  = Reg(Size())
   val ldoCmodeReg = Reg(m68k040.cache.CacheMode())
   dcLoadCmd.valid         := ldoValidReg
   dcLoadCmd.payload.vaddr := ldoVaddrReg
-  // exception sequencer runs MMU-off (identity, slice-1): paddr == vaddr.
-  dcLoadCmd.payload.paddr := ldoVaddrReg
+  // Identity (paddr == vaddr) for every pre-existing exception-sequencer load, because
+  // `ldoPaddr` defaults to `ldoVaddr`; FRESTORE's header read supplies a real
+  // DTLB-translated PA here instead (Task 11).
+  dcLoadCmd.payload.paddr := ldoPaddrReg
   dcLoadCmd.payload.size  := ldoSizeReg
   // Identity-physical, same rationale (and same DE=0 fix) as dcStore.payload.cacheMode
   // above -- this is in fact the ALLOCATING half of that coherency hole.
@@ -640,6 +772,7 @@ class ExceptionUnit(
   when(ldoVld && !ldoValidReg) {
     ldoValidReg := True
     ldoVaddrReg := ldoVaddr
+    ldoPaddrReg := ldoPaddr
     ldoSizeReg  := ldoSize
     ldoCmodeReg := excCacheMode
   }
@@ -738,6 +871,125 @@ class ExceptionUnit(
     out
   }
 
+  // ══ FSAVE / FRESTORE state frames (Task 11) ═══════════════════════════════════
+  //
+  // PRIMARY SOURCE for every offset and every field position below (Step 2, executed --
+  // this is a transcription off the rendered figure, not a derivation):
+  //   MC68040 User's Manual, 1989 FIRST EDITION, section 9.7 "Floating-Point State
+  //   Frames", **Figure 9-7 "Floating-Point State Frames (Sheet 2 of 2)", page 9-32**,
+  //   with the field SEMANTICS from the definition list on pages 9-33/9-34.
+  // Independently corroborated against Motorola's own FPSP (fpsp040) frame offsets --
+  // STAG at +$04, CMDREG1B at +$08, DTAG at +$0C, the E1/E3 byte at +$10 with E1 = bit
+  // 2, FPTEMP at +$14, ETEMP at +$20 -- which agree with the figure exactly.
+  //
+  //   $00  [31:24] VERSION NUMBER   [23:16] $28 (length code)  [15:0] reserved
+  //   $04  [31:29] STAG             (3-bit source data type)   rest reserved
+  //   $08  [31:16] CMDREG1B         (the faulting command word) [15:0] reserved
+  //   $0C  [31:29] DTAG             (3-bit destination data type) rest reserved
+  //   $10  bit 26 = E1              (i.e. byte $10 bit 2)      rest reserved
+  //   $14  [31] FPTS  [30:16] FPTE  [15:0] reserved     } FPTEMP = DESTINATION operand
+  //   $18  FPTM[63:32]                                  }
+  //   $1C  FPTM[31:00]                                  }
+  //   $20  [31] ETS   [30:16] ETE   [15:0] reserved     } ETEMP  = SOURCE operand
+  //   $24  ETM[63:32]                                   }
+  //   $28  ETM[31:00]                                   }
+  //                                        11 longwords = 44 bytes = 22 words
+  //
+  // NOTE, RECORDED BECAUSE IT IS A REAL PRIMARY-SOURCE CONFLICT AND NOT A TRANSCRIPTION
+  // SLIP: the LATER revision of this manual (M68040UM/AD rev 1, section 9.7, where the
+  // same figure is renumbered **Figure 9-10**) specifies a **26-word / 52-byte**
+  // unimplemented-instruction frame with length code $30, and says so in prose in four
+  // separate places. The 1989 first edition says 22 words / 44 bytes / $28, which is what
+  // the approved design spec (docs/superpowers/specs/2026-08-14-fpu-fpsp-design.md) locked
+  // and what this task implements. The two editions genuinely disagree; the null, idle and
+  // busy frames are identical in both. Changing to the 52-byte shape is a DESIGN-level
+  // decision, not an implementation choice, and is flagged for one -- see this task's
+  // report. Nothing else in this file depends on which is chosen.
+  //
+  // The FPU state-frame VERSION byte, finalized here as the design spec directs ("$40 is
+  // a reasonable default choice ... finalized at implementation time, not a design
+  // blocker"). $41 because (a) it is exactly what Figure 9-7's own idle-frame illustration
+  // shows and what MAME's 68040 FSAVE writes (`m68ki_write_32(addr, 0x41000000)`), (b) the
+  // vendored `fpu_fsave_idle_format_byte.s` asserts exactly 0x41, and (c) the Q700 FPSP's
+  // `if ((frame[0] & 0xf) == 0) skip_restore` optimization needs a NON-ZERO low nibble on a
+  // non-null frame -- $40 would make every idle frame look null to it. The NULL frame
+  // still FORCES byte $00 to $00 (Figure 9-7 shows `$00`, not the version, in the null
+  // frame's top byte), keeping that same optimization correct in the other direction.
+  val FPU_FRAME_VERSION = 0x41
+
+  val fsFrameBase = Reg(UInt(32 bits)); fsFrameBase.simPublic()  // LOW address of the frame
+  val fsSize      = Reg(UInt(8 bits))                            // total frame size in BYTES
+  val fsIsNull    = RegInit(False)
+  val fsIsUnimp   = RegInit(False)
+  val fsStep      = Reg(UInt(5 bits)) init 0; fsStep.simPublic() // WORD index, 0..21
+  val fsSplitLow  = RegInit(False)
+  val fsAnWrite   = RegInit(False)                               // does this op write An back?
+  // Translate-on-VPN-change bookkeeping (design addendum point 3). A 44-byte frame spans
+  // at most one page boundary, so a full replica of LsEuPlugin's two-pass cross-page split
+  // is disproportionate: compare each step's VPN against the last translated one and
+  // re-request only when it changes. At most 2 translation requests per frame, never 22,
+  // and every word still gets a real, current translation.
+  val fsPpn      = Reg(UInt(20 bits)) init 0
+  val fsLastVpn  = Reg(UInt(20 bits)) init 0
+  val fsVpnValid = RegInit(False)
+  /** Sticky: a DTLB translation for an FSAVE/FRESTORE frame access FAULTED. Drives
+    * `RobPlugin.coreHaltedIn` through the top-level wiring. See F_HALT. */
+  val fsXlateFault = RegInit(False); fsXlateFault.simPublic()
+
+  /** 3-bit STAG/DTAG operand data-type tag from an 80-bit extended value.
+    * Encodings verbatim from the MC68040 UM (1989 1st ed.) p.9-34 "STAG, DTAG":
+    *   000 Normalized / 001 Zero / 010 Infinity / 011 NAN
+    *   100 Extended precision denormalized or unnormalized input
+    *   101 Single or double precision denormalized input
+    * 101 is not reachable here: this unit only ever sees operands already widened to
+    * extended precision, so a denormal is always the 100 case. */
+  def fpTag(v: Bits): Bits = {
+    val exp        = v(78 downto 64)
+    val man        = v(63 downto 0)
+    val expAllOnes = exp.andR
+    val expZero    = !exp.orR
+    val manZero    = !man.orR
+    Mux(expAllOnes, Mux(manZero, B"3'b010", B"3'b011"),
+    Mux(expZero,    Mux(manZero, B"3'b001", B"3'b100"), B"3'b000"))
+  }
+
+  def fsFrameWordAddr(step: UInt): UInt = (fsFrameBase + (step << 1)).resized
+  def fsFrameWordData(step: UInt): Bits = {
+    val out = Bits(16 bits); out := B(0, 16 bits)
+    // Header word: [15:8] = version, [7:0] = the length-in-hex indicator (NOT a format
+    // enum -- the pop size is 4 + this byte, for every frame flavour).
+    //   null : $00 $00   (version FORCED to $00 -- identifies null)
+    //   idle : $41 $00   (0 extra bytes)
+    //   unimp: $41 $28   (40 extra bytes -> 44 total)
+    val hdr = Mux(fsIsNull,  B(0x0000, 16 bits),
+              Mux(fsIsUnimp, B((FPU_FRAME_VERSION << 8) | 0x28, 16 bits),
+                             B((FPU_FRAME_VERSION << 8) | 0x00, 16 bits)))
+    val src = fpuCtrl.uiSrcOperand   // ETEMP  : [79] sign, [78:64] exponent, [63:0] mantissa
+    val dst = fpuCtrl.uiDstOperand   // FPTEMP : same layout
+    switch(step) {
+      is(U(0,  5 bits)) { out := hdr }                                        // $00 version|len
+      is(U(2,  5 bits)) { out := fpTag(src) ## B(0, 13 bits) }                // $04 STAG  [31:29]
+      is(U(4,  5 bits)) { out := fpuCtrl.uiCmdReg1B }                         // $08 CMDREG1B [31:16]
+      is(U(6,  5 bits)) { out := fpTag(dst) ## B(0, 13 bits) }                // $0C DTAG  [31:29]
+      is(U(8,  5 bits)) { out := B(0, 5 bits) ## True ## B(0, 10 bits) }      // $10 E1 = bit 26
+      is(U(10, 5 bits)) { out := dst(79 downto 64) }                          // $14 FPTS|FPTE
+      is(U(12, 5 bits)) { out := dst(63 downto 48) }                          // $18 FPTM[63:32]
+      is(U(13, 5 bits)) { out := dst(47 downto 32) }
+      is(U(14, 5 bits)) { out := dst(31 downto 16) }                          // $1C FPTM[31:00]
+      is(U(15, 5 bits)) { out := dst(15 downto 0) }
+      is(U(16, 5 bits)) { out := src(79 downto 64) }                          // $20 ETS|ETE
+      is(U(18, 5 bits)) { out := src(63 downto 48) }                          // $24 ETM[63:32]
+      is(U(19, 5 bits)) { out := src(47 downto 32) }
+      is(U(20, 5 bits)) { out := src(31 downto 16) }                          // $28 ETM[31:00]
+      is(U(21, 5 bits)) { out := src(15 downto 0) }
+      // every other word is reserved -> 0 (the default above)
+    }
+    out
+  }
+  /** 22 words ($2C bytes) for the unimplemented-instruction frame, 2 words (4 bytes) for
+    * null and idle alike (both are a single longword per Figure 9-7). */
+  val fsLastStep = Mux(fsIsUnimp, U(21, 5 bits), U(1, 5 bits))
+
   val fsm = new StateMachine {
     val IDLE      = new State with EntryPoint
     // ENTRY path
@@ -796,6 +1048,22 @@ class ExceptionUnit(
     // idle BEFORE the walk starts.
     val S_MAINTWAIT = new State
     val S_REDIR   = new State
+    // ── Task 11: FSAVE / FRESTORE state-frame transfer ────────────────────────────
+    // Same two-state REQ/WAIT shape as every other memory step in this FSM
+    // (E_STORE/E_STWAIT, R_SRREQ/R_SRWAIT, E_VECREQ/E_VECWAIT, ...), plus a dedicated
+    // translation REQ/WAIT pair per direction because these are the only accesses this
+    // unit makes that are genuinely virtual.
+    val F_XREQ    = new State   // FSAVE: request a DTLB translation for the current word
+    val F_XWAIT   = new State   // FSAVE: await it; latch PPN or escalate on fault
+    val F_STORE   = new State   // FSAVE: issue one frame word (translated)
+    val F_STWAIT  = new State   // FSAVE: await its write-through ACK; advance
+    val F_RXREQ   = new State   // FRESTORE: request the header word's translation
+    val F_RXWAIT  = new State   // FRESTORE: await it
+    val F_HDRREQ  = new State   // FRESTORE: load the header word
+    val F_HDRWAIT = new State   // FRESTORE: dispatch on version / length byte
+    val F_RDONE   = new State   // FRESTORE: An += popSize
+    val F_RSETTLE = new State   // FRESTORE: let the committed-A7 readback settle
+    val F_HALT    = new State   // terminal: a frame translation faulted (see below)
 
     IDLE.whenIsActive {
       when(entryTrigger) {
@@ -867,6 +1135,22 @@ class ExceptionUnit(
         curLevel  := entryIplLevel
         curPpc    := ppcOrTarget.resized
         curFault  := entryFaultAddr
+        // ── Task 11: capture the unimplemented-instruction state ─────────────────
+        // A RECOGNIZED-but-unsupported FP op is being handed to FPSP via vector 11.
+        // Latch what a subsequent FSAVE needs to build the 44-byte unimplemented-
+        // instruction frame: the command word (CMDREG1B) plus both operands, from which
+        // STAG/DTAG and the FPTS/FPTE/FPTM + ETS/ETE/ETM fields are derived at emit time.
+        // Non-speculative: exception delivery is at commit.
+        when(entryVector === 11 && entryFpuUnimp) {
+          setUnimpFramePort.valid   := True
+          setUnimpFramePort.payload := entryFpuCmd ## committedFpSrcIn ## committedFpDstIn
+          // FPIAR := the faulting instruction's OWN PC (its architectural definition,
+          // "last FP exception PC"). `entryPc` is the POST-instruction PC for this class
+          // (Task 10 sets faultUsesNextPc so a real FPSP can RTE past the instruction),
+          // so the instruction's own PC is `ppc`.
+          setFpiarPort.valid   := True
+          setFpiarPort.payload := ppcOrTarget.resized
+        }
         // SSW = (in_mmu 0x400) | fc | (rw<<8); fc = data space (bit0=1) + supervisor
         // (bit2) if a supervisor access; rw = read?1:write?0 (MAME m68ki_aerr).
         // The faulting access's privilege = the PRE-exception S bit (SR bit13 =
@@ -1557,15 +1841,70 @@ class ExceptionUnit(
             }
           }
         }
+        // ── FSAVE <ea> (Task 11) ────────────────────────────────────────────────
+        is(skOrd(m68k040.decode.SysKind.FSAVE)) {
+          // Frame-type selection from LIVE FPU state. This needs NO memory read at all,
+          // which is exactly why FSAVE (unlike FRESTORE) sits in the middle band the
+          // design addendum describes: runtime-selected, but not data-dependent.
+          //   unimplemented-instruction : a recognized-but-unsupported FP op is pending
+          //                               software completion (Task 10's vector-11 path
+          //                               latched it) -- this is the route-to-FPSP frame
+          //   null                      : no FP op has executed since reset / null restore
+          //   idle                      : otherwise
+          val isUnimp = fpuCtrl.uiValid
+          val isNull  = !fpuCtrl.everExecuted && !isUnimp
+          val size    = Mux(isUnimp, U(44, 8 bits), U(4, 8 bits))
+          fsIsNull  := isNull
+          fsIsUnimp := isUnimp
+          fsSize    := size
+          // sysCapRc[3:1] = the EA mode, sysCapRc[0] = isRestore (0 here).
+          //   -(An) (mode 100): the frame occupies [An-size, An), and An := An-size.
+          //   (An)  (mode 010): the frame occupies [An, An+size), An unchanged.
+          val isPredec = sysCapRc(3 downto 1) === U(4, 3 bits)
+          val base     = Mux(isPredec, sysCapVal.asUInt - size.resize(32), sysCapVal.asUInt)
+          fsFrameBase := base
+          fsAnWrite   := isPredec
+          fsStep      := 0
+          fsSplitLow  := False
+          fsVpnValid  := False    // force a translation before the first word
+          // An write-back through the SAME port MOVEC's read direction uses. Driven HERE
+          // (not after the stores) because the value is already known combinationally --
+          // exactly MOVEC's shape. FRESTORE cannot do this (its size comes from memory),
+          // hence its separate F_RDONE state.
+          when(isPredec) {
+            sysRegWriteValid := True
+            sysRegWritePhys  := sysCapDstPhys
+            sysRegWriteData  := base
+          }
+          // Emitting the frame CONSUMES the pending unimplemented state -- that hand-off
+          // IS the route-to-FPSP mechanism.
+          when(isUnimp) { clearUnimpPort.valid := True; clearUnimpPort.payload := True }
+        }
+        // ── FRESTORE <ea> (Task 11) ─────────────────────────────────────────────
+        is(skOrd(m68k040.decode.SysKind.FRESTORE)) {
+          // The frame base is An for BOTH admitted modes ((An)+ and (An)); only the
+          // write-back differs. The pop size is unknown until the header word is read.
+          fsFrameBase := sysCapVal.asUInt
+          fsAnWrite   := sysCapRc(3 downto 1) === U(3, 3 bits)   // (An)+ postincrement
+          fsVpnValid  := False
+        }
       }
       // Task P5.5: CPUSH/CINV just pulsed a maintenance command whose walk runs for
       // many cycles; hold the (still serializing) sequencer until it reports done
       // before redirecting. Every other sysKind's effect completed within this single
       // S_APPLY cycle and goes straight on, exactly as before. Symbolic ordinals
       // (skOrd), same reasoning as the switch above.
+      //
+      // Task 11: FSAVE/FRESTORE detour through their own frame-transfer sub-sequences
+      // first. The transition MUST live here and not inside the `switch` arms above --
+      // a `goto` written there would be overridden by this later, unconditional one.
       when(sysCapKind === skOrd(m68k040.decode.SysKind.CPUSH) ||
            sysCapKind === skOrd(m68k040.decode.SysKind.CINV)) {
         goto(S_MAINTWAIT)
+      } elsewhen(sysCapKind === skOrd(m68k040.decode.SysKind.FSAVE)) {
+        goto(F_XREQ)
+      } elsewhen(sysCapKind === skOrd(m68k040.decode.SysKind.FRESTORE)) {
+        goto(F_RXREQ)
       } otherwise {
         goto(S_REDIR)
       }
@@ -1644,6 +1983,215 @@ class ExceptionUnit(
       redirectValid := True
       redirectPc    := sysCapNextPc
       goto(IDLE)
+    }
+
+    // ══ FSAVE: emit the state frame, one translated word at a time ═══════════════
+    //
+    // The address of the byte(s) this step actually touches. Task #163's cross-cache-line
+    // word split is preserved VERBATIM (it is a separate, already-proven-necessary bug
+    // class, unrelated to translation): `driveStoreNoXlate`'s plain {paddr,size} store
+    // path has NO cross-line handling and silently DROPS the second byte of a word landing
+    // at line-relative offset 15, so a crossing word is split into two single-byte pushes.
+    // `fsave -(An)` with an odd An is perfectly legal, so this is reachable, not theoretical.
+    //
+    // Deriving the VPN from `fsCurVa` (the split-aware address) rather than from the word
+    // address is what makes the translate-on-VPN-change rule correct at a page boundary:
+    // a word at page offset $FFF splits, and its low byte genuinely lives in the NEXT
+    // page, so the split phase re-triggers a translation all by itself.
+    val fsWordAddr = fsFrameWordAddr(fsStep)
+    val fsCrosses  = fsWordAddr(3 downto 0) === U(15, 4 bits)
+    val fsCurVa    = Mux(fsSplitLow, fsWordAddr + U(1, 32 bits), fsWordAddr)
+    val fsCurVpn   = fsCurVa(31 downto 12)
+    val fsNeedXlate = !fsVpnValid || (fsCurVpn =/= fsLastVpn)
+
+    F_XREQ.whenIsActive {
+      dxReqValid := True
+      dxReqVpn   := fsCurVpn
+      dxReqWrite := True                       // the frame push is a STORE
+      when(dxReqReady) { dxPendVpn := fsCurVpn; goto(F_XWAIT) }
+    }
+    F_XWAIT.whenIsActive {
+      when(dxRspMine) {
+        when(dxRspFault) {
+          fsXlateFault := True
+          goto(F_HALT)
+        } otherwise {
+          fsPpn      := dxRspPpn
+          fsLastVpn  := dxPendVpn
+          fsVpnValid := True
+          goto(F_STORE)
+        }
+      }
+    }
+    F_STORE.whenIsActive {
+      when(fsNeedXlate) {
+        // A step (or a split phase) walked into a new page -- re-translate before
+        // touching memory. At most one re-entry per frame in practice: 44 bytes can
+        // cross at most one page boundary.
+        goto(F_XREQ)
+      } otherwise {
+        val data = fsFrameWordData(fsStep)
+        val pa   = (fsPpn ## fsCurVa(11 downto 0)).asUInt
+        // NOTE: the ADDRESS is now genuinely translated, but the CACHE MODE deliberately
+        // still comes from `excCacheMode` (the CACR.DE fold every other exception-path
+        // store uses) rather than from `dxRspCacheMode`. Honouring the page's own cache
+        // mode here would be more architecturally faithful, but it would also re-open the
+        // task-P5.7 DE=0 coherency hole unless the DE fold were reapplied on top -- out of
+        // scope for this task, and flagged rather than silently taken.
+        when(fsSplitLow)     { driveStoreNoXlate(pa, Size.BYTE, data(7 downto 0)) }
+        .elsewhen(fsCrosses) { driveStoreNoXlate(pa, Size.BYTE, data(15 downto 8)) }
+        .otherwise           { driveStoreNoXlate(pa, Size.WORD, data) }
+        goto(F_STWAIT)
+      }
+    }
+    F_STWAIT.whenIsActive {
+      when(dcStoreAck) {
+        when(fsCrosses && !fsSplitLow) {
+          // Just pushed the HIGH byte of a split word; push the LOW byte next (same
+          // fsStep, same frame word -- do not advance).
+          fsSplitLow := True
+          goto(F_STORE)
+        } otherwise {
+          fsSplitLow := False
+          when(fsStep === fsLastStep) { goto(S_REDIR) }
+          .otherwise                  { fsStep := fsStep + 1; goto(F_STORE) }
+        }
+      }
+    }
+
+    // ══ FRESTORE: read the header word, dispatch on it ═══════════════════════════
+    // Structurally R_FMTREQ/R_FMTWAIT: a single WORD read whose value selects what
+    // happens next. Exactly ONE translated access is needed regardless of the real
+    // frame's size, because a non-null frame's BODY is deliberately never applied (see
+    // F_HDRWAIT) -- so the translate-on-VPN-change machinery degenerates to
+    // "translate once, use once" here and is deliberately NOT built as a loop.
+    F_RXREQ.whenIsActive {
+      dxReqValid := True
+      dxReqVpn   := fsFrameBase(31 downto 12)
+      dxReqWrite := False                      // the header access is a LOAD
+      when(dxReqReady) { dxPendVpn := fsFrameBase(31 downto 12); goto(F_RXWAIT) }
+    }
+    F_RXWAIT.whenIsActive {
+      when(dxRspMine) {
+        when(dxRspFault) {
+          fsXlateFault := True
+          goto(F_HALT)
+        } otherwise {
+          fsPpn      := dxRspPpn
+          fsLastVpn  := dxPendVpn
+          fsVpnValid := True
+          goto(F_HDRREQ)
+        }
+      }
+    }
+    F_HDRREQ.whenIsActive {
+      ldoVld   := True
+      ldoVaddr := fsFrameBase
+      ldoPaddr := (fsPpn ## fsFrameBase(11 downto 0)).asUInt
+      ldoSize  := Size.WORD
+      // WORD granularity, not LONG, for the same reason task #189 split RTE's PC read:
+      // `DcacheByteLane.extract` has no cross-line awareness. The residual exposure is
+      // identical to (and no worse than) that already-documented one -- a WORD landing
+      // exactly at line-relative offset 15, which for the header would ALSO be a page
+      // crossing. Not closed here; it is the same narrow residual class R_PCREQ carries.
+      when(dcLoadCmd.fire) { goto(F_HDRWAIT) }
+    }
+    F_HDRWAIT.whenIsActive {
+      when(dcLoadRsp.valid) {
+        val hdr     = dcLoadRsp.payload.data(15 downto 0)
+        val version = hdr(15 downto 8)
+        val lenByte = hdr(7 downto 0).asUInt
+        // Pop size = 4 + the length-in-hex indicator, for EVERY frame flavour. This is
+        // the one FRESTORE rule that is architecturally universal, and it is exactly what
+        // `fsave_frestore_basic.s`'s pop-size matrix checks (NULL -> 4, $28 -> 44,
+        // $60 -> 100, and the FPSP's manufactured version-$41/size-$00 pseudo-null -> 4).
+        // It costs nothing to get right for frame shapes this core never EMITS.
+        fsSize := (U(4, 9 bits) + lenByte.resize(9)).resize(8)
+        // A NULL frame (version byte $00) aborts all FPU operations and puts the FPU into
+        // the RESET state -- MC68040 UM (1989 1st ed.) p.9-30: "When an FRESTORE of a null
+        // state frame is performed, all FPU operations are aborted, and the FPU enters the
+        // reset state." That is the only FRESTORE behavior real hardware unconditionally
+        // requires, and the only one implemented. A non-null frame's BODY fields are
+        // deliberately NOT applied (spec-narrowed scope): real 68040 FSAVE saves no
+        // control registers at all, which is precisely why the ROM FPSP prologue
+        // separately does FMOVEM.L FPIAR/FPSR/FPCR,-(A7).
+        when(version === B(0, 8 bits)) {
+          setEverExecutedPort.valid   := True; setEverExecutedPort.payload := False
+          clearUnimpPort.valid        := True; clearUnimpPort.payload      := True
+          setFpcrPort.valid   := True; setFpcrPort.payload   := U(0, 32 bits)
+          setFpsrPort.valid   := True; setFpsrPort.payload   := U(0, 32 bits)
+          setFpiarPort.valid  := True; setFpiarPort.payload  := U(0, 32 bits)
+          fpccWriteValid := True; fpccWriteData := B(0, 4 bits)
+        } otherwise {
+          // A non-null frame means "the FPU had state" -> idle, not null, on a later FSAVE.
+          setEverExecutedPort.valid := True; setEverExecutedPort.payload := True
+        }
+        goto(F_RDONE)
+      }
+    }
+    // The An write-back for FRESTORE (An)+ has to happen HERE, not in S_APPLY: the pop
+    // size is only known once the header has been read out of memory.
+    F_RDONE.whenIsActive {
+      when(fsAnWrite) {
+        sysRegWriteValid := True
+        sysRegWritePhys  := sysCapDstPhys
+        sysRegWriteData  := fsFrameBase + fsSize.resize(32)
+      }
+      goto(F_RSETTLE)
+    }
+    // MANDATORY settle cycles before S_REDIR, for the `FRESTORE (A7)+` case specifically.
+    //
+    // S_REDIR unconditionally re-banks A7 by writing `committedPhysA7 := ss.a7` (its
+    // `a7WriteValid := obsFire` port). When the sysOp's own auto-update destination IS A7,
+    // the committed RAT now maps arch-15 at the SAME pdst `F_RDONE` just wrote -- so if
+    // `ss.isp/msp` have not yet caught up, S_REDIR writes the STALE pre-FRESTORE A7 straight
+    // back over the new one. `ss.writeA7` is fed from `committedA7In`, a PRF readback, so
+    // the new value needs two cycles to appear there and then in the bank register:
+    //   F_RDONE  : PRF[pdst] <= base+popSize      (visible next cycle)
+    //   +1       : committedA7In = base+popSize -> ss.isp <= base+popSize
+    //   +2       : ss.a7 reads the new bank      -> S_REDIR's re-bank is a harmless no-op
+    // FSAVE needs no equivalent state: its own multi-cycle F_STORE/F_STWAIT frame loop
+    // always provides far more than two cycles between the S_APPLY write and S_REDIR.
+    val fsSettle = Reg(UInt(2 bits)) init 0
+    F_RSETTLE.whenIsActive {
+      fsSettle := fsSettle + 1
+      when(fsSettle === U(2, 2 bits)) { fsSettle := 0; goto(S_REDIR) }
+    }
+
+    // ══ Terminal halt on a frame-translation fault ═══════════════════════════════
+    //
+    // DELIBERATE, DOCUMENTED DIVERGENCE FROM REAL 68040 BEHAVIOR. Real hardware would
+    // take a precise ACCESS FAULT (vector 2, format-$7) here. This core cannot: an
+    // ExceptionUnit episode genuinely cannot cleanly re-enter itself mid-sequence
+    // (`RobPlugin`'s `faultRetire` is gated on `excIdle`, which is unconditionally False
+    // for the whole episode), and unlike the one existing self-re-entry precedent (RTE
+    // synthesizing a vector-3/14 entry for a malformed frame format) -- which only works
+    // because RTE's path up to that point is READ-ONLY -- a partially-stacked FSAVE frame
+    // has already committed real stores, and this project has no unwind machinery for
+    // that. Building genuine nested/precise-fault re-entry would be new, unproven,
+    // safety-critical machinery that exists nowhere else in this core.
+    //
+    // So instead the fault escalates to the existing sticky, first-error-wins
+    // `RobPlugin.coreHaltedIn` -- the SAME escalation this project already uses for the
+    // structurally analogous problem (`DcachePlugin`'s diagnostic-fault channel: WT-beat
+    // drain, refill, eviction writeback, CPUSH writeback). `fsXlateFault` is a sticky Reg
+    // driven out to the top level, where it ORs into `coreHaltedIn` alongside
+    // `dc.diagFault`.
+    //
+    // This state is TERMINAL BY DESIGN and that is the point: it must actually STOP the
+    // frame transfer, not merely raise a flag while the loop keeps writing garbage past
+    // the faulting page. `fsStep` never advances, no store is ever driven again, and the
+    // FSM never returns to IDLE -- which keeps `active` (and therefore `excActive`) held,
+    // matching `coreHalted`'s own semantics (`headReady` forced False, the frontend
+    // quiesced, interrupts blocked). A halted core stays halted.
+    //
+    // SCOPING NOTE so this is not mistaken for solving more than it does: this closes the
+    // gap for FSAVE/FRESTORE's OWN new translated accesses only. The pre-existing fact
+    // that ordinary entry/RTE frame stores mark `precise := True` specifically so a bus
+    // error there never reaches the diagnostic channel at all is a SEPARATE, pre-existing
+    // gap -- not introduced by Task 11 and not closed by it.
+    F_HALT.whenIsActive {
+      fsXlateFault := True   // hold it asserted; the ROB-side latch is sticky anyway
     }
   }
 

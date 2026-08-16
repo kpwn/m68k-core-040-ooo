@@ -354,12 +354,33 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // Task P4.5: the D-cache's async diagnostic-fault channel (a non-OKAY AXI
     // response on a trusted-cacheable-path transaction) latches a sticky,
     // non-interrupt-wakeable CORE HALT.
-    rob.logic.coreHaltedIn := dc.diagFault
+    // Task 11 adds a SECOND producer: a DTLB translation fault taken while the commit-side
+    // sequencer is transferring an FSAVE/FRESTORE state frame. `coreHaltedIn` is a plain
+    // `Bool` whose only consumer is the sticky `coreHalted` latch (which forces
+    // `headReady` False, blocks `interruptPending`, and quiesces the frontend) -- nothing
+    // downstream distinguishes WHICH producer fired, so a plain OR is exactly right and a
+    // priority/first-wins encoding would buy nothing. See ExceptionUnit's `F_HALT` for why
+    // a translation fault escalates here instead of taking a precise access fault.
+    rob.logic.coreHaltedIn := dc.diagFault || exc.fsXlateFault
     lsEu.excActive          := excActive
     lsEu.excLoadCmdValid    := exc.dcLoadCmd.valid
     lsEu.excLoadCmdVaddr    := exc.dcLoadCmd.payload.vaddr
+    lsEu.excLoadCmdPaddr    := exc.dcLoadCmd.payload.paddr
     lsEu.excLoadCmdSize     := exc.dcLoadCmd.payload.size
     exc.dcLoadCmd.ready     := lsEu.excLoadCmdReady
+    // ── Task 11: the exception sequencer's own D-side DTLB port ──────────────────
+    // REQUEST goes through the LS EU's `excActive` MUX (the port is provably idle there);
+    // RESPONSE is read straight off `DTranslationService`, exactly like `exc.dcLoadRsp` is
+    // read straight off the D-cache rather than through that same MUX.
+    lsEu.excXlateValid      := exc.dxReqValid
+    lsEu.excXlateVpn        := exc.dxReqVpn
+    lsEu.excXlateWrite      := exc.dxReqWrite
+    lsEu.excXlateToken      := U(exc.ExcDtlbToken, m68k040.cache.DTranslationToken.Width bits)
+    exc.dxReqReady          := lsEu.excXlateReady
+    exc.dxRspValid          := dtlb.rsp.valid
+    exc.dxRspPpn            := dtlb.rsp.payload.ppn
+    exc.dxRspFault          := dtlb.rsp.payload.fault
+    exc.dxRspToken          := dtlb.rsp.payload.token
     lsEu.excStoreValid      := exc.dcStore.valid
     lsEu.excStorePayload    := exc.dcStore.payload
     exc.dcStore.ready       := lsEu.excStoreReady

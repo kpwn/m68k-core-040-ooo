@@ -113,14 +113,26 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
 
   // ── Exception-unit cache arbitration (full-core wiring drives these) ─────────
   // While `excActive`, the commit-side ExceptionUnit owns the D-cache request
-  // ports (the LS pipe is squashed/idle — serializing). Its frame/vector accesses
-  // are identity-physical and therefore do not enter the tagged DTLB service.
+  // ports (the LS pipe is squashed/idle — serializing).
   // Default-idle (allowOverride) keeps standalone LS tests unchanged.
+  //
+  // Task 11: the exception sequencer's frame/vector accesses used to be UNIFORMLY
+  // identity-physical, which is why this MUX never covered the tagged DTLB service.
+  // FSAVE/FRESTORE's state-frame transfers are the first ones that are genuinely
+  // VIRTUAL, so the same MUX now also hands over `xlate.req` — safe for exactly the
+  // reason the D-cache hand-off is: the LS pipe already relinquishes its own DTLB
+  // claim for the entire duration `excActive` is held (`xlate.req.valid := !excActive
+  // && ...` below, and `xlate.rsp.ready` unconditionally True while `excActive`).
   var excActive: Bool = null
   var excLoadCmdValid: Bool = null; var excLoadCmdVaddr: UInt = null; var excLoadCmdSize: m68k040.isa.Size.C = null
+  var excLoadCmdPaddr: UInt = null
   var excLoadCmdReady: Bool = null
   var excStoreValid: Bool = null;   var excStorePayload: DStoreCmd = null
   var excStoreReady: Bool = null
+  // DTLB request hand-off (Task 11). Mirrors the `excLoadCmd*` shape exactly.
+  var excXlateValid: Bool = null; var excXlateVpn: UInt = null
+  var excXlateWrite: Bool = null; var excXlateToken: UInt = null
+  var excXlateReady: Bool = null
   var sqEmptySig: Bool = null   // store queue drained (no committed store in flight)
 
   // ── Precise-path SQ<->ROB pass-throughs (Task P2.5 wires these end-to-end;
@@ -135,8 +147,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   during setup {
     excActive       = Bool()
     excLoadCmdValid = Bool(); excLoadCmdVaddr = UInt(32 bits); excLoadCmdSize = m68k040.isa.Size()
+    excLoadCmdPaddr = UInt(32 bits)
     excLoadCmdReady = Bool()
     excStoreValid   = Bool(); excStorePayload = DStoreCmd(); excStoreReady = Bool()
+    excXlateValid   = Bool(); excXlateVpn = UInt(20 bits)
+    excXlateWrite   = Bool(); excXlateToken = UInt(DTranslationToken.Width bits)
+    excXlateReady   = Bool()
     sqEmptySig      = Bool()
     robHeadIn              = UInt(6 bits)
     robHeadValidIn         = Bool()
@@ -208,10 +224,20 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     excActive.allowOverride;            excActive := False
     excLoadCmdValid.allowOverride;      excLoadCmdValid := False
     excLoadCmdVaddr.allowOverride;      excLoadCmdVaddr := U(0, 32 bits)
+    // Defaults to the vaddr (identity), NOT to zero: every DUT that wires the exception
+    // unit's load command but not this new paddr pass-through keeps its pre-Task-11
+    // identity-physical behaviour automatically, and a later override of
+    // `excLoadCmdVaddr` is followed for free because this is a plain combinational alias.
+    excLoadCmdPaddr.allowOverride;      excLoadCmdPaddr := excLoadCmdVaddr
     excLoadCmdSize.allowOverride;       excLoadCmdSize := m68k040.isa.Size.LONG
     excStoreValid.allowOverride;        excStoreValid := False
     excStorePayload.allowOverride;      excStorePayload.assignDontCare()
     excLoadCmdReady.allowOverride;      excLoadCmdReady := False
+    excXlateValid.allowOverride;        excXlateValid := False
+    excXlateVpn.allowOverride;          excXlateVpn := U(0, 20 bits)
+    excXlateWrite.allowOverride;        excXlateWrite := False
+    excXlateToken.allowOverride;        excXlateToken := U(0, DTranslationToken.Width bits)
+    excXlateReady.allowOverride;        excXlateReady := False
 
     // Precise-path pass-throughs default-idle (allowOverride): a DUT that doesn't
     // wire the ROB (standalone LS tests) sees robHeadValidIn=False -> headPreciseReady
@@ -2001,8 +2027,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     when(excActive && excLoadCmdValid) {
       dcache.loadCmd.valid         := True
       dcache.loadCmd.payload.vaddr := excLoadCmdVaddr
-      // exception sequencer runs MMU-off (identity, slice-1): paddr == vaddr.
-      dcache.loadCmd.payload.paddr := excLoadCmdVaddr
+      // Task 11: the PHYSICAL address now comes across explicitly instead of being
+      // regenerated as the vaddr here. Every pre-existing exception-sequencer load is
+      // still identity (ExceptionUnit's own `ldoPaddr` defaults to `ldoVaddr`), so this
+      // is behaviour-identical for them; FRESTORE's header read supplies a real
+      // DTLB-translated PA, which the old identity regeneration would have discarded.
+      dcache.loadCmd.payload.paddr := excLoadCmdPaddr
       dcache.loadCmd.payload.size  := excLoadCmdSize
       // identity-physical, matching dcStore's exc-path cacheMode.
       //
@@ -2046,15 +2076,41 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     when(dcache.store.fire && excActive && excStoreValid) {
       excStoreOutstanding := True
     }
-    // Exception frame/vector accesses are already physical on the cache ports and
-    // therefore must not create repeated tagged DTLB commands while excActive is
-    // held. Only the ordinary LS P2/P2T pipe owns this translation stream.
-    xlate.req.valid              := !excActive && (normalReqArm || splitReqArm)
+    // The ordinary LS P2/P2T pipe fully relinquishes this translation stream for the
+    // entire duration `excActive` is held. Historically that was because every
+    // exception-sequencer access was already physical on the cache ports; since Task 11
+    // it is ALSO what makes the hand-off below safe.
+    val lsXlateReqValid = !excActive && (normalReqArm || splitReqArm)
+    xlate.req.valid              := lsXlateReqValid
     xlate.req.payload.vpn        := reqDrvVpn
     xlate.req.payload.supervisor := reqDrvSup
     xlate.req.payload.write      := reqDrvWrite
     xlate.req.payload.token      := reqDrvToken
-    xlateRobIdSig                := Mux(xlate.req.valid, reqDrvRobId, U(0, 6 bits))
+    // Task 11: hand the DTLB REQUEST port to the commit-side exception sequencer for its
+    // FSAVE/FRESTORE state-frame accesses -- the first exception-path accesses that are
+    // genuinely virtual. Structurally identical to the `excActive && excLoadCmdValid`
+    // D-cache hand-off above (a LAST-driver `when` in the same scope, gated on the exc's
+    // OWN per-port request valid rather than on `excActive` alone), and it can only fire
+    // in cycles the LS pipe has already given the port up.
+    //
+    // The RESPONSE side needs nothing here: `xlate.rsp.ready` is already unconditionally
+    // True while `excActive` (see its assignment above), so a response fires the cycle it
+    // is valid and the exception unit samples it combinationally -- exactly how
+    // `exc.dcLoadRsp` is wired straight off the D-cache rather than through this MUX.
+    when(excActive && excXlateValid) {
+      xlate.req.valid              := True
+      xlate.req.payload.vpn        := excXlateVpn
+      xlate.req.payload.supervisor := True    // the exception sequencer runs supervisor
+      xlate.req.payload.write      := excXlateWrite
+      xlate.req.payload.token      := excXlateToken
+    }
+    excXlateReady := xlate.req.ready
+    // Deliberately keyed off the LS-SIDE valid, NOT the muxed `xlate.req.valid`:
+    // `umAccessRobId` tags a walk with the ROB id whose deferred U/M-bit commit it
+    // belongs to, and an exception-sequencer translation belongs to no ROB entry. Feeding
+    // the stale `reqDrvRobId` there would attribute the walk to an unrelated (possibly
+    // already-retired) instruction.
+    xlateRobIdSig                := Mux(lsXlateReqValid, reqDrvRobId, U(0, 6 bits))
 
     excLoadCmdReady := dcache.loadCmd.ready
   }

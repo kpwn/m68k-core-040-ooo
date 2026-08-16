@@ -241,11 +241,31 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     lsEu.excActive            := excActive
     lsEu.excLoadCmdValid      := exc.dcLoadCmd.valid
     lsEu.excLoadCmdVaddr      := exc.dcLoadCmd.payload.vaddr
+    lsEu.excLoadCmdPaddr      := exc.dcLoadCmd.payload.paddr
     lsEu.excLoadCmdSize       := exc.dcLoadCmd.payload.size
     exc.dcLoadCmd.ready       := lsEu.excLoadCmdReady
     lsEu.excStoreValid        := exc.dcStore.valid
     lsEu.excStorePayload      := exc.dcStore.payload
     exc.dcStore.ready         := lsEu.excStoreReady
+    // Task 11 parity with FullCoreSynth: the exception sequencer's own D-side DTLB port
+    // (request through the LS EU's `excActive` MUX, response straight off the service),
+    // plus the FSAVE/FRESTORE translation-fault escalation into `coreHaltedIn`. Without
+    // these the ExceptionUnit falls back to its identity-translation defaults, which
+    // would silently make FSAVE/FRESTORE ignore the MMU in this harness.
+    lsEu.excXlateValid        := exc.dxReqValid
+    lsEu.excXlateVpn          := exc.dxReqVpn
+    lsEu.excXlateWrite        := exc.dxReqWrite
+    lsEu.excXlateToken        := U(exc.ExcDtlbToken, m68k040.cache.DTranslationToken.Width bits)
+    exc.dxReqReady            := lsEu.excXlateReady
+    exc.dxRspValid            := dtlb.rsp.valid
+    exc.dxRspPpn              := dtlb.rsp.payload.ppn
+    exc.dxRspFault            := dtlb.rsp.payload.fault
+    exc.dxRspToken            := dtlb.rsp.payload.token
+    // NOTE: deliberately only the Task-11 producer. This harness has never wired
+    // `dc.diagFault` into `coreHaltedIn` (a pre-existing parity gap with FullCoreSynth,
+    // not this task's business); adding it here would change ported-corpus behaviour for
+    // unrelated reasons.
+    rob.logic.coreHaltedIn    := exc.fsXlateFault
     exc.sqDrained             := lsEu.sqEmptySig
     // Task P5.4/P5.5 parity with FullCoreSynth (this block mirrors it by hand; the
     // P5.4 `dcQuiesced` line was missing here, leaving the ExceptionUnit default of a

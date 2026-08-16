@@ -397,6 +397,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // pre-existing (MMU) behavior unless a NEW fault explicitly clears it — see
     // LsFault.atc / LsEuPlugin's captureFault(atc=...).
     val faultAtcStore  = Vec.fill(depth)(RegInit(True))
+    // Task 11: per-entry FP unimplemented-instruction marker + its command word, written
+    // ONLY at alloc (same discipline as the fault* family above) from Task 10's decode
+    // fields. Read by ExceptionUnit at vector-11 delivery to latch the state a later
+    // FSAVE turns into the unimplemented-instruction state frame.
+    val fpuUnimpStore = Vec.fill(depth)(RegInit(False))
+    val fpuCmdStore   = Vec.fill(depth)(Reg(Bits(16 bits)) init 0)
     // Instruction-fetch access-fault: set at ALLOC for a faulted (vector-2) µop whose
     // fault came from the I-cache (sswInstr). Selects a program-space SSW in the $7
     // frame. RegInit(False), reset per-alloc (mirrors faultedStore).
@@ -1038,6 +1044,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // occupant of this same slot — the RegInit(True) default alone only covered a
       // never-yet-written slot, not a reused one.
       faultAtcStore(tail)   := allocUopVec(0).faultAtc
+      // Task 11: FSAVE's route-to-FPSP source state (Task 10's decode fields).
+      fpuUnimpStore(tail)   := allocUopVec(0).fpuSoftwareComplete
+      fpuCmdStore(tail)     := allocUopVec(0).fpuCmdWord
       nzvcWrStore(tail) := False; xWrStore(tail) := False
       sysValRdyStore(tail)  := False
       // (isRte/first/needsSup/pc/sysOp/sysKind/sysReadDir/sysRc are written by
@@ -1057,6 +1066,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultAddrStore(tail + 1)  := allocUopVec(1).faultAddr
       faultInstrStore(tail + 1) := allocUopVec(1).sswInstr
       faultAtcStore(tail + 1)   := allocUopVec(1).faultAtc
+      fpuUnimpStore(tail + 1)   := allocUopVec(1).fpuSoftwareComplete
+      fpuCmdStore(tail + 1)     := allocUopVec(1).fpuCmdWord
       nzvcWrStore(tail + 1) := False; xWrStore(tail + 1) := False
       sysValRdyStore(tail + 1)  := False
       GenerationFlags.simulation { pcStore(tail + 1) := allocUopVec(1).pc }
@@ -1255,6 +1266,25 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // FpuControlPlugin. `null` selects ExceptionUnit's own local idle null object.
     val fpuCtrl: m68k040.services.FpuControlService =
       host.get[m68k040.services.FpuControlService].getOrElse(null)
+    // ── Task 11: drive FSAVE's null-vs-idle discriminator from FP commit ──────────
+    // "At least one instruction has been executed since the last hardware reset or
+    // FRESTORE of a null state frame" (MC68040 UM 1989 1st ed. p.9-30). Keyed on a
+    // committed FP REGISTER WRITE, which is a deliberately CONSERVATIVE reading of the
+    // manual's "nonconditional floating-point instruction": every instruction the manual
+    // excludes (FNOP, FBcc, FDBcc, FScc, FTRAPcc) writes no FP register, so none of them
+    // can set this bit -- exactly the required behavior, and it cannot drift.
+    //
+    // Placed BEFORE the ExceptionUnit is built, deliberately: a null-frame FRESTORE
+    // CLEARS the same flag from `F_HDRWAIT`, and SpinalHDL's later-`when`-wins ordering
+    // must let that clear beat this set. (They cannot actually collide -- retirement is
+    // blocked for the whole serializing episode -- so this is defence in depth.)
+    if (fpuCtrl != null) {
+      when((rc.commitPorts(0).valid && rc.commitPorts(0).fpWrite) ||
+           (rc.commitPorts(1).valid && rc.commitPorts(1).fpWrite)) {
+        fpuCtrl.setEverExecuted.valid   := True
+        fpuCtrl.setEverExecuted.payload := True
+      }
+    }
     val exc = new m68k040.exception.ExceptionUnit(
       ss = new m68k040.exception.SystemState,
       mmuCtrl = mmuCtrl,
@@ -1308,7 +1338,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       sysRc      = p0.sysRc,
       sysDstPhys = p0.intNew,        // the read µop's rename-allocated pdst (FSM writes it)
       sysPc      = p0.pc,
-      sysNextPc  = p0.predNextPc)
+      sysNextPc  = p0.predNextPc,
+      // Task 11: the head's FP unimplemented-instruction marker + command word, read
+      // only at vector-11 delivery.
+      entryFpuUnimp = fpuUnimpStore(h0),
+      entryFpuCmd   = fpuCmdStore(h0))
     excIdle := !exc.active
     val excActive = exc.active; excActive.simPublic()
     // Drive the forward-declared committed-S (the privilege check gates on it).
@@ -1339,7 +1373,20 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // at the trigger cycle (sysTriggerSig = sysRetire && S=1) for a read-direction head.
     // Only the int-RAT/freelist commit (intWrite); no trace (the obs is the ExcRec).
     // Last-wins over the default/retire0 (retire0 is gated off the sysOp head).
-    when(sysTriggerSig && p0.sysReadDir) {
+    //
+    // Task 11 WIDENED the gate from `p0.sysReadDir` alone to "read direction OR the head
+    // actually has a renamed int destination". FSAVE -(An) / FRESTORE (An)+ are the first
+    // sysOps whose An write-back rides `sysRegWrite*` while `sysReadDir` is FALSE (An is a
+    // genuine SOURCE for them -- its value has to reach `sysVal`/`sysCapVal` as the frame
+    // base -- and it is ALSO an auto-update destination). With the old gate their PRF
+    // write landed in a physical register the committed RAT never pointed at, so a later
+    // reader of An silently saw the pre-FSAVE value; found by this task's directed tests.
+    //
+    // This is a STRICT SUPERSET of the old condition, not a change to any existing case:
+    // every read-direction sysOp (MOVEC Rc->Rn, MOVE-USP USP->An, FMOVE FPcr->Rn) sets
+    // `dstValid` and therefore `intWrite` too, and every write-direction one leaves
+    // `intWrite` False -- so for them the block's effect is identical either way.
+    when(sysTriggerSig && (p0.sysReadDir || p0.intWrite)) {
       rc.commitPorts(0).valid     := True
       rc.commitPorts(0).intArch   := p0.archRegId
       rc.commitPorts(0).intNew    := p0.intNew

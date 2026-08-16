@@ -120,7 +120,16 @@ case class TranslationRsp() extends Bundle {
   * D-side is an elastic request/response pipeline: the LSU may launch a new VPN
   * while the preceding registered response is consumed. */
 object DTranslationToken {
-  val Width = 8 // {backendEpoch, splitPhase, robId[5:0]}
+  // LsEuPlugin composition: {backendEpoch, splitPhase, robId[5:0]}.
+  //
+  // Task 11 reserves the value $80 for the serializing commit-side ExceptionUnit's own
+  // FSAVE/FRESTORE state-frame translations, mirroring the sibling `DLoadToken`
+  // convention ("[7] source (0 = LS ROB, 1 = serializing exception unit)"). That
+  // reservation is a naming convention, not an exclusion — the LS pipe can in principle
+  // form the same 8-bit value — but the two producers are time-multiplexed and can never
+  // have a request in flight simultaneously (see ExceptionUnit.ExcDtlbToken for the full
+  // structural argument).
+  val Width = 8
 }
 case class DTranslationCmd() extends Bundle {
   val vpn        = UInt(20 bits)

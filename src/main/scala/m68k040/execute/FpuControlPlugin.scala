@@ -37,6 +37,16 @@ class FpuControlPlugin extends FiberPlugin with FpuControlService {
   var _setFpiar:  Flow[UInt] = null
   var _orFpsrExc: Flow[Bits] = null
 
+  // Task 11 (FSAVE/FRESTORE state frames).
+  var _everExecuted:    Bool       = null
+  var _setEverExecuted: Flow[Bool] = null
+  var _uiValid:         Bool       = null
+  var _uiCmdReg1B:      Bits       = null
+  var _uiSrcOperand:    Bits       = null
+  var _uiDstOperand:    Bits       = null
+  var _setUnimpFrame:   Flow[Bits] = null
+  var _clearUnimp:      Flow[Bool] = null
+
   override def fpcr:  UInt = _fpcr
   override def fpsr:  UInt = _fpsr
   override def fpiar: UInt = _fpiar
@@ -45,6 +55,15 @@ class FpuControlPlugin extends FiberPlugin with FpuControlService {
   override def setFpsr:   Flow[UInt] = _setFpsr
   override def setFpiar:  Flow[UInt] = _setFpiar
   override def orFpsrExc: Flow[Bits] = _orFpsrExc
+
+  override def everExecuted:    Bool       = _everExecuted
+  override def setEverExecuted: Flow[Bool] = _setEverExecuted
+  override def uiValid:         Bool       = _uiValid
+  override def uiCmdReg1B:      Bits       = _uiCmdReg1B
+  override def uiSrcOperand:    Bits       = _uiSrcOperand
+  override def uiDstOperand:    Bits       = _uiDstOperand
+  override def setUnimpFrame:   Flow[Bits] = _setUnimpFrame
+  override def clearUnimp:      Flow[Bool] = _clearUnimp
 
   override def roundingMode: Bits = _fpcr(5 downto 4).asBits
   override def precision:    Bits = _fpcr(7 downto 6).asBits
@@ -135,7 +154,54 @@ class FpuControlPlugin extends FiberPlugin with FpuControlService {
       fpsr(7 downto 0)  := fpsr(7 downto 0)  | aexcOf(orFpsrExc.payload).asUInt
     }
 
+    // ── Task 11: FSAVE null-vs-idle discriminator ─────────────────────────────────
+    // RegInit(False): power-on reports NULL ("no FP instruction has executed since the
+    // last hardware reset"), which is both what real hardware does and what lets an OS
+    // skip a pointless FRESTORE. Set by the first committed FP-register write; cleared
+    // ONLY by a null-frame FRESTORE (the one FRESTORE behavior real hardware
+    // unconditionally requires -- "all FPU operations are aborted, and the FPU enters
+    // the reset state", MC68040 UM 1989 1st ed. p.9-30).
+    val everExecuted = RegInit(False); everExecuted.simPublic()
+    val setEverExecuted = Flow(Bool())
+    setEverExecuted.valid.allowOverride;   setEverExecuted.valid   := False
+    setEverExecuted.payload.allowOverride; setEverExecuted.payload := False
+    setEverExecuted.valid.simPublic();     setEverExecuted.payload.simPublic()
+
+    // ── Task 11: latched unimplemented-instruction state ──────────────────────────
+    // Written at vector-11 delivery for a RECOGNIZED FP op (Task 10's
+    // `fpuSoftwareComplete`), read back by a later FSAVE, cleared when that FSAVE
+    // consumes it.
+    val uiValid      = RegInit(False);        uiValid.simPublic()
+    val uiCmdReg1B   = Reg(Bits(16 bits)) init 0; uiCmdReg1B.simPublic()
+    val uiSrcOperand = Reg(Bits(80 bits)) init 0; uiSrcOperand.simPublic()
+    val uiDstOperand = Reg(Bits(80 bits)) init 0; uiDstOperand.simPublic()
+    val setUnimpFrame = Flow(Bits(176 bits))
+    val clearUnimp    = Flow(Bool())
+    setUnimpFrame.valid.allowOverride;   setUnimpFrame.valid   := False
+    setUnimpFrame.payload.allowOverride; setUnimpFrame.payload := B(0, 176 bits)
+    clearUnimp.valid.allowOverride;      clearUnimp.valid      := False
+    clearUnimp.payload.allowOverride;    clearUnimp.payload    := False
+    setUnimpFrame.valid.simPublic();     setUnimpFrame.payload.simPublic()
+    clearUnimp.valid.simPublic()
+
+    when(setEverExecuted.valid) { everExecuted := setEverExecuted.payload }
+    when(setUnimpFrame.valid) {
+      uiValid      := True
+      uiCmdReg1B   := setUnimpFrame.payload(175 downto 160)
+      uiSrcOperand := setUnimpFrame.payload(159 downto 80)
+      uiDstOperand := setUnimpFrame.payload(79 downto 0)
+    }
+    // A LATER `when` wins in SpinalHDL, so a same-cycle clear beats a set. That ordering
+    // can only matter if an FSAVE retires in the very cycle a vector-11 entry is
+    // delivered, which the serializing sysOp/exception FSM makes impossible (both are
+    // states of the SAME ExceptionUnit FSM) -- defence in depth, not a live arbitration.
+    when(clearUnimp.valid) { uiValid := False }
+
     _fpcr = fpcr; _fpsr = fpsr; _fpiar = fpiar
     _setFpcr = setFpcr; _setFpsr = setFpsr; _setFpiar = setFpiar; _orFpsrExc = orFpsrExc
+    _everExecuted = everExecuted; _setEverExecuted = setEverExecuted
+    _uiValid = uiValid; _uiCmdReg1B = uiCmdReg1B
+    _uiSrcOperand = uiSrcOperand; _uiDstOperand = uiDstOperand
+    _setUnimpFrame = setUnimpFrame; _clearUnimp = clearUnimp
   }
 }

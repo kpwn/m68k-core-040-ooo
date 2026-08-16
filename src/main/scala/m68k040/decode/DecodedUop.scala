@@ -301,7 +301,35 @@ object SysKind extends SpinalEnum {
       // rather than a new payload bit: `sysKind` is only ever CONSUMED behind
       // `p0.sysOp` (via `sysRetire`), so an entry carrying it with `sysOp = False` is
       // invisible to every existing consumer.
-      FPCTRL_CAP
+      FPCTRL_CAP,
+      // ── Task 11: FSAVE <ea> (0xF300|<ea>) / FRESTORE <ea> (0xF340|<ea>) ──────────
+      // Line-F, cpID = 001 (op[11:9]), opclass 100 (FSAVE) / 101 (FRESTORE) in op[8:6].
+      // Encodings re-confirmed via `m68k-linux-gnu-as -m68040 -m68881`:
+      //   fsave -(%sp) -> F327 | fsave (%a0) -> F310
+      //   frestore (%sp)+ -> F35F | frestore (%a0) -> F350
+      // and independently corroborated by the vendored corpus's own raw literals
+      // (0xF327 / 0xF35F, commented as FSAVE -(A7) / FRESTORE (A7)+).
+      //
+      // BOTH ARE PRIVILEGED (real 68040). Unlike FMOVE_FPCTRL above, these need NO
+      // `sysPrivFault` exclusion -- the default "any sysOp head retiring at committed
+      // S == 0 takes vector 8" behavior is exactly right.
+      //
+      // COMMIT-TIME SYSTEM ops, deliberately NOT microcoded and deliberately NOT routed
+      // through Task 9b's "all memory movement rides ordinary microcode LS rows"
+      // mechanism. Both were evaluated and rejected on a real constraint (see
+      // docs/superpowers/specs/2026-08-16-fp-control-multiword-transfer-design.md, the
+      // post-Task-9b Addendum): straight-line microcode needs a transfer count fixed at
+      // PROGRAM-CONSTRUCTION time, and FMOVEM-control's register mask is decode-time
+      // resident so it fits -- but FSAVE's frame length is selected at EXECUTE time from
+      // live FpuControlPlugin flops (4 vs 44 bytes), and FRESTORE's pop size is
+      // discovered from a header byte READ OUT OF MEMORY at runtime, an unavoidable
+      // data-dependent branch no straight-line microcode can express. ExceptionUnit's own
+      // frame machinery already IS "emit N words where N is runtime-selected, then read a
+      // frame back and dispatch on its format byte", so these reuse it -- with a REAL
+      // D-side DTLB translation added (the addendum's whole point), time-multiplexed onto
+      // the single DTranslationService port via the already-proven `excActive` MUX.
+      FSAVE,
+      FRESTORE
       = newElement()
 }
 

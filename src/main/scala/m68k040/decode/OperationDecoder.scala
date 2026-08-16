@@ -1103,6 +1103,41 @@ object OperationDecoder {
           o.srcB := anField   // placeholder; MicroOpAssembler overrides with the real op[2:0] An
           o.dst.setNone(); o.dstWrites := False
         }
+        // ── FSAVE / FRESTORE (Task 11) ──────────────────────────────────────────
+        // `1111 001 100 mmmrrr` = 0xF300|<ea> (opclass 100, FSAVE) and
+        // `1111 001 101 mmmrrr` = 0xF340|<ea> (opclass 101, FRESTORE). Both PRIVILEGED.
+        // Confirmed via `m68k-linux-gnu-as -m68040 -m68881` (F327 / F310 / F35F / F350).
+        //
+        // NON-OVERLAP with every other line-F carve-out in this arm: CPUSH/CINV (0xF4xx)
+        // and PFLUSH/PTEST (0xF5xx) both have opword[11:9] = 010; MOVE16 (0xF620) has
+        // 011; cpGEN/FSF have opword[8:6] = 000/001. This arm requires (001, 100) or
+        // (001, 101), which none of them can produce -- and it is precisely the "band
+        // holds FSAVE/FRESTORE, owned by Task 9/11" carve-out the cpGEN arm below
+        // already documents as reserved.
+        //
+        // SCOPE: the register-indirect EA modes only --
+        //   FSAVE    : mode 100 (-(An))  and mode 010 ((An))   [predecrement + control]
+        //   FRESTORE : mode 011 ((An)+)  and mode 010 ((An))   [postincrement + control]
+        // matching the architectural alterable/control restrictions on each. The
+        // displacement/absolute forms (0xF338/0xF378 etc.) need a real EA computation
+        // that this commit-time sysOp path has no AGU for, so they stay OUT of scope on
+        // the line-F vector-11 fall-through.
+        val fsvBase    = opword(11 downto 9) === B"3'b001"
+        val fsvMode    = opword(5 downto 3)
+        val isFsave    = fsvBase && (opword(8 downto 6) === B"3'b100") &&
+                         ((fsvMode === B"3'b100") || (fsvMode === B"3'b010"))
+        val isFrestore = fsvBase && (opword(8 downto 6) === B"3'b101") &&
+                         ((fsvMode === B"3'b011") || (fsvMode === B"3'b010"))
+        when(isFsave || isFrestore) {
+          o.illegal    := False
+          o.op         := DecOp.MOVE
+          o.size       := Size.LONG
+          o.sysOp      := True
+          o.sysKind    := Mux(isFsave, SysKind.FSAVE, SysKind.FRESTORE)
+          o.sysReadDir := False    // both take An as a SOURCE value (PTEST's precedent)
+          o.srcA.setNone(); o.srcB.setNone()
+          o.dst.setNone(); o.dstWrites := False
+        }
         // ── F-line FP-GENERIC (cpGEN): `1111 001 000 mmmrrr` ────────────────────
         // Coprocessor ID 001 (the FPU) + type field 000 (the general FP instruction,
         // as opposed to 001=FScc/FDBcc/FTRAPcc, 010=FBcc.W, 011=FBcc.L, and the

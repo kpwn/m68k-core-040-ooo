@@ -2144,6 +2144,39 @@ object MicroOpAssembler {
         opUop.dstValid := False
         opUop.useImm := False
       }
+      // FSAVE / FRESTORE (Task 11): the An is op[2:0] (the standard <ea> reg field, NOT
+      // the op[11:9] the base `anField` uses) -- same override precedent as MOVE_USP's
+      // `uspAn` / PTEST's `ptestAn`. An's VALUE rides srcB so the ALU EU's plain MOVE
+      // writeback lands it in `sysValStore` -> `sysCapVal`, giving S_APPLY the frame base
+      // address.
+      //
+      // For the AUTO-UPDATE modes (FSAVE -(An), FRESTORE (An)+) the An must ALSO be
+      // written back. dstReg=An with dstValid=True makes rename allocate a pdst that the
+      // ROB commits at the serializing retire, and the FSM writes the updated value into
+      // PRF[pdst] through the existing `sysRegWrite*` port -- byte-for-byte MOVEC's and
+      // MOVE_USP's read-direction mechanism. The EU's own writeback into that pdst (which
+      // for op=MOVE is just An's old value) is overwritten by the FSM at commit; that
+      // EU-writes-then-FSM-overwrites shape is exactly what MOVE_USP's read arm already
+      // relies on.
+      //
+      // imm[3:0] carries the EA mode (imm[3:1]) and an isRestore marker (imm[0]) through
+      // the SAME imm -> `RobPlugin`'s `p.sysRc := u.imm(11 downto 0)` -> `sysCapRc`
+      // side-channel that MOVEC's Rc id and CPUSH/CINV's {scope,cacheSel} nibble use.
+      when(spec.sysKind === SysKind.FSAVE || spec.sysKind === SysKind.FRESTORE) {
+        val fsvAn     = (U(8, 5 bits) + op(2 downto 0).asUInt).resize(5)
+        val fsvIsRest = spec.sysKind === SysKind.FRESTORE
+        // -(An) is mode 100 (FSAVE only); (An)+ is mode 011 (FRESTORE only). Plain (An)
+        // (mode 010) writes nothing back. The decoder already restricted the admitted
+        // modes per direction, so testing both here is safe and self-documenting.
+        val fsvAuto   = (op(5 downto 3) === B"3'b100") || (op(5 downto 3) === B"3'b011")
+        opUop.srcBReg   := fsvAn; opUop.srcBValid := True
+        opUop.srcAValid := False
+        opUop.useImm    := False   // srcB is a REAL register read (An), like MOVEC/PTEST
+        opUop.imm       := (op(5 downto 3) ## fsvIsRest.asBits).resize(32)
+        opUop.dstReg    := fsvAn
+        opUop.dstValid  := fsvAuto
+        opUop.isMovea   := True    // An destination: full-32 write, no partial merge
+      }
     }
     when(isTrapOp) {
       // Unconditional faulted µop: vector 32+n, delivered at retire (format-$0).

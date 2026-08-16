@@ -244,6 +244,43 @@ trait FpuControlService {
   def roundingMode: Bits
   def precision:    Bits
   def excEnable:    Bits
+
+  // ── Task 11: FSAVE state-frame selection state ────────────────────────────────
+  /** Sticky "at least one NONCONDITIONAL floating-point instruction has executed since
+    * the last hardware reset or FRESTORE of a null state frame". Selects the NULL frame
+    * (False) vs the IDLE frame (True) at FSAVE time.
+    *
+    * MC68040 UM (1989 1st ed.) section 9.7, page 9-30: "A null state frame is saved if
+    * no floating-point instructions have been executed since the last hardware reset or
+    * FRESTORE of a null state frame ... An idle state frame is saved if no exceptions
+    * are pending, and at least one instruction has been executed since the last hardware
+    * reset or FRESTORE of a null state frame."  The rev-1 manual (section 9.7) adds the
+    * explicit conditional-instruction carve-out: "Floating-point conditional instructions
+    * do not set an internal flag, which changes the state frame from null to idle" —
+    * FNOP/FBcc/FDBcc/FScc/FTRAPcc must NOT set it.  This project drives it from an FP
+    * REGISTER WRITE at commit (`CommitSlot.fpWrite`), which is a conservative subset of
+    * "nonconditional": every conditional in that list writes no FP register, so none of
+    * them can set it. */
+  def everExecuted:    Bool
+  def setEverExecuted: Flow[Bool]
+
+  /** Latched unimplemented-instruction state, captured when a RECOGNIZED-but-unsupported
+    * FP op is delivered to vector 11 (Task 10's `fpuSoftwareComplete` path). A subsequent
+    * FSAVE emits the 44-byte unimplemented-instruction state frame built from it instead
+    * of the 4-byte idle frame; emitting the frame CONSUMES the state (`uiValid` clears),
+    * which is the whole "route to FPSP" hand-off: the trap tells the handler THAT
+    * something unsupported happened, the frame tells it WHAT.
+    *
+    * `uiSrcOperand`/`uiDstOperand` are 80-bit extended-precision values laid out
+    * {sign[79], exponent[78:64], mantissa[63:0]} — the shape the frame's ETS/ETE/ETM
+    * (source) and FPTS/FPTE/FPTM (destination) fields want. */
+  def uiValid:       Bool
+  def uiCmdReg1B:    Bits   // 16 — CMDREG1B, the faulting instruction's command word
+  def uiSrcOperand:  Bits   // 80 — ETEMP (source operand, extended precision)
+  def uiDstOperand:  Bits   // 80 — FPTEMP (destination operand, extended precision)
+  /** Packed {cmd[175:160], src[159:80], dst[79:0]} = 176 bits. */
+  def setUnimpFrame: Flow[Bits]
+  def clearUnimp:    Flow[Bool]
 }
 
 /** The external interrupt inputs (simple protocol): a 3-bit IPL plus the SoC's

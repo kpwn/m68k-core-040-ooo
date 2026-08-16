@@ -290,7 +290,17 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
         val move16  = (op & 0xFFF8) == 0xF620                                  // (Ax)+,(Ay)+ form
         val fsf     = op == 0xF27F                                             // task #180 carve-out
         val cpgen   = ((op >> 9) & 0x7) == 1 && ((op >> 6) & 0x7) == 0         // 0xF200-0xF23F
-        cpush || pflush || ptest || move16 || fsf || cpgen
+        // Task 11: FSAVE (0xF300|<ea>, opclass 100) / FRESTORE (0xF340|<ea>, opclass
+        // 101), register-indirect EA modes only -- FSAVE takes -(An) (mode 100) and (An)
+        // (mode 010); FRESTORE takes (An)+ (mode 011) and (An) (mode 010). Every OTHER
+        // <ea> mode in those two opclass bands is deliberately still a vector-11 trap
+        // (displacement/absolute forms are out of scope: the commit-time sysOp path has
+        // no AGU), so this exclusion is narrow on purpose and the sweep still covers them.
+        val fsave    = ((op & 0xFFC0) == 0xF300) &&
+                       (((op >> 3) & 7) == 4 || ((op >> 3) & 7) == 2)
+        val frestore = ((op & 0xFFC0) == 0xF340) &&
+                       (((op >> 3) & 7) == 3 || ((op >> 3) & 7) == 2)
+        cpush || pflush || ptest || move16 || fsf || cpgen || fsave || frestore
       }
       val bad = scala.collection.mutable.ArrayBuffer[String]()
       var swept = 0
