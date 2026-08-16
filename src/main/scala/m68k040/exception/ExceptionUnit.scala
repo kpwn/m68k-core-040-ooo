@@ -923,38 +923,97 @@ class ExceptionUnit(
 
   // ══ FSAVE / FRESTORE state frames (Task 11) ═══════════════════════════════════
   //
-  // PRIMARY SOURCE for every offset and every field position below (Step 2, executed --
-  // this is a transcription off the rendered figure, not a derivation):
-  //   MC68040 User's Manual, 1989 FIRST EDITION, section 9.7 "Floating-Point State
-  //   Frames", **Figure 9-7 "Floating-Point State Frames (Sheet 2 of 2)", page 9-32**,
-  //   with the field SEMANTICS from the definition list on pages 9-33/9-34.
-  // Independently corroborated against Motorola's own FPSP (fpsp040) frame offsets --
-  // STAG at +$04, CMDREG1B at +$08, DTAG at +$0C, the E1/E3 byte at +$10 with E1 = bit
-  // 2, FPTEMP at +$14, ETEMP at +$20 -- which agree with the figure exactly.
+  // ── WHICH unimplemented-instruction frame: 52 bytes (mask rev B), by USER DECISION ──
+  // Task 11 originally built the 44-byte / $28 frame of the MC68040 UM's 1989 FIRST
+  // EDITION (Figure 9-7). That edition and the LATER revision (M68040UM/AD rev 1, section
+  // 9.7, same figure renumbered **Figure 9-10**) genuinely disagree: rev 1 specifies a
+  // **26-word / 52-byte** frame with length code **$30** and says so in prose in four
+  // separate places (MC68040UM.txt lines 25816, 26927, 26930, 26941 -- e.g. verbatim "the
+  // FSAVE generates a 26-word unimplemented instruction state frame"), and its figure (d)
+  // runs $00..$30 = 13 longwords. The null, idle and busy frames are identical in both.
+  // The user was asked which to target and chose **52 bytes (mask rev B)**, because that
+  // is what the real Quadra 700 Mac ROM FPSP is written against and this project's stated
+  // FPU goal is to make real System 7 / 68040 ROM software reachable.
   //
-  //   $00  [31:24] VERSION NUMBER   [23:16] $28 (length code)  [15:0] reserved
-  //   $04  [31:29] STAG             (3-bit source data type)   rest reserved
-  //   $08  [31:16] CMDREG1B         (the faulting command word) [15:0] reserved
-  //   $0C  [31:29] DTAG             (3-bit destination data type) rest reserved
-  //   $10  bit 26 = E1              (i.e. byte $10 bit 2)      rest reserved
-  //   $14  [31] FPTS  [30:16] FPTE  [15:0] reserved     } FPTEMP = DESTINATION operand
-  //   $18  FPTM[63:32]                                  }
-  //   $1C  FPTM[31:00]                                  }
-  //   $20  [31] ETS   [30:16] ETE   [15:0] reserved     } ETEMP  = SOURCE operand
-  //   $24  ETM[63:32]                                   }
-  //   $28  ETM[31:00]                                   }
-  //                                        11 longwords = 44 bytes = 22 words
+  // ── The 52-byte layout, and exactly how confident each row is ──────────────────
+  // Three independent sources, in decreasing order of directness:
+  //   [ROM]    Live disassembly of the Q700 ROM FPSP (mroms/420DBFF3, base $40800000).
+  //            Its F-line handler at $4088D9FE does `linkw %fp,#-192 ; fsave %sp@-`, so a
+  //            52-byte frame's base is exactly `%fp@(-244)` and a field at frame+N is
+  //            `%fp@(N-244)`. The SYNTHETIC path at $4088DA4A..$4088DA60 is decisive for
+  //            the header: on seeing version byte $41 it does `subaw #48,%sp ;
+  //            moveb #65,%sp@ ; moveb #48,%sp@(1) ; clrw %sp@(2)` -- i.e. it MANUFACTURES
+  //            the very frame we must emit: version $41, length byte $30 = 48 extra bytes,
+  //            4 + 48 = 52 total, reserved word zero. Then it branches into the handler
+  //            body, so every subsequent `%fp@(-2xx)` in that body IS a 52-byte-frame
+  //            field reference.
+  //   [FIG]    MC68040 UM rev 1, Figure 9-10 sheet 2, sub-figure (d). Its offset column is
+  //            $00,$04,...,$30 and its field-label set is Figure 9-7's PLUS CMDREG3B and
+  //            the write-back-stage flag bits (E3, T, SBIT, WBTM0, WBTM1, WBTM66, WBTE15)
+  //            -- confirmed by counting label occurrences across sheets 1 and 2.
+  //   [DER]    Derived: the Figure-9-7 chain STAG -> CMDREG1B -> DTAG -> E1 -> FPTEMP ->
+  //            ETEMP is preserved at a constant +4 stride, anchored on the [ROM] points.
   //
-  // NOTE, RECORDED BECAUSE IT IS A REAL PRIMARY-SOURCE CONFLICT AND NOT A TRANSCRIPTION
-  // SLIP: the LATER revision of this manual (M68040UM/AD rev 1, section 9.7, where the
-  // same figure is renumbered **Figure 9-10**) specifies a **26-word / 52-byte**
-  // unimplemented-instruction frame with length code $30, and says so in prose in four
-  // separate places. The 1989 first edition says 22 words / 44 bytes / $28, which is what
-  // the approved design spec (docs/superpowers/specs/2026-08-14-fpu-fpsp-design.md) locked
-  // and what this task implements. The two editions genuinely disagree; the null, idle and
-  // busy frames are identical in both. Changing to the 52-byte shape is a DESIGN-level
-  // decision, not an implementation choice, and is flagged for one -- see this task's
-  // report. Nothing else in this file depends on which is chosen.
+  //   $00  [31:24] VERSION = $41  [23:16] $30 (length code)  [15:0] reserved     [ROM]
+  //   $04  reserved -- we emit 0                                                 [FIG]
+  //   $08  reserved -- we emit 0                                                 [FIG]
+  //   $0C  [31:29] STAG   (3-bit source data type), rest reserved                [DER]
+  //   $10  [31:16] CMDREG1B (the faulting command word), [15:0] reserved         [ROM]
+  //   $14  [31:29] DTAG   (3-bit destination data type), rest reserved           [ROM]
+  //   $18  bit 26 = E1    (i.e. byte $18 bit 2), rest reserved                   [ROM]
+  //   $1C  [31] FPTS  [30:16] FPTE  [15:0] reserved     } FPTEMP = DESTINATION   [ROM]
+  //   $20  FPTM[63:32]                                  }
+  //   $24  FPTM[31:00]                                  }
+  //   $28  [31] ETS   [30:16] ETE   [15:0] reserved     } ETEMP  = SOURCE        [ROM]
+  //   $2C  ETM[63:32]                                   }
+  //   $30  ETM[31:00]                                   }
+  //                                        13 longwords = 52 bytes = 26 words
+  //
+  // The [ROM] citations, instruction for instruction:
+  //   $10 CMDREG1B : $4088DA86 `movew %d0,%fp@(-228)` writes the F-line instruction's
+  //                  coprocessor command word (the ext word of the longword loaded from
+  //                  the faulting PC) to frame+$10; and the handler's `b1238_fix` reads it
+  //                  back as a command word -- $4088DBF2 `bfextu %fp@(-228){#3:#3}` picks
+  //                  CMDREG1B[12:10] (SRC Rx) and $4088DC02 `{#6:#3}` picks [9:7] (DST
+  //                  Ry), exactly the Figure-9-11 bit map. $4088DC3C `bfins %d0,
+  //                  %fp@(-228),0,6` rewrites its opclass/src field in place.
+  //   $14 DTAG     : $4088DC6A `movel %fp@(-224),%fp@(-68)` copies frame+$14 to a local and
+  //                  $4088DC70 `andil #$E0000000,%fp@(-68)` masks it to bits [31:29] -- a
+  //                  3-bit tag in exactly the position Figure 9-7 documents for DTAG, one
+  //                  longword above CMDREG1B just as in the 44-byte frame.
+  //   $18 E1       : $4088DF60 `bset #2,%fp@(-220)` / $4088DF74 `bclr #2,%fp@(-220)` set and
+  //                  clear E1, and $4088DF6E `bset #1,%fp@(-220)` sets E3 -- Motorola's
+  //                  `E_BYTE` with `E1 = 2` / `E3 = 1`, at frame+$18, byte 0. The bit
+  //                  POSITION (byte bit 2 = longword bit 26) is unchanged from the 44-byte
+  //                  frame; only the longword it lives in moved $10 -> $18.
+  //   $1C FPTEMP   : $4088D990 `lea %fp@(-216),%a0` takes the address of a 12-byte extended
+  //                  operand at frame+$1C -- the 12 bytes immediately below ETEMP.
+  //   $28 ETEMP    : $4088DC32 `fmovemx %d0,%fp@(-204)` writes a 12-byte extended value to
+  //                  frame+$28, and $4088DE14 `cmpiw #$407F,%fp@(-204)` inspects its
+  //                  sign/exponent word. frame+$28 + 12 = 52, i.e. ETEMP is exactly the
+  //                  LAST 12 bytes of the frame -- which is what pins the base at
+  //                  `%fp@(-244)` and therefore every other offset above.
+  //
+  // HONEST LABELLING of the two rows that are NOT directly pinned:
+  //   $04 / $08 are the two longwords this frame has that the 44-byte frame does not, and
+  //   we emit ZERO into both. That is a deliberate, safe choice rather than a claim about
+  //   their content. What is known: Figure 9-10(d) adds CMDREG3B and the write-back-stage
+  //   flags to this frame's field set, and the ROM's `b1238_fix` reads a command-register-
+  //   shaped word out of frame+$00's low half and frame+$04's high half ($4088DC0C
+  //   `bfextu %fp@(-244){#6:#3}` and $4088DBF8 `bfextu %fp@(-240){#6:#3}`, the classic
+  //   CMDREG3B / CMDREG2B destination-register compare) -- so $04 most likely carries
+  //   CMDREG2B and $00's reserved word most likely carries CMDREG3B. Both describe E3
+  //   (write-back-stage) exceptions, and this core's FP EU has no write-back-stage
+  //   exception state at all: it raises E1 only, and an E1-only frame legitimately reports
+  //   E3 = 0 with no CMDREG2B/CMDREG3B. Emitting zero is therefore not a placeholder for
+  //   missing data, it IS the correct content -- and it is what the FPSP requires, since it
+  //   checks E3 first and skips the whole E3 path when the bit is clear.
+  //   STAG at $0C is [DER], not [ROM]: no ROM instruction unambiguously reads a [31:29] tag
+  //   there. It is placed at CMDREG1B-4 because that is its position relative to CMDREG1B
+  //   in Figure 9-7, and because the ROM does manipulate a tag-shaped flag in that same
+  //   byte ($4088DC4A/$4088DC54 `bclr`/`bset #4,%fp@(-232)`, gated on the source mantissa's
+  //   explicit-integer bit at $4088DC42 `btst #6,%fp@(-204)` -- i.e. "mark the source
+  //   normalized vs unnormalized", which is precisely what STAG encodes).
   //
   // The FPU state-frame VERSION byte, finalized here as the design spec directs ("$40 is
   // a reasonable default choice ... finalized at implementation time, not a design
@@ -971,13 +1030,13 @@ class ExceptionUnit(
   val fsSize      = Reg(UInt(8 bits))                            // total frame size in BYTES
   val fsIsNull    = RegInit(False)
   val fsIsUnimp   = RegInit(False)
-  val fsStep      = Reg(UInt(5 bits)) init 0; fsStep.simPublic() // WORD index, 0..21
+  val fsStep      = Reg(UInt(5 bits)) init 0; fsStep.simPublic() // WORD index, 0..25
   val fsSplitLow  = RegInit(False)
   val fsAnWrite   = RegInit(False)                               // does this op write An back?
-  // Translate-on-VPN-change bookkeeping (design addendum point 3). A 44-byte frame spans
+  // Translate-on-VPN-change bookkeeping (design addendum point 3). A 52-byte frame spans
   // at most one page boundary, so a full replica of LsEuPlugin's two-pass cross-page split
   // is disproportionate: compare each step's VPN against the last translated one and
-  // re-request only when it changes. At most 2 translation requests per frame, never 22,
+  // re-request only when it changes. At most 2 translation requests per frame, never 26,
   // and every word still gets a real, current translation.
   val fsPpn      = Reg(UInt(20 bits)) init 0
   val fsLastVpn  = Reg(UInt(20 bits)) init 0
@@ -1010,35 +1069,39 @@ class ExceptionUnit(
     // enum -- the pop size is 4 + this byte, for every frame flavour).
     //   null : $00 $00   (version FORCED to $00 -- identifies null)
     //   idle : $41 $00   (0 extra bytes)
-    //   unimp: $41 $28   (40 extra bytes -> 44 total)
+    //   unimp: $41 $30   (48 extra bytes -> 52 total; byte-for-byte the header the Q700
+    //                     ROM FPSP manufactures for itself at $4088DA52..$4088DA60)
     val hdr = Mux(fsIsNull,  B(0x0000, 16 bits),
-              Mux(fsIsUnimp, B((FPU_FRAME_VERSION << 8) | 0x28, 16 bits),
+              Mux(fsIsUnimp, B((FPU_FRAME_VERSION << 8) | 0x30, 16 bits),
                              B((FPU_FRAME_VERSION << 8) | 0x00, 16 bits)))
     val src = fpuCtrl.uiSrcOperand   // ETEMP  : [79] sign, [78:64] exponent, [63:0] mantissa
     val dst = fpuCtrl.uiDstOperand   // FPTEMP : same layout
     switch(step) {
       is(U(0,  5 bits)) { out := hdr }                                        // $00 version|len
-      is(U(2,  5 bits)) { out := fpTag(src) ## B(0, 13 bits) }                // $04 STAG  [31:29]
-      is(U(4,  5 bits)) { out := fpuCtrl.uiCmdReg1B }                         // $08 CMDREG1B [31:16]
-      is(U(6,  5 bits)) { out := fpTag(dst) ## B(0, 13 bits) }                // $0C DTAG  [31:29]
-      is(U(8,  5 bits)) { out := B(0, 5 bits) ## True ## B(0, 10 bits) }      // $10 E1 = bit 26
-      is(U(10, 5 bits)) { out := dst(79 downto 64) }                          // $14 FPTS|FPTE
-      is(U(12, 5 bits)) { out := dst(63 downto 48) }                          // $18 FPTM[63:32]
-      is(U(13, 5 bits)) { out := dst(47 downto 32) }
-      is(U(14, 5 bits)) { out := dst(31 downto 16) }                          // $1C FPTM[31:00]
-      is(U(15, 5 bits)) { out := dst(15 downto 0) }
-      is(U(16, 5 bits)) { out := src(79 downto 64) }                          // $20 ETS|ETE
-      is(U(18, 5 bits)) { out := src(63 downto 48) }                          // $24 ETM[63:32]
-      is(U(19, 5 bits)) { out := src(47 downto 32) }
-      is(U(20, 5 bits)) { out := src(31 downto 16) }                          // $28 ETM[31:00]
-      is(U(21, 5 bits)) { out := src(15 downto 0) }
+      // steps 2..5 ($04, $08) are the two longwords the 52-byte frame adds over the
+      // 44-byte one. Reserved as far as this core is concerned -- see the field table
+      // above for why zero is the CORRECT content here and not a placeholder.
+      is(U(6,  5 bits)) { out := fpTag(src) ## B(0, 13 bits) }                // $0C STAG  [31:29]
+      is(U(8,  5 bits)) { out := fpuCtrl.uiCmdReg1B }                         // $10 CMDREG1B [31:16]
+      is(U(10, 5 bits)) { out := fpTag(dst) ## B(0, 13 bits) }                // $14 DTAG  [31:29]
+      is(U(12, 5 bits)) { out := B(0, 5 bits) ## True ## B(0, 10 bits) }      // $18 E1 = bit 26
+      is(U(14, 5 bits)) { out := dst(79 downto 64) }                          // $1C FPTS|FPTE
+      is(U(16, 5 bits)) { out := dst(63 downto 48) }                          // $20 FPTM[63:32]
+      is(U(17, 5 bits)) { out := dst(47 downto 32) }
+      is(U(18, 5 bits)) { out := dst(31 downto 16) }                          // $24 FPTM[31:00]
+      is(U(19, 5 bits)) { out := dst(15 downto 0) }
+      is(U(20, 5 bits)) { out := src(79 downto 64) }                          // $28 ETS|ETE
+      is(U(22, 5 bits)) { out := src(63 downto 48) }                          // $2C ETM[63:32]
+      is(U(23, 5 bits)) { out := src(47 downto 32) }
+      is(U(24, 5 bits)) { out := src(31 downto 16) }                          // $30 ETM[31:00]
+      is(U(25, 5 bits)) { out := src(15 downto 0) }
       // every other word is reserved -> 0 (the default above)
     }
     out
   }
-  /** 22 words ($2C bytes) for the unimplemented-instruction frame, 2 words (4 bytes) for
-    * null and idle alike (both are a single longword per Figure 9-7). */
-  val fsLastStep = Mux(fsIsUnimp, U(21, 5 bits), U(1, 5 bits))
+  /** 26 words ($34 bytes) for the unimplemented-instruction frame, 2 words (4 bytes) for
+    * null and idle alike (both are a single longword, unchanged between manual editions). */
+  val fsLastStep = Mux(fsIsUnimp, U(25, 5 bits), U(1, 5 bits))
 
   val fsm = new StateMachine {
     val IDLE      = new State with EntryPoint
@@ -1190,7 +1253,7 @@ class ExceptionUnit(
         curFault  := entryFaultAddr
         // ── Task 11: capture the unimplemented-instruction state ─────────────────
         // A RECOGNIZED-but-unsupported FP op is being handed to FPSP via vector 11.
-        // Latch what a subsequent FSAVE needs to build the 44-byte unimplemented-
+        // Latch what a subsequent FSAVE needs to build the 52-byte unimplemented-
         // instruction frame: the command word (CMDREG1B) plus both operands, from which
         // STAG/DTAG and the FPTS/FPTE/FPTM + ETS/ETE/ETM fields are derived at emit time.
         // Non-speculative: exception delivery is at commit.
@@ -1907,7 +1970,7 @@ class ExceptionUnit(
           //   idle                      : otherwise
           val isUnimp = fpuCtrl.uiValid
           val isNull  = !fpuCtrl.everExecuted && !isUnimp
-          val size    = Mux(isUnimp, U(44, 8 bits), U(4, 8 bits))
+          val size    = Mux(isUnimp, U(52, 8 bits), U(4, 8 bits))
           fsIsNull  := isNull
           fsIsUnimp := isUnimp
           fsSize    := size
@@ -2087,7 +2150,7 @@ class ExceptionUnit(
     F_STORE.whenIsActive {
       when(fsNeedXlate) {
         // A step (or a split phase) walked into a new page -- re-translate before
-        // touching memory. At most one re-entry per frame in practice: 44 bytes can
+        // touching memory. At most one re-entry per frame in practice: 52 bytes can
         // cross at most one page boundary.
         goto(F_XREQ)
       } otherwise {
@@ -2165,8 +2228,10 @@ class ExceptionUnit(
         // Pop size = 4 + the length-in-hex indicator, for EVERY frame flavour. This is
         // the one FRESTORE rule that is architecturally universal, and it is exactly what
         // `fsave_frestore_basic.s`'s pop-size matrix checks (NULL -> 4, $28 -> 44,
-        // $60 -> 100, and the FPSP's manufactured version-$41/size-$00 pseudo-null -> 4).
-        // It costs nothing to get right for frame shapes this core never EMITS.
+        // $30 -> 52, $60 -> 100, and the FPSP's manufactured version-$41/size-$00
+        // pseudo-null -> 4). It costs nothing to get right for frame shapes this core
+        // never EMITS -- and note this rule needed NO change when FSAVE's own frame moved
+        // from 44 to 52 bytes, which is exactly the point of keeping it length-byte-driven.
         fsSize := (U(4, 9 bits) + lenByte.resize(9)).resize(8)
         // A NULL frame (version byte $00) aborts all FPU operations and puts the FPU into
         // the RESET state -- MC68040 UM (1989 1st ed.) p.9-30: "When an FRESTORE of a null

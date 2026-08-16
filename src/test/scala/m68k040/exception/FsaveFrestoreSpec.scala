@@ -16,11 +16,14 @@ import org.scalatest.funsuite.AnyFunSuite
   * there is nothing for a lock-step oracle to referee here. The MC68040 User's Manual is
   * the reference and memory contents are the assertion.
   *
-  * FRAME LAYOUT PRIMARY SOURCE (this task's blocking Step 2, executed): MC68040 User's
-  * Manual, 1989 first edition, **Figure 9-7 "Floating-Point State Frames (Sheet 2 of 2)",
-  * page 9-32**, field semantics from the definition list on pages 9-33/9-34. See
-  * `ExceptionUnit.fsFrameWordData` for the full transcribed table, including the recorded
-  * conflict with the later manual revision's 26-word/52-byte variant.
+  * FRAME LAYOUT PRIMARY SOURCE: the unimplemented-instruction frame is the **26-word /
+  * 52-byte** shape of the MC68040 UM's LATER revision (M68040UM/AD rev 1, section 9.7,
+  * **Figure 9-10 sheet 2, sub-figure (d)**, length code `$30`) -- "mask rev B" -- chosen by
+  * explicit user decision over the 1989 first edition's 22-word/44-byte Figure 9-7, because
+  * it is what the real Quadra 700 Mac ROM FPSP is written against. Field offsets are pinned
+  * against a live disassembly of that ROM; see `ExceptionUnit.fsFrameWordData`'s table for
+  * the per-row citations and the honest confidence labelling. Null and idle frames are
+  * identical between the two manual editions and are unaffected.
   */
 class FsaveFrestoreSpec extends AnyFunSuite {
   // ONE Verilator build for the whole suite. Hoisted deliberately: compiling the DUT
@@ -210,8 +213,8 @@ class FsaveFrestoreSpec extends AnyFunSuite {
     assert(r.a7 == base, f"A7 must be 0x$base%08X, got 0x${r.a7}%08X")
   }
 
-  test("FSAVE -(A7) with a pending unimplemented instruction emits the 44-byte frame " +
-       "with MC68040 UM Figure 9-7's exact field placement", VerilatorTest) {
+  test("FSAVE -(A7) with a pending unimplemented instruction emits the 52-byte frame " +
+       "with MC68040 UM Figure 9-10(d)'s exact field placement", VerilatorTest) {
     // Sentinel operands, laid out {sign[79], exponent[78:64], mantissa[63:0]}.
     //   src (ETEMP)  : sign 0, exponent 0x4001, mantissa 0xC0FFEE0011223344 -> NORMALIZED (000)
     //   dst (FPTEMP) : sign 1, exponent 0x7FFF, mantissa 0                  -> INFINITY   (010)
@@ -219,51 +222,62 @@ class FsaveFrestoreSpec extends AnyFunSuite {
     val dst80 = (BigInt(1) << 79) | (BigInt(0x7FFF) << 64)
     val r = run(s"$fsaveA7 ; done: bra.s done", everExecuted = true,
                 unimp = Some((0xBEEF, src80, dst80)), name = "fsave-unimp")
-    val base = StackTop - 44
-    assert(r.a7 == base, f"FSAVE -(A7) of the 44-byte frame must leave A7 = 0x$base%08X, got 0x${r.a7}%08X")
+    val base = StackTop - 52
+    assert(r.a7 == base, f"FSAVE -(A7) of the 52-byte frame must leave A7 = 0x$base%08X, got 0x${r.a7}%08X")
     assert(frameByte(r, base, 0) == 0x41, "unimplemented frame version byte")
-    assert(frameByte(r, base, 1) == 0x28,
-      f"length indicator must be 0x28 (40 extra bytes = 44 total); got 0x${frameByte(r, base, 1)}%02X")
-    // $04 [31:29] STAG -- source is normalized -> 000.
-    assert((frameByte(r, base, 0x04) >> 5) == 0x0,
-      f"STAG at byte 0x04 bits 7:5 must be 000 (Normalized); got 0x${frameByte(r, base, 0x04)}%02X")
-    // $08 [31:16] CMDREG1B -- the one offset the design spec independently anchors.
-    assert(frameWord(r, base, 0x08) == 0xBEEF,
-      f"CMDREG1B at offset 0x08; got 0x${frameWord(r, base, 0x08)}%04X")
-    // $0C [31:29] DTAG -- destination is infinity -> 010.
-    assert((frameByte(r, base, 0x0C) >> 5) == 0x2,
-      f"DTAG at byte 0x0C bits 7:5 must be 010 (Infinity); got 0x${frameByte(r, base, 0x0C)}%02X")
-    // $10 bit 2 = E1 (an unimplemented-instruction frame always reports the CU-detected
-    // exception). Corroborated by Motorola's own FPSP: `E_BYTE` at +$10, `E1` = bit 2.
-    assert((frameByte(r, base, 0x10) & 0x04) != 0,
-      f"E1 must be bit 2 of the byte at offset 0x10; got 0x${frameByte(r, base, 0x10)}%02X")
-    // $14 FPTS|FPTE, $18..$1F FPTM -- the DESTINATION operand (FPTEMP).
-    assert(frameWord(r, base, 0x14) == 0xFFFF,
-      f"FPTS|FPTE at 0x14 must be sign 1 | exponent 0x7FFF; got 0x${frameWord(r, base, 0x14)}%04X")
-    for (off <- Seq(0x18, 0x1A, 0x1C, 0x1E))
+    // Byte-for-byte the header the Q700 ROM FPSP manufactures for itself at $4088DA52:
+    // `subaw #48,%sp ; moveb #65,%sp@ ; moveb #48,%sp@(1) ; clrw %sp@(2)`.
+    assert(frameByte(r, base, 1) == 0x30,
+      f"length indicator must be 0x30 (48 extra bytes = 52 total); got 0x${frameByte(r, base, 1)}%02X")
+    // $0C [31:29] STAG -- source is normalized -> 000.
+    assert((frameByte(r, base, 0x0C) >> 5) == 0x0,
+      f"STAG at byte 0x0C bits 7:5 must be 000 (Normalized); got 0x${frameByte(r, base, 0x0C)}%02X")
+    // $10 [31:16] CMDREG1B -- ROM-pinned: $4088DA86 `movew %d0,%fp@(-228)` with the frame
+    // base at %fp@(-244), and `b1238_fix`'s bfextu reads at the same address.
+    assert(frameWord(r, base, 0x10) == 0xBEEF,
+      f"CMDREG1B at offset 0x10; got 0x${frameWord(r, base, 0x10)}%04X")
+    // $14 [31:29] DTAG -- destination is infinity -> 010. ROM-pinned: $4088DC6A/$4088DC70
+    // copy %fp@(-224) and mask it with #$E0000000.
+    assert((frameByte(r, base, 0x14) >> 5) == 0x2,
+      f"DTAG at byte 0x14 bits 7:5 must be 010 (Infinity); got 0x${frameByte(r, base, 0x14)}%02X")
+    // $18 bit 2 = E1 (an unimplemented-instruction frame always reports the CU-detected
+    // exception). ROM-pinned: $4088DF60 `bset #2,%fp@(-220)` / $4088DF74 `bclr #2,...`.
+    assert((frameByte(r, base, 0x18) & 0x04) != 0,
+      f"E1 must be bit 2 of the byte at offset 0x18; got 0x${frameByte(r, base, 0x18)}%02X")
+    // $1C FPTS|FPTE, $20..$27 FPTM -- the DESTINATION operand (FPTEMP).
+    assert(frameWord(r, base, 0x1C) == 0xFFFF,
+      f"FPTS|FPTE at 0x1C must be sign 1 | exponent 0x7FFF; got 0x${frameWord(r, base, 0x1C)}%04X")
+    for (off <- Seq(0x20, 0x22, 0x24, 0x26))
       assert(frameWord(r, base, off) == 0x0000,
         f"FPTM word at 0x$off%02X must be 0; got 0x${frameWord(r, base, off)}%04X")
-    // $20 ETS|ETE, $24..$2B ETM -- the SOURCE operand (ETEMP).
-    assert(frameWord(r, base, 0x20) == 0x4001,
-      f"ETS|ETE at 0x20 must be sign 0 | exponent 0x4001; got 0x${frameWord(r, base, 0x20)}%04X")
-    assert(frameWord(r, base, 0x24) == 0xC0FF, f"ETM[63:48]; got 0x${frameWord(r, base, 0x24)}%04X")
-    assert(frameWord(r, base, 0x26) == 0xEE00, f"ETM[47:32]; got 0x${frameWord(r, base, 0x26)}%04X")
-    assert(frameWord(r, base, 0x28) == 0x1122, f"ETM[31:16]; got 0x${frameWord(r, base, 0x28)}%04X")
-    assert(frameWord(r, base, 0x2A) == 0x3344, f"ETM[15:00]; got 0x${frameWord(r, base, 0x2A)}%04X")
-    // Reserved words must be zero, not stale background.
+    // $28 ETS|ETE, $2C..$33 ETM -- the SOURCE operand (ETEMP), the LAST 12 bytes of the
+    // frame. ROM-pinned: $4088DC32 `fmovemx %d0,%fp@(-204)` = frame+$28, 12 bytes.
+    assert(frameWord(r, base, 0x28) == 0x4001,
+      f"ETS|ETE at 0x28 must be sign 0 | exponent 0x4001; got 0x${frameWord(r, base, 0x28)}%04X")
+    assert(frameWord(r, base, 0x2C) == 0xC0FF, f"ETM[63:48]; got 0x${frameWord(r, base, 0x2C)}%04X")
+    assert(frameWord(r, base, 0x2E) == 0xEE00, f"ETM[47:32]; got 0x${frameWord(r, base, 0x2E)}%04X")
+    assert(frameWord(r, base, 0x30) == 0x1122, f"ETM[31:16]; got 0x${frameWord(r, base, 0x30)}%04X")
+    assert(frameWord(r, base, 0x32) == 0x3344, f"ETM[15:00]; got 0x${frameWord(r, base, 0x32)}%04X")
+    // Reserved words must be zero, not stale background. $04/$08 are the two longwords the
+    // 52-byte frame adds over the 44-byte one; this core has no write-back-stage (E3)
+    // exception state, so zero there is the correct content, not a placeholder.
     assert(frameWord(r, base, 0x02) == 0x0000, "reserved word at 0x02")
-    assert(frameWord(r, base, 0x0A) == 0x0000, "reserved word at 0x0A")
+    for (off <- Seq(0x04, 0x06, 0x08, 0x0A))
+      assert(frameWord(r, base, off) == 0x0000,
+        f"the added longwords at 0x04/0x08 must be zero (E3 = 0, no CMDREG2B/CMDREG3B); " +
+        f"word at 0x$off%02X was 0x${frameWord(r, base, off)}%04X")
+    assert(frameWord(r, base, 0x12) == 0x0000, "reserved word at 0x12")
   }
 
   test("FSAVE CONSUMES the pending unimplemented state (a second FSAVE emits IDLE)", VerilatorTest) {
     val src80 = (BigInt(0x4001) << 64) | BigInt(0x1234)
     val r = run(s"$fsaveA7 ; $fsaveA7 ; done: bra.s done", everExecuted = true,
                 unimp = Some((0xBEEF, src80, BigInt(0))), name = "fsave-consume")
-    // First FSAVE pushes 44 bytes; the SECOND must be a 4-byte IDLE frame directly below it.
-    val second = StackTop - 44 - 4
+    // First FSAVE pushes 52 bytes; the SECOND must be a 4-byte IDLE frame directly below it.
+    val second = StackTop - 52 - 4
     assert(r.a7 == second,
-      f"after 44-byte + 4-byte frames A7 must be 0x$second%08X, got 0x${r.a7}%08X -- " +
-      "a second 44-byte frame means the pending state was never consumed")
+      f"after 52-byte + 4-byte frames A7 must be 0x$second%08X, got 0x${r.a7}%08X -- " +
+      "a second 52-byte frame means the pending state was never consumed")
     assert(frameByte(r, second, 0) == 0x41 && frameByte(r, second, 1) == 0x00,
       "the second FSAVE must emit an IDLE frame -- the first one consumed the pending state")
   }
@@ -272,12 +286,15 @@ class FsaveFrestoreSpec extends AnyFunSuite {
 
   test("FRESTORE (A0)+ pops 4 + the in-memory length byte, for every frame flavour", VerilatorTest) {
     // Architecturally universal, and exactly the matrix `fsave_frestore_basic.s` checks:
-    //   0x00000000 (null)                                  -> pop 4
-    //   0x41000000 (the FPSP's manufactured pseudo-null)    -> pop 4
-    //   0x41280000 (unimplemented instruction)              -> pop 44
-    //   0x41600000 (busy -- a shape this core never EMITS)  -> pop 100
+    //   0x00000000 (null)                                     -> pop 4
+    //   0x41000000 (the FPSP's manufactured pseudo-null)       -> pop 4
+    //   0x41280000 (unimplemented instruction, mask rev A)     -> pop 44
+    //   0x41300000 (unimplemented instruction, mask rev B --
+    //               the shape this core now EMITS)             -> pop 52
+    //   0x41600000 (busy -- a shape this core never EMITS)     -> pop 100
     for ((header, expectPop) <- Seq(0x00000000L -> 4, 0x41000000L -> 4,
-                                    0x41280000L -> 44, 0x41600000L -> 100)) {
+                                    0x41280000L -> 44, 0x41300000L -> 52,
+                                    0x41600000L -> 100)) {
       val r = run(f"lea 0x$RestoreBuf%08x,%%a0 ; $frestoreA0 ; done: bra.s done",
                   restoreHeader = Some(header), name = f"frestore-pop-$expectPop")
       // A0 is not directly visible; assert through a store instead would need another
@@ -291,7 +308,8 @@ class FsaveFrestoreSpec extends AnyFunSuite {
 
   test("FRESTORE (A0)+ advances A0 by 4 + the length byte (observed through a store)", VerilatorTest) {
     for ((header, expectPop) <- Seq(0x00000000L -> 4, 0x41000000L -> 4,
-                                    0x41280000L -> 44, 0x41600000L -> 100)) {
+                                    0x41280000L -> 44, 0x41300000L -> 52,
+                                    0x41600000L -> 100)) {
       val probe = 0x00025000L
       val r = run(
         f"lea 0x$RestoreBuf%08x,%%a0 ; $frestoreA0 ; move.l %%a0,0x$probe%08x ; done: bra.s done",
@@ -313,7 +331,7 @@ class FsaveFrestoreSpec extends AnyFunSuite {
     // state; it is now fixed structurally for EVERY sysOp whose own destination is A7
     // (see `ExceptionUnit.sysOwnA7Valid`) and the settle state is gone. This test still
     // guards exactly the same observable behavior, now against the general fix.
-    for ((header, expectPop) <- Seq(0x00000000L -> 4, 0x41280000L -> 44)) {
+    for ((header, expectPop) <- Seq(0x00000000L -> 4, 0x41300000L -> 52)) {
       val r = run(s"${".short 0xF35F"} ; done: bra.s done",   // FRESTORE (A7)+
                   restoreHeader = None, name = f"frestore-a7-$expectPop",
                   a7FrameHeader = Some(header))
@@ -366,23 +384,23 @@ class FsaveFrestoreSpec extends AnyFunSuite {
 
   // ── The translation-aware substrate (this task's whole point) ─────────────────
 
-  test("a 44-byte FSAVE frame that does not cross a page needs exactly ONE DTLB translation",
+  test("a 52-byte FSAVE frame that does not cross a page needs exactly ONE DTLB translation",
        VerilatorTest) {
-    // Regression guard against reverting to blind per-word retranslation: 22 words would
-    // mean 22 requests. StackTop-44 = 0x0002FFD4, comfortably inside one 4KB page.
+    // Regression guard against reverting to blind per-word retranslation: 26 words would
+    // mean 26 requests. StackTop-52 = 0x0002FFCC, comfortably inside one 4KB page.
     val src80 = (BigInt(0x4001) << 64) | BigInt(0x5555)
     val r = run(s"$fsaveA7 ; done: bra.s done", everExecuted = true,
                 unimp = Some((0xBEEF, src80, BigInt(0))), name = "fsave-one-xlate")
-    assert(r.a7 == StackTop - 44, "sanity: the 44-byte frame really was emitted")
+    assert(r.a7 == StackTop - 52, "sanity: the 52-byte frame really was emitted")
     assert(r.xlateReqs == 1,
-      s"a non-page-crossing 44-byte frame must issue exactly ONE DTLB translation " +
+      s"a non-page-crossing 52-byte frame must issue exactly ONE DTLB translation " +
       s"(translate-on-VPN-change); got ${r.xlateReqs}")
   }
 
   test("an FSAVE frame that STRADDLES a page boundary re-translates exactly once more",
        VerilatorTest) {
-    // Put the frame across a 4KB boundary: base = 0x00030000-44 is in page 0x2F, but if we
-    // move the stack to 0x00030014 the 44-byte frame spans 0x0002FFE8..0x00030013 -- both
+    // Put the frame across a 4KB boundary: base = 0x00030000-52 is in page 0x2F, but if we
+    // move the stack to 0x00030014 the 52-byte frame spans 0x0002FFE0..0x00030013 -- both
     // pages. Both are transparently translated, so the ONLY observable is the request count.
     val src80 = (BigInt(0x4001) << 64) | BigInt(0x5555)
     val image = ProgramAssembler.assemble(
@@ -437,7 +455,7 @@ class FsaveFrestoreSpec extends AnyFunSuite {
       a7 = dut.rob.logic.exc.ss.a7.toLong & 0xffffffffL
       assert(dmem != null)
     }
-    assert(a7 == 0x00030014L - 44, f"sanity: the 44-byte frame was emitted; A7 = 0x$a7%08X")
+    assert(a7 == 0x00030014L - 52, f"sanity: the 52-byte frame was emitted; A7 = 0x$a7%08X")
     assert(reqs == 2,
       s"a frame straddling ONE page boundary must translate exactly twice " +
       s"(translate-on-VPN-change, not per-word); got $reqs")
@@ -454,8 +472,8 @@ class FsaveFrestoreSpec extends AnyFunSuite {
     assert(r.coreHalted,
       "a faulting DTLB translation for an FSAVE frame store must drive coreHaltedIn")
     // And it must actually STOP: no frame word may have been written. The background is a
-    // deterministic 0 fill, and the header word would be 0x4128 if the store had gone ahead.
-    val base = StackTop - 44
+    // deterministic 0 fill, and the header word would be 0x4130 if the store had gone ahead.
+    val base = StackTop - 52
     assert(frameWord(r, base, 0) == 0x0000,
       f"the frame transfer must not proceed past the fault; header word was " +
       f"0x${frameWord(r, base, 0)}%04X")

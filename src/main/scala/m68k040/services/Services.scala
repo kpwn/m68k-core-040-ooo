@@ -266,7 +266,7 @@ trait FpuControlService {
 
   /** Latched unimplemented-instruction state, captured when a RECOGNIZED-but-unsupported
     * FP op is delivered to vector 11 (Task 10's `fpuSoftwareComplete` path). A subsequent
-    * FSAVE emits the 44-byte unimplemented-instruction state frame built from it instead
+    * FSAVE emits the 52-byte unimplemented-instruction state frame built from it instead
     * of the 4-byte idle frame; emitting the frame CONSUMES the state (`uiValid` clears),
     * which is the whole "route to FPSP" hand-off: the trap tells the handler THAT
     * something unsupported happened, the frame tells it WHAT.

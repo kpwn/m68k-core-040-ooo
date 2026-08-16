@@ -384,7 +384,7 @@ case class DecodedUop() extends Bundle {
   // True for an F-line opword this core RECOGNIZES as the register-to-register FPU
   // general form (Task 6's fpFormIsReg) that is NOT hardware-native (so it is routed to
   // FPSP via Task 6's own faultUsesNextPc mechanism). A subsequent FSAVE, if this bit was
-  // the most recent trap, emits the 44-byte unimplemented-instruction frame instead of the
+  // the most recent trap, emits the 52-byte unimplemented-instruction frame instead of the
   // 4-byte idle frame. DELIBERATELY NARROWER than Task 6's own faultUsesNextPc gate
   // (fpLenKnown, which covers every cpGEN form including memory-source, Task 6b): Task 11's
   // operand capture reads fpuCmdWord's ext[12:10]/ext[9:7] AS FP REGISTER NUMBERS, which is
