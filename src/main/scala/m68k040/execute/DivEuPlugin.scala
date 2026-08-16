@@ -250,7 +250,12 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // FP: exactly one DecOp for the whole F-line family, so the SPECIFIC operation (and
     // therefore which of FpuCore's two lanes it lands on) comes from the raw ISA opmode.
     val issueIsFp      = u0.op === DecOp.FPU
-    val fpOpIsIter     = FpSource.isIterativeOpmode(u0.fpuOp)
+    // ... EXCEPT for FMOVECR, whose 7-bit field is a constant-ROM offset, not an opmode:
+    // `romConst` vetoes the iterative classification exactly as it overrides the FpOp
+    // mapping below, so `FMOVECR #$04`/`#$20` cannot be misrouted onto a lane that would
+    // never produce a `doneIter` for them.
+    val fpIsRomConst   = u0.fpSrcKind === FpSrcKind.ROMCONST
+    val fpOpIsIter     = FpSource.isIterativeOpmode(u0.fpuOp, fpIsRomConst)
     val issueIsFpIter  = issueIsFp && fpOpIsIter        // FDIV / FSQRT -> single-context lane
     val issueIsFpFixed = issueIsFp && !fpOpIsIter       // everything else -> II=1 fixed pipe
     val fpIterBusy     = RegInit(False)
@@ -693,7 +698,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val fpIterStart  = fpAccept && issueIsFpIter
 
     fpu.io.start   := fpAccept
-    fpu.io.op      := FpSource.opmodeToFpOp(u0.fpuOp, u0.fpSrcKind === FpSrcKind.ROMCONST)
+    fpu.io.op      := FpSource.opmodeToFpOp(u0.fpuOp, fpIsRomConst)
     fpu.io.dst     := fpRdA.data
     fpu.io.src     := fpSrcVal
     fpu.io.rmode   := fpRmodeIn

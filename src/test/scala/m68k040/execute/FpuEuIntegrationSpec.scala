@@ -2,7 +2,7 @@ package m68k040.execute
 
 import m68k040.{M68kSim, VerilatorTest}
 import m68k040.decode.{DecOp, EaAuto, FpSrcKind, SysKind}
-import m68k040.execute.fpu.FpuCore
+import m68k040.execute.fpu.{FpCheapPipe, FpuCore}
 import m68k040.execute.iq.IqContext
 import m68k040.execute.regfile.{
   FpccRegFileService,
@@ -311,7 +311,12 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
     }
   }
 
-  test("FP lane: every fpSrcKind converts, executes, and writes the FP + FPCC files", VerilatorTest) {
+  /** Covers every fpSrcKind that actually SOURCES AN OPERAND, i.e. all nine minus
+    * `ROMCONST`: FMOVECR has no source operand at all (the gateway drives 0 and the value
+    * comes out of `FpCheapPipe`'s constant ROM instead), and it also overrides the opmode
+    * -> `FpOp` mapping, so it cannot ride this test's shared `FADD src,1.0` shape. The
+    * ninth kind is covered end to end by the FMOVECR test immediately below. */
+  test("FP lane: every operand-sourcing fpSrcKind converts, executes, and writes the FP + FPCC files", VerilatorTest) {
     dut.doSim { d =>
       val h = new Harness(d); import h._
       boot()
@@ -382,6 +387,116 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
           f"${cse.label}: FP PRF[$pdst] = 0x$back%020X, expected 0x${cse.sum}%020X")
         assert(readFpcc(pcc) == cse.cc, s"${cse.label}: FPCC PRF[$pcc] = ${readFpcc(pcc)}, expected ${cse.cc}")
       }
+    }
+  }
+
+  /** The ninth `fpSrcKind`: ROMCONST / FMOVECR.
+    *
+    * REGRESSION GUARD (Task 8 review, Critical #1). For FMOVECR the extension word's [6:0]
+    * field is the constant-ROM OFFSET, not an opmode, and `MicroOpAssembler.fpEmit` admits
+    * the FMOVECR form for EVERY offset value (its `fpNative` opmode whitelist does not
+    * apply to that form). `$04` and `$20` are therefore perfectly encodable offsets whose
+    * bit patterns collide with the FSQRT/FDIV opmodes. `FpSource.isIterativeOpmode`
+    * originally dispatched on the raw field alone, so those two offsets were classified as
+    * ITERATIVE while `FpuCore` -- whose `io.op` already had the `romConst` override applied
+    * -- ran them on the cheap FIXED pipe: `fpIterBusy` latched with a descriptor no
+    * `doneIter` would ever match, wedging the iterative lane permanently AND leaving that
+    * uop's ROB entry uncompletable (a hard, un-interruptible hang). Hence the two aliasing
+    * offsets below, and the explicit "the iterative lane was never touched" assertions. */
+  test("FP lane: ROMCONST/FMOVECR reads the constant ROM on the FIXED lane, including the " +
+       "offsets that alias the FSQRT/FDIV opmodes", VerilatorTest) {
+    dut.doSim { d =>
+      val h = new Harness(d); import h._
+      boot()
+
+      // Expected values are NOT invented here: the literals are the ones FpuCoreSpec's own
+      // "FpuCore FMOVECR constant ROM read-back" directed vectors assert (Task 7), and each
+      // is additionally cross-checked against FpCheapPipe.cromWords so a silent ROM/index
+      // drift fails here too rather than being papered over by a stale literal.
+      case class Cr(off: Int, expect: BigInt, cc: Int, label: String)
+      val cases = Seq(
+        Cr(0x00, BigInt("4000C90FDAA22168C235", 16), CcNone, "#$00 pi"),
+        Cr(0x32, One,                                CcNone, "#$32 1.0"),
+        Cr(0x0F, Zero,                               CcZ,    "#$0F 0.0"),
+        // The two regression offsets. Both are UNDEFINED ROM offsets, which the 68881 (and
+        // Musashi's `default: source = 0`) read back as +0.0 -- the same answer FpuCoreSpec
+        // asserts for its own undefined-offset list ($01/$0A/$10/$2F/$40/$7F).
+        Cr(0x04, Zero, CcZ, "#$04 (undefined; ALIASES the FSQRT opmode)"),
+        Cr(0x20, Zero, CcZ, "#$20 (undefined; ALIASES the FDIV opmode)"))
+      for (c <- cases)
+        assert(FpCheapPipe.cromWords(FpCheapPipe.cromIndexOf(c.off)) == c.expect,
+          f"expected literal for FMOVECR ${c.label} disagrees with FpCheapPipe.cromWords")
+
+      // A sentinel in every destination: "the ROM value landed" must be distinguishable
+      // from "the write never happened", especially for the +0.0 cases.
+      val Sentinel = ext(true, 0x4003, BigInt("DEADBEEFDEADBEEF", 16))
+
+      for ((c, i) <- cases.zipWithIndex) {
+        val rob  = 40 + i
+        val pdst = 4 + i
+        val pcc  = 4 + i
+        preloadFp(pdst, Sentinel)
+        val before = fpSeen.size
+
+        // The gateway contributes NO operand for ROMCONST (io.cromSel carries the offset
+        // instead), so its output must be exactly zero -- checked at the accepting edge,
+        // the same way the operand-sourcing kinds are checked above.
+        s.iOp #= DecOp.FPU
+        s.iRob #= rob; s.iFpuOp #= c.off; s.iFpSrcKind #= FpSrcKind.ROMCONST; s.iFpSrcFmt #= 7
+        s.iFpWideImm #= BigInt(0)
+        s.iPFpSrcA #= 1; s.iPFpSrcB #= 2; s.iPFpDst #= pdst
+        s.iWritesFp #= true; s.iPFpccDst #= pcc
+        s.iPsrcA #= 0; s.iPsrcB #= 0; s.iPsrcC #= 0
+        s.iPdstValid #= false; s.iWritesNzvc #= false
+        s.iValid #= true
+        sleep(1)
+        assert(s.fpSrcObs.toBigInt == BigInt(0),
+          f"FMOVECR ${c.label}: gateway drove 0x${s.fpSrcObs.toBigInt}%020X, expected 0")
+        assert(s.iReady.toBoolean && s.iFire.toBoolean, s"FMOVECR ${c.label} was not accepted")
+        tick()
+        s.iValid #= false
+
+        // THE regression assertion: an FMOVECR must never claim the single-context
+        // iterative lane, whatever its ROM offset happens to look like. (`sleep(1)` past
+        // the accepting edge so this reads the SETTLED post-edge register, not the value
+        // `tick()` returns on the edge itself -- otherwise it is a vacuous check.)
+        sleep(1)
+        assert(!s.fpIterBusyO.toBoolean,
+          s"FMOVECR ${c.label} was misrouted onto the ITERATIVE lane -- no doneIter can " +
+          "ever arrive for it, so the lane and this uop's ROB entry wedge permanently")
+        assert(!s.coreIterBusy.toBoolean,
+          s"FMOVECR ${c.label} started FpDivSqrtCore")
+
+        drainTo(before + 1, FpuCore.FixedLatency + 12, s"FMOVECR ${c.label}")
+        val g = fpSeen.last
+        assert(g.rob == rob, s"FMOVECR ${c.label}: completed rob=${g.rob}, expected $rob")
+        assert(g.data == c.expect,
+          f"FMOVECR ${c.label}: result 0x${g.data}%020X, expected 0x${c.expect}%020X")
+        assert(g.cc == c.cc, s"FMOVECR ${c.label}: FPCC=${g.cc}, expected ${c.cc}")
+        assert(g.fpWrote && g.pdst == pdst,
+          s"FMOVECR ${c.label}: FP wakeup pdst=${g.pdst}, expected $pdst")
+        assert(g.fpccDst == pcc, s"FMOVECR ${c.label}: FPCC wakeup dst=${g.fpccDst}, expected $pcc")
+        assert(!s.fpIterBusyO.toBoolean,
+          s"FMOVECR ${c.label} left the iterative lane busy")
+        tick()
+        val back = readFp(pdst)
+        assert(back == c.expect,
+          f"FMOVECR ${c.label}: FP PRF[$pdst] = 0x$back%020X, expected 0x${c.expect}%020X " +
+          f"(sentinel was 0x$Sentinel%020X)")
+        assert(readFpcc(pcc) == c.cc,
+          s"FMOVECR ${c.label}: FPCC PRF[$pcc] = ${readFpcc(pcc)}, expected ${c.cc}")
+      }
+
+      // A genuine FDIV right behind the aliasing FMOVECRs proves the iterative lane is
+      // still USABLE -- i.e. the bug's second symptom (a permanently occupied lane) is
+      // covered, not just the first (the wedged uop).
+      preloadFp(1, One); preloadFp(2, Two)
+      val before = fpSeen.size
+      issue(rob = 50, opmode = OpFDIV, kind = FpSrcKind.FPREG,
+        pFpSrcA = 1, pFpSrcB = 2, pFpDst = 9, pFpccDst = 9, label = "FDIV after FMOVECR")
+      drainTo(before + 1, 200, "FDIV after FMOVECR")
+      assert(fpSeen.last.data == Half,
+        f"FDIV after the aliasing FMOVECRs gave 0x${fpSeen.last.data}%020X, expected 0.5")
     }
   }
 

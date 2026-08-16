@@ -39,9 +39,21 @@ object FpSource {
   /** True for the two raw ISA opmodes (extension word [6:0]) that `FpuCore` executes on its
     * single-context iterative lane: 0x20 FDIV, 0x04 FSQRT. Dispatches on the RAW OPMODE, not
     * on `FpOp`, so the EU can gate `issuePort.ready` before it has computed the
-    * opmode -> `FpOp` mapping. */
-  def isIterativeOpmode(opmode: Bits): Bool =
-    (opmode === B"7'h20") || (opmode === B"7'h04")
+    * opmode -> `FpOp` mapping.
+    *
+    * `romConst` (fpSrcKind === ROMCONST, i.e. FMOVECR) is a MANDATORY veto, exactly as in
+    * `opmodeToFpOp` below and for exactly the same reason: for FMOVECR the 7-bit field is
+    * NOT an opmode at all, it is the constant-ROM OFFSET, driven verbatim from the command
+    * word by `MicroOpAssembler` -- and `fpEmit` admits every FMOVECR offset (no `fpNative`
+    * gate applies to that form). Offsets $04 and $20 are perfectly encodable constants, so
+    * without this veto `FMOVECR #$04`/`#$20` would be steered onto the iterative lane while
+    * `FpuCore` -- which sees `FpOp.FMOVECR`, the `romConst` override having already won --
+    * executes them on the cheap fixed pipe. The result: `fpIterBusy` set with no descriptor
+    * and no `doneIter` that can ever arrive, i.e. a permanently wedged iterative lane AND a
+    * ROB head that never completes. Keeping the two functions symmetric on `romConst` is
+    * what makes that unrepresentable. */
+  def isIterativeOpmode(opmode: Bits, romConst: Bool): Bool =
+    !romConst && ((opmode === B"7'h20") || (opmode === B"7'h04"))
 
   /** `RenamedUop.op` is always `DecOp.FPU` for the whole F-line family (one DecOp), so the
     * real per-operation selector is `RenamedUop.fpuOp`, the raw 7-bit extension-word opmode.

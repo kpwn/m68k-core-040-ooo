@@ -396,6 +396,39 @@ later implements the real "quiet on untrapped SNAN" destination rule, it belongs
 result-writeback path (one OR of 0xC000000000000000 gated on `exc.snan && !writeFp_is_cmp`),
 not in this datapath, and this entry must be revisited at that point.
 
+**D8 — `FMOVE.B (A7)+,FPn` / `FMOVE.B -(A7),FPn`: Musashi's FPU EA path adjusts A7 by ±1,
+real hardware (and this core) by ±2.** Found during Task 8, independently re-confirmed
+against the vendored source. The 68k rule is that a BYTE `(An)+`/`-(An)` access on the stack
+pointer adjusts by **2**, not 1, so A7 stays word-aligned. Musashi implements that rule in
+its INTEGER effective-address path only: `m68kcpu.h:749-750` defines the A7-specific
+`EA_A7_PI_8() ((REG_A[7]+=2)-2)` / `EA_A7_PD_8() (REG_A[7]-=2)`, and the integer opcode
+handlers use them (e.g. `m68kops.c:227,802,1399`). Musashi's **FPU** EA path does not:
+`m68kfpu.c`'s `READ_EA_8` uses the plain `EA_AY_PI_8()`/`EA_AY_PD_8()` — i.e. `(AY++)` /
+`(--AY)`, `m68kcpu.h:720,723` — for mode 3 and mode 4 at `m68kfpu.c:380` and `:385`, with no
+`reg == 7` special case anywhere in the function (`m68kfpu.c:362-425`); `WRITE_EA_8` has the
+same gap at `m68kfpu.c:802` and `:808`. So Musashi decrements/increments A7 by **1** for a
+Byte-format FP memory source, leaving the stack pointer odd. This core gets it right on both
+paths: the FP memory-source crack's own per-format delta table applies the quirk explicitly
+(`src/main/scala/m68k040/decode/DecodeStage.scala:1227,1234` —
+`B"3'b110" -> Mux(ucFpAnIsA7, U(2, 5 bits), U(1, 5 bits))`), matching the shared integer
+`EaDecoder` rule (`src/main/scala/m68k040/decode/EaDecoder.scala:44-49`) — i.e. the
+architecturally correct ±2.
+Scope of the divergence, precisely: **only the Byte source/destination format** (source
+specifier `110`), **only** `(A7)+` and `-(A7)`, and only the FP `<ea>` path. Word/Long/
+Single/Double/Extended are unaffected because `EA_AY_PI_16/32` already adjust by 2/4, which
+matches the A7 rule for those sizes; every address register other than A7 is unaffected by
+construction; and register-to-register / immediate FP forms have no EA at all.
+`FpuCore` is not involved — this is purely an address-generation difference, visible in A7
+(and in the byte actually read) rather than in any FP value.
+=> **Musashi is wrong here and our hardware is right; do NOT "fix" the core to match.**
+=> **Task 13 (bit-exact lock-step tests): no action required as currently scoped** — Task 13
+is explicitly register-to-register plus immediate loads, and states that memory-source `<ea>`
+forms (Task 6b's) are a separate, later subset. This entry exists so that the **later
+memory-source lock-step subset** either excludes `FMOVE.B (A7)+,FPn` / `FMOVE.B -(A7),FPn`
+from the Musashi-refereed corpus with this entry as the documented reason, or special-cases
+them in the oracle glue (post-step A7 fixup of ∓1); a directed whitebox test then owns the
+±2 behaviour, exactly as D1/D2/D5 are handled.
+
 ### VERIFY-AT-IMPLEMENTATION
 
 - **VERIFY-1 — the FMOVECR constant ROM words for offsets $0B and $38..$3F.**
