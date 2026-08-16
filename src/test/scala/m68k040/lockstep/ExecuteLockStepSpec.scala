@@ -3422,6 +3422,42 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 4)   // a5 == 0x12340000 (USP round-tripped; MOVEA sets no flags)
   }
 
+  // ── The sysOp whose OWN destination is A7 (ExceptionUnit `sysOwnA7Valid` fix) ──
+  //
+  // `S_REDIR` ends every sysOp by re-banking A7 into the int PRF from `ss.a7`. For a
+  // sysOp whose own read/auto-update destination IS arch-15, that write targets exactly
+  // the physical register `S_APPLY` wrote one cycle earlier — and `ss.a7` (a lagging PRF
+  // readback, which for a read-direction sysOp is additionally pointed at the µop's
+  // freshly renamed pdst holding the EU's throwaway MOVE result) does NOT yet hold the
+  // new value. The A7 write was therefore silently LOST for both instructions below.
+  // These two forms have NO settle state between `S_APPLY` and `S_REDIR` (they are
+  // consecutive cycles), so nothing could mask it; FRESTORE (A7)+ hit the identical
+  // mechanism and is covered separately by FsaveFrestoreSpec.
+  //
+  // Both tests lock-step A7 step-for-step against Musashi, AND surface it through a
+  // following reader (`move.l %sp,%a1`) so the PRF CONTENT — not just the commit obs —
+  // is checked. USP is seeded distinct from the boot SSP (0x00100000) so a lost write is
+  // unambiguous.
+
+  test("lock-step: MOVE USP,%A7 (sysOp dst IS A7) really writes A7", VerilatorTest) {
+    runLockStep("move-usp-to-a7",
+      // USP := 0x00200000, then MOVE USP,%A7 (0x4E6F) -> A7 (= SSP, S=1) := 0x00200000.
+      // A1 surfaces the architectural A7 afterwards; A2 keeps the expected value live so
+      // a mismatch is visible in the register comparison too.
+      "move.l #0x00200000,%a2 ; move.l %a2,%usp ; move.l %usp,%sp ; move.l %sp,%a1 ; " +
+      ".stop: bra .stop",
+      nInstr = 4)
+  }
+
+  test("lock-step: MOVEC USP,%A7 (sysOp dst IS A7) really writes A7", VerilatorTest) {
+    runLockStep("movec-usp-to-a7",
+      // Same shape through the MOVEC Rc->Rn arm: ext word 0xF800 = {A/D=1, reg#=7,
+      // Rc=0x800 (USP)} -> `movec %usp,%sp`.
+      "move.l #0x00300000,%a2 ; move.l %a2,%usp ; movec %usp,%sp ; move.l %sp,%a1 ; " +
+      ".stop: bra .stop",
+      nInstr = 4)
+  }
+
   // MOVE to SR — the S-bit write + A7 banking. Set USP distinct from SSP, then a
   // MOVE-to-SR clearing S switches supervisor->user: A7 must bank from SSP to the USP
   // value (lock-step a7 step-for-step). The SR system byte also changes (S 1->0). The

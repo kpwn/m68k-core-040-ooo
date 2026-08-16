@@ -308,8 +308,11 @@ class FsaveFrestoreSpec extends AnyFunSuite {
        VerilatorTest) {
     // The auto-update destination IS A7 here, which is the one case where S_REDIR's
     // unconditional `committedPhysA7 := ss.a7` re-bank targets the SAME physical register
-    // the FSM just wrote. Without ExceptionUnit's F_RSETTLE settle cycles this silently
-    // writes the stale pre-FRESTORE A7 straight back, and A7 never moves.
+    // the FSM just wrote, silently writing the stale pre-FRESTORE A7 straight back so A7
+    // never moves. Task 11 first worked around this with a dedicated `F_RSETTLE` settle
+    // state; it is now fixed structurally for EVERY sysOp whose own destination is A7
+    // (see `ExceptionUnit.sysOwnA7Valid`) and the settle state is gone. This test still
+    // guards exactly the same observable behavior, now against the general fix.
     for ((header, expectPop) <- Seq(0x00000000L -> 4, 0x41280000L -> 44)) {
       val r = run(s"${".short 0xF35F"} ; done: bra.s done",   // FRESTORE (A7)+
                   restoreHeader = None, name = f"frestore-a7-$expectPop",

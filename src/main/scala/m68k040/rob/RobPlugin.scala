@@ -1337,6 +1337,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       sysAux     = sysAux,          // Task 9b: the load direction's per-position values
       sysRc      = p0.sysRc,
       sysDstPhys = p0.intNew,        // the read µop's rename-allocated pdst (FSM writes it)
+      // The ARCHITECTURAL id behind that same pdst. The FSM needs it for exactly one
+      // question -- "is this sysOp's own destination A7?" -- which decides whether
+      // S_REDIR's A7 re-bank must be sourced from the sysOp's own write instead of the
+      // (stale/garbage) `ss.a7`. See ExceptionUnit's `sysOwnA7Valid` doc comment.
+      sysDstArch = p0.archRegId,
       sysPc      = p0.pc,
       sysNextPc  = p0.predNextPc,
       // Task 11: the head's FP unimplemented-instruction marker + command word, read

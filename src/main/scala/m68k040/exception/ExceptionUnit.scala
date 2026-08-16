@@ -116,6 +116,13 @@ class ExceptionUnit(
     // ROB commits the arch->pdst mapping at the serializing retire; the FSM writes the
     // system VALUE into PRF[pdst]. (An arbitrary Rn is renamed, unlike the identity A7.)
     sysDstPhys:   UInt = U(0, 6 bits),
+    // The ARCHITECTURAL dst reg of the same write (`RobPlugin`'s `p0.archRegId`, i.e.
+    // the µop's `dstArch`). Needed ONLY to answer "is this sysOp's own destination A7?"
+    // — the one case where S_REDIR's unconditional A7 re-bank would otherwise clobber
+    // the sysOp's own write. See `sysCapDstIsA7` / `sysOwnA7*` below for the full
+    // mechanism. Defaulted to a non-A7 value so the standalone unit DUTs
+    // (`SysOpApplySpec` / `FmovemCtrlApplySpec`) need no change.
+    sysDstArch:   UInt = U(0, 5 bits),
     sysPc:        UInt = U(0, 32 bits),
     sysNextPc:    UInt = U(0, 32 bits),
     // Task 11: the ROB head's per-entry "this is a RECOGNIZED-but-unsupported FP op
@@ -453,6 +460,11 @@ class ExceptionUnit(
   val sysCapDstPhys = Reg(UInt(6 bits))
   val sysCapPc      = Reg(UInt(32 bits))
   val sysCapNextPc  = Reg(UInt(32 bits))
+  // ── "this sysOp's OWN destination register IS A7" (arch 15) ──────────────────
+  // Latched at sysTrigger from `sysDstArch`. See `sysOwnA7Valid` right below for why
+  // this exists at all; `sysCapDstPhys` alone cannot answer the question (it is a
+  // PHYSICAL id, and the FSM has no view of the committed arch->phys map).
+  val sysCapDstIsA7 = RegInit(False)
 
   // ── SysKind -> raw `sysKind`/`sysCapKind` ordinal (SYMBOLIC, elaboration-time) ──
   // The `sysKind` port is a plain UInt, not a SpinalEnumCraft, because RobPlugin hands
@@ -560,6 +572,44 @@ class ExceptionUnit(
   val sysRegWriteValid = Bool();        sysRegWriteValid := False;        sysRegWriteValid.simPublic()
   val sysRegWritePhys  = UInt(6 bits);  sysRegWritePhys  := U(0, 6 bits);  sysRegWritePhys.simPublic()
   val sysRegWriteData  = UInt(32 bits); sysRegWriteData  := U(0, 32 bits); sysRegWriteData.simPublic()
+
+  // ── sysOp-writes-A7 conflict resolution (the S_REDIR re-bank vs the sysOp's own
+  //    destination write) ────────────────────────────────────────────────────────
+  //
+  // THE BUG THIS EXISTS TO FIX (confirmed live, not theoretical). `S_REDIR` ends EVERY
+  // sysOp by re-banking A7 into the int PRF: `obsA7 := ss.a7` with `a7WriteValid :=
+  // obsFire`, whose write ADDRESS is `RenameStage.committedPhysA7` at the wiring sites.
+  // That is exactly right for the sysOp it was written for (MOVE-to-SR flipping S, so
+  // arch-15 must switch banks) and a harmless no-op for the sysOps that touch neither
+  // A7 nor S. But a sysOp whose OWN auto-update/read destination happens to BE arch
+  // register 15 writes that very same physical register from `S_APPLY` (or, for
+  // FRESTORE, `F_RDONE`) through `sysRegWrite*` — and `S_REDIR` then overwrites it,
+  // one cycle later, with `ss.a7`.
+  //
+  // `ss.a7` is NOT a usable substitute there, for two independent reasons:
+  //   1. LAG. `ss.isp/msp/usp` track the architectural A7 through `ss.writeA7`, which is
+  //      fed from `committedA7In` — a PRF READBACK. The sysOp's own write needs ~2
+  //      cycles to appear there, and `S_APPLY -> S_REDIR` are CONSECUTIVE cycles for
+  //      every sysOp, so `ss.a7` still reads the PRE-sysOp value.
+  //   2. TRANSIENT GARBAGE. For a read-direction sysOp the ROB commits arch-15 ->
+  //      `intNew` at the trigger cycle, so `committedPhysA7` already names the µop's
+  //      freshly renamed pdst — which at that point holds the ALU EU's own throwaway
+  //      MOVE writeback (these µops have no real source), not any architectural A7.
+  //      That garbage propagates into `ss.isp` during S_DRAIN/S_APPLY.
+  // So the correct final A7 exists in exactly one place: the value the sysOp itself
+  // just wrote. Latch it, and let `S_REDIR` source the re-bank from it.
+  //
+  // AFFECTED, PREVIOUSLY-BROKEN INSTRUCTIONS (all silently lost their A7 write):
+  //   `MOVE USP,%A7`   (0x4E6F — the USP->An read direction with An = A7)
+  //   `MOVEC Rc,%A7`   (0x4E7A with ext bit15=1, reg#=7 — the Rc->Rn direction)
+  //   `FMOVE.L FPcr,%A7` (the same read-direction shape in the FMOVE_FPCTRL arm)
+  // FSAVE -(A7) escaped only because its own multi-cycle frame loop happens to give
+  // `ss.a7` time to catch up; FRESTORE (A7)+ was patched by Task 11 with a dedicated
+  // settle state, which this general fix makes unnecessary (it was removed).
+  //
+  // Set from the sysOp's OWN write (any state), cleared in IDLE.
+  val sysOwnA7Valid = RegInit(False)
+  val sysOwnA7Data  = Reg(UInt(32 bits))
   // PFLUSHA: a 1-cycle pulse consumed by DtlbPlugin/ItlbPlugin's `flushAll` port (mirrors
   // the existing `umFlush` top-level fan-out — see FullCoreSynth.scala/the test DUTs).
   // Only PFLUSHA drives this (S_APPLY's SysKind.PFLUSHA arm); every other sysKind —
@@ -1062,10 +1112,13 @@ class ExceptionUnit(
     val F_HDRREQ  = new State   // FRESTORE: load the header word
     val F_HDRWAIT = new State   // FRESTORE: dispatch on version / length byte
     val F_RDONE   = new State   // FRESTORE: An += popSize
-    val F_RSETTLE = new State   // FRESTORE: let the committed-A7 readback settle
     val F_HALT    = new State   // terminal: a frame translation faulted (see below)
 
     IDLE.whenIsActive {
+      // Arm the "this sysOp wrote A7 itself" latch fresh for every episode (see its
+      // declaration). Cleared here rather than at S_REDIR's exit so an ENTRY/RTE episode
+      // can never inherit a stale one either.
+      sysOwnA7Valid := False
       when(entryTrigger) {
         // An INTERRUPT entry is always a format-$0 frame (never $7/$2), regardless
         // of its vector value (autovector 24+level or a vectored 0..255). Fault/trap
@@ -1235,6 +1288,7 @@ class ExceptionUnit(
         sysCapVal     := sysVal
         sysCapRc      := sysRc
         sysCapDstPhys := sysDstPhys
+        sysCapDstIsA7 := sysDstArch === U(15, 5 bits)
         sysCapPc      := sysPc
         sysCapNextPc  := sysNextPc
         goto(S_DRAIN)
@@ -1961,7 +2015,14 @@ class ExceptionUnit(
       obsFire    := True
       obsPc      := sysCapNextPc            // the sysOp's commit step == its nextPc
       obsSysByte := ss.srSys                // post-write system byte (S/T/I)
-      obsA7      := ss.a7                   // re-banked A7 (Mux on post-write S)
+      // Re-banked A7 (Mux on post-write S) — EXCEPT when this sysOp's own destination
+      // was arch-15 itself, in which case the value it just wrote IS the architectural
+      // A7 and `ss.a7` is either stale or outright garbage. See `sysOwnA7Valid`'s
+      // declaration for the full mechanism and the list of instructions this closes.
+      // This drives BOTH the lock-step obs AND (via `a7WriteData`) the int-PRF write,
+      // so the re-bank becomes a correct, idempotent re-write of the sysOp's own value
+      // instead of a clobber.
+      obsA7      := Mux(sysOwnA7Valid, sysOwnA7Data, ss.a7)
       // MOVE-to-SR AND STOP write the full CCR (sysVal[4:0]) -> surface it so the whitebox
       // resyncs its running CCR to this absolute value. Other sysOps (MOVE-USP/MOVEC/
       // RESET/CPUSH/CINV/PFLUSHA/PTEST) leave CCR untouched. Symbolic ordinals (skOrd),
@@ -2137,25 +2198,16 @@ class ExceptionUnit(
         sysRegWritePhys  := sysCapDstPhys
         sysRegWriteData  := fsFrameBase + fsSize.resize(32)
       }
-      goto(F_RSETTLE)
-    }
-    // MANDATORY settle cycles before S_REDIR, for the `FRESTORE (A7)+` case specifically.
-    //
-    // S_REDIR unconditionally re-banks A7 by writing `committedPhysA7 := ss.a7` (its
-    // `a7WriteValid := obsFire` port). When the sysOp's own auto-update destination IS A7,
-    // the committed RAT now maps arch-15 at the SAME pdst `F_RDONE` just wrote -- so if
-    // `ss.isp/msp` have not yet caught up, S_REDIR writes the STALE pre-FRESTORE A7 straight
-    // back over the new one. `ss.writeA7` is fed from `committedA7In`, a PRF readback, so
-    // the new value needs two cycles to appear there and then in the bank register:
-    //   F_RDONE  : PRF[pdst] <= base+popSize      (visible next cycle)
-    //   +1       : committedA7In = base+popSize -> ss.isp <= base+popSize
-    //   +2       : ss.a7 reads the new bank      -> S_REDIR's re-bank is a harmless no-op
-    // FSAVE needs no equivalent state: its own multi-cycle F_STORE/F_STWAIT frame loop
-    // always provides far more than two cycles between the S_APPLY write and S_REDIR.
-    val fsSettle = Reg(UInt(2 bits)) init 0
-    F_RSETTLE.whenIsActive {
-      fsSettle := fsSettle + 1
-      when(fsSettle === U(2, 2 bits)) { fsSettle := 0; goto(S_REDIR) }
+      // Task 11 originally detoured through a dedicated `F_RSETTLE` state here, spinning
+      // 3 cycles so that `ss.a7` could catch up with the write above and S_REDIR's
+      // unconditional `obsA7 := ss.a7` re-bank would degrade into a harmless no-op. That
+      // was a TIMING workaround for a STRUCTURAL conflict; the conflict is now fixed at
+      // its source (see `sysOwnA7Valid`), which also closes the same hole for
+      // `MOVE USP,%A7` / `MOVEC Rc,%A7` — sysOps that reach S_REDIR the very cycle after
+      // their own write and could never have been rescued by a settle state they don't
+      // have. With S_REDIR sourcing the re-bank from the sysOp's own written value, the
+      // settle state has no remaining job and is gone.
+      goto(S_REDIR)
     }
 
     // ══ Terminal halt on a frame-translation fault ═══════════════════════════════
@@ -2193,6 +2245,19 @@ class ExceptionUnit(
     F_HALT.whenIsActive {
       fsXlateFault := True   // hold it asserted; the ROB-side latch is sticky anyway
     }
+  }
+
+  // ── Capture the sysOp's OWN A7 write (see `sysOwnA7Valid`'s declaration) ─────
+  // Placed AFTER the FSM so `sysRegWrite*` is fully driven: every state that writes the
+  // sysOp's destination (S_APPLY's MOVE_USP / MOVEC / FMOVE_FPCTRL read arms and its
+  // FSAVE -(An) arm; F_RDONE's FRESTORE (An)+ arm) funnels through that ONE port, so
+  // this single observer covers all of them — present and future — without touching any
+  // of the arms. `sysCapDstIsA7` is what makes it A7-specific; the `sysRegWriteValid`
+  // qualifier is what makes it safe for a sysOp with no destination at all (its captured
+  // `sysDstArch` is meaningless).
+  when(sysRegWriteValid && sysCapDstIsA7) {
+    sysOwnA7Valid := True
+    sysOwnA7Data  := sysRegWriteData
   }
 
   // `active` high whenever the FSM is mid-sequence (not IDLE).
