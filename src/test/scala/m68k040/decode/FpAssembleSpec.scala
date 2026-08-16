@@ -388,4 +388,32 @@ class FpAssembleSpec extends AnyFunSuite {
       assert(dut.uop.faulted.toBoolean, "a complex packet must trap, not emit")
     }
   }
+
+  test("Task 10: a recognized-but-non-native register-form FP op captures fpuSoftwareComplete/fpuCmdWord", VerilatorTest) {
+    run { dut =>
+      // FSIN FP1,FP0 (opmode 0x0E, non-native, register form) -- ext = 0x0000|... let's
+      // use the SAME literal Task 6's own directed test already uses: ext=0x000E, dst=FP0.
+      drive(dut, op = 0xF200, ext = 0x000E, len = 2); sleep(1)
+      assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 11)
+      assert(dut.uop.faultUsesNextPc.toBoolean, "set by Task 6's fpLenKnown, not this task")
+      assert(dut.uop.fpuSoftwareComplete.toBoolean,
+        "the register-to-register form must ALSO set this task's own trigger bit")
+      assert(dut.uop.fpuCmdWord.toInt == 0x000E, "fpuCmdWord must carry the raw ext word verbatim")
+    }
+  }
+
+  test("Task 10: an immediate-source or memory-source trap does NOT set fpuSoftwareComplete", VerilatorTest) {
+    run { dut =>
+      // FADD.L #imm,FP0, non-native opmode -- wait, use a genuinely non-native immediate
+      // form: reuse Task 6's FADD.P (packed) trap, which is opclass 010, NOT
+      // fpFormIsReg, so fpuGenRegUnimpl must NOT fire even though faultUsesNextPc does.
+      drive(dut, op = 0xF23C, ext = 0x4C22, ext2 = 0x0000, len = 8)
+      sleep(1)
+      assert(dut.uop.faulted.toBoolean && dut.uop.faultUsesNextPc.toBoolean,
+        "Task 6's broader gate still fires (this is exactly WHY fpuSoftwareComplete must stay narrower)")
+      assert(!dut.uop.fpuSoftwareComplete.toBoolean,
+        "an opclass-010 trap must NOT set fpuSoftwareComplete -- Task 11 would misread ext[12:10] as an FP register number")
+      assert(dut.uop.fpuCmdWord.toInt == 0, "fpuCmdWord stays zero for anything outside the narrow trigger population")
+    }
+  }
 }

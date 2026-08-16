@@ -2544,6 +2544,10 @@ object Microcode {
     u.faulted := Bool(d.bfIllegal) || Bool(d.fpMemTrap)
     u.faultVector := (if (d.bfIllegal) U(4, 8 bits) else if (d.fpMemTrap) U(11, 8 bits) else U(0, 8 bits))
     u.faultUsesNextPc := Bool(d.fpMemTrap)
+    // fpMemTrap is a memory-source FP trap (Task 6b) -- explicitly OUTSIDE this task's
+    // narrow register-to-register trigger population (see DecodedUop.fpuSoftwareComplete's
+    // doc comment): ext[12:10]/ext[9:7] are not FP register numbers for this form.
+    u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
     u.faultAddr := ctx.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     u.divSigned := False; u.div64 := False
     // The two An write-back ADDs are DROPPED crack µops (divIsRem): the commit
@@ -3072,6 +3076,10 @@ object Microcode {
     u.faulted := d.bfIllegal || d.fpMemTrap
     u.faultVector := Mux(d.bfIllegal, U(4, 8 bits), Mux(d.fpMemTrap, U(11, 8 bits), U(0, 8 bits)))
     u.faultUsesNextPc := d.fpMemTrap
+    // fpMemTrap is a memory-source FP trap (Task 6b) -- explicitly OUTSIDE this task's
+    // narrow register-to-register trigger population (see DecodedUop.fpuSoftwareComplete's
+    // doc comment): ext[12:10]/ext[9:7] are not FP register numbers for this form.
+    u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
     u.faultAddr := ctx.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     u.divSigned := False; u.div64 := False
     // The two An write-back ADDs are DROPPED crack µops (divIsRem): the commit

@@ -81,6 +81,7 @@ object MicroOpAssembler {
     u.cond        := 0; u.branchDisp := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+    u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
     u.faultAddr   := pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     u.divSigned   := False; u.div64 := False
     // `divRem` = the generic crack-DROP marker (like DIVREM / the source-EA An-update): a
@@ -133,6 +134,7 @@ object MicroOpAssembler {
     u.cond        := 0; u.branchDisp := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+    u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
     u.faultAddr   := pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     u.divSigned   := False; u.div64 := False; u.divIsRem := False
     u.isChk2      := False
@@ -185,6 +187,7 @@ object MicroOpAssembler {
     u.cond        := 0; u.branchDisp := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+    u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
     u.faultAddr   := pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     u.divSigned   := False; u.div64 := False
     u.divIsRem    := True     // dropped: never the macro's kept commit
@@ -241,6 +244,7 @@ object MicroOpAssembler {
     u.cond        := 0; u.branchDisp := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+    u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
     u.faultAddr   := pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     u.divSigned   := False; u.div64 := False
     u.divIsRem    := False
@@ -709,6 +713,7 @@ object MicroOpAssembler {
     opUop.faulted       := False
     opUop.faultVector   := 0
     opUop.faultUsesNextPc := False  // default: stack the faulting instr PC (pc); TRAP/TRAPV -> nextPc
+    opUop.fpuSoftwareComplete := False; opUop.fpuCmdWord := B(0, 16 bits)
     opUop.faultAddr     := pkt.pc
     opUop.sswInstr      := False; opUop.faultAtc := True
     opUop.isRte         := False
@@ -1088,6 +1093,7 @@ object MicroOpAssembler {
     ldUop.unimplemented := False
     ldUop.faulted       := False; ldUop.faultVector := 0; ldUop.isRte := False
     ldUop.faultUsesNextPc := False
+    ldUop.fpuSoftwareComplete := False; ldUop.fpuCmdWord := B(0, 16 bits)
     ldUop.faultAddr     := pkt.pc; ldUop.sswInstr := False; ldUop.faultAtc := True; ldUop.isCondTrap := False
     ldUop.divSigned     := False; ldUop.div64 := False; ldUop.divIsRem := False
     ldUop.isChk2        := False
@@ -1156,6 +1162,7 @@ object MicroOpAssembler {
     stUop.unimplemented := False
     stUop.faulted       := False; stUop.faultVector := 0; stUop.isRte := False
     stUop.faultUsesNextPc := False
+    stUop.fpuSoftwareComplete := False; stUop.fpuCmdWord := B(0, 16 bits)
     stUop.faultAddr     := pkt.pc; stUop.sswInstr := False; stUop.faultAtc := True; stUop.isCondTrap := False
     stUop.divSigned     := False; stUop.div64 := False; stUop.divIsRem := False
     stUop.isChk2        := False
@@ -1205,6 +1212,7 @@ object MicroOpAssembler {
     rmwStUop.unimplemented := False
     rmwStUop.faulted       := False; rmwStUop.faultVector := 0; rmwStUop.isRte := False
     rmwStUop.faultUsesNextPc := False
+    rmwStUop.fpuSoftwareComplete := False; rmwStUop.fpuCmdWord := B(0, 16 bits)
     rmwStUop.faultAddr     := pkt.pc; rmwStUop.sswInstr := False; rmwStUop.faultAtc := True; rmwStUop.isCondTrap := False
     rmwStUop.divSigned     := False; rmwStUop.div64 := False; rmwStUop.divIsRem := False
     rmwStUop.isChk2        := False
@@ -1839,6 +1847,21 @@ object MicroOpAssembler {
       }
     }
 
+    // ── FSAVE unimplemented-instruction-frame trigger (Task 10, reduced scope) ──────
+    // Reuses Task 6's own `fpFormIsReg`/`fpExt` locals -- NOT a re-derivation. Gated on
+    // `bad` (this fires only on the trapping path) and on lenWords===2 exactly (not >=2):
+    // the register-to-register form is ALWAYS exactly 2 words when its extension word was
+    // actually resident at predecode time (Task 5's fpIsRegForm arm); if it was not
+    // resident, predecode falls back to 1-word framing + ambiguousLine (Task 5's
+    // `!extWKnown` arm), and this gate correctly declines rather than promising a frame
+    // trigger built from words that were never really there.
+    val fpuGenRegUnimpl = bad && spec.fpGeneric && fpFormIsReg && pkt.simple &&
+                          (pkt.lenWords === U(2, pkt.lenWords.getWidth bits))
+    when(fpuGenRegUnimpl) {
+      opUop.fpuSoftwareComplete := True
+      opUop.fpuCmdWord          := fpExt   // == pkt.words(1)
+    }
+
     // ── FMOVE.L <ea>,FPcr / FPcr,<ea> : a COMMIT-TIME SYSTEM op (Task 9) ────────
     // Structurally identical to MOVEC's arm in the `isSysOp` block below -- same op
     // (MOVE), same cluster (INT), same operand routing, same `imm` side-channel -- but
@@ -2324,6 +2347,7 @@ object MicroOpAssembler {
       u.cond        := 0; u.branchDisp := 0
       u.unimplemented := False
       u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+    u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
       u.faultAddr   := pkt.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
       u.divSigned   := False; u.div64 := False; u.divIsRem := False; u.isChk2 := False
       u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.extByte := False
@@ -2395,6 +2419,7 @@ object MicroOpAssembler {
     divlUop.unimplemented := False
     divlUop.faulted       := False; divlUop.faultVector := 0; divlUop.isRte := False
     divlUop.faultUsesNextPc := True            // DIV0 stacks nextPc (group-2 format-$2)
+    divlUop.fpuSoftwareComplete := False; divlUop.fpuCmdWord := B(0, 16 bits)
     divlUop.faultAddr     := pkt.pc; divlUop.sswInstr := False; divlUop.faultAtc := True; divlUop.isCondTrap := False
     divlUop.divSigned     := divlSigned; divlUop.div64 := divl64; divlUop.divIsRem := False
     divlUop.isChk2        := False
@@ -2473,6 +2498,7 @@ object MicroOpAssembler {
     divremUop.unimplemented := False
     divremUop.faulted       := False; divremUop.faultVector := 0; divremUop.isRte := False
     divremUop.faultUsesNextPc := False
+    divremUop.fpuSoftwareComplete := False; divremUop.fpuCmdWord := B(0, 16 bits)
     divremUop.faultAddr     := pkt.pc; divremUop.sswInstr := False; divremUop.faultAtc := True; divremUop.isCondTrap := False
     divremUop.divSigned     := divlSigned; divremUop.div64 := divl64; divremUop.divIsRem := True
     divremUop.isChk2        := False
@@ -2557,6 +2583,7 @@ object MicroOpAssembler {
     mullUop.unimplemented := False
     mullUop.faulted       := False; mullUop.faultVector := 0; mullUop.isRte := False
     mullUop.faultUsesNextPc := False
+    mullUop.fpuSoftwareComplete := False; mullUop.fpuCmdWord := B(0, 16 bits)
     mullUop.faultAddr     := pkt.pc; mullUop.sswInstr := False; mullUop.faultAtc := True; mullUop.isCondTrap := False
     mullUop.divSigned     := mullSigned; mullUop.div64 := mull64; mullUop.divIsRem := False
     mullUop.isChk2        := False
@@ -2618,6 +2645,7 @@ object MicroOpAssembler {
     mulhiUop.unimplemented := False
     mulhiUop.faulted       := False; mulhiUop.faultVector := 0; mulhiUop.isRte := False
     mulhiUop.faultUsesNextPc := False
+    mulhiUop.fpuSoftwareComplete := False; mulhiUop.fpuCmdWord := B(0, 16 bits)
     mulhiUop.faultAddr     := pkt.pc; mulhiUop.sswInstr := False; mulhiUop.faultAtc := True; mulhiUop.isCondTrap := False
     mulhiUop.divSigned     := mullSigned; mulhiUop.div64 := mull64; mulhiUop.divIsRem := False
     mulhiUop.isChk2        := False
@@ -2722,6 +2750,7 @@ object MicroOpAssembler {
       u.cond        := 0; u.branchDisp := 0
       u.unimplemented := False
       u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+      u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
       u.faultAddr   := pkt.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
       u.divSigned   := False; u.div64 := False; u.divIsRem := False; u.isChk2 := False
       u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.extByte := False
@@ -2764,6 +2793,7 @@ object MicroOpAssembler {
       u.cond        := 0; u.branchDisp := 0
       u.unimplemented := False
       u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+      u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
       u.faultAddr   := pkt.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
       u.divSigned   := False; u.div64 := False; u.divIsRem := False; u.isChk2 := False
       u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0
@@ -2861,6 +2891,7 @@ object MicroOpAssembler {
       u.cond        := 0; u.branchDisp := 0
       u.unimplemented := False
       u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+      u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
       u.faultAddr   := pkt.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
       u.divSigned   := False; u.div64 := False; u.divIsRem := False; u.isChk2 := False
       u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.extByte := False
@@ -2905,6 +2936,7 @@ object MicroOpAssembler {
       // it stacks the NEXT instruction's PC. faultPc is captured at ALLOC, so set
       // faultUsesNextPc NOW (mirrors CHK / the DIV0 path).
       u.faultUsesNextPc := True
+      u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
       u.faultAddr   := pkt.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
       u.divSigned   := c2Ad; u.div64 := False; u.divIsRem := False   // divSigned reused = adReg
       u.isChk2      := c2IsChk2
@@ -2964,6 +2996,7 @@ object MicroOpAssembler {
     ibrUop.unimplemented := False
     ibrUop.faulted       := False; ibrUop.faultVector := 0; ibrUop.isRte := False
     ibrUop.faultUsesNextPc := False
+    ibrUop.fpuSoftwareComplete := False; ibrUop.fpuCmdWord := B(0, 16 bits)
     ibrUop.faultAddr     := pkt.pc; ibrUop.sswInstr := False; ibrUop.faultAtc := True; ibrUop.isCondTrap := False
     ibrUop.divSigned     := False; ibrUop.div64 := False; ibrUop.divIsRem := False
     ibrUop.isChk2        := False
@@ -3021,6 +3054,7 @@ object MicroOpAssembler {
       u.cond := cond; u.branchDisp := branchDisp
       u.unimplemented := False
       u.faulted := False; u.faultVector := 0; u.faultUsesNextPc := False
+      u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
       u.faultAddr := pkt.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
       u.divSigned := False; u.div64 := False; u.divIsRem := divIsRem
       u.isChk2 := False
@@ -3245,6 +3279,7 @@ object MicroOpAssembler {
       u.cond        := 0; u.branchDisp := 0
       u.unimplemented := False
       u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+      u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
       u.faultAddr   := pkt.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
       u.divSigned   := False; u.div64 := False; u.divIsRem := False
       u.isChk2      := False

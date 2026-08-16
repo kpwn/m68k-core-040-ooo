@@ -45,6 +45,13 @@ case class RenamedUop() extends Bundle {
   // Stack `nextPc` (not `pc`) in the exception frame — set for TRAP/TRAPV (not
   // restartable). 1-bit; the ROB selects pc vs nextPc at alloc. Threaded from decode.
   val faultUsesNextPc = Bool()
+  // FSAVE unimplemented-instruction-frame trigger (Task 10, threaded from decode --
+  // see DecodedUop.fpuSoftwareComplete's doc comment for the full rationale). True
+  // only for the recognized non-native register-to-register FPU form; fpuCmdWord
+  // carries that form's raw command extension word (CMDREG1B), consumed by Task 11's
+  // FSAVE frame capture (not read anywhere before Task 11 exists).
+  val fpuSoftwareComplete = Bool()
+  val fpuCmdWord          = Bits(16 bits)
   // isCondTrap: a branch-class execute-time conditional trap µop. The branch EU
   // evaluates `cond` (via `taken`); if taken drives a trapvFault (vector 7). Threaded.
   // TRAPV uses cond=9 (VS); TRAPcc uses cond=cccc. Never causes a redirect.

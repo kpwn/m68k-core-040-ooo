@@ -352,6 +352,26 @@ case class DecodedUop() extends Bundle {
   // sets this flag and the ROB stacks `nextPc` instead of `pc` (a 1-bit select keeps
   // the rename/dispatch pipeline narrow — no extra 32-bit field).
   val faultUsesNextPc = Bool()
+  // ── Recognized-FPU-instruction software completion (Task 11's FSAVE trigger) ──
+  // True for an F-line opword this core RECOGNIZES as the register-to-register FPU
+  // general form (Task 6's fpFormIsReg) that is NOT hardware-native (so it is routed to
+  // FPSP via Task 6's own faultUsesNextPc mechanism). A subsequent FSAVE, if this bit was
+  // the most recent trap, emits the 44-byte unimplemented-instruction frame instead of the
+  // 4-byte idle frame. DELIBERATELY NARROWER than Task 6's own faultUsesNextPc gate
+  // (fpLenKnown, which covers every cpGEN form including memory-source, Task 6b): Task 11's
+  // operand capture reads fpuCmdWord's ext[12:10]/ext[9:7] AS FP REGISTER NUMBERS, which is
+  // only a valid interpretation for the register-to-register form. Broadening this bit's
+  // population without also fixing Task 11's operand capture would silently address the
+  // wrong physical FP register for memory/immediate-source traps. See the note at the top
+  // of this task's text for the full argument.
+  val fpuSoftwareComplete = Bool()
+  // The FPU COMMAND extension word (words(1)) of a recognized FPU instruction matching the
+  // predicate above. Zero for everything else. Task 11 stacks this as the unimplemented-
+  // instruction state frame's CMDREG1B field, and ALSO reads ext[12:10]/ext[9:7] out of it
+  // to address the FP RAT for the frame's operand fields -- captured HERE, at decode,
+  // because by the time the frame is emitted (a later FSAVE) the instruction words are
+  // long gone.
+  val fpuCmdWord = Bits(16 bits)
   // Access-fault (vector 2) extras for the format-$7 frame, used for an
   // INSTRUCTION-FETCH fault (the I-cache raised DecodePacket.fault). `faultAddr` is
   // the faulting fetch PC (the EA stacked in the $7 frame); `sswInstr` set => the
