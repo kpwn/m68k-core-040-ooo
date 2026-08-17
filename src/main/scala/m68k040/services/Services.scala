@@ -234,9 +234,16 @@ trait FpuControlService {
     *
     * PRODUCER (Task 14c): `DivEuPlugin.fpExcAccrualPort`, wired by
     * `DivEuPlugin.wireFpControl`. It fires from the FP lane's COMPLETION register, i.e.
-    * at execute time, not at retirement — so an FP op that completes on a wrong path
-    * before an older branch resolves still accrues, and the sticky AEXC bits it sets are
-    * never undone. That is a known, reported limitation, not an oversight; the
+    * at execute time, not at retirement — so an FP op that completes SPECULATIVELY, before
+    * whatever would have squashed it resolves, still accrues, and the sticky AEXC bits it
+    * sets are never undone. The suppression window is exactly one cycle wide
+    * (`fpCompLive = fpCompValid && !flushSig`), and the condition is the GENERAL one, not a
+    * branch-specific one: `flushSig` is `RobPlugin.doFlushReg`, which is
+    * `branchRedirect || exc.redirectValid` (`RobPlugin.scala`), so ANY squash of
+    * younger-than-the-squash-point work suppresses identically — an older instruction's
+    * page fault, bus error, trap, or a delivered interrupt, not just a mispredicted branch.
+    * Conversely, an FP op that completes BEFORE any of those events accrues regardless.
+    * That is a known, reported limitation, not an oversight; the
     * architecturally correct fix is a retire-time fold (carry the EXC byte per-robId in
     * the ROB exactly as `faultVecStore` carries the fault vector, and OR it in from the
     * commit-port hook that already drives `setEverExecuted`), which is a real ROB

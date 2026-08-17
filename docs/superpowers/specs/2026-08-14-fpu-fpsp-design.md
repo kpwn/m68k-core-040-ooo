@@ -364,8 +364,31 @@ correctly-rounded word either way, which is precisely why $0B is the lone anomal
 therefore keeps `...F798`: it is the genuine 68881 FMOVECR-under-RN result, not a Musashi bug.
 
 **D4 — Every FPSR exception-status output is directed-test-only.** Decision 3 already
-records that Musashi raises zero FP exceptions. `FpuCore.io.res*.exc` (SNAN/OPERR/OVFL/UNFL/
-DZ/INEX2) therefore has no oracle and is never lock-stepped, only directed-tested.
+records that Musashi raises zero FP exceptions (confirmed in the vendored source: neither
+`fmove_reg_mem` nor `fpgen_rm_reg` ever calls `float_raise`; every `REG_FPSR` write in
+`m68kfpu.c` is an FPCC-nibble write). `FpuCore.io.res*.exc` (SNAN/OPERR/OVFL/UNFL/DZ/INEX2)
+therefore has no oracle and is directed-tested only.
+
+*Precise statement (tightened 2026-08-17 — the original wording said FPSR "is never
+lock-stepped", which is no longer true).* FPSR **is** read architecturally inside the
+lock-step corpus: `FpuLockStepSpec`'s FTST-vs-FCMP test executes `fmove.l %fpsr,%d0..%d3`
+and the resulting D-registers are compared **bit-exactly, all 32 bits**, by the ordinary
+`LockStep.compare` machinery. That is intentional and correct *for the FPCC nibble*, which
+Musashi does model. It is safe today only because that particular program never raises an
+FP exception — an incidental property of the chosen instructions, not a designed guard. So
+the real rule is:
+
+> **FPSR exception status is never lock-stepped IN A PROGRAM THAT CAN RAISE A FLAG.** Any
+> lock-stepped program containing an instruction that can set FPSR.EXC/AEXC must either
+> mask those bytes (`& 0xF0FF0000`, keeping FPCC and dropping EXC/AEXC) before comparing,
+> or must not compare FPSR at all — because our RTL will set the sticky bit and Musashi
+> will not, and the resulting divergence is *the oracle being wrong*, not the DUT.
+
+A future edit that adds a raising instruction to an existing lock-stepped FPSR-reading
+program would otherwise produce a confusing false divergence that a naive "fix" would try
+to match by *removing* correct FPSR accrual — exactly the class of mistake this Divergence
+Register exists to prevent. `FpuLockStepSpec` carries an in-file guard comment pointing
+back here.
 
 **D5 — pseudo-denormal (exp = 0, explicit integer bit set) exact cancellation.** `FpAddPipe`
 declares an exact cancellation whenever the two operands have equal *effective* exponents

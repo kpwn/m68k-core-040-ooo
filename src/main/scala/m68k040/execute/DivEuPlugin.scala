@@ -310,11 +310,47 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // / `.committedFpccIn` and `DecodeStage.pipeFlush` already use. The idle default also
     // keeps every standalone DivEu DUT elaborating without wiring anything.
     //
-    // Reading these live and unsynchronised is safe (design spec Decision 3): their only
-    // writer is ExceptionUnit's S_APPLY, always behind a serializing sysOp whose
-    // retirement unconditionally squashes and re-fetches everything younger, so a stale
-    // speculative read can never retire. Structurally identical to MmuControlService's
-    // already-live urp/srp/dtt0/dtt1 reads in DtlbPlugin/LsEuPlugin/ItlbPlugin.
+    // Reading these live and unsynchronised is safe (design spec Decision 3): FPCR and
+    // FPIAR have exactly ONE writer, ExceptionUnit's S_APPLY, always behind a serializing
+    // sysOp whose retirement unconditionally squashes and re-fetches everything younger,
+    // so a stale speculative read can never retire. Structurally identical to
+    // MmuControlService's already-live urp/srp/dtt0/dtt1 reads in
+    // DtlbPlugin/LsEuPlugin/ItlbPlugin.
+    //
+    // FPSR IS DIFFERENT SINCE TASK 14c and this comment used to be wrong about it. `fpsr`
+    // now has a SECOND writer -- `FpuControlPlugin`'s `orFpsrExc` OR-accumulate
+    // (`FpuControlPlugin.scala`, the `when(orFpsrExc.valid && !setFpsr.valid)` arm), fed
+    // from `fpExcAccrualPort` below at EXECUTE-time completion, NOT behind any sysOp. The
+    // 2026-08-16 FP-control design's Decision 4 required whoever wired that port to
+    // re-assess this argument for real; the assessment is recorded in that spec and
+    // summarised here:
+    //
+    //   * MAIN PATH SAFE, BUT INCIDENTALLY SO. The only consumer of these live reads is
+    //     `UFpCtrlRead` (FMOVEM-control / FMOVE-from-FPSR). That row ALWAYS declares
+    //     `readsFpcc` (Microcode.scala, `UFpCtrlRead`'s comment: the position-to-register
+    //     choice is a runtime mux, so the row cannot know statically whether it is the
+    //     FPSR one), and EVERY HW-native FP op writes FPCC (Microcode.scala's
+    //     `u.writesFpcc := True` for the FP-op family). So the CPLX dynamic-wakeup
+    //     scoreboard holds any FPSR read at least two cycles past the producing FP op's
+    //     `fpccW`, which fires the SAME cycle as its `fpExcAccrualPort` accrual (both are
+    //     gated on `fpCompLive`). The ordering is real, but it is load-bearing on an FPCC
+    //     dependency that has nothing to do with FPSR by design -- it would evaporate if
+    //     `readsFpcc` were ever narrowed to "only the FPSR position". Treat it as an
+    //     invariant to preserve, not as a coincidence to tidy away.
+    //
+    //   * KNOWN, DEFERRED RESIDUAL. Task 14b's `UFpStoreCvt` (the FMOVE FPn,<ea> store
+    //     -direction narrow converter) is a SECOND accrual site into the same port, and it
+    //     declares NO FPCC dependency at all (`readsFpcc` stays default `False`). So an
+    //     `FMOVE FPn,<ea>` that raises OPERR/INEX2/OVFL/UNFL/SNAN in the converter,
+    //     immediately followed by an `FMOVEM.L FPSR,-(An)`, has no ordering guarantee: the
+    //     stored FPSR image may miss the just-accrued sticky bit. This is NOT fixed here.
+    //     Severity is bounded by construction: the accrual is a pure OR of STICKY bits, so
+    //     the worst case is a snapshot one cycle late, never a torn or incoherent value,
+    //     and it is self-healing on any later read. Nothing exercises it today either --
+    //     the accrual-vs-read race only matters to a program that reads FPSR to dispatch,
+    //     and there is no FPCR-enabled-trap handler substrate on this branch yet. Closing
+    //     it is a real interlock change (give `UFpStoreCvt` a wakeup dependency, or make
+    //     the accrual retire-time), and belongs in its own gated slice.
     fpCtrlFpcrIn  = UInt(32 bits); fpCtrlFpcrIn.allowOverride;  fpCtrlFpcrIn  := U(0, 32 bits)
     fpCtrlFpsrIn  = UInt(32 bits); fpCtrlFpsrIn.allowOverride;  fpCtrlFpsrIn  := U(0, 32 bits)
     fpCtrlFpiarIn = UInt(32 bits); fpCtrlFpiarIn.allowOverride; fpCtrlFpiarIn := U(0, 32 bits)

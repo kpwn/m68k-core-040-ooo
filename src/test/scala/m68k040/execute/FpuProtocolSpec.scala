@@ -77,6 +77,16 @@ class FpuProtocolSpec extends AnyFunSuite {
   private val MinusOne = ext(true,  0x3FFF, Msb)
   private val MinusTwo = ext(true,  0x4000, Msb)
   private val PosInf   = ext(false, 0x7FFF, Msb)
+  /** 2^-65 -- a quarter of 1.0's extended ULP (2^-63), so `1.0 + 2^-65` under
+    * round-to-nearest returns exactly 1.0 and raises INEX2 and nothing else. Not a
+    * halfway case (that would be 2^-64), so no tie-break rule is involved. */
+  private val TwoPowM65 = ext(false, 0x3FFF - 65, Msb)
+
+  /** FPSR EXC byte, as `DivEuPlugin.fpsrExcByte` packs it (MC68040 UM Figure 9-5:
+    * FPSR bit 15 BSUN .. bit 8 INEX1 -> byte bits 7..0). Named rather than written as bare
+    * masks so an assertion says which exception it means. */
+  private val ExcDz    = 0x04
+  private val ExcInex2 = 0x02
 
   // FPCC internal layout (2026-08-09 spec section 8): bit0=N, bit1=Z, bit2=I, bit3=NaN.
   private val CcNone = 0
@@ -95,6 +105,9 @@ class FpuProtocolSpec extends AnyFunSuite {
   /** +0.0, preloaded separately (not by `preloadOperands`) only by the tests that need a
     * genuine divide-by-zero divisor (F1 fix, Task 15 review). */
   private val PZero = 7
+  /** 2^-65, preloaded separately only by the fixed-lane INEX2 test (N3, whole-branch
+    * review): the one physreg whose value makes an otherwise-ordinary FADD raise. */
+  private val PTiny = 8
 
   /** One FP operation under test: which two physregs it reads and what it must produce. */
   private case class Op(rob: Int, opmode: Int, a: Int, b: Int, pdst: Int, pcc: Int,
@@ -305,6 +318,14 @@ class FpuProtocolSpec extends AnyFunSuite {
       // failure text, and a raw `s.foo.toBoolean` expands into several hundred characters of
       // Fiber Handle type, burying the message that actually explains the failure.
       val faulted = s.fpFaultV.toBoolean
+      // UNFALSIFIABLE TODAY, DELIBERATELY KEPT (T15-#4). This DUT instantiates no
+      // `FpuControlPlugin`, so `DivEuPlugin.fpExcEnableIn` keeps its standalone default
+      // (`clearExc()`) and `fpEscalationOf` can never assert -- nothing here can fault. It is
+      // a REFACTOR TRIPWIRE, not a live check: it fires the day someone adds an FPCR source
+      // to this DUT, or makes escalation depend on something other than the enable byte
+      // (e.g. an unconditional trap on SNAN), either of which would silently invalidate every
+      // "exactly one completion / one PRF write" count in this file. "It never fails" is the
+      // intended state, not evidence that it is dead.
       assert(!faulted,
         s"unexpected FP enabled-trap escalation at cycle $cycle (FPCR enable byte is all-clear)")
       if (s.fpCValid.toBoolean) comps += Comp(cycle, s.fpCRob.toInt)
@@ -317,6 +338,15 @@ class FpuProtocolSpec extends AnyFunSuite {
       if (s.iFire.toBoolean)    fires += ((cycle, s.obsRob.toInt))
       // A wakeup with no completion behind it is an orphan broadcast: a consumer would be
       // released against a physreg that was never written.
+      //
+      // UNFALSIFIABLE TODAY, DELIBERATELY KEPT (T15-#4). `DivEuPlugin` drives
+      // `fpWakeupPort.valid := fpW.valid` (and `fpccWakeupPort.valid := fpccW.valid`), both of
+      // which are gated on the same `fpCompLive` as `fpCompletionPort.valid`, so this is
+      // tautological against the current netlist. It is a REFACTOR TRIPWIRE for the specific
+      // future in which the wakeup broadcast is decoupled from the completion register --
+      // e.g. an early/speculative wakeup added to shave a dependent op's issue latency, which
+      // is precisely the change that can start broadcasting against a physreg no write ever
+      // lands on. It is not a live check today and is not expected to fail.
       val orphanWakeup = !s.fpCValid.toBoolean && (s.fpWakeV.toBoolean || s.fpccWakeV.toBoolean)
       assert(!orphanWakeup, s"orphan FP wakeup at cycle $cycle with no completion")
     }
@@ -572,9 +602,15 @@ class FpuProtocolSpec extends AnyFunSuite {
 
       // STATUS OBSERVATION. These four operations are all exact, so the FPSR exception-status
       // accrual port must stay silent: a spurious accrual would corrupt architectural FPSR
-      // for a program that never raised anything. (A duplicate/missing accrual on a raising
-      // op is covered by the lock-step corpus, which can see real FPSR values; here the
-      // provable protocol property is that a clean op accrues nothing.)
+      // for a program that never raised anything -- here the provable protocol property is
+      // that a clean op accrues nothing.
+      //
+      // (T15-#1, whole-branch review: this used to say the RAISING half was "covered by the
+      // lock-step corpus, which can see real FPSR values". That was FALSE -- Divergence
+      // Register D4 records that Musashi models no FP exceptions at all, so lock-step has no
+      // oracle for FPSR.EXC and can never cover a raising op. The real coverage is the two
+      // raising-op tests immediately BELOW this one: the iterative-lane FDIV 1.0/0.0 (DZ) and
+      // the fixed-lane 1.0 + 2^-65 (INEX2).)
       assert(accruals.isEmpty,
         s"exact FP operations raised ${accruals.size} FPSR exception accrual(s): " +
         accruals.map { case (c, v) => f"cycle $c = 0x$v%02X" }.mkString(", "))
@@ -658,8 +694,13 @@ class FpuProtocolSpec extends AnyFunSuite {
       assert(compByCycle.get(accCycle).contains(divOp.rob),
         s"the sole accrual at cycle $accCycle does not line up with the FDIV's completion " +
         s"(rob completing that cycle: ${compByCycle.get(accCycle)}, expected ${divOp.rob})")
-      assert((accByte & 0x04) != 0,
-        f"the FDIV 1.0/0.0 accrual byte 0x$accByte%02X does not have DZ (bit 2) set")
+      // EXACT equality, not a mask test (T15-#3, whole-branch review): 1.0/0.0 raises DZ and
+      // ONLY DZ (it is not inexact, not an OPERR, no NaN involved), so the byte is provably
+      // 0x04. A mask test would pass with a spuriously co-set neighbouring bit -- exactly
+      // the failure mode a bad `fpsrExcByte` re-order would produce.
+      assert(accByte == ExcDz,
+        f"the FDIV 1.0/0.0 accrual byte is 0x$accByte%02X, expected exactly 0x$ExcDz%02X " +
+        "(DZ alone -- a divide by zero raises nothing else)")
 
       // THE NEGATIVE CASE, kept intact and re-proven under real concurrent traffic: none of
       // the 3 exact ops produced an accrual of their own.
@@ -676,6 +717,92 @@ class FpuProtocolSpec extends AnyFunSuite {
       assert(comps.size == settled, "an extra completion arrived after the raising-op batch drained")
       assert(accruals.size == 1, "an extra FPSR accrual arrived after the raising-op batch drained")
       readBackAll(ops, "raising-op batch")
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════════════════
+  // Requirement 2 (FIXED-lane raising half). Whole-branch review finding N3, 2026-08-17.
+  //
+  // Every raising-op test on the whole FPU branch -- this file's FDIV above, and all of
+  // FpuControlWiringSpec -- goes through FDIV, i.e. through the ITERATIVE lane, whose
+  // descriptor is a single `fpIterCtx` register captured at start and read back at done.
+  // The FIXED lane's attribution is a completely different mechanism: a 13-deep
+  // (`FpuCore.FixedLatency`) `fpFixedCtx` shadow pipe running alongside FpuCore, with
+  // `fpCompExc := fpsrExcByte(res.exc)` pairing `fpFixedCtx.last`'s robId against
+  // `fpu.io.resFixed.exc`. That pairing had NEVER been observed with a nonzero raise
+  // anywhere on the branch, so a stage-count skew between the shadow pipe and FpuCore's own
+  // exception output was undetectable: FPSR itself would look right (it just OR-accumulates,
+  // and the byte is identical either way), but the raise would be attributed to a NEIGHBOUR's
+  // robId -- which on the enabled-trap path is "the trap is delivered on the wrong
+  // instruction", a precise-exception bug.
+  //
+  // 1.0 + 2^-65 is the cheapest genuine fixed-lane raise: 2^-65 is a quarter of 1.0's
+  // extended ULP, so under RN (`fpRmodeIn`'s standalone-DUT default, B"2'b00") the result is
+  // exactly 1.0 with INEX2 and nothing else -- no substitution, no fault, no change to the
+  // lane's timing (`doneFixed` pulses at `FixedLatency` regardless of inexactness).
+  // ══════════════════════════════════════════════════════════════════════════════════════
+
+  test("FP status observation: an inexact FIXED-lane FADD (1.0 + 2^-65) accrues exactly " +
+       "INEX2 on its OWN robId's completion cycle, with exact fixed-lane neighbours on " +
+       "both sides accruing nothing", VerilatorTest) {
+    dut.doSim { d =>
+      val h = new Harness(d); import h._
+      boot()
+      preloadOperands()
+      preloadFp(PTiny, TwoPowM65)
+      clearLog()
+
+      // The raising op is INTERIOR to the batch on purpose. A shadow-pipe skew in either
+      // direction can only be caught if there is a real neighbour on both sides for the
+      // raise to be misattributed to.
+      val exact  = eightOps(robBase = 30, pdstBase = 9).take(3)  // rob 30,31,32; pdst 9,10,11
+      val inexOp = fadd(33, POne, PTiny, 12, One, CcNone, "1.0 + 2^-65 (INEX2)")
+      val ops    = Seq(exact(0), exact(1), inexOp, exact(2))
+
+      for (o <- ops) { present(o); acceptNow(s"fixed-lane INEX2 batch ${o.label} (rob=${o.rob})") }
+      s.iValid #= false
+
+      drainTo(ops.size, FpuCore.FixedLatency + 40, "fixed-lane INEX2 batch")
+      // Single lane, so completion order IS issue order and the strict per-index checker
+      // applies -- unlike the FDIV test above, which mixes lanes and must key on robId.
+      // This also pins the inexact op's own RESULT: 1.0 + 2^-65 must round back to exactly
+      // 1.0 with FPCC clear, i.e. the raise must not have perturbed the datapath.
+      checkExactlyOnce(ops, "fixed-lane INEX2 batch")
+
+      assert(accruals.size == 1,
+        s"expected exactly one FPSR exception accrual (the inexact FADD), saw " +
+        s"${accruals.size}: " +
+        accruals.map { case (c, v) => f"cycle $c = 0x$v%02X" }.mkString(", "))
+      val (accCycle, accByte) = accruals.head
+
+      // THE ATTRIBUTION CHECK -- the whole point of this test.
+      val inexIdx   = ops.indexOf(inexOp)
+      val inexCycle = comps(inexIdx).cycle
+      assert(accCycle == inexCycle,
+        s"the FPSR accrual landed at cycle $accCycle, but the inexact FADD (rob=" +
+        s"${inexOp.rob}) completed at cycle $inexCycle (rob completing at $accCycle: " +
+        s"${comps.find(_.cycle == accCycle).map(_.rob).getOrElse("none")}) -- the fixed " +
+        "lane's fpFixedCtx shadow pipe is out of step with FpuCore's own resFixed.exc, so " +
+        "raises are attributed to the wrong instruction")
+      assert(accByte == ExcInex2,
+        f"the 1.0 + 2^-65 accrual byte is 0x$accByte%02X, expected exactly 0x$ExcInex2%02X " +
+        "(INEX2 alone -- a quarter-ULP addend rounds cleanly to 1.0 and raises nothing else)")
+
+      // The negative half, restated per-neighbour so a failure names the op that leaked.
+      for ((o, i) <- ops.zipWithIndex if i != inexIdx) {
+        val c = comps(i).cycle
+        assert(c != accCycle,
+          s"${o.label} (an exact fixed-lane op, rob=${o.rob}) completed on the accrual " +
+          s"cycle $c -- the INEX2 raise was attributed to it instead of to rob=${inexOp.rob}")
+      }
+
+      val settled = comps.size
+      tick(FpuCore.FixedLatency + 10)
+      assert(comps.size == settled,
+        "an extra completion arrived after the fixed-lane INEX2 batch drained")
+      assert(accruals.size == 1,
+        "an extra FPSR accrual arrived after the fixed-lane INEX2 batch drained")
+      readBackAll(ops, "fixed-lane INEX2 batch")
     }
   }
 

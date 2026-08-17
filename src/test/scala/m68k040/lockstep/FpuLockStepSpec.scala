@@ -227,6 +227,18 @@ class FpuLockStepSpec extends AnyFunSuite {
     // FCMP takes a SEPARATE infinity branch that clears all FPCC bits and sets only
     // N/Z, never I) and empirically on the real oracle (FPSR 0x02000000 after FTST of
     // +inf, 0x04000000 after FCMP +inf,+inf).
+    //
+    // GUARD (Divergence Register D4, tightened 2026-08-17). The `fmove.l %fpsr,%dN` reads
+    // below land FPSR in D0..D3, which `LockStep.compare` then checks BIT-EXACTLY, all 32
+    // bits, against Musashi -- including the EXC/AEXC bytes. That is safe here ONLY because
+    // this specific program never raises an FP exception (FTST/FCMP of infinities raise
+    // nothing; see D6), so both sides read those bytes as zero. It is an incidental
+    // property of the chosen instructions, not a designed guard.
+    // => If you ever add a RAISING instruction to this program (or to any other lock-stepped
+    //    program that reads FPSR into an integer register), you MUST mask the exception
+    //    bytes before comparing -- Musashi models NO FP exceptions at all and will read 0
+    //    where our RTL correctly accrues a sticky bit. The resulting divergence is the
+    //    ORACLE being wrong, not the DUT; do not "fix" it by weakening FPSR accrual.
     val instrs = Seq(
       immX(0, PosInf._1, PosInf._2),
       immX(1, PosInf._1, PosInf._2),

@@ -197,6 +197,46 @@ op with a real completion event behind it, unlike FPCR/FPIAR, so the existing ta
 scoreboard pattern — not a new mechanism — would be the right tool if one turns out to be
 needed).
 
+#### 4a. The required assessment, PERFORMED (2026-08-17, post-Task-14c)
+
+`orFpsrExc` got its real producer in Task 14c (`DivEuPlugin.fpExcAccrualPort`, wired by
+`DivEuPlugin.wireFpControl`), so §4's mandated re-assessment is now due and is recorded here.
+Outcome: **(a) — the sticky-bit argument holds for the main path, no interlock added**, but
+with two qualifications that a future reader must not lose.
+
+1. **The main read path is safe, but only incidentally so.** The sole consumer of
+   `DivEuPlugin`'s live FPCR/FPSR/FPIAR reads is the `UFpCtrlRead` microcode row
+   (FMOVEM-control and FMOVE-from-FPSR). That row **always** declares `readsFpcc` — not
+   because it wants FPSR ordering, but because the position→register choice is a runtime mux
+   so the row cannot know statically whether it is the FPSR one (see `UFpCtrlRead`'s own
+   comment in `Microcode.scala`). Since **every** HW-native FP op writes FPCC
+   (`u.writesFpcc := True` in the FP-op decode family), the CPLX dynamic-wakeup scoreboard
+   already holds any FPSR read ≥2 cycles past the producing FP op's `fpccW` — and `fpccW`
+   fires on the *same* cycle as that op's `fpExcAccrualPort` accrual (both gated on
+   `fpCompLive`). So there is a genuine ordering guarantee for the arithmetic lane, and it is
+   stronger than the "one-cycle-late sticky snapshot" §4 was willing to settle for. It is,
+   however, **load-bearing on an FPCC dependency that has nothing to do with FPSR by design**.
+   Narrowing `readsFpcc` to "only the FPSR position" — an obvious-looking future
+   micro-optimisation — would silently delete this guarantee. Treat it as an invariant to
+   preserve, not a redundancy to tidy away.
+
+2. **One narrow residual remains open, deliberately.** Task 14b's `UFpStoreCvt` (the
+   `FMOVE FPn,<ea>` store-direction narrow converter) is a **second** accrual site on the same
+   port, and it declares **no** FPCC dependency at all (`readsFpcc` stays default `False`). An
+   `FMOVE FPn,<ea>` raising OPERR/INEX2/OVFL/UNFL/SNAN in the converter, immediately followed
+   by `FMOVEM.L FPSR,-(An)`, therefore has no ordering guarantee, and the stored FPSR image can
+   miss the just-accrued sticky bit. This is **not fixed**; it is accepted as a known, narrow
+   gap on exactly §4's own reasoning: the accrual is a pure OR of *sticky* bits, so the worst
+   case is a snapshot one cycle late — never a torn or incoherent value — and it self-heals on
+   any subsequent read. Nothing on this branch exercises it either, since the race only matters
+   to a handler that reads FPSR to dispatch and no FPCR-enabled-trap handler substrate exists
+   yet. Closing it means either giving `UFpStoreCvt` a real wakeup dependency or moving the
+   accrual to retire time (§4's option (b), or the retire-time fold `FpuControlService.orFpsrExc`'s
+   scaladoc already sketches) — a real interlock change that belongs in its own gated slice.
+
+The same summary is mirrored in-code at `DivEuPlugin.scala`'s live-read comment, so an RTL
+reader does not have to find this document to learn that FPSR now has two writers.
+
 ### 5. What this design deliberately does NOT touch
 
 - `RobPlugin.scala`'s `excActive`/`excSquash`/`flushing` — unchanged.
@@ -369,8 +409,10 @@ execute-time flops) or genuinely requires branching on one (FRESTORE: yes, unavo
 
 ## Open items (explicitly not resolved here — flag, don't guess)
 
-- **§4's `orFpsrExc` caveat** — not this design's job to close, must be re-examined by whoever
-  wires up the FP EU's exception-status accrual.
+- ~~**§4's `orFpsrExc` caveat** — not this design's job to close, must be re-examined by whoever
+  wires up the FP EU's exception-status accrual.~~ **DONE (2026-08-17): see §4a.** Assessed
+  post-Task-14c; main path confirmed safe (via an incidental FPCC dependency that must now be
+  preserved), one narrow `UFpStoreCvt` ordering residual explicitly accepted and deferred.
 - **Exact new `Sel`/`SysKind` names and the precise `S_APPLY` arm restructuring** — left to the
   re-briefed Task 9b's implementer, following Decision 2/3's shape exactly; this document
   fixes the mechanism, not the Scala identifiers.

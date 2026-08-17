@@ -238,4 +238,71 @@ class FpuControlWiringSpec extends AnyFunSuite {
     assert((r.fpsr.toInt & AexcIop) != 0,
       f"UM 9.2.3.4: IOP = IOP V (SNAN V OPERR); FPSR=0x${r.fpsr.toString(16)}")
   }
+
+  // ── The two ENABLE bits nothing else on this branch exercises (14c-M2/M4) ─────
+  //
+  // Whole-branch review finding. Every escalation test above drives DZ, OVFL, INEX2 or
+  // OPERR -- `en(2)`, `en(4)`, `en(1)`, `en(5)` of `DivEuPlugin.wireFpControl`'s FPCR
+  // ENABLE-byte map. `en(6)` (SNAN) and `en(3)` (UNFL) had NO test at all, so a
+  // `snan` <-> `unfl` transposition in that map would have passed the entire suite
+  // untouched -- INCLUDING the "unrelated enable bit does NOT escalate" negative control
+  // above, which only ever pairs OVFL with a DZ condition and so never observes either of
+  // the two swapped bits. These two tests close that hole by driving the remaining pair.
+  //
+  // WHICH RAISING SITE. Task 14b's store-direction narrowing converter
+  // (`FpNarrowPack`) feeds the IDENTICAL `fpEscalationOf` gate the arithmetic lane uses
+  // (`DivEuPlugin`'s `fpStoreEsc`), so either site proves the mapping. SNAN is taken on
+  // the arithmetic path (an SNaN operand into FADD) because a signalling NaN is trivial
+  // to construct from an integer register; UNFL is taken on the store path because an
+  // EXTENDED-precision underflow needs an exponent below -16382 and is not reachable from
+  // a short instruction sequence, whereas a SINGLE-precision store of a ~2^-155 value
+  // underflows immediately.
+
+  /** A signalling NaN as a SINGLE: exponent all-ones, mantissa MSB (the quiet bit) CLEAR,
+    * payload nonzero. `FpSource`'s single->extended widening deliberately preserves the
+    * signalling form (it sets only the explicit integer bit, unlike SoftFloat's
+    * `commonNaNToFloatx80`), so this arrives at the adder still signalling. */
+  private val SNanSingle = 0x7FA00000
+
+  test("FPCR.SNAN enable escalates an SNaN operand to a real vector-54 trap", VerilatorTest) {
+    // FPCR is written AFTER `fmove.s %d0,%fp0` on purpose: the FMOVE itself raises SNAN
+    // (FpCheapPipe does, and D7 records that it does NOT quiet the value), so setting the
+    // enable first would vector on the setup move instead of on the FADD under test.
+    val r = run(prog(Seq(f"move.l #0x$SNanSingle%08X,%%d0", "fmove.s %d0,%fp0") ++
+                     setFpcr(ExcSnan) ++
+                     Seq("fmove.l #1,%fp1", "fadd.x %fp0,%fp1")),
+                name = "snan-enabled")
+    assert(r.fpcr.toInt == ExcSnan,
+      f"the architectural FMOVE.L %%d0,%%fpcr must have landed; FPCR=0x${r.fpcr.toString(16)}")
+    assert(r.sawVector == VecSnan,
+      s"an ENABLED SNAN must vector to $VecSnan (MC68040 UM Table 8-1); saw ${r.sawVector}")
+    assert((r.fpsr.toInt & ExcSnan) != 0,
+      f"FPSR.EXC.SNAN must be set for the handler to read, FPSR=0x${r.fpsr.toString(16)}")
+    assert((r.fpsr.toInt & AexcIop) != 0,
+      f"UM 9.2.3.4: IOP = IOP V (SNAN V OPERR); FPSR=0x${r.fpsr.toString(16)}")
+  }
+
+  test("FPCR.UNFL enable escalates a single-precision store underflow to a real vector-51 trap",
+       VerilatorTest) {
+    // 1.0 divided by 2^31-1 five times is ~2^-155, far below single's smallest subnormal
+    // (2^-149) but nowhere near EXTENDED's underflow threshold -- so the five FDIVs
+    // themselves raise only INEX2 (not enabled here) and the UNFL comes strictly from the
+    // `fmove.s` narrowing conversion.
+    val tiny = Seq("fmove.l #1,%fp0", "fmove.l #0x7FFFFFFF,%fp1") ++
+               Seq.fill(5)("fdiv.x %fp1,%fp0")
+    val r = run(prog(setFpcr(ExcUnfl) ++ Seq("movea.l #0x3000,%a0") ++ tiny ++
+                     Seq("fmove.s %fp0,(%a0)")),
+                cycles = 8000, name = "unfl-enabled")
+    assert(r.fpcr.toInt == ExcUnfl,
+      f"the architectural FMOVE.L %%d0,%%fpcr must have landed; FPCR=0x${r.fpcr.toString(16)}")
+    assert(r.sawVector == VecUnfl,
+      s"an ENABLED UNFL must vector to $VecUnfl (MC68040 UM Table 8-1); saw ${r.sawVector}")
+    // UNFL sits one ENABLE bit below OVFL and one above DZ. Naming the two neighbours
+    // explicitly is what makes a transposition report itself instead of just failing:
+    assert(r.sawVector != VecOvfl && r.sawVector != VecDz,
+      s"vector ${r.sawVector} is UNFL's ENABLE-bit neighbour -- FPCR[15:8] -> FpExcFlags " +
+      "is transposed (en(4)=OVFL, en(3)=UNFL, en(2)=DZ)")
+    assert((r.fpsr.toInt & ExcUnfl) != 0,
+      f"FPSR.EXC.UNFL must be set for the handler to read, FPSR=0x${r.fpsr.toString(16)}")
+  }
 }
