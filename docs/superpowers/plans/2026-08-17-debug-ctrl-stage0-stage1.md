@@ -839,7 +839,7 @@ Expected before the file exists: `python3: can't open file ... No such file or d
 ```bash
 cd /home/qwertyoruiop/m68k-core-040-ooo
 cp tools/debug/debug_regmap.def /tmp/regmap_backup.def
-sed -i 's/^REG OFF_MON_SENSE          0x0005C/REG OFF_MON_SENSE          0x00064/' tools/debug/debug_regmap.def
+sed -i 's/^REG OFF_MON_SENSE         0x0005C/REG OFF_MON_SENSE         0x00064/' tools/debug/debug_regmap.def
 python3 tools/debug/test_sibling_conformance.py; echo "exit=$?"
 cp /tmp/regmap_backup.def tools/debug/debug_regmap.def
 rm -f /tmp/regmap_backup.def
