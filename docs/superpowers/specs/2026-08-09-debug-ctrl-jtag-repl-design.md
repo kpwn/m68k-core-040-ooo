@@ -932,7 +932,7 @@ non-zero reset values (`cpu_ram_window_lg2` = 26, `cpu_mon_sense` = 7'h06).
 **CPU-reset notification.** The core reset is *observed*, never consumed, by the
 debug domain: a rising-edge detector on the socket `rst`, clocked in the debug
 domain, with reset value 1 so a `rst` already high when the debug domain leaves
-POR does not manufacture a spurious edge (`debug_reset_ctl.v:129-139`). No extra
+POR does not manufacture a spurious edge (`debug_reset_ctl.v:133-142`). No extra
 socket port is added.
 
 **Build ID.** `DBG_BUILD_ID` remains SoC-supplied (§3.1). It enters the core as a
@@ -941,9 +941,49 @@ Verilog generator may override from the environment. It is deliberately NOT a
 socket port and NOT a `Global` database key (§0.9).
 
 **Init-done observation.** `init_done_seen` is a level input; the debug domain
-latches it sticky so a debugger attaching after DDR calibration still sees it,
-and `OFF_CONTROL` bit 3 (init-done override) ORs into the same status bit. Both
-live in the debug reset domain and therefore survive CPU reset.
+latches it sticky so a debugger attaching after DDR calibration still sees it.
+The deployed reference sends `OFF_CONTROL` bit 3 (init-done override) to its own
+DEDICATED output port, `dbg_init_done_override` (`debug_ctrl.v:157`, `:966`),
+and `OFF_STATUS` bit 2 reads `init_done_latched` ALONE, with no OR
+(`debug_ctrl.v:1426`) — consistent with this same spec's own §3.3 ("init-done
+override level, SoC-owned"). This core's `cpu_socket.vh` SoC-fabric control
+group has no init-done-override output at all, so there is nowhere on this
+socket to send that signal. This design therefore makes a **deliberate
+divergence** from the deployed reference: `OFF_CONTROL` bit 3 ORs directly
+into the same bit `OFF_STATUS` bit 2 reads, rather than driving a separate
+port. Naming the real consequence: STATUS bit 2 — a claim that DDR
+calibration completed — becomes forgeable by the host itself, which is
+exactly the class of thing §15.2 forbids two paragraphs below (a host must
+"discover the truth by reading back rather than by waiting for a status bit
+that will never set"). This is judged acceptable here because the forgery is
+self-inflicted: a debug host that writes CONTROL bit 3 is lying to *itself*
+about DDR-cal completion — there is no third party relying on the bit for the
+lie to defraud. Any Stage-2-or-later extension that lets an agent other than
+the writer act on STATUS bit 2 must revisit this call.
+
+Sticky init-done latching does **not** survive CPU reset, despite living in
+the debug reset domain — living in that domain does not by itself mean
+surviving CPU reset; `debug_reset_ctl.v` exists specifically so logic in that
+same domain can tell the two categories apart, via the CPU-reset rising-edge
+detector at `debug_reset_ctl.v:133-142`. The deployed reference explicitly
+WIPES both `ctrl_init_done_override` (`debug_ctrl.v:2468`) and
+`init_done_latched` (`debug_ctrl.v:2561`) inside a `counters_clear`-gated
+block (`debug_ctrl.v:2464`, itself driven from that same rising-edge
+detector) on every CPU-reset rising edge. The contract comment at
+`debug_ctrl.v:2447-2462` names this "CPU-COUPLED RUNTIME state" — state
+that, if it survived, would report a previous life as the current one — as
+exactly the category that must NOT survive, distinct from "host
+configuration" (break/halt-exception config, `ram_window_lg2_r`,
+`mon_sense_r`, the arch shadows, and `ctrl_cold_reset_hold`) which must.
+Stage 1 does not implement any init-done-latching RTL yet — that lands in
+Task 9 — so this spec records the requirement for that implementer rather
+than prescribing RTL here: Task 9 must add a CPU-reset rising-edge detector
+in the debug clock domain (mirroring `debug_reset_ctl.v:133-142`'s
+`cpu_rst_event`) and gate both the sticky init-done latch and the
+CONTROL-bit-3 override register on it, clearing each to its POR value of 0
+on that edge, exactly as `debug_ctrl.v:2464`'s `counters_clear` block does.
+`cold_reset_hold` is explicitly **not** part of this wipe set — §15.2
+already states it survives CPU reset, matching the deployed reference.
 
 ### 15.2 Stage-1 CONTROL and STATUS behaviour
 
