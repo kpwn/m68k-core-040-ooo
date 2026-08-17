@@ -8,6 +8,7 @@ Exits 0 on success, 1 on the first failure (with a diagnostic on stderr).
 
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -24,8 +25,44 @@ def check(label, cond, detail=""):
         print("FAIL  " + label + (("  -- " + detail) if detail else ""))
 
 
+def check_duplicate_name_guard():
+    """Task-1-review fold-in finding: offsets() built its name->offset dict with
+    no duplicate-name guard, so a future append whose BLK expansion lands on an
+    existing REG's name would silently overwrite/erase that REG's entry -- and
+    the existing "no two register names share an offset" check above can't catch
+    it, since it only ever sees the post-collapse dict. load() now calls
+    offsets() internally and propagates the ValueError it raises on collision.
+
+    This builds a deliberately damaged fixture with a genuine name collision,
+    confirms load() raises and names the colliding register, then confirms the
+    real debug_regmap.def (already loaded clean by main(), above) is unaffected."""
+    fixture = (
+        "REG OFF_DUP_A   0x00000 RW    1 0x00000000 first definition\n"
+        "REG OFF_DUP_A   0x00004 RW    1 0x00000000 duplicate name, different offset\n"
+    )
+    fh = tempfile.NamedTemporaryFile(mode="w", suffix=".def", delete=False)
+    try:
+        fh.write(fixture)
+        fh.close()
+        raised, detail = False, ""
+        try:
+            regmap.load(fh.name)
+        except ValueError as exc:
+            raised, detail = True, str(exc)
+        check("load() raises on a duplicate register name fixture", raised, detail)
+        check("the raised error names the colliding register",
+              raised and "OFF_DUP_A" in detail, detail)
+    finally:
+        os.unlink(fh.name)
+
+
 def main():
-    rm = regmap.load()
+    try:
+        rm = regmap.load()
+    except ValueError as exc:
+        sys.stderr.write("FATAL: regmap.load() raised on the real def file: %s\n" % exc)
+        return 1
+    check("the real debug_regmap.def loads with no duplicate-name collision", True)
 
     check("def file parses and is non-trivial",
           len(rm.regs) >= 80, "only %d REG records" % len(rm.regs))
@@ -48,6 +85,11 @@ def main():
         else:
             seen[off] = name
     check("no two register names share an offset", not dupes, "; ".join(dupes))
+
+    # No two records may share a NAME either -- a distinct hazard from sharing an
+    # offset (a later record would silently overwrite an earlier one's entry in
+    # offsets(), rather than merely aliasing the same address).
+    check_duplicate_name_guard()
 
     # Feature bits: dense 0..N, never renumbered, unique.
     bits = sorted(f.bit for f in rm.feats)

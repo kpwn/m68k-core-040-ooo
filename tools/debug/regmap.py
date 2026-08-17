@@ -91,15 +91,31 @@ class RegMap(object):
 
     def offsets(self):
         """name -> offset for every REG, every expanded BLK element, and every
-        RANGE base. The RANGE body itself is reserved but has one named base."""
+        RANGE base. The RANGE body itself is reserved but has one named base.
+
+        Raises ValueError if two entries (a REG, an expanded BLK element, or a
+        RANGE base) claim the same name -- a later one would otherwise silently
+        overwrite an earlier one's entry in the returned dict with no trace of
+        the collision. See debug_regmap.def's own comments for a near-miss this
+        guards against (an OFF_LIVE_A naming choice that would have collided
+        with OFF_LIVE_A7)."""
         out = {}
+        dupes = []
+        def put(name, off):
+            if name in out:
+                dupes.append(name)
+            else:
+                out[name] = off
         for r in self.regs:
-            out[r.name] = r.offset
+            put(r.name, r.offset)
         for b in self.blks:
             for name, off in b.elements():
-                out[name] = off
+                put(name, off)
         for rg in self.ranges:
-            out[rg.name] = rg.base
+            put(rg.name, rg.base)
+        if dupes:
+            raise ValueError("duplicate register name(s) in offsets(): %s"
+                             % ", ".join(sorted(set(dupes))))
         return out
 
     def features_for_stage(self, stage):
@@ -152,6 +168,7 @@ def load(path=None):
             except (IndexError, ValueError) as exc:
                 raise ValueError("%s:%d: %s (in %r)" % (path or DEF_PATH, lineno, exc, line))
     rm.feats.sort(key=lambda f: f.bit)
+    rm.offsets()  # validate: raises ValueError on any duplicate register name
     return rm
 
 
