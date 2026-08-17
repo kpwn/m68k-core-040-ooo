@@ -283,8 +283,34 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     val ftqPop = Bool(); ftqPop.allowOverride; ftqPop := False
     val ftqFlush = Bool(); ftqFlush.allowOverride; ftqFlush := False
     val ftqMismatchPending = Reg(Bool()) init False
-    val ftqMismatchPcReg = Reg(UInt(32 bits)) init 0
-    val ftqMismatchBrPcReg = Reg(UInt(32 bits)) init 0
+    // FMax (task #219, Fix 1 -- netlist-grounded against
+    // `synth/archive/866437c_fmax_fanout_fix_decode_fetch/fullcore_route_timing.rpt`,
+    // Design State: Routed): 26 of that report's 100 worst endpoints were
+    // `decodePc_reg[2] -> ftqMismatch{Pc,BrPc}Reg[*]/CE`, i.e. the *clock-enable* pins of
+    // these 64 flops, driven by `ftqMismatchDetect` at fo=71 (0.379ns of routing on the
+    // final net alone, plus a whole LUT6 level to fold the four detector terms together).
+    // The capture DATA is early -- `ftqHeadE.brPc` has no `decodePc` dependence at all, and
+    // the PC capture is a 2:1 select between two values that are both already computed. So:
+    // capture UNCONDITIONALLY every cycle into `Cur`/`Next`/`Sel` registers, and do the
+    // select on the REGISTERED side at C+1.
+    //
+    // WHY THIS IS EXACTLY EQUIVALENT (not an approximation): `ftqMismatchPcReg` and
+    // `ftqMismatchBrPcReg` are read ONLY through `ftqMismatchPc` (-> the `when(ftqMismatch)`
+    // recovery block) and `ftbClear.payload` (`ftbClear.valid := ftqMismatch`), so every
+    // reader is gated by `ftqMismatch` (== `ftqMismatchPending`). `ftqMismatchPending` has
+    // exactly one setter, `when(ftqMismatchDetect)`. So the captured values are observable
+    // ONLY on the cycle immediately after a detect -- precisely the cycle on which an
+    // unconditional capture still holds the detect cycle's values. Writes on every other
+    // cycle are architecturally dead. (And no second capture can land before the read:
+    // `ftqMismatchDetect` itself requires `!ftqMismatchPending`.) A sim-only shadow that
+    // captures under the ORIGINAL `when(ftqMismatchDetect)` gating and asserts equality on
+    // every pending cycle is wired up at the detector site below.
+    val ftqMismatchPcCurReg  = Reg(UInt(32 bits)) init 0
+    val ftqMismatchPcNextReg = Reg(UInt(32 bits)) init 0
+    val ftqMismatchPcSelReg  = Reg(Bool()) init False
+    val ftqMismatchBrPcReg   = Reg(UInt(32 bits)) init 0
+    val ftqMismatchPcReg     = UInt(32 bits)
+    ftqMismatchPcReg := Mux(ftqMismatchPcSelReg, ftqMismatchPcNextReg, ftqMismatchPcCurReg)
     ftqMismatchPending := False
     val ftqMismatchDetect = Bool(); ftqMismatchDetect.allowOverride; ftqMismatchDetect := False
     val ftqMismatchDetectPc = UInt(32 bits)
@@ -1034,10 +1060,38 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     ftqMismatchDetect := (ftqStarved || ftqPast || ftqLenBad || ftqOvershoot) &&
                          !quiesce && !stalled && !ftqMismatchPending
     ftqMismatchDetectPc := Mux(ftqLenBad || ftqOvershoot, decodePcNext, decodePc)
+    // FMax Fix 1 (see the capture-register declaration above for the full equivalence
+    // argument): unconditional capture. `ftqMismatchDetect` no longer reaches ANY of the
+    // 64 capture flops' CE pins -- it now drives only `ftqMismatchPending` (1 flop) and
+    // the pre-existing `predictDetectBlocked` term.
+    ftqMismatchPcCurReg  := decodePc
+    ftqMismatchPcNextReg := decodePcNext
+    ftqMismatchPcSelReg  := ftqLenBad || ftqOvershoot
+    ftqMismatchBrPcReg   := ftqHeadE.brPc
     when(ftqMismatchDetect) {
       ftqMismatchPending := True
-      ftqMismatchPcReg := ftqMismatchDetectPc
-      ftqMismatchBrPcReg := ftqHeadE.brPc
+    }
+    // Mandatory drift proof for the retime above: a sim-only shadow captured under the
+    // ORIGINAL gating must agree with the restructured registers on every cycle the values
+    // are architecturally observable (i.e. every pending cycle). Elaborated ONLY in
+    // simulation (`.includeSimulation`, see M68kSim.scala) -- putting a
+    // `when(ftqMismatchDetect)`-enabled 32-bit register in the SYNTHESIZED netlist would
+    // reintroduce the exact fo=71 CE cone this fix removes.
+    GenerationFlags.simulation {
+      val refPcReg   = Reg(UInt(32 bits)) init 0
+      val refBrPcReg = Reg(UInt(32 bits)) init 0
+      when(ftqMismatchDetect) {
+        refPcReg   := ftqMismatchDetectPc
+        refBrPcReg := ftqHeadE.brPc
+      }
+      when(ftqMismatchPending) {
+        assert(ftqMismatchPc === refPcReg,
+          "FetchAlignPlugin: FTQ mismatch recovery PC drifted from its gated-capture reference",
+          FAILURE)
+        assert(ftqMismatchBrPcReg === refBrPcReg,
+          "FetchAlignPlugin: FTQ mismatch recovery branch PC drifted from its gated-capture reference",
+          FAILURE)
+      }
     }
     // A live fallback may only fill the action register. Architectural redirects and
     // a malformed FTB claim on this detector edge cancel it; those actions already
