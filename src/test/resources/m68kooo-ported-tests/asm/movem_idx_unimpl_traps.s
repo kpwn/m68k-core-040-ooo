@@ -1,18 +1,23 @@
 | movem_idx_unimpl_traps.s — MOVEM brief-indexed shapes with no decoder
-| row (mode-110 An-indexed load/store, both sizes) must take a CLEAN
-| vec-4 ILLEGAL — pinning the fail-safe behaviour (no crack-wedge, no
-| partial execution).  Originally written against the 2026-07-15 audit
-| to pin FOUR still-unimplemented shapes; ported-tests triage
-| (movem_pc_idx_w HANG investigation) implemented the fourth shape for
-| real (MOVEM.W (d8,PC,Xn) LOAD — the FSM that computes the EA was
-| already fully size-generic, only OperationDecoder.scala's decoder gate
-| artificially restricted PC-indexed MOVEM to `.L`; positive coverage:
-| movem_pc_idx_w.s), so pinning it as "must trap" here would now be
-| wrong — that case is REMOVED.  Mode-110 (An-indexed) load/store, both
-| sizes, remain a genuine unimplemented gap in this fork (no EA-compute
-| crack for that mode at all) and stay pinned.  MOVEM.L (d8,PC,Xn) load
-| IS implemented (legacy row) and is covered by fuzz, not here.  A5
-| arms the continuation for the vec-4 handler; D5 counts traps.
+| row must take a CLEAN vec-4 ILLEGAL — pinning the fail-safe behaviour
+| (no crack-wedge, no partial execution).  Originally written against
+| the 2026-07-15 audit to pin FOUR still-unimplemented shapes.
+|
+| V1-decode-retirement phase 2 (2026-07-22) implemented two of those
+| four shapes for real (they are no longer gaps, so pinning them as
+| "must trap" here would be wrong):
+|   - MOVEM.L (d8,An,Xn) LOAD  — now a real EA-compute-then-N-LOAD
+|     crack (`movem_ea_is_idx_an_brief_f3`).  Positive coverage:
+|     movem_idx_an_load.s (+ fuzz `emit_movem_idx_an_load`).
+|   - MOVEM.W (d8,PC,Xn) LOAD  — the crack that made An-indexed .W work
+|     was generalized to also drop the old .L-only restriction on the
+|     PC-indexed crack.  Positive coverage: movem_pc_idx_w.s.
+|
+| STORE direction for brief-indexed EAs (mode 110) was NOT touched by
+| that fix — `v2_movem_ea_ok_store` still has no indexed-EA row at all
+| — so it remains a genuine gap and stays pinned here.
+|
+| A5 arms the continuation for the vec-4 handler; D5 counts traps.
 |
 | PASS: 0xC0FFEE00.  FAIL: 0xDEADBEEF.
 
@@ -27,18 +32,14 @@ _start:
     moveq   #0, %d0
 
     lea     _c2, %a5
-    movem.l %d6-%d7, (0,%a0,%d0.l)    | store .L An-indexed
+    movem.l %d6-%d7, (0,%a0,%d0.l)    | store .L An-indexed — still unimplemented
     bra     _fail
 _c2:
     lea     _c3, %a5
-    movem.l (0,%a0,%d0.l), %d6-%d7    | load .L An-indexed
+    movem.w %d6-%d7, (0,%a0,%d0.l)    | store .W An-indexed — still unimplemented
     bra     _fail
 _c3:
-    lea     _c4, %a5
-    movem.w (0,%a0,%d0.l), %d6-%d7    | load .W An-indexed
-    bra     _fail
-_c4:
-    cmp.l   #3, %d5                   | all three must have trapped
+    cmp.l   #2, %d5                   | both stores must have trapped
     bne     _fail
 
     | PASS

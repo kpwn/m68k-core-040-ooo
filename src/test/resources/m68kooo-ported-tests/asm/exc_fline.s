@@ -1,10 +1,8 @@
 | exc_fline.s — F-line (1111) trap exception (vector 11)
 |
-| Hypothesis: any opword with bits [15:12] = 1111 is an
-| unimplemented F-line instruction.  On a CPU without an FPU (or with
-| the FPU disabled — the phase-2.1 assumption), decode raises vec 11.
-| This is how Mac OS emulates FPU ops on FPU-less 68LC040 / 68EC040
-| parts.
+| Generic unimplemented F-line opwords raise vector 11.  Non-FPU
+| coprocessor IDs use a format-$0 frame; on-chip FPU unsupported
+| instructions use the ROM FPSP's format-$2 path.
 |
 | Vector 11 lives at 0x0000002C (11 * 4).
 |

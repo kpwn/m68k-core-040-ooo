@@ -5,17 +5,19 @@
 | list in memory EA modes, multi-µop crack into per-FP-register
 | 12-byte memory traffic).
 |
-| Behavior model: this landing produces correct memory traffic
-| (3 longs per FP register) but does NOT round-trip FP register data
-| through memory.  The test verifies:
-|   1. FMOVEM.X store does not trap (no F-line) and writes 12*N bytes
-|      of zeros to memory.
-|   2. FMOVEM.X load does not trap and reads 12*N bytes back.
-|   3. The instruction stream advances correctly past the FMOVEM.X
-|      opwords (no PC stall).
+| Behavior model — UPDATED 2026-08-03.  FMOVEM.X now moves REAL DATA
+| (FPU_X2MX + SYS_X2M_RD0/1/2 on the store side, FPU_M2X0/1/2 on the
+| load side).  This test previously asserted the OLD stub's behaviour —
+| "writes 12*N bytes of ZEROS", "load data is discarded" — i.e. it
+| pinned the bug.  Every structural assertion (EA generation, An
+| writeback, over-store guards, instruction length, index-register
+| integrity, trap-freedom) is kept; the zero assertions are now value
+| assertions against a seed image.
 |
-| FP register fidelity is a follow-up — this is the "FPSP recursion
-| break" landing.
+| Register-list -> address rule (see fpu_fmovem_x_roundtrip.s for the
+| Musashi/gas derivation): the HIGHEST-numbered register in the list
+| takes the LOWEST address.  With FP0-FP3 that is FP3 at +0 ... FP0 at
+| +36.
 |
 | Encodings (verified via m68k-linux-gnu-as -m68040):
 |   F228 F0F0 0000   FMOVEM.X FP0-FP3,(0,A0)
@@ -32,15 +34,15 @@
 |
 | PASS sentinel: 0xC0FFEE00.
 | FAIL sentinels:
-|   0xDEAD0F21 — memory not zeroed at offset 0 (store didn't fire)
-|   0xDEAD0F22 — memory not zeroed at offset 44 (last byte slot)
+|   0xDEAD0F21 — (d16,An) store did not reproduce the seed image
+|   0xDEAD0F22 — (d16,An) load did not deliver the seed image into FPn
 |   0xDEAD0F23 — sentinel was trampled (load wrote past EA range)
 |   0xDEAD0F24 — predecrement store did not update A0 by -12
-|   0xDEAD0F25 — predecrement store did not zero the 12-byte slot
+|   0xDEAD0F25 — predecrement store did not write FP0's actual value
 |   0xDEAD0F26 — postincrement load did not update A0 by +12
 |   0xDEAD0F27 — FMOVE immediate failed to advance to following code
-|   0xDEAD0F28 — indexed FMOVEM.X store did not zero first long
-|   0xDEAD0F29 — indexed FMOVEM.X store did not zero last long
+|   0xDEAD0F28 — indexed FMOVEM.X store wrote the wrong first long
+|   0xDEAD0F29 — indexed FMOVEM.X store wrote the wrong last long
 |   0xDEAD0F2A — indexed FMOVEM.X store overran the 24-byte range
 |   0xDEAD0F2B — indexed FMOVEM.X corrupted base/index registers
 |   0xDEAD0F01 — vec-11 F-line (decoder gap)
@@ -50,13 +52,16 @@
 
     .equ PASS_SENT, 0xFFFF0000
     .equ FP_BUF,    0x00020000
+    .equ SEED,      0x00021000
+    .equ CLOBBER,   0x00021040
+    .equ READBACK,  0x00021080
 
 _start:
     lea     0x00010000, %a7
     move.l  #_fline, 0x0000002C        | vec 11 F-line
 
     | Pre-fill the FP buffer with 0xDEADBEEF in every long so we can
-    | tell whether the FMOVEM.X store actually wrote zeros.
+    | tell whether the FMOVEM.X store actually wrote anything.
     lea     FP_BUF, %a0
     move.l  #0xDEADBEEF, %d0
     move.l  %d0, 0(%a0)
@@ -76,27 +81,73 @@ _start:
     | so we catch any over-store.
     move.l  #0xCAFEBABE, 48(%a0)
 
+    | Seed FP0-FP3 from a known 48-byte image (zero 16-bit pads so a
+    | store reproduces it exactly).
+    lea     SEED, %a1
+    move.l  #0x3FFF0000, 0(%a1)
+    move.l  #0x80000001, 4(%a1)
+    move.l  #0x00000011, 8(%a1)
+    move.l  #0x40000000, 12(%a1)
+    move.l  #0x90000002, 16(%a1)
+    move.l  #0x00000022, 20(%a1)
+    move.l  #0xC0010000, 24(%a1)
+    move.l  #0xA0000003, 28(%a1)
+    move.l  #0x00000033, 32(%a1)
+    move.l  #0xBFFE0000, 36(%a1)
+    move.l  #0xB0000004, 40(%a1)
+    move.l  #0x00000044, 44(%a1)
+    fmovem.x (%a1),%fp0-%fp3
+
     | FMOVEM.X FP0-FP3,(0,A0).
     .short  0xF228, 0xF0F0, 0x0000
 
-    | Check first long is zero (proves store fired).
-    move.l  0(%a0), %d0
-    cmp.l   #0, %d0
+    | The 48 bytes written must be a byte-for-byte copy of SEED.
+    lea     SEED, %a1
+    moveq   #0, %d1
+_seedcmp:
+    move.l  0(%a0,%d1.w), %d0
+    cmp.l   0(%a1,%d1.w), %d0
     bne     _fail_first
-
-    | Check last long (offset 44) is zero (proves all 12 phases fired).
-    move.l  44(%a0), %d0
-    cmp.l   #0, %d0
-    bne     _fail_last
+    addq.l  #4, %d1
+    cmp.l   #48, %d1
+    bne     _seedcmp
 
     | Check the past-end sentinel is intact (proves no over-store).
     move.l  48(%a0), %d0
     cmp.l   #0xCAFEBABE, %d0
     bne     _fail_overrun
 
-    | FMOVEM.X (0,A0),FP0-FP3 — should not trap.  We don't check FP
-    | register state (round-trip not implemented yet).
+    | FMOVEM.X (0,A0),FP0-FP3 — must not trap, AND must put the image
+    | back into the FP registers.  Clobber them first so the check is
+    | not vacuous, then reload and read back.
+    lea     CLOBBER, %a1
+    move.l  #0x00000000, 0(%a1)
+    move.l  #0x00000000, 4(%a1)
+    move.l  #0x00000000, 8(%a1)
+    move.l  #0x00000000, 12(%a1)
+    move.l  #0x00000000, 16(%a1)
+    move.l  #0x00000000, 20(%a1)
+    move.l  #0x00000000, 24(%a1)
+    move.l  #0x00000000, 28(%a1)
+    move.l  #0x00000000, 32(%a1)
+    move.l  #0x00000000, 36(%a1)
+    move.l  #0x00000000, 40(%a1)
+    move.l  #0x00000000, 44(%a1)
+    fmovem.x (%a1),%fp0-%fp3
+
     .short  0xF228, 0xD0F0, 0x0000
+
+    lea     READBACK, %a1
+    fmovem.x %fp0-%fp3,(%a1)
+    lea     SEED, %a2
+    moveq   #0, %d1
+_rbcmp:
+    move.l  0(%a1,%d1.w), %d0
+    cmp.l   0(%a2,%d1.w), %d0
+    bne     _fail_last
+    addq.l  #4, %d1
+    cmp.l   #48, %d1
+    bne     _rbcmp
 
     | FMOVEM.X FP0,-(A0) — Q700 ROM vector-11 handler shape
     | (fmovemx %fp0,%sp@- encodes as F227 E001).  The simplified store
@@ -110,11 +161,15 @@ _start:
     .short  0xF220, 0xE001
     cmpa.l  #(FP_BUF+64), %a0
     bne     _fail_predec_wb
+    | FP0 was seeded from SEED slot 3.
     move.l  0(%a0), %d0
-    cmp.l   #0, %d0
+    cmp.l   #0xBFFE0000, %d0
+    bne     _fail_predec_data
+    move.l  4(%a0), %d0
+    cmp.l   #0xB0000004, %d0
     bne     _fail_predec_data
     move.l  8(%a0), %d0
-    cmp.l   #0, %d0
+    cmp.l   #0x00000044, %d0
     bne     _fail_predec_data
     move.l  12(%a0), %d0
     cmp.l   #0xCAFEBABE, %d0
@@ -123,11 +178,23 @@ _start:
     | FMOVEM.X (A0)+,FP0 — should load and discard one 12-byte slot,
     | then postincrement A0 by 12.
     lea     FP_BUF+96, %a0
-    move.l  #0x11111111, 0(%a0)
+    move.l  #0x11110000, 0(%a0)
     move.l  #0x22222222, 4(%a0)
     move.l  #0x33333333, 8(%a0)
     .short  0xF218, 0xC001
     cmpa.l  #(FP_BUF+108), %a0
+    bne     _fail_postinc_wb
+    | ...and FP0 must actually hold those 12 bytes now.
+    lea     READBACK, %a1
+    fmovem.x %fp0,(%a1)
+    move.l  0(%a1), %d0
+    cmp.l   #0x11110000, %d0
+    bne     _fail_postinc_wb
+    move.l  4(%a1), %d0
+    cmp.l   #0x22222222, %d0
+    bne     _fail_postinc_wb
+    move.l  8(%a1), %d0
+    cmp.l   #0x33333333, %d0
     bne     _fail_postinc_wb
 
     | FMOVE.B #imm,FP0 and FMOVE.L #imm,FP2.  These immediate EA forms
@@ -155,28 +222,41 @@ _start:
     move.l  #0xDEADBEEF, 36(%a0)
     move.l  #0xDEADBEEF, 40(%a0)
     move.l  #0xCAFEBABE, 44(%a0)
+    | FP0-FP1 currently hold FP_BUF+96's image (FP0, from the postinc
+    | load above) and SEED slot 2 (FP1, from the seed load).  Re-seed
+    | both from a dedicated 24-byte image so the expected bytes are
+    | explicit rather than inherited.
+    lea     SEED+48, %a2
+    move.l  #0x3FFD0000, 0(%a2)          | -> FP1 (lower address)
+    move.l  #0x12345678, 4(%a2)
+    move.l  #0x9ABCDEF0, 8(%a2)
+    move.l  #0x40030000, 12(%a2)         | -> FP0
+    move.l  #0x0F0F0F0F, 16(%a2)
+    move.l  #0xF0F0F0F0, 20(%a2)
+    fmovem.x (%a2),%fp0-%fp1
+
     .short  0xF230, 0xF0C0, 0x1004       | FMOVEM.X FP0-FP1,(4,A0,D1.W)
     cmpa.l  #(FP_BUF+128), %a0
     bne     _fail_index_regs
     cmp.l   #16, %d1
     bne     _fail_index_regs
     move.l  20(%a0), %d0
-    cmp.l   #0, %d0
+    cmp.l   #0x3FFD0000, %d0
     bne     _fail_index_first
     move.l  40(%a0), %d0
-    cmp.l   #0, %d0
+    cmp.l   #0xF0F0F0F0, %d0
     bne     _fail_index_last
     move.l  44(%a0), %d0
     cmp.l   #0xCAFEBABE, %d0
     bne     _fail_index_overrun
 
-    | FMOVEM.X (4,A0,D1.W),FP0-FP1.  Load-list values are discarded by
-    | the current stub, but this still verifies decode, PC length, memory
-    | phase count completion, and A0/D1 architectural integrity.
-    move.l  #0x11111111, 20(%a0)
+    | FMOVEM.X (4,A0,D1.W),FP0-FP1 — load direction through the indexed
+    | EA.  Verifies decode, PC length, phase-count completion, A0/D1
+    | architectural integrity, AND that the data reaches FP0/FP1.
+    move.l  #0x11110000, 20(%a0)
     move.l  #0x22222222, 24(%a0)
     move.l  #0x33333333, 28(%a0)
-    move.l  #0x44444444, 32(%a0)
+    move.l  #0x44440000, 32(%a0)
     move.l  #0x55555555, 36(%a0)
     move.l  #0x66666666, 40(%a0)
     .short  0xF230, 0xD0C0, 0x1004       | FMOVEM.X (4,A0,D1.W),FP0-FP1
@@ -184,6 +264,14 @@ _start:
     bne     _fail_index_regs
     cmp.l   #16, %d1
     bne     _fail_index_regs
+    lea     READBACK, %a2
+    fmovem.x %fp0-%fp1,(%a2)
+    move.l  0(%a2), %d0
+    cmp.l   #0x11110000, %d0
+    bne     _fail_index_first
+    move.l  20(%a2), %d0
+    cmp.l   #0x66666666, %d0
+    bne     _fail_index_last
 
     | PASS.
     lea     PASS_SENT, %a1

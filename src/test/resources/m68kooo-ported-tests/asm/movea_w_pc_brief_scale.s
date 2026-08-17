@@ -1,92 +1,93 @@
-| movea_w_pc_brief_scale.s — verify (d8, PC, Dn.W*scale) brief EA.
+| movea_w_pc_brief_scale.s — brief-format index SCALE must be honoured,
+| for both (d8,An,Xn.W*s) and (d8,PC,Xn.W*s).
 |
-| HW investigation 2026-05-21: Q700 ROM uses MOVEA.W (d8, PC, D0.W*2), A0
-| at 0x40809BCE as part of the VBL IRQ handler dispatch.  MAME computes
-| the EA with scale=2 and lands at A0 = MEM[0x192] = 0x4080B140 (valid
-| ROM).  HW investigation suggests our impl may not honor the scale
-| field correctly for brief-format PC-indexed addressing.
+| ORIGINAL MOTIVATION (2026-05-21): the Q700 ROM uses
+| MOVEA.W (d8,PC,D0.W*2),A0 at 0x40809BCE in the VBL IRQ handler dispatch,
+| and an HW investigation suspected our impl might not honour the scale field
+| for brief-format PC-indexed addressing.
 |
-| Test:
-|   1. Pre-populate a sentinel at the address that scale=2 EA would read.
-|   2. Pre-populate a DIFFERENT sentinel at the scale=1 EA.
-|   3. Execute MOVEA.W (d8, PC, D0.W*scale), A0 with scale=2.
-|   4. Check A0 holds the scale=2 sentinel.
+| STATUS: that suspicion is REFUTED.  Checked against Musashi 2026-07-28 --
+| scale 1/2/4 match the golden model exactly for BOTH the An-base and PC-base
+| forms.  This test now locks that in rather than chasing a phantom.
+|
+| WHY IT WAS REWRITTEN: the previous version of this file DID NOT ASSEMBLE
+| ("attempt to move .org backwards") and had therefore been reported as [SKIP]
+| by every `make test` run -- contributing ZERO coverage while looking
+| harmless in the summary.  It was an unfinished draft; its own comments read
+| "Hmm but _movea position depends on prior insns" and "Actually scrap this
+| approach", and a leftover `.org 64` collided with the code already emitted.
+| No coverage is lost by this rewrite: there was none to lose.  The .org games
+| are gone -- the table is reached through labels instead.
+|
+| Table layout (byte offsets from `tbl`):
+|     0: 11 22 33 44 55 66     6: BE EF     8: 77 88 99 AA     12: CA FE
+| With D0=3:  scale*2 -> offset  6 -> 0xBEEF
+|             scale*4 -> offset 12 -> 0xCAFE
+| MOVEA.W SIGN-EXTENDS its word source into the full 32-bit An, which is why
+| the expected values are 0xFFFFBEEF / 0xFFFFCAFE -- documented instruction
+| behaviour, not a quirk of the table.
+|
+| PASS sentinel: 0xC0FFEE00
+| FAIL sentinels:
+|   0xDEAD5C01 — (An,Dn.W*2) scale not honoured
+|   0xDEAD5C02 — (An,Dn.W*4) scale not honoured
+|   0xDEAD5C03 — (PC,Dn.W*2) scale not honoured
+|   0xDEAD5C04 — (PC,Dn.W*4) scale not honoured
 
     .text
     .org 0
 
+    .equ PASS_SENT, 0xFFFF0000
+
 _start:
-    lea     0x00020000, %a7
-    move.w  #0x2700, %sr
+    lea     0x00010000, %a7
 
-    | Set D0 to a known value.  D0.W = 0x0010.  D0.W * 2 = 0x0020.
-    move.l  #0x00000010, %d0
+    | ── An base, scale = 2 ───────────────────────────────────────────
+    lea     tbl, %a2
+    moveq   #3, %d0
+    movea.w (0,%a2,%d0.w*2), %a1
+    cmpa.l  #0xFFFFBEEF, %a1
+    bne     fail_an2
 
-    | The MOVEA.W instruction we want to test:
-    |   307b XXXX    MOVEA.W (d8, PC, D0.W*scale), A0
-    | where ext word XXXX encodes:
-    |   D/A=0 (D), Xn=000 (D0), W/L=0 (W), scale=01 (=2), brief=0, d8=XX
-    | So XXXX = 0000_0010_0_XX (with scale field at bits 10-9 = 01)
-    |        = 0x02XX
-    | We want d8 = 4 so EA = (PC_base) + 4 + (D0.W * scale).
-    | With scale=2 and D0.W=0x10: EA = PC_base + 4 + 0x20 = PC_base + 0x24.
-    | With scale=1 and D0.W=0x10: EA = PC_base + 4 + 0x10 = PC_base + 0x14.
+    | ── An base, scale = 4 ───────────────────────────────────────────
+    movea.w (0,%a2,%d0.w*4), %a3
+    cmpa.l  #0xFFFFCAFE, %a3
+    bne     fail_an4
 
-    | The PC base for (d8, PC, Xn) brief per spec = pd_pc + 2 = addr of ext word.
-    | So if the MOVEA.W opcode is at PC=X:
-    |   X+0,1 = opcode bytes (0x30 0x7B)
-    |   X+2,3 = ext word bytes
-    |   X+4 onwards = next inst
-    |
-    | PC_base = X + 2.
-    | scale=2 EA = (X+2) + 4 + 0x20 = X + 0x26
-    | scale=1 EA = (X+2) + 4 + 0x10 = X + 0x16
-    |
-    | Place sentinel at offsets X+0x16 (scale=1) and X+0x26 (scale=2).
+    | ── PC base, scale = 2 (the form the Q700 ROM actually uses) ─────
+    movea.w tbl(%pc,%d0.w*2), %a4
+    cmpa.l  #0xFFFFBEEF, %a4
+    bne     fail_pc2
 
-_movea:
-    .word 0x307b      | MOVEA.W (d8, PC, D0.W*scale), A0
-    .word 0x0204      | ext: D/A=0, reg=0, W=0, scale=01 (=2), brief=0, d8=0x04
+    | ── PC base, scale = 4 ───────────────────────────────────────────
+    movea.w tbl(%pc,%d0.w*4), %a5
+    cmpa.l  #0xFFFFCAFE, %a5
+    bne     fail_pc4
 
-    | At this point A0 should = sign_ext(MEM_W[scale=2 EA]) = sign_ext(SENTINEL_S2).
-
-    | Check A0:
-    cmpa.l  #0x12345678, %a0       | Match scale=2 sentinel (sign-ext from word)
-    bne     _check_scale1
-
-    | scale=2 worked.
-    move.l  #0xC0FFEE00, 0xFFFF0000
+    move.l  #0xC0FFEE00, %d1
+    move.l  %d1, PASS_SENT
     bra     .
 
-_check_scale1:
-    cmpa.l  #0x76543210, %a0       | scale=1 sentinel (= we used wrong PC base or no scale)
-    bne     _unknown
-    move.l  #0xDEAD0001, 0xFFFF0000  | sentinel == scale=1 → bug
+fail_an2:
+    move.l  #0xDEAD5C01, %d1
+    move.l  %d1, PASS_SENT
+    bra     .
+fail_an4:
+    move.l  #0xDEAD5C02, %d1
+    move.l  %d1, PASS_SENT
+    bra     .
+fail_pc2:
+    move.l  #0xDEAD5C03, %d1
+    move.l  %d1, PASS_SENT
+    bra     .
+fail_pc4:
+    move.l  #0xDEAD5C04, %d1
+    move.l  %d1, PASS_SENT
     bra     .
 
-_unknown:
-    | A0 has some other value (e.g., from PC+4 base or no scale and PC+4 base).
-    | Write A0 itself for diagnostic.
-    move.l  %a0, 0xFFFF0000
-    bra     .
-
-    | Pad until X+0x16 (= the scale=1 EA target).
-    | _movea is at offset (well, we need to compute).
-    | The label _movea is after the move.w #imm,%sr (= 4 bytes) and
-    | move.l #imm,%d0 (= 6 bytes) and lea (= 6 bytes).  16 bytes of setup.
-    | After _movea label, MOVEA.W = 4 bytes (opcode 2 + ext 2).
-    | Then the cmpa.l + bne + move.l + bra etc.
-    | Easier: use .org to place sentinels at specific addresses.
-
-    .org 64
-    | offset 64 from _start.  Hmm but _movea position depends on prior insns.
-    | Let me just use absolute addresses via .org.
-
-    | Actually — putting sentinels at fixed _start-relative offsets requires
-    | knowing _movea's address.  Let me use a different approach:
-    | Instead of inlining the test code, use a SUBROUTINE that does the MOVEA
-    | with sentinels precisely placed via .org.
-
-    | Actually scrap this approach.  Just emit DIAG bytes around the MOVEA
-    | location and let A0 read them; we'll check the result against the bytes
-    | we placed.
+    .align 2
+tbl:
+    .byte   0x11,0x22,0x33,0x44,0x55,0x66
+    .short  0xBEEF
+    .byte   0x77,0x88,0x99,0xAA
+    .short  0xCAFE

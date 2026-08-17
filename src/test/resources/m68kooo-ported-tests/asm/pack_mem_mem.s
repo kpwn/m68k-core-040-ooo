@@ -1,25 +1,36 @@
 | pack_mem_mem.s — PACK -(A1),-(A0),#0
 |
-| Reads 2 bytes from -(A1) (first: low byte at lower address 1 past
-| predec, second: high byte at lower address 2 past predec), adds
-| #adj (16-bit), packs top nibble of high and low nibble of low into
-| a single byte, writes to -(A0).
+| PRM §4.146: "the source operand is a 16-bit word" read through -(Ay);
+| the adjustment is added; bits [11:8] and [3:0] of the sum are
+| concatenated into a byte written through -(Ax).
+| On a big-endian machine the source word's MSB is the LOWER-address
+| byte, so the source is exactly one LOAD.W at (A1-2).
 |
-| Musashi: REG_A[srcreg]-- ; src = read8 ; REG_A[srcreg]-- ; src |= read8<<8 ;
-|          src += adj ; REG_A[dstreg]-- ; write8 (((src>>4)&0xF0)|(src&0x0F))
+| ── HEADER CORRECTION (2026-08-09) ────────────────────────────────
+| The previous revision of this comment claimed Musashi shifts the
+| SECOND read left by 8.  That is backwards, and it made the test look
+| like it agreed with Musashi when it does not.  Musashi's actual
+| m68k_in.c `pack, 16, mm, .` is:
+|     ea = EA_AY_PD_8(); src = read_8(ea);           <- HIGHER address
+|     ea = EA_AY_PD_8(); src = (src << 8) | read_8(ea);
+| i.e. the FIRST read — the one at the HIGHER address — becomes the
+| MSB.  That is byte-swapped relative to a big-endian word read.
 |
-| Test: bytes '1' (0x31), '2' (0x32) at (A1-2), (A1-1).
-|       A1 starts at 0x00106002, so byte@106000=0x32 (first high in memory),
-|       byte@106001=0x31 (low byte in memory).
-|       In big-endian this is the 16-bit word 0x3231 at 0x00106000.
-|       Musashi: first read at 106001 = 0x31 (low byte of src);
-|                second read at 106000 = 0x32 → shifted << 8 = 0x3200;
-|                combined src = 0x3231.
-|       adj = 0, so sum = 0x3231.  Pack → (0x32>>0) & 0xF0 = 0x30 (wait,
-|       that's wrong — formula is (sum>>4)&0xF0 | sum&0x0F).
-|       sum = 0x3231 → (sum>>4) = 0x0323 → & 0xF0 = 0x20.
-|       sum & 0x0F = 0x01.  Packed byte = 0x21.
+| We follow the PRM, not Musashi, and this is a KNOWN DELIBERATE
+| DEVIATION (see docs/isa_status.md).  The PRM reading is also the only
+| one that makes PACK do its documented job: ASCII "12" stored in
+| address order (0x31,0x32) must pack to 0x12.  Musashi's own source
+| corroborates the bug independently — its A7 paths call EA_A7_PD_8()
+| (A7 -= 2) twice on the WORD side, moving A7 by 4 where a word access
+| moves it by 2.
+|
+| Test: byte 0x32 at 0x106000, byte 0x31 at 0x106001; A1 = 0x00106002.
+|       Big-endian source word at 0x00106000 = 0x3231.
+|       adj = 0, so sum = 0x3231.
+|       Packed = ((sum>>4)&0xF0) | (sum&0x0F)
+|              = (0x0323 & 0xF0) | 0x01 = 0x20 | 0x01 = 0x21.
 |       Write 0x21 to (A0-1).
+|       (Musashi, byte-swapped, would build src=0x3132 and yield 0x12.)
 
     .text
     .org 0
@@ -61,11 +72,14 @@ _start:
     cmp.l   #0xDC, %d3
     bne     _fail
 
-    | ── Non-zero adj: ASCII '7' (0x37) + '9' (0x39), adj=0xFFCA → ──
-    | combined = 0x3739 + 0xFFCA = 0x13703 → truncated to 16b = 0x3703.
-    | Pack: (sum>>4)&0xF0 = 0x3703>>4 = 0x0370 → & 0xF0 = 0x70.
-    |        sum & 0x0F = 0x03.  → 0x73 = ASCII '9' decimal digit? No,
-    | this just verifies the add+pack chain.
+    | ── Non-zero adj, exercising 16-bit wraparound of the add ──────
+    | Bytes 0x37 at 0x106000, 0x39 at 0x106001 → big-endian source
+    | word 0x3739.  adj = 0xFFCA.
+    | 0x3739 + 0xFFCA = 0x13703, truncated to 16 bits = 0x3703.
+    | Packed = ((0x3703>>4)&0xF0) | (0x3703&0x0F)
+    |        = (0x0370 & 0xF0) | 0x03 = 0x70 | 0x03 = 0x73.
+    | This verifies the add-then-pack chain and the carry-out discard.
+    | (Musashi, byte-swapped, would build 0x3937 and yield 0x91.)
     move.b  #0x37, 0(%a2)             | 0x106000 = 0x37 (high byte)
     move.b  #0x39, 1(%a2)             | 0x106001 = 0x39 (low byte)
     move.l  #0xBADCAFE0, 16(%a2)      | restore 0x106010..106013

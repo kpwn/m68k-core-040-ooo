@@ -1,15 +1,33 @@
 | unpk_mem_mem.s — UNPK -(A1),-(A0),#$3030
 |
-| UNPK takes a byte from -(A1), expands to 2 nibbles (src<<4)&0x0F00 |
-| src&0x0F, adds adj16, writes 2 bytes to -(A0): low byte at (A0-1),
-| high byte at (A0-2).  Classic use: BCD byte → ASCII digit pair with
-| adj = 0x3030.
+| PRM §4.190: UNPK reads a BYTE through -(Ay), splits it into two
+| nibbles as ((src<<4)&0x0F00)|(src&0x0F), adds the 16-bit adjustment,
+| and "the resulting word is written to the destination" through
+| -(Ax).  On a big-endian machine a word write puts bits [15:8] at the
+| LOWER address, so the destination is exactly one STORE.W at (A0-2).
+| Classic use: BCD byte → ASCII digit pair with adj = 0x3030.
+|
+| ── HEADER CORRECTION (2026-08-09) ────────────────────────────────
+| The previous revision of this comment stated the byte placement
+| exactly backwards ("Musashi writes 0x35 at (A0-1), 0x32 at (A0-2)"),
+| which made the assertions below look like they agreed with Musashi.
+| They do not.  Musashi's actual m68k_in.c `unpk, 16, mm, .` is:
+|     ea = EA_AX_PD_8(); write_8(ea, (src >> 8) & 0xff);   <- HIGHER addr
+|     ea = EA_AX_PD_8(); write_8(ea, src & 0xff);          <- LOWER addr
+| i.e. it puts the HIGH byte at the HIGHER address — byte-swapped
+| relative to a big-endian word write.
+|
+| We follow the PRM, not Musashi: KNOWN DELIBERATE DEVIATION, see
+| docs/isa_status.md.  The PRM reading is the only one under which UNPK
+| does its documented job — BCD 0x25 must unpack to ASCII "25" in
+| address order, and Musashi produces "52".
 |
 | Test: src byte = 0x25 at 0x00106001.  A1 = 0x00106002.
 |   expand = ((0x25<<4)&0x0F00) | (0x25&0x0F) = 0x0200 | 0x0005 = 0x0205.
-|   dst = 0x0205 + 0x3030 = 0x3235.
-|   Musashi writes 0x35 (low byte) at (A0-1), 0x32 (high byte) at (A0-2).
-|   In big-endian, the word at (A0-2)..(A0-1) is 0x3235 → ASCII "25".
+|   dst word = 0x0205 + 0x3030 = 0x3235.
+|   Stored big-endian at (A0-2): 0x106010 = 0x32 ('2'), 0x106011 = 0x35
+|   ('5') — i.e. ASCII "25" reading upward, as intended.
+|   (Musashi would write 0x35 at 0x106010 and 0x32 at 0x106011 → "52".)
 
     .text
     .org 0

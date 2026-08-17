@@ -41,7 +41,7 @@ _start:
     cmp.l   #0x00008000, %a7
     bne     _fail_usp
 
-    .short  0xF123
+    .short  0xF123                    | generic cp-ID 0 line-F, format $0
     cmp.l   #0x00008000, %a7
     bne     _fail_usp
 
@@ -94,8 +94,9 @@ _h_aline:
     rte
 
 _h_fline:
-    | F-line: 68040 format 2 frame (12 bytes), SSP = 0x1FFF4.
-    cmp.l   #0x0001FFF4, %a7
+    | Generic non-FPU line-F uses format 0 (8 bytes), SSP = 0x1FFF8.
+    | On-chip FPU unsupported-instruction traps remain format 2.
+    cmp.l   #0x0001FFF8, %a7
     bne     _fail_ssp
     move.l  4(%a7), %d0
     and.l   #0x00000FFF, %d0

@@ -5,10 +5,25 @@
 |   - If match (Z=1 after subtract): STORE Du → <ea>; Dc unchanged.
 |   - If mismatch (Z=0): Dc := loaded (size-truncated); memory unchanged.
 |
-| NOTE: this core implements the match path strictly, and the mismatch
-| path relaxes "memory unchanged" to "memory rewritten with loaded
-| value" (idempotent on match, arch-invisible in a uniprocessor).  All
-| observable state (Dc low bits, CCR) matches the PRM.
+| NOTE (corrected 2026-08-09): this header used to claim the mismatch
+| path "relaxes 'memory unchanged' to 'memory rewritten with loaded
+| value' (idempotent on match, arch-invisible in a uniprocessor)".  That
+| description was wrong on its own terms and hid a real data-corruption
+| bug.  The store the decoder actually emitted was unpredicated and took
+| its data from **Du**, not from the loaded value, so a failed compare
+| overwrote the cell with Du — arch-VISIBLE to the very next load, in
+| the exact lock-free retry idiom CAS exists for.  Measured on the
+| pre-fix RTL: memory at the CAS target read back 0x55555555 (= Du)
+| instead of 0xCAFEBABE.
+|
+| It survived because Tests 2 and 5 below — the only mismatch cases —
+| checked Dc and the CCR and never looked at memory at all.  They do now
+| (the original Dc/CCR assertions are kept and added to, not replaced),
+| and cas_mismatch_memory.s covers the mismatch path in depth.
+|
+| Both the CAS mismatch and CAS2 behaviour are now architecturally exact:
+| memory is left untouched, and the LSU suppresses the store outright
+| rather than rewriting the same bytes.
 |
 | PASS = store 0xC0FFEE00 to 0xFFFF0000.
 
@@ -34,9 +49,8 @@ _t1_ok:
     bne     _fail
 
     | ── Test 2: CAS.L mismatch.  mem[0x50010] = 0xCAFEBABE, Dc=D1=0x11223344.
-    |   Expect: Z=0, D1 := 0xCAFEBABE (full long), memory unchanged by arch
-    |   view (we accept the simplified "memory gets rewritten with loaded
-    |   value" relaxation so the arch-visible contents match).
+    |   Expect: Z=0, D1 := 0xCAFEBABE (full long), and memory UNCHANGED —
+    |   Du (0x55555555) must never reach the cell.
     lea     0x50010, %a1
     move.l  #0xCAFEBABE, (%a1)
     move.l  #0x11223344, %d1
@@ -47,6 +61,10 @@ _t1_ok:
 _t2_ok:
     move.l  #0xCAFEBABE, %d0
     cmp.l   %d0, %d1                  | D1 must be the loaded value
+    bne     _fail
+    move.l  (%a1), %d0                | ...and memory must be untouched
+    move.l  #0xCAFEBABE, %d3
+    cmp.l   %d3, %d0
     bne     _fail
 
     | ── Test 3: CAS.W match.  mem[0x50020] = 0x1234, Dc low word = 0x1234.
@@ -80,7 +98,8 @@ _t4_ok:
     bne     _fail
 
     | ── Test 5: CAS.B mismatch — Dc[7:0] gets the loaded byte, Dc upper
-    |   24 bits preserved.
+    |   24 bits preserved, and the memory byte is UNCHANGED (Du's low
+    |   byte 0x77 must not appear).
     lea     0x50040, %a4
     move.b  #0x99, (%a4)
     move.l  #0xAABBCC42, %d1
@@ -92,6 +111,10 @@ _t5_ok:
     | D1 low byte should be 0x99, upper 24 bits = 0xAABBCC
     move.l  #0xAABBCC99, %d0
     cmp.l   %d0, %d1
+    bne     _fail
+    move.b  (%a4), %d0                | ...and the memory byte stays 0x99
+    andi.l  #0xFF, %d0
+    cmpi.l  #0x99, %d0
     bne     _fail
 
     | ── PASS ─────────────────────────────────────────────────────────
