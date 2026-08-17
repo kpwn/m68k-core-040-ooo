@@ -1,7 +1,8 @@
 # `debug_ctrl` for the 040 OoO core — JTAG-REPL-compatible design
 
-**Status:** PROPOSED ARCHITECTURE ADDENDUM / DESIGN ONLY. No RTL or host tool is
-implemented by this document.
+**Status:** ACCEPTED ARCHITECTURE ADDENDUM for **Stages 0-1** (integration decisions
+resolved in §15, 2026-08-17). Stages 2-7 remain PROPOSED / DESIGN ONLY. Implementation
+plan: `docs/superpowers/plans/2026-08-17-debug-ctrl-stage0-stage1.md`.
 
 **Date:** 2026-08-09
 
@@ -880,3 +881,124 @@ These do not block the architecture but must be fixed in an implementation plan:
 
 None of these permits direct access to another plugin's internals, a second producer
 for a `Global` key, or an idle-path throughput bubble.
+
+---
+
+## 15. Resolved integration decisions for Stages 0-1 (2026-08-17)
+
+This section resolves the parts of §14 that block Stage 0/1 and records the
+Stage-1 behavioural choices that the implementation plan depends on. §14 items
+1, 2, 4 and 5 remain open; they block Stage 2 or later and are deliberately not
+decided here.
+
+### 15.1 §14 decision 3 — SoC socket and reset port naming (RESOLVED)
+
+The core exports the socket names **verbatim**, forced onto the generated
+Verilog with SpinalHDL `setName()`, so `macqd700-soc` binds them with no rename
+shim. The authority is `macqd700-soc/rtl/soc/cpu_socket.vh` §4 (lines 145-162)
+and §6 (lines 170-176); the names are additionally machine-checked against that
+file by `tools/debug/test_sibling_conformance.py`.
+
+| Core-side port | Dir | Width | Socket authority |
+|---|---|---:|---|
+| `dbg_axi_awaddr` / `awvalid` / `awready` | in/in/out | 20/1/1 | `cpu_socket.vh:146-148` |
+| `dbg_axi_wdata` / `wstrb` / `wvalid` / `wready` | in/in/in/out | 32/4/1/1 | `cpu_socket.vh:149-152` |
+| `dbg_axi_bresp` / `bvalid` / `bready` | out/out/in | 2/1/1 | `cpu_socket.vh:153-155` |
+| `dbg_axi_araddr` / `arvalid` / `arready` | in/in/out | 20/1/1 | `cpu_socket.vh:156-158` |
+| `dbg_axi_rdata` / `rresp` / `rvalid` / `rready` | out/out/out/in | 32/2/1/1 | `cpu_socket.vh:159-162` |
+| `cpu_cold_reset_pulse` | out | 1 | `cpu_socket.vh:171` |
+| `cpu_cold_reset_hold` | out | 1 | `cpu_socket.vh:172` |
+| `cpu_ram_window_lg2` | out | 6 | `cpu_socket.vh:173` |
+| `cpu_mon_sense` | out | 7 | `cpu_socket.vh:174` |
+| `init_done_seen` | in | 1 | `cpu_socket.vh:176` |
+
+There is **no** `AWPROT`/`ARPROT` on this interface. `cpu_socket.vh:145-162` does
+not declare them, so the standard SpinalHDL `AxiLite4` bundle (which does) is not
+used; a dedicated `DbgAxiLite` bundle carries exactly the socket's signal set.
+
+**Debug power-on reset.** The socket has *no* board-level POR input
+(`cpu_socket.vh:95-97` gives only `clk` and `rst`). The core therefore generates
+its own, exactly as `macqd700-soc/cpu/rtl/core/debug/debug_reset_ctl.v` does: a
+counter of deliberately reset-less flops whose only initial value is the FPGA
+configuration INIT, producing a `POR_CYCLES`-long pulse after configuration and
+then deasserting forever. In SpinalHDL this is a derived `ClockDomain` with
+`resetKind = BOOT`. `debug_reset_ctl.v`'s header states the requirement this
+satisfies: "dbg_rst … Asserted for POR_CYCLES clocks after FPGA configuration,
+then deasserted FOREVER -- it is NOT a function of cpu_rst." A POR pulse rather
+than bare INIT is mandatory because the debug domain holds registers with
+non-zero reset values (`cpu_ram_window_lg2` = 26, `cpu_mon_sense` = 7'h06).
+`POR_CYCLES` default is 16, matching the sibling module's default.
+
+**CPU-reset notification.** The core reset is *observed*, never consumed, by the
+debug domain: a rising-edge detector on the socket `rst`, clocked in the debug
+domain, with reset value 1 so a `rst` already high when the debug domain leaves
+POR does not manufacture a spurious edge (`debug_reset_ctl.v:129-139`). No extra
+socket port is added.
+
+**Build ID.** `DBG_BUILD_ID` remains SoC-supplied (§3.1). It enters the core as a
+`DebugCtrlPlugin` constructor parameter, defaulting to `0x00000000`, which the
+Verilog generator may override from the environment. It is deliberately NOT a
+socket port and NOT a `Global` database key (§0.9).
+
+**Init-done observation.** `init_done_seen` is a level input; the debug domain
+latches it sticky so a debugger attaching after DDR calibration still sees it,
+and `OFF_CONTROL` bit 3 (init-done override) ORs into the same status bit. Both
+live in the debug reset domain and therefore survive CPU reset.
+
+### 15.2 Stage-1 CONTROL and STATUS behaviour
+
+Stage 1 has no halt/step machinery, so it must not *pretend* to. Per-bit
+behaviour, chosen so a host discovers the truth by reading back rather than by
+waiting for a status bit that will never set:
+
+| CONTROL bit | Stage-1 behaviour |
+|---:|---|
+| 0 manual halt request | **RAZ/WI** — write ignored, reads 0 (Stage 2 implements it) |
+| 1 single-step pulse | **RAZ/WI** (Stage 2) |
+| 2 deprecated reset-pulse alias | real: aliases bit 5 |
+| 3 init-done override level | real |
+| 4 cold-reset hold level | real, drives `cpu_cold_reset_hold`, survives CPU reset |
+| 5 cold-reset pulse | real, drives a 1-cycle `cpu_cold_reset_pulse` |
+| 6 reserved | reads 0 |
+| 7 legacy step-arm observation | **RAZ/WI** (Stage 2) |
+
+`OFF_STATUS` in Stage 1: bit 0 `halted` = 0, bit 1 `exception pending` = 0, bit 2
+`init_done_seen` = real, bit 3 `running` = 1, bit 4 `auto-halt latched` = 0. This
+keeps §3.3's "`halted` and `running` are mutually exclusive" true.
+
+**Known gap, deliberately accepted:** the frozen contract has no discovery bit
+for manual halt itself, so a Stage-1 build is distinguishable from a
+halt-capable one only by `OFF_VERSION` (`0xDEB6_0100`) and by CONTROL bit 0
+reading back 0 after a write. A new append-only bit for basic stop/step should
+be minted when Stage 2 lands, and this is recorded as an open item rather than
+worked around.
+
+### 15.3 `cfg_wipe` scope (feature bit 2)
+
+`OFF_DBG_RESET_CTL` bit 0 restores host configuration to POR defaults **without
+resetting the AXI slave FSM**, so the very write that requested the wipe still
+receives its `B` response. This copies `debug_ctrl.v:3016-3024` verbatim,
+including its explicit contrast with a true debug-domain reset ("that DOES
+disturb the AXI FSM and is therefore fire-and-forget from the host's point of
+view"). In Stage 1 the wipe restores `cpu_ram_window_lg2` to 26 and
+`cpu_mon_sense` to `0x06` and nothing else. It deliberately does **not** clear
+`cold_reset_hold` or the init-done override, because the deployed wipe list
+(`debug_ctrl.v:3024-3062`) does not clear them either, and feature bit 2 must
+mean the same thing on both cores.
+
+### 15.4 CPU-reset counter
+
+`OFF_DBG_RESET_CTL[31:16]` is a 16-bit count of observed CPU-reset rising edges,
+living in the debug reset domain (so it survives the resets it counts), cleared
+by writing bit 1. It **saturates** at `0xFFFF` rather than wrapping: zero is a
+meaningful value ("no reset observed since clear") and must not be reachable by
+wraparound.
+
+### 15.5 Stage-1 feature value
+
+`OFF_FEATURES` reads `0x0004000F` — bits 0 `dbg_reset_domain`, 1
+`axi_ready_gated`, 2 `cfg_wipe`, 3 `cpu_reset_count`, 18 `mon_sense`. Every other
+bit reads 0. This value is not written by hand anywhere: it is computed from the
+`STAGE` column of `tools/debug/debug_regmap.def`, which is the machine-checked
+form of §3.4's "No feature bit may advertise a tied-off counter, stale shadow,
+placeholder probe, or operation that can be silently dropped."
