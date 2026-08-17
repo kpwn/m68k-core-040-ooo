@@ -558,4 +558,79 @@ class IssueQueueSpec extends AnyFunSuite {
         s"C must issue exactly 1 cycle after P (latency-1 wakeup); P@$pIdx C@$cIdx, per-cycle ${perCycle.map(_.mkString("+")).mkString("|")}")
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // Task #219 Fix 2 regression: the scoreboard busy-clear is RETIMED to C+1
+  // (decoded off the registered m2sPipe payload instead of the live MuxOH select
+  // cone). That retime is only safe because push-time `trigInit` reads
+  // `sb*BusyEff = busy & ~sb*Clr`, i.e. the same-cycle bypass of the in-flight
+  // clear. Drop that bypass and a consumer pushed EXACTLY ONE CYCLE after its
+  // producer's issue latches a static trigger on a slot that has already been
+  // freed and whose `events` pulse has already passed -> the trigger can never
+  // clear -> the consumer hangs forever (silent deadlock, no wrong answer).
+  //
+  // The phase of "exactly one cycle after issue" relative to the test's own push
+  // cadence is an implementation detail, so this sweeps the consumer's push delay
+  // across the whole window that can contain it and requires the consumer to
+  // issue (after its producer) for EVERY delay. MUTATION-PROVEN: replacing the
+  // four `sb*BusyEff` arguments in `trigInit` with the raw `sb*.busy` registers
+  // makes this hang at one of these delays; no other spec in the suite does.
+  test("MUST NOT DEADLOCK: consumer pushed 1 cycle after its producer's issue", VerilatorTest) {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+
+      for (delay <- 0 to 6) {
+        idle(dut)
+        // Flush between sub-cases so each starts from a clean queue/scoreboard.
+        dut.source.logic.flush #= true
+        cd.waitSampling()
+        dut.source.logic.flush #= false
+        cd.waitSampling(3)
+
+        dut.sink.logic.ready0 #= true
+        dut.sink.logic.ready1 #= true
+
+        // A fresh physreg per sub-case keeps the one-producer-per-physreg
+        // invariant intact across the sweep.
+        val pdst = 5 + delay
+        val prodRob = 10 + delay * 2
+        val consRob = prodRob + 1
+        val prod = UopSpec(rob = prodRob, pdstValid = true, pdst = pdst)
+        val cons = UopSpec(rob = consRob, psrcAValid = true, psrcA = pdst)
+
+        pushUops(dut, Some(prod), None)
+        cd.waitSampling()
+        pushUops(dut, None, None)
+
+        val perCycle = ArrayBuffer[Seq[Int]]()
+        var pushedC = false
+        for (i <- 0 until 40) {
+          if (!pushedC && i == delay && dut.source.logic.pushReady.toBoolean) {
+            pushUops(dut, Some(cons), None)
+            cd.waitSampling()
+            pushedC = true
+            pushUops(dut, None, None)
+          } else {
+            cd.waitSampling()
+          }
+          perCycle += issuedThisCycle(dut)
+        }
+
+        val flat = perCycle.flatten.toSeq
+        assert(pushedC, s"[delay=$delay] consumer was never accepted by the IQ")
+        assert(flat.contains(prodRob), s"[delay=$delay] producer never issued; got ${flat.mkString(",")}")
+        val pIdx = perCycle.indexWhere(_.contains(prodRob))
+        val cIdx = perCycle.indexWhere(_.contains(consRob))
+        assert(cIdx >= 0,
+          s"[delay=$delay] DEADLOCK: consumer rob=$consRob never issued in 40 cycles " +
+          s"(producer rob=$prodRob issued at cycle $pIdx). This is the retimed-scoreboard-clear " +
+          s"bypass failure mode -- `trigInit` must read `sb*BusyEff`, not raw `sb*.busy`. " +
+          s"per-cycle: ${perCycle.map(_.mkString("+")).mkString("|")}")
+        assert(cIdx > pIdx,
+          s"[delay=$delay] consumer issued at $cIdx, before/with its producer at $pIdx -- " +
+          s"the dependency was not tracked at all, so this sub-case proves nothing")
+      }
+    }
+  }
 }

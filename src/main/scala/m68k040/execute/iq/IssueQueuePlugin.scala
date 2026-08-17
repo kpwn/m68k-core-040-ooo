@@ -217,6 +217,43 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val sbFpcc = new Scoreboard(16)
     sbFp.busy.simPublic(); sbFpcc.busy.simPublic()  // debug-only
 
+    // ---- MANDATORY same-cycle bypass for the C+1 scoreboard clear (task #219, Fix 2) ----
+    // The issue-time `sb*.busy` clear is RETIMED to C+1 (it decodes off the registered
+    // m2sPipe payload instead of the live OHMasking/16:1 MuxOH select cone -- 12 of the
+    // top-100 worst routed endpoints in `synth/archive/866437c_fmax_fanout_fix_decode_fetch/`
+    // were `DcachePlugin_logic_fsm_stateReg -> IssueQueuePlugin_logic_sb{Int,X,Fp}_busy`).
+    //
+    // THIS BYPASS IS LOAD-BEARING FOR CORRECTNESS, NOT AN OPTIMIZATION. Without it the
+    // retime introduces a genuine, silent DEADLOCK class:
+    //
+    //   C   : producer P (a latency-1 sb* producer) wins selection and fires. `events`
+    //         carries its slot, so any trigger referencing it clears. Its slot is freed.
+    //   C+1 : the clear of `sb*.busy(P.dst)` is only NOW being written (visible at C+2),
+    //         so the raw register still reads BUSY. A consumer uop pushed at C+1 would
+    //         latch a static trigger at `physToSlot(P.dst) - wayCount` -- but P's slot is
+    //         gone and `events` at C+1 no longer carries it, so that trigger's ONLY
+    //         clearing event has already passed. The consumer waits forever.
+    //
+    // `sb*BusyEff = busy & ~sb*Clr` (where `sb*Clr` is the one-hot decode of THIS cycle's
+    // retimed clear) makes push-time `trigInit` see the producer as already-done, which is
+    // architecturally correct: P issued at C, so its latency-1 result is available at C+1,
+    // and a uop pushed at C+1 can be selected no earlier than C+2 and reads at C+3 --
+    // strictly LATER than the pre-retime behaviour it replaces, never earlier.
+    //
+    // `sb*Clr` are combinational, defaulted to 0 here and driven only by the retimed clear
+    // loop near the bottom of this file (declared here purely so `trigInit`, which is
+    // elaborated earlier, can read the bypassed value).
+    val sbIntClr  = Bits(physIntN bits); sbIntClr  := 0
+    val sbNzvcClr = Bits(16 bits);       sbNzvcClr := 0
+    val sbXClr    = Bits(16 bits);       sbXClr    := 0
+    val sbFpClr   = Bits(16 bits);       sbFpClr   := 0
+    val sbFpccClr = Bits(16 bits);       sbFpccClr := 0
+    val sbIntBusyEff  = sbInt.busy  & ~sbIntClr
+    val sbNzvcBusyEff = sbNzvc.busy & ~sbNzvcClr
+    val sbXBusyEff    = sbX.busy    & ~sbXClr
+    val sbFpBusyEff   = sbFp.busy   & ~sbFpClr
+    val sbFpccBusyEff = sbFpcc.busy & ~sbFpccClr
+
     // ---- Dynamic-completion (variant A) LS scoreboard ----
     // lsBusy[p] => int physreg p is produced by an in-flight LS LOAD that has NOT
     // yet completed. A consumer reading such a physreg is held NOT-ready until the
@@ -480,12 +517,23 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // head-of-line drain and hangs the pipeline. Explicitly AND `!flushSignal` into
     // the FINAL output valid (on top of what m2sPipe's own `flush` already does) so
     // a same-cycle race can never present a stale, pre-flush payload as valid.
-    for (k <- 0 until 5) {
+    val pipedPorts = Seq.tabulate(5) { k =>
       val piped = selPorts(k).m2sPipe(collapsBubble = false, flush = flushSignal)
       issuePorts(k).valid   := piped.valid && !flushSignal
       issuePorts(k).payload := piped.payload
       piped.ready           := issuePorts(k).ready
+      piped
     }
+    // FMax (task #219, Fix 2): the static-scoreboard busy-clear is retimed to C+1 and
+    // decodes off THESE ALREADY-REGISTERED payloads instead of the live OHMasking/16:1
+    // MuxOH select cone. `sbClearFire(k)` is exactly `RegNext(selPorts(k).fire)` (one flop
+    // per port). `pipedPorts(k).payload` is the m2sPipe data register, which SpinalHDL
+    // loads on `self.ready` -- and `selPorts(k).fire` implies `selPorts(k).ready` -- so on
+    // the cycle `sbClearFire(k)` is high, `pipedPorts(k).payload` is guaranteed to be the
+    // exact payload that fired the cycle before, whether or not the EU back-pressures
+    // (back-pressure only makes the m2sPipe HOLD it). See the clear loop near the bottom
+    // of this file, and the mandatory `sb*BusyEff` bypass declared with the scoreboards.
+    val sbClearFire = Seq.tabulate(5)(k => RegNext(selPorts(k).fire) init False)
 
     // Free chosen slots when their SELECT port fires (i.e. when the uop moves into
     // the registered issue stage).  The ALU candidate masks guarantee next-cycle
@@ -551,14 +599,17 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
           t(producerSlot) := True
         }
       }
-      dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcA, uop.psrcAValid)
-      dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcB, srcBIsReg(uop))
-      dep(sbInt.busy,  sbInt.physToSlot,  uop.psrcC, uop.psrcCValid)
-      dep(sbNzvc.busy, sbNzvc.physToSlot, uop.pNzvcSrc, uop.readsNzvc)
-      dep(sbX.busy,    sbX.physToSlot,    uop.pXSrc, uop.readsX)
-      dep(sbFp.busy,   sbFp.physToSlot,   uop.pFpSrcA,  uop.psrcAFpValid)
-      dep(sbFp.busy,   sbFp.physToSlot,   uop.pFpSrcB,  uop.psrcBFpValid)
-      dep(sbFpcc.busy, sbFpcc.physToSlot, uop.pFpccSrc, uop.readsFpcc)
+      // `sb*BusyEff`, NOT the raw `sb*.busy`: the retimed (C+1) scoreboard clear MUST be
+      // bypassed in here or a uop pushed exactly one cycle after its producer's issue
+      // latches a trigger that can never clear -> deadlock. See the bypass declaration.
+      dep(sbIntBusyEff,  sbInt.physToSlot,  uop.psrcA, uop.psrcAValid)
+      dep(sbIntBusyEff,  sbInt.physToSlot,  uop.psrcB, srcBIsReg(uop))
+      dep(sbIntBusyEff,  sbInt.physToSlot,  uop.psrcC, uop.psrcCValid)
+      dep(sbNzvcBusyEff, sbNzvc.physToSlot, uop.pNzvcSrc, uop.readsNzvc)
+      dep(sbXBusyEff,    sbX.physToSlot,    uop.pXSrc, uop.readsX)
+      dep(sbFpBusyEff,   sbFp.physToSlot,   uop.pFpSrcA,  uop.psrcAFpValid)
+      dep(sbFpBusyEff,   sbFp.physToSlot,   uop.pFpSrcB,  uop.psrcBFpValid)
+      dep(sbFpccBusyEff, sbFpcc.physToSlot, uop.pFpccSrc, uop.readsFpcc)
       t
     }
 
@@ -1091,14 +1142,38 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // unsound, the design would already be broken for those four far more common
     // classes. `!slowFire` was the lone asymmetric guard; dropping it makes
     // SHIFT/BITFIELD consistent with them rather than special.
+    //
+    // FMAX (task #219, Fix 2 -- netlist-grounded against
+    // `synth/archive/866437c_fmax_fanout_fix_decode_fetch/fullcore_slack_matrix.rpt`,
+    // Design State: Routed): this loop used to read `selPorts(k).payload`, i.e. the LIVE
+    // `MuxOH(oh_k, contexts)` 16:1 select cone, and `selPorts(k).fire`, whose `ready` term
+    // is the cross-plugin D-cache -> LS-EU -> IQ ready chain. That made
+    // `DcachePlugin_logic_fsm_stateReg -> IssueQueuePlugin_logic_sb{Int,X,Fp}_busy_reg[*]/D`
+    // 12 of the 100 worst routed endpoints (-1.263 .. -1.229ns). RETIMED to C+1: decode the
+    // clear off `pipedPorts(k).payload` (the m2sPipe register the same fire loaded) gated by
+    // `sbClearFire(k) == RegNext(selPorts(k).fire)`. The live select cone now terminates at
+    // one flop per port instead of driving the whole 5-port x 5-scoreboard decode tree.
+    //
+    // Zero architectural change, because of the MANDATORY `sb*BusyEff` bypass declared with
+    // the scoreboards: the C+1 clear is folded back into push-time `trigInit` in the SAME
+    // cycle it is being written, so a uop pushed one cycle after its producer's issue sees
+    // the producer as done rather than latching a trigger on a slot that has already been
+    // freed and can never fire `events` again. WITHOUT that bypass this retime is a silent
+    // deadlock (mutation-proven, task #219).
+    //
+    // Position in the file is deliberately unchanged (still AFTER the push-recording
+    // block), so the intra-cycle write ordering versus a same-cycle push is exactly what it
+    // was. Under the one-producer-per-physreg invariant no push at C+1 can target a physreg
+    // whose producer issued at C anyway: that producer has not even completed yet, so its
+    // pdst cannot have been freed and re-allocated.
     for (k <- selPorts.indices) {
-      val ctx = selPorts(k).payload
-      when(selPorts(k).fire) {
-        when(ctx.uop.pdstValid)  { sbInt.busy(ctx.uop.pdst)     := False }
-        when(ctx.uop.writesNzvc) { sbNzvc.busy(ctx.uop.pNzvcDst) := False }
-        when(ctx.uop.writesX)    { sbX.busy(ctx.uop.pXDst)       := False }
-        when(ctx.uop.pFpDstValid) { sbFp.busy(ctx.uop.pFpDst)     := False }
-        when(ctx.uop.writesFpcc)  { sbFpcc.busy(ctx.uop.pFpccDst) := False }
+      val ctx = pipedPorts(k).payload
+      when(sbClearFire(k)) {
+        when(ctx.uop.pdstValid)   { sbInt.busy(ctx.uop.pdst)      := False; sbIntClr(ctx.uop.pdst)      := True }
+        when(ctx.uop.writesNzvc)  { sbNzvc.busy(ctx.uop.pNzvcDst) := False; sbNzvcClr(ctx.uop.pNzvcDst) := True }
+        when(ctx.uop.writesX)     { sbX.busy(ctx.uop.pXDst)       := False; sbXClr(ctx.uop.pXDst)       := True }
+        when(ctx.uop.pFpDstValid) { sbFp.busy(ctx.uop.pFpDst)     := False; sbFpClr(ctx.uop.pFpDst)     := True }
+        when(ctx.uop.writesFpcc)  { sbFpcc.busy(ctx.uop.pFpccDst) := False; sbFpccClr(ctx.uop.pFpccDst) := True }
       }
     }
     // The BRANCH port (port 2) also clears its int pdst busy: an RTS/RTR ibranch is a
@@ -1107,9 +1182,13 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // NOTE: redundant with the widened loop above (now covers port 2 too); left in
     // place as a harmless idempotent duplicate rather than risk touching more lines
     // than necessary for this fix.
+    // (Retimed to C+1 with the loop above -- keeping it on the LIVE select cone would put
+    // the branch port's copy of the exact arc back into the netlist.)
     {
-      val bctx = selPorts(2).payload
-      when(selPorts(2).fire && bctx.uop.pdstValid) { sbInt.busy(bctx.uop.pdst) := False }
+      val bctx = pipedPorts(2).payload
+      when(sbClearFire(2) && bctx.uop.pdstValid) {
+        sbInt.busy(bctx.uop.pdst) := False; sbIntClr(bctx.uop.pdst) := True
+      }
     }
 
     // ---- Dynamic LS wakeup: clear lsBusy for the completed load's pdst ----
