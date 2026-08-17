@@ -18,7 +18,26 @@ object FpuCore {
     * cheap pipe are held at the same 10 on purpose -- see the header note below.
     *
     * FDIV/FSQRT are NOT covered by this constant: they are a busy/done handshake exactly
-    * like DivCore. Worst case FpDivSqrtCore.WorstCaseLatency cycles. */
+    * like DivCore. Worst case FpDivSqrtCore.WorstCaseLatency cycles.
+    *
+    * ADDENDUM (task #218, FMax closure -- read this before using the constant as an
+    * end-to-end latency). This is FpuCore's OWN start-to-doneFixed depth and it is still 13:
+    * nothing inside this component was re-timed. What DID change is upstream of it. The EU
+    * used to resolve the source operand combinationally in the issue cycle, off the integer
+    * PRF's bypass output -- i.e. straight off AluEuPlugin's S1 result cone -- which made
+    * `AluEu.s1Ctx -> FpMulPipe.m0_sClz` the whole design's worst path (6.652ns / 27 logic
+    * levels / WNS -2.669ns post-route). DivEuPlugin now has an ISSUE REGISTER (`fpS1*`) in
+    * front of that conversion cone, so:
+    *
+    *   EU-visible fixed-lane latency (issue accept -> FP completion register) is
+    *   FixedLatency + 1, NOT FixedLatency.
+    *
+    * GC-F2 is unchanged and still binding: the EU's descriptor shadow pipe is sized from
+    * this constant and stays exactly FixedLatency deep -- it is now PUSHED one cycle after
+    * acceptance, on the cycle `io.start` actually fires. Re-timing FpuCore still requires
+    * updating that pipe in the same commit; and moving that push back to the accept cycle
+    * (or bumping this constant to "14" to mean the EU-visible number) breaks the alignment
+    * in exactly the way DivEuPlugin's FS1 comment documents. */
   val FixedLatency = 13
 }
 

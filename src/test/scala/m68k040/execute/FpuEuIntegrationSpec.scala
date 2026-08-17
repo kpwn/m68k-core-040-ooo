@@ -406,8 +406,12 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
         val pdst = 4 + i          // distinct FP physregs: no two write ports share an address
         val pcc  = 4 + i
         val before = fpSeen.size
-        // The gateway output is combinational off the presented uop, so check it at the
-        // accepting edge -- this isolates a conversion bug from an arithmetic one.
+        // The gateway output is checked ONE CYCLE PAST the accepting edge -- this isolates a
+        // conversion bug from an arithmetic one. (Task #218 moved the conversion cone behind
+        // the EU's new FP issue register, so `fpSrcVal` is now the FS1 stage's output: in the
+        // presented cycle it still shows the PREVIOUS request. Reading it here, after the
+        // accepting edge and a `sleep(1)` settle, observes exactly this uop's conversion --
+        // and the operands themselves are still SAMPLED on the accepting edge, unchanged.)
         s.iOp #= DecOp.FPU
         s.iRob #= rob; s.iFpuOp #= OpFADD; s.iFpSrcKind #= cse.kind; s.iFpSrcFmt #= cse.fmt
         s.iFpWideImm #= cse.imm
@@ -417,11 +421,12 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
         s.iPdstValid #= false; s.iWritesNzvc #= false
         s.iValid #= true
         sleep(1)
-        assert(s.fpSrcObs.toBigInt == cse.src,
-          f"${cse.label}: gateway produced 0x${s.fpSrcObs.toBigInt}%020X, expected 0x${cse.src}%020X")
         assert(s.iReady.toBoolean && s.iFire.toBoolean, s"${cse.label} was not accepted")
         tick()
         s.iValid #= false
+        sleep(1)
+        assert(s.fpSrcObs.toBigInt == cse.src,
+          f"${cse.label}: gateway produced 0x${s.fpSrcObs.toBigInt}%020X, expected 0x${cse.src}%020X")
         drainTo(before + 1, FpuCore.FixedLatency + 12, cse.label)
         val g = fpSeen.last
         assert(g.rob == rob, s"${cse.label}: completed rob=${g.rob}, expected $rob")
@@ -500,8 +505,6 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
         s.iPdstValid #= false; s.iWritesNzvc #= false
         s.iValid #= true
         sleep(1)
-        assert(s.fpSrcObs.toBigInt == BigInt(0),
-          f"FMOVECR ${c.label}: gateway drove 0x${s.fpSrcObs.toBigInt}%020X, expected 0")
         assert(s.iReady.toBoolean && s.iFire.toBoolean, s"FMOVECR ${c.label} was not accepted")
         tick()
         s.iValid #= false
@@ -511,6 +514,11 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
         // the accepting edge so this reads the SETTLED post-edge register, not the value
         // `tick()` returns on the edge itself -- otherwise it is a vacuous check.)
         sleep(1)
+        // Same edge is also where this uop's gateway output settles (task #218's FP issue
+        // register): ROMCONST must drive a hard zero source, FpuCore's `cromSel` carries the
+        // ROM offset instead.
+        assert(s.fpSrcObs.toBigInt == BigInt(0),
+          f"FMOVECR ${c.label}: gateway drove 0x${s.fpSrcObs.toBigInt}%020X, expected 0")
         assert(!s.fpIterBusyO.toBoolean,
           s"FMOVECR ${c.label} was misrouted onto the ITERATIVE lane -- no doneIter can " +
           "ever arrive for it, so the lane and this uop's ROB entry wedge permanently")
@@ -597,10 +605,13 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
         s.iPdstValid #= false; s.iWritesNzvc #= false
         s.iValid #= true
         sleep(1)
-        assert(s.fpSrcObs.toBigInt == c.expect,
-          f"${c.label}: gateway 0x${s.fpSrcObs.toBigInt}%020X, expected 0x${c.expect}%020X")
         assert(s.iFire.toBoolean, s"${c.label} was not accepted")
         tick(); s.iValid #= false
+        // One cycle past the accepting edge: `fpSrcVal` is the FP issue register's output
+        // since task #218 (see the first fpSrcKind test for the full note).
+        sleep(1)
+        assert(s.fpSrcObs.toBigInt == c.expect,
+          f"${c.label}: gateway 0x${s.fpSrcObs.toBigInt}%020X, expected 0x${c.expect}%020X")
         drainTo(before + 1, FpuCore.FixedLatency + 12, c.label)
         assert(fpSeen.last.data == c.expect,
           f"${c.label}: FMOVE result 0x${fpSeen.last.data}%020X, expected 0x${c.expect}%020X")

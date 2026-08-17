@@ -525,14 +525,23 @@ class FpuProtocolSpec extends AnyFunSuite {
       //
       //     Accounting, since the exact off-by-one is easy to get wrong and a wrong
       //     constant here would silently make this a weaker test. `acceptCycles(i)` is the
-      //     cycle index AFTER the accepting edge, i.e. the cycle in which the descriptor
-      //     shadow pipe's stage 0 is already valid. From there: FpuCore.FixedLatency - 1
-      //     further edges carry the request to `doneFixed` (13 registered stages measured
-      //     from the pre-edge `start`, one of which is the accepting edge itself), and one
-      //     more edge captures it into the EU's own `fpComp*` completion register. Net:
-      //     exactly FpuCore.FixedLatency cycles from the accept index to the completion
-      //     index. Empirically confirmed at 13.
-      val ExpectedLatency = FpuCore.FixedLatency
+      //     cycle index AFTER the accepting edge, i.e. the cycle in which the EU's FP ISSUE
+      //     REGISTER (`fpS1*`) is already loaded. From there: one edge carries the request
+      //     out of that register into `fpu.io.start` and simultaneously pushes stage 0 of
+      //     the descriptor shadow pipe; FpuCore.FixedLatency - 1 further edges carry it to
+      //     `doneFixed` (13 registered stages measured from the pre-edge `start`, one of
+      //     which is that same edge); and one more edge captures it into the EU's own
+      //     `fpComp*` completion register. Net: exactly FpuCore.FixedLatency + 1 cycles from
+      //     the accept index to the completion index. Empirically confirmed at 14.
+      //
+      //     WHY +1 AND NOT +0 (task #218, FMax closure). The issue register is the whole
+      //     point of that task: the source-operand conversion cone used to sit in the issue
+      //     cycle, combinationally off AluEuPlugin's S1 result via the int-PRF bypass, and
+      //     was the design's worst post-route path. `FpuCore.FixedLatency` deliberately did
+      //     NOT change (FpuCore itself was not re-timed) -- see its doc comment. So this is
+      //     the one place that must carry the EU-level "+1", and it must stay written as
+      //     `FixedLatency + 1`, not as `14`: a real FpuCore re-time still has to fail here.
+      val ExpectedLatency = FpuCore.FixedLatency + 1
       for (i <- ops.indices) {
         val got = comps(i).cycle - acceptCycles(i)
         assert(got == ExpectedLatency,

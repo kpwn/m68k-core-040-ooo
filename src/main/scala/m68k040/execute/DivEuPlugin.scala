@@ -873,63 +873,14 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // ═════════════════════════════════════════════════════════════════════════
     val fpu = new FpuCore()
 
-    // ---- S0: source-operand gateway ----------------------------------------
+    // ---- S0: register-file reads (issue cycle) ------------------------------
     // FPn (the destination read back, dyadic ops only) and FPm (fpSrcKind === FPREG).
     fpRdA.addr := u0.pFpSrcA
     fpRdB.addr := u0.pFpSrcB
 
-    // The INT-register-borne source kinds all read the ORDINARY int PRF ports this EU
-    // already holds. `rdH`'s address is `u0.psrcC` UNCONDITIONALLY (line above, shared with
-    // DIVL's 64-bit dividend high word and CMP2/CHK2's compared Rn), so MEMEXT's third
-    // chunk needs no new port and no mutual-exclusion argument at all: there is exactly one
-    // port, its address expression is the same in every case, and only the DOWNSTREAM
-    // consumer differs. Same for rdA/rdB. Note `rdB.data` is used RAW rather than `s0B`:
-    // the microcode-emitted FP rows set useImm=True to carry the packed FP command word,
-    // which would otherwise mux the int immediate over the real T1 chunk.
-    // Byte/Word integer sources are SIGNED (Musashi m68kfpu.c:1221-1222,1234-1235 reads
-    // them as sint16/sint8 before int32_to_floatx80); the width selector is `fpSrcFmt`,
-    // NOT `size`, because the microcode memory path leaves `size` at its ROM-row default.
-    val fpFmt = u0.fpSrcFmt
-    val fpIntFromReg = fpFmt.mux(
-      B"3'b100" -> rdA.data(15 downto 0).asSInt.resize(32).asBits,   // Word, sign-extended
-      B"3'b110" -> rdA.data( 7 downto 0).asSInt.resize(32).asBits,   // Byte, sign-extended
-      default   -> rdA.data)                                          // Long (000) / unused
-    // One converter instance per FORMAT, with the register-vs-immediate choice muxed on the
-    // INPUT side -- three conversion cones, not six.
-    val fpIntIn = Mux(u0.fpSrcKind === FpSrcKind.INTIMM, u0.fpWideImm(31 downto 0), fpIntFromReg)
-    val fpSglIn = Mux(u0.fpSrcKind === FpSrcKind.SINGLEIMM, u0.fpWideImm(31 downto 0), rdA.data)
-    val fpDblIn = Mux(u0.fpSrcKind === FpSrcKind.DOUBLEIMM, u0.fpWideImm(63 downto 0),
-                                                            rdA.data ## rdB.data)
-    val fpFromInt = FpSource.intToExtended(fpIntIn)
-    val fpFromSgl = FpSource.singleToExtended(fpSglIn)
-    val fpFromDbl = FpSource.doubleToExtended(fpDblIn)
-    val fpSrcVal = u0.fpSrcKind.mux(
-      FpSrcKind.FPREG     -> fpRdB.data,
-      // INTREG covers BOTH `F<op>.<fmt> Dn,FPn` and the 1-chunk memory formats (the crack's
-      // load already parked the value in a temp int reg, making the two indistinguishable).
-      // Single (fmt 001) is a 32-bit BIT PATTERN, not an integer.
-      FpSrcKind.INTREG    -> Mux(fpFmt === B"3'b001", fpFromSgl, fpFromInt),
-      FpSrcKind.INTIMM    -> fpFromInt,
-      FpSrcKind.SINGLEIMM -> fpFromSgl,
-      FpSrcKind.DOUBLEIMM -> fpFromDbl,
-      // Extended immediate / Extended memory load: the internal Fp80 layout already.
-      // MEMEXT is pure bit placement -- {T0[31:16], T1, T2} IS the 80-bit value.
-      FpSrcKind.EXTIMM    -> u0.fpWideImm,
-      FpSrcKind.MEMPAIR   -> fpFromDbl,
-      FpSrcKind.MEMEXT    -> (rdA.data(31 downto 16) ## rdB.data ## rdH.data),
-      // ROMCONST (FMOVECR): no source operand at all -- io.cromSel carries the ROM offset.
-      FpSrcKind.ROMCONST  -> B(0, 80 bits))
-
     val fpAccept     = issuePort.fire && issueIsFp
     val fpFixedStart = fpAccept && issueIsFpFixed
     val fpIterStart  = fpAccept && issueIsFpIter
-
-    fpu.io.start   := fpAccept
-    fpu.io.op      := FpSource.opmodeToFpOp(u0.fpuOp, fpIsRomConst)
-    fpu.io.dst     := fpRdA.data
-    fpu.io.src     := fpSrcVal
-    fpu.io.rmode   := fpRmodeIn
-    fpu.io.cromSel := u0.fpuOp        // meaningful only when fpSrcKind === ROMCONST
 
     def loadFpCtx(c: FpPipeContext): Unit = {
       c.robId     := issuePort.payload.robId
@@ -939,15 +890,135 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       c.fpccWrite := u0.writesFpcc
     }
 
+    // ---- FS1: the FP lane's ISSUE REGISTER (task #218, FMax closure) --------
+    // WHY THIS STAGE EXISTS, and why it captures the RAW operands rather than the converted
+    // 80-bit value. Everything the FpSource gateway does used to run in the ISSUE cycle,
+    // hanging off the integer PRF's BYPASS output -- i.e. combinationally off AluEuPlugin's
+    // S1 result cone, with no flip-flop anywhere between the ALU's own context registers and
+    // the FP pipes' first-stage classification registers. On the FPU-integration branch that
+    // was the design's single worst path (post-route, `fc6ffe3_fpu_postrouteN9_decode_fetch/
+    // fullcore_route_timing.rpt`): AluEuPlugin_logic_s1Ctx_uop_op_reg[0] ->
+    // DivEuPlugin_logic_fpu/mulPipe/m0_sClz_reg[2], 6.652ns over 27 logic levels,
+    // WNS -2.669ns (149.95 MHz, vs a 201.450 MHz pre-FPU baseline).
+    //
+    // That report also gives the delay BREAKDOWN, which is what fixes the cut point here:
+    //   ALU result cone + int-PRF bypass mux ...... 2.834ns  (up to `DivEuPlugin_logic_s1A`)
+    //   the FpSource conversion cone below ........ 3.169ns  (`fpFromInt`/`srcR`, ~15 levels)
+    //   FpMulPipe's first-stage CLZ/classify ...... 0.649ns  (`m0_sInf`/`m0_sClz`)
+    // So registering the CONVERTED value (`fpSrcVal`, i.e. at FpuCore's port) would have left
+    // a 5.97ns first half and bought ~0.65ns. Registering the RAW operands here -- BEFORE the
+    // conversion cone -- splits the path at its real midpoint into 2.83ns + 3.85ns, which
+    // takes this family off the critical list outright instead of shaving its tail.
+    //
+    // COST, stated honestly: +1 cycle on EVERY FP issue. The fixed lane's EU-visible latency
+    // is FpuCore.FixedLatency + 1, and FDIV/FSQRT begin iterating one cycle later.
+    //
+    // GC-F2 (FpuCore.FixedLatency is a hard constant the descriptor shadow pipe is sized
+    // from): the pipe below is STILL exactly FpuCore.FixedLatency deep, because FpuCore
+    // itself is unchanged -- what moved is WHEN the pipe is pushed. It is pushed on
+    // `fpS1Fixed`, the cycle `fpu.io.start` actually fires, NOT on the original `fpAccept`.
+    // Pushing it on `fpAccept` while `fpu.io.start` fires a cycle later would misalign the
+    // shadow pipe against the real pipeline by exactly one cycle and silently associate every
+    // fixed-lane completion with the WRONG robId/pdst/pFpccDst (mutation-killed, task #218
+    // Step 4: FpuProtocolSpec's dense-8-fill and 4-in-flight tests both fail on it).
+    //
+    // Operand SAMPLING TIME is unchanged: every value below is captured on the accepting
+    // edge, exactly as before -- only its use moves a cycle later.
+    val fpS1Valid  = RegNext(fpAccept) init False
+    val fpS1Fixed  = RegNext(fpFixedStart) init False
+    val fpS1Ctx    = Reg(FpPipeContext())
+    val fpS1IntA   = Reg(Bits(32 bits))     // rdA: int source / Double+Extended chunk T0
+    val fpS1IntB   = Reg(Bits(32 bits))     // rdB: Double low half / Extended chunk T1
+    val fpS1IntC   = Reg(Bits(32 bits))     // rdH: Extended chunk T2
+    val fpS1FpDst  = Reg(Bits(80 bits))     // fpRdA: FPn read back for dyadic ops
+    val fpS1FpSrc  = Reg(Bits(80 bits))     // fpRdB: FPm (fpSrcKind === FPREG)
+    val fpS1Imm    = Reg(Bits(80 bits))     // u0.fpWideImm
+    val fpS1Kind   = Reg(FpSrcKind())
+    val fpS1Fmt    = Reg(Bits(3 bits))
+    val fpS1Opmode = Reg(Bits(7 bits))      // u0.fpuOp: the FpOp selector AND io.cromSel
+    val fpS1Rmode  = Reg(Bits(2 bits))      // FPCR[5:4] as it stood at ISSUE, not at start
+    when(fpAccept) {
+      fpS1IntA   := rdA.data
+      // `rdB.data` RAW rather than `s0B`: the microcode-emitted FP rows set useImm=True to
+      // carry the packed FP command word, which would otherwise mux the int immediate over
+      // the real T1 chunk.
+      fpS1IntB   := rdB.data
+      fpS1IntC   := rdH.data
+      fpS1FpDst  := fpRdA.data
+      fpS1FpSrc  := fpRdB.data
+      fpS1Imm    := u0.fpWideImm
+      fpS1Kind   := u0.fpSrcKind
+      fpS1Fmt    := u0.fpSrcFmt
+      fpS1Opmode := u0.fpuOp
+      fpS1Rmode  := fpRmodeIn
+      loadFpCtx(fpS1Ctx)
+    }
+
+    // ---- FS1: source-operand gateway (conversion cone) ---------------------
+    // The INT-register-borne source kinds all read the ORDINARY int PRF ports this EU
+    // already holds. `rdH`'s address is `u0.psrcC` UNCONDITIONALLY (shared with DIVL's
+    // 64-bit dividend high word and CMP2/CHK2's compared Rn), so MEMEXT's third chunk needs
+    // no new port and no mutual-exclusion argument at all: there is exactly one port, its
+    // address expression is the same in every case, and only the DOWNSTREAM consumer
+    // differs. Same for rdA/rdB.
+    // Byte/Word integer sources are SIGNED (Musashi m68kfpu.c:1221-1222,1234-1235 reads
+    // them as sint16/sint8 before int32_to_floatx80); the width selector is `fpSrcFmt`,
+    // NOT `size`, because the microcode memory path leaves `size` at its ROM-row default.
+    val fpFmt = fpS1Fmt
+    val fpIntFromReg = fpFmt.mux(
+      B"3'b100" -> fpS1IntA(15 downto 0).asSInt.resize(32).asBits,   // Word, sign-extended
+      B"3'b110" -> fpS1IntA( 7 downto 0).asSInt.resize(32).asBits,   // Byte, sign-extended
+      default   -> fpS1IntA)                                          // Long (000) / unused
+    // One converter instance per FORMAT, with the register-vs-immediate choice muxed on the
+    // INPUT side -- three conversion cones, not six.
+    val fpIntIn = Mux(fpS1Kind === FpSrcKind.INTIMM, fpS1Imm(31 downto 0), fpIntFromReg)
+    val fpSglIn = Mux(fpS1Kind === FpSrcKind.SINGLEIMM, fpS1Imm(31 downto 0), fpS1IntA)
+    val fpDblIn = Mux(fpS1Kind === FpSrcKind.DOUBLEIMM, fpS1Imm(63 downto 0),
+                                                        fpS1IntA ## fpS1IntB)
+    val fpFromInt = FpSource.intToExtended(fpIntIn)
+    val fpFromSgl = FpSource.singleToExtended(fpSglIn)
+    val fpFromDbl = FpSource.doubleToExtended(fpDblIn)
+    val fpSrcVal = fpS1Kind.mux(
+      FpSrcKind.FPREG     -> fpS1FpSrc,
+      // INTREG covers BOTH `F<op>.<fmt> Dn,FPn` and the 1-chunk memory formats (the crack's
+      // load already parked the value in a temp int reg, making the two indistinguishable).
+      // Single (fmt 001) is a 32-bit BIT PATTERN, not an integer.
+      FpSrcKind.INTREG    -> Mux(fpFmt === B"3'b001", fpFromSgl, fpFromInt),
+      FpSrcKind.INTIMM    -> fpFromInt,
+      FpSrcKind.SINGLEIMM -> fpFromSgl,
+      FpSrcKind.DOUBLEIMM -> fpFromDbl,
+      // Extended immediate / Extended memory load: the internal Fp80 layout already.
+      // MEMEXT is pure bit placement -- {T0[31:16], T1, T2} IS the 80-bit value.
+      FpSrcKind.EXTIMM    -> fpS1Imm,
+      FpSrcKind.MEMPAIR   -> fpFromDbl,
+      FpSrcKind.MEMEXT    -> (fpS1IntA(31 downto 16) ## fpS1IntB ## fpS1IntC),
+      // ROMCONST (FMOVECR): no source operand at all -- io.cromSel carries the ROM offset.
+      FpSrcKind.ROMCONST  -> B(0, 80 bits))
+
+    val fpS1IsRomConst = fpS1Kind === FpSrcKind.ROMCONST
+    // NOT gated on `flushSig`. An accepted request must always reach FpuCore, exactly as it
+    // did when `start` was `fpAccept`: the ITERATIVE lane's `fpIterBusy` is already set (see
+    // below) and only clears on a real `doneIter`, so suppressing the start of a request that
+    // was flushed one cycle after acceptance would wedge that lane permanently. Wrong-path
+    // FIXED results are dropped by the shadow pipe's flush clear instead, as before.
+    fpu.io.start   := fpS1Valid
+    fpu.io.op      := FpSource.opmodeToFpOp(fpS1Opmode, fpS1IsRomConst)
+    fpu.io.dst     := fpS1FpDst
+    fpu.io.src     := fpSrcVal
+    fpu.io.rmode   := fpS1Rmode
+    fpu.io.cromSel := fpS1Opmode      // meaningful only when fpSrcKind === ROMCONST
+
     // ---- fixed lane: a descriptor shadow pipe, sized from FpuCore.FixedLatency ----
     // Identical construction to mulCtx/mulCtxValid above (load index 0 at start, shift up,
     // read `.last` on done); FpuCore.io.doneFixed is an unconditional 1-cycle pulse exactly
     // FixedLatency cycles after an accepted start, in issue order, so `.last` is the
     // matching descriptor by construction.
+    // The push is on `fpS1Fixed` -- the cycle `fpu.io.start` fires -- NOT on `fpFixedStart`.
+    // See the FS1 comment above for why that one cycle is load-bearing (GC-F2).
     val fpFixedCtx      = Vec.fill(FpuCore.FixedLatency)(Reg(FpPipeContext()))
     val fpFixedCtxValid = Vec.fill(FpuCore.FixedLatency)(RegInit(False))
-    fpFixedCtxValid(0) := fpFixedStart
-    when(fpFixedStart) { loadFpCtx(fpFixedCtx(0)) }
+    fpFixedCtxValid(0) := fpS1Fixed
+    when(fpS1Fixed) { fpFixedCtx(0) := fpS1Ctx }
     for (i <- 1 until FpuCore.FixedLatency) {
       fpFixedCtxValid(i) := fpFixedCtxValid(i - 1)
       when(fpFixedCtxValid(i - 1)) { fpFixedCtx(i) := fpFixedCtx(i - 1) }
@@ -965,6 +1036,16 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // the architectural side effects. `fpIterBusy` then clears on the real completion, at
     // which point the lane is genuinely reusable.
     val fpIterFlushed = RegInit(False)
+    // DELIBERATELY still on `fpIterStart` (the ACCEPT cycle), not on FS1 like the fixed
+    // lane's shadow pipe, and the asymmetry is load-bearing in both directions:
+    //  * `fpIterBusy` MUST be set at acceptance, because it IS the issue-port's admission
+    //    gate (`issuePort.ready`, above). Moving it to FS1 would leave a one-cycle window in
+    //    which a SECOND FDIV/FSQRT is admitted while the first is still in the issue
+    //    register -- and FpDivSqrtCore's own `start` is swallowed while it is busy, so the
+    //    second op would vanish and its robId would never complete.
+    //  * `fpIterCtx` needs no shift-alignment at all (unlike the fixed pipe): it is a SINGLE
+    //    held context, and `fpIterBusy` -- set on this very cycle -- already excludes any
+    //    other iterative op from overwriting it before the result lands.
     when(fpIterStart) {
       fpIterBusy := True
       fpIterFlushed := False
