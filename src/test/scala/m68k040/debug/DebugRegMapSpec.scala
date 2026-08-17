@@ -16,6 +16,7 @@ import scala.io.Source
 class DebugRegMapSpec extends AnyFunSuite {
 
   private val defPath = "tools/debug/debug_regmap.def"
+  private val genPath = "src/main/scala/m68k040/debug/DebugRegMap.scala"
 
   private def num(tok: String): Int =
     if (tok.toLowerCase.startsWith("0x")) Integer.parseInt(tok.substring(2), 16)
@@ -53,6 +54,25 @@ class DebugRegMapSpec extends AnyFunSuite {
     } finally src.close()
   }
 
+  /** The standalone `val OFF_*: Int = 0x...` declarations, re-read straight from
+    * `DebugRegMap.scala`'s own source text. These are the form real RTL/consumer code
+    * actually references (not the `allOffsets` tuple), so they need their own drift
+    * guard rather than trusting `allOffsets` to be a faithful mirror. */
+  private lazy val standaloneOffsetVals: Map[String, Int] = {
+    val src = Source.fromFile(genPath, "UTF-8")
+    try {
+      val re = """^\s*val (OFF_\w+): Int = (0x[0-9A-Fa-f]+)\s*$""".r
+      val out = scala.collection.mutable.LinkedHashMap[String, Int]()
+      for (raw <- src.getLines()) {
+        raw match {
+          case re(name, hex) => out(name) = Integer.parseUnsignedInt(hex.substring(2), 16)
+          case _              =>
+        }
+      }
+      out.toMap
+    } finally src.close()
+  }
+
   test("the definition file is present and non-trivial") {
     val (offsets, feats, consts, ports) = parsed
     assert(offsets.size >= 100, s"only ${offsets.size} offsets parsed from $defPath")
@@ -71,6 +91,29 @@ class DebugRegMapSpec extends AnyFunSuite {
     val differing = offsets.filter { case (n, o) => generated(n) != o }
       .map { case (n, o) => f"$n: def 0x$o%05X vs scala 0x${generated(n)}%05X" }.toSeq.sorted
     assert(differing.isEmpty, s"offset drift: ${differing.mkString("; ")}")
+  }
+
+  test("standalone OFF_* val declarations in DebugRegMap.scala match allOffsets exactly") {
+    // Regression guard: allOffsets and the standalone `val OFF_*` declarations are two
+    // independently-hand/generator-written views of the same offsets, and only allOffsets
+    // was previously cross-checked against the .def file. Real consumer code (RTL-facing
+    // Scala, Task 6+) references the standalone vals, not the tuple -- so a drift here is
+    // exactly the class of bug the other checks in this spec cannot see.
+    val generated = DebugRegMap.allOffsets.toMap
+    val standalone = standaloneOffsetVals
+    assert(standalone.size >= 100, s"only ${standalone.size} standalone OFF_* vals parsed " +
+      s"from $genPath -- the regex may no longer match the file's style")
+    val missing = (generated.keySet -- standalone.keySet).toSeq.sorted
+    val extra   = (standalone.keySet -- generated.keySet).toSeq.sorted
+    assert(missing.isEmpty,
+      s"DebugRegMap.scala is missing standalone val(s) present in allOffsets: ${missing.mkString(", ")}")
+    assert(extra.isEmpty,
+      s"DebugRegMap.scala has standalone val(s) absent from allOffsets: ${extra.mkString(", ")}")
+    val differing = generated.filter { case (n, o) => standalone(n) != o }
+      .map { case (n, o) => f"$n: allOffsets 0x$o%05X vs standalone val 0x${standalone(n)}%05X" }
+      .toSeq.sorted
+    assert(differing.isEmpty,
+      s"DebugRegMap.scala's standalone OFF_* val(s) disagree with its own allOffsets: ${differing.mkString("; ")}")
   }
 
   test("generated DebugRegMap.features matches the definition file exactly") {
