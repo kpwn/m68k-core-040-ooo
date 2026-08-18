@@ -3974,6 +3974,34 @@ class DebugCtrlResetSpec extends AnyFunSuite {
       assert(dut.dbg.logic.monSense.toInt == 0x33)
     }
   }
+
+  // ── The two tests below are MANDATORY, not optional colour. Without them the §13
+  //    assertion's one-cycle skew and the counter-clear priority are both invisible:
+  //    every test above writes configuration only with the socket reset RELEASED, and
+  //    none of them ever collides a bit-1 clear with a reset edge. (Task 11 review.)
+
+  /** Spec 10.1 makes writing configuration DURING a held CPU reset legal and expected --
+    * the Q700 holds `cpu_rst` for the whole boot window, which is exactly when an operator
+    * programs the RAM window, the monitor sense and the cold-reset hold. Use raw pokes
+    * plus `sleep`, never `DbgAxiDriver.write`, which polls on the ClockDomain whose reset
+    * is held. A regression makes the simulation DIE with the §13 `FAILURE`. */
+  test("host configuration can be written while the CPU reset is HELD") {
+    // settle, assertReset, then (1) write OFF_RAM_WINDOW_LG2 and check it took effect,
+    // (2) write OFF_MON_SENSE then OFF_DBG_RESET_CTL bit 0 and check the wipe restored
+    // both POR values, (3) write OFF_CONTROL bit 4 and check coldResetHold -- all with the
+    // reset still asserted -- then deassert and read both back over AXI.
+  }
+
+  /** The clear/edge collision, constructed exactly rather than swept: AW and W presented
+    * together are captured on one edge E, so `doWrite` is high in the cycle after E and
+    * the clear applies on edge E+1; asserting the socket reset immediately after E puts
+    * `cpuRstEvent` on that same edge E+1. From a zero count the edge must still be counted
+    * (1, not 0); from a non-zero count the increment must win OUTRIGHT (1 -> 2), which is
+    * what debug_ctrl.v:2709 does. Finish by proving an uncontended bit-1 clear still
+    * clears, so this stays a priority fix and not a disabled clear. */
+  test("a CPU-reset edge colliding with a same-cycle counter clear is not swallowed") {
+    // see src/test/scala/m68k040/debug/DebugCtrlResetSpec.scala for the written form
+  }
 }
 ```
 
@@ -3994,18 +4022,40 @@ existing `cpuRstEvent` and `cpuRstLevel`. If it is somehow absent from the file,
 not completed as specified and this task is blocked on it, because a counter of edges and a
 wipe on edges must count the *same* edges from one detector, not two.
 
-In the `csr` Area of `src/main/scala/m68k040/debug/DebugCtrlPlugin.scala`, add the counter
-immediately after that existing detector:
+In the `csr` Area of `src/main/scala/m68k040/debug/DebugCtrlPlugin.scala`, declare the
+counter immediately after that existing detector:
 
 ```scala
       /** Surviving 16-bit count of observed CPU-reset edges. SATURATES: zero means "no
         * reset observed since the last clear" and must not be reachable by wraparound
-        * (spec 15.4). Lives in the debug domain, so it survives the resets it counts. */
+        * (spec 15.4). Lives in the debug domain, so it survives the resets it counts.
+        *
+        * The INCREMENT is deliberately NOT written here -- see below. */
       val cpuResetCount = Reg(UInt(16 bits)) init 0; cpuResetCount.simPublic()
-      when(cpuRstEvent && cpuResetCount =/= U(0xFFFF, 16 bits)) {
-        cpuResetCount := cpuResetCount + 1
+```
+
+**The increment goes BELOW the write decode, not here.** Put it inside Task 9's existing
+`when(cpuRstEvent)` wipe block, which is elaborated *after* the `when(doWrite)` switch:
+
+```scala
+      when(cpuRstEvent) {
+        ctrlInitDoneOvr := False
+        initDoneSticky  := False
+        when(cpuResetCount =/= U(0xFFFF, 16 bits)) {
+          cpuResetCount := cpuResetCount + 1
+        }
+      } elsewhen (initDoneSeen) {
+        initDoneSticky := True
       }
 ```
+
+Position is load-bearing. SpinalHDL resolves multiple assignments to one register by
+last-assignment-wins in elaboration order, so a host bit-1 clear (`cpuResetCount := 0`, in
+the write arm below) landing on the very same cycle as a genuine CPU-reset edge would
+SWALLOW that edge if the increment were declared above it -- the counter ends at 0 and the
+host is told "no reset occurred" about a reset that did. The deployed reference has the
+opposite, correct ordering: its clear is at `debug_ctrl.v:2417` and its saturating
+increment at `:2709`, later in the same always block, so the increment wins there.
 
 Extend the `OFF_DBG_RESET_CTL` write arm (added in Task 10) with bit 1:
 
@@ -4042,7 +4092,14 @@ Finally, add the second required §13 assertion next to the first:
           False ##
           B(DebugRegMap.RAM_WINDOW_LG2_POR, 6 bits) ##
           B(DebugRegMap.MON_SENSE_POR, 7 bits))
-        assert(!(cpuRstLevel && !doWrite && !cfgWipe && (cfgVec =/= cfgVecPrev)),
+        // MOVERS MUST BE DELAYED BY ONE CYCLE. `doWrite`/`cfgWipe` are write-ENABLEs:
+        // true in the cycle the write is APPLIED, while `cfgVec` only takes the new value
+        // on the NEXT edge. Comparing them at the same instant is off by one and fires on
+        // every legitimate config write -- and spec 10.1 exists precisely so the host CAN
+        // program the RAM window / monitor sense / cold-reset hold WHILE CPU reset is
+        // held (the real Q700 boot window), i.e. exactly when `cpuRstLevel` is high.
+        val cfgMoved = RegNext(doWrite || cfgWipe) init False
+        assert(!(cpuRstLevel && !cfgMoved && (cfgVec =/= cfgVecPrev)),
           "DebugCtrlPlugin: surviving debug configuration changed while CPU reset was " +
           "asserted (spec section 13)",
           FAILURE)
@@ -4054,7 +4111,7 @@ Finally, add the second required §13 assertion next to the first:
 cd /home/qwertyoruiop/m68k-core-040-ooo && ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlResetSpec m68k040.debug.DebugCtrlSocketSpec m68k040.debug.DebugCtrlCsrSpec m68k040.debug.DebugCtrlAxiSpec"
 ```
 
-Expected: 7 + 7 + 15 + 8 = 37 tests pass, `[success]`, and no `FAILURE` from either
+Expected: 9 + 7 + 15 + 8 = 39 tests pass, `[success]`, and no `FAILURE` from either
 synthesis-excluded assertion.
 
 - [ ] **Step 5: Commit**
@@ -4360,7 +4417,7 @@ make SBT=~/sbt/bin/sbt test-fast 2>&1 | tail -30
 Expected: `run_tests.sh` exits 0 with `All checks passed.` from each script and three
 `CURRENT:` lines; `test-fast` reports `[success]` with the pre-existing suite count plus
 the five new debug suites (`DebugRegMapSpec` 8, `DebugCtrlAxiSpec` 8, `DebugCtrlCsrSpec`
-15, `DebugCtrlSocketSpec` 7, `DebugCtrlResetSpec` 7 — 45 new tests). Any
+15, `DebugCtrlSocketSpec` 7, `DebugCtrlResetSpec` 9 — 47 new tests). Any
 pre-existing failure must be reproduced on the parent commit before being accepted as
 unrelated.
 
@@ -4580,8 +4637,8 @@ Checked every cross-task reference, since each task's implementer sees only thei
 - `DebugRegMap` members used by later tasks (`DBG_AW`, `DBG_DW`, `VERSION_VALUE`, `POR_CYCLES_DEFAULT`, `RAM_WINDOW_LG2_{POR,MIN,MAX}`, `MON_SENSE_POR`, `OFF_*`, `allOffsets`, `features`, `ports`, `featuresForStage`) are all emitted by Task 4's generator, with the Int-vs-BigInt split stated there (`VERSION_VALUE` is the only constant ≥ 2³¹, so it is the only `BigInt`).
 - `DbgAxiLite`'s 17 fields, `DebugCtrlDut`'s `dbg`/`axi`, and `DbgAxiDriver`'s five methods are declared in Task 7 and used unchanged in Tasks 8-11; `strb` is a defaulted 5th parameter on `write` and a required 5th on `writeAwFirst`/`writeWFirst`, matching every call site.
 - `csr` members added incrementally (`merged`, `cpuRstLevel`, `cpuRstEvent`, `controlWord`, `ctrlColdHold`, `ctrlInitDoneOvr`, `coldPulse`, `initDoneSticky`, `initDoneLatched`, `ramWindow`, `mon`, `cfgWipe`, `cpuResetCount`) are each declared before their first use in the elaboration order the tasks impose; the §13 assertion block stays last, so Task 11's assertion can read `doWrite`, `cfgWipe`, `ramWindow` and `mon` regardless of where they were inserted. `cpuRstLevel`/`cpuRstEvent` are declared once, by Task 9 (its spec-§15.1 init-done wipe is the first consumer), and only read by Task 11 — one detector, so the edges that wipe and the edges that count are the same edges.
-- One `csr` statement's POSITION, not just its declaration order, is load-bearing: Task 9's `when(cpuRstEvent){ ctrlInitDoneOvr := False; initDoneSticky := False }` must be elaborated after the `when(doWrite)` CONTROL arm, so SpinalHDL's last-assignment-wins ordering gives the reset wipe precedence over a host write landing on the same edge. Task 9 states this in the RTL comment; Tasks 10 and 11 add only `is(...)` arms inside the existing `when(doWrite)` switch, so they stay above it.
-- Test counts quoted in each task's Step 4 are consistent and cumulative (8 → 15 → 23 → 30 → 37), and Task 13's total of 45 new tests across five suites matches.
+- One `csr` statement's POSITION, not just its declaration order, is load-bearing: Task 9's `when(cpuRstEvent){ ctrlInitDoneOvr := False; initDoneSticky := False }` must be elaborated after the `when(doWrite)` CONTROL arm, so SpinalHDL's last-assignment-wins ordering gives the reset wipe precedence over a host write landing on the same edge. Task 9 states this in the RTL comment; Tasks 10 and 11 add only `is(...)` arms inside the existing `when(doWrite)` switch, so they stay above it. Task 11's `cpuResetCount` increment joins that same block for the same reason, with the opposite polarity of collision: there the reset edge must beat the host's bit-1 clear, or a genuine reset is reported as none at all (`debug_ctrl.v` clears at :2417 and increments at :2709, later in the same always block).
+- Test counts quoted in each task's Step 4 are consistent and cumulative (8 → 15 → 23 → 30 → 39; Task 11 contributes 9, two of which are the review-mandated regressions above), and Task 13's total of 47 new tests across five suites matches.
 
 ### Stage-0 code was executed, not just written
 
