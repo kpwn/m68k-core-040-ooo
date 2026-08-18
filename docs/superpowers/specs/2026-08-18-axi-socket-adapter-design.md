@@ -30,39 +30,59 @@ CPU-side glue (`if_to_axi.v`, `axi_narrow_to_wide.v`) is reproduced.
 
 Every numbered **DECIDED** item below is citable by a future implementation plan without
 re-deriving it. Items tagged **NOTED** record a confirmed non-problem or an accepted
-residual; items tagged **SOC** must be executed in `macqd700-soc`, not here.
+residual; items tagged **SOC** must be executed in `macqd700-soc`, not here; items tagged
+**OPEN** are genuinely undecided and require explicit sign-off before the implementation
+plan may pass the section that depends on them — they are recorded rather than silently
+resolved in either direction.
+
+`D24`-`D29` and `OPEN-1` were added by the 2026-08-18 design review of this spec (see the
+review-corrections block at the end of §12); `D4`/`D5`/`D6`/`D10`/`D15`/`D20`/`D22`'s
+wording was tightened by the same pass.
 
 | # | Decision |
 |---:|---|
 | **D1** | Adapt byte order at the socket boundary with a pure wire permutation. Do **not** change the core's native byte-address-invariant lane convention in `DcacheTypes` / `IcacheTypes` / `TableWalker`. (§2) |
 | **D2** | The permutation is a **per-32-bit-lane byte reversal** on WDATA/RDATA and a **per-4-bit-nibble reversal** on WSTRB. Inter-word order is untouched. It is an involution, so one function serves both directions and both widths. (§2.2) |
 | **D3** | The permutation lives in a new top-level `M68kSocketTop`, applied exactly once per master, only to `w.data` / `w.strb` / `r.data`. Never to address, id, len, size, burst, resp, or last. (§2.3) |
-| **D4** | The D-side derives a real `AxSIZE` and a byte-granular address for every **INHIBITED** access, from the access's own size/strobe — never from an address-range table. (§3) |
-| **D5** | The size/address derivation runs on the **core-side** (pre-permutation) strobe, because the byte-offset a run starts at is not permutation-invariant. (§3.3) |
-| **D6** | An INHIBITED access whose byte range crosses a 4-byte boundary is decomposed into **two naturally-aligned AXI sub-transactions** inside `DcachePlugin`'s INHIBITED path. This is an extension beyond the v1 algorithm and is required for parity — see §3.4 for why the naive containment fallback is wrong. |
+| **D4** | The D-side derives a real `AxSIZE` and a byte-granular address for every **INHIBITED** access, from the access's own size (loads) or size+strobe (stores) — never from an address-range table. (§3) |
+| **D5** | The store-side size/address derivation runs on the **core-side** (pre-permutation) strobe, because the byte-offset a run starts at is not permutation-invariant. (§3.3) |
+| **D6** | An INHIBITED access whose byte range crosses a 4-byte boundary is decomposed into **two naturally-aligned AXI sub-transactions** inside `DcachePlugin`'s INHIBITED path. This is an extension beyond the v1 algorithm and is required for parity — see §3.4 for why the naive containment fallback is wrong. The decomposed range is clamped to the containing 16-byte line per D25. |
 | **D7** | 4 masters → 2. `axi_i` stays I-cache-only. D-cache + ITLB walker + DTLB walker merge onto `axi_d`. The ITLB walker genuinely issues AXI writes, so it categorically cannot ride the read-only `axi_i`. (§4.1) |
 | **D8** | The merge is an **owner-tag serializing arbiter**, not a raw-ID demux. Responses route by the arbiter's latched grant owner; the returned AXI ID is forwarded as a fabric hint and is never consulted for routing. (§4.2) |
 | **D9** | Read and write grants are **independent** per-direction state machines. A single global token deadlocks against `refillWriteHold`. (§4.4) |
-| **D10** | Each plugin's existing internal ID demux (D-cache B-by-ID, walker completion) is preserved untouched; the arbiter is strictly additive. (§4.3) |
+| **D10** | The D-cache's existing internal B-by-ID demux is preserved untouched; for it the arbiter is strictly additive. The walkers have **no** existing ID check, so for them the arbiter is not additive but their *only* protection — see D27. (§4.3) |
 | **D11** | `axi_i` stays natively 256-bit, `len=1`/`size=5` (two 32-byte beats = a 64-byte line). No 256→128 downconverter is built in this repo. (§5) |
 | **SOC-1** | `macqd700-soc` must widen the `axi_i` socket-side path to 256 bit. The socket's single `CPU_SOCKET_AXI_DW` define must split into per-master `..._AXI_I_DW` (256) and `..._AXI_D_DW` (128). (§5, §11) |
 | **D12** | Reset/boot is a **real vector-0 AXI fetch**: one 16-byte read at physical 0x0, SSP from bytes 0-3, PC from bytes 4-7. Not a debug-CSR-supplied PC. (§6) |
 | **D13** | The vector-0 read is issued as a fourth read owner on the **`axi_d` merge arbiter**, never as a third socket master — only `XBAR_M_CPU`/`XBAR_M_CPUI` reads get the SoC's ROM overlay aliasing. (§6.2) |
 | **D14** | The initial SSP reaches committed A7 through the **existing shared `a7Wr` int-PRF port** at `RenameStage.committedPhysA7`, as a new highest-priority third source. SSP write in cycle N, fetch redirect in cycle N+1. (§6.3) |
-| **D15** | A non-OKAY vector-0 response latches the existing sticky `coreHalted` diagnostic, not a vector-2 frame. This is hardware-faithful (a fault during reset exception processing halts a real 68040) and a deliberate divergence from v1. (§6.4) |
+| **D15** | A non-OKAY vector-0 response latches the sticky `coreHalted` state, not a vector-2 frame. This is hardware-faithful (a fault during reset exception processing halts a real 68040) and a deliberate divergence from v1. The halt *reason* it reports needs the new channel of D28. (§6.4) |
 | **D16** | The reset-vector fetch is behind a constructor parameter, default **off**, mirroring v1's `FETCH_RESET_VECTORS`. The existing sim/lock-step/OOC flows keep the external `redirect` port. (§6.5) |
 | **D17** | `ipl_ack` is a 1-cycle pulse per interrupt exception entry actually taken, derived from the ExceptionUnit's own registered `obsIsInterrupt` observation, pinned by a count-equality assertion. (§7.2) |
 | **D18** | `iackAvec` is tied to 1 (autovector) and `iackVector` is dropped: the socket has no vector input. (§7.3) |
 | **D19** | The core does **not** reimplement a 20 s abandonment timer. The obligation is discharged by the SoC fabric's own bounded-response guarantee plus a stated, assertion-backed core-side invariant. (§8.2) |
-| **D20** | The merge arbiter carries its own **bounded-grant** watchdog, closing a new wedge mode this design creates (three owners on one port). This is *not* a reinstatement of the v1 abandonment timer D19 declines. Bound = v1's value copied verbatim (2e9 core-clk), never re-derived. On expiry it latches `coreHalted` with a distinct kind code; it never fabricates an AXI response. (§8.3) |
+| **D20** | The merge arbiter carries its own **bounded-grant** watchdog, closing a new wedge mode this design creates (three owners on one port). This is *not* a reinstatement of the v1 abandonment timer D19 declines. Bound = v1's value copied verbatim (2e9 core-clk), never re-derived. On expiry it latches `coreHalted` with a distinct halt-reason code (via D28's new channel); it never fabricates an AXI response. (§8.3) |
 | **D21** | Keep the core's async active-high reset; rename the socket top's port `reset` → `rst`, declare the `ClockDomainConfig` explicitly instead of inheriting the default, and re-run the post-route gate. (§9.1) |
-| **D22** | `cpu_peripheral_reset` (68040 `RESET` instruction output) is owned by **this** work, not the debug-ctrl plan. Driven from the commit-time `SysKind.RESET` arm. (§9.4) |
+| **D22** | `cpu_peripheral_reset` (68040 `RESET` instruction output) is owned by **this** work, not the debug-ctrl plan. Driven from the commit-time `SysKind.RESET` arm, as a **518-core-clock level** matching v1 verbatim. (§9.4) |
 | **SOC-2** | `macqd700-soc` must add `cpu_peripheral_reset` to `cpu_socket.vh` §6, which omits it today. (§9.4, §11) |
 | **SOC-3** | `macqd700-soc` must instantiate this core in place of v1, dropping `if_to_axi.v` and `axi_narrow_to_wide.v` from the CPU wrapper. That is the step which removes the 20 s timer — see D19. (§11.2) |
-| **D23** | The socket top exports **only** socket ports. The 37 probe/test top-level IOs stay on the unchanged `M68kFullCoreSynth` target. (§9.3) |
+| **D23** | The socket top exports **only** socket ports. The 37 probe/test top-level IOs stay on `M68kFullCoreSynth`, whose port surface and behaviour are unchanged. See also D29 for the AXI sidebands. (§9.3) |
 | **NOTED-1** | G9 (AXI in flight during reset): no work needed, the SoC already compensates. (§9.2) |
 | **NOTED-2** | G12 (bursts onto lite-only slaves): already error-terminated by the fabric, not corrupted. Not a task. (§9.5) |
 | **NOTED-3** | G14 (single-outstanding fabric): the I-cache's five refill IDs and any future multi-MSHR work deliver zero end-to-end benefit until the xbar is reworked. Expectation-setting only. (§9.6) |
+
+**Added by the 2026-08-18 design review of this spec.** Listed separately so the original
+D1-D23 numbering and its existing cross-references stay stable.
+
+| # | Decision |
+|---:|---|
+| **D24** | The **load**-side sizing/address derivation is a function of `(paddr[1:0], size)` alone. `DLoadCmd` carries no strobe and AXI reads have no byte enables, so WSTRB is the authoritative lane selector on **writes only**. (§3.3) |
+| **D25** | D6's sub-transaction decomposition **clamps** the derived byte range to the containing 16-byte line: `end = min(off + n, 16)`. The split FSM issues both slots at the *full* original size, so the range it presents is *not* line-contained on arrival and must be clamped rather than trusted. (§3.4) |
+| **D26** | An access whose bytes lie **inside one 4-byte group but are not naturally aligned within it** (e.g. a WORD at group offset 1) is emitted as a single `size=2` transaction at the group base. This is wrong on a byte-addressed peripheral and is an **accepted, explicit parity-with-v1 limitation**, not a silent gap. (§3.5) |
+| **D27** | Both table walkers gain a fail-closed ID guard on their response channels (`b.payload.id === WALK_WRITE`, `r.payload.id === WALK_READ`), matching the D-cache's existing discipline, so the arbiter's safety argument is uniform across all three merged masters. (§4.3) |
+| **D28** | A **new** kind-coded halt-reason channel is built from `RobPlugin`'s halt seam outward. D15 and D20 need to report *why* the core halted; today `rob.logic.coreHaltedIn` is a plain undiscriminated `Bool` and the kind codes are `DcachePlugin`-private. This is new scope, and a **second** debug-ctrl-plan touch point beyond `cpu_peripheral_reset`. (§6.4, §8.3, §10) |
+| **D29** | The socket-facing `Axi4Config` in `M68kSocketTop` sets `useProt`/`useCache`/`useLock`/`useQos`/`useRegion` **false**, so the sideband signals the socket does not declare do not exist on the socket boundary at all. (§9.3) |
+| **OPEN-1** | Whether `cpu_peripheral_reset`'s 518-cycle hold should also **gate dispatch/retire** the way v1's does. v1 gates both; this core's `RESET` is a pure NOP today. Needs explicit sign-off; the implementation plan may not silently pick either answer. (§9.4) |
 
 ---
 
@@ -205,6 +225,11 @@ Exactly three signals per master are permuted, and only these:
 | `axi_i` (256 b) | `r.data` | everything else |
 | `axi_d` (128 b) | `w.data`, `w.strb`, `r.data` | `aw.*`/`ar.*` (addr, id, len, size, burst), `b.*`, `r.id`/`r.resp`/`r.last` |
 
+"Untouched" above means *not permuted*; it does not mean *forwarded*. The `prot`/`cache`/
+`lock`/`qos`/`region` sidebands the core's `Axi4Config` defaults leave on are not part of the
+socket contract and do not cross this boundary at all — see **D29**/§9.3, which is a decision
+about the same connection site.
+
 Applying it to an address would be a bug; applying it twice would be a no-op that looks
 like a fix. The implementation must carry a comment at the single call site saying so, and
 a formal/directed test that a byte written at address A through `axi_d` is the byte the
@@ -257,35 +282,107 @@ Two independent failure modes against this SoC:
 
 Both D-cache command bundles already carry everything the derivation needs:
 
-- `DLoadCmd` (`DcacheTypes.scala:56-62`): full byte-granular `paddr`, `size`, `cacheMode`.
-- `DStoreCmd` (`DcacheTypes.scala:83-96`): full byte-granular `paddr`, `size`, `useStrb`,
+- `DLoadCmd` (`DcacheTypes.scala:55-61`): full byte-granular `paddr`, `size`, `cacheMode`.
+  **No strobe** — see D24/§3.3.2.
+- `DStoreCmd` (`DcacheTypes.scala:83-95`): full byte-granular `paddr`, `size`, `useStrb`,
   a 16-bit line-relative `strb`, `cacheMode`.
 
 The information is present at both AXI emission sites and is simply discarded when the
 transaction is formed. G5 is therefore a change local to `DcachePlugin`'s two INHIBITED
 emission paths, not a datapath change.
 
-### 3.3 The derivation (D4, D5)
+### 3.3 The derivation (D4, D5, D24)
 
-Mirroring the proven v1 rule (`axi_narrow_to_wide.v:33-51`), on the **core-side**
+The two directions derive the same thing from different inputs, because the two command
+bundles carry different information. Both derivations are stated for **one 4-byte group**;
+§3.4 (D6/D25) is what guarantees a transaction never spans more than one group.
+
+#### 3.3.1 Stores — from the core-side strobe
+
+Mirroring the proven v1 rule (`axi_narrow_to_wide.v:42-44`), on the **core-side**
 (pre-permutation) strobe of a single access, restricted to the containing 4-byte group:
 
 | Core-side strobe within the addressed longword | `AxSIZE` | Address presented |
 |---|---:|---|
-| exactly 1 bit set | 0 (1 B) | the access's full byte address, unmodified |
-| exactly 2 contiguous bits set | 1 (2 B) | byte address with bit 0 cleared |
+| exactly 1 bit set (`0001`/`0010`/`0100`/`1000`) | 0 (1 B) | the access's full byte address, unmodified |
+| exactly 2 contiguous bits set **at an even offset** (`0011`/`1100`) | 1 (2 B) | byte address with bit 0 cleared |
+| 2 contiguous bits set at an **odd** offset (`0110`) | 2 (4 B) | byte address with bits[1:0] cleared — see D26 |
 | anything else (3 or 4 bits, or sparse) | 2 (4 B) | byte address with bits[1:0] cleared |
 
-WSTRB remains the authoritative lane selector in all three cases — AXI permits sparse byte
-strobes at `size=2`, and `axi_narrow_to_wide.v:46-51` confirms the sparse case is designed
-to fall through exactly this way.
+WSTRB stays the authoritative lane selector on the **write** path in every row — AXI permits
+sparse byte strobes at `size=2`, and `axi_narrow_to_wide.v:47-50` confirms the sparse case is
+designed to fall through exactly this way.
 
-**D5 — why core-side.** Reversal within a nibble preserves popcount and preserves
-contiguity, but it does *not* preserve the offset at which a run starts. Deriving from the
-post-permutation strobe would produce the mirror-image address. The derivation must
-therefore run inside `DcachePlugin`, on the core's own byte-offset-indexed strobe, and the
-§2 permutation must be applied strictly afterwards, at the socket boundary. These two
-transforms are order-dependent and the implementation must say so at both sites.
+**One correction to v1's rule, made deliberately.** v1 lists `0110` alongside `0011`/`1100`
+as a two-contiguous-bit `awsize=1` case (`axi_narrow_to_wide.v:43`) and then clears address
+bit 0 to satisfy alignment. That pair is inconsistent: with `awsize=1` at an even address the
+transaction's active byte lanes are the group's bytes 0-1, while strobe `0110` asserts byte
+2 — a WSTRB bit outside the addressed transfer, which AXI4 forbids. This spec routes `0110`
+to the `size=2` group-base row instead, which is a well-formed transaction and is correct on
+memory (the strobe still selects bytes 1-2). It remains wrong on a byte-addressed peripheral;
+that residual is D26/§3.5 and is *functionally* the same limitation v1 has, so this is a
+legality fix rather than a behavioural divergence.
+
+#### 3.3.2 Loads — from `(paddr[1:0], size)` (D24)
+
+`DLoadCmd` (`DcacheTypes.scala:55-61`) has **no strobe field** — it carries `vaddr`, `paddr`,
+`size`, `cacheMode`, `token` and nothing else — and, more fundamentally, **AXI4 reads have no
+byte enables at all**: `ARSIZE` plus `ARADDR` *is* the entire lane selector on a read. So the
+load derivation cannot be strobe-phrased, and the write table's "WSTRB remains authoritative"
+escape hatch does not exist here. (v1 *appears* to derive its `arsize` from a strobe, but the
+strobe is manufactured inside `dcache.v` by the `m68k_mem_strb`/`arsize_from_wstrb` machinery
+purely from the access's own address and size — `axi_narrow_to_wide.v:52-58` — so it is the
+same information reaching the same decision by a longer route, not an extra input we lack.)
+
+For a load whose byte range within the group is `[gs, ge)` (group-relative, `0 ≤ gs < ge ≤ 4`,
+after the D6/D25 decomposition), with `n = ge - gs`:
+
+| Group-relative range | `AxSIZE` | Address presented | Bytes actually returned |
+|---|---:|---|---|
+| `n = 1` | 0 (1 B) | full byte address, unmodified | exactly the wanted byte |
+| `n = 2`, `gs` even (`[0,2)` or `[2,4)`) | 1 (2 B) | byte address with bit 0 cleared | exactly the wanted 2 |
+| `n = 2`, `gs` odd (`[1,3)`) | 2 (4 B) | byte address with bits[1:0] cleared | all 4 — D26 |
+| `n = 3` (`[0,3)` or `[1,4)`) | 2 (4 B) | byte address with bits[1:0] cleared | all 4 — §3.5 |
+| `n = 4` | 2 (4 B) | byte address with bits[1:0] cleared | exactly the wanted 4 |
+
+Equivalently, and this is the form to implement — stated over the **sub-range**, since after
+decomposition a sub-transaction's `n` is *not* the parent access's `size`:
+
+```
+AxSIZE = 0                       when n == 1
+AxSIZE = 1                       when n == 2 && base(0) == 0
+AxSIZE = 2                       otherwise
+ARADDR = base with the low AxSIZE bits cleared
+```
+
+where `base` is the sub-range's own start address. For a naturally-aligned access that needs
+no decomposition this collapses to the `size` field unchanged, which is the common case and
+costs nothing.
+
+Worked, in the core's own terms (all offsets line-relative, 16-byte line, LONG = 4 bytes):
+
+- `paddr(3:0) = 0x6`, `size = WORD`. Range `[6,8)`, one group (group 1), group-relative
+  `[2,4)`, `n = 2`, `gs = 2` even → `AxSIZE = 1` at `paddr` with bit 0 cleared = `0x6`.
+  Reads exactly bytes 6-7. On an 8-bit peripheral at `0x6` this touches one register.
+- `paddr(3:0) = 0x5`, `size = WORD`. Range `[5,7)`, one group (group 1), group-relative
+  `[1,3)`, `n = 2`, `gs = 1` odd → `AxSIZE = 2` at `0x4`. Reads bytes 4-7; the core keeps 5-6.
+  Four peripheral registers are touched. This is D26.
+- `paddr(3:0) = 0x2`, `size = LONG`. Range `[2,6)` — crosses the group boundary at 4, so D6
+  decomposes into `[2,4)` (`n=2`, `gs=2` even → `AxSIZE=1` at `0x2`) and `[4,6)` (`n=2`,
+  `gs=0` even → `AxSIZE=1` at `0x4`). Two well-formed sub-transactions, no over-read.
+- `paddr(3:0) = 0xD`, `size = LONG`. Range `[13,17)` — see §3.4; the clamp bounds it to
+  `[13,16)`, giving one group-3 sub-transaction with `n = 3` → `AxSIZE = 2` at `0xC`.
+
+**D5 — why core-side.** This applies to the store derivation, the only one with a strobe as
+an input. Reversal within a nibble preserves popcount and preserves contiguity, but it does
+*not* preserve the offset at which a run starts. Deriving from the post-permutation strobe
+would produce the mirror-image address. The derivation must therefore run inside
+`DcachePlugin`, on the core's own byte-offset-indexed strobe, and the §2 permutation must be
+applied strictly afterwards, at the socket boundary. These two transforms are
+order-dependent and the implementation must say so at both sites. The load derivation is
+immune to the ordering hazard for a different reason — its inputs (`paddr`, `size`) are
+never permuted at all (D3) — but it lives in the same place for the same structural reason:
+it needs the D6 sub-range, which only `DcachePlugin` has.
 
 **Standing-rule conformance.** Nothing in this derivation consults an address range. The
 only input that says "this is a device, not memory" is `cacheMode === INHIBITED`, which
@@ -294,7 +391,7 @@ comes from the MMU's page/TTR attributes on the access itself
 core may only reason from MMU-configured attributes and contemporaneous bus responses,
 never from a cached or assumed SoC decode map.
 
-### 3.4 The 4-byte-boundary case, and why v1's rule alone is not enough (D6)
+### 3.4 The 4-byte-boundary case, and why v1's rule alone is not enough (D6, D25)
 
 **This is an extension beyond the brief, made because the naive rule is provably wrong
 here.** v1's algorithm is complete *for v1* because v1's LSU never presents an access that
@@ -318,11 +415,49 @@ cacheMode-independent would split every misaligned cacheable access onto the rar
 replay FSM (`LsEuPlugin.scala:1492-1513`) and cost real IPC on the hot path.
 
 **D6 — where it does go.** Inside `DcachePlugin`'s INHIBITED emission, as a small
-**two-sub-beat sequencer**:
+**two-sub-beat sequencer** over a byte range the sequencer computes for itself:
 
-- The byte range of an INHIBITED access is, after `s1CrossLine` splitting, contained in one
-  16-byte line, so it spans **at most two** 4-byte groups. The sequencer therefore needs at
-  most two sub-transactions, never a loop.
+- **The input range must be clamped, not trusted (D25).** With `off = paddr(3 downto 0)` and
+  `n = sizeBytes(size)`, the sequencer's range is
+
+  ```
+  start = off
+  end   = min(off + n, 16)          // D25 — the clamp
+  ```
+
+  and the sub-transactions are the intersections of `[start, end)` with the two 4-byte
+  groups it can touch. Because `end ≤ 16` by construction, `[start, end)` lies inside one
+  16-byte line and therefore meets **at most two** 4-byte groups: the sequencer needs at most
+  two sub-transactions, never a loop. **That bound holds because of the clamp, not because
+  the incoming range was already line-contained** — it is not.
+
+- **Why it is not already line-contained (the load path).** `LsEuPlugin` issues *both* slots
+  of a cross-boundary split at the **full original size**: `dcache.loadCmd.payload.size :=
+  Mux(useSplitCmd, llReg.size, alignedCmd.size)` (`LsEuPlugin.scala:759`) has no slot-B arm,
+  while only the *address* is switched (`llReg.bDone ? llReg.addrB : llReg.vaddr`,
+  `:751-755`). Slot A therefore arrives at the D-cache as `(paddr = the original misaligned
+  address, size = the original size)` with `off + n > 16`, and slot B as `(paddr = the next
+  line base, size = the original size)`. Deriving group indices from an unclamped `off + n`
+  would produce a group index of 4 — i.e. **a sub-transaction at line offset 16, outside the
+  line**. Worked: `off = 13`, `size = LONG` → `[13,17)` → groups 3 **and 4**; group 4's base
+  is `paddr - 13 + 16`, the next line. When the containing line is the **last line of its
+  page**, that next line is the first line of the **next physical page** — an address the core
+  never translated. And that case is not a corner of a corner: `s1CrossPage` *implies* this
+  one. `lineOff = pageOff mod 16`, so `pageOff + n > 4096` forces `lineOff + n > 16`
+  (`LsEuPlugin.scala:441-443`) — **every** cross-page access is one of these escaping
+  derivations, and every one of them escapes into an untranslated page. This spec would have
+  *introduced* a wrong-address bus transaction — the precise class of bug §3 exists to prevent
+  — since today's REFILL path only ever emits the containing line base
+  (`DcachePlugin.scala:1194-1243`). With the clamp, `[13,17)` becomes `[13,16)`, one group-3
+  sub-transaction, and slot B independently covers the remainder at the next line under its
+  own, separately translated `paddrB`.
+
+- **Stores are unaffected either way**, but the clamp is uniform and applies to them too: the
+  SQ's split-slot form already carries a 16-bit **line-relative** strobe with `useStrb`
+  (`DcacheTypes.scala:78-89`), so a store slot's byte range is contained by construction and
+  the clamp is a no-op on it. Stating the rule once for both paths avoids a store/load
+  asymmetry in the sequencer.
+
 - **Loads:** issue sub-transaction A (the lower group's bytes) and, if the range extends
   past that group, sub-transaction B. Merge each response into `missLine` at its own byte
   offset before the existing `REPLAY` path runs. `loadRspPort.payload.data`'s extraction at
@@ -336,14 +471,65 @@ replay FSM (`LsEuPlugin.scala:1492-1513`) and cost real IPC on the hot path.
   `missCmode === INHIBITED` / `stS3Inhibited`), and one extra bus round trip on an
   already-slow, already-serialized MMIO path.
 
-**Deliberate residual, recorded not buried.** A *3-byte* INHIBITED access (reachable only
-through the SQ's explicit-strobe split-slot form, `DcacheTypes.scala:88-92`) still resolves
-to a `size=2` sparse-strobe transaction within its group. That is correct for memory and
-wrong for a byte-addressed peripheral. No 68k instruction generates a 3-byte access to an
-8-bit device in any Mac driver, and real hardware would also need multiple cycles. The
-implementation must carry a simulation assertion flagging it rather than leaving it silent.
+### 3.5 Recorded residuals of the D4/D6 design
 
-### 3.5 What does *not* change
+Everything in this list is a case where the emitted transaction is **legal AXI and correct
+against memory**, but touches more of a byte-addressed peripheral's address space than the
+architectural access asked for. None is silently handled; each is recorded here, and §13
+states the corresponding expected — not forbidden — behaviour. All are INHIBITED-path only,
+and all ranges below are **post-D6-decomposition sub-ranges**, i.e. already confined to a
+single 4-byte group (a range that straddles a group boundary is split first and each half
+lands in this list on its own merits, or in neither half).
+
+1. **3-byte store range.** Reachable through the SQ's explicit-strobe split-slot form
+   (`DcacheTypes.scala:78-89`), whose byte count need not be a clean 1/2/4. It resolves to a
+   `size=2` transaction at the group base with a 3-bit strobe. Correct for memory, three
+   registers touched instead of one on an 8-bit device.
+
+2. **3-byte load range.** Loads have no strobe (D24), so this one is strictly worse than its
+   store twin: the 3-byte range becomes a **4-byte read at the group base**, and on an 8-bit
+   peripheral — where `peripheral_bus.v:68-75` broadcasts the selected byte into all four
+   lanes of the word — that is one register's value read **and side-effected up to 4 times**,
+   with the core keeping the 3 bytes it wanted. A 3-byte load range arises from the D6
+   decomposition itself (e.g. the `off = 13`, `size = LONG` case above clamps to `[13,16)`),
+   so unlike case 1 it is not confined to the SQ's split-slot form.
+
+3. **Slot-B over-read on a cross-line/cross-page load.** Slot B arrives as `(paddr = next
+   line base, size = the *original* size n)` — `LsEuPlugin.scala:759` does not narrow it —
+   so its clamped range is `[0, n)` while only `[0, off + n − 16)` is architecturally needed.
+   Worked: `off = 13`, `size = LONG` → slot B needs byte 0 alone but is derived as `[0,4)` →
+   `AxSIZE = 2` at the next line's base. Up to `n − 1` bytes are read beyond the access. The
+   over-read is contained *within* slot B's own translated page (offsets 0-3 of its first
+   line), so it is never a wrong-address transaction — only a wider one. A future narrowing
+   could use the slot-B marker the load token already carries
+   (`(False ## llReg.bDone ## robId)`, `LsEuPlugin.scala:762-765`) to derive the true
+   remainder; that is **not decided here**, because it makes `DcachePlugin` depend on a
+   `DLoadToken` bit that is presently an LS-EU-private encoding.
+
+4. **In-group misalignment (D26).** An access whose bytes lie inside a single 4-byte group
+   but not naturally aligned within it — canonically a WORD at group offset 1 (`[1,3)`) —
+   is emitted as `size=2` at the group base and touches all four registers of the group.
+   D6 does not help: there is no group boundary to split at. Splitting *this* into two
+   byte transactions would be a genuine fix, and is **deliberately not taken**:
+
+   - **v1 has the same limitation**, so this is parity, not a new regression: v1's rule maps
+     strobe `0110` to `awsize=1` at the group base (`axi_narrow_to_wide.v:43`), which reaches
+     the same wrong registers *and* is a malformed AXI transaction on top (§3.3.1). This
+     spec's version is at least well-formed.
+   - The cost of fixing it is a general N-way byte sequencer in `DcachePlugin`'s INHIBITED
+     path instead of the bounded two-sub-transaction one, on a path that today has no
+     sequencer at all.
+
+   This is therefore an **explicit accepted limitation with sign-off recorded as D26**, not
+   an oversight. If a real driver is ever found to do a misaligned word access to an 8-bit
+   Mac peripheral, D26 is the item to revisit, and the fix is the general sequencer.
+
+The implementation must carry a **simulation assertion that fires (as a warning, not a
+failure) on cases 1-4**, so that any real occurrence is loud in the logs rather than silent.
+An assertion that *forbids* them would contradict D26 and case 3, which are accepted
+behaviour, not bugs to be trapped.
+
+### 3.6 What does *not* change
 
 Cacheable refills, evictions, CPUSH writebacks and table-walk descriptor accesses keep
 `size=4` at a 16-byte-aligned address. That is legal, is what the DDR path wants
@@ -406,7 +592,7 @@ lock. A full ID demux would require the deliberately-unbuilt V2a.2/V2a.3 infrast
 tagging `DLoadRsp`/`busFaultResp`/`inhibitedResp`/`storeAck` — for zero end-to-end gain on
 this fabric, while adding regression surface to the D-side load path. See §9.6.
 
-### 4.3 Why G3's ID collision evaporates (D10)
+### 4.3 Why G3's ID collision evaporates (D10, D27)
 
 ITLB and DTLB both emit AR=2 / AW=3 (`AxiIds.scala:67,69`). Under D8 that is inert, for two
 independent reasons:
@@ -418,15 +604,44 @@ independent reasons:
    single-outstanding per direction, so at most one walker transaction exists on `axi_d` at
    a time. There is no ambiguity for the ID to resolve.
 
-**D10 — the plugins' own ID logic stays.** The D-cache demultiplexes its *own three* write
+**D10 — the D-cache's own ID logic stays.** The D-cache demultiplexes its *own three* write
 issuers by ID (`D_STORE=1` store write-through at `DcachePlugin.scala:1957`, `D_PUSH=2`
 eviction writeback at `:1210`, `D_EVICT=4` maintenance writeback at `:1676`), deliberately
 fail-closed
 (`DcachePlugin.scala:1948-1956`: "an unrecognized id simply not ack anything — a hung drain,
 which is loud and debuggable, instead of a silent spurious ack"). The arbiter delivers `B`
 to the D-cache only when the D-cache is the write owner, so those compares keep working
-unchanged and keep their fail-closed property. The arbiter is strictly additive; it removes
-no existing check.
+unchanged and keep their fail-closed property. **For the D-cache, the arbiter is strictly
+additive: it removes no existing check.**
+
+**D27 — for the walkers it is not additive, and that changes the safety argument.** The
+walkers have **no ID check at all** today. Both TLB plugins accept every `B` beat
+unconditionally — `walkerAxi.b.ready := True` (`ItlbPlugin.scala:75`, `DtlbPlugin.scala:80`)
+with the U/M drain ack taken straight off that handshake (`ItlbPlugin.scala:271`,
+`DtlbPlugin.scala:340`) — and `TableWalker` likewise asserts `io.axi.r.ready := True`
+whenever it is waiting for a descriptor (`TableWalker.scala:114`). Today that is safe only
+because each walker is a *physically separate master* and the only responses reaching it are
+its own. After the merge it is the arbiter's owner latch, and nothing else, that stands
+between a walker and a response belonging to the D-cache or the reset-vector reader. So for
+two of the three merged masters the arbiter is not a redundant second line of defence — it is
+the **only** one.
+
+That is an acceptable position (the owner latch is exactly the right mechanism, and §4.4's
+assertions pin it), but the asymmetry is not acceptable to leave unstated, because a future
+reader would otherwise take "each plugin keeps its own demux" at face value. **D27** therefore
+adds the missing guard so the argument is uniform:
+
+- `ItlbPlugin` / `DtlbPlugin`: `walkerAxi.b.ready := (walkerAxi.b.payload.id === AxiIds.WALK_WRITE)`
+  in place of the unconditional `True`, with the drain ack unchanged (it is already gated on
+  the handshake, so a rejected beat simply does not ack).
+- `TableWalker`: qualify the descriptor-wait `io.axi.r.ready := True` with
+  `io.axi.r.payload.id === AxiIds.WALK_READ`.
+
+Cost is one 4-bit compare per site and no state. The property gained is the D-cache's own
+stated one, verbatim: an unrecognised ID hangs loudly instead of silently acking. Note this
+does **not** disambiguate ITLB from DTLB — they share AR=2/AW=3 (`AxiIds.scala:67,69`) and
+D8's owner latch is what separates them; D27 only fail-closes the *class* boundary between
+walker traffic and everything else.
 
 The one thing the implementation **must not** do is renumber `WALK_READ`/`WALK_WRITE` to
 "fix" the collision. Under D8 that would be churn with no correctness content, and it would
@@ -590,15 +805,13 @@ almost certainly be fine — the redirect only restarts *fetch*, many cycles bef
 could read A7 at issue — but "almost certainly fine" is not a property worth having in the
 boot path, and the cost is one cycle once per power-on.
 
-### 6.4 Bus error on the vector fetch (D15)
+### 6.4 Bus error on the vector fetch (D15, D28)
 
 v1 presents `pd_fault` at `pc=0` so commit raises bus-error vector 2
-(`if_stage.v:16-18`). **D15 diverges deliberately:** a non-OKAY vector-0 response latches
-the existing sticky `coreHalted` diagnostic channel (`FullCoreSynth.scala` `coreHaltedIn`,
-the same channel the D-cache's `diagFaultPulse` kinds 0/2/3 use) with a new kind code, and
-the core stops.
+(`if_stage.v:16-18`). **D15 diverges deliberately:** a non-OKAY vector-0 response latches the
+sticky `coreHalted` state and the core stops.
 
-Rationale, in order of weight:
+**D15 rationale**, in order of weight:
 
 1. **It is what real hardware does.** A bus fault taken during reset exception processing is
    a double bus fault on a real 68040; the part halts. Vector 2 is v1's divergence, not
@@ -611,6 +824,38 @@ Rationale, in order of weight:
    with no architectural recipient (`DcachePlugin.scala:1680-1683`: "Imprecise DIAGNOSTIC
    only, per the design's locked decision that a writeback error is a diagnostic crash and
    not an architectural trap").
+
+**D28 — the halt-*reason* channel D15 needs does not exist and must be built.** "Halts" is
+only half a diagnostic; an operator staring at a wedged core has to know *why*. The seam that
+would carry that is today a plain, undiscriminated `Bool`: `RobPlugin.scala:373-376` declares
+`coreHaltedIn` and latches `coreHalted` from it, and `FullCoreSynth.scala:364` drives it as
+`dc.diagFault || exc.fsXlateFault`. The kind codes are `DcachePlugin`-**private** —
+`diagFaultPulseKind` and the sticky `diagFaultKind` register (`DcachePlugin.scala:272-288`,
+`:1215`, `:1304`, `:1682`) never leave that plugin, and `FullCoreSynth.scala:356-363` says so
+in as many words: *"nothing downstream distinguishes WHICH producer fired, so a plain OR is
+exactly right"*. That was true with two producers that both meant "diagnostic crash". It stops
+being true here: D15 and D20 add producers whose whole point is to be told apart from each
+other and from the D-cache's.
+
+So D28 is **new scope**, not a reuse of something existing:
+
+- Widen the halt seam from `Bool` to a `{valid, reason}` pair (or an equivalent one-hot),
+  owned by `RobPlugin` alongside `coreHaltedIn`, with a sticky first-wins `reason` register
+  so the *first* halt cause survives any later one. `coreHalted`'s existing behaviour
+  (`headReady` forced False, `interruptPending` blocked, frontend quiesced) is unchanged;
+  this adds an observation, not a control path, so it cannot perturb the halt semantics any
+  existing test depends on.
+- Allocate reason codes for: the two existing producers (D-cache diagnostic fault, FSAVE/
+  FRESTORE translation fault), the D15 reset-vector bus error, and the D20 arbiter
+  bounded-grant expiry. The D-cache's private `diagFaultKind` stays private; it is a
+  *sub*-code under the D-cache reason, not a peer.
+- **Second debug-ctrl touch point.** Wherever this reason becomes CSR-observable it is a
+  `dbg_axi` register, and §10 already establishes that the debug-ctrl spec owns that port and
+  register map. This spec does **not** design the debug-ctrl side; it flags the seam so the
+  debug plan's port/register-map ownership list accounts for it, exactly as §9.4 does for
+  `cpu_peripheral_reset`. Until that lands, the reason is observable in simulation
+  (`simPublic`, matching `coreHaltedIn`'s existing treatment at `RobPlugin.scala:374`) and
+  that is sufficient for every §13 obligation.
 
 ### 6.5 Parameterisation (D16)
 
@@ -762,8 +1007,10 @@ the same "without making progress" formulation `axi_narrow_to_wide.v:97-101` use
 - **On expiry it does not fabricate a response.** Synthesising a `B` would be caught by the
   D-cache's fail-closed ID demux in the best case and would silently ack a store that never
   landed in the worst. Synthesising an `R` would inject garbage into a refill. Instead it
-  latches the sticky `coreHalted` diagnostic with its own kind code, exactly as §6.4 and the
-  D-cache's `diagFaultPulse` policy do.
+  latches the sticky `coreHalted` state with its own **reason code on D28's new halt-reason
+  channel** — the same channel §6.4 builds for D15, and the reason the channel has to exist
+  at all: an arbiter wedge and a reset-vector bus error are the two halts an operator most
+  needs to tell apart, and today's seam cannot express either.
 - **Rationale for halting rather than recovering:** an arbiter cannot construct a truthful
   completion on behalf of its owner, and this project's established policy for an
   un-actionable bus condition is a loud diagnosable halt. A 2e9-cycle expiry on this fabric
@@ -805,7 +1052,7 @@ the reset net's fanout changes with the new plugins.
 Confirmed no work needed. The SoC already compensates: `fpga_top_cpu.vh:77,108-110` and
 `axi_xbar.v:207-222,805-845`. Recorded so a future reader does not re-open it.
 
-### 9.3 G10 — test-only top-level IOs (D23)
+### 9.3 G10 — top-level port surface (D23, D29)
 
 **The scoping memory's "177 test-only top-level IOs" is imprecise and is corrected here.**
 177 is the *total* top-level port count of `M68kFullCoreSynth`, the great majority of which
@@ -817,14 +1064,46 @@ are the four AXI masters. The non-AXI ports number **42**, of which 5 are real
 - `redirect_valid`/`redirect_payload`, `resume_valid`/`resume_payload` — 4
 - `slot1ValidOut`, `IcachePlugin_logic_invalidateAll`, `RobPlugin_logic_flush_valid` — 3
 
+**A second, separate over-export the scoping pass did not name: AXI sideband signals.** The
+core's `Axi4Config`s are declared with only `addressWidth`/`dataWidth`/`idWidth`
+(`DcachePlugin.scala:53`, `IcachePlugin.scala:39`, `TableWalker.scala:37`), so SpinalHDL's
+defaults leave `useProt`/`useCache`/`useLock`/`useQos`/`useRegion` **on**, and the netlist
+duly carries them: `generated/M68kFullCoreSynth.v:107-116` exports
+`DcachePlugin_logic_axi_aw_payload_{region,lock,cache,qos,prot}` alongside
+`{addr,id,len,size,burst}`. `cpu_socket.vh:98-142` declares **none** of them — the socket's
+`axi_i`/`axi_d` groups are exactly `{id, addr, len, size, burst, valid, ready}` plus
+`{data, strb, last}` / `{id, data, resp, last}`.
+
+Worse than merely undeclared: the core drives them to **`x`**
+(`M68kFullCoreSynth.v:174916,175040-175043`, `assign … _prot = 3'bxxx;` and siblings, and the
+same for `IcachePlugin_logic_axi_ar_payload_{cache,prot}` at `:107706,107708` — line numbers
+in a *generated* file drift on every regeneration, so the signal names are the stable
+citation here, not the line numbers). They are
+genuine don't-cares — the core has no notion of protection, cacheability-hint or QoS to
+express — so anything downstream that read them would be reading X.
+
+**D29:** the socket-facing ports in `M68kSocketTop` are declared with an `Axi4Config` that
+sets `useProt = useCache = useLock = useQos = useRegion = false`, so those signals **do not
+exist at the socket boundary at all**. The plugins' internal configs are unchanged; the
+sidebands terminate at the socket top's connection, which is already the one place per master
+where the §2 permutation makes the connection field-by-field rather than a bulk `<>`. This is
+chosen over the alternative of driving socket-side constants (`prot = 0b000`, `cache =
+0b0000`, …) precisely because the socket declares no such ports: inventing them would export
+a wider surface than the contract, contradicting D23's "only socket ports" rule in the same
+breath as satisfying it. It also removes X-driven top-level outputs from the socket surface,
+which is worth having on its own.
+
 **D23:** `M68kSocketTop` exports only socket ports; none of the 37 crosses it.
-`M68kFullCoreSynth` is left **completely unchanged** as the OOC-synth / FMax-gate target, so
-the probe anchoring that keeps the retire path from being pruned there is preserved. In the
+`M68kFullCoreSynth`'s **port surface and behaviour are left unchanged** as the OOC-synth /
+FMax-gate target, so the probe anchoring that keeps the retire path from being pruned there is
+preserved. (Its wiring file is not frozen — D28 widens the halt seam it drives — but no port
+is added, removed or tied off, and D16's `enable=false` keeps the behaviour identical; see
+§10's last bullet.) In the
 socket top the anchor is the socket itself — real AXI masters, IPL in, `ipl_ack` out — so
 nothing prunes and no artificial anchoring is needed. The `redirect`/`resume` ports in
 particular become internal under D12/D16 rather than being tied off.
 
-### 9.4 G11 — `cpu_peripheral_reset` ownership (D22, SOC-2)
+### 9.4 G11 — `cpu_peripheral_reset` ownership (D22, SOC-2, OPEN-1)
 
 This is a real socket port: `m68k_axi_wrapper.v:683` binds `m68k_core.v`'s `cpu_reset_out`
 (`:128-130`, "68040 RESET instruction external indication. This does not reset the CPU core
@@ -841,12 +1120,50 @@ RESET is an internal NOP"). The RESET instruction is fully decoded and framed al
 (`OperationDecoder.scala:583-592`, `PredecodeWord.scala:548`,
 `MicroOpAssembler.scala:2170-2172`), so this is a new output on an existing, exercised arm.
 
-Width: a real 68040 asserts RSTO for 512 clocks. The implementation plan must read
-`m68k_core.v`'s `cpu_reset_out` driver and **match v1's observed width**, defaulting to 512
-core-clock cycles if v1 emits a bare pulse — the SoC consumer is a reset tree, and a
-one-cycle pulse into a reset tree is the kind of thing that works in simulation and not on
-hardware. Lock-step behaviour is unaffected either way: the output is not architectural
-state and Musashi models nothing here.
+**Width: v1's driver was read, and it is a 518-cycle level — not a pulse.** `commit.v:2081-2101`
+loads a down-counter `reset_instr_count` with `RESET_INSTR_CYCLES - 1` when the RESET
+instruction retires and holds `cpu_reset_out` high until it expires:
+`localparam integer RESET_INSTR_CYCLES = 518;`, commented *"MAME's 68040 model charges 518
+clocks for RESET. Holding the core for the same interval also exceeds the 68040 RSTO minimum
+of 124 clocks."* **D22 copies 518 verbatim**, for the same reason D20 copies its bound rather
+than re-deriving it. There is no pulse case to default around, so the earlier
+"512 cycles if v1 emits a bare pulse" fallback is withdrawn — the number is 518 and it is
+measured, not assumed.
+
+**OPEN-1 — v1's hold also gates dispatch and retire, and whether to reproduce that is
+undecided.** In v1 the same `cpu_reset_out` level is an *internal* stall as well as an
+external output, at four separate sites:
+
+| Site | Effect |
+|---|---|
+| `commit.v:1283` (`can_commit`) | no instruction retires while the level is high |
+| `commit.v:1321` (`can_commit_irq`) | no interrupt is taken while the level is high |
+| `m68k_core_fetch.vh:852` (`q_dispatch_fire`) | no µop dispatches |
+| `m68k_core_fetch.vh:1038` (`rn_ready`) | rename stops accepting |
+
+So on v1 a `RESET` instruction costs the machine 518 cycles of full quiescence, matching the
+518 clocks MAME charges. This core's `RESET` is a pure NOP today
+(`ExceptionUnit.scala:1830-1833`: *"The external reset line is not modeled for lock-step;
+RESET is an internal NOP"*), so implementing D22 as an output alone would assert
+`cpu_peripheral_reset` for 518 cycles **while the core keeps executing** — legal for the SoC
+(the output is a reset tree input, not a handshake) but a real behavioural divergence from
+v1 and from the timing a driver written against a 68040 may assume between `RESET` and its
+next peripheral access.
+
+The two answers, neither taken here:
+
+- **Reproduce the hold.** Faithful to v1 and to the 68040's own timing; costs a
+  dispatch/retire gate on a commit-side signal, which is a path the FMax campaign has
+  repeatedly found sensitive, and it must be proven not to deadlock against a
+  precise-drain/exception window that is itself blocking retire.
+- **Output only.** Zero risk to the existing pipeline and zero FMax exposure; diverges from
+  v1's observable timing and leaves a driver's post-`RESET` delay assumption unenforced.
+
+This needs explicit sign-off before the implementation plan writes the task, and the plan
+**must not** pick silently — the seam is small, but the first option touches the retire path.
+Lock-step behaviour is unaffected by the *output* either way (it is not architectural state
+and Musashi models nothing here); it would be affected by the *hold*, which changes cycle
+counts but not architectural results, so the lock-step comparison stays valid under both.
 
 **SOC-2:** add `cpu_peripheral_reset` to `cpu_socket.vh` §6. A small doc fix, worth doing
 regardless of what else happens, since the header is currently authoritative-but-wrong.
@@ -890,9 +1207,15 @@ serializing behaviour (D8) therefore costs nothing measurable.
 - **`dbg_axi`** — the CPU-exported debug/control AXI-Lite slave (`cpu_socket.vh:145-162`).
   Owned entirely by `docs/superpowers/specs/2026-08-09-debug-ctrl-jtag-repl-design.md` and
   its Stage 0/1 plan. Nothing here adds, removes, or reinterprets any part of it. The two
-  designs touch at exactly one point — `cpu_peripheral_reset` (§9.4), which this spec claims
-  and the debug plan's port list omits — and that claim is made explicitly so neither plan
-  can assume the other owns it.
+  designs touch at exactly **two** points, both flagged rather than designed here, so neither
+  plan can assume the other owns them:
+  1. `cpu_peripheral_reset` (§9.4/D22) — claimed by *this* spec; the debug plan's port list
+     omits it.
+  2. The **halt-reason channel** D28 builds (§6.4). This spec owns building the channel from
+     `RobPlugin`'s halt seam outward and allocating its reason codes. Whatever makes it
+     readable over `dbg_axi` is a debug-ctrl register and belongs to that plan — but its
+     port/register-map ownership list has to account for it, which today it does not, because
+     the channel does not exist yet. Nothing in §13 depends on the CSR half.
 - **The SoC-fabric control group** (`cpu_cold_reset_pulse`, `cpu_cold_reset_hold`,
   `cpu_ram_window_lg2`, `cpu_mon_sense`, `init_done_seen`, `cpu_socket.vh:170-176`). These
   are debug-CSR-owned outputs; the debug-ctrl spec §15.1 already assigns them.
@@ -900,7 +1223,13 @@ serializing behaviour (D8) therefore costs nothing measurable.
   own rules, tied to v1's internal signal set. Not reproduced.
 - **SoC address decode, ROM overlay policy, DDR/L2 behaviour.** Consumed as facts here,
   never assumed as a map (see the standing-rule conformance note in §3.3).
-- **Any change to `M68kFullCoreSynth`.** It stays exactly as it is (§9.3).
+- **Any change to `M68kFullCoreSynth`'s port surface or behaviour.** It stays exactly as it
+  is as the OOC-synth/FMax-gate target (§9.3): no port added, none removed, none tied off.
+  Its *wiring file* is not frozen — D28 widens the halt seam it drives at
+  `FullCoreSynth.scala:364`, and D27 touches the walkers it instantiates — but every such
+  change must be behaviour-identical with the socket-only plugins absent (D16's `enable=false`
+  elaborates them away), which the "`enable=false` leaves every existing test bit-identical"
+  obligation in §13 is what actually enforces.
 
 ---
 
@@ -910,12 +1239,20 @@ serializing behaviour (D8) therefore costs nothing measurable.
 
 Implementable and testable today, in dependency order:
 
-1. §2 byte-order permutation + `M68kSocketTop` skeleton (D1-D3).
-2. §4 merge arbiter (D7-D10) and its bounded-grant watchdog (D20).
-3. §3 MMIO sizing (D4-D6) — independent of 1 and 2, but its verification wants 1 in place.
-4. §6 reset-vector fetch (D12-D16) — depends on 2 for its read owner.
-5. §7 `ipl_ack` (D17-D18).
-6. §9.1 reset naming (D21), §9.3 port surface (D23), §9.4 `cpu_peripheral_reset` (D22).
+1. §2 byte-order permutation + `M68kSocketTop` skeleton (D1-D3), with the socket-facing
+   `Axi4Config` narrowed per D29.
+2. §6.4 **halt-reason channel** (D28) — small, and both 3 and 5 below report through it, so it
+   comes first rather than being retrofitted twice. This is the one item of *new scope* the
+   design review added; it is not a reuse of anything existing.
+3. §4 merge arbiter (D7-D10), the walkers' fail-closed ID guard (D27), and the bounded-grant
+   watchdog (D20, reports via 2).
+4. §3 MMIO sizing (D4-D6, D24-D26) — independent of 1 and 3, but its verification wants 1 in
+   place.
+5. §6 reset-vector fetch (D12-D16) — depends on 3 for its read owner and on 2 for D15.
+6. §7 `ipl_ack` (D17-D18).
+7. §9.1 reset naming (D21), §9.3 port surface (D23/D29), §9.4 `cpu_peripheral_reset` (D22).
+   **§9.4 cannot be written as a task until OPEN-1 is signed off**, since the two answers have
+   different blast radii (output-only vs. a retire-path gate).
 
 All of this can be verified in this repo against a socket-side simulation model that
 implements the SoC's byte-lane convention and sizing rules, before any hardware session.
@@ -976,7 +1313,7 @@ brief asked for.
    simply gain an INHIBITED term. §3.4 (D6) extends the design with a two-sub-beat sequencer
    inside `DcachePlugin`'s INHIBITED path. This is the one place where following the brief
    literally would have shipped a known-wrong result, so it is called out rather than folded
-   in quietly. §3.4 also records the residual 3-byte case that even D6 does not fix.
+   in quietly. §3.5 records the residuals that even D6 does not fix.
 
 Additionally noted, neither a correction to the source nor a decision:
 
@@ -989,6 +1326,29 @@ Additionally noted, neither a correction to the source nor a decision:
   supersedes it with 2e9 because `sd_ctrl` is the larger downstream bound. A reader who
   stops at the first block will reproduce a bug the file documents being introduced twice.
   §8.1 and D20 are written to prevent that here.
+
+### Corrections applied after the 2026-08-18 design review of *this spec*
+
+The review re-derived every claim from the real sources rather than checking internal
+consistency, and found one Critical error and six gaps in the spec as first written. All
+seven are fixed above; they are listed here so a future reader can tell which parts of this
+document were revised and why, and so the same mistakes are not reintroduced.
+
+| # | What was wrong | Where it is now correct |
+|---|---|---|
+| **C1** | §3.4 asserted that an INHIBITED access is "after `s1CrossLine` splitting, contained in one 16-byte line". **False on the load path** — `LsEuPlugin.scala:759` issues *both* split slots at the full original size, so slot A arrives with `off + n > 16`. Deriving groups from that unclamped range yields a sub-transaction one line past the access — and every cross-page access forces exactly that geometry (`pageOff + n > 4096` implies `lineOff + n > 16`), so that line is the first line of the **next physical page**, an address the core never translated. Implementing the spec literally would have *created* a wrong-address bus transaction that does not exist today. | §3.4's clamp `end = min(off + n, 16)` (**D25**), with the two-sub-transaction bound now derived *from* the clamp instead of from the false premise; the slot-B consequence recorded as §3.5 case 3. |
+| **I1** | §3.3 had no load-side derivation and claimed WSTRB was "the authoritative lane selector in all three cases". AXI reads have **no byte enables**, and `DLoadCmd` (`DcacheTypes.scala:55-61`) has no strobe field. | §3.3 split into 3.3.1 (stores, strobe) and 3.3.2 (loads, `(paddr[1:0], size)`, **D24**); the WSTRB claim scoped to writes. |
+| **I2** | The "residual 3-byte case" was narrower than reality and in-group misalignment was unrecorded. | §3.5 now lists four residuals: 3-byte store, 3-byte **load** (no strobe → 4-byte over-read), slot-B over-read, and in-group misalignment as an explicit parity-with-v1 decision (**D26**). §13's assertion language relaxed to match (see below). |
+| **I3** | §4.3 claimed the arbiter is "strictly additive; removes no existing check" and that each plugin's demux is "preserved untouched". True for the D-cache; **false for the walkers**, which accept `b`/`r` unconditionally (`ItlbPlugin.scala:75`, `DtlbPlugin.scala:80`, `TableWalker.scala:114`) and have no ID check at all — for them the arbiter is the *only* protection. | §4.3 states the distinction; **D27** adds the near-free fail-closed guard so the safety argument is uniform. |
+| **I4** | D15/D20 reused "the existing sticky `coreHalted` diagnostic … with a new distinct kind code, the same channel the D-cache's `diagFaultPulse` kinds use". No such channel exists: the seam is a plain `Bool` (`RobPlugin.scala:373-376`) and the kind codes never leave `DcachePlugin`. | §6.4's **D28** — build the channel; new scope; second `dbg_axi` touch point, flagged in §10 and in the §11.1 ordering. |
+| **I5** | D22 allowed "defaulting to 512 core-clock cycles if v1 emits a bare pulse". v1 emits a **518-cycle level** (`commit.v:2081-2101`) that also **gates dispatch and retire** at four sites. | §9.4 states 518 as measured fact; the pulse fallback is withdrawn; the dispatch-gating question is **OPEN-1**, requiring sign-off. |
+| **I6** | Nothing said what happens to `awprot`/`arprot`/`awcache`/`arcache`/`awlock`/`arlock`/`awqos`/`arqos`/`awregion`/`arregion`, which the core emits (as `x`) and `cpu_socket.vh` does not declare. | §9.3's **D29** — narrow the socket-facing `Axi4Config` so they do not exist at the boundary; cross-referenced from §2.3. |
+
+Verified-correct and therefore **not** touched by that pass, recorded so they are not
+re-litigated: the §2.2 byte-order transform (independently re-derived from scratch, three
+worked examples), D9's arbiter-deadlock argument, the standing no-SoC-address-map-assumption
+conformance in §3.3, and the three §12 self-corrections it spot-checked (ROM-overlay,
+177-vs-37 ports, the superseded watchdog value).
 
 ---
 
@@ -1007,13 +1367,27 @@ omit a class of check.
 - Structural: the permutation appears exactly once per master, and never on an address.
 
 **MMIO sizing (§3)**
-- Byte/word/long INHIBITED stores at every offset 0-15 produce a legal `size`/address pair
-  by AXI's own alignment rule.
-- A byte read of a byte-addressed device register touches that register and no other
-  (checked against a model with read-to-clear side effects on all four registers in the
-  longword).
+- Byte/word/long INHIBITED stores **and loads** at every offset 0-15 produce a legal
+  `size`/address pair by AXI's own alignment rule, and every asserted WSTRB bit lies inside
+  the addressed transfer (the §3.3.1 `0110` correction — v1 fails this one).
+- A byte read *or write* of a byte-addressed device register touches that register and no
+  other (checked against a model with read-to-clear side effects on all four registers in the
+  longword). **Scope:** naturally-aligned accesses. The accepted residuals of §3.5 are
+  excluded and get their own expected-behaviour checks below — this obligation and D26 would
+  otherwise be jointly unsatisfiable, and the point of D26 is that the limitation is chosen,
+  not that the check is impossible.
 - An INHIBITED access crossing a 4-byte boundary produces exactly two sub-transactions, each
   naturally aligned, and the merged result equals the memory content (D6).
+- **D25, directed and specifically adversarial:** for every `off` in 12-15 and every size
+  that makes `off + n > 16`, on both the cross-line and the cross-page geometry, **no AXI
+  address is emitted outside the 16-byte line the sub-transaction belongs to**, and in
+  particular none lands in the next physical page from slot A. This is the C1 regression and
+  the check that would have caught it.
+- **Expected-behaviour (not forbidden) checks for the §3.5 residuals**, each asserting the
+  *recorded* outcome so that a future change which silently alters one is caught:
+  a 3-byte store emits `size=2` + 3-bit strobe at the group base; a 3-byte load emits a
+  4-byte read at the group base; a cross-line load's slot B emits `[0,n)` at the next line's
+  base; a WORD at group offset 1 emits `size=2` at the group base (D26).
 - The cacheable path emits no extra transactions and its `size` is unchanged.
 
 **Merge arbiter (§4)**
@@ -1023,17 +1397,40 @@ omit a class of check.
 - ITLB and DTLB transactions with identical IDs, back to back, route to the right consumer.
 - The D-cache's three write issuers still ack correctly through the arbiter, including the
   fail-closed unknown-ID case.
+- **D27:** a `B` or `R` beat carrying a non-walker ID presented to a walker is *not* acked —
+  the walker hangs loudly rather than mis-completing a page-table walk. Directed, since no
+  legal stimulus produces it once the arbiter is correct; this checks the second line of
+  defence exists at all.
+
+**Halt-reason channel (§6.4, D28)**
+- Each of the four producers (D-cache diagnostic fault, FSAVE/FRESTORE translation fault,
+  D15 reset-vector bus error, D20 bounded-grant expiry) latches its own distinct reason.
+- First-wins: a second halt cause after the first does not overwrite the recorded reason.
+- `coreHalted`'s existing control behaviour is bit-identical to before the widening
+  (regression, not a new property).
 
 **Reset/boot (§6)**
 - SSP and PC land from bytes 0-3 / 4-7 of the vector line, big-endian.
 - No fetch occurs before the redirect; the first fetch is at the loaded PC.
 - Committed A7 reads back the SSP, and `ss.isp` tracks it.
-- A non-OKAY vector response halts with the D15 kind code and does not attempt a frame.
+- A non-OKAY vector response halts with the D15 reason code on D28's channel and does not
+  attempt a frame.
 - `enable=false` leaves every existing test bit-identical.
 
 **Interrupts (§7)**
 - The D17 count-equality assertion, run over the full lock-step corpus.
 - Autovector selection for levels 1-7.
+
+**Socket port surface and `RESET` (§9.3, §9.4)**
+- **D29, structural:** the elaborated `M68kSocketTop` has *no* `prot`/`cache`/`lock`/`qos`/
+  `region` port on either master, and its port set is a subset of `cpu_socket.vh` §§2-3, §6.
+  Cheap to check by enumerating the generated Verilog's port list, and it catches a future
+  `Axi4Config` change silently re-exporting them.
+- **D22:** `cpu_peripheral_reset` rises on `RESET` retirement and stays high for exactly 518
+  core-clock cycles, then falls; back-to-back `RESET`s re-arm it without a glitch low.
+- **OPEN-1:** whichever answer is signed off, the check follows it — either "no µop retires
+  during the hold" or "execution is unaffected by the hold". The plan must state which it is
+  testing; a test written against the unsigned-off assumption is worse than none.
 
 **Gates** — the project's standing rules apply unchanged: `make SBT=~/sbt/bin/sbt test-fast`,
 full lock-step, and an **uncontended** post-route gate for the socket top (§9.1 changes the
