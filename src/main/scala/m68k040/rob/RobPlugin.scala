@@ -372,8 +372,30 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // meaningfully service).
     val coreHaltedIn = Bool(); coreHaltedIn.allowOverride; coreHaltedIn := False
     coreHaltedIn.simPublic()   // pokable from a standalone DUT, same convention as preciseDrainBusyIn
+    // D28 (axi-socket adapter spec section 6.4): the halt seam carries a KIND alongside the
+    // Bool. "Halts" is only half a diagnostic; an operator staring at a wedged core has to
+    // know why. Deliberately an OBSERVATION, not a control path -- `coreHalted`'s three
+    // consumers (`headReady` below, `interruptPending`, and the frontend-quiesce service)
+    // are untouched, so this cannot perturb the halt semantics any existing test depends on.
+    //
+    // FIRST-WINS, not last: the first cause is the one that explains the machine. A later
+    // producer firing against an already-halted core is a CONSEQUENCE, not a second bug, and
+    // overwriting would hide the real one.
+    val haltReasonIn = UInt(m68k040.socket.HaltReason.W bits)
+    haltReasonIn.allowOverride
+    haltReasonIn := U(m68k040.socket.HaltReason.NONE, m68k040.socket.HaltReason.W bits)
+    haltReasonIn.simPublic()
     val coreHalted = RegInit(False); coreHalted.simPublic()
-    when(coreHaltedIn) { coreHalted := True }
+    val haltReason = RegInit(U(m68k040.socket.HaltReason.NONE, m68k040.socket.HaltReason.W bits))
+    haltReason.simPublic()
+    when(coreHaltedIn) {
+      coreHalted := True
+      // `!coreHalted` is the first-wins guard. It reads the REGISTER, not `coreHaltedIn`,
+      // so two producers asserting on the SAME cycle resolve by whatever the shared
+      // `haltReasonIn` wire carries that cycle -- which is the priority the driver in
+      // FullCoreSynth encodes, not an accident of elaboration order.
+      when(!coreHalted) { haltReason := haltReasonIn }
+    }
     // MMU access-fault per-entry capture (set at COMPLETION from the LS EU's
     // faultCompletion, NOT at alloc — an MMU fault is discovered at execute). On a
     // faulting LS access the LS EU marks the entry faulted vector 2 + the faulting VA

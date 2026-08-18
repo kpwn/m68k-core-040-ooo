@@ -362,6 +362,15 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // priority/first-wins encoding would buy nothing. See ExceptionUnit's `F_HALT` for why
     // a translation fault escalates here instead of taking a precise access fault.
     rob.logic.coreHaltedIn := dc.diagFault || exc.fsXlateFault
+    // D28: same two producers, now each carrying its own kind. The priority when both
+    // fire on the same cycle is stated here rather than left to elaboration order:
+    // the D-cache's diagnostic fault wins, because it is the one with a sub-code
+    // (`DcachePlugin`'s private `diagFaultKind`) that further localises the failure.
+    rob.logic.haltReasonIn := Mux(dc.diagFault,
+      U(m68k040.socket.HaltReason.DCACHE_DIAG, m68k040.socket.HaltReason.W bits),
+      Mux(exc.fsXlateFault,
+        U(m68k040.socket.HaltReason.FS_XLATE, m68k040.socket.HaltReason.W bits),
+        U(m68k040.socket.HaltReason.NONE, m68k040.socket.HaltReason.W bits)))
     lsEu.excActive          := excActive
     lsEu.excLoadCmdValid    := exc.dcLoadCmd.valid
     lsEu.excLoadCmdVaddr    := exc.dcLoadCmd.payload.vaddr
