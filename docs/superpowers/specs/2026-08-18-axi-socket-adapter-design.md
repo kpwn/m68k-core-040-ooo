@@ -1662,3 +1662,46 @@ full lock-step, and an **uncontended** post-route gate for the socket top (§9.1
 reset net's fanout, and FMax on this machine is unreliable under concurrent Vivado/JTAG
 sessions — a repeatedly confirmed hazard). `git worktree add` is mandatory for any
 before/after comparison.
+
+---
+
+## 14. Resolved open items (2026-08-18)
+
+### 14.1 `OPEN-1` — `cpu_peripheral_reset`'s 518-cycle hold and dispatch/retire gating
+
+**RESOLVED: Option A: output only.**
+
+Decided by explicit user sign-off on 2026-08-18, during the implementation-plan pass
+(`docs/superpowers/plans/2026-08-18-axi-socket-adapter-implementation-plan.md`, Task 11).
+
+**Rationale as given, verbatim:** *"wrt RESET you implement something that is as compatible to
+68k as possible."*
+
+**How this resolves the two options.** The M68000 family's `RESET` instruction is documented
+architecture-wide (68000 through 68040) as asserting only the external reset pin for a fixed
+duration; the processor's own internal state and instruction execution are explicitly
+unaffected — execution continues normally with the instruction stream through the pulse. v1's
+internal dispatch/retire gating during its own hold (`commit.v`'s `can_commit`/`can_commit_irq`
+stall, `m68k_core_fetch.vh`'s dispatch/rename stall) is v1's own implementation choice, not a
+requirement of the 68k ISA's own documented `RESET` semantics — so it is the answer that is
+*less*, not more, 68k-compatible, and is not reproduced here. Option A — `cpu_peripheral_reset`
+asserted for the full 518-cycle width while the core's own pipeline keeps executing normally —
+is the architecturally faithful behavior.
+
+**What this binds.** Task 12 of the implementation plan implements Option A:
+`PeripheralResetPlugin(gateDispatch = false)`. No `RobPlugin.scala` changes (`:585`, `:1447`,
+`:1487-1488` stay untouched — those are Option-B-only per Task 12's own file list). Per §13's
+`OPEN-1` bullet, the surviving test is *"execution is unaffected by the hold"* — a directed test
+that µops continue to retire while `cpu_peripheral_reset` is high; the Option-B "no µop retires
+during the hold" test is deleted, not left cancelled.
+
+`D22`'s measured facts are unchanged: the width is **518** core clocks, copied verbatim from
+`commit.v:2081-2101`, and the driver is the commit-time `SysKind.RESET` arm at
+`ExceptionUnit.scala:1830-1833`. Only the internal-gating question was open; the external pulse
+width and shape were never in question.
+
+**v1 note (out of scope here, tracked separately):** this resolution implies v1's own
+`commit.v`/`m68k_core_fetch.vh` gating is itself a real divergence from documented 68k `RESET`
+semantics, worth a v1 update once that repository's in-flight uncommitted work settles — see
+the project's standing "plan updates for v1, too" goal and the existing v1-bug tracking pattern
+(tasks #225/#226).
