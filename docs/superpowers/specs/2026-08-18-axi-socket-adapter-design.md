@@ -39,6 +39,11 @@ resolved in either direction.
 review-corrections block at the end of §12); `D4`/`D5`/`D6`/`D10`/`D15`/`D20`/`D22`'s
 wording was tightened by the same pass.
 
+`D30` and `SOC-4` were added by a later 2026-08-18 pass acting on explicit user direction
+that the in-group-misalignment case must **not** be carried as an accepted limitation (see
+the second corrections block at the end of §12). `D6`'s bound and `D26`'s content were
+rewritten by that pass; `D26` is now a write-path statement only.
+
 | # | Decision |
 |---:|---|
 | **D1** | Adapt byte order at the socket boundary with a pure wire permutation. Do **not** change the core's native byte-address-invariant lane convention in `DcacheTypes` / `IcacheTypes` / `TableWalker`. (§2) |
@@ -46,7 +51,7 @@ wording was tightened by the same pass.
 | **D3** | The permutation lives in a new top-level `M68kSocketTop`, applied exactly once per master, only to `w.data` / `w.strb` / `r.data`. Never to address, id, len, size, burst, resp, or last. (§2.3) |
 | **D4** | The D-side derives a real `AxSIZE` and a byte-granular address for every **INHIBITED** access, from the access's own size (loads) or size+strobe (stores) — never from an address-range table. (§3) |
 | **D5** | The store-side size/address derivation runs on the **core-side** (pre-permutation) strobe, because the byte-offset a run starts at is not permutation-invariant. (§3.3) |
-| **D6** | An INHIBITED access whose byte range crosses a 4-byte boundary is decomposed into **two naturally-aligned AXI sub-transactions** inside `DcachePlugin`'s INHIBITED path. This is an extension beyond the v1 algorithm and is required for parity — see §3.4 for why the naive containment fallback is wrong. The decomposed range is clamped to the containing 16-byte line per D25. |
+| **D6** | An INHIBITED access is decomposed inside `DcachePlugin`'s INHIBITED path into an **exactly-covering sequence of naturally-aligned AXI sub-transactions** — never more than **three**, and exactly one for every naturally-aligned access. This is an extension beyond the v1 algorithm and is required for parity — see §3.4 for why the naive containment fallback is wrong. The decomposed range is clamped to the containing 16-byte line per D25, and the ≤3 bound is proved from that clamp in §3.4. (Originally scoped to the 4-byte-boundary crossing alone; widened to exact cover by D30.) |
 | **D7** | 4 masters → 2. `axi_i` stays I-cache-only. D-cache + ITLB walker + DTLB walker merge onto `axi_d`. The ITLB walker genuinely issues AXI writes, so it categorically cannot ride the read-only `axi_i`. (§4.1) |
 | **D8** | The merge is an **owner-tag serializing arbiter**, not a raw-ID demux. Responses route by the arbiter's latched grant owner; the returned AXI ID is forwarded as a fabric hint and is never consulted for routing. (§4.2) |
 | **D9** | Read and write grants are **independent** per-direction state machines. A single global token deadlocks against `refillWriteHold`. (§4.4) |
@@ -78,11 +83,19 @@ D1-D23 numbering and its existing cross-references stay stable.
 |---:|---|
 | **D24** | The **load**-side sizing/address derivation is a function of `(paddr[1:0], size)` alone. `DLoadCmd` carries no strobe and AXI reads have no byte enables, so WSTRB is the authoritative lane selector on **writes only**. (§3.3) |
 | **D25** | D6's sub-transaction decomposition **clamps** the derived byte range to the containing 16-byte line: `end = min(off + n, 16)`. The split FSM issues both slots at the *full* original size, so the range it presents is *not* line-contained on arrival and must be clamped rather than trusted. (§3.4) |
-| **D26** | An access whose bytes lie **inside one 4-byte group but are not naturally aligned within it** (e.g. a WORD at group offset 1) is emitted as a single `size=2` transaction at the group base. This is wrong on a byte-addressed peripheral and is an **accepted, explicit parity-with-v1 limitation**, not a silent gap. (§3.5) |
+| **D26** | **Write path.** WSTRB is a *complete* lane selector: any write this core emits carries, per sub-transaction, exactly the bytes the architectural access names, and no covering-but-over-wide write is ever emitted (D30 removes the last one). Whether the right bytes actually land is therefore a property of the **slave**, not of the core. Investigated against the real fabric: `axi_wide_to_axilite.v` and the `dbg`/`dafb` AXI-Lite faces forward WSTRB verbatim and are correct; the 8-bit `pb_*` peripheral slots **silently drop bytes** on any write with more than one strobe bit hot. That is a real downstream bug, fixed by SOC-4, not a core-side limitation. (§3.3.1, §3.5) |
 | **D27** | Both table walkers gain a fail-closed ID guard on their response channels (`b.payload.id === WALK_WRITE`, `r.payload.id === WALK_READ`), matching the D-cache's existing discipline, so the arbiter's safety argument is uniform across all three merged masters. (§4.3) |
 | **D28** | A **new** kind-coded halt-reason channel is built from `RobPlugin`'s halt seam outward. D15 and D20 need to report *why* the core halted; today `rob.logic.coreHaltedIn` is a plain undiscriminated `Bool` and the kind codes are `DcachePlugin`-private. This is new scope, and a **second** debug-ctrl-plan touch point beyond `cpu_peripheral_reset`. (§6.4, §8.3, §10) |
 | **D29** | The socket-facing `Axi4Config` in `M68kSocketTop` sets `useProt`/`useCache`/`useLock`/`useQos`/`useRegion` **false**, so the sideband signals the socket does not declare do not exist on the socket boundary at all. (§9.3) |
 | **OPEN-1** | Whether `cpu_peripheral_reset`'s 518-cycle hold should also **gate dispatch/retire** the way v1's does. v1 gates both; this core's `RESET` is a pure NOP today. Needs explicit sign-off; the implementation plan may not silently pick either answer. (§9.4) |
+
+**Added by the 2026-08-18 user-direction pass.** Numbering continues from D29 / SOC-3 so
+every existing cross-reference stays valid.
+
+| # | Decision |
+|---:|---|
+| **D30** | D6's sequencer emits an **exact naturally-aligned cover** of the (clamped) byte range, not merely a split at the 4-byte group boundary. Every sub-transaction's address is naturally aligned for its own `AxSIZE` **and** its byte extent lies wholly inside the architectural access. The bound is **≤ 3 sub-transactions** for every reachable access, proved in §3.4 from `Size ∈ {BYTE,WORD,LONG}` and the D25 clamp — a *bounded* sequencer, not the "general N-way byte sequencer" an earlier draft claimed a fix would require. A naturally-aligned access still emits exactly one transaction, unchanged. This is the real fix for in-group misalignment (canonically a WORD load at group offset 1) on the **load** path, where AXI4's total lack of read byte-enables makes a downstream-only fix impossible in principle; it is applied uniformly to stores as well, per D6's existing "state the rule once for both paths". (§3.3, §3.4) |
+| **SOC-4** | `macqd700-soc`'s `peripheral_bus.v` must serialize a write whose active-lane WSTRB has more than one bit hot into one `pb_wr` pulse per hot bit, for **every** `pb_*` slot — generalizing the ASC-only `wr_asc_*` FSM that already does exactly this. Today the other slots take the single-byte fast path and silently drop every byte but one; the file's own comment records the gap. This is a shared-fabric fix and therefore **also corrects the v1 core's** observed behaviour for the same accesses (v1 routinely emits 2-hot-strobe WORD stores). Deliberately in scope. (§3.3.1, §3.5, §11.2) |
 
 ---
 
@@ -291,39 +304,84 @@ The information is present at both AXI emission sites and is simply discarded wh
 transaction is formed. G5 is therefore a change local to `DcachePlugin`'s two INHIBITED
 emission paths, not a datapath change.
 
-### 3.3 The derivation (D4, D5, D24)
+### 3.3 The derivation (D4, D5, D24, D26, D30)
 
 The two directions derive the same thing from different inputs, because the two command
 bundles carry different information. Both derivations are stated for **one 4-byte group**;
-§3.4 (D6/D25) is what guarantees a transaction never spans more than one group.
+§3.4 (D6/D25/D30) is what guarantees a transaction never spans more than one group and is
+always naturally aligned inside it.
 
 #### 3.3.1 Stores — from the core-side strobe
 
-Mirroring the proven v1 rule (`axi_narrow_to_wide.v:42-44`), on the **core-side**
-(pre-permutation) strobe of a single access, restricted to the containing 4-byte group:
+The store's byte range comes from the **core-side** (pre-permutation, byte-offset-indexed)
+inputs, in one of two forms:
 
-| Core-side strobe within the addressed longword | `AxSIZE` | Address presented |
-|---|---:|---|
-| exactly 1 bit set (`0001`/`0010`/`0100`/`1000`) | 0 (1 B) | the access's full byte address, unmodified |
-| exactly 2 contiguous bits set **at an even offset** (`0011`/`1100`) | 1 (2 B) | byte address with bit 0 cleared |
-| 2 contiguous bits set at an **odd** offset (`0110`) | 2 (4 B) | byte address with bits[1:0] cleared — see D26 |
-| anything else (3 or 4 bits, or sparse) | 2 (4 B) | byte address with bits[1:0] cleared |
+- ordinary form (`useStrb = false`): the range is `[paddr[3:0], paddr[3:0] + sizeBytes(size))`,
+  identical to the load derivation;
+- split-slot form (`useStrb = true`, `DcacheTypes.scala:78-89`): the range is the run of set
+  bits in the 16-bit line-relative `strb`. That run is contiguous by construction — a split
+  slot is a contiguous sub-range of one architectural access — so the range is well defined.
+  A hypothetically sparse strobe stays *safe* rather than correct: the sequencer would cover
+  the run's convex hull, and each sub-transaction still carries the exact strobe bits, so no
+  byte is written that was not strobed.
 
-WSTRB stays the authoritative lane selector on the **write** path in every row — AXI permits
-sparse byte strobes at `size=2`, and `axi_narrow_to_wide.v:47-50` confirms the sparse case is
-designed to fall through exactly this way.
+That range then goes through the **same** D6/D30 sequencer the load path uses (§3.4). Each
+emitted sub-transaction is naturally aligned, lies wholly inside the range, and carries the
+strobe bits for its own bytes:
 
-**One correction to v1's rule, made deliberately.** v1 lists `0110` alongside `0011`/`1100`
-as a two-contiguous-bit `awsize=1` case (`axi_narrow_to_wide.v:43`) and then clears address
-bit 0 to satisfy alignment. That pair is inconsistent: with `awsize=1` at an even address the
-transaction's active byte lanes are the group's bytes 0-1, while strobe `0110` asserts byte
-2 — a WSTRB bit outside the addressed transfer, which AXI4 forbids. This spec routes `0110`
-to the `size=2` group-base row instead, which is a well-formed transaction and is correct on
-memory (the strobe still selects bytes 1-2). It remains wrong on a byte-addressed peripheral;
-that residual is D26/§3.5 and is *functionally* the same limitation v1 has, so this is a
-legality fix rather than a behavioural divergence.
+| Sub-transaction byte extent | `AxSIZE` | Address presented | WSTRB |
+|---|---:|---|---|
+| 1 byte | 0 | that byte's full address, unmodified | the one bit |
+| 2 bytes, even start | 1 | that pair's address (bit 0 already 0) | the two bits |
+| 4 bytes, group-aligned start | 2 | the group base (bits[1:0] already 0) | all four |
 
-#### 3.3.2 Loads — from `(paddr[1:0], size)` (D24)
+There is no "anything else" row: D30's cover is exact, so an over-wide covering transaction
+is never emitted. WSTRB remains the authoritative lane selector on the **write** path (D24),
+but it is now never the *only* thing keeping a write correct — the address and size are
+correct on their own too, which is what makes the emission right on a byte-addressed
+peripheral as well as on memory.
+
+**One correction to v1's rule, and why this is more than a legality fix.** v1 lists `0110`
+alongside `0011`/`1100` as a two-contiguous-bit `awsize=1` case (`axi_narrow_to_wide.v:43`)
+and then clears address bit 0 to satisfy alignment. That pair is inconsistent: with
+`awsize=1` at an even address the transaction's active byte lanes are the group's bytes 0-1,
+while strobe `0110` asserts byte 2 — a WSTRB bit outside the addressed transfer, which AXI4
+forbids. An earlier draft of this spec merely re-routed `0110` to a well-formed `size=2` at
+the group base, which is legal and correct on memory but still names the wrong registers on a
+byte-addressed device. Under D30 the core does not emit that shape at all: the `[1,3)` range
+decomposes into two `size=0` writes at offsets 1 and 2. The v1 illegality is fixed *and* the
+behavioural divergence from real 68040 bus cycles is closed.
+
+**What the real fabric does with a multi-bit WSTRB, and why SOC-4 exists.** This matters even
+under D30, because an exact cover still emits `size=1` (2 hot strobe bits) and `size=2` (4 hot
+bits) sub-transactions for naturally-aligned WORD and LONG accesses, and those are the common
+case. Verified in `macqd700-soc` at `15e4650`:
+
+- `axi_wide_to_axilite.v` (the DMA-config window behind xbar S2) selects the 32-bit lane by
+  `awaddr[3:2]` and forwards the lane's strobe nibble verbatim to its AXI-Lite master
+  (`:100-104`, `:149`). Correct.
+- `peripheral_bus.v` likewise forwards `wr_lane_strb` verbatim to the two AXI-Lite faces it
+  owns — `dbg_wstrb` (`:959`) and `dafb_wstrb` (`:967`). Correct.
+- `peripheral_bus.v`'s 8-bit `pb_*` slots are **not** correct. `pb_wr_active` (`:993-1002`)
+  pulses `pb_wr` for exactly **one** cycle per AXI write beat, and the byte it presents is
+  chosen by a priority encoder over the strobe nibble — `wr_strb_byte` / `wr_byte`
+  (`:632-638`). Only three paths escape that: the ASC multi-byte strobe-walk FSM
+  (`:780-840`), the SONIC 16-bit word serializer (`:757-780`), and the SCSI DMA-shim
+  serializer (`:855-900`). For VIA1/VIA2/SCC/IWM/ENET/ORWELL/ADBINJ and SCSI register space,
+  a write with two strobe bits hot writes **one** byte and silently drops the other. The file
+  says so itself (`:587-592`): *"multi-byte writes to e.g. SCC would fall through the priority
+  encoder and silently drop bytes, but the boot path doesn't exercise that"*.
+
+So the write case is **not** already handled correctly downstream. It is a real bug in shared
+RTL that both cores traverse — v1 emits 2-hot-strobe WORD stores as its normal encoding
+(`peripheral_bus.v:568-577` documents `WORD off=2 → strb=4'b0011`), so v1 has been exposed to
+it all along. Per the user's direction that the hardware behind the bus is a legitimate fix
+target and that a shared fix should be embraced rather than avoided, this is recorded as
+**SOC-4** and explicitly scoped to fix v1's behaviour at the same time. The fix is small and
+already prototyped in-tree: generalize the existing `wr_asc_*` strobe-walk FSM from the ASC
+slot to every `pb_*` slot.
+
+#### 3.3.2 Loads — from `(paddr[1:0], size)` (D24, D30)
 
 `DLoadCmd` (`DcacheTypes.scala:55-61`) has **no strobe field** — it carries `vaddr`, `paddr`,
 `size`, `cacheMode`, `token` and nothing else — and, more fundamentally, **AXI4 reads have no
@@ -334,44 +392,69 @@ strobe is manufactured inside `dcache.v` by the `m68k_mem_strb`/`arsize_from_wst
 purely from the access's own address and size — `axi_narrow_to_wide.v:52-58` — so it is the
 same information reaching the same decision by a longer route, not an extra input we lack.)
 
-For a load whose byte range within the group is `[gs, ge)` (group-relative, `0 ≤ gs < ge ≤ 4`,
-after the D6/D25 decomposition), with `n = ge - gs`:
+**This asymmetry is the whole reason the load fix has to be CPU-side.** A covering write
+carries its own correction: `size=2` + `WSTRB=0110` still says, on the wire, "bytes 1 and 2
+only", so a conforming slave can get it right. A covering *read* carries nothing: `ARSIZE=2`
+at the group base is indistinguishable from a genuine longword read, and no slave, however
+well written, can recover which two bytes the CPU actually wanted. A downstream-only fix for
+the load case is therefore impossible in principle, not merely unimplemented — which is
+exactly why D30 puts the fix in the core.
 
-| Group-relative range | `AxSIZE` | Address presented | Bytes actually returned |
+Take a load sub-transaction whose byte range within the group is `[gs, ge)` (group-relative,
+`0 ≤ gs < ge ≤ 4`, after the D6/D25/D30 decomposition), with `n = ge − gs`. Because D30's
+cover is **exact**, only naturally-aligned extents reach this table at all:
+
+| Group-relative sub-range | `AxSIZE` | Address presented | Bytes actually returned |
 |---|---:|---|---|
-| `n = 1` | 0 (1 B) | full byte address, unmodified | exactly the wanted byte |
-| `n = 2`, `gs` even (`[0,2)` or `[2,4)`) | 1 (2 B) | byte address with bit 0 cleared | exactly the wanted 2 |
-| `n = 2`, `gs` odd (`[1,3)`) | 2 (4 B) | byte address with bits[1:0] cleared | all 4 — D26 |
-| `n = 3` (`[0,3)` or `[1,4)`) | 2 (4 B) | byte address with bits[1:0] cleared | all 4 — §3.5 |
-| `n = 4` | 2 (4 B) | byte address with bits[1:0] cleared | exactly the wanted 4 |
+| `n = 1`, any `gs` | 0 (1 B) | that byte's full address, unmodified | exactly the wanted byte |
+| `n = 2`, `gs` even (`[0,2)` or `[2,4)`) | 1 (2 B) | the sub-range's base (bit 0 already 0) | exactly the wanted 2 |
+| `n = 4`, `gs = 0` | 2 (4 B) | the group base (bits[1:0] already 0) | exactly the wanted 4 |
+
+The three non-naturally-aligned in-group shapes — `n=2` at `gs=1`, `n=3` at `gs=0`, `n=3` at
+`gs=1` — no longer appear as emitted transactions. §3.4 shows they are the *complete* set of
+such shapes and that each splits into exactly two rows of this table.
 
 Equivalently, and this is the form to implement — stated over the **sub-range**, since after
 decomposition a sub-transaction's `n` is *not* the parent access's `size`:
 
 ```
 AxSIZE = 0                       when n == 1
-AxSIZE = 1                       when n == 2 && base(0) == 0
-AxSIZE = 2                       otherwise
-ARADDR = base with the low AxSIZE bits cleared
+AxSIZE = 1                       when n == 2        // base(0) == 0 by construction
+AxSIZE = 2                       when n == 4        // base(1 downto 0) == 0 by construction
+ARADDR = base, already naturally aligned for AxSIZE
 ```
 
-where `base` is the sub-range's own start address. For a naturally-aligned access that needs
-no decomposition this collapses to the `size` field unchanged, which is the common case and
-costs nothing.
+where `base` is the sub-range's own start address. `n ∈ {1,2,4}` and the alignment of `base`
+are both guaranteed by the §3.4 emitter, so this stage does no address masking at all — an
+`ARADDR` whose low `AxSIZE` bits are non-zero is now an assertable *bug*, not a case to
+absorb. For a naturally-aligned access that needs no decomposition this collapses to the
+`size` field unchanged, which is the common case and costs nothing.
 
 Worked, in the core's own terms (all offsets line-relative, 16-byte line, LONG = 4 bytes):
 
 - `paddr(3:0) = 0x6`, `size = WORD`. Range `[6,8)`, one group (group 1), group-relative
-  `[2,4)`, `n = 2`, `gs = 2` even → `AxSIZE = 1` at `paddr` with bit 0 cleared = `0x6`.
+  `[2,4)`, `n = 2`, `gs = 2` even → one sub-transaction, `AxSIZE = 1` at `0x6`.
   Reads exactly bytes 6-7. On an 8-bit peripheral at `0x6` this touches one register.
 - `paddr(3:0) = 0x5`, `size = WORD`. Range `[5,7)`, one group (group 1), group-relative
-  `[1,3)`, `n = 2`, `gs = 1` odd → `AxSIZE = 2` at `0x4`. Reads bytes 4-7; the core keeps 5-6.
-  Four peripheral registers are touched. This is D26.
-- `paddr(3:0) = 0x2`, `size = LONG`. Range `[2,6)` — crosses the group boundary at 4, so D6
-  decomposes into `[2,4)` (`n=2`, `gs=2` even → `AxSIZE=1` at `0x2`) and `[4,6)` (`n=2`,
-  `gs=0` even → `AxSIZE=1` at `0x4`). Two well-formed sub-transactions, no over-read.
+  `[1,3)` — the D26/in-group-misaligned shape. Under D30 it decomposes into **two**
+  sub-transactions: `AxSIZE = 0` at `0x5` and `AxSIZE = 0` at `0x6`. Each returns exactly one
+  byte; the sequencer merges them into `missLine` at offsets 5 and 6 and the existing
+  `missPaddr[3:0]` extraction (`DcachePlugin.scala:498-503`) yields the WORD unchanged.
+  **Exactly two peripheral registers are touched, each exactly once** — the two the
+  architectural access names. This is what a real 68040 does with the same access, and it is
+  the case an earlier draft carried as an accepted limitation.
+- `paddr(3:0) = 0x2`, `size = LONG`. Range `[2,6)` — crosses the group boundary at 4, so it
+  decomposes into `[2,4)` (`n=2`, `gs=2` → `AxSIZE=1` at `0x2`) and `[4,6)` (`n=2`, `gs=0` →
+  `AxSIZE=1` at `0x4`). Two well-formed sub-transactions, no over-read. Unchanged from D6.
+- `paddr(3:0) = 0x1`, `size = LONG`. Range `[1,5)` → group split at 4 gives `[1,4)` and
+  `[4,5)`; `[1,4)` is the `n=3`, `gs=1` shape and covers exactly as `AxSIZE=0` at `0x1` plus
+  `AxSIZE=1` at `0x2`. **Three** sub-transactions in total — `0x1` (1 B), `0x2` (2 B),
+  `0x4` (1 B) — summing to exactly the 4 bytes wanted. This is the worst case; §3.4 proves
+  nothing reaches four.
 - `paddr(3:0) = 0xD`, `size = LONG`. Range `[13,17)` — see §3.4; the clamp bounds it to
-  `[13,16)`, giving one group-3 sub-transaction with `n = 3` → `AxSIZE = 2` at `0xC`.
+  `[13,16)`, group-relative `[1,4)`, which covers as `AxSIZE=0` at `0xD` plus `AxSIZE=1` at
+  `0xE`. Two sub-transactions, 3 bytes, no over-read. (Slot B still supplies the 16th byte
+  under its own translation, and remains over-wide — §3.5.)
 
 **D5 — why core-side.** This applies to the store derivation, the only one with a strobe as
 an input. Reversal within a nibble preserves popcount and preserves contiguity, but it does
@@ -391,7 +474,7 @@ comes from the MMU's page/TTR attributes on the access itself
 core may only reason from MMU-configured attributes and contemporaneous bus responses,
 never from a cached or assumed SoC decode map.
 
-### 3.4 The 4-byte-boundary case, and why v1's rule alone is not enough (D6, D25)
+### 3.4 Misalignment, and why v1's rule alone is not enough (D6, D25, D30)
 
 **This is an extension beyond the brief, made because the naive rule is provably wrong
 here.** v1's algorithm is complete *for v1* because v1's LSU never presents an access that
@@ -401,7 +484,7 @@ pre-split: `LsEuPlugin.scala:440-444` splits only on `s1CrossLine` (16 B) and `s
 (4 KiB). A misaligned longword at offset 1 within a line is a single `DLoadCmd`/`DStoreCmd`
 spanning two longwords.
 
-Under the §3.3 table alone that access falls to "anything else" → `size=2` at the
+Under v1's popcount rule alone that access falls to its catch-all → `size=2` at the
 *lower* longword, which reads/writes bytes 0-3 when the access needs bytes 1-4. On DRAM
 the strobe would save the write but the read would be short; on a byte-addressed
 peripheral it is simply the wrong register. Real 68040 hardware handles this case
@@ -415,7 +498,7 @@ cacheMode-independent would split every misaligned cacheable access onto the rar
 replay FSM (`LsEuPlugin.scala:1492-1513`) and cost real IPC on the hot path.
 
 **D6 — where it does go.** Inside `DcachePlugin`'s INHIBITED emission, as a small
-**two-sub-beat sequencer** over a byte range the sequencer computes for itself:
+**bounded sequencer** over a byte range the sequencer computes for itself:
 
 - **The input range must be clamped, not trusted (D25).** With `off = paddr(3 downto 0)` and
   `n = sizeBytes(size)`, the sequencer's range is
@@ -425,11 +508,9 @@ replay FSM (`LsEuPlugin.scala:1492-1513`) and cost real IPC on the hot path.
   end   = min(off + n, 16)          // D25 — the clamp
   ```
 
-  and the sub-transactions are the intersections of `[start, end)` with the two 4-byte
-  groups it can touch. Because `end ≤ 16` by construction, `[start, end)` lies inside one
-  16-byte line and therefore meets **at most two** 4-byte groups: the sequencer needs at most
-  two sub-transactions, never a loop. **That bound holds because of the clamp, not because
-  the incoming range was already line-contained** — it is not.
+  Because `end ≤ 16` by construction, `[start, end)` lies inside one 16-byte line and
+  therefore meets **at most two** 4-byte groups. **That containment holds because of the
+  clamp, not because the incoming range was already line-contained** — it is not.
 
 - **Why it is not already line-contained (the load path).** `LsEuPlugin` issues *both* slots
   of a cross-boundary split at the **full original size**: `dcache.loadCmd.payload.size :=
@@ -448,86 +529,141 @@ replay FSM (`LsEuPlugin.scala:1492-1513`) and cost real IPC on the hot path.
   derivations, and every one of them escapes into an untranslated page. This spec would have
   *introduced* a wrong-address bus transaction — the precise class of bug §3 exists to prevent
   — since today's REFILL path only ever emits the containing line base
-  (`DcachePlugin.scala:1194-1243`). With the clamp, `[13,17)` becomes `[13,16)`, one group-3
-  sub-transaction, and slot B independently covers the remainder at the next line under its
-  own, separately translated `paddrB`.
+  (`DcachePlugin.scala:1194-1243`). With the clamp, `[13,17)` becomes `[13,16)` — group 3,
+  `L=3`, `gs=1`, i.e. `1@0xD` + `2@0xE` — and slot B independently covers the remainder at
+  the next line under its own, separately translated `paddrB`.
 
-- **Stores are unaffected either way**, but the clamp is uniform and applies to them too: the
-  SQ's split-slot form already carries a 16-bit **line-relative** strobe with `useStrb`
-  (`DcacheTypes.scala:78-89`), so a store slot's byte range is contained by construction and
-  the clamp is a no-op on it. Stating the rule once for both paths avoids a store/load
-  asymmetry in the sequencer.
+- **The emission rule is an exact naturally-aligned cover (D30).** Splitting only at the
+  group boundary is not enough: a group-confined range can still be non-representable as one
+  transaction, and on the read path there is no strobe to compensate (§3.3.2). The rule is
+  therefore the obvious greedy one, applied to `[start, end)`:
 
-- **Loads:** issue sub-transaction A (the lower group's bytes) and, if the range extends
-  past that group, sub-transaction B. Merge each response into `missLine` at its own byte
-  offset before the existing `REPLAY` path runs. `loadRspPort.payload.data`'s extraction at
-  `missPaddr[3:0]` (`DcachePlugin.scala:498-503`) is then unchanged and correct. A non-OKAY
-  response on either sub-transaction raises the existing `busFaultResp`.
-- **Stores:** issue AW/W/B for sub-transaction A, then B, and assert `storeAck` only after
-  the second `B` handshake. `storeErrReg` is the OR of both responses. The existing
+  ```
+  p = start
+  while (p != end) {
+    sz = the largest of {4,2,1} with (p % sz == 0) && (p + sz <= end)
+    emit (address = p, AxSIZE = log2(sz))
+    p += sz
+  }
+  ```
+
+  `p` is line-relative, and the line base is 16-byte aligned, so `p`'s low bits *are* the
+  emitted address's low bits — the alignment test needs no separate address arithmetic.
+  Every emitted sub-transaction is naturally aligned for its own size and lies wholly inside
+  the access. Nothing outside the architectural byte range is ever read or written.
+
+- **Why it is bounded at three, and why that is a proof rather than an observation.**
+  `Size` has exactly three members — `BYTE`, `WORD`, `LONG` (`Isa.scala:32`) — so
+  `n ∈ {1,2,4}` and, after the clamp, `end − start ≤ 4`. Take one 4-byte group and a
+  group-confined range of length `L` starting at group offset `gs`:
+
+  | `L` | `gs` | Cover |
+  |---:|---:|---|
+  | 1 | any | `1@gs` — 1 piece |
+  | 2 | 0, 2 | `2@gs` — 1 piece |
+  | 2 | 1 | `1@1`, `1@2` — 2 pieces |
+  | 3 | 0 | `2@0`, `1@2` — 2 pieces |
+  | 3 | 1 | `1@1`, `2@2` — 2 pieces |
+  | 4 | 0 | `4@0` — 1 piece |
+
+  (Rows absent from the table cannot occur — `L=2` needs `gs ≤ 2`, `L=3` needs `gs ≤ 1`,
+  `L=4` needs `gs = 0`, or the range would leave the group.) So a group needs **at most 2**
+  pieces, and the three two-piece rows are the *complete* set of in-group ranges that no
+  single naturally-aligned AXI transfer covers exactly — the set §3.3.2's table is written
+  to exclude. Both
+  groups needing 2 pieces is impossible: that would require `L_A = 3` ending at the boundary
+  and `L_B = 3` starting at it, a 6-byte range, while `end − start ≤ 4`. Therefore **at most
+  3 sub-transactions, always**, with no loop bound to trust and no data-dependent iteration
+  count. A naturally-aligned access is one of the single-piece rows and still emits exactly
+  one transaction.
+
+- **This is what makes the earlier "general N-way sequencer" objection wrong.** An earlier
+  draft declined to fix in-group misalignment on the grounds that doing so needed an
+  unbounded byte sequencer. It does not: the reachable case set is the six rows above, the
+  cover is greedy and terminates in ≤ 3 steps by construction, and the mechanism is the same
+  one D6 already builds for the group-boundary split — a start pointer, a size choice, and a
+  merge offset. The incremental cost over the two-sub-beat version is one extra iteration of
+  an FSM that already exists.
+
+- **Stores take the same sequencer**, and the clamp is a no-op on them: the SQ's split-slot
+  form already carries a 16-bit **line-relative** strobe with `useStrb`
+  (`DcacheTypes.scala:78-89`), so a store slot's byte range is contained by construction.
+  Stating the rule once for both paths avoids a store/load asymmetry in the sequencer, and
+  under D30 it also means a store never emits a covering-but-over-wide transaction — the
+  addresses and sizes are correct on their own, with WSTRB agreeing rather than compensating.
+
+- **Loads:** issue each sub-transaction in turn (1 to 3 of them) and merge each response into
+  `missLine` at its own byte offset before the existing `REPLAY` path runs.
+  `loadRspPort.payload.data`'s extraction at `missPaddr[3:0]`
+  (`DcachePlugin.scala:498-503`) is then unchanged and correct. A non-OKAY response on **any**
+  sub-transaction raises the existing `busFaultResp`.
+- **Stores:** issue AW/W/B for each sub-transaction in turn, and assert `storeAck` only after
+  the **last** `B` handshake. `storeErrReg` is the OR of all responses. The existing
   fail-closed `=== AxiIds.D_STORE` B demux (`DcachePlugin.scala:1957`) is preserved for
   each.
+- **Ordering.** Sub-transactions are issued in ascending address order and strictly
+  serialized (one outstanding at a time), which is both what the fabric supports
+  (NOTED-3/G14) and what makes the emission match a real 68040's bus-cycle order for a
+  misaligned access — relevant on devices with order-sensitive register pairs.
 - Cost: zero on the cacheable path (the sequencer is reachable only when
-  `missCmode === INHIBITED` / `stS3Inhibited`), and one extra bus round trip on an
-  already-slow, already-serialized MMIO path.
+  `missCmode === INHIBITED` / `stS3Inhibited`), zero on any naturally-aligned INHIBITED
+  access, and at most two extra bus round trips on an already-slow, already-serialized MMIO
+  path in the misaligned case.
 
-### 3.5 Recorded residuals of the D4/D6 design
+### 3.5 Residuals of the D4/D6/D30 design — what is left, and what no longer is
 
-Everything in this list is a case where the emitted transaction is **legal AXI and correct
-against memory**, but touches more of a byte-addressed peripheral's address space than the
-architectural access asked for. None is silently handled; each is recorded here, and §13
-states the corresponding expected — not forbidden — behaviour. All are INHIBITED-path only,
-and all ranges below are **post-D6-decomposition sub-ranges**, i.e. already confined to a
-single 4-byte group (a range that straddles a group boundary is split first and each half
-lands in this list on its own merits, or in neither half).
+A residual here means: the emitted transaction is legal AXI and correct against memory, but
+touches more of a byte-addressed peripheral's address space than the architectural access
+asked for. All are INHIBITED-path only.
 
-1. **3-byte store range.** Reachable through the SQ's explicit-strobe split-slot form
-   (`DcacheTypes.scala:78-89`), whose byte count need not be a clean 1/2/4. It resolves to a
-   `size=2` transaction at the group base with a 3-bit strobe. Correct for memory, three
-   registers touched instead of one on an 8-bit device.
+**Exactly one residual survives D30.**
 
-2. **3-byte load range.** Loads have no strobe (D24), so this one is strictly worse than its
-   store twin: the 3-byte range becomes a **4-byte read at the group base**, and on an 8-bit
-   peripheral — where `peripheral_bus.v:68-75` broadcasts the selected byte into all four
-   lanes of the word — that is one register's value read **and side-effected up to 4 times**,
-   with the core keeping the 3 bytes it wanted. A 3-byte load range arises from the D6
-   decomposition itself (e.g. the `off = 13`, `size = LONG` case above clamps to `[13,16)`),
-   so unlike case 1 it is not confined to the SQ's split-slot form.
-
-3. **Slot-B over-read on a cross-line/cross-page load.** Slot B arrives as `(paddr = next
+1. **Slot-B over-read on a cross-line/cross-page load.** Slot B arrives as `(paddr = next
    line base, size = the *original* size n)` — `LsEuPlugin.scala:759` does not narrow it —
    so its clamped range is `[0, n)` while only `[0, off + n − 16)` is architecturally needed.
    Worked: `off = 13`, `size = LONG` → slot B needs byte 0 alone but is derived as `[0,4)` →
-   `AxSIZE = 2` at the next line's base. Up to `n − 1` bytes are read beyond the access. The
-   over-read is contained *within* slot B's own translated page (offsets 0-3 of its first
-   line), so it is never a wrong-address transaction — only a wider one. A future narrowing
-   could use the slot-B marker the load token already carries
+   a single `AxSIZE = 2` at the next line's base. Up to `n − 1` bytes are read beyond the
+   access. D30 does not help, and this is the reason it is the one survivor: the defect is in
+   the *range handed to* the sequencer, not in how the sequencer covers it. An exact cover of
+   a wrong range is still wrong. The over-read is contained *within* slot B's own translated
+   page (offsets 0-3 of its first line), so it is never a wrong-address transaction — only a
+   wider one. A future narrowing could use the slot-B marker the load token already carries
    (`(False ## llReg.bDone ## robId)`, `LsEuPlugin.scala:762-765`) to derive the true
    remainder; that is **not decided here**, because it makes `DcachePlugin` depend on a
    `DLoadToken` bit that is presently an LS-EU-private encoding.
 
-4. **In-group misalignment (D26).** An access whose bytes lie inside a single 4-byte group
-   but not naturally aligned within it — canonically a WORD at group offset 1 (`[1,3)`) —
-   is emitted as `size=2` at the group base and touches all four registers of the group.
-   D6 does not help: there is no group boundary to split at. Splitting *this* into two
-   byte transactions would be a genuine fix, and is **deliberately not taken**:
+**Closed by D30, recorded so the history is legible.** Three cases an earlier draft carried
+here are no longer residuals, because the sequencer's cover is now exact:
 
-   - **v1 has the same limitation**, so this is parity, not a new regression: v1's rule maps
-     strobe `0110` to `awsize=1` at the group base (`axi_narrow_to_wide.v:43`), which reaches
-     the same wrong registers *and* is a malformed AXI transaction on top (§3.3.1). This
-     spec's version is at least well-formed.
-   - The cost of fixing it is a general N-way byte sequencer in `DcachePlugin`'s INHIBITED
-     path instead of the bounded two-sub-transaction one, on a path that today has no
-     sequencer at all.
+- *3-byte store range* (the SQ's explicit-strobe split-slot form, `DcacheTypes.scala:78-89`).
+  Was `size=2` + a 3-bit strobe at the group base; now covers exactly, as
+  `2@gs + 1@gs+2` or `1@gs + 2@gs+1` (§3.4's table).
+- *3-byte load range* (arises from the D25 clamp itself, e.g. `off = 13`, `size = LONG` →
+  `[13,16)`). Was a 4-byte read at the group base; now `1@0xD + 2@0xE`. This one mattered
+  most, because loads have no strobe to compensate with (D24).
+- *In-group misalignment* — canonically a WORD at group offset 1 (`[1,3)`). Was a `size=2`
+  read/write at the group base; now two `size=0` transactions at offsets 1 and 2 (§3.3.2's
+  worked example). **This is the case the user directed must not be carried as an accepted
+  limitation, and D30 is that decision.** Parity-with-v1 was the wrong frame for it: v1's own
+  handling (`axi_narrow_to_wide.v:43`, `awsize=1` at the group base with a strobe bit outside
+  the addressed transfer) is both wrong *and* malformed, so "parity" meant reproducing a
+  defect rather than matching a contract.
 
-   This is therefore an **explicit accepted limitation with sign-off recorded as D26**, not
-   an oversight. If a real driver is ever found to do a misaligned word access to an 8-bit
-   Mac peripheral, D26 is the item to revisit, and the fix is the general sequencer.
+**One thing that is not a core residual but is a real defect on the path.** `peripheral_bus.v`
+drops all but one byte of any write whose active-lane WSTRB has more than one bit hot, on
+every `pb_*` slot except ASC/SONIC-word/SCSI-DMA (`:632-638`, `:993-1002`, `:587-592`; full
+derivation in §3.3.1). D30 does not remove the exposure, because a naturally-aligned WORD or
+LONG store legitimately emits 2 or 4 strobe bits. It is a downstream bug in shared RTL, it
+affects v1 identically and already does today, and it is fixed by **SOC-4**.
 
 The implementation must carry a **simulation assertion that fires (as a warning, not a
-failure) on cases 1-4**, so that any real occurrence is loud in the logs rather than silent.
-An assertion that *forbids* them would contradict D26 and case 3, which are accepted
-behaviour, not bugs to be trapped.
+failure) on the one surviving residual** — a slot-B sub-transaction whose derived range is
+wider than the remainder the parent access actually needs — so that any real occurrence is
+loud in the logs rather than silent. The other three cases no longer need a
+"this-is-expected-wrong-behaviour" carve-out; for them the assertion is inverted into a hard
+one: §13 now *forbids* an INHIBITED sub-transaction whose byte extent leaves the
+architectural access, and forbids an `AxADDR` that is not naturally aligned for its own
+`AxSIZE`.
 
 ### 3.6 What does *not* change
 
@@ -1246,8 +1382,10 @@ Implementable and testable today, in dependency order:
    design review added; it is not a reuse of anything existing.
 3. §4 merge arbiter (D7-D10), the walkers' fail-closed ID guard (D27), and the bounded-grant
    watchdog (D20, reports via 2).
-4. §3 MMIO sizing (D4-D6, D24-D26) — independent of 1 and 3, but its verification wants 1 in
-   place.
+4. §3 MMIO sizing (D4-D6, D24-D26, D30) — independent of 1 and 3, but its verification wants
+   1 in place. D30 is part of the same sequencer as D6 and must not be split off as a
+   follow-up: implementing D6 alone would ship the in-group-misalignment defect that D30
+   exists to prevent.
 5. §6 reset-vector fetch (D12-D16) — depends on 3 for its read owner and on 2 for D15.
 6. §7 `ipl_ack` (D17-D18).
 7. §9.1 reset naming (D21), §9.3 port surface (D23/D29), §9.4 `cpu_peripheral_reset` (D22).
@@ -1264,6 +1402,7 @@ implements the SoC's byte-lane convention and sizing rules, before any hardware 
 | **SOC-1** | Widen `axi_i`'s socket-side path to 256 bit; split `CPU_SOCKET_AXI_DW` into per-master `CPU_SOCKET_AXI_I_DW` (256) / `CPU_SOCKET_AXI_D_DW` (128); update `cpu_stub.v` to match. | **Hard blocker** for integration. Nothing in §11.1 depends on it, but the SoC cannot be brought up on this core until it lands. |
 | **SOC-2** | Add `cpu_peripheral_reset` to `cpu_socket.vh` §6. | Documentation only; not a functional blocker (the wrapper port already exists at `m68k_axi_wrapper.v:683`). |
 | **SOC-3** | Instantiate this core in place of v1, dropping `if_to_axi.v` and `axi_narrow_to_wide.v` from the CPU wrapper. | Integration step. Note this is what removes the 20 s timer — see §8 for why that is discharged rather than a regression. |
+| **SOC-4** | `peripheral_bus.v`: serialize any write whose active-lane WSTRB has >1 bit hot into one `pb_wr` pulse per hot bit, on **every** `pb_*` slot. Generalize the existing ASC `wr_asc_*` FSM (`:780-840`) rather than writing a new one; keep the single-hot-bit fast path, the SONIC 16-bit and SCSI DMA-shim serializers, and the same-slot rd/wr interlock unchanged. | Not a blocker for bring-up, but a real correctness fix. **Applies to v1 as much as to this core** — v1 emits 2-hot-strobe WORD stores as its normal encoding, so today a `move.w` to a VIA/SCC/IWM/ENET/ORWELL register silently loses a byte. Fixing shared RTL that both cores traverse is the intended outcome here, not a side effect to be minimised. Verify with a `tb_peripheral_bus.cpp` case per slot; the existing ASC multi-byte tests are the template. |
 
 ### 11.3 Confirmed *not* needed
 
@@ -1310,10 +1449,11 @@ brief asked for.
    32-bit word boundary (`m68k_mem_lane.vh`'s `m68k_mem_needs_split`). This core splits only
    at 16-byte lines and 4 KiB pages (`LsEuPlugin.scala:439-444`), and — critically — those
    predicates are evaluated at S1, *before* translation resolves `cacheMode`, so they cannot
-   simply gain an INHIBITED term. §3.4 (D6) extends the design with a two-sub-beat sequencer
-   inside `DcachePlugin`'s INHIBITED path. This is the one place where following the brief
-   literally would have shipped a known-wrong result, so it is called out rather than folded
-   in quietly. §3.5 records the residuals that even D6 does not fix.
+   simply gain an INHIBITED term. §3.4 (D6, later widened by D30) extends the design with a
+   bounded ≤3-sub-transaction exact-cover sequencer inside `DcachePlugin`'s INHIBITED path.
+   This is the one place where following the brief literally would have shipped a known-wrong
+   result, so it is called out rather than folded in quietly. §3.5 records the single residual
+   that even D30 does not fix.
 
 Additionally noted, neither a correction to the source nor a decision:
 
@@ -1336,9 +1476,9 @@ document were revised and why, and so the same mistakes are not reintroduced.
 
 | # | What was wrong | Where it is now correct |
 |---|---|---|
-| **C1** | §3.4 asserted that an INHIBITED access is "after `s1CrossLine` splitting, contained in one 16-byte line". **False on the load path** — `LsEuPlugin.scala:759` issues *both* split slots at the full original size, so slot A arrives with `off + n > 16`. Deriving groups from that unclamped range yields a sub-transaction one line past the access — and every cross-page access forces exactly that geometry (`pageOff + n > 4096` implies `lineOff + n > 16`), so that line is the first line of the **next physical page**, an address the core never translated. Implementing the spec literally would have *created* a wrong-address bus transaction that does not exist today. | §3.4's clamp `end = min(off + n, 16)` (**D25**), with the two-sub-transaction bound now derived *from* the clamp instead of from the false premise; the slot-B consequence recorded as §3.5 case 3. |
+| **C1** | §3.4 asserted that an INHIBITED access is "after `s1CrossLine` splitting, contained in one 16-byte line". **False on the load path** — `LsEuPlugin.scala:759` issues *both* split slots at the full original size, so slot A arrives with `off + n > 16`. Deriving groups from that unclamped range yields a sub-transaction one line past the access — and every cross-page access forces exactly that geometry (`pageOff + n > 4096` implies `lineOff + n > 16`), so that line is the first line of the **next physical page**, an address the core never translated. Implementing the spec literally would have *created* a wrong-address bus transaction that does not exist today. | §3.4's clamp `end = min(off + n, 16)` (**D25**), with the two-sub-transaction bound now derived *from* the clamp instead of from the false premise; the slot-B consequence recorded as §3.5's slot-B residual (numbered case 3 at the time; case 1, and the only one, after D30). |
 | **I1** | §3.3 had no load-side derivation and claimed WSTRB was "the authoritative lane selector in all three cases". AXI reads have **no byte enables**, and `DLoadCmd` (`DcacheTypes.scala:55-61`) has no strobe field. | §3.3 split into 3.3.1 (stores, strobe) and 3.3.2 (loads, `(paddr[1:0], size)`, **D24**); the WSTRB claim scoped to writes. |
-| **I2** | The "residual 3-byte case" was narrower than reality and in-group misalignment was unrecorded. | §3.5 now lists four residuals: 3-byte store, 3-byte **load** (no strobe → 4-byte over-read), slot-B over-read, and in-group misalignment as an explicit parity-with-v1 decision (**D26**). §13's assertion language relaxed to match (see below). |
+| **I2** | The "residual 3-byte case" was narrower than reality and in-group misalignment was unrecorded. | §3.5 was made to list four residuals: 3-byte store, 3-byte **load** (no strobe → 4-byte over-read), slot-B over-read, and in-group misalignment as an explicit parity-with-v1 decision (**D26**). **Superseded** — three of those four are now closed by D30 and D26 has been rewritten; see the user-direction block below. |
 | **I3** | §4.3 claimed the arbiter is "strictly additive; removes no existing check" and that each plugin's demux is "preserved untouched". True for the D-cache; **false for the walkers**, which accept `b`/`r` unconditionally (`ItlbPlugin.scala:75`, `DtlbPlugin.scala:80`, `TableWalker.scala:114`) and have no ID check at all — for them the arbiter is the *only* protection. | §4.3 states the distinction; **D27** adds the near-free fail-closed guard so the safety argument is uniform. |
 | **I4** | D15/D20 reused "the existing sticky `coreHalted` diagnostic … with a new distinct kind code, the same channel the D-cache's `diagFaultPulse` kinds use". No such channel exists: the seam is a plain `Bool` (`RobPlugin.scala:373-376`) and the kind codes never leave `DcachePlugin`. | §6.4's **D28** — build the channel; new scope; second `dbg_axi` touch point, flagged in §10 and in the §11.1 ordering. |
 | **I5** | D22 allowed "defaulting to 512 core-clock cycles if v1 emits a bare pulse". v1 emits a **518-cycle level** (`commit.v:2081-2101`) that also **gates dispatch and retire** at four sites. | §9.4 states 518 as measured fact; the pulse fallback is withdrawn; the dispatch-gating question is **OPEN-1**, requiring sign-off. |
@@ -1349,6 +1489,33 @@ re-litigated: the §2.2 byte-order transform (independently re-derived from scra
 worked examples), D9's arbiter-deadlock argument, the standing no-SoC-address-map-assumption
 conformance in §3.3, and the three §12 self-corrections it spot-checked (ROM-overlay,
 177-vs-37 ports, the superseded watchdog value).
+
+### Corrections applied after user direction, 2026-08-18
+
+The user rejected D26's "accepted parity-with-v1 limitation" framing on two grounds, both of
+which turned out to be load-bearing rather than stylistic:
+
+> *"the hardware behind the bus can be changed; the behaviour observed from the driver
+> shouldn't"* — `axi_wide_to_axilite.v` / `peripheral_bus.v` are FPGA-synthesized RTL under
+> project control, so "the fabric does X" is not a boundary condition; the invariant to hold
+> is what a real device driver observes.
+>
+> *"but also if we change this we should also change the v1 core"* — a fix belonging in the
+> shared downstream adapter benefits both cores' driver-visible behaviour, and that is to be
+> embraced as a deliberate companion work item rather than avoided as scope.
+
+Acting on that, the write case and the load case were re-derived separately — they are not
+symmetric — and both `macqd700-soc` files were read at `15e4650`. Four things changed:
+
+| # | What was wrong | Where it is now correct |
+|---|---|---|
+| **U1** | D26 treated writes and loads as one problem. They are not. A write's `size=2` + `WSTRB=0110` carries the full "which bytes are wanted" information to the slave; AXI4 reads have **no** byte-enable field, so a covering read carries none. A downstream-only fix is sufficient in principle for one and impossible in principle for the other. | §3.3.1 (writes, WSTRB is complete → the residual is the slave's) and §3.3.2 (loads, no strobe exists → the fix must be CPU-side). **D26** is now a write-path decision only; **D30** is the load/uniform one. |
+| **U2** | "The cost of fixing it is a general N-way byte sequencer" — an overstatement, and the sole justification for accepting the limitation. `Size` has three members (`Isa.scala:32`), so `n ∈ {1,2,4}` and the D25 clamp gives `end − start ≤ 4`; the complete set of non-representable in-group shapes is three, each covering in 2 pieces, and both groups cannot need 2. The exact cover is **≤ 3 sub-transactions, always**. | §3.4's enumeration table and the ≤3 proof; **D30**. The limitation was never worth accepting because the thing being avoided did not exist. |
+| **U3** | The write case was assumed to be handled downstream ("WSTRB stays the authoritative lane selector"). It is not. `peripheral_bus.v` pulses `pb_wr` exactly once per beat (`:993-1002`) and picks the byte with a strobe priority encoder (`:632-638`); only ASC, SONIC-word and the SCSI DMA shim serialize. Every other `pb_*` slot **silently drops bytes**, as the file's own comment states (`:587-592`). v1 is exposed to this today. | §3.3.1's fabric investigation and **SOC-4**, scoped explicitly to fix v1's behaviour too. `axi_wide_to_axilite.v:100-104,149` and `peripheral_bus.v:959,967` were checked and *are* correct — the defect is confined to the 8-bit `pb_*` slots. |
+| **U4** | §3.5 case 2 claimed a 4-byte over-read on an 8-bit peripheral is "one register's value read **and side-effected up to 4 times**". False. The read path issues **one** `pb_rd` pulse per AXI transaction (`peripheral_bus.v:1433-1436`) and broadcasts the single byte into all four lanes (`:1334`). The real consequence is one register read once — the *wrong* one where the slot's decode uses `addr[1:0]` (SCC `:1514`, ASC `:1573`, ENET/ORWELL/SONIC/SCSI), and coincidentally the right one where it does not (VIA1/VIA2/IWM decode from `addr[12:9]`, `:1463`/`:1470`/`:1617`). | The claim is deleted; §3.5's closed-case list states the corrected mechanism. The over-read was still a genuine defect — just a different one than recorded — and D30 closes it either way. |
+
+Not changed, and deliberately: §3.5's slot-B over-read survives as the one residual, because
+D30 fixes how a range is covered, not a range that was wrong when handed over.
 
 ---
 
@@ -1370,25 +1537,42 @@ omit a class of check.
 - Byte/word/long INHIBITED stores **and loads** at every offset 0-15 produce a legal
   `size`/address pair by AXI's own alignment rule, and every asserted WSTRB bit lies inside
   the addressed transfer (the §3.3.1 `0110` correction — v1 fails this one).
-- A byte read *or write* of a byte-addressed device register touches that register and no
-  other (checked against a model with read-to-clear side effects on all four registers in the
-  longword). **Scope:** naturally-aligned accesses. The accepted residuals of §3.5 are
-  excluded and get their own expected-behaviour checks below — this obligation and D26 would
-  otherwise be jointly unsatisfiable, and the point of D26 is that the limitation is chosen,
-  not that the check is impossible.
-- An INHIBITED access crossing a 4-byte boundary produces exactly two sub-transactions, each
-  naturally aligned, and the merged result equals the memory content (D6).
+- **D30, exhaustive and now a hard check, not an expected-behaviour one:** for every
+  `off` in 0-15 and every `size`, on both directions, the emitted sub-transactions
+  (a) are each naturally aligned for their own `AxSIZE`, (b) have byte extents that
+  partition the architectural byte range exactly — no gap, no overlap, and **nothing
+  outside it** — and (c) number at most three. 48 load cases and 48 store cases; small
+  enough to enumerate rather than sample, which is what makes "no byte outside the access
+  is ever touched" a proved property rather than a spot check.
+- A byte, word **or long** read *or write* of a byte-addressed device register touches
+  exactly the registers the access names, each exactly once, and no others — checked against
+  a model with read-to-clear side effects on all four registers in the longword. **Scope:
+  every offset, aligned or not.** Under D30 this is no longer restricted to naturally-aligned
+  accesses; the earlier carve-out existed only because D26 accepted a wrong answer for the
+  misaligned ones. The one exception is the slot-B residual below.
+- An INHIBITED access crossing a 4-byte boundary produces sub-transactions that are each
+  naturally aligned and whose merged result equals the memory content (D6). Directed
+  arithmetic checks on the §3.3.2 worked examples: `0x2`/LONG → 2 sub-transactions;
+  `0x5`/WORD → 2 (`size=0` at `0x5`, `size=0` at `0x6`); `0x1`/LONG → 3 (`0x1` 1 B, `0x2`
+  2 B, `0x4` 1 B); `0xD`/LONG slot A → 2 (`0xD` 1 B, `0xE` 2 B).
 - **D25, directed and specifically adversarial:** for every `off` in 12-15 and every size
   that makes `off + n > 16`, on both the cross-line and the cross-page geometry, **no AXI
   address is emitted outside the 16-byte line the sub-transaction belongs to**, and in
   particular none lands in the next physical page from slot A. This is the C1 regression and
   the check that would have caught it.
-- **Expected-behaviour (not forbidden) checks for the §3.5 residuals**, each asserting the
-  *recorded* outcome so that a future change which silently alters one is caught:
-  a 3-byte store emits `size=2` + 3-bit strobe at the group base; a 3-byte load emits a
-  4-byte read at the group base; a cross-line load's slot B emits `[0,n)` at the next line's
-  base; a WORD at group offset 1 emits `size=2` at the group base (D26).
+- **Expected-behaviour (not forbidden) check for the one surviving §3.5 residual:** a
+  cross-line load's slot B derives its range as `[0,n)` at the next line's base, wider than
+  the `[0, off + n − 16)` actually needed. Asserted as the *recorded* outcome so a future
+  change which silently alters it is caught, and paired with the sim warning §3.5 requires.
+  The three cases this list used to carry alongside it — 3-byte store, 3-byte load, WORD at
+  group offset 1 — are now covered by the hard D30 check above instead, and a test still
+  asserting the old outcomes would be asserting the bug.
 - The cacheable path emits no extra transactions and its `size` is unchanged.
+- **SOC-4, in `macqd700-soc`, not here:** a write with 2 or 4 strobe bits hot to each `pb_*`
+  slot delivers every strobed byte to the peripheral, in ascending address order, one
+  `pb_wr` pulse each. Regression-locked in `tb_peripheral_bus.cpp` per slot. Run the same
+  case against the **v1** wrapper as well — it fails there today, and that failing-then-
+  passing pair is the evidence that the shared fix landed for both cores.
 
 **Merge arbiter (§4)**
 - All four assertions in §4.4.
