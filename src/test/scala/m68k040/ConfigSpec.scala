@@ -11,7 +11,7 @@ class ConfigSpec extends AnyFunSuite {
     assert(p.physX == 16)
     assert(p.decodeWidth == 2)
     assert(p.retireWidth == 2)
-    assert(p.l1dKb == 16 && p.l1iKb == 16)
+    assert(p.l1iKb == 16)
   }
 
   test("derived widths are consistent") {

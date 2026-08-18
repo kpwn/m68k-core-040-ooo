@@ -1217,7 +1217,10 @@ deasserted source is strictly more permissive than a sync-reset one, not less.
 
 The alternative — switching to `resetKind = SYNC` to match the socket's literal wording —
 was rejected because it converts every register's reset in the design and is a real,
-unquantified risk to the 201.450 MHz post-route result for zero functional gain. The
+unquantified risk to the current 197.278 MHz post-route result (task #219, commit
+`5aae2c5` — the 201.450 MHz figure from the pre-FPU UFA/VTL campaign was superseded by the
+FPU-merge regression and the ongoing FMax-closure-fanout recovery) for zero functional
+gain. The
 implementation plan must still re-run the post-route gate after the socket top exists, since
 the reset net's fanout changes with the new plugins.
 

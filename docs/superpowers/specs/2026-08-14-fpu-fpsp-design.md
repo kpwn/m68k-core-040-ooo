@@ -1,6 +1,14 @@
 # FPU/FPSP Design
 
-**Status:** Design complete, approved, ready for `writing-plans`.
+**Status:** Implemented and merged (18-task implementation plan executed, see
+`docs/superpowers/plans/2026-08-15-fpu-fpsp-implementation-plan.md`). Integration validation
+against the ported m68k-ooo test corpus is only partial: the Task 14 triage
+(`docs/superpowers/sdd/2026-08-15-fpu-ported-test-triage.md`, 2026-08-15/16) found 12/46
+FPU/FPSP ported tests passing with several genuine gaps characterized — but the single
+largest failure bucket in that triage (the FMOVE FPn-to-`<ea>` store-direction gap, ~12 of
+the 34 failures) was fixed immediately after by Task 14b, and the corpus has not been
+re-run since, so the true current pass count is higher but unconfirmed. FBcc/FScc/FTRAPcc
+and the FMOVEM data-register-list form remain confirmed-open gaps as of that triage.
 
 **Goal:** Reverse this project's long-standing "FPU is permanently out of scope" convention.
 Implement a minimal hardware FPU sufficient to (a) let a real Motorola/Apple FPSP

@@ -1,6 +1,6 @@
 # FP-Control Multi-Word Transfer Design
 
-**Status:** Design complete, approved, ready for `writing-plans`/re-briefing.
+**Status:** Implemented (Task 9b, commit `9992813` — "FMOVEM control-register LIST form").
 
 **Goal:** A safe, general mechanism for moving multiple words between memory and the FPU's
 non-renamed control state (FPCR/FPSR/FPIAR) and FPCC as part of one macro-instruction, that

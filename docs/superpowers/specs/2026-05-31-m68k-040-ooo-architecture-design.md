@@ -1,6 +1,7 @@
 # m68k-core-040-ooo — Architecture Design
 
-**Status:** Draft for review
+**Status:** Historical baseline; the day-1 "FPU deferred" decision below was later reversed —
+the FPU is implemented and merged (see `docs/superpowers/specs/2026-08-14-fpu-fpsp-design.md`)
 **Date:** 2026-05-31
 **Supersedes:** the `m68k-ooo` / `m68k-ooo-v2` / `m68k-ooo-v3` prototypes
 **Sibling reference:** `m68k-core-030-inorder` (faithful in-order 68030; source of the

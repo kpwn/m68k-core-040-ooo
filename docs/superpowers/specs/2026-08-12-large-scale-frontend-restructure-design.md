@@ -1,6 +1,12 @@
 # Large-scale frontend restructure: the Unified Fetch Array + Verdict-Terminated Lookup (design)
 
-**Status:** design only. No RTL written, no synthesis run, no checkpoint opened for
+**Status:** Implemented and merged (`b370d89`, 2026-08-13 — the completed 16-task UFA/VTL
+frontend restructure). Post-route FMax 182.749 -> 195.427 MHz (+12.678 MHz) as an
+RTL+floorplan unit result at merge time; see the FMax ledger for later campaigns' numbers.
+Every number below reflects the pre-implementation design-time state and should be read
+as historical. Original text follows, unedited:
+
+No RTL written, no synthesis run, no checkpoint opened for
 this document. Every number below is either read directly out of the current source,
 read out of an already-archived report on disk, or explicitly labelled as an estimate
 or a projection. Awaiting explicit go-ahead before any implementation.
