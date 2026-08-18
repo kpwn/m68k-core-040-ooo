@@ -264,9 +264,17 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
 
   private def totalPendingBeats: Int = queues.map(_.size).sum
 
+  /** AXI4-correct byte-lane placement: a narrow transfer's data appears on the byte
+    * lane(s) matching its OWN address, i.e. lane `base mod busBytes`, not lane 0
+    * unconditionally. Every caller before task #227 (DcachePlugin's INHIBITED-load
+    * exact-cover sequencer) only ever read a full `busBytes`-wide, `busBytes`-aligned
+    * beat -- for which `base mod busBytes == 0` always, so `laneStart` is always 0
+    * and this is bit-for-bit the old behaviour. Only a narrow, non-bus-width-aligned
+    * `base` (the new INHIBITED sub-transaction case) changes what this returns. */
   private def readBeatData(base: Long, bytes: Int): BigInt = {
+    val laneStart = (base % (busConfig.dataWidth / 8)).toInt
     var v = BigInt(0)
-    for (i <- 0 until bytes) v = v | (BigInt(mem.read(base + i).toInt & 0xff) << (8 * i))
+    for (i <- 0 until bytes) v = v | (BigInt(mem.read(base + i).toInt & 0xff) << (8 * (laneStart + i)))
     v
   }
 

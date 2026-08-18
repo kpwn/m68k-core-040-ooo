@@ -191,6 +191,11 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     val missTag   = Reg(UInt(tagBits bits))
     val missOff   = Reg(UInt(offBits bits))
     val missSize  = Reg(Size())
+    // D6/D25/D30: the INHIBITED sub-transaction sequencer's cursor and its CLAMPED end.
+    // Both are LINE-RELATIVE, so `subP`'s low bits are the emitted address's low bits and
+    // the natural-alignment test needs no separate address arithmetic (spec 3.4).
+    val subP   = Reg(UInt(offBits bits)) init 0
+    val subEnd = Reg(UInt(offBits + 1 bits)) init 0
     // Task P1.4: an INHIBITED (MMIO) miss never allocates a line on refill (no
     // stale-data risk from caching a device register, no phantom "hit" on a
     // later access to the same address that may have changed underneath us).
@@ -1050,6 +1055,31 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
           missOff   := ldS1Off
           missSize  := ldS1Size
           missCmode := ldS1Cmode
+          // D25's clamp, applied where the range ENTERS the sequencer rather than where it
+          // is consumed: `end = min(off + n, 16)`. The incoming range is NOT already
+          // line-contained -- LsEuPlugin.scala:759 sends both split slots at the full
+          // original size -- so trusting it would emit a transaction one line past the
+          // access, which for a cross-page access is a page the core never translated.
+          //
+          // NOTE ON SITE CHOICE: `grep -n 'missCmode :='` finds TWO sites, not one -- this
+          // load-miss site (`ldS1Cmode`) and the store-drain-miss site below
+          // (`missCmode := CacheMode.COPYBACK`, a hardcoded literal). Only THIS site can
+          // ever latch `missCmode === INHIBITED` -- a COPYBACK drain-miss never does -- so
+          // `subP`/`subEnd` only need a real value here; REFILL's `inhib` gate (derived
+          // from `missCmode`) is False for the whole store-drain excursion regardless of
+          // what these two registers hold left over from a prior load.
+          subP   := ldS1Paddr(offBits - 1 downto 0)
+          subEnd := m68k040.socket.MmioCover.clampedEnd(
+                      ldS1Paddr(offBits - 1 downto 0),
+                      m68k040.socket.MmioCover.sizeBytes(ldS1Size))
+          // `missFault` must be cleared here: REFILL's INHIBITED arm now ACCUMULATES
+          // (`missFault || respErr`) across a multi-sub-transaction sequence rather than
+          // assigning once, so a stale True left over from a PRIOR access would otherwise
+          // leak into this one's first sub-transaction. The store-drain site does not
+          // need this: REFILL's non-INHIBITED arm still assigns `missFault := respErr`
+          // (a plain overwrite, not an OR) on every entry, so no stale value can survive
+          // there regardless of what it held on entry.
+          missFault := False
           victimWay := vw
           // Task P4.3: capture the victim's dirty/tag/line HERE — the shared read
           // port was pointed at ldS1Set exactly one cycle ago (the accept cycle
@@ -1239,12 +1269,30 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
         // Refill from the PHYSICAL line base (the access was already translated;
         // missPaddr holds the resolved physical address). Under identity == vaddr.
         val lineBase = (missPaddr(31 downto offBits) ## U(0, offBits bits)).asUInt
+
+        // ── D4/D24/D30: INHIBITED accesses get a REAL AxSIZE and a byte-granular address
+        // The cacheable path below is bit-identical to before: one len=0/size=4 beat at the
+        // line base. This arm is reachable only when `missCmode === INHIBITED`, and an
+        // INHIBITED load ALWAYS reaches REFILL because `ldS1Cacheable` (:353) forces every
+        // hit bit low by construction.
+        //
+        // WHY THE FIX IS HERE AND NOT IN LsEuPlugin's split predicate: `s1CrossLine` /
+        // `s1CrossPage` are computed at S1 from `s1Va` (:439-444), BEFORE translation
+        // resolves, so `cacheMode` is not known there. Making the predicate
+        // cacheMode-independent would put every misaligned CACHEABLE access on the rare
+        // two-pass replay FSM and cost real IPC on the hot path.
+        val inhib   = missCmode === CacheMode.INHIBITED
+        val subLog2 = m68k040.socket.MmioCover.stepLog2(subP, subEnd)
+        val subBytes = (U(1, 4 bits) |<< subLog2).resize(4 bits)     // 1, 2 or 4
+        val subAddr = (missPaddr(31 downto offBits) ## subP).asUInt
+        val subLast = (subP +^ subBytes) === subEnd
+
         when(!arSent) {
           axi.ar.valid         := True
-          axi.ar.payload.addr  := lineBase
+          axi.ar.payload.addr  := Mux(inhib, subAddr, lineBase)
           axi.ar.payload.id    := U(AxiIds.dRefill(0), AxiIds.ID_W bits)
           axi.ar.payload.len   := U(0, 8 bits)
-          axi.ar.payload.size  := U(4, 3 bits)  // 16 bytes
+          axi.ar.payload.size  := Mux(inhib, subLog2.resize(3 bits), U(4, 3 bits))
           axi.ar.payload.burst := Axi4.burst.INCR
           when(axi.ar.ready) { arSent := True }
         }
@@ -1290,9 +1338,53 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
             }
             victim(missSet) := victim(missSet) + 1
           }
-          missLine  := axi.r.payload.data
-          missFault := respErr
-          goto(REPLAY)
+          when(inhib) {
+            // Merge THIS sub-transaction's bytes into `missLine` at their own line offsets.
+            // A narrow AXI read returns its bytes in the lanes matching its own address, so
+            // the returned byte at line offset i is at data[8i +: 8] -- the same index it
+            // occupies in `missLine`. No shifting, and the existing extraction at :499-502
+            // (`DcacheByteLane.extract(missLine, missOff, missSize)`) stays correct
+            // unchanged, whether missLine was filled by one 16-byte beat or by three narrow
+            // ones.
+            val rBytes   = axi.r.payload.data.subdivideIn(8 bits)
+            val curBytes = missLine.subdivideIn(8 bits)
+            val newBytes = Vec(Bits(8 bits), 1 << offBits)
+            for (i <- 0 until (1 << offBits)) {
+              val inSub = (U(i, offBits + 1 bits) >= subP.resize(offBits + 1 bits)) &&
+                          (U(i, offBits + 1 bits) < (subP +^ subBytes))
+              newBytes(i) := Mux(inSub, rBytes(i), curBytes(i))
+            }
+            missLine  := newBytes.asBits
+            // Sticky across the sequence: a non-OKAY response on ANY sub-transaction raises
+            // the existing busFaultResp, exactly as a single-beat refill error does today.
+            missFault := missFault || respErr
+            when(subLast || respErr) {
+              goto(REPLAY)
+            } otherwise {
+              subP   := (subP +^ subBytes).resize(offBits bits)
+              arSent := False                      // arm the next sub-transaction
+            }
+          } otherwise {
+            missLine  := axi.r.payload.data
+            missFault := respErr
+            goto(REPLAY)
+          }
+        }
+
+        // Spec section 13 turns the D30 cases into a HARD check: an INHIBITED
+        // sub-transaction whose byte extent leaves the architectural access, or whose
+        // AxADDR is not naturally aligned for its own AxSIZE, is a BUG, not a case to
+        // absorb.
+        GenerationFlags.simulation {
+          when(inhib && axi.ar.valid) {
+            assert((subP +^ subBytes) <= subEnd,
+              "DcachePlugin: an INHIBITED sub-transaction runs past the access", FAILURE)
+            assert(subP >= missPaddr(offBits - 1 downto 0),
+              "DcachePlugin: an INHIBITED sub-transaction starts before the access", FAILURE)
+            assert((subP.asBits & ((subBytes - 1).asBits.resize(offBits))) === B(0, offBits bits),
+              "DcachePlugin: an INHIBITED AxADDR is not naturally aligned for its AxSIZE",
+              FAILURE)
+          }
         }
       }
 
