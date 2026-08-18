@@ -925,6 +925,17 @@ plan: `docs/superpowers/plans/2026-08-17-debug-ctrl-stage0-stage1.md`.
 
 - [ ] **Step 3: Append §15**
 
+**Note (Task 3 has been executed; this draft is superseded on two points).** The committed
+§15.1 in the spec is the authority, not the draft below. Its "Init-done observation"
+paragraph was corrected during Task 3's own review to state that init-done state does NOT
+survive CPU reset — the draft's "Both live in the debug reset domain and therefore survive
+CPU reset" is wrong, and the requirement it was replaced with (a CPU-reset rising-edge
+detector wiping both `ctrl_init_done_override` and `init_done_latched`, mirroring
+`debug_ctrl.v:2464`) is implemented by Task 9. The `debug_reset_ctl.v:129-139` citation
+below was likewise corrected to `:133-142`. Do not re-apply the draft text over the
+committed spec; read
+`docs/superpowers/specs/2026-08-09-debug-ctrl-jtag-repl-design.md` §15.1 instead.
+
 Append to the end of `docs/superpowers/specs/2026-08-09-debug-ctrl-jtag-repl-design.md`:
 
 ```markdown
@@ -2958,10 +2969,11 @@ EOF
 - Test: `src/test/scala/m68k040/debug/DebugCtrlCsrSpec.scala`
 
 **Interfaces:**
-- Consumes: `DebugCtrlPlugin.logic.csr.{doWrite, doRead, awAddr, arAddr, wData, wStrb, rData}` (Task 7); `DebugRegMap.{OFF_CONTROL, OFF_STATUS}` (Task 4).
+- Consumes: `DebugCtrlPlugin.logic.csr.{doWrite, doRead, awAddr, arAddr, wData, wStrb, rData}` and `DebugCtrlPlugin.logic.coreCd` (Task 7); `DebugRegMap.{OFF_CONTROL, OFF_STATUS}` (Task 4).
 - Produces, relied on by Tasks 10-12:
   - core-level ports `coldResetPulse: Bool` (`cpu_cold_reset_pulse`), `coldResetHold: Bool` (`cpu_cold_reset_hold`), `initDoneSeen: Bool` (`init_done_seen`);
-  - debug-domain registers `csr.ctrlInitDoneOvr: Bool`, `csr.ctrlColdHold: Bool`, `csr.coldPulse: Bool`, `csr.initDoneSticky: Bool`, all `simPublic()`;
+  - `csr.cpuRstLevel: Bool` (combinational, `coreCd.isResetActive`) and `csr.cpuRstEvent: Bool` (`simPublic()`) — the CPU-reset rising-edge detector mirroring `debug_reset_ctl.v:133-142`. It is declared **here, in Task 9, not in Task 11**, because spec §15.1's init-done wipe below is its first consumer and that wipe is unimplementable without it. Task 11 **consumes** both (for its surviving reset counter and its §13 assertion) and declares neither;
+  - debug-domain registers `csr.ctrlInitDoneOvr: Bool`, `csr.ctrlColdHold: Bool`, `csr.coldPulse: Bool`, `csr.initDoneSticky: Bool`, all `simPublic()`. Note the split spec §15.1 draws through this list: `ctrlColdHold` is *host configuration* and survives every CPU reset, while `ctrlInitDoneOvr` and `initDoneSticky` are *CPU-coupled runtime state* and are wiped to 0 on every `cpuRstEvent`. Anything downstream that treats these four as one category is wrong;
   - `csr.initDoneLatched: Bool` and `csr.controlWord: Bits` (a `def`, 32 bits), the single definition of the CONTROL readback word shared by the read mux and the write-side merge.
 
 - [ ] **Step 1: Write the failing test**
@@ -3103,6 +3115,61 @@ Append to `src/test/scala/m68k040/debug/DebugCtrlCsrSpec.scala`, inside the clas
     }
   }
 
+  test("a CPU reset wipes the init-done state but NOT the cold-reset hold") {
+    M68kSim().compile(new DebugCtrlDut()).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      dut.dbg.logic.initDoneSeen #= false
+      dut.clockDomain.waitSampling(20)
+      def status(): Long =
+        DbgAxiDriver.read(dut.axi, dut.clockDomain, DebugRegMap.OFF_STATUS.toLong)
+
+      // Arm all three bits: the override and the sticky latch (both CPU-COUPLED RUNTIME
+      // state, spec 15.1) plus the cold-reset hold (host configuration) as the control
+      // that proves the wipe is SELECTIVE and not a blanket reset of the debug domain.
+      DbgAxiDriver.write(dut.axi, dut.clockDomain, DebugRegMap.OFF_CONTROL.toLong,
+        CTRL_INIT_DONE_OVR | CTRL_COLD_HOLD)
+      dut.clockDomain.waitSampling(2)
+      dut.dbg.logic.initDoneSeen #= true
+      dut.clockDomain.waitSampling(3)
+      // Deassert the LEVEL before the reset: it is live truth from the SoC, so leaving it
+      // high would legitimately re-latch the sticky bit the cycle after the wipe and the
+      // test would be measuring the level, not the wipe.
+      dut.dbg.logic.initDoneSeen #= false
+      dut.clockDomain.waitSampling(3)
+      assert(dut.dbg.logic.csr.initDoneSticky.toBoolean, "the sticky latch did not set")
+      assert(dut.dbg.logic.csr.ctrlInitDoneOvr.toBoolean, "CONTROL bit 3 did not set")
+      assert((status() & STAT_INIT_DONE) != 0, "STATUS.init_done must be set before the reset")
+      assert(dut.dbg.logic.coldResetHold.toBoolean,
+        "the cold-reset hold (the survives-side control) did not set")
+
+      // Assert and release the SOCKET reset. Task 11 later factors this into a `cpuReset`
+      // helper in DebugCtrlResetSpec; Task 9 lands first, so it is written out here.
+      dut.clockDomain.assertReset()
+      dut.clockDomain.waitSampling(5)
+      dut.clockDomain.deassertReset()
+      dut.clockDomain.waitSampling(5)
+
+      // Spec 15.1: init-done state "would report a previous life as the current one" if it
+      // survived. A debugger attaching after a CPU reset must not be told DDR calibration
+      // of the PREVIOUS boot completed, and must not inherit the previous host's forgery.
+      assert(!dut.dbg.logic.csr.initDoneSticky.toBoolean,
+        "the sticky init-done latch survived a CPU reset (spec 15.1: it must be wiped)")
+      assert(!dut.dbg.logic.csr.ctrlInitDoneOvr.toBoolean,
+        "the CONTROL bit 3 override survived a CPU reset (spec 15.1: it must be wiped)")
+      assert((status() & STAT_INIT_DONE) == 0,
+        "STATUS.init_done still reads set after a CPU reset -- a stale claim that DDR " +
+        "calibration completed, which is exactly what spec 15.1 forbids")
+      // ... while the hold, host configuration, is untouched by the same edge.
+      assert(dut.dbg.logic.coldResetHold.toBoolean,
+        "the cold-reset hold was wiped too -- the wipe must be selective (spec 15.1: " +
+        "cold_reset_hold is explicitly NOT part of the wipe set)")
+      val rb = DbgAxiDriver.read(dut.axi, dut.clockDomain, DebugRegMap.OFF_CONTROL.toLong)
+      assert((rb & CTRL_COLD_HOLD) != 0, f"CONTROL readback 0x$rb%08X lost bit 4")
+      assert((rb & CTRL_INIT_DONE_OVR) == 0, f"CONTROL readback 0x$rb%08X kept bit 3")
+    }
+  }
+
   test("CONTROL honours byte strobes: a zero-strobe write changes nothing") {
     M68kSim().compile(new DebugCtrlDut()).doSim { dut =>
       dut.clockDomain.forkStimulus(10)
@@ -3138,7 +3205,21 @@ Expected: compilation error `value coldResetHold is not a member of ...` — the
 
 - [ ] **Step 3: Write minimal implementation**
 
-In `src/main/scala/m68k040/debug/DebugCtrlPlugin.scala`, immediately after the `dbgAxi.setName("dbg_axi")` line, add the socket group:
+In `src/main/scala/m68k040/debug/DebugCtrlPlugin.scala`, first correct the class scaladoc's
+reset-domain list, whose "CPU runtime" bullet Task 7 wrote as `Stage 1 has none; the CPU
+reset is only OBSERVED, as a rising edge detected inside the debug domain.` — this task is
+what makes that false. Replace that bullet's body with:
+
+```scala
+  *  - '''CPU runtime''' -- state that must restart with the CPU. The CPU reset is only ever
+  *    OBSERVED, as a rising edge detected inside the debug domain; it is never wired as a
+  *    reset here. Stage 1's CPU-coupled runtime state is the sticky init-done latch and the
+  *    CONTROL bit 3 override, which that observed edge WIPES (spec section 15.1,
+  *    `debug_ctrl.v:2464`). Host configuration -- the cold-reset hold, the RAM window, the
+  *    monitor sense -- is the other category and survives the same edge.
+```
+
+Then, immediately after the `dbgAxi.setName("dbg_axi")` line, add the socket group:
 
 ```scala
     // ── Socket surface (cpu_socket.vh section 6, "SoC-fabric control group") ────────
@@ -3148,20 +3229,52 @@ In `src/main/scala/m68k040/debug/DebugCtrlPlugin.scala`, immediately after the `
     coldResetPulse.simPublic(); coldResetHold.simPublic(); initDoneSeen.simPublic()
 ```
 
-Inside the `csr` Area, after the `merged` helper, add the configuration registers:
+Inside the `csr` Area, after the `merged` helper, add the CPU-reset edge detector. It must
+come **before** the registers below, because spec §15.1's init-done wipe is its first
+consumer. `coreCd` is the enclosing `logic` Area's `val coreCd = ClockDomain.current`
+(Task 7), so it is in scope here; `dbgCd.setSynchronousWith(coreCd)` (also Task 7) is what
+makes reading its reset as data legal rather than a clock-domain-crossing error:
 
 ```scala
-      // ── Host configuration, debug reset domain: survives every CPU reset ─────────
-      val ctrlInitDoneOvr = RegInit(False); ctrlInitDoneOvr.simPublic()
+      // ── CPU reset: OBSERVED, never consumed ────────────────────────────────────
+      // The socket `rst` is read as data by registers that this reset does not clear.
+      // Reset value True so a `rst` already high when the debug domain leaves POR does
+      // not manufacture a spurious edge (debug_reset_ctl.v:133-142).
+      val cpuRstLevel = coreCd.isResetActive
+      val cpuRstQ     = RegInit(True)
+      cpuRstQ := cpuRstLevel
+      val cpuRstEvent = cpuRstLevel && !cpuRstQ; cpuRstEvent.simPublic()
+```
+
+Then, still inside the `csr` Area, the configuration registers. Spec §15.1 splits these
+into two categories that must NOT be conflated — `debug_ctrl.v:2447-2462`'s contract
+comment is the authority — so they are declared under two separate headers:
+
+```scala
+      // ── Host configuration: survives every CPU reset (spec 15.1) ─────────────────
+      // The hold is a term of the SoC's cpu_rst_or AND lives in a domain that reset does
+      // not clear: the exact pairing debug_reset_ctl.v exists to make possible, since a
+      // hold that cleared itself on the reset it requests can never hold anything.
       val ctrlColdHold    = RegInit(False); ctrlColdHold.simPublic()
-      val initDoneSticky  = RegInit(False); initDoneSticky.simPublic()
-      /** One-cycle pulse; defaults low every cycle and is set only by a CONTROL write. */
+
+      /** One-cycle pulse; defaults low every cycle and is set only by a CONTROL write.
+        * Self-clearing, so the survives/wiped question does not arise for it. */
       val coldPulse       = RegInit(False); coldPulse.simPublic()
       coldPulse := False
 
-      // A level input, latched sticky so a debugger attaching after DDR calibration
-      // still observes it. Living in the debug domain, it also survives CPU reset.
-      when(initDoneSeen) { initDoneSticky := True }
+      // ── CPU-COUPLED RUNTIME state: WIPED on the CPU-reset edge (spec 15.1) ───────
+      // Not host configuration. State that, if it survived, "would report a previous life
+      // as the current one": STATUS bit 2 is a claim that DDR calibration completed, and a
+      // debugger attaching after a CPU reset must not be handed the previous boot's claim
+      // (nor the previous host's CONTROL-bit-3 forgery of it). The deployed reference
+      // wipes both of these in its cpu_rst_event-gated counters_clear block
+      // (debug_ctrl.v:2464, :2468, :2561). Living in the debug reset domain does NOT by
+      // itself mean surviving CPU reset -- the edge detector above is precisely what lets
+      // same-domain logic tell the two categories apart.
+      // The wipe itself is deliberately NOT written here; see the block after the write
+      // decode below, and the ordering note there for why.
+      val ctrlInitDoneOvr = RegInit(False); ctrlInitDoneOvr.simPublic()
+      val initDoneSticky  = RegInit(False); initDoneSticky.simPublic()
 
       val initDoneLatched = initDoneSticky || ctrlInitDoneOvr
 
@@ -3201,6 +3314,41 @@ Replace the empty `when(doWrite) { ... }` block with:
       }
 ```
 
+Immediately **after** that `when(doWrite)` block — the position is load-bearing, see the
+comment — add the init-done sticky latch and its CPU-reset wipe:
+
+```scala
+      // ── The spec-15.1 wipe, and the sticky latch it overrides ────────────────────
+      // POSITION IS LOAD-BEARING, and this is the one subtle thing in this file.
+      // SpinalHDL resolves several assignments to the same register by LAST ASSIGNMENT
+      // WINS in elaboration order (the generated process emits them in order, so a later
+      // `:=` overwrites an earlier one in the same cycle). This block is elaborated AFTER
+      // the CONTROL write arm above, so in the cycle where a CONTROL write lands on the
+      // very same edge that asserts the CPU reset, `ctrlInitDoneOvr := m(3)` is issued
+      // first and `ctrlInitDoneOvr := False` second -- the wipe wins, which is the
+      // required precedence: a host write racing the reset must not survive the reset it
+      // raced. Expressing it the other way round (wipe first, write second) would let a
+      // host resurrect the override in the same cycle the CPU restarted, i.e. exactly the
+      // stale claim spec 15.1 forbids. `when`/`elsewhen` gives the same precedence WITHIN
+      // this block: the reset edge beats a still-high `initDoneSeen` level for the wipe
+      // cycle, and if that level is genuinely still high the cycle after, the sticky latch
+      // simply re-arms from live SoC truth, which is correct and intended.
+      // MAINTENANCE RULE: any future statement assigning `ctrlInitDoneOvr` or
+      // `initDoneSticky` must be placed ABOVE this block, never below it. Task 10's and
+      // Task 11's write-decode additions all go inside the `when(doWrite)` switch above,
+      // so they are; Task 10's `cfgWipe` block is a PEER of this one, placed after the
+      // write decode for exactly the same last-wins reason, and assigns a disjoint set of
+      // registers (`ramWindow`, `mon`), so the order between those two blocks is free.
+      when(cpuRstEvent) {
+        ctrlInitDoneOvr := False
+        initDoneSticky  := False
+      } elsewhen (initDoneSeen) {
+        // A level input, latched sticky so a debugger attaching after DDR calibration
+        // still observes it -- within this CPU's lifetime, not a previous one.
+        initDoneSticky := True
+      }
+```
+
 Extend the `switch(arAddr)` read arm with:
 
 ```scala
@@ -3230,7 +3378,7 @@ Finally, drive the socket outputs at the end of the `csr` Area, before the asser
 cd /home/qwertyoruiop/m68k-core-040-ooo && ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlCsrSpec m68k040.debug.DebugCtrlAxiSpec"
 ```
 
-Expected: 14 + 8 = 22 tests pass, `[success]`. `DebugCtrlAxiSpec` needs no change: it never drives `initDoneSeen`, and SpinalSim leaves an unpoked input at 0.
+Expected: 15 + 8 = 23 tests pass, `[success]`. `DebugCtrlAxiSpec` needs no change: it never drives `initDoneSeen`, and SpinalSim leaves an unpoked input at 0.
 
 - [ ] **Step 5: Commit**
 
@@ -3251,10 +3399,27 @@ will never set.
 
 STATUS reads halted=0 / running=1 / exception=0 / auto-halt=0, keeping spec
 3.3's "halted and running are mutually exclusive" true, with bit 2 driven by a
-sticky latch of the socket's init_done_seen ORed with the override. Both the
-latch and the hold live in the debug reset domain, so they survive the CPU
-reset the hold itself requests -- the exact self-clearing bug debug_reset_ctl.v
-was written to fix.
+sticky latch of the socket's init_done_seen ORed with the override.
+
+Adds the CPU-reset rising-edge detector (debug_reset_ctl.v:133-142), whose own
+reset value is 1 so a reset already high when the debug domain leaves POR does
+not manufacture a spurious edge, and uses it to split the debug domain's state
+into the two categories spec 15.1 requires:
+
+  * host configuration -- ctrl_cold_reset_hold -- SURVIVES every CPU reset. It
+    is both a term of the SoC's cpu_rst_or and reset-immune, which is the exact
+    self-clearing bug debug_reset_ctl.v was written to fix.
+  * CPU-coupled runtime state -- the sticky init-done latch and the CONTROL
+    bit 3 override -- is WIPED to 0 on every CPU-reset edge, mirroring the
+    deployed counters_clear block (debug_ctrl.v:2464, :2468, :2561). Living in
+    the debug reset domain does not by itself mean surviving CPU reset: STATUS
+    bit 2 claims DDR calibration completed, and a debugger attaching after a
+    reset must not be handed the previous boot's claim, nor the previous host's
+    forgery of it.
+
+The wipe is elaborated after the CONTROL write arm, so SpinalHDL's last-
+assignment-wins ordering makes it beat a host write that lands on the very same
+edge -- a write racing the reset must not survive the reset it raced.
 
 Byte strobes gate the CONTROL write through the shared merged() helper, so a
 WSTRB=0 or byte-0-unstrobed write leaves the register untouched.
@@ -3558,7 +3723,7 @@ And drive the two new outputs alongside the cold-reset pair:
 cd /home/qwertyoruiop/m68k-core-040-ooo && ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlSocketSpec m68k040.debug.DebugCtrlCsrSpec m68k040.debug.DebugCtrlAxiSpec"
 ```
 
-Expected: 7 + 14 + 8 = 29 tests pass, `[success]`.
+Expected: 7 + 15 + 8 = 30 tests pass, `[success]`.
 
 - [ ] **Step 5: Commit**
 
@@ -3604,8 +3769,9 @@ EOF
 - Test: `src/test/scala/m68k040/debug/DebugCtrlResetSpec.scala`
 
 **Interfaces:**
-- Consumes: `csr.{doWrite, doRead, awAddr, arAddr, wData, wStrb, rData, ramWindow, mon, ctrlColdHold, ctrlInitDoneOvr, cfgWipe}` (Tasks 7, 9, 10); `logic.coreCd` (Task 7); `DebugRegMap.OFF_DBG_RESET_CTL` (Task 4).
-- Produces: `csr.cpuRstEvent: Bool` and `csr.cpuResetCount: UInt` (16 bits, saturating), both `simPublic()`; the `OFF_DBG_RESET_CTL` read arm; and the two remaining §13 assertions. This completes the Stage-1 RTL.
+- Consumes: `csr.{doWrite, doRead, awAddr, arAddr, wData, wStrb, rData, ramWindow, mon, ctrlColdHold, cfgWipe}` (Tasks 7, 9, 10); **`csr.cpuRstEvent` and `csr.cpuRstLevel`, both already declared by Task 9** (the CPU-reset rising-edge detector moved there because spec §15.1's init-done wipe is its first consumer); `DebugRegMap.OFF_DBG_RESET_CTL` (Task 4).
+- Produces: `csr.cpuResetCount: UInt` (16 bits, saturating, `simPublic()`); the `OFF_DBG_RESET_CTL` read arm; and the two remaining §13 assertions. This completes the Stage-1 RTL.
+- Deliberately NOT consumed: `csr.ctrlInitDoneOvr`. Spec §15.1 makes it CPU-coupled runtime state that Task 9 wipes on a CPU-reset edge, so it must stay out of the "surviving configuration" assertion below — including it would make that assertion fire on the first CPU reset `DebugCtrlResetSpec` performs.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3647,6 +3813,12 @@ class DebugCtrlResetSpec extends AnyFunSuite {
     dut.clockDomain.waitSampling(5)
   }
 
+  /** Only the HOST-CONFIGURATION half of spec section 15.1's split is tested here. Its
+    * mirror image -- that the CPU-COUPLED RUNTIME half (the sticky init-done latch and the
+    * CONTROL bit 3 override) is WIPED by the same edge -- is
+    * `DebugCtrlCsrSpec`'s "a CPU reset wipes the init-done state but NOT the cold-reset
+    * hold", next to the registers it concerns. The two together are the whole property;
+    * neither alone would catch a blanket-survive or a blanket-wipe implementation. */
   test("host configuration survives a CPU reset") {
     M68kSim().compile(new DebugCtrlDut()).doSim { dut =>
       settle(dut)
@@ -3745,7 +3917,7 @@ class DebugCtrlResetSpec extends AnyFunSuite {
     M68kSim().compile(new DebugCtrlDut(porCyclesArg = 8)).doSim { dut =>
       // Hold the socket reset asserted across the whole debug POR window. The edge
       // detector's reset value is 1 precisely so this does not manufacture an edge
-      // (debug_reset_ctl.v:129-139).
+      // (debug_reset_ctl.v:133-142).
       DbgAxiDriver.idle(dut.axi)
       dut.dbg.logic.initDoneSeen #= false
       dut.clockDomain.forkStimulus(10)
@@ -3815,19 +3987,17 @@ Expected: compilation error `value cpuResetCount is not a member of ...`.
 
 - [ ] **Step 3: Write minimal implementation**
 
-In the `csr` Area of `src/main/scala/m68k040/debug/DebugCtrlPlugin.scala`, add the edge
-detector and counter immediately after the AXI FSM registers:
+The CPU-reset edge detector (`cpuRstLevel` / `cpuRstQ` / `cpuRstEvent`) already exists:
+Task 9 declares it in this same `csr` Area, ahead of its init-done registers, because spec
+§15.1's init-done wipe is its first consumer. **Do not redeclare it here** — read the
+existing `cpuRstEvent` and `cpuRstLevel`. If it is somehow absent from the file, Task 9 was
+not completed as specified and this task is blocked on it, because a counter of edges and a
+wipe on edges must count the *same* edges from one detector, not two.
+
+In the `csr` Area of `src/main/scala/m68k040/debug/DebugCtrlPlugin.scala`, add the counter
+immediately after that existing detector:
 
 ```scala
-      // ── CPU reset: OBSERVED, never consumed ────────────────────────────────────
-      // The socket `rst` is read as data by registers that this reset does not clear.
-      // Reset value True so a `rst` already high when the debug domain leaves POR does
-      // not manufacture a spurious edge (debug_reset_ctl.v:129-139).
-      val cpuRstLevel = coreCd.isResetActive
-      val cpuRstQ     = RegInit(True)
-      cpuRstQ := cpuRstLevel
-      val cpuRstEvent = cpuRstLevel && !cpuRstQ; cpuRstEvent.simPublic()
-
       /** Surviving 16-bit count of observed CPU-reset edges. SATURATES: zero means "no
         * reset observed since the last clear" and must not be reachable by wraparound
         * (spec 15.4). Lives in the debug domain, so it survives the resets it counts. */
@@ -3862,9 +4032,14 @@ Finally, add the second required §13 assertion next to the first:
 ```scala
         // "CPU reset cannot change surviving debug configuration" (spec section 13).
         // The only legal movers of this vector are an applied AXI write and a cfg wipe.
-        val cfgVec = ctrlColdHold ## ctrlInitDoneOvr ## ramWindow.asBits ## mon.asBits
+        // `ctrlInitDoneOvr` is deliberately ABSENT: spec 15.1 classifies it as CPU-coupled
+        // runtime state that Task 9 WIPES on the CPU-reset edge, so it is not surviving
+        // configuration and including it here would make this assertion fire on the first
+        // CPU reset. `initDoneSticky` is absent for the same reason. What remains is
+        // exactly debug_ctrl.v:2447-2462's "host configuration" set for Stage 1.
+        val cfgVec = ctrlColdHold ## ramWindow.asBits ## mon.asBits
         val cfgVecPrev = RegNext(cfgVec) init (
-          False ## False ##
+          False ##
           B(DebugRegMap.RAM_WINDOW_LG2_POR, 6 bits) ##
           B(DebugRegMap.MON_SENSE_POR, 7 bits))
         assert(!(cpuRstLevel && !doWrite && !cfgWipe && (cfgVec =/= cfgVecPrev)),
@@ -3879,7 +4054,7 @@ Finally, add the second required §13 assertion next to the first:
 cd /home/qwertyoruiop/m68k-core-040-ooo && ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlResetSpec m68k040.debug.DebugCtrlSocketSpec m68k040.debug.DebugCtrlCsrSpec m68k040.debug.DebugCtrlAxiSpec"
 ```
 
-Expected: 7 + 7 + 14 + 8 = 36 tests pass, `[success]`, and no `FAILURE` from either
+Expected: 7 + 7 + 15 + 8 = 37 tests pass, `[success]`, and no `FAILURE` from either
 synthesis-excluded assertion.
 
 - [ ] **Step 5: Commit**
@@ -3891,16 +4066,22 @@ git add src/main/scala/m68k040/debug/DebugCtrlPlugin.scala \
 git commit -m "$(cat <<'EOF'
 debug(stage1): CPU-reset observation, surviving counter, and the section 13 assertions
 
-The socket `rst` is read as DATA by an edge detector clocked in the debug
-domain, whose own reset value is 1 so a reset already asserted when the debug
-domain leaves POR does not manufacture a spurious edge. The 16-bit count lives
-in the debug domain -- it survives the very resets it counts -- and SATURATES
+Counts the CPU-reset edges the detector added in the previous commit observes --
+the socket `rst` read as DATA, with the detector's own reset value 1 so a reset
+already asserted when the debug domain leaves POR does not manufacture a
+spurious edge. One detector feeds both consumers, so the edges that wipe
+init-done state are by construction the same edges this counts. The 16-bit
+count lives in the debug domain -- it survives the very resets it counts -- and SATURATES
 at 0xFFFF, because zero means "none observed since clear" and must not be
 reachable by wraparound. OFF_DBG_RESET_CTL reads {count, 16'd0}, the deployed
 layout, and write bit 1 clears it.
 
-Adds the second required assertion: surviving configuration may only change
-via an applied AXI write or a cfg wipe, never because CPU reset asserted.
+Adds the second required assertion: surviving configuration -- the cold-reset
+hold, the RAM window and the monitor sense, i.e. debug_ctrl.v:2447-2462's "host
+configuration" set -- may only change via an applied AXI write or a cfg wipe,
+never because CPU reset asserted. The init-done override and sticky latch are
+deliberately outside that vector: spec 15.1 makes them CPU-coupled runtime
+state that the previous commit wipes on exactly this edge.
 
 Tests exercise the properties the sibling's 2026-07-26 fix exists for, directly
 rather than by inference: configuration written before a CPU reset is still
@@ -4179,7 +4360,7 @@ make SBT=~/sbt/bin/sbt test-fast 2>&1 | tail -30
 Expected: `run_tests.sh` exits 0 with `All checks passed.` from each script and three
 `CURRENT:` lines; `test-fast` reports `[success]` with the pre-existing suite count plus
 the five new debug suites (`DebugRegMapSpec` 8, `DebugCtrlAxiSpec` 8, `DebugCtrlCsrSpec`
-14, `DebugCtrlSocketSpec` 7, `DebugCtrlResetSpec` 7 — 44 new tests). Any
+15, `DebugCtrlSocketSpec` 7, `DebugCtrlResetSpec` 7 — 45 new tests). Any
 pre-existing failure must be reproduced on the parent commit before being accepted as
 unrelated.
 
@@ -4398,8 +4579,9 @@ Checked every cross-task reference, since each task's implementer sees only thei
 
 - `DebugRegMap` members used by later tasks (`DBG_AW`, `DBG_DW`, `VERSION_VALUE`, `POR_CYCLES_DEFAULT`, `RAM_WINDOW_LG2_{POR,MIN,MAX}`, `MON_SENSE_POR`, `OFF_*`, `allOffsets`, `features`, `ports`, `featuresForStage`) are all emitted by Task 4's generator, with the Int-vs-BigInt split stated there (`VERSION_VALUE` is the only constant ≥ 2³¹, so it is the only `BigInt`).
 - `DbgAxiLite`'s 17 fields, `DebugCtrlDut`'s `dbg`/`axi`, and `DbgAxiDriver`'s five methods are declared in Task 7 and used unchanged in Tasks 8-11; `strb` is a defaulted 5th parameter on `write` and a required 5th on `writeAwFirst`/`writeWFirst`, matching every call site.
-- `csr` members added incrementally (`merged`, `controlWord`, `ctrlColdHold`, `ctrlInitDoneOvr`, `coldPulse`, `initDoneSticky`, `initDoneLatched`, `ramWindow`, `mon`, `cfgWipe`, `cpuRstEvent`, `cpuResetCount`) are each declared before their first use in the elaboration order the tasks impose; the §13 assertion block stays last, so Task 11's assertion can read `doWrite`, `cfgWipe`, `ramWindow` and `mon` regardless of where they were inserted.
-- Test counts quoted in each task's Step 4 are consistent and cumulative (8 → 15 → 22 → 29 → 36), and Task 13's total of 44 new tests across five suites matches.
+- `csr` members added incrementally (`merged`, `cpuRstLevel`, `cpuRstEvent`, `controlWord`, `ctrlColdHold`, `ctrlInitDoneOvr`, `coldPulse`, `initDoneSticky`, `initDoneLatched`, `ramWindow`, `mon`, `cfgWipe`, `cpuResetCount`) are each declared before their first use in the elaboration order the tasks impose; the §13 assertion block stays last, so Task 11's assertion can read `doWrite`, `cfgWipe`, `ramWindow` and `mon` regardless of where they were inserted. `cpuRstLevel`/`cpuRstEvent` are declared once, by Task 9 (its spec-§15.1 init-done wipe is the first consumer), and only read by Task 11 — one detector, so the edges that wipe and the edges that count are the same edges.
+- One `csr` statement's POSITION, not just its declaration order, is load-bearing: Task 9's `when(cpuRstEvent){ ctrlInitDoneOvr := False; initDoneSticky := False }` must be elaborated after the `when(doWrite)` CONTROL arm, so SpinalHDL's last-assignment-wins ordering gives the reset wipe precedence over a host write landing on the same edge. Task 9 states this in the RTL comment; Tasks 10 and 11 add only `is(...)` arms inside the existing `when(doWrite)` switch, so they stay above it.
+- Test counts quoted in each task's Step 4 are consistent and cumulative (8 → 15 → 23 → 30 → 37), and Task 13's total of 45 new tests across five suites matches.
 
 ### Stage-0 code was executed, not just written
 
