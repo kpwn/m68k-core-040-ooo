@@ -61,9 +61,20 @@ def parse_ports(text):
 
 
 def async_reset_blocks(text):
-    """Bodies of every `always @(posedge clk or posedge reset)` process."""
+    """Bodies of every asynchronous-reset process, i.e. every
+    `always @(posedge clk or posedge/negedge <anything>)`.
+
+    The reset term is deliberately matched as ANY identifier rather than the literal
+    `reset`. Hardcoding `reset` made this check VACUOUS once anything renamed the
+    core's top-level reset wire (a real regression that shipped: naming
+    `coreCd.isResetActive` inside a plugin Area renames the whole core's `reset`
+    port, after which the literal `posedge clk or posedge reset` occurred zero times
+    and every scan below trivially found nothing to complain about). The point of the
+    check is "no debug register sits in an async-reset process", not "no debug
+    register sits in a process whose reset happens to be spelled `reset`."""
     bodies = []
-    pat = re.compile(r"always\s*@\s*\(\s*posedge\s+clk\s+or\s+posedge\s+reset\s*\)")
+    pat = re.compile(
+        r"always\s*@\s*\(\s*posedge\s+clk\s+or\s+(?:posedge|negedge)\s+(\w+)\s*\)")
     token = re.compile(r"\b(begin|end)\b")
     for m in pat.finditer(text):
         i = text.find("begin", m.end())
@@ -135,13 +146,38 @@ def main():
         check("port %s width is %d" % (p.name, p.width), got[1] == p.width,
               "got %d" % got[1])
 
+    # The core's top-level reset must still be exported under its exact socket name.
+    # SpinalHDL renames the whole core's `reset` port if anything inside a plugin Area
+    # binds `ClockDomain.isResetActive` to a named val, which is both an interface break
+    # (spec 15.1: socket names export verbatim, no rename shim) and the thing that made
+    # the async-reset scan below vacuous. Checked explicitly so that regression class
+    # fails HERE, by name, rather than silently disarming the scan.
+    rst = ports.get("reset")
+    check("the top-level reset port is still named `reset`", rst is not None,
+          "no `reset` in the top-level port list -- something renamed the core's reset "
+          "wire (likely a named `ClockDomain.isResetActive` inside a plugin Area); "
+          "reset-like ports present: %r"
+          % sorted(n for n in ports if "rst" in n.lower() or "reset" in n.lower()))
+    if rst is not None:
+        check("the top-level reset port is a 1-bit input",
+              rst == ("input", 1), "got %r" % (rst,))
+
     # The debug domain must never take the core's asynchronous reset.
+    arst_bodies = async_reset_blocks(text)
+    # NON-VACUITY GUARD: if the scan finds no async-reset processes at all, the taint
+    # check below passes for free and proves nothing. A ~370K-line core built on an
+    # async-reset ClockDomain has dozens of them; zero means the matcher, not the
+    # netlist, is broken.
+    check("async-reset processes were found to scan", len(arst_bodies) > 0,
+          "zero `always @(posedge clk or posedge/negedge ...)` blocks matched -- the "
+          "taint check below would be vacuous")
     tainted = set()
-    for body in async_reset_blocks(text):
+    for body in arst_bodies:
         for name in re.findall(r"\b(DebugCtrlPlugin_\w+)\s*<=", body):
             tainted.add(name)
     check("no DebugCtrlPlugin register is clocked by the core's async reset process",
-          not tainted, ", ".join(sorted(tainted)))
+          not tainted, "%d of %d async-reset process(es) assign: %s"
+                       % (len(tainted), len(arst_bodies), ", ".join(sorted(tainted))))
 
     # The power-on counter must be reset-LESS, i.e. carry a declaration initializer --
     # either the inline `reg ... = value;` form, or (what this toolchain actually
