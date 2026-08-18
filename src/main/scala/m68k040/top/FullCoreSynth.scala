@@ -369,7 +369,16 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
       case Some(a) => a.logic.wedge
       case None    => False
     }
-    rob.logic.coreHaltedIn := dc.diagFault || exc.fsXlateFault || arbWedge
+    // D14/D28: resolved once here (rather than separately at the a7Wr site below) since
+    // both the halt fold immediately below and the a7Wr drive further down need it, and a
+    // single host.get keeps the two consumers from ever disagreeing about whether a
+    // ResetVectorPlugin is present in this build.
+    val rv = host.get[m68k040.socket.ResetVectorPlugin] match {
+      case Some(p) => p.logic
+      case None    => null
+    }
+    val rvHalt = if (rv != null) rv.haltPulse else False
+    rob.logic.coreHaltedIn := dc.diagFault || exc.fsXlateFault || arbWedge || rvHalt
     // D28: priority when several fire on the same cycle is stated here rather than left to
     // elaboration order. The D-cache's diagnostic fault wins because it is the one with a
     // sub-code (DcachePlugin's private diagFaultKind) that further localises the failure;
@@ -378,9 +387,11 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
       U(m68k040.socket.HaltReason.DCACHE_DIAG, m68k040.socket.HaltReason.W bits),
       Mux(exc.fsXlateFault,
         U(m68k040.socket.HaltReason.FS_XLATE, m68k040.socket.HaltReason.W bits),
-        Mux(arbWedge,
-          U(m68k040.socket.HaltReason.ARBITER_WEDGE, m68k040.socket.HaltReason.W bits),
-          U(m68k040.socket.HaltReason.NONE, m68k040.socket.HaltReason.W bits))))
+        Mux(rvHalt,
+          U(m68k040.socket.HaltReason.RESET_VECTOR, m68k040.socket.HaltReason.W bits),
+          Mux(arbWedge,
+            U(m68k040.socket.HaltReason.ARBITER_WEDGE, m68k040.socket.HaltReason.W bits),
+            U(m68k040.socket.HaltReason.NONE, m68k040.socket.HaltReason.W bits)))))
     lsEu.excActive          := excActive
     lsEu.excLoadCmdValid    := exc.dcLoadCmd.valid
     lsEu.excLoadCmdVaddr    := exc.dcLoadCmd.payload.vaddr
@@ -422,10 +433,29 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // The a7Write address uses committedPhysA7 (commReg(15)) so the write is correct
     // even when arch-15 has been renamed by an OoO A7 write (move ...,%sp / push / bsr).
     // When A7 is unrenamed, committedPhysA7 == 15, so this is identical to the old U(15).
-    a7Wr.valid   := exc.a7WriteValid || exc.sysRegWriteValid
-    a7Wr.address := Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
-                                              host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth))
-    a7Wr.data    := Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits)
+    // D14: the initial SSP reaches committed A7 through THIS existing shared int-PRF write
+    // port, as a new HIGHEST-PRIORITY third source. Safe by construction and by the same
+    // argument the existing direct writes rely on (the "task #176 safe fix pattern" of
+    // writing committedPhysA7 directly, bypassing rename and the freelist): at the moment
+    // the reset vector lands, no instruction has been fetched, so nothing is renamed, no
+    // ROB entry exists, the ExceptionUnit is idle, and committedPhysA7 still equals 15.
+    //
+    // It reaches ISP for free: SystemState.scala:36 initialises srSys to 0x27 (S=1, M=0),
+    // so A7 IS the ISP at reset, and the committedA7In readback below already routes it
+    // into ss.isp on the following cycle with no extra wiring.
+    // (`rv` is resolved once, up at the halt-fold site above, and reused here.)
+    val rvSspValid = if (rv != null) rv.sspWriteValid else False
+    val rvSspData  = if (rv != null) rv.sspData       else U(0, 32 bits)
+    a7Wr.valid   := rvSspValid || exc.a7WriteValid || exc.sysRegWriteValid
+    a7Wr.address := Mux(rvSspValid, host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth),
+                    Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
+                                              host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth)))
+    a7Wr.data    := Mux(rvSspValid, rvSspData.asBits,
+                    Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits))
+    GenerationFlags.simulation {
+      assert(!(rvSspValid && (exc.a7WriteValid || exc.sysRegWriteValid)),
+        "the reset-vector SSP write collided with an ExceptionUnit A7/sysReg write", FAILURE)
+    }
     // LIVE committed-A7 readback: read the int PRF at the committed arch-15 phys mapping
     // and feed it to the exception unit, which drives ss.writeA7 every cycle (routed by
     // committed S,M) so ss.usp/isp/msp track the architectural A7 of the active bank.

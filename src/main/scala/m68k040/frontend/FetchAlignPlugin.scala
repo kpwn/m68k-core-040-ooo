@@ -80,6 +80,16 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     mispredictRedirect.valid.allowOverride;   mispredictRedirect.valid   := False
     mispredictRedirect.payload.allowOverride; mispredictRedirect.payload := U(0, 32 bits)
 
+    // axi-socket adapter D12/D16: the reset-vector reader's redirect. Declared with the
+    // SAME shape as mispredictRedirect above and for the same reason -- the `redirect`
+    // slave port at :72 is an INPUT of M68kCore and a sibling plugin cannot drive it (see
+    // the `feed` comment at :64-66). Idle-defaulted with CONCRETE zeros and allowOverride,
+    // never assignDontCare, so a sibling's drive is not hidden from the consumer. With no
+    // ResetVectorPlugin in the plugin list this stays constantly idle and folds away.
+    val resetRedirect = Flow(UInt(32 bits))
+    resetRedirect.valid.allowOverride;   resetRedirect.valid   := False
+    resetRedirect.payload.allowOverride; resetRedirect.payload := U(0, 32 bits)
+
     // ── STOP/fatal-halt quiesce ─────────────────────────────────────────────────
     // The ROB remains the sole state owner. It publishes the exact combinational
     // NEXT state through a setup-allocated service; registering that truth locally
@@ -1243,6 +1253,33 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       // physically coming; its stale response clears recValid normally, preserving the
       // single-outstanding invariant — a new fetch issues only after that frees occupancy.)
       // Depth-2: mark ALL ring entries stale — every fetch issued before this redirect
+      // (and one issued THIS cycle, born stale via redirectThisCycle) is wrong-path; its
+      // response must be discarded. Free slots' stale bits are don't-care (overwritten at
+      // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
+      ringStale.foreach(_ := True)
+    }
+
+    // ---- reset-vector redirect (axi-socket adapter D12/D16) ----
+    // Same effect as the external redirect above, and its body is copied verbatim from
+    // that arm (only the payload source differs): placed AFTER the external redirect so a
+    // directed harness driving the external port still wins on the impossible cycle where
+    // both fire, and BEFORE mispredictRedirect so a commit-time redirect keeps its top
+    // priority.
+    when(resetRedirect.valid) {
+      val newPc   = resetRedirect.payload
+      decodePc    := newPc
+      // fetchPc = 8-aligned base of the window containing newPc
+      fetchPc     := newPc(31 downto 3) @@ U(0, 3 bits)
+      ibuf.io.flush  := True
+      stalled        := False
+      // Clear the I-fetch-fault hold: the exception delivered + vectored, resume fetch.
+      faultHold      := False
+      faultEmitted   := False
+      started        := True
+      pendingDrop    := newPc(2 downto 1)
+      // Per-fetch stale tracking (recValid/recStale/recDrop) replaces the single-bit rspStale/dropPending.
+      // Mark the in-flight fetch (if any) stale: a redirect invalidates it.
+      // Depth-2: mark ALL ring entries stale -- every fetch issued before this redirect
       // (and one issued THIS cycle, born stale via redirectThisCycle) is wrong-path; its
       // response must be discarded. Free slots' stale bits are don't-care (overwritten at
       // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
