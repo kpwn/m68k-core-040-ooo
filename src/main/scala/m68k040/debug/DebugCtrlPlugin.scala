@@ -167,11 +167,16 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
 
       /** Surviving 16-bit count of observed CPU-reset edges. SATURATES: zero means "no
         * reset observed since the last clear" and must not be reachable by wraparound
-        * (spec 15.4). Lives in the debug domain, so it survives the resets it counts. */
+        * (spec 15.4). Lives in the debug domain, so it survives the resets it counts.
+        *
+        * The INCREMENT is deliberately NOT written here: it lives below the write decode,
+        * in the `when(cpuRstEvent)` block, so that last-assignment-wins gives a genuine
+        * reset edge priority over a host bit-1 clear landing on the very same cycle. The
+        * deployed reference has exactly that ordering -- its `cpu_reset_count_r <= 16'd0`
+        * write arm is at debug_ctrl.v:2417 and the saturating increment at :2709, later in
+        * the same always block, so the increment wins the collision there too. Losing the
+        * edge instead would tell the host "no reset occurred" about a reset that did. */
       val cpuResetCount = Reg(UInt(16 bits)) init 0; cpuResetCount.simPublic()
-      when(cpuRstEvent && cpuResetCount =/= U(0xFFFF, 16 bits)) {
-        cpuResetCount := cpuResetCount + 1
-      }
 
       // ── Host configuration: survives every CPU reset (spec 15.1) ─────────────────
       // The hold is a term of the SoC's cpu_rst_or AND lives in a domain that reset does
@@ -342,15 +347,26 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
       // this block: the reset edge beats a still-high `initDoneSeen` level for the wipe
       // cycle, and if that level is genuinely still high the cycle after, the sticky latch
       // simply re-arms from live SoC truth, which is correct and intended.
-      // MAINTENANCE RULE: any future statement assigning `ctrlInitDoneOvr` or
-      // `initDoneSticky` must be placed ABOVE this block, never below it. Task 10's and
-      // Task 11's write-decode additions all go inside the `when(doWrite)` switch above,
-      // so they are; Task 10's `cfgWipe` block is a PEER of this one, placed after the
-      // write decode for exactly the same last-wins reason, and assigns a disjoint set of
-      // registers (`ramWindow`, `mon`), so the order between those two blocks is free.
+      // The saturating reset counter's INCREMENT is here for the same reason, and its
+      // collision is the mirror image: a host bit-1 clear (`cpuResetCount := 0`, in the
+      // write decode above) landing on the very same cycle as a genuine reset edge must
+      // NOT swallow that edge, or the host is told "no reset occurred" about a reset that
+      // did. Being elaborated after the write decode, the increment wins -- matching the
+      // deployed reference, whose clear is at debug_ctrl.v:2417 and whose increment is at
+      // :2709, later in the same always block. (Review finding, Task 11 fix pass.)
+      // MAINTENANCE RULE: any future statement assigning `ctrlInitDoneOvr`,
+      // `initDoneSticky` or `cpuResetCount` must be placed ABOVE this block, never below
+      // it. Task 10's and Task 11's write-decode additions all go inside the
+      // `when(doWrite)` switch above, so they are; Task 10's `cfgWipe` block is a PEER of
+      // this one, placed after the write decode for exactly the same last-wins reason, and
+      // assigns a disjoint set of registers (`ramWindow`, `mon`), so the order between
+      // those two blocks is free.
       when(cpuRstEvent) {
         ctrlInitDoneOvr := False
         initDoneSticky  := False
+        when(cpuResetCount =/= U(0xFFFF, 16 bits)) {
+          cpuResetCount := cpuResetCount + 1
+        }
       } elsewhen (initDoneSeen) {
         // A level input, latched sticky so a debugger attaching after DDR calibration
         // still observes it -- within this CPU's lifetime, not a previous one.
@@ -374,7 +390,21 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
           False ##
           B(DebugRegMap.RAM_WINDOW_LG2_POR, 6 bits) ##
           B(DebugRegMap.MON_SENSE_POR, 7 bits))
-        assert(!(cpuRstLevel && !doWrite && !cfgWipe && (cfgVec =/= cfgVecPrev)),
+
+        /** THE ONE-CYCLE SKEW, and why this register exists (review finding, Task 11 fix
+          * pass). `doWrite` and `cfgWipe` are write-ENABLE signals: they are true in the
+          * cycle a write is APPLIED, whereas `cfgVec` only takes the new value on the NEXT
+          * edge. Comparing the two at the same instant -- `!doWrite && !cfgWipe &&
+          * (cfgVec =/= cfgVecPrev)` -- is therefore always off by one: in the cycle the
+          * change becomes visible, the mover that caused it has already gone low, so the
+          * check fires on EVERY legitimate configuration write. That is not a corner case:
+          * spec 10.1 exists precisely so the host can program `cold_reset_hold`, the RAM
+          * window and the monitor sense WHILE CPU reset is held (the real Q700 boot
+          * window), which is exactly when `cpuRstLevel` is high. Aligning the movers to
+          * the change they cause -- one cycle of delay, same edge -- restores the intended
+          * meaning: a change with NO mover in the cycle that produced it. */
+        val cfgMoved = RegNext(doWrite || cfgWipe) init False
+        assert(!(cpuRstLevel && !cfgMoved && (cfgVec =/= cfgVecPrev)),
           "DebugCtrlPlugin: surviving debug configuration changed while CPU reset was " +
           "asserted (spec section 13)",
           FAILURE)

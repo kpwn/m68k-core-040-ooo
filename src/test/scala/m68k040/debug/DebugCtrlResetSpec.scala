@@ -44,6 +44,22 @@ class DebugCtrlResetSpec extends AnyFunSuite {
     dut.clockDomain.waitSampling(5)
   }
 
+  /** A single AXI write driven with raw pokes and `sleep`, so it works with the SOCKET
+    * reset HELD -- `DbgAxiDriver.write` polls with `waitSamplingWhere` on the very
+    * `ClockDomain` whose reset is held and would hang (class-level DEVIATION note).
+    * BREADY is left high by `settle`, so `bPend` drains between calls; AWREADY/WREADY are
+    * gated by `!awPend && !bPend`, which is what stops the still-high VALIDs from being
+    * captured a second time before they are dropped. */
+  private def rawWrite(dut: DebugCtrlDut, addr: Long, data: Long, strb: Int = 0xF): Unit = {
+    val b = dut.axi
+    b.bready #= true
+    b.awaddr #= addr;  b.awvalid #= true
+    b.wdata  #= data;  b.wstrb   #= strb; b.wvalid #= true
+    sleep(3 * PERIOD)
+    b.awvalid #= false; b.wvalid #= false
+    sleep(5 * PERIOD)
+  }
+
   /** Only the HOST-CONFIGURATION half of spec section 15.1's split is tested here. Its
     * mirror image -- that the CPU-COUPLED RUNTIME half (the sticky init-done latch and the
     * CONTROL bit 3 override) is WIPED by the same edge -- is
@@ -230,6 +246,109 @@ class DebugCtrlResetSpec extends AnyFunSuite {
       assert(DbgAxiDriver.read(dut.axi, dut.clockDomain,
         DebugRegMap.OFF_MON_SENSE.toLong) == 0x33L, "configuration was lost")
       assert(dut.dbg.logic.monSense.toInt == 0x33)
+    }
+  }
+
+  /** REGRESSION for the Task-11 review's Critical finding. Every test above only ever
+    * wrote configuration with the socket reset RELEASED, which is why the §13 assertion's
+    * one-cycle skew (comparing the write-ENABLE `doWrite`/`cfgWipe` against register
+    * VALUES that only move the following cycle) stayed invisible: the assertion
+    * false-fired on every legitimate configuration write made while `cpuRstLevel` was
+    * high, and nothing exercised that. Spec 10.1 exists precisely to make this legal --
+    * the Q700 holds `cpu_rst` for the whole boot window and that is exactly when an
+    * operator programs the RAM window, the monitor sense and the cold-reset hold. All
+    * three of the reviewer's tamper probes (an ordinary config write, a `cfg_wipe`, and a
+    * CONTROL bit-4 cold-reset-hold write) are reproduced here, held-reset throughout; a
+    * regression makes the simulation die with the §13 `FAILURE`, not merely mis-compare. */
+  test("host configuration can be written while the CPU reset is HELD") {
+    M68kSim().compile(new DebugCtrlDut()).doSim { dut =>
+      settle(dut)
+      dut.clockDomain.assertReset()
+      sleep(4 * PERIOD)
+
+      // Probe 1: an ordinary RW config register.
+      rawWrite(dut, DebugRegMap.OFF_RAM_WINDOW_LG2.toLong, 29L)
+      assert(dut.dbg.logic.ramWindowLg2.toInt == 29,
+        s"a RAM-window write made during a held CPU reset did not take effect " +
+        s"(${dut.dbg.logic.ramWindowLg2.toInt})")
+
+      // Probe 2: the cfg_wipe escape hatch, which moves the same registers a cycle later
+      // than the write that requested it -- the skew's second shape.
+      rawWrite(dut, DebugRegMap.OFF_MON_SENSE.toLong, 0x2AL)
+      assert(dut.dbg.logic.monSense.toInt == 0x2A, "mon-sense write during held reset")
+      rawWrite(dut, DebugRegMap.OFF_DBG_RESET_CTL.toLong, DRC_CFG_WIPE)
+      assert(dut.dbg.logic.ramWindowLg2.toInt == DebugRegMap.RAM_WINDOW_LG2_POR,
+        "cfg_wipe during a held CPU reset did not restore the RAM window POR value")
+      assert(dut.dbg.logic.monSense.toInt == DebugRegMap.MON_SENSE_POR,
+        "cfg_wipe during a held CPU reset did not restore the mon-sense POR value")
+
+      // Probe 3: CONTROL bit 4, the cold-reset hold -- the one register whose whole
+      // purpose is to be programmed while the reset it holds is asserted.
+      rawWrite(dut, DebugRegMap.OFF_CONTROL.toLong, 1L << 4)
+      assert(dut.dbg.logic.coldResetHold.toBoolean,
+        "a cold-reset-hold write made during a held CPU reset did not take effect")
+
+      dut.clockDomain.deassertReset()
+      dut.clockDomain.waitSampling(5)
+      assert(DbgAxiDriver.read(dut.axi, dut.clockDomain,
+        DebugRegMap.OFF_CONTROL.toLong) == (1L << 4),
+        "the cold-reset hold did not read back after the reset released")
+      assert(DbgAxiDriver.read(dut.axi, dut.clockDomain,
+        DebugRegMap.OFF_MON_SENSE.toLong) == DebugRegMap.MON_SENSE_POR.toLong,
+        "the wiped mon-sense value did not read back after the reset released")
+    }
+  }
+
+  /** REGRESSION for the Task-11 review's Minor finding. A host bit-1 clear and a genuine
+    * CPU-reset edge can land on the same cycle; if the clear wins, the edge is SWALLOWED
+    * and the host is told "no reset occurred" about a reset that did. The deployed
+    * reference resolves it the other way (clear at debug_ctrl.v:2417, saturating increment
+    * at :2709, later in the same always block, so the increment's NBA wins), and this core
+    * matches it by elaborating the increment below the write decode.
+    *
+    * The collision is constructed exactly, not swept: AW and W are presented together, so
+    * both are captured on one edge E, `doWrite` is high in the cycle after E, and the
+    * clear applies on edge E+1. Asserting the socket reset immediately after E makes
+    * `cpuRstEvent` true on that same edge E+1 -- `cpuRstQ` was sampled low at E. */
+  test("a CPU-reset edge colliding with a same-cycle counter clear is not swallowed") {
+    M68kSim().compile(new DebugCtrlDut()).doSim { dut =>
+      val b = dut.axi
+      settle(dut)
+      def count(): Long =
+        DbgAxiDriver.read(dut.axi, dut.clockDomain,
+          DebugRegMap.OFF_DBG_RESET_CTL.toLong) >>> 16
+
+      def collide(): Unit = {
+        b.bready #= true
+        b.awaddr #= DebugRegMap.OFF_DBG_RESET_CTL.toLong; b.awvalid #= true
+        b.wdata  #= DRC_COUNT_CLEAR; b.wstrb #= 0xF;      b.wvalid  #= true
+        dut.clockDomain.waitSamplingWhere(b.awready.toBoolean && b.wready.toBoolean)
+        b.awvalid #= false; b.wvalid #= false
+        dut.clockDomain.assertReset()   // seen at the very edge the clear applies on
+        sleep(6 * PERIOD)
+        dut.clockDomain.deassertReset()
+        dut.clockDomain.waitSampling(5)
+      }
+
+      assert(count() == 0, "the counter must start at zero")
+      collide()
+      assert(count() == 1,
+        s"the CPU-reset edge was swallowed by the same-cycle bit-1 clear (${count()})")
+
+      // From a NON-zero count the two candidate resolutions diverge, which pins the
+      // reference's exact semantics: the increment wins OUTRIGHT (1 -> 2, the clear is
+      // lost entirely), rather than the clear applying first (which would read 1).
+      collide()
+      assert(count() == 2,
+        s"the increment did not win the collision outright as debug_ctrl.v:2709 does " +
+        s"(${count()})")
+
+      // And with no collision the clear still works, so this is a priority fix and not a
+      // disabled clear.
+      assert(DbgAxiDriver.write(dut.axi, dut.clockDomain,
+        DebugRegMap.OFF_DBG_RESET_CTL.toLong, DRC_COUNT_CLEAR) == 0)
+      dut.clockDomain.waitSampling(2)
+      assert(count() == 0, "an uncontended bit-1 clear must still clear the counter")
     }
   }
 }
