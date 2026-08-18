@@ -22,6 +22,29 @@ import org.scalatest.funsuite.AnyFunSuite
   * (A7) without a side-effect; A7 is bumped by the trailing ibranch in Tasks 4/5).
   * Verifies A7 write-back + stack memory + the popped value round-trip. */
 class StackOpSpec extends AnyFunSuite {
+  // Task #233 root-cause fix: this directed harness predates the fast/precise
+  // store split (task P2.2, commit a1ecb7a). Its `Dut` wires no
+  // MmuControlPlugin, so `LsEuPlugin`'s `fastStore` is unconditionally False and
+  // EVERY store here classifies `precise=True` (LsEuPlugin.scala's
+  // `sq.io.alloc.payload.precise := !fastStore`). A precise store's ROB
+  // completion comes ONLY from `StoreQueue`'s at-head drain
+  // (`headPreciseReady`), which is gated on `robHeadValidIn`/`robHeadIn` — bare
+  // (non-`in()`) pass-through signals on `LsEuPlugin` whose only driver, absent
+  // a real IO-backed override, is their own idle default
+  // (`robHeadValidIn := False`, see LsEuPlugin.scala ~line 246). `LsEuSourcePlugin`
+  // never wires them, so the push's completion could structurally never fire —
+  // not a hazard, a permanent hang (`no completion for rob=1`). Mirrors
+  // `LsEuFastPreciseSpec`'s `TbPreciseDrainWirePlugin`: a minimal glue plugin
+  // giving both signals a genuine `in()`-backed IO so the test can drive them.
+  class TbPreciseDrainWirePlugin(eu: LsEuPlugin) extends FiberPlugin {
+    val logic = during build new Area {
+      val iRobHeadIn      = in UInt (6 bits)
+      val iRobHeadValidIn = in Bool ()
+      eu.robHeadIn      := iRobHeadIn
+      eu.robHeadValidIn := iRobHeadValidIn
+    }
+  }
+
   class Dut extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
@@ -33,7 +56,8 @@ class StackOpSpec extends AnyFunSuite {
     val dcache = new DcachePlugin()
     val eu     = new LsEuPlugin
     val src    = new LsEuSourcePlugin
-    db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, xlate, dcache, eu, src)) }
+    val wire   = new TbPreciseDrainWirePlugin(eu)
+    db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, xlate, dcache, eu, src, wire)) }
   }
 
   test("stack push.l (-(A7), data=imm, A7 write) then pop.l ((A7) load) round trip", VerilatorTest) {
@@ -45,6 +69,7 @@ class StackOpSpec extends AnyFunSuite {
       s.iLeaAddr #= false   // MUST default: undriven -> randomized per seed -> LEA path
       s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false
       s.iPsrcA #= 0; s.iPsrcB #= 0; s.iImm #= 0; s.iPdst #= 0; s.iPdstValid #= false; s.iRobId #= 0
+      dut.wire.logic.iRobHeadIn #= 0; dut.wire.logic.iRobHeadValidIn #= false
       cd.waitSampling(80)
 
       def seed(preg: Int, value: Long): Unit = {
@@ -63,6 +88,15 @@ class StackOpSpec extends AnyFunSuite {
       val a7Init = 0x40802000L
       val retPc  = 0x40800042L
       seed(a7Phys, a7Init)
+
+      // Park the ROB head on the push's own robId (1) BEFORE issuing it: a precise
+      // store's completion is driven solely by StoreQueue's at-head drain
+      // (`headPreciseReady`, gated on `robHeadValidIn`/`robHeadIn` matching the SQ
+      // head's robId, `!committed(head)`) -- see the Task #233 note on `Dut` above.
+      // This directed test's SQ never holds more than one resident entry at a time,
+      // so a static robId=1 target (rather than dynamically tracking `sq.head`, as
+      // LsEuFastPreciseSpec's background forks do) suffices.
+      dut.wire.logic.iRobHeadIn #= 1; dut.wire.logic.iRobHeadValidIn #= true
 
       // PUSH.L: stkPush store. base = A7 (phys 15), imm = retPC, int dst = phys 20 (the
       // new A7 value), size LONG. addr = A7 - 4; mem[A7-4] = retPC; phys20 := A7-4.
