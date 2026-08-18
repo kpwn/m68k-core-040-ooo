@@ -591,6 +591,13 @@ class ExceptionUnit(
   val sysRegWritePhys  = UInt(6 bits);  sysRegWritePhys  := U(0, 6 bits);  sysRegWritePhys.simPublic()
   val sysRegWriteData  = UInt(32 bits); sysRegWriteData  := U(0, 32 bits); sysRegWriteData.simPublic()
 
+  // ── axi-socket adapter D22: a one-cycle pulse when a `RESET` instruction retires ──
+  // The instruction remains an architectural NOP internally -- this is the EXTERNAL
+  // indication `m68k_core.v:128-130` describes ("This does not reset the CPU core
+  // itself; the SoC uses it for its warm peripheral reset"). Idle-defaulted so every
+  // existing DUT elaborates.
+  val resetInstrRetire = Bool(); resetInstrRetire := False; resetInstrRetire.simPublic()
+
   // ── sysOp-writes-A7 conflict resolution (the S_REDIR re-bank vs the sysOp's own
   //    destination write) ────────────────────────────────────────────────────────
   //
@@ -1875,8 +1882,12 @@ class ExceptionUnit(
           }
         }
         is(skOrd(m68k040.decode.SysKind.RESET)) {   // RESET : no architectural state change
-          // The external reset line is not modeled for lock-step; RESET is an internal NOP.
-          // S_REDIR just advances PC (the obs carries the UNCHANGED sysByte + A7).
+          // Still no architectural state change, and still an internal NOP for lock-step:
+          // Musashi models nothing here and the external line is not architectural state.
+          // What changes is that the retirement is now OBSERVABLE, so the socket can drive
+          // cpu_peripheral_reset from it (axi-socket adapter D22). S_REDIR still just
+          // advances PC (the obs carries the UNCHANGED sysByte + A7).
+          resetInstrRetire := True
         }
         is(skOrd(m68k040.decode.SysKind.STOP)) {    // STOP : SR := sysVal[15:0]
           // Identical SR write to MOVE-to-SR: system byte = sysVal[15:8] (S/T/I incl. the
