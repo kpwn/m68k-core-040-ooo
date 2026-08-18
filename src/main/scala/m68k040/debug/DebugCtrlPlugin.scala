@@ -165,6 +165,14 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
       cpuRstQ := cpuRstLevel
       val cpuRstEvent = cpuRstLevel && !cpuRstQ; cpuRstEvent.simPublic()
 
+      /** Surviving 16-bit count of observed CPU-reset edges. SATURATES: zero means "no
+        * reset observed since the last clear" and must not be reachable by wraparound
+        * (spec 15.4). Lives in the debug domain, so it survives the resets it counts. */
+      val cpuResetCount = Reg(UInt(16 bits)) init 0; cpuResetCount.simPublic()
+      when(cpuRstEvent && cpuResetCount =/= U(0xFFFF, 16 bits)) {
+        cpuResetCount := cpuResetCount + 1
+      }
+
       // ── Host configuration: survives every CPU reset (spec 15.1) ─────────────────
       // The hold is a term of the SoC's cpu_rst_or AND lives in a domain that reset does
       // not clear: the exact pairing debug_reset_ctl.v exists to make possible, since a
@@ -261,6 +269,10 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
           }
           is(DebugRegMap.OFF_RAM_WINDOW_LG2) { rData := ramWindowWord }
           is(DebugRegMap.OFF_MON_SENSE)      { rData := monSenseWord }
+          is(DebugRegMap.OFF_DBG_RESET_CTL) {
+            // Deployed layout (debug_ctrl.v:1411): {cpu_reset_count_r, 16'd0}.
+            rData := cpuResetCount.asBits ## B(0, 16 bits)
+          }
         }
       }
 
@@ -297,7 +309,7 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
           is(DebugRegMap.OFF_DBG_RESET_CTL) {
             when(wStrb(0)) {
               cfgWipe := wData(0)
-              // Bit 1 (CPU-reset count clear) is added by Task 11.
+              when(wData(1)) { cpuResetCount := U(0, 16 bits) }
             }
           }
         }
@@ -343,6 +355,29 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
         // A level input, latched sticky so a debugger attaching after DDR calibration
         // still observes it -- within this CPU's lifetime, not a previous one.
         initDoneSticky := True
+      }
+
+      GenerationFlags.simulation {
+        // "CPU reset cannot change surviving debug configuration" (spec section 13).
+        // The only legal movers of this vector are an applied AXI write and a cfg wipe.
+        // `ctrlInitDoneOvr` is deliberately ABSENT: spec 15.1 classifies it as CPU-coupled
+        // runtime state that Task 9 WIPES on the CPU-reset edge, so it is not surviving
+        // configuration and including it here would make this assertion fire on the first
+        // CPU reset. `initDoneSticky` is absent for the same reason. What remains is
+        // exactly debug_ctrl.v:2447-2462's "host configuration" set for Stage 1. This
+        // lives inside `dbgCd on {...}` (unlike the porChecks assertion above) because the
+        // condition it checks -- `cpuRstLevel`, the socket reset -- is a different signal
+        // from this domain's own `dbgRst`, so the dead-code tautology that forced the
+        // first assertion out of this domain does not apply here.
+        val cfgVec = ctrlColdHold ## ramWindow.asBits ## mon.asBits
+        val cfgVecPrev = RegNext(cfgVec) init (
+          False ##
+          B(DebugRegMap.RAM_WINDOW_LG2_POR, 6 bits) ##
+          B(DebugRegMap.MON_SENSE_POR, 7 bits))
+        assert(!(cpuRstLevel && !doWrite && !cfgWipe && (cfgVec =/= cfgVecPrev)),
+          "DebugCtrlPlugin: surviving debug configuration changed while CPU reset was " +
+          "asserted (spec section 13)",
+          FAILURE)
       }
 
       coldResetPulse := coldPulse
