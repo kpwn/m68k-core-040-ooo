@@ -160,7 +160,13 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
       // The socket `rst` is read as data by registers that this reset does not clear.
       // Reset value True so a `rst` already high when the debug domain leaves POR does
       // not manufacture a spurious edge (debug_reset_ctl.v:133-142).
-      val cpuRstLevel = coreCd.isResetActive
+      // `CombInit` is LOAD-BEARING, not a style choice. For an async-reset ClockDomain,
+      // `coreCd.isResetActive` IS the core's reset wire itself, so binding it to a named
+      // val inside this Area makes SpinalHDL rename the WHOLE CORE's top-level `reset`
+      // port to `DebugCtrlPlugin_logic_csr_cpuRstLevel` -- a whole-core interface break
+      // that violates spec 15.1's "socket names export verbatim, no rename shim".
+      // `CombInit` creates a genuinely fresh signal that merely copies the value.
+      val cpuRstLevel = CombInit(coreCd.isResetActive)
       val cpuRstQ     = RegInit(True)
       cpuRstQ := cpuRstLevel
       val cpuRstEvent = cpuRstLevel && !cpuRstQ; cpuRstEvent.simPublic()
