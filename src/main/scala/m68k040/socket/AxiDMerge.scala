@@ -169,6 +169,25 @@ class AxiDMerge(axiCfg: Axi4Config,
     // (mirroring the write side) so a single-beat AR correctly deasserts once that owner
     // completes its handshake with the arbiter, rather than staying presented for the
     // rest of the held grant.
+    // Task 13 finding: `Axi4Config(axiCfg)` leaves SpinalHDL's `prot`/`cache`/`lock`/`qos`/
+    // `region` sideband defaults ON (same as every other AXI4 bundle in this core -- see
+    // `SocketAxi.scala`'s D29 doc comment), and none of the four read owners below (nor
+    // their own upstream producers) ever assigns those five fields -- only `addr`/`id`/
+    // `len`/`size`/`burst`, which is everything D8's "AR payload is forwarded VERBATIM"
+    // promise actually needs. That is harmless the moment `io.out` is itself a genuine
+    // TOP-LEVEL boundary pin (SpinalHDL's no-latch check exempts an unassigned top-level
+    // output, which is why `DcachePlugin`'s OWN un-merged `master(Axi4(...))` -- see its
+    // doc comment -- has silently exported `..._payload_{region,lock,cache,qos,prot}`
+    // driven to `x` since long before this plan). It stops being harmless the instant this
+    // component is nested two levels deep, which is exactly what `M68kSocketTop` (Task 13)
+    // is the first build to ever do: SpinalHDL's `PhaseCheck_noLatchNoOverride` correctly
+    // flags a truly-unassigned INTERNAL net as a latch. The fix is the established idiom
+    // already used at `IcachePlugin.scala:996` for the identical situation on the I-side:
+    // default the whole payload to an explicit don't-care BEFORE the arbitration below
+    // overrides the fields it actually drives. Zero functional change -- these fields were
+    // always X on every path that reaches a real socket boundary; this just makes the X
+    // explicit early enough that SpinalHDL's checker accepts it as intentional.
+    io.out.ar.payload.assignDontCare()
     io.out.ar.valid := open && io.dc.ar.valid
     io.out.ar.payload.addr  := io.dc.ar.payload.addr
     io.out.ar.payload.id    := io.dc.ar.payload.id
