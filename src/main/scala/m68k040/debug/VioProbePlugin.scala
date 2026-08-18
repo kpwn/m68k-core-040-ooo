@@ -55,6 +55,29 @@ class VioProbePlugin(val enable: Boolean = false, val buildId: BigInt = 0) exten
     val vioBuildId      = Bits(32 bits)
     vioCpuSnapshot := B(0, 96 bits)
 
+    // Task 3's `probe_out` interface, declared UNCONDITIONALLY for the same Scala-scoping
+    // reason as the three fields above (see the comment there): a whitebox test needs
+    // `dut.vio.logic.vioBootPc`/`.vioCtl`/`.goPulse` reachable on an `enable=true` DUT, and
+    // Scala does not promote a `val` declared only inside an `if` block to a member of the
+    // enclosing Area regardless of what `enable` actually evaluates to at runtime.
+    //
+    // `vioBootPc`/`vioCtl` are plain INPUTS (level, not edge-converted themselves) -- same
+    // shape as `RobPlugin.scala`'s `coreHaltedIn`: a concrete zero default with
+    // `allowOverride` so a sim poke (or, later, real socket wiring) can drive them without
+    // the "two unconditional drivers" elaboration error.
+    val vioBootPc = UInt(32 bits)   // in, level, sampled only when goPulse fires (V17)
+    val vioCtl    = Bits(4 bits)    // in; [0]=boot_go (edge-converted below), [3:1] reserved (V20)
+    vioBootPc.allowOverride; vioBootPc := U(0, 32 bits)
+    vioCtl.allowOverride;    vioCtl    := B(0, 4 bits)
+    vioBootPc.simPublic(); vioCtl.simPublic()
+
+    // `goPulse` is a COMPUTED signal (like `vioHeartbeat`/`vioBuildId` above) -- full-width
+    // unconditional drive, so it needs the same if/else split (a real edge detector inside
+    // `if (enable)`, a concrete False in the `else`) to avoid the "assignment overlap" error
+    // Task 2's report already documents for this exact shape.
+    val goPulse = Bool()
+    goPulse.simPublic()
+
     if (enable) {
       // Task 2: the probe_in side -- pure observation, no host-driven input, no
       // edge-triggering concerns. Task 3 adds probe_out (V16's mandatory-drain-with-
@@ -115,6 +138,36 @@ class VioProbePlugin(val enable: Boolean = false, val buildId: BigInt = 0) exten
       }
       vioHeartbeat := heartbeatArea.cnt
 
+      // ── V16: mandatory edge discipline, no exception ─────────────────────────────
+      // RegInit(True), NEVER RegInit(False) -- reused verbatim from DebugCtrlPlugin's
+      // `cpuRstQ`/`cpuRstEvent` idiom. Reset is asserted at power-on, so a False init
+      // would manufacture a rising edge the MOMENT the design leaves reset if
+      // `vio_ctl(0)` (`boot_go`) happens to already be sitting high -- exactly the
+      // scenario a probe_out left high across a dropped JTAG link produces, and exactly
+      // the recovery scenario VIO exists to serve. This has hit the real bench TWICE.
+      // Only a genuine low-to-high TRANSITION with a live link fires the injector.
+      val goQ = RegInit(True)
+      goQ := vioCtl(0)
+      goPulse := vioCtl(0) && !goQ
+
+      // ── V17/V18/V19: the boot-PC injector ─────────────────────────────────────────
+      // On `goPulse`, drive `FetchAlignPlugin.logic.vioRedirect` -- a sibling plugin
+      // cannot drive `FetchAlignPlugin.redirect` itself (that port is an INPUT of
+      // M68kCore; see `FetchAlignPlugin.scala`'s own comment on `resetRedirect`/
+      // `mispredictRedirect`). `vioBootPc` is sampled only on the pulse (it is a level
+      // input, not itself edge-converted) via the Flow's `payload`, which the consumer
+      // (FetchAlignPlugin's priority arm) only latches when `valid` -- i.e. exactly on
+      // `goPulse` -- is high.
+      //
+      // V18 (a halted core cannot be resurrected by the injector) needs NO extra RTL
+      // here: `RobPlugin.logic.headReady` already reads `!coreHalted` independent of
+      // any fetch redirect source, so even if this redirect restarts fetch, nothing it
+      // feeds can ever retire while `coreHalted` is latched. Proven, not implemented,
+      // by this task's test suite.
+      val fa = host[FetchAlignPlugin]
+      fa.logic.vioRedirect.valid   := goPulse
+      fa.logic.vioRedirect.payload := vioBootPc
+
       // ── V8/V9: assemble the coherent 96-bit bundle ───────────────────────────────
       // One register-driven bundle so a single JTAG/VIO transaction captures every
       // field together and every fabric-side value is mutually consistent.
@@ -130,7 +183,7 @@ class VioProbePlugin(val enable: Boolean = false, val buildId: BigInt = 0) exten
       val haltedBit          = rob.logic.coreHalted
       val stoppedBit         = rob.logic.stopped
       val frontendQuiesceBit = host[FrontendQuiesceService].active
-      val fetchStartedBit    = host[FetchAlignPlugin].logic.started
+      val fetchStartedBit    = fa.logic.started
 
       // Sub-range assignment overrides only the touched bits of the `B(0, 96 bits)`
       // default declared above -- every untouched bit (the two reserved ranges) keeps
@@ -169,6 +222,9 @@ class VioProbePlugin(val enable: Boolean = false, val buildId: BigInt = 0) exten
       // second top-level default assignment.
       vioHeartbeat := U(0, 32 bits)
       vioBuildId   := B(0, 32 bits)
+      // `goPulse` needs the same treatment for the same reason (a computed, full-width
+      // signal -- see the declaration-site comment above).
+      goPulse := False
     }
   }
 }

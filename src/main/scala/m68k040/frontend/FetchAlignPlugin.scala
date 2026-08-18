@@ -90,6 +90,18 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     resetRedirect.valid.allowOverride;   resetRedirect.valid   := False
     resetRedirect.payload.allowOverride; resetRedirect.payload := U(0, 32 bits)
 
+    // vio-jtag-debug spec V17/V19: the VIO boot-PC injector's own redirect source. Same
+    // directionless/allowOverride/concrete-idle-default shape as resetRedirect immediately
+    // above (a sibling plugin cannot drive `redirect` itself -- that port is an INPUT of
+    // M68kCore, per the FetchAlignPlugin.scala:64-66 comment both resetRedirect and this seam
+    // already cite). Priority: placed after the `resume` arm and before the
+    // `mispredictRedirect` arm (see the priority-arm comment at that `when(vioRedirect.valid)`
+    // block below for why -- there are actually THREE automatic/external arms ahead of it,
+    // not the two the original design spec assumed).
+    val vioRedirect = Flow(UInt(32 bits))
+    vioRedirect.valid.allowOverride;   vioRedirect.valid   := False
+    vioRedirect.payload.allowOverride; vioRedirect.payload := U(0, 32 bits)
+
     // ── STOP/fatal-halt quiesce ─────────────────────────────────────────────────
     // The ROB remains the sole state owner. It publishes the exact combinational
     // NEXT state through a setup-allocated service; registering that truth locally
@@ -1296,6 +1308,40 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       pendingDrop    := newPc(2 downto 1)
       // Per-fetch stale tracking (recValid/recStale/recDrop) replaces the single-bit rspStale/dropPending.
       // Depth-2: mark ALL ring entries stale — every fetch issued before this redirect
+      // (and one issued THIS cycle, born stale via redirectThisCycle) is wrong-path; its
+      // response must be discarded. Free slots' stale bits are don't-care (overwritten at
+      // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
+      ringStale.foreach(_ := True)
+    }
+
+    // ---- VIO boot-PC injector redirect (vio-jtag-debug spec V17/V19) ----
+    // Placed AFTER `redirect`, `resetRedirect`, AND `resume` (a task-3-implementation-time
+    // correction to the plan brief, which only knew about `redirect` and `resetRedirect` --
+    // a third arm, `resume` (automatic stall-resume), also sits between them and was missed
+    // by the brief's own placement instruction). Outranking all three automatic/external
+    // frontend mechanisms is the correct, UNIFORM application of V19's own stated rationale
+    // ("the operator is physically present and pressing a button; [the automatic mechanism]
+    // is automatic. Deliberate manual override of an automatic mechanism is the correct
+    // precedence") -- that rationale does not carve out an exception for `resume` just
+    // because the brief's author had not yet found it. Placed BEFORE `mispredictRedirect` so
+    // a genuine ROB commit-time correction -- real architectural state a debug action must
+    // not corrupt -- always keeps final say. Body copied verbatim from the `resetRedirect`
+    // arm immediately above, payload source changed to `vioRedirect.payload`.
+    when(vioRedirect.valid) {
+      val newPc   = vioRedirect.payload
+      decodePc    := newPc
+      // fetchPc = 8-aligned base of the window containing newPc
+      fetchPc     := newPc(31 downto 3) @@ U(0, 3 bits)
+      ibuf.io.flush  := True
+      stalled        := False
+      // Clear the I-fetch-fault hold: the exception delivered + vectored, resume fetch.
+      faultHold      := False
+      faultEmitted   := False
+      started        := True
+      pendingDrop    := newPc(2 downto 1)
+      // Per-fetch stale tracking (recValid/recStale/recDrop) replaces the single-bit rspStale/dropPending.
+      // Mark the in-flight fetch (if any) stale: a redirect invalidates it.
+      // Depth-2: mark ALL ring entries stale -- every fetch issued before this redirect
       // (and one issued THIS cycle, born stale via redirectThisCycle) is wrong-path; its
       // response must be discarded. Free slots' stale bits are don't-care (overwritten at
       // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
