@@ -93,7 +93,7 @@ class LsBackendInjectSpec extends AnyFunSuite {
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
     val xlateD = new DIdentityTranslationPlugin
-    val dcache = new DcachePlugin
+    val dcache = new DcachePlugin()
     val lsEu   = new LsEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc

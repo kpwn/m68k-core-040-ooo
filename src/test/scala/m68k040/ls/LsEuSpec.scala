@@ -23,7 +23,7 @@ class LsEuSpec extends AnyFunSuite {
     val rfX    = new RegFilePluginX     // LS EU now writes X for RTR CCR-restore
     val cacheCtrl = new CacheControlStubPlugin
     val xlate  = new DIdentityTranslationPlugin
-    val dcache = new DcachePlugin
+    val dcache = new DcachePlugin()
     val eu     = new LsEuPlugin
     val src    = new LsEuSourcePlugin
     val phead  = new TbPreciseDrainWirePlugin(eu)

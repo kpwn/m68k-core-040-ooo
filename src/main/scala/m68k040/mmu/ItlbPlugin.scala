@@ -29,7 +29,8 @@ import spinal.lib.misc.plugin.FiberPlugin
   *    DTLB). No write-protect fault on fetch (a fetch is never a write). */
 class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
                  ways: Int = Tlb.DefaultWays,
-                 banks: Int = Tlb.DefaultBanks) extends FiberPlugin with TranslationService {
+                 banks: Int = Tlb.DefaultBanks,
+                 val socketMerged: Boolean = false) extends FiberPlugin with TranslationService {
   var _req: TranslationReq = null
   var _rsp: TranslationRsp = null
 
@@ -67,7 +68,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
   val logic = during build new Area {
     val tlb    = new Tlb(entries, ways, banks)
     val walker = new TableWalker()
-    walkerAxi = master(Axi4(axiCfg)).setName("itlbAxi")
+    walkerAxi = (if (socketMerged) Axi4(axiCfg) else master(Axi4(axiCfg))).setName("itlbAxi")
     walkerAxi.ar << walker.io.axi.ar
     walkerAxi.r  >> walker.io.axi.r
     walkerAxi.aw.valid := False; walkerAxi.aw.payload.assignDontCare()

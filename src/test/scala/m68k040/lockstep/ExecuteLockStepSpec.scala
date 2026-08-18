@@ -422,10 +422,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // explicit `require` in ExceptionUnit).
     val fpuCtl = new m68k040.execute.FpuControlPlugin
     val intCtrl = new m68k040.exception.InterruptControlPlugin
-    val itlb   = new ItlbPlugin
-    val dtlb   = new DtlbPlugin
+    val itlb   = new ItlbPlugin()
+    val dtlb   = new DtlbPlugin()
     val icache = new IcachePlugin
-    val dcache = new DcachePlugin
+    val dcache = new DcachePlugin()
     val btb    = new m68k040.frontend.BtbPlugin
     val ftb    = new m68k040.frontend.FtbPlugin
     val ras    = new m68k040.frontend.RasPlugin

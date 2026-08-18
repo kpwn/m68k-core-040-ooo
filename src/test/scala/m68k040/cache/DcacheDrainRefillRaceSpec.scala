@@ -52,7 +52,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
     val xlate  = new DIdentityTranslationPlugin
-    val dcache = new DcachePlugin
+    val dcache = new DcachePlugin()
     val probe  = new DcacheProbePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, dcache, probe)) }
   }

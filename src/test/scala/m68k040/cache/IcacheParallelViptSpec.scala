@@ -39,7 +39,7 @@ class IcacheParallelViptSpec extends AnyFunSuite {
     val host  = db on (new PluginHost)
     val ctrl  = new MmuControlPlugin
     val priv  = new TestPrivilegePlugin
-    val itlb  = new ItlbPlugin
+    val itlb  = new ItlbPlugin()
     val ic    = new IcachePlugin
     val probe = new FetchProbePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](

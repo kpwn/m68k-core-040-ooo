@@ -98,7 +98,7 @@ class DtlbCleanMissSerializationSpec extends AnyFunSuite {
     val db = new Database
     val host = db on (new PluginHost)
     val ctrl = new MmuControlPlugin
-    val dtlb = new DtlbPlugin
+    val dtlb = new DtlbPlugin()
     val probe = new DtlbMissStreamProbePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()), ctrl, dtlb, probe)) }
@@ -282,8 +282,8 @@ class DtlbFlushReuseSpec extends AnyFunSuite {
     val rfNzvc    = new RegFilePluginNzvc
     val rfX       = new RegFilePluginX
     val ctrl      = new MmuControlPlugin
-    val dtlb      = new DtlbPlugin
-    val dcache    = new DcachePlugin
+    val dtlb      = new DtlbPlugin()
+    val dcache    = new DcachePlugin()
     val cacheCtrl = new CacheControlStubPlugin
     val eu        = new LsEuPlugin
     val src       = new LsEuSourcePlugin

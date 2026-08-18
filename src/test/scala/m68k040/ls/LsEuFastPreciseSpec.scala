@@ -87,8 +87,8 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
     val rfNzvc    = new RegFilePluginNzvc
     val rfX       = new RegFilePluginX
     val ctrl      = new MmuControlPlugin
-    val dtlb      = new DtlbPlugin
-    val dcache    = new DcachePlugin
+    val dtlb      = new DtlbPlugin()
+    val dcache    = new DcachePlugin()
     val cacheCtrl = new CacheControlStubPlugin
     val eu        = new LsEuPlugin
     val src       = new LsEuSourcePlugin

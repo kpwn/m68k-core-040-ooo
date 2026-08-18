@@ -58,7 +58,7 @@ class RteSpec extends AnyFunSuite {
     val csink = new RenameCommitSinkPlugin
     val tsink = new CommitTraceSinkPlugin
     val dtlb = new DIdentityTranslationPlugin
-    val dcache = new DcachePlugin
+    val dcache = new DcachePlugin()
     val anchor = new AnchorPlugin
     val wire = new ExcDcacheWiring
     db.on { host.asHostOf(Seq[FiberPlugin](

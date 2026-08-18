@@ -27,7 +27,7 @@ class AguCrossSpec extends AnyFunSuite {
     val rfNzvc = new RegFilePluginNzvc   // LS EU now writes NZVC for MOVE-to-memory
     val rfX    = new RegFilePluginX     // LS EU now writes X for RTR CCR-restore
     val xlate  = new DIdentityTranslationPlugin
-    val dcache = new DcachePlugin
+    val dcache = new DcachePlugin()
     val eu     = new LsEuPlugin
     val src    = new LsEuSourcePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, xlate, dcache, eu, src)) }

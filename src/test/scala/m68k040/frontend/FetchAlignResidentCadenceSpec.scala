@@ -46,7 +46,7 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl  = new MmuControlPlugin
-    val itlb  = new ItlbPlugin
+    val itlb  = new ItlbPlugin()
     val ic    = new IcachePlugin
     val fa    = new FetchAlignPlugin
     val probe = new DecodeFeedProbePlugin

@@ -38,7 +38,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   *   DETECTION and the whole EVICT_WR/REFILL/REPLAY machinery are unchanged (they
   *   read only `ldS1Hit`). One uniform extra cycle of load-to-use latency.
   * Valids: register array. Victim: register array. */
-class DcachePlugin extends FiberPlugin with DcacheService {
+class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with DcacheService {
 
   private val geo     = CacheGeometry(cacheBytes = 8192, lineBytes = 16, ways = 4,
                                       indexingPolicy = CacheIndexingPolicy.Vipt)
@@ -92,7 +92,13 @@ class DcachePlugin extends FiberPlugin with DcacheService {
                                // AXI B to observe on that path); no-op for synthesis
     val storeErrReg = Bool()   // Task P1.4: 1-cycle pulse, non-OKAY B alongside storeAckReg
     storeErrReg.simPublic()
-    val axi         = master(Axi4(axiCfg))
+    // `socketMerged` (axi-socket adapter plan, Task 5): when this plugin's AXI is merged
+    // onto the single socket `axi_d` by AxiDMergePlugin, the bundle must be DIRECTIONLESS
+    // so a sibling plugin in the same Component can drive its response side --
+    // `master(...)` would make ar.ready/r.valid/b.valid inputs of M68kCore, which cannot
+    // be driven from inside (see FetchAlignPlugin.scala:64-66). No logic changes; the
+    // default (false) is today's behaviour and today's top-level port, exactly.
+    val axi         = if (socketMerged) Axi4(axiCfg) else master(Axi4(axiCfg))
 
     // ---- storage (sync-read BRAM: write + readSync ONLY, no readAsync) ----
     val dataMem = Seq.fill(ways)(Mem(Bits(128 bits), sets))
