@@ -111,7 +111,12 @@ class TableWalker extends Component {
         io.axi.ar.payload.burst := Axi4.burst.INCR
         when(io.axi.ar.ready) { arSent := True }
       }
-      io.axi.r.ready := True
+      // D27: fail-closed on the descriptor-read ID, for the same reason and with the same
+      // property as the ItlbPlugin/DtlbPlugin `b.ready` guards. A foreign beat is not
+      // consumed, so the walk hangs loudly instead of resolving a page-table descriptor
+      // out of somebody else's data. Cost is one 4-bit compare and no state.
+      io.axi.r.ready := io.axi.r.payload.id === U(m68k040.cache.AxiIds.WALK_READ,
+                                                  m68k040.cache.AxiIds.ID_W bits)
     }
 
     IDLE.whenIsActive {

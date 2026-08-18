@@ -67,4 +67,15 @@ object AxiIds {
   val WALK_READ = 2
   /** Table-walker U/M descriptor write-back. */
   val WALK_WRITE = 3
+
+  // -- reset-vector reader (axi-socket adapter spec D12/D13, section 6.2) --------
+  /** The boot vector-0 read, issued as a fourth READ owner on the `axi_d` merge
+    * arbiter -- never as a third socket master, because `axi_xbar.v:1178-1192`'s
+    * `apply_cpu_overlay` aliases low addresses into the ROM mirror only for reads whose
+    * master index is `XBAR_M_CPU`/`XBAR_M_CPUI`.
+    *
+    * Its VALUE is architecturally irrelevant under D8 (routing is by the arbiter's
+    * latched owner tag, never by ID), but it must not alias a live D-side ARID, so it
+    * sits outside the D-refill reserved range 0-3 and outside the walkers' AR=2. */
+  val RESET_VEC = 5
 }

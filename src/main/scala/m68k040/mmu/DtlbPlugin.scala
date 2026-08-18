@@ -77,7 +77,24 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // aw/w are driven by the U/M descriptor-write drain below (default idle).
     walkerAxi.aw.valid := False; walkerAxi.aw.payload.assignDontCare()
     walkerAxi.w.valid  := False; walkerAxi.w.payload.assignDontCare()
-    walkerAxi.b.ready  := True
+    // D27 (axi-socket adapter spec section 4.3): FAIL-CLOSED on the response ID, matching
+    // the D-cache's own discipline verbatim (DcachePlugin.scala:1948-1956: "an
+    // unrecognized id simply not ack anything -- a hung drain, which is loud and
+    // debuggable, instead of a silent spurious ack").
+    //
+    // Today this walker is a physically separate master and the only responses reaching it
+    // are its own, so the unconditional `True` was safe. After the D8 merge it is the
+    // arbiter's owner latch, and NOTHING ELSE, that stands between this walker and a
+    // response belonging to the D-cache or the reset-vector reader. This guard is the
+    // second line of defence that makes the safety argument uniform across all three
+    // merged masters instead of resting on the arbiter alone.
+    //
+    // It does NOT disambiguate ITLB from DTLB -- they share AR=2/AW=3 (AxiIds.scala:67,69)
+    // and D8's owner latch is what separates them. It fail-closes the CLASS boundary
+    // between walker traffic and everything else. The drain ack at :340 is already gated on
+    // this handshake, so a rejected beat simply does not ack.
+    walkerAxi.b.ready  := walkerAxi.b.payload.id === U(m68k040.cache.AxiIds.WALK_WRITE,
+                                                       m68k040.cache.AxiIds.ID_W bits)
 
     // U/M queue hooks: default-idle (allowOverride) so a standalone DUT elaborates;
     // the LS-cluster wiring OVERRIDES them.
