@@ -469,6 +469,19 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
 object GenFullCoreSynthVerilog {
   def main(args: Array[String]): Unit = {
     val p = M68kParams()
+    // DBG_BUILD_ID is supplied by the SoC build (spec 3.1). It enters as a plugin
+    // constructor parameter -- not a Global key (spec 0.9) and not a socket port -- so a
+    // bitstream build can stamp it without touching RTL. The value is HEXADECIMAL, with
+    // or without a leading 0x; anything else is a hard error rather than a silent 0,
+    // because a wrong build ID is worse than none (it makes a stale bitstream look fresh).
+    val dbgBuildId: BigInt = sys.env.get("DBG_BUILD_ID") match {
+      case None    => BigInt(0)
+      case Some(s) =>
+        val hex = s.trim.stripPrefix("0x").stripPrefix("0X")
+        require(hex.nonEmpty && hex.forall(c => "0123456789abcdefABCDEF".contains(c)),
+          s"DBG_BUILD_ID must be hexadecimal (got '$s')")
+        BigInt(hex, 16)
+    }
     M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog {
         val eu0 = new AluEuPlugin
@@ -510,6 +523,12 @@ object GenFullCoreSynthVerilog {
           new RegFilePluginFp(),
           new RegFilePluginFpcc(),
           new BackendWiringPlugin(eu0, eu1, branchEu, lsEu, divEu)
+          ,
+          // Stage 1 of the debug/control slave. Placed LAST because it consumes nothing
+          // from any other plugin -- it declares its own socket IO and reads no Global
+          // key, so its position in the list is free. Later stages that consume
+          // DebugCommitService will need to sit after RobPlugin.
+          new m68k040.debug.DebugCtrlPlugin(buildId = dbgBuildId, stage = 1)
         )).setDefinitionName("M68kFullCoreSynth")
       }
     println("Generated generated/M68kFullCoreSynth.v")
