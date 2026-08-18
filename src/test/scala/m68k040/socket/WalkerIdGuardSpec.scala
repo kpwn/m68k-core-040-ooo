@@ -1,6 +1,10 @@
 package m68k040.socket
 
+import m68k040.M68kSim
 import m68k040.cache.AxiIds
+import m68k040.mmu.TableWalker
+import spinal.core._
+import spinal.core.sim._
 import org.scalatest.funsuite.AnyFunSuite
 
 /** Spec section 13, "Merge arbiter", D27 bullet, verbatim: "a `B` or `R` beat carrying a
@@ -12,6 +16,38 @@ import org.scalatest.funsuite.AnyFunSuite
   * "an unrecognized id simply not ack anything -- a hung drain, which is loud and
   * debuggable, instead of a silent spurious ack." */
 class WalkerIdGuardSpec extends AnyFunSuite {
+
+  /** Thin wrapper: `TableWalker` is a plain Component with a `master(Axi4ReadOnly)`, so
+    * it can be driven directly with no plugin host at all. */
+  class WalkerDut extends Component {
+    val w = new TableWalker()
+    val io = new Bundle {
+      val start = in Bool ()
+      val req   = in(m68k040.mmu.WalkReq())
+      val busy  = out Bool ()
+      val done  = out Bool ()
+    }
+    w.io.start := io.start
+    w.io.req   := io.req
+    io.busy := w.io.busy
+    io.done := w.io.done
+    // AR is accepted immediately; R is driven by the test.
+    w.io.axi.ar.ready := True
+    w.io.axi.r.valid  := False
+    w.io.axi.r.payload.assignDontCare()
+    w.io.axi.r.valid.allowOverride
+    w.io.axi.r.payload.id.allowOverride
+    w.io.axi.r.payload.data.allowOverride
+    w.io.axi.r.payload.resp.allowOverride
+    w.io.axi.r.payload.last.allowOverride
+    w.io.axi.r.valid.simPublic()
+    w.io.axi.r.ready.simPublic()
+    w.io.axi.r.payload.id.simPublic()
+    w.io.axi.r.payload.data.simPublic()
+    w.io.axi.r.payload.resp.simPublic()
+    w.io.axi.r.payload.last.simPublic()
+    w.io.axi.ar.valid.simPublic()
+  }
 
   test("RESET_VEC is a distinct ID outside every live D-side ARID") {
     // Spec section 6.2: "it must not alias a live D-side ARID, so it goes outside the
@@ -27,12 +63,38 @@ class WalkerIdGuardSpec extends AnyFunSuite {
     assert(AxiIds.D_STORE == 1 && AxiIds.D_PUSH == 2 && AxiIds.D_EVICT == 4)
   }
 
-  test("D-side ID constants are invariant and non-overlapping") {
-    // Verify the ID allocation hasn't changed.
-    assert(AxiIds.D_STORE == 1, "D_STORE must remain 1")
-    assert(AxiIds.D_PUSH == 2, "D_PUSH must remain 2")
-    assert(AxiIds.D_EVICT == 4, "D_EVICT must remain 4")
-    assert(AxiIds.WALK_READ == 2, "WALK_READ must remain 2 (walk AR)")
-    assert(AxiIds.WALK_WRITE == 3, "WALK_WRITE must remain 3 (walk AW)")
+  test("TableWalker does not accept an R beat carrying a foreign ID") {
+    M68kSim().compile(new WalkerDut).doSim("foreign-r", seed = 1) { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.start #= false
+      dut.io.req.vpn     #= 0x00100
+      dut.io.req.rootPtr #= 0x00001000L
+      dut.io.req.isWrite #= false
+      dut.io.req.isSuper #= true
+      dut.clockDomain.waitSampling(4)
+      dut.io.start #= true
+      dut.clockDomain.waitSampling()
+      dut.io.start #= false
+      // Wait for the walker to present its descriptor AR.
+      dut.clockDomain.waitSamplingWhere(dut.w.io.axi.ar.valid.toBoolean)
+      dut.clockDomain.waitSampling()
+      // Present a beat carrying the D-cache's refill ID. It is NOT ours.
+      dut.w.io.axi.r.valid   #= true
+      dut.w.io.axi.r.payload.id   #= AxiIds.dRefill(0)
+      dut.w.io.axi.r.payload.data #= BigInt("0" * 32, 16)
+      dut.w.io.axi.r.payload.resp #= 0
+      dut.w.io.axi.r.payload.last #= true
+      for (i <- 0 until 8) {
+        dut.clockDomain.waitSampling()
+        assert(!dut.w.io.axi.r.ready.toBoolean,
+          s"walker acked a foreign R id at cycle $i -- fail-OPEN, not fail-closed")
+        assert(!dut.io.done.toBoolean, s"walk completed off a foreign beat at cycle $i")
+      }
+      // Its OWN id is accepted, so the guard is not simply wedged shut.
+      dut.w.io.axi.r.payload.id #= AxiIds.WALK_READ
+      dut.clockDomain.waitSampling()
+      assert(dut.w.io.axi.r.ready.toBoolean,
+        "walker rejected its own WALK_READ id -- the guard is inverted or over-tight")
+    }
   }
 }

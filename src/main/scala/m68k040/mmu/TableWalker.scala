@@ -138,7 +138,7 @@ class TableWalker extends Component {
     // ---- ROOT level ----
     RD_ROOT.whenIsActive {
       issueRead()
-      when(io.axi.r.valid) {
+      when(io.axi.r.fire) {
         val d = selectWord(io.axi.r.payload.data, descAddr)
         when(!MmuDesc.tblResident(d)) {
           rFault := True; rReason := MmuFaultReason.NON_RESIDENT
@@ -158,7 +158,7 @@ class TableWalker extends Component {
     // ---- POINTER level ----
     RD_PTR.whenIsActive {
       issueRead()
-      when(io.axi.r.valid) {
+      when(io.axi.r.fire) {
         val d = selectWord(io.axi.r.payload.data, descAddr)
         when(!MmuDesc.tblResident(d)) {
           rFault := True; rReason := MmuFaultReason.NON_RESIDENT
@@ -177,7 +177,7 @@ class TableWalker extends Component {
     // ---- PAGE (leaf) level ----
     RD_PAGE.whenIsActive {
       issueRead()
-      when(io.axi.r.valid) {
+      when(io.axi.r.fire) {
         val d = selectWord(io.axi.r.payload.data, descAddr)
         pageDescAddr := descAddr
         val wp  = accWriteProt | MmuDesc.pgWriteProt(d)
