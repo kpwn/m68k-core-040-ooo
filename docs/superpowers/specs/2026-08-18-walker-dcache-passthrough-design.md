@@ -24,7 +24,7 @@ out explicitly in §11.
 `docs/superpowers/plans/2026-08-18-axi-socket-adapter-implementation-plan.md` (Tasks 4 and
 5, both already merged, plus two textual citations in Task 13). See §9.
 
-**Numbering note.** Decisions here are numbered **W1-W26** rather than continuing the
+**Numbering note.** Decisions here are numbered **W1-W28** rather than continuing the
 socket spec's `D` series, because this spec *reworks* several `D` items and reusing the
 same namespace would make "D9" ambiguous between two documents.
 
@@ -35,6 +35,25 @@ and 7 Minor findings. Every one is folded in here. The two Critical findings bec
 into silent-corruption bugs), and the single largest substantive change is **W7**, which
 replaces the original drain-to-zero hand-over on the load direction with an
 **ownership-tag FIFO**. §13 records the review disposition item by item.
+
+**Revision note (round-3 fix pass, 2026-08-18).** `ca850ea` was re-reviewed and returned
+*changes requested* again, with 2 Critical, 3 Important and 4 Minor findings. The two Critical
+findings are both about round 2's own work rather than about the original design:
+
+- **Round 2 fixed 2 sites of a defect that has 9.** W23/W24 named `:2115` and `:265`; the
+  identical "a handshake drive that is correct today only because nothing but its own client
+  can own that port" shape occurs at seven further sites, including the store-side exact twin
+  of W23. The round-3 answer is **W27**: an **exhaustive**, per-site table of *every*
+  `dcache.*` handshake driver and consumer in `LsEuPlugin.scala` — re-derived from the file
+  rather than from the review — each row carrying either its owner-qualification or an
+  explicit justification for needing none. Per-finding patching of this defect class is
+  what round 2 got wrong and W27 exists to stop it recurring.
+- **W23's own prescribed fix line reopened the bug it closed**, in a different timing window,
+  because `(ldOwner === CORE)` is a *current-grant* fact while the hazard is an *in-flight*
+  fact. Corrected in §4.2.7 (`excLoadAdmit`, not a weaker proxy for it).
+
+Round 3 also adds **W28** (the same-cycle owner-coherence invariant that every one of these
+owner qualifications silently depends on). §14 records the round-3 disposition item by item.
 
 **Citation convention (fix pass).** `DcachePlugin.scala` line numbers in the original draft
 mixed a pre-Task-8 and a post-Task-8 snapshot (a `+5` and a `+43` shift respectively), and
@@ -59,22 +78,24 @@ by symbol, never by raw line.
 | **W8** | Base priority is `CORE-EXC > CORE-LS > walkers`, i.e. **today's behaviour exactly** whenever no walker is pending. Fairness comes from an **aging counter** per walker: after `WALKER_AGE_LIMIT` un-granted cycles a walker's `force` bit outranks `CORE-LS` (never `CORE-EXC`'s own presented command). `WALKER_AGE_LIMIT = 64`, constructor-parameterised for directed tests. Under W7's FIFO the force path is a rare fallback (probe-window/slot contention only), not the common case. (§4.2.4) |
 | **W9** | The two walkers tie-break against each other with a **1-bit round-robin**, per direction. (§4.2.4) |
 | **W10** | **No bounded-grant timer** (no D20 analogue) is built at this layer: starvation is structurally bounded by W7 + W8 and the bound is *proved* in §4.2.5. But the *observability* half of D20 is **not** declined — see W26. (§4.2.5) |
-| **W11** | Handing the load port to a walker also asserts `LsEuPlugin`'s **existing** `probeCancelAll` (`LsEuPlugin.scala:863`) and suppresses new probe launches, by folding the owner bit into the **same** `!excActive` conjunctions at `:863`, `:716` and `:1774-1776`. Without this the design **deadlocks** — see §4.2.6. This is a correctness requirement, not an optimisation. |
+| **W11** | Handing the load port to a walker also asserts `LsEuPlugin`'s **existing** `probeCancelAll` (`LsEuPlugin.scala:863`) and suppresses new probe launches, by folding the owner bit into the **same** `!excActive` conjunctions at `:863`, `:716` and `:1774-1776`. Without this the design **deadlocks** — see §4.2.6. This is a correctness requirement, not an optimisation. *(Round 3: the `:716` conjunction is **factored up** one level into `coreLsLoadAdmit` so it covers the split leg of `:756` too — W27. `alignedSendValid` keeps its meaning and `:766` is unaffected.)* |
 | **W12** | FMax mitigation is *structural* but **not costless**, and this spec does not claim it is. Three control-signal sites are pure `excActive`-conjunction substitutions (zero new levels). Two sites are genuinely new fan-in: the `loadCmdPort.payload.vaddr` mux widens 3-way → 5-way on the net that feeds `cmdSet` → `rdSet`, and `probeCancelAll` gains an OR term. Those are **mitigated, not eliminated**, and the mandatory 3-checkpoint synth gate is the control. (§5) |
 | **W13** | The walkers' `storeAck`/`storeErr` are **demultiplexed by the latched store owner**, and the existing `sq.io.drainAck := dcache.storeAck && !excStoreOutstanding` (`LsEuPlugin.scala:270`) gains the walker term. This is mandatory: `StoreQueue.scala:518` already asserts on a stray ack. (§4.3) |
 | **W14** | The load-response side gets **no bundle-level demux and no top-level rewiring**: `exc.dcLoadRsp` (`FullCoreSynth.scala:350-351`) and every DUT that replicates it stay byte-for-byte untouched. Routing is by W7's FIFO head (`rspOwner`) *inside* `LsEuPlugin`; the exception path keeps the pure temporal-exclusivity argument. (§4.3) |
 | **W15** | The walkers' client ports are plugin-level `var` hooks with default-idle `allowOverride` drives, wired by the **top-level/DUT wiring**, exactly mirroring the existing `umCommitValid`/`umFlush`/`excLoadCmdValid` idiom. No new `Plugin` service lookup, no new `FiberPlugin`. (§4.4) |
 | **W16** | `TableWalker.selectWord` is **deleted**; the walker consumes `loadRsp.payload.data` directly. This removes a hand-rolled duplicate of `DcacheByteLane.extract`'s LONG case. (§4.5) |
 | **W17** | The U/M writeback is emitted as `DStoreCmd` with `useStrb = True`, `strb = drainStrb`, `lineData = drainBeat`, `paddr = drainAddrReg`, `size = LONG` (don't-care under `useStrb`), `precise = False`. The whole `walkerAxi` AW/W/B drain FSM is deleted. (§4.6) |
-| **W18** | A **new sim helper `DcacheClientMemAgent`** (a `Stream`/`Flow` analogue of `BehavioralMemAgent`) is built so the DUTs with no `DcachePlugin` keep working. That is **7 files / 8 DUT classes**, not the 5 the original draft counted. (§8.1, §10.2) |
+| **W18** | A **new sim helper `DcacheClientMemAgent`** (a `Stream`/`Flow` analogue of `BehavioralMemAgent`) is built so the DUTs with no `DcachePlugin` keep working. That is **8 files / 8 DUT classes**, not the 5 the original draft counted. (§8.1, §10.2) |
 | **W19** | The exception sequencer's maintenance quiesce is protected by a new `quiesceHold` gate that closes **walker** admission only (never `CORE`), asserted over `S_DRAIN` **and** `S_APPLY` — the latter because `maintCmdOut` pulses in `S_APPLY` while `maintBusyReg` only rises a cycle later. Without it `ExceptionUnit.scala:1362-1381`'s written deadlock analysis ("With the LS EU flushed, nothing re-arms them") becomes false. (§6.2) |
 | **W20** | Task 4's committed code (`38e6c31`, `56f2438`) is **not reverted**; the walker-side half is deleted along with its host (`walkerAxi` ceases to exist), the `RESET_VEC` ARID half survives untouched, and `WalkerIdGuardSpec` is deleted. `AxiIds.WALK_READ`/`WALK_WRITE` stay defined-but-unused (renumbering is forbidden). (§9.1) |
 | **W21** | Task 5's `AxiDMerge` is **shrunk, not deleted and not repurposed**: read side 4 owners → 2 (`DCACHE`, `RESETVEC`), write side 3 owners → 1 (pass-through). The D20 watchdog stays on the read side. Its *code* is not reused for this design's mux; its *bounded-progress discipline* is (as W8's aging counter). (§9.2) |
 | **W22** | This is a **separate plan** with its own file. A single **superseding Task 5R** is inserted into the axi-socket-adapter plan, and D7/D8/D9/D19/D20/D27 get an addendum block in that spec. Tasks 6, 7, 8, 9, 10, 11, 12, 14 are unaffected in interface shape; Task 13 needs two textual citation updates. (§9.3) |
-| **W23** | **CRITICAL.** `LsEuPlugin.scala:2115`'s `excLoadCmdReady := dcache.loadCmd.ready` is **unconditional** and must be owner-qualified, as must `excLoadOutstanding`'s set term. Today both are safe only because nothing but the exception sequencer can own that `ready`. This is a *silent* corruption once walkers exist, not a hang. (§4.2.7) |
+| **W23** | **CRITICAL.** `LsEuPlugin.scala:2115`'s `excLoadCmdReady := dcache.loadCmd.ready` is **unconditional** and must be qualified — by **`excLoadAdmit`**, the §4.2.3 admission predicate, *not* by the weaker `(ldOwner === CORE) && excActive && excLoadCmdValid` the round-2 text prescribed. `excLoadOutstanding`'s set term takes the identical predicate. Round-2's weaker form **reopened** the very bug it closed, because `dcache.loadCmd.ready` never references `valid`. (§4.2.7) |
 | **W24** | **CRITICAL.** `LsEuPlugin.scala:265`'s `sq.io.drain.ready := dcache.store.ready` is **unconditional**. The existing exception mux already closes exactly this hole at `:2068`; that hold must be extended to cover "a walker owns the store port", or a walker's U/M store silently consumes the SQ drain's `ready` and a core store is permanently lost. (§4.2.7) |
-| **W25** | Walker `loadCmd.payload.token` is a **reserved value**, never a don't-care: `ITLB = 0x81`, `DTLB = 0x82`, disjoint from LS-EU probe tokens and from the exception sequencer's existing `0x80`. A don't-care token can collide with a live early-probe entry on token **and** vaddr and silently mis-answer the walker's read. (§4.5) |
+| **W25** | Walker `loadCmd.payload.token` is a **reserved value**, never a don't-care: `ITLB = 0x81`, `DTLB = 0x82`, disjoint from LS-EU probe tokens and from the exception sequencer's existing `0x80`. A don't-care token can collide with a live early-probe entry on token **and** vaddr and silently mis-answer the walker's read. `DcacheTypes.scala:6-8`'s token-layout doc comment is amended in the same edit, or the tree ends up with a now-false comment beside true constants. (§4.5) |
 | **W26** | The arbitration point gets a **production** (not sim-only) stall counter reporting on **D28's halt-reason channel**. W10 declines D20's *timer*; it does **not** decline D20's *observability*, because a wedge at this new merge point produces no AXI grant to time out and would otherwise be invisible to D19, D20 **and** D28. (§4.2.5) |
+| **W27** | **CRITICAL, round 3.** Owner-qualification is settled **exhaustively**, by a per-site table covering **every** `dcache.{loadCmd, store, loadRsp, storeAck, storeErr, loadProbe*}` driver and consumer in `LsEuPlugin.scala` (§4.2.7's table), each row carrying either its fix or an explicit justification for needing none. W23/W24 named **2** sites; the round-3 sweep produced a **29-row** table in which **10 further rows are new fixes no round-2 decision reached at all** (plus one recorded ordering constraint). Those ten include the split-load BK FSM's two `loadCmd.fire` samplings, `bkCompletes`'s `loadRsp` arm, the **store-side exact twin of W23** (`:2069`/`:2076`), the exception load/store **presentation** `when` headers (`:2027`, `:2067`) which nothing previously bound to an admission predicate, and the split leg of `dcache.loadCmd.valid` (`:756`), which no owner or arbitration term reaches at all. **No further per-finding patching of this class: the table is the unit of correctness.** (§4.2.7) |
+| **W28** | **Same-cycle owner coherence is an INVARIANT, not an implementation detail.** Every owner qualification in this spec is sound only if the mux's payload/valid **selection** and the qualification's **comparison** read the *identical* owner value on the *identical* cycle. The owner registers must therefore be updated in the same cycle, off the same signal, as the selection they gate — never a cycle later, and never with the mux selecting off a combinational grant while the comparison reads a registered owner. Otherwise C1/C2-class corruption reappears through a one-cycle timing gap instead of a missing site. (§4.2.8) |
 
 | # | Recorded non-decision |
 |---:|---|
@@ -285,7 +306,7 @@ table searches as cachable write-through accesses. The implementation plan shoul
 non-blocking step to confirm the wording against the real UM and record the section number;
 if the UM says otherwise, only §4.1.4's constant changes, not the architecture.
 
-### 4.2 W4-W11, W23, W24, W26 — arbitration
+### 4.2 W4-W11, W23, W24, W26, W27, W28 — arbitration
 
 #### 4.2.1 W4 — why the `LsEuPlugin` mux, and not a new arbiter component
 
@@ -429,8 +450,21 @@ ldOwnerFifo : depth-4 FIFO of the 2-bit owner code       // lives entirely in Ls
 ```
 
 Depth 4 (one more than the proven maximum of 3) so the FIFO can never be the binding
-constraint; `loadCmdPort.ready` is `False` when it is full, which by the bound above cannot
-occur. **`DcacheService` is unchanged, `DcachePlugin` is unchanged, and no DUT is rewired.**
+constraint. **`DcacheService` is unchanged, `DcachePlugin` is unchanged, and no DUT is
+rewired.**
+
+**Where the FIFO-full term lives — corrected in the round-3 fix pass.** The previous wording
+said "`loadCmdPort.ready` is `False` when it is full". That is a **misattribution to the
+protected file**: `loadCmdPort.ready` is driven entirely inside `DcachePlugin.scala:981`, the
+file W4/§5/§8/§12 all require to receive **zero** edits, and it is the signal
+`DcachePlugin.scala:759`'s own comment names at the head of the protected `rdSet` fan-in arc
+("breaking the post-route critical path (`loadCmdPort.ready` → arbiter → tag/dataMem
+read-address)"). Adding a FIFO-full term there is precisely the edit §5's entire FMax argument
+exists to prevent. The condition belongs on **`LsEuPlugin`'s own side of the boundary**: it is
+an *admission* term on `dcache.loadCmd.valid`, exactly where `walkerLoadAdmit` already carries
+its analogous `!ldOwnerFifo.full` term below. `DcachePlugin` is never told the FIFO exists.
+(By the ≤3 bound above the term can never actually fire; it is present as a structural
+guarantee, not as a live constraint.)
 
 Consequences:
 
@@ -464,16 +498,38 @@ Concretely, the admission rules are:
 ```
 ldBusyExc          = excLoadOutstanding || (excActive && excLoadCmdValid)
 walkerLoadAdmit(i) = grant(i) && !ldBusyExc && !quiesceHold && !ldOwnerFifo.full
-excLoadAdmit       = excActive && excLoadCmdValid && (ldOwnerFifo holds no WALKER entry)
+excLoadAdmit       = excActive && excLoadCmdValid && !ldOwnerFifoHoldsWalker
+
+coreLsLoadAdmit    = coreLsLoadReq && !dcLoadHeldByOther     // see W27 rows :716 / :756
+excStoreAdmit      = excActive && excStoreValid && (stOwner === CORE)
+walkerStoreAdmit(i)= grantSt(i) && !quiesceHold && !stBusy(CORE)   // drain-to-zero survives
 
 stBusy(CORE)       = coreStOutstanding =/= 0    // CORE store fires vs storeAcks
 stBusy(ITLB/DTLB)  = walkStOutstanding(i)
 ```
 
+`ldOwnerFifoHoldsWalker` is the OR-reduction over the FIFO's occupied entries of
+"this entry is not `CORE`". It is **not** the same fact as `ldOwner =/= CORE`, and the
+distinction is what W23's round-2 fix line got wrong (§4.2.7): `ldOwner` records who holds the
+*current grant*, while the FIFO records what is *still in flight*. A walker command accepted
+one cycle and the grant reverting to `CORE` the next leaves `ldOwner === CORE` **true** while a
+walker response is still owed. Every predicate that must exclude an in-flight walker therefore
+reads the FIFO, never `ldOwner`.
+
+**These predicates are the mux's own drive conditions, not commentary.** `excLoadAdmit` gates
+`LsEuPlugin.scala:2027`'s `when(excActive && excLoadCmdValid)` header (which drives
+`dcache.loadCmd.valid := True` at `:2028`) and `excStoreAdmit` gates `:2067`'s
+`when(excActive && excStoreValid)` header; `coreLsLoadAdmit` gates the base drive at `:756`
+including its split leg. W27's table (§4.2.7) binds each predicate to its exact site — the
+round-2 text defined `excLoadAdmit` without ever saying which line it drives, which left the
+exception sequencer presenting its command into a walker-occupied FIFO, a direct W7 violation.
+
 `excLoadOutstanding` is a new 1-bit register in `LsEuPlugin`, the direct load-side mirror of
-the **already existing** `excStoreOutstanding` (`LsEuPlugin.scala:266-270`) — but see **W23**
-(§4.2.7): its set term must be owner-qualified, or it is itself a bug. `coreStOutstanding`
-likewise mirrors `excStoreOutstanding`, widened to a count.
+the **already existing** `excStoreOutstanding` (`LsEuPlugin.scala:268`) — but see **W23**
+(§4.2.7): its set term must carry `excLoadAdmit`, or it is itself a bug. `coreStOutstanding`
+likewise mirrors `excStoreOutstanding`, widened to a count, and — because W6 makes the LS pipe
+and the exception sequencer **one** owner — it must count the exception sequencer's accepted
+stores **as well as** the SQ drain's. §4.2.7's `:2073` row depends on that.
 
 Walker-side outstanding stays 1 bit each: `TableWalker`'s FSM never issues a second read
 before the first responds (`arSent`/`issueRead()`, `:104-120` — the same serialisation,
@@ -484,27 +540,48 @@ gate (`DtlbPlugin.scala:334`).
 
 **(a) Core-side response consumers that were previously inert now need owner qualification.**
 Under drain-to-zero, `CORE`'s consumers were guaranteed idle whenever a walker response
-arrived. Under the FIFO they are **not**, so they must be qualified by `rspOwner === CORE`:
+arrived. Under the FIFO they are **not**, so they must be qualified by `rspOwner === CORE`.
+Two representative sites:
 
 - `alignedRspFire = alignedRspValid && dcache.loadRsp.valid` (`LsEuPlugin.scala:720`) becomes
   `alignedRspValid && dcache.loadRsp.valid && (rspOwner === CORE)`. This is not cosmetic:
   `alignedRspFire` decrements `alignedCount` and advances `alignedRspPtr`, so an
   unqualified version would pop a core load off the aligned queue on the walker's descriptor
   response and hand a page-table word to an architectural register.
-- The **split BK FSM**'s `WAIT_A`/`WAIT_B` sampling of `dcache.loadRsp` takes the identical
-  qualification, for the identical reason.
+- The **split BK FSM**'s `WAIT_A`/`WAIT_B` sampling of `dcache.loadRsp` (`:1520`, `:1541`)
+  takes the identical qualification, for the identical reason.
 
-These two sites are a **required part of W7**, not an optimisation, and the implementation
-plan must list them explicitly in its `LsEuPlugin` change list (§8).
+**These are examples, not the list.** *Round-3 correction: the round-2 wording said "these two
+sites", which a plan-writer reading it literally would take as complete — and it is not.
+`bkCompletes` (`:1574-1575`) is a third `loadRsp` consumer, deliberately defined **outside**
+both `whenIsActive` bodies (see its own comment, "Derived from `bkFsm.isActive` rather than
+from an assignment inside either FSM"), so an editor touching only the two FSM bodies misses
+it entirely — and an unqualified `bkCompletes` releases `S1`/`backCompFires` on a walker's
+mid-flight response.* **The complete, exhaustive list is W27's table in §4.2.7**, which is the
+authority; this caveat exists only to explain *why* the qualification is needed. Owner
+qualification is a **required part of W7**, not an optimisation, and the implementation plan
+must carry W27's table verbatim in its `LsEuPlugin` change list (§8).
 
 **(b) The latency win is real but it is not "a free slot".** `loadCmdPort.ready` also
 requires `(!earlyProbeTokenPresent || earlyProbeOwnsCmd)` (`DcachePlugin.scala:983`), so a
 walker command still cannot interleave into a stream with live probe tokens unless W11's
 `probeCancelAll` extension is in place. That cost is paid under the original drain-to-zero
-W7 **too** — W11 is mandatory either way (§4.2.6) — so the FIFO is strictly better than what
-it replaces, just not unconditionally free. W25 (§4.5) closes the second half of the same
-question: the walker's token must be a *reserved* value, not a don't-care, or it can match a
-resident probe entry by accident.
+W7 **too** — W11 is mandatory either way (§4.2.6) — so the FIFO is a **latency** improvement
+over what it replaces, not unconditionally free, and not better on every axis. *Round-3
+correction: the round-2 text said "strictly better", which the same paragraph's own honest
+framing ("paid, not eliminated") contradicts.* Concretely, the trade is:
+
+- **Latency genuinely improves.** A walker no longer waits for a live load stream to empty.
+- **Probe-destruction frequency genuinely rises.** Under drain-to-zero a walker was only ever
+  admitted into a **quiet** port, so `probeCancelAll` had little or nothing resident to
+  destroy and the cost was rare. Under the FIFO the walker interleaves into a **live** stream,
+  so each of a walk's up to three descriptor reads can individually trigger `probeCancelAll`
+  and destroy up to 4 resident early probes. That is a real, repeated IPC cost on the LS pipe,
+  paid to buy the latency, and the synth/IPC evidence in §10.3 is what settles whether the
+  trade is net positive on real workloads.
+
+W25 (§4.5) closes the second half of the same question: the walker's token must be a
+*reserved* value, not a don't-care, or it can match a resident probe entry by accident.
 
 #### 4.2.4 W8/W9 — priority and the fairness primitive
 
@@ -523,9 +600,35 @@ force(i) := (age(i) === LIMIT)
 ```
 
 `force(i)` does **not** yank the port mid-transaction. It only changes the *next* grant
-decision, and the switch still obeys W7 (drain to zero first). Concretely, `force` means
-"stop admitting new `CORE-LS` commands on this direction and take the port the moment it
-drains".
+decision.
+
+**What `force` means, per direction — rewritten in the round-3 fix pass.** *The round-2 text
+said `force` "still obeys W7 (drain to zero first)" and meant "stop admitting new `CORE-LS`
+commands and take the port the moment it drains". That was the pre-I4 model and it directly
+contradicts §4.2.3's current admission rules, which have **no drain term on the load
+direction at all** — eliminating exactly that wait is the whole point of the ownership FIFO.
+§12's fix-pass sweep touched the "pressure" paragraph below but not this one.* The current
+semantics:
+
+- **Load direction — no drain, ever.** `force(i)` raises walker `i` above `CORE-LS` in the
+  grant priority for the *next* grant cycle. Admission is then exactly
+  `walkerLoadAdmit(i) = grant(i) && !ldBusyExc && !quiesceHold && !ldOwnerFifo.full`
+  (§4.2.3) — a walker command may be accepted with `CORE-LS` loads still outstanding, which is
+  precisely what the FIFO makes identifiable. `CORE-LS` is not held to zero, is not drained,
+  and loses only the *next* command slot. The only load-side wait `force` can encounter is
+  `!ldBusyExc` — the surviving walker ↔ `CORE-EXC` boundary — and that is a `CORE-EXC` fact,
+  not a `CORE-LS` drain.
+- **Store direction — drain-to-zero survives, unchanged.** W7 keeps it there, so on stores
+  `force` does mean "stop admitting new `CORE` stores and take the port once
+  `stBusy(CORE)` reaches zero". The store direction is single-outstanding twice over
+  (§4.2.3), so this drain is short and bounded by at most 4 accepted store descriptors.
+
+**`WALKER_AGE_LIMIT` is unaffected by this correction and stays at 64 in this spec.** No
+finite `LIMIT` value can break §4.2.5's starvation bound — the bound is stated *in terms of*
+`LIMIT`, and W26's wedge bound likewise — so 64 is SAFE, merely possibly non-optimal. The
+constant was never the defect here; the stale paragraph above was. (The non-blocking
+re-derivation step below still stands, unchanged: it is a *tuning* step, not a correctness
+one.)
 
 `force` never outranks `CORE-EXC`'s **presented** command, but — critically — it does take
 the port on cycles the exception sequencer is not presenting one. That is required, not
@@ -581,8 +684,12 @@ mode does not recur here, and the difference is structural, not optimistic:
 2. **Requests are never withdrawn-and-reasserted in a way that resets the age.** `age(i)`
    resets only on *grant* or on the request genuinely going away.
 3. **Therefore** any pending walker request reaches `age = LIMIT` within `LIMIT` cycles,
-   after which `CORE-LS` admission stops and the port drains within a bounded number of
-   cycles, after which the walker is granted. Starvation bound: `LIMIT + drain`, finite.
+   after which it outranks `CORE-LS` and is granted the next command slot on that direction.
+   Starvation bound: `LIMIT + drain`, finite — where, per §4.2.4's corrected `force`
+   semantics, `drain` is **zero on the load direction** (the FIFO removed that wait; the only
+   residual load-side wait is the `!ldBusyExc` boundary, itself bounded by the exception
+   sequencer's own bounded access) and is at most 4 store descriptors on the store direction,
+   where drain-to-zero survives.
 4. **The reverse direction is bounded too.** A forced walker takes exactly one command's
    worth of port, then `age(i)` resets and base priority restores `CORE-LS` above it. A
    walker cannot chain-hold: its next request is a *new* request that starts ageing from 0.
@@ -678,16 +785,31 @@ deadlock is only genuinely reachable via the **ITLB** walker, which leaves the D
 The fix is written to cover both regardless — relying on that asymmetry would be exactly the
 kind of implicit invariant this codebase's review history keeps catching.
 
-#### 4.2.7 W23/W24 — two unconditional `ready` drives that this design turns into bugs
+#### 4.2.7 W23/W24/W27 — the ownerless-handshake defect class, swept exhaustively
 
-*Both added in the fix pass as CRITICAL findings. They are stated here as DECIDED items with
-the exact one-line RTL fix, even though this is a spec and not an implementation, because a
-plan-writer working only from the sections above would not encounter either site and both
-failures are **silent** — no assertion fires, no hang, no bus error.*
+*W23/W24 were added in the round-2 fix pass as CRITICAL findings. Round 3 found two things
+about that work: they named **2** sites where an exhaustive sweep of the same file finds
+**10 more** that need a fix, and **W23's own prescribed fix line reopened the very defect it
+closed**, in a different timing window. W27 is round 3's answer to the first: the sweep is
+done once, completely, as a table, and the table — not any individual finding — is the unit
+of correctness from here on. The corrected W23 below is the answer to the second.*
 
-Both are the same shape: a `ready` drive that is correct today **only** because nothing but
-its own client can ever own that port, written before a second (and now a fourth) client
-existed.
+**The defect class, stated precisely.** A `valid`, `ready` or `fire` reference on a
+`DcacheService` port that is correct today **only** because nothing but its own client can
+ever own that port. Every such reference was written when the port had one (later two)
+clients whose mutual exclusion was proven elsewhere. This design adds a third and fourth
+client and dissolves that proof. Every one of these failures is **silent**: no assertion
+fires, no hang, no bus error — a descriptor word simply lands somewhere architectural, or a
+core store simply disappears.
+
+**Why a table and not a list of findings.** Round 2 patched the two sites a review named and
+shipped. Two rounds of review then produced two more rounds of the same class. The sites are
+not conceptually hard — they are *numerous and scattered*, spread across a base drive, two
+FSM bodies, a signal deliberately defined outside both of them, and a 90-line exception
+override block at the far end of the file. The only reliable closure for that shape is
+enumeration, so §4.2.7 enumerates. **A plan-writer must re-derive the table against the
+then-current file (the line numbers are locators, the *sites* are the decision) and must not
+add a `dcache.*` reference to `LsEuPlugin` without adding a row.**
 
 ##### W23 — `excLoadCmdReady` and `excLoadOutstanding` (`LsEuPlugin.scala:2115`)
 
@@ -704,30 +826,71 @@ page-table descriptor. A descriptor word is written into a vector address, a sta
 a restored FPU frame field. There is no error path; the core simply runs on with corrupt
 architectural state.
 
-**Fix:**
+**Fix — corrected in the round-3 fix pass. The round-2 fix line was wrong and reopened this
+exact bug in a different window:**
 
 ```scala
+// ROUND-2 TEXT — DO NOT IMPLEMENT. Short one term; see below.
 excLoadCmdReady := dcache.loadCmd.ready && (ldOwner === CORE) && excActive && excLoadCmdValid
 ```
 
-(substituting whichever name the implementation gives the load-direction owner register if
-it is not `ldOwner`). Note the `excActive && excLoadCmdValid` conjunction is part of the fix,
-not decoration: within `CORE`, the SQ/LS side can also own the accepted command, so
-owner-qualification alone is insufficient — the exception sequencer must additionally be the
-one presenting.
+```scala
+// CORRECT (W23):
+excLoadCmdReady := dcache.loadCmd.ready && excLoadAdmit        // §4.2.3
+```
+
+**Why the round-2 line is a bug.** §4.2.3's load-admission rule for the exception path is
+**strictly stronger** than "the owner is `CORE`":
+`excLoadAdmit = excActive && excLoadCmdValid && !ldOwnerFifoHoldsWalker`. W7 keeps
+drain-to-zero at the walker ↔ `CORE-EXC` boundary specifically, so while **any** walker entry
+sits in the ownership FIFO the arbiter must *withhold* the exception sequencer's command and
+`dcache.loadCmd.valid` is deliberately held **low**. And `dcache.loadCmd.ready`
+(`DcachePlugin.scala:981`) **does not reference `valid` at all** — `DcachePlugin` asserts it
+on its own schedule, independent of whether anything is being presented.
+
+So in exactly the window the design most needs protected — a walker response outstanding, the
+exception command correctly withheld — all of `dcache.loadCmd.ready`, `(ldOwner === CORE)`
+(nothing walker-owned holds the *current grant*; the walker's claim is in the FIFO, not in
+`ldOwner` — see §4.2.3), `excActive` and `excLoadCmdValid` are simultaneously **true**. The
+round-2 line pulses `excLoadCmdReady` **with no command issued**. The exception sequencer's
+FSM advances (`E_VECREQ → E_VECWAIT`, `F_HDRREQ → F_HDRWAIT`, any `R_*` RTE-pop state)
+believing its command fired; `excLoadCmdValid` drops; `ldBusyExc` drops; the walker is
+unblocked; and the exception sequencer, now waiting on `dcLoadRsp.valid`, consumes the
+**walker's** response. That is byte-for-byte the round-1 C1 failure — a page-table descriptor
+word landing in a vector fetch, a stacked SR, or a restored FPU frame — arriving *through* the
+fix meant to close it. It is reachable in the ordinary way: any exception raised while an
+ITLB/DTLB walk is already outstanding.
+
+**The rationale W23 states must change with it.** Round 2 said "the exception sequencer must
+additionally be the one **presenting**". That is insufficient: presentation can be *correctly
+withheld* while `ready` is high for unrelated reasons. The rule is that the exception
+sequencer must be the one **ADMITTED** — which is what `excLoadAdmit` names, and why the fix
+reuses that predicate rather than re-deriving a weaker proxy for it. Equivalently and
+preferably, derive `excLoadCmdReady` from the **actual fire condition of the exception leg of
+the mux** rather than from any re-derivation at all; whichever form the implementation picks,
+it must be **at least as strong as `excLoadAdmit`**.
 
 **The same bug, second site.** `excLoadOutstanding`'s set term as specified in §4.2.3 —
 `dcache.loadCmd.fire && excActive && excLoadCmdValid` — carries the **identical** unqualified
 `fire`: `dcache.loadCmd.fire` is `valid && ready`, and under a walker grant that `fire` is
-the walker's. Setting `excLoadOutstanding` on a walker's fire corrupts `ldBusy(CORE)`, which
+the walker's. Setting `excLoadOutstanding` on a walker's fire corrupts `ldBusyExc`, which
 is **W7's own input** — so the bug feeds straight back into the hand-over rule that is
-supposed to prevent it. Fix identically:
+supposed to prevent it. Fix with the same predicate, for the same reason:
 
 ```scala
-when(dcache.loadCmd.fire && (ldOwner === CORE) && excActive && excLoadCmdValid) {
+when(dcache.loadCmd.fire && excLoadAdmit) {
   excLoadOutstanding := True
 }
 ```
+
+**And the presentation site itself.** *Round-3 addition.* Nothing in the round-2 text ever
+bound `excLoadAdmit` to a line of RTL — it was defined in §4.2.3 and then never used. The
+withholding C2's argument assumes therefore did not exist: `LsEuPlugin.scala:2027`'s
+`when(excActive && excLoadCmdValid)` header drives `dcache.loadCmd.valid := True` at `:2028`
+with **no** admission term, so the exception sequencer would present its command straight into
+a walker-occupied FIFO — a direct W7 violation, tripping §4.3's assertion in sim and
+mis-delivering a descriptor in silicon. That header becomes `when(excLoadAdmit)`, and its
+store-side twin at `:2067` becomes `when(excStoreAdmit)`. Both are rows in W27's table below.
 
 ##### W24 — `sq.io.drain.ready` (`LsEuPlugin.scala:265`)
 
@@ -763,18 +926,172 @@ with the existing `:2068` `sq.io.drain.ready := False` inside the exception over
 exactly as it is (it is the same rule expressed at the finer `CORE`-internal granularity,
 and last-assignment-wins already orders them correctly).
 
-##### Why both must appear in the plan's `LsEuPlugin` change list
+##### W27 — the exhaustive `dcache.*` handshake table
 
-§8's `LsEuPlugin` row did not previously mention either site. It now does, and the plan
-**must** carry them as named steps with their own directed checks:
+**Derivation.** Re-derived directly from `LsEuPlugin.scala` at this spec's HEAD by sweeping
+`dcache.loadCmd`, `dcache.store`, `dcache.loadRsp`, `dcache.storeAck`, `dcache.storeErr` and
+`dcache.loadProbe*` across the whole file, **not** transcribed from the review. Line numbers
+are locators only; a plan-writer re-resolves by symbol. Rows marked **NEW** were not covered
+by any round-2 decision.
 
-- W23: a directed test in `WalkerDcachePortArbSpec` that presents an exception-sequencer load
-  and a walker load in the same cycle and asserts the exception sequencer's FSM does **not**
-  advance and `excLoadOutstanding` does **not** set.
-- W24: a directed test that drains a non-empty `StoreQueue` while a walker U/M store owns the
-  port, and asserts every SQ entry reaches the cache — asserted against a byte-write observer
-  on the cache side, not against the SQ's own pointers, since it is precisely the pointers
-  that lie.
+*Two locator corrections the round-3 derivation produced, recorded so the plan does not edit
+the wrong line:* the split/aligned `dcache.loadCmd.valid` drive is at **`:756`**, not `:758`
+(`:758` is `payload.paddr`); and `excStoreOutstanding` is declared at **`:268`**, not
+`:266-270`.
+
+**Load command port — `dcache.loadCmd`**
+
+| Line | Site | Disposition |
+|---|---|---|
+| `:756` | `dcache.loadCmd.valid := Mux(useSplitCmd, llReg.valid, alignedSendValid)` — the CORE-LS base drive | **NEW — FIX.** See "the split leg" below. Becomes `coreLsLoadAdmit`-gated on **both** legs, and **both** legs must feed the arbiter's CORE-LS request. Today only the `alignedSendValid` leg is reached by any owner term (via `:716`). |
+| `:766` | `alignedCmdFire = alignedSendValid && dcache.loadCmd.ready` | **Covered, W11.** `alignedSendValid` already carries `!dcLoadHeldByOther` via `:716`, and it is the *same* signal that gates the port's `valid` on this leg — so `ready` can only be believed on a cycle CORE-LS is actually presenting. This is the pattern the other `ready` sites must copy, and the reason it is safe is worth stating: **the fire qualifier and the valid drive read one signal.** |
+| `:1508` | BK FSM `LAUNCH`: `when(dcache.loadCmd.fire) { llReg.valid := False; aDone := False; goto(WAIT_A) }` | **NEW — FIX.** `&& coreLsLoadAdmit`. Unqualified, a walker's fire advances the split FSM to `WAIT_A` with slot A never issued. |
+| `:1536` | BK FSM `WAIT_A`: `when(dcache.loadCmd.fire) { llReg.valid := False; goto(WAIT_B) }` | **NEW — FIX.** `&& coreLsLoadAdmit`. This is the reviewer's worked scenario: see "the split leg" below. |
+| `:2027-2028` | `when(excActive && excLoadCmdValid) { dcache.loadCmd.valid := True; … }` — the CORE-EXC presentation header and payload block | **NEW — FIX.** Header becomes `when(excLoadAdmit)`. Nothing previously bound `excLoadAdmit` to any RTL site, so the withholding W23's own argument assumes did not exist. |
+| `:2115` | `excLoadCmdReady := dcache.loadCmd.ready` | **W23, fix corrected in round 3.** `&& excLoadAdmit` — *not* the weaker `(ldOwner === CORE) && excActive && excLoadCmdValid` round 2 prescribed. |
+| (new) | `excLoadOutstanding`'s set term, `dcache.loadCmd.fire && …` | **W23, second site, predicate corrected.** `when(dcache.loadCmd.fire && excLoadAdmit)`. |
+| (new) | The two walker legs' `loadCmd.valid` / payload drives | **W7/W8.** Gated by `walkerLoadAdmit(i)`; lowest-priority legs of the last-assignment-wins chain (§5 item (1)). |
+
+**Store port — `dcache.store`**
+
+| Line | Site | Disposition |
+|---|---|---|
+| `:263-264` | `dcache.store.valid := sq.io.drain.valid` / `payload := sq.io.drain.payload` — the CORE-LS base drive | **NEW — stated, no new term needed.** Safe **only** because the exception override (`:2067`) and the new walker legs are *later* drivers in the same scope and last-assignment-wins overrides this base — the property `:2020-2026`'s own comment already relies on. The plan must **preserve that ordering** (walker legs after the base, before/after the exception leg per the priority chain); it is load-bearing, not incidental. |
+| `:265` | `sq.io.drain.ready := dcache.store.ready` | **W24.** `&& (stOwner === CORE)`, with `:2068`'s existing `:= False` hold left in place. |
+| `:2067` | `when(excActive && excStoreValid) { … }` — the CORE-EXC presentation header | **NEW — FIX.** Becomes `when(excStoreAdmit)`. Unqualified, an exception store's `valid`/`payload` jump ahead of a walker's in-flight U/M store; the resulting `storeAck` is demuxed by `stOwner` (still WALKER) back to the walker, and `umq.io.drainAck` retires a U/M entry whose descriptor byte was never written — **§1.1's original coherency bug, reintroduced by the redesign that exists to fix it.** |
+| `:2069` | `excStoreReady := dcache.store.ready` | **NEW — FIX. The store-side exact twin of W23.** `&& excStoreAdmit`. `storePort.ready` (`DcachePlugin.scala:1865`) no more references `valid` than `loadCmdPort.ready` does. Note the asymmetry with the load side: on stores, `excStoreAdmit` *is* the owner form, because store admission is drain-to-zero plus owner and there is no in-flight-vs-granted gap to fall through. That asymmetry is exactly why C2 happened, and is why every site cites its **admission predicate** rather than an owner comparison. |
+| `:2070-2071` | `dcache.store.valid := True` / `payload := excStorePayload` | **NEW — FIX.** Inside `:2067`'s corrected header; no separate term. |
+| `:2076` | `when(dcache.store.fire && excActive && excStoreValid) { excStoreOutstanding := True }` | **NEW — FIX.** `when(dcache.store.fire && excStoreAdmit)`. Same class as W23's second site: an unqualified `fire` under a walker grant sets a CORE-side outstanding flag on someone else's transaction, corrupting the very `stBusy(CORE)` the hand-over rule reads. |
+| (new) | The two walker legs' `store.valid` / payload drives | **W7/W13.** Gated by `walkerStoreAdmit(i)`. |
+
+**Load response — `dcache.loadRsp` (a `Flow`; no backpressure, so every consumer is a pure sample)**
+
+| Line | Site | Disposition |
+|---|---|---|
+| `:720` | `alignedRspFire = alignedRspValid && dcache.loadRsp.valid` | **W7 caveat (a).** `&& (rspOwner === CORE)`. |
+| `:1476`, `:1480` | `dcache.loadRsp.payload.fault` / `.data` inside `when(alignedRspFire && !alignedRspIsPoison)` | **Covered transitively by `:720`.** No own term: these are nested under the qualified `alignedRspFire`. Stated explicitly so a plan-writer does not "fix" them a second time and does not assume they are a gap. |
+| `:1520` | BK FSM `WAIT_A`: `when(dcache.loadRsp.valid && !aDone)` (and `:1521`/`:1529`'s payload use) | **W7 caveat (a).** `&& (rspOwner === CORE)`. |
+| `:1541` | BK FSM `WAIT_B`: `when(dcache.loadRsp.valid)` (and `:1546`/`:1548`'s payload use) | **W7 caveat (a).** `&& (rspOwner === CORE)`. |
+| `:1574-1575` | `bkCompletes = (bkInWaitB && dcache.loadRsp.valid) \|\| (bkInWaitA && dcache.loadRsp.valid && …fault)` | **NEW — FIX.** `&& (rspOwner === CORE)` on **both** arms. **Structurally the easiest row in this table to miss**, and it is why W27 is a table: it is deliberately defined *outside* both `whenIsActive` bodies (its own comment: "Derived from `bkFsm.isActive` rather than from an assignment inside either FSM"), so an editor implementing caveat (a)'s literal wording — which named only "WAIT_A/WAIT_B sampling" — touches the two FSM bodies and leaves this untouched. Unqualified, the `WAIT_B` arm treats a **walker's** response as slot B's completion, releasing `S1` and `backCompFires` (`:1579`) on a mid-flight response and completing the split load with slot B never received. |
+| `:1579` | `backCompFires = (bkCompletes && !bkPoisoned) \|\| (alignedRspFire && !alignedRspIsPoison)` | **Covered transitively** by the two rows above, once both are qualified. No own term. |
+
+**Store responses — `dcache.storeAck` / `dcache.storeErr` (bare ordered `Bool`s)**
+
+| Line | Site | Disposition |
+|---|---|---|
+| `:270-271` | `sq.io.drainAck` / `sq.io.drainErr := dcache.storeAck/Err && !excStoreOutstanding` | **W13.** `&& (stOwner === CORE) && !excStoreOutstanding`. Mandatory: `StoreQueue.scala:518` asserts on a stray ack. |
+| `:2073` | `when(dcache.storeAck && excStoreOutstanding) { excStoreOutstanding := False }` | **NEW — FIX (defence in depth), with its safety argument stated.** In principle safe without a term: `excStoreOutstanding` set implies `stBusy(CORE) =/= 0`, and the store direction's surviving drain-to-zero forbids a hand-over in that window — **but only if `coreStOutstanding` counts the exception sequencer's accepted stores as well as the SQ drain's** (W6 makes them one owner; §4.2.3 now says so explicitly). That is a cross-section invariant holding up a silent-corruption site, so the row takes `&& (stOwner === CORE)` anyway: one AND term on a low-fanout control register (§5), and the argument stops being load-bearing. |
+| (new) | `umq.io.drainAck := dcache.storeAck && (stOwner === i)`, per walker | **W13.** Already specified in §4.3. |
+| (new) | `exc.dcStoreAck` | **W13.** Gated at the mux, not at the top level — no DUT wiring changes. |
+
+**Probe ports — `dcache.loadProbe`, `loadProbeCancel`, `loadProbeResolve`**
+
+| Line | Site | Disposition |
+|---|---|---|
+| `:869-878` | `dcache.loadProbe.valid := probeWanted && xlate.req.ready` + payload | **No owner qualification needed, and the reason is a decision, not an accident: walkers never launch a probe** (W25). The probe ports have exactly one client and keep the pre-existing proof. What they *do* take is W11's suppression: `probeWanted` derives from `normalReqArm` (`:1775-1776`), whose `!excActive` becomes `!dcLoadHeldByOther`. |
+| `:879-881` | `dcache.loadProbeCancel.valid := probeCancel \|\| probeCancelAll` | **No owner qualification needed** (same reason). Takes W11's `probeCancelAll = sqFlushSig \|\| excActive \|\| walkerOwnsLoad` (`:863`) — an added OR term, counted as a real addition in §5. |
+| `:882-885`, `:1740-1745` | `dcache.loadProbeResolve` drives | **No owner qualification needed** (same reason). Keyed off `txRspFire`, a CORE-only translation event. |
+| `:1776` | `dcache.loadProbe.ready` inside `normalReqArm` | **No owner qualification needed** (same reason); takes W11's `!dcLoadHeldByOther` substitution in the same expression. |
+
+**Not a handshake, listed for completeness:** `dcache.loadBusy` is referenced only in the
+file's header doc comment (`:70`), never in `logic`. `host[DcacheService]` at `:197` is the
+service handle itself. No other `dcache.*` reference exists in the file.
+
+##### The split leg (`:756` / `:1508` / `:1536`) — the worked failure, and the two-part fix
+
+`useSplitCmd = bkBusy` (`:749`), and `:756` reads
+`dcache.loadCmd.valid := Mux(useSplitCmd, llReg.valid, alignedSendValid)`. W11's
+`dcLoadHeldByOther` fold reaches only the `alignedSendValid` leg, at `:716`. **When a split is
+in flight the arbiter-gated leg is bypassed entirely and `llReg.valid` reaches the port with
+no owner or arbitration term anywhere in its cone.**
+
+The failure, in order:
+
+1. A split load reaches `WAIT_A`. `aDone` is still false, so `llReg.valid` is low (`:1534-1535`
+   only raises it once `aDone` sets).
+2. With `llReg.valid` low and `alignedSendValid` low (`:717`'s `!bkBusy`), the arbiter sees
+   **no CORE-LS load request pending** and may grant a walker — or `force`-grant one under W8,
+   since CORE-LS looks idle and its age counter never resets against a request it cannot see.
+3. Slot A's response lands, `aDone` rises, `WAIT_A` raises `llReg.valid` and waits for
+   `dcache.loadCmd.fire` to launch slot B.
+4. The walker's own command fires in that window. `:1536` sees `dcache.loadCmd.fire` — true
+   because of the **walker's** fire — clears `llReg.valid`, and goes to `WAIT_B`. **Slot B was
+   never issued.**
+5. Either the FSM waits forever in `WAIT_B` for a response nobody will send (a hang), **or**
+   `bkCompletes`'s unqualified `WAIT_B` arm (`:1574`) sees the walker's `loadRsp` and treats it
+   as slot B's completion — releasing `S1`/`backCompFires` and completing a cross-line load
+   from a page-table descriptor line. `:1508` (`LAUNCH`, one step earlier) has the identical
+   shape for slot A.
+
+**The fix has two halves, and only doing one of them is worse than doing neither** (gating
+without requesting turns the silent corruption into a livelock):
+
+```scala
+// (i) VISIBILITY: the split leg is a first-class CORE-LS request to the arbiter.
+val coreLsLoadReq   = Mux(useSplitCmd, llReg.valid, alignedSendValidRaw)
+// (ii) ADMISSION: the same gate the aligned leg already gets, applied to BOTH legs.
+val coreLsLoadAdmit = coreLsLoadReq && !dcLoadHeldByOther
+dcache.loadCmd.valid := coreLsLoadAdmit
+// ...and every CORE-LS fire qualifier reads coreLsLoadAdmit, never bare `dcache.loadCmd.fire`:
+//   :1508  when(dcache.loadCmd.fire && coreLsLoadAdmit) { … }
+//   :1536  when(dcache.loadCmd.fire && coreLsLoadAdmit) { … }
+```
+
+where `alignedSendValidRaw` is `:716`'s expression **without** the `!dcLoadHeldByOther` term
+(the term moves up to `coreLsLoadAdmit` so it applies once, to both legs, instead of being
+duplicated). `alignedSendValid` itself keeps its current meaning — `alignedSendValidRaw &&
+!dcLoadHeldByOther` — so `:766`'s `alignedCmdFire` is unchanged and still reads the same
+signal that drives the port. **Half (i) is what keeps §4.2.5's starvation proof true for the
+split path**: without it a split load is invisible to the arbiter and the aging counters
+reason about a requester that is not in their request set.
+
+##### Why every one of these must appear in the plan's `LsEuPlugin` change list
+
+§8's `LsEuPlugin` row carries the whole table, not a selection from it. The plan **must**
+carry each **NEW — FIX** row as a named step with its own directed check (§10.2), and the
+**no-new-term** rows as explicitly-recorded no-ops with their justifications, so a later
+reviewer can tell "considered and justified" from "not looked at" — which is the distinction
+round 2 could not support and round 3 exists to make possible.
+
+#### 4.2.8 W28 — the same-cycle owner-coherence invariant
+
+Every owner qualification in this document — `ldOwner === CORE`, `stOwner === CORE`,
+`rspOwner === CORE`, `!ldOwnerFifoHoldsWalker`, and every predicate built on them in W7, W13,
+W23, W24 and W27 — rests on a premise that §5 only gestures at ("registered and never
+combinationally in a command path") and that nothing states as a requirement:
+
+> **The arbiter's payload/`valid` MUX selection and the qualification terms that gate belief in
+> that port's handshake MUST read the identical owner value on the identical cycle.**
+
+If, say, `ldOwner` is a register updated on the *grant edge* while the mux itself selects off a
+*combinational* grant signal, there is a one-cycle window in which the port is physically
+driven by one client while every qualification term says it belongs to another. Every C1/C2
+failure in this document then reappears — a descriptor into an architectural register, a lost
+core store, a split FSM advancing on someone else's fire — through a **timing gap** instead of
+a **missing site**. W27's table cannot detect that class; only this invariant can.
+
+**W28 (decision):** the owner-tracking state that qualification terms read (`ldOwner`,
+`stOwner`, the ownership FIFO and its `rspOwner` head, `walkerOwnsLoad`, `dcLoadHeldByOther`)
+**is the same state the mux selects on, sampled in the same cycle, off the same signal.** Two
+admissible implementations, and no third:
+
+- **Registered-grant (preferred).** The grant decision is registered; the mux selects off the
+  registered owner; the qualification terms read that same register. The command presented in
+  cycle *N* is selected by `owner[N]` and qualified by `owner[N]`. This is what §5's FMax
+  argument already assumes (a registered owner code compared against a constant, "one LUT from
+  a flop"), and it costs nothing extra.
+- **Combinational-grant, used consistently.** The mux selects off the combinational grant and
+  *every* qualification term reads that same combinational signal, with the registered owner
+  used **only** for FIFO push payloads and for reporting. Permitted, but it puts a computed
+  condition on the boundary mux's select and therefore trades against §5 item (1); if the plan
+  reaches for it, the synth gate is the arbiter.
+
+**What is forbidden** is the mixture: mux selecting off one, qualifying off the other. The
+plan must state which of the two it implements, in one place, and `WalkerDcachePortArbSpec`
+must carry a directed check that no cycle exists in which `dcache.loadCmd.fire` is true while
+the payload presented and the owner qualified disagree — the one property that makes every
+other owner-qualified assertion in this spec meaningful. A `GenerationFlags.simulation`
+assertion in the same style as §4.3's pair is the natural home for it.
 
 ### 4.3 W13/W14 — response routing
 
@@ -803,11 +1120,14 @@ happens, not whether it happens:
   stays wired straight from `DcacheService.loadRsp`, as does every DUT that replicates that
   line. `DLoadRsp` gains no field. This was the whole strength of the original W14 argument
   and it is preserved intact.
-- **Inside `LsEuPlugin`, routing is by `rspOwner`** — W7's FIFO head — for the two `CORE`-side
-  consumers that are no longer guaranteed inert. Per §4.2.3 caveat (a), `alignedRspFire`
-  (`LsEuPlugin.scala:720`) and the split BK FSM's `WAIT_A`/`WAIT_B` sampling each gain
-  `&& (rspOwner === CORE)`. That is two AND terms on already-registered control signals, not
-  a demux of the response bundle.
+- **Inside `LsEuPlugin`, routing is by `rspOwner`** — W7's FIFO head — for every `CORE`-side
+  consumer that is no longer guaranteed inert. `alignedRspFire` (`LsEuPlugin.scala:720`), the
+  split BK FSM's `WAIT_A`/`WAIT_B` sampling (`:1520`, `:1541`) and **`bkCompletes`
+  (`:1574-1575`)** each gain `&& (rspOwner === CORE)`; `:1476`/`:1480` and `:1579` are covered
+  transitively by their qualified parents. **W27's table (§4.2.7) is the authoritative list**
+  — round 2's "two sites" wording here was incomplete and is what let `bkCompletes` slip. Even
+  complete, this is four AND terms on already-registered control signals, not a demux of the
+  response bundle, so W14's argument is unchanged in substance.
 - **The exception sequencer alone keeps the pure temporal-exclusivity argument**, because W7
   keeps drain-to-zero at exactly that boundary. `ExceptionUnit`'s `dcLoadRsp` is only sampled
   in states entered *after* it issued a load (`:1470`, `:1532`, `:1544`, `:1556`, `:1569`,
@@ -918,6 +1238,26 @@ rather than being an invariant spread over three files. Two distinct values, not
 "walker" token, so that an ITLB command can never alias a DTLB command's entry either.
 Walkers still never *launch* a probe — the reserved token exists purely so their commands
 cannot **match** one.
+
+**`DcacheTypes.scala`'s token-layout doc comment must be amended in the same edit.** *Added in
+the round-3 fix pass.* The constants are genuinely disjoint — every existing token has bit 7
+clear except the exception sequencer's `0x80` — but `DcacheTypes.scala:6-8` currently defines
+the layout as:
+
+```scala
+// [7] source (0=LS ROB, 1=serializing exception unit), [6] split half,
+// [5:0] ROB id. Kept as a plain UInt field in all public bundles.
+```
+
+Under **that** layout `0x81` and `0x82` read as "serializing exception unit, split half 0,
+robId 1" and "…robId 2" — which is **false**; they are walker tokens belonging to no ROB entry
+at all. Landing correct constants beside a now-false comment describing them is exactly the
+citation/comment drift this spec objects to elsewhere (§6.2's obligation to rewrite
+`ExceptionUnit.scala:1362-1381`, §9.3's Task 13 citation updates). The comment must be
+rewritten to describe bit 7 as "non-LS source" with the three reserved values enumerated
+(`0x80` exception sequencer, `0x81` ITLB walker, `0x82` DTLB walker) and to state that
+`[6]`/`[5:0]` are meaningful **only** when bit 7 is clear. This is a required part of W25, not
+optional tidying.
 
 **`selectWord` is deleted (W16).** `DcacheByteLane.extract(line, paddr[3:0], LONG)`
 (`DcacheTypes.scala:186-190`) computes bit-for-bit what `selectWord` (`TableWalker.scala:86-94`)
@@ -1039,12 +1379,20 @@ Each of these replaces one register-sourced signal with another *inside an exist
 AND-tree*. Substitution adds no level; it adds one 2-input OR **outside** the timing path,
 feeding a signal that already fans out to these sites:
 
-- `:716` `alignedSendValid = ... && !bkBusy && !excActive` → `&& !dcLoadHeldByOther`
+- `:716` `alignedSendValid = ... && !bkBusy && !excActive` → the `!dcLoadHeldByOther` term
+  moves up one level into `coreLsLoadAdmit`, where it covers the split leg too (W27); the
+  level count at `:716` is unchanged and `:756`'s existing 2-way `Mux` gains one AND input.
 - `:1774-1776` `normalReqArm`/`splitReqArm`'s `!excActive` → `!dcLoadHeldByOther`
-- `sq.io.drain.ready` / `sq.io.drainAck` / `excLoadCmdReady` (W23/W24, §4.2.7) —
-  owner-qualification terms on low-fanout control signals, not on any BRAM address.
+- **All of W27's owner-qualification terms** — `sq.io.drain.ready`, `sq.io.drainAck`/`drainErr`,
+  `excLoadCmdReady`, `excStoreReady`, the `:2027`/`:2067` presentation headers, the two BK-FSM
+  `loadCmd.fire` qualifiers, the three `loadRsp` samplings plus `bkCompletes`, and `:2073`/`:2076`
+  (W23/W24/W27, §4.2.7). Every one is an AND term on a **low-fanout control signal**, sourced
+  from a register, feeding a control flop — **none touches a BRAM address**. That the round-3
+  sweep grew this list from 3 sites to 15 therefore does **not** change §5's risk picture: the
+  two real additions below are still the only two, and they are unchanged by round 3.
 
-with `dcLoadHeldByOther = excActive || walkerOwnsLoad` computed **once**, from a **register**.
+with `dcLoadHeldByOther = excActive || walkerOwnsLoad` computed **once**, from a **register**
+(and read on the same cycle the mux selects on — W28, §4.2.8).
 
 Also genuinely free, for a structural reason rather than an accounting one:
 
@@ -1282,9 +1630,9 @@ otherwise:
 | `mmu/TableWalker.scala` | Delete `io.axi`, `axiCfg`, `selectWord`; add the four client hooks; retarget `issueRead()`/`RD_*`; handle `loadRsp.fault` (W16) |
 | `mmu/ItlbPlugin.scala` | Delete `walkerAxi`, its D27 guard, the AW/W drain FSM; add client hooks; keep `drainBeat`/`drainStrb` (W17) |
 | `mmu/DtlbPlugin.scala` | Same as ITLB |
-| `execute/LsEuPlugin.scala` | Extend the `:2020-2078` mux to 4 sources; add `ldOwner`/`stOwner`/age/`force`/`walkRr`, the **W7 depth-4 ownership FIFO** + `rspOwner`, `excLoadOutstanding`, `coreStOutstanding`; fold `dcLoadHeldByOther` into `:716`, `:863`, `:1774-1776`; qualify `alignedRspFire` (`:720`) and the split BK FSM's `WAIT_A`/`WAIT_B` sampling by `rspOwner === CORE` (§4.2.3 caveat (a)); **owner-qualify `excLoadCmdReady` (`:2115`) and `excLoadOutstanding`'s set term — W23**; **owner-qualify `sq.io.drain.ready` (`:265`) — W24**; gate `sq.io.drainAck`/`drainErr` and `exc.dcStoreAck` (W13); the W26 wedge counters; the walker pass-through hooks; the simulation assertions |
+| `execute/LsEuPlugin.scala` | Extend the `:2020-2078` mux to 4 sources; add `ldOwner`/`stOwner`/age/`force`/`walkRr`, the **W7 depth-4 ownership FIFO** + `rspOwner`/`ldOwnerFifoHoldsWalker`, `excLoadOutstanding`, `coreStOutstanding` (counting the exception sequencer's stores too); the admission predicates `coreLsLoadAdmit`/`excLoadAdmit`/`excStoreAdmit`/`walkerLoadAdmit`/`walkerStoreAdmit` (§4.2.3); fold `dcLoadHeldByOther` into `:863`, `:1774-1776` and (via `coreLsLoadAdmit`) `:716`/`:756`; **implement W27's table (§4.2.7) in full — all 29 rows: the 10 `NEW — FIX` rows as named steps, the 1 `NEW — stated` row as a recorded ordering constraint, and the 18 already-decided / needs-no-term rows as recorded no-ops**, which subsumes W23 (`:2115` + `excLoadOutstanding`'s set term, qualified by `excLoadAdmit`, **not** by an owner comparison), W24 (`:265`), the split-leg visibility+admission fix (`:756`/`:1508`/`:1536`), `bkCompletes` (`:1574-1575`), the store-side W23 twin (`:2069`/`:2076`), the `:2027`/`:2067` presentation headers, `:2073`, and the `rspOwner` qualifications at `:720`/`:1520`/`:1541`; satisfy **W28**'s same-cycle owner-coherence invariant and state which of its two admissible shapes is implemented; gate `sq.io.drainAck`/`drainErr` and `exc.dcStoreAck` (W13); the W26 wedge counters; the walker pass-through hooks; the simulation assertions |
 | `exception/ExceptionUnit.scala` | Export the `quiesceHold` bool over `S_DRAIN \|\| S_APPLY` (W19/M1); correct the `:1362-1381` comment |
-| `cache/DcacheTypes.scala` | **Declaration-only:** add `DLoadToken.WALK_ITLB = 0x81` / `WALK_DTLB = 0x82` next to the existing width constant (W25). No bundle field, no behavioural change — see the note below |
+| `cache/DcacheTypes.scala` | **Declaration-only:** add `DLoadToken.WALK_ITLB = 0x81` / `WALK_DTLB = 0x82` next to the existing width constant, **and amend the `:6-8` token-layout doc comment** so it describes the walker values rather than mis-reading them as exception-unit tokens (W25). No bundle field, no behavioural change — see the note below |
 | `socket/AxiDMerge.scala` | Shrink to 2 read owners / 1 write owner (W21) |
 | `socket/AxiDMergePlugin.scala` | Drop the `itlb`/`dtlb` connections and the `socketMerged` requirement on those two plugins |
 | `top/FullCoreSynth.scala` | Wire the walker client hooks; remove the `itlbAxi`/`dtlbAxi` top-level ports |
@@ -1294,9 +1642,12 @@ otherwise:
 `cache/IcachePlugin.scala`. (`cache/DcacheTypes.scala` receives a *declaration-only* addition
 for W25 — two `Int` constants beside the existing `DLoadToken.Width`. No bundle field is
 added or changed, so W4's "`DcachePlugin` gains zero new client awareness" and W7's "no
-`DcacheService` bundle change" both stand. If a plan prefers to keep `DcacheTypes.scala`
-byte-identical, the two constants may instead live in `LsEuPlugin` beside the existing `0x80`
-literal; the *disjointness* is the decision, its file is not.)
+`DcacheService` bundle change" both stand. If a plan prefers to keep the *constants* out of
+`DcacheTypes.scala`, they may instead live in `LsEuPlugin` beside the existing `0x80`
+literal; the *disjointness* is the decision, its file is not. **The `:6-8` doc-comment
+amendment is required either way** — the token field it documents is the one the walker
+values travel in, so the comment is false wherever the constants are declared, and
+`DcacheTypes.scala` cannot be left byte-identical.)
 
 ### 8.1 Test-wiring churn — corrected inventory
 
@@ -1338,15 +1689,23 @@ page-table image to be planted where none existed. **This is the expensive part 
 and the plan must budget for it as such.** The 6 fully-shared files (plus
 `ExecuteLockStepSpec`'s 5 shared sites) are the cheap deletions.
 
-**W18's `DcacheClientMemAgent` is needed by 7 files / 8 DUT classes, not 5.** The original
+**W18's `DcacheClientMemAgent` is needed by 8 files / 8 DUT classes, not 5.** The original
 counted only the MMU-only bucket. Add:
 
 - `cache/IcacheParallelViptSpec` — `walkerAxi.ar`-fire counters at `:111` and `:166`;
 - `frontend/FetchAlignResidentCadenceSpec` — `walkerAxi.ar`-fire counter plus an address
   trace at `:139`/`:141`;
 - `ls/DtlbMissFlushSpec`'s **first** `Dut` class (`:97`, `DtlbCleanMissSerializationSpec`),
-  which has no `DcachePlugin` even though the file's *other* DUT does — hence 8 DUT classes
-  across 7 files.
+  which has no `DcachePlugin` even though the file's *other* DUT (`DtlbFlushReuseSpec`) does.
+
+**The count is 8 files / 8 DUT classes, not 7/8.** *Arithmetic corrected in the round-3 fix
+pass; the enumeration itself was right, only the total was wrong.* Seven files contribute one
+whole DUT each — `DtlbSpec`, `ItlbSpec`, `UmWriteSpec`, `MmuControlSpec`,
+`DtlbStreamPipelineSpec`, `IcacheParallelViptSpec`, `FetchAlignResidentCadenceSpec`, each with
+exactly one DUT class and no `DcachePlugin` reference — and `ls/DtlbMissFlushSpec` is an
+**eighth** file contributing the eighth DUT class. That file is not *wholly* in this bucket
+(its sibling DUT does instantiate `DcachePlugin`), which is what produced the miscount, but it
+is still a file the plan must open and edit.
 
 Assertions counting `walkerAxi.ar` fires are rewritten to count `walkLoadCmd` fires:
 `DtlbSpec.scala:135,177,230`, `UmWriteSpec.scala:220,290,351`,
@@ -1423,7 +1782,11 @@ stays") read as though a read-side watchdog were the only one that exists.* `Axi
 carries **two**, one per direction, exactly as D20-as-written requires ("**each direction** of
 `AxiDMergePlugin` carries a bounded-grant watchdog", socket design spec `:1162`):
 
-- **read side** — `AxiDMerge.scala:222-230` (`progress = out.ar.fire || out.r.fire`);
+- **read side** — `AxiDMerge.scala:225-230` (`progress = out.ar.fire || out.r.fire`);
+  *(locator corrected twice: the round-2 text said `:222-230`, and the round-3 review proposed
+  `:224-231`, which is itself off by one at both ends — `:223-224` are the block's comment and
+  `:231` closes the enclosing `Area`. `:225-230` is `progress`→`wedge`, exactly parallel to the
+  write side's `:298-303` below, which was already exact.)*
 - **write side** — `AxiDMerge.scala:298-303` (`progress = out.aw.fire || out.w.fire ||
   out.b.fire`);
 - combined at `:306-307` — `io.wedge := rd.wedge || wr.wedge`, `io.wedgeIsRead := rd.wedge`.
@@ -1501,7 +1864,8 @@ draft listed two; the fix pass adds items 3 and 4.)
    that make "every AXI transaction this core issues terminates on a response of *any* resp
    code, and every FSM that waits on a response treats SLVERR/DECERR as terminating" a stated
    invariant rather than a hope — **explicitly names `TableWalker.scala:114`** (the descriptor
-   `R` consumer) as one of its sites (socket design spec `:1145`). This redesign **deletes
+   `R` consumer) as one of its sites (socket design spec `:1146` — *locator corrected in the
+   round-3 fix pass; `:1145` is the preceding `:1210-1216` eviction-B evidence line*). This redesign **deletes
    that exact site**. Worse, the socket spec's own §12 states the invariant "must be
    re-checked, not assumed, by any future work that adds an AXI response consumer" — and this
    work both removes one consumer and adds a new response path at a different layer.
@@ -1553,8 +1917,11 @@ scoping memo §7 flagged ("do not rely on its current shape").
 
 | Test | What it pins |
 |---|---|
-| `DcacheClientMemAgent` (W18) + reworked `DtlbSpec`, `ItlbSpec`, `UmWriteSpec`, `MmuControlSpec`, `DtlbStreamPipelineSpec`, `IcacheParallelViptSpec`, `FetchAlignResidentCadenceSpec`, `DtlbMissFlushSpec`'s first `Dut` — **7 files / 8 DUT classes**, per §8.1 | Walks and U/M drains still work against a behavioural `DcacheService` client interface |
-| New `WalkerDcachePortArbSpec` | (a) the surviving drain-to-zero holds: no walker load is outstanding while the exception sequencer has one, and no store hand-over occurs with a core store outstanding (W7); (a′) the **W7 ownership FIFO** routes correctly with `CORE` and a walker concurrently outstanding, including the ≤3-deep case, and `alignedCount`/`alignedRspPtr` are untouched by a walker response (§4.2.3 caveat (a)); (b) a walker starved for `LIMIT` cycles under continuous SQ drain **does** get the port (W8) — the direct answer to the scoping memo §4's "a busy store queue could postpone a walker indefinitely"; (c) a walker cannot chain-hold against `CORE-LS` (W8.4); (d) ITLB/DTLB alternate (W9); (e) **W23** — a walker `loadCmd.ready` in the same cycle as a presented exception-sequencer load does not advance the exception FSM and does not set `excLoadOutstanding`; (f) **W24** — every `StoreQueue` entry reaches the cache while a walker U/M store owns the store port, asserted against a **cache-side byte-write observer**, never against the SQ's own pointers |
+| `DcacheClientMemAgent` (W18) + reworked `DtlbSpec`, `ItlbSpec`, `UmWriteSpec`, `MmuControlSpec`, `DtlbStreamPipelineSpec`, `IcacheParallelViptSpec`, `FetchAlignResidentCadenceSpec`, `DtlbMissFlushSpec`'s first `Dut` — **8 files / 8 DUT classes**, per §8.1 | Walks and U/M drains still work against a behavioural `DcacheService` client interface |
+| New `WalkerDcachePortArbSpec` | (a) the surviving drain-to-zero holds: no walker load is outstanding while the exception sequencer has one, and no store hand-over occurs with a core store outstanding (W7); (a′) the **W7 ownership FIFO** routes correctly with `CORE` and a walker concurrently outstanding, including the ≤3-deep case, and `alignedCount`/`alignedRspPtr` are untouched by a walker response (§4.2.3 caveat (a)); (b) a walker starved for `LIMIT` cycles under continuous SQ drain **does** get the port (W8) — the direct answer to the scoping memo §4's "a busy store queue could postpone a walker indefinitely"; (c) a walker cannot chain-hold against `CORE-LS` (W8.4); (d) ITLB/DTLB alternate (W9); (e) **W23** — a walker `loadCmd.ready` in the same cycle as a presented exception-sequencer load does not advance the exception FSM and does not set `excLoadOutstanding`; (e′) **W23's round-3 correction, the C2 regression test** — with a **walker entry sitting in the ownership FIFO** and the exception sequencer's command therefore correctly *withheld* (`loadCmd.valid` low) while `DcachePlugin` holds `loadCmd.ready` **high**, assert `excLoadCmdReady` never pulses, the exception FSM does not advance out of `E_VECREQ`/`F_HDRREQ`/`R_*`, and the walker's `loadRsp` is not consumed by the exception path. **This is the case round 2's fix line passed and round 3's must fail without `excLoadAdmit`** — the test must be shown to fail against the round-2 line; (f) **W24** — every `StoreQueue` entry reaches the cache while a walker U/M store owns the store port, asserted against a **cache-side byte-write observer**, never against the SQ's own pointers |
+| New `WalkerSplitLoadRaceSpec` (**W27**, round 3) | (a) **slot-B launch vs a walker grant** — drive a cross-line split load to `WAIT_A` with `aDone` low so the arbiter sees CORE-LS idle, grant a walker, then let slot A land so `llReg.valid` rises in the same cycle the walker's command fires; assert the BK FSM does **not** leave `WAIT_A` and that slot B is genuinely issued to the cache (asserted on a cache-side command observer, not on the FSM's own state). Must be shown to advance-without-issuing before the `:1536` fix; the `:1508` `LAUNCH` twin gets the same shape for slot A. (b) **`bkCompletes`'s `WAIT_B` arm fed a walker response** — with the FSM in `WAIT_B`, deliver a walker `loadRsp`; assert `bkCompletes`/`backCompFires` stay low, `S1` is not released, and the merged load still waits for its own slot-B line. Must be shown to complete the load from the descriptor word before the `:1574-1575` fix. (c) **arbiter visibility** — a split load pending in `WAIT_A` registers as a CORE-LS request (half (i) of the fix), so a walker's aging counter does not free-run against an invisible requester |
+| New coverage in `WalkerDcachePortArbSpec` (**W27** store side, round 3) | **An exception-sequencer store racing a walker's in-flight U/M store**: with `stOwner === WALKER` and a walker U/M store accepted but not yet acked, raise `excActive && excStoreValid`; assert the exception payload does **not** reach `dcache.store`, `excStoreReady` does **not** pulse, `excStoreOutstanding` does **not** set, and the walker's `storeAck` is demuxed to `umq.io.drainAck` with the **descriptor byte actually observed in memory/array**. Without the `:2067`/`:2069`/`:2076` fixes this retires a U/M queue entry whose byte was never written — §1.1's bug reintroduced — so the test must be shown to fail first |
+| New coverage in `WalkerDcachePortArbSpec` (**W28**, round 3) | **Same-cycle owner coherence**: assert there is no cycle in which a `dcache.loadCmd.fire` (or `dcache.store.fire`) presents client X's payload while the owner value every qualification term reads names client Y. Implemented as the `GenerationFlags.simulation` assertion §4.2.8 requires, plus a directed grant-edge test that walks the owner through every transition with a command presented on each side of it |
 | New `WalkerProbeDeadlockSpec` | The §4.2.6 deadlock: fill all 4 probe slots, then demand an ITLB walk, and require forward progress. Must be shown to **hang** without W11's `probeCancelAll` term. Plus **W25**: a walker command whose `vaddr` equals a live probe's `vaddr` (identity-mapped supervisor page tables) is answered from memory, not from the probe entry — must be shown to return the *wrong* descriptor with a don't-care token |
 | New `WalkerDescriptorCoherencySpec` | The §10.1 read-side test above, plus its write-side mirror (dirty resident descriptor line + U/M writeback ⇒ no lost update after a forced eviction) |
 | New `WalkerCacheModeSpec` | `CACR.DE = 1` ⇒ walker commands carry WRITETHROUGH; `DE = 0` ⇒ INHIBITED; read and write halves always agree (W1/W3) |
@@ -1637,15 +2004,29 @@ ground and are not:
   that already exist for the identical hand-over; W25 closes the token-collision half.
 - The `S_DRAIN`/`S_APPLY` quiesce hole (§6.2) is real but is closed by a command-granularity
   hold that is provably terminating.
-- The two Critical `ready` leaks (W23/W24, §4.2.7) are real, silent, and closed by one-line
-  owner-qualifications each, both following patterns already present in the file.
+- The **ownerless-handshake defect class** (W23/W24/W27, §4.2.7) is real, silent, and reaches
+  **twelve** sites in `LsEuPlugin.scala`, not the two round 2 found: the 2 round-2 sites, **10**
+  further sites no round-2 decision reached (§4.2.7's `NEW — FIX` rows), and one more
+  (`:263-264`) that is safe only by driver ordering and is now recorded as a constraint rather
+  than left as an accident. Every one is closed by an
+  AND term on a low-fanout control signal, following patterns already present in the file.
+  What round 3 changed is not the difficulty of any individual fix but the **method**: the
+  sites are enumerated exhaustively in one table, each with a fix or a justified no-op, rather
+  than patched as reviews name them. The one genuinely structural item among them is the split
+  leg's arbiter *visibility* (§4.2.7's half (i)), without which §4.2.5's starvation proof does
+  not hold for split loads.
+- **W23's round-2 fix line was itself an instance of the class it closed** — `(ldOwner ===
+  CORE)` is a current-grant fact where the hazard is an in-flight fact — and is corrected to
+  `excLoadAdmit`. That an owner *comparison* is not interchangeable with an *admission
+  predicate* is the single most transferable lesson in this document, and W28 (§4.2.8) states
+  the invariant the whole scheme silently depended on.
 - The D19 obligation (§9.3 item 3) is real but is discharged by W16, which is strictly
   stronger than the site it replaces.
 
 The genuine *costs* are stated plainly rather than hidden, with the fix-pass corrections:
 
 - **Test-wiring churn: 24 files**, not 28 — but materially *more* expensive than the original
-  implied. **7 files / 8 DUT classes** (not 5) need W18's new sim helper, and the
+  implied. **8 files / 8 DUT classes** (not 5) need W18's new sim helper, and the
   non-`sharedMem` case — which the original filed as the rare exception needing per-site
   review — is in fact the **dominant** case (only 6 of 24 files share memory at every walker
   site; `ExecuteLockStepSpec` at 5 of 19 sites). That per-site review is the bulk of the work.
@@ -1661,9 +2042,10 @@ The genuine *costs* are stated plainly rather than hidden, with the fix-pass cor
 
 ## 12. Self-review
 
-Performed against this document before each commit — first for `fc90cf5`, then again after
-the review-driven fix pass. Findings were fixed **inline** above; they are recorded here
-rather than left as open items. Fix-pass additions are marked **[FP]**.
+Performed against this document before each commit — first for `fc90cf5`, then after the
+review-driven fix pass (`ca850ea`), then again for the round-3 fix pass. Findings were fixed
+**inline** above; they are recorded here rather than left as open items. Round-2 fix-pass
+additions are marked **[FP]**; round-3 additions are marked **[R3]**.
 
 **Placeholder scan.** No `???`, `TBD`, `TODO`, `XXX`, `<fill in>` or unresolved bracket
 survives. The `<don't care ...>` markers in §4.5/§4.6 are deliberate specification prose
@@ -1676,7 +2058,15 @@ standard: `cacheMode` is stamped by the mux and therefore genuinely irrelevant a
 (W2); `DStoreCmd.data`/`size` are genuinely ignored under `useStrb` and `size` is still
 assigned a concrete legal value.
 
-**Internal consistency.** All **26** DECIDED items (W1-W26) cross-checked pairwise for the
+**[R3] Placeholder scan, round 3.** Re-run over the new §4.2.7 table, §4.2.8, §4.5's
+doc-comment paragraph and §10.2's three new test rows plus the (e′) sub-case. No `???`/`TBD`/`TODO`/`XXX` and no
+unresolved bracket. The `(new)` entries in W27's table's `Line` column are deliberate — those
+rows describe signals this design *creates*, so no current line number exists for them; each
+still names its exact site by symbol. The one place a value is deliberately left unpinned
+(W26's counter bound, "the plan derives the constant explicitly") is unchanged from round 2
+and was affirmed by the review as correct to leave to the plan.
+
+**Internal consistency.** All **28** DECIDED items (W1-W28) cross-checked pairwise for the
 claims each makes about another:
 - W1's expression appears once (§4.1.4) and is referenced, not restated, in §4.6 and §9.2.
   Checked that §9.2's claim ("walker traffic never engages the INHIBITED sequencer unless
@@ -1715,6 +2105,41 @@ claims each makes about another:
   the mechanism. **Fixed:** §5 states explicitly that W11 does both, and why each half stays
   off the protected net. **[FP]** §5 further corrected: the `probeCancelAll` change is an
   **addition**, not a substitution, and is now counted as such.
+- **[R3] W27 is new and subsumes W23/W24 rather than sitting beside them.** Checked that no
+  section still presents W23/W24 as the complete treatment of their defect class: §0's W23/W24
+  rows now point at W27, §4.2.3 caveat (a) is relabelled "examples, not the list" and defers to
+  W27's table, §4.2.7's own heading and framing changed from "two unconditional `ready`
+  drives" to the class-plus-sweep framing, §8's `LsEuPlugin` row carries the whole table, and
+  §11.2 states twelve reached sites rather than two. Checked the reverse direction too: W27 does not
+  contradict W13 (its `:270-271` and `umq.io.drainAck` rows restate W13's own rule verbatim),
+  W11 (its four probe rows record W11's substitutions and add nothing), or W7 (its `rspOwner`
+  rows are caveat (a)'s, extended by `bkCompletes`).
+- **[R3] W23's corrected fix predicate vs §4.2.3.** `excLoadAdmit` is now used at four sites
+  (`:2027`'s header, `:2115`, `excLoadOutstanding`'s set term, and §4.3's assertion, which
+  already read the FIFO rather than `ldOwner`). Checked that §4.3's assertion and W23's fix now
+  express the **same** condition — they did not before, which is precisely how the round-2 bug
+  survived its own section: the assertion would have caught the failure the fix line allowed.
+  Also checked the store-side asymmetry is stated rather than left implicit (§4.2.7's `:2069`
+  row): `excStoreAdmit` *is* the owner form on stores because store admission is drain-to-zero,
+  so there is no in-flight-vs-granted gap on that direction. The asymmetry is real and both
+  halves are now written down.
+- **[R3] W28 vs §5.** W28's preferred (registered-grant) shape is exactly what §5 already
+  assumes when it prices the walker select term as "one LUT from a flop"; checked that
+  adopting W28 therefore adds no cost to §5's accounting and that §5's second admissible shape
+  (combinational grant) is explicitly priced against §5 item (1) rather than silently allowed.
+- **[R3] W28 vs W7/W13/W23/W24/W27.** Checked that every owner-reading term in the document
+  falls under W28's scope, and that W28 does not weaken any of them: it constrains *when* the
+  owner value is sampled, never *which* value is required.
+- **[R3] I1's `force` correction vs §4.2.5.** §4.2.5 step 3 restated the same drain-to-zero
+  language §4.2.4 did; both are corrected together, and step 1's "a `CORE` load grant is no
+  longer bounded by drain-to-zero at all under W7's FIFO" was already consistent with the new
+  wording. Checked no third site restates the old model — §4.2.4's "pressure" paragraph
+  discusses drain-to-zero only in the past tense, which is correct.
+- **[R3] I2's fix vs W4/§5/§8/§12.** Removing the "`loadCmdPort.ready` is `False` when it is
+  full" sentence restores consistency with the four sections that require `DcachePlugin.scala`
+  to receive zero edits. Re-swept the document for any other sentence implying an edit to that
+  file and found none; §12's pre-existing cross-check (the `storeOutstanding` note) still
+  holds.
 
 **Ambiguity check.**
 - "The walker" was ambiguous between `TableWalker` (the component, one per TLB) and "a walker
@@ -1741,6 +2166,16 @@ claims each makes about another:
   both are named with line numbers, and dropping the write-side one is labelled a **deviation
   from D20 as written**, with its two named consequences (`io.wedgeIsRead` dead, assertion
   block vacuous).
+- **[R3]** §4.2.3 caveat (b) claimed the FIFO is "**strictly** better than what it replaces",
+  which the same paragraph's own "paid, not eliminated" framing contradicts. Fixed: the trade
+  is stated in both directions — latency improves, probe-destruction **frequency rises**,
+  because a walker now interleaves into a live stream rather than being admitted only into a
+  quiesced port. The superlative is gone and the claim now matches the evidence.
+- **[R3]** "Owner" was ambiguous between *who holds the current grant* (`ldOwner`) and *what is
+  still in flight* (the FIFO). That ambiguity is not stylistic — it **is** C2. Normalised:
+  `ldOwner`/`stOwner` name the grant, `ldOwnerFifoHoldsWalker` names in-flight, and every
+  qualification cites an **admission predicate** by name rather than open-coding an owner
+  comparison. §4.2.3 states the distinction explicitly where the predicates are defined.
 
 **Citation hygiene. [FP]** Every line-number citation in the document was re-resolved against
 current HEAD during the fix pass. `DcachePlugin.scala` citations are now anchored by symbol
@@ -1757,7 +2192,9 @@ in `loadCmdPort.ready`), `:1927-1935` (dirty is set, never cleared, on an S3 hit
 originally attributed to the load side only), `:1602-1608` (`dcIdleForMaint`'s terms),
 `:2073-2087` (the existing assertion-block style), `LsEuPlugin.scala:263-271` (the SQ
 ack/ready drives), `:716` / `:863` / `:1774-1776` (the three `excActive` conjunctions W12
-folds into), `StoreQueue.scala:446,518` (`drainAckFire`, the stray-ack assertion),
+folds into — **[R3]** `:716`'s is now factored up one level into `coreLsLoadAdmit` per W27,
+so it also covers `:756`'s split leg), `StoreQueue.scala:446,518` (`drainAckFire`, the
+stray-ack assertion),
 `ExceptionUnit.scala:1362-1381` (the `S_DRAIN` deadlock comment), `AxiDMerge.scala:131-232`
 (the read-side grant shape), `AxiDMergePlugin.scala:36-52` (the `socketMerged` requirement
 and walker connections).
@@ -1776,13 +2213,59 @@ completion), `:1010-1018` (shadow capture and its in-order doc comment), `:1030-
 and `:313-337` (the section-4.4 assertion block), plus a direct sweep of all 24
 walker-AXI-referencing test files for §8.1's counts and `sharedMem` distribution.
 
+**[R3] Round-3 RTL re-derivation (the C1 sweep).** W27's table was produced by grepping
+`dcache.loadCmd`, `dcache.store`, `dcache.loadRsp`, `dcache.storeAck`, `dcache.storeErr` and
+`dcache.loadProbe*` across the **whole** of `LsEuPlugin.scala` and reading every hit in
+context, then cross-checking the result against the review's list rather than transcribing it.
+Outcome:
+
+- The review's eight named items are all real and all in the table.
+- **Four further sites the review did not name were found and are fixed:** `:2027-2028` (the
+  exception's `loadCmd.valid` presentation header, which nothing bound to `excLoadAdmit` — the
+  withholding C2's own argument *assumes*), `:2067`/`:2070-2071` (its store-side twin),
+  `:2073` (`when(dcache.storeAck && excStoreOutstanding)`, a `storeAck` consumer), and
+  `:263-264` (the SQ store base drive, safe by driver ordering — recorded as a no-op with the
+  ordering named as load-bearing so the plan cannot reorder it away).
+- **Four further sites were found and justified as needing no term:** `:1476`/`:1480` and
+  `:1579` (transitively covered by their qualified parents), and the four probe-port sites
+  `:869-878`/`:879-881`/`:882-885`+`:1740-1745`/`:1776` (walkers never touch the probe ports —
+  a W25 decision, not an accident).
+- **Two locator corrections** relative to the review's own table: the `loadCmd.valid` drive is
+  `:756`, not `:758`; `excStoreOutstanding` is declared at `:268`, not `:266-270`.
+- Confirmed no other `dcache.*` reference exists in the file: the only two remaining hits are
+  the header doc comment's mention of `dcache.loadBusy` (`:70`) and the service handle itself
+  (`:197`).
+
+**[R3] Additionally verified against the RTL during round 3:** `LsEuPlugin.scala:716-720`
+(`alignedSendValid`/`alignedRspValid`/`alignedRspFire`), `:749`/`:756`/`:766` (`useSplitCmd`,
+the `Mux`, `alignedCmdFire`), `:863`/`:867`/`:869-887` (probe drives and token shape),
+`:1507-1537` (the BK FSM's two `loadCmd.fire` samplings and `WAIT_A`'s `aDone` handshake),
+`:1570-1581` (`bkInWaitA`/`bkInWaitB`/`bkCompletes`/`backCompFires` and the comment explaining
+why they live outside the FSM), `:1774-1776` (`splitReqArm`/`normalReqArm`), `:2027-2078` (the
+whole exception override block), `:2115`; `DcacheTypes.scala:6-8` (the token-layout comment —
+M2); `AxiDMerge.scala:221-231` and `:296-307` (both watchdog bodies, for M4's locator);
+the socket design spec's D19 evidence line (for M4's other locator); and a direct DUT-class
+and `DcachePlugin`-reference count over all eight W18 files (for M1's arithmetic).
+
 **Unverified claim, flagged in place:** §4.1.4's remark about real 68040 table-search
 cacheability. No primary source is present in this repository; the decision does not rest on
 it and the implementation plan carries a non-blocking confirmation step.
 
+**[R3] Nothing established by W1-W22 or by the round-2 fixes is reopened.** Explicitly
+re-checked: W1/W2/W3's cacheMode policy (untouched), W7's FIFO **concept** (untouched — only
+the FIFO-full term's *location* moved, off `DcachePlugin` and onto `LsEuPlugin`'s own valid
+drive, which is where §4.2.3 always intended it), W8's `WALKER_AGE_LIMIT = 64` (untouched;
+I1's resolution confirms the constant was never the defect), W11's early-probe fix (untouched;
+W27's probe rows record it rather than change it), W13 (untouched; W27 restates it), W14's
+no-rewiring argument (untouched — every round-3 fix is inside `LsEuPlugin`, no bundle field
+and no DUT wiring), W16/W19/W20/W21/W26 (untouched), and W25's file placement (untouched; only
+M2's doc-comment sentence added). The round-2 fixes W23 and W24 are both **strengthened**, not
+weakened: W24's `(stOwner === CORE)` stands exactly as written, and W23's predicate is replaced
+by a strictly stronger one.
+
 ---
 
-## 13. Review disposition (fix pass, 2026-08-18)
+## 13. Review disposition (round-2 fix pass, 2026-08-18)
 
 An independent review of `fc90cf5` returned **changes requested — implementation must not
 start until re-reviewed**, with 2 Critical, 8 Important and 7 Minor findings. Disposition:
@@ -1814,6 +2297,33 @@ W25's token addition), W13 (mandatory, per `StoreQueue.scala:518`), W19's premis
 W16's `selectWord` deletion (byte-identical to `DcacheByteLane.extract`'s LONG case), W20
 (Task 4's disposition — `38e6c31` genuinely bundles the guards with `RESET_VEC`, so a `git
 revert` is impossible), and §6.1's no-circular-translation-dependency finding.
+
+---
+
+## 14. Review disposition (round-3 fix pass, 2026-08-18)
+
+`ca850ea` was re-reviewed and returned **changes requested** again, with 2 Critical, 3
+Important and 4 Minor findings. Both Critical findings are about round 2's *own* work, not
+about the original design. Disposition:
+
+| Finding | Disposition | Where |
+|---|---|---|
+| **C1** W23/W24 cover 2 of 9 sites of one defect shape; plus one entirely ungated command-`valid` drive (the split leg) | **Closed, and closed by method rather than by patch.** New DECIDED item **W27**: an exhaustive per-site table of **every** `dcache.*` handshake driver and consumer in `LsEuPlugin.scala`, re-derived from the file, each row carrying a fix or a justified no-op. **29 rows in total: 10 marked `NEW — FIX`** (`:756`, `:1508`, `:1536`, `:1574-1575`, `:2027-2028`, `:2067`, `:2069`, `:2070-2071`, `:2076`, `:2073`), **1 marked `NEW — stated`** (`:263-264`, safe only by driver ordering, which is now recorded as load-bearing), and **18 already-decided or justified-needs-no-term rows** — the last group deliberately included so a later reviewer can tell "considered and justified" from "not looked at". The split leg gets a two-part fix — arbiter **visibility** *and* admission gating — because gating without requesting converts silent corruption into livelock. Three new directed-test rows in §10.2 | §4.2.7 (table + the split-leg worked failure), §0 (W27), §4.2.3 caveat (a), §8, §10.2, §11.2 |
+| **C2** W23's own fix line is short one term and reopens C1 in a new window | **Closed.** `excLoadCmdReady := dcache.loadCmd.ready && excLoadAdmit`, and `excLoadOutstanding`'s set term likewise — **not** `(ldOwner === CORE) && excActive && excLoadCmdValid`, which is satisfiable in exactly the window the design must protect, because `dcache.loadCmd.ready` never references `valid` and `ldOwner` records the *current grant* while the hazard is *in flight*. W23's rationale is rewritten from "must be the one PRESENTING" to "must be the one ADMITTED". The round-2 line is left in the document, explicitly marked **DO NOT IMPLEMENT**, so the distinction is not re-lost. §10.2 gains test (e′), which must be shown to **pass** against the round-2 line and fail without `excLoadAdmit`. The round-3 sweep also found that `excLoadAdmit` had never been bound to any RTL site at all (`:2027`), so the withholding C2 assumes did not exist — fixed in the same pass | §4.2.7 (W23), §4.2.3, §0 (W23), §10.2 |
+| **I1** §4.2.4's `force` semantics are stale and contradict §4.2.3 | **Adopted.** The "drain to zero first" paragraph is rewritten per direction: **no drain at all** on the load direction (the FIFO removed it), drain-to-zero surviving on stores. §4.2.5 step 3 restated the same stale model and is corrected with it. `WALKER_AGE_LIMIT` explicitly **not** touched — it stays 64, SAFE-but-possibly-non-optimal, with the non-blocking re-derivation step intact as *tuning*, not correctness | §4.2.4, §4.2.5 |
+| **I2** §4.2.3 misattributes a FIFO-full edit to the protected `DcachePlugin.scala` | **Adopted.** The sentence is replaced with an explicit statement that the term belongs on `LsEuPlugin`'s own `dcache.loadCmd.valid` admission, naming `DcachePlugin.scala:759`'s own comment about the protected `rdSet` arc as the reason. Document re-swept for any other implied edit to that file: none | §4.2.3 |
+| **I3** the same-cycle owner-coherence invariant is only implied | **Adopted.** New DECIDED item **W28** with its own section: the mux's selection and every qualification term read the identical owner value on the identical cycle. Two admissible implementations named (registered-grant preferred, consistent-combinational permitted-but-priced), the mixture forbidden, and a directed check plus a simulation assertion required | §4.2.8, §0 (W28), §10.2 |
+| **M1** W18's file count arithmetic | **Adopted.** **8 files / 8 DUT classes**, not 7/8 — `DtlbMissFlushSpec` is an eighth *file* contributing the eighth DUT even though only one of its two DUTs is in the bucket. Fixed at all four sites; enumeration itself was already right. Re-verified by direct DUT-class and `DcachePlugin`-reference counts over all eight files | §0 (W18), §8.1, §10.2, §11.2 |
+| **M2** W25's constants need the `DcacheTypes.scala` doc comment amended too | **Adopted.** The constants are genuinely disjoint, but `DcacheTypes.scala:6-8`'s layout comment makes `0x81`/`0x82` read as "exception unit, robId 1/2", which is false. The comment amendment is made a required part of W25, and §8's "byte-identical alternative" note is corrected — the comment must change wherever the constants are declared | §4.5, §0 (W25), §8 |
+| **M3** unqualified superlative in §4.2.3 caveat (b) | **Adopted.** "Strictly better" removed; the trade is stated in both directions — latency improves, probe-destruction **frequency rises** (a walker now interleaves into a live stream instead of being admitted only into a quiesced port, so each of up to three descriptor reads can destroy up to 4 resident probes) | §4.2.3 |
+| **M4** two locator drifts | **Adopted, with one of the two proposed values itself corrected.** The socket spec's D19/`TableWalker.scala:114` evidence is at `:1146` (was `:1145`) — as proposed. The `AxiDMerge` read-side watchdog is at **`:225-230`**, not the `:224-231` proposed: `:223-224` are the block's comment and `:231` closes the `Area`, and `:225-230` is exactly parallel to the already-exact write-side `:298-303`. Both corrections are recorded in place | §9.2, §9.3 |
+
+**Affirmed by the review and deliberately NOT reopened in round 3:** W1-W22 and the I4
+ownership-FIFO **concept**, all independently re-verified against the RTL by the reviewer;
+W25's file placement; `WALKER_AGE_LIMIT = 64`; and W26's bound being left for the plan to
+derive numerically (its optional polish — that `AxiDMerge`'s precedent is about copying a bad
+*derivation* rather than a bad *value* — was noted and the conclusion is unchanged either way,
+so §4.2.5 is left as written).
 
 **Status after this pass:** still **PROPOSED / DESIGN ONLY**, awaiting re-review. No RTL has
 been touched by this document at any point.
