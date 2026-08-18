@@ -23,8 +23,12 @@ import spinal.lib.misc.plugin.FiberPlugin
   *    A POR *pulse* rather than bare INIT is required because this domain holds registers
   *    with non-zero reset values (`cpu_ram_window_lg2` = 26, `cpu_mon_sense` = 0x06).
   *
-  *  - '''CPU runtime''' -- state that must restart with the CPU. Stage 1 has none; the
-  *    CPU reset is only OBSERVED, as a rising edge detected inside the debug domain.
+  *  - '''CPU runtime''' -- state that must restart with the CPU. The CPU reset is only ever
+  *    OBSERVED, as a rising edge detected inside the debug domain; it is never wired as a
+  *    reset here. Stage 1's CPU-coupled runtime state is the sticky init-done latch and the
+  *    CONTROL bit 3 override, which that observed edge WIPES (spec section 15.1,
+  *    `debug_ctrl.v:2464`). Host configuration -- the cold-reset hold, the RAM window, the
+  *    monitor sense -- is the other category and survives the same edge.
   *
   * ==No new services, no new `Global` key==
   * Spec section 0.9: "Add no `Global` database key for debug. Parameters are
@@ -54,6 +58,12 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
     // form of this and DebugCtrlPortNamesSpec proves it against the generated netlist.
     val dbgAxi = slave(DbgAxiLite(DebugRegMap.DBG_AW, DebugRegMap.DBG_DW))
     dbgAxi.setName("dbg_axi")
+
+    // ── Socket surface (cpu_socket.vh section 6, "SoC-fabric control group") ────────
+    val coldResetPulse = out(Bool()).setName("cpu_cold_reset_pulse")
+    val coldResetHold  = out(Bool()).setName("cpu_cold_reset_hold")
+    val initDoneSeen   = in(Bool()).setName("init_done_seen")
+    coldResetPulse.simPublic(); coldResetHold.simPublic(); initDoneSeen.simPublic()
 
     val coreCd = ClockDomain.current
 
@@ -142,6 +152,56 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
         out
       }
 
+      // ── CPU reset: OBSERVED, never consumed ────────────────────────────────────
+      // The socket `rst` is read as data by registers that this reset does not clear.
+      // Reset value True so a `rst` already high when the debug domain leaves POR does
+      // not manufacture a spurious edge (debug_reset_ctl.v:133-142).
+      val cpuRstLevel = coreCd.isResetActive
+      val cpuRstQ     = RegInit(True)
+      cpuRstQ := cpuRstLevel
+      val cpuRstEvent = cpuRstLevel && !cpuRstQ; cpuRstEvent.simPublic()
+
+      // ── Host configuration: survives every CPU reset (spec 15.1) ─────────────────
+      // The hold is a term of the SoC's cpu_rst_or AND lives in a domain that reset does
+      // not clear: the exact pairing debug_reset_ctl.v exists to make possible, since a
+      // hold that cleared itself on the reset it requests can never hold anything.
+      val ctrlColdHold    = RegInit(False); ctrlColdHold.simPublic()
+
+      /** One-cycle pulse; defaults low every cycle and is set only by a CONTROL write.
+        * Self-clearing, so the survives/wiped question does not arise for it. */
+      val coldPulse       = RegInit(False); coldPulse.simPublic()
+      coldPulse := False
+
+      // ── CPU-COUPLED RUNTIME state: WIPED on the CPU-reset edge (spec 15.1) ───────
+      // Not host configuration. State that, if it survived, "would report a previous life
+      // as the current one": STATUS bit 2 is a claim that DDR calibration completed, and a
+      // debugger attaching after a CPU reset must not be handed the previous boot's claim
+      // (nor the previous host's CONTROL-bit-3 forgery of it). The deployed reference
+      // wipes both of these in its cpu_rst_event-gated counters_clear block
+      // (debug_ctrl.v:2464, :2468, :2561). Living in the debug reset domain does NOT by
+      // itself mean surviving CPU reset -- the edge detector above is precisely what lets
+      // same-domain logic tell the two categories apart.
+      // The wipe itself is deliberately NOT written here; see the block after the write
+      // decode below, and the ordering note there for why.
+      val ctrlInitDoneOvr = RegInit(False); ctrlInitDoneOvr.simPublic()
+      val initDoneSticky  = RegInit(False); initDoneSticky.simPublic()
+
+      val initDoneLatched = initDoneSticky || ctrlInitDoneOvr
+
+      /** The CONTROL word exactly as the host reads it back. Defined ONCE and used by
+        * both the read mux and the write-side byte-strobe merge, so the two can never
+        * disagree about a bit's position or its RAZ/WI status. */
+      def controlWord: Bits =
+        B(0, 24 bits) ##
+        False ##            // bit 7  legacy step-arm      -- RAZ/WI until Stage 2
+        False ##            // bit 6  reserved             -- always 0 (spec 3.3)
+        coldPulse ##        // bit 5  cold-reset pulse
+        ctrlColdHold ##     // bit 4  cold-reset hold level
+        ctrlInitDoneOvr ##  // bit 3  init-done override level
+        coldPulse ##        // bit 2  deprecated pulse alias of bit 5
+        False ##            // bit 1  single-step pulse    -- RAZ/WI until Stage 2
+        False               // bit 0  manual halt request  -- RAZ/WI until Stage 2
+
       // ── Read mux ──────────────────────────────────────────────────────────────────
       // Stage 1's CSR values are added by Tasks 8-10. The default arm is the whole
       // contract for every offset this stage does not implement: spec 3.2 -- "It must
@@ -167,6 +227,17 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
           // OFF_CAP_TRACE is deliberately absent: Stage 1 has no trace memories, so it
           // reads the reserved zero above, which is exactly what feature bits 4/5 being
           // clear promises (spec section 9.3).
+          is(DebugRegMap.OFF_CONTROL) {
+            rData := controlWord
+          }
+          is(DebugRegMap.OFF_STATUS) {
+            rData := B(0, 27 bits) ##
+                     False ##            // bit 4  auto-halt latched    (Stage 2)
+                     True ##             // bit 3  running -- always, there is no halt yet
+                     initDoneLatched ##  // bit 2  init-done seen
+                     False ##            // bit 1  exception pending    (Stage 2)
+                     False               // bit 0  halted               (Stage 2)
+          }
         }
       }
 
@@ -174,8 +245,54 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
       // Writes to anything this stage does not implement are dropped with an OKAY
       // response, which the FSM above already produces unconditionally.
       when(doWrite) {
-        // Register writes are added by Tasks 9-10.
+        switch(awAddr) {
+          is(DebugRegMap.OFF_CONTROL) {
+            // Read-modify-write through the byte-strobe merge against the SAME word the
+            // host reads back, so an unstrobed byte provably cannot change a bit. Bits 0
+            // (halt), 1 (step) and 7 (step-arm) are absent from `controlWord`, so they
+            // merge as 0 and are never stored -- spec 15.2 chooses RAZ/WI over a level
+            // that reads back as if a halt were coming.
+            val m = merged(controlWord)
+            ctrlInitDoneOvr := m(3)
+            ctrlColdHold    := m(4)
+            // Bit 2 is the deprecated reset-pulse ALIAS of bit 5 (spec 3.3).
+            coldPulse       := m(5) || m(2)
+          }
+        }
       }
+
+      // ── The spec-15.1 wipe, and the sticky latch it overrides ────────────────────
+      // POSITION IS LOAD-BEARING, and this is the one subtle thing in this file.
+      // SpinalHDL resolves several assignments to the same register by LAST ASSIGNMENT
+      // WINS in elaboration order (the generated process emits them in order, so a later
+      // `:=` overwrites an earlier one in the same cycle). This block is elaborated AFTER
+      // the CONTROL write arm above, so in the cycle where a CONTROL write lands on the
+      // very same edge that asserts the CPU reset, `ctrlInitDoneOvr := m(3)` is issued
+      // first and `ctrlInitDoneOvr := False` second -- the wipe wins, which is the
+      // required precedence: a host write racing the reset must not survive the reset it
+      // raced. Expressing it the other way round (wipe first, write second) would let a
+      // host resurrect the override in the same cycle the CPU restarted, i.e. exactly the
+      // stale claim spec 15.1 forbids. `when`/`elsewhen` gives the same precedence WITHIN
+      // this block: the reset edge beats a still-high `initDoneSeen` level for the wipe
+      // cycle, and if that level is genuinely still high the cycle after, the sticky latch
+      // simply re-arms from live SoC truth, which is correct and intended.
+      // MAINTENANCE RULE: any future statement assigning `ctrlInitDoneOvr` or
+      // `initDoneSticky` must be placed ABOVE this block, never below it. Task 10's and
+      // Task 11's write-decode additions all go inside the `when(doWrite)` switch above,
+      // so they are; Task 10's `cfgWipe` block is a PEER of this one, placed after the
+      // write decode for exactly the same last-wins reason, and assigns a disjoint set of
+      // registers (`ramWindow`, `mon`), so the order between those two blocks is free.
+      when(cpuRstEvent) {
+        ctrlInitDoneOvr := False
+        initDoneSticky  := False
+      } elsewhen (initDoneSeen) {
+        // A level input, latched sticky so a debugger attaching after DDR calibration
+        // still observes it -- within this CPU's lifetime, not a previous one.
+        initDoneSticky := True
+      }
+
+      coldResetPulse := coldPulse
+      coldResetHold  := ctrlColdHold
     }
 
     // ── Required assertion (spec section 13) ────────────────────────────────────────
