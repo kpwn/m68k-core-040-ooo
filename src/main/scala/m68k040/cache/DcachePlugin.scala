@@ -547,6 +547,11 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     val stAddrReg  = Reg(UInt(32 bits))
     val stAwDone   = Reg(Bool()) init True   // True == no store in flight
     val stWDone    = Reg(Bool()) init True
+    // D6/D26/D30 store-side sequencer state. LINE-RELATIVE, like the load side's.
+    val stSubP      = Reg(UInt(offBits bits)) init 0
+    val stSubEnd    = Reg(UInt(offBits + 1 bits)) init 0
+    val stSubActive = RegInit(False)    // this drain is an INHIBITED covered sequence
+    val stSubErr    = RegInit(False)    // OR of every sub-transaction's B response
     // Task P4.3 AXI-hazard fix -- REVISION 3, the actual landed design. Two
     // earlier revisions were tried and BOTH proven unsafe by DcacheSpec's own new
     // AXI-hazard regression test (recorded here because the failure mode is
@@ -1939,6 +1944,44 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
       stAddrReg    := (stS3Payload.paddr(31 downto offBits) ## U(0, offBits bits)).asUInt
       stPreciseReg := stS3Payload.precise
 
+      // ── D5/D26/D30: the store's byte range, derived on the CORE-SIDE strobe ──────────
+      // D5: reversal within a nibble preserves popcount and contiguity but NOT the offset a
+      // run starts at, so this derivation MUST run before SocketByteOrder is applied at the
+      // socket boundary. The two transforms are order-dependent; SocketByteOrder's doc
+      // comment carries the other half of this statement.
+      //
+      // Two forms, and the second is normative rather than an optimisation (spec 3.3.1):
+      //   useStrb = false -> [paddr[3:0], paddr[3:0] + sizeBytes(size))
+      //   useStrb = true  -> the RUN OF SET BITS in the 16-bit line-relative strobe.
+      // `size` is NOT an input on the second path and must not be fallen back to:
+      // StoreQueue.scala:264 drives slot B's size as a flat Size.LONG whatever its true
+      // 1-3-byte extent, and slot B's paddr is the next LINE BASE so paddr[3:0] = 0. A
+      // size-derived range would read [0,4) for a slot whose real extent is [0,1) -- and
+      // D30's cover would then cover that over-wide range EXACTLY, and exactly wrongly,
+      // naming up to three peripheral registers the architectural access never touched.
+      val stOffS3   = stS3Payload.paddr(offBits - 1 downto 0)
+      val stNBytes  = m68k040.socket.MmioCover.sizeBytes(stS3Payload.size)
+      val stStartSz = stOffS3
+      val stEndSz   = m68k040.socket.MmioCover.clampedEnd(stOffS3, stNBytes)
+      val stStartSt = m68k040.socket.MmioCover.strbRunStart(stS3MergeStrb)
+      val stEndSt   = m68k040.socket.MmioCover.strbRunEnd(stS3MergeStrb)
+      stSubP      := Mux(stS3Payload.useStrb, stStartSt, stStartSz)
+      stSubEnd    := Mux(stS3Payload.useStrb, stEndSt,   stEndSz)
+      stSubActive := stS3Inhibited
+      stSubErr    := False
+
+      GenerationFlags.simulation {
+        // On the useStrb = false path the two derivations are the SAME range by
+        // construction (DcacheTypes.scala:312-320's storeStrbA sets exactly bytes
+        // off .. min(off+n,16)-1). Assert it rather than assume it, so a future change to
+        // the merge-strobe derivation is loud instead of silently re-widening the range.
+        when(stS3Valid && stS3Inhibited && !stS3Payload.useStrb) {
+          assert(stStartSt === stStartSz && stEndSt === stEndSz,
+            "DcachePlugin: the strobe-derived and size-derived store ranges disagree on a " +
+            "useStrb=false INHIBITED store", FAILURE)
+        }
+      }
+
       when(stS3Copyback) {
         // A COPYBACK descriptor reaches S3 only on a resident hit.
         stAwDone := True
@@ -1998,27 +2041,63 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // occur together without a further result register.
     val cbHitAckReg = stS3Valid && stS3Copyback && stS3Hit
 
-    // AXI write-through driver (single 128-bit beat) -- the registered store result
-    // path's OWN, EXCLUSIVE driver
-    // (id fixed at 1). EVICT_WR (Task P4.3) never touches these registers or this
-    // driver -- it has its own dedicated completion flags and drives axi.aw/axi.w
+    // AXI write-through driver -- the registered store result path's OWN, EXCLUSIVE
+    // driver (id fixed at 1). EVICT_WR (Task P4.3) never touches these registers or
+    // this driver -- it has its own dedicated completion flags and drives axi.aw/axi.w
     // directly (see EVICT_WR's own block above), gated off whenever this driver
     // wants the bus (`storeWantsAxi`), so the two physically never collide.
+    //
+    // ── D30: one naturally-aligned sub-transaction per iteration on an INHIBITED store ──
+    // The cacheable / write-through path is untouched: `stSubActive` is False there, so
+    // `subLog2` collapses to size=4 at the line base and the strobe passes through whole.
+    val stSubLog2  = m68k040.socket.MmioCover.stepLog2(stSubP, stSubEnd)
+    val stSubBytes = (U(1, 4 bits) |<< stSubLog2).resize(4 bits)
+    val stSubLast  = !stSubActive || ((stSubP +^ stSubBytes) === stSubEnd)
+    // Mask the merged 16-bit strobe down to THIS sub-transaction's own bytes. Every
+    // asserted WSTRB bit therefore lies inside the addressed transfer -- the AXI4 rule v1
+    // violates at axi_narrow_to_wide.v:43, where strobe 0110 is paired with awsize=1 at an
+    // even address, asserting byte 2 outside a transfer whose lanes are bytes 0-1.
+    val stSubStrbMask = Bits(1 << offBits bits)
+    for (i <- 0 until (1 << offBits)) {
+      // The load-side sequencer's identical mask (:1358) resizes `p` to `offBits + 1` bits
+      // before comparing against the `offBits + 1`-bit group index -- SpinalHDL's UInt
+      // comparator requires matching declared widths even though every value on both sides
+      // is provably in-range, so the raw offBits-wide `stSubP` needs the same explicit
+      // resize the brief's snippet omitted (compile-time-only fix, no behavior change).
+      stSubStrbMask(i) := (U(i, offBits + 1 bits) >= stSubP.resize(offBits + 1 bits)) &&
+                          (U(i, offBits + 1 bits) < (stSubP +^ stSubBytes))
+    }
+    val stSubAddr = (stAddrReg(31 downto offBits) ## stSubP).asUInt
+
     when(!stAwDone) {
       axi.aw.valid         := True
-      axi.aw.payload.addr  := stAddrReg
+      axi.aw.payload.addr  := Mux(stSubActive, stSubAddr, stAddrReg)
       axi.aw.payload.id    := U(AxiIds.D_STORE, AxiIds.ID_W bits)
       axi.aw.payload.len   := U(0, 8 bits)
-      axi.aw.payload.size  := U(4, 3 bits)
+      axi.aw.payload.size  := Mux(stSubActive, stSubLog2.resize(3 bits), U(4, 3 bits))
       axi.aw.payload.burst := Axi4.burst.INCR
       when(axi.aw.ready) { stAwDone := True }
     }
     when(!stWDone) {
       axi.w.valid        := True
+      // A narrow AXI write places its bytes in the lanes matching its own address, and
+      // `stMergeReg` is already a full-line, byte-offset-indexed image, so the data needs
+      // no shifting -- only the strobe narrows.
       axi.w.payload.data := stMergeReg
-      axi.w.payload.strb := stStrbReg
+      axi.w.payload.strb := Mux(stSubActive, stStrbReg & stSubStrbMask, stStrbReg)
       axi.w.payload.last := True
       when(axi.w.ready) { stWDone := True }
+    }
+
+    GenerationFlags.simulation {
+      when(stSubActive && axi.aw.valid) {
+        assert((stSubP +^ stSubBytes) <= stSubEnd,
+          "DcachePlugin: an INHIBITED store sub-transaction runs past the access", FAILURE)
+        assert((stSubP.asBits & ((stSubBytes - 1).asBits.resize(offBits))) === B(0, offBits bits),
+          "DcachePlugin: an INHIBITED AWADDR is not naturally aligned for its AWSIZE", FAILURE)
+        assert(((stStrbReg & stSubStrbMask) & ~stSubStrbMask) === B(0, (1 << offBits) bits),
+          "DcachePlugin: a WSTRB bit lies outside the addressed transfer", FAILURE)
+      }
     }
 
     // ---- store write-through ACK ----
@@ -2053,8 +2132,24 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // unrecognized id simply not ack anything — a hung drain, which is loud
     // and debuggable, instead of a silent spurious ack.
     val storeBAck = axi.b.valid && axi.b.ready && (axi.b.payload.id === U(AxiIds.D_STORE, AxiIds.ID_W bits))
-    storeErrReg := storeBAck && (axi.b.payload.resp =/= Axi4.resp.OKAY)
-    storeAckReg := storeBAck || cbHitAckReg || storeAllocAckReg
+    val storeBErr = storeBAck && (axi.b.payload.resp =/= Axi4.resp.OKAY)
+    // D30/spec 3.4 "Stores": assert storeAck only after the LAST B handshake, and make
+    // storeErr the OR of ALL of them. This is not cosmetic -- `sq.io.drainAck :=
+    // dcache.storeAck` (LsEuPlugin), so an ack after sub-transaction 1 of 3 pops the
+    // StoreQueue head before the remaining AW/W have been accepted, letting the next drain
+    // re-kick the shared stAddrReg/stMergeReg/stStrbReg mid-flight. The plugin's own
+    // one-ack-per-descriptor sim asserts at :1972-1992 are what pin this.
+    when(storeBAck && !stSubLast) {
+      // Advance and re-arm the pair. The existing fail-closed `=== D_STORE` demux above is
+      // preserved for EVERY sub-transaction, unchanged.
+      stSubP   := (stSubP +^ stSubBytes).resize(offBits bits)
+      stAwDone := False
+      stWDone  := False
+      stSubErr := stSubErr || storeBErr
+    }
+    when(storeBAck && stSubLast) { stSubActive := False }
+    storeErrReg := (storeBAck && stSubLast) && (stSubErr || storeBErr)
+    storeAckReg := (storeBAck && stSubLast) || cbHitAckReg || storeAllocAckReg
 
     // Task P4.6: pins design doc §5 item 7's one-ack-per-store contract now that
     // storeAckReg has three sources (write-through AXI B, registered copyback-hit

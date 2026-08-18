@@ -469,15 +469,32 @@ class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
 
   private def bytesPerBeat = busConfig.dataWidth / 8
 
+  /** AXI4-correct byte-lane placement, the write-side mirror of `AxiReadEngine.
+    * readBeatData`'s identical fix (see that method's doc comment for the full
+    * rationale): WSTRB bit `i` always names byte lane `i` of the FULL bus width, whose
+    * memory address is `alignedBase + i` where `alignedBase` is the beat's own address
+    * rounded DOWN to the bus width -- not `st.addr + i` directly, which is only the
+    * same thing when `st.addr` already sits on a bus-width boundary. Every write
+    * issuer before the D30 INHIBITED-store exact-cover sequencer (DcachePlugin's
+    * write-through beat, EVICT_WR, write-allocate, the maintenance walkback) only
+    * ever issued a full `bytesPerBeat`-wide, `bytesPerBeat`-aligned AW, for which
+    * `base` was always already aligned and `alignedBase == base`byte-for-byte
+    * identical to the old behaviour. Only a narrow, non-bus-width-aligned `base` (the
+    * new INHIBITED sub-transaction case) changes what this commits: confirmed
+    * concretely on this exact prescribed test code -- an unmasked `base=st.addr`
+    * wrote a BYTE-off=1 store's single byte to `lineBase+2` instead of `lineBase+1`,
+    * caught by the D30 cover test's byte-write-observer assertion, not by a silent
+    * final-image comparison. */
   private def applyBeat(st: AwState, data: BigInt, strb: BigInt, bad: Boolean): Unit = {
     val bpb  = 1 << st.size
     val base = (st.burst match { case 1 => st.addr + BigInt(bpb) * st.beat; case _ => st.addr }).toLong
+    val alignedBase = base - (base % bytesPerBeat)
     if (!bad) {
       for (i <- 0 until bytesPerBeat) {
         if (((strb >> i) & 1) == 1) {
           val byte = ((data >> (8 * i)) & 0xff).toInt.toByte
-          mem.write((base + i).toLong, byte)
-          if (onByteWrite != null) onByteWrite((base + i).toLong, byte)
+          mem.write((alignedBase + i).toLong, byte)
+          if (onByteWrite != null) onByteWrite((alignedBase + i).toLong, byte)
         }
       }
     }
