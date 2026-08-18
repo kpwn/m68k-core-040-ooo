@@ -94,7 +94,7 @@ every existing cross-reference stays valid.
 
 | # | Decision |
 |---:|---|
-| **D30** | D6's sequencer emits an **exact naturally-aligned cover** of the (clamped) byte range, not merely a split at the 4-byte group boundary. Every sub-transaction's address is naturally aligned for its own `AxSIZE` **and** its byte extent lies wholly inside the architectural access. The bound is **≤ 3 sub-transactions** for every reachable access, proved in §3.4 from `Size ∈ {BYTE,WORD,LONG}` and the D25 clamp — a *bounded* sequencer, not the "general N-way byte sequencer" an earlier draft claimed a fix would require. A naturally-aligned access still emits exactly one transaction, unchanged. This is the real fix for in-group misalignment (canonically a WORD load at group offset 1) on the **load** path, where AXI4's total lack of read byte-enables makes a downstream-only fix impossible in principle; it is applied uniformly to stores as well, per D6's existing "state the rule once for both paths". (§3.3, §3.4) |
+| **D30** | D6's sequencer emits an **exact naturally-aligned cover** of the (clamped) byte range, not merely a split at the 4-byte group boundary. Every sub-transaction's address is naturally aligned for its own `AxSIZE` **and** its byte extent lies wholly inside the architectural access. The bound is **≤ 3 sub-transactions** for every reachable access, proved in §3.4 from `Size ∈ {BYTE,WORD,LONG}` and the D25 clamp — a *bounded* sequencer, not the "general N-way byte sequencer" an earlier draft claimed a fix would require. A naturally-aligned access still emits exactly one transaction, unchanged. This is the real fix for in-group misalignment (canonically a WORD load at group offset 1) on the **load** path, where AXI4's total lack of read byte-enables makes a downstream-only fix impossible in principle; the **cover** is applied uniformly to stores as well, per D6's existing "state the rule once for both paths" — but the *range* it covers is derived from the strobe run, not from `size`, on a `useStrb` store slot (§3.3.1). (§3.3, §3.4) |
 | **SOC-4** | `macqd700-soc`'s `peripheral_bus.v` must serialize a write whose active-lane WSTRB has more than one bit hot into one `pb_wr` pulse per hot bit, for **every** `pb_*` slot — generalizing the ASC-only `wr_asc_*` FSM that already does exactly this. Today the other slots take the single-byte fast path and silently drop every byte but one; the file's own comment records the gap. This is a shared-fabric fix and therefore **also corrects the v1 core's** observed behaviour for the same accesses (v1 routinely emits 2-hot-strobe WORD stores). Deliberately in scope. (§3.3.1, §3.5, §11.2) |
 
 ---
@@ -319,11 +319,28 @@ inputs, in one of two forms:
 - ordinary form (`useStrb = false`): the range is `[paddr[3:0], paddr[3:0] + sizeBytes(size))`,
   identical to the load derivation;
 - split-slot form (`useStrb = true`, `DcacheTypes.scala:78-89`): the range is the run of set
-  bits in the 16-bit line-relative `strb`. That run is contiguous by construction — a split
-  slot is a contiguous sub-range of one architectural access — so the range is well defined.
-  A hypothetically sparse strobe stays *safe* rather than correct: the sequencer would cover
-  the run's convex hull, and each sub-transaction still carries the exact strobe bits, so no
-  byte is written that was not strobed.
+  bits in the 16-bit line-relative `strb` — `start` is the index of the lowest set bit, `end`
+  the index of the highest set bit plus one.
+
+  **`size` is not an input on this path, and the implementation must not fall back to it.**
+  A split slot's `size` field does not describe its byte count: `StoreQueue.scala:264` drives
+  slot B's `size` as a flat `Size.LONG()` regardless of the slot's true 1-3-byte extent, and
+  slot B's `paddr` is the next **line base** (`paddrBs`, from `s1AddrB = (s1Va & ~15) + 16`,
+  `LsEuPlugin.scala:448`), so `paddr[3:0] = 0`. The `off`/`n` pair of §3.4's D25 bullet would
+  therefore read `[0,4)` for a slot whose real extent is `[0,1)`, `[0,2)` or `[0,3)` — and
+  D30 would then cover that over-wide range *exactly*, and exactly wrongly, naming up to three
+  peripheral registers the architectural access never touched. The strobe is the **only**
+  field on `DStoreCmd` that still carries the true extent; the SQ's own byte counts
+  (`nbytesAs`/`nbytesBs`, `StoreQueue.scala:110,149`) are forwarding-private and are never
+  placed on the drain payload.
+
+  The run is contiguous by construction — a split slot is a contiguous sub-range of one
+  architectural access. Concretely, for an access of `n` bytes at line offset `off`,
+  `storeStrbA` (`DcacheTypes.scala:312-320`) sets exactly bytes `off … min(off+n,16)−1` (the
+  `pos < 16` guard is what bounds it) and `storeStrbB` (`:335-343`) sets exactly bytes
+  `0 … off+n−17`. A hypothetically sparse strobe stays *safe* rather than correct: the
+  sequencer would cover the run's convex hull, and each sub-transaction still carries the
+  exact strobe bits, so no byte is written that was not strobed.
 
 That range then goes through the **same** D6/D30 sequencer the load path uses (§3.4). Each
 emitted sub-transaction is naturally aligned, lies wholly inside the range, and carries the
@@ -501,7 +518,9 @@ replay FSM (`LsEuPlugin.scala:1492-1513`) and cost real IPC on the hot path.
 **bounded sequencer** over a byte range the sequencer computes for itself:
 
 - **The input range must be clamped, not trusted (D25).** With `off = paddr(3 downto 0)` and
-  `n = sizeBytes(size)`, the sequencer's range is
+  `n = sizeBytes(size)` — the derivation for loads and for `useStrb = false` stores; a
+  `useStrb = true` store slot derives its range from the strobe run instead (§3.3.1, and the
+  stores bullet below) — the sequencer's range is
 
   ```
   start = off
@@ -585,12 +604,31 @@ replay FSM (`LsEuPlugin.scala:1492-1513`) and cost real IPC on the hot path.
   merge offset. The incremental cost over the two-sub-beat version is one extra iteration of
   an FSM that already exists.
 
-- **Stores take the same sequencer**, and the clamp is a no-op on them: the SQ's split-slot
-  form already carries a 16-bit **line-relative** strobe with `useStrb`
-  (`DcacheTypes.scala:78-89`), so a store slot's byte range is contained by construction.
-  Stating the rule once for both paths avoids a store/load asymmetry in the sequencer, and
-  under D30 it also means a store never emits a covering-but-over-wide transaction — the
-  addresses and sizes are correct on their own, with WSTRB agreeing rather than compensating.
+- **Stores take the same sequencer, but not the same `[start, end)` derivation.** The
+  `off = paddr[3:0]` / `n = sizeBytes(size)` pair above is the derivation for **loads and for
+  `useStrb = false` stores only**. A `useStrb = true` store slot derives `[start, end)` from
+  its strobe run instead, per §3.3.1 — that is normative, and `size` is unusable there
+  (`StoreQueue.scala:264` forces slot B's `size` to `Size.LONG` whatever its true 1-3-byte
+  extent). What the two forms share is the *cover* (the D30 greedy loop) and the emission
+  tables, not the range computation feeding them. Both forms are line-contained, each for its
+  own reason, so the D25 clamp never actually bites on a store:
+
+  - `useStrb = false` — `useStrbA := twoAccess` (`LsEuPlugin.scala:797`) and
+    `twoAccess = s1CrossLine || s1CrossPage` (`:442-444`), so a non-strobe store is by
+    definition one that does not cross the 16-byte line: `off + n ≤ 16` already, and
+    `min(off+n,16) = off+n`. The clamp is a genuine no-op.
+  - `useStrb = true` — the strobe is 16 bits and **line-relative**, so any run inside it is
+    trivially inside the line. More than that, `storeStrbA`'s `pos < 16` guard
+    (`DcacheTypes.scala:312-320`) means the clamp has *already been applied at the producer*:
+    slot A's run is literally `[off, min(off+n,16))`, the clamped range itself. Slot B's run
+    is `[0, off+n−16)` (`:335-343`) — the exact spilled remainder, which is precisely the
+    quantity `size` no longer carries.
+
+  This is why the store path has no analogue of §3.5's surviving slot-B load residual: the
+  load side loses the remainder (`DLoadCmd` has no strobe, and `LsEuPlugin.scala:759` re-sends
+  the full original `size` on slot B), while the store side preserves it in `strbB`. Under
+  D30 a store therefore never emits a covering-but-over-wide transaction — the addresses and
+  sizes are correct on their own, with WSTRB agreeing rather than compensating.
 
 - **Loads:** issue each sub-transaction in turn (1 to 3 of them) and merge each response into
   `missLine` at its own byte offset before the existing `REPLAY` path runs.
