@@ -147,7 +147,27 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
       // contract for every offset this stage does not implement: spec 3.2 -- "It must
       // reserve them, return zero for absent functions, and never repurpose them."
       when(doRead) {
+        // The unconditional zero is the contract for EVERY offset this stage does not
+        // implement (spec 3.2: "return zero for absent functions"). The switch below has
+        // no `default` arm on purpose -- an offset that is not listed keeps this value,
+        // so adding a register can never accidentally un-reserve a neighbour.
         rData := B(0, DebugRegMap.DBG_DW bits)
+        switch(arAddr) {
+          is(DebugRegMap.OFF_VERSION) {
+            rData := B(DebugRegMap.VERSION_VALUE, DebugRegMap.DBG_DW bits)
+          }
+          is(DebugRegMap.OFF_BUILD_ID) {
+            rData := B(buildId, DebugRegMap.DBG_DW bits)
+          }
+          is(DebugRegMap.OFF_FEATURES) {
+            // NOT a literal: computed from the STAGE column of debug_regmap.def, so a
+            // build cannot advertise a bit whose behaviour it has not built (spec 3.4).
+            rData := B(DebugRegMap.featuresForStage(stage), DebugRegMap.DBG_DW bits)
+          }
+          // OFF_CAP_TRACE is deliberately absent: Stage 1 has no trace memories, so it
+          // reads the reserved zero above, which is exactly what feature bits 4/5 being
+          // clear promises (spec section 9.3).
+        }
       }
 
       // ── Write decode ──────────────────────────────────────────────────────────────
