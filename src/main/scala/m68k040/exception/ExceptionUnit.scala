@@ -401,11 +401,29 @@ class ExceptionUnit(
   // landed can still be mid-AXI-transaction. Either one concurrently owns exactly the
   // resources the walk would take.
   //
-  // The ENTRY (`E_DRAIN`) and RTE (`R_DRAIN`) paths already wait on `sqDrained` for
+  // The ENTRY (`E_DRAIN`) and RTE (`R_DRAIN`) paths already waited on `sqDrained` for
   // precisely the analogous reason ("wait for older committed stores to fully drain
   // before we use the store port"); the sysOp path went straight to `S_APPLY` the very
-  // next cycle because no sysOp had ever needed the guarantee. `S_DRAIN` below closes
-  // that gap for the whole sysOp family.
+  // next cycle because no sysOp had ever needed the guarantee. `S_DRAIN` below closed
+  // that gap for the sysOp family (Task P5.4).
+  //
+  // UPDATE (found during unrelated walker/DcacheService design review): `E_DRAIN`/
+  // `R_DRAIN` needed this SAME `dcQuiesced` wait too, for a LOAD-side reason
+  // `S_DRAIN`'s own history above does not cover -- they grab the D-cache LOAD port
+  // (this unit's own vector-fetch / RTE-pop / FRESTORE-header reads all funnel
+  // through `dcLoadCmd`/`dcLoadRsp`), and `dcLoadRsp` is a shared, UNTAGGED Flow
+  // this unit reads directly off the D-cache alongside `LsEuPlugin`'s own ordinary
+  // load pipe (`exc.dcLoadRsp.valid := dc.loadRsp.valid` in the wiring -- no
+  // arbitration between the two consumers on any given cycle). `LsEuPlugin` poisons
+  // and drains a flushed load rather than cancelling it, so a load already accepted
+  // by the D-cache before `excActive` rose can still have a response genuinely
+  // owed, and `DcachePlugin`'s `REPLAY` state re-launches a refill and returns to
+  // `IDLE` in the SAME cycle -- `loadCmdPort.ready` rises one cycle before that
+  // flushed load's OWN response lands. Without this wait, this unit's held load
+  // command could fire into exactly that window and blindly capture the stale
+  // response as its own (`E_VECWAIT`/`R_SRWAIT`/etc. sample `dcLoadRsp.valid`
+  // completely unqualified). Both `E_DRAIN` and `R_DRAIN` now wait on
+  // `sqDrained && dcQuiesced`, same as `S_DRAIN`.
   val dcQuiesced = Bool(); dcQuiesced.allowOverride; dcQuiesced := True
 
   // ── captured per-event state ────────────────────────────────────────────────
@@ -1386,8 +1404,34 @@ class ExceptionUnit(
     }
 
     // Wait for older committed stores to fully drain before we use the store port.
+    //
+    // Found during unrelated walker/DcacheService design review: this state
+    // used to wait ONLY on `sqDrained`, matching the comment's original framing
+    // ("mirrors E_DRAIN" was written INTO `S_DRAIN`'s own doc, above -- the intent
+    // was always symmetric, but the `dcQuiesced` half of that symmetry was added
+    // to `S_DRAIN` alone by Task P5.4 and never backported here). That left a real
+    // gap: `LsEuPlugin`'s ordinary load pipe uses poison-and-drain on a flush, not
+    // cancellation -- a load already accepted by the D-cache before `excActive`
+    // rose keeps draining, and its response is still genuinely owed on the
+    // SHARED, UNTAGGED `dc.loadRsp` Flow both this unit and `LsEuPlugin` read
+    // directly (see `exc.dcLoadRsp.valid := dc.loadRsp.valid` in the wiring).
+    // `DcachePlugin`'s `REPLAY` state re-launches a filled read and returns to
+    // `IDLE` in the SAME cycle, so `loadCmdPort.ready` (state-gated only, no
+    // `ldS1Valid`/`ldS2Valid` awareness) rises ONE CYCLE BEFORE that flushed
+    // load's own response lands. Entering `E_STORE`/eventually `E_VECREQ` while
+    // that is still true let this unit's own held load command fire into exactly
+    // that window and blindly capture the stale, unrelated response as its own
+    // (silently corrupting the vector fetch, and by the same shape RTE's SR/PC
+    // pops and FRESTORE's header read). `dcQuiesced` is exactly the "no D-cache
+    // load transaction anywhere in flight" predicate (`dcIdleForMaint`'s
+    // `!ldS1Valid && !ldS2Valid && !loadShadowValid && !pendingStoreMiss` terms,
+    // among others) that closes this -- see its own doc comment for the
+    // no-deadlock argument, which applies identically here: `active`/`excActive`
+    // is already high throughout this state (blocking any NEW `LsEuPlugin` send),
+    // and every term `dcQuiesced` conjoins is cleared by a bounded, self-driving
+    // completion with nothing left to re-arm it.
     E_DRAIN.whenIsActive {
-      when(sqDrained) {
+      when(sqDrained && dcQuiesced) {
         // RECOMPUTE frameBase from the SETTLED live supervisor bank (M ? MSP : ISP).
         // The IDLE entry-capture computed frameBase from ss.supBank on the IDLE->entry
         // edge, but the live committed-A7 readback has a 1-cycle latency, so that early
@@ -1516,8 +1560,11 @@ class ExceptionUnit(
     // ── RTE: pop the frame, restore SR + PC, SSP += 8, redirect ─────────────────
     // Wait for older committed stores to fully drain (mirrors E_DRAIN) before reading
     // the live supervisor-bank A7 for frameBase -- see the rteTrigger comment above.
+    // Same fix, same rationale, as `E_DRAIN` above: also wait for `dcQuiesced`
+    // before this state's own `R_SRREQ`/.../`R_FMTREQ` chain can grab the D-cache
+    // load port, so no flushed LS-EU load's still-owed response can land on it.
     R_DRAIN.whenIsActive {
-      when(sqDrained) {
+      when(sqDrained && dcQuiesced) {
         frameBase := Mux(ss.m, ss.msp, ss.isp)   // RTE reads the SETTLED current supervisor stack
         goto(R_SRREQ)
       }
