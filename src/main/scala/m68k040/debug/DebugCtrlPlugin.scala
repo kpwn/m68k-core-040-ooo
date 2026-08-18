@@ -156,8 +156,18 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
       when(doWrite) {
         // Register writes are added by Tasks 9-10.
       }
+    }
 
-      // ── Required assertion (spec section 13) ──────────────────────────────────────
+    // ── Required assertion (spec section 13) ────────────────────────────────────────
+    // Deliberately placed in the `porCd` (BOOT-kind, reset-LESS) domain rather than inside
+    // the `csr` Area above: SpinalHDL elaborates a synchronous-reset domain's clocked
+    // process as `if(reset) {...resets...} else {...this code...}`, so a check written
+    // inside `dbgCd on {...}` only ever runs in the `else` branch -- i.e. only when
+    // `dbgRst == 0` -- making its own `dbgRst && (...)` term a tautological False and the
+    // assert a dead check that can never fire (review finding, Task 7 fix pass). `porCd`
+    // has no reset at all, so its process has no if/else gating and this runs
+    // unconditionally every cycle, exactly like the BOOT-domain POR counter above.
+    val porChecks = porCd on new Area {
       GenerationFlags.simulation {
         assert(!(dbgRst && (dbgAxi.awready || dbgAxi.wready || dbgAxi.arready)),
           "DebugCtrlPlugin: AXI READY asserted while the debug domain is in reset " +
