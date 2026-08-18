@@ -81,6 +81,29 @@ terms that read that state.
 
 §15 records the round-4 disposition item by item.
 
+**Revision note (round-5 fix pass, 2026-08-18).** `aab837e` was re-reviewed and returned
+*changes requested* a fourth time, with **1 Critical, 1 Important and 4 Minor** findings — a
+narrow, mechanical pass, not a structural one. The review independently re-verified **W29, W30,
+W28 clauses (b)/(c), all three of round 4's new W27 rows, §6.6's boundedness proof, §4.3's
+second (`ldOwnerFifoOccupancy`) assertion and the 59-reference W27 coverage sweep as correct**;
+none of that is reopened. The Critical is the mirror image of the previous rounds' pattern:
+rather than an under-specified mechanism, it is an over-eager **check** —
+
+- **§4.3's mandated load-side assertion fired on CORRECT behaviour.** Round 4 wrote it against
+  the exception sequencer's **presentation** signal (`excActive && excLoadCmdValid`, which is
+  `ExceptionUnit`'s *held* `ldoValidReg`) when the property it needs is about **admission**
+  (`excLoadAdmit`). Its failure condition is therefore *exactly* the waiting state W30 part (2)
+  exists to create, which three other places in this document already specify as correct
+  (§6.6, §10.2's `(e′)` row, §10.2's W30 row — all three would trip it). The danger was not the
+  spurious failure but the obvious wrong way to silence it: weakening `excLoadAdmit` back toward
+  round 2's `!ldOwnerFifoHoldsWalker` form, which reopens C2 *and* re-inherits §11.1 item 9's
+  live production bug. Replaced with a tautology-against-W30 **structural tripwire**, which is
+  a property `LsEuPlugin` can actually hold by construction.
+
+The Important reclassifies §11.1 item 9: the pre-existing HEAD bug is **live, real and being
+fixed as its own standalone task**, not "out of scope". §16 records the round-5 disposition
+item by item.
+
 **Citation convention (fix pass).** `DcachePlugin.scala` line numbers in the original draft
 mixed a pre-Task-8 and a post-Task-8 snapshot (a `+5` and a `+43` shift respectively), and
 §9.3 deliberately sequences this work *after* Tasks 7/8. Every `DcachePlugin.scala` citation
@@ -478,9 +501,12 @@ needs no bundle field at all:
 ldOwnerFifo : depth-4 FIFO of the 2-bit ldRspTag         // lives entirely in LsEuPlugin
   push  <= ldPushTag           when dcache.loadCmd.fire  // W29 — see below
   pop                          when dcache.loadRsp.valid // deliberately UNQUALIFIED
-  ldRspTag = ldOwnerFifo.head                            // tags THIS response
+  ldRspTag = ldOwnerFifo.head                            // tags THIS response (PRE-pop)
   rspOwner = (ldRspTag === CORE_LS || ldRspTag === CORE_EXC) ? CORE
            : (ldRspTag === ITLB) ? ITLB : DTLB           // DERIVED, not stored
+
+  ldOwnerFifoEmpty / ldOwnerFifoHoldsWalker / ldOwnerFifoOccupancy
+                                                         // all PRE-pop/PRE-push; see below
 ```
 
 Depth 4 (one more than the proven maximum of 3) so the FIFO can never be the binding
@@ -540,14 +566,40 @@ that by bringing the push payload inside the same invariant.
 // identities — see W30 for why that distinction is load-bearing and not cosmetic.
 object LdRspTag { val CORE_LS = 0; val CORE_EXC = 1; val ITLB = 2; val DTLB = 3 }
 
+// Chain order MIRRORS the payload mux's own last-assignment-wins order (§4.2.7 `:757-764`,
+// §4.2.4's base priority CORE-EXC > CORE-LS > walkers, so CORE-EXC is the LAST driver):
+//   CORE-LS base  ->  walker legs  ->  CORE-EXC leg last.
 val ldPushTag = UInt(2 bits)
-ldPushTag := LdRspTag.CORE_LS                                        // base
-when(excLoadAdmit)             { ldPushTag := LdRspTag.CORE_EXC }
-when(walkerLoadAdmit(ITLB_ID)) { ldPushTag := LdRspTag.ITLB }
-when(walkerLoadAdmit(DTLB_ID)) { ldPushTag := LdRspTag.DTLB }
+ldPushTag := LdRspTag.CORE_LS                                            // base — CORE-LS leg
+when(walkerLoadAdmit(WALKER_ITLB_IDX)) { ldPushTag := LdRspTag.ITLB }
+when(walkerLoadAdmit(WALKER_DTLB_IDX)) { ldPushTag := LdRspTag.DTLB }
+when(excLoadAdmit)                     { ldPushTag := LdRspTag.CORE_EXC } // LAST, as in the mux
 
 when(dcache.loadCmd.fire) { ldOwnerFifo.push(ldPushTag) }
 ```
+
+*Round 5 fixed two things in this snippet, both cosmetic-looking and neither cosmetic.*
+
+- **The chain order was inverted relative to the mux it must agree with.** Round 4 wrote it
+  `CORE_LS < CORE_EXC < ITLB < DTLB`, so under last-assignment-wins a walker leg would have
+  overridden the exception leg — the **opposite** of the real payload mux, where the exception
+  leg is the last driver (§4.2.7's `:757-764` row; §4.2.4's base priority). This was harmless
+  *only* because property 2 below proves the four predicates pairwise exclusive, so at most one
+  `when` is ever true and the order never resolves anything. But "correct because a separate
+  proof happens to agree with it" is exactly the C-R4-1 shape: had that exclusivity ever been
+  violated by a later edit, the tag would have mis-attributed in the **opposite direction** from
+  the payload actually presented — the worst possible failure mode, and one the exclusivity
+  assertion would catch only if it were enabled. Reordered so the tag is correct **by
+  construction** and agrees with the mux under *any* number of simultaneously-true predicates.
+- **The walker vector index and the walker tag value are given visibly distinct names.**
+  `WALKER_ITLB_IDX`/`WALKER_DTLB_IDX` are **positional indices into the per-walker
+  `walkerLoadAdmit` vector** (2 walkers, so `0`/`1`); `LdRspTag.ITLB`/`LdRspTag.DTLB` are **tag
+  values** in the four-valued response encoding (`2`/`3`). They are different numbers and must
+  never be used interchangeably. Round 4's snippet wrote `ITLB_ID`/`DTLB_ID` and §12's
+  placeholder note called them "the existing owner-code constants", which conflates the vector
+  position with the three-valued owner code with the four-valued tag; under the owner-code
+  convention `{CORE=0, ITLB=1, DTLB=2}` the index and the tag are off by one from each other.
+  Naming, not logic — but the plan must carry the distinct names.
 
 Three properties make this correct, and each is a requirement on the plan, not an observation:
 
@@ -568,17 +620,22 @@ Three properties make this correct, and each is a requirement on the plan, not a
      and `walkerOwnsLoad` to be the same-cycle reading of the same state.
    - `excLoadAdmit` vs `walkerLoadAdmit(i)`: `walkerLoadAdmit(i)` requires `!ldBusyExc`, and
      `ldBusyExc ⊇ (excActive && excLoadCmdValid)`, which `excLoadAdmit` requires. Disjoint.
-   - `walkerLoadAdmit(ITLB)` vs `walkerLoadAdmit(DTLB)`: W9's round-robin grants one walker
-     per direction per cycle. Disjoint.
+   - `walkerLoadAdmit(WALKER_ITLB_IDX)` vs `walkerLoadAdmit(WALKER_DTLB_IDX)`: W9's round-robin
+     grants one walker per direction per cycle. Disjoint.
 
    The plan must carry this as a `GenerationFlags.simulation` assertion in the same style as
-   §4.3's pair, because the proof is what licenses the `when`-chain above to behave as a
-   one-hot select rather than as a priority encoder:
+   §4.3's, because the proof is what makes the `when`-chain above a one-hot select rather than
+   a priority encoder:
    ```
    assert(CountOne(Cat(coreLsLoadAdmit, excLoadAdmit,
-                       walkerLoadAdmit(ITLB), walkerLoadAdmit(DTLB))) <= 1,
+                       walkerLoadAdmit(WALKER_ITLB_IDX),
+                       walkerLoadAdmit(WALKER_DTLB_IDX))) <= 1,
           "two load-admission predicates true in one cycle", FAILURE)
    ```
+   *Round-5 note: the chain's reordering does **not** make this assertion optional. What the
+   reordering buys is that if the proof were ever falsified, the chain would resolve the same
+   way the payload mux does instead of the opposite way — a degraded-but-consistent outcome
+   rather than a silent mis-tag. The assertion is still the thing that says so out loud.*
 3. **`rspOwner` is derived from the tag, never stored beside it.** A second register holding
    "the owner of the head entry" would be a second source of truth and would reintroduce
    exactly the drift W29 exists to remove. **W6 is untouched:** the *arbiter* still has three
@@ -656,9 +713,30 @@ stBusy(CORE)       = coreStOutstanding =/= 0    // CORE store fires vs storeAcks
 stBusy(ITLB/DTLB)  = walkStOutstanding(i)
 ```
 
-`ldOwnerFifoEmpty` is "no entry is occupied"; `ldOwnerFifoHoldsWalker` (still used by W23's
-narrative and by §4.3's assertion) is the OR-reduction over the occupied entries of "this entry
-is a walker". Neither is the same fact as `ldOwner =/= CORE`, and that distinction is what
+The three named FIFO-state quantities, all read-only views of `ldOwnerFifo` and all living
+inside `LsEuPlugin` (round 5 adds the third, which §4.3's second assertion used without ever
+defining it):
+
+```
+ldOwnerFifoEmpty      = no entry is occupied
+ldOwnerFifoHoldsWalker = OR over the occupied entries of "this entry is ITLB or DTLB"
+ldOwnerFifoOccupancy   = the number of occupied entries (0..4)
+```
+
+**All three are read PRE-pop and PRE-push** — i.e. they are the FIFO's state *entering* the
+cycle, before that cycle's `dcache.loadCmd.fire` push and before that cycle's
+`dcache.loadRsp.valid` pop, including on a cycle where a push and a pop happen simultaneously.
+Combinationally this means they are functions of the FIFO's registered state only, never of
+`ldOwnerFifo.io.push/pop` in the same cycle — which is also the cheap implementation.
+The pre-pop reading is **load-bearing for §4.3's second assertion** and must not be
+"simplified" to a post-pop one: on the cycle the exception sequencer's own response arrives,
+`excLoadOutstanding` is still `True` (W30's clear term takes effect at the *next* edge) and the
+entry it names is still the FIFO's registered head, so `ldOwnerFifoOccupancy === 1 && ldRspTag
+=== CORE_EXC` holds. Under a post-pop reading the occupancy would already read `0` on that same
+cycle and the assertion would fire on correct behaviour. `ldRspTag` (`= ldOwnerFifo.head`) is
+pre-pop for the identical reason — it is what tags *this* cycle's response.
+
+None of the three is the same fact as `ldOwner =/= CORE`, and that distinction is what
 W23's round-2 fix line got wrong (§4.2.7): `ldOwner` records who holds the *current grant*,
 while the FIFO records what is *still in flight*. A walker command accepted one cycle and the
 grant reverting to `CORE` the next leaves `ldOwner === CORE` **true** while a walker response
@@ -1197,8 +1275,15 @@ bound `excLoadAdmit` to a line of RTL — it was defined in §4.2.3 and then nev
 withholding C2's argument assumes therefore did not exist: `LsEuPlugin.scala:2027`'s
 `when(excActive && excLoadCmdValid)` header drives `dcache.loadCmd.valid := True` at `:2028`
 with **no** admission term, so the exception sequencer would present its command straight into
-a walker-occupied FIFO — a direct W7 violation, tripping §4.3's assertion in sim and
-mis-delivering a descriptor in silicon. That header becomes `when(excLoadAdmit)`, and its
+a walker-occupied FIFO — a direct W7 violation, mis-delivering a descriptor in silicon.
+*(Round-5 correction to this sentence: round 3 wrote "tripping §4.3's assertion in sim". After
+C-R5-1 that is no longer true and must not be relied on — §4.3's assertions deliberately test
+**admission**, not **presentation**, so an unqualified presentation header leaves `excLoadAdmit`
+itself correct and fires nothing. What catches this shape is §10.2's directed row `(e′)`, whose
+whole content is "with the FIFO occupied and `loadCmd.ready` high, assert `excLoadCmdReady`
+never pulses and the exception FSM does not advance". That is the intended division of labour:
+a runtime assertion for a structural weakening, a directed test for a missing gate.)* That
+header becomes `when(excLoadAdmit)`, and its
 store-side twin at `:2067` becomes `when(excStoreAdmit)`. Both are rows in W27's table below.
 
 ##### W24 — `sq.io.drain.ready` (`LsEuPlugin.scala:265`)
@@ -1336,7 +1421,7 @@ and the plan must add a row for any further site it introduces.*
 | `when(dcache.loadCmd.fire) { ldOwnerFifo.push(ldPushTag) }` | **W29** (round 4) | **NEW — carries its own qualification, by construction.** The push must happen on **every** accepted command regardless of owner (that is what makes the tag positional), so the `fire` is correctly unqualified; the *qualification lives in the payload*, `ldPushTag`, which is the one-hot encode of the four admission predicates. This is the row that would have caught C-R4-1 had it existed: the defect was never "an unqualified `fire`", it was "a qualified `fire` paired with an unqualified value". |
 | `when(dcache.loadRsp.valid) { ldOwnerFifo.pop() }` | **W7** (specified round 2, never given a row) | **NEW — stated: DELIBERATELY UNQUALIFIED, and it must stay that way.** This is the single site in the file where a bare `dcache.loadRsp.valid` consumer is *required*: positional tagging is correct only if exactly one entry is popped per response, whoever the response belongs to. Adding an owner term here would desynchronise the FIFO from the response stream and mis-tag every subsequent response — i.e. the "fix" would be the bug. Recorded explicitly so a future sweep of this defect class does not "correct" it. Its soundness rests on the two premises proved in §4.2.3: exactly one `loadRsp` per accepted `loadCmd`, and strict in-order completion. |
 | `when(dcache.loadRsp.valid && (ldRspTag === CORE_EXC)) { excLoadOutstanding := False }` | **W30** (round 4) | **NEW — FIX.** The site C-R4-2 found missing entirely. Qualified by W29's tag, **not** by an `excStoreOutstanding`-style bare mirror. See W30 (§4.2.3) for the trace showing the bare form is reachable at HEAD. |
-| `assert(CountOne(Cat(coreLsLoadAdmit, excLoadAdmit, walkerLoadAdmit(ITLB), walkerLoadAdmit(DTLB))) <= 1)` | **W29** (round 4) | **NEW — listed for completeness (round 4); sim-only, and NOT a defect-class site.** Reads no `dcache.*` port at all (only `LsEuPlugin`-local admission predicates), so it is outside the defect class; listed because it is new logic in this neighbourhood and the round-4 self-check enumerated it rather than skipping it. Same `GenerationFlags.simulation` style as §4.3's pair. |
+| `assert(CountOne(Cat(coreLsLoadAdmit, excLoadAdmit, walkerLoadAdmit(WALKER_ITLB_IDX), walkerLoadAdmit(WALKER_DTLB_IDX))) <= 1)` | **W29** (round 4) | **NEW — listed for completeness (round 4); sim-only, and NOT a defect-class site.** Reads no `dcache.*` port at all (only `LsEuPlugin`-local admission predicates), so it is outside the defect class; listed because it is new logic in this neighbourhood and the round-4 self-check enumerated it rather than skipping it. Same `GenerationFlags.simulation` style as §4.3's block. *(Round 5: vector indices renamed per M-R5-4 — `WALKER_*_IDX` is a position in the `walkerLoadAdmit` vector, not the tag value `LdRspTag.ITLB`/`LdRspTag.DTLB`.)* |
 
 **Not a handshake, listed for completeness:** `dcache.loadBusy` is referenced only in the
 file's header doc comment (`:68-70`), never in `logic`. `host[DcacheService]` at `:197` is the
@@ -1492,7 +1577,7 @@ place, and `WalkerDcachePortArbSpec` must carry the directed checks §10.2 speci
 clauses — the round-3 check (payload presented vs. owner qualified) **and** the round-4 check
 (pushed FIFO tag vs. the admit predicate that actually drove the fire), because the round-4
 review demonstrated the first passes while the second fails. A `GenerationFlags.simulation`
-assertion in the same style as §4.3's pair is the natural home for both, alongside W29's
+assertion in the same style as §4.3's block is the natural home for both, alongside W29's
 one-hot exclusivity assertion.
 
 ### 4.3 W13/W14 — response routing
@@ -1547,15 +1632,29 @@ happens, not whether it happens:
   per §11.1 item 9, *stronger* than what HEAD actually implements today.
 
 What is added alongside are `GenerationFlags.simulation` assertions in `LsEuPlugin`, narrowed
-to the boundaries that are still drain-to-zero. *Round 4 strengthens the load-side assertion in
-lockstep with W30 — the round-3 form is left beside it as a comment, because an assertion
-weaker than the predicate it guards is how a future weakening goes unnoticed:*
+to the boundaries that are still drain-to-zero. *Round 5 corrects the first of them. Round 4
+wrote it against **presentation** (`excActive && excLoadCmdValid`) when the property it needed
+is about **admission** (`excLoadAdmit`), and that is not a wording nicety: `excLoadCmdValid` is
+`ExceptionUnit`'s **held, registered** `ldoValidReg` (`ExceptionUnit.scala:798-803`), asserted
+continuously from the cycle the FSM enters a `*REQ` state until `dcLoadCmd.fire`. Under W30
+part (2) the exception's command is **correctly withheld** for exactly as long as the FIFO is
+non-empty, with `excLoadCmdValid` high and `excLoadOutstanding` still `False` — which is
+literally the round-4 predicate. The assertion therefore fired on the very waiting behaviour
+W30 exists to create; §6.6's starvation argument, §10.2's row (e′) and §10.2's W30 row all
+specify that same state as correct, and all three would have tripped it. Both superseded forms
+are kept as comments, because an assertion that is wrong in the **weakening** direction and one
+that is wrong in the **firing-on-correct-behaviour** direction fail differently and a
+plan-writer should be able to recognise either:*
 
 ```
 // ROUND-3 FORM (superseded — walker-only, cannot see a CORE-LS straggler):
 //   assert(!(ldOwnerFifoHoldsWalker && (excLoadOutstanding || (excActive && excLoadCmdValid))), ...)
-assert(!(!ldOwnerFifoEmpty && (excActive && excLoadCmdValid) && !excLoadOutstanding),
-       "the exception sequencer presented a load with another client's response still in flight",
+// ROUND-4 FORM (superseded — WRONG, fires on correct behaviour: `excLoadCmdValid` is the HELD
+// `ldoValidReg`, so this predicate IS the W30 wait, not a violation of it. `LsEuPlugin` also
+// cannot make it true by construction — `ldoValidReg` is driven by `ExceptionUnit`):
+//   assert(!(!ldOwnerFifoEmpty && (excActive && excLoadCmdValid) && !excLoadOutstanding), ...)
+assert(!(excLoadAdmit && !ldOwnerFifoEmpty),
+       "excLoadAdmit was weakened: the exception's command can be admitted with a response in flight",
        FAILURE)
 assert(!(excLoadOutstanding && !(ldOwnerFifoOccupancy === 1 && ldRspTag === CORE_EXC)),
        "excLoadOutstanding is set without exactly its own command in the ownership FIFO", FAILURE)
@@ -1564,11 +1663,22 @@ assert(!(stOwner =/= CORE && (coreStOutstanding =/= 0)),
 ```
 
 so that if W7's or W30's surviving hand-over conditions are ever weakened, the netlist says so
-loudly rather than silently mis-delivering a descriptor into an architectural register. The
-second assertion is the direct, checkable statement of W30's soundness proof: while the
+loudly rather than silently mis-delivering a descriptor into an architectural register.
+
+The first assertion is deliberately **tautological against W30 part (2)'s own predicate**
+(`excLoadAdmit = excActive && excLoadCmdValid && ldOwnerFifoEmpty`), and that is the point: it
+is a **structural tripwire against a future weakening**, not a runtime timing check. It can
+never fire under a correct implementation, and it fires immediately if anyone ever relaxes
+`excLoadAdmit`'s FIFO term — e.g. back toward round 2's `!ldOwnerFifoHoldsWalker` form — which
+would simultaneously reopen C2 and re-inherit §11.1 item 9's live HEAD bug. A property that
+`LsEuPlugin` **can** hold by construction is the only kind worth asserting here: `excLoadAdmit`
+is `LsEuPlugin`'s own expression, whereas `excLoadCmdValid` is not.
+
+The second assertion is the direct, checkable statement of W30's soundness proof: while the
 exception sequencer has a load outstanding, the FIFO holds exactly its own entry and nothing
 else — which is what licenses both the tagged clear term *and* `exc.dcLoadRsp` staying
-unqualified.
+unqualified. It reads `ldOwnerFifoOccupancy` **pre-pop**, per §4.2.3's definition; that reading
+is load-bearing (see there).
 
 ### 4.4 W15 — where the walker client ports live
 
@@ -2059,12 +2169,25 @@ that no wait added by this design can hang:
   `CORE-LS` commands are already suppressed by `coreLsLoadAdmit`'s `!excActive`, and walker
   commands by `walkerLoadAdmit`'s `!ldBusyExc`. The exception sequencer waits on responses to
   commands accepted *before* it presented, never on new work it is itself blocking.
-- **The exception sequencer cannot be starved by walkers.** `excLoadCmdValid` is the
-  `ExceptionUnit`'s **held**, registered `ldoValidReg` (`ExceptionUnit.scala:798-803`), asserted
-  continuously until its own `dcLoadCmd.fire`. So from the first cycle it presents,
-  `ldBusyExc` is true and no *new* walker command can be admitted behind it; the FIFO can only
-  shrink. This is the load-side counterpart of §6.5's argument and relies on the same
-  "past admission completes without the port" property.
+- **The exception sequencer cannot be starved by walkers. Stated PER-LOAD, which is the scope
+  in which it is true** *(round 5: round 4's wording read as if it held continuously across a
+  whole multi-load exception episode; it does not, and the difference matters to a plan-writer
+  who might otherwise treat the episode-level reading as an invariant to lean on).*
+  `excLoadCmdValid` is `ExceptionUnit`'s **held**, registered `ldoValidReg`
+  (`ExceptionUnit.scala:798-803`), asserted continuously from the cycle the FSM enters a `*REQ`
+  state until **that load's** `dcLoadCmd.fire`. So for each individual exception load, from its
+  first presenting cycle `ldBusyExc` is true, no *new* walker command can be admitted behind it,
+  and the FIFO can only shrink — so **that** load's wait is bounded and it is guaranteed the
+  port. What is **not** true is that `ldBusyExc` stays high for the whole episode: between two
+  consecutive loads of one exception sequence there is a real 1-2 cycle window in which it is
+  low (`excLoadOutstanding` clears one cycle after the response lands, per W30 part (1), and
+  `ldoValidReg` does not rise again until the **next** `*REQ` state is entered), and a walker
+  **can** be admitted in it. That is deliberate and does not break the bound: the admitted
+  walker command is a single command that must complete before the next exception load is
+  admitted (W30 part (2)'s `ldOwnerFifoEmpty`), so the worst case is **at most one walker
+  command interposed per exception load**, not per episode, and each interposition costs one
+  bounded D-cache access. The per-load form is the load-side counterpart of §6.5's argument and
+  relies on the same "past admission completes without the port" property.
 - **N4 interaction unchanged.** A maintenance walk still refuses both directions for its
   bounded duration (`!maintBusyReg`); W30 adds no new interaction with it, because the
   exception sequencer's wait is on the FIFO, not on `loadCmdPort.ready`.
@@ -2107,7 +2230,7 @@ otherwise:
 | `mmu/TableWalker.scala` | Delete `io.axi`, `axiCfg`, `selectWord`; add the four client hooks; retarget `issueRead()`/`RD_*`; handle `loadRsp.fault` (W16) |
 | `mmu/ItlbPlugin.scala` | Delete `walkerAxi`, its D27 guard, the AW/W drain FSM; add client hooks; keep `drainBeat`/`drainStrb` (W17) |
 | `mmu/DtlbPlugin.scala` | Same as ITLB |
-| `execute/LsEuPlugin.scala` | Extend the `:2020-2078` mux to 4 sources; add `ldOwner`/`stOwner`/age/`force`/`walkRr`, the **W7 depth-4 ownership FIFO** + `ldRspTag`/`rspOwner`/`ldOwnerFifoEmpty`/`ldOwnerFifoHoldsWalker`, `excLoadOutstanding`, `coreStOutstanding` (counting the exception sequencer's stores too); the admission predicates `coreLsLoadAdmit`/`excLoadAdmit`/`excStoreAdmit`/`walkerLoadAdmit`/`walkerStoreAdmit` (§4.2.3); fold `dcLoadHeldByOther` into `:863`, `:1774-1776` and (via `coreLsLoadAdmit`) `:716`/`:756`; **implement W27's table (§4.2.7) in full — all 34 rows: the 11 `NEW — FIX` rows as named steps, the 3 `NEW — stated` rows (`:263-264`/`:757-764` driver ordering, and the deliberately-unqualified FIFO pop) as recorded constraints, the 1 `NEW — carries its own qualification` row (W29's FIFO push), and the 19 already-decided / needs-no-term rows as recorded no-ops**, which subsumes W23 (`:2115` + `excLoadOutstanding`'s set term, qualified by `excLoadAdmit`, **not** by an owner comparison), W24 (`:265`), the split-leg visibility+admission fix (`:756`/`:1508`/`:1536`), `bkCompletes` (`:1574-1575`), the store-side W23 twin (`:2069`/`:2076`), the `:2027`/`:2067` presentation headers, `:2073`, the `ldRspTag === CORE_LS` qualifications at `:720`/`:1520`/`:1541`/`:1574-1575`, and the round-4 rows (`:886`, `:757-764`, the FIFO push/pop, W30's clear); implement **W29**'s four-valued `ldRspTag` push encode + the one-hot exclusivity assertion, and **W30**'s tagged `excLoadOutstanding` clear term + `ldOwnerFifoEmpty` in `excLoadAdmit`; satisfy **W28**'s same-cycle owner-coherence invariant in **all three clauses** (reads, the FIFO push payload, and `ldOwner`/`stOwner`'s update rule) and state which of its two admissible shapes is implemented; gate `sq.io.drainAck`/`drainErr` and `exc.dcStoreAck` (W13); the W26 wedge counters; the walker pass-through hooks; the simulation assertions |
+| `execute/LsEuPlugin.scala` | Extend the `:2020-2078` mux to 4 sources; add `ldOwner`/`stOwner`/age/`force`/`walkRr`, the **W7 depth-4 ownership FIFO** + `ldRspTag`/`rspOwner`/`ldOwnerFifoEmpty`/`ldOwnerFifoHoldsWalker`/`ldOwnerFifoOccupancy` (every one of these read **pre-pop/pre-push**, §4.2.3 — `ldOwnerFifoOccupancy` is what §4.3's second assertion reads and the pre-pop reading is load-bearing there), `excLoadOutstanding`, `coreStOutstanding` (counting the exception sequencer's stores too); the admission predicates `coreLsLoadAdmit`/`excLoadAdmit`/`excStoreAdmit`/`walkerLoadAdmit`/`walkerStoreAdmit` (§4.2.3); fold `dcLoadHeldByOther` into `:863`, `:1774-1776` and (via `coreLsLoadAdmit`) `:716`/`:756`; **implement W27's table (§4.2.7) in full — all 34 rows: the 11 `NEW — FIX` rows as named steps, the 3 `NEW — stated` rows (`:263-264`/`:757-764` driver ordering, and the deliberately-unqualified FIFO pop) as recorded constraints, the 1 `NEW — carries its own qualification` row (W29's FIFO push), and the 19 already-decided / needs-no-term rows as recorded no-ops**, which subsumes W23 (`:2115` + `excLoadOutstanding`'s set term, qualified by `excLoadAdmit`, **not** by an owner comparison), W24 (`:265`), the split-leg visibility+admission fix (`:756`/`:1508`/`:1536`), `bkCompletes` (`:1574-1575`), the store-side W23 twin (`:2069`/`:2076`), the `:2027`/`:2067` presentation headers, `:2073`, the `ldRspTag === CORE_LS` qualifications at `:720`/`:1520`/`:1541`/`:1574-1575`, and the round-4 rows (`:886`, `:757-764`, the FIFO push/pop, W30's clear); implement **W29**'s four-valued `ldRspTag` push encode + the one-hot exclusivity assertion, and **W30**'s tagged `excLoadOutstanding` clear term + `ldOwnerFifoEmpty` in `excLoadAdmit`; satisfy **W28**'s same-cycle owner-coherence invariant in **all three clauses** (reads, the FIFO push payload, and `ldOwner`/`stOwner`'s update rule) and state which of its two admissible shapes is implemented; gate `sq.io.drainAck`/`drainErr` and `exc.dcStoreAck` (W13); the W26 wedge counters; the walker pass-through hooks; the simulation assertions |
 | `exception/ExceptionUnit.scala` | Export the `quiesceHold` bool over `S_DRAIN \|\| S_APPLY` (W19/M1); correct the `:1362-1381` comment |
 | `cache/DcacheTypes.scala` | **Declaration-only:** add `DLoadToken.WALK_ITLB = 0x81` / `WALK_DTLB = 0x82` next to the existing width constant, **and amend the `:6-8` token-layout doc comment** so it describes the walker values rather than mis-reading them as exception-unit tokens (W25). No bundle field, no behavioural change — see the note below |
 | `socket/AxiDMerge.scala` | Shrink to 2 read owners / 1 write owner (W21) |
@@ -2495,9 +2618,20 @@ failing-path *shape* compared, not just the number.
    frame words") from a *different* root cause, so the failure signature is already known to
    the codebase.
 
-   **Disposition:** out of scope to fix as a standalone task, but **this design must not build
-   on the assumption it violates**. W30 part (2) (`excLoadAdmit`'s `ldOwnerFifoEmpty` term)
-   closes it as a by-product, which is why that term is mandatory rather than defensive.
+   **Disposition** *(corrected in round 5 — round 4 wrote "out of scope to fix as a standalone
+   task", which understated both the urgency and the independence of the fix)*: this is a
+   **real, currently-live, silent-corruption bug in already-shipped production code**,
+   independently re-verified against the RTL, not a hypothetical and not something this
+   redesign introduces. It is **tracked and fixed as its own standalone task**, in
+   `ExceptionUnit.scala`/`LsEuPlugin.scala` alone, **completely independent of whether this
+   design is ever built** — no walker, no port mux, no ownership FIFO and no other part of this
+   document is required to close it. A reader must **not** conclude that the bug is only
+   closeable via this redesign landing, nor that closing it is gated on this design's timeline.
+   What this document owes the bug is the separate obligation that **this design must not build
+   on the assumption it violates**: W30 part (2) (`excLoadAdmit`'s `ldOwnerFifoEmpty` term)
+   closes it *again*, structurally, as a by-product, which is why that term is mandatory rather
+   than defensive.
+
    §10.2's W30 test row is written so its assertion (3) can be demonstrated failing at HEAD —
    the evidence standard §10.1 already requires of the §1.2 test. A plan-writer who finds this
    already fixed upstream must re-verify the trace rather than assume it, and must **not**
@@ -2806,8 +2940,13 @@ cost bullet, §10.2's three test rows, §11.1 item 9, §11.2, §0's W29/W30 rows
 `???`/`TBD`/`TODO`/`XXX`/`<fill in>` and no unresolved bracket. The one deliberately-unpinned
 value remains W26's counter bound, unchanged since round 2 and affirmed twice. W29's
 `ITLB_ID`/`DTLB_ID` in the push-encode snippet are the existing owner-code constants, not
-placeholders. The `// DO NOT IMPLEMENT` block in W30 is the same deliberate device round 3
-introduced for W23's superseded line, and is marked identically.
+placeholders. *(Round-5 correction to this sentence: they are **not** the owner-code constants,
+and calling them that conflated three distinct encodings. They are **positional indices into
+the `walkerLoadAdmit` vector** and are renamed `WALKER_ITLB_IDX`/`WALKER_DTLB_IDX` in §4.2.3 to
+keep them visibly distinct from the tag values `LdRspTag.ITLB`/`LdRspTag.DTLB` and from the
+three-valued arbiter owner code. Still not placeholders — the point of the correction is
+naming, not an unresolved value.)* The `// DO NOT IMPLEMENT` block in W30 is the same deliberate
+device round 3 introduced for W23's superseded line, and is marked identically.
 
 **[R4] Internal consistency, round 4.** All **30** DECIDED items (W1-W30) re-cross-checked;
 only the pairs this pass could disturb are recorded:
@@ -2943,6 +3082,53 @@ added beside it. Round 3's I1/I2/M1/M2/M3/M4 resolutions are all untouched, and 
 locator corrections round 3 made (`:756` not `:758`, `excStoreOutstanding` at `:268`,
 `AxiDMerge.scala:225-230`) were re-confirmed correct against the file during this pass.
 
+**[R5] Placeholder scan, round 5.** Re-run over exactly what this pass touched and nothing
+else, since round 5 is a targeted fix pass rather than a structural one: §4.2.3's FIFO
+pseudocode, the three FIFO-state definitions, the W29 push-encode snippet and its two
+round-5 notes, property 2's exclusivity assertion; §4.3's assertion block and the paragraphs
+around it; §6.6's third bullet; §8's `LsEuPlugin` symbol list; §11.1 item 9's disposition
+sentence; §12's round-4 `ITLB_ID` sentence; the round-5 revision note in the header; and §16.
+No `???`/`TBD`/`TODO`/`XXX`/`<fill in>` and no unresolved bracket in any of them. The one
+deliberately-unpinned value remains W26's counter bound, unchanged since round 2 and now
+affirmed three times. `WALKER_ITLB_IDX`/`WALKER_DTLB_IDX` are **not** placeholders — they are
+the `walkerLoadAdmit` vector's positional indices, named this way precisely so they cannot be
+confused with `LdRspTag.ITLB`/`LdRspTag.DTLB` (M-R5-4). The superseded round-3 **and** round-4
+assertion forms in §4.3 are commented-out on purpose, the same device round 3 introduced for
+W23's superseded line and round 4 used for W30's `// DO NOT IMPLEMENT` mirror, and each carries
+a one-line statement of *how* it was wrong so neither can be mistaken for a live prescription.
+
+**[R5] Internal consistency, round 5.** No DECIDED item is added, removed or changed in
+substance, so the pairwise cross-check is limited to the pairs this pass could disturb:
+
+- **§4.3's corrected assertion vs W30 part (2).** The assertion is now
+  `!(excLoadAdmit && !ldOwnerFifoEmpty)`, and W30 part (2) states
+  `excLoadAdmit = excActive && excLoadCmdValid && ldOwnerFifoEmpty`. The assertion is therefore
+  *entailed by* the decision it guards — checked deliberately, because that entailment is what
+  makes it a tripwire (it can only fire if the decision's own text stops being implemented) and
+  is the specific property the round-4 form lacked.
+- **§4.3's corrected assertion vs §6.6, §10.2 `(e′)`, §10.2's W30 row.** All three specify a
+  state in which the exception's command is presented-but-withheld with the FIFO non-empty.
+  Re-checked that the new assertion is **false** in that state for all three (it reads
+  `excLoadAdmit`, which is low exactly then), so none of the three trips it. This is the check
+  round 4 did not make, and the three sites are the evidence that the document's *other* three
+  statements were right and the assertion was the outlier.
+- **M-R5-2's reorder vs §4.2.7's `:757-764` row and §4.2.4's base priority.** The chain now
+  reads CORE-LS base → walkers → CORE-EXC last, which is the same order those two places
+  require of the payload mux. Checked in the direction that matters: the reorder cannot change
+  behaviour while W29 property 2 holds, and it makes tag and payload agree if it ever fails.
+- **M-R5-1's pre-pop rule vs W30 part (1) and §4.3's second assertion.** W30 part (1) clears
+  `excLoadOutstanding` on the *edge* after `dcache.loadRsp.valid && (ldRspTag === CORE_EXC)`,
+  so on the response cycle itself the register is still set; the pre-pop reading is what makes
+  the second assertion true on that cycle. Also checked against `ldRspTag = ldOwnerFifo.head`,
+  which must be pre-pop for the same reason and already was.
+- **I-R5-1 vs W30 part (2) and §10.2's W30 row.** Item 9's disposition now decouples the bug's
+  fix from this design's timeline, so re-checked that nothing downstream depended on the old
+  "out of scope" framing: W30 part (2) is justified independently (it is what restores W14's
+  argument for the walker-vs-`CORE-EXC` case, which no upstream fix covers), and item 9's
+  existing instruction to a plan-writer who finds the bug already fixed upstream — re-verify the
+  trace, and do **not** weaken W30 part (2) on that basis — is unchanged and now reads as the
+  expected case rather than the surprising one.
+
 ---
 
 ## 13. Review disposition (round-2 fix pass, 2026-08-18)
@@ -3059,3 +3245,48 @@ sentence that licensed C-R4-1.
 **Status after this pass:** still **PROPOSED / DESIGN ONLY**, awaiting re-review. No RTL has
 been touched by this document at any point. **30** DECIDED items (W1-W30), 4 recorded
 non-decisions (N1-N4).
+
+---
+
+## 16. Review disposition (round-5 fix pass, 2026-08-18)
+
+`aab837e` was re-reviewed and returned **changes requested** a fourth time, with 1 Critical,
+1 Important and 4 Minor findings. The review independently re-verified and **confirmed correct**
+W29 (the push-payload redefinition and its pairwise-exclusivity proof, under *both* W28 shapes),
+W30 parts (1) and (2), W28 clauses (b)/(c) (including that round 3's licensing sentence was
+genuinely withdrawn rather than left contradicting the new rule), all three W27 rows round 4
+added (including the "the FIFO pop must **stay** unqualified" reasoning), §6.6's
+boundedness/acyclicity proof, §4.3's **second** assertion, and W27's table coverage against a
+fresh independent 59-reference count. **None of that is reopened here.** No DECIDED item is
+added, removed or changed in substance by this pass: the count stays at **30 (W1-W30)**.
+
+| Finding | Disposition | Where |
+|---|---|---|
+| **C-R5-1** §4.3's mandated load-side simulation assertion fires on **correct** behaviour. It tests `!(!ldOwnerFifoEmpty && (excActive && excLoadCmdValid) && !excLoadOutstanding)` — but `excLoadCmdValid` is `ExceptionUnit`'s **held, registered** `ldoValidReg`, high from the `*REQ` state until fire, so under W30 part (2) that predicate *is* the intended wait, held continuously for the whole drain. §6.6, §10.2's `(e′)` row and §10.2's W30 row all specify that same state as correct, and running them as written would abort the simulation | **Adopted; the assertion is replaced, not weakened around.** The property actually wanted is about **admission**, not presentation: `assert(!(excLoadAdmit && !ldOwnerFifoEmpty), "excLoadAdmit was weakened: …", FAILURE)`. It is deliberately **tautological against W30 part (2)'s own predicate** — a *structural tripwire* against a future weakening of `excLoadAdmit`'s FIFO term, not a runtime timing check. It cannot fire under a correct implementation and fires immediately if anyone relaxes that term (which would reopen C2 *and* re-inherit §11.1 item 9's live bug). It is also the only form `LsEuPlugin` can hold **by construction**: `excLoadAdmit` is `LsEuPlugin`'s own expression, whereas `ldoValidReg` is driven by `ExceptionUnit` and is outside its control. Both superseded forms are retained as comments with their distinct failure modes named, since §8 carries this block into the implementation list. The **second** assertion (`ldOwnerFifoOccupancy`) is confirmed correct and is untouched | §4.3 |
+| **I-R5-1** §11.1 item 9's disposition ("out of scope to fix as a standalone task") under-escalates a confirmed **live** production bug and scope-ties its fix to this redesign's timeline | **Adopted.** The technical trace and every citation are preserved verbatim (independently re-confirmed correct); only the disposition sentence changes. It now states plainly that this is a real, currently-live, silent-corruption bug in already-shipped code, **tracked and fixed as its own standalone task** in `ExceptionUnit.scala`/`LsEuPlugin.scala` alone, independent of whether this design is ever built — and that a reader must not conclude it is only closeable via this redesign landing. What this document still owes it is unchanged: this design must not *build on* the assumption it violates, which is why W30 part (2) is mandatory | §11.1 item 9 |
+| **M-R5-1** `ldOwnerFifoOccupancy` is used by §4.3's second assertion but defined nowhere | **Adopted.** Defined in §4.2.3 beside `ldOwnerFifoEmpty`/`ldOwnerFifoHoldsWalker`, added to §4.2.3's FIFO pseudocode and to §8's symbol list. All three views (and `ldRspTag`/`rspOwner`) are specified **pre-pop and pre-push** — the FIFO's registered state entering the cycle, on a simultaneous push+pop cycle too. That reading is stated as load-bearing: on the cycle the exception's own response lands, `excLoadOutstanding` is still `True` and its entry is still the registered head, so the assertion holds; under a post-pop reading occupancy would read `0` and the assertion would fire on correct behaviour | §4.2.3, §4.3, §8 |
+| **M-R5-2** `ldPushTag`'s `when`-chain is ordered `CORE_LS < CORE_EXC < ITLB < DTLB`, the **opposite** of the payload mux's own last-assignment-wins order (CORE-LS base → walkers → CORE-EXC last) | **Adopted.** Reordered to mirror the mux. Harmless today only because W29's exclusivity proof means at most one leg is ever true — i.e. correct by a *separate* proof that happens to agree, which is the C-R4-1 shape. Now correct **by construction**: had the exclusivity ever been violated, the old chain would have mis-attributed in the opposite direction from the payload actually presented. The one-hot assertion is explicitly **not** made optional by the reorder; what the reorder buys is that a falsified proof degrades consistently instead of silently mis-tagging | §4.2.3 |
+| **M-R5-3** §6.6's third bullet reads as if `ldBusyExc` stays high across a whole exception episode; it is only true **per load** | **Adopted, wording only — the proof's substance is unchanged and was confirmed correct.** The bullet now states the per-load scope explicitly and names the real 1-2 cycle window between consecutive exception loads (`excLoadOutstanding` clears one cycle after the response lands; `ldoValidReg` does not rise again until the next `*REQ` state) in which a walker **can** be admitted. The bound still holds and is restated in its true form: **at most one walker command interposed per exception load**, not per episode | §6.6 |
+| **M-R5-4** `walkerLoadAdmit(ITLB_ID)` is a positional **vector index** while `LdRspTag.ITLB` is a **tag value**; §12 called `ITLB_ID` "the existing owner-code constants", conflating three encodings that are off by one from each other | **Adopted, naming only.** The vector positions are renamed `WALKER_ITLB_IDX`/`WALKER_DTLB_IDX` everywhere they appear (the push encode, the exclusivity proof, the exclusivity assertion) so they cannot be read as interchangeable with `LdRspTag.ITLB`/`LdRspTag.DTLB` or with the three-valued arbiter owner code. §12's round-4 placeholder sentence is corrected in place rather than silently rewritten | §4.2.3, §12 |
+
+**What this round did *not* find, and why that is worth recording.** Rounds 2→3→4 each closed
+their findings while leaving a hole in the mechanism they introduced. Round 5 found no such
+hole: W29's and W30's mechanisms are intact, and the one Critical was in a **check** written
+*about* those mechanisms rather than in the mechanisms themselves — an assertion phrased against
+the wrong one of two signals that differ only in *when* they are true. The generalisation worth
+carrying forward is narrower than the previous rounds' and is stated here so it is not
+rediscovered: **an assertion must be written against a predicate the asserting module can hold
+by construction.** `excLoadAdmit` is `LsEuPlugin`'s; `excLoadCmdValid` is `ExceptionUnit`'s, and
+no edit inside `LsEuPlugin` could ever have made the round-4 form true.
+
+**Affirmed by the review and deliberately NOT reopened in round 5:** W29 in full (push payload
++ pairwise-exclusivity proof, verified under both W28 shapes); W30 parts (1) and (2); W28
+clauses (b) and (c); round 4's three new W27 rows including the FIFO pop's "must stay
+unqualified" justification; §6.6's boundedness and acyclicity proof (substance — only its
+per-load scoping wording changed); §4.3's second (`ldOwnerFifoOccupancy`) assertion, confirmed
+to hold at every cycle; W27's table coverage, re-confirmed against a fresh independent
+59-reference sweep; and all of round 3's work, re-affirmed a second time.
+
+**Status after this pass:** still **PROPOSED / DESIGN ONLY**, awaiting re-review. No RTL has
+been touched by this document at any point. **30** DECIDED items (W1-W30), unchanged in count
+and in substance by this pass, and 4 recorded non-decisions (N1-N4).
