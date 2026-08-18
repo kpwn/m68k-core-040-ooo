@@ -589,7 +589,7 @@ object GenFullCoreSynthVerilog {
           // Vivado VIO integration (design spec 2026-08-18-vio-jtag-debug-design.md, V4).
           // enable=false here -- M68kFullCoreSynth is the OOC/FMax gate target and its port
           // surface must not move. GenFullCoreSynthVioVerilog below is the enabled twin.
-          new m68k040.debug.VioProbePlugin(enable = vioEnable)
+          new m68k040.debug.VioProbePlugin(enable = vioEnable, buildId = dbgBuildId)
         )).setDefinitionName(outputName)
       }
     println(s"Generated generated/$outputName.v")
