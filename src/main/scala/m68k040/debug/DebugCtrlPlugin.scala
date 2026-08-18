@@ -65,6 +65,10 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
     val initDoneSeen   = in(Bool()).setName("init_done_seen")
     coldResetPulse.simPublic(); coldResetHold.simPublic(); initDoneSeen.simPublic()
 
+    val ramWindowLg2 = out(UInt(6 bits)).setName("cpu_ram_window_lg2")
+    val monSense     = out(UInt(7 bits)).setName("cpu_mon_sense")
+    ramWindowLg2.simPublic(); monSense.simPublic()
+
     val coreCd = ClockDomain.current
 
     // ── Debug power-on reset: deliberately reset-LESS flops ─────────────────────────
@@ -202,6 +206,23 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
         False ##            // bit 1  single-step pulse    -- RAZ/WI until Stage 2
         False               // bit 0  manual halt request  -- RAZ/WI until Stage 2
 
+      // ── SoC-fabric configuration, debug reset domain ────────────────────────────
+      // POR values and the clamp bounds come from the deployed controller
+      // (debug_ctrl.v:1805 ram_window_lg2_r <= 6'd26, :1814 mon_sense_r <= 7'h06,
+      // :2202-2206 the [22,30] write clamp) via debug_regmap.def, never restated here.
+      val ramWindow = Reg(UInt(6 bits)) init U(DebugRegMap.RAM_WINDOW_LG2_POR, 6 bits)
+      val mon       = Reg(UInt(7 bits)) init U(DebugRegMap.MON_SENSE_POR, 7 bits)
+      ramWindow.simPublic(); mon.simPublic()
+
+      /** One-cycle strobe raised by OFF_DBG_RESET_CTL bit 0. Deliberately NOT a reset:
+        * it leaves the AXI FSM alone so the requesting write still gets its B response
+        * (spec 15.3; debug_ctrl.v:3016-3024). */
+      val cfgWipe = RegInit(False); cfgWipe.simPublic()
+      cfgWipe := False
+
+      def ramWindowWord: Bits = B(0, 26 bits) ## ramWindow.asBits
+      def monSenseWord:  Bits = B(0, 25 bits) ## mon.asBits
+
       // ── Read mux ──────────────────────────────────────────────────────────────────
       // Stage 1's CSR values are added by Tasks 8-10. The default arm is the whole
       // contract for every offset this stage does not implement: spec 3.2 -- "It must
@@ -238,6 +259,8 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
                      False ##            // bit 1  exception pending    (Stage 2)
                      False               // bit 0  halted               (Stage 2)
           }
+          is(DebugRegMap.OFF_RAM_WINDOW_LG2) { rData := ramWindowWord }
+          is(DebugRegMap.OFF_MON_SENSE)      { rData := monSenseWord }
         }
       }
 
@@ -258,7 +281,38 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
             // Bit 2 is the deprecated reset-pulse ALIAS of bit 5 (spec 3.3).
             coldPulse       := m(5) || m(2)
           }
+          is(DebugRegMap.OFF_RAM_WINDOW_LG2) {
+            val req = merged(ramWindowWord)(5 downto 0).asUInt
+            ramWindow := Mux(req < U(DebugRegMap.RAM_WINDOW_LG2_MIN, 6 bits),
+                             U(DebugRegMap.RAM_WINDOW_LG2_MIN, 6 bits),
+                         Mux(req > U(DebugRegMap.RAM_WINDOW_LG2_MAX, 6 bits),
+                             U(DebugRegMap.RAM_WINDOW_LG2_MAX, 6 bits),
+                             req))
+          }
+          is(DebugRegMap.OFF_MON_SENSE) {
+            // No clamping: every one of the 128 encodings is meaningful to the SoC's
+            // video.v sense_response(). Bit 6 is the extended-monitor flag.
+            mon := merged(monSenseWord)(6 downto 0).asUInt
+          }
+          is(DebugRegMap.OFF_DBG_RESET_CTL) {
+            when(wStrb(0)) {
+              cfgWipe := wData(0)
+              // Bit 1 (CPU-reset count clear) is added by Task 11.
+            }
+          }
         }
+      }
+
+      // ── SoC-fabric configuration wipe (spec 15.3) ────────────────────────────────
+      // Applied after the write decode on purpose: in SpinalHDL a later `when` wins, which
+      // is how debug_ctrl.v's cfg_wipe arm "overrides an in-flight config write without
+      // needing its own priority encoder". The wipe list is exactly the deployed one
+      // (debug_ctrl.v:3024-3062) restricted to the registers Stage 1 owns -- it does NOT
+      // clear cold-reset hold or the init-done override, because the deployed wipe does
+      // not either and feature bit 2 must mean the same thing on both cores (spec 15.3).
+      when(cfgWipe) {
+        ramWindow := U(DebugRegMap.RAM_WINDOW_LG2_POR, 6 bits)
+        mon       := U(DebugRegMap.MON_SENSE_POR, 7 bits)
       }
 
       // ── The spec-15.1 wipe, and the sticky latch it overrides ────────────────────
@@ -293,6 +347,8 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
 
       coldResetPulse := coldPulse
       coldResetHold  := ctrlColdHold
+      ramWindowLg2   := ramWindow
+      monSense       := mon
     }
 
     // ── Required assertion (spec section 13) ────────────────────────────────────────
