@@ -360,12 +360,18 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // rest of the macro. `movemHadSnap` persists for the whole macro (unlike
     // `movemSnapPhase`, which clears once the copy is accepted) so `movemFirst0` below can
     // tell whether the snapshot already claimed the macro's `firstOfInstr` boundary.
-    // Base-snap and idx-snap are MUTUALLY EXCLUSIVE (PC,Xn always has baseValid=False), so
-    // one shared T-phase (movemSnapIsIdx selects the src/dst pair) suffices.
+    // Base-snap and idx-snap were MUTUALLY EXCLUSIVE for every shape until task
+    // movem-agu-index-hazard-2026-08-19 ((d8,PC,Xn) always has baseValid=False, and
+    // (An)/(d16,An) never carry an index) -- one shared T-phase (movemSnapIsIdx selects
+    // the src/dst pair) sufficed. `(d8,An,Xn)` (mode 6) is the FIRST MOVEM EA shape with
+    // BOTH a real base register (An) AND a real index register (Xn) live at once, so it
+    // can need BOTH snapshots -- `movemSnapIdxPending` extends the single T-phase into a
+    // two-step sequence (base/T0 first, then index/T1) when both are required.
     val movemSnapPhase = RegInit(False)
     val movemSnapIsIdx = Reg(Bool())
+    val movemSnapIdxPending = Reg(Bool())
     val movemHadSnap   = Reg(Bool())
-    when(pipeFlush) { movemSnapPhase := False }
+    when(pipeFlush) { movemSnapPhase := False; movemSnapIdxPending := False }
     val movemOff      = Reg(SInt(32 bits))     // running byte offset for the NEXT element's address
     val movemEmitted  = Reg(UInt(5 bits))      // elements emitted so far (for the final An delta count)
     val movemPc       = Reg(UInt(32 bits))
@@ -765,12 +771,20 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val eIdxD8     = eIdxExt(7 downto 0).asSInt.resize(32).asBits
     val ePcIdxBase = (ePc + U(4, 32 bits) + eIdxD8.asUInt).asBits    // PC+4+sext(d8)
     val eIsPcIdxMovem = (eMode === B"3'b111") && (eReg === B"3'b011")
+    // `(d8,An,Xn)` brief-indexed LOAD (task movem-agu-index-hazard-2026-08-19, mode 6):
+    // the AN-based analogue of `eIsPcIdxMovem` above. Shares the SAME extension-word
+    // decode (eIdxExt/eIdxD8/etc, read unconditionally) since the mask still occupies
+    // words(1) regardless of base type -- only the base differs (a real An register here
+    // vs PC there).
+    val eIsAnIdxMovem = (eMode === B"3'b110")
+    val eIdxPresent = eIsPcIdxMovem || eIsAnIdxMovem
     val eBaseValidV = Bits(1 bits); val eBaseRegV = UInt(5 bits)
     val eBaseDispV  = Bits(32 bits)
     eBaseValidV := B"0"; eBaseRegV := 0; eBaseDispV := 0
     switch(eMode) {
       is(B"3'b010", B"3'b011", B"3'b100") { eBaseValidV := B"1"; eBaseRegV := eAnReg; eBaseDispV := 0 }      // (An)/(An)+/-(An)
       is(B"3'b101")                       { eBaseValidV := B"1"; eBaseRegV := eAnReg; eBaseDispV := eDisp16 } // (d16,An)
+      is(B"3'b110")                       { eBaseValidV := B"1"; eBaseRegV := eAnReg; eBaseDispV := eIdxD8 }  // (d8,An,Xn) brief-indexed
       is(B"3'b111") {
         switch(eReg) {
           is(B"3'b000") { eBaseValidV := B"0"; eBaseDispV := eDisp16 }   // (xxx).W
@@ -780,17 +794,30 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         }
       }
     }
-    // CONTROL-mode base ((An)/(d16,An), modes 2/5 — NOT the auto-update modes 3/4, which
-    // `movemLoadDst` already protects via a DISCARD, a different semantics than a snapshot
-    // needs) at risk of "in-list self-corruption" (task #200, case 3 of
+    // CONTROL-mode base ((An)/(d16,An)/(d8,An,Xn), modes 2/5/6 — NOT the auto-update modes
+    // 3/4, which `movemLoadDst` already protects via a DISCARD, a different semantics than
+    // a snapshot needs) at risk of "in-list self-corruption" (task #200, case 3 of
     // movem_an_in_list.s: `movem.l (%a0), %a0/%a3` — the SECOND transfer's address must
     // still see the ORIGINAL a0 even though the FIRST transfer already loaded a NEW value
-    // into architectural a0). See `movemSnapUop`'s doc for the full mechanism.
+    // into architectural a0). See `movemSnapUop`'s doc for the full mechanism. Mode 6's An
+    // base falls into this same bucket naturally (eBaseValidV=1, neither postinc/predec).
     val eNeedBaseSnap = eBaseValidV(0) && !eIsPostinc && !eIsPredec
+    // Index register at risk of the identical "in-list self-corruption" (task
+    // movem-agu-index-hazard-2026-08-19, the bug this fix targets: `movem.l
+    // (0,A2,D0.l*4),%d0-%d1` -- D0 is the index AND is reloaded by the macro's own first
+    // transfer). True for BOTH indexed shapes (PC- and An-based) -- the index register is
+    // always read fresh via rename same as any other operand, so it needs the identical
+    // immutable-snapshot protection regardless of what the base is.
+    val eNeedIdxSnap = eIdxPresent
     // Entry running-offset init: forward starts at 0, predec at -size (first element -> base-size).
     val eSizeBytes = Mux(eopw(6), S(4, 32 bits), S(2, 32 bits))
     val eMaskEmpty = eMask === 0
-    val eNeedSnap  = (eNeedBaseSnap || eIsPcIdxMovem) && !eMaskEmpty
+    // Mode 6 is the only shape where BOTH snaps can be needed at once (a real base AND a
+    // real index simultaneously) -- movemSnapIdxPending sequences base-then-index in that
+    // case; every other shape needs at most one of the two (mutually exclusive as before).
+    val eNeedBothSnap    = eNeedBaseSnap && eNeedIdxSnap && !eMaskEmpty
+    val eNeedIdxOnlySnap = eNeedIdxSnap && !eNeedBaseSnap && !eMaskEmpty
+    val eNeedSnap  = (eNeedBaseSnap || eNeedIdxSnap) && !eMaskEmpty
 
     // ── MOVEP micro-sequencer FSM (alternating-byte peripheral move) ──────────────
     // MOVEP (`0000 rrr 1 oo 001 aaa` + disp16) moves a data register <-> alternating
@@ -1464,22 +1491,24 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // IpcBenchSpec.scala). A different complex-routed family (not MOVE) hitting this same
     // blackout remains an OPEN, characterized gap -- not observed in the ported-test corpus,
     // deliberately not generalized here (see the cluster-11 report).
-    // ── MOVEM `(d8,PC,Xn)` brief-indexed front-end resume (task #200) ────────────────
+    // ── MOVEM `(d8,PC,Xn)` / `(d8,An,Xn)` brief-indexed front-end resume (task #200,
+    //    extended to An-indexed by task movem-agu-index-hazard-2026-08-19) ───────────
     // PredecodeWord.scala's MOVEM `mmOk` table (deliberately NOT touched here — FMax-
-    // sensitive front-end file) never marks mode-7-reg-3 `simple` (only reg 0/1/2 are), so
-    // this shape ALWAYS arrives as a `complex` packet (lenWords=0) exactly like the
-    // mem-indirect-MOVE blackout above — same missing-resume hazard, same fix shape: an
-    // unconditional real-length recompute + a `mispredictRedirect`-riding resume fired at
-    // FSM entry (movemBegin), not gated on the FSM finishing. Length is FIXED (not dynamic
-    // like the mem-indirect case): opword + mask + ONE brief ext word = 3 words, since
-    // OperationDecoder.scala's classifier only admits this shape for the brief-indexed
-    // encoding (see its MOVEM comment) — the full-format sub-case (ext word bit8=1) is
-    // NOT distinguishable from a single opword there, so it silently computes a WRONG (but
-    // still correctly-LENGTHED-here, so still non-hanging) EA instead; genuinely untested,
-    // out of scope, characterized not fixed (task #200 report). `movemPcIdxLenKnown` mirrors
+    // sensitive front-end file) never marks mode-7-reg-3 OR mode 6 `simple` (only modes
+    // 2/3/4/5/7-reg-0/1/2 are), so EITHER indexed shape ALWAYS arrives as a `complex`
+    // packet (lenWords=0) exactly like the mem-indirect-MOVE blackout above — same
+    // missing-resume hazard, same fix shape: an unconditional real-length recompute + a
+    // `mispredictRedirect`-riding resume fired at FSM entry (movemBegin), not gated on the
+    // FSM finishing. Length is FIXED (not dynamic like the mem-indirect case): opword +
+    // mask + ONE brief ext word = 3 words for BOTH shapes, since OperationDecoder.scala's
+    // classifier only admits either shape for the brief-indexed encoding (see its MOVEM
+    // comment) — the full-format sub-case (ext word bit8=1) is NOT distinguishable from a
+    // single opword there, so it silently computes a WRONG (but still correctly-LENGTHED-
+    // here, so still non-hanging) EA instead; genuinely untested, out of scope,
+    // characterized not fixed (task #200 report). `movemPcIdxLenKnown` mirrors
     // `ucMoveLenKnown`'s defensive wordCount guard (never observed false in this corpus).
     val movemPcIdxLenKnown   = U(3, 5 bits) <= movemEntryPkt.wordCount.resize(5)
-    val movemPcIdxResumeFire = movemBegin && eIsPcIdxMovem && movemPcIdxLenKnown
+    val movemPcIdxResumeFire = movemBegin && eIdxPresent && movemPcIdxLenKnown
     val movemPcIdxRealNextPc = (ePc + U(6, 32 bits)).resize(32)   // opword+mask+ext = 3 words
     // The real-length calculation used to drive FetchAlign's redirect action
     // combinationally. Fresh current-RTL routing measured that path from ucPendPkt through
@@ -2283,23 +2312,29 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       // `(d8,PC,Xn)` index (task #200): constant for the whole macro; invalid (srcCValid=
       // False downstream) for every non-indexed MOVEM EA.
       movemIdxReg   := eIdxRegV
-      movemIdxValid := eIsPcIdxMovem
+      movemIdxValid := eIdxPresent
       movemIdxLong  := eIdxLongV
       movemIdxScale := eIdxScaleV
-      // Base/index SNAPSHOT sub-phase (task #200): movemBaseReg/movemIdxReg still hold the
-      // REAL architectural id here — the T0/T1 redirect happens once the snapshot µop is
-      // accepted (elsewhen(movemActive) below). movemHadSnap persists for movemFirst0.
+      // Base/index SNAPSHOT sub-phase (task #200, extended by task
+      // movem-agu-index-hazard-2026-08-19 for mode 6's dual base+index case):
+      // movemBaseReg/movemIdxReg still hold the REAL architectural id here — the T0/T1
+      // redirect happens once the snapshot µop is accepted (elsewhen(movemActive) below).
+      // movemHadSnap persists for movemFirst0. When both are needed (mode 6 only),
+      // movemSnapIsIdx starts False (base/T0 step first) and movemSnapIdxPending carries
+      // the pending index/T1 step; the transition logic below sequences them.
       movemSnapPhase := eNeedSnap
-      movemSnapIsIdx := eIsPcIdxMovem
+      movemSnapIsIdx := eNeedIdxOnlySnap
+      movemSnapIdxPending := eNeedBothSnap
       movemHadSnap   := eNeedSnap
       movemOff      := Mux(eIsPredec, -eSizeBytes, S(0, 32 bits))
       movemEmitted  := 0
       movemPc       := ePc
-      // PredecodeWord.scala never frames mode-7-reg-3 as `simple` (see the resume comment
-      // below), so `eNextPc` (derived from `lenWords`) is 0-based/WRONG for this one shape —
-      // override with the real 3-word length here (mirrors `ucMoveRealNextPc`'s override of
-      // `ucEntryCtx.nextPc` for the analogous mem-indirect-MOVE blackout).
-      movemNextPc   := Mux(eIsPcIdxMovem, movemPcIdxRealNextPc, eNextPc)
+      // PredecodeWord.scala never frames mode-7-reg-3 OR mode 6 as `simple` (see the resume
+      // comment below), so `eNextPc` (derived from `lenWords`) is 0-based/WRONG for either
+      // indexed shape — override with the real 3-word length here (mirrors
+      // `ucMoveRealNextPc`'s override of `ucEntryCtx.nextPc` for the analogous mem-indirect-
+      // MOVE blackout).
+      movemNextPc   := Mux(eIdxPresent, movemPcIdxRealNextPc, eNextPc)
       // A pending slot1 MOVEM is now being consumed by this entry.
       when(movemPendValid) { movemPendValid := False }
       // Entering a slot0 MOVEM: STASH its slot1 (if any) so it is not lost when `fed` is
@@ -2339,11 +2374,26 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       when(movemSnapPhase) {
         // The base/index snapshot copy is emitted; once accepted, redirect the FSM's
         // addressing register to the immutable T0/T1 snapshot for the rest of the macro
-        // (task #200) and fall through to normal mask-draining next cycle.
+        // (task #200) and fall through to normal mask-draining next cycle. Mode 6 (task
+        // movem-agu-index-hazard-2026-08-19) can need BOTH: base/T0 goes first (the
+        // `otherwise` arm below), and if movemSnapIdxPending was latched at entry, that
+        // same acceptance flips movemSnapIsIdx and stays in movemSnapPhase for ONE more
+        // cycle to also emit the index/T1 snap — the index step (`when(movemSnapIsIdx)`)
+        // is always the LAST step regardless of how it was reached.
         when(pushProduced.ready) {
-          movemSnapPhase := False
-          when(movemSnapIsIdx) { movemIdxReg  := U(MicroOpAssembler.T1, 5 bits) }
-            .otherwise         { movemBaseReg := U(MicroOpAssembler.T0, 5 bits) }
+          when(movemSnapIsIdx) {
+            movemIdxReg    := U(MicroOpAssembler.T1, 5 bits)
+            movemSnapPhase := False
+          } otherwise {
+            movemBaseReg := U(MicroOpAssembler.T0, 5 bits)
+            when(movemSnapIdxPending) {
+              movemSnapIsIdx      := True
+              movemSnapIdxPending := False
+              // movemSnapPhase stays True — one more (index) snap step follows.
+            } otherwise {
+              movemSnapPhase := False
+            }
+          }
         }
       } elsewhen(movemAnUpdPhase) {
         // The single final An update is emitted; finish when the queue accepts it.

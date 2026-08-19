@@ -400,8 +400,9 @@ object OperationDecoder {
         // when active). The EA mode field DISAMBIGUATES from EXT.W (0x4880, mode 000) /
         // EXT.L (0x48C0, mode 000), which share bit11=1 & bits9:7=001 but use Dn-direct
         // (mode 0): a real MOVEM EA is a MEMORY mode (>=2), so EXCLUDE reg-direct modes 0/1.
-        // Indexed An-base (mode 6) / #imm+reserved (mode 7 reg>=4) remain OUT OF SCOPE
-        // (mode 6 has no An-indexed EA support in the FSM at all — pinned illegal by
+        // Indexed An-base (mode 6) LOAD is now admitted below (task movem-agu-index-hazard-
+        // 2026-08-19); mode-6 STORE / #imm+reserved (mode 7 reg>=4) remain OUT OF SCOPE
+        // (STORE has no An-indexed EA support in the FSM at all — pinned illegal by
         // movem_idx_unimpl_traps.s). `(d8,PC,Xn)` (mode 7 reg 3) GAINED an index-register
         // read port in the FSM (task #200, MicroOpAssembler.movemMoveUop's new srcC/
         // indexLong/indexScale threading), originally admitted here ONLY for `.L` (bit6=1).
@@ -458,11 +459,24 @@ object OperationDecoder {
         // classifier's EA-mode gate to exactly the FSM-supported shapes (mirroring
         // PredecodeWord's own `mmOk` table) leaves indexed MOVEM `illegal=True` (the
         // OpSpec.illegalDefault()), so it now takes the ordinary vector-4 path instead.
+        // task movem-agu-index-hazard-2026-08-19: `(d8,An,Xn)` brief-indexed LOAD (mode
+        // 110) is admitted here too, mirroring the `(d8,PC,Xn)` (mode 7 reg 3) precedent
+        // directly above -- DecodeStage.scala's FSM now has a real EA-compute-then-N-LOAD
+        // crack for it (base=An + index=Xn*scale + sext(d8), the same srcA/srcC/imm shape
+        // the AGU already proves correct for ordinary non-MOVEM indexed instructions), plus
+        // the generalized `eIdxPresent`-gated front-end resume + a TWO-STEP base+index
+        // snapshot (mode 6 is the first MOVEM EA shape with a REAL base register AND a real
+        // index register live at once, unlike PC-indexed where the base is folded into a
+        // literal and (An)/(d16,An) which have no index). STORE direction (opword(10)=0)
+        // stays OUT of scope -- `v2_movem_ea_ok_store` never gained an indexed row upstream
+        // either, and `movem_idx_unimpl_traps.s` pins An-indexed STORE (.W and .L) as a
+        // required vec-4 illegal trap.
         val mmMode4 = opword(5 downto 3)
         val mmReg4  = opword(2 downto 0)
         val movemEaOk = (mmMode4.asUInt >= 2 && mmMode4.asUInt <= 5) ||
                         (mmMode4 === B"3'b111" && mmReg4.asUInt <= 2) ||
-                        (mmMode4 === B"3'b111" && mmReg4 === B"3'b011")  // (d8,PC,Xn), .W and .L
+                        (mmMode4 === B"3'b111" && mmReg4 === B"3'b011") ||  // (d8,PC,Xn), .W and .L
+                        (mmMode4 === B"3'b110" && opword(10))               // (d8,An,Xn) LOAD only, .W and .L
         when(opword(11) && (opword(9 downto 7) === B"001") && movemEaOk) {
           o.illegal := False
           o.op := DecOp.MOVE                     // benign placeholder; the FSM produces the real µops
