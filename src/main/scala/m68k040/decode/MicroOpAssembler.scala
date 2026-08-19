@@ -2961,10 +2961,24 @@ object MicroOpAssembler {
     // (at words(2..)). Re-decode the EA from a SHIFTED words vector so its disp/abs come
     // from the right offset (the same shape as the DIV.L/MUL.L re-decode). The bounds EA
     // is a CONTROL mode -> EaDecoder classifies (An)/(d16,An)/(xxx)/(d16,PC) (+ indexed)
-    // as MEMSIMPLE; reg-direct/imm/(An)+/-(An) are NOT control. Indexed IS allowed (the
-    // LS-EU AGU reads the index, like LEA). pcRel folds pc.
+    // as MEMSIMPLE; reg-direct/imm/(An)+/-(An) are NOT control. pcRel folds pc.
     val c2SrcEa = EaDecoder.decode(op(5 downto 0), c2Size, Vec(pkt.words(0), pkt.words(2), pkt.words(3)))
-    val c2EaOk  = (c2SrcEa.klass === EaClass.MEMSIMPLE) && (c2SrcEa.autoMode === EaAuto.NONE)
+    // mode 6 ((d8,An,Xn), brief or full-format) and mode 7/reg 3 ((d8,PC,Xn), brief or
+    // full-format) are architecturally LEGAL CMP2/CHK2 control EAs (§4.39), but this
+    // 2-load+compare crack only forms a straight base+disp address (it never reads an
+    // index register, walks a full-format bd/od chain, or follows memory-indirection) --
+    // EaDecoder still classifies the brief-indexed and full-format-no-memind shapes as
+    // MEMSIMPLE (they're supported for the GENERIC ALU/MOVE crackLoad's AGU), which used
+    // to let CMP2/CHK2 silently admit them with a WRONG (index-less-if-full/garbage)
+    // address. Force them illegal here as a fail-safe until the crack actually implements
+    // index/full-format EA compute (chk2_cmp2_illegal_ea_traps.s's fail-safe-follow-up
+    // set). Memory-indirect (klass MEMINDIRECT) is already excluded by the klass check
+    // below; this adds the indexed/full-format MEMSIMPLE shapes on top of it.
+    val c2Mode = op(5 downto 3)
+    val c2Reg  = op(2 downto 0)
+    val c2IndexedShape = (c2Mode === B"110") || ((c2Mode === B"111") && (c2Reg === B"011"))
+    val c2EaOk  = (c2SrcEa.klass === EaClass.MEMSIMPLE) && (c2SrcEa.autoMode === EaAuto.NONE) &&
+                  !c2IndexedShape
     // CMP2/CHK2 has 2 ext words: [opword][cmp2_ext][ea_ext]. The EA ext word lives at
     // pc+4, so (d16,PC)/(d8,PC,Xn) PC-relative accesses must use pc+4 as the base
     // (= address of the EA extension word), NOT pc+2 (which would be the cmp2_ext word).
