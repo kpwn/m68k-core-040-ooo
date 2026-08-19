@@ -27,6 +27,26 @@ import org.scalatest.funsuite.AnyFunSuite
   */
 class AccessFaultCaptureSpec extends AnyFunSuite {
 
+  // Task #234 root-cause fix: this directed harness has the identical structural gap task
+  // #233 fixed in StackOpSpec -- `LsDut` predates the fast/precise store split (task P2.2,
+  // commit a1ecb7a) and never wires `LsEuPlugin`'s `robHeadIn`/`robHeadValidIn`. With no
+  // `MmuControlPlugin` present, `fastStore` is unconditionally False, so every store here
+  // classifies `precise=True`, and a precise store's ROB completion comes ONLY from
+  // `StoreQueue`'s at-head drain, gated on `robHeadValidIn`/`robHeadIn` matching the SQ
+  // head's robId -- signals whose only driver, absent a real override, is their own idle
+  // default (`robHeadValidIn := False`, see LsEuPlugin.scala). Mirrors task #233's
+  // `TbPreciseDrainWirePlugin` (also used by the already-reviewed `LsEuFastPreciseSpec`): a
+  // minimal glue plugin giving both signals a genuine `in()`-backed IO so the test can drive
+  // them.
+  class TbPreciseDrainWirePlugin(eu: LsEuPlugin) extends FiberPlugin {
+    val logic = during build new Area {
+      val iRobHeadIn      = in UInt (6 bits)
+      val iRobHeadValidIn = in Bool ()
+      eu.robHeadIn      := iRobHeadIn
+      eu.robHeadValidIn := iRobHeadValidIn
+    }
+  }
+
   // ── LS-EU half ──────────────────────────────────────────────────────────────
   class LsDut extends Component {
     val db   = new Database
@@ -39,7 +59,8 @@ class AccessFaultCaptureSpec extends AnyFunSuite {
     val dcache = new DcachePlugin()
     val eu     = new LsEuPlugin
     val src    = new LsEuSourcePlugin
-    db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, xlate, dcache, eu, src)) }
+    val wire   = new TbPreciseDrainWirePlugin(eu)
+    db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, xlate, dcache, eu, src, wire)) }
   }
 
   test("LS EU: a faulting store emits faultCompletion (VA, write, size, super); no reg write", VerilatorTest) {
@@ -55,6 +76,12 @@ class AccessFaultCaptureSpec extends AnyFunSuite {
       // (not the faulting VPN 0x2) on ~half the seeds. Pin it false (plain aligned store).
       s.iStkPush #= false
       s.iLeaAddr #= false   // MUST default: undriven -> randomized per seed -> LEA path
+      // Task #234: TbPreciseDrainWirePlugin's ports are real IO now shared by both tests in
+      // this class; a faulting access completes via a different path than a precise store's
+      // at-head drain (confirmed: this test passes unchanged), but an unpoked `in()` port
+      // still needs a defined default to avoid sim-input nondeterminism (this project's own
+      // documented gotcha -- undriven ports/regs randomize per seed).
+      dut.wire.logic.iRobHeadIn #= 0; dut.wire.logic.iRobHeadValidIn #= false
       cd.waitSampling(80)
       // Fault VA 0x2000 -> VPN 0x2.
       dut.xlate.logic.faultEn  #= true
@@ -97,11 +124,19 @@ class AccessFaultCaptureSpec extends AnyFunSuite {
       s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false
       s.iStkPush #= false   // pin false (undriven -> per-seed predecrement); plain store
       s.iLeaAddr #= false   // MUST default: undriven -> randomized per seed -> LEA path
+      dut.wire.logic.iRobHeadIn #= 0; dut.wire.logic.iRobHeadValidIn #= false
       cd.waitSampling(80)
       dut.xlate.logic.faultEn #= false   // no faults
       s.seedValid #= true; s.seedAddr #= 10; s.seedData #= BigInt(0x3000L); cd.waitSampling()
       s.seedAddr #= 11; s.seedData #= BigInt(0xAAAAL); cd.waitSampling()
       s.seedValid #= false; cd.waitSampling(2)
+      // Task #234 fix: park the ROB head on this store's own robId (4) BEFORE issuing it --
+      // a precise store's completion is driven solely by StoreQueue's at-head drain
+      // (`headPreciseReady`, gated on `robHeadValidIn`/`robHeadIn` matching the SQ head's
+      // robId, `!committed(head)`) -- see the class-level comment on `TbPreciseDrainWirePlugin`
+      // above. This directed test's SQ never holds more than one resident entry, so a static
+      // robId=4 target suffices (mirrors task #233's identical StackOpSpec fix).
+      dut.wire.logic.iRobHeadIn #= 4; dut.wire.logic.iRobHeadValidIn #= true
       s.iValid #= true; s.iMemOp #= MemOp.STORE; s.iSize #= Size.LONG
       s.iPsrcA #= 10; s.iPsrcAValid #= true; s.iPsrcB #= 11; s.iPsrcBValid #= true
       s.iImm #= 0; s.iPdstValid #= false; s.iPdst #= 0; s.iRobId #= 4
