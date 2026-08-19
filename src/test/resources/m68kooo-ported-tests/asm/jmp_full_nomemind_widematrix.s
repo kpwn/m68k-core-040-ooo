@@ -16,6 +16,21 @@
 | pre-existing control_full_memind_siblings.s, which already covers that
 | case via the (untouched) legacy decode_0100.vh memind rows.
 |
+| Investigation note (task jmp-full-nomemind, 2026-08-19): the full-format
+| nomemind EA decode/AGU logic itself was ALREADY CORRECT for every T1-T7
+| shape below -- each sub-case's own JMP redirected to the right target on
+| the first attempt. The test originally HUNG anyway because the T2/T6
+| low-memory trampolines write a JMP opcode into RAM and jump to it WITHOUT
+| the mandatory 68040 self-modifying-code cache maintenance (cpushl %bc) --
+| see ifstage_smc_far_control.s for the established idiom this corpus
+| otherwise always uses. T2 happened to "work" only by lucky compulsory-
+| miss timing; T6's target line lost the race against the I-cache's next-
+| line prefetcher (which speculatively caches up to 5 same-page lines
+| ahead of T2's own demand fetch, reaching exactly into T6's line before
+| T6 writes it) and served stale bytes forever after (no D-store-to-
+| I-cache snoop exists, matching real 68040 semantics). Fixed by adding
+| cpushl to both trampolines, matching the rest of the corpus.
+|
 | Sub-cases (each sets a unique bit in D0; final D0 must equal 0x7F):
 |   T1 (bit0): BS=1,IS=0,BD=null,  D2.L*1        -- exact HW repro shape.
 |   T2 (bit1): BS=1,IS=0,BD=null,  D3.W*2        -- low-memory trampoline
@@ -52,6 +67,12 @@ _t1_land:
     lea     0x00002000, %a0
     move.w  #0x4ef9, (%a0)          | JMP (xxx).L opcode
     move.l  #_t2_after, 2(%a0)      | absolute target operand
+    cpushl  %bc, (%a0)              | push D-cache line + invalidate I -- required
+                                     | before executing just-written code (68040 SMC
+                                     | rule; see ifstage_smc_far_control.s). Without
+                                     | this the I-cache's next-line prefetcher can
+                                     | (and, for T6 below, does) install a stale line
+                                     | here before this write lands.
     move.l  #0x00001000, %d3        | 0x1000 * 2 = 0x2000
     jmp     (%d3.w*2)
     bra     _fail_t2
@@ -87,6 +108,8 @@ _t5_land:
     lea     0x00002100, %a0
     move.w  #0x4ef9, (%a0)
     move.l  #_t6_after, 2(%a0)
+    cpushl  %bc, (%a0)              | push D-cache line + invalidate I -- see T2's
+                                     | identical note above; mandatory for SMC.
     .word   0x4ef0, 0x01e0, 0x2100  | JMP full-fmt BS=1,IS=1,BD=word(0x2100)
     bra     _fail_t6
 _t6_after:
