@@ -108,6 +108,17 @@ object Microcode {
   // ── PACK/UNPK MEMORY-form selectors (task #198) ─────────────────────────────
   case object SPackAdj extends Sel   // selImm: ctx.packAdj (the adj16 ext word, sign-extended)
   case object SShift8  extends Sel   // selImm: the constant 8 (UNPK's high-byte LSR count)
+  // A flat, unconditional -1 (byte) write-back for the SECOND leg of a byte-decomposed
+  // WORD access (pack_unpk_a7_word_stride, this session): PACK's two -(Ay) byte loads and
+  // UNPK's two -(Ax) byte stores each jointly compose ONE architectural 16-bit access, so
+  // their combined An stride must be a flat 2 (1+1) REGARDLESS of An==A7 — the A7
+  // byte-access "round up to 2" quirk (`deltaBytesU`'s `isA7Byte`) is for a genuine
+  // standalone BYTE access and must NOT be applied per sub-access here, else it doubles to
+  // 4 (exactly Musashi's bug the test asset documents; the PRM disagrees, see the asset's
+  // header comment). `SNegDeltaAy`/`SNegDeltaAx` stay correct/unchanged for every other
+  // customer (BCD/ADDX/SUBX mem, genuine single-access rows) — this is a NEW selector,
+  // used only by PACK_MEM_ENTRY's two Ay write-back rows.
+  case object SNegOne extends Sel    // selImm: constant -1 (32-bit, flat, no A7 quirk)
   // ── control-transfer / address-generate MEMORY-INDIRECT selectors (task #201) ────────
   case object SA7   extends Sel   // (15, True) — the constant A7 stack-pointer reg id
   case object SRetPc extends Sel  // selImm: ctx.nextPc (JSR-memind's pushed return PC)
@@ -255,6 +266,19 @@ object Microcode {
   case object APredecAx  extends Auto
   case object APostincAy extends Auto   // (Ay)+ — CMPM: addr = Ay (unmodified); delta write-back separate
   case object APostincAx extends Auto   // (Ax)+ — CMPM: addr = Ax (unmodified); delta write-back separate
+  // PACK/UNPK memory-form byte-decomposed WORD access (pack_unpk_a7_word_stride, this
+  // session): a flat, unconditional PREDEC of 1 byte — same as APredecAy/APredecAx EXCEPT
+  // it never applies the A7 byte-access "round up to 2" quirk. PACK's -(Ay) SOURCE (two
+  // byte loads) and UNPK's -(Ax) DEST (two byte stores) each jointly compose ONE real
+  // 16-bit access, so applying the standalone-byte A7 quirk to EACH of the two sub-accesses
+  // double-counts it (An -=4 instead of -=2) — exactly Musashi's bug (its m68k_in.c
+  // decomposes the same word access into two EA_A7_PD_8() calls); the PRM's actual A7
+  // stride for this word access is 2, matching every non-A7 register's existing (correct)
+  // total. The paired genuine single-byte access on the OTHER register (PACK's Ax dest,
+  // UNPK's Ay source) is a real standalone BYTE access and correctly keeps the ordinary
+  // APredecAy/APredecAx (A7-quirked) behavior — see PACK_MEM_ENTRY/UNPK_MEM_ENTRY below.
+  case object APredecAyFlat extends Auto
+  case object APredecAxFlat extends Auto
   // CAS auto-inc/dec EA: the LOAD + STORE both carry eaAuto/eaDelta from the latched ctx
   // (ctx.casAutoMode/Delta) so they compute the SAME effective address (matching Musashi's
   // M68KMAKE_GET_EA_AY single side-effect); the An := An ± size write-back rides the STORE
@@ -378,7 +402,7 @@ object Microcode {
         SFpDispHi, SFpDispMid, SFpStIdx0, SFpStIdx1, SFpStIdx2,
         SImm12, SImm16, SImm4, SImm8, SMiImm, SMiOd,
         SMiOther, SMiOtherEaBase, SMiOtherEaDispLo, SMiOtherOd, SMove16Ay, SMovesAn,
-        SMovesDelta, SMovesRn, SNegDeltaAx, SNegDeltaAy, SNone, SPackAdj,
+        SMovesDelta, SMovesRn, SNegDeltaAx, SNegDeltaAy, SNegOne, SNone, SPackAdj,
         SRetPc, SShift8, ST0, ST1, ST2, ST3 = newElement()
   }
 
@@ -407,11 +431,12 @@ object Microcode {
   }
 
   /** Hardware encoding of `Auto` (PREDEC/POSTINC auto-update kind) — one element
-    * per case object (9). */
+    * per case object (11, incl. the pack_unpk_a7_word_stride fix's APredecAyFlat/
+    * APredecAxFlat). */
   object AutoHw extends SpinalEnum {
     val
         ANoAuto, APredecAy, APredecAx, APostincAy, APostincAx, AEaCasLoad,
-        AEaCasStore, AEaMiOtherLoad, AEaMiOtherStore = newElement()
+        AEaCasStore, AEaMiOtherLoad, AEaMiOtherStore, APredecAyFlat, APredecAxFlat = newElement()
   }
 
   /** Hardware encoding of `Sz` (explicit µop size override) — one element per case
@@ -535,6 +560,8 @@ object Microcode {
       case AEaCasStore      => AutoHw.AEaCasStore
       case AEaMiOtherLoad   => AutoHw.AEaMiOtherLoad
       case AEaMiOtherStore  => AutoHw.AEaMiOtherStore
+      case APredecAyFlat    => AutoHw.APredecAyFlat
+      case APredecAxFlat    => AutoHw.APredecAxFlat
     })
 
     def sel(s: Sel): SpinalEnumElement[SelHw.type] = s match {
@@ -595,6 +622,7 @@ object Microcode {
       case SMovesRn => SelHw.SMovesRn
       case SNegDeltaAx => SelHw.SNegDeltaAx
       case SNegDeltaAy => SelHw.SNegDeltaAy
+      case SNegOne => SelHw.SNegOne
       case SNone => SelHw.SNone
       case SPackAdj => SelHw.SPackAdj
       case SRetPc => SelHw.SRetPc
@@ -1368,17 +1396,25 @@ object Microcode {
     // this row (see resolve()'s op-select block; register-form PACK never reaches this
     // ROM at all — it's a single-µop fast crack in MicroOpAssembler — so ctx.op===PACK
     // can ONLY mean "this UOpFromCtx row", no collision risk).
-    //   m0 LOAD.B (Ay) -> T0, auto=PREDEC(Ay)                                  (isFirst)
-    //   m1 ADD.L Ay - deltaAy -> Ay   (1st Ay predec write-back; dropped)
-    //   m2 LOAD.B (Ay) -> T1, auto=PREDEC(Ay)
-    //   m3 ADD.L Ay - deltaAy -> Ay   (2nd Ay predec write-back; dropped)
+    //   m0 LOAD.B (Ay) -> T0, auto=PREDEC(Ay), FLAT 1 (no A7 quirk)             (isFirst)
+    //   m1 ADD.L Ay - 1 -> Ay   (1st Ay predec write-back; dropped)
+    //   m2 LOAD.B (Ay) -> T1, auto=PREDEC(Ay), FLAT 1 (no A7 quirk)
+    //   m3 ADD.L Ay - 1 -> Ay   (2nd Ay predec write-back; dropped)
     //   m4 PACK  srcA=T0(lo), srcB=T1(hi), imm=adj16 -> T2 (packed byte, low 8 bits)
     //   m5 STORE.B T2 -> (Ax), auto=PREDEC(Ax), dst=Ax (self-write-back)      (isLast)
-    Desc(UMove, mem = MLoad, auto = APredecAy, srcA = SAy, dst = ST0, sz = SzByte,
+    // pack_unpk_a7_word_stride fix (this session): m0/m2's auto and m1/m3's write-back imm
+    // use the FLAT (non-A7-quirked) variants — APredecAyFlat/SNegOne instead of
+    // APredecAy/SNegDeltaAy — because these two byte loads jointly compose ONE real 16-bit
+    // SOURCE access (PRM §4.146: PACK's source "is a 16-bit word"); applying the standalone
+    // -(An)-BYTE A7 alignment quirk to EACH of the two sub-accesses double-counts it (An -=4
+    // instead of the PRM's -=2 — Musashi's bug, see the test asset's header comment). The
+    // Ax DEST (m5) stays on ordinary APredecAx: it is a genuine standalone BYTE access, so
+    // the A7 quirk correctly applies there unchanged.
+    Desc(UMove, mem = MLoad, auto = APredecAyFlat, srcA = SAy, dst = ST0, sz = SzByte,
          isFirst = true),                                                                 // µPC166 (m0)
-    Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SNegDeltaAy),               // µPC167 (m1)
-    Desc(UMove, mem = MLoad, auto = APredecAy, srcA = SAy, dst = ST1, sz = SzByte),        // µPC168 (m2)
-    Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SNegDeltaAy),               // µPC169 (m3)
+    Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SNegOne),                   // µPC167 (m1)
+    Desc(UMove, mem = MLoad, auto = APredecAyFlat, srcA = SAy, dst = ST1, sz = SzByte),    // µPC168 (m2)
+    Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SNegOne),                   // µPC169 (m3)
     Desc(UOpFromCtx, srcA = ST0, srcB = ST1, dst = ST2, useImm = true, imm = SPackAdj,
          sz = SzByte),                                                                    // µPC170 (m4)
     Desc(UMove, mem = MStore, auto = APredecAx, srcA = SAx, srcB = ST2, dst = SAx,
@@ -1401,18 +1437,24 @@ object Microcode {
     //   n1 ADD.L Ay - deltaAy -> Ay   (Ay predec write-back; dropped)
     //   n2 UNPK  srcA=T0(dummy merge src, unused), srcB=T0, imm=adj16 -> T1 (unpacked
     //      16-bit result; T1[7:0]=LOW result byte, T1[15:8]=HIGH result byte)
-    //   n3 STORE.B T1 -> (Ax), auto=PREDEC(Ax), dst=Ax   (LOW byte, written FIRST)
+    //   n3 STORE.B T1 -> (Ax), auto=PREDEC(Ax), FLAT 1 (no A7 quirk), dst=Ax (LOW, FIRST)
     //   n4 SHIFT.L T1 LSR #8 -> T2 (moves T1[15:8] down into T2[7:0])
-    //   n5 STORE.B T2 -> (Ax), auto=PREDEC(Ax), dst=Ax   (HIGH byte, written SECOND) (isLast)
+    //   n5 STORE.B T2 -> (Ax), auto=PREDEC(Ax), FLAT 1 (no A7 quirk), dst=Ax (HIGH, SECOND) (isLast)
+    // pack_unpk_a7_word_stride fix (this session): n3/n5 use the FLAT (non-A7-quirked)
+    // APredecAxFlat instead of APredecAx, mirroring PACK's m0/m2 fix above — these two byte
+    // stores jointly compose ONE real 16-bit DEST access (PRM §4.190: UNPK's destination
+    // "is the resulting word"), so the standalone-BYTE A7 quirk must not double-count across
+    // them. n0 (Ay SOURCE) stays on ordinary APredecAy: it is a genuine standalone BYTE
+    // access, so the A7 quirk correctly applies there unchanged.
     Desc(UMove, mem = MLoad, auto = APredecAy, srcA = SAy, dst = ST0, sz = SzByte,
          isFirst = true),                                                                 // µPC172 (n0)
     Desc(UAddDrop, srcA = SAy, dst = SAy, useImm = true, imm = SNegDeltaAy),               // µPC173 (n1)
     Desc(UOpFromCtx, srcA = ST0, srcB = ST0, dst = ST1, useImm = true, imm = SPackAdj,
          sz = SzWord),                                                                    // µPC174 (n2)
-    Desc(UMove, mem = MStore, auto = APredecAx, srcA = SAx, srcB = ST1, dst = SAx,
+    Desc(UMove, mem = MStore, auto = APredecAxFlat, srcA = SAx, srcB = ST1, dst = SAx,
          sz = SzByte),                                                                    // µPC175 (n3)
     Desc(UShiftR8, srcA = ST1, dst = ST2, useImm = true, imm = SShift8, sz = SzLong),      // µPC176 (n4)
-    Desc(UMove, mem = MStore, auto = APredecAx, srcA = SAx, srcB = ST2, dst = SAx,
+    Desc(UMove, mem = MStore, auto = APredecAxFlat, srcA = SAx, srcB = ST2, dst = SAx,
          sz = SzByte, isLast = true),                                                     // µPC177 (n5)
 
     // ════════════════════════════════════════════════════════════════════════
@@ -2521,6 +2563,7 @@ object Microcode {
     case SFpStIdx1    => B(1, 32 bits)
     case SFpStIdx2    => B(2, 32 bits)
     case SFpCtrlDelta => ctx.fpCtrlDelta                                // signed +/-4*popcount An delta
+    case SNegOne      => S(-1, 32 bits).asBits                          // flat -1, no A7 quirk (task #198 fix)
     case _           => B(0, 32 bits)
   }
 
@@ -2760,6 +2803,10 @@ object Microcode {
       // keyed to ctx.miOtherEaAutoMode/Delta instead of ctx.casAutoMode/Delta.
       case AEaMiOtherLoad  => u.eaAuto := ctx.miOtherEaAutoMode; u.eaDelta := ctx.miOtherEaAutoDelta
       case AEaMiOtherStore => u.eaAuto := ctx.miOtherEaAutoMode; u.eaDelta := ctx.miOtherEaAutoDelta
+      // pack_unpk_a7_word_stride fix: flat 1-byte PREDEC, no A7 quirk — see APredecAyFlat/
+      // APredecAxFlat's doc comment above.
+      case APredecAyFlat => u.eaAuto := EaAuto.PREDEC; u.eaDelta := U(1, 3 bits)
+      case APredecAxFlat => u.eaAuto := EaAuto.PREDEC; u.eaDelta := U(1, 3 bits)
     }
     u.ccrRestore := False; u.toCcr := False
     // shiftOp: 0 for every row EXCEPT UShiftR8 (task #198, UNPK's high-byte LSR #8),
@@ -3072,6 +3119,7 @@ object Microcode {
       is(SelHw.SFpStIdx1)    { imm := B(1, 32 bits) }
       is(SelHw.SFpStIdx2)    { imm := B(2, 32 bits) }
       is(SelHw.SFpCtrlDelta) { imm := ctx.fpCtrlDelta }
+      is(SelHw.SNegOne)      { imm := S(-1, 32 bits).asBits }          // flat -1, no A7 quirk (task #198 fix)
     }
     imm
   }
@@ -3315,6 +3363,10 @@ object Microcode {
       // keyed to ctx.miOtherEaAutoMode/Delta instead of ctx.casAutoMode/Delta.
       is(AutoHw.AEaMiOtherLoad)  { u.eaAuto := ctx.miOtherEaAutoMode; u.eaDelta := ctx.miOtherEaAutoDelta }
       is(AutoHw.AEaMiOtherStore) { u.eaAuto := ctx.miOtherEaAutoMode; u.eaDelta := ctx.miOtherEaAutoDelta }
+      // pack_unpk_a7_word_stride fix: flat 1-byte PREDEC, no A7 quirk — see APredecAyFlat/
+      // APredecAxFlat's doc comment above resolve()'s twin arm.
+      is(AutoHw.APredecAyFlat) { u.eaAuto := EaAuto.PREDEC; u.eaDelta := U(1, 3 bits) }
+      is(AutoHw.APredecAxFlat) { u.eaAuto := EaAuto.PREDEC; u.eaDelta := U(1, 3 bits) }
     }
     u.ccrRestore := False; u.toCcr := False
     // shiftOp: 0 for every row EXCEPT UShiftR8 (task #198, UNPK's high-byte LSR #8),
