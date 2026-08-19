@@ -41,10 +41,31 @@ object PredecodeWord {
   // Boolean-typed overload above is now a thin `Bool(...)`-wrapping shim over this one, so
   // BOTH produce byte-identical hardware for every existing (compile-time-constant) caller.
   def classify(op: Bits, extW: Bits, extW2: Bits, extW3: Bits,
-               extWValid: Bool, extW2Valid: Bool, extW3Valid: Bool): ChunkPredecode = {
+               extWValid: Bool, extW2Valid: Bool, extW3Valid: Bool): ChunkPredecode =
+    classify(op, extW, extW2, extW3, B(0, 16 bits), B(0, 16 bits), B(0, 16 bits),
+             extWValid, extW2Valid, extW3Valid, False, False, False)
+  // task #242 (memind_wide_disp_dst HANG, restructured 2026-08-19 -- see the
+  // fmax-closure-fanout ledger / task-memind-wide-disp-dst-restructure report for the
+  // regression this replaces): 3 more optional ext words (op+4/+5/+6), needed ONLY to
+  // resolve a MOVE dst-mode-6/mode7-3 full-format EA whose SOURCE itself consumed 3, 4, or
+  // 5 of its own extension words (a genuine full-format src EA -- bd.L+od.L, or bd.L+index
+  // -- pushes the dst's own base ext word to op+4/+5/+6, past the OLD 4-word (op+extW..
+  // extW3) lookahead this function had). EVERY existing caller keeps the OLD "extW4/5/6
+  // unknown" behavior bit-for-bit via the 7-arg overload above delegating here with
+  // `B(0,16 bits)`/`False` -- a Scala/hardware CONSTANT False, so IcachePlugin's 16 per-beat
+  // bake-time instances still fold to byte-identical logic (same "constant literal prunes
+  // dead logic" property extWValid/extW2Valid/extW3Valid already rely on, task #153/#202).
+  // Only FetchAlignPlugin's live-reclassify (`p0LiveReg`) call supplies real op+4/+5/+6 data
+  // + genuine runtime valid flags -- see that call site.
+  def classify(op: Bits, extW: Bits, extW2: Bits, extW3: Bits, extW4: Bits, extW5: Bits, extW6: Bits,
+               extWValid: Bool, extW2Valid: Bool, extW3Valid: Bool,
+               extW4Valid: Bool, extW5Valid: Bool, extW6Valid: Bool): ChunkPredecode = {
     val extWKnown  = extWValid
     val extW2Known = extW2Valid
     val extW3Known = extW3Valid
+    val extW4Known = extW4Valid
+    val extW5Known = extW5Valid
+    val extW6Known = extW6Valid
     val r = ChunkPredecode()
     r.simple        := False
     r.lenWords      := U(0, 4 bits)
@@ -424,20 +445,39 @@ object PredecodeWord {
         //     full-format dst, e.g. `MOVE.L (xxx).L,([bd.W,An],od.W)`; extW3 is the SAME
         //     3rd lookahead word added for the line-0 .L-immediate case above, reused
         //     here verbatim)
-        //   sExt>=3 -> op+4.. : STILL beyond even the 3-word lookahead (the source is
-        //     ITSELF full-format, consuming 3+ ext words) — we cannot see that far.
-        //     dstEaKnown=False routes this (rare: both EAs full-format, OR the far more
-        //     common task #223 case of an ordinary mode-6 dst whose 1-word lookahead
-        //     spills past an I-cache-line boundary) through the dst-mode-6 branch below,
-        //     which now assumes brief + flags `ambiguousLine` for a real Aligner
-        //     live-reclassify (see that branch's comment) rather than committing to
-        //     either a silent wrong guess OR an unresolvable COMPLEX rejection.
-        val dstEaW0    = Mux(sExt === U(0, 3 bits), extW,
-                          Mux(sExt === U(1, 3 bits), extW2,
-                          Mux(sExt === U(2, 3 bits), extW3, B(0, 16 bits))))
-        val dstEaKnown = Mux(sExt === U(0, 3 bits), extWKnown,
-                          Mux(sExt === U(1, 3 bits), extW2Known,
-                          Mux(sExt === U(2, 3 bits), extW3Known, False)))
+        //   sExt==3 -> op+4 = extW4 (task #242, memind_wide_disp_dst: a source consuming
+        //     exactly 3 ext words -- a full-format bd.L base EA with no index/od, e.g.
+        //     `([bd.L,An])` -- combined with a full-format dst)
+        //   sExt==4 -> op+5 = extW5 (source: full-format bd.L + a 1-word od, or bd.L+index)
+        //   sExt==5 -> op+6 = extW6 (source: full-format bd.L + od.L, the max single-EA
+        //     extension length -- 1 base + 2 bd + 2 od)
+        //   `extW4`/`extW5`/`extW6` are ONLY real (non-constant-zero) at the live-reclassify
+        //   call site (FetchAlignPlugin's `p0LiveReg`, which holds the full HEAD_WORDS=10-
+        //   word window); IcachePlugin's bake-time call still only ever sees 3 words past
+        //   its own beat and passes constant-zero/False for all three, so `dstEaKnown`
+        //   below still correctly falls back to "assume brief, flag ambiguousLine" there.
+        //
+        // task #242 restructure (2026-08-19, FMax regression fix): the original fix
+        // selected dstEaW0/dstEaKnown via a LINEARLY NESTED Mux chain (`Mux(sExt===0, x0,
+        // Mux(sExt===1, x1, Mux(...)))`), which is a data-dependent SERIAL chain of 2:1
+        // muxes -- going from 3 arms (extW/extW2/extW3, depth 3) to 6 arms (depth 6)
+        // literally DOUBLED the combinational depth of this specific expression. This feeds
+        // directly into FetchAlignPlugin's `p0LiveReg` register D-input on the live-
+        // reclassify path -- a path already deliberately isolated to its own register (FMax
+        // closure slice 1) but whose OWN D-input combinational depth is still charged
+        // against the clock period. Measured cost: -0.482ns synth-only WNS (confirmed via
+        // isolated OOC runs, baseline commit 95fe6d9 vs original-fix commit b3b80ce).
+        // Fix: select via a flat `Vec(..)(sExt)` indexed mux instead. This is the exact
+        // same truth table (same value picked for each `sExt`), so functionally identical,
+        // but lets the synthesis tool build a shallow/balanced decoder-mux (typically
+        // ceil(log2(8))~=3 levels total, vs 6 serial levels for the linear chain) instead of
+        // being forced into the RTL-literal serial structure. `sExt` is 3 bits (range 0-7);
+        // indices 6/7 are unreachable (eaExt never returns sExt>5) and map to the same
+        // "unknown, assume brief" default the old chain's tail used.
+        val dstEaWordVec  = Vec(extW, extW2, extW3, extW4, extW5, extW6, B(0, 16 bits), B(0, 16 bits))
+        val dstEaKnownVec = Vec(extWKnown, extW2Known, extW3Known, extW4Known, extW5Known, extW6Known, False, False)
+        val dstEaW0    = dstEaWordVec(sExt)
+        val dstEaKnown = dstEaKnownVec(sExt)
         when(dstMode === U(7, 3 bits)) {
           switch(dstReg) {
             is(U(0, 3 bits)) { dExt := U(1, 3 bits) }
