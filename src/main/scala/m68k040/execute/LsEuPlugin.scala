@@ -798,12 +798,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val nbytesA_st = Mux(p3Ctx.front.twoAccess, bytesInA.resize(3 bits), stBytes)
     val nbytesB_st = Mux(p3Ctx.front.twoAccess,
                          (stBytes - bytesInA).resize(3 bits), U(0, 3 bits))
-    val splitDataA = m68k040.cache.DcacheByteLane.storeDataA(
-      stOff, p3Ctx.front.size, p3Ctx.front.storeData)
-    val splitStrbA = m68k040.cache.DcacheByteLane.storeStrbA(stOff, p3Ctx.front.size)
-    val splitDataB = m68k040.cache.DcacheByteLane.storeDataB(
-      stOff, p3Ctx.front.size, p3Ctx.front.storeData)
-    val splitStrbB = m68k040.cache.DcacheByteLane.storeStrbB(stOff, p3Ctx.front.size)
+    // strb/lineData for both slots are no longer computed here (task #252): they are
+    // pure functions of (paddr low nibble, size, data), which the SQ already stores
+    // for unrelated reasons -- StoreQueue now re-derives them combinationally at its
+    // own drain read point instead of carrying a 288-bit redundant Mem row per entry.
 
     // ---- SQ alloc + fwd defaults ----
     sq.io.alloc.valid          := False
@@ -814,13 +812,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sq.io.alloc.payload.nbytesA   := nbytesA_st
     // Aligned store: drain via {data,size} (fast path). Split store: explicit strobe.
     sq.io.alloc.payload.useStrbA  := p3Ctx.front.twoAccess
-    sq.io.alloc.payload.strbA     := splitStrbA
-    sq.io.alloc.payload.lineDataA := splitDataA
     sq.io.alloc.payload.validB    := p3Ctx.front.twoAccess
     sq.io.alloc.payload.paddrB    := p3Ctx.paddrB
     sq.io.alloc.payload.nbytesB   := nbytesB_st
-    sq.io.alloc.payload.strbB     := splitStrbB
-    sq.io.alloc.payload.lineDataB := splitDataB
     // Precise-path fields (P2): placeholder wiring, replaced for real in Task P2.2
     // (the fast/precise classification). vaddr/vaddrB/cacheMode/supervisor are the
     // real live values already computed above for this access.

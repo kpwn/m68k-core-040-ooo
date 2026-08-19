@@ -155,18 +155,54 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
       precise: Boolean = false,
       useStrbA: Boolean = false,
       nbytesA: Int = 4,
-      strbA: Int = 0,
-      lineDataA: BigInt = 0,
       validB: Boolean = false,
       paddrB: Long = 0,
       modeB: SpinalEnumElement[CacheMode.type] = CacheMode.COPYBACK,
-      nbytesB: Int = 0,
-      strbB: Int = 0,
-      lineDataB: BigInt = 0)
+      nbytesB: Int = 0)
 
   private case class Desc(paddr: Long, data: BigInt, size: String,
                           useStrb: Boolean, strb: Int, lineData: BigInt,
                           mode: String, precise: Boolean)
+
+  // ---- Scala-host reference model of DcacheByteLane's store-split math ----------
+  // (cache/DcacheTypes.scala storeStrbA/storeDataA/storeStrbB/storeDataB). Task #252
+  // removed the SqAlloc/SQ-side strb/lineData fields -- StoreQueue now derives them
+  // combinationally at drain time from (paddr low nibble, size, data), so a directed
+  // test that wants to assert the drain payload's exact strb/lineData content must
+  // predict them the same way the RTL does, not poke arbitrary independent values.
+  private def sizeNBytes(size: SpinalEnumElement[Size.type]): Int = size match {
+    case Size.BYTE => 1
+    case Size.WORD => 2
+    case _         => 4
+  }
+  // Big-endian access byte k (k=0 = MSB) of `data`, mirroring DcacheByteLane.valueByte.
+  private def valueByte(size: SpinalEnumElement[Size.type], data: BigInt, k: Int): BigInt = {
+    val shift = size match {
+      case Size.BYTE => 0
+      case Size.WORD => if (k == 0) 8 else 0
+      case _         => (3 - k) * 8   // LONG
+    }
+    (data >> shift) & 0xff
+  }
+  // (strb, lineData) for the low line (highHalf=false, positions < 16) or the high
+  // line (highHalf=true, positions >= 16, re-based to 0), given the SAME line-offset
+  // `off` LsEuPlugin's `stOff` (= slot A's own paddr low nibble) used for both slots.
+  private def splitStrbLine(off: Int, size: SpinalEnumElement[Size.type], data: BigInt,
+                            highHalf: Boolean): (Int, BigInt) = {
+    var strb = 0
+    var line = BigInt(0)
+    val nBytes = sizeNBytes(size)
+    for (k <- 0 until 4) {
+      val pos = off + k
+      val active = (k < nBytes) && (if (highHalf) pos >= 16 else pos < 16)
+      if (active) {
+        val lpos = if (highHalf) pos - 16 else pos
+        strb |= (1 << lpos)
+        line |= (valueByte(size, data, k) << (lpos * 8))
+      }
+    }
+    (strb, line)
+  }
   private case class Event(cycle: Int, desc: Desc)
   private case class Trace(accepts: Vector[Event], acks: Vector[Event],
                            peakOutstanding: Int, arCount: Int, awCount: Int,
@@ -180,13 +216,22 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
 
   private def modeName(m: SpinalEnumElement[CacheMode.type]): String = m.toString
 
-  private def descA(s: StoreReq): Desc =
-    Desc(s.paddr, s.data, s.size.toString, s.useStrbA, s.strbA, s.lineDataA,
+  // Slot A/B strb+lineData are ALWAYS the derived value regardless of `useStrbA`
+  // (StoreQueue computes them unconditionally at drain -- a non-split store's strb
+  // is simply don't-care downstream since DcachePlugin only consumes it when
+  // useStrb is set, but the raw drain payload this test captures carries the real
+  // derived bits either way). Both slots derive off slot A's own paddr low nibble.
+  private def descA(s: StoreReq): Desc = {
+    val (strb, lineData) = splitStrbLine((s.paddr & 0xF).toInt, s.size, s.data, highHalf = false)
+    Desc(s.paddr, s.data, s.size.toString, s.useStrbA, strb, lineData,
          modeName(s.mode), s.precise)
+  }
 
-  private def descB(s: StoreReq): Desc =
+  private def descB(s: StoreReq): Desc = {
+    val (strb, lineData) = splitStrbLine((s.paddr & 0xF).toInt, s.size, s.data, highHalf = true)
     Desc(s.paddrB, BigInt(0), Size.LONG.toString, useStrb = true,
-         s.strbB, s.lineDataB, modeName(s.modeB), s.precise)
+         strb, lineData, modeName(s.modeB), s.precise)
+  }
 
   private def payloadDesc(p: DStoreCmd): Desc = {
     Desc(p.paddr.toLong & 0xffffffffL, p.data.toBigInt, p.size.toEnum.toString,
@@ -259,14 +304,10 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
     a.payload.size #= s.size
     a.payload.nbytesA #= s.nbytesA
     a.payload.useStrbA #= s.useStrbA
-    a.payload.strbA #= s.strbA
-    a.payload.lineDataA #= s.lineDataA
     a.payload.validB #= s.validB
     a.payload.paddrB #= s.paddrB
     a.payload.vaddrB #= s.paddrB
     a.payload.nbytesB #= s.nbytesB
-    a.payload.strbB #= s.strbB
-    a.payload.lineDataB #= s.lineDataB
     a.payload.cacheMode #= s.mode
     a.payload.cacheModeB #= s.modeB
     a.payload.supervisor #= false
@@ -500,13 +541,13 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
       val lineA = 0x3000L
       val lineB = 0x3010L
       warm(dut, cd, mem, Seq(lineA, lineB))
-      val splitAData = (BigInt(0xaa) << (14 * 8)) | (BigInt(0xbb) << (15 * 8))
-      val splitBData = BigInt(0xcc) | (BigInt(0xdd) << 8)
+      // data bytes (MSB-first, LONG): 0xaa,0xbb spill into slot A (line-offsets 14,15);
+      // 0xcc,0xdd spill into slot B (offsets 0,1 of the next line) -- the SAME split
+      // this test previously injected as independent strbA/lineDataA/strbB/lineDataB
+      // constants, now produced by the real derivation (task #252) from one `data` word.
       val split = StoreReq(
-        robId = 20, paddr = lineA + 14, data = 0, useStrbA = true,
-        nbytesA = 2, strbA = 0xc000, lineDataA = splitAData,
-        validB = true, paddrB = lineB, nbytesB = 2,
-        strbB = 0x0003, lineDataB = splitBData)
+        robId = 20, paddr = lineA + 14, data = BigInt("aabbccdd", 16), useStrbA = true,
+        nbytesA = 2, validB = true, paddrB = lineB, nbytesB = 2)
       val sameLine = StoreReq(robId = 21, paddr = lineB + 4,
                               data = BigInt("11223344", 16))
       val stores = Seq(split, sameLine)

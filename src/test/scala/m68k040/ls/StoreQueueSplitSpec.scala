@@ -10,16 +10,21 @@ import org.scalatest.funsuite.AnyFunSuite
 /** Directed test of the store-queue two-slot atomic drain + dual-slot forward (Task 4).
   *
   * A SPLIT (cross-line/page) store occupies ONE SQ entry with an optional slot B
-  * {paddrB, strbB, lineDataB, nbytesB, validB}. Forwarding checks a younger load
+  * {paddrB, nbytesB, validB} (strb/lineData are derived at drain time, task #252,
+  * not carried per-entry). Forwarding checks a younger load
   * against BOTH slots. Commit-drain emits slot A then slot B (two DStoreCmds),
   * popping only after BOTH are drain-ACKed. Flush drops both. */
 class StoreQueueSplitSpec extends AnyFunSuite {
 
-  /** Alloc a SPLIT store: slot A at paddrA (nbytesA, explicit strobe/line data),
-    * slot B at paddrB (nbytesB). */
+  /** Alloc a SPLIT store: slot A at paddrA (nbytesA), slot B at paddrB (nbytesB).
+    * strb/lineData are no longer alloc-time inputs (task #252) -- StoreQueue derives
+    * them at drain from (paddr low nibble, size, data); with `data #= 0` here (this
+    * test only checks paddr association, never the merge-data content), the derived
+    * strb still comes out exactly `0xC000`/`0x0003` for this paddrA/paddrB pair since
+    * the strobe depends only on (offset, size), never data. */
   def allocSplit(dut: StoreQueue, cd: ClockDomain, robId: Int,
-                 paddrA: Long, nbytesA: Int, strbA: Int, lineA: BigInt,
-                 paddrB: Long, nbytesB: Int, strbB: Int, lineB: BigInt): Unit = {
+                 paddrA: Long, nbytesA: Int,
+                 paddrB: Long, nbytesB: Int): Unit = {
     val a = dut.io.alloc
     a.valid #= true
     a.payload.robId #= robId
@@ -29,14 +34,10 @@ class StoreQueueSplitSpec extends AnyFunSuite {
     a.payload.size #= Size.LONG
     a.payload.nbytesA #= nbytesA
     a.payload.useStrbA #= true
-    a.payload.strbA #= strbA
-    a.payload.lineDataA #= lineA
     a.payload.validB #= true
     a.payload.paddrB #= paddrB
     a.payload.vaddrB #= paddrB   // identity for this test
     a.payload.nbytesB #= nbytesB
-    a.payload.strbB #= strbB
-    a.payload.lineDataB #= lineB
     a.payload.cacheMode #= m68k040.cache.CacheMode.WRITETHROUGH
     a.payload.supervisor #= false
     a.payload.precise #= false
@@ -54,14 +55,10 @@ class StoreQueueSplitSpec extends AnyFunSuite {
     a.payload.size #= size
     a.payload.nbytesA #= (size match { case Size.BYTE => 1; case Size.WORD => 2; case _ => 4 })
     a.payload.useStrbA #= false
-    a.payload.strbA #= 0
-    a.payload.lineDataA #= 0
     a.payload.validB #= false
     a.payload.paddrB #= 0
     a.payload.vaddrB #= 0
     a.payload.nbytesB #= 0
-    a.payload.strbB #= 0
-    a.payload.lineDataB #= 0
     a.payload.cacheMode #= m68k040.cache.CacheMode.WRITETHROUGH
     a.payload.supervisor #= false
     a.payload.precise #= false
@@ -107,8 +104,8 @@ class StoreQueueSplitSpec extends AnyFunSuite {
       val cd = initDut(dut)
       // split LONG at 0x10E..0x111: slot A = 0x10E (2 bytes: byte 14,15), slot B = 0x110 (2 bytes: byte 0,1)
       allocSplit(dut, cd, robId = 4,
-        paddrA = 0x10E, nbytesA = 2, strbA = 0xC000, lineA = BigInt("11220000000000000000000000000000", 16),
-        paddrB = 0x110, nbytesB = 2, strbB = 0x0003, lineB = BigInt("00000000000000000000000000003344", 16))
+        paddrA = 0x10E, nbytesA = 2,
+        paddrB = 0x110, nbytesB = 2)
       // younger load (robId 6) of a WORD at 0x110 overlaps slot B -> must NOT full-hit; must stall.
       setQuery(dut, robId = 6, paddr = 0x110, Size.WORD)
       cd.waitSampling(); sleep(1)
@@ -131,8 +128,8 @@ class StoreQueueSplitSpec extends AnyFunSuite {
           drained += ((dut.io.drain.payload.paddr.toLong, dut.io.drain.payload.strb.toLong)) } }
       forkDrainAck(dut, cd)
       allocSplit(dut, cd, robId = 4,
-        paddrA = 0x10E, nbytesA = 2, strbA = 0xC000, lineA = BigInt("11220000000000000000000000000000", 16),
-        paddrB = 0x110, nbytesB = 2, strbB = 0x0003, lineB = BigInt("00000000000000000000000000003344", 16))
+        paddrA = 0x10E, nbytesA = 2,
+        paddrB = 0x110, nbytesB = 2)
       // uncommitted -> no drain
       sleep(1); assert(!dut.io.drain.valid.toBoolean, "uncommitted split store must not drain")
       commit(dut, cd, robId = 4)
@@ -154,8 +151,8 @@ class StoreQueueSplitSpec extends AnyFunSuite {
           drained += dut.io.drain.payload.paddr.toLong } }
       forkDrainAck(dut, cd)
       allocSplit(dut, cd, robId = 9,
-        paddrA = 0x10E, nbytesA = 2, strbA = 0xC000, lineA = BigInt("11220000000000000000000000000000", 16),
-        paddrB = 0x110, nbytesB = 2, strbB = 0x0003, lineB = BigInt("00000000000000000000000000003344", 16))
+        paddrA = 0x10E, nbytesA = 2,
+        paddrB = 0x110, nbytesB = 2)
       // flush before commit -> squashed; neither half ever drains
       dut.io.flush #= true; cd.waitSampling(); dut.io.flush #= false
       cd.waitSampling(12)
