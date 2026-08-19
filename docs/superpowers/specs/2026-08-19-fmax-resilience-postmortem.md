@@ -210,29 +210,44 @@ per-index write).
 
 | File | Fields | Depth | Writer count (approx) | Risk | Notes |
 |---|---|---|---|---|---|
-| `RobPlugin.scala` | `faultAddrStore`+7 siblings | 64 | **6** (2 alloc + 4 completion) | **HIGH — proven critical-path contributor today** | Needs Pattern D (§3.1) design work first |
-| `RobPlugin.scala` | `completes`, `mispredictStore`, `branchTakenStore`, `btbIsBranchStore`, `phtValidStore`, `nzvcWrStore`/`xWrStore` | 64 | mostly 1-2 (completion + alloc-reset) | MEDIUM | Each individually closer to Pattern A/B if audited — not yet attempted |
-| `RegFilePlugin.scala` | PRF backing store (`v`) | per-spec depth | write-port-limited by design | **contributing today** (path #1) but NOT a flop-array shape — it's already LUTRAM/BRAM-inferred; the fanout is on the *address/select* side, not the storage. Different fix class (see §5.2) |
-| `StoreQueue.scala` | `valids`/`committed`/`robIds`/`paddrs`/`datas`/`sizes`/+9 more | 8 | 1-2 per field (alloc + drain/complete) | LOW-MEDIUM (small depth caps fanout severity) | Already had one real fold this session (task #252, `drainRowMem` elimination) — good precedent that this file rewards a fresh audit |
-| `Tlb.scala` (MMU) | `valids`/`tags`/`ppns`/`wProt`/`sup`/`cmode`/`modif` | banks×ways×nSets (3-level nest) | 1 (refill) + 1 (M-bit update) | MEDIUM | Nested `Vec.fill` of `Vec.fill` of `Vec.fill` — worth checking whether the innermost per-set arrays individually fold; not examined this session |
+| `RobPlugin.scala` | `faultAddrStore`+7 siblings | 64 | **6** (2 alloc + 4 completion), **CONFIRMED coincident** | **HIGH — proven critical-path contributor today** | Task #258 (2026-08-19): coincidence proven, real ceiling is 6/6, a plain 2-port fold would silently drop a real exception. Needs Pattern D (§3.1) design work, not a mechanical fold. See task #127. |
+| `RobPlugin.scala` | `completes` | 64 | **9** (2 fixed alloc-reset + **7 dynamic** — 6 generic `completion` ports + branch) | **HIGH, same unsafe class as `faultAddrStore`** | Audited 2026-08-19 (task #260): worse than `faultAddrStore` (7 dynamic writers vs. 4). Not foldable with any proven pattern. |
+| `RobPlugin.scala` | `nzvcWrStore`, `xWrStore` | 64 | **6** (2 fixed alloc-reset + **4 dynamic** `ccrCompletion` ports) | **HIGH, same unsafe class** | Audited 2026-08-19 (task #260). Sibling fields sharing the same `ccrCompletion` writer set (`nzvcValStore`/`xValStore`/`sysValStore`/`sysValRdyStore`) are the same shape, not yet individually confirmed. |
+| `RobPlugin.scala` | `mispredictStore`, `branchTakenStore`, `btbIsBranchStore`, `phtValidStore` | 64 | 1 dynamic (`branchCompletion`, confirmed structurally exclusive from all other completion ports) **+ 2 fixed alloc-reset writes that are proven load-bearing** (verified via `btbIsBranchStore`'s ungated retire-time read — without the reset a reused slot reads a stale `True`) | MEDIUM, **not a 2-port case** | Audited 2026-08-19 (task #260): corrects this row's original "mostly 1-2 writers, easy" guess — genuinely needs 3 concurrent write addresses (2 fixed + 1 dynamic, proven mutually disjoint), which exceeds the proven ≤2-port Pattern A/B idiom (BRAM natively supports 2 write ports). Not implemented; a real 3-port design would be needed. |
+| `RegFilePlugin.scala` | PRF backing store (`v`) | per-spec depth | write-port-limited by design | **contributing today** (path #1) but NOT a flop-array shape — it's already LUTRAM/BRAM-inferred; the fanout is on the *address/select* side, not the storage. Different fix class (see §5.2); scoping dispatched as task #259. |
+| `StoreQueue.scala` | `valids`/`committed`/`robIds`/`paddrs`/`datas`/`sizes`/+9 more | 8 | 1-2 per field (alloc + drain/complete) | LOW-MEDIUM (small depth caps fanout severity) | Already had one real fold this session (task #252, `drainRowMem` elimination) — good precedent that this file rewards a fresh audit. Not re-examined 2026-08-19 (out of scope for task #260's MEDIUM-row list). |
+| `Tlb.scala` (MMU) | `tags`/`ppns`/`wProt`/`sup`/`cmode`/`modif` | banks(2)×ways(4)×nSets(4) = 32 total | **1 each, confirmed** (`fillValid` only — no separate M-bit updater exists, the write-fault re-walk path reuses the same walker-completion pulse) | LOW, confirmed | Audited 2026-08-19 (task #260): genuinely single-writer, but the array is too small (32 total entries, 4-deep innermost dynamic dim) for the anti-pattern to matter — nowhere near the 100-1000-way-fanout regime seen elsewhere. `valids` has 2 writers (`fillValid` set + `invalidateAll` bulk clear, not a single-address write). Considered "not worth the risk for the payoff," no proven critical-path contribution — left as-is. |
 | `IcachePlugin.scala` | `valids`, MSHR fields (`mshrValid`+6 siblings) | `ways×sets`, `MSHR_N` | small, bounded | LOW | MSHR_N is typically small (2-4); unlikely to be fanout-dominant |
 | `DcachePlugin.scala` | `earlyProbe*` (5 fields) | 4 | small | LOW | Depth 4 — fanout-safe by construction |
 | `UmWriteQueue.scala` | `valids`/`committed`/`robIds`/`addrs`/`bytes` | queue depth (small) | 1-2 | LOW | Not examined; likely fine given small depth |
 | `LsEuPlugin.scala` | `alignedMem`+3, `pendMem`+2 | 4, 8 | 1-2 | LOW | Small depths |
 | `Btb.scala`/`Ftb.scala`/`Ras.scala` | `valids`, `ras` | `entries` (BTB/FTB sizing) | 1 (train/update port) | LOW-MEDIUM | Single-writer — should be an easy Pattern-B candidate if these entries counts are large enough to matter; not measured this session |
-| `RatTable.scala` | `specReg`/`commReg` | `archDepth` (=8, architectural register count) | multiple (per-rename-slot writes) | LOW (depth=8 is small) | Flagged in `fullcore_slack_matrix.rpt` (path #11, #40: `DecodeStage_logic_queue/head_reg[2] -> RenameStage_logic_intRat/specReg_*`) — small depth but appeared in the top-40 twice; worth a closer look given it's cheap to check |
+| `RatTable.scala` | `specReg`/`commReg` (5 RAT instances: `intRat` archDepth=**20**, `nzvcRat`/`xRat`/`fpccRat` archDepth=1, `fpRat` archDepth=8) | see left | **4 each** (`writePorts=2` + `commitPorts=2`, all dynamic) | **NOT SAFE — do not fold, ever** | Audited 2026-08-19 (task #260), corrects two things: (1) writer count is 4, not the depth alone; (2) **this file's own header documents a Mem-based fold was already tried and reverted** for a real correctness bug — dropped same-cell writes on the 1-entry flag RATs (`nzvcRat`/`xRat`/`fpccRat`, both write ports hardwired to address 0) caused a genuine branch mis-resolution/loop-divergence bug. The current Reg-Vec-with-explicit-priority-loop IS that fix. **Never re-attempt a Mem fold here.** The slack-matrix hits (paths #11/#40) trace to `DecodeStage`'s queue-head-indexed combinational read feeding the RAT's write-address compare with no register cut — same family as row 3 below (frontend imm/dst-field construction), NOT a RAT-array problem. Fix belongs in `DecodeStage.scala`; tracked as task #262. Also corrects this doc's earlier factual error: `archDepth=8` is `fpRat`, not `intRat` (which is 20, `Isa.ARCH_INT_REGS`). |
 | `MicroOpQueue.scala` | `bankRegs` | `rows` × `banks` | queue-shaped (few writers) | LOW | Already went through a BRAM-fold pass (task #215 Slice A/microcode ROM); this specific field may be a residual, not examined |
 
-**Reading the table:** the HIGH-risk row is the one already proven
-responsible for real critical-path violations today. Everything marked LOW
-is LOW because of *small depth*, not because the pattern is inherently safe
-— the anti-pattern is a function of `depth × writer-count × downstream logic
-depth`, and any of these could become HIGH if their depth or writer count
-grows in a future change. The RatTable hits in the slack matrix (twice in
-the top-40, small depth) are a concrete example: even an `archDepth=8` array
-shows up when its *driving* signal (`DecodeStage_logic_queue/head_reg[2]`)
-has its own deep fan-in cone — depth alone doesn't guarantee safety if the
-control signal feeding the decode is itself expensive.
+**Reading the table:** three rows are now confirmed HIGH (proven multi-
+dynamic-writer, unsafe to fold with any pattern in this codebase) as of the
+2026-08-19 audit (task #260), not just the original `faultAddrStore` row —
+`completes` and `nzvcWrStore`/`xWrStore` are the same class, one of them
+(`completes`) is structurally *worse* (7 dynamic writers). One row
+(`mispredictStore`/`branchTakenStore`/`btbIsBranchStore`/`phtValidStore`)
+moved from an optimistic MEDIUM guess to a confirmed **3-write-port
+requirement** — genuinely too many for the ≤2-port idiom, not simply
+"not yet attempted." The RatTable row carries the most important correction:
+it's not just LOW-risk-by-depth, it's a **documented, already-reverted
+prior fix** — the campaign's own history already tried and rejected a fold
+here, and the real fix for its slack-matrix appearance is elsewhere
+(`DecodeStage.scala`, task #262), not in this file at all.
+
+Everything still marked plain LOW is LOW because of *small depth AND* (where
+checked) *confirmed single-writer status* — the anti-pattern is a function
+of `depth × writer-count × downstream logic depth`, and any of these could
+become HIGH if their depth or writer count grows in a future change. The
+`Tlb.scala` row is a useful negative-result precedent: single-writer alone
+is not sufficient to justify a fold — a genuinely small array (32 entries)
+gets no synth benefit from folding regardless of writer count, because
+BRAM/LUTRAM primitives have a real minimum useful granularity well above
+that size.
 
 ## 5. Recommendations — making the core resilient, not just this gate
 
