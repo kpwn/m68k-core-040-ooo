@@ -111,12 +111,15 @@ object Bitfield {
     val extS   = (rotL.asSInt >> shAmt).asBits
     // BFFFO: field = data >> (32-width) (= extU). Scan field MSB->LSB for the first set
     // bit within the `width` MSBs; Dn2 := offset + (#leading-zero bits before first set)
-    // (= offset + width if the field is all zero). The field's `width` bits sit in
-    // extU[width-1:0]; left-justify to extU<<shAmt == rotL & maskBase so the CLZ over
-    // the top 32 bits, CLAMPED to width, gives the count. Use rotL's top `width` bits.
-    // Equivalent: clz of (extU left-justified to bit (width-1)). We left-justify the
-    // width-bit field to the MSB via (extU << (32-width)) and CLZ that, clamped to width.
-    val fieldLJ = (extU.asUInt << shAmt)(31 downto 0).asBits   // width-bit field at the top
+    // (= offset + width if the field is all zero). The field's `width` bits, left-justified
+    // to the MSB, are what stage2's CLZ (clamped to width) scans. Left-justifying is
+    // `extU << shAmt`, which is provably == `rotL & maskBase`: extU = rotL >> shAmt
+    // (logical), and (x >> s) << s == x & (0xffffffff << s) for any 32-bit x and s in
+    // 0..31 (the shift-right/shift-left round-trip zeroes exactly the low s bits — exactly
+    // what masking with maskBase = 0xffffffff<<shAmt does). Verified exhaustively over
+    // offset in 0..31 x width in 1..32 x random Dy (task #253) before making this swap;
+    // reuses the already-computed rotL/maskBase instead of a second 32-bit shift of extU.
+    val fieldLJ = (rotL.asUInt & maskBase.asUInt).asBits          // width-bit field at the top
 
     mid.dy      := cmd.dy
     mid.bfOp    := cmd.bfOp

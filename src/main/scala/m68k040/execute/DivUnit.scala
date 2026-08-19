@@ -48,14 +48,17 @@ class DivUnit extends Component {
   val signDivisor  = RegInit(False)
   val signedReg    = RegInit(False)
   val formReg      = Reg(DivForm())
-  // Divisor magnitude, latched at start (used by the divide-by-(-1) erratum check
-  // below -- see its comment). Not strictly required for correctness given io.divisor
-  // is held stable by the EU for the whole DIVING state, but latching mirrors the
-  // existing sign-capture pattern and avoids depending on that assumption.
-  val dvsrMagReg   = Reg(UInt(32 bits))
-  // Raw (pre-sign-normalize) 64-bit dividend, latched at start -- used ONLY by the
-  // L64 divide-by-(-1) erratum's exact-pattern check below (task #168).
-  val dividendReg  = Reg(UInt(64 bits))
+  // The divide-by-(-1) erratum check below (see its comment) only ever consumes 3
+  // booleans derived from the divisor magnitude / raw dividend, never the full values
+  // themselves -- so latch the booleans directly (task #253) instead of carrying the
+  // full 96 bits (32+64) of source data through registers just to re-derive them at
+  // `done`. Computed combinationally from the same io.divisor/io.dividend/io.signed
+  // this class already captures at the same `start` pulse (io.divisor/io.dividend are
+  // held stable by the EU for the whole DIVING state, same assumption the old
+  // dvsrMagReg/dividendReg registers relied on).
+  val divisorIsNegOneReg     = RegInit(False)
+  val l32DividendIsIntMinReg = RegInit(False)
+  val l64DividendIsExactReg  = RegInit(False)
 
   // Magnitudes: for signed, negate a negative operand. The dividend is a 64-bit
   // sign-extended value; the divisor is 32-bit sign-extended.
@@ -73,8 +76,9 @@ class DivUnit extends Component {
     signDivisor  := dvsrNeg
     signedReg    := io.signed
     formReg      := io.form
-    dvsrMagReg   := dvsrMag
-    dividendReg  := io.dividend
+    divisorIsNegOneReg     := io.signed && dvsrNeg && (dvsrMag === U(1, 32 bits))
+    l32DividendIsIntMinReg := io.dividend(31 downto 0) === U(0x80000000L, 32 bits)
+    l64DividendIsExactReg  := io.dividend === U(0x80000000L, 64 bits)
   }
 
   io.busy      := core.io.busy
@@ -178,13 +182,13 @@ class DivUnit extends Component {
   // now ALSO closed generally, independent of this erratum, via DIVREM's own real
   // srcA=Dr fix -- see DivEuPlugin.scala's isDivRem branch -- so an L64 overflow that
   // legitimately DOES set V, like INT64_MIN/-1, no longer deadlocks either.)
-  val divisorIsNegOne = signedReg && signDivisor && (dvsrMagReg === U(1, 32 bits))
-  val l32DividendIsIntMin = dividendReg(31 downto 0) === U(0x80000000L, 32 bits)
-  val l64DividendIsExactPattern = dividendReg === U(0x80000000L, 64 bits)   // hi=0, lo=0x80000000
+  // (divisorIsNegOneReg/l32DividendIsIntMinReg/l64DividendIsExactReg latched at `start`
+  // above -- see their declaration comment; task #253 shrunk this from two full-width
+  // source registers (96 bits) to the 3 booleans actually consumed here.)
   io.overflow := formReg.mux(
-    DivForm.W   -> (ovW && !(divisorIsNegOne && l32DividendIsIntMin)),
-    DivForm.L32 -> (ovL && !(divisorIsNegOne && l32DividendIsIntMin)),
-    DivForm.L64 -> (ovL && !(divisorIsNegOne && l64DividendIsExactPattern)))
+    DivForm.W   -> (ovW && !(divisorIsNegOneReg && l32DividendIsIntMinReg)),
+    DivForm.L32 -> (ovL && !(divisorIsNegOneReg && l32DividendIsIntMinReg)),
+    DivForm.L64 -> (ovL && !(divisorIsNegOneReg && l64DividendIsExactReg)))
 
   io.done := core.io.done
 }
