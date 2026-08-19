@@ -486,21 +486,46 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val legacyValid = RegInit(False)
     val legacyResult = Reg(CplxResult())
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Shared bound-operand sign-extension (task #256): CHK is mathematically CMP2
+    // with the lower bound hardwired to 0 -- its "Dn" (checked value) occupies the
+    // exact s1A slot CMP2/CHK2's lower bound does, and its "bound" (upper limit)
+    // occupies the exact s1B slot CMP2/CHK2's upper bound does. Both instructions
+    // sign-extend that slot by the SAME per-size rule (BYTE is unreachable for CHK,
+    // which never decodes with size=BYTE, so its arm is simply dead code on that
+    // path, not a behavior change). Since isChk/isCmp2 are mutually exclusive (one
+    // op occupies S1 at a time) this was previously TWO fully redundant 32-bit
+    // sign-extend cones computed in parallel every cycle regardless of which op (if
+    // either) was actually in S1; folding them into one physical cone removes that
+    // duplication (~20-50 LUT) with no numeric change on either path -- verified
+    // against the real 68040 PRM: CHK traps iff Dn<0 || Dn>bound, CMP2/CHK2 traps
+    // (CHK2 only) iff compare is outside [lower,upper], and CHK IS that formula with
+    // lower==0. What is genuinely NOT shared (kept fully separate below, per-op):
+    // the trap/flag COMPOSITION -- CHK's Z is (Dn==0) and it OVERWRITES all of NZVC,
+    // while CMP2/CHK2's Z is (compare==lower||compare==upper) and it's an RMW that
+    // PRESERVES old N/V -- and CMP2/CHK2's compared value (`c2Compare`, from s1H)
+    // has its own adReg-dependent zero/sign-extend that CHK has no equivalent of.
+    // Fault-vector wiring was checked too and needs NO unification: it was already
+    // shared correctly pre-existing -- CHK and CHK2 both raise vector 6 (M68000 PRM
+    // exception-vector table: "6 -- CHK, CHK2 Instruction", a single shared vector,
+    // not two different ones) via the same `captureFault` helper, and both mark
+    // `faultUsesNextPc := True` at assembly (MicroOpAssembler.scala:746 for CHK,
+    // :3058 for CMP2CHK2) since both are group-2/format-$2 traps that stack the
+    // NEXT instruction's PC.
+    def boundExtend(v: Bits): SInt = u1.size.mux(
+      Size.BYTE -> v( 7 downto 0).asSInt.resize(32),
+      Size.WORD -> v(15 downto 0).asSInt.resize(32),
+      default   -> v.asSInt)
+    val boundLo = boundExtend(s1A)   // CHK: Dn (checked value).   CMP2/CHK2: lower bound.
+    val boundHi = boundExtend(s1B)   // CHK: bound (upper limit).  CMP2/CHK2: upper bound.
+
     // ---- CHK compare (single-cycle) ----
     // CHK.W compares the low 16 bits (sign-extended); CHK.L the full 32. Trap
     // (vector 6) iff Dn<0 || Dn>bound. CHK writes no register, but DOES commit a
     // full NZVC every execution (both trap and no-trap paths) — see chkNzvc below.
     val isChk = u1.op === DecOp.CHK
-    val chkDn = u1.size.mux(
-      Size.WORD -> s1A(15 downto 0).asSInt.resize(32),
-      Size.LONG -> s1A.asSInt,
-      default   -> s1A.asSInt)
-    val chkBound = u1.size.mux(
-      Size.WORD -> s1B(15 downto 0).asSInt.resize(32),
-      Size.LONG -> s1B.asSInt,
-      default   -> s1B.asSInt)
-    val chkNeg   = chkDn < 0
-    val chkOver  = chkDn > chkBound
+    val chkNeg   = boundLo < 0
+    val chkOver  = boundLo > boundHi
     val chkTrap  = chkNeg || chkOver
     // N flag per the rule: N=1 if Dn<0, N=0 otherwise (incl. Dn>bound and in-bounds).
     // Z = (Dn==0) — Musashi's m68k_op_chk_{16,32}_d: `FLAG_Z = ZFLAG_16/32(src)`, set
@@ -510,7 +535,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // genuinely always 0 (also "Undocumented" in Musashi, confirmed unconditional).
     // CHK ALWAYS commits this NZVC (even on the trap path, so the stacked CCR matches).
     val chkN     = chkNeg
-    val chkZ     = chkDn === 0
+    val chkZ     = boundLo === 0
     val chkNzvc  = (chkN ## chkZ ## False ## False).asBits   // N Z V(0) C(0)
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -525,14 +550,8 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // CCR RMW = {oldN, Z, oldV, C} (preserve N/V; readsNzvc/writesNzvc). CHK2 (isChk2)
     // raises EuFault{vec6} on C (out-of-bounds); CMP2 never traps.
     val isCmp2 = u1.op === DecOp.CMP2CHK2
-    val c2Lower = u1.size.mux(
-      Size.BYTE -> s1A( 7 downto 0).asSInt.resize(32),
-      Size.WORD -> s1A(15 downto 0).asSInt.resize(32),
-      default   -> s1A.asSInt)
-    val c2Upper = u1.size.mux(
-      Size.BYTE -> s1B( 7 downto 0).asSInt.resize(32),
-      Size.WORD -> s1B(15 downto 0).asSInt.resize(32),
-      default   -> s1B.asSInt)
+    val c2Lower = boundLo
+    val c2Upper = boundHi
     // compare (Rn): mask to size; then for .B/.W, sign-extend ONLY when adReg==False
     // (data reg). For an address reg (.B/.W) it stays masked (zero-extended -> positive).
     // .L is the full 32 bits regardless of adReg.
