@@ -125,6 +125,11 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // wired defaults to False (user), exactly the prior hardcoded behavior — unchanged
     // for every existing non-full-core test.
     val privCtrl = host.get[PrivilegeService]
+    // Task #195: TCR.P (8KB pages) — same optional-host pattern as `privCtrl` above.
+    // A standalone I-cache DUT with no MmuControlPlugin wired defaults to False (4K
+    // pages, the pre-#195 behavior, unchanged).
+    val mmuCtrl = host.get[m68k040.services.MmuControlService]
+    val is8K = mmuCtrl.map(_.pageSize8K).getOrElse(False)
     // A translation is demanded only while the cache is actively looking at a real
     // offered fetch. In particular, a cmd held upstream during a demand refill must
     // not start an unowned younger walk merely because its Stream valid stays high.
@@ -205,7 +210,15 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // Translation only qualifies the physical tag and the small S1 control context;
     // it is deliberately NOT on the BRAM address/enable or the wide data mux.
     val lookupPc        = cmdPort.payload.pc
-    val lookupPaddr     = (xlate.rsp.ppn ## lookupPc(11 downto 0)).asUInt
+    // Task #195: same PPN/offset-width split as LsEuPlugin's `s1Paddr` — 12-bit
+    // offset (ppn's LSB is the real PA bit) for 4K pages, 13-bit offset (ppn's LSB
+    // is architecturally undefined for 8K pages per the MC68040 UM — PA[12] comes
+    // straight from the untranslated PC instead) for 8K pages. `is8K` is a plain
+    // control-register read, same shape/cost as `xlate.rsp.cacheMode` already
+    // consumed on this exact cycle below.
+    val lookupPaddr     = Mux(is8K,
+      (xlate.rsp.ppn(19 downto 1) ## lookupPc(12 downto 0)).asUInt,
+      (xlate.rsp.ppn ## lookupPc(11 downto 0)).asUInt)
     val lookupFault     = xlate.rsp.fault
     val lookupCmode     = xlate.rsp.cacheMode
     val lookupCacheable = lookupCmode =/= CacheMode.INHIBITED

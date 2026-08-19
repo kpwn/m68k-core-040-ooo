@@ -30,6 +30,7 @@ class TableWalkerSpec extends AnyFunSuite {
     val rootPtr    = in UInt (32 bits)
     val isWrite    = in Bool ()
     val isSuper    = in Bool ()
+    val is8K       = in Bool ()   // task #195
     val busy = out Bool ()
     val done = out Bool ()
     val fault = out Bool ()
@@ -48,6 +49,7 @@ class TableWalkerSpec extends AnyFunSuite {
     walker.io.req.rootPtr := rootPtr
     walker.io.req.isWrite := isWrite
     walker.io.req.isSuper := isSuper
+    walker.io.req.is8K    := is8K
     busy := walker.io.busy
     done := walker.io.done
     fault := walker.io.rsp.fault
@@ -83,6 +85,10 @@ class TableWalkerSpec extends AnyFunSuite {
   def ptrIdx(va: Long): Int  = ((va >> 18) & 0x7f).toInt
   def pageIdx(va: Long): Int = ((va >> 12) & 0x3f).toInt
   def vpnOf(va: Long): Long  = (va >> 12) & 0xfffff
+  // Task #195: VA fields for an 8 KB page: root(7)|ptr(7)|page(5)|offset(13) —
+  // MC68040 UM S3.1.2/Fig 3-9. root/ptr indices are IDENTICAL to the 4K functions
+  // above (unaffected by page size); only the page index narrows by one bit.
+  def pageIdx8K(va: Long): Int = ((va >> 13) & 0x1f).toInt
 
   /** Build a resident 3-level table for `va` mapping to `ppn`, with the given page
     * descriptor low byte (PDT/W/U/M/...). Returns the page descriptor's byte address. */
@@ -106,11 +112,34 @@ class TableWalkerSpec extends AnyFunSuite {
     pageAddr
   }
 
-  def runWalk(dut: Dut, cd: ClockDomain, va: Long, isWrite: Boolean, isSuper: Boolean): Unit = {
+  /** Task #195: the SAME table build as `buildTable`, but the leaf page descriptor
+    * is placed at the 8K-mode page index (5-bit PGI, VA[17:13]) instead of the 4K
+    * one — root/pointer levels are identical (index widths don't depend on page
+    * size). Returns the page descriptor's byte address. */
+  def buildTable8K(mem: BehavioralMemAgent, va: Long, ppn: Long,
+                   pageWp: Boolean = false, pageSuper: Boolean = false,
+                   pageInhibited: Boolean = false, pageResident: Boolean = true): Long = {
+    val rootDesc = (PTRT & 0xfffffff0L) | 0x3L
+    pokeWordLE(mem, ROOT + rootIdx(va) * 4, rootDesc)
+    val ptrDesc = (PAGT & 0xfffffff0L) | 0x3L
+    pokeWordLE(mem, PTRT + ptrIdx(va) * 4, ptrDesc)
+    var pd = (ppn << 12) & 0xfffff000L
+    if (pageResident) pd |= 0x1L else pd |= 0x0L
+    if (pageWp) pd |= 0x4L
+    if (pageInhibited) pd |= (0x2L << 5)
+    if (pageSuper) pd |= 0x80L
+    val pageAddr = PAGT + pageIdx8K(va) * 4
+    pokeWordLE(mem, pageAddr, pd)
+    pageAddr
+  }
+
+  def runWalk(dut: Dut, cd: ClockDomain, va: Long, isWrite: Boolean, isSuper: Boolean,
+             is8K: Boolean = false): Unit = {
     dut.vpn     #= vpnOf(va)
     dut.rootPtr #= ROOT
     dut.isWrite #= isWrite
     dut.isSuper #= isSuper
+    dut.is8K    #= is8K
     dut.start   #= true
     cd.waitSampling()
     dut.start   #= false
@@ -125,7 +154,7 @@ class TableWalkerSpec extends AnyFunSuite {
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       val mem = new BehavioralMemAgent(dut.mAxi, cd)
-      dut.start #= false; dut.isWrite #= false; dut.isSuper #= false
+      dut.start #= false; dut.isWrite #= false; dut.isSuper #= false; dut.is8K #= false
       dut.vpn #= 0; dut.rootPtr #= 0
       cd.waitSampling(4)
 
@@ -188,6 +217,44 @@ class TableWalkerSpec extends AnyFunSuite {
       // low byte 0x01 -> set U (0x08) and M (0x10) -> 0x19
       assert((dut.umByte.toInt & 0xff) == 0x19, f"U+M byte=0x${dut.umByte.toInt}%x expected 0x19")
       assert(dut.umAddr.toLong == pAddr + 3, "U/M-write addr = page descriptor low byte")
+    }
+  }
+
+  // Task #195: TCR.P=1 (8KB pages) — the pointer->page-table offset uses a 5-bit
+  // page index (VA[17:13]), NOT the 4K 6-bit one (VA[17:12]). va8k is chosen so the
+  // two indices genuinely diverge (8K index=1, 4K-style index=3): a "decoy"
+  // descriptor is planted at the WRONG (4K-style) slot with a different PPN, so a
+  // regression back to the hardcoded-4K walk would read the decoy and fail loudly
+  // instead of silently coincidentally passing.
+  test("8K-page walk (TCR.P=1) reads the 5-bit page index, not the 4K 6-bit one", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new BehavioralMemAgent(dut.mAxi, cd)
+      dut.start #= false; dut.isWrite #= false; dut.isSuper #= false; dut.is8K #= false
+      dut.vpn #= 0; dut.rootPtr #= 0
+      cd.waitSampling(4)
+
+      val va8k = 0x00803000L
+      assert(pageIdx8K(va8k) == 1 && pageIdx(va8k) == 3,
+        "test fixture assumption: 8K/4K page indices must diverge for this VA")
+      // Decoy at the 4K-style (WRONG, for this mode) slot — a walker that ignored
+      // is8K would read THIS descriptor and report ppn=0xBADBAD.
+      buildTable(mem, va8k, ppn = 0xBADBAL, pageResident = false)
+      // Real 8K descriptor at the correct 5-bit-PGI slot.
+      buildTable8K(mem, va8k, ppn = 0x9E9E0L)
+      runWalk(dut, cd, va8k, isWrite = false, isSuper = false, is8K = true)
+      assert(!dut.fault.toBoolean, "resident 8K page must not fault")
+      assert(dut.ppn.toLong == 0x9E9E0L,
+        f"ppn=0x${dut.ppn.toLong}%x expected 0x9E9E0 (8K page index) -- " +
+        f"a value of 0xBADBA would mean the walker used the 4K page index instead")
+
+      // Sanity: is8K=false against the SAME va8k must resolve through the decoy
+      // slot instead (proves the Mux genuinely branches both ways, not just
+      // "always 8K now").
+      runWalk(dut, cd, va8k, isWrite = false, isSuper = false, is8K = false)
+      assert(dut.fault.toBoolean, "4K-mode walk of va8k must hit the non-resident decoy")
+      assert(dut.faultReason.toEnum == MmuFaultReason.NON_RESIDENT)
     }
   }
 }

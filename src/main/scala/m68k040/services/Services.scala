@@ -190,6 +190,12 @@ trait MmuControlService {
   def itt1: UInt
   def dtt0: UInt
   def dtt1: UInt
+  // TCR.P (task #195): real MC68040 page-size bit (TCR bit 14, MC68040 UM Fig 3-4).
+  // False = 4KB pages (reset/legacy default — every pre-#195 test is unaffected),
+  // True = 8KB pages. Consulted by the table walker (pointer->page offset width),
+  // the DTLB/ITLB (VA[12] excluded from the TLB tag/index compare in 8K mode), and
+  // the two out-of-mmu/ PA-reconstruction sites (LsEuPlugin, IcachePlugin).
+  def pageSize8K: Bool
   // MMUSR (task #198): PTEST's result register — MOVEC Rc id 0x805, read-only from the
   // arch side (no MOVEC write case; real hardware has none either). Written at PTEST's
   // S_APPLY (ExceptionUnit) via `setMmusr`.
@@ -197,6 +203,7 @@ trait MmuControlService {
 
   // ── commit-time write ports (driven from ExceptionUnit's MOVEC S_APPLY case) ──
   def setEnable: Flow[Bool]
+  def setPageSize: Flow[Bool]
   def setUrp: Flow[UInt]
   def setSrp: Flow[UInt]
   def setItt0: Flow[UInt]

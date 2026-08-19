@@ -4,15 +4,27 @@ import m68k040.cache.CacheMode
 import spinal.core._
 
 /** 68040 MMU descriptor formats + virtual-address field decomposition for the
-  * D-side hardware table walker (4 KB pages, long-format descriptors only — the
-  * only format the 68040 uses).
+  * D-side hardware table walker (long-format descriptors only — the only format
+  * the 68040 uses). Task #195: both real MC68040 page sizes are supported, gated
+  * by TCR.P (`MmuControlService.pageSize8K`) — root/pointer index widths (7/7 bits)
+  * never change; only the pointer->page-table boundary shifts by one bit.
   *
-  * === Virtual address (4 KB pages) ===
+  * === Virtual address (4 KB pages, TCR.P=0) ===
   *   VA[31:25] root index   (7 bits, 128 root-table entries)
   *   VA[24:18] pointer index(7 bits, 128 pointer-table entries)
   *   VA[17:12] page index   (6 bits,  64 page-table entries)
   *   VA[11:0]  page offset   (12 bits)
   * (7 + 7 + 6 + 12 = 32; matches the m68040 PRM TIA/TIB/TIC = 7/7/6 for 4 KB.)
+  *
+  * === Virtual address (8 KB pages, TCR.P=1) ===
+  *   VA[31:25] root index   (7 bits, 128 root-table entries)
+  *   VA[24:18] pointer index(7 bits, 128 pointer-table entries)
+  *   VA[17:13] page index   (5 bits,  32 page-table entries)
+  *   VA[12:0]  page offset   (13 bits)
+  * (7 + 7 + 5 + 13 = 32; MC68040 UM S3.1.2/Fig 3-9. The page descriptor's upper 19
+  * bits are the PPN; descriptor bit 12 is architecturally undefined in this mode —
+  * PA[12] instead comes straight from the untranslated VA[12], same as any other
+  * offset bit.)
   *
   * === Long-format TABLE descriptor (root & pointer levels, 32 bits) ===
   *   [1:0]  UDT  (upper-level descriptor type): 00,01 = INVALID; 10,11 = RESIDENT
@@ -78,6 +90,11 @@ case class WalkReq() extends Bundle {
   val rootPtr    = UInt(32 bits)   // URP/SRP base
   val isWrite    = Bool()
   val isSuper    = Bool()
+  // TCR.P (task #195): 8KB-page mode for THIS walk (latched by the owning TLB
+  // plugin at miss-capture time, mirroring isWrite/isSuper). Only the pointer->page
+  // offset computation (5-bit vs 6-bit PGI) reads this — root/pointer index widths
+  // are always 7 bits regardless of page size (MC68040 UM S3.1.2).
+  val is8K       = Bool()
 }
 
 /** Walker result: the translated PPN + accumulated perms + fault flag, plus up to

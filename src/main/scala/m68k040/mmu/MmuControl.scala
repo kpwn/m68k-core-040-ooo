@@ -53,6 +53,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   * full 763-test ported corpus (see task #194's commit messages / report). */
 class MmuControlPlugin extends FiberPlugin with MmuControlService {
   var _mmuEnable: Bool = null
+  var _pageSize8K: Bool = null
   var _urp:       UInt = null
   var _srp:       UInt = null
   var _itt0:      UInt = null
@@ -62,6 +63,7 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
   var _mmusr:     UInt = null
 
   var _setEnable: Flow[Bool] = null
+  var _setPageSize: Flow[Bool] = null
   var _setUrp:    Flow[UInt] = null
   var _setSrp:    Flow[UInt] = null
   var _setItt0:   Flow[UInt] = null
@@ -71,6 +73,7 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
   var _setMmusr:  Flow[UInt] = null
 
   override def mmuEnable: Bool = _mmuEnable
+  override def pageSize8K: Bool = _pageSize8K
   override def urp:       UInt = _urp
   override def srp:       UInt = _srp
   override def itt0:      UInt = _itt0
@@ -80,6 +83,7 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
   override def mmusr:     UInt = _mmusr
 
   override def setEnable: Flow[Bool] = _setEnable
+  override def setPageSize: Flow[Bool] = _setPageSize
   override def setUrp:    Flow[UInt] = _setUrp
   override def setSrp:    Flow[UInt] = _setSrp
   override def setItt0:   Flow[UInt] = _setItt0
@@ -92,6 +96,11 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
     // The control regs. RegInit/Reg-init so a standalone DUT (no external driver)
     // elaborates with no UNASSIGNED REGISTER; sim pokes override.
     val mmuEnable = RegInit(False); mmuEnable.simPublic()
+    // TCR.P (task #195): real MC68040 page-size bit (TCR bit 14). RegInit(False) =
+    // 4KB pages, matching the architectural TCR-undefined-out-of-reset case treated
+    // as the pre-#195 hardcoded behavior — every existing MMU test stays bit-for-bit
+    // identical until software explicitly writes TCR.P=1 via MOVEC.
+    val pageSize8K = RegInit(False); pageSize8K.simPublic()
     val urp = Reg(UInt(32 bits)) init 0; urp.simPublic()
     val srp = Reg(UInt(32 bits)) init 0; srp.simPublic()
     val itt0 = Reg(UInt(32 bits)) init 0; itt0.simPublic()
@@ -106,6 +115,7 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
     // ── commit-time write ports (mirrors SystemState's setVbr/setUsp/setCacr/setItt0
     // pattern exactly: Flow, allowOverride, default-idle, a single `when` writer). ──
     val setEnable = Flow(Bool())
+    val setPageSize = Flow(Bool())
     val setUrp    = Flow(UInt(32 bits))
     val setSrp    = Flow(UInt(32 bits))
     val setItt0   = Flow(UInt(32 bits))
@@ -115,6 +125,8 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
     val setMmusr  = Flow(UInt(32 bits))
     setEnable.valid.allowOverride; setEnable.valid := False; setEnable.payload.allowOverride; setEnable.payload := False
     setEnable.valid.simPublic(); setEnable.payload.simPublic()
+    setPageSize.valid.allowOverride; setPageSize.valid := False; setPageSize.payload.allowOverride; setPageSize.payload := False
+    setPageSize.valid.simPublic(); setPageSize.payload.simPublic()
     setUrp.valid.simPublic()
     setUrp.valid.allowOverride;    setUrp.valid := False;    setUrp.payload.allowOverride;    setUrp.payload := U(0, 32 bits)
     setSrp.valid.allowOverride;    setSrp.valid := False;    setSrp.payload.allowOverride;    setSrp.payload := U(0, 32 bits)
@@ -125,6 +137,7 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
     setMmusr.valid.allowOverride;  setMmusr.valid := False;  setMmusr.payload.allowOverride;  setMmusr.payload := U(0, 32 bits)
 
     when(setEnable.valid) { mmuEnable := setEnable.payload }
+    when(setPageSize.valid) { pageSize8K := setPageSize.payload }
     when(setUrp.valid)    { urp  := setUrp.payload }
     when(setSrp.valid)    { srp  := setSrp.payload }
     when(setItt0.valid)   { itt0 := setItt0.payload }
@@ -134,6 +147,7 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
     when(setMmusr.valid)  { mmusr := setMmusr.payload }
 
     _mmuEnable = mmuEnable
+    _pageSize8K = pageSize8K
     _urp = urp
     _srp = srp
     _itt0 = itt0
@@ -142,6 +156,7 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
     _dtt1 = dtt1
     _mmusr = mmusr
     _setEnable = setEnable
+    _setPageSize = setPageSize
     _setUrp = setUrp
     _setSrp = setSrp
     _setItt0 = setItt0

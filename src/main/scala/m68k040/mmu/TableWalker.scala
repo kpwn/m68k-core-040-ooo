@@ -6,7 +6,8 @@ import spinal.lib._
 import spinal.lib.bus.amba4.axi.{Axi4, Axi4Config, Axi4ReadOnly}
 import spinal.lib.fsm._
 
-/** 68040 hardware 3-level table walker (4 KB pages, long-format descriptors).
+/** 68040 hardware 3-level table walker (4KB or 8KB pages per TCR.P, task #195;
+  * long-format descriptors).
   *
   * On `start`, walks: root[VAroot] -> pointer[VAptr] -> page[VApage], issuing three
   * dependent single-beat AXI reads from the root pointer + VA index slices, then
@@ -166,7 +167,14 @@ class TableWalker extends Component {
         } otherwise {
           accWriteProt := accWriteProt | MmuDesc.tblWriteProt(d)
           val base = MmuDesc.tblNextBase(d)
-          val off  = (reqReg.vpn(5 downto 0) ## U(0, 2 bits)).asUInt       // pageIdx(6)*4
+          // Task #195: pointer->page-table offset = PGI*4, but PGI itself is 6 bits
+          // (VA[17:12]) for 4K pages vs 5 bits (VA[17:13]) for 8K pages — VA[12]
+          // (vpn(0)) moves from "top bit of the page index" to "top bit of the page
+          // offset" when TCR.P=1. Both branches are computed to the SAME 8-bit width
+          // (zero-extended) so the Mux/resize below is unaffected by page size.
+          val off4k = (reqReg.vpn(5 downto 0) ## U(0, 2 bits)).asUInt         // pageIdx(6)*4
+          val off8k = (U(0, 1 bits) ## reqReg.vpn(5 downto 1) ## U(0, 2 bits)).asUInt // pageIdx(5)*4
+          val off   = Mux(reqReg.is8K, off8k, off4k)
           descAddr := base + off.resize(32)
           arSent := False
           goto(RD_PAGE)

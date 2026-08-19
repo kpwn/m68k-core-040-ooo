@@ -217,6 +217,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // test-harness special case.
     val mmuCtrl2  = host.get[m68k040.services.MmuControlService]
     val cacheCtrl = host.get[m68k040.services.CacheControlService]
+    // Task #195: TCR.P (8KB pages) — read the SAME way `fastStore` reads mmuEnable
+    // just below: a standalone LS-EU DUT with no MmuControlPlugin wired (most
+    // existing directed LS tests) defaults to False (4K pages), the pre-#195
+    // behavior, unchanged.
+    val is8K = mmuCtrl2.map(_.pageSize8K).getOrElse(False)
 
     // exc-arbitration inputs default-idle (allowOverride): a DUT that doesn't wire
     // the exception unit (standalone LS tests) sees excActive=False -> the LS EU
@@ -519,15 +524,29 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // tagged response. On a DTLB miss the response Stream remains invalid while the
     // walker runs; P2T holds the matching context and P2 may retain one younger op.
     // (request drivers are set after the stage controls are declared below.)
-    val s1Paddr = (xlate.rsp.payload.ppn ## txCtx.vaddr(11 downto 0)).asUInt
+    // Task #195: PA = PPN ## page-offset, but the offset is 12 bits (VA[11:0]) for
+    // 4K pages and 13 bits (VA[12:0]) for 8K pages — VA[12] moves from "PPN's LSB"
+    // to "top bit of the offset" when TCR.P=1. The 8K-mode PPN slice drops
+    // `ppn(0)` (the raw page descriptor's bit 12, architecturally undefined for 8K
+    // pages per the MC68040 UM — PA[12] instead comes straight from the
+    // untranslated VA[12], same as any other offset bit). `is8K` is a plain
+    // MmuControlPlugin register read (same cost/shape as `mmuEnable` already read
+    // on this same cone below); this Mux is a static width-select on an existing
+    // combinational concat that already registers into `p3Ctx` the next cycle —
+    // it adds no new pipeline stage.
+    val s1Paddr = Mux(is8K,
+      (xlate.rsp.payload.ppn(19 downto 1) ## txCtx.vaddr(12 downto 0)).asUInt,
+      (xlate.rsp.payload.ppn ## txCtx.vaddr(11 downto 0)).asUInt)
     // Slot-B (split-access second half) translated physical address: SAME `xlate.rsp`
     // port, combined with addrB's OWN page offset (not s1Va's — a line-crossing split
-    // stays within the same page but at a different 12-bit offset; only a page-
-    // crossing split shares offset 0). Only meaningful the cycle the LIVE xlate
-    // request/response actually corresponds to addrB's VPN (the new XLATE_B FSM
-    // state below arms this via `xlateBArm` -> `xlateVaddr`, mirroring exactly how
-    // `s1Paddr` above is only meaningful while IDLE is resolving slot A's request).
-    val s1PaddrB = (xlate.rsp.payload.ppn ## txCtx.addrB(11 downto 0)).asUInt
+    // stays within the same page but at a different offset; only a page-crossing
+    // split shares offset 0). Only meaningful the cycle the LIVE xlate request/
+    // response actually corresponds to addrB's VPN (the XLATE_B FSM state below arms
+    // this via `xlateBArm` -> `xlateVaddr`, mirroring exactly how `s1Paddr` above is
+    // only meaningful while IDLE is resolving slot A's request).
+    val s1PaddrB = Mux(is8K,
+      (xlate.rsp.payload.ppn(19 downto 1) ## txCtx.addrB(12 downto 0)).asUInt,
+      (xlate.rsp.payload.ppn ## txCtx.addrB(11 downto 0)).asUInt)
     val xlateReady = xlate.rsp.valid
     val xlateFault = xlate.rsp.payload.fault
 

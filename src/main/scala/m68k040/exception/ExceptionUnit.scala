@@ -1819,8 +1819,9 @@ class ExceptionUnit(
             sysRegWriteValid := True
             sysRegWritePhys  := sysCapDstPhys
             // Rc id: VBR=0x801, USP=0x800, SFC=0x000, DFC=0x001 (3-bit, zero-extended),
-            // CACR=0x002 (RAZ), TCR=0x003 (E bit only — bit 15; P/page-size + other
-            // bits RAZ, this core is 4K-pages-only), URP=0x806, SRP=0x807,
+            // CACR=0x002 (RAZ), TCR=0x003 (E=bit15, P/page-size=bit14 — task #195, the
+            // real MC68040 TCR format, MC68040 UM Fig 3-4; bits 13:0 RAZ), URP=0x806,
+            // SRP=0x807,
             // MSP=0x803, ISP=0x804 (task #170-cluster10: MSP/ISP banking itself already
             // works via the S/M-bit A7 Mux -- ss.msp/ss.isp ARE the real committed
             // registers backing it -- but they were not yet separately MOVEC-addressable;
@@ -1837,7 +1838,8 @@ class ExceptionUnit(
               U(0x804, 12 bits) -> ss.isp,
               U(0x000, 12 bits) -> ss.sfc.resize(32),
               U(0x001, 12 bits) -> ss.dfc.resize(32),
-              U(0x003, 12 bits) -> Mux(mmuCtrl.mmuEnable, U(0x8000, 32 bits), U(0, 32 bits)),
+              U(0x003, 12 bits) -> (Mux(mmuCtrl.mmuEnable, U(0x8000, 32 bits), U(0, 32 bits)) |
+                                    Mux(mmuCtrl.pageSize8K, U(0x4000, 32 bits), U(0, 32 bits))),
               U(0x002, 12 bits) -> ss.cacr,
               U(0x004, 12 bits) -> mmuCtrl.itt0,
               U(0x005, 12 bits) -> mmuCtrl.itt1,
@@ -1863,10 +1865,16 @@ class ExceptionUnit(
               // only the storage/round-trip half was missing).
               is(U(0x002, 12 bits)) { ss.setCacr.valid := True; ss.setCacr.payload := sysCapVal.asUInt }
               // TCR (0x003), task #194 (revives task #131's reverted attempt — see
-              // MmuControlPlugin's doc comment for why this is now believed safe):
-              // only the E (enable) bit, TCR bit 15, is modeled (this core is
-              // 4K-pages-only — P/page-size + other bits are don't-cares, WI).
-              is(U(0x003, 12 bits)) { mmuCtrl.setEnable.valid := True; mmuCtrl.setEnable.payload := sysCapVal(15) }
+              // MmuControlPlugin's doc comment for why this is now believed safe).
+              // Task #195: TCR bit 14 (P, page size — MC68040 UM Fig 3-4: 0=4KB,
+              // 1=8KB) is now captured too, not discarded — previously this core
+              // silently walked every TCR=8K-page program as 4K pages (a real
+              // mistranslation, not a fault/reject), the root cause of that task.
+              // Bits 13:0 stay WI (real hardware: reserved, must be written zero).
+              is(U(0x003, 12 bits)) {
+                mmuCtrl.setEnable.valid   := True; mmuCtrl.setEnable.payload   := sysCapVal(15)
+                mmuCtrl.setPageSize.valid := True; mmuCtrl.setPageSize.payload := sysCapVal(14)
+              }
               // ITT0/ITT1 (0x004/0x005) and DTT0/DTT1 (0x006/0x007), task #194: real,
               // FUNCTIONAL transparent-translation registers (TtMatch, consumed by
               // ItlbPlugin/DtlbPlugin to bypass the walker for a covered region) —
@@ -1962,8 +1970,13 @@ class ExceptionUnit(
           // U1/S/CM/M/W/T) reads 0 (no real translation-fault/write-protect/CM
           // probing modeled). sysCapVal carries An's value (write direction, exactly
           // like MOVE_USP's An->USP arm — see MicroOpAssembler's PTEST case).
+          // Task #195: the page mask itself is TCR.P-dependent (0xFFFFF000 for 4K,
+          // 0xFFFFE000 for 8K) — previously hardcoded 4K-only, dormant only because
+          // the ported corpus's ptest_w_an only exercises the MMU-disabled identity
+          // case (page mask is irrelevant there; PA=VA regardless of mask).
+          val ptestPageMask = Mux(mmuCtrl.pageSize8K, U(0xFFFFE000L, 32 bits), U(0xFFFFF000L, 32 bits))
           mmuCtrl.setMmusr.valid   := True
-          mmuCtrl.setMmusr.payload := (sysCapVal.asUInt & U(0xFFFFF000L, 32 bits)) | U(1, 32 bits)
+          mmuCtrl.setMmusr.payload := (sysCapVal.asUInt & ptestPageMask) | U(1, 32 bits)
         }
         is(skOrd(m68k040.decode.SysKind.FMOVE_FPCTRL)) { // FMOVE(M) <ea> <-> FPCR/FPSR/FPIAR
           // sysCapRc[2:0] is the register-select mask {FPCR, FPSR, FPIAR} (ext[12:10],
