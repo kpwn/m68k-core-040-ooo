@@ -3143,7 +3143,7 @@ object MicroOpAssembler {
               writesNzvc: Bool = False, writesX: Bool = False,
               op: DecOp.C = DecOp.MOVE, divIsRem: Bool = False,
               eaAuto: EaAuto.C = EaAuto.NONE, eaDelta: UInt = U(0, 3 bits),
-              keepCommit: Bool = False): DecodedUop = {
+              keepCommit: Bool = False, movesAliasStore: Bool = False): DecodedUop = {
       val u = DecodedUop()
       u.fpInert()
       u.valid := pkt.valid; u.pc := pkt.pc; u.nextPc := nextPc
@@ -3166,7 +3166,7 @@ object MicroOpAssembler {
       u.isChk2 := False
       u.shiftOp := 0; u.shiftDir := False; u.isMovea := False; u.isScc := False; u.isDbcc := False; u.extByte := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.bcdSub := False
       u.indexLong := False; u.indexScale := 0
-      u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := keepCommit
+      u.leaAddr := False; u.movesAliasStore := movesAliasStore; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := keepCommit
       u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
       u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
@@ -3289,13 +3289,31 @@ object MicroOpAssembler {
     //                   + [An := A7-disp (kept)].
     // µop0: a stkPush whose base/dst is A7 (predecrement A7 := A7-4) but whose store DATA
     // is the OLD An (srcB) — the LsEu data0 mux selects the register when srcBValid.
+    //
+    // LINK A7,#d SPECIAL CASE (PRM §4.133: `SP-4->SP ; An->(SP) ; SP->An ; SP+d->SP`,
+    // decrement FIRST): when An IS A7 both "An" and the predecremented "SP" are the SAME
+    // register, so:
+    //   - the pushed value must be the ALREADY-decremented A7 (A7_old-4), not a stale
+    //     register read of "old An" (srcB reads A7 as of BEFORE this µop's own A7-4
+    //     write, i.e. the pre-decrement value — wrong for the aliased case). Reuse the
+    //     MOVES store-data-aliasing mux (`movesAliasStore`, see LsEuPlugin.s1StoreData):
+    //     it substitutes the µop's own computed EA (s1Va = A7_old-4 for this stkPush) as
+    //     the store data instead of the raw register read — exactly the value PRM wants.
+    //   - `SP->An` is then a no-op (An already IS SP), so the trailing "+d" from linkA7
+    //     must NOT be undone by linkAnU's usual "An := A7_current - disp" (that formula
+    //     recovers the PRE-"+d" SP for a genuinely separate An — subtracting disp back off
+    //     A7 when An=A7 would cancel linkA7's own +d). Feed imm=0 instead of negDisp so
+    //     linkAnU degenerates to `A7 := A7_current` (an identity MOVE), landing on
+    //     A7_old-4+d — the correct final aliased result.
+    val linkIsA7 = (linkAn === U(A7, 5 bits))
     val linkPush = mkUop(cluster = Cluster.LS, memOp = MemOp.STORE, stkPush = True,
                          srcAReg = U(A7, 5 bits), srcAValid = True,   // base A7 (addr = A7-4)
                          srcBReg = linkAn,        srcBValid = True,    // store data = old An
                          dstReg  = U(A7, 5 bits), dstValid  = True,    // A7 := A7-4
-                         first = True)
+                         first = True,
+                         movesAliasStore = linkIsA7)  // An==A7: push the computed EA, not srcB
     val linkA7  = addUop(U(A7, 5 bits), linkDisp.asBits, U(A7, 5 bits), first = False, drop = True)
-    val linkAnU = addUop(U(A7, 5 bits), negDisp,         linkAn,        first = False, drop = False)
+    val linkAnU = addUop(U(A7, 5 bits), Mux(linkIsA7, B(0, 32 bits), negDisp), linkAn, first = False, drop = False)
 
     // UNLK An — [load.l (An) -> T0] + [A7 := An+4 (drop)] + [An := T0 (kept MOVE)].
     // load.l (An + 0) -> T0 (the saved frame value). An is a hardware UInt (not a Scala
