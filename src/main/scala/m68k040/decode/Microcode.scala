@@ -2404,6 +2404,21 @@ object Microcode {
     // Packed FP-issue command word (see SFpCmd above): opmode[6:0] | dstFp[2:0]<<7 |
     // srcSpec[2:0]<<10. Harmless (unread) for every other microcode customer.
     val fpCmd = Bits(32 bits)
+    // Task #228: the RAW 16-bit FP extension word (`ucFpExt` = words(1)) of a memory-source
+    // cpGEN instruction that DecodeStage's `ucFpMemBad` routed to `FP_MEM_TRAP_ENTRY` (wrong
+    // opclass / Packed / non-native opmode / unsupported EA klass). Unlike `fpCmd` above,
+    // this is the UNMODIFIED ext word bits[15:0] -- including OPCLASS (bits[15:13], which for
+    // a real memory-source trap is 010, i.e. R/M=1) -- because the 52-byte unimplemented-
+    // instruction frame's CMDREG1B field is architecturally the faulting COMMAND WORD itself
+    // (MC68040 UM Fig 9-8/9-11; confirmed against Musashi's `fpgen_rm_reg`:
+    // `rm=(w2>>14)&1; src=(w2>>10)&7; dst=(w2>>7)&7; opmode=w2&0x7f`), not a reconstruction
+    // that would zero OPCLASS and make a real FPSP kernel misclassify a memory-source op as
+    // register-source. Populated at `ucBegin` from `ucFpExt`, which PredecodeWord.scala's
+    // cpGEN framing guarantees is genuinely resident whenever this row is reached (the
+    // `!extWKnown` ambiguous-length case is resolved -- ambiguousLine + Aligner re-classify
+    // -- before decode ever sees it; see PredecodeWord.scala's cpGEN framing comment).
+    // Harmless (unread) for every other microcode customer.
+    val fpTrapCmd = Bits(16 bits)
     // ── Task 9b: FMOVEM control-register LIST form ──────────────────────────────
     // `fpCtrlRc` = {batch(bit3)=1, mask(bits[2:0]) = ext[12:10] {FPCR,FPSR,FPIAR}}.
     // `fpCtrlDelta` = the SIGNED An write-back for the auto buckets,
@@ -2694,10 +2709,26 @@ object Microcode {
     u.faulted := Bool(d.bfIllegal) || Bool(d.fpMemTrap)
     u.faultVector := (if (d.bfIllegal) U(4, 8 bits) else if (d.fpMemTrap) U(11, 8 bits) else U(0, 8 bits))
     u.faultUsesNextPc := Bool(d.fpMemTrap)
-    // fpMemTrap is a memory-source FP trap (Task 6b) -- explicitly OUTSIDE this task's
-    // narrow register-to-register trigger population (see DecodedUop.fpuSoftwareComplete's
-    // doc comment): ext[12:10]/ext[9:7] are not FP register numbers for this form.
-    u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
+    // Task #228: fpMemTrap DOES now populate fpuSoftwareComplete/fpuCmdWord (previously
+    // deliberately left at False/0 -- see DecodedUop.fpuSoftwareComplete's doc comment for
+    // the original narrow-scope rationale). The concern that comment raises is real for
+    // ext[12:10] (SRC): for a memory-source op that field is the source DATA FORMAT, not an
+    // FP register number, so a consumer that blindly read it as "the source FPn" would
+    // address the wrong physical register. But ext[9:7] (DST) IS the destination FPn
+    // register for EVERY opclass/R-M combination (confirmed against Musashi's
+    // `fpgen_rm_reg`: `dst = (w2>>7)&7` is computed unconditionally, before the `rm`
+    // branch), and CMDREG1B's OWN architectural purpose (MC68040 UM Fig 9-8/9-11) is to
+    // carry the raw faulting command word verbatim so a real FPSP kernel can classify
+    // OPCLASS/R-M/format itself -- not to be pre-interpreted here. `ctx.fpTrapCmd` is the
+    // RAW ext word (see its own doc comment); no register-number interpretation happens at
+    // this site, so there is no wrong-register risk from this assignment. What WOULD still
+    // be unsafe (and remains out of scope, unchanged) is a FUTURE consumer treating
+    // fpuCmdWord's ext[12:10] as a source FPn for an R/M=1 word -- `ExceptionUnit.scala`'s
+    // `fpuSrcArch`/`committedFpSrcIn` mechanism is exactly that future consumer, and it is
+    // NOT wired into any DUT as of this task (confirmed by repo-wide grep), so this change
+    // introduces no live corruption path today.
+    u.fpuSoftwareComplete := Bool(d.fpMemTrap)
+    u.fpuCmdWord          := (if (d.fpMemTrap) ctx.fpTrapCmd else B(0, 16 bits))
     u.faultAddr := ctx.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     u.divSigned := False; u.div64 := False
     // The two An write-back ADDs are DROPPED crack µops (divIsRem): the commit
@@ -3244,10 +3275,14 @@ object Microcode {
     u.faulted := d.bfIllegal || d.fpMemTrap
     u.faultVector := Mux(d.bfIllegal, U(4, 8 bits), Mux(d.fpMemTrap, U(11, 8 bits), U(0, 8 bits)))
     u.faultUsesNextPc := d.fpMemTrap
-    // fpMemTrap is a memory-source FP trap (Task 6b) -- explicitly OUTSIDE this task's
-    // narrow register-to-register trigger population (see DecodedUop.fpuSoftwareComplete's
-    // doc comment): ext[12:10]/ext[9:7] are not FP register numbers for this form.
-    u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
+    // Task #228: fpMemTrap DOES now populate fpuSoftwareComplete/fpuCmdWord -- see the
+    // twin comment on this same assignment in `resolve()` above (the Desc-based
+    // interpreter) for the full argument (why ext[9:7]/DST is safe unconditionally, why
+    // ext[12:10]/SRC's format-vs-register ambiguity does NOT matter here because nothing
+    // reads it as a register number at this site, and why the one FUTURE consumer that
+    // would care -- ExceptionUnit's `fpuSrcArch`/`committedFpSrcIn` -- is unwired today).
+    u.fpuSoftwareComplete := d.fpMemTrap
+    u.fpuCmdWord          := Mux(d.fpMemTrap, ctx.fpTrapCmd, B(0, 16 bits))
     u.faultAddr := ctx.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     u.divSigned := False; u.div64 := False
     // The two An write-back ADDs are DROPPED crack µops (divIsRem): the commit

@@ -1240,6 +1240,12 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       ucFpDeltaMag.resize(32).asBits)
     // Packed FP-issue command word (SFpCmd): opmode[6:0] | dstFp[2:0]<<7 | srcSpec[2:0]<<10.
     ucEntryCtx.fpCmd := (B(0, 19 bits) ## ucFpSrcSpec ## ucFpDstFp.asBits ## ucFpOpmode).resize(32)
+    // Task #228: the RAW 16-bit FP extension word, unconditionally (== `ucFpExt` ==
+    // `ucEntryPkt.words(1)`) -- see `Microcode.Ctx.fpTrapCmd`'s doc comment for why this
+    // must be the literal ext word (preserving OPCLASS bits[15:13]) rather than a
+    // reconstruction, and why it is safely resident here even on the `ucFpMemBad` reject
+    // path (framed by PredecodeWord.scala's cpGEN arm before badness is ever evaluated).
+    ucEntryCtx.fpTrapCmd := ucFpExt
     // ── Task 9b: FMOVEM control-register LIST form Ctx population ────────────────────
     // The SAME ext-word field `ucFpSrcSpec` names for the arithmetic forms (ext[12:10]) is,
     // for opclass 100/101, the register-select MASK {FPCR, FPSR, FPIAR} MSB-first

@@ -401,24 +401,40 @@ case class DecodedUop() extends Bundle {
   // the rename/dispatch pipeline narrow — no extra 32-bit field).
   val faultUsesNextPc = Bool()
   // ── Recognized-FPU-instruction software completion (Task 11's FSAVE trigger) ──
-  // True for an F-line opword this core RECOGNIZES as the register-to-register FPU
-  // general form (Task 6's fpFormIsReg) that is NOT hardware-native (so it is routed to
-  // FPSP via Task 6's own faultUsesNextPc mechanism). A subsequent FSAVE, if this bit was
-  // the most recent trap, emits the 52-byte unimplemented-instruction frame instead of the
-  // 4-byte idle frame. DELIBERATELY NARROWER than Task 6's own faultUsesNextPc gate
-  // (fpLenKnown, which covers every cpGEN form including memory-source, Task 6b): Task 11's
-  // operand capture reads fpuCmdWord's ext[12:10]/ext[9:7] AS FP REGISTER NUMBERS, which is
-  // only a valid interpretation for the register-to-register form. Broadening this bit's
-  // population without also fixing Task 11's operand capture would silently address the
-  // wrong physical FP register for memory/immediate-source traps. See the note at the top
-  // of this task's text for the full argument.
+  // True for an F-line opword this core RECOGNIZES as a cpGEN FPU instruction that is NOT
+  // hardware-native, whether register-to-register (Task 6's fpFormIsReg, MicroOpAssembler's
+  // fpuGenRegUnimpl) OR memory-source (Task 6b's fpMemTrap row, Task #228). A subsequent
+  // FSAVE, if this bit was the most recent trap, emits the 52-byte unimplemented-instruction
+  // frame instead of the 4-byte idle frame -- and (ExceptionUnit's `is2`) selects the
+  // format-$2 entry frame the vector-11 delivery itself uses, which a real FPSP kernel's own
+  // entry code checks for (confirmed live: `fpsp_packed_kernel_e2e.s`'s ROM handler checks
+  // the pushed format/vector word for exactly 0x202C before proceeding).
+  //
+  // Task #228 broadened this from register-form-only to also cover fpMemTrap, after
+  // confirming (cross-checked against Musashi's `fpgen_rm_reg`: `src=(w2>>10)&7;
+  // dst=(w2>>7)&7`, an independently-corroborated oracle, plus this project's own
+  // already-verified `ucFpOpClass/ucFpSrcSpec/ucFpDstFp` decode) that ext[9:7] (DST) is
+  // UNCONDITIONALLY the destination FPn register for every opclass/R-M combination, while
+  // ext[12:10] (SRC) is a register number ONLY when R/M=0 (bit14) -- for a memory-source op
+  // it is instead the 3-bit source DATA FORMAT code. The "wrong physical FP register" risk
+  // this comment used to warn about is specifically about a consumer reading ext[12:10] AS a
+  // source FPn for an R/M=1 word; as of this task, no such consumer exists in the codebase
+  // (`ExceptionUnit.scala`'s `fpuSrcArch`/`committedFpSrcIn` mechanism, the one place that
+  // WOULD do this, is confirmed unwired in every DUT — repo-wide grep), so broadening this
+  // bit's population introduces no live corruption path today. That risk becomes real again
+  // the moment `committedFpSrcIn` gets wired to a real FP-PRF read port; whoever does that
+  // must gate the SOURCE read on R/M (bit 14 of `fpuCmdWord`), not just address it via
+  // ext[12:10] unconditionally the way DST already safely can.
   val fpuSoftwareComplete = Bool()
   // The FPU COMMAND extension word (words(1)) of a recognized FPU instruction matching the
-  // predicate above. Zero for everything else. Task 11 stacks this as the unimplemented-
+  // predicate above -- the RAW, unmodified 16 bits (preserving OPCLASS/R-M), not a
+  // reconstruction. Zero for everything else. Task 11 stacks this as the unimplemented-
   // instruction state frame's CMDREG1B field, and ALSO reads ext[12:10]/ext[9:7] out of it
   // to address the FP RAT for the frame's operand fields -- captured HERE, at decode,
   // because by the time the frame is emitted (a later FSAVE) the instruction words are
-  // long gone.
+  // long gone. See `fpuSoftwareComplete`'s doc comment above for exactly which of those two
+  // sub-fields is safe to treat as a register number unconditionally (DST) vs. which is not
+  // (SRC, valid as a register number only when R/M=0).
   val fpuCmdWord = Bits(16 bits)
   // Access-fault (vector 2) extras for the format-$7 frame, used for an
   // INSTRUCTION-FETCH fault (the I-cache raised DecodePacket.fault). `faultAddr` is
