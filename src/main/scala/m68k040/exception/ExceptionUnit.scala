@@ -1256,9 +1256,18 @@ class ExceptionUnit(
         // RESUME pc (the instruction AFTER the traced one — RobPlugin's
         // tracePendingFire path); entryPpc = the traced instruction's OWN pc
         // (RobPlugin's tracePendingPpc), mirroring Musashi's REG_PC/REG_PPC split.
+        // Task #222 fix: vector 11 (line-F) is format-$2 (12-byte, with the extra
+        // "unimplemented instruction" word) ONLY for a genuine on-chip-FPU-unimplemented
+        // trap -- gated on the SAME `entryFpuUnimp` signal line 1285 already uses to
+        // capture the FSAVE frame state, so this reuses an already-correctly-driven
+        // signal rather than deriving a new one. Upstream m68k-ooo commit 20488bda split
+        // this the same way: a non-FPU line-F trap (a genuinely illegal F-line opcode,
+        // no FPU involvement at all) stacks the plain format-$0 (8-byte) frame instead --
+        // format-$2 was never meant to be the blanket vector-11 frame shape.
         val is2 = !entryIsInterrupt &&
                   ((entryVector === 7) || (entryVector === 6) || (entryVector === 5) ||
-                   (entryVector === 11) || (entryVector === 3) || (entryVector === 9))
+                   (entryVector === 11 && entryFpuUnimp) || (entryVector === 3) ||
+                   (entryVector === 9))
         // PPC: supplied explicitly (variable-length CHK/DIV0); fall back to entryPc-2
         // for callers that don't pass it (the TRAPV-only unit tests, 2-byte op).
         val ppc = if (entryPpc != null) entryPpc else (entryPc - 2).resized
