@@ -259,6 +259,27 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // merge path from the load-fill/direct-response paths above.
     val refillReqIsStore = Reg(Bool()) init False
 
+    // FMax fix (pea-cache-evict-2026-08-19 WNS-regression follow-up): a compact,
+    // register-free "did a REFILL/REPLAY array write land THIS cycle" pulse, always
+    // targeting `missSet` (both of its two drive sites below write missSet, never
+    // any other set -- see the REFILL-allocate and REPLAY-merge write() call sites).
+    // Exists PURELY so downstream same-set collision checks (the early-probe
+    // staleness logic below) can compare against this ONE (valid, set) pair instead
+    // of scanning the raw per-way `wrEn`/`wrSet` write-port vectors -- keeps new
+    // consumers off those already-widely-fanned-out nets. Mirrors this file's other
+    // single-pulse "did X happen this cycle" flags (`busFaultResp`, `inhibitedResp`,
+    // `storeAllocAckReg`).
+    val missArrayWrite = Bool(); missArrayWrite := False
+    // Same shape as `missArrayWrite` above, for the store-S3 RMW array write (the
+    // ONLY other physical writer of the shared per-way dataMem/tagMem ports). Driven
+    // at the S3 write site below from the already-computed `stS3ArrayWrite`/`stS3Set`
+    // -- declared HERE (early) purely so the early-probe staleness checks further
+    // down (which elaborate before `stS3ArrayWrite`/`stS3Set` in Scala source order)
+    // can read a same-shaped (valid, set) pair without a forward reference, and
+    // without themselves scanning the raw `wrEn`/`wrSet` write-port vectors.
+    val storeArrayWrite    = Bool(); storeArrayWrite := False
+    val storeArrayWriteSet = UInt(setBits bits); storeArrayWriteSet := U(0, setBits bits)
+
     // Store-drain-miss request, latched from store-S2 when a COPYBACK drain misses
     // (stS2Copyback && !stS2HitAny). Held until the (shared, single) refill engine
     // picks it up; a same-cycle load miss takes priority (mirrors this file's
@@ -439,13 +460,21 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
                                  (earlyProbeVaddrs(i) === cmdVaddr)
       earlyProbeMatchVec(i) := earlyProbePresentVec(i) && earlyProbeReadies(i)
       // A held result is a snapshot of the array read. Any intervening real write
-      // to its virtual set can stale it before the tagged command arrives. Compare
-      // only the four bounded entries against the four physical write ports; this
-      // preserves unrelated-set load/store overlap without adding cache storage.
-      earlyProbeSetWriteVec(i) := (0 until ways).map { w =>
-        wrEn(w) && (wrSet(w) ===
-          earlyProbeVaddrs(i)(offBits + setBits - 1 downto offBits))
-      }.orR
+      // to its virtual set can stale it before the tagged command arrives.
+      //
+      // FMax fix (pea-cache-evict-2026-08-19 WNS-regression follow-up): originally
+      // compared each of the four bounded entries against the four raw per-way
+      // `wrEn`/`wrSet` write-port vectors directly (16 AND/OR terms across the
+      // whole depth). There are only ever TWO distinct writers of those shared
+      // physical ports in any one cycle -- the store-S3 RMW write
+      // (`storeArrayWrite`/`storeArrayWriteSet`) and the REFILL/REPLAY array write
+      // (`missArrayWrite`/`missSet`, see their declarations) -- so comparing each
+      // entry against those two already-compact (valid, set) pairs is exactly
+      // equivalent coverage (same two possible physical sources) without adding
+      // fanout to `wrEn`/`wrSet` themselves.
+      val setBitsOf = earlyProbeVaddrs(i)(offBits + setBits - 1 downto offBits)
+      earlyProbeSetWriteVec(i) := (storeArrayWrite && (storeArrayWriteSet === setBitsOf)) ||
+                                   (missArrayWrite && (missSet === setBitsOf))
     }
     // Task pea-cache-evict-2026-08-19 fix: `earlyProbeSetWriteVec` above is a purely
     // COMBINATIONAL, THIS-CYCLE-ONLY check -- despite this block's own comment
@@ -1027,11 +1056,24 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
             // probe's own target set directly instead -- this is the exact
             // "read-launch-vs-S3-write, same cycle" hazard `stS1SameLineAsS3`
             // patches for the store side, mirrored here for the probe's own launch.
-            val allocRacesS3Write = (0 until ways).map { w =>
-              wrEn(w) && (wrSet(w) ===
-                loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits))
-            }.orR
-            earlyProbeStale(earlyProbeAllocIdx) := allocRacesS3Write
+            //
+            // FMax fix (WNS-regression follow-up): the original revision of this
+            // check scanned the raw per-way `wrEn`/`wrSet` write-port vectors (a
+            // 4-way OR of per-way ANDs), adding a brand-new consumer directly onto
+            // those already widely-fanned-out physical BRAM write-port nets. There
+            // are only ever TWO distinct writers of those ports in any one cycle --
+            // the store-S3 RMW write (`stS3ArrayWrite`/`stS3Set`, already read one
+            // screen down by `stS1SameLineAsS3` for the store side's own mirror-image
+            // hazard) and the REFILL/REPLAY array write (`missArrayWrite`/`missSet`,
+            // both of its two drive sites target `missSet` exclusively -- see their
+            // declarations). Comparing against those two already-compact (valid, set)
+            // pairs instead is exactly equivalent (same coverage: any write, from
+            // either possible source, to this probe's target set) but never touches
+            // `wrEn`/`wrSet` at all.
+            val allocTargetSet = loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
+            val allocRacesArrayWrite = (stS3ArrayWrite && (stS3Set === allocTargetSet)) ||
+                                       (missArrayWrite && (missSet === allocTargetSet))
+            earlyProbeStale(earlyProbeAllocIdx) := allocRacesArrayWrite
             probeReadValid  := True
             probeReadSlot   := earlyProbeAllocIdx
             probeReadSet    := loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
@@ -1425,6 +1467,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
                                              // later hit) dirties it
             }
             victim(missSet) := victim(missSet) + 1
+            missArrayWrite  := True
           }
           when(inhib) {
             // Merge THIS sub-transaction's bytes into `missLine` at their own line offsets.
@@ -1542,6 +1585,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
               dirtys(w)(missSet) := True
             }
             storeAllocAckReg := True
+            missArrayWrite   := True
             goto(IDLE)
           } otherwise {
             // Held — stay in REPLAY, retry next cycle (retry-don't-drop). Per the
@@ -2069,6 +2113,8 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
           wrData(w) := stS3MergedLine
           when(stS3Copyback) { dirtys(w)(stS3Set) := True }
         }
+        storeArrayWrite    := True
+        storeArrayWriteSet := stS3Set
       }
 
       stMergeReg   := stS3MergeData
