@@ -1308,18 +1308,38 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     //    never reach this engine at all (OperationDecoder's `fpMemIsMemEa` excludes them),
     //    which is exactly right -- a multi-bit mask against a register-direct <ea> is
     //    architecturally meaningless and Task 9's own fast-crack path owns the
-    //    single-register register-direct forms. PC-relative is rejected for BOTH
-    //    directions: it is not alterable (so the store direction is illegal outright), and
-    //    although the toolchain does assemble a PC-relative LOAD direction, this core
-    //    deliberately keeps the blocked attempt's conservative scope rather than shipping
-    //    a half-covered mode. Both reject to the SAME clean vector-11 trap this band
-    //    already produces today, so nothing regresses.
+    //    single-register register-direct forms.
+    //  - PC-relative: `(d16,PC)` (mode 7/reg 2 -- MEMSIMPLE, baseValid=False, pcRel=True,
+    //    indexValid=False) IS admitted for the LOAD direction only. The Q700 ROM's own
+    //    `fmovem.l (d16,PC),FPCR/FPSR` (task #140 session / this task's own report) proves
+    //    the toolchain assembles it and real firmware relies on it. STORE stays rejected
+    //    outright: `(d16,PC)` is not an alterable destination on real hardware, so
+    //    `FMOVEM.L list,(d16,PC)` genuinely is illegal, not merely unimplemented --
+    //    admitting it would be a NEW divergence from real-chip semantics, not a gap close.
+    //    `(d8,PC,Xn)` (mode 7/reg 3 brief -- ALSO MEMSIMPLE+pcRel, but indexValid=True)
+    //    stays excluded via the `!indexValid` term: it needs the 3-phase index crack
+    //    interleaved with the control-register-list walk (same reason `(d8,An,Xn)` stays
+    //    out of scope), which this fix does not add. Both rejected forms fall through to
+    //    the SAME clean vector-11 trap this band already produces today, so nothing
+    //    regresses.
+    //
+    //    The addressing side needs no new plumbing: `ucFpDispLoClean` (above) already
+    //    folds pc+4 into `ctx.eaDispLo` for every `ucIsFpMem` entry -- including this
+    //    ctrl-list band, since `isFpGeneric`/`o.op := DecOp.FPU` is opclass-agnostic
+    //    (OperationDecoder.scala's cpGEN arm) -- and `SFpDispMid`/`SFpDispHi` (the 2nd/3rd
+    //    register slots) derive from that SAME `eaDispLo` (+4/+8), so the whole
+    //    2-/3-register chain inherits the pc-relative fold for free. With `SEaBase`
+    //    already invalid for pcRel (mirrors the already-working absolute-EA case), the
+    //    Base (non-auto) bucket's existing rows are address-correct as-is; this is a pure
+    //    admission-gate widening, not new microcode.
     val ucFpCtrlIsLoad  = ucFpOpClass === B"3'b100"
     val ucFpCtrlIsStore = ucFpOpClass === B"3'b101"
+    val ucFpCtrlPcRelOk = ucFpCtrlIsLoad && ucBfEaDec.pcRel && !ucBfEaDec.indexValid
     val ucFpCtrlOk = (ucFpCtrlIsLoad || ucFpCtrlIsStore) &&
                      (ucFpExt(9 downto 0) === B(0, 10 bits)) &&
                      (ucFpCtrlMask =/= B"3'b000") &&
-                     (ucBfEaDec.klass === EaClass.MEMSIMPLE) && !ucBfEaDec.pcRel
+                     (ucBfEaDec.klass === EaClass.MEMSIMPLE) &&
+                     (!ucBfEaDec.pcRel || ucFpCtrlPcRelOk)
     // ── Task 14b: FMOVE FPn,<ea> (opclass 011) -- the STORE direction ACCEPT gate ────
     // `ucFpSrcSpec` (ext[12:10]) is REUSED verbatim, with a role-flip: for opclass 011 it
     // names the DESTINATION FORMAT, not the source format. Every downstream consumer this
