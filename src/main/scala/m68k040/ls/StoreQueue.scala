@@ -16,16 +16,17 @@ case class SqAlloc() extends Bundle {
   val data  = Bits(32 bits)
   val size  = Size()
   val nbytesA   = UInt(3 bits)        // covered byte count of slot A (for overlap)
-  val useStrbA  = Bool()              // drain slot A with explicit strobe (split) vs {data,size}
-  val strbA     = Bits(16 bits)       // line-relative byte strobe (when useStrbA)
-  val lineDataA = Bits(128 bits)      // line-aligned merge data (when useStrbA)
+  // drain slot A with explicit strobe (split) vs {data,size}. strb/lineData themselves
+  // are NOT carried here (task #252): they are pure functions of (paddr low nibble,
+  // size, data) -- exactly DcacheByteLane.storeStrbA/storeDataA/storeStrbB/storeDataB,
+  // the same math LsEuPlugin used to run once at alloc and stash 288 redundant bits/entry
+  // for. StoreQueue now re-derives them combinationally at the single drain read point.
+  val useStrbA  = Bool()
   // ---- slot B (optional second slot of a SPLIT store; one entry = one atomic store) ----
   val validB    = Bool()
   val paddrB    = UInt(32 bits)
   val vaddrB    = UInt(32 bits)   // logical address of slot B (cross-line/page)
   val nbytesB   = UInt(3 bits)
-  val strbB     = Bits(16 bits)
-  val lineDataB = Bits(128 bits)
   // ---- cache-mode / precision classification (captured at translate) ----
   val cacheMode  = CacheMode()
   val cacheModeB = CacheMode()
@@ -109,31 +110,25 @@ class StoreQueue(depth: Int = 8) extends Component {
   // slot-A explicit-strobe drain (split stores) + covered byte count (overlap)
   val nbytesAs  = Vec.fill(depth)(RegInit(U(1, 3 bits)))
   val useStrbAs = Vec.fill(depth)(RegInit(False))
-  // ── LUT-reduction SQ drain-payload fold (2026-08-15, investigation candidate 7) ──
-  // strbAs/lineDataAs/strbBs/lineDataBs (4 Reg-Vecs, 288 bits/entry = 2304 FF at
-  // depth 8, ~54% of the SQ payload) are DRAIN-ONLY: written exactly once, together,
-  // at `tail` in the single alloc block, and read exactly once, together, at
-  // `sendPtr` in the drain-present mux. They are NOT part of the forward CAM (the
-  // CAM/forward fields — valids/robIds/paddrs/datas/sizes/nbytes/paddrHi/validBs —
-  // stay Regs) and are never relocated by flush (flush only rolls `tail` back;
-  // squashed rows go stale and are unreachable behind the valids/committed gates).
-  // One write address + one read address ⟹ a single 1W/1R async-read Mem holding
-  // all four fields. Never-written-row reachability: io.drain.valid requires
-  // valids(sendPtr) (sendCommitted) on every mode path — a never-alloc'd slot has
-  // valids=False (RegInit), precises=False, cacheModes=WRITETHROUGH, so no drain
-  // presents an unwritten row; the drain payload is don't-care while !valid.
-  // Read-during-write (alloc at tail == sendPtr same cycle) is unobservable: the
-  // alloc cycle writes committed(tail):=False and a reused slot's valids is False
-  // that cycle, so sendCommitted is False whenever the row is being written.
-  // ram_style=distributed: the drain read must be asynchronous (BRAM cannot serve it).
-  case class SqDrainRow() extends Bundle {
-    val strbA     = Bits(16 bits)
-    val lineDataA = Bits(128 bits)
-    val strbB     = Bits(16 bits)
-    val lineDataB = Bits(128 bits)
-  }
-  val drainRowMem = Mem(SqDrainRow(), depth)
-  drainRowMem.addAttribute("ram_style", "distributed")
+  // ── SQ drain-payload elimination (task #252, 2026-08-19) ──
+  // The prior LUT-reduction pass (2026-08-15) folded strbA/lineDataA/strbB/lineDataB
+  // (288 bits/entry) into a single 1W/1R async-read `Mem` (`SqDrainRow`/`drainRowMem`),
+  // reasoning they were drain-only fields. That Mem itself turned out to be entirely
+  // redundant, not merely foldable: every one of those bits is re-derivable
+  // combinationally at drain time from data the SQ already stores for unrelated
+  // reasons -- `paddrs(i)`, `sizes(i)`, `datas(i)` are exactly the (off, size, data)
+  // inputs to `DcacheByteLane.storeStrbA/storeDataA/storeStrbB/storeDataB`
+  // (cache/DcacheTypes.scala), the SAME pure functions LsEuPlugin used to call once at
+  // alloc time to PRODUCE strbA/lineDataA/strbB/lineDataB in the first place. A store
+  // is at most 4 bytes (BYTE/WORD/LONG) and a split only occurs at line-offset 13-15
+  // (`s1CrossLine`, LsEuPlugin.scala), so slot A/B each carry at most 3 real bytes --
+  // never near the 128-bit width the old Mem row stored. The Mem/case-class and the
+  // alloc-time compute+store in LsEuPlugin are gone; the drain-side read below now
+  // calls DcacheByteLane directly, fed by `paddrs(sendPtr)(3 downto 0)` (the SAME
+  // line-offset LsEuPlugin's `stOff` used -- slot B's own paddr is always line-aligned
+  // at offset 0 for a split, so slot B's bytes are derived from slot A's offset too,
+  // exactly as before), `sizes(sendPtr)`, `datas(sendPtr)`. Same stability: sendPtr and
+  // the source registers are exactly as stable as the old Mem's own read address was.
   // FMax (P1): PRE-REGISTERED slot-A upper byte-range bound, computed at ALLOC as
   // paddr + nbytesA. The forward overlap test then compares the load range against
   // this stored bound (a COMPARE) instead of recomputing paddr+nbytes in the
@@ -147,7 +142,8 @@ class StoreQueue(depth: Int = 8) extends Component {
   val validBs   = Vec.fill(depth)(RegInit(False))
   val paddrBs   = Vec.fill(depth)(RegInit(U(0, 32 bits)))
   val nbytesBs  = Vec.fill(depth)(RegInit(U(0, 3 bits)))
-  // (strbBs/lineDataBs live in drainRowMem above — drain-payload fold.)
+  // (strbB/lineDataB are DERIVED at drain time -- see the drain-present mux below;
+  // no per-entry storage needed at all now, task #252.)
   // PRE-REGISTERED slot-B upper byte-range bound (= paddrB + nbytesB), same rationale
   // and same 32-bit width (bit-identical to the old `paddrBs(i) + nbytesBs(i)`).
   val paddrHiBs = Vec.fill(depth)(RegInit(U(0, 32 bits)))
@@ -283,16 +279,25 @@ class StoreQueue(depth: Int = 8) extends Component {
     Mux(sendPrecise, sendPreciseReady, sendSerialReady))
 
   // Present slot A (phase false) or slot B (phase true) from the send cursor.
-  // Drain-payload fold: ONE hoisted async read at sendPtr serves both phases (the
-  // A/B select happens AFTER the read, exactly as the old per-Vec muxes did).
-  val drainRowRd = drainRowMem.readAsync(sendPtr)
+  // Drain-payload derivation (task #252): strb/lineData are pure functions of
+  // (line-offset, size, data) — DcacheByteLane's own store-split math — computed here
+  // directly instead of reading a per-entry Mem row. `sendStOff` is slot A's own
+  // paddr low nibble; slot B's bytes are derived from that SAME offset (slot B's own
+  // paddr is always line-aligned at offset 0 for a split, so it carries no useful
+  // offset of its own — see LsEuPlugin's `stOff`, the original alloc-time source of
+  // this exact math).
+  val sendStOff = paddrs(sendPtr)(3 downto 0)
+  val sendStrbA = m68k040.cache.DcacheByteLane.storeStrbA(sendStOff, sizes(sendPtr))
+  val sendDataA = m68k040.cache.DcacheByteLane.storeDataA(sendStOff, sizes(sendPtr), datas(sendPtr))
+  val sendStrbB = m68k040.cache.DcacheByteLane.storeStrbB(sendStOff, sizes(sendPtr))
+  val sendDataB = m68k040.cache.DcacheByteLane.storeDataB(sendStOff, sizes(sendPtr), datas(sendPtr))
   when(!sendPhaseB) {
     io.drain.payload.paddr    := paddrs(sendPtr)
     io.drain.payload.data     := datas(sendPtr)
     io.drain.payload.size     := sizes(sendPtr)
     io.drain.payload.useStrb  := useStrbAs(sendPtr)
-    io.drain.payload.strb     := drainRowRd.strbA
-    io.drain.payload.lineData := drainRowRd.lineDataA
+    io.drain.payload.strb     := sendStrbA
+    io.drain.payload.lineData := sendDataA
     io.drain.payload.cacheMode := cacheModes(sendPtr)
     io.drain.payload.precise  := precises(sendPtr)
   } otherwise {
@@ -300,8 +305,8 @@ class StoreQueue(depth: Int = 8) extends Component {
     io.drain.payload.data     := B(0, 32 bits)
     io.drain.payload.size     := Size.LONG()
     io.drain.payload.useStrb  := True
-    io.drain.payload.strb     := drainRowRd.strbB
-    io.drain.payload.lineData := drainRowRd.lineDataB
+    io.drain.payload.strb     := sendStrbB
+    io.drain.payload.lineData := sendDataB
     io.drain.payload.cacheMode := cacheModesB(sendPtr)
     io.drain.payload.precise  := precises(sendPtr)
   }
@@ -444,14 +449,7 @@ class StoreQueue(depth: Int = 8) extends Component {
     nbytesBs(tail)  := io.alloc.payload.nbytesB
     // PRE-REGISTER the slot-B upper byte-range bound (= paddrB + nbytesB), same as A.
     paddrHiBs(tail) := io.alloc.payload.paddrB + io.alloc.payload.nbytesB
-    // Drain-payload fold: the four drain-only fields written as ONE Mem row (the
-    // single write port; same tail address, same cycle, same alloc gate as before).
-    val drainRowWr = SqDrainRow()
-    drainRowWr.strbA     := io.alloc.payload.strbA
-    drainRowWr.lineDataA := io.alloc.payload.lineDataA
-    drainRowWr.strbB     := io.alloc.payload.strbB
-    drainRowWr.lineDataB := io.alloc.payload.lineDataB
-    drainRowMem.write(tail, drainRowWr)
+    // (strbA/lineDataA/strbB/lineDataB no longer stored -- derived at drain, task #252.)
     vaddrAs(tail)     := io.alloc.payload.vaddr
     vaddrBs(tail)     := io.alloc.payload.vaddrB
     cacheModes(tail)  := io.alloc.payload.cacheMode

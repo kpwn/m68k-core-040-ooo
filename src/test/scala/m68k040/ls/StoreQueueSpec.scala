@@ -22,14 +22,10 @@ class StoreQueueSpec extends AnyFunSuite {
     // aligned (single-slot) store: covered byte count from the size, no slot B.
     dut.io.alloc.payload.nbytesA #= (size match { case Size.BYTE => 1; case Size.WORD => 2; case _ => 4 })
     dut.io.alloc.payload.useStrbA #= false
-    dut.io.alloc.payload.strbA #= 0
-    dut.io.alloc.payload.lineDataA #= 0
     dut.io.alloc.payload.validB #= false
     dut.io.alloc.payload.paddrB #= 0
     dut.io.alloc.payload.vaddrB #= 0
     dut.io.alloc.payload.nbytesB #= 0
-    dut.io.alloc.payload.strbB #= 0
-    dut.io.alloc.payload.lineDataB #= 0
     dut.io.alloc.payload.cacheMode #= cacheMode
     dut.io.alloc.payload.cacheModeB #= cacheMode
     dut.io.alloc.payload.supervisor #= supervisor
@@ -432,10 +428,10 @@ class StoreQueueSpec extends AnyFunSuite {
       a.payload.robId #= 7
       a.payload.paddr #= 0x1000; a.payload.vaddr #= 0x21000000L
       a.payload.data #= 0; a.payload.size #= Size.LONG
-      a.payload.nbytesA #= 2; a.payload.useStrbA #= true; a.payload.strbA #= 0x3; a.payload.lineDataA #= 0
+      a.payload.nbytesA #= 2; a.payload.useStrbA #= true
       a.payload.validB #= true
       a.payload.paddrB #= 0x2000; a.payload.vaddrB #= 0x22000000L
-      a.payload.nbytesB #= 2; a.payload.strbB #= 0x3; a.payload.lineDataB #= 0
+      a.payload.nbytesB #= 2
       a.payload.cacheMode #= m68k040.cache.CacheMode.WRITETHROUGH
       a.payload.cacheModeB #= m68k040.cache.CacheMode.WRITETHROUGH
       a.payload.supervisor #= false
@@ -482,10 +478,10 @@ class StoreQueueSpec extends AnyFunSuite {
       a.payload.robId #= 8
       a.payload.paddr #= 0x1000; a.payload.vaddr #= 0x21000000L
       a.payload.data #= 0; a.payload.size #= Size.LONG
-      a.payload.nbytesA #= 2; a.payload.useStrbA #= true; a.payload.strbA #= 0x3; a.payload.lineDataA #= 0
+      a.payload.nbytesA #= 2; a.payload.useStrbA #= true
       a.payload.validB #= true
       a.payload.paddrB #= 0x2000; a.payload.vaddrB #= 0x22000000L
-      a.payload.nbytesB #= 2; a.payload.strbB #= 0x3; a.payload.lineDataB #= 0
+      a.payload.nbytesB #= 2
       a.payload.cacheMode #= m68k040.cache.CacheMode.COPYBACK
       a.payload.cacheModeB #= m68k040.cache.CacheMode.INHIBITED
       a.payload.supervisor #= false
