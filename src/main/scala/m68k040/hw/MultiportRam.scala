@@ -129,8 +129,28 @@ case class RamAsyncMwXorCore[T <: Data](payloadType: HardType[T], depth: Int, wr
     storage.write(enable = port.valid, address = port.address, data = xored)
   }
 
-  val reads = for (port <- io.read) yield new Area {
-    val values = ram.map(_.readAsync(port.cmd.payload))
+  val reads = for ((port, idx) <- io.read.zipWithIndex) yield new Area {
+    // ── FMax "PRF LVT read fanout": local keep-tagged per-bank copies of this
+    // read port's address ──
+    // (docs/superpowers/specs/2026-08-19-fmax-resilience-postmortem.md §5.2,
+    //  task tracker #264, option O2)
+    //
+    // Exact mirror of `RamAsyncMwMux.writes`'s already-shipped `wr${idx}LocValid`/
+    // `wr${idx}LocAddr` (task #259, `b6ac229`), applied to this core's own read
+    // path: `port.cmd.payload` is a late address net that would otherwise fan out
+    // as ONE physical driver into every one of this core's `ram.size` banks'
+    // (=writePorts-1 XOR cross-read banks when this core is `RamAsyncMwMux`'s
+    // narrow LVT, or the full write-port count when used standalone via
+    // `RamAsyncMwXor`) address pins. Named+kept per-bank copies give each bank
+    // its own local node instead of sharing one, so the tool can place/route
+    // each independently rather than treating them as one several-hundred-way
+    // fanout net. Same boolean function, same cycle, no latency change.
+    val perBankAddr = ram.zipWithIndex.map { case (bank, bIdx) =>
+      val a = CombInit(port.cmd.payload)
+      a.setName(s"rd${idx}Bank${bIdx}Addr").addAttribute("keep", "true")
+      a
+    }
+    val values = (ram, perBankAddr).zipped.map((bank, a) => bank.readAsync(a))
     val xored  = values.reduceBalancedTree(_ ^ _)
     port.rsp := xored.as(payloadType)
   }
@@ -232,10 +252,34 @@ case class RamAsyncMwMux[T <: Data](payloadType: HardType[T], depth: Int, writeP
     loc.data := U(idx)
   }
 
-  val reads = for ((port, loc) <- (io.read, location.io.read).zipped) yield new Area {
+  val reads = for (((port, loc), idx) <- io.read.zip(location.io.read).zipWithIndex) yield new Area {
+    // ── FMax "PRF read-address fanout": local keep-tagged copies of this read
+    // port's address, one per consumer ──
+    // (docs/superpowers/specs/2026-08-19-fmax-resilience-postmortem.md §2 item 2,
+    //  §5.2, task tracker #264, option O2)
+    //
+    // Exact mirror of the `writes` block's already-shipped `wr${idx}LocValid`/
+    // `wr${idx}LocAddr` fix (task #259, `b6ac229`): without a distinct node here,
+    // `port.cmd.payload` is ONE physical driver shared between a SMALL consumer
+    // (this port's own narrow LVT select, `loc.cmd.payload`) and `writePorts`
+    // LARGE consumers (this port's replica-slot address pins inside every data
+    // bank of `ram`, each `ReplicatedBank` entry wide at `dataWidth` bits) — this
+    // is the literal worst post-route path in the archived data (`RegFilePluginInt`
+    // `RAMD64E ADDRA`, fanout-620). The named+kept local copies give each
+    // consumer its OWN node instead, so the tool can place/route the narrow LVT
+    // select and each wide bank independently rather than sharing one several-
+    // hundred-way fanout net. Same boolean function, same cycle, no latency
+    // change.
+    val rdLocAddr = CombInit(port.cmd.payload)
+    rdLocAddr.setName(s"rd${idx}LocAddr").addAttribute("keep", "true")
     loc.cmd.valid := port.cmd.valid
-    loc.cmd.payload := port.cmd.payload
-    val perBank = ram.map(_.readAsync(port.cmd.payload))
+    loc.cmd.payload := rdLocAddr
+
+    val perBank = ram.zipWithIndex.map { case (bank, bIdx) =>
+      val a = CombInit(port.cmd.payload)
+      a.setName(s"rd${idx}Bank${bIdx}Addr").addAttribute("keep", "true")
+      bank.readAsync(a)
+    }
     port.rsp := Vec(perBank)(loc.rsp).as(payloadType)
   }
 
