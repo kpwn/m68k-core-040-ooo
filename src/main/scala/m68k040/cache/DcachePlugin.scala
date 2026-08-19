@@ -120,6 +120,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     val wrData  = Vec.fill(ways)(B(0, 128 bits))
     val wrTagEn = Vec.fill(ways)(False)             // tag write (refill only)
     val wrTag   = Vec.fill(ways)(U(0, tagBits bits))
+    wrEn.simPublic(); wrSet.simPublic()   // DEBUG (pea-cache-evict-2026-08-19 investigation), temporary
     for (w <- 0 until ways) {
       dataMem(w).write(wrSet(w), wrData(w), wrEn(w))
       tagMem(w).write(wrSet(w), wrTag(w), wrTagEn(w))
@@ -135,6 +136,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     rdSet := U(0, setBits bits)
     rdEn  := False
     rdEn.simPublic()
+    rdSet.simPublic()   // DEBUG (pea-cache-evict-2026-08-19 investigation), temporary
     val rdData = Vec(dataMem.map(_.readSync(rdSet, rdEn)))
     val rdTag  = Vec(tagMem.map(_.readSync(rdSet, rdEn)))
 
@@ -445,11 +447,42 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
           earlyProbeVaddrs(i)(offBits + setBits - 1 downto offBits))
       }.orR
     }
+    // Task pea-cache-evict-2026-08-19 fix: `earlyProbeSetWriteVec` above is a purely
+    // COMBINATIONAL, THIS-CYCLE-ONLY check -- despite this block's own comment
+    // claiming to cover "any intervening real write", it only ever sees a same-set
+    // write that happens to land on the EXACT cycle `loadCmdPort` consumes the
+    // entry. A probe's captured `earlyProbeData` can sit in this queue for many
+    // cycles (the whole point of the "four-entry result queue absorbs the fixed
+    // probe->command distance" design) while a SAME-LINE store is still draining
+    // through the ordinary S1/S2/S3 pipe (barriers can hold a store in S1 for a long
+    // time -- see `storeMissBarrier`/`loadMissStoreBarrier` above). A same-line
+    // store that lands ANY cycle between the probe's read and the command's
+    // eventual consumption was silently invisible to this check, so the stale
+    // pre-store snapshot got served as if it were current. Confirmed via a
+    // cycle-exact whitebox trace (pea_4x_cache_evict.s, iteration 1): a check-code
+    // load's early probe captured the target line BEFORE that iteration's own
+    // PEA stores had drained, and the later `loadCmdPort` consumption of that
+    // already-ready entry never re-checked the (by-then long past) write.
+    //
+    // Fix: latch `earlyProbeSetWriteVec` into a STICKY per-entry register the
+    // moment it fires while the entry is valid, covering the entry's WHOLE dwell
+    // window (not just the consume cycle), cleared only when the entry is
+    // (re)allocated for a new probe. `earlyProbeHit` below ORs the live
+    // (this-cycle) and sticky (any-past-cycle) checks so no coverage is lost.
+    val earlyProbeStale = Vec.fill(earlyProbeDepth)(RegInit(False))
+    earlyProbeStale.simPublic()   // test-visibility only (pea-cache-evict-2026-08-19
+                                   // regression); no-op for synthesis
+    for (i <- 0 until earlyProbeDepth) {
+      when(earlyProbeValids(i) && earlyProbeSetWriteVec(i)) {
+        earlyProbeStale(i) := True
+      }
+    }
     val earlyProbeTokenPresent = earlyProbePresentVec.asBits.orR
     val earlyProbeOwnsCmd      = earlyProbeMatchVec.asBits.orR
     val earlyProbeMatchIdx     = OHToUInt(earlyProbeMatchVec.asBits)
     val earlyProbeHit          = earlyProbeOwnsCmd && earlyProbeHits(earlyProbeMatchIdx) &&
-                                 !earlyProbeSetWriteVec(earlyProbeMatchIdx)
+                                 !earlyProbeSetWriteVec(earlyProbeMatchIdx) &&
+                                 !earlyProbeStale(earlyProbeMatchIdx)
     val earlyProbeHitData      = earlyProbeData(earlyProbeMatchIdx)
     val useEarlyProbe          = earlyProbeHit && !ldS1Valid
     val earlyProbeFreeVec      = Vec(Bool(), earlyProbeDepth)
@@ -670,6 +703,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     val stS1Set     = stS1Payload.paddr(offBits + setBits - 1 downto offBits)
     val stS1Off     = stS1Payload.paddr(offBits - 1 downto 0)
     val stS1Tag     = stS1Payload.paddr(31 downto offBits + setBits)
+    stS1Set.simPublic(); stS1Off.simPublic(); stS1Tag.simPublic()   // DEBUG (pea-cache-evict-2026-08-19), temporary
     // Bounded arbitration only under real read-port contention.  One fresh load or
     // probe may win over a waiting store; the next fresh read yields.  Internal
     // replay/refill/maintenance work is never delayed by this bit.
@@ -712,6 +746,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
       stS3NewBytes(i) := Mux(stS3MergeStrb(i), stS3MrgBytes(i), stS3OldBytes(i))
     val stS3MergedLine = stS3NewBytes.asBits
     val stS3ArrayWrite = stS3Valid && stS3Hit && !stS3Inhibited
+    stS3OldLine.simPublic(); stS3MergedLine.simPublic()   // DEBUG (pea-cache-evict-2026-08-19), temporary
 
     stS3Valid.simPublic(); stS3Payload.simPublic(); stS3Hit.simPublic()
     stS3Set.simPublic(); stS3Way.simPublic(); stS3ArrayWrite.simPublic()
@@ -980,6 +1015,23 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
             earlyProbeHits(earlyProbeAllocIdx)    := False
             earlyProbeTokens(earlyProbeAllocIdx)  := loadProbePort.payload.token
             earlyProbeVaddrs(earlyProbeAllocIdx)  := loadProbePort.payload.vaddr
+            // Task pea-cache-evict-2026-08-19 fix: a freshly (re)allocated entry's
+            // sticky staleness must not carry over from whatever this physical slot
+            // held before -- reset it here, elaborated AFTER (and so overriding on
+            // the shared reuse-same-cycle edge) the generic per-cycle sticky-set
+            // loop above. `earlyProbeSetWriteVec(earlyProbeAllocIdx)` itself is NOT
+            // usable for this: it still compares against the OLD occupant's
+            // `earlyProbeVaddrs` (this same block overwrites that register only for
+            // the FOLLOWING cycle), so a write racing THIS NEW probe's own address
+            // on THIS SAME launch cycle would go undetected by it. Check the new
+            // probe's own target set directly instead -- this is the exact
+            // "read-launch-vs-S3-write, same cycle" hazard `stS1SameLineAsS3`
+            // patches for the store side, mirrored here for the probe's own launch.
+            val allocRacesS3Write = (0 until ways).map { w =>
+              wrEn(w) && (wrSet(w) ===
+                loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits))
+            }.orR
+            earlyProbeStale(earlyProbeAllocIdx) := allocRacesS3Write
             probeReadValid  := True
             probeReadSlot   := earlyProbeAllocIdx
             probeReadSet    := loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
@@ -1891,7 +1943,47 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // retry response as against the load: delay, never corrupt.
     val storePipeHeld = storeMissBarrier || storeMissDiscovered ||
       loadMissStoreBarrier || loadMissDiscovered
-    val stS1Advance = stS1Valid && !fsm.loadUsesPort && !maintUsesPort && !storePipeHeld
+
+    // Task pea-cache-evict-2026-08-19 fix: a store parked in S1 whose read is about
+    // to launch THIS cycle, targeting the SAME line (set+tag) an OLDER store is
+    // writing back THIS SAME cycle (stS3ArrayWrite), must not launch that read yet.
+    // The shared dataMem/tagMem read port has no read-during-write forwarding (see
+    // `stS2UsesS3Line`'s own comment two screens up, which patches the mirror-image
+    // hazard: an older store's S3 write landing on the SAME cycle a younger store's
+    // S2 already resolved, i.e. the read was launched ONE cycle before the write).
+    // That existing forward only covers stores pipelined with a ONE-cycle S2-to-S2
+    // gap (back-to-back, zero slack). It does NOT cover a store whose S1
+    // read-launch cycle lands exactly on an older same-line store's S3 write cycle
+    // -- which happens for a TWO-cycle S2-to-S2 gap, the pattern this project's own
+    // ordered-drain admission logic actually produces once a barrier releases a
+    // backlog of same-line stores (confirmed via a cycle-exact whitebox trace of
+    // pea_4x_cache_evict_once.s: four back-to-back COPYBACK-hit PEA stores to one
+    // line, each pair exactly two cycles apart at S2, silently reverted the
+    // immediately-older sibling's byte on EVERY pair -- store-to-load forwarding in
+    // the LSU happened to mask it for the two youngest stores in that specific
+    // repro, but the cache ARRAY was genuinely corrupted underneath; a later
+    // same-line load or eviction observes it too, as the ported test's failing
+    // check(s) do).
+    //
+    // Fix: HOLD (delay, never drop) this store's S1->S2 promotion for exactly one
+    // extra cycle instead of trying to forward a second, older snapshot into S2 --
+    // simpler and provably correct, matching this file's established
+    // hold-and-retry philosophy elsewhere (`refillWriteHold`, `storeMissBarrier`,
+    // `loadMissStoreBarrier`). By the very next cycle the racing S3 write has
+    // landed (S3 is exactly a one-cycle pulse per store), so the re-launched read
+    // is genuinely fresh. The raw read-launch itself (the `rdSet`/`rdEn` drive
+    // above, on the shared high-fanout BRAM read-address net) is deliberately left
+    // UNGATED here -- a held store simply gets a wasted, uncaptured read this
+    // cycle (the same benign pattern already exercised whenever `fsm.loadUsesPort`/
+    // `maintUsesPort`/`storePipeHeld` block promotion today) and retries next
+    // cycle; this keeps the fix off that FMax-sensitive net entirely.
+    val stS1SameLineAsS3 = stS1Valid && stS3ArrayWrite &&
+      (stS1Set === stS3Set) && (stS1Tag === stS3Tag)
+    stS1SameLineAsS3.simPublic()   // test-visibility only (pea-cache-evict-2026-08-19
+                                    // regression); no-op for synthesis
+
+    val stS1Advance = stS1Valid && !fsm.loadUsesPort && !maintUsesPort && !storePipeHeld &&
+      !stS1SameLineAsS3
     val stS1Ready   = !stS1Valid || stS1Advance
     val s0Advance   = s0Valid && stS1Ready && !storePipeHeld
     val s0Ready     = !s0Valid || s0Advance

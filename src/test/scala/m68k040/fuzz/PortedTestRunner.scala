@@ -408,6 +408,42 @@ object PortedTestRunner {
         }
       }
 
+      // DEBUG (pea-cache-evict-2026-08-19 investigation), temporary: full store-pipe
+      // cycle-by-cycle trace (S1 read-launch, S2 hit-detect, S3 array-write, and the
+      // raw shared-read-port/write-port drive) -- used to pin the exact same-line
+      // back-to-back store RMW race that PORTED_TRACE_DCHIT's S2-only view can't show
+      // (it only ever compares S2-vs-S3 on the SAME cycle, which misses a race between
+      // one store's S1 read-launch and an EARLIER store's S3 write). Zero cost unless
+      // PORTED_TRACE_DCPIPE is set.
+      if (sys.env.contains("PORTED_TRACE_DCPIPE")) {
+        var trCyc = 0
+        cd.onSamplings {
+          trCyc += 1
+          if (dut.dcache.logic.stS1Valid.toBoolean) {
+            println(f"[dcpipe] cyc=$trCyc%6d S1 set=${dut.dcache.logic.stS1Set.toInt}%3d " +
+              f"tag=0x${dut.dcache.logic.stS1Tag.toLong & 0xfffffL}%06x off=${dut.dcache.logic.stS1Off.toInt}%2d " +
+              f"rdSet=${dut.dcache.logic.rdSet.toInt}%3d rdEn=${dut.dcache.logic.rdEn.toBoolean}")
+          }
+          if (dut.dcache.logic.stS2Valid.toBoolean) {
+            val hv = (0 until 4).map(i => if (dut.dcache.logic.stS2HitVec(i).toBoolean) "1" else "0").mkString
+            println(f"[dcpipe] cyc=$trCyc%6d S2 set=${dut.dcache.logic.stS2Payload.paddr.toLong}%08x " +
+              f"hitVec=$hv useS3=${dut.dcache.logic.stS2UsesS3Line.toBoolean}")
+          }
+          if (dut.dcache.logic.stS3Valid.toBoolean) {
+            println(f"[dcpipe] cyc=$trCyc%6d S3 paddr=0x${dut.dcache.logic.stS3Payload.paddr.toLong}%08x " +
+              f"way=${dut.dcache.logic.stS3Way.toInt} hit=${dut.dcache.logic.stS3Hit.toBoolean} " +
+              f"arrayWrite=${dut.dcache.logic.stS3ArrayWrite.toBoolean} " +
+              f"oldLine=0x${dut.dcache.logic.stS3OldLine.toBigInt}%032x " +
+              f"mergedLine=0x${dut.dcache.logic.stS3MergedLine.toBigInt}%032x")
+          }
+          for (w <- 0 until 4) {
+            if (dut.dcache.logic.wrEn(w).toBoolean) {
+              println(f"[dcpipe] cyc=$trCyc%6d WR way=$w set=${dut.dcache.logic.wrSet(w).toInt}%3d")
+            }
+          }
+        }
+      }
+
       // debug-only, env-gated trace for the CPLX-NZVC dynamic wakeup (task #167,
       // ported-tests triage cluster 9 mull_basic HANG investigation). Prints the
       // wakeup port + any slot with cplxNzvcWait latched, so a permanently-latched
