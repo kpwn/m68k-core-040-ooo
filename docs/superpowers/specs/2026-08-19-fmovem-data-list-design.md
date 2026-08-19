@@ -140,6 +140,31 @@ EA modes × load/store direction, checking phase-shape (which FPn each chunk-seq
 to, in the correct ordering per §2) without requiring full functional simulation for every
 cell — mirrors this project's existing `PredecodeRefSpec`/decode-matrix test style.
 
+## 6.5. Hot-case cost (user-raised, 2026-08-19 — binding constraint, not just an FMax flag)
+
+The new FSM's own internal logic only costs anything while `fmovemxActive` is true. The real
+risk is its **entry-detection and fetch-hold signals**, which sit on shared combinational
+paths every decode cycle evaluates regardless of instruction — that's the part that can
+regress the hot (non-FMOVEM-data-list) case, and it's a stricter bar than "don't regress
+FMax overall": the goal is not to worsen the hot case AT ALL.
+
+This codebase already has the right pattern, used by all three existing multi-cycle-emit
+FSMs (`movemActive`, the MOVEP FSM, the µcode sequencer) — **fold in, don't parallel-build**:
+- `DecodeStage.scala` (~line 2274): `val movemHoldsFed = movemActive || movemPendValid` —
+  each FSM's "am I holding" is one more OR term in a shared aggregate.
+- `DecodeStage.scala` (~line 2293): `when(!movemActive && !movemBegin && !ucBegin &&
+  !ucActive && !movepActive && !movepBegin && pushProduced.ready) { ... }` — the "can the
+  normal fast path proceed" gate is a single wide AND across every FSM's active/begin flags.
+
+The new FSM's `fmovemxActive`/`fmovemxBegin` (or equivalent) must become additional terms
+folded into these SAME existing aggregate expressions, not a separate parallel hold-decision
+tree that then gets combined with the existing one (which WOULD add real depth on the hot
+path). Widening an already-wide gate by one more term is close to free; a second independent
+gate is not. Check for any other shared aggregate signals in the file (anything gating
+`fed.ready`, pipeline `ready`, a "some sequencer active" catch-all) and fold into those the
+same way. This applies to every task in the breakdown below, not just Task 1 — Tasks 2-4
+extend the same FSM and must not introduce a second hold path either.
+
 ## 7. Suggested task breakdown (for the implementation plan)
 
 1. FSM skeleton + non-auto EA modes ((An), (d16,An)) + load direction only — proves the core
