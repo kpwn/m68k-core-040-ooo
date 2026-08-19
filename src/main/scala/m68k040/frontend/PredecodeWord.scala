@@ -406,8 +406,10 @@ object PredecodeWord {
         // the source variant (which DOES accept (d16,PC)/(d8,PC,Xn) as read-only sources).
         val dOk  = Bool()
         val dExt = UInt(3 bits)
+        val dAmb = Bool()
         dOk  := True
         dExt := U(0, 3 bits)
+        dAmb := False
 
         // F1 FIX (deep-audit 2026-07-11): the dst EA's own first ext word sits at op+1+sExt,
         // NOT unconditionally op+1 — the OLD code (`Mux(sExt===0, extW, 0)`) only read it
@@ -423,10 +425,13 @@ object PredecodeWord {
         //     3rd lookahead word added for the line-0 .L-immediate case above, reused
         //     here verbatim)
         //   sExt>=3 -> op+4.. : STILL beyond even the 3-word lookahead (the source is
-        //     ITSELF full-format, consuming 3+ ext words) — we cannot see that far, so we
-        //     must NOT guess; dstEaKnown=False routes this (rare: both EAs full-format)
-        //     through the eaWKnown gate below, which safely rejects (COMPLEX) rather than
-        //     silently assuming brief.
+        //     ITSELF full-format, consuming 3+ ext words) — we cannot see that far.
+        //     dstEaKnown=False routes this (rare: both EAs full-format, OR the far more
+        //     common task #223 case of an ordinary mode-6 dst whose 1-word lookahead
+        //     spills past an I-cache-line boundary) through the dst-mode-6 branch below,
+        //     which now assumes brief + flags `ambiguousLine` for a real Aligner
+        //     live-reclassify (see that branch's comment) rather than committing to
+        //     either a silent wrong guess OR an unresolvable COMPLEX rejection.
         val dstEaW0    = Mux(sExt === U(0, 3 bits), extW,
                           Mux(sExt === U(1, 3 bits), extW2,
                           Mux(sExt === U(2, 3 bits), extW3, B(0, 16 bits))))
@@ -441,11 +446,27 @@ object PredecodeWord {
           }
         } elsewhen(dstMode === U(6, 3 bits)) {
           // (d8,An,Xn) brief = 1 ext word; FULL-format dst (bit8=1) = 1 + bd + od.
-          when(dstEaKnown) {
-            dExt := Mux(dstEaW0(8), fullExtLen(dstEaW0), U(1, 3 bits))
-          } otherwise {
-            dOk := False   // can't tell brief vs full -> COMPLEX (safe), see F1 note above
-          }
+          // task #223 (move_idx_idx, a brief-indexed EA on BOTH src and dst): this used
+          // to reject outright (dOk:=False -> COMPLEX) whenever dstEaKnown was False (its
+          // own ext word sits past the classify()-time lookahead, e.g. because the OPWORD
+          // itself lands on the LAST word of a 64-byte I-cache line and the dst's ext word
+          // spills into the next, not-yet-fetched line) -- unlike every OTHER mode-6 site
+          // in this file (memDestExt's mem-dest RMW case, eaExt's generic EA case, both
+          // task #170-cluster10), which instead ASSUME brief and flag `ambiguousLine` so
+          // the Aligner's live re-classify (p0LiveReg, see Aligner.scala) re-resolves it
+          // for real once more words are actually available. Rejecting as COMPLEX here
+          // is NOT safe the way the old comment claimed: a COMPLEX (non-ambiguous) packet
+          // is never re-resolved, and DecodeStage's complex/microcode path has no entry
+          // for an ordinary brief-indexed-both-EA MOVE (it isn't actually one of the
+          // complex shapes that path exists for) -- it falls through to the illegal-
+          // instruction default, a spurious vector-4 trap that only manifests when the
+          // REAL preceding instruction stream happens to land this opword on the last
+          // word of a cache line (reproduced via move_idx_idx: passes in isolation or any
+          // synthetic short repro, only faults with enough genuine preceding traffic to
+          // put it at exactly that offset). Fix: mirror the sibling sites' "assume brief +
+          // flag ambiguous" pattern instead of rejecting.
+          dExt := Mux(dstEaKnown, Mux(dstEaW0(8), fullExtLen(dstEaW0), U(1, 3 bits)), U(1, 3 bits))
+          when(!dstEaKnown) { dAmb := True }
         } otherwise {
           val (o, e, _) = eaExt(dstMode, dstReg, sizeL, allowImm = false, eaW = dstEaW0)
           dOk  := o
@@ -477,11 +498,11 @@ object PredecodeWord {
         when(sOk && dOk && (totalLen <= U(Aligner.WINDOW, totalLen.getWidth bits))) {
           r.simple   := True
           r.lenWords := totalLen.resized
-          // task #202: the source EA's own ambiguity (sAmb) is the only one threaded here —
-          // the dst mode-6 branch above already safely rejects (dOk:=False -> COMPLEX)
-          // rather than guessing when ITS ext word is unknown, so it never reaches this
-          // point with an unresolved guess baked in.
-          r.ambiguousLine := sAmb
+          // task #202 + task #223: thread BOTH EAs' ambiguity. The dst mode-6 branch above
+          // now also assumes-brief-and-flags (mirroring the source's sAmb) instead of
+          // rejecting outright, so either side being an unresolved guess must stall for
+          // the Aligner's live re-classify rather than committing to a possibly-wrong guess.
+          r.ambiguousLine := sAmb || dAmb
         }
       }
 
