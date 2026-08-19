@@ -87,6 +87,16 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     val loadBusyReg = Bool()
     val storePort   = Stream(DStoreCmd())
     storePort.valid.simPublic(); storePort.ready.simPublic(); storePort.payload.simPublic()
+    // NOTE on the "zero synthesis cost" claim repeated throughout this file (see
+    // docs/debug-trace-taps.md, section on that exact repeated claim, for the full
+    // writeup): true for QoR (area/timing are unaffected either way) but NOT true
+    // for exact synthesized signal *names* -- simPublic() on a signal can stop it
+    // being inlined into its consumer and renumber every auto-named
+    // `when_<Plugin>_lNNN` signal below it (see ExecuteLockStepSpec.scala:179-182
+    // for a worked example on a different plugin). This project's FMax methodology
+    // diffs exact Vivado register names across commits, so don't assume a name
+    // still resolves to the same signal across a commit that added/removed a
+    // simPublic() call here.
     val storeAckReg = Bool()
     storeAckReg.simPublic()   // test-visibility only (P4.1 COPYBACK-hit directed test: no
                                // AXI B to observe on that path); no-op for synthesis
@@ -137,6 +147,11 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // via the sim-side Mem.getBigInt(addr) API, the same idiom IcachePlugin already
     // uses for tagMem/lineMem, see IcachePlugin.scala's own `.simPublic()` loop);
     // no-op for synthesis.
+    // CONVENTION (task #240 gotcha, see docs/debug-trace-taps.md "Mem-typed state
+    // needs explicit .simPublic() per instance" for the full writeup): unlike a flat
+    // Reg/Vec(Reg) array, a Mem is NOT peekable via getBigInt/setBigInt in sim
+    // without this explicit per-instance simPublic() loop -- omitting it throws
+    // UNACCESSIBLE SIGNAL at sim time, not a silent no-op.
     for (w <- 0 until ways) { validsMem(w).simPublic(); dirtysMem(w).simPublic() }
     val victim  = Vec.fill(sets)(RegInit(U(0, wayBits bits)))
 
