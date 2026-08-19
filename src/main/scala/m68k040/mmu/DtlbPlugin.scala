@@ -111,10 +111,21 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // ITLB; the DTLB only READS it (no longer owns its own enable/root regs).
     val ctrl = host[MmuControlService]
     val mmuEnable = ctrl.mmuEnable
+    val is8K      = ctrl.pageSize8K
     val urp       = ctrl.urp
     val srp       = ctrl.srp
     val dtt0      = ctrl.dtt0
     val dtt1      = ctrl.dtt1
+
+    // Task #195: in 8K-page mode, VA[12] (vpn(0)) is part of the in-page offset, not
+    // the page number — two accesses differing only in VA[12] address the SAME 8K
+    // page and MUST hit/fill the same TLB entry. Masking it out of the TLB-facing key
+    // is sufficient (Tlb.scala itself is untouched: it just sees a 20-bit key with
+    // bit 0 forced to a constant in 8K mode, so two such VAs collide into one tag/
+    // set/bank exactly like a real duplicate lookup would). The walker's own PGI
+    // computation (TableWalker's RD_PTR state) never reads vpn(0) in 8K mode either,
+    // so masking it before `missReqReg.vpn` costs nothing there.
+    def tlbKey(vpn: UInt): UInt = Mux(is8K, (vpn(19 downto 1) ## False).asUInt, vpn)
 
     // ---- DTT0/DTT1 transparent-translation match (task #194) ----
     // A hit bypasses the walker/TLB entirely: PA=VA, no fault, no page table
@@ -128,7 +139,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val ttHit   = dtt0Hit || dtt1Hit
 
     // ---- TLB lookup (combinational) ----
-    tlb.io.lookupVpn := _req.payload.vpn
+    tlb.io.lookupVpn := tlbKey(_req.payload.vpn)
     tlb.io.invalidateAll := flushAll
     val tlbHit   = tlb.io.hit
     val tlbEntry = tlb.io.hitEntry
@@ -184,6 +195,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       val vpn   = Reg(UInt(20 bits))
       val write = Reg(Bool())
       val sup   = Reg(Bool())
+      val is8K  = Reg(Bool())
       val token = Reg(UInt(m68k040.cache.DTranslationToken.Width bits))
       val robId = Reg(UInt(6 bits))
     }
@@ -215,9 +227,10 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
         rspVpn               := _req.payload.vpn
       } otherwise {
         missReqReg.valid := True
-        missReqReg.vpn   := _req.payload.vpn
+        missReqReg.vpn   := tlbKey(_req.payload.vpn)
         missReqReg.write := _req.payload.write
         missReqReg.sup   := _req.payload.supervisor
+        missReqReg.is8K  := is8K
         missReqReg.token := _req.payload.token
         missReqReg.robId := umAccessRobId
         missPending      := True
@@ -235,6 +248,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     walker.io.req.rootPtr := Mux(missReqReg.sup, srp, urp)
     walker.io.req.isWrite := missReqReg.write
     walker.io.req.isSuper := missReqReg.sup
+    walker.io.req.is8K    := missReqReg.is8K
     walker.io.start       := missReqReg.valid && !umQueueFull && !flushAll
     when(walker.io.start) { missReqReg.valid := False }
 

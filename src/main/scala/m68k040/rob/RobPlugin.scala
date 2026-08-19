@@ -1266,6 +1266,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val mmuCtrl: m68k040.services.MmuControlService =
       host.get[m68k040.services.MmuControlService].getOrElse(new m68k040.services.MmuControlService {
         override def mmuEnable = False
+        override def pageSize8K = False
         override def urp = U(0, 32 bits)
         override def srp = U(0, 32 bits)
         override def itt0 = U(0, 32 bits)
@@ -1274,6 +1275,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
         override def dtt1 = U(0, 32 bits)
         override def mmusr = U(0, 32 bits)
         override def setEnable = { val f = Flow(Bool()); f.valid := False; f.payload := False; f }
+        override def setPageSize = { val f = Flow(Bool()); f.valid := False; f.payload := False; f }
         override def setUrp    = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
         override def setSrp    = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
         override def setItt0   = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }

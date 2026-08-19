@@ -104,10 +104,17 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // The ONE shared 68040 MMU control (read, not owned).
     val ctrl = host[MmuControlService]
     val mmuEnable = ctrl.mmuEnable
+    val is8K      = ctrl.pageSize8K
     val urp       = ctrl.urp
     val srp       = ctrl.srp
     val itt0      = ctrl.itt0
     val itt1      = ctrl.itt1
+
+    // Task #195 (mirrors DtlbPlugin's identical treatment): VA[12] is part of the
+    // in-page offset in 8K mode, not the page number, so it must be excluded from
+    // the TLB tag/index compare — two fetches differing only in VA[12] address the
+    // same 8K page.
+    def tlbKey(vpn: UInt): UInt = Mux(is8K, (vpn(19 downto 1) ## False).asUInt, vpn)
 
     // ---- ITT0/ITT1 transparent-translation match (task #194) — mirrors DtlbPlugin's
     // DTT0/DTT1 treatment exactly, on the I-side. A hit bypasses the walker/TLB
@@ -120,7 +127,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     val ttInhibited = Mux(itt0Hit, TtMatch.inhibited(itt0), TtMatch.inhibited(itt1))
 
     // ---- TLB lookup (combinational) ----
-    tlb.io.lookupVpn := _req.vpn
+    tlb.io.lookupVpn := tlbKey(_req.vpn)
     tlb.io.invalidateAll := flushAll
     val tlbHit   = tlb.io.hit
     val tlbEntry = tlb.io.hitEntry
@@ -134,7 +141,10 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     val latchFault  = Reg(Bool())
 
     // ---- walker control. Fetch is always a READ (write=False). ----
-    val latchMatch = latchValid && (latchVpn === _req.vpn)
+    // Task #195: `latchVpn` was filled from a masked (tlbKey'd) walkVpn, so the live
+    // side of this compare must be masked the SAME way, or two fetches to the same
+    // 8K page differing only in VA[12] would spuriously miss the just-filled latch.
+    val latchMatch = latchValid && (latchVpn === tlbKey(_req.vpn))
     val needWalk   = mmuEnable && _req.valid && !tlbHit && !latchMatch && !ttHit &&
                      !walker.io.busy && !walker.io.done
 
@@ -170,13 +180,15 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       val valid = RegInit(False)
       val vpn   = Reg(UInt(20 bits))
       val sup   = Reg(Bool())
+      val is8K  = Reg(Bool())
       val robId = Reg(UInt(6 bits))
     }
     missReqReg.valid := False
     when(needWalk && !missReqReg.valid && !umQueueFull) {
       missReqReg.valid := True
-      missReqReg.vpn   := _req.vpn
+      missReqReg.vpn   := tlbKey(_req.vpn)
       missReqReg.sup   := _req.supervisor
+      missReqReg.is8K  := is8K
       missReqReg.robId := umAccessRobId
     }
 
@@ -186,6 +198,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     walker.io.req.rootPtr := Mux(missReqReg.sup, srp, urp)
     walker.io.req.isWrite := False
     walker.io.req.isSuper := missReqReg.sup
+    walker.io.req.is8K    := missReqReg.is8K
     walker.io.start       := missReqReg.valid
 
     // VPN a walk is servicing: latched at walk-LAUNCH (the registered-trigger cycle)

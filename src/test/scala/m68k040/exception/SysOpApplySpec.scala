@@ -58,6 +58,7 @@ class SysOpApplySpec extends AnyFunSuite {
     when(setMmusrPort.valid) { mmusrWriteSeen := True }
 
     override def mmuEnable = False
+    override def pageSize8K = False
     override def urp  = U(0, 32 bits)
     override def srp  = U(0, 32 bits)
     override def itt0 = U(0, 32 bits)
@@ -66,6 +67,7 @@ class SysOpApplySpec extends AnyFunSuite {
     override def dtt1 = U(0, 32 bits)
     override def mmusr = mmusrReg
     override def setEnable = { val f = Flow(Bool());        f.valid := False; f.payload := False;          f }
+    override def setPageSize = { val f = Flow(Bool());      f.valid := False; f.payload := False;          f }
     override def setUrp    = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
     override def setSrp    = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
     override def setItt0   = { val f = Flow(UInt(32 bits)); f.valid := False; f.payload := U(0, 32 bits); f }
