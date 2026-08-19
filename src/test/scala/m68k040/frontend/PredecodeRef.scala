@@ -148,20 +148,27 @@ object PredecodeRef {
         val de = dstMode match {
           case 0 | 1 | 2 | 3 | 4 | 5 => eaExt(dstMode, dstReg, sizeL, allowImm = false)
           case 6 =>
-            // (d8,An,Xn) brief indexed destination: 1 ext word — but this reference model
-            // (like the RTL `classify()` it mirrors) only ever has a 2-word lookahead past
-            // the opword (extW@op+1, extW2@op+2). The dest's OWN ext word sits at
-            // op+1+se, which is visible only when se<=1. When se>=2 (e.g. an #imm.L
-            // source, which itself consumes op+1+op+2), the dest's brief-vs-full status
-            // is UNKNOWABLE here -> COMPLEX (F1 fix, 2026-07-11: reject rather than
-            // silently assume brief — this exhaustive sweep drives extW=extW2=0, so a
-            // naive "always brief" answer would happen to self-consistently match the
-            // OLD, buggy RTL, but not the FIXED RTL, which now correctly refuses to
-            // guess in this case).
-            se match {
-              case Some(s) if s <= 1 => Some(1)
-              case _                 => None
-            }
+            // (d8,An,Xn) brief indexed destination: 1 ext word. Task #223 (move_idx_idx):
+            // the F1 fix (2026-07-11) originally rejected this as COMPLEX whenever the
+            // dest's own ext word (at op+1+se) fell outside this model's/the RTL's 2-3
+            // word lookahead (se>=2) -- reasoning it was "UNKNOWABLE here". That reject
+            // was itself a real, reproducible bug: unlike every OTHER mode-6 call site in
+            // the RTL (eaExt/memDestExt above, both `Some(1)`/"assume brief" unconditionally
+            // per task #170-cluster10/#175), the MOVE-dst site never got the same fix, so a
+            // dst mode-6 MOVE whose src consumed >=2 ext words landed on the "reject as
+            // COMPLEX" path -- and COMPLEX (unlike the ambiguousLine-flagged "assume brief"
+            // guess the sibling sites make) is never re-resolved once more words actually
+            // become available, so DecodeStage's complex/microcode path (which has no entry
+            // for this ordinary shape) falls through to a spurious vector-4 illegal trap.
+            // Reproduced live: a genuine `MOVE.L (0,An,Dn),(0,An,Dn)` only faults when the
+            // real preceding instruction stream happens to land its opword on the LAST word
+            // of a 64-byte I-cache line (so the RTL's own extW lookahead for the dst spills
+            // into the next, not-yet-fetched line) -- passes in isolation or any short
+            // synthetic repro, matching this model's inherent "always assume brief" stance
+            // for mode 6 (no lookahead-window concept at all, by design -- see this file's
+            // header doc). Fixed to match: mode 6 is `Some(1)` unconditionally, exactly like
+            // every other mode-6 case in this file, regardless of `se`.
+            Some(1)
           // mode 7 reg 2/3 ((d16,PC)/(d8,PC,Xn)) are PC-relative => NOT a MOVE dest -> None.
           case 7 => dstReg match { case 0 => Some(1); case 1 => Some(2); case _ => None }
           case _ => None
