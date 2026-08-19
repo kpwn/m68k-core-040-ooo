@@ -199,10 +199,47 @@ class StoreQueue(depth: Int = 8) extends Component {
   }
 
   // ---- ROB circular age compare: is robId `a` strictly OLDER than `b`? ----
-  // True iff (b - a) in (0, 32) -- a sits "behind" b within half the 6-bit window.
+  // Bug (movem_rom_mem_forms ported-test triage, task movem-rom-mem-forms):
+  // the ORIGINAL formula tested `(b - a) mod 64` against a fixed `< 32` threshold
+  // -- i.e. it assumed no two SIMULTANEOUSLY-relevant robIds are ever more than
+  // half the ROB's 64-entry space apart. That assumption is false: the ROB
+  // (RobPlugin.scala, `depth = 64`) can hold up to 63 live entries at once, and a
+  // PRECISE store (MMU off/inhibited -- exactly the ported-test bare-metal
+  // posture) withholds its own ROB completion until it personally drains AT
+  // HEAD (see `headPreciseReady` below), which stalls the whole ROB head behind
+  // it. So a still-undrained precise store near the ROB head and a much younger
+  // load near the tail can legitimately be MORE than 31 robId slots apart
+  // whenever 30+ cheap non-memory instructions dispatch behind a store that is
+  // still waiting its turn to drain. Past that threshold the old compare
+  // silently flipped to "not older", so `ent` went False for a store that WAS
+  // still resident and WAS still older -- the load then fell through to the
+  // cache/memory (which the store had NOT yet reached) and returned
+  // stale/uninitialized data (0xFFFFFFFF in the repro) instead of forwarding.
+  // Reproduced directly: movem_rom_mem_forms's MOVEM.L D0-D5,24(A2) followed by
+  // enough later instructions (any mix, not MOVEM-specific -- plain `nop`s
+  // reproduce it identically) pushes the readback load's robId >=32 slots past
+  // the still-undrained store's robId.
+  //
+  // Fix, two cases:
+  //  1. `committed(a)` (the ROB has ALREADY retired this store) -> UNCONDITIONALLY
+  //     older than any live query. Retirement is strictly in-order, so anything
+  //     already retired precedes anything not yet retired -- no robId arithmetic
+  //     needed, and this is exactly the case a "fast" (non-precise, cacheable
+  //     MMU-on) store hits: it retires (ROB head passes it) before it drains,
+  //     which is also the ONE case where `io.robHeadIn` can run ahead of a still-
+  //     resident SQ entry (ruling out anchoring to it unconditionally).
+  //  2. `!committed(a)`: `a` has NOT yet retired, so by definition it still sits
+  //     at-or-after the current ROB head, and `b` (a live query's robId) is
+  //     ALSO always at-or-after head (an in-flight instruction can't query
+  //     before it's dispatched into a still-live ROB slot). Both operands are
+  //     therefore within the SAME unwrapped [head, head+64) window, so a
+  //     head-anchored distance compare is exact -- no half-window ceiling.
+  // (`committed(a)` is checked at the call site below, not inside this helper,
+  // so `olderThan` here covers ONLY case 2's head-anchored math.)
   def olderThan(a: UInt, b: UInt): Bool = {
-    val diff = (b - a)(5 downto 0)
-    (diff =/= 0) && (diff < U(32, 6 bits))
+    val ageA = (a - io.robHeadIn)(5 downto 0)
+    val ageB = (b - io.robHeadIn)(5 downto 0)
+    ageA < ageB
   }
 
   // ---- elastic ordered drain producer ---------------------------------------
@@ -280,7 +317,10 @@ class StoreQueue(depth: Int = 8) extends Component {
   val q          = io.fwd.query
   val qBytes     = sizeBytes(q.size)
   val perEntry   = for (i <- 0 until depth) yield new Area {
-    val ent      = valids(i) && olderThan(robIds(i), q.robId)
+    // committed(i): the ROB already retired this store -- unconditionally older
+    // than any live query (see olderThan's comment above, case 1). Otherwise
+    // fall back to the head-anchored compare (case 2).
+    val ent      = valids(i) && (committed(i) || olderThan(robIds(i), q.robId))
     val qLo      = q.paddr
     val qHi      = q.paddr + qBytes
     // slot A range. paddrHi is PRE-REGISTERED at alloc (= paddr + nbytesA), so the
