@@ -41,10 +41,32 @@ object PredecodeWord {
   // Boolean-typed overload above is now a thin `Bool(...)`-wrapping shim over this one, so
   // BOTH produce byte-identical hardware for every existing (compile-time-constant) caller.
   def classify(op: Bits, extW: Bits, extW2: Bits, extW3: Bits,
-               extWValid: Bool, extW2Valid: Bool, extW3Valid: Bool): ChunkPredecode = {
+               extWValid: Bool, extW2Valid: Bool, extW3Valid: Bool): ChunkPredecode =
+    classify(op, extW, extW2, extW3, B(0, 16 bits), B(0, 16 bits), B(0, 16 bits),
+             extWValid, extW2Valid, extW3Valid, False, False, False)
+  // task #242 (memind_wide_disp_dst HANG): 3 more optional ext words (op+4/+5/+6), needed
+  // ONLY to resolve a MOVE dst-mode-6/mode7-3 full-format EA whose SOURCE itself consumed
+  // 3, 4, or 5 of its own extension words (a genuine full-format src EA -- bd.L+od.L, or
+  // bd.L+index -- pushes the dst's own base ext word to op+4/+5/+6, past the OLD 4-word
+  // (op+extW..extW3) lookahead this function had). EVERY existing caller keeps the OLD
+  // "extW4/5/6 unknown" behavior bit-for-bit via the 7-arg overload above delegating here
+  // with `B(0,16 bits)`/`False` — a Scala/hardware CONSTANT False, so the extra dst-word-
+  // select logic added below is dead-code-eliminated at synth for every one of
+  // IcachePlugin's 16 per-beat bake-time instances (same "constant literal prunes dead
+  // logic" property `extWValid`/`extW2Valid`/`extW3Valid` already rely on, task #153/#202
+  // comments above). Only FetchAlignPlugin's live-reclassify (`p0LiveReg`) call supplies
+  // real op+4/+5/+6 data + a genuine runtime valid flag -- it already holds the full
+  // HEAD_WORDS=10-word `ibuf.io.head` window, so it CAN resolve what a same-cycle bake-time
+  // classify (only 3 words past its own beat) structurally cannot; see that call site.
+  def classify(op: Bits, extW: Bits, extW2: Bits, extW3: Bits, extW4: Bits, extW5: Bits, extW6: Bits,
+               extWValid: Bool, extW2Valid: Bool, extW3Valid: Bool,
+               extW4Valid: Bool, extW5Valid: Bool, extW6Valid: Bool): ChunkPredecode = {
     val extWKnown  = extWValid
     val extW2Known = extW2Valid
     val extW3Known = extW3Valid
+    val extW4Known = extW4Valid
+    val extW5Known = extW5Valid
+    val extW6Known = extW6Valid
     val r = ChunkPredecode()
     r.simple        := False
     r.lenWords      := U(0, 4 bits)
@@ -424,20 +446,33 @@ object PredecodeWord {
         //     full-format dst, e.g. `MOVE.L (xxx).L,([bd.W,An],od.W)`; extW3 is the SAME
         //     3rd lookahead word added for the line-0 .L-immediate case above, reused
         //     here verbatim)
-        //   sExt>=3 -> op+4.. : STILL beyond even the 3-word lookahead (the source is
-        //     ITSELF full-format, consuming 3+ ext words) — we cannot see that far.
-        //     dstEaKnown=False routes this (rare: both EAs full-format, OR the far more
-        //     common task #223 case of an ordinary mode-6 dst whose 1-word lookahead
-        //     spills past an I-cache-line boundary) through the dst-mode-6 branch below,
-        //     which now assumes brief + flags `ambiguousLine` for a real Aligner
-        //     live-reclassify (see that branch's comment) rather than committing to
-        //     either a silent wrong guess OR an unresolvable COMPLEX rejection.
+        //   sExt==3 -> op+4 = extW4 (task #242, memind_wide_disp_dst: a source consuming
+        //     exactly 3 ext words -- a full-format bd.L base EA with no index/od, e.g.
+        //     `([bd.L,An])` -- combined with a full-format dst)
+        //   sExt==4 -> op+5 = extW5 (source: full-format bd.L + a 1-word od, or bd.L+index)
+        //   sExt==5 -> op+6 = extW6 (source: full-format bd.L + od.L, the max single-EA
+        //     extension length -- 1 base + 2 bd + 2 od)
+        //   `extW4`/`extW5`/`extW6` are ONLY real (non-constant-zero) at the live-reclassify
+        //   call site (FetchAlignPlugin's `p0LiveReg`, which holds the full HEAD_WORDS=10-
+        //   word window); IcachePlugin's bake-time call still only ever sees 3 words past
+        //   its own beat and passes constant-zero/False for all three, so `dstEaKnown`
+        //   below still correctly falls back to "assume brief, flag ambiguousLine" there
+        //   -- exactly as it did before this task, just now resolvable for real once the
+        //   live reclassify gets a chance to see the actual words (see that branch's
+        //   comment for the "assume brief live re-classify" contract this was already
+        //   relying on -- it just could never actually succeed for sExt>=3 until now).
         val dstEaW0    = Mux(sExt === U(0, 3 bits), extW,
                           Mux(sExt === U(1, 3 bits), extW2,
-                          Mux(sExt === U(2, 3 bits), extW3, B(0, 16 bits))))
+                          Mux(sExt === U(2, 3 bits), extW3,
+                          Mux(sExt === U(3, 3 bits), extW4,
+                          Mux(sExt === U(4, 3 bits), extW5,
+                          Mux(sExt === U(5, 3 bits), extW6, B(0, 16 bits)))))))
         val dstEaKnown = Mux(sExt === U(0, 3 bits), extWKnown,
                           Mux(sExt === U(1, 3 bits), extW2Known,
-                          Mux(sExt === U(2, 3 bits), extW3Known, False)))
+                          Mux(sExt === U(2, 3 bits), extW3Known,
+                          Mux(sExt === U(3, 3 bits), extW4Known,
+                          Mux(sExt === U(4, 3 bits), extW5Known,
+                          Mux(sExt === U(5, 3 bits), extW6Known, False))))))
         when(dstMode === U(7, 3 bits)) {
           switch(dstReg) {
             is(U(0, 3 bits)) { dExt := U(1, 3 bits) }
