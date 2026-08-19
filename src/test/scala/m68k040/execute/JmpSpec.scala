@@ -65,6 +65,10 @@ class IbranchSourcePlugin extends FiberPlugin {
     uop.faultAddr    := 0; uop.sswInstr := False; uop.isRte := False
     uop.divSigned := False; uop.div64 := False; uop.divIsRem := False
     uop.isChk2 := False
+    // Task #191-adjacent fix: RenamedUop.indexLong/indexScale (AGU indexed-EA fields,
+    // RenamedUop.scala:117-118) postdate this directed test's exhaustive field list --
+    // an ibranch µop never uses AGU indexing at all, so these are simple, safe defaults.
+    uop.indexLong := False; uop.indexScale := 0
     uop.firstOfInstr := True
     uop.predTaken    := False; uop.predTarget := 0
     uop.nextPc       := iPc + 2

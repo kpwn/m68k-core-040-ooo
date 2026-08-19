@@ -55,6 +55,10 @@ class BranchEuSourcePlugin extends FiberPlugin {
     uop.pNzvcDst     := 0; uop.writesNzvc := False; uop.pNzvcOld := 0
     uop.readsX       := False; uop.pXSrc := 0
     uop.pXDst        := 0; uop.writesX := False; uop.pXOld := 0
+    // Task #191-adjacent fix: RenamedUop.indexLong/indexScale (AGU indexed-EA fields)
+    // postdate this directed test's "drive EVERY field" list -- a conditional branch µop
+    // never uses AGU indexing at all, so these are simple, safe defaults.
+    uop.indexLong := False; uop.indexScale := 0
     // branch fields
     uop.isBranch     := True
     uop.ibranch      := False
