@@ -317,32 +317,28 @@ catch { file copy -force iter_100_CongestedCLBsAndNets.txt synth/fullcore_conges
 catch { write_checkpoint -force synth/fullcore_routed.dcp }
 set paths [get_timing_paths -max_paths 1 -nworst 1 -setup]
 set wns [get_property SLACK $paths]
-puts "########### FULLCORE POST-ROUTE @ 250MHz (xcku5p-ffvb676-2) ###########"
+puts "########### FULLCORE POST-ROUTE @ 200MHz (xcku5p-ffvb676-2) ###########"
 puts "POSTROUTE_FULLCORE_WNS_NS $wns"
-set achieved [expr {1000.0/(4.000 - $wns)}]
-if {$wns < 0} { puts "POSTROUTE_FULLCORE_RESULT FAILED_AT_250  ACHIEVED_FMAX_MHZ $achieved" } else { puts "POSTROUTE_FULLCORE_RESULT MET_250  FMAX_MHZ $achieved" }
+set achieved [expr {1000.0/(5.000 - $wns)}]
+if {$wns < 0} { puts "POSTROUTE_FULLCORE_RESULT FAILED_AT_200  ACHIEVED_FMAX_MHZ $achieved" } else { puts "POSTROUTE_FULLCORE_RESULT MET_200  FMAX_MHZ $achieved" }
 puts "######################################################################"
 
-# SIGN-OFF CHECK against the real target (200 MHz / 5.000 ns), on the SAME
-# already-placed-and-routed implementation -- no re-place, no re-route, no
-# re-optimization. The 4.000 ns constraint above is an OPTIMIZATION PROBE:
-# targeting it directly makes phys_opt/route try harder and converges to a
-# BETTER result than targeting 5.000 ns directly does (confirmed 2026-08-14,
-# ledger sec 39 -- a matched-round-count 200MHz-target build plateaus
-# immediately and never catches up). This block answers the separate,
-# simpler question "does the design we actually built meet the real spec",
-# by re-checking timing on the fixed physical implementation against the
-# real target period. Setup slack scales exactly with period on a fixed
-# implementation (required_time = period - const), so this is a legitimate
-# sign-off re-check, not a second optimization pass -- do not read a WNS
-# from here as if the tool had tried to hit 200 MHz; it didn't need to.
-catch {
-  create_clock -name clk -period 5.000 [get_ports clk]
-  set p200 [get_timing_paths -max_paths 1 -nworst 1 -setup]
-  set wns200 [get_property SLACK $p200]
-  puts "########### SIGN-OFF @ 200MHz (real target, same routed netlist) ###########"
-  puts "SIGNOFF_200MHZ_WNS_NS $wns200"
-  if {$wns200 >= 0} { puts "SIGNOFF_200MHZ_RESULT MET_200" } else { puts "SIGNOFF_200MHZ_RESULT FAILED_AT_200" }
-  puts "##############################################################################"
-  create_clock -name clk -period 4.000 [get_ports clk]
-}
+# Historical note (2026-08-18/19): from ~2026-08-14 through this build, the
+# PRIMARY implementation constraint here was deliberately held at 4.000ns
+# (250MHz) as an "optimization probe" -- targeting the tighter period made
+# phys_opt/route converge to a BETTER 200MHz-equivalent result than
+# targeting 5.000ns/200MHz directly (ledger sec 39), and a separate
+# post-route-only re-check block re-applied 5.000ns against the same fixed,
+# already-routed netlist to report the true sign-off number without a
+# second optimization pass. User directive 2026-08-19: force the primary
+# target to 5.000ns going forward regardless of that finding (either to
+# re-validate it against the current, much-changed netlist, or simply to
+# build against the honest real spec). synth/clk.xdc now reads 5.000ns
+# directly, so the number above (POSTROUTE_FULLCORE_*) IS the real sign-off
+# number -- the separate re-check block is gone, since re-applying 5.000ns
+# when the netlist was already optimized for 5.000ns would be a no-op.
+# If a future build ever reintroduces a tighter probe period, restore an
+# analogous post-route re-check block rather than trusting the probe number
+# as sign-off.
+puts "SIGNOFF_200MHZ_WNS_NS $wns"
+if {$wns >= 0} { puts "SIGNOFF_200MHZ_RESULT MET_200" } else { puts "SIGNOFF_200MHZ_RESULT FAILED_AT_200" }
