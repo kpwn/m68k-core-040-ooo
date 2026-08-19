@@ -196,6 +196,20 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // the natural-alignment test needs no separate address arithmetic (spec 3.4).
     val subP   = Reg(UInt(offBits bits)) init 0
     val subEnd = Reg(UInt(offBits + 1 bits)) init 0
+    // Task #236 fix: `MmioCover.stepLog2`'s adder/comparator tree used to be recomputed
+    // COMBINATIONALLY every cycle from `subP`/`subEnd` inside REFILL.whenIsActive, even
+    // though `subP`/`subEnd` only change at the two sites that write them (miss-detect
+    // entry and the sub-transaction advance below) -- a multi-cycle AXI handshake wait
+    // recomputed the same adder/comparator tree on every idle cycle for nothing. Registered
+    // here, computed ONCE at each of those two write sites (from the NEW subP/subEnd, not
+    // the stale current ones), so REFILL's own per-cycle path only ever reads a register.
+    // Confirmed by the FMax regression investigation
+    // (.superpowers/sdd/fmax-regression-investigation-2026-08-19-report.md) as the direct
+    // cause of a real, measured 0.430ns synth-only WNS regression against the 197.278MHz
+    // baseline -- this is that fix. Init value is architecturally irrelevant: `subLog2Reg`
+    // is only ever consumed behind `inhib`, which is false until the entry site above has
+    // already run and set a real value.
+    val subLog2Reg = Reg(UInt(2 bits)) init 0
     // Task P1.4: an INHIBITED (MMIO) miss never allocates a line on refill (no
     // stale-data risk from caching a device register, no phantom "hit" on a
     // later access to the same address that may have changed underneath us).
@@ -552,6 +566,11 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     val stSubEnd    = Reg(UInt(offBits + 1 bits)) init 0
     val stSubActive = RegInit(False)    // this drain is an INHIBITED covered sequence
     val stSubErr    = RegInit(False)    // OR of every sub-transaction's B response
+    // Task #236 fix: the store-side mirror of `subLog2Reg` above -- `stSubLog2` used to be
+    // an UNCONDITIONAL top-level `val` (not even gated behind `stSubActive`), recomputing
+    // `MmioCover.stepLog2`'s adder/comparator tree every single cycle regardless of
+    // activity. Registered at the same two sites `stSubP`/`stSubEnd` are ever written.
+    val stSubLog2Reg = Reg(UInt(2 bits)) init 0
     // Task P4.3 AXI-hazard fix -- REVISION 3, the actual landed design. Two
     // earlier revisions were tried and BOTH proven unsafe by DcacheSpec's own new
     // AXI-hazard regression test (recorded here because the failure mode is
@@ -1073,10 +1092,18 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
           // `subP`/`subEnd` only need a real value here; REFILL's `inhib` gate (derived
           // from `missCmode`) is False for the whole store-drain excursion regardless of
           // what these two registers hold left over from a prior load.
-          subP   := ldS1Paddr(offBits - 1 downto 0)
-          subEnd := m68k040.socket.MmioCover.clampedEnd(
+          // Task #236 fix: compute the new subP/subEnd into locals ONCE, use them both for
+          // the register writes below AND to register subLog2Reg from the same new values
+          // (never from the stale current subP/subEnd, which reading `subP`/`subEnd`
+          // directly here would do -- SpinalHDL register reads see the pre-edge value even
+          // inside the same `when` block as their own `:=`).
+          val newSubP   = ldS1Paddr(offBits - 1 downto 0)
+          val newSubEnd = m68k040.socket.MmioCover.clampedEnd(
                       ldS1Paddr(offBits - 1 downto 0),
                       m68k040.socket.MmioCover.sizeBytes(ldS1Size))
+          subP       := newSubP
+          subEnd     := newSubEnd
+          subLog2Reg := m68k040.socket.MmioCover.stepLog2(newSubP, newSubEnd)
           // `missFault` must be cleared here: REFILL's INHIBITED arm now ACCUMULATES
           // (`missFault || respErr`) across a multi-sub-transaction sequence rather than
           // assigning once, so a stale True left over from a PRIOR access would otherwise
@@ -1287,7 +1314,11 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
         // cacheMode-independent would put every misaligned CACHEABLE access on the rare
         // two-pass replay FSM and cost real IPC on the hot path.
         val inhib   = missCmode === CacheMode.INHIBITED
-        val subLog2 = m68k040.socket.MmioCover.stepLog2(subP, subEnd)
+        // Task #236 fix: was `m68k040.socket.MmioCover.stepLog2(subP, subEnd)`, recomputed
+        // combinationally every cycle. Now a register read -- see `subLog2Reg`'s own
+        // declaration comment for why this is safe (registered at both sites that ever
+        // change subP/subEnd, from the same new values, never stale).
+        val subLog2 = subLog2Reg
         val subBytes = (U(1, 4 bits) |<< subLog2).resize(4 bits)     // 1, 2 or 4
         val subAddr = (missPaddr(31 downto offBits) ## subP).asUInt
         val subLast = (subP +^ subBytes) === subEnd
@@ -1366,8 +1397,17 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
             when(subLast || respErr) {
               goto(REPLAY)
             } otherwise {
-              subP   := (subP +^ subBytes).resize(offBits bits)
-              arSent := False                      // arm the next sub-transaction
+              // Task #236 fix: register the NEXT sub-transaction's subLog2 here too, from
+              // the same newSubP this cycle computes for subP itself -- `subEnd` doesn't
+              // change on an advance, only subP does. `subBytes` used below is still this
+              // cycle's (current, not yet advanced) value, correctly read from `subLog2Reg`
+              // before it gets overwritten -- SpinalHDL register reads see the pre-edge
+              // value, so `subBytes`'s own combinational derivation earlier in this block
+              // is unaffected by this same-cycle `subLog2Reg :=`.
+              val newSubP = (subP +^ subBytes).resize(offBits bits)
+              subP       := newSubP
+              subLog2Reg := m68k040.socket.MmioCover.stepLog2(newSubP, subEnd)
+              arSent     := False                      // arm the next sub-transaction
             }
           } otherwise {
             missLine  := axi.r.payload.data
@@ -1965,8 +2005,14 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
       val stEndSz   = m68k040.socket.MmioCover.clampedEnd(stOffS3, stNBytes)
       val stStartSt = m68k040.socket.MmioCover.strbRunStart(stS3MergeStrb)
       val stEndSt   = m68k040.socket.MmioCover.strbRunEnd(stS3MergeStrb)
-      stSubP      := Mux(stS3Payload.useStrb, stStartSt, stStartSz)
-      stSubEnd    := Mux(stS3Payload.useStrb, stEndSt,   stEndSz)
+      // Task #236 fix: compute the new stSubP/stSubEnd into locals ONCE, use them both for
+      // the register writes AND to register stSubLog2Reg from the same new values -- never
+      // from stSubP/stSubEnd read directly here, which would see the pre-edge (stale) value.
+      val newStSubP   = Mux(stS3Payload.useStrb, stStartSt, stStartSz)
+      val newStSubEnd = Mux(stS3Payload.useStrb, stEndSt,   stEndSz)
+      stSubP       := newStSubP
+      stSubEnd     := newStSubEnd
+      stSubLog2Reg := m68k040.socket.MmioCover.stepLog2(newStSubP, newStSubEnd)
       stSubActive := stS3Inhibited
       stSubErr    := False
 
@@ -2050,7 +2096,10 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // ── D30: one naturally-aligned sub-transaction per iteration on an INHIBITED store ──
     // The cacheable / write-through path is untouched: `stSubActive` is False there, so
     // `subLog2` collapses to size=4 at the line base and the strobe passes through whole.
-    val stSubLog2  = m68k040.socket.MmioCover.stepLog2(stSubP, stSubEnd)
+    // Task #236 fix: was recomputed combinationally every cycle, UNCONDITIONALLY (this val
+    // sat outside any `stSubActive`/state gate at all). Now a register read -- see
+    // `stSubLog2Reg`'s own declaration comment.
+    val stSubLog2  = stSubLog2Reg
     val stSubBytes = (U(1, 4 bits) |<< stSubLog2).resize(4 bits)
     val stSubLast  = !stSubActive || ((stSubP +^ stSubBytes) === stSubEnd)
     // Mask the merged 16-bit strobe down to THIS sub-transaction's own bytes. Every
@@ -2142,7 +2191,11 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     when(storeBAck && !stSubLast) {
       // Advance and re-arm the pair. The existing fail-closed `=== D_STORE` demux above is
       // preserved for EVERY sub-transaction, unchanged.
-      stSubP   := (stSubP +^ stSubBytes).resize(offBits bits)
+      // Task #236 fix: register the NEXT sub-transaction's stSubLog2 here too, from the same
+      // newStSubP this cycle computes for stSubP -- stSubEnd doesn't change on an advance.
+      val newStSubP = (stSubP +^ stSubBytes).resize(offBits bits)
+      stSubP       := newStSubP
+      stSubLog2Reg := m68k040.socket.MmioCover.stepLog2(newStSubP, stSubEnd)
       stAwDone := False
       stWDone  := False
       stSubErr := stSubErr || storeBErr
