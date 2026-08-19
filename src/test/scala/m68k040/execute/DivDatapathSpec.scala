@@ -124,13 +124,31 @@ class DivDatapathSpec extends AnyFunSuite {
     val r = dividend - q * divisor             // remainder; sign of dividend
     val qmask = (BigInt(1) << qw) - 1
     val rmask = (BigInt(1) << qw) - 1
-    val overflow =
+    val naiveOverflow =
       if (!signed) q >= (BigInt(1) << qw)
       else {
         val maxPos = (BigInt(1) << (qw - 1)) - 1
         val minNeg = -(BigInt(1) << (qw - 1))
         q > maxPos || q < minNeg
       }
+    // 68020+ DIVS.L/DIVU.L divide-by-(-1) erratum (documented real-silicon behavior,
+    // matched by Musashi -- see DivUnit.scala's own detailed comment on
+    // `divisorIsNegOne`/`l32DividendIsIntMin`/`l64DividendIsExactPattern`, tasks #149/
+    // #167): dividing by exactly -1 does NOT set V for one EXACT dividend pattern per
+    // form, even though the mathematical result overflows. This reference model was
+    // stale (missing the erratum entirely, hence checking mathematical truncated-division
+    // overflow only) -- mirrored here from the RTL's own logic verbatim, not re-derived,
+    // so the two can never silently drift out of correspondence again.
+    val vw32 = BigInt(1) << 32
+    val divisorIsNegOne = signed && form != FW && ((divisorArch & (vw32 - 1)) == (vw32 - 1))
+    val l32DividendIsIntMin = (dividendArch & (vw32 - 1)) == BigInt(0x80000000L)
+    val l64DividendIsExactPattern = dividendArch == BigInt(0x80000000L)
+    val suppressErratum = form match {
+      case FL32 => divisorIsNegOne && l32DividendIsIntMin
+      case FL64 => divisorIsNegOne && l64DividendIsExactPattern
+      case FW   => false
+    }
+    val overflow = naiveOverflow && !suppressErratum
     ((q & qmask), (r & rmask), overflow, false)
   }
 
