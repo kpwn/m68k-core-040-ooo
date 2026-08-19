@@ -350,7 +350,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
         // data, which the eviction machinery would later write back to memory as if it
         // were the store's own result.
         val setB = (SET_B & 0x7F).toInt
-        val dirtyWays = (0 until 4).filter(w => dut.dcache.logic.dirtys(w)(setB).toBoolean)
+        val dirtyWays = (0 until 4).filter(w => dut.dcache.logic.dirtysMem(w).getBigInt(setB) != 0)
         assert(dirtyWays.nonEmpty, "COPYBACK hit store must have dirtied its line")
         val gotB = load(dut, cd, addrB + 4, Size.LONG)
         assert(gotB == BigInt("DEADBEEF", 16),

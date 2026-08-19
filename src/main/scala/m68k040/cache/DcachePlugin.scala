@@ -109,9 +109,35 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // spinal_port1 nets, iter_100_CongestedCLBsAndNets.txt) -- force BRAM (95% free
     // budget) to both decongest the hot corridor and remove ~192 LUTRAM LUTs/way.
     val tagMem  = Seq.fill(ways)(Mem(UInt(tagBits bits), sets).addAttribute("ram_style", "block"))
-    val valids  = Vec.fill(ways)(Vec.fill(sets)(RegInit(False)))
-    val dirtys  = Vec.fill(ways)(Vec.fill(sets)(RegInit(False)))
-    dirtys.simPublic()   // test-visibility only (P4.1 directed tests); no-op for synthesis
+    // Task #240 (D2.1, LUT-reduction slice): valids/dirtys folded from per-way
+    // Vec.fill(ways)(Vec.fill(sets)(RegInit(False))) flop arrays (128 x 4 x 2 =
+    // 1,024 FF, behind wide dynamic-index read muxes at every consumer) into
+    // per-way single-write-port Mem(Bool, sets) -- LUTRAM by inference (1-bit-wide,
+    // 128-deep, same shape distributed-RAM inference already relied on for tagMem
+    // pre-block-attribute). Reads ride the SAME shared rdSet/rdEn synchronous port
+    // dataMem/tagMem already use (see rdValid/rdDirty below) -- every consumer of
+    // valids(w)(set)/dirtys(w)(set) already reads a sibling rdTag(w)/rdData(w) at
+    // the IDENTICAL address in the IDENTICAL cycle (verified against current source
+    // for every call site during this task), so no new read-port arbitration logic
+    // is needed at all.
+    //
+    // Mem.init(all False) replaces RegInit(False)'s per-bit reset -- real 68040
+    // semantics (cache contents undefined/INVALID at reset) are preserved exactly
+    // (all-False == all-invalid), and unlike a flop array this needs no reset
+    // fan-in: Vivado synthesizes the `initial` content directly into the LUTRAM
+    // primitive's INIT parameter (same mechanism as `ucRomMem` in DecodeStage.scala,
+    // just RAM instead of ROM), and the SpinalHDL simulator honors Mem.init as the
+    // sim-time reset content from cycle 0, so no boot-pulse invalidate walk is
+    // needed here (`Mem.init` already IS a clean, structurally-reset value -- see
+    // this task's report for why the report's speculative boot-walk turned out to
+    // be unnecessary).
+    val validsMem = Seq.fill(ways)(Mem(Bool(), sets) init Vector.fill(sets)(False))
+    val dirtysMem = Seq.fill(ways)(Mem(Bool(), sets) init Vector.fill(sets)(False))
+    // test-visibility only (DcacheSpec/DcacheDrainRefillRaceSpec peek dirtysMem(w)
+    // via the sim-side Mem.getBigInt(addr) API, the same idiom IcachePlugin already
+    // uses for tagMem/lineMem, see IcachePlugin.scala's own `.simPublic()` loop);
+    // no-op for synthesis.
+    for (w <- 0 until ways) { validsMem(w).simPublic(); dirtysMem(w).simPublic() }
     val victim  = Vec.fill(sets)(RegInit(U(0, wayBits bits)))
 
     // ---- single muxed data/tag write port per way (refill + store-write) ----
@@ -121,9 +147,32 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     val wrTagEn = Vec.fill(ways)(False)             // tag write (refill only)
     val wrTag   = Vec.fill(ways)(U(0, tagBits bits))
     wrEn.simPublic(); wrSet.simPublic()   // DEBUG (pea-cache-evict-2026-08-19 investigation), temporary
+    // Task #240 (D2.1): muxed write port per way for validsMem/dirtysMem, same
+    // shape/idiom as wrEn/wrSet/wrData/wrTagEn/wrTag above (plain combinational
+    // Vecs, last-assignment-wins across the writer sites below). Each way has
+    // AT MOST ONE active writer per cycle -- the full exclusivity proof (which
+    // writer sites, and why each pair is mutually exclusive) is recorded in this
+    // task's commit message and report (task #240); the short version: REFILL-
+    // allocate and REPLAY-merge are different states of the same single-active-
+    // state `fsm` StateMachine; maint CHECK/WRB are different states of the same
+    // single-active-state `maint.sm` StateMachine; the fsm-active group and the
+    // maint-walking group are mutually exclusive per the existing FAILURE-severity
+    // sim assert `!(maint.walking && !fsm.isActive(fsm.IDLE))` below; and store-S3's
+    // dirty write is excluded from the fsm-active group by the EXISTING
+    // `refillWriteHold`/`storeDrainRefillHold` hardware interlocks (not merely a
+    // sim assert) and from the maint-walking group by the existing
+    // `!(maint.walking && (... || stS3Valid))` assert.
+    val validsWrEn   = Vec.fill(ways)(False)
+    val validsWrSet  = Vec.fill(ways)(U(0, setBits bits))
+    val validsWrData = Vec.fill(ways)(False)
+    val dirtysWrEn   = Vec.fill(ways)(False)
+    val dirtysWrSet  = Vec.fill(ways)(U(0, setBits bits))
+    val dirtysWrData = Vec.fill(ways)(False)
     for (w <- 0 until ways) {
       dataMem(w).write(wrSet(w), wrData(w), wrEn(w))
       tagMem(w).write(wrSet(w), wrTag(w), wrTagEn(w))
+      validsMem(w).write(validsWrSet(w), validsWrData(w), validsWrEn(w))
+      dirtysMem(w).write(dirtysWrSet(w), dirtysWrData(w), dirtysWrEn(w))
     }
 
     // ---- shared synchronous read port per way (S0 launch -> S1 result) ----
@@ -137,8 +186,13 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     rdEn  := False
     rdEn.simPublic()
     rdSet.simPublic()   // DEBUG (pea-cache-evict-2026-08-19 investigation), temporary
-    val rdData = Vec(dataMem.map(_.readSync(rdSet, rdEn)))
-    val rdTag  = Vec(tagMem.map(_.readSync(rdSet, rdEn)))
+    val rdData  = Vec(dataMem.map(_.readSync(rdSet, rdEn)))
+    val rdTag   = Vec(tagMem.map(_.readSync(rdSet, rdEn)))
+    // Task #240 (D2.1): rdValid/rdDirty ride the SAME rdSet/rdEn port as rdTag/
+    // rdData -- every consumer below reads rdValid(w)/rdDirty(w) at the exact same
+    // address+cycle it already reads rdTag(w)/rdData(w) at (verified per call site).
+    val rdValid = Vec(validsMem.map(_.readSync(rdSet, rdEn)))
+    val rdDirty = Vec(dirtysMem.map(_.readSync(rdSet, rdEn)))
 
     // ---- tokenized early VIPT result queue ----
     // A probe reserves one small entry and launches the virtual-set BRAM read in
@@ -401,7 +455,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     val ldS1Cacheable = ldS1Cmode =/= CacheMode.INHIBITED
     val ldS1HitVec = Vec(Bool(), ways)
     for (w <- 0 until ways)
-      ldS1HitVec(w) := ldS1Cacheable && valids(w)(ldS1Set) && (rdTag(w) === ldS1Tag)
+      ldS1HitVec(w) := ldS1Cacheable && rdValid(w) && (rdTag(w) === ldS1Tag)
     val ldS1Hit     = ldS1HitVec.orR
     val ldS1HitWay  = OHToUInt(ldS1HitVec)
     // DEBUG (task #189 investigation, temporary): sim-only visibility.
@@ -428,7 +482,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
        (loadProbeResolvePort.payload.cacheMode =/= CacheMode.INHIBITED))
     val probeReadHitVec = Vec(Bool(), ways)
     for (w <- 0 until ways)
-      probeReadHitVec(w) := probeResolvedUsable && valids(w)(probeReadSet) &&
+      probeReadHitVec(w) := probeResolvedUsable && rdValid(w) &&
                             (rdTag(w) === probeResolvedTag)
     val probeReadHitWay = OHToUInt(probeReadHitVec)
     probeReadValid := False
@@ -791,7 +845,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // at this point (valids, rdTag, stS2Payload); no behavioural change from the move.
     val stS2HitVec = Vec(Bool(), ways)
     for (w <- 0 until ways)
-      stS2HitVec(w) := valids(w)(stS2Set) && (rdTag(w) === stS2Tag)
+      stS2HitVec(w) := rdValid(w) && (rdTag(w) === stS2Tag)
     stS2HitVec.simPublic()   // DEBUG (task #189), temporary
     // Task P1.4: an INHIBITED store never touches the cache array (skip the RMW line
     // write entirely) — only the AXI write-through beat is unconditional.
@@ -877,8 +931,9 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // DROPPED — no error, no retry, no fault.
     //
     // Under COPYBACK that is a silent MEMORY-corruption channel, not merely a lost
-    // cache update: the S2 hit arm's dirty-bit write (`dirtys(w)(stS2Set) := True`)
-    // is a SEPARATE register array, indexed by a DIFFERENT set, so it is NOT dropped
+    // cache update: the S2 hit arm's dirty-bit write (`dirtys(w)(stS2Set) := True`,
+    // now `dirtysWrEn/dirtysWrSet/dirtysWrData` post-task-#240) is a SEPARATE write
+    // port, indexed by a DIFFERENT set, so it is NOT dropped
     // by the collision — the line ends up marked dirty holding STALE (pre-store)
     // data, which EVICT_WR will later faithfully write back to memory as if it were
     // the store's own result.
@@ -1232,7 +1287,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
           val victimFromS3 = stS3ArrayWrite && (stS3Set === ldS1Set) &&
             (stS3Way === vw)
           loadVictimFromS3Dbg := victimFromS3
-          val victimDirtyNow = dirtys(vw)(ldS1Set) ||
+          val victimDirtyNow = rdDirty(vw) ||
             (victimFromS3 && stS3Copyback)
           val evictThis = victimDirtyNow && (ldS1Cmode =/= CacheMode.INHIBITED)
           victimEvictTag  := Mux(victimFromS3, stS3Tag, rdTag(vw))
@@ -1461,8 +1516,12 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
               wrData(w)  := axi.r.payload.data
               wrTagEn(w) := True
               wrTag(w)   := missTag
-              valids(w)(missSet) := True
-              dirtys(w)(missSet) := False   // a fresh allocate is always clean until
+              validsWrEn(w)   := True
+              validsWrSet(w)  := missSet
+              validsWrData(w) := True
+              dirtysWrEn(w)   := True
+              dirtysWrSet(w)  := missSet
+              dirtysWrData(w) := False   // a fresh allocate is always clean until
                                              // the write-allocate merge below (or a
                                              // later hit) dirties it
             }
@@ -1582,7 +1641,9 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
               wrEn(w)   := True
               wrSet(w)  := missSet
               wrData(w) := newBytes.asBits
-              dirtys(w)(missSet) := True
+              dirtysWrEn(w)   := True
+              dirtysWrSet(w)  := missSet
+              dirtysWrData(w) := True
             }
             storeAllocAckReg := True
             missArrayWrite   := True
@@ -1709,7 +1770,13 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // against store-S3's own write to those same arrays, which elaborates FIRST, so a
     // genuine same-cycle collision there would be last-assignment-wins (the walk's
     // clear winning over the store's set), i.e. silent, not a stall. That ordering gap
-    // is UNREACHABLE today and stays documented rather than fixed: `dcIdleForMaint`
+    // is UNREACHABLE today and stays documented rather than fixed (Task #240: this
+    // claim is UNCHANGED by the valids/dirtys register-array -> per-way Mem fold --
+    // `validsWrEn/validsWrSet/validsWrData` and `dirtysWrEn/dirtysWrSet/dirtysWrData`
+    // are plain combinational Vecs with the exact same last-assignment-wins ordering
+    // the raw register-array writes had, feeding a single write() call per way; the
+    // exclusivity proof this task added covers exactly this reachability question --
+    // see the writer-site declaration comment above `validsWrEn`): `dcIdleForMaint`
     // (registered-stage and accepted-count terms) plus `WAIT` mean no store is
     // anywhere in S0..S3 when the walk starts, the FAILURE-severity sim assert below
     // catches it if one ever is, and the caller (ExceptionUnit's `S_DRAIN` ->
@@ -1864,9 +1931,9 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
           val pageMatch = rdTag(curWay)(tagBits - 1 downto 1) === target(31 downto 12)
           val scopeHit  = Mux(cmd.scope === U(1, 2 bits), lineMatch,
                           Mux(cmd.scope === U(2, 2 bits), pageMatch, True))
-          val resident  = valids(curWay)(walkSet)
+          val resident  = rdValid(curWay)
           val matches   = resident && scopeHit
-          val isDirty   = dirtys(curWay)(walkSet)
+          val isDirty   = rdDirty(curWay)
           when(matches && cmd.push && isDirty) {
             // Latch OUR OWN writeback payload now (point 1 above) -- the AXI leg
             // never re-reads the shared array port.
@@ -1878,8 +1945,12 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
           } otherwise {
             when(matches && cmd.invalidate) {
               for (w <- 0 until ways) when(curWay === U(w, wayBits bits)) {
-                valids(w)(walkSet) := False
-                dirtys(w)(walkSet) := False
+                validsWrEn(w)   := True
+                validsWrSet(w)  := walkSet
+                validsWrData(w) := False
+                dirtysWrEn(w)   := True
+                dirtysWrSet(w)  := walkSet
+                dirtysWrData(w) := False
               }
             }
             goto(NEXTW)
@@ -1926,8 +1997,14 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
               // The line is now clean in memory. CPUSH-without-invalidate keeps it
               // resident-and-clean; the invalidating form drops it.
               for (w <- 0 until ways) when(curWay === U(w, wayBits bits)) {
-                dirtys(w)(walkSet) := False
-                when(cmd.invalidate) { valids(w)(walkSet) := False }
+                dirtysWrEn(w)   := True
+                dirtysWrSet(w)  := walkSet
+                dirtysWrData(w) := False
+                when(cmd.invalidate) {
+                  validsWrEn(w)   := True
+                  validsWrSet(w)  := walkSet
+                  validsWrData(w) := False
+                }
               }
               goto(NEXTW)
             }
@@ -2090,7 +2167,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
           (stS3Way === pVw)
         storeVictimFromS3Dbg := pVictimFromS3
         pendingVictimWay   := pVw
-        pendingVictimDirty := dirtys(pVw)(stS2Set) ||
+        pendingVictimDirty := rdDirty(pVw) ||
           (pVictimFromS3 && stS3Copyback)
         pendingVictimTag   := Mux(pVictimFromS3, stS3Tag, rdTag(pVw))
         pendingVictimLine  := Mux(pVictimFromS3, stS3MergedLine, rdData(pVw))
@@ -2111,7 +2188,11 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
           wrEn(w)   := True
           wrSet(w)  := stS3Set
           wrData(w) := stS3MergedLine
-          when(stS3Copyback) { dirtys(w)(stS3Set) := True }
+          when(stS3Copyback) {
+            dirtysWrEn(w)   := True
+            dirtysWrSet(w)  := stS3Set
+            dirtysWrData(w) := True
+          }
         }
         storeArrayWrite    := True
         storeArrayWriteSet := stS3Set

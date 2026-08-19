@@ -453,7 +453,7 @@ class DcacheSpec extends AnyFunSuite {
 
       // The dirty bit for this set (some way) must now be set.
       val setIdx = ((base + 4) >> 4) & 0x7F
-      val anyDirty = (0 until 4).exists(w => dut.dcache.logic.dirtys(w)(setIdx.toInt).toBoolean)
+      val anyDirty = (0 until 4).exists(w => dut.dcache.logic.dirtysMem(w).getBigInt(setIdx.toInt) != 0)
       assert(anyDirty, s"dirtys must be set for set $setIdx after a COPYBACK hit drain")
 
       // The merge landed in the cache array: a subsequent hit load sees the new value.
@@ -496,7 +496,7 @@ class DcacheSpec extends AnyFunSuite {
       assert(mem.peekByte(base + 7) == 0x44, "mem written through as before")
 
       val setIdx = ((base + 4) >> 4) & 0x7F
-      val anyDirty = (0 until 4).exists(w => dut.dcache.logic.dirtys(w)(setIdx.toInt).toBoolean)
+      val anyDirty = (0 until 4).exists(w => dut.dcache.logic.dirtysMem(w).getBigInt(setIdx.toInt) != 0)
       assert(!anyDirty, "WRITETHROUGH must never set a dirty bit")
 
       val got = load(dut, cd, base + 4, Size.LONG, CacheMode.WRITETHROUGH)
@@ -561,7 +561,7 @@ class DcacheSpec extends AnyFunSuite {
 
       // The dirty bit for this set (some way) must now be set.
       val setIdx = ((base + 4) >> 4) & 0x7F
-      val anyDirty = (0 until 4).exists(w => dut.dcache.logic.dirtys(w)(setIdx.toInt).toBoolean)
+      val anyDirty = (0 until 4).exists(w => dut.dcache.logic.dirtysMem(w).getBigInt(setIdx.toInt) != 0)
       assert(anyDirty, s"dirtys must be set for set $setIdx after a COPYBACK-miss write-allocate drain")
 
       // The line is now resident (valid): a subsequent hit load sees the merged
@@ -597,7 +597,7 @@ class DcacheSpec extends AnyFunSuite {
       cd.waitSamplingWhere(dut.dcache.logic.storeAckReg.toBoolean)
       cd.waitSampling(2)
       val setIdx = SET.toInt
-      assert(dut.dcache.logic.dirtys(0)(setIdx).toBoolean, "way 0 must be dirty before the eviction")
+      assert(dut.dcache.logic.dirtysMem(0).getBigInt(setIdx) != 0, "way 0 must be dirty before the eviction")
 
       // Ways 1..3: warm, clean -- victim round-robins back to way 0 on the 5th miss.
       for (k <- 1L until 4L) load(dut, cd, addrK(k), Size.LONG, CacheMode.WRITETHROUGH)
@@ -637,7 +637,7 @@ class DcacheSpec extends AnyFunSuite {
 
       // The way is now clean (a fresh allocate always clears dirty) and holds the
       // NEW (addrK(4)) line -- a reload must NOT re-trigger a refill.
-      assert(!dut.dcache.logic.dirtys(0)(setIdx).toBoolean, "way 0 must be clean after reallocation")
+      assert(dut.dcache.logic.dirtysMem(0).getBigInt(setIdx) == 0, "way 0 must be clean after reallocation")
       val beforeAr = arCount
       val got2 = load(dut, cd, addrK(4), Size.LONG, CacheMode.WRITETHROUGH)
       assert(got2 == expected(addrK(4), 4), "reload of the new line is a clean hit")
@@ -1093,7 +1093,7 @@ class DcacheSpec extends AnyFunSuite {
       cd.waitSamplingWhere(dut.dcache.logic.storeAckReg.toBoolean)
       cd.waitSampling(2)
       val setIdx = SET.toInt
-      assert(dut.dcache.logic.dirtys(0)(setIdx).toBoolean, "way 0 must be dirty before the eviction")
+      assert(dut.dcache.logic.dirtysMem(0).getBigInt(setIdx) != 0, "way 0 must be dirty before the eviction")
 
       // Ways 1..3: warm, clean -- victim round-robins back to way 0 on the 5th miss.
       for (k <- 1L until 4L) load(dut, cd, addrK(k), Size.LONG, CacheMode.WRITETHROUGH)
@@ -1164,7 +1164,7 @@ class DcacheSpec extends AnyFunSuite {
       // unconditional on the eviction's B response -- EVICT_WR's `goto(REFILL)` above
       // fires regardless of `axi.b.payload.resp`) and holds the NEW line; a reload
       // must not re-trigger a refill.
-      assert(!dut.dcache.logic.dirtys(0)(setIdx).toBoolean, "way 0 must be clean after reallocation")
+      assert(dut.dcache.logic.dirtysMem(0).getBigInt(setIdx) == 0, "way 0 must be clean after reallocation")
       val beforeAr = arCount
       val got2 = load(dut, cd, addrK(4), Size.LONG, CacheMode.WRITETHROUGH)
       assert(got2 == expected(addrK(4), 4), "reload of the new line is a clean hit")
@@ -1246,7 +1246,7 @@ class DcacheSpec extends AnyFunSuite {
 
   def setOf(addr: Long): Int = ((addr >> 4) & 0x7F).toInt
   def anyDirtyIn(dut: Dut, addr: Long): Boolean =
-    (0 until 4).exists(w => dut.dcache.logic.dirtys(w)(setOf(addr)).toBoolean)
+    (0 until 4).exists(w => dut.dcache.logic.dirtysMem(w).getBigInt(setOf(addr)) != 0)
 
   // (P5.4-a) CPUSH, Line scope: a dirty COPYBACK line is written back to memory and
   // left CLEAN but still RESIDENT (push without invalidate).
