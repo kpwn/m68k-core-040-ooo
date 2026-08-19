@@ -217,6 +217,10 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     fe.writeProt  := walker.io.rsp.writeProt
     fe.supervisor := walker.io.rsp.supervisor
     fe.cacheMode  := walker.io.rsp.cacheMode
+    // Fetch is always a read (task #210's write-hit M-refresh is a D-side-only
+    // concept); still thread the walker's own computed value through rather than
+    // a bare constant so the field is never left with a made-up value.
+    fe.modified   := walker.io.rsp.modified
     tlb.io.fillValid := False
     tlb.io.fillVpn   := walkVpn
     tlb.io.fillEntry := fe
@@ -249,6 +253,12 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // entry drains at the fetching instruction's commit and is discarded on a flush.
     val umq = new UmWriteQueue(4)
     umQueueFull := umq.io.full
+    // Task #210 added a mandatory pageQuery/pageHazard port to UmWriteQueue for
+    // the D-side write-hit M-refresh race; the I-side has no such race (fetches
+    // never set M, and no write-hit-triggered re-walk exists here) so this is
+    // wired but deliberately NOT consulted -- keeps ItlbPlugin's own behavior
+    // byte-for-byte unchanged.
+    umq.io.pageQuery := _req.vpn
     umq.io.alloc.valid          := walker.io.done && walker.io.rsp.umWrite.valid && !walker.io.rsp.fault
     umq.io.alloc.payload.robId  := walkRobId
     umq.io.alloc.payload.addr   := walker.io.rsp.umWrite.addr

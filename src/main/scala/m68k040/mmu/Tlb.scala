@@ -10,13 +10,19 @@ import spinal.lib._
   *  - ppn     : physical page number (addr[31:12]).
   *  - writeProt: page is write-protected (a write access faults).
   *  - supervisor: page requires supervisor access (a user access faults).
-  *  - cacheMode: cacheable / inhibited. */
+  *  - cacheMode: cacheable / inhibited.
+  *  - modified : task #210 -- the leaf descriptor's M bit as of this entry's last
+  *    fill (mirrors `WalkRsp.modified`: already reflects any write-triggered set).
+  *    A write-hit against an entry with `modified=false` must trigger a real
+  *    table-search re-walk to set M in memory + here (MC68040 UM S3.3); once set,
+  *    later write-hits to the SAME entry must not re-walk again. */
 case class TlbEntry() extends Bundle {
   val vpnTag     = UInt(Tlb.tagBitsFor(Tlb.DefaultEntries, Tlb.DefaultWays, Tlb.DefaultBanks) bits)
   val ppn        = UInt(20 bits)
   val writeProt  = Bool()
   val supervisor = Bool()
   val cacheMode  = CacheMode()
+  val modified   = Bool()
 }
 
 object Tlb {
@@ -88,6 +94,8 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
   val wProt   = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(False))))
   val sup     = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(False))))
   val cmode   = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(CacheMode.WRITETHROUGH))))
+  // Task #210: per-entry M-bit shadow (see TlbEntry doc).
+  val modif   = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(False))))
   // round-robin victim per (bank,set)
   val victim  = Vec.fill(banks)(Vec.fill(nSets)(RegInit(U(0, wayBits bits))))
 
@@ -109,6 +117,7 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
     e.writeProt  := wProt(lkBank)(w)(lkSet)
     e.supervisor := sup(lkBank)(w)(lkSet)
     e.cacheMode  := cmode(lkBank)(w)(lkSet)
+    e.modified   := modif(lkBank)(w)(lkSet)
     entVec(w) := e
   }
   io.hit      := hitVec.orR
@@ -129,6 +138,7 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
         wProt(b)(w)(flSet)  := io.fillEntry.writeProt
         sup(b)(w)(flSet)    := io.fillEntry.supervisor
         cmode(b)(w)(flSet)  := io.fillEntry.cacheMode
+        modif(b)(w)(flSet)  := io.fillEntry.modified
       }
     }
     victim(flBank)(flSet) := flWay + 1

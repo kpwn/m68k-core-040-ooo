@@ -117,6 +117,12 @@ case class WalkRsp() extends Bundle {
   // M on a write access). Folded into one byte write at the page-descriptor's low
   // byte (the byte holding U/M/PDT bits).
   val umWrite     = WalkUmWrite()
+  // Task #210: the leaf page descriptor's M (modified) bit as it stands AFTER this
+  // walk's own U/M update (i.e. `pgModified(d) || isWrite` — a write access always
+  // sets M). This is what the owning TLB should cache per-entry so a later
+  // write-hit can tell "M is already set in memory, no re-walk needed" from "M is
+  // still clear, a table search must run" without re-reading the descriptor.
+  val modified    = Bool()
 }
 
 /** Transparent-translation register (TTR) match logic (task #194): ITT0/ITT1 (I-side)

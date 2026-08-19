@@ -340,6 +340,95 @@ class UmWriteSpec extends AnyFunSuite {
     }
   }
 
+  // Task #210: a write that HITS an already-resident TLB entry whose cached M bit
+  // is clear must trigger a REAL table-search re-walk (the same single-outstanding
+  // walker machinery a cold miss uses) whose deferred descriptor write, once
+  // committed, sets M in memory. This access's OWN response is deliberately held
+  // back until that walk completes (exactly like a cold miss) rather than firing
+  // immediately with the walk backgrounded -- an earlier version of this fix did
+  // the latter and passed every DIRECTED test here while silently NEVER DRAINING
+  // on the real full core: `UmWriteQueue.commit` (see its own file) only marks
+  // committed an entry that is ALREADY allocated at the exact cycle the one-shot
+  // commit pulse arrives. The cold-miss path is safe by construction because its
+  // response -- and hence the triggering instruction's own retirement/commit --
+  // is held back until `walker.io.done`, the SAME cycle the queue allocation
+  // happens, so the commit pulse can never arrive before the entry exists. An
+  // immediate hit response breaks that invariant: the instruction can retire (and
+  // pulse commit) many cycles before the background walk even finishes, and the
+  // late allocation is then permanently stuck uncommitted. Blocking here costs
+  // one real 3-level walk -- exactly the "a table search proceeds" latency real
+  // hardware pays too -- but is correct by the same construction the miss path
+  // already relies on.
+  test("task #210: write-hit against an M=0 resident entry re-walks to set M", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val (cd, mem) = init(dut)
+      val va = 0x01A0B000L
+      val pageAddr = buildTable(mem, va, ppn = 0x67890L)
+      assert(mem.peekByte(pageAddr + 3) == 0x01, "initial descriptor: resident, U=0, M=0")
+
+      var arCount = 0
+      fork { while (true) { cd.waitSampling()
+        if (dut.walkerAxi.ar.valid.toBoolean && dut.walkerAxi.ar.ready.toBoolean) arCount += 1
+      } }
+
+      // READ (robId 1): cold miss -> walk -> fill (TLB entry modified=false); U-only
+      // deferred write queued and committed.
+      walk(dut, cd, va, write = false, robId = 1)
+      val afterRead = arCount
+      assert(afterRead >= 3, s"read miss should have walked; got $afterRead ARs")
+      dut.probe.logic.commitValid #= true
+      dut.probe.logic.commitId #= 1
+      cd.waitSampling()
+      dut.probe.logic.commitValid #= false
+      var guard = 0
+      while (mem.peekByte(pageAddr + 3) != 0x09 && guard < 200) { cd.waitSampling(); guard += 1 }
+      assert(mem.peekByte(pageAddr + 3) == 0x09, f"post-read-commit descriptor should be U=1,M=0 (0x09); got 0x${mem.peekByte(pageAddr + 3)}%x")
+
+      // WRITE the SAME va (robId 2): TLB-hits but the cached entry's modified bit
+      // is still false, so this must fall through to a REAL 3-level re-walk (its
+      // own tagged response only fires once that walk completes).
+      dut.probe.logic.accessRobId #= 2
+      dut.probe.logic.reqIn.valid #= true
+      dut.probe.logic.reqIn.vpn   #= vpnOf(va)
+      dut.probe.logic.reqIn.write #= true
+      dut.probe.logic.reqIn.supervisor #= false
+      cd.waitSampling()
+      guard = 0
+      while (!dut.probe.logic.rspOut.ready.toBoolean && guard < 300) { cd.waitSampling(); guard += 1 }
+      assert(dut.probe.logic.rspOut.ready.toBoolean, "write-hit-needing-refresh response must eventually fire")
+      dut.probe.logic.reqIn.valid #= false
+      assert(arCount > afterRead,
+        s"write-hit against M=0 entry must have performed a real re-walk before responding: $afterRead -> $arCount")
+
+      // Commit robId 2 (only NOW, after the response -- and hence the umq
+      // allocation -- are already known to have happened) -> the deferred M
+      // write drains.
+      dut.probe.logic.commitValid #= true
+      dut.probe.logic.commitId #= 2
+      cd.waitSampling()
+      dut.probe.logic.commitValid #= false
+      guard = 0
+      while (mem.peekByte(pageAddr + 3) != 0x19 && guard < 300) { cd.waitSampling(); guard += 1 }
+      assert(mem.peekByte(pageAddr + 3) == 0x19, f"post-write-hit-commit descriptor should be U=1,M=1 (0x19); got 0x${mem.peekByte(pageAddr + 3)}%x")
+
+      // A SECOND write-hit to the same (now modified=true) entry must NOT re-walk.
+      val beforeSecond = arCount
+      dut.probe.logic.accessRobId #= 3
+      dut.probe.logic.reqIn.valid #= true
+      dut.probe.logic.reqIn.vpn   #= vpnOf(va)
+      dut.probe.logic.reqIn.write #= true
+      dut.probe.logic.reqIn.supervisor #= false
+      cd.waitSampling()
+      guard = 0
+      while (!dut.probe.logic.rspOut.ready.toBoolean && guard < 300) { cd.waitSampling(); guard += 1 }
+      assert(dut.probe.logic.rspOut.ready.toBoolean, "second write-hit response must fire promptly")
+      dut.probe.logic.reqIn.valid #= false
+      cd.waitSampling(10)
+      assert(arCount == beforeSecond,
+        s"a write-hit against an already-modified=true entry must NOT re-walk: $beforeSecond -> $arCount")
+    }
+  }
+
   test("PFLUSHA during an active walk poisons its later response, fill, and U/M update", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val (cd, mem) = init(dut)

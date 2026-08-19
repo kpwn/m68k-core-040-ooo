@@ -69,6 +69,9 @@ class TableWalker extends Component {
   val rUmValid = Reg(Bool())
   val rUmAddr  = Reg(UInt(32 bits))
   val rUmByte  = Reg(Bits(8 bits))
+  // Task #210: the leaf descriptor's M bit as it stands after this walk's own
+  // U/M update (see WalkRsp.modified doc).
+  val rModified = Reg(Bool())
   val donePulse = RegInit(False)
 
   // ---- AXI defaults ----
@@ -214,6 +217,11 @@ class TableWalker extends Component {
         // only queue if a bit actually changes
         val changes = (newByte =/= curByte)
         rUmValid := noFault && changes
+        // Task #210: newByte(4) is the M bit as it stands after this walk's own
+        // update (curByte's M, OR'd with setM on a write) -- exactly what the
+        // owning TLB should cache for this entry regardless of whether `changes`
+        // is true (a resident hit that's already M=1 must not re-walk either).
+        rModified := newByte(4)
         // Task #194 (big-endian fix): `d(7 downto 0)` is the descriptor's numeric LOW
         // byte (holds PDT/W/U/M per the 68k page-descriptor format) — but real 68k
         // memory is big-endian, so that numeric LSB physically lives at the HIGHEST
@@ -244,4 +252,5 @@ class TableWalker extends Component {
   io.rsp.umWrite.valid   := rUmValid
   io.rsp.umWrite.addr    := rUmAddr
   io.rsp.umWrite.newByte := rUmByte
+  io.rsp.modified        := rModified
 }
