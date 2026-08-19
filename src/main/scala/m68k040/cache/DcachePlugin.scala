@@ -168,6 +168,27 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     val dirtysWrEn   = Vec.fill(ways)(False)
     val dirtysWrSet  = Vec.fill(ways)(U(0, setBits bits))
     val dirtysWrData = Vec.fill(ways)(False)
+    // Task #255: per-writer vote vectors -- the same "review-added collision
+    // detector" idiom as `diagFaultKind0Fires`/`diagFaultKind1Fires` far below
+    // (plain default-False signals, driven unconditionally at each real writer
+    // site, consumed ONLY by a GenerationFlags.simulation-gated assert). Needed
+    // because `validsWrEn(w)`/`dirtysWrEn(w)` themselves are last-assignment-wins
+    // muxes: they show the FINAL result, not how many of the writer sites above
+    // tried to fire for way `w` this cycle. These vote bits make the task-#240
+    // hand-proven exclusivity a runtime-checked invariant instead of merely an
+    // argued one. Zero synthesis cost: with no writer site ever pulsing a bit
+    // (which only happens inside a live collision, provably unreachable per the
+    // task-#240 report), each vote wire is a constant-False signal with no
+    // fanout outside the simulation-only assert below, so Vivado's own dead-code
+    // elimination removes it entirely from a non-simulation netlist.
+    val validsVoteW1 = Vec.fill(ways)(False)   // W1: REFILL-allocate
+    val validsVoteW2 = Vec.fill(ways)(False)   // W2: maint CHECK-invalidate
+    val validsVoteW3 = Vec.fill(ways)(False)   // W3: maint WRB-invalidate
+    val dirtysVoteD1 = Vec.fill(ways)(False)   // D1: REFILL-allocate
+    val dirtysVoteD2 = Vec.fill(ways)(False)   // D2: REPLAY-merge write-allocate
+    val dirtysVoteD3 = Vec.fill(ways)(False)   // D3: maint CHECK-invalidate
+    val dirtysVoteD4 = Vec.fill(ways)(False)   // D4: maint WRB-clean
+    val dirtysVoteD5 = Vec.fill(ways)(False)   // D5: store-S3-copyback
     for (w <- 0 until ways) {
       dataMem(w).write(wrSet(w), wrData(w), wrEn(w))
       tagMem(w).write(wrSet(w), wrTag(w), wrTagEn(w))
@@ -1524,6 +1545,8 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
               dirtysWrData(w) := False   // a fresh allocate is always clean until
                                              // the write-allocate merge below (or a
                                              // later hit) dirties it
+              validsVoteW1(w) := True    // Task #255 exclusivity tripwire (W1/D1)
+              dirtysVoteD1(w) := True
             }
             victim(missSet) := victim(missSet) + 1
             missArrayWrite  := True
@@ -1644,6 +1667,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
               dirtysWrEn(w)   := True
               dirtysWrSet(w)  := missSet
               dirtysWrData(w) := True
+              dirtysVoteD2(w) := True    // Task #255 exclusivity tripwire (D2)
             }
             storeAllocAckReg := True
             missArrayWrite   := True
@@ -1951,6 +1975,8 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
                 dirtysWrEn(w)   := True
                 dirtysWrSet(w)  := walkSet
                 dirtysWrData(w) := False
+                validsVoteW2(w) := True   // Task #255 exclusivity tripwire (W2/D3)
+                dirtysVoteD3(w) := True
               }
             }
             goto(NEXTW)
@@ -2000,10 +2026,12 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
                 dirtysWrEn(w)   := True
                 dirtysWrSet(w)  := walkSet
                 dirtysWrData(w) := False
+                dirtysVoteD4(w) := True   // Task #255 exclusivity tripwire (D4)
                 when(cmd.invalidate) {
                   validsWrEn(w)   := True
                   validsWrSet(w)  := walkSet
                   validsWrData(w) := False
+                  validsVoteW3(w) := True   // Task #255 exclusivity tripwire (W3)
                 }
               }
               goto(NEXTW)
@@ -2046,6 +2074,29 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
       assert(!(maintAxiPairOpen && (storeWantsAxi || evictAxiPairOpen)),
         "DcachePlugin: the cache-maintenance writeback's AXI aw/w pair was open at the same time as the store's or the eviction's -- AXI4 AW/W FIFO ordering cross-attributes overlapping pairs regardless of id (the proven-unsafe P4.3 revision-1/2 failure mode)",
         FAILURE)
+    }
+
+    // Task #255: turn the task-#240 hand-proven `valids`/`dirtys` write-mux
+    // exclusivity into a runtime-checked invariant, same `CountOne(...) <= U(1)`
+    // idiom as `stS2HitVec`/`ackSources` below. `validsWrEn(w)`/`dirtysWrEn(w)`
+    // are plain last-assignment-wins muxes: reading them alone cannot tell "one
+    // writer fired" apart from "two+ writers raced this way and the last one in
+    // source order silently won (wrong WrSet/WrData, not just a wrong enable)".
+    // The per-writer vote vectors declared next to `validsWrEn`/`dirtysWrEn`
+    // above exist exactly to make that distinction, so this checks each way,
+    // each cycle, that AT MOST ONE of the enumerated writer sites voted --
+    // matching, not weakening or strengthening, the task-#240 report's argued
+    // invariant. Sim-only; zero synthesis cost (see the vote-vector declaration
+    // comment for why).
+    GenerationFlags.simulation {
+      for (w <- 0 until ways) {
+        assert(CountOne(Seq(validsVoteW1(w), validsVoteW2(w), validsVoteW3(w))) <= U(1),
+          "DcachePlugin: multiple writers targeted validsMem(w) the same cycle -- the task-#240 write-mux exclusivity proof was violated",
+          FAILURE)
+        assert(CountOne(Seq(dirtysVoteD1(w), dirtysVoteD2(w), dirtysVoteD3(w), dirtysVoteD4(w), dirtysVoteD5(w))) <= U(1),
+          "DcachePlugin: multiple writers targeted dirtysMem(w) the same cycle -- the task-#240 write-mux exclusivity proof was violated",
+          FAILURE)
+      }
     }
 
     // ---- store read-port arbiter CONTROL (no BRAM-address logic here) ----
@@ -2192,6 +2243,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
             dirtysWrEn(w)   := True
             dirtysWrSet(w)  := stS3Set
             dirtysWrData(w) := True
+            dirtysVoteD5(w) := True   // Task #255 exclusivity tripwire (D5)
           }
         }
         storeArrayWrite    := True
