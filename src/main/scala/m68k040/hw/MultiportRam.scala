@@ -207,9 +207,29 @@ case class RamAsyncMwMux[T <: Data](payloadType: HardType[T], depth: Int, writeP
 
   val writes = for ((port, storage, loc) <- (io.writes, ram, location.io.writes).zipped) yield new Area {
     storage.write(enable = port.valid, address = port.address, data = port.data.asBits)
-    loc.valid := port.valid
-    loc.address := port.address
-    loc.data := U(ram.indexOf(storage))
+    val idx = ram.indexOf(storage)
+    // ── FMax "PRF LVT write broadcast": local keep-tagged loc.valid/address ──
+    // (docs/superpowers/specs/2026-08-19-fmax-resilience-postmortem.md §5.2,
+    //  /tmp/prf-address-fanout-scoping.md, task tracker #259)
+    //
+    // Mirrors the already-proven RobPlugin.scala `lsFaultSel`/`sqFaultSel`
+    // pattern: `port.valid`/`port.address` is a late control/address signal
+    // shared between a SMALL consumer (this write port's own bank slot inside
+    // `location`'s narrow LVT cross-read/select logic — 3 cores x N banks x
+    // (writePorts-1) cross-reads) and a LARGE consumer (this same write
+    // port's wide `storage.write(...)` data array, replicated across
+    // `ReplicatedBank`'s replicas x 32 data bits). Without a distinct node the
+    // tool is free to share ONE physical driver for `port.valid`/
+    // `port.address` across both consumers, so the narrow LVT side pays a
+    // route/placement penalty it does not need, riding on a several-hundred-
+    // way fanout net it doesn't otherwise require. The named+kept local copies
+    // give the LVT side its OWN local node to consume instead — same boolean
+    // function, same cycle, no latency change.
+    val locValid = CombInit(port.valid);   locValid.setName(s"wr${idx}LocValid").addAttribute("keep", "true")
+    val locAddr  = CombInit(port.address); locAddr.setName(s"wr${idx}LocAddr").addAttribute("keep", "true")
+    loc.valid := locValid
+    loc.address := locAddr
+    loc.data := U(idx)
   }
 
   val reads = for ((port, loc) <- (io.read, location.io.read).zipped) yield new Area {
