@@ -67,3 +67,4 @@ _halt_fail:
     .align 2
 _byte_zero:
     .byte   0
+    .byte   0                          | padding, keep image an even byte count
