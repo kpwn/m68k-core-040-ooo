@@ -150,11 +150,18 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
       assert(dut.uop.op.toEnum == DecOp.EOR && dut.uop.toCcr.toBoolean && !dut.uop.unimplemented.toBoolean)
     }
   }
-  // ANDI #imm,SR (0x027C, word) is privileged -> deferred (illegal). CMPI #imm,CCR is
-  // not a valid form -> illegal. Neither is a toCcr op.
-  test("ANDI #imm,SR (word, 0x027C) -> unimplemented (privileged, deferred)", VerilatorTest) {
+  // ANDI #imm,SR (0x027C, word) is a real PRIVILEGED sysOp (task #161: reuses
+  // SysKind.MOVE_TO_SR's ExceptionUnit S_APPLY case), NOT "unimplemented" -- this
+  // test previously asserted the pre-#161 stale/illegal behavior (confirmed via
+  // git-stash bisect against task #228's unrelated diff, reproduces identically on
+  // either side, i.e. genuinely stale, not a live bug). Per the isToSr assembler
+  // comment (MicroOpAssembler.scala ~line 2010): needsSupervisor is NOT the gate for
+  // this form -- privilege is enforced by RobPlugin's sysPrivFault, keyed off
+  // sysOp/sysKind alone, so this assertion does NOT check needsSupervisor.
+  test("ANDI #imm,SR (word, 0x027C) -> privileged sysOp (MOVE_TO_SR), not toCcr/unimplemented", VerilatorTest) {
     run { dut => drive(dut, 0x027C, 0x0000, len = 2); sleep(1)
-      assert(dut.uop.unimplemented.toBoolean && !dut.uop.toCcr.toBoolean)
+      assert(dut.uop.sysOp.toBoolean && dut.uop.sysKind.toEnum == SysKind.MOVE_TO_SR)
+      assert(!dut.uop.toCcr.toBoolean && !dut.uop.unimplemented.toBoolean)
     }
   }
   test("non-simple packet -> unimplemented", VerilatorTest) {
