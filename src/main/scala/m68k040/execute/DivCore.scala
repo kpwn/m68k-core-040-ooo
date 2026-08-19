@@ -42,9 +42,20 @@ class DivCore extends Component {
   // Restoring divider over the full 64-bit dividend: 64 iterations. The running
   // remainder is 33 bits (enough to hold a shifted-in bit above a 32-bit value for
   // the trial subtract against the 32-bit divisor).
+  //
+  // `qd` merges what used to be two separate 64-bit registers (`quot`/`divd`, task
+  // #253): a classic restoring divider needs only ONE combined register here, because
+  // each cycle consumes exactly one not-yet-used dividend MSB (read via `qd(63)`) and
+  // produces exactly one new quotient bit (shifted into bit 0) -- over 64 cycles the
+  // register's upper bits (still-unconsumed dividend) monotonically shrink by exactly
+  // the same 1 bit/cycle rate its lower bits (already-produced quotient) grow, so the
+  // same 64 bit-slots serve both roles across the run and the final value is bit-for-
+  // bit identical to the old `quot` register's final value (verified: unrolling the
+  // recurrence qd_{k+1} = qd_k(62:0) ## fits_k against quot_{k+1} = quot_k(62:0) ## fits_k
+  // shows qd's top bit read each cycle always equals the old divd(63), and after 64
+  // cycles qd == q0 q1 ... q63, the same MSB-first order `quot` produced).
   val rem  = Reg(UInt(33 bits)) init 0    // running partial remainder
-  val quot = Reg(UInt(64 bits)) init 0    // accumulated quotient
-  val divd = Reg(UInt(64 bits)) init 0    // remaining dividend bits (shifted out MSB-first)
+  val qd   = Reg(UInt(64 bits)) init 0    // dividend (upper, shrinking) / quotient (lower, growing)
   val dvsr = Reg(UInt(32 bits)) init 0
   val cnt  = Reg(UInt(7 bits)) init 0     // 0..64
   val running = RegInit(False)
@@ -53,7 +64,7 @@ class DivCore extends Component {
 
   io.busy      := running
   io.done      := donePulse
-  io.quotient  := quot
+  io.quotient  := qd
   io.remainder := rem(31 downto 0)
   io.divByZero := dz
 
@@ -63,28 +74,26 @@ class DivCore extends Component {
     // Latch operands; divide-by-zero short-circuits (no iteration).
     when(io.divisor === 0) {
       dz        := True
-      quot      := 0
+      qd        := 0
       rem       := 0
       donePulse := True
       running   := False
     } otherwise {
       dz      := False
       rem     := 0
-      quot    := 0
-      divd    := io.dividend
+      qd      := io.dividend
       dvsr    := io.divisor
       cnt     := 0
       running := True
     }
   } elsewhen(running) {
     // One restoring step: shift the next dividend MSB into rem, trial-subtract dvsr.
-    val shifted = (rem(31 downto 0) ## divd(63)).asUInt        // 33 bits
+    val shifted = (rem(31 downto 0) ## qd(63)).asUInt          // 33 bits
     val sub     = shifted - (False ## dvsr).asUInt             // 33-bit subtract
     val fits    = !sub(32)                                     // no borrow -> divisor fits
-    rem  := Mux(fits, sub, shifted)
-    quot := (quot(62 downto 0) ## fits).asUInt                 // quotient bit = fits
-    divd := (divd(62 downto 0) ## False).asUInt                // shift dividend left
-    cnt  := cnt + 1
+    rem := Mux(fits, sub, shifted)
+    qd  := (qd(62 downto 0) ## fits).asUInt                    // shift dividend out / quotient bit in
+    cnt := cnt + 1
     when(cnt === U(63)) {
       running   := False
       donePulse := True
