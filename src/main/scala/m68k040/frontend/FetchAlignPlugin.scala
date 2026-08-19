@@ -796,18 +796,25 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     p0LiveReg.simple        init False
     p0LiveReg.lenWords      init 0
     p0LiveReg.ambiguousLine init True    // reset state must never read as "already resolved"
-    // FMax Lever B: `p0LiveReg.size` is UNREAD by construction — Aligner deliberately takes
-    // slot0's size from `preds(0).size` rather than from the `p0` ambiguity mux (the two
-    // are identical, since `size` needs no lookahead word, and bypassing the mux keeps
-    // `size` off `L0`'s arrival chain, which is the point of the lever).
+    // task #250: `p0LiveReg.size` is UNREAD by construction — `Aligner.align` sources
+    // slot0's/slot1's `size` from `preds(0).size`/`p1.size` directly (see Aligner.scala's
+    // "Lever B" comments), never from the `p0 = Mux(preds(0).ambiguousLine, p0LiveReg,
+    // preds(0))` mux this register feeds. Confirmed fresh against Aligner.align: `p0.size`
+    // does not appear anywhere in that function.
     //
-    // The design spec claims this field is therefore PRUNED, so that the live reclassify is
-    // "not a 33rd hardware instance of the size decoder". That claim is FALSE and was
-    // checked against the real netlist: `p0LiveReg_size` appears 117 times in the design
-    // spec's own probe netlist and 118 times here. It survives elaboration in both, so it
-    // is not a difference between them and not a regression — but do not rely on the
-    // pruning argument if this field's cost ever matters. The init below is for reset
-    // determinism only (an uninitialised Reg randomises per sim seed).
+    // A prior version of this comment claimed the field was therefore PRUNED from the
+    // netlist ("not a 33rd hardware instance of the size decoder") — that claim was
+    // checked against the real netlist and found FALSE: `p0LiveReg_size` survived
+    // elaboration as a real register (117/118 occurrences in the probed netlists) despite
+    // being unread, because the bulk bundle assignment below drove it from `classify()`
+    // every cycle same as every other field, giving synthesis no dead-code signal. Fixed
+    // by assigning only the fields Aligner actually consumes (`simple`/`lenWords`/
+    // `ambiguousLine`) instead of bulk-assigning the whole `ChunkPredecode` — `.size` is
+    // now never written after its init below, so it is a true constant and synthesis can
+    // fold away both the register and `classify()`'s size-decode subtree feeding it. The
+    // init is kept for reset determinism / bundle-completeness only (an uninitialised Reg
+    // randomises per sim seed, and `ChunkPredecode.size` must have SOME driven value to
+    // elaborate); it is never re-driven by the live reclassify below.
     p0LiveReg.size          init m68k040.isa.Size.BYTE
     // task #242 (memind_wide_disp_dst HANG): pass 3 more lookahead words (op+4/+5/+6) --
     // `ibuf.io.head` is a HEAD_WORDS=10-word window, already resident here, so this is
@@ -831,7 +838,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // see PredecodeWord.scala's classify() for the actual restructuring (flat Vec-indexed
     // select instead of the nested-Mux chain), which is what fixes the regression while
     // this call site's own wiring stays functionally identical to the original fix.
-    p0LiveReg := PredecodeWord.classify(ibuf.io.head(0), ibuf.io.head(1), ibuf.io.head(2), ibuf.io.head(3),
+    val p0LiveClassified = PredecodeWord.classify(ibuf.io.head(0), ibuf.io.head(1), ibuf.io.head(2), ibuf.io.head(3),
       ibuf.io.head(4), ibuf.io.head(5), ibuf.io.head(6),
       extWValid  = availEff >= U(2, 4 bits),
       extW2Valid = availEff >= U(3, 4 bits),
@@ -839,6 +846,14 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       extW4Valid = availEff >= U(5, 4 bits),
       extW5Valid = availEff >= U(6, 4 bits),
       extW6Valid = availEff >= U(7, 4 bits))
+    // task #250: assign only the fields `Aligner.align` actually reads off `p0LiveReg`
+    // (`.simple`/`.lenWords`/`.ambiguousLine`, via the `p0` mux) — NOT a bulk bundle
+    // assign. `.size` is deliberately left undriven here (see the field's own comment
+    // above): leaving `p0LiveClassified.size` unconsumed lets synthesis prune the whole
+    // size-decode subtree of this `classify()` call along with the now-constant register.
+    p0LiveReg.simple        := p0LiveClassified.simple
+    p0LiveReg.lenWords      := p0LiveClassified.lenWords
+    p0LiveReg.ambiguousLine := p0LiveClassified.ambiguousLine
     val availEffPrev = RegNext(availEff) init 0
     // task #242: the content-immutability threshold widens from `cnt<4` to `cnt<7` to
     // match the classify() call now reading `ibuf.io.head(4..6)` too -- a push landing at
@@ -1263,6 +1278,39 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       }
     }
 
+    // task #250: shared helper for the five redirect arms below (`redirect`,
+    // `resetRedirect`, `resume`, `vioRedirect`, `mispredictRedirect`) -- each one restarts
+    // fetch at `newPc` and was previously ~15 nearly-identical inline lines setting this
+    // same field set. Pure mechanical dedup, zero behavioral change: every call site below
+    // sets exactly what its original inline block set, including `resume`'s pre-existing
+    // omission of `faultHold`/`faultEmitted`/`started` (`clearFaultHold = false`). NOT used
+    // by `ftqMismatch`/`predictFire` above: `ftqMismatch` has its own subtly different
+    // priority/suppression story and `predictFire`'s `fetchPc`/`pendingDrop` derivation is
+    // genuinely different (the `actionWins` window-reuse logic), so folding either in here
+    // would blur a real distinction rather than remove a redundant one.
+    def commonRedirect(newPc: UInt, clearFaultHold: Boolean = true): Unit = {
+      decodePc      := newPc
+      // fetchPc = 8-aligned base of the window containing newPc
+      fetchPc       := newPc(31 downto 3) @@ U(0, 3 bits)
+      ibuf.io.flush := True
+      stalled       := False
+      if (clearFaultHold) {
+        // Clear the I-fetch-fault hold: the exception delivered + vectored, resume fetch.
+        faultHold    := False
+        faultEmitted := False
+        started      := True
+      }
+      pendingDrop := newPc(2 downto 1)
+      // Per-fetch stale tracking (recValid/recStale/recDrop) replaces the single-bit
+      // rspStale/dropPending. Mark the in-flight fetch (if any) stale: a redirect
+      // invalidates it. Depth-2: mark ALL ring entries stale -- every fetch issued before
+      // this redirect (and one issued THIS cycle, born stale via redirectThisCycle) is
+      // wrong-path; its response must be discarded. Free slots' stale bits are don't-care
+      // (overwritten at their next issue). This is the recStale bug class: ALL outstanding
+      // fetches stale.
+      ringStale.foreach(_ := True)
+    }
+
     // Wrong framing claim: restart sequentially at the first not-yet-emitted PC (or the
     // just-emitted packet's fall-through), clear only this FTB entry, and suppress one
     // refetch application so the same stale claim cannot livelock. Architectural redirects
@@ -1281,72 +1329,28 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     }
 
     // ---- redirect (highest priority) ----
+    // (No !ic.rsp.valid guard — the per-fetch recStale bit is robust; a stale rsp is
+    // consumed + discarded in the rsp block. recValid is NOT cleared: the fetch is still
+    // physically coming; its stale response clears recValid normally, preserving the
+    // single-outstanding invariant — a new fetch issues only after that frees occupancy.)
     when(redirect.valid) {
-      val newPc   = redirect.payload
-      decodePc    := newPc
-      // fetchPc = 8-aligned base of the window containing newPc
-      fetchPc     := newPc(31 downto 3) @@ U(0, 3 bits)
-      ibuf.io.flush  := True
-      stalled        := False
-      // Clear the I-fetch-fault hold: the exception delivered + vectored, resume fetch.
-      faultHold      := False
-      faultEmitted   := False
-      started        := True
-      pendingDrop    := newPc(2 downto 1)
-      // Per-fetch stale tracking (recValid/recStale/recDrop) replaces the single-bit rspStale/dropPending.
-      // Mark the in-flight fetch (if any) stale: a redirect invalidates it.
-      // (No !ic.rsp.valid guard — the per-fetch recStale bit is robust; a stale rsp is
-      // consumed + discarded in the rsp block. recValid is NOT cleared: the fetch is still
-      // physically coming; its stale response clears recValid normally, preserving the
-      // single-outstanding invariant — a new fetch issues only after that frees occupancy.)
-      // Depth-2: mark ALL ring entries stale — every fetch issued before this redirect
-      // (and one issued THIS cycle, born stale via redirectThisCycle) is wrong-path; its
-      // response must be discarded. Free slots' stale bits are don't-care (overwritten at
-      // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
-      ringStale.foreach(_ := True)
+      commonRedirect(redirect.payload)
     }
 
     // ---- reset-vector redirect (axi-socket adapter D12/D16) ----
-    // Same effect as the external redirect above, and its body is copied verbatim from
-    // that arm (only the payload source differs): placed AFTER the external redirect so a
-    // directed harness driving the external port still wins on the impossible cycle where
-    // both fire, and BEFORE mispredictRedirect so a commit-time redirect keeps its top
-    // priority.
+    // Same effect as the external redirect above (now the same `commonRedirect` call, only
+    // the payload source differs): placed AFTER the external redirect so a directed harness
+    // driving the external port still wins on the impossible cycle where both fire, and
+    // BEFORE mispredictRedirect so a commit-time redirect keeps its top priority.
     when(resetRedirect.valid) {
-      val newPc   = resetRedirect.payload
-      decodePc    := newPc
-      // fetchPc = 8-aligned base of the window containing newPc
-      fetchPc     := newPc(31 downto 3) @@ U(0, 3 bits)
-      ibuf.io.flush  := True
-      stalled        := False
-      // Clear the I-fetch-fault hold: the exception delivered + vectored, resume fetch.
-      faultHold      := False
-      faultEmitted   := False
-      started        := True
-      pendingDrop    := newPc(2 downto 1)
-      // Per-fetch stale tracking (recValid/recStale/recDrop) replaces the single-bit rspStale/dropPending.
-      // Mark the in-flight fetch (if any) stale: a redirect invalidates it.
-      // Depth-2: mark ALL ring entries stale -- every fetch issued before this redirect
-      // (and one issued THIS cycle, born stale via redirectThisCycle) is wrong-path; its
-      // response must be discarded. Free slots' stale bits are don't-care (overwritten at
-      // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
-      ringStale.foreach(_ := True)
+      commonRedirect(resetRedirect.payload)
     }
 
     // ---- resume (lower priority than redirect, active when stalled) ----
+    // Pre-existing behavior preserved exactly: unlike the other four arms, this one does
+    // NOT clear faultHold/faultEmitted/started -- `commonRedirect(clearFaultHold = false)`.
     when(resume.valid && stalled) {
-      val newPc   = resume.payload
-      decodePc    := newPc
-      fetchPc     := newPc(31 downto 3) @@ U(0, 3 bits)
-      ibuf.io.flush  := True
-      stalled        := False
-      pendingDrop    := newPc(2 downto 1)
-      // Per-fetch stale tracking (recValid/recStale/recDrop) replaces the single-bit rspStale/dropPending.
-      // Depth-2: mark ALL ring entries stale — every fetch issued before this redirect
-      // (and one issued THIS cycle, born stale via redirectThisCycle) is wrong-path; its
-      // response must be discarded. Free slots' stale bits are don't-care (overwritten at
-      // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
-      ringStale.foreach(_ := True)
+      commonRedirect(resume.payload, clearFaultHold = false)
     }
 
     // ---- VIO boot-PC injector redirect (vio-jtag-debug spec V17/V19) ----
@@ -1360,27 +1364,10 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // precedence") -- that rationale does not carve out an exception for `resume` just
     // because the brief's author had not yet found it. Placed BEFORE `mispredictRedirect` so
     // a genuine ROB commit-time correction -- real architectural state a debug action must
-    // not corrupt -- always keeps final say. Body copied verbatim from the `resetRedirect`
-    // arm immediately above, payload source changed to `vioRedirect.payload`.
+    // not corrupt -- always keeps final say. Same effect as the `resetRedirect` arm above
+    // (now the same `commonRedirect` call), payload source changed to `vioRedirect.payload`.
     when(vioRedirect.valid) {
-      val newPc   = vioRedirect.payload
-      decodePc    := newPc
-      // fetchPc = 8-aligned base of the window containing newPc
-      fetchPc     := newPc(31 downto 3) @@ U(0, 3 bits)
-      ibuf.io.flush  := True
-      stalled        := False
-      // Clear the I-fetch-fault hold: the exception delivered + vectored, resume fetch.
-      faultHold      := False
-      faultEmitted   := False
-      started        := True
-      pendingDrop    := newPc(2 downto 1)
-      // Per-fetch stale tracking (recValid/recStale/recDrop) replaces the single-bit rspStale/dropPending.
-      // Mark the in-flight fetch (if any) stale: a redirect invalidates it.
-      // Depth-2: mark ALL ring entries stale -- every fetch issued before this redirect
-      // (and one issued THIS cycle, born stale via redirectThisCycle) is wrong-path; its
-      // response must be discarded. Free slots' stale bits are don't-care (overwritten at
-      // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
-      ringStale.foreach(_ := True)
+      commonRedirect(vioRedirect.payload)
     }
 
     // ---- commit-time mispredict redirect (HIGHEST priority) ----
@@ -1390,26 +1377,11 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // flushPc) — a REGISTERED one-cycle pulse. We drive it from the wiring plugin
     // (not by reading host[RedirectService] here) to avoid a Fiber build-order
     // cycle (FetchAlign build -> ROB build -> ... -> FetchAlign.feed). On the pulse
-    // we restart fetch at the resolved flushPc, exactly like an external redirect.
-    // Placed LAST so it wins (later when in SpinalHDL overrides the external one).
+    // we restart fetch at the resolved flushPc, exactly like an external redirect
+    // (same `commonRedirect` call). Placed LAST so it wins (later when in SpinalHDL
+    // overrides the external one).
     when(mispredictRedirect.valid) {
-      val newPc   = mispredictRedirect.payload
-      decodePc    := newPc
-      fetchPc     := newPc(31 downto 3) @@ U(0, 3 bits)
-      ibuf.io.flush  := True
-      stalled        := False
-      started        := True
-      // Clear the I-fetch-fault hold: the commit-side exception delivered the fault
-      // and vectored here -> resume fetching at the redirected (handler) PC.
-      faultHold      := False
-      faultEmitted   := False
-      pendingDrop    := newPc(2 downto 1)
-      // Per-fetch stale tracking (recValid/recStale/recDrop) replaces the single-bit rspStale/dropPending.
-      // Depth-2: mark ALL ring entries stale — every fetch issued before this redirect
-      // (and one issued THIS cycle, born stale via redirectThisCycle) is wrong-path; its
-      // response must be discarded. Free slots' stale bits are don't-care (overwritten at
-      // their next issue). This is the recStale bug class: ALL outstanding fetches stale.
-      ringStale.foreach(_ := True)
+      commonRedirect(mispredictRedirect.payload)
     }
 
     // FTQ occupancy is updated once, with flush last so no same-cycle prediction can
