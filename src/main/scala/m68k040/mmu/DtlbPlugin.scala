@@ -160,9 +160,20 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val walkUmPoison = RegInit(False)
     missPending.simPublic()
 
+    // Task #210: forward-declared (umq itself is built further below, mirroring
+    // umQueueFull's own forward-declaration) -- True while ANY queued-but-not-yet-
+    // drained deferred U/M descriptor write targets the SAME PAGE as this cycle's
+    // incoming request. See the assignment site (next to `umq`) for the full
+    // rationale: a resolved translation alone is not enough to guarantee a
+    // PROGRAM-ORDER-LATER access to that same page observes the updated
+    // descriptor, because the actual memory RMW only drains after the triggering
+    // instruction commits -- strictly later than when its own translation
+    // response (and hence its retirement) becomes possible.
+    val umqPageHazard = Bool()
+
     _rsp.valid   := rspValid && !flushAll
     _rsp.payload := rspPayload
-    _req.ready   := !missPending && (!rspValid || _rsp.ready) && !flushAll
+    _req.ready   := !missPending && (!rspValid || _rsp.ready) && !flushAll && !umqPageHazard
 
     when(_rsp.fire) { rspValid := False }
 
@@ -199,9 +210,38 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       val token = Reg(UInt(m68k040.cache.DTranslationToken.Width bits))
       val robId = Reg(UInt(6 bits))
     }
-    // Direct classes all produce a registered tagged response. A TLB miss instead
-    // captures the existing single walker context. Accept-last ordering lets an old
-    // response fire while the next direct hit is captured in the same cycle.
+    // Task #210 (MC68040 UM S3.3): "If the page is not write protected and the
+    // modified bit of the ATC entry is clear, a table search proceeds to set the
+    // modified bit in both the page descriptor in memory and in the ATC." A
+    // write-hit against a resident entry whose cached M bit is still clear must
+    // NOT take the fast direct-hit response path below -- it must fall through to
+    // the SAME walker capture a genuine miss uses.
+    //
+    // This is deliberately NOT "respond immediately, refresh in the background":
+    // an earlier version of this fix did exactly that and LOOKED correct in
+    // isolation (the walk genuinely ran, the descriptor genuinely got queued for
+    // an RMW) but silently never drained on the real full core. Root cause:
+    // `UmWriteQueue.commit` marks committed only entries that are ALREADY
+    // allocated at the exact cycle the commit pulse arrives (a one-cycle Flow,
+    // not sticky) -- see UmWriteQueue.scala. The cold-miss path is safe by
+    // construction because its response (and hence the triggering instruction's
+    // OWN retirement) is held back until `walker.io.done`, the SAME cycle the
+    // umq allocation happens, so the ROB cannot possibly commit that robId before
+    // its entry exists. An immediate hit response breaks that ordering outright:
+    // the instruction can retire (and its commit pulse can fire) many cycles
+    // before the background walk even finishes, let alone allocates -- the
+    // pulse arrives, finds no matching entry yet, and the later allocation is
+    // permanently stuck uncommitted (never drains). Blocking here costs the
+    // access one real 3-level walk (exactly the "a table search proceeds"
+    // latency real hardware pays too) but is correct by the same construction
+    // the existing miss path already relies on.
+    val fault = permFault(tlbEntry.writeProt, tlbEntry.supervisor,
+                           _req.payload.write, _req.payload.supervisor)
+    val needsMRefresh = tlbHit && !fault && _req.payload.write && !tlbEntry.modified
+    // Direct classes all produce a registered tagged response. A TLB miss (or a
+    // write-hit needing the M-refresh table search above) instead captures the
+    // existing single walker context. Accept-last ordering lets an old response
+    // fire while the next direct hit is captured in the same cycle.
     when(_req.fire) {
       when(!mmuEnable) {
         rspValid             := True
@@ -217,12 +257,11 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
         rspPayload.fault     := False
         rspPayload.token     := _req.payload.token
         rspVpn               := _req.payload.vpn
-      } elsewhen(tlbHit) {
+      } elsewhen(tlbHit && !needsMRefresh) {
         rspValid             := True
         rspPayload.ppn       := tlbEntry.ppn
         rspPayload.cacheMode := tlbEntry.cacheMode
-        rspPayload.fault     := permFault(tlbEntry.writeProt, tlbEntry.supervisor,
-                                           _req.payload.write, _req.payload.supervisor)
+        rspPayload.fault     := fault
         rspPayload.token     := _req.payload.token
         rspVpn               := _req.payload.vpn
       } otherwise {
@@ -270,6 +309,10 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     fe.writeProt  := walker.io.rsp.writeProt
     fe.supervisor := walker.io.rsp.supervisor
     fe.cacheMode  := walker.io.rsp.cacheMode
+    // Task #210: the leaf descriptor's M bit as of this fill (see WalkRsp.modified
+    // doc) -- correctly False on a fresh cold-miss read, True on any walk the
+    // write access itself triggered (the walker always sets M on a write).
+    fe.modified   := walker.io.rsp.modified
     tlb.io.fillValid := False
     tlb.io.fillVpn   := walkVpn
     tlb.io.fillEntry := fe
@@ -313,6 +356,19 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // performed speculatively.
     val umq = new UmWriteQueue(4)
     umQueueFull := umq.io.full
+    // Task #210: a queued-but-undrained deferred descriptor write is invisible to
+    // ordinary memory reads until it actually lands (commit marks it drainable;
+    // the AXI RMW itself then takes further cycles) -- strictly LATER than when
+    // the triggering instruction's own translation resolves. A PROGRAM-ORDER-LATER
+    // access to the SAME PAGE (page-granularity, not exact-byte: cheap and only
+    // ever over-blocks, never under-blocks) must not translate/proceed until that
+    // write has drained, or it can observe the stale pre-update descriptor byte --
+    // exactly the read-after-the-triggering-write race this task's own ATC test
+    // exercises. Real 68040 hardware has no such gap because a table search is
+    // simply part of the write's own (fully synchronous, non-speculative) bus
+    // activity; this is this OoO core's equivalent enforcement.
+    umq.io.pageQuery := _req.payload.vpn
+    umqPageHazard    := umq.io.pageHazard
     umq.io.alloc.valid          := walker.io.done && walker.io.rsp.umWrite.valid &&
                                   !walker.io.rsp.fault && !walkUmPoison &&
                                   !walkFlushPoison && !flushAll

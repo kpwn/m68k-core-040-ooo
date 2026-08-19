@@ -44,6 +44,19 @@ class UmWriteQueue(depth: Int = 4) extends Component {
     // Admission credit for the owning single walker. A full queue must never
     // silently wrap `tail` and overwrite an older architectural U/M update.
     val full     = out Bool ()
+    // Task #210: page-granularity hazard check against every still-VALID (not yet
+    // drained/acked) entry, regardless of its committed state. A queued-but-
+    // undrained deferred descriptor write is invisible to ordinary memory reads
+    // until the AXI RMW actually lands -- strictly LATER than when the triggering
+    // instruction's own translation resolves (which only requires the WALK to
+    // finish, not the drain). The owning DTLB uses this to hold off translating a
+    // program-order-later access to the SAME PAGE until the write has drained, so
+    // it cannot observe the stale pre-update descriptor byte. Page-granularity
+    // (not exact-byte) is a deliberately conservative/cheap over-approximation:
+    // it only ever adds a rare, correctly-scoped stall, never misses a real
+    // hazard.
+    val pageQuery  = in UInt (20 bits)
+    val pageHazard = out Bool ()
   }
 
   val valids    = Vec.fill(depth)(RegInit(False))
@@ -55,6 +68,9 @@ class UmWriteQueue(depth: Int = 4) extends Component {
   val head = RegInit(U(0, ptrW bits))
   val tail = RegInit(U(0, ptrW bits))
   io.full := valids.asBits.andR
+  io.pageHazard := (0 until depth).map(i =>
+    valids(i) && (addrs(i)(31 downto 12) === io.pageQuery)
+  ).reduce(_ || _)
 
   // ---- drain: oldest valid+committed entry, held until ack ----
   val drainBusy  = RegInit(False)

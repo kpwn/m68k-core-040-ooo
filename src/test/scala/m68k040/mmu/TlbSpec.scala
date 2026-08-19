@@ -26,6 +26,7 @@ class TlbSpec extends AnyFunSuite {
     dut.io.fillEntry.writeProt  #= wp
     dut.io.fillEntry.supervisor #= sup
     dut.io.fillEntry.cacheMode  #= (if (inhibited) CacheMode.INHIBITED else CacheMode.WRITETHROUGH)
+    dut.io.fillEntry.modified  #= false
     dut.io.fillValid #= true
     cd.waitSampling()
     dut.io.fillValid #= false
