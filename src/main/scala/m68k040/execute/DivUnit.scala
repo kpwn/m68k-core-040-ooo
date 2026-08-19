@@ -124,7 +124,7 @@ class DivUnit extends Component {
   }
   val ovW   = overflowFor(16)
   val ovL   = overflowFor(32)
-  // 68020+ DIVS.L/DIVU.L divide-by-(-1) erratum (documented real-silicon behavior,
+  // 68020+ DIVS.W/DIVS.L/DIVU.L divide-by-(-1) erratum (documented real-silicon behavior,
   // matched by Musashi -- our lock-step/whitebox oracle, tools/musashi/musashi/
   // m68kops.c m68k_op_divl_32_d): dividing by exactly -1 does NOT set V for one
   // EXACT dividend pattern per form, even though the mathematical result overflows.
@@ -141,6 +141,27 @@ class DivUnit extends Component {
   //     divisor" -- unlike L32, a 64-bit dividend divided by -1 overflows for MANY
   //     different dividend values (any |dividend| > 2^31-ish), and Musashi does NOT
   //     suppress V for those -- only for this one exact pattern.
+  //   W (16-bit dividend, 32-bit r_dst): Musashi's `M68KMAKE_OP(divs, 16, ., .)` uses
+  //     the SAME trigger as L32 -- `*r_dst == 0x80000000 && src == -1` -- i.e. the
+  //     dividend check is against the FULL 32-bit Dn (not just its low 16 bits), so
+  //     `l32DividendIsIntMin` (already computed for L32) is the right predicate here
+  //     too. Musashi's override for .W is a DIFFERENT shape than .L's, though: it
+  //     forces the WHOLE 32-bit dest to 0 (Z=1,N=0,V=0,C=0), not "keep the mathematical
+  //     quotient and just clear V" (that's what .L does, and it's correct there because
+  //     INT32_MIN happens to be a representable 32-bit quotient). For .W this needs NO
+  //     separate override path, though: the ordinary magnitude divide already produces
+  //     magQ=0x0000000080000000 (0x80000000 magnitude / 1), and the EU packs the .W
+  //     result from the LOW 16 BITS of quotient/remainder (divResultW = resR[15:0] ##
+  //     resQ[15:0]) -- 0x80000000's low 16 bits are 0x0000 and the remainder is exactly
+  //     0, so the generic non-overflow datapath already yields dest=0x00000000 and
+  //     N=0/Z=1 for free. Suppressing V here (exactly like L32) is therefore sufficient;
+  //     divs_word_intmin_minus1.s pins this. task divs_word_intmin_minus1: the sibling
+  //     v1 project's mul_div.v only ever special-cased the .L form (`divsl_special`,
+  //     gated on is_divl_signed) -- DIVS.W fell through to the generic overflow check
+  //     there and silently left the destination unchanged with V=1. This datapath does
+  //     NOT share that structure (there is one shared `overflowFor`/erratum mux for all
+  //     three forms), but the W arm was still missing the suppression term before this
+  //     fix -- same observable bug, different root cause.
   // Task #167 (ported-tests triage, divl_sz1_overflow.s Test 2) FIXED a regression
   // from task #149's original fix: task #149 validated only the L32 case (divl_basic.s
   // Test 5, dividend=INT32_MIN) and over-generalized the suppression to "any signed
@@ -161,7 +182,7 @@ class DivUnit extends Component {
   val l32DividendIsIntMin = dividendReg(31 downto 0) === U(0x80000000L, 32 bits)
   val l64DividendIsExactPattern = dividendReg === U(0x80000000L, 64 bits)   // hi=0, lo=0x80000000
   io.overflow := formReg.mux(
-    DivForm.W   -> ovW,
+    DivForm.W   -> (ovW && !(divisorIsNegOne && l32DividendIsIntMin)),
     DivForm.L32 -> (ovL && !(divisorIsNegOne && l32DividendIsIntMin)),
     DivForm.L64 -> (ovL && !(divisorIsNegOne && l64DividendIsExactPattern)))
 
