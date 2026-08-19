@@ -289,13 +289,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       ftb.logic.invalidateAll := predictorInvalidate
       btb.logic.queryPc     := faBtb.logic.btbQueryPc0
       btb.logic.queryValid  := faBtb.logic.btbQueryValid0
-      btb.logic.query2BasePc := faBtb.logic.btbQueryBasePc1
-      btb.logic.query2Sel    := faBtb.logic.btbQuerySel1
-      btb.logic.query2Valid := faBtb.logic.btbQueryValid1
       faBtb.logic.btbPredTaken0  := btb.logic.predTakenComb
       faBtb.logic.btbPredTarget0 := btb.logic.predTargetComb
-      faBtb.logic.btbPredTaken1  := btb.logic.predTaken2Comb
-      faBtb.logic.btbPredTarget1 := btb.logic.predTarget2Comb
       // RAS (slice 2): drive push/pop, read the combinational predict.
       val ras   = host[m68k040.frontend.RasPlugin]
       ras.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
@@ -316,8 +311,6 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       gsh.logic.queryValid1   := faBtb.logic.btbQueryValid1
       faBtb.logic.gsBtbHit0   := btb.logic.predHitComb
       faBtb.logic.gsBtbType0  := btb.logic.predTypeComb
-      faBtb.logic.gsBtbHit1   := btb.logic.predHit2Comb
-      faBtb.logic.gsBtbType1  := btb.logic.predType2Comb
       faBtb.logic.gsPhtTaken0 := gsh.logic.phtTaken0
       faBtb.logic.gsPhtIndex0 := gsh.logic.phtIndex0
       faBtb.logic.gsPhtTaken1 := gsh.logic.phtTaken1

@@ -15,16 +15,6 @@ object Aligner {
     val shiftWords = UInt(4 bits)
     val stall      = Bool()
     val complex    = Bool()
-    // FMax "Lever D" (2026-08-08): the RAW `L0` (slot0's predecoded lenWords), exported
-    // UNCONDITIONALLY — outside the arm mux-chain every other Result field goes through.
-    // It is the BTB's slot-1 late-select index: `slot1.pc == slot0.pc + 2*slot1Sel` by
-    // construction, so the BTB can read all 9 `slot1Sel` candidates speculatively off the
-    // registered `decodePc` and consume `slot1Sel` only at the final mux, instead of
-    // needing it to form the read ADDRESS. Deliberately NOT `slot0.lenWords` (which is
-    // the same value in every arm that can set `slot1Valid`, but reaches the consumer one
-    // arm-mux later — the whole point of this lever is to keep this signal's arc as short
-    // as it possibly can be). See `Btb.scala`'s `spec2*` block for the full derivation.
-    val slot1Sel   = UInt(4 bits)
   }
 
   /** `p0LiveReg`: the REGISTERED live re-classification of the buffer head (see the task
@@ -94,12 +84,6 @@ object Aligner {
     // already-multi-cycle-tolerant ambiguous-head case.
     val p0 = Mux(preds(0).ambiguousLine, p0LiveReg, preds(0))
     val L0 = p0.lenWords  // UInt(4 bits)
-
-    // FMax "Lever D": export L0 raw (see `Result.slot1Sel`). Assigned exactly once, here,
-    // OUTSIDE the arm chain below — so no `when` arm ever adds a mux level to it. It is
-    // only ever CONSUMED (by the BTB slot-1 late select) when `slot1Valid` is set, i.e.
-    // inside the `slot1Ok` arm, where `slot1.pc == headPc + 2*L0` holds by construction.
-    r.slot1Sel := L0
 
     when(avail === 0) {
       // keep defaults: stall, nothing valid

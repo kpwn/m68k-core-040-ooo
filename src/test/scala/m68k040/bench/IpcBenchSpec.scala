@@ -213,13 +213,8 @@ class IpcBenchSpec extends AnyFunSuite {
       ftb.logic.invalidateAll := predictorInvalidate
       btb.logic.queryPc     := fa.logic.btbQueryPc0
       btb.logic.queryValid  := fa.logic.btbQueryValid0
-      btb.logic.query2BasePc := fa.logic.btbQueryBasePc1
-      btb.logic.query2Sel    := fa.logic.btbQuerySel1
-      btb.logic.query2Valid := fa.logic.btbQueryValid1
       fa.logic.btbPredTaken0  := btb.logic.predTakenComb
       fa.logic.btbPredTarget0 := btb.logic.predTargetComb
-      fa.logic.btbPredTaken1  := btb.logic.predTaken2Comb
-      fa.logic.btbPredTarget1 := btb.logic.predTarget2Comb
       // RAS (slice 2): drive push/pop, read the combinational predict.
       val rasP = host[m68k040.frontend.RasPlugin]
       rasP.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
@@ -240,8 +235,6 @@ class IpcBenchSpec extends AnyFunSuite {
       gsh.logic.queryValid1   := fa.logic.btbQueryValid1
       fa.logic.gsBtbHit0      := btb.logic.predHitComb
       fa.logic.gsBtbType0     := btb.logic.predTypeComb
-      fa.logic.gsBtbHit1      := btb.logic.predHit2Comb
-      fa.logic.gsBtbType1     := btb.logic.predType2Comb
       fa.logic.gsPhtTaken0    := gsh.logic.phtTaken0
       fa.logic.gsPhtIndex0    := gsh.logic.phtIndex0
       fa.logic.gsPhtTaken1    := gsh.logic.phtTaken1

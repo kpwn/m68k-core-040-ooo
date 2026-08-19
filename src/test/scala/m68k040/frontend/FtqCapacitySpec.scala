@@ -101,14 +101,9 @@ class FtqCapacitySpec extends AnyFunSuite {
       val btb = host[BtbPlugin]
       btb.logic.queryPc := fa.logic.btbQueryPc0
       btb.logic.queryValid := fa.logic.btbQueryValid0
-      btb.logic.query2BasePc := fa.logic.btbQueryBasePc1
-      btb.logic.query2Sel := fa.logic.btbQuerySel1
-      btb.logic.query2Valid := fa.logic.btbQueryValid1
       btb.logic.invalidateAll := False
       fa.logic.btbPredTaken0 := btb.logic.predTakenComb
       fa.logic.btbPredTarget0 := btb.logic.predTargetComb
-      fa.logic.btbPredTaken1 := btb.logic.predTaken2Comb
-      fa.logic.btbPredTarget1 := btb.logic.predTarget2Comb
     }
   }
 

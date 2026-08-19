@@ -137,26 +137,21 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // Directionless plain wires (the IcachePlugin convention): the wiring layer
     // connects the query OUTPUTS to the BTB and the prediction INPUTS back. Concrete
     // idle defaults so FetchAlign elaborates standalone (predictor inert).
-    //   btbQueryPc0/1, btbQueryValid0/1 : DRIVEN here (the aligner slot PCs).
-    //   btbPredTaken0/1, btbPredTarget0/1 : INPUT (the BTB's combinational predict).
+    //   btbQueryPc0/1, btbQueryValid0/1 : DRIVEN here (the aligner slot PCs; slot1's
+    //     pair also doubles as the gshare slot-1 query below).
+    //   btbPredTaken0, btbPredTarget0 : INPUT (the BTB's combinational predict for slot0
+    //     only). The slot-1 speculative BTB read ("Lever D", the `query2*`/`spec2*` block
+    //     in `Btb.scala`) was deleted (task #248): it was the design's #1 failing setup
+    //     cone, and its only consumer (the old BTB-sourced `slot1WouldPred` slot1 defer)
+    //     is now redundant with `slot1WouldFtq` below, sourced from the fetch-directed
+    //     FTB/FTQ (task #126) instead — a 4-bit register compare, not a speculative
+    //     9-way BTB read.
     val btbQueryPc0    = UInt(32 bits); val btbQueryValid0 = Bool()
     val btbQueryPc1    = UInt(32 bits); val btbQueryValid1 = Bool()
-    // FMax "Lever D" (2026-08-08): the BTB's slot-1 port is addressed as (base, sel), not
-    // as the pre-summed `btbQueryPc1`, so its RAM read never waits on `L0`. `btbQueryPc1`
-    // itself is KEPT — it is still the gshare slot-1 query PC and the architectural slot-1
-    // packet PC — but the BTB now takes these two instead. Invariant tying them together:
-    // `btbQueryPc1 == btbQueryBasePc1 + 2*btbQuerySel1` whenever `btbQueryValid1` is set
-    // (`decodePc` is `res.slot0.pc` in every arm that can raise `slot1Valid`, and
-    // `Aligner` computes `slot1.pc = headPc + (L0 << 1)` there). See `Btb.scala`'s
-    // `spec2*` block for the derivation and the equivalence proof.
-    val btbQueryBasePc1 = UInt(32 bits); val btbQuerySel1 = UInt(4 bits)
     val btbPredTaken0  = Bool(); val btbPredTarget0 = UInt(32 bits)
-    val btbPredTaken1  = Bool(); val btbPredTarget1 = UInt(32 bits)
     // Inputs: idle-defaulted (allowOverride) so a standalone DUT (no BTB) reads not-taken.
     btbPredTaken0.allowOverride;  btbPredTaken0  := False
     btbPredTarget0.allowOverride; btbPredTarget0 := U(0, 32 bits)
-    btbPredTaken1.allowOverride;  btbPredTaken1  := False
-    btbPredTarget1.allowOverride; btbPredTarget1 := U(0, 32 bits)
 
     // ── Fetch-time RAS interface (return-address stack, slice 2) ─────────────────
     // FetchAlign DRIVES the push (call retPC) + pop (predicted return) and READS the
@@ -183,18 +178,16 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // predict inputs back. Concrete idle defaults so FetchAlign elaborates standalone
     // (gshare inert: gsPhtTaken reads not-taken, gsPhtIndex 0).
     //   btbQueryPc0/1 (above) double as the gshare query PCs (same aligner slot PCs).
-    //   gsBtbHit0/1, gsBtbType0/1 : the BTB hit + brType (INPUT, to form condBtbHit).
+    //   gsBtbHit0, gsBtbType0 : the BTB hit + brType (INPUT, to form condBtbHit) for
+    //     slot0 only (slot1's BTB hit/type input was deleted with Lever D; see above).
     //   gsPhtTaken0/1 : the PHT direction for that PC (INPUT).
     //   gsPhtIndex0/1 : the 11-bit folded-XOR index (INPUT, carried down).
     //   gsShiftValid/gsShiftDir : the GHR shift (OUTPUT, driven below).
     val gsBtbHit0   = Bool(); val gsBtbType0 = UInt(2 bits)
-    val gsBtbHit1   = Bool(); val gsBtbType1 = UInt(2 bits)
     val gsPhtTaken0 = Bool(); val gsPhtIndex0 = UInt(11 bits)
     val gsPhtTaken1 = Bool(); val gsPhtIndex1 = UInt(11 bits)
     gsBtbHit0.allowOverride;   gsBtbHit0   := False
     gsBtbType0.allowOverride;  gsBtbType0  := U(0, 2 bits)
-    gsBtbHit1.allowOverride;   gsBtbHit1   := False
-    gsBtbType1.allowOverride;  gsBtbType1  := U(0, 2 bits)
     gsPhtTaken0.allowOverride; gsPhtTaken0 := False
     gsPhtIndex0.allowOverride; gsPhtIndex0 := U(0, 11 bits)
     gsPhtTaken1.allowOverride; gsPhtTaken1 := False
@@ -881,15 +874,6 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     btbQueryValid0 := predEnable && res.slot0Valid
     btbQueryPc1    := res.slot1.pc
     btbQueryValid1 := predEnable && res.slot1Valid
-    // FMax "Lever D": the BTB slot-1 address, split. `decodePc` is a REGISTER (so the 9
-    // speculative reads start at cycle 0), and `slot1Sel` (== the aligner's raw `L0`) is
-    // consumed ONLY by the BTB's final 16:1 result mux — removing the
-    // `L0 -> index adder -> RAM read -> tag compare` serialization from the
-    // `headPtr -> L0 -> ... -> io_shift -> headPtr` feedback loop without adding any
-    // register to it. Deliberately `decodePc` rather than `res.slot0.pc`: identical value
-    // in every arm that can raise `slot1Valid`, but one arm-mux earlier.
-    btbQueryBasePc1 := decodePc
-    btbQuerySel1    := res.slot1Sel
     // ── gshare direction composition (slice 3) ──────────────────────────────────
     // gshare OVERRIDES the DIRECTION of a CONDITIONAL branch that hit the BTB. The BTB
     // still supplies the target; the predicted-taken bit becomes phtTaken (NOT the BTB
@@ -901,32 +885,18 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // STEP 1 (gshare inert) gsBtbHit0=False -> condBtbHit0=False -> this reduces to the
     // BTB predict-taken (behavior-neutral); STEP 2 wires gsBtbHit0/gsPhtTaken0 live.
     val slot0PredTaken = Mux(condBtbHit0, gsPhtTaken0, btbPredTaken0)
-    // slot1 predicted-taken: keep the SLICE-1 BTB source (NOT gshare). FMax: the slot1
-    // predict feeds slot1ValidOut -> the ibuf shift/suppress cone, which is the front-end
-    // critical path; injecting the gshare slot1 PHT read + condBtbHit1 there regressed
-    // FMax. A slot1 predicted-taken branch is only DEFERRED to slot0 next cycle anyway
-    // (slot1WouldPred), where slot0's gshare direction takes over — so sourcing the slot1
-    // DEFER decision from the BTB bimodal (vs gshare) is a pure micro-perf nuance on the
-    // defer cycle, never a correctness issue (the EU verifies; gshare drives it as slot0
-    // next cycle). This keeps the slot1ValidOut cone identical to slice-1/2.
-    val slot1PredTaken = btbPredTaken1
     // slot0 predicted-taken: stamp slot0 + suppress slot1 + redirect (the proven path).
     val slot0IsPred = slot0PredTaken && res.slot0Valid
-    // slot1 predicted-taken (and slot0 is NOT): SUPPRESS slot1 this cycle so ONLY slot0
-    // emits; decodePc advances to the branch, which becomes slot0 NEXT cycle and takes
-    // the (correct, single-slot) slot0 prediction path. Costs one dual-issue slot on the
-    // predicted branch but reuses the proven slot0 redirect and keeps recovery simple.
-    val slot1WouldPred = slot1PredTaken && res.slot1Valid && res.slot0Valid && !slot0IsPred
-    // NOTE (FMax): we deliberately do NOT defer a predicted-NOT-taken slot1 conditional.
-    // If both slot0 and slot1 are conditionals emitted the same cycle, only slot0's GHR
-    // bit shifts (the single-ported GHR shifts once) — slot1's history bit is lost. That
-    // is a pure ACCURACY imperfection (the accept-corruption philosophy already tolerates
-    // GHR imprecision), NOT a correctness bug: each conditional carries its OWN fetch-time
-    // phtIndex down, so the retire-time train hits the exact entry the lookup read
-    // regardless of the GHR shift. Deferring slot1 instead pulled the BTB slot1 hit/brType
-    // (condBtbHit1) into the ibuf shift/suppress cone and regressed the fetch FMax, so it
-    // is intentionally omitted (the slot1-predicted-TAKEN defer, slot1WouldPred, stays —
-    // it already existed for the BTB and is needed for the redirect discipline).
+    // NOTE (task #248): a slot1 predicted-taken branch used to be deferred to slot0 next
+    // cycle via a dedicated BTB-sourced `slot1WouldPred` (Lever D's 9-way speculative
+    // slot-1 BTB read, `Btb.scala`'s deleted `spec2*` block — the design's #1 failing
+    // setup cone). That deferral is now covered by `slot1WouldFtq` below, sourced from
+    // the fetch-directed FTB/FTQ (task #126) instead of a speculative BTB read — a 4-bit
+    // register compare rather than a 9-way RAM lookup. We still do NOT defer a
+    // predicted-NOT-taken slot1 conditional (only slot0's GHR bit shifts if both slot0
+    // and slot1 are conditionals emitted the same cycle; slot1's history bit is lost —
+    // a pure ACCURACY imperfection, not a correctness bug, since each conditional
+    // carries its OWN fetch-time phtIndex down for the retire-time train).
 
     // ── RAS classification of the EMITTED slot0 (slice 2) ────────────────────────
     // isCall / isReturn are recomputed from the emitted slot0 opword (already in the
@@ -948,7 +918,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
 
     // A RETURN in slot1 (slot0 not predicted): defer it — suppress slot1 so the return
     // becomes slot0 NEXT cycle and takes the (single-slot) slot0 RAS-predict path. This
-    // mirrors slot1WouldPred (the BTB slot1-branch deferral) and is essential: a leaf
+    // mirrors slot1WouldFtq below (the FTQ-sourced slot1-branch deferral) and is essential: a leaf
     // `add ; rts` emits add=slot0 + rts=slot1 in one cycle, so without deferral the rts
     // never reaches the slot0 RAS-predict and every return mispredicts (the flush the
     // RAS is meant to remove). The opword classification only needs slot1's opword.
@@ -1004,7 +974,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // Suppress slot1 when slot0 is the predicted-taken branch (slot1 is wrong-path) OR
     // when slot1 WOULD be a predicted branch (defer it to slot0 next cycle). slot0Predicted
     // folds in a RAS-predicted return (slice 2): its slot1 is equally wrong-path.
-    when(slot0Predicted || slot1WouldPred || slot1WouldRasPred || slot1WouldFtq || ftqConfirm) {
+    when(slot0Predicted || slot1WouldRasPred || slot1WouldFtq || ftqConfirm) {
       slot1ValidOut := False
     }
     // Stamp the prediction onto slot0 (rides to the EU). The target is the composed
@@ -1091,7 +1061,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // branch deferred to next cycle), consume only slot0's words (lenWords); else the
     // aligner's full shift. Without this, suppressing slot1 would still CONSUME its
     // words from the IBuf — losing the deferred branch / the wrong-path successor.
-    val suppressSlot1 = slot0Predicted || slot1WouldPred || slot1WouldRasPred ||
+    val suppressSlot1 = slot0Predicted || slot1WouldRasPred ||
                         slot1WouldFtq || ftqConfirm
     val effShift = Mux(suppressSlot1, res.slot0.lenWords.resize(res.shiftWords.getWidth), res.shiftWords)
     // FMax (front-end floor): RETIME the decodePc advance so the late suppressSlot1 decision
@@ -1216,7 +1186,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // Shift the GHR on the emitted slot0 predicted CONDITIONAL (taken OR not — gated on
     // condBtbHit0, not the taken-only fallback detector/action), with the predicted bit.
     // We shift for slot0 only: a slot1-predicted-TAKEN conditional is deferred to slot0
-    // next cycle (slot1WouldPred); a slot1 not-taken conditional that co-emits with slot0
+    // next cycle (slot1WouldFtq / slot1WouldRasPred); a slot1 not-taken conditional that co-emits with slot0
     // simply loses its GHR bit (accept-corruption — its carried phtIndex still trains the
     // right entry at retire, so correctness is unaffected). The lookup index used the GHR
     // BEFORE this shift; the carried phtIndex (stamped above) matches. NOT checkpointed/

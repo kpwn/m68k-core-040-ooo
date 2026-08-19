@@ -110,13 +110,8 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // the predict-taken + target return THIS cycle into FetchAlign's prediction inputs.
     btb.logic.queryPc     := fa.logic.btbQueryPc0
     btb.logic.queryValid  := fa.logic.btbQueryValid0
-    btb.logic.query2BasePc := fa.logic.btbQueryBasePc1
-    btb.logic.query2Sel    := fa.logic.btbQuerySel1
-    btb.logic.query2Valid := fa.logic.btbQueryValid1
     fa.logic.btbPredTaken0  := btb.logic.predTakenComb
     fa.logic.btbPredTarget0 := btb.logic.predTargetComb
-    fa.logic.btbPredTaken1  := btb.logic.predTaken2Comb
-    fa.logic.btbPredTarget1 := btb.logic.predTarget2Comb
     // RAS (slice 2): FetchAlign drives the push (call retPC) + pop (predicted return);
     // the RAS returns its combinational top-of-stack predict. Invalidate on the
     // external boot/reset I-cache-invalidate port only (`invalidateAll`) -- unlike
@@ -147,8 +142,6 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     gsh.logic.queryValid1   := fa.logic.btbQueryValid1
     fa.logic.gsBtbHit0      := btb.logic.predHitComb
     fa.logic.gsBtbType0     := btb.logic.predTypeComb
-    fa.logic.gsBtbHit1      := btb.logic.predHit2Comb
-    fa.logic.gsBtbType1     := btb.logic.predType2Comb
     fa.logic.gsPhtTaken0    := gsh.logic.phtTaken0
     fa.logic.gsPhtIndex0    := gsh.logic.phtIndex0
     fa.logic.gsPhtTaken1    := gsh.logic.phtTaken1
