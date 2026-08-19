@@ -165,6 +165,87 @@ gate is not. Check for any other shared aggregate signals in the file (anything 
 same way. This applies to every task in the breakdown below, not just Task 1 — Tasks 2-4
 extend the same FSM and must not introduce a second hold path either.
 
+## 6.6. SUPERSEDES §3's "new bespoke FSM" plan — Approach A: shared register-list-walk skeleton
+
+**User directive (2026-08-19), following a core-wide architecture review**: instead of building
+`fmovemxActive` as a 4th independent bespoke FSM, extract `movemActive`'s (integer MOVEM,
+`DecodeStage.scala:314-480`) control skeleton into a shared, parameterized piece that BOTH
+integer MOVEM and this task's FP data-list instantiate. This is "Approach A" from the
+sequencer-unification discussion (task #246) — deliberately narrower than a full 4-way merge:
+MOVEP (a fixed linear byte-stepper) and the µcode ROM sequencer (already its own successful
+generalization, "the ROM-driven generalization of the MOVEM FSM" per its own header comment,
+`DecodeStage.scala:945`) stay untouched. Only the register-list-walk shape — runtime-mask-driven
+priority-encode + per-element address stepping — gets shared, because that's the one piece
+integer MOVEM and FP data-list genuinely both need and neither the µcode sequencer nor MOVEP can
+express.
+
+**This is a refactor of existing, heavily bug-hardened, working code, not greenfield addition.**
+`movemActive` carries the scars of real, previously-shipped bugs (task #200's base/index
+in-list-self-corruption snapshot mechanism, the movem-agu-index-hazard-2026-08-19 index-snapshot
+extension, the 5-bit-counter-sign-flip fix for all-16-registers MOVEM, the B6 fuzzer-caught
+postinc-load-target-is-base-register fix). The extraction MUST preserve every one of these
+behaviors bit-for-bit for the integer-MOVEM instantiation — this is the dominant risk of this
+task, not the new FP instantiation's own correctness.
+
+### What's shared (the skeleton)
+
+- Mask register + priority-encode/bit-extraction (`movemBit0`/`movemMask1`/`OHMasking.first`
+  pattern) — parameterized by mask width (16 for int, 8 for FP).
+- Register-index-from-bit-position ordering rule (`movemRegOf`'s forward/reverse split) —
+  parameterized (int: bit i → reg i forward / reg 15-i reverse; FP data-list per §2 of this
+  doc: mask bit n → FPn forward / FP(7-n) reverse — NOTE the FP ordering is NOT the same
+  formula as int's, despite the superficial "forward/reverse" similarity — the shared skeleton
+  must take the register-mapping function as a parameter, not hardcode int's `15-i`).
+- Running address/offset computation (`movemOff`, `movemStep`, the base+offset stepping) —
+  parameterized by element size (2/4 bytes for int; 12 bytes/3-chunks for FP Extended).
+- The "hold `fed`, push directly to the queue bypassing `AssembledUops`" plumbing and the
+  entry/exit state machine (idle → active → mask-empty → final-update → idle).
+- Entry-detection and fetch-hold signals **must fold into the SAME existing shared aggregate
+  gates** documented in §6.5 above (this constraint is unchanged and applies with equal force
+  to the now-shared skeleton, not just a lone new instance) — the refactor of `movemActive`
+  itself must not change how it participates in those gates, only how its internals are
+  organized.
+
+### What stays instance-specific (injected)
+
+- **Per-element µop emission**: int MOVEM emits one `movemMoveUop` per element (single-cycle);
+  FP data-list emits the existing scalar Extended crack's per-element row sequence (§3's
+  `[LOAD×3 + UFpIssue]` / `[UFpStoreCvt×3 + MStore×3]` shape) over multiple sub-phases. This is
+  the injected "emit µop(s) for element at address X, register R, this cycle's sub-phase"
+  callback from §3's original architecture section — that part of the original design is
+  UNCHANGED by this addendum, only its container changes from "new FSM" to "new instantiation
+  of the shared skeleton."
+- **Base/index snapshot hazard machinery** (task #200's `movemSnapPhase`/`movemSnapIsIdx`/
+  `movemSnapIdxPending`/`movemHadSnap`): int-only, stays exactly as-is for the int
+  instantiation; the FP instantiation does not enable it at all (per §3's original note — FP
+  and integer register files are disjoint, this hazard cannot occur for FP).
+- **EA-mode admission set**: int MOVEM admits more EA modes than this task's FP data-list scope
+  (§1's table); the shared skeleton's EA-decode stage must be parameterized by the admitted-mode
+  set, not hardcoded to either instance's specific list.
+- **Lock-step macro-commit convention**: int MOVEM uses a final no-op `An := An + 0` µop for
+  control-mode EAs to carry the commit; FP data-list reuses the existing scalar crack's own
+  `isLast`/`keepCommit` convention (§3's note) — these differ and must both be expressible via
+  the same "how does this instantiation mark its macro's committed record" parameter.
+
+### Verification bar (non-negotiable, given the refactor risk)
+
+Before this task can be considered done, the REFACTORED integer-MOVEM path must pass, bit-for-bit
+identical to pre-refactor behavior:
+- Every existing MOVEM-specific test (search `src/test/scala/` for MOVEM-named specs and the
+  decode-matrix/phase-shape tests referenced in this codebase's MOVEM comments).
+- The full ported-corpus MOVEM-family tests (`movem_*` — at minimum `movem_idx_an_load`,
+  `movem_pc_idx_w`, `movem_rom_mem_forms`, `movem_postinc_odd_sp_cold_dcache`, and any others
+  found by `ls src/test/resources/m68kooo-ported-tests/asm/movem_*`).
+- `ExecuteLockStepSpec` in full (not just a filtered subset) — MOVEM lock-step behavior is
+  exactly the kind of thing a skeleton-extraction refactor could subtly perturb.
+- A fuzz run if the existing fuzz infrastructure has MOVEM-generating emitters (check
+  `FuzzLockStepSpec.scala`/`PortedM68kOooSpec.scala` for a MOVEM emitter).
+
+If ANY of these regress, the refactor is wrong — do not "fix" a regression by special-casing the
+shared skeleton back toward int-specific behavior in a way that breaks the parameterization;
+that's a sign the abstraction boundary was drawn in the wrong place and needs rethinking, not
+patching.
+
 ## 7. Suggested task breakdown (for the implementation plan)
 
 1. FSM skeleton + non-auto EA modes ((An), (d16,An)) + load direction only — proves the core
