@@ -953,6 +953,30 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val fpS1FpSrc  = Reg(Bits(80 bits))     // fpRdB: FPm (fpSrcKind === FPREG)
     val fpS1Imm    = Reg(Bits(80 bits))     // u0.fpWideImm
     val fpS1Kind   = Reg(FpSrcKind())
+    // ── FMax fanout split: a physical duplicate of `fpS1Kind` (task #265, option O4) ──
+    // `fpS1Kind` is ONE register whose output fans out into two structurally different
+    // consumer clusters below: the NARROW pre-mux selects (`fpIntIn`/`fpSglIn`/`fpDblIn`,
+    // single-bit compares) and `fpS1IsRomConst`, versus the WIDE `fpSrcVal` kind-mux
+    // (an 8-way select driving an 80-bit-wide output -- ~640 mux-input bits gated off the
+    // SAME compare logic). docs/superpowers/specs/2026-08-19-fmax-resilience-postmortem.md
+    // §2 item 4 traces several of the current worst-100 postroute paths
+    // (`DivEuPlugin_logic_fpS1Kind`/`fpS1IntA`/`s1FpSrc`) to this register's ~100+ total
+    // loads -- residue task #218's original DivEu classification fix (149.95->189.5MHz)
+    // didn't fully exhaust.
+    // `fpS1KindB` is a genuine second flip-flop, not a `keep`-tagged wire copy: it has the
+    // IDENTICAL D-input (`u0.fpSrcKind`) and enable (`fpAccept`) as `fpS1Kind`, driven from
+    // the SAME `when(fpAccept)` block below, so by construction both registers hold the
+    // exact same value on every cycle -- this is a placement/fanout split, not a new degree
+    // of freedom. `dont_touch` on BOTH copies stops Vivado's sequential/equivalent-register
+    // merging from quietly re-collapsing them into one physical FF (which would undo the
+    // whole point); SpinalHDL sim ignores synthesis attributes, so this is functionally
+    // invisible in simulation by construction, unlike the `keep`-tagged-wire form used for
+    // net-sharing cases elsewhere (e.g. `b6ac229`'s PRF LVT broadcast fix).
+    // The WIDE `fpSrcVal` mux (:~1000) reads `fpS1KindB`; the NARROW selects
+    // (`fpIntIn`/`fpSglIn`/`fpDblIn`/`fpS1IsRomConst`) keep reading the original `fpS1Kind`.
+    val fpS1KindB  = Reg(FpSrcKind())
+    fpS1Kind.addAttribute("dont_touch", "true")
+    fpS1KindB.addAttribute("dont_touch", "true")
     val fpS1Fmt    = Reg(Bits(3 bits))
     val fpS1Opmode = Reg(Bits(7 bits))      // u0.fpuOp: the FpOp selector AND io.cromSel
     val fpS1Rmode  = Reg(Bits(2 bits))      // FPCR[5:4] as it stood at ISSUE, not at start
@@ -967,6 +991,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       fpS1FpSrc  := fpRdB.data
       fpS1Imm    := u0.fpWideImm
       fpS1Kind   := u0.fpSrcKind
+      fpS1KindB  := u0.fpSrcKind    // physical duplicate of fpS1Kind, see comment above
       fpS1Fmt    := u0.fpSrcFmt
       fpS1Opmode := u0.fpuOp
       fpS1Rmode  := fpRmodeIn
@@ -997,7 +1022,9 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val fpFromInt = FpSource.intToExtended(fpIntIn)
     val fpFromSgl = FpSource.singleToExtended(fpSglIn)
     val fpFromDbl = FpSource.doubleToExtended(fpDblIn)
-    val fpSrcVal = fpS1Kind.mux(
+    // Reads `fpS1KindB` (the physical duplicate above), NOT `fpS1Kind`: this is the WIDE
+    // 80-bit-output cluster the fanout split separates from the narrow selects above.
+    val fpSrcVal = fpS1KindB.mux(
       FpSrcKind.FPREG     -> fpS1FpSrc,
       // INTREG covers BOTH `F<op>.<fmt> Dn,FPn` and the 1-chunk memory formats (the crack's
       // load already parked the value in a temp int reg, making the two indistinguishable).
