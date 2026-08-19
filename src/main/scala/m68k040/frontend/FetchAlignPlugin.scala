@@ -809,13 +809,36 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // pruning argument if this field's cost ever matters. The init below is for reset
     // determinism only (an uninitialised Reg randomises per sim seed).
     p0LiveReg.size          init m68k040.isa.Size.BYTE
+    // task #242 (memind_wide_disp_dst HANG): pass 3 more lookahead words (op+4/+5/+6) --
+    // `ibuf.io.head` is a HEAD_WORDS=10-word window, already resident here, so this is
+    // real data (not the constant-zero the bake-time IcachePlugin call still passes via
+    // the narrower overload). This is the ONLY thing that lets the live reclassify
+    // actually resolve a MOVE dst-mode-6/mode7-3 EA whose source consumed 3-5 of its own
+    // ext words (see PredecodeWord.classify's dstEaW0/dstEaKnown comment) -- without it,
+    // `ambiguousLine` could never clear for that shape (the old 4-word-capped classify
+    // call re-derives the identical "unknown" verdict every cycle, forever), which is
+    // exactly the HANG this task fixes: the Aligner's `.elsewhen(p0.ambiguousLine)` stall
+    // arm (Aligner.scala) never had a real chance to resolve, so fetch stalled permanently.
     p0LiveReg := PredecodeWord.classify(ibuf.io.head(0), ibuf.io.head(1), ibuf.io.head(2), ibuf.io.head(3),
+      ibuf.io.head(4), ibuf.io.head(5), ibuf.io.head(6),
       extWValid  = availEff >= U(2, 4 bits),
       extW2Valid = availEff >= U(3, 4 bits),
-      extW3Valid = availEff >= U(4, 4 bits))
+      extW3Valid = availEff >= U(4, 4 bits),
+      extW4Valid = availEff >= U(5, 4 bits),
+      extW5Valid = availEff >= U(6, 4 bits),
+      extW6Valid = availEff >= U(7, 4 bits))
     val availEffPrev = RegNext(availEff) init 0
+    // task #242: the content-immutability threshold widens from `cnt<4` to `cnt<7` to
+    // match the classify() call now reading `ibuf.io.head(4..6)` too -- a push landing at
+    // cnt in [4,6] writes exactly those newly-read logical positions (see the `cnt<4`
+    // derivation in the block comment above: "a push landing with cnt<N writes logical
+    // words N..N+n-1, i.e. affects visible head words < N"), which the OLD `cnt<4` gate
+    // did not cover (those words weren't read by classify() at all before this task).
+    // `availEffPrev =/= availEff` already independently covers every VALIDITY-flag change
+    // (any avail change, not just crossing 2/3/4), so only the content-immutability term
+    // needed widening.
     val p0LiveInvalidate = ibuf.io.flush || (ibuf.io.shift =/= 0) ||
-                           (ibuf.io.push.fire && (ibuf.io.cnt < U(4, ibuf.io.cnt.getWidth bits))) ||
+                           (ibuf.io.push.fire && (ibuf.io.cnt < U(7, ibuf.io.cnt.getWidth bits))) ||
                            (availEffPrev =/= availEff)
     when(p0LiveInvalidate) {
       p0LiveReg.ambiguousLine := True
