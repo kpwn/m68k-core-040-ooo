@@ -49,3 +49,4 @@ _halt_fail:
     .align 2
 _status_byte:
     .byte   0x44
+    .byte   0x00                        | padding, keep image an even byte count
