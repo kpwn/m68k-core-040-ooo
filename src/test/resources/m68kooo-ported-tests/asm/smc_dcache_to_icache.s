@@ -15,8 +15,50 @@
 | FAIL sentinels:
 |   0xDEAD0001  — the staged routine wasn't executed correctly
 |                 (its expected register write didn't happen)
+|   0xDEAD0002  — bus error (= wrong-path speculative garbage past the
+|                 un-pushed-back staged routine faulted on the bus; the
+|                 real symptom this project's core produces for the SAME
+|                 underlying coherency gap the original 0xDEAD0004 comment
+|                 below describes -- see the "ported-sweep-copyback"
+|                 investigation note further down)
 |   0xDEAD0004  — vec-4 illegal-instruction trap (= I-cache returned
 |                 garbage / stale bytes, the SMC coherency bug)
+|
+| Investigation note (task smc-dcache-to-icache, 2026-08-19): under the
+| default (AsWritten) cache posture this test passes trivially -- CACR is
+| never enabled by the test itself, so every access is architecturally
+| uncached and every D-side store is observed on the bus immediately,
+| keeping the harness's separate I-side memory image in sync with no
+| special handling required. Under the harness's "ported-sweep-copyback"
+| posture (CACR.DE=1, DTT0/ITT0 COPYBACK, exercising this core's REAL
+| cache hardware) this test originally FAILED with a bus-error sentinel.
+| Root-caused via cycle-exact whitebox tracing (D-cache S1/S2/S3 pipe,
+| DTLB req/rsp, branch-EU S1/completion, fetch-PC stream): the JSR's
+| return-address push (0x0000fffc) and the RTS's own pop of that SAME
+| address were BOTH independently confirmed correct (pushed and popped
+| value identically 0x4080003a) -- this is NOT a D-cache RMW race (the
+| stS1SameLineAsS3 / earlyProbeStale classes fixed this session do not
+| apply here). Instead, the I-cache's fill of the freshly-staged 8-byte
+| routine returned bytes that did NOT match what the D-side stores wrote
+| (confirmed via the fetch/predecode packet trace), so predecode computed
+| the wrong length for the staged MOVE.L and the trailing RTS opcode was
+| never recognized as an instruction at all -- execution silently fell
+| through into adjacent (uninitialized) memory, eventually decoding a
+| "load" whose garbage effective address bus-faulted for real.
+|
+| This is EXACTLY the class of gap this test's own header describes --
+| except this project's core, on real-68040 grounds, deliberately does
+| NOT implement an automatic D-cache-write -> I-cache-fill snoop (see
+| commits 69c7b59 / c994092: "No D-store-to-I-cache snoop exists by
+| design, matches real 68040 CINV-required semantics"). Genuine MC68040
+| silicon has the SAME property: software MUST push the dirty D-cache
+| line and invalidate the I-cache line with CPUSHL before executing
+| self-modified code, exactly the idiom the rest of this ported corpus
+| already uses (ifstage_smc_far_control.s, jmp_full_nomemind_widematrix.s).
+| This test, as vendored from upstream m68k-ooo, assumed its origin
+| core's non-standard automatic snoop and omitted the mandatory CPUSHL --
+| fixed below by adding it, matching the established corpus idiom. No RTL
+| change; the D-cache/DTLB/branch-EU behavior traced above is correct.
 
     .text
     .org 0
@@ -54,6 +96,15 @@ _start:
     | reads DDR4, gets zeros, decodes 0x0000 as ORI.B #imm,D0 (valid
     | but not what we wrote).  Post-fix: I-cache pre-fill snoop forces
     | D-cache writeback so DDR4 has our staged bytes when I-cache reads.
+
+    | Mandatory 68040 self-modifying-code cache maintenance (see the
+    | investigation note above): push the dirty D-cache line covering the
+    | staged routine back to memory and invalidate the matching I-cache
+    | line, so the upcoming JSR's instruction fetch observes the bytes we
+    | just wrote instead of whatever the I-cache/DDR4 held before. Without
+    | this, this core (correctly, matching real 68040 CPUSH-required
+    | semantics) has no obligation to make the write visible to fetch.
+    cpushl  %bc, (%a0)
 
     | Pre-seed D7 to a sentinel different from the staged value.
     move.l  #0x11111111, %d7
