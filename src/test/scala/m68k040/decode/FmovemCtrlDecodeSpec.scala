@@ -231,11 +231,39 @@ class FmovemCtrlDecodeSpec extends AnyFunSuite {
     assert(us.forall(!_.sysOp), s"$ctx: a rejected form must emit no sysOp")
   }
 
-  test("PC-relative <ea> is rejected in BOTH directions (conservative scope)", VerilatorTest) {
-    // F23A 9C00 000A = fmovem.l (10,%pc),%fpiar/%fpsr/%fpcr — a real, assemblable LOAD
-    // direction the toolchain emits; deliberately still trapped (see DecodeStage's gate).
-    assertTrap(collect(Seq(0xF23A, 0x9C00, 0x000A) ++ filler, base, 1), "(d16,PC) load")
+  // Task fmovem_ctrl_pcdi_load (2026-08-19): `(d16,PC)` LOAD now decodes -- the Q700 ROM's
+  // own `fmovem.l (d16,PC),FPCR/FPSR` at 0x408ED416 needs it (see
+  // src/test/resources/m68kooo-ported-tests/asm/fmovem_ctrl_pcdi_load.s). STORE and the
+  // indexed `(d8,PC,Xn)` form (both directions) stay rejected -- see the two tests below.
+  test("F23A 9C00 000A = FMOVEM.L (10,PC),FPIAR/FPSR/FPCR: PC-relative LOAD decodes " +
+       "(3 loads, no base register, terminal apply LAST)", VerilatorTest) {
+    val us = collect(Seq(0xF23A, 0x9C00, 0x000A) ++ filler, base, 4)
+    assert(us.length == 4, s"expected 4 uops, got ${us.length}: $us")
+    // address = (insn + 4) + sext(disp16) = the address of the disp16 word itself, plus
+    // the displacement -- mirrors this task's own asm-level report on the +4 offset.
+    val addr = base + 4 + 10
+    Seq((0, T0, 0L), (1, T1, 4L), (2, T2, 8L)).foreach { case (i, t, off) =>
+      assertCapture(us(i), t, s"load $i")
+      assert(!us(i).srcAV, s"PC-relative load must carry NO base register: ${us(i)}")
+      assert(us(i).useImm && us(i).imm == (addr + off),
+             f"load $i addr=0x${us(i).imm}%x expected 0x${addr + off}%x")
+    }
+    assert(us(0).first, "the first load must carry firstOfInstr")
+    assertApply(us(3), 0x7, "terminal")
+    assert(us.take(3).forall(!_.sysOp), "no µop before the last may be a sysOp")
+  }
+
+  test("F23A BC00 000A = FMOVEM.L FPIAR/FPSR/FPCR,(10,PC): STORE to PC-relative stays " +
+       "rejected (not an alterable destination on real hardware)", VerilatorTest) {
     assertTrap(collect(Seq(0xF23A, 0xBC00, 0x000A) ++ filler, base, 1), "(d16,PC) store")
+  }
+
+  test("(d8,PC,Xn) indexed PC-relative stays rejected in BOTH directions " +
+       "(needs the 3-phase index crack, out of scope)", VerilatorTest) {
+    // opword bits[5:0] = 111,011 (mode 7 reg 3) -> 0xF23B; brief-format ext word (bit8=0)
+    // so EaDecoder still classifies MEMSIMPLE+pcRel, but with indexValid=True this time.
+    assertTrap(collect(Seq(0xF23B, 0x9C00, 0x000A) ++ filler, base, 1), "(d8,PC,Xn) load")
+    assertTrap(collect(Seq(0xF23B, 0xBC00, 0x000A) ++ filler, base, 1), "(d8,PC,Xn) store")
   }
 
   test("mask == 000 stays trapped (Divergence Register D9b is unresolved)", VerilatorTest) {
