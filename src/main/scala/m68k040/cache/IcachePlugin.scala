@@ -195,6 +195,11 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // ldS1Valid/stS2Valid.simPublic() DEBUG hooks): exposes the raw shared arrays
     // for a directed test to assert an UNRELATED way's tag/data/pred content is
     // byte-for-byte unchanged by a same-set INHIBITED miss. No-op for synthesis.
+    // CONVENTION (see docs/debug-trace-taps.md "Mem-typed state needs explicit
+    // .simPublic() per instance"): tagMem/lineMem are Mem, not Reg -- each way's
+    // instance needs its own simPublic() call or Mem.getBigInt(addr) throws
+    // UNACCESSIBLE SIGNAL at sim time (the same gotcha hit D-cache validsMem/
+    // dirtysMem in task #240).
     for (w <- 0 until ways) { tagMem(w).simPublic(); lineMem(w).simPublic() }
     valids.simPublic()
 
