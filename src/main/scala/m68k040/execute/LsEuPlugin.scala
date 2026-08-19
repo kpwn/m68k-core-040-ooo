@@ -1751,8 +1751,24 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     txOut.cmode  := Mux(txSecond, txCmodeA, txEffectiveCmode)
     txOut.cmodeB := txEffectiveCmode
 
+    // Task #191 fix: a needsSupervisor-tagged access executed in user mode should NEVER
+    // reach translation in the first place -- it must be a vector-8 privilege violation,
+    // not whatever the MMU/ATC's genuine translation fault reports (vector 2). Mirrors the
+    // EXISTING `suppressForLaterPrivCheck` pattern used for the aligned back-stage bus-error
+    // path above (`alignedRspEntry.bk.needsSupervisor && !alignedRspEntry.bk.xlateSup`,
+    // `xlateSup` being that struct's own copy of `.supervisor`): when suppressed, do NOT
+    // report a fault at all -- fall through to the SAME control path a genuinely successful
+    // translation takes (`elsewhen(txFirstSplitRsp)` / the final `otherwise`, both of which
+    // never call `captureFaultFront`/`cancelProbeFor` for an ordinary response either). The
+    // entry proceeds as if untranslated data were valid; RobPlugin's own commit-time
+    // privViolation check (independent of what this completion reported) correctly squashes
+    // it at retire, and the OoO flush/rename-rollback machinery already hides every
+    // wrong-path effect either way -- the same reasoning this file's own
+    // `storePrivBlocked`/EQ decoupling comment (above) already establishes for the
+    // analogous privileged-STORE case.
+    val txSuppressForLaterPrivCheck = txCtx.needsSupervisor && !txCtx.supervisor
     when(txRspFire) {
-      when(xlateFault) {
+      when(xlateFault && !txSuppressForLaterPrivCheck) {
         captureFaultFront(txCtx, Mux(txSecond, txCtx.addrB, txCtx.vaddr))
         cancelProbeFor(txCtx.robId)
         txCanLeave := True
