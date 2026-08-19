@@ -113,6 +113,17 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // (`exceptionPc`) is bit-identical: same sources, same alloc write, same
     // headReady/count>0 read gating as every other B1 field (see SAFETY above).
     val faultUsesNextPc = Bool()
+    // ── LUT-reduction ROB-fold (task #249) ──────────────────────────────────────
+    // Replaces the deleted `fpuUnimpStore`/`fpuCmdStore` (Vec.fill(depth)(...)):
+    // Task 11's per-entry FP unimplemented-instruction marker + its command word,
+    // written ONLY at alloc (tail/tail+1, same 2-write-port shape every other B1
+    // field above already uses -- tail != tail+1 always holds at this depth, so the
+    // 2-port collision case MultiPortWritesSymplifier's XOR-LVT lowering must avoid
+    // never arises) and read ONLY at the single retire-time site (vector-11
+    // delivery, `entryFpuUnimp`/`entryFpuCmd` below), gated by the same
+    // headReady/count>0 discipline as every other B1 field (see SAFETY above).
+    val fpuUnimp = Bool()
+    val fpuCmd   = Bits(16 bits)
   }
 
   /** BTB/gshare retire-time training payload (task #129, area). Written ONLY by
@@ -423,8 +434,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // ONLY at alloc (same discipline as the fault* family above) from Task 10's decode
     // fields. Read by ExceptionUnit at vector-11 delivery to latch the state a later
     // FSAVE turns into the unimplemented-instruction state frame.
-    val fpuUnimpStore = Vec.fill(depth)(RegInit(False))
-    val fpuCmdStore   = Vec.fill(depth)(Reg(Bits(16 bits)) init 0)
+    // (ROB-fold task #249: folded into `payload.fpuUnimp`/`payload.fpuCmd` -- see
+    // RobPayload. No standalone Vec anymore.)
     // Instruction-fetch access-fault: set at ALLOC for a faulted (vector-2) µop whose
     // fault came from the I-cache (sswInstr). Selects a program-space SSW in the $7
     // frame. RegInit(False), reset per-alloc (mirrors faultedStore).
@@ -569,6 +580,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       p.sysRc      := u.imm(11 downto 0).asUInt
       // ROB-fold Slice A: the 1-bit fault-PC selector (replaces faultPcStore).
       p.faultUsesNextPc := u.faultUsesNextPc
+      // ROB-fold (task #249): FSAVE's route-to-FPSP source state (replaces
+      // fpuUnimpStore/fpuCmdStore -- Task 10's decode fields, same as before).
+      p.fpuUnimp := u.fpuSoftwareComplete
+      p.fpuCmd   := u.fpuCmdWord
       p
     }
 
@@ -1066,9 +1081,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // occupant of this same slot — the RegInit(True) default alone only covered a
       // never-yet-written slot, not a reused one.
       faultAtcStore(tail)   := allocUopVec(0).faultAtc
-      // Task 11: FSAVE's route-to-FPSP source state (Task 10's decode fields).
-      fpuUnimpStore(tail)   := allocUopVec(0).fpuSoftwareComplete
-      fpuCmdStore(tail)     := allocUopVec(0).fpuCmdWord
+      // (Task 11 fpuUnimp/fpuCmd: written by payloadFrom above — ROB-fold task #249.)
       nzvcWrStore(tail) := False; xWrStore(tail) := False
       sysValRdyStore(tail)  := False
       // (isRte/first/needsSup/pc/sysOp/sysKind/sysReadDir/sysRc are written by
@@ -1088,8 +1101,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultAddrStore(tail + 1)  := allocUopVec(1).faultAddr
       faultInstrStore(tail + 1) := allocUopVec(1).sswInstr
       faultAtcStore(tail + 1)   := allocUopVec(1).faultAtc
-      fpuUnimpStore(tail + 1)   := allocUopVec(1).fpuSoftwareComplete
-      fpuCmdStore(tail + 1)     := allocUopVec(1).fpuCmdWord
+      // (Task 11 fpuUnimp/fpuCmd: written by payloadFrom above — ROB-fold task #249.)
       nzvcWrStore(tail + 1) := False; xWrStore(tail + 1) := False
       sysValRdyStore(tail + 1)  := False
       GenerationFlags.simulation { pcStore(tail + 1) := allocUopVec(1).pc }
@@ -1369,9 +1381,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       sysPc      = p0.pc,
       sysNextPc  = p0.predNextPc,
       // Task 11: the head's FP unimplemented-instruction marker + command word, read
-      // only at vector-11 delivery.
-      entryFpuUnimp = fpuUnimpStore(h0),
-      entryFpuCmd   = fpuCmdStore(h0))
+      // only at vector-11 delivery. ROB-fold task #249: now payload.fpuUnimp/fpuCmd.
+      entryFpuUnimp = p0.fpuUnimp,
+      entryFpuCmd   = p0.fpuCmd)
     excIdle := !exc.active
     val excActive = exc.active; excActive.simPublic()
     // Drive the forward-declared committed-S (the privilege check gates on it).
@@ -1623,30 +1635,46 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       val setCcr5      = UInt(5 bits)
       val setCcr5Valid = Bool()
     }
-    val commitObs = Vec(CommitObs(), 3); commitObs.simPublic()
-    commitObs(0).fire := RegNext(retire0) init False; commitObs(0).robId := RegNext(h0); commitObs(0).pc := RegNext(commitPc0)
-    commitObs(0).sysByte := RegNext(exc.ss.srSys); commitObs(0).a7 := RegNext(exc.ss.a7); commitObs(0).isInterrupt := False
-    commitObs(0).ccrFold := 0; commitObs(0).ccrFoldValid := False
-    commitObs(0).setCcr5 := 0; commitObs(0).setCcr5Valid := False
-    commitObs(1).fire := RegNext(retire1) init False; commitObs(1).robId := RegNext(h1); commitObs(1).pc := RegNext(commitPc1)
-    commitObs(1).sysByte := RegNext(exc.ss.srSys); commitObs(1).a7 := RegNext(exc.ss.a7); commitObs(1).isInterrupt := False
-    commitObs(1).ccrFold := 0; commitObs(1).ccrFoldValid := False
-    commitObs(1).setCcr5 := 0; commitObs(1).setCcr5Valid := False
-    // Exception / RTE commit (handler-entry or restored PC + post-event sysByte/A7).
-    // For a FAULT entry where the faulting head wrote flags (CHK), carry its NZVC fold
-    // so the whitebox folds it (the faulting µop's Wb never retires normally).
-    commitObs(2).fire := RegNext(exc.obsFire) init False; commitObs(2).robId := RegNext(h0)
-    commitObs(2).pc := RegNext(exc.obsPc); commitObs(2).sysByte := RegNext(exc.obsSysByte); commitObs(2).a7 := RegNext(exc.obsA7)
-    // Fold value held since the trigger (aligned with the late obsFire entry pulse).
-    // Applied ONLY to a fault/trap ENTRY obs (obsIsEntry) that is not an interrupt and
-    // whose faulting instruction wrote flags (CHK). RTE obs / interrupt entries carry
-    // no fold (their running-CCR reconstruction is already correct).
-    commitObs(2).ccrFold      := RegNext(heldCcrFold)
-    commitObs(2).ccrFoldValid := RegNext(exc.obsFire && exc.obsIsEntry && !exc.obsIsInterrupt && heldCcrFoldValid) init False
-    commitObs(2).isInterrupt := RegNext(exc.obsIsInterrupt) init False
-    // MOVE-to-SR's absolute CCR write (registered alongside the obs pulse).
-    commitObs(2).setCcr5      := RegNext(exc.obsSetCcr5)
-    commitObs(2).setCcr5Valid := RegNext(exc.obsFire && exc.obsSetCcr5Valid) init False
+    // Task #249: sim-only like every other tap in this section (pcStore above,
+    // faultedStore.simPublic, etc.), but unlike its sibling `pcStore` this whole
+    // section was never actually GATED by `GenerationFlags.simulation` -- it always
+    // elaborated 3x91 bits of registers + fan-in into every synth/GenVerilog build.
+    // Its only real consumer, IplAckPlugin's `rob.logic.commitObs(2)` read
+    // (`IplAckPlugin.scala:105`), is itself already inside a `GenerationFlags.
+    // simulation` block, so that access is unaffected by gating the producer too.
+    // `commitObs(0)`/`commitObs(1)` have zero consumers anywhere (grep-confirmed) --
+    // this whole block is sim-only observability, exactly like `pcStore`. Mirrors
+    // pcStore's exact idiom: the val itself is `null` in every synth/GenVerilog
+    // build, so (like pcStore) it must never be referenced outside a
+    // `GenerationFlags.simulation` block -- which is already true of its sole
+    // consumer above.
+    val commitObs = GenerationFlags.simulation {
+      val obs = Vec(CommitObs(), 3); obs.simPublic()
+      obs(0).fire := RegNext(retire0) init False; obs(0).robId := RegNext(h0); obs(0).pc := RegNext(commitPc0)
+      obs(0).sysByte := RegNext(exc.ss.srSys); obs(0).a7 := RegNext(exc.ss.a7); obs(0).isInterrupt := False
+      obs(0).ccrFold := 0; obs(0).ccrFoldValid := False
+      obs(0).setCcr5 := 0; obs(0).setCcr5Valid := False
+      obs(1).fire := RegNext(retire1) init False; obs(1).robId := RegNext(h1); obs(1).pc := RegNext(commitPc1)
+      obs(1).sysByte := RegNext(exc.ss.srSys); obs(1).a7 := RegNext(exc.ss.a7); obs(1).isInterrupt := False
+      obs(1).ccrFold := 0; obs(1).ccrFoldValid := False
+      obs(1).setCcr5 := 0; obs(1).setCcr5Valid := False
+      // Exception / RTE commit (handler-entry or restored PC + post-event sysByte/A7).
+      // For a FAULT entry where the faulting head wrote flags (CHK), carry its NZVC fold
+      // so the whitebox folds it (the faulting µop's Wb never retires normally).
+      obs(2).fire := RegNext(exc.obsFire) init False; obs(2).robId := RegNext(h0)
+      obs(2).pc := RegNext(exc.obsPc); obs(2).sysByte := RegNext(exc.obsSysByte); obs(2).a7 := RegNext(exc.obsA7)
+      // Fold value held since the trigger (aligned with the late obsFire entry pulse).
+      // Applied ONLY to a fault/trap ENTRY obs (obsIsEntry) that is not an interrupt and
+      // whose faulting instruction wrote flags (CHK). RTE obs / interrupt entries carry
+      // no fold (their running-CCR reconstruction is already correct).
+      obs(2).ccrFold      := RegNext(heldCcrFold)
+      obs(2).ccrFoldValid := RegNext(exc.obsFire && exc.obsIsEntry && !exc.obsIsInterrupt && heldCcrFoldValid) init False
+      obs(2).isInterrupt := RegNext(exc.obsIsInterrupt) init False
+      // MOVE-to-SR's absolute CCR write (registered alongside the obs pulse).
+      obs(2).setCcr5      := RegNext(exc.obsSetCcr5)
+      obs(2).setCcr5Valid := RegNext(exc.obsFire && exc.obsSetCcr5Valid) init False
+      obs
+    }
   }
 
   override def trace     = logic.traceVec
