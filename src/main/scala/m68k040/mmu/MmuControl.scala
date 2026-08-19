@@ -52,45 +52,60 @@ import spinal.lib.misc.plugin.FiberPlugin
   * 394-test suite (byte-identical fail-list before/after, git-stash A/B) and the
   * full 763-test ported corpus (see task #194's commit messages / report). */
 class MmuControlPlugin extends FiberPlugin with MmuControlService {
-  var _mmuEnable: Bool = null
-  var _pageSize8K: Bool = null
-  var _urp:       UInt = null
-  var _srp:       UInt = null
-  var _itt0:      UInt = null
-  var _itt1:      UInt = null
-  var _dtt0:      UInt = null
-  var _dtt1:      UInt = null
-  var _mmusr:     UInt = null
+  // Task #195 follow-up (elaboration-crash fix for GenFullCoreSynthVerilog, found the
+  // session after #195 landed -- NOT task #236, a separate/unrelated DcachePlugin
+  // retiming fix on the fmax-closure-fanout branch): these getters used
+  // to read plain `var _field` mirrors that `logic`'s Area body assigned as a SIDE
+  // EFFECT at the very end of its own body (see below). That bypassed SpinalHDL's
+  // Fiber synchronization entirely: `logic`'s `during build { ... }` body runs
+  // ASYNCHRONOUSLY (its own forked Fiber task), and there is NO guarantee it has
+  // executed by the time some OTHER plugin's `during build` body (e.g. LsEuPlugin's,
+  // ExceptionUnit's) reaches a `host.get[MmuControlService].map(_.pageSize8K)` call --
+  // that race is real and was caught here: `GenFullCoreSynthVerilog` (the ONLY target
+  // that actually assembles every plugin, including this one, together) crashed with
+  // `AssertionError` at `BaseType.newMultiplexer` because `Mux(is8K, ...)` in
+  // LsEuPlugin received a Scala-`null` `Bool` for `is8K` -- `_pageSize8K` had not yet
+  // been assigned when LsEuPlugin's build body ran `mmuCtrl2.map(_.pageSize8K)`,
+  // confirmed by instrumenting both reads: `is8K` (read a few lines after `host.get`)
+  // was null, while `mmuEnable` (read ~360 lines later in the SAME build body, after
+  // far more real wall-clock elaboration work had given MmuControlPlugin's own build
+  // task time to finish) was already a valid signal -- i.e. a genuine cross-Fiber-task
+  // ordering race, not a width/type mismatch (both Mux branches ARE width- and
+  // type-consistent; NOT the bug). Directed unit-test DUTs never hit this because they
+  // don't wire MmuControlService at all (`host.get` -> None -> `.getOrElse(False)`, a
+  // real non-null literal, never touches this race).
+  //
+  // Fix: route every getter through `logic` -- a `Handle[Area]` (SpinalHDL's
+  // Fiber synchronization primitive) -- instead of the racy `var` mirrors. Calling
+  // `.mmuEnable`/`.pageSize8K`/etc. directly on a `Handle` resolves via
+  // `Handle.keyImplicit`'s implicit `Handle[T] => T = _.get`, and `Handle.get` BLOCKS
+  // the CALLING Fiber task (parking + rescheduling it, not a busy-spin) until this
+  // plugin's own `during build` body has actually run and loaded the Handle -- the
+  // exact mechanism this codebase already relies on for cross-plugin `during build`
+  // wiring done at the top level (e.g. `rob.logic.excActive`,
+  // `host[IcachePlugin].logic.invalidateAll` in FullCoreSynth.scala) but that this
+  // plugin's OWN service getters had bypassed by shadowing with plain vars. This is a
+  // strictly ADDITIVE synchronization fix -- no register, no page-table-walk, no
+  // width/slice semantics changed.
+  override def mmuEnable: Bool = logic.mmuEnable
+  override def pageSize8K: Bool = logic.pageSize8K
+  override def urp:       UInt = logic.urp
+  override def srp:       UInt = logic.srp
+  override def itt0:      UInt = logic.itt0
+  override def itt1:      UInt = logic.itt1
+  override def dtt0:      UInt = logic.dtt0
+  override def dtt1:      UInt = logic.dtt1
+  override def mmusr:     UInt = logic.mmusr
 
-  var _setEnable: Flow[Bool] = null
-  var _setPageSize: Flow[Bool] = null
-  var _setUrp:    Flow[UInt] = null
-  var _setSrp:    Flow[UInt] = null
-  var _setItt0:   Flow[UInt] = null
-  var _setItt1:   Flow[UInt] = null
-  var _setDtt0:   Flow[UInt] = null
-  var _setDtt1:   Flow[UInt] = null
-  var _setMmusr:  Flow[UInt] = null
-
-  override def mmuEnable: Bool = _mmuEnable
-  override def pageSize8K: Bool = _pageSize8K
-  override def urp:       UInt = _urp
-  override def srp:       UInt = _srp
-  override def itt0:      UInt = _itt0
-  override def itt1:      UInt = _itt1
-  override def dtt0:      UInt = _dtt0
-  override def dtt1:      UInt = _dtt1
-  override def mmusr:     UInt = _mmusr
-
-  override def setEnable: Flow[Bool] = _setEnable
-  override def setPageSize: Flow[Bool] = _setPageSize
-  override def setUrp:    Flow[UInt] = _setUrp
-  override def setSrp:    Flow[UInt] = _setSrp
-  override def setItt0:   Flow[UInt] = _setItt0
-  override def setItt1:   Flow[UInt] = _setItt1
-  override def setDtt0:   Flow[UInt] = _setDtt0
-  override def setDtt1:   Flow[UInt] = _setDtt1
-  override def setMmusr:  Flow[UInt] = _setMmusr
+  override def setEnable: Flow[Bool] = logic.setEnable
+  override def setPageSize: Flow[Bool] = logic.setPageSize
+  override def setUrp:    Flow[UInt] = logic.setUrp
+  override def setSrp:    Flow[UInt] = logic.setSrp
+  override def setItt0:   Flow[UInt] = logic.setItt0
+  override def setItt1:   Flow[UInt] = logic.setItt1
+  override def setDtt0:   Flow[UInt] = logic.setDtt0
+  override def setDtt1:   Flow[UInt] = logic.setDtt1
+  override def setMmusr:  Flow[UInt] = logic.setMmusr
 
   val logic = during build new Area {
     // The control regs. RegInit/Reg-init so a standalone DUT (no external driver)
@@ -145,24 +160,5 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
     when(setDtt0.valid)   { dtt0 := setDtt0.payload }
     when(setDtt1.valid)   { dtt1 := setDtt1.payload }
     when(setMmusr.valid)  { mmusr := setMmusr.payload }
-
-    _mmuEnable = mmuEnable
-    _pageSize8K = pageSize8K
-    _urp = urp
-    _srp = srp
-    _itt0 = itt0
-    _itt1 = itt1
-    _dtt0 = dtt0
-    _dtt1 = dtt1
-    _mmusr = mmusr
-    _setEnable = setEnable
-    _setPageSize = setPageSize
-    _setUrp = setUrp
-    _setSrp = setSrp
-    _setItt0 = setItt0
-    _setItt1 = setItt1
-    _setDtt0 = setDtt0
-    _setDtt1 = setDtt1
-    _setMmusr = setMmusr
   }
 }
