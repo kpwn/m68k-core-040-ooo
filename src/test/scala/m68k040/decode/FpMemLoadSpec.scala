@@ -264,13 +264,38 @@ class FpMemLoadSpec extends AnyFunSuite {
       s"opclass 011 must emit a STORE, never a LOAD: ${us(1)}")
   }
 
-  // ── FMOVEM <ea>,list (opclass 110) shares this opword band but is NOT this task's job ──
-  test("FMOVEM.X (A0),FP0-FP7 (opclass 110): shares the opword band, still traps -- unowned gap", VerilatorTest) {
+  // ── FMOVEM <ea>,list (opclass 110) shares this opword band -- task #241/#246 LANDED the
+  //    static-list `(An)`/`(d16,An)` load-direction case (the `fmovemxActive` FSM in
+  //    DecodeStage, NOT this µcode engine -- it diverts BEFORE `ucBegin` claims the slot,
+  //    see `slot0IsFmovemx`'s doc), so this is no longer an "unowned gap, still traps" case
+  //    -- what this test now guards is that it reaches the NEW engine's [LOAD x3 chunks] +
+  //    [FP issue row] shape instead of the trap row. Full data-list coverage (register-list
+  //    ordering, empty list, decode-matrix collision checks) lives in
+  //    `FmovemxDataListDecodeSpec`; this test only guards that THIS spec's own harness
+  //    agrees the opword band routes away from the µcode engine's trap for this case.
+  test("FMOVEM.X (A0),FP0-FP7 (opclass 110, static list): now the fmovemxActive engine, NOT a trap", VerilatorTest) {
     val op  = fpOp(2, 0)
-    val ext = fpExt(6, 0, 0, 0xFF)                   // opclass 110 (FMOVEM), NOT this task's job
+    val ext = fpExt(6, 0, 0, 0xFF)                   // opclass 110 (FMOVEM), static list, mask=0xFF
+    val us = collect(Seq(op, ext) ++ filler, 0x40800000L, 4)
+    assert(us.length == 4, s"expected element 0's [LOAD x3 + issue] sub-phase shape: $us")
+    assert(!us.exists(_.faulted), s"must NOT trap -- task #241/#246 closed this gap: $us")
+    val loads = us.take(3)
+    assert(loads.forall(u => u.memOp.startsWith("LOAD") && !u.faulted), s"$loads")
+    val issue = us(3)
+    assert(issue.op == "FPU" && issue.writesFp && !issue.writesFpcc,
+      s"element 0's issue row must write FP0, and FMOVEM must never write FPCC: $issue")
+  }
+
+  // ── Still genuinely unowned/out-of-scope for THIS task: opclass 111 (store direction,
+  //    task #242) with a MEMORY EA -- must keep trapping exactly as before, since
+  //    `slot0IsFmovemx`'s gate is opclass-110-only. (The register-direct opclass-111 alias,
+  //    FMOVECR, is covered separately by `FmovemxDataListDecodeSpec`'s own collision test.) ──
+  test("FMOVEM.X list,(A0) (opclass 111, store -- task #242, still unowned): still traps", VerilatorTest) {
+    val op  = fpOp(2, 0)
+    val ext = fpExt(7, 0, 0, 0xFF)                   // opclass 111 (FMOVEM store), static list
     val us = collect(Seq(op, ext) ++ filler, 0x40800000L, 1)
     assert(us.length == 1, s"expected 1 uop (the trap row): $us")
-    assert(us(0).faulted && us(0).faultVector == 11, s"opclass 110 (FMOVEM) must still trap: ${us(0)}")
+    assert(us(0).faulted && us(0).faultVector == 11, s"opclass 111 (FMOVEM store) must still trap: ${us(0)}")
   }
 
   // ── A non-hardware-native opmode (e.g. FSIN, opmode 0x0E) memory source must ALSO trap --

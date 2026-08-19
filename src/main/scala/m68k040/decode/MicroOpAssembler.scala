@@ -206,6 +206,154 @@ object MicroOpAssembler {
   }
 
   // ════════════════════════════════════════════════════════════════════════════
+  // FMOVEM.X data-register-list µop builders (task #241/#246, the `fmovemxActive` FSM --
+  // the SECOND instantiation of the `RegListWalk` shared skeleton, see RegListWalk.scala).
+  // Design spec: docs/superpowers/specs/2026-08-19-fmovem-data-list-design.md §§1-3/6.6.
+  // LOAD direction only, EA modes `(An)`/`(d16,An)` only (this task's scope; store/auto-
+  // update/indexed/PC-relative are tasks #242-245). Extended is the ONLY in-memory format
+  // (§2: "always Extended... the ONLY format FMOVEM.X data-register-list transfers"), so
+  // every element needs exactly the existing scalar Extended crack's per-element row shape
+  // -- `[LOAD x3 chunks] + [UFpIssue]` (`Microcode.scala`'s `fpMemBaseGroup`, chunks=3) --
+  // built DIRECTLY as hardware (mirroring `movemMoveUop`'s direct-construction style)
+  // instead of routed through the µcode ROM/Ctx-resolve machinery (which is the µcode
+  // SEQUENCER's own separate, unrelated engine -- this FSM bypasses it exactly like
+  // `movemActive` bypasses `AssembledUops`).
+
+  /** One 32-bit chunk LOAD into a FIXED scratch temp (`dstTemp` = T0/T1/T2, selected by the
+    * FSM's own sub-phase counter), address = `base + disp` (the running per-element byte
+    * offset + the chunk's 0/4/8 sub-offset, folded by the caller). Mirrors `movemMoveUop`'s
+    * field-by-field style verbatim (plain LS-cluster load, no flags, no auto-fold -- this
+    * task's admitted EA modes are both non-auto). UNCONDITIONALLY dropped from the lock-step
+    * commit stream (`divIsRem := True`): it writes only a scratch temp, never a real
+    * architectural destination on its own -- exactly like the µcode ROM's own `fpMemBaseGroup`
+    * LOAD rows (never `isLast`/kept) and MOVEM's own `movemLoadDst`-redirected loads. The
+    * loaded VALUE still reaches the scratch temp's real PRF slot via the ordinary rename/
+    * wakeup path, so the following issue-row's srcA/srcB/srcC reads see it correctly. */
+  def fmovemxLoadChunkUop(base: UInt, baseValid: Bool, disp: Bits, dstTemp: UInt,
+                           first: Bool, valid: Bool, pc: UInt, nextPc: UInt): DecodedUop = {
+    val u = DecodedUop()
+    u.fpInert()
+    u.valid       := valid
+    u.pc          := pc
+    u.nextPc      := nextPc
+    u.op          := DecOp.MOVE
+    u.cluster     := Cluster.LS
+    u.size        := Size.LONG
+    u.memOp       := MemOp.LOAD
+    u.srcAReg     := base; u.srcAValid := baseValid
+    u.srcBReg     := 0;    u.srcBValid := False
+    u.srcCReg     := 0;    u.srcCValid := False    // no index -- this task's EA scope has none
+    u.dstReg      := dstTemp; u.dstValid := True
+    u.useImm      := True; u.imm := disp
+    u.readsNzvc   := False; u.readsX := False
+    u.writesNzvc  := False; u.writesX := False     // FMOVEM affects NO integer condition codes
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
+    u.cond        := 0; u.branchDisp := 0
+    u.unimplemented := False
+    u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+    u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
+    u.faultAddr   := pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
+    u.divSigned   := False; u.div64 := False
+    u.divIsRem    := True     // a scratch-temp load is NEVER the macro's kept commit
+    u.isChk2      := False
+    u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
+    u.ccrRestore  := False; u.toCcr := False
+    u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.extByte := False
+    u.isMovea     := False
+    u.isScc       := False; u.isDbcc := False
+    u.indexLong   := False; u.indexScale := 0
+    u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+    u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+    u.predTaken := False; u.predTarget := U(0, 32 bits)
+    u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+    u.firstOfInstr := first
+    u
+  }
+
+  /** The per-element FP issue row: reads the 3 already-loaded chunk temps (T0/T1/T2, the
+    * Extended-format srcA/srcB/srcC gateway -- `fpSrcKind = MEMEXT`, mirrors
+    * `Microcode.scala`'s `UFpIssue` resolve block field-for-field) and writes the current
+    * element's target FPn (`fpDst`, 0-7). `fpuOp = 0x00` (FMOVE -- a plain load/convert, no
+    * compute; `FpSource.opmodeToFpOp`'s own documented safe default).
+    *
+    * ONE DELIBERATE DIVERGENCE from `UFpIssue`'s own field values, NOT a bug: `writesFpcc`
+    * is forced FALSE here, where `UFpIssue` sets it unconditionally True. The design doc §2
+    * is explicit that FMOVEM (list or otherwise) is NOT a compute instruction and must NOT
+    * update FPSR/FPCC ("Musashi's `fmovem()` never touches FPSR") -- unlike a scalar single-
+    * register `FMOVE <ea>,FPn`, which DOES update FPCC and is exactly what `UFpIssue` is
+    * for. Building this uop directly (rather than routing through the µcode ROM's
+    * `UFpIssue` descriptor) is what lets this field diverge correctly per element.
+    *
+    * `drop` mirrors MOVEM's own `movemHasFinal`-driven drop convention, generalized past 2
+    * writers: EVERY element's issue row drops (`divIsRem := True`) EXCEPT the LAST emitted
+    * element of the macro, whose issue row is the sole kept commit -- the exact same "N
+    * dropped writers + 1 kept" shape the CPLX cluster's `DivEuPlugin` already relies on for
+    * DIVREM (2 writers: the kept quotient move + the dropped remainder move) and MOVEM
+    * already proves scales to N (`LsEuPlugin`'s `crackDrop <- divIsRem`); the CPLX cluster's
+    * OWN `wbObs.keepCommit` is hardcoded False (`DivEuPlugin.scala`), so the "exactly one
+    * non-drop writer per macro" convention -- not an explicit keepCommit override -- is the
+    * ONLY mechanism CPLX writers have, and it generalizes to this FSM's up-to-8 writers with
+    * no new EU-side plumbing. */
+  def fmovemxIssueUop(fpDst: UInt, drop: Bool, first: Bool, valid: Bool,
+                       pc: UInt, nextPc: UInt): DecodedUop = {
+    val u = DecodedUop()
+    // NO `u.fpInert()` here (unlike every OTHER builder in this file): every fp* field is
+    // explicitly, unconditionally set below -- calling fpInert() first would completely
+    // overlap those same fields with no intervening `when`, which SpinalHDL's
+    // PhaseCheck_noLatchNoOverride correctly flags as dead-code-shaped (exactly the class of
+    // issue Microcode.scala's own UFpIssue resolve block documents wrapping in `when(Bool(...))`
+    // to avoid -- here the simpler fix is to just not double-write these particular fields).
+    u.valid       := valid
+    u.pc          := pc
+    u.nextPc      := nextPc
+    u.op          := DecOp.FPU
+    u.cluster     := Cluster.CPLX
+    u.size        := Size.LONG
+    u.memOp       := MemOp.NONE
+    u.srcAReg     := U(T0, 5 bits); u.srcAValid := True
+    u.srcBReg     := U(T1, 5 bits); u.srcBValid := True
+    u.srcCReg     := U(T2, 5 bits); u.srcCValid := True
+    u.dstReg      := 0; u.dstValid := False    // no INT destination -- FP PRF only
+    u.useImm      := False; u.imm := 0
+    u.readsNzvc   := False; u.readsX := False
+    u.writesNzvc  := False; u.writesX := False
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
+    u.cond        := 0; u.branchDisp := 0
+    u.unimplemented := False
+    u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+    u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
+    u.faultAddr   := pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
+    u.divSigned   := False; u.div64 := False
+    u.divIsRem    := drop
+    u.isChk2      := False
+    u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
+    u.ccrRestore  := False; u.toCcr := False
+    u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.extByte := False
+    u.isMovea     := False
+    u.isScc       := False; u.isDbcc := False
+    u.indexLong   := False; u.indexScale := 0
+    u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False
+    u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+    u.predTaken := False; u.predTarget := U(0, 32 bits)
+    u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+    u.firstOfInstr := first
+    // ── FP-domain fields (mirrors Microcode.scala's UFpIssue resolve block) ──────────
+    u.fpuOp      := B(0, 7 bits)              // 0x00 FMOVE: plain load/convert, no compute
+    u.fpDstReg   := fpDst.resize(3)
+    u.writesFp   := True
+    u.writesFpcc := False    // DELIBERATE divergence from UFpIssue -- see doc above (design §2)
+    u.readsFpcc  := False
+    u.fpSrcAReg  := fpDst.resize(3)           // harmless: usesFpSrcA=False below (not dyadic)
+    u.usesFpSrcA := False
+    u.fpSrcBReg  := 0
+    u.usesFpSrcB := False                      // source is the memory-loaded temps, not FPm
+    u.fpSrcFmt   := B"3'b010"                  // srcSpec code for Extended (design doc §2)
+    u.fpSrcKind  := FpSrcKind.MEMEXT
+    u.fpWideImm  := B(0, 80 bits)
+    u
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // MOVEP micro-sequencer µop builders (the DecodeStage MOVEP FSM). MOVEP moves a
   // data register <-> alternating EVEN memory bytes; the FSM emits a byte-at-a-time
   // load/store sequence + the shift/and/or assembly using EXISTING DecOps (MOVE+memOp,

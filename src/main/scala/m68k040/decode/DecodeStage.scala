@@ -382,16 +382,24 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val movemSizeBytes = Mux(movemSizeLong, S(4, 32 bits), S(2, 32 bits))
     val movemStep      = Mux(movemRev, -movemSizeBytes, movemSizeBytes)
 
-    // Priority-extract the lowest two set mask bits (the `x & (x-1)` clears the lowest set
-    // bit; done in UInt since Bits has no arithmetic).
-    val movemMask0 = movemMask.asUInt
-    val movemBit0  = OHToUInt(OHMasking.first(movemMask))                  // lowest set bit index
-    val movemMask1 = movemMask0 & (movemMask0 - 1)                         // clear the lowest set bit
-    val movemHas1  = movemMask1 =/= 0
-    val movemBit1  = OHToUInt(OHMasking.first(movemMask1.asBits))
-    val movemMask2 = (movemMask1 & (movemMask1 - 1)).asBits                // after clearing two bits
-    // bit -> register: forward bit i -> reg i; reverse bit i -> reg 15-i.
-    def movemRegOf(bit: UInt): UInt = Mux(movemRev, (U(15, 5 bits) - bit.resize(5)), bit.resize(5))
+    // Priority-extract the lowest two set mask bits (task #241/#246 "Approach A": this is
+    // now the shared `RegListWalk.extractLowest2` skeleton primitive, parameterized by
+    // width instead of hardcoded to 16 bits -- SAME formula as before the refactor, just
+    // relocated; see RegListWalk.scala's header doc for the shared/instance-specific
+    // boundary. `x & (x-1)` clears the lowest set bit; done in UInt since Bits has no
+    // arithmetic).
+    val movemExtract = RegListWalk.extractLowest2(movemMask)
+    val movemBit0  = movemExtract.bit0                                     // lowest set bit index
+    val movemMask1 = movemExtract.mask1                                    // clear the lowest set bit
+    val movemHas1  = movemExtract.has1
+    val movemBit1  = movemExtract.bit1
+    val movemMask2 = movemExtract.mask2                                    // after clearing two bits
+    // bit -> register: forward bit i -> reg i; reverse bit i -> reg 15-i. Now routed through
+    // the shared `RegListWalk.regOf` (caller-supplied forward/reverse maps -- int's OWN
+    // `15 - bit` reverse formula, unchanged; NOT the FP data-list FSM's different `7 - bit`
+    // formula, per RegListWalk's doc).
+    def movemRegOf(bit: UInt): UInt =
+      RegListWalk.regOf(bit, movemRev, b => b.resize(5), b => (U(15, 5 bits) - b.resize(5)))
     val movemReg0 = movemRegOf(movemBit0)
     val movemReg1 = movemRegOf(movemBit1)
     // Element addresses: imm = baseDisp + runningOffset; the 2nd element steps by movemStep.
@@ -605,6 +613,45 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     val s0dstExtW0Shifted = s0WordAtDyn((U(1, 5 bits) + s0srcWordCount.resize(5)).resize(5))
     val s0dstIsMemIndShifted = s0dstModeIsFullCandidate && s0dstExtW0Shifted(8) &&
                                (s0dstExtW0Shifted(2 downto 0).asUInt =/= U(0, 3 bits))
+    // ── FMOVEM.X data-register-list entry detection (task #241/#246) ────────────────────
+    // `OperationDecoder`'s cpGEN memory-<ea> arm (`fpMemIsMemEa`, OperationDecoder.scala
+    // ~1194-1236) is OPCLASS-AGNOSTIC — it cannot see `words(1)` (Task 4's own grounding),
+    // so it marks `spec0.microcoded := True` for EVERY cpGEN memory-EA opword regardless of
+    // whether the real ext word turns out to be a generic load/store (010/011), a control-
+    // register list (100/101, owned by the µcode engine's own `ucFpCtrlOk`), or THIS task's
+    // data-register list (110/111). Deliberately NOT touching `OperationDecoder.scala`/
+    // `fpMemIsMemEa`/`o.microcoded` for this — that shared marker feeds many OTHER µcode
+    // engine customers, and the engine already correctly re-decodes the real ext word itself
+    // (`ucBegin`'s `ucFpOpClass`/`ucFpMemBad` dispatch) to route each real case, INCLUDING
+    // falling back to `FP_MEM_TRAP_ENTRY` for exactly the data-list opclasses today (since
+    // `ucFpMemBad` requires `ucFpOpClass === 010`). Mirroring 10+ existing precedents in
+    // THIS file (`s0dstModeIsFullCandidate`, `s0IsLea`, `s0bfExt`, ...), this is instead a
+    // LOCAL, narrowly-scoped opword+real-ext-word classifier that carves the in-scope subset
+    // (static list, EA mode `(An)`/`(d16,An)` only — §1 of the design doc; postinc/predec/
+    // indexed/PC-rel stay on the µcode engine's existing trap path until tasks #242-245) out
+    // to the new `fmovemxActive` FSM, leaving `spec0.microcoded`/`ucFpMemBad`/`ucBegin`'s
+    // dispatch of every OTHER cpGEN case byte-for-byte unchanged. `slot0OwnedByUc` below
+    // folds in the exclusion (§6.5's "fold into the SAME existing aggregate" pattern), so
+    // the µcode engine never also tries to claim this same opword.
+    //
+    // Opword pattern `1111 001 000 mmmrrr` (cpGEN, `0xF200|<ea>`), mirrors OperationDecoder's
+    // own `isFpGeneric` bit test (`opword[11:9]===001 && opword[8:6]===000`) plus the EA-mode
+    // restriction to mode 010 `(An)` / 101 `(d16,An)` (this task's scope only).
+    val s0FpGenEaMode = s0opw(5 downto 3)
+    val s0IsFpGenMemEa = (s0opw(15 downto 9) === B"7'b1111001") && (s0opw(8 downto 6) === B"3'b000") &&
+                         ((s0FpGenEaMode === B"3'b010") || (s0FpGenEaMode === B"3'b101"))
+    // The real ext word (`words(1)`, right after the opword — mirrors `movemEntryPkt`'s own
+    // `eMask = words(1)` layout, and `ucFpExt`'s identical positioning): opclass[15:13] (110
+    // load / 111 store — store is task #242, so only 110 is admitted here), bit[11] = static
+    // (0) vs dynamic (1) list — dynamic stays trapped, bit[12] = list-format (0=predecrement
+    // bit-n->FPn identity map / 1=control-postincrement bit-n->FP(7-n) reverse map, §2),
+    // bits[7:0] = the register mask itself (read later, inside the FSM's own entry latch).
+    val s0FpExt1     = s0pkt.words(1)
+    val s0FpOpClass  = s0FpExt1(15 downto 13)
+    val s0FpIsStatic = !s0FpExt1(11)
+    // THIS task's scope is load-direction only (opclass 110); store (111) stays on the
+    // pre-existing µcode-engine trap path until task #242 lands.
+    val slot0IsFmovemx = fed.valid && s0IsFpGenMemEa && (s0FpOpClass === B"3'b110") && s0FpIsStatic
     // Control-transfer / address-generate full-format mem-indirect (task #201): see the
     // s1mi_isLea/isPea/isJmp/isJsr comment (mirrored here for slot0) — OperationDecoder
     // never recognizes JMP/JSR at all (illegal=True always) and marks LEA/PEA non-illegal
@@ -713,7 +760,13 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
                              s0bfRdOnly && s0bfMemindOk
     // A slot0 owned by the µcode engine: an OperationDecoder-microcoded op OR a full-format
     // mem-indirect host OR a dynamic read-only bit-field (all enter the engine, off the fast head).
-    val slot0OwnedByUc = slot0IsMicrocoded || slot0IsMemInd || slot0IsBfDynMem || slot0IsBfMemindMem
+    // task #241/#246: a `slot0IsFmovemx` opword is ALSO always `slot0IsMicrocoded` (same
+    // opword pattern, `spec0.microcoded` is opclass-agnostic per `s0IsFpGenMemEa`'s own doc
+    // above) -- excluded here (§6.5's "fold into the SAME existing aggregate" pattern) so the
+    // µcode engine never also tries to claim it. `slot0IsFmovemx` is False for every
+    // pre-existing opword/EA-mode, so this exclusion is a no-op everywhere else.
+    val slot0OwnedByUc = (slot0IsMicrocoded || slot0IsMemInd || slot0IsBfDynMem || slot0IsBfMemindMem) &&
+                         !slot0IsFmovemx
     // µcode engine state (declared early — referenced by normalHeadValid below). The
     // sequencer logic + transitions live in the µcode SEQUENCER region further down.
     val ucActive    = RegInit(False)
@@ -726,12 +779,19 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // Hoisted early (also used by movemBegin and ucBegin mutual-exclusion guards):
     val movepActive    = RegInit(False)
     val movepPendValid = RegInit(False)
+    // Hoisted early (task #241/#246, mirrors movepActive/movepPendValid's own hoist comment
+    // above): the FMOVEM.X data-list FSM's OWN active flag, needed by movemBegin/ucBegin/
+    // movepBegin's mutual-exclusion guards below. Unlike the other three FSMs, this task's
+    // scope never enters from a stashed slot1 (§ the entry-detection doc at `slot0IsFmovemx`
+    // above), so there is no `fmovemxPendValid` to hoist alongside it.
+    val fmovemxActive  = RegInit(False)
 
     // The source packet the FSM enters from: the stashed slot1 MOVEM, else slot0.
     val movemEntryPkt = Mux(movemPendValid, movemPendPkt, fed.payload.packets(0))
     // Begin a MOVEM: there's a MOVEM to start (a pending slot1 one, or slot0 is MOVEM and
     // not blocked by a stash/replay) and the FSM is idle.
     val movemBegin = !movemActive && !ucActive && !ucPendValid && !movepActive && !movepPendValid &&
+                     !fmovemxActive &&
                      (movemPendValid || (slot0IsMovem && !stashValid))
 
     // Decode the entry packet's EA + mask. The mask is words(1); a (d16,An)/(xxx)/(d16,PC)
@@ -856,6 +916,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // Begin a MOVEP: a pending slot1 one, OR a slot0 MOVEP (not blocked by a stash/replay),
     // while the MOVEP FSM AND the MOVEM/µcode sequencers are all idle.
     val movepBegin = !movepActive && !movemActive && !movemPendValid && !ucActive && !ucPendValid &&
+                     !fmovemxActive &&
                      (movepPendValid || (slot0IsMovep && !stashValid))
 
     // The per-step µop. The address disp for the byte at position k is movepDisp + k
@@ -927,6 +988,95 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       }
     }
 
+    // ── FMOVEM.X data-register-list FSM (task #241/#246) ─────────────────────────
+    // The SECOND instantiation of the RegListWalk shared skeleton (RegListWalk.scala) --
+    // see the task-241 report for the full shared/instance-specific boundary as actually
+    // drawn. Structurally modeled on movemActive (entry/hold/exit shape, priority-encode +
+    // regOf math shared via RegListWalk), but does NOT share movemActive's literal state
+    // registers or transition logic: int MOVEM walks up to 2 elements/CYCLE with a
+    // single-µop-per-element emission, while this FSM walks exactly 1 element at a time but
+    // spends 4 SUB-PHASE cycles per element (mirrors the existing scalar Extended crack's own
+    // row shape, Microcode.scala's fpMemBaseGroup: [LOAD x3 chunks] + [UFpIssue]) -- a
+    // fundamentally different per-cycle cadence that would have forced int MOVEM's own
+    // cycle-accurate behavior to change to unify literally, which this refactor deliberately
+    // avoids (see the design doc's "if it doesn't fit cleanly... rethink the boundary" note).
+    // LOAD direction only, EA modes (An)/(d16,An) only (this task's scope, `slot0IsFmovemx`'s
+    // own doc); store/auto-update/indexed/PC-relative are tasks #242-245. No base/index
+    // snapshot hazard machinery at all (task #200's mechanism is int-MOVEM-specific -- FP and
+    // integer register files are disjoint, so an FPn can never alias the An base, per the
+    // design doc §3's explicit note).
+    val fmovemxMask     = Reg(Bits(8 bits))
+    val fmovemxRevMap   = Reg(Bool())          // ext1[12]: True=control/postinc (bit n -> FP(7-n)); False=predecrement-list (bit n -> FPn identity) -- design doc §2
+    val fmovemxBaseReg  = Reg(UInt(5 bits))    // always a real An in this task's scope (both admitted EA modes have one)
+    val fmovemxBaseDisp = Reg(Bits(32 bits))   // 0 for (An); sign-extended d16 for (d16,An)
+    val fmovemxOff      = Reg(SInt(32 bits))   // running byte offset for the CURRENT element (12 bytes/elt Extended, always ascending -- neither admitted EA mode auto-updates)
+    val fmovemxEmitted  = Reg(UInt(4 bits))    // elements emitted so far (0..8)
+    val fmovemxPc       = Reg(UInt(32 bits))
+    val fmovemxNextPc   = Reg(UInt(32 bits))
+    val fmovemxPhase    = Reg(UInt(2 bits))    // 0/1/2 = LOAD chunk 0/1/2 (-> T0/T1/T2); 3 = the FP issue row
+    val fmovemxCurReg   = Reg(UInt(3 bits))    // this element's target FPn (0-7), latched when the element begins
+    when(pipeFlush) { fmovemxActive := False }
+
+    // bit -> FPn mapping (RegListWalk.regOf, NOT movemRegOf's formula -- design doc §6.6's
+    // explicit warning: identity forward / `7 - bit` reverse, NOT int's `15 - bit`).
+    def fmovemxMapBit(bit: UInt, rev: Bool): UInt =
+      RegListWalk.regOf(bit, rev, b => b.resize(3), b => (U(7, 3 bits) - b.resize(3)))
+    // The CURRENT element's bit (RegListWalk's 1-bit-per-element primitive) + the mask
+    // with it cleared; `fmovemxIsLastElem` is True when nothing remains after it (its issue
+    // row is then the macro's kept commit). A SECOND extraction on `fmovemxMaskAfterCur`
+    // gives the bit/register of the element AFTER this one -- used by the transition logic
+    // below when advancing. (Extracting `fmovemxMask` only ONCE and reusing that same bit
+    // as "next" is a bug -- it re-derives the CURRENT element's own bit, not the next one;
+    // this is why the second extraction below is not redundant.)
+    val (fmovemxCurBit, fmovemxMaskAfterCur) = RegListWalk.extractLowest1(fmovemxMask)
+    val fmovemxIsLastElem = fmovemxMaskAfterCur === 0
+    val (fmovemxNextBit, _) = RegListWalk.extractLowest1(fmovemxMaskAfterCur)
+    val fmovemxElemAddr   = (fmovemxBaseDisp.asSInt + fmovemxOff).asBits
+    def fmovemxChunkDisp(i: Int): Bits = (fmovemxElemAddr.asSInt + S(i * 4, 32 bits)).asBits
+
+    // ── Per-cycle sub-phase µop (combinational; latched by pushReg like every other FSM) ──
+    val fmovemxLoadDisp = fmovemxPhase.mux(
+      U(0, 2 bits) -> fmovemxChunkDisp(0),
+      U(1, 2 bits) -> fmovemxChunkDisp(1),
+      default      -> fmovemxChunkDisp(2))
+    val fmovemxLoadTemp = fmovemxPhase.mux(
+      U(0, 2 bits) -> U(MicroOpAssembler.T0, 5 bits),
+      U(1, 2 bits) -> U(MicroOpAssembler.T1, 5 bits),
+      default      -> U(MicroOpAssembler.T2, 5 bits))
+    // The macro's very FIRST emitted µop (the first LOAD chunk of the first element) carries
+    // firstOfInstr -- mirrors movemFirst0's identical "only the first emitted move of the
+    // whole macro" rule.
+    val fmovemxFirstUop = (fmovemxEmitted === 0) && (fmovemxPhase === U(0, 2 bits))
+    val fmovemxLoadUop  = MicroOpAssembler.fmovemxLoadChunkUop(
+      base = fmovemxBaseReg, baseValid = True, disp = fmovemxLoadDisp, dstTemp = fmovemxLoadTemp,
+      first = fmovemxFirstUop, valid = True, pc = fmovemxPc, nextPc = fmovemxNextPc)
+    val fmovemxIssueUopV = MicroOpAssembler.fmovemxIssueUop(
+      fpDst = fmovemxCurReg, drop = !fmovemxIsLastElem, first = False, valid = True,
+      pc = fmovemxPc, nextPc = fmovemxNextPc)
+    val fmovemxCurUop = Mux(fmovemxPhase === U(3, 2 bits), fmovemxIssueUopV, fmovemxLoadUop)
+
+    // ── FMOVEM.X entry detection (slot0 only in this task's scope -- see slot0IsFmovemx's
+    // own doc for why a slot1-positioned in-scope op is left on the pre-existing µcode-
+    // engine trap path instead of a new pend/stash mechanism). ──────────────────────────
+    val fxEntryPkt  = fed.payload.packets(0)
+    val fxOpw       = fxEntryPkt.words(0)
+    val fxExt1      = fxEntryPkt.words(1)
+    val fxMaskIn    = fxExt1(7 downto 0)
+    val fxRevIn     = fxExt1(12)
+    val fxMode      = fxOpw(5 downto 3)
+    val fxReg       = fxOpw(2 downto 0)
+    val fxAnReg     = (U(8, 5 bits) + fxReg.asUInt).resized
+    val fxDisp16    = fxEntryPkt.words(2).asSInt.resize(32).asBits
+    val fxIsDispAn  = fxMode === B"3'b101"          // (d16,An); else mode 010 (An), disp=0
+    val fxBaseDisp  = Mux(fxIsDispAn, fxDisp16, B(0, 32 bits))
+    val fxPc        = fxEntryPkt.pc
+    val fxNextPc    = (fxPc + (fxEntryPkt.lenWords << 1)).resize(32)
+    val fxMaskEmpty = fxMaskIn === 0
+    val (fxBit0, _) = RegListWalk.extractLowest1(fxMaskIn)
+
+    val fmovemxBegin = !fmovemxActive && !movemActive && !movemPendValid && !ucActive && !ucPendValid &&
+                       !movepActive && !movepPendValid && slot0IsFmovemx && !stashValid
+
     // ── Normal (non-MOVEM) push production ──────────────────────────────────────
     def normUop(i: Int): DecodedUop = i match {
       case 0 => headUop(0)
@@ -938,7 +1088,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // regardless of what slot0 in the HELD next group is — even a MOVEM that waits), OR a
     // fresh slot0 that is NOT a MOVEM and no slot1 MOVEM is pending. A slot0 MOVEM (when not
     // replaying a stash) is owned by the FSM -> the normal head does not push it.
-    val normalHeadValid = stashValid || (fed.valid && !slot0IsMovem && !slot0OwnedByUc && !slot0IsMovep && !movemPendValid && !ucPendValid && !ucActive && !movepPendValid && !movepActive)
+    val normalHeadValid = stashValid || (fed.valid && !slot0IsMovem && !slot0OwnedByUc && !slot0IsMovep && !movemPendValid && !ucPendValid && !ucActive && !movepPendValid && !movepActive && !slot0IsFmovemx && !fmovemxActive)
 
     // Produce the push as a Stream. When the MOVEM FSM is active it OVERRIDES the source
     // (its 2 moves / the final An update); otherwise the normal crack drives it.
@@ -1011,6 +1161,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // Begin a µcode op: a pending slot1 microcoded op, OR a microcoded slot0 (not blocked
     // by a stash), while the engine + the MOVEM FSM are idle.
     val ucBegin = !ucActive && !movemActive && !movemPendValid && !movepActive && !movepPendValid &&
+                  !fmovemxActive &&
                   (ucPendValid || (slot0OwnedByUc && !stashValid))
     // Entering a slot0 microcoded op (not a pending one): its group is consumed on entry.
     val ucEnterSlot0 = ucBegin && !ucPendValid
@@ -2225,6 +2376,15 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       pushProduced.payload.uops(2) := movepUop
       pushProduced.payload.uops(3) := movepUop
       pushProduced.payload.count   := U(1, 3 bits)
+    } elsewhen(fmovemxActive) {
+      // FMOVEM.X data-list FSM drive: one sub-phase µop/cycle (a chunk LOAD for phases
+      // 0-2, the FP issue row for phase 3).
+      pushProduced.valid           := True
+      pushProduced.payload.uops(0) := fmovemxCurUop
+      pushProduced.payload.uops(1) := fmovemxCurUop
+      pushProduced.payload.uops(2) := fmovemxCurUop
+      pushProduced.payload.uops(3) := fmovemxCurUop
+      pushProduced.payload.count   := U(1, 3 bits)
     } otherwise {
       pushProduced.valid           := normalHeadValid
       pushProduced.payload.uops(0) := normUop(0)
@@ -2283,14 +2443,22 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // group (movepHoldsFed), released by the normal head once movepActive clears.
     val movepEnterSlot0 = movepBegin && !movepPendValid
     val movepHoldsFed   = movepActive || movepPendValid
+    // FMOVEM.X data-list (task #241/#246): identical contract, minus a pend mechanism (this
+    // task's scope only ever enters from slot0 -- `slot0IsFmovemx`'s own doc). §6.5's binding
+    // constraint: folded in as one more OR/AND term on these SAME pre-existing aggregates,
+    // not a parallel hold-decision tree.
+    val fmovemxEnterSlot0 = fmovemxBegin
+    val fmovemxHoldsFed   = fmovemxActive
     // NOTE: the engine does NOT consume `fed` on its last µop — the held FOLLOWING group
     // is emitted by the normal head once ucActive clears (ucHoldsFed drops). Consuming it
     // here would DROP that group. The sbcd's OWN group was already consumed at entry
     // (ucEnterSlot0) or when its slot1 was stashed (ucPendValid set in the normal consume).
     fed.ready := (!stashValid && !movemHoldsFed && !slot0IsMovem && !ucHoldsFed &&
-                  !movepHoldsFed && !slot0IsMovep && pushProduced.ready) ||
-                 movemEnterSlot0 || ucEnterSlot0 || movepEnterSlot0
-    when(!movemActive && !movemBegin && !ucBegin && !ucActive && !movepActive && !movepBegin && pushProduced.ready) {
+                  !movepHoldsFed && !slot0IsMovep && !fmovemxHoldsFed && !slot0IsFmovemx &&
+                  pushProduced.ready) ||
+                 movemEnterSlot0 || ucEnterSlot0 || movepEnterSlot0 || fmovemxEnterSlot0
+    when(!movemActive && !movemBegin && !ucBegin && !ucActive && !movepActive && !movepBegin &&
+         !fmovemxActive && !fmovemxBegin && pushProduced.ready) {
       when(stashValid) {
         stashValid := False                  // the stashed slot1/RTR was emitted (into pushReg) this cycle
       } elsewhen(slot1IsMovem) {
@@ -2443,6 +2611,81 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       movemActive     := False
       movemAnUpdPhase := False
       movemPendValid  := False
+    }
+
+    // ── FMOVEM.X data-list FSM transitions (task #241/#246) ──────────────────────
+    when(fmovemxBegin) {
+      // Latch all state; start emitting next cycle from these registers (mirrors
+      // movemBegin's own "entry cycle primes registers, emission starts next cycle"
+      // shape -- pushProduced's `elsewhen(fmovemxActive)` reads the REGISTERED value,
+      // which is still False during this very cycle).
+      fmovemxActive   := True
+      fmovemxMask     := fxMaskIn
+      fmovemxRevMap   := fxRevIn
+      fmovemxBaseReg  := fxAnReg
+      fmovemxBaseDisp := fxBaseDisp
+      fmovemxOff      := S(0, 32 bits)
+      fmovemxEmitted  := 0
+      fmovemxPc       := fxPc
+      fmovemxNextPc   := fxNextPc
+      fmovemxPhase    := 0
+      fmovemxCurReg   := fmovemxMapBit(fxBit0, fxRevIn)
+      // Entering a slot0 fmovemx op: STASH its slot1 (if any) so it is not lost when `fed`
+      // is consumed this cycle -- mirrors movemBegin's own identical block verbatim (same
+      // elsewhen chain: slot1 is itself a MOVEM / a MOVEP / µcode-engine-owned / else a
+      // normal decoded instruction). This task's scope has no `fmovemxPendValid`, so there
+      // is no extra "slot1 is itself an in-scope fmovemx op" arm -- that case already falls
+      // through correctly to the generic `slot1IsUcodeEarly` µcode-engine stash (its opword
+      // is ALSO always `spec.microcoded`, per `slot0IsFmovemx`'s own doc), which traps it at
+      // the pre-existing FP_MEM_TRAP_ENTRY -- a known, bounded, NON-regressing scope limit
+      // (this exact case was unsupported before this task too), not a dropped instruction.
+      when(fed.payload.slot1Valid) {
+        when(slot1IsMovem) {
+          movemPendValid := True
+          movemPendPkt   := fed.payload.packets(1)
+        } elsewhen(slot1IsMovepEarly) {
+          movepPendValid := True
+          movepPendPkt   := fed.payload.packets(1)
+        } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
+          ucPendValid := True
+          ucPendPkt   := fed.payload.packets(1)
+          ucPendSpecReg := fed.payload.specs(1).spec
+        } otherwise {
+          stashValid  := True
+          stashCount  := a1raw.count
+          for (i <- 0 until 3) { stashUops(i) := a1raw.uops(i) }
+        }
+      }
+      // Empty list (design doc §2): architecturally a no-op (no memory traffic, An
+      // unchanged) -- finish immediately, mirrors MOVEM's own `eMaskEmpty` handling
+      // verbatim (zero µops ever emitted for this macro).
+      when(fxMaskEmpty) {
+        fmovemxActive := False
+      }
+    } elsewhen(fmovemxActive) {
+      when(pushProduced.ready) {
+        when(fmovemxPhase === U(3, 2 bits)) {
+          // The element's issue row was accepted -> this element is done.
+          when(fmovemxIsLastElem) {
+            fmovemxActive := False    // last element's issue row was the kept commit; macro done
+          } otherwise {
+            fmovemxMask    := fmovemxMaskAfterCur
+            fmovemxOff     := (fmovemxOff + S(12, 32 bits)).resize(32)
+            fmovemxEmitted := fmovemxEmitted + 1
+            fmovemxPhase   := 0
+            fmovemxCurReg  := fmovemxMapBit(fmovemxNextBit, fmovemxRevMap)
+          }
+        } otherwise {
+          fmovemxPhase := fmovemxPhase + 1    // advance to the next LOAD chunk / the issue row
+        }
+      }
+    }
+    // pipeFlush ABORTS the FSM (LAST word, so a flush coinciding with fmovemxBegin still
+    // resets it): the partially-emitted µops are squashed by the queue flush; the macro
+    // re-decodes from scratch on re-fetch. Mirrors MOVEM's own identical late pipeFlush
+    // block (§ its own comment above).
+    when(pipeFlush) {
+      fmovemxActive := False
     }
 
     // ── µcode µPC NEXT-VALUE (LUT-reduction Task A5) ─────────────────────────────
