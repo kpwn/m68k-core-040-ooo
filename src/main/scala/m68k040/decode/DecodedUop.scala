@@ -607,6 +607,11 @@ case class DecodedUop() extends Bundle {
   //
   // Default True (every single-µop instruction is its own first AND last µop).
   val lastOfInstr = Bool()
+  // Registered frontend PC-breakpoint marker. All uops of a cracked macro carry the
+  // same result; commit honors it only on firstOfInstr, so wrong-path markers disappear
+  // through the ordinary recovery machinery.
+  val debugBreakValid = Bool()
+  val debugBreakSlot  = UInt(2 bits)
   // ── Brief-format indexed EA (the AGU index term) ────────────────────────────
   // For a mem µop whose address is an indexed EA, the index register rides srcCReg/
   // srcCValid (psrcC after rename), and these two fields tell the LS-EU AGU how to

@@ -44,7 +44,9 @@ class RobPluginSpec extends AnyFunSuite {
       writesX: Boolean = false, pXDst: Int = 0, pXOld: Int = 0,
       isBranch: Boolean = false,
       firstOfInstr: Boolean = false,
-      lastOfInstr: Boolean = true
+      lastOfInstr: Boolean = true,
+      debugBreakValid: Boolean = false,
+      debugBreakSlot: Int = 0
   ): Unit = {
     u.valid #= valid
     u.pc #= pc
@@ -72,6 +74,8 @@ class RobPluginSpec extends AnyFunSuite {
     // Defaults True, matching DecodedUop.lastOfInstr's own "a single-µop macro is its own
     // first AND last µop" default -- a test that does not care pokes single-µop macros.
     u.lastOfInstr #= lastOfInstr
+    u.debugBreakValid #= debugBreakValid
+    u.debugBreakSlot #= debugBreakSlot
   }
 
   def initSimple(dut: SimpleDut, cd: ClockDomain): Unit = {
@@ -89,6 +93,7 @@ class RobPluginSpec extends AnyFunSuite {
     dut.rob.logic.haltAfterEpochIn #= 0
     dut.rob.logic.haltAfterArmedIn #= false
     dut.rob.logic.haltAfterInvalidateIn #= false
+    dut.rob.logic.haltExceptionMaskIn #= 0
     cd.waitSampling()
   }
 
@@ -886,6 +891,8 @@ class RobPluginSpec extends AnyFunSuite {
     u.faultAddr #= 0
     u.firstOfInstr #= firstOfInstr
     u.lastOfInstr #= true    // single-µop macros; keeps the gate DUT's pokes deterministic
+    u.debugBreakValid #= false
+    u.debugBreakSlot #= 0
   }
 
   def initGate(dut: GateDut, cd: ClockDomain): Unit = {
@@ -1959,6 +1966,42 @@ class RobPluginSpec extends AnyFunSuite {
       dut.rob.logic.haltAfterArmedIn #= true
       waitUntil(cd, dut.dsink.logic.effectiveHaltOut.toBoolean)
       assert(dut.dsink.logic.macroCountOut.toBigInt == 1)
+    }
+  }
+
+  test("marked PC breakpoint halts pre-effect, flushes to the hit PC, and reports its slot") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x12345678L,
+        firstOfInstr = true, lastOfInstr = true,
+        pdstValid = true, dstArch = 3, pdst = 20, pdstOld = 3,
+        debugBreakValid = true, debugBreakSlot = 2)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= false
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+
+      var sawHit = false
+      var sawRetire = false
+      var cycles = 0
+      while (!dut.dsink.logic.effectiveHaltOut.toBoolean && cycles < 20) {
+        cd.waitSampling()
+        sawHit ||= dut.dsink.logic.breakpointHitValidOut.toBoolean &&
+          dut.dsink.logic.breakpointHitSlotOut.toInt == 2
+        sawRetire ||= dut.tsink.logic.fireOut(0).toBoolean || dut.tsink.logic.fireOut(1).toBoolean
+        cycles += 1
+      }
+      assert(dut.dsink.logic.effectiveHaltOut.toBoolean, "breakpoint never reached effective halt")
+      assert(sawHit, "DebugCommitService did not report breakpoint slot 2")
+      assert(!sawRetire, "the breakpoint-marked macro retired before the stop")
+      assert(dut.dsink.logic.macroCountOut.toBigInt == 0,
+        "pre-effect breakpoint must not increment the macro-retire count")
+      assert(dut.dsink.logic.haltReasonDebugOut.toInt == DebugHaltReasonCode.BREAKPOINT)
+      assert(dut.dsink.logic.haltHitPcOut.toLong == 0x12345678L)
+      assert(dut.dsink.logic.livePcOut.toLong == 0x12345678L)
+      assert(dut.rob.logic.count.toInt == 0, "breakpoint recovery must flush all in-flight work")
     }
   }
 }

@@ -85,6 +85,7 @@ class FpCommitPathSpec extends AnyFunSuite {
     u.sysOp #= false; u.sysKind #= m68k040.decode.SysKind.NONE; u.sysReadDir #= false
     u.needsSupervisor #= false
     u.firstOfInstr #= true
+    u.debugBreakValid #= false; u.debugBreakSlot #= 0
     // FP fields (the whole point of this poke).
     u.fpSrcAReg #= fpSrcAReg; u.usesFpSrcA #= usesFpSrcA
     u.fpSrcBReg #= fpSrcBReg; u.usesFpSrcB #= usesFpSrcB
@@ -379,6 +380,7 @@ class FpCommitPathSpec extends AnyFunSuite {
         u.pNzvcDst #= 0; u.writesNzvc #= false; u.pNzvcOld #= 0
         u.pXSrc #= 0; u.readsX #= false; u.pXDst #= 0; u.writesX #= false; u.pXOld #= 0
         u.faulted #= false; u.faultVector #= 0; u.isRte #= false
+        u.debugBreakValid #= false; u.debugBreakSlot #= 0
         u.sysOp #= false; u.sysKind #= m68k040.decode.SysKind.NONE; u.sysReadDir #= false
         u.needsSupervisor #= false
         u.fpDstArch #= fpDstArch

@@ -1,6 +1,6 @@
 package m68k040.debug
 
-import m68k040.services.DebugCommitService
+import m68k040.services.{DebugCommitService, FrontendDebugMatchService}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib.misc.database.Database
@@ -17,18 +17,42 @@ class DebugCtrlDut(buildIdArg:   BigInt  = BigInt(0x12345678L),
                    porCyclesArg: Int     = 4,
                    stageArg:     Int     = 1,
                    enableArg:    Boolean = true,
-                   withCommitStubArg: Boolean = false) extends Component {
+                   withCommitStubArg: Boolean = false,
+                   withFrontendStubArg: Boolean = false) extends Component {
   val db   = new Database
   val host = db on (new PluginHost)
   val commitStub: DebugCommitStubPlugin =
     if (withCommitStubArg) new DebugCommitStubPlugin else null
+  val frontendStub: FrontendDebugMatchStubPlugin =
+    if (withFrontendStubArg) new FrontendDebugMatchStubPlugin else null
   val dbg  = new DebugCtrlPlugin(buildId = buildIdArg, porCycles = porCyclesArg, stage = stageArg,
                                  enable = enableArg)
   val plugins: Seq[FiberPlugin] =
-    if (withCommitStubArg) Seq(commitStub, dbg) else Seq(dbg)
+    Seq(Option(commitStub), Option(frontendStub), Some(dbg)).flatten
   db.on { host.asHostOf(plugins) }
 
   def axi: DbgAxiLite = dbg.logic.dbgAxi
+}
+
+class FrontendDebugMatchStubPlugin extends FiberPlugin with FrontendDebugMatchService {
+  private var pcsWire: Vec[UInt] = null
+  private var enablesWire: Bits = null
+  private var skipOnceWire: Bits = null
+  during setup {
+    pcsWire = Vec(UInt(32 bits), 4); pcsWire.foreach { p => p.allowOverride; p := 0 }
+    enablesWire = Bits(4 bits); enablesWire.allowOverride; enablesWire := 0
+    skipOnceWire = Bits(4 bits); skipOnceWire.allowOverride; skipOnceWire := 0
+  }
+  val logic = during build new Area {
+    val pcs = out(Vec(UInt(32 bits), 4)); pcs := pcsWire
+    val enables = out(Bits(4 bits)); enables := enablesWire
+    val skipOnce = out(Bits(4 bits)); skipOnce := skipOnceWire
+    val skipConsumedDrive = Bits(4 bits); skipConsumedDrive := 0
+  }
+  override def configure(pcs: Vec[UInt], enables: Bits, skipOnce: Bits): Unit = {
+    pcsWire := pcs; enablesWire := enables; skipOnceWire := skipOnce
+  }
+  override def skipConsumed: Bits = logic.skipConsumedDrive
 }
 
 /** Minimal test provider for DebugCtrlPlugin's real service boundary. Readback values
@@ -44,6 +68,7 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
   private var haltAfterEpochWire: UInt = null
   private var haltAfterArmedWire: Bool = null
   private var haltAfterInvalidateWire: Bool = null
+  private var haltExceptionMaskWire: Bits = null
 
   override def effectiveHalt: Bool = effectiveHaltWire
   override def autoHaltLatched: Bool = autoHaltWire
@@ -53,6 +78,12 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
   override def macroCount: UInt = logic.macroCountDrive
   override def haltHitInstCount: UInt = logic.haltHitInstCountDrive
   override def haltAfterConsumed: Bool = logic.haltAfterConsumedDrive
+  override def haltHitPc: UInt = logic.haltHitPcDrive
+  override def breakpointHit: spinal.lib.Flow[UInt] = logic.breakpointHitDrive
+  override def exceptionPending: Bool = logic.exceptionPendingDrive
+  override def haltExceptionVector: UInt = logic.haltExceptionVectorDrive
+  override def haltExceptionPc: UInt = logic.haltExceptionPcDrive
+  override def haltExceptionFaultAddress: UInt = logic.haltExceptionFaultAddressDrive
 
   during setup {
     effectiveHaltWire = Bool()
@@ -68,6 +99,8 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     haltAfterArmedWire = Bool(); haltAfterArmedWire.allowOverride; haltAfterArmedWire := False
     haltAfterInvalidateWire = Bool(); haltAfterInvalidateWire.allowOverride
     haltAfterInvalidateWire := False
+    haltExceptionMaskWire = Bits(256 bits); haltExceptionMaskWire.allowOverride
+    haltExceptionMaskWire := 0
   }
 
   val logic = during build new Area {
@@ -79,6 +112,19 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     val macroCountDrive = Reg(UInt(64 bits)) init 0; macroCountDrive.simPublic()
     val haltHitInstCountDrive = Reg(UInt(64 bits)) init 0; haltHitInstCountDrive.simPublic()
     val haltAfterConsumedDrive = RegInit(False); haltAfterConsumedDrive.simPublic()
+    val haltHitPcDrive = Reg(UInt(32 bits)) init 0; haltHitPcDrive.simPublic()
+    val breakpointHitDrive = spinal.lib.Flow(UInt(2 bits))
+    val breakpointHitValidDrive = RegInit(False); breakpointHitValidDrive.simPublic()
+    val breakpointHitSlotDrive = Reg(UInt(2 bits)) init 0; breakpointHitSlotDrive.simPublic()
+    breakpointHitValidDrive := breakpointHitValidDrive
+    breakpointHitSlotDrive := breakpointHitSlotDrive
+    breakpointHitDrive.valid := breakpointHitValidDrive
+    breakpointHitDrive.payload := breakpointHitSlotDrive
+    val exceptionPendingDrive = RegInit(False); exceptionPendingDrive.simPublic()
+    val haltExceptionVectorDrive = Reg(UInt(8 bits)) init 0; haltExceptionVectorDrive.simPublic()
+    val haltExceptionPcDrive = Reg(UInt(32 bits)) init 0; haltExceptionPcDrive.simPublic()
+    val haltExceptionFaultAddressDrive = Reg(UInt(32 bits)) init 0
+    haltExceptionFaultAddressDrive.simPublic()
     effectiveHaltDrive := effectiveHaltDrive
     autoHaltDrive := autoHaltDrive
     haltReasonDrive := haltReasonDrive
@@ -87,6 +133,11 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     macroCountDrive := macroCountDrive
     haltHitInstCountDrive := haltHitInstCountDrive
     haltAfterConsumedDrive := haltAfterConsumedDrive
+    haltHitPcDrive := haltHitPcDrive
+    exceptionPendingDrive := exceptionPendingDrive
+    haltExceptionVectorDrive := haltExceptionVectorDrive
+    haltExceptionPcDrive := haltExceptionPcDrive
+    haltExceptionFaultAddressDrive := haltExceptionFaultAddressDrive
     effectiveHaltWire := effectiveHaltDrive
     autoHaltWire := autoHaltDrive
 
@@ -98,6 +149,7 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     val haltAfterEpoch = out(UInt(8 bits))
     val haltAfterArmed = out(Bool())
     val haltAfterInvalidate = out(Bool())
+    val haltExceptionMask = out(Bits(256 bits))
     stopRequest := stopWire
     resumeRequest := resumeWire
     stepRequest := stepWire
@@ -106,6 +158,7 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     haltAfterEpoch := haltAfterEpochWire
     haltAfterArmed := haltAfterArmedWire
     haltAfterInvalidate := haltAfterInvalidateWire
+    haltExceptionMask := haltExceptionMaskWire
   }
 
   override def request(stop: Bool, resume: Bool, step: Bool, clearSticky: Bool): Unit = {
@@ -120,6 +173,9 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     haltAfterEpochWire := epoch
     haltAfterArmedWire := armed
     haltAfterInvalidateWire := invalidate
+  }
+  override def configureExceptionMask(mask: Bits): Unit = {
+    haltExceptionMaskWire := mask
   }
 }
 

@@ -164,6 +164,7 @@ class ExceptionUnitStaleLoadRspRaceSpec extends AnyFunSuite {
     u.pXSrc #= 0; u.readsX #= false
     u.pXDst #= 0; u.writesX #= false; u.pXOld #= 0
     u.faulted #= false; u.faultVector #= 0; u.isRte #= isRte
+    u.debugBreakValid #= false; u.debugBreakSlot #= 0
   }
 
   def simConfig = M68kSim().withVerilator

@@ -221,6 +221,8 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.isDbcc       := dec.isDbcc
       r.firstOfInstr := dec.firstOfInstr
       r.lastOfInstr  := dec.lastOfInstr
+      r.debugBreakValid := dec.debugBreakValid
+      r.debugBreakSlot  := dec.debugBreakSlot
       r.indexLong    := dec.indexLong
       r.indexScale   := dec.indexScale
       r.leaAddr         := dec.leaAddr

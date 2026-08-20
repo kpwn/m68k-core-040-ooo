@@ -120,6 +120,13 @@ class DebugCommitSinkPlugin extends FiberPlugin {
     val macroCountOut       = out(UInt(64 bits))
     val haltHitInstCountOut = out(UInt(64 bits))
     val haltAfterConsumedOut = out(Bool())
+    val haltHitPcOut = out(UInt(32 bits))
+    val breakpointHitValidOut = out(Bool())
+    val breakpointHitSlotOut = out(UInt(2 bits))
+    val exceptionPendingOut = out(Bool())
+    val haltExceptionVectorOut = out(UInt(8 bits))
+    val haltExceptionPcOut = out(UInt(32 bits))
+    val haltExceptionFaultAddressOut = out(UInt(32 bits))
     effectiveHaltOut    := d.effectiveHalt
     autoHaltLatchedOut  := d.autoHaltLatched
     haltReasonDebugOut  := d.haltReasonDebug
@@ -128,5 +135,12 @@ class DebugCommitSinkPlugin extends FiberPlugin {
     macroCountOut       := d.macroCount
     haltHitInstCountOut := d.haltHitInstCount
     haltAfterConsumedOut := d.haltAfterConsumed
+    haltHitPcOut := d.haltHitPc
+    breakpointHitValidOut := d.breakpointHit.valid
+    breakpointHitSlotOut := d.breakpointHit.payload
+    exceptionPendingOut := d.exceptionPending
+    haltExceptionVectorOut := d.haltExceptionVector
+    haltExceptionPcOut := d.haltExceptionPc
+    haltExceptionFaultAddressOut := d.haltExceptionFaultAddress
   }
 }

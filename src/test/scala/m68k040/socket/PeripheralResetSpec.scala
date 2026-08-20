@@ -140,6 +140,7 @@ class PeripheralResetSpec extends AnyFunSuite {
     u.pXSrc #= 0; u.readsX #= false
     u.pXDst #= 0; u.writesX #= false; u.pXOld #= 0
     u.faulted #= false; u.faultVector #= 0; u.isRte #= false
+    u.debugBreakValid #= false; u.debugBreakSlot #= 0
     u.sysOp #= sysOp; u.sysKind #= sysKind; u.sysReadDir #= false
     u.needsSupervisor #= false
   }

@@ -177,6 +177,7 @@ class AccessFaultCaptureSpec extends AnyFunSuite {
     u.pNzvcSrc #= 0; u.readsNzvc #= false; u.pNzvcDst #= 0; u.writesNzvc #= false; u.pNzvcOld #= 0
     u.pXSrc #= 0; u.readsX #= false; u.pXDst #= 0; u.writesX #= false; u.pXOld #= 0
     u.faulted #= false; u.faultVector #= 0; u.isRte #= false
+    u.debugBreakValid #= false; u.debugBreakSlot #= 0
     u.sysOp #= false; u.sysKind #= m68k040.decode.SysKind.NONE; u.sysReadDir #= false
   }
 

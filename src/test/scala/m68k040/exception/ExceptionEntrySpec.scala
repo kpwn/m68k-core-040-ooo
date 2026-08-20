@@ -6,7 +6,7 @@ import m68k040.cache.{DcachePlugin, DcacheService}
 import m68k040.mmu.DIdentityTranslationPlugin
 import m68k040.decode.DecOp
 import m68k040.rename.RenamedUop
-import m68k040.rob.{RobPlugin, RenameUopSourcePlugin, RobAllocDriverPlugin, RenameCommitSinkPlugin, CommitTraceSinkPlugin}
+import m68k040.rob.{RobPlugin, RenameUopSourcePlugin, RobAllocDriverPlugin, RenameCommitSinkPlugin, CommitTraceSinkPlugin, DebugCommitSinkPlugin, DebugHaltReasonCode}
 import m68k040.isa.{Cluster, Size}
 import m68k040.ls.BehavioralMemAgent
 import spinal.core._
@@ -71,11 +71,12 @@ class ExceptionEntrySpec extends AnyFunSuite {
     val rob  = new RobPlugin
     val csink = new RenameCommitSinkPlugin
     val tsink = new CommitTraceSinkPlugin
+    val dsink = new DebugCommitSinkPlugin
     val dtlb = new DIdentityTranslationPlugin
     val dcache = new DcachePlugin()
     val wire = new ExcDcacheWiring
     db.on { host.asHostOf(Seq[FiberPlugin](
-      new ParamPlugin(M68kParams()), rsrc, drv, rob, csink, tsink, dtlb, dcache, wire)) }
+      new ParamPlugin(M68kParams()), rsrc, drv, rob, csink, tsink, dsink, dtlb, dcache, wire)) }
   }
 
   def pokeRu(u: RenamedUop, valid: Boolean = true, pc: Long = 0,
@@ -95,6 +96,8 @@ class ExceptionEntrySpec extends AnyFunSuite {
     u.pXSrc #= 0; u.readsX #= false
     u.pXDst #= 0; u.writesX #= false; u.pXOld #= 0
     u.faulted #= faulted; u.faultVector #= faultVector; u.isRte #= isRte
+    u.firstOfInstr #= true; u.lastOfInstr #= true
+    u.debugBreakValid #= false; u.debugBreakSlot #= 0
   }
 
   def init(dut: Dut, cd: ClockDomain): Unit = {
@@ -135,6 +138,7 @@ class ExceptionEntrySpec extends AnyFunSuite {
       val handler = 0x40009000L
       dut.rob.logic.exc.ss.isp #= ssp0
       dut.rob.logic.exc.ss.vbr #= vbr
+      dut.rob.logic.haltExceptionMaskIn #= (BigInt(1) << 4)
       // srSys at reset = 0x27 (S=1). committed CCR seeded 0.
       // preload vector table: mem[VBR + 4*4] = handler. The 68k vector table is
       // big-endian (the cache LONG-extract assembles byte at offset 0 as the MSB).
@@ -200,6 +204,17 @@ class ExceptionEntrySpec extends AnyFunSuite {
       }
       assert(redirPc == handler, f"redirect pc=0x$redirPc%x expected handler 0x$handler%x")
       assert(historySeen, "completed exception entry must emit committed debug history")
+      var haltWait = 0
+      while (!dut.dsink.logic.effectiveHaltOut.toBoolean && haltWait < 10) {
+        cd.waitSampling(); haltWait += 1
+      }
+      assert(dut.dsink.logic.effectiveHaltOut.toBoolean,
+        "masked completed exception entry did not reach effective halt")
+      assert(dut.dsink.logic.haltReasonDebugOut.toInt == DebugHaltReasonCode.EXCEPTION)
+      assert(dut.dsink.logic.exceptionPendingOut.toBoolean)
+      assert(dut.dsink.logic.haltExceptionVectorOut.toInt == 4)
+      assert((dut.dsink.logic.haltExceptionPcOut.toLong & 0xffffffffL) == faultPc)
+      assert((dut.dsink.logic.haltExceptionFaultAddressOut.toLong & 0xffffffffL) == 0L)
       assert(acceptedStores == 4,
         s"format-$$0 entry must accept exactly four frame words, saw $acceptedStores")
 

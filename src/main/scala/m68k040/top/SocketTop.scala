@@ -57,7 +57,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   * the brief's own sketch has it -- only the newer `VioProbePlugin` addition is excluded. */
 class M68kSocketTop(p: M68kParams = M68kParams(),
                     dbgBuildId: BigInt = 0,
-                    debugStage: Int = 4) extends Component {
+                    debugStage: Int = 5) extends Component {
   setDefinitionName("M68kSocketTop")
   noIoPrefix()
 

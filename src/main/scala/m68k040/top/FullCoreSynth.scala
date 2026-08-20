@@ -679,6 +679,14 @@ object GenFullCoreSynthStage4Verilog {
   }
 }
 
+object GenFullCoreSynthStage5Verilog {
+  def main(args: Array[String]): Unit = {
+    GenFullCoreSynthVerilog.buildWith(
+      GenFullCoreSynthVerilog.readDbgBuildIdEnv(), vioEnable = false,
+      outputName = "M68kFullCoreSynthStage5", debugStage = 5)
+  }
+}
+
 /** Emits M68kFullCoreSynthVio.v -- the ONLY generation target with VioProbePlugin(enable=true).
   * Exists solely for the Stage-1.5 cost-delta measurement (spec section 8.1) and to give
   * Task 5's netlist checker a real "enabled" artifact to test against. NOT a synthesis target

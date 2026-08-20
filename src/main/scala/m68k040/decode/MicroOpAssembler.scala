@@ -54,6 +54,7 @@ object MicroOpAssembler {
                    isLoad: Bool, first: Bool, last: Bool, drop: Bool, valid: Bool, pc: UInt, nextPc: UInt,
                    idxReg: UInt, idxValid: Bool, idxLong: Bool, idxScale: UInt): DecodedUop = {
     val u = DecodedUop()
+    u.debugBreakValid := False; u.debugBreakSlot := 0
     u.fpInert()
     u.valid       := valid
     u.pc          := pc
@@ -121,6 +122,7 @@ object MicroOpAssembler {
     * for predec). It carries the nextPc so the ROB advances PC correctly at commit. */
   def movemAnUpdUop(an: UInt, signedDelta: SInt, valid: Bool, pc: UInt, nextPc: UInt): DecodedUop = {
     val u = DecodedUop()
+    u.debugBreakValid := False; u.debugBreakSlot := 0
     u.fpInert()
     u.valid       := valid
     u.pc          := pc
@@ -178,6 +180,7 @@ object MicroOpAssembler {
     * macro's first emitted µop when present (the interrupt/firstOfInstr boundary). */
   def movemSnapUop(dst: UInt, src: UInt, valid: Bool, pc: UInt, nextPc: UInt): DecodedUop = {
     val u = DecodedUop()
+    u.debugBreakValid := False; u.debugBreakSlot := 0
     u.fpInert()
     u.valid       := valid
     u.pc          := pc
@@ -247,6 +250,7 @@ object MicroOpAssembler {
   def fmovemxLoadChunkUop(base: UInt, baseValid: Bool, disp: Bits, dstTemp: UInt,
                            first: Bool, valid: Bool, pc: UInt, nextPc: UInt): DecodedUop = {
     val u = DecodedUop()
+    u.debugBreakValid := False; u.debugBreakSlot := 0
     u.fpInert()
     u.valid       := valid
     u.pc          := pc
@@ -315,6 +319,7 @@ object MicroOpAssembler {
   def fmovemxIssueUop(fpDst: UInt, drop: Bool, first: Bool, last: Bool, valid: Bool,
                        pc: UInt, nextPc: UInt): DecodedUop = {
     val u = DecodedUop()
+    u.debugBreakValid := False; u.debugBreakSlot := 0
     // NO `u.fpInert()` here (unlike every OTHER builder in this file): every fp* field is
     // explicitly, unconditionally set below -- calling fpInert() first would completely
     // overlap those same fields with no intervening `when`, which SpinalHDL's
@@ -392,6 +397,7 @@ object MicroOpAssembler {
     * pc/nextPc threaded for the macro commit. Mutated by the specific builders. */
   private def movepBase(pc: UInt, nextPc: UInt): DecodedUop = {
     val u = DecodedUop()
+    u.debugBreakValid := False; u.debugBreakSlot := 0
     u.fpInert()
     // The specific builders below override a few fields (op/size/srcs/dst/flags) after
     // these defaults; allowOverride makes that last-wins (the defaults provide the inert
@@ -867,6 +873,7 @@ object MicroOpAssembler {
 
     // ── opUop = the operation (EASRC operand routed to T0 when cracked) ────────
     val opUop = DecodedUop()
+    opUop.debugBreakValid := False; opUop.debugBreakSlot := 0
     opUop.fpInert()
     opUop.valid         := pkt.valid
     opUop.pc            := pkt.pc
@@ -1184,6 +1191,7 @@ object MicroOpAssembler {
     // Address = base An (psrcA) + disp(imm); for (d16,PC) the PC is folded into the
     // absolute disp (base=0). dst = T0.
     val ldUop = DecodedUop()
+    ldUop.debugBreakValid := False; ldUop.debugBreakSlot := 0
     ldUop.fpInert()
     ldUop.valid         := pkt.valid
     ldUop.pc            := pkt.pc
@@ -1302,6 +1310,7 @@ object MicroOpAssembler {
     // and writes the NZVC PRF (+ bypass) at completion. (MOVEA — to an address reg —
     // never reaches here: an address-reg dst is not memSimple.)
     val stUop = DecodedUop()
+    stUop.debugBreakValid := False; stUop.debugBreakSlot := 0
     stUop.fpInert()
     stUop.valid         := pkt.valid
     stUop.pc            := pkt.pc
@@ -1355,6 +1364,7 @@ object MicroOpAssembler {
     // side effect, so base+disp recompute identically). data = T1 (the op result). NO
     // int dst, NO flags (the op µop owns NZVCX). firstOfInstr=False (a trailing µop).
     val rmwStUop = DecodedUop()
+    rmwStUop.debugBreakValid := False; rmwStUop.debugBreakSlot := 0
     rmwStUop.fpInert()
     rmwStUop.valid         := pkt.valid
     rmwStUop.pc            := pkt.pc
@@ -2611,6 +2621,7 @@ object MicroOpAssembler {
     // convention — identical shape to CMP2/CHK2/the bit-field memory crack below.
     def divMulLoadUop(ea: EaSpec): DecodedUop = {
       val u = DecodedUop()
+      u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
@@ -2678,6 +2689,7 @@ object MicroOpAssembler {
 
     // DIV (quotient) µop.
     val divlUop = DecodedUop()
+    divlUop.debugBreakValid := False; divlUop.debugBreakSlot := 0
     divlUop.fpInert()
     divlUop.valid         := pkt.valid
     divlUop.pc            := pkt.pc
@@ -2738,6 +2750,7 @@ object MicroOpAssembler {
     // comes from the DivEu's internal latch, not this register read -- srcA exists
     // SOLELY to carry the old value through on the overflow path.
     val divremUop = DecodedUop()
+    divremUop.debugBreakValid := False; divremUop.debugBreakSlot := 0
     divremUop.fpInert()
     divremUop.valid         := pkt.valid
     divremUop.pc            := pkt.pc
@@ -2844,6 +2857,7 @@ object MicroOpAssembler {
 
     // MUL (low-product) µop. Writes Dl. Sets N/Z (+ V for the .L32 form).
     val mullUop = DecodedUop()
+    mullUop.debugBreakValid := False; mullUop.debugBreakSlot := 0
     mullUop.fpInert()
     mullUop.valid         := pkt.valid
     mullUop.pc            := pkt.pc
@@ -2915,6 +2929,7 @@ object MicroOpAssembler {
     // new memSimple-multiplier path, which has no prior working behavior to regress).
     // Writes Dh; sets no flags (the MUL set N/Z; V=0).
     val mulhiUop = DecodedUop()
+    mulhiUop.debugBreakValid := False; mulhiUop.debugBreakSlot := 0
     mulhiUop.fpInert()
     mulhiUop.valid         := pkt.valid
     mulhiUop.pc            := pkt.pc
@@ -3020,6 +3035,7 @@ object MicroOpAssembler {
                   bfmWidthRaw.asBits.resize(5) ## B(0, 5 bits)).resize(32)
     def bfmLoadUop(disp: Bits, dst: Int, size: Size.C, first: Bool): DecodedUop = {
       val u = DecodedUop()
+      u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
@@ -3063,6 +3079,7 @@ object MicroOpAssembler {
     val bfmIsTst    = (bfmBfOp === 0)
     val bfmCompute = {
       val u = DecodedUop()
+      u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
@@ -3177,6 +3194,7 @@ object MicroOpAssembler {
     // Common load builder (every field once): addr = base + disp + index, -> dst.
     def c2LoadUop(disp: Bits, dst: Int, first: Bool): DecodedUop = {
       val u = DecodedUop()
+      u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
@@ -3219,6 +3237,7 @@ object MicroOpAssembler {
     // on out-of-bounds C. reads+writes NZVC (preserve N/V); no int dst.
     val c2Cmp = {
       val u = DecodedUop()
+      u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
@@ -3279,6 +3298,7 @@ object MicroOpAssembler {
     // pc into the imm (base=0), exactly like the load crack's pcRelAddr.
     val ctrlPcRelAddr = (pkt.pc + U(2, 32 bits) + srcEa.disp.asUInt).asBits
     val ibrUop = DecodedUop()
+    ibrUop.debugBreakValid := False; ibrUop.debugBreakSlot := 0
     ibrUop.fpInert()
     ibrUop.valid         := pkt.valid
     ibrUop.pc            := pkt.pc
@@ -3349,6 +3369,7 @@ object MicroOpAssembler {
               eaAuto: EaAuto.C = EaAuto.NONE, eaDelta: UInt = U(0, 3 bits),
               keepCommit: Bool = False, movesAliasStore: Bool = False): DecodedUop = {
       val u = DecodedUop()
+      u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
       u.valid := pkt.valid; u.pc := pkt.pc; u.nextPc := nextPc
       u.op := op; u.cluster := cluster; u.size := size; u.memOp := memOp
@@ -3588,6 +3609,7 @@ object MicroOpAssembler {
     val ctrlEaPcRel = (pkt.pc + U(2, 32 bits) + srcEa.disp.asUInt).asBits
     def leaGenUop(leaDst: UInt, leaFirst: Bool): DecodedUop = {
       val u = DecodedUop()
+      u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc

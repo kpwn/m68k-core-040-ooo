@@ -1,7 +1,7 @@
 package m68k040.decode
 
 import m68k040.frontend.{DecodePacket, PipeStage}
-import m68k040.services.{DecodeFeedService, DecodeUopService}
+import m68k040.services.{DecodeFeedService, DecodeUopService, FrontendDebugMatchService}
 import m68k040.isa.Size
 import spinal.core._
 import spinal.core.sim._
@@ -29,7 +29,20 @@ import spinal.lib.misc.plugin.FiberPlugin
   * The skid is flushed by the same `pipeFlush` as the queue so a wrong-path group
   * held in the register is squashed on a mispredict/exception redirect.
   */
-class DecodeStage extends FiberPlugin with DecodeUopService {
+class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMatchService {
+
+  // Setup-allocated wires let DebugCtrl resolve/configure this service without making
+  // its build order part of the frontend's existing Fetch->Decode dependency chain.
+  private var _debugBreakPcs: Vec[UInt] = null
+  private var _debugBreakEn: Bits = null
+  private var _debugBreakSkip: Bits = null
+  private var _debugSkipConsumed: Bits = null
+  during setup {
+    _debugBreakPcs = Vec(UInt(32 bits), 4)
+    _debugBreakEn = Bits(4 bits)
+    _debugBreakSkip = Bits(4 bits)
+    _debugSkipConsumed = Bits(4 bits)
+  }
 
   // FMAX "FRONTEND LEVER C" (docs/superpowers/specs/2026-08-08-fmax-frontend-leverc-register-split-design.md,
   // .../plans/2026-08-08-fmax-frontend-leverc-register-split-plan.md): the RAW aligner-output
@@ -75,6 +88,20 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
   }
 
   val logic = during build new Area {
+    for (i <- 0 until 4) {
+      _debugBreakPcs(i).allowOverride
+      _debugBreakPcs(i) := 0
+    }
+    _debugBreakEn.allowOverride; _debugBreakEn := 0
+    _debugBreakSkip.allowOverride; _debugBreakSkip := 0
+
+    // Frontend-local registered snapshot: no surviving debug-domain configuration bit
+    // enters the decode datapath combinationally.
+    val debugBreakPcs = Vec.fill(4)(Reg(UInt(32 bits)) init 0)
+    val debugBreakEn = RegNext(_debugBreakEn) init 0
+    val debugBreakSkip = RegNext(_debugBreakSkip) init 0
+    for (i <- 0 until 4) debugBreakPcs(i) := _debugBreakPcs(i)
+
     val df = host[DecodeFeedService]
 
     // ── µop expansion queue ──────────────────────────────────────────────────
@@ -2414,6 +2441,29 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       pushProduced.payload.count   := totalCount
     }
 
+    // Stage-5 registered PC-breakpoint marker. Both its PC and configuration inputs are
+    // registers, and its only destination is the existing push register below. It cannot
+    // affect admission/backpressure. Stamp all uops; the ROB honors only firstOfInstr.
+    val debugSkipConsumeNow = Bits(4 bits)
+    debugSkipConsumeNow := 0
+    for (i <- 0 until 4) {
+      val matchBits = Bits(4 bits)
+      for (slot <- 0 until 4)
+        matchBits(slot) := debugBreakEn(slot) &&
+          (pushProduced.payload.uops(i).pc === debugBreakPcs(slot))
+      val firstMatch = OHMasking.first(matchBits)
+      val matchSlot = OHToUInt(firstMatch).resize(2)
+      pushProduced.payload.uops(i).debugBreakValid.allowOverride
+      pushProduced.payload.uops(i).debugBreakSlot.allowOverride
+      pushProduced.payload.uops(i).debugBreakValid := matchBits.orR && !debugBreakSkip(matchSlot)
+      pushProduced.payload.uops(i).debugBreakSlot := matchSlot
+      when(pushProduced.fire && pushProduced.payload.uops(i).firstOfInstr &&
+           matchBits.orR && debugBreakSkip(matchSlot)) {
+        debugSkipConsumeNow(matchSlot) := True
+      }
+    }
+    _debugSkipConsumed := RegNext(debugSkipConsumeNow) init 0
+
     // P1: register the produced push. The deep `assemble` cone ends at pushReg's input;
     // the ring write in N+1 is a shallow, register-driven broadcast. Flushed by the SAME
     // pipeFlush that squashes `fed` and the queue, so a held wrong-path group is discarded.
@@ -2870,4 +2920,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
   override def uop1Valid: Bool               = logic.uop1Sig
   override def pipeFlush: Bool               = logic.pipeFlush
   override def complexResume: Flow[UInt]     = logic.ucComplexResume
+  override def configure(pcs: Vec[UInt], enables: Bits, skipOnce: Bits): Unit = {
+    for (i <- 0 until 4) _debugBreakPcs(i) := pcs(i)
+    _debugBreakEn := enables
+    _debugBreakSkip := skipOnce
+  }
+  override def skipConsumed: Bits = _debugSkipConsumed
 }

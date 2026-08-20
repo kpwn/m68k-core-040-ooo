@@ -60,6 +60,7 @@ class DispatchSpec extends AnyFunSuite {
     u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0
     u.unimplemented #= false
     u.faulted #= false; u.faultVector #= 0; u.isRte #= false
+    u.debugBreakValid #= false; u.debugBreakSlot #= 0
     u.dstArch #= dstArch
     u.psrcA #= 0; u.psrcAValid #= false
     u.psrcB #= 0; u.psrcBValid #= false

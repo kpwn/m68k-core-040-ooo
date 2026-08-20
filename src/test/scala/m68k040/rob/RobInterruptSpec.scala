@@ -65,6 +65,7 @@ class RobInterruptSpec extends AnyFunSuite {
     u.faulted #= faulted
     u.faultVector #= faultVector
     u.isRte #= false
+    u.debugBreakValid #= false; u.debugBreakSlot #= 0
     u.sysOp #= false; u.sysKind #= m68k040.decode.SysKind.NONE; u.sysReadDir #= false
     u.isCondTrap #= false
     u.sswInstr #= false

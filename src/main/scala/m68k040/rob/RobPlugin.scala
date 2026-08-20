@@ -21,6 +21,8 @@ object DebugHaltReasonCode {
   val STEP = 2
   val HALT_AFTER = 3
   val FATAL = 4
+  val BREAKPOINT = 5
+  val EXCEPTION = 6
 }
 
 /** RobPlugin: instruction-level reorder buffer ring with 2-wide in-order retire.
@@ -74,6 +76,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   private var _debugMacroCount:       UInt = null
   private var _debugHaltHitInstCount: UInt = null
   private var _debugHaltAfterConsumed: Bool = null
+  private var _debugHaltHitPc:         UInt = null
+  private var _debugBreakpointHit:     Flow[UInt] = null
+  private var _debugExceptionPending:  Bool = null
+  private var _debugHaltExceptionVector: UInt = null
+  private var _debugHaltExceptionPc: UInt = null
+  private var _debugHaltExceptionFaultAddress: UInt = null
   override def effectiveHalt:    Bool = _debugEffectiveHalt
   override def autoHaltLatched:  Bool = _debugAutoHaltLatched
   override def haltReasonDebug:  UInt = _debugHaltReason
@@ -82,6 +90,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   override def macroCount:       UInt = _debugMacroCount
   override def haltHitInstCount: UInt = _debugHaltHitInstCount
   override def haltAfterConsumed: Bool = _debugHaltAfterConsumed
+  override def haltHitPc: UInt = _debugHaltHitPc
+  override def breakpointHit: Flow[UInt] = _debugBreakpointHit
+  override def exceptionPending: Bool = _debugExceptionPending
+  override def haltExceptionVector: UInt = _debugHaltExceptionVector
+  override def haltExceptionPc: UInt = _debugHaltExceptionPc
+  override def haltExceptionFaultAddress: UInt = _debugHaltExceptionFaultAddress
   during setup {
     _supervisor             = Bool()
     _dcacheEnabled          = Bool()
@@ -95,6 +109,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     _debugMacroCount        = UInt(64 bits)
     _debugHaltHitInstCount  = UInt(64 bits)
     _debugHaltAfterConsumed = Bool()
+    _debugHaltHitPc         = UInt(32 bits)
+    _debugBreakpointHit     = Flow(UInt(2 bits))
+    _debugExceptionPending  = Bool()
+    _debugHaltExceptionVector = UInt(8 bits)
+    _debugHaltExceptionPc = UInt(32 bits)
+    _debugHaltExceptionFaultAddress = UInt(32 bits)
   }
 
   /** One ROB entry's commit/free + trace payload. */
@@ -153,6 +173,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // occupancy-based derivation reads "macro complete" mid-macro. Read only under the
     // same headReady / count>0 gating as `first` (see the SAFETY note above).
     val last       = Bool()
+    val debugBreakValid = Bool()
+    val debugBreakSlot  = UInt(2 bits)
     val needsSup   = Bool()
     val sysOp      = Bool()
     val sysKind    = m68k040.decode.SysKind()
@@ -463,6 +485,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     haltAfterArmedIn := False; haltAfterArmedIn.simPublic()
     val haltAfterInvalidateIn = Bool(); haltAfterInvalidateIn.allowOverride
     haltAfterInvalidateIn := False; haltAfterInvalidateIn.simPublic()
+    val haltExceptionMaskIn = Bits(256 bits); haltExceptionMaskIn.allowOverride
+    haltExceptionMaskIn := 0; haltExceptionMaskIn.simPublic()
     // D28 (axi-socket adapter spec section 6.4): the halt seam carries a KIND alongside the
     // Bool. "Halts" is only half a diagnostic; an operator staring at a wedged core has to
     // know why. Deliberately an OBSERVATION, not a control path -- `coreHalted`'s three
@@ -654,6 +678,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       p.isRte      := u.isRte
       p.first      := u.firstOfInstr
       p.last       := u.lastOfInstr
+      p.debugBreakValid := u.debugBreakValid
+      p.debugBreakSlot  := u.debugBreakSlot
       p.needsSup   := u.needsSupervisor
       p.sysOp      := u.sysOp
       p.sysKind    := u.sysKind
@@ -727,11 +753,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       (!haltAfterCmpArmedReg || haltAfterComparePending)
 
     val debugStepBoundaryHit = Bool() // driven after retire/boundary classification
+    val debugBreakpointBoundaryHit = Bool()
+    val debugExceptionBoundaryHit = Bool()
     val debugQuiesceNext = Mux(debugHaltState === DebugHaltState.RUNNING,
-      debugStopRequestIn || haltAfterDue,
+      debugStopRequestIn || haltAfterDue || debugBreakpointBoundaryHit || debugExceptionBoundaryHit,
       Mux(debugHaltState === DebugHaltState.HALTED,
         !(debugResumeRequestIn || debugStepRequestIn),
-        Mux(debugHaltState === DebugHaltState.STEP_RUNNING, debugStepBoundaryHit, True)))
+        Mux(debugHaltState === DebugHaltState.STEP_RUNNING,
+          debugStepBoundaryHit || debugBreakpointBoundaryHit || debugExceptionBoundaryHit, True)))
     val debugLivePcReg = Reg(UInt(32 bits)) init 0
     debugLivePcReg.simPublic()
     // Exception squash: high on the entry/RTE trigger cycle AND while the FSM runs
@@ -865,9 +894,16 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     def sysAuxCapKind = m68k040.decode.SysKind.FPCTRL_CAP
     val sysAuxRdy0 = (p0.sysKind =/= sysAuxCapKind) || sysValRdyStore(h0)
     val sysAuxRdy1 = (p1.sysKind =/= sysAuxCapKind) || sysValRdyStore(h1)
+    debugBreakpointBoundaryHit := (count > 0) && p0.first && p0.debugBreakValid &&
+      excIdle && !flushing && !stopped && !coreHalted &&
+      ((debugHaltState === DebugHaltState.RUNNING) ||
+       (debugHaltState === DebugHaltState.STOP_PENDING) ||
+       (debugHaltState === DebugHaltState.STEP_RUNNING))
+    debugBreakpointBoundaryHit.simPublic()
     val retire0 = headReady && !faultedStore(h0) && !p0.isRte && !p0.sysOp &&
                   !interruptPending && !privViolation && !stopped && !tracePendingFire &&
-                  sysAuxRdy0 && !haltAfterDue && !haltAfterRetireBlock
+                  sysAuxRdy0 && !haltAfterDue && !haltAfterRetireBlock &&
+                  !debugBreakpointBoundaryHit
     // Root-cause fix (post-Task-P2.5 lock-step investigation): completion port 4
     // (the SQ precise-path at-head drain) fires ASYNCHRONOUSLY, many cycles after
     // its store's issue -- unlike every other completion source, which settles
@@ -953,7 +989,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     debugStepBoundaryHit := (debugHaltState === DebugHaltState.STEP_RUNNING) &&
       (debugStepNormalBoundaryHit || debugSequencerBoundaryHit)
     debugStepBoundaryHit.simPublic()
-    val debugRecoverEnter = debugStopBoundaryHit || debugStepBoundaryHit
+    val debugRecoverEnter = debugExceptionBoundaryHit || debugBreakpointBoundaryHit ||
+      debugStopBoundaryHit || debugStepBoundaryHit
     debugRecoverEnter.simPublic()
     val debugHaltHitInstCountReg = Reg(UInt(64 bits)) init 0
     debugHaltHitInstCountReg.simPublic()
@@ -963,15 +1000,32 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       debugHaltHitInstCountReg := Mux(haltAfterDue || debugAutoHaltLatchedReg,
         haltAfterCmpCountReg, debugMacroCountReg + debugMacroCountInc.resized)
     }
+    when(debugBreakpointBoundaryHit || debugExceptionBoundaryHit) {
+      debugHaltHitInstCountReg := debugMacroCountReg
+    }
+    val debugHaltHitPcReg = Reg(UInt(32 bits)) init 0
+    debugHaltHitPcReg.simPublic()
+    val debugExceptionPendingReg = RegInit(False)
+    val debugHaltExceptionVectorReg = Reg(UInt(8 bits)) init 0
+    val debugHaltExceptionPcReg = Reg(UInt(32 bits)) init 0
+    val debugHaltExceptionFaultAddressReg = Reg(UInt(32 bits)) init 0
+    debugExceptionPendingReg.simPublic(); debugHaltExceptionVectorReg.simPublic()
+    debugHaltExceptionPcReg.simPublic(); debugHaltExceptionFaultAddressReg.simPublic()
+    when(debugClearStickyIn) { debugHaltHitPcReg := 0 }
+    when(debugBreakpointBoundaryHit) { debugHaltHitPcReg := p0.pc }
     switch(debugHaltState) {
       is(DebugHaltState.RUNNING) {
-        when(debugStopRequestIn || haltAfterDue) {
+        when(debugExceptionBoundaryHit || debugBreakpointBoundaryHit) {
+          debugHaltState := DebugHaltState.RECOVER
+        }.elsewhen(debugStopRequestIn || haltAfterDue) {
           when(debugStopBoundaryHit) { debugHaltState := DebugHaltState.RECOVER }
             .otherwise             { debugHaltState := DebugHaltState.STOP_PENDING }
         }
       }
       is(DebugHaltState.STOP_PENDING) {
-        when(debugStopBoundaryHit) { debugHaltState := DebugHaltState.RECOVER }
+        when(debugExceptionBoundaryHit || debugBreakpointBoundaryHit || debugStopBoundaryHit) {
+          debugHaltState := DebugHaltState.RECOVER
+        }
       }
       is(DebugHaltState.RECOVER) {
         debugHaltState := DebugHaltState.HALTED
@@ -984,7 +1038,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
         }
       }
       is(DebugHaltState.STEP_RUNNING) {
-        when(debugStepBoundaryHit) { debugHaltState := DebugHaltState.RECOVER }
+        when(debugExceptionBoundaryHit || debugBreakpointBoundaryHit || debugStepBoundaryHit) {
+          debugHaltState := DebugHaltState.RECOVER
+        }
       }
     }
     val debugStepRejected = RegInit(False); debugStepRejected.simPublic()
@@ -1001,11 +1057,15 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     when(coreHaltedIn && !coreHalted) {
       debugHaltReasonReg := DebugHaltReasonCode.FATAL
     }.elsewhen(debugRecoverEnter) {
-      debugHaltReasonReg := Mux(debugHaltState === DebugHaltState.STEP_RUNNING,
-        U(DebugHaltReasonCode.STEP, 3 bits),
-        Mux(haltAfterDue || debugAutoHaltLatchedReg,
-          U(DebugHaltReasonCode.HALT_AFTER, 3 bits),
-          U(DebugHaltReasonCode.MANUAL, 3 bits)))
+      debugHaltReasonReg := Mux(debugExceptionBoundaryHit,
+        U(DebugHaltReasonCode.EXCEPTION, 3 bits),
+        Mux(debugBreakpointBoundaryHit,
+          U(DebugHaltReasonCode.BREAKPOINT, 3 bits),
+          Mux(debugHaltState === DebugHaltState.STEP_RUNNING,
+            U(DebugHaltReasonCode.STEP, 3 bits),
+            Mux(haltAfterDue || debugAutoHaltLatchedReg,
+              U(DebugHaltReasonCode.HALT_AFTER, 3 bits),
+              U(DebugHaltReasonCode.MANUAL, 3 bits)))))
     }
     GenerationFlags.simulation {
       assert(!((debugHalted || coreHalted) && (retire0 || retire1)),
@@ -1014,6 +1074,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
         "RobPlugin: single-step dual-retired across a macro boundary", FAILURE)
       assert(!((debugHaltState === DebugHaltState.STEP_RUNNING) && (debugMacroCountInc > 1)),
         "RobPlugin: single-step completed more than one macro in one cycle", FAILURE)
+      assert(!(debugBreakpointBoundaryHit && (retire0 || retire1)),
+        "RobPlugin: breakpoint-marked macro retired on its pre-effect stop cycle", FAILURE)
     }
     when((debugHaltState === DebugHaltState.RUNNING) && haltAfterDue) {
       debugAutoHaltLatchedReg := True
@@ -1827,6 +1889,13 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     _debugMacroCount       := debugMacroCountReg // Task 3: real producer
     _debugHaltHitInstCount := debugHaltHitInstCountReg
     _debugHaltAfterConsumed := (debugHaltState === DebugHaltState.RUNNING) && haltAfterDue
+    _debugHaltHitPc := debugHaltHitPcReg
+    _debugBreakpointHit.valid := debugBreakpointBoundaryHit
+    _debugBreakpointHit.payload := p0.debugBreakSlot
+    _debugExceptionPending := debugExceptionPendingReg
+    _debugHaltExceptionVector := debugHaltExceptionVectorReg
+    _debugHaltExceptionPc := debugHaltExceptionPcReg
+    _debugHaltExceptionFaultAddress := debugHaltExceptionFaultAddressReg
 
     // ── DebugSystemStateService live readback + halted apply sink ──────────────
     // The command producer accepts it only at effective halt. Keep that policy
@@ -1884,6 +1953,24 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     debugExceptionEntry.payload.exceptionPc := exc.obsExceptionPc
     debugExceptionEntry.payload.faultAddress := exc.obsFaultAddress
     debugExceptionEntry.payload.handlerPc := exc.obsHandlerPc
+    debugExceptionBoundaryHit := debugExceptionEntry.valid &&
+      haltExceptionMaskIn(debugExceptionEntry.payload.vector) && !coreHalted &&
+      ((debugHaltState === DebugHaltState.RUNNING) ||
+       (debugHaltState === DebugHaltState.STOP_PENDING) ||
+       (debugHaltState === DebugHaltState.STEP_RUNNING))
+    debugExceptionBoundaryHit.simPublic()
+    when(debugClearStickyIn) {
+      debugExceptionPendingReg := False
+      debugHaltExceptionVectorReg := 0
+      debugHaltExceptionPcReg := 0
+      debugHaltExceptionFaultAddressReg := 0
+    }
+    when(debugExceptionBoundaryHit) {
+      debugExceptionPendingReg := True
+      debugHaltExceptionVectorReg := debugExceptionEntry.payload.vector
+      debugHaltExceptionPcReg := debugExceptionEntry.payload.exceptionPc
+      debugHaltExceptionFaultAddressReg := debugExceptionEntry.payload.faultAddress
+    }
 
     // ── Drive trace-exception (T0/T1) recognition (task #193) ───────────────────
     // T1/T0 are bits 7/6 of the SR SYSTEM byte (srSys(7)=T1, srSys(6)=T0 — see
@@ -1960,9 +2047,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val debugStepRestartPc = Mux(retire1 && p1.last, p1.predNextPc, p0.predNextPc)
     val debugRestartPc = Mux(exc.redirectValid, exc.redirectPc,
                          Mux(branchRedirect, nextPcRd0,
+                         Mux(debugBreakpointBoundaryHit, p0.pc,
                          Mux(haltAfterDue || debugAutoHaltLatchedReg, debugLivePcReg,
                          Mux(debugHaltState === DebugHaltState.STEP_RUNNING, debugStepRestartPc,
-                         Mux(count === 0, debugLivePcReg, p0.predNextPc)))))
+                         Mux(count === 0, debugLivePcReg, p0.predNextPc))))))
     // A halted PC edit must update the frontend's registered restart point as well as
     // debugLivePcReg. Reusing the ordinary registered flush keeps every speculative
     // consumer empty and does not release the debug halt.
@@ -1972,8 +2060,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     when(branchRedirect)    { flushPcReg := nextPcRd0 }   // Slice B: shared h0 read port
     when(exc.redirectValid) { flushPcReg := exc.redirectPc }
     when(debugRecoverEnter && !branchRedirect && !exc.redirectValid) {
-      flushPcReg := Mux(debugHaltState === DebugHaltState.STEP_RUNNING,
-        debugStepRestartPc, p0.predNextPc)
+      flushPcReg := Mux(debugBreakpointBoundaryHit, p0.pc,
+        Mux(debugHaltState === DebugHaltState.STEP_RUNNING,
+          debugStepRestartPc, p0.predNextPc))
     }
     when(debugRecoverEnter) { debugLivePcReg := debugRestartPc }
 
@@ -2085,6 +2174,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     logic.haltAfterEpochIn := epoch
     logic.haltAfterArmedIn := armed
     logic.haltAfterInvalidateIn := invalidate
+  }
+  override def configureExceptionMask(mask: Bits): Unit = {
+    logic.haltExceptionMaskIn := mask
   }
 
   override def sr: UInt = logic.debugSystemSr

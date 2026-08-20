@@ -118,6 +118,8 @@ case class RenamedUop() extends Bundle {
   // neither. Threaded verbatim from `DecodedUop.lastOfInstr` (see its doc for why
   // this must be a real field rather than a ROB-side ring-occupancy derivation).
   val lastOfInstr = Bool()
+  val debugBreakValid = Bool()
+  val debugBreakSlot  = UInt(2 bits)
   // Brief-format indexed EA: the index reg rides psrcC/psrcCValid; these size+scale it
   // in the LS-EU AGU (indexLong => full 32 vs .W sign-extend; indexScale = *1/2/4/8).
   val indexLong  = Bool()

@@ -947,8 +947,9 @@ These do not block the architecture but must be fixed in an implementation plan:
 
 1. Whether the shared cache-maintenance owner is a new arbiter plugin or an extension
    of the ROB/ExceptionUnit owner. It cannot remain top-level internal wiring.
-2. The exact service payload used to carry the frontend breakpoint marker through
-   decode/rename without adding a combinational ready path.
+2. RESOLVED for Stage 5 in section 15.6: the frontend owns a registered configuration
+   snapshot and stamps `{debugBreakValid, debugBreakSlot}` into the ordinary uop
+   payload; decode, rename, and the ROB copy those fields verbatim.
 3. The SoC socket/reset-port naming for debug POR, CPU-reset notification, build ID,
    cold-reset hold/pulse, and init-done observation.
 4. Which append-only offset exposes cache REJECTED/ERROR and architectural dirty-mask
@@ -1119,3 +1120,26 @@ bit reads 0. This value is not written by hand anywhere: it is computed from the
 `STAGE` column of `tools/debug/debug_regmap.def`, which is the machine-checked
 form of §3.4's "No feature bit may advertise a tied-off counter, stale shadow,
 placeholder probe, or operation that can be silently dropped."
+
+### 15.6 Stage-5 frontend breakpoint marker (2026-08-21)
+
+`DecodeStage` is the sole producer of `FrontendDebugMatchService`. The service accepts
+four PC values, their enable mask, and the hardware/host skip-once mask from
+`DebugCtrlPlugin`; it returns only a registered four-bit skip-consumed pulse mask. The
+service configuration is copied into frontend-local registers before comparison.
+
+The comparison consumes the already-registered decode uop PC and terminates at the
+existing decode push register. It never drives `valid`, `ready`, packet selection, or
+queue admission. The resulting `debugBreakValid` and two-bit `debugBreakSlot` fields
+are ordinary plain SpinalHDL fields in `DecodedUop`, `RenamedUop`, and the ROB payload.
+All uops of a cracked macro carry the same comparison result; the ROB acts on it only
+when the marked entry is `firstOfInstr` at the architectural head. Ordinary frontend,
+queue, rename, and ROB recovery therefore discard wrong-path markers without a special
+kill path.
+
+Skip-once is armed in the surviving debug domain from the ROB's precise hit report
+before `HALTED` becomes visible. It suppresses the first registered frontend match for
+that slot after restart and is consumed when the marked first uop is accepted into the
+decode push register. A precise breakpoint halt always empties the machine and restarts
+at its saved hit PC, so this first post-halt match is the required refetch; the compare
+and consume pulse remain outside every backpressure path.

@@ -545,4 +545,50 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
         DebugRegMap.OFF_HALT_HIT_INST_HI.toLong) == 0x01234567L)
     }
   }
+
+  test("Stage 5 exposes four PC slots, skip-once, exception masks, and atomic hit descriptors") {
+    M68kSim().compile(new DebugCtrlDut(stageArg = 5, withCommitStubArg = true,
+      withFrontendStubArg = true)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      dut.dbg.logic.initDoneSeen #= false
+      cd.waitSampling(20)
+
+      val features = DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_FEATURES.toLong)
+      assert((features & (1L << 6)) != 0, f"four-slot PC breakpoints not advertised: 0x$features%08X")
+      assert((features & (1L << 7)) != 0, f"halt-on-exception mask not advertised: 0x$features%08X")
+
+      val pcs = Seq(0x00102030L, 0x11223344L, 0x55667788L, 0x99AABBCCL)
+      val offs = Seq(DebugRegMap.OFF_BREAK_PC0, DebugRegMap.OFF_BREAK_PC1,
+        DebugRegMap.OFF_BREAK_PC2, DebugRegMap.OFF_BREAK_PC3)
+      for ((pc, off) <- pcs.zip(offs)) DbgAxiDriver.write(dut.axi, cd, off.toLong, pc)
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_BREAK_PC_CTRL.toLong, 0xDL)
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_HALT_EXC_MASK0.toLong, 0x00000004L)
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_HALT_EXC_MASK7.toLong, 0x80000000L)
+      cd.waitSampling(2)
+      assert(dut.frontendStub.logic.pcs.map(_.toLong) == pcs)
+      assert(dut.frontendStub.logic.enables.toInt == 0xD)
+      assert(dut.commitStub.logic.haltExceptionMask.toBigInt ==
+        ((BigInt(1) << 255) | (BigInt(1) << 2)))
+
+      dut.commitStub.logic.breakpointHitSlotDrive #= 2
+      dut.commitStub.logic.breakpointHitValidDrive #= true
+      cd.waitSampling()
+      dut.commitStub.logic.breakpointHitValidDrive #= false
+      cd.waitSampling()
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_BP_SKIP_ONCE.toLong) == 4)
+
+      dut.commitStub.logic.exceptionPendingDrive #= true
+      dut.commitStub.logic.haltExceptionVectorDrive #= 2
+      dut.commitStub.logic.haltExceptionPcDrive #= 0x40801234L
+      dut.commitStub.logic.haltExceptionFaultAddressDrive #= 0x00ABCDEF
+      dut.commitStub.logic.haltHitPcDrive #= 0x12345678L
+      cd.waitSampling()
+      assert((DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_STATUS.toLong) & 2) != 0)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_HALT_HIT_PC.toLong) == 0x12345678L)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_VEC.toLong) == 2)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_PC.toLong) == 0x40801234L)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_FAULT_ADDR.toLong) == 0x00ABCDEFL)
+    }
+  }
 }

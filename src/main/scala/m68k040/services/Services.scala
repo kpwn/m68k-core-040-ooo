@@ -63,6 +63,17 @@ trait FrontendQuiesceService {
   def next: Bool
 }
 
+/** Registered frontend PC-breakpoint matcher configuration and skip consumption.
+  *
+  * The configuration is debug-domain state owned by `DebugCtrlPlugin`; this service
+  * copies it into frontend-local registers and stamps match metadata into ordinary uop
+  * payloads. The returned pulse reports that a skip-once match entered the registered
+  * decode push stage. PRODUCER: `DecodeStage` (exactly one). */
+trait FrontendDebugMatchService {
+  def configure(pcs: Vec[UInt], enables: Bits, skipOnce: Bits): Unit
+  def skipConsumed: Bits // one pulse bit per slot; supports two-wide frontend consumption
+}
+
 /** ROB-owned debug halt/resume/step state (design spec
   * `docs/superpowers/specs/2026-08-09-debug-ctrl-jtag-repl-design.md` section 6, Stage 2).
   * `DebugCtrlPlugin` is the sole consumer. Commands enter through `request`, never by
@@ -76,10 +87,18 @@ trait DebugCommitService {
   def macroCount:       UInt
   def haltHitInstCount: UInt
   def haltAfterConsumed: Bool
+  def haltHitPc:         UInt
+  def breakpointHit:     Flow[UInt] // payload is the two-bit slot
+  def exceptionPending:  Bool
+  def haltExceptionVector: UInt
+  def haltExceptionPc:   UInt
+  def haltExceptionFaultAddress: UInt
   def request(stop: Bool, resume: Bool, step: Bool, clearSticky: Bool): Unit
   /** Surviving debug-domain halt-after configuration. `invalidate` is the accepted
     * target-write pulse; it cancels a stale pipelined comparison on that same edge. */
   def configureHaltAfter(target: UInt, epoch: UInt, armed: Bool, invalidate: Bool): Unit
+  /** Surviving debug-domain halt-on-exception configuration. */
+  def configureExceptionMask(mask: Bits): Unit
 }
 
 /** One atomic commit-owner update used by the halted architectural-apply FSM.

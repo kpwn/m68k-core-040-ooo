@@ -1,7 +1,7 @@
 package m68k040.debug
 
 import m68k040.services.{DebugCommitService, DebugSystemStateService, DebugMemoryService,
-  DebugHistoryService, DebugMemoryCommand}
+  DebugHistoryService, DebugMemoryCommand, FrontendDebugMatchService}
 import m68k040.services.CommittedMapService
 import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, XRegFileService,
   RegFileReadPort, RegFileWritePort}
@@ -153,10 +153,13 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
     val debugMemory = if (enable && stage >= 3) host.get[DebugMemoryService] else None
     val historyEnabled = enable && stage >= 3 && historyDepth > 0
     val debugHistory = if (historyEnabled) host.get[DebugHistoryService] else None
+    val frontendDebug = if (enable && stage >= 5) host.get[FrontendDebugMatchService] else None
     val historyBuilt = historyEnabled && debugHistory.nonEmpty
     val unavailableFeatures = Set("dcache_probe") ++
       (if (historyBuilt) Set.empty[String] else Set("pc_trace", "exc_ring", "branch_ring")) ++
-      (if (debugMemory.nonEmpty) Set.empty[String] else Set("cache_maint_only"))
+      (if (debugMemory.nonEmpty) Set.empty[String] else Set("cache_maint_only")) ++
+      (if (frontendDebug.nonEmpty) Set.empty[String] else Set("break_pc_multi")) ++
+      (if (dbgCommit.nonEmpty) Set.empty[String] else Set("halt_exc_mask"))
     val advertisedFeatures = DebugRegMap.features
       .filter(f => f._3 <= stage && !unavailableFeatures.contains(f._1))
       .foldLeft(BigInt(0))((acc, f) => acc | (BigInt(1) << f._2))
@@ -430,6 +433,30 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
            (awAddr === DebugRegMap.OFF_HALT_AFTER_HI))
       } else False
       if (stage >= 2) haltAfterInvalidate.simPublic()
+
+      // Stage-5 breakpoint/exception configuration lives in the debug reset domain and
+      // therefore survives CPU reset. Runtime hit descriptors remain ROB-owned.
+      val breakPc = if (stage >= 5) Vec.fill(4)(Reg(UInt(32 bits)) init 0) else null
+      val breakPcEnable = if (stage >= 5) Reg(Bits(4 bits)) init 0 else B(0, 4 bits)
+      val breakSkipOnce = if (stage >= 5) Reg(Bits(4 bits)) init 0 else B(0, 4 bits)
+      val haltExceptionMask = if (stage >= 5)
+        Vec.fill(8)(Reg(Bits(32 bits)) init 0) else null
+      if (stage >= 5) {
+        breakPc.simPublic(); breakPcEnable.simPublic(); breakSkipOnce.simPublic()
+        haltExceptionMask.simPublic()
+        frontendDebug.foreach { matcher =>
+          when(matcher.skipConsumed.orR) {
+            breakSkipOnce := breakSkipOnce & ~matcher.skipConsumed
+          }
+        }
+        dbgCommit.foreach { commit =>
+          // Arming wins over a same-cycle consume; a newly reported breakpoint must be
+          // skippable before the following cycle can expose HALTED.
+          when(commit.breakpointHit.valid) {
+            breakSkipOnce(commit.breakpointHit.payload) := True
+          }
+        }
+      }
 
       // ── Stage 3 architectural write shadows ─────────────────────────────────
       // One word/dirty bit per independently applicable field. Logical indices are
@@ -778,12 +805,36 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           is(DebugRegMap.OFF_LAST_PC) { rData := lastPc.asBits }
           is(DebugRegMap.OFF_HALT_AFTER_LO) { rData := haltAfterTarget(31 downto 0).asBits }
           is(DebugRegMap.OFF_HALT_AFTER_HI) { rData := haltAfterTarget(63 downto 32).asBits }
+          if (stage >= 5) {
+            is(DebugRegMap.OFF_BREAK_PC0) { rData := breakPc(0).asBits }
+            is(DebugRegMap.OFF_BREAK_PC1) { rData := breakPc(1).asBits }
+            is(DebugRegMap.OFF_BREAK_PC2) { rData := breakPc(2).asBits }
+            is(DebugRegMap.OFF_BREAK_PC3) { rData := breakPc(3).asBits }
+            is(DebugRegMap.OFF_BREAK_PC_CTRL) { rData := B(0, 28 bits) ## breakPcEnable }
+            is(DebugRegMap.OFF_BP_SKIP_ONCE) { rData := B(0, 28 bits) ## breakSkipOnce }
+            for (i <- 0 until 8) {
+              is(DebugRegMap.OFF_HALT_EXC_MASK0 + i * 4) { rData := haltExceptionMask(i) }
+            }
+          }
           is(DebugRegMap.OFF_HALT_CTL) {
             rData := B(0, 31 bits) ## haltAfterArmed
           }
           is(DebugRegMap.OFF_HALT_REASON) {
             rData := B(0, 29 bits) ##
               dbgCommit.map(_.haltReasonDebug).getOrElse(U(0, 3 bits)).asBits
+          }
+          is(DebugRegMap.OFF_HALT_HIT_PC) {
+            rData := dbgCommit.map(_.haltHitPc.asBits).getOrElse(B(0, 32 bits))
+          }
+          is(DebugRegMap.OFF_EXC_VEC) {
+            rData := dbgCommit.map(s => s.haltExceptionVector.resize(32).asBits)
+              .getOrElse(B(0, 32 bits))
+          }
+          is(DebugRegMap.OFF_EXC_PC) {
+            rData := dbgCommit.map(_.haltExceptionPc.asBits).getOrElse(B(0, 32 bits))
+          }
+          is(DebugRegMap.OFF_EXC_FAULT_ADDR) {
+            rData := dbgCommit.map(_.haltExceptionFaultAddress.asBits).getOrElse(B(0, 32 bits))
           }
           is(DebugRegMap.OFF_INST_LO) { rData := macroCount(31 downto 0).asBits }
           is(DebugRegMap.OFF_INST_HI) { rData := macroCount(63 downto 32).asBits }
@@ -798,7 +849,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
                      automaticHalt ##    // bit 4  auto-halt latched
                      !effectiveHalt ##   // bit 3  running (inverse of halted)
                      initDoneLatched ##  // bit 2  init-done seen
-                     False ##            // bit 1  exception pending (Stage 5 halt_exc_mask)
+                     dbgCommit.map(_.exceptionPending).getOrElse(False) ## // bit 1
                      effectiveHalt       // bit 0  effective coherent halt
           }
           is(DebugRegMap.OFF_RAM_WINDOW_LG2) { rData := ramWindowWord }
@@ -915,6 +966,33 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
               haltAfterArmed := False
             }
           }
+          if (stage >= 5) {
+            is(DebugRegMap.OFF_BREAK_PC0) {
+              when(wStrb.orR) { breakPc(0) := merged(breakPc(0).asBits).asUInt }
+            }
+            is(DebugRegMap.OFF_BREAK_PC1) {
+              when(wStrb.orR) { breakPc(1) := merged(breakPc(1).asBits).asUInt }
+            }
+            is(DebugRegMap.OFF_BREAK_PC2) {
+              when(wStrb.orR) { breakPc(2) := merged(breakPc(2).asBits).asUInt }
+            }
+            is(DebugRegMap.OFF_BREAK_PC3) {
+              when(wStrb.orR) { breakPc(3) := merged(breakPc(3).asBits).asUInt }
+            }
+            is(DebugRegMap.OFF_BREAK_PC_CTRL) {
+              when(wStrb(0)) { breakPcEnable := wData(3 downto 0) }
+            }
+            is(DebugRegMap.OFF_BP_SKIP_ONCE) {
+              when(wStrb(0)) { breakSkipOnce := wData(3 downto 0) }
+            }
+            for (i <- 0 until 8) {
+              is(DebugRegMap.OFF_HALT_EXC_MASK0 + i * 4) {
+                when(wStrb.orR) {
+                  haltExceptionMask(i) := merged(haltExceptionMask(i)).asBits
+                }
+              }
+            }
+          }
           is(DebugRegMap.OFF_HALT_CTL) {
             if (stage >= 2) when(wStrb(0)) {
               when(wData(0)) { haltAfterArmed := True }
@@ -995,6 +1073,12 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           cacheOpError := False
           cacheOpLaunched := False
           cacheOpSel := 0
+        }
+        if (stage >= 5) {
+          for (i <- 0 until 4) breakPc(i) := 0
+          breakPcEnable := 0
+          breakSkipOnce := 0
+          for (i <- 0 until 8) haltExceptionMask(i) := 0
         }
       }
 
@@ -1081,6 +1165,17 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           "DebugCtrlPlugin: surviving debug configuration changed while CPU reset was " +
           "asserted (spec section 13)",
           FAILURE)
+        if (stage >= 5) {
+          val stage5Cfg = haltExceptionMask.reverse.reduce(_ ## _) ##
+            breakPc.reverse.map(_.asBits).reduce(_ ## _) ## breakPcEnable ## breakSkipOnce
+          val stage5CfgPrev = RegNext(stage5Cfg) init B(0, widthOf(stage5Cfg) bits)
+          val stage5RuntimeMove = dbgCommit.map(_.breakpointHit.valid).getOrElse(False) ||
+            frontendDebug.map(_.skipConsumed.orR).getOrElse(False)
+          val stage5CfgMoved = RegNext(doWrite || cfgWipe || stage5RuntimeMove) init False
+          assert(!(cpuRstLevel && !stage5CfgMoved && (stage5Cfg =/= stage5CfgPrev)),
+            "DebugCtrlPlugin: Stage-5 breakpoint/exception configuration changed while " +
+            "CPU reset was asserted", FAILURE)
+        }
       }
 
       coldResetPulse := coldPulse
@@ -1113,6 +1208,14 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         csr.debugClearStickyRequest && !dbgRst))
       dbgCommit.foreach(_.configureHaltAfter(csr.haltAfterTarget, csr.haltAfterEpoch,
         csr.haltAfterArmed && !dbgRst, csr.haltAfterInvalidate && !dbgRst))
+      if (stage >= 5) {
+        val exceptionMask = csr.haltExceptionMask.reverse.reduce(_ ## _)
+        dbgCommit.foreach(_.configureExceptionMask(exceptionMask))
+        frontendDebug.foreach(_.configure(csr.breakPc, csr.breakPcEnable,
+          csr.breakSkipOnce))
+      } else {
+        dbgCommit.foreach(_.configureExceptionMask(B(0, 256 bits)))
+      }
     }
     if (enable && stage >= 3) {
       dbgSystem.foreach(_.requestApply(csr.systemApply))
