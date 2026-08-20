@@ -1447,6 +1447,13 @@ class RobPluginSpec extends AnyFunSuite {
       // PC", the instruction's own address).
       assert(dut.dsink.logic.lastPcOut.toLong == 0x200L,
         s"debugLastPc must be slot-1's (p1) raw PC (0x200), not slot-0's (0x100), got 0x${dut.dsink.logic.lastPcOut.toLong.toHexString}")
+      // Task 3 review finding: this same dual-retire (retire0 && retire1, both
+      // p0.first/p1.first == true) cycle is also the highest-risk case for
+      // debugMacroCountReg's increment expression -- it must add 2, not 1 or 0,
+      // when BOTH slots retire a macro's own first uop the same cycle. Assert it
+      // here rather than only in the reviewer's own (unrecorded) probe.
+      assert(dut.dsink.logic.macroCountOut.toBigInt == BigInt(2),
+        s"debugMacroCount must be 2 after a genuine dual-first-uop retire, got ${dut.dsink.logic.macroCountOut.toBigInt}")
       assert(dut.rob.logic.count.toInt == 0, "ROB drained (test precondition sanity)")
     }
   }
