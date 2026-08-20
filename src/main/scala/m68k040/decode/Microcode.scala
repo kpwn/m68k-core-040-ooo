@@ -2985,6 +2985,12 @@ object Microcode {
       case _          => B(0, 3 bits)
     })
     u.firstOfInstr := Bool(d.isFirst)
+    // `lastOfInstr` (Stage 2 task 4, spec section 6.2's `macroLast`) = the ROM row's own
+    // pre-existing `isLast` flag, which is ALREADY the microcode program's terminal-row
+    // marker: DecodeStage's sequencer only advances `ucNextPc := ucPc + 1` while
+    // `!ucCurLast`, and clears `ucActive` on the isLast row, so the isLast row's µop is
+    // by construction the macro's last µop. No separate derivation is possible or needed.
+    u.lastOfInstr := Bool(d.isLast)
     u
   }
 
@@ -3509,6 +3515,9 @@ object Microcode {
     // CAS/CAS2 compute sub-form (DecOp.CASOP); 0 for every other µop.
     u.casForm := Mux(d.uop === UOpHw.UCasOp, d.casForm.asBits, B(0, 3 bits))
     u.firstOfInstr := d.isFirst
+    // `lastOfInstr` -- exact twin of resolve()'s block above (the ROM row's own `isLast`
+    // terminal-row marker); see there for the rationale.
+    u.lastOfInstr := d.isLast
     u
   }
 }

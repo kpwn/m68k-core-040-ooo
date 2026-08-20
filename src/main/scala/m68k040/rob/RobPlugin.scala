@@ -126,6 +126,15 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val pc         = UInt(32 bits)
     val isRte      = Bool()
     val first      = Bool()
+    // Macro-boundary LAST marker (Stage 2 task 4, spec section 6.2's `macroLast`), the
+    // exact mirror of `first`: True iff this entry is the LAST µop of its macro. Captured
+    // at ALLOC from `RenamedUop.lastOfInstr` (decode-time known), NOT derived here from
+    // ring occupancy -- a 3+-µop crack can reach `count == 1` with a MIDDLE µop at the
+    // head before its real last µop is even allocated (MicroOpQueue pops <= 2 µops/cycle
+    // and DispatchPlugin gates 2-wide dispatch on ROB/IQ backpressure), so any
+    // occupancy-based derivation reads "macro complete" mid-macro. Read only under the
+    // same headReady / count>0 gating as `first` (see the SAFETY note above).
+    val last       = Bool()
     val needsSup   = Bool()
     val sysOp      = Bool()
     val sysKind    = m68k040.decode.SysKind()
@@ -599,6 +608,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       p.pc         := u.pc
       p.isRte      := u.isRte
       p.first      := u.firstOfInstr
+      p.last       := u.lastOfInstr
       p.needsSup   := u.needsSupervisor
       p.sysOp      := u.sysOp
       p.sysKind    := u.sysKind
@@ -623,6 +633,19 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // only through derived consumers (rteRetire/sysRetire/privViolation/...). Zero
     // synthesis cost, same convention as head/tail/count/completes above.
     p0.simPublic(); p1.simPublic()
+
+    // ── Macro-boundary detection for debug stop (Stage 2) ───────────────────────
+    // "Is the entry retiring at h0 THIS cycle the LAST µop of its macro?" -- spec
+    // section 6.2's macroLast, now a real alloc-time-captured per-entry fact
+    // (RobPayload.last, threaded from DecodedUop/RenamedUop.lastOfInstr through every
+    // MicroOpAssembler/Microcode crack site). A ring-occupancy-derived form
+    // ((count <= 1) || p1.first) was tried first and is WRONG: a 3-µop crack (e.g. a
+    // memory-destination RMW [load, op, store]) can reach count==1 with h0 = the MIDDLE
+    // op µop, mid-macro, before its store is even allocated -- so a debug stop taken at
+    // that instant would RECOVER there and the store would never execute. Valid only
+    // under the usual `count > 0` gating (p0 is an uninitialised-Mem read otherwise).
+    val h0IsMacroLast = p0.last
+    h0IsMacroLast.simPublic()
     // Commit-time mispredict redirect is a REGISTERED pulse (declared here so the
     // retire guards can gate on it). `flushing` = test flush OR the registered
     // redirect pulse; it drives ONLY pointer/reg resets (no combinational fanout).

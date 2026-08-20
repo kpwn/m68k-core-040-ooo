@@ -51,7 +51,7 @@ object MicroOpAssembler {
     *  - STORE: reg -> [base+disp] (srcBReg=reg = the stored data, no int dst, NO flags).
     */
   def movemMoveUop(reg: UInt, base: UInt, baseValid: Bool, disp: Bits, sizeLong: Bool,
-                   isLoad: Bool, first: Bool, drop: Bool, valid: Bool, pc: UInt, nextPc: UInt,
+                   isLoad: Bool, first: Bool, last: Bool, drop: Bool, valid: Bool, pc: UInt, nextPc: UInt,
                    idxReg: UInt, idxValid: Bool, idxLong: Bool, idxScale: UInt): DecodedUop = {
     val u = DecodedUop()
     u.fpInert()
@@ -106,6 +106,12 @@ object MicroOpAssembler {
     // interrupt is only taken at the MOVEM boundary (never mid-emission — the partly-
     // emitted moves would otherwise be re-run after RTE since they share the MOVEM pc).
     u.firstOfInstr := first
+    // `lastOfInstr` (Stage 2 task 4): a move µop is the macro's LAST µop only for the
+    // abs/PC-base MOVEM forms, which emit NO trailing An-update µop (movemHasFinal
+    // False) — and then only the very last move of the very last emission cycle. The
+    // DecodeStage FSM owns that determination (it holds the mask-drain state); this
+    // builder just carries it.
+    u.lastOfInstr := last
     u
   }
 
@@ -148,6 +154,10 @@ object MicroOpAssembler {
     u.predTaken := False; u.predTarget := U(0, 32 bits)
     u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
     u.firstOfInstr := False    // trailing µop of the MOVEM macro
+    // ...and, when it is emitted at all (every An-base MOVEM form, movemHasFinal), it is
+    // UNCONDITIONALLY the macro's last µop: the FSM leaves movemAnUpdPhase straight to
+    // movemActive=False once the queue accepts it (DecodeStage's MOVEM transition block).
+    u.lastOfInstr := True
     u
   }
 
@@ -202,6 +212,11 @@ object MicroOpAssembler {
     u.predTaken := False; u.predTarget := U(0, 32 bits)
     u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
     u.firstOfInstr := True
+    // The snapshot µop is emitted BEFORE any move and is never the macro's last µop:
+    // the FSM only enters the snap phase from `movemBegin` with a NON-empty mask (an
+    // empty-mask MOVEM clears movemActive at entry and emits nothing at all), so at
+    // least one move µop always follows it.
+    u.lastOfInstr := False
     u
   }
 
@@ -267,6 +282,9 @@ object MicroOpAssembler {
     u.predTaken := False; u.predTarget := U(0, 32 bits)
     u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
     u.firstOfInstr := first
+    // A chunk LOAD is NEVER the macro's last µop: each element is [LOAD x3][issue row],
+    // so the element's own FP issue row always follows the 3 chunk loads.
+    u.lastOfInstr := False
     u
   }
 
@@ -294,7 +312,7 @@ object MicroOpAssembler {
     * non-drop writer per macro" convention -- not an explicit keepCommit override -- is the
     * ONLY mechanism CPLX writers have, and it generalizes to this FSM's up-to-8 writers with
     * no new EU-side plumbing. */
-  def fmovemxIssueUop(fpDst: UInt, drop: Bool, first: Bool, valid: Bool,
+  def fmovemxIssueUop(fpDst: UInt, drop: Bool, first: Bool, last: Bool, valid: Bool,
                        pc: UInt, nextPc: UInt): DecodedUop = {
     val u = DecodedUop()
     // NO `u.fpInert()` here (unlike every OTHER builder in this file): every fp* field is
@@ -337,6 +355,11 @@ object MicroOpAssembler {
     u.predTaken := False; u.predTarget := U(0, 32 bits)
     u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
     u.firstOfInstr := first
+    // The element's issue row is the macro's last µop exactly when this is the LAST
+    // element of the list (`fmovemxIsLastElem`): the FSM clears fmovemxActive right
+    // after that row is accepted. Same signal that already drives `drop` (inverted) --
+    // the last element's issue row is BOTH the kept macro commit and the last µop.
+    u.lastOfInstr := last
     // ── FP-domain fields (mirrors Microcode.scala's UFpIssue resolve block) ──────────
     u.fpuOp      := B(0, 7 bits)              // 0x00 FMOVE: plain load/convert, no compute
     u.fpDstReg   := fpDst.resize(3)
@@ -407,6 +430,11 @@ object MicroOpAssembler {
     u.predTaken := False; u.predTarget := U(0, 32 bits)
     u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
     u.firstOfInstr := False
+    // Inert default. The AUTHORITATIVE value for every MOVEP µop is stamped once, by
+    // the DecodeStage MOVEP FSM, from its OWN pre-existing per-step `movepLast` signal
+    // (the same signal that ends the FSM) -- a single source of truth that cannot drift
+    // from the FSM's real step sequence. See DecodeStage's `movepUop.lastOfInstr` stamp.
+    u.lastOfInstr := False
     u
   }
 
@@ -899,6 +927,7 @@ object MicroOpAssembler {
     // other path opUop is uops(0), the macro-instruction boundary.)
     val opHasLeadingLoad = crackLoad || crackRmw || crackLoadOnly
     opUop.firstOfInstr  := !opHasLeadingLoad
+    opUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
 
     // --- srcA slot ---
     switch(spec.srcA.kind) {
@@ -1247,6 +1276,7 @@ object MicroOpAssembler {
     ldUop.isChk2        := False
     ldUop.shiftOp := 0; ldUop.shiftDir := False; ldUop.isMovea := False; ldUop.isScc := False; ldUop.isDbcc := False; ldUop.extByte := False; ldUop.bitOp := 0; ldUop.bfOp := 0; ldUop.bfDynamic := False; ldUop.bfMem := False; ldUop.bfStoreForm := 0; ldUop.bcdSub := False
     ldUop.firstOfInstr  := True    // the LOAD is the FIRST µop of a cracked instruction
+    ldUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
 
     // MOVE #imm,<mem> destination EA RE-DECODE (immToMemCase only): the immediate
     // SOURCE precedes the destination EA's own extension words in the instruction
@@ -1318,6 +1348,7 @@ object MicroOpAssembler {
     // A single reg-to-mem STORE is its own first µop; a mem-to-mem store TRAILS the load,
     // and an immediate-materialize store (immToMemCase) TRAILS the materialize opUop.
     stUop.firstOfInstr  := !crackMemMem && !immToMemCase
+    stUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
 
     // ── rmwStUop = the STORE of a memory-destination RMW (crackRmw / crackClr) ──
     // The EA is op[5:0] = `srcEa` (the SAME descriptor the load used — MEMSIMPLE has no
@@ -1366,6 +1397,7 @@ object MicroOpAssembler {
     rmwStUop.isChk2        := False
     rmwStUop.shiftOp := 0; rmwStUop.shiftDir := False; rmwStUop.isMovea := False; rmwStUop.isScc := False; rmwStUop.isDbcc := False; rmwStUop.extByte := False; rmwStUop.bitOp := 0; rmwStUop.bfOp := 0; rmwStUop.bfDynamic := False; rmwStUop.bfMem := False; rmwStUop.bfStoreForm := 0; rmwStUop.bcdSub := False
     rmwStUop.firstOfInstr  := False    // the trailing store of a cracked RMW
+    rmwStUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
 
     // ── unimplemented gating (folded into opUop, last-wins) ────────────────────
     // Defer: non-simple, illegal op, a USED src EA that is neither reg/imm nor a
@@ -2612,6 +2644,7 @@ object MicroOpAssembler {
       u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
       u.firstOfInstr := True
+      u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
     }
 
@@ -2686,6 +2719,7 @@ object MicroOpAssembler {
     // firstOfInstr: True unless a leading LOAD µop precedes it (memSimple divisor,
     // task #180 — the load becomes uops(0) and divlUop moves to uops(1)).
     divlUop.firstOfInstr  := !divlDivisorIsMem
+    divlUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
     // 64-bit dividend high word Dr: carried in srcC (psrcC after rename). For the
     // 32-bit form psrcC is unused.
     divlUop.srcCReg       := divlDr; divlUop.srcCValid := divl64
@@ -2763,6 +2797,7 @@ object MicroOpAssembler {
     divremUop.predTaken := False; divremUop.predTarget := U(0, 32 bits)
     divremUop.phtValid := False; divremUop.phtIndex := U(0, 11 bits); divremUop.casForm := 0
     divremUop.firstOfInstr  := False           // trailing crack µop
+    divremUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
 
     // DIV.L divisor EA: reg/imm (always OK), OR a memSimple (non-auto-update) EA —
     // task #180 (ported-tests triage cluster13/muldiv_indexed_mem_src): a leading
@@ -2850,6 +2885,7 @@ object MicroOpAssembler {
     // firstOfInstr: True unless a leading LOAD µop precedes it (memSimple multiplier,
     // task #180 — the load becomes uops(0) and mullUop moves to uops(1)).
     mullUop.firstOfInstr  := !mullMulIsMem
+    mullUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
 
     // MULHI (high-product move) µop (.L64 only): CPLX, writes the EU's LATCHED high
     // product to Dh. The high product itself is an internal EU latch (no real source
@@ -2910,6 +2946,7 @@ object MicroOpAssembler {
     mulhiUop.predTaken := False; mulhiUop.predTarget := U(0, 32 bits)
     mulhiUop.phtValid := False; mulhiUop.phtIndex := U(0, 11 bits); mulhiUop.casForm := 0
     mulhiUop.firstOfInstr  := False           // trailing crack µop
+    mulhiUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
 
     // MUL.L multiplier EA: reg/imm (always OK), OR a memSimple (non-auto-update) EA —
     // task #180 (ported-tests triage cluster13/muldiv_indexed_mem_src): a leading
@@ -3015,6 +3052,7 @@ object MicroOpAssembler {
       u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
       u.firstOfInstr := first
+      u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
     }
     val bfmLoadLo = bfmLoadUop(bfmDispLo, T0, Size.LONG, first = True)   // misaligned LONG `lo`
@@ -3059,6 +3097,7 @@ object MicroOpAssembler {
       u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
       u.firstOfInstr := False
+      u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
     }
     // A bit-field memory op with a non-control EA -> illegal (vector 4). DYNAMIC read-only mem
@@ -3170,6 +3209,7 @@ object MicroOpAssembler {
       u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
       u.firstOfInstr := first
+      u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
     }
     val c2Load0 = c2LoadUop(c2Disp1, T0, first = True)       // lower @ [EA]
@@ -3216,6 +3256,7 @@ object MicroOpAssembler {
       u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
       u.firstOfInstr := False                                   // trailing (loads are first)
+      u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
     }
     // A CMP2/CHK2 with a non-control EA -> illegal (vector 4).
@@ -3277,6 +3318,7 @@ object MicroOpAssembler {
     // JMP is a single µop (its own first); JSR's ibranch is the TRAILING µop (the push
     // is first), so firstOfInstr is False for JSR.
     ibrUop.firstOfInstr  := !isJsrOp
+    ibrUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
 
     // A JMP/JSR with a non-control EA -> illegal (vector 4), like the `bad` path.
     when(jmpBad || jsrBad) {
@@ -3333,6 +3375,7 @@ object MicroOpAssembler {
       u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
       u.firstOfInstr := first
+      u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
     }
 
@@ -3579,6 +3622,7 @@ object MicroOpAssembler {
       u.predTaken := False; u.predTarget := U(0, 32 bits)
       u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
       u.firstOfInstr := leaFirst
+      u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
     }
     val leaAn   = (U(8, 5 bits) + op(11 downto 9).asUInt).resized
@@ -3849,6 +3893,26 @@ object MicroOpAssembler {
       out.count   := 1
       out.uops(0) := opUop
       out.uops(1) := opUop
+    }
+    // ── Macro-boundary LAST stamp (Stage 2 task 4, spec section 6.2's `macroLast`) ──
+    // `firstOfInstr` is decided per-builder because the builders themselves know which
+    // µop leads their crack. `lastOfInstr` is stamped HERE instead, from the crack tree
+    // directly above, because the crack tree IS the definition of "which µop is last":
+    // every arm assigns `out.uops(0 .. count-1)` as ONE macro's µops in program order,
+    // so the macro's last µop is exactly the one at index `count-1`.
+    //
+    // Doing it per-builder would have meant re-deriving that same fact as a boolean over
+    // the crack conditions -- and those conditions are NOT mutually exclusive, only
+    // PRIORITISED by this `when/elsewhen` chain. Example hazard: `opUop` is the middle
+    // µop of a `crackRmw` [load, op, store] (last=False) but the WHOLE macro on the
+    // higher-priority `bad` arm (count=1 -> last=True); a naive per-site `!crackRmw`
+    // would silently emit a macro with NO last µop whenever both hold, which a debug
+    // stop would then never be able to end on. (`firstOfInstr` carries that same latent
+    // shape today -- see `opHasLeadingLoad` -- which is exactly why this field does not
+    // copy the pattern.) Stamped last-wins, mirroring the predTaken/phtValid stamp below.
+    for (i <- 0 until 3) {
+      out.uops(i).lastOfInstr.allowOverride
+      out.uops(i).lastOfInstr := out.count === U(i + 1, 2 bits)
     }
     // ── Fetch-time prediction stamp (BTB + bimodal, slice 1) ────────────────────
     // Stamp EVERY µop of this instruction with the SOURCE PACKET's predTaken/predTarget

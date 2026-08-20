@@ -43,7 +43,8 @@ class RobPluginSpec extends AnyFunSuite {
       writesNzvc: Boolean = false, pNzvcDst: Int = 0, pNzvcOld: Int = 0,
       writesX: Boolean = false, pXDst: Int = 0, pXOld: Int = 0,
       isBranch: Boolean = false,
-      firstOfInstr: Boolean = false
+      firstOfInstr: Boolean = false,
+      lastOfInstr: Boolean = true
   ): Unit = {
     u.valid #= valid
     u.pc #= pc
@@ -67,6 +68,10 @@ class RobPluginSpec extends AnyFunSuite {
     u.sysOp #= false; u.sysKind #= m68k040.decode.SysKind.NONE; u.sysReadDir #= false
     u.needsSupervisor #= false   // Track C field (privViolation): inert, else garbage spuriously blocks retire
     u.firstOfInstr #= firstOfInstr   // macro boundary marker (Stage 2 task 3: real debugMacroCount consumer)
+    // Trailing macro-boundary marker (Stage 2 task 4: RobPayload.last -> h0IsMacroLast).
+    // Defaults True, matching DecodedUop.lastOfInstr's own "a single-µop macro is its own
+    // first AND last µop" default -- a test that does not care pokes single-µop macros.
+    u.lastOfInstr #= lastOfInstr
   }
 
   def initSimple(dut: SimpleDut, cd: ClockDomain): Unit = {
@@ -864,6 +869,7 @@ class RobPluginSpec extends AnyFunSuite {
     u.sswInstr #= false
     u.faultAddr #= 0
     u.firstOfInstr #= firstOfInstr
+    u.lastOfInstr #= true    // single-µop macros; keeps the gate DUT's pokes deterministic
   }
 
   def initGate(dut: GateDut, cd: ClockDomain): Unit = {
@@ -1455,6 +1461,131 @@ class RobPluginSpec extends AnyFunSuite {
       assert(dut.dsink.logic.macroCountOut.toBigInt == BigInt(2),
         s"debugMacroCount must be 2 after a genuine dual-first-uop retire, got ${dut.dsink.logic.macroCountOut.toBigInt}")
       assert(dut.rob.logic.count.toInt == 0, "ROB drained (test precondition sanity)")
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Stage 2 task 4: macro-boundary LAST detection (spec section 6.2's `macroLast`).
+  // `h0IsMacroLast` is a plain read of the alloc-time-captured `RobPayload.last`, so
+  // these tests pin the ALLOC->retire plumbing of that bit. The decode-side derivation
+  // of `lastOfInstr` itself (which µop of a real crack carries it) is covered by
+  // MovemDecodeSpec's own real-decode-path test.
+
+  /** Single-wide alloc of one uop with explicit first/last markers. Returns its robId. */
+  private def allocOneFL(dut: SimpleDut, cd: ClockDomain, pc: Long,
+                         first: Boolean, last: Boolean): Int = {
+    pokeRu(dut.rsrc.logic.src.payload(0), pc = pc, firstOfInstr = first, lastOfInstr = last)
+    dut.rsrc.logic.src.valid #= true
+    dut.rsrc.logic.u1v #= false
+    val id = dut.rob.logic.tail.toInt
+    cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+    dut.rsrc.logic.src.valid #= false
+    cd.waitSampling()
+    id
+  }
+
+  /** Complete `id`, wait for its (single-wide) retire pulse, and return h0IsMacroLast as
+    * sampled IN the retiring cycle -- the cycle Task 5's stop FSM will read it. */
+  private def retireAndSampleLast(dut: SimpleDut, cd: ClockDomain, id: Int): Boolean = {
+    markComplete(dut, id)
+    cd.waitSampling()
+    clearComplete(dut)
+    cd.waitSamplingWhere(dut.tsink.logic.fireOut(0).toBoolean)
+    val v = dut.rob.logic.h0IsMacroLast.toBoolean
+    cd.waitSampling()
+    v
+  }
+
+  test("h0IsMacroLast is True on the trailing uop of a cracked MOVEM, False on its leading uops") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      // A real An-base MOVEM (e.g. MOVEM.L (A1)+,D0/D1/A0) decodes to N transfer µops
+      // PLUS a trailing An-update µop -- so the macro's last µop is the An update, NOT
+      // the last DATA transfer. Markers: first = T,F,F,F ; last = F,F,F,T.
+      // (MovemDecodeSpec asserts this exact shape out of the real decode FSM.)
+      val ldA = allocOneFL(dut, cd, 0x300, first = true,  last = false)
+      assert(!retireAndSampleLast(dut, cd, ldA), "MOVEM transfer 0 is not the macro's last uop")
+      val ldB = allocOneFL(dut, cd, 0x300, first = false, last = false)
+      assert(!retireAndSampleLast(dut, cd, ldB), "MOVEM transfer 1 is not the macro's last uop")
+      val ldC = allocOneFL(dut, cd, 0x300, first = false, last = false)
+      assert(!retireAndSampleLast(dut, cd, ldC),
+        "the LAST DATA TRANSFER of a MOVEM is still not the macro's last uop -- the An update follows it")
+      val anU = allocOneFL(dut, cd, 0x300, first = false, last = true)
+      assert(retireAndSampleLast(dut, cd, anU),
+        "the trailing An-update uop IS the MOVEM macro's last uop")
+    }
+  }
+
+  test("h0IsMacroLast is True for every single-uop macro") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+      // A plain uncracked instruction (NOP-shaped): first AND last, per
+      // DecodedUop.lastOfInstr's documented default.
+      val id = allocOneFL(dut, cd, 0x400, first = true, last = true)
+      assert(retireAndSampleLast(dut, cd, id),
+        "a single-uop macro is its own first AND last uop")
+    }
+  }
+
+  test("h0IsMacroLast is False on OP mid-crack even when STORE has not yet been allocated") {
+    // THE regression test for the derivation that had to be retracted: an earlier
+    // attempt derived h0IsMacroLast as `(count <= 1) || p1.first`. That reads TRUE for
+    // the scenario built below -- a 3-uop memory-destination RMW crack ([load, op,
+    // store]) whose LOAD retires before the STORE is even allocated, leaving the ROB at
+    // count==1 with the MIDDLE op uop at the head. Recovering a debug stop there would
+    // silently drop the RMW's memory write. Reachable for real: MicroOpQueue pops at
+    // most 2 uops/cycle and DispatchPlugin gates 2-wide dispatch on ROB/IQ backpressure.
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      // 1. LOAD (first=True,last=False) + OP (first=False,last=False) in ONE 2-wide
+      //    dispatch cycle. The STORE is deliberately NOT allocated yet.
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x500, firstOfInstr = true,  lastOfInstr = false)
+      pokeRu(dut.rsrc.logic.src.payload(1), pc = 0x500, firstOfInstr = false, lastOfInstr = false)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= true
+      val ldId = dut.rob.logic.tail.toInt
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      dut.rsrc.logic.u1v #= false
+      cd.waitSampling()
+      val opId = (ldId + 1) % 64
+      assert(dut.rob.logic.count.toInt == 2, s"precondition: 2 entries allocated, got ${dut.rob.logic.count.toInt}")
+
+      // 2. Complete + retire the LOAD ALONE (the OP is never completed, so retire1
+      //    cannot fire and the pair cannot retire 2-wide).
+      markComplete(dut, ldId)
+      cd.waitSampling()
+      clearComplete(dut)
+      cd.waitSamplingWhere(dut.tsink.logic.fireOut(0).toBoolean)
+      assert(!dut.tsink.logic.fireOut(1).toBoolean, "precondition: LOAD retires ALONE (single-wide)")
+      assert(!dut.rob.logic.h0IsMacroLast.toBoolean, "the LOAD is not the macro's last uop either")
+      cd.waitSampling()
+
+      // 3. THE counterexample state: ROB holds exactly ONE entry, and it is the MIDDLE
+      //    op uop of a still-incomplete macro. Nothing younger exists to look at.
+      assert(dut.rob.logic.count.toInt == 1,
+        s"precondition: ROB must be at count==1 with the OP at the head, got ${dut.rob.logic.count.toInt}")
+      assert(dut.rob.logic.head.toInt == opId, "precondition: the OP is the head entry")
+      assert(!dut.rob.logic.h0IsMacroLast.toBoolean,
+        "h0IsMacroLast must be FALSE for a MIDDLE crack uop at count==1 -- the retracted " +
+        "(count<=1)||p1.first derivation read True here and would have released a debug " +
+        "stop before the RMW's STORE ever executed")
+
+      // 4. Now allocate the STORE (first=False,last=True) -- the macro's real last uop --
+      //    and confirm the head STILL does not claim the boundary while the OP is there.
+      val stId = allocOneFL(dut, cd, 0x500, first = false, last = true)
+      assert(stId == (opId + 1) % 64, "precondition: STORE allocated directly behind the OP")
+      assert(!dut.rob.logic.h0IsMacroLast.toBoolean,
+        "the OP at the head is still not the macro's last uop once the STORE is allocated")
+
+      // 5. Retire the OP, then the STORE; only the STORE's retiring cycle is a boundary.
+      assert(!retireAndSampleLast(dut, cd, opId), "the OP's own retiring cycle is not a macro boundary")
+      assert(retireAndSampleLast(dut, cd, stId), "the STORE IS the RMW macro's last uop")
     }
   }
 }

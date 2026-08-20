@@ -34,7 +34,8 @@ class MovemDecodeSpec extends AnyFunSuite {
 
   /** One collected µop (the fields under test). */
   case class U(op: String, mem: String, dst: Int, dstV: Boolean, srcB: Int, srcBV: Boolean,
-               base: Int, baseV: Boolean, imm: Long, sizeL: Boolean, isMovea: Boolean, first: Boolean)
+               base: Int, baseV: Boolean, imm: Long, sizeL: Boolean, isMovea: Boolean, first: Boolean,
+               last: Boolean)
 
   /** Drive `words` at `base`, redirect, and collect up to `n` emitted µops. */
   def collect(words: Seq[Int], base: Long, n: Int): Seq[U] = {
@@ -56,7 +57,8 @@ class MovemDecodeSpec extends AnyFunSuite {
             val p = dut.sink.logic.uopsOut.payload(i)
             U(p.op.toEnum.toString, p.memOp.toEnum.toString, p.dstReg.toInt, p.dstValid.toBoolean,
               p.srcBReg.toInt, p.srcBValid.toBoolean, p.srcAReg.toInt, p.srcAValid.toBoolean,
-              p.imm.toLong & 0xffffffffL, p.size.toEnum == Size.LONG, p.isMovea.toBoolean, p.firstOfInstr.toBoolean)
+              p.imm.toLong & 0xffffffffL, p.size.toEnum == Size.LONG, p.isMovea.toBoolean, p.firstOfInstr.toBoolean,
+              p.lastOfInstr.toBoolean)
           }
           acc += rd(0)
           if (dut.sink.logic.u1v.toBoolean) acc += rd(1)
@@ -209,6 +211,52 @@ class MovemDecodeSpec extends AnyFunSuite {
     assert(us.length == 1, s"$us")
     assert(us(0).op == "MOVE" && us(0).mem == "NONE" && us(0).dst == 0 && us(0).imm == 5,
       s"expected the trailing MOVEQ to decode after the empty MOVEM: $us")
+  }
+
+  // ── Stage 2 task 4: `lastOfInstr` (spec section 6.2's `macroLast`) off the REAL FSM ──
+  // The interesting property, and the one a "last = !first" shortcut gets wrong: for every
+  // An-base MOVEM form the macro's last µop is the TRAILING An-update µop, not the last
+  // data transfer -- so a MOVEM has middle µops that are neither first nor last.
+  test("MOVEM lastOfInstr marks the trailing An-update uop, not the last transfer", VerilatorTest) {
+    val base = 0x9700L
+    // MOVEM.L (A1)+,D0/D1/A0 -> 3 LOADs (2 in one cycle + an odd tail) + the An update.
+    val us = collect(Seq(movem(1, 1, 3, 1), 0x0103, 0x4e71, 0x4e71), base, 4)
+    assert(us.length == 4, s"expected 3 loads + 1 An update, got ${us.length}: $us")
+    assert(us.take(3).forall(u => u.mem == "LOAD" && !u.last),
+      s"no transfer uop may claim lastOfInstr while a trailing An update follows: $us")
+    assert(us(3).op == "ADD" && us(3).mem == "NONE" && us(3).last,
+      s"the trailing An-update uop IS the macro's last uop: $us")
+    // ...and the macro's MIDDLE uops are neither first nor last (the exact shape a
+    // mechanical `last = !first` would have gotten wrong).
+    assert(us(1).first == false && us(1).last == false, s"uop 1 must be neither first nor last: $us")
+    assert(us(2).first == false && us(2).last == false, s"uop 2 must be neither first nor last: $us")
+  }
+
+  test("MOVEM lastOfInstr: PC-relative form (no An update) marks the final transfer", VerilatorTest) {
+    // (d16,PC) has NO An base -> movemHasFinal is False -> no trailing An-update uop, so
+    // the LAST TRANSFER carries lastOfInstr. Two sub-cases, because the FSM emits up to
+    // TWO transfers per cycle and the marker must land on the right one of the pair.
+    // (a) 2 registers -> ONE emission cycle of 2 moves: the SECOND of the pair is last.
+    val pair = collect(Seq(movem(1, 1, 7, 2), 0x0003, 0x0020, 0x4e71), 0x9780L, 2)
+    assert(pair.length == 2, s"$pair")
+    assert(pair(0).first && !pair(0).last, s"pair uop0 is first, not last: $pair")
+    assert(!pair(1).first && pair(1).last, s"pair uop1 (2nd of the emitted pair) is last: $pair")
+    // (b) 3 registers -> a pair then an ODD TAIL cycle of 1 move: the tail is last, and
+    //     the 2nd of the leading pair must NOT be (its cycle does not drain the mask).
+    val odd = collect(Seq(movem(1, 1, 7, 2), 0x0103, 0x0020, 0x4e71), 0x97c0L, 3)
+    assert(odd.length == 3, s"$odd")
+    assert(!odd(0).last && !odd(1).last, s"neither of the leading pair may be last: $odd")
+    assert(odd(2).last, s"the odd-tail transfer is the macro's last uop: $odd")
+  }
+
+  test("MOVEM lastOfInstr: the base-snapshot uop is never the macro's last uop", VerilatorTest) {
+    // Control-mode (An) with the base An itself addressable -> a leading snapshot uop
+    // (firstOfInstr) precedes every transfer, and the trailing An+=0 is still last.
+    val us = collect(Seq(movem(0, 1, 2, 1), 0x0103, 0x4e71, 0x4e71), 0x9800L, 5)
+    assert(us.length == 5, s"expected snapshot + 3 stores + An update, got ${us.length}: $us")
+    assert(us(0).first && !us(0).last, s"the snapshot uop is first, never last: $us")
+    assert(us.slice(1, 4).forall(!_.last), s"no store may claim lastOfInstr: $us")
+    assert(us(4).op == "ADD" && us(4).last, s"the trailing An update is last: $us")
   }
 
   test("MOVEM then a following MOVEQ -> front-end resumes (the held fed releases cleanly)", VerilatorTest) {

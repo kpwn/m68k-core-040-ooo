@@ -420,6 +420,19 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
     // last µop when a final exists, so it is always dropped alongside the first when
     // movemHasFinal.
     val movemFirst0 = (movemEmitted === 0) && !movemHadSnap
+    // ── Macro-boundary LAST markers (Stage 2 task 4, spec section 6.2's `macroLast`) ──
+    // A MOVEM move µop is the macro's LAST µop only when NO trailing An-update µop
+    // follows it (`!movemHasFinal` -- the abs/PC-base forms; every An-base form ends on
+    // `movemAnUop`, which carries lastOfInstr=True unconditionally) AND this emission
+    // cycle drains the mask. `movemRemainingAfter` is the SAME expression the FSM's own
+    // transition block uses to decide it is done (`remaining === 0` there), kept here as
+    // the single shared definition so the two can never disagree. Within a draining
+    // cycle, uop0 is last only when it is the ODD TAIL (a single move this cycle,
+    // `!movemHas1`); when two moves are emitted, uop1 is the last one.
+    val movemRemainingAfter = Mux(movemHas1, movemMask2.asUInt, movemMask1)
+    val movemMoveIsLast     = !movemHasFinal && (movemRemainingAfter === 0)
+    val movemLast0          = movemMoveIsLast && !movemHas1
+    val movemLast1          = movemMoveIsLast
     // FUZZER-CAUGHT (B6): a POSTINC MOVEM *LOAD* whose target register IS the base An
     // must DISCARD the loaded value — Musashi (movem, er, pi) loads REG_DA[i] in the
     // loop and then overwrites An with `AY = ea` (the post-incremented address) AFTER
@@ -434,12 +447,12 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
           U(MicroOpAssembler.T0, 5 bits), reg)
     val movemUop0 = MicroOpAssembler.movemMoveUop(
       reg = movemLoadDst(movemReg0), base = movemBaseReg, baseValid = movemBaseValid, disp = movemImm0,
-      sizeLong = movemSizeLong, isLoad = movemIsLoad, first = movemFirst0, drop = movemHasFinal,
+      sizeLong = movemSizeLong, isLoad = movemIsLoad, first = movemFirst0, last = movemLast0, drop = movemHasFinal,
       valid = True, pc = movemPc, nextPc = movemNextPc,
       idxReg = movemIdxReg, idxValid = movemIdxValid, idxLong = movemIdxLong, idxScale = movemIdxScale)
     val movemUop1 = MicroOpAssembler.movemMoveUop(
       reg = movemLoadDst(movemReg1), base = movemBaseReg, baseValid = movemBaseValid, disp = movemImm1,
-      sizeLong = movemSizeLong, isLoad = movemIsLoad, first = False, drop = movemHasFinal,
+      sizeLong = movemSizeLong, isLoad = movemIsLoad, first = False, last = movemLast1, drop = movemHasFinal,
       valid = True, pc = movemPc, nextPc = movemNextPc,
       idxReg = movemIdxReg, idxValid = movemIdxValid, idxLong = movemIdxLong, idxScale = movemIdxScale)
     // The final An update (kept macro commit): An := An + emitted*step for (An)+/-(An)
@@ -987,6 +1000,13 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
         }
       }
     }
+    // ── Macro-boundary LAST stamp (Stage 2 task 4, spec section 6.2's `macroLast`) ──
+    // Every MOVEP builder leaves `lastOfInstr` at its inert False default; the real value
+    // is stamped ONCE here from `movepLast`, the FSM's OWN per-step terminal marker (the
+    // same signal that ends the sequence). Deriving it per-builder instead would have
+    // duplicated `movepLast`'s 4-variant step table and could silently drift from it.
+    movepUop.lastOfInstr.allowOverride
+    movepUop.lastOfInstr := movepLast
 
     // ── FMOVEM.X data-register-list FSM (task #241/#246) ─────────────────────────
     // The SECOND instantiation of the RegListWalk shared skeleton (RegListWalk.scala) --
@@ -1051,7 +1071,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService {
       base = fmovemxBaseReg, baseValid = True, disp = fmovemxLoadDisp, dstTemp = fmovemxLoadTemp,
       first = fmovemxFirstUop, valid = True, pc = fmovemxPc, nextPc = fmovemxNextPc)
     val fmovemxIssueUopV = MicroOpAssembler.fmovemxIssueUop(
-      fpDst = fmovemxCurReg, drop = !fmovemxIsLastElem, first = False, valid = True,
+      fpDst = fmovemxCurReg, drop = !fmovemxIsLastElem, first = False, last = fmovemxIsLastElem, valid = True,
       pc = fmovemxPc, nextPc = fmovemxNextPc)
     val fmovemxCurUop = Mux(fmovemxPhase === U(3, 2 bits), fmovemxIssueUopV, fmovemxLoadUop)
 

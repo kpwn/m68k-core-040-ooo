@@ -591,6 +591,22 @@ case class DecodedUop() extends Bundle {
   // only when the ROB head is a first µop (never mid-cracked-instruction). Default
   // True (every single-µop instruction is its own first µop).
   val firstOfInstr = Bool()
+  // Macro-instruction boundary marker: True for the LAST µop of an instruction.
+  // The mirror image of `firstOfInstr`, and NOT simply `!firstOfInstr`: a 3+-µop
+  // crack has MIDDLE µops that are neither first nor last (e.g. a memory-destination
+  // RMW cracks to [load, op, store] — the op µop is first=False AND last=False).
+  //
+  // Consumed by the debug halt/resume/step machinery (`RobPayload.last` ->
+  // `RobPlugin`'s `h0IsMacroLast`, spec section 6.2's `macroLast`): a debug stop may
+  // only be taken at a macro boundary, so the ROB must know, per retiring entry,
+  // whether the macro is complete. It CANNOT be inferred from ring occupancy plus
+  // the next entry's `first` — `MicroOpQueue` pops at most 2 µops/cycle and
+  // `DispatchPlugin` gates 2-wide dispatch on ROB/IQ backpressure, so a 3-µop crack
+  // can reach ROB `count==1` with a MIDDLE µop at the head before its real last µop
+  // has even been allocated. Hence a real, decode-time-captured field.
+  //
+  // Default True (every single-µop instruction is its own first AND last µop).
+  val lastOfInstr = Bool()
   // ── Brief-format indexed EA (the AGU index term) ────────────────────────────
   // For a mem µop whose address is an indexed EA, the index register rides srcCReg/
   // srcCValid (psrcC after rename), and these two fields tell the LS-EU AGU how to

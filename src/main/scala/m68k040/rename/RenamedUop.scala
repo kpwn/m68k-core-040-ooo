@@ -112,6 +112,12 @@ case class RenamedUop() extends Bundle {
   // Macro-instruction boundary marker (interrupts): True for the FIRST µop of an
   // instruction (the only multi-µop case is a memSimple-source crack [load, op]).
   val firstOfInstr = Bool()
+  // Macro-instruction boundary marker (debug halt/resume/step, spec section 6.2's
+  // `macroLast`): True for the LAST µop of an instruction. NOT `!firstOfInstr` — a
+  // 3+-µop crack (e.g. mem-dest RMW [load, op, store]) has middle µops that are
+  // neither. Threaded verbatim from `DecodedUop.lastOfInstr` (see its doc for why
+  // this must be a real field rather than a ROB-side ring-occupancy derivation).
+  val lastOfInstr = Bool()
   // Brief-format indexed EA: the index reg rides psrcC/psrcCValid; these size+scale it
   // in the LS-EU AGU (indexLong => full 32 vs .W sign-extend; indexScale = *1/2/4/8).
   val indexLong  = Bool()
