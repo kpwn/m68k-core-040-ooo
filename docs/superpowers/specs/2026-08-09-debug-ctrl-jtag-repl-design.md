@@ -229,7 +229,7 @@ range absent only by returning zero and clearing the corresponding feature bit.
 | `0x200`-`0x214` | D-cache probe, D-cache op, I-cache op |
 | `0x1000`-`0x1018` | cycle, macro-retire, and truthful sourced counters |
 | `0x2000`-`0x2084` | architectural write shadows and apply/status |
-| `0x2100`-`0x2180` | live VBR/SR/SP banks/D/A/MMU state |
+| `0x2100`-`0x2194` | live VBR/SR/SP banks/D/A/MMU/system state |
 | `0x3000`-`0x3040` | optional implementation diagnostics/snapshots |
 | `0x10000` / `0x11000` | optional PC trace body / head |
 | `0x12000` / `0x13000` | optional exception ring / head |
@@ -566,9 +566,17 @@ Readback includes the deployed set:
 
 - D0-D7, A0-A7;
 - SR (system byte plus committed X/NZVC), PC, VBR;
-- USP, ISP, MSP/SSP compatibility view and active A7;
+- USP, ISP, MSP through the frozen `*_SSP` compatibility offsets, and active A7;
 - CACR, SFC, DFC;
-- TC, ITT0/1, DTT0/1, URP, SRP and MMUSR when their deployed/new offsets are defined.
+- TC, ITT0/1, DTT0/1, URP, SRP and MMUSR. The append-only live registers at
+  `0x2184`-`0x2194` complete the dump with CACR, SFC, DFC, a canonical PC alias,
+  and MMUSR; `OFF_PC` remains the compatible primary next-PC readback.
+
+This core implements the 68040 three-bank stack model. The deployed register names
+`OFF_ARCH_SSP` and `OFF_LIVE_SSP` are therefore retained at their frozen offsets but
+mean the master supervisor stack bank (MSP); `*_ISP` names the interrupt supervisor
+stack bank. They are never aliases of one storage element. A7 remains the active
+USP/ISP/MSP value selected by committed `(S,M)`.
 
 General-register live reads are valid only at effective halt. Existing Tcl/GDB already
 enforces this. Raw reads while running are outside the validity contract and must not

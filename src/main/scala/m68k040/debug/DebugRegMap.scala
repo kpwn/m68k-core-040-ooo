@@ -164,6 +164,11 @@ object DebugRegMap {
   val OFF_LIVE_MMU_URP: Int = 0x02178
   val OFF_LIVE_SSP: Int = 0x0217C
   val OFF_LIVE_ISP: Int = 0x02180
+  val OFF_LIVE_CACR: Int = 0x02184
+  val OFF_LIVE_SFC: Int = 0x02188
+  val OFF_LIVE_DFC: Int = 0x0218C
+  val OFF_LIVE_PC: Int = 0x02190
+  val OFF_LIVE_MMUSR: Int = 0x02194
   val OFF_WEDGE0: Int = 0x03000
   val OFF_WEDGE1: Int = 0x03004
   val OFF_WEDGE2: Int = 0x03008
@@ -333,6 +338,11 @@ object DebugRegMap {
     ("OFF_LIVE_MMU_URP", 0x02178),
     ("OFF_LIVE_SSP", 0x0217C),
     ("OFF_LIVE_ISP", 0x02180),
+    ("OFF_LIVE_CACR", 0x02184),
+    ("OFF_LIVE_SFC", 0x02188),
+    ("OFF_LIVE_DFC", 0x0218C),
+    ("OFF_LIVE_PC", 0x02190),
+    ("OFF_LIVE_MMUSR", 0x02194),
     ("OFF_WEDGE0", 0x03000),
     ("OFF_WEDGE1", 0x03004),
     ("OFF_WEDGE2", 0x03008),

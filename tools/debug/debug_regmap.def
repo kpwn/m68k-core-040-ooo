@@ -124,7 +124,7 @@ REG OFF_EXC_COUNT         0x01018 RO    7 0x00000000 Exceptions taken; zero unti
 BLK OFF_ARCH_D            0x02000 8 0x04 RW 3 Architectural shadow D0-D7.
 BLK OFF_ARCH_A            0x02020 8 0x04 RW 3 Architectural shadow A0-A7.
 REG OFF_ARCH_USP          0x02040 RW    3 0x00000000 Architectural shadow USP.
-REG OFF_ARCH_SSP          0x02044 RW    3 0x00000000 Architectural shadow SSP (compatibility view).
+REG OFF_ARCH_SSP          0x02044 RW    3 0x00000000 Architectural shadow MSP (legacy SSP compatibility name).
 REG OFF_ARCH_ISP          0x02048 RW    3 0x00000000 Architectural shadow ISP.
 REG OFF_ARCH_SR           0x0204C RW    3 0x00000000 Architectural shadow SR.
 REG OFF_ARCH_VBR          0x02050 RW    3 0x00000000 Architectural shadow VBR.
@@ -159,8 +159,13 @@ REG OFF_LIVE_MMU_ITT0     0x0216C RO    3 0x00000000 Live committed ITT0.
 REG OFF_LIVE_MMU_ITT1     0x02170 RO    3 0x00000000 Live committed ITT1.
 REG OFF_LIVE_MMU_SRP      0x02174 RO    3 0x00000000 Live committed SRP.
 REG OFF_LIVE_MMU_URP      0x02178 RO    3 0x00000000 Live committed URP.
-REG OFF_LIVE_SSP          0x0217C RO    3 0x00000000 Live committed SSP.
+REG OFF_LIVE_SSP          0x0217C RO    3 0x00000000 Live committed MSP (legacy SSP compatibility name).
 REG OFF_LIVE_ISP          0x02180 RO    3 0x00000000 Live committed ISP.
+REG OFF_LIVE_CACR         0x02184 RO    3 0x00000000 Live committed CACR.
+REG OFF_LIVE_SFC          0x02188 RO    3 0x00000000 Live committed SFC, zero-extended from 3 bits.
+REG OFF_LIVE_DFC          0x0218C RO    3 0x00000000 Live committed DFC, zero-extended from 3 bits.
+REG OFF_LIVE_PC           0x02190 RO    3 0x00000000 Live committed next PC; canonical dump alias of OFF_PC.
+REG OFF_LIVE_MMUSR        0x02194 RO    3 0x00000000 Live committed MMUSR (read-only architectural state).
 
 # ------------------------------------- optional implementation diagnostics --
 REG OFF_WEDGE0            0x03000 RO    9 0x00000000 Legacy wedge snapshot 0; reserved, not implemented.
