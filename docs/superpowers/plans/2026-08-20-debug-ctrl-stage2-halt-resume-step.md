@@ -19,7 +19,7 @@
 - **Macro-boundary detection reuses `RobPayload.first`, no new per-uop field.** Confirmed by direct grep (2026-08-20): `firstOfInstr` is set at ~20 independent call sites across `MicroOpAssembler.scala`; `MicroOp.scala:12`'s `lastUop` field exists but is dead (zero consumers) and threading an equally-independent "last" bit through the same ~20 sites would be large and error-prone for no benefit — the retiring entry's own `RobPayload.first` (macroFirst) plus the NEXT entry's `RobPayload.first` (already read every cycle as `p1`, `RobPlugin.scala:594`) together give the exact spec-required "explicit macroFirst and macroLast **or an equivalent boundary event from the ROB**" (spec §6.2) with no new decode-side plumbing. Task 4 makes this precise.
 - **Effective halt does NOT require the store queue or D-cache to be idle** (spec §6.3, verbatim: "Effective halt deliberately does not require the store queue or D-cache to be idle... If a bus is wedged, requiring global memory quiescence here would make the debugger unable to stop at the exact moment it is needed most"). Do not gate the halt FSM's `HALTED` transition on any SQ/D-cache busy signal. `DebugMemoryQuiesceService` (a SEPARATE, later concern for cache-maintenance/arch-apply launch) is explicitly OUT of scope for this plan — Stage 2 has no cache-maintenance or arch-apply command to gate.
 - **Fatal halt (`coreHalted`) is non-resumable and takes priority over debug halt** (spec §6.3, §13: "a resume request cannot release a fatal halt"). Every task touching resume must preserve this.
-- **`ExecuteLockStepSpec` baseline is 390/394** (4 known pre-existing failures: `STOP #imm -> halt -> IRQ -> handler -> RTE -> resume`, 3 ITLB tests) — verify against this exact baseline, not a fresh count, at every task's gate. Re-read the CURRENT actual failing-test names before the first task (they may have drifted since this plan was written) rather than trusting this list blindly.
+- **`ExecuteLockStepSpec` baseline is 399/400** (1 known pre-existing failure: `CMP2.W (d8,An,Xn) indexed bounds pointer` (task #257, already tracked) -- CORRECTED 2026-08-20 during Task 1 execution, the STOP/ITLB-failures baseline this plan originally cited was stale project-memory, not the actual current HEAD baseline) — verify against this exact baseline, not a fresh count, at every task's gate. Re-read the CURRENT actual failing-test names before the first task (they may have drifted since this plan was written) rather than trusting this list blindly.
 - **`sbt "testOnly X -- -z name"` as separate shell tokens SILENTLY DROPS the `-z` filter** in this environment and runs the entire suite. Use the single quoted form: `sbt "testOnly X -- -z name"`. (Standing warning from the Stage 0/1 plan's own ledger, repeated here since every task's verification step needs it.)
 - **The real, hardware-motivating context for this plan**: this session found that `tools/jtag_repl.tcl`'s `halt-status`/`pc`/`sweep`/`arch` commands all read back zero/uninformative against a real CPU=m68k040 bitstream — not because the CPU is hung, but because none of this RTL exists yet (Stage 1 only implements version/build/features/control/status/reset-count). A concurrently-running boot_fsm ROM-mirror fix (commit `d3b21e3`, macqd700-soc worktree) is independently verified correct via direct AXI memory readback; whether the CPU is actually executing that code cannot currently be told apart from a genuine hang. This plan's Task 14 gate should be followed by a real hardware re-test once merged (tracked separately, not a task in this plan — this plan's scope is the RTL and its Scala-level verification only, not a new bitstream build/flash cycle).
 - **Mandatory full-core OOC synth gate at the end (project standing rule, `[[synth-gate-every-slice]]`)**: report absolute LUT/FF/DSP/BRAM utilization and FMax for both `enable=true` and `enable=false` builds. **User directive (2026-08-20): the `enable=true` build's FMax hit is EXPLICITLY ACCEPTED, even beyond spec §11's provisional +2% ceiling** — the stated plan is that this halt/resume/step logic will eventually sit on a hot retire-path signal, production ships `enable=false` for full clock speed, and a JTAG-enabled debug bitstream running at roughly half clock speed is an accepted tradeoff, not a gate failure. **Concrete numeric targets (user, same message): `enable=true` (JTAG bitstream) targets ~100MHz; `enable=false` (production, no JTAG) targets ~200MHz** — these are the real product-level numbers this session's own real-hardware bitstream work already runs at 100MHz (`CORE_CLK_HZ=100_000_000` in the macqd700-soc build), so an `enable=true` post-route result comfortably above 100MHz is a PASS regardless of how far below the `enable=false` build's own number it lands; the `enable=false` build is judged against the actual current FMax-campaign reference (~200MHz class, re-read at execution time per this file's own standing rule below), not against the `enable=true` number. **This does NOT relax the `enable=false` build's gate**, which must still show zero-to-negligible cost against the pre-Stage-2 reference (it carries none of this task's new logic — see Task 1's `if(enable)` gating) — that build is production's actual target and spec §11's numbers still apply to it. Task 14 therefore gates on: (a) `enable=false` meets the strict spec §11 numbers against the ~200MHz-class reference, (b) `enable=true` clears ~100MHz post-route with real margin (not a knife-edge pass), and its WNS regression relative to `enable=false`, however large, traces cleanly to the NEW debug halt/resume/step logic itself (report the worst path and confirm it's plausibly this feature, not an unrelated regression riding along), and (c) still flag if the `enable=true` worst path is literally "a debug comparator, CSR read mux, or high-fanout debug enable" per spec §11's specific named failure mode, since THAT diagnosis (as opposed to the raw number) is what tells us whether a later pipelining pass could recover most of the loss cheaply — worth knowing even though it's no longer a hard blocker. The FMax reference is re-read at execution time from the most recent recorded post-route number on this branch, never hardcoded — Task 14 re-reads it.
@@ -116,7 +116,7 @@ test("enable=false: AXI READY never asserts, cold-reset outputs stay low, RAM wi
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 390/394, unchanged
+~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400, unchanged
 ~/sbt/bin/sbt "runMain m68k040.top.GenFullCoreSynth"
 ~/sbt/bin/sbt "runMain m68k040.top.GenFullCoreSynthNoDebugVerilog"
 make lint-fpga-top CPU=m68k040   # from the macqd700-soc worktree, if reachable; note if not and defer
@@ -252,7 +252,7 @@ test("DebugCommitService resolves and every field is inert (False/0) with no deb
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 390/394, unchanged
+~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400, unchanged
 ```
 
 - [ ] **Step 6: Commit**
@@ -345,7 +345,7 @@ test("debugLastPc tracks the most recently retired entry's PC, single- and dual-
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 390/394, unchanged
+~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400, unchanged
 ```
 
 - [ ] **Step 6: Commit**
@@ -426,7 +426,7 @@ test("h0IsMacroLast is True when h0 is the newest allocated entry and nothing fo
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 390/394, unchanged (h0IsMacroLast is unused by anything yet)
+~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400, unchanged (h0IsMacroLast is unused by anything yet)
 ```
 
 - [ ] **Step 5: Commit**
@@ -579,7 +579,7 @@ test("repeated halt/continue (10 cycles) leaves the ROB in a consistent state ea
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 390/394 -- debugStopRequestIn defaults False so this task is a behavioral no-op for every existing test
+~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400 -- debugStopRequestIn defaults False so this task is a behavioral no-op for every existing test
 ```
 
 - [ ] **Step 8: Commit**
@@ -699,7 +699,7 @@ test("writing OFF_CONTROL bit 0 = 1 through dbg_axi halts the full core at the n
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 390/394
+~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400
 ```
 
 - [ ] **Step 8: Commit**
@@ -812,7 +812,7 @@ test("halt-after target write while a comparison is in flight does not fire agai
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
 ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 390/394
+~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400
 ```
 
 - [ ] **Step 7: Commit**
@@ -911,7 +911,7 @@ test("single-step never dual-retires across the step boundary even when h1 could
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
 ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 390/394
+~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400
 ```
 
 - [ ] **Step 6: Commit**
@@ -1020,7 +1020,7 @@ test("OFF_HALT_CTL bit 2 clears the sticky reason back to NONE without disturbin
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
 ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 390/394
+~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400
 ```
 
 - [ ] **Step 9: Commit**
@@ -1103,7 +1103,7 @@ This task changes REAL behavior (`_frontendQuiesceActive`'s new OR term), unlike
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 390/394 -- debugHaltState stays RUNNING for every existing test (debugStopRequestIn/debugStepRequestIn both default False), so this extension is a no-op in practice, but VERIFY, don't assume
+~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400 -- debugHaltState stays RUNNING for every existing test (debugStopRequestIn/debugStepRequestIn both default False), so this extension is a no-op in practice, but VERIFY, don't assume
 # Full ported corpus, isolated worktree, per project standing verification methodology:
 git worktree add /tmp/debug-stage2-task11-after HEAD
 cd /tmp/debug-stage2-task11-after && ~/sbt/bin/sbt "testOnly m68k040.PortedTestRunner"   # or whatever the actual full-corpus runner target is named -- confirm the exact sbt target before running
@@ -1148,7 +1148,7 @@ test("stage=2: OFF_FEATURES advertises bits 22 (macro_retire_count) and 23 (stop
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 390/394
+~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400
 ~/sbt/bin/sbt "runMain m68k040.top.GenFullCoreSynth"
 make lint-fpga-top CPU=m68k040   # from the macqd700-soc worktree if reachable
 ```
