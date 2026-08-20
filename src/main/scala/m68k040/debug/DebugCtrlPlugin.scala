@@ -42,10 +42,20 @@ import spinal.lib.misc.plugin.FiberPlugin
   * @param porCycles Length of the debug power-on reset in core clocks.
   * @param stage     Implementation stage this build has actually reached. Drives
   *                  `OFF_FEATURES` through `DebugRegMap.featuresForStage`, which is the
-  *                  executable form of spec section 3.4's honesty rule. */
-class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
-                      val porCycles: Int    = DebugRegMap.POR_CYCLES_DEFAULT,
-                      val stage:     Int    = 1) extends FiberPlugin {
+  *                  executable form of spec section 3.4's honesty rule.
+  * @param enable    When false, every socket port this plugin declares (`dbg_axi`,
+  *                  `cpu_cold_reset_pulse`, `cpu_cold_reset_hold`, `cpu_ram_window_lg2`,
+  *                  `cpu_mon_sense`) stays present with its exact name and width -- the
+  *                  socket contract never moves -- but is tied to a dead-idle value (AXI
+  *                  READY held low forever, `bresp`/`rresp` OKAY on the rare accepted
+  *                  default path, cold-reset outputs low, RAM window/mon-sense their POR
+  *                  constants) and zero debug logic is instantiated. Mirrors
+  *                  `VioProbePlugin`'s `enable` pattern exactly (spec
+  *                  `2026-08-18-vio-jtag-debug-design.md` V4). */
+class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
+                      val porCycles: Int     = DebugRegMap.POR_CYCLES_DEFAULT,
+                      val stage:     Int     = 1,
+                      val enable:    Boolean = true) extends FiberPlugin {
   require(porCycles >= 1, s"DebugCtrlPlugin: porCycles must be >= 1 (got $porCycles)")
   require(stage >= 1, s"DebugCtrlPlugin: stage must be >= 1 (got $stage)")
   require(buildId >= 0 && buildId < (BigInt(1) << DebugRegMap.DBG_DW),
@@ -76,6 +86,11 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
     // synthesises to a Xilinx INIT attribute and simulates from the declaration
     // initializer. debug_reset_ctl.v: "a domain whose purpose is to have no external
     // reset cannot take one."
+    // Deliberately UNCONDITIONAL (unlike `CsrArea` below): a tiny (~POR-counter-width)
+    // fixed cost kept regardless of `enable` so `porChecks`' required assertion (spec
+    // section 13) stays meaningful and `dbgCd`/`porCd` stay in scope for `CsrArea`'s own
+    // type definition below -- the real area this plugin is gated for is `CsrArea`'s
+    // ~20-register AXI-FSM/CSR set, not this handful of POR-domain flops.
     val porCd = ClockDomain(clock  = coreCd.clock,
                             config = coreCd.config.copy(resetKind = BOOT))
     porCd.setSynchronousWith(coreCd)
@@ -99,7 +114,17 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
                                                         resetActiveLevel = HIGH))
     dbgCd.setSynchronousWith(coreCd)
 
-    val csr = dbgCd on new Area {
+    // A NAMED (not anonymous) local class, so its type stays visible OUTSIDE the
+    // `enable` gate below: Stage-1 whitebox tests (`DebugCtrlCsrSpec`, `DebugCtrlResetSpec`,
+    // `DebugCtrlSocketSpec`) reach into `dut.dbg.logic.csr.<field>` directly, and Scala
+    // does not promote a val's type out of a nested `if` block's local scope (the same
+    // constraint `VioProbePlugin`'s own comment documents for its port-facing signals,
+    // discovered here to also bite whitebox-only internals reached from OTHER spec files,
+    // not just this plugin's own socket ports). `csr: CsrArea` stays a real, stably-typed
+    // field of `logic` whether `enable` is true (real object, real hardware: the AXI FSM
+    // and every CSR register) or false (null -- zero hardware, this class is never
+    // instantiated, so none of its `Reg()` calls ever run).
+    class CsrArea extends Area {
       // ── AXI4-Lite slave FSM ───────────────────────────────────────────────────────
       // AW and W are captured INDEPENDENTLY into their own skid registers and the write
       // is applied only once both have arrived (spec 3.1). At most one outstanding read
@@ -422,6 +447,39 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
       monSense       := mon
     }
 
+    // A stably-typed handle that is either a real, fully-elaborated `CsrArea`
+    // (enable=true) or `null` (enable=false, nothing built -- none of `CsrArea`'s
+    // `Reg()` calls ever run). MUST stay `dbgCd on new CsrArea` as a single expression
+    // assigned directly to this `val` (matching the exact call-site shape `porChecks`/
+    // `por` below use): review finding -- an earlier version of this line instead
+    // declared `CsrArea` as its own separately-defined named class and populated a
+    // `var csr` from inside a nested `if(enable) { csr = ... }`, which silently defeated
+    // SpinalHDL's val-name-reflection naming pass (every `CsrArea` signal fell back to
+    // auto-generated `_zz_NNN` names instead of `DebugCtrlPlugin_logic_csr_*`) -- caught
+    // by this task's own required netlist byte-diff, not by any test.
+    val csr: CsrArea = if (enable) (dbgCd on new CsrArea) else null
+
+    if (!enable) {
+      // ── enable=false: every port declared above is tied to a dead-idle value, zero
+      // debug logic (`CsrArea` -- the AXI FSM and every CSR register, ~20 registers) is
+      // instantiated (spec `2026-08-18-vio-jtag-debug-design.md` V4, mirrored from
+      // `VioProbePlugin`'s own `enable` pattern). READY held low forever is a legal AXI4
+      // idle state (the master simply never completes a transaction against this slave),
+      // not a protocol violation -- exactly "this plugin does not exist".
+      dbgAxi.awready := False
+      dbgAxi.wready  := False
+      dbgAxi.arready := False
+      dbgAxi.bvalid  := False
+      dbgAxi.bresp   := DbgAxiLite.RESP_OKAY
+      dbgAxi.rvalid  := False
+      dbgAxi.rdata   := B(0, DebugRegMap.DBG_DW bits)
+      dbgAxi.rresp   := DbgAxiLite.RESP_OKAY
+      coldResetPulse := False
+      coldResetHold  := False
+      ramWindowLg2   := U(DebugRegMap.RAM_WINDOW_LG2_POR, 6 bits)
+      monSense       := U(DebugRegMap.MON_SENSE_POR, 7 bits)
+    }
+
     // ── Required assertion (spec section 13) ────────────────────────────────────────
     // Deliberately placed in the `porCd` (BOOT-kind, reset-LESS) domain rather than inside
     // the `csr` Area above: SpinalHDL elaborates a synchronous-reset domain's clocked
@@ -431,6 +489,8 @@ class DebugCtrlPlugin(val buildId:   BigInt = BigInt(0),
     // assert a dead check that can never fire (review finding, Task 7 fix pass). `porCd`
     // has no reset at all, so its process has no if/else gating and this runs
     // unconditionally every cycle, exactly like the BOOT-domain POR counter above.
+    // With enable=false the condition is trivially False (READY is tied False above), so
+    // this stays a harmless, never-firing check rather than a dead one.
     val porChecks = porCd on new Area {
       GenerationFlags.simulation {
         assert(!(dbgRst && (dbgAxi.awready || dbgAxi.wready || dbgAxi.arready)),

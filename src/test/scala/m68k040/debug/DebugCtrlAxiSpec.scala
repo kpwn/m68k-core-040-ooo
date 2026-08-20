@@ -137,6 +137,35 @@ class DebugCtrlAxiSpec extends AnyFunSuite {
     }
   }
 
+  test("enable=false: AXI READY never asserts, cold-reset outputs stay low, RAM window/mon-sense read POR defaults") {
+    // Stage 2 task 1: DebugCtrlPlugin(enable = false) ties every port to a dead-idle
+    // value and instantiates zero debug logic. READY staying low forever is a legal
+    // AXI4 idle state (the master simply never completes a transaction), not a
+    // protocol violation -- exactly "this plugin does not exist".
+    M68kSim().compile(new DebugCtrlDut(enableArg = false)).doSim { dut =>
+      val b = dut.axi
+      dut.clockDomain.forkStimulus(10)
+      DbgAxiDriver.idle(b)
+      b.awvalid #= true; b.awaddr #= 0x00058
+      b.wvalid  #= true; b.wdata  #= 0x18; b.wstrb #= 0xF
+      b.arvalid #= true; b.araddr #= DebugRegMap.OFF_VERSION.toLong
+      for (i <- 0 until 64) {
+        dut.clockDomain.waitSampling()
+        assert(!b.awready.toBoolean, s"awready asserted with enable=false (cycle $i)")
+        assert(!b.wready.toBoolean,  s"wready asserted with enable=false (cycle $i)")
+        assert(!b.arready.toBoolean, s"arready asserted with enable=false (cycle $i)")
+        assert(!b.bvalid.toBoolean,  s"bvalid asserted with enable=false (cycle $i)")
+        assert(!b.rvalid.toBoolean,  s"rvalid asserted with enable=false (cycle $i)")
+      }
+      assert(!dut.dbg.logic.coldResetPulse.toBoolean, "coldResetPulse must stay low with enable=false")
+      assert(!dut.dbg.logic.coldResetHold.toBoolean,  "coldResetHold must stay low with enable=false")
+      assert(dut.dbg.logic.ramWindowLg2.toBigInt == BigInt(DebugRegMap.RAM_WINDOW_LG2_POR),
+        "ramWindowLg2 must read its POR default with enable=false")
+      assert(dut.dbg.logic.monSense.toBigInt == BigInt(DebugRegMap.MON_SENSE_POR),
+        "monSense must read its POR default with enable=false")
+    }
+  }
+
   test("back-to-back transactions do not wedge the slave") {
     M68kSim().compile(new DebugCtrlDut()).doSim { dut =>
       dut.clockDomain.forkStimulus(10)

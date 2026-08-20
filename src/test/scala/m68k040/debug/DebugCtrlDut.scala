@@ -12,12 +12,14 @@ import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
   *
   * `porCyclesArg` defaults to 4 so the debug power-on window is a handful of cycles in
   * simulation instead of the synthesis default of 16. */
-class DebugCtrlDut(buildIdArg:   BigInt = BigInt(0x12345678L),
-                   porCyclesArg: Int    = 4,
-                   stageArg:     Int    = 1) extends Component {
+class DebugCtrlDut(buildIdArg:   BigInt  = BigInt(0x12345678L),
+                   porCyclesArg: Int     = 4,
+                   stageArg:     Int     = 1,
+                   enableArg:    Boolean = true) extends Component {
   val db   = new Database
   val host = db on (new PluginHost)
-  val dbg  = new DebugCtrlPlugin(buildId = buildIdArg, porCycles = porCyclesArg, stage = stageArg)
+  val dbg  = new DebugCtrlPlugin(buildId = buildIdArg, porCycles = porCyclesArg, stage = stageArg,
+                                 enable = enableArg)
   db.on { host.asHostOf(Seq[FiberPlugin](dbg)) }
 
   def axi: DbgAxiLite = dbg.logic.dbgAxi
