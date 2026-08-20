@@ -51,6 +51,20 @@ trait FrontendQuiesceService {
   def next: Bool
 }
 
+/** ROB-owned debug halt/resume/step state (design spec
+  * `docs/superpowers/specs/2026-08-09-debug-ctrl-jtag-repl-design.md` section 6, Stage 2).
+  * Read-side only in this task; `DebugCtrlPlugin` is the sole consumer, wired centrally
+  * in `BackendWiringPlugin` like every other cross-plugin signal in this codebase. */
+trait DebugCommitService {
+  def effectiveHalt:    Bool
+  def autoHaltLatched:  Bool
+  def haltReasonDebug:  UInt
+  def livePc:           UInt
+  def lastPc:           UInt
+  def macroCount:       UInt
+  def haltHitInstCount: UInt
+}
+
 /** Produced by the I-cache; consumed by the fetch/align stage (later). */
 trait FetchService {
   def cmd: Stream[FetchCmd]

@@ -1,6 +1,6 @@
 package m68k040.rob
 
-import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate, GshareUpdateService, GshareUpdate, PrivilegeService, CacheControlService, FrontendQuiesceService}
+import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate, GshareUpdateService, GshareUpdate, PrivilegeService, CacheControlService, FrontendQuiesceService, DebugCommitService}
 import m68k040.rename.RenamedUop
 import m68k040.types.CommitTrace
 import spinal.core._
@@ -19,7 +19,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   *
   * retireAlone entries (branches, for now) retire 1-wide.
   */
-class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService {
+class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService {
 
   // PrivilegeService: the wire is allocated in `setup` (BEFORE any plugin's `build`
   // runs) and driven inside `logic` (build) below, mirroring TranslationService's
@@ -46,11 +46,37 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   private var _frontendQuiesceNext: Bool = null
   override def active: Bool = _frontendQuiesceActive
   override def next: Bool = _frontendQuiesceNext
+  // DebugCommitService: same setup-allocated-wire pattern as PrivilegeService/
+  // FrontendQuiesceService above, for the identical Fiber-cycle reason (breaks the
+  // Icache -> Rob -> Rename -> Decode -> FetchAlign -> Icache dependency cycle).
+  // Pure plumbing in this task (Stage 2 task 2): every field below is driven to an
+  // inert default in `logic`; later tasks give them real producers.
+  private var _debugEffectiveHalt:    Bool = null
+  private var _debugAutoHaltLatched:  Bool = null
+  private var _debugHaltReason:       UInt = null
+  private var _debugLivePc:           UInt = null
+  private var _debugLastPc:           UInt = null
+  private var _debugMacroCount:       UInt = null
+  private var _debugHaltHitInstCount: UInt = null
+  override def effectiveHalt:    Bool = _debugEffectiveHalt
+  override def autoHaltLatched:  Bool = _debugAutoHaltLatched
+  override def haltReasonDebug:  UInt = _debugHaltReason
+  override def livePc:           UInt = _debugLivePc
+  override def lastPc:           UInt = _debugLastPc
+  override def macroCount:       UInt = _debugMacroCount
+  override def haltHitInstCount: UInt = _debugHaltHitInstCount
   during setup {
     _supervisor             = Bool()
     _dcacheEnabled          = Bool()
     _frontendQuiesceActive  = Bool()
     _frontendQuiesceNext    = Bool()
+    _debugEffectiveHalt     = Bool()
+    _debugAutoHaltLatched   = Bool()
+    _debugHaltReason        = UInt(3 bits)
+    _debugLivePc            = UInt(32 bits)
+    _debugLastPc            = UInt(32 bits)
+    _debugMacroCount        = UInt(64 bits)
+    _debugHaltHitInstCount  = UInt(64 bits)
   }
 
   /** One ROB entry's commit/free + trace payload. */
@@ -1524,6 +1550,17 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     _frontendQuiesceNext := stoppedNext || coreHaltedNext
     _frontendQuiesceActive.simPublic()
     _frontendQuiesceNext.simPublic()
+
+    // ── DebugCommitService inert defaults (Stage 2 task 2 -- pure plumbing) ─────
+    // Every field driven to an inert default here; no real producer yet. Tasks 3+
+    // give these real values (macro-retire counter, last-committed PC, halt FSM).
+    _debugEffectiveHalt    := False
+    _debugAutoHaltLatched  := False
+    _debugHaltReason       := U(0, 3 bits)
+    _debugLivePc           := p0.pc          // best available "next" PC today; Task 6 refines
+    _debugLastPc           := U(0, 32 bits)  // Task 3 gives this a real producer
+    _debugMacroCount       := U(0, 64 bits)  // Task 3 gives this a real producer
+    _debugHaltHitInstCount := U(0, 64 bits)
 
     // ── Drive trace-exception (T0/T1) recognition (task #193) ───────────────────
     // T1/T0 are bits 7/6 of the SR SYSTEM byte (srSys(7)=T1, srSys(6)=T0 — see

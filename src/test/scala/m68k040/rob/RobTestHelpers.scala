@@ -1,7 +1,7 @@
 package m68k040.rob
 
 import m68k040.services.{RenameUopService, RenameCommitService, RobAllocService,
-  CacheControlService, FrontendQuiesceService}
+  CacheControlService, FrontendQuiesceService, DebugCommitService}
 import m68k040.rename.RenamedUop
 import spinal.core._
 import spinal.core.sim._
@@ -100,5 +100,31 @@ class FrontendQuiesceSinkPlugin extends FiberPlugin {
     val nextOut = out(Bool())
     activeOut := q.active
     nextOut := q.next
+  }
+}
+
+/** Test-only: consumes the actual ROB-owned DebugCommitService and exposes every
+  * accessor as a named top-level output. Mirrors FrontendQuiesceSinkPlugin exactly
+  * -- verifies the setup-allocated service boundary itself rather than reaching
+  * into the provider's private wire. Stage 2 task 2: implements nothing, just
+  * peeks the (currently inert) read-side accessors for a directed test.
+  */
+class DebugCommitSinkPlugin extends FiberPlugin {
+  val logic = during build new Area {
+    val d = host[DebugCommitService]
+    val effectiveHaltOut    = out(Bool())
+    val autoHaltLatchedOut  = out(Bool())
+    val haltReasonDebugOut  = out(UInt(3 bits))
+    val livePcOut           = out(UInt(32 bits))
+    val lastPcOut           = out(UInt(32 bits))
+    val macroCountOut       = out(UInt(64 bits))
+    val haltHitInstCountOut = out(UInt(64 bits))
+    effectiveHaltOut    := d.effectiveHalt
+    autoHaltLatchedOut  := d.autoHaltLatched
+    haltReasonDebugOut  := d.haltReasonDebug
+    livePcOut           := d.livePc
+    lastPcOut           := d.lastPc
+    macroCountOut       := d.macroCount
+    haltHitInstCountOut := d.haltHitInstCount
   }
 }

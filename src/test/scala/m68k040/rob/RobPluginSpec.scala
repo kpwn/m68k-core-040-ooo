@@ -28,8 +28,9 @@ class RobPluginSpec extends AnyFunSuite {
     val csink = new RenameCommitSinkPlugin
     val tsink = new CommitTraceSinkPlugin
     val cacheCtrl = new CacheControlSinkPlugin
+    val dsink = new DebugCommitSinkPlugin
     db.on { host.asHostOf(Seq[FiberPlugin](
-      new ParamPlugin(M68kParams()), rsrc, drv, rob, csink, tsink, cacheCtrl)) }
+      new ParamPlugin(M68kParams()), rsrc, drv, rob, csink, tsink, cacheCtrl, dsink)) }
   }
 
   /** Poke a RenamedUop slot with sane defaults. */
@@ -1304,6 +1305,54 @@ class RobPluginSpec extends AnyFunSuite {
       assert(p0.sysRc.toInt == 0xABC, f"sysRc round-trip: got 0x${p0.sysRc.toInt}%x")
       assert(p0.needsSup.toBoolean, "needsSup round-trip")
       assert(p0.first.toBoolean, "first (firstOfInstr) round-trip")
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Stage 2 task 2: DebugCommitService skeleton -- pure plumbing, zero behavior.
+  test("DebugCommitService resolves and every field is inert (False/0) with no debug driver wired") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      def assertInert(msg: String): Unit = {
+        assert(!dut.dsink.logic.effectiveHaltOut.toBoolean, s"effectiveHalt must stay False ($msg)")
+        assert(!dut.dsink.logic.autoHaltLatchedOut.toBoolean, s"autoHaltLatched must stay False ($msg)")
+        assert(dut.dsink.logic.haltReasonDebugOut.toInt == 0, s"haltReasonDebug must stay 0 ($msg)")
+        assert(dut.dsink.logic.macroCountOut.toBigInt == 0, s"macroCount must stay 0 ($msg)")
+        assert(dut.dsink.logic.haltHitInstCountOut.toBigInt == 0, s"haltHitInstCount must stay 0 ($msg)")
+      }
+
+      assertInert("before any traffic")
+
+      // Drive normal alloc + 2-wide retire traffic (mirrors "alloc + 2-wide retire"
+      // above) and confirm the service stays inert throughout -- proves this task
+      // adds zero observable behavior change, only plumbing.
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x100, dstArch = 3, pdst = 20, pdstValid = true, pdstOld = 3)
+      pokeRu(dut.rsrc.logic.src.payload(1), pc = 0x200, dstArch = 5, pdst = 21, pdstValid = true, pdstOld = 5)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= true
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      dut.rsrc.logic.u1v #= false
+      cd.waitSampling()
+      assertInert("after alloc")
+
+      markComplete(dut, 1)
+      cd.waitSampling()
+      assertInert("mid-completion")
+      dut.rob.logic.completion(0).payload #= 0
+      cd.waitSampling()
+      clearComplete(dut)
+
+      cd.waitSamplingWhere(dut.tsink.logic.fireOut(0).toBoolean)
+      assertInert("at 2-wide retire")
+
+      for (_ <- 0 until 20) {
+        cd.waitSampling()
+        assertInert("post-retire settle")
+      }
+      assert(dut.rob.logic.count.toInt == 0, "ROB drained (test precondition sanity)")
     }
   }
 }
