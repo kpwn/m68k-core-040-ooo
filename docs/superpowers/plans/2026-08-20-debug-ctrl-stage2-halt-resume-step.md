@@ -117,7 +117,7 @@ test("enable=false: AXI READY never asserts, cold-reset outputs stay low, RAM wi
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlPluginSpec"
 ~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400, unchanged
-~/sbt/bin/sbt "runMain m68k040.top.GenFullCoreSynth"
+~/sbt/bin/sbt "runMain m68k040.top.GenFullCoreSynthVerilog"
 ~/sbt/bin/sbt "runMain m68k040.top.GenFullCoreSynthNoDebugVerilog"
 make lint-fpga-top CPU=m68k040   # from the macqd700-soc worktree, if reachable; note if not and defer
 ```
@@ -1149,7 +1149,7 @@ test("stage=2: OFF_FEATURES advertises bits 22 (macro_retire_count) and 23 (stop
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlPluginSpec"
 ~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400
-~/sbt/bin/sbt "runMain m68k040.top.GenFullCoreSynth"
+~/sbt/bin/sbt "runMain m68k040.top.GenFullCoreSynthVerilog"
 make lint-fpga-top CPU=m68k040   # from the macqd700-soc worktree if reachable
 ```
 
