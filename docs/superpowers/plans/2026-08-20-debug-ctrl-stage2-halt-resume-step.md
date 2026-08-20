@@ -313,6 +313,8 @@ when(retire1)      { debugLastPcReg := p1.pc }
   .elsewhen(retire0) { debugLastPcReg := p0.pc }
 ```
 
+**Clarifying note (added 2026-08-20 during Task 3 execution, its own implementer's finding):** `OFF_LAST_PC`/`debugLastPcReg` captures `payload.pc` — the retiring macro's OWN raw starting PC (`u.pc`, set at alloc), NOT `predNextPc`/`commitPc` (the NEXT macro's PC, `pc + 2` for a plain 1-word instruction). These are two genuinely different conventions already in use elsewhere in this same file (e.g. an existing "alloc + 2-wide retire" test's own comment uses `predNextPc = pc + 2`) — do not assume they're interchangeable when writing directed tests against this field; a 1-word instruction at PC `0x200` retiring leaves `debugLastPcReg == 0x200`, not `0x202`.
+
 Place both immediately after the existing `retire1` definition (so `retire0`/`retire1`/`p0`/`p1` are already in scope) and BEFORE the head/tail-advance logic, matching this file's existing convention of computing retire-time derived state close to where `retire0`/`retire1` are defined.
 
 - [ ] **Step 3: Wire into the Task-2 service accessors**
