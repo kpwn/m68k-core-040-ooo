@@ -116,7 +116,7 @@ test("enable=false: AXI READY never asserts, cold-reset outputs stay low, RAM wi
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400, unchanged
+~/sbt/bin/sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"   # expect 399/400, unchanged
 ~/sbt/bin/sbt "runMain m68k040.top.GenFullCoreSynthVerilog"
 ~/sbt/bin/sbt "runMain m68k040.top.GenFullCoreSynthNoDebugVerilog"
 make lint-fpga-top CPU=m68k040   # from the macqd700-soc worktree, if reachable; note if not and defer
@@ -252,7 +252,7 @@ test("DebugCommitService resolves and every field is inert (False/0) with no deb
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400, unchanged
+~/sbt/bin/sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"   # expect 399/400, unchanged
 ```
 
 - [ ] **Step 6: Commit**
@@ -345,7 +345,7 @@ test("debugLastPc tracks the most recently retired entry's PC, single- and dual-
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400, unchanged
+~/sbt/bin/sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"   # expect 399/400, unchanged
 ```
 
 - [ ] **Step 6: Commit**
@@ -426,7 +426,7 @@ test("h0IsMacroLast is True when h0 is the newest allocated entry and nothing fo
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400, unchanged (h0IsMacroLast is unused by anything yet)
+~/sbt/bin/sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"   # expect 399/400, unchanged (h0IsMacroLast is unused by anything yet)
 ```
 
 - [ ] **Step 5: Commit**
@@ -579,7 +579,7 @@ test("repeated halt/continue (10 cycles) leaves the ROB in a consistent state ea
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400 -- debugStopRequestIn defaults False so this task is a behavioral no-op for every existing test
+~/sbt/bin/sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"   # expect 399/400 -- debugStopRequestIn defaults False so this task is a behavioral no-op for every existing test
 ```
 
 - [ ] **Step 8: Commit**
@@ -699,7 +699,7 @@ test("writing OFF_CONTROL bit 0 = 1 through dbg_axi halts the full core at the n
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400
+~/sbt/bin/sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"   # expect 399/400
 ```
 
 - [ ] **Step 8: Commit**
@@ -812,7 +812,7 @@ test("halt-after target write while a comparison is in flight does not fire agai
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
 ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400
+~/sbt/bin/sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"   # expect 399/400
 ```
 
 - [ ] **Step 7: Commit**
@@ -911,7 +911,7 @@ test("single-step never dual-retires across the step boundary even when h1 could
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
 ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400
+~/sbt/bin/sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"   # expect 399/400
 ```
 
 - [ ] **Step 6: Commit**
@@ -1020,7 +1020,7 @@ test("OFF_HALT_CTL bit 2 clears the sticky reason back to NONE without disturbin
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
 ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400
+~/sbt/bin/sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"   # expect 399/400
 ```
 
 - [ ] **Step 9: Commit**
@@ -1103,7 +1103,7 @@ This task changes REAL behavior (`_frontendQuiesceActive`'s new OR term), unlike
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400 -- debugHaltState stays RUNNING for every existing test (debugStopRequestIn/debugStepRequestIn both default False), so this extension is a no-op in practice, but VERIFY, don't assume
+~/sbt/bin/sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"   # expect 399/400 -- debugHaltState stays RUNNING for every existing test (debugStopRequestIn/debugStepRequestIn both default False), so this extension is a no-op in practice, but VERIFY, don't assume
 # Full ported corpus, isolated worktree, per project standing verification methodology:
 git worktree add /tmp/debug-stage2-task11-after HEAD
 cd /tmp/debug-stage2-task11-after && ~/sbt/bin/sbt "testOnly m68k040.PortedTestRunner"   # or whatever the actual full-corpus runner target is named -- confirm the exact sbt target before running
@@ -1148,7 +1148,7 @@ test("stage=2: OFF_FEATURES advertises bits 22 (macro_retire_count) and 23 (stop
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.debug.DebugCtrlPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"   # expect 399/400
+~/sbt/bin/sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"   # expect 399/400
 ~/sbt/bin/sbt "runMain m68k040.top.GenFullCoreSynthVerilog"
 make lint-fpga-top CPU=m68k040   # from the macqd700-soc worktree if reachable
 ```
@@ -1169,7 +1169,7 @@ git commit -m "debug: ship Stage 2 -- bump stage=2, advertise features 22/23 (St
 - [ ] **Step 1: Full lock-step, exact baseline check**
 
 ```
-~/sbt/bin/sbt "testOnly m68k040.ExecuteLockStepSpec"
+~/sbt/bin/sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"
 ```
 Confirm exactly the 4 pre-existing known failures, byte-identical names to this plan's Global Constraints list (re-verify the CURRENT names first — they may have drifted since this plan was written).
 
