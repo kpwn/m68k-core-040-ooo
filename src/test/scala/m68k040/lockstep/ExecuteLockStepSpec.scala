@@ -7789,4 +7789,140 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "handler: move.l 2(%a7),%d1 ; addq.l #4,%d1 ; move.l %d1,2(%a7) ; moveq #1,%d2 ; rte",
       nInstr = 14, checkMem = Seq(0x3000L), checkSpan = 4)
   }
+
+  /** DIAGNOSTIC (SoC-integration task #272 follow-up, 2026-08-20): reproduce, with
+    * full whitebox visibility, a macqd700-soc smoke-test observation that fetch never
+    * appeared to settle back into a tight `BRA.S -2` self-loop after 500k-2M cycles.
+    *
+    * This deliberately does NOT use `attachProgram`/`LockStepRunAheadGuardWords` --
+    * that guard fills the region past the image with MORE `0x60FE` self-branches,
+    * which would trivially "fix" any run-ahead divergence by accident and prove
+    * nothing about the real scenario. Instead this attaches a `ConstFillSparseMemory`
+    * zero-fill (matching the SoC's unwritten 4 MiB ROM window) so any run-ahead past
+    * the loop decodes exactly what the SoC saw: `0x0000 0x0000` = `ORI.B #0,%d0`
+    * (a legal, side-effect-bounded, non-branching 4-byte instruction) repeating
+    * forever -- which explains a monotonically-climbing FETCH address by itself and
+    * is expected/harmless IF it is pure wrong-path speculation that never retires.
+    *
+    * The question this test isolates: does the RETIRED (committed, architectural)
+    * PC stream ever leave the self-loop once it has entered it? Wrong-path fetch
+    * into the zero region is fine and expected (exactly the "bounded run-ahead,
+    * flushed within the drain window" behavior `attachProgram`'s doc comment
+    * describes); only a retired excursion away from the loop would be a real bug. */
+  test("diag: BRA.S -2 self-loop retirement stays put under an UNGUARDED zero-filled run-ahead region", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    // `bra.s` (explicit .s size) forces the exact 2-byte 0x60FE encoding described in
+    // the SoC report -- plain `bra` lets GAS pick the 4-byte word-displacement form
+    // (`braw`, 0x6000 0xfffe) instead, which is also self-referential but not
+    // byte-identical to what the SoC actually booted.
+    val src = "nop ; nop ; nop ; loop: bra.s loop"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[bra-self-loop] ProgramAssembler.assemble failed: ${err.reason}")
+    }
+    // 3 NOPs (2 bytes each) then the BRA.S opword.
+    val loopPc = loadAddr + 6
+
+    compiledDut.doSim(freshSimName("bra-self-loop")) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+
+      // Attach the I-fetch memory with a PLAIN ZERO fill past the image -- no
+      // run-ahead guard -- reproducing the SoC's unguarded ROM scenario.
+      val zeroMem = new m68k040.sim.ConstFillSparseMemory(0)
+      m68k040.sim.AxiMemModel.attachProgramIFetch(
+        dut.icache.logic.axi, cd, loadAddr, image.bytes,
+        sharedMem = zeroMem, runAheadGuardWords = 0)
+
+      val dmem      = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val ptmem     = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid    #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+
+      // Same boot sequence as runLockStep's default (no MMU, no initialSr): boot
+      // supervisor, ISP = 0x00100000.
+      dut.rob.logic.exc.ss.isp  #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L
+      dut.rob.logic.exc.ss.usp  #= BigInt(0x00200000L)
+      dut.ctrl.logic.mmuEnable #= false
+      dut.ctrl.logic.urp #= 0
+      dut.ctrl.logic.srp #= 0
+
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= true
+      dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= false
+
+      // Trace RETIRED (committed) PCs only -- via rob.logic.commitObs, exactly the
+      // channel runLockStep's whitebox capture reads (see the shared `cd.onSamplings`
+      // block above around line 700). Also watch the exception-commit channel
+      // (commitObs(2)) in case wrong-path speculation somehow reaches an exception.
+      //
+      // NOTE on `c.pc` semantics (discovered empirically running this test): it reads
+      // as the instruction's RESOLVED NEXT pc, not its own pc (matches the
+      // `// commitObs = resolved nextPc` remark near the branch-EU wbObs capture
+      // above) -- e.g. NOP #1 at 0x..00 commits with c.pc == 0x..02. For a *self*-loop
+      // branch this distinction is moot at steady state: the branch's resolved next pc
+      // IS its own address (0x..06), so `loopPc` below is correct as the "has entered
+      // / stayed in the loop" sentinel either way -- the invariant under test (does
+      // this value ever change once it first equals loopPc) holds regardless.
+      val trace       = scala.collection.mutable.ArrayBuffer[(Int, Int, Long)]()  // (cycle, port, pc)
+      val excTrace    = scala.collection.mutable.ArrayBuffer[(Int, Long)]()
+      var guard       = 0
+      val targetCommits = 300
+      val cap         = 20000
+      while (trace.size < targetCommits && guard < cap) {
+        cd.waitSampling(); guard += 1
+        for (k <- 0 until 2) {
+          val c = dut.rob.logic.commitObs(k)
+          if (c.fire.toBoolean) trace += ((guard, k, c.pc.toLong & 0xffffffffL))
+        }
+        val ce = dut.rob.logic.commitObs(2)
+        if (ce.fire.toBoolean) excTrace += ((guard, ce.pc.toLong & 0xffffffffL))
+      }
+
+      println(f"[bra-self-loop] loadAddr=0x$loadAddr%08x loopPc=0x$loopPc%08x retired ${trace.size} commits in $guard cycles")
+      trace.zipWithIndex.foreach { case ((cyc, k, pc), i) =>
+        println(f"  [$i%3d] cyc=$cyc%6d port=$k pc=0x$pc%08x${if (pc == loopPc) " <-- LOOP" else ""}")
+      }
+      if (excTrace.nonEmpty) {
+        println(s"[bra-self-loop] ${excTrace.size} exception-channel commits fired (unexpected for this program):")
+        excTrace.foreach { case (cyc, pc) => println(f"    cyc=$cyc%6d excPc=0x$pc%08x") }
+      }
+
+      assert(trace.size >= targetCommits,
+        s"[bra-self-loop] only ${trace.size}/$targetCommits instructions committed within $cap cycles")
+      assert(excTrace.isEmpty,
+        s"[bra-self-loop] unexpected exception-channel commit(s) fired: ${excTrace.mkString(", ")}")
+
+      // The first 3 commits are the 3 NOPs; every commit from the 4th onward MUST be
+      // the branch's own PC (loopPc), and MUST STAY there forever -- once retirement
+      // has entered the self-loop it may never architecturally leave it, no matter
+      // what wrong-path fetch does past the loop into the zero-filled region.
+      val afterFirstLoopHit = trace.dropWhile(_._3 != loopPc)
+      assert(afterFirstLoopHit.nonEmpty,
+        s"[bra-self-loop] loop PC 0x${loopPc.toHexString} was NEVER retired at all -- " +
+          s"retirement never reached the branch (real bug candidate #1: branch never resolves/commits)")
+      val excursions = afterFirstLoopHit.zipWithIndex.filter { case ((_, _, pc), _) => pc != loopPc }
+      assert(excursions.isEmpty,
+        s"[bra-self-loop] retired PC LEFT the self-loop after first entering it -- " +
+          s"real bug candidate #2 (misprediction redirect target wrong/one-shot, not sticky): " +
+          excursions.take(20).map { case ((cyc, _, pc), i) => f"idx=$i cyc=$cyc%6d pc=0x$pc%08x" }.mkString("; "))
+    }
+  }
 }
