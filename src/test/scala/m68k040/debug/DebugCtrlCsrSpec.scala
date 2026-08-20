@@ -97,6 +97,30 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
     }
   }
 
+  test("Stage 3 architectural shadows are byte-strobed, independently dirty, and cfg-wipeable") {
+    M68kSim().compile(new DebugCtrlDut(stageArg = 3, withCommitStubArg = true)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi); cd.waitSampling(20)
+
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_D0, 0x11223344L)
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_D0, 0xAABBCCDDL, strb = 0x5)
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_SSP, 0x55667788L)
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_DFC, 0x00000006L)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_ARCH_D0) == 0x11BB33DDL)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_ARCH_SSP) == 0x55667788L)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_ARCH_DFC) == 6L)
+      val dirty = dut.dbg.logic.csr.archDirty.toBigInt
+      assert(dirty.testBit(0) && dirty.testBit(17) && dirty.testBit(31))
+      assert(dirty.bitCount == 3, f"unexpected dirty mask 0x$dirty%08x")
+
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_DBG_RESET_CTL, 1L)
+      cd.waitSampling(2)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_ARCH_D0) == 0L)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_ARCH_SSP) == 0L)
+      assert(dut.dbg.logic.csr.archDirty.toBigInt == 0)
+    }
+  }
+
   test("a higher stage parameter advertises strictly more, never less") {
     // The plugin is stage-parameterised so a later tranche cannot forget to widen
     // OFF_FEATURES, and cannot widen it by hand-editing a literal.

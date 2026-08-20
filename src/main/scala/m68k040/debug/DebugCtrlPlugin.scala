@@ -277,6 +277,19 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       } else False
       if (stage >= 2) haltAfterInvalidate.simPublic()
 
+      // ── Stage 3 architectural write shadows ─────────────────────────────────
+      // One word/dirty bit per independently applicable field. Logical indices are
+      // deliberately decoupled from CSR word offsets because APPLY/STATUS occupy two
+      // holes before SFC/DFC in the frozen deployed map.
+      val archShadow = if (stage >= 3) Vec.fill(32)(Reg(Bits(32 bits)) init 0) else null
+      val archDirty  = if (stage >= 3) Reg(Bits(32 bits)) init 0 else null
+      if (stage >= 3) { archShadow.simPublic(); archDirty.simPublic() }
+      def archWord(index: Int): Bits = if (stage >= 3) archShadow(index) else B(0, 32 bits)
+      def writeArch(index: Int): Unit = if (stage >= 3) when(wStrb.orR) {
+        archShadow(index) := merged(archShadow(index))
+        archDirty(index) := True
+      }
+
       def effectiveHalt: Bool =
         if (stage >= 2) dbgCommit.map(_.effectiveHalt).getOrElse(False) else False
       def automaticHalt: Bool =
@@ -385,6 +398,26 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
             // Deployed layout (debug_ctrl.v:1411): {cpu_reset_count_r, 16'd0}.
             rData := cpuResetCount.asBits ## B(0, 16 bits)
           }
+          for (i <- 0 until 8) {
+            is(DebugRegMap.OFF_ARCH_D0 + i * 4) { rData := archWord(i) }
+            is(DebugRegMap.OFF_ARCH_A0 + i * 4) { rData := archWord(8 + i) }
+          }
+          is(DebugRegMap.OFF_ARCH_USP)  { rData := archWord(16) }
+          is(DebugRegMap.OFF_ARCH_SSP)  { rData := archWord(17) }
+          is(DebugRegMap.OFF_ARCH_ISP)  { rData := archWord(18) }
+          is(DebugRegMap.OFF_ARCH_SR)   { rData := archWord(19) }
+          is(DebugRegMap.OFF_ARCH_VBR)  { rData := archWord(20) }
+          is(DebugRegMap.OFF_ARCH_CACR) { rData := archWord(21) }
+          is(DebugRegMap.OFF_ARCH_TC)   { rData := archWord(22) }
+          is(DebugRegMap.OFF_ARCH_ITT0) { rData := archWord(23) }
+          is(DebugRegMap.OFF_ARCH_ITT1) { rData := archWord(24) }
+          is(DebugRegMap.OFF_ARCH_DTT0) { rData := archWord(25) }
+          is(DebugRegMap.OFF_ARCH_DTT1) { rData := archWord(26) }
+          is(DebugRegMap.OFF_ARCH_URP)  { rData := archWord(27) }
+          is(DebugRegMap.OFF_ARCH_SRP)  { rData := archWord(28) }
+          is(DebugRegMap.OFF_ARCH_PC)   { rData := archWord(29) }
+          is(DebugRegMap.OFF_ARCH_SFC)  { rData := archWord(30) }
+          is(DebugRegMap.OFF_ARCH_DFC)  { rData := archWord(31) }
         }
       }
 
@@ -453,6 +486,26 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
               when(wData(1)) { cpuResetCount := U(0, 16 bits) }
             }
           }
+          for (i <- 0 until 8) {
+            is(DebugRegMap.OFF_ARCH_D0 + i * 4) { writeArch(i) }
+            is(DebugRegMap.OFF_ARCH_A0 + i * 4) { writeArch(8 + i) }
+          }
+          is(DebugRegMap.OFF_ARCH_USP)  { writeArch(16) }
+          is(DebugRegMap.OFF_ARCH_SSP)  { writeArch(17) }
+          is(DebugRegMap.OFF_ARCH_ISP)  { writeArch(18) }
+          is(DebugRegMap.OFF_ARCH_SR)   { writeArch(19) }
+          is(DebugRegMap.OFF_ARCH_VBR)  { writeArch(20) }
+          is(DebugRegMap.OFF_ARCH_CACR) { writeArch(21) }
+          is(DebugRegMap.OFF_ARCH_TC)   { writeArch(22) }
+          is(DebugRegMap.OFF_ARCH_ITT0) { writeArch(23) }
+          is(DebugRegMap.OFF_ARCH_ITT1) { writeArch(24) }
+          is(DebugRegMap.OFF_ARCH_DTT0) { writeArch(25) }
+          is(DebugRegMap.OFF_ARCH_DTT1) { writeArch(26) }
+          is(DebugRegMap.OFF_ARCH_URP)  { writeArch(27) }
+          is(DebugRegMap.OFF_ARCH_SRP)  { writeArch(28) }
+          is(DebugRegMap.OFF_ARCH_PC)   { writeArch(29) }
+          is(DebugRegMap.OFF_ARCH_SFC)  { writeArch(30) }
+          is(DebugRegMap.OFF_ARCH_DFC)  { writeArch(31) }
         }
       }
 
@@ -470,6 +523,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       when(cfgWipe) {
         ramWindow := U(DebugRegMap.RAM_WINDOW_LG2_POR, 6 bits)
         mon       := U(DebugRegMap.MON_SENSE_POR, 7 bits)
+        if (stage >= 3) {
+          for (i <- 0 until 32) archShadow(i) := B(0, 32 bits)
+          archDirty := B(0, 32 bits)
+        }
       }
 
       // ── The spec-15.1 wipe, and the sticky latch it overrides ────────────────────
