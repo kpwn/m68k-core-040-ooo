@@ -223,7 +223,7 @@ range absent only by returning zero and clearing the corresponding feature bit.
 | `0x060`-`0x07C` | 256-bit halt-on-exception mask |
 | `0x080`-`0x090` | breakpoint skip-once, BP1-BP3, four-slot enable mask |
 | `0x094`-`0x09C` | double-fault and legacy diagnostic PC capture |
-| `0x0A0` / `0x0A4` / `0x0A8` | features / debug-reset control / trace depths |
+| `0x0A0`-`0x0AC` | features / debug-reset control / trace depths |
 | `0x0B0`-`0x0DC` | two data-watchpoint configs and queued hit report |
 | `0x0E0`-`0x108` | two A-trap slots and capture; these actual deployed offsets win over stale documents which proposed another block at `0x100` |
 | `0x200`-`0x214` | D-cache probe, D-cache op, I-cache op |
@@ -233,6 +233,7 @@ range absent only by returning zero and clearing the corresponding feature bit.
 | `0x3000`-`0x3040` | optional implementation diagnostics/snapshots |
 | `0x10000` / `0x11000` | optional PC trace body / head |
 | `0x12000` / `0x13000` | optional exception ring / head |
+| `0x14000` / `0x15000` | optional retired-branch ring / head |
 
 The first implementation need not decode all of these as functional registers. It
 must reserve them, return zero for absent functions, and never repurpose them.
@@ -294,6 +295,7 @@ Reserve these new append-only bits:
 | 21 | `cache_maint_only` | halted-only push/invalidate works even if legacy bit 11 probe support is absent |
 | 22 | `macro_retire_count` | `OFF_INST_*` and halt-after count architectural macro-instructions, not internal uops |
 | 23 | `stop_status_v2` | effective halt means commit recovery and stable architectural state; cache/apply commands additionally wait for reported memory quiescence |
+| 24 | `branch_ring` | 32-entry retired-branch history with resolved flow metadata |
 
 Host tools should append these names to their feature list. Old tools ignore the high
 bits and continue using the frozen offsets.
@@ -683,9 +685,11 @@ remain capability-gated because a nonmatching qualified trap incurs a debug reco
 
 ### 9.3 Trace and telemetry
 
-PC trace and exception rings use synchronous BRAM with a registered AXI read response.
-Depths are reported by `OFF_CAP_TRACE`; host code never assumes the RTL default. Trace
-is optional by constructor parameter and must compile out cleanly.
+PC trace, retired-branch, and exception rings use synchronous BRAM with a registered
+AXI read response. Depths are reported by `OFF_CAP_TRACE` and `OFF_CAP_TRACE2`; host
+code never assumes the RTL default. Trace is optional by constructor parameter and
+must compile out cleanly. `OFF_CAP_TRACE` reports PC depth in `[31:16]` and exception
+depth in `[15:0]`; the append-only `OFF_CAP_TRACE2[15:0]` reports retired-branch depth.
 
 The initial PC-retirement trace depth is 32 entries. It records architectural macro
 completion, not uop activity: push the macro's raw PC only when a retiring ROB entry
@@ -695,6 +699,27 @@ identifies the next write position; after wrap, the preceding 32 ring positions 
 the 32 most recently completed macros. The ring remains live while RUNNING and freezes
 naturally once effective halt is reached, giving JTAG a stable history alongside the
 stable architectural snapshot.
+
+The initial retired-branch history depth is also 32 entries. It records only
+architecturally retired branch-family macros, never speculative resolution. One entry
+occupies four 32-bit words at `OFF_BRANCH_RING_BODY + index*16`: raw branch PC,
+resolved next PC, metadata, and a reserved-zero word. Metadata bit 0 is taken, bit 1
+is mispredicted, bits `[3:2]` are the branch type, and all other bits are reserved
+zero. `OFF_BRANCH_RING_HEAD` is the next write position. Branch history is pushed at
+the same macro-commit boundary as the PC trace, so a halted reader sees only committed
+control flow and no wrong-path branch.
+
+The initial exception history depth is 32 entries. One entry occupies four 32-bit
+words at `OFF_EXC_RING_BODY + index*16`: metadata, exception PC, fault address, and
+installed handler PC. Metadata bits `[7:0]` hold the vector and all remaining bits are
+reserved zero until an append-only format revision defines them. Push exactly once
+when exception entry has installed its final architectural state and handler PC; do
+not push for speculative faults or intermediate exception-entry uops.
+
+All three head registers identify the next write position. After wrap, walking the
+preceding `depth` entries yields oldest-to-newest history. They remain live while
+RUNNING and freeze naturally only once effective halt is reached; no explicit freeze
+command is required for the initial implementation.
 
 Performance feature bit 12 remains zero until every advertised counter has a real
 producer. Cycle count, macro count, exception count, flush count, predictor
@@ -809,6 +834,9 @@ implemented tranche.
 ### Stage 3 — live state and halted apply
 
 - Add committed-map/system-state services and shared PRF ports.
+- Provide a complete coherent register dump at effective halt and halted-only register
+  set through the shadow/dirty/apply transaction; JTAG must never sample speculative
+  maps or expose a partially applied register set.
 - Implement all legacy live/shadow offsets, dirty mask, apply FSM, rejection, and
   stays-halted capability.
 - Round-trip every D/A, X/NZVC/SR bit, all SP banks, PC/VBR/CACR/SFC/DFC, and MMU state.
@@ -846,7 +874,7 @@ implemented tranche.
 ### Stage 7 — trace and truthful telemetry
 
 - Add the optional 32-entry macro-retirement PC ring described in section 9.3, plus
-  optional exception rings and real event producers.
+  the optional 32-entry retired-branch and exception rings and real event producers.
 - Validate wrap/head semantics, build-time depths, synchronous-read latency, simultaneous
   dual-retire events, and no fabricated counters.
 

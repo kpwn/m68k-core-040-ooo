@@ -65,7 +65,8 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
                            "live_arch", "dcache_probe", "perf_counters", "watchpoints",
                            "atrap_bp", "atrap_regcap", "atrap_d0qual",
                            "arch_apply_stays_halted", "arch_dirty_apply",
-                           "cache_maint_only", "macro_retire_count", "stop_status_v2")) {
+                           "cache_maint_only", "macro_retire_count", "stop_status_v2",
+                           "branch_ring")) {
         val bit = DebugRegMap.features.find(_._1 == optional)
           .getOrElse(fail(s"feature '$optional' is missing from DebugRegMap"))._2
         assert(((got >> bit) & 1L) == 0L, s"optional feature '$optional' (bit $bit) must read 0")

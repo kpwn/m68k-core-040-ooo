@@ -76,6 +76,7 @@ REG OFF_PC_MISALIGNED_PC  0x0009C RO    9 0x00000000 Retired legacy diagnostic; 
 REG OFF_FEATURES          0x000A0 RO    1 0x0004000F Capability bitmap; see FEAT records.
 REG OFF_DBG_RESET_CTL     0x000A4 MIXED 1 0x00000000 Read [31:16] = CPU-reset count; write bit0 = cfg wipe, bit1 = count clear.
 REG OFF_CAP_TRACE         0x000A8 RO    7 0x00000000 [31:16] PC-trace depth, [15:0] exception-ring depth.
+REG OFF_CAP_TRACE2        0x000AC RO    7 0x00000000 [15:0] retired-branch ring depth; [31:16] reserved zero.
 
 # ------------------------------------------------ watchpoints and A-traps --
 REG OFF_WP0_ADDR          0x000B0 RW    6 0x00000000 Watchpoint 0 physical address.
@@ -185,6 +186,8 @@ RANGE OFF_PC_TRACE_BODY   0x10000 0x1000 RO 7 PC trace ring body.
 REG   OFF_PC_TRACE_HEAD   0x11000 RO 7 0x00000000 PC trace ring head pointer.
 RANGE OFF_EXC_RING_BODY   0x12000 0x1000 RO 7 Exception ring body.
 REG   OFF_EXC_RING_HEAD   0x13000 RO 7 0x00000000 Exception ring head pointer.
+RANGE OFF_BRANCH_RING_BODY 0x14000 0x1000 RO 7 Retired-branch ring body.
+REG   OFF_BRANCH_RING_HEAD 0x15000 RO 7 0x00000000 Retired-branch ring head pointer.
 
 # ---------------------------------------------------------- feature bitmap --
 FEAT dbg_reset_domain       0  1 Debug CSRs and configuration survive CPU reset.
@@ -211,6 +214,7 @@ FEAT arch_dirty_apply      20  3 Only shadows written since the last apply/confi
 FEAT cache_maint_only      21  4 Halted-only push/invalidate works without legacy probe support.
 FEAT macro_retire_count    22  2 OFF_INST_* and halt-after count macro-instructions, not uops.
 FEAT stop_status_v2        23  2 Effective halt means commit recovery and stable architectural state.
+FEAT branch_ring           24  7 Retired-branch history ring present.
 
 # ------------------------------------------------------------ socket ports --
 # Verbatim from macqd700-soc/rtl/soc/cpu_socket.vh:145-176. DIR is from the

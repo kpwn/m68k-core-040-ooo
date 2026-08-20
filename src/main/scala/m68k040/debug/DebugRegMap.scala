@@ -64,6 +64,7 @@ object DebugRegMap {
   val OFF_FEATURES: Int = 0x000A0
   val OFF_DBG_RESET_CTL: Int = 0x000A4
   val OFF_CAP_TRACE: Int = 0x000A8
+  val OFF_CAP_TRACE2: Int = 0x000AC
   val OFF_WP0_ADDR: Int = 0x000B0
   val OFF_WP0_AMASK: Int = 0x000B4
   val OFF_WP0_VALUE: Int = 0x000B8
@@ -184,6 +185,8 @@ object DebugRegMap {
   val OFF_PC_TRACE_HEAD: Int = 0x11000
   val OFF_EXC_RING_BODY: Int = 0x12000
   val OFF_EXC_RING_HEAD: Int = 0x13000
+  val OFF_BRANCH_RING_BODY: Int = 0x14000
+  val OFF_BRANCH_RING_HEAD: Int = 0x15000
 
   /** Every reserved offset: (name, offset), ordered by offset. */
   val allOffsets: Seq[(String, Int)] = Seq(
@@ -230,6 +233,7 @@ object DebugRegMap {
     ("OFF_FEATURES", 0x000A0),
     ("OFF_DBG_RESET_CTL", 0x000A4),
     ("OFF_CAP_TRACE", 0x000A8),
+    ("OFF_CAP_TRACE2", 0x000AC),
     ("OFF_WP0_ADDR", 0x000B0),
     ("OFF_WP0_AMASK", 0x000B4),
     ("OFF_WP0_VALUE", 0x000B8),
@@ -350,6 +354,8 @@ object DebugRegMap {
     ("OFF_PC_TRACE_HEAD", 0x11000),
     ("OFF_EXC_RING_BODY", 0x12000),
     ("OFF_EXC_RING_HEAD", 0x13000),
+    ("OFF_BRANCH_RING_BODY", 0x14000),
+    ("OFF_BRANCH_RING_HEAD", 0x15000),
   )
 
   /** Capability bitmap: (name, bit, stage-that-makes-it-real). */
@@ -378,6 +384,7 @@ object DebugRegMap {
     ("cache_maint_only", 21, 4),
     ("macro_retire_count", 22, 2),
     ("stop_status_v2", 23, 2),
+    ("branch_ring", 24, 7),
   )
 
   /** OR of (1 << bit) for every feature this stage genuinely implements.

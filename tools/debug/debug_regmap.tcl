@@ -64,6 +64,7 @@ set ::dbg::OFF(OFF_PC_MISALIGNED_PC) 0x0009C
 set ::dbg::OFF(OFF_FEATURES) 0x000A0
 set ::dbg::OFF(OFF_DBG_RESET_CTL) 0x000A4
 set ::dbg::OFF(OFF_CAP_TRACE) 0x000A8
+set ::dbg::OFF(OFF_CAP_TRACE2) 0x000AC
 set ::dbg::OFF(OFF_WP0_ADDR) 0x000B0
 set ::dbg::OFF(OFF_WP0_AMASK) 0x000B4
 set ::dbg::OFF(OFF_WP0_VALUE) 0x000B8
@@ -184,6 +185,8 @@ set ::dbg::OFF(OFF_PC_TRACE_BODY) 0x10000
 set ::dbg::OFF(OFF_PC_TRACE_HEAD) 0x11000
 set ::dbg::OFF(OFF_EXC_RING_BODY) 0x12000
 set ::dbg::OFF(OFF_EXC_RING_HEAD) 0x13000
+set ::dbg::OFF(OFF_BRANCH_RING_BODY) 0x14000
+set ::dbg::OFF(OFF_BRANCH_RING_HEAD) 0x15000
 
 set ::dbg::FEAT_BIT(dbg_reset_domain) 0
 set ::dbg::FEAT_STAGE(dbg_reset_domain) 1
@@ -233,6 +236,8 @@ set ::dbg::FEAT_BIT(macro_retire_count) 22
 set ::dbg::FEAT_STAGE(macro_retire_count) 2
 set ::dbg::FEAT_BIT(stop_status_v2) 23
 set ::dbg::FEAT_STAGE(stop_status_v2) 2
+set ::dbg::FEAT_BIT(branch_ring) 24
+set ::dbg::FEAT_STAGE(branch_ring) 7
 
 set ::dbg::PORT_DIR(dbg_axi_awaddr) IN
 set ::dbg::PORT_WIDTH(dbg_axi_awaddr) 20

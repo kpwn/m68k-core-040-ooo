@@ -69,6 +69,7 @@ OFF_PC_MISALIGNED_PC = 0x0009C
 OFF_FEATURES = 0x000A0
 OFF_DBG_RESET_CTL = 0x000A4
 OFF_CAP_TRACE = 0x000A8
+OFF_CAP_TRACE2 = 0x000AC
 OFF_WP0_ADDR = 0x000B0
 OFF_WP0_AMASK = 0x000B4
 OFF_WP0_VALUE = 0x000B8
@@ -189,6 +190,8 @@ OFF_PC_TRACE_BODY = 0x10000
 OFF_PC_TRACE_HEAD = 0x11000
 OFF_EXC_RING_BODY = 0x12000
 OFF_EXC_RING_HEAD = 0x13000
+OFF_BRANCH_RING_BODY = 0x14000
+OFF_BRANCH_RING_HEAD = 0x15000
 
 ALL_OFFSETS = {
     "OFF_VERSION": 0x00000,
@@ -234,6 +237,7 @@ ALL_OFFSETS = {
     "OFF_FEATURES": 0x000A0,
     "OFF_DBG_RESET_CTL": 0x000A4,
     "OFF_CAP_TRACE": 0x000A8,
+    "OFF_CAP_TRACE2": 0x000AC,
     "OFF_WP0_ADDR": 0x000B0,
     "OFF_WP0_AMASK": 0x000B4,
     "OFF_WP0_VALUE": 0x000B8,
@@ -354,6 +358,8 @@ ALL_OFFSETS = {
     "OFF_PC_TRACE_HEAD": 0x11000,
     "OFF_EXC_RING_BODY": 0x12000,
     "OFF_EXC_RING_HEAD": 0x13000,
+    "OFF_BRANCH_RING_BODY": 0x14000,
+    "OFF_BRANCH_RING_HEAD": 0x15000,
 }
 
 # -- capability bitmap: name -> (bit, stage-that-makes-it-real) ------------
@@ -382,6 +388,7 @@ FEATURES = {
     "cache_maint_only": (21, 4),
     "macro_retire_count": (22, 2),
     "stop_status_v2": (23, 2),
+    "branch_ring": (24, 7),
 }
 
 # -- socket ports: name -> (direction from the CPU, width) ----------------

@@ -108,6 +108,7 @@ def main():
         "mon_sense": 18, "arch_apply_stays_halted": 19,
         "arch_dirty_apply": 20, "cache_maint_only": 21,
         "macro_retire_count": 22, "stop_status_v2": 23,
+        "branch_ring": 24,
     }
     by_name = {f.name: f.bit for f in rm.feats}
     check("frozen feature bit numbering is exact", by_name == frozen,
